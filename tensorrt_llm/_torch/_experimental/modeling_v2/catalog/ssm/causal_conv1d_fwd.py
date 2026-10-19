@@ -13,21 +13,76 @@ import torch
 import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtllm.*
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 
-#: This checkpoint's GDN mixer: `[q|k|v]` is 10240 wide, the conv is width 4,
-#: so each pool slot holds a 3-column window.
-CKPT_DIM = 10240
+#: qwen4_exp's GDN mixer: `[q|k|v]` is 10240 wide, the conv is width 4, so each
+#: pool slot holds a 3-column window.
+QWEN4_EXP_DIM = 10240
 #: The largest conv-pool slot count the cache manager was seen to allocate for
-#: this checkpoint (10, 35, 366, 368, 396, 399, 432 and 461 across twelve
+#: qwen4_exp (10, 35, 366, 368, 396, 399, 432 and 461 across twelve
 #: runtime-value dumps, while `max_num_sequences` never exceeds 32). The target
 #: hands the pool over unsliced, so 461 tops the certified interval.
-ENGINE_SLOTS = 461
+QWEN4_EXP_SLOTS = 461
+
+#: Nemotron-3 Ultra's Mamba2 mixer at tep4, per rank: the conv runs over
+#: xBC = x 4096 | B 256 | C 256 channels, width 4, with bias.
+ULTRA_TP4_DIM = 4608
+#: It reads xBC in place from the rank's in_proj output row, laid out
+#: z 4096 | xBC 4608 | dt 64: a column slice with token stride 8768.
+ULTRA_TP4_PROJ_WIDTH = 8768
+ULTRA_TP4_XBC_OFFSET = 4096
+#: The conv pool MambaHybridCacheManagerV2 allocates at that geometry
+#: (max_batch_size 32), measured: 35 slots, each slot holding all 48 Mamba
+#: layers' `[4608, 3]` windows back to back, so one layer's view is
+#: `[35, 4608, 3]` with strides `(48 * 4608 * 3, 3, 1)`.
+ULTRA_TP4_SLOTS = 35
+ULTRA_TP4_POOL_LAYERS = 48
+
+#: At dep4 (attention DP) every rank runs the whole mixer: xBC = x 16384 |
+#: B 1024 | C 1024 channels, read from the in_proj row z 16384 | xBC 18432 |
+#: dt 256 (token stride 35072). The cache manager then uses tp=1 for Mamba;
+#: measured at that geometry: the same 35 slots x 48 layers, one layer's view
+#: `[35, 18432, 3]` with strides `(48 * 18432 * 3, 3, 1)`.
+ULTRA_DEP4_DIM = 18432
+ULTRA_DEP4_PROJ_WIDTH = 35072
+ULTRA_DEP4_XBC_OFFSET = 16384
 
 
 def _engine_batch_slots() -> tuple[int, ...]:
-    """32 distinct slots over the whole engine pool, slot 0 and the last included."""
-    slots = (0, ENGINE_SLOTS - 1) + tuple((i * 13 + 5) % (ENGINE_SLOTS - 2) + 1 for i in range(30))
+    """32 distinct slots over qwen4_exp's whole engine pool, slot 0 and the last included."""
+    slots = (0, QWEN4_EXP_SLOTS - 1) + tuple(
+        (i * 13 + 5) % (QWEN4_EXP_SLOTS - 2) + 1 for i in range(30)
+    )
     assert len(set(slots)) == 32
     return slots
+
+
+def _ultra_batch_slots() -> tuple[int, ...]:
+    """32 distinct, scattered slots of the 35-slot Ultra pool, slot 0 and the last included."""
+    slots = (0, ULTRA_TP4_SLOTS - 1) + tuple(
+        (i * 7 + 3) % (ULTRA_TP4_SLOTS - 2) + 1 for i in range(30)
+    )
+    assert len(set(slots)) == 32
+    return slots
+
+
+#: The Mamba2 prefill call site: xBC read in place from the projection, the
+#: result written token-major, bias on, one layer's view of the engine pool.
+_ULTRA = dict(
+    dim=ULTRA_TP4_DIM,
+    bias=True,
+    layout="proj",
+    proj_width=ULTRA_TP4_PROJ_WIDTH,
+    proj_offset=ULTRA_TP4_XBC_OFFSET,
+    pool_slots=ULTRA_TP4_SLOTS,
+    pool_layers=ULTRA_TP4_POOL_LAYERS,
+    pool_layer=17,
+)
+#: The same call at dep4 geometry.
+_ULTRA_DEP4 = dict(
+    _ULTRA,
+    dim=ULTRA_DEP4_DIM,
+    proj_width=ULTRA_DEP4_PROJ_WIDTH,
+    proj_offset=ULTRA_DEP4_XBC_OFFSET,
+)
 
 
 class CausalConv1dFwd(OpWrapper):
@@ -43,7 +98,7 @@ class CausalConv1dFwd(OpWrapper):
 
     Fusion boundary: the state read, the convolution, the bias, the SiLU and the
     state publish are inside. The projection that produces `x`, and slicing the
-    result into q/k/v, are the caller's.
+    result into q/k/v or x/B/C, are the caller's.
 
     Writes the activation into `out`, or into `x` in place when `out is None`,
     and returns that tensor. `conv_states` is advanced in place for every
@@ -56,18 +111,22 @@ class CausalConv1dFwd(OpWrapper):
     required, channel-last, disjoint from `x`). The two agree bitwise.
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = frozenset({Arch.SM_103, Arch.SM_107})
 
     # spec keys: dim, width, dtype, lengths (varlen) or batch3d=(batch, seqlen),
-    # pool_slots (None -> no conv_states), slots (None -> cache_indices None),
-    # initial (None -> has_initial_state None), silu, bias, pad_slot_id,
-    # layout: "in_place" | "out" | "channel_last".
+    # pool_slots (None -> no conv_states), pool_layers/pool_layer (the pool is
+    # layer `pool_layer`'s view of a `[slots, pool_layers, dim, W-1]` buffer),
+    # slots (None -> cache_indices None), initial (None -> has_initial_state
+    # None), silu, bias, pad_slot_id, layout: "in_place" | "out" |
+    # "channel_last" | "proj" (x the `.t()` of columns [proj_offset,
+    # proj_offset + dim) of a token-major `[T, proj_width]` buffer, out a
+    # token-major `[T, dim]` buffer's `.t()`).
     CELLS: tuple[Cell, ...] = (
         (
             Cell(
-                why="checkpoint prefill 37+1+128 tokens in place, 8-slot pool",
+                why="qwen4_exp GDN prefill 37+1+128 tokens in place, 8-slot pool",
                 spec=dict(
-                    dim=CKPT_DIM,
+                    dim=QWEN4_EXP_DIM,
                     lengths=(37, 1, 128),
                     pool_slots=8,
                     slots=(3, 0, 5),
@@ -75,21 +134,21 @@ class CausalConv1dFwd(OpWrapper):
                 ),
             ),
             Cell(
-                why="checkpoint prefill at the engine's 461-slot pool: slots 460, 0, 230",
+                why="qwen4_exp GDN prefill at its 461-slot pool: slots 460, 0, 230",
                 spec=dict(
-                    dim=CKPT_DIM,
+                    dim=QWEN4_EXP_DIM,
                     lengths=(37, 1, 128),
-                    pool_slots=ENGINE_SLOTS,
-                    slots=(ENGINE_SLOTS - 1, 0, ENGINE_SLOTS // 2),
+                    pool_slots=QWEN4_EXP_SLOTS,
+                    slots=(QWEN4_EXP_SLOTS - 1, 0, QWEN4_EXP_SLOTS // 2),
                     initial=(True, False, True),
                 ),
             ),
             Cell(
                 why="32 sequences (the batch ceiling) scattered over the 461-slot pool",
                 spec=dict(
-                    dim=CKPT_DIM,
+                    dim=QWEN4_EXP_DIM,
                     lengths=tuple(1 + (i * 7) % 96 for i in range(32)),
-                    pool_slots=ENGINE_SLOTS,
+                    pool_slots=QWEN4_EXP_SLOTS,
                     slots=_engine_batch_slots(),
                     initial=tuple(i % 3 != 0 for i in range(32)),
                 ),
@@ -97,7 +156,7 @@ class CausalConv1dFwd(OpWrapper):
             Cell(
                 why="explicit channel-major out: result lands there, x is read-only",
                 spec=dict(
-                    dim=CKPT_DIM,
+                    dim=QWEN4_EXP_DIM,
                     lengths=(64, 9),
                     pool_slots=4,
                     slots=(1, 2),
@@ -108,12 +167,81 @@ class CausalConv1dFwd(OpWrapper):
             Cell(
                 why="channel-last x (a bare .t() of token-major), into its own out",
                 spec=dict(
-                    dim=CKPT_DIM,
+                    dim=QWEN4_EXP_DIM,
                     lengths=(37, 1, 128),
                     pool_slots=8,
                     slots=(3, 0, 5),
                     initial=(True, False, True),
                     layout="channel_last",
+                ),
+            ),
+            Cell(
+                why="Mamba2 tep4 prefill: 4 sequences, mixed carry, scattered engine slots",
+                spec=dict(
+                    _ULTRA,
+                    lengths=(37, 1, 128, 300),
+                    slots=(ULTRA_TP4_SLOTS - 1, 0, 17, 5),
+                    initial=(True, False, True, False),
+                ),
+            ),
+            Cell(
+                why="Mamba2 tep4: 32 sequences (batch ceiling) over the 35-slot pool",
+                spec=dict(
+                    _ULTRA,
+                    lengths=tuple(1 + (i * 37) % 255 for i in range(32)),
+                    slots=_ultra_batch_slots(),
+                    initial=tuple(i % 3 != 0 for i in range(32)),
+                ),
+            ),
+            Cell(
+                why="Mamba2 tep4: one 4101-token sequence across many token chunks",
+                spec=dict(_ULTRA, lengths=(4101,), slots=(12,), initial=(False,)),
+            ),
+            Cell(
+                why="Mamba2 tep4 at the 8192-token step ceiling, 3 sequences",
+                spec=dict(
+                    _ULTRA, lengths=(4096, 4095, 1), slots=(3, 30, 0), initial=(True, False, True)
+                ),
+            ),
+            Cell(
+                why="Mamba2 tep4 chunked-prefill continuations shorter than the window",
+                spec=dict(_ULTRA, lengths=(1, 2, 3, 5), slots=(1, 2, 3, 4), initial=(True,) * 4),
+            ),
+            Cell(
+                why="Mamba2 tep4 layout, pad_slot_id -1: the channel-last kernel skips it",
+                spec=dict(_ULTRA, lengths=(16, 8, 16), slots=(0, -1, 2), initial=(True,) * 3),
+            ),
+            Cell(
+                why="Mamba2 dep4 prefill: 4 sequences, mixed carry, scattered engine slots",
+                spec=dict(
+                    _ULTRA_DEP4,
+                    lengths=(37, 1, 128, 300),
+                    slots=(ULTRA_TP4_SLOTS - 1, 0, 17, 5),
+                    initial=(True, False, True, False),
+                ),
+            ),
+            Cell(
+                why="Mamba2 dep4: 32 sequences (batch ceiling) over the 35-slot pool",
+                spec=dict(
+                    _ULTRA_DEP4,
+                    lengths=tuple(1 + (i * 37) % 255 for i in range(32)),
+                    slots=_ultra_batch_slots(),
+                    initial=tuple(i % 3 != 0 for i in range(32)),
+                ),
+            ),
+            Cell(
+                why="Mamba2 dep4 at the 8192-token step ceiling, 3 sequences",
+                spec=dict(
+                    _ULTRA_DEP4,
+                    lengths=(4096, 4095, 1),
+                    slots=(3, 30, 0),
+                    initial=(True, False, True),
+                ),
+            ),
+            Cell(
+                why="Mamba2 dep4 chunked-prefill continuations shorter than the window",
+                spec=dict(
+                    _ULTRA_DEP4, lengths=(1, 2, 3, 5), slots=(1, 2, 3, 4), initial=(True,) * 4
                 ),
             ),
             Cell(
@@ -188,11 +316,15 @@ class CausalConv1dFwd(OpWrapper):
             ),
             Cell(
                 why="one 2048-token sequence: the vectorised channel-major load",
-                spec=dict(dim=CKPT_DIM, lengths=(2048,), pool_slots=1, slots=(0,), initial=(True,)),
+                spec=dict(
+                    dim=QWEN4_EXP_DIM, lengths=(2048,), pool_slots=1, slots=(0,), initial=(True,)
+                ),
             ),
             Cell(
                 why="one 2047-token sequence: the scalar channel-major load",
-                spec=dict(dim=CKPT_DIM, lengths=(2047,), pool_slots=1, slots=(0,), initial=(True,)),
+                spec=dict(
+                    dim=QWEN4_EXP_DIM, lengths=(2047,), pool_slots=1, slots=(0,), initial=(True,)
+                ),
             ),
             Cell(
                 why="several long sequences: the 128-thread block",
@@ -236,13 +368,28 @@ class CausalConv1dFwd(OpWrapper):
     (`conv_states`, `[slots, dim, W - 1]`), slot map (`cache_indices`, int32)
     and carry flags (`has_initial_state`, bool) are explicit arguments.
 
-    Call site: the GDN prefill half -- `x` the `[10240, num_prefill_tokens]`
+    Call sites.
+    qwen4_exp, the GDN prefill half: `x` the `[10240, num_prefill_tokens]`
     channel-major output of `extract_transpose_prefill_slice`, W 4, no bias,
-    SiLU on, the layer's whole conv pool unsliced, `pad_slot_id` -1, `out` None.
-    The first three cells are that call; 461 slots tops the certified pool
-    interval (8 and 461 bracket every width the cache manager was seen to
-    allocate). At 461 the activation and state are bitwise identical to the
-    8-slot result for the same slot content.
+    SiLU on, the layer's whole conv pool unsliced, `pad_slot_id` -1, `out`
+    None. The `qwen4_exp GDN` cells and the 461-slot batch cell are that call;
+    461 slots tops the certified pool interval (8 and 461 bracket every width
+    the cache manager was seen to allocate). At 461 the activation and state
+    are bitwise identical to the 8-slot result for the same slot content.
+    nemotron_h Ultra tep4, the Mamba2 prefill: `x = proj[:T, 4096:8704].t()`
+    -- the rank's xBC columns of the in_proj output read in place (channel-last,
+    token stride 8768) -- into `out = torch.empty(T, 4608).t()`, so the result
+    is token-major and x/B/C are its column views; W 4 with bias, SiLU on;
+    `conv_states` the layer's engine view `[35, 4608, 3]` with slot stride
+    48 * 4608 * 3 (the 48 Mamba layers' windows share one slot);
+    `query_start_loc`, `cache_indices` and `has_initial_state` the context
+    prefix of the step's Mamba2 metadata buffers; `pad_slot_id` -1. The
+    `Mamba2 tep4` cells are that call; the in_proj buffer outside the read and
+    the other 47 layers' windows are gated bitwise unchanged.
+    nemotron_h Ultra dep4, the same call unsharded: `x = proj[:T,
+    16384:34816].t()` (token stride 35072), `out = torch.empty(T, 18432).t()`,
+    `conv_states` the layer's view `[35, 18432, 3]`, slot stride
+    48 * 18432 * 3 -- the `Mamba2 dep4` cells.
 
     Preconditions the op checks itself (all raise): dtypes in {bf16, fp16,
     fp32}, `conv_states`/`bias` dtype, int32 `query_start_loc`/`cache_indices`,
@@ -366,6 +513,19 @@ class CausalConv1dFwd(OpWrapper):
         assert weight.dtype == x.dtype, (
             "weight must have x's dtype; the kernel reads it as x's type without converting"
         )
+        # Both kernels read entry `b` of the three per-sequence tensors at
+        # data_ptr + b, ignoring their strides: a stride-2 view of each was
+        # measured 2.9 (cache_indices), 3.2 (has_initial_state) and 4.6
+        # (query_start_loc) off, with no error.
+        for name, meta in (
+            ("query_start_loc", query_start_loc),
+            ("cache_indices", cache_indices),
+            ("has_initial_state", has_initial_state),
+        ):
+            assert meta is None or meta.numel() < 2 or meta.stride(-1) == 1, (
+                f"{name} must have unit stride; the kernels read entry b at data_ptr + b "
+                "and ignore the stride, so a strided view silently selects the wrong entries"
+            )
         varlen = query_start_loc is not None
         c_axis, l_axis = (0, 1) if varlen else (1, 2)
         if x.dim() != (2 if varlen else 3):

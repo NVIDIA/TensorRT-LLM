@@ -25,8 +25,11 @@ _E2M1_VALUES = torch.tensor(
 def _build(spec, seed):
     g = torch.Generator(device="cuda").manual_seed(seed)
     x = torch.randn(spec["shape"], generator=g, device="cuda").to(spec["dtype"])
-    # The canonical NVFP4 activation global scale, 448*6/amax.
-    gs = (448.0 * 6.0 / x.abs().max().float()).reshape(1)
+    # The canonical NVFP4 activation global scale, 448*6/amax -- or, for a
+    # static checkpoint scale calibrated below this batch's amax, that scale
+    # over `amax_headroom` < 1, which pushes the largest blocks past e4m3's 448.
+    amax = x.abs().max().float() * spec.get("amax_headroom", 1.0)
+    gs = (448.0 * 6.0 / amax).reshape(1)
     return x, gs, spec["vec"], spec["swizzled"]
 
 
@@ -54,6 +57,9 @@ def test_certified_cells(cell) -> None:
     ref_packed, ref_sf = op.reference(x, gs, vec, False, swizzled)
 
     assert torch.equal(sf, ref_sf), "block scales are exact; a mismatch is a defect"
+    if cell.spec.get("amax_headroom", 1.0) < 1.0:
+        # e4m3's largest finite value, 448, is byte 0x7E; saturation must have happened
+        assert bool((sf == 0x7E).any()), "the outrun scale saturated no block"
 
     tie = op.near_tie(op.scaled(x, gs, vec))
     codes, ref_codes = _unpack(packed), _unpack(ref_packed)

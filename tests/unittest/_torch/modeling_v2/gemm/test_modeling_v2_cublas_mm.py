@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """GPU test for the cublas_mm catalog entry."""
 
+import math
 import zlib
 
 import pytest
@@ -32,13 +33,35 @@ def _compare(out: torch.Tensor, ref: torch.Tensor) -> None:
     So: 4 ulp element-wise against the row scale, 2 ulp of relative RMS.
     Measured worst case across this entry's cells is 1.5e-4 absolute, or
     roughly 3e-4 ulp -- four orders of margin, and a band that a genuinely
-    wrong product would miss by orders rather than squeak past.
+    wrong product would miss by orders rather than squeak past. On sm_107 the
+    nemotron_h cells, up to K 8192 and 8192 rows, reach 1.8 ulp element-wise
+    and 0.06 of RMS.
     """
-    # Scored in bf16 ulp even when the output is fp32: every cell's
-    # operands are bf16, so the fp32 out_dtype the router asks for is a
-    # wider container for a bf16-limited product, not a more precise one.
-    # Against fp32's own ulp the same 2.4e-6 difference reads as 5x over.
     assert_within_ulp(out, ref, element_ulp=4.0, rms_ulp=2.0, ulp=ULP[torch.bfloat16])
+
+
+def _compare_fp32(out: torch.Tensor, ref: torch.Tensor, k: int) -> None:
+    """An fp32 output, gated at fp32 accumulation error.
+
+    A product of two bf16 operands is exact in fp32, so an fp32 out_dtype is a
+    genuinely fp32 result and the bf16 band above would pass one rounded to
+    bf16 (about 14,000 fp32 ulp RMS). Kernel and reference differ only in how
+    they sum K exact products in fp32. A rounding error of up to half an ulp
+    per add, accumulated as a random walk over partial sums that grow like the
+    final one, gives about sqrt(K / 8) ulp of relative RMS: 32 at K 8192.
+
+    Measured on sm_107 against the exact (fp64) product at K 8192: 5-12 ulp RMS
+    up to 32 rows, and 76 at 8192 rows, where the tensor-core kernels add error
+    inside each MMA; element-wise up to 148 against `reference`. The deepseek
+    router cell (K 7168, 16 rows) sits at 8 / 6. The gate is 2 * sqrt(K) ulp of
+    relative RMS and 4 * sqrt(K) element-wise against the row scale, 181 / 362
+    at K 8192: 2.4x the measured worst on both, and still some 75x inside a
+    bf16-rounded result.
+    """
+    root_k = math.sqrt(k)
+    assert_within_ulp(
+        out, ref, element_ulp=4.0 * root_k, rms_ulp=2.0 * root_k, ulp=ULP[torch.float32]
+    )
 
 
 def _build(spec, seed):
@@ -66,7 +89,66 @@ def test_certified_cells(cell) -> None:
         out = op(mat_a, mat_b, bias, out_dtype)
     assert out.shape == (mat_a.shape[0], mat_b.shape[1])
     assert out.dtype is (out_dtype or mat_a.dtype)
-    _compare(out, op.reference(mat_a, mat_b, bias, out_dtype))
+    ref = op.reference(mat_a, mat_b, bias, out_dtype)
+    if out.dtype is torch.float32 and mat_a.dtype is not torch.float32:
+        _compare_fp32(out, ref, k=mat_a.shape[1])
+    else:
+        _compare(out, ref)
+
+
+def _router(rows: int = 32, k: int = 8192, n: int = 512):
+    """The nemotron_h router call: bf16 activations against a bf16-exact weight."""
+    g = torch.Generator(device="cuda").manual_seed(8192)
+    x = torch.randn(rows, k, generator=g, device="cuda").to(torch.bfloat16)
+    w = (torch.randn(n, k, generator=g, device="cuda") * 0.02).to(torch.bfloat16)
+    return x, w
+
+
+def test_fp32_logits_are_not_bf16_limited() -> None:
+    """The control for `_compare_fp32`: the same logits rounded to bf16 are what
+    the bf16 band would accept, and the fp32 gate must refuse them."""
+    x, w = _router()
+    out = op(x, w.t(), None, torch.float32)
+    ref = op.reference(x, w.t(), None, torch.float32)
+    _compare_fp32(out, ref, k=x.shape[1])
+    _compare(out.to(torch.bfloat16).float(), ref)
+    with pytest.raises(AssertionError):
+        _compare_fp32(out.to(torch.bfloat16).float(), ref, k=x.shape[1])
+
+
+def _tf32_matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """torch's fp32 matmul with TF32 forced on, the setting `true_fp32_matmul` undoes."""
+    prev_allow = torch.backends.cuda.matmul.allow_tf32
+    prev_prec = getattr(torch.backends.cuda.matmul, "fp32_precision", None)
+    torch.backends.cuda.matmul.allow_tf32 = True
+    if prev_prec is not None:
+        torch.backends.cuda.matmul.fp32_precision = "tf32"
+    try:
+        return a.float() @ b.float()
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = prev_allow
+        if prev_prec is not None:
+            torch.backends.cuda.matmul.fp32_precision = prev_prec
+
+
+def test_tf32_is_inert_on_bf16_exact_operands() -> None:
+    """Why a router weight stored in fp32 but bf16-exact loses nothing either way.
+
+    TF32 keeps a 10-bit mantissa, so it cannot truncate a bf16 value: a TF32
+    product of bf16-exact operands stays inside `_compare_fp32` of the true fp32
+    one. The control is the hazard itself, operands that are not bf16-exact,
+    where TF32 truncation moves the product orders of magnitude past the gate.
+    """
+    x, w = _router()
+    k = x.shape[1]
+    ref = op.reference(x, w.t(), None, torch.float32)
+    _compare_fp32(_tf32_matmul(x, w.t()), ref, k=k)
+
+    g = torch.Generator(device="cuda").manual_seed(8193)
+    x32 = x.float() + torch.randn(x.shape, generator=g, device="cuda") * 1e-3
+    exact = op.reference(x32, w.t(), None, torch.float32)
+    with pytest.raises(AssertionError):
+        _compare_fp32(_tf32_matmul(x32, w.t()), exact, k=k)
 
 
 def _ok(dtype=torch.bfloat16):

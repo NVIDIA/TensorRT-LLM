@@ -1,0 +1,890 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+"""ModelingV2 target: Nemotron-3 Ultra 550B-A55B NVFP4 / sm_107 / tep4 -- self-contained modeling code.
+
+A 108-block hybrid stack (48 Mamba2, 12 attention, 48 LatentMoE blocks, the order
+read from the checkpoint's `layers_block_type`), every block pre-normed with its
+own RMSNorm and added back to a bf16 residual stream:
+
+* Mamba2: FP8 `in_proj` -> depthwise causal conv + SiLU over x|B|C -> SSD scan
+  (chunked on context rows, one recurrence step on generation rows) -> gated
+  grouped RMSNorm (gate before the norm) -> FP8 `out_proj`.
+* attention: BF16 GQA with no positional encoding at all, FP8 KV cache.
+* LatentMoE: an fp32 sigmoid router with a selection-only correction bias over
+  the full hidden state; the 512 NVFP4 relu2 experts run in a 2048-wide latent
+  space between two BF16 projections; an FP8 relu2 shared expert runs on the full
+  hidden state beside them.
+
+tep4: every block's output is a per-rank partial sum (mamba and attention by
+head, the shared expert by its intermediate split, the routed experts by EP
+window) completed by one all-reduce over the 4 ranks.
+
+Each target is self-contained: it holds the per-layer weight views it reads,
+passes every argument to every op at the call site, and shares no code with the
+other targets.
+"""
+
+from typing import NamedTuple
+
+import torch
+from torch import nn
+from transformers import PretrainedConfig
+
+from tensorrt_llm._torch._experimental.modeling_v2._router_index import step_contract_enabled
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.thop_attention import (
+    QM_FP8_KV_CACHE,
+    thop_attention,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.cublas_mm import cublas_mm
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.cublas_scaled_mm import (
+    cublas_scaled_mm,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.fp4_block_scale_moe_runner import (
+    ACT_TYPE_RELU2,
+    fp4_block_scale_moe_runner,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.noaux_tc_op import noaux_tc_op
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.flashinfer_fused_add_rmsnorm import (  # noqa: E501
+    flashinfer_fused_add_rmsnorm,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.flashinfer_rmsnorm import (
+    flashinfer_rmsnorm,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.rms_norm_gated_grouped import (
+    rms_norm_gated_grouped,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.quantization.fp4_quantize import (
+    fp4_quantize,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.quantization.static_quantize_e4m3_per_tensor import (  # noqa: E501
+    static_quantize_e4m3_per_tensor,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.ssm.causal_conv1d_fwd import (
+    causal_conv1d_fwd,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.ssm.causal_conv1d_update import (
+    causal_conv1d_update,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.ssm.mamba_chunk_scan_combined import (  # noqa: E501
+    mamba_chunk_scan_combined,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.ssm.selective_state_update import (
+    selective_state_update,
+)
+from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
+from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
+from tensorrt_llm._torch.distributed.ops import get_allreduce_workspace
+from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.models.modeling_utils import DecoderModel, DecoderModelForCausalLM
+from tensorrt_llm.functional import AllReduceStrategy
+
+from . import weights as _weights
+from .ops.comm.allreduce import allreduce
+
+# The certification is per GPU architecture: this code was gated on sm_107 only.
+_SM = (10, 7)
+
+# Pre-routed: ids and weights come from the router below, so the runner's own routing
+# never runs. The autotuner's warm-up still builds a dummy routing of this family
+# (DeepSeekV3), which is why n_group / topk_group / routed_scaling_factor are numbers.
+_ROUTING_DEEPSEEK_V3 = 2
+# The runner reads the activation block scales as a linear buffer, not 128x4.
+_SF_LINEAR = False
+# An empty slot in the recurrent-state pools (padding rows of a captured batch).
+_PAD_SLOT_ID = -1
+# AUTO picks the one-shot / two-shot IPC kernels for decode-sized payloads and NCCL for
+# large prefill payloads (it falls back to NCCL past the workspace); every strategy it
+# can pick is certified at this target's row counts.
+_ALLREDUCE_STRATEGY = AllReduceStrategy.AUTO
+# The checkpoint's time_step_limit (0, inf): softplus(dt + dt_bias) is not clamped.
+_DT_LIMIT = (0.0, float("inf"))
+
+_CALL_CONSTANTS = dict(
+    output_sf=None,
+    k=None,
+    v=None,
+    is_fused_qkv=True,
+    update_kv_cache=True,
+    predicted_tokens_per_seq=1,
+    attention_input_type=0,
+    is_mla_enable=False,
+    mask_type=1,
+    q_scaling=1.0,
+    # FP8 KV cache. The checkpoint's k/v scales are exactly 1.0 (asserted at load),
+    # so the scale tensors are absent and read as 1.0.
+    quant_mode=QM_FP8_KV_CACHE,
+    kv_scale_orig_quant=None,
+    kv_scale_quant_orig=None,
+    attention_sinks=None,
+    # No positional encoding: in-kernel RoPE is disabled; the rope_* values below are
+    # inert placeholders.
+    position_embedding_type=0,
+    rotary_inv_freq=None,
+    rotary_cos_sin=None,
+    rope_dim=0,
+    rope_base=10000.0,
+    rope_scale_type=0,
+    rope_scale=1.0,
+    rope_short_m_scale=1.0,
+    rope_long_m_scale=1.0,
+    rope_max_positions=1024,
+    rope_original_max_positions=1024,
+    out_scale=None,
+    latent_cache=None,
+    q_pe=None,
+    q_lora_rank=None,
+    kv_lora_rank=None,
+    qk_nope_head_dim=None,
+    qk_rope_head_dim=None,
+    v_head_dim=None,
+    rope_append=None,
+    chunked_prefill_buffer_batch_size=1,
+    attention_chunk_size=None,
+    softmax_stats_tensor=None,
+    sparse_kv_indices=None,
+    sparse_kv_offsets=None,
+    sparse_attn_indices=None,
+    sparse_attn_offsets=None,
+    sparse_attn_indices_block_size=0,
+    mrope_rotary_cos_sin=None,
+    mrope_position_deltas=None,
+    helix_position_offsets=None,
+    helix_is_inactive_rank=None,
+    cross_kv=None,
+    relative_attention_bias=None,
+    relative_attention_max_distance=0,
+    kv_norm_weight=None,
+    kv_norm_eps=1e-6,
+    skip_correction_threshold=0.0,
+)
+
+
+class _Mamba(NamedTuple):
+    """One Mamba2 block's weights, as the views the ops read."""
+
+    in_w: torch.Tensor
+    in_is: torch.Tensor
+    in_ws: torch.Tensor
+    conv_w: torch.Tensor
+    conv_b: torch.Tensor
+    A: torch.Tensor
+    A_hd: torch.Tensor
+    D: torch.Tensor
+    D_hd: torch.Tensor
+    dt_bias: torch.Tensor
+    dt_bias_hd: torch.Tensor
+    gnorm: torch.Tensor
+    out_w: torch.Tensor
+    out_is: torch.Tensor
+    out_ws: torch.Tensor
+
+
+class _Attention(NamedTuple):
+    qkv: torch.Tensor
+    o: torch.Tensor
+
+
+class _Moe(NamedTuple):
+    gate: torch.Tensor
+    gate_bias: torch.Tensor
+    fc1_lat: torch.Tensor
+    fc2_lat: torch.Tensor
+    sh_up: torch.Tensor
+    sh_up_is: torch.Tensor
+    sh_up_ws: torch.Tensor
+    sh_down: torch.Tensor
+    sh_down_is: torch.Tensor
+    sh_down_ws: torch.Tensor
+    fc1_w: torch.Tensor
+    fc1_s: torch.Tensor
+    fc2_w: torch.Tensor
+    fc2_s: torch.Tensor
+    x_global_scale: torch.Tensor
+    out1_scale: torch.Tensor
+    out1_gate_scale: torch.Tensor
+    out2_scale: torch.Tensor
+
+
+class _Bound(NamedTuple):
+    """Everything taken off one KV cache manager: the attention layers' pool rows and the
+    mamba layers' conv and SSM state pools."""
+
+    cm: object
+    pool_row: dict
+    conv: dict
+    ssm: dict
+
+
+def _layer_views(core) -> list:
+    """Per block, the views its forward reads, and the *next* block's input norm (the
+    final norm after the last block) as the second element."""
+    w = core.w
+    d = core.dims
+    hd = d.head_dim_ssm
+    st = d.ssm_state
+    views = []
+    for i, kind in enumerate(d.kinds):
+        if kind == "mamba":
+            A = w[f"l{i}_A"]
+            D = w[f"l{i}_D"]
+            dtb = w[f"l{i}_dt_bias"]
+            L = _Mamba(
+                in_w=w[f"l{i}_in_proj_w"].t(),
+                in_is=w[f"l{i}_in_proj_is"],
+                in_ws=w[f"l{i}_in_proj_ws"],
+                conv_w=w[f"l{i}_conv_w"],
+                conv_b=w[f"l{i}_conv_b"],
+                A=A,
+                # The decode step reads per-(head, dim, state) A and per-(head, dim) D and
+                # dt_bias; broadcast views, no copies.
+                A_hd=A[:, None, None].expand(d.heads_r, hd, st),
+                D=D,
+                D_hd=D[:, None].expand(d.heads_r, hd),
+                dt_bias=dtb,
+                dt_bias_hd=dtb[:, None].expand(d.heads_r, hd),
+                gnorm=w[f"l{i}_gnorm"],
+                out_w=w[f"l{i}_out_proj_w"].t(),
+                out_is=w[f"l{i}_out_proj_is"],
+                out_ws=w[f"l{i}_out_proj_ws"],
+            )
+        elif kind == "attention":
+            L = _Attention(qkv=w[f"l{i}_qkv_w"].t(), o=w[f"l{i}_o_w"].t())
+        else:
+            assert kind == "moe", kind
+            fc1_is = w[f"l{i}_ex_fc1_is"]
+            fc2_is = w[f"l{i}_ex_fc2_is"]
+            fc1_ws2 = w[f"l{i}_ex_fc1_ws2"]
+            fc2_ws2 = w[f"l{i}_ex_fc2_ws2"]
+            L = _Moe(
+                gate=w[f"l{i}_gate_w"].t(),
+                gate_bias=w[f"l{i}_gate_b"],
+                fc1_lat=w[f"l{i}_fc1_lat_w"].t(),
+                fc2_lat=w[f"l{i}_fc2_lat_w"].t(),
+                sh_up=w[f"l{i}_sh_up_w"].t(),
+                sh_up_is=w[f"l{i}_sh_up_is"],
+                sh_up_ws=w[f"l{i}_sh_up_ws"],
+                sh_down=w[f"l{i}_sh_down_w"].t(),
+                sh_down_is=w[f"l{i}_sh_down_is"],
+                sh_down_ws=w[f"l{i}_sh_down_ws"],
+                fc1_w=w[f"l{i}_ex_fc1_w"],
+                fc1_s=w[f"l{i}_ex_fc1_s"].view(torch.float8_e4m3fn),
+                fc2_w=w[f"l{i}_ex_fc2_w"],
+                fc2_s=w[f"l{i}_ex_fc2_s"].view(torch.float8_e4m3fn),
+                # FC1's activation global scale is one value per layer (asserted at load).
+                x_global_scale=(1.0 / fc1_is[:1]).contiguous(),
+                # The relu2 FC1 epilogue is C = out1 * relu(out1_gate * acc)^2: out1_gate
+                # dequantizes FC1 (input scale x the expert's weight global scale) before
+                # the activation, out1 is FC2's input quantization only. The SwiGlu
+                # convention (out1 = out1_gate / FC2 input scale) zeroes this layer.
+                out1_scale=(1.0 / fc2_is).contiguous(),
+                out1_gate_scale=(fc1_is * fc1_ws2).contiguous(),
+                out2_scale=(fc2_is * fc2_ws2).contiguous(),
+            )
+        nxt = w[f"l{i + 1}_norm"] if i + 1 < d.num_layers else w["final_norm"]
+        views.append((L, nxt))
+    return views
+
+
+class NemotronUltraTep4ModelingV2(DecoderModel):
+    def __init__(self, model_config: ModelConfig):
+        super().__init__(model_config)
+        self.dims = _weights.MODEL_WEIGHTS.dims(self)
+        self.w = _weights.MODEL_WEIGHTS.declare(self.dims)
+        mapping = model_config.mapping
+        self.tp_group = list(mapping.tp_group)
+        self._bound: "_Bound | None" = None
+        self._binds = 0
+        self._prefill: "PrefillTarget | None" = None
+        self._decode: "DecodeTarget | None" = None
+
+    def post_load_weights(self) -> None:
+        """Construct the two targets, now that the weights are real.
+
+        Called twice by the engine (the shell's hook, then the loader's module
+        walk), so it rebuilds rather than accumulates. Must never run from
+        `__init__`, where the containers are still meta.
+        """
+        # The IPC workspace the custom allreduce kernels use, allocated once outside any
+        # capture (the same tensor the engine's own AllReduce modules hold).
+        self.ar_workspace = get_allreduce_workspace(self.model_config.mapping)
+        # The shared expert runs on this stream beside the routed experts.
+        self.side_stream = torch.cuda.Stream()
+        self._prefill = PrefillTarget(self)
+        self._decode = DecodeTarget(self)
+
+    def _bind_cache_manager(self, md) -> None:
+        """Take every pool view this model reads from one KV cache manager.
+
+        Called once per manager rather than once per model: with capacity
+        estimation the engine builds a throwaway manager, warms up on it and then
+        builds the real one under the same module, and a view held across the swap
+        would dangle silently.
+        """
+        cm = md.kv_cache_manager
+        assert cm is not None, "a paged KV cache is required"
+        assert not (self._binds and torch.cuda.is_current_stream_capturing()), (
+            f"the KV cache manager changed to {type(cm).__name__} during CUDA graph capture"
+        )
+        self._binds += 1
+        d = self.dims
+        for name in ("get_conv_states", "get_ssm_states", "layer_offsets"):
+            assert hasattr(cm, name), (
+                f"{type(cm).__name__} has no {name}: the runtime allocated no hybrid "
+                "recurrent-state pool for this model"
+            )
+        # thop_attention addresses the KV pool by the layer's pool row; counting
+        # attention layers instead would alias layers with finite, plausible output.
+        pool_row = {i: cm.layer_offsets[i] for i in d.attn_layers}
+        conv = {i: cm.get_conv_states(i) for i in d.mamba_layers}
+        ssm = {i: cm.get_ssm_states(i) for i in d.mamba_layers}
+        c0, s0 = conv[d.mamba_layers[0]], ssm[d.mamba_layers[0]]
+        assert c0.shape[1:] == (d.conv_r, d.conv_kernel - 1), (
+            f"conv state pool {tuple(c0.shape)}: expected [slots, {d.conv_r}, {d.conv_kernel - 1}]"
+        )
+        assert s0.shape[1:] == (d.heads_r, d.head_dim_ssm, d.ssm_state), (
+            f"ssm state pool {tuple(s0.shape)}: expected "
+            f"[slots, {d.heads_r}, {d.head_dim_ssm}, {d.ssm_state}]"
+        )
+        assert md.effective_beam_width == 1, "beam search is not implemented"
+        assert md.cache_indirection is None, "beam search is not implemented"
+        assert not md.is_cross, "cross attention is not implemented"
+        self._bound = _Bound(cm, pool_row, conv, ssm)
+
+    def _select_target(self, attn_metadata) -> "PrefillTarget | DecodeTarget":
+        """One host-side integer read: a mixed batch goes to prefill, so prefill is the
+        general case and decode the specialization that may assume no context rows."""
+        return self._decode if attn_metadata.num_contexts == 0 else self._prefill
+
+    def forward(self, attn_metadata: AttentionMetadata, *args, **kwargs) -> torch.Tensor:
+        """Bind the step's cache manager if it changed, then route the step."""
+        if self._bound is None or attn_metadata.kv_cache_manager is not self._bound.cm:
+            self._bind_cache_manager(attn_metadata)
+        return self._select_target(attn_metadata).forward(attn_metadata, *args, **kwargs)
+
+
+class PrefillTarget:
+    """The general case: context rows, and possibly generation rows after them."""
+
+    def __init__(self, core: NemotronUltraTep4ModelingV2) -> None:
+        """Take the views and constants this target's forward reads, once, off the real weights."""
+        self.core = core
+        # Off unless TRTLLM_MODELING_V2_VALIDATE asks for it; read once here.
+        self._contract_pending = step_contract_enabled()
+        cfg = core.model_config.pretrained_config
+        self._eps = cfg.layer_norm_epsilon
+        self._norm0 = core.w["l0_norm"]
+        self._layers = _layer_views(core)
+
+    def _check_step_contract(self, md) -> None:
+        """Opt-in first-forward fail-fast: the metadata fields this target consumes
+        must exist (they are private trtllm surface). Calling `step_args` and reading
+        the mamba fields is the check."""
+        if not self._contract_pending:
+            return
+        try:
+            self.step_args(md)
+            mm = md.mamba_metadata
+            for name in ("state_indices", "has_initial_states", "query_start_loc", "seq_idx"):
+                getattr(mm, name)
+            mm.use_initial_states, mm.chunk_size  # noqa: B018 — read for the AttributeError
+        except AttributeError as exc:
+            raise AssertionError(f"attention metadata surface drifted: {exc}") from exc
+        self._contract_pending = False
+
+    def step_args(self, md: TrtllmAttentionMetadata) -> dict:
+        """Project the prepared metadata onto thop_attention's explicit batch state."""
+        return dict(
+            sequence_length=md.kv_lens_cuda_runtime,
+            host_past_key_value_lengths=md.kv_lens_runtime,
+            host_total_kv_lens=md.host_total_kv_lens,
+            context_lengths=md.prompt_lens_cuda_runtime,
+            host_context_lengths=md.prompt_lens_cpu_runtime,
+            host_request_types=md.host_request_types_runtime,
+            kv_cache_block_offsets=md.kv_cache_block_offsets,
+            host_kv_cache_pool_pointers=md.host_kv_cache_pool_pointers,
+            host_kv_cache_pool_mapping=md.host_kv_cache_pool_mapping,
+            workspace_=md.effective_workspace,
+            tokens_per_block=md.tokens_per_block,
+            max_num_requests=md.max_num_requests,
+            max_context_length=md.max_context_length,
+            max_seq_len=md.max_seq_len,
+            num_contexts=md.num_contexts,
+            num_ctx_tokens=md.num_ctx_tokens,
+            trtllm_gen_jit_warmup=md.trtllm_gen_jit_warmup,
+            use_paged_context_fmha=md.use_paged_context_fmha,
+            beam_width=md.effective_beam_width,
+            cache_indirection=md.cache_indirection,
+            block_ids_per_seq=md.block_ids_per_seq,
+            max_context_q_len_override=md.max_context_q_len_override,
+            is_cross=md.is_cross,
+            is_spec_decoding_enabled=md.is_spec_decoding_enabled,
+            use_spec_decoding=md.use_spec_decoding,
+            is_spec_dec_tree=md.is_spec_dec_tree,
+            spec_decoding_generation_lengths=md.spec_decoding_generation_lengths,
+            spec_decoding_position_offsets_for_cpp=md.spec_decoding_position_offsets_for_cpp,
+            spec_decoding_packed_mask=md.spec_decoding_packed_mask,
+            spec_decoding_bl_tree_mask_offset=md.spec_decoding_bl_tree_mask_offset,
+            spec_decoding_bl_tree_mask=md.spec_decoding_bl_tree_mask,
+            spec_decoding_target_max_draft_tokens=md.max_total_draft_tokens,
+            spec_bl_tree_first_sparse_mask_offset_kv=md.spec_bl_tree_first_sparse_mask_offset_kv,
+            num_sparse_topk=md.num_sparse_topk,
+            flash_mla_tile_scheduler_metadata=md.flash_mla_tile_scheduler_metadata,
+            flash_mla_num_splits=md.flash_mla_num_splits,
+            max_num_sequences=md.max_num_sequences,
+            force_prepare_spec_dec_tree_mask=md.force_prepare_spec_dec_tree_mask,
+        )
+
+    def forward(
+        self,
+        attn_metadata: AttentionMetadata,
+        input_ids: torch.IntTensor | None = None,
+        position_ids: torch.IntTensor | None = None,
+        inputs_embeds: torch.FloatTensor | None = None,
+        lora_params: dict | None = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        core = self.core
+        d = core.dims
+        md = attn_metadata
+        eps = self._eps
+        bound = core._bound
+        group = core.tp_group
+
+        self._check_step_contract(md)
+        step = self.step_args(md)
+        window = md.max_seq_len
+
+        # Host-side batch split: context rows first, then single-token generation rows.
+        nc = md.num_contexts
+        nct = md.num_ctx_tokens
+        ns = md.num_seqs
+        mm = md.mamba_metadata
+        si = mm.state_indices
+        qsl = mm.query_start_loc
+        hi = mm.has_initial_states
+        use_init = mm.use_initial_states
+        seq_idx = mm.seq_idx
+        chunk_indices = mm.chunk_indices
+        chunk_offsets = mm.chunk_offsets
+        chunk = mm.chunk_size
+        si_ctx = si[:nc]
+        si_gen = si[nc:ns]
+        has_gen = ns > nc
+
+        if inputs_embeds is None:
+            h = nn.functional.embedding(input_ids, core.w["embed"])
+        else:
+            h = inputs_embeds
+        num_tokens = h.shape[0]
+        attn_out = torch.empty([num_tokens, d.q_width_r], dtype=h.dtype, device=h.device)
+
+        din, conv_c = d.d_inner_r, d.conv_r
+        heads, hd, gn = d.heads_r, d.head_dim_ssm, d.gn_r
+        groups, st = d.groups_r, d.ssm_state
+
+        x = flashinfer_rmsnorm(h, self._norm0, eps)
+        residual = h
+        for i, (L, norm_next) in enumerate(self._layers):
+            if isinstance(L, _Mamba):
+                conv_state = bound.conv[i]
+                ssm_state = bound.ssm[i]
+                xq = static_quantize_e4m3_per_tensor(x, L.in_is)
+                zxbcdt = cublas_scaled_mm(xq, L.in_w, L.in_is, L.in_ws, out_dtype=torch.bfloat16)
+                z = zxbcdt[:, :din]
+                xbc = zxbcdt[:, din : din + conv_c]
+                dt = zxbcdt[:, din + conv_c :]
+                y = torch.empty([num_tokens, heads, hd], dtype=h.dtype, device=h.device)
+
+                # Context rows: varlen conv (seeding from and writing back the conv
+                # state), then the chunked scan seeded from the SSM state where the
+                # sequence has one, with each sequence's final state written back.
+                # Channel-last views on both sides: the result is token-major
+                # [nct, x|B|C], so x, B and C are column views of it.
+                xbc_ctx = causal_conv1d_fwd(
+                    xbc[:nct].t(),
+                    L.conv_w,
+                    L.conv_b,
+                    conv_state,
+                    qsl[: nc + 1],
+                    si_ctx,
+                    hi[:nc],
+                    True,
+                    _PAD_SLOT_ID,
+                    torch.empty([nct, conv_c], dtype=h.dtype, device=h.device).t(),
+                ).t()
+                xs = xbc_ctx[:, :din].reshape(1, nct, heads, hd)
+                Bm = xbc_ctx[:, din : din + gn].reshape(1, nct, groups, st)
+                Cm = xbc_ctx[:, din + gn :].reshape(1, nct, groups, st)
+                # A fresh row's slot still holds the previous request's state, which
+                # the scan cannot tell apart from a carried one: zero it here.
+                init = None
+                if use_init:
+                    init = ssm_state[si_ctx].to(torch.float32)
+                    init.masked_fill_(~hi[:nc].view(nc, 1, 1, 1), 0)
+                final = mamba_chunk_scan_combined(
+                    xs,
+                    dt[:nct].unsqueeze(0),
+                    L.A,
+                    Bm,
+                    Cm,
+                    chunk,
+                    L.D,
+                    None,
+                    L.dt_bias,
+                    init,
+                    seq_idx,
+                    chunk_indices,
+                    chunk_offsets,
+                    qsl[: nc + 1],
+                    True,
+                    _DT_LIMIT,
+                    y[:nct].view(1, nct, heads, hd),
+                    False,
+                    True,
+                    torch.float32,
+                )
+                ssm_state[si_ctx] = final.to(ssm_state.dtype)
+
+                # Generation rows: one conv step and one recurrence step each.
+                if has_gen:
+                    # Activates the generation rows of xBC in place inside zxbcdt.
+                    xbc_gen = causal_conv1d_update(
+                        xbc[nct:], conv_state, L.conv_w, L.conv_b, True, None, si_gen, _PAD_SLOT_ID
+                    )
+                    ng = num_tokens - nct
+                    selective_state_update(
+                        ssm_state,
+                        xbc_gen[:, :din].reshape(ng, heads, hd),
+                        dt[nct:][:, :, None].expand(ng, heads, hd),
+                        L.A_hd,
+                        xbc_gen[:, din : din + gn].reshape(ng, groups, st),
+                        xbc_gen[:, din + gn :].reshape(ng, groups, st),
+                        D=L.D_hd,
+                        z=None,
+                        dt_bias=L.dt_bias_hd,
+                        dt_softplus=True,
+                        state_batch_indices=si_gen,
+                        pad_slot_id=_PAD_SLOT_ID,
+                        out=y[nct:],
+                    )
+
+                yn = rms_norm_gated_grouped(
+                    y.reshape(num_tokens, din), z, L.gnorm, eps, d.norm_group
+                )
+                yq = static_quantize_e4m3_per_tensor(yn, L.out_is)
+                out = cublas_scaled_mm(yq, L.out_w, L.out_is, L.out_ws, out_dtype=torch.bfloat16)
+            elif isinstance(L, _Attention):
+                qkv = cublas_mm(x, L.qkv)
+                attn_out = thop_attention(
+                    q=qkv,
+                    output=attn_out,
+                    local_layer_idx=bound.pool_row[i],
+                    num_heads=d.q_heads_r,
+                    num_kv_heads=1,
+                    head_size=d.head_dim,
+                    attention_window_size=window,
+                    **step,
+                    **_CALL_CONSTANTS,
+                )
+                out = cublas_mm(attn_out, L.o)
+            else:
+                # The shared expert reads only x: run it on the side stream while the
+                # routed experts run on the main one, joined before the sum.
+                side = core.side_stream
+                main = torch.cuda.current_stream()
+                side.wait_stream(main)
+                with torch.cuda.stream(side):
+                    sq = static_quantize_e4m3_per_tensor(x, L.sh_up_is)
+                    u = cublas_scaled_mm(
+                        sq, L.sh_up, L.sh_up_is, L.sh_up_ws, out_dtype=torch.bfloat16
+                    )
+                    a = torch.square(torch.relu(u))
+                    aq = static_quantize_e4m3_per_tensor(a, L.sh_down_is)
+                    shared = cublas_scaled_mm(
+                        aq, L.sh_down, L.sh_down_is, L.sh_down_ws, out_dtype=torch.bfloat16
+                    )
+                # Router: fp32 logits over the full hidden state (the bf16 router weight
+                # is the fp32 one exactly), selection on sigmoid + correction bias,
+                # weights from the unbiased sigmoid, renormalized and scaled.
+                logits = cublas_mm(x, L.gate, out_dtype=torch.float32)
+                topk_w, topk_ids = noaux_tc_op(logits, L.gate_bias, 1, 1, d.top_k, d.routed_scale)
+                # Routed experts in the latent space, this rank's EP window only.
+                xl = cublas_mm(x, L.fc1_lat)
+                xl_q, xl_sf = fp4_quantize(
+                    xl, L.x_global_scale, _weights.SF_BLOCK, False, _SF_LINEAR
+                )
+                routed = fp4_block_scale_moe_runner(
+                    routing_logits=None,
+                    routing_bias=None,
+                    hidden_states=xl_q,
+                    hidden_states_scale=xl_sf.view(torch.float8_e4m3fn),
+                    gemm1_weights=L.fc1_w,
+                    gemm1_weights_scale=L.fc1_s,
+                    gemm1_bias=None,
+                    gemm1_alpha=None,
+                    gemm1_beta=None,
+                    gemm1_clamp_limit=None,
+                    gemm2_weights=L.fc2_w,
+                    gemm2_weights_scale=L.fc2_s,
+                    gemm2_bias=None,
+                    output1_scale_scalar=L.out1_scale,
+                    output1_scale_gate_scalar=L.out1_gate_scale,
+                    output2_scale_scalar=L.out2_scale,
+                    num_experts=d.num_experts,
+                    top_k=d.top_k,
+                    n_group=1,
+                    topk_group=1,
+                    intermediate_size=d.moe_inter,
+                    local_expert_offset=d.expert_offset,
+                    local_num_experts=d.local_experts,
+                    routed_scaling_factor=d.routed_scale,
+                    routing_method_type=_ROUTING_DEEPSEEK_V3,
+                    do_finalize=True,
+                    act_type=ACT_TYPE_RELU2,
+                    topk_weights=topk_w.to(torch.bfloat16),
+                    topk_ids=topk_ids.to(torch.int32),
+                )[0]
+                out = cublas_mm(routed, L.fc2_lat)
+                main.wait_stream(side)
+                out = out + shared
+            out = allreduce(out, group, _ALLREDUCE_STRATEGY, core.ar_workspace)
+            x, residual = flashinfer_fused_add_rmsnorm(out, residual, norm_next, eps)
+        return x
+
+
+class DecodeTarget:
+    """The specialization: routed to only when there are no context rows."""
+
+    def __init__(self, core: NemotronUltraTep4ModelingV2) -> None:
+        """Take the views and constants this target's forward reads, once, off the real weights."""
+        self.core = core
+        self._contract_pending = step_contract_enabled()
+        cfg = core.model_config.pretrained_config
+        self._eps = cfg.layer_norm_epsilon
+        self._norm0 = core.w["l0_norm"]
+        self._layers = _layer_views(core)
+
+    def _check_step_contract(self, md) -> None:
+        """Opt-in first-forward fail-fast: the metadata fields this target consumes
+        must exist (they are private trtllm surface)."""
+        if not self._contract_pending:
+            return
+        try:
+            self.step_args(md)
+            md.mamba_metadata.state_indices  # noqa: B018 — read for the AttributeError
+        except AttributeError as exc:
+            raise AssertionError(f"attention metadata surface drifted: {exc}") from exc
+        self._contract_pending = False
+
+    def step_args(self, md: TrtllmAttentionMetadata) -> dict:
+        """Project the prepared metadata onto thop_attention's explicit batch state."""
+        return dict(
+            sequence_length=md.kv_lens_cuda_runtime,
+            host_past_key_value_lengths=md.kv_lens_runtime,
+            host_total_kv_lens=md.host_total_kv_lens,
+            context_lengths=md.prompt_lens_cuda_runtime,
+            host_context_lengths=md.prompt_lens_cpu_runtime,
+            host_request_types=md.host_request_types_runtime,
+            kv_cache_block_offsets=md.kv_cache_block_offsets,
+            host_kv_cache_pool_pointers=md.host_kv_cache_pool_pointers,
+            host_kv_cache_pool_mapping=md.host_kv_cache_pool_mapping,
+            workspace_=md.effective_workspace,
+            tokens_per_block=md.tokens_per_block,
+            max_num_requests=md.max_num_requests,
+            max_context_length=md.max_context_length,
+            max_seq_len=md.max_seq_len,
+            num_contexts=0,
+            num_ctx_tokens=0,
+            trtllm_gen_jit_warmup=md.trtllm_gen_jit_warmup,
+            use_paged_context_fmha=md.use_paged_context_fmha,
+            beam_width=md.effective_beam_width,
+            cache_indirection=md.cache_indirection,
+            block_ids_per_seq=md.block_ids_per_seq,
+            max_context_q_len_override=md.max_context_q_len_override,
+            is_cross=md.is_cross,
+            is_spec_decoding_enabled=md.is_spec_decoding_enabled,
+            use_spec_decoding=md.use_spec_decoding,
+            is_spec_dec_tree=md.is_spec_dec_tree,
+            spec_decoding_generation_lengths=md.spec_decoding_generation_lengths,
+            spec_decoding_position_offsets_for_cpp=md.spec_decoding_position_offsets_for_cpp,
+            spec_decoding_packed_mask=md.spec_decoding_packed_mask,
+            spec_decoding_bl_tree_mask_offset=md.spec_decoding_bl_tree_mask_offset,
+            spec_decoding_bl_tree_mask=md.spec_decoding_bl_tree_mask,
+            spec_decoding_target_max_draft_tokens=md.max_total_draft_tokens,
+            spec_bl_tree_first_sparse_mask_offset_kv=md.spec_bl_tree_first_sparse_mask_offset_kv,
+            num_sparse_topk=md.num_sparse_topk,
+            flash_mla_tile_scheduler_metadata=md.flash_mla_tile_scheduler_metadata,
+            flash_mla_num_splits=md.flash_mla_num_splits,
+            max_num_sequences=md.max_num_sequences,
+            force_prepare_spec_dec_tree_mask=md.force_prepare_spec_dec_tree_mask,
+        )
+
+    def forward(
+        self,
+        attn_metadata: AttentionMetadata,
+        input_ids: torch.IntTensor | None = None,
+        position_ids: torch.IntTensor | None = None,
+        inputs_embeds: torch.FloatTensor | None = None,
+        lora_params: dict | None = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        core = self.core
+        d = core.dims
+        md = attn_metadata
+        eps = self._eps
+        bound = core._bound
+        group = core.tp_group
+
+        self._check_step_contract(md)
+        step = self.step_args(md)
+        window = md.max_seq_len
+
+        # Every row is one generation token of its own sequence.
+        ns = md.num_seqs
+        si = md.mamba_metadata.state_indices[:ns]
+
+        if inputs_embeds is None:
+            h = nn.functional.embedding(input_ids, core.w["embed"])
+        else:
+            h = inputs_embeds
+        num_tokens = h.shape[0]
+        attn_out = torch.empty([num_tokens, d.q_width_r], dtype=h.dtype, device=h.device)
+
+        din, conv_c = d.d_inner_r, d.conv_r
+        heads, hd, gn = d.heads_r, d.head_dim_ssm, d.gn_r
+        groups, st = d.groups_r, d.ssm_state
+
+        x = flashinfer_rmsnorm(h, self._norm0, eps)
+        residual = h
+        for i, (L, norm_next) in enumerate(self._layers):
+            if isinstance(L, _Mamba):
+                conv_state = bound.conv[i]
+                ssm_state = bound.ssm[i]
+                xq = static_quantize_e4m3_per_tensor(x, L.in_is)
+                zxbcdt = cublas_scaled_mm(xq, L.in_w, L.in_is, L.in_ws, out_dtype=torch.bfloat16)
+                z = zxbcdt[:, :din]
+                xbc = zxbcdt[:, din : din + conv_c]
+                dt = zxbcdt[:, din + conv_c :]
+                # Activates xBC in place inside zxbcdt.
+                xbc = causal_conv1d_update(
+                    xbc, conv_state, L.conv_w, L.conv_b, True, None, si, _PAD_SLOT_ID
+                )
+                y = torch.empty([num_tokens, heads, hd], dtype=h.dtype, device=h.device)
+                selective_state_update(
+                    ssm_state,
+                    xbc[:, :din].reshape(num_tokens, heads, hd),
+                    dt[:, :, None].expand(num_tokens, heads, hd),
+                    L.A_hd,
+                    xbc[:, din : din + gn].reshape(num_tokens, groups, st),
+                    xbc[:, din + gn :].reshape(num_tokens, groups, st),
+                    D=L.D_hd,
+                    z=None,
+                    dt_bias=L.dt_bias_hd,
+                    dt_softplus=True,
+                    state_batch_indices=si,
+                    pad_slot_id=_PAD_SLOT_ID,
+                    out=y,
+                )
+                yn = rms_norm_gated_grouped(
+                    y.reshape(num_tokens, din), z, L.gnorm, eps, d.norm_group
+                )
+                yq = static_quantize_e4m3_per_tensor(yn, L.out_is)
+                out = cublas_scaled_mm(yq, L.out_w, L.out_is, L.out_ws, out_dtype=torch.bfloat16)
+            elif isinstance(L, _Attention):
+                qkv = cublas_mm(x, L.qkv)
+                attn_out = thop_attention(
+                    q=qkv,
+                    output=attn_out,
+                    local_layer_idx=bound.pool_row[i],
+                    num_heads=d.q_heads_r,
+                    num_kv_heads=1,
+                    head_size=d.head_dim,
+                    attention_window_size=window,
+                    **step,
+                    **_CALL_CONSTANTS,
+                )
+                out = cublas_mm(attn_out, L.o)
+            else:
+                # The shared expert reads only x: run it on the side stream while the
+                # routed experts run on the main one, joined before the sum.
+                side = core.side_stream
+                main = torch.cuda.current_stream()
+                side.wait_stream(main)
+                with torch.cuda.stream(side):
+                    sq = static_quantize_e4m3_per_tensor(x, L.sh_up_is)
+                    u = cublas_scaled_mm(
+                        sq, L.sh_up, L.sh_up_is, L.sh_up_ws, out_dtype=torch.bfloat16
+                    )
+                    a = torch.square(torch.relu(u))
+                    aq = static_quantize_e4m3_per_tensor(a, L.sh_down_is)
+                    shared = cublas_scaled_mm(
+                        aq, L.sh_down, L.sh_down_is, L.sh_down_ws, out_dtype=torch.bfloat16
+                    )
+                logits = cublas_mm(x, L.gate, out_dtype=torch.float32)
+                topk_w, topk_ids = noaux_tc_op(logits, L.gate_bias, 1, 1, d.top_k, d.routed_scale)
+                xl = cublas_mm(x, L.fc1_lat)
+                xl_q, xl_sf = fp4_quantize(
+                    xl, L.x_global_scale, _weights.SF_BLOCK, False, _SF_LINEAR
+                )
+                routed = fp4_block_scale_moe_runner(
+                    routing_logits=None,
+                    routing_bias=None,
+                    hidden_states=xl_q,
+                    hidden_states_scale=xl_sf.view(torch.float8_e4m3fn),
+                    gemm1_weights=L.fc1_w,
+                    gemm1_weights_scale=L.fc1_s,
+                    gemm1_bias=None,
+                    gemm1_alpha=None,
+                    gemm1_beta=None,
+                    gemm1_clamp_limit=None,
+                    gemm2_weights=L.fc2_w,
+                    gemm2_weights_scale=L.fc2_s,
+                    gemm2_bias=None,
+                    output1_scale_scalar=L.out1_scale,
+                    output1_scale_gate_scalar=L.out1_gate_scale,
+                    output2_scale_scalar=L.out2_scale,
+                    num_experts=d.num_experts,
+                    top_k=d.top_k,
+                    n_group=1,
+                    topk_group=1,
+                    intermediate_size=d.moe_inter,
+                    local_expert_offset=d.expert_offset,
+                    local_num_experts=d.local_experts,
+                    routed_scaling_factor=d.routed_scale,
+                    routing_method_type=_ROUTING_DEEPSEEK_V3,
+                    do_finalize=True,
+                    act_type=ACT_TYPE_RELU2,
+                    topk_weights=topk_w.to(torch.bfloat16),
+                    topk_ids=topk_ids.to(torch.int32),
+                )[0]
+                out = cublas_mm(routed, L.fc2_lat)
+                main.wait_stream(side)
+                out = out + shared
+            out = allreduce(out, group, _ALLREDUCE_STRATEGY, core.ar_workspace)
+            x, residual = flashinfer_fused_add_rmsnorm(out, residual, norm_next, eps)
+        return x
+
+
+class ModelingV2Nemotron3UltraNvfp4Sm107Tep4(
+    DecoderModelForCausalLM[NemotronUltraTep4ModelingV2, PretrainedConfig]
+):
+    def __init__(self, model_config: ModelConfig):
+        cap = torch.cuda.get_device_capability()
+        assert cap == _SM, (
+            f"this target is certified on sm_{_SM[0]}{_SM[1]} only; the device is "
+            f"sm_{cap[0]}{cap[1]}"
+        )
+        cfg = model_config.pretrained_config
+        super().__init__(
+            NemotronUltraTep4ModelingV2(model_config),
+            config=model_config,
+            hidden_size=cfg.hidden_size,
+            vocab_size=cfg.vocab_size,
+        )
+
+    def load_weights(self, weights, *args, **kwargs):
+        _weights.MODEL_WEIGHTS.load(self, weights)
+
+    def post_load_weights(self):
+        super().post_load_weights()
+        self.model.post_load_weights()

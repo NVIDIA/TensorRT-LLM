@@ -29,12 +29,12 @@ class FlashinferFusedAddRmsnorm(OpWrapper):
     form, no quantization.
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = frozenset({Arch.SM_103, Arch.SM_107})
 
-    # The two hidden sizes the shipped targets normalize over, at a decode
-    # shape and a prefill shape. Both targets call this op only on the
-    # residual stream, so there is no third width to cover and no 3-D case:
-    # unlike plain rmsnorm this one never runs on a per-head view.
+    # The hidden sizes the shipped targets normalize over, at decode and
+    # prefill shapes. Every target calls this op only on the residual stream,
+    # so there is no 3-D case: unlike plain rmsnorm this one never runs on a
+    # per-head view.
     CELLS: tuple[Cell, ...] = (
         Cell(
             why="decode-shaped, gpt-oss-120b hidden",
@@ -47,6 +47,18 @@ class FlashinferFusedAddRmsnorm(OpWrapper):
         Cell(
             why="prefill-shaped: enough rows to cross the kernel's grid tiling",
             spec=dict(shape=(2048, 7168), dtype=torch.bfloat16, eps=1e-6),
+        ),
+        Cell(
+            why="nemotron_h hidden 8192, decode-shaped (T=1), eps 1e-5: the widest row",
+            spec=dict(shape=(1, 8192), dtype=torch.bfloat16, eps=1e-5),
+        ),
+        Cell(
+            why="nemotron_h hidden 8192 at T=32, the decode CUDA-graph ceiling",
+            spec=dict(shape=(32, 8192), dtype=torch.bfloat16, eps=1e-5),
+        ),
+        Cell(
+            why="nemotron_h hidden 8192 at T=8192, a max_num_tokens prefill step",
+            spec=dict(shape=(8192, 8192), dtype=torch.bfloat16, eps=1e-5),
         ),
     )
 

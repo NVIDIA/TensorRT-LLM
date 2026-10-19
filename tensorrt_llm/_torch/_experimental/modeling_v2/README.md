@@ -233,6 +233,40 @@ boot and accuracy are blind to it and only the acceptance rate against a
 reference can see it. Draft lengths 1 and 2 remain ungated -- they are the
 dominated end of the measured draft-length axis.
 
+### sm_107 and the nemotron_h target
+
+`Arch.SM_107` is the second architecture. The two Nemotron-3 Ultra NVFP4
+targets (`models/nemotron_h/nemotron3_ultra_nvfp4__sm_107__{tep4,dep4}`) are
+built from entries driven on sm_107 at both targets' call sites:
+
+* shared, certified on sm_107 beside sm_103: `thop_attention`, `cublas_mm`,
+  `flashinfer_rmsnorm`, `flashinfer_fused_add_rmsnorm`, `fp4_quantize`,
+  `fp4_block_scale_moe_runner`, `allgather`, `reducescatter`, and the two
+  promoted from other targets -- `noaux_tc_op` (from deepseek) and
+  `causal_conv1d_fwd` / `causal_conv1d_update` (from qwen4_exp);
+* shared, sm_107 only (promoted from tep4 when dep4 arrived):
+  `static_quantize_e4m3_per_tensor`, `cublas_scaled_mm`,
+  `mamba_chunk_scan_combined`, `selective_state_update`, `rms_norm_gated_grouped`;
+* owned by tep4: `allreduce`.
+
+What the sm_107 cells surfaced, each written up in its entry:
+
+* **The relu2 FC1 epilogue takes its own scalar convention.** For act type
+  Relu2 the kernel computes `out1 * relu(out1_gate * acc)^2`: `out1_gate`
+  dequantizes FC1 and `out1` is FC2's input quantization alone. The SwiGlu
+  convention (`out1 = out1_gate / fc2_input_scale`) returns exactly zero on this
+  checkpoint's scales.
+* **A NemotronH hybrid pool puts attention in pool 1**, mamba state in pool 0 --
+  the reverse of qwen4_exp's -- so attention addresses rows by
+  `kv_cache_manager.layer_offsets`, never by counting attention layers.
+* **Static FP8 activation scales saturate** on the mamba `out_proj` input at the
+  first token of a chat-templated prompt; the quantize entry certifies the
+  saturating conversion.
+
+Both targets are gated by
+`tests/integration/defs/accuracy/modeling_v2/test_nemotron_h.py` (gsm8k, the
+protocol of `TestNemotronV3Ultra`, `modeling_v2="require"`).
+
 ### What replaced the version pin
 
 Out of tree each target hard-asserted a pinned `tensorrt_llm` version at

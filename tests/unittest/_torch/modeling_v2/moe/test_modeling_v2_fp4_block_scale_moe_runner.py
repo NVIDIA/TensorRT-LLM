@@ -8,6 +8,10 @@ import pytest
 import torch
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.fp4_block_scale_moe_runner import (  # noqa: E501
+    ACT_TYPE_RELU2,
+    ACT_TYPE_SWIGLU,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.fp4_block_scale_moe_runner import (  # noqa: E501
     fp4_block_scale_moe_runner as moe,
 )
 from tensorrt_llm._torch.autotuner import AutoTuner, autotune
@@ -93,6 +97,14 @@ def _compare(out: torch.Tensor, ref: torch.Tensor) -> None:
     any of them reaches is 39.8 at the deepseek geometries; at qwen4_exp's the
     same five land 223, 62, 265, 362 and 23 RMS ulp out, the last the closest
     any wrong variant comes.
+
+    Relu2 adds no second band. Its FC1 epilogue is likewise one requantization,
+    read out bit for bit at every token tile (8 through 256) by
+    `test_relu2_intermediate_is_nvfp4_requantized`, and Nemotron-3 Ultra's
+    geometry (512 experts, top-22, H 2048 / I 5120, 128-wide windows,
+    per-expert weight_scale_2) lands at 5.14 / 0.74 per window over its whole
+    column and 2.77 / 0.84 for the four windows summed. Its wrong variants sit
+    19 (no FC1-output requantization) to 9561 RMS ulp out.
     """
     assert out.dtype == ref.dtype == torch.bfloat16, (out.dtype, ref.dtype)
     assert out.shape == ref.shape, (out.shape, ref.shape)
@@ -364,6 +376,24 @@ def _call(data, sf, args, num_experts, top_k, scale_as_is=False, **kw):
 # ── reference ─────────────────────────────────────────────────────────────
 
 
+def _proj(x, operand, e: int) -> torch.Tensor:
+    """`x @ W_e^T` for expert `e` of a `(codes, scales[, weight_scale_2])`
+    operand; a per-expert `weight_scale_2` multiplies the fp32 product."""
+    y = x @ _dequant(operand[0][e], operand[1][e]).t()
+    return y * operand[2][e].float() if len(operand) > 2 else y
+
+
+def _fc1_act(xe, up, gate, e: int, act_type: int) -> torch.Tensor:
+    """Expert `e`'s true FC1 activation for rows `xe`, fp32, before any
+    requantization: `up * silu(gate)` for SwiGlu, `relu(up) ** 2` for Relu2."""
+    u = _proj(xe, up, e)
+    if act_type == ACT_TYPE_RELU2:
+        r = torch.relu(u)
+        return r * r
+    g = _proj(xe, gate, e)
+    return u * g * torch.sigmoid(g)
+
+
 def _ref_moe(
     x,
     ids,
@@ -382,28 +412,30 @@ def _ref_moe(
     `[offset, offset + num_local)`. `scales[t, j]` multiplies slot `j`'s expert
     output; nothing is renormalized. The FC1 activation is requantized to
     NVFP4 under global scale `g2` before FC2, which is what the kernel does.
+    `ref["act_type"]` (SwiGlu when absent) picks the activation; the two swaps
+    are SwiGlu's wrong variants.
     """
     num_tokens, hidden = x.shape
-    up_c, up_s = ref["up"]
-    gt_c, gt_s = ref["gate"]
-    dn_c, dn_s = ref["down"]
+    act_type = ref.get("act_type", ACT_TYPE_SWIGLU)
+    up, gate, down = ref["up"], ref["gate"], ref["down"]
     if swap_gate_up:
-        (up_c, up_s), (gt_c, gt_s) = (gt_c, gt_s), (up_c, up_s)
-    num_local = up_c.shape[0] if num_local is None else num_local
+        up, gate = gate, up
+    num_local = up[0].shape[0] if num_local is None else num_local
     out = torch.zeros(num_tokens, hidden, dtype=torch.float32, device=x.device)
     for local_e in range(num_local):
         tok, slot = (ids == offset + local_e).nonzero(as_tuple=True)
         if tok.numel() == 0:
             continue
         xe = x[tok]
-        up = xe @ _dequant(up_c[local_e], up_s[local_e]).t()
-        gate = xe @ _dequant(gt_c[local_e], gt_s[local_e]).t()
         if swap_scalars:
-            up, gate = up / g2, gate * g2
-        act = up * gate * torch.sigmoid(gate)
+            u = _proj(xe, up, local_e) / g2
+            g = _proj(xe, gate, local_e) * g2
+            act = u * g * torch.sigmoid(g)
+        else:
+            act = _fc1_act(xe, up, gate, local_e, act_type)
         # the FC1 epilogue emits g2 * act as NVFP4; FC2's alpha divides it back
         act = _q_nvfp4(act, g2) / g2 if quantize_intermediate else act
-        y = act @ _dequant(dn_c[local_e], dn_s[local_e]).t()
+        y = _proj(act, down, local_e)
         out.index_add_(0, tok, y * scales[tok, slot].float().unsqueeze(1))
     return out
 
@@ -411,17 +443,14 @@ def _ref_moe(
 def _calibrate_g2(x, ids, ref) -> float:
     """`448*6 / amax` of the true FC1 activation — the FC2 input global scale a
     checkpoint's `down_proj.input_scale` encodes."""
-    up_c, up_s = ref["up"]
-    gt_c, gt_s = ref["gate"]
+    act_type = ref.get("act_type", ACT_TYPE_SWIGLU)
     amax = 0.0
-    for e in range(up_c.shape[0]):
+    for e in range(ref["up"][0].shape[0]):
         tok = (ids == e).nonzero(as_tuple=True)[0].unique()
         if tok.numel() == 0:
             continue
-        xe = x[tok]
-        up = xe @ _dequant(up_c[e], up_s[e]).t()
-        gate = xe @ _dequant(gt_c[e], gt_s[e]).t()
-        amax = max(amax, (up * gate * torch.sigmoid(gate)).abs().max().item())
+        act = _fc1_act(x[tok], ref["up"], ref["gate"], e, act_type)
+        amax = max(amax, act.abs().max().item())
     return E4M3_MAX * E2M1_MAX / amax
 
 
@@ -568,12 +597,13 @@ def _many_experts():
 
 
 # The token column swept at that geometry. The pre-routed path picks its
-# permutation kernel by row count: `BlockKernelMaxNumTokens` takes 4 rows and
-# below, the dynamic-block kernel is out of reach here because
-# `DynBlockKernelMaxNumExperts` is 256, and `MaxNumTokensSingleCluster` carries
-# everything from 5 rows up to 8192 (all three in
-# `cpp/tensorrt_llm/kernels/moe/trtllmGen/routing/RoutingCustomPolicy.cuh`). So
-# the column brackets the 4/5 boundary as well as the decode and prefill ends.
+# permutation kernel by row count (`runPostTopKPipeline` in
+# `cpp/tensorrt_llm/kernels/moe/trtllmGen/routing/RoutingFromTopKIds.cu`): the
+# static-block kernel takes 4 rows and below, the dynamic-block one 5 to 12
+# rows at expert tiers up to 1024 -- 512 here -- and the single-cluster one
+# everything from 13 rows up to 8192. Measured by kernel name at this geometry.
+# So the column brackets the 4/5 boundary as well as the decode and prefill
+# ends.
 _MANY_TOKENS = (1, 2, 3, 4, 5, 8, 16, 64, 256, 1024, 4096, 8192)
 
 
@@ -588,6 +618,183 @@ def _renorm_routing(num_tokens, num_experts, top_k, gen):
     w, idx = torch.topk(torch.softmax(logits, dim=-1), top_k, dim=-1)
     w = w / w.sum(-1, keepdim=True)
     return idx.to(torch.int32).contiguous(), w.to(torch.bfloat16).contiguous()
+
+
+# ── Relu2 (element-wise, non-gated) layout and scalars ────────────────────
+#
+# Self-contained on purpose: a target copies these four into its own
+# weights.py (targets share nothing but the catalog), so they take the
+# checkpoint's tensors as stored and depend on nothing else in this file.
+# `test_relu2_layout_matches_the_engine_loader` pins the layout against
+# trtllm's own MoE weight preparation, `test_relu2_intermediate_is_nvfp4_
+# requantized` pins the scalars' roles bit for bit, and the Relu2 cells and
+# `test_ultra_relu2_geometry` drive both end to end.
+
+
+def blk32_row_perm(rows: int, device=None) -> torch.Tensor:
+    """Gather index of trtllm-gen's 32-row block shuffle (epilogue tile M 128).
+
+    Within each block of 32 rows, source row `4u + v` lands at destination row
+    `8v + u`: `shuffled = w.index_select(-2, blk32_row_perm(w.shape[-2]))`.
+    """
+    assert rows % 32 == 0, f"{rows} rows is not a whole number of 32-row blocks"
+    j = torch.arange(32, device=device)
+    src = torch.empty_like(j)
+    src[(j % 4) * 8 + j // 4] = j
+    block_base = torch.arange(rows // 32, device=device).repeat_interleave(32) * 32
+    return src.repeat(rows // 32) + block_base
+
+
+def swizzle_128x4(sf: torch.Tensor) -> torch.Tensor:
+    """trtllm-gen's 128x4 block-scale swizzle per expert, viewed back as `[E, M, C]`.
+
+    Byte `(e, m, c)` lands at flat offset `e*M*C + (m // 128)*512*(C // 4) +
+    (c // 4)*512 + (m % 32)*16 + ((m % 128) // 32)*4 + c % 4`, which is what
+    `torch.ops.trtllm.block_scale_interleave` writes when `M % 128 == 0` and
+    `C % 4 == 0` -- the case where it pads nothing.
+    """
+    e, m, c = sf.shape
+    assert m % 128 == 0 and c % 4 == 0, f"[{m}, {c}] block scales would need padding"
+    v = sf.reshape(e, m // 128, 4, 32, c // 4, 4).permute(0, 1, 4, 3, 2, 5)
+    return v.reshape(e, m, c).contiguous()
+
+
+def nvfp4_moe_single_layout(packed: torch.Tensor, block_scales: torch.Tensor):
+    """An NVFP4 expert stack the kernel reads as one matrix, in kernel form.
+
+    That is Relu2's FC1 (`up_proj` stacked to `[E, I, H/2]` -- element-wise,
+    so there is no gate half to interleave) and every FC2 (`down_proj`,
+    `[E, H, I/2]`). Takes the checkpoint's tensors stacked over the window's
+    experts: `packed` uint8 `[E, M, K/2]` (element 2i in the low nibble) and
+    `block_scales` float8_e4m3fn `[E, M, K/16]`, linear. Returns `(uint8
+    [E, M, K/2], float8_e4m3fn [E, M, K/16])`: rows block-shuffled in both,
+    the scales then 128x4-swizzled. Requires `M % 128 == 0` and `K % 64 == 0`.
+    """
+    perm = blk32_row_perm(packed.shape[1], packed.device)
+    weights = packed.index_select(1, perm).contiguous()
+    scales = block_scales.view(torch.uint8).index_select(1, perm)
+    return weights, swizzle_128x4(scales).view(torch.float8_e4m3fn)
+
+
+def relu2_moe_scalars(up_input_scale, up_weight_scale_2, down_input_scale, down_weight_scale_2):
+    """The op's scalars for a Relu2 layer, from a ModelOpt NVFP4 checkpoint.
+
+    `*_input_scale` are the layer's shared activation scales (0-d or `[1]`,
+    `amax / (6 * 448)`), `*_weight_scale_2` the experts' fp32 `[E]` global
+    weight scales. Returns fp32 `(activation global scale [1] for
+    fp4_quantize, output1_scale_scalar [E], output1_scale_gate_scalar [E],
+    output2_scale_scalar [E])`; a rank slices the three `[E]` vectors to its
+    window. The FC1 epilogue applies `output1_scale_gate_scalar` before the
+    relu2 and `output1_scale_scalar` after it, so for Relu2 the latter is the
+    FC2-input quantization scale alone -- unlike SwiGlu's, which also carries
+    the dequantization.
+    """
+    up_is = up_input_scale.float().reshape(())
+    down_is = down_input_scale.float().reshape(())
+    num_experts = up_weight_scale_2.numel()
+    act_global_scale = (1.0 / up_is).reshape(1)
+    output1_scale_scalar = (1.0 / down_is).expand(num_experts).contiguous()
+    output1_scale_gate_scalar = (up_is * up_weight_scale_2.float().reshape(-1)).contiguous()
+    output2_scale_scalar = (down_is * down_weight_scale_2.float().reshape(-1)).contiguous()
+    return act_global_scale, output1_scale_scalar, output1_scale_gate_scalar, output2_scale_scalar
+
+
+def _rand_weight_scale_2(num_experts: int, gen: torch.Generator) -> torch.Tensor:
+    """Per-expert fp32 global weight scales, log-uniform over a factor of 4 and
+    never a power of two, so a scalar applied to the wrong expert shows."""
+    return torch.exp2(torch.rand(num_experts, device=DEV, generator=gen) * 2.0 - 1.0) / 64.0
+
+
+def _build_relu2(num_experts: int, hidden: int, inter: int, seed: int):
+    """One Relu2 MoE layer: kernel-ready tensors plus the reference operands.
+
+    FC1 is the up projection alone (`[E, I, H/2]`), every expert has its own
+    `weight_scale_2` on both projections, and the layout comes from the
+    self-contained helpers above -- the ones a target copies.
+    """
+    gen = torch.Generator(device=DEV).manual_seed(seed)
+    up_p, up_s, up_c = _rand_nvfp4(num_experts, inter, hidden, gen)
+    dn_p, dn_s, dn_c = _rand_nvfp4(num_experts, hidden, inter, gen)
+    up_ws2 = _rand_weight_scale_2(num_experts, gen)
+    dn_ws2 = _rand_weight_scale_2(num_experts, gen)
+    w1, s1 = nvfp4_moe_single_layout(up_p, up_s)
+    w2, s2 = nvfp4_moe_single_layout(dn_p, dn_s)
+    args = dict(
+        gemm1_weights=w1,
+        gemm1_weights_scale=s1,
+        gemm2_weights=w2,
+        gemm2_weights_scale=s2,
+        intermediate_size=inter,
+    )
+    ref = dict(
+        up=(up_c, up_s, up_ws2),
+        gate=None,
+        down=(dn_c, dn_s, dn_ws2),
+        raw=(up_p, up_s, dn_p, dn_s),
+        hidden=hidden,
+        inter=inter,
+        num_experts=num_experts,
+        gen=gen,
+        act_type=ACT_TYPE_RELU2,
+    )
+    return args, ref
+
+
+# Nemotron-3 Ultra's routed experts in latent space, built once and shared:
+# 512 experts, H = 2048, I = 5120, Relu2. The kernel-ready stack is ~6 GiB (FC1
+# [512, 5120, 1024] + [512, 5120, 128], FC2 [512, 2048, 2560] + [512, 2048,
+# 320]) and the reference operands and raw packed copies take it to ~23 GiB.
+_ULTRA = None
+
+
+def _ultra():
+    global _ULTRA
+    if _ULTRA is None:
+        _ULTRA = _build_relu2(512, 2048, 5120, seed=5122048)
+    return _ULTRA
+
+
+# The routing arguments the tep4 target passes with its pre-routed call. Inert
+# on a cold cache; under `autotune()` DeepSeekV3's dummy routing needs all
+# three as numbers.
+_ULTRA_ROUTING_ARGS = dict(
+    routing_method_type=2, n_group=1, topk_group=1, routed_scaling_factor=5.0
+)
+
+# The token column swept at that geometry, per 128-wide window: the static-block
+# permutation kernel's last count (4), the dynamic-block kernel's span (5-12),
+# the single-cluster kernel from 13 up, decode (1-32) through the 8192-row
+# prefill ceiling; cold-cache FC1 token tiles 8 (to 32 rows), 16, 64 and 256.
+_ULTRA_TOKENS = (1, 2, 4, 5, 8, 12, 13, 32, 64, 128, 300, 1024, 4096, 8192)
+
+
+def _sigmoid_x5_routing(num_tokens, num_experts, top_k, gen):
+    """Pre-routed ids/weights in the form Nemotron-3 Ultra's router emits.
+
+    Sigmoid scores; selection on scores plus a large, nearly flat correction
+    bias (selection only, as the router's is); the selected *unbiased* scores
+    renormalized to sum to 1 and scaled by 5. Distinct ids per row.
+    """
+    scores = torch.sigmoid(
+        torch.randn(num_tokens, num_experts, device=DEV, dtype=torch.float32, generator=gen)
+    )
+    bias = 25.25 + 0.125 * torch.rand(num_experts, device=DEV, generator=gen)
+    idx = torch.topk(scores + bias, top_k, dim=-1).indices
+    w = torch.gather(scores, 1, idx)
+    w = w / w.sum(-1, keepdim=True) * 5.0
+    return idx.to(torch.int32).contiguous(), w.to(torch.bfloat16).contiguous()
+
+
+def _ultra_scalars(ref, g1: float, g2: float):
+    """The three per-expert vectors for the whole 512-expert stack, from the
+    checkpoint-form quantities a target holds: input scales `1/g1`, `1/g2`
+    shared by the layer, per-expert `weight_scale_2`. Returns `(s1, sg, s2,
+    g2_used)` where `g2_used` is the fp32 FC2-input scale the kernel is handed
+    -- the value a reference has to requantize with to match it."""
+    up_is = torch.tensor(1.0 / g1, dtype=torch.float32, device=DEV)
+    down_is = torch.tensor(1.0 / g2, dtype=torch.float32, device=DEV)
+    _, s1, sg, s2 = relu2_moe_scalars(up_is, ref["up"][2], down_is, ref["down"][2])
+    return s1, sg, s2, s1[0].item()
 
 
 # ── tests ─────────────────────────────────────────────────────────────────
@@ -1001,7 +1208,8 @@ def _window_ref(ref, off: int, num_local: int):
     """The reference operands of one expert-parallel window."""
     sub = dict(ref)
     for k in ("up", "gate", "down"):
-        sub[k] = (ref[k][0][off : off + num_local], ref[k][1][off : off + num_local])
+        if ref[k] is not None:
+            sub[k] = tuple(t[off : off + num_local] for t in ref[k])
     return sub
 
 
@@ -1780,6 +1988,556 @@ def test_narrow_intermediate_is_nvfp4_requantized():
     )
 
 
+def test_relu2_layout_matches_the_engine_loader():
+    """The self-contained Relu2 layout helpers are trtllm's own MoE weight prep.
+
+    Pinned at Nemotron-3 Ultra's shapes -- FC1 `[5120, 1024]` bytes with
+    `[5120, 128]` scales, FC2 `[2048, 2560]` with `[2048, 320]` -- against
+    the row permutations trtllm's fused-MoE loader builds for a non-gated FC1
+    and for FC2 (`trtllmgen_maybe_get_cached_*_permute_indices`, epilogue tile
+    128), applied by `shuffle_matrix`, and against `block_scale_interleave` for
+    the scales. Bitwise. The loader's gated FC1 permutation (the `[up; gate]`
+    interleave) is a different one at the same shape, so a helper that applied
+    it would fail here.
+    """
+    from tensorrt_llm._torch.moe.fused_moe.quantization import (
+        trtllmgen_maybe_get_cached_w2_permute_indices,
+        trtllmgen_maybe_get_cached_w3_w1_permute_indices,
+    )
+
+    gen = torch.Generator(device=DEV).manual_seed(2025)
+    num_experts = 3
+    for rows, packed_cols, which in ((5120, 1024, "fc1"), (2048, 2560, "fc2")):
+        packed = torch.randint(
+            0, 256, (num_experts, rows, packed_cols), dtype=torch.uint8, device=DEV, generator=gen
+        )
+        sf = torch.randint(
+            0, 256, (num_experts, rows, packed_cols * 2 // SV), dtype=torch.uint8, device=DEV,
+            generator=gen,
+        )  # fmt: skip
+        weights, scales = nvfp4_moe_single_layout(packed, sf.view(torch.float8_e4m3fn))
+        assert weights.shape == packed.shape and scales.shape == sf.shape
+        for e in range(num_experts):
+            if which == "fc1":
+                perm_w = trtllmgen_maybe_get_cached_w3_w1_permute_indices(
+                    packed[e], {}, 128, is_gated_act_gemm=False
+                )
+                perm_s = trtllmgen_maybe_get_cached_w3_w1_permute_indices(
+                    sf[e], {}, 128, num_elts_per_sf=SV, is_gated_act_gemm=False
+                )
+                gated = trtllmgen_maybe_get_cached_w3_w1_permute_indices(
+                    packed[e], {}, 128, is_gated_act_gemm=True
+                )
+                assert not torch.equal(gated.to(DEV), perm_w.to(DEV)), (
+                    "the gated permutation no longer differs from the non-gated one"
+                )
+            else:
+                perm_w = trtllmgen_maybe_get_cached_w2_permute_indices(packed[e], {}, 128)
+                perm_s = trtllmgen_maybe_get_cached_w2_permute_indices(
+                    sf[e], {}, 128, num_elts_per_sf=SV
+                )
+            ref_w = torch.ops.trtllm.shuffle_matrix(packed[e].contiguous(), perm_w.to(DEV))
+            ref_s = torch.ops.trtllm.block_scale_interleave(
+                torch.ops.trtllm.shuffle_matrix(sf[e].contiguous(), perm_s.to(DEV))
+            )
+            assert torch.equal(weights[e], ref_w), f"{which} rows differ from the loader's"
+            assert ref_s.numel() == sf[e].numel(), f"{which} scales were padded"
+            assert torch.equal(scales[e].view(torch.uint8).reshape(-1), ref_s.reshape(-1)), (
+                f"{which} scales differ from the loader's shuffle + 128x4 swizzle"
+            )
+    print("  test_relu2_layout_matches_the_engine_loader OK")
+
+
+def test_relu2_intermediate_is_nvfp4_requantized():
+    """Read the Relu2 FC1 epilogue straight out of the kernel, at every token tile.
+
+    The SwiGlu tests' device -- a down projection that is the identity on the
+    intermediate's columns, a unit FC2 scalar, one slot per row -- at
+    Nemotron-3 Ultra's latent width H = 2048 (I = 2048 so the identity fits;
+    the FC1 kernel is picked by H and the token tile, not by I), with
+    per-expert `weight_scale_2` and the scalars from `relu2_moe_scalars`. A
+    16-wide window at offset 384 of 512 experts makes the cold-cache token
+    tile walk 8, 16, 32, 64, 128 and 256 within 4096 rows, and each tile is a
+    different kernel, so each is pinned.
+
+    Exact on every element against
+        C = output1_scale_scalar * relu(output1_scale_gate_scalar * acc) ** 2
+    quantized once: `sf = e4m3(amax16(C) / 6)` saturating at 448, `e2m1(C /
+    sf)`. `acc` is the FC1 accumulator, computed exactly here (dyadic operands
+    whose sums fit fp32's mantissa, so every accumulation order gives it), and
+    the products are the fp32 products the kernel forms. A reference that
+    instead dequantizes the activation first (`x / g1`, as `reference` does)
+    is off in the last fp32 bit, which moves an e2m1 rounding or a block scale
+    on a few elements in a million -- counted here, and absorbed by the
+    entry's band rather than unexplained by it.
+
+    Also driven: an FC2-input scale 8x too large for the data, so block scales
+    saturate at 448 and codes at 6 -- what a static checkpoint scale does when
+    an activation outruns its calibration -- still exact; and the two scalar
+    mistakes a Relu2 caller can make, the SwiGlu convention
+    (`output1_scale_scalar * output1_scale_gate_scalar`) and the two
+    swapped, each matching almost none of the nonzero elements.
+    """
+    num_experts, hidden, inter, nloc, off = 512, 2048, 2048, 16, 384
+    gen = torch.Generator(device=DEV).manual_seed(20482048)
+    up_p, up_s, up_c = _rand_nvfp4(nloc, inter, hidden, gen)
+    up_ws2 = _rand_weight_scale_2(nloc, gen)
+    w1, sw1 = nvfp4_moe_single_layout(up_p, up_s)
+    sel = torch.zeros(nloc, hidden, inter, dtype=torch.uint8, device=DEV)
+    d = torch.arange(inter, device=DEV)
+    sel[:, d, d] = 2  # e2m1 code 2 == +1.0
+    dn_p = (sel[..., 0::2] | (sel[..., 1::2] << 4)).contiguous()
+    dn_s = torch.ones(nloc, hidden, inter // SV, device=DEV).to(torch.float8_e4m3fn)
+    w2, sw2 = nvfp4_moe_single_layout(dn_p, dn_s)
+    del sel, dn_p, up_p
+    weights = dict(
+        gemm1_weights=w1,
+        gemm1_weights_scale=sw1,
+        gemm2_weights=w2,
+        gemm2_weights_scale=sw2,
+        intermediate_size=inter,
+    )
+    up_dq = [_dequant(up_c[e], up_s[e]) for e in range(nloc)]  # exact: dyadic values
+    g1 = 137.0
+    up_is = torch.tensor(1.0 / g1, dtype=torch.float32, device=DEV)
+    unit = torch.ones(nloc, dtype=torch.float32, device=DEV)
+
+    plain_flips = 0
+    compared = 0
+    saturated = 0
+    for num_tokens in (16, 128, 256, 512, 1024, 2048, 4096):
+        data, sf, x = _rand_activation(num_tokens, hidden, g1, gen)
+        xs = _unpack_activation(data, sf, hidden, 1.0)  # codes * block scales, exact
+        ids = (
+            torch.randint(0, nloc, (num_tokens, 1), dtype=torch.int32, device=DEV, generator=gen)
+            + off
+        )
+        wts = torch.ones(num_tokens, 1, dtype=torch.bfloat16, device=DEV)
+        # output1_scale_gate_scalar does not depend on the down scale
+        sg = relu2_moe_scalars(up_is, up_ws2, torch.ones((), device=DEV), unit)[2]
+        act = torch.zeros(num_tokens, inter, dtype=torch.float32, device=DEV)
+        plain = torch.zeros_like(act)
+        for e in (ids[:, 0] - off).unique().tolist():
+            tok = (ids[:, 0] == off + e).nonzero(as_tuple=True)[0]
+            acc = (xs[tok].double() @ up_dq[e].double().t()).float()
+            r = torch.relu(acc * sg[e])
+            act[tok] = r * r
+            rp = torch.relu((x[tok] @ up_dq[e].t()) * up_ws2[e])
+            plain[tok] = rp * rp
+        g2 = E4M3_MAX * E2M1_MAX / act.max().item()
+        for over in (1.0, 8.0):
+            down_is = torch.tensor(1.0 / (g2 * over), dtype=torch.float32, device=DEV)
+            _, s1, sg_, _ = relu2_moe_scalars(up_is, up_ws2, down_is, unit)
+            assert torch.equal(sg_, sg)
+            y = _call(
+                data,
+                sf,
+                weights,
+                num_experts,
+                1,
+                act_type=ACT_TYPE_RELU2,
+                local_expert_offset=off,
+                local_num_experts=nloc,
+                topk_ids=ids,
+                topk_weights=wts,
+                output1_scale_scalar=s1,
+                output1_scale_gate_scalar=sg,
+                output2_scale_scalar=unit,
+            )[0].float()
+            g = s1[0].item()
+            exact = _q_nvfp4(act, g)
+            assert torch.equal(y, exact), (
+                f"T={num_tokens}, FC2-input scale x{over:g}: the Relu2 FC1 epilogue is not "
+                f"o1 * relu(o1g * acc)**2 quantized once: {(y != exact).sum().item()} of "
+                f"{y.numel()} elements differ"
+            )
+            plain_flips += (y != _q_nvfp4(plain, g)).sum().item()
+            compared += y.numel()
+            if over > 1.0:
+                saturated += (exact.abs() == E2M1_MAX * E4M3_MAX).sum().item()
+        if num_tokens == 1024:
+            keep = (data, sf, ids, wts, s1, sg, exact)
+    assert saturated > 0, "the x8 scale saturated nothing, so saturation was not driven"
+    assert plain_flips <= 1e-5 * compared, (
+        f"the dequantize-first reference differs on {plain_flips} of {compared} elements -- "
+        "more than last-bit rounding can explain"
+    )
+
+    # The scalar mistakes, against the 1024-row result with the x8 scale.
+    data, sf, ids, wts, s1, sg, exact = keep
+    nonzero = exact != 0
+    fracs = {}
+    for name, o1, o1g in (
+        ("SwiGlu-convention output1_scale_scalar", (s1 * sg).contiguous(), sg),
+        ("output1 scalars swapped", sg, s1),
+    ):
+        bad = _call(
+            data,
+            sf,
+            weights,
+            num_experts,
+            1,
+            act_type=ACT_TYPE_RELU2,
+            local_expert_offset=off,
+            local_num_experts=nloc,
+            topk_ids=ids,
+            topk_weights=wts,
+            output1_scale_scalar=o1,
+            output1_scale_gate_scalar=o1g,
+            output2_scale_scalar=unit,
+        )[0].float()
+        fracs[name] = (bad[nonzero] == exact[nonzero]).float().mean().item()
+        assert fracs[name] < 0.1, f"{name} still matches {fracs[name]:.1%} of the nonzero elements"
+    print(
+        f"  test_relu2_intermediate_is_nvfp4_requantized OK (bit-exact on all {compared} "
+        f"elements over tiles 8-256, {saturated} saturated; dequantize-first reference "
+        f"flips {plain_flips}; nonzero matches: "
+        + ", ".join(f"{n} {v:.1%}" for n, v in fracs.items())
+        + ")"
+    )
+
+
+def test_ultra_relu2_geometry():
+    """E=512, H=2048, I=5120, top-22, Relu2: Nemotron-3 Ultra's latent experts.
+
+    As its tep4 target runs them: every rank routes the same tokens over all
+    512 experts and runs its own 128-wide window, and the four windows' bf16
+    outputs sum (the all-reduce). Over the whole token column
+    `_ULTRA_TOKENS`, each window is gated against the reference over its own
+    experts, rows routed entirely outside a window must come back bitwise
+    zero, and the four-window sum is gated against the 512-expert reference.
+    Scalars come from `relu2_moe_scalars` -- input scales shared by the
+    layer, `weight_scale_2` per expert -- the routing from
+    `_sigmoid_x5_routing`, and the routing arguments are the target's.
+
+    Then, at 300 rows in the last window, the wrong computations a target
+    could ship, each required to land more than 10 rms ulp from the correct
+    result against the 2-ulp gate: the SwiGlu `output1_scale_scalar`
+    convention, the two output1 scalars swapped, one layer-wide alpha for
+    every expert, a reference without the FC1-output requantization, scales
+    left unswizzled, rows left unshuffled, SwiGlu's `[up; gate]` interleave
+    applied to the up rows, and the window offset left at 0.
+    """
+    args, ref = _ultra()
+    num_experts, hidden, inter, top_k, shard = 512, 2048, 5120, 22, 128
+    windows = [(r * shard, shard) for r in range(4)]
+    win_args = [_window_args(args, off, n) for off, n in windows]
+    win_ref = [_window_ref(ref, off, n) for off, n in windows]
+    gen = torch.Generator(device=DEV).manual_seed(22512)
+    g1 = 137.0
+    worst_win = (0.0, 0.0)
+    worst_sum = (0.0, 0.0)
+    worst_drop = 1e9
+
+    for num_tokens in _ULTRA_TOKENS:
+        data, sf, x = _rand_activation(num_tokens, hidden, g1, gen)
+        ids, wts = _sigmoid_x5_routing(num_tokens, num_experts, top_k, gen)
+        s1, sg, s2, g2 = _ultra_scalars(ref, g1, _calibrate_g2(x, ids, ref))
+        parts = []
+        for (off, n), wa, wr in zip(windows, win_args, win_ref):
+            y = _call(
+                data,
+                sf,
+                wa,
+                num_experts,
+                top_k,
+                act_type=ACT_TYPE_RELU2,
+                local_expert_offset=off,
+                local_num_experts=n,
+                topk_ids=ids,
+                topk_weights=wts,
+                **_window_scalars(s1, sg, s2, off, n),
+                **_ULTRA_ROUTING_ARGS,
+            )[0]
+            assert y.shape == (num_tokens, hidden) and y.dtype == torch.bfloat16, y.shape
+            exp = _ref_moe(x, ids, wts, wr, g2, offset=off, num_local=n).to(torch.bfloat16)
+            _assert_moe_close(y, exp)
+            outside = ~((ids >= off) & (ids < off + n)).any(dim=1)
+            assert torch.equal(y[outside], torch.zeros_like(y[outside])), (
+                f"window (off={off}) wrote into rows routed entirely elsewhere at T={num_tokens}"
+            )
+            worst_win = tuple(max(a, b) for a, b in zip(worst_win, _dev(y, exp)))
+            parts.append(y)
+        exp_full = _ref_moe(x, ids, wts, ref, g2).to(torch.bfloat16)
+        summed = sum(p.float() for p in parts).to(torch.bfloat16)
+        _assert_moe_close(summed, exp_full)
+        worst_sum = tuple(max(a, b) for a, b in zip(worst_sum, _dev(summed, exp_full)))
+        if num_tokens >= 256:
+            for drop in range(4):
+                partial = sum(p.float() for i, p in enumerate(parts) if i != drop)
+                _, rms = _dev(partial.to(torch.bfloat16), exp_full)
+                assert rms > 25.0, f"dropping window {drop} at T={num_tokens} is only {rms:.1f}"
+                worst_drop = min(worst_drop, rms)
+
+    # The wrong computations, at 300 rows in the last window.
+    off, n = windows[3]
+    data, sf, x = _rand_activation(300, hidden, g1, gen)
+    ids, wts = _sigmoid_x5_routing(300, num_experts, top_k, gen)
+    s1, sg, s2, g2 = _ultra_scalars(ref, g1, _calibrate_g2(x, ids, ref))
+    good_scalars = _window_scalars(s1, sg, s2, off, n)
+    kw = dict(
+        act_type=ACT_TYPE_RELU2,
+        local_num_experts=n,
+        topk_ids=ids,
+        topk_weights=wts,
+        **_ULTRA_ROUTING_ARGS,
+    )
+    good_ref = _ref_moe(x, ids, wts, win_ref[3], g2, offset=off, num_local=n).to(torch.bfloat16)
+    good = _call(
+        data, sf, win_args[3], num_experts, top_k, local_expert_offset=off, **good_scalars, **kw
+    )[0]
+    _assert_moe_close(good, good_ref)
+
+    # The routing arguments do not reach a pre-routed result at (512, top-22)
+    # either: the other methods a caller might pass, and the target's own with
+    # its group and scaling arguments absent, are all bitwise the target's.
+    for routing in (
+        dict(routing_method_type=0),
+        dict(routing_method_type=1),
+        dict(routing_method_type=4),
+        dict(routing_method_type=6),
+        dict(routing_method_type=2, n_group=None, topk_group=None, routed_scaling_factor=None),
+    ):
+        alt = _call(
+            data,
+            sf,
+            win_args[3],
+            num_experts,
+            top_k,
+            local_expert_offset=off,
+            **good_scalars,
+            **{**kw, **routing},
+        )[0]
+        assert torch.equal(alt, good), f"{routing} changed the pre-routed result at 512 / top-22"
+
+    o1 = good_scalars["output1_scale_scalar"]
+    o1g = good_scalars["output1_scale_gate_scalar"]
+    o2 = good_scalars["output2_scale_scalar"]
+    up_p, up_s, dn_p, dn_s = (t[off : off + n] for t in ref["raw"])
+    interleave = _fc1_perm(inter)
+    bad_layouts = {
+        "scales left unswizzled": (
+            _prep_fc2(up_p, up_s, swizzle=False),
+            _prep_fc2(dn_p, dn_s, swizzle=False),
+        ),
+        "rows left unshuffled": (
+            _prep_fc2(up_p, up_s, shuffle=False),
+            _prep_fc2(dn_p, dn_s, shuffle=False),
+        ),
+        "SwiGlu's [up; gate] interleave on the up rows": (
+            (
+                torch.index_select(up_p, 1, interleave).contiguous(),
+                _swizzle_scales(torch.index_select(up_s, 1, interleave).view(torch.uint8))
+                .view(torch.float8_e4m3fn)
+                .contiguous(),
+            ),
+            (win_args[3]["gemm2_weights"], win_args[3]["gemm2_weights_scale"]),
+        ),
+    }
+    scalar_mistakes = {
+        "SwiGlu-convention output1_scale_scalar": (
+            dict(good_scalars, output1_scale_scalar=(o1 * o1g).contiguous())
+        ),
+        "output1 scalars swapped": (
+            dict(good_scalars, output1_scale_scalar=o1g, output1_scale_gate_scalar=o1)
+        ),
+        "one layer-wide alpha for every expert": (
+            dict(
+                good_scalars,
+                output1_scale_gate_scalar=o1g.mean().expand(n).contiguous(),
+                output2_scale_scalar=o2.mean().expand(n).contiguous(),
+            )
+        ),
+    }
+    dist = {}
+    for name, scalars in scalar_mistakes.items():
+        bad = _call(
+            data, sf, win_args[3], num_experts, top_k, local_expert_offset=off, **scalars, **kw
+        )[0]
+        dist[name] = _dev(bad, good_ref)
+    for name, ((bw1, bs1), (bw2, bs2)) in bad_layouts.items():
+        bad_args = dict(
+            gemm1_weights=bw1,
+            gemm1_weights_scale=bs1,
+            gemm2_weights=bw2,
+            gemm2_weights_scale=bs2,
+            intermediate_size=inter,
+        )
+        bad = _call(
+            data, sf, bad_args, num_experts, top_k, local_expert_offset=off, **good_scalars, **kw
+        )[0]
+        dist[name] = _dev(bad, good_ref)
+    no_requant = _ref_moe(
+        x, ids, wts, win_ref[3], g2, offset=off, num_local=n, quantize_intermediate=False
+    )
+    dist["no FC1-output requantization"] = _dev(good, no_requant.to(torch.bfloat16))
+    at_zero = _call(
+        data, sf, win_args[3], num_experts, top_k, local_expert_offset=0, **good_scalars, **kw
+    )[0]
+    dist["window offset left at 0"] = _dev(at_zero, good_ref)
+    for name, (elt, rms) in dist.items():
+        assert rms > 10.0, f"{name} is only {rms:.1f} rms ulp from the correct result"
+    print(
+        f"  test_ultra_relu2_geometry OK (window {worst_win[0]:.2f} elt / {worst_win[1]:.2f} "
+        f"rms, four-window sum {worst_sum[0]:.2f} elt / {worst_sum[1]:.2f} rms, one window "
+        f"dropped >= {worst_drop:.0f} rms ulp; wrong variants "
+        + ", ".join(f"{k} {v[1]:.0f}" for k, v in dist.items())
+        + " rms ulp)"
+    )
+
+
+def test_relu2_act_type_must_match_fc1_rows():
+    """Gated or not is read off FC1's row count; the kernel is picked by act_type.
+
+    The op accepts either row count with either activation. Relu2 handed a
+    SwiGlu stack (`[E, 2I, H/2]`) walks it at I-row strides and returns
+    plausible rows from the wrong weights -- driven raw here, and far from
+    the Relu2 layer the caller meant. SwiGlu handed a Relu2 stack would read
+    2I rows per expert from an I-row stack, past its end, so that direction is
+    only shown refused by the guard, before the kernel.
+    """
+    num_experts, hidden, inter, top_k, num_tokens = 8, 256, 128, 2, 16
+    gated_args, gated_ref = _build(num_experts, hidden, inter, seed=1212)
+    relu2_args, relu2_ref = _build_relu2(num_experts, hidden, inter, seed=1313)
+    gen = relu2_ref["gen"]
+    g1 = 137.0
+    data, sf, x = _rand_activation(num_tokens, hidden, g1, gen)
+    ids, wts = _routing(num_tokens, num_experts, top_k, gen)
+
+    meant = dict(gated_ref, gate=None, act_type=ACT_TYPE_RELU2)  # relu2 over the up halves
+    g2 = _calibrate_g2(x, ids, meant)
+    s1 = torch.full((num_experts,), g2, dtype=torch.float32, device=DEV)
+    sg = torch.full((num_experts,), 1.0 / g1, dtype=torch.float32, device=DEV)
+    s2 = torch.full((num_experts,), 1.0 / g2, dtype=torch.float32, device=DEV)
+    raw = torch.ops.trtllm.fp4_block_scale_moe_runner(
+        None,
+        None,
+        data,
+        sf.view(torch.float8_e4m3fn),
+        gated_args["gemm1_weights"],
+        gated_args["gemm1_weights_scale"],
+        None,
+        None,
+        None,
+        None,
+        gated_args["gemm2_weights"],
+        gated_args["gemm2_weights_scale"],
+        None,
+        s1,
+        sg,
+        s2,
+        num_experts,
+        top_k,
+        None,
+        None,
+        inter,
+        0,
+        num_experts,
+        None,
+        1,
+        True,
+        ACT_TYPE_RELU2,
+        topk_weights=wts,
+        topk_ids=ids,
+    )[0]
+    assert torch.isfinite(raw.float()).all() and raw.abs().max() > 0
+    elt, rms = _dev(raw, _ref_moe(x, ids, wts, meant, g2).to(torch.bfloat16))
+    assert rms > 25.0, f"Relu2 over a SwiGlu stack is only {rms:.1f} rms ulp off -- re-check"
+
+    scalars = dict(output1_scale_scalar=s1, output1_scale_gate_scalar=sg, output2_scale_scalar=s2)
+    with pytest.raises(AssertionError, match=f"act_type 1 needs FC1 with {inter} rows"):
+        _call(data, sf, gated_args, num_experts, top_k, act_type=ACT_TYPE_RELU2,
+              topk_ids=ids, topk_weights=wts, **scalars)  # fmt: skip
+    with pytest.raises(AssertionError, match=f"act_type 0 needs FC1 with {2 * inter} rows"):
+        _call(data, sf, relu2_args, num_experts, top_k, act_type=ACT_TYPE_SWIGLU,
+              topk_ids=ids, topk_weights=wts, **scalars)  # fmt: skip
+    print(
+        f"  test_relu2_act_type_must_match_fc1_rows OK (Relu2 over a SwiGlu stack: {rms:.0f} rms ulp)"
+    )
+
+
+def test_ultra_window_replays_under_a_cuda_graph():
+    """The Relu2 window call captures into a CUDA graph and replays exactly.
+
+    A tep4 decode step runs as a captured graph. Captured here at the decode
+    ceiling (32 rows) in the last window with the target's routing arguments,
+    then replayed three times with fresh activations and fresh routing copied
+    into the captured input buffers; each replay must be bitwise the eager
+    call on the same buffers. One static FC2-input scale serves every step,
+    as a served layer's does. The cache is cold; a warm one is bitwise inert
+    (`test_ultra_autotuner_cache_is_inert`).
+    """
+    args, ref = _ultra()
+    num_experts, hidden, top_k, off, n, num_tokens = 512, 2048, 22, 384, 128, 32
+    wa = _window_args(args, off, n)
+    gen = torch.Generator(device=DEV).manual_seed(3232)
+    g1 = 137.0
+
+    def draw():
+        data, sf, x = _rand_activation(num_tokens, hidden, g1, gen)
+        ids, wts = _sigmoid_x5_routing(num_tokens, num_experts, top_k, gen)
+        return [data, sf.view(torch.float8_e4m3fn), ids, wts], x
+
+    bufs, x = draw()
+    s1, sg, s2, _ = _ultra_scalars(ref, g1, _calibrate_g2(x, bufs[2], ref))
+    scalars = _window_scalars(s1, sg, s2, off, n)
+
+    def step():
+        data, sf, ids, wts = bufs
+        return moe(
+            None,
+            None,
+            data,
+            sf,
+            wa["gemm1_weights"],
+            wa["gemm1_weights_scale"],
+            None,
+            None,
+            None,
+            None,
+            wa["gemm2_weights"],
+            wa["gemm2_weights_scale"],
+            None,
+            scalars["output1_scale_scalar"],
+            scalars["output1_scale_gate_scalar"],
+            scalars["output2_scale_scalar"],
+            num_experts,
+            top_k,
+            _ULTRA_ROUTING_ARGS["n_group"],
+            _ULTRA_ROUTING_ARGS["topk_group"],
+            wa["intermediate_size"],
+            off,
+            n,
+            _ULTRA_ROUTING_ARGS["routed_scaling_factor"],
+            _ULTRA_ROUTING_ARGS["routing_method_type"],
+            True,
+            ACT_TYPE_RELU2,
+            topk_weights=wts,
+            topk_ids=ids,
+        )[0]
+
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        step()
+    torch.cuda.current_stream().wait_stream(side)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = step()
+    for replay in range(3):
+        fresh, _ = draw()
+        for buf, new in zip(bufs, fresh):
+            buf.copy_(new)
+        graph.replay()
+        eager = step()
+        torch.cuda.synchronize()
+        assert torch.equal(captured, eager), (
+            f"replay {replay} differs from the eager call on the same inputs: "
+            f"{_dev(captured, eager.float())} (elt / rms ulp)"
+        )
+    print("  test_ultra_window_replays_under_a_cuda_graph OK (3 replays bitwise eager)")
+
+
 @pytest.fixture
 def clear_autotuner_cache():
     """Leave the profiling cache cold even when the test fails part-way, so a
@@ -1975,6 +2733,104 @@ def test_many_experts_autotuner_cache_is_inert(clear_autotuner_cache):
         f"  test_many_experts_autotuner_cache_is_inert OK ({len(keys)} tuned "
         f"entries over unique_ids {unique_ids}, {len(tactics)} distinct tactics; "
         f"all {len(token_counts)} token counts bitwise unchanged)"
+    )
+
+
+def test_ultra_autotuner_cache_is_inert(clear_autotuner_cache):
+    """A warm autotuner cache leaves the Relu2 windows' results unchanged, and
+    warming it needs the routing arguments as numbers.
+
+    The tep4 target's engine profiles this op during warm-up, so the Relu2
+    windows run warm in service while every other call here runs cold. Same
+    shape as the R1 test: cold results first, then warm through trtllm's own
+    `autotune()` at the target's call (`_ULTRA_ROUTING_ARGS`, 8192 rows) for
+    the first and last window, then **bitwise** equality over the token column.
+
+    Before warming, the one place the pre-routed call reads its routing
+    arguments: under `autotune()` the op builds DeepSeekV3's dummy routing
+    (`routing_method_type` 2) in Python, and `None` for `n_group` /
+    `topk_group` or for `routed_scaling_factor` raises `TypeError` there --
+    while the same call on a cold cache is fine.
+    """
+    args, ref = _ultra()
+    num_experts, hidden, top_k = 512, 2048, 22
+    windows = ((0, 128), (384, 128))
+    win_args = {off: _window_args(args, off, n) for off, n in windows}
+    gen = torch.Generator(device=DEV).manual_seed(2222)
+    g1 = 137.0
+    token_counts = (1, 8, 32, 300, 1024, 8192)
+    cases = {}
+    for num_tokens in token_counts:
+        data, sf, x = _rand_activation(num_tokens, hidden, g1, gen)
+        ids, wts = _sigmoid_x5_routing(num_tokens, num_experts, top_k, gen)
+        cases[num_tokens] = (
+            data,
+            sf,
+            ids,
+            wts,
+            _ultra_scalars(ref, g1, _calibrate_g2(x, ids, ref)),
+        )
+
+    def run(off, n, num_tokens, **over):
+        data, sf, ids, wts, (s1, sg, s2, _) = cases[num_tokens]
+        return _call(
+            data,
+            sf,
+            win_args[off],
+            num_experts,
+            top_k,
+            act_type=ACT_TYPE_RELU2,
+            local_expert_offset=off,
+            local_num_experts=n,
+            topk_ids=ids,
+            topk_weights=wts,
+            **_window_scalars(s1, sg, s2, off, n),
+            **{**_ULTRA_ROUTING_ARGS, **over},
+        )[0]
+
+    tuner = AutoTuner.get()
+    op = "trtllm::fp4_block_scale_moe_runner"
+
+    def entries():
+        return [k for k in tuner.profiling_cache.cache if k[0] == op]
+
+    assert not entries(), (
+        "the profiling cache already holds entries for this op — the cold-cache "
+        "receipt every other test in this file records would be void"
+    )
+    cold = {(off, t): run(off, n, t) for off, n in windows for t in token_counts}
+    nones = (dict(n_group=None, topk_group=None), dict(routed_scaling_factor=None))
+    for over in nones:
+        assert torch.equal(run(0, 128, 32, **over), cold[(0, 32)]), f"{over} changed a cold call"
+    assert not entries(), "an ordinary call wrote a profiling-cache entry"
+
+    for over in nones:
+        with pytest.raises(TypeError, match="NoneType"):
+            with autotune():
+                run(0, 128, token_counts[-1], **over)
+    tuner.clear_cache()
+    with autotune():
+        for off, n in windows:
+            run(off, n, token_counts[-1])
+    keys = entries()
+    assert keys, "autotune() recorded nothing for this op — nothing was warmed"
+    tactics = {str(tuner.profiling_cache.cache[k][1]) for k in keys}
+    assert "-1" not in tactics, (
+        f"the tuner recorded the fallback tactic, so warm and cold are the same "
+        f"execution and this comparison proves nothing: {sorted(tactics)}"
+    )
+    unique_ids = sorted({str(k[2]) for k in keys})
+    for off, n in windows:
+        for num_tokens in token_counts:
+            warm = run(off, n, num_tokens)
+            assert torch.equal(warm, cold[(off, num_tokens)]), (
+                f"a warm autotuner cache changed the result at local_expert_offset={off}, "
+                f"T={num_tokens}: {_dev(warm, cold[(off, num_tokens)].float())} (elt / rms ulp)"
+            )
+    print(
+        f"  test_ultra_autotuner_cache_is_inert OK ({len(keys)} tuned entries over unique_ids "
+        f"{unique_ids}, {len(tactics)} distinct tactics; all "
+        f"{len(windows) * len(token_counts)} (window, T) results bitwise unchanged)"
     )
 
 
@@ -2294,8 +3150,15 @@ def test_strided_inputs_are_silently_wrong():
     print("  test_strided_inputs_are_silently_wrong OK")
 
 
-# The shared layer each cell's (num_experts, hidden, intermediate) names.
-_GEOMETRIES = {(256, 7168, 2048): _dsr1, (512, 2560, 640): _many_experts}
+# The shared layer each cell's (num_experts, hidden, intermediate, act_type) names.
+_GEOMETRIES = {
+    (256, 7168, 2048, ACT_TYPE_SWIGLU): _dsr1,
+    (512, 2560, 640, ACT_TYPE_SWIGLU): _many_experts,
+    (512, 2048, 5120, ACT_TYPE_RELU2): _ultra,
+}
+
+# How each cell's `routing` names its pre-routed ids and weights.
+_ROUTINGS = {None: _routing, "renormalized": _renorm_routing, "sigmoid_x5": _sigmoid_x5_routing}
 
 
 @pytest.mark.parametrize("cell", moe.CELLS, ids=[c.why[:44] for c in moe.CELLS])
@@ -2310,20 +3173,31 @@ def test_certified_cells(cell, certifying):  # noqa: F811
     before either is used to gate the kernel. Two references disagreeing is a
     different failure from the kernel moving, and collapsing them into one
     assert loses which happened.
+
+    A Relu2 cell is driven the way its target calls the op: scalars from the
+    checkpoint-form quantities through `relu2_moe_scalars` (per-expert
+    `weight_scale_2`, layer-shared input scales) and the target's routing
+    arguments, `_ULTRA_ROUTING_ARGS`.
     """
     certifying(moe)
     spec = cell.spec
-    args, ref = _GEOMETRIES[(spec["num_experts"], spec["hidden"], spec["intermediate"])]()
+    act_type = spec.get("act_type", ACT_TYPE_SWIGLU)
+    key = (spec["num_experts"], spec["hidden"], spec["intermediate"], act_type)
+    args, ref = _GEOMETRIES[key]()
     off, n = spec["local_expert_offset"], spec["local_num_experts"]
     num_experts, hidden, top_k = spec["num_experts"], spec["hidden"], spec["top_k"]
     gen = torch.Generator(device=DEV).manual_seed(zlib.crc32(cell.why.encode()) % 2**31)
     g1 = 137.0
 
     data, sf, x = _rand_activation(spec["tokens"], hidden, g1, gen)
-    routing = _renorm_routing if spec.get("routing") == "renormalized" else _routing
-    ids, wts = routing(spec["tokens"], num_experts, top_k, gen)
+    ids, wts = _ROUTINGS[spec.get("routing")](spec["tokens"], num_experts, top_k, gen)
     g2 = _calibrate_g2(x, ids, ref)
-    s1, sg, s2 = _scalars(num_experts, g1, g2)
+    if act_type == ACT_TYPE_RELU2:
+        s1, sg, s2, g2 = _ultra_scalars(ref, g1, g2)
+        routing_args = _ULTRA_ROUTING_ARGS
+    else:
+        s1, sg, s2 = _scalars(num_experts, g1, g2)
+        routing_args = {}
 
     win_args = args if n == num_experts else _window_args(args, off, n)
     win_ref = ref if n == num_experts else _window_ref(ref, off, n)
@@ -2339,6 +3213,7 @@ def test_certified_cells(cell, certifying):  # noqa: F811
         g2,
         local_expert_offset=off,
         local_num_experts=n,
+        act_type=act_type,
     )
     local_ref = _ref_moe(x, ids, wts, win_ref, g2, offset=off, num_local=n)
     torch.testing.assert_close(entry_ref, local_ref, rtol=0.0, atol=0.0)
@@ -2350,11 +3225,13 @@ def test_certified_cells(cell, certifying):  # noqa: F811
         win_args,
         num_experts,
         top_k,
+        act_type=act_type,
         local_expert_offset=off,
         local_num_experts=n,
         topk_ids=ids,
         topk_weights=wts,
         **_window_scalars(s1, sg, s2, off, n),
+        **routing_args,
     )[0]
     assert y.shape == (spec["tokens"], hidden), y.shape
     _compare(y, entry_ref.to(torch.bfloat16))

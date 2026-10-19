@@ -21,10 +21,10 @@ class Allgather(OpWrapper):
     freshly allocated tensor on every rank; `input` is left untouched.
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = frozenset({Arch.SM_103, Arch.SM_107})
 
-    # deepseek-r1 at dep4 is the only caller and always passes `sizes=None`:
-    # it pads every rank to a common height first, so the ragged form the op
+    # deepseek-r1 and nemotron_h at dep4 are the callers and always pass
+    # `sizes=None`: they pad every rank to a common height first, so the ragged form the op
     # also supports is not something a shipped target reaches. Row counts span
     # what an attention-DP rank feeds its expert-parallel MoE call, from one
     # decode token to a full prefill chunk.
@@ -40,6 +40,19 @@ class Allgather(OpWrapper):
         Cell(
             why="prefill chunk height",
             spec=dict(rows=2048, trailing=(7168,), dtype=torch.bfloat16, sizes=None),
+        ),
+        # nemotron_h's Ultra at dep4 gathers the normed hidden state, padded to
+        # the largest rank's token count, before its expert-parallel MoE.
+        *(
+            Cell(
+                why=f"nemotron_h dep4 MoE input, T_pad={rows}: hidden 8192{tail}",
+                spec=dict(rows=rows, trailing=(8192,), dtype=torch.bfloat16, sizes=None),
+            )
+            for rows, tail in (
+                (1, ", one decode token per rank"),
+                (32, ", the decode CUDA-graph ceiling"),
+                (8192, ", a max_num_tokens prefill step"),
+            )
         ),
     )
 

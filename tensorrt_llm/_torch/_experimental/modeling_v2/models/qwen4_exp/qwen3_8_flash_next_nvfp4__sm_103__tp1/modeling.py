@@ -73,6 +73,12 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.fp4_block_scale_m
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.quantization.fp4_quantize import (
     fp4_quantize,
 )
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.ssm.causal_conv1d_fwd import (
+    causal_conv1d_fwd,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.ssm.causal_conv1d_update import (
+    causal_conv1d_update,
+)
 from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.model_config import ModelConfig
@@ -105,9 +111,7 @@ from .ops.ple.gated_ngram_injection import gated_ngram_injection
 from .ops.ple.ngram_token_history import ngram_token_history
 from .ops.quantization.dequantize_e4m3_per_tensor import dequantize_e4m3_per_tensor
 from .ops.quantization.fp8_quantize_1x128 import fp8_quantize_1x128
-from .ops.ssm.causal_conv1d_fwd import causal_conv1d_fwd
 from .ops.ssm.causal_conv1d_triton_update import causal_conv1d_triton_update
-from .ops.ssm.causal_conv1d_update import causal_conv1d_update
 from .ops.ssm.chunk_gated_delta_rule import chunk_gated_delta_rule
 from .ops.ssm.cu_seqlens_from_seq_lens import cu_seqlens_from_seq_lens
 from .ops.ssm.dilated_short_conv_paged import dilated_short_conv_paged

@@ -11,19 +11,73 @@ import torch
 import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtllm.*
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 
-#: This checkpoint's GDN `[q|k|v]` width; the conv is width 4 over a 3-column pool.
-CKPT_DIM = 10240
-#: Largest conv-pool slot count the cache manager was seen to allocate for this
-#: checkpoint (10 .. 461 over twelve runtime-value dumps, batch never above 32).
+#: qwen4_exp's GDN `[q|k|v]` width; the conv is width 4 over a 3-column pool.
+QWEN4_EXP_DIM = 10240
+#: Largest conv-pool slot count the cache manager was seen to allocate for
+#: qwen4_exp (10 .. 461 over twelve runtime-value dumps, batch never above 32).
 #: The decode step hands the whole pool over unsliced.
-ENGINE_SLOTS = 461
+QWEN4_EXP_SLOTS = 461
+
+#: Nemotron-3 Ultra's Mamba2 mixer at tep4, per rank: xBC = x 4096 | B 256 |
+#: C 256 channels, width 4, with bias ...
+ULTRA_TP4_DIM = 4608
+#: ... read in place from the rank's in_proj output row z 4096 | xBC 4608 |
+#: dt 64: a column slice with row stride 8768.
+ULTRA_TP4_PROJ_WIDTH = 8768
+ULTRA_TP4_XBC_OFFSET = 4096
+#: MambaHybridCacheManagerV2's conv pool at that geometry (max_batch_size 32),
+#: measured: 35 slots, each holding all 48 Mamba layers' `[4608, 3]` windows
+#: back to back -- one layer's view is `[35, 4608, 3]`, strides
+#: `(48 * 4608 * 3, 3, 1)`.
+ULTRA_TP4_SLOTS = 35
+ULTRA_TP4_POOL_LAYERS = 48
+
+#: At dep4 (attention DP) every rank runs the whole mixer: xBC = x 16384 |
+#: B 1024 | C 1024 channels of the in_proj row z 16384 | xBC 18432 | dt 256
+#: (row stride 35072). The cache manager uses tp=1 for Mamba there; measured:
+#: the same 35 slots x 48 layers, one layer's view `[35, 18432, 3]`, strides
+#: `(48 * 18432 * 3, 3, 1)`.
+ULTRA_DEP4_DIM = 18432
+ULTRA_DEP4_PROJ_WIDTH = 35072
+ULTRA_DEP4_XBC_OFFSET = 16384
 
 
 def _pinned(batch: int) -> tuple[int, ...]:
-    """`batch` distinct slots of the engine pool, slot 0 and the last pinned in."""
+    """`batch` distinct slots of qwen4_exp's engine pool, slot 0 and the last pinned in."""
     if batch == 1:
         return (0,)
-    return (0,) + tuple(i * 14 + 3 for i in range(1, batch - 1)) + (ENGINE_SLOTS - 1,)
+    return (0,) + tuple(i * 14 + 3 for i in range(1, batch - 1)) + (QWEN4_EXP_SLOTS - 1,)
+
+
+def _ultra_pinned(batch: int) -> tuple[int, ...]:
+    """`batch` distinct, scattered slots of the 35-slot Ultra pool, 0 and the last pinned in."""
+    if batch == 1:
+        return (0,)
+    middle = tuple(1 + (i * 7) % (ULTRA_TP4_SLOTS - 2) for i in range(1, batch - 1))
+    slots = (0,) + middle + (ULTRA_TP4_SLOTS - 1,)
+    assert len(set(slots)) == batch
+    return slots
+
+
+#: The Mamba2 decode call site: the decode rows' xBC columns of the projection,
+#: written in place, bias on, one layer's view of the engine pool.
+_ULTRA = dict(
+    dim=ULTRA_TP4_DIM,
+    bias=True,
+    x_form="proj",
+    proj_width=ULTRA_TP4_PROJ_WIDTH,
+    proj_offset=ULTRA_TP4_XBC_OFFSET,
+    pool_slots=ULTRA_TP4_SLOTS,
+    pool_layers=ULTRA_TP4_POOL_LAYERS,
+    pool_layer=17,
+)
+#: The same call at dep4 geometry.
+_ULTRA_DEP4 = dict(
+    _ULTRA,
+    dim=ULTRA_DEP4_DIM,
+    proj_width=ULTRA_DEP4_PROJ_WIDTH,
+    proj_offset=ULTRA_DEP4_XBC_OFFSET,
+)
 
 
 class CausalConv1dUpdate(OpWrapper):
@@ -39,28 +93,34 @@ class CausalConv1dUpdate(OpWrapper):
     the first new token's absolute position, and nothing shifts.
 
     Fusion boundary: window read, convolution, bias, SiLU and state write are
-    inside. The projection producing `x`, slot allocation and the q/k/v split
-    are the caller's.
+    inside. The projection producing `x`, slot allocation and the q/k/v or
+    x/B/C split are the caller's.
 
     Returns `x` -- the same object, written in place. A 2-D `[batch, dim]` `x`
     is handed to the op as an `unsqueeze(-1)` view (metadata only; the op
     writes through it). `conv_state` is advanced in place and not returned.
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = frozenset({Arch.SM_103, Arch.SM_107})
 
     # spec keys: dim, width (4), state_len (3), seqlen (1), batch, pool_slots,
-    # slots ("random" | tuple | None), dtype, bias, silu, cache_seqlens,
-    # pad_slot_id, x_form ("3d" | "2d" | "2d_row_slice" | "token_major"),
-    # strided_state.
+    # pool_layers/pool_layer (the pool is layer `pool_layer`'s view of a
+    # `[slots, pool_layers, dim, state_len]` buffer), slots ("random" | tuple |
+    # None), dtype, bias, silu, cache_seqlens, pad_slot_id, x_form ("3d" |
+    # "2d" | "2d_row_slice" | "token_major" | "proj": 2-D x the columns
+    # [proj_offset, proj_offset + dim) of rows [rows_ahead, rows_ahead + batch)
+    # of a token-major `[rows_ahead + batch, proj_width]` buffer),
+    # strided_state, padding_rows (the last rows name one shared slot, as a
+    # CUDA-graph-padded batch does; their outputs and that slot are left out
+    # of the comparison).
     CELLS: tuple[Cell, ...] = (
         tuple(
             Cell(
-                why=f"decode batch {batch}, call-site 2-D x, 461-slot pool",
+                why=f"qwen4_exp GDN decode batch {batch}: 2-D x, 461-slot pool",
                 spec=dict(
-                    dim=CKPT_DIM,
+                    dim=QWEN4_EXP_DIM,
                     batch=batch,
-                    pool_slots=ENGINE_SLOTS,
+                    pool_slots=QWEN4_EXP_SLOTS,
                     slots=_pinned(batch),
                     x_form="2d",
                 ),
@@ -69,11 +129,11 @@ class CausalConv1dUpdate(OpWrapper):
         )
         + (
             Cell(
-                why="mixed batch: 2-D x is the decode-row slice of the projection",
+                why="qwen4_exp mixed batch: 2-D x the decode-row slice of the projection",
                 spec=dict(
-                    dim=CKPT_DIM,
+                    dim=QWEN4_EXP_DIM,
                     batch=8,
-                    pool_slots=ENGINE_SLOTS,
+                    pool_slots=QWEN4_EXP_SLOTS,
                     slots=_pinned(8),
                     x_form="2d_row_slice",
                 ),
@@ -81,26 +141,77 @@ class CausalConv1dUpdate(OpWrapper):
         )
         + tuple(
             Cell(
+                why=f"Mamba2 tep4 decode batch {batch}: xBC slice of the projection, engine pool",
+                spec=dict(_ULTRA, batch=batch, slots=_ultra_pinned(batch)),
+            )
+            for batch in (1, 2, 8, 17, 32)
+        )
+        + (
+            Cell(
+                why="Mamba2 tep4 mixed batch: decode rows below 37 prefill rows",
+                spec=dict(_ULTRA, batch=8, rows_ahead=37, slots=_ultra_pinned(8)),
+            ),
+            Cell(
+                why="Mamba2 tep4 graph-padded batch: 3 padding rows share one dummy slot",
+                spec=dict(
+                    _ULTRA,
+                    batch=8,
+                    slots=(0, 9, 23, 5, 16) + (ULTRA_TP4_SLOTS - 1,) * 3,
+                    padding_rows=3,
+                ),
+            ),
+        )
+        + tuple(
+            Cell(
+                why=f"Mamba2 dep4 decode batch {batch}: xBC slice of the projection, engine pool",
+                spec=dict(_ULTRA_DEP4, batch=batch, slots=_ultra_pinned(batch)),
+            )
+            for batch in (1, 7, 32)
+        )
+        + (
+            Cell(
+                why="Mamba2 dep4 mixed batch: decode rows below 37 prefill rows",
+                spec=dict(_ULTRA_DEP4, batch=8, rows_ahead=37, slots=_ultra_pinned(8)),
+            ),
+            Cell(
+                why="Mamba2 dep4 graph-padded batch: 3 padding rows share one dummy slot",
+                spec=dict(
+                    _ULTRA_DEP4,
+                    batch=8,
+                    slots=(0, 9, 23, 5, 16) + (ULTRA_TP4_SLOTS - 1,) * 3,
+                    padding_rows=3,
+                ),
+            ),
+        )
+        + tuple(
+            Cell(
                 why=f"decode batch {batch}, [batch, dim, 1] x, 128-slot pool",
-                spec=dict(dim=CKPT_DIM, batch=batch, pool_slots=128, slots="random"),
+                spec=dict(dim=QWEN4_EXP_DIM, batch=batch, pool_slots=128, slots="random"),
             )
             for batch in (1, 2, 17, 64)
         )
         + (
             Cell(
                 why="pad_slot_id -1 rows: x rows and the pool untouched",
-                spec=dict(dim=CKPT_DIM, batch=6, pool_slots=128, slots=(3, -1, 7, 11, -1, 2)),
+                spec=dict(dim=QWEN4_EXP_DIM, batch=6, pool_slots=128, slots=(3, -1, 7, 11, -1, 2)),
             ),
             Cell(
                 why="pad_slot_id 9: the sentinel is compared by value",
-                spec=dict(dim=CKPT_DIM, batch=4, pool_slots=128, slots=(5, 9, 0, 9), pad_slot_id=9),
+                spec=dict(
+                    dim=QWEN4_EXP_DIM, batch=4, pool_slots=128, slots=(5, 9, 0, 9), pad_slot_id=9
+                ),
             ),
         )
         + tuple(
             Cell(
                 why=f"bias={bias}, silu={silu} (general kernel unless silu)",
                 spec=dict(
-                    dim=CKPT_DIM, batch=4, pool_slots=128, slots="random", bias=bias, silu=silu
+                    dim=QWEN4_EXP_DIM,
+                    batch=4,
+                    pool_slots=128,
+                    slots="random",
+                    bias=bias,
+                    silu=silu,
                 ),
             )
             for bias in (False, True)
@@ -179,13 +290,25 @@ class CausalConv1dUpdate(OpWrapper):
     note = """
     Metadata consumed: none.
 
-    Call site: the GDN decode step -- 2-D `[num_decodes, 10240]` x (the decode
+    Call sites. Both run the dedicated seqlen-1 kernel: silu, no ring,
+    `state_len == W - 1`; every other cell runs the general one.
+    qwen4_exp, the GDN decode step: 2-D `[num_decodes, 10240]` x (the decode
     rows of the projection), the layer's whole conv pool `[slots, 10240, 3]`,
-    W 4, no bias, SiLU on, `cache_seqlens` None, int32 slots, `pad_slot_id` -1.
-    That exact shape (silu, no ring, `state_len == W - 1`) runs a dedicated
-    seqlen-1 kernel; every other cell runs the general one. Certified at 128
-    and 461 pool slots; at 461 the result is bitwise identical to 128 for the
-    same slot content.
+    W 4, no bias, SiLU on, `cache_seqlens` None, int32 slots, `pad_slot_id`
+    -1. Certified at 128 and 461 pool slots; at 461 the result is bitwise
+    identical to 128 for the same slot content.
+    nemotron_h Ultra tep4, the Mamba2 decode step: 2-D
+    `x = proj[T_ctx:, 4096:8704]` -- the decode rows' xBC columns of the
+    rank's in_proj output (row stride 8768), activated in place, so x/B/C are
+    read back as column views of the same buffer -- W 4 with bias, SiLU on,
+    `conv_state` the layer's engine view `[35, 4608, 3]` with slot stride
+    48 * 4608 * 3, `conv_state_indices` the decode rows' slice of the step's
+    Mamba2 state indices, `pad_slot_id` -1. The `Mamba2 tep4` cells are that
+    call; the projection's z and dt columns, the rows above the decode rows and
+    the other 47 layers' windows are gated bitwise unchanged.
+    nemotron_h Ultra dep4, the same call unsharded: `x = proj[T_ctx:,
+    16384:34816]` (row stride 35072), `conv_state` the layer's view
+    `[35, 18432, 3]`, slot stride 48 * 18432 * 3 -- the `Mamba2 dep4` cells.
 
     Everything metadata the op checks itself, loudly: width 2..4, `state_len
     >= W - 1`, one dtype across x/conv_state/weight (bias matches weight),
@@ -194,7 +317,12 @@ class CausalConv1dUpdate(OpWrapper):
 
     Not guarded because it is content, not metadata: two rows naming one slot
     race -- the slot ended up matching neither row's expected state in 10 of
-    10 runs while both outputs matched. Slot uniqueness is the caller's.
+    10 runs while both outputs matched. Slot uniqueness is the caller's, with
+    one exception the engine makes on purpose: a CUDA-graph-padded decode
+    batch repeats a single dummy request, so all its padding rows name that
+    request's slot. The slot's content and those rows' outputs are then
+    whatever the race left -- both discarded -- while the real rows and every
+    other slot are exact; the graph-padded cell gates exactly that.
     Out-of-range slot values are an illegal access, not probed.
 
     A row whose index equals `pad_slot_id` is skipped: its x rows and the pool
@@ -202,7 +330,8 @@ class CausalConv1dUpdate(OpWrapper):
     sentinel, including one that collides with a live slot.
 
     Hard limits
-      none probed.
+      slot * slot stride  uint32 offset  boundary 2^32 elements; the Ultra
+        pool view reaches 2.3e7.
     """
 
     def __call__(

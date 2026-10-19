@@ -1,12 +1,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """NVFP4-weight / NVFP4-activation mixture-of-experts layer: caller-supplied
-top-k + grouped FC1 GEMM + gated activation + NVFP4 requantization + grouped
-FC2 GEMM + routing-weighted combine, in one trtllm-gen call."""
+top-k + grouped FC1 GEMM + gated (SwiGlu) or element-wise (Relu2) activation +
+NVFP4 requantization + grouped FC2 GEMM + routing-weighted combine, in one
+trtllm-gen call."""
 
 from __future__ import annotations
 
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Union
 
 import torch
 
@@ -21,8 +22,17 @@ SF_VEC_SIZE = 16
 E2M1_MAX = 6.0
 E4M3_MAX = 448.0
 
-#: `act_type` for SwiGlu, the only activation this entry certifies.
+#: `act_type` for SwiGlu: FC1 is the `[up; gate]` pair, 2 * I rows.
 ACT_TYPE_SWIGLU = 0
+
+#: `act_type` for Relu2, `relu(x) ** 2`: element-wise, so FC1 is the up
+#: projection alone, I rows.
+ACT_TYPE_RELU2 = 1
+
+#: The trtllm-gen activations whose FC1 is a gated pair: SwiGlu (0) and SiTu
+#: (3). Relu2 (1) and Silu (2) are element-wise. SiTu and Silu are not
+#: certified here; they are listed so the FC1 row-count guard is right for them.
+_GATED_ACT_TYPES = frozenset({0, 3})
 
 #: The widest unchunked call a stock engine issues: trtllm's default
 #: `max_num_tokens`. A caller whose own token count exceeds it must chunk.
@@ -49,8 +59,11 @@ _E2M1_VALUES = (
     -6.0,
 )
 
-#: One expert stack's `(codes, block scales)`, unshuffled and unswizzled.
-Operand = Tuple[torch.Tensor, torch.Tensor]
+#: One expert stack's NVFP4 projection as a checkpoint stores it, unshuffled
+#: and unswizzled: `(codes [E, M, K] uint8, block scales [E, M, K/16] e4m3)`,
+#: optionally followed by `weight_scale_2 [E]` fp32 -- each expert's global
+#: dequantization scale, 1 when absent.
+Operand = Union[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]
 
 
 def _e2m1_rne(a: torch.Tensor) -> torch.Tensor:
@@ -92,6 +105,17 @@ def dequantize_nvfp4(codes: torch.Tensor, block_scales: torch.Tensor) -> torch.T
     return table[codes.long()] * block_scales.float().repeat_interleave(SF_VEC_SIZE, dim=1)
 
 
+def _project(x: torch.Tensor, operand: Operand, expert: int) -> torch.Tensor:
+    """`x @ W_e^T` for one expert of an `Operand`, fp32.
+
+    A per-expert `weight_scale_2` multiplies the product rather than the
+    weight, which is where the kernel applies it too: folded into the
+    accumulator's dequantization scalar.
+    """
+    y = x @ dequantize_nvfp4(operand[0][expert], operand[1][expert]).t()
+    return y * operand[2][expert].float() if len(operand) > 2 else y
+
+
 class Fp4BlockScaleMoeRunner(OpWrapper):
     """One NVFP4-weight MoE layer over NVFP4 (e2m1 + e4m3 block-scale)
     activations, entered pre-routed.
@@ -109,7 +133,7 @@ class Fp4BlockScaleMoeRunner(OpWrapper):
     unwritten scale buffer, and the expanded-index -> permuted-row map.
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = frozenset({Arch.SM_103, Arch.SM_107})
 
     # DeepSeek-R1-0528's routed geometry. The dep4 target gathers four ranks'
     # tokens before the expert call and issues one call per 64-wide window, so
@@ -131,6 +155,26 @@ class Fp4BlockScaleMoeRunner(OpWrapper):
         local_expert_offset=0,
         local_num_experts=512,
         routing="renormalized",
+    )
+
+    # Nemotron-3 Ultra's routed experts, in its 2048-wide latent space, as its
+    # tep4 target issues them: every rank routes the same tokens over all 512
+    # experts and answers for its own 128-wide window, so the windows' outputs
+    # sum across ranks. FC1 is the up projection alone (Relu2 is element-wise:
+    # 5120 rows, no gate half). The slot weights are the router's sigmoid
+    # scores of the top 22, renormalized and scaled to sum to 5
+    # (`routing="sigmoid_x5"`). Every expert carries its own `weight_scale_2`
+    # while both input scales are shared by the layer, so the scalars differ
+    # per expert -- the test draws them that way at every Relu2 cell. Nothing
+    # is padded: H % 256, I % 128, H/16 % 4 and I/16 % 4 are all zero.
+    _ULTRA = dict(
+        hidden=2048,
+        intermediate=5120,
+        num_experts=512,
+        top_k=22,
+        local_num_experts=128,
+        act_type=ACT_TYPE_RELU2,
+        routing="sigmoid_x5",
     )
 
     CELLS: tuple[Cell, ...] = (
@@ -156,8 +200,8 @@ class Fp4BlockScaleMoeRunner(OpWrapper):
             spec=dict(tokens=4, **_QWEN4_EXP),
         ),
         Cell(
-            why="qwen4_exp at 5 rows: the first count on the single-cluster permutation "
-            "kernel (the dynamic-block one stops at 256 experts)",
+            why="qwen4_exp at 5 rows: the first count on the pre-routed path's "
+            "dynamic-block permutation kernel (5 to 12 rows)",
             spec=dict(tokens=5, **_QWEN4_EXP),
         ),
         Cell(
@@ -165,43 +209,124 @@ class Fp4BlockScaleMoeRunner(OpWrapper):
             "of the certified column",
             spec=dict(tokens=8192, **_QWEN4_EXP),
         ),
+        Cell(
+            why="Ultra tep4 decode, 1 row, rank 0: relu2 FC1 of 5120 rows, top-22 of 512, "
+            "a 128-wide window",
+            spec=dict(tokens=1, local_expert_offset=0, **_ULTRA),
+        ),
+        Cell(
+            why="Ultra decode, 1 row, rank 3: the last window, ids 384-511 -- the top of "
+            "the expert range",
+            spec=dict(tokens=1, local_expert_offset=384, **_ULTRA),
+        ),
+        Cell(
+            why="Ultra at 8 rows, rank 1: the pre-routed path's dynamic-block permutation "
+            "kernel (5 to 12 rows)",
+            spec=dict(tokens=8, local_expert_offset=128, **_ULTRA),
+        ),
+        Cell(
+            why="Ultra decode ceiling, 32 rows, rank 0: the single-cluster permutation kernel",
+            spec=dict(tokens=32, local_expert_offset=0, **_ULTRA),
+        ),
+        Cell(
+            why="Ultra decode ceiling, 32 rows, rank 3",
+            spec=dict(tokens=32, local_expert_offset=384, **_ULTRA),
+        ),
+        Cell(
+            why="Ultra prefill chunk, 300 rows, rank 0: a mid-width FC1 token tile",
+            spec=dict(tokens=300, local_expert_offset=0, **_ULTRA),
+        ),
+        Cell(
+            why="Ultra prefill chunk, 300 rows, rank 3",
+            spec=dict(tokens=300, local_expert_offset=384, **_ULTRA),
+        ),
+        Cell(
+            why="Ultra prefill at 8192 rows, rank 0: the widest FC1 token tile and the top "
+            "of the certified column",
+            spec=dict(tokens=8192, local_expert_offset=0, **_ULTRA),
+        ),
+        Cell(
+            why="Ultra prefill at 8192 rows, rank 3",
+            spec=dict(tokens=8192, local_expert_offset=384, **_ULTRA),
+        ),
     )
 
     note = """
     Certified pre-routed only: `routing_logits` is `None` at every cell, so the
     kernel's own routing is not exercised and `routing_method_type`, `n_group`,
-    `topk_group` and `routed_scaling_factor` are inert -- they are passed
-    because the signature takes them, not because they do anything here.
+    `topk_group` and `routed_scaling_factor` do not change the result -- they
+    are passed because the signature takes them. `routing_method_type` 0, 2,
+    4, 5, 6 were measured bitwise identical to 1 at 512 experts / top-10; at
+    512 experts / top-22, 0, 1, 4 and 6, and 2 with `n_group`, `topk_group`
+    and `routed_scaling_factor` either numbers or `None`, are all bitwise one
+    result.
 
-    That holds at 512 experts / top-10 too, where it would matter if it were
-    read: which `(num_experts, top_k)` pairs the routing kernels are compiled
-    for is a per-policy tier list, and a pair with no tier is a logged error,
-    not a raise. The pre-routed path substitutes its own preprocess/postprocess
-    pair before dispatch, and `routing_method_type` 0, 2, 4, 5, 6 were measured
-    bitwise identical to 1 there. It picks its permutation kernel by row count
-    instead: a static-block kernel up to 4 rows, a dynamic-block one up to 16
-    rows only at <= 256 experts, a single-cluster one up to 8192 rows.
+    They are read in one place: inside the autotuner's `autotune()` context the
+    op builds a dummy routing from `routing_method_type` to profile with, and
+    DeepSeekV3's (2) is constructed in Python from `n_group`, `topk_group` and
+    `routed_scaling_factor` -- `None` for any of them raises `TypeError` there
+    and only there, so a cold-cache test never sees it. A caller passing 2
+    passes all three as numbers (a single group is `n_group = topk_group = 1`);
+    1 (Renormalize) needs none of them.
 
-    `act_type` 0 (SwiGlu) only. `gemm1_bias`, `gemm1_alpha`, `gemm1_beta`,
-    `gemm1_clamp_limit` and `gemm2_bias` are `None`. `hidden_states_scale` is
-    the linear (unswizzled) e4m3 block-scale layout, one scale per 16 elements
-    of each row.
+    Which `(num_experts, top_k)` pairs the routing kernels are compiled for is
+    a per-policy tier list, and a pair with no tier is a logged error, not a
+    raise. The pre-routed path substitutes its own preprocess/postprocess pair
+    (whose tiers include 512/16 and 512/22) before dispatch, and picks its
+    permutation kernel by row count: a static-block kernel up to 4 rows, a
+    dynamic-block one from 5 to 12 rows while the expert tier is at most 1024,
+    a single-cluster one up to 8192 rows.
 
-    At 512 experts only the whole stack is certified: no expert-parallel window
-    of it, `do_finalize=False` or a caller-supplied `output` was measured there.
+    `act_type` 0 (SwiGlu) and 1 (Relu2). Gated or not is read off FC1's row
+    count (2 * I or I) while the kernel that runs is chosen by `act_type`; the
+    two must agree, which `is_valid` checks. The FC1 epilogue, read out of the
+    kernel bit for bit, is
+        SwiGlu: C = output1_scale_scalar * up_acc * silu(output1_scale_gate_scalar * gate_acc)
+        Relu2:  C = output1_scale_scalar * relu(output1_scale_gate_scalar * up_acc) ** 2
+    followed by one NVFP4 quantization of C (e4m3 block scale
+    `amax16(C) / 6`, saturating at 448). So `output1_scale_gate_scalar` is the
+    FC1 dequantization and, for Relu2, `output1_scale_scalar` is the FC2-input
+    quantization scale *alone* -- for SwiGlu it also carries the dequantization.
+    From a ModelOpt NVFP4 checkpoint (per expert e; `input_scale` shared by the
+    layer, `weight_scale_2` per expert):
+        activation global scale (fp4_quantize)  = 1 / up.input_scale
+        output1_scale_gate_scalar[e]            = up.input_scale * up.weight_scale_2[e]
+        output1_scale_scalar[e]  (Relu2)        = 1 / down.input_scale
+        output1_scale_scalar[e]  (SwiGlu)       = output1_scale_gate_scalar[e] / down.input_scale
+        output2_scale_scalar[e]                 = down.input_scale * down.weight_scale_2[e]
+    The SwiGlu form handed to a Relu2 call is accepted and wrong by the factor
+    `output1_scale_gate_scalar`, which at checkpoint magnitudes underflows the
+    intermediate's block scales: measured on a real checkpoint layer's scales,
+    the output is exactly zero.
+
+    `gemm1_bias`, `gemm1_alpha`, `gemm1_beta`, `gemm1_clamp_limit` and
+    `gemm2_bias` are `None`. `hidden_states_scale` is the linear (unswizzled)
+    e4m3 block-scale layout, one scale per 16 elements of each row.
+
+    At 512 experts the SwiGlu cells hold the whole stack and the Relu2 cells
+    128-wide windows; `do_finalize=False` and a caller-supplied `output` were
+    measured at neither.
 
     `tune_max_num_tokens` is an autotuner bucket hint and was measured inert;
     it is not a token count. `T` is `hidden_states.shape[0]`, and 8192 is the
     top of the certified column. A warm autotuner cache was measured bitwise
-    inert against a cold one at the R1 stack, its windows and the 512-expert
-    stack; `local_num_experts` separates the tuner's cache entries, so each
-    layout warms its own.
+    inert against a cold one at the R1 stack, its windows, the 512-expert
+    stack and the Relu2 128-wide windows; `local_num_experts` separates the
+    tuner's cache entries, so each layout warms its own.
 
-    The caller owns the weight layout entirely: FC1 and FC2 weights are
-    pre-shuffled and their scales additionally 128x4 swizzled. Nothing here
-    checks that, and getting it wrong is 300-3400 bf16 ulp with no error -- the
-    entry's test builds the layout twice, once in torch and once through the
-    trtllm preprocessing ops, and compares them before either reaches the op.
+    A Relu2 window call captures into a CUDA graph and replays bitwise equal
+    to the eager call (decode ceiling, 32 rows); the op allocates its own
+    intermediates per call, which capture takes from the graph's pool.
+
+    The caller owns the weight layout entirely. Each expert's FC1 and FC2 rows
+    are permuted in 32-row blocks (source row `4u + v` of a block lands at
+    `8v + u`) and their e4m3 scales take the same row permutation and then the
+    128x4 swizzle; SwiGlu's FC1 additionally interleaves its `[up; gate]`
+    halves row by row before the block permutation, and Relu2's has nothing to
+    interleave. Nothing here checks any of it, and getting it wrong is 300-3400
+    bf16 ulp with no error -- the entry's test builds the layout in torch,
+    compares it with trtllm's own preprocessing before either reaches the op,
+    and shows each omission landing far outside its gate.
     """
 
     def __call__(
@@ -280,49 +405,62 @@ class Fp4BlockScaleMoeRunner(OpWrapper):
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
         up: Operand,
-        gate: Operand,
+        gate: Optional[Operand],
         down: Operand,
         fc2_global_scale: float,
         local_expert_offset: int = 0,
         local_num_experts: Optional[int] = None,
+        act_type: int = ACT_TYPE_SWIGLU,
     ) -> torch.Tensor:
         """The layer, in plain torch over dequantized weights, fp32 throughout.
 
         The documented exception to mirroring: `__call__` takes the *prepared*
         operands -- packed e2m1 codes, shuffled rows, swizzled scales -- and a
         reference given those would be re-deriving the layout rather than the
-        computation. So this takes the per-expert `(codes, scales)` pairs the
-        layout was built from, which is where a target's checkpoint starts too,
-        plus the routing this call was entered with.
+        computation. So this takes the per-expert operands the layout was built
+        from, which is where a target's checkpoint starts too, plus the routing
+        this call was entered with. `hidden_states` is the activation's exact
+        value (codes times block scales over the global scale); `act_type`
+        keeps `__call__`'s name.
 
-        `up`, `gate` and `down` are each `(codes[E, M, K/2], scales[E, M, K/16])`
-        in their unshuffled, unswizzled form. `topk_ids` carries *global* ids;
-        this rank contributes only for the ids its window owns, and every other
-        slot contributes zero -- which is what makes an expert-parallel split
-        summable.
+        `up`, `gate` and `down` are each an `Operand`: `(codes[E, M, K],
+        scales[E, M, K/16])` in their unshuffled, unswizzled form, optionally
+        with each expert's `weight_scale_2` as a third element. `gate` is
+        `None` for Relu2, whose FC1 is the up projection alone. `topk_ids`
+        carries *global* ids; this rank contributes only for the ids its window
+        owns, and every other slot contributes zero -- which is what makes an
+        expert-parallel split summable.
 
         The FC1 activation is requantized to NVFP4 under `fc2_global_scale`
         before FC2, because the kernel does: the FC1 epilogue emits `g2 * act`
         as NVFP4 and FC2's alpha divides it back out. Skipping that step is a
         reference that disagrees with a correct kernel by ~23 ulp RMS, so it is
-        not an optional refinement.
+        not an optional refinement. That holds for Relu2 as for SwiGlu: the
+        relu2 output is what is requantized, under the same global scale.
         """
+        if act_type == ACT_TYPE_SWIGLU:
+            assert gate is not None, "SwiGlu is gated: the gate operand is required"
+        elif act_type == ACT_TYPE_RELU2:
+            assert gate is None, "Relu2 is element-wise: FC1 is the up projection alone"
+        else:
+            raise NotImplementedError(f"act_type {act_type} is not certified by this entry")
         num_tokens, hidden = hidden_states.shape
-        up_c, up_s = up
-        gt_c, gt_s = gate
-        dn_c, dn_s = down
-        local_num_experts = up_c.shape[0] if local_num_experts is None else local_num_experts
+        local_num_experts = up[0].shape[0] if local_num_experts is None else local_num_experts
         out = torch.zeros(num_tokens, hidden, dtype=torch.float32, device=hidden_states.device)
         for local_e in range(local_num_experts):
             tok, slot = (topk_ids == local_expert_offset + local_e).nonzero(as_tuple=True)
             if tok.numel() == 0:
                 continue
             xe = hidden_states[tok]
-            u = xe @ dequantize_nvfp4(up_c[local_e], up_s[local_e]).t()
-            g = xe @ dequantize_nvfp4(gt_c[local_e], gt_s[local_e]).t()
-            act = u * g * torch.sigmoid(g)
+            u = _project(xe, up, local_e)
+            if act_type == ACT_TYPE_RELU2:
+                r = torch.relu(u)
+                act = r * r
+            else:
+                g = _project(xe, gate, local_e)
+                act = u * g * torch.sigmoid(g)
             act = quantize_nvfp4(act, fc2_global_scale) / fc2_global_scale
-            y = act @ dequantize_nvfp4(dn_c[local_e], dn_s[local_e]).t()
+            y = _project(act, down, local_e)
             out.index_add_(0, tok, y * topk_weights[tok, slot].float().unsqueeze(1))
         return out
 
@@ -361,14 +499,29 @@ class Fp4BlockScaleMoeRunner(OpWrapper):
         tune_max_num_tokens: int = 8192,
         use_dp: bool = False,
     ) -> None:
-        """The two ways this op takes an input and answers it wrongly.
+        """The three ways this op takes an input and answers it wrongly.
 
-        Everything else a caller can get wrong here the op rejects loudly: a
-        mismatched `intermediate_size`, a `top_k` outside `(0, num_experts)`, a
-        hidden width that disagrees between the two weight operands. Those are
-        not restated -- swapping their errors for ours would only make them
-        worse.
+        Everything else a caller can get wrong here the op rejects loudly: an
+        `intermediate_size` that is neither FC1's row count nor half of it, a
+        `top_k` outside `(0, num_experts)`, a hidden width that disagrees
+        between the two weight operands. Those are not restated -- swapping
+        their errors for ours would only make them worse.
         """
+        # Gated or not is read off FC1's row count -- 2 * I rows is a gated
+        # [up; gate] pair, I rows a single projection -- while the kernel that
+        # runs is chosen by act_type, and the op checks only that the rows are
+        # one or the other. Relu2 handed a 2I-row SwiGlu stack walks it at
+        # I-row strides and returns plausible rows from the wrong weights
+        # (measured); SwiGlu handed an I-row stack would read 2I rows per
+        # expert, past the end of the stack. A count that is neither the op
+        # rejects itself.
+        rows = gemm1_weights.shape[1]
+        expected = (2 if act_type in _GATED_ACT_TYPES else 1) * intermediate_size
+        assert rows not in (intermediate_size, 2 * intermediate_size) or rows == expected, (
+            f"act_type {act_type} needs FC1 with {expected} rows (intermediate_size "
+            f"{intermediate_size}), got {rows}: the op accepts either count and answers wrongly"
+        )
+
         # The kernel takes raw data pointers and assumes a dense row-major
         # layout for every tensor. A strided view is accepted without complaint
         # and silently reads -- or writes -- the wrong elements. Observed on

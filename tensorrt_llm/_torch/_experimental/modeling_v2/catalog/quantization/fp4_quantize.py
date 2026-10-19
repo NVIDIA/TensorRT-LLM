@@ -45,13 +45,17 @@ class Fp4Quantize(OpWrapper):
     is something a consumer has to be told, not something its shape shows.
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = frozenset({Arch.SM_103, Arch.SM_107})
 
     # deepseek-r1 reaches this op from both layouts: the swizzled one feeding
     # nvfp4_gemm in the dense and shared-expert MLPs, the linear one feeding the
     # routed-expert path, at its hidden size and its intermediate. qwen3.8
     # (qwen4_exp) calls it only for its routed experts: linear scales at hidden
-    # 2560. A linear buffer has no row padding, so at a row count that is not a
+    # 2560. Nemotron-3 Ultra likewise, at its 2048-wide latent: the routed
+    # experts' input is the latent projection, quantized with linear scales
+    # under the checkpoint's static `1 / up_proj.input_scale` -- a calibrated
+    # scale a batch can outrun, so its blocks saturate rather than rescale. A
+    # linear buffer has no row padding, so at a row count that is not a
     # multiple of 128 it is shorter than the swizzled one; at a multiple of 128
     # the two are the same length and only the cells' byte order tells them
     # apart.
@@ -87,6 +91,34 @@ class Fp4Quantize(OpWrapper):
         Cell(
             why="qwen3.8 prefill at max_num_tokens 8192, hidden 2560, linear",
             spec=dict(shape=(8192, 2560), dtype=torch.bfloat16, vec=16, swizzled=False),
+        ),
+        Cell(
+            why="Nemotron-3 Ultra decode: 1 row of its 2048-wide latent, linear -- the "
+            "routed-expert input",
+            spec=dict(shape=(1, 2048), dtype=torch.bfloat16, vec=16, swizzled=False),
+        ),
+        Cell(
+            why="Ultra latent, 7 rows, linear: several rows at an odd count",
+            spec=dict(shape=(7, 2048), dtype=torch.bfloat16, vec=16, swizzled=False),
+        ),
+        Cell(
+            why="Ultra latent at its tep4 decode ceiling, 32 rows, linear",
+            spec=dict(shape=(32, 2048), dtype=torch.bfloat16, vec=16, swizzled=False),
+        ),
+        Cell(
+            why="Ultra latent at max_num_tokens 8192, linear",
+            spec=dict(shape=(8192, 2048), dtype=torch.bfloat16, vec=16, swizzled=False),
+        ),
+        Cell(
+            why="a static global scale the batch outruns 2x: blocks past the calibrated "
+            "amax saturate to scale 448, codes 6",
+            spec=dict(
+                shape=(300, 2048),
+                dtype=torch.bfloat16,
+                vec=16,
+                swizzled=False,
+                amax_headroom=0.5,
+            ),
         ),
     )
 

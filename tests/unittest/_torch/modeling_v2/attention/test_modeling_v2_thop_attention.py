@@ -188,13 +188,24 @@ exercised:
    arguments that are inert there, the workspace high-water mark over the
    mmmu serving shapes, and the two boundaries (update_kv_cache=False is
    rejected; head_size 72 has no generation phase).
+14. Nemotron-3 Ultra at tep4: GQA 16q/1kv d128 over an fp8 pool whose kv scales
+   are passed as None, with no positional encoding. None is pinned bitwise equal
+   to scale tensors holding 1.0. Packed prefill reads the call's bf16 rows;
+   decode and the paged-context path read e4m3 from the pool, and every decode
+   batch size from 1 to 32 is driven. Within one 128-key tile the e4m3 model is
+   the kernel's arithmetic; past it the kernel's split softmax rounds the
+   probabilities against group maxima, gated in a band derived from e4m3's
+   rounding (`_compare_split_softmax`). The engine's own hybrid manager is built
+   for the checkpoint's 108-layer pattern: its 60-row mapping puts the attention
+   rows 4, 8, ..., 55 on pool 1 and the mamba rows on pool 0, and two cells
+   drive rows 4 and 55 with the recurrent state held at a sentinel.
 The cells at the end drive the entry's own `reference` and `_compare` over the
 configurations the targets run.
 """
 
 import math
 import zlib
-from typing import Dict, List, NamedTuple, Optional, Tuple
+from typing import Callable, Dict, List, NamedTuple, Optional, Tuple
 
 import pytest
 import torch
@@ -209,6 +220,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.thop_attent
 )
 from tensorrt_llm._torch.attention.backends.interface import RopeParams
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.resource_manager import CacheTypeCpp, DataType
 from tensorrt_llm.functional import RotaryScalingType
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
@@ -308,6 +320,9 @@ def _compare(out: torch.Tensor, ref: torch.Tensor) -> None:
     models it instead. Measured on sm_103: the qwen4_exp, encoder and fp8
     context cells use at most 0.25 of the element gate and 0.16 of the RMS
     one; the fp8 200-token decode, whose KV range spans tiles, 0.58 of both.
+    On sm_107 the nemotron_h packed-context rows, up to 1100 rows a sequence,
+    use 0.25 and 0.13. Its e4m3 rows have a band of their own,
+    `_compare_split_softmax`.
     """
     assert_within_ulp(out, ref, element_ulp=8.0, rms_ulp=4.0, ulp=ULP[torch.bfloat16])
 
@@ -648,10 +663,12 @@ class _PagedAttnEnv:
 
     def expected_cache(self, kv: torch.Tensor) -> torch.Tensor:
         """Map bf16 K/V fed to the op to the expected pool content: identity
-        for a bf16 pool; fp32-scale-then-RN-cast for a quantized pool."""
+        for a bf16 pool; fp32-scale-then-RN-cast for a quantized pool, where
+        scale tensors passed as None are read as exactly 1.0."""
         if self.kv_cache.dtype == torch.bfloat16:
             return kv
-        assert self.kv_scale_orig_quant is not None
+        if self.kv_scale_orig_quant is None:
+            return kv.float().to(self.kv_cache.dtype)
         return (kv.float() * self.kv_scale_orig_quant).to(self.kv_cache.dtype)
 
     def cache_pages_content(self, request_id: int) -> Tuple[torch.Tensor, ...]:
@@ -847,6 +864,8 @@ class _MultiLayerPagedAttnEnv:
             self.kv_scale_quant_orig = factor
             self.kv_scale_orig_quant = 1.0 / factor
         assert self.mgr.num_pools == 1, "test expects one pool holding all layers"
+        # Which pool's block-offset table holds this env's attention pages.
+        self.attn_pool = 0
         pool_mapping = self.mgr.kv_cache_pool_mapping
         assert pool_mapping is not None
         self.pool_mapping: torch.Tensor = pool_mapping
@@ -1118,11 +1137,13 @@ class _MultiLayerPagedAttnEnv:
 
     def expected_cache(self, kv: torch.Tensor) -> torch.Tensor:
         """Map bf16 K/V fed to the op to the expected pool content: identity
-        for a bf16 pool; fp32-scale-then-RN-cast for a quantized pool."""
+        for a bf16 pool; fp32-scale-then-RN-cast for a quantized pool, where
+        scale tensors passed as None are read as exactly 1.0."""
         pool_dtype = self.layer_views[0].dtype
         if pool_dtype == torch.bfloat16:
             return kv
-        assert self.kv_scale_orig_quant is not None
+        if self.kv_scale_orig_quant is None:
+            return kv.float().to(pool_dtype)
         return (kv.float() * self.kv_scale_orig_quant).to(pool_dtype)
 
     def check_caches(self, request_ids: List[int], layers: Optional[List[int]] = None) -> None:
@@ -1141,8 +1162,8 @@ class _MultiLayerPagedAttnEnv:
                 v_seq = self.expected_cache(torch.cat(self.v_history[layer_idx, rid]))
                 total = k_seq.shape[0]
                 for j in range((total + tpb - 1) // tpb):
-                    k_off = int(self.block_offsets[0, s, 0, j].item())
-                    v_off = int(self.block_offsets[0, s, 1, j].item())
+                    k_off = int(self.block_offsets[self.attn_pool, s, 0, j].item())
+                    v_off = int(self.block_offsets[self.attn_pool, s, 1, j].item())
                     assert k_off % slabs_per_page == 0, "multi-layer K offset stride"
                     assert v_off == k_off + 1, "V slab follows K within the page"
                     page = k_off // slabs_per_page
@@ -6814,6 +6835,428 @@ def test_encoder_no_kv_cache_boundaries() -> None:
     )
 
 
+# ─── Nemotron-3 Ultra at tep4: GQA 16/1/128 over an fp8 pool ───────────
+#
+# The checkpoint's 108-layer stack interleaves 48 Mamba-2 mixers, 48 MoE blocks
+# and 12 attention layers with no positional encoding. At tep4 a rank holds 16 of
+# the 64 q heads and one of the two kv heads, so every attention call is 16:1
+# over head_size 128, on an fp8 pool whose kv scales the target passes as None.
+#
+# The engine's MambaHybridCacheManagerV2 manages the 60 mamba-or-attention
+# layers as one list, so the `local_layer_idx` the target passes -- the layer's
+# `layer_offsets` entry -- is its position in that list: rows 4, 8, 13, ..., 55.
+# Built here with the real manager rather than composed by hand, because the
+# manager is what decides where the attention layers live, and for this
+# checkpoint it puts them on pool 1 at layer-in-pool 0..11 with the 48 mamba rows
+# on pool 0 -- the reverse of qwen4_exp's hybrid arrangement. A call that read
+# the pool column wrong would address the recurrent state.
+
+ULTRA_PATTERN = (
+    "MEMEMEM*EMEMEM*EMEMEMEM*EMEMEMEM*EMEMEM*EMEMEMEM*EMEMEMEM*EMEMEM*"
+    "EMEMEMEM*EMEMEMEM*EMEMEM*EMEMEMEM*EMEMEMEME"
+)
+ULTRA_ATTN_LAYERS = [i for i, c in enumerate(ULTRA_PATTERN) if c == "*"]
+ULTRA_MAMBA_LAYERS = [i for i, c in enumerate(ULTRA_PATTERN) if c == "M"]
+#: Each attention layer's position among the 60 managed layers.
+ULTRA_ATTN_ROWS = [4, 8, 13, 18, 22, 27, 32, 36, 41, 46, 50, 55]
+ULTRA_TP = 4
+ULTRA_HQ, ULTRA_HKV, ULTRA_D = 16, 1, 128
+#: The unsharded layer every rank runs at dep4 (attention data parallel).
+ULTRA_DEP4_HQ, ULTRA_DEP4_HKV = 64, 2
+
+
+def _compare_split_softmax(out: torch.Tensor, ref: torch.Tensor) -> None:
+    """The e4m3 band at 16 q heads per kv head, d128, where the kernel rounds the
+    softmax probabilities against maxima the reference cannot reproduce.
+
+    On the e4m3 paths the probabilities are an MMA operand: `exp(s - m)` scaled
+    by 448 and rounded to e4m3, `m` a running maximum. `reference` takes `m` as
+    the row's maximum. The 16:1 d128 decode kernel instead deals 128-key tiles
+    round-robin to two softmax groups, each with its own running maximum, and
+    splits a long KV range across CTAs in chunks of tiles whose count the launch
+    heuristic picks from the batch, the length and the GPU -- not something a
+    reference should encode. Measured on sm_107: a plain-torch model of exactly
+    that schedule reproduces the kernel to 1.6 ulp element / 0.7 ulp RMS at 768
+    to 1100 keys, where `reference` sits 7-11 / up to 8.1 away; within one tile
+    the two agree bitwise (`test_ultra_fp8_decode_one_tile_is_the_e4m3_model`).
+    The paged-context prefill, whose FMHA also reads e4m3 from the pool, shows
+    the same signature against `reference`; its schedule was not modelled.
+
+    So the band is e4m3's own rounding. A key whose group maximum is not the row
+    maximum is rounded independently on the two sides. e4m3's relative rounding
+    error is uniform within half its 2^-3 / mantissa spacing, RMS 2^-4 *
+    sqrt(0.541 / 3) = 0.0265 over log-uniform mantissas, so two independent
+    roundings differ by 0.0375 RMS, carried straight into the output: 9.6 bf16
+    ulp of relative RMS when every key differs, the ceiling. Gated at 12.
+    Element-wise 2^-4 of the row scale, 16 ulp: over five standard deviations
+    of a single element at that ceiling, against a row maximum about three
+    times the row's RMS. Measured: 11.2 / 8.1 at worst, the paged-context and
+    the 1100-key decode cells. dep4's unsharded 64:2 (32 q heads per kv head)
+    decode shows the same signature inside the same band: 10.3 / 7.7 at worst
+    over its cells and the batch 1..32 sweep.
+
+    What it still separates: a wrong scale, page, kv head or mask moves the
+    output by O(1). What it cannot: whether q is rounded or the probabilities
+    are kept in fp32 (5-6 ulp RMS away). The one-tile test settles those.
+    """
+    assert_within_ulp(out, ref, element_ulp=16.0, rms_ulp=12.0, ulp=ULP[torch.bfloat16])
+
+
+def _e4m3_compare_for(spec) -> Callable[[torch.Tensor, torch.Tensor], None]:
+    """The band a cell's e4m3 rows are gated in: `_compare_split_softmax` at the
+    16:1 d128 geometry whose kernel schedule was measured, `_compare` elsewhere."""
+    geometry = (spec["num_heads"], spec["num_kv_heads"], spec["head_size"])
+    return _compare_split_softmax if geometry == (ULTRA_HQ, ULTRA_HKV, ULTRA_D) else _compare
+
+
+class _UltraHybridEnv(_MultiLayerPagedAttnEnv):
+    """The attention half of a real MambaHybridCacheManagerV2, built the way the
+    engine's nemotron-hybrid branch builds one for this checkpoint at tep4: the
+    108-layer masks, two kv heads per attention layer split across four ranks
+    to one, the per-rank Mamba-2 state geometry (conv [slots, 4608, 3] bf16, ssm
+    [slots, 64, 64, 128] fp16), an fp8 pool at tokens_per_block 32.
+
+    `dep4=True` builds it as attention data parallelism does instead: the same
+    four-rank mapping with `enable_attention_dp`, under which the manager splits
+    neither the kv heads (64 q over 2 kv per rank) nor the Mamba-2 state (conv
+    [slots, 18432, 3], ssm [slots, 256, 64, 128]), since each rank holds its own
+    requests through unsharded layers.
+
+    This env's layer ordinals are attention ordinals (0..11), the keys of the
+    base class's histories; `rows[layer]` is the manager's mapping row for that
+    layer. The pool pointers, the 60-row mapping and the per-pool block-offset
+    table reach the op exactly as the manager produces them. The recurrent
+    state is filled with a sentinel byte before the calls, so a call that
+    addressed the wrong pool shows up as a changed mamba slab.
+    """
+
+    SENTINEL = 0x5A
+
+    def __init__(self, max_batch: int = 32, max_seq_len: int = 2048, dep4: bool = False) -> None:
+        mamba_mask = [c == "M" for c in ULTRA_PATTERN]
+        attn_mask = [c == "*" for c in ULTRA_PATTERN]
+        self.num_layers = len(ULTRA_ATTN_LAYERS)
+        self.num_heads = ULTRA_DEP4_HQ if dep4 else ULTRA_HQ
+        self.num_kv_heads = ULTRA_DEP4_HKV if dep4 else ULTRA_HKV
+        self.head_dim = ULTRA_D
+        self.tokens_per_block = 32
+        self.max_batch = max_batch
+        self.max_seq_len = max_seq_len
+        self.quant_mode = QUANT_MODE_FP8_KV_CACHE
+        self.mgr = MambaHybridCacheManagerV2(
+            128,  # ssm_state_size
+            4,  # conv_kernel
+            256,  # mamba_num_heads, 64 per rank
+            8,  # n_groups, 2 per rank
+            64,  # mamba_head_dim
+            sum(mamba_mask),
+            mamba_mask,
+            torch.bfloat16,  # conv state: the model dtype
+            torch.float16,  # ssm state: the gate's mamba_ssm_cache_dtype
+            # The budget covers the recurrent slots too: 32 rows leave ~940 pages.
+            KvCacheConfig(max_tokens=1024 * 32 * (4 if dep4 else 1), enable_block_reuse=False),
+            CacheTypeCpp.SELF,
+            num_layers=sum(attn_mask),
+            layer_mask=attn_mask,
+            num_kv_heads=[2] * len(ULTRA_PATTERN),
+            head_dim=ULTRA_D,
+            tokens_per_block=self.tokens_per_block,
+            max_seq_len=max_seq_len,
+            max_batch_size=max_batch,
+            mapping=Mapping(
+                world_size=ULTRA_TP,
+                tp_size=ULTRA_TP,
+                rank=0,
+                moe_ep_size=ULTRA_TP,
+                moe_tp_size=1,
+                enable_attention_dp=dep4,
+            ),
+            dtype=DataType.FP8,
+            conv_state_layout="x_b_c",
+        )
+        # The checkpoint's k/v scales are 1.0 and the target passes None.
+        self.kv_scale_quant_orig = None
+        self.kv_scale_orig_quant = None
+        self.pool_mapping = self.mgr.kv_cache_pool_mapping
+        self.rows = [self.mgr.layer_offsets[g] for g in ULTRA_ATTN_LAYERS]
+        self.attn_pool = int(self.pool_mapping[self.rows[0], 0])
+        self.block_offsets = torch.zeros(
+            self.mgr.num_pools,
+            max_batch,
+            2,
+            self.mgr.max_blocks_per_seq,
+            dtype=torch.int32,
+            device="cuda",
+        )
+        self.layer_views = []
+        for g in ULTRA_ATTN_LAYERS:
+            view = self.mgr.get_buffers(g, kv_layout="HND")
+            page_scale = self.mgr.get_layer_page_index_scale(g)
+            assert page_scale == self.num_layers * 2, "twelve layers share each attention page"
+            view = view[:: page_scale // 2]
+            view.zero_()
+            self.layer_views.append(view)
+        self.recurrent = [
+            (m, kind, getter(m))
+            for m in ULTRA_MAMBA_LAYERS
+            for kind, getter in (
+                ("conv", self.mgr.get_conv_states),
+                ("ssm", self.mgr.get_ssm_states),
+            )
+        ]
+        self.workspace = torch.empty(0, dtype=torch.int8, device="cuda")
+        self.prompt_lens = {}
+        self.k_history = {}
+        self.v_history = {}
+
+    def fill_recurrent_sentinel(self) -> None:
+        for _, _, state in self.recurrent:
+            state.view(torch.uint8).fill_(self.SENTINEL)
+
+    def assert_recurrent_untouched(self, label: str) -> None:
+        for layer, kind, state in self.recurrent:
+            assert bool((state.view(torch.uint8) == self.SENTINEL).all()), (
+                f"{label}: an attention call wrote mamba layer {layer}'s {kind} state"
+            )
+
+
+def test_ultra_hybrid_manager_puts_attention_on_pool_1() -> None:
+    """The arrangement the Ultra cells are built on, asserted on the real manager.
+
+    Rows 4, 8, ..., 55 of a 60-row mapping are the twelve attention layers, on
+    pool 1 at layer-in-pool 0..11; the 48 mamba rows are pool 0 at 0..47. The
+    manager's offsets for this batch name pool 1 only. Every other cell in this
+    file addresses pool 0, which is why the two Ultra hybrid cells exist; if the
+    manager ever moves attention to pool 0 this fails, rather than those cells
+    silently certifying the common case twice.
+    """
+    env = _UltraHybridEnv(max_batch=4)
+    try:
+        assert env.mgr.num_pools == 2
+        assert env.rows == ULTRA_ATTN_ROWS
+        mapping = env.pool_mapping.tolist()
+        assert len(mapping) == len(ULTRA_ATTN_LAYERS) + len(ULTRA_MAMBA_LAYERS) == 60
+        assert [mapping[r] for r in ULTRA_ATTN_ROWS] == [[1, k] for k in range(12)]
+        mamba_rows = [r for r in range(60) if r not in ULTRA_ATTN_ROWS]
+        assert [mapping[r] for r in mamba_rows] == [[0, k] for k in range(48)]
+        assert env.attn_pool == 1
+        assert env.mgr.kv_cache_pool_pointers.shape == (2, 2)
+        ptrs = env.mgr.kv_cache_pool_pointers
+        assert int(ptrs[1, 0]) == env.layer_views[0].data_ptr(), "pool 1 is the attention pool"
+        assert int(ptrs[0, 0]) != int(ptrs[1, 0])
+        env.add_request(0, 70)
+        env.add_request(1, 33)
+        env.refresh_offsets([0, 1], num_contexts=2)
+        assert bool((env.block_offsets[0] == 0).all()), "pool 0's offset table stays empty"
+        assert bool((env.block_offsets[1, :2, :, :2] != 0).any())
+    finally:
+        env.mgr.shutdown()
+
+
+def test_ultra_dep4_hybrid_manager_layout() -> None:
+    """The attention-DP manager the dep4 cells are built on.
+
+    The same 60-row arrangement as tep4 -- attention rows 4, 8, ..., 55 on pool
+    1 at layer-in-pool 0..11, mamba rows on pool 0 -- but nothing is split
+    across the four ranks: each attention page holds both kv heads, and each
+    mamba layer's state is the whole layer's (conv 18432 channels x 3, ssm
+    256 heads x 64 x 128).
+    """
+    env = _UltraHybridEnv(max_batch=4, dep4=True)
+    try:
+        assert env.mgr.num_pools == 2
+        assert env.rows == ULTRA_ATTN_ROWS
+        mapping = env.pool_mapping.tolist()
+        assert [mapping[r] for r in ULTRA_ATTN_ROWS] == [[1, k] for k in range(12)]
+        mamba_rows = [r for r in range(60) if r not in ULTRA_ATTN_ROWS]
+        assert [mapping[r] for r in mamba_rows] == [[0, k] for k in range(48)]
+        assert env.layer_views[0].shape[1:] == (2, ULTRA_DEP4_HKV, 32, ULTRA_D)
+        assert env.layer_views[0].dtype == torch.float8_e4m3fn
+        conv = env.mgr.get_conv_states(ULTRA_MAMBA_LAYERS[0])
+        ssm = env.mgr.get_ssm_states(ULTRA_MAMBA_LAYERS[0])
+        assert conv.shape[1:] == (18432, 3) and conv.dtype == torch.bfloat16, conv.shape
+        assert ssm.shape[1:] == (256, 64, 128) and ssm.dtype == torch.float16, ssm.shape
+    finally:
+        env.mgr.shutdown()
+
+
+def test_ultra_dep4_hybrid_decode_every_batch_size() -> None:
+    """dep4 decode on the attention-DP hybrid pool at every batch size 1..32.
+
+    One rank's own requests, at row 41 (pool 1, layer-in-pool 8): histories of
+    33..512 tokens with one of 1100 from batch 16 on, so the short- and long-KV
+    decode kernels are both driven at every size. Rows gated by
+    `_compare_split_softmax` against the e4m3 reference; afterwards every page
+    is bitwise where the manager put it and the recurrent state is untouched.
+    """
+    torch.manual_seed(1074)
+    env = _UltraHybridEnv(max_batch=32, dep4=True)
+    try:
+        row = 41
+        layer = ULTRA_ATTN_ROWS.index(row)
+        hist = [33 + (i * 97) % 480 for i in range(32)]
+        hist[15] = 1100
+        rids = list(range(32))
+        for rid, n in zip(rids, hist):
+            env.add_request(rid, n)
+        env.fill_recurrent_sentinel()
+        env.refresh_offsets(rids, num_contexts=32)
+        env.call_op(layer, env.random_qkv(sum(hist)), hist, 32, rids, local_layer_idx=row)
+        # Room for the up-to-32 decode rows a request takes over the sweep.
+        for rid in rids:
+            for _ in range(32):
+                env.add_decode_token(rid)
+        worst = 0.0
+        for batch in range(1, 33):
+            env.refresh_offsets(rids[:batch], num_contexts=0)
+            qkv = env.random_qkv(batch)
+            out = env.call_op(
+                layer,
+                qkv,
+                [1] * batch,
+                0,
+                rids[:batch],
+                local_layer_idx=row,
+                ctx_lens=[env.prompt_lens[r] for r in rids[:batch]],
+            )
+            ref = _op_reference(env, qkv, [1] * batch, rids[:batch], e4m3=True, layer=layer)
+            _compare_split_softmax(out, ref)
+            rel = (out.float() - ref.float()).pow(2).mean().sqrt() / ref.float().pow(
+                2
+            ).mean().sqrt()
+            worst = max(worst, rel.item() / ULP[torch.bfloat16])
+        env.check_caches(rids, layers=[layer])
+        print(f"dep4 hybrid decode worst rel RMS {worst:.2f} ulp")
+        env.assert_recurrent_untouched("dep4 decode")
+    finally:
+        env.mgr.shutdown()
+
+
+def _ultra_fp8_env(kv_scaling_factor: Optional[float] = None, **kwargs) -> _PagedAttnEnv:
+    """The Ultra rank's attention over a single-layer fp8 pool."""
+    kwargs.setdefault("num_blocks", 1024)
+    kwargs.setdefault("max_batch", 32)
+    kwargs.setdefault("max_blocks_per_seq", 48)
+    return _PagedAttnEnv(
+        num_heads=ULTRA_HQ,
+        num_kv_heads=ULTRA_HKV,
+        head_dim=ULTRA_D,
+        tokens_per_block=32,
+        pool_dtype=torch.float8_e4m3fn,
+        quant_mode=QUANT_MODE_FP8_KV_CACHE,
+        kv_scaling_factor=kv_scaling_factor,
+        **kwargs,
+    )
+
+
+def test_ultra_none_kv_scales_are_exactly_one() -> None:
+    """What lets the target pass both kv scales as None: the checkpoint's k_scale
+    and v_scale are 1.0 on every layer, and None is read as exactly that. A
+    packed prefill and a decode with None, and the same two calls with fp32 [1]
+    tensors holding 1.0, leave the output and the pool bitwise identical. The
+    control is the same comparison at s = 2.0, which must see the scale."""
+    torch.manual_seed(1071)
+    lens = [70, 33]
+    width = (ULTRA_HQ + 2 * ULTRA_HKV) * ULTRA_D
+    ctx = torch.randn(sum(lens), width, dtype=torch.bfloat16, device="cuda")
+    dec = torch.randn(2, width, dtype=torch.bfloat16, device="cuda")
+    runs = {}
+    for scale in (None, 1.0, 2.0):
+        env = _ultra_fp8_env(kv_scaling_factor=scale)
+        for rid, n in enumerate(lens):
+            env.add_request(rid, n)
+        prefill = env.call_op(ctx, lens, 2, [0, 1], MASK_CAUSAL)
+        decode = env.call_op(dec, [1, 1], 0, [0, 1], MASK_CAUSAL)
+        runs[scale] = (prefill, decode, env.kv_cache.clone())
+    for i, what in enumerate(("prefill output", "decode output", "pool")):
+        assert _bitwise_equal(runs[None][i], runs[1.0][i]), f"{what}: None is not 1.0"
+    assert not _bitwise_equal(runs[None][2], runs[2.0][2]), (
+        "the pool at s = 2.0 equals the pool at None: this comparison cannot see a scale"
+    )
+
+
+def test_ultra_fp8_decode_every_batch_size() -> None:
+    """Decode at every batch size from 1 to 32, one call each.
+
+    The target's decode-only steps run in CUDA graphs padded to a captured size,
+    and its mixed steps hand the op any count of generation rows, so every size
+    up to the batch ceiling reaches the kernel; the cells pin 1 and 32. Batches
+    below 16 read histories of 33..512 tokens, and from 16 on they include an
+    1100-token one, so both the short-KV and long-KV kernel choices are driven at
+    every size they meet. Each call is inside `_compare_split_softmax` of the
+    e4m3 reference.
+    """
+    torch.manual_seed(1072)
+    env = _ultra_fp8_env()
+    hist = [33 + (i * 97) % 480 for i in range(32)]
+    hist[15] = 1100
+    rids = list(range(32))
+    for rid, n in zip(rids, hist):
+        env.add_request(rid, n)
+    env.call_op(env.random_qkv(sum(hist)), hist, len(hist), rids, MASK_CAUSAL)
+    for batch in range(1, 33):
+        qkv = env.random_qkv(batch)
+        out = env.call_op(qkv, [1] * batch, 0, rids[:batch], MASK_CAUSAL)
+        _compare_split_softmax(out, _op_reference(env, qkv, [1] * batch, rids[:batch], e4m3=True))
+    for rid in rids:
+        env.check_cache(rid)
+    env.check_unwritten_pool_zero()
+
+
+def test_ultra_fp8_decode_one_tile_is_the_e4m3_model() -> None:
+    """Within one KV tile the decode has a single running maximum, the row's,
+    so `reference(e4m3_inputs, e4m3_probabilities)` is the kernel's own
+    arithmetic: q, K, V and the 448-scaled probabilities all e4m3, the row sum
+    in fp32, the kv scales passed as None read as 1.0. Batch 32 over histories
+    of 33..64 keys -- past the first page, inside one tile even of half the
+    128 keys measured -- is gated at 1 ulp element / 0.25 ulp RMS, and the two
+    models `_compare_split_softmax` cannot separate -- probabilities kept in
+    fp32, and no e4m3 rounding at all -- must each sit far outside that."""
+    torch.manual_seed(1073)
+    env = _ultra_fp8_env()
+    hist = [33 + i for i in range(32)]
+    assert max(hist) <= 64
+    rids = list(range(32))
+    for rid, n in zip(rids, hist):
+        env.add_request(rid, n)
+    env.call_op(env.random_qkv(sum(hist)), hist, len(hist), rids, MASK_CAUSAL)
+    qkv = env.random_qkv(32)
+    out = env.call_op(qkv, [1] * 32, 0, rids, MASK_CAUSAL)
+    assert_within_ulp(
+        out,
+        _op_reference(env, qkv, [1] * 32, rids, e4m3=True),
+        element_ulp=1.0,
+        rms_ulp=0.25,
+        ulp=ULP[torch.bfloat16],
+    )
+    ks, vs = zip(*(_history(env, rid) for rid in rids))
+    rivals = {
+        "probabilities kept in fp32": dict(e4m3_inputs=True),
+        "no e4m3 rounding at all": dict(),
+    }
+    for label, kw in rivals.items():
+        rival = op.reference(
+            qkv[:, : ULTRA_HQ * ULTRA_D],
+            torch.cat(ks).reshape(-1, ULTRA_HKV * ULTRA_D),
+            torch.cat(vs).reshape(-1, ULTRA_HKV * ULTRA_D),
+            [1] * 32,
+            hist,
+            num_heads=ULTRA_HQ,
+            num_kv_heads=ULTRA_HKV,
+            qk_head_dim=ULTRA_D,
+            v_head_dim=ULTRA_D,
+            softmax_scale=1.0 / math.sqrt(ULTRA_D),
+            **kw,
+        )
+        rel_rms = (
+            (out.float() - rival.float()).pow(2).mean().sqrt() / rival.float().pow(2).mean().sqrt()
+        ).item()
+        assert rel_rms > 4 * 0.25 * ULP[torch.bfloat16], (
+            f"the rival '{label}' sits {rel_rms / ULP[torch.bfloat16]:.2f} ulp RMS from the kernel: "
+            f"this test cannot tell it from the e4m3 model"
+        )
+
+
 # ─── The entry's own cell list ──────────────────────────────────────────
 
 
@@ -6924,14 +7367,15 @@ def _seed(cell) -> None:
     torch.manual_seed(zlib.crc32(cell.why.encode()))
 
 
-def _cell_paged(cell, arm) -> None:
+def _cell_paged(cell, arm, e4m3_compare=None) -> None:
     """A standard-configuration cell over a single-layer paged pool.
 
     A first, uncertified context call fills each sequence's `cached` tokens;
     the certified call then appends `new` rows per sequence (P for a generation
     row) and is gated against `op.reference` over the history it should have
     attended. Over an fp8 pool every operand that call reads went through
-    e4m3, except on the packed context path, which never reads the pool.
+    e4m3, except on the packed context path, which never reads the pool;
+    `_gate_rows` gates the two kinds of row separately.
     """
     spec = cell.spec
     arm(op)
@@ -6944,7 +7388,7 @@ def _cell_paged(cell, arm) -> None:
         tokens_per_block=spec["tokens_per_block"],
         num_blocks=spec["num_blocks"],
         max_batch=spec["max_num_requests"],
-        max_blocks_per_seq=16,
+        max_blocks_per_seq=spec.get("max_blocks_per_seq", 16),
         pool_dtype=torch.float8_e4m3fn if fp8 else torch.bfloat16,
         quant_mode=spec["quant_mode"],
         kv_scaling_factor=spec["kv_scale"] if fp8 else None,
@@ -6979,15 +7423,49 @@ def _cell_paged(cell, arm) -> None:
         use_paged_context_fmha=paged,
         predicted_tokens_per_seq=p,
     )
-    # One e4m3 flag covers the whole call: the packed path's context rows read
-    # bf16, its generation rows e4m3, so a cell never mixes the two there.
-    assert not (fp8 and not paged and 0 < nc < len(rids))
-    e4m3 = fp8 and (paged or nc == 0)
     causal = spec["mask_type"] == MASK_CAUSAL
-    _compare(out, _op_reference(env, qkv, list(new), rids, causal=causal, e4m3=e4m3))
+    _gate_rows(out, env, qkv, list(new), rids, nc, fp8, paged, e4m3_compare, causal=causal)
     for rid in rids:
         env.check_cache(rid)
     env.check_unwritten_pool_zero()
+
+
+def _gate_rows(
+    out: torch.Tensor,
+    env,
+    qkv: torch.Tensor,
+    new: List[int],
+    rids: List[int],
+    nc: int,
+    fp8: bool,
+    paged: bool,
+    e4m3_compare=None,
+    causal: bool = True,
+    layer: Optional[int] = None,
+) -> None:
+    """Gate each row group of a call against the `op.reference` matching what it read.
+
+    Over an fp8 pool the paged-context path and every generation row read e4m3
+    operands from the pool, and are gated by `e4m3_compare` (`_compare` unless a
+    cell's geometry says otherwise); the packed path's context rows attend over
+    this call's own bf16 q/k/v rows and never read the pool, so they get
+    `_compare` against the unrounded reference. A packed mixed step carries
+    both groups; every other call is one group.
+    """
+    if not fp8:
+        _compare(out, _op_reference(env, qkv, new, rids, causal=causal, layer=layer))
+        return
+    e4m3_compare = e4m3_compare or _compare
+    first_e4m3 = 0 if paged else nc
+    split = sum(new[:first_e4m3])
+    if split:
+        ref = _op_reference(env, qkv[:split], new[:nc], rids[:nc], causal, e4m3=False, layer=layer)
+        _compare(out[:split], ref)
+    if split < out.shape[0]:
+        ref = _op_reference(
+            env, qkv[split:], new[first_e4m3:], rids[first_e4m3:], causal, e4m3=True, layer=layer
+        )
+        e4m3_compare(out[split:], ref)
 
 
 def _cell_layered(cell, arm) -> None:
@@ -7070,6 +7548,74 @@ def _cell_layered(cell, arm) -> None:
         assert _bitwise_equal(before, after), "a pool-0 row wrote the second pool"
 
 
+def _cell_ultra_hybrid(cell, arm) -> None:
+    """A Nemotron-3 Ultra cell at one row of the real hybrid manager's mapping.
+
+    The history goes in through the same row by an uncertified context call on
+    the cell's own path; the certified call's rows are then gated against
+    `op.reference` by `_gate_rows`, the e4m3 ones in `_compare_split_softmax`.
+    Beside that: every page landed bitwise where the manager's pool-1 offsets
+    put it, the call moved its own layer's slabs and no sibling's, and the
+    recurrent state on pool 0 kept its sentinel through both calls.
+    """
+    spec = cell.spec
+    arm(op)
+    _seed(cell)
+    dep4 = spec["pool_layout"] == "ultra_hybrid60_dep4"
+    env = _UltraHybridEnv(max_batch=spec["max_num_requests"], dep4=dep4)
+    try:
+        assert (env.num_heads, env.num_kv_heads) == (spec["num_heads"], spec["num_kv_heads"])
+        row, p = spec["local_layer_idx"], spec["predicted_tokens_per_seq"]
+        cached, new, nc = spec["cached"], spec["new"], spec["num_contexts"]
+        paged = spec["use_paged_context_fmha"]
+        layer = ULTRA_ATTN_ROWS.index(row)
+        assert env.rows == ULTRA_ATTN_ROWS
+        assert env.pool_mapping[row].tolist() == [env.attn_pool, layer], "row -> (pool, layer)"
+        rids = list(range(len(new)))
+        for rid in rids:
+            env.add_request(rid, cached[rid] + (new[rid] if rid < nc else 0))
+        env.fill_recurrent_sentinel()
+        prior = [rid for rid in rids if cached[rid]]
+        if prior:
+            hist = [cached[rid] for rid in prior]
+            env.refresh_offsets(prior, num_contexts=len(prior))
+            env.call_op(
+                layer,
+                env.random_qkv(sum(hist)),
+                hist,
+                len(prior),
+                prior,
+                local_layer_idx=row,
+                use_paged_context_fmha=paged,
+                ctx_lens=hist,
+            )
+        for rid in rids[nc:]:
+            for _ in range(p):
+                env.add_decode_token(rid)
+        env.refresh_offsets(rids, num_contexts=nc)
+        qkv = env.random_qkv(sum(new))
+        snapshot = [v.clone() for v in env.layer_views]
+        out = env.call_op(
+            layer,
+            qkv,
+            list(new),
+            nc,
+            rids,
+            local_layer_idx=row,
+            use_paged_context_fmha=paged,
+            ctx_lens=[new[i] if i < nc else env.prompt_lens[i] for i in rids],
+            predicted_tokens_per_seq=p,
+        )
+        _gate_rows(
+            out, env, qkv, list(new), rids, nc, True, paged, _compare_split_softmax, layer=layer
+        )
+        env.check_caches(rids, layers=[layer])
+        _assert_only_this_layer_moved(env, snapshot, layer, cell.why)
+        env.assert_recurrent_untouched(cell.why)
+    finally:
+        env.mgr.shutdown()
+
+
 def _cell_encoder(cell, arm) -> None:
     """The no-KV-cache mode: one context sequence per frame, no cache
     addressing, gated against `op.reference` over each frame's own rows."""
@@ -7106,10 +7652,12 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811
     kind = spec["input_type"]
     if spec.get("kv_cache") == "none":
         _cell_encoder(cell, certifying)
+    elif spec.get("pool_layout") in ("ultra_hybrid60", "ultra_hybrid60_dep4"):
+        _cell_ultra_hybrid(cell, certifying)
     elif "pool_layout" in spec:
         _cell_layered(cell, certifying)
     elif "cached" in spec:
-        _cell_paged(cell, certifying)
+        _cell_paged(cell, certifying, _e4m3_compare_for(spec))
     elif kind == STANDARD:
         _cell_standard(cell)
     elif kind == MLA_CONTEXT:

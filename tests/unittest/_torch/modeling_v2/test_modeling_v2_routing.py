@@ -338,3 +338,105 @@ def test_qwen4_exp_deepstack_vision_tower_does_not_match():
 def test_qwen4_exp_on_two_ranks_does_not_match():
     config = _model_config(_qwen4_exp_config(), world_size=2, tp_size=2)
     assert modeling_v2_resolve(config, _llm_args("auto")) is None
+
+
+# --- nemotron_h -------------------------------------------------------------
+
+_SM107 = (10, 7)
+_ULTRA_TARGET = (
+    "models.nemotron_h.nemotron3_ultra_nvfp4__sm_107__tep4.modeling."
+    "ModelingV2Nemotron3UltraNvfp4Sm107Tep4"
+)
+_ULTRA_DEP4_TARGET = (
+    "models.nemotron_h.nemotron3_ultra_nvfp4__sm_107__dep4.modeling."
+    "ModelingV2Nemotron3UltraNvfp4Sm107Dep4"
+)
+_TEP4 = dict(world_size=4, tp_size=4, moe_ep_size=4, moe_tp_size=1, enable_attention_dp=False)
+
+
+def _ultra_config(**overrides):
+    """The shape Nemotron-3 Ultra 550B-A55B NVFP4's own config.json declares."""
+    fields = dict(
+        architectures=["NemotronHForCausalLM"],
+        model_type="nemotron_h",
+        hidden_size=8192,
+        mamba_num_heads=256,
+        mamba_head_dim=64,
+        n_groups=8,
+        ssm_state_size=128,
+        num_attention_heads=64,
+        num_key_value_heads=2,
+        head_dim=128,
+        n_routed_experts=512,
+        num_experts_per_tok=22,
+        moe_intermediate_size=5120,
+        moe_latent_size=2048,
+        moe_shared_expert_intermediate_size=10240,
+        layers_block_type=["mamba", "moe", "mamba", "attention", "moe"] * 2,
+        quantization_config=dict(
+            quant_algo="MIXED_PRECISION",
+            kv_cache_scheme=dict(dynamic=False, num_bits=8, type="float"),
+        ),
+    )
+    fields.update(overrides)
+    return PretrainedConfig(**fields)
+
+
+@pytest.fixture
+def _on_sm107(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **k: _SM107)
+
+
+@pytest.mark.parametrize("mode", ["auto", "require"])
+def test_ultra_tep4_matches(mode, _on_sm107):
+    config = _model_config(_ultra_config(), **_TEP4)
+    assert _qualified(modeling_v2_resolve(config, _llm_args(mode))) == _ULTRA_TARGET
+
+
+@pytest.mark.parametrize("mode", ["auto", "require"])
+def test_ultra_dep4_matches(mode, _on_sm107):
+    """Attention DP is an identity criterion: it selects the replicated-attention target."""
+    config = _model_config(_ultra_config(), **dict(_TEP4, enable_attention_dp=True))
+    assert _qualified(modeling_v2_resolve(config, _llm_args(mode))) == _ULTRA_DEP4_TARGET
+
+
+def test_ultra_depth_is_not_part_of_the_identity(_on_sm107):
+    """Every weight the target declares is per layer and the stack is built from the
+    config's own block list, so a prefix of the layers runs the same code."""
+    config = _model_config(_ultra_config(layers_block_type=["mamba", "moe", "attention"]), **_TEP4)
+    assert _qualified(modeling_v2_resolve(config, _llm_args("require"))) == _ULTRA_TARGET
+
+
+@pytest.mark.parametrize(
+    "config_kwargs, mapping_kwargs, missed",
+    [
+        # Nemotron-3 Super's geometry
+        (dict(hidden_size=4096, n_routed_experts=512), {}, r"config shape \(4096,"),
+        # a dense-MLP block the target does not implement
+        (dict(layers_block_type=["mamba", "mlp", "attention"]), {}, "block kinds"),
+        # a BF16 export of the same model
+        (dict(quantization_config=None), {}, r"quantization \(None, None\)"),
+        # the right checkpoint, the experts tensor-parallel instead of expert-parallel
+        (dict(), dict(_TEP4, moe_ep_size=1, moe_tp_size=4), "moe_ep=1"),
+        # the right checkpoint on 8 ranks
+        (dict(), dict(world_size=8, tp_size=8, moe_ep_size=8), "world_size=8"),
+    ],
+)
+def test_ultra_near_misses_do_not_match(config_kwargs, mapping_kwargs, missed, _on_sm107):
+    config = _model_config(_ultra_config(**config_kwargs), **(mapping_kwargs or _TEP4))
+    assert modeling_v2_resolve(config, _llm_args("auto")) is None
+
+    with pytest.raises(ValueError, match=missed):
+        modeling_v2_resolve(config, _llm_args("require"))
+
+
+def test_ultra_on_sm103_does_not_match():
+    """Certification is per architecture: the autouse fixture routes as a GB300."""
+    config = _model_config(_ultra_config(), **_TEP4)
+    with pytest.raises(ValueError, match=r"compute capability \(10, 3\)"):
+        modeling_v2_resolve(config, _llm_args("require"))
+
+
+def test_ultra_with_speculative_decoding_does_not_match(_on_sm107):
+    config = _model_config(_ultra_config(), spec_config=_NGRAM, **_TEP4)
+    assert modeling_v2_resolve(config, _llm_args("auto")) is None

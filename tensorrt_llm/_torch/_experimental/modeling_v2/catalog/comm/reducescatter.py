@@ -41,10 +41,10 @@ class Reducescatter(OpWrapper):
     every rank; `input` is left untouched.
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = frozenset({Arch.SM_103, Arch.SM_107})
 
-    # deepseek-r1 at dep4 is the only caller and always passes `sizes=None`:
-    # it pads to a common height first. The row counts are the full heights an
+    # deepseek-r1 and nemotron_h at dep4 are the callers and always pass
+    # `sizes=None`: they pad to a common height first. The row counts are the full heights an
     # attention-DP step reduces, which is the rank count times a slice.
     CELLS: tuple[Cell, ...] = (
         Cell(
@@ -58,6 +58,19 @@ class Reducescatter(OpWrapper):
         Cell(
             why="prefill chunk height",
             spec=dict(rows_per_rank=2048, trailing=(7168,), dtype=torch.bfloat16, sizes=None),
+        ),
+        # nemotron_h's Ultra at dep4 sums the experts' latent partials over the
+        # gathered rows, [4 * T_pad, 2048], and keeps its own T_pad rows.
+        *(
+            Cell(
+                why=f"nemotron_h dep4 MoE latent partial, T_pad={rows}: latent 2048{tail}",
+                spec=dict(rows_per_rank=rows, trailing=(2048,), dtype=torch.bfloat16, sizes=None),
+            )
+            for rows, tail in (
+                (1, ", one decode token per rank"),
+                (32, ", the decode CUDA-graph ceiling"),
+                (8192, ", a max_num_tokens prefill step"),
+            )
         ),
     )
 

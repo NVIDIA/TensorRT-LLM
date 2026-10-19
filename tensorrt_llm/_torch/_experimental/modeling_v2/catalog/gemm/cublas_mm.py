@@ -18,10 +18,10 @@ class CublasMm(OpWrapper):
     is -- the targets pass `weight.t()` and no transpose kernel runs.
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = frozenset({Arch.SM_103, Arch.SM_107})
 
-    # Both targets use this for every dense projection, so the cells are the
-    # three argument shapes that differ in kind rather than in size: fused bias
+    # The targets use this for every bf16 dense projection, so the first cells
+    # are the three argument shapes that differ in kind rather than in size: fused bias
     # (gpt-oss carries one on qkv, o and the router), no bias (deepseek's
     # projections), and an out_dtype that is not the input's (deepseek's router
     # asks for fp32 logits).
@@ -44,12 +44,74 @@ class CublasMm(OpWrapper):
             why="decode-shaped: one token, the shape every projection sees per step",
             spec=dict(m=1, k=7168, n=1536, dtype=torch.bfloat16, bias=False, out_dtype=None),
         ),
+        # nemotron_h's Ultra at tep4: every dense projection of a rank, at the three
+        # row counts that pick different cuBLAS kernels -- one decode token, the
+        # 32-row CUDA-graph ceiling, and an 8192-token prefill step.
+        *(
+            Cell(
+                why=f"nemotron_h {what}, T={m}{tail}",
+                spec=dict(m=m, k=k, n=n, dtype=torch.bfloat16, bias=False, out_dtype=None),
+            )
+            for what, k, n, first in (
+                ("qkv", 8192, 2304, ": hidden 8192 -> (16 + 1 + 1) x 128 = 2304"),
+                ("o_proj / fc2_latent", 2048, 8192, ": 2048 -> 8192, a row-parallel partial"),
+                ("fc1_latent", 8192, 2048, ": hidden 8192 -> latent 2048"),
+            )
+            for m, tail in (
+                (1, first),
+                (32, ", the decode CUDA-graph ceiling"),
+                (8192, ", a max_num_tokens prefill step"),
+            )
+        ),
+        *(
+            Cell(
+                why=f"nemotron_h router, T={m}{tail}",
+                spec=dict(
+                    m=m, k=8192, n=512, dtype=torch.bfloat16, bias=False, out_dtype=torch.float32
+                ),
+            )
+            for m, tail in (
+                (1, ": bf16-exact weight, fp32 logits for 512 experts"),
+                (32, ", the decode CUDA-graph ceiling"),
+                (8192, ", a max_num_tokens prefill step"),
+            )
+        ),
+        # nemotron_h's Ultra at dep4: attention is replicated, so a rank runs the
+        # unsharded qkv and o_proj over its own tokens.
+        *(
+            Cell(
+                why=f"nemotron_h dep4 {what}, T={m}{tail}",
+                spec=dict(m=m, k=8192, n=n, dtype=torch.bfloat16, bias=False, out_dtype=None),
+            )
+            for what, n, first in (
+                ("qkv", 8704, ": hidden 8192 -> (64 + 2 + 2) x 128 = 8704"),
+                ("o_proj", 8192, ": 64 x 128 = 8192 -> hidden 8192, unsharded"),
+            )
+            for m, tail in (
+                (1, first),
+                (32, ", the decode CUDA-graph ceiling"),
+                (8192, ", a max_num_tokens prefill step"),
+            )
+        ),
     )
 
     note = """
     `output_buffer_kind` and `group` are the op's multi-stream and collective
-    arguments. Both shipped targets leave them at their defaults, so neither is
+    arguments. The shipped targets leave them at their defaults, so neither is
     a cell axis and neither is certified here.
+
+    `out_dtype=torch.float32` over bf16 operands is a genuinely fp32 result,
+    not a bf16 one in a wider container: a product of two bf16 values has at
+    most 16 significant bits and is exact in fp32, so the only error left is
+    fp32 accumulation. Measured on sm_107 against the exact product at K 8192:
+    5-12 fp32 ulp RMS up to 32 rows, 76 at 8192 rows (the large-row tensor-core
+    kernels accumulate with more error), against about 14,000 for the same
+    logits rounded to bf16. That is what a router reading its logits against a
+    bias near 32 relies on. The router weight nemotron_h stores in fp32 is
+    bf16-exact, so it is passed as bf16 at no cost. For the same reason TF32
+    would not truncate these operands either: bf16 values are exact in TF32's
+    10-bit mantissa. TF32 only bites fp32 operands that are not already
+    bf16-exact.
     """
 
     def __call__(

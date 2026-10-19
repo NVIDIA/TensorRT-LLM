@@ -81,24 +81,69 @@ _FP8_24_4_256 = dict(
     max_num_requests=4,
 )
 
+#: Nemotron-3 Ultra's attention layer at tep4, per rank: the checkpoint's 64 q / 2 kv
+#: heads split four ways are 16 q heads over ceil(2/4) = 1 kv head, head_size 128.
+#: The model has no positional encoding anywhere, so nothing rotates q or k
+#: (position_embedding_type 0, rope_dim 0). The pool is fp8-e4m3 and both kv scales
+#: are passed as None, which the op reads as exactly 1.0 -- the checkpoint's k/v
+#: scale on every layer. The context calls take the packed path unless chunked
+#: prefill, block reuse or speculation is on, which is what turns the paged-context
+#: path on. Pool sizes are chosen: 48 block-offset columns per sequence (1536
+#: tokens) and 32 rows, the target's CUDA-graph batch ceiling.
+_ULTRA_FP8_16_1_128 = dict(
+    input_type=STANDARD,
+    num_heads=16,
+    num_kv_heads=1,
+    head_size=128,
+    v_head_dim=128,
+    sinks=False,
+    window=None,
+    quant_mode=QM_FP8_KV_CACHE,
+    kv_scale=None,
+    mask_type=1,
+    tokens_per_block=32,
+    num_blocks=640,
+    max_num_requests=32,
+    max_blocks_per_seq=48,
+    use_paged_context_fmha=False,
+)
+
+#: Nemotron-3 Ultra's attention layer at dep4 (attention data parallel): every rank
+#: runs its own requests through the unsharded layer, 64 q heads over 2 kv heads at
+#: head_size 128, otherwise the tep4 configuration. Its pool is the real hybrid
+#: manager's under attention DP, where kv heads and the mamba state are not split.
+_ULTRA_DEP4_FP8_64_2_128 = dict(
+    _ULTRA_FP8_16_1_128,
+    num_heads=64,
+    num_kv_heads=2,
+    pool_layout="ultra_hybrid60_dep4",
+)
+
+#: The 32 histories of the batch-32 decode cells: every one past its first page,
+#: from 33 (one row into the second page) up to 512, with page fills that differ.
+_ULTRA_DECODE_HISTORIES = tuple(33 + (i * 97) % 480 for i in range(32))
+
 
 class ThopAttention(OpWrapper):
     """Append this step's K/V to the paged cache, then attend over it.
 
     The most load-bearing entry in the catalog and the only one wrapping a
-    pybind binding rather than a registered torch op. Three targets go through
+    pybind binding rather than a registered torch op. Four targets go through
     it, by different paths: gpt-oss on the standard path with attention sinks
-    and an alternating sliding window, deepseek on MLA's two phases, and
+    and an alternating sliding window, deepseek on MLA's two phases,
     qwen4_exp on the standard path twice over -- its full-attention layers and
     MTP module (GQA 24/2/256, a P-token draft block per generation sequence,
-    a two-pool hybrid mapping), and its vision tower with no KV cache at all.
+    a two-pool hybrid mapping), and its vision tower with no KV cache at all --
+    and nemotron_h's Ultra on the standard path with no positional encoding,
+    16 q heads over one kv head at d128 at tep4 and the unsharded 64 over 2 at
+    dep4, over an fp8 pool that its hybrid manager places on pool 1.
 
     Writes rows `[:num_tokens]` of `output` and returns `output` -- the same
     buffer, mutated and handed back so a call site can show what it touched
     without allocating.
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = frozenset({Arch.SM_103, Arch.SM_107})
 
     # gpt-oss alternates its two window classes inside one engine, so both of
     # its cells are live every step; deepseek runs context and generation
@@ -404,6 +449,136 @@ class ThopAttention(OpWrapper):
                 predicted_tokens_per_seq=3,
             ),
         ),
+        Cell(
+            why="nemotron_h ultra tep4 packed prefill: GQA 16q/1kv d128, fp8 pool, kv "
+            "scales None, no rope; fresh contexts of 1, 1100, 77 and 300 rows",
+            spec=dict(
+                _ULTRA_FP8_16_1_128,
+                cached=(0, 0, 0, 0),
+                new=(1, 1100, 77, 300),
+                num_contexts=4,
+                predicted_tokens_per_seq=1,
+            ),
+        ),
+        Cell(
+            why="nemotron_h ultra decode, batch 1: one row over an 1100-token history "
+            "of 35 pages, the longest KV range a cell reads",
+            spec=dict(
+                _ULTRA_FP8_16_1_128,
+                cached=(1100,),
+                new=(1,),
+                num_contexts=0,
+                predicted_tokens_per_seq=1,
+            ),
+        ),
+        Cell(
+            why="nemotron_h ultra decode, batch 32, the target's CUDA-graph ceiling: "
+            "histories 33..512, every one past its first page",
+            spec=dict(
+                _ULTRA_FP8_16_1_128,
+                cached=_ULTRA_DECODE_HISTORIES,
+                new=(1,) * 32,
+                num_contexts=0,
+                predicted_tokens_per_seq=1,
+            ),
+        ),
+        Cell(
+            why="nemotron_h ultra mixed step, packed: fresh 1- and 1031-row contexts "
+            "ahead of six decode rows over histories 33..700",
+            spec=dict(
+                _ULTRA_FP8_16_1_128,
+                cached=(0, 0, 33, 64, 65, 200, 511, 700),
+                new=(1, 1031, 1, 1, 1, 1, 1, 1),
+                num_contexts=2,
+                predicted_tokens_per_seq=1,
+            ),
+        ),
+        Cell(
+            why="nemotron_h ultra paged-context prefill (chunked prefill / block reuse): "
+            "512 rows over a 640-token cached prefix beside a fresh 1-row context",
+            spec=dict(
+                _ULTRA_FP8_16_1_128,
+                use_paged_context_fmha=True,
+                cached=(640, 0),
+                new=(512, 1),
+                num_contexts=2,
+                predicted_tokens_per_seq=1,
+            ),
+        ),
+        Cell(
+            why="nemotron_h ultra hybrid pool: row 55 of a real MambaHybridCacheManagerV2's "
+            "60-row mapping (pool 1, layer-in-pool 11), packed mixed step",
+            spec=dict(
+                _ULTRA_FP8_16_1_128,
+                pool_layout="ultra_hybrid60",
+                local_layer_idx=55,
+                cached=(0, 0, 100, 37, 300),
+                new=(1, 1100, 1, 1, 1),
+                num_contexts=2,
+                predicted_tokens_per_seq=1,
+            ),
+        ),
+        Cell(
+            why="nemotron_h ultra hybrid pool: row 4, the first attention layer "
+            "(pool 1, layer-in-pool 0), decode batch 32",
+            spec=dict(
+                _ULTRA_FP8_16_1_128,
+                pool_layout="ultra_hybrid60",
+                local_layer_idx=4,
+                cached=_ULTRA_DECODE_HISTORIES,
+                new=(1,) * 32,
+                num_contexts=0,
+                predicted_tokens_per_seq=1,
+            ),
+        ),
+        Cell(
+            why="nemotron_h ultra dep4 packed prefill: GQA 64q/2kv d128 on the attention-DP "
+            "hybrid pool, row 4; fresh contexts of 1, 1100, 77 and 300 rows",
+            spec=dict(
+                _ULTRA_DEP4_FP8_64_2_128,
+                local_layer_idx=4,
+                cached=(0, 0, 0, 0),
+                new=(1, 1100, 77, 300),
+                num_contexts=4,
+                predicted_tokens_per_seq=1,
+            ),
+        ),
+        Cell(
+            why="nemotron_h ultra dep4 decode, batch 1: row 55, one row over an "
+            "1100-token history of 35 pages",
+            spec=dict(
+                _ULTRA_DEP4_FP8_64_2_128,
+                local_layer_idx=55,
+                cached=(1100,),
+                new=(1,),
+                num_contexts=0,
+                predicted_tokens_per_seq=1,
+            ),
+        ),
+        Cell(
+            why="nemotron_h ultra dep4 decode, batch 32, the CUDA-graph ceiling: row 27, "
+            "histories 33..512",
+            spec=dict(
+                _ULTRA_DEP4_FP8_64_2_128,
+                local_layer_idx=27,
+                cached=_ULTRA_DECODE_HISTORIES,
+                new=(1,) * 32,
+                num_contexts=0,
+                predicted_tokens_per_seq=1,
+            ),
+        ),
+        Cell(
+            why="nemotron_h ultra dep4 mixed step, packed: row 55, fresh 1- and 1031-row "
+            "contexts ahead of six decode rows over histories 33..700",
+            spec=dict(
+                _ULTRA_DEP4_FP8_64_2_128,
+                local_layer_idx=55,
+                cached=(0, 0, 33, 64, 65, 200, 511, 700),
+                new=(1, 1031, 1, 1, 1, 1, 1, 1),
+                num_contexts=2,
+                predicted_tokens_per_seq=1,
+            ),
+        ),
     )
 
     note = """
@@ -414,10 +589,15 @@ class ThopAttention(OpWrapper):
     A third pool is outside what was measured. qwen4_exp's hybrid tower is the
     other two-pool shape: a 48-row mapping whose full-attention rows 3, 7, ...,
     47 sit on pool 0 at layer-in-pool 0..11 and whose 36 recurrent rows name
-    pool 1. `local_layer_idx` is the mapping *row* -- the layer's
-    `layer_offsets` entry -- and the pool-base shift comes from the row's
-    layer column; an index computed by counting attention layers addresses a
-    sibling's slabs and returns plausible output.
+    pool 1. Nemotron-3 Ultra's is the reverse: MambaHybridCacheManagerV2 gives
+    its 108-layer pattern a 60-row mapping whose attention rows 4, 8, 13, ...,
+    55 sit on pool 1 at layer-in-pool 0..11, and whose 48 mamba rows are pool
+    0, where the recurrent state lives. Under attention DP (dep4) the manager
+    keeps both kv heads and the whole mamba state per rank and gives the same
+    60-row arrangement. `local_layer_idx` is the mapping *row*
+    -- the layer's `layer_offsets` entry -- and the pool-base shift comes from
+    the row's layer column; an index computed by counting attention layers
+    addresses a sibling's slabs and returns plausible output.
 
     `reference` covers the masked-softmax half. The append half -- that this
     step's K/V land in the right pool slots -- is what the paged-cache entries
@@ -449,10 +629,24 @@ class ThopAttention(OpWrapper):
     Over an fp8-e4m3 pool the packed context path reads the bf16 q rows and
     never the pool, while `use_paged_context_fmha=True` reads the pool, so its
     operands are e4m3: the flag is output-inert over a bf16 pool only. Every
-    fp8 cell runs kv scale 1.0; at 1.5 `reference` does not reproduce the
-    kernel's probability rounding.
+    fp8 cell runs kv scale 1.0, as fp32 [1] tensors or, in the nemotron_h
+    cells, as None for both, which the op reads as exactly 1.0: output and
+    pool come back bitwise equal to the tensor form. At 1.5 `reference` does
+    not reproduce the kernel's probability rounding.
     quant_mode 384, 1152, 4224 and 4480 are bit-identical to 128 at 24/4/256;
     4352 (the same bits without FP8_KV_CACHE) reads e4m3 slabs as bf16.
+
+    At 16 q heads per kv head and d128 the e4m3 decode kernel rounds each
+    probability against the running maximum of the softmax group that owns its
+    128-key tile -- two groups alternate tiles, and a launch heuristic also
+    splits a long KV range across CTAs -- where
+    `reference(e4m3_probabilities=True)` rounds against the row's maximum. A
+    plain-torch model of that schedule reproduces the kernel to 0.7 bf16 ulp
+    RMS. `reference` agrees bitwise within one tile and is up to 8 ulp RMS off
+    past it, which is e4m3's own rounding. The paged-context prefill over the
+    pool shows the same signature (11 ulp element, 4.6 RMS at 1152 keys). The
+    test gates both in a band derived from e4m3's rounding error, rather than
+    modelling a schedule the GPU picks.
 
     The sparse / skip-softmax arguments are bitwise inert in the standard
     configuration (nine off-default settings at 24/2/256): passing them does
