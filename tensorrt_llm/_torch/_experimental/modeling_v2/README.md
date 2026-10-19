@@ -123,6 +123,8 @@ The targets, as `models/<family>/<target>`:
   `kernels/`, with their C++ kernels and ops in `cpp/tensorrt_llm/kernels/glmMoeDsa` and
   `cpp/tensorrt_llm/thop/glmMoeDsa`; `shared/dispatch.py` selects them and lists the knobs.
   The tp8 and tep targets run the layer composition of `shared/layers.py`, each with its own plan.
+  Each GLM-5.2 target is gated end to end by
+  `tests/integration/defs/accuracy/modeling_v2/test_glm_moe_dsa.py` (GSM8K under `require`).
 * `glm_moe_dsa/glm_5_2_nvfp4__sm_103__tep`: the same checkpoint with attention tensor-parallel
   over four or eight ranks and the experts expert-parallel over the same ranks. It runs the
   shared fast paths that take its tensor-parallel size, in front of the built-in

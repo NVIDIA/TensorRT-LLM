@@ -20,6 +20,8 @@ l0_gb300_multi_gpus:
   - accuracy/modeling_v2/test_deepseek_v3.py::TestModelingV2DeepseekR10528Nvfp4Sm103Dep4::test_gsm8k_identity_vs_mtp3
   - accuracy/modeling_v2/test_deepseek_v3.py::TestModelingV2DeepseekR10528Nvfp4Sm103Dep4::test_mtp3_acceptance[modeling_v2]
   - accuracy/modeling_v2/test_deepseek_v3.py::TestModelingV2DeepseekR10528Nvfp4Sm103Dep4::test_mtp3_acceptance[stock]
+  # GLM-5.2 NVFP4 modeling_v2 tep target, GSM8K under modeling_v2="require". Measured 17 min on 4 GB300.
+  - accuracy/modeling_v2/test_glm_moe_dsa.py::TestModelingV2Glm52Nvfp4Sm103::test_gsm8k_tep4 TIMEOUT (60)
   # Covers tests/unittest/_torch/attention/. Two sub-trees moved in here from elsewhere
   # under tests/unittest/_torch/ and have no entry of their own on any list, so this entry
   # is what picks them up:
