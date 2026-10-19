@@ -210,9 +210,8 @@ def _grid_for_rows(rows: int) -> list[int]:
 class _GroupedEncoderModel(MultimodalModelMixin):
     """Minimal model whose encoder serves image and video in one call.
 
-    Mirrors the Qwen3-VL shape: `encode_multimodal_inputs` delegates to
-    `encode_multimodal_by_groups`, which is what makes the
-    `multimodal_embedding_lengths` contract load-bearing.
+    Mirrors the Qwen3-VL grouped encoder, including its prompt-order output
+    assembly from the common item metadata.
     """
 
     supports_mm_encoder_item_scheduling = True
@@ -306,8 +305,6 @@ def _make_request(modalities: list[str], *, value_start: float = 1.0) -> Multimo
         encoder_token_lengths=list(lengths),
         output_embedding_lengths=list(lengths),
     )
-    # Processors retain this field for legacy consumers. Encoder groups use
-    # the typed item metadata when available.
     return MultimodalParams(multimodal_data=multimodal_data)
 
 
@@ -394,8 +391,7 @@ def test_declared_audio_layout_selects_packed_frames_on_a_nonzero_axis():
 
 
 def test_sliced_items_survive_the_grouped_encoder_path():
-    """Regression: without `multimodal_embedding_lengths` on the slice, the
-    grouped path splits to zero rows and returns nothing for every item."""
+    """Selected views preserve output rows without acquiring request cache ownership."""
     model = _GroupedEncoderModel()
     request = _make_request(["image", "image"])
     owner = MultimodalEncoderRequestState(
@@ -417,46 +413,50 @@ def test_sliced_items_survive_the_grouped_encoder_path():
         torch.testing.assert_close(output, expected)
 
 
-def test_adjacent_same_modality_items_share_one_encoder_call():
-    """`forward_multimodal_encoder_items` batches consecutive same-modality
-    inputs into a single grouped-encoder invocation."""
-    model = _GroupedEncoderModel()
-    request = _make_request(["image", "image"])
-
-    outputs, encoder_inputs = _run_items(model, [(request, 0), (request, 1)])
-
-    assert len(encoder_inputs) == 1, "adjacent same-modality items must be sliced together"
-    assert encoder_inputs[0][1] == tuple(ITEM_ROWS["image"][:2])
-    assert model.encoder_calls == [sum(ITEM_ROWS["image"][:2])]
-    assert len(outputs) == 2
-
-
-def test_mixed_modality_items_keep_scheduler_order():
-    """A request interleaving modalities must still get one output per item,
-    in scheduler order -- this is where the per-modality reorder could bite."""
-    model = _GroupedEncoderModel()
-    request = _make_request(["image", "video", "image"])
-    selected = [(request, idx) for idx in range(3)]
-
-    outputs, encoder_inputs = _run_items(model, selected)
-
-    # image / video / image cannot merge across the modality change.
-    assert [modality for _, _, modality in encoder_inputs] == ["image", "video", "image"]
-    assert len(outputs) == 3
-    for item_idx, output in enumerate(outputs):
-        torch.testing.assert_close(output, _expected_rows(request, item_idx))
-
-
-@pytest.mark.parametrize("modalities", [["video", "image", "image"], ["image", "video", "image"]])
-def test_full_and_item_encoder_paths_share_item_metadata(modalities: list[str]) -> None:
+@pytest.mark.parametrize(
+    "modalities,item_order,expected_runs",
+    [
+        pytest.param(["image", "image"], [0, 1], [("image", 5)], id="adjacent-images"),
+        pytest.param(
+            ["video", "image", "image"],
+            [0, 1, 2],
+            [("video", 4), ("image", 5)],
+            id="video-then-images",
+        ),
+        pytest.param(
+            ["image", "video", "image"],
+            [0, 1, 2],
+            [("image", 2), ("video", 4), ("image", 3)],
+            id="interleaved-vision",
+        ),
+        pytest.param(["image", "image"], [1, 0], [("image", 5)], id="reordered-images"),
+    ],
+)
+def test_full_and_item_encoder_paths_share_item_metadata(
+    modalities: list[str], item_order: list[int], expected_runs: list[tuple[str, int]]
+) -> None:
     model = _GroupedEncoderModel()
     request = _make_request(modalities)
-    full_output = model.encode_multimodal_inputs([request])
-    item_outputs, _ = _run_items(model, [(request, i) for i in range(len(modalities))])
-    expected = torch.cat([_expected_rows(request, i) for i in range(len(modalities))])
+    original = request.item_metadata
+    # Reorder prompt refs while retaining the original payload-local indices.
+    request.multimodal_data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = MultimodalItemMetadata(
+        [original.item_refs[i] for i in item_order],
+        [original.encoder_token_lengths[i] for i in item_order],
+        [original.output_embedding_lengths[i] for i in item_order],
+    )
+    expected = [_expected_rows(request, i) for i in range(len(item_order))]
+    torch.testing.assert_close(
+        model.encode_multimodal_inputs([request]), torch.cat(expected), rtol=0, atol=0
+    )
 
-    torch.testing.assert_close(full_output, expected, rtol=0, atol=0)
-    torch.testing.assert_close(torch.cat(item_outputs), expected, rtol=0, atol=0)
+    model.encoder_calls.clear()
+    item_outputs, encoder_inputs = _run_items(model, [(request, i) for i in range(len(item_order))])
+
+    assert [modality for _, _, modality in encoder_inputs] == [m for m, _ in expected_runs]
+    assert model.encoder_calls == [rows for _, rows in expected_runs]
+    assert len(item_outputs) == len(expected)
+    for actual, rows in zip(item_outputs, expected, strict=True):
+        torch.testing.assert_close(actual, rows, rtol=0, atol=0)
 
 
 def test_metadata_is_rebased_for_partial_and_reordered_items() -> None:
@@ -475,19 +475,6 @@ def test_metadata_is_rebased_for_partial_and_reordered_items() -> None:
     assert request.multimodal_data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] is original
     torch.testing.assert_close(outputs[0], _expected_rows(request, 2), rtol=0, atol=0)
     torch.testing.assert_close(outputs[1], _expected_rows(request, 0), rtol=0, atol=0)
-
-
-def test_full_and_item_order_can_differ_from_raw_payload_order() -> None:
-    model = _GroupedEncoderModel()
-    request = _make_request(["image", "image"])
-    request.multimodal_data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = MultimodalItemMetadata(
-        [("image", 1), ("image", 0)], [3, 2], [3, 2]
-    )
-    expected = torch.cat([_expected_rows(request, 0), _expected_rows(request, 1)])
-    item_outputs, _ = _run_items(model, [(request, 0), (request, 1)])
-    torch.testing.assert_close(torch.cat(item_outputs), expected, rtol=0, atol=0)
-
-    torch.testing.assert_close(model.encode_multimodal_inputs([request]), expected, rtol=0, atol=0)
 
 
 def _attach_cache_metadata(request, item_lengths):
@@ -532,7 +519,6 @@ def test_full_cache_write_uses_canonical_lengths_without_legacy_fields():
     model._multimodal_encoder_cache = TensorLRUCache(4096)
     request = _make_request(["image", "image"])
     lengths = request.item_metadata.output_embedding_lengths
-    request.multimodal_data.pop("multimodal_embedding_lengths", None)
     _attach_cache_metadata(request, lengths)
     expected = model.encode_multimodal_inputs([request])
     calls_before = len(model.encoder_calls)
@@ -570,7 +556,6 @@ def test_partial_cache_batches_mixed_vision_and_audio_misses():
         [4, 1, 3, 2, 1],
         [4, 1, 3, 2, 1],
     )
-    request.multimodal_data.pop("multimodal_embedding_lengths", None)
     lengths = request.item_metadata.output_embedding_lengths
     _attach_cache_metadata(request, lengths)
     expected = model.encode_multimodal_inputs([request])
@@ -640,7 +625,6 @@ def test_vision_and_audio_groups_share_full_and_item_ordering(shared_vision_enco
     request.multimodal_data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = MultimodalItemMetadata(
         [("video", 0), ("audio", 0), ("image", 0), ("audio", 1)], [4, 2, 2, 2], [4, 2, 2, 2]
     )
-    request.multimodal_data.pop("multimodal_embedding_lengths", None)
     expected = torch.cat(
         [_expected_rows(request, 0), audio[0], _expected_rows(request, 2), audio[1]]
     )
