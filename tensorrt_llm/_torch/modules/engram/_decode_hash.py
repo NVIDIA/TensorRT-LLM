@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""One-token-per-request Engram history and hash computation."""
+"""Engram request-history scatter and hash computation kernels."""
 
 import triton
 import triton.language as tl
@@ -83,3 +83,33 @@ def _decode_hash_kernel(
         hashed = tl.where(remainder < 0, remainder + modulus, remainder)
         output_offset = token * ((MAX_NGRAM - 1) * N_HEAD) + (offset - 1) * N_HEAD + heads
         tl.store(output + output_offset, tl.where(real, hashed, 0), heads < N_HEAD)
+
+
+@triton.jit(do_not_specialize=["num_tokens", "history_columns"])
+def _history_scatter_kernel(
+    input_ids,
+    positions,
+    rows,
+    lookup,
+    history,
+    num_tokens,
+    history_columns,
+    VOCAB_SIZE: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """``history[rows, positions] = lookup[clamp(input_ids)]`` for unique (row, position) cells."""
+    token = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    real = token < num_tokens
+    raw = tl.load(input_ids + token, real, other=0).to(tl.int64)
+    compressed = tl.load(lookup + tl.minimum(tl.maximum(raw, 0), VOCAB_SIZE - 1), real, other=0)
+    position = tl.load(positions + token, real, other=0).to(tl.int64)
+    row = tl.load(rows + token, real, other=0).to(tl.int64)
+    valid_position = (position >= -history_columns) & (position < history_columns)
+    # PyTorch advanced indexing: negative positions wrap, out-of-range ones are errors.
+    tl.device_assert((~real) | valid_position, "Engram history position out of bounds")
+    write_position = tl.where(position < 0, position + history_columns, position)
+    tl.store(
+        history + row * history_columns + write_position,
+        compressed.to(tl.int32),
+        real & valid_position,
+    )
