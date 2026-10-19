@@ -561,7 +561,7 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
             raise NotImplementedError("K/V cache attention does not combine with sparse attention.")
         packed = None
         if k is None and v is None:
-            # q is the fused projection [1, S, H + 2*H_kv, D]: the kernel takes it as
+            # ``q`` contains packed QKV [1, S, H + 2*H_kv, D]. The kernel takes it as
             # it is and the cache takes strided K/V slices of it, so nothing is
             # re-concatenated.
             packed = q
@@ -573,8 +573,9 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
             raise ValueError("K/V cache attention needs separate q, k, v, or one packed qkv.")
         if kv_cache.tokens_per_page != TRTLLM_GEN_TOKENS_PER_PAGE:
             raise NotImplementedError(
-                f"trtllm-gen ships paged context kernels for {TRTLLM_GEN_TOKENS_PER_PAGE}-token "
-                f"pages only; the cache uses {kv_cache.tokens_per_page}. Build the cache with "
+                f"The TRTLLM backend ships paged context kernels for "
+                f"{TRTLLM_GEN_TOKENS_PER_PAGE}-token pages only; the cache uses "
+                f"{kv_cache.tokens_per_page}. Build the cache with "
                 f"tokens_per_page={TRTLLM_GEN_TOKENS_PER_PAGE} or use the CUDNN backend."
             )
         batch, num_rows, _, _ = q.shape
