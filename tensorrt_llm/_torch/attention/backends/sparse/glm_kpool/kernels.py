@@ -83,6 +83,85 @@ def gather_fp8_kv_rows(
     return selected, local_indices
 
 
+#: FlashInfer's GLM53_NOPE sparse-MLA row: 512 FP8 latent values, then four
+#: FP32 scales, one per 128-wide group.
+GLM53_NOPE_ROW_BYTES = 528
+GLM53_NOPE_PAGE_ROWS = 64
+
+
+@triton.jit
+def _pack_glm53_kv_rows_kernel(
+    rows,
+    indices,
+    scale,
+    packed,
+    packed_scales,
+    local_indices,
+    row_stride,
+    index_stride,
+    column_stride,
+    NUM_ROWS: tl.constexpr,
+    DIM: tl.constexpr,
+    ROW_BYTES: tl.constexpr,
+    NUM_SCALES: tl.constexpr,
+    TOPK: tl.constexpr,
+):
+    token = tl.program_id(0)
+    index = tl.load(indices + (token // TOPK) * index_stride + (token % TOPK) * column_stride)
+    valid = (index >= 0) & (index < NUM_ROWS)
+    dim = tl.arange(0, DIM)
+    payload = tl.load(rows + index.to(tl.int64) * row_stride + dim, mask=valid, other=0)
+    tl.store(packed + token.to(tl.int64) * ROW_BYTES + dim, payload)
+    group_scales = tl.load(scale) + tl.zeros([NUM_SCALES], dtype=tl.float32)
+    scale_offset = token.to(tl.int64) * (ROW_BYTES // 4) + DIM // 4
+    tl.store(packed_scales + scale_offset + tl.arange(0, NUM_SCALES), group_scales)
+    tl.store(local_indices + token, tl.where(valid, token, -1))
+
+
+def pack_glm53_kv_rows(
+    rows: torch.Tensor, indices: torch.Tensor, scale: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Pack selected FP8 rows into FlashInfer GLM53_NOPE pages and remap indices.
+
+    ``rows`` is ``[N, 1, 512]`` FP8 with contiguous features, ``indices`` is
+    ``[queries, topk]`` with ``topk`` a multiple of 64 and ``scale`` is the
+    cache's device FP32 dequantization scalar. Each packed row keeps the cached
+    FP8 bytes and repeats ``scale`` for all four groups, so it dequantizes to
+    the cached values. Returns uint8 pages ``[queries * topk / 64, 64, 528]``
+    and int32 local row ids; invalid indices remain -1.
+    """
+    dim = rows.shape[-1]
+    num_scales = (GLM53_NOPE_ROW_BYTES - dim) // 4
+    if rows.dtype != torch.float8_e4m3fn or num_scales * 128 != dim:
+        raise ValueError(
+            f"GLM53_NOPE packing needs FP8 rows of width 512, got {rows.dtype} width {dim}"
+        )
+    if indices.shape[1] % GLM53_NOPE_PAGE_ROWS:
+        raise ValueError(f"GLM53_NOPE packing needs topk % 64 == 0, got {indices.shape[1]}")
+    packed = torch.empty(
+        (indices.numel(), GLM53_NOPE_ROW_BYTES), dtype=torch.uint8, device=rows.device
+    )
+    local_indices = torch.empty(indices.shape, dtype=torch.int32, device=indices.device)
+    if indices.numel():
+        _pack_glm53_kv_rows_kernel[(indices.numel(),)](
+            rows.view(torch.uint8),
+            indices,
+            scale,
+            packed,
+            packed.view(torch.float32),
+            local_indices,
+            rows.stride(0),
+            indices.stride(0),
+            indices.stride(1),
+            NUM_ROWS=rows.shape[0],
+            DIM=dim,
+            ROW_BYTES=GLM53_NOPE_ROW_BYTES,
+            NUM_SCALES=num_scales,
+            TOPK=indices.shape[1],
+        )
+    return packed.view(-1, GLM53_NOPE_PAGE_ROWS, GLM53_NOPE_ROW_BYTES), local_indices
+
+
 _FP32_MIN = torch.finfo(torch.float32).min
 
 

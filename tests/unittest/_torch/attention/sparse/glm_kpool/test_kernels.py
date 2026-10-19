@@ -369,6 +369,9 @@ def test_pool_expansion_graph_replay_tracks_request_tables_and_tails():
 
 @pytest.mark.skipif(not HAS_FLASH_MLA, reason="FlashMLA not available")
 @pytest.mark.skipif(get_sm_version() < 90, reason="FlashMLA requires SM90 (Hopper) or later")
+@pytest.mark.skipif(
+    get_sm_version() in (120, 121), reason="SM120/121 runs FlashInfer, not FlashMLA"
+)
 @pytest.mark.parametrize("heads", [16, 64])
 def test_fp8_sparse_core_matches_dequantized_cache_and_replays_graph(heads):
     """Exercise the selected-row core used by production prefill, decode and verify."""
@@ -410,6 +413,106 @@ def test_fp8_sparse_core_matches_dequantized_cache_and_replays_graph(heads):
     storage.copy_((storage.float() * 0.5).to(storage.dtype))
     graph.replay()
     torch.testing.assert_close(captured, reference(), atol=2e-2, rtol=2e-2)
+
+
+def test_glm53_packing_keeps_fp8_payload_and_cache_scale():
+    """Packed rows are the cached FP8 bytes plus the per-tensor scale in every group slot."""
+    from tensorrt_llm._torch.attention.backends.sparse.glm_kpool import latent_pool_rows
+    from tensorrt_llm._torch.attention.backends.sparse.glm_kpool.kernels import pack_glm53_kv_rows
+
+    generator = torch.Generator(device="cuda").manual_seed(5)
+    storage = torch.randn(9, 8, 512, device="cuda", generator=generator).to(torch.float8_e4m3fn)
+    rows, base, stride = latent_pool_rows(storage[2::3])
+    positions = torch.randint(0, 24, (3, 128), device="cuda", generator=generator)
+    indices = (base + positions // 8 * stride + positions % 8).int()
+    indices[:, 5] = -1
+    indices[:, 7] = rows.shape[0]
+    scale = torch.tensor([0.0375], device="cuda")
+
+    pages, local = pack_glm53_kv_rows(rows, indices, scale)
+
+    assert pages.shape == (6, 64, 528) and pages.dtype == torch.uint8
+    flat = pages.view(-1, 528)
+    valid = (indices >= 0) & (indices < rows.shape[0])
+    expected_local = torch.arange(indices.numel(), device="cuda", dtype=torch.int32).view_as(local)
+    assert torch.equal(local, torch.where(valid, expected_local, -1))
+    valid_flat = valid.flatten()
+    expected_payload = rows.view(torch.uint8)[indices.flatten()[valid_flat].long(), 0]
+    assert torch.equal(flat[valid_flat, :512], expected_payload)
+    assert torch.count_nonzero(flat[~valid_flat, :512]) == 0
+    assert torch.equal(
+        flat[:, 512:].contiguous().view(torch.float32), scale.expand(flat.shape[0], 4)
+    )
+
+
+def _flashinfer_has_glm53_nope() -> bool:
+    try:
+        from flashinfer.mla._sparse_mla_sm120 import _DECODE_GLM53_NOPE_DISPATCH  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+def _reference_sparse_mla(q, rows, indices, softmax_scale):
+    """Dense softmax(q . k) v over each token's valid selected rows (K = V = row)."""
+    valid = (indices >= 0) & (indices < rows.shape[0])
+    kv = rows[indices.clamp(0, rows.shape[0] - 1).long(), 0].float()
+    scores = torch.einsum("thd,tkd->thk", q.float(), kv) * softmax_scale
+    scores = scores.masked_fill(~valid[:, None, :], float("-inf"))
+    return torch.einsum("thk,tkd->thd", scores.softmax(-1), kv).to(q.dtype)
+
+
+@pytest.mark.skipif(
+    get_sm_version() not in (120, 121), reason="FlashInfer GLM53_NOPE sparse MLA requires SM120/121"
+)
+@pytest.mark.skipif(
+    not _flashinfer_has_glm53_nope(), reason="FlashInfer without GLM53_NOPE sparse MLA"
+)
+@pytest.mark.parametrize("heads", [12, 16, 64])
+def test_fp8_sparse_core_sm120_matches_dequantized_cache_and_replays_graph(heads):
+    """SM120 core: packed FP8 rows through FlashInfer match attention over the dequantized cache."""
+    from tensorrt_llm._torch.attention.backends.sparse.glm_kpool import (
+        GlmKpoolSparseAttention,
+        latent_pool_rows,
+    )
+
+    backend = object.__new__(GlmKpoolSparseAttention)
+    backend.kv_lora_rank = 512
+    backend.softmax_scale = 256**-0.5
+    # Scores with a standard deviation near 0.4. FlashInfer's MXFP8 MMAs round
+    # queries and probabilities to FP8, so sharper softmaxes need wider bounds.
+    backend.kv_scale_quant_orig = torch.tensor([0.0375 / 8], device="cuda")
+    backend._FP8_QUERY_CHUNK_SIZE = 2  # Exercise multiple chunks and a short final chunk.
+    generator = torch.Generator(device="cuda").manual_seed(71)
+    storage = (
+        torch.randn(12, 64, 512, device="cuda", generator=generator).mul(64).clamp(-448, 448)
+    ).to(torch.float8_e4m3fn)
+    pool = storage[1::3]  # Nonzero offset and coalesced page stride.
+    rows, base, stride = latent_pool_rows(pool)
+    q = torch.randn(5, heads, 512, device="cuda", generator=generator).to(torch.bfloat16)
+    positions = torch.randint(0, 256, (5, 67), device="cuda", generator=generator)
+    indices = (base + positions // 64 * stride + positions % 64).int()
+    indices[:, -2] = -1
+    indices[:, -1] = rows.shape[0]  # Out-of-range rows are masked like -1.
+
+    def reference():
+        decoded = (rows.float() * backend.kv_scale_quant_orig).to(torch.bfloat16)
+        return _reference_sparse_mla(q, decoded, indices, backend.softmax_scale)
+
+    actual = backend._dispatch_sparse_core(q, rows, indices)
+    assert actual.shape == (5, heads, 512)
+    torch.testing.assert_close(actual, reference(), atol=5e-3, rtol=5e-2)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        backend._dispatch_sparse_core(q, rows, indices)
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = backend._dispatch_sparse_core(q, rows, indices)
+    storage.copy_((storage.float() * 0.5).to(storage.dtype))
+    graph.replay()
+    torch.testing.assert_close(captured, reference(), atol=5e-3, rtol=5e-2)
 
 
 @pytest.mark.parametrize("context", [False, True])
