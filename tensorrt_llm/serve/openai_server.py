@@ -782,6 +782,8 @@ class OpenAIServer(_VideoRoutesMixin):
             thread_name_prefix="trtllm_metrics_stats",
         )
         self._metrics_stats_read: Optional[asyncio.Future] = None
+        # Whether a scrape has taken (or is waiting for) the last read's stats.
+        self._metrics_stats_read_claimed = True
 
         model_dir = Path(model)
         if model_dir.exists() and model_dir.is_dir():
@@ -925,6 +927,10 @@ class OpenAIServer(_VideoRoutesMixin):
             if self.resource_governor is not None:
                 self.resource_governor.close()
             self.generator.shutdown()
+            # A stats read still in flight fails fast now that the executor is
+            # down; the /metrics handler already treats that as no stats.
+            self._metrics_stats_executor.shutdown(wait=False,
+                                                  cancel_futures=True)
 
         self.app = FastAPI(lifespan=lifespan)
         self.app.router.route_class = _MsgspecRoute
@@ -1848,18 +1854,27 @@ class OpenAIServer(_VideoRoutesMixin):
         # every response being streamed for as long as it waits.
         # One read at a time: a scrape that arrives while a read is in flight
         # returns no stats instead of queueing behind it, so scraping an idle
-        # server faster than one read per 2 s cannot build a backlog. The read
-        # in flight still hands everything it drains to its own caller.
-        if (self._metrics_stats_read is not None
-                and not self._metrics_stats_read.done()):
+        # server faster than one read per 2 s cannot build a backlog. A read
+        # drains the queue and hands everything to its own scrape, so when two
+        # scrapers poll at once, one of them regularly gets an empty list.
+        read = self._metrics_stats_read
+        if read is not None and not read.done():
             return JSONResponse(content=[])
-        read = asyncio.get_running_loop().run_in_executor(
-            self._metrics_stats_executor, self.generator.get_stats, 2)
-        self._metrics_stats_read = read
+        if (read is None or self._metrics_stats_read_claimed
+                or read.cancelled()):
+            read = asyncio.get_running_loop().run_in_executor(
+                self._metrics_stats_executor, self.generator.get_stats, 2)
+            self._metrics_stats_read = read
+        # Otherwise the last read finished after its scrape went away, and
+        # this scrape takes the stats it drained rather than losing them.
+        self._metrics_stats_read_claimed = True
         try:
-            # Shielded so a cancelled caller leaves the read marked in flight
-            # until its thread actually finishes.
+            # Shielded so a scrape that goes away leaves the read running, and
+            # marked in flight, until its thread finishes.
             stats = await asyncio.shield(read)
+        except asyncio.CancelledError:
+            self._metrics_stats_read_claimed = False
+            raise
         except RPCError as e:
             # The executor is unreachable, e.g. while it shuts down.
             logger.debug(f"Failed to fetch iteration stats: {e}")
