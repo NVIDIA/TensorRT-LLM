@@ -935,16 +935,16 @@ class CuDNNAttention(AttentionBackend):
             kv_cache: A ``CausalKVCacheManager``. When given, ``k``/``v`` are the new
                 tokens only: they are written at ``staging_offset`` and attention runs
                 over everything cached before them plus themselves.
-            seq_len: Keyword understood by the ``kv_cache`` path only. Number of real
-                tokens; absent, all ``S_q`` rows are real. When smaller than ``S_q``,
-                the rows past it are padding added so the sequence splits evenly
-                across ranks; they are neither written to the cache nor attended, and
-                their output rows are zero.
-            causal_block_size: Keyword understood by the ``kv_cache`` path only. Cuts
-                the real tokens into consecutive causal blocks: full attention within a
-                block, causal across blocks. Use it when the cache must hold each
-                block's K/V as if the blocks had been generated one at a time, so later
-                blocks never leak into earlier ones. Absent: one causal block.
+            seq_len: Number of real tokens when ``kv_cache`` is given; all ``S_q`` rows
+                are real if it is ``None`` or ``kv_cache`` is absent. Rows past it are
+                padding added so the sequence splits evenly across ranks; they are
+                neither written to the cache nor attended, and their output rows are zero.
+            causal_block_size: Specifies how the real tokens are cut into consecutive
+                causal blocks: full attention within a block, causal across blocks.
+                Requires ``kv_cache``; passing it without one raises. Use it when the
+                cache must hold each block's K/V as if the blocks had been generated one
+                at a time, so later blocks never leak into earlier ones. Absent: one
+                causal block.
 
         Returns:
             Output tensor ``[B, S_q, H, D_v]``.
