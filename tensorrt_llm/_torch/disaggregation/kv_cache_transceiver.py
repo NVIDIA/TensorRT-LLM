@@ -440,6 +440,15 @@ class KvCacheTransceiver(ABC):
         """
         return False
 
+    def context_transfer_peer_ready_time(self,
+                                         req: LlmRequest) -> Optional[float]:
+        """``time.monotonic()`` at which every peer rank had asked for this send.
+
+        The transfer timeout is measured from this moment when it is later than
+        the send itself. None when unknown, which keeps the timeout unchanged.
+        """
+        return None
+
     def has_poisoned_transfer_buffer(self) -> bool:
         """Return True when a cancelled transfer may have corrupted a shared buffer."""
         return False

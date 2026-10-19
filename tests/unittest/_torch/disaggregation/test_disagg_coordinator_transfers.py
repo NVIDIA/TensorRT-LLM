@@ -367,16 +367,37 @@ def test_context_timeout_does_not_count_the_wait_for_the_peer_to_ask(clock) -> N
     clock["t"] += 2.0
 
     h.coordinator.check_transfer_timeouts()
-
     assert not req.py_kv_transfer_timed_out
-    assert req.py_kv_transfer_start_time == clock["t"]
 
+    peer_ready_at = clock["t"]
     h.transceiver.context_transfer_is_waiting_for_peer = lambda req: False
+    h.transceiver.context_transfer_peer_ready_time = lambda req: peer_ready_at
     clock["t"] += 0.5
     h.coordinator.check_transfer_timeouts()
     assert not req.py_kv_transfer_timed_out
 
     clock["t"] += 1.0
+    h.coordinator.check_transfer_timeouts()
+    assert req.py_kv_transfer_timed_out
+
+
+def test_context_transfer_is_timed_from_when_its_peers_asked(clock) -> None:
+    """Peers that ask between two checks start the transfer clock themselves.
+
+    The check may first see the send only after the peers asked, e.g. after a
+    long executor iteration; the time before they asked is still not charged.
+    """
+    h = _Harness(kv_transfer_timeout_ms=1000)
+    req = _Request(1)
+    h.send(req)
+    peer_ready_at = clock["t"] + 2.5
+    h.transceiver.context_transfer_peer_ready_time = lambda req: peer_ready_at
+    clock["t"] += 3.0
+
+    h.coordinator.check_transfer_timeouts()
+    assert not req.py_kv_transfer_timed_out
+
+    clock["t"] += 0.6
     h.coordinator.check_transfer_timeouts()
     assert req.py_kv_transfer_timed_out
 

@@ -275,34 +275,42 @@ class DisaggTransferCoordinator:
 
         # Context requests start their clock on the last chunk, which is also
         # when they enter the transfer manager, so this covers the whole
-        # context side. While the peer has not asked for the data yet, the
-        # clock is moved along so it measures the transfer, not the peer's
-        # queueing delay.
+        # context side. Nothing is sent before every peer rank has asked for
+        # the data, so a send still waiting for that is not flagged, and once
+        # the peers have asked, the transfer is measured from that moment
+        # rather than charged with their queueing delay.
         now = time.monotonic()
         for req in self._transfers.requests_in_transfer().values():
             if self._context_send_awaits_peer(req, now, timeout_ms):
-                req.py_kv_transfer_start_time = now
                 continue
+            peer_ready_time = self._transceiver.context_transfer_peer_ready_time(req)
+            if (
+                peer_ready_time is not None
+                and req.py_kv_transfer_start_time is not None
+                and peer_ready_time > req.py_kv_transfer_start_time
+            ):
+                req.py_kv_transfer_start_time = peer_ready_time
             flag_if_timed_out(req, "context")
         for req in self._registry.active_requests():
             if req.is_disagg_generation_transmission_in_progress:
                 flag_if_timed_out(req, "generation")
 
     def _context_send_awaits_peer(self, req: LlmRequest, now: float, timeout_ms: int) -> bool:
-        """Whether a context send may keep moving its transfer clock.
+        """Whether a context send is still exempt from its transfer timeout.
 
-        The send is posted when the context finishes, but nothing is written
-        until the generation peer asks, and under load that request can sit in
-        the generation queue for longer than the transfer timeout. Expiring
-        then gives up on transfers that never got to run, and the peer later
-        finds no data. A peer that never asks must still be reclaimed, since
-        this deadline is the only thing that ends such a send, so the wait is
-        capped at ``_CTX_PEER_WAIT_TIMEOUT_MULTIPLIER`` times the timeout.
+        The send is posted when the context finishes, but nothing is sent
+        until every generation peer rank asks, and under load that request can
+        sit in the generation queue for longer than the transfer timeout.
+        Expiring then gives up on transfers that never got to run, and the peer
+        later finds no data. A peer that never asks must still be reclaimed,
+        since this deadline is the only thing that ends such a send, so the
+        wait is capped at ``_CTX_PEER_WAIT_TIMEOUT_MULTIPLIER`` times the
+        timeout, counted from the send.
         """
-        peer_wait_start = getattr(req, "py_kv_transfer_peer_wait_start", None)
-        if peer_wait_start is None or req.py_kv_transfer_start_time is None:
+        if req.py_kv_transfer_start_time is None:
             return False
-        if (now - peer_wait_start) * 1000 > timeout_ms * _CTX_PEER_WAIT_TIMEOUT_MULTIPLIER:
+        waited_ms = (now - req.py_kv_transfer_start_time) * 1000
+        if waited_ms > timeout_ms * _CTX_PEER_WAIT_TIMEOUT_MULTIPLIER:
             return False
         return self._transceiver.context_transfer_is_waiting_for_peer(req)
 
@@ -553,7 +561,6 @@ class DisaggTransferCoordinator:
                     continue
                 if self._transceiver.kv_transfer_timeout_ms is not None:
                     req.py_kv_transfer_start_time = time.monotonic()
-                    req.py_kv_transfer_peer_wait_start = req.py_kv_transfer_start_time
             elif (
                 self._transceiver.pipeline_transfer_enabled
                 and req.state != LlmRequestState.GENERATION_COMPLETE

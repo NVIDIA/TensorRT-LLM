@@ -1727,6 +1727,33 @@ def test_request_data_for_a_session_not_yet_created_is_still_parked() -> None:
 
 
 @pytest.mark.cpu_only
+def test_retried_request_data_for_a_live_session_is_failed_not_parked() -> None:
+    """A retry asks under a fresh unique_rid while the session it names is live.
+
+    Looking it up by the fresh id misses the session; parking it as an early
+    generation-first request would leave the retry's receive waiting forever.
+    """
+    ctx_rid = 114
+    sender = _make_sender_with_cleared_session(ctx_rid + 1)  # some unrelated retired session
+    live_session = object()
+    sender._sessions[ctx_rid] = live_session
+    info = transfer_mod.RecvReqInfo(
+        sender_req_id=ctx_rid,
+        instance_name="gen",
+        instance_rank=0,
+        block_ids_per_layer_groups=[],
+        unique_rid=ctx_rid + 1000,
+        slice_id=0,
+    )
+
+    sender._respond_with_kv(b"receiver", [MessageType.REQUEST_DATA, info.to_bytes()])
+
+    sender._save_peer_req_info.assert_not_called()
+    sender._send_failed_result_to_receiver.assert_called_once_with(info)
+    assert sender._sessions[ctx_rid] is live_session
+
+
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("retried", [False, True])
 def test_cleared_session_failure_reaches_the_waiting_receive(
     retried: bool, monkeypatch: pytest.MonkeyPatch
@@ -1801,33 +1828,78 @@ def test_cleared_session_failure_reaches_the_waiting_receive(
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize(
-    ("status", "waiting"),
+    ("status", "receiver_ready", "waiting"),
     [
-        (SessionStatus.INIT, True),
-        (SessionStatus.READY, False),
-        (SessionStatus.TRANSFERRING, False),
-        (SessionStatus.TRANSFERRED, False),
-        (SessionStatus.CANCELLED, False),
-        (SessionStatus.ERROR, False),
-        (None, False),
+        (SessionStatus.INIT, False, True),
+        # Ranks that already asked are being written while others are queued.
+        (SessionStatus.TRANSFERRING, False, True),
+        (SessionStatus.READY, True, False),
+        (SessionStatus.TRANSFERRING, True, False),
+        (SessionStatus.CANCELLED, False, False),
+        (SessionStatus.ERROR, False, False),
+        (None, False, False),
     ],
 )
-def test_context_send_waits_for_peer_only_while_live_and_unasked(status, waiting) -> None:
-    """Only a live send whose peer ranks have not all asked yet is waiting.
+def test_context_send_waits_for_peer_until_every_rank_asked(
+    status, receiver_ready: bool, waiting: bool
+) -> None:
+    """A live send waits until every peer rank has asked, whatever its writes do.
 
-    A send that was retired (e.g. by a peer's CANCEL_SESSION) has no peer
-    request info left either, but it must time out normally rather than be
-    held for the whole peer-wait ceiling.
+    A send that was retired (e.g. by a peer's CANCEL_SESSION) or failed is not
+    waiting: it must time out normally rather than be held for the whole
+    peer-wait ceiling.
     """
     rid = 111
     transceiver = object.__new__(KvCacheTransceiverV2)
-    transceiver._send_sessions = {} if status is None else {rid: SimpleNamespace(status=status)}
+    transceiver._send_sessions = (
+        {}
+        if status is None
+        else {
+            rid: SimpleNamespace(status=status, receiver_ready=receiver_ready, peer_ready_time=7.0)
+        }
+    )
     request = SimpleNamespace(
         py_request_id=rid,
         py_disaggregated_params=DisaggregatedParams(disagg_request_id=rid),
     )
 
     assert transceiver.context_transfer_is_waiting_for_peer(request) is waiting
+    expected_ready_time = None if status is None else 7.0
+    assert transceiver.context_transfer_peer_ready_time(request) == expected_ready_time
+
+
+@pytest.mark.cpu_only
+def test_send_session_records_when_every_peer_rank_asked(monkeypatch) -> None:
+    rid = 113
+    clock = {"t": 50.0}
+    monkeypatch.setattr(transfer_mod.time, "monotonic", lambda: clock["t"])
+    sender = object.__new__(transfer_mod.Sender)
+    sender._peer_requests_lock = threading.Lock()
+    sender._peer_requests, sender._peer_requests_timestamps = {}, {}
+    sender._registrar = SimpleNamespace(
+        get_peer_rank_info=Mock(return_value=SimpleNamespace(dp_rank=0)),
+        get_peer_overlap=Mock(return_value=SimpleNamespace(ranks=[0, 1])),
+    )
+    session = SimpleNamespace(receiver_ready=False, peer_ready_time=None)
+    sender._sessions = {rid: session}
+
+    def ask(rank: int) -> None:
+        sender._save_peer_req_info(
+            transfer_mod.RecvReqInfo(
+                sender_req_id=rid,
+                instance_name="gen",
+                instance_rank=rank,
+                block_ids_per_layer_groups=[],
+                unique_rid=rid,
+            )
+        )
+
+    ask(0)
+    assert (session.receiver_ready, session.peer_ready_time) == (False, None)
+
+    clock["t"] += 3.0
+    ask(1)
+    assert (session.receiver_ready, session.peer_ready_time) == (True, 53.0)
 
 
 @pytest.mark.cpu_only

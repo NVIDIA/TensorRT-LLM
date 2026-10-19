@@ -991,9 +991,6 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.is_attention_dp_dummy = False
         self.is_cuda_graph_dummy = False
         self.py_kv_transfer_start_time = None
-        # When a context send was posted. Unlike py_kv_transfer_start_time it is
-        # never moved while the send waits for its peer, so that wait stays bounded.
-        self.py_kv_transfer_peer_wait_start = None
         self.py_kv_transfer_timed_out = False
         # Prevent recreation after a send session drops peer registration.
         self.py_kv_send_session_retired = False

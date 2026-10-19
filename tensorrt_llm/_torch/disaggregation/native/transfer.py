@@ -862,6 +862,7 @@ class Sender(SenderBase):
             if self._is_req_ready(unique_rid, expected_count):
                 with tx_session.lock:
                     tx_session.receiver_ready = True
+                    tx_session.peer_ready_time = time.monotonic()
         return
 
     def _get_session(self, unique_rid: Optional[int]) -> Optional["TxSession"]:
@@ -1668,16 +1669,24 @@ class Sender(SenderBase):
                     info.unique_rid in self._retired_rids
                     or info.sender_req_id in self._retired_rids
                 )
-                if not retired:
+                # The session it names may also still be live. Serving it would
+                # need every reply keyed by the receiver's id and could write the
+                # same pieces to two attempts, so it is refused rather than parked.
+                retry_of_live_session = (
+                    info.sender_req_id != info.unique_rid
+                    and self._get_session(info.sender_req_id) is not None
+                )
+                if not (retired or retry_of_live_session):
                     self._save_peer_req_info(info)
                     return
         if session is None:
-            # The session was already cleared, typically because the context side
-            # timed out waiting for this request while the peer's request sat in its
-            # generation queue. Nothing will ever be sent; say so instead of leaving
-            # the peer's receive (and its KV pages) waiting forever.
+            # Nothing will ever be sent for this request; say so instead of leaving
+            # the peer's receive (and its KV pages) waiting forever. Typically the
+            # context side timed out waiting for it while the peer's request sat in
+            # its generation queue, or it is a retry of a request still in flight.
             logger.warning(
-                f"_respond_with_kv: TxSession {info.sender_req_id} already retired; "
+                f"_respond_with_kv: TxSession {info.sender_req_id} "
+                f"{'already retired' if retired else 'serves an earlier attempt'}; "
                 f"failing REQUEST_DATA for peer rid={info.unique_rid} "
                 f"rank={info.instance_rank}"
             )
@@ -1841,6 +1850,7 @@ class Sender(SenderBase):
             session = self._get_session(req_info.unique_rid)
             if session is not None and not session.receiver_ready:
                 session.receiver_ready = True
+                session.peer_ready_time = time.monotonic()
 
     def has_all_peer_req_infos(self, unique_rid: int) -> bool:
         req_info = self._get_first_req_info(unique_rid)
@@ -1953,6 +1963,8 @@ class TxSession(TxSessionBase):
         self._aux_buffer = aux_buffer
         self.aux_slot = aux_buffer.alloc_slot().id if aux_buffer is not None else None
         self.receiver_ready: bool = False
+        # time.monotonic() when receiver_ready turned True, i.e. every peer rank had asked.
+        self.peer_ready_time: Optional[float] = None
         self.kv_tasks = []
         self.aux_task = None
         self._reported_aux_peer_ranks: set[int] = set()
