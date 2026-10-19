@@ -213,21 +213,30 @@ artifact caches under a single root. TensorRT-LLM supplies the following
 defaults. Except for the isolation behavior described below, an individually
 configured environment variable takes precedence.
 
-| Environment variable | Default under `TRTLLM_CACHE_DIR` |
-|----------------------|------------------------------------|
-| `TLLM_AUTOTUNER_CACHE_PATH` | `autotuner/cache.json` |
-| `TORCHINDUCTOR_CACHE_DIR` | `inductor` |
-| `TRITON_CACHE_DIR` | `triton` |
-| `TORCH_EXTENSIONS_DIR` | `torch_extensions` |
-| `FLASHINFER_WORKSPACE_BASE` | `flashinfer` |
-| `CUTE_DSL_CACHE_DIR` | `cute_dsl` |
-| `DG_JIT_CACHE_DIR` | `deep_gemm` |
-| `TRTLLM_DG_CACHE_DIR` | `trtllm_deep_gemm` |
-| `CUDA_CACHE_PATH` | `cuda` |
+| Environment variable | Default cache path | Default under `TRTLLM_CACHE_DIR` |
+|----------------------|--------------------|------------------------------------|
+| `TLLM_AUTOTUNER_CACHE_PATH` | Disabled | `autotuner/cache.json` |
+| `TORCHINDUCTOR_CACHE_DIR` | `/tmp/torchinductor_$USER` | `inductor` |
+| `TRITON_CACHE_DIR` | `$HOME/.triton/cache` | `triton` |
+| `TORCH_EXTENSIONS_DIR` | `$HOME/.cache/torch_extensions` | `torch_extensions` |
+| `FLASHINFER_WORKSPACE_BASE` | `$HOME/.cache/flashinfer` | `flashinfer` |
+| `CUTE_DSL_CACHE_DIR` | `/tmp/$USER/cutlass_python_cache` | `cute_dsl` |
+| `DG_JIT_CACHE_DIR` | `$HOME/.deep_gemm` | `deep_gemm` |
+| `TRTLLM_DG_CACHE_DIR` | Disabled | `trtllm_deep_gemm` |
+| `CUDA_CACHE_PATH` | `$HOME/.nv/ComputeCache` | `cuda` |
+
+**Important note**: while some of the caches controlled by `TRTLLM_CACHE_DIR`
+are enabled and persisted by default (e.g., `FLASHINFER_WORKSPACE_BASE`),
+others are disabled or with a path defaulting to `/tmp` (e.g., `CUTE_DSL_CACHE_DIR`
+or `TLLM_AUTOTUNER_CACHE_PATH`). As such, these are not validated for sharing
+across model instances or long-term persistence, which may lead to errors 
+and other unintended behavior. We recommend using distinct `TRTLLM_CACHE_DIR` 
+caches for different models, and invalidating them anytime a component in the 
+software stack changes.
 
 The directories are created by their respective consumers when needed.
-TensorRT-LLM does not add cache locking, cleanup, or per-rank isolation for
-these unified defaults (with the exceptions described below). The
+TensorRT-LLM does not add cache locking, cleanup; per-rank isolation is
+enabled only for the exceptions described below. The
 configured values are forwarded to dynamically spawned MPI workers.
 
 Configuring `TRTLLM_DG_CACHE_DIR`, either directly or through
