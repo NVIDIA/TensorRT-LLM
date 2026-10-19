@@ -57,7 +57,9 @@ def test_disabled_encoder_does_not_initialize_processor():
 
 def _bind_items(mm_item_scheduler: MultimodalItemScheduler, request, *, row_bytes: int = 8) -> None:
     state = request.py_mm_encoder_state
-    for item_idx, rows in enumerate(state.embedding_lengths):
+    for item_idx, rows in enumerate(
+        request.py_multimodal_params.item_metadata.output_embedding_lengths
+    ):
         cache_key = make_mm_encoder_transient_cache_key(request.request_id, item_idx)
         assert mm_item_scheduler.encoder_cache.acquire(
             cache_key, rows * row_bytes, retain_after_release=False

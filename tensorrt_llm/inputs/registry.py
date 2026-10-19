@@ -1538,14 +1538,6 @@ def create_input_processor_with_hash(
         item_metadata.validate()
         multimodal_data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = item_metadata
         normalize_multimodal_item_metadata(multimodal_data, mm_item_order)
-        embedding_lengths = item_metadata.output_embedding_lengths
-        if embedding_lengths is not None:
-            existing = multimodal_data.get("multimodal_embedding_lengths")
-            if existing is not None and existing != embedding_lengths:
-                raise ValueError(
-                    "Computed multimodal encoder embedding lengths "
-                    "do not match the existing prompt metadata")
-            multimodal_data["multimodal_embedding_lengths"] = embedding_lengths
         return prompt_token_ids, extra_processed_inputs
 
     return input_processor_wrapper

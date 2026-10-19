@@ -2532,7 +2532,7 @@ class TestNemotronEpdEvs:
                 expected.extend([100, 500, *([20] * count), 501])
         expected.append(102)
         assert prompt_token_ids == expected
-        assert params.item_metadata.output_embedding_lengths == list(map(sum, counts))
+        assert params.item_metadata.output_embedding_lengths == tuple(map(sum, counts))
         assert params.multimodal_input.multimodal_lengths == [
             sum(item) + 2 * len(item) for item in counts
         ]

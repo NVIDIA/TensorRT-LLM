@@ -185,7 +185,7 @@ def test_mm_item_metadata_is_materialized_when_embedding_lengths_match():
         encoder_token_lengths=[4],
         output_embedding_lengths=[2],
     )
-    assert multimodal_data["multimodal_embedding_lengths"] == [2]
+    assert "multimodal_embedding_lengths" not in multimodal_data
     assert "multimodal_item_refs" not in multimodal_data
     assert "multimodal_encoder_token_lengths" not in multimodal_data
 
@@ -216,9 +216,9 @@ def test_mm_item_metadata_none_falls_back_to_non_item_path():
     _, extra = input_processor({"prompt": "unused"}, sampling_params=None)
 
     metadata = extra["multimodal_data"][MULTIMODAL_ENCODER_ITEM_METADATA_KEY]
-    assert metadata.item_refs == [("image", 0)]
+    assert metadata.item_refs == (("image", 0),)
     assert metadata.encoder_token_lengths is None
-    assert metadata.output_embedding_lengths == [2]
+    assert metadata.output_embedding_lengths == (2,)
 
 
 def test_mm_item_metadata_rejects_wrong_return_type():
@@ -377,9 +377,9 @@ def test_generic_metadata_normalizes_mixed_order_without_encoder_costs(precomput
         {"prompt": "unused", "mm_item_order": order}, None
     )
     metadata = extra["multimodal_data"][MULTIMODAL_ENCODER_ITEM_METADATA_KEY]
-    assert metadata.item_refs == [("audio", 0), ("image", 0)]
+    assert metadata.item_refs == (("audio", 0), ("image", 0))
     assert metadata.encoder_token_lengths is None
-    assert metadata.output_embedding_lengths == [1, 1]
+    assert metadata.output_embedding_lengths == (1, 1)
 
 
 def test_maybe_compute_mm_embed_cumsum_populates_py_multimodal_data():
@@ -736,7 +736,7 @@ def test_multimodal_input_contract_snapshot(
     assert cumsum.device.type == "cpu"
     assert cumsum.tolist() == expected_cumsum
     assert data["mm_bidirectional_blocks"] is True
-    assert data["multimodal_embedding_lengths"] == [2] * num_items
+    assert "multimodal_embedding_lengths" not in data
     assert data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] == MultimodalItemMetadata(
         item_refs, [4] * num_items, [2] * num_items
     )
@@ -948,11 +948,9 @@ def test_attached_embeddings_share_item_metadata_and_prompt_layout():
     )
 
     assert params.item_metadata is metadata
-    assert params.get_item_layout() == ([("video", 0)], [3])
+    assert params.get_item_layout() == ((("video", 0),), (3,))
     assert params.multimodal_data["multimodal_embedding"] is handles
-    assert (
-        params.multimodal_data["multimodal_embedding_lengths"] is metadata.output_embedding_lengths
-    )
+    assert "multimodal_embedding_lengths" not in params.multimodal_data
     assert params.multimodal_data["special_token_offsets"] == [2]
     assert params.multimodal_input.multimodal_positions == [1]
     assert params.multimodal_input.multimodal_lengths == [4]
@@ -974,7 +972,7 @@ def test_attached_embeddings_accept_tensors_without_cache_hashes(modality):
     )
 
     assert params.multimodal_input is None
-    assert params.item_metadata.item_refs == [(modality, 0)]
+    assert params.item_metadata.item_refs == ((modality, 0),)
     assert params.multimodal_data["multimodal_embedding"][0] is embedding
     assert params.item_metadata.encoder_token_lengths is None
 
@@ -1077,3 +1075,39 @@ def test_runtime_data_requires_cumsum():
     """embed_mask_cumsum is required."""
     with pytest.raises(TypeError):
         MultimodalRuntimeData(past_seen_token_num=0, chunk_end_pos=5)
+
+
+def test_normalized_params_keep_one_order_and_output_length_record():
+    refs = [("audio", 0), ("image", 0)]
+    costs = [4, 8]
+    rows = [2, 3]
+    metadata = MultimodalItemMetadata(refs, costs, rows)
+    data = {
+        MULTIMODAL_ENCODER_ITEM_METADATA_KEY: metadata,
+        "multimodal_embedding_lengths": list(rows),
+    }
+    params = MultimodalParams(
+        multimodal_data=data,
+        mm_item_order=[{"modality": m, "index": i} for m, i in refs],
+    )
+    refs.reverse()
+    costs[0] = 100
+    rows[0] = 100
+
+    assert params.item_metadata is metadata
+    assert params.mm_item_order is None
+    assert "multimodal_embedding_lengths" not in data
+    assert metadata.item_refs == (("audio", 0), ("image", 0))
+    assert metadata.encoder_token_lengths == (4, 8)
+    assert metadata.output_embedding_lengths == (2, 3)
+    with pytest.raises(TypeError):
+        metadata.output_embedding_lengths[0] = 100
+    with pytest.raises(AttributeError):
+        metadata.encoder_token_lengths = (100, 8)
+
+
+def test_unknown_item_layout_preserves_legacy_order_at_input_boundary():
+    order = [{"modality": "audio", "index": 0}]
+    params = MultimodalParams(multimodal_data={"audio": {}}, mm_item_order=order)
+    assert params.item_metadata is None
+    assert params.mm_item_order is order
