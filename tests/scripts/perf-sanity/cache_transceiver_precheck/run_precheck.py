@@ -842,8 +842,9 @@ class StatusRecorder:
         else:
             line = f"RUNNING {self.role}_{self.server_idx}"
         try:
-            atomic_write_shared_file(self.json_path, json.dumps(doc, indent=2))
+            # The gate reads the one-line .status file, so write it first.
             atomic_write_shared_file(self.text_path, line + "\n")
+            atomic_write_shared_file(self.json_path, json.dumps(doc, indent=2))
         except OSError as e:
             # Log the verdict too: the gate's error excerpt is then the only
             # place left that names the root cause.
@@ -2022,6 +2023,10 @@ def _hard_abort_unhandled(runner, exc):
             # before this rank's abort kills it. No barrier: the other ranks may
             # be blocked in a different collective.
             time.sleep(ABORT_COORDINATION_TIMEOUT_S)
+            # The leader may not have failed and is about to be killed, so peer
+            # instances would otherwise wait out their timeouts. Write-once: if
+            # the leader already raised the flag, this is a no-op.
+            raise_abort_flag(runner.work_dir, f"{name} r{runner.rank} UNHANDLED_ERROR: {detail}")
     except Exception:  # noqa: BLE001 - abort must still happen
         pass
     try:
