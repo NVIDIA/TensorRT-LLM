@@ -257,12 +257,13 @@ separate CUDA streams. This allows to significantly reduce the latency overhead 
 (i.e., memory-bound) regimes. This option covers the LoRA path for the `mlp`, `gated_mlp`, `attention` and `linear` modules, but does
 not apply to MoE LoRA.
 
-The second option is `cudagraph_specialize_lora`: enabling this triggers the capture of two sets of CUDA graphs, having the LoRA path
+The second option is `cuda_graph_specialize_lora`: enabling this triggers the capture of two sets of CUDA graphs, having the LoRA path
 enabled or disabled for all requests in the batch; by default, a single set of CUDA graphs is captured with the LoRA path active, using
-dummy adapters for requests that do not supply them. This option is particularly effective when the majority of requests in the workload
-does not use LoRA, since it allows most batches to follow the non-LoRA path and therefore eliminate all of the associated overhead.
+dummy requests without `lora_task_id`, with empty adapter slots that have rank `0` and zeroed weight pointers. This option is particularly 
+effective when the majority of requests in the workload does not use LoRA, since it allows most batches to follow the non-LoRA path and 
+therefore eliminate all of the associated overhead.
 
-However, it should be noted that enabling `cudagraph_specialize_lora` will result in a slight memory overhead due to the additional
+However, it should be noted that enabling `cuda_graph_specialize_lora` will result in a slight memory overhead due to the additional
 number of CUDA graphs that need to be captured and stored (about 50MB for 21 generation graphs with Qwen3 32B).
 
 ## TRTLLM serve with LoRA
