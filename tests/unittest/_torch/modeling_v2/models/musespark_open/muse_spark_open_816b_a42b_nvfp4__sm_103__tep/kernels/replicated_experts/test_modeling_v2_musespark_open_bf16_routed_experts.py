@@ -54,28 +54,31 @@ _WITH_PERSISTENT = (
 )
 
 
-def test_the_bf16_routed_experts_build_on_the_replicated_experts():
-    assert dispatch.closure({"bf16_routed_experts"}) == {
-        "bf16_routed_experts",
-        "replicated_experts",
-    }
-    with pytest.raises(ValueError, match="builds on"):
-        dispatch.Plan(frozenset({"bf16_routed_experts"}))
+def test_the_bf16_routed_experts_build_on_no_other_path():
+    """Over the ring-buddy stack with ``replicated_experts``, else over the owner-only window."""
+    assert dispatch.closure({"bf16_routed_experts"}) == {"bf16_routed_experts"}
+    dispatch.Plan(frozenset({"bf16_routed_experts"}))
+
+
+_TP4 = types.SimpleNamespace(tp_size=4)
 
 
 @pytest.mark.parametrize(
     "paths, expected",
     [
         (("replicated_experts",), {}),
-        (("persistent_experts",), {"persistent": True}),
-        (("bf16_routed_experts",), {"bf16_unpacked": True}),
+        (("replicated_experts", "persistent_experts"), {"persistent": True}),
+        (("replicated_experts", "bf16_routed_experts"), {"bf16_unpacked": True}),
+        (("persistent_experts",), {"persistent": True, "windows": 1}),
+        (("bf16_routed_experts",), {"bf16_unpacked": True, "windows": 1}),
         (_WITH_PERSISTENT, {"persistent": True}),
         (_WITH_PERSISTENT + ("bf16_routed_experts",), {"persistent": True, "bf16_unpacked": True}),
     ],
 )
 def test_bf16_routing_reaches_ring_buddy_install_only_when_planned(monkeypatch, paths, expected):
     """With ``bf16_routed_experts`` the install gets ``bf16_unpacked=True``; without it the
-    keyword is not passed at all, so the install is the packed-routing one."""
+    keyword is not passed at all, so the install is the packed-routing one. Without
+    ``replicated_experts`` the install is the owner-only window's (``windows=1``)."""
     calls = []
     fake = types.ModuleType("ring_buddy")
     fake.BLOCK, fake.STATIC_FROM = 32, 28
@@ -92,7 +95,7 @@ def test_bf16_routing_reaches_ring_buddy_install_only_when_planned(monkeypatch, 
         fake,
         raising=False,
     )
-    target_weights.install_loaded_features(object(), object(), dispatch.plan_of(*paths))
+    target_weights.install_loaded_features(object(), _TP4, dispatch.plan_of(*paths))
     assert calls == [expected]
 
 
@@ -124,8 +127,9 @@ def _backend(op_backend):
     )
 
 
-def _stacks():
-    return {"w3_w1_weight": object(), "w2_weight": object()}
+def _stacks(window=2 * ring_buddy.BLOCK):
+    """Stand-in stacks: only their leading dim (the call's window) is read."""
+    return {"w3_w1_weight": torch.empty(window, 1), "w2_weight": torch.empty(window, 1)}
 
 
 def test_unpacked_bf16_call_hands_the_entry_both_tensors(monkeypatch):
@@ -152,6 +156,10 @@ def test_unpacked_bf16_call_hands_the_entry_both_tensors(monkeypatch):
     assert args[5:] == (4096, 0, 2 * ring_buddy.BLOCK, 101, 200, True, 1, 256, 8)
     # A row that is not plain BF16 (the NVFP4 layers' quantized input) is not this call's.
     assert call(stacks, x.float(), ids, weights) is None
+    # The owner-only window of a tep4 rank: the 64-expert own block, the same geometry.
+    seen.clear()
+    assert call(_stacks(64), x, ids, weights) == "unpacked"
+    assert seen[0][5:8] == (4096, 0, 64)
 
 
 def test_packed_bf16_call_is_unchanged_without_bf16_routing(monkeypatch):

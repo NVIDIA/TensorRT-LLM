@@ -368,3 +368,123 @@ def test_three_windows_refresh_keeps_ineligible_layers_at_two(monkeypatch):
         assert stack.shape[0] == 2 * ring_buddy.BLOCK
         assert torch.equal(stack[ring_buddy.BLOCK :], stack[: ring_buddy.BLOCK] + 1000)
     assert bool((narrow.stacks["w2_weight"][: ring_buddy.BLOCK] == 9.0).all())
+
+
+# --- tep4 and the owner-only window -------------------------------------------------------------
+
+
+def _tep4_model(monkeypatch, layers=2):
+    """Stand-in tep4 text model: 64-expert own blocks, every peer agreeing."""
+    model = types.SimpleNamespace(layers=[])
+    for index in range(layers):
+        backend = types.SimpleNamespace(
+            quant_method=types.SimpleNamespace(transform_weights=lambda leaf: None)
+        )
+        for k, name in enumerate(ring_buddy.STACKED["nvfp4"]):
+            data = torch.full((64, 3), float(100 * index + k), device="cuda")
+            setattr(backend, name, _Param(data))
+        experts = _Experts()
+        experts.backend = backend
+        moe = types.SimpleNamespace(experts=experts)
+        model.layers.append(types.SimpleNamespace(feed_forward=moe))
+    monkeypatch.setattr(ring_buddy, "eligible", lambda moe, mapping: None)
+    monkeypatch.setattr(ring_buddy, "expert_format", lambda moe: "nvfp4")
+    monkeypatch.setattr(ring_buddy._tp_agreement, "Distributed", _TpGroup([None] * 3))
+    return model, types.SimpleNamespace(tp_rank=1, tp_size=4)
+
+
+def test_owner_window_install_replicates_nothing_at_tep4(monkeypatch):
+    """``windows=1`` at tep4: no all-gather, the stacks are the parameters themselves, the
+    window is the 64-expert own block, and the routing hook places owner-only on the
+    4-rank ring."""
+    model, mapping = _tep4_model(monkeypatch)
+    gathered = []
+    monkeypatch.setattr(
+        ring_buddy, "_ring_block", lambda local, mapping, back: gathered.append(back) or local
+    )
+    seen = {}
+
+    def nvfp4_call(backend, routing, persistent=False, stacks=None):
+        seen["persistent"], seen["windows"] = persistent, sorted(stacks or {})
+
+        def call(stacks, x, local_ids, weights_bf16):
+            seen["window"] = stacks["w3_w1_weight"].shape[0]
+            seen["ids"] = local_ids
+            return "stacked"
+
+        return call
+
+    monkeypatch.setattr(ring_buddy, "_nvfp4_call", nvfp4_call)
+    assert ring_buddy.install(model, mapping, balance=False, persistent=True, windows=1) == [0, 1]
+    assert gathered == [], "the owner-only window gathered a peer's block"
+    moe = model.layers[1].feed_forward
+    state = moe._replicated_experts
+    backend = moe.experts.backend
+    assert (state.windows, state.ranks, state.block, state.default_window) == (1, 4, 64, 64)
+    assert state.static_from == 64 and not state.balance
+    for name, stack in state.stacks.items():
+        assert stack is getattr(backend, name).data, f"{name}: the window must be the parameter"
+    assert seen["persistent"] and seen["windows"] == [64]
+    g = torch.Generator(device="cuda").manual_seed(41)
+    with torch.inference_mode():
+        logits = torch.randn(8, 256, device="cuda", generator=g)
+        x = torch.randn(8, 64, device="cuda", generator=g)
+        selected, weights = moe.experts.routing_method.apply(logits)
+        assert moe.experts.forward(x, logits, do_finalize=False) == "stacked"
+    assert seen["window"] == 64
+    want, _, _ = ring_buddy_assign(selected, weights, 1, False, ranks=4)
+    assert torch.equal(seen["ids"], want)
+    for g_id, local in zip(selected.reshape(-1).tolist(), want.reshape(-1).tolist()):
+        assert local == g_id - 64 if g_id // 64 == 1 else local >= 128
+
+
+def test_owner_window_refusals(monkeypatch):
+    """The owner-only window has no copy to balance onto; three windows do not fit at tep4."""
+    model, mapping = _tep4_model(monkeypatch)
+    with pytest.raises(ValueError, match="owner-only window holds no copy"):
+        ring_buddy.install(model, mapping, balance=True, windows=1)
+    with pytest.raises(ValueError, match="owner-only window holds no copy"):
+        ring_buddy.install(model, mapping, balance=False, static_from=56, windows=1)
+    with pytest.raises(ValueError, match="three_window_placement at tep4"):
+        ring_buddy.install(model, mapping, persistent=True, windows=3)
+    assert all(not hasattr(layer.feed_forward, "_replicated_experts") for layer in model.layers)
+
+
+def test_two_windows_at_tep4_stack_the_predecessors_64_experts(monkeypatch):
+    """``replicated_experts`` at tep4 (not composed by default): 128-expert stacks."""
+    model, mapping = _tep4_model(monkeypatch)
+    monkeypatch.setattr(ring_buddy, "_ring_block", lambda local, mapping, back: local + 1000)
+    monkeypatch.setattr(ring_buddy, "_nvfp4_call", lambda backend, routing: None)
+    assert ring_buddy.install(model, mapping) == [0, 1]
+    state = model.layers[0].feed_forward._replicated_experts
+    assert (state.windows, state.block, state.default_window) == (2, 64, 128)
+    for stack in state.stacks.values():
+        assert stack.shape[0] == 128 and torch.equal(stack[64:], stack[:64] + 1000)
+
+
+def test_eligible_reads_the_ring_from_the_mapping():
+    """tep8 needs 32-expert own blocks, tep4 64-expert ones; any other size is not served."""
+    from tensorrt_llm._torch.moe.fused_moe.moe_op_backend import TRTLLMOpBackend
+
+    def moe_of(block, rank):
+        backend = types.SimpleNamespace(
+            has_nvfp4=True,
+            op_backend=object.__new__(TRTLLMOpBackend),
+            num_slots=256,
+            expert_size_per_partition=block,
+            slot_start=block * rank,
+            bias=False,
+        )
+        for name in ring_buddy.STACKED["nvfp4"]:
+            setattr(backend, name, torch.zeros(block, 1))
+        return types.SimpleNamespace(experts=types.SimpleNamespace(backend=backend, comm=None))
+
+    def mapping_of(tp, rank):
+        return types.SimpleNamespace(
+            tp_size=tp, moe_ep_size=tp, moe_tp_size=1, moe_ep_rank=rank, tp_rank=rank
+        )
+
+    assert ring_buddy.eligible(moe_of(32, 5), mapping_of(8, 5)) is None
+    assert ring_buddy.eligible(moe_of(64, 3), mapping_of(4, 3)) is None
+    assert "64-expert block" in ring_buddy.eligible(moe_of(32, 3), mapping_of(4, 3))
+    assert "neither tp8/ep8 nor tp4/ep4" in ring_buddy.eligible(moe_of(128, 1), mapping_of(2, 1))

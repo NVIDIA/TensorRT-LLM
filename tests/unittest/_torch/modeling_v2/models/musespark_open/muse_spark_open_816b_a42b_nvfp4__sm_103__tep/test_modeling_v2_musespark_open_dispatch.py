@@ -235,13 +235,16 @@ _TEP4_BITWISE = {
 _TEP4 = _TEP4_BITWISE | {"drafter_fc_shard"}
 
 #: sm103 TEP4's composition adds the attention paths validated at a tep4 rank's 32
-#: query / 4 KV heads.
+#: query / 4 KV heads, and the expert paths on the owner-only 64-expert window (no
+#: replication).
 _SM103_TEP4 = _TEP4 | {
     "swa_paged_decode",
     "swa_block",
     "full_attention_split_kv",
     "full_attention_prep_fold",
     "drafter_block_decode",
+    "persistent_experts",
+    "bf16_routed_experts",
 }
 
 

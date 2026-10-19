@@ -108,8 +108,9 @@ Dense projections and prefetch:
   by the end of their forward.
 * ``next_qkv_prefetch`` registers a named fork in the dense GEMM plan, joined
   by the QKV dispatchers only, and gives every MoE module whose next QKV edge
-  ``boundary_early_release`` converted the next layer's QKV weight: the stacked
-  expert call forks its L2 prefetch right after the expert launch, and
+  ``boundary_early_release`` converted the next layer's QKV weight: a wrapper
+  around the experts' forward (installed with the expert paths once the weights
+  are final) forks its L2 prefetch right after the expert launch, and
   ``DecodeTarget`` forks layer 0's before the embedding. No module is
   re-classed.
 
@@ -187,10 +188,12 @@ installed by the shell's ``load_weights`` after the built-in loader
   patches every layer's experts module and routing method, whatever class the
   MoE module itself has.
 * ``persistent_experts`` routes the NVFP4 layers' stacked calls of at most 8
-  rows to the persistent expert kernel.
+  rows to the persistent expert kernel. Without ``replicated_experts`` (tp 4)
+  the stacked calls run over the rank's own expert block (the owner-only window,
+  ``ring_buddy.install(windows=1)``), with nothing replicated.
 * ``three_window_placement`` stacks a third ring window on them.
 * ``bf16_routed_experts`` gives the two BF16 layers' stacked calls unpacked
-  routing.
+  routing (on the owner-only window as well).
 * ``early_expert_ids`` gives the layers that run the prologue's routed kernel
   one early-ids buffer, so the expert kernel starts its weight stream from ids
   the routed kernel publishes before it ends.
@@ -581,7 +584,7 @@ _TEP4_BITWISE_PATHS = frozenset(
 #: still verifies every draft; it shards every row count at TP4).
 _TEP4_PATHS = _TEP4_BITWISE_PATHS | frozenset({"drafter_fc_shard"})
 #: TEP4 on sm103 adds the attention paths validated at a tep4 rank's 32 query / 4 KV
-#: heads.
+#: heads, and the expert paths on the owner-only 64-expert window (no replication).
 _SM103_TEP4_PATHS = _TEP4_PATHS | frozenset(
     {
         "swa_paged_decode",
@@ -589,6 +592,8 @@ _SM103_TEP4_PATHS = _TEP4_PATHS | frozenset(
         "full_attention_split_kv",
         "full_attention_prep_fold",
         "drafter_block_decode",
+        "persistent_experts",
+        "bf16_routed_experts",
     }
 )
 

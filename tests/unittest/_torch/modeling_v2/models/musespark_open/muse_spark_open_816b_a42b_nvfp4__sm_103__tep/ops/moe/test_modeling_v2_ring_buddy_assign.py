@@ -21,6 +21,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.musespark_open.muse_sp
     RANKS,
     TOP_K,
     balance_ring,
+    block_of,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.musespark_open.muse_spark_open_816b_a42b_nvfp4__sm_103__tep.ops.moe.ring_buddy_assign import (  # noqa: E501
     ring_buddy_assign as op,
@@ -36,13 +37,18 @@ def _seed(text: str) -> int:
     return zlib.crc32(text.encode())
 
 
-def _routing(rows: int, kind: str, rng: random.Random) -> list[list[int]]:
-    """``rows`` top-8 rows of distinct global expert ids under one routing model."""
+def _routing(rows: int, kind: str, rng: random.Random, block: int = BLOCK) -> list[list[int]]:
+    """``rows`` top-8 rows of distinct global expert ids under one routing model.
+
+    ``one_block`` draws from block 0 on the tep8 ring, and from the last block's
+    upper half on the tep4 ring, so a 64-bit presence word's high half is exercised.
+    """
     out = []
     prev = None
     for _ in range(rows):
         if kind == "one_block":
-            row = rng.sample(range(BLOCK), TOP_K)
+            pool = range(block) if block == BLOCK else range(EXPERTS - block // 2, EXPERTS)
+            row = rng.sample(pool, TOP_K)
         elif kind == "keep5" and prev is not None:
             kept = rng.sample(prev, 5)
             row = kept + rng.sample([e for e in range(EXPERTS) if e not in kept], TOP_K - 5)
@@ -53,39 +59,43 @@ def _routing(rows: int, kind: str, rng: random.Random) -> list[list[int]]:
     return out
 
 
-def _inputs(rows: int, kind: str, seed: int):
+def _inputs(rows: int, kind: str, seed: int, block: int = BLOCK):
     rng = random.Random(seed)
-    ids = _routing(rows, kind, rng)
+    ids = _routing(rows, kind, rng, block)
     selected = torch.tensor(ids, dtype=torch.int32, device="cuda")
     g = torch.Generator(device="cuda").manual_seed(seed)
     weights = torch.rand((rows, TOP_K), generator=g, device="cuda", dtype=torch.float32)
     return selected, weights
 
 
-def _executed(local_ids: torch.Tensor, rank: int) -> dict[int, int]:
+def _executed(local_ids: torch.Tensor, rank: int, ranks: int = RANKS) -> dict[int, int]:
     """slot -> global expert, for the slots ``rank`` executes."""
+    block = block_of(ranks)
     out = {}
     for slot, local in enumerate(local_ids.reshape(-1).tolist()):
-        if local < BLOCK:
-            out[slot] = BLOCK * rank + local
-        elif local < 2 * BLOCK:
-            out[slot] = BLOCK * ((rank - 1) % RANKS) + local - BLOCK
+        if local < block:
+            out[slot] = block * rank + local
+        elif local < 2 * block:
+            out[slot] = block * ((rank - 1) % ranks) + local - block
     return out
 
 
-def _check_partition(selected: torch.Tensor, per_rank: list[torch.Tensor]) -> list[int]:
+def _check_partition(
+    selected: torch.Tensor, per_rank: list[torch.Tensor], ranks: int = RANKS
+) -> list[int]:
     """Every slot runs on exactly one rank, as the expert it selected; returns per-rank expert counts."""
+    block = block_of(ranks)
     flat = selected.reshape(-1).tolist()
     owner = {}
     experts_on = []
     for rank, local_ids in enumerate(per_rank):
-        executed = _executed(local_ids, rank)
+        executed = _executed(local_ids, rank, ranks)
         for slot, expert in executed.items():
             assert slot not in owner, f"slot {slot} executed by ranks {owner[slot]} and {rank}"
             assert expert == flat[slot], (
                 f"rank {rank} runs expert {expert} for slot {slot}, which selected {flat[slot]}"
             )
-            assert expert // BLOCK in (rank, (rank - 1) % RANKS), (
+            assert expert // block in (rank, (rank - 1) % ranks), (
                 f"rank {rank} holds no copy of expert {expert}"
             )
             owner[slot] = rank
@@ -99,13 +109,15 @@ def _check_partition(selected: torch.Tensor, per_rank: list[torch.Tensor]) -> li
 def test_cells(cell, balance, certifying):  # noqa: F811 — pytest resolves the fixture by this name
     certifying(op)
     spec = cell.spec
+    ranks = spec.get("ranks", RANKS)
+    block = block_of(ranks)
     for trial in range(4):
-        selected, weights = _inputs(spec["rows"], spec["routing"], _seed(f"{spec}-{trial}"))
+        selected, weights = _inputs(spec["rows"], spec["routing"], _seed(f"{spec}-{trial}"), block)
         per_rank = []
         stats_seen = None
-        for rank in range(RANKS):
-            local_ids, weights_bf16, stats = op(selected, weights, rank, balance)
-            ref_ids, ref_w, ref_stats = op.reference(selected, weights, rank, balance)
+        for rank in range(ranks):
+            local_ids, weights_bf16, stats = op(selected, weights, rank, balance, ranks=ranks)
+            ref_ids, ref_w, ref_stats = op.reference(selected, weights, rank, balance, ranks=ranks)
             assert torch.equal(local_ids, ref_ids), f"rank {rank}: ids differ from the reference"
             assert torch.equal(weights_bf16, ref_w)
             assert torch.equal(stats, ref_stats), f"rank {rank}: stats {stats} vs {ref_stats}"
@@ -114,8 +126,8 @@ def test_cells(cell, balance, certifying):  # noqa: F811 — pytest resolves the
                 stats_seen = stats
             assert torch.equal(stats, stats_seen)
             per_rank.append(local_ids)
-        experts_on = _check_partition(selected, per_rank)
-        before, after = stats_seen[:RANKS].tolist(), stats_seen[RANKS:].tolist()
+        experts_on = _check_partition(selected, per_rank, ranks)
+        before, after = stats_seen[:ranks].tolist(), stats_seen[ranks:].tolist()
         assert experts_on == after
         assert sum(after) == sum(before) == len(set(selected.reshape(-1).tolist()))
         if balance:
@@ -207,3 +219,50 @@ def test_static_placement(rows):
             for slot, expert in _executed(local_ids, rank).items():
                 moved = expert % BLOCK >= 28
                 assert expert // BLOCK == ((rank - 1) % RANKS if moved else rank), (slot, expert)
+
+
+@pytest.mark.parametrize("rows", [1, 8, 16])
+def test_tep4_owner_only_ids_address_the_own_block_window(rows):
+    """tep4 owner-only: a rank's own experts are ``g - 64 * rank`` (0..63), every other id is
+    past the 128-expert two-window range, so a 64-expert own-block call (``ring_buddy``'s
+    ``windows=1``) and a 128-expert two-window call execute the same slots."""
+    ranks, block = 4, block_of(4)
+    for trial in range(4):
+        selected, weights = _inputs(rows, "keep5", _seed(f"tep4-owner-{rows}-{trial}"), block)
+        for rank in range(ranks):
+            ids, _, _ = op(selected, weights, rank, False, ranks=ranks)
+            for g, local in zip(selected.reshape(-1).tolist(), ids.reshape(-1).tolist()):
+                if g // block == rank:
+                    assert local == g - block * rank
+                else:
+                    assert 2 * block <= local < EXPERTS
+
+
+@pytest.mark.parametrize("rows", [1, 8, 16])
+def test_tep4_static_placement(rows):
+    """The static placement on the tep4 ring: local experts 56..63 of every block on the successor."""
+    ranks, block = 4, block_of(4)
+    for trial in range(4):
+        selected, weights = _inputs(rows, "keep5", _seed(f"tep4-static-{rows}-{trial}"), block)
+        per_rank = []
+        for rank in range(ranks):
+            got = op(selected, weights, rank, False, 56, ranks=ranks)
+            want = op.reference(selected, weights, rank, False, 56, ranks=ranks)
+            for a, b in zip(got, want):
+                assert torch.equal(a, b), f"rank {rank}: kernel differs from the reference"
+            per_rank.append(got[0])
+        _check_partition(selected, per_rank, ranks)
+
+
+def test_tep4_ring_balance_is_optimal():
+    """The closed form on the 4-rank ring reaches the min-max flow."""
+    import itertools
+
+    rng = random.Random(4)
+    for _ in range(25):
+        load = [rng.randint(0, 6) for _ in range(4)]
+        best = min(
+            max(load[r] - x[r] + x[(r - 1) % 4] for r in range(4))
+            for x in itertools.product(*[range(v + 1) for v in load])
+        )
+        assert balance_ring(load)[0] == best, load

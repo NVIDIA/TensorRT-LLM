@@ -15,11 +15,14 @@ early release launches QKV early (its kernel stages its weight before its wait,
 and the dense GEMM prefetch's unpooler prefetch of the same weight is dropped there):
 
 * Each layer ``l < L - 1`` asks the L2 for layer ``l + 1``'s QKV weight from a
-  side stream, forked right after its expert call is launched (the ring-buddy
-  stacked call: the persistent expert kernel on the NVFP4 layers, the BF16 leaf
-  on layer 0) and before the fused finalize; the last layer forks none. Layer
-  0's QKV weight is asked for at the start of the decode forward (the embedding
-  chain runs in front of it).
+  side stream, forked right after its expert call is launched (whatever expert
+  call the layer runs: the persistent expert kernel on the NVFP4 layers, the BF16
+  leaf on layer 0, or the built-in TRTLLM-gen call) and before the fused finalize;
+  the last layer forks none. Layer 0's QKV weight is asked for at the start of the
+  decode forward (the embedding chain runs in front of it). The fork is made by
+  an outermost wrapper of the experts' ``forward`` (``ExpertsForward``, installed
+  by ``wrap_expert_forwards`` once the expert paths are installed), so it does not
+  depend on ``replicated_experts`` and runs at every tensor-parallel size.
 * The fork is the dense GEMM plan's named fork ``qkv_prefetch_qkv`` (``dense_gemms.NamedFork``), joined
   only by the QKV dispatchers: the unpooler's dispatcher and the boundary in
   between do not wait for it.
@@ -98,7 +101,7 @@ class QkvPrefetch:
 
 
 class AfterExperts:
-    """Called by the ring-buddy stacked expert call right after it launched the experts (``ring_buddy``)."""
+    """Called by ``ExpertsForward`` right after the layer's expert call launched the experts."""
 
     def __init__(self, prefetch: QkvPrefetch, next_weight: Callable[[], torch.Tensor]) -> None:
         self.prefetch = prefetch
@@ -106,6 +109,49 @@ class AfterExperts:
 
     def __call__(self, rows: int) -> None:
         self.prefetch.ask(self.next_weight(), rows)
+
+
+class ExpertsForward:
+    """A MoE layer's ``experts.forward``: the expert forward installed under it, then the hook.
+
+    The outermost wrapper of the experts' forward (``wrap_expert_forwards``): it
+    calls ``inner`` (the built-in forward, or the stacked call ``ring_buddy``
+    patched in, whichever the layer runs) and, on a ``do_finalize=False`` call,
+    the layer's ``_qkv_prefetch_after_experts`` with the call's row count, so the
+    fork follows the expert launches on the current stream.
+    """
+
+    def __init__(self, inner: Callable, moe) -> None:
+        self.inner = inner
+        self.moe = moe
+
+    def __call__(self, x, router_logits, *args, do_finalize=True, **kwargs):
+        outputs = self.inner(x, router_logits, *args, do_finalize=do_finalize, **kwargs)
+        if not do_finalize:
+            after = getattr(self.moe, "_qkv_prefetch_after_experts", None)
+            if after is not None:
+                after(int(x.shape[0]))
+        return outputs
+
+
+def wrap_expert_forwards(model) -> int:
+    """Give every layer with a prefetch hook the ``ExpertsForward`` wrapper; returns how many.
+
+    Call it after every expert path has patched ``experts.forward``
+    (``weights.install_loaded_features`` does, last), so the wrapper is
+    outermost. Idempotent: a layer already wrapped keeps its wrapper.
+    """
+    wrapped = 0
+    for layer in model.layers:
+        moe = layer.feed_forward
+        if getattr(moe, "_qkv_prefetch_after_experts", None) is None:
+            continue
+        experts = moe.experts
+        if isinstance(vars(experts).get("forward"), ExpertsForward):
+            continue
+        experts.forward = ExpertsForward(experts.forward, moe)
+        wrapped += 1
+    return wrapped
 
 
 def converted_layers(model) -> FrozenSet[int]:
@@ -135,10 +181,11 @@ def install(model, plan) -> QkvPrefetch:
 
     Runs after ``dense_gemms`` (whose plan carries the fork and whose QKV
     dispatchers join it) and ``boundary_early_release`` (which converts the
-    edges). Layer ``l``'s MoE module gets ``_qkv_prefetch_after_experts`` (read
-    by ``ring_buddy`` at call time, so the replicated experts' later install
-    needs nothing from here); a layer whose next QKV edge keeps the dense GEMM
-    prefetch's unpooler prefetch (a capture layer without ``capture_fold``) gets none.
+    edges). Layer ``l``'s MoE module gets ``_qkv_prefetch_after_experts``, read
+    at call time by the ``ExpertsForward`` wrapper that ``wrap_expert_forwards``
+    puts around the experts' forward once the weights and the expert paths are
+    installed; a layer whose next QKV edge keeps the dense GEMM prefetch's
+    unpooler prefetch (a capture layer without ``capture_fold``) gets none.
 
     Raises:
         ValueError: if the plan does not launch with programmatic dependent

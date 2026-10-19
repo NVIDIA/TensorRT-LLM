@@ -45,7 +45,7 @@ def test_three_windows_build_on_the_persistent_experts_and_the_prologue():
 @pytest.mark.parametrize(
     "paths, extra",
     [
-        (("persistent_experts", "moe_prologue"), {"persistent": True}),
+        (("replicated_experts", "persistent_experts", "moe_prologue"), {"persistent": True}),
         (("three_window_placement",), {"persistent": True, "windows": 3}),
         (("replicated_experts",), {}),
     ],

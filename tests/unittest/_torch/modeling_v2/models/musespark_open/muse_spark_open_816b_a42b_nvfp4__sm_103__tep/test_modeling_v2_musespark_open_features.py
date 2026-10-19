@@ -812,11 +812,19 @@ def test_load_weights_installs_ring_buddy_after_the_builtin_load(monkeypatch, pa
 # --------------------------------------------------------------------------
 # The persistent NVFP4 expert kernel, a modifier of the ring-buddy install
 # --------------------------------------------------------------------------
+_TP4 = types.SimpleNamespace(tp_size=4)
+_TP8 = types.SimpleNamespace(tp_size=8)
+
+
 @pytest.mark.parametrize(
-    "paths, expected",
+    "paths, mapping, expected",
     [
-        (("replicated_experts",), ("install", True, 32)),
-        (("persistent_experts",), ("install", True, 32, True)),
+        (("replicated_experts",), _TP8, ("install", True, 32, {})),
+        (
+            ("replicated_experts", "persistent_experts"),
+            _TP8,
+            ("install", True, 32, {"persistent": True}),
+        ),
         (
             (
                 "preattn_prep",
@@ -830,25 +838,49 @@ def test_load_weights_installs_ring_buddy_after_the_builtin_load(monkeypatch, pa
                 "drafter_fc_shard",
                 "fused_accept",
                 "drafter_fixed_gemms",
+                "replicated_experts",
                 "persistent_experts",
             ),
-            ("install", True, 32, True),
+            _TP8,
+            ("install", True, 32, {"persistent": True}),
+        ),
+        # Without replicated_experts: the owner-only window, at tp 4 and tp 8.
+        (
+            ("persistent_experts",),
+            _TP4,
+            ("install", False, None, {"persistent": True, "windows": 1}),
+        ),
+        (
+            ("persistent_experts",),
+            _TP8,
+            ("install", False, None, {"persistent": True, "windows": 1}),
+        ),
+        (
+            ("persistent_experts", "bf16_routed_experts"),
+            _TP4,
+            ("install", False, None, {"persistent": True, "bf16_unpacked": True, "windows": 1}),
+        ),
+        (
+            ("bf16_routed_experts",),
+            _TP4,
+            ("install", False, None, {"bf16_unpacked": True, "windows": 1}),
         ),
     ],
 )
 def test_persistent_experts_reaches_ring_buddy_install_only_when_selected(
-    monkeypatch, paths, expected
+    monkeypatch, paths, mapping, expected
 ):
     """With ``persistent_experts`` the install gets ``persistent=True``; without it the
-    call is exactly the replicated experts' one (no ``persistent`` keyword at all)."""
+    call is exactly the replicated experts' one (no ``persistent`` keyword at all).
+    Without ``replicated_experts`` the expert paths take the owner-only window
+    (``windows=1``, owner placement, nothing replicated)."""
     calls = []
     fake = types.ModuleType("ring_buddy")
     fake.BLOCK, fake.STATIC_FROM = 32, 28
 
-    def install(text_model, mapping, balance=True, static_from=32, **kwargs):
-        assert set(kwargs) <= {"persistent"}
-        call = ("install", balance, static_from)
-        calls.append(call + (kwargs["persistent"],) if kwargs else call)
+    def install(text_model, mapping, balance=True, static_from=None, **kwargs):
+        assert set(kwargs) <= {"persistent", "bf16_unpacked", "windows"}
+        calls.append(("install", balance, static_from, kwargs))
 
     fake.install = install
     package = modeling.__name__.rsplit(".", 1)[0]
@@ -859,8 +891,16 @@ def test_persistent_experts_reaches_ring_buddy_install_only_when_selected(
         fake,
         raising=False,
     )
-    target_weights.install_loaded_features(object(), object(), _PLAN(*paths))
+    target_weights.install_loaded_features(object(), mapping, _PLAN(*paths))
     assert calls == [expected]
+
+
+def test_owner_window_refuses_other_tp_sizes(monkeypatch):
+    """The owner-only window is written for tp 4 and tp 8 only."""
+    with pytest.raises(ValueError, match="tp 4 and tp 8, not tp 2"):
+        target_weights.install_loaded_features(
+            object(), types.SimpleNamespace(tp_size=2), _PLAN("persistent_experts")
+        )
 
 
 class _Fork:

@@ -25,10 +25,13 @@ Contract (the unfinalized triple the MuseSpark MoE finalize reads):
   take as ``expanded_idx_to_permuted_idx`` (``expert_rows.slot_row_map``; the
   contract every finalize follows is ``expert_rows.py``'s).
 
-The window is the leading dim of the weight tensors: ``L = 32`` is a rank's
-own expert block (ids rebased to it), ``L = 64`` the ring-buddy stack,
-``L = 96`` the three-window stack ``[own | b-1 | b-2]``. An expert's rows
-do not depend on the window it is read from.
+The window is the leading dim of the weight tensors: ``L = 32`` is a tep8
+rank's own expert block (ids rebased to it), ``L = 64`` the tep8 ring-buddy
+stack or a tep4 rank's own 64-expert block (the owner-only window of
+``ring_buddy.install(windows=1)``, ids rebased to it), ``L = 96`` the tep8
+three-window stack ``[own | b-1 | b-2]``. The kernel's active-expert bit set
+is over window ids (two 32-bit words up to 64), so the ring's block size does
+not enter it. An expert's rows do not depend on the window it is read from.
 """
 
 from __future__ import annotations
@@ -404,6 +407,11 @@ class PersistentExperts(OpWrapper):
         Cell(
             why="a rank's own 32-expert block (plain expert parallelism), 6 active experts",
             spec=dict(rows=8, window=32, active=6),
+        ),
+        Cell(
+            why="tep4: a rank's own 64-expert block (the owner-only window), the busiest rank "
+            "of a K=7 verify step (~28 distinct experts over 4 ranks, up to ~12 on one)",
+            spec=dict(rows=8, window=64, active=12),
         ),
         Cell(
             why="a single decode row: one token, up to 8 local experts",

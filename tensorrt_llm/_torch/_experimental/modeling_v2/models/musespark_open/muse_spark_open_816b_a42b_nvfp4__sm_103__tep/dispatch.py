@@ -115,7 +115,7 @@ FAST_PATHS: Tuple[FastPath, ...] = (
         "next_qkv_prefetch",
         "next layer's QKV weight prefetched from the expert call",
         "construct",
-        ("dense_gemms", "boundary_early_release", "replicated_experts"),
+        ("dense_gemms", "boundary_early_release"),
     ),
     # Hops and boundaries.
     FastPath(
@@ -171,24 +171,16 @@ FAST_PATHS: Tuple[FastPath, ...] = (
         "construct",
     ),
     FastPath("replicated_experts", "ring-buddy expert replication, balanced", "load"),
-    FastPath(
-        "persistent_experts",
-        "NVFP4 experts as one persistent launch",
-        "load",
-        ("replicated_experts",),
-    ),
+    # persistent_experts and bf16_routed_experts run over the ring-buddy stack with
+    # replicated_experts, else over the rank's own expert block (the owner-only window).
+    FastPath("persistent_experts", "NVFP4 experts as one persistent launch", "load"),
     FastPath(
         "three_window_placement",
         "a third ring window for the replicated experts",
         "load",
         ("replicated_experts", "persistent_experts", "moe_prologue"),
     ),
-    FastPath(
-        "bf16_routed_experts",
-        "BF16 experts given unpacked routing",
-        "load",
-        ("replicated_experts",),
-    ),
+    FastPath("bf16_routed_experts", "BF16 experts given unpacked routing", "load"),
     FastPath(
         "early_expert_ids",
         "persistent expert kernel starting from early-published ids",

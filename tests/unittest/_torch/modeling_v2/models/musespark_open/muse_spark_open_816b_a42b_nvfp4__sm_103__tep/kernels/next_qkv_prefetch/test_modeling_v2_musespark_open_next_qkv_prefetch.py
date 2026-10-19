@@ -9,8 +9,9 @@ Here: what it builds on, ``post_wait_columns``, which layers get the hook (those
 next QKV edge ``boundary_early_release`` converted), at which row counts a fork is made (those whose QKV
 kernel stages its weight before its wait and loads its last k-tiles after it, whatever
 kernel table the plan carries), that the fork is the ``dense_gemms`` plan's named fork joined at the
-QKV site, that ``ring_buddy``'s stacked expert call calls the hook after it launched the
-experts, and that the decode forward forks layer 0's prefetch before anything else.
+QKV site, that the ``ExpertsForward`` wrapper calls the hook after whichever expert call the
+layer runs (the built-in one, or ``ring_buddy``'s stacked call), and that the decode forward
+forks layer 0's prefetch before anything else.
 """
 
 from __future__ import annotations
@@ -46,11 +47,13 @@ _DEFAULT_QKV = dense_gemms.default_kernels()["qkv"]
 # --- what it builds on -----------------------------------------------------------------------
 
 
-def test_qkv_prefetch_builds_on_the_gemms_the_converted_edges_and_the_replicated_experts():
+def test_qkv_prefetch_builds_on_the_gemms_and_the_converted_edges():
     """The fork joins at the ``dense_gemms`` QKV site, after the edge ``boundary_early_release``
-    converted, from the hook ``ring_buddy``'s stacked expert call runs."""
-    direct = {"dense_gemms", "boundary_early_release", "replicated_experts"}
+    converted, from the hook the experts' forward wrapper runs (any expert call, so not
+    ``replicated_experts``)."""
+    direct = {"dense_gemms", "boundary_early_release"}
     assert dispatch.closure({"next_qkv_prefetch"}) >= direct
+    assert "replicated_experts" not in dispatch.closure({"next_qkv_prefetch"})
     for missing in sorted(direct):
         with pytest.raises(ValueError, match="builds on"):
             dispatch.Plan(dispatch.closure({"next_qkv_prefetch"}) - {missing})
@@ -232,27 +235,61 @@ def test_a_fork_is_made_only_at_the_rows_early_release_launches_qkv_early(rows, 
 # --- call sites ------------------------------------------------------------------------------------
 
 
-def test_ring_buddy_calls_the_hook_after_the_stacked_expert_call(monkeypatch):
+def _hooked_moe(log):
+    moe = nn.Module()
+    moe.experts = nn.Module()
+    moe._qkv_prefetch_after_experts = lambda rows: log.append(("qkv_prefetch", rows))
+    return moe
+
+
+def test_the_wrapper_calls_the_hook_after_the_built_in_expert_call():
+    """At tp 4 (no ring-buddy stack) the layer runs the built-in expert forward; the
+    wrapper forks the prefetch after it, on ``do_finalize=False`` calls only."""
+    log = []
+    moe = _hooked_moe(log)
+    moe.experts.forward = (
+        lambda x, logits, *a, do_finalize=True, **k: log.append(("builtin", do_finalize)) or "out"
+    )
+    model = types.SimpleNamespace(
+        layers=[
+            types.SimpleNamespace(feed_forward=moe),
+            types.SimpleNamespace(feed_forward=nn.Module()),
+        ]
+    )
+    assert qkv_prefetch.wrap_expert_forwards(model) == 1
+    x = torch.zeros(8, 4)
+    assert moe.experts(x, torch.zeros(8, 2), do_finalize=False, output_dtype=None) == "out"
+    assert log == [("builtin", False), ("qkv_prefetch", 8)]
+    log.clear()
+    moe.experts(x, torch.zeros(8, 2), do_finalize=True)
+    assert log == [("builtin", True)]
+    # Idempotent: a second wrap (a weight reload) keeps the one wrapper.
+    wrapper = moe.experts.forward
+    assert qkv_prefetch.wrap_expert_forwards(model) == 0
+    assert moe.experts.forward is wrapper
+
+
+def test_the_wrapper_calls_the_hook_after_the_stacked_expert_call(monkeypatch):
+    """At tp 8 the ring-buddy stacked call is patched in first; the wrapper sits outside it."""
     from tensorrt_llm._torch._experimental.modeling_v2.models.musespark_open.muse_spark_open_816b_a42b_nvfp4__sm_103__tep.kernels.replicated_experts import (  # noqa: E501
         ring_buddy,
     )
 
     log = []
-    moe = nn.Module()
-    moe.experts = nn.Module()
+    moe = _hooked_moe(log)
     routing = types.SimpleNamespace(
         apply=lambda logits, ids=None: log.append("routing"),
         routing_method_type=0,
     )
     moe.experts.routing_method = routing
     moe.experts.forward = lambda *a, **k: log.append("builtin")
-    moe._qkv_prefetch_after_experts = lambda rows: log.append(("qkv_prefetch", rows))
     placement = (None, None, "ids", "weights", None)
     state = types.SimpleNamespace(
         active=True,
         kind="bf16",
         stacks="stacks",
         by_window={2 * ring_buddy.BLOCK: "stacks"},
+        default_window=2 * ring_buddy.BLOCK,
         current=lambda logits: placement,
     )
     monkeypatch.setattr(ring_buddy, "_backend", lambda m: None)
@@ -263,6 +300,12 @@ def test_ring_buddy_calls_the_hook_after_the_stacked_expert_call(monkeypatch):
     )
     ring_buddy._patch_experts(moe, state)
     x = torch.zeros(8, 4)
+    # Without the wrapper the stacked call forks nothing.
+    assert moe.experts.forward(x, torch.zeros(8, 2), do_finalize=False) == "out"
+    assert log == ["routing", "experts"]
+    log.clear()
+    model = types.SimpleNamespace(layers=[types.SimpleNamespace(feed_forward=moe)])
+    assert qkv_prefetch.wrap_expert_forwards(model) == 1
     assert moe.experts.forward(x, torch.zeros(8, 2), do_finalize=False) == "out"
     assert log == ["routing", "experts", ("qkv_prefetch", 8)]
 

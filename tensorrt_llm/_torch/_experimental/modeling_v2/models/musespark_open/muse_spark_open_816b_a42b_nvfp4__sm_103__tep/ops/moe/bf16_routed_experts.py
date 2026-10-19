@@ -45,7 +45,9 @@ HIDDEN = 4096
 INTER = 4096
 EXPERTS = 256
 TOP_K = 8
-#: The ring-buddy window: ``[own block | predecessor's block]``.
+#: The window the cells use: the tep8 ring-buddy stack ``[own block | predecessor's
+#: block]``, which is also a tep4 rank's own block (the owner-only window). The op
+#: itself takes any window (``local_num_experts``).
 WINDOW = 64
 #: BlockMajorK's K block: 128 bytes of BF16.
 BLOCK_K = 64

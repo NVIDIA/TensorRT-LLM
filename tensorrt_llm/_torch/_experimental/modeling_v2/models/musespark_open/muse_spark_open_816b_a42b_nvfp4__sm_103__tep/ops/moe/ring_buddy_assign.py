@@ -2,7 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Per-step expert placement for ring-buddy replicated experts (``replicated_experts``).
 
-Under expert parallelism over ``RANKS`` ranks, block ``b`` (global experts
+Under expert parallelism over ``RANKS`` ranks (``RING_SIZES``: 8 ranks of 32-expert
+blocks at tep8, 4 ranks of 64-expert blocks at tep4), block ``b`` (global experts
 ``[BLOCK*b, BLOCK*(b+1))``) lives on rank ``b``. With ring-buddy replication
 rank ``b + 1`` (mod ``RANKS``) holds a second copy of block ``b``, so every
 selected expert can run on its owner or on the owner's successor. This entry
@@ -34,15 +35,22 @@ highest local index move.
 
 The kernel is one program that sits on the decode step's MoE critical path
 when the main stream is the longer branch, so it is kept to ``[slots, RANKS]``
-work: the census is one 32-bit presence word per block (an OR-reduction of
-``1 << i`` over the slots of that block, which also counts a repeated expert
-once), a block's load is the word's population count, and an expert's rank
-within its block is the population count of the bits above its own.
+work: the census is one presence word per block, as wide as the block (32 bits
+at tep8, 64 bits at tep4), an OR-reduction of ``1 << i`` over the slots of that
+block, which also counts a repeated expert once; a block's load is the word's
+population count, and an expert's rank within its block is the population count
+of the bits above its own.
+
+With ``balance=False`` and ``static_from`` at the block size every expert stays on
+its owner. Those ids address a one-window call as well: the rank's own block
+alone (``local_num_experts = BLOCK``), the owner-only window
+``ring_buddy.install(windows=1)`` gives ``persistent_experts`` and
+``bf16_routed_experts`` without replication.
 """
 
 from __future__ import annotations
 
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 import triton
@@ -50,11 +58,29 @@ import triton.language as tl
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 
-#: Model geometry: 256 experts over the 8 expert-parallel ranks of tep8.
+#: Model geometry: 256 experts over the 8 expert-parallel ranks of tep8 (the
+#: defaults), or over the 4 of tep4 (``ranks=4``).
 EXPERTS = 256
 RANKS = 8
 BLOCK = EXPERTS // RANKS
 TOP_K = 8
+#: The ring sizes the kernel serves: expert-parallel ranks -> experts per block.
+RING_SIZES = {8: EXPERTS // 8, 4: EXPERTS // 4}
+
+
+def block_of(ranks: int) -> int:
+    """Experts per block on a ring of ``ranks``.
+
+    Raises:
+        ValueError: for a ring size not in ``RING_SIZES``.
+    """
+    if ranks == 8:
+        return RING_SIZES[8]
+    elif ranks == 4:
+        return RING_SIZES[4]
+    raise ValueError(f"ring_buddy_assign serves rings of {sorted(RING_SIZES)} ranks, got {ranks}")
+
+
 #: Largest ``M * TOP_K`` one program handles (M <= 16 decode rows).
 MAX_SLOTS = 128
 
@@ -83,6 +109,15 @@ def _popc32(v):
 
 
 @triton.jit
+def _popc(v, WIDE: tl.constexpr):
+    """Set bits of each presence word (uint32, or uint64 when ``WIDE``), as int32."""
+    if WIDE:
+        return _popc32(v.to(tl.uint32)) + _popc32((v >> 32).to(tl.uint32))
+    else:
+        return _popc32(v)
+
+
+@triton.jit
 def _ring_buddy_assign_kernel(
     selected_ptr,  # [num_slots] int32 global expert ids
     weights_ptr,  # [num_slots] float32 routing weights
@@ -98,7 +133,8 @@ def _ring_buddy_assign_kernel(
     BALANCE: tl.constexpr,
     STATIC_FROM: tl.constexpr,
 ):
-    tl.static_assert(BLOCK == 32, "one 32-bit presence word per block")
+    tl.static_assert(BLOCK == 32 or BLOCK == 64, "one 32- or 64-bit presence word per block")
+    WIDE: tl.constexpr = BLOCK == 64
     s = tl.arange(0, SLOTS)
     smask = s < num_slots
     g = tl.load(selected_ptr + s, mask=smask, other=0)
@@ -109,12 +145,17 @@ def _ring_buddy_assign_kernel(
 
     # Census: one presence word per block, bit i set when local expert i is
     # selected by any slot; a duplicate id sets the same bit.
-    shift = i.to(tl.uint32)
-    bit = tl.full([SLOTS], 1, tl.uint32) << shift
+    if WIDE:
+        shift = i.to(tl.uint64)
+        bit = tl.full([SLOTS], 1, tl.uint64) << shift
+        no_bits = tl.zeros([SLOTS, RANKS], dtype=tl.uint64)
+    else:
+        shift = i.to(tl.uint32)
+        bit = tl.full([SLOTS], 1, tl.uint32) << shift
+        no_bits = tl.zeros([SLOTS, RANKS], dtype=tl.uint32)
     in_rank = (blk[:, None] == ranks[None, :]) & smask[:, None]  # [SLOTS, RANKS]
-    no_bits = tl.zeros([SLOTS, RANKS], dtype=tl.uint32)
     word = tl.reduce(tl.where(in_rank, bit[:, None], no_bits), 0, _bit_or)  # [RANKS]
-    load = _popc32(word)  # [RANKS]
+    load = _popc(word, WIDE)  # [RANKS]
 
     if BALANCE:
         # arc[r, n-1]: load of the n blocks ending at r (n = 1..RANKS).
@@ -132,7 +173,7 @@ def _ring_buddy_assign_kernel(
     elif STATIC_FROM < BLOCK:
         # Fixed placement: local experts STATIC_FROM.. of every block run on
         # the successor, whatever the step selects.
-        x = _popc32(word >> STATIC_FROM)
+        x = _popc(word >> STATIC_FROM, WIDE)
     else:
         x = tl.zeros([RANKS], dtype=tl.int32)
 
@@ -140,7 +181,7 @@ def _ring_buddy_assign_kernel(
     # a slot's expert moves when fewer than x[b] present experts of its block
     # sit above it.
     word_s = tl.reduce(tl.where(in_rank, word[None, :], no_bits), 1, _bit_or)  # [SLOTS]
-    above = _popc32((word_s >> shift) >> 1)
+    above = _popc((word_s >> shift) >> 1, WIDE)
     x_blk = tl.sum(tl.where(in_rank, x[None, :], 0), axis=1)  # [SLOTS]
     er = (blk + (above < x_blk).to(tl.int32)) % RANKS
 
@@ -181,16 +222,18 @@ class RingBuddyAssign(OpWrapper):
     """Place one step's selected experts on owner or successor; rewrite ids for one rank.
 
     Takes the routing method's ``selected`` ids ``[M, 8]`` (int32, global) and
-    its fp32 ``weights``, and this rank's index. Returns ``(local_ids [M, 8]
-    int32, weights_bf16 [M, 8], stats [16] int32)``: the ids in this rank's
-    stacked expert space (see the module docstring), the weights cast to the
-    BF16 the TRTLLM-gen expert op requires, and the per-rank distinct-expert
-    loads before (``stats[:8]``) and after (``stats[8:]``) placement.
-    ``balance=False`` places every expert on its owner, which reproduces plain
-    expert parallelism through the stacked layout; with ``balance=False`` and
-    ``static_from < 32``, local experts ``static_from..31`` of every block run
-    on the successor at every step instead (a routing-independent regrouping,
-    the static placement).
+    its fp32 ``weights``, this rank's index and the ring size ``ranks`` (8, the
+    default, or 4; the block is ``256 / ranks`` experts). Returns ``(local_ids
+    [M, 8] int32, weights_bf16 [M, 8], stats [2 * ranks] int32)``: the ids in
+    this rank's stacked expert space (see the module docstring), the weights
+    cast to the BF16 the TRTLLM-gen expert op requires, and the per-rank
+    distinct-expert loads before (``stats[:ranks]``) and after
+    (``stats[ranks:]``) placement. ``balance=False`` places every expert on its
+    owner, which reproduces plain expert parallelism through the stacked layout
+    (or the owner-only window); with ``balance=False`` and ``static_from`` below
+    the block size, local experts ``static_from..`` of every block run on the
+    successor at every step instead (a routing-independent regrouping, the
+    static placement). ``static_from`` defaults to the block size.
     """
 
     ARCHS = frozenset({Arch.SM_103})
@@ -230,6 +273,23 @@ class RingBuddyAssign(OpWrapper):
             why="the program's slot limit: 16 rows, 128 slots",
             spec=dict(rows=16, routing="uniform"),
         ),
+        Cell(
+            why="tep4 (4 ranks of 64-expert blocks, 64-bit presence words) at the DFlash K=7 "
+            "verify width with correlated rows",
+            spec=dict(rows=8, routing="keep5", ranks=4),
+        ),
+        Cell(
+            why="tep4, a single decode row",
+            spec=dict(rows=1, routing="uniform", ranks=4),
+        ),
+        Cell(
+            why="tep4, every selected expert in one 64-expert block, high bits of the word set",
+            spec=dict(rows=8, routing="one_block", ranks=4),
+        ),
+        Cell(
+            why="tep4 at the program's slot limit: 16 rows, 128 slots",
+            spec=dict(rows=16, routing="uniform", ranks=4),
+        ),
     )
 
     note = """
@@ -238,9 +298,11 @@ class RingBuddyAssign(OpWrapper):
     (top-k selection is distinct) and are counted once in the census.
 
     The rewritten ids are meaningful only for an expert call with
-    ``local_expert_offset=0`` and ``local_num_experts=64`` over a stacked
-    ``[own block | predecessor's block]`` weight tensor; any other window
-    would execute experts this rank was not assigned.
+    ``local_expert_offset=0`` and ``local_num_experts=2*BLOCK`` over a stacked
+    ``[own block | predecessor's block]`` weight tensor (64 experts at tep8, 128
+    at tep4), or, for the owner-only placement, ``local_num_experts=BLOCK`` over
+    the rank's own block; any other window would execute experts this rank was
+    not assigned.
     """
 
     def __call__(
@@ -249,12 +311,15 @@ class RingBuddyAssign(OpWrapper):
         weights: torch.Tensor,
         rank: int,
         balance: bool = True,
-        static_from: int = BLOCK,
+        static_from: Optional[int] = None,
+        ranks: int = RANKS,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        block = block_of(ranks)
+        static_from = block if static_from is None else static_from
         num_slots = selected.numel()
         local_ids = torch.empty_like(selected, dtype=torch.int32)
         weights_bf16 = torch.empty(selected.shape, dtype=torch.bfloat16, device=selected.device)
-        stats = torch.empty(2 * RANKS, dtype=torch.int32, device=selected.device)
+        stats = torch.empty(2 * ranks, dtype=torch.int32, device=selected.device)
         slots = max(16, triton.next_power_of_2(num_slots))
         _ring_buddy_assign_kernel[(1,)](
             selected,
@@ -266,8 +331,8 @@ class RingBuddyAssign(OpWrapper):
             num_slots,
             SLOTS=slots,
             EXPERTS=EXPERTS,
-            RANKS=RANKS,
-            BLOCK=BLOCK,
+            RANKS=ranks,
+            BLOCK=block,
             BALANCE=balance,
             STATIC_FROM=static_from,
             num_warps=NUM_WARPS,
@@ -280,36 +345,39 @@ class RingBuddyAssign(OpWrapper):
         weights: torch.Tensor,
         rank: int,
         balance: bool = True,
-        static_from: int = BLOCK,
+        static_from: Optional[int] = None,
+        ranks: int = RANKS,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """The placement in plain Python over the host copy of ``selected``."""
+        size = block_of(ranks)
+        static_from = size if static_from is None else static_from
         flat = [int(v) for v in selected.reshape(-1).tolist()]
         present = sorted(set(flat))
-        load = [0] * RANKS
+        load = [0] * ranks
         for expert in present:
-            load[expert // BLOCK] += 1
+            load[expert // size] += 1
         if balance:
             x = balance_ring(load)[1]
         else:
             x = [
-                sum(1 for e in present if e // BLOCK == b and e % BLOCK >= static_from)
-                for b in range(RANKS)
+                sum(1 for e in present if e // size == b and e % size >= static_from)
+                for b in range(ranks)
             ]
         moved = set()
-        for block in range(RANKS):
-            in_block = [e for e in present if e // BLOCK == block]
-            moved.update(sorted(in_block, reverse=True)[: x[block]])
+        for b in range(ranks):
+            in_block = [e for e in present if e // size == b]
+            moved.update(sorted(in_block, reverse=True)[: x[b]])
         local = []
         for expert in flat:
-            block, index = divmod(expert, BLOCK)
-            runs_on = (block + (expert in moved)) % RANKS
+            owner, index = divmod(expert, size)
+            runs_on = (owner + (expert in moved)) % ranks
             if runs_on != rank:
-                local.append(2 * BLOCK + expert % (EXPERTS - 2 * BLOCK))
-            elif block == rank:
+                local.append(2 * size + expert % (EXPERTS - 2 * size))
+            elif owner == rank:
                 local.append(index)
             else:
-                local.append(BLOCK + index)
-        after = [load[r] - x[r] + x[(r - 1) % RANKS] for r in range(RANKS)]
+                local.append(size + index)
+        after = [load[r] - x[r] + x[(r - 1) % ranks] for r in range(ranks)]
         device = selected.device
         return (
             torch.tensor(local, dtype=torch.int32, device=device).reshape(selected.shape),
@@ -323,9 +391,13 @@ class RingBuddyAssign(OpWrapper):
         weights: torch.Tensor,
         rank: int,
         balance: bool = True,
-        static_from: int = BLOCK,
+        static_from: Optional[int] = None,
+        ranks: int = RANKS,
     ) -> None:
         """Inputs the kernel would read past or misplace without an error."""
+        assert ranks in RING_SIZES, f"ranks must be one of {sorted(RING_SIZES)}, got {ranks}"
+        block = block_of(ranks)
+        static_from = block if static_from is None else static_from
         assert selected.is_cuda and selected.dtype == torch.int32 and selected.is_contiguous(), (
             "selected must be contiguous int32 on the device; the kernel reads raw words"
         )
@@ -339,8 +411,8 @@ class RingBuddyAssign(OpWrapper):
             "weights must be contiguous float32"
         )
         assert weights.shape == selected.shape, "weights and selected must have one shape"
-        assert 0 <= static_from <= BLOCK, f"static_from must be in [0, {BLOCK}]"
-        assert 0 <= rank < RANKS, f"rank must be in [0, {RANKS}), got {rank}"
+        assert 0 <= static_from <= block, f"static_from must be in [0, {block}]"
+        assert 0 <= rank < ranks, f"rank must be in [0, {ranks}), got {rank}"
 
 
 ring_buddy_assign = RingBuddyAssign()

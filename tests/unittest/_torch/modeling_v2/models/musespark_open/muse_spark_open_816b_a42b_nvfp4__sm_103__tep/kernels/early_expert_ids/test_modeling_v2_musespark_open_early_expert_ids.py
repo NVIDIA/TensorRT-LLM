@@ -25,7 +25,6 @@ pytestmark = pytest.mark.cpu_only
 def test_the_early_start_builds_on_the_persistent_experts_and_the_prologue():
     assert dispatch.closure({"early_expert_ids"}) >= {
         "persistent_experts",
-        "replicated_experts",
         "moe_prologue",
     }
     with pytest.raises(ValueError, match="builds on"):
