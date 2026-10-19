@@ -537,6 +537,47 @@ def test_native_sparse_decode_coalesced_rows_and_graph_replay(
             torch.testing.assert_close(actual, expected, atol=0.02, rtol=0.02)
 
 
+@pytest.mark.skipif(
+    get_sm_version() not in (100, 103), reason="native sparse MLA requires SM100/103"
+)
+@pytest.mark.parametrize("rows,width,heads", [(8, 2052, 16), (8, 2052, 32), (64, 256, 64)])
+def test_native_fp8_sparse_decode_query_quantization_error(rows: int, width: int, heads: int):
+    """Bound the error of the FP8 query against BF16-query attention over the same FP8 cache."""
+    from types import SimpleNamespace
+
+    from tensorrt_llm._torch.attention.backends.sparse.glm_kpool.backend import latent_pool_rows
+    from tensorrt_llm._torch.attention.backends.sparse.glm_kpool.native_decode import (
+        GlmKpoolNativeDecode,
+    )
+
+    generator = torch.Generator(device="cuda").manual_seed(20261019)
+    kv_scale = torch.tensor([0.75], device="cuda")
+    latent = torch.randn(32, 32, 512, dtype=torch.bfloat16, device="cuda", generator=generator)
+    cache = (latent.float() / kv_scale).clamp(-448, 448).to(torch.float8_e4m3fn)
+    kv_rows, base, stride = latent_pool_rows(cache)
+    q = torch.randn(rows, heads, 512, dtype=torch.bfloat16, device="cuda", generator=generator)
+    logical = torch.randint(0, 1024, (rows, width), device="cuda", generator=generator)
+    indices = (base + logical // 32 * stride + logical % 32).int()
+    indices[:, ::5] = -1
+    runner = GlmKpoolNativeDecode()
+    metadata = SimpleNamespace(effective_workspace=torch.empty(0, dtype=torch.int8, device="cuda"))
+    runner.prepare_workspace(
+        q, metadata, max_query_rows=max(rows, 8), query_dtype=torch.float8_e4m3fn
+    )
+    scale = 256**-0.5
+    actual = runner(q, kv_rows, indices, scale, metadata, kv_scale=kv_scale).float()
+
+    valid = indices >= 0
+    selected = kv_rows.float()[indices.clamp_min(0).long(), 0] * kv_scale
+    selected.masked_fill_(~valid[:, :, None], 0)
+    logits = torch.einsum("rhd,rkd->rhk", q.float(), selected) * scale
+    logits.masked_fill_(~valid[:, None, :], float("-inf"))
+    expected = torch.einsum("rhk,rkd->rhd", logits.softmax(dim=-1), selected)
+    # Energy-normalized error of the E4M3 query (measured ~7e-4 on Gaussian data).
+    diff = (actual - expected).square().sum() / (actual.square().sum() + expected.square().sum())
+    assert diff < 1e-3
+
+
 def test_pool_scores_offsets_beyond_int32() -> None:
     from tensorrt_llm._torch.attention.backends.sparse.glm_kpool.kernels import _kpool_score_kernel
 
