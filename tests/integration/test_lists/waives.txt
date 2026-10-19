@@ -219,8 +219,6 @@ perf/test_visual_gen_perf_sanity.py::test_visual_gen_e2e[vg_upload-flux2_blackwe
 test_doc.py::test_relative_path_validity SKIP (https://nvbugs/6784181)
 test_e2e.py::test_ptp_quickstart_bert[TRTLLM-BertForSequenceClassification-bert/bert-base-uncased-yelp-polarity] SKIP (https://nvbugs/6605819)
 test_e2e.py::test_ptp_quickstart_bert[VANILLA-BertForSequenceClassification-bert/bert-base-uncased-yelp-polarity] SKIP (bug pending, tracked in PR 17414)
-unittest/_torch/attention --ignore=unittest/_torch/attention/sparse/dsa/test_cute_dsl_fp8_paged_mqa_logits.py --ignore=unittest/_torch/attention/sparse/dsa/test_cute_dsl_fp4_paged_mqa_logits.py --ignore=unittest/_torch/attention/sparse/test_cute_dsl_gvr_topk_decode.py SKIP (https://nvbugs/6932265)
-unittest/_torch/attention/multi_gpu/test_mha_helix.py::test_mha_helix_distributed[nccl-scenario: Scenario(dtype=torch.bfloat16, kv_cache_dtype=torch.bfloat16, num_layers=1, num_heads=16, num_kv_heads=4, head_dim=128, hidden_size=2048, rope_theta=10000.0, kv_cache_tokens_per_block=32, bias=False, batch=1, ctx_len=64, atol=0.1, rtol=0.05)] SKIP (https://nvbugs/6932241)
 unittest/_torch/attention/sparse/dsa/test_req_idx_per_token.py::test_on_update_kv_lens_rebuilds_stale_map SKIP (https://nvbugs/6574939)
 unittest/_torch/attention/sparse/msa/test_msa_backend.py::test_msa_buffers_stage_local_cache_views SKIP (https://nvbugs/6831694)
 unittest/_torch/attention/test_attention_backends.py::test_attention_backend[qwen2_0_5b_gqa_hd64-ctx-bf16-HND-p32-v1] SKIP (https://nvbugs/6641268)
