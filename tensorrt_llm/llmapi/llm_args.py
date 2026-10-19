@@ -173,6 +173,57 @@ def _get_trtllm_json_schema_extra(field_info: Any) -> dict[str, Any]:
     return json_schema_extra if isinstance(json_schema_extra, dict) else {}
 
 
+class BeamSearchCudaGraphProfile(StrictBaseModel):
+    """Beam sampling shapes to prepare before the executor worker starts."""
+
+    batch_sizes: list[PositiveInt] = Field(
+        min_length=1,
+        description=
+        "Exact request batch sizes, excluding beam rows. No batch padding is applied."
+    )
+    beam_widths: list[PositiveInt] = Field(
+        min_length=1,
+        description=
+        "Output beam widths for successive generated tokens. A single width is repeated for max_tokens; otherwise provide exactly max_tokens widths."
+    )
+    max_tokens: PositiveInt = Field(
+        description=
+        "Number of generated-token steps to prepare. Longer requests use eager sampling for uncovered steps."
+    )
+    early_stopping: Literal[0, 1, 2] = Field(
+        default=1,
+        description=
+        "Beam early-stopping mode: 0 (false), 1 (true), or 2 (never).")
+
+    @model_validator(mode='after')
+    def validate_schedule(self) -> 'BeamSearchCudaGraphProfile':
+        if len(self.beam_widths) not in (1, self.max_tokens):
+            raise ValueError(
+                "beam_widths must contain one width or exactly max_tokens widths"
+            )
+        return self
+
+
+class BeamSearchCudaGraphConfig(StrictBaseModel):
+    """Opt-in CUDA graphs for single-GPU synchronous beam sampling."""
+
+    profiles: list[BeamSearchCudaGraphProfile] = Field(
+        min_length=1,
+        description=
+        "Explicit startup profiles. Uncovered shapes and parameter combinations execute eagerly; requests never trigger capture."
+    )
+    max_graphs: PositiveInt = Field(
+        default=192,
+        description=
+        "Maximum number of prepared sampling graphs. Profiles are prepared in declaration order until this limit is reached."
+    )
+    max_static_input_bytes: PositiveInt = Field(
+        default=512 * 1024 * 1024,
+        description=
+        "Maximum bytes of persistent logits staging buffers per sampler. This excludes graph scratch, sampler state, temporary warmup tensors, and the 1 MiB radix workspace."
+    )
+
+
 class BaseCudaGraphConfig(StrictBaseModel):
     """Common configuration for CUDA graphs."""
     # List of batch sizes to create CUDA graphs for.
@@ -6343,6 +6394,36 @@ class TorchLlmArgs(BaseLlmArgs):
         since the input shapes are a function of the sequence lengths).\
          Note that each CUDA graph can use up to 200 MB of extra memory.",
         status="beta")
+
+    beam_search_cuda_graph_config: Optional[BeamSearchCudaGraphConfig] = Field(
+        default=None,
+        description=
+        "Opt-in startup CUDA graphs for beam sampling. Disabled when omitted. Supports a single GPU and synchronous TorchSampler; uncovered requests execute eagerly. Independent of model-forward cuda_graph_config.",
+        status="prototype")
+
+    @model_validator(mode='after')
+    def validate_beam_search_cuda_graph_config(self) -> 'TorchLlmArgs':
+        config = self.beam_search_cuda_graph_config
+        if config is None:
+            return self
+        if (self.tensor_parallel_size != 1 or self.pipeline_parallel_size != 1
+                or self.context_parallel_size != 1):
+            raise ValueError(
+                "beam_search_cuda_graph_config requires a single GPU")
+        if self.sampler_force_async_worker or self.speculative_config is not None or self.encode_only:
+            raise ValueError(
+                "beam_search_cuda_graph_config requires a synchronous decoder sampler without speculative decoding"
+            )
+        for profile in config.profiles:
+            if max(profile.beam_widths) > self.max_beam_width:
+                raise ValueError("beam graph widths exceed max_beam_width")
+            if self.max_batch_size is not None and max(
+                    profile.batch_sizes) > self.max_batch_size:
+                raise ValueError("beam graph batch sizes exceed max_batch_size")
+            if self.max_seq_len is not None and profile.max_tokens >= self.max_seq_len:
+                raise ValueError(
+                    "beam graph max_tokens must be smaller than max_seq_len")
+        return self
 
     encoder_cuda_graph_config: Optional[EncodeCudaGraphConfig] = Field(
         default=None,

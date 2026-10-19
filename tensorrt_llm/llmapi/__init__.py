@@ -10,6 +10,7 @@ from ..scheduling_params import SchedulingParams
 from .llm import LLM, RequestOutput
 # yapf: disable
 from .llm_args import (AttentionDpConfig, AutoDecodingConfig, BatchingType,
+                       BeamSearchCudaGraphConfig, BeamSearchCudaGraphProfile,
                        BlockReuseConfig, CacheTransceiverConfig, CalibConfig,
                        CapacitySchedulerPolicy,
                        ColdPageQuantizationCompressionConfig,
@@ -59,6 +60,8 @@ __all__ = [
     'MambaStateConfig',
     'KvCacheRetentionConfig',
     'CudaGraphConfig',
+    'BeamSearchCudaGraphConfig',
+    'BeamSearchCudaGraphProfile',
     'DecodeCudaGraphConfig',
     'EncodeCudaGraphConfig',
     'EncodeExtraInputSpec',

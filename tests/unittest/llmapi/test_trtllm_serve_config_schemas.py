@@ -82,6 +82,57 @@ def schemas(tmp_path_factory: pytest.TempPathFactory) -> dict[str, dict]:
         (generator.SERVE_SCHEMA, {"multimodal_config": None}, True),
         (generator.SERVE_SCHEMA, {"num_serve_frontends": 0}, False),
         (generator.SERVE_SCHEMA, {"cuda_graph_config": {}}, True),
+        (generator.SERVE_SCHEMA, {"beam_search_cuda_graph_config": None}, True),
+        (
+            generator.SERVE_SCHEMA,
+            {
+                "beam_search_cuda_graph_config": {
+                    "profiles": [{"batch_sizes": [1, 2], "beam_widths": [4], "max_tokens": 8}]
+                }
+            },
+            True,
+        ),
+        (generator.SERVE_SCHEMA, {"beam_search_cuda_graph_config": {}}, False),
+        (generator.SERVE_SCHEMA, {"beam_search_cuda_graph_config": {"profiles": []}}, False),
+        (
+            generator.SERVE_SCHEMA,
+            {
+                "beam_search_cuda_graph_config": {
+                    "profiles": [{"batch_sizes": [0], "beam_widths": [4], "max_tokens": 8}]
+                }
+            },
+            False,
+        ),
+        (
+            generator.SERVE_SCHEMA,
+            {
+                "beam_search_cuda_graph_config": {
+                    "profiles": [{"batch_sizes": [1], "beam_widths": [4], "max_tokens": 0}]
+                }
+            },
+            False,
+        ),
+        (
+            generator.SERVE_SCHEMA,
+            {
+                "beam_search_cuda_graph_config": {
+                    "profiles": [{"batch_sizes": [1], "beam_widths": [4], "max_tokens": 8}],
+                    "max_graphs": 0,
+                }
+            },
+            False,
+        ),
+        (
+            generator.SERVE_SCHEMA,
+            {
+                "beam_search_cuda_graph_config": {
+                    "profiles": [
+                        {"batch_sizes": [1], "beam_widths": [4], "max_tokens": 8, "typo": True}
+                    ]
+                }
+            },
+            False,
+        ),
         (generator.SERVE_SCHEMA, {"cuda_graph_config": {"batch_sizes": [1, 2, 4]}}, True),
         (generator.SERVE_SCHEMA, {"checkpoint_loader": {}}, False),
         (generator.SERVE_SCHEMA, {"tokenizer": 42}, False),

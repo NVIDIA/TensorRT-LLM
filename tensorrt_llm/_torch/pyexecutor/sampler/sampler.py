@@ -53,6 +53,7 @@ from .beam_search import (
     finalize_beam,
     prepare_beam_search,
 )
+from .beam_search_graph import BeamSearchGraphProfile
 from .finish_reasons import FinishReasonsHandler
 from .logprobs import LogProbsHandler, LogProbsState, LogProbsStateList, LogProbsStore
 from .ops.custom import fused_sample_from_logits, fused_sample_from_logits_with_probs
@@ -180,6 +181,16 @@ class _SamplingGroup:
 
 
 class Sampler(ABC, Generic[GenericSampleState]):
+    @property
+    def needs_cuda_graph_warmup(self) -> bool:
+        return False
+
+    def prepare_cuda_graphs(self, *, vocab_size: int) -> None:
+        """Prepare optional sampler graphs in the executor's quiescent startup phase."""
+
+    def release_cuda_graphs(self) -> None:
+        """Release sampler graphs after its executor worker has stopped."""
+
     def setup_sampler_step(self, scheduled_requests: ScheduledRequests) -> None:
         pass
 
@@ -578,6 +589,9 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         disable_overlap_scheduler: bool = False
         enable_async_worker: bool = False
         enable_speculative_beam_history_d2h: bool = False
+        beam_search_graph_profiles: tuple[BeamSearchGraphProfile, ...] = ()
+        beam_search_graph_max_graphs: int = 192
+        beam_search_graph_max_static_input_bytes: int = 512 * 1024 * 1024
 
     def __init__(self, args: Args):
         self.max_seq_len = args.max_seq_len
@@ -738,7 +752,26 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             has_multi_token_stop_words=check_stop_words_length,
             copy_to_host=self._copy_to_host,
             make_side_stream_copier=self._make_side_stream_copier,
+            graph_profiles=() if self.async_worker_enabled() else args.beam_search_graph_profiles,
+            graph_max_graphs=args.beam_search_graph_max_graphs,
+            graph_max_static_input_bytes=args.beam_search_graph_max_static_input_bytes,
         )
+
+    @property
+    def needs_cuda_graph_warmup(self) -> bool:
+        return self._beam_search.needs_cuda_graph_warmup
+
+    def prepare_cuda_graphs(self, *, vocab_size: int) -> None:
+        """Warm the beam handler against the sampler's persistent stores."""
+        self._beam_search.prepare_cuda_graphs(
+            vocab_size=vocab_size,
+            new_log_probs=self.store.log_probs_store.sampled_log_probs[..., DEFAULT_STEP_IDX],
+            end_ids_cuda=self._finish_reasons_handler.store.end_ids_cuda,
+            past_tokens_cuda=self._finish_reasons_handler.store.past_tokens_cuda,
+        )
+
+    def release_cuda_graphs(self) -> None:
+        self._beam_search.release_cuda_graphs()
 
     @staticmethod
     def _is_draft_batch(requests: list[LlmRequest]) -> bool:
@@ -1910,7 +1943,8 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 beam_step = BeamSearchStep.from_params(
                     group.beam_params, cuda_device, return_probs=group.needs_probs
                 )
-                group_next_tokens_cuda, group_softmax_cuda = beam_step.sample(
+                group_next_tokens_cuda, group_softmax_cuda = self._beam_search.sample(
+                    beam_step,
                     group_logits_cuda,
                     metadata=self._beam_search.build_metadata(
                         requests=requests,

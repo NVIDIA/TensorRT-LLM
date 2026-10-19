@@ -115,6 +115,41 @@
       "path": "batch_wait_timeout_ms"
     },
     {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "beam_search_cuda_graph_config.max_graphs"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "beam_search_cuda_graph_config.max_static_input_bytes"
+    },
+    {
+      "capture_policy": "list[list[int]]",
+      "kind": "value",
+      "path": "beam_search_cuda_graph_config.profiles.batch_sizes"
+    },
+    {
+      "capture_policy": "list[list[int]]",
+      "kind": "value",
+      "path": "beam_search_cuda_graph_config.profiles.beam_widths"
+    },
+    {
+      "allowed_values": [
+        0,
+        1,
+        2
+      ],
+      "capture_policy": "list[literal]",
+      "kind": "categorical",
+      "path": "beam_search_cuda_graph_config.profiles.early_stopping"
+    },
+    {
+      "capture_policy": "list[int]",
+      "kind": "value",
+      "path": "beam_search_cuda_graph_config.profiles.max_tokens"
+    },
+    {
       "capture_policy": "bool",
       "kind": "value",
       "path": "cache_transceiver_config.agent_bounce_buffer_enable"

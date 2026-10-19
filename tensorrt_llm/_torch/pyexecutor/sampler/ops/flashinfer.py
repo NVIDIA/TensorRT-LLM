@@ -68,6 +68,7 @@ SeedOrTensor = Union[int, torch.Tensor]
 def radix_topk_op(
     values: torch.Tensor,
     k: int,
+    workspace: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Sorted top-k via flashinfer's radix-select kernel.
 
@@ -81,8 +82,39 @@ def radix_topk_op(
     ``deterministic=True``: the default collect pass races, which makes the
     order among equal values vary run to run. This op sits on the default beam
     path, where reproducible tie order matters for triage.
+
+    Args:
+        values: Contiguous [rows, vocabulary] floating-point values on CUDA.
+        k: Number of entries to select from each row.
+        workspace: Optional owner-local, contiguous uint8 CUDA buffer of at
+            least 1 MiB. The caller must serialize its reuse across streams.
+            None uses FlashInfer's default workspace.
     """
-    topk_values, topk_indices = flashinfer.top_k(values, k, sorted=True, deterministic=True)
+    if workspace is None:
+        return flashinfer.top_k(values, k, sorted=True, deterministic=True)
+
+    # The deterministic multi-CTA kernel uses this row-state buffer to coordinate
+    # its CTAs. A graph owner must not share it with unrelated streams.
+    from flashinfer.topk import get_topk_module
+
+    if (
+        workspace.device != values.device
+        or workspace.dtype != torch.uint8
+        or not workspace.is_contiguous()
+        or workspace.numel() < 1024 * 1024
+    ):
+        raise ValueError(
+            "radix top-k requires a contiguous 1 MiB uint8 workspace on the input device"
+        )
+    topk_values = torch.empty((values.size(0), k), dtype=values.dtype, device=values.device)
+    topk_indices = (
+        get_topk_module()
+        .radix_topk(values, k, k <= 2048, True, 0, workspace, topk_values, False)
+        .long()
+    )
+    if k > 2048:
+        topk_values, order = torch.sort(topk_values, dim=-1, descending=True, stable=True)
+        topk_indices = torch.gather(topk_indices, dim=-1, index=order)
     return topk_values, topk_indices
 
 

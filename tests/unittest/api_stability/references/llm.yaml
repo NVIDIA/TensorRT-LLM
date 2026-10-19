@@ -114,6 +114,10 @@ methods:
         annotation: Union[tensorrt_llm.llmapi.llm_args.DecodeCudaGraphConfig, tensorrt_llm.llmapi.llm_args.EncodeCudaGraphConfig, NoneType]
         default: null
         status: beta
+      beam_search_cuda_graph_config:
+        annotation: Optional[tensorrt_llm.llmapi.llm_args.BeamSearchCudaGraphConfig]
+        default: null
+        status: prototype
       encoder_cuda_graph_config:
         annotation: Optional[tensorrt_llm.llmapi.llm_args.EncodeCudaGraphConfig]
         default: null
