@@ -42,6 +42,17 @@ def test_field_layout_selects_tensor_item_axis(axis: int, indices: list[int]) ->
 
 
 @pytest.mark.parametrize("axis", [0, 1, -1])
+@pytest.mark.parametrize("indices", [[0, 1], [-2, -1], [2], []])
+def test_batched_item_partition_preserves_contiguous_views(axis, indices) -> None:
+    values = torch.arange(9).reshape(3, 3)
+    selected = MultimodalItemPartition(item_axis=axis).select(values, indices)
+    expected = values[indices] if axis == 0 else values[:, indices]
+
+    torch.testing.assert_close(selected, expected)
+    assert selected.untyped_storage().data_ptr() == values.untyped_storage().data_ptr()
+
+
+@pytest.mark.parametrize("axis", [0, 1, -1])
 @pytest.mark.parametrize(
     ("indices", "is_view"),
     [
@@ -116,9 +127,12 @@ def test_packed_field_layout_rejects_inconsistent_lengths() -> None:
 
 
 @pytest.mark.parametrize("index", [-4, 3])
-def test_packed_item_partition_rejects_out_of_bounds_indices(index: int) -> None:
+@pytest.mark.parametrize("packed", [False, True])
+def test_item_partition_rejects_out_of_bounds_indices(index: int, packed: bool) -> None:
+    lengths = (2, 3, 1) if packed else None
+    values = torch.zeros(6 if packed else 3, 2)
     with pytest.raises(IndexError):
-        MultimodalItemPartition(item_lengths=(2, 3, 1)).select(torch.zeros(6, 2), [index])
+        MultimodalItemPartition(item_lengths=lengths).select(values, [index])
 
 
 def test_media_modalities_match_io_and_validation_contract() -> None:

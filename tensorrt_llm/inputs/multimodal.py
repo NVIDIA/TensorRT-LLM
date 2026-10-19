@@ -50,46 +50,52 @@ class MultimodalItemPartition(NamedTuple):
     def select(self, value: Any, item_indices: Sequence[int]) -> Any:
         """Select items in the requested order, preserving tensor dtype/device.
 
-        Contiguous selections of a packed tensor return a view. Other tensor
-        selections copy only the selected items; shared values retain identity.
+        Contiguous tensor selections return views that callers must treat as
+        read-only. Other selections copy only the selected items; shared values
+        retain identity.
         """
-        if self.item_axis is None or value is None:
+        axis, lengths = self
+        if axis is None or value is None:
             return value
-        indices = list(item_indices)
         if isinstance(value, torch.Tensor):
-            if self.item_lengths is None:
-                if self.item_axis == 0:
-                    return value[indices]
-                index: list[slice | list[int]] = [slice(None)] * value.ndim
-                index[self.item_axis] = indices
-                return value[tuple(index)]
-
-            offsets = list(accumulate(self.item_lengths, initial=0))
-            if offsets[-1] != value.shape[self.item_axis]:
-                raise ValueError(
-                    "Packed field size does not match its item lengths")
-            if not indices:
-                return value.narrow(self.item_axis, 0, 0)
-            item_range = range(len(self.item_lengths))
-            indices = [item_range[i] for i in indices]
-            if indices == list(range(indices[0], indices[0] + len(indices))):
-                start = offsets[indices[0]]
-                if self.item_axis == 0:
-                    return value[start:offsets[indices[-1] + 1]]
-                return value.narrow(self.item_axis, start,
-                                    offsets[indices[-1] + 1] - start)
-            if self.item_axis == 0:
-                pieces = [value[offsets[i]:offsets[i + 1]] for i in indices]
+            offsets = None
+            if lengths is not None:
+                offsets = list(accumulate(lengths, initial=0))
+                if offsets[-1] != value.shape[axis]:
+                    raise ValueError(
+                        "Packed field size does not match its item lengths")
+                item_range = range(len(lengths))
             else:
-                pieces = [
-                    value.narrow(self.item_axis, offsets[i],
-                                 self.item_lengths[i]) for i in indices
-                ]
-            return torch.cat(pieces, dim=self.item_axis)
+                item_range = range(value.shape[axis])
+            # Python range indexing normalizes negatives and rejects out-of-range
+            # items before any view can silently truncate the requested rows.
+            indices = [item_range[i] for i in item_indices]
+            if not indices:
+                return value.narrow(axis, 0, 0)
+            if indices == list(range(indices[0], indices[0] + len(indices))):
+                start, end = indices[0], indices[-1] + 1
+                if offsets is not None:
+                    start, end = offsets[start], offsets[end]
+                if axis == 0:
+                    return value[start:end]
+                return value.narrow(axis, start, end - start)
+            if offsets is not None:
+                if axis == 0:
+                    pieces = [value[offsets[i]:offsets[i + 1]] for i in indices]
+                else:
+                    pieces = [
+                        value.narrow(axis, offsets[i], lengths[i])
+                        for i in indices
+                    ]
+                return torch.cat(pieces, dim=axis)
+            if axis == 0:
+                return value[indices]
+            index: list[slice | list[int]] = [slice(None)] * value.ndim
+            index[axis] = indices
+            return value[tuple(index)]
 
-        if (isinstance(value, (list, tuple)) and self.item_axis == 0
-                and self.item_lengths is None):
-            return type(value)(value[i] for i in indices)
+        if (isinstance(value, (list, tuple)) and axis == 0 and lengths is None):
+            return type(value)(value[i] for i in item_indices)
         raise TypeError(
             "Item fields must be tensors or lists/tuples on item axis zero")
 
@@ -163,6 +169,13 @@ class MultimodalEncoderItemMetadata(NamedTuple):
         Each modality's payload must be sliced in the same selected-item order.
         The source metadata remains owned by the original request.
         """
+        if len(item_indices) == 1:
+            i = item_indices[0]
+            return MultimodalEncoderItemMetadata(
+                [(self.item_refs[i][0], 0)],
+                [self.encoder_token_lengths[i]],
+                [self.output_embedding_lengths[i]],
+            )
         local_counts: dict[str, int] = {}
         item_refs = []
         for i in item_indices:
@@ -721,7 +734,12 @@ class MultimodalParams:
         ``mm_item_order`` and ``multimodal_embedding_lengths``; a request with
         just one modality can omit the order.
         """
-        metadata = self.item_metadata
+        # Input processors validate this record before dispatch; layout reads
+        # do not need to revalidate encoder costs on every forward.
+        metadata = cast(
+            Optional[MultimodalEncoderItemMetadata],
+            self.multimodal_data.get(MULTIMODAL_ENCODER_ITEM_METADATA_KEY),
+        )
         if metadata is not None:
             return metadata.item_refs, metadata.output_embedding_lengths
 
