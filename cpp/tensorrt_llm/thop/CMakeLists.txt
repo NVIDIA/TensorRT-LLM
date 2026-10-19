@@ -30,7 +30,6 @@ endif()
 
 add_library(th_utils STATIC thUtils.cpp)
 set_property(TARGET th_utils PROPERTY POSITION_INDEPENDENT_CODE ON)
-set_property(TARGET th_utils PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 # Newer Torch headers (e.g. ATen/native/cuda/Resize.h) compare ArrayRef against
 # OptionalArrayRef in the reverse order, relying on C++20's automatic generation
 # of the reversed comparison operator. th_utils/th_common only contain host .cpp
@@ -156,6 +155,7 @@ add_th_common_family(
   parallelDecodeKVCacheUpdateOp.cpp
   specDecOp.cpp
   fusedSamplingOp.cpp
+  chainSpeculativeSamplingOp.cpp
   dynamicTreeOp.cpp
   loraOp.cpp
   inplaceSliceCopyOp.cpp

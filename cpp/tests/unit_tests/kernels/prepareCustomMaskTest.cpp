@@ -41,7 +41,6 @@ using tensorrt_llm::kernels::TllmGenFmhaRunnerParams;
 using tensorrt_llm::runtime::BufferManager;
 using tensorrt_llm::runtime::CudaStream;
 using tensorrt_llm::runtime::MemoryType;
-using tensorrt_llm::runtime::bufferCast;
 
 inline int32_t ceilDiv(int32_t dividend, int32_t divisor)
 {
@@ -298,8 +297,9 @@ protected:
         auto customMaskDevice = mBufferManager->gpu(totalMaskSize, tensorrt_llm::DataType::kINT32);
 
         // Clear GPU buffers to ensure no stale data from previous tests
-        cudaMemsetAsync(bufferCast<int64_t>(*customMaskOffsetsDevice), 0, batchSize * sizeof(int64_t), mStream->get());
-        cudaMemsetAsync(bufferCast<int32_t>(*customMaskDevice), 0, totalMaskSize * sizeof(int32_t), mStream->get());
+        cudaMemsetAsync(
+            customMaskOffsetsDevice->getBufferPtr<int64_t>(), 0, batchSize * sizeof(int64_t), mStream->get());
+        cudaMemsetAsync(customMaskDevice->getBufferPtr<int32_t>(), 0, totalMaskSize * sizeof(int32_t), mStream->get());
         cudaStreamSynchronize(mStream->get());
 
         TllmGenFmhaRunnerParams runnerParams;
@@ -307,13 +307,13 @@ protected:
         runnerParams.mNumHeadsQPerKv = numHeadsQPerKv;
         runnerParams.mMaxSeqLenQ = uniformSeqLenQ; // All batches have same Q length
         runnerParams.mMaxSeqLenKv = *std::max_element(seqLensKv.begin(), seqLensKv.end());
-        runnerParams.seqLensKvPtr = bufferCast<int32_t>(*seqLensKvDevice);
-        runnerParams.cumSeqLensQPtr = bufferCast<int32_t>(*cumSeqLensQDevice);
-        runnerParams.seqLensQPtr = bufferCast<int32_t>(*specDecodingGenerationLengthsDevice);
-        runnerParams.firstSparseMaskOffsetsKvPtr = bufferCast<int32_t>(*firstSparseMaskOffsetsKvDevice);
-        runnerParams.generalPackedCustoMaskPtr = bufferCast<int32_t>(*inputPackedMaskDevice);
-        runnerParams.customMaskOffsetsPtr = bufferCast<int64_t>(*customMaskOffsetsDevice);
-        runnerParams.customMaskPtr = reinterpret_cast<uint32_t*>(bufferCast<int32_t>(*customMaskDevice));
+        runnerParams.seqLensKvPtr = seqLensKvDevice->getBufferPtr<int32_t>();
+        runnerParams.cumSeqLensQPtr = cumSeqLensQDevice->getBufferPtr<int32_t>();
+        runnerParams.seqLensQPtr = specDecodingGenerationLengthsDevice->getBufferPtr<int32_t>();
+        runnerParams.firstSparseMaskOffsetsKvPtr = firstSparseMaskOffsetsKvDevice->getBufferPtr<int32_t>();
+        runnerParams.generalPackedCustoMaskPtr = inputPackedMaskDevice->getBufferPtr<int32_t>();
+        runnerParams.customMaskOffsetsPtr = customMaskOffsetsDevice->getBufferPtr<int64_t>();
+        runnerParams.customMaskPtr = reinterpret_cast<uint32_t*>(customMaskDevice->getBufferPtr<int32_t>());
 
         int32_t const stepQ = tileSizeQ * numInstsQ;
         int32_t const stepKv = tileSizeKv * numInstsKv;
@@ -334,10 +334,10 @@ protected:
             = prepareCustomMaskBuffersCPU(batchSize, numHeadsQPerKv, tileSizeQ, tileSizeKv, numInstsQ, numInstsKv,
                 seqLensQ, seqLensKv, firstSparseMaskOffsetsKv, inputTreeMaskHost);
 
-        auto* gpuOffsets = bufferCast<int64_t>(*customMaskOffsetsHost);
-        auto* gpuMask = reinterpret_cast<uint32_t*>(bufferCast<int32_t>(*customMaskHost));
+        auto* gpuOffsets = customMaskOffsetsHost->getBufferPtr<int64_t>();
+        auto* gpuMask = reinterpret_cast<uint32_t*>(customMaskHost->getBufferPtr<int32_t>());
         auto firstSparseMaskOffsetsKvHost = mBufferManager->copyFrom(*firstSparseMaskOffsetsKvDevice, MemoryType::kCPU);
-        auto* gpuAdjustedOffsets = bufferCast<int32_t>(*firstSparseMaskOffsetsKvHost);
+        auto* gpuAdjustedOffsets = firstSparseMaskOffsetsKvHost->getBufferPtr<int32_t>();
 
         // Compare only the effective portion
         for (int32_t i = 0; i < cpuMask.size(); ++i)

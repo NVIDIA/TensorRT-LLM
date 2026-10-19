@@ -14,6 +14,7 @@ from tensorrt_llm.llmapi.llm_args import (_CACHE_TRANSCEIVER_BACKEND_ENV_VARS,
 from tensorrt_llm.mapping import Mapping
 
 from ..pyexecutor.config_utils import resolve_cache_transceiver_config
+from ..pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from ..pyexecutor.kv_cache.mamba_cache_manager import (
     BaseMambaCacheManager, CppMambaHybridCacheManager,
     MambaHybridCacheManagerV2, MixedMambaHybridCacheManager)
@@ -183,35 +184,42 @@ def create_kv_cache_transceiver(
             "hangs or lower-than-expected performance.")
 
     # Select transceiver implementation based on transceiver_runtime.
-    # transceiver_runtime == None or "CPP" -> use C++ transceiver (default)
-    # transceiver_runtime == "PYTHON" -> use Python transceiver.
+    # transceiver_runtime == None or "CPP" -> use C++ transceiver.
+    # transceiver_runtime == "PYTHON" -> use Python transceiver (default).
     #
-    # MambaHybridCacheManagerV2 is backed by the Python KVCacheManagerV2 core,
-    # not the C++ BaseKVCacheManager binding required by CacheTransceiverCpp.
-    is_v2_mamba_hybrid = isinstance(mamba_cache_manager,
-                                    MambaHybridCacheManagerV2)
+    # V2 managers use a Python core, not the C++ BaseKVCacheManager binding
+    # required by CacheTransceiverCpp.
+    uses_v2_manager = (isinstance(kv_cache_manager, KVCacheManagerV2)
+                       or isinstance(mamba_cache_manager,
+                                     MambaHybridCacheManagerV2))
     use_python_transceiver = (
         cache_transceiver_config.transceiver_runtime == "PYTHON")
 
-    if is_v2_mamba_hybrid and not use_python_transceiver:
+    if uses_v2_manager and not use_python_transceiver:
         raise ValueError(
-            "MambaHybridCacheManagerV2 requires transceiver_runtime='PYTHON' "
-            "with backend='NIXL'; it cannot use the C++ transceiver.")
+            "KV cache manager V2 requires transceiver_runtime='PYTHON' "
+            "with backend='NIXL'; it cannot use the C++ transceiver. "
+            "To use the C++ transceiver, set "
+            "kv_cache_config.use_kv_cache_manager_v2=False for a model "
+            "that supports V1.")
 
     if use_python_transceiver:
         if isinstance(mamba_cache_manager, CppMambaHybridCacheManager):
             raise ValueError(
                 "transceiver_runtime='PYTHON' cannot drive "
                 "CppMambaHybridCacheManager (C++ pool backed). Use "
-                "transceiver_runtime='CPP', or select the V2 manager "
+                "transceiver_runtime='CPP' with "
+                "kv_cache_config.use_kv_cache_manager_v2=False, or select "
+                "the V2 manager "
                 "with use_kv_cache_manager_v2=True.")
         # DEFAULT has already been resolved above, so Python must see NIXL.
         if cache_transceiver_config.backend != "NIXL":
             raise ValueError(
                 f"Python transceiver currently only supports the NIXL backend, "
                 f"got {cache_transceiver_config.backend}. "
-                f"Please use transceiver_runtime='CPP' for MPI, UCX, or MOONCAKE backends."
-            )
+                "Please use transceiver_runtime='CPP' with "
+                "kv_cache_config.use_kv_cache_manager_v2=False for MPI, UCX, "
+                "or MOONCAKE backends, with a model that supports V1.")
         from tensorrt_llm._torch.disaggregation.transceiver import \
             KvCacheTransceiverV2
         logger.info("Using KvCacheTransceiverV2")
@@ -219,7 +227,7 @@ def create_kv_cache_transceiver(
         return KvCacheTransceiverV2(mapping, dist, kv_cache_manager,
                                     cache_transceiver_config)
 
-    # Default: use C++ transceiver (transceiver_runtime is None or "CPP")
+    # Explicit legacy runtime: transceiver_runtime is None or "CPP".
     return BindKvCacheTransceiver(mapping, dist, kv_cache_manager,
                                   attention_type, cache_transceiver_config,
                                   mamba_cache_manager)

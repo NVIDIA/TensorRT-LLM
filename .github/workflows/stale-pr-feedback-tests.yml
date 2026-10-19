@@ -1,0 +1,25 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Stale PR feedback automation tests
+on:
+  pull_request:
+    paths:
+      - '.github/scripts/stale_pr_feedback*'
+      - '.github/workflows/auto-close-inactive-issues.yml'
+      - '.github/workflows/stale-pr-feedback-tests.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: node --test .github/scripts/stale_pr_feedback.test.js

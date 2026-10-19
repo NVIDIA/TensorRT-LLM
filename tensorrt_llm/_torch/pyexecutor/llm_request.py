@@ -228,7 +228,6 @@ class MultimodalEncoderRequestState:
 
 if TYPE_CHECKING:
     from ..tensor_lru_cache import TensorLRUCache
-    from .sampler.sampler_strategy import Strategy
 
 
 @dataclass(slots=True)
@@ -866,15 +865,12 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             seq_slot: Optional[int] = None,
             target_seq_slot: Optional[int] = None,
             num_logprobs: int = 0,
-            is_first_draft: bool = False,
             use_chunked_generation_logits: bool = True,
             logits_chunk_size: int = 8,
             logprobs_mode: LogprobMode = LogprobMode.RAW,
             logprobs_simple_format: bool = False,
             return_routed_experts: bool = False,
             **kwargs):
-        self.py_sampling_strategy: "Strategy | None" = None
-
         self.py_logits_post_processors = kwargs.pop("py_logits_post_processors",
                                                     None)
         # Owned entirely on the Python side: the TorchSampler is the only
@@ -920,7 +916,6 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             super().__init__(llm_request)
         else:
             super().__init__(*args,
-                             client_id=client_id,
                              return_log_probs=return_log_probs,
                              return_context_logits=False,
                              return_generation_logits=False,
@@ -943,17 +938,14 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         # Manager-owned helix decode-step counter; see
         # KVCacheManagerV2._set_helix_rank_fields.
         self.py_helix_decode_group_index = 0
-        self.py_draft_logits = None
-        self.py_target_probs = None
         self.py_per_pos_drafted = [0] * MAX_SPEC_DECODE_POSITIONS
         self.py_per_pos_accepted = [0] * MAX_SPEC_DECODE_POSITIONS
         # Cumulative spec-decode counters backing
         # RequestPerfMetrics.speculative_decoding for return_perf_metrics. The
-        # C++ runtime fills that section in updateNumTokensPerIteration(),
-        # which the PyTorch flow (TorchSampler) never calls, so the PyTorch
-        # executor accumulates these instead (exact, unlike the per-pos arrays
-        # capped at MAX_SPEC_DECODE_POSITIONS) and attaches them to the
-        # response (see PyExecutor._handle_responses / LlmResult.spec_dec_totals).
+        # PyTorch executor owns and accumulates these exact counters and
+        # attaches them to the response; unlike these counters, the per-pos
+        # arrays are capped at MAX_SPEC_DECODE_POSITIONS. See
+        # PyExecutor._handle_responses and LlmResult.spec_dec_totals.
         self.py_total_draft_tokens = 0
         self.py_total_accepted_draft_tokens = 0
         self.is_attention_dp_dummy = False
@@ -999,8 +991,6 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         # If the request is a draft request, target_seq_slot is the sequence slot ID of its target request.
         self.py_target_seq_slot = target_seq_slot
         self.use_draft_model = is_draft
-        # Whether the request is for the first forward of the draft model.
-        self.py_is_first_draft = is_first_draft
         self.d2t = None
         self.py_disable_speculative_decoding = False
 
@@ -1025,9 +1015,11 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         # allocation clears this flag so replay can report its new pages.
         self.py_connector_allocation_reported = False
 
-        # End of the connector prefix retained by this allocation, or 0. This
-        # depth survives async parking; local reuse cannot reconstruct it.
-        self.py_connector_served_position = 0
+        # End of the prefix served from outside the manager (a KV cache
+        # connector's load, or a staging fetch the request resumes from) retained
+        # by this allocation, or 0. This depth survives async parking; local reuse
+        # cannot reconstruct it.
+        self.py_served_prefix_end = 0
 
         self.py_result = PyResult(
             prompt_len=self.py_prompt_len,
@@ -1829,7 +1821,10 @@ def executor_request_to_llm_request(
 def rewind_context_after_cache_drop(request: LlmRequest,
                                     tokens_per_block: int) -> None:
     """Reset context progress after callers release the request's KV caches."""
-    request.set_prepopulated_prompt_len(0, tokens_per_block)
+    # The setter requires prepopulated < promptLen. A Helix CP rank that holds
+    # none of the prompt has promptLen 0, so there is nothing to reset.
+    if request.prompt_len > 0:
+        request.set_prepopulated_prompt_len(0, tokens_per_block)
     # Clearing prepopulation does not rewind the native context cursor.
     request.context_current_position = 0
     request.context_chunk_size = request.prompt_len

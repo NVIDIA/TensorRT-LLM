@@ -9,7 +9,9 @@ import torch
 import transformers
 
 from tensorrt_llm._utils import str_dtype_to_torch
-from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig
+from tensorrt_llm.llmapi.llm_args import (CacheTransceiverConfig,
+                                          is_speculators_dspark_config,
+                                          translate_speculators_dspark_config)
 from tensorrt_llm.logger import logger
 
 if TYPE_CHECKING:
@@ -45,7 +47,9 @@ def resolve_cache_transceiver_config(
             "enable_pipelined_transfer is set; auto-selecting the Python "
             "transceiver instead of the C++ transceiver to enable "
             "pipelined KV cache transfer. "
-            "Set transceiver_runtime='CPP' to disable this auto-selection.")
+            "Set transceiver_runtime='CPP' and "
+            "kv_cache_config.use_kv_cache_manager_v2=False to select C++ "
+            "with a model that supports V1; disable pipelined transfer too.")
         cache_transceiver_config.transceiver_runtime = "PYTHON"
     elif runtime == "CPP" and enable_pipelined_transfer:
         raise ValueError(
@@ -58,8 +62,9 @@ def resolve_cache_transceiver_config(
         raise ValueError(
             f"Python transceiver currently only supports NIXL backend, "
             f"got {effective_backend}. "
-            f"Please use transceiver_runtime='CPP' for MPI, UCX, or MOONCAKE backends."
-        )
+            "Please use transceiver_runtime='CPP' with "
+            "kv_cache_config.use_kv_cache_manager_v2=False for MPI, UCX, "
+            "or MOONCAKE backends, with a model that supports V1.")
 
 
 def uses_vswa_kv_cache_layout(
@@ -334,8 +339,8 @@ def resolve_auto_ssm_cache_dtype(config, fallback):
     kv_cache_config.mamba_ssm_cache_dtype; prefill, decode and sequential
     verify then stage the addressed rows through an fp32 copy and round the
     committed state back to bf16. The fused MTP verify kernel
-    (``trtllm::kda_mtp_decode``) has no such staging and rejects a non-fp32
-    pool outright, so bf16 and fused KDA MTP verify are mutually exclusive.
+    (``trtllm::kda_mtp_decode``) reads and writes a bf16 pool directly and
+    rounds the committed state to nearest.
     A checkpoint-declared
     mamba_ssm_cache_dtype is not applied to Kimi K3 (the released
     checkpoints do not carry the field); it is logged when it would have
@@ -987,6 +992,18 @@ def load_pretrained_config(model_name_or_path: str,
             MistralConfigLoader
         model_config = MistralConfigLoader().load(
             model_name_or_path).pretrained_config
+    elif is_speculators_dspark_config(config_dict):
+        # A DSpark drafter in the vLLM speculators format: no top-level
+        # model_type, and its auto_map needs the speculators package. Build
+        # the backbone's config from the translation the spec config uses.
+        from transformers.models.auto.configuration_auto import CONFIG_MAPPING
+        translated = translate_speculators_dspark_config(config_dict)
+        model_config = CONFIG_MAPPING["qwen3"].from_dict(translated)
+        logger.info(
+            f"{model_name_or_path}: speculators-format DSpark drafter, read as "
+            f"qwen3 with target_layer_ids "
+            f"{translated['dflash_config']['target_layer_ids']} "
+            f"(aux_hidden_state_layer_ids - 1) and no sliding window")
     elif model_type in ("glm5_next", "glm5_next_text"):
         from tensorrt_llm._torch import configs
         config_name = ("Glm5NextConfig"

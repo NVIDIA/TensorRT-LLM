@@ -94,10 +94,13 @@ MODEL_PATH_DICT = {
     "kimi_k2.5_fp4": "Kimi-K2.5-NVFP4",
     # Kimi K3 (KDA linear attention + MLA MoE, MXFP4 routed experts)
     "kimi_k3": "Kimi-K3",
+    # Kimi K3 NVFP4 requant (MIXED_PRECISION routed experts). Its DSpark drafter
+    # is the separate Inferact-Kimi-K3-DSpark checkpoint, given per config as
+    # `speculative_model`.
+    "kimi_k3_nvfp4": "Kimi-K3-NVFP4",
     # Keys below are sanity-side aliases; some point to the same weights as
     # entries above but are kept under sanity's historical naming.
     "deepseek_v32_fp4": "DeepSeek-V3.2-Exp-FP4-v2",
-    "k2_thinking_fp4": "Kimi-K2-Thinking-NVFP4",
     "k25_thinking_fp4": "Kimi-K2.5-NVFP4",
     "super_nvfp4": "NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4",
     "super_fp8": "NVIDIA-Nemotron-3-Super-120B-A12B-FP8",

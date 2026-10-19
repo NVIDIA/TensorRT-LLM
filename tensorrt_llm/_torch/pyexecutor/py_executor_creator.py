@@ -802,6 +802,9 @@ def _create_py_executor(
             model_weights_restore_mode=model_weights_restore_mode,
         )
 
+    # Model loading can disable reuse after runtime features were created.
+    _set_model_engines_cache_reuse([model_engine],
+                                   kv_cache_config.enable_block_reuse)
     validate_feature_combination(llm_args, model_engine)
 
     calibrator = get_calibrator()
@@ -915,6 +918,20 @@ def _create_py_executor(
             if draft_model_engine is not None:
                 draft_model_engine.attn_runtime_features.chunked_prefill = False
 
+    if (kv_cache_config.enable_block_reuse
+            and model_engine.model.model_config.is_encoder_decoder
+            and getattr(model_engine.input_processor,
+                        "requires_encoder_features", False)):
+        # Both KV pools depend on encoder features, which have no token IDs
+        # or input discriminator to safely key reuse between requests.
+        logger.info(
+            "Disabling block reuse for the self- and cross-KV caches: "
+            "the encoder takes feature tensors, so requests carry no "
+            "encoder tokens or input discriminator to key cache entries.")
+        kv_cache_config.enable_block_reuse = False
+        _set_model_engines_cache_reuse([model_engine, draft_model_engine],
+                                       False)
+
     # Set default value for cache_transceiver_config.max_tokens_in_buffer.
     # Placed after the FlashMLA tokens_per_block override and rounded up to a
     # tokens_per_block multiple: CacheTransBufferManager requires
@@ -1000,11 +1017,11 @@ def _create_py_executor(
             f"Initializing kv connector with config: {kv_connector_config}")
 
         # `use_kv_cache_manager_v2` is tri-state and under "auto" the manager is
-        # not chosen until model loading, so the manager-dependent rejections
-        # below fire here only when the config names the manager outright,
-        # sparing an explicit config a model load it cannot use.
-        # `_maybe_init_kv_connector_manager` repeats them against the manager
-        # that was actually built.
+        # not chosen until model loading, so the manager-dependent
+        # rejections below fire here when the config selects a boolean value,
+        # including the default True, sparing it a model load it cannot use.
+        # `_maybe_init_kv_connector_manager` repeats them against the
+        # manager that was actually built.
         v2_selection = kv_cache_config.use_kv_cache_manager_v2
 
         # Rejected draft tokens shrink a request's page list, and the freed slot
@@ -1307,10 +1324,22 @@ def _create_py_executor(
     if mapping.rank == 0:
         logger.info(f"LLM Args:\n{llm_args}")
 
-    with _startup_timer.phase("executor_start_worker",
-                              metrics=creation_metrics,
-                              metric_name="worker_start_seconds"):
-        py_executor.start_worker()
+    # Only the final executor advertises ready publishers.
+    events = getattr(llm_args.kv_cache_config, "kv_events_config", None)
+    if (getattr(llm_args, "_openengine_discovery", None) is not None
+            and events is not None and events.enable_kv_cache_events
+            and events.publisher == "zmq"):
+        from tensorrt_llm.grpc.openengine.node import initialize_node_discovery
+        initialize_node_discovery(py_executor)
+    try:
+        with _startup_timer.phase("executor_start_worker",
+                                  metrics=creation_metrics,
+                                  metric_name="worker_start_seconds"):
+            py_executor.start_worker()
+    except BaseException:
+        if py_executor._openengine_node_server is not None:
+            py_executor._openengine_node_server.close()
+        raise
 
     py_executor.metrics.update(initial_model_engine_metrics)
     _move_model_engine_metrics(py_executor, model_engine, "final",

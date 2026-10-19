@@ -37,6 +37,7 @@ from tensorrt_llm._torch.pyexecutor.executor_request_queue import (
     SHUTDOWN_REQUEST_ID,
     RequestQueueItem,
 )
+from tensorrt_llm._torch.pyexecutor.kv_cache_load import KvLoadTracker
 from tensorrt_llm._torch.pyexecutor.llm_request import (
     LlmRequest,
     LlmRequestState,
@@ -372,6 +373,7 @@ def test_context_model_capacity_profile_uses_real_dummy_requests(
     if not has_transceiver:
         executor.kv_cache_transceiver = None
     executor.max_beam_width = 1
+    executor.kv_cache_manager = None
     executor.sampler = Mock()
     executor._configure_csa2_remote_tail = types.MethodType(
         PyExecutor._configure_csa2_remote_tail, executor
@@ -1170,6 +1172,10 @@ def _make_executor_with_kv_cache_manager(kv_cache_manager):
     executor.resource_manager.resource_managers = {
         ResourceManagerType.KV_CACHE_MANAGER: kv_cache_manager
     }
+    executor.enable_attention_dp = False
+    executor.adp_router = Mock(exclude_retiring_requests=False)
+    executor._kv_cache_capacity = executor._read_kv_cache_capacity()
+    executor._kv_load_tracker = KvLoadTracker(kv_cache_manager, rank=0, enabled=True)
     return executor
 
 
@@ -1179,7 +1185,8 @@ def test_get_kv_cache_capacity_without_manager():
     assert executor.get_kv_cache_capacity() == {}
 
 
-def test_get_kv_cache_capacity_from_stats():
+@pytest.mark.parametrize("streaming_events", [False, True])
+def test_get_kv_cache_capacity_from_stats(streaming_events):
     """KV capacity is available without consuming iteration stats."""
     kv_stats = Mock()
     kv_stats.max_num_blocks = 123
@@ -1187,14 +1194,18 @@ def test_get_kv_cache_capacity_from_stats():
 
     kv_cache_manager = Mock()
     kv_cache_manager.get_kv_cache_stats.return_value = kv_stats
+    kv_cache_manager.streaming_kv_events_enabled = streaming_events
 
     executor = _make_executor_with_kv_cache_manager(kv_cache_manager)
 
-    assert executor.get_kv_cache_capacity() == {
+    expected = {
         "maxNumBlocks": 123,
         "tokensPerBlock": 64,
         "maxNumTokens": 7872,
     }
+    if streaming_events:
+        expected["kvEventsEnabled"] = True
+    assert executor.get_kv_cache_capacity() == expected
 
 
 def test_get_kv_cache_capacity_falls_back_to_manager_pool_size():
@@ -1236,6 +1247,142 @@ def test_get_kv_cache_capacity_falls_back_to_max_resource_count():
         "tokensPerBlock": 16,
         "maxNumTokens": 8192,
     }
+
+
+def test_get_kv_cache_load_is_non_destructive_and_rate_limited():
+    kv_stats = Mock(max_num_blocks=100, used_num_blocks=25, tokens_per_block=32)
+    kv_cache_manager = Mock()
+    kv_cache_manager.get_kv_cache_stats.return_value = kv_stats
+    executor = _make_executor_with_kv_cache_manager(kv_cache_manager)
+    kv_cache_manager.reset_mock()
+
+    executor._kv_load_tracker.record_local(
+        executor._kv_load_tracker.sample(executor._kv_cache_capacity)
+    )
+    first = executor.get_kv_cache_load()
+    second = executor.get_kv_cache_load()
+
+    assert first["usedKvBlocks"] == 25
+    assert first["totalKvBlocks"] == 100
+    assert first["ranks"][0]["rank"] == 0
+    assert second == first
+    kv_cache_manager.get_kv_cache_stats.assert_called_once()
+
+
+def test_idle_entry_refreshes_load_before_waiting():
+    """A short final request must not leave occupied blocks published forever."""
+    kv_stats = types.SimpleNamespace(max_num_blocks=100, used_num_blocks=25, tokens_per_block=32)
+    manager = Mock()
+    manager.get_kv_cache_stats.return_value = kv_stats
+    executor = _make_executor_with_kv_cache_manager(manager)
+    executor._kv_load_tracker.idle_sampled = False
+    executor._kv_load_tracker.record_local(
+        executor._kv_load_tracker.sample(executor._kv_cache_capacity)
+    )
+    kv_stats.used_num_blocks = 0
+
+    class ReachedIdleWait(Exception):
+        pass
+
+    def idle_wait(waiting_queue, num_active):
+        assert num_active == 0
+        assert executor.get_kv_cache_load()["usedKvBlocks"] == 0
+        raise ReachedIdleWait
+
+    executor._fetch_and_enqueue_requests = idle_wait
+    with pytest.raises(ReachedIdleWait):
+        executor._fetch_new_requests(FCFSWaitingQueue(), [])
+
+
+def test_capacity_and_load_use_the_same_pool_group_units():
+    class Manager:
+        tokens_per_block = 32
+        blocks_in_primary_pool = 100
+
+        def get_primary_block_counts(self):
+            return 150, 200
+
+    executor = _make_executor_with_kv_cache_manager(Manager())
+    executor._kv_load_tracker.record_local(
+        executor._kv_load_tracker.sample(executor._kv_cache_capacity)
+    )
+    assert executor.get_kv_cache_capacity()["maxNumBlocks"] == 200
+    assert executor.get_kv_cache_load()["totalKvBlocks"] == 200
+    assert executor.get_kv_cache_load()["usedKvBlocks"] == 150
+
+
+def test_kv_pool_rebalance_refreshes_capacity_without_mixing_discovery_metadata():
+    class Manager:
+        tokens_per_block = 32
+
+        def __init__(self):
+            self.total_blocks = 100
+            self.impl = Mock()
+            self.impl.adjust.side_effect = lambda: setattr(self, "total_blocks", 80)
+
+        def get_primary_block_counts(self):
+            return 0, self.total_blocks
+
+    manager = Manager()
+    executor = _make_executor_with_kv_cache_manager(manager)
+    executor.kv_cache_manager = manager
+    executor.active_requests = []
+    executor._suspend_padding_dummies_for_rebalance = Mock(return_value=[])
+    executor._resume_padding_dummies_after_rebalance = Mock()
+    executor._openengine_discovery = {"node": {"engine_id": "test"}}
+
+    executor._rebalance_kv_pools_now()
+
+    assert executor.get_kv_cache_capacity() == {
+        "maxNumBlocks": 80,
+        "tokensPerBlock": 32,
+        "maxNumTokens": 2560,
+    }
+    assert executor.get_openengine_discovery() == {"node": {"engine_id": "test"}}
+
+
+def test_adp_running_counts_update_without_a_new_block_sample():
+    """The final request count must update even inside the sampling interval."""
+    from tensorrt_llm._torch.pyexecutor.scheduler.rank_state import RankIterStatsPayload, RankState
+
+    manager = Mock()
+    manager.get_kv_cache_stats.return_value = types.SimpleNamespace(
+        max_num_blocks=100, used_num_blocks=0, tokens_per_block=32
+    )
+    executor = _make_executor_with_kv_cache_manager(manager)
+    executor.enable_attention_dp = True
+    executor.enable_iter_perf_stats = False
+    executor._kv_load_tracker.idle_sampled = True
+    executor.dist = types.SimpleNamespace(rank=0, tp_rank=0)
+    states = [
+        RankState(
+            rank=rank,
+            num_active_requests=1,
+            iter_stats=RankIterStatsPayload(
+                kv_used_blocks=0, kv_total_blocks=100, kv_load_timestamp_ns=123
+            ),
+        )
+        for rank in range(2)
+    ]
+    executor.adp_router = Mock()
+    executor.adp_router.gather_all_rank_states.return_value = states
+
+    class ReachedWait(Exception):
+        pass
+
+    def stop_at_wait(*args):
+        raise ReachedWait
+
+    executor._fetch_and_enqueue_requests = stop_at_wait
+    for running in (1, 0):
+        for state in states:
+            state.num_active_requests = running
+        with pytest.raises(ReachedWait):
+            executor._fetch_new_requests(FCFSWaitingQueue(), [])
+        assert [rank["runningRequests"] for rank in executor.get_kv_cache_load()["ranks"]] == [
+            running,
+            running,
+        ]
 
 
 def _classify_termination(
@@ -1576,6 +1723,45 @@ class TestIdleDisaggLoopPacing:
         executor.disagg.pace_idle()
 
         assert sleep.called is expect_sleep
+
+
+class TestDeferUnreadyGenReceivesGate:
+    """The coordinator defers unready receives only where the admission fence
+    can still be queued behind an in-flight forward and nothing else orders
+    the receive after it."""
+
+    @staticmethod
+    def _build(*, kv_manager_v2: bool, overlap: bool, pp_size: int, kv_connector: bool):
+        executor = object.__new__(PyExecutor)
+        executor.kv_cache_transceiver = Mock()
+        executor._is_kv_manager_v2 = kv_manager_v2
+        executor.disable_overlap_scheduler = not overlap
+        executor.dist = Mock(rank=0, tp_size=1, world_size=pp_size, pp_size=pp_size)
+        executor.kv_connector_manager = Mock() if kv_connector else None
+        return executor._build_disagg_coordinator()
+
+    @pytest.mark.parametrize("kv_connector", [False, True], ids=["no_connector", "connector"])
+    @pytest.mark.parametrize("pp_size", [1, 2], ids=["pp1", "pp2"])
+    @pytest.mark.parametrize("overlap", [True, False], ids=["overlap", "no_overlap"])
+    @pytest.mark.parametrize("kv_manager_v2", [True, False], ids=["v2", "v1"])
+    def test_defers_only_with_v2_overlap_pp1_and_no_connector(
+        self, kv_manager_v2: bool, overlap: bool, pp_size: int, kv_connector: bool
+    ) -> None:
+        coordinator = self._build(
+            kv_manager_v2=kv_manager_v2, overlap=overlap, pp_size=pp_size, kv_connector=kv_connector
+        )
+
+        assert isinstance(coordinator, DisaggTransferCoordinator)
+        expected = kv_manager_v2 and overlap and pp_size == 1 and not kv_connector
+        assert coordinator._defer_unready_gen_receives is expected
+
+    def test_unset_executor_attributes_keep_the_blocking_fence(self) -> None:
+        """An executor assembled without the scheduler and cache-manager
+        attributes falls back to the blocking fence."""
+        executor = object.__new__(PyExecutor)
+        executor.kv_cache_transceiver = Mock()
+
+        assert executor._build_disagg_coordinator()._defer_unready_gen_receives is False
 
 
 class TestDisaggTransferAdmissionPP:
@@ -2540,6 +2726,125 @@ def test_pad_still_warns_on_a_genuine_routable_surplus():
     assert "exceeds expected_num_active_requests" in mock_logger.warning.call_args[0][0]
 
 
+def _run_non_adp_fetch(active_requests, *, exclude_retiring_requests, max_num_active_requests=4):
+    """Drive the non-attention-DP branch of ``_fetch_new_requests``.
+
+    Returns the ``total_num_live_requests`` handed to the queue wait and the
+    ``total_num_active_requests`` that admission subtracts from its capacity.
+    """
+    stub = types.SimpleNamespace(
+        enable_attention_dp=False,
+        adp_router=Mock(exclude_retiring_requests=exclude_retiring_requests),
+        max_num_active_requests=max_num_active_requests,
+        enable_iter_perf_stats=False,
+        num_fetch_requests=0,
+        dist=Mock(cp_config={}, cp_rank=0, cp_size=1, rank=0),
+        _should_exclude_last_generation_logits=lambda: False,
+        _kv_load_tracker=KvLoadTracker(None, rank=0, enabled=False),
+        _kv_cache_capacity={},
+    )
+    seen = {}
+    stub._fetch_and_enqueue_requests = lambda waiting_queue, live: seen.update(live=live)
+
+    def _pop(waiting_queue, total_num_active_requests, all_ranks_num_active_requests):
+        seen["active"] = total_num_active_requests
+        seen["all_ranks"] = all_ranks_num_active_requests
+        return []
+
+    stub._pop_from_waiting_queue = _pop
+    with patch(
+        "tensorrt_llm._torch.pyexecutor.py_executor.merge_requests", return_value=[]
+    ) as merge:
+        assert PyExecutor._fetch_new_requests(stub, Mock(), active_requests) == []
+    merge.assert_called_once()
+    return seen
+
+
+def test_non_adp_admission_excludes_retiring_requests_with_headroom():
+    """A context server under overlap: every request retires one iteration late.
+
+    With ``max_batch_size`` 4 and the previous batch's 4 requests all retiring,
+    admission must see an empty pool so it can seat a full replacement batch in
+    the headroom (nvbug 6919819); counting the retirees capped every refill at
+    the seats the previous iteration had left unused. The retirees still count
+    as live, so the idle wait does not block while they are resident.
+    """
+    retiring = [_make_adp_request(_STATE_GENERATION_TO_COMPLETE, request_id=i) for i in range(4)]
+
+    seen = _run_non_adp_fetch(retiring, exclude_retiring_requests=True)
+
+    assert seen == {"live": 4, "active": 0, "all_ranks": None}
+
+
+def test_non_adp_admission_counts_retiring_requests_without_headroom():
+    """Without the headroom a retiring request still holds one of the B seats."""
+    active = [
+        _make_adp_request(_STATE_GENERATION_TO_COMPLETE, request_id=1),
+        _make_adp_request(_STATE_GENERATION_IN_PROGRESS, request_id=2),
+    ]
+
+    seen = _run_non_adp_fetch(active, exclude_retiring_requests=False)
+
+    assert seen == {"live": 2, "active": 2, "all_ranks": None}
+
+
+def test_non_adp_admission_keeps_counting_requests_that_are_not_retiring():
+    active = [
+        _make_adp_request(LlmRequestState.CONTEXT_INIT, request_id=1),
+        _make_adp_request(_STATE_GENERATION_IN_PROGRESS, request_id=2),
+        _make_adp_request(_STATE_GENERATION_TO_COMPLETE, request_id=3),
+    ]
+
+    seen = _run_non_adp_fetch(active, exclude_retiring_requests=True)
+
+    assert seen == {"live": 3, "active": 2, "all_ranks": None}
+
+
+@pytest.mark.parametrize(
+    ("exclude_retiring_requests", "expected_admitted_ids"),
+    [(True, [10, 11, 12, 13]), (False, [])],
+)
+def test_non_adp_fetch_pops_a_full_batch_beside_retiring_requests(
+    exclude_retiring_requests, expected_admitted_ids
+):
+    """Run the real waiting-queue pop: 4 retiring, 4 waiting, capacity 4.
+
+    With the overlap headroom the whole waiting batch is admitted beside the
+    retiring requests; without it the retiring requests fill every seat. Either
+    way the retiring requests still count as live for the idle wait.
+    """
+    retiring = [_make_adp_request(_STATE_GENERATION_TO_COMPLETE, request_id=i) for i in range(4)]
+    waiting_queue = FCFSWaitingQueue()
+    waiting_queue.add_requests(RequestQueueItem(10 + i) for i in range(4))
+    stub = types.SimpleNamespace(
+        enable_attention_dp=False,
+        adp_router=Mock(exclude_retiring_requests=exclude_retiring_requests),
+        max_num_active_requests=4,
+        is_benchmark_disagg=False,
+        enable_iter_perf_stats=False,
+        num_fetch_requests=0,
+        dist=Mock(cp_config={}, cp_rank=0, cp_size=1, rank=0, tp_size=1),
+        _should_exclude_last_generation_logits=lambda: False,
+        _kv_load_tracker=KvLoadTracker(None, rank=0, enabled=False),
+        _kv_cache_capacity={},
+    )
+    for name in ("_get_request_admission_capacity", "_pop_from_waiting_queue"):
+        setattr(stub, name, types.MethodType(getattr(PyExecutor, name), stub))
+    live = []
+    stub._fetch_and_enqueue_requests = lambda queue, num_live: live.append(num_live)
+
+    with patch(
+        "tensorrt_llm._torch.pyexecutor.py_executor.merge_requests",
+        side_effect=lambda new_requests, **_: list(new_requests),
+    ):
+        admitted = PyExecutor._fetch_new_requests(stub, waiting_queue, retiring)
+
+    assert [item.id for item in admitted] == expected_admitted_ids
+    assert [item.id for item in waiting_queue] == [10, 11, 12, 13][len(expected_admitted_ids) :]
+    assert live == [4]
+    assert stub.num_fetch_requests == len(expected_admitted_ids)
+
+
 def test_generic_disagg_adp_mixed_rank_states_stay_queueable():
     # The generic non-PP path must give both ranks a non-empty scheduled batch:
     # one rank schedules its real request, while the terminal-only rank
@@ -2825,6 +3130,45 @@ def test_pad_dummy_gen_keeps_default_token_nums():
     assert call["token_nums"] is None
     assert call["is_gen"] is True
     assert stub.active_requests[-1].state == _STATE_GENERATION_IN_PROGRESS
+
+
+def _make_cleanup_stub(active_requests):
+    stub = Mock()
+    stub.active_requests = list(active_requests)
+    return stub
+
+
+def test_attention_dp_dummy_cleanup_removes_dummy_that_is_not_last():
+    dummy = Mock(is_attention_dp_dummy=True, py_request_id=17)
+    real_request = Mock(is_attention_dp_dummy=False, py_request_id=18)
+    stub = _make_cleanup_stub([dummy, real_request])
+
+    PyExecutor._terminate_attention_dp_dummy_requests(stub)
+
+    assert stub.active_requests == [real_request]
+    assert dummy.state == LlmRequestState.GENERATION_COMPLETE
+    stub.inflight_req_ids.erase.assert_called_once_with(17)
+    stub._terminate_request.assert_called_once_with(dummy)
+
+
+def test_attention_dp_dummy_cleanup_preserves_real_requests():
+    real_request = Mock(is_attention_dp_dummy=False, py_request_id=19)
+    stub = _make_cleanup_stub([real_request])
+
+    PyExecutor._terminate_attention_dp_dummy_requests(stub)
+
+    assert stub.active_requests == [real_request]
+    stub.inflight_req_ids.erase.assert_not_called()
+    stub._terminate_request.assert_not_called()
+
+
+def test_update_request_states_uses_common_dummy_cleanup():
+    stub = Mock()
+    scheduled_requests = Mock(context_requests=[])
+
+    PyExecutor._update_request_states_tp(stub, scheduled_requests)
+
+    stub._terminate_attention_dp_dummy_requests.assert_called_once_with()
 
 
 def test_overlap_adp_preserves_legacy_role_without_forward_intent_collective():

@@ -1,0 +1,33 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1048 132" width="1048" height="132">
+<defs><marker id="ah" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto" markerUnits="userSpaceOnUse"><path d="M0,0.5 L7,4 L0,7.5" fill="none" stroke="#4f5d75" stroke-width="1"/></marker></defs>
+<rect x="0" y="0" width="1048" height="132" fill="#f5f5f5"/>
+<rect x="24" y="24" width="176" height="84" rx="6" fill="#f5f5f5" stroke="#76B900" stroke-width="1" stroke-dasharray="5,4"/>
+<text x="36" y="42" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="500" letter-spacing="1.4" fill="#76B900">STAGE 1 · PREFILL-CHUNK</text>
+<text x="36" y="62" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142">After each</text>
+<text x="36" y="79" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142">prefill chunk</text>
+<text x="36" y="97" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="500" fill="#76B900">Future</text>
+<line x1="202" y1="66.0" x2="228" y2="66.0" stroke="#4f5d75" stroke-width="1" marker-end="url(#ah)"/>
+<rect x="230" y="24" width="176" height="84" rx="6" fill="#f5f5f5" stroke="#76B900" stroke-width="1" stroke-dasharray="5,4"/>
+<text x="242" y="42" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="500" letter-spacing="1.4" fill="#76B900">STAGE 2 · AFTER-PREFILL</text>
+<text x="242" y="62" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142">Right after</text>
+<text x="242" y="79" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142">prefill</text>
+<text x="242" y="97" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="500" fill="#76B900">Future</text>
+<line x1="408" y1="66.0" x2="434" y2="66.0" stroke="#4f5d75" stroke-width="1" marker-end="url(#ah)"/>
+<rect x="436" y="24" width="176" height="84" rx="6" fill="rgba(118,185,0,0.08)" stroke="#76B900" stroke-width="1.25"/>
+<text x="448" y="42" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="500" letter-spacing="1.4" fill="#76B900">STAGE 3 · DECODE</text>
+<text x="448" y="62" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142">Between</text>
+<text x="448" y="79" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142">decode steps</text>
+<text x="448" y="97" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="500" fill="#76B900">TriAttention</text>
+<line x1="614" y1="66.0" x2="640" y2="66.0" stroke="#4f5d75" stroke-width="1" marker-end="url(#ah)"/>
+<rect x="642" y="24" width="176" height="84" rx="6" fill="#f5f5f5" stroke="#76B900" stroke-width="1" stroke-dasharray="5,4"/>
+<text x="654" y="42" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="500" letter-spacing="1.4" fill="#76B900">STAGE 4 · TOOL-CALL</text>
+<text x="654" y="62" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142">Around</text>
+<text x="654" y="79" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142">a tool call</text>
+<text x="654" y="97" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="500" fill="#76B900">Future</text>
+<line x1="820" y1="66.0" x2="846" y2="66.0" stroke="#4f5d75" stroke-width="1" marker-end="url(#ah)"/>
+<rect x="848" y="24" width="176" height="84" rx="6" fill="rgba(118,185,0,0.08)" stroke="#76B900" stroke-width="1.25"/>
+<text x="860" y="42" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="500" letter-spacing="1.4" fill="#76B900">STAGE 5 · AFTER-REQUEST</text>
+<text x="860" y="62" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142">After</text>
+<text x="860" y="79" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142">the request</text>
+<text x="860" y="97" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="500" fill="#76B900">Cold-Page Compression</text>
+</svg>
