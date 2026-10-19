@@ -246,8 +246,11 @@ def test_video_runtime_availability_requires_importable_opencv(monkeypatch):
     monkeypatch.setattr(request_mapping.importlib, "import_module", lambda _name: object())
     assert request_mapping._video_runtime_available() is True
 
+
+@pytest.mark.parametrize("error", [ImportError(), OSError()])
+def test_video_runtime_unavailable_when_opencv_fails_to_load(monkeypatch, error):
     def missing(_name):
-        raise ImportError
+        raise error
 
     monkeypatch.setattr(request_mapping.importlib, "import_module", missing)
     assert request_mapping._video_runtime_available() is False

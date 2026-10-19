@@ -390,7 +390,7 @@ def _decoded_video_bytes(video: Any) -> int:
 def _video_runtime_available() -> bool:
     try:
         importlib.import_module("cv2")
-    except ImportError:
+    except (ImportError, OSError):
         return False
     return True
 
