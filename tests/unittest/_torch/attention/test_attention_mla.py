@@ -734,18 +734,14 @@ def test_attention_mla_cute_dsl_autotune(v2_kv_cache: bool) -> None:
     kernel_keys = list(CuteDSLNVMlaDecodeBlackwellRunner.kernel_cache)
     assert kernel_keys, "tuning-mode pass compiled no CuTe DSL MLA kernels"
     # Kernel-cache key layout: unique_id + (out_dtype, mma_qk, mma_pv,
-    # split_kv, is_persistent, has_kv_bounds). The trailing has_kv_bounds
-    # separates the helix per-token-bounds kernel variant from the plain one
-    # and is not a tuner tactic, so index the two tactic elements from the
-    # end past it. Both tactic elements chosen by the tuner must have been
-    # exercised during profiling.
-    persistent_variants = {key[-2] for key in kernel_keys}
+    # use_workspace, is_persistent, has_kv_bounds, is_var_split_kv). split_kv
+    # is a runtime argument and not part of the key. The runner offers only
+    # the non-persistent schedule, so no persistent variant may be compiled.
+    persistent_variants = {key[-3] for key in kernel_keys}
     assert persistent_variants == {
-        True, False
-    }, (f"expected both is_persistent tactic candidates to be profiled, "
+        False
+    }, (f"expected only the non-persistent tactic to be profiled, "
         f"got {persistent_variants}")
-    split_kv_variants = {key[-3] for key in kernel_keys}
-    assert split_kv_variants, "no split_kv tactic variant was profiled"
 
     # Serving-mode pass: tuned tactics must be reused as-is -- any new
     # kernel_cache entry means a runtime cute.compile happened post-tuning.
@@ -797,19 +793,30 @@ def test_attention_mla_cute_dsl_autotune(v2_kv_cache: bool) -> None:
     # The assertions above can hold even for an unbucketed fallback when this
     # GPU's occupancy makes split_kv(65) == split_kv(64), so also check the
     # bucketing itself with the occupancy ceiling pinned to a value where the
-    # raw batch and its bucket disagree: 256 // 65 // 2 == 1, while bucket 64
-    # gives 256 // 64 // 2 == 2.
+    # raw batch and its bucket disagree: with 91 blocks, batch 65 gives
+    # split_kv 4 while bucket 64 gives 8.
+    pinned_max_active_blocks = 91
+    num_q_tiles = runner.get_num_q_tiles(runner.num_heads, runner.seq_len_q)
+    bucket_split_kv = runner.get_default_split_kv(64, num_q_tiles,
+                                                  pinned_max_active_blocks)
+    raw_split_kv = runner.get_default_split_kv(65, num_q_tiles,
+                                               pinned_max_active_blocks)
+    assert bucket_split_kv != raw_split_kv, (
+        f"pinned max_active_blocks {pinned_max_active_blocks} no longer "
+        f"separates batch 65 from bucket 64 (split_kv {raw_split_kv} vs "
+        f"{bucket_split_kv}); pick another value")
     with mock.patch.object(CuteDSLNVMlaDecodeBlackwellRunner,
                            "_cute_dsl_max_active_blocks",
-                           256,
+                           pinned_max_active_blocks,
                            create=True):
         pinned_tactic = runner.default_tactic(65)
         assert pinned_tactic == runner.default_tactic(64), (
             f"default_tactic no longer buckets the batch: got {pinned_tactic} "
             f"for batch 65 vs {runner.default_tactic(64)} for batch 64")
-        assert pinned_tactic[2] == 2, (
-            f"expected bucket-64 split_kv 2 with max_active_blocks pinned to "
-            f"256, got {pinned_tactic[2]}")
+        assert pinned_tactic[2] == bucket_split_kv, (
+            f"expected bucket-64 split_kv {bucket_split_kv} with "
+            f"max_active_blocks pinned to {pinned_max_active_blocks}, "
+            f"got {pinned_tactic[2]}")
 
 
 def _run_test_for_backend(backend_name,

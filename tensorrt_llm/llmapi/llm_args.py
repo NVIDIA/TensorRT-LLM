@@ -3647,10 +3647,11 @@ class DSparkDecodingConfig(DecodingBaseConfig):
         "namespace). Ignored by the embedded DeepSeek-V4-Pro draft. Independent "
         "of the backend that builds the drafter's own attention modules.\n\n"
         "AUTO resolves per drafter family and is right unless you are pinning a "
-        "kernel: a GQA backbone degrades when its kernel is missing, an MLA one "
-        "raises. TRTLLM needs FlashInfer and SM100/SM103. CUTEDSL is MLA-only "
-        "and needs a cute-dsl MLA decode taking per-token kv_bounds that is not "
-        "upstream yet. Which kernel each name selects: MLADSparkForCausalLM.")
+        "kernel: TRTLLM for a GQA backbone, which degrades when its kernel is "
+        "missing, and CUTEDSL for an MLA one, which raises. TRTLLM needs "
+        "FlashInfer and SM100/SM103. CUTEDSL is MLA-only: one cute-dsl MLA "
+        "decode pass over context and block, on SM100/SM103/SM107. Which "
+        "kernel each name selects: MLADSparkForCausalLM.")
 
     @model_validator(mode="after")
     def set_max_total_draft_tokens(self):

@@ -216,7 +216,7 @@ def BOLT_CONSUME = "bolt_consume"
 // `"bolt_consume": true` opts in a single run without one. Either way
 // resolveBoltConsume() still applies the post-merge and branch restrictions.
 @Field
-def ENABLE_BOLT_PREMERGE_CONSUME = true
+def ENABLE_BOLT_PREMERGE_CONSUME = false
 // Version-controlled rollout switch for post-merge BOLT, same idiom as above.
 //
 // Post-merge cannot use the pre-merge shape, where the BOLTed build REPLACES the
@@ -779,7 +779,9 @@ def launchReleaseCheck(pipeline, globalVars)
 
         // Step 2: Run guardwords scan
         def isOfficialPostMergeJob = (env.JOB_NAME ==~ /.*PostMerge.*/)
-        if (env.alternativeTRT || isOfficialPostMergeJob) {
+        if (env.alternativeTRT ||
+            isOfficialPostMergeJob ||
+            runMode == "nightly_release") {
             trtllm_utils.checkoutSource(SCAN_REPO, SCAN_COMMIT, SCAN_ROOT, false, true)
             trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${SCAN_ROOT} && pip3 install -e .")
             try {
@@ -1789,7 +1791,6 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         "tests/integration/test_lists/test-db/l0_gb200_multi_gpus.yml",
         "tests/integration/test_lists/test-db/l0_gb200_multi_gpus_perf_sanity.yml",
         "tests/integration/test_lists/test-db/l0_gb200_multi_nodes.yml",
-        "tests/integration/test_lists/test-db/l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu1_gen1_node1_gpu2.yml",
         "tests/integration/test_lists/test-db/l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu1_gen1_node1_gpu4.yml",
         "tests/integration/test_lists/test-db/l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu1_gen1_node2_gpu8.yml",
         "tests/integration/test_lists/test-db/l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node2_gpu8.yml",

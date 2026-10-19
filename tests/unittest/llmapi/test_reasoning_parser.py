@@ -1412,3 +1412,136 @@ def test_deepseek_r1_keeps_a_second_close_as_content() -> None:
     result = ReasoningParserFactory.create_reasoning_parser(
         "deepseek-r1").parse("a</think>b</think><tool_call>f")
     assert result.content == "b</think><tool_call>f"
+
+
+M3_START, M3_END = "<mm:think>", "</mm:think>"
+# How the server relays the mode it resolved from the rendered prompt:
+# thinking enabled (`<mm:think>` prefilled), disabled (`</mm:think>`
+# prefilled) and adaptive / unresolved (nothing prefilled).
+M3_ENABLED = {"enable_thinking": True}
+M3_DISABLED = {"enable_thinking": False}
+M3_ADAPTIVE = None
+# The template's own knob, when the caller passes it.
+M3_MODE_ENABLED = {"thinking_mode": "enabled"}
+M3_MODE_ADAPTIVE = {"thinking_mode": "adaptive"}
+# What the Responses path hands the parser for `reasoning.effort`: an injected
+# `thinking` the M3 template never reads, here next to a resolved mode of off.
+M3_EFFORT_INJECTED = {"enable_thinking": False, "thinking": True}
+
+
+def _m3_parser(kwargs: dict | None):
+    return ReasoningParserFactory.create_reasoning_parser("minimax_m3", kwargs)
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "text", "content", "reasoning_content"),
+    [
+        # Adaptive: the model opens with a tag or with the bare sentinel.
+        (M3_ADAPTIVE, f"{M3_START}a{M3_END}b", "b", "a"),
+        (M3_ADAPTIVE, f"{M3_END}b", "b", ""),
+        (M3_ADAPTIVE, "b", "b", ""),
+        # Reasoning truncated before the closing tag (e.g. by max_tokens).
+        (M3_ADAPTIVE, f"{M3_START}a", "", "a"),
+        (M3_ADAPTIVE, M3_START, "", ""),
+        # Text before an opening tag is content, as in streaming.
+        (M3_ADAPTIVE, f"x{M3_START}a{M3_END}b", "xb", "a"),
+        (M3_ADAPTIVE, f"x{M3_START}a", "x", "a"),
+        (M3_ADAPTIVE, f"x{M3_END}b", "xb", ""),
+        # Enabled: the prompt ends with `<mm:think>`, so the output starts
+        # inside the reasoning block and carries no opening tag.
+        (M3_ENABLED, f"a{M3_END}b", "b", "a"),
+        (M3_ENABLED, "a", "", "a"),
+        (M3_ENABLED, f"{M3_END}b", "b", ""),
+        # Disabled: the prompt ends with `</mm:think>`; the output is content.
+        (M3_DISABLED, "b", "b", ""),
+        (M3_DISABLED, f"{M3_START}a{M3_END}b", "b", "a"),
+        # The template's knob decides when present; an injected `thinking`
+        # (Responses path, `reasoning.effort`) does not open the block.
+        (M3_MODE_ENABLED, f"a{M3_END}b", "b", "a"),
+        (M3_MODE_ADAPTIVE, f"{M3_START}a{M3_END}b", "b", "a"),
+        (M3_EFFORT_INJECTED, "b", "b", ""),
+        (M3_EFFORT_INJECTED, f"{M3_START}a{M3_END}b", "b", "a"),
+        ({
+            "thinking": True
+        }, f"{M3_START}a{M3_END}b", "b", "a"),
+    ])
+def test_minimax_m3_reasoning_parser(kwargs: dict | None, text: str,
+                                     content: str,
+                                     reasoning_content: str) -> None:
+    result = _m3_parser(kwargs).parse(text)
+    assert result.content == content
+    assert result.reasoning_content == reasoning_content
+
+
+def _m3_stream(kwargs: dict | None, chunks: list[str]) -> tuple[str, str]:
+    reasoning_parser = _m3_parser(kwargs)
+    content, reasoning_content = "", ""
+    for chunk in chunks:
+        result = reasoning_parser.parse_delta(chunk)
+        content += result.content
+        reasoning_content += result.reasoning_content
+    result = reasoning_parser.finish()
+    content += result.content
+    reasoning_content += result.reasoning_content
+    return content, reasoning_content
+
+
+@pytest.mark.parametrize(
+    "kwargs", [M3_ADAPTIVE, M3_ENABLED, M3_DISABLED, M3_EFFORT_INJECTED],
+    ids=["adaptive", "enabled", "disabled", "effort-injected"])
+@pytest.mark.parametrize("text", [
+    f"{M3_START}a{M3_END}b",
+    f"{M3_END}b",
+    f"{M3_END}",
+    f"{M3_START}a",
+    M3_START,
+    f"a{M3_END}b",
+    "a",
+    f"x{M3_START}a{M3_END}b",
+    f"x{M3_END}b",
+])
+def test_minimax_m3_reasoning_parser_stream_matches_non_stream(
+        kwargs: dict | None, text: str) -> None:
+    """Streaming in any chunking then finishing must match a non-streaming parse."""
+    if kwargs == M3_ENABLED and text.endswith(M3_START):
+        # Inside a prefilled block a trailing second opening tag is withheld
+        # by streaming as a possible delimiter and dropped at the end; the
+        # shape is outside the contract.
+        pytest.skip("second opening tag inside a prefilled block")
+    whole = _m3_parser(kwargs).parse(text)
+    expected = (whole.content, whole.reasoning_content)
+    assert _m3_stream(kwargs, [text]) == expected
+    assert _m3_stream(kwargs, list(text)) == expected
+    for i, j in itertools.combinations_with_replacement(range(len(text) + 1),
+                                                        2):
+        chunks = [text[:i], text[i:j], text[j:]]
+        assert _m3_stream(kwargs, chunks) == expected, chunks
+
+
+@pytest.mark.parametrize("kwargs", [M3_ADAPTIVE, M3_ENABLED, M3_DISABLED],
+                         ids=["adaptive", "enabled", "disabled"])
+def test_minimax_m3_streaming_matches_parse_on_random_text(
+        kwargs: dict | None) -> None:
+    """Parity on random tag soup with at most one reasoning block.
+
+    A second ``<mm:think>`` after the close is outside the parsers' contract.
+    """
+    pieces = [
+        M3_START, M3_END, "<", "</", "<mm", "</mm:th", "think>", "a", " ", "\n"
+    ]
+    rng = random.Random(0)
+    for _ in range(3000):
+        text = "".join(rng.choices(pieces, k=rng.randint(0, 8)))
+        if text.count(M3_START) > 1 or text.count(M3_END) > 1:
+            continue
+        if kwargs == M3_ENABLED and (
+                text.endswith(M3_START) or
+            (M3_END in text and M3_START in text[text.index(M3_END):])):
+            # The prefilled block is the one block; an opening tag after its
+            # close (or trailing, see above) would start a second one.
+            continue
+        whole = _m3_parser(kwargs).parse(text)
+        cuts = [i for i in range(1, len(text)) if rng.random() < 0.3]
+        chunks = [text[i:j] for i, j in zip([0] + cuts, cuts + [len(text)])]
+        expected = (whole.content, whole.reasoning_content)
+        assert _m3_stream(kwargs, chunks) == expected, chunks
