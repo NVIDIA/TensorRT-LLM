@@ -552,7 +552,6 @@ def buildImage(config, imageKeyToTag, versionOverride)
         // If using a forked repo, svc_tensorrt needs to have the access to the forked repo.
         trtllm_utils.checkoutSource(LLM_REPO, LLM_COMMIT_OR_BRANCH, LLM_ROOT, true, true)
     }
-    def sourceWheelVersionArg = ""
     if (versionOverride) {
         def resolvedVersionOverride = versionOverride
         if (versionOverride.startsWith(".")) {
@@ -566,9 +565,6 @@ def buildImage(config, imageKeyToTag, versionOverride)
         }
         env.TRTLLM_VERSION_OVERRIDE = resolvedVersionOverride
         args += ' TRT_LLM_VERSION="${TRTLLM_VERSION_OVERRIDE}"'
-        // BUILD_WHEEL_OPTS applies to source builds, including the retry below.
-        // Downloaded wheels use their own explicit BUILD_WHEEL_ARGS instead.
-        sourceWheelVersionArg = ' --version-override ${TRTLLM_VERSION_OVERRIDE}'
     }
 
     // Step 2: Build the images
@@ -663,7 +659,7 @@ def buildImage(config, imageKeyToTag, versionOverride)
                 TORCH_INSTALL_TYPE=${torchInstallType} \
                 IMAGE_WITH_TAG=${rawDependentTag} \
                 STAGE=${dependent.dockerfileStage} \
-                BUILD_WHEEL_OPTS="-j ${build_jobs}${sourceWheelVersionArg}" ${args}
+                BUILD_WHEEL_OPTS='-j ${build_jobs}' ${args}
                 """, sleepInSecs: randomSleep, numRetries: 6, shortCommondRunTimeMax: 7200)
                 args += " DEVEL_IMAGE=${rawDependentTag}"
                 if (target == "ngc-release") {
@@ -693,7 +689,7 @@ def buildImage(config, imageKeyToTag, versionOverride)
                 TORCH_INSTALL_TYPE=${torchInstallType} \
                 IMAGE_WITH_TAG=${rawImageTag} \
                 STAGE=${dockerfileStage} \
-                BUILD_WHEEL_OPTS="-j ${build_jobs}${sourceWheelVersionArg}" ${args} ${buildWheelArgs}
+                BUILD_WHEEL_OPTS='-j ${build_jobs}' ${args} ${buildWheelArgs}
                 """, sleepInSecs: randomSleep, numRetries: 6, shortCommondRunTimeMax: 7200)
             } catch (InterruptedException ex) {
                 throw ex
@@ -715,7 +711,7 @@ def buildImage(config, imageKeyToTag, versionOverride)
                 TORCH_INSTALL_TYPE=${torchInstallType} \
                 IMAGE_WITH_TAG=${rawImageTag} \
                 STAGE=${dockerfileStage} \
-                BUILD_WHEEL_OPTS="-j ${build_jobs}${sourceWheelVersionArg}" ${args} ${buildWheelArgs}
+                BUILD_WHEEL_OPTS='-j ${build_jobs}' ${args} ${buildWheelArgs}
                 """, sleepInSecs: randomSleep, numRetries: 6, shortCommondRunTimeMax: 7200)
             }
             if (target == "ngc-release") {
@@ -732,7 +728,7 @@ def buildImage(config, imageKeyToTag, versionOverride)
                 TORCH_INSTALL_TYPE=${torchInstallType} \
                 IMAGE_WITH_TAG=${rawCustomTag} \
                 STAGE=${dockerfileStage} \
-                BUILD_WHEEL_OPTS="-j ${build_jobs}${sourceWheelVersionArg}" ${args} ${buildWheelArgs}
+                BUILD_WHEEL_OPTS='-j ${build_jobs}' ${args} ${buildWheelArgs}
                 """
             }
         }

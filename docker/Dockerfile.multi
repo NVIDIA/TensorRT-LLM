@@ -171,6 +171,7 @@ COPY setup.py requirements.txt requirements-dev.txt requirements-grpc-smg.txt co
 ENV CCACHE_DIR=/root/.cache/ccache
 # Build the TRT-LLM wheel
 ARG GIT_COMMIT
+ARG TRT_LLM_VER
 ARG GITHUB_MIRROR=""
 ARG BUILD_WHEEL_ARGS="--clean"
 ARG BUILD_WHEEL_SCRIPT="scripts/build_wheel.py"
@@ -183,6 +184,7 @@ RUN --mount=type=cache,target=/root/.cache/pip --mount=type=cache,target=${CCACH
     # (3rdparty/fetch_content.json) that this build pulls from github.com.
     . docker/common/github_auth.sh && \
     TRTLLM_BUILD_SOURCE_COMMIT=${GIT_COMMIT} \
+    TRTLLM_BUILD_VERSION="${TRT_LLM_VER}" \
     GITHUB_MIRROR=${GITHUB_MIRROR} \
     python3 ${BUILD_WHEEL_SCRIPT} ${BUILD_WHEEL_ARGS}
 
