@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
 import copy
 import dataclasses
 import os
@@ -54,6 +55,7 @@ from ..speculative import (draft_prompt_lookahead, get_num_extra_kv_tokens,
                            get_num_spec_layers, get_spec_decoder,
                            should_use_separate_draft_kv_cache)
 from ..utils import is_gdn_replay_enabled
+from ..virtual_memory import preserve_contents
 from . import config_utils
 from .config_utils import (MambaKVCacheParams, _is_sliding_attention_layer,
                            extract_mamba_kv_cache_params,
@@ -2824,6 +2826,14 @@ class KvCacheCreator:
                        resources: Dict,
                        estimating_kv_cache: bool = False) -> None:
         """Construct KV caches for model and draft model (if applicable)."""
+        # V2 keeps KV data in native pools, which follow the KV restore mode.
+        # Tagged allocations made here hold manager metadata, which sleep keeps.
+        with (preserve_contents()
+              if self._is_kv_cache_manager_v2 else contextlib.nullcontext()):
+            self._build_managers(resources, estimating_kv_cache)
+
+    def _build_managers(self, resources: Dict,
+                        estimating_kv_cache: bool) -> None:
         if self._skip_est:
             self.configure_kv_cache_capacity()
         original_max_seq_len = self._max_seq_len

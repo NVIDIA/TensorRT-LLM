@@ -109,11 +109,10 @@ the `KV_CACHE` tag. V2 keeps cache objects and logical state while releasing the
 physical GPU storage. `NONE` and `MEMSET` discard KV contents and reusable prefixes
 and release HOST pool backing; `CPU` and
 `PINNED` preserve live request pages through the configured cache tiers, while
-reusable pages may be dropped under capacity pressure. Only KV release in `CPU`
-or `PINNED` mode requires a host tier
-below all GPU levels with capacity at least equal to their combined GPU quota;
-all ranks validate this capacity before release begins. Weights-only release and
-KV discard modes do not require backup capacity. See [V2 sleep and wakeup](kvcache.md#sleep-and-wakeup-with-v2).
+reusable pages may be dropped under capacity pressure. KV release in `CPU` or
+`PINNED` mode warns when the host tier below all GPU levels is smaller than their
+combined GPU quota. Weights-only release and KV discard modes do not use backup
+capacity. See [V2 sleep and wakeup](kvcache.md#sleep-and-wakeup-with-v2).
 
 | `ExecutorMemoryType` | Tag value | Contents |
 | --- | --- | --- |

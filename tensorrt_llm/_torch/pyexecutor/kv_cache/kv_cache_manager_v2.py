@@ -39,7 +39,7 @@ from strenum import StrEnum
 from tensorrt_llm._torch.disaggregation.resource.page import MapperKind, RoleLayout
 from tensorrt_llm._torch.distributed.communicator import Distributed, ReduceOp
 from tensorrt_llm._torch.utils import helix_local_len, maybe_compile
-from tensorrt_llm._torch.virtual_memory import RestoreMode, preserve_contents
+from tensorrt_llm._torch.virtual_memory import RestoreMode
 from tensorrt_llm._utils import (
     TensorWrapper,
     binding_to_torch_dtype,
@@ -1974,8 +1974,7 @@ class KVCacheManagerV2(BaseResourceManager):
         # Requests whose pages a connector is still reading from, so the
         # release half of `preempt_request` has to wait.
         self._pending_preemption: Dict[int, LlmRequest] = {}
-        with preserve_contents():
-            self._prepare_page_table_tensor(index_mapper_capacity)
+        self._prepare_page_table_tensor(index_mapper_capacity)
         self._sparse_layer_group_ids = tuple(
             sorted(
                 {
@@ -6751,7 +6750,11 @@ class KVCacheManagerV2(BaseResourceManager):
         return success
 
     def validate_sleep_config(self, mode: RestoreMode) -> None:
-        """Check backup capacity only when KV contents must survive release."""
+        """Warn when a preserving release may not keep every evicted GPU page.
+
+        Live pages of retained internal caches must still fit in the colder tiers;
+        otherwise the release itself fails.
+        """
         if mode in (RestoreMode.NONE, RestoreMode.MEMSET):
             return
         tiers = self.impl.init_config.cache_tiers
@@ -6767,14 +6770,15 @@ class KVCacheManagerV2(BaseResourceManager):
         )
         if host_quota < gpu_quota:
             shortfall = gpu_quota - host_quota
-            raise ValueError(
-                "KVCacheManagerV2 CPU/PINNED sleep requires a host tier below all GPU levels with "
-                "capacity at least as large as the combined hot and cold GPU cache quota. "
-                f"Required: {gpu_quota} bytes ({gpu_quota / (1 << 20):.2f} MiB); "
+            logger.warning(
+                "KVCacheManagerV2 CPU/PINNED sleep has a host tier below all GPU levels smaller "
+                "than the combined hot and cold GPU cache quota, so reusable pages may be dropped "
+                "and the release fails if live pages of retained internal requests do not fit. "
+                f"Combined GPU quota: {gpu_quota} bytes ({gpu_quota / (1 << 20):.2f} MiB); "
                 f"largest eligible host tier: {host_quota} bytes ({host_quota / (1 << 20):.2f} MiB); "
                 f"shortfall: {shortfall} bytes ({shortfall / (1 << 20):.2f} MiB). "
                 f"Set kv_cache_config.host_cache_size to at least {gpu_quota} bytes "
-                "and ensure the host tier is below all GPU levels, or reduce the GPU cache quota."
+                "to back up the full GPU cache."
             )
 
     def release_memory(self, mode: RestoreMode) -> None:
@@ -6800,12 +6804,16 @@ class KVCacheManagerV2(BaseResourceManager):
             if self.conversation_manager is not None:
                 self.conversation_manager.clear()
 
+    def _zero_pools_on_wakeup(self, mode: RestoreMode) -> bool:
+        """Whether restored GPU pools are zeroed before surviving pages return to them."""
+        return mode == RestoreMode.MEMSET
+
     def materialize_memory(self) -> None:
         """Restore pool backing and reconnect surviving requests to their cache pages."""
         mode = self._sleep_restore_mode
         if mode is None:
             return
-        self.impl.materialize_gpu_memory(zero=mode == RestoreMode.MEMSET)
+        self.impl.materialize_gpu_memory(zero=self._zero_pools_on_wakeup(mode))
         for req_id in self._sleeping_active_caches:
             cache = self.kv_cache_map[req_id]
             if not cache.is_active and not cache.resume(self._stream.cuda_stream):

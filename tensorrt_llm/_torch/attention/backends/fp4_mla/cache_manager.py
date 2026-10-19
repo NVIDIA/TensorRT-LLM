@@ -215,6 +215,7 @@ class Fp4MlaV2CacheLayoutPolicy:
             "get_disagg_global_layer_ids",
             "_get_runtime_cache_size_layer_components",
             "_get_generation_request_capacity",
+            "_zero_pools_on_wakeup",
         )
         for method_name in method_names:
             method = getattr(Fp4MlaV2CacheLayoutPolicy, method_name)
@@ -230,6 +231,11 @@ class Fp4MlaV2CacheLayoutPolicy:
         with torch.cuda.stream(manager._stream):
             Fp4MlaV2CacheLayoutPolicy.get_mla_v_scale_pool_base(manager).zero_()
         manager._stream.synchronize()
+
+    def _zero_pools_on_wakeup(self, mode) -> bool:
+        """Remapped pools must restore the zeroed V-scale tiles set by ``finalize_manager``."""
+        del mode
+        return True
 
     @property
     def fp4_mla_hp_pool_size(self) -> int:

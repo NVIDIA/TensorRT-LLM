@@ -261,17 +261,18 @@ their activation points.
 
 ### Sleep and Wakeup with V2
 
-When releasing V2 KV cache with `CPU` or `PINNED` preservation, a host cache tier below
-all GPU cache levels must have a quota at least as large as their combined GPU
-cache quota for each KV manager on each rank, including draft managers.
-Set `kv_cache_config.host_cache_size`
-accordingly; speculative decoding splits this budget between the target and
-draft managers. Automatic host sizing uses the minimum across ranks and may
-choose a smaller quota because of available host memory or pinned-memory limits.
-All participating ranks validate this capacity before any rank starts releasing
-memory. Weights-only release and KV `NONE`/`MEMSET` release do not require this
-backup capacity; ordinary host-tier sizing and sparse-attention requirements
-still apply.
+When releasing V2 KV cache with `CPU` or `PINNED` preservation, GPU pages are
+evicted into a host cache tier below all GPU cache levels. To back up the full GPU
+cache, give that tier a quota at least as large as the combined GPU cache quota
+for each KV manager on each rank, including draft managers, by setting
+`kv_cache_config.host_cache_size`; speculative decoding splits this budget between
+the target and draft managers. Automatic host sizing uses the minimum across ranks
+and may choose a smaller quota because of available host memory or pinned-memory
+limits. A smaller host tier logs a warning before release: reusable pages may then
+be dropped, and the release fails if live pages of retained internal requests do
+not fit in the configured tiers. Weights-only release and KV `NONE`/`MEMSET`
+release do not use this backup capacity; ordinary host-tier sizing and
+sparse-attention requirements still apply.
 
 The `kv_cache` entry in `sleep_config.restore_modes` controls the KV data policy:
 

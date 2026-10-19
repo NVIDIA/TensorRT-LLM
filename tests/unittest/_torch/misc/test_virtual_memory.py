@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import contextlib
 import gc
 
 import pytest
@@ -177,6 +178,32 @@ def test_restore():
     del pool
 
 
+@pytest.mark.parametrize("is_v2", [True, False])
+def test_kv_cache_creator_keeps_v2_manager_metadata(is_v2):
+    from tensorrt_llm._torch.pyexecutor._util import KvCacheCreator
+
+    creator = object.__new__(KvCacheCreator)
+    creator._is_kv_cache_manager_v2 = is_v2
+    tensors = []
+    creator._build_managers = lambda resources, estimating_kv_cache: tensors.append(
+        torch.full([1024], 42, dtype=torch.int8, device='cuda'))
+    tag = "kv_cache_creator_metadata"
+
+    with virtual_memory.scope(tag, virtual_memory.RestoreMode.MEMSET) as pool:
+        creator.build_managers({})
+
+    torch.cuda.synchronize()
+    virtual_memory.release_with_tag(tag)
+    virtual_memory.materialize_with_tag(tag)
+    torch.cuda.synchronize()
+
+    # V2 metadata survives a discarding KV restore mode; V1 allocations follow it.
+    assert tensors[0][0].item() == (42 if is_v2 else 0)
+
+    tensors.clear()
+    del pool
+
+
 class _KVCacheManagerV2WithColdGpu(KVCacheManagerV2):
 
     def _build_cache_config(
@@ -248,7 +275,10 @@ def test_kv_cache_manager(process_gpu_memory_info_available, manager_cls,
         alloc_size = alloc_size * 3 // 4
 
     with virtual_memory.scope(tag, restore_mode) as pool:
-        mgr = manager_cls(**kv_cache_params)
+        # Mirrors KvCacheCreator.build_managers, which keeps V2 manager metadata.
+        with (virtual_memory.preserve_contents()
+              if is_v2 else contextlib.nullcontext()):
+            mgr = manager_cls(**kv_cache_params)
         if is_v2:
             assert mgr._use_per_layer_page_tables
             metadata = mgr._device_attention_op_scales
@@ -339,19 +369,20 @@ def test_cuda_graph(process_gpu_memory_info_available, restore_mode):
     tag = "cuda_graph"
 
     with virtual_memory.scope(tag, restore_mode) as pool:
-        manager = KVCacheManagerV2(
-            kv_cache_config=KvCacheConfig(max_gpu_total_bytes=4 << 20,
-                                          host_cache_size=8 << 20),
-            kv_cache_type=CacheType.SELF,
-            num_layers=1,
-            num_kv_heads=4,
-            head_dim=64,
-            tokens_per_block=4,
-            max_seq_len=16,
-            max_batch_size=1,
-            mapping=Mapping(world_size=1, tp_size=1, rank=0),
-            dtype=tensorrt_llm.bindings.DataType.FLOAT,
-        )
+        with virtual_memory.preserve_contents():
+            manager = KVCacheManagerV2(
+                kv_cache_config=KvCacheConfig(max_gpu_total_bytes=4 << 20,
+                                              host_cache_size=8 << 20),
+                kv_cache_type=CacheType.SELF,
+                num_layers=1,
+                num_kv_heads=4,
+                head_dim=64,
+                tokens_per_block=4,
+                max_seq_len=16,
+                max_batch_size=1,
+                mapping=Mapping(world_size=1, tp_size=1, rank=0),
+                dtype=tensorrt_llm.bindings.DataType.FLOAT,
+            )
         hole = manager.add_dummy_requests([122], token_nums=[4], is_gen=True)[0]
         dummy = manager.add_dummy_requests([123], token_nums=[4],
                                            is_gen=True)[0]

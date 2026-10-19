@@ -3130,7 +3130,7 @@ def test_fresh_fill_preserves_kv_across_block_onboard(
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize(
-    "host_tiers,mode,error",
+    "host_tiers,mode,warning",
     [
         ([], RestoreMode.NONE, None),
         ([], RestoreMode.CPU, "shortfall: 33554432 bytes"),
@@ -3138,19 +3138,56 @@ def test_fresh_fill_preserves_kv_across_block_onboard(
         ([32 << 20], RestoreMode.PINNED, None),
     ],
 )
-def test_sleep_requires_host_capacity_covering_gpu(
-    host_tiers: list[int], mode: RestoreMode, error: str | None
+def test_sleep_warns_when_host_capacity_below_gpu(
+    host_tiers: list[int], mode: RestoreMode, warning: str | None
 ) -> None:
     manager = object.__new__(KVCacheManagerV2)
-    # Hot and cold GPU levels both need backup capacity.
+    # Hot and cold GPU levels both count toward the backup capacity.
     tiers = [GpuCacheTierConfig(quota=16 << 20), GpuCacheTierConfig(quota=16 << 20)]
     tiers.extend(HostCacheTierConfig(quota=quota) for quota in host_tiers)
     manager.impl = Mock(init_config=SimpleNamespace(cache_tiers=tiers))
-    if error is None:
+    with patch(
+        "tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2.logger.warning"
+    ) as mock_warning:
         manager.validate_sleep_config(mode)
+    if warning is None:
+        mock_warning.assert_not_called()
     else:
-        with pytest.raises(ValueError, match=error):
-            manager.validate_sleep_config(mode)
+        mock_warning.assert_called_once()
+        assert warning in mock_warning.call_args.args[0]
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("mode", list(RestoreMode))
+def test_wakeup_zeroes_pools_for_memset_and_fp4_mla(mode: RestoreMode) -> None:
+    from tensorrt_llm._torch.attention.backends.fp4_mla.cache_manager import Fp4MlaKVCacheManagerV2
+
+    manager = object.__new__(KVCacheManagerV2)
+    manager._sleep_restore_mode = mode
+    manager._sleeping_active_caches = set()
+    manager.kv_cache_map = {}
+    manager.sparse_metadata_batch = None
+    manager._stream = SimpleNamespace(synchronize=lambda: None)
+    manager.impl = Mock()
+    manager.materialize_memory()
+    manager.impl.materialize_gpu_memory.assert_called_once_with(zero=mode == RestoreMode.MEMSET)
+
+    # FP4 MLA reads whole V-scale pages, so remapped pools must start zeroed.
+    assert object.__new__(Fp4MlaKVCacheManagerV2)._zero_pools_on_wakeup(mode)
+
+
+@pytest.mark.cpu_only
+def test_minimax_m3_rejects_sleep_with_index_value_buffers() -> None:
+    from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.cache_manager import (
+        MiniMaxM3KVCacheManagerV2,
+    )
+
+    manager = object.__new__(MiniMaxM3KVCacheManagerV2)
+    manager._index_v_buffers = {3: torch.zeros(1)}
+    with pytest.raises(ValueError, match="index-V buffers"):
+        manager.validate_sleep_config(RestoreMode.NONE)
+    manager._index_v_buffers = {}
+    manager.validate_sleep_config(RestoreMode.NONE)
 
 
 class _GuardKVCache:

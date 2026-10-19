@@ -54,6 +54,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
 )
 
 if TYPE_CHECKING:
+    from tensorrt_llm._torch.virtual_memory import RestoreMode
     from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
 
 
@@ -693,6 +694,16 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
 
     def has_index_value(self, layer_idx: int) -> bool:
         return layer_idx in self._index_v_buffers
+
+    def validate_sleep_config(self, mode: RestoreMode) -> None:
+        """Reject KV sleep while slot-indexed index-V buffers live outside the pools."""
+        if self._index_v_buffers:
+            raise ValueError(
+                "KV_CACHE sleep does not support MiniMaxM3 index-V buffers: they are "
+                "indexed by KV slot outside the native pools, so restored pages would "
+                "not match them."
+            )
+        super().validate_sleep_config(mode)
 
     def _kv_slot_geometry(
         self, layer_idx: int, kv_layout: Optional[str] = None

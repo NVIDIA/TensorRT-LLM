@@ -4488,23 +4488,18 @@ def test_v2_hybrid_static_dynamic_tree_capacity():
 
 
 @skip_no_cuda
-@pytest.mark.parametrize("restore_mode", [None, RestoreMode.MEMSET])
 @pytest.mark.parametrize(
     "builder",
     [_build_hybrid_with_mamba_layer, _build_v2_hybrid_with_mamba_layer],
     ids=["cpp", "v2"],
 )
-def test_hybrid_replay_buffers_size_by_tokens_per_gen_step(builder, restore_mode):
+def test_hybrid_replay_buffers_size_by_tokens_per_gen_step(builder):
     spec_config = _make_wide_spec_config(max_draft_len=2, tokens_per_gen_step=5)
-    tag = "hybrid_replay_sleep"
-    with virtual_memory.maybe_scope(
-        restore_mode is not None, tag, restore_mode or RestoreMode.NONE
-    ) as pool:
-        mgr = builder(
-            max_batch_size=4,
-            spec_config=spec_config,
-            use_replay_state_update=True,
-        )
+    mgr = builder(
+        max_batch_size=4,
+        spec_config=spec_config,
+        use_replay_state_update=True,
+    )
     try:
         replay_metadata = mgr.get_replay_state_update_metadata()
         assert mgr.use_replay_state_update is True
@@ -4517,18 +4512,6 @@ def test_hybrid_replay_buffers_size_by_tokens_per_gen_step(builder, restore_mode
         _assert_replay_layer_cache_uses_history_size(
             layer_cache, replay_metadata.replay_history_size
         )
-        if restore_mode is not None:
-            assert pool is not None
-            mgr.prev_num_accepted_tokens.fill_(2)
-            mgr.cache_buf_idx.fill_(1)
-            expected_indices = mgr.intermediate_state_indices.clone()
-            torch.cuda.synchronize()
-            assert virtual_memory.release_with_tag(tag) > 0
-            assert virtual_memory.materialize_with_tag(tag) > 0
-            torch.cuda.synchronize()
-            assert torch.all(mgr.prev_num_accepted_tokens == 2)
-            assert torch.all(mgr.cache_buf_idx == 1)
-            torch.testing.assert_close(mgr.intermediate_state_indices, expected_indices)
     finally:
         mgr.shutdown()
 
