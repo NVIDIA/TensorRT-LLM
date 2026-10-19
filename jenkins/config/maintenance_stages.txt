@@ -27,3 +27,7 @@
 # Reason: The H100 cluster is under maintenance.
 # H100_PCIe-*
 # DGX_H100-*
+
+Reason: aws-pdx-slurm-1 complete outage, with no backup cluster 2026-10-20 00:00-05:00 Beijing time. Slack: https://nvidia.slack.com/archives/C0ANDGK93DZ/p1792098411747449 Maintenance Link: https://aihub.nvidia.com/allocations/maintenances/6ad13fc03cf25574bf03db7c
+B300-*
+DGX_B300-*
