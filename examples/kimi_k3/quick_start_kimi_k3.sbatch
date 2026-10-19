@@ -101,7 +101,7 @@ srun --mpi=pmix \
         # rename (seen as a DeepGEMM JIT runtime assertion in
         # fp8_swap_ab_gemm). Keep it node-local and per-rank, like the Triton
         # cache above.
-        export DG_JIT_CACHE_DIR=/tmp/deep-gemm-rank\${SLURM_PROCID:-0}
+        export DG_JIT_CACHE_DIR=/tmp/deep-gemm-job${SLURM_JOB_ID:-0}-rank\${SLURM_PROCID:-0}
         mkdir -p \"\$DG_JIT_CACHE_DIR\"
         echo \"[k3] DG_JIT_CACHE_DIR=\$DG_JIT_CACHE_DIR\"
 
