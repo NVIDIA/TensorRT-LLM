@@ -200,7 +200,6 @@ def _make_single_token_context_graph_batch(
             or request.context_current_position + 1 != request.py_prompt_len
             or request.py_beam_width != 1
             or get_draft_token_length(request) > 0
-            or request.py_is_first_draft
             or request.is_context_only_request
             or request.is_generation_only_request
             or request.py_disaggregated_params is not None
@@ -219,7 +218,6 @@ def _make_single_token_context_graph_batch(
         if (
             request.py_beam_width != 1
             or get_draft_token_length(request) > 0
-            or request.py_is_first_draft
             or request.py_disaggregated_params is not None
         ):
             return scheduled_requests, frozenset()
@@ -838,9 +836,19 @@ class DecoderRunner(ScheduledModelRunner):
                     gc.collect()
                     torch.cuda.empty_cache()
 
-        # Helix CP is decode-only and runs into issues with the
-        # autotuner warmup's context requests.
-        if self._context_warmups_supported and not self.mapping.has_cp_helix():
+        # Helix CP is decode-only, so it tunes on generation requests.
+        if self._context_warmups_supported and self.mapping.has_cp_helix():
+            with (
+                self._warmup_timer.phase(
+                    "autotuner", metrics=self._metrics, metric_name="autotuner_warmup_seconds"
+                ),
+                self._maybe_bypass_torch_compile(bypass=True),
+            ):
+                self._run_autotuner_warmup(resource_manager, generation_only=True)
+            log_mem_snapshot("warmup/after_autotuner")
+            gc.collect()
+            torch.cuda.empty_cache()
+        elif self._context_warmups_supported:
             with (
                 self._warmup_timer.phase(
                     "autotuner", metrics=self._metrics, metric_name="autotuner_warmup_seconds"
@@ -1513,8 +1521,14 @@ class DecoderRunner(ScheduledModelRunner):
         if release_megamoe_scratch is not None:
             release_megamoe_scratch()
 
-    def _run_autotuner_warmup(self, resource_manager: ResourceManager) -> None:
-        """Runs forward passes to populate the autotuner cache."""
+    def _run_autotuner_warmup(
+        self, resource_manager: ResourceManager, generation_only: bool = False
+    ) -> None:
+        """Runs forward passes to populate the autotuner cache.
+
+        ``generation_only`` tunes on one batch of ``max_batch_size`` generation
+        requests instead of a context batch, for Helix CP generation workers.
+        """
         from tensorrt_llm._torch.custom_ops.torch_custom_ops import (
             IS_FLASHINFER_MXFP8_CUTE_DSL_AVAILABLE,
             MXFP8GemmRunner,
@@ -1608,14 +1622,22 @@ class DecoderRunner(ScheduledModelRunner):
         enable_native_mxfp8_autotuner = bool(native_mxfp8_methods)
 
         kv_cache_manager = resource_manager.get_resource_manager(self.kv_cache_manager_key)
-        token_num_upper_bound = min(
-            self._config.max_num_tokens,
-            self._config.max_batch_size * (self._config.max_seq_len - 1),
-        )
-        curr_max_num_tokens = kv_cache_manager.get_num_available_tokens(
-            token_num_upper_bound=token_num_upper_bound,
-            max_num_draft_tokens=self._config.original_max_draft_len,
-        )
+        if generation_only:
+            tokens_per_gen_request = 1 + self._config.max_total_draft_tokens
+            num_gen_requests = min(
+                self._config.max_batch_size,
+                self._config.max_num_tokens // tokens_per_gen_request,
+            )
+            curr_max_num_tokens = num_gen_requests * tokens_per_gen_request
+        else:
+            token_num_upper_bound = min(
+                self._config.max_num_tokens,
+                self._config.max_batch_size * (self._config.max_seq_len - 1),
+            )
+            curr_max_num_tokens = kv_cache_manager.get_num_available_tokens(
+                token_num_upper_bound=token_num_upper_bound,
+                max_num_draft_tokens=self._config.original_max_draft_len,
+            )
 
         # The warmup runs again after the KV cache is rebuilt; when the token
         # shape is unchanged and no MXFP8 tuning is pending, the profiling
@@ -1645,10 +1667,13 @@ class DecoderRunner(ScheduledModelRunner):
             f"FlashInfer MXFP8={enable_flashinfer_mxfp8_autotuner})..."
         )
 
-        warmup_configs = [(curr_max_num_tokens, 0)]
-        if self.guided_decoder is None and not self.mapping.has_pp():
-            # Add generation request to warmup the autotuner cache.
-            warmup_configs.append((1 + self._config.max_total_draft_tokens, 1))
+        if generation_only:
+            warmup_configs = [(curr_max_num_tokens, num_gen_requests)]
+        else:
+            warmup_configs = [(curr_max_num_tokens, 0)]
+            if self.guided_decoder is None and not self.mapping.has_pp():
+                # Add generation request to warmup the autotuner cache.
+                warmup_configs.append((1 + self._config.max_total_draft_tokens, 1))
 
         def run_autotuner_pass(autotune_context: Any, synchronize_trtllm_cache: bool) -> bool:
             """Run one isolated tuning pass with fresh synthetic batches."""
@@ -3605,7 +3630,6 @@ class DecoderRunner(ScheduledModelRunner):
         extend_requests = []
         extend_dummy_requests = []
         generation_requests = []
-        first_draft_requests = []
         # Collect generation request IDs during categorization to avoid
         # a separate iteration over scheduled_requests.generation_requests later.
         all_gen_request_ids = []
@@ -3635,8 +3659,6 @@ class DecoderRunner(ScheduledModelRunner):
                     extend_dummy_requests.append(request)
                 else:
                     extend_requests.append(request)
-            elif request.py_is_first_draft:
-                first_draft_requests.append(request)
             else:
                 generation_requests.append(request)
         extend_requests += extend_dummy_requests
@@ -3823,35 +3845,6 @@ class DecoderRunner(ScheduledModelRunner):
                     prompt_lengths.append(request.py_prompt_len)
 
             extra_inputs.add_generation_request(request)
-
-        for request in first_draft_requests:
-            request_ids.append(request.py_request_id)
-            draft_lens.append(0)
-            # Only the length and the last (original_max_draft_len+1) tokens are
-            # needed here; get_num_tokens is O(1) and get_tokens_range copies only
-            # the requested window, whereas get_tokens(0) marshals the whole
-            # O(seq_len) VecTokens into a Python list.
-            _num_tokens = request.get_num_tokens(0)
-            begin_compute = _num_tokens - self._config.original_max_draft_len - 1
-            end_compute = begin_compute + self._config.original_max_draft_len + 1
-            prompt_tokens = request.get_tokens_range(0, begin_compute, end_compute)
-            position_ids.extend(range(begin_compute, begin_compute + len(prompt_tokens)))
-            input_ids.extend(prompt_tokens)
-            gather_ids.append(
-                len(input_ids)
-                - 1
-                - (self._config.original_max_draft_len - request.py_num_accepted_draft_tokens)
-            )
-            num_accepted_draft_tokens.append(request.py_num_accepted_draft_tokens)
-
-            sequence_lengths.append(1 + self._config.original_max_draft_len)
-            prompt_lengths.append(request.py_prompt_len)
-            past_seen_token_num = begin_compute
-            num_cached_tokens_per_seq.append(past_seen_token_num - request.py_num_compressed_tokens)
-            extra_inputs.add_generation_request(request)
-
-            # update batch index
-            request.py_batch_idx = request.py_seq_slot
 
         # Cache invariant method result to avoid repeated calls per-request
         _n_gen = len(generation_requests)
@@ -4521,12 +4514,7 @@ class DecoderRunner(ScheduledModelRunner):
                 total_num_tokens=total_num_tokens,
             )
 
-        num_generation_tokens = (
-            len(generation_requests)
-            + len(extend_requests)
-            + sum(draft_lens)
-            + len(first_draft_requests)
-        )
+        num_generation_tokens = len(generation_requests) + len(extend_requests) + sum(draft_lens)
         self.iter_states["num_ctx_requests"] = num_ctx_requests
         self.iter_states["num_ctx_tokens"] = num_ctx_tokens
         self.iter_states["num_generation_tokens"] = num_generation_tokens
@@ -4538,7 +4526,6 @@ class DecoderRunner(ScheduledModelRunner):
                 (
                     (scheduled_requests.context_requests, 1),
                     (extend_requests, 1),
-                    (first_draft_requests, 1),
                     (generation_requests, beam_width if generation_requests else 1),
                 ),
             )
@@ -4572,7 +4559,6 @@ class DecoderRunner(ScheduledModelRunner):
                 and not _has_cp_helix
                 and num_ctx_requests == 0
                 and not extend_requests
-                and not first_draft_requests
                 and _n_gen > 0
                 and previous_batch_len == _n_gen
                 and num_tokens == 0

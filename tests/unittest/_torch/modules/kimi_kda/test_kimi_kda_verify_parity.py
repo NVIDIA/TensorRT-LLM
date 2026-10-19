@@ -113,6 +113,7 @@ def test_forward_uses_metadata_aligned_generation_state_indices(
         ssm_pool: torch.Tensor,
         slot_indices: torch.Tensor,
         output: torch.Tensor | None = None,
+        allow_prequantized_output: bool = False,
     ) -> torch.Tensor:
         captured["slot_indices"] = slot_indices
         return torch.zeros_like(hidden_states)

@@ -2059,25 +2059,41 @@ class AutoTuner:
             f"[AutoTuner] Whether using distributed tuning: {self._is_distributed()}"
         )
 
+    def _tuning_group(self) -> Tuple[int, int]:
+        """Return ``(size, index)`` of this rank's tuning group.
+
+        The group is the TP group. Helix CP ranks run the same SPMD forward
+        on the same token batch, so Helix adds the CP ranks too. Otherwise a
+        Helix generation worker with ``tp_size == 1`` would profile every
+        tactic on every CP rank. The index matches the TP-major, CP-minor
+        order of ``Distributed.tp_cp_allgather``, which merges the results.
+        """
+        if self.mapping is None:
+            return 1, 0
+        size = self.mapping.tp_size
+        index = self.mapping.tp_rank
+        if self.mapping.has_cp_helix():
+            size *= self.mapping.cp_size
+            index = index * self.mapping.cp_size + self.mapping.cp_rank
+        return size, index
+
     def _is_distributed(self) -> bool:
         """Check if we're in a distributed environment."""
-        return self.mapping is not None and self.mapping.tp_size > 1 and self._dist is not None
+        return self._dist is not None and self._tuning_group()[0] > 1
 
     def _maybe_parallelize_tactics(
             self, all_valid_tactics: List[Any],
             strategy: DistributedTuningStrategy) -> List[Any]:
-        """Parallelize tactics across all TP ranks if strategy is PARALLEL."""
+        """Split tactics across the tuning group if strategy is PARALLEL."""
         if strategy == DistributedTuningStrategy.PARALLEL and self._is_distributed(
         ):
-            # only distribute across TP ranks
-            # each TP rank will only tune the tactics that are assigned to it
-            tp_size = self.mapping.tp_size
-            tp_rank = self.mapping.tp_rank
-            valid_tactics = []
-            for idx, tactic in enumerate(all_valid_tactics):
-                if idx % tp_size == tp_rank:
-                    valid_tactics.append(tactic)
-            return valid_tactics
+            # Each rank of the tuning group only tunes its share of tactics;
+            # _merge_cache_data then keeps the fastest across the group.
+            group_size, group_index = self._tuning_group()
+            return [
+                tactic for idx, tactic in enumerate(all_valid_tactics)
+                if idx % group_size == group_index
+            ]
         else:
             return all_valid_tactics
 

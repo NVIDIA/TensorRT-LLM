@@ -401,7 +401,6 @@ def _make_manager_for_cache_tier_test(
 
     module = "tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2"
     with (
-        patch(f"{module}.CuError", _CacheTierInitError),
         patch(f"{module}.IndexMapper"),
         patch(f"{module}.KVCacheManagerPy", impl_constructor),
         patch.object(KVCacheManagerV2, "_build_base_config", build_base_config),
@@ -482,42 +481,41 @@ def test_buffered_events_receive_vocab_size(
     assert impl_constructor.call_args.kwargs["event_manager"] is manager.event_manager
 
 
-def _multi_rank_host_fallback_consensus_worker() -> tuple[int, int, int, bool]:
-    """Exercise the real world collective from an MPI worker."""
+def _multi_rank_host_failure_consensus_worker() -> tuple[int, int, bool, int]:
+    """Exercise the real world collective from an MPI worker.
+
+    Only rank 1 fails to build the host tier. Every rank must still raise: a
+    rank that returned a working manager while another aborted would leave the
+    job half-initialized and hang on the next collective.
+    """
     from tensorrt_llm._utils import mpi_rank, mpi_world_size
 
     rank = mpi_rank()
     world_size = mpi_world_size()
-    initial_impl = Mock()
-    fallback_impl = Mock()
+    local_impl = Mock()
     impl_side_effect: list[object] = (
-        [initial_impl, fallback_impl]
-        if rank == 0
-        else [_CacheTierInitError("rank-local host tier failure"), fallback_impl]
+        [local_impl] if rank == 0 else [_CacheTierInitError("rank-local host tier failure")]
     )
 
-    manager, impl_constructor = _make_manager_for_cache_tier_test(
-        KvCacheConfig(
-            max_gpu_total_bytes=16 << 20,
-            host_cache_size=16 << 20,
-        ),
-        impl_side_effect,
-        mapping=Mapping(
-            world_size=world_size,
-            rank=rank,
-            tp_size=world_size,
-        ),
-    )
+    raised = False
+    try:
+        _make_manager_for_cache_tier_test(
+            KvCacheConfig(
+                max_gpu_total_bytes=16 << 20,
+                host_cache_size=16 << 20,
+            ),
+            impl_side_effect,
+            mapping=Mapping(
+                world_size=world_size,
+                rank=rank,
+                tp_size=world_size,
+            ),
+        )
+    except Exception:
+        raised = True
 
-    return (
-        rank,
-        impl_constructor.call_count,
-        initial_impl.shutdown.call_count,
-        any(
-            isinstance(tier, HostCacheTierConfig)
-            for tier in manager.kv_cache_manager_py_config.cache_tiers
-        ),
-    )
+    # The rank that succeeded must also release what it built.
+    return (rank, world_size, raised, local_impl.shutdown.call_count)
 
 
 def test_base_config_uses_local_attention_window_order() -> None:
@@ -1121,73 +1119,40 @@ def test_disk_init_failure_does_not_use_host_fallback(tmp_path) -> None:
 def test_kv_cache_manager_init_status_sync_uses_world_max() -> None:
     mapping = SimpleNamespace(world_size=2)
     dist = Mock()
-    dist.allreduce.return_value = int(_KVCacheManagerInitStatus.USE_NO_HOST)
+    dist.allreduce.return_value = int(_KVCacheManagerInitStatus.ABORT)
 
     with patch.object(Distributed, "get", return_value=dist):
-        status = _sync_kv_cache_manager_init_status(_KVCacheManagerInitStatus.KEEP_HOST, mapping)
+        status = _sync_kv_cache_manager_init_status(_KVCacheManagerInitStatus.OK, mapping)
 
-    assert status == _KVCacheManagerInitStatus.USE_NO_HOST
-    dist.allreduce.assert_called_once_with(
-        int(_KVCacheManagerInitStatus.KEEP_HOST), op=ReduceOp.MAX
-    )
+    assert status == _KVCacheManagerInitStatus.ABORT
+    dist.allreduce.assert_called_once_with(int(_KVCacheManagerInitStatus.OK), op=ReduceOp.MAX)
 
 
 @pytest.mark.cpu_only
 @pytest.mark.skipif(not ENABLE_MULTI_DEVICE, reason="multi-device (MPI) build required")
-def test_world_ranks_converge_on_hostless_fallback() -> None:
+def test_world_ranks_converge_on_host_failure() -> None:
     from tensorrt_llm.llmapi.mpi_session import MpiPoolSession
 
     session = MpiPoolSession(n_workers=2)
     try:
-        results = session.submit_sync(_multi_rank_host_fallback_consensus_worker)
+        results = session.submit_sync(_multi_rank_host_failure_consensus_worker)
     finally:
         session.shutdown()
 
-    assert sorted(results) == [(0, 2, 1, False), (1, 2, 0, False)]
+    # Rank 1 failed locally; rank 0 succeeded and must abort with it, after
+    # shutting down the manager it had already built.
+    assert sorted(results) == [(0, 2, True, 1), (1, 2, True, 0)]
 
 
-def test_local_fallback_failure_is_shared_before_raising() -> None:
+def test_peer_init_failure_discards_local_candidate() -> None:
+    """A rank whose own init succeeded still aborts, and releases what it built."""
+    local_impl = Mock()
     module = "tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2"
 
     with (
         patch(
             f"{module}._sync_kv_cache_manager_init_status",
-            side_effect=[
-                _KVCacheManagerInitStatus.USE_NO_HOST,
-                _KVCacheManagerInitStatus.ABORT,
-            ],
-        ) as sync_status,
-        pytest.raises(RuntimeError, match="fallback init failed"),
-    ):
-        _make_manager_for_cache_tier_test(
-            KvCacheConfig(
-                max_gpu_total_bytes=16 << 20,
-                host_cache_size=16 << 20,
-            ),
-            [
-                _CacheTierInitError("host tier init failed"),
-                RuntimeError("fallback init failed"),
-            ],
-        )
-
-    assert [call.args[0] for call in sync_status.call_args_list] == [
-        _KVCacheManagerInitStatus.USE_NO_HOST,
-        _KVCacheManagerInitStatus.ABORT,
-    ]
-
-
-def test_peer_fallback_failure_discards_local_candidate() -> None:
-    initial_impl = Mock()
-    fallback_impl = Mock()
-    module = "tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2"
-
-    with (
-        patch(
-            f"{module}._sync_kv_cache_manager_init_status",
-            side_effect=[
-                _KVCacheManagerInitStatus.USE_NO_HOST,
-                _KVCacheManagerInitStatus.ABORT,
-            ],
+            return_value=_KVCacheManagerInitStatus.ABORT,
         ),
         pytest.raises(RuntimeError, match="failed on another rank"),
     ):
@@ -1196,94 +1161,45 @@ def test_peer_fallback_failure_discards_local_candidate() -> None:
                 max_gpu_total_bytes=16 << 20,
                 host_cache_size=16 << 20,
             ),
-            [initial_impl, fallback_impl],
+            [local_impl],
         )
 
-    initial_impl.shutdown.assert_called_once_with()
-    fallback_impl.shutdown.assert_called_once_with()
+    local_impl.shutdown.assert_called_once_with()
 
 
-@pytest.mark.parametrize(
-    ("add_secondary_gpu_tier", "expected_can_evict"),
-    [(False, False), (True, True)],
-)
-def test_host_init_fallback_recomputes_eviction_capability(
-    add_secondary_gpu_tier: bool,
-    expected_can_evict: bool,
-) -> None:
-    impl = Mock()
-    manager, impl_constructor = _make_manager_for_cache_tier_test(
-        KvCacheConfig(
-            max_gpu_total_bytes=16 << 20,
-            host_cache_size=16 << 20,
-        ),
-        [_CacheTierInitError("host tier init failed"), impl],
-        add_secondary_gpu_tier=add_secondary_gpu_tier,
-    )
+@pytest.mark.parametrize("add_secondary_gpu_tier", [False, True])
+def test_host_init_failure_propagates_without_rebuilding(add_secondary_gpu_tier: bool) -> None:
+    """A configured host tier is honoured or the manager does not come up.
 
-    assert manager.can_evict is expected_can_evict
-    assert impl_constructor.call_count == 2
-    initial_tiers = impl_constructor.call_args_list[0].args[0].cache_tiers
-    fallback_tiers = impl_constructor.call_args_list[1].args[0].cache_tiers
-    assert any(isinstance(tier, HostCacheTierConfig) for tier in initial_tiers)
-    assert all(isinstance(tier, GpuCacheTierConfig) for tier in fallback_tiers)
-    assert len(fallback_tiers) == 1 + int(add_secondary_gpu_tier)
+    Dropping the tier and rebuilding would run the job on a cache other than the
+    one asked for. The construction is attempted exactly once.
+    """
+    # A second impl is offered: if the host tier were dropped and construction
+    # retried, that retry would succeed and nothing would be raised. The error
+    # escaping is what shows the retry did not happen.
+    with pytest.raises(_CacheTierInitError, match="host tier init failed"):
+        _make_manager_for_cache_tier_test(
+            KvCacheConfig(
+                max_gpu_total_bytes=16 << 20,
+                host_cache_size=16 << 20,
+            ),
+            [_CacheTierInitError("host tier init failed"), Mock()],
+            add_secondary_gpu_tier=add_secondary_gpu_tier,
+        )
 
 
-def test_host_init_fallback_drops_only_host_tier(tmp_path) -> None:
-    impl = Mock()
-    manager, impl_constructor = _make_manager_for_cache_tier_test(
-        KvCacheConfig(
-            max_gpu_total_bytes=16 << 20,
-            host_cache_size=16 << 20,
-            disk_cache_size=16 << 20,
-            disk_cache_path=str(tmp_path),
-        ),
-        [_CacheTierInitError("host tier init failed"), impl],
-    )
-
-    assert manager.can_evict
-    assert impl_constructor.call_count == 2
-    initial_tiers = impl_constructor.call_args_list[0].args[0].cache_tiers
-    fallback_tiers = impl_constructor.call_args_list[1].args[0].cache_tiers
-    assert [type(tier) for tier in initial_tiers] == [
-        GpuCacheTierConfig,
-        HostCacheTierConfig,
-        DiskCacheTierConfig,
-    ]
-    assert [type(tier) for tier in fallback_tiers] == [
-        GpuCacheTierConfig,
-        DiskCacheTierConfig,
-    ]
-
-
-@pytest.mark.cpu_only
-def test_host_init_fallback_recreates_cold_codec_and_keeps_disk(tmp_path) -> None:
-    impl = Mock()
-    codecs = [object(), object()]
-    codec_provider = Mock()
-    codec_provider.create_cold_page_codec.side_effect = codecs
-    manager, impl_constructor = _make_manager_for_cache_tier_test(
-        KvCacheConfig(
-            max_gpu_total_bytes=16 << 20,
-            host_cache_size=16 << 20,
-            disk_cache_size=16 << 20,
-            disk_cache_path=str(tmp_path),
-        ),
-        [_CacheTierInitError("host tier init failed"), impl],
-        cold_page_codec_provider=codec_provider,
-    )
-
-    assert manager.can_evict
-    assert codec_provider.create_cold_page_codec.call_count == 2
-    assert impl_constructor.call_count == 2
-    assert impl_constructor.call_args_list[0].kwargs["cold_page_codec"] is codecs[0]
-    assert impl_constructor.call_args_list[1].kwargs["cold_page_codec"] is codecs[1]
-    fallback_tiers = impl_constructor.call_args_list[1].args[0].cache_tiers
-    assert [type(tier) for tier in fallback_tiers] == [
-        GpuCacheTierConfig,
-        DiskCacheTierConfig,
-    ]
+def test_host_init_failure_propagates_with_disk_tier(tmp_path) -> None:
+    """The disk tier is no reason to retry without the host tier either."""
+    with pytest.raises(_CacheTierInitError, match="host tier init failed"):
+        _make_manager_for_cache_tier_test(
+            KvCacheConfig(
+                max_gpu_total_bytes=16 << 20,
+                host_cache_size=16 << 20,
+                disk_cache_size=16 << 20,
+                disk_cache_path=str(tmp_path),
+            ),
+            [_CacheTierInitError("host tier init failed"), Mock()],
+        )
 
 
 @pytest.mark.cpu_only
