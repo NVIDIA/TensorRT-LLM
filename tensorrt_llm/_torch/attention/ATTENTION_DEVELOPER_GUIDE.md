@@ -224,6 +224,11 @@ routes, and optional token-validity bits mask ragged KV tails. Plans contain
 only static format, proxy, geometry, and capacity choices; every run receives
 the live routes, summaries, validity bits, page tables, and sequence lengths.
 
+Both `k_summary` and `v_summary` are arithmetic means over the tokens present
+in each KV block, excluding padding in a partial final block. The kernel
+weights each proxy by its represented token count; do not pass V sums or
+pre-weight the summaries.
+
 `PrimsTSBlockSparseFmha` owns its wrapper-plan cache by default. Integrations
 whose attention layers execute serially may explicitly bind a model-scoped
 cache to reuse graph-stable route workspaces across compatible layers. The
