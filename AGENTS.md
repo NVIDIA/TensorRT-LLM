@@ -195,38 +195,10 @@ historical implementation details.
 
 ### Vendor source tools and promotion
 
-Use `scripts/vendor/manage.py` for lock/vendor-state changes and
-`scripts/vendor/promote.py promote` for lock-only promotion after a source-update
-PR merges. Select the vendor, upstream, and canonical fork/branch explicitly.
-Manual publication uses `--publish --auto-merge`; dry-run is the default.
-`scripts/vendor/bot.py run` provides an optional local monitor with `--workdir`,
-`--daemon`, and opt-in `--publish`. Do not launch a publishing daemon unless the
-user requested ongoing automation. Never commit operator credentials or runtime
-state. The bot asks the PR author to correct metadata or ambiguous attribution;
-it never approves code merely because metadata passes. Use the entry points
-under `scripts/vendor/`; no legacy script wrappers are provided. See
-`scripts/vendor/README.md` and `3rdparty/vendor-sources.md`. Preserve structured
-promotion provenance and DCO sign-off in the final squash message. CI skip applies
-only to verified lock-only promotions, not changes to these tools.
-Git/GitHub promotion commits are authoritative; SQLite is a disposable cache.
-After cache loss, stop the old process and relaunch with the same operator/config.
-Cold discovery backfills merged PRs; `--since` explicitly limits that history.
-After a canonical-branch refresh merges, stop the bot and reuse its workdir with
-the new `--canonical-branch` plus `--migrate-canonical-branch-from OLD_BRANCH`.
-Start with `--once` without `--publish`; migration verifies the merged lock,
-blocks unresolved old promotions, and atomically archives branch-dependent cache
-results before rediscovery. Other identity changes still require another workdir.
-Each monitor handles one consumer base branch (`--base-branch`, default `main`);
-use separate workdirs for main and release monitors. Launching one never enables
-the other. Before a refresh PR, stop its monitor or restart with the explicitly
-audited `--refresh-branch NEW_BRANCH` in the configured canonical repository.
-This repeatable option excludes refresh PRs from promotion; it does not authorize
-publication to a new branch. After merge, the explicit migration is still required.
-Migration checks ignore promotion records for other consumer repositories/bases.
-After cache loss, use the new configuration without the migration flag.
-For monitoring, use INFO poll summaries/30-second active-operation heartbeats
-and `bot.py status --workdir ...`. Check the last poll outcome and next deadline;
-the process lock and heartbeat alone do not establish successful reconciliation.
+Use the tools under `scripts/vendor/` to manage locked vendor sources, prepare
+lock-only promotions, and optionally monitor source-update PRs. Read
+[Vendored Sources](3rdparty/vendor-sources.md) for commands, contributor metadata,
+and operator guidance before changing vendor state or publishing promotions.
 
 ### Triggering CI
 
