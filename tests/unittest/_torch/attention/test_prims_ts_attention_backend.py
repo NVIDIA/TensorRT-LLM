@@ -1467,6 +1467,7 @@ def _check_prims_ts_compact_query(
     head_dim: int,
     total_q: int,
     storage_offset_rows: int = 0,
+    plan_total_q: int | None = None,
 ) -> None:
     from tensorrt_llm._torch.attention.backends.prims_ts import (
         BatchPrefillPagedTSWrapper,
@@ -1476,6 +1477,10 @@ def _check_prims_ts_compact_query(
     torch.manual_seed(0)
     device = torch.device("cuda")
     num_qo_heads, num_kv_heads, page_size = 8, 2, 32
+    # Equal plan bounds share one compiled kernel across Q sizes, which keeps
+    # JIT time down and makes the kernel choose the descriptor path at run time.
+    plan_total_q = plan_total_q or total_q
+    assert plan_total_q >= total_q
     q_lengths = [3, total_q - 4, 1]
     kv_lengths = [33, total_q + 28, 17]
     q_offsets = [0, 3, total_q - 1, total_q]
@@ -1503,8 +1508,8 @@ def _check_prims_ts_compact_query(
     plan_args = {
         "device": device,
         "batch_size": len(q_lengths),
-        "max_seq_len_q": max(q_lengths),
-        "max_kv_len": max(kv_lengths),
+        "max_seq_len_q": plan_total_q - 4,
+        "max_kv_len": plan_total_q + 28,
         "num_qo_heads": num_qo_heads,
         "num_kv_heads": num_kv_heads,
         "head_dim": head_dim,
@@ -1515,7 +1520,7 @@ def _check_prims_ts_compact_query(
         "mask_type": "causal",
     }
     if paged:
-        max_pages = math.ceil(max(kv_lengths) / page_size)
+        max_pages = math.ceil(plan_args["max_kv_len"] / page_size)
         cache_shape = (len(q_lengths) * max_pages, num_kv_heads, page_size, head_dim)
         k_cache = torch.zeros(cache_shape, device=device, dtype=dtype)
         v_cache = torch.zeros_like(k_cache)
@@ -1564,12 +1569,19 @@ def test_prims_ts_context_compact_query_boundary(
     paged: bool, delta: int, dtype: torch.dtype, head_dim: int, boundary_q: int
 ) -> None:
     # These compact Q tensors span just below, at, and above 128 KiB.
-    _check_prims_ts_compact_query(paged, dtype, head_dim, boundary_q + delta)
+    _check_prims_ts_compact_query(
+        paged, dtype, head_dim, boundary_q + delta, plan_total_q=boundary_q + 1
+    )
 
 
 def test_prims_ts_context_compact_query_storage_offset() -> None:
     _check_prims_ts_compact_query(
-        paged=False, dtype=torch.bfloat16, head_dim=128, total_q=64, storage_offset_rows=1
+        paged=False,
+        dtype=torch.bfloat16,
+        head_dim=128,
+        total_q=64,
+        storage_offset_rows=1,
+        plan_total_q=65,
     )
 
 
