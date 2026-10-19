@@ -645,7 +645,7 @@ ENTRIES = {
     # up to 8 rows.
     "early_expert_ids": ({"early_ids"}, 4, 8),
     # qkv_prefetch's prefetch of the next QKV weight: at the forward's start and after the
-    # expert call of each layer whose boundary early_release converted (5), from 3 rows
+    # expert call of each layer whose boundary early_release converted (5), at the split-K QKV rows
     # (_expected_counts).
     "qkv_prefetch_prefetch": ({"qkv_prefetch"}, 6, 8),
     # split_kv on the full-attention layers, at up to 8 rows (prep_append's folded steps).

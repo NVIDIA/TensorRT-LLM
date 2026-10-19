@@ -103,9 +103,9 @@ and every replay must give the undelayed replay's bits.
   dispatcher, must leave the bits of the tier-3 / tier-4 target set and of that set with
   ``unpool_direct``. These tables add the delay site ``qkv_prefetch_L2`` (the prefetch's
   side stream, before layer 2's QKV prefetch), which the probe must find holding every
-  rank. At 3..8 rows each prefetch adds one programmatic edge (into its QKV GEMM) over the
-  same set's graph without it; a short prefill of 3 or 8 rows forks it after each
-  converted layer's experts.
+  rank. At the rows whose QKV kernel is split-K (3..8 on sm103, 4..8 on sm107) each prefetch
+  adds one programmatic edge (into its QKV GEMM) over the same set's graph without it; a
+  short prefill of such a width forks it after each converted layer's experts.
 * ``three_windows`` (``TIER3_ARMS`` + ``THREE_WINDOWS_ARMS``): the tier-3 target set and
   the ``moe_prologue`` chain with the third ring window, which regroups the expert
   partials as ``ring_buddy`` does, so these arms are their own references.
@@ -1995,7 +1995,7 @@ ENTRIES = {
     # early_ids: the expert kernel's early launches, on the four NVFP4 layers up to 8 rows.
     "early_expert_ids": ({"early_ids"}, 4, 8),
     # qkv_prefetch's prefetch of the next QKV weight: at the forward's start and after the
-    # expert call of each layer whose boundary early_release converted (5), from 3 rows
+    # expert call of each layer whose boundary early_release converted (5), at the split-K QKV rows
     # (_expected_counts).
     "qkv_prefetch_prefetch": ({"qkv_prefetch"}, 6, 8),
     # split_kv on the full-attention layers at up to 8 rows (combine_norm_gate takes their
@@ -2796,6 +2796,8 @@ def _short_prefill_problems(selection, short_counts: dict) -> list:
     """Where ``dense_gemms`` / ``gemm_prefetch`` (at most 8 rows) and ``ring_buddy`` (at most 16) did not act on a
     short prefill they take, or acted on one they do not."""
     selected = _selection(selection)
+    pdl_triggers = importlib.import_module(_PKG + ".kernels.boundary_early_release.triggers")
+    split_k_rows = pdl_triggers.weights_before_wait_rows(_served_qkv_kernels())
     problems = []
     for rows, counts in short_counts.items():
         short = _short_prefill_rows(rows)
@@ -2803,8 +2805,9 @@ def _short_prefill_problems(selection, short_counts: dict) -> list:
             "dense_gemm": bool(selected & {"dense_gemms", "gemm_prefetch"}) and short <= 8,
             "l2_prefetch": "gemm_prefetch" in selected and short <= 8,
             "ring_buddy_assign": bool(selected & _plans.LOADED) and short <= 16,
-            # After each converted layer's experts (no forward-start fork in a prefill).
-            "qkv_prefetch_prefetch": "qkv_prefetch" in selected and 3 <= short <= 8,
+            # After each converted layer's experts (no forward-start fork in a prefill), at the
+            # rows whose served QKV kernel is split-K.
+            "qkv_prefetch_prefetch": "qkv_prefetch" in selected and short in split_k_rows,
         }
         for entry, active in acting.items():
             if bool(counts.get(entry, 0)) != active:
