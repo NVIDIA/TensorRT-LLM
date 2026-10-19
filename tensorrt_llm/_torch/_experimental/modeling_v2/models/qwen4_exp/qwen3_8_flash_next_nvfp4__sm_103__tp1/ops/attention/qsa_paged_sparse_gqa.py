@@ -13,6 +13,9 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell
 # Approved exception: QSA's sparse path never reaches the thop attention op's
 # sparse argument group, so there is no torch.ops surface for this computation.
 from tensorrt_llm._torch.attention.backends.sparse.qsa.kernels import (
+    can_fuse_qsa_splitk_output_gate as _can_fuse_qsa_splitk_output_gate,
+)
+from tensorrt_llm._torch.attention.backends.sparse.qsa.kernels import (
     triton_qsa_paged_sparse_gqa as _triton_qsa_paged_sparse_gqa,
 )
 
@@ -27,7 +30,8 @@ _CHECKPOINT = dict(
     q_dtype=torch.bfloat16,
     # K and V are the two role planes of one [pages, 2, kv, tpb, D] pool.
     cache_layout="pool_planes",
-    # q is the first 24 heads of the packed [T, 24 + 2 + 2, 256] QKV buffer.
+    # q is the first 24 heads of the packed [T, 24 + 2 + 2, 256] QKV buffer;
+    # "fused_row" is the target's fused input projection row, 55 heads of 256.
     q_layout="qkv_slice",
     request_dtype=torch.int32,
     # The engine's table: 260 pages per slot, -1 past each sequence.
@@ -91,9 +95,20 @@ class QsaPagedSparseGqa(OpWrapper):
     silently truncated (measured: a planted index moving the right answer by
     0.77 moved the op's by nothing). The split-K kernel ignores the pair.
 
-    Fusion boundary: the block-table gather, scale, online softmax, P.V and
-    the split-K merge are inside. Deciding what to attend to, appending K/V to
-    the pool, and q's projection, norm, RoPE and output gate are not.
+    **The output gate rides the merge when `output_gate` is passed.** Each
+    merged head row is rounded to `q.dtype`, multiplied in fp32 by
+    `sigmoid(output_gate)` and rounded again: the arithmetic of the ungated
+    call followed by `fused_sigmoid_mul_inplace`. `output_gate` is `[rows,
+    Hq * D]` or `[rows, Hq, D]` in `q.dtype`, unit stride in its last dim, any
+    row stride (the gate columns of the fused projection row). Only a split-K
+    launch with more than one split has a merge to carry it; `fuses_output_gate`
+    says whether a call does, and the op raises `ValueError` if handed a gate
+    it cannot carry.
+
+    Fusion boundary: the block-table gather, scale, online softmax, P.V, the
+    split-K merge and, when passed, the output gate are inside. Deciding what
+    to attend to, appending K/V to the pool, and q's projection, norm and RoPE
+    are not.
     """
 
     ARCHS = frozenset({Arch.SM_103})
@@ -107,6 +122,22 @@ class QsaPagedSparseGqa(OpWrapper):
         Cell(
             why="decode: 4 requests x 1 row, split-K + merge, PDL",
             spec=_decode(((4000, 1), (4037, 1), (4074, 1), (4111, 1))),
+        ),
+        Cell(
+            why="decode: 1 row, gate off the fused row, in the merge, PDL",
+            spec=_decode(((4000, 1),), q_layout="fused_row", gate="fused_row"),
+        ),
+        Cell(
+            why="decode: 4 requests x 1 row, gate fused into the merge",
+            spec=_decode(tuple((4000 + 37 * i, 1) for i in range(4)), gate="fused_row"),
+        ),
+        Cell(
+            why="decode: 128 rows, 8-way split-K, gate fused into the merge",
+            spec=_decode(((600, 1),) * 128, q_layout="fused_row", slots=160, gate="fused_row"),
+        ),
+        Cell(
+            why="decode: 4 rows, a compact [rows, Hq, D] gate in the merge",
+            spec=_decode(((900, 1),) * 4, gate="heads"),
         ),
         Cell(
             why="decode MTP: 4 requests x 2 rows, split-K + merge",
@@ -221,6 +252,18 @@ class QsaPagedSparseGqa(OpWrapper):
             why="int64 request indices", spec=_decode(((1000, 2),) * 4, request_dtype=torch.int64)
         ),
         Cell(
+            why="q as the head slice of the fused projection row (55 x 256), decode",
+            spec=_decode(((900, 1),) * 4, q_layout="fused_row"),
+        ),
+        Cell(
+            why="q off the fused projection row (55 x 256), 128 decode rows",
+            spec=_decode(((600, 1),) * 128, q_layout="fused_row", slots=160),
+        ),
+        Cell(
+            why="q off the fused projection row (55 x 256), 8191-row prefill",
+            spec=_decode(((0, 8191),), launches=_PREFILL, prefill_pair=True, q_layout="fused_row"),
+        ),
+        Cell(
             why="standalone contiguous K and V buffers, contiguous q",
             spec=_decode(((900, 1),) * 4, cache_layout="contiguous", q_layout="contiguous"),
         ),
@@ -286,6 +329,7 @@ class QsaPagedSparseGqa(OpWrapper):
         softmax_scale: float,
         query_positions: Optional[torch.Tensor] = None,
         compress_ratio: Optional[int] = None,
+        output_gate: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         return _triton_qsa_paged_sparse_gqa(
             q=q,
@@ -298,7 +342,18 @@ class QsaPagedSparseGqa(OpWrapper):
             softmax_scale=softmax_scale,
             query_positions=query_positions,
             compress_ratio=compress_ratio,
+            output_gate=output_gate,
         )
+
+    @staticmethod
+    def fuses_output_gate(
+        q: torch.Tensor,
+        k_cache: torch.Tensor,
+        selected_tokens: torch.Tensor,
+        output_gate: torch.Tensor,
+    ) -> bool:
+        """Whether a call with these operands and no prefill pair carries `output_gate`."""
+        return _can_fuse_qsa_splitk_output_gate(q, k_cache, selected_tokens, output_gate)
 
     def reference(
         self,
@@ -313,8 +368,10 @@ class QsaPagedSparseGqa(OpWrapper):
         softmax_scale: float,
         query_positions: Optional[torch.Tensor] = None,
         compress_ratio: Optional[int] = None,
+        output_gate: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """fp32 sparse GQA over every resident selected token, rounded once.
+        """fp32 sparse GQA over every resident selected token, rounded once;
+        with `output_gate`, then gated in fp32 and rounded again.
 
         `query_positions` and `compress_ratio` are ignored: on a prefix-packed
         selection the prefill kernel's bound reads exactly the valid entries.
@@ -354,7 +411,10 @@ class QsaPagedSparseGqa(OpWrapper):
             weights = torch.nan_to_num(torch.softmax(scores, dim=-1), nan=0.0)
             pooled = torch.einsum("bhgk,bkhd->bhgd", weights, values)
             out[start:stop] = pooled.reshape(stop - start, num_q_heads, head_dim)
-        return out.to(q.dtype)
+        if output_gate is None:
+            return out.to(q.dtype)
+        gate = output_gate.reshape(rows, num_q_heads, head_dim).float()
+        return (out.to(q.dtype).float() * torch.sigmoid(gate)).to(q.dtype)
 
 
 qsa_paged_sparse_gqa = QsaPagedSparseGqa()

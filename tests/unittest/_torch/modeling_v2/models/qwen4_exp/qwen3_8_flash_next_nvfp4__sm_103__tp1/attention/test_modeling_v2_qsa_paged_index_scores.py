@@ -51,7 +51,7 @@ DEV = torch.device("cuda")
 #: The callable's own threshold: at or below it every call is row-wise.
 DECODE_ROW_LIMIT = 256
 #: Index heads must divide this into more than one row for the query tile.
-DOT_TILE_WIDTH = 16
+DOT_TILE_WIDTH = 128
 CAPTURE_PAGES = 260
 
 
@@ -358,6 +358,78 @@ def test_both_modes_agree_on_the_visible_columns() -> None:
     unspecified = op(**{**args, "only_visible_blocks": True})
     visible = _visible(args)
     assert torch.equal(padded[visible], unspecified[visible])
+
+
+def test_pdl_launch_is_bitwise_the_plain_one_and_reads_after_the_wait() -> None:
+    """`use_pdl` changes the launch, not the result; under graph replay a producer rewrites
+    q right before the op, and a read of it before the wait would see the previous
+    replay's."""
+    args = _build(_case(4, 4, only_visible_blocks=True), seed=313)
+    visible = _visible(args)
+    plain = op(**args)
+    assert torch.equal(op(**{**args, "use_pdl": True})[visible], plain[visible])
+    src = args["q"].clone()
+
+    def step():
+        args["q"].copy_(src * 1.0)
+        return op(**{**args, "use_pdl": True})
+
+    warmup = torch.cuda.Stream()
+    warmup.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(warmup):
+        step()
+    torch.cuda.current_stream().wait_stream(warmup)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graph_out = step()
+    for trial in range(3):
+        src.copy_(_build(_case(4, 4, only_visible_blocks=True), seed=314 + trial)["q"])
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(graph_out[visible], op(**args)[visible]), f"replay {trial}"
+
+
+def test_prefetch_reads_the_fresh_anchor_key_and_q_after_the_wait() -> None:
+    """`prefetch` reads pages and keys before the PDL wait. Under graph replay a producer
+    rewrites q and, at rows whose position ends a group, the last visible block's anchor
+    key -- what the decode prologue writes -- right before the op; both must be seen.
+    The other keys are static, as they are in the decode step."""
+    args = _build(_case(4, 4, only_visible_blocks=True), seed=411)
+    cr, tpb = args["compress_ratio"], args["tokens_per_block"]
+    pos = args["query_positions"].clone()
+    assert bool((pos >= cr).all())
+    ends = torch.tensor([True, False, True, True], device=DEV)
+    args["query_positions"] = torch.where(ends, pos - (pos + 1) % cr, pos).to(pos.dtype)
+    pos = args["query_positions"].long()
+    assert bool(((pos + 1) % cr == 0).eq(ends).all())
+    pages = args["block_table"][args["request_indices"].long(), pos // tpb].long()
+    anchors = (pages[ends], (pos % tpb)[ends])
+    visible = _visible(args)
+    plain = op(**args)
+    assert torch.equal(op(**{**args, "use_pdl": True, "prefetch": True})[visible], plain[visible])
+    src_q = args["q"].clone()
+    src_k = args["index_cache"][anchors].clone()
+
+    def step():
+        args["q"].copy_(src_q * 1.0)
+        args["index_cache"][anchors] = src_k * 1.0
+        return op(**{**args, "use_pdl": True, "prefetch": True})
+
+    warmup = torch.cuda.Stream()
+    warmup.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(warmup):
+        step()
+    torch.cuda.current_stream().wait_stream(warmup)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graph_out = step()
+    for trial in range(3):
+        fresh = _build(_case(4, 4, only_visible_blocks=True), seed=412 + trial)
+        src_q.copy_(fresh["q"])
+        src_k.copy_(torch.randn(src_k.shape, device=DEV).to(src_k.dtype))
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(graph_out[visible], op(**args)[visible]), f"replay {trial}"
 
 
 def test_capture_shape_survives_cuda_graph_capture_and_replay() -> None:

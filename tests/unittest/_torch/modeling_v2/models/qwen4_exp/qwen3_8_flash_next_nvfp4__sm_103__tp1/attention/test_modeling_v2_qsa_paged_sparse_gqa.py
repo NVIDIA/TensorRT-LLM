@@ -20,6 +20,9 @@ import re
 import pytest
 import torch
 
+from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.activation.fused_sigmoid_mul_inplace import (  # noqa: E501
+    fused_sigmoid_mul_inplace,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.attention.qsa_paged_sparse_gqa import (  # noqa: E501
     qsa_paged_sparse_gqa as op,
 )
@@ -179,8 +182,9 @@ def _build(spec, seed):
         k_cache, v_cache = k_cache.contiguous(), v_cache.contiguous()
 
     q_dtype = spec["q_dtype"]
-    if spec["q_layout"] == "qkv_slice":
-        qkv = torch.randn(rows, q_heads + 2 * kv, d, generator=gen, device=DEV).to(q_dtype)
+    if spec["q_layout"] in ("qkv_slice", "fused_row"):
+        row_heads = q_heads + 2 * kv if spec["q_layout"] == "qkv_slice" else 55
+        qkv = torch.randn(rows, row_heads, d, generator=gen, device=DEV).to(q_dtype)
         q = qkv[:, :q_heads]
     else:
         q = torch.randn(rows, q_heads, d, generator=gen, device=DEV).to(q_dtype)
@@ -195,6 +199,15 @@ def _build(spec, seed):
         request_indices[2] = slots + 67  # a request the table does not have
         block_table[:, 0] = -1  # every request's first page unmapped
 
+    gate = None
+    if spec.get("gate") == "fused_row":
+        # The gate columns of the target's fused projection row (55 heads of
+        # D): heads 28..51, after q, k and v.
+        fused = torch.randn(rows, 55 * d, generator=gen, device=DEV).to(q_dtype)
+        gate = fused[:, 28 * d : (28 + q_heads) * d]
+    elif spec.get("gate") == "heads":
+        gate = torch.randn(rows, q_heads, d, generator=gen, device=DEV).to(q_dtype)
+
     args = dict(
         q=q,
         k_cache=k_cache,
@@ -207,6 +220,8 @@ def _build(spec, seed):
     )
     if spec["prefill_pair"]:
         args.update(query_positions=positions, compress_ratio=spec["compress_ratio"])
+    if gate is not None:
+        args.update(output_gate=gate)
     return args, generation
 
 
@@ -367,6 +382,37 @@ def test_calls_are_bitwise_deterministic() -> None:
     """Including a 32-split launch whose merge is a second kernel."""
     args, _ = _build(_with(segments=tuple((4000 + 37 * i, 2) for i in range(4))), seed=8800)
     assert torch.equal(op(**args), op(**args))
+
+
+@pytest.mark.parametrize("rows", [1, 4, 128])
+def test_output_gate_in_the_merge_is_the_standalone_gate(rows) -> None:
+    """The gate carried by the merge equals the ungated call followed by the
+    standalone gate kernel, bit for bit, and the gate moves the output."""
+    spec = _with(segments=((4000, 1),) * rows, slots=rows + 32, q_layout="fused_row")
+    spec["gate"] = "fused_row"
+    args, _ = _build(spec, seed=8900 + rows)
+    gate = args.pop("output_gate")
+    assert op.fuses_output_gate(args["q"], args["k_cache"], args["selected_tokens"], gate)
+    ungated = op(**args)
+    gated = op(**args, output_gate=gate)
+    standalone = fused_sigmoid_mul_inplace(ungated.reshape(rows, -1).clone(), gate)
+    assert torch.equal(gated.reshape(rows, -1), standalone)
+    assert (gated.float() - ungated.float()).abs().max().item() > 0.1
+
+
+def test_output_gate_needs_a_merge() -> None:
+    """One split (300 rows) and the prefill kernel have no merge to carry the
+    gate: `fuses_output_gate` says so and the call refuses it."""
+    for spec in (
+        _with(segments=((600, 1),) * 300, slots=384),
+        _with(segments=((2032, 272),), prefill_pair=True),
+    ):
+        spec["gate"] = "heads"
+        args, _ = _build(spec, seed=9200)
+        gate = args["output_gate"]
+        assert not op.fuses_output_gate(args["q"], args["k_cache"], args["selected_tokens"], gate)
+        with pytest.raises(ValueError, match="output-gate fusion requires a compatible split-K"):
+            op(**args)
 
 
 def test_zero_rows_return_an_empty_output() -> None:

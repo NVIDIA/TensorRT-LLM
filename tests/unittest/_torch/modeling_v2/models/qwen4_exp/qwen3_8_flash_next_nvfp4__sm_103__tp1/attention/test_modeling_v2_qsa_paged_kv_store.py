@@ -97,10 +97,14 @@ def _build(spec, seed: int):
 
     rows = len(positions)
     qkv = torch.randn(
-        rows, spec["heads_q"] + 2 * hkv, head_dim, generator=gen, dtype=torch.float32
+        rows,
+        spec["heads_q"] + 2 * hkv + spec.get("row_pad_heads", 0),
+        head_dim,
+        generator=gen,
+        dtype=torch.float32,
     ).to(device=DEV, dtype=spec["row_dtype"])
     k = qkv[:, spec["heads_q"] : spec["heads_q"] + hkv]
-    v = qkv[:, spec["heads_q"] + hkv :]
+    v = qkv[:, spec["heads_q"] + hkv : spec["heads_q"] + 2 * hkv]
     if spec["values"] == "every_bf16":
         patterns = torch.arange(-(2**15), 2**15, dtype=torch.int32).to(torch.int16)
         patterns = patterns.view(torch.bfloat16).reshape(rows, hkv, head_dim).to(DEV)
