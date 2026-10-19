@@ -13,11 +13,9 @@ import triton.language as tl
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 
 # Approved exception (as for `qsa_paged_sparse_gqa`): QSA's sparse path has no torch.ops
-# surface; its split-K buckets and row-count PDL policy are reached as Python.
-from tensorrt_llm._torch.attention.backends.sparse.qsa.kernels import (
-    _qsa_pdl_enabled,
-    _qsa_splitk_launch_config,
-)
+# surface; its row-count PDL policy is reached as Python. The split-K buckets are this
+# entry's own: an NVFP4 tile needs 16 tokens where the bf16 one takes 64.
+from tensorrt_llm._torch.attention.backends.sparse.qsa.kernels import _qsa_pdl_enabled
 
 #: Base-2 online softmax: scores are scaled by log2(e) once.
 _LOG2_E = tl.constexpr(1.4426950408889634)
@@ -575,6 +573,30 @@ def _nvfp4_merge_splitk_kernel(
     tl.store(output + row * output_stride_row + head * output_stride_head + dim_offsets, merged)
 
 
+def _splitk_launch_config(
+    rows: int, num_kv_heads: int, selected_width: int
+) -> tuple[int, int, int]:
+    """(BLOCK_N, splits, warps) by programs = rows x Hkv. Always 16-token tiles: at D 256
+    a 64-token tile's dequantized fp32 K and V spill (GB300, 128 rows: 10.0 ms at 64 x 2
+    warps, 0.76 ms at 16 x 2 warps, 16 splits)."""
+    base_programs = rows * num_kv_heads
+    if base_programs <= 4:
+        block_n, target_splits, num_warps = 16, 64, 4
+    elif base_programs < 32:
+        block_n, target_splits, num_warps = 16, 32, 4
+    elif base_programs < 128:
+        block_n, target_splits, num_warps = 16, 16, 4
+    elif base_programs <= 256:
+        block_n, target_splits, num_warps = 16, 16, 2
+    elif base_programs <= 512:
+        block_n, target_splits, num_warps = 16, 8, 2
+    else:
+        block_n, target_splits, num_warps = 16, 1, 2
+    num_tiles = triton.cdiv(selected_width, block_n)
+    max_useful_splits = 1 << (num_tiles.bit_length() - 1)
+    return block_n, min(max_useful_splits, target_splits), num_warps
+
+
 def _sparse_gqa_nvfp4(
     *,
     q: torch.Tensor,
@@ -723,14 +745,16 @@ def _sparse_gqa_nvfp4(
             BLOCK_TOPK=token_topk // compress_ratio,
             COMPRESS_RATIO=compress_ratio,
             BLOCK_M=block_m,
-            BLOCK_N=64,
+            # 16-token tiles, 4 warps: wider tiles spill (16384 rows: 77 ms against 948 ms
+            # at 64 x 2 warps on GB300).
+            BLOCK_N=16,
             HEAD_DIM=head_dim,
-            num_warps=2,
+            num_warps=4,
             num_stages=2,
         )
         return output
 
-    block_n, num_splits, num_warps = _qsa_splitk_launch_config(
+    block_n, num_splits, num_warps = _splitk_launch_config(
         rows, num_kv_heads, selected_tokens.shape[1]
     )
     num_tiles = triton.cdiv(selected_tokens.shape[1], block_n)
@@ -882,11 +906,11 @@ class QsaPagedSparseGqaNvfp4(OpWrapper):
             spec=_decode(tuple((4000 + 37 * i, 3) for i in range(5))),
         ),
         Cell(
-            why="decode MTP draft 7: 16 requests x 8 rows (128 rows, 8-way)",
+            why="decode MTP draft 7: 16 requests x 8 rows (128 rows, 16-way)",
             spec=_decode(tuple((100 + (499 * g) % 8000, 8) for g in range(16))),
         ),
         Cell(
-            why="decode MTP draft 7: 32 x 8 = 256 rows, 512 programs (4-way top)",
+            why="decode MTP draft 7: 32 x 8 = 256 rows, 512 programs (8-way top)",
             spec=_decode(tuple((100 + (499 * g) % 8000, 8) for g in range(32))),
         ),
         Cell(
@@ -998,11 +1022,14 @@ class QsaPagedSparseGqaNvfp4(OpWrapper):
     prefill pair on every step, the decode forward never does; both pass `q` as
     the 24-head slice of the packed QKV row (row stride 7168).
 
-    Launch shapes at Hkv 2 (programs = rows x 2), as on the bf16 entry: split-K
-    64-way up to 2 rows, 32-way up to 15 (16-token tiles), 8-way up to 128 and
-    4-way up to 256 (64-token tiles), each followed by the merge; past 256 rows
-    the prefill kernel when the pair is passed, else one split and no merge.
-    The decode site reaches 256 rows at max_draft_len 7 (32 requests x 8).
+    Launch shapes at Hkv 2 (programs = rows x 2), all 16-token tiles: split-K
+    64-way up to 2 rows, 32-way up to 15, 16-way up to 128 and 8-way up to 256,
+    each followed by the merge; past 256 rows the prefill kernel when the pair
+    is passed, else one split and no merge. The decode site reaches 256 rows at
+    max_draft_len 7 (32 requests x 8). The bf16 entry's 64-token tiles at 2
+    warps hold a dequantized fp32 [256, 64] K tile and its V twin per program,
+    which spills: on GB300 the 64-token buckets ran 13x (decode, 128 rows) and
+    12x (prefill kernel, 16384 rows) slower than these.
 
     Equivalence: the test also runs QSA's bf16 sparse GQA over a bf16 pool
     holding the dequantized values; on every cell the two outputs agree within

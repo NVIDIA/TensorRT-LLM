@@ -146,6 +146,7 @@ from .ops.activation.silu_and_mul_rows import silu_and_mul_rows
 from .ops.attention.qsa_canonical_selection import qsa_canonical_selection
 from .ops.attention.qsa_expand_block_indices import qsa_expand_block_indices
 from .ops.attention.qsa_mtp_reuse_topk import qsa_mtp_reuse_topk
+from .ops.attention.qsa_nvfp4_pages_to_bf16 import qsa_nvfp4_pages_to_bf16
 from .ops.attention.qsa_paged_index_scores import qsa_paged_index_scores
 from .ops.attention.qsa_paged_index_store import qsa_paged_index_store
 from .ops.attention.qsa_paged_kv_store import qsa_paged_kv_store
@@ -256,6 +257,10 @@ _MAMBA_FIELDS = (
 # A context launch at or above this many rows takes `qsa_sparse_gqa_rowtile`;
 # measured on GB300 it loses at 543 rows and wins from 4096 rows up.
 _ROWTILE_MIN_ROWS = 2048  # capacity: fixed: a dispatch threshold, not a buffer size
+# Over an NVFP4 pool, a step with more context rows than this reads its context requests'
+# pages dequantized into a bf16 scratch through `qsa_sparse_gqa_rowtile`. GB300, a layer:
+# 16384 context rows 1.36 ms there against 77-948 ms for the NVFP4 per-row kernel.
+_NVFP4_ROWTILE_MIN_ROWS = 256  # capacity: fixed: a dispatch threshold, not a buffer size
 
 #: Context-step MoE launches of at least this many rows run on the CuTe DSL MoE
 #: (`fp4_moe_renorm_cute_dsl`, from the second expert copy `weights.py` keeps in
@@ -2489,6 +2494,86 @@ def _cute_dsl_routed(core, L, logits, xq, xsf, routed_out) -> torch.Tensor:
     )
 
 
+def _nvfp4_context_plan(core, md, req_idx, block_table, tpb: int) -> tuple:
+    """The pages a step's context requests read, for the bf16 row-tile pass over an NVFP4
+    pool: request `r` lists its first `ceil(kv_len / tpb)` table pages at scratch pages
+    `offsets[r]` on. Returns `(slots, counts, offsets, table, k_scratch, v_scratch)`, the
+    operands `qsa_nvfp4_pages_to_bf16` fills per layer: `table` (all -1 here) gets the
+    requests' slot rows, the scratch pools `[listed, Hkv, tpb, D]` bf16 the pages."""
+    num_contexts = md.num_contexts
+    device = block_table.device
+    # The host's and the device's KV lengths are the same per-step values: the host's
+    # size the scratch, the device's place the pages.
+    listed = int(((md.kv_lens_runtime[:num_contexts] + (tpb - 1)) // tpb).sum())
+    lens = md.seq_lens_cuda[:num_contexts].long()
+    slots = req_idx[torch.cumsum(lens, 0) - lens]
+    counts = torch.div(
+        md.kv_lens_cuda_runtime[:num_contexts].long() + (tpb - 1), tpb, rounding_mode="floor"
+    )
+    offsets = torch.cumsum(counts, 0) - counts
+    table = torch.full_like(block_table, -1)
+    shape = (listed, core.heads_kv, tpb, core.head_dim)
+    k_scratch = torch.empty(shape, dtype=torch.bfloat16, device=device)
+    v_scratch = torch.empty(shape, dtype=torch.bfloat16, device=device)
+    return slots, counts, offsets, table, k_scratch, v_scratch
+
+
+def _sparse_gqa_nvfp4_context(
+    core, kv, plan, q, block_table, selected, req_idx, logical, tpb: int, num_ctx: int, out
+) -> torch.Tensor:
+    """Sparse GQA of a step with context rows over an NVFP4 pool, into `out` `[rows,
+    q_width]`. With a plan (`_nvfp4_context_plan`) the first `num_ctx` rows, the context
+    rows, take the row-tile pass over the plan's scratch, filled here from this layer's
+    pool; the other rows, and every row without a plan, go split-K over the pool itself
+    (with the prefill pair the entry would take its per-row prefill kernel)."""
+    rows = q.shape[0]
+    head = 0
+    if plan is not None:
+        slots, counts, offsets, table, k_scratch, v_scratch = plan
+        qsa_nvfp4_pages_to_bf16(
+            kv.k,
+            kv.v,
+            kv.k_scale,
+            kv.v_scale,
+            core.kv_scale_quant_orig,
+            block_table,
+            slots,
+            counts,
+            offsets,
+            table,
+            k_scratch,
+            v_scratch,
+        )
+        context = qsa_sparse_gqa_rowtile(
+            q=q[:num_ctx],
+            k_cache=k_scratch,
+            v_cache=v_scratch,
+            block_table=table,
+            selected_tokens=selected[:num_ctx],
+            request_indices=req_idx[:num_ctx],
+            tokens_per_block=tpb,
+            softmax_scale=core.softmax_scale,
+            query_positions=logical[:num_ctx],
+            compress_ratio=core.compress_ratio,
+        )
+        out[:num_ctx].copy_(torch.reshape(context, [num_ctx, core.q_width]))
+        head = num_ctx
+    if head < rows:
+        rest = _sparse_gqa(
+            core,
+            kv,
+            q=q[head:],
+            block_table=block_table,
+            selected_tokens=selected[head:],
+            request_indices=req_idx[head:],
+            tokens_per_block=tpb,
+            query_positions=None,
+            compress_ratio=None,
+        )
+        out[head:rows].copy_(torch.reshape(rest, [rows - head, core.q_width]))
+    return out
+
+
 def _live_score_columns(core, md, batch: int) -> int:
     """A host-side bound on every row's selection window in a step with context rows: the
     longest sequence's compressed length, with the verify width as slack for the draft
@@ -2604,8 +2689,9 @@ class _PrefillStep(NamedTuple):
     `n` ids. `attn` is thop_attention's per-step arguments; `gdn`, `ple` and `qsa` are the
     recurrent, PLE and QSA bookkeeping tuples their breaks unpack, each cut to the batch's
     rows; `stage` says the speculative rollback stages this verify step; `vision` is the
-    shell's `(rows, mm_token_indices)` or None. A new one replaces it every step, so no
-    break reads a previous step's."""
+    shell's `(rows, mm_token_indices)` or None; `nvfp4_context` is `_nvfp4_context_plan`'s
+    scratch for the context rows over an NVFP4 pool, or None. A new one replaces it every
+    step, so no break reads a previous step's."""
 
     num_tokens: int
     physical_tokens: int
@@ -2616,6 +2702,7 @@ class _PrefillStep(NamedTuple):
     qsa: tuple
     stage: bool
     vision: tuple | None
+    nvfp4_context: tuple | None = None
 
 
 class PrefillTarget:
@@ -3020,11 +3107,25 @@ class PrefillTarget:
                             token_topk=core.token_topk,
                         )
                     )
-            # A context launch of thousands of rows over a bf16 pool takes the row-tile
-            # pass: consecutive rows of one request share their K/V tiles; rows of groups
-            # that span requests, the generation rows of a mixed step among them, are served
-            # row by row. Below the threshold the per-row kernel is faster.
-            if num_tokens >= _ROWTILE_MIN_ROWS and kv.k.dtype == q_dst.dtype:
+            if kv.k_scale is not None:
+                _sparse_gqa_nvfp4_context(
+                    core,
+                    kv,
+                    step.nvfp4_context,
+                    q_dst,
+                    block_table,
+                    selected,
+                    req_idx,
+                    logical,
+                    tokens_per_block,
+                    num_ctx,
+                    attn_out[:num_tokens],
+                )
+            elif num_tokens >= _ROWTILE_MIN_ROWS and kv.k.dtype == q_dst.dtype:
+                # A context launch of thousands of rows over a bf16 pool takes the row-tile
+                # pass: consecutive rows of one request share their K/V tiles; rows of
+                # groups that span requests, the generation rows of a mixed step among them,
+                # are served row by row. Below the threshold the per-row kernel is faster.
                 out = qsa_sparse_gqa_rowtile(
                     q=q_dst,
                     k_cache=kv.k,
@@ -3037,6 +3138,7 @@ class PrefillTarget:
                     query_positions=logical,
                     compress_ratio=core.compress_ratio,
                 )
+                attn_out[:num_tokens].copy_(torch.reshape(out, [num_tokens, core.q_width]))
             else:
                 out = _sparse_gqa(
                     core,
@@ -3051,7 +3153,7 @@ class PrefillTarget:
                     query_positions=logical,
                     compress_ratio=core.compress_ratio,
                 )
-            attn_out[:num_tokens].copy_(torch.reshape(out, [num_tokens, core.q_width]))
+                attn_out[:num_tokens].copy_(torch.reshape(out, [num_tokens, core.q_width]))
         else:
             # The dense op reads its packed QKV flat: one compact copy.
             qkv = proj_qkv[:num_tokens]
@@ -3812,6 +3914,16 @@ class PrefillTarget:
                 tokens_per_block=md.tokens_per_block,
             )
 
+        nvfp4_context = None
+        if (
+            sparse
+            and core.quant_mode == QM_NVFP4_KV_CACHE
+            and num_prefill_tokens > _NVFP4_ROWTILE_MIN_ROWS
+        ):
+            nvfp4_context = _nvfp4_context_plan(
+                core, md, qsa[0], md.qsa_block_table, md.tokens_per_block
+            )
+
         self._step = _PrefillStep(
             num_tokens=num_tokens,
             physical_tokens=physical_tokens,
@@ -3822,6 +3934,7 @@ class PrefillTarget:
             qsa=qsa,
             stage=stage,
             vision=vision,
+            nvfp4_context=nvfp4_context,
         )
 
     def forward(
@@ -4286,20 +4399,39 @@ class PrefillTarget:
                 compress_ratio=core.compress_ratio,
                 token_topk=core.token_topk,
             )
-            attn_out = torch.reshape(
-                _sparse_gqa(
+            if kv.k_scale is not None:
+                num_ctx = md.num_ctx_tokens
+                plan = None
+                if num_ctx > _NVFP4_ROWTILE_MIN_ROWS:
+                    plan = _nvfp4_context_plan(core, md, req_idx, block_table, tokens_per_block)
+                _sparse_gqa_nvfp4_context(
                     core,
                     kv,
-                    q=q_dst,
-                    block_table=block_table,
-                    selected_tokens=selected,
-                    request_indices=req_idx,
-                    tokens_per_block=tokens_per_block,
-                    query_positions=logical,
-                    compress_ratio=core.compress_ratio,
-                ),
-                [rows, core.q_width],
-            )
+                    plan,
+                    q_dst,
+                    block_table,
+                    selected,
+                    req_idx,
+                    logical,
+                    tokens_per_block,
+                    num_ctx,
+                    attn_out,
+                )
+            else:
+                attn_out = torch.reshape(
+                    _sparse_gqa(
+                        core,
+                        kv,
+                        q=q_dst,
+                        block_table=block_table,
+                        selected_tokens=selected,
+                        request_indices=req_idx,
+                        tokens_per_block=tokens_per_block,
+                        query_positions=logical,
+                        compress_ratio=core.compress_ratio,
+                    ),
+                    [rows, core.q_width],
+                )
         else:
             attn_out = thop_attention(
                 q=qkv,
