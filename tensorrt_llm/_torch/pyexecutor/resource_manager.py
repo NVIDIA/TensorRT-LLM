@@ -1415,7 +1415,7 @@ class KVCacheManager(BaseResourceManager):
         """Create dummy requests and eagerly allocate their KV cache resources.
 
         Register each request in the target cache and, when supplied, the draft
-        cache, including extra KV tokens. There is no allocation-free mode.
+        cache, including extra KV tokens.
         ``token_nums`` specifies history plus input length, excluding draft
         tokens. With ``is_gen=True``, requests enter generation state and reserve
         draft KV capacity; ``kv_reserve_draft_tokens`` overrides that reserve

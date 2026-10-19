@@ -971,6 +971,7 @@ def _capture_tllm_logs():
 @pytest.mark.parametrize("schedule", [{4: 4, 8: 2, 16: 1}, {4: 2}, {16: 4}, {4: 0}])
 def test_dynamic_warmup_graphs_match_replay_schedule(schedule: dict[int, int]) -> None:
     from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDAGraphRunner
+    from tensorrt_llm._torch.speculative.utils import get_draft_len_for_batch_size
 
     batch_sizes = [1, 2, 4, 8, 16]
     runner = object.__new__(DecoderRunner)
@@ -988,7 +989,7 @@ def test_dynamic_warmup_graphs_match_replay_schedule(schedule: dict[int, int]) -
 
     reachable_graphs = set()
     for batch_size in range(1, max(batch_sizes) + 1):
-        draft_len = next((length for bound, length in schedule.items() if batch_size <= bound), 0)
+        draft_len = get_draft_len_for_batch_size(schedule, batch_size, max(schedule.values()))
         padded_size = replay._round_up_batch_size_with_draft_len(batch_size, draft_len)
         assert padded_size >= batch_size
         reachable_graphs.add((padded_size, draft_len))

@@ -5438,9 +5438,9 @@ class KVCacheManagerV2(BaseResourceManager):
     ):
         """Create dummy requests with allocated target and optional draft KV caches.
 
-        Resource preparation is unconditional. ``token_nums`` specifies history
-        plus input length, excluding draft tokens; extra KV tokens are reserved
-        internally. With ``is_gen=True``, requests enter generation state and
+        ``token_nums`` specifies history plus input length, excluding draft
+        tokens; extra KV tokens are reserved internally. With ``is_gen=True``,
+        requests enter generation state and
         reserve draft capacity. ``kv_reserve_draft_tokens`` overrides this
         reserve without changing the ``max_num_draft_tokens`` proposal length.
         ``materialize_history=True`` also backs the declared generation history

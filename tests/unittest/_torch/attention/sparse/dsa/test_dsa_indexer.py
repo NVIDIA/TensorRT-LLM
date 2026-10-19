@@ -4788,9 +4788,7 @@ def _mla_prefill_reuse_case(monkeypatch, dsa_cache_manager):
     )
     indexer = create_indexer(sparse_attn_config, layer_idx=0)
     request_ids = list(range(batch_size))
-    cache_manager.add_dummy_requests(
-        request_ids, total_kv_lens, is_gen=False, prepare_resource=True
-    )
+    cache_manager.add_dummy_requests(request_ids, total_kv_lens, is_gen=False)
 
     # Write distinct K for every position first, so the cached prefixes hold
     # real values rather than ties that either chunking may break differently.
