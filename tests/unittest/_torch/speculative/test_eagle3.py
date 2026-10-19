@@ -26,8 +26,7 @@ import pytest
 import torch
 from test_common.llm_data import with_mocked_hf_download_for_single_gpu
 from utils.llm_data import llm_models_root
-from utils.util import (skip_blackwell, skip_num_gpus_less_than,
-                        skip_pre_blackwell)
+from utils.util import skip_num_gpus_less_than, skip_pre_blackwell
 
 from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm._torch.attention.backends.sparse.dsa import (
@@ -503,15 +502,7 @@ def test_kv_lens_runtime_with_eagle3_one_model():
         prompt_lens[i] - seq_lens_q[i] for i in range(num_seqs)
     ]
 
-    # Create a mock KV cache manager
-    mock_kv_cache_manager = MagicMock()
-    mock_kv_cache_manager.tokens_per_block = 32
-    mock_kv_cache_manager.num_pools = 1
-    mock_kv_cache_manager.num_attention_op_pools = mock_kv_cache_manager.num_pools
-    mock_kv_cache_manager.max_blocks_per_seq = 16
-    mock_kv_cache_manager.max_batch_size = num_seqs
-    mock_kv_cache_manager.max_seq_len = 512  # Large enough to hold our test sequences
-    mock_kv_cache_manager.copy_batch_block_offsets = MagicMock()
+    mock_kv_cache_manager = _make_mock_kv_cache_manager(num_seqs)
 
     attn_metadata = TrtllmAttentionMetadata(
         max_num_requests=num_seqs,
@@ -556,6 +547,9 @@ def _make_mock_kv_cache_manager(num_seqs: int) -> MagicMock:
     mock_kv_cache_manager.max_batch_size = num_seqs
     mock_kv_cache_manager.max_seq_len = 512
     mock_kv_cache_manager.copy_batch_block_offsets = MagicMock()
+    # MagicMock fabricates every attribute; metadata detects an FP4 MLA cache
+    # layout from this hook, so a plain (non-FP4) manager must not expose it.
+    mock_kv_cache_manager.get_fp4_mla_page_table_spec = None
     return mock_kv_cache_manager
 
 
@@ -773,7 +767,8 @@ def test_eagle3_spec_decoding_stats(eagle3_one_model):
         pytest.skip(f"Required models not found")
 
     kv_cache_config = KvCacheConfig(enable_block_reuse=False,
-                                    free_gpu_memory_fraction=0.6)
+                                    free_gpu_memory_fraction=0.6,
+                                    use_kv_cache_manager_v2=eagle3_one_model)
     spec_config = Eagle3DecodingConfig(
         max_draft_len=3,
         speculative_model=eagle_model_dir,
@@ -887,9 +882,7 @@ def test_llama_eagle3_long_prompt(use_cuda_graph):
     generated_text_ref = [result.outputs[0].text for result in results_ref]
     llm_ref.shutdown()
 
-    # The LLM with speculation on should dynamically turn it off in this
-    # test since it goes beyond the max seqlen. Thus, the text should be
-    # _exactly_ the same, no need to use similarity scoring.
+    # Greedy decoding must match the non-speculative reference for a long prompt.
     assert generated_text_spec[0] == generated_text_ref[0]
 
 
@@ -1066,7 +1059,8 @@ def test_multi_eagle3(use_one_model: bool):
         max_batch_size = 16
         max_draft_len = 3
         kv_cache_config = KvCacheConfig(enable_block_reuse=enable_block_reuse,
-                                        free_gpu_memory_fraction=0.5)
+                                        free_gpu_memory_fraction=0.5,
+                                        use_kv_cache_manager_v2=use_one_model)
         cuda_graph_config = CudaGraphConfig(
             batch_sizes=[1]) if use_cuda_graph else None
 
@@ -1100,7 +1094,6 @@ def test_multi_eagle3(use_one_model: bool):
                          ids=["no_dynamic_tree", "dynamic_tree"])
 @pytest.mark.parametrize("use_cuda_graph", [False, True])
 @pytest.mark.high_cuda_memory
-@skip_blackwell
 # Opt out of MPI session reuse: the XQA JIT cubin registry is process-global
 # (DecoderXQARunner::getResourceGlobal) and its lookup key does not include
 # q_seq_len / is_spec_dec_tree, so running the dynamic-tree and non-dynamic-tree
@@ -1110,7 +1103,8 @@ def test_multi_eagle3(use_one_model: bool):
 @with_mocked_hf_download_for_single_gpu
 def test_llama_eagle3_rejection_sampling_modes(use_dynamic_tree: bool,
                                                use_cuda_graph: bool):
-    """Test one-model rejection sampling with and without dynamic tree."""
+    """Test one-model rejection sampling with and without dynamic tree, with
+    more than one generation request per step."""
     total_mem_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
     if total_mem_gb < 35:
         pytest.skip("Not enough memory to load target + draft model")
@@ -1119,13 +1113,13 @@ def test_llama_eagle3_rejection_sampling_modes(use_dynamic_tree: bool,
     target_model_dir = f"{models_path}/llama-3.1-model/Llama-3.1-8B-Instruct"
     eagle_model = f"{models_path}/EAGLE3-LLaMA3.1-Instruct-8B"
 
-    max_batch_size = 1
+    max_batch_size = 2
     max_draft_len = 6
     dynamic_tree_max_top_k = 10
     max_total_draft_tokens = 60
     kv_cache_config = KvCacheConfig(enable_block_reuse=False, max_tokens=8192)
     cuda_graph_config = CudaGraphConfig(
-        batch_sizes=[1]) if use_cuda_graph else None
+        batch_sizes=[1, 2]) if use_cuda_graph else None
 
     llm_common_config = dict(
         model=target_model_dir,
@@ -1153,14 +1147,17 @@ def test_llama_eagle3_rejection_sampling_modes(use_dynamic_tree: bool,
                    speculative_config=Eagle3DecodingConfig(
                        **spec_config_kwargs))
 
-    prompts = ["The president of the United States is"]
+    prompts = [
+        "The president of the United States is",
+        "The capital of France is",
+    ]
     sampling_params = SamplingParams(max_tokens=20, temperature=1.0, top_p=1.0)
 
     results = llm_spec.generate(prompts, sampling_params)
     llm_spec.shutdown()
 
     assert len(results) == len(prompts)
-    assert len(results[0].outputs[0].token_ids) > 0
+    assert all(len(result.outputs[0].token_ids) > 0 for result in results)
 
 
 @pytest.mark.parametrize("disable_overlap_scheduler", [False, True])
@@ -1303,10 +1300,21 @@ def test_eagle3_lora(use_cuda_graph: bool):
 
 @pytest.mark.parametrize("disable_overlap_scheduler", [False])
 @pytest.mark.parametrize("use_cuda_graph", [True])
+# dl3_k4_dt12_bs1 covers one request against a mask buffer sized for one request on the Blackwell SwapsMmaAb kernel.
+@pytest.mark.parametrize(
+    "max_draft_len,dynamic_tree_max_topK,max_total_draft_tokens,max_batch_size,kv_cache_max_tokens",
+    [
+        pytest.param(6, 10, 30, 4, 2048, id="dl6_k10_dt30"),
+        pytest.param(
+            3, 4, 12, 1, 4096, id="dl3_k4_dt12_bs1", marks=skip_pre_blackwell),
+    ])
 @pytest.mark.high_cuda_memory
 @with_mocked_hf_download_for_single_gpu
-def test_llama_eagle3_dynamic_tree(use_cuda_graph: bool,
-                                   disable_overlap_scheduler: bool):
+def test_llama_eagle3_dynamic_tree(
+        use_cuda_graph: bool, disable_overlap_scheduler: bool,
+        max_draft_len: int, dynamic_tree_max_topK: int,
+        max_total_draft_tokens: int, max_batch_size: int,
+        kv_cache_max_tokens: int):
     """Test EAGLE3 dynamic tree speculative decoding with one-model architecture."""
     total_mem_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
     if total_mem_gb < 35:
@@ -1316,12 +1324,8 @@ def test_llama_eagle3_dynamic_tree(use_cuda_graph: bool,
     target_model_dir = f"{models_path}/llama-3.1-model/Llama-3.1-8B-Instruct"
     eagle_model = f"{models_path}/EAGLE3-LLaMA3.1-Instruct-8B"
 
-    max_batch_size = 4
-    max_draft_len = 6
-    dynamic_tree_max_topK = 10
-    max_total_draft_tokens = 30
     kv_cache_config = KvCacheConfig(enable_block_reuse=False,
-                                    max_tokens=2048,
+                                    max_tokens=kv_cache_max_tokens,
                                     free_gpu_memory_fraction=0.5)
     cuda_graph_config = CudaGraphConfig(
         batch_sizes=[i for i in range(1, max_batch_size +

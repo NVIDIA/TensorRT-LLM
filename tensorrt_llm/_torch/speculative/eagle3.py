@@ -101,8 +101,6 @@ class Eagle3ResourceManager(BaseResourceManager):
                                                   device='cuda')
         # start indices of each slot
         self.start_indices = {i: 0 for i in range(slot_size)}
-        # whether the next draft forward is the first
-        self.is_first_draft = True
         self.spec_tree_manager = None
 
         if isinstance(config, EagleDecodingConfig) and config.use_dynamic_tree:
@@ -120,12 +118,16 @@ class Eagle3ResourceManager(BaseResourceManager):
         self.slot_ids = []
         for req in context_batch:
             if req.is_first_context_chunk:
-                slot_id = self.slot_manager.add_slot(req.request_id)
+                # A padding dummy (e.g. the attention-DP idle-rank dummy) may
+                # already hold a slot from add_dummy_requests -- reuse it
+                # instead of re-adding, which SlotManager.add_slot only
+                # tolerates for the CUDA-graph dummy id.
+                slot_id = self.slot_manager.get_slot(req.request_id)
+                if slot_id is None:
+                    slot_id = self.slot_manager.add_slot(req.request_id)
                 self.slot_ids.append(slot_id)
                 if self.use_relaxed_acceptance_for_thinking:
                     self.relaxed_delta_pool[slot_id].fill_(0)
-        # reset the flag before model forward
-        self.is_first_draft = True
 
     def update_resources(self, scheduled_batch: ScheduledRequests):
         pass

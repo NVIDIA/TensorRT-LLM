@@ -19,13 +19,13 @@ import torch.nn.functional as F
 
 from tensorrt_llm._torch.attention.backends.interface import PredefinedAttentionMask
 from tensorrt_llm._torch.utils import unswizzle_sf
-from tensorrt_llm._torch.visual_gen.attention_backend import create_attention
-from tensorrt_llm._torch.visual_gen.attention_backend.cudnn import (
+from tensorrt_llm._torch.visual_gen.attention.backends import create_attention
+from tensorrt_llm._torch.visual_gen.attention.backends.cudnn import (
     CuDNNAttention,
     _quantize_mxfp8_qk,
     _quantize_mxfp8_v,
 )
-from tensorrt_llm._torch.visual_gen.attention_backend.interface import AttentionTensorLayout
+from tensorrt_llm._torch.visual_gen.attention.backends.interface import AttentionTensorLayout
 from tensorrt_llm.visual_gen.args import AttentionConfig, QuantAttentionConfig
 
 # Quantization dtype -> quant_attention_config accepted by AttentionConfig.

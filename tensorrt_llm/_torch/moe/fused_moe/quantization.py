@@ -274,6 +274,27 @@ def interleave_linear_and_gate(x: torch.Tensor,
     return x
 
 
+def interleave_gate_and_linear(x: torch.Tensor,
+                               group_size: int = 16,
+                               dim: int = -1) -> torch.Tensor:
+    """Interleave a ``[linear | gate]`` FC1 tensor into ``[gate, linear]`` groups.
+
+    Same input contract as ``interleave_linear_and_gate`` (the two halves of
+    ``dim`` are the linear/up and gate projections), but every group of
+    ``group_size`` rows leads with the gate half. ``group_size=16`` is the FC1
+    B / block-scale row order the Rubin (SM107) NVFP4 CuTe DSL kernels read.
+    """
+    sizes = x.size()
+    dim = dim % x.dim()
+    assert sizes[dim] % (group_size * 2) == 0
+    prev_sizes = sizes[:dim]
+    post_sizes = sizes[dim + 1:]
+    x = x.view(*prev_sizes, 2, sizes[dim] // (group_size * 2), group_size,
+               *post_sizes)
+    x = x.flip(dim).transpose(dim, dim + 1).contiguous().view(*sizes)
+    return x
+
+
 class EplbSupportStatus(Enum):
     """EPLB support status for FusedMoEMethod classes."""
     SUPPORTED = auto()
@@ -3574,30 +3595,20 @@ class NVFP4MarlinFusedMoEMethod(NVFP4CutlassFusedMoEMethod):
 
 
 class W4A16NVFP4CutlassFusedMoEMethod(NVFP4CutlassFusedMoEMethod):
-    """W4A16 dequant-on-the-fly variant of NVFP4 MoE for SM<100.
-
-    Loads an unmodified NVFP4 MoE ckpt; only load-time change is un-swizzling
-    per-block scales once so the per-forward dequant skips that step.
-    ``CutlassFusedMoE.run_moe`` dispatches here and uses an active-mask Triton
-    kernel (``dequant_active_experts_to_hp``) to dequant only routed experts
-    into a static [E_total, N, K] workspace, then runs the bf16 ``fused_moe``.
-    """
+    """Dequantize active NVFP4 experts into a BF16/FP16 workspace for CUTLASS."""
 
     quantizes_nvfp4_activations = False
 
-    def process_weights_after_loading(self, module: torch.nn.Module):
-        super().process_weights_after_loading(module)
+    def _interleave_w3_w1_weight_scale(
+            self, dst_w3_w1_weight_scale: torch.Tensor) -> None:
+        # Dequantization reads linear scales, including host copies migrated
+        # into resident slots by online EPLB.
+        pass
 
-        # Scale buffer: int32-packed FP8, viewed as uint8 has shape
-        # [E, pad_up(N, 128), pad_up(K/sf_vec, 4)] -- the 3D layout
-        # block_scale_interleave_reverse accepts.
-        def _unswizzle_inplace(scale_param: torch.nn.Parameter):
-            sf_view = scale_param.data.view(float4_sf_dtype)
-            linear = torch.ops.trtllm.block_scale_interleave_reverse(sf_view)
-            scale_param.data.view(float4_sf_dtype).copy_(linear)
-
-        _unswizzle_inplace(module.w3_w1_weight_scale)
-        _unswizzle_inplace(module.w2_weight_scale)
+    def _interleave_w2_weight_scale(self,
+                                    dst_w2_weight_scale: torch.Tensor) -> None:
+        # FC2 uses the same linear layout for resident and host copies.
+        pass
 
     def dequant_active_experts_to_hp(
         self,
@@ -3673,12 +3684,24 @@ class NVFP4CuteDslFusedMoEMethod(NVFP4CutlassFusedMoEMethod):
         # CuteDsl interleave deferred to process_weights_after_loading().
 
     @staticmethod
+    def _interleave_fc1_rows(x: torch.Tensor) -> torch.Tensor:
+        """Reorder FC1 rows (dim 0) into the gate/up interleave the fused
+        gather+GEMM+activation kernel of this GPU reads.
+
+        The Rubin (SM107) kernels consume ``[gate16, up16]`` groups; the
+        Blackwell kernels consume ``[up64, gate64]`` groups. Weights and their
+        block scales go through the same permutation.
+        """
+        if get_sm_version() == 107:
+            return interleave_gate_and_linear(x, group_size=16, dim=0)
+        return interleave_linear_and_gate(x, group_size=64, dim=0)
+
+    @staticmethod
     def _interleave_w3_w1_weight(dst_w3_w1_weight: torch.Tensor):
         """Interleave FC1 weight for GEMM1 + SwiGLU fusion."""
         w3_w1_weight = dst_w3_w1_weight.cuda().view(float4_e2m1x2)
-        w3_w1_weight_interleaved = interleave_linear_and_gate(w3_w1_weight,
-                                                              group_size=64,
-                                                              dim=0)
+        w3_w1_weight_interleaved = (
+            NVFP4CuteDslFusedMoEMethod._interleave_fc1_rows(w3_w1_weight))
         dst_w3_w1_weight.copy_(
             w3_w1_weight_interleaved.view(dst_w3_w1_weight.dtype))
 
@@ -3711,8 +3734,8 @@ class NVFP4CuteDslFusedMoEMethod(NVFP4CutlassFusedMoEMethod):
         w3_w1_weight_scale = dst_w3_w1_weight_scale.cuda().view(float4_sf_dtype)
         w3_w1_weight_scale_unswizzled = unswizzle_sf(
             w3_w1_weight_scale, n, k).view(n, k // module.scaling_vector_size)
-        w3_w1_weight_scale_unswizzled_interleaved = interleave_linear_and_gate(
-            w3_w1_weight_scale_unswizzled, group_size=64, dim=0)
+        w3_w1_weight_scale_unswizzled_interleaved = self._interleave_fc1_rows(
+            w3_w1_weight_scale_unswizzled)
         w3_w1_weight_scale_interleaved = swizzle_sf(
             w3_w1_weight_scale_unswizzled_interleaved, n,
             k).view(n, k // module.scaling_vector_size)
@@ -7241,6 +7264,11 @@ def _import_deep_gemm():
             f"tensorrt_llm.deep_gemm missing mega_moe symbols {missing}; "
             f"upgrade the TRT-LLM bundled DeepGEMM to a release that "
             f"includes fp8_fp4_mega_moe.")
+    if not hasattr(_dg, "set_barrier_timeout_seconds"):
+        raise _MegaMoEUnavailable(
+            "tensorrt_llm.deep_gemm lacks set_barrier_timeout_seconds; rebuild "
+            "so the bundled DeepGEMM carries "
+            "3rdparty/patches/deepgemm_configurable_barrier_timeout.patch.")
 
     mega_moe_params = inspect.signature(_dg.fp8_fp4_mega_moe).parameters
     missing_situ_params = [

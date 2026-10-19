@@ -4,6 +4,7 @@
 import pytest
 
 from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.moe.fused_moe.impl_contract import MoEEnvironment
 from tensorrt_llm._torch.moe.fused_moe.moe_resolution import build_moe_deployment
 
 pytestmark = pytest.mark.cpu_only
@@ -31,6 +32,7 @@ def test_deterministic_flags_reach_moe_backend_selection(
     explicit_disable: bool,
     expected_disable: bool,
 ) -> None:
+    """Deterministic flags must reach backend policy without probing GPU hardware."""
     for key, value in (
         ("FORCE_DETERMINISTIC", global_flag),
         ("FORCE_MOE_KERNEL_DETERMINISTIC", moe_flag),
@@ -41,7 +43,7 @@ def test_deterministic_flags_reach_moe_backend_selection(
             monkeypatch.setenv(key, value)
 
     config = ModelConfig(moe_disable_finalize_fusion=explicit_disable)
-    deployment = build_moe_deployment(config, num_experts=8)
+    deployment = build_moe_deployment(config, num_experts=8, environment=MoEEnvironment(sm=100))
 
     assert config.moe_disable_finalize_fusion is expected_disable
     assert deployment.fused_finalize_enabled is not expected_disable

@@ -15,6 +15,18 @@ Python and C++ codebase with a PyTorch execution path.
 - `pre-commit` hooks run on commit — if files are modified by hooks, re-stage and commit again
 - LLM args or nested-config changes must run `python3 scripts/generate_llm_args_golden_manifest.py` and commit
   `tensorrt_llm/usage/llm_args_golden_manifest.json`; new fields require telemetry/privacy CODEOWNER approval
+- Changes to serving YAML fields, aliases, defaults, types, or constraints (including nested,
+  disaggregated, and VisualGen configs) must regenerate and inspect the editor JSON Schemas with
+  `python3 scripts/generate_trtllm_serve_schemas.py`, using a
+  TensorRT-LLM build matching the checkout. Update the generator's YAML-specific adaptations when
+  configuration annotations alone do not capture the change, and add regression coverage for the
+  affected accepted/rejected values. Run
+  `pytest -m cpu_only tests/unittest/llmapi/test_trtllm_serve_config_schemas.py`.
+  Commit the generated `tensorrt_llm/schemas/*.json` snapshots; never hand-edit them.
+  Version bumps in `tensorrt_llm/version.py` also require regeneration: the snapshots
+  include the package version in their `$id` and `title`.
+  `python3 scripts/generate_trtllm_serve_schemas.py --check` and the CPU schema tests
+  reject missing or stale snapshots. Wheels and HTML docs publish these same files.
 - When adding or renaming a public model architecture identifier, update
   `tensorrt_llm/usage/architecture_allowlist.py` with its exact identifier. It must be publicly
   documented by the upstream model provider or in `docs/source/models/supported-models.md`; never add
@@ -30,6 +42,8 @@ Python and C++ codebase with a PyTorch execution path.
 | Task | Command |
 |------|---------|
 | Unit tests | `pytest tests/unittest/` |
+| C++ component tests | `cmake --build cpp/build_RelWithDebInfo --target common-tests` (also `runtime-tests`, `executor-tests`, `batch-manager-tests`, `kernel-tests`) |
+| C++ test scheduling | `ctest --test-dir cpp/build_RelWithDebInfo -L common --output-on-failure` (build the selected tests first) |
 | Specific test | `pytest tests/unittest/llmapi/test_llm_args.py` |
 | Pattern match | `pytest tests/unittest -k "test_llm_args"` |
 | Integration tests | `LLM_MODELS_ROOT=/path/to/models pytest tests/integration/defs/...` |
@@ -167,6 +181,11 @@ See [CI overview](docs/source/developer-guide/ci-overview.md) for full details.
 | Test lists | `tests/integration/test_lists/test-db/` | Per-GPU YAML files (`l0_a10.yml`, `l0_h100.yml`, etc.) |
 | Test waives | `tests/integration/test_lists/waives.txt` | Skip known-failing tests with NVBug links |
 | Performance | See [benchmarking guide](docs/source/developer-guide/perf-benchmarking.md) | `trtllm-bench` and `trtllm-serve` benchmarks |
+
+New C++ unit tests should use `add_tllm_gtest` with explicit `SOURCES`,
+`LINK_LIBRARIES`, `OWNER`, and scheduling `LABELS`. Request `FULL_STACK` explicitly
+for integration tests and `REQUIRES_GPU` for tests that need a GPU. `google-tests`
+continues to build all C++ tests; component aggregate targets build migrated tests.
 
 ### Advisory semantic review
 
