@@ -296,7 +296,9 @@ class MetricsCollector:
             name=self.metric_prefix + "kv_cache_iter_connector_reused_blocks",
             documentation=
             "Total reused KV cache blocks loaded by a KV cache connector "
-            "from an external store (a subset of the reused blocks)",
+            "from an external store (a subset of the reused blocks). Counted "
+            "when the load is accepted, before an asynchronous transfer "
+            "completes.",
             labelnames=self.labels.keys())
         self.kv_cache_gen_alloc_blocks_total = Counter(
             name=self.metric_prefix + "kv_cache_gen_alloc_blocks_total",
@@ -464,7 +466,9 @@ class MetricsCollector:
                 "Pages already prefetched from disk to host count as host. "
                 "Tokens a KV cache connector loaded from an external store "
                 "are reported as cache_tier=connector with an empty "
-                "cache_level, since the store is not a configured level."),
+                "cache_level, since the store is not a configured level. "
+                "They are counted when the load is accepted, before an "
+                "asynchronous transfer completes."),
             labelnames=self.labels_with_cache_level.keys())
         # The configured levels are only known once stats arrive; children are created then so
         # that zero-valued levels are still visible before their first cache hit.
