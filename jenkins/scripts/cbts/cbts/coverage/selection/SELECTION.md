@@ -61,12 +61,14 @@ of:
 
 ## 4. Bounding low-risk import-executed changes
 
-Import-phase rows are recorded only by the tests that spawn subprocesses (`../collection/COLLECTION.md`
-§5.2), so a `<module>` or `ClassName` row set is missing the tests served by MPI pool workers. Widening
-to the file's row set recovers some of them but is a **recovery heuristic, not an upper bound**: a test
-that imports the file and never enters any function in it records nothing there at all, so it is absent
-from the file set too. Measured on `llmapi/llm_args.py`, the widening goes from 509 holders to 735 while
-about 746 tests import the file — the gap does not close.
+Every process, including an `mpi4py.futures` pool worker, records its own import phase (see
+`../collection/COLLECTION.md` §5.2); only the outer pytest's own pre-test import is unattributed,
+since it runs under the empty context and the merge filters that out with `WHERE test != ''`. So a
+`<module>` or `ClassName` row set can still fall short of the full set of tests that import the file:
+a test that imports it and never enters any function in it records nothing there at all. Widening to
+the file's row set recovers those cases but is a **recovery heuristic, not an upper bound** for the
+same reason — a test whose only interaction with the file is the bare import still records nothing,
+so it is absent from the file set too.
 
 Consequently, Tier 2 never uses `<module>` or class-body rows as an impact bound. Most import-executed
 changes still decline. A small AST allowlist can instead translate these low-risk module statements to
@@ -197,7 +199,7 @@ The resulting stage set unions with every rule contribution, including
 
 | Signal | Meaning |
 |---|---|
-| `test_case_meta` reports incomplete | `outcome != passed`, `saved_procs < expected_workers + 1`, or `tainted != 0` — the compact DB's logical completeness view |
+| `test_case_meta` reports incomplete | `outcome` is missing or not `passed`, or `tainted != 0` — the compact DB's logical completeness view |
 | Drove inference but has no `py_executor` rows | the coordinator ran but the worker's coverage never arrived |
 | Footprint < 30 functions | the record is near-empty |
 | On a `-Ray-` stage | the GPU worker is uninstrumented, only driver-side rows exist |

@@ -14,7 +14,7 @@
 """Generic process-launch-target detection, used by the guest bootstrap.
 
 Opts build tooling and Ray infrastructure subtrees out of coverage instrumentation, and
-identifies an `mpi4py.futures` pool worker so only that process type defers activation.
+identifies an `mpi4py.futures` pool worker, whose activation the bootstrap defers.
 """
 
 from __future__ import annotations
@@ -123,11 +123,16 @@ def is_ray_infra_process() -> bool:
 def is_mpi_pool_worker() -> bool:
     """Return True in an ``mpi4py.futures`` pool worker process (spawned via ``MPI_Comm_spawn``).
 
-    This is the *only* process type that needs deferred PY_START activation: it's the one
-    place a slow instrumented import can trip ``MpiPoolSession``'s ``wait_shutdown`` identity
-    barrier (``tensorrt_llm/llmapi/mpi_session.py``), whose deadline the process spawn plus
-    this cold import shares. Every other product process (``trtllm-serve``, disagg helpers,
-    ...) has no such budget to protect and should activate immediately instead.
+    This is the one process type whose channel address does not arrive at exec like an
+    ordinary child's: it is forwarded only through mpi4py's own sync handshake, which
+    runs after this process has already started. The bootstrap defers activation for
+    exactly this process type instead of attempting (and always failing) immediately;
+    see ``sitecustomize.py``'s ``_install_worker_sync_hook``.
+
+    An ``mpirun``-launched sibling that later becomes an ``MPICommExecutor`` worker is
+    *not* this: it is spawned by ``mpirun`` as an ordinary OS process (fork+exec), not
+    by ``MPI_Comm_spawn``, so it inherits whatever environment was current when the
+    test invoked ``mpirun`` -- the channel address included, same as any other child.
     """
     argv = getattr(sys, "orig_argv", sys.argv) or ()
     return _MPI_POOL_WORKER_MODULE in argv
