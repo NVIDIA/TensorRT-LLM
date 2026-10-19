@@ -453,6 +453,46 @@ def get_rank_model_storage(model):
     return total_bytes
 
 
+def _checkpoint_io_incompatibility_reason(
+    checkpoint_loader: Optional[BaseCheckpointLoader],
+    checkpoint_format: CheckpointFormat | str | None,
+    load_format: LoadFormat,
+    requested_policy: CheckpointIOPolicy,
+    partial_model_loading: bool,
+) -> Optional[str]:
+    """Return the first unmet requirement for optimized checkpoint I/O.
+
+    This function is called only when requested_policy is not CheckpointIOPolicy.NATIVE.
+    """
+    if checkpoint_loader is not None:
+        return "an explicit checkpoint loader was provided"
+    if checkpoint_format != CheckpointFormat.HF:
+        return (
+            f"checkpoint_io_policy={requested_policy.value!r} requires checkpoint_format='HF' "
+            f"(received '{checkpoint_format}')")
+
+    if load_format != LoadFormat.AUTO:
+        return (
+            f"checkpoint_io_policy={requested_policy.value!r} requires load_format='auto' "
+            f"(received {load_format.name!r})")
+    if partial_model_loading:
+        return "partial model loading was requested"
+
+    from tensorrt_llm._torch.models.checkpoints.hf.checkpoint_loader import \
+        HfCheckpointLoader
+    from tensorrt_llm._torch.models.checkpoints.hf.weight_loader import \
+        HfWeightLoader
+    from tensorrt_llm._torch.models.modeling_utils import (
+        CHECKPOINT_LOADER_FORMAT_DEFAULT_MAPPING, get_checkpoint_weight_loader)
+
+    if (CHECKPOINT_LOADER_FORMAT_DEFAULT_MAPPING.get(CheckpointFormat.HF)
+            is not HfCheckpointLoader):
+        return "the registered HF checkpoint loader is not the built-in loader"
+    if get_checkpoint_weight_loader(CheckpointFormat.HF) is not HfWeightLoader:
+        return "the registered HF weight loader is not the built-in loader"
+    return None
+
+
 def _resolve_checkpoint_io_policy(
     checkpoint_loader: Optional[BaseCheckpointLoader],
     checkpoint_format: CheckpointFormat | str | None,
@@ -460,53 +500,35 @@ def _resolve_checkpoint_io_policy(
     requested_policy: CheckpointIOPolicy,
     partial_model_loading: bool,
 ) -> tuple[CheckpointIOPolicy, Optional[str]]:
-    """Select a safe executable policy before checkpoint loading starts."""
+    """Return the policy to use and the reason for a fallback, if any."""
+
     if requested_policy == CheckpointIOPolicy.NATIVE:
         return CheckpointIOPolicy.NATIVE, None
 
-    reason = None
-    if checkpoint_loader is not None:
-        reason = "an explicit checkpoint loader was provided"
-    elif checkpoint_format != CheckpointFormat.HF:
-        reason = ("rank-striped read-ahead requires checkpoint_format='HF' "
-                  f"(received '{checkpoint_format}')")
-    elif load_format != LoadFormat.AUTO:
-        reason = ("rank-striped read-ahead requires load_format='auto' "
-                  f"(received {load_format.name!r})")
-    elif partial_model_loading:
-        reason = "partial model loading was requested"
+    # requested_policy can be AUTO or RANK_STRIPED_READ_AHEAD:
+    reason = _checkpoint_io_incompatibility_reason(checkpoint_loader,
+                                                   checkpoint_format,
+                                                   load_format,
+                                                   requested_policy,
+                                                   partial_model_loading)
 
     if reason is None:
-        from tensorrt_llm._torch.models.checkpoints.hf.checkpoint_loader import \
-            HfCheckpointLoader
-        from tensorrt_llm._torch.models.checkpoints.hf.weight_loader import \
-            HfWeightLoader
-        from tensorrt_llm._torch.models.modeling_utils import (
-            CHECKPOINT_LOADER_FORMAT_DEFAULT_MAPPING,
-            get_checkpoint_weight_loader)
+        # Compatible: AUTO and RANK_STRIPED_READ_AHEAD both use read-ahead.
+        return CheckpointIOPolicy.RANK_STRIPED_READ_AHEAD, None
 
-        if (CHECKPOINT_LOADER_FORMAT_DEFAULT_MAPPING.get(CheckpointFormat.HF)
-                is not HfCheckpointLoader):
-            reason = "the registered HF checkpoint loader is not the built-in loader"
-        elif get_checkpoint_weight_loader(
-                CheckpointFormat.HF) is not HfWeightLoader:
-            reason = "the registered HF weight loader is not the built-in loader"
-
-    if reason is not None:
-        message = ("Checkpoint I/O policy resolved before loading: "
-                   f"requested={requested_policy}, "
-                   f"selected={CheckpointIOPolicy.NATIVE}, "
-                   f"reason={reason}.")
-        if requested_policy == CheckpointIOPolicy.RANK_STRIPED_READ_AHEAD:
-            logger.warning(message)
-        else:
-            logger.info(message)
-        return CheckpointIOPolicy.NATIVE, reason
-
-    return CheckpointIOPolicy.RANK_STRIPED_READ_AHEAD, None
+    # Not compatible: fall back to native I/O.
+    message = ("Checkpoint I/O policy resolved before loading: "
+               f"requested={requested_policy}, "
+               f"selected={CheckpointIOPolicy.NATIVE}, "
+               f"reason={reason}.")
+    if requested_policy == CheckpointIOPolicy.RANK_STRIPED_READ_AHEAD:
+        logger.warning(message)
+    else:
+        logger.info(message)
+    return CheckpointIOPolicy.NATIVE, reason
 
 
-def _construct_checkpoint_loader(
+def construct_checkpoint_loader(
     checkpoint_loader: Optional[BaseCheckpointLoader],
     checkpoint_format: CheckpointFormat | str | None,
     *,

@@ -40,7 +40,7 @@ from tensorrt_llm._torch.pyexecutor.config_utils import (
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MixedMambaHybridCacheManager
 from tensorrt_llm._torch.pyexecutor.model_loader import (
     ModelLoader,
-    _construct_checkpoint_loader,
+    construct_checkpoint_loader,
     validate_and_set_kv_cache_quant,
     validate_and_set_mamba_ssm_cache_dtype,
 )
@@ -415,7 +415,7 @@ class Runner:
     ) -> None:
         super().__init__()
 
-        checkpoint_loader = _construct_checkpoint_loader(None, CheckpointFormat.HF)
+        checkpoint_loader = construct_checkpoint_loader(None, CheckpointFormat.HF)
         # Please refer to `tensorrt_llm/_torch/pyexecutor/model_loader.py` for effective args
         llm_args = TorchLlmArgs(
             model=pretrained_model_name_or_path,
