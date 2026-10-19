@@ -273,7 +273,7 @@ def _make_kvcm_replay_manager(num_heads):
 def _offload_and_resume(manager, request_ids):
     """Suspend the requests' KV caches, push their pages to the host tier with newer caches, and resume them; returns
     the slots they resume in."""
-    from tensorrt_llm.runtime.kv_cache_manager_v2 import LayerId
+    from tensorrt_llm.runtime.kv_cache_manager_v2 import CACHE_LEVEL1, LayerId, _introspection
 
     stream = torch.cuda.current_stream().cuda_stream
     caches = [manager.kv_cache_map[rid] for rid in request_ids]
@@ -295,6 +295,9 @@ def _offload_and_resume(manager, request_ids):
     finally:
         for other in pressure:
             other.close()
+    # The suspended requests' pages must have been evicted to the host tier, or
+    # the resume below would not exercise the offload path at all.
+    assert max(_introspection.storage_utilization(manager.impl, CACHE_LEVEL1)) > 0
     new_slots = []
     for cache in reversed(caches):
         assert cache.resume(stream)
@@ -323,7 +326,7 @@ def _offload_and_resume(manager, request_ids):
     ],
 )
 def test_fused_vs_sequential_two_rounds(
-    num_heads, use_full_rank_gate, checkpoint_fp8, large_state_stride, kvcm_replay
+    request, num_heads, use_full_rank_gate, checkpoint_fp8, large_state_stride, kvcm_replay
 ):
     """With ``kvcm_replay``, the fused world keeps its states and replay caches in a V2 manager's KVCM pools, and
     the requests are offloaded to the host tier and resumed in other slots between the two rounds."""
@@ -382,6 +385,7 @@ def test_fused_vs_sequential_two_rounds(
     fused_slots = slot_indices
     replay_manager = _make_kvcm_replay_manager(num_heads) if kvcm_replay else None
     if replay_manager is not None:
+        request.addfinalizer(replay_manager.shutdown)
         request_ids = list(range(101, 101 + B))
         replay_manager.add_dummy_requests(request_ids, token_nums=[32] * B, is_gen=False)
         fused_slots = torch.tensor(
@@ -458,8 +462,6 @@ def test_fused_vs_sequential_two_rounds(
         cache_seq, conv_pool_seq, ssm_pool_seq, torch.zeros(B, dtype=torch.long, device="cuda")
     )
     ok &= _rep("committed ssm", ssm_pool_fused.index_select(0, fused_slots.long()), ssm_pool_seq)
-    if replay_manager is not None:
-        replay_manager.shutdown()
 
     assert ok
 
