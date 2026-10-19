@@ -62,7 +62,7 @@ from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 from tensorrt_llm.logger import logger
 
 from ..kv_cache_connector import KvCacheConnectorWorker
-from ..kv_cache_layout import KvCacheLayout
+from ..kv_cache_layout import KvCacheLayout, fold_replicated_regions
 from .addressing import PageAddressing
 from .config import CONFIG_PATH_ENV, MooncakeStoreConnectorConfig, pool_config
 from .gpudirect import REGISTRATION_DEBUG_ENV, format_diagnosis
@@ -409,6 +409,10 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
             )
             return
 
+        if self._attention_world_size == 1:
+            # One attention shard holds every byte, so there is nothing to store
+            # once per group; keep a single page and key per block.
+            layout = fold_replicated_regions(layout)
         validate_layout(layout)
         addressing = PageAddressing(layout)
         # Torch's current device is thread-local, so read it here on the
@@ -692,9 +696,7 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
         total_pages += rep_pages
         if not keys:
             return
-        # `_resolve` emits one key per page in transfer order, so this is the
-        # owning request of every key.
-        owners = [entry.request_id for entry in metadata.loads for _ in entry.pages]
+        owners = self._owners(metadata.loads) + self._owners(metadata.loads, replicated=True)
 
         staging = self._load_staging
         handle = _stream_handle(stream) if staging is not None else 0
@@ -857,6 +859,13 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
             loaded_bytes = 0
             try:
                 keys, addresses, sizes, total_pages = self._resolve([transfers])
+                rep_keys, rep_addresses, rep_sizes, rep_pages = self._resolve(
+                    [transfers], replicated=True
+                )
+                keys += rep_keys
+                addresses += rep_addresses
+                sizes += rep_sizes
+                total_pages += rep_pages
                 owners = [request_id] * len(keys)
                 failed_requests, num_failed_pages, first_failure, loaded_bytes = self._load_pages(
                     keys, addresses, sizes, owners, staging, handle, self._async_batch_size
@@ -1195,6 +1204,21 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
                 sizes.append(page_sizes)
                 pages += 1
         return keys, addresses, sizes, pages
+
+    def _owners(self, transfers: Sequence[RequestTransfers], replicated: bool = False) -> List[int]:
+        """The owning request of every key `_resolve` emits for the same arguments.
+
+        Kept beside `_resolve` because the two must agree key for key: the
+        replicated page exists only for layer groups that hold a replicated
+        role, so it is not one per page.
+        """
+        known = self._replicated_namespaces if replicated else self._namespaces
+        return [
+            entry.request_id
+            for entry in transfers
+            for page in entry.pages
+            if page.layer_group_id in known
+        ]
 
     def _reraise_save_error(self) -> None:
         with self._save_lock:

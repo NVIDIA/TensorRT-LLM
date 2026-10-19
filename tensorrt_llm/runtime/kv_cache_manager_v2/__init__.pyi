@@ -147,6 +147,7 @@ class BufferConfig:
     role: DataRole
     size: int
     tokens_per_block_override: int | None = None
+    coalesce_last: bool = False
 
 @dataclass(slots=True)
 class AttentionLayerConfig:

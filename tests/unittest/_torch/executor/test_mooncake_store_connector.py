@@ -1015,6 +1015,37 @@ def test_worker_saves_and_loads_both_classes(store_config, fake_store):
         ]
 
 
+def test_worker_load_owns_every_key_of_both_classes(store_config, fake_store):
+    # One owner per key: a replicated page adds a key without adding a page, and
+    # a missing one would fail the whole batch with a bare IndexError.
+    layout = make_layout(replicated_per_group=1)
+    block_hash = b"\x06" * 16
+    with make_worker(fake_store, layout=layout) as worker:
+        key = worker._namespaces[0].key(block_hash)
+        rep_key = worker._replicated_namespaces[0].key(block_hash)
+        fake_store.objects.update({key, rep_key})
+        loads = [
+            RequestTransfers(1, [PageTransfer(block_hash, 0, 1), PageTransfer(block_hash, 0, 2)]),
+            RequestTransfers(2, [PageTransfer(block_hash, 0, 3)]),
+        ]
+        assert worker._owners(loads) == [1, 1, 2]
+        assert worker._owners(loads, replicated=True) == [1, 1, 2]
+        worker.bind_connector_meta(SimpleNamespace(loads=loads, saves=[]))
+        worker.start_load_kv(None)
+        assert fake_store.get_calls[0][0] == [key, key, key, rep_key, rep_key, rep_key]
+
+
+def test_worker_load_reports_a_request_whose_replicated_page_is_missing(store_config, fake_store):
+    layout = make_layout(replicated_per_group=1)
+    block_hash = b"\x07" * 16
+    with make_worker(fake_store, layout=layout) as worker:
+        fake_store.objects.add(worker._namespaces[0].key(block_hash))  # replicated page absent
+        transfers = RequestTransfers(9, [PageTransfer(block_hash, 0, 4)])
+        worker.bind_connector_meta(SimpleNamespace(loads=[transfers], saves=[]))
+        worker.start_load_kv(None)
+        assert worker.take_failed_load_requests() == {9}
+
+
 def test_worker_saves_the_replicated_page_from_one_rank_only(
     store_config: Path, fake_store: FakeStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -92,6 +92,15 @@ class BufferConfig:
     KVCacheManagerConfig and size should be based on tokens_per_block_override.
     """
 
+    coalesce_last: bool = False
+    """
+    When True, and this buffer shares a coalesced pool buffer with others of the same size (same life cycle),
+    it is placed after all buffers that do not set this flag, instead of interleaved with them in layer order.
+    Buffers that set the flag keep their relative order. Offsets are only a layout choice: every accessor goes
+    through the per-buffer attributes. The effect is that the flagged buffers of all layers are contiguous, which
+    lets a consumer treat them as a single aggregated page.
+    """
+
 
 class LayerType(IntEnum):
     ATTENTION = 0

@@ -13,11 +13,13 @@
 
 import gc
 import unittest
+from unittest import mock
 
 import torch
 
 import tensorrt_llm
 import tensorrt_llm.bindings
+from tensorrt_llm._torch.pyexecutor.connectors import kv_cache_layout as kv_cache_layout_module
 from tensorrt_llm._torch.pyexecutor.connectors.kv_cache_layout import (
     KvCacheBufferRef,
     KvCacheLayerGroupLayout,
@@ -319,7 +321,12 @@ class TestBuildKvCacheLayoutV2(unittest.TestCase):
 
         mgr = _IndexKeyManager(**kwargs)
         try:
-            layout = build_kv_cache_layout_v2(mgr)
+            # Interleaving makes the split cost 2 * num_layers regions, which the
+            # production guard would refuse; lift it to look at the split itself.
+            with mock.patch.object(
+                kv_cache_layout_module, "MAX_EXTRA_REGIONS_FOR_REPLICATION", 10**9
+            ):
+                layout = build_kv_cache_layout_v2(mgr)
             self.assertEqual(len(layout.groups), 1)
             group = layout.groups[0]
 
@@ -348,6 +355,36 @@ class TestBuildKvCacheLayoutV2(unittest.TestCase):
             )
             for (_, prev_end), (next_start, _) in zip(spans, spans[1:]):
                 self.assertLessEqual(prev_end, next_start)
+        finally:
+            mgr.shutdown()
+            del mgr
+
+    def test_an_interleaved_replicated_role_falls_back_to_one_page(self):
+        # Same interleaved K, V, INDEX_KEY pool, default guard: splitting would
+        # turn 1 region into 2 * num_layers, so the group is described unsplit.
+        num_layers = 4
+        kwargs = _make_kwargs(num_layers=num_layers)
+        bytes_per_block = (
+            kwargs["num_kv_heads"]
+            * kwargs["head_dim"]
+            * kwargs["tokens_per_block"]
+            * torch.tensor([], dtype=torch.float16).element_size()
+        )
+
+        class _IndexKeyManager(KVCacheManagerV2):
+            def _extra_buffers_per_layer(self, *, tokens_per_block):
+                return {
+                    layer: [BufferConfig(role=Role.INDEX_KEY, size=bytes_per_block)]
+                    for layer in range(num_layers)
+                }
+
+        mgr = _IndexKeyManager(**kwargs)
+        try:
+            group = build_kv_cache_layout_v2(mgr).groups[0]
+            self.assertEqual(group.replicated_regions, ())
+            self.assertEqual(len(group.regions), 1)
+            pool = list(mgr.impl.pool_group_descs)[0].pools[0]
+            self.assertEqual(group.bytes_per_page, int(pool.slot_bytes))
         finally:
             mgr.shutdown()
             del mgr

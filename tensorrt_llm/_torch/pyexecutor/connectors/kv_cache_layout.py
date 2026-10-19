@@ -38,14 +38,22 @@ as MiniMax-M3's index-K. The manager declares which roles those are, and they
 are described as replicated_regions so a connector can store them once for a TP
 group instead of once per rank. V2 may interleave the two classes within a pool,
 so each class is aggregated separately rather than sliced out of a merged range.
+
+Splitting is not free. Interleaved classes fragment *both* sets (MiniMax-M3 at
+TP=2 goes from 3 regions to 59 + 57), and every region is a separate copy or
+RDMA descriptor on both the save and the load path. A group is therefore only
+split when that costs at most MAX_EXTRA_REGIONS_FOR_REPLICATION descriptors over
+the unsplit aggregation; otherwise it is described as before, every byte in
+regions, and the connector stores it per rank.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import torch
 
 from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor
+from tensorrt_llm.logger import logger
 
 if TYPE_CHECKING:
     from ..kv_cache_manager_v2 import KVCacheManagerV2
@@ -239,6 +247,39 @@ def _regions_for(
     return tuple(regions)
 
 
+#: How many more descriptors per page a group may need once its replicated
+#: bytes are split out, relative to the unsplit aggregation. One is the
+#: replicated page itself; the second covers a pool whose replicated run sits
+#: between other buffers (index-K among dense/draft K/V at TP=8), which splits
+#: that pool's shard-specific bytes in two. A fragmented split (one region per
+#: layer) is far above this and falls back to per-rank storage.
+MAX_EXTRA_REGIONS_FOR_REPLICATION = 2
+
+
+def fold_replicated_regions(layout: "KvCacheLayout") -> "KvCacheLayout":
+    """Describe every byte as shard-specific, for a consumer with one attention shard.
+
+    Replicated regions exist so a connector can store bytes that every shard
+    holds once per group. With a single shard (attention DP, where each owner
+    holds complete attention KV, or TP=1) there is no second copy to save, and
+    the split only turns one key per page into two. Folding keeps one page and
+    one key, exactly as if no role had been declared.
+    """
+    if not any(group.replicated_regions for group in layout.groups):
+        return layout
+    return replace(
+        layout,
+        groups=tuple(
+            replace(
+                group,
+                regions=(*group.regions, *group.replicated_regions),
+                replicated_regions=(),
+            )
+            for group in layout.groups
+        ),
+    )
+
+
 def build_kv_cache_layout_v2(manager: "KVCacheManagerV2") -> KvCacheLayout:
     """Describe a ``KVCacheManagerV2``'s GPU pools for a KV connector.
 
@@ -284,15 +325,31 @@ def build_kv_cache_layout_v2(manager: "KVCacheManagerV2") -> KvCacheLayout:
         sharded_ids = [b for b in buffer_ids if str(b.role) not in replicated_roles]
         replicated_ids = [b for b in buffer_ids if str(b.role) in replicated_roles]
 
+        regions = _regions_for(impl, sharded_ids, layer_group_id, num_slots, global_by_local)
+        replicated_regions = _regions_for(
+            impl, replicated_ids, layer_group_id, num_slots, global_by_local
+        )
+        if replicated_regions:
+            unsplit = _regions_for(impl, buffer_ids, layer_group_id, num_slots, global_by_local)
+            split_count = len(regions) + len(replicated_regions)
+            if split_count > len(unsplit) + MAX_EXTRA_REGIONS_FOR_REPLICATION:
+                logger.warning(
+                    f"KV connector layout: layer group {layer_group_id} would need "
+                    f"{split_count} regions per page with replicated roles stored once "
+                    f"({len(regions)} shard-specific + {len(replicated_regions)} "
+                    f"replicated) against {len(unsplit)} unsplit; storing it per rank "
+                    "instead. The replicated buffers are interleaved with other "
+                    "buffers in the pool."
+                )
+                regions, replicated_regions = unsplit, ()
+
         groups.append(
             KvCacheLayerGroupLayout(
                 layer_group_id=layer_group_id,
                 layer_ids=tuple(global_by_local[lid] for lid in local_layer_ids),
                 window_size=_window_size(init_config, local_layer_ids[0]),
-                regions=_regions_for(impl, sharded_ids, layer_group_id, num_slots, global_by_local),
-                replicated_regions=_regions_for(
-                    impl, replicated_ids, layer_group_id, num_slots, global_by_local
-                ),
+                regions=regions,
+                replicated_regions=replicated_regions,
             )
         )
 

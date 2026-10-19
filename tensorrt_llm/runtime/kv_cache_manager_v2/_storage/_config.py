@@ -202,6 +202,7 @@ def create_storage_config(config: KVCacheManagerConfig) -> StorageConfig:
     life_cycle_registry = LifeCycleRegistry(config)
     tokens_per_block = config.tokens_per_block
     expansion_map = dict[BufferId, int]()
+    coalesce_last = set[BufferId]()
     for layer in config.layers:
         life_cycle = make_life_cycle(layer, tokens_per_block)
         life_cycle_id = life_cycle_registry.get_id(life_cycle)
@@ -213,6 +214,13 @@ def create_storage_config(config: KVCacheManagerConfig) -> StorageConfig:
             buf_id = BufferId(layer.layer_id, buffer.role)
             expansion_map[buf_id] = expansion
             size_to_buffers[size].append(buf_id)
+            if buffer.coalesce_last:
+                coalesce_last.add(buf_id)
+    if coalesce_last:
+        # Stable partition: flagged buffers go after the rest of their coalesced buffer, in layer order.
+        for size_to_buffers in buffer_groups.values():
+            for buffer_ids in size_to_buffers.values():
+                buffer_ids.sort(key=lambda b: b in coalesce_last)
     # Create one slot group for each life cycle.
     # It's possible that buffers with different sizes form coalesced buffers with the same coalesced size.
     # @TODO: add test for this case.
