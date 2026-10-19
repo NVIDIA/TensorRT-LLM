@@ -233,7 +233,7 @@ class TestQwen3VL(TestModelingMultimodal):
             # Prepare metadata before capture (like in working Qwen2.5-VL test)
             trtllm_inputs["attn_metadata"].prepare()
 
-            key = (1, 0, False)
+            key = (1, 0)
             graph_runner.capture(
                 key=key,
                 forward_fn=lambda inputs: self.trtllm_model.forward(**inputs),
