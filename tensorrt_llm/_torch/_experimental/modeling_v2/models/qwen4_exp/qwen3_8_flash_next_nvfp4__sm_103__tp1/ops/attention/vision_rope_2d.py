@@ -141,6 +141,19 @@ class VisionRope2d(OpWrapper):
                 ),
             ),
             Cell(
+                why="call site: packed qkv views, video at the 32768-row ceiling",
+                spec=dict(
+                    grid=((64, 16, 32),),
+                    dtype=torch.bfloat16,
+                    layout="packed_qkv",
+                    grid_dtype=torch.int64,
+                ),
+            ),
+            Cell(
+                why="float32, video at the 32768-row ceiling, two frame groups of 128x128",
+                spec=dict(grid=((2, 128, 128),), dtype=torch.float32),
+            ),
+            Cell(
                 why="grid_thw int64 on the device (host sync)",
                 spec=dict(
                     grid=GRIDS["two_images"],
@@ -177,7 +190,7 @@ class VisionRope2d(OpWrapper):
     measured.
 
     Not certified: mixed q/k dtypes; float8; `spatial_merge_size` != 2; grid
-    sides past 6272 or calls past 22144 tokens.
+    sides past 6272 or calls past 32768 rows.
     """
 
     def __call__(

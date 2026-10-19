@@ -38,9 +38,10 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell
 #: 3, hence the 9-column state the mamba cache manager allocates per slot.
 CKPT_CHANNELS = 10240
 CKPT_DILATION = 3
-#: Largest PLE-conv-pool slot count the cache manager was seen to allocate for
-#: this checkpoint (10 .. 461 over twelve runtime-value dumps, batch never
-#: above 32). The target hands the whole pool over unsliced.
+#: A PLE-conv-pool slot count of a full-size engine run. The kernel addresses a slot by its
+#: index alone, so a pool of another size (the pool shares the recurrent pool's slot space,
+#: and a bf16 recurrent pool holds more slots in the same memory) takes the same path. The
+#: target hands the whole pool over unsliced.
 ENGINE_SLOTS = 461
 
 
@@ -119,6 +120,17 @@ class DilatedShortConvPaged(OpWrapper):
                 initial=(False,) + (True,) * 8,
                 x_form="token_major",
                 qsl_dtype=torch.int64,
+            ),
+            *(
+                _ckpt(
+                    f"MTP verify p={p} at 461 slots: {n} rows of {p} tokens",
+                    (p,) * n,
+                    pool_slots=ENGINE_SLOTS,
+                    slots=_scattered(n),
+                    x_form="token_major",
+                    qsl_dtype=torch.int64,
+                )
+                for p, n in ((5, 8), (6, 32), (7, 8), (8, 1), (8, 32))
             ),
         )
         + tuple(
@@ -212,7 +224,9 @@ class DilatedShortConvPaged(OpWrapper):
     dilation 3 (state 9), SiLU on, the whole `[slots, 10240, 9]` pool, int32
     slots, `query_start_loc_long` (int64, rebuilt from `seq_lens` under MTP),
     carry flags covering the whole batch, `pad_slot_id` -1. Certified at 8, 32
-    and 461 slots; at 461 bitwise identical to 8 for the same slot content.
+    and 461 slots; at 461 bitwise identical to 8 for the same slot content. MTP
+    verify batches are certified at 3 and at 5..8 tokens per request, up to 32
+    requests.
 
     Preconditions: `query_start_loc[-1] == x.shape[1]`; a short one indexes
     past the internal history and fires a device-side assert that kills the
@@ -226,8 +240,10 @@ class DilatedShortConvPaged(OpWrapper):
     Launch-bound on decode (8 rows: 0.461 ms eager vs 0.029 ms of conv; 0.094
     ms replayed from a graph).
 
-    Not measured: pools above 461 slots, token counts above 8192, dilation
-    above 3, kernel above 5, `torch.compile`, a pool dtype unlike the model's.
+    Not measured: pools above 461 slots (a bf16 recurrent state gives the engine
+    larger ones; a slot is addressed by its index alone), token counts above 8192,
+    dilation above 3, kernel above 5, `torch.compile`, a pool dtype unlike the
+    model's.
     """
 
     def __call__(

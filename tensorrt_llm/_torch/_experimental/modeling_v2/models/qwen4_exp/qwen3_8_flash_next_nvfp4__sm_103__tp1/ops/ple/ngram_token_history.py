@@ -25,9 +25,10 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell
 CKPT_NGRAM_SIZE = 3
 CKPT_EOS_TOKEN_ID = 248044
 CKPT_VOCAB_SIZE = 248320
-#: Largest `ple_ngram` pool the cache manager was seen to allocate for this
-#: checkpoint (10, 35, 366, 368, 396, 399, 432, 461 over twelve runtime-value
-#: dumps, batch never above 32). The target hands the whole pool over unsliced.
+#: A `ple_ngram` slot count of a full-size engine run. The op addresses a slot by its index
+#: alone, so a pool of another size (the pool shares the recurrent pool's slot space, and a
+#: bf16 recurrent pool holds more slots in the same memory) takes the same path. The target
+#: hands the whole pool over unsliced.
 ENGINE_SLOTS = 461
 
 
@@ -160,6 +161,19 @@ class NgramTokenHistory(OpWrapper):
                 ENGINE_SLOTS,
                 qsl_from="seq_lens",
                 **_CALL_SITE,
+            ),
+            *(
+                _cell(
+                    f"MTP verify p={rows}: {decodes} decode{'s' if decodes > 1 else ''} x "
+                    f"{rows} rows, qsl rebuilt",
+                    (rows,) * decodes,
+                    _scattered(decodes),
+                    (True,) * decodes,
+                    ENGINE_SLOTS,
+                    qsl_from="seq_lens",
+                    **_CALL_SITE,
+                )
+                for rows, decodes in ((5, 8), (6, 32), (7, 8), (8, 1), (8, 32))
             ),
             _cell(
                 "MTP verify mixed: 37-token context + 8 x 3 rows",

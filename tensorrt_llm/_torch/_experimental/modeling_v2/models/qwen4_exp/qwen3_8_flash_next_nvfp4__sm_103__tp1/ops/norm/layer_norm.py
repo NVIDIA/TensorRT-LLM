@@ -53,6 +53,12 @@ class LayerNorm(OpWrapper):
             )
             for rows in (1, 7, 256, 1024, 4096)
         )
+        + (
+            Cell(
+                why="vision norm at the tower call ceiling, 32768 patch rows x 1152 bf16",
+                spec=dict(shape=(32768, WIDTH), dtype=torch.bfloat16),
+            ),
+        )
         + tuple(
             Cell(
                 why=f"{str(dtype)[6:]} activations, {rows} rows",
