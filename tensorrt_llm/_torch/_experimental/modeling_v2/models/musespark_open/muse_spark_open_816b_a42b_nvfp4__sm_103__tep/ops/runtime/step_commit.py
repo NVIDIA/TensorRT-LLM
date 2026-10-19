@@ -46,6 +46,8 @@ import torch
 import triton
 import triton.language as tl
 
+from tensorrt_llm._utils import prefer_pinned
+
 KIND_COPY, KIND_GATHER, KIND_FILL, KIND_BLOCKS = 0, 1, 2, 3
 
 #: int64 fields per descriptor: kind, dst, src, count, a4, a5, a6, unused.
@@ -115,10 +117,21 @@ class StepStaging:
         self.short = False
 
     def _allocate(self, max_descriptors: int, data_bytes: int) -> None:
+        # The kernel reads the block zero-copy from the device, so it must be pinned.
+        if not prefer_pinned():
+            raise RuntimeError(
+                "StepStaging needs pinned host memory, which is unavailable here "
+                "(no CUDA device, or confidential compute is enabled)"
+            )
         self.desc = torch.zeros(
-            (max_descriptors, DESC_FIELDS), dtype=torch.int64, device="cpu", pin_memory=True
+            (max_descriptors, DESC_FIELDS),
+            dtype=torch.int64,
+            device="cpu",
+            pin_memory=prefer_pinned(),
         )
-        self.data = torch.zeros(data_bytes, dtype=torch.uint8, device="cpu", pin_memory=True)
+        self.data = torch.zeros(
+            data_bytes, dtype=torch.uint8, device="cpu", pin_memory=prefer_pinned()
+        )
         self._desc_np = self.desc.numpy()
         self._data_np = self.data.numpy()
         self._desc_base = self.desc.data_ptr()
