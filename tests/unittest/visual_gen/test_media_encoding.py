@@ -154,6 +154,7 @@ def test_ffmpeg_encoder_feeds_frames_without_holding_the_gil(tmp_path):
             return b"", b""
 
     stop = threading.Event()
+    sampling = threading.Event()
     worst_gap = [0.0]
 
     def heartbeat():
@@ -163,9 +164,11 @@ def test_ffmpeg_encoder_feeds_frames_without_holding_the_gil(tmp_path):
             now = time.perf_counter()
             worst_gap[0] = max(worst_gap[0], now - last)
             last = now
+            sampling.set()
 
     thread = threading.Thread(target=heartbeat)
     thread.start()
+    assert sampling.wait(timeout=10)
     try:
         with (
             mock.patch.object(media_encoding, "_get_ffmpeg_path", return_value="ffmpeg"),
