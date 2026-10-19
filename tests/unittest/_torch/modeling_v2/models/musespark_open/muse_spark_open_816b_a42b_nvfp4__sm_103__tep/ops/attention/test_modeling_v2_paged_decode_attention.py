@@ -26,6 +26,7 @@ import math
 import os
 import statistics
 import tempfile
+import types
 import zlib
 
 import pytest
@@ -489,7 +490,8 @@ PAGE = 32
 
 
 def _attention_module(layer_idx: int):
-    """The built-in attention at one tep8 rank's geometry, FP8 KV cache, adopted."""
+    """The built-in attention at one tep8 rank's geometry, FP8 KV cache, adopted, with the
+    decode FMHA selection the core makes for this device (``attention.select_decode_fmha``)."""
     from tensorrt_llm._torch.configs.musespark_open import MuseSparkOpenConfig
     from tensorrt_llm._torch.model_config import ModelConfig
     from tensorrt_llm._torch.models.modeling_musespark_open import MuseSparkOpenAttention
@@ -512,7 +514,10 @@ def _attention_module(layer_idx: int):
     assert attention.is_sliding == (layer_idx == SLIDING_LAYER)
     assert attention.attention_window_size == (WINDOW if attention.is_sliding else None)
     assert attention.attn.has_fp8_kv_cache
-    return target_attention.MuseSparkOpenTepDecodeAttention.adopt(attention)
+    adopted = target_attention.MuseSparkOpenTepDecodeAttention.adopt(attention)
+    layer = types.SimpleNamespace(self_attn=adopted)
+    target_attention.select_decode_fmha([layer], torch.cuda.get_device_capability())
+    return adopted
 
 
 @contextlib.contextmanager
