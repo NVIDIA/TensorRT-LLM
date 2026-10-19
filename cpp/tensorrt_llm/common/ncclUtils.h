@@ -217,6 +217,9 @@ bool isNcclWindowSupportedForPlatform(int realSmVersion, bool isIntegrated, int 
 // and the current CUDA device is not in a known-unsupported platform/version set.
 bool isNcclWindowSupported();
 
+// NCCL 2.30.7 is the first public release supporting window registration during capture.
+bool isNcclWindowRegistrationCaptureSupported();
+
 //==============================================================================
 // NCCL Window Buffer Allocation
 //==============================================================================
@@ -269,7 +272,7 @@ public:
     // Eager requests only reuse unowned buffers. A request made during CUDA graph capture first
     // reuses buffers owned by that PyTorch graph memory pool, then may claim an unowned buffer for it.
     // Uses best-fit strategy: selects the smallest eligible buffer that meets the size requirement.
-    // New allocation/registration is prohibited during capture.
+    // New allocation/registration during capture requires NCCL runtime 2.30.7+ and a graph-pool owner.
     // Uses the supplied stream for capture detection and stream-scoped reuse eligibility.
     // Callers using a non-default stream must pass it explicitly.
     NCCLWindowBuffer requestBuffer(ncclComm_t comm, size_t size, cudaStream_t stream = nullptr);
@@ -353,7 +356,11 @@ public:
 private:
     friend class NCCLWindowAllocatorTestAccess;
 
-    NCCLWindowAllocator() = default;
+    NCCLWindowAllocator()
+        : mCaptureRegistrationSupported(isNcclWindowRegistrationCaptureSupported())
+    {
+    }
+
     ~NCCLWindowAllocator() = default;
 
     // Allocate a new buffer and register it with NCCL as a window
@@ -436,6 +443,7 @@ private:
     void quarantineTensorLeaseLocked(TensorLease const& tensorLease);
     void assertLifecycleWarning() const noexcept;
 
+    bool const mCaptureRegistrationSupported;
     mutable std::mutex mMutex;
     std::atomic_bool mSuppressLifecycleWarningAssertionsForTest{false};
     std::unordered_map<ncclComm_t, std::vector<BufferEntry>> mBufferPool;

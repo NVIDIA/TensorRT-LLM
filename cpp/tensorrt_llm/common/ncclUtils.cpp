@@ -321,6 +321,16 @@ bool isNcclWindowSupported()
     return windowBuffersSupported;
 }
 
+bool isNcclWindowRegistrationCaptureSupported()
+{
+#if NCCL_VERSION_CODE >= NCCL_VERSION(2, 28, 0)
+    int runtimeVersion = 0;
+    return ncclGetVersion(&runtimeVersion) == ncclSuccess && runtimeVersion >= NCCL_VERSION(2, 30, 7);
+#else
+    return false;
+#endif
+}
+
 //==============================================================================
 // NcclCommResourceManager Implementation
 //==============================================================================
@@ -700,14 +710,13 @@ NCCLWindowBuffer NCCLWindowAllocator::requestBuffer(ncclComm_t comm, size_t size
         return NCCLWindowBuffer();
     }
 
-    // Registration is not capture-safe. A capture without a suitable dedicated/eager buffer must
-    // use the existing unregistered fallback path. Successful production capture lifecycles, window
-    // requests, tensor-scope exits, and explicit graph-owner releases execute in identical SPMD order.
-    // Failure and destructor paths abandon or quarantine their buffers instead of changing eligibility.
+    // Older NCCL runtimes require an existing dedicated/eager buffer during capture. Successful production capture
+    // lifecycles, window requests, tensor-scope exits, and explicit graph-owner releases execute in identical SPMD
+    // order. Failure and destructor paths abandon or quarantine their buffers instead of changing eligibility.
     // Cross-stream reuse is enabled only at an explicit device-synchronization boundary. Together,
     // these rules keep best-fit selection rank-symmetric: GC timing cannot change pool
     // history, and an NCCL symmetric collective never mixes window-backed and plain pointers.
-    if (isCapturing)
+    if (isCapturing && !mCaptureRegistrationSupported)
     {
         if (markFallbackWarningLoggedLocked(comm, FallbackWarning::kNoEligibleCaptureBuffer))
         {
@@ -738,7 +747,7 @@ NCCLWindowBuffer NCCLWindowAllocator::requestBuffer(ncclComm_t comm, size_t size
     if (buffer.isValid())
     {
         buffer.leaseId = mNextLeaseId++;
-        commBuffers.push_back({buffer, true, getDevice(), std::nullopt});
+        commBuffers.push_back({buffer, true, getDevice(), isCapturing ? std::make_optional(graphOwner) : std::nullopt});
     }
     else
     {

@@ -518,9 +518,15 @@ TEST_F(NCCLWindowAllocatorTest, ExplicitStreamAllocationAndCapture)
     nccl_util::NCCLWindowBuffer newBuffer;
     EXPECT_NO_THROW(reusedBuffer = allocator.requestBuffer(*testComm, kBufferSize, stream.get()));
     {
-        // Registration is prohibited during capture, so the larger request uses the unregistered fallback.
-        ExpectedLifecycleWarning const expectedWarning{allocator};
-        EXPECT_NO_THROW(newBuffer = allocator.requestBuffer(*testComm, kBufferSize * 2, stream.get()));
+        if (nccl_util::isNcclWindowRegistrationCaptureSupported())
+        {
+            EXPECT_NO_THROW(newBuffer = allocator.requestBuffer(*testComm, kBufferSize * 2, stream.get()));
+        }
+        else
+        {
+            ExpectedLifecycleWarning const expectedWarning{allocator};
+            EXPECT_NO_THROW(newBuffer = allocator.requestBuffer(*testComm, kBufferSize * 2, stream.get()));
+        }
     }
     allocator.setGraphPoolOwner(-1);
     cudaGraph_t graph = nullptr;
@@ -532,9 +538,11 @@ TEST_F(NCCLWindowAllocatorTest, ExplicitStreamAllocationAndCapture)
 
     EXPECT_TRUE(reusedBuffer.isValid());
     EXPECT_EQ(reusedBuffer.ptr, buffer.ptr);
-    EXPECT_FALSE(newBuffer.isValid());
-    EXPECT_EQ(allocator.getBufferCount(*testComm), 1);
+    bool const captureSupported = nccl_util::isNcclWindowRegistrationCaptureSupported();
+    EXPECT_EQ(newBuffer.isValid(), captureSupported);
+    EXPECT_EQ(allocator.getBufferCount(*testComm), captureSupported ? 2 : 1);
     allocator.releaseBuffer(*testComm, reusedBuffer.ptr);
+    allocator.releaseBuffer(*testComm, newBuffer.ptr);
     allocator.releaseGraphPoolOwner(kOwner);
 
     nccl_util::ScopedNCCLWindowBuffer const scopedBuffer(testComm, kBufferSize * 2, stream.get());
