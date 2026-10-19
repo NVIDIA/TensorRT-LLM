@@ -3671,6 +3671,191 @@ class TestPendingTransferResponseFlush:
         assert executor._flush_pending_transfer_responses.call_count == 2
 
 
+class TestKvCacheEventFlushRankSymmetry:
+    """KV cache event flushing must stay in lockstep across attention-DP ranks.
+
+    With attention DP and buffered KV events, KV cache manager V2's
+    ``flush_iteration_events`` allgathers events across the attention-DP group.
+    In the overlap loop, ``_process_previous_batch`` runs only on ranks where
+    ``should_process_previous_batch`` holds, and that flag differs between
+    ranks when some ranks scheduled work and others did not. These tests drive
+    one such iteration on each simulated rank and compare the ordered trace of
+    attention-DP collectives that every rank issues.
+    """
+
+    @staticmethod
+    def _make_rank(monkeypatch, *, enable_attention_dp, has_local_work, has_previous_batch):
+        for target in ("torch.cuda.set_device", "cudart.cudaSetDevice", "CUASSERT"):
+            monkeypatch.setattr(f"tensorrt_llm._torch.pyexecutor.py_executor.{target}", Mock())
+
+        trace = []
+        executor = object.__new__(PyExecutor)
+        executor.device_id = 0
+        profiler = MagicMock()
+        profiler.__enter__.return_value = Mock()
+        executor._profiler = Mock(return_value=profiler)
+        executor.hang_detector = MagicMock()
+        executor.enable_iter_perf_stats = False
+        executor.enable_attention_dp = enable_attention_dp
+        executor.enable_kv_cache_events = True
+        executor.enable_early_first_token_response = False
+        executor.is_benchmark_disagg = False
+        executor.iter_counter = 0
+        executor._resource_governor_enabled = False
+        executor._is_kv_manager_v2 = False
+        executor._mm_encoder_item_scheduling_enabled = False
+        executor.kv_connector_manager = None
+        executor.drafter = None
+        executor.speculation_gate = None
+        executor.model_engine = types.SimpleNamespace()
+        executor.perf_manager = Mock()
+
+        coordinator = Mock()
+        coordinator.handle_timeouts_synced.side_effect = lambda: trace.append("timeouts")
+        executor._disagg_coordinator = coordinator
+
+        kv_cache_manager = Mock()
+        kv_cache_manager.flush_iteration_events.side_effect = lambda: trace.append(
+            "kv_cache_events"
+        )
+        executor.resource_manager = types.SimpleNamespace(
+            update_resources=Mock(),
+            resource_managers={ResourceManagerType.KV_CACHE_MANAGER: kv_cache_manager},
+        )
+
+        # Both response paths end in the same attention-DP response gather.
+        executor._handle_responses = Mock(side_effect=lambda **_: trace.append("responses") or [])
+        executor._enqueue_responses = Mock(side_effect=lambda _: trace.append("responses"))
+        executor._flush_pending_transfer_responses = Mock(
+            side_effect=lambda: trace.append("transfer_responses")
+        )
+
+        scheduled_batch = types.SimpleNamespace(
+            encoder_requests=[], paused_requests=[], generation_requests=[]
+        )
+        executor._prepare_and_schedule_batch = Mock(
+            side_effect=[(scheduled_batch, None), (None, None)]
+        )
+        executor._check_benchmark_disagg_gate = Mock(return_value=(True, False))
+        # Some rank has no work, so no rank can queue this iteration.
+        executor._can_queue = Mock(return_value=(False, has_local_work))
+        executor.previous_batch = (
+            types.SimpleNamespace(
+                sample_state=Mock(),
+                scheduled_requests=Mock(all_requests=Mock(return_value=[])),
+            )
+            if has_previous_batch
+            else None
+        )
+        for name in (
+            "_wait_for_model_engine_input_copy",
+            "_terminate_requests",
+            "_pause_requests",
+            "_release_unused_connector_reservations",
+            "_revert_gen_alloc",
+            "_finalize_adp_dummy_allocation",
+            "_update_requests",
+            "_send_kv_async",
+            "_commit_kv_cache_stats",
+            "_handle_canceled_requests",
+            "_flush_iter_stats_synced",
+            "_kv_connector_terminate_requests",
+        ):
+            setattr(executor, name, Mock())
+        return executor, trace, kv_cache_manager
+
+    def test_adp_ranks_flush_kv_cache_events_in_lockstep(self, monkeypatch):
+        """A rank that defers its previous batch still joins the KV event gather."""
+        busy, busy_trace, _ = self._make_rank(
+            monkeypatch, enable_attention_dp=True, has_local_work=True, has_previous_batch=True
+        )
+        idle, idle_trace, _ = self._make_rank(
+            monkeypatch, enable_attention_dp=True, has_local_work=False, has_previous_batch=True
+        )
+
+        PyExecutor._executor_loop_overlap(busy)
+        PyExecutor._executor_loop_overlap(idle)
+
+        # The ranks did diverge: only the idle rank processed its previous batch.
+        busy.resource_manager.update_resources.assert_not_called()
+        idle.resource_manager.update_resources.assert_called_once()
+        assert busy_trace == idle_trace
+        assert busy_trace.count("kv_cache_events") == 1
+
+    def test_adp_rank_without_previous_batch_joins_kv_cache_event_gather(self, monkeypatch):
+        """Ranks disagree on ``previous_batch is not None`` after a deferred step."""
+        with_batch, with_batch_trace, _ = self._make_rank(
+            monkeypatch, enable_attention_dp=True, has_local_work=False, has_previous_batch=True
+        )
+        without_batch, without_batch_trace, _ = self._make_rank(
+            monkeypatch, enable_attention_dp=True, has_local_work=False, has_previous_batch=False
+        )
+
+        PyExecutor._executor_loop_overlap(with_batch)
+        PyExecutor._executor_loop_overlap(without_batch)
+
+        assert with_batch_trace == without_batch_trace
+        assert with_batch_trace.count("kv_cache_events") == 1
+
+    @pytest.mark.parametrize(
+        "has_local_work, has_previous_batch, expected_flushes",
+        [(False, True, 1), (False, False, 0)],
+    )
+    def test_without_adp_flushes_once_per_processed_previous_batch(
+        self, monkeypatch, has_local_work, has_previous_batch, expected_flushes
+    ):
+        """Without attention DP the flush cadence is unchanged."""
+        executor, _, kv_cache_manager = self._make_rank(
+            monkeypatch,
+            enable_attention_dp=False,
+            has_local_work=has_local_work,
+            has_previous_batch=has_previous_batch,
+        )
+
+        PyExecutor._executor_loop_overlap(executor)
+
+        assert kv_cache_manager.flush_iteration_events.call_count == expected_flushes
+
+    @pytest.mark.parametrize(
+        "enable_attention_dp, has_previous_batch, expected_flushes",
+        [(True, True, 1), (True, False, 1), (False, True, 1), (False, False, 0)],
+    )
+    def test_rebalance_flushes_kv_cache_events_on_every_adp_rank(
+        self, monkeypatch, enable_attention_dp, has_previous_batch, expected_flushes
+    ):
+        """The rebalance hook consumes ``previous_batch`` only where it exists."""
+        executor, _, kv_cache_manager = self._make_rank(
+            monkeypatch,
+            enable_attention_dp=enable_attention_dp,
+            has_local_work=False,
+            has_previous_batch=has_previous_batch,
+        )
+        monkeypatch.setattr(
+            "tensorrt_llm._torch.pyexecutor.py_executor.torch.cuda.current_stream", Mock()
+        )
+        executor._agreed_need_adjustment = Mock(return_value=True)
+        executor._rebalance_kv_pools_now = Mock()
+
+        PyExecutor._maybe_rebalance_kv_pools(executor)
+
+        assert executor.previous_batch is None
+        assert kv_cache_manager.flush_iteration_events.call_count == expected_flushes
+
+    @pytest.mark.parametrize("enable_attention_dp", [True, False])
+    def test_kv_cache_events_disabled_never_flushes(self, monkeypatch, enable_attention_dp):
+        executor, _, kv_cache_manager = self._make_rank(
+            monkeypatch,
+            enable_attention_dp=enable_attention_dp,
+            has_local_work=False,
+            has_previous_batch=True,
+        )
+        executor.enable_kv_cache_events = False
+
+        PyExecutor._executor_loop_overlap(executor)
+
+        kv_cache_manager.flush_iteration_events.assert_not_called()
+
+
 class TestOneModelMTPDraftTokenScheduling:
     """Regression tests for the one-model MTP over-scheduling bug (#16101).
 

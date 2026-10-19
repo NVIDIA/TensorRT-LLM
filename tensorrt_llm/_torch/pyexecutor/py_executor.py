@@ -5495,7 +5495,9 @@ class PyExecutor:
             return
 
         torch.cuda.current_stream().synchronize()
+        had_previous_batch = self.previous_batch is not None
         self._consume_previous_batch_for_rebalance()
+        self._add_kv_cache_events_synced(had_previous_batch)
         self._rebalance_kv_pools_now()
 
     def _rebalance_kv_pools_now(self) -> None:
@@ -5984,7 +5986,9 @@ class PyExecutor:
                             and scheduled_batch.context_requests):
                         self._update_v2_context_resources(scheduled_batch)
 
-                if self.previous_batch is not None and should_process_previous_batch:
+                processed_previous_batch = (self.previous_batch is not None
+                                            and should_process_previous_batch)
+                if processed_previous_batch:
                     self._commit_kv_cache_stats(
                         self.previous_batch.scheduled_requests)
                     # _process_previous_batch may terminate requests or resize
@@ -5996,6 +6000,10 @@ class PyExecutor:
                         self.previous_batch.scheduled_requests.all_requests())
                 else:
                     self._enqueue_responses([])
+
+                # Rank-symmetric KV cache event flush for the
+                # (per-rank-divergent) _process_previous_batch above.
+                self._add_kv_cache_events_synced(processed_previous_batch)
 
                 # Drain buffers from the (per-rank-divergent)
                 # _process_previous_batch above; rank-symmetric companion to
@@ -6146,8 +6154,6 @@ class PyExecutor:
         self.resource_manager.update_resources(scheduled_requests,
                                                attn_metadata,
                                                kv_cache_dtype_byte_size)
-        if self.enable_kv_cache_events:
-            self._add_kv_cache_events()
 
         if self.enable_iter_perf_stats:
             self._process_iter_stats(finished_requests, self.active_requests,
@@ -6880,6 +6886,30 @@ class PyExecutor:
         # Flush iteration events at each iteration to ensure that events have enough time
         # to be transferred to main thread when user needs them.
         kv_cache_manager.flush_iteration_events()
+
+    def _add_kv_cache_events_synced(self,
+                                    processed_previous_batch: bool) -> None:
+        """Flush KV cache events after a possibly rank-divergent batch step.
+
+        With attention DP and buffered KV events, KV cache manager V2's
+        ``flush_iteration_events`` allgathers events across the attention-DP
+        group.  The steps that produce the events (``_process_previous_batch``
+        in the overlap loop and in the rebalance hook) are gated by
+        ``should_process_previous_batch`` or ``previous_batch is not None``,
+        both of which can differ between ranks, so the flush is issued here,
+        from a point every rank reaches in the same order.  Under attention DP every rank flushes on every
+        call; an empty flush only joins the gather.  Without attention DP
+        the flush is local and keeps its previous cadence: once per
+        processed previous batch.
+
+        Args:
+            processed_previous_batch: Whether this rank just ran
+                ``_process_previous_batch``.
+        """
+        if not self.enable_kv_cache_events:
+            return
+        if self.enable_attention_dp or processed_previous_batch:
+            self._add_kv_cache_events()
 
     def _balance_adp_requests(self, context_requests: list[LlmRequest],
                               generation_requests: list[LlmRequest]):

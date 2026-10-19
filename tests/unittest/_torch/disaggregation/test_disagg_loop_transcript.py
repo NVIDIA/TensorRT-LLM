@@ -121,6 +121,7 @@ def _idle_executor(monkeypatch, calls: list) -> PyExecutor:
     executor.hang_detector = MagicMock()
     executor.enable_iter_perf_stats = False
     executor.enable_attention_dp = False
+    executor.enable_kv_cache_events = False
     executor.is_benchmark_disagg = False
     executor.iter_counter = 0
     executor._resource_governor_enabled = False
