@@ -26,21 +26,15 @@ class MixedPrecisionKVView:
     @classmethod
     def prepare_batch(cls, metadata: AttentionMetadata) -> None:
         """Update addresses and native Attention plans before capture or replay."""
-        manager = metadata.kv_cache_manager
-        for layer_idx, local in manager.layer_offsets.items():
-            if local not in manager.high_layers:
-                continue
-            view = metadata.mixed_precision_kv_views.get(layer_idx)
-            if view is None or not metadata.is_cuda_graph:
-                view = cls(metadata, layer_idx)
-                metadata.mixed_precision_kv_views[layer_idx] = view
-            view.update(metadata, layer_idx)
+        if not metadata.kv_cache_manager.high_layers:
+            return
+        view = next(iter(metadata.mixed_precision_kv_views.values()), None)
+        if view is None or not metadata.is_cuda_graph:
+            view = cls(metadata)
+            metadata.mixed_precision_kv_views = dict.fromkeys(view.pools, view)
+        view.update(metadata)
 
-    def __init__(
-        self,
-        metadata: AttentionMetadata,
-        layer_idx: int,
-    ) -> None:
+    def __init__(self, metadata: AttentionMetadata) -> None:
         from .trtllm import TrtllmAttentionMetadata
 
         manager = metadata.kv_cache_manager
@@ -49,33 +43,41 @@ class MixedPrecisionKVView:
         self.block_size = manager.tokens_per_block
         # Native BF16 paged-context FMHA uses 32-token pages.
         self.tokens_per_block = min(self.block_size, 32) if trtllm else self.block_size
-        pools = (
-            manager.get_buffers(layer_idx, metadata.kv_layout, mixed_precision_pool=pool)
-            for pool in ("low", "scales", "high")
-        )
-        self.pools = tuple(
-            pool if self.layout == metadata.kv_layout else pool.transpose(2, 3) for pool in pools
-        )
         self.max_seq_len = manager.max_seq_len
         self.max_blocks_per_seq = (
             self.max_seq_len + self.tokens_per_block - 1
         ) // self.tokens_per_block
         self.kv_factor = manager.kv_factor
-        self.layer_offsets = {layer_idx: 0}
         self.max_attention_window_vec = (None,)
         # Fixed per-request spans keep addresses unchanged as sequences grow.
         self.page_starts = [row * self.max_blocks_per_seq for row in range(metadata.num_seqs + 1)]
-        shape = [self.page_starts[-1], *self.pools[-1].shape[1:]]
-        shape[3 if self.layout == "HND" else 2] = self.tokens_per_block
-        self.pool = manager.get_staging_buffer(shape, self.pools[-1].dtype)
+        storage = manager.mixed_precision_buffers.get_buffer(
+            [manager._staging_bytes], torch.uint8, "mixed_kv_staging", True
+        )
+        self.pools = {}
+        for layer_idx, local in manager.layer_offsets.items():
+            if local not in manager.high_layers:
+                continue
+            pools = (
+                manager.get_buffers(layer_idx, metadata.kv_layout, mixed_precision_pool=pool)
+                for pool in ("low", "scales", "high")
+            )
+            pools = tuple(
+                pool if self.layout == metadata.kv_layout else pool.transpose(2, 3)
+                for pool in pools
+            )
+            shape = [self.page_starts[-1], *pools[-1].shape[1:]]
+            shape[3 if self.layout == "HND" else 2] = self.tokens_per_block
+            staging = manager.mixed_precision_buffers._view_as(storage, shape, pools[-1].dtype)
+            self.pools[layer_idx] = (staging, *pools)
+        self.layer_offsets = dict.fromkeys(self.pools, 0)
         self.dtype = manager.dtype
-        self.kv_cache_pool_pointers = torch.tensor([[self.pool.data_ptr(), 0]], dtype=torch.int64)
+        self.kv_cache_pool_pointers = torch.tensor([[storage.data_ptr(), 0]], dtype=torch.int64)
         self.kv_cache_pool_mapping = torch.zeros((1, 2), dtype=torch.int32)
         self.metadata = None
 
-    def update(self, metadata: AttentionMetadata, layer_idx: int) -> None:
+    def update(self, metadata: AttentionMetadata) -> None:
         manager = metadata.kv_cache_manager
-        page_tables = manager.get_mixed_precision_page_tables(metadata.request_ids, layer_idx)
         cached_lengths = metadata.kv_cache_params.num_cached_tokens_per_seq
         seq_lens = metadata.seq_lens.tolist()
         lengths = [a + b for a, b in zip(cached_lengths, seq_lens)]
@@ -85,23 +87,23 @@ class MixedPrecisionKVView:
         batch = len(lengths)
         buffers = manager.mixed_precision_buffers
         max_pages = (self.max_seq_len + self.block_size - 1) // self.block_size
-        tables = torch.full(
-            (3, batch, max_pages), -1, dtype=torch.int32, pin_memory=prefer_pinned()
-        )
-        for role, rows in enumerate(page_tables):
-            for row, pages in enumerate(rows):
-                count = (lengths[row] + self.block_size - 1) // self.block_size
-                if role < 2 and (len(pages) < count or any(page < 0 for page in pages[:count])):
-                    raise ValueError("Mixed-precision primary KV and scales must cover every token")
-                count = min(len(pages), max_pages)
-                tables[role, row, :count] = torch.tensor(pages[:count], dtype=torch.int32)
-        self.page_tables = buffers.get_buffer(
-            (3, manager.max_batch_size, max_pages),
-            torch.int32,
-            f"mixed_page_tables_{layer_idx}",
-            metadata.is_cuda_graph,
-        )[:, :batch]
-        self.page_tables.copy_(tables, non_blocking=True)
+        self.page_tables = {}
+        for layer_idx in self.pools:
+            page_tables = manager.get_mixed_precision_page_tables(metadata.request_ids, layer_idx)
+            tables = torch.full(
+                (3, batch, max_pages), -1, dtype=torch.int32, pin_memory=prefer_pinned()
+            )
+            for role, rows in enumerate(page_tables):
+                for row, pages in enumerate(rows):
+                    count = min(len(pages), max_pages)
+                    tables[role, row, :count] = torch.tensor(pages[:count], dtype=torch.int32)
+            self.page_tables[layer_idx] = buffers.get_buffer(
+                (3, manager.max_batch_size, max_pages),
+                torch.int32,
+                f"mixed_page_tables_{layer_idx}",
+                metadata.is_cuda_graph,
+            )[:, :batch]
+            self.page_tables[layer_idx].copy_(tables, non_blocking=True)
         self.lengths = buffers.get_buffer(
             (2, manager.max_batch_size), torch.int32, "mixed_lengths", metadata.is_cuda_graph
         )[:, :batch]
@@ -140,7 +142,7 @@ class MixedPrecisionKVView:
             block_offsets = buffers.get_buffer(
                 (1, manager.max_batch_size, 2, self.max_blocks_per_seq),
                 torch.int32,
-                f"mixed_block_offsets_{layer_idx}",
+                "mixed_block_offsets",
                 metadata.is_cuda_graph,
             )[:, : len(lengths)]
             block_offsets.copy_(
@@ -150,25 +152,29 @@ class MixedPrecisionKVView:
             self.metadata.kv_cache_block_offsets = block_offsets
         self.metadata.mixed_precision_kv_views = None
 
-    def materialize(self) -> None:
-        from ...cute_dsl_kernels.mixed_precision_kv import materialize_mixed_precision_kv
+    def convert(self, layer_idx: int, *, writeback: bool = False) -> None:
+        from ...cute_dsl_kernels.mixed_precision_kv import convert_mixed_precision_kv
 
-        materialize_mixed_precision_kv(
-            self.pool,
-            *self.pools,
-            self.page_tables,
+        convert_mixed_precision_kv(
+            writeback,
+            self.max_new_tokens_per_request
+            if writeback
+            else self.max_blocks_per_seq * self.tokens_per_block,
+            *self.pools[layer_idx],
+            self.page_tables[layer_idx],
             self.lengths,
             self.layout,
         )
 
     def get_buffers(self, layer_idx: int, kv_layout: str = "NHD") -> torch.Tensor:
-        return self.pool if kv_layout == self.layout else self.pool.transpose(2, 3)
+        pool = self.pools[layer_idx][0]
+        return pool if kv_layout == self.layout else pool.transpose(2, 3)
 
     def get_attention_op_num_blocks(self, local_layer_idx: int) -> int:
-        return self.pool.shape[0] * self.pool.shape[1]
+        return self.page_starts[-1] * self.kv_factor
 
     def get_attention_op_kv_page_offset(self, local_layer_idx: int) -> int:
-        return self.pool.shape[1] - 1
+        return self.kv_factor - 1
 
     def get_batch_cache_indices(self, request_ids: list[int], layer_idx: int) -> list[list[int]]:
         return [
@@ -178,7 +184,7 @@ class MixedPrecisionKVView:
 
     @property
     def blocks_in_primary_pool(self) -> int:
-        return self.pool.shape[0]
+        return self.page_starts[-1]
 
     def get_batch_cache_indices_flat(self, request_ids, num_blocks, layer_idx=None):
         return torch.tensor(
@@ -189,17 +195,4 @@ class MixedPrecisionKVView:
             ],
             dtype=torch.int32,
             pin_memory=prefer_pinned(),
-        )
-
-    def writeback(self) -> None:
-        """Write every new token to the primary pool and its retained high page."""
-        from ...cute_dsl_kernels.mixed_precision_kv import writeback_mixed_precision_kv
-
-        writeback_mixed_precision_kv(
-            self.pool,
-            *self.pools,
-            self.page_tables,
-            self.lengths,
-            self.max_new_tokens_per_request,
-            self.layout,
         )

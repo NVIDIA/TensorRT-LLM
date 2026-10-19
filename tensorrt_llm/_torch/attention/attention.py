@@ -989,7 +989,7 @@ class Attention(nn.Module):
         mixed_precision_kv_view = get_mixed_precision_kv_view(
             attn_metadata, self.attn.layer_idx)
         if mixed_precision_kv_view is not None:
-            mixed_precision_kv_view.materialize()
+            mixed_precision_kv_view.convert(self.attn.layer_idx)
             attn_metadata = mixed_precision_kv_view.metadata
         attn_output = self.attn.forward(
             q,
@@ -1013,7 +1013,7 @@ class Attention(nn.Module):
                 relative_attention_max_distance=relative_attention_max_distance,
             ))
         if mixed_precision_kv_view is not None:
-            mixed_precision_kv_view.writeback()
+            mixed_precision_kv_view.convert(self.attn.layer_idx, writeback=True)
         if isinstance(attn_output, tuple):
             assert len(
                 attn_output

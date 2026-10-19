@@ -2927,12 +2927,16 @@ class KVCacheManagerV2(BaseResourceManager):
             non_blocking=True,
         )
 
+    def _get_layer_storage_dtype(self, local_layer_idx: int) -> DataType:
+        """Return the storage dtype for one local layer."""
+        return self.dtype
+
     def _get_buffer_roles_for_layer(self, local_layer_idx: int) -> List[DataRole]:
         """Return the primary cache roles allocated for one local layer."""
         roles = [Role.KEY]
         if self.kv_cache_type != CacheTypeCpp.SELFKONLY:
             roles.append(Role.VALUE)
-        if self.dtype == DataType.NVFP4:
+        if self._get_layer_storage_dtype(local_layer_idx) == DataType.NVFP4:
             head_dim = self.head_dim_per_layer[local_layer_idx]
             assert head_dim % 2 == 0, (
                 f"head_dim must be divisible by 2 for nvfp4 kv cache, "
@@ -3261,36 +3265,36 @@ class KVCacheManagerV2(BaseResourceManager):
         assert kv_layout in ["NHD", "HND"], f"Unsupported kv_layout: {kv_layout}"
 
         element_per_container = 1
-        dtype = self.dtype
+        dtype = self._get_layer_storage_dtype(layer_offset)
         if dtype == DataType.NVFP4:
             element_per_container = 2
             dtype = torch.int8
 
-        layer_head_dim = self.head_dim_per_layer[layer_offset]
-        if kv_layout == "NHD":
-            shape = [
-                self.impl.get_page_index_upper_bound(layer_offset, Role.KEY) // self.kv_factor,
-                self.kv_factor,
-                self.tokens_per_block,
-                self.num_kv_heads_per_layer[layer_offset],
-                layer_head_dim // element_per_container,
-            ]
-        else:
-            shape = [
-                self.impl.get_page_index_upper_bound(layer_offset, Role.KEY) // self.kv_factor,
-                self.kv_factor,
-                self.num_kv_heads_per_layer[layer_offset],
-                self.tokens_per_block,
-                layer_head_dim // element_per_container,
-            ]
-
-        return convert_to_torch_tensor(
-            TensorWrapper(
-                addr_key,
-                dtype,
-                shape,
-            )
+        head_shape = (
+            self.num_kv_heads_per_layer[layer_offset],
+            self.head_dim_per_layer[layer_offset] // element_per_container,
         )
+        return self._get_pool_view(layer_offset, Role.KEY, dtype, head_shape, kv_layout)
+
+    def _get_pool_view(
+        self,
+        layer_id: int,
+        role: DataRole,
+        dtype: DataType | torch.dtype,
+        head_shape: tuple[int, int],
+        kv_layout: str,
+    ) -> torch.Tensor:
+        """Return a zero-copy paged pool view with the given head shape."""
+        address = self.impl.get_mem_pool_base_address(layer_id, role, PageIndexMode.SHARED)
+        shape = [
+            self.impl.get_page_index_upper_bound(layer_id, role) // self.kv_factor,
+            self.kv_factor,
+            self.tokens_per_block,
+            *head_shape,
+        ]
+        if kv_layout == "HND":
+            shape[2], shape[3] = shape[3], shape[2]
+        return convert_to_torch_tensor(TensorWrapper(address, dtype, shape))
 
     def get_index_k_buffer(
         self,
@@ -5880,35 +5884,28 @@ class KVCacheManagerV2(BaseResourceManager):
         return out_tensor
 
     def get_cache_bytes_per_token(self) -> int:
-        data_roles = [Role.KEY]
-        if self.kv_cache_type != CacheTypeCpp.SELFKONLY:
-            data_roles.append(Role.VALUE)
-        if self.dtype == DataType.NVFP4:
-            data_roles.append(Role.KEY_BLOCK_SCALE)
-            if self.kv_cache_type != CacheTypeCpp.SELFKONLY:
-                data_roles.append(Role.VALUE_BLOCK_SCALE)
-
         return sum(
             self.get_layer_bytes_per_token(local_layer_idx=local_layer_idx, data_role=data_role)
             for local_layer_idx in range(self.num_local_layers)
-            for data_role in data_roles
+            for data_role in self._get_buffer_roles_for_layer(local_layer_idx)
         )
 
     def get_layer_bytes_per_token(self, local_layer_idx: int, data_role: Role):
-        if self.dtype not in (
+        dtype = self._get_layer_storage_dtype(local_layer_idx)
+        if dtype not in (
             DataType.FP8,
             DataType.HALF,
             DataType.BF16,
             DataType.FLOAT,
             DataType.NVFP4,
         ):
-            raise ValueError(f"Cannot support {self.dtype} KV cache.")
+            raise ValueError(f"Cannot support {dtype} KV cache.")
 
         if data_role == Role.ALL:
             kv_factor = self.kv_factor
         elif data_role in [Role.KEY, Role.VALUE, Role.KEY_BLOCK_SCALE, Role.VALUE_BLOCK_SCALE]:
             if data_role in [Role.KEY_BLOCK_SCALE, Role.VALUE_BLOCK_SCALE]:
-                assert self.dtype == DataType.NVFP4, (
+                assert dtype == DataType.NVFP4, (
                     "NVFP4 is the only supported dtype for block quant data roles"
                 )
             if data_role == Role.VALUE:
@@ -5925,14 +5922,14 @@ class KVCacheManagerV2(BaseResourceManager):
             * self.head_dim_per_layer[local_layer_idx]
         )
 
-        cache_size_bytes_per_token = get_size_in_bytes(cache_size_per_token, self.dtype)
+        cache_size_bytes_per_token = get_size_in_bytes(cache_size_per_token, dtype)
 
         if data_role in [Role.KEY, Role.VALUE]:
             return cache_size_bytes_per_token
 
         quant_size_per_token = 0
 
-        if self.dtype == DataType.NVFP4:
+        if dtype == DataType.NVFP4:
             quant_size_per_token = self.calculate_scaling_factor_size_bytes(
                 cache_size_per_token,
                 quant_vector_size=16,
@@ -6768,7 +6765,6 @@ class MixedPrecisionKVCacheManager(KVCacheManagerV2):
         *args,
         first_n: int = 256,
         last_n: int = 256,
-        dtype: DataType = DataType.HALF,
         low_dtype: DataType = DataType.NVFP4,
         high_low_pool_ratio: float | None = None,
         **kwargs,
@@ -6796,37 +6792,10 @@ class MixedPrecisionKVCacheManager(KVCacheManagerV2):
         from ...memory_buffer_utils import Buffers
 
         self.mixed_precision_buffers = Buffers()
-        super().__init__(*args, dtype=dtype, **kwargs)
+        super().__init__(*args, **kwargs)
 
-    # KVCacheManagerV2 overrides.
-
-    def _get_buffer_roles_for_layer(self, local_layer_idx: int) -> list[DataRole]:
-        roles = super()._get_buffer_roles_for_layer(local_layer_idx)
-        if self._uses_mixed_precision(local_layer_idx):
-            roles.append(Role.KEY_BLOCK_SCALE)
-            if Role.VALUE in roles:
-                roles.append(Role.VALUE_BLOCK_SCALE)
-        return roles
-
-    def get_layer_bytes_per_token(self, local_layer_idx: int, data_role: Role) -> int:
-        if not self._uses_mixed_precision(local_layer_idx):
-            return super().get_layer_bytes_per_token(local_layer_idx, data_role)
-        elements = (
-            self.num_kv_heads_per_layer[local_layer_idx]
-            * self.head_dim_per_layer[local_layer_idx]
-            * (self.kv_factor if data_role == Role.ALL else 1)
-        )
-        data_bytes = get_size_in_bytes(elements, self.low_dtype)
-        if data_role in (Role.KEY, Role.VALUE):
-            return data_bytes
-        scale_bytes = self.calculate_scaling_factor_size_bytes(elements, 16, DataType.FP8)
-        return data_bytes + scale_bytes if data_role == Role.ALL else scale_bytes
-
-    def get_cache_bytes_per_token(self) -> int:
-        return sum(
-            self.get_layer_bytes_per_token(layer, Role.ALL)
-            for layer in range(self.num_local_layers)
-        )
+    def _get_layer_storage_dtype(self, local_layer_idx: int) -> DataType:
+        return self.low_dtype if self._uses_mixed_precision(local_layer_idx) else self.dtype
 
     def _build_cache_config(self, config: KVCacheManagerConfigPy) -> KVCacheManagerConfigPy:
         # Compact native layers before assigning extra pool IDs.
@@ -6854,8 +6823,11 @@ class MixedPrecisionKVCacheManager(KVCacheManagerV2):
             layer_id = int(layer.layer_id)
             if self.low_dtype == DataType.NVFP4 and self.head_dim_per_layer[layer_id] % 16:
                 raise ValueError("NVFP4 mixed-precision KV requires head_dim divisible by 16")
-            page_bytes = self.tokens_per_block * super().get_layer_bytes_per_token(
-                layer_id, Role.KEY
+            page_bytes = get_size_in_bytes(
+                self.tokens_per_block
+                * self.num_kv_heads_per_layer[layer_id]
+                * self.head_dim_per_layer[layer_id],
+                self.dtype,
             )
             buffers = [
                 BufferConfig(role=buffer.role, size=page_bytes)
@@ -6890,12 +6862,12 @@ class MixedPrecisionKVCacheManager(KVCacheManagerV2):
         reserve += 2 * self.max_batch_size * 4
         # TRTLLM uses at most 32 tokens per staging page and two offsets even for MLA.
         view_pages = math.ceil(self.max_seq_len / min(self.tokens_per_block, 32))
-        reserve += len(self.high_layers) * self.max_batch_size * 2 * view_pages * 4
+        reserve += self.max_batch_size * 2 * view_pages * 4
         quota = config.cache_tiers[0].quota - reserve
         if quota <= 0:
             raise ValueError("KV budget cannot cover mixed-precision Attention staging")
         tiers = [GpuCacheTierConfig(quota=quota), *config.cache_tiers[1:]]
-        ratio = self._split_mixed_precision_pool_ratio(config)
+        ratio = self._split_mixed_precision_pool_ratio(config, layers)
         return replace(config, layers=layers, cache_tiers=tiers, initial_pool_ratio=ratio)
 
     def get_buffers(
@@ -6905,7 +6877,6 @@ class MixedPrecisionKVCacheManager(KVCacheManagerV2):
         *,
         mixed_precision_pool: Literal["low", "high", "scales"] = "low",
     ) -> torch.Tensor | None:
-        """Return a zero-copy view of the selected KV pool."""
         local = self.layer_offsets[layer_idx]
         if local not in self.high_layers:
             return super().get_buffers(layer_idx, kv_layout)
@@ -6915,23 +6886,12 @@ class MixedPrecisionKVCacheManager(KVCacheManagerV2):
             "high": (self.high_layers[local], Role.KEY, self.dtype, width),
             "scales": (local, Role.KEY_BLOCK_SCALE, torch.uint8, width // 16),
         }[mixed_precision_pool]
-        address = self.impl.get_mem_pool_base_address(layer, role, PageIndexMode.SHARED)
-        shape = [
-            self.impl.get_page_index_upper_bound(layer, role) // self.kv_factor,
-            self.kv_factor,
-            self.tokens_per_block,
-            self.num_kv_heads_per_layer[local],
-            width,
-        ]
-        if kv_layout == "HND":
-            shape[2], shape[3] = shape[3], shape[2]
-        return convert_to_torch_tensor(TensorWrapper(address, dtype, shape))
+        head_shape = (self.num_kv_heads_per_layer[local], width)
+        return self._get_pool_view(layer, role, dtype, head_shape, kv_layout)
 
     def shutdown(self) -> None:
         super().shutdown()
         self.mixed_precision_buffers.buffers.clear()
-
-    # Mixed-precision accessors.
 
     def get_mixed_precision_page_tables(
         self, request_ids: list[int], layer_idx: int
@@ -6951,15 +6911,6 @@ class MixedPrecisionKVCacheManager(KVCacheManagerV2):
             )
         )
 
-    def get_staging_buffer(self, shape: Sequence[int], dtype: torch.dtype) -> torch.Tensor:
-        """Return shared Attention staging storage."""
-        buffer = self.mixed_precision_buffers.get_buffer(
-            [self._staging_bytes], torch.uint8, "mixed_kv_staging", True
-        )
-        return self.mixed_precision_buffers._view_as(buffer, shape, dtype)
-
-    # Configuration helpers.
-
     def _uses_mixed_precision(self, local_layer_idx: int) -> bool:
         return (
             self.num_kv_heads_per_layer[local_layer_idx] > 0
@@ -6968,15 +6919,15 @@ class MixedPrecisionKVCacheManager(KVCacheManagerV2):
         )
 
     def _split_mixed_precision_pool_ratio(
-        self, config: KVCacheManagerConfigPy
+        self, config: KVCacheManagerConfigPy, layers: Sequence[object]
     ) -> list[float] | None:
         """Split selected KV budgets between high and low pools."""
         if self.high_low_pool_ratio is None:
             return config.initial_pool_ratio
 
-        low_layer = next(iter(self.high_layers))
         groups = []
-        for layer in config.layers:
+        layer_groups = []
+        for layer in layers:
             lifecycle = (
                 type(layer),
                 AttnLifeCycle.make(
@@ -6991,23 +6942,17 @@ class MixedPrecisionKVCacheManager(KVCacheManagerV2):
             )
             if lifecycle not in groups:
                 groups.append(lifecycle)
-            if int(layer.layer_id) == low_layer:
-                low_group = groups.index(lifecycle)
+            layer_groups.append(groups.index(lifecycle))
 
         ratio = list(config.initial_pool_ratio) if config.initial_pool_ratio is not None else [1.0]
-        if len(ratio) != len(groups):
+        if len(ratio) != len(set(layer_groups[: len(config.layers)])):
             raise ValueError(
                 "Set pool_ratio for the original layer groups before splitting mixed KV"
             )
 
-        high = (
-            AttentionLayerConfig,
-            AttnLifeCycle.make(self.last_n + 1, self.first_n, config.tokens_per_block),
-        )
-        if high not in groups:
-            groups.append(high)
-            ratio.append(0.0)
-        high_group = groups.index(high)
+        ratio.extend([0.0] * (len(groups) - len(ratio)))
+        low, high = next(iter(self.high_layers.items()))
+        low_group, high_group = layer_groups[low], layer_groups[high]
         transferred = ratio[low_group] * self.high_low_pool_ratio / (1 + self.high_low_pool_ratio)
         ratio[low_group] -= transferred
         ratio[high_group] += transferred

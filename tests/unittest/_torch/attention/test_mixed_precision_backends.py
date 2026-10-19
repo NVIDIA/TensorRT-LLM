@@ -71,7 +71,7 @@ def test_optimized_two_pool_prefill_and_decode(
             max_tokens=65536, enable_block_reuse=True, enable_swa_scratch_reuse=scratch_reuse
         ),
         CacheType.SELF,
-        num_layers=1,
+        num_layers=2,
         num_kv_heads=heads,
         head_dim=width,
         tokens_per_block=block,
@@ -99,14 +99,18 @@ def test_optimized_two_pool_prefill_and_decode(
     original_config = quant_config.model_dump()
     original_quant_mode = quant_config.quant_mode
     original_layer_quant_mode = quant_config.layer_quant_mode
-    attention = backend(
-        layer_idx=0,
-        num_heads=query_heads,
-        head_dim=width,
-        num_kv_heads=heads,
-        quant_config=quant_config,
-        **({"flashinfer_backend": "trtllm-gen"} if fp8_input else {}),
-    )
+    attentions = [
+        backend(
+            layer_idx=layer_idx,
+            num_heads=query_heads,
+            head_dim=width,
+            num_kv_heads=heads,
+            quant_config=quant_config,
+            **({"flashinfer_backend": "trtllm-gen"} if fp8_input else {}),
+        )
+        for layer_idx in range(2)
+    ]
+    attention = attentions[0]
     selection_cache = attention._fmha_manager if backend is TrtllmAttention else None
     history_scale = torch.full(
         (1,), 1 / 6 if high_dtype == DataType.FP8 else 1, dtype=torch.float32, device="cuda"
@@ -121,9 +125,10 @@ def test_optimized_two_pool_prefill_and_decode(
     )
     module._attn_impl = partial(Attention._attn_impl, module)
     decode_graph = None
+    staging_address = None
 
     def forward(begin, end, context):
-        nonlocal decode_graph
+        nonlocal decode_graph, staging_address
         metadata = backend.Metadata(
             seq_lens=torch.tensor([end - begin] * batch, dtype=torch.int32),
             num_contexts=batch if context else 0,
@@ -141,7 +146,11 @@ def test_optimized_two_pool_prefill_and_decode(
         assert metadata.mixed_precision_kv_views == {}
         metadata.prepare()
         view = metadata.mixed_precision_kv_views[0]
-        assert view.pool.dtype == high_torch_dtype
+        assert metadata.mixed_precision_kv_views[1] is view
+        assert view.get_buffers(0).dtype == high_torch_dtype
+        if staging_address is None:
+            staging_address = view.get_buffers(0).data_ptr()
+        assert view.get_buffers(0).data_ptr() == staging_address
         assert view.metadata.mixed_precision_kv_views is None
         q, k, v = [
             tensor[:, begin:end].reshape(-1, tensor.shape[-1]) for tensor in (query, key, value)
@@ -152,19 +161,36 @@ def test_optimized_two_pool_prefill_and_decode(
             if backend is TrtllmAttention
             else tuple(tensor.to(input_dtype, copy=True) for tensor in (q, k, v))
         )
+        other_inputs = (
+            (torch.cat((q, k, -v), dim=-1), None, None)
+            if backend is TrtllmAttention
+            else tuple(tensor.to(input_dtype, copy=True) for tensor in (q, k, -v))
+        )
+        layer_outputs = None
 
         def run():
-            return Attention.forward_impl(
-                module,
-                *inputs,
-                metadata,
-                PredefinedAttentionMask.CAUSAL,
-                None,
-                None,
-                None,
-            )
+            nonlocal layer_outputs
+            layer_outputs = []
+            try:
+                for layer_attention, layer_inputs in zip(attentions, (inputs, other_inputs)):
+                    module.attn = layer_attention
+                    layer_outputs.append(
+                        Attention.forward_impl(
+                            module,
+                            *layer_inputs,
+                            metadata,
+                            PredefinedAttentionMask.CAUSAL,
+                            None,
+                            None,
+                            None,
+                        )
+                    )
+            finally:
+                module.attn = attention
+            return layer_outputs[0]
 
         output = run()
+        torch.testing.assert_close(layer_outputs[1], -output, atol=0.01, rtol=0.02)
         if not context and high_dtype == DataType.BF16:
             reference = output.clone()
             eager_metadata = metadata
@@ -177,7 +203,7 @@ def test_optimized_two_pool_prefill_and_decode(
             # Replay with different physical pages, without recapturing.
             metadata.request_ids = request_ids[::-1]
             metadata.prepare()
-            for tensor in inputs:
+            for tensor in (*inputs, *other_inputs):
                 if tensor is not None:
                     tensor.copy_(tensor.flip(0))
             other_metadata = eager_metadata.create_cuda_graph_metadata(batch, buffers=Buffers())
@@ -186,7 +212,8 @@ def test_optimized_two_pool_prefill_and_decode(
             other_view = other_metadata.mixed_precision_kv_views[0]
             assert other_view is not view
             for tensor, other_tensor in (
-                (view.page_tables, other_view.page_tables),
+                (view.page_tables[0], other_view.page_tables[0]),
+                (view.page_tables[1], other_view.page_tables[1]),
                 (view.lengths, other_view.lengths),
             ):
                 assert tensor.untyped_storage().data_ptr() == (
@@ -196,7 +223,8 @@ def test_optimized_two_pool_prefill_and_decode(
             metadata.prepare()
             graph.replay()
             torch.testing.assert_close(output, reference.flip(0), atol=0.01, rtol=0.02)
-            decode_graph = (metadata, graph, output, run)
+            torch.testing.assert_close(layer_outputs[1], -output, atol=0.01, rtol=0.02)
+            decode_graph = (metadata, graph, output, layer_outputs[1], run)
             output = output.flip(0)
         assert metadata.kv_cache_manager is manager and metadata.kv_layout == kv_layout
         return output
@@ -241,7 +269,6 @@ def test_optimized_two_pool_prefill_and_decode(
             atol=0.05 if high_dtype == DataType.FP8 else 0.02,
             rtol=0.001 if high_dtype == DataType.FP8 else 0.02,
         )
-        arena = manager.get_staging_buffer((1,), torch.uint8).data_ptr()
         history_before = token_major(manager.get_buffers(0, kv_layout=kv_layout)).clone()
         scales_before = token_major(
             manager.get_buffers(0, kv_layout, mixed_precision_pool="scales")
@@ -269,7 +296,6 @@ def test_optimized_two_pool_prefill_and_decode(
             assert cache.resize(length + 1)
             manager._restore_page_index_bufs(request_id, cache)
         output = forward(length, length + 1, False)
-        assert manager.get_staging_buffer((1,), torch.uint8).data_ptr() == arena
         assert_native_config()
         history = token_major(manager.get_buffers(0, kv_layout=kv_layout))
         all_history_ids, all_scale_ids, all_high_ids = manager.get_mixed_precision_page_tables(
@@ -341,7 +367,7 @@ def test_optimized_two_pool_prefill_and_decode(
             ).reshape_as(output[row])
             torch.testing.assert_close(output[row], expected, atol=0.01, rtol=0.02)
         if decode_graph is not None:
-            metadata, graph, captured_output, run = decode_graph
+            metadata, graph, captured_output, captured_other_output, run = decode_graph
             for request_id in request_ids:
                 cache = manager.kv_cache_map[request_id]
                 assert cache.resize(None, length + 1)
@@ -351,6 +377,7 @@ def test_optimized_two_pool_prefill_and_decode(
             metadata.prepare()
             graph.replay()
             replayed = captured_output.clone()
+            torch.testing.assert_close(captured_other_output, -replayed, atol=0.01, rtol=0.02)
             ordinal, offset = divmod(length, block)
             for row, history_ids in enumerate(all_history_ids):
                 # The next replay appends the same K/V at the updated sequence length.
@@ -403,10 +430,7 @@ def _reference_dequant(packed, scales, scale):
 def test_mixed_precision_paged_conversion(dtype, width, layout):
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required")
-    from tensorrt_llm._torch.cute_dsl_kernels.mixed_precision_kv import (
-        materialize_mixed_precision_kv,
-        writeback_mixed_precision_kv,
-    )
+    from tensorrt_llm._torch.cute_dsl_kernels.mixed_precision_kv import convert_mixed_precision_kv
 
     values = torch.linspace(-6, 6, 192 * 4 * width, device="cuda").view(192, 2, 2, width).to(dtype)
     pool = values.view(3, 64, 2, 2, width).transpose(1, 2).contiguous()
@@ -428,7 +452,7 @@ def test_mixed_precision_paged_conversion(dtype, width, layout):
         ].transpose(0, 1)
     expected_high[1] = values[:128].transpose(0, 1)
     pools = tuple(t.transpose(2, 3) if layout == "HND" else t for t in (pool, low, scales, high))
-    writeback_mixed_precision_kv(*pools, tables, lengths, 130, layout)
+    convert_mixed_precision_kv(True, 130, *pools, tables, lengths, layout)
     for actual, expected in ((low, expected_low), (scales, expected_scales), (high, expected_high)):
         torch.testing.assert_close(
             actual.view(torch.uint8), expected.view(torch.uint8), rtol=0, atol=0
@@ -441,7 +465,7 @@ def test_mixed_precision_paged_conversion(dtype, width, layout):
     expected[:128] = values[:128]
     expected[128:130] = restored[128:130].to(dtype)
     lengths[0].fill_(130)
-    materialize_mixed_precision_kv(*pools, tables, lengths, layout)
+    convert_mixed_precision_kv(False, 192, *pools, tables, lengths, layout)
     actual = pool.transpose(1, 2).reshape_as(values)
     torch.testing.assert_close(actual.view(torch.uint8), expected.view(torch.uint8), rtol=0, atol=0)
 
@@ -484,7 +508,7 @@ def test_mla_preserves_native_rope_and_attention(backend):
     manager = MixedPrecisionKVCacheManager(
         KvCacheConfig(max_tokens=65536),
         CacheType.SELFKONLY,
-        num_layers=1,
+        num_layers=2,
         num_kv_heads=1,
         head_dim=576,
         tokens_per_block=128,
@@ -508,7 +532,7 @@ def test_mla_preserves_native_rope_and_attention(backend):
         predicted_tokens_per_seq=1,
         max_position_embeddings=1024,
         bias=False,
-        layer_idx=0,
+        layer_idx=1,
         pos_embd_params=PositionalEmbeddingParams(
             type=PositionEmbeddingType.rope_gpt_neox,
             rope=RopeParams(dim=64, max_positions=1024, duplicate_data=True),
@@ -546,15 +570,15 @@ def test_mla_preserves_native_rope_and_attention(backend):
                 ),
             )
             metadata.prepare()
-            assert metadata.mixed_precision_kv_views[0].pool.dtype == torch.bfloat16
+            assert metadata.mixed_precision_kv_views[1].get_buffers(1).dtype == torch.bfloat16
             output = hidden.new_empty((end - begin, 16 * 128))
             model.forward_impl(
                 torch.arange(begin, end, device="cuda"), hidden[begin:end], metadata, [output]
             )
             assert torch.isfinite(output).all()
             assert metadata.kv_cache_manager is manager
-        high = manager.get_buffers(0, mixed_precision_pool="high")
-        _, _, ids = manager.get_mixed_precision_page_tables([0], 0)
+        high = manager.get_buffers(1, mixed_precision_pool="high")
+        _, _, ids = manager.get_mixed_precision_page_tables([0], 1)
         assert high.shape[1] == 1
         assert ids[0][0] >= 0 and ids[0][1] == kv.BAD_PAGE_INDEX and ids[0][-1] >= 0
     finally:

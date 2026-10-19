@@ -970,7 +970,7 @@ class MLA(nn.Module):
 
         mixed_precision_kv_view = get_mixed_precision_kv_view(attn_metadata, self.layer_idx)
         if mixed_precision_kv_view is not None:
-            mixed_precision_kv_view.materialize()
+            mixed_precision_kv_view.convert(self.layer_idx)
             attn_metadata = mixed_precision_kv_view.metadata
 
         self._forward_impl(
@@ -981,7 +981,7 @@ class MLA(nn.Module):
             latent_cache_gen=latent_cache_gen,
         )
         if mixed_precision_kv_view is not None:
-            mixed_precision_kv_view.writeback()
+            mixed_precision_kv_view.convert(self.layer_idx, writeback=True)
 
     def _forward_impl(
         self,

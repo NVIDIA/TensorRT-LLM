@@ -2318,7 +2318,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 from .utils import append_mla_latent_cache
                 append_mla_latent_cache(
                     metadata.kv_cache_manager,
-                    self.get_local_layer_idx(metadata),
+                    self.layer_idx,
                     metadata.request_ids,
                     metadata.seq_lens.tolist(),
                     metadata.kv_cache_params.num_cached_tokens_per_seq,

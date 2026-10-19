@@ -132,7 +132,7 @@ class _PagedMixedPrecisionKV:
 _compiled_kernels = {}
 
 
-def _run(
+def convert_mixed_precision_kv(
     write: bool,
     capacity: int,
     pool: torch.Tensor,
@@ -143,6 +143,7 @@ def _run(
     lengths: torch.Tensor,
     layout: str,
 ) -> None:
+    """Convert up to capacity tokens per request between native and mixed KV pools."""
     if capacity == 0 or lengths.shape[1] == 0:
         return
     pools = (pool, history.view(torch.uint8), scales.view(torch.uint8), high)
@@ -159,42 +160,3 @@ def _run(
                 options="--enable-tvm-ffi",
             )
     _compiled_kernels[key](*tensors)
-
-
-def materialize_mixed_precision_kv(
-    pool: torch.Tensor,
-    history: torch.Tensor,
-    scales: torch.Tensor,
-    high: torch.Tensor,
-    page_tables: torch.Tensor,
-    lengths: torch.Tensor,
-    layout: str,
-) -> None:
-    """Restore cached KV from high pages or dequantized low pages.
-
-    Pools use 5D HND/NHD layouts. CUDA int32 page_tables[3, B, P] holds
-    low/scale/high IDs (-1 for missing high pages); lengths[2, B] holds
-    cached/total lengths.
-    """
-    block_size = pool.shape[3 if layout == "HND" else 2]
-    capacity = pool.shape[0] // lengths.shape[1] * block_size if lengths.shape[1] else 0
-    _run(False, capacity, pool, history, scales, high, page_tables, lengths, layout)
-
-
-def writeback_mixed_precision_kv(
-    pool: torch.Tensor,
-    history: torch.Tensor,
-    scales: torch.Tensor,
-    high: torch.Tensor,
-    page_tables: torch.Tensor,
-    lengths: torch.Tensor,
-    max_new_tokens_per_request: int,
-    layout: str,
-) -> None:
-    """Quantize new KV into low pools and copy retained high pages.
-
-    max_new_tokens_per_request bounds every replay; layouts match materialize.
-    """
-    _run(
-        True, max_new_tokens_per_request, pool, history, scales, high, page_tables, lengths, layout
-    )
