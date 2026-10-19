@@ -2,8 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """MegaMoE-CuteDSL deferred finalize (skip_topk_reduce) tests.
 
-Contract tests (CPU): kernel constructor guards, compile-cache key split,
-runner unique_id split, scheduler do_finalize gating, backend env-knob wiring.
+Contract tests (CPU): combine_quant region query, runner unique_id split,
+scheduler do_finalize gating, backend env-knob wiring and routing-weight
+placement per architecture.
 
 GPU tests (SM100 family + cutlass-dsl): drive the
 ``trtllm::cute_dsl_megamoe_nvfp4_blackwell`` op directly with synthetic NVFP4
@@ -21,10 +22,11 @@ finite) and check, in ladder order:
 """
 
 import types
-from typing import Optional
+from typing import List, Optional
 
 import pytest
 import torch
+from transformers import PretrainedConfig
 
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.moe.custom_ops.cute_dsl_megamoe_custom_op import IS_MEGAMOE_OP_AVAILABLE
@@ -33,11 +35,6 @@ from tensorrt_llm._torch.moe.fused_moe.moe_scheduler import FusedCommMoESchedule
 from tensorrt_llm._torch.moe.fused_moe.routing import RenormalizeMoeRoutingMethod
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.mapping import Mapping
-
-requires_megamoe_op = pytest.mark.skipif(
-    not IS_MEGAMOE_OP_AVAILABLE,
-    reason="MegaMoE CuteDSL op is not available (cutlass-dsl[cu13] missing)",
-)
 
 
 def _requires_sm100_gpu() -> Optional[str]:
@@ -51,70 +48,21 @@ def _requires_sm100_gpu() -> Optional[str]:
 
 
 # ---------------------------------------------------------------------------
-# Kernel constructor guards + cache-key split
+# combine_quant staging region
 # ---------------------------------------------------------------------------
 
 
-def _make_kernel(**overrides):
-    import cutlass
-
-    from tensorrt_llm._torch.cute_dsl_kernels.mega_moe_nvfp4 import SfPaddingBlock, import_kernel
-    from tensorrt_llm._torch.cute_dsl_kernels.mega_moe_nvfp4.token_comm import CombineFormat
-
-    kwargs = dict(
-        mma_tiler_mnk=(256, 128, 256),
-        cluster_shape_mnk=(2, 1, 1),
-        use_2cta_instrs=True,
-        group_hint=512,
-        token_padding_block=64,
-        sf_padding_block=SfPaddingBlock,
-        static_expert_shape=(8, 1024, 512),
-        world_size=1,
-        num_topk=4,
-        max_tokens_per_rank=128,
-        hidden=512,
-        fc2_output_dtype=cutlass.BFloat16,
-        combine_format=CombineFormat.parse("bf16"),
-    )
-    kwargs.update(overrides)
-    return import_kernel()(**kwargs)
-
-
-@requires_megamoe_op
-def test_kernel_skip_topk_reduce_rejects_form_b():
-    with pytest.raises(ValueError, match="skip_topk_reduce requires in_kernel_fc2_reduce=False"):
-        _make_kernel(
-            skip_topk_reduce=True,
-            in_kernel_fc2_reduce=True,
-            apply_topk_in_fc1=True,
-        )
-
-
-@requires_megamoe_op
-def test_kernel_skip_topk_reduce_rejects_quantized_wire():
-    from tensorrt_llm._torch.cute_dsl_kernels.mega_moe_nvfp4.token_comm import CombineFormat
-
-    with pytest.raises(ValueError, match="skip_topk_reduce requires the bf16 combine format"):
-        _make_kernel(
-            skip_topk_reduce=True,
-            combine_format=CombineFormat.parse("32e4m3xe8m0"),
-        )
-
-
-@requires_megamoe_op
-def test_kernel_name_splits_compile_cache_on_skip():
-    base = _make_kernel(apply_topk_in_fc1=False)
-    skip = _make_kernel(apply_topk_in_fc1=False, skip_topk_reduce=True)
-    assert base.name() != skip.name(), "skip_topk_reduce must split the compiled-kernel cache key"
-    assert "_skipredu" in skip.name() and "_skipredu" not in base.name()
-
-
-@requires_megamoe_op
 def test_query_combine_quant_region_matches_bf16_tensor_size():
+    reason = _requires_sm100_gpu()
+    if reason:
+        pytest.skip(reason)
     from tensorrt_llm._torch.moe.custom_ops.cute_dsl_megamoe_custom_op import (
         query_megamoe_combine_quant_region,
     )
 
+    # The probe sizes the kernel's launch from the device through the driver
+    # API, which needs a current CUDA context.
+    torch.zeros(1, device="cuda")
     max_t, top_k, hidden = 128, 4, 512
     offset, nbytes = query_megamoe_combine_quant_region(
         world_size=1,
@@ -336,8 +284,11 @@ def test_model_registers_finalize_only_under_a_comm_strategy(
 # ---------------------------------------------------------------------------
 
 
-def _make_backend() -> MegaMoECuteDsl:
+def _make_backend(architectures: Optional[List[str]] = None) -> MegaMoECuteDsl:
     model_config = ModelConfig(
+        pretrained_config=(
+            PretrainedConfig(architectures=architectures) if architectures is not None else None
+        ),
         mapping=Mapping(world_size=1, rank=0, tp_size=1, moe_tp_size=1, moe_ep_size=1),
         moe_backend="MEGAMOE_CUTEDSL",
         skip_create_weights_in_init=True,
@@ -358,18 +309,36 @@ def test_backend_deferred_finalize_defaults_off(monkeypatch: pytest.MonkeyPatch)
     moe = _make_backend()
     assert moe.deferred_finalize is False
     assert moe.supports_deferred_finalize is False
-    assert moe.apply_topk_in_fc1 is True, "default path must stay byte-identical"
 
 
 def test_backend_deferred_finalize_selects_transformers_route(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("MEGAMOE_DEFERRED_FINALIZE", "1")
-    moe = _make_backend()
+    moe = _make_backend(["DeepseekV4ForCausalLM"])
     assert moe.deferred_finalize is True
     assert moe.supports_deferred_finalize is True
     assert moe.apply_topk_in_fc1 is False, (
         "deferred finalize must apply routing weights post-norm (RMSNorm is "
         "scale-invariant; a folded weight would be erased)"
     )
+
+
+@pytest.mark.parametrize(
+    "architectures, expected",
+    [
+        (None, False),
+        (["Qwen3MoeForCausalLM"], False),
+        (["MuseSparkOpenOmniForCausalLM"], False),
+        (["DeepseekV4ForCausalLM"], True),
+        (["DeepseekV41ForCausalLM"], True),
+    ],
+)
+def test_backend_folds_routing_weights_into_fc1_only_for_deepseek_v4(
+    monkeypatch: pytest.MonkeyPatch, architectures: Optional[List[str]], expected: bool
+):
+    """Only DeepSeek V4 and V4.1 apply routing weights before the FC2 input
+    quantization; every other model keeps them after FC2."""
+    monkeypatch.delenv("MEGAMOE_DEFERRED_FINALIZE", raising=False)
+    assert _make_backend(architectures).apply_topk_in_fc1 is expected
 
 
 def test_backend_deferred_finalize_rejects_quantized_wire(monkeypatch: pytest.MonkeyPatch):

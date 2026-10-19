@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Fallback and opt-out contracts for the finalize+all-reduce fusion setup.
+"""Fallback contracts for the finalize+all-reduce fusion setup.
 
 Everything here is host-side plumbing: no GPU, no IPC. The real workspace
 constructor is replaced so the tests pin the *selection* behavior -- when the
@@ -54,34 +54,6 @@ def test_ipc_probe_failure_falls_back_with_warning(monkeypatch, warnings_seen, e
 
 def test_workspace_built_when_probe_succeeds(monkeypatch, warnings_seen):
     workspace = object()
-    monkeypatch.setattr(finalize_ar, "HAS_CUTEDSL", True)
-    monkeypatch.setattr(finalize_ar, "FinalizeIpcWorkspace", lambda mapping: workspace)
-    assert _build_finalize_ar_workspace(MAPPING) is workspace
-    assert warnings_seen == []
-
-
-@pytest.mark.parametrize("value", ["0", "false", "no", "off"])
-def test_finalize_ar_env_opt_out(monkeypatch, warnings_seen, value):
-    """MUSESPARK_OPEN_FUSED_FINALIZE_AR falsy skips the workspace entirely."""
-
-    def must_not_construct(mapping):
-        raise AssertionError("FinalizeIpcWorkspace must not be constructed when opted out")
-
-    monkeypatch.setenv("MUSESPARK_OPEN_FUSED_FINALIZE_AR", value)
-    monkeypatch.setattr(finalize_ar, "HAS_CUTEDSL", True)
-    monkeypatch.setattr(finalize_ar, "FinalizeIpcWorkspace", must_not_construct)
-    assert _build_finalize_ar_workspace(MAPPING) is None
-    assert warnings_seen == []
-
-
-@pytest.mark.parametrize("value", [None, "1", "true"])
-def test_finalize_ar_default_and_truthy_stay_fused(monkeypatch, warnings_seen, value):
-    """Unset or truthy leaves the fusion on -- the default is unchanged."""
-    workspace = object()
-    if value is None:
-        monkeypatch.delenv("MUSESPARK_OPEN_FUSED_FINALIZE_AR", raising=False)
-    else:
-        monkeypatch.setenv("MUSESPARK_OPEN_FUSED_FINALIZE_AR", value)
     monkeypatch.setattr(finalize_ar, "HAS_CUTEDSL", True)
     monkeypatch.setattr(finalize_ar, "FinalizeIpcWorkspace", lambda mapping: workspace)
     assert _build_finalize_ar_workspace(MAPPING) is workspace

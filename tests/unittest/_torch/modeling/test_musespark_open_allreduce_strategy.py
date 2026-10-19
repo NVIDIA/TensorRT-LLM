@@ -1,19 +1,15 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""The all-reduce strategy MuseSparkOpen pins, and the knob that overrides it.
+"""The all-reduce strategy MuseSparkOpen builds its all-reduces with.
 
-The row-parallel attention output projection takes its strategy from the model
-config, which defaults to AUTO. At TP4 on one node a decode step reduces a tiny
-message, and AUTO routes tiny messages through the NCCL symmetric-memory
-all-reduce, which reuses a shared buffer across launches without
-synchronising: ranks overwrite each other's payload and the layer output comes
-back non-finite. Argmax over an all-NaN row is index 0, which is the token-0
-collapse the bring-up chased.
-
-So NCCL is the default here, on both the attention and the MoE all-reduce, and
-``MUSESPARK_OPEN_ALLREDUCE`` names a different one for a single attribution leg.
-A typo in that variable must not silently decide correctness, so an unparsable
-name keeps the pin instead of failing engine construction.
+AUTO, the configured default, fails this model at TP4. On the row-parallel
+attention output projection it routes each decode step's tiny message through
+the NCCL symmetric-memory all-reduce, which reuses a shared buffer across
+launches without synchronising: ranks overwrite each other's payload, the layer
+output comes back non-finite, and argmax over the all-NaN row collapses every
+request to token 0. On the MoE combine its autotuner hangs engine warmup. Both
+all-reduces therefore take NCCL in place of AUTO, and any other configured
+strategy is used as given.
 """
 
 import ast
@@ -22,8 +18,9 @@ import pathlib
 
 import pytest
 
+from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models import modeling_musespark_open
-from tensorrt_llm._torch.models.modeling_musespark_open import _attention_allreduce_strategy
+from tensorrt_llm._torch.models.modeling_musespark_open import _allreduce_strategy
 from tensorrt_llm.functional import AllReduceStrategy
 
 
@@ -54,56 +51,39 @@ def _method_source(module, class_name: str, method: str) -> str:
     )
 
 
-def test_the_default_is_nccl_not_auto(monkeypatch):
-    """AUTO is never selected by default. That is the whole point of the pin."""
-    monkeypatch.delenv("MUSESPARK_OPEN_ALLREDUCE", raising=False)
-    assert _attention_allreduce_strategy() is AllReduceStrategy.NCCL
+def test_auto_becomes_nccl():
+    """AUTO is the configured default, and it is never what this model builds."""
+    model_config = ModelConfig()
+    assert model_config.allreduce_strategy is AllReduceStrategy.AUTO
+    assert _allreduce_strategy(model_config) is AllReduceStrategy.NCCL
 
 
-@pytest.mark.parametrize("value", ["", "   "])
-def test_an_empty_value_is_the_default(monkeypatch, value):
-    """An exported-but-empty variable is not a request for something else."""
-    monkeypatch.setenv("MUSESPARK_OPEN_ALLREDUCE", value)
-    assert _attention_allreduce_strategy() is AllReduceStrategy.NCCL
+@pytest.mark.parametrize(
+    "strategy",
+    [strategy for strategy in AllReduceStrategy if strategy is not AllReduceStrategy.AUTO],
+    ids=lambda strategy: strategy.name,
+)
+def test_an_explicit_strategy_is_used_as_configured(strategy):
+    assert _allreduce_strategy(ModelConfig(allreduce_strategy=strategy)) is strategy
 
 
-@pytest.mark.parametrize("name", ["AUTO", "NCCL", "ONESHOT", "TWOSHOT"])
-def test_the_knob_selects_a_named_strategy(monkeypatch, name):
-    """Including AUTO: a control leg needs the racy default to reproduce the fault."""
-    monkeypatch.setenv("MUSESPARK_OPEN_ALLREDUCE", name)
-    assert _attention_allreduce_strategy() is AllReduceStrategy[name]
+def test_a_strategy_named_in_the_llm_args_is_used_as_configured():
+    """``allreduce_strategy`` reaches the model config as a string."""
+    model_config = ModelConfig(allreduce_strategy="ONESHOT")
+    assert _allreduce_strategy(model_config) is AllReduceStrategy.ONESHOT
 
 
-@pytest.mark.parametrize("spelling", ["auto", "Auto", "  auto  "])
-def test_the_knob_is_case_and_whitespace_insensitive(monkeypatch, spelling):
-    monkeypatch.setenv("MUSESPARK_OPEN_ALLREDUCE", spelling)
-    assert _attention_allreduce_strategy() is AllReduceStrategy.AUTO
-
-
-@pytest.mark.parametrize("name", ["NCLL", "nccl2", "0", "none"])
-def test_an_unparsable_name_keeps_the_pin(monkeypatch, name):
-    """A typo must not quietly restore the failing default."""
-    monkeypatch.setenv("MUSESPARK_OPEN_ALLREDUCE", name)
-    assert _attention_allreduce_strategy() is AllReduceStrategy.NCCL
-
-
-def test_the_attention_projection_uses_the_resolved_strategy():
+@pytest.mark.parametrize("class_name", ["MuseSparkOpenAttention", "MuseSparkOpenMoE"])
+def test_both_allreduces_use_the_resolved_strategy(class_name):
     """``__init__`` must build its AllReduce from the resolver, not the config.
 
-    A source check: constructing the attention module needs a full model config
-    and a mapping with a real TP group. What can regress cheaply is the wiring
-    -- someone dropping the override and letting ``o_proj`` keep the config's
-    AUTO -- and that is what this pins.
+    A source check: constructing either module needs a full model config and a
+    mapping with a real TP group. What can regress cheaply is the wiring --
+    someone dropping the override and letting the config's AUTO through -- and
+    that is what this pins.
     """
-    source = _method_source(modeling_musespark_open, "MuseSparkOpenAttention", "__init__")
-    assert "self.o_proj.all_reduce = AllReduce(" in source
-    assert "strategy=_attention_allreduce_strategy()" in source
-
-
-def test_the_moe_allreduce_is_pinned_to_nccl():
-    """The MoE side is pinned outright: no knob, no AUTO, no tunable autotuner."""
-    source = _method_source(modeling_musespark_open, "MuseSparkOpenMoE", "__init__")
-    assert "strategy=AllReduceStrategy.NCCL" in source
+    source = _method_source(modeling_musespark_open, class_name, "__init__")
+    assert "strategy=_allreduce_strategy(model_config)" in source
     assert "AllReduceStrategy.AUTO" not in source
 
 
@@ -116,7 +96,7 @@ def test_the_moe_combine_is_cast_down_before_it_is_reduced():
     costs about 0.6 ms of every decode iteration and is a one-line regression
     that no unit assertion on the module's output could see -- the output dtype
     is the same on both sides of it. So it is pinned as an ordering check on
-    the code, in the same spirit as the strategy pins above.
+    the code, in the same spirit as the strategy check above.
     """
     forward = _method_node(modeling_musespark_open, "MuseSparkOpenMoE", "forward")
 
