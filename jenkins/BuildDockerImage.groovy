@@ -1143,7 +1143,7 @@ pipeline {
         stage("Register NGC Image For Security Check") {
             when {
                 expression {
-                    return params.nspect_id && params.action == "push"
+                    return params.nspect_id && params.action == "push" && params.register_images
                 }
             }
             steps {
@@ -1152,7 +1152,7 @@ pipeline {
                         container("python3") {
                             trtllm_utils.llmExecStepWithRetry(this, script: "pip3 install --upgrade pip")
                             trtllm_utils.llmExecStepWithRetry(this, script: "pip3 install 'requests>=2.32.4,<3'")
-                            def nspect_commit = "5dcee25cfa2c55249ce390a9f78e1b5dac42fa44"
+                            def nspect_commit = "f1a83d7cedc4cae9ecd592b3a8458e006d49d9c2"
                             def override_commit = env."NSPECT_OVERRIDE_${nspect_commit}"
                             if (override_commit) {
                                 echo "Overriding nspect_commit with value from environment variable \$NSPECT_OVERRIDE_${nspect_commit}: ${override_commit}"
@@ -1168,29 +1168,30 @@ pipeline {
                                 --nspect_id ${params.nspect_id} \
                                 --program_version_name '${nspectReleaseVersion}' \
                                 """
-                            if (params.register_images) {
-                                cmd += "--add_version "
-                                if (params.release_type_id) {
-                                    cmd += "--release_type_id ${params.release_type_id} "
-                                }
-                            }
-                            if (params.osrb_ticket) {
-                                cmd += "--osrb_ticket ${params.osrb_ticket} "
-                            }
+                            def imageArgs = "--image " + imageKeyToTag.values().join(" ")
+                            def registrationCmd = cmd + "--add_version " +
+                                "--release_type_id ${params.release_type_id ?: 1} "
                             if (params.export_compliance_bug) {
-                                cmd += "--export_compliance_bug '${params.export_compliance_bug}' "
+                                registrationCmd += "--export_compliance_bug '${params.export_compliance_bug}' "
                             }
-                            if (params.wait_success_seconds) {
-                                cmd += "--check_launch_api "
-                                cmd += "--wait_success ${params.wait_success_seconds} "
-                            }
-                            cmd += "--image "
-                            cmd += imageKeyToTag.values().join(" ")
+                            registrationCmd += "--check_launch_api --criteria container-registration --wait_success 180 " + imageArgs
                             withCredentials([
                                 usernamePassword(credentialsId: "NSPECT_CLIENT-${nspect_env}", usernameVariable: 'NSPECT_CLIENT_ID', passwordVariable: 'NSPECT_CLIENT_SECRET'),
                                 usernamePassword(credentialsId: "aws-artifactory-credentials", usernameVariable: 'ARTIFACTORY_USERNAME', passwordVariable: 'ARTIFACTORY_PASSWORD')
                             ]) {
-                                trtllm_utils.llmExecStepWithRetry(this, script: cmd, sleepInSecs: 600, numRetries: 0, shortCommondRunTimeMax: 7200)
+                                catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE', catchInterruptions: false) {
+                                    retry(3) {
+                                        sh(label: 'Register images to nSpect', script: registrationCmd)
+                                        if (params.osrb_ticket) {
+                                            sh(label: 'Associate images with OSRB in nSpect',
+                                                script: cmd + "--osrb_ticket ${params.osrb_ticket} " + imageArgs)
+                                        }
+                                    }
+                                }
+                                if (params.wait_success_seconds) {
+                                    def launchCheckCmd = cmd + "--check_launch_api --wait_success ${params.wait_success_seconds} " + imageArgs
+                                    trtllm_utils.llmExecStepWithRetry(this, script: launchCheckCmd, sleepInSecs: 600, numRetries: 0, shortCommondRunTimeMax: 7200)
+                                }
                             }
                         }
                     }
