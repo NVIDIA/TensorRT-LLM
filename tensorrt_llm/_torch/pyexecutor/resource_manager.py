@@ -1412,6 +1412,25 @@ class KVCacheManager(BaseResourceManager):
         draft_kv_cache_manager: Optional[BaseResourceManager] = None,
         capture_sampling_params: Optional[SamplingParams] = None,
     ):
+        """Create dummy requests and eagerly allocate their KV cache resources.
+
+        Register each request in the target cache and, when supplied, the draft
+        cache, including extra KV tokens. There is no allocation-free mode.
+        ``token_nums`` specifies history plus input length, excluding draft
+        tokens. With ``is_gen=True``, requests enter generation state and reserve
+        draft KV capacity; ``kv_reserve_draft_tokens`` overrides that reserve
+        without changing the ``max_num_draft_tokens`` proposal length.
+
+        Returns:
+            Requests in ``request_ids`` order, or ``None`` if the target cache
+            has no free blocks at entry. Allocation exceptions trigger an
+            attempt to release all sequences registered by this call, then
+            propagate (a cleanup exception takes precedence if cleanup fails).
+
+        The caller must release each returned request with ``free_resources``
+        on this manager and the supplied draft manager when it is no longer
+        needed, including when subsequent warmup or graph capture fails.
+        """
         _kv_draft = kv_reserve_draft_tokens if kv_reserve_draft_tokens is not None else max_num_draft_tokens
         available_blocks = self.get_num_free_blocks()
         # No padding if not enough KV cache space

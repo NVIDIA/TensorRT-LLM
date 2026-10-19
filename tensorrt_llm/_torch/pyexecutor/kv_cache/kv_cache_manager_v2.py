@@ -5436,6 +5436,26 @@ class KVCacheManagerV2(BaseResourceManager):
         draft_kv_cache_manager: Optional["BaseResourceManager"] = None,
         capture_sampling_params: Optional[SamplingParams] = None,
     ):
+        """Create dummy requests with allocated target and optional draft KV caches.
+
+        Resource preparation is unconditional. ``token_nums`` specifies history
+        plus input length, excluding draft tokens; extra KV tokens are reserved
+        internally. With ``is_gen=True``, requests enter generation state and
+        reserve draft capacity. ``kv_reserve_draft_tokens`` overrides this
+        reserve without changing the ``max_num_draft_tokens`` proposal length.
+        ``materialize_history=True`` also backs the declared generation history
+        with blocks instead of using the committed-history capacity hint.
+
+        Returns:
+            Requests in ``request_ids`` order, or ``None`` when cache creation,
+            resume, resize, or beam expansion reports insufficient capacity.
+            These failure returns release resources allocated by this call;
+            unexpected exceptions propagate.
+
+        The caller must release each returned request with ``free_resources``
+        on this manager and the supplied draft manager when it is no longer
+        needed, including when subsequent warmup or graph capture fails.
+        """
         _kv_draft = (
             kv_reserve_draft_tokens if kv_reserve_draft_tokens is not None else max_num_draft_tokens
         )
