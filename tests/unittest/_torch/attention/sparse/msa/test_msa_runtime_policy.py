@@ -304,9 +304,16 @@ def pools(monkeypatch):
     return kv_pool, scale_pool
 
 
-def _assert_kv_view(view: torch.Tensor, pool: torch.Tensor) -> None:
+def _assert_kv_view(
+    view: torch.Tensor, pool: torch.Tensor, manager: MiniMaxM3KVCacheManagerV2
+) -> None:
+    # The pool is laid out in the manager's physical layout; a view in the other layout swaps the
+    # page's head and token axes over the same memory.
+    page = list(PAGE_SHAPE)
+    if manager._main_kv_view_layout != manager._main_kv_layout_name():
+        page[0], page[1] = page[1], page[0]
     assert view.data_ptr() == pool.data_ptr()
-    assert list(view.shape) == [NUM_SLOTS, 2, *PAGE_SHAPE]
+    assert list(view.shape) == [NUM_SLOTS, 2, *page]
     assert view.stride(0) == SCALE * 2 * 8 * 16
 
 
@@ -319,8 +326,8 @@ def test_pool_views_are_rebuilt_on_every_call_by_default(manager, pools):
 
     assert not manager.reuse_pool_views
     assert first is not second
-    _assert_kv_view(first, kv_pool)
-    _assert_kv_view(second, kv_pool)
+    _assert_kv_view(first, kv_pool, manager)
+    _assert_kv_view(second, kv_pool, manager)
 
 
 @requires_cuda
@@ -334,7 +341,7 @@ def test_reused_pool_views_are_built_once_per_geometry(manager, pools):
     assert manager.get_buffers(3) is view
     assert manager.get_block_scale_buffers(3) is scale_view
     assert scale_view is not view
-    _assert_kv_view(view, kv_pool)
+    _assert_kv_view(view, kv_pool, manager)
     assert scale_view.data_ptr() == scale_pool.data_ptr()
     assert scale_view.dtype == torch.uint8
 
@@ -352,7 +359,7 @@ def test_reused_pool_views_are_kept_per_inference_mode(manager, pools):
     assert inference_view is not view
     assert inference_view.is_inference()
     assert not view.is_inference()
-    _assert_kv_view(inference_view, kv_pool)
+    _assert_kv_view(inference_view, kv_pool, manager)
 
 
 @requires_cuda

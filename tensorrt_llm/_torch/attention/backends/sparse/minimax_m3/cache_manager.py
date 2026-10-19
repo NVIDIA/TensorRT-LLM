@@ -848,10 +848,17 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         addr_key, torch_dtype, num_slots, scale, page_shape = self._kv_slot_geometry(
             layer_idx, self._main_kv_layout_name()
         )
-        kv = self._pool_view("kv", addr_key, torch_dtype, num_slots, scale, page_shape)
         # Sparse reference kernels use token-major indexing; preserve the
         # native head-major backing and expose a zero-copy strided view.
-        return kv if kv_layout == self._main_kv_layout_name() else kv.transpose(2, 3)
+        return self._pool_view(
+            "kv",
+            addr_key,
+            torch_dtype,
+            num_slots,
+            scale,
+            page_shape,
+            transpose=kv_layout != self._main_kv_layout_name(),
+        )
 
     def configure_decode_shortcuts(
         self, skip_unchanged_block_offsets: bool, reuse_pool_views: bool
@@ -874,8 +881,10 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         num_slots: int,
         scale: int,
         page_shape: List[int],
+        transpose: bool = False,
     ) -> torch.Tensor:
-        """The ``[num_slots, 2, ...]`` K+V view of a pool rooted at ``addr_key``.
+        """The ``[num_slots, 2, ...]`` K+V view of a pool rooted at ``addr_key``; ``transpose`` swaps the
+        page's head and token axes (the token-major view of head-major storage).
 
         The view is a pure function of the pool geometry, which is static once the
         pool is laid out, so with ``reuse_pool_views`` it is built once per geometry
@@ -889,6 +898,7 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
             num_slots,
             scale,
             tuple(page_shape),
+            transpose,
             torch.is_inference_mode_enabled(),
         )
         view = self._pool_views.get(key) if self.reuse_pool_views else None
@@ -898,6 +908,8 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
                 TensorWrapper(addr_key, torch_dtype, full_slot_shape)
             )
             view = full_view[:, :2]
+            if transpose:
+                view = view.transpose(2, 3)
             if self.reuse_pool_views:
                 self._pool_views[key] = view
         return view
