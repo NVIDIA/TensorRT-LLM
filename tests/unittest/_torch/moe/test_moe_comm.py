@@ -1283,6 +1283,11 @@ def _worker_nccl_ep_cuda_graph_replay(config: CommTestConfig, routing_dtype: tor
             dtype=torch.bfloat16,
             device="cuda",
         )
+        # Preserve the first quantization block as a rank tag, and exercise
+        # signed, nonuniform payloads in the remaining blocks.
+        hidden_states[:, 16:] = (torch.arange(config.hidden_size - 16, device="cuda") % 7 - 3).to(
+            torch.bfloat16
+        )
         weights = torch.ones(num_tokens, 1, dtype=routing_dtype, device="cuda")
         local_routes = _nccl_ep_replay_slots(
             target_rank=rank,
@@ -1296,31 +1301,104 @@ def _worker_nccl_ep_cuda_graph_replay(config: CommTestConfig, routing_dtype: tor
             experts_per_rank=experts_per_rank,
         )
 
-        with nccl_window_tensor_scope(hidden_states):
-            # Initialize the context and handle eagerly. Capture is intentionally
-            # rejected before this point, matching production graph setup.
-            comm.dispatch(
-                hidden_states,
-                None,
-                local_routes,
-                weights,
-                all_rank_num_tokens,
-            )
-            torch.cuda.synchronize()
+        from tensorrt_llm._torch.nccl_window_graph import (
+            nccl_window_graph_capture,
+            release_nccl_window_graph_owner,
+        )
 
-            static_routes = local_routes.clone()
-            graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph):
-                recv_hs, _, recv_slots, recv_scales = comm.dispatch(
-                    hidden_states,
-                    None,
-                    static_routes,
-                    weights,
-                    all_rank_num_tokens,
+        static_routes = local_routes.clone()
+
+        global_scale = torch.ones(num_tokens, 1, device="cuda", dtype=torch.float32)
+
+        def quantized_input():
+            if config.quant_mode == "fp8":
+                return hidden_states.to(torch.float8_e4m3fn), None
+            if config.quant_mode == "nvfp4":
+                return Buffer.quantize_bf16_to_nvfp4(hidden_states, global_scale)
+            return hidden_states, None
+
+        def expected_output(weight):
+            tokens, scales = quantized_input()
+            expected = _to_bf16(tokens, scales, global_scale, config.quant_mode) * weight
+            if config.use_low_precision_combine:
+                expected = _simulate_nvfp4_round_trip(expected)
+            return expected
+
+        def combine_matches(actual, weight):
+            return bool(
+                torch.all(
+                    torch.isclose(
+                        actual,
+                        expected_output(weight),
+                        rtol=0.02 if config.use_low_precision_combine else 0,
+                        atol=0,
+                    )
+                ).item()
+            )
+
+        def roundtrip():
+            with nccl_window_tensor_scope(hidden_states):
+                tokens, scales = quantized_input()
+                recv_hs, recv_sf, recv_slots, recv_scales = comm.dispatch(
+                    tokens, scales, static_routes, weights, all_rank_num_tokens
+                )
+                dispatch_windowed = recv_hs.data_ptr() != comm._ctx.output_tokens_buf.data_ptr()
+                from tensorrt_llm._torch.moe.fused_moe.communication.nccl_ep import NcclEPWindow
+                from tensorrt_llm.bindings.internal.thop import BufferKind
+
+                destination, kind, handle = torch.ops.trtllm.allocate_output_with_nccl_window(
+                    recv_hs,
+                    int(BufferKind.NCCL_WINDOW),
+                    comm.mapping.moe_ep_group,
+                    [comm.max_recv_tokens, comm.hidden_size],
+                    torch.bfloat16,
+                )
+                combine_windowed = kind == int(BufferKind.NCCL_WINDOW) and bool(handle)
+                window = (
+                    NcclEPWindow(
+                        handle,
+                        destination.data_ptr(),
+                        destination.numel(),
+                        destination.dtype,
+                        destination.device,
+                    )
+                    if combine_windowed
+                    else None
+                )
+                # A minimal expert writes directly into the supplied destination.
+                decoded = _to_bf16(recv_hs, recv_sf, global_scale, config.quant_mode)
+                torch.mul(decoded, recv_scales[:, :1], out=destination)
+                combined = comm.combine(destination, window=window)
+                # Copy observations before the scope releases the dispatch lease.
+                observed_hs = decoded.clone()
+                observed_slots = recv_slots.clone()
+                observed_scales = recv_scales.clone()
+            return (
+                observed_hs,
+                observed_slots,
+                observed_scales,
+                combined,
+                dispatch_windowed,
+                combine_windowed,
+            )
+
+        # Warm both directions and release their leases before graph capture.
+        eager = roundtrip()
+        torch.cuda.synchronize()
+        assert combine_matches(eager[3], 1.0)
+        if comm._ctx.window_buffers_supported:
+            assert eager[4] and eager[5], "Eager execution missed registered windows"
+        pool = torch.cuda.graph_pool_handle()
+        graph = torch.cuda.CUDAGraph()
+        try:
+            with nccl_window_graph_capture(graph, pool):
+                recv_hs, recv_slots, recv_scales, combined, dispatch_windowed, combine_windowed = (
+                    roundtrip()
                 )
             torch.cuda.synchronize()
-
             assert recv_scales.dtype == routing_dtype
+            if comm._ctx.window_buffers_supported:
+                assert dispatch_windowed and combine_windowed, "Capture missed prewarmed windows"
 
             def replay_and_check(expected_sender: int, expected_weight: float) -> dict:
                 graph.replay()
@@ -1333,6 +1411,7 @@ def _worker_nccl_ep_cuda_graph_replay(config: CommTestConfig, routing_dtype: tor
                     "weights_match": bool(
                         torch.all(recv_scales[valid, 0] == expected_weight).item()
                     ),
+                    "combine_matches": bool(combine_matches(combined, expected_weight)),
                 }
 
             static_routes.copy_(local_routes)
@@ -1341,7 +1420,32 @@ def _worker_nccl_ep_cuda_graph_replay(config: CommTestConfig, routing_dtype: tor
             static_routes.copy_(peer_routes)
             weights.fill_(0.25)
             peer_result = replay_and_check(peer_rank, 0.25)
+
+            # The first graph retains its windows. Warm another scoped roundtrip
+            # so an independent graph owner can claim its own registered buffers.
+            roundtrip()
+            torch.cuda.synchronize()
+            second_pool = torch.cuda.graph_pool_handle()
+            second_graph = torch.cuda.CUDAGraph()
+            try:
+                with nccl_window_graph_capture(second_graph, second_pool):
+                    _, _, _, second_combined, dispatch_windowed, combine_windowed = roundtrip()
+                if comm._ctx.window_buffers_supported:
+                    assert dispatch_windowed and combine_windowed, "Second capture missed windows"
+                for weight in (0.5, 0.25):
+                    weights.fill_(weight)
+                    second_graph.replay()
+                    torch.cuda.synchronize()
+                    assert combine_matches(second_combined, weight)
+                    # Replaying the second owner must not invalidate the first.
+                    assert replay_and_check(peer_rank, weight)["combine_matches"]
+            finally:
+                second_graph.reset()
+                release_nccl_window_graph_owner(second_pool)
             return {"rank": rank, "local": local_result, "peer": peer_result}
+        finally:
+            graph.reset()
+            release_nccl_window_graph_owner(pool)
     except Exception:
         traceback.print_exc()
         raise
@@ -2497,7 +2601,12 @@ def _run_full_test_group(mpi_pool_executor, group: CommTestGroup):
     _verify_full_test_results(all_results, pending.config)
 
 
-def _run_nccl_ep_cuda_graph_replay_test(mpi_pool_executor, routing_dtype: torch.dtype) -> None:
+def _run_nccl_ep_cuda_graph_replay_test(
+    mpi_pool_executor,
+    routing_dtype: torch.dtype,
+    quant_mode: str = "none",
+    use_low_precision_combine: bool = False,
+) -> None:
     """Verify graph replay observes routing changed between replays."""
     ep_size = mpi_pool_executor.num_workers
     config = CommTestConfig(
@@ -2507,6 +2616,8 @@ def _run_nccl_ep_cuda_graph_replay_test(mpi_pool_executor, routing_dtype: torch.
         top_k=1,
         hidden_size=DEFAULT_HIDDEN_SIZE,
         all_num_tokens=[16] * ep_size,
+        quant_mode=quant_mode,
+        use_low_precision_combine=use_low_precision_combine,
     )
     skip_reason = _get_skip_reason(config)
     if skip_reason:
@@ -2530,6 +2641,9 @@ def _run_nccl_ep_cuda_graph_replay_test(mpi_pool_executor, routing_dtype: torch.
             )
             assert replay["weights_match"], (
                 f"rank {rank}: {replay_name} replay did not observe the updated routing weights"
+            )
+            assert replay["combine_matches"], (
+                f"rank {rank}: {replay_name} combine replay did not recover the weighted input"
             )
 
 
@@ -3068,11 +3182,21 @@ class TestMoEComm:
     @pytest.mark.threadleak(enabled=False)
     @pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
     @pytest.mark.parametrize("routing_dtype", [torch.bfloat16, torch.float16, torch.float32])
+    @pytest.mark.parametrize(
+        "quant_mode,use_low_precision_combine",
+        [("none", False), ("fp8", False), ("nvfp4", False), ("nvfp4", True)],
+    )
     def test_nccl_ep_cuda_graph_replay_uses_updated_routing(
-        self, mpi_pool_executor, routing_dtype: torch.dtype
+        self,
+        mpi_pool_executor,
+        routing_dtype: torch.dtype,
+        quant_mode: str,
+        use_low_precision_combine: bool,
     ) -> None:
         """Verify LL CUDA graph replay reads routing written after capture."""
-        _run_nccl_ep_cuda_graph_replay_test(mpi_pool_executor, routing_dtype)
+        _run_nccl_ep_cuda_graph_replay_test(
+            mpi_pool_executor, routing_dtype, quant_mode, use_low_precision_combine
+        )
 
     @pytest.mark.threadleak(enabled=False)
     @pytest.mark.parametrize(

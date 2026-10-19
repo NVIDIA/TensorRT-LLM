@@ -440,7 +440,7 @@ def test_nccl_ep_window_refusal_returns_persistent_dispatch_buffer(
         topk_idx_dtype=torch.int32,
         kernel_resets_recv_topk_idx=True,
         kernel_writes_global_ids=True,
-        zerocopy_enabled=True,
+        window_buffers_supported=True,
         dispatch_outputs=SimpleNamespace(tokens=object()),
         layout=object(),
         dispatch_layout_info=object(),
