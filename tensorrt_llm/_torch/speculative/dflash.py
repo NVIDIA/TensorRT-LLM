@@ -38,6 +38,16 @@ from .dflash_attention import (
 )
 from .interface import SpecMetadata, SpecWorkerBase
 
+# TLLM_DFLASH_PREFILL_CTX_SNAPSHOT=1 (read at import): _store_prefill_context
+# reads the context rows' draft page counts from a host snapshot taken in
+# DFlashSpecMetadata.prepare() -- after attn_metadata.prepare() filled
+# draft_kv_cache_block_offsets, before the target forward is enqueued --
+# instead of a blocking .tolist() of a device tensor at the end of the forward.
+# That read made every context forward wait for its own GPU work, so the
+# executor's host work between chunks could not overlap the next chunk. Same
+# formula on the same tensor, so the values are identical.
+_PREFILL_CTX_SNAPSHOT = os.environ.get("TLLM_DFLASH_PREFILL_CTX_SNAPSHOT", "0") == "1"
+
 # Backends that keep the draft's private context K/V in a paged HND pool.
 # They share the pool layout, page table and paged append op
 _PAGED_ATTENTION_BACKENDS = ("TRTLLM", "FA4")
@@ -629,6 +639,8 @@ class DFlashSpecMetadata(SpecMetadata):
                 pin_memory=prefer_pinned(),
             )
             worker._batch_to_slot[:num_seqs].copy_(mapping, non_blocking=True)
+            if _PREFILL_CTX_SNAPSHOT:
+                worker._snapshot_ctx_block_counts(num_contexts)
 
     def is_layer_capture(self, layer_id: int) -> bool:
         return layer_id in self._capture_layer_set
@@ -750,6 +762,10 @@ class DFlashWorker(SpecWorkerBase):
         # Pages the manager handed this request, per batch row. Saturates at
         # the table width on the default backend -- dflash_allocated_ctx_limit.
         self._ctx_block_counts = None
+        # TLLM_DFLASH_PREFILL_CTX_SNAPSHOT: the offsets tensor of the last
+        # refresh and the prepare-time host snapshot of the context rows.
+        self._ctx_offsets_src = None
+        self._ctx_counts_snapshot = None
         self._ctx_pool_idx = 0
         self._ctx_block_divisor = 1  # encoded offset -> raw pool block index
         self._ctx_kv_indptr = None
@@ -1023,6 +1039,7 @@ class DFlashWorker(SpecWorkerBase):
         # pool, and the drafter addresses blocks, not planes.
         # clone(): .to() is a no-op for an int64 source, and the in-place ops
         # below would then edit attn_metadata's own tensor.
+        self._ctx_offsets_src = src
         encoded = src[self._ctx_pool_idx, :num_seqs, 0].to(torch.int64).clone()
         # Before the clamp erases the placeholders. Informative only on the
         # python V2 backend; the cpp one already mapped BAD_PAGE_INDEX to 0.
@@ -1030,6 +1047,58 @@ class DFlashWorker(SpecWorkerBase):
         decoded = encoded.clamp_(min=0).div_(self._ctx_block_divisor, rounding_mode="floor")
         self._ctx_block_tables[:num_seqs].copy_(decoded.to(torch.int32))
         return True
+
+    def _snapshot_ctx_block_counts(self, num_contexts: int) -> None:
+        """Stream-ordered host copy of the context rows' draft page counts.
+
+        Called from DFlashSpecMetadata.prepare(), after attn_metadata.prepare()
+        refilled draft_kv_cache_block_offsets on this stream and before the
+        target forward is enqueued. The counts are computed as
+        _refresh_ctx_block_tables does (rows [0, num_contexts) of the same
+        tensor, which nothing writes between here and the refresh) and copied
+        non-blocking into pinned memory behind an event. The offsets tensor is
+        the persistent buffer seen by the previous refresh;
+        _take_ctx_block_counts only accepts the snapshot if the forward's
+        attn_metadata carries that same tensor.
+        """
+        self._ctx_counts_snapshot = None
+        src = self._ctx_offsets_src
+        if (
+            num_contexts <= 0
+            or src is None
+            or self._ctx_block_tables is None
+            or not prefer_pinned()
+            or torch.cuda.is_current_stream_capturing()
+        ):
+            return
+        encoded = src[self._ctx_pool_idx, :num_contexts, 0]
+        counts = (encoded >= 0).sum(dim=1)
+        counts_host = torch.empty(counts.shape, dtype=counts.dtype, pin_memory=prefer_pinned())
+        counts_host.copy_(counts, non_blocking=True)
+        event = torch.cuda.Event()
+        event.record()
+        binding = (self._ctx_kv_manager, self._ctx_pool_idx)
+        self._ctx_counts_snapshot = (src, num_contexts, binding, counts_host, event)
+
+    def _take_ctx_block_counts(self, attn_metadata, num_contexts: int) -> Optional[torch.Tensor]:
+        """The host page counts snapshotted for this forward, or None."""
+        snapshot = self._ctx_counts_snapshot
+        self._ctx_counts_snapshot = None
+        if snapshot is None:
+            return None
+        src, n, binding, counts_host, event = snapshot
+        if (
+            n != num_contexts
+            or src is not getattr(attn_metadata, "draft_kv_cache_block_offsets", None)
+            or src is not self._ctx_offsets_src
+            or binding != (self._ctx_kv_manager, self._ctx_pool_idx)
+            or self._ctx_block_tables is None
+        ):
+            return None
+        # Completes once the GPU has started this forward (the copy sits in
+        # front of it), not after it.
+        event.synchronize()
+        return counts_host
 
     def _lazy_init_ctx_buffers(
         self, draft_model, spec_metadata, attn_metadata, draft_kv_cache_manager=None
@@ -1486,11 +1555,17 @@ class DFlashWorker(SpecWorkerBase):
         # it must fit that row's allocation as well as the arena's length.
         # One tolist() for the whole loop: the lengths themselves come from
         # _ctx_len_host, so the loop body below stays sync-free.
-        ctx_alloc = (
-            (self._ctx_block_counts[:num_contexts] * self._ctx_page_size).tolist()
-            if self._ctx_block_tables is not None
+        counts = (
+            self._take_ctx_block_counts(attn_metadata, num_contexts)
+            if _PREFILL_CTX_SNAPSHOT
             else None
         )
+        if self._ctx_block_tables is None:
+            ctx_alloc = None
+        elif counts is not None:
+            ctx_alloc = (counts * self._ctx_page_size).tolist()
+        else:
+            ctx_alloc = (self._ctx_block_counts[:num_contexts] * self._ctx_page_size).tolist()
         for i in range(num_contexts):
             req_id = spec_metadata.request_ids[i]
             slen = int(attn_metadata._seq_lens[i])
