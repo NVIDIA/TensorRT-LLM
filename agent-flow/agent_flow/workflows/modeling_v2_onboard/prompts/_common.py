@@ -144,7 +144,8 @@ your own notes about jobs in another file of your node directory.
 **Re-attach before you launch.** Read your `jobs.json` first. A job already
 recorded under the handle that is still running is polled, not relaunched; a
 finished one is collected; only a gone or failed one is launched again under
-the same handle.
+the same handle. Check a recorded Slurm job yourself with `squeue -j <id>`,
+then `sacct -j <id> -o State,ExitCode` once it has left the queue.
 """
 
 GPU_POOL = """\
@@ -188,8 +189,15 @@ container without the code under test, is not evidence.
 
 A fresh worktree has no native build artifacts. When `implements_tips` or
 `test_commands.md` give a way to reuse an existing build, use it; it is valid
-as long as your task changes no C++ or CUDA source. Otherwise the checkout is
-built inside the same job as the command it serves.
+as long as your task changes no C++ or CUDA source. Otherwise each fresh
+container session builds the checkout it runs from, in the same job as the
+command it serves:
+
+```bash
+cd <your worktree>
+./scripts/build_wheel.py --trt_root /usr/local/tensorrt --benchmarks --skip_building_wheel -f --nvtx --use_ccache
+pip install -e .[devel]
+```
 
 `test_commands.md` in the workspace is a cache of commands other tasks have
 **verified** to work: read it before drafting a command, record one after it
