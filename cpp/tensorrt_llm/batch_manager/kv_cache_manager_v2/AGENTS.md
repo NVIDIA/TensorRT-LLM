@@ -25,6 +25,7 @@ layouts or ownership models must not override the implementation.
 - `blockRadixTree.*`: the shared prefix-reuse tree and SHA-256 block keys.
 - `page.*`, `kvCache.*`, and `kvCacheManager.*`: page lifecycle, per-request
   cache state, and the top-level manager.
+- `batch.*`: stable request rows, dirty tracking, and raw GPU metadata publication.
 - `storage/`, `storageManager.*`, `evictionController.*`, and `copyEngine.*`:
   pools, eviction ownership, migration, and data movement.
 - `lifeCycleRegistry.*`: layer-group/lifecycle mapping, including attention and
@@ -79,6 +80,14 @@ slots, schedules pages for eviction, migrates pages between levels, and resizes
 pools. `CopyEngine` performs the actual batched transfers; C++ code calls it
 directly and must not round-trip through Python bindings.
 
+`Batch` groups requests from one manager across all layer groups. Request changes
+invalidate their stable rows; `publish()` uploads final raw indices and eligible
+history counts, including post-rollback state. Device addresses remain fixed.
+Publish and wait for readiness outside graph capture; after submitting readers
+or replaying a graph, call `recordRead()` before mutating requests or membership.
+Publication waits for offload and prior readers, and retains each staging buffer
+until its upload completes. DLPack views keep the allocation alive, not KV pages.
+
 The dependency direction is broadly:
 
 ```text
@@ -131,6 +140,14 @@ moving a shared host source. Rollback records the original lock level, and
 `ScratchSlotLock` remains GPU-only. This does not itself demote GPU history;
 offload requires a separate transfer and GPU-slot ownership handoff.
 
+Prefill admission, prefetch, and rebasing promote a host-locked sparse page into
+one shared GPU slot. Promotion waits for all owners' prior work and finished
+readers, updates every owner's page indices and metadata version, and releases
+the source host slot with a copy-completion fence. Allocation or copy failure
+preserves host ownership. Decoding owners retain deferred-offload work so that
+`Batch.publish()` retries demotion after the prefill owner enters decode,
+suspends, or closes, even without history growth.
+
 ## Ownership and lifetime
 
 The high-level ownership shape is:
@@ -146,6 +163,11 @@ KvCache
 |- KvCacheManager (shared; cache keeps manager alive)
 `- per-beam/per-block page holders and locks
 
+Batch
+|- KvCacheManager (shared)
+|- request rows (non-owning; exclusive membership, driven by one owning thread)
+`- fixed device metadata and event-protected staging buffers
+
 BlockRadixTree
 `- roots -> child Blocks (strong ownership through next maps)
               `- lifecycle page entries (raw observer links)
@@ -159,6 +181,10 @@ Eviction controller
   strong ones merely to simplify access.
 - `KvCache` keeps its `KvCacheManager` alive. The manager's registry of living
   caches must not create the reverse strong-reference cycle.
+- Closing a request removes its `Batch` row; closing a batch detaches its live
+  requests without closing them. Removed rows stay dirty until publication clears
+  them. Batch destruction waits for uploads and recorded readers before freeing
+  memory; exported arrays can extend the allocation lifetime beyond `close()`.
 - A committed page is referenced by the radix tree without making the tree its
   permanent owner. Eviction queues may be the only strong owner of a droppable
   page, so never store a raw pointer past the operation that obtained it.

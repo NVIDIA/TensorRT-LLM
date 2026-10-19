@@ -15,6 +15,7 @@
 """Unit tests for the OpenEngine gRPC adapter."""
 
 import asyncio
+import gc
 from types import SimpleNamespace
 
 import pytest
@@ -22,8 +23,11 @@ import pytest
 grpc = pytest.importorskip(  # noqa: E402
     "grpc", reason='gRPC runtime not installed (pip install "grpcio>=1.67.1,<2")'
 )
-
-from tensorrt_llm.grpc.openengine.bindings import openengine_pb2_grpc, server_pb2  # noqa: E402
+from tensorrt_llm.grpc.openengine.bindings import (  # noqa: E402
+    kv_pb2,
+    openengine_pb2_grpc,
+    server_pb2,
+)
 from tensorrt_llm.grpc.openengine.server import OpenEngineServer  # noqa: E402
 
 # grpc.aio starts a `_poll_wrapper` daemon thread on server start and tears it
@@ -74,16 +78,57 @@ def test_openengine_server_serves_the_control_contract() -> None:
         assert server.port != 0
 
         await server.start()
+        with pytest.raises(RuntimeError, match="Failed to bind"):
+            OpenEngineServer(host="127.0.0.1", port=server.port, llm=llm, model="test-model")
         channel = grpc.aio.insecure_channel(f"127.0.0.1:{server.port}")
         try:
             control = openengine_pb2_grpc.ControlStub(channel)
             info = await control.GetServerInfo(server_pb2.GetServerInfoRequest(), timeout=5)
             assert info.engine_name == "tensorrt_llm"
+            sources = await control.GetKvEventSources(kv_pb2.GetKvEventSourcesRequest(), timeout=5)
+            assert list(sources.sources) == []
+            with pytest.raises(grpc.aio.AioRpcError) as error:
+                async for _ in control.SubscribeKvEvents(
+                    kv_pb2.SubscribeKvEventsRequest(), timeout=5
+                ):
+                    pass
+            assert error.value.code() == grpc.StatusCode.UNIMPLEMENTED
             assert info.schema_revision == 1
             assert info.minimum_client_revision == 1
             assert info.schema_release == "768a93c7b44e40f28c692ad0b471a8f2"
         finally:
             await channel.close()
+            await server.stop(grace=0)
+
+    asyncio.run(exercise_server())
+
+
+@pytest.mark.parametrize("publisher_enabled", [False, True])
+def test_event_startup_requires_loaded_publisher(publisher_enabled: bool) -> None:
+    """Configured events must not advertise a source absent from the loaded engine."""
+    from tensorrt_llm.grpc.openengine.kv_events import KvEventsUnavailableError
+
+    llm = SimpleNamespace(
+        args=SimpleNamespace(
+            guided_decoding_backend=None,
+            kv_cache_config=SimpleNamespace(
+                kv_events_config=SimpleNamespace(enable_kv_cache_events=True, publisher="zmq")
+            ),
+        ),
+        _executor=SimpleNamespace(
+            get_kv_cache_capacity=lambda: {"kvEventsEnabled": True} if publisher_enabled else {}
+        ),
+    )
+
+    async def exercise_server() -> None:
+        server = OpenEngineServer(host="127.0.0.1", port=0, llm=llm, model="test-model")
+        try:
+            if publisher_enabled:
+                await server.start()
+            else:
+                with pytest.raises(KvEventsUnavailableError, match="no streaming publisher"):
+                    await server.start()
+        finally:
             await server.stop(grace=0)
 
     asyncio.run(exercise_server())
@@ -101,3 +146,58 @@ def test_is_loopback_classifies_bind_hosts() -> None:
     assert not _is_loopback("10.0.0.7")
     # An unresolvable name is not assumed safe.
     assert not _is_loopback("some-host")
+
+
+class _StopLaunch(Exception):
+    """Ends launch_server once the server would start accepting requests."""
+
+
+@pytest.mark.parametrize(
+    ("value", "gc_enabled"),
+    [("1", False), ("0", True), (None, True)],
+)
+def test_launch_server_disables_gc_only_when_requested(
+    monkeypatch: pytest.MonkeyPatch, value: str | None, gc_enabled: bool
+) -> None:
+    """TRTLLM_SERVER_DISABLE_GC=1 turns cyclic GC off before serving, as trtllm-serve does."""
+    import tensorrt_llm.grpc.openengine.server as oe_server
+
+    if value is None:
+        monkeypatch.delenv("TRTLLM_SERVER_DISABLE_GC", raising=False)
+    else:
+        monkeypatch.setenv("TRTLLM_SERVER_DISABLE_GC", value)
+    seen = {}
+
+    class _Llm:
+        def __init__(self, **kwargs) -> None:
+            del kwargs
+            self.llm_id = "test-instance"
+
+        def shutdown(self) -> None:
+            pass
+
+    class _Server:
+        def __init__(self, **kwargs) -> None:
+            del kwargs
+
+        async def start(self) -> None:
+            seen["gc_enabled"] = gc.isenabled()
+            raise _StopLaunch
+
+        async def stop(self) -> None:
+            pass
+
+    monkeypatch.setattr(oe_server, "PyTorchLLM", _Llm)
+    monkeypatch.setattr(oe_server, "OpenEngineServer", _Server)
+    gc_was_enabled = gc.isenabled()
+    gc.enable()
+    try:
+        with pytest.raises(_StopLaunch):
+            oe_server.launch_server("127.0.0.1", 0, {"backend": "pytorch", "model": "test-model"})
+    finally:
+        if gc_was_enabled:
+            gc.enable()
+        else:
+            gc.disable()
+
+    assert seen["gc_enabled"] is gc_enabled

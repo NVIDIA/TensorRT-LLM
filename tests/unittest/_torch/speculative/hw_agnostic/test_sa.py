@@ -462,7 +462,8 @@ class TestKdaReplaySeedOnDisaggTransfer(unittest.TestCase):
         cache.kda_conv_q = torch.full((L, SLOTS, D, committed + M), 7.0)
         cache.kda_conv_k = torch.full((L, SLOTS, D, committed + M), 7.0)
         cache.kda_conv_v = torch.full((L, SLOTS, D, committed + M), 7.0)
-        cache.kda_qkg_cache = torch.full((L, SLOTS, M, 3, D), 7.0)
+        cache.kda_k_cache = torch.full((L, SLOTS, M, D), 7.0)
+        cache.kda_g_cache = torch.full((L, SLOTS, M, D), 7.0)
         cache.kda_v_cache = torch.full((L, SLOTS, M, D), 7.0)
         cache.kda_beta_cache = torch.full((L, SLOTS, M, NH), 7.0)
         cache.prev_num_accepted_tokens = torch.full((SLOTS,), 5, dtype=torch.int32)
@@ -490,7 +491,8 @@ class TestKdaReplaySeedOnDisaggTransfer(unittest.TestCase):
                     kda[:, slot, :, :committed], conv_before[:, slot, lo:hi].to(kda.dtype)
                 )
                 assert (kda[:, slot, :, committed:] == 0).all()
-            assert (cache.kda_qkg_cache[:, slot] == 0).all()
+            assert (cache.kda_k_cache[:, slot] == 0).all()
+            assert (cache.kda_g_cache[:, slot] == 0).all()
             assert (cache.kda_v_cache[:, slot] == 0).all()
             assert (cache.kda_beta_cache[:, slot] == 0).all()
             assert cache.prev_num_accepted_tokens[slot] == 0
@@ -499,7 +501,8 @@ class TestKdaReplaySeedOnDisaggTransfer(unittest.TestCase):
         # Untouched slots keep their contents.
         for slot in (0, 2):
             assert (cache.kda_conv_q[:, slot] == 7.0).all()
-            assert (cache.kda_qkg_cache[:, slot] == 7.0).all()
+            assert (cache.kda_k_cache[:, slot] == 7.0).all()
+            assert (cache.kda_g_cache[:, slot] == 7.0).all()
             assert cache.prev_num_accepted_tokens[slot] == 5
 
     def test_noop_without_kda_replay_or_unknown_ids(self):

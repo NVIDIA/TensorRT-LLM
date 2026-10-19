@@ -26,7 +26,7 @@ treat this as internal API rather than test-only scaffolding.
 from __future__ import annotations
 
 import sys
-from typing import Any
+from typing import Any, NamedTuple
 
 
 def _cpp_introspection_module() -> Any | None:
@@ -70,6 +70,11 @@ def create_test_padding_cold_page_codec(cold_page_bytes_by_layer: dict[int, int]
     return _cpp().create_test_padding_cold_page_codec(cold_page_bytes_by_layer)
 
 
+def drop_optional_pages(kv_cache: Any, end: int, groups: list[int] | None = None) -> None:
+    """Test-only eviction injection, preserving other groups and live readers."""
+    _cpp().drop_optional_pages(kv_cache, end, groups)
+
+
 def make_test_block(
     manager: Any,
     tokens: Any,
@@ -106,6 +111,30 @@ def event_manager_add_stored_life_cycle(event_manager: Any, block: Any, life_cyc
     _cpp().event_manager_add_stored_life_cycle(event_manager, block, life_cycle_id)
 
 
+def streaming_event_sink_add_stored_block(event_sink: Any, block: Any) -> None:
+    """Feed a real test block to the native streaming sink."""
+    _cpp().streaming_event_sink_add_stored_block(event_sink, block)
+
+
+def streaming_event_sink_add_stored_life_cycle(
+    event_sink: Any, block: Any, life_cycle_id: int
+) -> None:
+    """Feed one lifecycle of a real test block to the native streaming sink."""
+    _cpp().streaming_event_sink_add_stored_life_cycle(event_sink, block, life_cycle_id)
+
+
+def streaming_event_sink_add_removed_block(event_sink: Any, block: Any) -> None:
+    """Remove a real test block from the native streaming sink."""
+    _cpp().streaming_event_sink_add_removed_block(event_sink, block)
+
+
+def streaming_event_sink_add_removed_life_cycle(
+    event_sink: Any, block: Any, life_cycle_id: int
+) -> None:
+    """Remove one lifecycle of a real test block from the native streaming sink."""
+    _cpp().streaming_event_sink_add_removed_life_cycle(event_sink, block, life_cycle_id)
+
+
 def active_page_stats(kv_cache: Any) -> tuple[list[int], list[int]]:
     """Return active pages and unscheduled evictable active pages by cache level."""
     counts, unscheduled_evictable = _cpp().active_page_stats(kv_cache)
@@ -121,6 +150,35 @@ def committed_page_is_linked(kv_cache: Any, ordinal: int, lc_id: int) -> bool | 
     build catches the fault itself.
     """
     return _cpp().committed_page_is_linked(kv_cache, ordinal, lc_id)
+
+
+class HostMemPlacement(NamedTuple):
+    """Where a host-tier allocation's pages landed, and under which NUMA policy."""
+
+    gpu_numa_node: int
+    #: None where the policy could not be read back, which also means mbind did
+    #: not apply and the placement came from first touch.
+    strict_binding: bool | None
+    #: Resident pages per NUMA node.
+    node_page_counts: dict[int, int]
+
+
+def probe_host_mem_placement(
+    size: int, allow_remote_numa_fallback: bool
+) -> HostMemPlacement | None:
+    """Allocate host-tier memory the way the host tier would and report its placement.
+
+    None where the question does not apply: a platform whose selected backing is
+    not mmap, no libnuma, or a single NUMA node.
+    """
+    placement = _cpp().probe_host_mem_placement(size, allow_remote_numa_fallback)
+    if placement is None:
+        return None
+    return HostMemPlacement(
+        gpu_numa_node=placement.gpu_numa_node,
+        strict_binding=placement.strict_binding,
+        node_page_counts=dict(placement.node_page_counts),
+    )
 
 
 def all_tree_pages_droppable(manager: Any) -> bool:

@@ -54,6 +54,7 @@ _cpp = _load_cpp_module()
 
 AggregatedPageDesc = _cpp.AggregatedPageDesc
 AttentionLayerConfig = _cpp.AttentionLayerConfig
+AttentionReusePolicy = _cpp.AttentionReusePolicy
 AttnLifeCycle = _cpp.AttnLifeCycle
 BatchDesc = _cpp.BatchDesc
 # BatchDesc is also consumed via dataclasses.replace(): MambaCacheManager's
@@ -80,11 +81,14 @@ CoalescedBuffer = _cpp.CoalescedBuffer
 CacheTier = _cpp.CacheTier
 CorruptedError = _cpp.CorruptedError
 CuError = _cpp.CuError
+CuOOMError = _cpp.CuOOMError
 DiskCacheTierConfig = _cpp.DiskCacheTierConfig
+DiskOOMError = _cpp.DiskOOMError
 GpuCacheTierConfig = _cpp.GpuCacheTierConfig
 ExpandedBuffer = _cpp.ExpandedBuffer
 HalfOpenRange = _cpp.HalfOpenRange
 HostCacheTierConfig = _cpp.HostCacheTierConfig
+HostOOMError = _cpp.HostOOMError
 KVCacheDesc = _cpp.KVCacheDesc
 KVCacheCreatedData = _cpp.KVCacheCreatedData
 KVCacheEvent = _cpp.KVCacheEvent
@@ -93,6 +97,10 @@ KVCacheEventManager = _cpp.KVCacheEventManager
 KVCacheIterationStatsDelta = _cpp.KVCacheIterationStatsDelta
 KVCacheManager = _cpp.KVCacheManager
 KVCacheManagerConfig = _cpp.KVCacheManagerConfig
+StreamingBlockRemovedData = _cpp.StreamingBlockRemovedData
+StreamingBlockStoredData = _cpp.StreamingBlockStoredData
+StreamingEventSink = _cpp.StreamingEventSink
+StreamingEventStats = _cpp.StreamingEventStats
 IKvCacheColdPageCodec = _cpp.IKvCacheColdPageCodec
 create_default_kv_cache_cold_page_codec = _cpp.create_default_kv_cache_cold_page_codec
 # The C++ KVCacheManagerConfig binding replaces the Python @dataclass, but
@@ -123,6 +131,8 @@ class _KVCacheManagerConfigFieldSpec:
     commit_min_snapshot: bool = False
     enable_stats: bool = True
     text_only: bool = False
+    enable_partial_commit: bool = True
+    pool_rebalance: object = None
 
 
 KVCacheManagerConfig.__dataclass_fields__ = _KVCacheManagerConfigFieldSpec.__dataclass_fields__
@@ -133,15 +143,21 @@ KVCacheStoredBlockData = _cpp.KVCacheStoredBlockData
 KVCacheStoredData = _cpp.KVCacheStoredData
 KVCacheUpdatedData = _cpp.KVCacheUpdatedData
 KvCacheStatus = _cpp.KvCacheStatus
+LogicError = _cpp.LogicError
 OutOfMemoryError = _cpp.OutOfMemoryError
 OutOfPagesError = _cpp.OutOfPagesError
 PageIndexConverter = _cpp.PageIndexConverter
 PageIndexMode = _cpp.PageIndexMode
 PageStatus = _cpp.PageStatus
+PageStorageSnapshot = _cpp.PageStorageSnapshot
+Batch = _cpp.Batch
+BatchDeviceArray = _cpp.BatchDeviceArray
 PlannedDropHandle = _cpp.PlannedDropHandle
 PoolDesc = _cpp.PoolDesc
 PoolGroupDesc = _cpp.PoolGroupDesc
 PoolGroupPeakBlockStats = _cpp.PoolGroupPeakBlockStats
+PoolRebalanceConfig = _cpp.PoolRebalanceConfig
+ReuseGroupStatus = _cpp.ReuseGroupStatus
 ReuseScope = _cpp.ReuseScope
 ReusedBlocksByLevel = _cpp.ReusedBlocksByLevel
 ScratchDesc = _cpp.ScratchDesc
@@ -197,6 +213,7 @@ def typed_range(*args: int) -> range:
 __all__ = [
     "AggregatedPageDesc",
     "AttentionLayerConfig",
+    "AttentionReusePolicy",
     "BAD_PAGE_INDEX",
     "CACHE_LEVEL1",
     "BatchDesc",
@@ -232,6 +249,7 @@ __all__ = [
     "LayerGroupId",
     "LayerId",
     "LifeCycleId",
+    "LogicError",
     "MemAddress",
     "NDEBUG",
     "OutOfPagesError",
@@ -240,11 +258,15 @@ __all__ = [
     "PoolGroupPeakBlockStats",
     "PageIndexMode",
     "PageStatus",
+    "PageStorageSnapshot",
+    "Batch",
+    "BatchDeviceArray",
     "PoolDesc",
     "PoolGroupDesc",
     "PoolGroupIndex",
     "PoolIndex",
     "Priority",
+    "ReuseGroupStatus",
     "ReuseScope",
     "ScratchDesc",
     "KVCacheIterationStatsDelta",
@@ -254,7 +276,12 @@ __all__ = [
     "SlidingWindowSize",
     "SlotDesc",
     "SlotDescVariant",
+    "PoolRebalanceConfig",
     "SsmLayerConfig",
+    "StreamingBlockRemovedData",
+    "StreamingBlockStoredData",
+    "StreamingEventSink",
+    "StreamingEventStats",
     "SwaScratchReuseConfig",
     "TokenId",
     "TokenIdExt",
@@ -262,6 +289,9 @@ __all__ = [
     "AttnLifeCycle",
     "CorruptedError",
     "CuError",
+    "CuOOMError",
+    "DiskOOMError",
+    "HostOOMError",
     "OutOfMemoryError",
     "_KVCache",
     "create_default_kv_cache_cold_page_codec",

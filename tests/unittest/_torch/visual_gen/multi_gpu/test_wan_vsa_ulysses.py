@@ -32,11 +32,10 @@ os.environ["TLLM_DISABLE_MPI"] = "1"
 import pytest
 import torch
 import torch.distributed as dist
-import torch.multiprocessing as mp
 from utils.llm_data import get_checkpoint
 
-from tensorrt_llm._torch.visual_gen.attention_backend.cute_dsl import _cute_dsl_import_error
-from tensorrt_llm._torch.visual_gen.attention_backend.sparse.vsa import (
+from tensorrt_llm._torch.visual_gen.attention.backends.cute_dsl import _cute_dsl_import_error
+from tensorrt_llm._torch.visual_gen.attention.backends.sparse.vsa import (
     VSAMetadataBuilder,
     set_vsa_forward_context,
 )
@@ -46,8 +45,9 @@ from tensorrt_llm._torch.visual_gen.config import (
     TorchCompileConfig,
 )
 from tensorrt_llm._torch.visual_gen.mapping import VisualGenMapping
-from tensorrt_llm._utils import get_free_port
 from tensorrt_llm.visual_gen.sparse_attention import VideoSparseAttentionConfig
+
+from ._worker_pool import run_distributed
 
 _cute_dsl_available = _cute_dsl_import_error is None
 
@@ -63,41 +63,10 @@ def _cleanup_mpi_env():
 # =============================================================================
 
 
-def init_distributed_worker(rank: int, world_size: int, backend: str = "nccl", port: int = 29500):
-    os.environ["MASTER_ADDR"] = "localhost"
-    os.environ["MASTER_PORT"] = str(port)
-    os.environ["RANK"] = str(rank)
-    os.environ["WORLD_SIZE"] = str(world_size)
-    torch.cuda.set_device(rank % torch.cuda.device_count())
-    dist.init_process_group(backend=backend, rank=rank, world_size=world_size)
-
-
-def cleanup_distributed():
-    if dist.is_initialized():
-        dist.destroy_process_group()
-
-
-def _distributed_worker(rank, world_size, backend, test_fn, port, kwargs):
-    try:
-        init_distributed_worker(rank, world_size, backend, port)
-        test_fn(rank, world_size, **kwargs)
-    except Exception as e:
-        print(f"Rank {rank} failed with error: {e}")
-        raise
-    finally:
-        cleanup_distributed()
-
-
 def run_test_in_distributed(world_size: int, test_fn: Callable, **kwargs):
     if torch.cuda.device_count() < world_size:
         pytest.skip(f"Test requires {world_size} GPUs, only {torch.cuda.device_count()} available")
-    port = get_free_port()
-    mp.spawn(
-        _distributed_worker,
-        args=(world_size, "nccl", test_fn, port, kwargs),
-        nprocs=world_size,
-        join=True,
-    )
+    run_distributed(world_size, test_fn, dist_backend="nccl", preload=("tensorrt_llm",), **kwargs)
 
 
 _VIDEO_T = 4

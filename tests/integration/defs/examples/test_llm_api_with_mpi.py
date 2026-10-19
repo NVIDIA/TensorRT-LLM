@@ -15,17 +15,17 @@
 
 import os
 
-import pytest
 from defs.common import venv_mpi_check_call
+from defs.conftest import llm_models_root
 
 
-@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
-                         indirect=True)
-def test_llm_api_single_gpu_with_mpirun(llmapi_example_root, llm_venv,
-                                        llama_model_root):
+def test_llm_api_single_gpu_with_mpirun(llmapi_example_root, llm_venv):
+    qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
+    assert os.path.exists(
+        qwen_model_root
+    ), f"{qwen_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
     src_dst_dict = {
-        llama_model_root:
-        f"{llm_venv.get_working_directory()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+        qwen_model_root: f"{llm_venv.get_working_directory()}/Qwen3/Qwen3-0.6B",
     }
     for src, dst in src_dst_dict.items():
         if not os.path.islink(dst):

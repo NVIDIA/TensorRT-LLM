@@ -155,7 +155,8 @@ class RemoteDisaggOpenAIServer(RemoteOpenAIServer):
                  llmapi_launch: bool = False,
                  disagg_config: Optional[dict] = None,
                  log_path: Optional[str] = None,
-                 wait_ready: bool = True) -> None:
+                 wait_ready: bool = True,
+                 server_start_timeout: Optional[int] = None) -> None:
         self.ctx_servers = ctx_servers
         self.gen_servers = gen_servers
         self.host = "0.0.0.0"
@@ -174,6 +175,8 @@ class RemoteDisaggOpenAIServer(RemoteOpenAIServer):
         launch_cmd = [
             "trtllm-serve", "disaggregated", "-c", self.extra_config_file
         ]
+        if server_start_timeout is not None:
+            launch_cmd += ["--server_start_timeout", str(server_start_timeout)]
         print(f"launch_cmd: {launch_cmd}, extra_config: {self.disagg_config}")
         if llmapi_launch:
             # start server with llmapi-launch on multi nodes

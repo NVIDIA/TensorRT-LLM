@@ -709,6 +709,24 @@ def test_collect_llm_api_config_captures_decoding_type_for_every_arm():
     assert _walk_captured_keys(auto) >= {"decoding_type"}
 
 
+def test_collect_llm_api_config_captures_spec_dec_variant_with_decoding_type():
+    """The algorithm version is captured next to its decoding_type family."""
+    from tensorrt_llm.llmapi.llm_args import NGramDecodingConfig
+
+    args = TorchLlmArgs(
+        model="/customer/private/Llama",
+        skip_tokenizer_init=True,
+        speculative_config=NGramDecodingConfig(max_draft_len=2),
+    )
+    config, _ = _loads_payloads(args)
+    assert config["speculative_config.decoding_type"] == "NGram"
+    assert config["speculative_config.spec_dec_variant"] == 1
+
+    args.speculative_config.spec_dec_variant = 2
+    config, _ = _loads_payloads(args)
+    assert config["speculative_config.spec_dec_variant"] == 2
+
+
 def test_collect_llm_api_config_captures_max_total_draft_tokens_for_every_arm():
     """Inherited safe fields remain capturable on concrete model arms."""
     from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig
@@ -720,6 +738,7 @@ def test_collect_llm_api_config_captures_max_total_draft_tokens_for_every_arm():
 def test_collect_llm_api_config_captures_sparse_algorithm_for_every_arm():
     """Every reachable sparse algorithm Literal is captured from its active model arm."""
     from tensorrt_llm.llmapi.llm_args import (
+        CSA2SparseAttentionConfig,
         DeepSeekSparseAttentionConfig,
         DeepSeekV4SparseAttentionConfig,
         MiniMaxM3SparseAttentionConfig,
@@ -733,6 +752,7 @@ def test_collect_llm_api_config_captures_sparse_algorithm_for_every_arm():
         QSASparseAttentionConfig(),
         DeepSeekSparseAttentionConfig(),
         DeepSeekV4SparseAttentionConfig(),
+        CSA2SparseAttentionConfig(),
         RocketSparseAttentionConfig(),
         SkipSoftmaxAttentionConfig(),
         MiniMaxM3SparseAttentionConfig(),
