@@ -972,6 +972,21 @@ class RemoteMpiCommSessionServer():
     # Reply to a shutdown request, so the stop client knows it was received.
     SHUTDOWN_ACK = "shutdown-ack"
 
+    def _receive(self) -> Optional[RemoteTask]:
+        """Read one message from the control socket.
+
+        A shutdown request (None) is acknowledged as soon as it is read: the
+        stop client resends on a new connection whenever an attempt goes
+        unacknowledged, and the server only accepts the new connection when
+        it next reads the socket, so a reply sent later would go to a client
+        that has already closed.
+        """
+        message = self.queue.get()
+        if message is None:
+            # Best-effort: a client that has already given up does not need it.
+            self.queue.put_noblock(self.SHUTDOWN_ACK, retry=2)
+        return message
+
     def _wait_for_pending_futures(self, pending_futures: list) -> list:
         """Wait for a previous task's worker futures, servicing the socket.
 
@@ -1013,7 +1028,7 @@ class RemoteMpiCommSessionServer():
                 # All workers failed, no point waiting further.
                 break
             while self.queue.poll(0):
-                received.append(self.queue.get())
+                received.append(self._receive())
         if n_failed:
             logger.error(f"RemoteMpiCommSessionServer: {n_failed}/"
                          f"{len(pending_futures)} MPI worker(s) failed. "
@@ -1036,14 +1051,11 @@ class RemoteMpiCommSessionServer():
                 pending_futures.clear()
 
             message: Optional[RemoteTask] = (received.pop(0)
-                                             if received else self.queue.get())
+                                             if received else self._receive())
             if message is None:
                 logger_debug(
                     f"RemoteMpiCommSessionServer [rank{global_mpi_rank()}] received shutdown signal\n",
                     "green")
-                # Best-effort: the stop client stops resending once it sees
-                # this; a client that has already given up does not need it.
-                self.queue.put_noblock(self.SHUTDOWN_ACK, retry=2)
                 self.session.shutdown_abort()
                 self._close_global_comm_executor()
                 break

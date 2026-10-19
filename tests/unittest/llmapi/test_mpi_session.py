@@ -875,7 +875,7 @@ def _spawn_proxy_ipc(monkeypatch, tmp_path: Path):
 
 @pytest.mark.cpu_only
 def test_stop_request_reaches_server_still_waiting_for_workers(
-        _spawn_proxy_ipc) -> None:
+        _spawn_proxy_ipc, monkeypatch) -> None:
     """The stop client must stop a server whose workers are still running.
 
     This is ``trtllm-llmapi-launch``'s teardown: the engine (the PAIR client
@@ -883,34 +883,48 @@ def test_stop_request_reaches_server_still_waiting_for_workers(
     asks the server to shut down while the server is still waiting for the
     task's worker futures. A PAIR socket only takes the new client once it has
     processed the engine's disconnect, so a single request sent right away was
-    dropped and the server, and every follower rank, hung.
+    dropped and the server, and every follower rank, hung. The request must
+    also be acknowledged during the wait: the client gives up on an attempt
+    after ``ack_timeout`` and reconnects, so an acknowledgment sent after the
+    wait finds no peer and the client resends until it runs out of attempts.
     """
     from concurrent.futures import Future
 
+    from tensorrt_llm.llmapi import mpi_session
     from tensorrt_llm.llmapi.mgmn_leader_node import stop_server_main
+    from tensorrt_llm.llmapi.mpi_session import RemoteTask
 
     addr, hmac_key = _spawn_proxy_ipc
     server = _bare_server_on(addr, hmac_key)
     worker_future = Future()
     stopped = threading.Event()
 
-    def serve_until_stopped():
-        assert server.queue.get() == "task"
-        received = server._wait_for_pending_futures([worker_future])
-        message = received.pop(0) if received else server.queue.get()
-        assert message is None
-        server.queue.put(RemoteMpiCommSessionServer.SHUTDOWN_ACK)
-        stopped.set()
+    class _Session:
+        """The MPI session the server drives, with one worker."""
+        n_workers = 1
 
-    server_thread = threading.Thread(target=serve_until_stopped, daemon=True)
+        def submit(self, *args, **kwargs):
+            return [worker_future]
+
+        def shutdown_abort(self):
+            stopped.set()
+
+    server.session = _Session()
+    monkeypatch.setattr(mpi_session, "mpi_world_size", lambda: 1, raising=False)
+    monkeypatch.setattr(RemoteMpiCommSessionServer,
+                        "_close_global_comm_executor",
+                        staticmethod(lambda: None))
+    server_thread = threading.Thread(target=server.serve, daemon=True)
     server_thread.start()
     try:
         engine = _pair_client(addr, hmac_key)
-        engine.put("task")
+        engine.put(RemoteTask(print, (), {}))
         engine.close()
         # The workers finish well after the first stop request was sent.
         threading.Timer(3.0, worker_future.set_result, args=(None, )).start()
+        start = time.monotonic()
         assert stop_server_main(ack_timeout=0.5, max_attempts=40)
+        assert time.monotonic() - start < 3.0
         assert stopped.wait(10)
     finally:
         server_thread.join(10)
@@ -929,9 +943,14 @@ def test_stop_request_gives_up_without_a_server(_spawn_proxy_ipc) -> None:
 
 @pytest.mark.cpu_only
 def test_server_wait_for_futures_logs_failures_and_returns_no_messages(
-        tmp_path: Path) -> None:
+        tmp_path: Path, monkeypatch) -> None:
     from concurrent.futures import Future
 
+    from tensorrt_llm.llmapi import mpi_session
+
+    errors = []
+    monkeypatch.setattr(mpi_session.logger, "error",
+                        lambda *msg: errors.append(" ".join(map(str, msg))))
     server = _bare_server_on(f"ipc://{tmp_path / 'server.sock'}",
                              os.urandom(32))
     try:
@@ -939,5 +958,7 @@ def test_server_wait_for_futures_logs_failures_and_returns_no_messages(
         ok.set_result(1)
         failed.set_exception(RuntimeError("rank 1 failed"))
         assert server._wait_for_pending_futures([ok, failed]) == []
+        assert len(errors) == 1
+        assert "1/2" in errors[0] and "rank 1 failed" in errors[0]
     finally:
         server.queue.close()
