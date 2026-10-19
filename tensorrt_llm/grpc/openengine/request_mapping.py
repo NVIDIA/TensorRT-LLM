@@ -4,6 +4,7 @@
 """Translate an OpenEngine GenerateRequest into TensorRT-LLM request inputs."""
 
 import asyncio
+import importlib
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -12,7 +13,7 @@ from urllib.parse import urlparse
 import grpc
 
 from tensorrt_llm.conversation_params import ConversationParams
-from tensorrt_llm.inputs.media_io import AudioMediaIO, ImageMediaIO, MediaFetchError, VideoMediaIO
+from tensorrt_llm.inputs.media_io import ImageMediaIO, MediaFetchError, VideoMediaIO
 from tensorrt_llm.inputs.multimodal_data import AudioData, VideoData
 from tensorrt_llm.inputs.registry import BaseMultimodalInputProcessor
 from tensorrt_llm.sampling_params import GuidedDecodingParams, SamplingParams
@@ -25,7 +26,7 @@ from .errors import MediaUnavailableError, UnsupportedFeatureError
 # output index and a scan of every generated token, so an unbounded list lets a
 # single request tax the event loop for the whole stream.
 _MAX_STOP_CONDITIONS = 64
-# Bound per-request decode work and retained image data.
+# Bound per-request decode work and retained decoded media.
 _MAX_MEDIA_ITEMS = 64
 _MAX_CONCURRENT_MEDIA_LOADS = 8
 # Checked after each decode; concurrency bounds peak overshoot. Encoded inputs
@@ -38,11 +39,16 @@ _DETOKENIZE_EXTRA_KEY = "detokenize"
 _MediaLoader = Callable[[generation_pb2.MediaItem, int], Awaitable[Any]]
 
 
+def _always_available() -> bool:
+    return True
+
+
 @dataclass(frozen=True)
 class _MediaHandler:
     name: str
     loader_factory: Callable[[Any], _MediaLoader]
     decoded_bytes: Callable[[Any], int]
+    runtime_available: Callable[[], bool] = _always_available
 
 
 def conversation_affinity_enabled(llm: Any) -> bool:
@@ -340,15 +346,6 @@ def _video_loader_factory(llm: Any) -> _MediaLoader:
     return load
 
 
-def _audio_loader_factory(llm: Any) -> _MediaLoader:
-    audio_io = _media_io_for_model(llm, "audio", AudioMediaIO)
-
-    async def load(item: generation_pb2.MediaItem, index: int) -> Any:
-        return await _load_media_item(item, audio_io, index, "audio")
-
-    return load
-
-
 def _decoded_image_bytes(image: Any) -> int:
     import numpy as np
     import torch
@@ -374,12 +371,6 @@ def _decoded_audio_data_bytes(audio: AudioData) -> int:
     raise TypeError(f"unsupported decoded audio type: {type(audio.samples).__name__}")
 
 
-def _decoded_audio_bytes(audio: Any) -> int:
-    if not isinstance(audio, tuple) or len(audio) != 2:
-        raise TypeError(f"unsupported decoded audio type: {type(audio).__name__}")
-    return _decoded_audio_data_bytes(AudioData(samples=audio[0], sample_rate=audio[1]))
-
-
 def _decoded_video_bytes(video: Any) -> int:
     import numpy as np
 
@@ -396,21 +387,29 @@ def _decoded_video_bytes(video: Any) -> int:
     return total
 
 
+def _video_runtime_available() -> bool:
+    try:
+        importlib.import_module("cv2")
+    except (ImportError, OSError):
+        return False
+    return True
+
+
 _MEDIA_HANDLERS: dict[int, _MediaHandler] = {
     generation_pb2.MODALITY_IMAGE: _MediaHandler(
         "image", _image_loader_factory, _decoded_image_bytes
     ),
     generation_pb2.MODALITY_VIDEO: _MediaHandler(
-        "video", _video_loader_factory, _decoded_video_bytes
-    ),
-    generation_pb2.MODALITY_AUDIO: _MediaHandler(
-        "audio", _audio_loader_factory, _decoded_audio_bytes
+        "video", _video_loader_factory, _decoded_video_bytes, _video_runtime_available
     ),
 }
 
 
 def media_capabilities_for_model(llm: Any) -> MediaCapabilities:
-    return resolve_media_capabilities(llm, {handler.name for handler in _MEDIA_HANDLERS.values()})
+    return resolve_media_capabilities(
+        llm,
+        {handler.name for handler in _MEDIA_HANDLERS.values() if handler.runtime_available()},
+    )
 
 
 def _modality_name(modality: int) -> str:
@@ -430,16 +429,16 @@ async def _input_from_request(
     if not request.media:
         return inputs
 
+    capabilities = media_capabilities or media_capabilities_for_model(llm)
+    modalities = capabilities.modalities
+    if not modalities:
+        raise UnsupportedFeatureError("media input is not supported by the loaded model")
+
     if len(request.media) > _MAX_MEDIA_ITEMS:
         raise ValueError(
             f"at most {_MAX_MEDIA_ITEMS} media items are supported per request, "
             f"got {len(request.media)}"
         )
-
-    capabilities = media_capabilities or media_capabilities_for_model(llm)
-    modalities = capabilities.modalities
-    if not modalities:
-        raise UnsupportedFeatureError("media input is not supported by the loaded model")
 
     resolved_handlers: list[_MediaHandler] = []
     for index, item in enumerate(request.media):

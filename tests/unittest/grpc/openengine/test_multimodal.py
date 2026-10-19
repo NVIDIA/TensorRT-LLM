@@ -36,7 +36,26 @@ def _ignore_synthetic_decoded_size(monkeypatch) -> None:
     monkeypatch.setitem(
         request_mapping._MEDIA_HANDLERS,
         generation_pb2.MODALITY_IMAGE,
-        request_mapping._MediaHandler(handler.name, handler.loader_factory, lambda _decoded: 0),
+        request_mapping._MediaHandler(
+            handler.name,
+            handler.loader_factory,
+            lambda _decoded: 0,
+            handler.runtime_available,
+        ),
+    )
+
+
+def _set_video_runtime_available(monkeypatch, available: bool) -> None:
+    handler = request_mapping._MEDIA_HANDLERS[generation_pb2.MODALITY_VIDEO]
+    monkeypatch.setitem(
+        request_mapping._MEDIA_HANDLERS,
+        generation_pb2.MODALITY_VIDEO,
+        request_mapping._MediaHandler(
+            handler.name,
+            handler.loader_factory,
+            handler.decoded_bytes,
+            lambda: available,
+        ),
     )
 
 
@@ -79,18 +98,6 @@ class _ImageInputProcessor(BaseMultimodalInputProcessor):
             "image": {"format": "np"},
             "video": {"format": "np", "num_frames": 4},
         }
-
-
-class _AudioInputProcessor:
-    """Registered processor that does not use BaseMultimodalInputProcessor."""
-
-    _registered_model_type = _ImageConfig.model_type
-
-    def __init__(self, config: _ImageConfig) -> None:
-        self.config = config
-
-    def __call__(self, inputs, sampling_params):
-        raise NotImplementedError
 
 
 class _Tokenizer:
@@ -161,6 +168,7 @@ class _ImageLlm:
 
 @pytest.fixture
 def image_llm(monkeypatch):
+    _set_video_runtime_available(monkeypatch, True)
     config = _ImageConfig()
     input_processor = _ImageInputProcessor(config)
     seen_model_types = []
@@ -186,6 +194,7 @@ def image_llm(monkeypatch):
 
 @pytest.fixture
 def image_video_llm(monkeypatch):
+    _set_video_runtime_available(monkeypatch, True)
     config = _ImageConfig()
     input_processor = _ImageInputProcessor(config)
     monkeypatch.setattr(
@@ -206,33 +215,11 @@ def image_video_llm(monkeypatch):
     )
 
 
-@pytest.fixture
-def image_video_audio_llm(monkeypatch):
-    config = _ImageConfig()
-    input_processor = _ImageInputProcessor(config)
-    monkeypatch.setattr(
-        MULTIMODAL_PLACEHOLDER_REGISTRY,
-        "is_valid",
-        lambda model_type, modality: (
-            model_type == _ImageConfig.model_type and modality in {"image", "video", "audio"}
-        ),
-    )
-    monkeypatch.setattr(
-        MULTIMODAL_PLACEHOLDER_REGISTRY,
-        "get_placeholder",
-        lambda model_type, modality: f"<{modality}_{{}}>",
-    )
-    return SimpleNamespace(
-        _hf_model_config=config,
-        input_processor=input_processor,
-    )
-
-
 def test_media_capability_requires_the_loaded_multimodal_processor(image_llm):
     llm, seen_model_types = image_llm
 
     assert request_mapping.media_capabilities_for_model(llm).modalities == {"image"}
-    assert seen_model_types == [_ImageConfig.model_type] * 3
+    assert seen_model_types == [_ImageConfig.model_type] * 2
     assert (
         request_mapping.media_capabilities_for_model(
             SimpleNamespace(_hf_model_config=llm._hf_model_config, input_processor=object())
@@ -241,32 +228,32 @@ def test_media_capability_requires_the_loaded_multimodal_processor(image_llm):
     )
 
 
-def test_media_capability_accepts_a_registered_non_base_processor(monkeypatch):
-    config = _ImageConfig()
-    monkeypatch.setattr(
-        MULTIMODAL_PLACEHOLDER_REGISTRY,
-        "is_valid",
-        lambda model_type, modality: model_type == _ImageConfig.model_type and modality == "audio",
-    )
-    monkeypatch.setattr(
-        MULTIMODAL_PLACEHOLDER_REGISTRY,
-        "get_placeholder",
-        lambda model_type, modality: "",
-    )
-    llm = SimpleNamespace(
-        _hf_model_config=config,
-        input_processor=_AudioInputProcessor(config),
-    )
-
-    assert request_mapping.media_capabilities_for_model(llm).modalities == {"audio"}
-
-
 def test_media_capabilities_are_hashable():
     first = MediaCapabilities({"image": "<image_{}>"})
     second = MediaCapabilities({"image": "<image_{}>"})
 
     assert first == second
     assert hash(first) == hash(second)
+
+
+def test_media_capability_requires_the_runtime_decoder(image_video_llm, monkeypatch):
+    _set_video_runtime_available(monkeypatch, False)
+
+    assert request_mapping.media_capabilities_for_model(image_video_llm).modalities == {"image"}
+
+
+def test_video_runtime_availability_requires_importable_opencv(monkeypatch):
+    monkeypatch.setattr(request_mapping.importlib, "import_module", lambda _name: object())
+    assert request_mapping._video_runtime_available() is True
+
+
+@pytest.mark.parametrize("error", [ImportError(), OSError()])
+def test_video_runtime_unavailable_when_opencv_fails_to_load(monkeypatch, error):
+    def missing(_name):
+        raise error
+
+    monkeypatch.setattr(request_mapping.importlib, "import_module", missing)
+    assert request_mapping._video_runtime_available() is False
 
 
 def test_unknown_decoded_image_type_is_rejected():
@@ -284,12 +271,6 @@ def test_decoded_video_bytes_include_frames_and_audio():
     assert request_mapping._decoded_video_bytes(video) == 2 * 3 * 4 * 3 + 8 * 4
     with pytest.raises(TypeError, match="unsupported decoded video type"):
         request_mapping._decoded_video_bytes(object())
-
-
-def test_decoded_audio_bytes_count_samples_and_reject_unknown_types():
-    assert request_mapping._decoded_audio_bytes((np.zeros(8, dtype=np.float32), 16000)) == 8 * 4
-    with pytest.raises(TypeError, match="unsupported decoded audio type"):
-        request_mapping._decoded_audio_bytes(object())
 
 
 def test_media_capability_rejects_a_malformed_placeholder_at_startup(image_llm, monkeypatch):
@@ -428,9 +409,8 @@ async def test_image_sources_preserve_order_uuid_and_model_decode_defaults(image
 
 
 @pytest.mark.asyncio
-async def test_media_sources_preserve_global_order(image_video_audio_llm, monkeypatch):
+async def test_image_and_video_sources_preserve_global_order(image_video_llm, monkeypatch):
     created_with = []
-    audio_sources = []
 
     class _ImageIo:
         @classmethod
@@ -453,19 +433,8 @@ async def test_media_sources_preserve_global_order(image_video_audio_llm, monkey
                 metadata={"source": source},
             )
 
-    class _AudioIo:
-        @classmethod
-        def create(cls, defaults, runtime):
-            created_with.append(("audio", defaults, runtime))
-            return cls()
-
-        async def async_load(self, source):
-            audio_sources.append(source)
-            return np.zeros(8, dtype=np.float32), 16000
-
     monkeypatch.setattr(request_mapping, "ImageMediaIO", _ImageIo)
     monkeypatch.setattr(request_mapping, "VideoMediaIO", _VideoIo)
-    monkeypatch.setattr(request_mapping, "AudioMediaIO", _AudioIo)
     request = generation_pb2.GenerateRequest(
         prompt="mixed media",
         media=[
@@ -480,26 +449,18 @@ async def test_media_sources_preserve_global_order(image_video_audio_llm, monkey
                 mime_type="image/png",
             ),
             generation_pb2.MediaItem(
-                modality=generation_pb2.MODALITY_AUDIO,
-                url="https://example.com/audio.wav",
-                uuid="audio-id",
-            ),
-            generation_pb2.MediaItem(
                 modality=generation_pb2.MODALITY_VIDEO,
                 data_uri="data:video/mp4;base64,dmlkZW8=",
             ),
         ],
     )
 
-    mapped = await request_mapping._input_from_request(request, image_video_audio_llm)
+    mapped = await request_mapping._input_from_request(request, image_video_llm)
 
     assert created_with == [
         ("video", {"format": "np", "num_frames": 4}, None),
         ("image", {"format": "np"}, None),
-        ("audio", None, None),
     ]
-    assert audio_sources == ["https://example.com/audio.wav"]
-    assert mapped["multi_modal_data"]["audio"][0][1] == 16000
     assert [video.metadata["source"] for video in mapped["multi_modal_data"]["video"]] == [
         "https://example.com/first.mp4",
         "data:video/mp4;base64,dmlkZW8=",
@@ -508,12 +469,10 @@ async def test_media_sources_preserve_global_order(image_video_audio_llm, monkey
     assert mapped["multi_modal_uuids"] == {
         "video": ["video-id", None],
         "image": [None],
-        "audio": ["audio-id"],
     }
     assert mapped["mm_item_order"] == [
         {"modality": "video", "index": 0, "placeholder": "<video_1>"},
         {"modality": "image", "index": 0, "placeholder": "<image_1>"},
-        {"modality": "audio", "index": 0, "placeholder": "<audio_1>"},
         {"modality": "video", "index": 1, "placeholder": "<video_2>"},
     ]
 
@@ -613,9 +572,7 @@ async def test_image_count_is_bounded_before_decoding(image_llm, monkeypatch):
         prompt="too many images",
         media=[
             generation_pb2.MediaItem(
-                # Unsupported on purpose: the count guard must win before the
-                # per-item modality loop.
-                modality=generation_pb2.MODALITY_VIDEO,
+                modality=generation_pb2.MODALITY_IMAGE,
                 raw_bytes=b"image",
             )
             for _ in range(request_mapping._MAX_MEDIA_ITEMS + 1)
@@ -624,6 +581,23 @@ async def test_image_count_is_bounded_before_decoding(image_llm, monkeypatch):
 
     with pytest.raises(ValueError, match="at most 64 media items"):
         await request_mapping._input_from_request(request, llm)
+
+
+@pytest.mark.asyncio
+async def test_model_capability_is_checked_before_media_count_limit():
+    request = generation_pb2.GenerateRequest(
+        prompt="too many images",
+        media=[
+            generation_pb2.MediaItem(
+                modality=generation_pb2.MODALITY_IMAGE,
+                raw_bytes=b"image",
+            )
+            for _ in range(request_mapping._MAX_MEDIA_ITEMS + 1)
+        ],
+    )
+
+    with pytest.raises(UnsupportedFeatureError, match="media input is not supported"):
+        await request_mapping._input_from_request(request, SimpleNamespace())
 
 
 @pytest.mark.asyncio
@@ -884,20 +858,3 @@ async def test_raw_video_mime_type_is_validated(image_video_llm):
 
     with pytest.raises(ValueError, match="must start with video/"):
         await request_mapping._input_from_request(request, image_video_llm)
-
-
-@pytest.mark.asyncio
-async def test_raw_audio_mime_type_is_validated(image_video_audio_llm):
-    request = generation_pb2.GenerateRequest(
-        prompt="audio",
-        media=[
-            generation_pb2.MediaItem(
-                modality=generation_pb2.MODALITY_AUDIO,
-                raw_bytes=b"audio",
-                mime_type="video/mp4",
-            )
-        ],
-    )
-
-    with pytest.raises(ValueError, match="must start with audio/"):
-        await request_mapping._input_from_request(request, image_video_audio_llm)
