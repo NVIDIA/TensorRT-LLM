@@ -772,12 +772,13 @@ class TestLocalityDomainMoePlanner:
         "tensorrt_llm._torch.locality_domain_utils.is_locality_domain_enabled", return_value=True
     )
     def test_moe_reads_layer_quant_mode_over_quant_mode(self, mock_locality_domain):
-        """plan_moe must key off layer_quant_mode: with quant_mode claiming weight
-        quantization but layer_quant_mode reporting none, the BF16 path is selected,
-        so a regression back to reading quant_mode fails this test."""
-        planner = LocalityDomainExecutionPlanner(LocalityDomainPolicy(enabled=True))
+        """plan_moe must key off layer_quant_mode: with quant_mode claiming NVFP4
+        weight quantization but layer_quant_mode reporting none, the BF16 path is
+        selected, so reading quant_mode for either check fails this test."""
+        policy = LocalityDomainPolicy(enabled=True, allowed_ops=frozenset({"bf16_moe"}))
+        planner = LocalityDomainExecutionPlanner(policy)
         config = _FakeMoeQuantConfig(
-            nvfp4=False,
+            nvfp4=True,
             any_quant=True,
             layer_quant_mode=_FakeMoeQuantMode(nvfp4=False, any_quant=False),
         )
