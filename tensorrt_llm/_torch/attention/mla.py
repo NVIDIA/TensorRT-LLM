@@ -824,8 +824,15 @@ class MLA(nn.Module):
         v: torch.Tensor,
         position_ids: Optional[torch.Tensor],
         attn_metadata: AttentionMetadata,
+        helix_v_up: bool = False,
         **kwargs,
     ):
+        """Run generation attention; under Helix CP also exchange and combine partials.
+
+        With ``helix_v_up`` the V up-projection of every head is applied to this
+        rank's partial outputs before the all-to-all, so the result holds
+        ``num_heads_tp_cp * v_head_dim`` values per token instead of latents.
+        """
         if self.mapping.has_cp_helix():
             # partial_o: [num_tokens, num_heads_tp * kv_lora_rank]
             # softmax_stats: [num_tokens, num_heads_tp, 2]
@@ -867,12 +874,16 @@ class MLA(nn.Module):
                     seq_start=attn_metadata.num_contexts,
                     num_seqs=attn_metadata.num_generations,
                 )
+            value_dim = kv_lora_rank
+            if helix_v_up:
+                partial_o = self._helix_project_v_partials(partial_o)
+                value_dim = self.v_head_dim
             return _helix_post_process(
                 partial_o,
                 softmax_stats,
                 self.mapping,
                 self.num_heads_tp_cp,
-                kv_lora_rank,
+                value_dim,
                 self.aux_stream,
                 self.ln_events,
                 zero_kv_mask=zero_kv_mask,
@@ -1561,6 +1572,30 @@ class MLA(nn.Module):
             q, compressed_kv, k_pe, position_ids, attn_metadata, output, latent_cache
         )
 
+    def _helix_v_up_enabled(self) -> bool:
+        """Whether Helix generation projects V before the CP all-to-all."""
+        return (
+            self.mapping.has_cp_helix() and getattr(self, "helix_v_b_proj_full", None) is not None
+        )
+
+    def _helix_project_v_partials(self, partial_o: torch.Tensor) -> torch.Tensor:
+        """Apply every head's V up-projection to this CP rank's partial outputs.
+
+        The CP combine is a per-head weighted sum of the ranks' partial outputs,
+        so it commutes with the per-head linear V projection. Projecting first
+        shrinks each head's all-to-all payload from ``kv_lora_rank`` to
+        ``v_head_dim`` values. ``helix_v_b_proj_full`` is the BF16
+        ``[num_heads_tp, v_head_dim, kv_lora_rank]`` weight of all heads.
+        """
+        num_tokens = partial_o.shape[0]
+        partial_v = partial_o.new_empty((num_tokens, self.num_heads_tp, self.v_head_dim))
+        torch.ops.trtllm.bmm_out(
+            partial_o.view(num_tokens, self.num_heads_tp, self.kv_lora_rank).transpose(0, 1),
+            self.helix_v_b_proj_full.transpose(1, 2),
+            partial_v.transpose(0, 1),
+        )
+        return partial_v.view(num_tokens, self.num_heads_tp * self.v_head_dim)
+
     def _bmm_bf16_out(
         self, a, b_no_transpose, b_transposed, output, locality_domain_weight_shards=None
     ):
@@ -1761,6 +1796,7 @@ class MLA(nn.Module):
         else:
             raise RuntimeError("MLA absorption requires k_b_proj_trans")
 
+        helix_v_up = self._helix_v_up_enabled()
         attn_out_latent = self._attn_forward_gen(
             self.mqa,
             fused_q,
@@ -1768,6 +1804,7 @@ class MLA(nn.Module):
             None,
             position_ids,
             attn_metadata,
+            helix_v_up=helix_v_up,
             attention_input_type=AttentionInputType.generation_only,
             out_scale=self.out_scale,
             latent_cache=latent_cache,  # kvcache and k_pe
@@ -1781,6 +1818,12 @@ class MLA(nn.Module):
             **kwargs,
         )
         fused_q = None
+
+        if helix_v_up:
+            # The V up-projection already ran before the all-to-all.
+            assert attn_out_latent.shape == (q.shape[0], self.num_heads_tp_cp * self.v_head_dim)
+            output.view(attn_out_latent.shape).copy_(attn_out_latent)
+            return output
 
         # note: if we do not have CP, then num_heads_tp_cp == num_heads_tp
         assert (
