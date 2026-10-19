@@ -235,6 +235,11 @@ std::tuple<torch::Tensor, torch::Tensor> alltoall_helix_native(torch::Tensor par
     {
         auto const& mask = zero_kv_mask.value();
         CHECK_TH_CUDA(mask);
+        // CHECK_TH_CUDA only asserts "is a CUDA tensor". The kernel dereferences
+        // this pointer on partial_o's device, so a mask on a different device
+        // would be an invalid access rather than an error.
+        TORCH_CHECK(mask.device() == partial_o.device(), "zero_kv_mask must be on the same device as partial_o (got ",
+            mask.device(), " vs ", partial_o.device(), ")");
         CHECK_CONTIGUOUS(mask);
         CHECK_TYPE(mask, at::ScalarType::Bool);
         TORCH_CHECK(mask.numel() > 0 && entry_count % mask.numel() == 0, "zero_kv_mask numel (", mask.numel(),

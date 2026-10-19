@@ -27,6 +27,7 @@ from tensorrt_llm._torch.modules.layer_norm import LayerNorm
 from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
 from tensorrt_llm._torch.modules.mlp import MLP
 from tensorrt_llm._torch.utils import Fp4QuantizedTensor, gelu_tanh
+from tensorrt_llm._torch.visual_gen.attention.attention import Attention, QKVMode
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm._torch.visual_gen.models.modeling import BaseDiffusionModel
 from tensorrt_llm._torch.visual_gen.models.wan.utils_wan import (
@@ -36,7 +37,6 @@ from tensorrt_llm._torch.visual_gen.models.wan.utils_wan import (
     apply_fused_layernorm_affine_quant,
     get_nvfp4_input_scale,
 )
-from tensorrt_llm._torch.visual_gen.modules.attention import Attention, QKVMode
 from tensorrt_llm._torch.visual_gen.modules.rms_norm import RMSNormTPAware
 from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeightLoader
 from tensorrt_llm._torch.visual_gen.utils import SequenceSharder
@@ -351,6 +351,7 @@ class WanBlock(nn.Module):
             config=model_config,
             layer_idx=_layer_idx,
             async_ulysses=self._use_async_ulysses,
+            separate_qkv_is_self_attention=True,
             module_name=f"blocks.{_layer_idx}.attn1",
         )
 
@@ -406,7 +407,7 @@ class WanBlock(nn.Module):
             reduce_output=(tp_size != 1),
         )
 
-        # VSA gates (CUTEDSL backend, sparse_attention_config.algorithm == "vsa").
+        # VSA gates are shared by the backend-specific fine-stage implementations.
         # G_c weights the coarse branch; G_f weights the fine branch.
         self.to_gate_compress = None
         self.to_gate_fine = None
@@ -414,10 +415,15 @@ class WanBlock(nn.Module):
         _sa_cfg = getattr(_attn_cfg, "sparse_attention_config", None) if _attn_cfg else None
         _is_vsa = (
             _attn_cfg is not None
-            and getattr(_attn_cfg, "backend", "VANILLA") == "CUTEDSL"
             and _sa_cfg is not None
             and getattr(_sa_cfg, "algorithm", None) == "vsa"
         )
+        if _is_vsa and model_config.parallel.token_sharded_tp:
+            raise ValueError(
+                "Token-sharded TP does not support Video Sparse Attention yet: the VSA gates are "
+                "projected from the token-sharded block input. Unset parallel_config.tp_layout "
+                "or disable VSA."
+            )
         if _is_vsa:
             q_dim = num_heads * head_dim
             gate_tp_mode = TensorParallelMode.COLUMN if tp_size > 1 else None
@@ -432,6 +438,10 @@ class WanBlock(nn.Module):
                 force_dynamic_quantization=force_dynamic_quant,
                 tensor_parallel_mode=gate_tp_mode,
                 reduce_output=False,
+                override_tp_sharding=(
+                    self.attn1.local_q_dim_start,
+                    self.attn1.local_q_dim_end,
+                ),
             )
             self.to_gate_fine = Linear(
                 hidden_size,
@@ -444,6 +454,10 @@ class WanBlock(nn.Module):
                 force_dynamic_quantization=force_dynamic_quant,
                 tensor_parallel_mode=gate_tp_mode,
                 reduce_output=False,
+                override_tp_sharding=(
+                    self.attn1.local_q_dim_start,
+                    self.attn1.local_q_dim_end,
+                ),
             )
 
         # I2V: Additional K/V projections for image embeddings.
@@ -588,7 +602,12 @@ class WanBlock(nn.Module):
         # so each V/Q/K GEMM + norm + RoPE overlaps with the peer push on the
         # side stream; both paths return 3D [B, S, H*D].
         if self._use_async_ulysses:
-            attn1_out = self.attn1.forward_async(normed, freqs=freqs, timestep=timestep)
+            attn1_out = self.attn1.forward_async(
+                normed,
+                freqs=freqs,
+                timestep=timestep,
+                **attn1_kwargs,
+            )
         else:
             attn1_out = self.attn1(normed, freqs=freqs, timestep=timestep, **attn1_kwargs)
 
@@ -699,6 +718,7 @@ class WanBlock(nn.Module):
 
 class WanTransformer3DModel(BaseDiffusionModel):
     _supports_gradient_checkpointing = True
+    _supports_token_sharded_tp = True
 
     def __init__(
         self,
@@ -819,6 +839,7 @@ class WanTransformer3DModel(BaseDiffusionModel):
         )
 
         self.__post_init__()
+        self._apply_tp_layout()
 
     @property
     def device(self):
@@ -894,6 +915,8 @@ class WanTransformer3DModel(BaseDiffusionModel):
         rope = self.sharder.shard_rope((freqs_cos, freqs_sin), seq_len=seq_len, seq_dim=1)
         if rope is not None:
             freqs_cos, freqs_sin = rope
+        # Token-sharded TP: x holds this rank's [n, g, D] sample groups; RoPE stays whole.
+        token_sharded = self.sharder.token_sharded_tp
 
         # Time and text/image embeddings. WAN timestep embeddings use the
         # scheduler's 1000-step scale internally.
@@ -922,10 +945,12 @@ class WanTransformer3DModel(BaseDiffusionModel):
         else:
             # batch_size, 6, hidden_size
             temb_proj = temb_proj.unflatten(1, (6, self.config.hidden_size))
-            if self.config.expand_timesteps:
+            if self.config.expand_timesteps and not token_sharded:
                 # x is already sequence-sharded; uniform T2V timesteps only need
                 # a local broadcast view for fused AdaLN.
                 temb_proj = temb_proj.unsqueeze(1).expand(-1, x.shape[1], -1, -1)
+            # Token-sharded TP: the entries of this rank's sample groups (no-op otherwise).
+            temb_proj = self.sharder.shard_per_sample(temb_proj)
 
         # I2V: Concatenate image and text embeddings if image embeddings are provided
         if encoder_hidden_states_image is not None:
@@ -941,7 +966,8 @@ class WanTransformer3DModel(BaseDiffusionModel):
                 [encoder_hidden_states_image, encoder_hidden_states], dim=1
             )
 
-        x = self._pertoken_adaln_runtime.prepare(x, temb_proj)
+        if not token_sharded:  # per-token AdaLN kernels stay off on token shards
+            x = self._pertoken_adaln_runtime.prepare(x, temb_proj)
 
         # Transformer blocks (attention handles distributed communication internally)
         for block in self.blocks:

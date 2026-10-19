@@ -257,5 +257,6 @@ def prepare_sparse_runtime_params(
         runtime_params = sparse_params.scheduler.get_runtime_params(
             runtime_params=runtime_params,
             timestep=forward_args.timestep,
+            graph_phase=forward_args.sparse_attn_phase,
         )
     return runtime_params

@@ -344,11 +344,6 @@ class SamplingParams:
         default_factory=tuple, init=False, repr=False
     )
 
-    # Used in logprobs calculation in TRT flow to drop logits early if user did not explicitly request them.
-    # Can be deprecated after migration to PyTorch backend.
-    _context_logits_auto_enabled: bool = False
-    _generation_logits_auto_enabled: bool = False
-
     # TODO: deprecate this after trtllm-serve migrate to use TopK logprobs
     _return_log_probs: bool = False
 
@@ -507,7 +502,7 @@ class SamplingParams:
         self._validate()
 
     # NB: The predicates below are static because downstream code (e.g.
-    #     sampler_strategy.resolve_sampling_strategy) only holds instances of
+    #     sampling_resolution.resolve_row_params) only holds instances of
     #     bindings.SamplingConfig (not SamplingParams). They are the single
     #     source of truth for the greedy / top-p-decay resolution shared by
     #     _greedy_decoding and the torch sampler.
@@ -580,14 +575,6 @@ class SamplingParams:
             min_p=self.min_p,
             top_p_decay=self.top_p_decay,
         )
-
-    @property
-    def _need_return_context_logits(self) -> bool:
-        return self.return_context_logits and not self._context_logits_auto_enabled
-
-    @property
-    def _need_return_generation_logits(self) -> bool:
-        return self.return_generation_logits and not self._generation_logits_auto_enabled
 
     def _setup(
         self, tokenizer, hf_model_config, generation_config, add_special_tokens: bool = False

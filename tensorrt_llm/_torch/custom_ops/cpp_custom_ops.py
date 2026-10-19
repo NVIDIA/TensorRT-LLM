@@ -317,6 +317,26 @@ def _register_fake():
             shape, dtype=out_dtype if out_dtype is not None else mat_a.dtype)
         return ret
 
+    @torch.library.register_fake("trtllm::dsv3_router_latent_gemm_op")
+    def _(input: torch.Tensor, gate_weight: torch.Tensor,
+          down_weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        for tensor in (input, gate_weight, down_weight):
+            torch._check(tensor.is_cuda and tensor.device == input.device)
+            torch._check(tensor.dim() == 2 and tensor.dtype == torch.bfloat16)
+            torch._check(tensor.is_contiguous())
+            torch._check(tensor.stride(0) == 7168)
+            torch._check(tensor.stride(1) == 1)
+            torch._check(tensor.storage_offset() % 8 == 0)
+        torch._check(input.shape[0] >= 1)
+        torch._check(input.shape[0] <= 16)
+        torch._check(input.shape[1] == 7168)
+        torch._check(gate_weight.shape[0] == 896)
+        torch._check(gate_weight.shape[1] == 7168)
+        torch._check(down_weight.shape[0] == 3584)
+        torch._check(down_weight.shape[1] == 7168)
+        return (input.new_empty((input.shape[0], 896), dtype=torch.float32),
+                input.new_empty((input.shape[0], 3584), dtype=torch.bfloat16))
+
     @torch.library.register_fake("trtllm::dsv3_fused_a_gemm_op")
     def _(mat_a, mat_b, bias, out_dtype):
         shape = list(mat_a.shape)
@@ -377,7 +397,8 @@ def _register_fake():
           index_topk,
           compress_ratio=1,
           radix_aux_indices=None,
-          radix_aux_logits=None):
+          radix_aux_logits=None,
+          row_kv_lens=None):
         # In-place operation, no return value (void function)
         pass
 
@@ -432,6 +453,69 @@ def _register_fake():
         return qk.new_empty((qk.shape[0], num_heads_q, head_dim),
                             dtype=torch.float8_e4m3fn)
 
+    @torch.library.register_fake("trtllm::fused_qk_norm_rope_to_fp8")
+    def _(qkv: torch.Tensor, num_heads_q: int, num_heads_k: int,
+          num_heads_v: int, head_dim: int, rotary_dim: int, eps: float,
+          q_weight: torch.Tensor, k_weight: torch.Tensor, base: float,
+          is_neox: bool, position_ids: torch.Tensor, factor: float, low: float,
+          high: float, attention_factor: float, is_qk_norm: bool,
+          use_gemma: bool, use_mrope: bool, mrope_section1: int,
+          mrope_section2: int) -> torch.Tensor:
+        """Infer FP8 QKV output geometry while preserving symbolic token counts."""
+        del rotary_dim, eps, q_weight, k_weight, base, is_neox, position_ids
+        del factor, low, high, attention_factor, is_qk_norm, use_gemma
+        del use_mrope, mrope_section1, mrope_section2
+        total_heads = num_heads_q + num_heads_k + num_heads_v
+        return qkv.new_empty((qkv.shape[0], total_heads * head_dim),
+                             dtype=torch.float8_e4m3fn)
+
+    @torch.library.register_fake(
+        "trtllm::minimax_m3_fp8_qk_norm_rope_kv_insert")
+    def _(qkv: torch.Tensor, kv_cache: torch.Tensor,
+          out_cache_loc: torch.Tensor, num_heads_q: int, num_heads_k: int,
+          num_heads_v: int, head_dim: int, rotary_dim: int, eps: float,
+          q_weight: torch.Tensor, k_weight: torch.Tensor, base: float,
+          is_neox: bool, position_ids: torch.Tensor) -> torch.Tensor:
+        """Infer FP8 query geometry without performing the KV-cache write."""
+        del kv_cache, out_cache_loc, num_heads_k, num_heads_v, rotary_dim, eps
+        del q_weight, k_weight, base, is_neox, position_ids
+        return qkv.new_empty((qkv.shape[0], num_heads_q, head_dim),
+                             dtype=torch.float8_e4m3fn)
+
+    @torch.library.register_fake(
+        "trtllm::minimax_m3_fp8_qkv_indexer_norm_rope_kv_insert")
+    def _(packed: torch.Tensor, kv_cache: torch.Tensor,
+          index_k_cache: torch.Tensor, out_cache_loc: torch.Tensor,
+          num_heads_q: int, num_heads_kv: int, num_heads_index: int,
+          head_dim: int, rotary_dim: int, eps: float, q_weight: torch.Tensor,
+          k_weight: torch.Tensor, index_q_weight: torch.Tensor,
+          index_k_weight: torch.Tensor, rotary_cos_sin: torch.Tensor,
+          position_ids: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Infer main and index query shapes without mutating either cache."""
+        del kv_cache, index_k_cache, out_cache_loc, num_heads_kv, rotary_dim
+        del eps, q_weight, k_weight, index_q_weight, index_k_weight
+        del rotary_cos_sin, position_ids
+        num_tokens = packed.shape[0]
+        return (packed.new_empty((num_tokens, num_heads_q, head_dim),
+                                 dtype=torch.float8_e4m3fn),
+                packed.new_empty((num_tokens, num_heads_index, head_dim),
+                                 dtype=torch.float8_e4m3fn))
+
+    @torch.library.register_fake(
+        "trtllm::minimax_m3_nvfp4_qkv_indexer_norm_rope_kv_insert")
+    def _(packed, kv_data_cache, kv_scale_cache, index_k_cache, out_cache_loc,
+          kv_quant_scale, num_heads_q, num_heads_kv, num_heads_index, head_dim,
+          rotary_dim, eps, q_weight, k_weight, index_q_weight, index_k_weight,
+          rotary_cos_sin, position_ids):
+        del kv_data_cache, kv_scale_cache, index_k_cache, out_cache_loc
+        del kv_quant_scale, num_heads_kv, rotary_dim, eps, q_weight, k_weight
+        del index_q_weight, index_k_weight, rotary_cos_sin, position_ids
+        num_tokens = packed.shape[0]
+        return (packed.new_empty((num_tokens, num_heads_q, head_dim),
+                                 dtype=torch.float8_e4m3fn),
+                packed.new_empty((num_tokens, num_heads_index, head_dim),
+                                 dtype=torch.float8_e4m3fn))
+
     @torch.library.register_fake("trtllm::userbuffers_allreduce_finalize")
     def _(input, force_applying_finalize):
         return torch.empty_like(input)
@@ -453,6 +537,8 @@ def _register_fake():
         topk: int,
         route_scale: float,
         is_hash: bool,
+        image_mask: Optional[torch.Tensor] = None,
+        vision_bias: Optional[torch.Tensor] = None,
     ) -> None:
         # In-place operation, no return value.
         pass
@@ -699,13 +785,11 @@ def _register_fake():
     @torch.library.register_fake("trtllm::moe_a2a_initialize")
     def _(
         workspace: torch.Tensor,
+        metainfo: torch.Tensor,
         ep_rank: int,
         ep_size: int,
-        max_num_tokens_per_rank: int,
-        eplb_stats_num_experts: Optional[int] = None,
-        can_use_cft_counted_writes: bool = False,
-    ) -> torch.Tensor:
-        return torch.empty((10, ), dtype=torch.int64, device="cpu")
+    ) -> None:
+        return None
 
     @torch.library.register_fake("trtllm::moe_a2a_sanitize_expert_ids")
     def _(
@@ -720,10 +804,10 @@ def _register_fake():
     @torch.library.register_fake("trtllm::moe_a2a_get_combine_payload_tensor")
     def _(
         workspace: torch.Tensor,
+        metainfo: torch.Tensor,
         ep_rank: int,
         ep_size: int,
         runtime_max_tokens_per_rank: int,
-        combine_payload_offset: int,
         out_dtype: torch.dtype,
         hidden_size: int,
     ) -> torch.Tensor:
@@ -879,6 +963,20 @@ def _register_fake():
         min_ps: torch.Tensor,
     ) -> torch.Tensor:
         return logits.new_empty(logits.shape, dtype=torch.float32)
+
+    @torch.library.register_fake("trtllm::chain_speculative_sampling")
+    def _(
+        draft_probs: torch.Tensor,
+        draft_token_ids: torch.Tensor,
+        target_probs: torch.Tensor,
+        seed: torch.Tensor,
+        offset: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        batch_size, num_draft = draft_token_ids.shape
+        return (
+            draft_token_ids.new_empty((batch_size, num_draft + 1)),
+            draft_token_ids.new_empty((batch_size, )),
+        )
 
     @torch.library.register_fake(
         "trtllm::mtp_sampling_and_accepted_draft_tokens_op")

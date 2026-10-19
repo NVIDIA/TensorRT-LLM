@@ -413,7 +413,7 @@ class Runner:
     ) -> None:
         super().__init__()
 
-        checkpoint_loader = _construct_checkpoint_loader("pytorch", None, "HF")
+        checkpoint_loader = _construct_checkpoint_loader(None, "HF")
         # Please refer to `tensorrt_llm/_torch/pyexecutor/model_loader.py` for effective args
         llm_args = TorchLlmArgs(
             model=pretrained_model_name_or_path,
@@ -902,8 +902,7 @@ class Runner:
 
         # Please refer to `tensorrt_llm/_torch/pyexecutor/_util.py` for `kv_cache_manager`
         config = model_config.pretrained_config
-        # max_seq_len + 1 because the is_gen path in add_dummy_requests resizes each
-        # request to capacity + 1; without the extra token the last block rounds down.
+        # Reserve one token of headroom before rounding to a block boundary.
         # kv_pool_headroom oversizes max_tokens when the manager splits it across
         # several pools. DeepSeek-V4 needs 3; the default 1 keeps every other model
         # on its previous allocation.
@@ -973,11 +972,12 @@ class Runner:
                 # Multi-token verify reads per-slot replay caches when the fused
                 # kernel is available, else the legacy per-step buffers.
                 from tensorrt_llm._torch.modules.kimi_kda._kda_kernels import (
-                    is_kda_mtp_verify_available,
+                    kda_mtp_replay_num_spec,
                 )
 
-                if is_kda_mtp_verify_available():
-                    kimi_extra_kwargs["kda_replay_num_spec"] = spec_config.tokens_per_gen_step - 1
+                kda_replay_num_spec = kda_mtp_replay_num_spec(spec_config.tokens_per_gen_step - 1)
+                if kda_replay_num_spec is not None:
+                    kimi_extra_kwargs["kda_replay_num_spec"] = kda_replay_num_spec
             kv_cache_manager = kv_cache_manager_cls(
                 # mamba (KDA) cache parameters
                 mamba_params.state_size,

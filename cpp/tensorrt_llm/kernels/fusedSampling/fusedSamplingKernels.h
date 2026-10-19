@@ -16,13 +16,21 @@
  */
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
+
 #include <cstdint>
 #include <cuda_runtime.h>
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
+
+//! Philox subsequences from here up hold per-row streams: a row with its own seed/offset draws
+//! from subsequence kPerRowSubsequenceBase | offset. A shared seed/offset makes the row index
+//! the subsequence, which never reaches them. The speculative acceptance kernels follow the
+//! same convention.
+constexpr uint64_t kPerRowSubsequenceBase = 1ULL << 63;
 
 //! \brief Inputs and outputs of the fused sampler.
 //!
@@ -58,7 +66,12 @@ struct FusedSamplingParams
     //! call is legal inside a captured CUDA graph.
     uint64_t const* seed{nullptr};
     uint64_t const* offset{nullptr};
-    //! Whether seed/offset carry one entry per row rather than a single shared entry.
+    //! Whether seed/offset carry one entry per row (a single-row call included) rather
+    //! than one entry shared by several rows. A shared entry makes the row index the
+    //! Philox subsequence, so rows still draw independent streams. A per-row offset
+    //! instead names the row's own subsequence: its draws then depend only on its own
+    //! seed/offset, not on its position in the batch, and rows need only distinct
+    //! offsets, however many values each one draws.
     bool perRowRng{false};
 
     //! Output [numRows], optional. Sampled token ids.
@@ -77,4 +90,5 @@ template <typename T>
 void invokeFusedSampling(FusedSamplingParams const& params, cudaStream_t stream);
 
 } // namespace kernels
-} // namespace tensorrt_llm
+
+TRTLLM_NAMESPACE_END

@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import dataclasses
 import datetime
 import enum
@@ -19,6 +22,7 @@ CONTROL_REQUEST_ID = -2
 # profile window applies on every PyExecutor, not just the leader.
 PROFILE_START_REQUEST_ID = -3
 PROFILE_STOP_REQUEST_ID = -4
+PREFIX_LOAD_COMPLETION_REQUEST_ID = -5
 
 
 class RequestAdmissionState(enum.Enum):
@@ -49,6 +53,7 @@ class RequestQueueItem:
     # ``num_steps``, ``start_step``, and ``activities`` that every rank
     # applies when the broadcast reaches them.
     profile_config: Optional[dict] = None
+    finished_prefix_load_ids: Optional[list[int]] = None
 
     @property
     def is_shutdown_request(self):
@@ -58,7 +63,12 @@ class RequestQueueItem:
     def is_normal_request(self):
         return not (self.is_shutdown_request or self.is_canceled_request
                     or self.is_control_request or self.is_profile_start_request
-                    or self.is_profile_stop_request)
+                    or self.is_profile_stop_request
+                    or self.is_prefix_load_completion_request)
+
+    @property
+    def is_prefix_load_completion_request(self):
+        return self.id == PREFIX_LOAD_COMPLETION_REQUEST_ID
 
     @property
     def is_control_request(self):
@@ -177,6 +187,11 @@ class ExecutorRequestQueue:
         """Permanently close admission after sleep/wakeup may have mutated state."""
         with self.enqueue_lock:
             self.admission_state = RequestAdmissionState.FAILED
+
+    def get_memory_status(self) -> tuple[RequestAdmissionState, frozenset[str]]:
+        """Return an atomic snapshot of admission state and parked tags."""
+        with self.enqueue_lock:
+            return self.admission_state, self._parked_tags
 
     def get_admission_state(self) -> RequestAdmissionState:
         with self.enqueue_lock:

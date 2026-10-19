@@ -275,6 +275,8 @@ __device__ __forceinline__ Sum2 block_reduce_sum2_for(float x, float y, float* s
         block_y = lane < kReduceWarps ? scratch[kReduceWarps + lane] : 0.0f;
         block_x = warp_reduce_sum(block_x);
         block_y = warp_reduce_sum(block_y);
+        // Lane 0 overwrites partials that other lanes of this warp read above.
+        __syncwarp();
         if (lane == 0)
         {
             scratch[0] = block_x;
@@ -349,6 +351,8 @@ __device__ __forceinline__ Sum2 block_reduce_sum2_active_for(float x, float y, f
         block_y = lane < kReduceWarps ? scratch[kReduceWarps + lane] : 0.0f;
         block_x = warp_reduce_sum(block_x);
         block_y = warp_reduce_sum(block_y);
+        // Lane 0 overwrites partials that other lanes of this warp read above.
+        __syncwarp();
         if (lane == 0)
         {
             scratch[0] = block_x;
@@ -1560,6 +1564,7 @@ void dispatch_kda_decode_heads(KdaDecodeLaunchParams const& p)
     case 24: dispatch_kda_decode_layout<kCompact, 24>(p); break;
     case 32: dispatch_kda_decode_layout<kCompact, 32>(p); break;
     case 48: dispatch_kda_decode_layout<kCompact, 48>(p); break;
+    case 64: dispatch_kda_decode_layout<kCompact, 64>(p); break;
     case 96: dispatch_kda_decode_layout<kCompact, 96>(p); break;
     default:
         if constexpr (kCompact)

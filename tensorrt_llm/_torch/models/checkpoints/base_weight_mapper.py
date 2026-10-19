@@ -84,6 +84,11 @@ class BaseWeightMapper(ABC):
         self._model = None
         self._config = None
 
+    @staticmethod
+    def map_mtp_module_name(name: str, num_hidden_layers: int) -> str:
+        """Map a checkpoint module name or exclusion glob to the MTP module tree."""
+        return name
+
     def build_weight_load_plan(self,
                                catalog: CheckpointCatalog) -> WeightLoadPlan:
         """Build a conservative shadow plan for this rank.

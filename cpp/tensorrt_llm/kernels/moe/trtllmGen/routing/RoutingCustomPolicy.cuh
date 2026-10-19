@@ -405,6 +405,23 @@ static constexpr int CoopBlockKernelSingleTokenMinNumExperts = 512;
 // Cooperative block kernel: one thread per expert, so at most 1024 experts (1 CUDA block).
 static constexpr int CoopBlockKernelMaxNumExperts = 1024;
 
+// Small-token kernel (routingIndicesSmallTokenKernel): one warp per token for the TopK and one thread per
+// expert for the histogram / offsets / permutation. The token capacity is structural: each expert's
+// (token -> position in the top-K) map is one 64-bit shared-memory row, one byte per token, so at most 8
+// tokens; the per-tier bound is the smaller of 8 and the tier's warp count (4 at 128 experts, 5 at 160,
+// 8 from 256 up).
+static constexpr int SmallTokenKernelMaxNumTokens = 8;
+// Host dispatch bound (see prefersSmallTokenKernel()) and the largest tier the kernel is compiled for:
+// tiers above it keep the cooperative / classic selection, because the one-warp-per-token TopK spills
+// at the wide 576+ tiers.
+static constexpr int SmallTokenKernelDispatchMaxNumExperts = 512;
+
+__host__ __device__ constexpr int32_t getSmallTokenKernelMaxNumTokens(int32_t maxNumExperts)
+{
+    int32_t const numWarps = maxNumExperts / WarpSize;
+    return numWarps < SmallTokenKernelMaxNumTokens ? numWarps : SmallTokenKernelMaxNumTokens;
+}
+
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 int32_t constexpr getMaxNumExperts(int32_t numExperts)
@@ -570,6 +587,8 @@ struct PolicyTraits<NoOpPreprocess, SoftmaxPostprocess>
             Tier<512, 16>,       // Various 512-expert models with high topK
             Tier<512, 22>,       // Nemotron Super V3 (512 experts, topK=22)
             Tier<576, 8>,        // Customized model with 576 experts
+            Tier<1024, 32>,      // Kimi K3 post-topK permutation (896 experts, topK 16): without this tier the
+                                 // >128-token cluster launch and the dyn-block dispatch fell to <2048,32>
             Tier<2048, 32>       // Large-expert fallback
             >;
 };
