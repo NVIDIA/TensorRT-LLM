@@ -10,6 +10,8 @@ import torch
 from test_modeling_qwen3vl import TestQwen3VLScenario as _TestQwen3VLScenario
 from utils.llm_data import llm_models_root
 
+from tensorrt_llm._torch.attention.backends.interface import RopeParams
+from tensorrt_llm._torch.attention.rotary_embedding import MRotaryEmbedding
 from tensorrt_llm._torch.configs import Cosmos3EdgeConfig
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.checkpoints.hf.cosmos3_edge_weight_mapper import (
@@ -17,6 +19,8 @@ from tensorrt_llm._torch.models.checkpoints.hf.cosmos3_edge_weight_mapper import
 )
 from tensorrt_llm._torch.models.checkpoints.hf.weight_loader import HfWeightLoader
 from tensorrt_llm._torch.models.modeling_cosmos3_edge import (
+    Cosmos3EdgeAttention,
+    Cosmos3EdgeImageProcessor,
     Cosmos3EdgeInputProcessor,
     Cosmos3EdgeModel,
     _edge_positional_embedding_params,
@@ -24,7 +28,9 @@ from tensorrt_llm._torch.models.modeling_cosmos3_edge import (
     resize_positional_embeddings_packed,
 )
 from tensorrt_llm._torch.models.modeling_qwen3vl import Qwen3VLVisionPatchMerger
-from tensorrt_llm.functional import RotaryScalingType
+from tensorrt_llm.functional import PositionEmbeddingType, RotaryScalingType
+from tensorrt_llm.inputs.multimodal import MultimodalInput, MultimodalParams, MultimodalRuntimeData
+from tensorrt_llm.llmapi.llm_args import MultimodalConfig
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 
@@ -187,8 +193,120 @@ def test_edge_rope_scale_follows_rope_type():
         }
     )
     params = _edge_positional_embedding_params(config)
+    assert params.type == PositionEmbeddingType.mrope
+    assert params.mrope_interleaved is True
     assert params.rope.scale_type == RotaryScalingType.yarn
     assert params.rope.scale == 2.0
+
+
+def _resize_size(size):
+    height = getattr(size, "height", None)
+    width = getattr(size, "width", None)
+    if height is None:
+        height = size["height"]
+        width = size["width"]
+    return int(height), int(width)
+
+
+@pytest.mark.cpu_only
+def test_edge_resize_keeps_a_factor_on_each_side():
+    processor = object.__new__(Cosmos3EdgeImageProcessor)
+    processor.merge_size = 2
+    processor.patch_size = 16
+    processor.size = {"shortest_edge": 1024, "longest_edge": 65536}
+    captured = {}
+
+    def capture_resize(image, size, resample):
+        del image, resample
+        captured["size"] = size
+        return torch.empty(1)
+
+    processor.resize = capture_resize
+    processor._resize_image(
+        torch.empty(3, 40, 8000),
+        max_ratio=200,
+        resample=None,
+        min_pixels=1024,
+        max_pixels=65536,
+    )
+    height, width = _resize_size(captured["size"])
+    assert height >= 32
+    assert width >= 32
+    assert height % 32 == 0
+    assert width % 32 == 0
+
+
+def _enable_encoder_cache(model, max_bytes: int):
+    model.model_config._frozen = False
+    model.model_config.multimodal_config = MultimodalConfig(encoder_cache_max_bytes=max_bytes)
+    assert model.encoder_cache_active
+    if hasattr(model, "_initialize_multimodal_encoder_cache"):
+        cache = model._initialize_multimodal_encoder_cache(max_bytes)
+    else:
+        cache = model._get_multimodal_encoder_cache()
+    assert cache is not None
+    return cache
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_edge_to_device_keeps_grids_on_cpu():
+    paths = Cosmos3EdgeModel.multimodal_data_device_paths.fget(None)
+    params = MultimodalParams(
+        multimodal_data={
+            "image": {
+                "pixel_values": torch.randn(4, 8),
+                "image_grid_thw": torch.tensor([[1, 2, 2]]),
+            },
+            "video": {
+                "pixel_values_videos": torch.randn(4, 8),
+                "video_grid_thw": torch.tensor([[1, 2, 2]]),
+            },
+            "mrope_config": {
+                "mrope_position_ids": torch.zeros(3, 1, 4),
+                "mrope_position_deltas": torch.zeros(1, 1),
+            },
+        }
+    )
+    params.to_device("multimodal_data", device="cuda", pin_memory=True, target_keywords=paths)
+    data = params.multimodal_data
+    assert data["image"]["pixel_values"].device.type == "cuda"
+    assert data["video"]["pixel_values_videos"].device.type == "cuda"
+    assert data["mrope_config"]["mrope_position_ids"].device.type == "cuda"
+    assert data["mrope_config"]["mrope_position_deltas"].device.type == "cuda"
+    assert data["image"]["image_grid_thw"].device.type == "cpu"
+    assert data["video"]["video_grid_thw"].device.type == "cpu"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_edge_yarn_fused_cache_matches_decoder():
+    from tensorrt_llm._torch.configs.cosmos3_edge import Cosmos3EdgeTextConfig
+
+    text = Cosmos3EdgeTextConfig(
+        rope_parameters={
+            "rope_type": "yarn",
+            "rope_theta": 1e8,
+            "factor": 2.0,
+            "original_max_position_embeddings": 32768,
+        }
+    )
+    text.disable_fuse_rope = True
+    attention = Cosmos3EdgeAttention(ModelConfig(pretrained_config=text), layer_idx=0)
+    holder = SimpleNamespace()
+    Cosmos3EdgeModel.init_mrope_embedding(
+        holder,
+        SimpleNamespace(pretrained_config=SimpleNamespace(text_config=text)),
+    )
+    assert attention.rotary_emb is not None
+    decoder_table = attention.rotary_emb.rotary_cos_sin.cuda()
+    fused_table = holder.rotary_emb.rotary_cos_sin.cuda()
+    torch.testing.assert_close(decoder_table, fused_table)
+    uncorrected = MRotaryEmbedding(
+        RopeParams.from_config(text),
+        head_dim=attention.head_dim,
+        mrope_section=attention.pos_embd_params.mrope_section,
+        mrope_interleaved=attention.pos_embd_params.mrope_interleaved,
+    )
+    assert not torch.allclose(uncorrected.rotary_cos_sin.cuda().float(), fused_table.float())
 
 
 @pytest.mark.cpu_only
@@ -239,6 +357,85 @@ class TestCosmos3Edge(_qwen3vl.TestQwen3VL):
         self.assertTrue(
             torch.isfinite(outputs).all().item(),
             "forward outputs contain non-finite values",
+        )
+
+    def test_encoder_output_reaches_prefill_through_cache(self):
+        model = self.trtllm_model
+        _enable_encoder_cache(model, 1 << 20)
+        vision = model.mm_encoder.visual.config
+        merge = int(vision.spatial_merge_size)
+        height = width = merge * 2
+        patch_dim = int(vision.num_channels) * int(vision.patch_size) ** 2
+        rows = (height // merge) * (width // merge)
+        pixels = torch.randn(height * width, patch_dim, device="cuda")
+        grid = torch.tensor([[1, height, width]], dtype=torch.int64)
+        model.mm_encoder.setup_attn_metadata(max_num_tokens=max(64, height * width))
+
+        calls = {"n": 0}
+        visual_forward = model.mm_encoder.visual.forward
+
+        def counted_forward(*args, **kwargs):
+            calls["n"] += 1
+            return visual_forward(*args, **kwargs)
+
+        model.mm_encoder.visual.forward = counted_forward
+        try:
+
+            def image_param():
+                return MultimodalParams(
+                    multimodal_input=MultimodalInput(
+                        multimodal_hashes=[[1, 2, 3, 4, 5, 6, 7, 8]],
+                        multimodal_positions=[1],
+                        multimodal_lengths=[rows],
+                    ),
+                    multimodal_data={
+                        "image": {"pixel_values": pixels, "image_grid_thw": grid},
+                        "multimodal_embedding_lengths": [rows],
+                        "mm_processor_kwargs_hash": "edge-review",
+                    },
+                    multimodal_runtime=MultimodalRuntimeData(
+                        embed_mask_cumsum=torch.arange(1, rows + 1, dtype=torch.int64),
+                        past_seen_token_num=0,
+                        chunk_end_pos=rows,
+                    ),
+                )
+
+            first = model._get_or_encode_multimodal_embeddings([image_param()])
+            self.assertEqual(tuple(first.shape), (rows, model.embedding_dim))
+            self.assertEqual(calls["n"], 1)
+            second = model._get_or_encode_multimodal_embeddings([image_param()])
+            self.assertEqual(calls["n"], 1)
+            torch.testing.assert_close(second, first)
+        finally:
+            model.mm_encoder.visual.forward = visual_forward
+
+        image_token_id = self.hf_config.image_token_id
+        vision_start = self.hf_config.vision_start_token_id
+        vision_end = self.hf_config.vision_end_token_id
+        processor = object.__new__(Cosmos3EdgeInputProcessor)
+        processor._config = self.hf_config
+        processor._tokenizer = _FakeTokenizer([11, vision_start, image_token_id, vision_end, 12])
+        handoff = processor.build_disagg_prefill_multimodal_inputs(
+            {"prompt": "image"},
+            [{"tensor_size": tuple(first.shape)}],
+        )
+        self.assertEqual(handoff.multimodal_embedding_lengths, [rows])
+        input_ids = torch.tensor(handoff.prompt_token_ids, dtype=torch.long, device="cuda")
+        image_positions = torch.nonzero(input_ids == image_token_id, as_tuple=False).flatten()
+        text_positions = torch.nonzero(input_ids != image_token_id, as_tuple=False).flatten()
+        self.assertEqual(image_positions.numel(), rows)
+        prepared = model.prepare_multimodal_inputs(
+            input_ids=input_ids,
+            positions=None,
+            multimodal_params=[MultimodalParams(multimodal_data={"multimodal_embedding": first})],
+            num_context_requests=1,
+            text_token_indices=text_positions,
+            mm_token_indices=image_positions,
+        )
+        self.assertIsNotNone(prepared.inputs_embeds)
+        torch.testing.assert_close(
+            prepared.inputs_embeds[image_positions],
+            first.to(dtype=prepared.inputs_embeds.dtype),
         )
 
     def run_trtllm_forward(self, trtllm_inputs, use_cuda_graph: bool = False):

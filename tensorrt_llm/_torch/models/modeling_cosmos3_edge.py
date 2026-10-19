@@ -707,8 +707,8 @@ class Cosmos3EdgeImageProcessor(Siglip2ImageProcessor):
     ) -> torch.Tensor:
         """Resize so both sides are divisible by ``merge_size * patch_size``.
 
-        The pixel count stays inside ``[min_pixels, max_pixels]`` and the aspect
-        ratio is preserved as closely as possible.
+        Each side stays at least one factor. A long image can otherwise floor
+        its short side to zero while still passing the aspect-ratio check.
         """
         image_min_pixels = kwargs.get("min_pixels") or self.size.get("shortest_edge", None)
         image_max_pixels = kwargs.get("max_pixels") or self.size.get("longest_edge", None)
@@ -728,8 +728,8 @@ class Cosmos3EdgeImageProcessor(Siglip2ImageProcessor):
         w_bar = max(factor, round_by_factor(width, factor))
         if h_bar * w_bar > image_max_pixels:
             beta = math.sqrt((height * width) / image_max_pixels)
-            h_bar = floor_by_factor(height / beta, factor)
-            w_bar = floor_by_factor(width / beta, factor)
+            h_bar = max(factor, floor_by_factor(height / beta, factor))
+            w_bar = max(factor, floor_by_factor(width / beta, factor))
         elif h_bar * w_bar < image_min_pixels:
             beta = math.sqrt(image_min_pixels / (height * width))
             h_bar = ceil_by_factor(height * beta, factor)
