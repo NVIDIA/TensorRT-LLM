@@ -2506,6 +2506,7 @@ class _StubADPExecutor:
         )
         kv_cache_manager.num_extra_kv_tokens = 0
         kv_cache_manager.tokens_per_block = 128
+        kv_cache_manager.kda_context_only = False
 
         def _add_dummy(**kwargs):
             self.add_dummy_calls.append(kwargs)
@@ -3408,6 +3409,26 @@ def test_pad_empty_batch_adds_generation_dummy_to_scheduled_batch():
     # pick: this rank is empty precisely because it is short of KV cache.
     assert stub.add_dummy_calls[0]["is_gen"] is True
     assert stub.add_dummy_calls[0]["token_nums"] is None
+
+
+def test_pad_empty_batch_uses_context_dummy_on_kda_context_only_worker():
+    stub, scheduled_batch = _unfittable_rank()
+    stub.kv_cache_manager.kda_context_only = True
+    stub.max_total_draft_tokens = 3
+
+    _run_pad_empty(stub, scheduled_batch)
+
+    assert scheduled_batch.batch_size == 1
+    assert scheduled_batch.generation_requests == []
+    assert len(scheduled_batch.context_requests) == 1
+    dummy = scheduled_batch.context_requests[0]
+    assert dummy.is_attention_dp_dummy is True
+    assert dummy in stub.active_requests
+    call = stub.add_dummy_calls[0]
+    assert call["is_gen"] is False
+    assert call["token_nums"] == [1]
+    assert call["max_num_draft_tokens"] == 0
+    assert stub._pending_adp_dummy_request is dummy
 
 
 def test_pad_empty_batch_no_op_when_batch_is_not_empty():

@@ -7946,7 +7946,13 @@ class PyExecutor:
         if any(request.py_request_id == ATTENTION_DP_DUMMY_REQUEST_ID
                for request in self.active_requests):
             return
-        if not self._has_adp_dummy_kv_capacity(None):
+        # A KDA context-only cache manager keeps no replay or draft-verification
+        # buffers, so it cannot run a generation row; pad with a one-token
+        # context dummy instead.
+        context_dummy = bool(
+            getattr(self.kv_cache_manager, "kda_context_only", False))
+        token_nums = [1] if context_dummy else None
+        if not self._has_adp_dummy_kv_capacity(token_nums):
             logger.warning_once(
                 "attention-DP rank scheduled an empty batch and cannot afford "
                 "even a padding dummy; the forward pass is vetoed fleet-wide "
@@ -7961,9 +7967,10 @@ class PyExecutor:
             # peers in the collectives that follow.
             dummy_requests = self.kv_cache_manager.add_dummy_requests(
                 request_ids=dummy_request_ids,
-                token_nums=None,
-                is_gen=True,
-                max_num_draft_tokens=self.max_total_draft_tokens,
+                token_nums=token_nums,
+                is_gen=not context_dummy,
+                max_num_draft_tokens=(0 if context_dummy else
+                                      self.max_total_draft_tokens),
             )
         except (OutOfPagesError, NoFreeSlotsError):
             dummy_requests = None
@@ -7985,10 +7992,14 @@ class PyExecutor:
                 return
 
         dummy_request.is_attention_dp_dummy = True
-        # Never grown by the V2 scheduler, so `_revert_gen_alloc` must skip it.
-        dummy_request.py_skip_gen_alloc_revert = True
         self.active_requests.append(dummy_request)
-        scheduled_batch.generation_requests.append(dummy_request)
+        if context_dummy:
+            scheduled_batch.append_context_request(dummy_request)
+        else:
+            # Never grown by the V2 scheduler, so `_revert_gen_alloc` must skip
+            # it.
+            dummy_request.py_skip_gen_alloc_revert = True
+            scheduled_batch.generation_requests.append(dummy_request)
         # Let `_finalize_adp_dummy_allocation` roll this back if the fleet still
         # cannot queue: no forward runs then, so the usual dummy teardown in
         # `_handle_responses` is not reached this iteration.
