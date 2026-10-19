@@ -51,7 +51,17 @@ class LogicError(Exception):
     """An operation violates the cache or batch's state and usage requirements."""
 
 class OutOfMemoryError(Exception): ...
-class OutOfPagesError(OutOfMemoryError): ...
+
+class HostOOMError(OutOfMemoryError):
+    """The host tier could not be backed by physical memory."""
+
+class DiskOOMError(OutOfMemoryError):
+    """The disk tier's backing file could not be grown."""
+
+class CuOOMError(OutOfMemoryError):
+    """A CUDA allocation failed for want of device memory."""
+
+class OutOfPagesError(Exception): ...
 
 def poison_reason() -> str | None:
     """First recorded invariant violation, or None. Never clears, so it is safe to poll."""
@@ -114,9 +124,23 @@ TokenIdExt = Union[TokenId, bytes]
 class PlannedDropHandle:
     def drop(self) -> None: ...
 
-class ReuseScope(NamedTuple):
-    lora_id: int | None = None
-    salt: int | None = None
+class ReuseScope:
+    """Reuse identity; salt is also reported in stored-block events."""
+
+    def __init__(
+        self,
+        lora_id: int | None = None,
+        salt: str | None = None,
+    ) -> None: ...
+    @property
+    def lora_id(self) -> int | None: ...
+    @property
+    def salt(self) -> str | None: ...
+    def __len__(self) -> int: ...
+    def __getitem__(self, index: int) -> int | str | None: ...
+    def __iter__(self) -> Iterator[int | str | None]: ...
+    def __hash__(self) -> int: ...
+    def __eq__(self, other: object) -> bool: ...
 
 SlidingWindowSize: TypeAlias = int | None
 LayerId = NewType("LayerId", int)
@@ -204,21 +228,23 @@ class CacheTierConfig(Protocol):
     quota: int
     @property
     def tier(self) -> CacheTier: ...
-    def assert_valid(self) -> None: ...
+    def validate(self) -> None: ...
 
 @dataclass(slots=True)
 class GpuCacheTierConfig:
     quota: int
     @property
     def tier(self) -> CacheTier: ...
-    def assert_valid(self) -> None: ...
+    def validate(self) -> None: ...
 
 @dataclass(slots=True)
 class HostCacheTierConfig:
     quota: int
+    max_quota: int | None = None
+    allow_remote_numa_fallback: bool = True
     @property
     def tier(self) -> CacheTier: ...
-    def assert_valid(self) -> None: ...
+    def validate(self) -> None: ...
 
 @dataclass(slots=True)
 class DiskCacheTierConfig:
@@ -226,7 +252,7 @@ class DiskCacheTierConfig:
     path: str
     @property
     def tier(self) -> CacheTier: ...
-    def assert_valid(self) -> None: ...
+    def validate(self) -> None: ...
 
 @dataclass(slots=True)
 class BufferConfig:
@@ -274,6 +300,14 @@ class SwaScratchReuseConfig:
     max_rewind_len: int = 0
 
 @dataclass(slots=True)
+class PoolRebalanceConfig:
+    min_sampled_kv_caches: int = 2000
+    cooldown_secs: float = 120.0
+    target_ratio_update_interval: int = 100
+    ratio_tolerance: float = 0.25
+    moving_average_decay: float = 0.9999
+
+@dataclass(slots=True)
 class KVCacheManagerConfig:
     tokens_per_block: int
     cache_tiers: list[CacheTierConfig]
@@ -293,6 +327,7 @@ class KVCacheManagerConfig:
     enable_stats: bool = True
     text_only: bool = False
     enable_partial_commit: bool = True
+    pool_rebalance: PoolRebalanceConfig = ...
     @property
     def enable_swa_scratch_reuse(self) -> bool: ...
 
@@ -393,6 +428,8 @@ class StreamingEventSink:
     def stats(self) -> StreamingEventStats: ...
 
 class KVCacheEventManager:
+    @staticmethod
+    def _hash_cache_salt(salt: str) -> int: ...
     def __init__(
         self,
         max_kv_event_entries: int,

@@ -631,4 +631,4 @@ If Tiers 1-2 do not answer the question, consult the original sources:
 - **Megatron Core docs**: `https://docs.nvidia.com/megatron-core/developer-guide/latest/index.html`
 
 Return to Tier 2 afterward and consider whether the answer should be distilled
-into the references directory for next time.
+into the references directory for next time. A distilled file opens with a `**Source:**` paragraph above its first `##` section: a markdown link to the original, `Distilled <YYYY-MM-DD>` and the revision distilled, and what the original still answers.

@@ -204,7 +204,7 @@ class TestTokenParity:
         # binding are field-iterable (see reuse_scope_to_bytes), lora_id first.
         assert tuple(probe_scope) == tuple(create_scope)
         assert tuple(probe_scope)[0] == 7
-        assert tuple(probe_scope)[1] is not None
+        assert tuple(probe_scope)[1] == "tenant-a"
 
     def test_cache_salt_changes_the_scope(self) -> None:
         """Different reuse namespaces must not dedup against each other."""
