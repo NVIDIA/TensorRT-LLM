@@ -27,7 +27,6 @@ from typing import Optional
 
 import torch
 
-from .. import dispatch
 from ..ops.gemm.m3_target_head import encode_chunked, round_trip_ok
 from ..ops.spec.m3_draft_step import MAX_TILES_PER_CTA, MAX_TOKENS, bf16_fragments
 from ..ops.spec.m3_draft_step import m3_draft_step as _draft_step_op
@@ -63,16 +62,16 @@ def head_supported(lm_head) -> bool:
     return (n // 16 + _num_sms() - 1) // _num_sms() <= MAX_TILES_PER_CTA
 
 
-def prepare_head(lm_head, tp_rank: int) -> DraftHead:
+def prepare_head(lm_head, tp_rank: int, coded: bool) -> DraftHead:
     """The streamed copy of ``lm_head``'s local shard (global ids from tp_rank * rows): its 12-bit coding when
-    ``dispatch.DRAFT_HEAD_CODED``, K is a multiple of 64 and the coding decodes to the shard bit for bit, else (fail
+    ``coded``, K is a multiple of 64 and the coding decodes to the shard bit for bit, else (fail
     closed) the fragment-ordered BF16 copy.
     Built once, eagerly, before the executor's warmup (``M3Eagle3Worker.prebuild_draft_head``)."""
     weight = lm_head.weight
     offset = tp_rank * weight.shape[0]
     with torch.no_grad():
         w = weight.detach()
-        if dispatch.DRAFT_HEAD_CODED and w.shape[1] % 64 == 0:
+        if coded and w.shape[1] % 64 == 0:
             packed, base, exc_off, exc_pos, exc_w = encode_chunked(w)
             if round_trip_ok(packed, base, exc_off, exc_pos, exc_w, w):
                 return DraftHead(
@@ -104,13 +103,13 @@ def _num_sms() -> int:
 
 
 def workspace(mapping, device) -> Optional[AcceptWorkspace]:
-    """The exchange workspace ([2][MAX_TOKENS][world] slots), created collectively on the first eager call; a
-    CUDA-graph capture that finds it missing is a miss."""
+    """The exchange workspace ([2][MAX_TOKENS][world] slots), created collectively on the first eager call; None
+    during a CUDA-graph capture that finds it missing."""
     global _WS
     if _WS is not None:
         return _WS
     if torch.cuda.is_current_stream_capturing():
-        dispatch.capture_missed(dispatch.DRAFT_STEP.path, None, "the draft-step exchange workspace")
+        # A capture that finds it missing is the caller's miss (it is built on the eager steps).
         return None
     _WS = create_workspace(mapping, device, MAX_TOKENS)
     return _WS

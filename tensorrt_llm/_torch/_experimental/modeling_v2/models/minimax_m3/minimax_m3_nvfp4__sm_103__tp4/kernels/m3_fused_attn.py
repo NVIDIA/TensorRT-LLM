@@ -42,11 +42,13 @@ from typing import Optional
 
 import torch
 
-NUM_HEADS = 16
-HEAD_DIM = 128
+from ..ops.attention.m3_fused_decode_attn import m3_fused_decode_attn as _m3_fused_decode_attn_op
+
+NUM_HEADS = 16  # capacity: fixed: the tp4 query heads
+HEAD_DIM = 128  # capacity: fixed: the checkpoint's head dim
 PAGE_SIZE = 128
-MAX_BLOCKS = 16
-PACKED_WIDTH = (NUM_HEADS + 4) * HEAD_DIM
+MAX_BLOCKS = 16  # capacity: fixed: the MSA top-16 blocks
+PACKED_WIDTH = (NUM_HEADS + 4) * HEAD_DIM  # capacity: fixed: the tp4 packed QKV width
 
 # (decode_query_len, tokens per cluster, KV blocks per CTA) geometries compiled into the op: what
 # default_geometry() returns for every step shape the target routes here (at most 16 tokens).
@@ -318,7 +320,8 @@ def m3_fused_decode_attn(
         (decode_query_len, qg, bpc) in GEOMETRIES,
         f"geometry {(decode_query_len, qg, bpc)} is not compiled",
     )
-    _load_module().minimax_m3_fused_decode_attn(
+    _load_module()
+    _m3_fused_decode_attn_op(
         packed,
         kv_data,
         kv_scale,

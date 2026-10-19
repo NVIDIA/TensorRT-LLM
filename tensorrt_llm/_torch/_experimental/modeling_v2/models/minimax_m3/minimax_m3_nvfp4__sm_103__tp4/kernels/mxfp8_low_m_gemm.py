@@ -38,7 +38,7 @@ _CONFIGS = {
     (6144, 3072): (4, 2, 8, 2),  # dense MLP down
 }
 # Opt-in shared memory per CTA on SM100 (227 KiB) less a margin for the static mbarriers.
-_MAX_DYNAMIC_SMEM = 227 * 1024 - 1024
+_MAX_DYNAMIC_SMEM = 227 * 1024 - 1024  # capacity: fixed: the device's shared-memory limit
 
 _logged_shapes = set()
 

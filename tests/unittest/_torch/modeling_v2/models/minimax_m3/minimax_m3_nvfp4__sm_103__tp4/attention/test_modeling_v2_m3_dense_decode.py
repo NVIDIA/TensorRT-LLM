@@ -14,7 +14,7 @@ import pytest
 import torch
 
 from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_103__tp4 import (  # noqa: E501
-    dispatch,
+    modeling as dispatch,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_103__tp4.ops.attention.m3_dense_decode import (  # noqa: E501
     CAPPED,

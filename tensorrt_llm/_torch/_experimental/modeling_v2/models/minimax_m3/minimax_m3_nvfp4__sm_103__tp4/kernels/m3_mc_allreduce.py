@@ -38,7 +38,7 @@ from ..ops.comm.m3_mc_finalize_allreduce_norm import (
     m3_mc_finalize_allreduce_norm as _finalize_allreduce_norm_op,
 )
 
-MAX_TOKENS = 48
+MAX_TOKENS = 48  # capacity: fixed: the decode kernels' row bound (decode steps)
 BUCKETS = (8, 16, 48)  # token capacity of each workspace (grid = bucket * cluster CTAs)
 EMPTY_WORD = -2147483648
 

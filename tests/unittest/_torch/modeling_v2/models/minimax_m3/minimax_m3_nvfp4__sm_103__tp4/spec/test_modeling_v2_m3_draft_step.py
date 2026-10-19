@@ -313,7 +313,8 @@ def test_fragments_round_trip() -> None:
     assert wf.shape == (4, 6, 256)
     assert torch.equal(from_fragments(wf), w)
     head = SimpleNamespace(weight=w, bias=None)
-    prepared = draft_step_kernels.prepare_head(head, 3)  # K 96: no coding, the BF16 fragments
+    # K 96: never coded, the BF16 fragments.
+    prepared = draft_step_kernels.prepare_head(head, 3, True)
     assert not prepared.coded
     assert torch.equal(prepared.wf, wf) and prepared.vocab_offset == 3 * 64 and prepared.weight is w
 
@@ -643,7 +644,7 @@ def test_prepare_head_codes_the_shard_and_fails_closed(monkeypatch) -> None:
     g = gen(seed_of("prepare coded"))
     w = randn((4096, 1024), g, 0.02)
     head = SimpleNamespace(weight=w, bias=None)
-    prepared = draft_step_kernels.prepare_head(head, 2)
+    prepared = draft_step_kernels.prepare_head(head, 2, True)
     assert prepared.coded and prepared.vocab_offset == 2 * 4096 and prepared.weight is w
     assert torch.equal(head_weight(prepared.wf, 1024, prepared.exc_off, prepared.exc_pos, prepared.exc_w,
                                    prepared.exp_base), w)  # fmt: skip
@@ -655,17 +656,17 @@ def test_prepare_head_codes_the_shard_and_fails_closed(monkeypatch) -> None:
         return packed, base, exc_off, exc_pos, exc_w
 
     monkeypatch.setattr(draft_step_kernels, "encode_chunked", corrupt)
-    dropped = draft_step_kernels.prepare_head(head, 2)
+    dropped = draft_step_kernels.prepare_head(head, 2, True)
     assert not dropped.coded and dropped.exc_off is None
     assert torch.equal(dropped.wf, bf16_fragments(w))
 
 
 def test_prepare_head_keeps_bf16_when_coding_is_off(monkeypatch) -> None:
-    """DRAFT_HEAD_CODED = False keeps the BF16 fragments even for a shard whose coding would decode bit for bit."""
+    """``coded`` False (``DRAFT_HEAD_CODED`` off) keeps the BF16 fragments even for a shard whose coding would decode
+    bit for bit."""
     g = gen(seed_of("prepare bf16"))
     w = randn((4096, 1024), g, 0.02)
-    monkeypatch.setattr(draft_step_kernels.dispatch, "DRAFT_HEAD_CODED", False)
-    prepared = draft_step_kernels.prepare_head(SimpleNamespace(weight=w, bias=None), 2)
+    prepared = draft_step_kernels.prepare_head(SimpleNamespace(weight=w, bias=None), 2, False)
     assert not prepared.coded and prepared.exc_off is None
     assert torch.equal(prepared.wf, bf16_fragments(w))
 

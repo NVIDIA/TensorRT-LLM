@@ -54,22 +54,14 @@ def tactic_for(n: int, k: int, m: int) -> Optional[Tuple[str, tuple]]:
     return None
 
 
-def _cells() -> tuple[Cell, ...]:
-    names = {
-        (1280, 12288): "qkv",
-        (6144, 1024): "o_proj",
-        (4608, 6144): "gate_up",
-        (6144, 2304): "down",
-        (6144, 18432): "fc",
-    }
-    return tuple(
-        Cell(
-            why=f"drafter {names[nk]}, {m} rows: {tactic_for(nk[0], nk[1], m)[0]} tactic",
-            spec=dict(nk=nk, m=m),
-        )
-        for nk, table in TACTICS.items()
-        for m in range(1, table[-1][0] + 1)
-    )
+#: The drafter linear each (N, K) of the table is.
+_NAMES: Mapping[Tuple[int, int], str] = {
+    (1280, 12288): "qkv",
+    (6144, 1024): "o_proj",
+    (4608, 6144): "gate_up",
+    (6144, 2304): "down",
+    (6144, 18432): "fc",
+}
 
 
 class M3DraftLowM(OpWrapper):
@@ -78,11 +70,19 @@ class M3DraftLowM(OpWrapper):
     ``kind`` / ``tactic`` pick FlashInfer's kernel: "d" runs ``run_direct_dense`` (SIMT, one dot product per output in
     K order), "s" runs ``run_splitk_dense`` (tcgen05 MMA, K split over ``split_k`` CTAs and summed in FP32). Both
     round once to BF16. The kernel is compiled on its first call per (M, N, K, tactic, PDL); the target compiles every
-    covered call before warmup (kernels/m3_draft_lowm.prebuild).
+    covered call before warmup (modeling's ``_prebuild_draft_lowm``).
     """
 
     ARCHS = frozenset({Arch.SM_103})
-    CELLS: tuple[Cell, ...] = _cells()
+    # Every row count of every table entry.
+    CELLS: tuple[Cell, ...] = tuple(
+        Cell(
+            why=f"drafter {_NAMES[nk]}, {m} rows: {tactic_for(nk[0], nk[1], m)[0]} tactic",
+            spec=dict(nk=nk, m=m),
+        )
+        for nk, table in TACTICS.items()
+        for m in range(1, table[-1][0] + 1)
+    )
 
     note = """
     The table is the TP8 drafter's: its shapes are the per-rank shards of the Eagle3 layer at 8-way tensor

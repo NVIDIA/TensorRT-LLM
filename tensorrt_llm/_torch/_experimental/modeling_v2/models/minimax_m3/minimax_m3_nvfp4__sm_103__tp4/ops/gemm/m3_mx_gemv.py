@@ -9,8 +9,8 @@ from typing import Optional
 import torch
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
-from tensorrt_llm._torch.cute_dsl_kernels.minimax_m3.mx_gemv import op as _gemv
 
+from ...kernels.mx_gemv import op as _gemv
 from ..moe.m3_moe_engine import mxfp8_dequant
 
 __all__ = ["PROJECTIONS", "gemv_is_valid", "m3_mx_gemv", "served_cells"]

@@ -13,7 +13,7 @@ one kernel over this rank's BF16 logits shard (the target lm_head's own local GE
 
 The argmax is taken over the BF16 logits without arithmetic, so the tokens are those of the in-tree path's argmax
 over the gathered logits. The kernel is compiled into TensorRT-LLM (cpp/tensorrt_llm/kernels/minimaxM3/
-shardAccept.cu) and called as ``torch.ops.trtllm.minimax_m3_shard_accept``.
+shardAccept.cu) and reached through the ``ops/spec`` entry ``m3_shard_accept``.
 """
 
 from dataclasses import dataclass
@@ -21,10 +21,10 @@ from typing import Any, Optional
 
 import torch
 
-from .. import dispatch
+from ..ops.spec.m3_shard_accept import m3_shard_accept as _shard_accept_op
 
 #: Verify rows per call, and exchange rows per call half of the workspace.
-SHARD_ROWS = 48
+SHARD_ROWS = 48  # capacity: fixed: DECODE_MAX_TOKENS verify rows
 
 
 @dataclass(eq=False)
@@ -107,7 +107,7 @@ def _workspace(mapping, device) -> Optional[AcceptWorkspace]:
     if _WS is not None:
         return _WS
     if torch.cuda.is_current_stream_capturing():
-        dispatch.capture_missed(dispatch.SHARD_ACCEPT.path, None, "the shard-accept workspace")
+        # A capture that finds it missing is the caller's miss (it is built on the eager steps).
         return None
     _WS = create_workspace(mapping, device, SHARD_ROWS)
     return _WS
@@ -154,7 +154,7 @@ def shard_accept(
     accepted = torch.empty((nreq, draft_len + 1), dtype=torch.int32, device=dev)
     num_accepted = torch.empty(nreq, dtype=torch.int32, device=dev)
     gather_ids = torch.empty(nreq, dtype=torch.int64, device=dev)
-    torch.ops.trtllm.minimax_m3_shard_accept(
+    _shard_accept_op(
         logits,
         vocab_offset,
         ws.keys,

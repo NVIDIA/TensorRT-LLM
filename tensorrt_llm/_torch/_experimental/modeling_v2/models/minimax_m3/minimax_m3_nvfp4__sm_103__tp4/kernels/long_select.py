@@ -35,7 +35,7 @@ def long_select_blocks(
 
     Returns the head-major backed [total_q, num_kv_heads, 16] int32 table, or None outside this kernel's shapes
     (callers keep the reference op). ``early_trigger`` releases the dependent sparse decode right after the select's
-    grid wait (``dispatch.SELECT_EARLY_MAX_ROWS``).
+    grid wait (``SELECT_EARLY_MAX_ROWS`` in modeling.py).
     """
     if (
         max_score_kv.dtype != torch.float32

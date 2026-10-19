@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""The tp8 target's files that are byte copies of the tp4 target's (and of the shared CuTe DSL GEMV kernel) stay so.
+"""The tp8 target's files that are byte copies of the tp4 target's stay so.
 
 The two MiniMax-M3 targets share no code by design (``test_modeling_v2_claims.test_targets_do_not_share_files``): the
 tp8 target was made as a copy of the tp4 one and keeps its own copy of every file, tp8-specific or not. The files
@@ -15,7 +15,6 @@ from pathlib import Path
 
 import pytest
 
-import tensorrt_llm._torch as _torch_pkg
 import tensorrt_llm._torch._experimental.modeling_v2 as _modeling_v2
 
 # Nothing of either target is imported (no GPU, no built extensions needed): the paths are the packages', resolved
@@ -27,8 +26,14 @@ _TP4 = _M3 / "minimax_m3_nvfp4__sm_103__tp4"
 _TP8 = _M3 / "minimax_m3_nvfp4__sm_103__tp8"
 
 #: Paths relative to the target directory that are byte copies of the tp4 target's.
+#: (``ops/attention/m3_msa_attention.py`` left the list: its reference dequantizes NVFP4 pages with each target's own
+#: long-context sparse decode entry, ``m3_sparse_decode_lc`` at TP4 and ``m3_sparse_decode_lc8`` at TP8.)
 IDENTICAL_TO_TP4 = (
+    "kernels/embedding_firstnorm/__init__.py",
+    "kernels/embedding_firstnorm/m3_embedding_firstnorm_kernel.py",
+    "kernels/embedding_firstnorm/op.py",
     "kernels/long_select.py",
+    "kernels/m3_force_vec.py",
     "kernels/m3_index_score.py",
     "kernels/m3_prequant.py",
     "kernels/m3_router_gemv.py",
@@ -36,15 +41,23 @@ IDENTICAL_TO_TP4 = (
     "kernels/m3_shard_accept.py",
     "kernels/m3_spec_tail.py",
     "kernels/msa_kv_update.py",
+    "kernels/mx_gemv/m3_mx_gemv_kernel.py",
     "kernels/triton_sparse_decode_mq.py",
     "ops/__init__.py",
+    "ops/activation/__init__.py",
     "ops/attention/__init__.py",
+    "ops/attention/m3_draft_attention.py",
+    "ops/attention/m3_fp8_indexer_qk_norm_rope.py",
+    "ops/attention/m3_select_blocks.py",
     "ops/attention/msa_kv_update.py",
     "ops/comm/__init__.py",
+    "ops/embedding/__init__.py",
+    "ops/embedding/m3_embedding.py",
     "ops/gemm/__init__.py",
+    "ops/gemm/m3_fp32_linear.py",
     "ops/moe/__init__.py",
-    "ops/moe/m3_router_gemv.py",
     "ops/moe/m3_router_gemv_fp4.py",
+    "ops/moe/m3_router_gemv.py",
     "ops/moe/m3_router_tc.py",
     "ops/norm/__init__.py",
     "ops/norm/m3_embedding_firstnorm.py",
@@ -52,29 +65,14 @@ IDENTICAL_TO_TP4 = (
     "ops/spec/m3_capture_norm.py",
     "ops/spec/m3_chunk_norm.py",
     "ops/spec/m3_draft_input.py",
+    "ops/spec/m3_force_vec.py",
     "ops/spec/m3_slot_scatter.py",
     "ops/spec/m3_step_gather.py",
 )
 
-#: The tp8 target's own copy of the CuTe DSL decode GEMV kernel (its op.py carries the TP8 tables), against the shared
-#: one the tp4 target uses.
-GEMV_KERNEL = "kernels/mx_gemv/m3_mx_gemv_kernel.py"
-_SHARED_GEMV_KERNEL = (
-    Path(_torch_pkg.__file__).resolve().parent
-    / "cute_dsl_kernels"
-    / "minimax_m3"
-    / "mx_gemv"
-    / "m3_mx_gemv_kernel.py"
-)
-
 
 def test_the_targets_are_where_this_test_reads_them() -> None:
-    for path in (
-        _TP4 / "dispatch.py",
-        _TP8 / "dispatch.py",
-        _TP8 / GEMV_KERNEL,
-        _SHARED_GEMV_KERNEL,
-    ):
+    for path in (_TP4 / "modeling.py", _TP8 / "modeling.py"):
         assert path.is_file(), path
 
 
@@ -97,14 +95,6 @@ def test_the_copy_is_the_tp4_file(relative) -> None:
     assert not diff, (
         f"{diff}. The targets share no code, so a change to one copy must be considered for the other: apply it to "
         "both, or drop the file from IDENTICAL_TO_TP4 stating why the copies now differ."
-    )
-
-
-def test_the_gemv_kernel_is_the_shared_kernel() -> None:
-    diff = _differs(_TP8 / GEMV_KERNEL, _SHARED_GEMV_KERNEL)
-    assert not diff, (
-        f"{diff}. The tp8 target's decode GEMV kernel is a copy of the shared CuTe DSL one: a change to one copy "
-        "must be considered for the other."
     )
 
 

@@ -28,14 +28,14 @@ import torch
 
 from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
 
-MAX_TOKENS = 48
+MAX_TOKENS = 48  # capacity: fixed: the decode kernels' row bound (decode steps)
 MMA_WIDTHS = (
     8,
     16,
     32,
     48,
 )  # token columns of the compiled MMA; a call uses the smallest that holds M
-_SMEM_LIMIT = 220 * 1024
+_SMEM_LIMIT = 220 * 1024  # capacity: fixed: the device's shared-memory limit
 
 
 def _mma_n(m: int) -> int:

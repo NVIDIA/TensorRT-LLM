@@ -584,7 +584,11 @@ def test_prepare_head_streams_the_bf16_fragments_at_every_k() -> None:
         assert torch.equal(head_weight(prepared.wf, k).view(torch.int16), w.view(torch.int16))
     with pytest.raises(NotImplementedError):
         head_weight(prepared.wf, 96, torch.zeros(2, dtype=torch.int32, device="cuda"))
-    assert not hasattr(draft_step_kernels.dispatch, "DRAFT_HEAD_CODED")
+    from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_103__tp8 import (  # noqa: E501
+        modeling,
+    )
+
+    assert not hasattr(modeling, "DRAFT_HEAD_CODED")
     assert all(not c.spec["coded"] for c in op.CELLS)
 
 

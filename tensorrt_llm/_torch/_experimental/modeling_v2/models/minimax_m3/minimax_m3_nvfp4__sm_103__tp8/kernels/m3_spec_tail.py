@@ -13,8 +13,13 @@ from typing import Optional, Tuple
 
 import torch
 
-# The kernels are compiled into TensorRT-LLM (cpp/tensorrt_llm/kernels/minimaxM3/specTail.cu) and called as
-# torch.ops.trtllm.minimax_m3_{draft_input, chunk_norm, capture_norm, step_gather, slot_scatter}.
+# The kernels are compiled into TensorRT-LLM (cpp/tensorrt_llm/kernels/minimaxM3/specTail.cu) and reached through the
+# ops/spec entries.
+from ..ops.spec.m3_capture_norm import m3_capture_norm as _capture_norm_op
+from ..ops.spec.m3_chunk_norm import m3_chunk_norm as _chunk_norm_op
+from ..ops.spec.m3_draft_input import m3_draft_input as _draft_input_op
+from ..ops.spec.m3_slot_scatter import m3_slot_scatter as _slot_scatter_op
+from ..ops.spec.m3_step_gather import m3_step_gather as _step_gather_op
 
 
 def draft_input(
@@ -33,10 +38,9 @@ def draft_input(
     m, h = ids.shape[0], table.shape[1]
     out = torch.empty((m, 2 * h), dtype=table.dtype, device=table.device)
     residual = torch.empty((m, h), dtype=table.dtype, device=table.device)
-    torch.ops.trtllm.minimax_m3_draft_input(
+    return _draft_input_op(
         ids, table, hidden, rows, w_embed, w_hidden, eps_embed, eps_hidden, out, residual, use_pdl
     )
-    return out, residual
 
 
 def chunk_norm(
@@ -45,8 +49,7 @@ def chunk_norm(
     """Per-chunk RMSNorm of src [M, >= C*H] (row stride may exceed C*H) with weights [C, H] -> [M, C*H]."""
     c, h = weights.shape
     out = torch.empty((src.shape[0], c * h), dtype=src.dtype, device=src.device)
-    torch.ops.trtllm.minimax_m3_chunk_norm(src, weights, eps, out, use_pdl)
-    return out
+    return _chunk_norm_op(src, weights, eps, out, use_pdl)
 
 
 # The overlap scheduler's per-step gathers and the spec sampler's slot stores as one kernel each (step_gather /
@@ -72,7 +75,7 @@ def step_gather(
         and kv_off.is_contiguous()
     ):
         return False
-    torch.ops.trtllm.minimax_m3_step_gather(
+    _step_gather_op(
         new_tok, next_draft, lens, slots, ppi, P, T, D, ids, ids0, draft, d0, pos_off, kv_off, b0
     )
     return True
@@ -88,7 +91,7 @@ def slot_scatter(
     two = (src_new, dst_new, src_next_new, dst_next_new, src_draft, dst_draft)
     if any(t.dim() != 2 for t in two) or src_lens.dim() != 1 or dst_lens.dim() != 1:
         return False
-    torch.ops.trtllm.minimax_m3_slot_scatter(
+    _slot_scatter_op(
         slots,
         src_new,
         dst_new,
@@ -110,4 +113,4 @@ def capture_norm(
     dst: torch.Tensor,
 ) -> None:
     """dst [M, H] (row stride may exceed H) = rmsnorm(h + residual) * weight with chunk_norm's rounding."""
-    torch.ops.trtllm.minimax_m3_capture_norm(h, residual, weight, eps, dst)
+    _capture_norm_op(h, residual, weight, eps, dst)

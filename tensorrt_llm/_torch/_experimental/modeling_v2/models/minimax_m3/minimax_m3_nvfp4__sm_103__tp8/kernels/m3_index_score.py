@@ -543,10 +543,10 @@ class IndexScoreRunner:
     per CTA."""
 
     kernel_cache: dict = {}
-    SUPPORTED_HEAD_DIM = 128
+    SUPPORTED_HEAD_DIM = 128  # capacity: fixed: the checkpoint's index head dim
     SUPPORTED_PAGE_SIZE = IndexDecodeScoreKernel.BLOCK_K
     # BLOCK_Q must fit one warp's worth of epilogue lanes.
-    MAX_BLOCK_Q = 32
+    MAX_BLOCK_Q = 32  # capacity: fixed: the scorer's query tile
     EARLY_PREFETCH_DEPTH = 1
 
     @classmethod

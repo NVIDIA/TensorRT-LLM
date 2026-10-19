@@ -16,7 +16,8 @@ log-domain recurrence. Accumulation order inside the MMAs and the reductions dif
 not bit for bit.
 
 Schedule: the request length and the query rows (FP8 widened to FP16 in shared memory) are read before the PDL grid
-wait, which overlaps them with the select ahead when it releases this grid early (``dispatch.SELECT_EARLY_MAX_ROWS``);
+wait, which overlaps them with the select ahead when it releases this grid early (modeling's
+``SELECT_EARLY_MAX_ROWS``);
 the split-K partials travel by ``st.async`` into each receiving CTA's own mbarrier instead of a cluster-wide barrier.
 Neither changes a value or the merge order.
 

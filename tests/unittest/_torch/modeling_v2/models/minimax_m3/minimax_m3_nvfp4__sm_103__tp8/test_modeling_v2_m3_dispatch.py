@@ -1,7 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""The tp8 decode target's dispatch table (``dispatch.py``): its row ranges against the catalog cells that certify
-them and the kernels' own limits, the selection for every decode row count, and the miss / uncovered policy.
+"""The tp8 decode target's dispatch table (``modeling.py``, imported here as ``dispatch``): its row ranges against the
+catalog cells that certify them and the kernels' own limits, the selection for every decode row count, and the miss /
+uncovered policy.
 
 CPU only: nothing here launches a kernel.
 """
@@ -15,14 +16,10 @@ import pytest
 import torch
 
 from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_103__tp8 import (  # noqa: E501
-    dispatch,
-    layers,
-    linears,
-    spec_worker,
+    modeling as dispatch,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_103__tp8.kernels import (  # noqa: E501
     m3_attn_lc8,
-    m3_draft_lowm,
     m3_draft_step,
     m3_fused_score_select,
     m3_mc_allreduce,
@@ -31,9 +28,6 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_103__tp8.kernels.mx_gemv import (  # noqa: E501
     op as mx_gemv,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_103__tp8.modeling import (  # noqa: E501
-    DecodeTarget,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_103__tp8.ops.attention import (  # noqa: E501
     m3_fused_score_select as fused_score_select_entry,
@@ -54,7 +48,6 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_
 from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_103__tp8.ops.spec import (  # noqa: E501
     m3_draft_step as draft_step_entry,
 )
-from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
 from tensorrt_llm._torch.modules.linear import TensorParallelMode
 
 _TARGET = (
@@ -158,9 +151,9 @@ def test_the_removed_tp4_paths_are_gone() -> None:
     ):
         assert importlib.util.find_spec(f"{_TARGET}.{module}") is None, module
     for method in ("prebuild_target_head", "_m3_coded_head"):
-        assert not hasattr(spec_worker.M3Eagle3Worker, method), method
+        assert not hasattr(dispatch.M3Eagle3Worker, method), method
     for method in ("moe16_engine", "_build_moe16_engine"):
-        assert not hasattr(layers.M3MoE, method), method
+        assert not hasattr(dispatch.MiniMaxM3Tp8ModelingV2, method), method
 
 
 # ------------------------------------------------------------------ the ranges against the kernels' own limits
@@ -187,8 +180,7 @@ def test_the_shared_expert_projections_take_no_gemv(nk, push) -> None:
     """At TP8 the shared expert (768 x 6144 gate_up, 6144 x 384 down) runs inside the MoE engine on decode rows and on
     the generic GEMM otherwise: the GEMV has no config for it and the dispatch never routes a call there."""
     assert mx_gemv.get_config(*nk) is None
-    module = SimpleNamespace(weight=torch.zeros(1, 1).expand(*nk), m3_push=push, tp_size=8)
-    assert linears.gemv_variants(module) == []
+    assert dispatch._gemv_variants(*nk, push, 8) == []
 
 
 def test_the_plans_are_the_all_reduce_buckets() -> None:
@@ -405,6 +397,80 @@ def test_a_miss_logs_once_per_reason_otherwise(log) -> None:
     assert "m3_moe_engine at 5 rows: the engine is not built" in log.warning[0]
 
 
+# ------------------------------------------------------------------ the phase split
+
+
+def test_the_core_selects_the_target_on_the_context_count_alone() -> None:
+    """Every pure generation step is decode's, whatever its width; a step with context rows (a mixed one too) is
+    prefill's. Nothing but ``num_contexts`` is read: the metadata stand-in carries no other field."""
+    core = SimpleNamespace(_prefill="prefill", _decode="decode")
+    select = dispatch.MiniMaxM3Tp8ModelingV2._select_target
+    assert select(core, SimpleNamespace(num_contexts=0)) == "decode"
+    assert select(core, SimpleNamespace(num_contexts=1)) == "prefill"
+    assert select(core, SimpleNamespace(num_contexts=7)) == "prefill"
+
+
+_DECODE_FIELDS = (
+    "num_tokens",
+    "num_seqs",
+    "kv_cache_manager",
+    "msa_idx_k_cache",
+    "msa_out_cache_loc",
+    "msa_decode_span",
+    "msa_block_table",
+    "msa_seq_lens_cuda",
+    "_msa_short_ok",
+    "msa_short_table",
+    "msa_proxy_max_score_view",
+    "msa_worst_case_max_k_tiles",
+    "msa_n_valid_blocks",
+)
+
+
+def _decode_metadata(num_tokens: int) -> SimpleNamespace:
+    """The decode projection's fields and nothing else (no ``num_contexts`` / ``num_ctx_tokens``)."""
+    md = SimpleNamespace(**{name: object() for name in _DECODE_FIELDS})
+    md.num_tokens = num_tokens
+    return md
+
+
+def test_the_decode_projection_states_the_phase_and_reads_no_count_back() -> None:
+    md = _decode_metadata(4)
+    step = dispatch.DecodeTarget(SimpleNamespace()).step_args(md)
+    assert step["num_contexts"] == 0 and step["num_ctx_tokens"] == 0
+    assert step["metadata"] is md and step["msa_short_ok"] is md._msa_short_ok
+
+
+@pytest.mark.parametrize(
+    "rows,embeds", [(49, False), (64, False), (4, True)], ids=["49_rows", "64_rows", "embeds"]
+)
+def test_a_wide_generation_step_runs_every_layer_generically_in_decode(
+    monkeypatch, rows, embeds
+) -> None:
+    """Past the decode kernels' rows (or with embeddings) the decode target runs its own generic layer for every
+    layer, with its own projection, and never the decode-kernel layer."""
+    layers, seen = 3, []
+    core = SimpleNamespace(num_layers=layers, w={"embed": None})
+    monkeypatch.setattr(dispatch, "m3_embedding", lambda ids, table: ("embedded", int(ids.numel())))
+
+    def generic(self, i, position_ids, hidden, residual, step, spec_metadata, capture):
+        seen.append((i, step["num_contexts"], step["metadata"]))
+        return ("hidden", i), ("residual", i)
+
+    def kernels(self, *args):
+        raise AssertionError("the decode-kernel layer ran on a wide step")
+
+    monkeypatch.setattr(dispatch.DecodeTarget, "_generic_layer", generic)
+    monkeypatch.setattr(dispatch.DecodeTarget, "_layer", kernels)
+    md = _decode_metadata(rows)
+    ids = torch.arange(rows, dtype=torch.int32)
+    out = dispatch.DecodeTarget(core).forward(
+        md, None if embeds else ids, None, ("embeds",) if embeds else None, None, None
+    )
+    assert out == ("hidden", layers - 1)
+    assert seen == [(i, 0, md) for i in range(layers)]
+
+
 def test_uncovered_never_raises_and_logs_once(log) -> None:
     dispatch.set_require(True)
     for _ in range(3):
@@ -413,14 +479,13 @@ def test_uncovered_never_raises_and_logs_once(log) -> None:
 
 
 class _Core:
-    """The parts of the text model ``DecodeTarget._embed`` reads: no embedding owners built."""
+    """The parts of the core ``DecodeTarget``'s embedding and push targets read: no embedding owners built."""
 
     def __init__(self):
-        self._embed_owners = {}
-
-    @staticmethod
-    def embed_tokens(input_ids: torch.Tensor) -> torch.Tensor:
-        return input_ids.to(torch.float32)[:, None].expand(-1, 4)
+        self.embed_owners = {}
+        self.w = {"embed": torch.arange(64 * 4, dtype=torch.float32).view(64, 4)}
+        self.mapping = None
+        self.hidden = 6144
 
 
 @pytest.mark.parametrize("rows", (1, 8))
@@ -429,11 +494,11 @@ def test_embedding_without_its_owner_raises_under_require(rows) -> None:
     with pytest.raises(
         dispatch.FastPathUnavailable, match=rf"'embed_firstnorm'.* {rows} rows.*owner"
     ):
-        DecodeTarget(_Core())._embed(torch.arange(rows, dtype=torch.int32), rows)
+        dispatch.DecodeTarget(_Core())._embed(torch.arange(rows, dtype=torch.int32), rows)
 
 
 def test_embedding_without_its_owner_falls_back_and_logs_once(log) -> None:
-    target = DecodeTarget(_Core())
+    target = dispatch.DecodeTarget(_Core())
     for _ in range(2):
         hidden, residual = target._embed(torch.arange(3, dtype=torch.int32), 3)
     assert residual is None and hidden.shape == (3, 4)
@@ -442,7 +507,7 @@ def test_embedding_without_its_owner_falls_back_and_logs_once(log) -> None:
 
 def test_embedding_past_its_rows_is_uncovered_in_every_mode(log) -> None:
     dispatch.set_require(True)
-    hidden, residual = DecodeTarget(_Core())._embed(torch.arange(9, dtype=torch.int32), 9)
+    hidden, residual = dispatch.DecodeTarget(_Core())._embed(torch.arange(9, dtype=torch.int32), 9)
     assert residual is None and hidden.shape == (9, 4)
     assert len(log.info) == 1 and "embed_firstnorm" in log.info[0] and not log.warning
 
@@ -451,41 +516,35 @@ def test_a_push_without_its_workspace_raises_under_require(monkeypatch) -> None:
     monkeypatch.setattr(m3_mc_allreduce, "get_workspace", lambda mapping, hidden: None)
     dispatch.set_require(True)
     with pytest.raises(dispatch.FastPathUnavailable, match=r"'attn_push'.* 4 rows"):
-        DecodeTarget(_Core())._attn_push_target(_Layer(), 4, 6144)
+        dispatch.DecodeTarget(_Core())._attn_push_target(4)
 
 
 def test_a_push_without_its_workspace_falls_back_and_logs_once(monkeypatch, log) -> None:
     monkeypatch.setattr(m3_mc_allreduce, "get_workspace", lambda mapping, hidden: None)
-    target = DecodeTarget(_Core())
-    assert target._attn_push_target(_Layer(), 4, 6144) is None
-    assert target._moe_push_targets(_Layer(), 4, 6144) is None
-    assert target._attn_push_target(_Layer(), 4, 6144) is None
+    target = dispatch.DecodeTarget(_Core())
+    assert target._attn_push_target(4) is None
+    assert target._moe_push_targets(4) is None
+    assert target._attn_push_target(4) is None
     assert len(log.warning) == 2
     assert "attn_push at 4 rows" in log.warning[0] and "moe_push at 4 rows" in log.warning[1]
 
 
-class _Layer:
-    """The parts of a decoder layer the push targets read."""
-
-    mapping = None
-
-
-def test_every_dispatch_name_the_target_uses_exists() -> None:
-    """A fallback message or selection that names a missing ``dispatch.X`` fails only when that branch runs."""
+def test_the_target_has_no_dispatch_module_left() -> None:
+    """The dispatch tables live in ``modeling.py``: no module of the target still reaches a ``dispatch`` module."""
     target_dir = Path(dispatch.__file__).parent
-    missing = []
+    assert not (target_dir / "dispatch.py").exists()
+    stale = []
     for path in sorted(target_dir.rglob("*.py")):
         for node in ast.walk(ast.parse(path.read_text())):
+            if isinstance(node, ast.ImportFrom) and any(a.name == "dispatch" for a in node.names):
+                stale.append(f"{path.relative_to(target_dir)}:{node.lineno}")
             if (
                 isinstance(node, ast.Attribute)
                 and isinstance(node.value, ast.Name)
                 and node.value.id == "dispatch"
-                and not hasattr(dispatch, node.attr)
             ):
-                missing.append(
-                    f"{path.relative_to(target_dir)}:{node.lineno}: dispatch.{node.attr}"
-                )
-    assert not missing, missing
+                stale.append(f"{path.relative_to(target_dir)}:{node.lineno}: dispatch.{node.attr}")
+    assert not stale, stale
 
 
 # ------------------------------------------------------------------ the fused index score + top-16 select
@@ -499,14 +558,15 @@ class _FssConfig:
     local_blocks = 1
 
 
-def _fss_layer():
-    """What ``M3Attention._fused_score_select`` reads of its layer."""
-    return SimpleNamespace(attn=SimpleNamespace(m3_config=_FssConfig()), layer_idx=5)
+def _fss_core():
+    """What ``DecodeTarget._fused_score_select`` reads of the core: layer 5's MSA backend configuration."""
+    return SimpleNamespace(attn={5: SimpleNamespace(m3_config=_FssConfig())})
 
 
-def _fss_metadata(rows: int, qlen: int, max_tiles: int = 8192, n_valid: bool = True):
-    """A decode span's metadata as the fused score + select reads it (CPU stand-ins, never launched)."""
-    return SimpleNamespace(
+def _fss_step(rows: int, qlen: int, max_tiles: int = 8192, n_valid: bool = True):
+    """A decode span's ``step_args`` entries as the fused score + select reads them (CPU stand-ins, never
+    launched)."""
+    return dict(
         msa_idx_k_cache=lambda layer_idx: torch.zeros(4, 1, 128, 128, dtype=torch.float8_e4m3fn),
         msa_worst_case_max_k_tiles=max_tiles,
         msa_n_valid_blocks=torch.ones(rows * qlen, dtype=torch.int32) if n_valid else None,
@@ -517,8 +577,8 @@ def _fss_metadata(rows: int, qlen: int, max_tiles: int = 8192, n_valid: bool = T
 
 def _fss(rows: int, qlen: int = 4, dtype=torch.float8_e4m3fn, **md):
     idx_q = torch.zeros(rows * qlen, 128, dtype=dtype)
-    return layers.M3Attention._fused_score_select(
-        _fss_layer(), idx_q, _fss_metadata(rows, qlen, **md), rows, qlen, rows * qlen
+    return dispatch.DecodeTarget(_fss_core())._fused_score_select(
+        5, idx_q, _fss_step(rows, qlen, **md), rows, qlen, rows * qlen
     )
 
 
@@ -593,13 +653,22 @@ def _lowm_operands(nk, m: int):
     return weight, torch.zeros(m, k, dtype=torch.bfloat16)
 
 
-def _draft_linear(weight, x, bias=None):
-    return m3_draft_lowm.draft_linear(weight, x, bias)
+_IN_TREE = "the in-tree BF16 GEMM"
+
+
+@pytest.fixture(autouse=True)
+def _in_tree_gemm(monkeypatch):
+    """The in-tree BF16 GEMM a drafter linear falls back to, stubbed (nothing here launches a kernel)."""
+    monkeypatch.setattr(dispatch, "m3_bf16_linear", lambda x, weight: _IN_TREE)
+
+
+def _draft_linear(weight, x):
+    return dispatch._draft_linear(x, weight)
 
 
 @pytest.mark.parametrize("nk", DRAFTER_LINEARS, ids=str)
 def test_draft_linear_without_its_prebuilt_kernel_raises_under_require(monkeypatch, nk) -> None:
-    monkeypatch.setattr(m3_draft_lowm, "_BUILT", set())
+    monkeypatch.setattr(dispatch, "_DRAFT_LOWM_BUILT", set())
     weight, x = _lowm_operands(nk, 1)
     dispatch.set_require(True)
     with pytest.raises(
@@ -611,10 +680,10 @@ def test_draft_linear_without_its_prebuilt_kernel_raises_under_require(monkeypat
 def test_draft_linear_without_its_prebuilt_kernel_falls_back_and_logs_once(
     monkeypatch, log
 ) -> None:
-    monkeypatch.setattr(m3_draft_lowm, "_BUILT", set())
+    monkeypatch.setattr(dispatch, "_DRAFT_LOWM_BUILT", set())
     weight, x = _lowm_operands((6144, 1024), 2)
     for _ in range(2):
-        assert _draft_linear(weight, x) is None
+        assert _draft_linear(weight, x) is _IN_TREE
     assert len(log.warning) == 1 and "m3_draft_lowm at 2 rows" in log.warning[0]
 
 
@@ -632,45 +701,41 @@ def test_draft_linear_on_a_strided_activation_keeps_the_in_tree_gemm(log) -> Non
     wide[:, :1024] = x
     assert not wide[:, :1024].is_contiguous()
     dispatch.set_require(True)
-    assert _draft_linear(weight, wide[:, :1024]) is None
+    assert _draft_linear(weight, wide[:, :1024]) is _IN_TREE
     assert len(log.info) == 1 and not log.warning
 
 
 def test_draft_linear_past_its_rows_is_uncovered_in_every_mode(monkeypatch, log) -> None:
-    monkeypatch.setattr(m3_draft_lowm, "_BUILT", set())
+    monkeypatch.setattr(dispatch, "_DRAFT_LOWM_BUILT", set())
     dispatch.set_require(True)
     weight, x = _lowm_operands((6144, 1024), 3)  # the o_proj table ends at 2 rows
-    assert _draft_linear(weight, x) is None
+    assert _draft_linear(weight, x) is _IN_TREE
     weight, x = _lowm_operands((1280, 12288), 9)
-    assert _draft_linear(weight, x) is None
+    assert _draft_linear(weight, x) is _IN_TREE
     weight, x = _lowm_operands((4096, 1024), 1)  # not a drafter shape
-    assert _draft_linear(weight, x) is None
+    assert _draft_linear(weight, x) is _IN_TREE
     assert len(log.info) == 3 and not log.warning
 
 
-def test_draft_linear_with_a_bias_is_not_taken(monkeypatch, log) -> None:
-    monkeypatch.setattr(m3_draft_lowm, "_BUILT", set())
+def test_draft_linear_on_a_batched_activation_is_uncovered(monkeypatch, log) -> None:
+    monkeypatch.setattr(dispatch, "_DRAFT_LOWM_BUILT", set())
     dispatch.set_require(True)
     weight, x = _lowm_operands((6144, 1024), 1)
-    assert _draft_linear(weight, x, torch.zeros(6144, dtype=torch.bfloat16)) is None
-    assert _draft_linear(weight, x[None]) is None
-    assert not log.info and not log.warning
+    assert _draft_linear(weight, x[None]) is _IN_TREE
+    assert len(log.info) == 1 and not log.warning
 
 
 def test_prebuild_drafter_linears_caps_the_drafter_attention(monkeypatch) -> None:
-    """The drafter attention gets ``DRAFT_DECODE_MAX_SEQ_LEN_BY_BATCH`` and every drafter linear goes to the
-    low-M method before warmup; without a drafter nothing is built."""
-    installed = []
-    monkeypatch.setattr(m3_draft_lowm, "install", lambda dm: installed.append(dm) or 5)
-    monkeypatch.setattr(m3_draft_lowm, "prebuild", lambda dm: 17)
-    worker = spec_worker.M3Eagle3Worker.__new__(spec_worker.M3Eagle3Worker)
-    assert worker.prebuild_drafter_linears(None) == 0 and not installed
+    """The drafter attention gets ``DRAFT_DECODE_MAX_SEQ_LEN_BY_BATCH`` and every covered drafter linear call is
+    compiled before warmup; without a drafter nothing is built."""
+    built = []
+    monkeypatch.setattr(dispatch, "_prebuild_draft_lowm", lambda dm: built.append(dm) or 17)
+    worker = dispatch.M3Eagle3Worker.__new__(dispatch.M3Eagle3Worker)
+    assert worker.prebuild_drafter_linears(None) == 0 and not built
     attn = SimpleNamespace()
-    drafter = SimpleNamespace(
-        model=SimpleNamespace(midlayer=SimpleNamespace(self_attn=SimpleNamespace(attn=attn)))
-    )
+    drafter = SimpleNamespace(attn=attn)
     assert worker.prebuild_drafter_linears(drafter) == 17
-    assert installed == [drafter]
+    assert built == [drafter]
     assert attn.dense_decode_max_seq_len_by_batch is dispatch.DRAFT_DECODE_MAX_SEQ_LEN_BY_BATCH
 
 
@@ -681,23 +746,8 @@ _HIDDEN = 32
 
 
 def _drafter(head_weight=None):
-    """A drafter with only what M3Eagle3Worker._m3_drafter_supported reads: one plain Eagle3 layer with a gated MLP,
-    a whole-table embedding, all-reduced o_proj and down_proj and a vocab-sharded BF16 head (TP8)."""
-    mlp = GatedMLP.__new__(GatedMLP)
-    torch.nn.Module.__init__(mlp)
-    mlp.down_proj = SimpleNamespace(all_reduce=object())
-    layer = SimpleNamespace(
-        _next_layer_regular=False,
-        mlp=mlp,
-        self_attn=SimpleNamespace(o_proj=SimpleNamespace(all_reduce=object())),
-    )
-    model = SimpleNamespace(
-        num_layers=1,
-        _use_mla=False,
-        _eh_proj_before_attn=False,
-        midlayer=layer,
-        embed_tokens=SimpleNamespace(tp_size=1),
-    )
+    """A drafter with only what M3Eagle3Worker._m3_drafter_supported reads: its vocab-sharded BF16 head at TP8 (the
+    drafter's one-layer shape is validated when ``M3Eagle3Draft`` is built)."""
     weight = (
         head_weight
         if head_weight is not None
@@ -706,13 +756,13 @@ def _drafter(head_weight=None):
     lm_head = SimpleNamespace(
         weight=weight, bias=None, tp_mode=TensorParallelMode.COLUMN, padding_size=0, tp_size=8
     )
-    return SimpleNamespace(model=model, lm_head=lm_head)
+    return SimpleNamespace(lm_head=lm_head)
 
 
 def _worker():
     """An M3Eagle3Worker past the step's verify: the fused verify left the first-pass gather rows and the fused
     first draft inputs; nothing else of the in-tree worker is read."""
-    worker = spec_worker.M3Eagle3Worker.__new__(spec_worker.M3Eagle3Worker)
+    worker = dispatch.M3Eagle3Worker.__new__(dispatch.M3Eagle3Worker)
     worker.mapping = SimpleNamespace(tp_size=8, tp_rank=1, enable_attention_dp=False)
     worker._d2t = None
     worker._m3_draft_head = None
@@ -734,9 +784,7 @@ def no_gpu_draft_head(monkeypatch):
 
 def test_draft_loop_without_the_prebuilt_head_raises_under_require(no_gpu_draft_head) -> None:
     dispatch.set_require(True)
-    with pytest.raises(
-        dispatch.FastPathUnavailable, match=r"'m3_draft_step'.* 4 rows.*prebuild_draft_head"
-    ):
+    with pytest.raises(dispatch.FastPathUnavailable, match=r"'m3_draft_step'.* 4 rows.*prebuild"):
         _worker()._m3_fused_loop_ok(_ATTN_MD, _SPEC_MD, 4, _drafter())
 
 
@@ -821,9 +869,7 @@ def test_an_unsupported_drafter_is_uncovered(no_gpu_draft_head, log) -> None:
     worker = _worker()
     padded = _drafter()
     padded.lm_head.padding_size = 16
-    two_layers = _drafter()
-    two_layers.model.num_layers = 2
-    for drafter in (padded, two_layers):
+    for drafter in (padded,):
         assert not worker.prebuild_draft_head(drafter)
         assert not worker._m3_fused_loop_ok(_ATTN_MD, _SPEC_MD, 4, drafter)
     assert log.info and not log.warning
@@ -856,7 +902,7 @@ class _CaptureMetadata:
 
 
 def _fc_early_worker(monkeypatch, eligible: bool = True):
-    worker = spec_worker.M3Eagle3Worker.__new__(spec_worker.M3Eagle3Worker)
+    worker = dispatch.M3Eagle3Worker.__new__(dispatch.M3Eagle3Worker)
     worker._m3_capture_norm = None
     worker._m3_fc_norm_w = None
     worker._m3_fc_early_drafter = None
@@ -883,8 +929,8 @@ def test_no_early_fork_at_tp8(monkeypatch, nreq, eligible) -> None:
     assert worker._m3_fc_early_drafter is None
     for layer_id in md.layers_to_capture:
         worker.capture_hidden_states(md, layer_id, None)
-    worker.capture_hidden_states(md, spec_worker.FINAL_HIDDEN_LAYER_ID, None)
-    assert md.captured == [1, 29, 56, spec_worker.FINAL_HIDDEN_LAYER_ID]
+    worker.capture_hidden_states(md, dispatch.FINAL_HIDDEN_LAYER_ID, None)
+    assert md.captured == [1, 29, 56, dispatch.FINAL_HIDDEN_LAYER_ID]
     assert not forks and worker._m3_fc_early_stream is None
 
 
@@ -893,9 +939,9 @@ def test_no_early_fork_with_a_final_state_capture(monkeypatch) -> None:
     stock place instead of forking at the last captured decoder layer."""
     worker, forks = _fc_early_worker(monkeypatch)
     md = _CaptureMetadata(1)
-    md.layers_to_capture = (spec_worker.FINAL_HIDDEN_LAYER_ID, 29, 56)
+    md.layers_to_capture = (dispatch.FINAL_HIDDEN_LAYER_ID, 29, 56)
     worker.arm_capture_norm(SimpleNamespace(num_seqs=1), md, object(), object())
-    for layer_id in (29, 56, spec_worker.FINAL_HIDDEN_LAYER_ID):
+    for layer_id in (29, 56, dispatch.FINAL_HIDDEN_LAYER_ID):
         worker.capture_hidden_states(md, layer_id, None)
     assert not forks and worker._m3_fc_early_stream is None
 
@@ -903,93 +949,115 @@ def test_no_early_fork_with_a_final_state_capture(monkeypatch) -> None:
 # ------------------------------------------------------------------ the NVFP4 producer's coverage
 
 
+def _producer_core(nvfp4: bool = True, heads: int = 8):
+    """What the producer dispatch reads off the core before its first precondition."""
+    return SimpleNamespace(main_kv_is_nvfp4=nvfp4, heads=heads, kv_heads=1, index_heads=1)
+
+
 def test_the_producer_covers_the_tp8_nvfp4_layers_only() -> None:
-    """``dispatch.PRODUCER`` covers a sparse layer on an NVFP4 cache at the TP8 heads (8 query, one KV and one
-    index head); elsewhere the built-in producers run without a miss."""
-    covered = layers.producer_pw_covered
-    assert covered(True, 8, 1, 1)
-    assert not covered(False, 8, 1, 1)
-    assert not covered(True, 16, 1, 1)
-    assert not covered(True, 8, 2, 2)
+    """``PRODUCER`` covers a sparse layer on an NVFP4 cache at the TP8 heads (8 query, one KV and one index head);
+    elsewhere the generic producer runs without a miss."""
+    covered = dispatch._producer_covered
+    assert covered(_producer_core())
+    assert not covered(_producer_core(nvfp4=False))
+    assert not covered(_producer_core(heads=16))
+    assert not covered(SimpleNamespace(main_kv_is_nvfp4=True, heads=8, kv_heads=2, index_heads=2))
     assert dispatch.PRODUCER.keys == frozenset({"nvfp4_tp8"})
     assert dispatch.PRODUCER.covers("nvfp4_tp8")
     assert not dispatch.PRODUCER.covers("nvfp4_tp4")
 
 
-class _FakeMsaAttn:
-    indexer_kv_dtype = "fp8"
-
-
-def _producer_layer(monkeypatch, nvfp4: bool = True, heads: int = 8):
-    """What the producer dispatch reads before its first precondition: a fused-projection MSA sparse layer."""
-    monkeypatch.setattr(layers, "MiniMaxM3MsaSparseAttention", _FakeMsaAttn)
-    return SimpleNamespace(
-        enable_fused_qkv_index_projection=True,
-        attn=_FakeMsaAttn(),
-        main_kv_is_fp8=not nvfp4,
-        main_kv_is_nvfp4=nvfp4,
-        num_heads=heads,
-        num_key_value_heads=1,
-        sparse_num_index_heads=1,
-        pos_embd_params=None,
-    )
-
-
-def _produce(layer):
+def _produce(core):
     # The packed TP8 projection: 8 query heads, K, V, index Q and index K of 128 each.
     packed = torch.zeros(4, 12 * 128, dtype=torch.bfloat16)
-    return layers.M3Attention._fused_fp8_qkv_indexer_norm_rope_kv_insert(
-        layer, packed, None, SimpleNamespace()
-    )
+    return dispatch._sparse_qkv_producer(core, 3, packed, None, None, None, None)
 
 
-def test_a_covered_producer_layer_missing_a_precondition_raises_under_require(monkeypatch) -> None:
+def test_a_covered_producer_layer_missing_a_precondition_raises_under_require() -> None:
     """A TP8 NVFP4 sparse layer whose step lacks a producer precondition (here the position ids) is a miss."""
     dispatch.set_require(True)
     with pytest.raises(
         dispatch.FastPathUnavailable, match=r"'m3_producer' covers this step at 4 rows"
     ):
-        _produce(_producer_layer(monkeypatch))
+        _produce(_producer_core())
 
 
-def test_a_covered_producer_layer_without_the_fused_projection_raises_under_require(
-    monkeypatch,
-) -> None:
-    layer = _producer_layer(monkeypatch)
-    layer.enable_fused_qkv_index_projection = False
+def _runtime(fused: bool, indexer: str = "fp8", kv: str = "fp8"):
+    """A model config with the runtime fields ``_validate_runtime`` reads."""
+    sparse = SimpleNamespace(
+        algorithm="minimax_m3",
+        implementation="msa",
+        fuse_qkv_index_projection=fused,
+        indexer_kv_dtype=indexer,
+    )
+    mode = SimpleNamespace(
+        has_fp8_kv_cache=lambda: kv == "fp8", has_fp4_kv_cache=lambda: kv == "nvfp4"
+    )
+    return SimpleNamespace(
+        sparse_attention_config=sparse, quant_config=SimpleNamespace(quant_mode=mode)
+    )
+
+
+@pytest.mark.parametrize("fused", [True, False], ids=["five_way", "unfused"])
+def test_the_target_takes_both_projection_layouts(fused) -> None:
+    """The packed five-way projection and the separate QKV + BF16 index projections
+    (fuse_qkv_index_projection=False) are both this target's; a BF16 indexer or a BF16 KV cache is not."""
+    dispatch._validate_runtime(_runtime(fused))
+    dispatch._validate_runtime(_runtime(fused, kv="nvfp4"))
+    with pytest.raises(ValueError, match="indexer_kv_dtype='fp8'"):
+        dispatch._validate_runtime(_runtime(fused, indexer="bf16"))
+    with pytest.raises(ValueError, match="FP8 or NVFP4 KV cache"):
+        dispatch._validate_runtime(_runtime(fused, kv="bf16"))
+
+
+@pytest.mark.parametrize("target", ["PrefillTarget", "DecodeTarget"])
+def test_an_unfused_layer_the_producer_covers_is_a_miss(target) -> None:
+    """As the built-in target: a layer the NVFP4 producer covers needs the five-way projection, so the unfused path is
+    a miss there (raised under require) before anything runs, in either target."""
     dispatch.set_require(True)
+    attention = getattr(dispatch, target)(_producer_core())._unfused_sparse_attention
     with pytest.raises(dispatch.FastPathUnavailable, match="fuse_qkv_index_projection is disabled"):
-        layers.M3Attention._check_producer_projection(layer)
+        if target == "PrefillTarget":
+            attention(3, None, None, None)
+        else:
+            attention(3, None, None, None, None)
 
 
-def test_an_uncovered_layer_without_the_fused_projection_is_not_a_miss(monkeypatch) -> None:
-    layer = _producer_layer(monkeypatch, nvfp4=False)
-    layer.enable_fused_qkv_index_projection = False
-    dispatch.set_require(True)
-    layers.M3Attention._check_producer_projection(layer)
-
-
-def test_a_covered_producer_miss_falls_back_and_logs_once(monkeypatch, log) -> None:
-    layer = _producer_layer(monkeypatch)
-    assert _produce(layer) is None and _produce(layer) is None
+def test_a_covered_producer_miss_falls_back_and_logs_once(log) -> None:
+    core = _producer_core()
+    assert _produce(core) is None and _produce(core) is None
     assert len(log.warning) == 1 and "m3_producer at 4 rows" in log.warning[0]
 
 
 @pytest.mark.parametrize("nvfp4,heads", [(False, 8), (True, 16)], ids=["fp8_cache", "tp4_heads"])
-def test_an_uncovered_producer_layer_falls_back_silently(monkeypatch, log, nvfp4, heads) -> None:
+def test_an_uncovered_producer_layer_falls_back_silently(log, nvfp4, heads) -> None:
     dispatch.set_require(True)
-    assert _produce(_producer_layer(monkeypatch, nvfp4, heads)) is None
+    assert _produce(_producer_core(nvfp4, heads)) is None
     assert not log.warning
 
 
 def test_a_covered_producer_layer_with_the_wrong_pool_layout_is_not_supported() -> None:
-    """The pool-layout check the covered branch takes before the native fallback (then a miss)."""
+    """The pool-layout check the covered branch takes before the generic producer (then a miss)."""
     pool = torch.zeros(4, 2, 1, 128, 32, dtype=torch.uint8)
     scales = torch.zeros(4, 2, 1, 128, 8, dtype=torch.uint8)
-    assert not layers.producer_pw_supported(8, 1, 1, pool, scales)
+    assert not dispatch._producer_layout(pool, scales)
     good = torch.zeros(4, 2, 1, 128, 64, dtype=torch.uint8)
-    assert layers.producer_pw_supported(8, 1, 1, good, scales)
-    assert not layers.producer_pw_supported(16, 1, 1, good, scales)
-    assert not layers.producer_pw_supported(
-        8, 1, 1, good, scales.transpose(3, 4).contiguous().transpose(3, 4)
-    )
+    assert dispatch._producer_layout(good, scales)
+    assert not dispatch._producer_layout(good, scales.transpose(3, 4).contiguous().transpose(3, 4))
+
+
+# ------------------------------------------------------------------ the shell's speculative plumbing
+
+
+def test_the_shell_installs_guided_decoding_on_the_worker() -> None:
+    """With speculation the guided decoder goes to the worker (the in-tree one-engine shell's delegation); without a
+    worker the shell reports it cannot take one."""
+    shell_cls = dispatch.ModelingV2MiniMaxM3Nvfp4Sm103Tp8
+    shell = shell_cls.__new__(shell_cls)
+    torch.nn.Module.__init__(shell)
+    installed = []
+    shell.spec_worker = SimpleNamespace(set_guided_decoder=lambda g: installed.append(g) or True)
+    decoder = object()
+    assert shell.set_guided_decoder(decoder) and installed == [decoder]
+    shell.spec_worker = None
+    assert shell.set_guided_decoder(decoder) is False

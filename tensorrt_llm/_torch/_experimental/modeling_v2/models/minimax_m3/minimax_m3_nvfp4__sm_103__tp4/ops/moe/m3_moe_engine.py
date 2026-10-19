@@ -10,7 +10,12 @@ from typing import Optional
 import torch
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
-from tensorrt_llm._torch.cute_dsl_kernels.minimax_m3.moe.op import (
+from tensorrt_llm.quantization.utils.fp4_utils import (
+    get_reorder_rows_for_gated_act_gemm_row_indices,
+    get_shuffle_matrix_a_row_indices,
+)
+
+from ...kernels.m3_moe.op import (
     HIDDEN,
     INTER,
     SHARED_INTER,
@@ -19,10 +24,6 @@ from tensorrt_llm._torch.cute_dsl_kernels.minimax_m3.moe.op import (
     M3MoeState,
     ar_push_desc,
     is_supported,
-)
-from tensorrt_llm.quantization.utils.fp4_utils import (
-    get_reorder_rows_for_gated_act_gemm_row_indices,
-    get_shuffle_matrix_a_row_indices,
 )
 
 __all__ = [

@@ -15,9 +15,9 @@ log-domain recurrence. Accumulation order inside the MMAs and the reductions dif
 not bit for bit.
 
 Schedule: the kernel releases its PDL dependents right after its grid wait, so the o_proj launches and streams its
-weights while attention runs. Up to ``dispatch.LC8_PREWAIT_MAX_ROWS`` query rows it also stages the request length,
-the query rows and the request's block-table row before that wait, overlapping them with the select ahead when it
-releases this grid early (``dispatch.SELECT_EARLY_MAX_ROWS``). Neither changes a value.
+weights while attention runs. Up to ``LC8_PREWAIT_MAX_ROWS`` (modeling.py) query rows it also stages the request
+length, the query rows and the request's block-table row before that wait, overlapping them with the select ahead
+when it releases this grid early (``SELECT_EARLY_MAX_ROWS`` in modeling.py). Neither changes a value.
 
 Geometry: 8 query heads per KV head (TP8), one KV head, head_dim 128, page 128, top-k 16. The kernel is
 ``torch.ops.trtllm.minimax_m3_tp8_sparse_decode_lc8``, called through this target's ``m3_sparse_decode_lc8`` entry.
@@ -25,8 +25,14 @@ Geometry: 8 query heads per KV head (TP8), one KV head, head_dim 128, page 128, 
 
 import torch
 
-from .. import dispatch
 from ..ops.attention.m3_sparse_decode_lc8 import NUM_HEADS, WIDTH, m3_sparse_decode_lc8
+
+
+def _prewait_max_rows() -> int:
+    """``LC8_PREWAIT_MAX_ROWS`` of the target's dispatch (imported at call time: modeling imports this module)."""
+    from .. import modeling
+
+    return modeling.LC8_PREWAIT_MAX_ROWS
 
 
 def lc8_applies(q, k_paged, v_paged, topk_idx, k_block_scale, v_block_scale, output) -> bool:
@@ -106,5 +112,5 @@ def m3_lc8_attn(
         float(sm_scale),
         bool(linear_softmax),
         bool(use_pdl),
-        total_q <= dispatch.LC8_PREWAIT_MAX_ROWS,
+        total_q <= _prewait_max_rows(),
     )

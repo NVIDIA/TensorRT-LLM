@@ -57,7 +57,7 @@ from tensorrt_llm._torch.memory_buffer_utils import get_memory_buffers
 from . import m3_attn_lc, m3_prequant
 
 # One sparse block is exactly one KV page.
-SPARSE_BLOCK_SIZE = 128
+SPARSE_BLOCK_SIZE = 128  # capacity: fixed: the MSA block size of the checkpoint
 
 _FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
 
@@ -68,7 +68,7 @@ _TL_DTYPES = {
 }
 
 # Total CTAs the split-K partitioning aims for before it stops splitting.
-_TARGET_GRID = 256
+_TARGET_GRID = 256  # capacity: fixed: a launch-grid target, not a size
 
 # NVFP4 quantizes in groups of 16 cache elements along head_dim, one E4M3 scale
 # byte each; see the fp4_quantize call in msa_scatter.fused_write_layer_caches_nvfp4.
@@ -77,7 +77,7 @@ NVFP4_SF_VEC_SIZE = 16
 
 # Fewest query rows for which the merge writes the MXFP8 o_proj hand-off: every decode step, so the MXFP8 o_proj
 # never runs its own quantize kernel after attention.
-MERGE_MXFP8_MIN_TOKENS = 1
+MERGE_MXFP8_MIN_TOKENS = 1  # capacity: fixed: a row lower bound
 
 
 class MergeMxfp8:
@@ -89,7 +89,7 @@ class MergeMxfp8:
     merge rewrites it, in stream order.
     """
 
-    MAX_ROWS = 128
+    MAX_ROWS = 128  # capacity: fixed: the merge hand-off's rows (decode steps)
 
     def __init__(self):
         self._buffers = {}
@@ -1176,7 +1176,7 @@ def _check_nvfp4_inputs(
 
 # Multi-query producer (triton_sparse_decode_mq) for identity-selection verify steps with at least this many query
 # tokens; below it the per-token producer is as fast.
-MQ_MIN_TOKENS = 17
+MQ_MIN_TOKENS = 17  # capacity: fixed: the multi-query producer's crossover
 # Warps per multi-query producer program.
 MQ_NUM_WARPS = 8
 

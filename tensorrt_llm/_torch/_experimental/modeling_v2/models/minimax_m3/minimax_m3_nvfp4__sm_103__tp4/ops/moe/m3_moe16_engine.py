@@ -11,9 +11,9 @@ from typing import Optional
 import torch
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
-from tensorrt_llm._torch.cute_dsl_kernels.minimax_m3.moe.op import M3MoeLayer
-from tensorrt_llm._torch.cute_dsl_kernels.minimax_m3.moe.op16 import M3Moe16State
 
+from ...kernels.m3_moe.op import M3MoeLayer
+from ...kernels.m3_moe.op16 import M3Moe16State
 from .m3_moe_engine import moe_reference
 
 __all__ = ["M3Moe16State", "m3_moe16_engine"]

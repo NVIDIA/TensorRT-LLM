@@ -10,11 +10,9 @@ from unittest import mock
 
 import pytest
 import torch
-from torch import nn
 
 from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_103__tp4 import (  # noqa: E501
-    dispatch,
-    layers,
+    modeling,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_103__tp4.kernels import (  # noqa: E501
     m3_mc_allreduce as mc,
@@ -23,10 +21,10 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_
 
 @pytest.fixture(autouse=True)
 def _restore_modes():
-    require = dispatch.require_mode()
+    require = modeling.require_mode()
     yield
-    dispatch.set_require(require)
-    dispatch.reset_logged()
+    modeling.set_require(require)
+    modeling.reset_logged()
 
 
 @pytest.mark.parametrize("finalize", [False, True])
@@ -129,52 +127,45 @@ def test_tp_agree_built_two_ranks(two_rank_comm, oks):
     assert out == (built if all(oks) else [None, None])
 
 
-def _moe(layer_idx: int, fail: bool) -> layers.M3MoE:
-    """An M3MoE on two simulated TP ranks whose engine builds are stubbed (and fail on one)."""
+def _core(fail: bool) -> SimpleNamespace:
+    """The engine-building half of the core (``MiniMaxM3Tp4ModelingV2``) on one of two simulated TP ranks, its
+    engine builds stubbed (and failing on one rank)."""
+    core = SimpleNamespace(mapping=_mapping(2), moe_engines={}, moe16_engines={})
+    cls = modeling.MiniMaxM3Tp4ModelingV2
 
-    def stock_init(self, model_config, aux_stream_dict, layer_idx=None):
-        nn.Module.__init__(self)
-        self.mapping = _mapping(2)
-        self.shared_experts = None
-
-    with mock.patch.object(layers.MiniMaxM3MoE, "__init__", stock_init):
-        moe = layers.M3MoE(None, {}, layer_idx)
-    moe.shared_experts = object()
-
-    def build(num_tokens, shared=True):
+    def build(i, num_tokens, shared=True):
         if fail:
             raise RuntimeError("compile failed on this rank")
         return ("engine", num_tokens)
 
-    moe._build_engine = build
-    moe._build_moe16_engine = lambda num_tokens: build(num_tokens)
-    return moe
+    core._build_engine = build
+    core._build_moe16_engine = lambda i, num_tokens: build(i, num_tokens)
+    for name in ("_prebuild_engines", "_try_build", "engine", "moe16_engine", "_lookup"):
+        setattr(core, name, getattr(cls, name).__get__(core))
+    return core
 
 
 @pytest.mark.parametrize("fail", [(False, False), (False, True)])
 def test_engine_build_agreed_across_ranks(two_rank_comm, fail):
-    moes = [_moe(3, f) for f in fail]
-    _run_ranks([m.prebuild_engines for m in moes])
-    keys = sorted(moes[0]._engines) + sorted(moes[0]._moe16_engines)
+    cores = [_core(f) for f in fail]
+    _run_ranks([lambda c=c: c._prebuild_engines(3) for c in cores])
+    keys = sorted(cores[0].moe_engines[3]) + sorted(cores[0].moe16_engines[3])
     assert keys and two_rank_comm.calls == 2 * len(keys)
-    for engines in ("_engines", "_moe16_engines"):
-        a, b = getattr(moes[0], engines), getattr(moes[1], engines)
+    for engines in ("moe_engines", "moe16_engines"):
+        a, b = getattr(cores[0], engines)[3], getattr(cores[1], engines)[3]
         assert a.keys() == b.keys()
         for key in a:
             assert (a[key] is None) == (b[key] is None) == any(fail), (engines, key)
-    # Both ranks then take the same path in the forward: the engine, or (after a miss) the built-in MoE.
-    dispatch.set_require(False)
-    for n in sorted(dispatch.MOE_ENGINE.keys):
-        got = [m.engine(n, shared=True) for m in moes]
+    # Both ranks then take the same path in the forward: the engine, or (after a miss) the generic MoE.
+    modeling.set_require(False)
+    for n in sorted(modeling.MOE_ENGINE.keys):
+        got = [c.engine(3, n, shared=True) for c in cores]
         assert (got[0] is None) == (got[1] is None)
 
 
 @pytest.mark.parametrize("capturing", [False, True])
 def test_fc_join_records_output_on_main(monkeypatch, capturing):
-    from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_103__tp4.spec_worker import (  # noqa: E501
-        M3Eagle3Worker,
-    )
-
+    M3Eagle3Worker = modeling.M3Eagle3Worker
     main, fork = mock.Mock(name="main"), mock.Mock(name="fork")
     hidden = mock.Mock(name="hidden", is_cuda=True)
     monkeypatch.setattr(torch.cuda, "current_stream", lambda *a: main)

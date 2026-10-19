@@ -25,7 +25,6 @@ from typing import Optional
 
 import torch
 
-from .. import dispatch
 from ..ops.spec.m3_draft_step import MAX_TILES_PER_CTA, MAX_TOKENS, bf16_fragments
 from ..ops.spec.m3_draft_step import m3_draft_step as _draft_step_op
 from .m3_shard_accept import AcceptWorkspace, create_workspace
@@ -79,13 +78,13 @@ def _num_sms() -> int:
 
 
 def workspace(mapping, device) -> Optional[AcceptWorkspace]:
-    """The exchange workspace ([2][MAX_TOKENS][world] slots), created collectively on the first eager call; a
-    CUDA-graph capture that finds it missing is a miss."""
+    """The exchange workspace ([2][MAX_TOKENS][world] slots), created collectively on the first eager call; None
+    during a CUDA-graph capture that finds it missing."""
     global _WS
     if _WS is not None:
         return _WS
     if torch.cuda.is_current_stream_capturing():
-        dispatch.capture_missed(dispatch.DRAFT_STEP.path, None, "the draft-step exchange workspace")
+        # A capture that finds it missing is the caller's miss (it is built on the eager steps).
         return None
     _WS = create_workspace(mapping, device, MAX_TOKENS)
     return _WS

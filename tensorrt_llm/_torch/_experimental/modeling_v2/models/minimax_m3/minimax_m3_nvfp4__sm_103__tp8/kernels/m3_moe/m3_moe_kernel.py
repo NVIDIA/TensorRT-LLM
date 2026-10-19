@@ -62,7 +62,7 @@ def _cfg(key: str, default):
 # =============================================================================
 # Problem shape (trace-time constants).
 # =============================================================================
-H = 6144
+H = 6144  # capacity: fixed: the checkpoint's hidden size
 # routed intermediate per rank: 768 at TP4, 384 at TP8 (FC2 K = 1.5 256-K tiles: the last tile's A box is half out
 # of bounds, zero-filled by TMA, and only its first KB2_LAST K-64 MMAs / scale atoms are issued; no padding, no extra
 # bytes)
@@ -70,7 +70,7 @@ I_TP = _cfg("i_tp", 768)
 TWO_I = 2 * I_TP
 assert I_TP % 128 == 0 and 128 <= I_TP <= 768, I_TP
 E_LOCAL = 128
-TOP_K = 4
+TOP_K = 4  # capacity: fixed: the checkpoint's top-k
 ROUTE_SCALE = 2.0
 SUM_EPS = 1e-20
 M_MAX = _cfg("m_max", 1)
@@ -91,7 +91,7 @@ G_CAP = TOP_K * M_MAX  # distinct experts per call
 NG_CAP = M_MAX  # groups of 4 slots
 XW = _cfg("xw", 5 if M_MAX > 4 else (4 if M_MAX > 2 else 1))  # FC2 B builder warps: 5, then 8 ..
 THREADS = 256 + 32 * (XW - 1)
-GEMV_THREADS = 256
+GEMV_THREADS = 256  # capacity: fixed: the CTA size
 # SHARED: the MoE's shared expert (MXFP8 gate_up [1536, 6144] -> SwiGLU-OAI -> MXFP8 down [6144, 768]) on NSH more
 # CTAs (warps 0-3), its output added in finalize: out = bf16(shared + routed) (shared_output.add_(routed_output)).
 # The math is mxfp8_low_m_gemm's (native MXFP8 activation quant, mma.sync m16n8k32 e4m3 per 32-K block, block scales
@@ -119,12 +119,14 @@ SH_ROWS = SH_I // 24
 # gate_up K slices (= m3_mx_gemv's cluster ranks, contiguous K ranges)
 SH_SPLIT = 128 // (2 * SH_ROWS)
 SH_NB = 8 * SH_SPLIT  # gate_up B rows (8 q + t: token t's slice-q k-tile) = its MMA N
-SH_KB = H // 32  # gate_up K blocks
-SH_DKB = SH_I // 32  # down K blocks
+SH_KB = H // 32  # gate_up K blocks  # capacity: fixed: a kernel tile constant
+SH_DKB = SH_I // 32  # down K blocks  # capacity: fixed: a kernel tile constant
 SH_DKT = SH_I // 128  # down k-tiles
-SH_GT = SH_KB // 4 // SH_SPLIT  # gate_up k-tiles (128 K) per slice
+# Gate_up k-tiles (128 K) per slice.
+SH_GT = SH_KB // 4 // SH_SPLIT  # capacity: fixed: a kernel tile constant
 SH_STAGES_GU = SH_GT
-SH_STAGES = SH_GT + 2 * SH_DKT  # + 2 down tiles x SH_DKT k-tiles
+# + 2 down tiles x SH_DKT k-tiles.
+SH_STAGES = SH_GT + 2 * SH_DKT  # capacity: fixed: pipeline stages
 SHX_BAR = 6
 # SH_PRETILE: the shared weights come pre-tiled (op._pretile_shared): per shared CTA its SH_STAGES stages, each the
 # 16 KB shared-memory image of its 128-row MMA tile (128-byte swizzle) followed by the stage's 512-byte instruction
@@ -149,14 +151,14 @@ R1 = 32
 C1 = 4
 U1 = TWO_I // R1  # 48 units per slot
 K1_TILES = H // 256
-S1 = K1_TILES // C1  # 6 stages per unit
-NUM_BYTES_A = MMA_M * KT_BYTES
+S1 = K1_TILES // C1  # 6 stages per unit  # capacity: fixed: pipeline stages
+NUM_BYTES_A = MMA_M * KT_BYTES  # capacity: fixed: a stage's operand bytes
 NUM_BYTES_BOX1 = R1 * KT_BYTES
 SF1_KA = H // 64
 SF1_RB = TWO_I // 128
 NUM_BYTES_SFA_RAW = 16 * 512
 NUM_WORDS_SFA_RAW = NUM_BYTES_SFA_RAW // 4
-NUM_BYTES_SFA = NUM_KB * 512
+NUM_BYTES_SFA = NUM_KB * 512  # capacity: fixed: a stage's scale bytes
 NUM_WORDS_SFA = NUM_BYTES_SFA // 4
 NUM_BYTES_B1 = N1 * KT_BYTES
 NUM_SFB1_ATOMS = S1 * NUM_KB
@@ -186,7 +188,7 @@ H_ROW = UNITS_ROW * 16
 HB_REPL = _cfg("hb_repl", 1)
 assert 1 <= HB_REPL <= 32, HB_REPL  # (copy i is written by lane i)
 HB_STRIDE = (G_CAP * M_MAX * UNITS_ROW * 4 + 255) // 256 * 256 + 32
-PARTIAL_EMPTY = -1
+PARTIAL_EMPTY = -1  # capacity: fixed: a sentinel, not a size
 EPI_THREADS = 128
 EPI_BAR = 1
 ROUTE_BAR = 2
@@ -229,11 +231,12 @@ B2IMG_NS = _cfg("b2img_ns", 16)  # (B2IMG) counter poll back-off
 B2_DLY = _cfg(
     "b2_dly", 0
 )  # (stress) the release warp spins up to this many ns (CTA- and group-dependent) first
-W_WARP = 4
-X_WARP = 5
-S_WARP = 6
-MMA_WARP = 7
-E0_WARP = MMA_WARP  # (M <= 3) the early stages are issued by the idle MMA warp, not by warp 4 (routing's critical path)
+W_WARP = 4  # capacity: fixed: a warp role index
+X_WARP = 5  # capacity: fixed: a warp role index
+S_WARP = 6  # capacity: fixed: a warp role index
+MMA_WARP = 7  # capacity: fixed: a warp role index
+# (M <= 3) the early stages are issued by the idle MMA warp, not by warp 4 (routing's critical path).
+E0_WARP = MMA_WARP  # capacity: fixed: a warp role index
 E0_BAR = 8
 E1_BAR = 9
 E0_OFFLOAD = EARLY0 and NRW0 <= 3 and bool(_cfg("e0_off", 1))
@@ -308,8 +311,8 @@ SH_ACC_GU = 0
 SH_ACC_DN = SH_NB
 SH_SFA = SH_ACC_DN + 16
 SH_SFB_GU = SH_SFA + 4 * 8
-SH_SFB_DN = SH_SFB_GU + 4 * SH_GT
-SH_TMEM = 256
+SH_SFB_DN = SH_SFB_GU + 4 * SH_GT  # capacity: fixed: a kernel tile constant
+SH_TMEM = 256  # capacity: fixed: TMEM columns
 if SHARED:
     assert FUSED_ROUTER, "shared expert: fused router only"
     assert SH_STAGES - SH_NST <= 64, SH_STAGES

@@ -20,7 +20,7 @@ from ..ops.moe.m3_router_gemv_fp4 import m3_router_gemv_fp4 as _router_gemv_fp4_
 from ..ops.moe.m3_router_tc import m3_router_tc as _router_tc_op
 
 # Opt-in dynamic shared memory left after the kernel's static reduction buffer (SM100: 227 KiB).
-_MAX_DYNAMIC_SMEM = 227 * 1024 - 1024
+_MAX_DYNAMIC_SMEM = 227 * 1024 - 1024  # capacity: fixed: the device's shared-memory limit
 
 
 def m3_router_gemv(

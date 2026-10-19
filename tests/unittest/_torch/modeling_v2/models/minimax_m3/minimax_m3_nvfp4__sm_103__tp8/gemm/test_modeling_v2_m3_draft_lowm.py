@@ -3,22 +3,19 @@
 """GPU test for the gemm/m3_draft_lowm entry: the Eagle3 drafter's BF16 linears on FlashInfer's fixed-tactic low-M
 kernels (direct SIMT and split-K tensor-core), at the TP8 drafter shards.
 
-Every cell is held to the fp64 reference within the derived band. The target's linear method
-(``kernels/m3_draft_lowm.DraftLowMLinearMethod``) is held on a real ``Linear`` (BF16, no bias): a covered row count is
-the entry's call bit for bit, an uncovered one the in-tree method's.
+Every cell is held to the fp64 reference within the derived band. The target's drafter linear (``_draft_linear`` in
+modeling.py) is held on real BF16 weights: a covered row count is the entry's call bit for bit, an uncovered one the
+in-tree BF16 GEMM's (``m3_bf16_linear``).
 """
 
 import zlib
+from types import SimpleNamespace
 
 import pytest
 import torch
-from torch import nn
 
 from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_103__tp8 import (  # noqa: E501
-    dispatch,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_103__tp8.kernels import (  # noqa: E501
-    m3_draft_lowm,
+    modeling as dispatch,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_103__tp8.ops.gemm.m3_draft_lowm import (  # noqa: E501
     TACTICS,
@@ -28,7 +25,6 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_
     m3_draft_lowm as op,
 )
 from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
-from tensorrt_llm._torch.modules.linear import Linear, UnquantizedLinearMethod
 
 __extra_import_path__ = ["../../../.."]
 from _validating import assert_within_ulp, certifying, validating  # noqa: E402, F401
@@ -103,79 +99,45 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — pytest res
     assert torch.equal(plain.view(torch.int16), out.view(torch.int16))
 
 
-def _linear(nk, seed: int, bias: bool = False) -> Linear:
-    n, k = nk
-    linear = Linear(k, n, bias=bias, dtype=torch.bfloat16).cuda()
-    _, w = build(n, k, 1, seed)
-    linear.weight.data.copy_(w)
-    if bias:
-        linear.bias.data.zero_()
-    return linear
-
-
-class _Drafter(nn.Module):
-    """A module tree holding drafter linears, as ``install`` / ``prebuild`` walk it."""
-
-    def __init__(self, *linears: Linear):
-        super().__init__()
-        self.linears = nn.ModuleList(linears)
+def _drafter(weight: torch.Tensor):
+    """A drafter whose every linear is ``weight`` (``_prebuild_draft_lowm`` compiles per distinct shape)."""
+    return SimpleNamespace(w={key: weight for key in ("qkv", "o", "gu", "dn", "fc")})
 
 
 @pytest.mark.parametrize("nk", sorted(DRAFTER_LINEARS), ids=lambda nk: DRAFTER_LINEARS[nk])
-def test_the_linear_method_is_the_entry_and_falls_back_past_its_rows(nk) -> None:
+def test_the_drafter_linear_is_the_entry_and_falls_back_past_its_rows(nk) -> None:
     n, k = nk
-    linear = _linear(nk, seed=n + k)
-    drafter = _Drafter(linear)
-    assert m3_draft_lowm.install(drafter) == 1
-    assert isinstance(linear.quant_method, m3_draft_lowm.DraftLowMLinearMethod)
-    m3_draft_lowm.prebuild(drafter)
+    _, weight = build(n, k, 1, seed=n + k)
+    dispatch._prebuild_draft_lowm(_drafter(weight))
     use_pdl = get_env_enable_pdl()
     last = TACTICS[nk][-1][0]
     dispatch.set_require(True)
     for m in range(1, last + 1):
         assert dispatch.DRAFT_LOWM.covers((nk, m))
         x, _ = build(n, k, m, seed=m)
-        got = linear.quant_method.apply(linear, x, None)
+        got = dispatch._draft_linear(x, weight)
         kind, tactic = tactic_for(n, k, m)
-        want = op(
-            x, linear.weight, torch.empty(m, n, dtype=x.dtype, device="cuda"), kind, tactic, use_pdl
-        )
+        want = op(x, weight, torch.empty(m, n, dtype=x.dtype, device="cuda"), kind, tactic, use_pdl)
         assert torch.equal(got.view(torch.int16), want.view(torch.int16)), m
-        assert torch.equal(linear(x).view(torch.int16), want.view(torch.int16)), m
-    # Past the table: the in-tree method, silently, even under require.
+    # Past the table: the in-tree BF16 GEMM, even under require.
     for m in (last + 1, 2 * last + 3):
         assert not dispatch.DRAFT_LOWM.covers((nk, m))
         x, _ = build(n, k, m, seed=m)
-        got = linear.quant_method.apply(linear, x, None)
-        stock = UnquantizedLinearMethod().apply(linear, x, None)
+        got = dispatch._draft_linear(x, weight)
+        stock = dispatch.m3_bf16_linear(x, weight)
         assert torch.equal(got.view(torch.int16), stock.view(torch.int16)), m
 
 
-def test_install_takes_only_covered_bias_free_bf16_linears() -> None:
-    covered = _linear((6144, 1024), seed=1)
-    biased = _linear((6144, 1024), seed=2, bias=True)
-    other = _linear((256, 512), seed=3)
-    drafter = _Drafter(covered, biased, other)
-    assert m3_draft_lowm.install(drafter) == 1
-    assert isinstance(covered.quant_method, m3_draft_lowm.DraftLowMLinearMethod)
-    assert type(biased.quant_method) is UnquantizedLinearMethod
-    assert type(other.quant_method) is UnquantizedLinearMethod
-    # A second install finds nothing left to take.
-    assert m3_draft_lowm.install(drafter) == 0
-
-
 def test_a_covered_call_not_prebuilt_raises_under_require(monkeypatch) -> None:
-    monkeypatch.setattr(m3_draft_lowm, "_BUILT", set())
-    linear = _linear((6144, 1024), seed=4)
-    m3_draft_lowm.install(_Drafter(linear))
-    x, _ = build(6144, 1024, 1, seed=5)
+    monkeypatch.setattr(dispatch, "_DRAFT_LOWM_BUILT", set())
+    x, weight = build(6144, 1024, 1, seed=5)
     dispatch.set_require(True)
     with pytest.raises(dispatch.FastPathUnavailable, match="not compiled before warmup"):
-        linear.quant_method.apply(linear, x, None)
-    # Outside require it falls back to the in-tree method.
+        dispatch._draft_linear(x, weight)
+    # Outside require it falls back to the in-tree BF16 GEMM.
     dispatch.set_require(False)
-    got = linear.quant_method.apply(linear, x, None)
-    stock = UnquantizedLinearMethod().apply(linear, x, None)
+    got = dispatch._draft_linear(x, weight)
+    stock = dispatch.m3_bf16_linear(x, weight)
     assert torch.equal(got.view(torch.int16), stock.view(torch.int16))
 
 

@@ -40,11 +40,13 @@ import cutlass.experimental.cuda as cuda
 from cutlass import dsl_user_op
 from cutlass.experimental import primitives as prims
 
-CTA_M = 128  # weight rows per CTA = the MMA's M
+CTA_M = 128  # weight rows per CTA = the MMA's M  # capacity: fixed: a kernel tile constant
 MMA_N = 8  # token columns
-CTA_K = 128  # one k-tile: 128 E4M3 bytes per row = one 128-byte swizzle row
+CTA_K = 128  # one k-tile: 128 E4M3 bytes per row = one 128-byte swizzle row  # capacity: fixed: a kernel tile constant
 MMA_INST_K = 32
-K_BLOCKS = CTA_K // MMA_INST_K  # 4 MMAs per k-tile, one per scale byte of the atom
+K_BLOCKS = (
+    CTA_K // MMA_INST_K
+)  # 4 MMAs per k-tile, one per scale byte of the atom  # capacity: fixed: a kernel tile constant
 THREADS = 256
 SF_ATOM_BYTES = 512
 SF_ATOM_U16 = SF_ATOM_BYTES // 2

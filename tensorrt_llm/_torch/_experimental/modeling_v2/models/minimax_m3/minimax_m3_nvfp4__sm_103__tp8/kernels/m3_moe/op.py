@@ -53,19 +53,23 @@ from typing import Dict, Optional, Tuple
 
 import torch
 
-HIDDEN = 6144
-INTER = 384  # the routed intermediate per TP rank
+HIDDEN = 6144  # capacity: fixed: the checkpoint's hidden size
+# The routed intermediate per TP rank.
+INTER = 384  # capacity: fixed: the routed experts' width per tp8 rank
 NUM_EXPERTS = 128
-SHARED_INTER = 384  # the shared expert's intermediate per TP rank (the routed one)
-SHARED_CTAS = 24  # m3_moe's shared-expert CTAs (beside num_ctas routed CTAs)
+# The shared expert's intermediate per TP rank (the routed one).
+SHARED_INTER = 384  # capacity: fixed: the shared expert's width per tp8 rank
+# M3_moe's shared-expert CTAs (beside num_ctas routed CTAs).
+SHARED_CTAS = 24  # capacity: fixed: an SM split, not a size
 TOP_K = 4
 U1 = 2 * INTER // 32  # FC1 units per expert
-MIN_CTAS = 64  # the router GEMV takes at most 2 experts per CTA (router weights held in registers)
+# The router GEMV takes at most 2 experts per CTA (router weights held in registers).
+MIN_CTAS = 64  # capacity: fixed: an SM split, not a size
 
 _UNIT_BYTES = 32 * (HIDDEN // 2 + HIDDEN // 16)  # one FC1 unit's weight + scale bytes
 _ROW2_BYTES = INTER // 2 + INTER // 16  # one FC2 weight row's bytes (values + scales)
-_S1 = 6  # FC1 stages (items) per unit
-_ITEM_BYTES = _UNIT_BYTES // _S1
+_S1 = 6  # FC1 stages (items) per unit  # capacity: fixed: pipeline stages
+_ITEM_BYTES = _UNIT_BYTES // _S1  # capacity: fixed: a ring item's bytes
 _modules: Dict[tuple, object] = {}
 _compiled: Dict[tuple, object] = {}
 # m3_moe trace-time options by token count 1..8 (index num_tokens - 1).
@@ -84,7 +88,7 @@ HB_REPL_BY_M: Tuple[int, ...] = (32, 32, 8, 8, 1, 1, 1, 1)
 # ``lg_repl``: replicas of the router logit exchange at up to LG_REPL_MAX_TOKENS tokens (fewer stores before the
 # exchange; bit-identical outputs). Above that the kernel's default applies.
 LG_REPL = 32
-LG_REPL_MAX_TOKENS = 4
+LG_REPL_MAX_TOKENS = 4  # capacity: fixed: measured exchange-replica crossover
 # Byte-balanced FC1 ranges below one unit per CTA (:func:`_fine_ranges`) for groups too small to give every CTA a
 # whole unit; False gives such groups whole units on the CTAs with the least FC2 work.
 FINE_PLAN = True
@@ -198,7 +202,9 @@ def _pretile_shared(gu8, gusf8, dn8, dnsf8, n_cta: int = 24) -> torch.Tensor:
     octant = r // P
     chunk = torch.arange(8, device=dev)
     swz = chunk[None, :] ^ (r[:, None] & 7)  # source chunk of image chunk j: j ^ (r % 8)
-    out = torch.empty(n_cta, gt + 2 * dkt, 16384 + 512, dtype=torch.uint8, device=dev)
+    out = torch.empty(
+        n_cta, gt + 2 * dkt, 16384 + 512, dtype=torch.uint8, device=dev
+    )  # capacity: fixed: a workspace of the kernel's fixed geometry
     for s in range(n_cta):
         # gate_up: MMA row R -> weight row, slice
         nrow = (octant & 1) * I_ + P * s + r % P

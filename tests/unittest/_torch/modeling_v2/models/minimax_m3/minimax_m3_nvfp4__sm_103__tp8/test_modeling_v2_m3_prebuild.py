@@ -1,27 +1,25 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""The decode kernels ``build_targets`` builds before the executor's warmup (``prebuild_kernels``), and that a forward
-after it never compiles one: the MoE engine of every ``MOE_ENGINE`` token count, the decode GEMVs with their push
-variants, and the index scorer's prefetching kernel at every decode query length (the tp8 target never selects the
-scorer's early-issue schedule: ``INDEX_SCORE_EARLY_MAX_REQUESTS`` is 0).
+"""The decode kernels the core builds before the executor's warmup (``prebuild_kernels``), and that a forward after it
+never compiles one: the MoE engine of every ``MOE_ENGINE`` token count, the decode GEMVs with their push variants, and
+the index scorer's prefetching kernel at every decode query length (the tp8 target never selects the scorer's
+early-issue schedule: ``INDEX_SCORE_EARLY_MAX_REQUESTS`` is 0).
 
 The engine builds are stubbed (a real one needs a loaded checkpoint's expert buffers; the engine kernels have their
 own tests); the GEMVs and the scorer compile for real on the GPU.
 """
 
 from types import SimpleNamespace
-from unittest import mock
 
 import pytest
 import torch
-from torch import nn
 
 import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers the trtllm ops
 from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_103__tp8 import (  # noqa: E501
-    dispatch,
-    layers,
-    linears,
     modeling,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_103__tp8.kernels import (  # noqa: E501
+    m3_index_score as index_score_kernel,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_103__tp8.kernels.mx_gemv import (  # noqa: E501
     op as mx_gemv,
@@ -35,11 +33,23 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_
     QKV_SPARSE,
 )
 
+dispatch = modeling
+
 assert torch.cuda.is_available(), "the prebuild checks require a CUDA device"
 
 INDEX_HEADS = 1  # index heads per rank at TP8
 INDEX_DIM = 128
 DRAFT_LEN = 3
+_CORE_METHODS = (
+    "prebuild_kernels",
+    "_prebuild_engines",
+    "_try_build",
+    "engine",
+    "_lookup",
+    "_scorer_variants",
+    "_prebuild_index_scorer",
+    "decode_query_lens",
+)
 
 
 @pytest.fixture(autouse=True)
@@ -57,56 +67,38 @@ class _FakeSparseAttn:
         self.m3_config = SimpleNamespace(num_index_heads=INDEX_HEADS, sparse_index_dim=INDEX_DIM)
 
 
-def _moe(layer_idx: int, shared: bool = True) -> layers.M3MoE:
-    """An M3MoE built by its own constructor over a stub stock block: only what prebuild_engines and the lookups
-    read (the builds are stubbed)."""
-
-    def stock_init(self, model_config, aux_stream_dict, layer_idx=None):
-        nn.Module.__init__(self)
-        # One rank: the build agreement takes no collective.
-        self.mapping = SimpleNamespace(tp_size=1, enable_attention_dp=False)
-        self.shared_experts = None
-
-    with mock.patch.object(layers.MiniMaxM3MoE, "__init__", stock_init):
-        moe = layers.M3MoE(None, {}, layer_idx)
-    moe.shared_experts = object() if shared else None
-    return moe
-
-
-def _model(monkeypatch, num_layers: int = 3, indexer_kv_dtype: str = "fp8"):
-    """The parts of MiniMaxM3Tp8ModelingV2 prebuild_kernels reads: layers (MoE + sparse attention), the embedding
-    device and the speculative config."""
-    monkeypatch.setattr(layers, "MiniMaxM3MsaSparseAttention", _FakeSparseAttn)
-    model_layers = []
-    for idx in range(num_layers):
-        model_layers.append(
-            SimpleNamespace(
-                block_sparse_moe=_moe(idx, shared=idx != 1) if idx else None,
-                self_attn=SimpleNamespace(
-                    is_sparse_attention_layer=idx != 0, attn=_FakeSparseAttn(indexer_kv_dtype)
-                ),
-            )
-        )
-    stub = SimpleNamespace(
-        layers=model_layers,
-        embed_tokens=SimpleNamespace(weight=torch.empty(1, device="cuda")),
+def _core(num_layers: int = 3, indexer_kv_dtype: str = "fp8", built=None, fail=False):
+    """The parts of ``MiniMaxM3Tp8ModelingV2`` the prebuild reads: one rank (the build agreement takes no
+    collective), MoE + sparse layers 1.. (layer 0 dense), no projections (the GEMV prebuild has its own test), the
+    speculative config; the engine builds stubbed."""
+    core = SimpleNamespace(
+        mapping=SimpleNamespace(tp_size=1, enable_attention_dp=False),
+        moe_layers=frozenset(range(1, num_layers)),
+        sparse_layers=frozenset(range(1, num_layers)),
+        attn=[_FakeSparseAttn(indexer_kv_dtype) for _ in range(num_layers)],
+        w={"embed": torch.empty(1, device="cuda")},
+        mxfp8=SimpleNamespace(quant_method=SimpleNamespace(use_cutlass=True)),
         model_config=SimpleNamespace(
             spec_config=SimpleNamespace(max_draft_len=DRAFT_LEN, max_total_draft_tokens=DRAFT_LEN)
         ),
+        moe_engines={},
+        projections=lambda: [],
     )
-    stub.decode_query_lens = lambda: modeling.MiniMaxM3Tp8ModelingV2.decode_query_lens(stub)
-    return stub
+    for name in _CORE_METHODS:
+        setattr(core, name, getattr(modeling.MiniMaxM3Tp8ModelingV2, name).__get__(core))
+    built = [] if built is None else built
+
+    def build(i, num_tokens, shared=True):
+        if fail:
+            raise ValueError("the routed experts are not TRTLLM-Gen NVFP4 SwiGLU-OAI")
+        built.append(("moe", i, num_tokens, shared))
+        return ("engine", i, num_tokens)
+
+    core._build_engine = build
+    return core
 
 
-def _stub_engine_builds(monkeypatch, built: list) -> None:
-    def build(self, num_tokens, shared=True):
-        built.append(("moe", self.layer_idx, num_tokens, shared))
-        return ("engine", self.layer_idx, num_tokens)
-
-    monkeypatch.setattr(layers.M3MoE, "_build_engine", build)
-
-
-def _forbid_compiles(monkeypatch) -> None:
+def _forbid_compiles(monkeypatch, core=None) -> None:
     """Every compile / build entry point a forward could reach raises."""
     import cutlass.cute as cute
 
@@ -116,112 +108,110 @@ def _forbid_compiles(monkeypatch) -> None:
     monkeypatch.setattr(cute, "compile", boom)
     monkeypatch.setattr(mx_gemv, "ensure_compiled", boom)
     monkeypatch.setattr(mx_gemv, "precompile", boom)
-    monkeypatch.setattr(layers.M3MoE, "_build_engine", boom)
-    monkeypatch.setattr(layers._scorer_runner(), "_compile", boom)
+    monkeypatch.setattr(index_score_kernel.IndexScoreRunner, "_compile", boom)
+    if core is not None:
+        core._build_engine = boom
 
 
-def test_decode_query_lens_follow_the_speculative_config(monkeypatch) -> None:
-    model = _model(monkeypatch)
-    assert model.decode_query_lens() == [1, 1 + DRAFT_LEN]
-    model.model_config.spec_config = None
-    assert model.decode_query_lens() == [1]
-    model.model_config.spec_config = SimpleNamespace(
+def test_decode_query_lens_follow_the_speculative_config() -> None:
+    core = _core()
+    assert core.decode_query_lens() == [1, 1 + DRAFT_LEN]
+    core.model_config.spec_config = None
+    assert core.decode_query_lens() == [1]
+    core.model_config.spec_config = SimpleNamespace(
         max_draft_len=4, max_total_draft_tokens=4, draft_len_schedule={1: 4, 8: 2}
     )
-    assert model.decode_query_lens() == [1, 3, 5]
+    assert core.decode_query_lens() == [1, 3, 5]
 
 
-def test_prebuild_builds_every_engine_count_and_scorer_variant(monkeypatch) -> None:
+def test_prebuild_builds_every_engine_count_and_scorer_variant() -> None:
     built = []
-    _stub_engine_builds(monkeypatch, built)
-    monkeypatch.setattr(modeling, "adopt_m3_linears", lambda root: built.append(("linears",)))
-    model = _model(monkeypatch)
-    times = modeling.MiniMaxM3Tp8ModelingV2.prebuild_kernels(model)
+    core = _core(built=built)
+    times = core.prebuild_kernels()
 
-    assert built[0] == ("linears",)
     assert mx_gemv.frozen(), "prebuild must close the GEMV compiles"
-    # Layer 0 is dense, layer 1 has no shared expert (no engine takes it); layer 2 gets every count, in order.
-    assert built[1:] == [("moe", 2, n, True) for n in range(1, dispatch.MOE_ENGINE_MAX_TOKENS + 1)]
-    moe = model.layers[2].block_sparse_moe
-    assert set(moe._engines) == {(n, True, True) for n in dispatch.MOE_ENGINE.keys}
-    assert not hasattr(moe, "_moe16_engines")
 
-    runner = layers._scorer_runner()
+    # Layer 0 is dense; every MoE layer gets every count, in layer order.
+    def per_layer(i):
+        return [("moe", i, n, True) for n in range(1, dispatch.MOE_ENGINE_MAX_TOKENS + 1)]
+
+    assert built == per_layer(1) + per_layer(2)
+    assert set(core.moe_engines[2]) == {(n, True, True) for n in dispatch.MOE_ENGINE.keys}
+    assert not hasattr(core, "moe16_engines")
+
     want = {
-        (torch.float8_e4m3fn, INDEX_HEADS, qlen, INDEX_DIM, layers.INDEX_SCORE_SPLIT_K, False)
+        (torch.float8_e4m3fn, INDEX_HEADS, qlen, INDEX_DIM, modeling.INDEX_SCORE_SPLIT_K, False)
         for qlen in (1, 1 + DRAFT_LEN)
     }
     assert set(times["scorer_keys"]) == want
-    assert want <= set(runner.kernel_cache)
+    assert want <= set(index_score_kernel.IndexScoreRunner.kernel_cache)
     for key in ("gemv_s", "moe_s", "scorer_s"):
         assert times[key] >= 0.0
 
-    # A second build_targets builds nothing again.
+    # A second build builds no engine again.
     built.clear()
-    modeling.MiniMaxM3Tp8ModelingV2.prebuild_kernels(model)
-    assert built == [("linears",)]
+    core.prebuild_kernels()
+    assert built == []
 
 
 def test_engine_lookups_after_prebuild_never_build(monkeypatch) -> None:
-    built = []
-    _stub_engine_builds(monkeypatch, built)
-    moe = _moe(5)
-    moe.prebuild_engines()
-    _forbid_compiles(monkeypatch)
+    core = _core()
+    core._prebuild_engines(5)
+    _forbid_compiles(monkeypatch, core)
     for require in (False, True):
         dispatch.set_require(require)
         for n in sorted(dispatch.MOE_ENGINE.keys):
-            assert moe.engine(n, shared=True) == ("engine", 5, n)
+            assert core.engine(5, n, shared=True) == ("engine", 5, n)
 
 
 def test_missing_engine_is_a_miss_not_a_build(monkeypatch) -> None:
-    _forbid_compiles(monkeypatch)
-    moe = _moe(7)
+    core = _core()
+    core.moe_engines[7] = {}
+    _forbid_compiles(monkeypatch, core)
     dispatch.set_require(False)
-    assert moe.engine(3, shared=True) is None
+    assert core.engine(7, 3, shared=True) is None
     dispatch.set_require(True)
     with pytest.raises(dispatch.FastPathUnavailable, match="not built before warmup"):
-        moe.engine(3, shared=True)
+        core.engine(7, 3, shared=True)
 
 
-def test_failed_engine_build_is_logged_then_missed(monkeypatch) -> None:
-    def fail(self, num_tokens, shared=True):
-        raise ValueError("experts backend is not TRTLLM-Gen NVFP4 SwiGLU-OAI")
-
-    monkeypatch.setattr(layers.M3MoE, "_build_engine", fail)
-    moe = _moe(9)
-    moe.prebuild_engines()
-    assert all(v is None for v in moe._engines.values()) and len(moe._engines) == 8
+def test_failed_engine_build_is_logged_then_missed() -> None:
+    core = _core(fail=True)
+    core._prebuild_engines(9)
+    assert all(v is None for v in core.moe_engines[9].values()) and len(core.moe_engines[9]) == 8
     dispatch.set_require(True)
     with pytest.raises(dispatch.FastPathUnavailable, match="build failed"):
-        moe.engine(1, shared=True)
+        core.engine(9, 1, shared=True)
 
 
 def _projection(nk, push):
     n, k = nk
     w = (torch.randn(n, k, device="cuda") / k**0.5).to(torch.bfloat16)
     wq, wsf = torch.ops.trtllm.mxfp8_quantize(w, True)
-    return SimpleNamespace(weight=wq.view(n, k), weight_scale=wsf, m3_push=push, tp_size=8)
+    return SimpleNamespace(weight=wq.view(n, k), weight_scale=wsf, push=push)
 
 
 @pytest.mark.parametrize(
     "nk,push",
-    ((O_PROJ, linears.PUSH_ATTN), (QKV_SPARSE, None), (DENSE_DOWN, None)),
+    ((O_PROJ, "attn"), (QKV_SPARSE, None), (DENSE_DOWN, None)),
     ids=("o_proj", "qkv_sparse", "dense_down"),
 )
 def test_gemvs_after_prebuild_never_compile(monkeypatch, nk, push) -> None:
     use_pdl = True
     module = _projection(nk, push)
-    variants = linears.gemv_variants(module)
+    variants = modeling._gemv_variants(*nk, push, 8)
     pushes = [v for v in variants if v[2] is not None]
     if push is None:
         assert not pushes
     else:
-        covered = dispatch.ATTN_PUSH.keys if push == linears.PUSH_ATTN else dispatch.MOE_PUSH.keys
+        covered = dispatch.ATTN_PUSH.keys if push == "attn" else dispatch.MOE_PUSH.keys
         assert {rows for rows, _, _ in pushes} == set(covered)
         assert {p[1] for _, _, p in pushes} == {b for b in (8, 16) if b <= max(covered)}
     mx_gemv.freeze(False)
-    assert linears.prebuild_m3_gemvs(module, use_pdl) > 0
+    # As prebuild_kernels compiles one projection.
+    mx_gemv.ensure_compiled(module.weight, module.weight_scale, use_pdl)
+    for rows, x_bf16, ar in variants:
+        mx_gemv.precompile(module.weight, module.weight_scale, rows, x_bf16, use_pdl=use_pdl, ar=ar)
     mx_gemv.freeze(True)
     _forbid_compiles(monkeypatch)
 
@@ -269,13 +259,11 @@ def test_frozen_gemv_declines_an_uncompiled_kernel(monkeypatch) -> None:
 
 @pytest.mark.parametrize("indexer_kv_dtype", ("fp8", "bf16"))
 def test_scorer_after_prebuild_never_compiles(monkeypatch, indexer_kv_dtype) -> None:
-    model = _model(monkeypatch, indexer_kv_dtype=indexer_kv_dtype)
-    keys = layers.prebuild_index_scorer(
-        model.layers, model.decode_query_lens(), torch.device("cuda")
-    )
+    core = _core(indexer_kv_dtype=indexer_kv_dtype)
+    keys = core._prebuild_index_scorer(core.decode_query_lens(), torch.device("cuda"))
     # The decode query lengths 1 and 1 + DRAFT_LEN, the prefetching kernel only.
     assert len(keys) == 2 and not any(key[-1] for key in keys)
-    _forbid_compiles(monkeypatch)
+    _forbid_compiles(monkeypatch, core)
     dtype = torch.float8_e4m3fn if indexer_kv_dtype == "fp8" else torch.bfloat16
     for _, heads, qlen, dim, split_k, early in keys:
         rows = 1 if early else 2
@@ -298,8 +286,3 @@ def test_scorer_after_prebuild_never_compiles(monkeypatch, indexer_kv_dtype) -> 
             early,
         )
     torch.cuda.synchronize()
-
-
-def test_moe_keeps_its_layer_index():
-    # prebuild_engines names the layer in its build and agreement messages.
-    assert _moe(5).layer_idx == 5

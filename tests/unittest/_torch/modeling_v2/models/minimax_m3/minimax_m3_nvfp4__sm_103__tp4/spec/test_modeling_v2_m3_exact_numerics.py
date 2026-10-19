@@ -21,8 +21,7 @@ import pytest
 import torch
 
 from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_103__tp4 import (  # noqa: E501
-    linears,
-    spec_worker,
+    modeling,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_103__tp4.kernels import (  # noqa: E501
     m3_spec_tail,
@@ -72,8 +71,8 @@ def _stock_accept(logits: torch.Tensor, draft: torch.Tensor):
     worker._sample_tokens_for_batch = lambda *a: Eagle3OneModelWorker._sample_tokens_for_batch(
         worker, *a
     )
-    worker._apply_force_accepted_tokens = (
-        lambda *a, **k: Eagle3OneModelWorker._apply_force_accepted_tokens(worker, *a, **k)
+    worker._apply_force_accepted_tokens = lambda *a, **k: (
+        Eagle3OneModelWorker._apply_force_accepted_tokens(worker, *a, **k)
     )
     nreq = draft.shape[0]
     return Eagle3OneModelWorker._sample_and_accept_draft_tokens_base(
@@ -268,8 +267,7 @@ def test_the_drafter_is_the_in_tree_drafter() -> None:
     re-quantizes the drafter's linears or the LM heads: no hook of a quantized / pruned head or drafter projection is
     left in the target, and the fused head streams the BF16 head weight itself."""
     assert (
-        spec_worker.M3Eagle3Worker._forward_draft_loop
-        is not Eagle3OneModelWorker._forward_draft_loop
+        modeling.M3Eagle3Worker._forward_draft_loop is not Eagle3OneModelWorker._forward_draft_loop
     )
     for name in (
         "_forward_linear_draft_loop",
@@ -277,17 +275,15 @@ def test_the_drafter_is_the_in_tree_drafter() -> None:
         "sample_draft_tokens",
         "sample_and_accept_draft_tokens",
     ):
-        assert getattr(spec_worker.M3Eagle3Worker, name) is getattr(Eagle3OneModelWorker, name), (
-            name
-        )
+        assert getattr(modeling.M3Eagle3Worker, name) is getattr(Eagle3OneModelWorker, name), name
     for module, name in (
-        (spec_worker, "M3DraftGemvLinearMethod"),
-        (spec_worker, "adopt_draft_linears"),
-        (spec_worker, "greedy_head_outputs"),
-        (linears, "M3FP8LMHeadMethod"),
-        (linears, "adopt_fp8_lm_heads"),
+        (modeling, "M3DraftGemvLinearMethod"),
+        (modeling, "adopt_draft_linears"),
+        (modeling, "greedy_head_outputs"),
+        (modeling, "M3FP8LMHeadMethod"),
+        (modeling, "adopt_fp8_lm_heads"),
     ):
         assert not hasattr(module, name), f"{module.__name__}.{name}"
-    pkg = spec_worker.__name__.rsplit(".", 1)[0]
+    pkg = modeling.__name__.rsplit(".", 1)[0]
     for gone in ("kernels.m3_draft_head", "ops.spec.m3_draft_head", "ops.gemm.m3_draft_gemv"):
         assert importlib.util.find_spec(f"{pkg}.{gone}") is None, gone

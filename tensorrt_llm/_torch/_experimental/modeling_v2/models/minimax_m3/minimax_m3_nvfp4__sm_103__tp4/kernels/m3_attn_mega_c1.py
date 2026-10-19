@@ -46,11 +46,13 @@ from typing import Optional
 
 import torch
 
+from ..ops.attention.m3_attn_c1 import m3_attn_c1 as _m3_attn_c1_op
+
 NUM_HEADS = 16
-HEAD_DIM = 128
+HEAD_DIM = 128  # capacity: fixed: the checkpoint's head dim
 PAGE_SIZE = 128
-MAX_BLOCKS = 16
-PACKED_WIDTH = (NUM_HEADS + 4) * HEAD_DIM
+MAX_BLOCKS = 16  # capacity: fixed: the MSA top-16 blocks
+PACKED_WIDTH = (NUM_HEADS + 4) * HEAD_DIM  # capacity: fixed: the tp4 packed QKV width
 
 # The geometries of m3_fused_attn, which default_geometry() reads (only C1_GEOMETRIES is compiled into this op).
 GEOMETRIES = frozenset(
@@ -231,8 +233,12 @@ class MegaWorkspace:
         ).view(torch.bfloat16)
         self.flags = torch.zeros(256, dtype=torch.int32, device=device)
         # Two call-parity buffers of the attention's MXFP8 hand-off to the o_proj units, all 0xFF ("not yet").
-        self.q8 = torch.full((2 * max_tokens * 2048,), 255, dtype=torch.uint8, device=device)
-        self.sf = torch.full((2 * 16 * 512,), 255, dtype=torch.uint8, device=device)
+        self.q8 = torch.full(
+            (2 * max_tokens * 2048,), 255, dtype=torch.uint8, device=device
+        )  # capacity: fixed: a workspace of the kernel's fixed geometry
+        self.sf = torch.full(
+            (2 * 16 * 512,), 255, dtype=torch.uint8, device=device
+        )  # capacity: fixed: a workspace of the kernel's fixed geometry
         self.calls = 0  # host mirror of the call count (eager use only; graph replays advance the device copy)
 
 
@@ -321,7 +327,8 @@ def m3_attn_c1(
         "y must be bf16 [T, 6144]",
     )
     out2d = output.view(num_tokens, NUM_HEADS * HEAD_DIM)
-    _load_module().minimax_m3_attn_c1(
+    _load_module()
+    _m3_attn_c1_op(
         packed,
         ws.flags,
         kv_data,

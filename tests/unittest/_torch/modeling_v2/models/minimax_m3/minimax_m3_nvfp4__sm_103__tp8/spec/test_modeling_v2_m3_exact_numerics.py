@@ -5,13 +5,13 @@
 * Verify: the target logits are the in-tree BF16 LM head's own shard GEMM, and the fused shard argmax + acceptance
   gives the in-tree greedy acceptance of the gathered logits, bit for bit, on every rank (peers' keys are the real
   per-shard maxima, computed by the same kernel).
-* Drafter: the worker runs the in-tree drafter's modules and weights (its BF16 linears on fixed-tactic BF16 low-M
-  kernels at the rows ``dispatch.DRAFT_LOWM`` covers, held to the fp64 product and to the entry by
-  test_modeling_v2_m3_draft_lowm.py); its own drafter arithmetic is the first pass's
-  fc_norm (chunk_norm, or capture_norm folded into the capture), held here to the in-tree ``apply_eagle3_fc`` RMSNorm
-  modules within one bf16 ulp (its effect on the fc output and on the full-vocabulary BF16 head's draft tokens is
-  measured too), and the fused draft loop's draft input and BF16 head, held to the in-tree modules and greedy draft
-  sampling by their own tests (test_modeling_v2_m3_draft_input.py, test_modeling_v2_m3_draft_step.py).
+* Drafter: the worker runs the in-tree drafter's arithmetic and weights (its BF16 linears on fixed-tactic BF16 low-M
+  kernels at the rows ``DRAFT_LOWM`` covers, held to the fp64 product and to the entry by
+  test_modeling_v2_m3_draft_lowm.py); its own drafter arithmetic is the first pass's fc_norm (chunk_norm, or
+  capture_norm folded into the capture), held here to the in-tree ``apply_eagle3_fc`` RMSNorm modules within one bf16
+  ulp (its effect on the fc output and on the full-vocabulary BF16 head's draft tokens is measured too), and the
+  fused draft loop's draft input and BF16 head, held to the in-tree modules and greedy draft sampling by their own
+  tests (test_modeling_v2_m3_draft_input.py, test_modeling_v2_m3_draft_step.py).
 
 Synthetic weights: hidden 6144, vocabulary 200064 (8 x 25008 shards), 3 captured layers, draft length 3.
 """
@@ -23,11 +23,9 @@ import pytest
 import torch
 
 from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_103__tp8 import (  # noqa: E501
-    linears,
-    spec_worker,
+    modeling,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_103__tp8.kernels import (  # noqa: E501
-    m3_draft_lowm,
     m3_spec_tail,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_103__tp8.ops.spec.m3_shard_accept import (  # noqa: E501
@@ -39,7 +37,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_
 )
 from tensorrt_llm._torch.models.modeling_speculative import Eagle3ForCausalLM
 from tensorrt_llm._torch.modules.embedding import LMHead
-from tensorrt_llm._torch.modules.linear import Linear, UnquantizedLinearMethod
+from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm._torch.speculative.eagle3 import Eagle3OneModelWorker
 
@@ -75,8 +73,8 @@ def _stock_accept(logits: torch.Tensor, draft: torch.Tensor):
     worker._sample_tokens_for_batch = lambda *a: Eagle3OneModelWorker._sample_tokens_for_batch(
         worker, *a
     )
-    worker._apply_force_accepted_tokens = (
-        lambda *a, **k: Eagle3OneModelWorker._apply_force_accepted_tokens(worker, *a, **k)
+    worker._apply_force_accepted_tokens = lambda *a, **k: (
+        Eagle3OneModelWorker._apply_force_accepted_tokens(worker, *a, **k)
     )
     nreq = draft.shape[0]
     return Eagle3OneModelWorker._sample_and_accept_draft_tokens_base(
@@ -269,11 +267,9 @@ def test_draft_tokens_through_the_full_vocab_head(rows) -> None:
 def test_the_drafter_is_the_in_tree_drafter() -> None:
     """Outside the fused draft loop's steps the worker drafts with the in-tree loop, forward and sampling, and nothing
     re-quantizes the drafter's linears or the LM heads: no hook of a quantized / pruned head or drafter projection is
-    left in the target, the drafter linears' low-M method is the in-tree BF16 method's subclass, and the fused head
-    streams the BF16 head weight itself (no coded copy)."""
+    left in the target, and the fused head streams the BF16 head weight itself (no coded copy)."""
     assert (
-        spec_worker.M3Eagle3Worker._forward_draft_loop
-        is not Eagle3OneModelWorker._forward_draft_loop
+        modeling.M3Eagle3Worker._forward_draft_loop is not Eagle3OneModelWorker._forward_draft_loop
     )
     for name in (
         "_forward_linear_draft_loop",
@@ -281,25 +277,23 @@ def test_the_drafter_is_the_in_tree_drafter() -> None:
         "sample_draft_tokens",
         "sample_and_accept_draft_tokens",
     ):
-        assert getattr(spec_worker.M3Eagle3Worker, name) is getattr(Eagle3OneModelWorker, name), (
-            name
-        )
+        assert getattr(modeling.M3Eagle3Worker, name) is getattr(Eagle3OneModelWorker, name), name
     for module, name in (
-        (spec_worker, "M3DraftGemvLinearMethod"),
-        (spec_worker, "adopt_draft_linears"),
-        (spec_worker, "greedy_head_outputs"),
-        (linears, "M3FP8LMHeadMethod"),
-        (linears, "adopt_fp8_lm_heads"),
+        (modeling, "M3DraftGemvLinearMethod"),
+        (modeling, "adopt_draft_linears"),
+        (modeling, "greedy_head_outputs"),
+        (modeling, "M3FP8LMHeadMethod"),
+        (modeling, "adopt_fp8_lm_heads"),
     ):
         assert not hasattr(module, name), f"{module.__name__}.{name}"
-    assert issubclass(m3_draft_lowm.DraftLowMLinearMethod, UnquantizedLinearMethod)
-    assert not hasattr(spec_worker.M3Eagle3Worker, "prebuild_target_head")
-    pkg = spec_worker.__name__.rsplit(".", 1)[0]
+    assert not hasattr(modeling.M3Eagle3Worker, "prebuild_target_head")
+    pkg = modeling.__name__.rsplit(".", 1)[0]
     for gone in (
         "kernels.m3_draft_head",
         "ops.spec.m3_draft_head",
         "ops.gemm.m3_draft_gemv",
         "kernels.m3_target_head",
         "ops.gemm.m3_target_head",
+        "kernels.m3_draft_lowm",
     ):
         assert importlib.util.find_spec(f"{pkg}.{gone}") is None, gone

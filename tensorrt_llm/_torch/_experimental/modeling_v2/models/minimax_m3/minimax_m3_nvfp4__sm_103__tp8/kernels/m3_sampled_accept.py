@@ -28,11 +28,12 @@ from typing import Optional
 
 import torch
 
-from .. import dispatch
+from ..ops.spec.m3_sampled_accept import m3_sampled_accept as _sampled_accept_op
+from ..ops.spec.m3_sampled_accept_ws_words import m3_sampled_accept_ws_words as _ws_words_op
 
-# The kernel is compiled into TensorRT-LLM (cpp/tensorrt_llm/kernels/minimaxM3/sampledAccept.cu) and called as
-# torch.ops.trtllm.minimax_m3_sampled_accept.
-MAX_ROWS = 48
+# The kernel is compiled into TensorRT-LLM (cpp/tensorrt_llm/kernels/minimaxM3/sampledAccept.cu) and reached through
+# the ops/spec entry m3_sampled_accept.
+MAX_ROWS = 48  # capacity: fixed: the kernel's built rows (decode steps)
 
 
 class SampledAcceptWorkspace:
@@ -49,7 +50,7 @@ class SampledAcceptWorkspace:
 
     @classmethod
     def create(cls, mapping, device) -> "SampledAcceptWorkspace":
-        words = int(torch.ops.trtllm.minimax_m3_sampled_accept_ws_words(max(mapping.tp_size, 1)))
+        words = int(_ws_words_op(max(mapping.tp_size, 1)))
         if mapping.tp_size == 1:
             uc = torch.zeros(words, dtype=torch.int64, device=device)
             return cls(uc, uc.data_ptr(), 0, 1)
@@ -88,7 +89,7 @@ def workspace(mapping, device) -> Optional[SampledAcceptWorkspace]:
     global _WS
     if _WS is None:
         if torch.cuda.is_current_stream_capturing():
-            dispatch.capture_missed("spec_tail", None, "the sampled-accept workspace")
+            # A capture that finds it missing is the caller's miss (it is built on the eager steps).
             return None
         _WS = SampledAcceptWorkspace.create(mapping, device)
     return _WS
@@ -131,7 +132,7 @@ def sampled_accept(
     accepted = torch.empty((nreq, draft_len + 1), dtype=torch.int32, device=dev)
     num_accepted = torch.empty(nreq, dtype=torch.int32, device=dev)
     gather_ids = torch.empty(nreq, dtype=torch.int64, device=dev)
-    torch.ops.trtllm.minimax_m3_sampled_accept(
+    _sampled_accept_op(
         logits,
         int(vocab_offset),
         temperatures[:rows].float().contiguous(),

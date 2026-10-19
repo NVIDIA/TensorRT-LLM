@@ -9,10 +9,8 @@ from typing import Tuple
 import torch
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
-from tensorrt_llm._torch.cute_dsl_kernels.minimax_m3.embedding_firstnorm.op import (
-    DecodeEmbedding,
-    m3_embed_norm,
-)
+
+from ...kernels.embedding_firstnorm.op import DecodeEmbedding, m3_embed_norm
 
 __all__ = ["DecodeEmbedding", "m3_embedding_firstnorm"]
 
