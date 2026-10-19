@@ -971,17 +971,20 @@ def _capture_tllm_logs():
 @pytest.mark.parametrize("schedule", [{4: 4, 8: 2, 16: 1}, {4: 2}, {16: 4}, {4: 0}])
 def test_dynamic_warmup_graphs_match_replay_schedule(schedule: dict[int, int]) -> None:
     from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDAGraphRunner
+    from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.graphs import (
+        compute_dynamic_draft_len_mapping,
+    )
     from tensorrt_llm._torch.speculative.utils import get_draft_len_for_batch_size
 
     batch_sizes = [1, 2, 4, 8, 16]
-    runner = object.__new__(DecoderRunner)
+    runner = object.__new__(DecoderCudaGraphs)
     mode = SimpleNamespace(support_dynamic_draft_len=lambda: True)
     runner._config = SimpleNamespace(
         spec_config=SimpleNamespace(draft_len_schedule=schedule, spec_dec_mode=mode),
         cuda_graph_batch_sizes=batch_sizes,
         original_max_draft_len=max(schedule.values()),
     )
-    runner._dynamic_draft_len_mapping = runner._compute_dynamic_draft_len_mapping()
+    runner._dynamic_draft_len_mapping = compute_dynamic_draft_len_mapping(runner._config)
     graphs = runner._get_graphs_to_capture(batch_sizes)
     replay = object.__new__(CUDAGraphRunner)
     replay.supported_batch_sizes = batch_sizes
