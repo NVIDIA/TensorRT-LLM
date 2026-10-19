@@ -34,6 +34,7 @@ aux_stream_name_list = [
     'MlaIndexer',
     'MlaIndexerAux',
     'MlaCompressor',
+    'MoeRouter',
 ]
 AuxStreamType = Enum(
     'AuxStreamType',
