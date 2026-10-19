@@ -87,8 +87,12 @@ class Fp8Quantize1x128(OpWrapper):
         Cell(why="64 tokens: a multiple of every pad", spec=dict(tokens=64, **_CKPT)),
         Cell(why="1024 tokens: prefill-shaped", spec=dict(tokens=1024, **_CKPT)),
         Cell(
-            why="8192 tokens: max_num_tokens, the top of the certified column",
+            why="8192 tokens: max_num_tokens of the identity config",
             spec=dict(tokens=8192, **_CKPT),
+        ),
+        Cell(
+            why="16384 rows: max_num_tokens of the tuned config",
+            spec=dict(tokens=16384, **_CKPT),
         ),
         Cell(
             why="H 128: one whole block per row", spec=dict(tokens=7, hidden=128, use_ue8m0=False)
@@ -138,7 +142,8 @@ class Fp8Quantize1x128(OpWrapper):
     independent; the registered fake matches eager shapes.
 
     Hard limits
-      T   certified 0..8192 at H 2560; above that not probed
+      T   certified 0..16384 at H 2560 (max_num_tokens of the tuned config);
+          above that not probed
       H   multiple of 16 (raises otherwise); certified 16..7168
     """
 

@@ -122,8 +122,12 @@ class Fp8BlockScaleMoeRunner(OpWrapper):
         Cell(why="1024 tokens: ~20 rows per expert", spec=dict(tokens=1024, **_CKPT)),
         Cell(why="4096 tokens: ~80 rows per expert", spec=dict(tokens=4096, **_CKPT)),
         Cell(
-            why="8192 tokens: max_num_tokens, the top of the certified column",
+            why="8192 tokens: max_num_tokens of the identity config",
             spec=dict(tokens=8192, **_CKPT),
+        ),
+        Cell(
+            why="16384 rows: max_num_tokens of the tuned config",
+            spec=dict(tokens=16384, **_CKPT),
         ),
         Cell(
             why="gemm1_clamp_limit=1.0: live, ~63 ulp RMS from the unclamped result",
@@ -217,7 +221,11 @@ class Fp8BlockScaleMoeRunner(OpWrapper):
     states): an upstream defect, eager is unaffected.
 
     Hard limits
-      T            certified 1..8192 (max_num_tokens); chunk above it, not probed
+      T            certified 1..16384 (max_num_tokens of the tuned config);
+                   chunk above it, not probed. Autotuner buckets stop at
+                   `tune_max_num_tokens` (default 8192, which the target
+                   leaves): past it a call runs the 8192 bucket's tactic; a
+                   larger value makes the op append a bucket at that size
       top_k        <= 32 (raises past it); certified 1, 2, 6, 8, 10, 16
       E, H, I      certified up to 512, 7168, 2048
 

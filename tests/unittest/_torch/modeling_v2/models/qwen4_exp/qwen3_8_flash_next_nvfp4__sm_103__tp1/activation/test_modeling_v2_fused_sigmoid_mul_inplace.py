@@ -58,6 +58,11 @@ def _build(spec, seed):
         gate = gate_buffer[:, :, d:]
     elif gate_layout == "packed":
         gate_buffer = gate = randn(t, heads, d)
+    elif gate_layout == "fused_row":
+        # The target's fused input projection row [q | k | v | gate | index | pad]:
+        # 14080 columns, the gate a 2-D [T, hidden] window at column 7168.
+        gate_buffer = randn(t, 14080)
+        gate = gate_buffer[:, 7168 : 7168 + hidden]
     else:
         gate_buffer = gate = randn(t, hidden, dt=spec.get("gate_dtype", dtype))
     return buffer, region(buffer), region, gate_buffer, gate
