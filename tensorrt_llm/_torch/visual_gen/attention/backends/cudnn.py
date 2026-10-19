@@ -646,9 +646,7 @@ class CuDNNAttention(AttentionBackend):
             raise TypeError(f"q is {q.dtype} but the cache holds {buf.dtype}")
         kv_cache.write_staged(self.layer_idx, k[0], v[0], causal_block_size)
         # The cache keeps lengths and page-table rows for every causal block of its
-        # max_staged_tokens, in device tensors that commit() refreshes in place. A
-        # shorter forward (a first or last chunk) uses the leading blocks; the slices are
-        # views, so a captured graph keeps reading the live values.
+        # max_staged_tokens, in device tensors that commit() refreshes in place.
         seq_len_q, seq_len_kv = kv_cache.causal_block_lengths(causal_block_size)
         seq_len_q, seq_len_kv = seq_len_q[:num_causal_blocks], seq_len_kv[:num_causal_blocks]
 
