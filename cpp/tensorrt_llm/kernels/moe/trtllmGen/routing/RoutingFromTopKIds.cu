@@ -74,8 +74,18 @@ void runPostTopKPipeline(DataType const& data, uint32_t /*numThreadsHist*/, void
     static int const smMajor = tensorrt_llm::common::getSMVersion() / 10;
     bool const useStaticBlock = data.mNumTokens <= routingCustom::BlockKernelMaxNumTokens;
     int32_t const dispatchedMaxExperts = routingCustom::queryDispatchedMaxExperts(customData);
-    bool const useDynBlock = !useStaticBlock && data.mNumTokens <= routingCustom::DynBlockKernelMaxNumTokens
-        && dispatchedMaxExperts <= routingCustom::DynBlockKernelMaxNumExperts;
+    // Post-topK only permutes (no in-kernel TopK), so the single-CTA dyn-block kernel is worth using
+    // for larger expert tiers than in the scores path: the 8-CTA cluster kernel pays a DSMEM gather +
+    // cluster-barrier latency floor regardless of token count. Measured on B200 (896 experts/top-16,
+    // E=1024 tier): dyn-block 3.1/3.3/4.2 us at 5/8/16 tokens vs the 256-thread cluster kernel
+    // 4.7/4.7/5.2 us; but the dyn-block per-expert loops run over all tokens (~0.11 us/token), while
+    // the post-topK 512-thread cluster variant (see launchClusterKernel) is ~4.3 us at 17 tokens and
+    // nearly flat -> crossover ~12 tokens (dyn-block 4.7 us vs cluster 4.3 us already at 16-17).
+    // smem = tokens * MaxNumExperts * 3 B (int8 k-idx + int16 offset) = 36 KB at 12 x 1024.
+    static constexpr int PostTopKDynBlockMaxNumTokens = 12;
+    static constexpr int PostTopKDynBlockMaxNumExperts = 1024;
+    bool const useDynBlock = !useStaticBlock && data.mNumTokens <= PostTopKDynBlockMaxNumTokens
+        && dispatchedMaxExperts <= PostTopKDynBlockMaxNumExperts;
 
     // runPostTopKPipeline only handles pre-computed topK (mPtrTopKIds or mPtrTopKPacked),
     // never raw scores. The cluster kernel's routingPermutation uses thread-per-expanded-index
