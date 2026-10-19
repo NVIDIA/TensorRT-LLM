@@ -70,11 +70,16 @@ class BudgetTracker:
         max_num_tokens: Optional[int],
         max_num_requests: int,
         peft_cache_manager=None,
+        max_ctx_cost: Optional[float] = None,
     ):
         self.max_num_tokens = max_num_tokens
         self.max_num_requests = max_num_requests
         self.num_tokens = 0
         self.num_requests = 0
+        # Equal-cost chunking budget in token*kv units; None keeps pure
+        # token budgeting. See KVCacheV2Scheduler.__init__.
+        self.max_ctx_cost = max_ctx_cost
+        self.ctx_cost = 0.0
 
         # PEFT accounting
         self._peft_cache_manager = peft_cache_manager
@@ -102,6 +107,17 @@ class BudgetTracker:
         if self.max_num_tokens is None:
             return None
         return self.max_num_tokens - self.num_tokens
+
+    @property
+    def remaining_ctx_cost(self) -> float:
+        """Remaining cost budget (token*kv units), inf if cost-unlimited."""
+        if self.max_ctx_cost is None:
+            return float("inf")
+        return self.max_ctx_cost - self.ctx_cost
+
+    def commit_ctx_cost(self, cost: float) -> None:
+        """Record a scheduled context chunk's predicted cost."""
+        self.ctx_cost += cost
 
     def commit(self, req: LlmRequest, num_tokens: int, peft_pages: int) -> None:
         """Record a successfully scheduled request's token and PEFT consumption."""
@@ -261,6 +277,45 @@ class KVCacheV2Scheduler(RequestScheduler):
             os.environ.get("TLLM_DISAGG_GEN_PRIORITIZE_FIRST_TOKEN", "0") == "1"
         )
 
+        # Opt-in (default off): equal-cost context chunking. A context chunk of
+        # n tokens at KV depth kv costs ~ (kv_cost_offset + kv) * n, where
+        # kv_cost_offset converts the KV-independent per-token work into kv
+        # equivalents. Capping each rank's chunks against the shared budget
+        # B = (kv_cost_offset + kv_depth_threshold) * max_num_tokens equalizes
+        # attention-DP lockstep iteration times with no cross-rank
+        # coordination; requests shallower than kv_depth_threshold are
+        # unaffected (the token cap binds first).
+        #
+        # Optional per-chunk depth term (default 0 = off), paid before a chunk's
+        # tokens: every chunk also costs R * kv_depth, the prefix re-read that
+        # does not shrink with the chunk size. The budget grows by
+        # R * kv_depth_threshold so a single request at the threshold still fits
+        # a full chunk.
+        # TODO(perf): promote to a config field, calibrate kv_cost_offset online.
+        kv_cost_offset = int(os.environ.get("TLLM_V2_CTX_COST_KV_OFFSET", "0"))
+        kv_depth_threshold = int(os.environ.get("TLLM_V2_CTX_COST_KV_DEPTH_THRESHOLD", "0"))
+        per_chunk_depth_tokens = int(os.environ.get("TLLM_V2_CTX_COST_PER_CHUNK_DEPTH_TOKENS", "0"))
+        self._cost_chunking_enabled = (
+            kv_cost_offset > 0
+            and kv_depth_threshold > 0
+            and max_num_tokens is not None
+            and self.chunking_enabled
+        )
+        self._kv_cost_offset = kv_cost_offset
+        self._ctx_per_chunk_depth_tokens = float(max(0, per_chunk_depth_tokens))
+        self._ctx_cost_budget: Optional[float] = None
+        if self._cost_chunking_enabled:
+            self._ctx_cost_budget = (
+                float((kv_cost_offset + kv_depth_threshold) * max_num_tokens)
+                + self._ctx_per_chunk_depth_tokens * kv_depth_threshold
+            )
+            logger.info(
+                f"KVCacheV2Scheduler: equal-cost context chunking ON, "
+                f"kv_cost_offset={kv_cost_offset}, kv_depth_threshold={kv_depth_threshold}, "
+                f"per_chunk_depth_tokens={per_chunk_depth_tokens}, "
+                f"cost_budget={self._ctx_cost_budget:.4e} token*kv"
+            )
+
         # Registered by PyExecutor; see set_async_transfer_manager.
         self._async_transfer_manager = None
 
@@ -371,6 +426,7 @@ class KVCacheV2Scheduler(RequestScheduler):
             self.max_num_tokens,
             self.max_num_requests,
             self.peft_cache_manager,
+            max_ctx_cost=self._ctx_cost_budget,
         )
 
         # Use indexed iteration (while + req_it_end) so that MAX_UTIL
@@ -635,6 +691,15 @@ class KVCacheV2Scheduler(RequestScheduler):
                 if len(scheduled_ctx) == 1:
                     scheduled_remote_mode = remote_mode
                 budget.commit(req, tokens, peft_pages)
+                if self._cost_chunking_enabled:
+                    # Charged at the same site as the token commit so the two
+                    # ledgers can never diverge. context_current_position is
+                    # still the chunk start (it advances after the forward),
+                    # i.e. the same value the cost cap priced this chunk at.
+                    budget.commit_ctx_cost(
+                        float(self._kv_cost_offset + req.context_current_position) * tokens
+                        + self._ctx_per_chunk_depth_tokens * req.context_current_position
+                    )
                 # Register the block only once the request has cleared its
                 # budget and is committed. Registering earlier, inside the check
                 # above, would let a request that then fails to schedule defer
@@ -1032,6 +1097,25 @@ class KVCacheV2Scheduler(RequestScheduler):
         chunk_size = min(
             chunk_size, remaining_budget if remaining_budget is not None else chunk_size
         )
+
+        # Equal-cost chunking: also cap the chunk by the remaining cost budget.
+        # context_current_position is valid here: prepare_context above already
+        # advanced it past the reused prefix and prior chunks.
+        if self._cost_chunking_enabled:
+            cost_rate = self._kv_cost_offset + req.context_current_position
+            # The per-chunk depth term is paid before any token of this chunk.
+            remaining_cost = (
+                budget.remaining_ctx_cost
+                - self._ctx_per_chunk_depth_tokens * req.context_current_position
+            )
+            affordable = int(remaining_cost // cost_rate) if remaining_cost > 0 else 0
+            # Head-of-line floor: the first request of an iteration gets at least
+            # a quarter of the token budget. Unit-sized chunks that each re-read
+            # the whole prefix cost more than a bounded budget overshoot.
+            hol_floor = max(self.chunk_unit_size, (self.max_num_tokens or 0) // 4)
+            if affordable < hol_floor and budget.ctx_cost == 0.0:
+                affordable = hol_floor
+            chunk_size = min(chunk_size, affordable)
 
         # Round down to chunk_unit_size boundary only when not hitting the end
         # or a checkpoint.

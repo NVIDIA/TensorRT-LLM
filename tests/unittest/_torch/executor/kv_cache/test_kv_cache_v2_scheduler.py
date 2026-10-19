@@ -5016,3 +5016,115 @@ def test_rewind_context_after_cache_drop_handles_empty_rank_local_prompt(
     assert request.context_chunk_size == prompt_len
     assert request.estimated_reusable_tokens == 0
     assert request.py_ctx_pre_resize_cap is None
+
+
+class TestEqualCostChunking:
+    """Chunks capped by (kv_cost_offset + kv_start) * n against the budget
+    B = (kv_cost_offset + kv_depth_threshold) * max_num_tokens."""
+
+    ENV = {"TLLM_V2_CTX_COST_KV_OFFSET": "140000", "TLLM_V2_CTX_COST_KV_DEPTH_THRESHOLD": "64000"}
+
+    OFF = {
+        "TLLM_V2_CTX_COST_KV_OFFSET": "0",
+        "TLLM_V2_CTX_COST_KV_DEPTH_THRESHOLD": "0",
+        "TLLM_V2_CTX_COST_PER_CHUNK_DEPTH_TOKENS": "0",
+    }
+
+    def _make(self, env=None, max_num_tokens=8192, ctx_chunk_config=(None, 64)):
+        mgr = make_kv_cache_manager(tokens_per_block=64)
+        with patch.dict("os.environ", {**self.OFF, **(env or {})}):
+            return make_scheduler(
+                mgr, max_num_tokens=max_num_tokens, ctx_chunk_config=ctx_chunk_config
+            )
+
+    def _deep_req(self, request_id, kv_start):
+        req = make_ctx_request(
+            request_id,
+            context_remaining_length=2_000_000,
+            is_first_context_chunk=False,
+            is_last_context_chunk=False,
+        )
+        req.context_current_position = kv_start
+        return req
+
+    def test_disabled_without_env(self):
+        req = self._deep_req(0, kv_start=500_000)
+        sched = self._make()
+        assert not sched._cost_chunking_enabled
+        assert sched._ctx_cost_budget is None
+        sched.schedule_request([req], set())
+        assert req.context_chunk_size == 8192
+
+    def test_disabled_when_only_one_knob_is_set(self):
+        sched = self._make({"TLLM_V2_CTX_COST_KV_OFFSET": "140000"})
+        assert not sched._cost_chunking_enabled
+        sched = self._make({"TLLM_V2_CTX_COST_KV_DEPTH_THRESHOLD": "64000"})
+        assert not sched._cost_chunking_enabled
+
+    def test_disabled_without_chunking(self):
+        """The cost cap only shapes chunks; without chunking it stays off."""
+        sched = self._make(self.ENV, ctx_chunk_config=None)
+        assert not sched._cost_chunking_enabled
+
+    def test_budget_tracker_without_cost_budget_is_unlimited(self):
+        budget = BudgetTracker(max_num_tokens=1024, max_num_requests=8)
+        assert budget.remaining_ctx_cost == float("inf")
+        budget = BudgetTracker(max_num_tokens=1024, max_num_requests=8, max_ctx_cost=100.0)
+        budget.commit_ctx_cost(40.0)
+        assert budget.remaining_ctx_cost == 60.0
+
+    def test_shallow_request_unaffected(self):
+        req = self._deep_req(0, kv_start=32_000)
+        self._make(self.ENV).schedule_request([req], set())
+        assert req.context_chunk_size == 8192  # token cap binds below kv_depth_threshold
+
+    def test_deep_request_shrinks_per_formula(self):
+        req = self._deep_req(0, kv_start=500_000)
+        self._make(self.ENV).schedule_request([req], set())
+        # B = 204000 * 8192; affordable = B // 640_000 = 2611 -> 64-aligned 2560
+        assert req.context_chunk_size == 2560
+
+    def test_leftover_cost_backfills_next_request(self):
+        deep, shallow = self._deep_req(0, 500_000), self._deep_req(1, 0)
+        out = self._make(self.ENV).schedule_request([deep, shallow], set())
+        assert ids(out.context_requests) == [0, 1]
+        assert deep.context_chunk_size == 2560
+        # leftover 32_768_000 // 140_000 = 234 -> 64-aligned 192
+        assert shallow.context_chunk_size == 192
+
+    def test_head_of_line_floor(self):
+        env = {"TLLM_V2_CTX_COST_KV_OFFSET": "100", "TLLM_V2_CTX_COST_KV_DEPTH_THRESHOLD": "100"}
+        req = self._deep_req(0, kv_start=10_000)
+        self._make(env, max_num_tokens=1024).schedule_request([req], set())
+        # affordable = 204_800 // 10_100 = 20 < floor -> floored to max_num_tokens // 4
+        assert req.context_chunk_size == 256
+
+    def test_per_chunk_depth_term_scales_with_prefix(self):
+        """TLLM_V2_CTX_COST_PER_CHUNK_DEPTH_TOKENS: every chunk also costs R * kv_depth and the
+        budget grows by R * kv_depth_threshold, so a request at the threshold still gets
+        a full chunk, a deep request pays a bigger fixed share than a shallow one, and a
+        zero-depth backfill pays nothing extra."""
+        env = dict(self.ENV, TLLM_V2_CTX_COST_PER_CHUNK_DEPTH_TOKENS="500")
+        at_threshold = self._deep_req(0, kv_start=64_000)
+        self._make(env).schedule_request([at_threshold], set())
+        assert at_threshold.context_chunk_size == 8192
+
+        deep, shallow = self._deep_req(0, 500_000), self._deep_req(1, 0)
+        out = self._make(env).schedule_request([deep, shallow], set())
+        assert ids(out.context_requests) == [0, 1]
+        # B = 204000 * 8192 + 500 * 64000 = 1_703_168_000
+        # deep: (B - 500 * 500_000) // 640_000 = 2270 -> 64-aligned 2240
+        assert deep.context_chunk_size == 2240
+        # leftover 1_703_168_000 - (640_000 * 2240 + 250_000_000) = 19_568_000; depth term
+        # at kv 0 is 0 -> 19_568_000 // 140_000 = 139 -> 128
+        assert shallow.context_chunk_size == 128
+
+        # A depth term the leftover cannot pay skips the backfill instead of over-committing.
+        env = dict(self.ENV, TLLM_V2_CTX_COST_PER_CHUNK_DEPTH_TOKENS="1000")
+        deep, shallow = self._deep_req(0, 500_000), self._deep_req(1, 0)
+        out = self._make(env).schedule_request([deep, shallow], set())
+        # B = 204000 * 8192 + 1000 * 64000 = 1_735_168_000; deep: (B - 500_000_000) // 640_000 = 1929,
+        # below the head-of-line floor max_num_tokens // 4 = 2048 -> the first request gets 2048
+        assert deep.context_chunk_size == 2048
+        # leftover 1_735_168_000 - (640_000 * 2048 + 500_000_000) < 0 -> the backfill is skipped
+        assert ids(out.context_requests) == [0]
