@@ -16,7 +16,6 @@ walks each row's own selected columns instead, as the per-row kernel does.
 from __future__ import annotations
 
 import math
-import os
 
 import cutlass
 import cutlass.cute as cute
@@ -29,12 +28,13 @@ from cutlass.cutlass_dsl import T, dsl_user_op
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 from tensorrt_llm._torch.cute_dsl_kernels.blackwell.utils import make_ptr
+from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
 
 from .qsa_paged_sparse_gqa import qsa_paged_sparse_gqa as _per_row_entry
+from .qsa_rowtile_attention_cute import BLOCK_M, BLOCK_N
 from .qsa_rowtile_attention_cute import eligible as _cute_eligible
 from .qsa_rowtile_attention_cute import rowtile_attention_cute as _rowtile_attention_cute
 
-_LOG2_E = 1.4426950408889634
 _INTEGER_DTYPES = (torch.int32, torch.int64)
 # The per-row kernel's scan tile: the prefill bound is rounded up to it, so the
 # bitmap reads exactly the columns that kernel reads.
@@ -43,75 +43,25 @@ _BOUND_TILE = 64
 _LONE_PROGRAMS = 256  # capacity: fixed: a launch width; the lone list may be any length
 # Bitmap words the plan pass unions and packs per loop step.
 _PLAN_WORDS = 16  # capacity: fixed: a loop step; the plan loops over every word
-
-
-def _pdl_enabled() -> bool:
-    if os.environ.get("TRTLLM_ENABLE_PDL", "1") != "1":
-        return False
-    return torch.cuda.get_device_capability()[0] >= 9
-
-
-@triton.jit
-def _rowtile_bits_kernel(
-    selected_tokens,
-    query_positions,
-    bits,
-    row_info,
-    selected_stride_row,
-    selected_stride_token,
-    bits_stride_row,
-    TOPK: tl.constexpr,
-    BLOCK_TOPK: tl.constexpr,
-    COMPRESS_RATIO: tl.constexpr,
-    TOKENS_PER_BLOCK: tl.constexpr,
-    PAGE_TABLE_WIDTH: tl.constexpr,
-    BOUND_TILE: tl.constexpr,
-    BLOCK_C: tl.constexpr,
-):
-    """Row `r`: OR a bit per readable selected token into `bits[r]`; record the
-    highest such token and the number of columns read in `row_info[r]`."""
-    row = tl.program_id(0).to(tl.int64)
-    visible_tokens = tl.load(query_positions + row) + 1
-    selected_blocks = tl.minimum(visible_tokens // COMPRESS_RATIO, BLOCK_TOPK)
-    valid_tokens = selected_blocks * COMPRESS_RATIO + visible_tokens % COMPRESS_RATIO
-    columns_read = tl.minimum(
-        tl.cdiv(tl.minimum(valid_tokens, TOPK), BOUND_TILE) * BOUND_TILE, TOPK
-    )
-    columns_read = tl.maximum(columns_read, 0).to(tl.int32)
-    offsets = tl.arange(0, BLOCK_C)
-    highest = tl.full([BLOCK_C], -1, tl.int32)
-    one = tl.full([BLOCK_C], 1, tl.int64)
-    for start in tl.range(0, columns_read, BLOCK_C):
-        columns = start + offsets
-        in_bound = columns < columns_read
-        tokens = tl.load(
-            selected_tokens + row * selected_stride_row + columns * selected_stride_token,
-            mask=in_bound,
-            other=-1,
-        ).to(tl.int32)
-        readable = in_bound & (tokens >= 0) & (tokens // TOKENS_PER_BLOCK < PAGE_TABLE_WIDTH)
-        safe = tl.maximum(tokens, 0)
-        tl.atomic_or(
-            bits + row * bits_stride_row + (safe >> 6),
-            one << (safe & 63).to(tl.int64),
-            mask=readable,
-            sem="relaxed",
-        )
-        highest = tl.maximum(highest, tl.where(readable, tokens, -1))
-    tl.store(row_info + row * 2, tl.max(highest, axis=0))
-    tl.store(row_info + row * 2 + 1, columns_read)
+# A one-request group takes the row-tile pass when its list's 64-slot tiles, each costing
+# this many quarters of a per-row tile (2.5x), cost no more than its rows' own columns.
+_SHARED_TILE_COST = 10
+_PLAN_WARPS = 4
+_LONE_WARPS = 2
+_LONE_STAGES = 2
 
 
 # --------------------------------------------------------------------------------------
-# The bitmap pass in CuTe DSL (Tier 6). The Triton pass above ORs every readable selected
-# token's bit into a zeroed global bitmap with a global `atomic_or` (~2051 a row). Here a
-# CTA owns one row: the row's selection is staged in shared memory with coalesced loads,
-# each thread walks `_BITS_RUN` consecutive columns, ORs the bits of one 64-token word in a
-# register and flushes the word into a shared-memory bitmap with one `red.shared.or.b64`
-# when the run leaves it; then the CTA writes every word of the row and `row_info`. The
-# result is the Triton pass's, word for word, in any column order (OR is idempotent and
-# commutative); the order only decides how few flushes a run makes, and the selection
-# arrives in token order. No memset of the bitmap is needed.
+# The bitmap pass (CuTe DSL, Tier 6). Row `r`: one bit per readable selected token (a
+# column below the per-row kernel's prefill bound naming a token >= 0 whose page is inside
+# the table) set in `bits[r]`, and the highest such token and the number of columns read
+# in `row_info[r]`. A CTA owns one row: the row's selection is staged in shared memory with
+# coalesced loads, each thread walks `_BITS_RUN` consecutive columns, ORs the bits of one
+# 64-token word in a register and flushes the word into a shared-memory bitmap with one
+# `red.shared.or.b64` when the run leaves it; then the CTA writes every word of the row and
+# `row_info`. Any column order gives the same words (OR is idempotent and commutative); the
+# order only decides how few flushes a run makes, and the selection arrives in token order.
+# No memset of the bitmap is needed.
 # --------------------------------------------------------------------------------------
 
 _BITS_THREADS = 128
@@ -135,7 +85,7 @@ def _red_or_shared(addr, val, *, loc=None, ip=None):
 
 
 class _RowBitsKernel:
-    """`_rowtile_bits_kernel`'s `bits` and `row_info`, one CTA a row."""
+    """The bitmap pass's `bits` and `row_info`, one CTA a row."""
 
     def __init__(self, topk, block_topk, compress_ratio, tokens_per_block, table_width, num_words):
         self.topk, self.block_topk, self.cr = topk, block_topk, compress_ratio
@@ -245,23 +195,13 @@ _ROW_BITS: dict = {}
 def _row_bits(
     selected_tokens, query_positions, compress_ratio, tokens_per_block, table_width, num_words
 ):
-    """`(bits [rows, num_words] int64, row_info [rows, 2] int32)` of the bitmap pass: the
-    CuTe kernel when the selection has unit column stride, the Triton pass otherwise."""
+    """`(bits [rows, num_words] int64, row_info [rows, 2] int32)` of the bitmap pass over a
+    selection with unit column stride."""
     rows, final_topk = selected_tokens.shape
     block_topk = (final_topk - compress_ratio + 1) // compress_ratio
     device = selected_tokens.device
     row_info = torch.empty((rows, 2), dtype=torch.int32, device=device)
     query_positions = query_positions.contiguous()
-    if selected_tokens.stride(1) != 1:
-        bits = torch.zeros((rows, num_words), dtype=torch.int64, device=device)
-        _rowtile_bits_kernel[(rows,)](
-            selected_tokens, query_positions, bits, row_info,
-            selected_tokens.stride(0), selected_tokens.stride(1), bits.stride(0),
-            TOPK=final_topk, BLOCK_TOPK=block_topk, COMPRESS_RATIO=compress_ratio,
-            TOKENS_PER_BLOCK=tokens_per_block, PAGE_TABLE_WIDTH=table_width,
-            BOUND_TILE=_BOUND_TILE, BLOCK_C=1024, num_warps=4,
-        )  # fmt: skip
-        return bits, row_info
     bits = torch.empty((rows, num_words), dtype=torch.int64, device=device)
     key = (
         final_topk, compress_ratio, tokens_per_block, table_width,
@@ -400,123 +340,6 @@ def _rowtile_plan_kernel(
     if not shared:
         base = tl.atomic_add(lone_count, tl.sum(live.to(tl.int32), axis=0))
         tl.store(lone_rows + base + offsets, members.to(tl.int32), mask=live)
-
-
-@triton.jit
-def _rowtile_attention_kernel(
-    q, k_cache, v_cache, slots, packed_bits, group_plan, output,
-    softmax_scale, rows,
-    q_stride_row: tl.constexpr, q_stride_head: tl.constexpr, q_stride_dim: tl.constexpr,
-    k_stride_page: tl.constexpr, k_stride_head: tl.constexpr,
-    k_stride_token: tl.constexpr, k_stride_dim: tl.constexpr,
-    v_stride_page: tl.constexpr, v_stride_head: tl.constexpr,
-    v_stride_token: tl.constexpr, v_stride_dim: tl.constexpr,
-    slots_stride_group: tl.constexpr, bits_stride_row: tl.constexpr,
-    output_stride_row: tl.constexpr, output_stride_head: tl.constexpr,
-    output_stride_dim: tl.constexpr,
-    GROUP_SIZE: tl.constexpr, TOKENS_PER_BLOCK: tl.constexpr, ROWS_PER_TILE: tl.constexpr,
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
-    HEAD_DIM: tl.constexpr, RESCALE_THRESHOLD: tl.constexpr, NUM_STAGES: tl.constexpr,
-    WARP_SPECIALIZE: tl.constexpr, USE_PDL: tl.constexpr,
-):  # fmt: skip
-    """A group of rows of one request: walk the group's packed slot list in
-    64-slot tiles, each tile's K/V loaded once for all rows and heads, each
-    row masked to its own packed bitmap word. Groups the plan did not take
-    exit here and are served row by row by `_rowtile_lone_kernel`."""
-    group = tl.program_id(0).to(tl.int64)
-    kv_head = tl.program_id(1)
-    tiles = tl.load(group_plan + group * 2)
-    if tiles < 0:
-        if USE_PDL:
-            # The lone pass may still be running: exit only once it has, so a
-            # later launch on the stream sees every row written.
-            tl.extra.cuda.gdc_wait()
-        return
-    listed = tl.load(group_plan + group * 2 + 1)
-    slot_base = slots + group * slots_stride_group
-    m = tl.arange(0, BLOCK_M)
-    local_row = m // GROUP_SIZE
-    head = m % GROUP_SIZE
-    row = group * ROWS_PER_TILE + local_row
-    live = (local_row < ROWS_PER_TILE) & (row < rows)
-    safe_row = tl.where(live, row, 0)
-
-    dim_offsets = tl.arange(0, HEAD_DIM)
-    query_heads = kv_head * GROUP_SIZE + head
-    q_tile = tl.load(
-        q + safe_row[:, None] * q_stride_row + query_heads[:, None] * q_stride_head
-        + dim_offsets[None, :] * q_stride_dim,
-        mask=live[:, None],
-        other=0.0,
-    )  # fmt: skip
-    accumulator = tl.zeros([BLOCK_M, HEAD_DIM], tl.float32)
-    # Finite, so a row with nothing yet attended rescales by exactly zero.
-    running_max = tl.full([BLOCK_M], -1.0e30, tl.float32)
-    running_sum = tl.zeros([BLOCK_M], tl.float32)
-    token_offsets = tl.arange(0, BLOCK_N)
-    # The packed bitmap as int32 halves: word 2t holds list entries [64t, 64t+32), 2t+1 the rest.
-    word_base = packed_bits + safe_row * bits_stride_row
-    in_high_half = token_offsets >= 32
-    # Moves bit (n % 32) of a word to the sign bit, so a select is one compare.
-    to_sign = 31 - token_offsets % 32
-    for tile in tl.range(0, tiles, num_stages=NUM_STAGES, warp_specialize=WARP_SPECIALIZE):
-        low = tl.load(word_base + 2 * tile, mask=live, other=0)
-        high = tl.load(word_base + 2 * tile + 1, mask=live, other=0)
-        entries = tile * BLOCK_N + token_offsets
-        usable = entries < listed
-        cache_slots = tl.load(slot_base + entries, mask=usable, other=0)
-        safe_pages = (cache_slots // TOKENS_PER_BLOCK).to(tl.int64)
-        token_in_page = cache_slots % TOKENS_PER_BLOCK
-        # K and V tiles share one [slots, dim] layout, so the slot list is read
-        # in one layout per tile; the QK product takes K transposed.
-        keys = tl.trans(tl.load(
-            k_cache + safe_pages[:, None] * k_stride_page + kv_head * k_stride_head
-            + token_in_page[:, None] * k_stride_token + dim_offsets[None, :] * k_stride_dim,
-            mask=usable[:, None],
-            other=0.0,
-        ).to(q_tile.dtype))  # fmt: skip
-        values = tl.load(
-            v_cache + safe_pages[:, None] * v_stride_page + kv_head * v_stride_head
-            + token_in_page[:, None] * v_stride_token + dim_offsets[None, :] * v_stride_dim,
-            mask=usable[:, None],
-            other=0.0,
-        ).to(q_tile.dtype)  # fmt: skip
-        # A row's bits are set only on listed entries, so they already imply residency.
-        word = tl.where(in_high_half[None, :], high[:, None], low[:, None])
-        attend = (word << to_sign[None, :]) < 0
-        scores = tl.dot(q_tile, keys) * (softmax_scale * 1.4426950408889634)
-        scores = tl.where(attend, scores, -float("inf"))
-        next_max = tl.maximum(running_max, tl.max(scores, axis=1))
-        if RESCALE_THRESHOLD > 0:
-            # Rescale only when some row's maximum grew past the threshold;
-            # otherwise exponentiate against the stale maximum (probabilities
-            # stay below 2**RESCALE_THRESHOLD; the final division is unchanged).
-            if tl.max(next_max - running_max, axis=0) > RESCALE_THRESHOLD:
-                correction = tl.math.exp2(running_max - next_max)
-                accumulator = accumulator * correction[:, None]
-                running_sum = running_sum * correction
-                running_max = next_max
-        else:
-            correction = tl.math.exp2(running_max - next_max)
-            accumulator = accumulator * correction[:, None]
-            running_sum = running_sum * correction
-            running_max = next_max
-        # Unattended scores are -inf, so their probabilities are exactly zero.
-        probabilities = tl.math.exp2(scores - running_max[:, None])
-        accumulator = tl.dot(probabilities.to(q_tile.dtype), values, accumulator)
-        running_sum = running_sum + tl.sum(probabilities, axis=1)
-
-    normalized = tl.where(
-        running_sum[:, None] > 0, accumulator / tl.maximum(running_sum[:, None], 1.0e-20), 0.0
-    )
-    tl.store(
-        output + safe_row[:, None] * output_stride_row + query_heads[:, None] * output_stride_head
-        + dim_offsets[None, :] * output_stride_dim,
-        normalized.to(output.dtype.element_ty),
-        mask=live[:, None],
-    )  # fmt: skip
-    if USE_PDL:
-        tl.extra.cuda.gdc_wait()
 
 
 @triton.jit
@@ -663,12 +486,12 @@ def _check_inputs(q, k_cache, v_cache, block_table, selected_tokens, request_ind
         raise ValueError("QSA cache token dimension must match positive tokens_per_block")
     if k_cache.shape[3] != head_dim or k_cache.dtype != v_cache.dtype:
         raise ValueError("QSA query and K/V cache head geometry is incompatible")
-    if q.dtype not in (torch.bfloat16, torch.float16):
-        raise ValueError("QSA queries must use BF16 or FP16")
-    if k_cache.dtype not in (torch.bfloat16, torch.float16, torch.float8_e4m3fn):
-        raise ValueError("QSA K/V cache must use BF16, FP16, or FP8 E4M3")
-    if head_dim < 16 or head_dim & (head_dim - 1):
-        raise ValueError("QSA sparse GQA requires a power-of-two head dimension")
+    if q.dtype != torch.bfloat16:
+        raise ValueError("QSA queries must use BF16")
+    if k_cache.dtype != torch.bfloat16:
+        raise ValueError("QSA K/V cache must use BF16")
+    if selected_tokens.stride(1) != 1:
+        raise ValueError("QSA selected tokens must have unit column stride")
     num_kv_heads = k_cache.shape[1]
     if num_kv_heads <= 0 or num_q_heads <= 0 or num_q_heads % num_kv_heads:
         raise ValueError("QSA query heads must be divisible by non-zero KV heads")
@@ -691,6 +514,13 @@ def _check_inputs(q, k_cache, v_cache, block_table, selected_tokens, request_ind
                                   request_indices, query_positions)}  # fmt: skip
     if len(devices) != 1 or next(iter(devices)).type != "cuda":
         raise ValueError("QSA row-tile sparse GQA needs every tensor on one CUDA device")
+    if num_q_heads // num_kv_heads > BLOCK_M:
+        raise ValueError("a row's query heads per KV head must fit the 128-row tile")
+    if not _cute_eligible(q, k_cache, v_cache):
+        raise ValueError(
+            "the row-tile pass needs SM103, head_dim 256, unit-stride heads (q's heads packed) "
+            "and 16-byte-aligned rows"
+        )
 
 
 def qsa_rowtile_sparse_gqa(
@@ -705,40 +535,23 @@ def qsa_rowtile_sparse_gqa(
     softmax_scale: float,
     query_positions: torch.Tensor,
     compress_ratio: int,
-    block_m: int = 128,
-    block_n: int = 64,
-    num_warps: int = 8,
-    num_stages: int = 3,
-    rescale_threshold: float = 0.0,
-    warp_specialize: bool = False,
-    shared_tile_cost: int = 10,
-    lone_warps: int = 2,
-    lone_stages: int = 2,
-    plan_warps: int = 4,
-    plan_words: int = _PLAN_WORDS,
 ) -> torch.Tensor:
-    """Bitmap pass, plan pass, lone-row pass, row-tile pass; returns `[rows, Hq, D]` contiguous.
-    The row-tile pass runs `qsa_rowtile_attention_cute` where it is eligible (SM103, bf16 q and
-    K/V, D = 256, the default tile) and the Triton kernel otherwise; the Triton launch knobs
-    (`num_warps`, `num_stages`, `rescale_threshold`, `warp_specialize`) apply to the latter."""
+    """Bitmap pass, plan pass, lone-row pass, row-tile pass (`qsa_rowtile_attention_cute`);
+    returns `[rows, Hq, D]` contiguous."""
     _check_inputs(q, k_cache, v_cache, block_table, selected_tokens, request_indices,
                   tokens_per_block, softmax_scale, query_positions, compress_ratio)  # fmt: skip
     rows, num_q_heads, head_dim = q.shape
     num_kv_heads = k_cache.shape[1]
     group_size = num_q_heads // num_kv_heads
-    if block_m < group_size or block_m & (block_m - 1):
-        raise ValueError("block_m must be a power of two holding at least one row's heads")
     output = torch.empty((rows, num_q_heads, head_dim), dtype=q.dtype, device=q.device)
     if rows == 0:
         return output
     table_width = block_table.shape[1]
-    if block_n != 64:
-        raise ValueError("block_n must be the 64-token bitmap word")
     num_words = triton.cdiv(table_width * tokens_per_block, 64)
     bits, row_info = _row_bits(
         selected_tokens, query_positions, compress_ratio, tokens_per_block, table_width, num_words
     )
-    rows_per_tile = block_m // group_size
+    rows_per_tile = BLOCK_M // group_size
     rows_pow2 = triton.next_power_of_2(rows_per_tile)
     kv_strides = (
         k_cache.stride(0), k_cache.stride(1), k_cache.stride(2), k_cache.stride(3),
@@ -764,35 +577,23 @@ def qsa_rowtile_sparse_gqa(
         lone_rows, lone_count, rows,
         bits.stride(0), block_table.stride(0), block_table.stride(1), slots.stride(0),
         ROWS_PER_TILE=rows_per_tile, NUM_REQUESTS=block_table.shape[0], ROWS_POW2=rows_pow2,
-        BLOCK_N=block_n, SHARED_TILE_COST=shared_tile_cost, NUM_CACHE_PAGES=k_cache.shape[0],
+        BLOCK_N=BLOCK_N, SHARED_TILE_COST=_SHARED_TILE_COST, NUM_CACHE_PAGES=k_cache.shape[0],
         PAGE_TABLE_WIDTH=table_width, TOKENS_PER_BLOCK=tokens_per_block,
-        PLAN_WORDS=plan_words, num_warps=plan_warps,
+        PLAN_WORDS=_PLAN_WORDS, num_warps=_PLAN_WARPS,
     )  # fmt: skip
-    use_pdl = _pdl_enabled()
+    use_pdl = get_env_enable_pdl()
     _rowtile_lone_kernel[(min(rows, _LONE_PROGRAMS), num_kv_heads)](
         q, k_cache, v_cache, block_table, selected_tokens, request_indices, row_info,
         lone_rows, lone_count, output, softmax_scale, rows,
         *common, selected_tokens.stride(0), selected_tokens.stride(1), *out_strides,
         BLOCK_H=max(16, triton.next_power_of_2(group_size)), BLOCK_N=64,
-        LONE_PROGRAMS=min(rows, _LONE_PROGRAMS), USE_PDL=use_pdl, LONE_STAGES=lone_stages,
-        num_warps=lone_warps, **geometry,
+        LONE_PROGRAMS=min(rows, _LONE_PROGRAMS), USE_PDL=use_pdl, LONE_STAGES=_LONE_STAGES,
+        num_warps=_LONE_WARPS, **geometry,
     )  # fmt: skip
-    if _cute_eligible(q, k_cache, v_cache, block_m, block_n):
-        _rowtile_attention_cute[(num_groups, num_kv_heads)](
-            q, k_cache, v_cache, slots, packed_bits, group_plan, output, softmax_scale, rows,
-            group_size=group_size, rows_per_tile=rows_per_tile, tokens_per_block=tokens_per_block,
-            use_pdl=use_pdl,
-        )  # fmt: skip
-        return output
-    _rowtile_attention_kernel[(num_groups, num_kv_heads)](
-        q, k_cache, v_cache, slots, packed_bits.view(torch.int32), group_plan, output,
-        softmax_scale, rows, *q_strides, *kv_strides, slots.stride(0), 2 * packed_bits.stride(0),
-        *out_strides,
-        GROUP_SIZE=group_size, TOKENS_PER_BLOCK=tokens_per_block, ROWS_PER_TILE=rows_per_tile,
-        BLOCK_M=block_m, BLOCK_N=block_n, HEAD_DIM=head_dim,
-        RESCALE_THRESHOLD=rescale_threshold, NUM_STAGES=num_stages,
-        WARP_SPECIALIZE=warp_specialize, USE_PDL=use_pdl,
-        num_warps=num_warps, launch_pdl=use_pdl,
+    _rowtile_attention_cute[(num_groups, num_kv_heads)](
+        q, k_cache, v_cache, slots, packed_bits, group_plan, output, softmax_scale, rows,
+        group_size=group_size, rows_per_tile=rows_per_tile, tokens_per_block=tokens_per_block,
+        use_pdl=use_pdl,
     )  # fmt: skip
     return output
 
@@ -858,9 +659,9 @@ class QsaSparseGqaRowtile(OpWrapper):
     (group, KV head), loads each listed tile's K/V once for the 120 (row,
     head) pairs and masks each row to its own re-indexed bits; it is launched
     programmatically dependent on the lone pass, whose rows are disjoint, so
-    the two overlap. On SM103 with bf16 q and K/V and D = 256 that pass is
-    `qsa_rowtile_attention_cute` (tcgen05 MMAs, S / P / O in tensor memory,
-    a cp.async gather of the K/V rows), elsewhere a Triton kernel.
+    the two overlap. That pass is `qsa_rowtile_attention_cute` (tcgen05 MMAs,
+    S / P / O in tensor memory, a cp.async gather of the K/V rows), so the entry
+    serves SM103, bf16 q and K/V and D = 256.
 
     Fusion boundary: as `qsa_paged_sparse_gqa` -- the block-table gather,
     scale, online softmax and P.V are inside; deciding what to attend to,
@@ -914,14 +715,6 @@ class QsaSparseGqaRowtile(OpWrapper):
             ),
         ),  # fmt: skip
         Cell(
-            why="fp16 pool and fp16 q",
-            spec=_spec([(1900, 300)], cache_dtype=torch.float16, q_dtype=torch.float16),
-        ),
-        Cell(
-            why="fp8-e4m3 pool under a bf16 q, read unscaled",
-            spec=_spec([(1900, 300)], cache_dtype=torch.float8_e4m3fn),
-        ),
-        Cell(
             why="int64 request indices and positions",
             spec=_spec([(1000, 300)], request_dtype=torch.int64),
         ),
@@ -966,10 +759,9 @@ class QsaSparseGqaRowtile(OpWrapper):
     leave almost no gap in the union, and the call costs what the full walk
     does (16292-row mixed step: 3859 vs 3836 us). Below a few hundred rows
     it is slower than the per-row kernel (generation-only launches 1.4-2x);
-    the campaign's context launches are thousands of rows. The tensor-core
+    the target's served context launches are thousands of rows. The tensor-core
     row-tile pass alone, on two dumped 16384-row context launches of the
-    target (GB300, same plan): 631 and 887 us against 1597 and 2313 us for
-    the Triton pass.
+    target (GB300): 631 and 887 us.
 
     Scratch per call: the bitmap and the re-indexed bitmap, each `rows x
     ceil(table_width * tpb / 64)` int64 words (21 MB at 16384 rows and 320

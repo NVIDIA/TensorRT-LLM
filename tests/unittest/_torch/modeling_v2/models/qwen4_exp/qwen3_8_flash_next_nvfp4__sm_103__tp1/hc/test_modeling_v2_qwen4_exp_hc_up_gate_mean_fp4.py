@@ -12,12 +12,12 @@ import pytest
 import torch
 
 import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtllm.*
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.quantization.fp4_quantize import (
+    Fp4Quantize,
+    fp4_quantize,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.hc.qwen4_exp_gated_residual import (  # noqa: E501
     gate_ratio,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.hc.qwen4_exp_hc_decode_mix_fp4 import (  # noqa: E501
-    nvfp4_near_tie,
-    nvfp4_reference,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.hc.qwen4_exp_hc_up_gate_mean import (  # noqa: E501
     qwen4_exp_hc_up_gate_mean,
@@ -32,6 +32,18 @@ from _validating import certifying, validating  # noqa: E402,F401 — path above
 assert torch.cuda.is_available(), "qwen4_exp_hc_up_gate_mean_fp4 requires a CUDA device"
 
 DEV = "cuda"
+
+
+def nvfp4_reference(x, gs):
+    """`fp4_quantize`'s native-torch NVFP4 of `x` `[T, K]` with linear scales:
+    `(packed [T, K/2] uint8, sf [T*K/16] uint8)`."""
+    return fp4_quantize.reference(x, gs, 16, False, False)
+
+
+def nvfp4_near_tie(x, gs):
+    """`[T, K]` bool: elements within `fp4_quantize`'s tie window of an e2m1 midpoint,
+    where the kernels' approximate reciprocals may round either way."""
+    return Fp4Quantize.near_tie(fp4_quantize.scaled(x, gs, 16))
 
 
 def _unpack(xq: torch.Tensor) -> torch.Tensor:

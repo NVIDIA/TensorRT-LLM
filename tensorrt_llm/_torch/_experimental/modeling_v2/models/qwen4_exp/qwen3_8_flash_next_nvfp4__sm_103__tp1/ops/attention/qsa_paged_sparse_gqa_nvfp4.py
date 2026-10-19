@@ -4,7 +4,6 @@
 
 from __future__ import annotations
 
-import os
 from typing import Optional
 
 import torch
@@ -12,7 +11,13 @@ import triton
 import triton.language as tl
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
-from tensorrt_llm._utils import get_sm_version
+
+# Approved exception (as for `qsa_paged_sparse_gqa`): QSA's sparse path has no torch.ops
+# surface; its split-K buckets and row-count PDL policy are reached as Python.
+from tensorrt_llm._torch.attention.backends.sparse.qsa.kernels import (
+    _qsa_pdl_enabled,
+    _qsa_splitk_launch_config,
+)
 
 #: Base-2 online softmax: scores are scaled by log2(e) once.
 _LOG2_E = tl.constexpr(1.4426950408889634)
@@ -570,30 +575,6 @@ def _nvfp4_merge_splitk_kernel(
     tl.store(output + row * output_stride_row + head * output_stride_head + dim_offsets, merged)
 
 
-def _splitk_launch_config(
-    rows: int, num_kv_heads: int, selected_width: int
-) -> tuple[int, int, int]:
-    """(BLOCK_N, splits, warps): the QSA split-K buckets by programs = rows x Hkv."""
-    base_programs = rows * num_kv_heads
-    if base_programs <= 4:
-        block_n, target_splits, num_warps = 16, 64, 4
-    elif base_programs < 32:
-        block_n, target_splits, num_warps = 16, 32, 4
-    elif base_programs <= 256:
-        block_n, target_splits, num_warps = 64, 8, 2
-    elif base_programs <= 512:
-        block_n, target_splits, num_warps = 64, 4, 2
-    else:
-        block_n, target_splits, num_warps = 64, 1, 2
-    num_tiles = triton.cdiv(selected_width, block_n)
-    max_useful_splits = 1 << (num_tiles.bit_length() - 1)
-    return block_n, min(max_useful_splits, target_splits), num_warps
-
-
-def _pdl_enabled(rows: int) -> bool:
-    return rows <= 4 and os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1" and get_sm_version() >= 90
-
-
 def _sparse_gqa_nvfp4(
     *,
     q: torch.Tensor,
@@ -749,11 +730,11 @@ def _sparse_gqa_nvfp4(
         )
         return output
 
-    block_n, num_splits, num_warps = _splitk_launch_config(
+    block_n, num_splits, num_warps = _qsa_splitk_launch_config(
         rows, num_kv_heads, selected_tokens.shape[1]
     )
     num_tiles = triton.cdiv(selected_tokens.shape[1], block_n)
-    use_pdl = num_splits > 1 and _pdl_enabled(rows)
+    use_pdl = num_splits > 1 and _qsa_pdl_enabled(rows)
     if num_splits == 1:
         partial_output = partial_lse = output
     else:

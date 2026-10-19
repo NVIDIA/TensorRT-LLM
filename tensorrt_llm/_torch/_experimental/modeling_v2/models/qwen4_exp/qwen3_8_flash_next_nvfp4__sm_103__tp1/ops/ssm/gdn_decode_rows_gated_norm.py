@@ -3,10 +3,10 @@
 """One Gated-DeltaNet decode step per row and the gated RMS norm on its output, streamed
 over the fp32 state pool: the decode step at batch sizes past the cluster kernel's.
 
-Tier 6 (CuTe DSL written for this target; the recurrence is the gated delta rule as
-`gated_delta_rule_decode_pretranspose` states it, reimplemented here). At a decode batch
-the step is the pool's traffic -- each (row, v-head) state, 64 KB fp32, read and written
-once -- so a CTA owns one whole state and streams it: warp w the value rows
+Tier 6 (CuTe DSL written for this target; the recurrence is the gated delta rule of
+FlashInfer's `gdn_decode.gated_delta_rule_decode_pretranspose`, reimplemented here). At a
+decode batch the step is the pool's traffic -- each (row, v-head) state, 64 KB fp32, read
+and written once -- so a CTA owns one whole state and streams it: warp w the value rows
 [w * RPW, (w + 1) * RPW), lane l the key columns [4l, 4l + 4) of each, so a warp's
 access is one contiguous 512-byte state row. The state is loaded before
 `griddepcontrol.wait` (nothing in the step writes it ahead of this kernel). The two dot
@@ -29,13 +29,11 @@ from cutlass.cute.runtime import from_dlpack
 from cutlass.cutlass_dsl import T, dsl_user_op
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.ssm.gated_delta_rule_decode_pretranspose import (  # noqa: E501
-    gated_delta_rule_decode_pretranspose as _recurrence,
-)
 from tensorrt_llm._torch.cute_dsl_kernels.blackwell.utils import make_ptr
+from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
 
-from ..norm.rms_norm_gated_token_major import rms_norm_gated_token_major as _gated_norm
-from .gdn_decode_gated_norm_pdl import pdl_enabled
+from .gdn_decode_gated_norm_pdl import _recurrence_reference
+from .gdn_decode_gated_norm_pdl import gdn_decode_gated_norm_pdl as _one_launch
 
 #: Key columns a lane (a 16-byte vector of a state row).
 _PL = 4
@@ -388,10 +386,7 @@ def launch(proj, pool, slots, A_log, dt_bias, norm_weight, eps, k_heads, kdim, p
         out = torch.empty((rows, v_heads * vdim), dtype=torch.bfloat16, device=proj.device)
     if rows == 0:
         return out
-    dev = proj.device
-    pdl = bool(
-        pdl and pdl_enabled(dev.index if dev.index is not None else torch.cuda.current_device())
-    )
+    pdl = bool(pdl and get_env_enable_pdl())
     key = (k_heads, v_heads, kdim, vdim, pdl, norm)
     ptrs = (
         proj,
@@ -497,8 +492,8 @@ class GdnDecodeRowsGatedNorm(OpWrapper):
 
     Numerics: fp32 inside; each dot product over K is a lane's 4-term FMA chain and then
     the transposed reduction's tree; `o` rounded to bf16 before the norm, the output
-    rounded once. Inside the recurrence entry's band (torch's default for bf16 / fp32)
-    of the composition's float64 reference, not bitwise FlashInfer's kernel.
+    rounded once. Inside torch's default band for bf16 / fp32 of the composition's
+    float64 reference, not bitwise FlashInfer's kernel.
     """
 
     def __call__(
@@ -529,35 +524,12 @@ class GdnDecodeRowsGatedNorm(OpWrapper):
         kdim: int,
         pdl: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """`(out, pool_after)`: the recurrence entry's fp64 reference (o rounded to
-        bf16, the pool to fp32), then the gated norm entry's fp32 reference."""
-        rows = proj.shape[0]
-        v_heads, vdim = pool.shape[1], pool.shape[2]
-        q, k, v, z, a, b = torch.split(
-            proj,
-            [k_heads * kdim, k_heads * kdim, v_heads * vdim, v_heads * vdim, v_heads, v_heads],
-            1,
+        """`(out, pool_after)`: `gdn_decode_gated_norm_pdl`'s reference, the same contract --
+        the fp64 recurrence (o rounded to bf16, the pool to fp32), then the gated norm
+        entry's fp32 reference."""
+        return _one_launch.reference(
+            proj, pool, slots, A_log, dt_bias, norm_weight, eps, k_heads, kdim, pdl
         )
-        o, pool_after = _recurrence.reference(
-            q=q.reshape(rows, 1, k_heads, kdim),
-            k=k.reshape(rows, 1, k_heads, kdim),
-            v=v.reshape(rows, 1, v_heads, vdim),
-            state=None,
-            A_log=A_log,
-            a=a.reshape(rows, 1, v_heads),
-            dt_bias=dt_bias,
-            b=b.reshape(rows, 1, v_heads),
-            scale=None,
-            output=torch.empty(rows, 1, v_heads, vdim, dtype=torch.bfloat16, device=proj.device),
-            use_qk_l2norm=True,
-            initial_state=pool,
-            initial_state_indices=slots,
-            output_state_indices=None,
-        )
-        out = _gated_norm.reference(
-            o.reshape(-1, vdim), z.reshape(rows, v_heads, vdim), norm_weight, eps, None, "sigmoid"
-        )
-        return out.reshape(rows, v_heads * vdim), pool_after
 
     def is_valid(
         self,
@@ -655,7 +627,7 @@ class GdnDecodeRows(OpWrapper):
         out: torch.Tensor,
         pdl: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """`(o, pool_after)`: the recurrence entry's fp64 reference, o rounded to bf16."""
+        """`(o, pool_after)`: the fp64 recurrence, o rounded to bf16 (the pool to fp32)."""
         rows = proj.shape[0]
         v_heads, vdim = pool.shape[1], pool.shape[2]
         q, k, v, _, a, b = torch.split(
@@ -663,21 +635,16 @@ class GdnDecodeRows(OpWrapper):
             [k_heads * kdim, k_heads * kdim, v_heads * vdim, v_heads * vdim, v_heads, v_heads],
             1,
         )
-        o, pool_after = _recurrence.reference(
-            q=q.reshape(rows, 1, k_heads, kdim),
-            k=k.reshape(rows, 1, k_heads, kdim),
-            v=v.reshape(rows, 1, v_heads, vdim),
-            state=None,
-            A_log=A_log,
-            a=a.reshape(rows, 1, v_heads),
-            dt_bias=dt_bias,
-            b=b.reshape(rows, 1, v_heads),
-            scale=None,
-            output=torch.empty(rows, 1, v_heads, vdim, dtype=torch.bfloat16, device=proj.device),
-            use_qk_l2norm=True,
-            initial_state=pool,
-            initial_state_indices=slots,
-            output_state_indices=None,
+        o, pool_after = _recurrence_reference(
+            q.reshape(rows, 1, k_heads, kdim),
+            k.reshape(rows, 1, k_heads, kdim),
+            v.reshape(rows, 1, v_heads, vdim),
+            A_log,
+            a.reshape(rows, 1, v_heads),
+            dt_bias,
+            b.reshape(rows, 1, v_heads),
+            pool,
+            slots,
         )
         return o.reshape(rows, v_heads * vdim), pool_after
 

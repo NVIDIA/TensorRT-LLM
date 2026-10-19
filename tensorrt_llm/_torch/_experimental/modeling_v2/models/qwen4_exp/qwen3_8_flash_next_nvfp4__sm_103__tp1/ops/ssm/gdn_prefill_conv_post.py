@@ -6,7 +6,7 @@ the SiLU, the q/k split and L2 norm, the v copy and the decay/beta gates fused
 in, and each sequence's conv window published to the paged pool.
 
 Tier 6 (CuTe DSL written for this target) for the conv pass, Tier 5 (Triton)
-for the gates, the window publish and the fallback conv pass. The three-call
+for the gates and the window publish. The three-call
 composition it replaces -- `extract_transpose_prefill_slice` (token-major ->
 channel-major copy), `causal_conv1d_fwd` (channel-major conv, in place) and
 `fused_gdn_post_conv` (split + norm + gates) -- moves the `[T, 10240]`
@@ -43,140 +43,8 @@ A_LOG_RANGE = (-5.5625, 3.5625)
 DT_BIAS_RANGE = (-8.9375, 19.25)
 SOFTPLUS_THRESHOLD = 20.0
 
-#: Launch shape of the main kernel, chosen by micro-bench at 2048, 8192 and
-#: 16384 tokens (see the entry note). The register cap is what makes it fast:
-#: uncapped, the compiler takes 140+ registers for the pool-reading branch and
-#: the occupancy that leaves cannot hide the load latency; capped at 72 that
-#: branch spills, and it runs only on blocks holding a sequence's first rows.
-_BLOCK_T = 32
-_NUM_WARPS = 4
-_MAXNREG = 72
 #: Channels per program of the window publish.
 _PUBLISH_BLOCK_C = 512
-
-
-@triton.jit(do_not_specialize=["num_tokens", "num_seqs", "search_steps"])
-def _gdn_prefill_conv_post_kernel(
-    x_ptr,
-    stride_xt,
-    w_ptr,
-    stride_wc,
-    stride_wk,
-    state_ptr,
-    stride_ss,
-    stride_sc,
-    stride_sw,
-    qsl_ptr,
-    slot_ptr,
-    init_ptr,
-    a_ptr,
-    stride_at,
-    stride_ah,
-    b_ptr,
-    stride_bt,
-    stride_bh,
-    A_log_ptr,
-    dt_bias_ptr,
-    q_ptr,
-    k_ptr,
-    v_ptr,
-    g_ptr,
-    beta_ptr,
-    num_tokens,
-    num_seqs,
-    search_steps,
-    pad_slot_id,
-    l2_norm_eps,
-    softplus_threshold,
-    IDX: tl.constexpr,
-    NUM_K_HEADS: tl.constexpr,
-    NUM_V_HEADS: tl.constexpr,
-    HEAD_DIM: tl.constexpr,
-    BLOCK_T: tl.constexpr,
-):
-    """One program: BLOCK_T tokens x one 128-channel head of the conv output."""
-    head = tl.program_id(0)
-    t = tl.program_id(1) * BLOCK_T + tl.arange(0, BLOCK_T)
-    t_mask = t < num_tokens
-    d = tl.arange(0, HEAD_DIM)
-    c = head * HEAD_DIM + d
-    rows2 = (tl.program_id(1) * BLOCK_T + tl.arange(0, BLOCK_T))[:, None]
-    rmask2 = rows2 < num_tokens
-
-    # Sequence of each token: the largest s with qsl[s] <= t (a zero-length
-    # sequence shares its start with the next one and is never chosen over it).
-    lo = tl.zeros([BLOCK_T], dtype=tl.int32)
-    hi = tl.zeros([BLOCK_T], dtype=tl.int32) + num_seqs
-    for _ in range(search_steps):
-        mid = (lo + hi) // 2
-        right = tl.load(qsl_ptr + mid) <= t
-        lo = tl.where(right, mid, lo)
-        hi = tl.where(right, hi, mid)
-    s0 = tl.load(qsl_ptr + lo)
-
-    # Width-4 causal conv, taps accumulated in fp32 in tap order. A tap before
-    # the sequence start reads the carried window column W-1-(s0-pos), or 0.
-    # Only a block holding one of a sequence's first three tokens needs that;
-    # every other block takes the branch whose taps are plain row loads.
-    acc = tl.zeros([BLOCK_T, HEAD_DIM], dtype=tl.float32)
-    if tl.min(tl.where(t_mask, t - s0, 3), axis=0) < 3:
-        slot = tl.load(slot_ptr + lo, mask=t_mask, other=pad_slot_id)
-        carry = t_mask & (tl.load(init_ptr + lo, mask=t_mask, other=0) != 0) & (slot != pad_slot_id)
-        slot64 = slot.to(tl.int64)
-        for kk in tl.static_range(4):
-            pos = t - 3 + kk
-            in_seq = pos >= s0
-            xv = tl.load(
-                x_ptr + pos[:, None].to(IDX) * stride_xt + c[None, :],
-                mask=(t_mask & in_seq)[:, None],
-                other=0.0,
-            )
-            s_row = slot64 * stride_ss + (3 + pos - s0) * stride_sw
-            sv = tl.load(
-                state_ptr + s_row[:, None] + c[None, :] * stride_sc,
-                mask=(carry & (~in_seq))[:, None],
-                other=0.0,
-            )
-            wk = tl.load(w_ptr + c * stride_wc + kk * stride_wk).to(tl.float32)
-            acc += tl.where(in_seq[:, None], xv, sv).to(tl.float32) * wk[None, :]
-    else:
-        for kk in tl.static_range(4):
-            xv = tl.load(
-                x_ptr + (rows2 - (3 - kk)).to(IDX) * stride_xt + c[None, :], mask=rmask2, other=0.0
-            )
-            wk = tl.load(w_ptr + c * stride_wc + kk * stride_wk).to(tl.float32)
-            acc += xv.to(tl.float32) * wk[None, :]
-    act = acc / (1.0 + tl.exp(-acc))
-    # The conv result is rounded to the activation dtype once, as the
-    # unfused conv stores it, before anything reads it back.
-    y = act.to(q_ptr.dtype.element_ty)
-
-    ri2 = rows2.to(IDX)
-    if head < 2 * NUM_K_HEADS:
-        yf = y.to(tl.float32)
-        inv = 1.0 / tl.sqrt(tl.sum(yf * yf, axis=1) + l2_norm_eps)
-        normed = (yf * inv[:, None]).to(q_ptr.dtype.element_ty)
-        o_off = ri2 * (NUM_K_HEADS * HEAD_DIM) + (head % NUM_K_HEADS) * HEAD_DIM + d[None, :]
-        if head < NUM_K_HEADS:
-            tl.store(q_ptr + o_off, normed, mask=rmask2)
-        else:
-            tl.store(k_ptr + o_off, normed, mask=rmask2)
-    else:
-        vh = head - 2 * NUM_K_HEADS
-        o_off = ri2 * (NUM_V_HEADS * HEAD_DIM) + vh * HEAD_DIM + d[None, :]
-        tl.store(v_ptr + o_off, y, mask=rmask2)
-        t64 = t.to(IDX)
-        a_val = tl.load(a_ptr + t64 * stride_at + vh * stride_ah, mask=t_mask, other=0.0)
-        b_val = tl.load(b_ptr + t64 * stride_bt + vh * stride_bh, mask=t_mask, other=0.0)
-        A_log = tl.load(A_log_ptr + vh).to(tl.float32)
-        dt_bias = tl.load(dt_bias_ptr + vh).to(tl.float32)
-        gate_input = a_val.to(tl.float32) + dt_bias
-        softplus = tl.where(
-            gate_input <= softplus_threshold, tl.log(1.0 + tl.exp(gate_input)), gate_input
-        )
-        g_off = t64 * NUM_V_HEADS + vh
-        tl.store(g_ptr + g_off, -tl.exp(A_log) * softplus, mask=t_mask)
-        tl.store(beta_ptr + g_off, tl.sigmoid(b_val.to(tl.float32)), mask=t_mask)
 
 
 @triton.jit
@@ -233,7 +101,7 @@ def _gdn_prefill_conv_publish_kernel(
 # registers; then a thread (4 channels x `_TPT` consecutive tokens) slides the width-4
 # window over shared-memory rows, every element converted to fp32 once. The conv runs
 # as `fma.rn.f32x2` on channel pairs (first tap from zero, then in tap order: per element
-# the Triton pass's `fma.rn.f32` chain); the SiLU is `acc * rcp(1 + 2^(-acc * log2e))`
+# an `fma.rn.f32` chain); the SiLU is `acc * rcp(1 + 2^(-acc * log2e))`
 # with `ex2.approx.ftz` and `rcp.approx.ftz`, rounded in pairs by `cvt.rn.bf16x2.f32`.
 # --------------------------------------------------------------------------------------
 
@@ -307,9 +175,9 @@ def _fmul2(a0, a1, b0, b1, *, loc=None, ip=None):
 @dsl_user_op
 def _silu2(a0, a1, *, loc=None, ip=None):
     """`acc * rcp(1 + 2^(acc * -log2e))` for two values: `mul.rn.f32x2`, `ex2.approx.ftz`,
-    `add.rn.f32x2`, `rcp.approx.ftz`, `mul.rn`. For `1 + e` in [1, 2^126] this equals the
-    Triton pass's `div.full.f32`; past it (acc < -87.3) it gives -0 where that gives a
-    value below 1e-36."""
+    `add.rn.f32x2`, `rcp.approx.ftz`, `mul.rn`. For `1 + e` in [1, 2^126] this equals a
+    Triton `acc / (1 + exp(-acc))` (`div.full.f32`); past it (acc < -87.3) it gives -0
+    where that gives a value below 1e-36."""
     r = _asm2(
         T.f32(),
         [cutlass.Float32(a0), cutlass.Float32(a1)],
@@ -343,7 +211,8 @@ def _fma_rn(a, b, c, *, loc=None, ip=None):
 
 @dsl_user_op
 def _inv_norm(ss, eps, *, loc=None, ip=None):
-    """1 / sqrt(ss + eps): `add.f32`, `sqrt.approx.ftz.f32`, `div.full.f32` (the Triton pass's)."""
+    """1 / sqrt(ss + eps): `add.f32`, `sqrt.approx.ftz.f32`, `div.full.f32` (a Triton
+    `1.0 / tl.sqrt(...)`)."""
     return cutlass.Float32(
         _asm1(
             T.f32(),
@@ -686,8 +555,7 @@ def _gdn_gates_kernel(
     HP: tl.constexpr,
     BLOCK_T: tl.constexpr,
 ):
-    """The decay/beta gates over `[T, NUM_V_HEADS]`, one row-coalesced tile a program:
-    the Triton conv pass's code for them."""
+    """The decay/beta gates over `[T, NUM_V_HEADS]`, one row-coalesced tile a program."""
     t = (tl.program_id(0) * BLOCK_T + tl.arange(0, BLOCK_T))[:, None]
     h = tl.arange(0, HP)[None, :]
     m = (t < num_tokens) & (h < NUM_V_HEADS)
@@ -802,9 +670,6 @@ def _launch(
     pad_slot_id,
     l2_norm_eps,
     softplus_threshold,
-    block_t=_BLOCK_T,
-    num_warps=_NUM_WARPS,
-    maxnreg=_MAXNREG,
 ):
     assert head_k_dim == head_v_dim and weight.shape[-1] == CONV_WIDTH, (
         "one program per 128-channel head: head_k_dim must equal head_v_dim, and the "
@@ -821,9 +686,12 @@ def _launch(
     beta = torch.empty((1, num_tokens, num_v_heads), dtype=torch.float32, device=dev)
     if num_seqs == 0:
         return q, k, v, g, beta
-    if num_tokens > 0 and _cute_conv_pass_ok(
-        x, weight, conv_states, num_k_heads, head_k_dim, num_v_heads
-    ):
+    if num_tokens > 0:
+        assert _cute_conv_pass_ok(x, weight, conv_states, num_k_heads, head_k_dim, num_v_heads), (
+            "the conv pass takes bf16 x with 128-channel heads, 16-byte aligned rows and "
+            f"int32 weight/pool strides; got {x.dtype}, head_k_dim {head_k_dim}, x at "
+            f"{x.data_ptr() % 16} mod 16 with row stride {x.stride(0)}"
+        )
         _cute_conv_pass(
             x, weight, conv_states, query_start_loc, cache_indices, has_initial_state, q, k, v,
             num_k_heads, num_v_heads, head_k_dim, pad_slot_id, l2_norm_eps,
@@ -845,50 +713,6 @@ def _launch(
             HP=triton.next_power_of_2(num_v_heads),
             BLOCK_T=64,
             num_warps=4,
-        )
-    elif num_tokens > 0:
-        heads = 2 * num_k_heads + num_v_heads
-        blocks = triton.cdiv(num_tokens, block_t)
-        # int32 element offsets suffice while the largest one fits.
-        out_width = max(num_k_heads * head_k_dim, num_v_heads * head_v_dim)
-        off64 = (num_tokens + 3) * max(x.stride(0), a.stride(0), b.stride(0), out_width) >= 2**31
-        _gdn_prefill_conv_post_kernel[(heads, blocks)](
-            x,
-            x.stride(0),
-            weight,
-            weight.stride(0),
-            weight.stride(1),
-            conv_states,
-            *conv_states.stride(),
-            query_start_loc,
-            cache_indices,
-            has_initial_state,
-            a,
-            a.stride(0),
-            a.stride(1),
-            b,
-            b.stride(0),
-            b.stride(1),
-            A_log,
-            dt_bias,
-            q,
-            k,
-            v,
-            g,
-            beta,
-            num_tokens,
-            num_seqs,
-            max(num_seqs - 1, 0).bit_length() + 1,
-            pad_slot_id,
-            l2_norm_eps,
-            softplus_threshold,
-            IDX=tl.int64 if off64 else tl.int32,
-            NUM_K_HEADS=num_k_heads,
-            NUM_V_HEADS=num_v_heads,
-            HEAD_DIM=head_k_dim,
-            BLOCK_T=block_t,
-            num_warps=num_warps,
-            maxnreg=maxnreg,
         )
     _gdn_prefill_conv_publish_kernel[(num_seqs, triton.cdiv(conv_dim, _PUBLISH_BLOCK_C))](
         x,
@@ -1076,29 +900,21 @@ class GdnPrefillConvPost(OpWrapper):
     inside one sequence takes a straight-line branch, the rest read the pool
     token by token. The gates (Triton): one row-coalesced `[64, 48]` tile a
     program. Then a per-sequence window publish (Triton), after both, so no
-    program reads a window another has already advanced. Inputs the CuTe
-    pass cannot take (not bf16, a row of `x` not 16-byte aligned, other head
-    sizes) run the Triton conv pass (`_gdn_prefill_conv_post_kernel`, gates
-    included) instead.
+    program reads a window another has already advanced.
 
     Speed (one layer, 461-slot pool, in_proj views, us, graph replay over 4
-    layers' inputs): 16384 tokens / 3 contexts 136 (the Triton conv pass 198,
-    the three-call chain it replaced 528). The Triton pass is bound by its
-    instruction stream (ncu: 183 M warp instructions, 74% issue-busy, DRAM
-    41%); the CuTe pass's straight-line window and paired fp32 arithmetic
-    issue a third fewer, and the shared-memory tile keeps the bytes in flight
-    out of registers.
+    layers' inputs): 16384 tokens / 3 contexts 136 (the three-call chain it
+    replaced 528).
 
     Numerics: the conv result is rounded to bf16 before the norm reads it, as
     the unfused path stores it. Conv taps: fp32 FMAs from zero in tap order
     (`fma.rn.f32x2` on channel pairs). SiLU: `acc * rcp(1 + 2^(-acc *
-    log2e))` with `ex2.approx.ftz` and `rcp.approx.ftz` -- the Triton pass's
-    `ex2.approx` / `div.full` values wherever `1 + e <= 2^126`; below
-    acc = -87.3 it returns -0 where those return a value under 1e-36. q/k
-    norm: the 128-channel fp32 sum of squares as each thread's pairs plus a
-    32-lane butterfly, `sqrt.approx.ftz`, `div.full`. v, g, beta and the pool
-    are bitwise the Triton pass's; q/k one bf16 ulp on ~3e-6 of elements
-    (the sum's order). Against the unfused path (entry test, every cell):
+    log2e))` with `ex2.approx.ftz` and `rcp.approx.ftz` -- a Triton
+    `acc / (1 + exp(-acc))`'s `ex2.approx` / `div.full` values wherever
+    `1 + e <= 2^126`; below acc = -87.3 it returns -0 where those return a
+    value under 1e-36. q/k norm: the 128-channel fp32 sum of squares as each
+    thread's pairs plus a 32-lane butterfly, `sqrt.approx.ftz`, `div.full`.
+    Against the unfused path (entry test, every cell):
     q/k/v within one bf16 ulp on 1e-6..1e-4 of elements, g/beta within the
     fp32 band, conv pool bitwise.
 
@@ -1113,7 +929,9 @@ class GdnPrefillConvPost(OpWrapper):
     4]` in `x`'s dtype (any strides); `conv_states` `[slots, qkv_dim, 3]` in
     `x`'s dtype (any strides); int32 `query_start_loc`/`cache_indices`, bool
     `has_initial_state`. Loud (`__call__`): `head_k_dim != head_v_dim`, conv
-    width other than 4.
+    width other than 4, and what the conv pass cannot take: an `x` not bf16,
+    heads other than 128 channels, a row of `x` not 16-byte aligned, a weight
+    or pool stride from 2^31 elements.
 
     Not checked: `cache_indices` within the pool and distinct;
     `query_start_loc` non-decreasing and ending at `T`.
@@ -1121,8 +939,8 @@ class GdnPrefillConvPost(OpWrapper):
     Not certified: fp16/fp32 activations, other head geometries, bias.
 
     Hard limits
-      element offsets  int32 unless the call needs int64 (chosen on the host
-        from T and the strides)  not probed beyond 16384 tokens.
+      element offsets  64-bit for the rows of x and the outputs; weight and
+        pool strides int32 (refused from 2^31)  not probed beyond 16384 tokens.
     """
 
     def __call__(

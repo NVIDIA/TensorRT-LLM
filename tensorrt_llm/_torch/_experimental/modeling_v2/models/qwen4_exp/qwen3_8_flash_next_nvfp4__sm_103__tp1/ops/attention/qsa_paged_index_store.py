@@ -109,7 +109,7 @@ def _qsa_paged_index_store_kernel(
 def _launch_rows(rows: int) -> Tuple[int, int]:
     """Rows per program and warps: one row per program while the grid is small,
     a tile of rows once there are enough rows to fill the machine. Measured on
-    GB300 against 1/4/8/16/32 rows per program (microbench `qsa-index-store-kernel`)."""
+    GB300 against 1/4/8/16/32 rows per program."""
     if rows <= 256:
         return 1, 1
     return 16, 4
@@ -140,7 +140,7 @@ _CKPT = dict(
 
 _DECODE = ((0, 1), (1, 1), (31, 1), (32, 1), (33, 1), (63, 1), (64, 1), (95, 1))
 
-#: The campaign's envelope: ISL 8192 + OSL 1024 puts decode rows up to position
+#: The target's serving envelope: ISL 8192 + OSL 1024 puts decode rows up to position
 #: 9215 (page column 287), 128 concurrent requests, and `max_num_tokens` 16384
 #: rows in one prefill or mixed step.
 _WIDE = dict(slots=160, width=300)
@@ -279,7 +279,7 @@ class QsaPagedIndexStore(OpWrapper):
             why="int64 requests and int64 positions",
             spec=_spec(_DECODE, pages=32, request_dtype=torch.int64),
         ),
-        # ---- the campaign envelope: decode M=128, 16384-row steps ----------
+        # ---- the serving envelope: decode M=128, 16384-row steps -----------
         Cell(
             why="decode M=128 at positions up to 9153 (page column 286)",
             spec=_spec(_DECODE_128, pages=18432, **_WIDE),

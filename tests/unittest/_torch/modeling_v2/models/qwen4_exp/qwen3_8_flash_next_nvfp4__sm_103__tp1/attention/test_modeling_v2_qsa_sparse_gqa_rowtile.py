@@ -64,22 +64,14 @@ _KERNELS = (
     "_row_bits",
     "_rowtile_plan_kernel",
     "_rowtile_lone_kernel",
-    "_rowtile_attention_kernel",
+    "_rowtile_attention_cute",
 )
-#: The row-tile pass on SM103 tensor cores, which stands in for `_rowtile_attention_kernel`
-#: on eligible launches (bf16 q and K/V, D = 256).
-_CUTE_PASS = "_rowtile_attention_cute"
-
-
-def _expected_kernels(args) -> list:
-    cute = _module._cute_eligible(args["q"], args["k_cache"], args["v_cache"], 128, 64)
-    return [*_KERNELS[:3], _CUTE_PASS if cute else _KERNELS[3]]
 
 
 @pytest.fixture
 def launches(monkeypatch):
     log: list = []
-    for name in (*_KERNELS, _CUTE_PASS):
+    for name in _KERNELS:
         inner = getattr(_module, name)
         monkeypatch.setattr(_module, name, _LaunchRecorder(inner, name, log))
     return log
@@ -217,7 +209,7 @@ def test_certified_cells(cell, certifying, launches) -> None:  # noqa: F811
         assert bool(_is_prefix_packed(selected).all())
         assert torch.equal((selected >= 0).sum(1), _bound(args["query_positions"], spec))
     out = op(**args)
-    assert [name for name, _ in launches] == _expected_kernels(args)
+    assert [name for name, _ in launches] == list(_KERNELS)
     groups = math.ceil(rows / 10)
     assert launches[0][1] == (rows,) and launches[1][1] == (groups,)
     assert launches[2][1] == (min(rows, 256), spec["kv_heads"])
@@ -323,7 +315,7 @@ _REJECTIONS = {
         lambda a: {**a, "query_positions": None, "compress_ratio": None},
         "the row-tile kernel needs the prefill pair",
     ),
-    "float32_query": (lambda a: {**a, "q": a["q"].float()}, "QSA queries must use BF16 or FP16"),
+    "float32_query": (lambda a: {**a, "q": a["q"].float()}, "QSA queries must use BF16"),
     "int64_selection": (
         lambda a: {**a, "selected_tokens": a["selected_tokens"].long()},
         "QSA selected tokens must be a two-dimensional int32 tensor",
@@ -402,8 +394,8 @@ def test_packed_walk_is_the_resident_union(segments, shared_scores, monkeypatch)
     if not shared_scores:
         args["block_table"][:, 3] = -1  # an unmapped page inside every request's span
     log: list = []
-    for name in ("_rowtile_attention_kernel", _CUTE_PASS):
-        monkeypatch.setattr(_module, name, _PlanRecorder(getattr(_module, name), log))
+    name = "_rowtile_attention_cute"
+    monkeypatch.setattr(_module, name, _PlanRecorder(getattr(_module, name), log))
     out = op(**args)
     _compare(out, op.reference(**args))
     plan = log[0].cpu()
@@ -415,54 +407,3 @@ def test_packed_walk_is_the_resident_union(segments, shared_scores, monkeypatch)
     assert torch.equal(plan[taken, 0], (plan[taken, 1] + 63) // 64)
     if shared_scores:
         assert int(plan[taken, 0].sum()) * 2 < int(dense[taken].sum())
-
-
-def _triton_bits(args):
-    """The Triton bitmap pass (`_rowtile_bits_kernel`) into a zeroed bitmap."""
-    selected, positions = args["selected_tokens"], args["query_positions"].contiguous()
-    tpb, cr, width = args["tokens_per_block"], args["compress_ratio"], args["block_table"].shape[1]
-    rows, final_topk = selected.shape
-    num_words = (width * tpb + 63) // 64
-    bits = torch.zeros((rows, num_words), dtype=torch.int64, device=DEV)
-    info = torch.empty((rows, 2), dtype=torch.int32, device=DEV)
-    _module._rowtile_bits_kernel[(rows,)](
-        selected, positions, bits, info, selected.stride(0), selected.stride(1), bits.stride(0),
-        TOPK=final_topk, BLOCK_TOPK=(final_topk - cr + 1) // cr, COMPRESS_RATIO=cr,
-        TOKENS_PER_BLOCK=tpb, PAGE_TABLE_WIDTH=width, BOUND_TILE=64, BLOCK_C=1024, num_warps=4,
-    )  # fmt: skip
-    return bits, info
-
-
-@pytest.mark.parametrize(
-    "order, holes, positions_dtype",
-    [
-        ("emitted", False, torch.int32),
-        ("shuffled", True, torch.int64),
-        ("emitted", True, torch.int64),
-    ],
-    ids=["emitted", "shuffled-with-holes", "holes-int64-positions"],
-)
-def test_bitmap_pass_is_the_triton_pass_bitwise(order, holes, positions_dtype) -> None:
-    """The CuTe bitmap pass writes the Triton pass's `bits` and `row_info` word for word:
-    on the emitted token order, on columns shuffled within each row (any order is
-    correct; order only changes the shared-memory flushes), and with an all-padding row
-    and tokens past the table."""
-    args = _build(_with([(0, 900), (907, 2200), (5000, 37)], slots=16), seed=8100)
-    args["query_positions"] = args["query_positions"].to(positions_dtype)
-    selected = args["selected_tokens"]
-    if order == "shuffled":
-        perm = torch.argsort(torch.rand(selected.shape, device=DEV), dim=1)
-        selected = torch.gather(selected, 1, perm)
-    if holes:
-        selected = selected.clone()
-        selected[1] = -1
-        selected[5, :8] = args["block_table"].shape[1] * args["tokens_per_block"] + 3
-    args["selected_tokens"] = selected.contiguous()
-    want_bits, want_info = _triton_bits(args)
-    width = args["block_table"].shape[1]
-    got_bits, got_info = _module._row_bits(
-        args["selected_tokens"], args["query_positions"], args["compress_ratio"],
-        args["tokens_per_block"], width, want_bits.shape[1],
-    )  # fmt: skip
-    assert torch.equal(got_info, want_info)
-    assert torch.equal(got_bits, want_bits)

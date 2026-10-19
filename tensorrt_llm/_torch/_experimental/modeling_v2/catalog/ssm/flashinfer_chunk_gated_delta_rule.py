@@ -147,8 +147,9 @@ class FlashinferChunkGatedDeltaRule(OpWrapper):
     contiguous `[1, T, H, 128]`; `g` fp32 log-space; `beta` fp32). Give it
     context rows only: single-token rows are slow here. Measured per layer
     at 8065 + 127 x 1 tokens: 1078.8 us with every row in this op, 399.4 us
-    with the 127 decode rows sent to `gated_delta_rule_decode_pretranspose`
-    instead (both halves plus the concatenation).
+    with the 127 decode rows sent to FlashInfer's decode kernel
+    (`gdn_decode.gated_delta_rule_decode_pretranspose`) instead (both halves
+    plus the concatenation).
 
     Memory per call: a packed fp32 copy of the named slots in and out (2 x
     3 MiB per sequence), `exp(g)`, and the output. q/k/v/beta are not copied

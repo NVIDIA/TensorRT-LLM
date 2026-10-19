@@ -17,8 +17,6 @@ re-layout), so the stream reduction stays inside one thread.
 
 from __future__ import annotations
 
-import os
-
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
@@ -38,9 +36,10 @@ from tensorrt_llm._torch.cute_dsl_kernels.blackwell.custom_pipeline import (
     PipelineUmmaAsync,
 )
 from tensorrt_llm._torch.cute_dsl_kernels.blackwell.utils import make_ptr
+from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
 
 #: Programmatic dependent launch (sm_90+), off with TRTLLM_ENABLE_PDL=0.
-_PDL = os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1"
+_PDL = get_env_enable_pdl()
 
 
 @dsl_user_op
@@ -829,8 +828,8 @@ class Qwen4ExpHcUpGateMean(OpWrapper):
     The GEMM accumulates in fp32 in tensor memory and is never rounded or
     written; sigmoid, product and stream mean are fp32 with one rounding to
     `normed`'s dtype. Returns a fresh `[T, H]` tensor. Fusion boundary: the up
-    projection, the sigmoid gate and the stream mean (what `cublas_mm(low, up)`
-    + `qwen4_exp_hc_gate_mean` compute as two launches).
+    projection, the sigmoid gate and the stream mean (two launches as `cublas_mm(low,
+    up)` followed by a separate gate-and-mean pass).
     """
 
     ARCHS = frozenset({Arch.SM_103})
@@ -859,8 +858,7 @@ class Qwen4ExpHcUpGateMean(OpWrapper):
     Tier 6 (CuTe DSL written for this target): a persistent tcgen05 GEMM whose
     epilogue applies the gate, so the `[T, C*H]` gate logits never reach HBM;
     tiers 1-5 have no GEMM with a custom multi-input epilogue (cuBLAS writes
-    the logits; the Triton `qwen4_exp_hc_gate_mix` was 2.7x slower than
-    cuBLAS + gate_mean at prefill rows). Metadata consumed: none. Call sites:
+    the logits). Metadata consumed: none. Call sites:
     the trunk's hyper-connection mixers (`_hc_mixer`). Preconditions (bf16):
     `low` `[T, R]` contiguous, `up` the transposed view of a contiguous
     `[C*H, R]` weight, `normed` `[T, C*H]` contiguous, 16-byte aligned

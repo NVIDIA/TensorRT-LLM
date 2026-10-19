@@ -35,6 +35,9 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.fp4_block_scale_m
     fp4_block_scale_moe_runner,
     quantize_nvfp4,
 )
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.quantization.fp4_quantize import (
+    fp4_quantize,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1 import (  # noqa: E501
     modeling as M,
 )
@@ -53,6 +56,10 @@ ISC1 = 5.0 / (448 * 6)
 #: expert's.
 ISC2 = 64.0 / (448 * 6)
 E2M1 = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
+#: The routed runners read activation scales as a linear buffer, not the 128x4-swizzled
+#: one of a dense NVFP4 GEMM; byte counts match at multiples of 128 rows, so the wrong
+#: one passes silently.
+SF_LINEAR = False
 
 #: Tokens of the two routings: one per expert, and a weighted top-10.
 ONE_HOT_TOKENS = E
@@ -170,7 +177,7 @@ def _cutedsl_routed(layer, x, ids, weights) -> torch.Tensor:
     """The CuteDSL branch of `_moe_block`, from the quantization to the unpermute."""
     sc = layer.scalars
     tokens = x.shape[0]
-    xq, xsf = M.fp4_quantize(x, sc["global_scale"], M._SF_VEC, False, M._SF_LINEAR)
+    xq, xsf = fp4_quantize(x, sc["global_scale"], M._SF_VEC, False, SF_LINEAR)
     tile_expert, tile_limit, expanded_to_permuted, permuted_to_expanded, _, live_tiles = M.moe_sort(
         token_selected_experts=ids,
         token_final_scales=weights,
@@ -226,7 +233,7 @@ def _cutedsl_routed(layer, x, ids, weights) -> torch.Tensor:
 def _trtllm_gen_routed(layer, x, ids, weights) -> torch.Tensor:
     """The trtllm-gen branch of `_moe_block`."""
     sc = layer.scalars
-    xq, xsf = M.fp4_quantize(x, sc["global_scale"], M._SF_VEC, False, M._SF_LINEAR)
+    xq, xsf = fp4_quantize(x, sc["global_scale"], M._SF_VEC, False, SF_LINEAR)
     return fp4_block_scale_moe_runner(
         routing_logits=None,
         routing_bias=None,
@@ -302,7 +309,7 @@ def _reference(backend: str, case: str, spread: bool) -> torch.Tensor:
     ck, layer = _checkpoint(spread), _layer(backend, spread)
     x, ids, weights = _problem(case)
     sc = layer.scalars
-    xq, xsf = M.fp4_quantize(x, sc["global_scale"], M._SF_VEC, False, M._SF_LINEAR)
+    xq, xsf = fp4_quantize(x, sc["global_scale"], M._SF_VEC, False, SF_LINEAR)
     x_dq = _dequant(xq.view(torch.uint8), xsf.view(x.shape[0], H // VEC)) * ISC1
     if backend == "CUTEDSL":
         g2 = [float(sc["global_sf"])] * E

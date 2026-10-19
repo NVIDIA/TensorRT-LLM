@@ -110,9 +110,6 @@ def test_mixer_matches_the_gated_residual_reference(rows, with_inject) -> None:
     from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.hc.qwen4_exp_gated_residual import (  # noqa: E501
         qwen4_exp_gated_residual,
     )
-    from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.hc.qwen4_exp_hc_gate_mean import (  # noqa: E501
-        qwen4_exp_hc_gate_mean,
-    )
     from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.hc.qwen4_exp_hc_lowrank_act import (  # noqa: E501
         qwen4_exp_hc_lowrank_act,
     )
@@ -143,8 +140,4 @@ def test_mixer_matches_the_gated_residual_reference(rows, with_inject) -> None:
         normed, down, up, inject_w if with_inject else None, hc
     )
     _compare(mixed, want[0])
-    prev = qwen4_exp_hc_gate_mean(cublas_mm(low, up.t()), normed, hc)
-    print(
-        f"\n  rows {rows}: fused {gate_ratio(mixed, want[0]):.3f}x band, "
-        f"cublas + gate_mean {gate_ratio(prev, want[0]):.3f}x"
-    )
+    print(f"\n  rows {rows}: fused {gate_ratio(mixed, want[0]):.3f}x band")

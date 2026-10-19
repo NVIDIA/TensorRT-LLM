@@ -28,7 +28,6 @@ only as the first ones exit.
 from __future__ import annotations
 
 import functools
-import os
 
 import cuda.bindings.driver as cuda_drv
 import cutlass
@@ -47,6 +46,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import (
     OpWrapper,
     true_fp32_matmul,
 )
+from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
 
 #: Largest row count one launch serves; every row re-reads the weight from registers.
 MAX_ROWS = 4
@@ -65,13 +65,6 @@ _COMPILE_OPTIONS_SMEM = "--ptxas-options -maxrregcount=80"
 #: replay) 4 runs the attention tail 13.5 us a layer against 14.6 at 1 and 15.6 at 2-3;
 #: the GDN tail is unchanged.
 MIN_BLOCKS_SMEM = 4
-
-
-@functools.lru_cache(maxsize=None)
-def pdl_enabled(device_index: int) -> bool:
-    """Programmatic dependent launch: sm_90+ unless TRTLLM_ENABLE_PDL=0."""
-    props = torch.cuda.get_device_properties(device_index)
-    return props.major >= 9 and os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1"
 
 
 def tiling(n: int, k: int) -> tuple[int, int, int, int]:
@@ -292,12 +285,12 @@ def _compiled(rows, n, k, pdl):
 
 
 def launch(mat_a: torch.Tensor, mat_b: torch.Tensor, pdl: bool) -> torch.Tensor:
-    """The launch behind `Bf16GemvPdl.__call__`. `pdl` is honoured only where
-    `pdl_enabled` allows it."""
+    """The launch behind `Bf16GemvPdl.__call__`. `pdl` is honoured unless
+    `TRTLLM_ENABLE_PDL=0`."""
     m, k = mat_a.shape
     n = mat_b.shape[1]
     dev = mat_a.device
-    pdl = pdl and pdl_enabled(dev.index if dev.index is not None else torch.cuda.current_device())
+    pdl = pdl and get_env_enable_pdl()
     out = torch.empty((m, n), dtype=mat_a.dtype, device=dev)
     if m > 0:
         fn = _compiled(m, n, k, bool(pdl))

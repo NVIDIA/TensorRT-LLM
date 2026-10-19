@@ -39,7 +39,6 @@ from __future__ import annotations
 
 import functools
 import math
-import os
 from typing import Optional
 
 import cuda.bindings.driver as cuda_drv
@@ -80,13 +79,6 @@ THREADS = WARPS * 32
 BT_STAGE = 4096
 HEAD_DIM = 256
 LOG2E = 1.4426950408889634
-
-
-@functools.lru_cache(maxsize=None)
-def pdl_enabled(device_index: int) -> bool:
-    """Programmatic dependent launch: sm_90+ unless TRTLLM_ENABLE_PDL=0."""
-    props = torch.cuda.get_device_properties(device_index)
-    return props.major >= 9 and os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1"
 
 
 class _SplitKKernel:
@@ -623,7 +615,6 @@ def launch(
     if rows == 0:
         return output
     dev = q.device
-    pdl = pdl and pdl_enabled(dev.index if dev.index is not None else torch.cuda.current_device())
     use_pdl = bool(pdl and _qsa_pdl_enabled(rows))
     partial_output = torch.empty(
         (n_splits, rows, num_q_heads, head_dim), dtype=torch.float32, device=dev

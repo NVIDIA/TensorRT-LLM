@@ -1206,19 +1206,6 @@ class DecoderInputPreparer:
             else:
                 generation_requests.append(request)
         extend_requests += extend_dummy_requests
-        # The engine no longer builds first-draft requests; one that still carries the
-        # flag is refused on an mRoPE model rather than packed without a delta slot.
-        first_draft_requests = [
-            request
-            for request in scheduled_requests.generation_requests
-            if getattr(request, "py_is_first_draft", False)
-        ]
-        if host.use_mrope and first_draft_requests:
-            raise NotImplementedError(
-                "First-draft requests on an mRoPE model are not supported: they add no "
-                "mRoPE delta read slot, so every later generation request would read "
-                "another request's delta."
-            )
 
     def _prepare_helix_state(
         self, host: HostInputs, kv_cache_manager: KVCacheManager | KVCacheManagerV2 | None

@@ -29,9 +29,6 @@ Element `k` of a row is held by thread `(k // VEC) % THREADS` as its vector
 
 from __future__ import annotations
 
-import functools
-import os
-
 import cuda.bindings.driver as cuda_drv
 import cutlass
 import cutlass.cute as cute
@@ -48,6 +45,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import (
     OpWrapper,
     true_fp32_matmul,
 )
+from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
 
 VEC = 8
 #: Before its PDL wait a CTA also has the weight rows of CTAs `bidx + j * L2_DIST`
@@ -82,13 +80,6 @@ MAX_ROWS = 2
 TILING = {2560: (64, 2)}
 WIDTH = 4  # conv taps
 _COMPILE_OPTIONS = "--ptxas-options -maxrregcount=64"
-
-
-@functools.lru_cache(maxsize=None)
-def pdl_enabled(device_index: int) -> bool:
-    """Programmatic dependent launch: sm_90+ unless TRTLLM_ENABLE_PDL=0."""
-    props = torch.cuda.get_device_properties(device_index)
-    return props.major >= 9 and os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1"
 
 
 class _InProjConvKernel:
@@ -245,52 +236,11 @@ def _dl(t: torch.Tensor, align: int):
     return from_dlpack(t, assumed_align=align)
 
 
-@functools.lru_cache(maxsize=None)
-def _compiled(rows, n, k, conv_dim, pad_slot, pdl, state_shape, state_stride):
-    threads, outs = TILING[k]
-    kern = _InProjConvKernel(
-        rows=rows, k=k, threads=threads, outs=outs, conv_dim=conv_dim, pad_slot=pad_slot, pdl=pdl
-    )
-    dev = "cuda"
-    a = torch.empty(rows, k, dtype=torch.bfloat16, device=dev)
-    w = torch.empty(n, k, dtype=torch.bfloat16, device=dev)
-    out = torch.empty(rows, n, dtype=torch.bfloat16, device=dev)
-    state = torch.empty_strided(state_shape, state_stride, dtype=torch.bfloat16, device=dev)
-    convw = torch.empty(conv_dim, WIDTH, dtype=torch.bfloat16, device=dev)
-    slot = torch.empty(rows, dtype=torch.int32, device=dev)
-    stream = cuda_drv.CUstream(torch.cuda.current_stream().cuda_stream)
-    return cute_ext.compile(
-        kern,
-        _dl(a, 32),
-        _dl(w, 32),
-        _dl(out, 32),
-        _dl(state, 2),
-        _dl(convw, 8),
-        _dl(slot, 4),
-        stream,
-        options=_COMPILE_OPTIONS,
-    )
+_COMPILED: dict = {}
 
 
-def launch(x, mat_b, conv_state, conv_weight, conv_state_indices, conv_dim, pad_slot_id, pdl):
-    """The launch behind `GdnInProjConv1dPdl.__call__`. Returns the fresh `[M, N]` output."""
-    rows, k = x.shape
-    n = mat_b.shape[1]
-    dev = x.device
-    pdl = pdl and pdl_enabled(dev.index if dev.index is not None else torch.cuda.current_device())
-    out = torch.empty(rows, n, dtype=x.dtype, device=dev)
-    fn = _compiled(
-        rows,
-        n,
-        k,
-        conv_dim,
-        int(pad_slot_id),
-        bool(pdl),
-        tuple(conv_state.shape),
-        tuple(conv_state.stride()),
-    )
-    stream = cuda_drv.CUstream(torch.cuda.current_stream(dev).cuda_stream)
-    fn(
+def _operands(x, mat_b, out, conv_state, conv_weight, conv_state_indices, stream):
+    return (
         _dl(x, 32),
         _dl(mat_b.t(), 32),
         _dl(out, 32),
@@ -299,6 +249,45 @@ def launch(x, mat_b, conv_state, conv_weight, conv_state_indices, conv_dim, pad_
         _dl(conv_state_indices, 4),
         stream,
     )
+
+
+def launch(x, mat_b, conv_state, conv_weight, conv_state_indices, conv_dim, pad_slot_id, pdl):
+    """The launch behind `GdnInProjConv1dPdl.__call__`. Returns the fresh `[M, N]` output."""
+    rows, k = x.shape
+    n = mat_b.shape[1]
+    dev = x.device
+    pdl = bool(pdl and get_env_enable_pdl())
+    out = torch.empty(rows, n, dtype=x.dtype, device=dev)
+    stream = cuda_drv.CUstream(torch.cuda.current_stream(dev).cuda_stream)
+    operands = (x, mat_b, out, conv_state, conv_weight, conv_state_indices, stream)
+    key = (
+        rows,
+        n,
+        k,
+        conv_dim,
+        int(pad_slot_id),
+        pdl,
+        tuple(conv_state.shape),
+        conv_state.stride(),
+    )
+    fn = _COMPILED.get(key)
+    if fn is None:
+        # Compiled from the call's own operands (a stand-in for the pool would span every
+        # layer of the coalesced conv cache).
+        threads, outs = TILING[k]
+        kern = _InProjConvKernel(
+            rows=rows,
+            k=k,
+            threads=threads,
+            outs=outs,
+            conv_dim=conv_dim,
+            pad_slot=int(pad_slot_id),
+            pdl=pdl,
+        )
+        fn = _COMPILED[key] = cute_ext.compile(
+            kern, *_operands(*operands), options=_COMPILE_OPTIONS
+        )
+    fn(*_operands(*operands))
     return out
 
 

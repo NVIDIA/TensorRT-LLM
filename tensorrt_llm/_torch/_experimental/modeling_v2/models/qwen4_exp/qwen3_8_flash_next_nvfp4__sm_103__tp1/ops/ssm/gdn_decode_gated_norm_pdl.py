@@ -3,8 +3,8 @@
 """One Gated-DeltaNet decode step per row, and the gated RMS norm on its output, in
 one PDL launch.
 
-Tier 5 (CuTe DSL written for this target; the recurrence is the gated delta rule
-as `gated_delta_rule_decode_pretranspose` states it, reimplemented here). At one
+Tier 5 (CuTe DSL written for this target; the recurrence is the gated delta rule of
+FlashInfer's `gdn_decode.gated_delta_rule_decode_pretranspose`, reimplemented here). At one
 decode row the step reads and writes each v-head's 64 KB fp32 state once and
 otherwise does a few hundred flops per state row; the rest of its time is latency.
 The state is not produced by anything in the step ahead of this kernel -- the
@@ -24,9 +24,6 @@ memory, and every CTA then normalizes and gates its own rows.
 
 from __future__ import annotations
 
-import functools
-import os
-
 import cuda.bindings.driver as cuda_drv
 import cutlass
 import cutlass.cute as cute
@@ -38,9 +35,7 @@ from cutlass.cute.runtime import from_dlpack
 from cutlass.cutlass_dsl import dsl_user_op
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.ssm.gated_delta_rule_decode_pretranspose import (  # noqa: E501
-    gated_delta_rule_decode_pretranspose as _recurrence,
-)
+from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
 
 from ..norm.rms_norm_gated_token_major import rms_norm_gated_token_major as _gated_norm
 
@@ -49,13 +44,6 @@ MAX_ROWS = 4
 #: CTAs per v-head (one cluster) and warps per CTA; their product must be <= 32.
 CLUSTER = 8
 WARPS = 4
-
-
-@functools.lru_cache(maxsize=None)
-def pdl_enabled(device_index: int) -> bool:
-    """Programmatic dependent launch: sm_90+ unless TRTLLM_ENABLE_PDL=0."""
-    props = torch.cuda.get_device_properties(device_index)
-    return props.major >= 9 and os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1"
 
 
 @dsl_user_op
@@ -295,29 +283,19 @@ def _dl(t: torch.Tensor, align: int = 4):
     return from_dlpack(t, assumed_align=align)
 
 
-@functools.lru_cache(maxsize=None)
-def _compiled(rows, k_heads, v_heads, kdim, vdim, proj_stride, pool_shape, pool_stride, pdl):
-    kern = _GdnKernel(k_heads=k_heads, v_heads=v_heads, kdim=kdim, vdim=vdim, pdl=pdl)
-    dev = "cuda"
-    width = 2 * k_heads * kdim + 2 * v_heads * vdim + 2 * v_heads
-    proj = torch.empty(rows, proj_stride, dtype=torch.bfloat16, device=dev)[:, :width]
-    pool = torch.empty_strided(pool_shape, pool_stride, dtype=torch.float32, device=dev)
-    slot = torch.empty(rows, dtype=torch.int32, device=dev)
-    a_log_h = torch.empty(v_heads, dtype=torch.float32, device=dev)
-    dt = torch.empty(v_heads, dtype=torch.float32, device=dev)
-    w = torch.empty(vdim, dtype=torch.bfloat16, device=dev)
-    out = torch.empty(rows, v_heads * vdim, dtype=torch.bfloat16, device=dev)
-    stream = cuda_drv.CUstream(torch.cuda.current_stream().cuda_stream)
-    return cute_ext.compile(
-        kern,
+_COMPILED: dict = {}
+
+
+def _operands(proj, pool, slots, A_log, dt_bias, norm_weight, out, eps, stream):
+    return (
         _dl(proj, 8),
         _dl(pool, 16),
-        _dl(slot),
-        _dl(a_log_h),
-        _dl(dt),
-        _dl(w, 2),
+        _dl(slots),
+        _dl(A_log),
+        _dl(dt_bias),
+        _dl(norm_weight, 2),
         _dl(out, 2),
-        cutlass.Float32(1e-6),
+        cutlass.Float32(eps),
         stream,
     )
 
@@ -330,9 +308,10 @@ def launch(proj, pool, slots, A_log, dt_bias, norm_weight, eps, k_heads, kdim, p
     out = torch.empty((rows, v_heads * vdim), dtype=torch.bfloat16, device=proj.device)
     if rows == 0:
         return out
-    dev = proj.device
-    pdl = pdl and pdl_enabled(dev.index if dev.index is not None else torch.cuda.current_device())
-    fn = _compiled(
+    pdl = bool(pdl and get_env_enable_pdl())
+    stream = cuda_drv.CUstream(torch.cuda.current_stream(proj.device).cuda_stream)
+    operands = (proj, pool, slots, A_log, dt_bias, norm_weight, out, eps, stream)
+    key = (
         rows,
         k_heads,
         v_heads,
@@ -340,22 +319,51 @@ def launch(proj, pool, slots, A_log, dt_bias, norm_weight, eps, k_heads, kdim, p
         vdim,
         proj.stride(0),
         tuple(pool.shape),
-        tuple(pool.stride()),
-        bool(pdl),
+        pool.stride(),
+        pdl,
     )
-    stream = cuda_drv.CUstream(torch.cuda.current_stream(dev).cuda_stream)
-    fn(
-        _dl(proj, 8),
-        _dl(pool, 16),
-        _dl(slots),
-        _dl(A_log),
-        _dl(dt_bias),
-        _dl(norm_weight, 2),
-        _dl(out, 2),
-        cutlass.Float32(eps),
-        stream,
-    )
+    fn = _COMPILED.get(key)
+    if fn is None:
+        # Compiled from the call's own operands (a stand-in for the pool would span every
+        # layer of the coalesced state cache).
+        kern = _GdnKernel(k_heads=k_heads, v_heads=v_heads, kdim=kdim, vdim=vdim, pdl=pdl)
+        fn = _COMPILED[key] = cute_ext.compile(kern, *_operands(*operands))
+    fn(*_operands(*operands))
     return out
+
+
+def _recurrence_reference(q, k, v, A_log, a, dt_bias, b, pool, slots):
+    """`(o, pool_after)` of one gated-delta-rule decode step per row in fp64, rounded once:
+    `o` to bf16, the state to the pool's dtype. Row `n` reads and writes `pool[slots[n]]`
+    (a negative slot skips the row: zero output, no state access); q and k are
+    L2-normalized, the decay is `exp(-exp(A_log) * softplus(a + dt_bias))`, `beta =
+    sigmoid(b)`, the scale `K^-0.5`. `q` / `k` `[n, 1, H, K]`, `v` `[n, 1, HV, V]`, `a` /
+    `b` `[n, 1, HV]`, `pool` `[slots, HV, V, K]`. Mutates nothing."""
+    dt = torch.float64
+    batch, _, num_k_heads, k_dim = q.shape
+    hv = v.shape[2]
+    rep = hv // num_k_heads
+    scale = k_dim**-0.5
+    reads = slots.tolist()
+    pool_after = pool.clone()
+    o = torch.zeros(batch, 1, hv, v.shape[3], dtype=dt, device=q.device)
+    neg_a = -torch.exp(A_log.to(dt))
+    for n in range(batch):
+        if reads[n] < 0:
+            continue
+        q_n = q[n, 0].to(dt).repeat_interleave(rep, dim=0)
+        k_n = k[n, 0].to(dt).repeat_interleave(rep, dim=0)
+        q_n = q_n * torch.rsqrt(q_n.pow(2).sum(-1, keepdim=True) + 1e-6)
+        k_n = k_n * torch.rsqrt(k_n.pow(2).sum(-1, keepdim=True) + 1e-6)
+        x = a[n, 0].to(dt) + dt_bias.to(dt)
+        softplus = torch.where(x <= 20.0, torch.log1p(torch.exp(x)), x)
+        beta = torch.sigmoid(b[n, 0].to(dt))
+        h = pool[reads[n]].to(dt) * torch.exp(neg_a * softplus)[:, None, None]
+        u = (v[n, 0].to(dt) - torch.einsum("hvk,hk->hv", h, k_n)) * beta[:, None]
+        h = h + u[:, :, None] * k_n[:, None, :]
+        o[n, 0] = torch.einsum("hvk,hk->hv", h, q_n * scale)
+        pool_after[reads[n]] = h.to(pool.dtype)
+    return o.to(torch.bfloat16), pool_after
 
 
 class GdnDecodeGatedNormPdl(OpWrapper):
@@ -406,9 +414,8 @@ class GdnDecodeGatedNormPdl(OpWrapper):
 
     Launch: `HV * 8` CTAs a row, clusters of 8 (one v-head), 128 threads, <= 64
     registers. Numerics: fp32 inside; `o` rounded to bf16 before the norm, the output
-    rounded once. Inside the recurrence entry's band (torch's default for bf16 / fp32) of the
-    fp64 composition. Deterministic. Graph-capturable after the first call per
-    geometry (compiled then).
+    rounded once. Inside torch's default band for bf16 / fp32 of the fp64 composition.
+    Deterministic. Graph-capturable after the first call per geometry (compiled then).
     """
 
     def __call__(
@@ -439,7 +446,7 @@ class GdnDecodeGatedNormPdl(OpWrapper):
         kdim: int,
         pdl: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """`(out, pool_after)`: the recurrence entry's fp64 reference (o rounded to
+        """`(out, pool_after)`: the fp64 recurrence (`_recurrence_reference`; o rounded to
         bf16, the pool to fp32), then the gated norm entry's fp32 reference."""
         rows = proj.shape[0]
         v_heads, vdim = pool.shape[1], pool.shape[2]
@@ -448,21 +455,16 @@ class GdnDecodeGatedNormPdl(OpWrapper):
             [k_heads * kdim, k_heads * kdim, v_heads * vdim, v_heads * vdim, v_heads, v_heads],
             1,
         )
-        o, pool_after = _recurrence.reference(
-            q=q.reshape(rows, 1, k_heads, kdim),
-            k=k.reshape(rows, 1, k_heads, kdim),
-            v=v.reshape(rows, 1, v_heads, vdim),
-            state=None,
-            A_log=A_log,
-            a=a.reshape(rows, 1, v_heads),
-            dt_bias=dt_bias,
-            b=b.reshape(rows, 1, v_heads),
-            scale=None,
-            output=torch.empty(rows, 1, v_heads, vdim, dtype=torch.bfloat16, device=proj.device),
-            use_qk_l2norm=True,
-            initial_state=pool,
-            initial_state_indices=slots,
-            output_state_indices=None,
+        o, pool_after = _recurrence_reference(
+            q.reshape(rows, 1, k_heads, kdim),
+            k.reshape(rows, 1, k_heads, kdim),
+            v.reshape(rows, 1, v_heads, vdim),
+            A_log,
+            a.reshape(rows, 1, v_heads),
+            dt_bias,
+            b.reshape(rows, 1, v_heads),
+            pool,
+            slots,
         )
         out = _gated_norm.reference(
             o.reshape(-1, vdim), z.reshape(rows, v_heads, vdim), norm_weight, eps, None, "sigmoid"

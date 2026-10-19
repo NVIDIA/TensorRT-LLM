@@ -23,8 +23,6 @@ dependents at its start), and this kernel releases its own consumer
 
 from __future__ import annotations
 
-import os
-
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
@@ -44,13 +42,14 @@ from tensorrt_llm._torch.cute_dsl_kernels.blackwell.custom_pipeline import (
     PipelineUmmaAsync,
 )
 from tensorrt_llm._torch.cute_dsl_kernels.blackwell.utils import make_ptr
+from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
 
 #: Largest row count this entry is certified for: one 128-row MMA tile.
 MAX_ROWS = 128
 
 #: Programmatic dependent launch (sm_90+), off with TRTLLM_ENABLE_PDL=0. Without it
 #: the grid-dependency wait and the dependents trigger are no-ops.
-_PDL = os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1"
+_PDL = get_env_enable_pdl()
 
 
 def _asm(ret, args, text, constraints, loc, ip, side_effects=False):
@@ -597,7 +596,7 @@ class Qwen4ExpHcDecodeTcFirst(OpWrapper):
     that `qwen4_exp_hc_lowrank_act` reads back (three launches), and the
     Triton `tl.dot` K-loop designs measured 36-60 us at 128 rows.
     Metadata consumed: none. Call sites: `DecodeTarget`'s trunk
-    hyper-connection mixers from `_HC_TC_FIRST_MIN_ROWS` to
+    hyper-connection mixers past `_HC_DECODE_GEMV_MAX_ROWS` and up to
     `_HC_TC_FIRST_MAX_ROWS` (= MAX_ROWS) rows, 97 per forward, between
     `qwen4_exp_hc_inject_norm` (or the PLE tail) and
     `qwen4_exp_hc_up_gate_mean(_fp4)`. Preconditions (bf16): `normed`
@@ -614,10 +613,10 @@ class Qwen4ExpHcDecodeTcFirst(OpWrapper):
     before `griddepcontrol.wait`, `normed` after it; dependents released
     at kernel start. Graph-capturable (current stream, no host sync, no
     persistent state). Compiles once per (BN, KS, C, R, N, K, inject).
-    Measured on GB300 (graph replay, 24 cold weights, `microbench/` of the
-    candidate): 6.4 us at 128 rows against 8.6 us for cuBLAS split-K +
-    reduce + lowrank_act; tile sweep BN 32 / 48 / 64 / 112 x KS 8 / 10 /
-    16, 48 x 16 fastest at every row count.
+    Measured on GB300 (graph replay, 24 cold weights): 6.4 us at 128 rows
+    against 8.6 us for cuBLAS split-K + reduce + lowrank_act; tile sweep
+    BN 32 / 48 / 64 / 112 x KS 8 / 10 / 16, 48 x 16 fastest at every row
+    count.
     """
 
     def __call__(

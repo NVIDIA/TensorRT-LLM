@@ -5,12 +5,9 @@ the grouped RMS, the SiLU bottleneck and the injection weights from the first ha
 partials, the up projection, the sigmoid gate, the stream mean and the NVFP4 of the
 mean for the routed experts -- one PDL launch.
 
-Tier 5 (CuTe DSL written for this target). `qwen4_exp_hc_decode_mix_fp4` computes the
-same for up to 16 rows in Triton, whose programs hold a 64-row x 320 tile of the up
-weight in 128 threads. Here a CTA
-owns one 16-column NVFP4 block of the hidden width across the 4 streams (64 rows of
-the up weight), and 8 threads share a row, 40 weights each; 160 CTAs of 512 threads,
-all resident at once.
+Tier 5 (CuTe DSL written for this target). A CTA owns one 16-column NVFP4 block of the
+hidden width across the 4 streams (64 rows of the up weight), and 8 threads share a
+row, 40 weights each; 160 CTAs of 512 threads, all resident at once.
 
 Order of work inside a CTA:
 
@@ -33,15 +30,16 @@ import cuda.bindings.driver as cuda_drv
 import cutlass
 import cutlass.cute as cute
 import torch
+import torch.nn.functional as F
 from cutlass import const_expr
 from cutlass.cute import experimental as cute_ext
 from cutlass.cute.runtime import from_dlpack
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
-
-from .qwen4_exp_hc_decode_first_cute import pdl_enabled
-from .qwen4_exp_hc_decode_mix import qwen4_exp_hc_decode_mix as _triton_mix
-from .qwen4_exp_hc_decode_mix_fp4 import qwen4_exp_hc_decode_mix_fp4 as _triton_mix_fp4
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.quantization.fp4_quantize import (
+    fp4_quantize,
+)
+from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
 
 MAX_ROWS = 1
 VEC = 8
@@ -294,7 +292,7 @@ def launch(part, ss, up, hc_out, norm_weight, eps, hc_count, with_inject, global
     xsf = torch.empty((rows * (hidden // 16),), dtype=torch.uint8, device=dev) if fp4 else None
     if rows == 0:
         return mixed, inject_out, xq, xsf
-    pdl = pdl_enabled(dev.index if dev.index is not None else torch.cuda.current_device())
+    pdl = get_env_enable_pdl()
     part2 = part[:, 0, :]
     fn = _compiled(
         hidden,
@@ -334,14 +332,40 @@ def launch(part, ss, up, hc_out, norm_weight, eps, hc_count, with_inject, global
     return mixed, inject_out, xq, xsf
 
 
-def _check(part, ss, up, hc_out, norm_weight, hc_count) -> None:
+def _check(part, ss, up, hc_out, norm_weight, hc_count, with_inject) -> None:
     rows, width = hc_out.shape
+    rank = up.shape[0]
+    assert hc_out.stride(1) == 1, "hc_out unit column stride"
+    assert part.dtype == torch.float32 and part.stride(2) == 1, "part fp32, unit last stride"
+    assert part.shape[:2] == (hc_count, rows), "part [C, T, N]"
+    assert part.shape[2] >= rank + (hc_count if with_inject else 0), "part too narrow"
+    assert ss.dtype == torch.float32 and ss.shape == (hc_count, rows), "ss fp32 [C, T]"
+    assert up.shape == (rank, width), "up [R, width]"
+    assert norm_weight.shape == (width,) and norm_weight.is_contiguous()
     assert rows <= MAX_ROWS, "one row"
-    assert width // hc_count == 2560 and up.shape[0] == 320 and hc_count == 4, (
+    assert width // hc_count == 2560 and rank == 320 and hc_count == 4, (
         "the checkpoint's 4 x 2560, rank 320"
     )
     assert hc_out.dtype == torch.bfloat16 and up.dtype == torch.bfloat16, "bf16"
     assert up.t().is_contiguous(), "up the [R, width] view of a row-major [width, R] weight"
+
+
+def _reference(part, ss, up, hc_out, norm_weight, eps, hc_count, with_inject):
+    """`(mixed, inject_out)` in float64, one rounding per output."""
+    dtype = hc_out.dtype
+    rank = up.shape[0]
+    hidden = hc_out.shape[1] // hc_count
+    rstd = torch.rsqrt(ss.double().t() / hidden + eps)
+    logits = torch.einsum("ts,stn->tn", rstd, part.double())
+    low = F.silu(logits[:, :rank] / hc_count)
+    gate = torch.sigmoid(low @ up.double())
+    x = hc_out.double().unflatten(-1, (hc_count, hidden)) * rstd.unsqueeze(-1)
+    normed = x.flatten(-2) * (1.0 + norm_weight.double())
+    mixed = (gate * normed).unflatten(-1, (hc_count, hidden)).mean(dim=-2).to(dtype)
+    inject_out = None
+    if with_inject:
+        inject_out = (2.0 * torch.sigmoid(logits[:, rank : rank + hc_count] / hc_count)).to(dtype)
+    return mixed, inject_out
 
 
 _CELLS = (
@@ -352,10 +376,27 @@ _CELLS = (
 
 
 class Qwen4ExpHcDecodeMixFp4Cute(OpWrapper):
-    """`qwen4_exp_hc_decode_mix_fp4` for a one-row batch: `(mixed, inject_out, xq,
-    xsf)`, the NVFP4 of the rounded `mixed` with linear scales (see that entry).
+    """`qwen4_exp_hc_decode_mix_cute` plus the NVFP4 of its `mixed` for the routed
+    experts. With `C = hc_count`, `H = width // C`, `R = up.shape[0]`, `part` / `ss` the
+    per-stream partial logits `[C, T, >= R (+ C)]` and sums of squares `[C, T]` from
+    `qwen4_exp_hc_decode_first_cute`, `up` the `[R, width]` view of the up weight::
 
-    Fusion boundary: as `qwen4_exp_hc_decode_mix_fp4`.
+        rstd[t, s]       = 1 / sqrt(ss[s, t] / H + eps)
+        logits[t, n]     = sum_s rstd[t, s] * part[s, t, n]
+        low              = silu(logits[:, :R] / C)
+        gate             = sigmoid(low @ up)                                  # [T, C*H]
+        normed[t, s*H+i] = hc_out[t, s*H+i] * rstd[t, s] * (1 + norm_weight[s*H+i])
+        mixed[t, i]      = mean over s of gate[t, s*H+i] * normed[t, s*H+i]
+        inject_out       = 2 * sigmoid(logits[:, R:R+C] / C)                  # with_inject only
+        xq, xsf          = NVFP4(mixed)   # e2m1 pairs, e4m3 scale per 16, linear layout
+
+    fp32 inside, one rounding per output; the quantization reads the rounded `mixed`.
+    Returns fresh `(mixed, inject_out, xq [T, H/2] uint8, xsf [T*H/16] uint8)`;
+    `inject_out` is None without `with_inject`. `global_scale` is the 1-element fp32
+    NVFP4 global scale.
+
+    Fusion boundary: everything `qwen4_exp_hc_decode_mix_cute` fuses, plus the NVFP4
+    quantization of `mixed`. The partials are the producer's.
     """
 
     ARCHS = frozenset({Arch.SM_103})
@@ -363,35 +404,40 @@ class Qwen4ExpHcDecodeMixFp4Cute(OpWrapper):
 
     note = """
     Metadata consumed: none. Call sites: `DecodeTarget`'s MoE sites at a one-row
-    decode step, after `qwen4_exp_hc_decode_first_cute`; batches of more rows keep the
-    Triton entries.
+    decode step, after `qwen4_exp_hc_decode_first_cute`; `xq`/`xsf` feed
+    `fp4_block_scale_moe_renorm_routed` (linear scales). Batches of more rows take
+    `qwen4_exp_hc_up_gate_mean_fp4`.
 
-    Preconditions: the Triton entry's, and one row, the checkpoint's 4 x 2560 width,
-    rank 320, bf16; `up` the `.t()` view of a contiguous `[width, R]` weight;
-    `global_scale` fp32 with one element.
+    Preconditions: those of `qwen4_exp_hc_decode_mix_cute`, and `global_scale` fp32 with
+    one element.
 
-    Numerics: fp32 inside, one rounding per output, the Triton entry's formula and
-    order up to fp32 reassociation of the up-projection dot (inside its band); the
-    NVFP4 is `fp4_quantize`'s arithmetic on the rounded `mixed` (`rcp.approx.ftz`
-    reciprocals, e4m3 scale rounded to nearest, e2m1 nearest-even with saturation at
-    6). Deterministic; graph-capturable once compiled (the first call per variant).
+    Numerics: `mixed` and `inject_out` as `qwen4_exp_hc_decode_mix_cute`; the NVFP4 is
+    `fp4_quantize`'s arithmetic on the rounded `mixed` (`rcp.approx.ftz` reciprocals,
+    e4m3 scale rounded to nearest, e2m1 nearest-even with saturation at 6).
+    Deterministic; graph-capturable once compiled (the first call per variant).
     PDL: the weight rows and norm elements stream before `griddepcontrol.wait`.
     """
 
     def __call__(self, part, ss, up, hc_out, norm_weight, eps, hc_count, with_inject, global_scale):
         return launch(part, ss, up, hc_out, norm_weight, eps, hc_count, with_inject, global_scale)
 
-    def reference(self, *args, **kwargs):
-        """The Triton entry's reference: float64, then the NVFP4 of the rounded `mixed`."""
-        return _triton_mix_fp4.reference(*args, **kwargs)
+    def reference(
+        self, part, ss, up, hc_out, norm_weight, eps, hc_count, with_inject, global_scale
+    ):
+        """float64 with one rounding per output, then `fp4_quantize`'s native-torch NVFP4
+        of the rounded `mixed` (linear scales)."""
+        mixed, inject_out = _reference(
+            part, ss, up, hc_out, norm_weight, eps, hc_count, with_inject
+        )
+        return (mixed, inject_out) + fp4_quantize.reference(
+            mixed, global_scale, BLOCK_H, False, False
+        )
 
     def is_valid(
         self, part, ss, up, hc_out, norm_weight, eps, hc_count, with_inject, global_scale
     ) -> None:
-        _triton_mix_fp4.is_valid(
-            part, ss, up, hc_out, norm_weight, eps, hc_count, with_inject, global_scale
-        )
-        _check(part, ss, up, hc_out, norm_weight, hc_count)
+        _check(part, ss, up, hc_out, norm_weight, hc_count, with_inject)
+        # The kernel loads element 0 only; a per-row scale would be applied as row 0's.
         assert global_scale.numel() == 1 and global_scale.dtype == torch.float32, (
             "global_scale fp32 [1]"
         )
@@ -401,10 +447,16 @@ qwen4_exp_hc_decode_mix_fp4_cute = Qwen4ExpHcDecodeMixFp4Cute()
 
 
 class Qwen4ExpHcDecodeMixCute(OpWrapper):
-    """`qwen4_exp_hc_decode_mix` for a one-row batch: `(mixed, inject_out)` -- this
-    kernel's plain build (no NVFP4 output).
+    """The second half of a one-row decode hyper-connection site: the grouped RMS, the
+    SiLU bottleneck and the injection weights from `qwen4_exp_hc_decode_first_cute`'s
+    per-stream partials, then the up projection, the sigmoid gate on the normed stream
+    and the mean over streams -- `qwen4_exp_hc_decode_mix_fp4_cute`'s formulas without
+    the NVFP4 output. Returns fresh `(mixed, inject_out)` in `hc_out`'s dtype;
+    `inject_out` is None without `with_inject`.
 
-    Fusion boundary: as `qwen4_exp_hc_decode_mix`.
+    Fusion boundary: the grouped RMS, the bottleneck SiLU, the injection weights, the
+    up projection, the sigmoid gate, the normed stream and the stream mean. The
+    partials are the producer's.
     """
 
     ARCHS = frozenset({Arch.SM_103})
@@ -412,17 +464,19 @@ class Qwen4ExpHcDecodeMixCute(OpWrapper):
 
     note = """
     Metadata consumed: none. Call sites: `DecodeTarget`'s non-MoE sites at a one-row
-    decode step, after `qwen4_exp_hc_decode_first_cute`; batches of more rows keep the
-    Triton entry. Beside a first kernel capped at 96 registers, its 160 CTAs (512
-    threads at 49 registers) are all resident while that kernel runs, so the up weight
-    is in registers when the wait returns; the Triton entry's 320 programs are not.
+    decode step, after `qwen4_exp_hc_decode_first_cute`; batches of more rows take
+    `qwen4_exp_hc_up_gate_mean`. Beside a first kernel capped at 96 registers, its 160
+    CTAs (512 threads at 49 registers) are all resident while that kernel runs, so the
+    up weight is in registers when the wait returns.
 
-    Preconditions: the Triton entry's, and one row, the checkpoint's 4 x 2560 width,
-    rank 320, bf16; `up` the `.t()` view of a contiguous `[width, R]` weight.
+    Preconditions: `part` fp32 `[C, T, >= R (+ C)]` and `ss` fp32 `[C, T]`, `part` with
+    unit last stride; `hc_out` `[T, width]` with unit column stride; `norm_weight`
+    contiguous `[width]`; one row, the checkpoint's 4 x 2560 width, rank 320, bf16;
+    `up` the `.t()` view of a contiguous `[width, R]` weight.
 
-    Numerics: fp32 inside, one rounding per output, the Triton entry's formula and
-    order up to fp32 reassociation of the up-projection dot (inside its band).
-    Deterministic; graph-capturable once compiled (the first call per variant).
+    Numerics: fp32 inside (`low`, the gate logits and `normed` are never rounded), one
+    rounding per output, inside the float64 reference's band. Deterministic;
+    graph-capturable once compiled (the first call per variant).
     """
 
     def __call__(self, part, ss, up, hc_out, norm_weight, eps, hc_count, with_inject):
@@ -431,13 +485,12 @@ class Qwen4ExpHcDecodeMixCute(OpWrapper):
         )
         return mixed, inject_out
 
-    def reference(self, *args, **kwargs):
-        """The Triton entry's float64 reference."""
-        return _triton_mix.reference(*args, **kwargs)
+    def reference(self, part, ss, up, hc_out, norm_weight, eps, hc_count, with_inject):
+        """float64, one rounding per output."""
+        return _reference(part, ss, up, hc_out, norm_weight, eps, hc_count, with_inject)
 
     def is_valid(self, part, ss, up, hc_out, norm_weight, eps, hc_count, with_inject) -> None:
-        _triton_mix.is_valid(part, ss, up, hc_out, norm_weight, eps, hc_count, with_inject)
-        _check(part, ss, up, hc_out, norm_weight, hc_count)
+        _check(part, ss, up, hc_out, norm_weight, hc_count, with_inject)
 
 
 qwen4_exp_hc_decode_mix_cute = Qwen4ExpHcDecodeMixCute()

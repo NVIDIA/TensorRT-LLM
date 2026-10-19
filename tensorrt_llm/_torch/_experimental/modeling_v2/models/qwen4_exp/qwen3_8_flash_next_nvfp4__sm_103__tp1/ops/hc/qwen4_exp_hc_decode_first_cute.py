@@ -4,13 +4,11 @@
 block's injection (with the MoE block's combine and the routed experts' finalize
 folded in, when given) and the first projection per stream, one PDL launch.
 
-Tier 5 (CuTe DSL written for this target). `qwen4_exp_hc_decode_first` computes the
-same thing for up to 16 rows in Triton, whose power-of-two tiles pad a
-2560-wide stream to 8 x 512: three eighths of every program's weight, activation
-and scale tiles are masked lanes holding registers. Here a stream is exactly
-`THREADS x VEC` elements, one 16-byte vector per thread, and the grid is sized so
-that every CTA is resident at once (one wave), so all of them stream their weight
-before the producer finishes.
+Tier 5 (CuTe DSL written for this target). A stream is exactly `THREADS x VEC`
+elements, one 16-byte vector per thread (a power-of-two tile would pad a 2560-wide
+stream to 8 x 512, three eighths of it masked lanes holding registers), and the grid
+is sized so that every CTA is resident at once (one wave), so all of them stream their
+weight before the producer finishes.
 
 Order of work inside a CTA (`OUTS` weight rows x one stream):
 
@@ -28,7 +26,6 @@ Order of work inside a CTA (`OUTS` weight rows x one stream):
 from __future__ import annotations
 
 import functools
-import os
 from typing import Optional, Tuple
 
 import cuda.bindings.driver as cuda_drv
@@ -40,11 +37,10 @@ from cutlass.cute import experimental as cute_ext
 from cutlass.cute.runtime import from_dlpack
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
 
-from .qwen4_exp_hc_decode_first import qwen4_exp_hc_decode_first as _triton_first
-
-#: One decode row per launch (the 1-row batch is the one the Triton entry is slowest at
-#: relative to its weight stream).
+#: One decode row per launch: the forward runs only 1-row decode batches through the
+#: site's GEMV pair (`_HC_DECODE_GEMV_MAX_ROWS`).
 MAX_ROWS = 1
 VEC = 8
 #: Threads per CTA: one 16-byte vector of a 2560-wide stream each.
@@ -52,13 +48,6 @@ THREADS = 320
 #: Streaming multiprocessors the one-wave grid must fit (GB300).
 _SMS = 152
 _COMPILE_OPTIONS = "--ptxas-options -maxrregcount=128"
-
-
-@functools.lru_cache(maxsize=None)
-def pdl_enabled(device_index: int) -> bool:
-    """Programmatic dependent launch: sm_90+ unless TRTLLM_ENABLE_PDL=0."""
-    props = torch.cuda.get_device_properties(device_index)
-    return props.major >= 9 and os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1"
 
 
 def outs_for(n_cols: int, hc_count: int) -> int:
@@ -354,7 +343,7 @@ def launch(
     ss = torch.empty((hc_count, rows), dtype=torch.float32, device=dev)
     if rows == 0:
         return hc_out, part, ss
-    pdl = pdl_enabled(dev.index if dev.index is not None else torch.cuda.current_device())
+    pdl = get_env_enable_pdl()
     weight = first.t()  # the row-major [n_rows, width] weight
     gate = gate_logits.reshape(1) if has_shared else hyper_input.new_empty(1)
     n_perm = block_out.shape[0] if (has_inject and top_k) else 1
@@ -396,23 +385,49 @@ def launch(
 
 
 class Qwen4ExpHcDecodeFirstCute(OpWrapper):
-    """`qwen4_exp_hc_decode_first`'s computation and return values for a one-row batch
-    (see that entry for the formulas, the MoE combine and the finalize fold)::
+    """The first half of a one-row decode hyper-connection site: the previous block's
+    injection and the mixer's first projection (`[down; block_inject]`) per stream. With
+    `C = hc_count`, `H = width // C`, `N = n_cols`, `first` the `[width, >= N]` view of
+    the load-time `[down; block_inject; 0]` weight::
 
         hc_out[0, s*H+i] = hyper_input[0, s*H+i] + block_out[0, i] * inject[0, s]   (rounded once)
         part[s, 0, n]    = sum_i hc_out[0, s*H+i] * (1 + norm_weight[s*H+i]) * first[s*H+i, n]
         ss[s, 0]         = sum_i hc_out[0, s*H+i]^2
 
-    Returns `(hc_out, part, ss)`: `hc_out` fresh (it *is* `hyper_input` at a norm-only
-    site), `part` fp32 `[C, 1, N]`, `ss` fp32 `[C, 1]`. The combine (`shared`,
-    `gate_logits`) and the fold (`topk_weights`, `topk_rows`) are the Triton entry's.
+    Returns `(hc_out, part, ss)`: `hc_out` fresh in the activation dtype (it *is*
+    `hyper_input` when `block_out` / `inject` are None -- the norm-only site), `part`
+    fp32 `[C, 1, N]`, `ss` fp32 `[C, 1]`. The grouped RMS `rstd[s] = (ss[s, 0] / H +
+    eps)^-1/2` scales stream `s`'s partial: `normed @ first[:, :N] = sum_s rstd[s] *
+    part[s]`. `qwen4_exp_hc_decode_mix_cute` makes that combination.
 
-    Fusion boundary: as `qwen4_exp_hc_decode_first`.
+    With `shared` and `gate_logits` (the site after a MoE block), `block_out` is the
+    routed experts' output and the block output injected above is `block_out[0, i] +
+    sigmoid(gate_logits[0]) * shared[0, i]` in fp32, rounded once to `block_out`'s
+    dtype -- bitwise what `fused_sigmoid_gate_mul_add` stores. `gate_logits` is one
+    pre-sigmoid scalar per row, `[T, 1]` or `[T]`.
+
+    With `topk_weights` / `topk_rows` as well (the MoE runner left unfinalized),
+    `block_out` is its permuted FC2 output `[P, H]` and the routed row is the runner's
+    finalize, formed here: `routed[0, i] = sum_k topk_weights[0, k] *
+    block_out[topk_rows[0, k], i]` as fp32 FMAs in slot order from zero (a slot whose
+    row is -1 is skipped), rounded once to `block_out`'s dtype -- bitwise what the
+    runner's finalize stores. `topk_rows` is the runner's expanded->permuted index map
+    `[T, k]` int32, `topk_weights` its `[T, k]` routing weights. The fold needs the
+    combine (`shared`, `gate_logits`).
+
+    Fusion boundary: the routed experts' finalize (optional), the shared-expert combine
+    (optional), the previous block's injection, the `(1 + w)` scale and the first
+    projection per stream, plus the per-stream sum of squares. The routed and shared
+    experts and the gate projection, the RMS itself, the activations and everything
+    after are not inside.
     """
 
     ARCHS = frozenset({Arch.SM_103})
 
-    # spec: the Triton entry's (rows is 1).
+    # spec: rows (1), inject (True), moe (False: shared + gate_logits too), gate
+    # "column" [T, 1] | "flat" [T], fold (0: top-k of the finalize folded in, block_out
+    # then the permuted rows), drop (False: some slots -1), n_cols (324), n_rows (384:
+    # the padded weight), layout ("row_slice": hyper_input a row slice).
     CELLS: tuple[Cell, ...] = (
         Cell(why="checkpoint 4x2560, 324 cols of 384, bf16, inject, 1 row", spec=dict(rows=1)),
         Cell(why="MoE combine, [T, 1] gate, 1 row", spec=dict(rows=1, moe=True)),
@@ -439,16 +454,22 @@ class Qwen4ExpHcDecodeFirstCute(OpWrapper):
     note = """
     Metadata consumed: none. Call sites: `DecodeTarget`'s trunk, every
     hyper-connection site of a one-row decode step (97 per forward), followed by
-    `qwen4_exp_hc_decode_mix`; batches of more rows keep `qwen4_exp_hc_decode_first`.
+    `qwen4_exp_hc_decode_mix_cute` (or its NVFP4 variant at an MoE site); batches of
+    more rows take `qwen4_exp_hc_inject_norm` and the mixer. The 47 sites after a MoE
+    block other than the one before the PLE add pass `shared` and `gate_logits`, and
+    with them the unfinalized runner's `topk_weights` / `topk_rows`.
 
-    Preconditions: as the Triton entry, and: one row; `hidden` 2560 (320 threads x
-    8); bf16 operands; `n_cols` with a divisor that keeps `n_cols / outs x C <= 152`
+    Preconditions: 2-D operands with unit column stride (row strides free); `first`
+    `[width, >= n_cols]` with unit stride along `width` (the `.t()` view of a row-major
+    `[N, width]` weight; columns past `n_cols` are never read); one row; `hidden` 2560
+    (320 threads x 8); bf16 operands; `n_cols` with a divisor that keeps `n_cols / outs x C <= 152`
     CTAs (324 -> 9 rows x 36 tiles x 4 streams = 144; 320 -> 10 rows, 128); the
     permuted rows' count is part of the compiled layout (one compile per value).
 
-    Numerics: `hc_out` the Triton entry's arithmetic (fp32 FMAs, one rounding; the
-    finalize and the combine likewise), so bitwise equal to it; `part` and `ss`
-    reduce in another fp32 order (inside the same band of the float64 reference).
+    Numerics: `hc_out` as `qwen4_exp_hc_inject_norm` (fp32 FMAs, one rounding; the
+    finalize and the combine likewise); `part` and `ss` are fp32 reductions in a fixed
+    order, inside the float64 reference's band (the combine and the finalize can each
+    land one ulp of the block output from it, scaled into `hc_out` by `inject`).
     Deterministic. Graph-capturable: compiled on the first call per variant, which
     must precede capture (the engine's warmup forward does it).
 
@@ -485,9 +506,47 @@ class Qwen4ExpHcDecodeFirstCute(OpWrapper):
             topk_rows,
         )
 
-    def reference(self, *args, **kwargs) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """The Triton entry's float64 reference."""
-        return _triton_first.reference(*args, **kwargs)
+    def reference(
+        self,
+        hyper_input: torch.Tensor,
+        block_out: Optional[torch.Tensor],
+        inject: Optional[torch.Tensor],
+        norm_weight: torch.Tensor,
+        first: torch.Tensor,
+        hc_count: int,
+        n_cols: int,
+        shared: Optional[torch.Tensor] = None,
+        gate_logits: Optional[torch.Tensor] = None,
+        topk_weights: Optional[torch.Tensor] = None,
+        topk_rows: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """float64; the finalize (with `topk_rows`) rounded once to
+        `block_out`'s dtype, the combine (with `shared`) rounded once to `block_out`'s
+        dtype, `hc_out` rounded once to the activation dtype, `part` and `ss`
+        rounded once to fp32."""
+        dtype = hyper_input.dtype
+        rows, width = hyper_input.shape
+        hidden = width // hc_count
+        if block_out is None:
+            hc_out = hyper_input
+        else:
+            if topk_rows is not None:
+                valid = (topk_rows >= 0).unsqueeze(-1)
+                rows_ = block_out.double()[topk_rows.clamp(min=0).long()]
+                w = topk_weights.double().unsqueeze(-1)
+                block_out = torch.where(valid, rows_ * w, 0.0).sum(1).to(block_out.dtype)
+            if shared is not None:
+                sg = torch.sigmoid(gate_logits.double().reshape(rows, 1))
+                block_out = (block_out.double() + sg * shared.double()).to(block_out.dtype)
+            streams = hyper_input.double().unflatten(-1, (hc_count, hidden))
+            gated = block_out.double().unsqueeze(-2) * inject.double().unsqueeze(-1)
+            hc_out = (streams + gated).flatten(-2).to(dtype)
+        x = hc_out.double().unflatten(-1, (hc_count, hidden))
+        y = x * (1.0 + norm_weight.double()).unflatten(-1, (hc_count, hidden))
+        w = first[:, :n_cols].double().unflatten(0, (hc_count, hidden))
+        part = torch.einsum("tsi,sin->stn", y, w).float()
+        ss = x.pow(2).sum(dim=-1).t().float()
+        return hc_out, part, ss
 
     def is_valid(
         self,
@@ -503,19 +562,39 @@ class Qwen4ExpHcDecodeFirstCute(OpWrapper):
         topk_weights: Optional[torch.Tensor] = None,
         topk_rows: Optional[torch.Tensor] = None,
     ) -> None:
-        _triton_first.is_valid(
-            hyper_input,
-            block_out,
-            inject,
-            norm_weight,
-            first,
-            hc_count,
-            n_cols,
-            shared,
-            gate_logits,
-            topk_weights,
-            topk_rows,
+        # Raw row strides with unit column stride everywhere; a contiguous
+        # [width, N] weight would be read with its rows and columns swapped.
+        assert hyper_input.dim() == 2 and hyper_input.stride(1) == 1, "hyper_input [T, width]"
+        rows, width = hyper_input.shape
+        assert width % hc_count == 0 and (width // hc_count) % 16 == 0, "hidden multiple of 16"
+        assert (block_out is None) == (inject is None), "block_out and inject come together"
+        assert (shared is None) == (gate_logits is None), "shared and gate_logits come together"
+        assert shared is None or block_out is not None, "the combine needs block_out"
+        assert (topk_weights is None) == (topk_rows is None), (
+            "topk_weights and topk_rows come together"
         )
+        assert topk_rows is None or shared is not None, "the finalize fold needs the combine"
+        if block_out is not None:
+            if topk_rows is None:
+                assert block_out.shape == (rows, width // hc_count) and block_out.stride(1) == 1
+            else:
+                # The permuted FC2 rows: any row count, read through topk_rows.
+                assert block_out.dim() == 2 and block_out.shape[1] == width // hc_count
+                assert block_out.stride(1) == 1, "permuted rows [P, hidden]"
+                assert topk_rows.dtype == torch.int32, "topk_rows int32 (the runner's index map)"
+                assert topk_rows.dim() == 2 and topk_rows.shape[0] == rows, "topk_rows [T, k]"
+                assert topk_rows.stride(1) == 1 and topk_weights.stride(1) == 1
+                assert topk_weights.shape == topk_rows.shape, "topk_weights [T, k]"
+            assert inject.shape == (rows, hc_count) and inject.stride(1) == 1
+        if shared is not None:
+            assert shared.shape == (rows, width // hc_count), "shared [T, hidden]"
+            assert shared.stride(1) == 1, "shared [T, hidden]"
+            assert shared.dtype == block_out.dtype, "shared in block_out's dtype"
+            assert gate_logits.shape in ((rows,), (rows, 1)), "gate_logits [T, 1] or [T]"
+            assert rows <= 1 or gate_logits.stride(0) != 0, "one gate logit per row"
+        assert norm_weight.shape == (width,) and norm_weight.is_contiguous(), "norm_weight [width]"
+        assert first.shape[0] == width and first.shape[1] >= n_cols, "first [width, >= n_cols]"
+        assert first.stride(0) == 1, "first must be the .t() view of a row-major [N, width] weight"
         assert hyper_input.shape[0] <= MAX_ROWS, "one row"
         assert hyper_input.shape[1] // hc_count == THREADS * VEC, "hidden 2560"
         assert hyper_input.dtype == torch.bfloat16, "bf16"

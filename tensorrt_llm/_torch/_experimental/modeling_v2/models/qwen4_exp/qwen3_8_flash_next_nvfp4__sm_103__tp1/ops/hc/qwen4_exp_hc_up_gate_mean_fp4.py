@@ -20,9 +20,14 @@ from typing import Tuple
 import torch
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.quantization.fp4_quantize import (
+    fp4_quantize,
+)
 
-from .qwen4_exp_hc_decode_mix_fp4 import SF_VEC, nvfp4_reference
 from .qwen4_exp_hc_up_gate_mean import _BLOCK_H, hc_up_gate_mean_fp4, qwen4_exp_hc_up_gate_mean
+
+#: NVFP4 block: one e4m3 scale per this many contiguous elements.
+SF_VEC = 16
 
 
 class Qwen4ExpHcUpGateMeanFp4(OpWrapper):
@@ -69,7 +74,7 @@ class Qwen4ExpHcUpGateMeanFp4(OpWrapper):
     kernel compiled with its NVFP4 epilogue; tiers 1-5 have no GEMM with this
     multi-input epilogue, and the fused up projection itself is tier 6.
     Metadata consumed: none. Call sites: the 48 MoE-site mixers (prefill, and
-    decode from `_HC_FUSED_UP_MIN_ROWS` rows); `xq`/`xsf` feed
+    decode past `_HC_DECODE_GEMV_MAX_ROWS` rows); `xq`/`xsf` feed
     `fp4_block_scale_moe_renorm_routed` (linear scales), `mixed` the router and
     the shared expert. Preconditions: those of `qwen4_exp_hc_up_gate_mean`
     (bf16, `R % 64 == 0`, `H % 32 == 0`, `C * 32 <= 256`, 16-byte aligned
@@ -104,7 +109,7 @@ class Qwen4ExpHcUpGateMeanFp4(OpWrapper):
         """`mixed` in float64 with one rounding, then the NVFP4 of that rounded
         value in native torch."""
         mixed = qwen4_exp_hc_up_gate_mean.reference(low, up, normed, hc_count)
-        return (mixed,) + nvfp4_reference(mixed, global_scale)
+        return (mixed,) + fp4_quantize.reference(mixed, global_scale, SF_VEC, False, False)
 
     def is_valid(
         self,
