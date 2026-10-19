@@ -181,8 +181,6 @@ class _FfmpegCliEncoder(_VideoEncoder):
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                 )
-                # tobytes() copies the video while holding the GIL and stalls the serving event
-                # loop; reshape(-1) yields the same C-order bytes without holding it.
                 raw_frames = memoryview(video_np.reshape(-1))
                 _, stderr = process.communicate(input=raw_frames)
                 if process.returncode != 0:
