@@ -3180,6 +3180,12 @@ class MiniMaxM3VLForConditionalGeneration(MiniMaxM3ForCausalLM):
                     vid.get("pixel_values_videos") is not None
                     or vid.get("pixel_values") is not None
                 )
+                # A request whose placeholder rows are all cached or beyond
+                # this chunk needs no vision forward; dropping it here keeps
+                # the tower calls and the embedding rows to the active params.
+                runtime = getattr(param, "multimodal_runtime", None)
+                if runtime is not None and runtime.num_mm_tokens_in_chunk == 0:
+                    continue
                 if has_image_pv or has_video_pv:
                     mm_params_with_data.append(param)
 

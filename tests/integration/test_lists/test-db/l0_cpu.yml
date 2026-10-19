@@ -85,31 +85,10 @@ l0_cpu:
   - unittest/_torch/models/test_minimax_m3.py::test_piecewise_attention_boundary_preserves_indexer_cache_contract
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_five_way_projection_shard_geometry
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_five_way_loader_returns_exact_generic_skip
-  # MiniMax-M3 VL tokenizer-only CPU contracts.
-  - unittest/_torch/models/test_minimax_m3_vl.py::test_text_request_needs_no_hf_processor
-  - unittest/_torch/models/test_minimax_m3_vl.py::test_tokenizer_from_auto_processor_is_not_image_support
-  - unittest/_torch/models/test_minimax_m3_vl.py::test_image_request_uses_a_valid_processor
-  - unittest/_torch/models/test_minimax_m3_vl.py::test_serve_rendered_image_prompt_is_used_verbatim
-  - unittest/_torch/models/test_minimax_m3_vl.py::test_serve_rendered_mixed_image_and_video_prompt
-  - unittest/_torch/models/test_minimax_m3_vl.py::test_framed_marker_is_reduced_to_the_bare_marker
-  - unittest/_torch/models/test_minimax_m3_vl.py::test_marker_and_media_count_mismatch_is_rejected
-  - unittest/_torch/models/test_minimax_m3_vl.py::test_raw_prompt_marker_text_is_rejected
-  - unittest/_torch/models/test_minimax_m3_vl.py::test_openai_chat_marks_the_rendered_prompt_for_the_input_processor
-  - unittest/_torch/models/test_minimax_m3_vl.py::test_image_token_count_accepts_every_media_io_format
-  - unittest/_torch/models/test_minimax_m3_vl.py::test_preferred_media_io_format_is_uint8_numpy
-  - unittest/_torch/models/test_minimax_m3_vl.py::test_video_token_count_is_one_bracket_per_temporal_patch
-  - unittest/_torch/models/test_minimax_m3_vl.py::test_fast_path_expand_video_one_bracket_per_temporal_patch
-  - unittest/_torch/models/test_minimax_m3_vl.py::test_token_id_request_takes_the_fast_path_without_detokenizing
-  - unittest/_torch/models/test_minimax_m3_vl.py::test_video_request_lets_the_processor_resize_frames
-  - unittest/_torch/models/test_minimax_m3_vl.py::test_float_tensor_media_reach_the_processor_as_uint8_hwc
-  # MiniMax-M3 VL forward under speculative decoding, KV reuse and chunked prefill.
-  - unittest/_torch/models/test_minimax_m3_vl_spec_reuse.py::test_speculative_multimodal_prefill_forwards_orig_input_ids
-  - unittest/_torch/models/test_minimax_m3_vl_spec_reuse.py::test_full_image_prefix_reuse_hit_skips_fusion
-  - unittest/_torch/models/test_minimax_m3_vl_spec_reuse.py::test_partial_image_prefix_reuse_slices_the_uncached_rows
-  - unittest/_torch/models/test_minimax_m3_vl_spec_reuse.py::test_chunk_boundary_inside_image_span_keeps_only_the_chunk_rows
-  - unittest/_torch/models/test_minimax_m3_vl_spec_reuse.py::test_batched_requests_advance_the_row_cursor_per_request
-  - unittest/_torch/models/test_minimax_m3_vl_spec_reuse.py::test_two_images_in_one_request_fuse_in_prompt_order
-  - unittest/_torch/models/test_minimax_m3_vl_spec_reuse.py::test_text_only_batch_passes_through
+  # MiniMax-M3 VL input processor and wrapper forward; the CPU stage's -m cpu_only
+  # leaves the checkpoint-backed tests out.
+  - unittest/_torch/models/test_minimax_m3_vl.py
+  - unittest/_torch/models/test_minimax_m3_vl_spec_reuse.py
   - unittest/_torch/models/checkpoints
   - unittest/_torch/modules
   - unittest/_torch/moe

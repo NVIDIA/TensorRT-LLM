@@ -17,20 +17,17 @@
 ``MiniMaxM3VLForConditionalGeneration.forward`` owes the executor and the
 speculative-decoding workers this contract:
 
-* a plain multimodal prefill fuses the vision rows into ``inputs_embeds`` and
-  forwards the pre-fusion token ids as ``orig_input_ids`` (``input_ids`` is None
-  after fusion, and ``SpecDecOneEngineForCausalLM.forward`` reads
-  ``orig_input_ids`` for the DSpark/DFlash, MTP and Eagle workers);
-* a full image-prefix KV-reuse hit (``multimodal_runtime`` says every embedding
-  row is cached) skips fusion: ``input_ids`` passes through unchanged,
-  ``inputs_embeds`` stays None and no ``orig_input_ids`` is set;
+* a multimodal prefill fuses the vision rows into ``inputs_embeds`` in prompt
+  order and forwards the pre-fusion token ids as ``orig_input_ids``
+  (``input_ids`` is None after fusion, and ``SpecDecOneEngineForCausalLM.forward``
+  reads ``orig_input_ids`` for the DSpark/DFlash, MTP and Eagle workers);
+* a request whose placeholder rows are all cached runs no vision forward; when
+  every request in the batch is, fusion is skipped and ``input_ids`` passes
+  through unchanged;
 * a partial reuse hit or a chunk boundary inside the placeholder span keeps
   exactly the rows ``find_input_mm_embeds`` selects
-  (``[num_cached : num_cached + in_chunk]``) and scatters them at the
-  placeholder positions of the current chunk;
-* a batch of two requests with one image each, the second partially cached,
-  advances the pre-concatenated row cursor by ``total_embeds_in_request``;
-* one request carrying two images fuses both in prompt order.
+  (``[num_cached : num_cached + in_chunk]``), advancing the pre-concatenated row
+  cursor by ``total_embeds_in_request`` per request.
 
 The model is built with ``object.__new__`` plus ``nn.Module.__init__`` so no
 checkpoint, config or CUDA is needed; the vision tower is a fake that maps each
@@ -181,22 +178,26 @@ def _fused_rows(captured: Dict[str, Any], ids: List[int]) -> List[float]:
     return embeds[:, 0].tolist()
 
 
-def test_speculative_multimodal_prefill_forwards_orig_input_ids(vl_model: _VLModel) -> None:
-    """Fusion drops ``input_ids``; the pre-fusion ids reach the spec worker as ``orig_input_ids``."""
+def test_multimodal_prefill_fuses_images_in_order_and_forwards_orig_input_ids(
+    vl_model: _VLModel,
+) -> None:
+    """Two images (4 + 2 tokens), no runtime data: rows fused in prompt order, ids kept for spec."""
     model, captured = vl_model
-    ids = [_TXT, _TXT, _IMG, _IMG, _IMG, _IMG, _TXT]
+    ids = [_TXT, _IMG, _IMG, _IMG, _IMG, _TXT, _IMG, _IMG, _TXT]
     spec_metadata = object()
-    input_ids = _run(model, ids, [_params([[10.0, 11.0, 12.0, 13.0]])], spec_metadata=spec_metadata)
+    input_ids = _run(
+        model, ids, [_params([[1.0, 2.0, 3.0, 4.0], [5.0, 6.0]])], spec_metadata=spec_metadata
+    )
 
     assert captured["input_ids"] is None
-    assert torch.equal(captured["kwargs"]["orig_input_ids"], input_ids.flatten())
+    assert torch.equal(captured["kwargs"]["orig_input_ids"], input_ids)
     assert captured["kwargs"]["spec_metadata"] is spec_metadata
     assert "multimodal_params" not in captured["kwargs"]
-    assert _fused_rows(captured, ids) == [-8.0, -8.0, 10.0, 11.0, 12.0, 13.0, -8.0]
+    assert _fused_rows(captured, ids) == [-8.0, 1.0, 2.0, 3.0, 4.0, -8.0, 5.0, 6.0, -8.0]
 
 
 def test_full_image_prefix_reuse_hit_skips_fusion(vl_model: _VLModel) -> None:
-    """Every placeholder row is cached: no fusion, ``input_ids`` passes through unchanged."""
+    """Every placeholder row is cached: no vision forward, no fusion, ``input_ids`` unchanged."""
     model, captured = vl_model
     full = [_TXT, _IMG, _IMG, _IMG, _IMG, _TXT, _TXT]
     # The cached prefix covers the whole image span; this forward computes the tail only.
@@ -205,24 +206,30 @@ def test_full_image_prefix_reuse_hit_skips_fusion(vl_model: _VLModel) -> None:
     chunk_ids = full[5:]
     input_ids = _run(model, chunk_ids, [_params([[1.0, 2.0, 3.0, 4.0]], runtime)])
 
-    assert captured["input_ids"] is not None
     assert torch.equal(captured["input_ids"], input_ids)
     assert captured["inputs_embeds"] is None
     assert "orig_input_ids" not in captured["kwargs"]
+    assert model.vision_tower.calls == []
 
 
-def test_partial_image_prefix_reuse_slices_the_uncached_rows(vl_model: _VLModel) -> None:
-    """Two of four rows cached: rows ``[2:4]`` land on the two placeholders left in this forward."""
+def test_fully_reused_request_in_a_batch_runs_no_vision_forward(vl_model: _VLModel) -> None:
+    """A fully cached request next to a fresh one: only the fresh image is encoded and fused."""
     model, captured = vl_model
-    full = [_TXT, _IMG, _IMG, _IMG, _IMG, _TXT]
-    runtime = _runtime(full, past_seen=3, chunk_end=len(full))
-    assert (runtime.num_cached_mm_tokens, runtime.num_mm_tokens_in_chunk) == (2, 2)
-    chunk_ids = full[3:]
-    input_ids = _run(model, chunk_ids, [_params([[1.0, 2.0, 3.0, 4.0]], runtime)])
+    full_a = [_TXT, _IMG, _IMG, _IMG, _IMG, _TXT, _TXT]
+    full_b = [_TXT, _IMG, _IMG, _IMG, _IMG]
+    runtime_a = _runtime(full_a, past_seen=5, chunk_end=len(full_a))
+    runtime_b = _runtime(full_b, past_seen=0, chunk_end=len(full_b))
+    assert runtime_a.num_mm_tokens_in_chunk == 0
+    ids = full_a[5:] + full_b
+    params: List[Optional[MultimodalParams]] = [
+        _params([[1.0, 2.0, 3.0, 4.0]], runtime_a),
+        _params([[10.0, 11.0, 12.0, 13.0]], runtime_b),
+    ]
+    input_ids = _run(model, ids, params)
 
-    assert captured["input_ids"] is None
     assert torch.equal(captured["kwargs"]["orig_input_ids"], input_ids)
-    assert _fused_rows(captured, chunk_ids) == [3.0, 4.0, -8.0]
+    assert _fused_rows(captured, ids) == [-8.0, -8.0, -8.0, 10.0, 11.0, 12.0, 13.0]
+    assert model.vision_tower.calls == [4]
 
 
 def test_chunk_boundary_inside_image_span_keeps_only_the_chunk_rows(vl_model: _VLModel) -> None:
@@ -244,6 +251,7 @@ def test_batched_requests_advance_the_row_cursor_per_request(vl_model: _VLModel)
     full_b = [_TXT, _IMG, _IMG, _IMG, _IMG, _IMG, _IMG, _TXT]
     runtime_a = _runtime(full_a, past_seen=0, chunk_end=len(full_a))
     runtime_b = _runtime(full_b, past_seen=3, chunk_end=len(full_b))
+    assert (runtime_b.num_cached_mm_tokens, runtime_b.num_mm_tokens_in_chunk) == (2, 4)
     ids = full_a + full_b[3:]
     params: List[Optional[MultimodalParams]] = [
         _params([[10.0, 11.0, 12.0, 13.0]], runtime_a),
@@ -256,26 +264,3 @@ def test_batched_requests_advance_the_row_cursor_per_request(vl_model: _VLModel)
         -8.0, 10.0, 11.0, 12.0, 13.0,  # request A, nothing cached
         22.0, 23.0, 24.0, 25.0, -8.0,  # request B, rows [2:6]
     ]  # fmt: skip
-
-
-def test_two_images_in_one_request_fuse_in_prompt_order(vl_model: _VLModel) -> None:
-    """One request with two images (4 + 2 tokens) and no runtime data fuses both in order."""
-    model, captured = vl_model
-    ids = [_TXT, _IMG, _IMG, _IMG, _IMG, _TXT, _IMG, _IMG, _TXT]
-    input_ids = _run(model, ids, [_params([[1.0, 2.0, 3.0, 4.0], [5.0, 6.0]])])
-
-    assert torch.equal(captured["kwargs"]["orig_input_ids"], input_ids)
-    assert _fused_rows(captured, ids) == [-8.0, 1.0, 2.0, 3.0, 4.0, -8.0, 5.0, 6.0, -8.0]
-
-
-def test_text_only_batch_passes_through(vl_model: _VLModel) -> None:
-    """No vision data: ``input_ids`` and ``multimodal_params`` are untouched, no ``orig_input_ids``."""
-    model, captured = vl_model
-    ids = [_TXT, _TXT, _TXT]
-    text_only = MultimodalParams(multimodal_data={})
-    input_ids = _run(model, ids, [text_only, None])
-
-    assert torch.equal(captured["input_ids"], input_ids)
-    assert captured["inputs_embeds"] is None
-    assert "orig_input_ids" not in captured["kwargs"]
-    assert model.vision_tower.calls == []

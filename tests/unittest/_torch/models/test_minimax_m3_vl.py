@@ -103,6 +103,7 @@ def _make_vision_config_dict() -> dict:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.cpu_only
 def test_clip_vision_config_from_dict_uses_checkpoint_fields():
     cfg = CLIPVisionConfig.from_dict_or_obj(_make_vision_config_dict())
     assert cfg.hidden_size == 1280
@@ -118,6 +119,7 @@ def test_clip_vision_config_from_dict_uses_checkpoint_fields():
     assert cfg.img_token_compression_config["temporal_patch_size"] == 2
 
 
+@pytest.mark.cpu_only
 def test_clip_vision_config_from_dict_ignores_unknown_keys():
     data = _make_vision_config_dict()
     data["projection_dim"] = 6144  # unknown to the dataclass; must be ignored
@@ -126,6 +128,7 @@ def test_clip_vision_config_from_dict_ignores_unknown_keys():
     assert cfg.hidden_size == 1280
 
 
+@pytest.mark.cpu_only
 def test_clip_vision_config_from_dict_accepts_simplenamespace():
     ns = SimpleNamespace(
         hidden_size=128,
@@ -140,6 +143,7 @@ def test_clip_vision_config_from_dict_accepts_simplenamespace():
     assert cfg.num_hidden_layers == 2
 
 
+@pytest.mark.cpu_only
 def test_clip_vision_config_from_none_yields_defaults():
     cfg = CLIPVisionConfig.from_dict_or_obj(None)
     # Defaults match the M3 VL checkpoint vision_config dimensions.
@@ -147,6 +151,7 @@ def test_clip_vision_config_from_none_yields_defaults():
     assert cfg.num_hidden_layers == 32
 
 
+@pytest.mark.cpu_only
 def test_minimax_vl_vision_model_state_dict_keys_match_checkpoint_pattern():
     cfg = CLIPVisionConfig.from_dict_or_obj(_make_vision_config_dict())
     model = MiniMaxVLVisionModel(
@@ -199,6 +204,7 @@ def test_minimax_vl_vision_model_state_dict_keys_match_checkpoint_pattern():
     assert "patch_merge_mlp.linear_2.bias" in state_dict
 
 
+@pytest.mark.cpu_only
 def test_minimax_vl_vision_model_param_shapes_match_checkpoint():
     cfg = CLIPVisionConfig.from_dict_or_obj(_make_vision_config_dict())
     model = MiniMaxVLVisionModel(
@@ -238,6 +244,7 @@ def test_minimax_vl_vision_model_param_shapes_match_checkpoint():
     assert tuple(pm2.shape) == (6144, 6144)
 
 
+@pytest.mark.cpu_only
 def test_minimax_vl_vision_model_supports_meta_init():
     config_dict = _make_vision_config_dict()
     config_dict["num_hidden_layers"] = 2
@@ -261,6 +268,7 @@ def test_minimax_vl_vision_model_supports_meta_init():
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.cpu_only
 def test_reanchor_multimodal_checkpoint_keys_maps_vision_branches():
     keys = [
         "vision_tower.vision_model.embeddings.patch_embedding.weight",
@@ -285,6 +293,7 @@ def test_reanchor_multimodal_checkpoint_keys_maps_vision_branches():
     assert "language_model.lm_head.weight" not in plan
 
 
+@pytest.mark.cpu_only
 def test_split_multimodal_weights_partitions_text_and_vision():
     weights = {
         "language_model.model.norm.weight": torch.zeros(2),
@@ -304,6 +313,7 @@ def test_split_multimodal_weights_partitions_text_and_vision():
     assert "multi_modal_projector.linear_1.weight" not in text
 
 
+@pytest.mark.cpu_only
 def test_split_multimodal_weights_preserves_unknown_top_level_keys():
     weights = {
         "language_model.model.norm.weight": torch.zeros(2),
@@ -319,6 +329,7 @@ def test_split_multimodal_weights_preserves_unknown_top_level_keys():
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.cpu_only
 def test_load_minimax_m3_vl_state_dict_fills_target_slots():
     # Use a tiny config so the test is fast on CPU.
     cfg = CLIPVisionConfig.from_dict_or_obj(
@@ -365,6 +376,7 @@ def test_load_minimax_m3_vl_state_dict_fills_target_slots():
     assert torch.all(pre_ln == 0.5)
 
 
+@pytest.mark.cpu_only
 def test_load_minimax_m3_vl_state_dict_strict_rejects_missing_keys():
     cfg = CLIPVisionConfig.from_dict_or_obj(
         {
@@ -393,6 +405,7 @@ def test_load_minimax_m3_vl_state_dict_strict_rejects_missing_keys():
         load_minimax_m3_vl_state_dict(model, raw_weights, strict=True)
 
 
+@pytest.mark.cpu_only
 def test_load_minimax_m3_vl_state_dict_rejects_shape_mismatch():
     cfg = CLIPVisionConfig.from_dict_or_obj(
         {
@@ -590,6 +603,7 @@ def test_real_checkpoint_vision_weight_load_smoke():
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.cpu_only
 def test_compute_visual_token_count_matches_sglang_formula():
     # Single image, grid (1, 48, 48) with spatial_merge_size 2 -> 1 * 24 * 24 = 576.
     assert compute_visual_token_count(1, 48, 48, 2) == 576
@@ -599,6 +613,7 @@ def test_compute_visual_token_count_matches_sglang_formula():
     assert compute_visual_token_count(1, 4, 4, 2) == 4
 
 
+@pytest.mark.cpu_only
 def test_compute_visual_token_counts_batched():
     # [1, 4, 4] merge=2 -> 1 * 2 * 2 = 4
     # [1, 8, 8] merge=2 -> 1 * 4 * 4 = 16
@@ -607,6 +622,7 @@ def test_compute_visual_token_counts_batched():
     assert counts == [4, 16, 12]
 
 
+@pytest.mark.cpu_only
 def test_compute_visual_token_count_rejects_non_divisible_grid():
     with pytest.raises(ValueError, match="multiple of spatial_merge_size"):
         compute_visual_token_count(1, 5, 4, 2)
@@ -614,6 +630,7 @@ def test_compute_visual_token_count_rejects_non_divisible_grid():
         compute_visual_token_count(1, 4, 5, 2)
 
 
+@pytest.mark.cpu_only
 def test_expand_multimodal_placeholders_image_only():
     # Two image placeholders with different repeat counts.
     input_ids = [1, 2, 200025, 3, 200025, 4]
@@ -625,6 +642,7 @@ def test_expand_multimodal_placeholders_image_only():
     assert video_spans == []
 
 
+@pytest.mark.cpu_only
 def test_expand_multimodal_placeholders_image_and_video():
     input_ids = [10, 200025, 20, 200026, 30]
     expanded, image_spans, video_spans = expand_multimodal_placeholders(
@@ -639,6 +657,7 @@ def test_expand_multimodal_placeholders_image_and_video():
     assert video_spans == [(4, 8)]
 
 
+@pytest.mark.cpu_only
 def test_expand_multimodal_placeholders_count_mismatch_raises():
     with pytest.raises(ValueError, match="more image tokens"):
         expand_multimodal_placeholders([200025, 200025], image_token_id=200025, image_repeats=[2])
@@ -646,6 +665,7 @@ def test_expand_multimodal_placeholders_count_mismatch_raises():
         expand_multimodal_placeholders([1, 2, 3], image_token_id=200025, image_repeats=[2])
 
 
+@pytest.mark.cpu_only
 def test_apply_multimodal_pad_values_rewrites_only_spans():
     input_ids = [1, 2, 200025, 200025, 200025, 4, 200026, 200026, 6]
     out = apply_multimodal_pad_values(
@@ -658,6 +678,7 @@ def test_apply_multimodal_pad_values_rewrites_only_spans():
     assert out == [1, 2, 7777, 7777, 7777, 4, 8888, 8888, 6]
 
 
+@pytest.mark.cpu_only
 def test_merge_multimodal_embeddings_image_only_replaces_correct_positions():
     text_seq = 8
     hidden = 4
@@ -676,6 +697,7 @@ def test_merge_multimodal_embeddings_image_only_replaces_correct_positions():
         assert torch.allclose(out[i], input_embeds[i])
 
 
+@pytest.mark.cpu_only
 def test_merge_multimodal_embeddings_rejects_mismatched_counts():
     input_embeds = torch.zeros((8, 4))
     image_embeds = torch.ones((4, 4))
@@ -687,6 +709,7 @@ def test_merge_multimodal_embeddings_rejects_mismatched_counts():
         )
 
 
+@pytest.mark.cpu_only
 def test_merge_multimodal_embeddings_negative_control_wrong_span():
     """Negative control — merging at the wrong span gives a different result.
 
@@ -732,6 +755,7 @@ def _tiny_vision_config():
     }
 
 
+@pytest.mark.cpu_only
 def test_vision_tower_forward_shape_and_dtype_cpu():
     """Run the full vision tower on tiny synthetic data — CPU-only shape check."""
     cfg = CLIPVisionConfig.from_dict_or_obj(_tiny_vision_config())
@@ -765,6 +789,7 @@ def test_vision_tower_forward_shape_and_dtype_cpu():
     assert torch.isfinite(out).all()
 
 
+@pytest.mark.cpu_only
 def test_vision_tower_forward_multi_image_concat():
     """Concatenated multi-image batch produces concatenated outputs."""
     cfg = CLIPVisionConfig.from_dict_or_obj(_tiny_vision_config())
@@ -792,6 +817,7 @@ def test_vision_tower_forward_multi_image_concat():
     assert torch.isfinite(out).all()
 
 
+@pytest.mark.cpu_only
 def test_patch_embedding_shape_matches_conv3d_semantics():
     """Patch embedding produces ``[N, hidden]`` matching the Conv3d kernel."""
     cfg = CLIPVisionConfig.from_dict_or_obj(_tiny_vision_config())
@@ -809,6 +835,7 @@ def test_patch_embedding_shape_matches_conv3d_semantics():
     assert out.shape == (n, cfg.hidden_size)
 
 
+@pytest.mark.cpu_only
 def test_patch_merger_forward_compresses_by_merge_factor():
     """``[N, hidden]`` -> ``[N / merge**2, hidden]`` after the merger."""
     cfg = CLIPVisionConfig.from_dict_or_obj(_tiny_vision_config())
@@ -823,6 +850,7 @@ def test_patch_merger_forward_compresses_by_merge_factor():
     assert out.shape == (4, 16)
 
 
+@pytest.mark.cpu_only
 def test_patch_merger_rejects_unaligned_input():
     cfg = CLIPVisionConfig.from_dict_or_obj(_tiny_vision_config())
     merge = MiniMaxVLPatchMerger(
@@ -1204,6 +1232,7 @@ _VS_TOK = 200029  # ]<]start of image[>[  (used for BOTH images and videos)
 _VE_TOK = 200030  # ]<]end of image[>[
 
 
+@pytest.mark.cpu_only
 def test_build_multimodal_input_ids_image_start_end_matches_sglang_oracle():
     """SGLang-style bracketed image expansion matches the oracle byte-for-byte."""
     # Prompt mirrors what the M3 tokenizer emits for "<sys> ]<]start of image[>[
@@ -1242,6 +1271,7 @@ def test_build_multimodal_input_ids_image_start_end_matches_sglang_oracle():
     assert trt_mods == ["image"]
 
 
+@pytest.mark.cpu_only
 def test_build_multimodal_input_ids_video_uses_image_start_end_markers():
     """Videos use the IMAGE start/end markers (processing_minimax.py:54-62)."""
     # Video frame grid (2, 4, 6) merge=2 -> 2*2*3 = 12 placeholders.
@@ -1264,6 +1294,7 @@ def test_build_multimodal_input_ids_video_uses_image_start_end_markers():
     assert mods == ["video"]
 
 
+@pytest.mark.cpu_only
 def test_build_multimodal_input_ids_image_and_video_interleaved():
     """Interleaved image + video preserves order in modality_list and offsets."""
     # image (1,4,4)=4 placeholders, then video (1,4,6)=6 placeholders.
@@ -1291,6 +1322,7 @@ def test_build_multimodal_input_ids_image_and_video_interleaved():
     assert mods == ["image", "video"]
 
 
+@pytest.mark.cpu_only
 def test_build_multimodal_input_ids_rejects_count_mismatch():
     # Two placeholders but only one grid -> ValueError.
     prompt = [_VS_TOK, _IMG_TOK, _VE_TOK, _VS_TOK, _IMG_TOK, _VE_TOK]
@@ -1313,6 +1345,7 @@ def test_build_multimodal_input_ids_rejects_count_mismatch():
         )
 
 
+@pytest.mark.cpu_only
 def test_pad_multimodal_input_tokens_inclusive_matches_sglang_pad():
     """``pad_multimodal_input_tokens`` matches SGLang ``pad_input_tokens``.
 
@@ -1358,6 +1391,7 @@ def test_pad_multimodal_input_tokens_inclusive_matches_sglang_pad():
             assert padded[i] == original, (i, padded[i], original)
 
 
+@pytest.mark.cpu_only
 def test_merge_multimodal_embeddings_inclusive_offsets_round_trip():
     """``merge_multimodal_embeddings_inclusive`` accepts SGLang inclusive offsets."""
     prompt = [9, _VS_TOK, _IMG_TOK, _VE_TOK, 10]
@@ -1383,6 +1417,7 @@ def test_merge_multimodal_embeddings_inclusive_offsets_round_trip():
             assert torch.equal(merged[i], text_embeds[i]), i
 
 
+@pytest.mark.cpu_only
 def test_negative_control_raw_exclusive_span_breaks_inclusive_pad():
     """Negative control — feeding raw exclusive spans into the SGLang-style
     inclusive pad/merge helpers clobbers the trailing VISION_END marker.
@@ -1447,6 +1482,7 @@ def test_negative_control_raw_exclusive_span_breaks_inclusive_pad():
     assert sgl_padded != misused_padded
 
 
+@pytest.mark.cpu_only
 def test_negative_control_wrong_grid_order_breaks_parity():
     """Reversing the per-item grid order breaks parity at the placeholder count.
 
@@ -2053,6 +2089,7 @@ def _make_minimax_m3_vl_fast_path_processor():
     return obj
 
 
+@pytest.mark.cpu_only
 def test_fast_path_get_text_with_mm_placeholders_returns_empty():
     """``get_text_with_mm_placeholders`` must return ``""`` so the chat
     template inserts exactly ``mm_counts['image']`` image markers via the
@@ -2067,6 +2104,7 @@ def test_fast_path_get_text_with_mm_placeholders_returns_empty():
     assert proc.get_text_with_mm_placeholders({}) == ""
 
 
+@pytest.mark.cpu_only
 def test_fast_path_mm_token_and_special_ids_match_checkpoint_constants():
     """The MM fast-path expansion must report the M3 VL canonical token
     ids (200025/200026 placeholders + 200029/200030 framing) so the
@@ -2080,6 +2118,7 @@ def test_fast_path_mm_token_and_special_ids_match_checkpoint_constants():
     assert specials == [_VS_TOK, _VE_TOK]
 
 
+@pytest.mark.cpu_only
 def test_fast_path_expand_image_placeholders_adds_framing():
     """Each single ``IMAGE_TOKEN_ID`` in the Dynamo-style prompt must be
     rewritten to ``[VISION_START, IMAGE_TOKEN*N, VISION_END]`` where
@@ -2107,6 +2146,7 @@ def test_fast_path_expand_image_placeholders_adds_framing():
     assert expanded.count(vs) == 1 and expanded.count(ve) == 1
 
 
+@pytest.mark.cpu_only
 def test_fast_path_expand_multi_image_per_item_counts():
     """Two images with different per-item token counts must be expanded
     with their respective ``num_mm_tokens_per_placeholder`` entries.
@@ -2126,6 +2166,7 @@ def test_fast_path_expand_multi_image_per_item_counts():
     assert len(expanded) == len(prompt_token_ids) + 9
 
 
+@pytest.mark.cpu_only
 def test_fast_path_expand_video_placeholders_use_video_token_id():
     """Video-only requests must expand ``VIDEO_TOKEN_ID`` placeholders,
     not ``IMAGE_TOKEN_ID`` ones.
@@ -2143,6 +2184,7 @@ def test_fast_path_expand_video_placeholders_use_video_token_id():
     assert expanded.count(vid) == 2
 
 
+@pytest.mark.cpu_only
 def test_fast_path_expand_video_one_bracket_per_temporal_patch():
     """A video spans ``grid_t`` framed brackets, as the HF processor lays it out.
 
@@ -2170,6 +2212,7 @@ def test_fast_path_expand_video_one_bracket_per_temporal_patch():
         )
 
 
+@pytest.mark.cpu_only
 def test_video_token_count_is_one_bracket_per_temporal_patch():
     """``grid_t * (grid_h*grid_w/merge^2 + 2)`` for the processor's grid.
 
@@ -2188,6 +2231,7 @@ def test_video_token_count_is_one_bracket_per_temporal_patch():
         proc.get_num_tokens_per_video(video=[])
 
 
+@pytest.mark.cpu_only
 def test_preferred_media_io_format_is_uint8_numpy():
     """The registered processor asks media_io for uint8 HWC arrays.
 
@@ -2206,6 +2250,7 @@ def test_preferred_media_io_format_is_uint8_numpy():
     }
 
 
+@pytest.mark.cpu_only
 def test_fast_path_expand_rejects_mixed_image_and_video():
     """Single-modality only: the registry's ``_get_single_mm_token_lengths``
     returns only one modality's counts, so mixing image + video in one
@@ -2220,6 +2265,7 @@ def test_fast_path_expand_rejects_mixed_image_and_video():
         )
 
 
+@pytest.mark.cpu_only
 def test_fast_path_expand_rejects_placeholder_count_mismatch():
     """If the prompt carries more (or fewer) placeholder tokens than
     ``num_mm_tokens_per_placeholder`` entries, we raise rather than
@@ -2246,6 +2292,7 @@ def test_fast_path_expand_rejects_placeholder_count_mismatch():
         )
 
 
+@pytest.mark.cpu_only
 def test_token_id_request_takes_the_fast_path_without_detokenizing():
     """A ``prompt_token_ids`` + image request is expanded in token space.
 
@@ -2258,9 +2305,6 @@ def test_token_id_request_takes_the_fast_path_without_detokenizing():
     ``VISION_START + IMAGE_TOKEN * N + VISION_END``.
     """
     from tensorrt_llm.sampling_params import SamplingParams
-
-    cls = get_minimax_m3_vl_input_processor_cls()
-    assert cls.supports_token_id_mm_expansion is True
 
     proc = _make_minimax_m3_vl_fast_path_processor()
 
@@ -2419,8 +2463,10 @@ def _tokenizer_only_processor(monkeypatch, auto_processor_result):
 
 @pytest.mark.cpu_only
 def test_text_request_needs_no_hf_processor(monkeypatch):
-    proc, loads = _tokenizer_only_processor(monkeypatch, _WordTokenizer())
-    assert loads == [] and proc._processor is None
+    """Text is tokenized without the HF processor; the first media request loads it once."""
+    valid = _ValidImageProcessor()
+    proc, loads = _tokenizer_only_processor(monkeypatch, valid)
+    assert loads == []
 
     ids, extra = proc.call_with_text_prompt(
         {"prompt": "why is the sky blue"}, SimpleNamespace(add_special_tokens=True)
@@ -2431,7 +2477,16 @@ def test_text_request_needs_no_hf_processor(monkeypatch):
         SimpleNamespace(add_special_tokens=False, truncate_prompt_tokens=2),
     )
     assert ids == [100, 101]
-    assert loads == [] and proc._processor is None
+    assert loads == []
+
+    image = Image.new("RGB", (32, 32))
+    for prompt in ("describe", "again"):
+        ids, extra = proc.call_with_text_prompt(
+            {"prompt": prompt, "multi_modal_data": {"image": [image]}}, SimpleNamespace()
+        )
+        assert ids == [7, _VS_TOK, _IMG_TOK, _VE_TOK]
+        assert extra["multimodal_data"]["image"]["pixel_values"].dtype == torch.bfloat16
+    assert len(loads) == 1 and proc.processor is valid
 
 
 @pytest.mark.cpu_only
@@ -2451,42 +2506,36 @@ def test_tokenizer_from_auto_processor_is_not_image_support(monkeypatch):
 
 
 @pytest.mark.cpu_only
-def test_image_request_uses_a_valid_processor(monkeypatch):
-    valid = _ValidImageProcessor()
-    proc, loads = _tokenizer_only_processor(monkeypatch, valid)
-    image = Image.new("RGB", (32, 32))
-    ids, extra = proc.call_with_text_prompt(
-        {"prompt": "describe", "multi_modal_data": {"image": [image]}}, SimpleNamespace()
-    )
-    assert ids == [7, _VS_TOK, _IMG_TOK, _VE_TOK]
-    assert valid.calls == [["user: describe ]<]image[>[ assistant:"]]
-    image_data = extra["multimodal_data"]["image"]
-    assert image_data["pixel_values"].dtype == torch.bfloat16
-    assert image_data["image_grid_thw"].tolist() == [[1, 2, 2]]
-    # Loaded once, then reused; token counting uses the same processor.
-    proc.call_with_text_prompt(
-        {"prompt": "again", "multi_modal_data": {"image": [image]}}, SimpleNamespace()
-    )
-    assert len(loads) == 1 and proc.processor is valid
-
-
-@pytest.mark.cpu_only
 def test_serve_rendered_image_prompt_is_used_verbatim(monkeypatch):
+    """The prompt builder's rendered prompt reaches the processor as rendered.
+
+    ``async_build_multimodal_prompt`` runs the steps trtllm-serve runs for a
+    chat completion and marks the result ``chat_template_applied``; the
+    registry placeholder is the bare marker, so the HF processor adds the only
+    start/end framing.
+    """
+    from tensorrt_llm.inputs.utils import async_build_multimodal_prompt
+
     valid = _ValidImageProcessor()
     proc, _ = _tokenizer_only_processor(monkeypatch, valid)
-    request = _serve_style_prompt(
-        proc.tokenizer, "describe", {"image": [Image.new("RGB", (32, 32))]}
+    png = io.BytesIO()
+    Image.new("RGB", (32, 32), "red").save(png, format="PNG")
+    request = asyncio.run(
+        async_build_multimodal_prompt(
+            model_type="minimax_m3_vl",
+            tokenizer=proc.tokenizer,
+            processor=None,
+            prompt="describe",
+            media=["data:image/png;base64," + base64.b64encode(png.getvalue()).decode()],
+        )
     )
     rendered = request["prompt"]
-    # The registry placeholder is the bare marker: the HF processor adds the
-    # start/end framing, so the rendered prompt must not carry it.
     assert rendered == "user: ]<]image[>[\ndescribe assistant:"
-    assert MINIMAX_M3_VL_VISION_START_TOKEN not in rendered
-    assert MINIMAX_M3_VL_VISION_END_TOKEN not in rendered
+    assert request["chat_template_applied"] is True
     assert proc.tokenizer.template_calls == 1
 
     ids, extra = proc.call_with_text_prompt(request, SimpleNamespace())
-    # Not rendered a second time; the processor sees the serve output as is.
+    # Not rendered a second time; the processor sees the builder output as is.
     assert proc.tokenizer.template_calls == 1
     assert valid.calls == [[rendered]]
     assert ids == [7, _VS_TOK, _IMG_TOK, _VE_TOK]
@@ -2532,10 +2581,16 @@ def test_framed_marker_is_reduced_to_the_bare_marker(monkeypatch):
 
 @pytest.mark.cpu_only
 def test_marker_and_media_count_mismatch_is_rejected(monkeypatch):
+    """More markers than media is a request error, before the HF processor runs.
+
+    A rendered prompt is counted as written. A raw prompt gets one marker per
+    item from the chat template, so marker text in it is one marker too many.
+    """
     valid = _ValidImageProcessor()
     proc, _ = _tokenizer_only_processor(monkeypatch, valid)
     image = Image.new("RGB", (32, 32))
-    with pytest.raises(ValueError, match="2 ']<]image\\[>\\[' markers but the request carries 1"):
+    mismatch = "2 ']<]image\\[>\\[' markers but the request carries 1"
+    with pytest.raises(ValueError, match=mismatch):
         proc.call_with_text_prompt(
             {
                 "prompt": "]<]image[>[ ]<]image[>[ compare",
@@ -2544,29 +2599,13 @@ def test_marker_and_media_count_mismatch_is_rejected(monkeypatch):
             },
             SimpleNamespace(),
         )
-    assert valid.calls == []
-
-
-@pytest.mark.cpu_only
-def test_raw_prompt_marker_text_is_rejected(monkeypatch):
-    # Without chat_template_applied the template inserts the markers, so
-    # marker text in the raw prompt is one marker too many.
-    valid = _ValidImageProcessor()
-    proc, _ = _tokenizer_only_processor(monkeypatch, valid)
-    with pytest.raises(ValueError, match="2 ']<]image\\[>\\[' markers but the request carries 1"):
+    with pytest.raises(ValueError, match=mismatch):
         proc.call_with_text_prompt(
-            {
-                "prompt": "Explain ]<]image[>[",
-                "multi_modal_data": {"image": [Image.new("RGB", (32, 32))]},
-            },
+            {"prompt": "Explain ]<]image[>[", "multi_modal_data": {"image": [image]}},
             SimpleNamespace(),
         )
     assert proc.tokenizer.template_calls == 1
     assert valid.calls == []
-    # With no media the prompt is plain text and is tokenized as written.
-    ids, extra = proc.call_with_text_prompt({"prompt": "Explain ]<]image[>["}, SimpleNamespace())
-    assert ids == [1, 100, 101] and extra is None
-    assert proc._processor is None
 
 
 @pytest.mark.cpu_only
