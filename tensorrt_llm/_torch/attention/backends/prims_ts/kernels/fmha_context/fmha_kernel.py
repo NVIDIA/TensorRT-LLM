@@ -683,6 +683,8 @@ def build_context_task_manager(
     vc_q_scale: cute.Tensor | None = None,
     vc_k_scale: cute.Tensor | None = None,
     vc_repair_tiles: int = 0,
+    vc_seq_len_q: int = 0,
+    vc_seq_len_k: int = 0,
     num_kv_tiles: int | Int32,
     q_offset: int | Int32,
     domain_n_kwargs: DomainKwargs,
@@ -1214,6 +1216,8 @@ def build_context_task_manager(
         vc_q_scale=vc_q_scale,
         vc_k_scale=vc_k_scale,
         vc_repair_tiles=vc_repair_tiles,
+        vc_seq_len_q=vc_seq_len_q,
+        vc_seq_len_k=vc_seq_len_k,
         name="tmem_sp0",
     )
     tmem_p0: TmemPResource | None = None
@@ -1310,6 +1314,8 @@ def build_context_task_manager(
             vc_q_scale=vc_q_scale,
             vc_k_scale=vc_k_scale,
             vc_repair_tiles=vc_repair_tiles,
+            vc_seq_len_q=vc_seq_len_q,
+            vc_seq_len_k=vc_seq_len_k,
             name="tmem_sp1",
         )
         tmem_vec1 = TmemStatsResource(
@@ -2638,6 +2644,8 @@ def build_fmha_task_manager(
     vc_q_scale: cute.Tensor | None = None,
     vc_k_scale: cute.Tensor | None = None,
     vc_repair_tiles: int = 0,
+    vc_seq_len_q: int = 0,
+    vc_seq_len_k: int = 0,
     is_persistent: bool = True,
     is_clc_dynamic: bool = False,
     clc_response_ptr: cute.Pointer | None = None,
@@ -2734,6 +2742,8 @@ def build_fmha_task_manager(
         vc_q_scale=vc_q_scale,
         vc_k_scale=vc_k_scale,
         vc_repair_tiles=vc_repair_tiles,
+        vc_seq_len_q=vc_seq_len_q,
+        vc_seq_len_k=vc_seq_len_k,
         num_kv_tiles=domain_num_kv_tiles,
         q_offset=effective_q_offset,
         domain_n_kwargs=domain_policy.domain_n_kwargs,
@@ -3473,6 +3483,8 @@ class FmhaTs:
             vc_q_scale,
             vc_k_scale,
             vc_repair_tiles,
+            s_q if cfg.vc_qk8 else 0,
+            s_k if cfg.vc_qk8 else 0,
             self.is_persistent,
             self.is_clc_dynamic,
         ).launch(
@@ -3517,6 +3529,8 @@ class FmhaTs:
         vc_q_scale: cute.Tensor | None,
         vc_k_scale: cute.Tensor | None,
         vc_repair_tiles: cutlass.Constexpr[int] = 0,
+        vc_seq_len_q: cutlass.Constexpr[int] = 0,
+        vc_seq_len_k: cutlass.Constexpr[int] = 0,
         is_persistent: cutlass.Constexpr[bool] = True,
         is_clc_dynamic: cutlass.Constexpr[bool] = False,
     ) -> None:
@@ -3588,6 +3602,8 @@ class FmhaTs:
             vc_q_scale=vc_q_scale if cfg.vc_qk8 else None,
             vc_k_scale=vc_k_scale if cfg.vc_qk8 else None,
             vc_repair_tiles=vc_repair_tiles,
+            vc_seq_len_q=vc_seq_len_q,
+            vc_seq_len_k=vc_seq_len_k,
             is_persistent=is_persistent,
             is_clc_dynamic=is_clc_dynamic,
             clc_response_ptr=clc_response_ptr,

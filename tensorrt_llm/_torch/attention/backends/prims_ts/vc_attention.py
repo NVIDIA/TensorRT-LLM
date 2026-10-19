@@ -271,7 +271,7 @@ class VCAttentionOperands:
     mu: (
         torch.Tensor | None
     )  # [B, H, ceil(num_kv_tiles / 16), 16, 256] bf16 packed kernel operands
-    perm: torch.Tensor | None  # [B, H, S_k] int64 token permutation
+    perm: torch.Tensor | None  # [B, H, S_k] int32/int64 token permutation
     demean: bool = True  # whether the means were subtracted (else zero)
     repair_tiles: int = 0
     seq_len_kv: int | None = None  # K/V tokens before the repair tiles and padding
@@ -442,7 +442,7 @@ def vc_quantize(
 
     if perm is None:
         perm = vc_token_permutation(v, iters=kmeans_iters, generator=generator)[0]
-    k_p, v8, v_scale, mean, mu, _ = vc_prepare(
+    k_p, v8, v_scale, mean, mu = vc_prepare(
         k.contiguous(),
         v.contiguous(),
         perm,
@@ -496,7 +496,7 @@ def vc_quantize_fp8(
 
     if perm is None:
         perm = vc_token_permutation(v, iters=kmeans_iters, generator=generator)[0]
-    q8, k8, v8, q_scale, k_scale, v_scale, mean, mu, _ = vc_prepare_fp8(
+    q8, k8, v8, q_scale, k_scale, v_scale, mean, mu = vc_prepare_fp8(
         q.contiguous(), k.contiguous(), v.contiguous(), perm, demean=demean
     )
     return VCAttentionOperands(
@@ -542,50 +542,18 @@ def vc_quantize_repair(
             "q must be [B, S, H, D] with the batch, heads, head_dim and dtype of k"
         )
     _check_prepare_inputs(k)
-    from .kernels.vc_prepare import (
-        vc_prepare,
-        vc_prepare_fp8,
-        vc_prepare_repair_keys_fp8,
-    )
+    from .kernels.vc_prepare import vc_prepare_repair
 
-    b, s_k, h, d = k.shape
+    s_k = k.shape[1]
     repair_tiles = vc_repair_tiles(s_k, budget)
-    k = k.contiguous()
-    if q is None:
-        k_all, v_all, v_scale, _, _, energy = vc_prepare(
-            k,
-            v.contiguous(),
-            None,
-            demean=False,
-            repair_tiles=repair_tiles,
-        )
-        q8 = q_scale = k_scale = None
-    else:
-        q8, k_all, v_all, q_scale, k_scale, v_scale, _, _, energy = vc_prepare_fp8(
-            q.contiguous(),
-            k,
-            v.contiguous(),
-            None,
-            demean=False,
-            repair_tiles=repair_tiles,
-        )
     selected = max(1, round(budget * s_k))
-    whole = s_k // VC_K_BLOCK_SIZE * VC_K_BLOCK_SIZE
-    shift = repair_tiles * VC_K_BLOCK_SIZE
-    index = energy.topk(selected, dim=2, sorted=False).indices  # [B, H, sel]
-    if q is not None:
-        vc_prepare_repair_keys_fp8(k, k_all, k_scale, index, repair_tiles)
-    index = index.permute(0, 2, 1).unsqueeze(-1).expand(-1, -1, -1, d)
-    vs = v_scale.unsqueeze(1)
-    v_sel = torch.gather(v, 1, index).float()
-    if q is None:
-        k_all[:, whole : whole + selected] = torch.gather(k, 1, index)
-    v_all[:, whole : whole + selected] = (
-        (v_sel - (v_sel / vs).to(torch.float8_e4m3fn).float() * vs) / vs
-    ).to(torch.float8_e4m3fn)
-    for rows in (k_all, v_all):
-        rows[:, whole + selected : whole + shift].zero_()
-        rows[:, s_k + shift :].zero_()
+    q8, k_all, v_all, q_scale, k_scale, v_scale = vc_prepare_repair(
+        None if q is None else q.contiguous(),
+        k.contiguous(),
+        v.contiguous(),
+        repair_tiles=repair_tiles,
+        selected=selected,
+    )
     return VCAttentionOperands(
         k=k_all,
         v=v_all,
@@ -680,7 +648,7 @@ class VCAttentionPreprocessor:
                     init_centroids=None if entry is None else entry["centroids"],
                 )
                 entry = {
-                    "perm": perm,
+                    "perm": perm.to(torch.int32),
                     "centroids": centroids,
                     "step": None if denoise_step is None else denoise_step[0],
                 }
@@ -691,7 +659,7 @@ class VCAttentionPreprocessor:
             # permutation with zero tile means.
             perm = entry["perm"]
         else:
-            perm = torch.arange(k.shape[1], device=k.device, dtype=torch.int64)
+            perm = torch.arange(k.shape[1], device=k.device, dtype=torch.int32)
             perm = perm.view(1, 1, -1).expand(k.shape[0], k.shape[2], -1).contiguous()
         if q is not None:
             return vc_quantize_fp8(q, k, v, perm=perm, demean=smooth)

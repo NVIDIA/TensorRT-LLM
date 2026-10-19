@@ -1998,25 +1998,31 @@ def _get_compiled_context(
     if vc_attention:
         if packed:
             raise RuntimeError("VC-Attention context requires fixed tensors")
+        # The plan fixes every VC operand shape, so the kernel addresses the
+        # tile means and the Q and K scale tables with compile-time extents.
+        vc_shapes = vc_scale_shapes(
+            compile_spec.vc,
+            batch_size=batch_size,
+            seq_len_kv=max_seq_len_k,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim_vo or head_dim,
+            seq_len_q=max_seq_len_q,
+            num_qo_heads=num_qo_heads,
+            qk_fp8=vc_qk8,
+        )
         if compile_spec.vc.demean:
-            vc_mu_fake = fake_compact(
-                cutlass.BFloat16,
-                vc_scale_shapes(
-                    compile_spec.vc,
-                    batch_size=batch_size,
-                    seq_len_kv=max_seq_len_k,
-                    num_kv_heads=num_kv_heads,
-                    head_dim=head_dim_vo or head_dim,
-                )["tile_means"],
+            vc_mu_fake = fake_compact(cutlass.BFloat16, vc_shapes["tile_means"], 16)
+        if vc_qk8:
+            # The kernel reads the Q and K scale tables as one row of blocks per head.
+            vc_q_scale_fake = fake_compact(
+                cutlass.Float32,
+                (num_qo_heads, batch_size * vc_shapes["q_scale"][2]),
                 16,
             )
-        if vc_qk8:
-            # Q and K scale tables, [heads, batch, blocks], one scale per 128-token block.
-            vc_q_scale_fake = fake_compact(
-                cutlass.Float32, (num_qo_heads, batch_size, cute.sym_int()), 16
-            )
             vc_k_scale_fake = fake_compact(
-                cutlass.Float32, (num_kv_heads, batch_size, cute.sym_int()), 16
+                cutlass.Float32,
+                (num_kv_heads, batch_size * vc_shapes["k_scale"][2]),
+                16,
             )
     stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
 
@@ -2886,7 +2892,8 @@ class BatchPrefillTSWrapper:
                     raise ValueError(
                         "VC-Attention-QK8 plans require vc.q_scale and vc.k_scale"
                     )
-                vc_q_scale, vc_k_scale = vc.q_scale, vc.k_scale
+                vc_q_scale = vc.q_scale.view(geometry.num_qo_heads, -1)
+                vc_k_scale = vc.k_scale.view(geometry.num_kv_heads, -1)
             elif vc.q_scale is not None or vc.k_scale is not None:
                 raise ValueError(
                     "vc.q_scale and vc.k_scale belong to VC-Attention-QK8 plans with "

@@ -42,6 +42,32 @@ from cutlass.experimental.task_scheduling.resources import StageInfo
 VC_KSCALE_BARRIER_ID = 8
 
 
+@cute.jit
+def vc_flat_q_slot(
+    batch_coord: Int32,
+    row: Int32,
+    seq_len_q: cutlass.Constexpr[int],
+    q_block_log2: cutlass.Constexpr[int],
+) -> Int32:
+    """Slot of query ``row`` of sequence ``batch_coord`` in the Q scale table, which
+    holds one scale per block of every sequence in turn."""
+    lbq = Int32(q_block_log2)
+    row_c = cute.math.min(row, Int32(seq_len_q - 1))
+    blocks = (seq_len_q + (1 << q_block_log2) - 1) >> q_block_log2
+    return batch_coord * Int32(blocks) + (row_c >> lbq)
+
+
+@cute.jit
+def vc_flat_k_base(
+    batch_coord: Int32,
+    seq_len_k: cutlass.Constexpr[int],
+    kv_tile_n: cutlass.Constexpr[int],
+) -> Int32:
+    """Slot of K/V tile 0 of sequence ``batch_coord`` in the K scale table, which
+    holds one scale per tile of every sequence in turn. Tile ``t`` is ``base + t``."""
+    return batch_coord * Int32((seq_len_k + kv_tile_n - 1) // kv_tile_n)
+
+
 class VCKScaleTable:
     """One softmax group's ``sfK`` table for the work tile, staged in SMEM."""
 
@@ -73,15 +99,16 @@ class VCKScaleTable:
         stage_info: StageInfo,
         vc_k_scale: cute.Tensor,
         kv_head: Int32,
-        batch: Int32,
-        num_tiles: Int32,
+        k_base: Int32,
+        num_tiles: cutlass.Constexpr[int],
     ) -> Float32:
-        """Gather this work tile's ``sfK`` words from the ``[H, B, tiles]`` table and
-        publish them to the group's four warps; returns tile 0's scale."""
+        """Gather this work tile's ``sfK`` words from the flat layout and publish
+        the table to the group's four warps; returns tile 0's scale."""
         cfg = self.cfg
         num_threads = len(cfg.softmax0_warp_ids) * cute.arch.WARP_SIZE
         barrier_id = VC_KSCALE_BARRIER_ID + self.q_half
         table = self.view(stage_info)
+        num_tiles = Int32(num_tiles)
         warp_id_in_sg = cute.arch.warp_idx() % len(cfg.softmax0_warp_ids)
         thread = warp_id_in_sg * cute.arch.WARP_SIZE + cute.arch.lane_idx()
         cute.arch.barrier(barrier_id=barrier_id, number_of_threads=num_threads)
@@ -90,7 +117,7 @@ class VCKScaleTable:
         ):
             tile_idx = Int32(pass_idx * num_threads) + thread
             if tile_idx < num_tiles:
-                table[tile_idx] = Float32(vc_k_scale[(kv_head, batch, tile_idx)])
+                table[tile_idx] = Float32(vc_k_scale[(kv_head, k_base + tile_idx)])
         cute.arch.barrier(barrier_id=barrier_id, number_of_threads=num_threads)
         return Float32(table[Int32(0)])
 

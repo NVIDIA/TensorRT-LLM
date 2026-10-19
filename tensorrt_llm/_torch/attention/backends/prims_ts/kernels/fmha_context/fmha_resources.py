@@ -97,7 +97,7 @@ from .vc_resources import (
     _f16x2_sum4,
     _split_bf16_hi_lo_word,
 )
-from .vc_scales import VCKScaleTable
+from .vc_scales import VCKScaleTable, vc_flat_k_base, vc_flat_q_slot
 from .helpers import (
     bottom_right_window_left_bound,
     bottom_right_window_tile_start,
@@ -2719,6 +2719,8 @@ class TmemSPResource(MemoryResource):
         vc_q_scale: cute.Tensor | None = None,
         vc_k_scale: cute.Tensor | None = None,
         vc_repair_tiles: int = 0,
+        vc_seq_len_q: int = 0,
+        vc_seq_len_k: int = 0,
         **kwargs: Any,
     ) -> None:
         """Bind S/P TMEM offsets, Q peer index, and optional varlen metadata.
@@ -2726,12 +2728,14 @@ class TmemSPResource(MemoryResource):
         The repair tile count is a compile-time constant. It says how many
         K/V tiles at the end of the loop are VC-Attention outlier tiles. It is
         zero on plans that restore the tile means. VC-Attention-QK8 plans also
-        pass the Q and K scale tables, ``[H, B, blocks]`` with one scale per
-        128-token block.
+        pass the exact Q and K/V lengths of the fixed plan, which address the
+        Q and K scale tables.
         """
         super().__init__(pipeline_config=pipeline_config, **kwargs)
         self.cfg = cfg
         self.vc_repair_tiles = vc_repair_tiles
+        self.vc_seq_len_q = vc_seq_len_q
+        self.vc_seq_len_k = vc_seq_len_k
         self.tmem_s_offset = tmem_s_offset
         self.tmem_p_offset = tmem_p_offset
         self.q_half = q_half
@@ -3319,20 +3323,16 @@ class TmemSPResource(MemoryResource):
         if cutlass.const_expr(self.cfg.vc_qk8):
             batch_coord, head, row = self._vc_coords(stage_info)
             kv_head = head // self.cfg.h_r
-            # Rows past the sequence take the last Q block's scale.
-            q_block = cute.math.min(
-                row >> (self.cfg.kv_tile_n.bit_length() - 1),
-                self.vc_q_scale.shape[2] - 1,
+            q_slot = vc_flat_q_slot(
+                batch_coord, row, self.vc_seq_len_q, self.cfg.kv_tile_n.bit_length() - 1
             )
-            row_scale = row_scale * Float32(
-                self.vc_q_scale[(head, batch_coord, q_block)]
-            )
+            row_scale = row_scale * Float32(self.vc_q_scale[(head, q_slot)])
+            k_base = vc_flat_k_base(batch_coord, self.vc_seq_len_k, self.cfg.kv_tile_n)
+            num_tiles = (
+                self.vc_seq_len_k + self.cfg.kv_tile_n - 1
+            ) // self.cfg.kv_tile_n
             k_scale_next = self._vc_k_scales.fill(
-                stage_info,
-                self.vc_k_scale,
-                kv_head,
-                batch_coord,
-                self.vc_k_scale.shape[2],
+                stage_info, self.vc_k_scale, kv_head, k_base, num_tiles
             )
         return (row_scale, Float32(0.0)) + (Float32(0.0),) * 17 + (k_scale_next,)
 
