@@ -218,7 +218,7 @@ CKPT_LAYERS = (0, 1, 2, 59, 60, 61)
 STEPS = 3
 TOKENS_PER_BLOCK = 32
 #: Decode widths: 1..8, and two the features must leave to the built-in path
-#: (except ring_buddy, which takes up to 16 rows).
+#: (except ring_buddy, which takes up to 16 rows, and preattn_prep, up to its cap).
 ROWS = (1, 2, 3, 4, 5, 6, 7, 8, 9, 16)
 #: Prompt length at width M: past the 2048-token window, so decode attends a full one.
 PROMPT_BASE = 2100
@@ -609,7 +609,8 @@ DETERMINISM = {
 #: quantization falls back there; the last layer's unpool keeps the built-in join;
 #: model layers 1 and 5 are full-attention layers, the other four sliding-window ones.
 ENTRIES = {
-    "preattn_prep": ({"preattn_prep"}, 6, 8),
+    # preattn_prep takes decode steps up to its own cap (wider than every other entry here).
+    "preattn_prep": ({"preattn_prep"}, 6, target_attention._PREATTN_PREP_MAX_ROWS),
     "post_attn_hop": ({"hop", "hop_early_trigger"}, 6, 8),
     "unpool_gather_boundary": ({"gathers"}, 5, 8),
     "pool_gather_fp4quant": ({"gathers"}, 4, 8),
