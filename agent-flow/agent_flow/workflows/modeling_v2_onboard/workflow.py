@@ -467,8 +467,9 @@ class ModelingV2OnboardWorkflow:
     async def _work(self, node: Node) -> TaskResult | None:
         """Worktree, merge of the dependencies, worker, commit.
 
-        Returns ``None`` for a side task stopped at the deadline; what its
-        worker left in the worktree is still committed to its branch.
+        Returns ``None`` for a side task stopped at the deadline. What a
+        stopped worker left in its worktree is still committed to its branch,
+        so a resumed task starts from it.
         """
         plan = self._plan
         landing = plan.is_landing(node.id)
@@ -488,6 +489,8 @@ class ModelingV2OnboardWorkflow:
                 )
             except asyncio.CancelledError:
                 if node.id not in self._overdue:
+                    if node.isolation != "shared":
+                        await self._git(self.isolation.commit, node, path)
                     raise
                 result = None
             await self._git(self.isolation.commit, node, path)

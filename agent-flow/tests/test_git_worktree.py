@@ -413,6 +413,18 @@ def test_commit_persists_worktree_changes_to_node_branch(tmp_git_repo, tmp_path)
     anyio.run(iso.reclaim, node)
 
 
+def test_commit_signs_off_the_node_output(tmp_git_repo, tmp_path):
+    iso = GitWorktreeIsolation(repo_path=tmp_git_repo, worktrees_root=tmp_path / "wt")
+    node = Node(id="c1", type="impl")
+    cwd = anyio.run(iso.acquire, node)
+    (cwd / "impl.py").write_text("x = 1\n")
+
+    anyio.run(iso.commit, node, cwd)
+
+    assert "Signed-off-by: " in _git(cwd, "log", "-1", "--format=%B")
+    anyio.run(iso.release, node)
+
+
 def test_commit_is_noop_when_worktree_has_no_changes(tmp_git_repo, tmp_path):
     """``commit`` returns ``None`` and creates no commit when nothing changed."""
     iso = GitWorktreeIsolation(repo_path=tmp_git_repo, worktrees_root=tmp_path / "wt")

@@ -216,6 +216,7 @@ class GitWorktreeIsolation:
         commit (a clean tree). ``--no-verify`` skips any pre-commit hooks the
         target repo installs: a per-node commit is internal plumbing, not a
         user-authored commit, so a slow or failing hook must not block the handoff.
+        The commit is signed off all the same, for repositories that require it.
 
         Raises:
             IsolationError: If a ``git`` step fails for an unexpected reason.
@@ -227,7 +228,7 @@ class GitWorktreeIsolation:
         if returncode == 0:
             return None
         message = f"[agent-flow] node {node.id} ({node.kind}) output"
-        await self._git("commit", "--no-verify", "-m", message, cwd=cwd)
+        await self._git("commit", "-s", "--no-verify", "-m", message, cwd=cwd)
         return (await self._git("rev-parse", "--short", "HEAD", cwd=cwd)).strip()
 
     async def clean(self) -> None:

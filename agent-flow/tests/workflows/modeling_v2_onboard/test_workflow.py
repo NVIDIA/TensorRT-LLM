@@ -512,6 +512,26 @@ def test_the_run_resumes_after_an_interruption(tmp_path, tmp_git_repo):
     assert (tmp_git_repo / "b.txt").is_file()
 
 
+def test_a_stop_keeps_what_a_running_worker_had_not_committed(tmp_path, tmp_git_repo):
+    async def write_then_hang(agent, prompt, attempt):
+        (agent.cwd / "draft.py").write_text("x = 1\n")
+        await asyncio.Event().wait()
+
+    async def crashing_turn(agent, prompt):
+        raise RuntimeError("planner backend died")
+
+    workflow = _workflow(
+        tmp_path,
+        tmp_git_repo,
+        FakeFactory(planner=_planner(crashing_turn), worker=_Workers(b=write_then_hang)),
+    )
+    with pytest.raises(RuntimeError, match="planner backend died"):
+        workflow.run()
+
+    assert _git(tmp_git_repo, "show", "node/b:draft.py") == "x = 1\n"
+    assert "Signed-off-by: " in _git(tmp_git_repo, "log", "-1", "--format=%B", "node/b")
+
+
 def test_no_more_than_max_parallel_workers_run(tmp_path, tmp_git_repo):
     graph = "".join(f"  - id: t{i}\n    type: new_op\n" for i in range(5)) + (
         "  - id: land\n    type: merge\n    kind: merge\n    isolation: shared\n"
