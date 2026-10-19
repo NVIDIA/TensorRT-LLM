@@ -82,7 +82,18 @@ def __getattr__(name: str):
             if e.name != f"{__name__}.{name}":
                 raise
             raise AttributeError(f"module {__name__!r} has no attribute {name!r}") from None
-    module = importlib.import_module(f".{module_name}", __name__)
+    try:
+        module = importlib.import_module(f".{module_name}", __name__)
+    except AttributeError as e:
+        # An AttributeError escaping the submodule is a bug inside it, not a
+        # missing name here. Raised as is, hasattr() and ``from ... import``
+        # would swallow it, and from-import would run the submodule again,
+        # hiding the cause.
+        raise ImportError(
+            f"cannot import {name!r} from {__name__!r}: importing "
+            f"{__name__}.{module_name} raised {e!r}",
+            name=__name__,
+        ) from e
     attr = getattr(module, name)
     globals()[name] = attr  # cache: subsequent access skips __getattr__
     return attr

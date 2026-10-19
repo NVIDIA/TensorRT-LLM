@@ -17,7 +17,8 @@
 The package root resolves the module-layer classes on attribute access
 (PEP 562). These checks pin the contract: every exported name is the
 defining submodule's own object, plain submodule access still works, a
-missing dependency inside a submodule surfaces as ``ModuleNotFoundError``,
+missing dependency inside a submodule surfaces as ``ModuleNotFoundError``, an
+``AttributeError`` inside one surfaces as ``ImportError`` with its cause,
 importing the package root or its ``backends`` sub-package loads no
 module-layer module, and ``rotary_embedding`` (which the backends import
 back) works as the first import of a process. The import-order checks run in
@@ -125,6 +126,36 @@ def test_missing_dependency_inside_submodule_propagates(pkg, monkeypatch, name):
     with pytest.raises(ModuleNotFoundError) as excinfo:
         getattr(pkg, name)
     assert excinfo.value.name == "some_missing_dep"
+
+
+@pytest.mark.parametrize(
+    "access",
+    [
+        lambda pkg: getattr(pkg, "MLA"),
+        lambda pkg: hasattr(pkg, "MLA"),
+        lambda pkg: getattr(pkg, "MLA", None),
+        lambda pkg: exec(f"from {PKG} import MLA", {}),
+    ],
+    ids=["getattr", "hasattr", "getattr_default", "from_import"],
+)
+def test_attribute_error_inside_submodule_surfaces_as_import_error(pkg, monkeypatch, access):
+    """An AttributeError raised while importing a submodule must not be swallowed or retried."""
+    real_import_module = importlib.import_module
+    calls = []
+
+    def fake_import_module(target, package=None):
+        if package == PKG and target == ".mla":
+            calls.append(target)
+            raise AttributeError("module 'torch' has no attribute 'some_missing_op'")
+        return real_import_module(target, package)
+
+    monkeypatch.delitem(pkg.__dict__, "MLA", raising=False)
+    monkeypatch.setattr(pkg.importlib, "import_module", fake_import_module)
+    with pytest.raises(ImportError) as excinfo:
+        access(pkg)
+    assert isinstance(excinfo.value.__cause__, AttributeError)
+    assert "some_missing_op" in str(excinfo.value.__cause__)
+    assert calls == [".mla"]
 
 
 def test_package_root_import_is_lazy():
