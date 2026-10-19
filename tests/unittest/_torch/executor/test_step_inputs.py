@@ -21,7 +21,7 @@ pytestmark = [
     pytest.mark.skipif(
         not _scatter_op_registered(),
         reason="torch.ops.trtllm.step_inputs_scatter is not registered (built from "
-        "cpp/tensorrt_llm/thop/stepInputsScatterOp.cpp)",
+        "cpp/tensorrt_llm/thop/minimaxM3/stepInputsScatterOp.cpp)",
     ),
 ]
 

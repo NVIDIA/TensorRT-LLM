@@ -15,7 +15,7 @@
  * limitations under the License.
  */
 
-#include "tensorrt_llm/kernels/stepInputsScatter.h"
+#include "tensorrt_llm/kernels/minimaxM3/stepInputsScatter.h"
 
 TRTLLM_NAMESPACE_BEGIN
 

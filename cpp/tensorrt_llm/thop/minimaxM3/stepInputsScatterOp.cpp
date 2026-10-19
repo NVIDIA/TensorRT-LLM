@@ -15,7 +15,7 @@
  * limitations under the License.
  */
 
-#include "tensorrt_llm/kernels/stepInputsScatter.h"
+#include "tensorrt_llm/kernels/minimaxM3/stepInputsScatter.h"
 
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -28,9 +28,9 @@ namespace torch_ext
 
 //! Issue a batch of packed host-to-device and device-to-device copies in one launch.
 //!
-//! @param stage Contiguous uint8 CUDA tensor laid out as described in kernels/stepInputsScatter.h. Its destinations are
-//! raw device addresses: the caller guarantees each one is live and that no other work on the stream writes it between
-//! staging and this call.
+//! @param stage Contiguous uint8 CUDA tensor laid out as described in kernels/minimaxM3/stepInputsScatter.h. Its
+//! destinations are raw device addresses: the caller guarantees each one is live and that no other work on the stream
+//! writes it between staging and this call.
 void stepInputsScatter(torch::Tensor const& stage)
 {
     TORCH_CHECK(stage.is_cuda(), "step_inputs_scatter expects a CUDA staging buffer");

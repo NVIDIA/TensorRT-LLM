@@ -29,6 +29,9 @@ from typing import Iterator, Optional
 
 import torch
 
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3 import (  # noqa: F401
+    fake_ops as _m3_fake_ops,  # registers trtllm::step_inputs_scatter's fake impl
+)
 from tensorrt_llm._utils import prefer_pinned
 
 
