@@ -972,6 +972,12 @@ class AttentionForwardArgs:
     # E4M3 with one scale each, folded into the softmax and output scales.
     qk_fp8_per_tensor: bool = False
     v_fp8_per_tensor: bool = False
+    # VC-Attention recipe of the PrimTS FMHA library. V is stored as E4M3 tile
+    # residuals, fp8 Q/K are Hadamard-rotated with per-block scales, and the
+    # repair budget appends that fraction of tokens as V repair rows.
+    vc_attention: bool = False
+    vc_attention_qk_fp8: bool = False
+    vc_repair_budget: float = 0.0
 
     # Packed QKV for non-MLA attention. MLA always passes a separate query.
     is_fused_qkv: bool = False

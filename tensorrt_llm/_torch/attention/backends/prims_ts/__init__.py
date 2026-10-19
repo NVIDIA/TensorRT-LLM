@@ -47,11 +47,19 @@ from .q_token_kv_block_sparse_metadata import (
     q_token_kv_block_sparse_attention_with_paged_kv_cache,
 )
 from .sage import SageAttentionConfig, SageAttentionParams
+from .vc_attention import (
+    VCAttentionConfig,
+    VCAttentionParams,
+    VCAttentionPreprocessor,
+)
 
 __all__ = [
     "BlockSparseTSWrapper",
     "SageAttentionConfig",
     "SageAttentionParams",
+    "VCAttentionConfig",
+    "VCAttentionParams",
+    "VCAttentionPreprocessor",
     "BlockSparsePagedTSWrapper",
     "block_sparse_attention",
     "block_sparse_attention_with_paged_kv_cache",

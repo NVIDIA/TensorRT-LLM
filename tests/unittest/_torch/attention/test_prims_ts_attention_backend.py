@@ -1296,8 +1296,11 @@ def _forward_with_recipe(monkeypatch: pytest.MonkeyPatch, recipe) -> None:
         "AttentionForwardArgs",
         functools.partial(
             AttentionForwardArgs,
-            qk_fp8_per_tensor=recipe.qk_dtype == "fp8",
-            v_fp8_per_tensor=recipe.v_dtype == "fp8",
+            qk_fp8_per_tensor=not recipe.vc_attention and recipe.qk_dtype == "fp8",
+            v_fp8_per_tensor=not recipe.vc_attention and recipe.v_dtype == "fp8",
+            vc_attention=recipe.vc_attention,
+            vc_attention_qk_fp8=recipe.vc_attention and recipe.qk_dtype == "fp8",
+            vc_repair_budget=recipe.vc_repair_budget,
         ),
     )
 
@@ -1316,9 +1319,24 @@ _CACHE_FREE_CASE = dict(
 
 
 @pytest.mark.parametrize("outlier", [1.0, 10.0])
-@pytest.mark.parametrize(("qk_dtype", "v_dtype"), [("bf16", "fp8"), ("fp8", "fp8")])
+@pytest.mark.parametrize(
+    ("qk_dtype", "v_dtype", "vc_attention", "vc_repair_budget"),
+    [
+        ("bf16", "fp8", False, 0.0),
+        ("fp8", "fp8", False, 0.0),
+        ("bf16", "fp8", True, 0.0),
+        ("bf16", "fp8", True, 0.01),
+        ("fp8", "fp8", True, 0.0),
+        ("fp8", "fp8", True, 0.01),
+    ],
+)
 def test_prims_ts_cache_free_fp8_recipes(
-    monkeypatch: pytest.MonkeyPatch, qk_dtype: str, v_dtype: str, outlier: float
+    monkeypatch: pytest.MonkeyPatch,
+    qk_dtype: str,
+    v_dtype: str,
+    vc_attention: bool,
+    vc_repair_budget: float,
+    outlier: float,
 ) -> None:
     """Cache-free recipes plan FP8 operands, fold the per-tensor scales, and match SDPA.
 
@@ -1329,7 +1347,12 @@ def test_prims_ts_cache_free_fp8_recipes(
     from tensorrt_llm._torch.attention.backends.prims_ts.context import BatchPrefillTSWrapper
     from tensorrt_llm.visual_gen.args import QuantAttentionConfig
 
-    recipe = QuantAttentionConfig(qk_dtype=qk_dtype, v_dtype=v_dtype)
+    recipe = QuantAttentionConfig(
+        qk_dtype=qk_dtype,
+        v_dtype=v_dtype,
+        vc_attention=vc_attention,
+        vc_repair_budget=vc_repair_budget,
+    )
     _forward_with_recipe(monkeypatch, recipe)
     plans: list[dict] = []
     runs: list[dict] = []
@@ -1376,19 +1399,30 @@ def test_prims_ts_cache_free_fp8_recipes(
     def dequant_scale(x: torch.Tensor) -> torch.Tensor:
         return (x.float().abs().amax() / 448.0).reshape(1)
 
-    # The quantize op returns BF16-rounded dequant scales.
-    torch.testing.assert_close(
-        run_kwargs["output_scale"], dequant_scale(inputs["new_v"]), rtol=1e-2, atol=0.0
-    )
-    if qk_dtype == "fp8":
-        expected = (
-            dequant_scale(inputs["q"])
-            * dequant_scale(inputs["new_k"])
-            * (math.log2(math.e) / math.sqrt(case.head_dim))
-        )
-        torch.testing.assert_close(run_kwargs["scale_softmax_log2"], expected, rtol=1e-2, atol=0.0)
-    else:
+    if vc_attention:
+        # The VC operands carry the V scale and tile means (and the Q/K block scales under
+        # QK8); no per-tensor scale is folded.
+        assert run_kwargs["vc"] is not None
+        assert (run_kwargs["vc"].q_scale is not None) == (qk_dtype == "fp8")
+        assert (plan_kwargs["vc_config"].repair_tiles > 0) == (vc_repair_budget > 0)
+        assert run_kwargs["output_scale"] is None
         assert run_kwargs["scale_softmax_log2"] is None
+    else:
+        # The quantize op returns BF16-rounded dequant scales.
+        torch.testing.assert_close(
+            run_kwargs["output_scale"], dequant_scale(inputs["new_v"]), rtol=1e-2, atol=0.0
+        )
+        if qk_dtype == "fp8":
+            expected = (
+                dequant_scale(inputs["q"])
+                * dequant_scale(inputs["new_k"])
+                * (math.log2(math.e) / math.sqrt(case.head_dim))
+            )
+            torch.testing.assert_close(
+                run_kwargs["scale_softmax_log2"], expected, rtol=1e-2, atol=0.0
+            )
+        else:
+            assert run_kwargs["scale_softmax_log2"] is None
     # The second sample's output is ``outlier`` times larger. Normalize it before comparing.
     sample_gain = torch.tensor([1.0, outlier], device=out.device).view(-1, 1)
     torch.testing.assert_close(
