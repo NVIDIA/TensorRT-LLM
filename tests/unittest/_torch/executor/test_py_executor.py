@@ -609,6 +609,54 @@ def test_disagg_generation_model_state_is_prepared_after_first_token(accepted: b
         assert events == []
 
 
+def test_disagg_generation_rebuilds_imported_cache_before_first_forward() -> None:
+    events = []
+    received = types.SimpleNamespace(
+        is_disagg_generation_transmission_complete=True,
+        py_request_id=41,
+        context_phase_params=types.SimpleNamespace(first_gen_tokens=[17], draft_tokens=None),
+    )
+    terminated = types.SimpleNamespace(
+        is_disagg_generation_transmission_complete=True,
+        py_request_id=42,
+        context_phase_params=types.SimpleNamespace(first_gen_tokens=[18], draft_tokens=None),
+    )
+
+    def setup_sampler_step(_requests):
+        # A failed sampler setup terminates the request before generation.
+        terminated.is_disagg_generation_transmission_complete = False
+
+    def finish_gen_receive(req):
+        events.append(("finish", req.py_request_id))
+        return False
+
+    kv_cache_manager = types.SimpleNamespace(
+        rebuild_disagg_imported_cache=lambda requests: events.append(
+            ("rebuild", [req.py_request_id for req in requests])
+        )
+    )
+    executor = types.SimpleNamespace(
+        model_engine=types.SimpleNamespace(enable_spec_decode=False),
+        resource_manager=types.SimpleNamespace(
+            resource_managers={
+                ResourceManagerType.SEQ_SLOT_MANAGER: Mock(),
+                ResourceManagerType.KV_CACHE_MANAGER: kv_cache_manager,
+            }
+        ),
+        disagg=types.SimpleNamespace(
+            completed_gen_receives=lambda batch: batch.generation_requests,
+            try_finish_gen_receive=finish_gen_receive,
+        ),
+        _setup_sampler_step=setup_sampler_step,
+    )
+
+    PyExecutor._prepare_disagg_gen_transmission_complete(
+        executor, types.SimpleNamespace(generation_requests=[received, terminated])
+    )
+
+    assert events == [("rebuild", [41]), ("finish", 41), ("finish", 42)]
+
+
 def test_free_request_resources_releases_target_and_draft_model_state() -> None:
     target, draft = Mock(), Mock()
     executor = types.SimpleNamespace(
