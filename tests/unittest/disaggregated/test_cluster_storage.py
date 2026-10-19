@@ -327,6 +327,32 @@ class TestEtcdClusterStorage(TestClusterStorage):
         self.etcd.kill()
         self.etcd.wait()
 
+    @timeout(10)
+    @pytest.mark.asyncio(loop_scope="module")
+    async def test_expire_with_empty_keepalive_response(self, storage_server,
+                                                        storage_client,
+                                                        monkeypatch):
+        # A keepalive stream that ends without a response must be reported as
+        # a failed refresh as well, and the cached lease must be dropped so
+        # that the following re-registration is granted a new one.
+        key = gen_key("empty_keepalive_key")
+        assert await storage_client.set(key,
+                                        "test_value",
+                                        overwrite_if_exists=True,
+                                        ttl=5)
+        stale_lease_id = storage_client._leases[key].id
+        with monkeypatch.context() as m:
+            m.setattr(storage_client.client, "refresh_lease",
+                      lambda lease_id: iter(()))
+            assert not await storage_client.expire(key, 5)
+        assert key not in storage_client._leases
+        assert await storage_client.set(key,
+                                        "recovered",
+                                        overwrite_if_exists=True,
+                                        ttl=5)
+        assert storage_client._leases[key].id != stale_lease_id
+        assert await storage_client.get(key) == "recovered"
+
 
 @pytest.mark.asyncio
 async def test_expiry_does_not_charge_the_storage_own_outage():
