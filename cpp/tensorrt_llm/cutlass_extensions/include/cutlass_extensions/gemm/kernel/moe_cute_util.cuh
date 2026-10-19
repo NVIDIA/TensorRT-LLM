@@ -162,11 +162,7 @@ CUTE_DEVICE auto util_convert_type(cute::Tensor<Engine, Layout> const& tensor)
     // HACK: this requires tensor to be "contiguous"
     auto frag = convert_op(*reinterpret_cast<cutlass::Array<From_type, numel> const*>(tensor.data()));
     auto converted = cute::make_tensor<To_type>(tensor.layout());
-    CUTLASS_PRAGMA_UNROLL
-    for (int element_idx = 0; element_idx < numel; ++element_idx)
-    {
-        converted.data()[element_idx] = frag[element_idx];
-    }
+    cute::copy(cute::make_tensor(frag.data(), tensor.layout()), converted);
     return converted;
 }
 
