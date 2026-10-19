@@ -32,23 +32,27 @@ pytestmark = pytest.mark.cpu_only
 
 
 @pytest.mark.parametrize("axis", [0, 1, -1])
-@pytest.mark.parametrize("indices", [[2, 0], [1, 1, 0], []])
-def test_field_layout_selects_tensor_item_axis(axis: int, indices: list[int]) -> None:
-    values = torch.arange(9).reshape(3, 3)
-    selected = MultimodalItemPartition(item_axis=axis).select(values, indices)
-    expected = torch.index_select(values, axis, torch.tensor(indices, dtype=torch.long))
-    torch.testing.assert_close(selected, expected)
-
-
-@pytest.mark.parametrize("axis", [0, 1, -1])
-@pytest.mark.parametrize("indices", [[0, 1], [-2, -1], [2], []])
-def test_batched_item_partition_preserves_contiguous_views(axis, indices) -> None:
+@pytest.mark.parametrize(
+    "indices,is_view",
+    [
+        ([0, 1], True),
+        ([2, 0], False),
+        ([1, 1, 0], False),
+        ([], True),
+        ([-2, -1], True),
+        ([2], True),
+    ],
+)
+def test_batched_item_partition_selects_items_and_preserves_views(
+    axis: int, indices: list[int], is_view: bool
+) -> None:
     values = torch.arange(9).reshape(3, 3)
     selected = MultimodalItemPartition(item_axis=axis).select(values, indices)
     expected = values[indices] if axis == 0 else values[:, indices]
 
     torch.testing.assert_close(selected, expected)
-    assert selected.untyped_storage().data_ptr() == values.untyped_storage().data_ptr()
+    shares_storage = selected.untyped_storage().data_ptr() == values.untyped_storage().data_ptr()
+    assert shares_storage is is_view
 
 
 @pytest.mark.parametrize("axis", [0, 1, -1])
@@ -628,80 +632,16 @@ def test_mm_item_metadata_rejects_conflicting_prompt_order(hashing_enabled: bool
     assert processor.multimodal_hashing_supported is hashing_enabled
 
 
-@pytest.mark.parametrize("hashing_enabled", [False, True], ids=["fallback", "hashing"])
-@pytest.mark.parametrize("use_uuids", [False, True], ids=["content", "uuid"])
-@pytest.mark.parametrize("frontend_order", [False, True], ids=["record-order", "frontend-order"])
-@pytest.mark.parametrize(
-    "modalities,token_ids,explicit_ids,special_ids,expected_cumsum,expected_runs",
-    [
-        pytest.param(
-            ["image"],
-            [10, 101, 102, 20],
-            None,
-            None,
-            [0, 1, 2, 2],
-            ([0, 1], [1], [2]),
-            id="out-of-vocab-image",
-        ),
-        pytest.param(
-            ["image"],
-            [10, 101, 102, 20],
-            [101, 102],
-            None,
-            [0, 1, 2, 2],
-            ([0, 1], [1], [2]),
-            id="explicit-image-tokens",
-        ),
-        pytest.param(
-            ["image"],
-            [10, 101, 200, 102, 20],
-            [101, 102],
-            [200],
-            [0, 1, 1, 2, 2],
-            ([0, 1], [1], [3]),
-            id="image-framing-token",
-        ),
-        pytest.param(
-            ["video"],
-            [10, 101, 20, 102, 30],
-            None,
-            None,
-            [0, 1, 1, 2, 2],
-            ([0, 2], [1, 3], [1, 1]),
-            id="video-interleaved-text",
-        ),
-        pytest.param(
-            ["audio"],
-            [10, 101, 102, 20],
-            [101, 102],
-            None,
-            [0, 1, 2, 2],
-            ([0, 1], [1], [2]),
-            id="audio",
-        ),
-        pytest.param(
-            ["video", "image", "audio"],
-            [10, 101, 102, 20, 101, 102, 30, 101, 102, 40],
-            [101, 102],
-            None,
-            [0, 1, 2, 2, 3, 4, 4, 5, 6, 6],
-            ([0, 1, 2, 3], [1, 4, 7], [2, 2, 2]),
-            id="mixed-prompt-order",
-        ),
-    ],
-)
-def test_multimodal_input_contract_snapshot(
+def _process_mm_contract(
     modalities: list[str],
     token_ids: list[int],
     explicit_ids: list[int] | None,
     special_ids: list[int] | None,
-    expected_cumsum: list[int],
-    expected_runs: tuple[list[int], list[int], list[int]],
-    hashing_enabled: bool,
-    use_uuids: bool,
-    frontend_order: bool,
-) -> None:
-    """Pin framework metadata independently of model-specific media encoding."""
+    *,
+    hashing_enabled: bool = True,
+    use_uuids: bool = False,
+    frontend_order: bool = True,
+) -> tuple[list[int], dict]:
     item_refs = [(modality, 0) for modality in modalities]
     num_items = len(item_refs)
 
@@ -757,7 +697,58 @@ def test_multimodal_input_contract_snapshot(
     if use_uuids:
         inputs["multi_modal_uuids"] = {modality: [f"{modality}-id"] for modality in modalities}
 
-    actual_token_ids, extra = create_input_processor_with_hash(Processor())(inputs, None)
+    return create_input_processor_with_hash(Processor())(inputs, None)
+
+
+@pytest.mark.parametrize("hashing_enabled", [False, True], ids=["fallback", "hashing"])
+@pytest.mark.parametrize(
+    "modalities,token_ids,explicit_ids,special_ids,expected_cumsum,expected_runs",
+    [
+        (["image"], [10, 101, 102, 20], None, None, [0, 1, 2, 2], ([0, 1], [1], [2])),
+        (["image"], [10, 101, 102, 20], [101, 102], None, [0, 1, 2, 2], ([0, 1], [1], [2])),
+        (
+            ["image"],
+            [10, 101, 200, 102, 20],
+            [101, 102],
+            [200],
+            [0, 1, 1, 2, 2],
+            ([0, 1], [1], [3]),
+        ),
+        (["video"], [10, 101, 20, 102, 30], None, None, [0, 1, 1, 2, 2], ([0, 2], [1, 3], [1, 1])),
+        (["audio"], [10, 101, 102, 20], [101, 102], None, [0, 1, 2, 2], ([0, 1], [1], [2])),
+        (
+            ["video", "image", "audio"],
+            [10, 101, 102, 20, 101, 102, 30, 101, 102, 40],
+            [101, 102],
+            None,
+            [0, 1, 2, 2, 3, 4, 4, 5, 6, 6],
+            ([0, 1, 2, 3], [1, 4, 7], [2, 2, 2]),
+        ),
+    ],
+    ids=[
+        "out-of-vocab-image",
+        "explicit-image-tokens",
+        "image-framing-token",
+        "video-interleaved-text",
+        "audio",
+        "mixed-prompt-order",
+    ],
+)
+def test_multimodal_input_contract_snapshot(
+    modalities: list[str],
+    token_ids: list[int],
+    explicit_ids: list[int] | None,
+    special_ids: list[int] | None,
+    expected_cumsum: list[int],
+    expected_runs: tuple[list[int], list[int], list[int]],
+    hashing_enabled: bool,
+) -> None:
+    """Pin framework metadata independently of model-specific media encoding."""
+    actual_token_ids, extra = _process_mm_contract(
+        modalities, token_ids, explicit_ids, special_ids, hashing_enabled=hashing_enabled
+    )
+    item_refs = [(modality, 0) for modality in modalities]
+    num_items = len(item_refs)
 
     assert actual_token_ids == token_ids
     data = extra["multimodal_data"]
@@ -775,11 +766,9 @@ def test_multimodal_input_contract_snapshot(
         return
 
     mm_input = extra["multimodal_input"]
-    hashes = _UUID_HASH_SNAPSHOT if use_uuids else _CONTENT_HASH_SNAPSHOT
+    hashes = _CONTENT_HASH_SNAPSHOT
     assert mm_input.multimodal_hashes == [hashes[modality] for modality in modalities]
-    assert mm_input.multimodal_uuids == (
-        [f"{modality}-id" for modality in modalities] if use_uuids else None
-    )
+    assert mm_input.multimodal_uuids is None
     assert mm_input.multimodal_positions == [1 + 3 * index for index in range(num_items)]
     assert mm_input.multimodal_lengths == [2 + len(special_ids or [])] * num_items
     assert (
@@ -789,6 +778,30 @@ def test_multimodal_input_contract_snapshot(
     ) == expected_runs
     if special_ids:
         assert data["special_token_offsets"] == [1]
+
+
+@pytest.mark.parametrize("use_uuids", [False, True], ids=["content", "uuid"])
+@pytest.mark.parametrize("frontend_order", [False, True], ids=["record-order", "frontend-order"])
+def test_hashes_and_uuids_follow_common_item_refs(use_uuids: bool, frontend_order: bool) -> None:
+    modalities = ["video", "image", "audio"]
+    _, extra = _process_mm_contract(
+        modalities,
+        [10, 101, 102, 20, 101, 102, 30, 101, 102, 40],
+        [101, 102],
+        None,
+        use_uuids=use_uuids,
+        frontend_order=frontend_order,
+    )
+    mm_input = extra["multimodal_input"]
+    hashes = _UUID_HASH_SNAPSHOT if use_uuids else _CONTENT_HASH_SNAPSHOT
+    assert mm_input.multimodal_hashes == [hashes[modality] for modality in modalities]
+    assert mm_input.multimodal_uuids == (
+        [f"{modality}-id" for modality in modalities] if use_uuids else None
+    )
+    assert mm_input.multimodal_positions == [1, 4, 7]
+    assert extra["multimodal_data"][MULTIMODAL_ENCODER_ITEM_METADATA_KEY].item_refs == tuple(
+        (modality, 0) for modality in modalities
+    )
 
 
 def test_mm_processor_kwargs_hash_is_stable_for_canonical_values():
