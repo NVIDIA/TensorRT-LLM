@@ -495,7 +495,9 @@ class Qwen3VLInputProcessorBase(Qwen2VLInputProcessorBase):
         if not isinstance(mm_handles, list):
             raise TypeError("mm_handles must be a list")
 
-        num_deepstack_levels = len(self.config.vision_config.deepstack_visual_indexes)
+        # Edge has no deepstack indexes. A missing field is zero levels.
+        deepstack_indexes = getattr(self.config.vision_config, "deepstack_visual_indexes", None)
+        num_deepstack_levels = len(deepstack_indexes or [])
         # This is because, unlike previous Qwen VL models, the embeddings are concatenated with
         # feature maps from deepstack layers.
         expected_size = self.config.text_config.hidden_size * (1 + num_deepstack_levels)

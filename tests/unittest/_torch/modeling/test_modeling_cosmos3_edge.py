@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import os
+from types import SimpleNamespace
 
 import pytest
 import test_modeling_qwen3vl as _qwen3vl
@@ -16,11 +17,14 @@ from tensorrt_llm._torch.models.checkpoints.hf.cosmos3_edge_weight_mapper import
 )
 from tensorrt_llm._torch.models.checkpoints.hf.weight_loader import HfWeightLoader
 from tensorrt_llm._torch.models.modeling_cosmos3_edge import (
+    Cosmos3EdgeInputProcessor,
     Cosmos3EdgeModel,
+    _edge_positional_embedding_params,
     merge_spatial_patches,
     resize_positional_embeddings_packed,
 )
 from tensorrt_llm._torch.models.modeling_qwen3vl import Qwen3VLVisionPatchMerger
+from tensorrt_llm.functional import RotaryScalingType
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 
@@ -119,6 +123,72 @@ def test_spatial_merge_packs_two_by_two_blocks():
     grid = torch.tensor([[frames, height, width]], dtype=torch.int64)
     merged = merge_spatial_patches(embeds, grid, merge_size=2)
     assert merged.shape == (frames * (height // 2) * (width // 2), 2 * 2 * hidden)
+
+
+class _FakeTokenizer:
+    def __init__(self, input_ids):
+        self.input_ids = input_ids
+
+    def __call__(self, prompt, return_tensors=None):
+        assert return_tensors == "pt"
+        return SimpleNamespace(input_ids=torch.tensor([self.input_ids]))
+
+
+@pytest.mark.cpu_only
+def test_edge_disagg_handoff_without_deepstack():
+    image_token_id = 19
+    vision_start = 20
+    vision_end = 21
+    processor = object.__new__(Cosmos3EdgeInputProcessor)
+    processor._config = SimpleNamespace(
+        image_token_id=image_token_id,
+        video_token_id=18,
+        vision_start_token_id=vision_start,
+        text_config=SimpleNamespace(hidden_size=16),
+        vision_config=SimpleNamespace(),
+    )
+    processor._tokenizer = _FakeTokenizer([11, vision_start, image_token_id, vision_end, 12])
+
+    handoff = processor.build_disagg_prefill_multimodal_inputs(
+        {"prompt": "image prompt"},
+        [{"tensor_size": (2, 16)}],
+    )
+
+    assert handoff.prompt_token_ids == [
+        11,
+        vision_start,
+        image_token_id,
+        image_token_id,
+        vision_end,
+        12,
+    ]
+    assert handoff.multimodal_embedding_lengths == [2]
+
+
+@pytest.mark.cpu_only
+def test_edge_grid_stays_off_the_device_path_and_encoder_cache_is_enabled():
+    paths = Cosmos3EdgeModel.multimodal_data_device_paths.fget(None)
+    assert "image.pixel_values" in paths
+    assert "image.image_grid_thw" not in paths
+    assert "video.video_grid_thw" not in paths
+    assert Cosmos3EdgeModel.supports_encoder_cache is True
+
+
+@pytest.mark.cpu_only
+def test_edge_rope_scale_follows_rope_type():
+    from tensorrt_llm._torch.configs.cosmos3_edge import Cosmos3EdgeTextConfig
+
+    config = Cosmos3EdgeTextConfig(
+        rope_parameters={
+            "rope_type": "yarn",
+            "rope_theta": 1e8,
+            "factor": 2.0,
+            "original_max_position_embeddings": 32768,
+        }
+    )
+    params = _edge_positional_embedding_params(config)
+    assert params.rope.scale_type == RotaryScalingType.yarn
+    assert params.rope.scale == 2.0
 
 
 @pytest.mark.cpu_only
