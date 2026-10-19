@@ -21,7 +21,7 @@ missing dependency inside a submodule surfaces as ``ModuleNotFoundError``, an
 ``AttributeError`` inside one surfaces as ``ImportError`` with its cause,
 importing the package root or its ``backends`` sub-package loads no
 module-layer module, and ``rotary_embedding`` (which the backends import
-back) works as the first import of a process. The import-order checks run in
+back) works as the first import of a process and loads none of the backends. The import-order checks run in
 a fresh interpreter, because the pytest process has long since imported most
 of the package.
 """
@@ -55,6 +55,8 @@ MODULE_LAYER = [
     f"{PKG}.qk_norm_attention",
     f"{PKG}.rotary_embedding",
 ]
+
+BACKENDS = f"{PKG}.backends"
 
 _SENTINEL = "CLOSURE-OK"
 
@@ -191,5 +193,19 @@ def test_backends_import_loads_no_module_layer():
     ],
 )
 def test_rotary_embedding_first_import(statement):
-    """rotary_embedding imports the backends, which import it back; neither order may cycle."""
+    """Backends import rotary_embedding back; importing it first must not cycle."""
     _run_fresh(statement)
+
+
+def test_rotary_embedding_import_loads_no_backends():
+    """rotary_embedding uses the backends only in annotations, so importing it must not load them."""
+    _run_fresh(f"""
+        import sys
+        import tensorrt_llm._torch
+        before = set(sys.modules)
+        backends = {BACKENDS!r}
+        assert backends not in before, "tensorrt_llm._torch already imports the backends"
+        import {PKG}.rotary_embedding
+        loaded = sorted(m for m in set(sys.modules) - before if m == backends or m.startswith(backends + "."))
+        assert not loaded, loaded
+    """)
