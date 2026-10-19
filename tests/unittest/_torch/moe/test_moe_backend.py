@@ -2102,11 +2102,7 @@ def _make_megamoe_cutedsl_minimax_problem(
 
 
 def _make_megamoe_cutedsl_test_deployment(
-    *,
-    ep_size: int = 1,
-    parallel_size: int = 1,
-    use_dp: bool = False,
-    use_cuda_graph: bool = False,
+    *, ep_size: int = 1, parallel_size: int = 1, use_dp: bool = False
 ) -> MoEDeployment:
     return MoEDeployment(
         ep_size=ep_size,
@@ -2118,7 +2114,6 @@ def _make_megamoe_cutedsl_test_deployment(
             sm=100,
             available_deps=(MoEDep.MEGAMOE_CUTEDSL_RUNTIME, MoEDep.MEGAMOE_CUTEDSL_OP),
         ),
-        use_cuda_graph=use_cuda_graph,
     )
 
 
@@ -2197,54 +2192,6 @@ def test_megamoe_cutedsl_accepts_tep_for_every_model(
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("activation,constants", _MEGAMOE_CUTEDSL_TEP_ACTIVATIONS)
-def test_megamoe_cutedsl_rejects_tep_with_cuda_graphs(
-    activation: ActivationType, constants: set[str]
-) -> None:
-    """TEP is eager-only: graph warmup deadlocks (https://nvbugs/6946611)."""
-    verdict = MegaMoECuteDsl.can_implement(
-        _make_megamoe_cutedsl_tep_problem(activation, constants),
-        _make_megamoe_cutedsl_test_deployment(ep_size=8, parallel_size=8, use_cuda_graph=True),
-    )
-
-    assert not verdict.eligible
-    assert verdict.reject_reason is MoERejectReason.TOPOLOGY_UNSUPPORTED
-    assert "6946611" in verdict.detail
-
-
-@pytest.mark.cpu_only
-@pytest.mark.parametrize(
-    "parallel_size, use_dp", [(1, False), (8, True)], ids=["single_rank", "adp"]
-)
-def test_megamoe_cutedsl_accepts_cuda_graphs_outside_tep(parallel_size: int, use_dp: bool) -> None:
-    verdict = MegaMoECuteDsl.can_implement(
-        _make_megamoe_cutedsl_tep_problem(ActivationType.Swiglu, set()),
-        _make_megamoe_cutedsl_test_deployment(
-            ep_size=parallel_size, parallel_size=parallel_size, use_dp=use_dp, use_cuda_graph=True
-        ),
-    )
-
-    assert verdict.eligible, verdict.detail
-
-
-@pytest.mark.cpu_only
-def test_strict_megamoe_cutedsl_request_reports_tep_cuda_graph_rejection() -> None:
-    """A strict MEGAMOE_CUTEDSL request names the TEP + CUDA-graph rejection."""
-    model_config = ModelConfig()
-    model_config.moe_backend = "MEGAMOE_CUTEDSL"
-
-    with pytest.raises(ValueError, match="6946611"):
-        resolve_moe_impl(
-            model_config,
-            problem=_make_megamoe_cutedsl_tep_problem(ActivationType.Swiglu, set()),
-            deployment=_make_megamoe_cutedsl_test_deployment(
-                ep_size=8, parallel_size=8, use_cuda_graph=True
-            ),
-            allow_degradation=False,
-        )
-
-
-@pytest.mark.cpu_only
-@pytest.mark.parametrize("activation,constants", _MEGAMOE_CUTEDSL_TEP_ACTIVATIONS)
 def test_megamoe_cutedsl_rejects_moe_tensor_parallelism(
     activation: ActivationType, constants: set[str]
 ) -> None:
@@ -2257,6 +2204,24 @@ def test_megamoe_cutedsl_rejects_moe_tensor_parallelism(
 
     assert not verdict.eligible
     assert verdict.reject_reason is MoERejectReason.TOPOLOGY_UNSUPPORTED
+
+
+@pytest.mark.cpu_only
+def test_strict_megamoe_cutedsl_request_reports_rejection_detail() -> None:
+    """A strict MEGAMOE_CUTEDSL request names why the backend was rejected."""
+    model_config = ModelConfig()
+    model_config.moe_backend = "MEGAMOE_CUTEDSL"
+    deployment = dataclasses.replace(
+        _make_megamoe_cutedsl_test_deployment(ep_size=2, parallel_size=4), tp_size=2
+    )
+
+    with pytest.raises(ValueError, match="EP-only"):
+        resolve_moe_impl(
+            model_config,
+            problem=_make_megamoe_cutedsl_tep_problem(ActivationType.Swiglu, set()),
+            deployment=deployment,
+            allow_degradation=False,
+        )
 
 
 def _fused_comm_scheduler(
