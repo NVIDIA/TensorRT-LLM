@@ -1246,17 +1246,30 @@ def _validate_optional_int_list(values: Any,
 
 def get_multimodal_embedding_lengths(
         request: LlmRequest) -> Optional[List[int]]:
-    """Return explicit per-item encoder-output lengths for a multimodal request."""
+    """Return canonical item output rows, falling back to legacy layout."""
     py_multimodal_data = request.py_multimodal_data
     if py_multimodal_data is not None and not isinstance(
             py_multimodal_data, dict):
         raise TypeError("py_multimodal_data must be a dict")
-    # `multimodal_embedding_lengths` is Python-side layout metadata, not a
-    # nanobind request field, so validate the flat handoff contract here.
-    multimodal_embedding_lengths = _validate_optional_int_list(
+    multimodal_embedding_lengths = (
         py_multimodal_data.get("multimodal_embedding_lengths")
-        if py_multimodal_data is not None else None,
-        "multimodal_embedding_lengths")
+        if py_multimodal_data is not None else None)
+    item_metadata = get_multimodal_item_metadata(py_multimodal_data)
+    if (item_metadata is not None
+            and item_metadata.output_embedding_lengths is not None):
+        item_lengths = item_metadata.output_embedding_lengths
+        if (multimodal_embedding_lengths is not None
+                and multimodal_embedding_lengths is not item_lengths):
+            _validate_optional_int_list(multimodal_embedding_lengths,
+                                        "multimodal_embedding_lengths")
+            if multimodal_embedding_lengths != item_lengths:
+                raise ValueError(
+                    "Multimodal encoder item output lengths must match "
+                    "multimodal_embedding_lengths")
+        multimodal_embedding_lengths = item_lengths
+    # Output rows are Python-side metadata, not a nanobind request field.
+    multimodal_embedding_lengths = _validate_optional_int_list(
+        multimodal_embedding_lengths, "multimodal_embedding_lengths")
     if multimodal_embedding_lengths is None:
         return None
 
