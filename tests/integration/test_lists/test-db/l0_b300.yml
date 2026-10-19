@@ -135,15 +135,50 @@ l0_b300:
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_chunked_prefill[quant_dtype=fp8-kv_cache_reuse=True-fp8kv=True-overlap_scheduler=True] # Cover nvbugs 6084445
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16_flashinfer[enable_chunked_prefill=False]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16_flashinfer[enable_chunked_prefill=True]
-  # TIMEOUT measured: 348 cases in 5m34s on one GB300, so 30 is 5x headroom.
+  # TIMEOUT measured: 2259 cases in 11m55s on one GB300 (the cpu_only files run on the CPU
+  # stage instead), so 30 is 2.5x headroom.
   - unittest/_torch/modeling_v2 --ignore=unittest/_torch/modeling_v2/comm TIMEOUT (30)
   - accuracy/modeling_v2/test_gpt_oss.py::TestModelingV2GptOss120bSm10xDefault::test_gsm8k[tp1]
-  # qwen4_exp target: gsm8k; gsm8k with MTP plus the acceptance-length floor, the
-  # only gate that sees a miscomputed draft layer; mmmu with MTP, the only gate
-  # that reaches the vision tower.
+  # qwen4_exp target: gsm8k, and gsm8k with the trunk's routed experts on CuteDSL;
+  # gsm8k with MTP plus the acceptance-length floor, the only gate that sees a
+  # miscomputed draft layer, at one draft over bf16 and fp8 KV, at three drafts
+  # alone and over CuteDSL experts, and at five and seven drafts (the verify step's
+  # six and eight rows per request); 3k-6k-token pass key prompts, the only cases that
+  # run the sparse attention path (IndexShare over bf16 KV, fp8 KV), and 3k-12k-token ones
+  # at seven drafts; seven drafts all rejected and all accepted by forced acceptance at
+  # batch 32 over long prompts; the recurrent-state verify path that
+  # TRTLLM_USE_GDN_REPLAY=0 selects; the recurrent state stored in bf16 without speculation,
+  # at three drafts and at seven drafts over long prompts; mmmu with MTP and synthetic
+  # videos, the only gates that reach the vision tower; and the opt-in breakable prefill
+  # CUDA graph: gsm8k, gsm8k with three drafts and the length floor, 3k-6k-token pass keys
+  # prefilled in replayed 2048-token chunks, mmmu, and replayed against eager greedy
+  # continuations at the bucket edges and with context and generation rows in one batch.
   - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1::test_gsm8k
+  - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1::test_gsm8k_cutedsl_moe
   - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1::test_mtp1_gsm8k_and_acceptance
+  - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1::test_mtp1_fp8_kv_gsm8k_and_acceptance
+  - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1::test_mtp1_nvfp4_kv_gsm8k_and_acceptance
+  - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1::test_mtp3_gsm8k_and_acceptance
+  - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1::test_mtp3_cutedsl_gsm8k_and_acceptance
+  - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1::test_mtp5_gsm8k_and_acceptance
+  - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1::test_mtp7_gsm8k_and_acceptance
+  - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1::test_mtp3_long_context_passkey[index_share]
+  - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1::test_mtp3_long_context_passkey[fp8_kv]
+  - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1::test_mtp3_long_context_passkey[nvfp4_kv]
+  - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1::test_mtp7_long_context_passkey
+  - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1::test_mtp7_forced_acceptance_extremes[all_rejected]
+  - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1::test_mtp7_forced_acceptance_extremes[all_accepted]
+  - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1::test_gsm8k_bf16_ssm_state
+  - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1::test_mtp3_bf16_ssm_state_gsm8k_and_acceptance
+  - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1::test_mtp7_bf16_ssm_state_long_context_passkey
+  - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1::test_mtp1_gdn_legacy_verify
   - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1::test_mtp1_mmmu
+  - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1::test_mtp1_video
+  - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1::test_gsm8k_breakable_prefill_cuda_graph
+  - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1::test_mtp3_breakable_prefill_gsm8k_and_acceptance
+  - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1::test_mtp3_long_context_passkey[breakable_prefill]
+  - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1::test_mtp1_mmmu_breakable_prefill
+  - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1::test_breakable_prefill_matches_eager
 - condition:
     ranges:
       system_gpu_count:
