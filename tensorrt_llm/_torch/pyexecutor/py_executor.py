@@ -7670,13 +7670,15 @@ class PyExecutor:
         return local_schedulable_count, _ADPForwardIntent(global_intent)
 
     def _has_adp_dummy_kv_capacity(self,
-                                   token_nums: Optional[List[int]]) -> bool:
+                                   token_nums: Optional[List[int]],
+                                   draft_reserve: Optional[int] = None) -> bool:
         """Check the full dummy allocation before entering rank-local code.
 
         V1's dummy allocator historically checked only that one block was
         free. Generation dummies also reserve draft tokens, so that check can
         still let the C++ batch allocation fail after a peer rank has
-        succeeded.
+        succeeded. ``draft_reserve`` overrides the draft tokens reserved for
+        the dummy; by default they follow the dummy role.
         """
         token_num = (token_nums[0] if token_nums is not None else 1 +
                      self.max_total_draft_tokens)
@@ -7684,8 +7686,9 @@ class PyExecutor:
         has_cp_helix = getattr(mapping, "has_cp_helix", None)
         if callable(has_cp_helix) and has_cp_helix():
             token_num = max(token_num, 2)
-        draft_reserve = (self.max_total_draft_tokens
-                         if self._adp_dummy_is_gen else 0)
+        if draft_reserve is None:
+            draft_reserve = (self.max_total_draft_tokens
+                             if self._adp_dummy_is_gen else 0)
         available_tokens = self.kv_cache_manager.get_num_available_tokens(
             token_num_upper_bound=token_num, max_num_draft_tokens=draft_reserve)
         if available_tokens < token_num:
@@ -7952,7 +7955,8 @@ class PyExecutor:
         context_dummy = bool(
             getattr(self.kv_cache_manager, "kda_context_only", False))
         token_nums = [1] if context_dummy else None
-        if not self._has_adp_dummy_kv_capacity(token_nums):
+        if not self._has_adp_dummy_kv_capacity(
+                token_nums, draft_reserve=0 if context_dummy else None):
             logger.warning_once(
                 "attention-DP rank scheduled an empty batch and cannot afford "
                 "even a padding dummy; the forward pass is vetoed fleet-wide "

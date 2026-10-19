@@ -3431,6 +3431,22 @@ def test_pad_empty_batch_uses_context_dummy_on_kda_context_only_worker():
     assert stub._pending_adp_dummy_request is dummy
 
 
+def test_pad_empty_batch_context_dummy_checks_capacity_without_draft_reserve():
+    stub, scheduled_batch = _unfittable_rank()
+    stub.kv_cache_manager.kda_context_only = True
+    stub.max_total_draft_tokens = 3
+    # The dummy role can still say generation when no transceiver drives it.
+    stub._adp_dummy_is_gen = True
+    stub.kv_cache_manager.get_num_available_tokens.return_value = 1
+
+    _run_pad_empty(stub, scheduled_batch)
+
+    stub.kv_cache_manager.get_num_available_tokens.assert_called_once_with(
+        token_num_upper_bound=1, max_num_draft_tokens=0
+    )
+    assert len(scheduled_batch.context_requests) == 1
+
+
 def test_pad_empty_batch_no_op_when_batch_is_not_empty():
     stub, scheduled_batch = _unfittable_rank()
     scheduled_batch.context_requests_chunking = [
