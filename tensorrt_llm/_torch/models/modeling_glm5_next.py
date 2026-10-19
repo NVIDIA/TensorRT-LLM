@@ -671,7 +671,7 @@ class Glm5NextForCausalLM(SpecDecOneEngineForCausalLM):
         # The loader reduces every expert's scalar input_scale into the
         # layer-wide activation scale, which must be identical on every rank
         # because tokens are quantized before dispatch.
-        all_expert_input_scales = quant_algo == QuantAlgo.NVFP4
+        collect_all_expert_input_scales = quant_algo == QuantAlgo.NVFP4
         moe_weights: dict[str, torch.Tensor] = {}
         proj_to_w = {"gate_proj": "w1", "up_proj": "w3", "down_proj": "w2"}
 
@@ -689,7 +689,7 @@ class Glm5NextForCausalLM(SpecDecOneEngineForCausalLM):
                 tensor = moe.group("tensor")
                 # Other EP ranks' weights are never read.
                 if expert_id in local_expert_ids or (
-                    all_expert_input_scales and tensor == "input_scale"
+                    collect_all_expert_input_scales and tensor == "input_scale"
                 ):
                     moe_weights[f"{expert_id}.{proj_to_w[moe.group('proj')]}.{tensor}"] = (
                         materialize(lazy)
@@ -811,7 +811,7 @@ class Glm5NextForCausalLM(SpecDecOneEngineForCausalLM):
                 QuantAlgo.NVFP4: 12,
             }.get(quant_algo, 3)
             expected = tensors_per_expert * len(local_expert_ids)
-            if all_expert_input_scales:
+            if collect_all_expert_input_scales:
                 # One input_scale per projection of every non-local expert.
                 expected += len(proj_to_w) * (experts.num_experts - len(local_expert_ids))
             if len(moe_weights) != expected:
