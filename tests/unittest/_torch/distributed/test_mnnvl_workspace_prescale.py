@@ -74,6 +74,34 @@ def test_lookup_allowed_under_compile(tp4_mapping, monkeypatch):
     assert result is workspace[tp4_mapping]
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA for a native method handle")
+def test_cached_lookup_traces_with_a_native_handle(tp4_mapping):
+    """The cached lookup of a compiled forward must not call the workspace handle.
+
+    The real handle is a nanobind object, which Dynamo cannot trace; a C++-bound method
+    (``torch.cuda.Stream.query``) stands in for ``is_mapped`` so that the fast path of the public
+    lookup is traced for real, not with a Python lambda.
+    """
+    stream = torch.cuda.Stream()
+    MNNVLAllReduce.allreduce_mnnvl_workspaces[tp4_mapping] = {
+        "handle": SimpleNamespace(is_mapped=stream.query),
+        "buffer_size_bytes": 1 << 20,
+        "captured": False,
+    }
+
+    def lookup(x):
+        workspace = ops.get_or_scale_allreduce_mnnvl_workspace(
+            tp4_mapping, torch.bfloat16, buffer_size_bytes=1 << 20
+        )
+        return x + workspace["buffer_size_bytes"]
+
+    torch._dynamo.reset()
+    out = torch.compile(lookup, backend="eager", fullgraph=True)(torch.zeros(2))
+    assert out.tolist() == [float(1 << 20)] * 2
+    # The compiled graph embeds the workspace buffers, so the workspace must not be replaced later.
+    assert MNNVLAllReduce.allreduce_mnnvl_workspaces[tp4_mapping]["captured"] is True
+
+
 def _make_module(mapping, dtype):
     module = MNNVLAllReduce.__new__(MNNVLAllReduce)
     module.mapping = mapping

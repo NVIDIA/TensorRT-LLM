@@ -295,7 +295,10 @@ def get_or_scale_allreduce_mnnvl_workspace(
     allreduce_mnnvl_workspaces = MNNVLAllReduce.allreduce_mnnvl_workspaces
     if mapping in allreduce_mnnvl_workspaces:
         workspace = allreduce_mnnvl_workspaces[mapping]
-        if not workspace["handle"].is_mapped():
+        # The handle probe is a nanobind call, which dynamo cannot trace; the
+        # compiled path relies on the pre-scaled workspace being attached.
+        if (not torch.compiler.is_compiling()
+                and not workspace["handle"].is_mapped()):
             raise RuntimeError("MNNVL workspace handles are not attached")
         if workspace["buffer_size_bytes"] >= (buffer_size_bytes or 0):
             return _mark_if_capturing(workspace)
@@ -308,8 +311,17 @@ def get_or_scale_allreduce_mnnvl_workspace(
 
 
 def _mark_if_capturing(workspace: _MnnvlWorkspace) -> _MnnvlWorkspace:
-    """Record that a CUDA graph being captured launches on this workspace."""
-    if not workspace["captured"] and torch.cuda.is_current_stream_capturing():
+    """Record that a CUDA graph being captured launches on this workspace.
+
+    A torch.compile'd region is marked while it is traced: its graph embeds the
+    workspace buffers, so replacing the workspace later would leave it launching
+    on freed memory whether or not a CUDA graph was captured. The capture probe
+    is a bool-returning call that dynamo cannot trace.
+    """
+    if workspace["captured"]:
+        return workspace
+    if torch.compiler.is_compiling() or torch.cuda.is_current_stream_capturing(
+    ):
         workspace["captured"] = True
     return workspace
 
