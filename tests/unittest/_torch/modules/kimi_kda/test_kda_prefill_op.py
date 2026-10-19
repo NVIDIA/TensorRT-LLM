@@ -682,6 +682,75 @@ def test_fused_prefill_does_not_depend_on_k1_warp_timing(
 
 
 @torch.no_grad()
+@pytest.mark.parametrize("num_sms", [148, 37])
+def test_kda_prefill_persistent_grid_size_does_not_change_results(
+    num_sms: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """K123 and K4 size their persistent grids by the device SM count.
+
+    Any grid size must give the same bits, because each work unit is computed
+    by one block regardless of which block or round it lands in.
+    """
+    from tensorrt_llm._torch.custom_ops import cute_dsl_kimi_k3_custom_ops as kimi_k3_ops
+
+    torch.manual_seed(11)
+    sequence_lengths = [100, 257, 63, 64, 1, 512, 130, 8]
+    num_sequences = len(sequence_lengths)
+    sequence_length = sum(sequence_lengths)
+    cu_seqlens = torch.tensor(
+        [0, *torch.tensor(sequence_lengths).cumsum(0).tolist()],
+        dtype=torch.long,
+        device="cuda",
+    )
+
+    def randn(*shape: int, dtype: torch.dtype = torch.bfloat16, scale: float = 0.05):
+        return (torch.randn(*shape, dtype=torch.float32, device="cuda") * scale).to(dtype)
+
+    def l2norm(x: torch.Tensor) -> torch.Tensor:
+        return torch.nn.functional.normalize(x.float(), dim=-1).to(torch.bfloat16)
+
+    shape = (1, sequence_length, NUM_HEADS, HEAD_DIM)
+    inputs = dict(
+        q=l2norm(randn(*shape)),
+        k=l2norm(randn(*shape)),
+        v=randn(*shape),
+        g=randn(*shape),
+        beta=randn(1, sequence_length, NUM_HEADS, dtype=torch.float32),
+        scale=HEAD_DIM**-0.5,
+        state_indices=torch.arange(num_sequences, dtype=torch.int32, device="cuda"),
+        safe_gate=True,
+        lower_bound=-5.0,
+        use_gate_in_kernel=True,
+        A_log=torch.randn(NUM_HEADS, dtype=torch.float32, device="cuda") * 0.1,
+        dt_bias=torch.randn(NUM_HEADS * HEAD_DIM, dtype=torch.float32, device="cuda") * 0.1,
+        cu_seqlens=cu_seqlens,
+        use_beta_sigmoid_in_kernel=True,
+    )
+    initial_state = randn(
+        num_sequences, NUM_HEADS, HEAD_DIM, HEAD_DIM, dtype=torch.float32, scale=0.01
+    )
+
+    def run() -> tuple[torch.Tensor, torch.Tensor]:
+        state = initial_state.clone()
+        output = torch.ops.trtllm.kda_prefill(state_pool=state, **inputs).clone()
+        return output, state
+
+    expected_output, expected_state = run()
+    device_index = torch.cuda.current_device()
+    assert kimi_k3_ops._num_sms_by_device[device_index] == (
+        torch.cuda.get_device_properties(device_index).multi_processor_count
+    )
+    monkeypatch.setattr(kimi_k3_ops, "_num_sms_by_device", {device_index: num_sms})
+    monkeypatch.setattr(kimi_k3_ops, "_fused_k123_cache", {})
+    monkeypatch.setattr(kimi_k3_ops, "_k4p_cache", {})
+    monkeypatch.setattr(kimi_k3_ops, "_k4p_tm_ws", {})
+    output, state = run()
+
+    torch.testing.assert_close(output, expected_output, rtol=0, atol=0)
+    torch.testing.assert_close(state, expected_state, rtol=0, atol=0)
+
+
+@torch.no_grad()
 def test_kda_mixer_empty_prefill():
     """An empty token payload still publishes the conv state for its slot."""
     optimized = _make_kda()

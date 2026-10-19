@@ -18,7 +18,8 @@ Persistent Fused K1+K2+K3 Kernel for KDA.
 Fuses gate activation + cumsum + scaling (K1), intra sub-chunk Aqk/Akk (K2),
 and inter sub-chunk solve + merged inverse (K3) into a single persistent kernel.
 
-Grid: (NUM_SMS, 1, 1) — 148 persistent blocks, each loops over work units
+Grid: (NUM_SMS, 1, 1) — one persistent block per SM of the launch device
+  (make_host_function(num_sms=...)), each loops over work units
   Total work units = (NT/4) * H * B, distributed round-robin across SMs
   Block i processes work units i, i+NUM_SMS, i+2*NUM_SMS, ...
 Block: 992 threads (31 warps), warp-specialized with setmaxnreg:
@@ -67,6 +68,7 @@ Outputs (g_cumsum stays in SMEM, not written to GMEM):
 """
 
 import cuda.bindings.driver as cuda
+import cuda.bindings.runtime as cudart
 import cutlass
 import cutlass.cute as cute
 from cutlass import for_generate, yield_out
@@ -81,7 +83,6 @@ K_DIM = 128
 K_PAD = 8
 K_STRIDE = K_DIM + K_PAD  # 136, padded row stride to avoid bank conflicts
 CHUNKS_PER_BLOCK = 4
-NUM_SMS = 148  # Persistent kernel: one resident block per SM
 
 NUM_K1_TMA_WARPS = 16  # Warps 0-15:  K1 compute (4 warpgroups, 8×2) -- TMA offloaded
 NUM_MMA_WARPS = 11  # Warps 16-26: MMA (10 active + 1 TMA producer, dropped idle warp 27)
@@ -974,6 +975,7 @@ def fused_kernel123(
     USE_SAFE_GATE: cutlass.Constexpr[int],
     valid_tokens: cutlass.Int32,
     USE_BETA_SIGMOID: cutlass.Constexpr[int],
+    NUM_SMS: cutlass.Constexpr[int],
     VARLEN_PURE: cutlass.Constexpr[int] = 0,
 ):
     block_id, _, _ = cute.arch.block_idx()
@@ -2121,6 +2123,18 @@ def fused_kernel123(
 # =========================================================================
 # Host function
 # =========================================================================
+def _current_device_num_sms():
+    err, dev = cudart.cudaGetDevice()
+    if err != cudart.cudaError_t.cudaSuccess:
+        raise RuntimeError(f"cudaGetDevice failed: {err}")
+    err, num_sms = cudart.cudaDeviceGetAttribute(
+        cudart.cudaDeviceAttr.cudaDevAttrMultiProcessorCount, dev
+    )
+    if err != cudart.cudaError_t.cudaSuccess:
+        raise RuntimeError(f"cudaDeviceGetAttribute(MultiProcessorCount) failed: {err}")
+    return num_sms
+
+
 def make_host_function(
     B,
     NT,
@@ -2131,8 +2145,13 @@ def make_host_function(
     use_safe_gate=False,
     use_beta_sigmoid=False,
     varlen_pure=False,
+    num_sms=None,
 ):
     """
+    `num_sms` is the persistent grid size (one block per SM) and is baked into
+    the compiled function, so callers that cache compiled functions must key
+    the cache on it. None uses the SM count of the current CUDA device.
+
     `varlen_pure=True` asserts that all seq lengths in the batch are multiples
     of BT (= 64). Under that assumption every chunk has 64 valid rows so the
     four mask sites (K1 row mask, K1 store mask, MMA accumulator zero-fill,
@@ -2145,6 +2164,7 @@ def make_host_function(
     _USE_SAFE_GATE = 1 if use_safe_gate else 0
     _USE_BETA_SIGMOID = 1 if use_beta_sigmoid else 0
     _VARLEN_PURE = 1 if (is_varlen and varlen_pure) else 0
+    _NUM_SMS = int(num_sms) if num_sms is not None else _current_device_num_sms()
     if is_varlen:
         assert B == 1, "Varlen requires B=1"
         assert T_padded is not None, "T_padded required for varlen"
@@ -2300,7 +2320,7 @@ def make_host_function(
         # Constant grid: the persistent for_generate loop bounds work by the
         # runtime total_cgs, so blocks past the work count exit immediately.
         # (A shape-dependent min() here would re-bake the grid per NT.)
-        _grid_x = NUM_SMS
+        _grid_x = _NUM_SMS
 
         fused_kernel123(
             tma_atom_Q,
@@ -2342,6 +2362,7 @@ def make_host_function(
             _USE_SAFE_GATE,
             valid_tokens,
             _USE_BETA_SIGMOID,
+            _NUM_SMS,
             _VARLEN_PURE,
         ).launch(
             grid=(_grid_x, 1, 1),

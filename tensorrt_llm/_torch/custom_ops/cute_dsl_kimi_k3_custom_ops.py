@@ -158,6 +158,18 @@ def _cute_int_type(dtype):
         raise ValueError(f"Unsupported integer dtype: {dtype}")
 
 
+# Persistent K123 / K4 grids: one block per SM of the launch device.
+_num_sms_by_device = {}
+
+
+def _device_num_sms(dev_idx):
+    num_sms = _num_sms_by_device.get(dev_idx)
+    if num_sms is None:
+        num_sms = torch.cuda.get_device_properties(dev_idx).multi_processor_count
+        _num_sms_by_device[dev_idx] = num_sms
+    return num_sms
+
+
 # ========== Fused K1+K2+K3 compilation cache ==========
 _fused_k123_cache = {}
 # id(cu_seqlens) -> bool. Skips per-call GPU->CPU sync on subsequent calls
@@ -542,11 +554,14 @@ def _launch_k4_persistent(
     cu_seqlens,
     chunk_offsets,
     cu_eqlen_passed=False,
-    num_sm=148,
+    num_sm=None,
     H=None,
     V_dim=None,
 ):
     """Launch persistent K4 with cached CuTe wrappers.
+
+    ``num_sm`` is the persistent-grid ceiling; None uses the SM count of
+    ``v_beta``'s device.
 
     Precondition: all sequence lengths in cu_seqlens must be > 0 (a
     zero-length sequence deadlocks the kernel's chunk-loop barriers; see the
@@ -564,6 +579,8 @@ def _launch_k4_persistent(
     N_seqs = cu_seqlens.shape[0] - 1
     dev = v_beta.device
     dev_idx = dev.index or 0
+    if num_sm is None:
+        num_sm = _device_num_sms(dev_idx)
 
     s_ct = _dynamic_dlpack_arg(state_pool)
     a_ct = cute_wrappers["a_ct"]
@@ -745,10 +762,12 @@ def _launch_fused_k123_inv(
     # compile-time batch stride, which depends on T. Varlen fixes B=1, so that
     # batch stride is never used and all T shapes can keep sharing one compile.
     eqlen_t_key = T if not is_varlen else -1
+    num_sms = _device_num_sms(dev)
     cache_key = (
         H,
         is_varlen,
         dev,
+        num_sms,
         has_bias,
         safe_gate,
         varlen_pure,
@@ -837,6 +856,7 @@ def _launch_fused_k123_inv(
             use_safe_gate=safe_gate,
             use_beta_sigmoid=use_beta_sigmoid_in_kernel,
             varlen_pure=varlen_pure,
+            num_sms=num_sms,
         )
         _fused_k123_cache[cache_key] = cute.compile(host_fn, *ct_args)
     k123_fn = _fused_k123_cache[cache_key]
