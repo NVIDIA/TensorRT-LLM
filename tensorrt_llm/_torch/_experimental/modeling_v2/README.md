@@ -267,6 +267,81 @@ Both targets are gated by
 `tests/integration/defs/accuracy/modeling_v2/test_nemotron_h.py` (gsm8k, the
 protocol of `TestNemotronV3Ultra`, `modeling_v2="require"`).
 
+### sm_100 and the BF16 nemotron_h target
+
+`Arch.SM_100` is the third architecture. `models/nemotron_h/nemotron3_ultra_bf16__sm_100__tep8`
+runs the BF16 release of Nemotron-3 Ultra -- no quantization at all, 1.1 TB of
+weights -- on 8 sm_100 ranks (one HGX B200 node, or two GB200 nodes), with
+tensor-parallel attention, mamba and shared expert and expert-parallel routed
+experts. It is the sm_107 NVFP4 tep4 target with the quantization taken out and
+the rank count doubled. It has no dep8 sibling: attention data parallelism
+replicates every non-expert weight on every rank (about 68 GB: the mamba
+projections, the shared experts, attention, the latent projections, the
+embeddings) beside 129 GB of experts, more than a 186 GB GPU holds. Routing
+claims it for the BF16 checkpoint (`quantization_config` absent), compute
+capability (10, 0), exactly 8 ranks tensor-parallel with expert-parallel MoE,
+attention DP off and no speculative decoding.
+
+What differs from the NVFP4 target:
+
+* Every GEMM is `cublas_mm` over bf16 weights. The FP8 `static_quantize_e4m3_per_tensor`
+  / `cublas_scaled_mm` pairs, the NVFP4 `fp4_quantize` / `fp4_block_scale_moe_runner`
+  pair and every `input_scale`, `weight_scale` and `weight_scale_2` the other
+  checkpoint carries are gone, and with them the expert weight layout recipe
+  (32-row block shuffle, 128x4 scale swizzle): the experts are stacked as the
+  checkpoint stores them.
+* The routed experts run through `fused_moe`, the CUTLASS grouped GEMM, with
+  `activation_type` Relu2: FC1 is the up projection alone (`[E, 5120, 2048]`, no
+  gate half), FC2 is `[E, 2048, 5120]`, the weights are this rank's 64 experts and
+  the ids are global, so an expert-parallel split is 8 calls whose outputs sum.
+  The entry was deepseek's own (`fused_moe`, SwiGLU, bf16); it is promoted to the
+  catalog with its test and gains Relu2 and the Ultra geometry as cells.
+* The KV cache is bf16 (`quant_mode` 0, no scales to pass) and the SSM state is fp32,
+  the checkpoint's `mamba_ssm_cache_dtype`; the NVFP4 gate runs fp16.
+* TP8 geometry per rank: 8 query heads over one kv head (each of the 2 kv heads is
+  replicated on four ranks), 32 mamba heads in the rank's single group, a 1280-wide
+  slice of the shared expert, 64 of the 512 experts.
+* The all-reduce is `AUTO` inside one node (the IPC one-shot / two-shot kernels for
+  decode-sized payloads, NCCL for large ones) and NCCL across nodes, where the IPC
+  workspace has no peers.
+
+Entries: `Arch.SM_100` is declared on every shared entry the target calls, each driven
+whole on sm_100: `thop_attention`, `cublas_mm`, `flashinfer_rmsnorm`,
+`flashinfer_fused_add_rmsnorm`, `rms_norm_gated_grouped`, `noaux_tc_op`,
+`causal_conv1d_fwd`, `causal_conv1d_update`, `mamba_chunk_scan_combined`,
+`selective_state_update` and the promoted `fused_moe`. The cells added for tep8 -- the
+rank's in_proj, qkv, o_proj and shared-expert GEMM shapes; 8 q / 1 kv head over a bf16
+pool, including rows 4 and 55 of a real `MambaHybridCacheManagerV2`'s 60-row mapping;
+conv, scan and decode-step shapes at 32 heads in one group over an fp32 state pool; one
+group of 2048 for the gated norm; Relu2 over a window of 64 experts -- were driven on
+sm_100 only, so on an entry that also lists sm_103 or sm_107 they are not a claim about
+those. The target's own `allreduce` entry sits under its `ops/comm/` with a matrix that
+runs at 8 ranks where the node has 8 GPUs and at 4 where it has 4; it was driven at 4
+ranks (one GB200 node), so the one-shot / two-shot kernels at 8 ranks inside one node
+-- an HGX B200 -- are not covered by any run yet. The accuracy gate ran on two GB200
+nodes, where the all-reduce is NCCL.
+
+What the sm_100 runs surfaced, each written up in its entry or test:
+
+* **The BF16 release's router biases are not on the NVFP4 checkpoint's 0.125 grid.**
+  Layer 1's span 0.0022 over 23 levels and layer 107's 0.35 over 394, so selection
+  leans on the fp32 bias add more than the NVFP4 cells did; `noaux_tc_op` has a cell
+  for each layer read from the BF16 release.
+* **Relu2 squares FC1's output**, which doubles the accumulation-order noise reaching
+  FC2: over the whole tactic space `fused_moe` stays inside the same gates at the Ultra
+  geometry as at R1's, with a thinner element-wise margin (the test's `_compare` has the
+  measured worst cases).
+* **The IPC all-reduce has no peers across nodes**: `get_allreduce_workspace` allocates
+  nothing to open there, so the target passes NCCL explicitly when the mapping spans
+  nodes rather than leaving `AUTO` to discover it.
+
+The target is gated by
+`tests/integration/defs/accuracy/modeling_v2/test_nemotron_h.py::TestModelingV2Nemotron3UltraBf16Sm100Tep8`
+(gsm8k, the protocol of `TestNemotronV3Ultra`, 8 ranks, `modeling_v2="require"`). It
+reads the BF16 release as `NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16` under
+`LLM_MODELS_ROOT`, and its reference entry is the one `references/gsm8k.yaml` carries for
+`nvidia/Nemotron-Ultra-V3` with neither a `quant_algo` nor a `kv_cache_quant_algo`.
+
 ### What replaced the version pin
 
 Out of tree each target hard-asserted a pinned `tensorrt_llm` version at

@@ -6863,6 +6863,9 @@ ULTRA_TP = 4
 ULTRA_HQ, ULTRA_HKV, ULTRA_D = 16, 1, 128
 #: The unsharded layer every rank runs at dep4 (attention data parallel).
 ULTRA_DEP4_HQ, ULTRA_DEP4_HKV = 64, 2
+#: The BF16 checkpoint over 8 ranks: 8 q heads over the one kv head a rank holds.
+ULTRA_BF16_TP = 8
+ULTRA_BF16_HQ, ULTRA_BF16_HKV = 8, 1
 
 
 def _compare_split_softmax(out: torch.Tensor, ref: torch.Tensor) -> None:
@@ -6922,6 +6925,10 @@ class _UltraHybridEnv(_MultiLayerPagedAttnEnv):
     [slots, 18432, 3], ssm [slots, 256, 64, 128]), since each rank holds its own
     requests through unsharded layers.
 
+    `bf16_tep8=True` builds the BF16 checkpoint's: an eight-rank mapping (8 q heads
+    over one kv head, conv [slots, 2304, 3], ssm [slots, 32, 64, 128]), a bf16 pool
+    and fp32 SSM state (the config's `mamba_ssm_cache_dtype`).
+
     This env's layer ordinals are attention ordinals (0..11), the keys of the
     base class's histories; `rows[layer]` is the manager's mapping row for that
     layer. The pool pointers, the 60-row mapping and the per-pool block-offset
@@ -6932,27 +6939,40 @@ class _UltraHybridEnv(_MultiLayerPagedAttnEnv):
 
     SENTINEL = 0x5A
 
-    def __init__(self, max_batch: int = 32, max_seq_len: int = 2048, dep4: bool = False) -> None:
+    def __init__(
+        self,
+        max_batch: int = 32,
+        max_seq_len: int = 2048,
+        dep4: bool = False,
+        bf16_tep8: bool = False,
+    ) -> None:
+        assert not (dep4 and bf16_tep8), "one variant at a time"
         mamba_mask = [c == "M" for c in ULTRA_PATTERN]
         attn_mask = [c == "*" for c in ULTRA_PATTERN]
+        tp = ULTRA_BF16_TP if bf16_tep8 else ULTRA_TP
         self.num_layers = len(ULTRA_ATTN_LAYERS)
-        self.num_heads = ULTRA_DEP4_HQ if dep4 else ULTRA_HQ
-        self.num_kv_heads = ULTRA_DEP4_HKV if dep4 else ULTRA_HKV
+        if bf16_tep8:
+            self.num_heads, self.num_kv_heads = ULTRA_BF16_HQ, ULTRA_BF16_HKV
+        elif dep4:
+            self.num_heads, self.num_kv_heads = ULTRA_DEP4_HQ, ULTRA_DEP4_HKV
+        else:
+            self.num_heads, self.num_kv_heads = ULTRA_HQ, ULTRA_HKV
         self.head_dim = ULTRA_D
         self.tokens_per_block = 32
         self.max_batch = max_batch
         self.max_seq_len = max_seq_len
-        self.quant_mode = QUANT_MODE_FP8_KV_CACHE
+        self.quant_mode = 0 if bf16_tep8 else QUANT_MODE_FP8_KV_CACHE
         self.mgr = MambaHybridCacheManagerV2(
             128,  # ssm_state_size
             4,  # conv_kernel
-            256,  # mamba_num_heads, 64 per rank
-            8,  # n_groups, 2 per rank
+            256,  # mamba_num_heads, 64 per rank (32 at tep8)
+            8,  # n_groups, 2 per rank (1 at tep8)
             64,  # mamba_head_dim
             sum(mamba_mask),
             mamba_mask,
             torch.bfloat16,  # conv state: the model dtype
-            torch.float16,  # ssm state: the gate's mamba_ssm_cache_dtype
+            # ssm state: the gate's mamba_ssm_cache_dtype (fp16), the BF16 config's fp32
+            torch.float32 if bf16_tep8 else torch.float16,
             # The budget covers the recurrent slots too: 32 rows leave ~940 pages.
             KvCacheConfig(max_tokens=1024 * 32 * (4 if dep4 else 1), enable_block_reuse=False),
             CacheTypeCpp.SELF,
@@ -6964,14 +6984,14 @@ class _UltraHybridEnv(_MultiLayerPagedAttnEnv):
             max_seq_len=max_seq_len,
             max_batch_size=max_batch,
             mapping=Mapping(
-                world_size=ULTRA_TP,
-                tp_size=ULTRA_TP,
+                world_size=tp,
+                tp_size=tp,
                 rank=0,
-                moe_ep_size=ULTRA_TP,
+                moe_ep_size=tp,
                 moe_tp_size=1,
                 enable_attention_dp=dep4,
             ),
-            dtype=DataType.FP8,
+            dtype=DataType.BF16 if bf16_tep8 else DataType.FP8,
             conv_state_layout="x_b_c",
         )
         # The checkpoint's k/v scales are 1.0 and the target passes None.
@@ -7562,7 +7582,9 @@ def _cell_ultra_hybrid(cell, arm) -> None:
     arm(op)
     _seed(cell)
     dep4 = spec["pool_layout"] == "ultra_hybrid60_dep4"
-    env = _UltraHybridEnv(max_batch=spec["max_num_requests"], dep4=dep4)
+    bf16_tep8 = spec["pool_layout"] == "ultra_hybrid60_tep8_bf16"
+    env = _UltraHybridEnv(max_batch=spec["max_num_requests"], dep4=dep4, bf16_tep8=bf16_tep8)
+    fp8 = bool(env.quant_mode & QUANT_MODE_FP8_KV_CACHE)
     try:
         assert (env.num_heads, env.num_kv_heads) == (spec["num_heads"], spec["num_kv_heads"])
         row, p = spec["local_layer_idx"], spec["predicted_tokens_per_seq"]
@@ -7607,7 +7629,7 @@ def _cell_ultra_hybrid(cell, arm) -> None:
             predicted_tokens_per_seq=p,
         )
         _gate_rows(
-            out, env, qkv, list(new), rids, nc, True, paged, _compare_split_softmax, layer=layer
+            out, env, qkv, list(new), rids, nc, fp8, paged, _compare_split_softmax, layer=layer
         )
         env.check_caches(rids, layers=[layer])
         _assert_only_this_layer_moved(env, snapshot, layer, cell.why)
@@ -7652,7 +7674,11 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811
     kind = spec["input_type"]
     if spec.get("kv_cache") == "none":
         _cell_encoder(cell, certifying)
-    elif spec.get("pool_layout") in ("ultra_hybrid60", "ultra_hybrid60_dep4"):
+    elif spec.get("pool_layout") in (
+        "ultra_hybrid60",
+        "ultra_hybrid60_dep4",
+        "ultra_hybrid60_tep8_bf16",
+    ):
         _cell_ultra_hybrid(cell, certifying)
     elif "pool_layout" in spec:
         _cell_layered(cell, certifying)

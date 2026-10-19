@@ -30,6 +30,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.nvfp4_gemm impor
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.fp4_block_scale_moe_runner import (
     fp4_block_scale_moe_runner,
 )
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.fused_moe import fused_moe
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.noaux_tc_op import noaux_tc_op
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.flashinfer_fused_add_rmsnorm import (  # noqa: E501
     flashinfer_fused_add_rmsnorm,
@@ -53,7 +54,6 @@ from .ops.attention.mla_rope_append_paged_kv_assign_q import (  # noqa: E501
 )
 from .ops.attention.mla_rope_generation import mla_rope_generation
 from .ops.gemm.bmm_out import bmm_out
-from .ops.moe.fused_moe import fused_moe
 
 _CACHED_CTX_FIELDS = (
     "enable_context_mla_with_cached_kv",

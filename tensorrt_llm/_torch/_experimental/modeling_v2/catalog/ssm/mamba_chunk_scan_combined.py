@@ -16,6 +16,9 @@ from tensorrt_llm._torch.modules.mamba import ssd_combined as _ssd_combined
 NHEADS, HEADDIM, NGROUPS, DSTATE = 64, 64, 2, 128
 #: At dep4 (attention DP) every rank runs the whole mixer: 256 heads, 8 groups.
 DEP4_NHEADS, DEP4_NGROUPS = 256, 8
+#: At tep8 (the BF16 checkpoint over 8 ranks) a rank runs an eighth of the mixer: 32
+#: heads over one group, the same 32 heads per group as at the other two.
+TEP8_NHEADS, TEP8_NGROUPS = 32, 1
 #: `config.chunk_size`; the engine hands it to Mamba2Metadata as `mamba_chunk_size`.
 CHUNK_SIZE = 128
 #: The engine's SSM pool for this checkpoint (V2 hybrid manager, max_batch_size 32): 35 slots,
@@ -28,6 +31,7 @@ ENGINE_SLOT_LAYERS = 48
 
 _LENGTHS_32 = tuple(1 + (i * 37) % 300 for i in range(32))
 _DEP4 = dict(nheads=DEP4_NHEADS, ngroups=DEP4_NGROUPS)
+_TEP8 = dict(nheads=TEP8_NHEADS, ngroups=TEP8_NGROUPS)
 
 
 class MambaChunkScanCombined(OpWrapper):
@@ -51,7 +55,7 @@ class MambaChunkScanCombined(OpWrapper):
     states.
     """
 
-    ARCHS = frozenset({Arch.SM_107})
+    ARCHS = frozenset({Arch.SM_100, Arch.SM_107})
 
     # spec keys: lengths (tokens per context row), initial (has_initial_state per row),
     # pool_dtype (the SSM cache, default fp16), state_dtype (default fp32),
@@ -145,6 +149,40 @@ class MambaChunkScanCombined(OpWrapper):
         Cell(
             why="dep4: an 8192-token continuation carrying fp32-pool state",
             spec=dict(_DEP4, lengths=(8192,), initial=(True,), pool_dtype=torch.float32),
+        ),
+        # The BF16 checkpoint's SSM state is fp32 (config `mamba_ssm_cache_dtype`), so the
+        # tep8 cells that read the pool read an fp32 one.
+        Cell(
+            why="tep8 32 heads / 1 group: 3 fresh rows off the chunk grid",
+            spec=dict(_TEP8, lengths=(100, 300, 37), initial=(False, False, False)),
+        ),
+        Cell(
+            why="tep8: fresh rows beside carried rows, fp32 pool",
+            spec=dict(
+                _TEP8,
+                lengths=(5, 200, 1, 129, 64),
+                initial=(True, False, True, False, True),
+                pool_dtype=torch.float32,
+            ),
+        ),
+        Cell(
+            why="tep8: 32 rows at the engine's 35-slot x 48-layer fp32 pool",
+            spec=dict(
+                _TEP8,
+                lengths=_LENGTHS_32,
+                initial=tuple(i % 3 != 0 for i in range(32)),
+                pool_slots=ENGINE_SLOTS,
+                pool_layers=ENGINE_SLOT_LAYERS,
+                pool_dtype=torch.float32,
+            ),
+        ),
+        Cell(
+            why="tep8: one fresh 8192-token prompt (the token ceiling)",
+            spec=dict(_TEP8, lengths=(8192,), initial=(False,)),
+        ),
+        Cell(
+            why="tep8: an 8192-token continuation carrying fp32-pool state",
+            spec=dict(_TEP8, lengths=(8192,), initial=(True,), pool_dtype=torch.float32),
         ),
     )
 

@@ -77,12 +77,15 @@ def route(
     kinds = _block_kinds(cfg)
     quant = _quantization(cfg)
 
-    # Both targets put 4 ranks on the same checkpoint and differ in where the
+    # The NVFP4 targets put 4 ranks on one checkpoint and differ in where the
     # non-expert weights live -- a weight-layout question, which is why each
     # selects a target rather than a runtime branch. tep4: attention and mamba
     # heads tensor-parallel over the 4 ranks. dep4: attention data-parallel,
     # everything but the routed experts whole on every rank. Both put the routed
-    # experts expert-parallel over the same 4 ranks.
+    # experts expert-parallel over the same 4 ranks. The BF16 checkpoint is 1.1 TB
+    # (the NVFP4 one 329 GB), so it takes 8 ranks, and only the tensor-parallel
+    # layout: replicating the non-expert weights (dep) would put about 68 GB of
+    # them on every rank beside 129 GB of experts, more than a 186 GB GPU holds.
     four_rank_ep = (
         mapping.world_size == 4
         and mapping.tp_size == 4
@@ -90,16 +93,24 @@ def route(
         and mapping.moe_ep_size == 4
         and mapping.moe_tp_size == 1
     )
-    ultra = (
-        compute_capability == (10, 7)
-        and shape == (8192, 256, 64, 8, 128, 64, 2, 128, 512, 22, 5120, 2048, 10240)
+    eight_rank_ep = (
+        mapping.world_size == 8
+        and mapping.tp_size == 8
+        and mapping.pp_size == 1
+        and mapping.moe_ep_size == 8
+        and mapping.moe_tp_size == 1
+    )
+    ultra_shape = (
+        shape == (8192, 256, 64, 8, 128, 64, 2, 128, 512, 22, 5120, 2048, 10240)
         and kinds == _ULTRA_BLOCK_KINDS
-        and quant == ("MIXED_PRECISION", 8)
         # The targets implement no draft path (the checkpoint's MTP module is not
         # loaded), so claiming such a deployment would fail in the model instead
         # of falling back.
         and spec_config is None
     )
+    ultra = ultra_shape and compute_capability == (10, 7) and quant == ("MIXED_PRECISION", 8)
+    # The BF16 release declares no quantization at all.
+    ultra_bf16 = ultra_shape and compute_capability == (10, 0) and quant == (None, None)
 
     # Nemotron-3 Ultra 550B-A55B NVFP4 on 4 sm_107 GPUs, tep4.
     if ultra and four_rank_ep and not mapping.enable_attention_dp:
@@ -121,6 +132,16 @@ def route(
 
         return ModelingV2Nemotron3UltraNvfp4Sm107Dep4
 
+    # Nemotron-3 Ultra 550B-A55B BF16 on 8 sm_100 GPUs, tep8.
+    if ultra_bf16 and eight_rank_ep and not mapping.enable_attention_dp:
+        # fmt: off
+        # isort: off
+        from .nemotron3_ultra_bf16__sm_100__tep8.modeling import ModelingV2Nemotron3UltraBf16Sm100Tep8
+        # isort: on
+        # fmt: on
+
+        return ModelingV2Nemotron3UltraBf16Sm100Tep8
+
     raise NoTarget(
         f"compute capability {compute_capability}, config shape {shape}, "
         f"block kinds {sorted(kinds)}, quantization {quant}, "
@@ -128,7 +149,9 @@ def route(
         f"moe_ep={mapping.moe_ep_size} moe_tp={mapping.moe_tp_size} "
         f"attention_dp={mapping.enable_attention_dp}, speculative decoding "
         f"{type(spec_config).__name__ if spec_config is not None else 'off'}; "
-        "the nemotron_h targets are Nemotron-3 Ultra 550B-A55B NVFP4 (MIXED_PRECISION, "
-        "FP8 KV) on sm_107, 4 ranks with expert-parallel MoE, either tep4 (tensor-parallel "
-        "attention and mamba) or dep4 (attention data parallel), without speculative decoding"
+        "the nemotron_h targets are Nemotron-3 Ultra 550B-A55B without speculative "
+        "decoding: NVFP4 (MIXED_PRECISION, FP8 KV) on sm_107, 4 ranks with expert-parallel "
+        "MoE, either tep4 (tensor-parallel attention and mamba) or dep4 (attention data "
+        "parallel); and BF16 (no quantization) on sm_100, 8 ranks with expert-parallel MoE "
+        "and tensor-parallel attention and mamba (tep8)"
     )

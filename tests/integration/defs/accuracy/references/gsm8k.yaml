@@ -483,6 +483,9 @@ nvidia/Nemotron-Ultra-V3:
     kv_cache_quant_algo: FP8
     spec_dec_algo: MTP
     accuracy: 94.655
+  # The BF16 release (no quantization): the built-in implementation, 8 ranks (TP8/EP8), the
+  # modeling_v2 BF16 gate's own configuration.
+  - accuracy: 94.769
 nvidia/Nemotron-3-Nano:
   - accuracy: 69.37
   - quant_algo: FP8

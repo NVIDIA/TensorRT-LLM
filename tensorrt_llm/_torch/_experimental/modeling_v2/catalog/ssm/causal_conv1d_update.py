@@ -41,6 +41,13 @@ ULTRA_DEP4_DIM = 18432
 ULTRA_DEP4_PROJ_WIDTH = 35072
 ULTRA_DEP4_XBC_OFFSET = 16384
 
+#: At tep8 (the BF16 checkpoint over 8 ranks) a rank runs an eighth of the mixer: xBC =
+#: x 2048 | B 128 | C 128 channels of the in_proj row z 2048 | xBC 2304 | dt 32 (row
+#: stride 4384), one layer's pool view `[35, 2304, 3]`, strides `(48 * 2304 * 3, 3, 1)`.
+ULTRA_TEP8_DIM = 2304
+ULTRA_TEP8_PROJ_WIDTH = 4384
+ULTRA_TEP8_XBC_OFFSET = 2048
+
 
 def _pinned(batch: int) -> tuple[int, ...]:
     """`batch` distinct slots of qwen4_exp's engine pool, slot 0 and the last pinned in."""
@@ -78,6 +85,13 @@ _ULTRA_DEP4 = dict(
     proj_width=ULTRA_DEP4_PROJ_WIDTH,
     proj_offset=ULTRA_DEP4_XBC_OFFSET,
 )
+#: ... and at tep8 geometry.
+_ULTRA_TEP8 = dict(
+    _ULTRA,
+    dim=ULTRA_TEP8_DIM,
+    proj_width=ULTRA_TEP8_PROJ_WIDTH,
+    proj_offset=ULTRA_TEP8_XBC_OFFSET,
+)
 
 
 class CausalConv1dUpdate(OpWrapper):
@@ -101,7 +115,7 @@ class CausalConv1dUpdate(OpWrapper):
     writes through it). `conv_state` is advanced in place and not returned.
     """
 
-    ARCHS = frozenset({Arch.SM_103, Arch.SM_107})
+    ARCHS = frozenset({Arch.SM_100, Arch.SM_103, Arch.SM_107})
 
     # spec keys: dim, width (4), state_len (3), seqlen (1), batch, pool_slots,
     # pool_layers/pool_layer (the pool is layer `pool_layer`'s view of a
@@ -177,6 +191,28 @@ class CausalConv1dUpdate(OpWrapper):
                 why="Mamba2 dep4 graph-padded batch: 3 padding rows share one dummy slot",
                 spec=dict(
                     _ULTRA_DEP4,
+                    batch=8,
+                    slots=(0, 9, 23, 5, 16) + (ULTRA_TP4_SLOTS - 1,) * 3,
+                    padding_rows=3,
+                ),
+            ),
+        )
+        + tuple(
+            Cell(
+                why=f"Mamba2 tep8 decode batch {batch}: xBC slice of the projection, engine pool",
+                spec=dict(_ULTRA_TEP8, batch=batch, slots=_ultra_pinned(batch)),
+            )
+            for batch in (1, 2, 8, 17, 32)
+        )
+        + (
+            Cell(
+                why="Mamba2 tep8 mixed batch: decode rows below 37 prefill rows",
+                spec=dict(_ULTRA_TEP8, batch=8, rows_ahead=37, slots=_ultra_pinned(8)),
+            ),
+            Cell(
+                why="Mamba2 tep8 graph-padded batch: 3 padding rows share one dummy slot",
+                spec=dict(
+                    _ULTRA_TEP8,
                     batch=8,
                     slots=(0, 9, 23, 5, 16) + (ULTRA_TP4_SLOTS - 1,) * 3,
                     padding_rows=3,

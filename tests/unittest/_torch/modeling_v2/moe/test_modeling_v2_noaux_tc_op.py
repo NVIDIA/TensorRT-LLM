@@ -37,6 +37,9 @@ assert torch.cuda.is_available(), "noaux_tc_op requires a CUDA device"
 #: The checkpoint the ("checkpoint", layer) cells read their bias from, under
 #: LLM_MODELS_ROOT. Missing, it fails loudly rather than skipping a cell.
 ULTRA_CHECKPOINT = "NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4"
+#: The BF16 release carries the same tensor names with unquantized router biases.
+ULTRA_BF16_CHECKPOINT = "NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16"
+_RELEASES = {"nvfp4": ULTRA_CHECKPOINT, "bf16": ULTRA_BF16_CHECKPOINT}
 
 #: How far the kernel's weights may sit from `reference`'s, per output dtype, in
 #: `_validating.ULP` units against each row's largest weight.
@@ -64,9 +67,9 @@ ULTRA_CELLS = [c for c in op.CELLS if c.spec["n_group"] == 1]
 
 
 @lru_cache(maxsize=None)
-def _checkpoint_bias(layer: int) -> torch.Tensor:
+def _checkpoint_bias(layer: int, release: str = "nvfp4") -> torch.Tensor:
     """One MoE layer's `gate.e_score_correction_bias`, read alone from its shard."""
-    root = get_checkpoint(ULTRA_CHECKPOINT)
+    root = get_checkpoint(_RELEASES[release])
     key = f"backbone.layers.{layer}.mixer.gate.e_score_correction_bias"
     with open(os.path.join(root, "model.safetensors.index.json")) as f:
         shard = json.load(f)["weight_map"][key]

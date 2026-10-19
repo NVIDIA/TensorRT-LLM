@@ -353,6 +353,13 @@ _ULTRA_DEP4_TARGET = (
 )
 _TEP4 = dict(world_size=4, tp_size=4, moe_ep_size=4, moe_tp_size=1, enable_attention_dp=False)
 
+_SM100 = (10, 0)
+_ULTRA_BF16_TARGET = (
+    "models.nemotron_h.nemotron3_ultra_bf16__sm_100__tep8.modeling."
+    "ModelingV2Nemotron3UltraBf16Sm100Tep8"
+)
+_TEP8 = dict(world_size=8, tp_size=8, moe_ep_size=8, moe_tp_size=1, enable_attention_dp=False)
+
 
 def _ultra_config(**overrides):
     """The shape Nemotron-3 Ultra 550B-A55B NVFP4's own config.json declares."""
@@ -385,6 +392,11 @@ def _ultra_config(**overrides):
 @pytest.fixture
 def _on_sm107(monkeypatch):
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **k: _SM107)
+
+
+@pytest.fixture
+def _on_sm100(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **k: _SM100)
 
 
 @pytest.mark.parametrize("mode", ["auto", "require"])
@@ -439,4 +451,83 @@ def test_ultra_on_sm103_does_not_match():
 
 def test_ultra_with_speculative_decoding_does_not_match(_on_sm107):
     config = _model_config(_ultra_config(), spec_config=_NGRAM, **_TEP4)
+    assert modeling_v2_resolve(config, _llm_args("auto")) is None
+
+
+# --- nemotron_h, BF16 on sm_100 -----------------------------------------------
+
+
+def _ultra_bf16_config(**overrides):
+    """The shape Nemotron-3 Ultra 550B-A55B BF16's own config.json declares: the
+    NVFP4 release's, with no quantization_config at all."""
+    fields = dict(quantization_config=None)
+    fields.update(overrides)
+    return _ultra_config(**fields)
+
+
+@pytest.mark.parametrize("mode", ["auto", "require"])
+def test_ultra_bf16_tep8_matches(mode, _on_sm100):
+    config = _model_config(_ultra_bf16_config(), **_TEP8)
+    assert _qualified(modeling_v2_resolve(config, _llm_args(mode))) == _ULTRA_BF16_TARGET
+
+
+def test_ultra_bf16_depth_is_not_part_of_the_identity(_on_sm100):
+    config = _model_config(
+        _ultra_bf16_config(layers_block_type=["mamba", "moe", "attention"]), **_TEP8
+    )
+    assert _qualified(modeling_v2_resolve(config, _llm_args("require"))) == _ULTRA_BF16_TARGET
+
+
+@pytest.mark.parametrize(
+    "config_kwargs, mapping_kwargs, missed",
+    [
+        # the NVFP4 release of the same model: sm_100 has no NVFP4 target
+        (
+            dict(
+                quantization_config=dict(
+                    quant_algo="MIXED_PRECISION",
+                    kv_cache_scheme=dict(dynamic=False, num_bits=8, type="float"),
+                )
+            ),
+            {},
+            r"quantization \('MIXED_PRECISION', 8\)",
+        ),
+        # the right checkpoint on 4 ranks: 1.1 TB of weights do not fit
+        (dict(), _TEP4, "world_size=4"),
+        # the right checkpoint with attention data parallel: the replicated non-expert
+        # weights would not fit beside the experts
+        (dict(), dict(_TEP8, enable_attention_dp=True), "attention_dp=True"),
+        # the experts tensor-parallel instead of expert-parallel
+        (dict(), dict(_TEP8, moe_ep_size=1, moe_tp_size=8), "moe_ep=1"),
+        # Nemotron-3 Super's geometry
+        (dict(hidden_size=4096), {}, r"config shape \(4096,"),
+        # a dense-MLP block the target does not implement
+        (dict(layers_block_type=["mamba", "mlp", "attention"]), {}, "block kinds"),
+    ],
+)
+def test_ultra_bf16_near_misses_do_not_match(config_kwargs, mapping_kwargs, missed, _on_sm100):
+    config = _model_config(_ultra_bf16_config(**config_kwargs), **(mapping_kwargs or _TEP8))
+    assert modeling_v2_resolve(config, _llm_args("auto")) is None
+
+    with pytest.raises(ValueError, match=missed):
+        modeling_v2_resolve(config, _llm_args("require"))
+
+
+@pytest.mark.parametrize("capability, text", [((10, 7), r"\(10, 7\)"), ((10, 3), r"\(10, 3\)")])
+def test_ultra_bf16_on_another_architecture_does_not_match(capability, text, monkeypatch):
+    """Certification is per architecture: the BF16 target is gated on sm_100 only."""
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **k: capability)
+    config = _model_config(_ultra_bf16_config(), **_TEP8)
+    with pytest.raises(ValueError, match=rf"compute capability {text}"):
+        modeling_v2_resolve(config, _llm_args("require"))
+
+
+def test_ultra_bf16_with_speculative_decoding_does_not_match(_on_sm100):
+    config = _model_config(_ultra_bf16_config(), spec_config=_NGRAM, **_TEP8)
+    assert modeling_v2_resolve(config, _llm_args("auto")) is None
+
+
+def test_ultra_nvfp4_does_not_route_on_sm100(_on_sm100):
+    """The sm_107 targets stay sm_107's: on an sm_100 device the NVFP4 checkpoint falls back."""
+    config = _model_config(_ultra_config(), **_TEP4)
     assert modeling_v2_resolve(config, _llm_args("auto")) is None

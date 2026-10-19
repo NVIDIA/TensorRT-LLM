@@ -1,7 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """Fused mixture-of-experts layer: expert permutation + grouped FC1/FC2 GEMMs
-with a gated activation between them + routing-weighted combine, in one call.
+with an activation between them (gated SwiGLU, or element-wise Relu2) +
+routing-weighted combine, in one call.
 
 Everything a target author needs is below and all of it is checked: what the
 op computes (`reference`), what it refuses (`is_valid`), how close the two
@@ -17,10 +18,45 @@ import torch
 import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtllm.*
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 
-#: The one geometry this entry is certified at: the R1-0528 MTP layer's MoE,
-#: which is the only thing that calls this op. Repeated into every cell so a
-#: cell prints as a complete configuration rather than a delta.
-_R1 = dict(hidden=7168, inter=2048, experts_local=64, ep_size=4, topk=8)
+#: `activation_type` for SwiGLU in *this* op's enum (`ActivationType` in
+#: `tensorrt_llm/_torch/utils.py`, mirroring the CUTLASS enum), which is not the
+#: trtllm-gen runner's enum of the same name. FC1 is the `[up; gate]` pair,
+#: 2 * I rows per expert.
+ACTIVATION_SWIGLU = 5
+
+#: `activation_type` for Relu2, `relu(x) ** 2`. Element-wise, so FC1 is the up
+#: projection alone: I rows per expert.
+ACTIVATION_RELU2 = 8
+
+#: Two geometries are certified, one per caller, each repeated into every cell
+#: so a cell prints as a complete configuration rather than a delta.
+#:
+#: The R1-0528 MTP layer's MoE (deepseek): bf16, SwiGLU, 64 of 256 experts per
+#: rank over 4 ranks, top-8.
+_R1 = dict(
+    hidden=7168,
+    inter=2048,
+    experts_local=64,
+    ep_size=4,
+    topk=8,
+    activation_type=ACTIVATION_SWIGLU,
+)
+
+#: Nemotron-3 Ultra's routed experts (bf16 checkpoint), in the 2048-wide latent
+#: space, as its tep8 target issues them: every rank routes the same tokens over
+#: all 512 experts and answers for its own 64-wide window, so the windows'
+#: outputs sum across the 8 ranks. FC1 is the up projection alone (5120 rows:
+#: Relu2 has no gate half). The slot weights are the router's sigmoid scores of
+#: the top 22, renormalized and scaled to sum to 5.0 (`routing="sigmoid_x5"`).
+_ULTRA = dict(
+    hidden=2048,
+    inter=5120,
+    experts_local=64,
+    ep_size=8,
+    topk=22,
+    activation_type=ACTIVATION_RELU2,
+    routing="sigmoid_x5",
+)
 
 
 class FusedMoe(OpWrapper):
@@ -30,17 +66,19 @@ class FusedMoe(OpWrapper):
     them, and the routing-weighted combine. Routing itself happens before the
     call (`noaux_tc_op`), and the op\'s own `n_group`/`topk_group` stay inert.
 
-    Of this op\'s ~50 parameters the shipped call sets twelve. The rest --
+    Of this op\'s ~50 parameters the shipped calls set a dozen. The rest --
     biases, the quantized paths, LoRA, alltoall, min-latency, the swiglu
     alpha/beta/limit triple -- are left at their defaults and are not
     certified here. `activation_type=5` is Swiglu in *this* op\'s enum, which
-    is not the trtllm-gen runner\'s enum of the same name.
+    is not the trtllm-gen runner\'s enum of the same name; `activation_type=8`
+    is Relu2, whose FC1 is `[E, I, H]` (the up projection alone) where
+    Swiglu\'s is `[E, 2I, H]`.
     """
 
     #: What CI drives. The geometry is fixed -- one op, one caller, one shape
     #: family -- so the cells vary what the caller actually varies: how many
     #: tokens arrive in a chunk, and which expert window this rank owns.
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = frozenset({Arch.SM_100, Arch.SM_103})
 
     CELLS: tuple[Cell, ...] = (
         Cell(
@@ -65,6 +103,45 @@ class FusedMoe(OpWrapper):
             why="token count not a multiple of anything: the tail path",
             spec=dict(**_R1, num_tokens=37, ep_rank=1),
         ),
+        Cell(
+            why="Ultra tep8 decode, 1 row, rank 0: relu2 FC1 of 5120 rows, top-22 of 512, "
+            "a 64-wide window",
+            spec=dict(**_ULTRA, num_tokens=1, ep_rank=0),
+        ),
+        Cell(
+            why="Ultra decode, 1 row, rank 7: the last window, ids 448-511 -- the top of "
+            "the expert range",
+            spec=dict(**_ULTRA, num_tokens=1, ep_rank=7),
+        ),
+        Cell(
+            why="Ultra at 8 rows, rank 3: a mid window at a small row count",
+            spec=dict(**_ULTRA, num_tokens=8, ep_rank=3),
+        ),
+        Cell(
+            why="Ultra decode ceiling, 32 rows, rank 0",
+            spec=dict(**_ULTRA, num_tokens=32, ep_rank=0),
+        ),
+        Cell(
+            why="Ultra decode ceiling, 32 rows, rank 7",
+            spec=dict(**_ULTRA, num_tokens=32, ep_rank=7),
+        ),
+        Cell(
+            why="Ultra prefill chunk, 300 rows, rank 0: a mid-width FC1 token tile",
+            spec=dict(**_ULTRA, num_tokens=300, ep_rank=0),
+        ),
+        Cell(
+            why="Ultra prefill chunk, 300 rows, rank 7",
+            spec=dict(**_ULTRA, num_tokens=300, ep_rank=7),
+        ),
+        Cell(
+            why="Ultra prefill at 8192 rows, rank 0: the engine's default chunk and the "
+            "top of the certified column",
+            spec=dict(**_ULTRA, num_tokens=8192, ep_rank=0),
+        ),
+        Cell(
+            why="Ultra prefill at 8192 rows, rank 7",
+            spec=dict(**_ULTRA, num_tokens=8192, ep_rank=7),
+        ),
     )
 
     note = """
@@ -75,9 +152,10 @@ class FusedMoe(OpWrapper):
 
     Repeated ids in one token\'s top-k are summed, not deduplicated.
 
-    The autotuner\'s hot path is exercised by test_r1_mtp_autotuned_tactics
-    rather than by a cell: what a tuning pass leaves in its cache is the
-    tuner\'s behaviour, and `misc/test_autotuner.py` owns it.
+    The autotuner\'s hot path is exercised by test_autotuned_tactics, and the
+    whole tactic space by test_tactic_space, each at both geometries, rather
+    than by a cell: what a tuning pass leaves in its cache is the tuner\'s
+    behaviour, and `misc/test_autotuner.py` owns it.
     """
 
     def __call__(
@@ -236,6 +314,7 @@ class FusedMoe(OpWrapper):
         *unused_args: object,
         ep_size: int = 1,
         ep_rank: int = 0,
+        activation_type: int = ACTIVATION_SWIGLU,
         **unused_kwargs: object,
     ) -> torch.Tensor:
         """What the op computes, in plain torch, fp32 through both GEMMs.
@@ -245,11 +324,14 @@ class FusedMoe(OpWrapper):
         reference that accepted them would have to ignore them, which reads
         as coverage it does not have.
 
-        `fc1_expert_weights[e]` is `[up | gate]` stacked on dim 0. Ids are
-        global; this rank owns `[ep_rank * E_local, (ep_rank + 1) * E_local)`
-        and everything outside contributes nothing, which is how expert
-        parallelism tiles the routing space.
+        For SwiGLU `fc1_expert_weights[e]` is `[up | gate]` stacked on dim 0; for
+        Relu2 it is the up projection alone. Ids are global; this rank owns
+        `[ep_rank * E_local, (ep_rank + 1) * E_local)` and everything outside
+        contributes nothing, which is how expert parallelism tiles the routing
+        space.
         """
+        if activation_type not in (ACTIVATION_SWIGLU, ACTIVATION_RELU2):
+            raise NotImplementedError(f"activation_type {activation_type} is not certified")
         num_tokens, hidden = input.shape
         num_local = fc1_expert_weights.shape[0]
         out = torch.zeros(num_tokens, hidden, dtype=torch.float32, device=input.device)
@@ -259,12 +341,16 @@ class FusedMoe(OpWrapper):
             tok, slot = mask.nonzero(as_tuple=True)
             if tok.numel() == 0:
                 continue
-            w_up, w_gate = fc1_expert_weights[local_e].float().chunk(2, dim=0)
-            h_up = xf[tok] @ w_up.t()
-            h_gate = xf[tok] @ w_gate.t()
-            gated = h_gate * torch.sigmoid(h_gate)
+            if activation_type == ACTIVATION_RELU2:
+                relu = torch.relu(xf[tok] @ fc1_expert_weights[local_e].float().t())
+                act = relu * relu
+            else:
+                w_up, w_gate = fc1_expert_weights[local_e].float().chunk(2, dim=0)
+                h_up = xf[tok] @ w_up.t()
+                h_gate = xf[tok] @ w_gate.t()
+                act = h_gate * torch.sigmoid(h_gate) * h_up
             # the kernel materializes the FC1 activation in the input dtype
-            inter = (gated * h_up).to(input.dtype).float()
+            inter = act.to(input.dtype).float()
             y = inter @ fc2_expert_weights[local_e].float().t()
             weight = (
                 torch.ones(tok.numel(), device=input.device)

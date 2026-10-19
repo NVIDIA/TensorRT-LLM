@@ -16,6 +16,10 @@ from tensorrt_llm._torch.modules.mamba import selective_state_update as _ssu
 NHEADS, HEADDIM, NGROUPS, DSTATE = 64, 64, 2, 128
 #: At dep4 (attention DP) every rank runs the whole mixer: 256 heads, 8 groups.
 DEP4_NHEADS, DEP4_NGROUPS = 256, 8
+#: At tep8 (the BF16 checkpoint over 8 ranks) a rank runs an eighth of the mixer: 32
+#: heads over one group. Its SSM state is fp32 (config `mamba_ssm_cache_dtype`): a layer's
+#: pool view is `[35, 32, 64, 128]`, slot stride 48 * 32 * 64 * 128.
+TEP8_NHEADS, TEP8_NGROUPS = 32, 1
 #: The engine's SSM pool for this checkpoint (V2 hybrid manager, max_batch_size 32): 35 slots,
 #: every slot holding all 48 Mamba layers' states side by side, so a layer's view
 #: `[35, 64, 64, 128]` has slot stride 48 * 64 * 64 * 128 and dense inner dims. At dep4
@@ -28,6 +32,7 @@ ENGINE_SLOT_LAYERS = 48
 DEEP_SLOTS = 90
 
 _DEP4 = dict(nheads=DEP4_NHEADS, ngroups=DEP4_NGROUPS)
+_TEP8 = dict(nheads=TEP8_NHEADS, ngroups=TEP8_NGROUPS, pool_dtype=torch.float32)
 #: Seven scattered engine slots, both ends and slots past 2^31 elements included.
 _DEP4_SLOTS_7 = (ENGINE_SLOTS - 1, 0, 22, 5, 30, 13, 27)
 
@@ -51,7 +56,7 @@ class SelectiveStateUpdate(OpWrapper):
     Writes `out` (required, `x.shape`) and the named pool slots; returns `out`.
     """
 
-    ARCHS = frozenset({Arch.SM_107})
+    ARCHS = frozenset({Arch.SM_100, Arch.SM_107})
 
     # spec keys: batch, pool_dtype (default fp16), pool_slots / pool_layers (the pool
     # as `[slots, layers, H, P, N]` viewed at one layer; default 40 x 3), slots
@@ -157,6 +162,34 @@ class SelectiveStateUpdate(OpWrapper):
         Cell(
             why="dep4 pad_slot_id -1 rows: pool untouched, out still written",
             spec=dict(_DEP4, batch=7, pads=(1, 4)),
+        ),
+        Cell(
+            why="tep8 decode batch 1 into the engine fp32 pool's last slot",
+            spec=dict(
+                _TEP8,
+                batch=1,
+                pool_slots=ENGINE_SLOTS,
+                pool_layers=ENGINE_SLOT_LAYERS,
+                slots=(ENGINE_SLOTS - 1,),
+            ),
+        ),
+        Cell(
+            why="tep8 decode batch 7, scattered engine slots, fp32 pool",
+            spec=dict(
+                _TEP8,
+                batch=7,
+                pool_slots=ENGINE_SLOTS,
+                pool_layers=ENGINE_SLOT_LAYERS,
+                slots=_DEP4_SLOTS_7,
+            ),
+        ),
+        Cell(
+            why="tep8 decode batch 32 (the CUDA-graph ceiling), engine fp32 pool",
+            spec=dict(_TEP8, batch=32, pool_slots=ENGINE_SLOTS, pool_layers=ENGINE_SLOT_LAYERS),
+        ),
+        Cell(
+            why="tep8 pad_slot_id -1 rows: pool untouched, out still written",
+            spec=dict(_TEP8, batch=7, pads=(1, 4)),
         ),
     )
 

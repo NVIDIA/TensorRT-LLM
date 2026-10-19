@@ -45,6 +45,13 @@ ULTRA_DEP4_DIM = 18432
 ULTRA_DEP4_PROJ_WIDTH = 35072
 ULTRA_DEP4_XBC_OFFSET = 16384
 
+#: At tep8 (the BF16 checkpoint over 8 ranks) a rank runs an eighth of the mixer: xBC =
+#: x 2048 | B 128 | C 128 channels of the in_proj row z 2048 | xBC 2304 | dt 32 (token
+#: stride 4384), one layer's pool view `[35, 2304, 3]` with strides `(48 * 2304 * 3, 3, 1)`.
+ULTRA_TEP8_DIM = 2304
+ULTRA_TEP8_PROJ_WIDTH = 4384
+ULTRA_TEP8_XBC_OFFSET = 2048
+
 
 def _engine_batch_slots() -> tuple[int, ...]:
     """32 distinct slots over qwen4_exp's whole engine pool, slot 0 and the last included."""
@@ -83,6 +90,13 @@ _ULTRA_DEP4 = dict(
     proj_width=ULTRA_DEP4_PROJ_WIDTH,
     proj_offset=ULTRA_DEP4_XBC_OFFSET,
 )
+#: ... and at tep8 geometry.
+_ULTRA_TEP8 = dict(
+    _ULTRA,
+    dim=ULTRA_TEP8_DIM,
+    proj_width=ULTRA_TEP8_PROJ_WIDTH,
+    proj_offset=ULTRA_TEP8_XBC_OFFSET,
+)
 
 
 class CausalConv1dFwd(OpWrapper):
@@ -111,7 +125,7 @@ class CausalConv1dFwd(OpWrapper):
     required, channel-last, disjoint from `x`). The two agree bitwise.
     """
 
-    ARCHS = frozenset({Arch.SM_103, Arch.SM_107})
+    ARCHS = frozenset({Arch.SM_100, Arch.SM_103, Arch.SM_107})
 
     # spec keys: dim, width, dtype, lengths (varlen) or batch3d=(batch, seqlen),
     # pool_slots (None -> no conv_states), pool_layers/pool_layer (the pool is
@@ -243,6 +257,43 @@ class CausalConv1dFwd(OpWrapper):
                 spec=dict(
                     _ULTRA_DEP4, lengths=(1, 2, 3, 5), slots=(1, 2, 3, 4), initial=(True,) * 4
                 ),
+            ),
+            Cell(
+                why="Mamba2 tep8 prefill: 4 sequences, mixed carry, scattered engine slots",
+                spec=dict(
+                    _ULTRA_TEP8,
+                    lengths=(37, 1, 128, 300),
+                    slots=(ULTRA_TP4_SLOTS - 1, 0, 17, 5),
+                    initial=(True, False, True, False),
+                ),
+            ),
+            Cell(
+                why="Mamba2 tep8: 32 sequences (batch ceiling) over the 35-slot pool",
+                spec=dict(
+                    _ULTRA_TEP8,
+                    lengths=tuple(1 + (i * 37) % 255 for i in range(32)),
+                    slots=_ultra_batch_slots(),
+                    initial=tuple(i % 3 != 0 for i in range(32)),
+                ),
+            ),
+            Cell(
+                why="Mamba2 tep8 at the 8192-token step ceiling, 3 sequences",
+                spec=dict(
+                    _ULTRA_TEP8,
+                    lengths=(4096, 4095, 1),
+                    slots=(3, 30, 0),
+                    initial=(True, False, True),
+                ),
+            ),
+            Cell(
+                why="Mamba2 tep8 chunked-prefill continuations shorter than the window",
+                spec=dict(
+                    _ULTRA_TEP8, lengths=(1, 2, 3, 5), slots=(1, 2, 3, 4), initial=(True,) * 4
+                ),
+            ),
+            Cell(
+                why="Mamba2 tep8 layout, pad_slot_id -1: the channel-last kernel skips it",
+                spec=dict(_ULTRA_TEP8, lengths=(16, 8, 16), slots=(0, -1, 2), initial=(True,) * 3),
             ),
             Cell(
                 why="pad_slot_id -1 (the engine's sentinel): sequence and slot skipped",

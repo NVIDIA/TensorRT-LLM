@@ -18,7 +18,7 @@ class CublasMm(OpWrapper):
     is -- the targets pass `weight.t()` and no transpose kernel runs.
     """
 
-    ARCHS = frozenset({Arch.SM_103, Arch.SM_107})
+    ARCHS = frozenset({Arch.SM_100, Arch.SM_103, Arch.SM_107})
 
     # The targets use this for every bf16 dense projection, so the first cells
     # are the three argument shapes that differ in kind rather than in size: fused bias
@@ -72,6 +72,29 @@ class CublasMm(OpWrapper):
             )
             for m, tail in (
                 (1, ": bf16-exact weight, fp32 logits for 512 experts"),
+                (32, ", the decode CUDA-graph ceiling"),
+                (8192, ", a max_num_tokens prefill step"),
+            )
+        ),
+        # nemotron_h's Ultra BF16 at tep8: every dense projection a rank runs that is
+        # not already a cell above -- the mamba in_proj (z | x | B | C | dt rows of one
+        # rank), the 8-q-head qkv and o_proj, and the two halves of the shared expert --
+        # at the same three row counts. fc1_latent, fc2_latent / the mamba out_proj and
+        # the router are the cells above: their shapes do not depend on the rank count.
+        *(
+            Cell(
+                why=f"nemotron_h BF16 tep8 {what}, T={m}{tail}",
+                spec=dict(m=m, k=k, n=n, dtype=torch.bfloat16, bias=False, out_dtype=None),
+            )
+            for what, k, n, first in (
+                ("mamba in_proj", 8192, 4384, ": hidden 8192 -> 2 x 2048 + 2 x 128 + 32 = 4384"),
+                ("qkv", 8192, 1280, ": hidden 8192 -> (8 + 1 + 1) x 128 = 1280"),
+                ("o_proj", 1024, 8192, ": 8 x 128 = 1024 -> hidden 8192, a row-parallel partial"),
+                ("shared up", 8192, 1280, ": hidden 8192 -> 10240 / 8 = 1280"),
+                ("shared down", 1280, 8192, ": 1280 -> hidden 8192, a row-parallel partial"),
+            )
+            for m, tail in (
+                (1, first),
                 (32, ", the decode CUDA-graph ceiling"),
                 (8192, ", a max_num_tokens prefill step"),
             )

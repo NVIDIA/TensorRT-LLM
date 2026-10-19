@@ -22,6 +22,10 @@ PROJ_WIDTH = 8768
 #: z 16384 | xBC 18432 | dt 256.
 DEP4_WIDTH = 16384
 DEP4_PROJ_WIDTH = 35072
+#: At tep8 (the BF16 checkpoint over 8 ranks) a rank holds exactly one group: 16384 / 8 =
+#: 2048 channels, z the first 2048 columns of the in_proj row z 2048 | xBC 2304 | dt 32.
+TEP8_WIDTH = 2048
+TEP8_PROJ_WIDTH = 4384
 #: `layer_norm_epsilon` of the checkpoint.
 EPS = 1e-5
 
@@ -29,6 +33,8 @@ EPS = 1e-5
 _CALL_SITE = dict(width=WIDTH, group_size=GROUP_SIZE, eps=EPS, z="proj", proj_width=PROJ_WIDTH)
 #: The same call at dep4 geometry.
 _DEP4_CALL_SITE = dict(_CALL_SITE, width=DEP4_WIDTH, proj_width=DEP4_PROJ_WIDTH)
+#: ... and at tep8 geometry.
+_TEP8_CALL_SITE = dict(_CALL_SITE, width=TEP8_WIDTH, proj_width=TEP8_PROJ_WIDTH)
 
 
 class RmsNormGatedGrouped(OpWrapper):
@@ -51,7 +57,7 @@ class RmsNormGatedGrouped(OpWrapper):
     `x.dtype`. `x` and `z` are not mutated.
     """
 
-    ARCHS = frozenset({Arch.SM_107})
+    ARCHS = frozenset({Arch.SM_100, Arch.SM_107})
 
     # spec keys: tokens, width, group_size, eps, z ("proj": the first `width`
     # columns of a token-major `[tokens, proj_width]` buffer | "contiguous"),
@@ -90,6 +96,17 @@ class RmsNormGatedGrouped(OpWrapper):
                 tokens=32,
                 group_scales=(1.0, 100.0, 0.01, 3.0, 30.0, 0.3, 10.0, 0.1),
             ),
+        ),
+        Cell(
+            why="tep8 decode, 1 token: 2048 wide, one group, z the projection's first columns",
+            spec=dict(_TEP8_CALL_SITE, tokens=1),
+        ),
+        Cell(why="tep8 decode batch 32", spec=dict(_TEP8_CALL_SITE, tokens=32)),
+        Cell(why="tep8 prefill 4101 tokens", spec=dict(_TEP8_CALL_SITE, tokens=4101)),
+        Cell(why="tep8 prefill at the 8192-token ceiling", spec=dict(_TEP8_CALL_SITE, tokens=8192)),
+        Cell(
+            why="tep8: rows whose mean square is near eps: eps inside the root",
+            spec=dict(_TEP8_CALL_SITE, tokens=32, x_scale=1e-3),
         ),
     )
 

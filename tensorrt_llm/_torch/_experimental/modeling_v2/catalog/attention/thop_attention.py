@@ -119,6 +119,18 @@ _ULTRA_DEP4_FP8_64_2_128 = dict(
     pool_layout="ultra_hybrid60_dep4",
 )
 
+#: Nemotron-3 Ultra BF16's attention layer at tep8, per rank: the 64 q / 2 kv heads split
+#: eight ways are 8 q heads over one kv head (each kv head replicated across four ranks),
+#: head_size 128, no positional encoding. The checkpoint declares no kv-cache quantization,
+#: so the pool is bf16 (quant_mode 0) and there are no scales to pass. Everything else is the
+#: tep4 configuration.
+_ULTRA_BF16_8_1_128 = dict(
+    _ULTRA_FP8_16_1_128,
+    num_heads=8,
+    num_kv_heads=1,
+    quant_mode=0,
+)
+
 #: The 32 histories of the batch-32 decode cells: every one past its first page,
 #: from 33 (one row into the second page) up to 512, with page fills that differ.
 _ULTRA_DECODE_HISTORIES = tuple(33 + (i * 97) % 480 for i in range(32))
@@ -136,14 +148,15 @@ class ThopAttention(OpWrapper):
     a two-pool hybrid mapping), and its vision tower with no KV cache at all --
     and nemotron_h's Ultra on the standard path with no positional encoding,
     16 q heads over one kv head at d128 at tep4 and the unsharded 64 over 2 at
-    dep4, over an fp8 pool that its hybrid manager places on pool 1.
+    dep4, over an fp8 pool that its hybrid manager places on pool 1, and 8 over
+    one at tep8 for the BF16 checkpoint, over a bf16 pool.
 
     Writes rows `[:num_tokens]` of `output` and returns `output` -- the same
     buffer, mutated and handed back so a call site can show what it touched
     without allocating.
     """
 
-    ARCHS = frozenset({Arch.SM_103, Arch.SM_107})
+    ARCHS = frozenset({Arch.SM_100, Arch.SM_103, Arch.SM_107})
 
     # gpt-oss alternates its two window classes inside one engine, so both of
     # its cells are live every step; deepseek runs context and generation
@@ -576,6 +589,89 @@ class ThopAttention(OpWrapper):
                 cached=(0, 0, 33, 64, 65, 200, 511, 700),
                 new=(1, 1031, 1, 1, 1, 1, 1, 1),
                 num_contexts=2,
+                predicted_tokens_per_seq=1,
+            ),
+        ),
+        Cell(
+            why="nemotron_h ultra BF16 tep8 packed prefill: GQA 8q/1kv d128, bf16 pool, no "
+            "rope; fresh contexts of 1, 1100, 77 and 300 rows",
+            spec=dict(
+                _ULTRA_BF16_8_1_128,
+                cached=(0, 0, 0, 0),
+                new=(1, 1100, 77, 300),
+                num_contexts=4,
+                predicted_tokens_per_seq=1,
+            ),
+        ),
+        Cell(
+            why="nemotron_h ultra BF16 tep8 decode, batch 1: one row over an 1100-token "
+            "history of 35 pages",
+            spec=dict(
+                _ULTRA_BF16_8_1_128,
+                cached=(1100,),
+                new=(1,),
+                num_contexts=0,
+                predicted_tokens_per_seq=1,
+            ),
+        ),
+        Cell(
+            why="nemotron_h ultra BF16 tep8 decode, batch 32, the target's CUDA-graph "
+            "ceiling: histories 33..512, every one past its first page",
+            spec=dict(
+                _ULTRA_BF16_8_1_128,
+                cached=_ULTRA_DECODE_HISTORIES,
+                new=(1,) * 32,
+                num_contexts=0,
+                predicted_tokens_per_seq=1,
+            ),
+        ),
+        Cell(
+            why="nemotron_h ultra BF16 tep8 mixed step, packed: fresh 1- and 1031-row "
+            "contexts ahead of six decode rows over histories 33..700",
+            spec=dict(
+                _ULTRA_BF16_8_1_128,
+                cached=(0, 0, 33, 64, 65, 200, 511, 700),
+                new=(1, 1031, 1, 1, 1, 1, 1, 1),
+                num_contexts=2,
+                predicted_tokens_per_seq=1,
+            ),
+        ),
+        Cell(
+            why="nemotron_h ultra BF16 tep8 paged-context prefill (chunked prefill / block "
+            "reuse): 512 rows over a 640-token cached prefix beside a fresh 1-row context",
+            spec=dict(
+                _ULTRA_BF16_8_1_128,
+                use_paged_context_fmha=True,
+                cached=(640, 0),
+                new=(512, 1),
+                num_contexts=2,
+                predicted_tokens_per_seq=1,
+            ),
+        ),
+        Cell(
+            why="nemotron_h ultra BF16 tep8 hybrid pool: row 55 of a real "
+            "MambaHybridCacheManagerV2's 60-row mapping (pool 1, layer-in-pool 11), packed "
+            "mixed step",
+            spec=dict(
+                _ULTRA_BF16_8_1_128,
+                pool_layout="ultra_hybrid60_tep8_bf16",
+                local_layer_idx=55,
+                cached=(0, 0, 100, 37, 300),
+                new=(1, 1100, 1, 1, 1),
+                num_contexts=2,
+                predicted_tokens_per_seq=1,
+            ),
+        ),
+        Cell(
+            why="nemotron_h ultra BF16 tep8 hybrid pool: row 4, the first attention layer "
+            "(pool 1, layer-in-pool 0), decode batch 32",
+            spec=dict(
+                _ULTRA_BF16_8_1_128,
+                pool_layout="ultra_hybrid60_tep8_bf16",
+                local_layer_idx=4,
+                cached=_ULTRA_DECODE_HISTORIES,
+                new=(1,) * 32,
+                num_contexts=0,
                 predicted_tokens_per_seq=1,
             ),
         ),

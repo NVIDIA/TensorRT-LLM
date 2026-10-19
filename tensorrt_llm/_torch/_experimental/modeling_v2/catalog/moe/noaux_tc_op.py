@@ -25,7 +25,7 @@ class NoauxTcOp(OpWrapper):
     of biased score.
     """
 
-    ARCHS = frozenset({Arch.SM_103, Arch.SM_107})
+    ARCHS = frozenset({Arch.SM_100, Arch.SM_103, Arch.SM_107})
 
     # Two routers call this.
     # - deepseek-r1: 256 experts in 8 groups, 4 groups kept, 8 experts per token,
@@ -37,9 +37,10 @@ class NoauxTcOp(OpWrapper):
     # targets produce: one per decode step, the decode CUDA-graph ceiling, and
     # the chunk a prefill is split into.
     #
-    # The ultra checkpoint's biases sit on a 0.125 grid, with one to four levels
-    # per layer. The synthetic ultra cells draw them uniformly over layer 107's
-    # range at full fp32 resolution, so every bit of the bias add counts.
+    # The NVFP4 ultra checkpoint's biases sit on a 0.125 grid, with one to four levels
+    # per layer; the BF16 release's are not quantized (layer 1's span 0.0022 over 23
+    # levels, layer 107's 0.35 over 394). The synthetic ultra cells draw them uniformly
+    # over layer 107's range at full fp32 resolution, so every bit of the bias add counts.
     # Logits are drawn at the scale each layer's gate produces on unit-RMS
     # inputs: std 1.3 at layer 107 and 0.004 at layer 1.
     CELLS: tuple[Cell, ...] = (
@@ -158,6 +159,36 @@ class NoauxTcOp(OpWrapper):
                 logits_dtype=torch.float32,
                 logit_std=1.3,
                 bias=("checkpoint", 107),
+            ),
+        ),
+        Cell(
+            why="layer 1's bias in the BF16 release (25.3119 to 25.3141, 23 levels) at its own "
+            "logit scale: scores crowd 0.5, so near-ties are routine and go to the lower id",
+            spec=dict(
+                tokens=8192,
+                experts=512,
+                n_group=1,
+                topk_group=1,
+                topk=22,
+                scale=5.0,
+                logits_dtype=torch.float32,
+                logit_std=0.004,
+                bias=("checkpoint", 1, "bf16"),
+            ),
+        ),
+        Cell(
+            why="layer 107's bias in the BF16 release (37.83 to 38.18, 394 levels) on the "
+            "decode path, where the fp32 add keeps the score only to 2^-18",
+            spec=dict(
+                tokens=32,
+                experts=512,
+                n_group=1,
+                topk_group=1,
+                topk=22,
+                scale=5.0,
+                logits_dtype=torch.float32,
+                logit_std=1.3,
+                bias=("checkpoint", 107, "bf16"),
             ),
         ),
     )
