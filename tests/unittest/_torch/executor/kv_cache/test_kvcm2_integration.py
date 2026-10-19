@@ -2372,9 +2372,25 @@ def test_live_storage_stats_use_the_manager_api() -> None:
         core.shutdown()
 
 
-def test_iteration_stats_reports_physical_pool_groups_without_window_metadata() -> None:
+@pytest.mark.parametrize(
+    "kv_connector_manager, expected_connector_cached_tokens, expected_load_latencies",
+    [
+        (None, None, None),
+        (
+            SimpleNamespace(capacity_only=False, take_async_load_latencies=lambda: [0.5]),
+            9,
+            [0.5],
+        ),
+    ],
+    ids=["no_connector", "serving_connector"],
+)
+def test_iteration_stats_reports_physical_pool_groups_without_window_metadata(
+    kv_connector_manager, expected_connector_cached_tokens, expected_load_latencies
+) -> None:
     manager = object.__new__(KVCacheManagerV2)
     manager.enable_stats = True
+    manager.is_draft = False
+    manager.kv_connector_manager = kv_connector_manager
     snapshot_delta = SimpleNamespace(
         iter_snapshot_lookups=2,
         iter_snapshot_hits=1,
@@ -2391,7 +2407,9 @@ def test_iteration_stats_reports_physical_pool_groups_without_window_metadata() 
         get_and_reset_iteration_suspend_resume_stats=lambda: (0, 0),
         get_and_reset_iteration_disk_prefetch_blocks=lambda: 7,
         get_and_reset_iteration_cached_tokens_by_level=lambda: [5, 2, 1],
+        get_and_reset_iteration_connector_cached_tokens=lambda: 9,
         get_and_reset_iteration_reused_blocks_by_level=lambda: {},
+        get_and_reset_iteration_connector_reused_blocks=lambda: {},
     )
     manager._stats_life_cycle_metadata = lambda: {3: (1, None, "ssm")}
     manager._storage_pool_groups_by_window = lambda: {}
@@ -2411,6 +2429,8 @@ def test_iteration_stats_reports_physical_pool_groups_without_window_metadata() 
     assert ssm_stats.snapshot_stats.iter_reused_tokens == 32
     assert stats.disk_prefetch_blocks == 7
     assert stats.cached_tokens_by_level == [5, 2, 1]
+    assert stats.connector_cached_tokens == expected_connector_cached_tokens
+    assert stats.connector_load_latencies_s == expected_load_latencies
 
 
 def _make_admission_manager(

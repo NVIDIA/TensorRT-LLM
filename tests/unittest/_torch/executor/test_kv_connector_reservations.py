@@ -400,3 +400,49 @@ def test_invalid_reservation_answer_is_rejected(manager, req, monkeypatch, answe
     with pytest.raises(ValueError):
         manager.reserve_prefix(req, 32)
     assert manager.get_prefix_reservation(req) is None
+
+
+@pytest.fixture
+def clock(manager, monkeypatch):
+    now = SimpleNamespace(value=0.0)
+    monkeypatch.setattr(connector, "time", SimpleNamespace(monotonic=lambda: now.value))
+    return now
+
+
+def test_async_prefix_load_latency_spans_acceptance_to_completion(manager, req, clock):
+    clock.value = 10.0
+    reservation = accept(manager, req)
+    dispatch(manager)
+    clock.value = 12.5
+    manager.worker.finished = [reservation.reservation_id]
+    finish(manager)
+    assert manager.take_async_load_latencies() == [2.5]
+    assert manager.take_async_load_latencies() == []
+
+
+def test_async_query_load_latency_spans_acceptance_to_completion(manager, req, clock):
+    manager.configure_prefix_reservations(False)
+    clock.value = 1.0
+    manager.commit_new_matched_tokens(req, 64, True)
+    clock.value = 1.75
+    manager.worker.legacy_finished = ([], [req.request_id])
+    manager.get_finished()
+    assert manager.take_async_load_latencies() == [0.75]
+
+
+def test_sync_and_released_loads_report_no_latency(manager, req, clock):
+    manager.scheduler.is_async = False
+    reservation = manager.reserve_prefix(req, 32)
+    manager.accept_prefix_load(req, 32, 96, [[1, 2, 3]])
+    manager.build_scheduler_output(ScheduledRequests(), None)
+    dispatch(manager)
+    manager.worker.finished = [reservation.reservation_id]
+    finish(manager)
+    assert manager.take_async_load_latencies() == []
+
+    manager.reset_request_state(req)
+    manager.scheduler.is_async = True
+    accept(manager, req)
+    manager.release_unstarted_prefix_loads(req)
+    assert manager.take_async_load_latencies() == []
+    assert req.request_id not in manager._async_load_start_times
