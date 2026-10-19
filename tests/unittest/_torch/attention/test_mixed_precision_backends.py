@@ -28,13 +28,16 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.runtime import kv_cache_manager_v2 as kv
 
 
-def _attention_reference(query, key, value, width, causal=False):
+def _attention_reference(query, key, value, width):
+    mask = torch.ones((query.shape[1], key.shape[1]), dtype=torch.bool, device=query.device).tril(
+        key.shape[1] - query.shape[1]
+    )
     tensors = [
         tensor.reshape(*tensor.shape[:2], -1, width).transpose(1, 2)
         for tensor in (query, key, value)
     ]
     output = torch.nn.functional.scaled_dot_product_attention(
-        *tensors, is_causal=causal, enable_gqa=True
+        *tensors, attn_mask=mask, enable_gqa=True
     )
     return output.transpose(1, 2).reshape(-1, query.shape[-1])
 
@@ -246,75 +249,68 @@ def test_optimized_two_pool_prefill_and_decode(
         return pool.transpose(2, 3) if kv_layout == "HND" else pool
 
     try:
-        manager.add_dummy_requests(request_ids, [length] * batch, is_gen=False)
-        output = forward(0, length, True)
-        reference = _attention_reference(
-            query[:, :length],
-            key[:, :length].to(high_torch_dtype).to(compute_dtype),
-            value[:, :length].to(high_torch_dtype).to(compute_dtype),
-            width,
-            causal=True,
-        )
-        # Match test_attention.py for native FP8 FMHA, which also quantizes P.
-        torch.testing.assert_close(
-            output,
-            reference,
-            atol=0.05 if high_dtype == DataType.FP8 else 0.02,
-            rtol=0.001 if high_dtype == DataType.FP8 else 0.02,
-        )
-        history_before = token_major(manager.get_buffers(0, kv_layout=kv_layout)).clone()
-        for request_id in request_ids:
-            cache = manager.kv_cache_map[request_id]
-            assert cache.resize(None, length)
-            cache.suspend()
-            assert cache.resume(torch.cuda.current_stream().cuda_stream, is_decoding=True)
-            assert cache.resize(length + 1)
-            manager._restore_page_index_bufs(request_id, cache)
-        output = forward(length, length + 1, False)
-        if native_interleave:
-            native_reference = _attention_reference(
-                query[:, -1:],
-                key.to(high_torch_dtype).to(compute_dtype),
-                value.to(high_torch_dtype).to(compute_dtype),
-                width,
-            )
-            torch.testing.assert_close(native_output, native_reference, atol=0.01, rtol=0.02)
-        history = token_major(manager.get_buffers(0, kv_layout=kv_layout))
-        all_history_ids, all_high_ids = manager.get_mixed_precision_page_tables(request_ids, 0)
-        for row, (history_ids, high_ids) in enumerate(zip(all_history_ids, all_high_ids)):
-            assert high_ids[0] >= 0 and high_ids[1:3] == [kv.BAD_PAGE_INDEX] * 2
-            assert high_ids[-1] >= 0
-            reference = []
-            for tensor in (key, value):
-                original = tensor[row].view(-1, heads, width)
-                native_high_values = original.to(high_torch_dtype)
-                high_values = native_high_values.to(compute_dtype)
-                packed, scale_bytes = _reference_quant(
-                    native_high_values, history_scale.reciprocal()
+        prefix = 512
+        manager.add_dummy_requests(request_ids, [prefix] * batch, is_gen=False)
+        for begin, end, context in (
+            (0, prefix, True),
+            (prefix, length, True),
+            (length, length + 1, False),
+        ):
+            if begin:
+                for request_id in request_ids:
+                    cache = manager.kv_cache_map[request_id]
+                    assert cache.resize(None, begin)
+                    cache.suspend()
+                    assert cache.resume(
+                        torch.cuda.current_stream().cuda_stream, is_decoding=not context
+                    )
+                    assert cache.resize(end)
+                    manager._restore_page_index_bufs(request_id, cache)
+            history_before = token_major(manager.get_buffers(0, kv_layout=kv_layout)).clone()
+            all_history_ids, all_high_ids = manager.get_mixed_precision_page_tables(request_ids, 0)
+            output = forward(begin, end, context).reshape(batch, end - begin, -1)
+            # Native FP8 context FMHA also quantizes P; retain its existing tolerance.
+            atol = (0.05 if high_dtype == DataType.FP8 else 0.02) if context else 0.01
+            rtol = 0.001 if context and high_dtype == DataType.FP8 else 0.02
+            if native_interleave:
+                native_reference = _attention_reference(
+                    query[:, begin:end],
+                    key[:, :end].to(high_torch_dtype).to(compute_dtype),
+                    value[:, :end].to(high_torch_dtype).to(compute_dtype),
+                    width,
                 )
-                low = (
-                    _reference_dequant(packed, scale_bytes, history_scale)
-                    .to(compute_dtype)
-                    .to(high_torch_dtype)
-                    .to(compute_dtype)
-                )
-                expected = low.clone()
-                high_mask = (
-                    torch.tensor(high_ids, device="cuda")[
-                        torch.arange(length + 1, device="cuda") // block
-                    ]
-                    >= 0
-                )
-                expected[high_mask] = high_values[high_mask]
-                # New tokens use the native KV representation before NVFP4 storage.
-                expected[-1] = high_values[-1]
-                reference.append(expected.transpose(0, 1)[None])
-            pages = history_ids[: length // block]
-            torch.testing.assert_close(history[pages], history_before[pages], rtol=0, atol=0)
-            expected = torch.nn.functional.scaled_dot_product_attention(
-                query[row, -1].view(1, query_heads, 1, width), *reference, enable_gqa=True
-            ).reshape_as(output[row])
-            torch.testing.assert_close(output[row], expected, atol=0.01, rtol=0.02)
+                torch.testing.assert_close(native_output, native_reference, atol=atol, rtol=rtol)
+            history = token_major(manager.get_buffers(0, kv_layout=kv_layout))
+            for row, (history_ids, high_ids) in enumerate(zip(all_history_ids, all_high_ids)):
+                if begin:
+                    # Cached context and decode must both read low-only history.
+                    assert high_ids[0] >= 0 and high_ids[1] == kv.BAD_PAGE_INDEX
+                    assert high_ids[-1] >= 0
+                high_pages = torch.tensor(high_ids, device="cuda")
+                high_mask = high_pages[torch.arange(end, device="cuda") // block] >= 0
+                reference = []
+                for tensor in (key, value):
+                    native_high_values = (
+                        tensor[row, :end].view(-1, heads, width).to(high_torch_dtype)
+                    )
+                    high_values = native_high_values.to(compute_dtype)
+                    packed, scale_bytes = _reference_quant(
+                        native_high_values, history_scale.reciprocal()
+                    )
+                    expected = (
+                        _reference_dequant(packed, scale_bytes, history_scale)
+                        .to(compute_dtype)
+                        .to(high_torch_dtype)
+                        .to(compute_dtype)
+                    )
+                    expected[high_mask] = high_values[high_mask]
+                    # Incoming tokens have not yet been compressed to the low pool.
+                    expected[begin:] = high_values[begin:]
+                    reference.append(expected.reshape(1, end, -1))
+                pages = history_ids[: begin // block]
+                torch.testing.assert_close(history[pages], history_before[pages], rtol=0, atol=0)
+                expected = _attention_reference(query[row : row + 1, begin:end], *reference, width)
+                torch.testing.assert_close(output[row], expected, atol=atol, rtol=rtol)
         if decode_graph is not None:
             metadata, graph, captured_output, captured_other_output, run = decode_graph
             for request_id in request_ids:
