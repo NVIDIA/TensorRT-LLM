@@ -47,7 +47,7 @@ _STRICT_BUFFER_CHECK = _strict_buffer_check_enabled()
 # A large prime number used for dummy request IDs to avoid collisions
 CUDA_GRAPH_DUMMY_REQUEST_ID = (1 << 64) - 1
 # Gen dummies get prompt_len = token_num - 1. Before capturing enc-dec decode
-# graphs, EncoderDecoderRunner._prepare_capture_batch temporarily runs each
+# graphs, EncoderDecoderCudaGraphs.prepare_capture_batch temporarily runs each
 # dummy generation request as a one-token context chunk to write its cross-KV
 # cache, so enc-dec dummies need one prompt token plus one generated token.
 ENC_DEC_CUDA_GRAPH_DUMMY_TOKEN_NUM = 2
@@ -994,7 +994,7 @@ class CUDAGraphRunner:
         would mis-associate every real request with another request's output,
         because three separate consumers hard-code "the generation rows start
         at index 0":
-          * ``DecoderRunner._prepare_tp_inputs`` skips the input_ids of
+          * ``DecoderInputPreparer.prepare_inputs`` skips the input_ids of
             CUDA-graph dummies and blits the overlap scheduler's tokens at
             ``input_ids_cuda[num_tokens:...]``, which only lines up with the
             per-row position_ids while every dummy sits after every real row;
@@ -1285,7 +1285,7 @@ class CUDAGraphRunner:
         """Finds the smallest graph batch size >= batch_size that also matches the given draft_len.
 
         The dynamic draft length mapping exists exactly when the dynamic draft
-        length feature is active (see _compute_dynamic_draft_len_mapping);
+        length feature is active (see compute_dynamic_draft_len_mapping);
         without it, this ignores draft_len and reduces to plain batch-size
         rounding.
         """

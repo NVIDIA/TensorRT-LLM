@@ -51,7 +51,7 @@ from .config_utils import (is_hybrid_linear, is_minimax_m3,
 from .connectors.kv_cache_connector import KvCacheConnectorManager
 from .connectors.registry import uses_connector
 from .dwdp import DwdpManager, get_global_dwdp_manager
-from .engine.runners.decoder.runner import uses_full_generation_page_table
+from .engine.runners.decoder.inputs import uses_full_generation_page_table
 from .guided_decoder import CapturableGuidedDecoder, GuidedDecoder
 from .hang_diagnostics import monitor_executor_initialization
 from .model_engine import PyTorchModelEngine

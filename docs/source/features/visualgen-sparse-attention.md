@@ -152,7 +152,7 @@ args = VisualGenArgs(
     ),
 )
 
-pipe = VisualGen(args)
+pipe = VisualGen(model=args.model, args=args)
 ```
 
 ```python
