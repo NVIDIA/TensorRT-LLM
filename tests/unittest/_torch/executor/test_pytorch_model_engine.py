@@ -78,7 +78,7 @@ _TWO_MODEL_SPEC_MODE = SimpleNamespace(use_one_engine=lambda: False)
 
 def _input_preparer() -> DecoderInputPreparer:
     return DecoderInputPreparer(buffers=None,
-                                config=None,
+                                config=SimpleNamespace(is_spec_decode=False),
                                 mapping=None,
                                 dist=None,
                                 model=None,
