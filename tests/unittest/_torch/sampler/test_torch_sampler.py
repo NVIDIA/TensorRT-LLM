@@ -920,6 +920,74 @@ def test_greedy_occurrence_penalties_bypass_stable_path(penalty_name: str, penal
     assert new_tokens_host.reshape(-1)[0].item() == 2
 
 
+@pytest.mark.parametrize(
+    ("target_tokens", "finish_step", "force_num_accepted", "expected_tokens", "expected_accepted"),
+    [
+        pytest.param([5, 6, 7, 8], None, 0, [5, 6, 7, 8], 3, id="all_accepted"),
+        pytest.param([9, 6, 7, 8], None, 0, [9], 0, id="first_rejected"),
+        pytest.param([5, 6, 9, 8], None, 0, [5, 6, 9], 2, id="mid_chain_rejected"),
+        pytest.param([5, 6, 7, 8], 1, 0, [5, 6], 1, id="finished_mid_chain"),
+        pytest.param([9, 9, 9, 9], None, 2, [9, 9, 9], 2, id="force_num_accepted"),
+    ],
+)
+def test_draft_tokens_accepted_until_first_mismatch(
+    monkeypatch: pytest.MonkeyPatch,
+    target_tokens: list[int],
+    finish_step: Optional[int],
+    force_num_accepted: int,
+    expected_tokens: list[int],
+    expected_accepted: int,
+):
+    draft_tokens = [5, 6, 7]
+    max_num_sequences = 4
+    monkeypatch.setenv("TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS", str(force_num_accepted))
+    sampler = TorchSampler(
+        args=TorchSampler.Args(
+            max_seq_len=32,
+            max_draft_len=len(draft_tokens),
+            max_total_draft_tokens=len(draft_tokens),
+            max_num_sequences=max_num_sequences,
+            max_beam_width=1,
+            disable_overlap_scheduler=True,
+        )
+    )
+    prompt = [1, 2]
+    request = LlmRequest(
+        request_id=0,
+        seq_slot=2,
+        input_tokens=prompt,
+        max_new_tokens=16,
+        sampling_config=SamplingConfig(),
+        is_streaming=False,
+        draft_tokens=draft_tokens,
+    )
+    scheduled_requests = ScheduledRequests()
+    scheduled_requests.context_requests_last_chunk = [request]
+    sampler.setup_sampler_step(scheduled_requests)
+
+    new_tokens = torch.zeros((len(draft_tokens) + 1, max_num_sequences, 1), dtype=torch.int32)
+    new_tokens[:, request.py_seq_slot, 0] = torch.tensor(target_tokens, dtype=torch.int32)
+    finish_reasons = torch.full_like(new_tokens, FinishReason.NOT_FINISHED.value)
+    if finish_step is not None:
+        finish_reasons[finish_step, request.py_seq_slot, 0] = FinishReason.END_ID.value
+    state = SampleStateTorch(
+        requests=[request],
+        device=None,
+        host=SampleStateTensorsHostTorch(
+            new_tokens=new_tokens,
+            finish_reasons=finish_reasons,
+            first_finish_reasons=None,
+        ),
+    )
+
+    sampler.update_requests(state)
+
+    assert request.get_tokens(0) == prompt + expected_tokens
+    assert request.py_num_accepted_draft_tokens == expected_accepted
+    assert request.py_rewind_len == len(draft_tokens) - expected_accepted
+    assert request.is_finished == (finish_step is not None)
+
+
 class TestFinishReasons:
     NOT_FINISHED = FinishReason.NOT_FINISHED
     STOP_WORDS = FinishReason.STOP_WORDS
