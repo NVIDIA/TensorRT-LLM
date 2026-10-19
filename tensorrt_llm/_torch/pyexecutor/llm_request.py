@@ -18,8 +18,7 @@ from tensorrt_llm.inputs.multimodal import \
 from tensorrt_llm.inputs.multimodal import \
     MultimodalEncoderRequestState as MultimodalEncoderRequestState
 from tensorrt_llm.inputs.multimodal import (MultimodalParams,
-                                            get_multimodal_item_metadata,
-                                            normalize_multimodal_item_metadata)
+                                            get_multimodal_item_metadata)
 from tensorrt_llm.sampling_params import LogprobMode
 
 SamplingConfig = tllm_executor.SamplingConfig
@@ -737,11 +736,8 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         # The request owns one MM aggregate. Compatibility properties below
         # expose the existing field names without duplicate data or state.
         mm_data = kwargs.pop("py_multimodal_data", None)
-        mm_item_order = kwargs.pop("py_mm_item_order", None)
-        self.py_multimodal_params: MultimodalParams | None = (
-            MultimodalParams(multimodal_data=mm_data,
-                             mm_item_order=mm_item_order)
-            if mm_data is not None or mm_item_order is not None else None)
+        self.py_multimodal_params: MultimodalParams | None = (MultimodalParams(
+            multimodal_data=mm_data) if mm_data is not None else None)
         # Per-item MM encoder state, created at admission by
         # `initialize_multimodal_encoder_request` when raw MM payloads must
         # run through the item scheduler; `None` otherwise (also the
@@ -1156,19 +1152,6 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             self.py_multimodal_params.multimodal_data = data
 
     @property
-    def py_mm_item_order(self) -> list[dict[str, Any]] | None:
-        params = self.py_multimodal_params
-        return params.mm_item_order if params is not None else None
-
-    @py_mm_item_order.setter
-    def py_mm_item_order(self, order: list[dict[str, Any]] | None) -> None:
-        if self.py_multimodal_params is None:
-            if order is None:
-                return
-            self.py_multimodal_params = MultimodalParams()
-        self.py_multimodal_params.mm_item_order = order
-
-    @property
     def py_mm_encoder_state(self) -> MultimodalEncoderRequestState | None:
         params = self.py_multimodal_params
         return params.encoder_state if params is not None else None
@@ -1246,45 +1229,28 @@ def _validate_optional_int_sequence(values: Any,
 
 def get_multimodal_embedding_lengths(
         request: LlmRequest) -> Optional[Sequence[int]]:
-    """Return canonical item output rows, falling back to legacy layout."""
-    py_multimodal_data = request.py_multimodal_data
-    if py_multimodal_data is not None and not isinstance(
-            py_multimodal_data, dict):
-        raise TypeError("py_multimodal_data must be a dict")
-    multimodal_embedding_lengths = (
-        py_multimodal_data.get("multimodal_embedding_lengths")
-        if py_multimodal_data is not None else None)
-    item_metadata = get_multimodal_item_metadata(py_multimodal_data)
-    if (item_metadata is not None
-            and item_metadata.output_embedding_lengths is not None):
-        item_lengths = item_metadata.output_embedding_lengths
-        if (multimodal_embedding_lengths is not None
-                and multimodal_embedding_lengths is not item_lengths):
-            _validate_optional_int_sequence(multimodal_embedding_lengths,
-                                            "multimodal_embedding_lengths")
-            if tuple(multimodal_embedding_lengths) != item_lengths:
-                raise ValueError(
-                    "Multimodal encoder item output lengths must match "
-                    "multimodal_embedding_lengths")
-        multimodal_embedding_lengths = item_lengths
+    """Read output rows from the request's common item metadata."""
+    item_metadata = get_multimodal_item_metadata(request.py_multimodal_data)
+    multimodal_embedding_lengths = (item_metadata.output_embedding_lengths
+                                    if item_metadata is not None else None)
     # Output rows are Python-side metadata, not a nanobind request field.
     multimodal_embedding_lengths = _validate_optional_int_sequence(
-        multimodal_embedding_lengths, "multimodal_embedding_lengths")
+        multimodal_embedding_lengths, "output_embedding_lengths")
     if multimodal_embedding_lengths is None:
         return None
 
     if any(length < 0 for length in multimodal_embedding_lengths):
-        raise ValueError("multimodal_embedding_lengths must be non-negative")
+        raise ValueError("output_embedding_lengths must be non-negative")
     multimodal_lengths = request.multimodal_lengths
     if multimodal_lengths is not None:
         if len(multimodal_embedding_lengths) != len(multimodal_lengths):
-            raise ValueError("multimodal_embedding_lengths length must match "
+            raise ValueError("output_embedding_lengths length must match "
                              "multimodal_lengths")
         for item_idx, (embedding_length, prompt_length) in enumerate(
                 zip(multimodal_embedding_lengths, multimodal_lengths)):
             if embedding_length > prompt_length:
                 raise ValueError(
-                    f"multimodal_embedding_lengths[{item_idx}] exceeds "
+                    f"output_embedding_lengths[{item_idx}] exceeds "
                     f"multimodal_lengths[{item_idx}]")
 
     return multimodal_embedding_lengths
@@ -1296,7 +1262,7 @@ def get_multimodal_encoder_token_lengths(
 
     Field-level validation happens inside
     `MultimodalItemMetadata.validate`; only the request-level
-    cross-check against `multimodal_embedding_lengths` lives here.
+    cross-check against `output_embedding_lengths` lives here.
     """
     item_metadata = get_multimodal_item_metadata(request.py_multimodal_data)
     if item_metadata is None:
@@ -1307,10 +1273,10 @@ def get_multimodal_encoder_token_lengths(
     embedding_lengths = get_multimodal_embedding_lengths(request)
     if embedding_lengths is None:
         raise ValueError("Multimodal encoder item scheduling requires "
-                         "multimodal_embedding_lengths")
+                         "output_embedding_lengths")
     if item_metadata.output_embedding_lengths != tuple(embedding_lengths):
         raise ValueError("Multimodal encoder item output lengths must match "
-                         "multimodal_embedding_lengths")
+                         "output_embedding_lengths")
     return item_metadata.encoder_token_lengths
 
 
@@ -1394,9 +1360,6 @@ def initialize_multimodal_encoder_request(
     (see `get_mm_max_resident_embeddings`).
     """
     mm_data = request.py_multimodal_data
-    if isinstance(mm_data, dict):
-        normalize_multimodal_item_metadata(
-            mm_data, getattr(request, "py_mm_item_order", None))
     has_raw_payload = isinstance(mm_data, dict) and any(
         isinstance(mm_data.get(modality), dict)
         for modality in ("image", "video", "audio"))
@@ -1425,7 +1388,7 @@ def initialize_multimodal_encoder_request(
         embedding_lengths = get_multimodal_embedding_lengths(request)
         if embedding_lengths is None:
             raise ValueError("Multimodal item scheduling requires "
-                             "multimodal_embedding_lengths")
+                             "output_embedding_lengths")
         # Prefill slices the cached item outputs by the prompt's embedding
         # slots, so the items must declare exactly one row per slot.
         embed_mask_cumsum = mm_data.get("multimodal_embed_mask_cumsum")
@@ -1697,7 +1660,6 @@ def executor_request_to_llm_request(
         cache_salt=executor_request.cache_salt,
         arrival_time=getattr(executor_request, "py_arrival_time", None),
         py_multimodal_data=py_multimodal_data,
-        py_mm_item_order=getattr(executor_request, "py_mm_item_order", None),
         kv_cache_retention_config=executor_request.kv_cache_retention_config,
         agent_hierarchy=agent_hierarchy,
         logprobs_mode=getattr(executor_request, "py_logprobs_mode",

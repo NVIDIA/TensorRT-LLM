@@ -103,8 +103,8 @@ before changing multimodal preprocessing, item selection, or request ownership.
   how processed fields are selected by item; model hooks retain batching and padding policy.
   Keep prompt token counts, encoder costs, and output embedding rows distinct.
 - Item refs, costs, and output rows are immutable tuples. Encoder state references the
-  admitted record instead of copying its lengths. Normalized Params consume legacy order
-  and length fields; keep compatibility inputs only where normalization is unavailable.
+  admitted record instead of copying its lengths. Input preparation produces this record;
+  request and forward Params do not reconstruct it from separate order or length fields.
 - Only request Params own `encoder_state` cache references. Encoder selection and LLM chunk
   Params are separate views; cleanup remains in the executor and the cache remains model-owned.
 - Persistent encoder caching reuses one lazily reconstructed `MultimodalInput` per request.
@@ -114,8 +114,10 @@ before changing multimodal preprocessing, item selection, or request ownership.
   the transport envelope. Do not serialize live encoder state or CUDA events in a new wire format.
 - When changing an E/P contract, check external callers such as Dynamo separately from
   local processor hooks: wire compatibility and Python API compatibility are distinct.
-- Validate producer/admission contracts at their boundaries. Preserve legacy adapters and
-  model capabilities without adding repeated full-metadata validation to selection or forward.
+- Validate producer/admission contracts at their boundaries, without repeated full-metadata
+  validation in selection or forward. Processors use `get_mm_item_metadata`; do not add a
+  second metadata format or old-hook dispatch. Unknown encoder costs remain `None`, and
+  common item metadata does not imply item scheduling support.
 
 ## Key Files
 

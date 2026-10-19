@@ -56,7 +56,6 @@ def test_multimodal_payload_broadcast_and_children_keep_the_same_contract():
         MULTIMODAL_ENCODER_ITEM_METADATA_KEY: metadata,
         "audio": {"features": torch.arange(6).reshape(2, 3)},
         "image": {},
-        "multimodal_embedding_lengths": [1, 2],
     }
     source = trtllm.Request(
         input_token_ids=[1, 2, 3],

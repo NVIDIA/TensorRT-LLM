@@ -88,13 +88,26 @@ The item refs, costs, and output rows are stored as immutable tuples; list input
 are accepted by the metadata constructor. Encoder state references this same
 record and reads its lengths without a second snapshot. Producers fill the
 partition declarations before admission.
-Legacy `mm_item_order`, `multimodal_embedding_lengths`, and the three-field
-`MultimodalEncoderItemMetadata` remain compatibility inputs. Migrated producers
-publish the shared metadata record. Normalization checks and removes redundant
-legacy lengths, and Params clear the order manifest once metadata is available.
-Inputs without a known layout retain their compatibility path. The executor's
-output-length helper reads canonical rows and rejects conflicting legacy lengths.
-The encoder-result boundary still exports lengths as lists.
+Input preparation publishes the common item record directly. The frontend's
+`mm_item_order` describes prompt order during preprocessing; executor Params
+carry that order only in `item_metadata.item_refs`. Output row counts are stored
+only in `item_metadata.output_embedding_lengths`. Request admission, selected-item
+encoding, full-request encoding, cache keys and encoder output export all read
+the same record. The encoder-result boundary still exports lengths as lists.
+
+`get_mm_item_metadata(prompt_token_ids, multimodal_data, mm_item_order=None)` is
+the processor hook. Generic preparation supplies prompt order and known output
+rows; model processors add encoder costs and partitions. Partial model metadata
+retains known prompt rows, while conflicting order or rows fail at input preparation.
+Gemma4 and Nemotron add partitions to this record. Qwen and Mistral also provide
+physical encoder costs. A custom processor overrides this same hook and returns
+`MultimodalItemMetadata`; the old three-field tuple, encoder-only metadata hook,
+and Params order/length fallbacks have been removed.
+
+This data contract is independent of item scheduling. Processors can provide
+common order and output rows with `encoder_token_lengths=None` and keep
+full-request encoding. Model capability and configuration still decide whether
+items are scheduled separately.
 
 Execution Params can receive model outputs. Inline encoding and prefetch retain
 their existing output write-back to the request, while item-scheduled LLM chunks
