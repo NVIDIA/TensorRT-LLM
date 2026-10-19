@@ -46,15 +46,33 @@ class MegaMoeWorkspace:
         self.world_size = world_size
         self.topk_index_dtype = topk_index_dtype
         self.full_bucket = full_bucket
-        self.providers: dict[int, MegaMoeSymmMemProvider] = {}
-        self.direct_input_buckets: set[int] = set()
+        self._providers: dict[int, MegaMoeSymmMemProvider] = {}
+        self._direct_input_buckets: set[int] = set()
         self._local_staging_cache: dict[tuple, dict[str, torch.Tensor]] = {}
         self._last_staged_T: dict[int, int] = {}
 
     @property
     def full_provider(self) -> MegaMoeSymmMemProvider | None:
         """Return the full-bucket provider, or None before multi-rank allocation."""
-        return self.providers.get(self.full_bucket)
+        return self._providers.get(self.full_bucket)
+
+    def register_provider(
+        self,
+        max_tokens: int,
+        provider: MegaMoeSymmMemProvider,
+        *,
+        supports_direct_inputs: bool,
+    ) -> None:
+        """Attach a build-time provider and its kernel's input capability."""
+        self._providers[max_tokens] = provider
+        if supports_direct_inputs:
+            self._direct_input_buckets.add(max_tokens)
+        else:
+            self._direct_input_buckets.discard(max_tokens)
+
+    def supports_direct_inputs(self, max_tokens: int) -> bool:
+        """Whether this bucket's kernel can consume the caller's input buffers."""
+        return max_tokens in self._direct_input_buckets
 
     def _ensure_local_staging(
         self,
@@ -107,7 +125,7 @@ class MegaMoeWorkspace:
             )
             shared_bytes, supports_direct_inputs = query_local_kernel(max_T, top_k, hidden)
             if supports_direct_inputs:
-                self.direct_input_buckets.add(max_T)
+                self._direct_input_buckets.add(max_T)
             # zeros (not empty): the leading counter prefix is an atomic-add
             # target the kernel only tail-resets for the NEXT launch, so the
             # FIRST launch needs it pre-zeroed (one-time; cached per bucket).
@@ -163,7 +181,7 @@ class MegaMoeWorkspace:
             )
         # ``launch_max_T`` comes from ``_select_launch_max_tokens``, so it is
         # always a ladder member.
-        provider = self.providers[launch_max_T]
+        provider = self._providers[launch_max_T]
         if provider.num_topk != top_k:
             raise MegaMoeCuteDslUnavailable(
                 f"MegaMoECuteDsl symm provider was built for top_k="

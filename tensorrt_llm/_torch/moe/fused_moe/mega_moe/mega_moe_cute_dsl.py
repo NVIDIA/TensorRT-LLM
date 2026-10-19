@@ -710,8 +710,6 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
                 shared_workspace_bytes,
                 supports_direct_inputs,
             ) = self._query_kernel_properties(max_T, top_k, self.hidden_size)
-            if supports_direct_inputs:
-                self._workspace.direct_input_buckets.add(max_T)
             provider = get_megamoe_symm_provider(
                 process_group=self._ep_pg,
                 world_size=self.ep_size,
@@ -723,7 +721,9 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
                 combine_format=self.combine_format,
                 shared_workspace_bytes=shared_workspace_bytes,
             )
-            self._workspace.providers[max_T] = provider
+            self._workspace.register_provider(
+                max_T, provider, supports_direct_inputs=supports_direct_inputs
+            )
             # AutoTuner profiling scratch: record only the request kwargs
             # (full bucket only, matching tuning mode's forced top bucket);
             # the multi-GiB allocation itself is deferred to the op's
@@ -991,7 +991,8 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
             combine_output[:num_tokens].zero_()
 
         with self._profiling_scratch.activate(
-            world_size=world_size, tuning=AutoTuner.get().is_tuning_mode
+            world_size=world_size,
+            tuning=self.tactic_autotune and world_size > 1 and AutoTuner.get().is_tuning_mode,
         ):
             torch.ops.trtllm.cute_dsl_megamoe_nvfp4_blackwell(
                 activation=_as_nvfp4(activation),
@@ -1198,7 +1199,7 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
             self.ep_size > 1
             and not self.tactic_autotune
             and num_tokens == launch_max_T
-            and launch_max_T in self._workspace.direct_input_buckets
+            and self._workspace.supports_direct_inputs(launch_max_T)
             and x.shape == bufs.activation.shape
             and x_sf.shape == bufs.activation_sf.shape
             and x.is_contiguous()

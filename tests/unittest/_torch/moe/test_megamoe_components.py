@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import ast
 import gc
 import importlib.util
 import sys
@@ -140,7 +141,8 @@ def test_local_workspace_reuses_buffers_and_initializes_counter_prefix(component
     assert first.shared_workspace is second.shared_workspace
     assert c.trace == []
     query.assert_called_once_with(8, 2, 80)
-    assert workspace.direct_input_buckets == {8}
+    assert workspace.supports_direct_inputs(8)
+    assert not workspace.supports_direct_inputs(4)
     third = _acquire(c, workspace, bucket=4, query=query)
     assert third.activation is not first.activation
     assert query.call_count == 2
@@ -163,7 +165,7 @@ def test_multirank_workspace_only_allocates_local_routes(components):
         }
     )
     provider = SimpleNamespace(num_topk=2, get_regions=lambda: regions)
-    workspace.providers[8] = provider
+    workspace.register_provider(8, provider, supports_direct_inputs=True)
     query = MagicMock(
         side_effect=AssertionError("forward must not query/allocate symmetric memory")
     )
@@ -173,7 +175,10 @@ def test_multirank_workspace_only_allocates_local_routes(components):
     assert bufs.activation is regions.activation
     assert bufs.peer_offsets is regions.peer_offsets
     assert workspace.full_provider is provider
+    assert workspace.supports_direct_inputs(8)
     query.assert_not_called()
+    workspace.register_provider(8, provider, supports_direct_inputs=False)
+    assert not workspace.supports_direct_inputs(8)
     provider.num_topk = 3
     with pytest.raises(c.runtime.MegaMoeCuteDslUnavailable, match="top_k"):
         _acquire(c, workspace, query=query)
@@ -349,3 +354,112 @@ def test_runtime_probe_keeps_capability_cache_per_architecture(components):
     c.runtime.get_sm_version = lambda: 100
     c.runtime.is_megamoe_cute_dsl_runtime_available()
     assert set(c.runtime._RUNTIME_PROBE_CACHE) == {100, 107}
+
+
+def _kernel_launcher(c, tuner):
+    """Execute the actual launch method without importing CUDA backend dependencies."""
+    source = _COMPONENTS / "mega_moe_cute_dsl.py"
+    tree = ast.parse(source.read_text())
+    backend = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "TrtllmCutedslMegaMoeNvfp4Impl"
+    )
+    method = next(
+        node
+        for node in backend.body
+        if isinstance(node, ast.FunctionDef) and node.name == "_launch_megamoe_kernel"
+    )
+    module = ast.Module(
+        body=[
+            ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0),
+            method,
+        ],
+        type_ignores=[],
+    )
+    namespace = {
+        "torch": c.torch,
+        "AutoTuner": tuner,
+        "ActivationType": SimpleNamespace(SwigluBias="bias", SiTu="situ"),
+        "_as_nvfp4": lambda tensor: tensor,
+        "_as_fp8_sf": lambda tensor: tensor,
+    }
+    exec(compile(ast.fix_missing_locations(module), str(source), "exec"), namespace)
+    return namespace[method.name]
+
+
+@pytest.mark.parametrize(
+    "world,tactic_autotune,queries_tuner",
+    [(1, False, False), (8, False, False), (1, True, False), (8, True, True)],
+)
+def test_kernel_launch_only_queries_tuner_for_multirank_autotuning(
+    components, world, tactic_autotune, queries_tuner
+):
+    c = components
+    tuner = SimpleNamespace(get=MagicMock(return_value=SimpleNamespace(is_tuning_mode=True)))
+    op = MagicMock()
+    c.torch.ops = SimpleNamespace(trtllm=SimpleNamespace(cute_dsl_megamoe_nvfp4_blackwell=op))
+    owner = SimpleNamespace(
+        tactic_autotune=tactic_autotune,
+        _profiling_scratch=_profiling(c),
+        _use_in_kernel_fc2_reduce=lambda _: False,
+        expert_size_per_partition=4,
+        intermediate_size_per_partition=64,
+        expand_intermediate_size_per_partition=128,
+        apply_topk_in_fc1=False,
+        act_clamp=None,
+        act_alpha=None,
+        act_beta=None,
+        activation_type="plain",
+        combine_format="bf16",
+    )
+    tensor = _Tensor((8, 1, 80), "bfloat16", "cpu", c.trace, "output")
+    weights = SimpleNamespace(
+        **{
+            name: tensor
+            for name in (
+                "fc1_weight",
+                "fc1_weight_sf",
+                "fc2_weight",
+                "fc2_weight_sf",
+                "fc31_alpha",
+                "fc2_alpha",
+                "fc1_norm_const",
+            )
+        }
+    )
+    result = _kernel_launcher(c, tuner)(
+        owner,
+        activation=tensor,
+        activation_sf=tensor,
+        topk_idx=tensor,
+        topk_weights=tensor,
+        weight_view=weights,
+        combine_output=tensor,
+        shared_workspace=tensor,
+        world_size=world,
+        local_rank=0,
+        top_k=2,
+        hidden=80,
+        peer_offsets=list(range(world)),
+        num_tokens=0,
+        output_dtype="bfloat16",
+        launch_max_T=8,
+    )
+    assert result.shape == (0, 80)
+    op.assert_called_once()
+    if queries_tuner:
+        tuner.get.assert_called_once_with()
+    else:
+        tuner.get.assert_not_called()
+    c.op.set_active_megamoe_profiling_scratch.assert_called_with(None)
+    c.op.set_active_megamoe_profiling_scratch_factory.assert_called_with(None)
+
+
+@pytest.mark.parametrize("error", [_MpiError, RuntimeError, ValueError])
+def test_mpi_rank_query_failure_leaves_collectives_uninitialized(components, error):
+    c = components
+    c.utils.mpi_world_size = MagicMock(side_effect=error("rank query unavailable"))
+    c.runtime.maybe_init_torch_dist_under_mpi(ep_size=8)
+    c.comm.bcast.assert_not_called()
+    c.dist.init_process_group.assert_not_called()
