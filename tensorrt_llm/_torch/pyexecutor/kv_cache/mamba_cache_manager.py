@@ -97,19 +97,19 @@ def _allocate_kda_beta_cache(
     shape: Tuple[int, ...],
     device: Optional[torch.device],
 ) -> torch.Tensor:
-    """Allocate a logically shaped beta cache with aligned physical rows."""
+    """Allocate a logically shaped bf16 beta cache with aligned physical rows."""
     logical_num_heads = shape[-1]
     heads_per_alignment = (_KDA_BETA_CACHE_ALIGNMENT_BYTES //
-                           torch.float32.itemsize)
+                           torch.bfloat16.itemsize)
     padded_num_heads = ((logical_num_heads + heads_per_alignment - 1) //
                         heads_per_alignment) * heads_per_alignment
     # CuTe requires every nested cache view to be 16-byte aligned. Keep the
-    # logical head count while padding the physical stride (six fp32 heads are
-    # 24 bytes, so an unpadded row makes alternating views only 8-byte aligned).
+    # logical head count while padding the physical stride (six bf16 heads are
+    # 12 bytes, so an unpadded row makes alternating views only 4-byte aligned).
     return torch.zeros(
         *shape[:-1],
         padded_num_heads,
-        dtype=torch.float32,
+        dtype=torch.bfloat16,
         device=device,
     )[..., :logical_num_heads]
 
@@ -246,6 +246,19 @@ def _allocate_mamba_seed_buffer(cache_size: int, rank_offset: int,
         for i in range(cache_size)
     ]
     return torch.tensor(slot_seeds, dtype=torch.int64, device=device)
+
+
+def _host_slots_to_device(slots: List[int],
+                          device: torch.device) -> torch.Tensor:
+    """Copy host slot ids to ``device`` without a host sync.
+
+    A pageable copy would wait for the queued step. Each call stages through a
+    fresh pinned tensor, so no later host write can race the copy.
+    """
+    return torch.tensor(slots,
+                        dtype=torch.long,
+                        pin_memory=device.type == "cuda"
+                        and prefer_pinned()).to(device, non_blocking=True)
 
 
 def _mamba_rank_offset(mapping: Mapping) -> int:
@@ -426,17 +439,19 @@ class PythonMambaCacheManager(BaseResourceManager):
         # the LAST GOLDEN token; the accepted drafts recorded in
         # prev_num_accepted_tokens are pending in these caches and are
         # replayed by the kernel at the start of the next verify round.
-        # Extended conv caches [layers, slots, dim, (W-1) + num_spec] fp32,
-        # dim-contiguous (stride(dim) == 1): columns [0, W-1) are the
+        # Extended conv caches [layers, slots, dim, (W-1) + num_spec] bf16
+        # (raw projection inputs, so bf16 is exact), dim-contiguous (stride(dim) == 1): columns [0, W-1) are the
         # committed raw-input window, tail columns the pending drafts' raw
         # inputs.
         kda_conv_q: torch.Tensor | None = None
         kda_conv_k: torch.Tensor | None = None
         kda_conv_v: torch.Tensor | None = None
-        # Post-processed per-draft quantities for replay:
-        # [layers, slots, num_spec, 3, H*K] (q/k/gate), [.., num_spec, H*V],
-        # [.., num_spec, H] — all fp32.
-        kda_qkg_cache: torch.Tensor | None = None
+        # Post-processed per-draft quantities for replay: k
+        # [layers, slots, num_spec, H*K] bf16, gate [.., num_spec, H*K] fp32
+        # (feeds the cumulative-gate exponents), v [.., num_spec, H*V] bf16,
+        # beta [.., num_spec, H] bf16. q is recomputed from the conv caches.
+        kda_k_cache: torch.Tensor | None = None
+        kda_g_cache: torch.Tensor | None = None
         kda_v_cache: torch.Tensor | None = None
         kda_beta_cache: torch.Tensor | None = None
 
@@ -459,7 +474,7 @@ class PythonMambaCacheManager(BaseResourceManager):
         def has_kda_replay_caches(self) -> bool:
             """True when the KDA fused-verify replay caches were allocated
             (the fused ``trtllm::kda_mtp_decode`` verify path)."""
-            return self.kda_qkg_cache is not None
+            return self.kda_k_cache is not None
 
         def commit_conv_window(self, slot_indices: torch.Tensor,
                                conv_pool: torch.Tensor) -> None:
@@ -638,11 +653,13 @@ class PythonMambaCacheManager(BaseResourceManager):
                 extended_s = w_kernel - 1 + M
 
                 def _dim_contiguous_conv_cache():
+                    # raw bf16 projection inputs: bf16 is exact and halves
+                    # the per-draft replay traffic of the verify kernel
                     return torch.zeros(num_local_layers,
                                        max_batch_size,
                                        extended_s,
                                        section_dim,
-                                       dtype=torch.float32,
+                                       dtype=torch.bfloat16,
                                        device=device).transpose(-1, -2)
 
                 spec_kwargs['prev_num_accepted_tokens'] = torch.zeros(
@@ -650,25 +667,31 @@ class PythonMambaCacheManager(BaseResourceManager):
                 spec_kwargs['kda_conv_q'] = _dim_contiguous_conv_cache()
                 spec_kwargs['kda_conv_k'] = _dim_contiguous_conv_cache()
                 spec_kwargs['kda_conv_v'] = _dim_contiguous_conv_cache()
-                spec_kwargs['kda_qkg_cache'] = torch.zeros(num_local_layers,
-                                                           max_batch_size,
-                                                           M,
-                                                           3,
-                                                           section_dim,
-                                                           dtype=torch.float32,
-                                                           device=device)
-                spec_kwargs['kda_v_cache'] = torch.zeros(num_local_layers,
+                spec_kwargs['kda_k_cache'] = torch.zeros(num_local_layers,
+                                                         max_batch_size,
+                                                         M,
+                                                         section_dim,
+                                                         dtype=torch.bfloat16,
+                                                         device=device)
+                spec_kwargs['kda_g_cache'] = torch.zeros(num_local_layers,
                                                          max_batch_size,
                                                          M,
                                                          section_dim,
                                                          dtype=torch.float32,
                                                          device=device)
+                spec_kwargs['kda_v_cache'] = torch.zeros(num_local_layers,
+                                                         max_batch_size,
+                                                         M,
+                                                         section_dim,
+                                                         dtype=torch.bfloat16,
+                                                         device=device)
                 spec_kwargs['kda_beta_cache'] = _allocate_kda_beta_cache(
                     (num_local_layers, max_batch_size, M, nheads), device)
                 ssm_spec_cache = [
                     spec_kwargs['kda_conv_q'], spec_kwargs['kda_conv_k'],
-                    spec_kwargs['kda_conv_v'], spec_kwargs['kda_qkg_cache'],
-                    spec_kwargs['kda_v_cache'], spec_kwargs['kda_beta_cache']
+                    spec_kwargs['kda_conv_v'], spec_kwargs['kda_k_cache'],
+                    spec_kwargs['kda_g_cache'], spec_kwargs['kda_v_cache'],
+                    spec_kwargs['kda_beta_cache']
                 ]
                 spec_path_label = "kda-replay"
             elif self._use_replay_state_update:
@@ -896,7 +919,7 @@ class PythonMambaCacheManager(BaseResourceManager):
                 device=cache.device)
             seeded[:, :, :, :committed] = section.to(cache.dtype)
             cache.index_copy_(1, idx, seeded)
-        for buf in (self.mamba_cache.kda_qkg_cache,
+        for buf in (self.mamba_cache.kda_k_cache, self.mamba_cache.kda_g_cache,
                     self.mamba_cache.kda_v_cache,
                     self.mamba_cache.kda_beta_cache):
             buf.index_fill_(1, idx, 0)
@@ -1127,7 +1150,8 @@ class PythonMambaCacheManager(BaseResourceManager):
                 kda_conv_q=_drop(self.mamba_cache.kda_conv_q),
                 kda_conv_k=_drop(self.mamba_cache.kda_conv_k),
                 kda_conv_v=_drop(self.mamba_cache.kda_conv_v),
-                kda_qkg_cache=_drop(self.mamba_cache.kda_qkg_cache),
+                kda_k_cache=_drop(self.mamba_cache.kda_k_cache),
+                kda_g_cache=_drop(self.mamba_cache.kda_g_cache),
                 kda_v_cache=_drop(self.mamba_cache.kda_v_cache),
                 kda_beta_cache=_drop(self.mamba_cache.kda_beta_cache),
             )
@@ -3470,7 +3494,8 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         self.kda_conv_q = None
         self.kda_conv_k = None
         self.kda_conv_v = None
-        self.kda_qkg_cache = None
+        self.kda_k_cache = None
+        self.kda_g_cache = None
         self.kda_v_cache = None
         self.kda_beta_cache = None
 
@@ -3490,12 +3515,14 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         extended_window = committed_window + num_spec
 
         def allocate_dim_contiguous_conv_cache() -> torch.Tensor:
+            # raw bf16 projection inputs: bf16 is exact and halves the
+            # per-draft replay traffic of the verify kernel
             return torch.zeros(
                 self.local_num_mamba_layers,
                 cache_size,
                 extended_window,
                 section_dim,
-                dtype=torch.float32,
+                dtype=torch.bfloat16,
                 device=device,
             ).transpose(-1, -2)
 
@@ -3505,11 +3532,21 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         self.kda_conv_q = allocate_dim_contiguous_conv_cache()
         self.kda_conv_k = allocate_dim_contiguous_conv_cache()
         self.kda_conv_v = allocate_dim_contiguous_conv_cache()
-        self.kda_qkg_cache = torch.zeros(
+        # k / v / beta replay entries in bf16 (halves the per-draft replay
+        # traffic of the verify kernel); the gate cache stays fp32 because it
+        # feeds the cumulative-gate exponents of the replayed chunk.
+        self.kda_k_cache = torch.zeros(
             self.local_num_mamba_layers,
             cache_size,
             num_spec,
-            3,
+            section_dim,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        self.kda_g_cache = torch.zeros(
+            self.local_num_mamba_layers,
+            cache_size,
+            num_spec,
             section_dim,
             dtype=torch.float32,
             device=device,
@@ -3519,7 +3556,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             cache_size,
             num_spec,
             section_dim,
-            dtype=torch.float32,
+            dtype=torch.bfloat16,
             device=device,
         )
         self.kda_beta_cache = _allocate_kda_beta_cache(
@@ -4287,8 +4324,10 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         if num_contexts == 0 or not self.use_kda_replay_update:
             return
         assert self.prev_num_accepted_tokens is not None
-        context_slots = self.cuda_state_indices[:num_contexts].long()
-        self.prev_num_accepted_tokens[context_slots] = 0
+        context_slots = _host_slots_to_device(
+            self._host_state_indices[:num_contexts].tolist(),
+            self.prev_num_accepted_tokens.device)
+        self.prev_num_accepted_tokens.index_fill_(0, context_slots, 0)
 
     def _reset_kda_replay_slots(
         self,
@@ -4297,11 +4336,17 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         """Reset pending KDA drafts for newly initialized logical slots."""
         assert self.use_kda_replay_update
         assert self.prev_num_accepted_tokens is not None
-        slots = torch.as_tensor(slots,
-                                dtype=torch.long,
-                                device=self.prev_num_accepted_tokens.device)
+        device = self.prev_num_accepted_tokens.device
+        if isinstance(slots, torch.Tensor) and slots.device.type != "cpu":
+            slots = slots.to(device=device, dtype=torch.long, non_blocking=True)
+        else:
+            if isinstance(slots, torch.Tensor):
+                slots = slots.tolist()
+            if not slots:
+                return
+            slots = _host_slots_to_device(slots, device)
         if slots.numel() > 0:
-            self.prev_num_accepted_tokens[slots] = 0
+            self.prev_num_accepted_tokens.index_fill_(0, slots, 0)
 
     def _kda_replay_state_buffers(self) -> List[Tuple[torch.Tensor, int]]:
         """The per-slot KDA replay state kept outside the V2 pools, as
@@ -4309,8 +4354,8 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         assert self.prev_num_accepted_tokens is not None
         buffers = [(self.prev_num_accepted_tokens, 0)]
         for replay_buffer in (self.kda_conv_q, self.kda_conv_k, self.kda_conv_v,
-                              self.kda_qkg_cache, self.kda_v_cache,
-                              self.kda_beta_cache):
+                              self.kda_k_cache, self.kda_g_cache,
+                              self.kda_v_cache, self.kda_beta_cache):
             assert replay_buffer is not None
             buffers.append((replay_buffer, 1))
         return buffers
@@ -4326,12 +4371,9 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             return
 
         device = self.prev_num_accepted_tokens.device
-        source_slots = torch.tensor([old for old, _ in moves],
-                                    dtype=torch.long,
-                                    device=device)
-        destination_slots = torch.tensor([new for _, new in moves],
-                                         dtype=torch.long,
-                                         device=device)
+        source_slots = _host_slots_to_device([old for old, _ in moves], device)
+        destination_slots = _host_slots_to_device([new for _, new in moves],
+                                                  device)
         for buffer, dim in self._kda_replay_state_buffers():
             buffer.index_copy_(dim, destination_slots,
                                buffer.index_select(dim, source_slots))
@@ -4389,8 +4431,9 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         """Commit the slot's pending accepted drafts and its conv window into
         its V2 SSM and conv states, in place, and clear its draft count.
 
-        Afterwards the V2 states hold exactly what the next verify would have
-        started from (``commit_kda_pending_drafts``).
+        Afterwards the V2 states hold what the next verify would have started
+        from: the conv window exactly, the SSM state to the verify kernel's
+        accuracy (``commit_kda_pending_drafts``).
         """
         from tensorrt_llm._torch.modules.kimi_kda._kda_kernels import \
             commit_kda_pending_drafts
@@ -4413,7 +4456,8 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                     self.kda_conv_q[layer_offset],
                     self.kda_conv_k[layer_offset],
                     self.kda_conv_v[layer_offset],
-                    self.kda_qkg_cache[layer_offset],
+                    self.kda_k_cache[layer_offset],
+                    self.kda_g_cache[layer_offset],
                     self.kda_v_cache[layer_offset],
                     self.kda_beta_cache[layer_offset],
                     slots,
@@ -4602,10 +4646,8 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             return
 
         assert self.prev_num_accepted_tokens is not None
-        device = self.prev_num_accepted_tokens.device
-        state_indices = torch.tensor(sorted(set(slots)),
-                                     dtype=torch.long,
-                                     device=device)
+        state_indices = _host_slots_to_device(
+            sorted(set(slots)), self.prev_num_accepted_tokens.device)
         self._seed_kda_replay_slots(state_indices)
 
     def _seed_kda_replay_slots(self, state_indices: torch.Tensor) -> None:
@@ -4630,11 +4672,11 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                 replay_layer[:, :, :committed_window].index_copy_(
                     0, state_indices, section.to(replay_layer.dtype))
 
-        for replay_buffer in (self.kda_qkg_cache, self.kda_v_cache,
-                              self.kda_beta_cache):
+        for replay_buffer in (self.kda_k_cache, self.kda_g_cache,
+                              self.kda_v_cache, self.kda_beta_cache):
             assert replay_buffer is not None
             replay_buffer.index_fill_(1, state_indices, 0)
-        self.prev_num_accepted_tokens[state_indices] = 0
+        self.prev_num_accepted_tokens.index_fill_(0, state_indices, 0)
 
     def mamba_layer_cache(
         self, layer_idx: int
@@ -4648,7 +4690,8 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         assert self.kda_conv_q is not None
         assert self.kda_conv_k is not None
         assert self.kda_conv_v is not None
-        assert self.kda_qkg_cache is not None
+        assert self.kda_k_cache is not None
+        assert self.kda_g_cache is not None
         assert self.kda_v_cache is not None
         assert self.kda_beta_cache is not None
         spec_kwargs = {
@@ -4656,7 +4699,8 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             "kda_conv_q": self.kda_conv_q[layer_offset],
             "kda_conv_k": self.kda_conv_k[layer_offset],
             "kda_conv_v": self.kda_conv_v[layer_offset],
-            "kda_qkg_cache": self.kda_qkg_cache[layer_offset],
+            "kda_k_cache": self.kda_k_cache[layer_offset],
+            "kda_g_cache": self.kda_g_cache[layer_offset],
             "kda_v_cache": self.kda_v_cache[layer_offset],
             "kda_beta_cache": self.kda_beta_cache[layer_offset],
         }
@@ -4942,7 +4986,8 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         self.kda_conv_q = None
         self.kda_conv_k = None
         self.kda_conv_v = None
-        self.kda_qkg_cache = None
+        self.kda_k_cache = None
+        self.kda_g_cache = None
         self.kda_v_cache = None
         self.kda_beta_cache = None
         self._kda_replay_suspended.clear()
