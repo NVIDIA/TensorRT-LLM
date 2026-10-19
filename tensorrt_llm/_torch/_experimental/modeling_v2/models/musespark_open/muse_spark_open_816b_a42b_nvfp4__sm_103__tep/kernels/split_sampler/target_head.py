@@ -107,8 +107,9 @@ from ...ops.spec import head_sampler as _hs
 
 #: Rows the inbox gather runs on: the K = 7 verify block of one request.
 GATHER_ROWS = _hs.INBOX_ROWS
-#: TP width the inbox layout is written for.
-GATHER_WORLD = 8
+#: TP widths the inbox is validated on: one tray of 4 and two trays of 4. The layout
+#: (``HeadGatherWorkspace``) and the gather kernel take the rank count from the group.
+GATHER_WORLDS = (4, 8)
 
 
 def lm_head_gemm_into(lm_head: Linear, x: torch.Tensor, out: torch.Tensor) -> None:
@@ -518,8 +519,10 @@ def unsupported_reason(llm, mapping, gather: bool) -> Optional[str]:
     if getattr(mapping, "enable_attention_dp", False):
         return "attention data parallelism"
     if gather:
-        if lm_head.tp_size != GATHER_WORLD or mapping.tp_size != GATHER_WORLD:
-            return f"the inbox is written for TP{GATHER_WORLD}"
+        if lm_head.tp_size != mapping.tp_size:
+            return f"the LM head is on TP{lm_head.tp_size}, the model on TP{mapping.tp_size}"
+        if mapping.tp_size not in GATHER_WORLDS:
+            return f"the inbox is validated at TP{' and TP'.join(map(str, GATHER_WORLDS))} only"
         if not _low_m.LOW_M_GEMM_ACTIVE or getattr(lm_head, "use_custom_cublas_mm", False):
             return "the LM head does not take the low-M dispatcher (TRTLLM_LOW_M_GEMM_BACKEND)"
         if (

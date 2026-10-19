@@ -60,16 +60,53 @@ def test_the_default_plan_by_row_count():
     )
 
 
+def test_the_tp4_plans_by_row_count():
+    """TP4 (one tray) on sm103: its own table, the pooler and unpooler per projection layout."""
+    sharded = dense_gemms.default_kernels(4, sharded=True)
+    assert sharded == {
+        "qkv": ("direct:256,2",) * 2 + ("splitk:64,8,2,10",) * 6,
+        "o_proj": ("direct:128,4",) * 2 + ("cublas",) * 6,
+        "pool": ("direct:256,2",) * 2 + ("direct:256,4",) * 3 + ("splitk:64,8,4,10",) * 3,
+        "unpool": ("direct:128,2",) * 2 + ("direct:128,4",) * 2 + ("splitk:64,8,4,10",) * 4,
+    }
+    replicated = dense_gemms.default_kernels(4, sharded=False)
+    assert {site: replicated[site] for site in ("qkv", "o_proj")} == {
+        site: sharded[site] for site in ("qkv", "o_proj")
+    }
+    assert replicated["pool"] == ("direct:256,2",) * 2 + ("splitk:64,8,2,10",) * 6
+    assert replicated["unpool"] == ("direct:128,2",) * 2 + ("cublas",) * 6
+    # TP8 keeps its table whatever the layout; no other TP size has one.
+    assert dense_gemms.default_kernels(8, sharded=False) == dense_gemms.default_kernels()
+    for tp in (1, 2, 16):
+        with pytest.raises(ValueError, match=rf"no kernel table for SM \(10, 3\) at TP {tp}"):
+            dense_gemms.default_kernels(tp)
+
+
 def test_the_sm107_plan_by_row_count():
-    plan = dense_gemms.default_kernels((10, 7))
+    plan = dense_gemms.default_kernels(capability=(10, 7))
     assert plan == {
         "qkv": ("direct:256,2", "direct:128,4", "direct:64,2") + ("splitk:64,8,4,12",) * 5,
         "o_proj": ("direct:64,4",) * 2 + ("splitk:64,8,1,12",) * 6,
         "pool": dense_gemms.default_kernels()["pool"],
         "unpool": ("direct:256,2",) + ("direct:128,2",) * 6 + ("splitk:64,8,4,12",),
     }
+    # sm107 has a TP8 table only.
+    with pytest.raises(ValueError, match=r"no kernel table for SM \(10, 7\) at TP 4"):
+        dense_gemms.default_kernels(4, capability=(10, 7))
     with pytest.raises(ValueError, match=r"no kernel table for SM \(10, 0\)"):
-        dense_gemms.default_kernels((10, 0))
+        dense_gemms.default_kernels(capability=(10, 0))
+
+
+@pytest.mark.parametrize("sharded", (True, False), ids=("sharded", "replicated"))
+def test_install_picks_the_table_of_the_models_tp_size(low_m_on, monkeypatch, sharded):
+    monkeypatch.setattr(dense_gemms, "device_capability", lambda: (10, 3))
+    monkeypatch.setattr(_Mapping, "tp_size", 4)
+    model = _builtin_text_model()
+    plan = dense_gemms.install(_shard(model) if sharded else model, prefetch=False)
+    assert plan.kernels == dense_gemms.default_kernels(4, sharded)
+    monkeypatch.setattr(_Mapping, "tp_size", 2)
+    with pytest.raises(ValueError, match="no kernel table for SM"):
+        dense_gemms.install(_builtin_text_model(), prefetch=False)
 
 
 def test_install_takes_a_kernel_table(low_m_on, monkeypatch):
@@ -86,7 +123,7 @@ def test_install_takes_a_kernel_table(low_m_on, monkeypatch):
 def test_install_takes_the_devices_table(low_m_on, monkeypatch, capability):
     monkeypatch.setattr(dense_gemms, "device_capability", lambda: capability)
     plan = dense_gemms.install(_builtin_text_model(), prefetch=False)
-    assert plan.kernels == dense_gemms.default_kernels(capability)
+    assert plan.kernels == dense_gemms.default_kernels(capability=capability)
     assert plan.capability == capability
 
 

@@ -88,7 +88,7 @@ from tensorrt_llm._torch.speculative.dflash import DFlashWorker
 from tensorrt_llm.logger import logger
 
 from .dispatch import LAUNCH_PDL
-from .ops.gemm.fixed_low_m_gemm import SPLITK_TACTICS, fixed_low_m_gemm, tactic_for, takes
+from .ops.gemm.fixed_low_m_gemm import fixed_low_m_gemm, splitk_tactics, tactic_for, takes
 from .ops.spec.dflash_accept import (
     COUNTER_STRIDE,
     FORCE_FIXED,
@@ -112,18 +112,24 @@ FC_SHARD_WORLDS = (4, 8)
 FC_SHARD_TP8_ROWS = 1024
 
 
-def _gemm(x: torch.Tensor, weight: torch.Tensor, enable_pdl: bool) -> torch.Tensor:
-    """``x @ weight.T`` on the fixed low-M tactic when one is listed for the shape, else ``F.linear``."""
+def _gemm(
+    x: torch.Tensor, weight: torch.Tensor, enable_pdl: bool, tactics: Optional[dict] = None
+) -> torch.Tensor:
+    """``x @ weight.T`` on the fixed low-M tactic ``tactics`` lists for the shape, else ``F.linear``.
+
+    ``tactics`` is the table of the drafter's TP size (``splitk_tactics``); the
+    device's TP8 one when None.
+    """
     if takes(x, weight):
-        tactic = tactic_for(x.shape[0], x.shape[1], weight.shape[0])
+        tactic = tactic_for(x.shape[0], x.shape[1], weight.shape[0], tactics)
         if tactic is not None:
             return fixed_low_m_gemm(x, weight, tactic, enable_pdl)
     return F.linear(x, weight)
 
 
-def _listed(in_features: int, out_features: int) -> bool:
-    """Whether ``SPLITK_TACTICS`` lists a tactic for a ``[out_features, in_features]`` weight."""
-    return any((k, n) == (in_features, out_features) for _, k, n in SPLITK_TACTICS)
+def _listed(in_features: int, out_features: int, tactics: dict) -> bool:
+    """Whether ``tactics`` lists a tactic for a ``[out_features, in_features]`` weight."""
+    return any((k, n) == (in_features, out_features) for _, k, n in tactics)
 
 
 def _bound_to(bound, function: Callable) -> bool:
@@ -438,12 +444,13 @@ class FixedTacticProjection(nn.Linear):
     """A plain ``nn.Linear`` (no bias) whose listed shapes run ``fixed_low_m_gemm``.
 
     Never constructed: ``install_fixed_tactic_gemms`` re-classes the
-    convolutions' built-in ``kernel_projection``. ``_fixed_gemm_pdl`` is set then.
+    convolutions' built-in ``kernel_projection``. ``_fixed_gemm_pdl`` and
+    ``_fixed_gemm_tactics`` (the drafter TP size's table) are set then.
     """
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         if self.bias is None and input.dim() == 2:
-            return _gemm(input, self.weight, self._fixed_gemm_pdl)
+            return _gemm(input, self.weight, self._fixed_gemm_pdl, self._fixed_gemm_tactics)
         return super().forward(input)
 
 
@@ -458,9 +465,16 @@ class FixedTacticLinearMethod(UnquantizedLinearMethod):
     rows) is the built-in method's.
     """
 
-    def __init__(self, enable_pdl: bool) -> None:
+    def __init__(self, enable_pdl: bool, tactics: Optional[dict] = None) -> None:
         super().__init__()
         self.enable_pdl = enable_pdl
+        #: The tactic table of the drafter's TP size (``splitk_tactics``; the device's
+        #: TP8 one when None).
+        self.tactics = splitk_tactics() if tactics is None else tactics
+
+    def tactic_for(self, m: int, k: int, n: int):
+        """The fixed tactic this method runs a ``[m, k] x [n, k]^T`` call on, or None."""
+        return tactic_for(m, k, n, self.tactics)
 
     def apply(self, module, input, bias):
         if (
@@ -471,7 +485,7 @@ class FixedTacticLinearMethod(UnquantizedLinearMethod):
         ):
             x = input.reshape(-1, input.shape[-1])
             if takes(x, module.weight):
-                tactic = tactic_for(x.shape[0], x.shape[1], module.weight.shape[0])
+                tactic = self.tactic_for(x.shape[0], x.shape[1], module.weight.shape[0])
                 if tactic is not None:
                     out = fixed_low_m_gemm(x, module.weight, tactic, self.enable_pdl)
                     return out.view(*input.shape[:-1], module.weight.shape[0])
@@ -504,7 +518,9 @@ def fixed_tactic_precompute_context_kv(
     elif projected_hidden.dtype != weight_dtype:
         projected_hidden = projected_hidden.to(weight_dtype)
 
-    kv_flat = _gemm(projected_hidden, self._fused_kv_weight, self._fixed_gemm_pdl)
+    kv_flat = _gemm(
+        projected_hidden, self._fused_kv_weight, self._fixed_gemm_pdl, self._fixed_gemm_tactics
+    )
     kv = kv_flat.view(N, L, 2, nkv, hd)
     k = kv[:, :, 0].contiguous()
     v = kv[:, :, 1].contiguous()
@@ -531,19 +547,19 @@ class FixedTacticSites:
     changed: int = field(default=0, compare=False)
 
 
-def _projection_reason(proj: nn.Module) -> Optional[str]:
+def _projection_reason(proj: nn.Module, tactics: dict) -> Optional[str]:
     if type(proj) not in (nn.Linear, FixedTacticProjection):
         return f"is {type(proj).__name__}, not a plain nn.Linear"
     if proj.bias is not None:
         return "has a bias"
     if proj.weight.dtype != torch.bfloat16:
         return f"weight is {proj.weight.dtype}"
-    if not _listed(proj.in_features, proj.out_features):
+    if not _listed(proj.in_features, proj.out_features, tactics):
         return f"no fixed tactic for a [{proj.out_features}, {proj.in_features}] weight"
     return None
 
 
-def _linear_reason(module: Linear) -> Optional[str]:
+def _linear_reason(module: Linear, tactics: dict) -> Optional[str]:
     method = module.quant_method
     if type(method) is not UnquantizedLinearMethod:
         return f"quant method is {type(method).__name__}"
@@ -554,7 +570,7 @@ def _linear_reason(module: Linear) -> Optional[str]:
     if getattr(module, "use_custom_cublas_mm", False):
         return "runs the custom cuBLAS GEMM (output may live in an NCCL window)"
     out_features, in_features = module.weight.shape
-    if not _listed(in_features, out_features):
+    if not _listed(in_features, out_features, tactics):
         return f"no fixed tactic for a [{out_features}, {in_features}] weight"
     return None
 
@@ -568,16 +584,20 @@ def _context_kv_reason(draft_model: DFlashForCausalLM) -> Optional[str]:
     return None
 
 
-def install_fixed_tactic_gemms(draft_model: nn.Module, enable_pdl: bool) -> FixedTacticSites:
+def install_fixed_tactic_gemms(
+    draft_model: nn.Module, enable_pdl: bool, tactics: Optional[dict] = None
+) -> FixedTacticSites:
     """Put the drafter's small GEMMs on fixed tactics; return which call sites changed and which not.
 
-    Idempotent. The candidates are the DFlash 2 convolutions'
+    ``tactics`` is the table of the drafter's TP size (``splitk_tactics``; the
+    device's TP8 one when None). Idempotent. The candidates are the DFlash 2 convolutions'
     ``kernel_projection`` (``nn.Linear``), the decoder layers' ``Linear``
     modules, and the fused context K/V GEMM of ``precompute_context_kv``. A
     candidate changes only if it is still the built-in (class, quant method,
     method binding), bias-free BF16, and its shape has a listed tactic;
     every other candidate is reported in ``declined`` with the reason.
     """
+    tactics = splitk_tactics() if tactics is None else tactics
     if not isinstance(draft_model, DFlashForCausalLM):
         return FixedTacticSites(0, (f"not a DFlashForCausalLM ({type(draft_model).__name__})",))
     installed, changed, declined = 0, 0, []
@@ -588,7 +608,7 @@ def install_fixed_tactic_gemms(draft_model: nn.Module, enable_pdl: bool) -> Fixe
                 declined.append(f"{where} is {type(conv).__name__}, not a DFlash2BlockConv")
                 continue
             proj = conv.kernel_projection
-            reason = _projection_reason(proj)
+            reason = _projection_reason(proj, tactics)
             if reason is not None:
                 declined.append(f"{where}.kernel_projection {reason}")
                 continue
@@ -596,6 +616,7 @@ def install_fixed_tactic_gemms(draft_model: nn.Module, enable_pdl: bool) -> Fixe
                 proj.__class__ = FixedTacticProjection
                 changed += 1
             proj._fixed_gemm_pdl = enable_pdl
+            proj._fixed_gemm_tactics = tactics
             installed += 1
     for name, module in draft_model.model.layers.named_modules():
         if not isinstance(module, Linear):
@@ -603,13 +624,14 @@ def install_fixed_tactic_gemms(draft_model: nn.Module, enable_pdl: bool) -> Fixe
         method = module.quant_method
         if type(method) is FixedTacticLinearMethod:
             method.enable_pdl = enable_pdl
+            method.tactics = tactics
             installed += 1
             continue
-        reason = _linear_reason(module)
+        reason = _linear_reason(module, tactics)
         if reason is not None:
             declined.append(f"model.layers.{name} {reason}")
             continue
-        module.quant_method = FixedTacticLinearMethod(enable_pdl)
+        module.quant_method = FixedTacticLinearMethod(enable_pdl, tactics)
         installed += 1
         changed += 1
     reason = _context_kv_reason(draft_model)
@@ -617,6 +639,7 @@ def install_fixed_tactic_gemms(draft_model: nn.Module, enable_pdl: bool) -> Fixe
         declined.append(f"context K/V GEMM: {reason}")
     else:
         draft_model._fixed_gemm_pdl = enable_pdl
+        draft_model._fixed_gemm_tactics = tactics
         if not _bound_to(
             draft_model.__dict__.get("precompute_context_kv"), fixed_tactic_precompute_context_kv
         ):
@@ -653,7 +676,8 @@ def install(
     Raises:
         ValueError: if ``fc_shard`` or ``fused_accept`` is asked for and cannot be installed
             (no drafter / worker, or the reason its install declined), or
-            ``fixed_gemms`` is asked for and some drafter GEMM call site takes no fixed
+            ``fixed_gemms`` is asked for on a TP size without a tactic table
+            (``splitk_tactics``: 4 and 8) or some drafter GEMM call site takes no fixed
             tactic -- running the built-in path under the fast path's name would
             misreport what runs.
     """
@@ -690,7 +714,14 @@ def install(
     if fixed_gemms:
         if draft_model is None:
             raise ValueError("[musespark_open] drafter_fixed_gemms cannot run here: no drafter")
-        sites = install_fixed_tactic_gemms(draft_model, enable_pdl)
+        tp_size = getattr(mapping, "tp_size", None)
+        try:
+            tactics = splitk_tactics(tp_size)
+        except ValueError as error:
+            raise ValueError(
+                f"[musespark_open] drafter_fixed_gemms cannot run here: {error}"
+            ) from error
+        sites = install_fixed_tactic_gemms(draft_model, enable_pdl, tactics)
         total = sites.installed + len(sites.declined)
         if not sites.installed or sites.declined:
             # The sites follow from the drafter's structure, the same on every rank.
@@ -702,5 +733,5 @@ def install(
         if sites.changed:
             logger.info(
                 f"[musespark_open] drafter_fixed_gemms: {sites.installed} of {total} drafter GEMM call sites "
-                "on fixed low-M tactics"
+                f"on fixed low-M tactics (the TP{tp_size} table)"
             )

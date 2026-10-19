@@ -8,7 +8,7 @@ each rank and caches the winner per rank; ranks can and do settle on
 different kernels for one shape, and plain ``nn.Linear`` / ``F.linear`` call
 sites never reach it. This entry is the split-K kernel the dispatcher would
 launch, with the tactic chosen by the caller: one tactic per shape, the same
-on every rank, measured once on each target GPU (``SPLITK_TACTICS_BY_SM``).
+on every rank, measured once per target GPU and TP size (``SPLITK_TACTICS_BY_SM_TP``).
 
 The kernel accumulates in fp32 and rounds once; its K-split differs from
 cuBLAS's, so results differ from ``F.linear`` in the last bf16 place on a few
@@ -26,9 +26,9 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import (
     true_fp32_matmul,
 )
 
-#: The split-K tactic ``(mma_m, mma_n, split_k, ab_stages)`` per ``(M, K, N)`` on sm103,
-#: chosen on GB300 with cold weights and PDL on; each one beats cuBLAS at its
-#: shape. Shapes not listed are not taken by this op's callers.
+#: The split-K tactic ``(mma_m, mma_n, split_k, ab_stages)`` per ``(M, K, N)`` of a
+#: tep8 drafter (two trays) on sm103, chosen on GB300 with cold weights and PDL on;
+#: each one beats cuBLAS at its shape. Shapes not listed are not taken by this op's callers.
 SPLITK_TACTICS: dict[tuple[int, int, int], tuple[int, int, int, int]] = {
     # DFlash 2 convolution coefficient projection (replicated).
     (8, 8192, 2048): (64, 8, 4, 10),
@@ -54,46 +54,77 @@ SM107_SPLITK_TACTICS: dict[tuple[int, int, int], tuple[int, int, int, int]] = {
     (8, 40960, 1024): (64, 8, 4, 12),
 }
 
-#: The tactic table of each supported device compute capability; each lists the same shapes.
-SPLITK_TACTICS_BY_SM: dict[
-    tuple[int, int], dict[tuple[int, int, int], tuple[int, int, int, int]]
+#: The same for a tep4 drafter (one tray) on sm103: every TP-sharded projection is
+#: twice the tep8 one along its sharded dimension; the replicated convolution
+#: coefficient projection is the tep8 one. The fastest split-K tactic of each shape in
+#: chains of cold weights with PDL on; it beats cuBLAS on the qkv, gate_up and
+#: convolution shapes, ties it on down_proj and trails it slightly on o_proj in
+#: isolation, where ``drafter_pdl_chain``'s early weight load is what it is for.
+SPLITK_TACTICS_TP4: dict[tuple[int, int, int], tuple[int, int, int, int]] = {
+    # DFlash 2 convolution coefficient projection (replicated).
+    (8, 8192, 2048): (64, 8, 4, 10),
+    # drafter qkv_proj per rank, and the fused context K/V projection.
+    (8, 8192, 2560): (64, 8, 2, 11),
+    # drafter o_proj per rank.
+    (8, 2048, 8192): (64, 8, 1, 11),
+    # drafter down_proj per rank.
+    (8, 7168, 8192): (64, 8, 1, 11),
+    # drafter gate_up_proj per rank.
+    (8, 8192, 14336): (128, 8, 1, 6),
+}
+
+#: The measured table of each ``(compute capability, drafter TP size)``.
+SPLITK_TACTICS_BY_SM_TP: dict[
+    tuple[tuple[int, int], int], dict[tuple[int, int, int], tuple[int, int, int, int]]
 ] = {
-    (10, 3): SPLITK_TACTICS,
-    (10, 7): SM107_SPLITK_TACTICS,
+    ((10, 3), 8): SPLITK_TACTICS,
+    ((10, 3), 4): SPLITK_TACTICS_TP4,
+    ((10, 7), 8): SM107_SPLITK_TACTICS,
 }
 
 #: The kernel's row limit (the dispatcher's ``_MAX_M``).
 MAX_M = 32
 
-_DEVICE_TACTICS: dict[tuple[int, int, int], tuple[int, int, int, int]] | None = None
+_DEVICE_CAPABILITY: tuple[int, int] | None = None
 
 
-def device_tactics() -> dict[tuple[int, int, int], tuple[int, int, int, int]]:
-    """The tactic table of this process's CUDA device (``SPLITK_TACTICS_BY_SM``), read once.
+def device_capability() -> tuple[int, int]:
+    """This process's CUDA device compute capability, read once.
 
-    On a host without CUDA, where no kernel launches, the target's own sm103 table.
-
-    Raises:
-        ValueError: on a device of another compute capability.
+    On a host without CUDA, where no kernel launches, the target's own sm103.
     """
-    global _DEVICE_TACTICS
-    if _DEVICE_TACTICS is None:
-        capability = (
+    global _DEVICE_CAPABILITY
+    if _DEVICE_CAPABILITY is None:
+        _DEVICE_CAPABILITY = (
             tuple(torch.cuda.get_device_capability()) if torch.cuda.is_available() else (10, 3)
         )
-        table = SPLITK_TACTICS_BY_SM.get(capability)
-        if table is None:
-            raise ValueError(
-                f"fixed_low_m_gemm: no split-K tactics for SM {capability} "
-                f"(supported: {sorted(SPLITK_TACTICS_BY_SM)})"
-            )
-        _DEVICE_TACTICS = table
-    return _DEVICE_TACTICS
+    return _DEVICE_CAPABILITY
 
 
-def tactic_for(m: int, k: int, n: int):
-    """The fixed tactic for this shape on this device, or None when the shape is not covered."""
-    return device_tactics().get((m, k, n))
+def splitk_tactics(
+    tp_size: int = 8, capability: tuple[int, int] | None = None
+) -> dict[tuple[int, int, int], tuple[int, int, int, int]]:
+    """The tactic table of a drafter on a TP group of ``tp_size`` on ``capability``.
+
+    ``capability`` defaults to this process's device (``device_capability``).
+
+    Raises:
+        ValueError: if ``SPLITK_TACTICS_BY_SM_TP`` has no table for the pair.
+    """
+    key = (tuple(device_capability() if capability is None else capability), tp_size)
+    table = SPLITK_TACTICS_BY_SM_TP.get(key)
+    if table is None:
+        raise ValueError(
+            f"fixed_low_m_gemm: no split-K tactics for SM {key[0]} at TP {key[1]} "
+            f"(supported: {sorted(SPLITK_TACTICS_BY_SM_TP)})"
+        )
+    return table
+
+
+def tactic_for(m: int, k: int, n: int, tactics: dict | None = None):
+    """The fixed tactic for this shape in ``tactics`` (a ``splitk_tactics`` table; the
+    device's TP8 one when None), or None when the shape is not covered."""
+    return (splitk_tactics() if tactics is None else tactics).get((m, k, n))
 
 
 def takes(x: torch.Tensor, weight: torch.Tensor) -> bool:
@@ -120,31 +151,47 @@ class FixedLowMGemm(OpWrapper):
 
     ARCHS = frozenset({Arch.SM_103})
 
-    # spec: m, k, n; the tactic is SPLITK_TACTICS[(m, k, n)].
+    # spec: m, k, n, tp; the tactic is splitk_tactics(tp)[(m, k, n)].
     CELLS: tuple[Cell, ...] = (
         Cell(
             why="DFlash 2 convolution coefficient projection, replicated [2048, 8192], verify block 8",
-            spec=dict(m=8, k=8192, n=2048),
+            spec=dict(m=8, k=8192, n=2048, tp=8),
         ),
         Cell(
             why="drafter qkv_proj per TP8 rank [1280, 8192]; also the fused context K/V projection",
-            spec=dict(m=8, k=8192, n=1280),
+            spec=dict(m=8, k=8192, n=1280, tp=8),
         ),
         Cell(
             why="drafter o_proj per TP8 rank [8192, 1024]",
-            spec=dict(m=8, k=1024, n=8192),
+            spec=dict(m=8, k=1024, n=8192, tp=8),
         ),
         Cell(
             why="drafter down_proj per TP8 rank [8192, 3584]",
-            spec=dict(m=8, k=3584, n=8192),
+            spec=dict(m=8, k=3584, n=8192, tp=8),
         ),
         Cell(
             why="drafter gate_up_proj per TP8 rank [7168, 8192]",
-            spec=dict(m=8, k=8192, n=7168),
+            spec=dict(m=8, k=8192, n=7168, tp=8),
         ),
         Cell(
             why="DFlash fc, one TP8 column shard [1024, 5 * 8192]",
-            spec=dict(m=8, k=40960, n=1024),
+            spec=dict(m=8, k=40960, n=1024, tp=8),
+        ),
+        Cell(
+            why="drafter qkv_proj per TP4 rank [2560, 8192]; also the fused context K/V projection",
+            spec=dict(m=8, k=8192, n=2560, tp=4),
+        ),
+        Cell(
+            why="drafter o_proj per TP4 rank [8192, 2048]",
+            spec=dict(m=8, k=2048, n=8192, tp=4),
+        ),
+        Cell(
+            why="drafter down_proj per TP4 rank [8192, 7168]: the deepest K of the drafter",
+            spec=dict(m=8, k=7168, n=8192, tp=4),
+        ),
+        Cell(
+            why="drafter gate_up_proj per TP4 rank [14336, 8192]: the widest N of the drafter",
+            spec=dict(m=8, k=8192, n=14336, tp=4),
         ),
     )
 
@@ -159,7 +206,8 @@ class FixedLowMGemm(OpWrapper):
     Call sites (``drafter_fixed_gemms`` / ``drafter_fc_shard``, ``drafter_worker.py``): the
     drafter's convolution coefficient projections, its context K/V projection,
     its TP-sharded ``qkv`` / ``o_proj`` / ``gate_up`` / ``down`` projections, and the
-    DFlash ``fc`` shard -- each only at the shapes in ``SPLITK_TACTICS``.
+    DFlash ``fc`` shard -- each only at the shapes in the table of the drafter's
+    TP size (``splitk_tactics``).
 
     Numerics: fp32 accumulation, one rounding to bf16; the K-split order is
     the tactic's. Within one bf16 ulp of the fp32 ``reference`` per element

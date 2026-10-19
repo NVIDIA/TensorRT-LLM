@@ -576,6 +576,22 @@ def _mnnvl_fp32_all_reduce(text_model, model_config) -> bool:
     )
 
 
+def _mnnvl_bf16_all_reduce(text_model, model_config) -> bool:
+    """Whether an explicitly requested BF16 MNNVL all-reduce is built on this TP group.
+
+    The drafter hops' row projections need one; on one tray the hops' install
+    requests it by name. Allocates nothing.
+    """
+    import torch
+
+    from tensorrt_llm._torch.distributed.ops import MNNVLAllReduce
+
+    mapping = getattr(model_config, "mapping", None)
+    return mapping is not None and bool(
+        MNNVLAllReduce.is_mnnvl(mapping, torch.bfloat16, explicitly_requested=True)
+    )
+
+
 def _fabric_finalize(text_model, model_config) -> bool:
     workspace = getattr(text_model, "_finalize_ar_workspace", None)
     return workspace is not None and all(
@@ -680,6 +696,11 @@ PRECONDITIONS: Tuple[Precondition, ...] = (
         "an MNNVL FP32 all-reduce on the TP group (the draft head's key exchange)",
         _mnnvl_fp32_all_reduce,
         ("draft_head",),
+    ),
+    Precondition(
+        "an MNNVL BF16 all-reduce on the TP group (the drafter hops' row projections)",
+        _mnnvl_bf16_all_reduce,
+        ("drafter_hops",),
     ),
     Precondition(
         "the fabric fused finalize all-reduce (MUSESPARK_OPEN_FUSED_FINALIZE_AR_MNNVL=1)",

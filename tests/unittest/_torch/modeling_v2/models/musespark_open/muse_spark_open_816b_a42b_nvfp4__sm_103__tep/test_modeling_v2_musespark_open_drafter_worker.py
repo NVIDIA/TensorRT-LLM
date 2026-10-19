@@ -43,6 +43,8 @@ def _no_runtime_hooks(monkeypatch):
 
 
 _SHELL = modeling.ModelingV2MuseSparkOpen816bA42bNvfp4Sm103Tep
+#: A TP8 mapping as far as ``drafter_worker.install`` reads it (the fixed GEMMs' tactic table).
+_TP8 = SimpleNamespace(tp_size=8)
 
 
 @pytest.fixture
@@ -300,7 +302,7 @@ def test_install_refuses_a_selected_feature_it_cannot_install(
     logged = _record_logs(monkeypatch)
     switches = [name == feature for name in ("fc_shard", "fused_accept", "fixed_gemms")]
     with pytest.raises(ValueError, match=match):
-        drafter_worker.install(drafter, worker, None, *switches)
+        drafter_worker.install(drafter, worker, _TP8, *switches)
     assert logged == []
 
 
@@ -331,14 +333,14 @@ def test_install_logs_a_feature_only_on_the_call_that_changed_something(monkeypa
     worker._saved_ctx_base = None
     worker._saved_ctx_base_host = None
     drafter = _context_kv_drafter()
-    drafter_worker.install(drafter, worker, None, False, True, True)
+    drafter_worker.install(drafter, worker, _TP8, False, True, True)
     assert [level for level, _ in logged] == ["info", "info"]
     assert "fused_accept: DFlash acceptance" in logged[0][1]
     assert "worker class FusedAcceptDFlashWorker" in logged[0][1]
     assert (
         "drafter_fixed_gemms: 1 of 1 drafter GEMM call sites on fixed low-M tactics" in logged[1][1]
     )
-    drafter_worker.install(drafter, worker, None, False, True, True)
+    drafter_worker.install(drafter, worker, _TP8, False, True, True)
     assert len(logged) == 2
     sites = drafter_worker.install_fixed_tactic_gemms(drafter, enable_pdl=False)
     assert (sites.installed, sites.changed, sites.declined) == (1, 0, ())
@@ -353,7 +355,7 @@ def test_a_drafter_gemm_site_without_a_fixed_tactic_fails_the_install(monkeypatc
         match=r"drafter_fixed_gemms cannot run here: 1 of 2 drafter GEMM call sites take no fixed tactic "
         r"\(attention_convs.0 is Identity, not a DFlash2BlockConv\)",
     ):
-        drafter_worker.install(drafter, None, None, False, False, True)
+        drafter_worker.install(drafter, None, _TP8, False, False, True)
     assert logged == []
 
 

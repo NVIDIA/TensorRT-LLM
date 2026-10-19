@@ -703,10 +703,12 @@ def test_a_capture_that_fails_part_way_gives_the_site_order_back(env, transport)
 def test_microbenchmark(env):
     """The drafter's hop chain in one graph: built-in three kernels vs the fused hop.
 
-    Per forward 5 layers x (o_proj GEMM [8, 1024] x [1024, 8192] -> hop -> the next
-    conv projection [8, 8192] x [8192, 2048], down GEMM [8, 3584] x [3584, 8192]
-    -> hop -> the next conv projection), every GEMM on the drafter's fixed split-K tactic
-    with PDL and distinct cold weights, the hop's output feeding the next GEMM.
+    Per forward 5 layers x (o_proj GEMM [8, K_o] x [K_o, 8192] -> hop -> the next
+    conv projection [8, 8192] x [8192, 2048], down GEMM [8, K_d] x [K_d, 8192]
+    -> hop -> the next conv projection), at the world's per-rank drafter shapes
+    (K_o, K_d = 1024, 3584 at 8 ranks; 2048, 7168 at 4), every GEMM on the drafter's
+    fixed split-K tactic of that world with PDL and distinct cold weights, the hop's
+    output feeding the next GEMM.
     Per arm the median of 2 x 5 x 50 replays, arms timed in order and reversed;
     max over ranks; microseconds per hop site. Also the hops alone.
     """
@@ -714,6 +716,7 @@ def test_microbenchmark(env):
 
     from tensorrt_llm._torch._experimental.modeling_v2.models.musespark_open.muse_spark_open_816b_a42b_nvfp4__sm_103__tep.ops.gemm.fixed_low_m_gemm import (  # noqa: E501
         fixed_low_m_gemm,
+        splitk_tactics,
         tactic_for,
     )
     from tensorrt_llm._torch._experimental.modeling_v2.models.musespark_open.muse_spark_open_816b_a42b_nvfp4__sm_103__tep.ops.spec.dflash2_block_conv import (  # noqa: E501
@@ -722,20 +725,23 @@ def test_microbenchmark(env):
 
     dev = torch.device("cuda", torch.cuda.current_device())
     g = torch.Generator().manual_seed(5)
+    tactics = splitk_tactics(WORLD)
+    k_o, k_d = HIDDEN // WORLD, 3584 * 8 // WORLD
 
     def w(n, k):
         return (0.02 * torch.randn(n, k, generator=g)).to(torch.bfloat16).to(dev)
 
     layers = 5
-    o_w = [w(HIDDEN, 1024) for _ in range(layers)]
-    d_w = [w(HIDDEN, 3584) for _ in range(layers)]
+    o_w = [w(HIDDEN, k_o) for _ in range(layers)]
+    d_w = [w(HIDDEN, k_d) for _ in range(layers)]
     c_w = [w(2048, HIDDEN) for _ in range(2 * layers)]
     partials, residual0, coefficients0, base, weight = _inputs(8, 99)
-    xo = partials[RANK][:, :1024].contiguous()
-    xd = (torch.randn(8, 3584, generator=g)).to(torch.bfloat16).to(dev)
+    xo = partials[RANK][:, :k_o].contiguous()
+    xd = (torch.randn(8, k_d, generator=g)).to(torch.bfloat16).to(dev)
 
     def gemm(x, weight_):
-        return fixed_low_m_gemm(x, weight_, tactic_for(8, x.shape[1], weight_.shape[0]), True)
+        tactic = tactic_for(8, x.shape[1], weight_.shape[0], tactics)
+        return fixed_low_m_gemm(x, weight_, tactic, True)
 
     def chain(arm, with_gemm):
         residual = residual0.clone()
@@ -750,7 +756,7 @@ def test_microbenchmark(env):
                 if arm == "direct":
                     ws = env["workspaces"]["direct"]
                     out = ws.direct_output(ws.next_site, 8)
-                    tactic = SplitKTactic(*tactic_for(8, src.shape[1], HIDDEN))
+                    tactic = SplitKTactic(*tactic_for(8, src.shape[1], HIDDEN, tactics))
                     run_splitk_dense(src, wt.t(), None, out, True, tactic)
                     part = None
                 else:

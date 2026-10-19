@@ -23,8 +23,11 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.musespark_open.muse_sp
     spec_worker as drafter_worker,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.musespark_open.muse_spark_open_816b_a42b_nvfp4__sm_103__tep.ops.gemm.fixed_low_m_gemm import (  # noqa: E501
+    SM107_SPLITK_TACTICS,
     SPLITK_TACTICS,
-    SPLITK_TACTICS_BY_SM,
+    SPLITK_TACTICS_BY_SM_TP,
+    SPLITK_TACTICS_TP4,
+    splitk_tactics,
     tactic_for,
     takes,
 )
@@ -47,6 +50,8 @@ assert torch.cuda.is_available(), "fixed_low_m_gemm requires a CUDA device"
 #: i.e. up to 2 of these units. RMS: only the elements whose fp32 sums
 #: straddle a rounding boundary differ (<1 % of them here).
 ELEMENT_ULP, RMS_ULP = 2.0, 0.25
+#: The compute capability the certified cells and the TP4 table were measured on.
+_SM103 = (10, 3)
 
 
 def _seed(text: str) -> int:
@@ -65,7 +70,7 @@ def _operands(m, k, n, seed):
 def test_certified_cells(cell, certifying):  # noqa: F811
     certifying(op)
     m, k, n = (cell.spec[d] for d in ("m", "k", "n"))
-    tactic = SPLITK_TACTICS[(m, k, n)]
+    tactic = splitk_tactics(cell.spec["tp"], _SM103)[(m, k, n)]
     x, w = _operands(m, k, n, _seed(cell.why))
     out = op(x, w, tactic, True)
     assert out.shape == (m, n) and out.dtype == torch.bfloat16 and out.is_contiguous()
@@ -78,16 +83,43 @@ def test_certified_cells(cell, certifying):  # noqa: F811
     assert err <= cublas_err + one_ulp, (err, cublas_err, one_ulp)
 
 
+def test_the_tactic_tables_by_sm_and_tp_size():
+    """On sm103, TP4 and TP8 each have a table covering every drafter call site of that width;
+    sm107 has the TP8 shapes; other pairs none."""
+    assert splitk_tactics(8, _SM103) is SPLITK_TACTICS
+    assert splitk_tactics(4, _SM103) is SPLITK_TACTICS_TP4
+    assert splitk_tactics(8, (10, 7)) is SM107_SPLITK_TACTICS
+    assert set(SM107_SPLITK_TACTICS) == set(SPLITK_TACTICS)
+    for tp in (1, 2, 16):
+        with pytest.raises(ValueError, match=rf"no split-K tactics for SM \(10, 3\) at TP {tp}"):
+            splitk_tactics(tp, _SM103)
+    with pytest.raises(ValueError, match=r"no split-K tactics for SM \(10, 7\) at TP 4"):
+        splitk_tactics(4, (10, 7))
+    # Every TP-sharded drafter projection is twice as wide (or deep) per rank at TP4.
+    sharded = {(8192, 1280): (8192, 2560), (1024, 8192): (2048, 8192)}
+    sharded.update({(3584, 8192): (7168, 8192), (8192, 7168): (8192, 14336)})
+    for tp8, tp4 in sharded.items():
+        assert (8, *tp8) in SPLITK_TACTICS and (8, *tp4) in SPLITK_TACTICS_TP4
+    # The replicated convolution coefficient projection is the same at both widths.
+    assert (8, 8192, 2048) in SPLITK_TACTICS and (8, 8192, 2048) in SPLITK_TACTICS_TP4
+    # drafter_fc_shard's TP4 shard runs the built-in GEMM: it has no TP4 entry.
+    assert (8, 40960, 1024) not in SPLITK_TACTICS_TP4
+    assert {c.spec["tp"] for c in op.CELLS} == {4, 8}
+    for cell in op.CELLS:
+        spec = cell.spec
+        assert (spec["m"], spec["k"], spec["n"]) in splitk_tactics(spec["tp"], _SM103), cell.why
+
+
 @pytest.mark.parametrize("shape", sorted(SPLITK_TACTICS))
 @torch.inference_mode()
 def test_the_devices_tactic_meets_the_cells_band(shape):
-    """``tactic_for`` gives this device's tactic (``SPLITK_TACTICS_BY_SM``) for every listed
-    shape, within the certified cells' band of the fp32 reference and no farther from
+    """``tactic_for`` gives this device's TP8 tactic (``SPLITK_TACTICS_BY_SM_TP``) for every
+    listed shape, within the certified cells' band of the fp32 reference and no farther from
     fp64 than cuBLAS."""
     m, k, n = shape
     capability = torch.cuda.get_device_capability()
     tactic = tactic_for(m, k, n)
-    assert tactic == SPLITK_TACTICS_BY_SM[capability][shape]
+    assert tactic == SPLITK_TACTICS_BY_SM_TP[capability, 8][shape]
     x, w = _operands(m, k, n, _seed(f"device {shape}"))
     out = op(x, w, tactic, True)
     assert_within_ulp(out, op.reference(x, w, tactic, True), ELEMENT_ULP, RMS_ULP)
@@ -98,19 +130,22 @@ def test_the_devices_tactic_meets_the_cells_band(shape):
     assert err <= cublas_err + one_ulp, (err, cublas_err, one_ulp)
 
 
-@pytest.mark.parametrize("shape", sorted(SPLITK_TACTICS))
+@pytest.mark.parametrize(
+    "tp, shape", [(tp, shape) for tp in (8, 4) for shape in sorted(splitk_tactics(tp, _SM103))]
+)
 @torch.inference_mode()
-def test_cuda_graph_replay_follows_new_inputs(shape):
+def test_cuda_graph_replay_follows_new_inputs(tp, shape):
     m, k, n = shape
+    tactic = splitk_tactics(tp, _SM103)[shape]
     x, w = _operands(m, k, n, 3)
-    op(x, w, SPLITK_TACTICS[shape], True)  # JIT outside the capture
+    op(x, w, tactic, True)  # JIT outside the capture
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        out = op(x, w, SPLITK_TACTICS[shape], True)
+        out = op(x, w, tactic, True)
     for scale in (1.0, 7.0, 0.01):
         x.copy_(torch.randn_like(x, dtype=torch.float32).mul_(scale).to(x.dtype))
         graph.replay()
-        assert torch.equal(out, op(x, w, SPLITK_TACTICS[shape], True))
+        assert torch.equal(out, op(x, w, tactic, True))
 
 
 @torch.inference_mode()
@@ -129,7 +164,14 @@ def test_takes_refuses_what_the_kernel_does_not_take():
 # --------------------------------------------------------------------------
 # drafter_fixed_gemms install on the drafter's module classes
 # --------------------------------------------------------------------------
-def _stand_in_drafter():
+#: The drafter's per-rank TP-sharded projections ``name: (K, N)`` at TP8 and TP4.
+TP8_LAYER = dict(qkv_proj=(8192, 1280), o_proj=(1024, 8192), down_proj=(3584, 8192))
+TP4_LAYER = dict(
+    qkv_proj=(8192, 2560), o_proj=(2048, 8192), down_proj=(7168, 8192), gate_up_proj=(8192, 14336)
+)
+
+
+def _stand_in_drafter(layer_shapes=None):
     """A DFlashForCausalLM carrying the module classes drafter_fixed_gemms touches, at the real per-rank shapes."""
     drafter = DFlashForCausalLM.__new__(DFlashForCausalLM)
     nn.Module.__init__(drafter)
@@ -151,9 +193,7 @@ def _stand_in_drafter():
     drafter.attention_convs = nn.ModuleList([conv()])
     drafter.mlp_convs = nn.ModuleList([conv()])
     layer = nn.Module()
-    for name, (k, n) in dict(
-        qkv_proj=(8192, 1280), o_proj=(1024, 8192), down_proj=(3584, 8192)
-    ).items():
+    for name, (k, n) in (TP8_LAYER if layer_shapes is None else layer_shapes).items():
         lin = Linear(k, n, bias=False, dtype=torch.bfloat16)
         lin.weight.data = (0.02 * torch.randn(n, k, generator=g, device="cuda")).to(torch.bfloat16)
         setattr(layer, name, lin)
@@ -198,7 +238,7 @@ def test_install_reclasses_only_and_runs_the_fixed_tactic():
     inputs = {"conv": x8[8192], "qkv": x8[8192], "o": x8[1024], "down": x8[3584]}
     for name in after:
         w, x = weights[name], inputs[name]
-        tactic = SPLITK_TACTICS[(8, x.shape[1], w.shape[0])]
+        tactic = splitk_tactics(8)[(8, x.shape[1], w.shape[0])]
         assert torch.equal(after[name], op(x, w, tactic, True)), name
         assert_within_ulp(after[name], before[name], ELEMENT_ULP, 2 * RMS_ULP)
     # Shapes the table does not list run the built-in path, unchanged.
@@ -213,6 +253,41 @@ def test_install_reclasses_only_and_runs_the_fixed_tactic():
     )
 
 
+@torch.inference_mode()
+def test_tp4_install_runs_the_tp4_tactics_and_the_tp8_table_declines_tp4_shapes():
+    """At TP4 every drafter call site takes the TP4 table's tactic, within the band of the built-in."""
+    from types import SimpleNamespace
+
+    if torch.cuda.get_device_capability() != _SM103:
+        pytest.skip("the TP4 tactic table is measured on sm103 only")
+
+    drafter = _stand_in_drafter(TP4_LAYER)
+    layer = drafter.model.layers[0]
+    # The TP8 table lists none of the TP4 per-rank shapes: the old refusal at TP4.
+    declined = drafter_worker.install_fixed_tactic_gemms(_stand_in_drafter(TP4_LAYER), True)
+    assert len(declined.declined) == 4 and all("no fixed tactic" in d for d in declined.declined)
+    with pytest.raises(ValueError, match="no split-K tactics for SM"):
+        drafter_worker.install(drafter, None, SimpleNamespace(tp_size=2), False, False, True)
+    inputs = {
+        name: torch.randn(8, k, device="cuda").to(torch.bfloat16)
+        for name, (k, _) in TP4_LAYER.items()
+    }
+    before = {name: getattr(layer, name)(x) for name, x in inputs.items()}
+    drafter_worker.install(drafter, None, SimpleNamespace(tp_size=4), False, False, True)
+    for name, x in inputs.items():
+        linear = getattr(layer, name)
+        assert type(linear.quant_method) is drafter_worker.FixedTacticLinearMethod
+        assert linear.quant_method.tactics is SPLITK_TACTICS_TP4
+        tactic = SPLITK_TACTICS_TP4[(8, x.shape[1], linear.weight.shape[0])]
+        after = linear(x)
+        assert torch.equal(after, op(x, linear.weight, tactic, True)), name
+        assert_within_ulp(after, before[name], ELEMENT_ULP, 2 * RMS_ULP)
+    proj = drafter.attention_convs[0].kernel_projection
+    assert proj._fixed_gemm_tactics is SPLITK_TACTICS_TP4
+    x = inputs["qkv_proj"]
+    assert torch.equal(proj(x), op(x, proj.weight, SPLITK_TACTICS_TP4[(8, 8192, 2048)], True))
+
+
 @pytest.mark.parametrize("mode", ["inference_mode", "no_grad"])
 def test_projection_with_trainable_weights_runs_under_inference(mode):
     """As served: weights built outside inference mode (the conv's ``nn.Linear``
@@ -225,7 +300,7 @@ def test_projection_with_trainable_weights_runs_under_inference(mode):
     with ctx:
         x = torch.randn(8, 8192, device="cuda").to(torch.bfloat16)
         out = proj(x)
-        tactic = SPLITK_TACTICS[(8, 8192, proj.weight.shape[0])]
+        tactic = splitk_tactics(8)[(8, 8192, proj.weight.shape[0])]
         assert torch.equal(out, op(x, proj.weight.detach(), tactic, True))
         assert torch.equal(op(x, proj.weight, tactic, True), out)
 
@@ -261,7 +336,7 @@ def test_context_kv_is_the_builtin_body_with_the_gemm_swapped(monkeypatch):
     # rounded again: two more roundings on each side.
     assert_within_ulp(k1.reshape(8, -1), k0.reshape(8, -1), 2 * ELEMENT_ULP, 4 * RMS_ULP)
     # With the GEMM put back, the written-out body is bitwise the built-in.
-    monkeypatch.setattr(drafter_worker, "_gemm", lambda x, w, pdl: F.linear(x, w))
+    monkeypatch.setattr(drafter_worker, "_gemm", lambda x, w, pdl, tactics: F.linear(x, w))
     k2, v2 = drafter.precompute_context_kv(ph, pos)
     assert torch.equal(k2, k0) and torch.equal(v2, v0)
 

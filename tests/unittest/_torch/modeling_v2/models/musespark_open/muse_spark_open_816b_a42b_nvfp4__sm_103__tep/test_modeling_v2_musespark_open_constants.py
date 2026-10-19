@@ -393,7 +393,7 @@ MODULE_CONSTANTS = {'kernels.capture_fold.fold': {'LAYER_KWARG': 'capture_fold'}
                                       'spec_metadata',
                                       'draft_model']},
  'kernels.swa_block.attention': {'_CLASSES': {}},
- 'kernels.split_sampler.target_head': {'GATHER_WORLD': 8,
+ 'kernels.split_sampler.target_head': {'GATHER_WORLDS': [4, 8],
                  'PASS_THROUGH_METHODS': ['_reshape_logits_for_accept',
                                           '_apply_occurrence_penalties'],
                  'WORKER_METHODS': ['_execute_guided_decoder_if_present',

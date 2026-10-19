@@ -126,7 +126,7 @@ S0_KERNELS = {
     },
 }
 #: The ``dense_gemms`` plan of this device: ``PLAN[site][rows - 1]``.
-PLAN = dense_gemms.default_kernels(dense_gemms.device_capability())
+PLAN = dense_gemms.default_kernels(capability=dense_gemms.device_capability())
 
 
 def _operands(m, k, n, seed):
@@ -293,6 +293,101 @@ def test_split_k4_siblings_compute_the_same_bits(site, pinned, siblings) -> None
             out = op(x, w, pinned)
             for sibling in siblings:
                 assert torch.equal(out, op(x, w, sibling)), (site, m, seed, sibling)
+
+
+#: TP4 (one tray) per-rank shapes ``(K, N)`` by site; ``*_replicated``: the pooler and unpooler
+#: on the whole weights, as the built-in model runs them at TP4 without sharded projections.
+TP4_SITE_SHAPES = {
+    "qkv": (8192, 4608),
+    "o_proj": (2048, 8192),
+    "pool": (8192, 1024),
+    "unpool": (4096, 2048),
+    "pool_replicated": (8192, 4096),
+    "unpool_replicated": (4096, 8192),
+}
+#: The TP4 plan per site and row count (``*_replicated``: the replicated layout's table).
+TP4_PLAN = dict(
+    dense_gemms.default_kernels(4, sharded=True),
+    pool_replicated=dense_gemms.default_kernels(4, sharded=False)["pool"],
+    unpool_replicated=dense_gemms.default_kernels(4, sharded=False)["unpool"],
+)
+_K2_11, _K2_12, _K1_11, _K1_12 = (
+    "splitk:64,8,2,11",
+    "splitk:64,8,2,12",
+    "splitk:64,8,1,11",
+    "splitk:64,8,1,12",
+)
+#: The kernel one sm103 rank's built-in autotuner picks for the TP4 shapes, rows 1..8 (from
+#: a tactic sweep); cuBLAS is the other kernel the built-in race keeps on some rank.
+TP4_AUTOTUNED = {
+    "qkv": (_D256_2, _K2_12, _K2_12, _K2_12, _K2_12, "splitk:128,8,4,6", _K2_12, _K2_11),
+    "o_proj": ("direct:128,4", _K1_12, _K1_11, _K1_12, _K1_11, _K1_12, _K1_11, _K1_12),
+    "pool": (_D128_2, _D64_2, _D64_2, _S11, _S12, _S12, _S12, _S12),
+    "unpool": (
+        _D128_4,
+        _D128_2,
+        _D128_4,
+        _K2_11,
+        "splitk:128,8,4,6",
+        _K2_12,
+        "splitk:64,8,2,10",
+        "splitk:128,8,4,6",
+    ),
+    "pool_replicated": (_D256_2,) + (_K2_12,) * 7,
+    "unpool_replicated": (_D128_2, _K1_12, _K1_12, _K1_12, _K1_12, _K1_12, _K1_11, _K1_12),
+}
+
+
+def test_the_tp4_plan_validates_on_its_shapes() -> None:
+    for site, (k, n) in TP4_SITE_SHAPES.items():
+        for m in range(1, MAX_ROWS + 1):
+            assert dense_gemms.kernel_error(TP4_PLAN[site][m - 1], m, k, n) is None, (site, m)
+
+
+@pytest.mark.parametrize("m", (1, 2, 3, 5, 8))
+@pytest.mark.parametrize("site", tuple(TP4_SITE_SHAPES))
+def test_the_tp4_planned_kernel_is_within_the_error_budget(site, m) -> None:
+    """The TP4 plan's kernel against the kernels a built-in rank runs for the same rows at TP4
+    (its autotuned pick and cuBLAS), with the TP8 budget: B1' no worse in ulps, B2 / B3 within 1.25x."""
+    k, n = TP4_SITE_SHAPES[site]
+    draws = 8
+    planned = _budget_stats(TP4_PLAN[site][m - 1], k, n, m, draws, False)
+    builtin = [
+        _budget_stats(kernel, k, n, m, draws, False)
+        for kernel in sorted({TP4_AUTOTUNED[site][m - 1], "cublas"})
+    ]
+    print(
+        f"[budget tp4] {site} M={m}: planned {TP4_PLAN[site][m - 1]} {planned} built-in {builtin}"
+    )
+    assert planned[0] <= 1.25 * max(b[0] for b in builtin), ("B2", planned, builtin)
+    assert planned[1] <= max(b[1] for b in builtin), ("B1'", planned, builtin)
+    assert planned[2] <= 1.25 * max(b[2] for b in builtin), ("B3", planned, builtin)
+
+
+@pytest.mark.parametrize("rows", (1, 4, 8))
+@pytest.mark.parametrize("site", tuple(TP4_SITE_SHAPES))
+def test_tp4_repeat_pdl_and_graph_replay_give_the_same_bits(site, rows) -> None:
+    k, n = TP4_SITE_SHAPES[site]
+    kernel = TP4_PLAN[site][rows - 1]
+    x, w = _operands(rows, k, n, seed=31)
+    first = op(x, w, kernel, enable_pdl=True)
+    assert torch.equal(first, op(x, w, kernel, enable_pdl=True))
+    assert torch.equal(first, op(x, w, kernel, enable_pdl=False))
+    static_x = x.clone()
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        op(static_x, w, kernel)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        captured = op(static_x, w, kernel)
+    for seed in range(3):
+        fresh, _ = _operands(rows, k, n, seed=60 + seed)
+        static_x.copy_(fresh)
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(captured, op(fresh, w, kernel))
 
 
 def test_cublas_is_the_builtin_cublas_runner() -> None:

@@ -77,7 +77,8 @@ from ...ops.gemm.dense_gemm import (
 #: The four projections of a layer, in the order a step runs them.
 SITES = ("qkv", "o_proj", "pool", "unpool")
 
-#: Kernel per site by row count, as ``(last row count, kernel)`` steps, chosen in
+#: Kernel per site by row count on sm103 at tep8 (two trays, sharded pooler and
+#: unpooler), as ``(last row count, kernel)`` steps, chosen in
 #: 62-layer chains of cold weights behind predecessors that release at exit: the
 #: direct kernel is the fastest for every shape at 1-2 rows and for the pooler and
 #: unpooler slices at 3-4 rows; split-K 4 for QKV from 3 rows, and it ties with
@@ -92,7 +93,7 @@ DEFAULT_KERNELS: Mapping[str, Tuple[Tuple[int, str], ...]] = {
     "unpool": ((2, "direct:256,1"), (5, "direct:64,2"), (MAX_ROWS, "splitk:64,8,4,12")),
 }
 
-#: The same table for sm107 (212 SMs), chosen the same way: the direct kernel at two or
+#: The same table for sm107 (212 SMs) at tep8, chosen the same way: the direct kernel at two or
 #: four outputs per CTA for QKV at 1-3 rows and for the unpooler slice at 1-7 rows;
 #: split-K 4 for QKV from 4 rows (36 x 4 CTAs is the widest split-K grid at its width);
 #: flashinfer's split-K ``(64, 8, 1, 12)`` for the attention output projection from 3 rows,
@@ -110,10 +111,38 @@ SM107_KERNELS: Mapping[str, Tuple[Tuple[int, str], ...]] = {
     "unpool": ((1, "direct:256,2"), (7, "direct:128,2"), (MAX_ROWS, "splitk:64,8,4,12")),
 }
 
-#: The kernel table of each supported device compute capability.
-KERNELS_BY_SM: Mapping[Tuple[int, int], Mapping[str, Tuple[Tuple[int, str], ...]]] = {
-    (10, 3): DEFAULT_KERNELS,
-    (10, 7): SM107_KERNELS,
+#: The same on sm103 at tep4 (one tray), per-rank shapes QKV ``[4608, 8192]``, o_proj
+#: ``[8192, 2048]`` and the sharded pooler / unpooler slices ``[1024, 8192]`` /
+#: ``[2048, 4096]``, chosen the same way (``TP4_REPLICATED_PROJECTION_KERNELS``
+#: replaces the pooler and unpooler entries when they are replicated). The direct
+#: kernel is the fastest for every shape at 1-2 rows and for the pooler and
+#: unpooler slices up to 5 and 4 rows; from 3 rows QKV runs split-K 2 (its N of
+#: 4608 already fills the GPU with 72 column tiles), the slices split-K 4, and the
+#: attention output projection cuBLAS, as at tep8.
+TP4_KERNELS: Mapping[str, Tuple[Tuple[int, str], ...]] = {
+    "qkv": ((2, "direct:256,2"), (MAX_ROWS, "splitk:64,8,2,10")),
+    "o_proj": ((2, "direct:128,4"), (MAX_ROWS, CUBLAS)),
+    "pool": ((2, "direct:256,2"), (5, "direct:256,4"), (MAX_ROWS, "splitk:64,8,4,10")),
+    "unpool": ((2, "direct:128,2"), (4, "direct:128,4"), (MAX_ROWS, "splitk:64,8,4,10")),
+}
+
+#: The tep4 pooler and unpooler on the whole replicated weights ``[4096, 8192]`` /
+#: ``[8192, 4096]``: the built-in model's tep4 projections, which it shards only at
+#: tep8. Direct at 1-2 rows; from 3 rows split-K 2 for the pooler, cuBLAS for the
+#: unpooler (K = 4096 leaves split-K no slices to spread).
+TP4_REPLICATED_PROJECTION_KERNELS: Mapping[str, Tuple[Tuple[int, str], ...]] = {
+    "pool": ((2, "direct:256,2"), (MAX_ROWS, "splitk:64,8,2,10")),
+    "unpool": ((2, "direct:128,2"), (MAX_ROWS, CUBLAS)),
+}
+
+#: The measured table of each ``(compute capability, TP size)``, with the pooler and
+#: unpooler on the rank's slices (``kernel_steps`` swaps in the replicated tep4 cells).
+KERNELS_BY_SM_TP: Mapping[
+    Tuple[Tuple[int, int], int], Mapping[str, Tuple[Tuple[int, str], ...]]
+] = {
+    ((10, 3), 8): DEFAULT_KERNELS,
+    ((10, 3), 4): TP4_KERNELS,
+    ((10, 7), 8): SM107_KERNELS,
 }
 
 
@@ -126,19 +155,37 @@ def _by_rows(steps: Tuple[Tuple[int, str], ...]) -> List[str]:
     return kernels
 
 
-def default_kernels(capability: Tuple[int, int] = (10, 3)) -> Dict[str, Tuple[str, ...]]:
-    """The kernel of each site for rows 1..8 on a device of compute ``capability``.
+def kernel_steps(
+    capability: Tuple[int, int], tp_size: int, sharded: bool
+) -> Mapping[str, Tuple[Tuple[int, str], ...]]:
+    """The ``(last row count, kernel)`` steps of each site on ``capability`` at ``tp_size``.
+
+    ``sharded``: whether the pooler and unpooler GEMMs read the rank's slice
+    (``sharded_projections``) rather than the whole replicated weight.
 
     Raises:
-        ValueError: if ``KERNELS_BY_SM`` has no table for ``capability``.
+        ValueError: if ``KERNELS_BY_SM_TP`` has no table for ``(capability, tp_size)``.
     """
-    table = KERNELS_BY_SM.get(tuple(capability))
+    key = (tuple(capability), int(tp_size))
+    table = KERNELS_BY_SM_TP.get(key)
     if table is None:
         raise ValueError(
-            f"[musespark_open] dense_gemms: no kernel table for SM {tuple(capability)} "
-            f"(supported: {sorted(KERNELS_BY_SM)})"
+            f"[musespark_open] dense_gemms: no kernel table for SM {key[0]} at TP {key[1]} "
+            f"(supported: {sorted(KERNELS_BY_SM_TP)})"
         )
-    return {site: tuple(_by_rows(steps)) for site, steps in table.items()}
+    if key == ((10, 3), 4) and not sharded:
+        return {**table, **TP4_REPLICATED_PROJECTION_KERNELS}
+    return table
+
+
+def default_kernels(
+    tp_size: int = 8, sharded: bool = True, capability: Tuple[int, int] = (10, 3)
+) -> Dict[str, Tuple[str, ...]]:
+    """The kernel of each site for rows 1..8 on ``capability`` at ``tp_size`` (``kernel_steps``)."""
+    return {
+        site: tuple(_by_rows(steps))
+        for site, steps in kernel_steps(capability, tp_size, sharded).items()
+    }
 
 
 def device_capability() -> Tuple[int, int]:
@@ -702,19 +749,21 @@ def install(
     """Route every layer's four projections through ``dense_gemm``; return the shared plan.
 
     ``kernels`` is the kernel of each site per row count; when None, the table of the
-    device's compute capability (``device_capability``, ``default_kernels``), read once
-    here. Every module is checked before any is re-classed, so a refusal
+    device's compute capability (``device_capability``, read once here), the model's TP
+    size and its projection layout (``default_kernels``). Every module is checked
+    before any is re-classed, so a refusal
     leaves the model as it was. Only the weights' shapes are read, so this runs
     on a model whose weights are still on the meta device.
 
     Raises:
         ValueError: if the low-M dispatch is off (``TRTLLM_LOW_M_GEMM_BACKEND``), so
-            the built-in ``Linear`` never asks a dispatcher; if ``prefetch`` is asked
+            the built-in ``Linear`` never asks a dispatcher; if no ``kernels`` are given
+            and the device and TP size have no table (``kernel_steps``); if ``prefetch`` is asked
             without the sharded projections (``sharded_projections``), whose
             pooler GEMM would read the whole replicated weight; if a
             projection cannot be re-classed (see
             ``MuseSparkOpenTepDenseLinear.check``); or if a named kernel cannot
-            serve its site's shape, or no table exists for the device.
+            serve its site's shape.
         TypeError: if a projection is not the built-in ``Linear``.
     """
     if not _low_m_gemm.LOW_M_GEMM_ACTIVE:
@@ -722,8 +771,9 @@ def install(
             "dense_gemms serves the low-M GEMM dispatch, which TRTLLM_LOW_M_GEMM_BACKEND leaves off"
         )
     capability = device_capability()
-    kernels = default_kernels(capability) if kernels is None else dict(kernels)
     sharded = sharded_projections(model)
+    tp_size = int(model.layers[0].feed_forward.mapping.tp_size)
+    kernels = default_kernels(tp_size, sharded, capability) if kernels is None else dict(kernels)
     if prefetch and not sharded:
         raise ValueError(
             "dense_gemm_prefetch prefetches the rank's pooler slice and needs the sharded projections "
@@ -778,7 +828,9 @@ def install(
         MuseSparkOpenTepDenseLinear.adopt(linear, DenseGemmDispatcher(site))
 
     logger.info(
-        f"[musespark_open] dense_gemms: dense projections of all {len(layers)} layers on calls of at most "
+        f"[musespark_open] dense_gemms: dense projections of all {len(layers)} layers (SM {capability}, "
+        f"TP{tp_size}, "
+        f"{'sharded' if sharded else 'replicated'} pooler/unpooler) on calls of at most "
         f"{MAX_ROWS} rows by {describe(kernels)}; "
         f"L2 prefetch of the next weight {'on' if prefetch else 'off'}"
     )

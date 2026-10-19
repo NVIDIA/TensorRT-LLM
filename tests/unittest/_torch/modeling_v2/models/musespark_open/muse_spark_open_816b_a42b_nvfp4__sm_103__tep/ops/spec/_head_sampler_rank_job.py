@@ -1,12 +1,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""8-rank (two GB300 trays) check and chain timing of the ``lm_head_inbox`` head gather.
+"""8-rank (two GB300 trays) or 4-rank (one tray) check and chain timing of the ``lm_head_inbox`` head gather.
 
-Run one process per rank under MPI (eight ranks, four per node), e.g.
+Run one process per rank under MPI (eight ranks, four per node; or four ranks on one node), e.g.
 
     python3 _head_sampler_rank_job.py --check --bench --out result.json
 
-Every rank multiplies the same rows by its own random ``[25256, 8192]`` BF16
+Every rank multiplies the same rows by its own random ``[202048 / ranks, 8192]`` BF16
 LM-head shard with the split-K tactic the autotuner picks for it at this shape
 (``SERVED_TACTICS``) and writes the result through the multicast address into
 its inbox slot (``HeadGatherWorkspace.slot``); kernel A gathers, kernel B
@@ -66,7 +66,8 @@ from tensorrt_llm.mapping import Mapping
 
 MULTIPLIER = 0.1767766952966369
 SOFT_CAP = 20.0
-SHARD = 25256
+#: The target vocabulary; each rank's LM-head shard is ``VOCAB // WORLD`` rows (``SHARD``).
+VOCAB = 202048
 HIDDEN = 8192
 ROWS = 8
 #: The LM head's split-K tactic at 8 rows per rank, as the autotuner picks it for this shape.
@@ -81,6 +82,8 @@ def log(*a):
 COMM = mpi_comm()
 WORLD = COMM.Get_size()
 RANK = COMM.Get_rank()
+#: This rank's LM-head shard: 25256 rows at 8 ranks (two trays), 50512 at 4 (one tray).
+SHARD = VOCAB // WORLD
 
 
 def agree(ok: bool) -> bool:

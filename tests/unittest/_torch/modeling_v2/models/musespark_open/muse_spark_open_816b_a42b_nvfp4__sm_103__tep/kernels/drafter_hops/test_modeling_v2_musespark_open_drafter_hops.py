@@ -277,3 +277,84 @@ def test_the_pre_wait_operands_are_the_parameters_themselves():
         assert any(t is model.model.layers[index].post_attention_layernorm.weight for t in tensors)
     assert not any(t is model.model.layers[0].input_layernorm.weight for t in tensors)
     assert tensors[-1] is model.model.norm.weight
+
+
+# --- the row projections' all-reduce, by TP size -------------------------------------------------
+
+
+def _row_linear(tp_size: int, mnnvl: bool, symm_mem: bool = False):
+    """A drafter row-parallel ``Linear`` as far as ``_all_reduce_reason`` reads it."""
+    from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
+
+    linear = Linear.__new__(Linear)
+    nn.Module.__init__(linear)
+    linear.tp_mode = TensorParallelMode.ROW
+    linear.reduce_output = True
+    linear.register_parameter("bias", None)
+    linear.weight = nn.Parameter(
+        torch.empty(_hop.HIDDEN, 16, dtype=torch.bfloat16, device="meta"), requires_grad=False
+    )
+    linear.mapping = SimpleNamespace(tp_size=tp_size)
+    linear.all_reduce = SimpleNamespace(
+        mnnvl_allreduce=object() if mnnvl else None,
+        symm_mem_allreduce=object() if symm_mem else None,
+    )
+    return linear
+
+
+@pytest.mark.parametrize("requestable", (True, False))
+def test_tp4_takes_a_row_projection_whose_mnnvl_all_reduce_can_be_requested(
+    monkeypatch, requestable
+):
+    """One tray: AUTO builds no MNNVL all-reduce, the install requests it by name."""
+    monkeypatch.setattr(drafter_hops, "_mnnvl_requestable", lambda mapping: requestable)
+    reason = drafter_hops._all_reduce_reason(_row_linear(4, mnnvl=False), "o_proj", 4)
+    assert (reason is None) is requestable
+    if not requestable:
+        assert "cannot all-reduce with the MNNVL one-shot" in reason
+    assert drafter_hops._all_reduce_reason(_row_linear(4, mnnvl=True), "o_proj", 4) is None
+    assert "symmetric memory" in drafter_hops._all_reduce_reason(
+        _row_linear(4, mnnvl=True, symm_mem=True), "o_proj", 4
+    )
+
+
+def test_tp8_needs_the_mnnvl_all_reduce_built_and_other_sizes_are_refused(monkeypatch):
+    monkeypatch.setattr(drafter_hops, "_mnnvl_requestable", lambda mapping: True)
+    assert drafter_hops._all_reduce_reason(_row_linear(8, mnnvl=True), "o_proj", 8) is None
+    assert "does not all-reduce with the MNNVL one-shot" in drafter_hops._all_reduce_reason(
+        _row_linear(8, mnnvl=False), "o_proj", 8
+    )
+    for tp in (2, 16):
+        assert "the hop serves 4 or 8" in drafter_hops._all_reduce_reason(
+            _row_linear(tp, mnnvl=True), "o_proj", tp
+        )
+    assert "the drafter's is 4" in drafter_hops._all_reduce_reason(
+        _row_linear(8, mnnvl=True), "o_proj", 4
+    )
+
+
+def test_request_mnnvl_builds_one_per_row_projection_without_one(monkeypatch):
+    from tensorrt_llm._torch.distributed import ops as _ops
+
+    built = []
+
+    class _Built:
+        def __init__(self, mapping, dtype):
+            built.append((mapping, dtype))
+
+    monkeypatch.setattr(_ops, "MNNVLAllReduce", _Built)
+    layers = [
+        SimpleNamespace(
+            self_attn=SimpleNamespace(o_proj=_row_linear(4, mnnvl=False)),
+            mlp=SimpleNamespace(down_proj=_row_linear(4, mnnvl=index == 1)),
+        )
+        for index in range(3)
+    ]
+    drafter = SimpleNamespace(model=SimpleNamespace(layers=layers))
+    assert drafter_hops.request_mnnvl(drafter) == 5
+    assert [dtype for _, dtype in built] == [torch.bfloat16] * 5
+    assert all(
+        linear.all_reduce.mnnvl_allreduce is not None
+        for linear in drafter_hops.row_linears(drafter)
+    )
+    assert drafter_hops.request_mnnvl(drafter) == 0  # idempotent

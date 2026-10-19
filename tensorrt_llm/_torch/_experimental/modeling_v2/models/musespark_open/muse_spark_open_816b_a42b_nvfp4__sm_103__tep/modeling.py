@@ -584,7 +584,10 @@ _TEP4_BITWISE_PATHS = frozenset(
 #: still verifies every draft; it shards every row count at TP4).
 _TEP4_PATHS = _TEP4_BITWISE_PATHS | frozenset({"drafter_fc_shard"})
 #: TEP4 on sm103 adds the attention paths validated at a tep4 rank's 32 query / 4 KV
-#: heads, and the expert paths on the owner-only 64-expert window (no replication).
+#: heads, the dense projections and drafter GEMMs on their tep4 kernel tables, the
+#: drafter hops and PDL chain on the tray's MNNVL one-shot, the LM-head inbox on the
+#: tray's multicast, and the expert paths on the owner-only 64-expert window (no
+#: replication).
 _SM103_TEP4_PATHS = _TEP4_PATHS | frozenset(
     {
         "swa_paged_decode",
@@ -592,6 +595,11 @@ _SM103_TEP4_PATHS = _TEP4_PATHS | frozenset(
         "full_attention_split_kv",
         "full_attention_prep_fold",
         "drafter_block_decode",
+        "dense_gemms",
+        "drafter_fixed_gemms",
+        "drafter_hops",
+        "drafter_pdl_chain",
+        "lm_head_inbox",
         "persistent_experts",
         "bf16_routed_experts",
     }

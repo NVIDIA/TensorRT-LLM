@@ -235,21 +235,29 @@ _TEP4_BITWISE = {
 _TEP4 = _TEP4_BITWISE | {"drafter_fc_shard"}
 
 #: sm103 TEP4's composition adds the attention paths validated at a tep4 rank's 32
-#: query / 4 KV heads, and the expert paths on the owner-only 64-expert window (no
-#: replication).
+#: query / 4 KV heads, the dense projections and drafter GEMMs on their tep4 kernel
+#: tables, the drafter hops and PDL chain on the tray's MNNVL one-shot, the LM-head
+#: inbox on the tray's multicast, and the expert paths on the owner-only 64-expert
+#: window (no replication).
 _SM103_TEP4 = _TEP4 | {
     "swa_paged_decode",
     "swa_block",
     "full_attention_split_kv",
     "full_attention_prep_fold",
     "drafter_block_decode",
+    "dense_gemms",
+    "drafter_fixed_gemms",
+    "drafter_hops",
+    "drafter_pdl_chain",
+    "lm_head_inbox",
     "persistent_experts",
     "bf16_routed_experts",
 }
 
 
-def test_tensor_parallel_size_4_serves_the_bitwise_paths_on_one_tray():
+def test_sm103_tensor_parallel_size_4_serves_its_composition_on_one_tray():
     tep4 = modeling.TARGET_PATHS[103, 4]
+    assert _TEP4 < _SM103_TEP4
     assert tep4.served == _SM103_TEP4
     assert dispatch.closure(tep4.served) == tep4.served
     assert tep4.topology is dispatch.ONE_TRAY_OF_4
@@ -265,7 +273,6 @@ def test_tensor_parallel_size_4_serves_the_bitwise_paths_on_one_tray():
 #: Requirements only the TP8 composition's paths have: a TP4 deployment cannot (the
 #: sharded projections raise in the built-in model at tp 4) or need not meet them.
 _TP8_ONLY = (
-    "TRTLLM_LOW_M_GEMM_BACKEND",
     "MUSESPARK_OPEN_FUSED_FINALIZE_AR_MNNVL",
     "MUSESPARK_OPEN_SHARDED_PROJECTIONS",
     "MUSESPARK_OPEN_ROUTING_MEMO",
@@ -275,7 +282,6 @@ _TP8_ONLY = (
     "MoE prologue",
     "pool transport",
     "unpool transport",
-    "drafter hops",
 )
 
 
@@ -286,6 +292,7 @@ def test_tensor_parallel_size_4_needs_no_tp8_only_setting():
         assert not any(word in requirement for requirement in required), word
     for word in (
         "TRTLLM_ENABLE_PDL",
+        "TRTLLM_LOW_M_GEMM_BACKEND",
         "MUSESPARK_OPEN_ALLREDUCE=MNNVL",
         "draft head's key exchange",
         "MUSESPARK_OPEN_FUSED_RESIDUAL",
@@ -295,6 +302,7 @@ def test_tensor_parallel_size_4_needs_no_tp8_only_setting():
         "CuTe-DSL RMSNorm",
         "post-attention hop",
         "head sampler",
+        "drafter hops",
         "MUSESPARK_OPEN_PREFILL_SEQUENCE_PARALLEL",
     ):
         assert any(word in requirement for requirement in required), word

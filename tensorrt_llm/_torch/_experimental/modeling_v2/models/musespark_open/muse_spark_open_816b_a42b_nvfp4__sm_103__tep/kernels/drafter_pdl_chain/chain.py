@@ -108,8 +108,10 @@ HEAD_ROWS = ROWS - 1
 # Successor checks
 # --------------------------------------------------------------------------
 def _fixed_tactic_reason(linear: nn.Module, rows: int, where: str) -> Optional[str]:
-    """Why ``linear`` is not on the ``drafter_fixed_gemms`` split-K tactic at ``rows`` rows, or None."""
-    from ...ops.gemm.fixed_low_m_gemm import tactic_for
+    """Why ``linear`` is not on the ``drafter_fixed_gemms`` split-K tactic at ``rows`` rows, or None.
+
+    The tactic is the one the installed method runs: its table is the drafter's TP size's.
+    """
     from ...spec_worker import FixedTacticLinearMethod
 
     if not isinstance(linear, Linear):
@@ -120,7 +122,7 @@ def _fixed_tactic_reason(linear: nn.Module, rows: int, where: str) -> Optional[s
     if not method.enable_pdl:
         return f"{where}'s fixed GEMM is launched without programmatic dependent launch"
     out_features, in_features = linear.weight.shape
-    if tactic_for(rows, in_features, out_features) is None:
+    if method.tactic_for(rows, in_features, out_features) is None:
         return f"{where} has no fixed tactic at {rows} rows"
     return None
 

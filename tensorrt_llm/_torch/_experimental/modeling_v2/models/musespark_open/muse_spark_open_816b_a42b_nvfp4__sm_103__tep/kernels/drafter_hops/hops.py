@@ -116,6 +116,13 @@ class DrafterHopCall:
         return self._site(site, partial, residual, coefficients, conv, norm, block_size)
 
 
+def _mnnvl_requestable(mapping) -> bool:
+    """Whether an MNNVL BF16 all-reduce requested by name can be built on ``mapping``'s TP group."""
+    from tensorrt_llm._torch.distributed.ops import MNNVLAllReduce
+
+    return bool(MNNVLAllReduce.is_mnnvl(mapping, torch.bfloat16, explicitly_requested=True))
+
+
 def _all_reduce_reason(linear: nn.Module, where: str, tp_size: int) -> Optional[str]:
     if not isinstance(linear, Linear) or linear.tp_mode != TensorParallelMode.ROW:
         return f"{where} is not a row-parallel Linear"
@@ -125,16 +132,56 @@ def _all_reduce_reason(linear: nn.Module, where: str, tp_size: int) -> Optional[
         return f"{where} has a bias"
     if linear.weight.dtype != torch.bfloat16 or linear.weight.shape[0] != _hop.HIDDEN:
         return f"{where} is not a BF16 projection to {_hop.HIDDEN}"
-    if linear.mapping.tp_size != tp_size or tp_size not in (4, _hop.MAX_RANKS):
-        return f"{where} is on a TP group of {linear.mapping.tp_size}, the hop serves 4 or 8"
+    if linear.mapping.tp_size != tp_size:
+        return f"{where} is on a TP group of {linear.mapping.tp_size}, the drafter's is {tp_size}"
     all_reduce = linear.all_reduce
     if getattr(all_reduce, "symm_mem_allreduce", None) is not None:
         return f"{where} all-reduces with symmetric memory, not the MNNVL one-shot"
-    if getattr(all_reduce, "mnnvl_allreduce", None) is None:
-        return f"{where} does not all-reduce with the MNNVL one-shot"
+    if tp_size == 4:
+        # One tray: the built-in AUTO strategy builds the MNNVL all-reduce only across
+        # nodes, so the install requests it by name (``request_mnnvl``) when it is missing.
+        if getattr(all_reduce, "mnnvl_allreduce", None) is None and not _mnnvl_requestable(
+            linear.mapping
+        ):
+            return f"{where} cannot all-reduce with the MNNVL one-shot on this TP group"
+    elif tp_size == _hop.MAX_RANKS:
+        if getattr(all_reduce, "mnnvl_allreduce", None) is None:
+            return f"{where} does not all-reduce with the MNNVL one-shot"
+    else:
+        return f"{where} is on a TP group of {tp_size}, the hop serves 4 or 8"
     # A LoRA layer (attention modules always build one for o_proj) applies only with
     # lora_params, which the block decode never passes, on either path.
     return None
+
+
+def row_linears(draft_model: nn.Module) -> list[Linear]:
+    """The drafter's row-parallel projections the hops all-reduce: every layer's ``o_proj`` and ``down_proj``."""
+    return [
+        linear
+        for layer in draft_model.model.layers
+        for linear in (layer.self_attn.o_proj, layer.mlp.down_proj)
+    ]
+
+
+def request_mnnvl(draft_model: nn.Module) -> int:
+    """Give every drafter row projection the MNNVL one-shot all-reduce, requested by name.
+
+    For a TP group on one tray, where the built-in ``AUTO`` strategy leaves it
+    off: each ``o_proj`` / ``down_proj`` all-reduce without one gets an
+    ``MNNVLAllReduce`` (the one ``AllReduce(strategy=MNNVL)`` builds), so the calls
+    the hop does not take (more than ``MAX_ROWS`` rows) reduce with the same
+    one-shot arithmetic as the hop. Collective (the MNNVL workspace); returns how
+    many all-reduces it changed.
+    """
+    from tensorrt_llm._torch.distributed.ops import MNNVLAllReduce
+
+    changed = 0
+    for linear in row_linears(draft_model):
+        all_reduce = linear.all_reduce
+        if getattr(all_reduce, "mnnvl_allreduce", None) is None:
+            all_reduce.mnnvl_allreduce = MNNVLAllReduce(linear.mapping, torch.bfloat16)
+            changed += 1
+    return changed
 
 
 def _norm_reason(norm: nn.Module, where: str) -> Optional[str]:
@@ -262,7 +309,9 @@ def install(draft_model: Optional[nn.Module], mapping=None) -> None:
     and ``drafter_worker.install`` (``drafter_fixed_gemms``), with the shell's ``mapping``
     (the drafter shares it; without one, the drafter's own ``o_proj`` mapping).
     The refusal is agreed over that TP group (collective) before the
-    workspace's collective construction. Idempotent.
+    workspace's collective construction. On a TP group of 4 (one tray) the
+    drafter's row projections are given the MNNVL one-shot all-reduce first
+    (``request_mnnvl``, collective). Idempotent.
 
     Raises:
         ValueError: if the hop cannot run on this drafter on some rank (on every
@@ -282,6 +331,14 @@ def install(draft_model: Optional[nn.Module], mapping=None) -> None:
     if reason is not None:
         raise ValueError(reason)
     layers = draft_model.model.layers
+    tp_size = layers[0].self_attn.o_proj.mapping.tp_size
+    if tp_size == 4:
+        requested = request_mnnvl(draft_model)
+        if requested:
+            logger.info(
+                f"[musespark_open] drafter_hops: MNNVL one-shot all-reduce requested by name on {requested} "
+                "drafter row projections (one tray)"
+            )
     norms = [layer.post_attention_layernorm for layer in layers]
     norms += [layer.input_layernorm for layer in layers[1:]] + [draft_model.model.norm]
     eps = sorted({float(norm.variance_epsilon) for norm in norms})

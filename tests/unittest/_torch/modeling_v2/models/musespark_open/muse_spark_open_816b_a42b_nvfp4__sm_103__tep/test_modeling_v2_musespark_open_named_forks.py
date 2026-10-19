@@ -208,7 +208,8 @@ def _linear(n: int, k: int) -> Linear:
 
 
 class _Mapping:
-    tp_size = 1
+    # A TP size with a dense_gemms table; the projections here are not sharded.
+    tp_size = 8
     tp_rank = 0
 
 
