@@ -51,7 +51,17 @@ class LogicError(Exception):
     """An operation violates the cache or batch's state and usage requirements."""
 
 class OutOfMemoryError(Exception): ...
-class OutOfPagesError(OutOfMemoryError): ...
+
+class HostOOMError(OutOfMemoryError):
+    """The host tier could not be backed by physical memory."""
+
+class DiskOOMError(OutOfMemoryError):
+    """The disk tier's backing file could not be grown."""
+
+class CuOOMError(OutOfMemoryError):
+    """A CUDA allocation failed for want of device memory."""
+
+class OutOfPagesError(Exception): ...
 
 def poison_reason() -> str | None:
     """First recorded invariant violation, or None. Never clears, so it is safe to poll."""
@@ -204,21 +214,23 @@ class CacheTierConfig(Protocol):
     quota: int
     @property
     def tier(self) -> CacheTier: ...
-    def assert_valid(self) -> None: ...
+    def validate(self) -> None: ...
 
 @dataclass(slots=True)
 class GpuCacheTierConfig:
     quota: int
     @property
     def tier(self) -> CacheTier: ...
-    def assert_valid(self) -> None: ...
+    def validate(self) -> None: ...
 
 @dataclass(slots=True)
 class HostCacheTierConfig:
     quota: int
+    max_quota: int | None = None
+    allow_remote_numa_fallback: bool = True
     @property
     def tier(self) -> CacheTier: ...
-    def assert_valid(self) -> None: ...
+    def validate(self) -> None: ...
 
 @dataclass(slots=True)
 class DiskCacheTierConfig:
@@ -226,7 +238,7 @@ class DiskCacheTierConfig:
     path: str
     @property
     def tier(self) -> CacheTier: ...
-    def assert_valid(self) -> None: ...
+    def validate(self) -> None: ...
 
 @dataclass(slots=True)
 class BufferConfig:

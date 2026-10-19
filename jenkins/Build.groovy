@@ -517,7 +517,11 @@ def runLLMBuild(
         "TRTLLM_BUILD_SOURCE_COMMIT=${env.gitlabCommit}",
         "TRTLLM_VERSION_OVERRIDE=${versionOverride}",
     ]) {
-        sh "cd ${LLM_ROOT} && python3 scripts/build_wheel.py --version-override \"\${TRTLLM_VERSION_OVERRIDE}\" --use_ccache -G Ninja -j ${buildJobs} -a '${buildFlags[WHEEL_ARCHS]}' ${buildFlags[WHEEL_EXTRA_ARGS]}"
+        // cmake will download third-party sources, so we add retry
+        trtllm_utils.llmExecStepWithRetry(
+            pipeline,
+            script: "cd ${LLM_ROOT} && python3 scripts/build_wheel.py --version-override \"\${TRTLLM_VERSION_OVERRIDE}\" --clean --use_ccache -G Ninja -j ${buildJobs} -a '${buildFlags[WHEEL_ARCHS]}' ${buildFlags[WHEEL_EXTRA_ARGS]}"
+        )
     }
 
     // Type-check with the compiled bindings that build_wheel.py just produced in
