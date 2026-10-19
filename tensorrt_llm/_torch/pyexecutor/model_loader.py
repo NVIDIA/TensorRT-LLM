@@ -974,11 +974,12 @@ class ModelLoader:
                 model = AutoModelForCausalLM.from_config(config)
                 is_meta_init = False
 
-            # With JIT prefetch on (TLLM_JIT_PREFETCH=1), FlashInfer JIT
-            # modules the model's layers build in warmup are built in a
-            # CPU-only helper while the weights load.
+            # With JIT prefetch on (TLLM_JIT_PREFETCH=1), JIT kernels the
+            # model's layers build in warmup (FlashInfer modules, CuTe DSL
+            # FP8 GEMM tactics) are built in CPU-only helpers while the
+            # weights load.
             from ..jit_prefetch import start_model_builds
-            start_model_builds(model)
+            start_model_builds(model, rank=self.mapping.rank)
 
             requires_standard_hf_loading = any(
                 getattr(module, "_requires_standard_hf_loading", False)

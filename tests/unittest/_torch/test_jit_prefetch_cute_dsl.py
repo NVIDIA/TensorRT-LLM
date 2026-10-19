@@ -458,3 +458,126 @@ def test_kda_provider_lists_one_k4_variant_per_layer_shape():
     bf16_pool = (0, 148, H, K, K, (torch.bfloat16, (3, H, K, K), (H * K * K, K * K, K, 1), True),
                  (torch.int32, (1,), True))  # fmt: skip
     assert jcd.k4_spec_from_cache_key(bf16_pool) is None
+
+
+def test_fp8_gemm_export_is_what_the_runner_runs(tmp_path):
+    """Every FP8 blockwise GEMM tactic Fp8GemmProvider enumerates for a
+    model's block-FP8 Linear layers (those that opt out of DeepGEMM), compiled
+    by the helper (no visible GPU) and loaded through the runner's loader,
+    gives bitwise the runner's own in-process output on GEMMs of several
+    shapes, and the runner compiles nothing."""
+    from tensorrt_llm._torch.custom_ops import cute_dsl_custom_ops as ops
+    from tensorrt_llm._torch.modules.linear import Linear
+    from tensorrt_llm.models.modeling_utils import QuantConfig
+    from tensorrt_llm.quantization.mode import QuantAlgo
+
+    qc = QuantConfig(quant_algo=QuantAlgo.FP8_BLOCK_SCALES)
+    shapes = [(1024, 512), (2048, 1536)]  # (n, k)
+    model = torch.nn.Module()
+    for i, (n, k) in enumerate(shapes):
+        setattr(
+            model,
+            f"proj{i}",
+            Linear(k, n, bias=False, dtype=torch.bfloat16, quant_config=qc, disable_deep_gemm=True),
+        )
+    # A DeepGEMM layer is not this runner's.
+    model.dg = Linear(512, 4096, bias=False, dtype=torch.bfloat16, quant_config=qc)
+    provider = jcd.Fp8GemmProvider(model)
+    assert provider.shapes == sorted(shapes)
+    specs = provider.enumerate_specs()
+    runner = ops.CuteDSLFp8BlackwellRunner(output_dtype=torch.bfloat16, use_tvm_ffi=True)
+    g = torch.Generator(device="cuda").manual_seed(0)
+
+    def inputs(m, n, k):
+        x = torch.randn(m, k, generator=g, device="cuda").to(torch.bfloat16)
+        a, a_sf = torch.ops.trtllm.fp8_quantize_1x128(x)
+        w = (torch.randn(n, k, generator=g, device="cuda") * 0.5).to(torch.float8_e4m3fn)
+        w_sf = torch.rand(n // 128, k // 128, generator=g, device="cuda") + 0.5
+        return [a, w, a_sf, w_sf]
+
+    tactics = set()
+    data = {}
+    for n, k in shapes:
+        for m in (1, 37, 1000):
+            data[(m, n, k)] = inputs(m, n, k)
+            tactics.update(map(tuple, runner.get_valid_tactics(data[(m, n, k)], None)))
+    # The provider covers every tactic the autotuner benchmarks for these shapes.
+    planned = {
+        (s["use_2cta"], tuple(s["mma_tiler"]), tuple(s["cluster"])) for s in map(json.loads, specs)
+    }
+    assert tactics == planned, tactics ^ planned
+    replies = _helper_build(str(tmp_path / "aot"), specs)
+    assert all(r["ok"] and r["built"] for r in replies), [r for r in replies if not r["ok"]][:3]
+
+    def run():
+        out = {}
+        for t in sorted(tactics):
+            for c, x in data.items():
+                out[(t, c)] = runner(x, tactic=t).clone()
+        torch.cuda.synchronize()
+        return out
+
+    saved = dict(ops.CuteDSLFp8BlackwellRunner.kernel_cache)
+    try:
+        ops.CuteDSLFp8BlackwellRunner.kernel_cache.clear()
+        ops.fp8_gemm_loader = None
+        ref = run()
+        ops.CuteDSLFp8BlackwellRunner.kernel_cache.clear()
+        loads = []
+
+        def loader(spec):
+            fn = jcd.load(spec, str(tmp_path / "aot"))
+            loads.append((fn is not None, spec))
+            return fn
+
+        assert jcd.install_fp8_gemm_loader(loader)
+        got = run()
+    finally:
+        ops.fp8_gemm_loader = None
+        ops.CuteDSLFp8BlackwellRunner.kernel_cache.clear()
+        ops.CuteDSLFp8BlackwellRunner.kernel_cache.update(saved)
+    missing = [spec for ok, spec in loads if not ok]
+    assert len(loads) == len(tactics) and not missing, f"tactics not prefetched: {missing}"
+    for key, value in ref.items():
+        assert torch.equal(got[key], value), key
+
+
+def test_start_model_builds_queues_the_gemm_tactics_before_warmup(monkeypatch):
+    """Right after model construction (no weights, no quant method yet) the
+    FP8 GEMM provider already sees the block-FP8 Linear layers that opt out of
+    DeepGEMM, and with prefetch on ``start_model_builds`` hands every tactic
+    to the CuTe DSL helpers and installs the runner's loader."""
+    from tensorrt_llm._torch import jit_prefetch as jp
+    from tensorrt_llm._torch.custom_ops import cute_dsl_custom_ops as ops
+    from tensorrt_llm._torch.modules.linear import Linear
+    from tensorrt_llm.models.modeling_utils import QuantConfig
+    from tensorrt_llm.quantization.mode import QuantAlgo
+
+    qc = QuantConfig(quant_algo=QuantAlgo.FP8_BLOCK_SCALES)
+    model = torch.nn.Module()
+    model.proj = Linear(
+        512, 1024, bias=False, dtype=torch.bfloat16, quant_config=qc, disable_deep_gemm=True,
+        skip_create_weights_in_init=True,
+    )  # fmt: skip
+    assert getattr(model.proj, "quant_method", None) is None  # no weights yet
+    provider = jcd.Fp8GemmProvider(model)
+    assert provider.shapes == [(1024, 512)] and provider.specs
+
+    queued = []
+
+    class _Prefetcher:
+        def enable_fp8_gemm(self, p):
+            queued.extend(p.enumerate_specs())
+            return True
+
+        def enable_cute_dsl(self, p):
+            return False
+
+    monkeypatch.setenv("TLLM_JIT_PREFETCH", "1")
+    monkeypatch.setattr(jp.JitPrefetcher, "init", classmethod(lambda cls, rank: _Prefetcher()))
+    assert jp.start_model_builds(model)
+    assert queued == provider.specs
+    monkeypatch.setenv("TLLM_JIT_PREFETCH", "0")
+    queued.clear()
+    assert not jp.start_model_builds(model)
+    assert queued == [] and ops.fp8_gemm_loader is None

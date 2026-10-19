@@ -23,6 +23,13 @@ batch, outside the CUDA graphs that warmup captures:
 * GDN prefill / mixed-batch input prep: ``_extract_transpose_prefill_kernel``
   and ``_fused_gdn_post_conv_kernel`` (``HAS_DECODE`` and the prefill / decode
   token counts' integer classes).
+* KDA prefill input prep: ``_extract_transpose_prefill_kernel`` and
+  ``_fused_kda_post_conv_kernel``. The latter's input is channel-major, or,
+  when the BF16 qkvg GEMM's transposed rows would start unaligned (a prefill
+  token count that is not a multiple of 8), a transposed view of token-major
+  rows: ``TOKEN_MAJOR`` and the specialized token stride differ between the
+  two, and a single-token view takes the channel-major path with the
+  token-major stride.
 * KDA prefill on a BF16 state cache: ``_reset_recurrent_state_rows_kernel``
   zeroes the fresh rows of the dense FP32 copy the mixer stages the batch's
   rows into. That copy has one row per context request, and its row count
@@ -158,6 +165,7 @@ class LinearAttnProvider:
         "tensorrt_llm._torch.modules.mamba.fuse_elementwise_ops",
         "tensorrt_llm._torch.modules.mamba.mamba2_metadata",
         "tensorrt_llm._torch.modules.mamba.recurrent_state_cache",
+        "tensorrt_llm._torch.modules.kimi_kda._kda_kernels",
     )
 
     def _sms(self) -> int:
@@ -347,6 +355,7 @@ class LinearAttnProvider:
         return calls
 
     def _plan_kda(self, s: _KdaShape, p: int, d: int) -> List[KernelCall]:
+        from ..kimi_kda._kda_kernels import fused_kda_post_conv
         from .fuse_elementwise_ops import extract_transpose_prefill_slice
 
         meta = torch.device("meta")
@@ -359,5 +368,16 @@ class LinearAttnProvider:
                 # [T, 4 * proj] qkvg projection output for the convolution.
                 qkvg = torch.empty(p, 4 * proj, dtype=s.dtype, device=meta)
                 extract_transpose_prefill_slice(qkvg, p, 0, 3 * proj)
+                # The convolution then hands fused_kda_post_conv a [3 * proj, p]
+                # tensor in either layout (_project_packed_conv_input): the
+                # channel-major result of the qkvg GEMM or of the repack, or,
+                # when the token rows of the BF16 GEMM would start unaligned,
+                # a transposed view of token-major rows, as causal_conv1d_fn
+                # returns it for a channel-last input. Both are planned.
+                for packed in (
+                    torch.empty(3 * proj, p, dtype=s.dtype, device=meta),
+                    torch.empty(p, 3 * proj, dtype=s.dtype, device=meta).t(),
+                ):
+                    fused_kda_post_conv(packed, num_heads=s.heads, head_dim=s.head_dim)
             self._gated_norm(t, s.heads, s.head_dim, g_out, False, "sigmoid")
         return list(rec)

@@ -109,7 +109,9 @@ def _real_gdn(s, p, d):
     return list(rec)
 
 
-def _real_kda(s, t):
+def _real_kda(s, t, token_major=False):
+    from tensorrt_llm._torch.modules.kimi_kda._kda_kernels import fused_kda_post_conv
+    from tensorrt_llm._torch.modules.mamba.causal_conv1d import causal_conv1d_fn
     from tensorrt_llm._torch.modules.mamba.fuse_elementwise_ops import (
         extract_transpose_prefill_slice,
     )
@@ -118,13 +120,29 @@ def _real_kda(s, t):
     dev = torch.device("cuda")
     proj = s.heads * s.head_dim
     # KimiKDALinearAttention._project_packed_conv_input with the fused FP8
-    # qkvg projection: [T, 4 * proj], the [q | k | v] columns repacked.
+    # qkvg projection: [T, 4 * proj], the [q | k | v] columns repacked
+    # channel-major; with the BF16 qkvg GEMM on an unaligned token count, a
+    # transposed view of the GEMM's token-major rows instead.
     qkvg = torch.randn(t, 4 * proj, dtype=s.dtype, device=dev)
     g = torch.randn(t, proj, dtype=s.dtype, device=dev).view(t, s.heads, s.head_dim)
     x = torch.randn(t * s.heads, s.head_dim, dtype=s.dtype, device=dev)
     w = torch.randn(s.head_dim, dtype=s.dtype, device=dev)
+    conv_w = torch.randn(3 * proj, 4, dtype=s.dtype, device=dev)
+    query_start_loc = torch.tensor([0, t], dtype=torch.int32, device=dev)
+    cache_indices = torch.zeros(1, dtype=torch.int32, device=dev)
+    has_init = torch.zeros(1, dtype=torch.bool, device=dev)
+    conv_states = torch.zeros(1, 3 * proj, 3, dtype=s.dtype, device=dev)
     with jp.shadow_launches() as rec:
-        extract_transpose_prefill_slice(qkvg, t, 0, 3 * proj)
+        if token_major:
+            packed = qkvg[:, : 3 * proj].contiguous().t()
+        else:
+            packed = extract_transpose_prefill_slice(qkvg, t, 0, 3 * proj)
+        # The real convolution keeps its input's layout (channel-last in,
+        # token-major out); it is not a Triton kernel, so it records nothing.
+        packed = causal_conv1d_fn(packed, conv_w, query_start_loc=query_start_loc,
+                                  cache_indices=cache_indices, has_initial_state=has_init,
+                                  conv_states=conv_states, activation="silu")  # fmt: skip
+        fused_kda_post_conv(packed, num_heads=s.heads, head_dim=s.head_dim)
         rms_norm_gated_token_major._init_fn(x, g, w, 1e-6, gate_activation="sigmoid")
     return list(rec)
 
@@ -147,17 +165,21 @@ def test_gdn_planned_keys_cover_real_launches(ctx_lens, gen, fp8):
     assert real <= planned, f"unplanned: {sorted(real - planned)}"
 
 
-@pytest.mark.parametrize("t", [1, 7, 16, 100, 2000, 6000])
-def test_kda_planned_keys_cover_real_launches(t):
+@pytest.mark.parametrize("token_major", [False, True])
+@pytest.mark.parametrize("t", [1, 7, 16, 100, 2000, 6000, 8134])
+def test_kda_planned_keys_cover_real_launches(t, token_major):
     s = _kda()
     p = _provider([s])
     batch = type("B", (), {"ctx_chunk_lens": [t], "gen_tokens": 0})()
     planned = _keys(p(batch))
-    real = _keys(_real_kda(s, t))
-    assert {name for name, _ in real} == {
-        "_extract_transpose_prefill_kernel",
+    real = _keys(_real_kda(s, t, token_major))
+    names = {
+        "_fused_kda_post_conv_kernel",
         "_rms_norm_gated_fwd_multirow_kernel",
-    }, real
+    }
+    if not token_major:
+        names.add("_extract_transpose_prefill_kernel")
+    assert {name for name, _ in real} == names, real
     assert real <= planned, f"unplanned: {sorted(real - planned)}"
 
 

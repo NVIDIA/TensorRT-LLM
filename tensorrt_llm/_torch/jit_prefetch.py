@@ -371,24 +371,48 @@ def flashinfer_builds_pending() -> bool:
     return bool(_fi_builds)
 
 
-def start_model_builds(model) -> bool:
-    """Start building, in a CPU-only helper, the FlashInfer JIT modules
-    ``model``'s layers build in warmup's first forwards; called once the model
-    is constructed, so the build runs while the weights load. Each provider
-    module that knows of such modules lists them from the model's geometry.
-    Returns False if prefetch is off or there is nothing to build."""
+def start_model_builds(model, rank: int = 0) -> bool:
+    """Start building, in CPU-only helpers, the JIT kernels ``model``'s layers
+    build in warmup's first forwards, which follow from the model's geometry
+    alone: FlashInfer JIT modules (each provider module that knows of such
+    modules lists them), the CuTe DSL FP8 blockwise GEMM tactics the
+    autotuner benchmarks (``jit_prefetch_cute_dsl.Fp8GemmProvider``) and the
+    KDA prefill kernel (``KdaPrefillProvider``). Called once the model is
+    constructed, so the builds run while the weights load. Returns False if
+    prefetch is off or there is nothing to build."""
     if not prefetch_enabled():
         return False
+    started = False
     try:
         from .attention.backends.sparse.glm_kpool.jit_prefetch import (
             flashinfer_modules as glm_kpool_modules,
         )
 
         modules = tuple(glm_kpool_modules(model))
+        started = bool(modules) and start_flashinfer_build(modules)
     except Exception as e:  # noqa: BLE001 - the modules then build in place
         logger.warning(f"[JIT prefetch] FlashInfer builds not planned: {type(e).__name__}: {e}")
-        return False
-    return bool(modules) and start_flashinfer_build(modules)
+    try:
+        from .cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
+
+        if IS_CUTLASS_DSL_AVAILABLE:
+            from . import jit_prefetch_cute_dsl as jcd
+
+            # Both follow from the layers' geometry and are compiled in
+            # warmup's first forwards: the FP8 GEMM tactics by the
+            # autotuner, the KDA prefill kernel by the first prefill.
+            gemm_provider = jcd.Fp8GemmProvider(model)
+            kda_provider = jcd.KdaPrefillProvider(model)
+            if gemm_provider or kda_provider:
+                prefetcher = JitPrefetcher.init(rank)
+                if prefetcher is not None:
+                    if gemm_provider:
+                        started = prefetcher.enable_fp8_gemm(gemm_provider) or started
+                    if kda_provider:
+                        started = prefetcher.enable_cute_dsl(kda_provider) or started
+    except Exception as e:  # noqa: BLE001 - the kernels then compile in place
+        logger.warning(f"[JIT prefetch] CuTe DSL builds not planned: {type(e).__name__}: {e}")
+    return started
 
 
 # ---------------------------------------------------------------------------
@@ -870,6 +894,7 @@ class JitPrefetcher:
         self._dg_moe = None
         self._cd = None  # CuTe DSL KDA provider (jit_prefetch_cute_dsl)
         self._cd_dir = None
+        self._fp8_gemm = False  # the FP8 blockwise GEMM loader is installed
 
         self._executor_thread: Optional[int] = None
         # The thread running JitPrefetcher.tune, while it runs.
@@ -1355,6 +1380,31 @@ class JitPrefetcher:
         for spec in specs:
             self._submit(spec, spec, "cute_dsl", _PRIO_BATCH, kind=jcd.KIND)
         self._event(f"CSA2 candidate publication prefetch: {len(specs)} variant(s)")
+        return True
+
+    def enable_fp8_gemm(self, gemm_provider) -> bool:
+        """Compile the CuTe DSL FP8 blockwise GEMM tactics the model's Linear
+        layers reach in the CuTe DSL helpers, and have the runner load them.
+
+        Called right after the model is constructed (``start_model_builds``),
+        before warmup: the autotuner's first pass compiles every tactic it
+        benchmarks, and the helpers compile them while the weights load. A
+        tactic whose export is missing when the runner needs it compiles in
+        place; one a helper is compiling is waited for (``_cute_dsl_load``).
+        """
+        from . import jit_prefetch_cute_dsl as jcd
+
+        if self._fp8_gemm or not gemm_provider or not self._start_cute_dsl_helpers():
+            return False
+        if not jcd.install_fp8_gemm_loader(self._cute_dsl_load):
+            return False
+        self._fp8_gemm = True
+        for spec in gemm_provider.enumerate_specs():
+            self._submit(spec, spec, "cute_dsl", _PRIO_BATCH, kind=jcd.KIND)
+        self._event(
+            f"CuTe DSL FP8 GEMM prefetch: {len(gemm_provider.shapes)} Linear shape(s), "
+            f"{len(gemm_provider.specs)} tactic(s)"
+        )
         return True
 
     def enable_flashinfer_norm(self, norm_provider) -> bool:

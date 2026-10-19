@@ -521,16 +521,82 @@ def _build_csa2_publish(s: Dict[str, Any]):
     return fn, args, ""
 
 
+# The FP8 blockwise GEMM (custom_ops' CuteDSLFp8BlackwellRunner, the block-FP8
+# Linear path of models that opt out of DeepGEMM), keyed like the runner's
+# kernel cache: the tactic, plus the cluster occupancy the runner passes as a
+# compile-time constant.
+_FP8_GEMM = "cute_dsl_fp8_blockwise_gemm"
+
+
+def fp8_gemm_spec(
+    use_2cta_instrs: bool, mma_tiler_mn, cluster_shape_mn, max_active_clusters: int
+) -> str:
+    """Spec for one TVM-FFI ``CuteDSLFp8BlackwellRunner`` kernel."""
+    return json.dumps(
+        {
+            "kernel": _FP8_GEMM,
+            "use_2cta": bool(use_2cta_instrs),
+            "mma_tiler": [int(x) for x in mma_tiler_mn],
+            "cluster": [int(x) for x in cluster_shape_mn],
+            "max_active_clusters": int(max_active_clusters),
+        },
+        sort_keys=True,
+    )
+
+
+def _build_fp8_gemm(s: Dict[str, Any]):
+    """Return (wrapper, fake args, options) for one FP8 blockwise GEMM tactic.
+
+    The kernel takes every extent as a runtime scalar and its operands as
+    pointers (16-byte aligned, as the runner makes them); only the output is a
+    tensor, the runner's ``(m, n, 1)`` view with strides ``(n, 1, m * n)``
+    marked dynamic except the unit stride, which a fake tensor of 32-bit
+    extents and 64-bit strides reproduces. So any address and extent compile
+    the same kernel the runner would compile for any shape.
+    """
+    import cutlass
+    import cutlass.cute as cute
+
+    from .cute_dsl_kernels.blackwell.blockwise_gemm.blockwise_gemm import Sm100BlockwiseGemmKernel
+    from .cute_dsl_kernels.blackwell.utils import make_ptr
+
+    gemm = Sm100BlockwiseGemmKernel(
+        cutlass.Float32,
+        use_2cta_instrs=s["use_2cta"],
+        mma_tiler_mn=tuple(s["mma_tiler"]),
+        cluster_shape_mn=tuple(s["cluster"]),
+    )
+
+    def ptr(dtype):
+        return make_ptr(dtype, 1 << 20, cute.AddressSpace.gmem, assumed_align=16)
+
+    c = cute.runtime.make_fake_tensor(
+        cutlass.BFloat16,
+        (cute.sym_int(), cute.sym_int(), cute.sym_int()),
+        stride=(cute.sym_int64(), 1, cute.sym_int64()),
+    )
+    i32 = cutlass.Int32
+    args = [i32(1), i32(1), i32(1), i32(1), i32(1), i32(1), i32(1)]  # m n k sf_m sf_n sf_k batch
+    args += [ptr(cutlass.Float8E4M3FN), ptr(cutlass.Float8E4M3FN)]
+    args += [ptr(cutlass.Float32), ptr(cutlass.Float32), c]
+    kwargs = {
+        "max_active_clusters": s["max_active_clusters"],
+        "stream": cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+    }
+    return gemm.wrapper, (args, kwargs), "--opt-level 2 --enable-tvm-ffi"
+
+
 _BUILDERS = {
     _K123: _build_k123,
     _K4: _build_k4,
     _FI_NORM: _build_fi_norm,
     _CSA2_PUBLISH: _build_csa2_publish,
+    _FP8_GEMM: _build_fp8_gemm,
 }
 # Builders that return an already compiled kernel instead of (fn, args, options).
 _PRECOMPILED = {_TOPK: _build_topk}
 # Kernels compiled with TVM-FFI are loaded as TVM-FFI functions.
-_TVM_FFI = {_FI_NORM, _TOPK}
+_TVM_FFI = {_FI_NORM, _TOPK, _FP8_GEMM}
 
 
 def build(spec: str, gpu_arch: str, out_dir: str) -> bool:
@@ -565,8 +631,9 @@ def _compile_export(spec: str, gpu_arch: str, out_dir: str, key: str, final: str
         compiled = _PRECOMPILED[s["kernel"]](s)
     else:
         fn, args, options = _BUILDERS[s["kernel"]](s)
+        args, kwargs = args if isinstance(args, tuple) else (args, {})
         options = f"{options} --gpu-arch {gpu_arch}".strip()
-        compiled = cute.compile(fn, *args, options=options)
+        compiled = cute.compile(fn, *args, **kwargs, options=options)
     tmp_name = f".{key}.{os.getpid()}"
     if s["kernel"] in _TVM_FFI:
         compiled.export_to_c(
@@ -738,6 +805,107 @@ class KdaPrefillProvider:
 
     def enumerate_specs(self) -> List[str]:
         return self.specs(True) + self.specs(False) + self.k4_specs
+
+
+class Fp8GemmProvider:
+    """Every TVM-FFI FP8 blockwise GEMM tactic the model's Linear layers reach.
+
+    A block-FP8 ``Linear`` that opts out of DeepGEMM (``disable_deep_gemm`` or
+    ``use_cute_dsl_blockscaling_mm``) runs ``trtllm::cute_dsl_fp8_gemm_blackwell``
+    on SM100/SM103, and the autotuner's first pass benchmarks every tactic the
+    runner lists (30 on these GPUs: the 1-CTA 64/128-row and 2-CTA 128/256-row
+    tiles over every cluster shape up to 16 CTAs), compiling each at its first
+    benchmark on the GPU's thread. The runner's kernel is shape-generic, so the
+    set follows from the device alone; every tactic valid for some layer's
+    ``(n, k)`` is enumerated, with the cluster occupancy of this device, before
+    the first forward.
+    """
+
+    def __init__(self, model):
+        from .._utils import get_sm_version
+        from .modules.linear import Linear
+
+        self.shapes = []
+        self.specs: List[str] = []
+        if get_sm_version() not in (100, 103):
+            return
+        shapes = set()
+        for mod in model.modules():
+            if not isinstance(mod, Linear):
+                continue
+            if not (
+                getattr(mod, "use_cute_dsl_blockscaling_mm", False)
+                or getattr(mod, "disable_deep_gemm", False)
+            ):
+                continue
+            # The quant mode, not the quant method: right after construction
+            # the layers have no weights (nor a quant method) yet.
+            quant_config = getattr(mod, "quant_config", None)
+            mode = getattr(quant_config, "layer_quant_mode", None)
+            if mode is None or not mode.has_fp8_block_scales():
+                continue
+            n, k = getattr(mod, "out_features", None), getattr(mod, "in_features", None)
+            if not n or not k:
+                continue
+            shapes.add((int(n), int(k)))
+        self.shapes = sorted(shapes)
+        if not self.shapes:
+            return
+        self.specs = self._enumerate()
+
+    def __bool__(self):
+        return bool(self.specs)
+
+    def _enumerate(self) -> List[str]:
+        import cutlass
+
+        from .custom_ops.cute_dsl_custom_ops import CuteDSLFp8BlackwellRunner
+
+        kernel = CuteDSLFp8BlackwellRunner.kernel_class
+        tactics = set()
+        # get_valid_tactics' candidate grid, checked the way it checks it
+        # (M only enters the 16-byte alignment test, which any M passes).
+        for use_2cta in (False, True):
+            for tiler in ((64, 128), (128, 128), (256, 128)):
+                for cluster in ((1, 1), (1, 2), (1, 4), (2, 1), (2, 2), (2, 4),
+                                (4, 1), (4, 2), (4, 4)):  # fmt: skip
+                    for n, k in self.shapes:
+                        if kernel.can_implement(
+                            cutlass.Float8E4M3FN, cutlass.Float32, cutlass.BFloat16,
+                            use_2cta, tiler, cluster, 128, n, k, 1, "k", "k", "n",
+                        ):  # fmt: skip
+                            tactics.add((use_2cta, tiler, cluster))
+                            break
+        # The cluster occupancy, computed as the runner computes it.
+        hw = cutlass.utils.HardwareInfo()
+        occupancy: Dict[int, int] = {}
+        specs = []
+        for use_2cta, tiler, cluster in sorted(tactics):
+            size = cluster[0] * cluster[1]
+            if size not in occupancy:
+                occupancy[size] = hw.get_max_active_clusters(size)
+            specs.append(fp8_gemm_spec(use_2cta, tiler, cluster, occupancy[size]))
+        return specs
+
+    def enumerate_specs(self) -> List[str]:
+        return list(self.specs)
+
+
+def install_fp8_gemm_loader(loader: Callable[[str], Optional[Callable]]) -> bool:
+    """Route ``CuteDSLFp8BlackwellRunner``'s TVM-FFI compiles through
+    ``loader(spec)``; returns False if CuTe DSL is unavailable."""
+    try:
+        from .custom_ops import cute_dsl_custom_ops as ops
+    except ImportError:
+        return False
+
+    def _loader(use_2cta_instrs, mma_tiler_mn, cluster_shape_mn, max_active_clusters):
+        return loader(
+            fp8_gemm_spec(use_2cta_instrs, mma_tiler_mn, cluster_shape_mn, max_active_clusters)
+        )
+
+    ops.fp8_gemm_loader = _loader
+    return True
 
 
 class FlashInferNormProvider:
