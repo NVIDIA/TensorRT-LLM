@@ -15,6 +15,7 @@
 # limitations under the License.
 
 import os
+from typing import Iterator, Optional
 
 import yaml
 
@@ -112,7 +113,7 @@ def parse_positive_concurrency(value: object) -> int:
 EPLB_SHM_TMPFS_MOUNT = "tmpfs:/dev/shm:size=640G"
 
 
-def _iter_worker_llm_configs(config):
+def _iter_worker_llm_configs(config: Optional[dict]) -> Iterator[dict]:
     """Yield every per-server LLM API config dict in a perf-sanity YAML.
 
     Disaggregated YAMLs keep them under ``worker_config.{ctx,gen}``; aggregated
@@ -126,13 +127,41 @@ def _iter_worker_llm_configs(config):
             yield server_config
 
 
-def uses_online_eplb(config, llm_src=""):
+def _load_yaml(path: str, llm_src: str) -> object:
+    """Load a YAML file; a relative ``path`` is resolved against ``llm_src``."""
+    if not os.path.isabs(path):
+        path = os.path.join(llm_src, path)
+    with open(path, "r") as f:
+        return yaml.safe_load(f)
+
+
+def _merged_llm_api_config(server_config: dict, llm_src: str) -> dict:
+    """Return the LLM API config one server is launched with.
+
+    The file at ``extra_llm_api_config_path`` is the base and the inline fields
+    replace its top-level keys, matching ``ServerConfig.merged_llm_api_config_data``
+    in ``tests/integration/defs/perf/test_perf_sanity.py``.
+    """
+    extra_config_path = server_config.get("extra_llm_api_config_path")
+    if not extra_config_path:
+        return server_config
+    extra_config = _load_yaml(extra_config_path, llm_src) or {}
+    if not isinstance(extra_config, dict):
+        raise ValueError(
+            f"extra_llm_api_config_path {extra_config_path} does not contain a YAML mapping"
+        )
+    return {**extra_config, **server_config}
+
+
+def uses_online_eplb(config: Optional[dict], llm_src: str = "") -> bool:
     """Return True when any server in the YAML enables online EPLB.
 
     Online EPLB (``moe_config.load_balancer.layer_updates_per_iter > 0``) is the
     only EPLB mode that keeps expert weights in host shared memory.
-    ``load_balancer`` is either an inline dict or a path to an EPLB YAML; a
-    relative path is resolved against ``llm_src``.
+    ``moe_config`` is read from the config each server is launched with, so a
+    load balancer set only in its ``extra_llm_api_config_path`` file counts.
+    ``load_balancer`` is either an inline dict or a path to an EPLB YAML.
+    Relative paths are resolved against ``llm_src``.
 
     Args:
         config: The parsed perf-sanity config YAML.
@@ -141,14 +170,11 @@ def uses_online_eplb(config, llm_src=""):
     Returns:
         bool
     """
-    for llm_config in _iter_worker_llm_configs(config):
+    for server_config in _iter_worker_llm_configs(config):
+        llm_config = _merged_llm_api_config(server_config, llm_src)
         load_balancer = (llm_config.get("moe_config") or {}).get("load_balancer")
         if isinstance(load_balancer, str) and load_balancer:
-            path = load_balancer
-            if not os.path.isabs(path):
-                path = os.path.join(llm_src, path)
-            with open(path, "r") as f:
-                load_balancer = yaml.safe_load(f)
+            load_balancer = _load_yaml(load_balancer, llm_src)
         if (
             isinstance(load_balancer, dict)
             and (load_balancer.get("layer_updates_per_iter") or 0) > 0
@@ -157,7 +183,17 @@ def uses_online_eplb(config, llm_src=""):
     return False
 
 
-def add_eplb_shm_mount(mounts, config, llm_src=""):
+def _mount_target(entry: str) -> str:
+    """Return the container path of one ``--container-mounts`` entry.
+
+    pyxis mounts a source-only entry such as ``/dev/shm`` on the same path.
+    """
+    parts = entry.split(":")
+    target = parts[1] if len(parts) > 1 else parts[0]
+    return target.rstrip("/") or "/"
+
+
+def add_eplb_shm_mount(mounts: str, config: Optional[dict], llm_src: str = "") -> str:
     """Append the large /dev/shm tmpfs mount when the YAML uses online EPLB.
 
     Args:
@@ -172,6 +208,6 @@ def add_eplb_shm_mount(mounts, config, llm_src=""):
     if not uses_online_eplb(config, llm_src):
         return mounts
     entries = [entry for entry in mounts.split(",") if entry]
-    if any(entry.split(":")[1:2] == ["/dev/shm"] for entry in entries):
+    if any(_mount_target(entry) == "/dev/shm" for entry in entries):
         return mounts
     return ",".join(entries + [EPLB_SHM_TMPFS_MOUNT])

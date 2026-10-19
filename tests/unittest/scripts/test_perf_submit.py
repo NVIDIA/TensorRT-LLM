@@ -151,6 +151,50 @@ def test_uses_online_eplb_reads_load_balancer_file(
     )
 
 
+@pytest.mark.parametrize(
+    "server_config, expected",
+    [
+        ({"extra_llm_api_config_path": "online_extra.yaml"}, True),
+        ({"extra_llm_api_config_path": "lb_file_extra.yaml"}, True),
+        ({"extra_llm_api_config_path": "static_extra.yaml"}, False),
+        ({"extra_llm_api_config_path": "empty_extra.yaml"}, False),
+        # Inline fields replace the file's top-level keys, so this moe_config wins.
+        (
+            {
+                "extra_llm_api_config_path": "online_extra.yaml",
+                "moe_config": {"backend": "CUTEDSL"},
+            },
+            False,
+        ),
+    ],
+)
+def test_uses_online_eplb_reads_extra_llm_api_config(
+    benchmark_utils_module: ModuleType, tmp_path: Path, server_config, expected
+):
+    (tmp_path / "online_extra.yaml").write_text(
+        "moe_config:\n  load_balancer:\n    num_slots: 288\n    layer_updates_per_iter: 1\n"
+    )
+    (tmp_path / "static_extra.yaml").write_text(
+        "moe_config:\n  load_balancer:\n    num_slots: 288\n    layer_updates_per_iter: 0\n"
+    )
+    (tmp_path / "lb_file_extra.yaml").write_text("moe_config:\n  load_balancer: online.yaml\n")
+    (tmp_path / "online.yaml").write_text("num_slots: 288\nlayer_updates_per_iter: 1\n")
+    (tmp_path / "empty_extra.yaml").write_text("")
+    disagg_config = {"worker_config": {"gen": server_config}}
+    aggr_config = {"server_configs": [server_config]}
+    assert benchmark_utils_module.uses_online_eplb(disagg_config, str(tmp_path)) is expected
+    assert benchmark_utils_module.uses_online_eplb(aggr_config, str(tmp_path)) is expected
+
+
+def test_uses_online_eplb_rejects_non_mapping_extra_llm_api_config(
+    benchmark_utils_module: ModuleType, tmp_path: Path
+):
+    (tmp_path / "list_extra.yaml").write_text("- moe_config\n")
+    config = {"worker_config": {"gen": {"extra_llm_api_config_path": "list_extra.yaml"}}}
+    with pytest.raises(ValueError, match="does not contain a YAML mapping"):
+        benchmark_utils_module.uses_online_eplb(config, str(tmp_path))
+
+
 def test_uses_online_eplb_on_checked_in_configs(benchmark_utils_module: ModuleType):
     assert benchmark_utils_module.uses_online_eplb(
         _load_repo_yaml(KIMI_K25_EPLB416_CONFIG), str(REPO_ROOT)
@@ -166,6 +210,8 @@ def test_uses_online_eplb_on_checked_in_configs(benchmark_utils_module: ModuleTy
         ("", "tmpfs:/dev/shm:size=640G"),
         ("/a:/a", "/a:/a,tmpfs:/dev/shm:size=640G"),
         ("/a:/a,", "/a:/a,tmpfs:/dev/shm:size=640G"),
+        ("/x:/dev/shm/sub", "/x:/dev/shm/sub,tmpfs:/dev/shm:size=640G"),
+        ("/dev/shm:/host_shm", "/dev/shm:/host_shm,tmpfs:/dev/shm:size=640G"),
     ],
 )
 def test_add_eplb_shm_mount_appends_for_online_eplb(
@@ -175,9 +221,17 @@ def test_add_eplb_shm_mount_appends_for_online_eplb(
     assert benchmark_utils_module.add_eplb_shm_mount(mounts, config) == expected_suffix
 
 
-def test_add_eplb_shm_mount_keeps_caller_dev_shm(benchmark_utils_module: ModuleType):
+@pytest.mark.parametrize(
+    "mounts",
+    [
+        "/a:/a,tmpfs:/dev/shm:size=900G",
+        "/dev/shm",
+        "/a:/a,/dev/shm",
+        "/host/shm:/dev/shm/",
+    ],
+)
+def test_add_eplb_shm_mount_keeps_caller_dev_shm(benchmark_utils_module: ModuleType, mounts):
     config = _lb_config({"num_slots": 416, "layer_updates_per_iter": 1})
-    mounts = "/a:/a,tmpfs:/dev/shm:size=900G"
     assert benchmark_utils_module.add_eplb_shm_mount(mounts, config) == mounts
 
 
