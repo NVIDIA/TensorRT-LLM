@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Local GPU QA: exercise the optimized backends, not a reference fallback."""
+"""Exercise mixed-precision cache routing and optimized Attention backends."""
 
 from functools import partial
 from types import SimpleNamespace
@@ -61,8 +61,8 @@ def test_optimized_two_pool_prefill_and_decode(
     fp8_input,
     scratch_reuse,
 ):
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA is required for native KVCM")
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] not in (10, 12):
+        pytest.skip("Mixed-precision NVFP4 KV requires Blackwell")
     block, length, batch = 128, 640, 2
     request_ids = list(range(batch))
     high_torch_dtype = binding_to_torch_dtype(high_dtype)
@@ -417,8 +417,8 @@ def _reference_dequant(packed, scales, scale):
     "dtype,width", [(torch.float16, 64), (torch.bfloat16, 80), (torch.float8_e4m3fn, 96)]
 )
 def test_mixed_precision_paged_conversion(dtype, width, layout):
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA is required")
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] not in (10, 12):
+        pytest.skip("Mixed-precision NVFP4 KV requires Blackwell")
     from tensorrt_llm._torch.cute_dsl_kernels.mixed_precision_kv import convert_mixed_precision_kv
 
     values = torch.linspace(-6, 6, 192 * 4 * width, device="cuda").view(192, 2, 2, width).to(dtype)
@@ -464,9 +464,94 @@ def test_mixed_precision_paged_conversion(dtype, width, layout):
     torch.testing.assert_close(actual.view(torch.uint8), expected.view(torch.uint8), rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("layout", ("NHD", "HND"))
+def test_mixed_precision_conversion_reuses_dynamic_shapes(layout, monkeypatch):
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] not in (10, 12):
+        pytest.skip("Mixed-precision NVFP4 KV requires Blackwell")
+    from tensorrt_llm._torch.cute_dsl_kernels import mixed_precision_kv as kernels
+
+    monkeypatch.setattr(kernels, "_compiled_kernels", {})
+    block, heads, width = 32, 2, 64
+    row_bytes = kernels.get_mixed_precision_kv_row_bytes(DataType.NVFP4, width)
+    compiled = None
+    for batch, pages, capacity, padding in ((1, 2, 33, 0), (1, 2, 35, 2), (2, 3, 65, 3)):
+        tokens = pages * block
+        # E2M1 values with power-of-two scales are exactly representable in NVFP4.
+        values = torch.arange(batch * tokens * 2 * heads, device="cuda") % 9 - 4
+        values = (2.0**values).to(torch.bfloat16).reshape(batch, tokens, 2, heads, 1)
+        pattern = torch.tensor(
+            [-6, -4, -3, -2, -1, -0.5, 0, 0.5, 1, 2, 3, 4, 6, 0, 0, 0],
+            device="cuda",
+            dtype=values.dtype,
+        ).repeat(width // 16)
+        values = values * pattern
+        pool = values.reshape(batch * pages, block, 2, heads, width).transpose(1, 2).contiguous()
+        low = torch.zeros(
+            (batch * pages + 2, 2, block, heads, row_bytes), device="cuda", dtype=torch.uint8
+        )
+        high = torch.zeros(
+            (batch * pages + 3, 2, block, heads, width), device="cuda", dtype=values.dtype
+        )
+        pools = tuple(
+            t.transpose(2, 3).contiguous() if layout == "HND" else t for t in (pool, low, high)
+        )
+        tables = torch.empty(
+            (2, batch + padding, pages + padding), dtype=torch.int32, device="cuda"
+        )[:, :batch, :pages]
+        indices = torch.arange(batch * pages, 0, -1, device="cuda").reshape(batch, pages)
+        tables[0].copy_(indices)
+        tables[1].copy_(indices)
+        tables[1, :, 1::2] = -1
+        lengths = torch.zeros((2, batch + padding), dtype=torch.int32, device="cuda")[:, :batch]
+        ends = capacity - torch.arange(batch, device="cuda")
+        lengths[1].copy_(ends)
+        kernels.convert_mixed_precision_kv(
+            True, capacity, *pools, tables, lengths, layout, low_dtype=DataType.NVFP4
+        )
+        native, low, high = tuple(t.transpose(2, 3) for t in pools) if layout == "HND" else pools
+        records = low[indices.flatten()].transpose(1, 2).reshape(batch, tokens, 2, heads, row_bytes)
+        decoded = _reference_dequant(
+            records[..., : width // 2], records[..., width // 2 : width // 2 + width // 16], 1
+        )
+        valid = torch.arange(tokens, device="cuda")[None, :] < ends[:, None]
+        torch.testing.assert_close(decoded[valid], values[valid].float(), rtol=0, atol=0)
+        high_values = high[indices.flatten()].transpose(1, 2).reshape_as(values)
+        high_valid = valid & ((torch.arange(tokens, device="cuda") // block % 2) == 0)
+        torch.testing.assert_close(high_values[high_valid], values[high_valid], rtol=0, atol=0)
+
+        lengths[0].copy_(ends)
+        native.fill_(99)
+        kernels.convert_mixed_precision_kv(
+            False, tokens, *pools, tables, lengths, layout, low_dtype=DataType.NVFP4
+        )
+        expected = values.masked_fill(~valid[..., None, None, None], 0)
+        torch.testing.assert_close(
+            native.transpose(1, 2).reshape_as(values), expected, rtol=0, atol=0
+        )
+        if compiled is None:
+            assert len(kernels._compiled_kernels) == 2
+            compiled = dict(kernels._compiled_kernels)
+        assert kernels._compiled_kernels == compiled
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        kernels.convert_mixed_precision_kv(
+            False, tokens, *pools, tables, lengths, layout, low_dtype=DataType.NVFP4
+        )
+    lengths[0].sub_(1)
+    native.fill_(99)
+    graph.replay()
+    valid = torch.arange(tokens, device="cuda")[None, :] < (ends - 1)[:, None]
+    expected = values.masked_fill(~valid[..., None, None, None], 0)
+    torch.testing.assert_close(native.transpose(1, 2).reshape_as(values), expected, rtol=0, atol=0)
+    assert kernels._compiled_kernels == compiled
+
+
+@pytest.mark.cpu_only
 def test_mixed_precision_public_options():
     from pydantic import ValidationError
 
+    assert KvCacheConfig().high_low_pool_ratio == 1 / 5
     config = KvCacheConfig(enable_mix_precision="nvfp4", dtype="fp8", high_low_pool_ratio=0.25)
     assert config.first_n == config.last_n == 256
     assert config.dtype == "fp8"
@@ -474,6 +559,7 @@ def test_mixed_precision_public_options():
         {"enable_mix_precision": "int4"},
         {"first_n": -1},
         {"high_low_pool_ratio": 0},
+        {"high_low_pool_ratio": None},
         {"enable_mix_precision": "nvfp4", "first_n": 0, "last_n": 0},
     ):
         with pytest.raises(ValidationError):
@@ -485,6 +571,7 @@ def test_mixed_precision_public_options():
 
 @pytest.mark.parametrize("backend", ("TRTLLM", "FLASHINFER"))
 @pytest.mark.parametrize("mixed_precision,use_v2", ((None, False), (None, True), ("nvfp4", True)))
+@pytest.mark.cpu_only
 def test_mixed_precision_manager_routing(backend, mixed_precision, use_v2):
     from tensorrt_llm._torch.pyexecutor import _util
 
@@ -526,6 +613,7 @@ def test_mixed_precision_manager_routing(backend, mixed_precision, use_v2):
     ],
     ids=("v1", "mamba", "sparse", "backend"),
 )
+@pytest.mark.cpu_only
 def test_mixed_precision_manager_rejects_unsupported_routes(model_overrides, use_v2, error, match):
     from tensorrt_llm._torch.pyexecutor._util import get_kv_cache_manager_cls
 
@@ -542,6 +630,7 @@ def test_mixed_precision_manager_rejects_unsupported_routes(model_overrides, use
         get_kv_cache_manager_cls(model_config, config)
 
 
+@pytest.mark.cpu_only
 def test_mixed_precision_does_not_override_fp4_mla_routing():
     from tensorrt_llm._torch.attention.backends.fp4_mla.cache_manager import Fp4MlaKVCacheManagerV2
     from tensorrt_llm._torch.pyexecutor._util import get_kv_cache_manager_cls
@@ -567,8 +656,8 @@ def test_mixed_precision_does_not_override_fp4_mla_routing():
 )
 @torch.inference_mode()
 def test_mla_preserves_native_rope_and_attention(backend):
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA is required")
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] not in (10, 12):
+        pytest.skip("Mixed-precision NVFP4 KV requires Blackwell")
     from tensorrt_llm._torch.attention.backends.interface import (
         PositionalEmbeddingParams,
         RopeParams,

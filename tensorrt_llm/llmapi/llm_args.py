@@ -4916,13 +4916,13 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         "Recent tokens retained at the KV dtype when mixed precision is enabled. "
         "Accepts any nonnegative count; retention follows native page granularity."
     )
-    high_low_pool_ratio: Optional[PositiveFloat] = Field(
-        default=None,
+    high_low_pool_ratio: PositiveFloat = Field(
+        default=1 / 5,
         status="prototype",
         description=
-        "High-precision to NVFP4 KV byte-budget ratio. Splits the selected KV "
-        "groups without changing other groups' shares. None uses native pool sizing."
-    )
+        "High-to-low KV byte-budget ratio when mixed precision is enabled. "
+        "Defaults to low:high=5:1. Splits the selected original KV groups "
+        "without changing other groups' shares.")
 
     # This is a pure python field, not a pybind field. It is only for the Pytorch backend.
     mamba_ssm_cache_dtype: Literal[

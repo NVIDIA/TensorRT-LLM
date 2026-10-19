@@ -86,9 +86,8 @@ class _NVFP4Codec:
 
 
 class _PagedMixedPrecisionKV:
-    def __init__(self, write: bool, capacity: int, codec: object) -> None:
+    def __init__(self, write: bool, codec: object) -> None:
         self.write = write
-        self.capacity = capacity
         self.codec = codec
 
     @cute.jit
@@ -99,12 +98,16 @@ class _PagedMixedPrecisionKV:
         high: cute.Tensor,
         tables: cute.Tensor,
         lengths: cute.Tensor,
+        capacity: cutlass.Int32,
         stream,
     ):
         groups = (
-            self.capacity * pool.shape[1] * pool.shape[3] * (pool.shape[4] // self.codec.group_size)
+            cutlass.Int64(capacity)
+            * pool.shape[1]
+            * pool.shape[3]
+            * (pool.shape[4] // self.codec.group_size)
         )
-        self.convert_paged_kv(pool, low, high, tables, lengths).launch(
+        self.convert_paged_kv(pool, low, high, tables, lengths, capacity).launch(
             grid=((groups + 127) // 128, lengths.shape[1], 1), block=(128, 1, 1), stream=stream
         )
 
@@ -116,6 +119,7 @@ class _PagedMixedPrecisionKV:
         high: cute.Tensor,
         tables: cute.Tensor,
         lengths: cute.Tensor,
+        capacity: cutlass.Int32,
     ):
         thread, _, _ = cute.arch.thread_idx()
         block, request, _ = cute.arch.block_idx()
@@ -131,7 +135,7 @@ class _PagedMixedPrecisionKV:
         position = token
         if cutlass.const_expr(self.write):
             position += lengths[0, request]
-        if token < self.capacity:
+        if token < capacity:
             view_page = request * pages_per_request + position // pool.shape[2]
             view_row = pool[view_page, kv, position % pool.shape[2], head, None]
             view_tile = cute.local_tile(view_row, (self.codec.group_size,), (group,))
@@ -201,8 +205,8 @@ def convert_mixed_precision_kv(
     key = (
         low_dtype,
         write,
-        capacity,
-        tuple((t.dtype, t.shape, t.stride(), t.device.index) for t in tensors),
+        tuple((t.dtype, t.shape[1:], t.stride(), t.device.index) for t in pools),
+        tuple((t.dtype, t.shape[0], t.ndim, t.device.index) for t in (page_tables, lengths)),
     )
     if key not in _compiled_kernels:
         try:
@@ -211,11 +215,31 @@ def convert_mixed_precision_kv(
             raise NotImplementedError(
                 f"Mixed KV conversion between {low_dtype} and {pool.dtype} is not implemented"
             ) from None
+        fake_tensors = [
+            cute.runtime.make_fake_tensor(
+                from_dlpack(t).element_type,
+                (cute.sym_int64(), *t.shape[1:]),
+                t.stride(),
+                assumed_align=16,
+            )
+            for t in pools
+        ]
+        # Metadata slices retain their reserved-capacity strides as batches change.
+        for t in (page_tables, lengths):
+            fake_tensors.append(
+                cute.runtime.make_fake_tensor(
+                    from_dlpack(t).element_type,
+                    (t.shape[0], *(cute.sym_int64() for _ in t.shape[1:])),
+                    tuple(cute.sym_int64() for _ in t.stride()),
+                    assumed_align=t.element_size(),
+                )
+            )
         with BaseDSL.enable_pyir():
             _compiled_kernels[key] = cute.compile(
-                _PagedMixedPrecisionKV(write, capacity, codec),
-                *(from_dlpack(t) for t in tensors),
+                _PagedMixedPrecisionKV(write, codec),
+                *fake_tensors,
+                cutlass.Int32(capacity),
                 make_fake_stream(use_tvm_ffi_env_stream=True),
                 options="--enable-tvm-ffi",
             )
-    _compiled_kernels[key](*tensors)
+    _compiled_kernels[key](*tensors, capacity)

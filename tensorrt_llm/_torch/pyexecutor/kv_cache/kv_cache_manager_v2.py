@@ -6769,7 +6769,7 @@ class MixedPrecisionKVCacheManager(KVCacheManagerV2):
         first_n: int = 256,
         last_n: int = 256,
         low_dtype: DataType = DataType.NVFP4,
-        high_low_pool_ratio: float | None = None,
+        high_low_pool_ratio: float | None = 1 / 5,
         **kwargs,
     ) -> None:
         if torch.cuda.get_device_capability()[0] not in (10, 12):

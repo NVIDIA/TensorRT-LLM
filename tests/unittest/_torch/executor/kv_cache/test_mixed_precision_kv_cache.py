@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Local GPU QA for mixed-precision KV allocation, reuse and transfer."""
+"""GPU tests for mixed-precision KV allocation, reuse and transfer."""
 
 from dataclasses import replace
 from types import SimpleNamespace
@@ -21,7 +21,10 @@ from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.runtime import kv_cache_manager_v2 as kv
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+pytestmark = pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] not in (10, 12),
+    reason="Mixed-precision NVFP4 KV requires Blackwell",
+)
 
 
 @pytest.fixture
@@ -47,7 +50,6 @@ def manager(request):
         mapping=Mapping(),
         dtype=high_dtype,
         low_dtype=history_dtype,
-        high_low_pool_ratio=1 / 3,
         first_n=1,
         last_n=65,
     )
@@ -66,6 +68,8 @@ def manager(request):
 )
 def test_extra_pool_uses_existing_dtype_layout(manager):
     """High keeps the native dtype; low stores each packed record in one buffer."""
+    assert manager.high_low_pool_ratio == 1 / 5
+    assert manager.kv_cache_manager_py_config.initial_pool_ratio == pytest.approx([5 / 6, 1 / 6])
     high = manager.kv_cache_manager_py_config.layers[1]
     for buffer in high.buffers:
         expected = get_size_in_bytes(2 * 64 * 128, manager.dtype)
