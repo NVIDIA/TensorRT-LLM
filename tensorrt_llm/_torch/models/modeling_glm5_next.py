@@ -1299,8 +1299,10 @@ class Glm5NextSparseAttention(nn.Module):
         _, w_v_t = self.absorbed_kv_b()
         tokens = out_latent.shape[0]
         per_head = out_latent.view(tokens, self.num_heads, self.kv_lora_rank)
-        out = torch.bmm(per_head.transpose(0, 1), w_v_t)  # [H, T, v_head]
-        out = self.o_proj(out.transpose(0, 1).reshape(tokens, -1))
+        # Write the per-head products straight into [T, H, v_head] for o_proj.
+        out = per_head.new_empty(tokens, self.num_heads, self.v_head_dim)
+        torch.bmm(per_head.transpose(0, 1), w_v_t, out=out.transpose(0, 1))
+        out = self.o_proj(out.view(tokens, -1))
         if not reduce or self.tp_all_reduce is None:
             return out
         return self.tp_all_reduce(out)
