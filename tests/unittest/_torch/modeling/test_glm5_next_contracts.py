@@ -376,6 +376,24 @@ def test_allreduce_defaults_honor_user_strategy(override):
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "architecture", ["Glm5NextForCausalLM", "Glm5NextForConditionalGeneration"]
+)
+@pytest.mark.parametrize("sm_100f, expected", [(True, "TRTLLM"), (False, "CUTLASS")])
+def test_moe_auto_backend_prefers_trtllm_gen_on_blackwell(
+    monkeypatch, architecture, sm_100f, expected
+):
+    from tensorrt_llm.models.modeling_utils import QuantConfig
+    from tensorrt_llm.quantization.mode import QuantAlgo
+
+    monkeypatch.setattr("tensorrt_llm._torch.model_config.is_sm_100f", lambda: sm_100f)
+    nvfp4 = QuantConfig(quant_algo=QuantAlgo.NVFP4, group_size=16)
+    assert ModelConfig.resolve_moe_backend("AUTO", architecture) == expected
+    assert ModelConfig.resolve_moe_backend("AUTO", architecture, quant_config=nvfp4) == expected
+    assert ModelConfig.resolve_moe_backend("CUTLASS", architecture, quant_config=nvfp4) == "CUTLASS"
+
+
+@pytest.mark.cpu_only
 def test_mtp_rejects_unsupported_attention_dp_lm_head_sharding():
     from tensorrt_llm.llmapi import MTPDecodingConfig
 
