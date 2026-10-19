@@ -2155,7 +2155,8 @@ def _build_arm(e, selection):
         model = MuseSparkOpenForCausalLM(config).model
     plan = _plans.plan_of_ids(selection)
     if plan is not None:
-        modeling.MuseSparkOpenTepModelingV2.adopt(model, plan)
+        # For the device's architecture, as the shell adopts it (the decode FMHA selection).
+        modeling.MuseSparkOpenTepModelingV2.adopt(model, plan, modeling.device_compute_capability())
         if model._decode.preattn_prep is not None:
             model._decode.preattn_prep = _Counted("preattn_prep", model._decode.preattn_prep)
         if model._post_attn_hop is not None:
