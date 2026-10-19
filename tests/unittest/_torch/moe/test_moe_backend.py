@@ -2222,6 +2222,23 @@ def test_megamoe_cutedsl_accepts_cuda_graphs_outside_tep(parallel_size: int, use
 
 
 @pytest.mark.cpu_only
+def test_strict_megamoe_cutedsl_request_reports_tep_cuda_graph_rejection() -> None:
+    """A strict MEGAMOE_CUTEDSL request names the TEP + CUDA-graph rejection."""
+    model_config = ModelConfig()
+    model_config.moe_backend = "MEGAMOE_CUTEDSL"
+
+    with pytest.raises(ValueError, match="6946611"):
+        resolve_moe_impl(
+            model_config,
+            problem=_make_megamoe_cutedsl_tep_problem(ActivationType.Swiglu, set()),
+            deployment=_make_megamoe_cutedsl_test_deployment(
+                ep_size=8, parallel_size=8, use_cuda_graph=True
+            ),
+            allow_degradation=False,
+        )
+
+
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("activation,constants", _MEGAMOE_CUTEDSL_TEP_ACTIVATIONS)
 def test_megamoe_cutedsl_rejects_moe_tensor_parallelism(
     activation: ActivationType, constants: set[str]
