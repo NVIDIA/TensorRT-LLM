@@ -50,7 +50,12 @@ def _plan_mod():
     ],
 )
 def test_plan_mla_split_kv_policy(kv_lens: list[int], rows: int, expected: list[int]) -> None:
-    plan = _plan_mod().plan_mla_split_kv(kv_lens, rows_per_request=rows, wave_clusters=WAVE)
+    # The expectations are for the default split cap of 32; pass it explicitly
+    # so a raised TLLM_CUTE_DSL_MLA_MAX_SPLIT_KV (read at import) does not
+    # change them.
+    plan = _plan_mod().plan_mla_split_kv(
+        kv_lens, rows_per_request=rows, wave_clusters=WAVE, max_split=32
+    )
     assert plan == expected
 
 
