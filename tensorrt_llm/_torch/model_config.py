@@ -284,6 +284,8 @@ class ModelConfig(Generic[TConfig]):
     # disables the optimization; hardware support is resolved by the backend.
     skip_correction_threshold: float = 0.0
     moe_backend: str = 'CUTLASS'  # options can be CUTLASS, TRTLLM
+    # The backend the user requested, before AUTO resolution.
+    moe_backend_requested: str = 'AUTO'
     # IF true, disables FC2+finalize fusion in CUTLASS MoE backend
     moe_disable_finalize_fusion: bool = False
     # If true, use low precision combine in MoE operations (only for NVFP4 quantization)
@@ -1526,6 +1528,7 @@ class ModelConfig(Generic[TConfig]):
             architecture,
             quant_config=quant_config,
         )
+        kwargs['moe_backend_requested'] = requested_moe_backend
 
         # V4.1 names the routed experts exactly as V4 does and encodes MXFP4 the
         # same way (I8 storage), so the detector and setter apply verbatim.

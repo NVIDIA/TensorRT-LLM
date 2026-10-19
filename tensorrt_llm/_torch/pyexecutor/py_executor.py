@@ -6496,6 +6496,12 @@ class PyExecutor:
         # Perform sampler-specific validation
         self.sampler.validate_request(request)
 
+        # Perform model-specific validation, for models that define the hook
+        validate = getattr(getattr(self.model_engine, "model", None),
+                           "validate_request", None)
+        if validate is not None:
+            validate(request)
+
         # Check if request has enough budget
         self._validate_request_budget(request)
 

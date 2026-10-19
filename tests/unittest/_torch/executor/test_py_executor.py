@@ -529,6 +529,92 @@ def test_model_without_remote_tail_does_not_inspect_request() -> None:
     PyExecutor._configure_csa2_remote_tail(executor, types.SimpleNamespace())
 
 
+def _make_admission_executor(model, requests):
+    """An executor whose `_fetch_and_activate_new_requests` and `_validate_request` are the
+    real ones, over a model engine holding `model`; everything else they touch is a stub."""
+    executor = types.SimpleNamespace(
+        model_engine=types.SimpleNamespace(model=model),
+        kv_cache_manager=None,
+        kv_cache_transceiver=None,
+        max_beam_width=1,
+        sampler=Mock(),
+        waiting_queue=object(),
+        active_requests=[],
+        _mm_encoder_item_scheduling_enabled=False,
+        _fetch_new_requests=Mock(return_value=requests),
+        _configure_csa2_remote_tail=Mock(),
+        _validate_token_id_range=Mock(),
+        _validate_request_budget=Mock(),
+        _handle_errors=Mock(),
+    )
+    executor._validate_request = types.MethodType(PyExecutor._validate_request, executor)
+    return executor
+
+
+def _make_admission_request(request_id: int) -> types.SimpleNamespace:
+    return types.SimpleNamespace(
+        request_id=request_id,
+        py_disaggregated_params=None,
+        sampling_config=None,
+        kv_cache_retention_config=None,
+    )
+
+
+def test_model_validation_fails_only_the_request_it_rejects() -> None:
+    requests = [_make_admission_request(i) for i in range(3)]
+
+    def validate_request(request) -> None:
+        if request.request_id == 1:
+            raise ValueError("frame too large")
+
+    model = types.SimpleNamespace(validate_request=Mock(side_effect=validate_request))
+    executor = _make_admission_executor(model, requests)
+
+    admitted = PyExecutor._fetch_and_activate_new_requests(executor)
+
+    assert admitted == [requests[0], requests[2]]
+    assert executor.active_requests == [requests[0], requests[2]]
+    executor._handle_errors.assert_called_once_with(
+        "frame too large", requests=[requests[1]], charge_budget=False
+    )
+    assert [call.args[0] for call in model.validate_request.call_args_list] == requests
+    # The checks after the model's still run for the requests it admitted.
+    assert executor._validate_request_budget.call_count == 2
+
+
+def test_model_validation_runs_after_the_sampler_and_before_the_budget() -> None:
+    order = []
+    model = types.SimpleNamespace(validate_request=lambda request: order.append("model"))
+    executor = _make_admission_executor(model, [])
+    executor.sampler.validate_request.side_effect = lambda request: order.append("sampler")
+    executor._validate_request_budget.side_effect = lambda request: order.append("budget")
+
+    PyExecutor._validate_request(executor, _make_admission_request(0))
+
+    assert order == ["sampler", "model", "budget"]
+
+
+@pytest.mark.parametrize(
+    "model",
+    [
+        types.SimpleNamespace(),
+        Mock(spec=DecoderModelForCausalLM),
+        types.SimpleNamespace(validate_request=None),
+        None,
+    ],
+    ids=["no_attribute", "spec_mock", "none_attribute", "no_model"],
+)
+def test_models_without_the_validation_hook_are_unaffected(model) -> None:
+    requests = [_make_admission_request(i) for i in range(2)]
+    executor = _make_admission_executor(model, requests)
+
+    admitted = PyExecutor._fetch_and_activate_new_requests(executor)
+
+    assert admitted == requests
+    assert executor.active_requests == requests
+    executor._handle_errors.assert_not_called()
+
+
 @pytest.mark.parametrize("mode", ["standalone", "generation", "disabled"])
 def test_full_model_requests_without_remote_handoff_are_unchanged(mode: str) -> None:
     executor, request = _make_remote_tail_executor_and_request(context_only=False)
