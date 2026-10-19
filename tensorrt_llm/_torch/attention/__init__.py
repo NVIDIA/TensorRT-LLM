@@ -71,17 +71,7 @@ __all__ = [
 def __getattr__(name: str):
     module_name = _LAZY_ATTRS.get(name)
     if module_name is None:
-        # Also resolve bare submodule access (attention.backends,
-        # attention.rotary_embedding, ...).
-        try:
-            return importlib.import_module(f".{name}", __name__)
-        except ModuleNotFoundError as e:
-            # Only translate "no such submodule" into AttributeError; a
-            # ModuleNotFoundError raised *inside* an existing submodule
-            # (missing dependency) must propagate unchanged.
-            if e.name != f"{__name__}.{name}":
-                raise
-            raise AttributeError(f"module {__name__!r} has no attribute {name!r}") from None
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
     try:
         module = importlib.import_module(f".{module_name}", __name__)
     except AttributeError as e:
