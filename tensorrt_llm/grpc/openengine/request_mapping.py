@@ -13,7 +13,7 @@ from urllib.parse import urlparse
 import grpc
 
 from tensorrt_llm.conversation_params import ConversationParams
-from tensorrt_llm.inputs.media_io import ImageMediaIO, MediaFetchError, VideoMediaIO
+from tensorrt_llm.inputs.media_io import AudioMediaIO, ImageMediaIO, MediaFetchError, VideoMediaIO
 from tensorrt_llm.inputs.multimodal_data import AudioData, VideoData
 from tensorrt_llm.inputs.registry import BaseMultimodalInputProcessor
 from tensorrt_llm.sampling_params import GuidedDecodingParams, SamplingParams
@@ -346,6 +346,15 @@ def _video_loader_factory(llm: Any) -> _MediaLoader:
     return load
 
 
+def _audio_loader_factory(llm: Any) -> _MediaLoader:
+    audio_io = _media_io_for_model(llm, "audio", AudioMediaIO)
+
+    async def load(item: generation_pb2.MediaItem, index: int) -> Any:
+        return await _load_media_item(item, audio_io, index, "audio")
+
+    return load
+
+
 def _decoded_image_bytes(image: Any) -> int:
     import numpy as np
     import torch
@@ -369,6 +378,12 @@ def _decoded_audio_data_bytes(audio: AudioData) -> int:
     if isinstance(audio.samples, np.ndarray):
         return audio.samples.nbytes
     raise TypeError(f"unsupported decoded audio type: {type(audio.samples).__name__}")
+
+
+def _decoded_audio_bytes(audio: Any) -> int:
+    if not isinstance(audio, tuple) or len(audio) != 2:
+        raise TypeError(f"unsupported decoded audio type: {type(audio).__name__}")
+    return _decoded_audio_data_bytes(AudioData(samples=audio[0], sample_rate=audio[1]))
 
 
 def _decoded_video_bytes(video: Any) -> int:
@@ -401,6 +416,9 @@ _MEDIA_HANDLERS: dict[int, _MediaHandler] = {
     ),
     generation_pb2.MODALITY_VIDEO: _MediaHandler(
         "video", _video_loader_factory, _decoded_video_bytes, _video_runtime_available
+    ),
+    generation_pb2.MODALITY_AUDIO: _MediaHandler(
+        "audio", _audio_loader_factory, _decoded_audio_bytes
     ),
 }
 
