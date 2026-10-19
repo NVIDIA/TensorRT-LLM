@@ -558,7 +558,6 @@ AgentConnection const* AgentConnectionManager::recvConnectionAndRequestInfo(
                     auto requestAndBufferInfo = std::get<RequestAndBufferInfo>(notificationInfo.mInfo);
 
                     erase = true;
-                    requestInfo = requestAndBufferInfo.mRequestInfo;
                     auto const& address = requestAndBufferInfo.mAddress;
                     auto const& bufferDescsRef = requestAndBufferInfo.mBufferDescs;
                     auto metadataOpt = requestAndBufferInfo.mMetadata;
@@ -566,61 +565,73 @@ AgentConnection const* AgentConnectionManager::recvConnectionAndRequestInfo(
                     auto const& remoteAgentName = requestAndBufferInfo.mAgentName;
                     auto const& bufferKindsRef = requestAndBufferInfo.mBufferKinds;
 
-                    TLLM_CHECK_WITH_INFO(agent == remoteAgentName,
-                        "AgentConnectionManager received RequestAndBufferInfo from '%s' with embedded agent '%s'",
-                        agent.c_str(), remoteAgentName.c_str());
-                    auto const* expectedAgentState = findAgentState(mCommState, remoteAgentName);
-                    if (expectedAgentState != nullptr)
+                    try
                     {
-                        TLLM_CHECK_WITH_INFO(address == expectedAgentState->mConnectionInfo,
-                            "AgentConnectionManager received mismatched connection info for agent '%s'",
-                            remoteAgentName.c_str());
-                    }
-                    else
-                    {
-                        std::scoped_lock remoteInfoLock(mRemoteConnectionInfoMutex);
-                        auto [remoteInfoIt, inserted] = mRemoteConnectionInfo.emplace(remoteAgentName, address);
-                        TLLM_CHECK_WITH_INFO(inserted || remoteInfoIt->second == address,
-                            "AgentConnectionManager received mismatched connection info for dynamic agent '%s'",
-                            remoteAgentName.c_str());
-                    }
-                    TLLM_CHECK_WITH_INFO(connectionIdx >= 0,
-                        "AgentConnectionManager received negative connection index for agent '%s'",
-                        remoteAgentName.c_str());
-                    TLLM_CHECK_WITH_INFO(!bufferDescsRef.empty(),
-                        "AgentConnectionManager received empty destination descriptors from agent '%s'",
-                        remoteAgentName.c_str());
-                    TLLM_CHECK_WITH_INFO(bufferDescsRef.size() == bufferKindsRef.size(),
-                        "AgentConnectionManager received %zu descriptors but %zu buffer kinds from agent '%s'",
-                        bufferDescsRef.size(), bufferKindsRef.size(), remoteAgentName.c_str());
-                    TLLM_CHECK_WITH_INFO(bufferDescsRef.size() <= mCacheTransBufferManagers.size(),
-                        "AgentConnectionManager received too many destination descriptors from agent '%s'",
-                        remoteAgentName.c_str());
-                    for (auto const kind : bufferKindsRef)
-                    {
-                        TLLM_CHECK_WITH_INFO(isValidBufferKind(kind),
-                            "AgentConnectionManager received invalid buffer kind %u from agent '%s'",
-                            static_cast<unsigned>(kind), remoteAgentName.c_str());
-                        bool isConfiguredKind = false;
-                        for (auto const configuredKind : mBufferKinds)
+                        TLLM_CHECK_WITH_INFO(agent == remoteAgentName,
+                            "AgentConnectionManager received RequestAndBufferInfo from '%s' with embedded agent '%s'",
+                            agent.c_str(), remoteAgentName.c_str());
+                        auto const* expectedAgentState = findAgentState(mCommState, remoteAgentName);
+                        if (expectedAgentState != nullptr)
                         {
-                            if (configuredKind == kind)
-                            {
-                                isConfiguredKind = true;
-                                break;
-                            }
+                            TLLM_CHECK_WITH_INFO(address == expectedAgentState->mConnectionInfo,
+                                "AgentConnectionManager received mismatched connection info for agent '%s'",
+                                remoteAgentName.c_str());
                         }
-                        TLLM_CHECK_WITH_INFO(isConfiguredKind,
-                            "AgentConnectionManager received unconfigured buffer kind %u from agent '%s'",
-                            static_cast<unsigned>(kind), remoteAgentName.c_str());
+                        TLLM_CHECK_WITH_INFO(connectionIdx >= 0,
+                            "AgentConnectionManager received negative connection index for agent '%s'",
+                            remoteAgentName.c_str());
+                        TLLM_CHECK_WITH_INFO(!bufferDescsRef.empty(),
+                            "AgentConnectionManager received empty destination descriptors from agent '%s'",
+                            remoteAgentName.c_str());
+                        TLLM_CHECK_WITH_INFO(bufferDescsRef.size() == bufferKindsRef.size(),
+                            "AgentConnectionManager received %zu descriptors but %zu buffer kinds from agent '%s'",
+                            bufferDescsRef.size(), bufferKindsRef.size(), remoteAgentName.c_str());
+                        TLLM_CHECK_WITH_INFO(bufferDescsRef.size() <= mCacheTransBufferManagers.size(),
+                            "AgentConnectionManager received too many destination descriptors from agent '%s'",
+                            remoteAgentName.c_str());
+                        for (auto const kind : bufferKindsRef)
+                        {
+                            TLLM_CHECK_WITH_INFO(isValidBufferKind(kind),
+                                "AgentConnectionManager received invalid buffer kind %u from agent '%s'",
+                                static_cast<unsigned>(kind), remoteAgentName.c_str());
+                            bool isConfiguredKind = false;
+                            for (auto const configuredKind : mBufferKinds)
+                            {
+                                if (configuredKind == kind)
+                                {
+                                    isConfiguredKind = true;
+                                    break;
+                                }
+                            }
+                            TLLM_CHECK_WITH_INFO(isConfiguredKind,
+                                "AgentConnectionManager received unconfigured buffer kind %u from agent '%s'",
+                                static_cast<unsigned>(kind), remoteAgentName.c_str());
+                        }
+                        TLLM_CHECK_WITH_INFO(
+                            requestAndBufferInfo.mRequestInfo.getTransState().getCacheState().has_value(),
+                            "AgentConnectionManager received request without cache state from agent '%s'",
+                            remoteAgentName.c_str());
+                        TLLM_CHECK_WITH_INFO(
+                            requestAndBufferInfo.mRequestInfo.getTransState().getCommState().has_value(),
+                            "AgentConnectionManager received request without comm state from agent '%s'",
+                            remoteAgentName.c_str());
+                        if (expectedAgentState == nullptr)
+                        {
+                            std::scoped_lock remoteInfoLock(mRemoteConnectionInfoMutex);
+                            auto [remoteInfoIt, inserted] = mRemoteConnectionInfo.emplace(remoteAgentName, address);
+                            TLLM_CHECK_WITH_INFO(inserted || remoteInfoIt->second == address,
+                                "AgentConnectionManager received mismatched connection info for dynamic agent '%s'",
+                                remoteAgentName.c_str());
+                        }
                     }
-                    TLLM_CHECK_WITH_INFO(requestInfo.getTransState().getCacheState().has_value(),
-                        "AgentConnectionManager received request without cache state from agent '%s'",
-                        remoteAgentName.c_str());
-                    TLLM_CHECK_WITH_INFO(requestInfo.getTransState().getCommState().has_value(),
-                        "AgentConnectionManager received request without comm state from agent '%s'",
-                        remoteAgentName.c_str());
+                    catch (std::exception const& e)
+                    {
+                        TLLM_LOG_WARNING("Dropping invalid agent request: %s", e.what());
+                        notifIt = notifs.erase(notifIt);
+                        continue;
+                    }
 
+                    requestInfo = requestAndBufferInfo.mRequestInfo;
                     TLLM_LOG_DEBUG(" recv Address:%s", address.c_str());
                     auto connection = connect(remoteAgentName, address, metadataOpt, true);
                     TLLM_CHECK_WITH_INFO(

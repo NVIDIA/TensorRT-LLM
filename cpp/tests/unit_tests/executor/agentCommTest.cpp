@@ -254,6 +254,11 @@ TEST_P(AgentCommTest, MalformedNotificationRecovery)
 
     // A truncated variant index must be removed before the valid request is processed.
     sender.getAgent()->notifySyncMessage(receiverName, "x");
+    // A well-formed payload with a mismatched sender must also be discarded.
+    RequestAndBufferInfo invalidRequest{"different-agent", "address", request, {}, "", 0, {}};
+    std::ostringstream invalidRequestStream;
+    NotificationInfo::serialize(NotificationInfo{invalidRequest}, invalidRequestStream);
+    sender.getAgent()->notifySyncMessage(receiverName, invalidRequestStream.str());
     agentConnection->sendRequestAndBufferInfo(request, {std::optional<size_t>{0}}, 0);
     tensorrt_llm::batch_manager::RequestInfo received;
     auto requestFuture = std::async(std::launch::async,
