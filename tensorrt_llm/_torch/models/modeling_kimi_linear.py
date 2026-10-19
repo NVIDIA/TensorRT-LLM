@@ -151,6 +151,11 @@ from .modeling_utils import DecoderModel, register_auto_model, run_concurrently
 # instead of the min-latency fused GEMM op (read once at import).
 _K3_DISABLE_MIN_LATENCY_LATENT_PROJ = get_env_flag("TLLM_K3_DISABLE_MIN_LATENCY_LATENT_PROJ", False)
 
+# A/B escape hatch (read once at import): TRTLLM_K3_LATENT_OVERLAP=0 runs the CuteDSL MoE latent
+# down-projection on the main stream after the router GEMM instead of beside the routing chain
+# on the MoeOutputMemset aux stream.
+_K3_LATENT_OVERLAP = get_env_flag("TRTLLM_K3_LATENT_OVERLAP", True)
+
 if TYPE_CHECKING:
     from transformers import PretrainedConfig
 
@@ -1542,6 +1547,15 @@ def _k3_router_gemm_bf16(tp_group_shares_requests: bool) -> bool:
         raise ValueError(f"{error}, or legacy") from None
 
 
+def _k3_latent_down_stream(aux_stream_dict, moe_backend: str):
+    """Return the aux stream for the MoE latent down-projection, or ``None`` for the main stream."""
+    # CuteDSL already quantizes the MoE input on the MoeOutputMemset stream; the latent
+    # down-projection runs there too, beside the routing chain.
+    if not _K3_LATENT_OVERLAP or moe_backend not in ("CUTEDSL", "CUTEDSL_FC12"):
+        return None
+    return aux_stream_dict.get(AuxStreamType.MoeOutputMemset)
+
+
 class KimiK3MoERuntime(nn.Module):
     """Kimi K3 latent MoE block backed by ConfigurableMoE."""
 
@@ -1709,12 +1723,8 @@ class KimiK3MoERuntime(nn.Module):
         self.moe_main_event = torch.cuda.Event()
         self.moe_shared_event = torch.cuda.Event()
         self.moe_routed_event = torch.cuda.Event() if self._defer_shared_allreduce else None
-        # CuteDSL already quantizes the MoE input on the MoeOutputMemset stream;
-        # the latent down-projection runs there too, beside the routing chain.
-        self.latent_down_stream = (
-            aux_stream_dict.get(AuxStreamType.MoeOutputMemset)
-            if routed_moe_model_config.moe_backend in ("CUTEDSL", "CUTEDSL_FC12")
-            else None
+        self.latent_down_stream = _k3_latent_down_stream(
+            aux_stream_dict, routed_moe_model_config.moe_backend
         )
         has_latent_stream = self.latent_down_stream is not None
         self.moe_latent_fork_event = torch.cuda.Event() if has_latent_stream else None
