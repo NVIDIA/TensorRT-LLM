@@ -99,6 +99,7 @@ l0_cpu:
   - unittest/_torch/models/test_minimax_m3_vl.py::test_preferred_media_io_format_is_uint8_numpy
   - unittest/_torch/models/test_minimax_m3_vl.py::test_video_token_count_is_one_bracket_per_temporal_patch
   - unittest/_torch/models/test_minimax_m3_vl.py::test_fast_path_expand_video_one_bracket_per_temporal_patch
+  - unittest/_torch/models/test_minimax_m3_vl.py::test_token_id_request_takes_the_fast_path_without_detokenizing
   - unittest/_torch/models/test_minimax_m3_vl.py::test_video_request_lets_the_processor_resize_frames
   - unittest/_torch/models/test_minimax_m3_vl.py::test_float_tensor_media_reach_the_processor_as_uint8_hwc
   # MiniMax-M3 VL forward under speculative decoding, KV reuse and chunked prefill.
