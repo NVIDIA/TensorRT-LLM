@@ -115,7 +115,8 @@ def _make_server(
     # thread installs (and shuts down) its own.
     server._metrics_stats_executor = None
     server._metrics_stats_read = None
-    server._metrics_stats_read_claimed = True
+    server._metrics_stats_read_waiting = False
+    server._metrics_stats_read_consumed = True
     return server
 
 
@@ -256,6 +257,38 @@ async def test_stats_read_for_a_cancelled_scrape_goes_to_the_next_scrape():
     response = await server.get_iteration_stats()
     assert _response_content(response) == [{"iter": 9}]
     assert len(server.generator.stats_timeouts) == 2
+
+
+@pytest.mark.asyncio
+async def test_finished_read_stays_with_its_scrape_until_the_scrape_resumes():
+    """A scrape arriving after a read finished, but before its scrape resumed, does not replace it.
+
+    Starting a new read there would lose what the first read drained if its
+    scrape is then cancelled before resuming.
+    """
+    gate = threading.Event()
+    server = _make_server([[{"iter": 8}], [{"iter": 9}]], with_stats_buffer=False, stats_gate=gate)
+
+    first = asyncio.create_task(server.get_iteration_stats())
+    await _run_ready_tasks()
+    loop = asyncio.get_running_loop()
+    racing = []
+
+    def on_read_done(_):
+        # Runs once the read has finished and before the first scrape resumes:
+        # another scrape arrives, then the first scrape is cancelled.
+        racing.append(asyncio.Task(server.get_iteration_stats(), loop=loop, eager_start=True))
+        first.cancel()
+
+    server._metrics_stats_read.add_done_callback(on_read_done)
+    gate.set()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+    assert _response_content(await racing[0]) == []
+
+    response = await server.get_iteration_stats()
+    assert _response_content(response) == [{"iter": 8}]
+    assert len(server.generator.stats_timeouts) == 1
 
 
 @pytest.mark.asyncio
