@@ -7,11 +7,13 @@ import shlex
 import subprocess  # nosec B404
 import sys
 import threading
+import time
 from pathlib import Path
 from subprocess import PIPE, Popen
 from typing import Literal
 
 import pytest
+import zmq
 
 from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
 from tensorrt_llm.llmapi.mpi_session import (_DEFAULT_IDENTITY_TIMEOUT,
@@ -837,3 +839,105 @@ def test_server_close_is_a_noop_without_a_global_executor(
     MPINodeState._global_comm_executor = None
     # Must not touch MPI at all (no abort callable is even constructed).
     RemoteMpiCommSessionServer._close_global_comm_executor(grace=0.1)
+
+
+def _pair_client(addr: str, hmac_key: bytes):
+    from tensorrt_llm.executor.ipc import ZeroMqQueue
+    return ZeroMqQueue((addr, hmac_key),
+                       is_server=False,
+                       socket_type=zmq.PAIR,
+                       use_hmac_encryption=True)
+
+
+def _bare_server_on(addr: str, hmac_key: bytes):
+    """A RemoteMpiCommSessionServer with a real control socket and no MPI."""
+    from tensorrt_llm.executor.ipc import ZeroMqQueue
+    server = object.__new__(RemoteMpiCommSessionServer)
+    server.addr = addr
+    server.queue = ZeroMqQueue((addr, hmac_key),
+                               is_server=True,
+                               socket_type=zmq.PAIR,
+                               use_hmac_encryption=True)
+    return server
+
+
+@pytest.fixture
+def _spawn_proxy_ipc(monkeypatch, tmp_path: Path):
+    """The IPC address and HMAC key trtllm-llmapi-launch exports."""
+    from tensorrt_llm.executor import utils as executor_utils
+    addr = f"ipc://{tmp_path / 'server.sock'}"
+    hmac_key = os.urandom(32)
+    monkeypatch.setenv("TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR", addr)
+    monkeypatch.setattr(executor_utils, "_SPAWN_PROXY_PROCESS_IPC_HMAC_KEY",
+                        hmac_key)
+    return addr, hmac_key
+
+
+@pytest.mark.cpu_only
+def test_stop_request_reaches_server_still_waiting_for_workers(
+        _spawn_proxy_ipc) -> None:
+    """The stop client must stop a server whose workers are still running.
+
+    This is ``trtllm-llmapi-launch``'s teardown: the engine (the PAIR client
+    that submitted the worker task) exits, then the stop client connects and
+    asks the server to shut down while the server is still waiting for the
+    task's worker futures. A PAIR socket only takes the new client once it has
+    processed the engine's disconnect, so a single request sent right away was
+    dropped and the server, and every follower rank, hung.
+    """
+    from concurrent.futures import Future
+
+    from tensorrt_llm.llmapi.mgmn_leader_node import stop_server_main
+
+    addr, hmac_key = _spawn_proxy_ipc
+    server = _bare_server_on(addr, hmac_key)
+    worker_future = Future()
+    stopped = threading.Event()
+
+    def serve_until_stopped():
+        assert server.queue.get() == "task"
+        received = server._wait_for_pending_futures([worker_future])
+        message = received.pop(0) if received else server.queue.get()
+        assert message is None
+        server.queue.put(RemoteMpiCommSessionServer.SHUTDOWN_ACK)
+        stopped.set()
+
+    server_thread = threading.Thread(target=serve_until_stopped, daemon=True)
+    server_thread.start()
+    try:
+        engine = _pair_client(addr, hmac_key)
+        engine.put("task")
+        engine.close()
+        # The workers finish well after the first stop request was sent.
+        threading.Timer(3.0, worker_future.set_result, args=(None, )).start()
+        assert stop_server_main(ack_timeout=0.5, max_attempts=40)
+        assert stopped.wait(10)
+    finally:
+        server_thread.join(10)
+        server.queue.close()
+
+
+@pytest.mark.cpu_only
+def test_stop_request_gives_up_without_a_server(_spawn_proxy_ipc) -> None:
+    from tensorrt_llm.llmapi.mgmn_leader_node import stop_server_main
+
+    start = time.monotonic()
+    assert not stop_server_main(ack_timeout=0.1, max_attempts=3)
+    # Every attempt is dropped with linger 0, so nothing blocks the exit.
+    assert time.monotonic() - start < 5
+
+
+@pytest.mark.cpu_only
+def test_server_wait_for_futures_logs_failures_and_returns_no_messages(
+        tmp_path: Path) -> None:
+    from concurrent.futures import Future
+
+    server = _bare_server_on(f"ipc://{tmp_path / 'server.sock'}",
+                             os.urandom(32))
+    try:
+        ok, failed = Future(), Future()
+        ok.set_result(1)
+        failed.set_exception(RuntimeError("rank 1 failed"))
+        assert server._wait_for_pending_futures([ok, failed]) == []
+    finally:
+        server.queue.close()
