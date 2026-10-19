@@ -25,9 +25,14 @@ changing anything here.
 
 The module-layer classes listed in ``__all__`` can be imported from this
 package (``from tensorrt_llm._torch.attention import Attention``). They are
-resolved lazily by the module-level ``__getattr__`` below, so importing this
-package, or any sub-package such as ``backends``, loads none of the modules
-beside it. Keep it that way: those modules pull in torch, the attention
+resolved lazily by the module-level ``__getattr__`` below: importing this
+package or its ``backends`` sub-package loads none of the modules beside it,
+and accessing an exported name imports its defining submodule. Modules
+inside ``backends`` can still import them themselves; several under
+``backends.sparse`` import ``rotary_embedding``, so importing one of those
+loads it.
+
+Keep the package root lazy: those modules pull in torch, the attention
 backends and the distributed layer, so an eager import here would make every
 backend-only caller pay for the whole module layer at import time. It would
 also put this ``__init__`` on the ``backends`` -> ``rotary_embedding`` import
