@@ -31,7 +31,8 @@ Covers the two classes of bug that ordinary op-math parity tests cannot see:
    new token count for most prefill batches, so entries are evicted all the
    time. ``test_evicted_prefill_scratch_is_released`` checks that an evicted
    entry's scratch is freed: nothing else, such as a cached CuTe wrapper, may
-   keep it alive.
+   keep it alive. ``test_prefill_scratch_plateaus_over_distinct_token_counts``
+   checks that memory stays bounded when every call brings a new token count.
 """
 
 import gc
@@ -296,6 +297,75 @@ def test_evicted_prefill_scratch_is_released(
         )
         alive = sum(ref() is not None for ref in evicted_scratch)
         assert alive == 0, f"pass {iteration}: {alive} tensors of an evicted entry are still alive"
+
+
+def _prefill_scratch_set_bytes(total_tokens: int) -> int:
+    """Upper bound on the large tensors of one varlen ``_get_buffers`` entry.
+
+    k_scaled, kg and q_scaled are [T + BT, H, K] and A_qk and A_kk are
+    [T + BT, H, BT], all bf16. One extra [T + BT, H, V] term covers the
+    smaller tensors and the prefill output with room to spare.
+    """
+    chunk = 64
+    rows = total_tokens + chunk
+    return rows * NUM_HEADS * 2 * (3 * HEAD_DIM + 2 * chunk + HEAD_DIM)
+
+
+@torch.no_grad()
+def test_prefill_scratch_plateaus_over_distinct_token_counts(
+    dispatch_pair: tuple[KDAKernelDispatch, KDAKernelDispatch],
+    gate_params: tuple[torch.Tensor, torch.Tensor],
+) -> None:
+    """Prefill memory plateaus when every call brings a token count never seen before.
+
+    The executor's packed prefill token count is the sum of the iteration's
+    context chunks and is not quantized, so a long run keeps presenting new
+    shapes. The eviction test above cycles through a fixed set of shapes, so a
+    shape-keyed cache that is not bounded would be filled on its first pass and
+    never grow after the baseline. Here every call uses a new token count, so
+    any such cache, and any state pinning evicted scratch, grows by one buffer
+    set per call and fails the budget.
+    """
+    optimized, _ = dispatch_pair
+    module = _op_module()
+    num_calls = 24
+
+    def run(first_length: int, seed: int) -> None:
+        sequence_lengths = [first_length, 200]
+        inputs = _make_inputs(sum(sequence_lengths), seed=seed)
+        run_indexed_prefill(optimized, gate_params, inputs, _make_cu_seqlens(sequence_lengths))
+
+    def settle() -> None:
+        torch.cuda.synchronize()
+        _flush_tensor_cache_pins()
+        gc.collect()
+
+    # Compile the kernels and fill the shape-independent compile caches before
+    # the baseline, at token counts the measured loop does not use.
+    for i in range(2):
+        run(100 + 64 * i, seed=700 + i)
+    settle()
+    module._buf_cache.clear()
+    settle()
+    baseline = torch.cuda.memory_allocated()
+
+    first_lengths = [300 + 64 * i for i in range(num_calls)]
+    for i, first_length in enumerate(first_lengths):
+        run(first_length, seed=800 + i)
+    settle()
+    grown = torch.cuda.memory_allocated() - baseline
+
+    cap = module._BUF_CACHE_MAX_ENTRIES
+    assert len(module._buf_cache) <= cap
+    # Clamp the cap used for the budget, so raising TLLM_KDA_BUF_CACHE_ENTRIES
+    # cannot hide a leak; a deliberately larger cap should revisit this bound.
+    max_tokens = first_lengths[-1] + 200
+    budget = (min(cap, 4) + 2) * _prefill_scratch_set_bytes(max_tokens) + (128 << 20)
+    assert grown <= budget, (
+        f"prefill scratch grows with the token count instead of plateauing: "
+        f"{grown / (1 << 20):.0f} MiB allocated after {num_calls} new token counts, "
+        f"budget {budget / (1 << 20):.0f} MiB for a cache of {cap} entries"
+    )
 
 
 @torch.no_grad()
