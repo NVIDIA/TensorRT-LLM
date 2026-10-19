@@ -742,6 +742,11 @@ class MiniMaxH3Pipeline(BasePipeline):
         prompt: str,
         keyframes: list[Image.Image],
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self._uses_tensor_parallel_text_encoder and keyframes:
+            raise NotImplementedError(
+                "MiniMax-H3 tensor-parallel text encoder currently supports "
+                "text-only prompts; set text_encoder_tp_size=1 for keyframe requests."
+            )
         if self.world_size == 1:
             return self._encode_prompt_local(prompt, keyframes)
 
@@ -795,11 +800,6 @@ class MiniMaxH3Pipeline(BasePipeline):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if self.text_encoder is None:
             raise RuntimeError("MiniMax-H3 text encoder is not loaded on this rank.")
-        if self._uses_tensor_parallel_text_encoder and keyframes:
-            raise NotImplementedError(
-                "MiniMax-H3 tensor-parallel text encoder currently supports "
-                "text-only prompts; set text_encoder_tp_size=1 for keyframe requests."
-            )
         if not self._uses_tensor_parallel_text_encoder:
             num_layers = self.text_encoder.config.text_config.num_hidden_layers
             if num_layers <= MINIMAX_H3_TEXT_ENCODER_LAYER:
