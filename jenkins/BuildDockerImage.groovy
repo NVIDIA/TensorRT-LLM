@@ -552,6 +552,7 @@ def buildImage(config, imageKeyToTag, versionOverride)
         // If using a forked repo, svc_tensorrt needs to have the access to the forked repo.
         trtllm_utils.checkoutSource(LLM_REPO, LLM_COMMIT_OR_BRANCH, LLM_ROOT, true, true)
     }
+    def sourceWheelVersionArg = ""
     if (versionOverride) {
         def resolvedVersionOverride = versionOverride
         if (versionOverride.startsWith(".")) {
@@ -565,6 +566,9 @@ def buildImage(config, imageKeyToTag, versionOverride)
         }
         env.TRTLLM_VERSION_OVERRIDE = resolvedVersionOverride
         args += ' TRT_LLM_VERSION="${TRTLLM_VERSION_OVERRIDE}"'
+        // BUILD_WHEEL_OPTS applies to source builds, including the retry below.
+        // Downloaded wheels use their own explicit BUILD_WHEEL_ARGS instead.
+        sourceWheelVersionArg = ' --version-override ${TRTLLM_VERSION_OVERRIDE}'
     }
 
     // Step 2: Build the images
@@ -659,7 +663,7 @@ def buildImage(config, imageKeyToTag, versionOverride)
                 TORCH_INSTALL_TYPE=${torchInstallType} \
                 IMAGE_WITH_TAG=${rawDependentTag} \
                 STAGE=${dependent.dockerfileStage} \
-                BUILD_WHEEL_OPTS='-j ${build_jobs}' ${args}
+                BUILD_WHEEL_OPTS="-j ${build_jobs}${sourceWheelVersionArg}" ${args}
                 """, sleepInSecs: randomSleep, numRetries: 6, shortCommondRunTimeMax: 7200)
                 args += " DEVEL_IMAGE=${rawDependentTag}"
                 if (target == "ngc-release") {
@@ -689,7 +693,7 @@ def buildImage(config, imageKeyToTag, versionOverride)
                 TORCH_INSTALL_TYPE=${torchInstallType} \
                 IMAGE_WITH_TAG=${rawImageTag} \
                 STAGE=${dockerfileStage} \
-                BUILD_WHEEL_OPTS='-j ${build_jobs}' ${args} ${buildWheelArgs}
+                BUILD_WHEEL_OPTS="-j ${build_jobs}${sourceWheelVersionArg}" ${args} ${buildWheelArgs}
                 """, sleepInSecs: randomSleep, numRetries: 6, shortCommondRunTimeMax: 7200)
             } catch (InterruptedException ex) {
                 throw ex
@@ -711,7 +715,7 @@ def buildImage(config, imageKeyToTag, versionOverride)
                 TORCH_INSTALL_TYPE=${torchInstallType} \
                 IMAGE_WITH_TAG=${rawImageTag} \
                 STAGE=${dockerfileStage} \
-                BUILD_WHEEL_OPTS='-j ${build_jobs}' ${args} ${buildWheelArgs}
+                BUILD_WHEEL_OPTS="-j ${build_jobs}${sourceWheelVersionArg}" ${args} ${buildWheelArgs}
                 """, sleepInSecs: randomSleep, numRetries: 6, shortCommondRunTimeMax: 7200)
             }
             if (target == "ngc-release") {
@@ -728,7 +732,7 @@ def buildImage(config, imageKeyToTag, versionOverride)
                 TORCH_INSTALL_TYPE=${torchInstallType} \
                 IMAGE_WITH_TAG=${rawCustomTag} \
                 STAGE=${dockerfileStage} \
-                BUILD_WHEEL_OPTS='-j ${build_jobs}' ${args} ${buildWheelArgs}
+                BUILD_WHEEL_OPTS="-j ${build_jobs}${sourceWheelVersionArg}" ${args} ${buildWheelArgs}
                 """
             }
         }
@@ -979,7 +983,7 @@ pipeline {
         booleanParam(
             name: "useWheelFromBuildStage",
             defaultValue: false,
-            description: "Install the wheel from the build-stage tarball instead of compiling one inside the image. Read since Aug 2025 but never DECLARED, so params.useWheelFromBuildStage was always null and prepareWheelFromBuildStage() returned early on every run -- see nvbug 5433581, whose temporary kill switch was never reverted. Declared here so the flag is at least capable of being set; it stays false by default, and nothing turns it on. boltOptimizeWheel does NOT depend on it: a BOLT request carries itself past this gate for the SBSA release image only."
+            description: "Install the build-stage wheel instead of compiling inside the image. Nightly releases request this explicitly; other callers default to false. SBSA release images with boltOptimizeWheel enabled require the build-stage wheel independently of this flag."
         )
         booleanParam(
             name: "boltOptimizeWheel",

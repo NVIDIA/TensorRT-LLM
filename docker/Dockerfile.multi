@@ -236,6 +236,14 @@ ARG TARGETARCH
 ENV TRT_LLM_GIT_COMMIT=${GIT_COMMIT} \
     TRT_LLM_VERSION=${TRT_LLM_VER}
 
+# Check installed metadata without importing CUDA-linked modules.
+RUN if [ -n "${TRT_LLM_VER}" ]; then \
+      python3 -c 'import sys; from importlib.metadata import version; from packaging.version import Version; \
+actual = version("tensorrt_llm"); expected = sys.argv[1]; \
+sys.exit(0 if Version(actual) == Version(expected) else f"TRT-LLM version mismatch: installed={actual}, expected={expected}")' \
+        "${TRT_LLM_VER}"; \
+    fi
+
 # Generate OSS attribution file for release image
 RUN --mount=type=bind,source=scripts/generate_container_oss_attribution.sh,target=/mnt/gen_attribution.sh \
     bash /mnt/gen_attribution.sh "release" "${TRT_LLM_VER}" "${TARGETARCH}"
