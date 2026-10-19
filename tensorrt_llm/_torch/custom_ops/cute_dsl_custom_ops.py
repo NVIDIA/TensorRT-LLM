@@ -11966,6 +11966,14 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
         _MMA_TILE_M = 128
         _MAX_SPLIT_KV = 32
+        # TLLM_CUTE_DSL_MLA_REDUCTION_PREFETCH=1 (read at import): the split-KV
+        # reduction prefetches _REDUCTION_PREFETCH_SPLITS splits' partials and
+        # reduces 4 D bands per row while that grid fits
+        # _REDUCTION_D_BAND_MAX_WAVES SM waves (see get_reducer_d_tiles).
+        _REDUCTION_PREFETCH = os.environ.get(
+            "TLLM_CUTE_DSL_MLA_REDUCTION_PREFETCH", "0") == "1"
+        _REDUCTION_PREFETCH_SPLITS = 32
+        _REDUCTION_D_BAND_MAX_WAVES = 12
         # CTA waves the split targets: with one wave, the longest request of a
         # skewed decode batch sets the kernel time.
         _SPLIT_KV_WAVES = 8
@@ -12042,6 +12050,16 @@ if IS_CUTLASS_DSL_AVAILABLE:
             two; ``S`` is the number of packed query tiles per request."""
             target = cls._SPLIT_KV_WAVES * max_active_blocks / (2 * B * S)
             return min(cls._MAX_SPLIT_KV, 1 << max(0, round(math.log2(target))))
+
+        @classmethod
+        def get_reducer_d_tiles(cls, rows: int) -> int:
+            """D bands per reduction row (``rows`` = B * S * H query rows):
+            4 with the prefetching reduction while the 4-band grid fits
+            ``_REDUCTION_D_BAND_MAX_WAVES`` SM waves, else 1."""
+            if cls._REDUCTION_PREFETCH and 4 * rows <= (
+                    cls._REDUCTION_D_BAND_MAX_WAVES * _get_num_sms()):
+                return 4
+            return 1
 
         @staticmethod
         def get_split_kv_candidates(B: int, S: int,
@@ -12571,6 +12589,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
             if not use_workspace:
                 block_split_kvs = None
             is_var_split_kv = block_split_kvs is not None
+            reducer_d_tiles = (self.get_reducer_d_tiles(batch_size * seq_len_q *
+                                                        self.num_heads)
+                               if use_workspace else 1)
+            reducer_prefetch_splits = (self._REDUCTION_PREFETCH_SPLITS
+                                       if use_workspace
+                                       and self._REDUCTION_PREFETCH else 0)
             # split_kv is a runtime Int32; only the workspace use is compiled in.
             cache_key = self.unique_id() + (
                 out_dtype,
@@ -12580,6 +12604,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 is_persistent,
                 kv_bounds is not None,
                 is_var_split_kv,
+                reducer_d_tiles,
+                reducer_prefetch_splits,
             )
             if cache_key not in CuteDSLNVMlaDecodeBlackwellRunner.kernel_cache:
                 # A compile outside the tuning window stalls the serving loop
@@ -12610,6 +12636,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     # The variable split-KV reducer needs the generic capacity.
                     reducer_max_splits=(MLA_DECODE_MAX_SPLITS
                                         if is_var_split_kv else 32),
+                    reducer_d_tiles=reducer_d_tiles,
+                    reducer_prefetch_splits=reducer_prefetch_splits,
                     emit_softmax_stats=self.emit_softmax_stats,
                 )
                 q_latent_ct = cute.runtime.from_dlpack(

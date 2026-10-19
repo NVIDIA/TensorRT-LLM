@@ -148,6 +148,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
         seq_len_q: int = 1,
         reducer_d_tiles: int = 1,
         reducer_max_splits: int = MAX_SPLITS,
+        reducer_prefetch_splits: int = 0,
         emit_softmax_stats: bool = False,
     ):
         """Initializes the configuration for a Blackwell Multi-Head Latent Attention (MLA) kernel.
@@ -188,6 +189,11 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
             retain the generic 256-split capacity by default; callers choosing
             a smaller specialization must cap runtime split-KV accordingly.
         :type reducer_max_splits: int
+        :param reducer_prefetch_splits: When positive, the split-KV reduction
+            loads the partials of this many splits into registers before
+            accumulating them, in split order (the same multiply-adds, so the
+            output is unchanged); 0 keeps the one-split-at-a-time loop.
+        :type reducer_prefetch_splits: int
         :param emit_softmax_stats: Whether to fuse Helix softmax-statistics
             stores into the attention epilogue.
         :type emit_softmax_stats: bool
@@ -237,6 +243,11 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
         if reducer_d_tiles not in (1, 2, 4):
             raise ValueError(f"unsupported reducer_d_tiles={reducer_d_tiles}")
         self.reducer_d_tiles = reducer_d_tiles
+        if reducer_prefetch_splits < 0:
+            raise ValueError(
+                f"unsupported reducer_prefetch_splits={reducer_prefetch_splits}"
+            )
+        self.reducer_prefetch_splits = reducer_prefetch_splits
         self.reducer_d_tile = self.latent_dim // reducer_d_tiles
         mma_qk_tiler_k = self.rope_dim if self.seq_len_q == 1 else self.rope_dim * 2
         self.mma_qk_tiler = (
@@ -1915,12 +1926,37 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
                 rO = cute.make_rmem_tensor(
                     cute.make_layout(elements_per_thread), self.o_dtype)
                 rAccO.fill(0.0)
-                for i in range(local_split_kv):
-                    for j in cutlass.range_constexpr(elements_per_thread):
-                        element_idx = (
-                            d_tile_idx * self.reducer_d_tile + tidx +
-                            j * self.threads_per_warp * self.num_compute_warps)
-                        rAccO[j] += gAccO[i, element_idx] * smem_lse_scale[i]
+                if cutlass.const_expr(self.reducer_prefetch_splits > 0):
+                    # Load a group of splits' partials (split index clamped),
+                    # then accumulate them in split order.
+                    num_prefetch = self.reducer_prefetch_splits
+                    rBuf = cute.make_rmem_tensor(
+                        cute.make_layout((num_prefetch, elements_per_thread)),
+                        self.acc_dtype)
+                    for i0 in range(0, local_split_kv, num_prefetch):
+                        for u in cutlass.range_constexpr(num_prefetch):
+                            ii = cutlass.min(i0 + u, local_split_kv - 1)
+                            for j in cutlass.range_constexpr(
+                                    elements_per_thread):
+                                element_idx = (
+                                    d_tile_idx * self.reducer_d_tile + tidx +
+                                    j * self.threads_per_warp *
+                                    self.num_compute_warps)
+                                rBuf[u, j] = gAccO[ii, element_idx]
+                        for u in cutlass.range_constexpr(num_prefetch):
+                            if cute.elem_less(i0 + u, local_split_kv):
+                                for j in cutlass.range_constexpr(
+                                        elements_per_thread):
+                                    rAccO[j] += (rBuf[u, j] *
+                                                 smem_lse_scale[i0 + u])
+                else:
+                    for i in range(local_split_kv):
+                        for j in cutlass.range_constexpr(elements_per_thread):
+                            element_idx = (d_tile_idx * self.reducer_d_tile +
+                                           tidx + j * self.threads_per_warp *
+                                           self.num_compute_warps)
+                            rAccO[j] += gAccO[i,
+                                              element_idx] * smem_lse_scale[i]
                 rO.store(rAccO.load().to(self.o_dtype))
                 for j in cutlass.range_constexpr(elements_per_thread):
                     element_idx = (
