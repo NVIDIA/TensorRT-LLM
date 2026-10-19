@@ -52,13 +52,15 @@ def test_in_range_ids_are_accepted(kind):
 
 @pytest.mark.parametrize("kind", ["list", "numpy", "torch"])
 def test_id_at_vocab_size_is_rejected(kind):
-    with pytest.raises(RequestError, match=f"Prompt token id {_VOCAB} is out of range"):
+    with pytest.raises(RequestError, match=f"prompt token id {_VOCAB} does not fit a vocabulary"):
         _check_prompt_token_id_range(_as(kind, [1, _VOCAB, 2]), _VOCAB, allow_out_of_vocab=False)
 
 
 @pytest.mark.parametrize("kind", ["list", "numpy", "torch"])
 def test_negative_id_is_rejected(kind):
-    with pytest.raises(RequestError, match="must be non-negative, got -1"):
+    with pytest.raises(
+        RequestError, match="^Token ID out of range: prompt token ids must be non-negative, got -1"
+    ):
         _check_prompt_token_id_range(_as(kind, [1, -1, 2]), _VOCAB, allow_out_of_vocab=False)
 
 
@@ -170,7 +172,7 @@ def test_generate_async_rejects_before_submission(monkeypatch, inputs, kwargs, e
 def test_generate_async_rejects_raw_prompts_before_submission(monkeypatch, inputs):
     preprocess = MagicMock(return_value=([1, _VOCAB], None, None, None))
     llm, executor = _fake_llm(monkeypatch, preprocess=preprocess)
-    with pytest.raises(RequestError, match=f"Prompt token id {_VOCAB} is out of range"):
+    with pytest.raises(RequestError, match=f"prompt token id {_VOCAB} does not fit a vocabulary"):
         BaseLLM.generate_async(llm, inputs)
     preprocess.assert_called_once()
     assert preprocess.call_args.args[0] == inputs

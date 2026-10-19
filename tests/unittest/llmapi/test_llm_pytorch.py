@@ -229,23 +229,21 @@ def test_llm_invalid_input_token_async():
             [42],
         ]
         fail_idx = [0]
+        # The invalid prompt is rejected by generate_async before submission;
+        # the valid request submitted before or after it must still complete.
         for submit_order in [[0, 1], [1, 0]]:
-            for collect_order in [[0, 1], [1, 0]]:
-                print(f"submitting {submit_order}")
-                futures = [
-                    llm.generate_async(
-                        prompts[submit_idx],
-                        sampling_params=SamplingParams(max_tokens=5),
-                    ) for submit_idx in submit_order
-                ]
-                for collect_idx in collect_order:
-                    with _validate_invalid_token_error_scope(
-                    ) if submit_order[collect_idx] in fail_idx else nullcontext(
-                    ):
-                        print(
-                            f"collect order {collect_order}, collecting {collect_idx}"
-                        )
-                        futures[collect_idx].result()
+            print(f"submitting {submit_order}")
+            futures = []
+            for submit_idx in submit_order:
+                with _validate_invalid_token_error_scope(
+                ) if submit_idx in fail_idx else nullcontext():
+                    futures.append(
+                        llm.generate_async(
+                            prompts[submit_idx],
+                            sampling_params=SamplingParams(max_tokens=5),
+                        ))
+            for future in futures:
+                future.result()
 
 
 @skip_ray

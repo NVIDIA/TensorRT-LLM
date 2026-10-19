@@ -372,11 +372,14 @@ def _check_prompt_token_id_range(prompt_token_ids: Union[Sequence[int],
         low = min(prompt_token_ids)
         high = max(prompt_token_ids)
     if low < 0:
-        raise RequestError(f"Prompt token ids must be non-negative, got {low}.")
+        raise RequestError(
+            f"Token ID out of range: prompt token ids must be non-negative, got {low}."
+        )
     if vocab_size is not None and high >= vocab_size and not allow_out_of_vocab:
         raise RequestError(
-            f"Prompt token id {high} is out of range for a vocabulary of "
-            f"{vocab_size} tokens (vocab_size from the model config).")
+            f"Token ID out of range: prompt token id {high} does not fit a "
+            f"vocabulary of {vocab_size} tokens (vocab_size from the model "
+            "config).")
 
 
 TORCH_LLM_DOCSTRING = TORCH_LLMARGS_EXPLICIT_DOCSTRING + """
