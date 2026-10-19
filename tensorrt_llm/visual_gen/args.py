@@ -191,15 +191,16 @@ class AttentionConfig(StrictBaseModel):
         }
         # VC-Attention stores V as E4M3 residuals around tile means with one scale per channel.
         # VC-Attention-QK16 keeps Q/K in BF16, VC-Attention-QK8 quantizes the Hadamard-rotated
-        # Q/K to E4M3 with one scale per 128 tokens.
+        # Q/K to E4M3 with one scale per 128 tokens. The recipe fixes these block sizes, so the
+        # config names only the element formats.
         VC_ATTENTION_RECIPES = {
             100: {
-                ("bf16", "fp8", (0, 0, 1)),
-                ("fp8", "fp8", (128, 128, 1)),
+                ("bf16", "fp8"),
+                ("fp8", "fp8"),
             },
             103: {
-                ("bf16", "fp8", (0, 0, 1)),
-                ("fp8", "fp8", (128, 128, 1)),
+                ("bf16", "fp8"),
+                ("fp8", "fp8"),
             },
         }
         # Other recipes verify the hardware at corresponding backend implementations.
@@ -224,14 +225,18 @@ class AttentionConfig(StrictBaseModel):
             return self
 
         q_config = self.quant_attention_config
-        recipe = (
-            q_config.qk_dtype,
-            q_config.v_dtype,
-            (q_config.q_block_size, q_config.k_block_size, q_config.v_block_size),
-        )
+        block_sizes = (q_config.q_block_size, q_config.k_block_size, q_config.v_block_size)
+        recipe = (q_config.qk_dtype, q_config.v_dtype, block_sizes)
         if self.backend == "TRTLLM":
             sm_version = get_sm_version()
             if q_config.vc_attention:
+                if block_sizes != (0, 0, 0):
+                    raise ValueError(
+                        "q_block_size, k_block_size and v_block_size are SageAttention options "
+                        "and do not apply to VC-Attention, which fixes its own block sizes. "
+                        f"Leave them at 0, got {block_sizes!r}."
+                    )
+                recipe = (q_config.qk_dtype, q_config.v_dtype)
                 recipes = VC_ATTENTION_RECIPES.get(sm_version, set())
                 family = "VC-Attention"
             else:

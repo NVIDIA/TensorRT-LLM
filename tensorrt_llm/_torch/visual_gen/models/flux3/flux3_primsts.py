@@ -185,6 +185,23 @@ def _gemm_config(
     )
 
 
+def qkv_gemm_config(
+    activation: torch.Tensor,
+    weight: torch.Tensor,
+    head_dim: int,
+    *,
+    qkv_scale: bool = False,
+) -> PrimsTsGemmConfig | None:
+    """Config the fused QKV GEMM runs with, None on SM120 and under autotuning.
+
+    The config decides the output layout. With separate_qkv_output the kernel writes
+    Q, K and V as three [M, N/3] planes, otherwise the output is packed [M, N].
+    """
+    if is_sm120(activation.device):
+        return None
+    return _gemm_config(activation, weight, "qkv_qknorm_rope", head_dim, qkv_scale=qkv_scale)
+
+
 @torch.library.custom_op("trtllm::flux3_primsts_fp8_linear", mutates_args=(), device_types="cuda")
 def fp8_linear(
     activation: torch.Tensor,
@@ -279,7 +296,7 @@ def fp8_qkv_qknorm_rope(
         num_kv_heads=heads,
         head_dim=head_dim,
         is_neox=False,
-        config=_gemm_config(activation, weight, "qkv_qknorm_rope", head_dim),
+        config=qkv_gemm_config(activation, weight, head_dim),
     )
 
 
@@ -548,13 +565,7 @@ def nvfp4_qkv_qknorm_rope(
         q_norm=q_norm,
         k_norm=k_norm,
         qkv_scale=qkv_scale,
-        config=_gemm_config(
-            activation,
-            weight,
-            "qkv_qknorm_rope",
-            q_norm.numel(),
-            qkv_scale=qkv_scale is not None,
-        ),
+        config=qkv_gemm_config(activation, weight, q_norm.numel(), qkv_scale=qkv_scale is not None),
     )
     return prepared(
         activation.detach(),

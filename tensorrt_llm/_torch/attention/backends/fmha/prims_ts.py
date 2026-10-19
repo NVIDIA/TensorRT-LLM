@@ -51,7 +51,7 @@ if TYPE_CHECKING:
     from tensorrt_llm._torch.attention.backends.prims_ts.mla_decode import (
         BatchMLADecodePagedTSWrapper,
     )
-    from tensorrt_llm._torch.attention.backends.prims_ts.vc_attention import VCAttentionPreprocessor
+    from tensorrt_llm._torch.attention.backends.prims_ts.vc_quantization import VCAttentionPreprocessor
     from tensorrt_llm._torch.attention.backends.trtllm import (
         TrtllmAttention,
         TrtllmAttentionMetadata,
@@ -157,6 +157,42 @@ def get_attention_feature_unsupported_reason(
     ):
         return "SageAttention is not supported."
     return None
+
+
+def vc_smooth_phase(denoise_step):
+    """V-Smooth phase of a denoise step as (smooth, refresh), the VCAttentionPreprocessor schedule.
+
+    No step, as in warm-up, counts as a refreshing smooth step. The CUDA graph runner keys the
+    transformer graph on this value so each phase replays its own capture.
+    """
+    from tensorrt_llm._torch.attention.backends.prims_ts.vc_quantization import (
+        VC_PERM_REFRESH_EVERY,
+        VC_SMOOTH_STEP_FRACTION,
+    )
+
+    if denoise_step is None:
+        return (True, True)
+    step_idx, num_steps = denoise_step
+    smooth = step_idx < math.ceil(VC_SMOOTH_STEP_FRACTION * num_steps)
+    return (smooth, smooth and step_idx % VC_PERM_REFRESH_EVERY == 0)
+
+
+def vc_phase_denoise_step():
+    """A denoise step that puts the preprocessor in the phase of the current graph key.
+
+    Under CUDA graph replay the real step is unknown to the captured code, so the phase the
+    runner resolved on the host selects a representative step. Outside the runner the real step is used.
+    """
+    from tensorrt_llm._torch.visual_gen.cuda_graph_runner import resolved_extra_key
+    from tensorrt_llm._torch.visual_gen.denoise_step import get_denoise_step
+
+    phase = resolved_extra_key("flux3_vc_phase")
+    if phase is None:
+        return get_denoise_step()
+    smooth, refresh = phase
+    if not smooth:
+        return (7, 8)
+    return (0, 8) if refresh else (1, 8)
 
 
 class PrimsTSFmha(PhasedFmha):
@@ -836,6 +872,7 @@ class PrimsTSFmha(PhasedFmha):
             return
         super().forward(q, k, v, metadata, forward_args)
 
+    @torch.compiler.disable
     def _forward_without_kv_cache(
         self,
         q: torch.Tensor,
@@ -875,6 +912,7 @@ class PrimsTSFmha(PhasedFmha):
         output_scale = None
         vc_params = None
         vc_repair_tiles = 0
+        vc_demean = True
         if forward_args.vc_attention:
             # VC-Attention carries its V scale and tile means (and under QK8 the E4M3 Q/K
             # with their block scales) in the run operands instead of per-tensor scales.
@@ -883,7 +921,7 @@ class PrimsTSFmha(PhasedFmha):
             # and E4M3 residuals on the V-Smooth schedule.
             vc_q = q_bshd if forward_args.vc_attention_qk_fp8 else None
             if forward_args.vc_repair_budget:
-                from tensorrt_llm._torch.attention.backends.prims_ts.vc_attention import (
+                from tensorrt_llm._torch.attention.backends.prims_ts.vc_quantization import (
                     vc_quantize_repair,
                 )
 
@@ -892,18 +930,17 @@ class PrimsTSFmha(PhasedFmha):
                 )
                 vc_repair_tiles = vc_operands.repair_tiles
             else:
-                from tensorrt_llm._torch.visual_gen.denoise_step import get_denoise_step
-
                 if self._vc_preprocessor is None:
-                    from tensorrt_llm._torch.attention.backends.prims_ts.vc_attention import (
+                    from tensorrt_llm._torch.attention.backends.prims_ts.vc_quantization import (
                         VCAttentionPreprocessor,
                     )
 
                     self._vc_preprocessor = VCAttentionPreprocessor()
                 vc_operands = self._vc_preprocessor.prepare(
-                    k_bshd, v_bshd, q=vc_q, denoise_step=get_denoise_step()
+                    k_bshd, v_bshd, q=vc_q, denoise_step=vc_phase_denoise_step()
                 )
             k_bshd, v_bshd, vc_params = vc_operands.k, vc_operands.v, vc_operands.params
+            vc_demean = vc_operands.demean
             if vc_operands.q is not None:
                 q_bshd = vc_operands.q
         elif forward_args.v_fp8_per_tensor:
@@ -911,7 +948,18 @@ class PrimsTSFmha(PhasedFmha):
             output_scale = v_dequant_scale.float().reshape(1)
         out = output.view(batch_size, seq_len, num_heads, head_dim)
         mask_type = self._get_prims_mask_type(forward_args)
-        key = (batch_size, seq_len, q_bshd.dtype, v_bshd.dtype, out.dtype, mask_type)
+        # A VC plan is compiled per demean phase and repair tile count, so the
+        # operands of either V-Smooth phase meet a matching plan.
+        key = (
+            batch_size,
+            seq_len,
+            q_bshd.dtype,
+            v_bshd.dtype,
+            out.dtype,
+            mask_type,
+            vc_demean,
+            vc_repair_tiles,
+        )
         wrapper = self._contiguous_context_wrappers.get(key)
         if wrapper is None:
             if torch.cuda.is_current_stream_capturing():
@@ -943,7 +991,7 @@ class PrimsTSFmha(PhasedFmha):
                 out_dtype=out.dtype,
                 mask_type=mask_type,
                 sm_scale=sm_scale,
-                vc_config=VCAttentionConfig(repair_tiles=vc_repair_tiles)
+                vc_config=VCAttentionConfig(demean=vc_demean, repair_tiles=vc_repair_tiles)
                 if vc_params is not None
                 else None,
             )

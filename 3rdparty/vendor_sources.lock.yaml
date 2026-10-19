@@ -2,15 +2,15 @@ schema_version: 1
 vendors:
   flashinfer-prims-ts:
     url: https://github.com/harrisonzhy/flashinfer.git
-    branch: harrisonzhy/trtllm-prims-ts-dev_vc-attn
-    commit: 8897c605eba09394e3a57357ea588c57d9e86b8e
+    branch: harrisonzhy/trtllm-prims-ts-dev_vc-attn-fused
+    commit: 6fa6865e9a96c0d12b50d3540d2ee2a4cf0355b3
     source: flashinfer/attention/prims_ts
     destination: tensorrt_llm/_torch/attention/backends/prims_ts
     include:
     - '**/*.py'
     patch: 3rdparty/vendor_patches/flashinfer-prims-ts.patch
-    patch_digest: sha256:a7b8a8e4615f9b80cd3cebc114146c77844b09b64c40a0b49bda8c76327c1ada
-    digest: sha256-tree-v1:c2e2e9cf229532060e752ef5f42d7a3f1046d83bdbe490c2c456c27b7dc80507
+    patch_digest: sha256:221671fd8a5b7bc09505077978af96aff15bc3f7dd89e8db01cbe4f625c3cc36
+    digest: sha256-tree-v1:740db0125a8731fd47567dd69b125a9eb70d54f60d78f7caf8817bf3b4e59cb2
   openengine-proto:
     url: https://github.com/ai-dynamo/openengine.git
     tag: v0.1.0
@@ -36,14 +36,3 @@ vendors:
     patch: 3rdparty/vendor_patches/sana-sol-attn.patch
     patch_digest: sha256:0d66669021683773aff34533abaf8f200abd09e3af93d19eed0e2a2e04f2f980
     digest: sha256-tree-v1:383f6085ca1bc2438e8d7d4796036af3a816dbfd396313704f7f4be2c06ac55b
-  flashinfer-prims-ts-gemm:
-    url: https://github.com/flashinfer-ai/flashinfer.git
-    branch: main
-    commit: 8b37094e149c27e112d415fc92d1920c950f9ebd
-    source: flashinfer/prims_ts/gemm
-    destination: tensorrt_llm/_torch/visual_gen/prims_ts/gemm
-    include:
-    - '**/*.py'
-    patch: 3rdparty/vendor_patches/flashinfer-prims-ts-gemm.patch
-    patch_digest: sha256:3550539e3287d87c76daa18f283dadea77f044634258b399c841a053c1bad92b
-    digest: sha256-tree-v1:614da6fe590c9243fce6674f1e47e104cef66b510d1fda30dbbf741fb8f18e2d

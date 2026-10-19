@@ -61,7 +61,7 @@ index d4652b8b68958ee3dab29d062a7cd082ea604c47..bb56724e986d302854722bf33962bea0
      q: torch.Tensor,
      paged_kv_cache: PagedKVCache,
 diff --git a/context.py b/context.py
-index d1ded2838cd43501aaf7bf866ce5631045c30eab..577896447822853e8cc4469a4b1bb15c54868bb0 100644
+index 95542c46d8ee89f2968269c95fd179627bbca4d1..37fe7579ee550383e3abcd619aecb98711740394 100644
 --- a/context.py
 +++ b/context.py
 @@ -54,7 +54,7 @@ from .vc_attention import (
@@ -73,7 +73,7 @@ index d1ded2838cd43501aaf7bf866ce5631045c30eab..577896447822853e8cc4469a4b1bb15c
  
  
  if TYPE_CHECKING:
-@@ -521,7 +521,7 @@ def _validate_device(device: torch.device) -> int:
+@@ -500,7 +500,7 @@ def _validate_device(device: torch.device) -> int:
      # Rubin runs through the sm_100f family target; a CuTe DSL older than 4.8
      # cannot emit for it unless CUTE_DSL_ARCH=sm_100f is set before import.
      if capability == (10, 7):

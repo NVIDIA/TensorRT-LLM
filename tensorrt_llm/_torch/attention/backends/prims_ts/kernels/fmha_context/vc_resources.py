@@ -18,8 +18,8 @@ VC-Attention-QK16 stores E4M3 V as residuals around the bf16 mean of each
 128-token K/V tile and restores the mean inside the online softmax with one
 bf16 K=16 UMMA step per tile, ``O += rowsum(P_tile) * mean_tile``.
 :class:`SmemMuResource` is the TMA-fed ring of the ``mean_tile`` operands. The
-ExpCast helpers code the probabilities directly as E4M3 bytes and accumulate
-the quantized row sums that become the step's A operand.
+ExpCast helpers in ``helpers`` code the probabilities directly as E4M3 bytes
+and accumulate the quantized row sums that become the step's A operand.
 The resources in ``fmha_resources`` own the row-sum operand (behind the
 SMEM P tile), the exp2 and store paths and the mean UMMA issue.
 """
@@ -30,7 +30,7 @@ from typing import Any, Optional
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Float32, Int16, Int32
+from cutlass import Int16, Int32
 from cutlass.cutlass_dsl import Constexpr
 from cutlass.experimental import primitives as prims
 from cutlass.experimental.task_scheduling.enums import WorkAttr
@@ -67,139 +67,18 @@ VC_EXPCAST_CODE_BIAS = (
 )
 
 
-@cute.jit
-def _split_bf16_hi_lo_word(value: Float32) -> Int32:
-    """Pack ``value`` as two bf16 halves: low 16 bits = truncated high part,
-    high 16 bits = truncated remainder ``value - hi``."""
-    return cute.arch.inline_ptx(
-        """{
-            .reg .b32 bits, hb, hf, lobits, lb;
-            .reg .f32 hif, lof;
-            mov.b32 bits, {$r0};
-            shr.u32 hb, bits, 16;
-            shl.b32 hf, hb, 16;
-            mov.b32 hif, hf;
-            sub.f32 lof, {$r0}, hif;
-            mov.b32 lobits, lof;
-            and.b32 lb, lobits, 0xffff0000;
-            or.b32 {$w0}, hb, lb;
-        }""",
-        write_only_types=[Int32],
-        read_only_args=[value],
-    )
-
-
-@cute.jit
-def _expcast_e4m3_quad_relu(
-    c0: Float32,
-    c1: Float32,
-    c2: Float32,
-    c3: Float32,
-    acc01: Int32,
-    acc23: Int32,
-) -> tuple[Int32, Int32, Int32]:
-    """ExpCast four unclamped codes into one packed E4M3 word and accumulate
-    their values into two f16x2 row-sum registers.
-
-    ``c = 8 * (s * scale - m) + VC_EXPCAST_CODE_BIAS``
-
-    ``cvt.rn.relu.f16x2.f32`` packs a pair and clamps underflow to code 0, an
-    f16 FMA adds 1024 so the low byte of each half is the rounded code, one
-    ``prmt`` gathers the four bytes, and the E4M3-pair to f16x2 conversion
-    with one f16 FMA per pair accumulates the quantized values.
-    """
-    return cute.arch.inline_ptx(
-        """
-        {
-            .reg .b32 h01, h23, y01, y23, v01, v23, a01, a23, r01, r23, one2, k1024;
-            .reg .b16 c01, c23;
-            mov.b32 one2, 0x3C003C00;
-            mov.b32 k1024, 0x64006400;
-            mov.b32 a01, {$r4};
-            mov.b32 a23, {$r5};
-            cvt.rn.relu.f16x2.f32 h01, {$r1}, {$r0};
-            cvt.rn.relu.f16x2.f32 h23, {$r3}, {$r2};
-            fma.rn.f16x2 y01, h01, one2, k1024;
-            fma.rn.f16x2 y23, h23, one2, k1024;
-            prmt.b32 {$w0}, y01, y23, 0x6420;
-            mov.b32 {c01, c23}, {$w0};
-            cvt.rn.f16x2.e4m3x2 v01, c01;
-            cvt.rn.f16x2.e4m3x2 v23, c23;
-            fma.rn.f16x2 r01, v01, one2, a01;
-            fma.rn.f16x2 r23, v23, one2, a23;
-            mov.b32 {$w1}, r01;
-            mov.b32 {$w2}, r23;
-        }""",
-        write_only_types=[Int32, Int32, Int32],
-        read_only_args=[c0, c1, c2, c3, acc01, acc23],
-    )
-
-
-@cute.jit
-def _expcast_e4m3_quad_relu_init(
-    c0: Float32, c1: Float32, c2: Float32, c3: Float32
-) -> tuple[Int32, Int32, Int32]:
-    """First quad of a chain for :func:`_expcast_e4m3_quad_relu` (zero accumulators)."""
-    return cute.arch.inline_ptx(
-        """
-        {
-            .reg .b32 h01, h23, y01, y23, one2, k1024;
-            .reg .b16 c01, c23;
-            mov.b32 one2, 0x3C003C00;
-            mov.b32 k1024, 0x64006400;
-            cvt.rn.relu.f16x2.f32 h01, {$r1}, {$r0};
-            cvt.rn.relu.f16x2.f32 h23, {$r3}, {$r2};
-            fma.rn.f16x2 y01, h01, one2, k1024;
-            fma.rn.f16x2 y23, h23, one2, k1024;
-            prmt.b32 {$w0}, y01, y23, 0x6420;
-            mov.b32 {c01, c23}, {$w0};
-            cvt.rn.f16x2.e4m3x2 {$w1}, c01;
-            cvt.rn.f16x2.e4m3x2 {$w2}, c23;
-        }""",
-        write_only_types=[Int32, Int32, Int32],
-        read_only_args=[c0, c1, c2, c3],
-    )
-
-
-@cute.jit
-def _f16x2_sum4(a0: Int32, a1: Int32, a2: Int32, a3: Int32) -> Float32:
-    """fp32 sum of the eight fp16 halves of four f16x2 registers."""
-    return cute.arch.inline_ptx(
-        """
-        {
-            .reg .b16 h<8>;
-            .reg .f32 f<8>;
-            mov.b32 {h0, h1}, {$r0};
-            mov.b32 {h2, h3}, {$r1};
-            mov.b32 {h4, h5}, {$r2};
-            mov.b32 {h6, h7}, {$r3};
-            cvt.f32.f16 f0, h0;
-            cvt.f32.f16 f1, h1;
-            cvt.f32.f16 f2, h2;
-            cvt.f32.f16 f3, h3;
-            cvt.f32.f16 f4, h4;
-            cvt.f32.f16 f5, h5;
-            cvt.f32.f16 f6, h6;
-            cvt.f32.f16 f7, h7;
-            add.f32 f0, f0, f1;
-            add.f32 f2, f2, f3;
-            add.f32 f4, f4, f5;
-            add.f32 f6, f6, f7;
-            add.f32 f0, f0, f2;
-            add.f32 f4, f4, f6;
-            add.f32 {$w0}, f0, f4;
-        }""",
-        write_only_types=[Float32],
-        read_only_args=[a0, a1, a2, a3],
-    )
-
-
 # ---------------------------------------------------------------------------
 # SmemMuResource -- VC-Attention-QK16 bf16 tile-mean operand ring
 # ---------------------------------------------------------------------------
 @dataclass(kw_only=True)
 class SmemMuResource(MemoryResource):
-    """The bf16 [D x 16] K-major mean operands of one group of 16 K/V tiles.
+    """Shared memory buffer for mu, the paper's name for the per-tile mean of V.
+
+    One buffer holds the bf16 means of a group of sixteen K/V tiles, packed as
+    K-major UMMA operands. The means are a tensor core B operand and the MMA
+    instruction reads its operands through shared memory descriptors. They
+    therefore follow the same path as K and V in SmemKVResource and are staged
+    into shared memory by TMA with a TmaUmma pipeline.
 
     Producer: the load warp TMA-loads the operands of the group holding K/V tile
     ``i-1`` beside V tile ``i``. Consumer: the UMMA warp issues two
@@ -335,34 +214,20 @@ class SmemMuResource(MemoryResource):
         kv_head_coord: Int32,
         batch_coord: Int32,
         kv_tile_start: Int32,
+        is_tail: Constexpr[bool] = False,
     ) -> None:
         """TMA-load the mean operand of the group holding K/V tile ``loop_offset - 1``.
 
         A group's mean step is issued one tile late, beside PV of the tile after
-        the group, so the ring runs one tile behind V.
+        the group, so the ring runs one tile behind V. The tail call loads the
+        group of the last tile for the tail mean step.
         """
-        tile_idx = cute.math.max(
-            kv_tile_start + stage_info.loop_offset - Int32(1), Int32(0)
-        )
-        self._tma_load_tile(
-            stage_info,
-            tile_idx // Int32(VC_MEAN_GROUP_TILES),
-            kv_head_coord,
-            batch_coord,
-        )
-
-    @producer_work
-    @cute.jit
-    def mu_load_last(
-        self,
-        stage_info: StageInfo,
-        *,
-        kv_head_coord: Int32,
-        batch_coord: Int32,
-        kv_tile_start: Int32,
-    ) -> None:
-        """TMA-load the mean operand of the last group for the tail mean step."""
-        tile_idx = kv_tile_start + Int32(stage_info.loop_end) - Int32(1)
+        if cutlass.const_expr(is_tail):
+            tile_idx = kv_tile_start + Int32(stage_info.loop_end) - Int32(1)
+        else:
+            tile_idx = cute.math.max(
+                kv_tile_start + stage_info.loop_offset - Int32(1), Int32(0)
+            )
         self._tma_load_tile(
             stage_info,
             tile_idx // Int32(VC_MEAN_GROUP_TILES),

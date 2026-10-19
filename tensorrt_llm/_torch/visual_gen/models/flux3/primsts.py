@@ -31,6 +31,7 @@ from tensorrt_llm._torch.visual_gen.models.flux3.flux3_primsts import (
     pack_nvfp4_swiglu_weight,
     pack_swiglu_weight,
     prepare_nvfp4_gemm,
+    qkv_gemm_config,
 )
 from tensorrt_llm._torch.visual_gen.models.flux3.fp8 import (
     Flux3FP8RowwiseLinearMethod,
@@ -514,8 +515,10 @@ def qkv_forward(
     attn: nn.Module,
     x: PrimsTSInput,
     freqs: tuple[torch.Tensor, torch.Tensor],
-) -> torch.Tensor | None:
-    """Return fused QKV, or None when the input requires native dispatch."""
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+    """Return Q, K and V after the fused projection, or None when the input
+    requires native dispatch. Each is ``[..., heads * head_dim]`` and the tuned
+    configs make them contiguous."""
     adapter = getattr(attn, "_flux3_primsts_nvfp4_qkv", None)
     if adapter is None:
         if not getattr(attn, "_primsts_fp8_qkv_rope", False):
@@ -547,4 +550,12 @@ def qkv_forward(
         )
     else:
         output = fp8_qkv_qknorm_rope(*args, None)
-    return output.reshape(*original.shape[:-1], output.shape[-1])
+    width = output.shape[-1] // 3
+    config = qkv_gemm_config(
+        data, adapter.weight, 128, qkv_scale=getattr(adapter, "qkv_scale", None) is not None
+    )
+    if config is not None and config.separate_qkv_output:
+        q, k, v = output.view(3, -1, width)
+    else:
+        q, k, v = output.split(width, dim=-1)
+    return tuple(t.reshape(*original.shape[:-1], width) for t in (q, k, v))

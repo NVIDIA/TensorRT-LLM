@@ -23,6 +23,7 @@ from typing import Optional, Union
 
 import torch
 
+from tensorrt_llm._torch.attention.backends.fmha.fallback import FallbackFmha
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.visual_gen.args import QuantAttentionConfig
@@ -393,10 +394,17 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
         # V only on the calls that run its sparse path. Its dense-layer and
         # dense-phase calls take the fused path: the TRTLLM kernel serves dense
         # self-attention from fused QKV only.
+        # Without the trtllm-gen fallback library (TLLM_FMHA_LIBS=prims_ts) dense attention is served by a
+        # cache-free FMHA that takes separate Q, K and V.
+        fmha_libs = getattr(getattr(self, "_fmha_manager", None), "fmha_libs", None)
+        no_fallback_fmha = isinstance(fmha_libs, (list, tuple)) and not any(
+            isinstance(fmha, FallbackFmha) for fmha in fmha_libs
+        )
         use_separate_qkv = (
             block_sparse_inputs is not None
             or self.quant_attention_config is not None
             or (not self.support_fused_qkv() and self.should_use_sparse(sparse_attn_phase))
+            or no_fallback_fmha
         )
         if use_separate_qkv and (k is None or v is None):
             raise ValueError("This TRTLLM attention call requires separate q, k, and v tensors.")

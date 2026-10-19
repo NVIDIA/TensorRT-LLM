@@ -203,4 +203,8 @@ def gemm_config(
             epilogue_warps=warps,
             use_tma_store=tma,
         )
+    if epilogue == "qkv_qknorm_rope":
+        # Separate Q, K and V planes spare the attention backend a copy of QKV.
+        # The kernel writes them with direct stores.
+        kwargs.update(separate_qkv_output=True, use_tma_store=False)
     return PrimsTsGemmConfig(**kwargs)
