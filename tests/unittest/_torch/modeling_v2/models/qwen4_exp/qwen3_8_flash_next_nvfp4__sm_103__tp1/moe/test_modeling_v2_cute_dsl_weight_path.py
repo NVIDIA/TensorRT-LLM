@@ -9,7 +9,7 @@ the checkpoint's expert tensors (512 experts: packed NVFP4 `up_proj` / `gate_pro
 (`weights._expert_fc1_w` / `_expert_fc1_s` / `_expert_fc2_w` / `_expert_fc2_s`) and scalar
 derivation (`modeling._moe_layer_scalars`), once per routed backend. The operands then go
 through the call sequence of the target's `_moe_block` -- CuteDSL: sort, FC1 with SwiGLU,
-FC2, unpermute; trtllm-gen: the one-call runner -- with explicit routing.
+FC2, unpermute; trtllm-gen: the one-call block-scale runner -- with explicit routing.
 
 Two routings hit all 512 experts. In the first every token's only non-zero routing weight is
 on its own expert, so each expert's output is checked alone: a layout error confined to one
@@ -32,6 +32,7 @@ import pytest
 import torch
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.fp4_block_scale_moe_runner import (
+    fp4_block_scale_moe_runner,
     quantize_nvfp4,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1 import (  # noqa: E501
@@ -226,7 +227,7 @@ def _trtllm_gen_routed(layer, x, ids, weights) -> torch.Tensor:
     """The trtllm-gen branch of `_moe_block`."""
     sc = layer.scalars
     xq, xsf = M.fp4_quantize(x, sc["global_scale"], M._SF_VEC, False, M._SF_LINEAR)
-    return M.fp4_block_scale_moe_runner(
+    return fp4_block_scale_moe_runner(
         routing_logits=None,
         routing_bias=None,
         hidden_states=xq,

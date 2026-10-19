@@ -20,6 +20,19 @@ Differences from other targets:
 * **Hyper-connections.** The inter-block residual is ``4 * 2560 = 10240`` wide.
   There is **no** ``model.language_model.norm.weight``: the stack-final
   ``hyper_connection_mixer`` is the final norm and ``lm_head`` reads its output.
+  In the trunk each site is ``ops/hc/qwen4_exp_hc_inject_norm`` (the previous block's
+  accumulate fused with this site's grouped norm; after a MoE block it also forms that
+  block's output from the routed and shared outputs and the gate logit) and then the
+  mixer: ``catalog/gemm/cublas_mm`` over the concatenated ``[down; block_inject]``
+  weight, ``ops/hc/qwen4_exp_hc_lowrank_act`` and ``ops/hc/qwen4_exp_hc_up_gate_mean``
+  (the up projection as a tcgen05 GEMM whose epilogue applies the sigmoid gate and the
+  stream mean). ``DecodeTarget`` mixers run the first projection as one tcgen05 launch
+  (``ops/hc/qwen4_exp_hc_decode_tc_first``, ``_HC_TC_FIRST_MIN_ROWS`` to
+  ``_HC_TC_FIRST_MAX_ROWS`` rows) or, at ``_HC_DECODE_GEMV_MAX_ROWS`` rows, two GEMV
+  launches (``ops/hc/qwen4_exp_hc_decode_first_cute``, ``ops/hc/qwen4_exp_hc_decode_mix``);
+  at the 48 MoE sites the mixer's last launch also writes the routed experts' NVFP4
+  input. The MTP layer and the prefill PLE block keep the unfused
+  ``qwen4_exp_gated_residual`` / ``qwen4_exp_post_inject`` / ``_grouped_norm``.
 * **QSA sparse attention.** The index plane is maintained on every step so a
   request can cross ``dense_seq_len_threshold`` later without rebuilding its
   prefix; sparse selection replaces the dense core only above it. The MTP draft
@@ -30,7 +43,11 @@ Differences from other targets:
   trunk's routed experts run on trtllm-gen's block-scale runner (``TRTLLM``, and what
   ``AUTO`` selects) or on the CuteDSL sort / grouped-GEMM pipeline (``CUTEDSL``),
   chosen by ``moe_config.backend``; any other request is refused. The MTP draft
-  layer's FP8 block-scale experts run on trtllm-gen under either.
+  layer's FP8 block-scale experts run on trtllm-gen under either. Under ``TRTLLM`` the
+  prefill-sized launches (``_CUTE_DSL_MOE_MIN_ROWS``) run the CuteDSL pipeline over a
+  second copy of the experts in its layout. A graph-captured decode step routes its block
+  projections through ``catalog/gemm/low_m_bf16_mm`` (FlashInfer low-M kernels at
+  M <= 32 on the shapes it lists, cuBLAS otherwise); see ``DecodeTarget.forward``.
 
 Integration facts this file depends on:
 
@@ -107,20 +124,22 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.thop_attent
     thop_attention,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.cublas_mm import cublas_mm
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.low_m_bf16_mm import low_m_bf16_mm
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.graph.eager_on_graph import (
     eager_on_graph,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.fp4_block_scale_moe_runner import (
-    fp4_block_scale_moe_runner,
-)
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.quantization.fp4_quantize import (
     fp4_quantize,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.ssm.flashinfer_chunk_gated_delta_rule import (  # noqa: E501
+    flashinfer_chunk_gated_delta_rule,
 )
 from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_utils import DecoderModel, DecoderModelForCausalLM
 from tensorrt_llm._torch.modules.fla.cached_replay import CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE
+from tensorrt_llm._torch.modules.logits_processor import LogitsProcessor
 from tensorrt_llm._torch.speculative import get_spec_worker, should_use_separate_draft_kv_cache
 from tensorrt_llm._torch.utils import ActivationType
 from tensorrt_llm.logger import logger
@@ -130,6 +149,7 @@ from . import weights as _weights
 from .ops.activation.fused_sigmoid_mul_inplace import fused_sigmoid_mul_inplace
 from .ops.activation.gelu_erf import gelu_erf
 from .ops.activation.gelu_tanh import gelu_tanh
+from .ops.activation.silu_and_mul_rows import silu_and_mul_rows
 from .ops.attention.qsa_canonical_selection import qsa_canonical_selection
 from .ops.attention.qsa_expand_block_indices import qsa_expand_block_indices
 from .ops.attention.qsa_mtp_reuse_topk import qsa_mtp_reuse_topk
@@ -138,17 +158,41 @@ from .ops.attention.qsa_paged_index_store import qsa_paged_index_store
 from .ops.attention.qsa_paged_kv_store import qsa_paged_kv_store
 from .ops.attention.qsa_paged_kv_store_nvfp4 import qsa_paged_kv_store_nvfp4
 from .ops.attention.qsa_paged_sparse_gqa import qsa_paged_sparse_gqa
+from .ops.attention.qsa_paged_sparse_gqa_decode import MAX_ROWS as _SPARSE_DECODE_MAX_ROWS
+from .ops.attention.qsa_paged_sparse_gqa_decode import qsa_paged_sparse_gqa_decode
+from .ops.attention.qsa_paged_sparse_gqa_decode import supports as _sparse_decode_supports
 from .ops.attention.qsa_paged_sparse_gqa_nvfp4 import qsa_paged_sparse_gqa_nvfp4
 from .ops.attention.qsa_prefill_compress import qsa_prefill_compress
+from .ops.attention.qsa_sparse_gqa_rowtile import qsa_sparse_gqa_rowtile
+from .ops.attention.qsa_topk_expand_decode import qsa_topk_expand_decode
 from .ops.attention.qsa_topk_select import qsa_topk_select
+from .ops.attention.qwen4_exp_attn_decode_prologue import qwen4_exp_attn_decode_prologue
+from .ops.attention.qwen4_exp_qk_norm_rope import qwen4_exp_qk_norm_rope
 from .ops.attention.vision_rope_2d import vision_rope_2d
 from .ops.embedding.ngram_hash import ngram_hash
+from .ops.gemm.bf16_gemv_pdl import TILING as _GEMV_TILED_K
+from .ops.gemm.bf16_gemv_pdl import bf16_gemv_pdl
 from .ops.hc.qwen4_exp_gated_residual import qwen4_exp_gated_residual
+from .ops.hc.qwen4_exp_hc_decode_first_cute import qwen4_exp_hc_decode_first_cute
+from .ops.hc.qwen4_exp_hc_decode_mix import qwen4_exp_hc_decode_mix
+from .ops.hc.qwen4_exp_hc_decode_mix_fp4_cute import (
+    qwen4_exp_hc_decode_mix_cute,
+    qwen4_exp_hc_decode_mix_fp4_cute,
+)
+from .ops.hc.qwen4_exp_hc_decode_tc_first import qwen4_exp_hc_decode_tc_first
+from .ops.hc.qwen4_exp_hc_gate_mean import qwen4_exp_hc_gate_mean
+from .ops.hc.qwen4_exp_hc_inject_norm import qwen4_exp_hc_inject_norm
+from .ops.hc.qwen4_exp_hc_lowrank_act import qwen4_exp_hc_lowrank_act
+from .ops.hc.qwen4_exp_hc_up_gate_mean import qwen4_exp_hc_up_gate_mean
+from .ops.hc.qwen4_exp_hc_up_gate_mean_fp4 import qwen4_exp_hc_up_gate_mean_fp4
 from .ops.hc.qwen4_exp_post_inject import qwen4_exp_post_inject
 from .ops.moe.cute_dsl_nvfp4_gather_grouped_gemm_act_fusion import (
     cute_dsl_nvfp4_gather_grouped_gemm_act_fusion,
 )
 from .ops.moe.cute_dsl_nvfp4_grouped_gemm import cute_dsl_nvfp4_grouped_gemm
+from .ops.moe.fp4_block_scale_moe_renorm_permuted import fp4_block_scale_moe_renorm_permuted
+from .ops.moe.fp4_block_scale_moe_renorm_routed import fp4_block_scale_moe_renorm_routed
+from .ops.moe.fp4_moe_renorm_cute_dsl import fp4_moe_renorm_cute_dsl
 from .ops.moe.fp8_block_scale_moe_runner import fp8_block_scale_moe_runner
 from .ops.moe.fused_sigmoid_gate_mul_add import fused_sigmoid_gate_mul_add
 from .ops.moe.moe_sort import moe_sort
@@ -159,6 +203,9 @@ from .ops.norm.layer_norm import layer_norm
 from .ops.norm.rms_norm_gated_token_major import rms_norm_gated_token_major
 from .ops.ple.gated_ngram_injection import gated_ngram_injection
 from .ops.ple.ngram_token_history import ngram_token_history
+from .ops.ple.ple_gate_conv_inject_norm import ple_gate_conv_inject_norm
+from .ops.ple.ple_ngram_embed import ple_ngram_embed
+from .ops.quantization.bf16_to_fp32 import bf16_to_fp32
 from .ops.quantization.dequantize_e4m3_per_tensor import dequantize_e4m3_per_tensor
 from .ops.quantization.fp8_quantize_1x128 import fp8_quantize_1x128
 from .ops.ssm.causal_conv1d_fwd import causal_conv1d_fwd
@@ -175,6 +222,12 @@ from .ops.ssm.fused_recurrent_gated_delta_rule_cached_replay_update import (
 )
 from .ops.ssm.fused_recurrent_gated_delta_rule_update import fused_recurrent_gated_delta_rule_update
 from .ops.ssm.fused_sigmoid_gating_delta_rule_update import fused_sigmoid_gating_delta_rule_update
+from .ops.ssm.gdn_decode_gated_norm_pdl import MAX_ROWS as _GDN_DECODE_FUSED_MAX_ROWS
+from .ops.ssm.gdn_decode_gated_norm_pdl import gdn_decode_gated_norm_pdl
+from .ops.ssm.gdn_decode_rows_gated_norm import gdn_decode_rows, gdn_decode_rows_gated_norm
+from .ops.ssm.gdn_in_proj_conv1d_pdl import MAX_ROWS as _GDN_CONV_FUSED_MAX_ROWS
+from .ops.ssm.gdn_in_proj_conv1d_pdl import gdn_in_proj_conv1d_pdl
+from .ops.ssm.gdn_prefill_conv_post import gdn_prefill_conv_post
 from .ops.ssm.pack_gdn_decode_qkv import pack_gdn_decode_qkv
 from .ops.ssm.reset_recurrent_state_rows import reset_recurrent_state_rows
 from .ops.vision.patch_embed_conv3d import patch_embed_conv3d
@@ -204,6 +257,33 @@ _MAMBA_FIELDS = (
     "query_start_loc",
     "query_start_loc_long",
 )
+
+
+# A context launch at or above this many rows takes `qsa_sparse_gqa_rowtile`;
+# measured on GB300 it loses at 543 rows and wins from 4096 rows up.
+_ROWTILE_MIN_ROWS = 2048  # capacity: fixed: a dispatch threshold, not a buffer size
+
+#: Context-step MoE launches of at least this many rows run on the CuTe DSL MoE
+#: (`fp4_moe_renorm_cute_dsl`, from the second expert copy `weights.py` keeps in
+#: its layout); smaller ones, every decode one among them, keep the trtllm-gen
+#: runner. From GB300 micro-benches, us a layer, CuTe DSL vs trtllm-gen: 2048
+#: rows 275 vs 273, 8192 rows 451 vs 555, 16384 rows 656 vs 882.
+_CUTE_DSL_MOE_MIN_ROWS = 4096  # capacity: fixed: a dispatch threshold, not a buffer size
+
+
+def _decode_projection(mat_a: torch.Tensor, mat_b: torch.Tensor) -> torch.Tensor:
+    """A graph-captured decode step's bf16 projection, always a PDL launch.
+
+    One row runs `bf16_gemv_pdl` on every K it tiles (each decode projection of this
+    checkpoint): its weight streams into registers before it waits on the producer, and it
+    triggers its own dependents. More rows run `low_m_bf16_mm` with its FlashInfer
+    branches' PDL on (its cuBLAS branch, above M=32 and off its table, ignores the flag).
+    Every kernel either path launches reads the activation only after
+    `griddepcontrol.wait`.
+    """
+    if mat_a.shape[0] == 1 and mat_b.shape[0] in _GEMV_TILED_K:
+        return bf16_gemv_pdl(mat_a, mat_b, True)
+    return low_m_bf16_mm(mat_a, mat_b, True)
 
 
 # Per-call constants of the dense attention call shape: packed-QKV causal GQA, RoPE
@@ -405,7 +485,7 @@ _CUTEDSL_MAX_DRAFT_LEN = 3
 _PAD_SLOT_ID = -1
 
 # Gated-DeltaNet gating form: the only pair `fused_sigmoid_gating_delta_rule_update`
-# is certified at; matches `fused_gdn_post_conv`'s default so prefill and decode
+# is certified at; matches `gdn_prefill_conv_post`'s default so prefill and decode
 # compute the same `g`.
 _SOFTPLUS_BETA = 1.0
 _SOFTPLUS_THRESHOLD = 20.0
@@ -462,6 +542,31 @@ _MTP_NUM_LAYERS = 1
 #: streams; False: stream 0 only. A wrong choice yields bit-correct text with every
 #: draft rejected; only the acceptance gate can tell.
 _MTP_EMBED_BLOCK_ALL_STREAMS = True
+
+#: Decode batches up to this many rows run each trunk hyper-connection site as
+#: `qwen4_exp_hc_decode_first_cute` + `qwen4_exp_hc_decode_mix` (two GEMV launches);
+#: larger ones as `qwen4_exp_hc_inject_norm` + cuBLAS. A dispatch threshold from the
+#: GB300 micro-bench (the GEMVs win at 1 row and lose from 2), at most the entries'
+#: MAX_ROWS.
+_HC_DECODE_GEMV_MAX_ROWS = 1  # capacity: fixed: dispatch threshold, not a buffer bound
+
+#: Decode row count from which the hyper-connection up projection runs as
+#: `qwen4_exp_hc_up_gate_mean` (gate and stream mean in the GEMM epilogue). The
+#: fused kernel's 80 tiles read the 6.5 MB up weight slower than cuBLAS at
+#: one row (5.8 vs 5.2 us); from 2 rows on the saved launch and logits round
+#: trip win (5.6 vs 6.1 us at 2, 5.5 vs 7.4 at 128; GB300, graph-replayed,
+#: cold weights). Prefill always takes the fused op. Trunk sites at most
+#: `_HC_DECODE_GEMV_MAX_ROWS` rows never reach the mixer (two GEMV launches).
+_HC_FUSED_UP_MIN_ROWS = 2  # capacity: fixed: dispatch threshold, not a buffer bound
+
+#: Decode row counts whose hyper-connection mixer runs its first half (projection
+#: and activations) as the one tcgen05 launch `qwen4_exp_hc_decode_tc_first`
+#: instead of cuBLAS split-K (+ its reduce) + `qwen4_exp_hc_lowrank_act`. The upper
+#: bound is the entry's MAX_ROWS (one 128-row MMA tile); larger batches keep cuBLAS.
+_HC_TC_FIRST_MIN_ROWS = 2  # capacity: fixed: dispatch threshold, not a buffer bound
+_HC_TC_FIRST_MAX_ROWS = (
+    128  # capacity: fixed: dispatch threshold (one MMA tile), not a buffer bound
+)
 
 #: FP8 block-scale block edge, on both weight-scale axes and the activation row.
 _FP8_BLOCK = _weights.FP8_BLOCK
@@ -937,6 +1042,13 @@ class Qwen4ExpTp1ModelingV2(DecoderModel):
             f"residual and is a different assembly"
         )
         self.stream = self.hc_count * self.hidden
+        # Columns of the padded first-projection weight (`_fuse_hc_first_projections`)
+        # the cuBLAS first projection multiplies: the real `[down; block_inject]` rows
+        # rounded up to 32 (352 here). GB300, fp32 out, K 10240: 16384 rows 81.5 us
+        # against 91.5 at the padded 384, 8193 rows 41.6 against 51.2, never slower
+        # below; the real columns are bitwise the 384-wide product's at every row
+        # count measured (1-16384; at 320 columns they are not).
+        self.hc_first_cols = -(-(self.hc_lowrank + self.hc_count) // 32) * 32
 
         # ---- full attention ---------------------------------------------
         self.heads_q = cfg.num_attention_heads
@@ -1093,6 +1205,19 @@ class Qwen4ExpTp1ModelingV2(DecoderModel):
         # Packed [q | k | v] scratch for the fused norm+rope call; the spare KV head
         # is the v slot the op needs but never reads.
         self.index_scratch_width = self.index_width + self.index_head_dim
+        # The fused input projection's output row (`weights._attn_in_w`):
+        # [q | k | v | gate | index q, k | v slot]. Its leading columns are the
+        # packed QKV the main norm+rope rewrites in place, and its tail is the
+        # index scratch's layout, so the row is `qkv_width + q_width +
+        # index_scratch_width` wide. The norm+rope addresses a row as
+        # `(Hq + Hk + Hv) * head_dim` and never touches the v heads, so the
+        # row must be a whole number of heads: everything after k is "v" to it.
+        self.attn_in_width = self.qkv_width + self.q_width + self.index_scratch_width
+        assert self.attn_in_width % self.head_dim == 0, (
+            f"the fused projection row ({self.attn_in_width}) is not a whole number of "
+            f"{self.head_dim}-wide heads, so the main norm+rope cannot address it in place"
+        )
+        self.attn_in_tail_heads = self.attn_in_width // self.head_dim - self.heads_q - self.heads_kv
         self.softmax_scale = 1.0 / math.sqrt(self.head_dim)
 
         # ---- gated deltanet ----------------------------------------------
@@ -1110,6 +1235,8 @@ class Qwen4ExpTp1ModelingV2(DecoderModel):
         self.key_dim = self.num_k_heads * self.head_k_dim
         self.value_dim = self.num_v_heads * self.head_v_dim
         self.conv_dim = 2 * self.key_dim + self.value_dim
+        # Column widths of the one input-projection GEMM's output: [q|k|v | z | a | b].
+        self.in_proj_split = (self.conv_dim, self.value_dim, self.num_v_heads, self.num_v_heads)
         # Gate activation of the gated RMS norm (`silu` or `sigmoid`).
         gate_type = getattr(cfg, "output_gate_type", None)
         assert gate_type == "sigmoid", (
@@ -1362,6 +1489,7 @@ class Qwen4ExpTp1ModelingV2(DecoderModel):
 
         # Derived once after load (`post_load_weights`).
         self._moe_scalars: list | None = None
+        self._moe_scalars_cd: list | None = None
         self._gdn_gating: dict | None = None
         self._cos_sin: torch.Tensor | None = None
         # The attention op's KV scales: fp32 [1] ones over an fp8 pool (never None there: the
@@ -1384,6 +1512,9 @@ class Qwen4ExpTp1ModelingV2(DecoderModel):
         )
         self._prefill: "PrefillTarget | None" = None
         self._decode: "DecodeTarget | None" = None
+        # The shared expert's stream; see `_moe_block`. Made in `post_load_weights`:
+        # a stream created inside a graph capture is not capturable.
+        self._side_stream: torch.cuda.Stream | None = None
         self.vision_tower: VisionTower | None = None
         # Everything derived from the KV cache manager (`_bind_cache_manager`);
         # None until the first forward.
@@ -1400,6 +1531,41 @@ class Qwen4ExpTp1ModelingV2(DecoderModel):
         """Split a grouped-norm weight into its per-group slices (taken once)."""
         return tuple(torch.split(self.w[key], self.hidden, dim=0))
 
+    def _fuse_hc_first_projections(self) -> None:
+        """Concatenate each trunk hyper-connection's `down` and `block_inject`
+        weights into one `[rows, stream]` tensor, zero-padded to a multiple of
+        128 rows, so a site's first projection is one GEMM
+        (`_hc_first[(layer, tag)]`; `_hc_first["fhc"]` is the stack-final
+        mixer's `down`, padded the same way). cuBLAS was measured 1.8x (decode)
+        to 4.5x (8192 rows) faster at N = 384 than at the unpadded 324; its calls
+        multiply the first `hc_first_cols` (352) columns, faster still.
+
+        The checkpoint's parameters are rebound as row views of the padded
+        tensors, so this costs only the padding rows (~1.2 MB per site), and
+        anything still reading them separately reads the same values."""
+        w = self.w
+
+        def fuse(*params):
+            rows = sum(t.shape[0] for t in params)
+            padded = -(-rows // 128) * 128
+            pad = torch.zeros(
+                [padded - rows, self.stream], dtype=params[0].dtype, device=params[0].device
+            )
+            both = torch.cat([t.data for t in params] + [pad], 0)
+            start = 0
+            for t in params:
+                n = t.shape[0]
+                t.data = both[start : start + n]
+                start += n
+            return both
+
+        self._hc_first = {
+            (i, tag): fuse(w[f"l{i}_{tag}_down"], w[f"l{i}_{tag}_inject"])
+            for i in range(self.num_layers)
+            for tag in ("ahc", "mhc")
+        }
+        self._hc_first["fhc"] = fuse(w["fhc_down"])
+
     def post_load_weights(self) -> None:
         """Derive what the targets read, then build them, now that the weights are real.
 
@@ -1409,7 +1575,15 @@ class Qwen4ExpTp1ModelingV2(DecoderModel):
         moe_scalars = [
             _moe_layer_scalars(w, i, self.trunk_moe_backend) for i in range(self.num_layers)
         ]
+        # Under trtllm-gen, the CuteDSL scalars of the second expert copy that
+        # prefill-sized launches run on (`_CUTE_DSL_MOE_MIN_ROWS`).
+        moe_scalars_cd = (
+            [_moe_layer_scalars(w, i, "CUTEDSL") for i in range(self.num_layers)]
+            if self.trunk_moe_backend == "TRTLLM"
+            else None
+        )
         self._moe_scalars = moe_scalars
+        self._moe_scalars_cd = moe_scalars_cd
         # Both delta-rule entries index A_log and dt_bias as `ptr + head` and certify
         # fp32; the checkpoint is bf16.
         self._gdn_gating = {
@@ -1455,6 +1629,10 @@ class Qwen4ExpTp1ModelingV2(DecoderModel):
         if self.mtp_enabled:
             self._mtp = _mtp_views(self)
 
+        self._fuse_hc_first_projections()
+
+        # The CPU-only load checks build the targets over host weights; they launch nothing.
+        self._side_stream = torch.cuda.Stream(device=device) if device.type == "cuda" else None
         self._prefill = PrefillTarget(self)
         self._decode = DecodeTarget(self)
         self.vision_tower = VisionTower(self)
@@ -1889,27 +2067,19 @@ class _LayerWeights(NamedTuple):
     """One trunk layer's weights as the views the ops read (GEMM operands are `.t()`
     views). Attention fields are None on a Gated-DeltaNet layer and vice versa."""
 
-    ahc_norm: tuple
-    ahc_down: torch.Tensor
+    ahc_norm: torch.Tensor
+    ahc_first: torch.Tensor
     ahc_up: torch.Tensor
-    ahc_inject: torch.Tensor
-    mhc_norm: tuple
-    mhc_down: torch.Tensor
+    mhc_norm: torch.Tensor
+    mhc_first: torch.Tensor
     mhc_up: torch.Tensor
-    mhc_inject: torch.Tensor
-    q: torch.Tensor | None
-    k: torch.Tensor | None
-    v: torch.Tensor | None
+    attn_in: torch.Tensor | None
     o: torch.Tensor | None
     q_norm: torch.Tensor | None
     k_norm: torch.Tensor | None
-    idx: torch.Tensor | None
     idx_qn: torch.Tensor | None
     idx_kn: torch.Tensor | None
-    in_qkv: torch.Tensor | None
-    in_z: torch.Tensor | None
-    in_a: torch.Tensor | None
-    in_b: torch.Tensor | None
+    in_proj: torch.Tensor | None
     out: torch.Tensor | None
     conv_w: torch.Tensor | None
     a_log: torch.Tensor | None
@@ -1929,9 +2099,21 @@ class _LayerWeights(NamedTuple):
     alpha1: torch.Tensor | None
     alpha2: torch.Tensor | None
     global_sf: torch.Tensor | None
+    # Under trtllm-gen, the second expert copy in the CuteDSL layout and its scalars,
+    # which prefill-sized launches run on (`_CUTE_DSL_MOE_MIN_ROWS`); None on CuteDSL.
+    fc1_w_cd: torch.Tensor | None
+    fc1_s_cd: torch.Tensor | None
+    fc2_w_cd: torch.Tensor | None
+    fc2_s_cd: torch.Tensor | None
+    alpha1_cd: torch.Tensor | None
+    alpha2_cd: torch.Tensor | None
+    global_sf_cd: torch.Tensor | None
     sh_gu: torch.Tensor
     sh_dn: torch.Tensor
     sh_gate: torch.Tensor
+    # `[gate | up | gate logit | pad]` (`weights._cat_rows`): `sh_gu` and `sh_gate` are its
+    # column blocks.
+    sh_gug: torch.Tensor
 
 
 def _layer_views(core: Qwen4ExpTp1ModelingV2) -> list[_LayerWeights]:
@@ -1946,21 +2128,15 @@ def _layer_views(core: Qwen4ExpTp1ModelingV2) -> list[_LayerWeights]:
     layers = []
     for i in range(core.num_layers):
         attn: dict = dict(
-            q=None,
-            k=None,
-            v=None,
+            attn_in=None,
             o=None,
             q_norm=None,
             k_norm=None,
-            idx=None,
             idx_qn=None,
             idx_kn=None,
         )
         gdn: dict = dict(
-            in_qkv=None,
-            in_z=None,
-            in_a=None,
-            in_b=None,
+            in_proj=None,
             out=None,
             conv_w=None,
             a_log=None,
@@ -1969,23 +2145,17 @@ def _layer_views(core: Qwen4ExpTp1ModelingV2) -> list[_LayerWeights]:
         )
         if core.is_attn[i]:
             attn = dict(
-                q=w[f"l{i}_q_w"].t(),
-                k=w[f"l{i}_k_w"].t(),
-                v=w[f"l{i}_v_w"].t(),
+                attn_in=w[f"l{i}_attn_in_w"].t(),
                 o=w[f"l{i}_o_w"].t(),
                 q_norm=w[f"l{i}_q_norm"],
                 k_norm=w[f"l{i}_k_norm"],
-                idx=w[f"l{i}_idx_w"].t(),
                 idx_qn=w[f"l{i}_idx_qn"],
                 idx_kn=w[f"l{i}_idx_kn"],
             )
         else:
             a_log, dt_bias = core._gdn_gating[i]
             gdn = dict(
-                in_qkv=w[f"l{i}_in_qkv_w"].t(),
-                in_z=w[f"l{i}_in_z_w"].t(),
-                in_a=w[f"l{i}_in_a_w"].t(),
-                in_b=w[f"l{i}_in_b_w"].t(),
+                in_proj=w[f"l{i}_in_proj_w"].t(),
                 out=w[f"l{i}_out_w"].t(),
                 # [conv_dim, 1, width] -> [conv_dim, width]: a view (unit width stride).
                 conv_w=w[f"l{i}_conv_w"].reshape(core.conv_dim, core.conv_kernel),
@@ -1994,16 +2164,34 @@ def _layer_views(core: Qwen4ExpTp1ModelingV2) -> list[_LayerWeights]:
                 gnorm=w[f"l{i}_gnorm"],
             )
         scalars = core._moe_scalars[i]
+        cute_dsl_copy: dict = dict(
+            fc1_w_cd=None,
+            fc1_s_cd=None,
+            fc2_w_cd=None,
+            fc2_s_cd=None,
+            alpha1_cd=None,
+            alpha2_cd=None,
+            global_sf_cd=None,
+        )
+        if core._moe_scalars_cd is not None:
+            scalars_cd = core._moe_scalars_cd[i]
+            cute_dsl_copy = dict(
+                fc1_w_cd=w[f"l{i}_fc1_w_cd"],
+                fc1_s_cd=w[f"l{i}_fc1_s_cd"],
+                fc2_w_cd=w[f"l{i}_fc2_w_cd"],
+                fc2_s_cd=w[f"l{i}_fc2_s_cd"],
+                alpha1_cd=scalars_cd["alpha1"],
+                alpha2_cd=scalars_cd["alpha2"],
+                global_sf_cd=scalars_cd["global_sf"],
+            )
         layers.append(
             _LayerWeights(
-                ahc_norm=core._norm_slices(f"l{i}_ahc_norm"),
-                ahc_down=w[f"l{i}_ahc_down"],
-                ahc_up=w[f"l{i}_ahc_up"],
-                ahc_inject=w[f"l{i}_ahc_inject"],
-                mhc_norm=core._norm_slices(f"l{i}_mhc_norm"),
-                mhc_down=w[f"l{i}_mhc_down"],
-                mhc_up=w[f"l{i}_mhc_up"],
-                mhc_inject=w[f"l{i}_mhc_inject"],
+                ahc_norm=w[f"l{i}_ahc_norm"],
+                ahc_first=core._hc_first[(i, "ahc")].t(),
+                ahc_up=w[f"l{i}_ahc_up"].t(),
+                mhc_norm=w[f"l{i}_mhc_norm"],
+                mhc_first=core._hc_first[(i, "mhc")].t(),
+                mhc_up=w[f"l{i}_mhc_up"].t(),
                 **attn,
                 **gdn,
                 router=w[f"l{i}_router"].t(),
@@ -2018,9 +2206,11 @@ def _layer_views(core: Qwen4ExpTp1ModelingV2) -> list[_LayerWeights]:
                 alpha1=scalars.get("alpha1"),
                 alpha2=scalars.get("alpha2"),
                 global_sf=scalars.get("global_sf"),
-                sh_gu=w[f"l{i}_sh_gu"].t(),
+                **cute_dsl_copy,
+                sh_gu=w[f"l{i}_sh_gu"][: 2 * core.shared_inter].t(),
                 sh_dn=w[f"l{i}_sh_dn"].t(),
-                sh_gate=w[f"l{i}_sh_gate"].t(),
+                sh_gate=w[f"l{i}_sh_gu"][2 * core.shared_inter : 2 * core.shared_inter + 1].t(),
+                sh_gug=w[f"l{i}_sh_gu"].t(),
             )
         )
     return layers
@@ -2030,14 +2220,17 @@ class _StackWeights(NamedTuple):
     """The weights outside the layer loop: the stack-final mixer (this checkpoint's
     final norm) and the PLE side path."""
 
-    fhc_norm: tuple
-    fhc_down: torch.Tensor
+    fhc_norm: torch.Tensor
+    fhc_first: torch.Tensor
     fhc_up: torch.Tensor
     ple_key: torch.Tensor
     ple_val: torch.Tensor
     ple_nk: tuple
     ple_nq: tuple
     ple_nc: tuple
+    ple_nk_w: torch.Tensor
+    ple_nq_w: torch.Tensor
+    ple_nc_w: torch.Tensor
     ple_conv_w: torch.Tensor
     ple_mult: torch.Tensor
     ple_vocab: torch.Tensor
@@ -2048,14 +2241,19 @@ class _StackWeights(NamedTuple):
 def _stack_views(core: Qwen4ExpTp1ModelingV2) -> _StackWeights:
     w = core.w
     return _StackWeights(
-        fhc_norm=core._norm_slices("fhc_norm"),
-        fhc_down=w["fhc_down"],
-        fhc_up=w["fhc_up"],
+        fhc_norm=w["fhc_norm"],
+        fhc_first=core._hc_first["fhc"].t(),
+        fhc_up=w["fhc_up"].t(),
         ple_key=w["ple_key_w"].t(),
         ple_val=w["ple_val_w"].t(),
         ple_nk=core._norm_slices("ple_nk"),
         ple_nq=core._norm_slices("ple_nq"),
         ple_nc=core._norm_slices("ple_nc"),
+        # The same three weights whole, for the decode target's fused tail, which
+        # normalizes each stream inside one program.
+        ple_nk_w=w["ple_nk"],
+        ple_nq_w=w["ple_nq"],
+        ple_nc_w=w["ple_nc"],
         ple_conv_w=w["ple_conv_w"],
         ple_mult=w["ple_mult"],
         ple_vocab=w["ple_vocab"],
@@ -2132,9 +2330,9 @@ def _mtp_views(core: Qwen4ExpTp1ModelingV2) -> _MtpWeights:
         fc1_s=w[f"{p}fc1_s"],
         fc2_w=w[f"{p}fc2_w"],
         fc2_s=w[f"{p}fc2_s"],
-        sh_gu=w[f"{p}sh_gu"].t(),
+        sh_gu=w[f"{p}sh_gu"][: 2 * core.shared_inter].t(),
         sh_dn=w[f"{p}sh_dn"].t(),
-        sh_gate=w[f"{p}sh_gate"].t(),
+        sh_gate=w[f"{p}sh_gu"][2 * core.shared_inter : 2 * core.shared_inter + 1].t(),
         fhc_norm=core._norm_slices(f"{p}fhc_norm"),
         fhc_down=w[f"{p}fhc_down"],
         fhc_up=w[f"{p}fhc_up"],
@@ -2233,6 +2431,80 @@ def _sparse_gqa(
         softmax_scale=core.softmax_scale,
         query_positions=query_positions,
         compress_ratio=compress_ratio,
+    )
+
+
+def _attn_in_heads(core, proj):
+    """The main q, k and v heads of the fused attention projection's output `proj`
+    `[T, attn_in_width]` (`weights._attn_in_w`), as `[T, heads, head_dim]` views."""
+    q, k, v, _ = torch.split(
+        torch.reshape(proj, [proj.shape[0], core.attn_in_width // core.head_dim, core.head_dim]),
+        [core.heads_q, core.heads_kv, core.heads_kv, core.attn_in_tail_heads - core.heads_kv],
+        1,
+    )
+    return q, k, v
+
+
+def _cute_dsl_routed(core, L, logits, xq, xsf, routed_out) -> torch.Tensor:
+    """The trunk's routed experts on the CuteDSL pipeline: Renormalize routing, the sort
+    into per-expert row tiles, FC1 gathering its rows from the unpermuted NVFP4 activation
+    `xq` / `xsf` (linear scales) with SwiGLU and the requantize to the layer's one FC2 input
+    scale fused, FC2, and the routing-weighted unpermute in a fixed slot order, which
+    writes every row of `routed_out` `[T, hidden]` and returns it."""
+    # fp32 weights: the dtype the unpermute scales by.
+    topk_ids, topk_w = renorm_moe_routing_op(logits, topk=core.topk, output_dtype=torch.float32)
+    # The sort pads each expert's (token, expert) pairs to whole tiles and emits the tile
+    # tables both GEMMs walk.
+    tile_expert, tile_limit, expanded_to_permuted, permuted_to_expanded, _, live_tiles = moe_sort(
+        token_selected_experts=topk_ids,
+        token_final_scales=topk_w,
+        num_experts=core.num_experts,
+        top_k=core.topk,
+        local_expert_offset=0,
+        local_num_experts=core.num_experts,
+        tile_tokens_dim=_CUTEDSL_TILE_SIZE,
+    )
+    h, h_sf = cute_dsl_nvfp4_gather_grouped_gemm_act_fusion(
+        input=xq.view(torch.float4_e2m1fn_x2),
+        weight=L.fc1_w,
+        input_scale=xsf.view(torch.uint8).view(xq.shape[0], core.hidden // _SF_VEC),
+        weight_scale=L.fc1_s,
+        alpha=L.alpha1,
+        tile_idx_to_group_idx=tile_expert,
+        tile_idx_to_mn_limit=tile_limit,
+        permuted_idx_to_expanded_idx=permuted_to_expanded,
+        num_non_exiting_tiles=live_tiles,
+        global_sf=L.global_sf,
+        num_experts=core.num_experts,
+        top_k=core.topk,
+        num_local_experts=core.num_experts,
+        local_expert_offset=0,
+        tile_size=_CUTEDSL_TILE_SIZE,
+        scaling_vector_size=_SF_VEC,
+        activation_type=int(ActivationType.Swiglu),
+    )
+    # FC2 writes one bf16 row per permuted row.
+    y = cute_dsl_nvfp4_grouped_gemm(
+        input=h,
+        weight=L.fc2_w,
+        input_scale=h_sf,
+        weight_scale=L.fc2_s,
+        alpha=L.alpha2,
+        tile_idx_to_group_idx=tile_expert,
+        num_non_exiting_tiles=live_tiles,
+        num_experts=core.num_experts,
+        top_k=core.topk,
+        num_local_experts=core.num_experts,
+        local_expert_offset=0,
+        tile_size=_CUTEDSL_TILE_SIZE,
+        output_dtype=torch.bfloat16,
+        scaling_vector_size=_SF_VEC,
+    )
+    return moe_unpermute_inplace(
+        permuted_input=y,
+        output=routed_out,
+        expanded_idx_to_permuted_idx=expanded_to_permuted,
+        topk_scales=topk_w,
     )
 
 
@@ -2446,6 +2718,38 @@ class PrefillTarget:
 
     # --------------------------------------------------------------- blocks ---
 
+    def _hc_mixer(self, normed, first, up, with_inject):
+        """One hyper-connection mixer from the site's normed stream: the first
+        projection over `[down; block_inject; 0]` (fp32 logits), the SiLU and
+        injection activations, then the up projection with the sigmoid gate and
+        the stream mean in its epilogue (the gate logits never leave the GEMM).
+        Returns `(mixed, inject)`; `inject` is None without `with_inject` (the
+        stack-final mixer)."""
+        core = self.core
+        low, inject = qwen4_exp_hc_lowrank_act(
+            cublas_mm(normed, first[:, : core.hc_first_cols], None, torch.float32),
+            core.hc_lowrank,
+            core.hc_count,
+            with_inject,
+            normed.dtype,
+        )
+        return qwen4_exp_hc_up_gate_mean(low, up, normed, core.hc_count), inject
+
+    def _hc_moe_mixer(self, normed, first, up, gscale):
+        """`_hc_mixer` at an MoE site (always with injection) whose fused up
+        projection also writes the routed experts' NVFP4 input (linear scales,
+        the layer's global scale `gscale`). Returns `(mixed, inject, xq, xsf)`."""
+        core = self.core
+        low, inject = qwen4_exp_hc_lowrank_act(
+            cublas_mm(normed, first[:, : core.hc_first_cols], None, torch.float32),
+            core.hc_lowrank,
+            core.hc_count,
+            True,
+            normed.dtype,
+        )
+        mixed, xq, xsf = qwen4_exp_hc_up_gate_mean_fp4(low, up, normed, core.hc_count, gscale)
+        return mixed, inject, xq, xsf
+
     def _grouped_norm(self, x: torch.Tensor, weights: tuple) -> torch.Tensor:
         """`Qwen4ExpTextRMSNorm(group_size=hidden)`: an independent RMS per `hidden`-wide
         group, then `(1 + w)` over the full width; one gemma-RMS-norm per column
@@ -2456,209 +2760,144 @@ class PrefillTarget:
             [flashinfer_gemma_rmsnorm(part, w, core.eps) for w, part in zip(weights, parts)], 1
         )
 
-    def _moe_block(
-        self, x: torch.Tensor, L: _LayerWeights, dt: torch.dtype, routed_out: torch.Tensor | None
-    ) -> torch.Tensor:
-        """NVFP4 routed experts (quantized once in the linear block-scale layout, with
-        finished top-k ids and weights so the runner's routing arguments are inert)
-        plus a bf16 shared expert folded in by a per-token sigmoid gate. `routed_out`
-        is the CuteDSL path's `[T, hidden]` output buffer (None on trtllm-gen, whose
-        runner allocates its own)."""
+    def _moe_block(self, x, xq, xsf, L: _LayerWeights, routed_out) -> tuple:
+        """One MoE layer: NVFP4 routed experts plus a bf16 shared expert, left
+        uncombined. Returns `(routed, (gate_logits, shared))`: the next
+        `qwen4_exp_hc_inject_norm` forms `routed + sigmoid(gate_logits) * shared`
+        inside its kernel.
+
+        The shared expert and its per-token gate logit run on the core's side
+        stream, concurrently with the routed path, and join it before this
+        returns, so every consumer on the main stream is ordered after both.
+        `x` is the bf16 hidden states (router and shared expert); `xq` / `xsf`
+        are the same states in NVFP4 with **linear** block scales, written by the
+        MoE-site mixer (`_hc_moe_mixer`). On trtllm-gen the routed path hands the
+        runner the router logits (its Renormalize routing is bitwise the
+        `renorm_moe_routing_op` + pre-routed composition), and a launch of at
+        least `_CUTE_DSL_MOE_MIN_ROWS` rows runs the CuteDSL MoE over the second
+        expert copy instead; on CuteDSL every launch is `_cute_dsl_routed`, which
+        writes `routed_out`."""
         core = self.core
-        # The routing op reads logits from data_ptr() ignoring strides; cublas_mm
-        # allocates them contiguous.
+        main = torch.cuda.current_stream()
+        side = core._side_stream
+        # Fork: the side stream reads `x` only after everything queued on `main`
+        # so far. What it allocates is consumed on `main` after the join below,
+        # and the next layer's fork orders any reuse of those blocks after that.
+        side.wait_stream(main)
+        with torch.cuda.stream(side):
+            # One GEMM forms gate|up and the gate logit (`sh_gug`'s extra rows): a separate
+            # gate GEMV at prefill sizes keeps the SMs from the routed path's persistent
+            # FC1 until it drains.
+            gug = cublas_mm(x, L.sh_gug)
+            shared = cublas_mm(silu_and_mul_rows(gug, core.shared_inter), L.sh_dn)
+            gate_logits = gug[:, 2 * core.shared_inter : 2 * core.shared_inter + 1]
+        # The routing reads its logits as a dense row-major buffer from data_ptr()
+        # and ignores strides; cublas_mm allocates them contiguous.
         logits = cublas_mm(x, L.router)
         if core.trunk_moe_backend == "CUTEDSL":
-            # fp32 weights: the dtype the unpermute scales by.
-            topk_ids, topk_w = renorm_moe_routing_op(
-                logits, topk=core.topk, output_dtype=torch.float32
-            )
-            xq, xsf = fp4_quantize(x, L.moe_gscale, _SF_VEC, False, _SF_LINEAR)
-            # The sort pads each expert's (token, expert) pairs to whole tiles and emits
-            # the tile tables both GEMMs walk.
-            tile_expert, tile_limit, expanded_to_permuted, permuted_to_expanded, _, live_tiles = (
-                moe_sort(
-                    token_selected_experts=topk_ids,
-                    token_final_scales=topk_w,
-                    num_experts=core.num_experts,
-                    top_k=core.topk,
-                    local_expert_offset=0,
-                    local_num_experts=core.num_experts,
-                    tile_tokens_dim=_CUTEDSL_TILE_SIZE,
-                )
-            )
-            # FC1 gathers its rows from the unpermuted activation, applies SwiGLU and
-            # requantizes with the layer's one FC2 input scale. `fp4_quantize` returns the
-            # linear scales flat; the GEMM reads them as [T, hidden / 16].
-            h, h_sf = cute_dsl_nvfp4_gather_grouped_gemm_act_fusion(
-                input=xq.view(torch.float4_e2m1fn_x2),
-                weight=L.fc1_w,
-                input_scale=xsf.view(x.shape[0], core.hidden // _SF_VEC),
-                weight_scale=L.fc1_s,
-                alpha=L.alpha1,
-                tile_idx_to_group_idx=tile_expert,
-                tile_idx_to_mn_limit=tile_limit,
-                permuted_idx_to_expanded_idx=permuted_to_expanded,
-                num_non_exiting_tiles=live_tiles,
-                global_sf=L.global_sf,
-                num_experts=core.num_experts,
-                top_k=core.topk,
-                num_local_experts=core.num_experts,
-                local_expert_offset=0,
-                tile_size=_CUTEDSL_TILE_SIZE,
-                scaling_vector_size=_SF_VEC,
-                activation_type=int(ActivationType.Swiglu),
-            )
-            # FC2 writes one bf16 row per permuted row; the unpermute writes every row of
-            # `routed_out` as the routing-weighted sum of its token's top-k rows.
-            y = cute_dsl_nvfp4_grouped_gemm(
-                input=h,
-                weight=L.fc2_w,
-                input_scale=h_sf,
-                weight_scale=L.fc2_s,
-                alpha=L.alpha2,
-                tile_idx_to_group_idx=tile_expert,
-                num_non_exiting_tiles=live_tiles,
-                num_experts=core.num_experts,
-                top_k=core.topk,
-                num_local_experts=core.num_experts,
-                local_expert_offset=0,
-                tile_size=_CUTEDSL_TILE_SIZE,
-                output_dtype=torch.bfloat16,
-                scaling_vector_size=_SF_VEC,
-            )
-            routed = moe_unpermute_inplace(
-                permuted_input=y,
-                output=routed_out,
-                expanded_idx_to_permuted_idx=expanded_to_permuted,
-                topk_scales=topk_w,
+            routed = _cute_dsl_routed(core, L, logits, xq, xsf, routed_out)
+        elif x.shape[0] >= _CUTE_DSL_MOE_MIN_ROWS:
+            routed = fp4_moe_renorm_cute_dsl(
+                logits,
+                xq,
+                xsf,
+                L.fc1_w_cd,
+                L.fc1_s_cd,
+                L.alpha1_cd,
+                L.fc2_w_cd,
+                L.fc2_s_cd,
+                L.alpha2_cd,
+                L.global_sf_cd,
+                core.num_experts,
+                core.topk,
             )
         else:
-            topk_ids, topk_w = renorm_moe_routing_op(logits, topk=core.topk, output_dtype=dt)
-            xq, xsf = fp4_quantize(x, L.moe_gscale, _SF_VEC, False, _SF_LINEAR)
-            routed = fp4_block_scale_moe_runner(
-                routing_logits=None,
-                routing_bias=None,
-                hidden_states=xq,
-                hidden_states_scale=xsf.view(torch.float8_e4m3fn),
-                gemm1_weights=L.fc1_w,
-                gemm1_weights_scale=L.fc1_s,
-                gemm1_bias=None,
-                gemm1_alpha=None,
-                gemm1_beta=None,
-                gemm1_clamp_limit=None,
-                gemm2_weights=L.fc2_w,
-                gemm2_weights_scale=L.fc2_s,
-                gemm2_bias=None,
-                output1_scale_scalar=L.out1_scale,
-                output1_scale_gate_scalar=L.out1_gate_scale,
-                output2_scale_scalar=L.out2_scale,
-                num_experts=core.num_experts,
-                top_k=core.topk,
-                n_group=None,
-                topk_group=None,
-                intermediate_size=core.moe_inter,
-                local_expert_offset=0,
-                local_num_experts=core.num_experts,
-                routed_scaling_factor=None,
-                routing_method_type=_ROUTING_METHOD_RENORM,
-                do_finalize=True,
-                act_type=_ACT_TYPE_SWIGLU,
-                topk_weights=topk_w,
-                topk_ids=topk_ids,
-            )[0]
-        shared = cublas_mm(flashinfer_silu_and_mul(cublas_mm(x, L.sh_gu)), L.sh_dn)
-        gate_logits = cublas_mm(x, L.sh_gate)
-        return fused_sigmoid_gate_mul_add(routed, gate_logits, shared)
+            routed = fp4_block_scale_moe_renorm_routed(
+                logits,
+                xq,
+                xsf.view(torch.float8_e4m3fn),
+                L.fc1_w,
+                L.fc1_s,
+                L.fc2_w,
+                L.fc2_s,
+                L.out1_scale,
+                L.out1_gate_scale,
+                L.out2_scale,
+                core.num_experts,
+                core.topk,
+                core.moe_inter,
+            )
+        main.wait_stream(side)
+        return routed, (gate_logits, shared)
 
-    def _attention_block(self, x, i, L, qkv, index_scratch, attn_out, pos, pos3):
+    def _attention_block(self, x, i, L, proj_qkv, index_scratch, attn_out, pos3):
         """One gated GQA layer plus its QSA index branch.
 
-        The q projection is twice as wide as q (q and output gate interleave per
-        head, as HF chunks the last dim); only the q half is packed into the QKV
-        buffer and the gate half is read later through its own strides. The
-        projections, the packing and both ropes are row-wise and run over all `T` rows
-        here; the cache writes, the selection and the attention core read the step's
-        batch and run in the `_attention_core` break, which leaves the attention output
-        in `attn_out`."""
+        The four input projections are one GEMM against the load-time fused
+        operand (`weights._attn_in_w`), whose output row is
+        `[q | k | v | gate | index q, k | v slot]`. One norm+rope launch rewrites
+        the main q/k heads in place on that output and writes the normalized,
+        rotated index query into the scratch; v, the gate and the raw index key
+        are not touched. Both are row-wise and run over all `T` rows here; the
+        cache writes, the selection and the attention core read the step's batch
+        and run in the `_attention_core` break, which leaves the attention output
+        in `attn_out`. The gate is read through its row stride."""
         core = self.core
         num_tokens = x.shape[0]
 
-        qg = cublas_mm(x, L.q)
-        k = cublas_mm(x, L.k)
-        v = cublas_mm(x, L.v)
-
-        # Destination views into the packed QKV buffer.
-        qkv_h = torch.reshape(qkv, [num_tokens, core.heads_q + 2 * core.heads_kv, core.head_dim])
-        q_dst, k_dst, v_dst = torch.split(qkv_h, [core.heads_q, core.heads_kv, core.heads_kv], 1)
-        q_src, gate = torch.split(
-            torch.reshape(qg, [num_tokens, core.heads_q, 2 * core.head_dim]),
-            [core.head_dim, core.head_dim],
-            2,
-        )
-        q_dst.copy_(q_src)
-        k_dst.copy_(torch.reshape(k, [num_tokens, core.heads_kv, core.head_dim]))
-        v_dst.copy_(torch.reshape(v, [num_tokens, core.heads_kv, core.head_dim]))
-        fused_qk_norm_rope(
-            qkv,
+        proj = cublas_mm(x, L.attn_in)
+        gate = torch.split(proj, [core.qkv_width, core.q_width, core.index_scratch_width], 1)[1]
+        # The index query lands in the q slots of the scratch; its k and v slots
+        # are layout only and nothing reads them.
+        q_index = torch.split(
+            torch.reshape(
+                index_scratch,
+                [num_tokens, core.index_heads + 2 * core.index_kv_heads, core.index_head_dim],
+            ),
+            [core.index_heads, core.index_kv_heads, core.index_kv_heads],
+            1,
+        )[0]
+        # Both planes' Gemma norm + rope in one launch, over the target's fp32
+        # cos|sin table: the main q/k heads in place (the real interleaved mRoPE;
+        # three agreeing rows reduce exactly to the plain rope on row 0), the index
+        # query from the projection's index columns into `q_index` (coordinate 0
+        # alone, matching `_QSA_MROPE_SECTION` on the key side).
+        index_section = (_QSA_MROPE_SECTION or (0, 0, 0)) if _QSA_INDEX_USE_MROPE else (0, 0, 0)
+        qwen4_exp_qk_norm_rope(
+            proj,
+            q_index,
+            pos3,
+            core._cos_sin,
+            L.q_norm,
+            L.k_norm,
+            L.idx_qn,
             num_heads_q=core.heads_q,
             num_heads_k=core.heads_kv,
-            num_heads_v=core.heads_kv,
             head_dim=core.head_dim,
+            index_heads=core.index_heads,
+            index_head_dim=core.index_head_dim,
+            index_q_col=core.qkv_width + core.q_width,
             rotary_dim=core.rotary_dim,
             eps=core.eps,
-            q_weight=L.q_norm,
-            k_weight=L.k_norm,
-            base=core.theta,
-            is_neox=True,
-            position_ids=pos3,
-            is_qk_norm=True,
-            # The gemma QK norm, `rmsnorm(x) * (1 + w)`.
-            use_gemma=True,
-            # Real mRoPE, unconditionally. A wrong wiring is invisible on text (equal
-            # rows) and ~500x out on an image batch.
-            use_mrope=True,
             mrope_section1=core.mrope_section1,
             mrope_section2=core.mrope_section2,
+            index_mrope_section1=index_section[1],
+            index_mrope_section2=index_section[2],
         )
-        if self._kv_probe is not None and not self._kv_probe.observe(i, k_dst, v_dst):
-            self._kv_probe = None
-
-        # One replicated projection produces [index_heads q | 1 k]; its raw key is what
-        # the break stores. The query's norm and rotation run here in the fused call's
-        # packed layout, on a scratch copy: the k slot is computed and discarded, the v
-        # slot exists only because the layout has one. Coordinate 0 alone, matching
-        # `_QSA_MROPE_SECTION` on the key side.
-        qk_index = cublas_mm(x, L.idx)
-        scratch_h = torch.reshape(index_scratch, [num_tokens, core.index_scratch_width])
-        scratch_h[:, : core.index_width].copy_(qk_index)
-        fused_qk_norm_rope(
-            index_scratch,
-            num_heads_q=core.index_heads,
-            num_heads_k=core.index_kv_heads,
-            num_heads_v=core.index_kv_heads,
-            head_dim=core.index_head_dim,
-            rotary_dim=core.rotary_dim,
-            eps=core.eps,
-            q_weight=L.idx_qn,
-            k_weight=L.idx_kn,
-            base=core.theta,
-            is_neox=True,
-            position_ids=pos3 if _QSA_INDEX_USE_MROPE else pos,
-            is_qk_norm=True,
-            use_gemma=True,
-            use_mrope=_QSA_INDEX_USE_MROPE,
-            mrope_section1=(_QSA_MROPE_SECTION or (0, 0, 0))[1],
-            mrope_section2=(_QSA_MROPE_SECTION or (0, 0, 0))[2],
-        )
-        eager_on_graph(qkv, qk_index, index_scratch, attn_out, i, inner=self._attention_core)
+        if self._kv_probe is not None:
+            _, k_dst, v_dst = _attn_in_heads(core, proj)
+            if not self._kv_probe.observe(i, k_dst, v_dst):
+                self._kv_probe = None
+        eager_on_graph(proj, proj_qkv, index_scratch, attn_out, i, inner=self._attention_core)
         fused_sigmoid_mul_inplace(attn_out, gate)
         return cublas_mm(attn_out, L.o)
 
-    def _attention_core(self, qkv, qk_index, index_scratch, attn_out, i) -> None:
+    def _attention_core(self, proj, proj_qkv, index_scratch, attn_out, i) -> None:
         """Break: the index plane's store and compression, the dense/sparse decision and the
         attention core over the step's `n` rows. Writes rows `[:n]` of `attn_out`
-        `[T, q_width]` in place and zeroes rows `[n:]`.
+        `[T, q_width]` in place and zeroes rows `[n:]`. `proj` is the layer's fused
+        projection output after the norm+rope, `proj_qkv` the dense op's packed QKV
+        scratch.
 
         The index plane advances on every step, including below the threshold, so a
         request growing past it finds its prefix compressed; above it the main K/V append
@@ -2686,16 +2925,19 @@ class PrefillTarget:
             live_cols,
         ) = step.qsa
         num_tokens = step.num_tokens
-        qkv = qkv[:num_tokens]
-        qkv_h = torch.reshape(qkv, [num_tokens, core.heads_q + 2 * core.heads_kv, core.head_dim])
-        q_dst, k_dst, v_dst = torch.split(qkv_h, [core.heads_q, core.heads_kv, core.heads_kv], 1)
+        proj = proj[:num_tokens]
+        qkv_view, _, index_view = torch.split(
+            proj, [core.qkv_width, core.q_width, core.index_scratch_width], 1
+        )
+        q_dst, k_dst, v_dst = _attn_in_heads(core, proj)
 
         index_cache = core._bound.index_cache[i]
         token_k = torch.split(
             torch.reshape(
-                qk_index[:num_tokens], [num_tokens, core.index_heads + core.index_kv_heads, -1]
+                index_view,
+                [num_tokens, core.index_scratch_width // core.index_head_dim, core.index_head_dim],
             ),
-            [core.index_heads, core.index_kv_heads],
+            [core.index_heads, core.index_kv_heads, 1],
             1,
         )[1]
         if step.stage:
@@ -2740,44 +2982,100 @@ class PrefillTarget:
             # unit KV scales; over an NVFP4 pool they quantize and dequantize at the dense op's
             # second-level scales.
             _store_kv(core, kv, k_dst, v_dst, req_idx, logical, block_table, tokens_per_block)
-            scores = qsa_paged_index_scores(
-                q=q_index,
-                index_cache=index_cache,
-                block_table=block_table,
-                query_positions=logical,
-                request_indices=req_idx,
-                tokens_per_block=tokens_per_block,
-                compress_ratio=core.compress_ratio,
-                only_visible_blocks=True,
-                context_rows=True,
+            # The step's context rows come first, consecutive rows of a request, and score
+            # as query tiles; its generation rows, one a request, score row by row (a query
+            # tile of them would walk every request's keys once per row). Each part selects
+            # into its own rows of the top-k.
+            num_ctx = step.attn["num_ctx_tokens"]
+            parts = [(0, num_ctx, True)]
+            if num_ctx < num_tokens:
+                parts.append((num_ctx, num_tokens, False))
+            # Each part's canonical block top-k and its expansion are one launch writing its
+            # rows of the step's selection (QSA's row starts are zero); a score table wider
+            # than that kernel's 4096 columns takes the composition.
+            selected = torch.empty(
+                [num_tokens, core.token_topk + core.compress_ratio - 1],
+                dtype=torch.int32,
+                device=proj.device,
             )
-            _select(core, scores, topk_row_starts, visible_blocks, topk_indices, live_cols)
-            selected = qsa_expand_block_indices(
-                topk_indices,
-                logical,
-                seq_lens_q,
-                compress_ratio=core.compress_ratio,
-                token_topk=core.token_topk,
-            )
-            attn_out[:num_tokens].copy_(
-                torch.reshape(
-                    _sparse_gqa(
-                        core,
-                        kv,
-                        q=q_dst,
-                        block_table=block_table,
-                        selected_tokens=selected,
-                        request_indices=req_idx,
-                        tokens_per_block=tokens_per_block,
-                        # A bound, not a mask: lets the kernel stop scanning a row early
-                        # (context-batch branch only).
-                        query_positions=logical,
-                        compress_ratio=core.compress_ratio,
-                    ),
-                    [num_tokens, core.q_width],
+            fused_select = block_table.shape[1] * tokens_per_block // core.compress_ratio <= 4096
+            for lo, hi, context_rows in parts:
+                scores = qsa_paged_index_scores(
+                    q=q_index[lo:hi],
+                    index_cache=index_cache,
+                    block_table=block_table,
+                    query_positions=logical[lo:hi],
+                    request_indices=req_idx[lo:hi],
+                    tokens_per_block=tokens_per_block,
+                    compress_ratio=core.compress_ratio,
+                    only_visible_blocks=True,
+                    context_rows=context_rows,
                 )
-            )
+                if fused_select and scores.shape[1] % 4 == 0:
+                    qsa_topk_expand_decode(
+                        scores,
+                        visible_blocks[lo:hi],
+                        logical[lo:hi],
+                        seq_lens_q[lo:hi],
+                        topk_indices[lo:hi],
+                        core.compress_ratio,
+                        core.token_topk,
+                        out=selected[lo:hi],
+                    )
+                else:
+                    _select(
+                        core,
+                        scores,
+                        topk_row_starts[lo:hi],
+                        visible_blocks[lo:hi],
+                        topk_indices[lo:hi],
+                        live_cols,
+                    )
+                    selected[lo:hi].copy_(
+                        qsa_expand_block_indices(
+                            topk_indices[lo:hi],
+                            logical[lo:hi],
+                            seq_lens_q[lo:hi],
+                            compress_ratio=core.compress_ratio,
+                            token_topk=core.token_topk,
+                        )
+                    )
+            # A context launch of thousands of rows over a bf16 pool takes the row-tile
+            # pass: consecutive rows of one request share their K/V tiles; rows of groups
+            # that span requests, the generation rows of a mixed step among them, are served
+            # row by row. Below the threshold the per-row kernel is faster.
+            if num_tokens >= _ROWTILE_MIN_ROWS and kv.k.dtype == q_dst.dtype:
+                out = qsa_sparse_gqa_rowtile(
+                    q=q_dst,
+                    k_cache=kv.k,
+                    v_cache=kv.v,
+                    block_table=block_table,
+                    selected_tokens=selected,
+                    request_indices=req_idx,
+                    tokens_per_block=tokens_per_block,
+                    softmax_scale=core.softmax_scale,
+                    query_positions=logical,
+                    compress_ratio=core.compress_ratio,
+                )
+            else:
+                out = _sparse_gqa(
+                    core,
+                    kv,
+                    q=q_dst,
+                    block_table=block_table,
+                    selected_tokens=selected,
+                    request_indices=req_idx,
+                    tokens_per_block=tokens_per_block,
+                    # A bound, not a mask: lets the kernel stop scanning a row early
+                    # (context-batch branch only).
+                    query_positions=logical,
+                    compress_ratio=core.compress_ratio,
+                )
+            attn_out[:num_tokens].copy_(torch.reshape(out, [num_tokens, core.q_width]))
         else:
+            # The dense op reads its packed QKV flat: one compact copy.
+            qkv = proj_qkv[:num_tokens]
+            qkv.copy_(qkv_view)
             thop_attention(
                 q=qkv,
                 output=attn_out[:num_tokens],
@@ -2883,23 +3181,25 @@ class PrefillTarget:
         return torch.reshape(out, [1, n * p, core.num_v_heads, core.head_v_dim])
 
     def _gdn_block(self, x, i, L, core_out) -> torch.Tensor:
-        """One Gated-DeltaNet layer over a batch with a context prefix: the four input
-        projections and the gated-norm epilogue run over all `T` rows here, the
-        recurrence in the `_gdn_core` break, which leaves its output in `core_out`
-        `[1, T, num_v_heads, head_v_dim]`."""
-        mixed_qkv = cublas_mm(x, L.in_qkv)
-        z = cublas_mm(x, L.in_z)
-        a = cublas_mm(x, L.in_a)
-        b = cublas_mm(x, L.in_b)
-        eager_on_graph(mixed_qkv, a, b, core_out, i, inner=self._gdn_core)
+        """One Gated-DeltaNet layer over a batch with a context prefix: the one input
+        projection GEMM (q|k|v, z, a and b are column views of its output) and the
+        gated-norm epilogue run over all `T` rows here, the recurrence in the `_gdn_core`
+        break, which leaves its output in `core_out` `[1, T, num_v_heads, head_v_dim]`."""
+        core = self.core
+        proj = cublas_mm(x, L.in_proj)
+        z = torch.split(proj, core.in_proj_split, 1)[1]
+        eager_on_graph(proj, core_out, i, inner=self._gdn_core)
         return self._gdn_epilogue(core_out, z, L, x.shape[0])
 
-    def _gdn_core(self, mixed_qkv, a, b, out, i) -> None:
-        """Break: the recurrence over the step's `n` rows (the conv, the post-conv gating and
-        the chunked delta rule, or under speculation the verify path for the generation
-        rows). Writes rows `[:n]` of `out` `[1, T, num_v_heads, head_v_dim]` in place and
-        zeroes rows `[n:]`. Every branch is on a host int of the step, never a tensor
-        value."""
+    def _gdn_core(self, proj, out, i) -> None:
+        """Break: the recurrence over the step's `n` rows. Writes rows `[:n]` of `out`
+        `[1, T, num_v_heads, head_v_dim]` in place and zeroes rows `[n:]`. Every branch
+        is on a host int of the step, never a tensor value.
+
+        Over an fp32 recurrent pool outside a verify step the context rows take one fused
+        conv + post-conv pass (`_gdn_prefill_prep`) and FlashInfer's chunked recurrence, and
+        a mixed step's one-token generation rows FlashInfer's single-token decode kernel;
+        otherwise `_gdn_core_generic`."""
         core = self.core
         L = self._layers[i]
         step = self._step
@@ -2922,9 +3222,119 @@ class PrefillTarget:
             replay,
         ) = step.gdn
         num_tokens = step.num_tokens
-        mixed_qkv = mixed_qkv[:num_tokens]
-        a = a[:num_tokens]
-        b = b[:num_tokens]
+        ssm_states = core._bound.ssm[i]
+        if is_verify or ssm_states.dtype != torch.float32:
+            self._gdn_core_generic(proj, out, i)
+            return
+        mixed_qkv, _, a, b = torch.split(proj[:num_tokens], core.in_proj_split, 1)
+        conv_states = core._bound.conv[i]
+
+        # A context sequence carrying nothing starts from a zeroed slot; only the
+        # context prefix is a candidate (a generation row's state must survive).
+        reset_recurrent_state_rows(ssm_states, si_p, hi_p, conv_states)
+        if num_decode_tokens > 0:
+            mq_p, mq_d = torch.split(mixed_qkv, [num_prefill_tokens, num_decode_tokens], 0)
+            a_p, b_p = a[:num_prefill_tokens], b[:num_prefill_tokens]
+            q, k, v, g, beta = self._gdn_prefill_prep(mq_p, a_p, b_p, L, i, qsl_p, si_p, hi_p)
+            causal_conv1d_update(
+                x=mq_d,
+                conv_state=conv_states,
+                weight=L.conv_w,
+                bias=None,
+                silu_activation=True,
+                cache_seqlens=None,
+                conv_state_indices=si_d,
+                pad_slot_id=_PAD_SLOT_ID,
+            )
+            # The two halves run separate recurrences over disjoint slots and write
+            # disjoint row ranges of the output.
+            out_p = out[:, :num_prefill_tokens]
+            flashinfer_chunk_gated_delta_rule(
+                q,
+                k,
+                v,
+                g,
+                beta,
+                scale=None,
+                initial_state=ssm_states,
+                initial_state_indices=si_p,
+                inplace_indexed_state_update=True,
+                output_final_state=False,
+                cu_seqlens=qsl_long_p,
+                head_first=False,
+                use_qk_l2norm_in_kernel=False,
+                output=out_p,
+                state_workspace=None,
+            )
+            # The generation rows: the decode step's recurrence (its kernel without the
+            # gated norm, which runs with the context rows' below) over their rows of the
+            # projection, whose q/k/v columns the conv step rewrote; it computes both gates
+            # and the q/k norm itself and reads the rows' pool slots before its PDL wait
+            # (the context rows' reset and recurrence touch only theirs).
+            gdn_decode_rows(
+                proj[num_prefill_tokens:num_tokens],
+                ssm_states,
+                si_d,
+                L.a_log,
+                L.dt_bias,
+                core.num_k_heads,
+                core.head_k_dim,
+                out[0, num_prefill_tokens:num_tokens].view(num_decode_tokens, core.value_dim),
+            )
+        else:
+            q, k, v, g, beta = self._gdn_prefill_prep(
+                mixed_qkv, a, b, L, i, qsl_all, si_all, hi_all
+            )
+            # q and k arrive L2-normalized; the recurrence must not repeat it.
+            flashinfer_chunk_gated_delta_rule(
+                q,
+                k,
+                v,
+                g,
+                beta,
+                scale=None,
+                initial_state=ssm_states,
+                initial_state_indices=si_all,
+                inplace_indexed_state_update=True,
+                output_final_state=False,
+                cu_seqlens=qsl_long,
+                head_first=False,
+                use_qk_l2norm_in_kernel=False,
+                output=out[:, :num_tokens],
+                state_workspace=None,
+            )
+        out[:, num_tokens:].zero_()
+
+    def _gdn_core_generic(self, proj, out, i) -> None:
+        """`_gdn_core` on a verify step or over a bf16 recurrent pool: the conv, the
+        post-conv gating and the chunked delta rule over the step's `n` rows, or under
+        speculation the verify path for the generation rows. The q|k|v, a and b columns are
+        copied out of the projection first: these entries are certified on contiguous
+        operands."""
+        core = self.core
+        L = self._layers[i]
+        step = self._step
+        (
+            num_prefill_tokens,
+            num_decode_tokens,
+            si_p,
+            si_all,
+            si_d,
+            hi_p,
+            hi_all,
+            qsl_p,
+            qsl_all,
+            qsl_long,
+            is_verify,
+            num_decodes,
+            gen_p,
+            int_idx,
+            qsl_long_p,
+            replay,
+        ) = step.gdn
+        num_tokens = step.num_tokens
+        mixed_qkv, _, a, b = torch.split(proj[:num_tokens], core.in_proj_split, 1)
+        mixed_qkv, a, b = mixed_qkv.contiguous(), a.contiguous(), b.contiguous()
 
         conv_states = core._bound.conv[i]
         ssm_states = core._bound.ssm[i]
@@ -3062,6 +3472,32 @@ class PrefillTarget:
         out[:, :num_tokens].copy_(recurrence)
         out[:, num_tokens:].zero_()
 
+    def _gdn_prefill_prep(self, mq, a, b, L, i, qsl, si, hi):
+        """The context rows' recurrence inputs: the causal conv against each sequence's
+        carried window (published back to the pool), SiLU, the q|k|v split with q/k
+        L2-normalized, and the decay/beta gates -- one pass over `mq`, the token-major
+        q|k|v column view of the projection."""
+        core = self.core
+        return gdn_prefill_conv_post(
+            x=mq,
+            weight=L.conv_w,
+            conv_states=core._bound.conv[i],
+            query_start_loc=qsl,
+            cache_indices=si,
+            has_initial_state=hi,
+            a=a,
+            b=b,
+            A_log=L.a_log,
+            dt_bias=L.dt_bias,
+            num_k_heads=core.num_k_heads,
+            head_k_dim=core.head_k_dim,
+            num_v_heads=core.num_v_heads,
+            head_v_dim=core.head_v_dim,
+            pad_slot_id=_PAD_SLOT_ID,
+            l2_norm_eps=_L2_NORM_EPS,
+            softplus_threshold=_SOFTPLUS_THRESHOLD,
+        )
+
     def _gdn_epilogue(self, out, z, L, num_tokens) -> torch.Tensor:
         """Gated RMS norm and output projection shared by every recurrence."""
         core = self.core
@@ -3076,10 +3512,11 @@ class PrefillTarget:
         )
         return cublas_mm(torch.reshape(o, [num_tokens, core.value_dim]), L.out)
 
-    def _ple_block(self, hc, out) -> None:
-        """Break: the n-gram side path on one decoder layer, over the step's `n` rows. Writes
-        rows `[:n]` of `out` `[T, stream]` in place and zeroes rows `[n:]`; the caller adds
-        `out` into the hyper-connection stream.
+    def _ple_block(self, hc, hc_out, normed_out) -> None:
+        """Break: the n-gram side path on one decoder layer, over the step's `n` rows,
+        added into the stream and normalized for the layer's attention-side site. Writes
+        rows `[:n]` of `hc_out` (the stream) and `normed_out` (its grouped norm), both
+        `[T, stream]`, in place and zeroes rows `[n:]`.
 
         Per-request stateful: ids become one `ngram_size`-wide window per token
         (predecessors from the paged id history); each window hashes to one row per
@@ -3087,25 +3524,79 @@ class PrefillTarget:
         scale; key/value projections and the gate scale one value into each stream;
         a dilated depthwise short conv over a paged state is added back. A sequence
         carrying nothing is seeded with `eos_token_id`, not 0: id 0 is a real token
-        the hash cannot distinguish.
+        the hash cannot distinguish. The id history and the conv state publish the
+        state after the whole chunk.
 
-        The id history and the conv state publish the state after the whole chunk. On
-        a verify step (`stage`) the generation rows' pre-step pool rows, id windows and
-        conv input go to `SpeculativeRollback`, which rewrites both pools to the
-        accepted prefix once the sampler has decided it."""
+        Outside a verify step the window, hash, gather and dequantize are
+        `ple_ngram_embed`, and the gate, the conv, the residual add and the next site's
+        grouped norm `ple_gate_conv_inject_norm`. On a verify step (`stage`) the
+        generation rows' pre-step pool rows, id windows and conv input go to
+        `SpeculativeRollback`, which rewrites both pools to the accepted prefix once the
+        sampler has decided it, so that step takes `_ple_delta`, which exposes them."""
         core = self.core
         S = self._stack
         step = self._step
         conv_states, ngram_pool, si_all, carry_all, qsl = step.ple
-        stage = step.stage
         num_tokens = step.num_tokens
-        input_ids = step.input_ids
+        next_norm = self._layers[core.ple_layer].ahc_norm
         hc = hc[:num_tokens]
+        if step.stage:
+            stream = torch.add(hc, self._ple_delta(hc))
+            stream, normed = qwen4_exp_hc_inject_norm(
+                stream, None, None, next_norm, core.eps, core.hc_count
+            )
+        else:
+            ngram = ple_ngram_embed(
+                step.input_ids,
+                ngram_pool,
+                si_all,
+                carry_all,
+                qsl,
+                core.w["ple_table"],
+                S.ple_tscale,
+                S.ple_mult,
+                S.ple_vocab,
+                S.ple_offs,
+                core.eos_token_id,
+                num_tokens,
+            )
+            stream, normed = ple_gate_conv_inject_norm(
+                hc,
+                cublas_mm(ngram, S.ple_key),
+                cublas_mm(ngram, S.ple_val),
+                S.ple_nk_w,
+                S.ple_nq_w,
+                S.ple_nc_w,
+                S.ple_conv_w,
+                conv_states,
+                si_all,
+                qsl,
+                next_norm,
+                core.eps,
+                core.hc_count,
+                _PLE_CLAMP_MIN,
+                core.ple_dilation,
+                _PAD_SLOT_ID,
+                num_tokens,
+                carry_all,
+            )
+        hc_out[:num_tokens].copy_(stream)
+        normed_out[:num_tokens].copy_(normed)
+        hc_out[num_tokens:].zero_()
+        normed_out[num_tokens:].zero_()
 
-        if stage:
-            core.spec_rollback.stage_ple_pools(ngram_pool, conv_states)
+    def _ple_delta(self, hc) -> torch.Tensor:
+        """A verify step's PLE output for the batch's `n` stream rows `hc`, before it is
+        added into the stream, through the unfused ops whose intermediates
+        `SpeculativeRollback` stages: the pre-step pool rows, the id windows and the conv
+        input."""
+        core = self.core
+        S = self._stack
+        step = self._step
+        conv_states, ngram_pool, si_all, carry_all, qsl = step.ple
+        core.spec_rollback.stage_ple_pools(ngram_pool, conv_states)
         window = ngram_token_history(
-            input_ids, ngram_pool, si_all, carry_all, qsl, core.eos_token_id, core.ngram_size
+            step.input_ids, ngram_pool, si_all, carry_all, qsl, core.eos_token_id, core.ngram_size
         )
         rows = torch.reshape(
             ngram_hash(
@@ -3130,8 +3621,7 @@ class PrefillTarget:
             key_normed, query_normed, value, core.hc_count, _PLE_CLAMP_MIN
         )
         conv_in = self._grouped_norm(gated, S.ple_nc)
-        if stage:
-            core.spec_rollback.stage_ple_rows(window, conv_in)
+        core.spec_rollback.stage_ple_rows(window, conv_in)
         # The short conv reads channel-major; a bare transpose is the certified form.
         convolved = dilated_short_conv_paged(
             x=torch.transpose(conv_in, 0, 1),
@@ -3145,8 +3635,7 @@ class PrefillTarget:
             silu_activation=True,
             pad_slot_id=_PAD_SLOT_ID,
         )
-        torch.add(gated, torch.transpose(convolved, 0, 1), out=out[:num_tokens])
-        out[num_tokens:].zero_()
+        return torch.add(gated, torch.transpose(convolved, 0, 1))
 
     def _splice(self, h) -> None:
         """Break: write the step's vision rows over their placeholder rows of the token
@@ -3246,13 +3735,19 @@ class PrefillTarget:
         si_all = mm.state_indices[:batch]
         hi_all = mm.has_initial_states[:batch]
         si_p, si_d = torch.split(si_all, [num_prefills, num_decodes], 0)
+        # The single-token decode kernel takes its slot vector through a 16-byte-aligned
+        # pointer, and the generation half of the int32 slot vector starts `num_prefills`
+        # rows in, aligned only when that count is a multiple of four: one copy per step
+        # makes it aligned for every layer.
+        si_d = torch.clone(si_d)
         hi_p = hi_all[:num_prefills]
-        # `query_start_loc` covers the context prefix; `_long` the whole batch.
+        # `query_start_loc` covers the context prefix; `_long` the whole batch, and its
+        # prefix the context rows' chunked recurrence when generation rows run beside them.
         qsl_all = mm.query_start_loc
         qsl_p = None if qsl_all is None else qsl_all[: num_prefills + 1]
         qsl_long = mm.query_start_loc_long
+        qsl_long_p = qsl_long[: num_prefills + 1]
         int_idx = None
-        qsl_long_p = None
         replay = None
         if is_verify:
             # The runtime's arange over the slot pool, from the cache manager (what
@@ -3261,8 +3756,6 @@ class PrefillTarget:
             int_idx = core._bound.int_idx[:num_decodes]
             if core._bound.replay is not None:
                 replay = _replay_work(core, mm, num_decodes)
-            # Context rows keep an ordinary chunked recurrence over their prefix.
-            qsl_long_p = qsl_long[: num_prefills + 1]
         gdn_state = (
             num_prefill_tokens,
             num_decode_tokens,
@@ -3372,7 +3865,11 @@ class PrefillTarget:
         Gated-DeltaNet layer). Each writes rows `[:n]` of a fixed output allocated here and
         zeroes rows `[n:]`, so the padding rows stay finite through the row-wise ops and
         reach neither a state pool nor a real row. With the backend off every step is
-        eager and unpadded, and the breaks are plain calls."""
+        eager and unpadded, and the breaks are plain calls.
+
+        Every hyper-connection site is `qwen4_exp_hc_inject_norm` (the previous block's
+        injection fused with this site's grouped norm; after a MoE block it also forms that
+        block's output) and then the mixer (`_hc_mixer`, `_hc_moe_mixer`)."""
         core = self.core
         num_tokens = input_ids.shape[0]
         assert num_tokens == self._step.physical_tokens, (
@@ -3380,10 +3877,8 @@ class PrefillTarget:
             f"{self._step.physical_tokens}"
         )
 
-        # Two views of one `[3, 1, T]` buffer: `pos` (row 0, flat `[T]`: QSA index rope) and
-        # `pos3` (contiguous `[3, T]` for `use_mrope=True`; the engine hands a slice of a
-        # larger buffer and the op rejects the row stride, hence the copy).
-        pos = torch.reshape(torch.split(position_ids, [1, _QSA_POSITION_AXES - 1], 0)[0], [-1])
+        # `pos3`: contiguous `[3, T]` for `use_mrope=True` (the engine hands a slice of a
+        # larger buffer, whose row stride the ops reject, hence the copy).
         pos3 = torch.empty(
             [_QSA_POSITION_AXES, position_ids.shape[-1]],
             dtype=torch.int32,
@@ -3397,17 +3892,17 @@ class PrefillTarget:
         dt = h.dtype
         dev = h.device
 
-        # Scratch shared by every layer that uses it; each break rewrites its whole output
-        # and both packed buffers are fully rewritten by the projection copies.
-        qkv = torch.empty([num_tokens, core.qkv_width], dtype=dt, device=dev)
+        # Scratch shared by every layer that uses it; each break rewrites its whole output.
+        proj_qkv = torch.empty([num_tokens, core.qkv_width], dtype=dt, device=dev)
         index_scratch = torch.empty([num_tokens, core.index_scratch_width], dtype=dt, device=dev)
         attn_out = torch.empty([num_tokens, core.q_width], dtype=dt, device=dev)
         gdn_out = torch.empty(
             [1, num_tokens, core.num_v_heads, core.head_v_dim], dtype=dt, device=dev
         )
-        ple_out = torch.empty([num_tokens, core.stream], dtype=dt, device=dev)
+        ple_hc = torch.empty([num_tokens, core.stream], dtype=dt, device=dev)
+        ple_normed = torch.empty([num_tokens, core.stream], dtype=dt, device=dev)
         # The CuteDSL routed output, shared by all layers: each layer's unpermute rewrites
-        # every row, and the post-inject consumes it before the next layer's MoE starts.
+        # every row, and the next site's injection consumes it before the next layer's MoE.
         routed_out = (
             torch.empty([num_tokens, core.hidden], dtype=dt, device=dev)
             if core.trunk_moe_backend == "CUTEDSL"
@@ -3417,29 +3912,35 @@ class PrefillTarget:
         # The embedding repeated across the hc_count residual streams.
         hc_count = core.hc_count
         hc = torch.cat([h] * hc_count, -1)
-        for i, L in enumerate(self._layers):
+        layers, S = self._layers, self._stack
+        _, normed = qwen4_exp_hc_inject_norm(hc, None, None, layers[0].ahc_norm, core.eps, hc_count)
+        for i, L in enumerate(layers):
             if i == core.ple_layer:
-                eager_on_graph(hc, ple_out, inner=self._ple_block)
-                hc = torch.add(hc, ple_out)
-            mixed, inject = qwen4_exp_gated_residual(
-                self._grouped_norm(hc, L.ahc_norm), L.ahc_down, L.ahc_up, L.ahc_inject, hc_count
-            )
+                eager_on_graph(hc, ple_hc, ple_normed, inner=self._ple_block)
+                hc, normed = ple_hc, ple_normed
+            mixed, inject = self._hc_mixer(normed, L.ahc_first, L.ahc_up, True)
             if core.is_attn[i]:
                 block_out = self._attention_block(
-                    mixed, i, L, qkv, index_scratch, attn_out, pos, pos3
+                    mixed, i, L, proj_qkv, index_scratch, attn_out, pos3
                 )
             else:
                 block_out = self._gdn_block(mixed, i, L, gdn_out)
-            hc = qwen4_exp_post_inject(hc, block_out, inject)
-            mixed, inject = qwen4_exp_gated_residual(
-                self._grouped_norm(hc, L.mhc_norm), L.mhc_down, L.mhc_up, L.mhc_inject, hc_count
+            hc, normed = qwen4_exp_hc_inject_norm(
+                hc, block_out, inject, L.mhc_norm, core.eps, hc_count
             )
-            hc = qwen4_exp_post_inject(hc, self._moe_block(mixed, L, dt, routed_out), inject)
+            mixed, inject, xq, xsf = self._hc_moe_mixer(normed, L.mhc_first, L.mhc_up, L.moe_gscale)
+            next_norm = layers[i + 1].ahc_norm if i + 1 < len(layers) else S.fhc_norm
+            # The MoE block output is formed inside the injection: routed +
+            # sigmoid(gate) * shared, rounded once. Both [T, hidden] operands are
+            # released here, not at the next layer's MoE block, whose own peak they
+            # would otherwise add to.
+            routed, (gate_logits, shared) = self._moe_block(mixed, xq, xsf, L, routed_out)
+            hc, normed = qwen4_exp_hc_inject_norm(
+                hc, routed, inject, next_norm, core.eps, hc_count, shared, gate_logits
+            )
+            del routed, gate_logits, shared
         # The stack-final mixer with no injection weight is the final norm.
-        S = self._stack
-        final, _ = qwen4_exp_gated_residual(
-            self._grouped_norm(hc, S.fhc_norm), S.fhc_down, S.fhc_up, None, hc_count
-        )
+        final, _ = self._hc_mixer(normed, S.fhc_first, S.fhc_up, False)
         if not core.mtp_enabled:
             return final
         # `lm_head` reads the `[T, hidden]` mix; the MTP module reads the
@@ -3919,6 +4420,122 @@ class DecodeTarget:
 
     # --------------------------------------------------------------- blocks ---
 
+    def _hc_first(self, normed, first, with_inject):
+        """The mixer's first half from the site's normed stream: the projection
+        over `[down; block_inject; 0]` and the SiLU / injection activations.
+        Returns `(low, inject)`. Between `_HC_TC_FIRST_MIN_ROWS` and
+        `_HC_TC_FIRST_MAX_ROWS` rows (a per-capture constant) one tcgen05 launch,
+        `qwen4_exp_hc_decode_tc_first`; otherwise cuBLAS's fp32 logits and
+        `qwen4_exp_hc_lowrank_act`."""
+        core = self.core
+        if _HC_TC_FIRST_MIN_ROWS <= normed.shape[0] <= _HC_TC_FIRST_MAX_ROWS:
+            return qwen4_exp_hc_decode_tc_first(
+                normed, first, core.hc_lowrank, core.hc_count, with_inject
+            )
+        return qwen4_exp_hc_lowrank_act(
+            cublas_mm(normed, first[:, : core.hc_first_cols], None, torch.float32),
+            core.hc_lowrank,
+            core.hc_count,
+            with_inject,
+            normed.dtype,
+        )
+
+    def _hc_mixer(self, normed, first, up, with_inject):
+        """One hyper-connection mixer from the site's normed stream: the first
+        projection over `[down; block_inject; 0]` (fp32 logits), the SiLU and
+        injection activations, the up projection, and the sigmoid gate with the
+        stream mean. From `_HC_FUSED_UP_MIN_ROWS` rows (a per-capture constant)
+        the up projection carries the gate and the mean in its epilogue; below
+        it cuBLAS's up projection + `qwen4_exp_hc_gate_mean` is faster.
+        Returns `(mixed, inject)`; `inject` is None without `with_inject` (the
+        stack-final mixer).
+
+        Neither projection takes the step's `gemm` (`low_m_bf16_mm` under CUDA
+        graphs): neither FlashInfer low-M kernel writes the first projection's
+        fp32 logits, and the up projection's K = 320 tiles neither of them."""
+        core = self.core
+        low, inject = self._hc_first(normed, first, with_inject)
+        if normed.shape[0] >= _HC_FUSED_UP_MIN_ROWS:
+            return qwen4_exp_hc_up_gate_mean(low, up, normed, core.hc_count), inject
+        return qwen4_exp_hc_gate_mean(cublas_mm(low, up), normed, core.hc_count), inject
+
+    def _hc_site(self, hc, block_out, inject, norm, first, up, with_inject, normed=None, moe=None):
+        """One trunk hyper-connection site: the previous block's injection (none at
+        the stack's first site and after the PLE add), this site's grouped norm and
+        its mixer. Returns `(hc, mixed, inject)`. The row count is a per-capture
+        constant: at most `_HC_DECODE_GEMV_MAX_ROWS` rows run two GEMV launches,
+        larger batches `qwen4_exp_hc_inject_norm` and `_hc_mixer`. `normed`, when
+        given, is this site's grouped norm of `hc` already computed (the PLE tail's,
+        with no injection pending); the cuBLAS path starts from it.
+
+        After a MoE block, `block_out` is its routed output and `moe` the
+        `(gate_logits, shared, topk_weights, topk_rows)` `_moe_block` left
+        uncombined: the site's first kernel forms the block output itself. With
+        the top-k pair `block_out` is the runner's permuted FC2 rows and that
+        kernel (on either route) also forms their finalize. A site handed
+        `normed` has no pending block, so it never carries `moe`."""
+        core = self.core
+        gate_logits, shared, topk_w, topk_rows = moe if moe is not None else (None,) * 4
+        if hc.shape[0] <= _HC_DECODE_GEMV_MAX_ROWS:
+            n_cols = core.hc_lowrank + (core.hc_count if with_inject else 0)
+            hc, part, ss = qwen4_exp_hc_decode_first_cute(
+                hc,
+                block_out,
+                inject,
+                norm,
+                first,
+                core.hc_count,
+                n_cols,
+                shared,
+                gate_logits,
+                topk_w,
+                topk_rows,
+            )
+            mix = qwen4_exp_hc_decode_mix_cute if hc.shape[0] == 1 else qwen4_exp_hc_decode_mix
+            mixed, inject = mix(part, ss, up, hc, norm, core.eps, core.hc_count, with_inject)
+            return hc, mixed, inject
+        if normed is None:
+            hc, normed = qwen4_exp_hc_inject_norm(
+                hc,
+                block_out,
+                inject,
+                norm,
+                core.eps,
+                core.hc_count,
+                shared,
+                gate_logits,
+                topk_w,
+                topk_rows,
+            )
+        mixed, inject = self._hc_mixer(normed, first, up, with_inject)
+        return hc, mixed, inject
+
+    def _hc_moe_site(self, hc, block_out, inject, norm, first, up, gscale):
+        """`_hc_site` at an MoE site (always with injection), returning the
+        routed experts' NVFP4 input (linear scales, the layer's global scale
+        `gscale`) beside the mix, written by the mixer's own last launch: on the
+        GEMV route `qwen4_exp_hc_decode_mix_fp4_cute`, from `_HC_FUSED_UP_MIN_ROWS`
+        rows the fused up projection `qwen4_exp_hc_up_gate_mean_fp4`. Between
+        the two (only if the thresholds leave a gap) `fp4_quantize` reads the
+        mix back. Returns `(hc, mixed, inject, xq, xsf)`."""
+        core = self.core
+        if hc.shape[0] <= _HC_DECODE_GEMV_MAX_ROWS:
+            hc, part, ss = qwen4_exp_hc_decode_first_cute(
+                hc, block_out, inject, norm, first, core.hc_count, core.hc_lowrank + core.hc_count
+            )
+            mixed, inject, xq, xsf = qwen4_exp_hc_decode_mix_fp4_cute(
+                part, ss, up, hc, norm, core.eps, core.hc_count, True, gscale
+            )
+            return hc, mixed, inject, xq, xsf
+        hc, normed = qwen4_exp_hc_inject_norm(hc, block_out, inject, norm, core.eps, core.hc_count)
+        if normed.shape[0] >= _HC_FUSED_UP_MIN_ROWS:
+            low, inject = self._hc_first(normed, first, True)
+            mixed, xq, xsf = qwen4_exp_hc_up_gate_mean_fp4(low, up, normed, core.hc_count, gscale)
+            return hc, mixed, inject, xq, xsf
+        mixed, inject = self._hc_mixer(normed, first, up, True)
+        xq, xsf = fp4_quantize(mixed, gscale, _SF_VEC, False, _SF_LINEAR)
+        return hc, mixed, inject, xq, xsf
+
     def _grouped_norm(self, x: torch.Tensor, weights: tuple) -> torch.Tensor:
         """See `PrefillTarget._grouped_norm`."""
         core = self.core
@@ -3928,118 +4545,169 @@ class DecodeTarget:
         )
 
     def _moe_block(
-        self, x: torch.Tensor, L: _LayerWeights, dt: torch.dtype, routed_out: torch.Tensor | None
-    ) -> torch.Tensor:
-        """See `PrefillTarget._moe_block`."""
-        core = self.core
-        # The routing op reads logits from data_ptr() ignoring strides.
-        logits = cublas_mm(x, L.router)
-        if core.trunk_moe_backend == "CUTEDSL":
-            # fp32 weights: the dtype the unpermute scales by.
-            topk_ids, topk_w = renorm_moe_routing_op(
-                logits, topk=core.topk, output_dtype=torch.float32
-            )
-            xq, xsf = fp4_quantize(x, L.moe_gscale, _SF_VEC, False, _SF_LINEAR)
-            # The sort pads each expert's (token, expert) pairs to whole tiles and emits
-            # the tile tables both GEMMs walk.
-            tile_expert, tile_limit, expanded_to_permuted, permuted_to_expanded, _, live_tiles = (
-                moe_sort(
-                    token_selected_experts=topk_ids,
-                    token_final_scales=topk_w,
-                    num_experts=core.num_experts,
-                    top_k=core.topk,
-                    local_expert_offset=0,
-                    local_num_experts=core.num_experts,
-                    tile_tokens_dim=_CUTEDSL_TILE_SIZE,
-                )
-            )
-            # FC1 gathers its rows from the unpermuted activation, applies SwiGLU and
-            # requantizes with the layer's one FC2 input scale. `fp4_quantize` returns the
-            # linear scales flat; the GEMM reads them as [T, hidden / 16].
-            h, h_sf = cute_dsl_nvfp4_gather_grouped_gemm_act_fusion(
-                input=xq.view(torch.float4_e2m1fn_x2),
-                weight=L.fc1_w,
-                input_scale=xsf.view(x.shape[0], core.hidden // _SF_VEC),
-                weight_scale=L.fc1_s,
-                alpha=L.alpha1,
-                tile_idx_to_group_idx=tile_expert,
-                tile_idx_to_mn_limit=tile_limit,
-                permuted_idx_to_expanded_idx=permuted_to_expanded,
-                num_non_exiting_tiles=live_tiles,
-                global_sf=L.global_sf,
-                num_experts=core.num_experts,
-                top_k=core.topk,
-                num_local_experts=core.num_experts,
-                local_expert_offset=0,
-                tile_size=_CUTEDSL_TILE_SIZE,
-                scaling_vector_size=_SF_VEC,
-                activation_type=int(ActivationType.Swiglu),
-            )
-            # FC2 writes one bf16 row per permuted row; the unpermute writes every row of
-            # `routed_out` as the routing-weighted sum of its token's top-k rows.
-            y = cute_dsl_nvfp4_grouped_gemm(
-                input=h,
-                weight=L.fc2_w,
-                input_scale=h_sf,
-                weight_scale=L.fc2_s,
-                alpha=L.alpha2,
-                tile_idx_to_group_idx=tile_expert,
-                num_non_exiting_tiles=live_tiles,
-                num_experts=core.num_experts,
-                top_k=core.topk,
-                num_local_experts=core.num_experts,
-                local_expert_offset=0,
-                tile_size=_CUTEDSL_TILE_SIZE,
-                output_dtype=torch.bfloat16,
-                scaling_vector_size=_SF_VEC,
-            )
-            routed = moe_unpermute_inplace(
-                permuted_input=y,
-                output=routed_out,
-                expanded_idx_to_permuted_idx=expanded_to_permuted,
-                topk_scales=topk_w,
-            )
-        else:
-            topk_ids, topk_w = renorm_moe_routing_op(logits, topk=core.topk, output_dtype=dt)
-            xq, xsf = fp4_quantize(x, L.moe_gscale, _SF_VEC, False, _SF_LINEAR)
-            routed = fp4_block_scale_moe_runner(
-                routing_logits=None,
-                routing_bias=None,
-                hidden_states=xq,
-                hidden_states_scale=xsf.view(torch.float8_e4m3fn),
-                gemm1_weights=L.fc1_w,
-                gemm1_weights_scale=L.fc1_s,
-                gemm1_bias=None,
-                gemm1_alpha=None,
-                gemm1_beta=None,
-                gemm1_clamp_limit=None,
-                gemm2_weights=L.fc2_w,
-                gemm2_weights_scale=L.fc2_s,
-                gemm2_bias=None,
-                output1_scale_scalar=L.out1_scale,
-                output1_scale_gate_scalar=L.out1_gate_scale,
-                output2_scale_scalar=L.out2_scale,
-                num_experts=core.num_experts,
-                top_k=core.topk,
-                n_group=None,
-                topk_group=None,
-                intermediate_size=core.moe_inter,
-                local_expert_offset=0,
-                local_num_experts=core.num_experts,
-                routed_scaling_factor=None,
-                routing_method_type=_ROUTING_METHOD_RENORM,
-                do_finalize=True,
-                act_type=_ACT_TYPE_SWIGLU,
-                topk_weights=topk_w,
-                topk_ids=topk_ids,
-            )[0]
-        shared = cublas_mm(flashinfer_silu_and_mul(cublas_mm(x, L.sh_gu)), L.sh_dn)
-        gate_logits = cublas_mm(x, L.sh_gate)
-        return fused_sigmoid_gate_mul_add(routed, gate_logits, shared)
+        self, x, xq, xsf, L: _LayerWeights, routed_out, gemm=cublas_mm, fold=False
+    ) -> tuple:
+        """One MoE layer: NVFP4 routed experts plus a bf16 shared expert, left
+        uncombined. Returns `(routed, (gate_logits, shared, topk_weights,
+        topk_rows))`: the next hyper-connection site forms `routed +
+        sigmoid(gate_logits) * shared` inside its first kernel (`_hc_site`'s
+        `moe`). With `fold` (trtllm-gen, and the next site takes the combine; a
+        per-capture constant) the runner also skips its finalize: `routed` is then
+        its permuted FC2 rows and `topk_weights` / `topk_rows` its routing weights
+        and index map, which that site's first kernel
+        (`qwen4_exp_hc_decode_first_cute` or `qwen4_exp_hc_inject_norm`) gathers;
+        without it both are None and `routed` is the finalized `[T, H]` rows.
 
-    def _attention_block(self, x, i, L, qkv, index_scratch, attn_out, qsa, step, stage):
-        """One gated GQA layer plus its QSA index branch for a generation-only batch;
-        see `PrefillTarget._attention_block`."""
+        The shared expert and its per-token gate logit run on the core's side
+        stream, concurrently with the routed path, and join it before this
+        returns. `x` is the bf16 hidden states (router and shared expert); `xq` /
+        `xsf` are the same states in NVFP4 with **linear** block scales, from
+        `_hc_moe_site`. On trtllm-gen the routed path hands the runner the router
+        logits (its Renormalize routing is bitwise the `renorm_moe_routing_op` +
+        pre-routed composition); on CuteDSL it is `_cute_dsl_routed`, which writes
+        `routed_out`. `gemm` is the step's bf16 projection entry (see `forward`); it
+        launches on the current stream, so the shared expert's GEMMs run on the side
+        stream."""
+        core = self.core
+        main = torch.cuda.current_stream()
+        side = core._side_stream
+        # Fork: the side stream reads `x` only after everything queued on `main`
+        # so far. What it allocates is consumed on `main` after the join below,
+        # and the next layer's fork orders any reuse of those blocks after that.
+        side.wait_stream(main)
+        with torch.cuda.stream(side):
+            shared = gemm(flashinfer_silu_and_mul(gemm(x, L.sh_gu)), L.sh_dn)
+            gate_logits = gemm(x, L.sh_gate)
+        # The routing reads its logits as a dense row-major buffer from data_ptr() and
+        # ignores strides; both projection entries allocate them contiguous.
+        logits = gemm(x, L.router)
+        if core.trunk_moe_backend == "CUTEDSL":
+            routed = _cute_dsl_routed(core, L, logits, xq, xsf, routed_out)
+            main.wait_stream(side)
+            return routed, (gate_logits, shared, None, None)
+        moe_op = fp4_block_scale_moe_renorm_permuted if fold else fp4_block_scale_moe_renorm_routed
+        out = moe_op(
+            logits,
+            xq,
+            xsf.view(torch.float8_e4m3fn),
+            L.fc1_w,
+            L.fc1_s,
+            L.fc2_w,
+            L.fc2_s,
+            L.out1_scale,
+            L.out1_gate_scale,
+            L.out2_scale,
+            core.num_experts,
+            core.topk,
+            core.moe_inter,
+        )
+        main.wait_stream(side)
+        if fold:
+            routed, topk_w, topk_rows = out
+            return routed, (gate_logits, shared, topk_w, topk_rows)
+        return out, (gate_logits, shared, None, None)
+
+    def _attention_prologue(
+        self, proj, q_index, index_view, index_cache, index_section, L, qsa, side, stage
+    ) -> None:
+        """The norm + rope of both planes on this stream and the QSA index branch (the
+        verify step's staging, the raw-key store, then compression) on the side stream,
+        which reads only the projection's index-key columns and the index pools; the
+        attention core joins it before reading either."""
+        core = self.core
+        num_tokens = proj.shape[0]
+        req_idx, logical, _, _, _, _, block_table, tokens_per_block, _, pos3, coords, _ = qsa
+        side.wait_stream(torch.cuda.current_stream())
+        qwen4_exp_qk_norm_rope(
+            proj,
+            q_index,
+            pos3,
+            core._cos_sin,
+            L.q_norm,
+            L.k_norm,
+            L.idx_qn,
+            num_heads_q=core.heads_q,
+            num_heads_k=core.heads_kv,
+            head_dim=core.head_dim,
+            index_heads=core.index_heads,
+            index_head_dim=core.index_head_dim,
+            index_q_col=core.qkv_width + core.q_width,
+            rotary_dim=core.rotary_dim,
+            eps=core.eps,
+            mrope_section1=core.mrope_section1,
+            mrope_section2=core.mrope_section2,
+            index_mrope_section1=index_section[1],
+            index_mrope_section2=index_section[2],
+        )
+
+        # ---- the QSA index branch ------------------------------------------
+        # The raw key is stored **before** anything normalizes or rotates it, because
+        # the compression step pools raw keys and applies the norm and the rotation
+        # itself at the group's first member's coordinates; a key normalized on the way
+        # in double-normalizes every anchor that reads it, which is finite, silent, and
+        # invisible below the sparse threshold. The norm + rope above never writes the
+        # index key columns.
+        with torch.cuda.stream(side):
+            token_k = torch.split(
+                torch.reshape(
+                    index_view,
+                    [
+                        num_tokens,
+                        core.index_scratch_width // core.index_head_dim,
+                        core.index_head_dim,
+                    ],
+                ),
+                [core.index_heads, core.index_kv_heads, 1],
+                1,
+            )[1]
+            if stage:
+                core.spec_rollback.stage_index(index_cache, core._bound.position_cache)
+            qsa_paged_index_store(
+                token_k,
+                coords,
+                index_cache,
+                core._bound.position_cache,
+                req_idx,
+                logical,
+                block_table,
+                tokens_per_block,
+            )
+            qsa_prefill_compress(
+                logical_positions=logical,
+                request_indices=req_idx,
+                block_table=block_table,
+                index_cache=index_cache,
+                position_cache=core._bound.position_cache,
+                k_norm_weight=L.idx_kn,
+                cos_sin=core._cos_sin,
+                eps=core.eps,
+                tokens_per_block=tokens_per_block,
+                compress_ratio=core.compress_ratio,
+                mrope_section=_QSA_MROPE_SECTION,
+            )
+
+    def _attention_block(
+        self, x, i, L, qkv, index_scratch, attn_out, qsa, step, stage, gemm=cublas_mm
+    ):
+        """One gated GQA layer plus its QSA index branch for a generation-only batch.
+
+        The four input projections are one GEMM against the load-time fused
+        operand (`weights._attn_in_w`), whose output row is
+        `[q | k | v | gate | index q, k | v slot]`. One norm+rope launch rewrites
+        the main q/k heads in place on that output and writes the normalized,
+        rotated index query into the scratch; the sparse path reads q/k/v as views
+        of it, the dense path takes one compact copy of its leading `[q | k | v]`
+        (the dense op reads its QKV flat), the gate is read through its row stride,
+        and the index branch reads its raw key from it.
+
+        **The index plane is maintained on every step, at both ends of the
+        threshold.** Below it the dense core runs and the index cache is still
+        advanced, so a request that grows past the threshold finds its prefix
+        already compressed; above it the dense core is replaced outright and the
+        main K/V append becomes this layer's own call, because the op that would
+        have done it is not the one running. Above the threshold over a bf16 pool
+        everything up to the index scores is one launch,
+        `qwen4_exp_attn_decode_prologue`."""
         core = self.core
         (
             req_idx,
@@ -4057,116 +4725,81 @@ class DecodeTarget:
         ) = qsa
         num_tokens = x.shape[0]
 
-        qg = cublas_mm(x, L.q)
-        k = cublas_mm(x, L.k)
-        v = cublas_mm(x, L.v)
-
-        # Destination views into the packed QKV buffer.
-        qkv_h = torch.reshape(qkv, [num_tokens, core.heads_q + 2 * core.heads_kv, core.head_dim])
-        q_dst, k_dst, v_dst = torch.split(qkv_h, [core.heads_q, core.heads_kv, core.heads_kv], 1)
-        q_src, gate = torch.split(
-            torch.reshape(qg, [num_tokens, core.heads_q, 2 * core.head_dim]),
-            [core.head_dim, core.head_dim],
-            2,
+        proj = gemm(x, L.attn_in)
+        main = torch.cuda.current_stream()
+        side = core._side_stream
+        qkv_view, gate, index_view = torch.split(
+            proj, [core.qkv_width, core.q_width, core.index_scratch_width], 1
         )
-        q_dst.copy_(q_src)
-        k_dst.copy_(torch.reshape(k, [num_tokens, core.heads_kv, core.head_dim]))
-        v_dst.copy_(torch.reshape(v, [num_tokens, core.heads_kv, core.head_dim]))
-        fused_qk_norm_rope(
-            qkv,
-            num_heads_q=core.heads_q,
-            num_heads_k=core.heads_kv,
-            num_heads_v=core.heads_kv,
-            head_dim=core.head_dim,
-            rotary_dim=core.rotary_dim,
-            eps=core.eps,
-            q_weight=L.q_norm,
-            k_weight=L.k_norm,
-            base=core.theta,
-            is_neox=True,
-            position_ids=pos3,
-            is_qk_norm=True,
-            # The gemma QK norm, `rmsnorm(x) * (1 + w)`.
-            use_gemma=True,
-            # Real mRoPE, unconditionally (see PrefillTarget).
-            use_mrope=True,
-            mrope_section1=core.mrope_section1,
-            mrope_section2=core.mrope_section2,
-        )
-        if self._kv_probe is not None and not self._kv_probe.observe(i, k_dst, v_dst):
-            self._kv_probe = None
-
-        # ---- the QSA index branch (see PrefillTarget) ------------------------
-        # The raw key is stored before any norm/rotation; the compression step
-        # applies both itself.
-        qk_index = cublas_mm(x, L.idx)
-        index_cache = core._bound.index_cache[i]
-        token_k = torch.split(
-            torch.reshape(qk_index, [num_tokens, core.index_heads + core.index_kv_heads, -1]),
-            [core.index_heads, core.index_kv_heads],
-            1,
-        )[1]
-        if stage:
-            core.spec_rollback.stage_index(index_cache, core._bound.position_cache)
-        qsa_paged_index_store(
-            token_k,
-            coords,
-            index_cache,
-            core._bound.position_cache,
-            req_idx,
-            logical,
-            block_table,
-            tokens_per_block,
-        )
-        # Query norm+rotation; coordinate 0 alone, matching `_QSA_MROPE_SECTION`.
-        scratch_h = torch.reshape(index_scratch, [num_tokens, core.index_scratch_width])
-        scratch_h[:, : core.index_width].copy_(qk_index)
-        fused_qk_norm_rope(
-            index_scratch,
-            num_heads_q=core.index_heads,
-            num_heads_k=core.index_kv_heads,
-            num_heads_v=core.index_kv_heads,
-            head_dim=core.index_head_dim,
-            rotary_dim=core.rotary_dim,
-            eps=core.eps,
-            q_weight=L.idx_qn,
-            k_weight=L.idx_kn,
-            base=core.theta,
-            is_neox=True,
-            position_ids=pos3 if _QSA_INDEX_USE_MROPE else pos,
-            is_qk_norm=True,
-            use_gemma=True,
-            use_mrope=_QSA_INDEX_USE_MROPE,
-            mrope_section1=(_QSA_MROPE_SECTION or (0, 0, 0))[1],
-            mrope_section2=(_QSA_MROPE_SECTION or (0, 0, 0))[2],
-        )
+        q_dst, k_dst, v_dst = _attn_in_heads(core, proj)
+        # The index query lands in the q slots of the scratch; its k and v slots
+        # are layout only and nothing reads them.
         q_index = torch.split(
             torch.reshape(
-                scratch_h,
+                index_scratch,
                 [num_tokens, core.index_heads + 2 * core.index_kv_heads, core.index_head_dim],
             ),
             [core.index_heads, core.index_kv_heads, core.index_kv_heads],
             1,
         )[0]
-        qsa_prefill_compress(
-            logical_positions=logical,
-            request_indices=req_idx,
-            block_table=block_table,
-            index_cache=index_cache,
-            position_cache=core._bound.position_cache,
-            k_norm_weight=L.idx_kn,
-            cos_sin=core._cos_sin,
-            eps=core.eps,
-            tokens_per_block=tokens_per_block,
-            compress_ratio=core.compress_ratio,
-            mrope_section=_QSA_MROPE_SECTION,
-        )
+        index_section = (_QSA_MROPE_SECTION or (0, 0, 0)) if _QSA_INDEX_USE_MROPE else (0, 0, 0)
+        index_cache = core._bound.index_cache[i]
+        kv = core._bound.kv[i]
+        fused_prologue = sparse and kv.k_scale is None and kv.k.dtype == proj.dtype
+        if fused_prologue:
+            # The norm + rope of both planes, the K/V append the dense op would have
+            # owned, and the index branch's raw-key and coordinate store and group
+            # compression in one launch on this stream.
+            if stage:
+                core.spec_rollback.stage_index(index_cache, core._bound.position_cache)
+            qwen4_exp_attn_decode_prologue(
+                proj,
+                q_index,
+                pos3,
+                coords,
+                core._cos_sin,
+                L.q_norm,
+                L.k_norm,
+                L.idx_qn,
+                L.idx_kn,
+                kv.k,
+                kv.v,
+                index_cache,
+                core._bound.position_cache,
+                req_idx,
+                logical,
+                block_table,
+                tokens_per_block,
+                core.compress_ratio,
+                num_heads_q=core.heads_q,
+                num_heads_k=core.heads_kv,
+                head_dim=core.head_dim,
+                index_heads=core.index_heads,
+                index_head_dim=core.index_head_dim,
+                index_q_col=core.qkv_width + core.q_width,
+                rotary_dim=core.rotary_dim,
+                eps=core.eps,
+                mrope_section1=core.mrope_section1,
+                mrope_section2=core.mrope_section2,
+                index_mrope_section1=index_section[1],
+                index_mrope_section2=index_section[2],
+                compress_mrope_section=_QSA_MROPE_SECTION,
+            )
+        else:
+            self._attention_prologue(
+                proj, q_index, index_view, index_cache, index_section, L, qsa, side, stage
+            )
+        if self._kv_probe is not None and not self._kv_probe.observe(i, k_dst, v_dst):
+            self._kv_probe = None
 
+        gated = False
         if sparse:
-            kv = core._bound.kv[i]
-            # Append the fused-norm+rope'd K/V; the selection reads the current
-            # token from the pool. Over an fp8 or NVFP4 pool as in the prefill target.
-            _store_kv(core, kv, k_dst, v_dst, req_idx, logical, block_table, tokens_per_block)
+            if not fused_prologue:
+                # Selection reads the index plane the side stream wrote.
+                main.wait_stream(side)
+                # Append the fused-norm+rope'd K/V; the selection reads the current
+                # token from the pool. Over an fp8 or NVFP4 pool as in the prefill target.
+                _store_kv(core, kv, k_dst, v_dst, req_idx, logical, block_table, tokens_per_block)
             scores = qsa_paged_index_scores(
                 q=q_index,
                 index_cache=index_cache,
@@ -4177,17 +4810,36 @@ class DecodeTarget:
                 compress_ratio=core.compress_ratio,
                 only_visible_blocks=True,
                 context_rows=False,
+                # Its predecessor is the prologue launch and its consumer the top-k,
+                # which waits before reading the scores. The prologue writes no
+                # compressed key but the one the entry re-reads after its wait, so at
+                # decode-sized batches the pages and keys are read before it.
+                use_pdl=fused_prologue,
+                prefetch=fused_prologue and num_tokens <= _SPARSE_DECODE_MAX_ROWS,
             )
-            _select(core, scores, topk_row_starts, visible_blocks, topk_indices)
-            selected = qsa_expand_block_indices(
-                topk_indices,
-                logical,
-                seq_lens_q,
-                compress_ratio=core.compress_ratio,
-                token_topk=core.token_topk,
-            )
-            out = torch.reshape(
-                _sparse_gqa(
+            if scores.shape[1] % 4 == 0 and scores.shape[1] <= 4096:
+                # The canonical block top-k and its expansion to tokens in one launch
+                # (QSA's row starts are zero).
+                selected = qsa_topk_expand_decode(
+                    scores,
+                    visible_blocks,
+                    logical,
+                    seq_lens_q,
+                    topk_indices,
+                    core.compress_ratio,
+                    core.token_topk,
+                )
+            else:
+                _select(core, scores, topk_row_starts, visible_blocks, topk_indices)
+                selected = qsa_expand_block_indices(
+                    topk_indices,
+                    logical,
+                    seq_lens_q,
+                    compress_ratio=core.compress_ratio,
+                    token_topk=core.token_topk,
+                )
+            if kv.k_scale is not None:
+                attn = _sparse_gqa(
                     core,
                     kv,
                     q=q_dst,
@@ -4198,10 +4850,48 @@ class DecodeTarget:
                     # The prefill pair bounds a context row's scan; none here.
                     query_positions=None,
                     compress_ratio=None,
-                ),
-                [num_tokens, core.q_width],
-            )
+                )
+            else:
+                # The output gate rides the split-K merge whenever the launch has
+                # one (more than one split); otherwise it is its own kernel below.
+                gated = qsa_paged_sparse_gqa.fuses_output_gate(q_dst, kv.k, selected, gate)
+                if (
+                    gated
+                    and num_tokens <= _SPARSE_DECODE_MAX_ROWS
+                    and _sparse_decode_supports(q_dst, kv.k, selected)
+                ):
+                    # The split-K pass, then the merge and the gate as one launch spread
+                    # over the SMs.
+                    attn = qsa_paged_sparse_gqa_decode(
+                        q_dst,
+                        kv.k,
+                        kv.v,
+                        block_table,
+                        selected,
+                        req_idx,
+                        tokens_per_block,
+                        core.softmax_scale,
+                        gate,
+                    )
+                else:
+                    attn = qsa_paged_sparse_gqa(
+                        q=q_dst,
+                        k_cache=kv.k,
+                        v_cache=kv.v,
+                        block_table=block_table,
+                        selected_tokens=selected,
+                        request_indices=req_idx,
+                        tokens_per_block=tokens_per_block,
+                        softmax_scale=core.softmax_scale,
+                        query_positions=None,
+                        compress_ratio=None,
+                        output_gate=gate if gated else None,
+                    )
+            out = torch.reshape(attn, [num_tokens, core.q_width])
         else:
+            main.wait_stream(side)
+            # The dense op reads its packed QKV flat: one compact copy.
+            qkv.copy_(qkv_view)
             out = thop_attention(
                 q=qkv,
                 output=attn_out,
@@ -4215,8 +4905,9 @@ class DecodeTarget:
                 **step,
                 **_CALL_CONSTANTS,
             )
-        fused_sigmoid_mul_inplace(out, gate)
-        return cublas_mm(out, L.o)
+        if not gated:
+            fused_sigmoid_mul_inplace(out, gate)
+        return gemm(out, L.o)
 
     def _gdn_verify(
         self, mq_d, a_d, b_d, ssm_states, i, L, si_d, int_idx, n, p, replay
@@ -4283,24 +4974,74 @@ class DecodeTarget:
         )
         return torch.reshape(out, [1, n * p, core.num_v_heads, core.head_v_dim])
 
-    def _gdn_block(self, x, i, L, gdn_state) -> torch.Tensor:
+    def _gdn_block(self, x, i, L, gdn_state, gemm=cublas_mm, fused_conv=False) -> torch.Tensor:
         """One Gated-DeltaNet layer over a generation-only batch: one token per
-        sequence, or under speculation the whole draft chain via the verify path."""
+        sequence, or under speculation the whole draft chain through the verify
+        path. Every branch is on a host int the engine fixes for a capture.
+
+        One GEMM for all four input projections: q|k|v, z, a and b are column views of
+        its output. A graph-captured single-token step at up to `_GDN_CONV_FUSED_MAX_ROWS`
+        rows runs the conv step as that GEMM's epilogue (`gdn_in_proj_conv1d_pdl`), and
+        over an fp32 recurrent pool at up to `_GDN_DECODE_FUSED_MAX_ROWS` rows the
+        recurrence and the gated norm as one launch (`gdn_decode_gated_norm_pdl`); past
+        them, after the conv step, as one streaming launch (`gdn_decode_rows_gated_norm`).
+        Over a bf16 pool the recurrence is `fused_sigmoid_gating_delta_rule_update`'s rows
+        form, which is batch-invariant."""
         core = self.core
         si_all, qsl_long, is_verify, num_decodes, gen_p, int_idx, replay = gdn_state
         num_tokens = x.shape[0]
-
-        mixed_qkv = cublas_mm(x, L.in_qkv)
-        z = cublas_mm(x, L.in_z)
-        a = cublas_mm(x, L.in_a)
-        b = cublas_mm(x, L.in_b)
-
         ssm_states = core._bound.ssm[i]
-        if is_verify:
-            out = self._gdn_verify(
-                mixed_qkv, a, b, ssm_states, i, L, si_all, int_idx, num_decodes, gen_p, replay
+        fp32_state = ssm_states.dtype == torch.float32
+
+        conv_fused = fused_conv and not is_verify and num_tokens <= _GDN_CONV_FUSED_MAX_ROWS
+        if conv_fused:
+            proj = gdn_in_proj_conv1d_pdl(
+                x,
+                L.in_proj,
+                core._bound.conv[i],
+                L.conv_w,
+                si_all,
+                core.conv_dim,
+                _PAD_SLOT_ID,
+                True,
             )
         else:
+            proj = gemm(x, L.in_proj)
+        mixed_qkv, z, a, b = torch.split(proj, core.in_proj_split, 1)
+
+        if fp32_state and conv_fused and num_tokens <= _GDN_DECODE_FUSED_MAX_ROWS:
+            # The recurrence and the gated norm as one launch that reads this layer's
+            # pool rows before its PDL wait: in a captured single-token step nothing
+            # ahead of it writes them, and the slot indices are filled before the
+            # graph is launched.
+            o = gdn_decode_gated_norm_pdl(
+                proj,
+                ssm_states,
+                si_all,
+                L.a_log,
+                L.dt_bias,
+                L.gnorm,
+                core.eps,
+                core.num_k_heads,
+                core.head_k_dim,
+            )
+            return gemm(o, L.out)
+        if is_verify:
+            out = self._gdn_verify(
+                mixed_qkv,
+                a.contiguous(),
+                b.contiguous(),
+                ssm_states,
+                i,
+                L,
+                si_all,
+                int_idx,
+                num_decodes,
+                gen_p,
+                replay,
+            )
+            return self._gdn_epilogue(out, z, L, num_tokens, gemm)
+        if not conv_fused:
             causal_conv1d_update(
                 x=mixed_qkv,
                 conv_state=core._bound.conv[i],
@@ -4311,61 +5052,56 @@ class DecodeTarget:
                 conv_state_indices=si_all,
                 pad_slot_id=_PAD_SLOT_ID,
             )
-            if ssm_states.dtype == torch.bfloat16:
-                # Over a bf16 pool a call with `cu_seqlens` reaches FlashInfer's CuTe-DSL
-                # decode, whose kernel changes with the batch size and so changes a row's
-                # last bits; without `cu_seqlens` the entry runs its Triton kernel, one program
-                # per (row, head). That form finds row n's tokens at `n * q.stride(1)`, so q/k/v
-                # must be split from the whole contiguous `[T, 10240]` block reshaped to
-                # `[T, 1, 80, 128]` (K and V heads are both 128 wide), where the size-1 token
-                # axis carries the row stride; a/b are contiguous `[T, 48]`.
-                qkv = torch.reshape(mixed_qkv, [num_tokens, 1, -1, core.head_k_dim])
-                q, k, v = torch.split(
-                    qkv, [core.num_k_heads, core.num_k_heads, core.num_v_heads], 2
-                )
-                out = fused_sigmoid_gating_delta_rule_update(
-                    A_log=L.a_log,
-                    a=torch.reshape(a, [num_tokens, 1, core.num_v_heads]),
-                    dt_bias=L.dt_bias,
-                    softplus_beta=_SOFTPLUS_BETA,
-                    softplus_threshold=_SOFTPLUS_THRESHOLD,
-                    q=q,
-                    k=k,
-                    v=v,
-                    b=torch.reshape(b, [num_tokens, 1, core.num_v_heads]),
-                    initial_state_source=ssm_states,
-                    initial_state_indices=si_all,
-                    scale=None,
-                    use_qk_l2norm_in_kernel=True,
-                    cu_seqlens=None,
-                    output=None,
-                )
-            else:
-                # q/k/v stay views over the conv output (native strides, no copy).
-                qv, kv, vv = torch.split(mixed_qkv, [core.key_dim, core.key_dim, core.value_dim], 1)
-                out = fused_sigmoid_gating_delta_rule_update(
-                    A_log=L.a_log,
-                    a=a,
-                    dt_bias=L.dt_bias,
-                    softplus_beta=_SOFTPLUS_BETA,
-                    softplus_threshold=_SOFTPLUS_THRESHOLD,
-                    q=torch.reshape(qv, [1, num_tokens, core.num_k_heads, core.head_k_dim]),
-                    k=torch.reshape(kv, [1, num_tokens, core.num_k_heads, core.head_k_dim]),
-                    v=torch.reshape(vv, [1, num_tokens, core.num_v_heads, core.head_v_dim]),
-                    b=b,
-                    initial_state_source=ssm_states,
-                    initial_state_indices=si_all,
-                    scale=None,
-                    use_qk_l2norm_in_kernel=True,
-                    cu_seqlens=qsl_long,
-                    output=None,
-                )
-        return self._gdn_epilogue(out, z, L, num_tokens)
+        if fp32_state:
+            # The recurrence and the gated norm as one launch over `proj`, whose q/k/v
+            # columns the conv step rewrote in place; it computes both gates and the
+            # q/k L2 norm itself, at the softplus pair (1, 20) and epsilon 1e-6 this
+            # target's constants name, and reads this layer's pool rows before its PDL
+            # wait (nothing in a single-token step writes them ahead of it).
+            o = gdn_decode_rows_gated_norm(
+                proj,
+                ssm_states,
+                si_all,
+                L.a_log,
+                L.dt_bias,
+                L.gnorm,
+                core.eps,
+                core.num_k_heads,
+                core.head_k_dim,
+            )
+            return gemm(o, L.out)
+        else:
+            # The rows form, `cu_seqlens` None: it finds row n's tokens at
+            # `n * q.stride(1)`, so q/k/v are split from a contiguous `[T, 10240]` copy
+            # reshaped to `[T, 1, 80, 128]` (K and V heads are both 128 wide), where the
+            # size-1 token axis carries the row stride; a/b are contiguous `[T, 48]`.
+            qkv_rows = torch.reshape(mixed_qkv.contiguous(), [num_tokens, 1, -1, core.head_k_dim])
+            q, k, v = torch.split(
+                qkv_rows, [core.num_k_heads, core.num_k_heads, core.num_v_heads], 2
+            )
+            out = fused_sigmoid_gating_delta_rule_update(
+                A_log=L.a_log,
+                a=torch.reshape(a.contiguous(), [num_tokens, 1, core.num_v_heads]),
+                dt_bias=L.dt_bias,
+                softplus_beta=_SOFTPLUS_BETA,
+                softplus_threshold=_SOFTPLUS_THRESHOLD,
+                q=q,
+                k=k,
+                v=v,
+                b=torch.reshape(b.contiguous(), [num_tokens, 1, core.num_v_heads]),
+                initial_state_source=ssm_states,
+                initial_state_indices=si_all,
+                scale=None,
+                use_qk_l2norm_in_kernel=True,
+                cu_seqlens=None,
+                output=None,
+            )
+        return self._gdn_epilogue(out, z, L, num_tokens, gemm)
 
-    def _gdn_epilogue(self, out, z, L, num_tokens) -> torch.Tensor:
-        """Gated RMS norm and output projection shared by every recurrence."""
+    def _gdn_epilogue(self, out, z, L, num_tokens, gemm=cublas_mm) -> torch.Tensor:
+        """Gated RMS norm (sigmoid gate, plain non-gemma weight) and output projection
+        shared by every recurrence."""
         core = self.core
-        # Sigmoid gate, plain (non-gemma) weight.
         o = rms_norm_gated_token_major(
             torch.reshape(out, [-1, core.head_v_dim]),
             torch.reshape(z, [num_tokens, core.num_v_heads, core.head_v_dim]),
@@ -4374,58 +5110,109 @@ class DecodeTarget:
             fp8_scale=None,
             gate_activation="sigmoid",
         )
-        return cublas_mm(torch.reshape(o, [num_tokens, core.value_dim]), L.out)
+        return gemm(torch.reshape(o, [num_tokens, core.value_dim]), L.out)
 
-    def _ple_block(self, hc, input_ids, ple_state, stage) -> torch.Tensor:
-        """The n-gram side path on one decoder layer; see `PrefillTarget._ple_block`."""
+    def _ple_block(self, hc, input_ids, ple_state, next_norm, stage, gemm=cublas_mm) -> tuple:
+        """The n-gram side path on one decoder layer, added into the stream and
+        normalized for the next site. Returns `(hc, normed)`.
+
+        The same steps as the prefill target's `_ple_block` -- id history, hash, table
+        gather and dequant, the gated injection, the dilated short conv -- in three
+        launches plus the two projections, because a decode batch carries at most
+        `gen_p` rows per sequence:
+
+        1. `ple_ngram_embed`: window, hash, gather, dequantize, and the id
+           history published back, one program per sequence;
+        2. the key and value projections, on the step's bf16 projection entry
+           `gemm` (see `forward`);
+        3. `ple_gate_conv_inject_norm`: the key / query grouped norms, the gate,
+           the conv-input grouped norm, the conv against the paged conv state
+           (published back), the residual add into the stream and this
+           layer's attention-side grouped norm, one program per
+           (sequence, stream).
+
+        Every generation sequence carries its history by construction, so no carry
+        flags are passed. A verify step (`stage`) takes the unfused ops instead, whose
+        intermediates `SpeculativeRollback` stages (see `PrefillTarget._ple_delta`)."""
         core = self.core
         S = self._stack
-        conv_states, ngram_pool, si_all, carry_all, qsl = ple_state
-
+        conv_states, ngram_pool, si_all, carry_all, qsl, gen_p = ple_state
         if stage:
             core.spec_rollback.stage_ple_pools(ngram_pool, conv_states)
-        window = ngram_token_history(
-            input_ids, ngram_pool, si_all, carry_all, qsl, core.eos_token_id, core.ngram_size
-        )
-        rows = torch.reshape(
-            ngram_hash(
-                window,
-                layer_multipliers=S.ple_mult,
-                head_vocab_sizes=S.ple_vocab,
-                head_offsets=S.ple_offs,
-                eos_token_id=core.eos_token_id,
-                num_query_tokens=1,
-            ),
-            [-1, core.ngram_heads],
-        )
-        gathered = nn.functional.embedding(rows, core.w["ple_table"])
-        ngram = torch.reshape(
-            dequantize_e4m3_per_tensor(gathered, S.ple_tscale), [-1, core.ple_embed_dim]
-        )
-
-        key_normed = self._grouped_norm(cublas_mm(ngram, S.ple_key), S.ple_nk)
-        query_normed = self._grouped_norm(hc, S.ple_nq)
-        value = cublas_mm(ngram, S.ple_val)
-        gated = gated_ngram_injection(
-            key_normed, query_normed, value, core.hc_count, _PLE_CLAMP_MIN
-        )
-        conv_in = self._grouped_norm(gated, S.ple_nc)
-        if stage:
+            window = ngram_token_history(
+                input_ids, ngram_pool, si_all, carry_all, qsl, core.eos_token_id, core.ngram_size
+            )
+            rows = torch.reshape(
+                ngram_hash(
+                    window,
+                    layer_multipliers=S.ple_mult,
+                    head_vocab_sizes=S.ple_vocab,
+                    head_offsets=S.ple_offs,
+                    eos_token_id=core.eos_token_id,
+                    num_query_tokens=1,
+                ),
+                [-1, core.ngram_heads],
+            )
+            gathered = nn.functional.embedding(rows, core.w["ple_table"])
+            ngram = torch.reshape(
+                dequantize_e4m3_per_tensor(gathered, S.ple_tscale), [-1, core.ple_embed_dim]
+            )
+            key_normed = self._grouped_norm(cublas_mm(ngram, S.ple_key), S.ple_nk)
+            query_normed = self._grouped_norm(hc, S.ple_nq)
+            value = cublas_mm(ngram, S.ple_val)
+            gated = gated_ngram_injection(
+                key_normed, query_normed, value, core.hc_count, _PLE_CLAMP_MIN
+            )
+            conv_in = self._grouped_norm(gated, S.ple_nc)
             core.spec_rollback.stage_ple_rows(window, conv_in)
-        # The short conv reads channel-major; a bare transpose is the certified form.
-        convolved = dilated_short_conv_paged(
-            x=torch.transpose(conv_in, 0, 1),
-            weight=S.ple_conv_w,
-            bias=None,
-            conv_states=conv_states,
-            query_start_loc=qsl,
-            cache_indices=si_all,
-            has_initial_state=carry_all,
-            dilation=core.ple_dilation,
-            silu_activation=True,
-            pad_slot_id=_PAD_SLOT_ID,
+            # The short conv reads channel-major; a bare transpose is the certified form.
+            convolved = dilated_short_conv_paged(
+                x=torch.transpose(conv_in, 0, 1),
+                weight=S.ple_conv_w,
+                bias=None,
+                conv_states=conv_states,
+                query_start_loc=qsl,
+                cache_indices=si_all,
+                has_initial_state=carry_all,
+                dilation=core.ple_dilation,
+                silu_activation=True,
+                pad_slot_id=_PAD_SLOT_ID,
+            )
+            hc = torch.add(hc, torch.add(gated, torch.transpose(convolved, 0, 1)))
+            return qwen4_exp_hc_inject_norm(hc, None, None, next_norm, core.eps, core.hc_count)
+        ngram = ple_ngram_embed(
+            input_ids,
+            ngram_pool,
+            si_all,
+            None,
+            qsl,
+            core.w["ple_table"],
+            S.ple_tscale,
+            S.ple_mult,
+            S.ple_vocab,
+            S.ple_offs,
+            core.eos_token_id,
+            gen_p,
         )
-        return torch.add(gated, torch.transpose(convolved, 0, 1))
+        return ple_gate_conv_inject_norm(
+            hc,
+            gemm(ngram, S.ple_key),
+            gemm(ngram, S.ple_val),
+            S.ple_nk_w,
+            S.ple_nq_w,
+            S.ple_nc_w,
+            S.ple_conv_w,
+            conv_states,
+            si_all,
+            qsl,
+            next_norm,
+            core.eps,
+            core.hc_count,
+            _PLE_CLAMP_MIN,
+            core.ple_dilation,
+            _PAD_SLOT_ID,
+            gen_p,
+        )
 
     # -------------------------------------------------------------- forward ---
 
@@ -4443,6 +5230,9 @@ class DecodeTarget:
         step = self.step_args(md)
         spec_metadata = kwargs.get("spec_metadata")
         mm = md.mamba_metadata
+        # The bf16 block projections of a graph-captured step run as PDL launches
+        # (`_decode_projection`); an eager step keeps cuBLAS.
+        gemm = _decode_projection if md.is_cuda_graph else cublas_mm
 
         # Three views of one `[3, 1, T]` buffer (see PrefillTarget.forward): `pos`,
         # contiguous `pos3`, and `coords`.
@@ -4473,7 +5263,7 @@ class DecodeTarget:
 
         # The batch's bookkeeping, built once; every sequence is a generation sequence.
         batch = md.num_seqs
-        # Host-int check (graph-safe); see PrefillTarget.forward.
+        # Host-int check (graph-safe); see PrefillTarget.prepare.
         assert num_tokens == md.num_tokens, (
             f"the engine handed {num_tokens} activation rows for a batch its "
             f"metadata describes as {md.num_tokens} tokens "
@@ -4497,7 +5287,7 @@ class DecodeTarget:
             "speculation off; the base path implements one query token per "
             "generation sequence"
         )
-        # `gen_p > 1` is load-bearing for verify (see PrefillTarget.forward).
+        # `gen_p > 1` is load-bearing for verify (see PrefillTarget.prepare).
         if spec_metadata is not None and batch > 0:
             declared_p = spec_metadata.runtime_draft_len + 1
             assert gen_p == declared_p, (
@@ -4529,12 +5319,19 @@ class DecodeTarget:
             [batch], dtype=mm.has_initial_states.dtype, device=mm.has_initial_states.device
         )
         # PLE segmentation vector: rebuilt from `seq_lens_cuda` when `gen_p > 1` (see
-        # PrefillTarget.forward).
+        # PrefillTarget.prepare).
         if gen_p == 1:
             ple_qsl = qsl_long
         else:
             ple_qsl = cu_seqlens_from_seq_lens(md.seq_lens_cuda[:batch], torch.int64)
-        ple_state = (core._bound.ple_state[0], core._bound.ple_state[1], si_all, ple_carry, ple_qsl)
+        ple_state = (
+            core._bound.ple_state[0],
+            core._bound.ple_state[1],
+            si_all,
+            ple_carry,
+            ple_qsl,
+            gen_p,
+        )
 
         # Dense/sparse decision once per forward, from a host-side metadata read: a
         # per-capture constant matching the engine's short/long decode graph families.
@@ -4556,7 +5353,7 @@ class DecodeTarget:
         )
 
         # Staging for the speculative rollback, as on the prefill target (see
-        # PrefillTarget.forward); every row here is a generation row.
+        # PrefillTarget.prepare); every row here is a generation row.
         stage = is_verify
         rollback = core.spec_rollback
         if rollback is not None:
@@ -4574,12 +5371,14 @@ class DecodeTarget:
                 tokens_per_block=md.tokens_per_block,
             )
 
-        # Scratch shared by all attention layers (each fully rewrites them).
+        # Scratch shared by all attention layers: thop_attention overwrites rows
+        # [:num_tokens] of `output` in place, and the packed buffers are fully
+        # rewritten every layer (the QKV one on the dense path only).
         qkv = torch.empty([num_tokens, core.qkv_width], dtype=dt, device=dev)
         index_scratch = torch.empty([num_tokens, core.index_scratch_width], dtype=dt, device=dev)
         attn_out = torch.empty([num_tokens, core.q_width], dtype=dt, device=dev)
         # The CuteDSL routed output, shared by all layers: each layer's unpermute rewrites
-        # every row, and the post-inject consumes it before the next layer's MoE starts.
+        # every row, and the next site's injection consumes it before the next layer's MoE.
         routed_out = (
             torch.empty([num_tokens, core.hidden], dtype=dt, device=dev)
             if core.trunk_moe_backend == "CUTEDSL"
@@ -4589,27 +5388,56 @@ class DecodeTarget:
         # The embedding repeated across the hc_count residual streams.
         hc_count = core.hc_count
         hc = torch.cat([h] * hc_count, -1)
-        for i, L in enumerate(self._layers):
+        layers, S = self._layers, self._stack
+        # Every hyper-connection site (`_hc_site`): the previous block's pending
+        # injection, this site's grouped norm and its mixer. The stack's first
+        # site has no pending injection; at the PLE layer it is applied alone
+        # (the PLE block reads the injected stream), and the PLE tail returns the
+        # stream with its output added plus this site's grouped norm of it, which
+        # the site's cuBLAS mixer starts from (a GEMV site normalizes inside its
+        # first launch and reads the stream alone). A MoE block's output is
+        # pending uncombined (`moe`): the next site's first kernel forms it,
+        # except before the PLE add, where the combine runs alone.
+        block_out = inject = moe = None
+        for i, L in enumerate(layers):
             if i == core.ple_layer:
-                hc = torch.add(hc, self._ple_block(hc, input_ids, ple_state, stage))
-            mixed, inject = qwen4_exp_gated_residual(
-                self._grouped_norm(hc, L.ahc_norm), L.ahc_down, L.ahc_up, L.ahc_inject, hc_count
+                if block_out is not None:
+                    if moe is not None:
+                        # `_moe_block` never folds the finalize before this layer.
+                        block_out = fused_sigmoid_gate_mul_add(block_out, *moe[:2])
+                    hc = qwen4_exp_post_inject(hc, block_out, inject)
+                    block_out = inject = moe = None
+                hc, normed = self._ple_block(hc, input_ids, ple_state, L.ahc_norm, stage, gemm)
+            else:
+                normed = None
+            hc, mixed, inject = self._hc_site(
+                hc,
+                block_out,
+                inject,
+                L.ahc_norm,
+                L.ahc_first,
+                L.ahc_up,
+                True,
+                normed=normed,
+                moe=moe,
             )
             if core.is_attn[i]:
                 block_out = self._attention_block(
-                    mixed, i, L, qkv, index_scratch, attn_out, qsa, step, stage
+                    mixed, i, L, qkv, index_scratch, attn_out, qsa, step, stage, gemm
                 )
             else:
-                block_out = self._gdn_block(mixed, i, L, gdn_state)
-            hc = qwen4_exp_post_inject(hc, block_out, inject)
-            mixed, inject = qwen4_exp_gated_residual(
-                self._grouped_norm(hc, L.mhc_norm), L.mhc_down, L.mhc_up, L.mhc_inject, hc_count
+                block_out = self._gdn_block(mixed, i, L, gdn_state, gemm, md.is_cuda_graph)
+            hc, mixed, inject, xq, xsf = self._hc_moe_site(
+                hc, block_out, inject, L.mhc_norm, L.mhc_first, L.mhc_up, L.moe_gscale
             )
-            hc = qwen4_exp_post_inject(hc, self._moe_block(mixed, L, dt, routed_out), inject)
-        # The stack-final mixer with no injection weight is the final norm.
-        S = self._stack
-        final, _ = qwen4_exp_gated_residual(
-            self._grouped_norm(hc, S.fhc_norm), S.fhc_down, S.fhc_up, None, hc_count
+            # The trtllm-gen runner's finalize folds into the next site's first kernel
+            # when that site takes the combine (every one but the PLE layer's).
+            fold = core.trunk_moe_backend == "TRTLLM" and i + 1 != core.ple_layer
+            block_out, moe = self._moe_block(mixed, xq, xsf, L, routed_out, gemm, fold=fold)
+        # The stack-final mixer with no injection weight: it returns the mix
+        # alone, and that mix *is* this checkpoint's final norm.
+        hc, final, _ = self._hc_site(
+            hc, block_out, inject, S.fhc_norm, S.fhc_first, S.fhc_up, False, moe=moe
         )
         if spec_metadata is None:
             return final
@@ -5511,6 +6339,33 @@ _MEDIA_KEYS = {
 }
 
 
+class _WidenedHead:
+    """`lm_head` whose bf16 logits come back as fp32 from `bf16_to_fp32` (one vectorized
+    kernel; torch's `.float()` is an unvectorized copy at under half the bandwidth), so the
+    logits processor's own `.float()` returns them as they are. The same values bit for
+    bit."""
+
+    def __init__(self, lm_head) -> None:
+        self.lm_head = lm_head
+
+    def __call__(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        logits = self.lm_head(hidden_states)
+        if logits.dtype == torch.bfloat16 and logits.is_contiguous():
+            return bf16_to_fp32(logits)
+        return logits
+
+
+class _WideningLogitsProcessor(LogitsProcessor):
+    """The shell's logits processor (its row gather, its fp32 logits) over `_WidenedHead`."""
+
+    def forward(
+        self, hidden_states, lm_head, attn_metadata, return_context_logits: bool = False
+    ) -> torch.Tensor:
+        return super().forward(
+            hidden_states, _WidenedHead(lm_head), attn_metadata, return_context_logits
+        )
+
+
 class ModelingV2Qwen38FlashNextNvfp4Sm103Tp1(
     DecoderModelForCausalLM[Qwen4ExpTp1ModelingV2, PretrainedConfig]
 ):
@@ -5552,6 +6407,8 @@ class ModelingV2Qwen38FlashNextNvfp4Sm103Tp1(
             hidden_size=text.hidden_size,
             vocab_size=text.vocab_size,
         )
+        # The logits' bf16 -> fp32 cast as one vectorized kernel (the draft head shares it).
+        self.logits_processor = _WideningLogitsProcessor()
         # Media placeholder ids for the executor; built lazily (`__init__` runs under
         # meta init).
         self._mm_token_ids_value = (self.model.image_token_id, self.model.video_token_id)
