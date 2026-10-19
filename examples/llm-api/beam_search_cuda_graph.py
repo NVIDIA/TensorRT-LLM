@@ -165,14 +165,14 @@ def main() -> None:
     schedules = [[4] * 8] if args.suite == "small" else [[20, 300, 500], [20] * 6 + [300, 500]]
     width = max(max(schedule) for schedule in schedules)
     config = BeamSearchCudaGraphConfig(
-        profiles=[
+        batch_sizes=[1, 2],
+        capture_configs=[
             dict(
-                batch_sizes=[1, 2],
-                beam_widths=schedule,
-                max_tokens=len(schedule),
+                beam_width_array=[schedule[0]] if len(set(schedule)) == 1 else schedule,
+                max_capture_tokens=len(schedule),
             )
             for schedule in schedules
-        ]
+        ],
     )
     kwargs = dict(
         model=args.model,
@@ -238,6 +238,7 @@ def main() -> None:
             [
                 ("uncovered_batch3", 3, schedules[0], {}, False),
                 ("uncovered_penalty", 1, schedules[0], dict(length_penalty=0.8), False),
+                ("uncovered_steps", 1, schedules[0] + [schedules[0][-1]] * 2, {}, False),
                 ("eos_enabled", 1, schedules[0], dict(ignore_eos=False), True),
             ]
         )
@@ -248,7 +249,7 @@ def main() -> None:
                 n=schedule[-1],
                 best_of=schedule[-1],
                 use_beam_search=True,
-                beam_width_array=schedule,
+                beam_width_array=schedules[0] if name == "uncovered_steps" else schedule,
                 max_tokens=len(schedule),
                 ignore_eos=extra.get("ignore_eos", True),
                 detokenize=False,
@@ -273,6 +274,11 @@ def main() -> None:
                         step["graph"] == (step["batch"] in (1, 2)) for step in audit["steps"]
                     ), (name, audit)
                     assert any(not step["graph"] for step in audit["steps"]), (name, audit)
+                elif name == "uncovered_steps":
+                    assert len(audit["steps"]) == len(schedule), (name, audit)
+                    assert [step["graph"] for step in audit["steps"]] == [
+                        index < len(schedules[0]) for index in range(len(schedule))
+                    ], (name, audit)
                 else:
                     assert all(step["graph"] == covered for step in audit["steps"]), (name, audit)
             # The timed loop has no observer, clones, state comparisons or extra CBA calls.

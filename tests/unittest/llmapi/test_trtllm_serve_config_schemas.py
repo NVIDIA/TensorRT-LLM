@@ -87,18 +87,39 @@ def schemas(tmp_path_factory: pytest.TempPathFactory) -> dict[str, dict]:
             generator.SERVE_SCHEMA,
             {
                 "beam_search_cuda_graph_config": {
-                    "profiles": [{"batch_sizes": [1, 2], "beam_widths": [4], "max_tokens": 8}]
+                    "capture_configs": [{"beam_width_array": [4], "max_capture_tokens": 8}]
+                }
+            },
+            True,
+        ),
+        (
+            generator.SERVE_SCHEMA,
+            {
+                "beam_search_cuda_graph_config": {
+                    "capture_configs": [{"beam_width_array": [4], "max_capture_tokens": 8}],
+                    "max_batch_size": 16,
+                }
+            },
+            True,
+        ),
+        (
+            generator.SERVE_SCHEMA,
+            {
+                "beam_search_cuda_graph_config": {
+                    "capture_configs": [{"beam_width_array": [4], "max_capture_tokens": 8}],
+                    "batch_sizes": [1, 2],
                 }
             },
             True,
         ),
         (generator.SERVE_SCHEMA, {"beam_search_cuda_graph_config": {}}, False),
-        (generator.SERVE_SCHEMA, {"beam_search_cuda_graph_config": {"profiles": []}}, False),
+        (generator.SERVE_SCHEMA, {"beam_search_cuda_graph_config": {"capture_configs": []}}, False),
         (
             generator.SERVE_SCHEMA,
             {
                 "beam_search_cuda_graph_config": {
-                    "profiles": [{"batch_sizes": [0], "beam_widths": [4], "max_tokens": 8}]
+                    "capture_configs": [{"beam_width_array": [4], "max_capture_tokens": 8}],
+                    "batch_sizes": [0],
                 }
             },
             False,
@@ -107,7 +128,8 @@ def schemas(tmp_path_factory: pytest.TempPathFactory) -> dict[str, dict]:
             generator.SERVE_SCHEMA,
             {
                 "beam_search_cuda_graph_config": {
-                    "profiles": [{"batch_sizes": [1], "beam_widths": [4], "max_tokens": 0}]
+                    "capture_configs": [{"beam_width_array": [4], "max_capture_tokens": 8}],
+                    "batch_sizes": [],
                 }
             },
             False,
@@ -116,7 +138,17 @@ def schemas(tmp_path_factory: pytest.TempPathFactory) -> dict[str, dict]:
             generator.SERVE_SCHEMA,
             {
                 "beam_search_cuda_graph_config": {
-                    "profiles": [{"batch_sizes": [1], "beam_widths": [4], "max_tokens": 8}],
+                    "capture_configs": [{"beam_width_array": [4], "max_capture_tokens": 8}],
+                    "max_batch_size": -1,
+                }
+            },
+            False,
+        ),
+        (
+            generator.SERVE_SCHEMA,
+            {
+                "beam_search_cuda_graph_config": {
+                    "capture_configs": [{"beam_width_array": [4], "max_capture_tokens": 8}],
                     "max_graphs": 0,
                 }
             },
@@ -126,9 +158,27 @@ def schemas(tmp_path_factory: pytest.TempPathFactory) -> dict[str, dict]:
             generator.SERVE_SCHEMA,
             {
                 "beam_search_cuda_graph_config": {
-                    "profiles": [
-                        {"batch_sizes": [1], "beam_widths": [4], "max_tokens": 8, "typo": True}
+                    "capture_configs": [{"beam_width_array": [4], "max_capture_tokens": 0}]
+                }
+            },
+            False,
+        ),
+        (
+            generator.SERVE_SCHEMA,
+            {
+                "beam_search_cuda_graph_config": {
+                    "capture_configs": [
+                        {"beam_width_array": [4], "max_capture_tokens": 8, "typo": True}
                     ]
+                }
+            },
+            False,
+        ),
+        (
+            generator.SERVE_SCHEMA,
+            {
+                "beam_search_cuda_graph_config": {
+                    "profiles": [{"batch_sizes": [1], "beam_widths": [4], "max_tokens": 8}]
                 }
             },
             False,

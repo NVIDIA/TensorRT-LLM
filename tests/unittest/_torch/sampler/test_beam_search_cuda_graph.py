@@ -619,6 +619,35 @@ def test_real_sampler_startup_restores_state_and_dispatches_handler(monkeypatch)
         sampler.release_cuda_graphs()
 
 
+def test_service_capture_config_reaches_native_startup() -> None:
+    from tensorrt_llm._torch.pyexecutor._util import create_torch_sampler_args
+    from tensorrt_llm.llmapi import BeamSearchCudaGraphConfig
+
+    args = create_torch_sampler_args(
+        max_seq_len=16,
+        speculative_config=None,
+        max_beam_width=4,
+        disable_overlap_scheduler=False,
+        enable_async_worker=False,
+        enable_speculative_beam_history_d2h=False,
+        max_num_sequences=4,
+        beam_search_cuda_graph_config=BeamSearchCudaGraphConfig(
+            max_batch_size=2, capture_configs=[dict(beam_width_array=[2, 4], max_capture_tokens=3)]
+        ),
+    )
+    sampler = TorchSampler(args)
+    ex = executor(sampler)
+    try:
+        executor_warmup()(ex)
+        runner = sampler._beam_search._graph_runner
+        assert runner is not None
+        assert runner.capture_count == 6 and runner.capture_failures == 0
+        assert not sampler.needs_cuda_graph_warmup
+    finally:
+        ex._beam_graph_capture_owner.close()
+        sampler.release_cuda_graphs()
+
+
 @pytest.mark.parametrize(
     "guard",
     [

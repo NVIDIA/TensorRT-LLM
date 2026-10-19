@@ -115,24 +115,14 @@
       "path": "batch_wait_timeout_ms"
     },
     {
-      "capture_policy": "int",
+      "capture_policy": "list[int]|none",
       "kind": "value",
-      "path": "beam_search_cuda_graph_config.max_graphs"
-    },
-    {
-      "capture_policy": "int",
-      "kind": "value",
-      "path": "beam_search_cuda_graph_config.max_static_input_bytes"
+      "path": "beam_search_cuda_graph_config.batch_sizes"
     },
     {
       "capture_policy": "list[list[int]]",
       "kind": "value",
-      "path": "beam_search_cuda_graph_config.profiles.batch_sizes"
-    },
-    {
-      "capture_policy": "list[list[int]]",
-      "kind": "value",
-      "path": "beam_search_cuda_graph_config.profiles.beam_widths"
+      "path": "beam_search_cuda_graph_config.capture_configs.beam_width_array"
     },
     {
       "allowed_values": [
@@ -142,12 +132,27 @@
       ],
       "capture_policy": "list[literal]",
       "kind": "categorical",
-      "path": "beam_search_cuda_graph_config.profiles.early_stopping"
+      "path": "beam_search_cuda_graph_config.capture_configs.early_stopping"
     },
     {
       "capture_policy": "list[int]",
       "kind": "value",
-      "path": "beam_search_cuda_graph_config.profiles.max_tokens"
+      "path": "beam_search_cuda_graph_config.capture_configs.max_capture_tokens"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "beam_search_cuda_graph_config.max_batch_size"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "beam_search_cuda_graph_config.max_graphs"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "beam_search_cuda_graph_config.max_static_input_bytes"
     },
     {
       "capture_policy": "bool",

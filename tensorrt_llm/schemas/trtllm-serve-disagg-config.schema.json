@@ -340,13 +340,86 @@
       "title": "AutoDecodingConfig",
       "type": "object"
     },
+    "BeamSearchCudaGraphCaptureConfig": {
+      "additionalProperties": false,
+      "description": "Beam schedule and generation steps to prepare at executor startup.",
+      "properties": {
+        "beam_width_array": {
+          "description": "Non-decreasing output beam widths for successive generated tokens. Steps beyond the array repeat its last width, as in SamplingParams.beam_width_array. A single width describes fixed-width beam search.",
+          "items": {
+            "exclusiveMinimum": 0,
+            "type": "integer"
+          },
+          "minItems": 1,
+          "title": "Beam Width Array",
+          "type": "array"
+        },
+        "early_stopping": {
+          "default": 1,
+          "description": "Beam early-stopping mode to prepare: 0 (false), 1 (true), or 2 (never). Other request modes execute eagerly unless separately prepared.",
+          "enum": [
+            0,
+            1,
+            2
+          ],
+          "title": "Early Stopping",
+          "type": "integer"
+        },
+        "max_capture_tokens": {
+          "description": "Number of generated-token steps to prepare. This does not limit request max_tokens; uncovered steps execute eagerly.",
+          "exclusiveMinimum": 0,
+          "title": "Max Capture Tokens",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "beam_width_array",
+        "max_capture_tokens"
+      ],
+      "title": "BeamSearchCudaGraphCaptureConfig",
+      "type": "object"
+    },
     "BeamSearchCudaGraphConfig": {
       "additionalProperties": false,
-      "description": "Opt-in CUDA graphs for single-GPU synchronous beam sampling.",
+      "description": "Opt-in startup capture ranges for single-GPU synchronous beam sampling.",
       "properties": {
+        "batch_sizes": {
+          "anyOf": [
+            {
+              "items": {
+                "exclusiveMinimum": 0,
+                "type": "integer"
+              },
+              "minItems": 1,
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Exact request-group sizes to prepare, excluding beam rows. No padding is applied. If omitted, sizes are generated from max_batch_size using the decode CUDA graph policy with padding disabled.",
+          "title": "Batch Sizes"
+        },
+        "capture_configs": {
+          "description": "Beam schedules to prepare in declaration order, sharing the batch sizes and resource limits below. Uncovered shapes and parameters execute eagerly; requests never trigger capture.",
+          "items": {
+            "$ref": "#/$defs/BeamSearchCudaGraphCaptureConfig"
+          },
+          "minItems": 1,
+          "title": "Capture Configs",
+          "type": "array"
+        },
+        "max_batch_size": {
+          "default": 0,
+          "description": "Maximum request-group size to prepare. When batch_sizes is given, 0 infers its maximum; an explicit value must equal that maximum. If both are omitted, the capture limit is min(128, the executor max_batch_size). This does not limit the service batch capacity.",
+          "minimum": 0,
+          "title": "Max Batch Size",
+          "type": "integer"
+        },
         "max_graphs": {
           "default": 192,
-          "description": "Maximum number of prepared sampling graphs. Profiles are prepared in declaration order until this limit is reached.",
+          "description": "Maximum number of prepared sampling graphs. Capture configurations are prepared in declaration order until this limit is reached.",
           "exclusiveMinimum": 0,
           "title": "Max Graphs",
           "type": "integer"
@@ -357,71 +430,12 @@
           "exclusiveMinimum": 0,
           "title": "Max Static Input Bytes",
           "type": "integer"
-        },
-        "profiles": {
-          "description": "Explicit startup profiles. Uncovered shapes and parameter combinations execute eagerly; requests never trigger capture.",
-          "items": {
-            "$ref": "#/$defs/BeamSearchCudaGraphProfile"
-          },
-          "minItems": 1,
-          "title": "Profiles",
-          "type": "array"
         }
       },
       "required": [
-        "profiles"
+        "capture_configs"
       ],
       "title": "BeamSearchCudaGraphConfig",
-      "type": "object"
-    },
-    "BeamSearchCudaGraphProfile": {
-      "additionalProperties": false,
-      "description": "Beam sampling shapes to prepare before the executor worker starts.",
-      "properties": {
-        "batch_sizes": {
-          "description": "Exact request batch sizes, excluding beam rows. No batch padding is applied.",
-          "items": {
-            "exclusiveMinimum": 0,
-            "type": "integer"
-          },
-          "minItems": 1,
-          "title": "Batch Sizes",
-          "type": "array"
-        },
-        "beam_widths": {
-          "description": "Output beam widths for successive generated tokens. A single width is repeated for max_tokens; otherwise provide exactly max_tokens widths.",
-          "items": {
-            "exclusiveMinimum": 0,
-            "type": "integer"
-          },
-          "minItems": 1,
-          "title": "Beam Widths",
-          "type": "array"
-        },
-        "early_stopping": {
-          "default": 1,
-          "description": "Beam early-stopping mode: 0 (false), 1 (true), or 2 (never).",
-          "enum": [
-            0,
-            1,
-            2
-          ],
-          "title": "Early Stopping",
-          "type": "integer"
-        },
-        "max_tokens": {
-          "description": "Number of generated-token steps to prepare. Longer requests use eager sampling for uncovered steps.",
-          "exclusiveMinimum": 0,
-          "title": "Max Tokens",
-          "type": "integer"
-        }
-      },
-      "required": [
-        "batch_sizes",
-        "beam_widths",
-        "max_tokens"
-      ],
-      "title": "BeamSearchCudaGraphProfile",
       "type": "object"
     },
     "BlockReuseConfig": {

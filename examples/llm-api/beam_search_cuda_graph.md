@@ -19,6 +19,31 @@ beam capture in the new executor.
 
 ## Configuration
 
+The service declares capture ranges at startup. Requests retain their own
+sampling parameters and generation limits. Providing
+`beam_search_cuda_graph_config` opts in; omitting it or setting it to `None`
+keeps beam sampling eager.
+
+```yaml
+max_batch_size: 64
+max_beam_width: 500
+max_seq_len: 1024
+beam_search_cuda_graph_config:
+  max_batch_size: 16
+  capture_configs:
+    - beam_width_array: [4]
+      max_capture_tokens: 8
+    - beam_width_array: [20, 300, 500]
+      max_capture_tokens: 3
+```
+
+Pass this YAML with `trtllm-serve --config`. The service still admits batches
+up to 64; beam capture considers request groups up to 16. Both schedules share
+the batch sizes and resource budgets. Preparation is bounded by those budgets,
+so declaring a range does not guarantee every entry will be captured.
+
+The same nested configuration is accepted by the Python API:
+
 ```python
 from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm.llmapi import BeamSearchCudaGraphConfig
@@ -29,45 +54,46 @@ llm = LLM(
     max_beam_width=4,
     max_seq_len=1024,
     beam_search_cuda_graph_config=BeamSearchCudaGraphConfig(
-        profiles=[
-            {"batch_sizes": [1, 2], "beam_widths": [4], "max_tokens": 8},
+        capture_configs=[
+            {"beam_width_array": [4], "max_capture_tokens": 8},
         ],
-        max_graphs=192,
-        max_static_input_bytes=512 * 1024 * 1024,
     ),
 )
 outputs = llm.generate(
     ["The capital of France is"],
-    SamplingParams(n=4, best_of=4, use_beam_search=True, max_tokens=8),
+    SamplingParams(n=4, best_of=4, use_beam_search=True, max_tokens=12),
 )
 llm.shutdown()
 ```
 
-The same nested configuration is accepted by `trtllm-serve --config`:
+This prepares the first eight steps, subject to resource limits. The request
+can still generate up to twelve tokens; uncovered steps execute eagerly.
 
-```yaml
-max_batch_size: 4
-max_beam_width: 4
-max_seq_len: 1024
-beam_search_cuda_graph_config:
-  profiles:
-    - batch_sizes: [1, 2]
-      beam_widths: [4]
-      max_tokens: 8
-  max_graphs: 192
-  max_static_input_bytes: 536870912
-```
-
-- `batch_sizes` are exact counts of requests in a sampling group, excluding
-  beam rows. There is no beam-sampling batch padding.
-- `beam_widths` describes output widths for successive generated tokens. One
-  width repeats for `max_tokens` steps. A variable schedule must provide exactly
-  `max_tokens` widths, for example `[20, 300, 500]` with `max_tokens: 3` and
-  `max_beam_width: 500`.
-- `early_stopping` is `0` (false), `1` (true, the default), or `2` (never).
+- `batch_sizes` optionally lists exact counts of requests in a sampling group,
+  excluding beam rows. Sizes are sorted and deduplicated. There is no
+  beam-sampling batch padding, and these sizes are independent of the
+  model-forward `cuda_graph_config`.
+- `max_batch_size` optionally sets the beam capture limit. With explicit
+  `batch_sizes`, it defaults to their maximum; if both are specified, they
+  must agree. Without a list, sizes use the existing decode CUDA graph policy
+  with padding disabled: dense sizes through 32, then sparse sizes, always
+  including the chosen maximum. When both options are omitted, the limit is
+  `min(128, executor max_batch_size)`. Explicit sizes or limits exceeding the
+  executor capacity are rejected.
+- Each `capture_configs` entry supplies a non-decreasing `beam_width_array`.
+  A single width describes fixed-width beam search. As with the request
+  parameter of the same name, steps past the array repeat its last width.
+  For example, `[2, 4]` with `max_capture_tokens: 4` prepares `[2, 4, 4, 4]`.
+  A longer array is truncated for capture; all its widths must still fit
+  `max_beam_width`.
+- `max_capture_tokens` is the number of generation steps to prepare for that
+  schedule, not a request generation limit. It must be smaller than the
+  executor's `max_seq_len`. A request's `max_tokens` remains independent.
+- `early_stopping` selects `0` (false), `1` (true, the default), or `2` (never).
+  To prepare another mode, add a capture configuration for it.
 - Requests without logprobs and with raw logprobs use the same graphs.
   Processed logprobs are not prepared and take the existing eager path.
-- The initial profiles cover zero length/diversity penalties. Nonzero
+- Capture configurations cover zero length/diversity penalties. Nonzero
   per-request penalties take the eager path. Temperature scaling remains
   outside the captured region.
 
@@ -80,8 +106,8 @@ state remain inputs to the native algorithm.
 
 ## Memory and failures
 
-`max_graphs` bounds prepared entries. Profiles are considered in declaration
-order. `max_static_input_bytes` bounds persistent logits staging storage, shared
+`max_graphs` (default 192) bounds prepared entries. Capture configurations
+are considered in declaration order, with batch sizes in ascending order. `max_static_input_bytes` (default 512 MiB) bounds persistent logits staging storage, shared
 where shapes permit. It is **not** a total GPU-memory limit: graph scratch,
 persistent sampler state, temporary warmup inputs/state backups and a private
 1 MiB radix workspace also consume memory. Leave room for those allocations
