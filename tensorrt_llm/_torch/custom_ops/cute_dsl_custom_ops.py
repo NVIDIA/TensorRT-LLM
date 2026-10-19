@@ -11925,7 +11925,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         BlackwellMultiHeadLatentAttentionForwardFP8
     from ..attention.kernels.blackwell.mla.mla_decode_fp16 import \
         BlackwellMultiHeadLatentAttentionForwardFP16
-    from ..cute_dsl_kernels.blackwell.attention.mla.mla_helpers import \
+    from ..attention.kernels.blackwell.mla.mla_helpers import \
         MAX_SPLITS as MLA_DECODE_MAX_SPLITS
 
     class CuteDSLNVMlaDecodeBlackwellRunner(TunableRunner):
