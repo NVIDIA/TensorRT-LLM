@@ -14,8 +14,10 @@
 # limitations under the License.
 import asyncio
 import json
+import threading
 import time
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
 import httpx
@@ -28,6 +30,8 @@ from tensorrt_llm.serve.openai_server import OpenAIServer
 # The CPU-* CI stages run pytest with -m 'cpu_only'; without the marker every
 # test here is deselected.
 pytestmark = pytest.mark.cpu_only
+
+_METRICS_STATS_THREAD = "test_metrics_stats"
 
 
 class _FakeGenerator:
@@ -49,10 +53,12 @@ class _FakeGenerator:
         self._stats_delay = stats_delay
         self._stats_error = stats_error
         self.stats_timeouts = []
+        self.stats_threads = []
 
     def get_stats(self, timeout: float | None) -> list[dict]:
         # Blocks like the executor's stats RPC, which waits for stats to arrive.
         self.stats_timeouts.append(timeout)
+        self.stats_threads.append(threading.current_thread().name)
         time.sleep(self._stats_delay)
         if self._stats_error is not None:
             raise self._stats_error
@@ -101,6 +107,9 @@ def _make_server(
         server.generator.args.iter_stats_max_iterations
     )
     server._iteration_stats_buffer = deque(maxlen=max_buffer_size) if with_stats_buffer else None
+    # The loop's default executor; a test that checks the dedicated metrics
+    # thread installs (and shuts down) its own.
+    server._metrics_stats_executor = None
     return server
 
 
@@ -169,6 +178,27 @@ async def test_metrics_endpoint_does_not_block_the_event_loop():
     assert _response_content(response) == stats
     # About 50 ticks fit in the 0.5 s wait; none would if it held the loop.
     assert ticks >= 10
+
+
+@pytest.mark.asyncio
+async def test_metrics_stats_reads_stay_off_the_default_executor():
+    """Waiting scrapes queue on the server's metrics thread.
+
+    On the default executor they would hold threads that request handling
+    also needs, one per concurrent scrape.
+    """
+    server = _make_server([[{"iter": 8}], [{"iter": 9}]], with_stats_buffer=False, stats_delay=0.1)
+    server._metrics_stats_executor = ThreadPoolExecutor(
+        max_workers=1, thread_name_prefix=_METRICS_STATS_THREAD
+    )
+    try:
+        responses = await asyncio.gather(server.get_iteration_stats(), server.get_iteration_stats())
+    finally:
+        server._metrics_stats_executor.shutdown(wait=True)
+
+    assert sorted(_response_content(r)[0]["iter"] for r in responses) == [8, 9]
+    assert len(server.generator.stats_threads) == 2
+    assert all(name.startswith(_METRICS_STATS_THREAD) for name in server.generator.stats_threads)
 
 
 @pytest.mark.asyncio

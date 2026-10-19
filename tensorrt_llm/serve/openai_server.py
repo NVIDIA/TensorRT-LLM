@@ -773,6 +773,14 @@ class OpenAIServer(_VideoRoutesMixin):
             thread_name_prefix="trtllm_media_load",
         )
         BaseMediaIO.set_executor(self._media_load_executor)
+        # /metrics reads iteration stats with a blocking call that waits up to
+        # 2 s. One dedicated thread keeps those waits off the default executor,
+        # which request handling also uses, however many scrapes arrive at
+        # once; concurrent scrapes queue on this thread instead.
+        self._metrics_stats_executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="trtllm_metrics_stats",
+        )
 
         model_dir = Path(model)
         if model_dir.exists() and model_dir.is_dir():
@@ -1835,10 +1843,11 @@ class OpenAIServer(_VideoRoutesMixin):
 
         # Legacy path: no background collector -> read the queue directly.
         # The read waits up to 2 s for stats inside a blocking executor call,
-        # so it runs in a worker thread; on the event loop it would stall every
-        # response being streamed for as long as it waits.
+        # so it runs on the metrics thread; on the event loop it would stall
+        # every response being streamed for as long as it waits.
         try:
-            stats = await asyncio.to_thread(self.generator.get_stats, 2)
+            stats = await asyncio.get_running_loop().run_in_executor(
+                self._metrics_stats_executor, self.generator.get_stats, 2)
         except RPCError as e:
             # The executor is unreachable, e.g. while it shuts down.
             logger.debug(f"Failed to fetch iteration stats: {e}")
