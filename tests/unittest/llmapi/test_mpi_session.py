@@ -920,13 +920,14 @@ def test_stop_request_reaches_server_still_waiting_for_workers(
         engine = _pair_client(addr, hmac_key)
         engine.put(RemoteTask(print, (), {}))
         engine.close()
-        # The workers finish well after the first stop request was sent.
-        threading.Timer(3.0, worker_future.set_result, args=(None, )).start()
-        start = time.monotonic()
-        assert stop_server_main(ack_timeout=0.5, max_attempts=40)
-        assert time.monotonic() - start < 3.0
+        # The worker keeps running until the stop client has its answer.
+        assert stop_server_main(ack_timeout=0.5, max_attempts=20)
+        assert not stopped.is_set()
+        worker_future.set_result(None)
         assert stopped.wait(10)
     finally:
+        if not worker_future.done():
+            worker_future.set_result(None)
         server_thread.join(10)
         server.queue.close()
 
