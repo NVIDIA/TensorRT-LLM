@@ -439,9 +439,17 @@ def test_mixed_precision_public_options():
     config = KvCacheConfig(enable_mix_precision="nvfp4", dtype="fp8", high_low_pool_ratio=0.25)
     assert config.first_n == config.last_n == 256
     assert config.dtype == "fp8"
-    for invalid in ({"enable_mix_precision": "int4"}, {"first_n": -1}, {"high_low_pool_ratio": 0}):
+    for invalid in (
+        {"enable_mix_precision": "int4"},
+        {"first_n": -1},
+        {"high_low_pool_ratio": 0},
+        {"enable_mix_precision": "nvfp4", "first_n": 0, "last_n": 0},
+    ):
         with pytest.raises(ValidationError):
             KvCacheConfig(**invalid)
+    for first_n, last_n in ((0, 1), (1, 0)):
+        KvCacheConfig(enable_mix_precision="nvfp4", first_n=first_n, last_n=last_n)
+    KvCacheConfig(first_n=0, last_n=0)
 
 
 @pytest.mark.parametrize(

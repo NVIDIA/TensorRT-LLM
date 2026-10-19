@@ -5123,6 +5123,15 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
             '"nvfp4", or valid torch.dtype string')
 
     @model_validator(mode='after')
+    def validate_mixed_precision(self) -> 'KvCacheConfig':
+        if (self.enable_mix_precision is not None
+                and self.first_n == self.last_n == 0):
+            raise ValueError(
+                "Mixed-precision KV requires first_n or last_n to be greater than zero."
+            )
+        return self
+
+    @model_validator(mode='after')
     def reject_fp8_ds_mla_pool_rebalance(self) -> 'KvCacheConfig':
         """Reject resizing while packed sparse-MLA pool views are fixed."""
         if self.dtype == "fp8_ds_mla" and self.enable_kv_pool_rebalance:
