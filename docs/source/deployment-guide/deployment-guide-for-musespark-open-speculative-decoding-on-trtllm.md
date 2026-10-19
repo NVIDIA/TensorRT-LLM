@@ -16,7 +16,8 @@ edits, tool-call loops) and costs a verification of `1 + max_draft_len` position
 - The MuseSparkOpen NVFP4 checkpoint and its tokenizer (`custom_tokenizer: musespark_open`).
 - A build containing the speculative-decoding fixes for this model: the FlashInfer one-engine gate, the draft-KV-cache
   rule for SA, the decoder admission (`assert_supported_spec_config`) and the guided-decoding rollback
-  (`CapturableGuidedDecoder.rollback_rejected_batch`).
+  (`CapturableGuidedDecoder.rollback_rejected_batch`). The preview container pinned in the main guide's
+  [Run Docker Container](deployment-guide-for-musespark-open-on-trtllm.md#run-docker-container) section contains all of these.
 - 4 GPUs (one tray). The tests below assume `LLM_MODELS_ROOT`-style access to the checkpoint through `MUSESPARK_REFERENCE_CKPT`.
 
 ## Recipe
