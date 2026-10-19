@@ -110,7 +110,8 @@ def _make_param(item_ids: list[int], lengths: list[int]) -> MultimodalParams:
                 "image_sizes": [[1, 1] for _ in item_ids],
             },
             MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
-                [("image", index) for index in range(len(lengths))],
+                item_refs=[("image", i) for i in range(len(item_ids))],
+                encoder_token_lengths=lengths,
                 output_embedding_lengths=lengths,
             ),
         }
