@@ -675,6 +675,12 @@ def _create_py_executor(
     enable_sleep = sleep_config is not None
 
     cache_transceiver_config = llm_args.cache_transceiver_config
+    if mapping.has_cp_helix(
+    ) and not is_disagg_enabled(cache_transceiver_config):
+        raise NotImplementedError(
+            "Helix context parallelism is supported only on disaggregated "
+            "generation servers; aggregated serving with Helix is not "
+            "supported yet.")
 
     has_spec_drafter = False
     if spec_config is not None:

@@ -369,6 +369,53 @@ def test_scheduler_allocation_failure_raises_under_helix() -> None:
         )
 
 
+def _context_resize_mgr(cp_rank: int, cp_size: int, resizes: list) -> SimpleNamespace:
+    kv = SimpleNamespace(capacity=0, resize=lambda cap: resizes.append(cap) or True)
+    return SimpleNamespace(
+        _has_cp_helix=True,
+        _helix_cp_rank=cp_rank,
+        _helix_cp_size=cp_size,
+        kv_cache_map={7: kv},
+        num_extra_kv_tokens=0,
+        _connector_reservations_enabled=lambda: False,
+        _fill_fresh_kv_pages=lambda req_id: None,
+        _log_window_crossing=lambda *args: None,
+    )
+
+
+def _context_req(prompt_len: int, total_input_len_cp: int) -> SimpleNamespace:
+    return SimpleNamespace(
+        py_request_id=7,
+        is_disagg_generation_init_state=False,
+        is_dummy_request=False,
+        prompt_len=prompt_len,
+        total_input_len_cp=total_input_len_cp,
+        context_current_position=64,
+        is_first_context_chunk=False,
+    )
+
+
+def test_resize_context_allows_full_prompt_helix_request() -> None:
+    """An agg helix request holds the full prompt on every rank, so its
+    context target is already in global ledger tokens and is rank-invariant."""
+    cp_size = 4
+    resizes = []
+    for r in range(cp_size):
+        req = _context_req(prompt_len=200, total_input_len_cp=200)
+        assert KVCacheManagerV2.resize_context(
+            _context_resize_mgr(r, cp_size, resizes), req, num_tokens=32
+        )
+    assert resizes == [64 + 32] * cp_size
+
+
+def test_resize_context_rejects_sliced_helix_request() -> None:
+    """A disagg helix request holds only this rank's slice of the prompt; a
+    rank-local target would under-size the global ledger."""
+    req = _context_req(prompt_len=50, total_input_len_cp=200)
+    with pytest.raises(ValueError, match="needs the full prompt"):
+        KVCacheManagerV2.resize_context(_context_resize_mgr(0, 4, []), req, num_tokens=32)
+
+
 def test_dummy_frozen_fields_sum_invariant() -> None:
     """The frozen dummy fiction (last rank active, shared synthetic global
     length) keeps the same books as real requests: per-rank lengths sum to
