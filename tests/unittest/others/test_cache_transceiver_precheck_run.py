@@ -318,6 +318,24 @@ def test_recorder_reports_a_write_failure_then_recovers(tmp_path, capfd):
     assert [case["peer"] for case in doc["cases"]] == ["ctx_0", "ctx_1"]
 
 
+def test_recorder_writes_the_status_line_before_the_json(tmp_path, monkeypatch):
+    """The gate reads only the .status line, so a failed .json write must not hold it back."""
+    real_write = rp.atomic_write_shared_file
+
+    def write_all_but_json(path, *args, **kwargs):
+        if path.endswith(".json"):
+            raise OSError(5, "Input/output error", path)
+        real_write(path, *args, **kwargs)
+
+    monkeypatch.setattr(rp, "atomic_write_shared_file", write_all_but_json)
+    rec = rp.StatusRecorder(str(tmp_path), "gen", 0, is_leader=True)
+    rec.record("ctx_0", 1024, "MISMATCH", "pair=13 layer=0")
+    status = (tmp_path / "status" / "gen_0.status").read_text()
+    assert status.startswith(
+        "FAIL gen_0: 1 case(s) failed; first: peer=ctx_0 req_len=1024 MISMATCH"
+    )
+
+
 # --------------------------------------------------------------------------- #
 # Bandwidth CSV parsing
 # --------------------------------------------------------------------------- #
@@ -1241,8 +1259,9 @@ def test_hard_abort_unhandled_records_the_error_then_aborts(tmp_path, monkeypatc
         )
         assert doc["overall"] == "FAIL"
     if scenario == "non_leader":
-        # Neither a verdict nor the abort flag: only the leader writes.
-        assert os.listdir(work) == []
+        # No verdict (only the leader writes one), but peers still fail fast.
+        assert os.listdir(work) == ["precheck.abort"]
+        assert rp.abort_flag_reason(work) == f"ctx_2 r3 UNHANDLED_ERROR: {detail}"
     # Only a non-leader waits, in case the leader failed too and is still writing its verdict.
     assert slept == ([rp.ABORT_COORDINATION_TIMEOUT_S] if scenario == "non_leader" else [])
 
