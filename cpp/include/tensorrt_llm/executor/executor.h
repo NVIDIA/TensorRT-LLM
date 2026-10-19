@@ -766,20 +766,6 @@ struct Result
     /// @brief The log probabilities for each generated token. Size [beamSize, outputLen]
     std::optional<std::vector<VecLogProbs>> logProbs;
 
-    /// @brief The context logits. Size [promptLen, vocabSizePadded]
-    std::optional<Tensor> contextLogits;
-
-    /// @brief The generation logits. Size [beamSize, maxTokens, vocabSizePadded] (non-streaming)
-    /// or [maxTokens, beamSize, vocabSizePadded] (streaming and allGeneratedTokens)
-    /// or [1, beamSize, vocabSizePadded] (streaming and non-allGeneratedTokens)
-    std::optional<Tensor> generationLogits;
-
-    /// @brief Logits information for direct transfer when using fast logits
-    std::optional<SpeculativeDecodingFastLogitsInfo> specDecFastLogitsInfo;
-
-    /// @brief The encoder output. Size [encoderLen, hiddenSize]
-    std::optional<Tensor> encoderOutput;
-
     /// @brief The reason why the model stopped generating tokens for each beam in this request. Size [beamSize].
     /// Currently only supported when beamSize is 1 and when using BatchingType::kINFLIGHT.
     std::vector<FinishReason> finishReasons;
@@ -808,9 +794,6 @@ struct Result
 
     /// @brief Performance metrics if returnPerfMetrics is set in OutputConfig
     std::optional<RequestPerfMetrics> requestPerfMetrics;
-
-    /// @brief The additional outputs
-    std::vector<AdditionalOutput> additionalOutputs;
 };
 
 /// @brief Class that holds either an error or a result

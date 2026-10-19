@@ -334,10 +334,14 @@ def test_optional_tensor_results_are_python_owned(streaming) -> None:
     response = request.create_response()
     assert response is not None
     native = response.result.get_result()
-    assert native.context_logits is None
-    assert native.generation_logits is None
-    assert native.encoder_output is None
-    assert native.additional_outputs == []
+    for name in (
+        "context_logits",
+        "generation_logits",
+        "encoder_output",
+        "additional_outputs",
+        "spec_dec_fast_logits_info",
+    ):
+        assert not hasattr(native, name)
     torch.testing.assert_close(response.result.context_logits, context)
     torch.testing.assert_close(response.result.generation_logits, generation.transpose(0, 1))
     torch.testing.assert_close(response.result.encoder_output, encoder)

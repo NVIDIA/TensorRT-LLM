@@ -960,10 +960,6 @@ Result Serialization::deserializeResult(std::istream& is)
     result.outputTokenIds = su::deserialize<BeamTokens>(is);
     result.cumLogProbs = su::deserialize<std::optional<VecLogProbs>>(is);
     result.logProbs = su::deserialize<std::optional<std::vector<VecLogProbs>>>(is);
-    result.contextLogits = su::deserialize<std::optional<Tensor>>(is);
-    result.generationLogits = su::deserialize<std::optional<Tensor>>(is);
-    result.specDecFastLogitsInfo = su::deserialize<std::optional<SpeculativeDecodingFastLogitsInfo>>(is);
-    result.encoderOutput = su::deserialize<std::optional<Tensor>>(is);
     result.finishReasons = su::deserialize<std::vector<FinishReason>>(is);
     result.contextPhaseParams = su::deserialize<std::optional<ContextPhaseParams>>(is);
     result.decodingIter = su::deserialize<SizeType32>(is);
@@ -971,7 +967,6 @@ Result Serialization::deserializeResult(std::istream& is)
     result.sequenceIndex = su::deserialize<SizeType32>(is);
     result.isSequenceFinal = su::deserialize<bool>(is);
     result.requestPerfMetrics = su::deserialize<std::optional<RequestPerfMetrics>>(is);
-    result.additionalOutputs = su::deserialize<std::vector<AdditionalOutput>>(is);
     return result;
 }
 
@@ -981,10 +976,6 @@ void Serialization::serialize(Result const& result, std::ostream& os)
     su::serialize(result.outputTokenIds, os);
     su::serialize(result.cumLogProbs, os);
     su::serialize(result.logProbs, os);
-    su::serialize(result.contextLogits, os);
-    su::serialize(result.generationLogits, os);
-    su::serialize(result.specDecFastLogitsInfo, os);
-    su::serialize(result.encoderOutput, os);
     su::serialize(result.finishReasons, os);
     su::serialize(result.contextPhaseParams, os);
     su::serialize(result.decodingIter, os);
@@ -992,7 +983,6 @@ void Serialization::serialize(Result const& result, std::ostream& os)
     su::serialize(result.sequenceIndex, os);
     su::serialize(result.isSequenceFinal, os);
     su::serialize(result.requestPerfMetrics, os);
-    su::serialize(result.additionalOutputs, os);
 }
 
 size_t Serialization::serializedSize(Result const& result)
@@ -1002,10 +992,6 @@ size_t Serialization::serializedSize(Result const& result)
     totalSize += su::serializedSize(result.outputTokenIds);
     totalSize += su::serializedSize(result.cumLogProbs);
     totalSize += su::serializedSize(result.logProbs);
-    totalSize += su::serializedSize(result.contextLogits);
-    totalSize += su::serializedSize(result.specDecFastLogitsInfo);
-    totalSize += su::serializedSize(result.generationLogits);
-    totalSize += su::serializedSize(result.encoderOutput);
     totalSize += su::serializedSize(result.finishReasons);
     totalSize += su::serializedSize(result.contextPhaseParams);
     totalSize += su::serializedSize(result.decodingIter);
@@ -1013,7 +999,6 @@ size_t Serialization::serializedSize(Result const& result)
     totalSize += su::serializedSize(result.sequenceIndex);
     totalSize += su::serializedSize(result.isSequenceFinal);
     totalSize += su::serializedSize(result.requestPerfMetrics);
-    totalSize += su::serializedSize(result.additionalOutputs);
     return totalSize;
 }
 
