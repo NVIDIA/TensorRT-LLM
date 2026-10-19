@@ -74,7 +74,6 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     CacheLevel,
     CacheTier,
     CacheTierConfig,
-    CuError,
     DataRole,
     DiskCacheTierConfig,
     GpuCacheTierConfig,
@@ -87,6 +86,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     PageIndexMode,
     PlannedDropHandle,
     PoolGroupPeakBlockStats,
+    PoolRebalanceConfig,
     ReuseScope,
     SsmLayerConfig,
     SwaScratchReuseConfig,
@@ -99,7 +99,6 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
 )
 from tensorrt_llm.runtime.kv_cache_manager_v2 import KVCacheManager as KVCacheManagerPy
 from tensorrt_llm.runtime.kv_cache_manager_v2 import KVCacheManagerConfig as KVCacheManagerConfigPy
-from tensorrt_llm.runtime.kv_cache_manager_v2 import OutOfMemoryError as KVCacheOutOfMemoryError
 from tensorrt_llm.sampling_params import SamplingParams
 
 from ..config_utils import get_layer_attention_window, uses_vswa_kv_cache_layout
@@ -481,9 +480,8 @@ def _sync_host_tier_quota(host_quota: int, mapping: Mapping) -> int:
 class _KVCacheManagerInitStatus(IntEnum):
     # The numeric order is part of the allreduce(MAX) protocol: more severe
     # outcomes must have larger values.
-    KEEP_HOST = 0
-    USE_NO_HOST = 1
-    ABORT = 2
+    OK = 0
+    ABORT = 1
 
 
 def _sync_kv_cache_manager_init_status(
@@ -1743,7 +1741,7 @@ class KVCacheManagerV2(BaseResourceManager):
             )
         else:
             init_error: Optional[Exception] = None
-            local_init_status = _KVCacheManagerInitStatus.KEEP_HOST
+            local_init_status = _KVCacheManagerInitStatus.OK
             try:
                 candidate = KVCacheManagerPy(
                     config,
@@ -1751,11 +1749,8 @@ class KVCacheManagerV2(BaseResourceManager):
                     cold_page_codec=create_cold_page_codec(config),
                 )
             except Exception as error:
-                if isinstance(error, (CuError, KVCacheOutOfMemoryError)):
-                    local_init_status = _KVCacheManagerInitStatus.USE_NO_HOST
-                else:
-                    init_error = error.with_traceback(None)
-                    local_init_status = _KVCacheManagerInitStatus.ABORT
+                init_error = error.with_traceback(None)
+                local_init_status = _KVCacheManagerInitStatus.ABORT
 
             init_status = _sync_kv_cache_manager_init_status(local_init_status, mapping)
 
@@ -1765,50 +1760,6 @@ class KVCacheManagerV2(BaseResourceManager):
                 if init_error is not None:
                     raise init_error
                 raise RuntimeError("KV cache manager initialization failed on another rank")
-
-            if init_status == _KVCacheManagerInitStatus.USE_NO_HOST:
-                logger.warning(
-                    "At least one rank could not use the KV cache manager host tier "
-                    "(cuMemHostRegister may have failed). Rebuilding without the "
-                    "host cache tier on all ranks."
-                )
-                fallback_error: Optional[Exception] = None
-                try:
-                    if candidate is not None:
-                        candidate.shutdown()
-                    candidate = None
-                    config = replace(
-                        config,
-                        cache_tiers=[
-                            tier
-                            for tier in config.cache_tiers
-                            if not isinstance(tier, HostCacheTierConfig)
-                        ],
-                    )
-                    candidate = KVCacheManagerPy(
-                        config,
-                        event_manager=event_sink,
-                        cold_page_codec=create_cold_page_codec(config),
-                    )
-                except Exception as error:
-                    fallback_error = error.with_traceback(None)
-
-                local_fallback_status = (
-                    _KVCacheManagerInitStatus.USE_NO_HOST
-                    if fallback_error is None
-                    else _KVCacheManagerInitStatus.ABORT
-                )
-                fallback_status = _sync_kv_cache_manager_init_status(local_fallback_status, mapping)
-
-                if fallback_status == _KVCacheManagerInitStatus.ABORT:
-                    if candidate is not None:
-                        candidate.shutdown()
-                    if fallback_error is not None:
-                        raise fallback_error
-                    raise RuntimeError(
-                        "KV cache manager initialization without the host cache tier "
-                        "failed on another rank"
-                    )
 
         assert candidate is not None
         self.kv_cache_manager_py_config = config
@@ -3056,6 +3007,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 )
             )
 
+        rebalance_cfg = kv_cache_config.kv_pool_rebalance_config
         return KVCacheManagerConfigPy(
             # Used by the backend only for token<->block arithmetic and
             # radix hashing; BufferConfig.size above stays the physical page.
@@ -3090,6 +3042,13 @@ class KVCacheManagerV2(BaseResourceManager):
                 and self.block_reuse_policy != BlockReusePolicy.ALL_REUSABLE
             ),
             initial_pool_ratio=kv_cache_config.pool_ratio,
+            pool_rebalance=PoolRebalanceConfig(
+                min_sampled_kv_caches=rebalance_cfg.min_sampled_kv_caches,
+                cooldown_secs=rebalance_cfg.cooldown_secs,
+                target_ratio_update_interval=rebalance_cfg.target_ratio_update_interval,
+                ratio_tolerance=rebalance_cfg.ratio_tolerance,
+                moving_average_decay=rebalance_cfg.moving_average_decay,
+            ),
         )
 
     def _build_cache_config(self, config: KVCacheManagerConfigPy) -> KVCacheManagerConfigPy:

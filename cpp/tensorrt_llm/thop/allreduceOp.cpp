@@ -2024,6 +2024,7 @@ MnnvlFusionPattern getMnnvlFusionPattern(AllReduceFusionOp fusionOp)
     switch (fusionOp)
     {
     case AllReduceFusionOp::NONE: return MnnvlFusionPattern::kAllReduce;
+    case AllReduceFusionOp::RMS_NORM: return MnnvlFusionPattern::kARRMSNorm;
     case AllReduceFusionOp::RESIDUAL_RMS_NORM: return MnnvlFusionPattern::kARResidualRMSNorm;
     case AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_FP8: return MnnvlFusionPattern::kARResidualRMSNormFP8Quant;
     case AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_NVFP4: return MnnvlFusionPattern::kARResidualRMSNormFP4Quant;
@@ -2052,7 +2053,7 @@ bool isMnnvlNvfp4FusionOp(AllReduceFusionOp fusionOp)
 
 bool hasMnnvlNormOutput(AllReduceFusionOp fusionOp)
 {
-    return fusionOp == AllReduceFusionOp::RESIDUAL_RMS_NORM
+    return fusionOp == AllReduceFusionOp::RMS_NORM || fusionOp == AllReduceFusionOp::RESIDUAL_RMS_NORM
         || fusionOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_FP8
         || fusionOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4;
 }
@@ -2096,12 +2097,21 @@ std::vector<torch::Tensor> mnnvlFusionAllReduce(torch::Tensor& input, torch::opt
 
     if (hasRmsNormFusion)
     {
-        TORCH_CHECK(residual_in.has_value() && gamma.has_value() && epsilon.has_value(),
-            "[mnnvlFusionAllReduce] residual_in, gamma, and epsilon must be provided for RMSNorm fusion");
-        TORCH_CHECK(residual_in.value().is_contiguous(), "[mnnvlFusionAllReduce] residual_in must be contiguous");
+        // kARRMSNorm has no residual operand (kHasResidual/kHasResidualOut
+        // are both false), so residual_in is optional for it alone.
+        bool const needsResidual = fusionOp != AllReduceFusionOp::RMS_NORM;
+        TORCH_CHECK(gamma.has_value() && epsilon.has_value(),
+            "[mnnvlFusionAllReduce] gamma and epsilon must be provided for RMSNorm fusion");
+        TORCH_CHECK(!needsResidual || residual_in.has_value(),
+            "[mnnvlFusionAllReduce] residual_in must be provided for residual RMSNorm fusion");
+        TORCH_CHECK(!residual_in.has_value() || residual_in.value().is_contiguous(),
+            "[mnnvlFusionAllReduce] residual_in must be contiguous");
         TORCH_CHECK(gamma.value().is_contiguous(), "[mnnvlFusionAllReduce] gamma must be contiguous");
 
-        residualOut = torch::empty_like(residual_in.value());
+        if (needsResidual)
+        {
+            residualOut = torch::empty_like(residual_in.value());
+        }
         if (hasMnnvlNormOutput(fusionOp))
         {
             normOut = torch::empty_like(input);
@@ -2169,12 +2179,12 @@ std::vector<torch::Tensor> mnnvlFusionAllReduce(torch::Tensor& input, torch::opt
     {
         allreduce_params.output = normOut.defined() ? normOut.mutable_data_ptr() : nullptr;
 
-        allreduce_params.residualIn = residual_in.value().const_data_ptr();
+        allreduce_params.residualIn = residual_in.has_value() ? residual_in.value().const_data_ptr() : nullptr;
         allreduce_params.gamma = gamma.value().const_data_ptr();
         allreduce_params.epsilon = static_cast<float>(epsilon.value());
         allreduce_params.rmsNormFusion = true;
 
-        allreduce_params.residualOut = residualOut.mutable_data_ptr();
+        allreduce_params.residualOut = residualOut.defined() ? residualOut.mutable_data_ptr() : nullptr;
     }
 
     if (isMnnvlQuantFusionOp(fusionOp))
@@ -2203,6 +2213,7 @@ std::vector<torch::Tensor> mnnvlFusionAllReduce(torch::Tensor& input, torch::opt
     switch (fusionOp)
     {
     case AllReduceFusionOp::NONE: return {reduceOut};
+    case AllReduceFusionOp::RMS_NORM: return {normOut};
     case AllReduceFusionOp::RESIDUAL_RMS_NORM: return {normOut, residualOut};
     case AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_FP8: return {quantOut, residualOut};
     case AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_FP8: return {normOut, quantOut, residualOut};

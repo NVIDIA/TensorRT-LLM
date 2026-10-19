@@ -99,6 +99,7 @@ class RefSlotSpec(StrictBaseModel):
 if TYPE_CHECKING:
     from .cache import CacheAccelerator
     from .config import DiffusionPipelineConfig
+    from .sleep import SleepRestoreMode
 
 
 class BasePipeline(nn.Module):
@@ -424,6 +425,16 @@ class BasePipeline(nn.Module):
 
     def forward(self, *args, **kwargs):
         raise NotImplementedError
+
+    def _sleep_loading_context(
+        self, restore_mode: "SleepRestoreMode", *, device: torch.device
+    ) -> contextlib.AbstractContextManager[None]:
+        """Capture persistent allocations for pipelines that explicitly support sleep.
+
+        The loader calls this hook only when sleep is requested, before tensor
+        materialization, and exits the context before inference warmup.
+        """
+        raise ValueError("Pipeline sleep is currently not supported for this model")
 
     def load_transformer_weights(self, checkpoint_dir: str) -> Dict[str, torch.Tensor]:
         """Load transformer weights from checkpoint.
