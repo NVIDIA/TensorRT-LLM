@@ -38,6 +38,32 @@ The examples below use `/path/to/musespark-open-checkpoint` — replace it with 
 
 ## Deployment Steps
 
+### Run Docker Container
+
+Run the Docker container using the TensorRT LLM NVIDIA NGC image published from this branch. The image is multi-arch (x86_64 and aarch64), so it runs on GB300 trays directly:
+
+```bash
+docker run --rm -it \
+    --ipc=host \
+    --gpus all \
+    -p 8000:8000 \
+    -v "$HOST_MODELS_DIR":/models \
+    --name tensorrt_llm \
+    nvcr.io/nvidia/tensorrt-llm/release:1.4.0a0.dev202610171236 \
+    /bin/bash
+```
+
+> [!WARNING]
+> `1.4.0a0.dev202610171236` is a preview tag published from the head of `feat/musespark-open` (commit `79e45c5d`) on 2026-10-17. Preview artifacts are retained for roughly two months, so expect this tag (and the matching wheels) to be removed around mid-December 2026. If the tag is gone, use a newer release published from this branch (see the [release tags page](https://catalog.ngc.nvidia.com/orgs/nvidia/teams/tensorrt-llm/containers/release/tags)) or build the container from this branch's sources (see the [Docker guide](source:docker/README.md)).
+
+For installations without Docker, the matching Python wheel is available from the preview index:
+
+```bash
+pip install "tensorrt_llm==1.4.0a0.dev202610171236" --extra-index-url https://pypi.nvidia.com/trtllm_preview/
+```
+
+> **All commands below should be run inside the Docker container.**
+
 ### Recommended Performance Settings
 
 **Treat these as a starting point and tune the parameters for your workload.**

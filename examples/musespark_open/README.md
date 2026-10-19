@@ -17,7 +17,10 @@ validated on GB300 NVL (`SM103`) with 4 GPUs (TP4/EP4).
 ## Prerequisites
 
 - A TensorRT-LLM release container (or an equivalent installation with the
-  runtime dependencies).
+  runtime dependencies). The deployment guide's
+  [Run Docker Container](../../docs/source/deployment-guide/deployment-guide-for-musespark-open-on-trtllm.md#run-docker-container)
+  section pins the preview container published from this branch and notes when
+  that tag expires.
 - A complete Hugging Face-format Muse Spark Open checkpoint and tokenizer, e.g.
   `meta-models/Muse-Spark-Open-816B-A42B-NVFP4`
   (`model_type: muse_spark`). The checkpoint ships the routed-expert weights
