@@ -8650,6 +8650,7 @@ class PyExecutor:
         params = getattr(request, "py_multimodal_params", None)
         if params is not None:
             params.encoder_event = None
+            params.multimodal_input = None
         mm_data = getattr(request, "py_multimodal_data", None)
         if mm_data:
             strip_mm_data_for_generation(mm_data)

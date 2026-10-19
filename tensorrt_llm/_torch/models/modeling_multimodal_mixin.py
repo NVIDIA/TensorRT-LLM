@@ -284,20 +284,25 @@ def _build_request_multimodal_input(
     request: "LlmRequest", cache_enabled: bool
 ) -> Optional[MultimodalInput]:
     """Build the encoder-cache key metadata carried by one request."""
-    # Skip construction (and `from_components` validation) when no persistent cache consumes it.
-    if not cache_enabled or request.multimodal_hashes is None:
+    if not cache_enabled:
         return None
-    # `MultimodalModelMixin._encoder_cache_keys` uses UUID-aware multimodal hashes internally.
-    # Although the UUIDs are not exposed as an attribute, they remain in the backing C++ request
-    # for KV-cache block keys and cache events.
-    return MultimodalInput.from_components(
-        request.multimodal_hashes,
+    params = getattr(request, "py_multimodal_params", None)
+    if params is not None and params.multimodal_input is not None:
+        return params.multimodal_input
+    hashes = request.multimodal_hashes
+    if hashes is None:
+        return None
+    multimodal_input = MultimodalInput.from_components(
+        hashes,
         request.multimodal_positions,
         request.multimodal_lengths,
         mm_item_run_cu_offsets=request.multimodal_item_run_cu_offsets,
         mm_run_positions=request.multimodal_run_positions,
         mm_run_lengths=request.multimodal_run_lengths,
     )
+    if params is not None:
+        params.multimodal_input = multimodal_input
+    return multimodal_input
 
 
 def _get_mm_aux_stream(max_prefetch_ahead: int = 0) -> Optional[torch.cuda.Stream]:
@@ -472,7 +477,7 @@ class MultimodalModelMixin:
     def prepare_multimodal_encoder_inputs(
         self,
         selected_items: Sequence[tuple[MultimodalParams, int]],
-    ) -> list[tuple[MultimodalParams, list[int], str]]:
+    ) -> list[tuple[MultimodalParams, Sequence[int], str]]:
         """Build selected item encoder inputs before the caller performs H2D.
 
         Adjacent items from the same request and modality are sliced in one
@@ -488,7 +493,7 @@ class MultimodalModelMixin:
             Tuples of `(sliced encoder params, per-item embedding row counts, modality)`, in
             input order. Flattening the row-count lists recovers the per-item sequence.
         """
-        encoder_inputs: list[tuple[MultimodalParams, list[int], str]] = []
+        encoder_inputs: list[tuple[MultimodalParams, Sequence[int], str]] = []
         for (
             multimodal_param,
             run_indices,
@@ -519,7 +524,7 @@ class MultimodalModelMixin:
             encoder_inputs.append(
                 (
                     residual,
-                    residual.multimodal_data["multimodal_embedding_lengths"],
+                    residual.item_metadata.output_embedding_lengths,
                     modality,
                 )
             )
@@ -570,7 +575,7 @@ class MultimodalModelMixin:
 
     def forward_multimodal_encoder_items(
         self,
-        encoder_inputs: Sequence[tuple[MultimodalParams, list[int], str]],
+        encoder_inputs: Sequence[tuple[MultimodalParams, Sequence[int], str]],
     ) -> list[torch.Tensor]:
         """Forward prepared MM encoder inputs in scheduler item order.
 
@@ -1410,10 +1415,6 @@ class MultimodalModelMixin:
         if metadata is not None:
             selected = metadata.select(item_indices)
             residual.multimodal_data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = selected
-            if selected.output_embedding_lengths is not None:
-                residual.multimodal_data["multimodal_embedding_lengths"] = (
-                    selected.output_embedding_lengths
-                )
         else:
             source_lengths = source.multimodal_data["multimodal_embedding_lengths"]
             residual.multimodal_data["multimodal_embedding_lengths"] = [

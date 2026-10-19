@@ -30,10 +30,10 @@ from tensorrt_llm._torch.models.modeling_multimodal_utils import _is_mm_disagg
 from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm.functional import PositionEmbeddingType
-from tensorrt_llm.inputs.multimodal import (MultimodalEncoderItemMetadata,
-                                            MultimodalItemMetadata,
-                                            MultimodalItemPartition,
-                                            MultimodalParams)
+from tensorrt_llm.inputs.multimodal import (
+    MULTIMODAL_ENCODER_ITEM_METADATA_KEY, MultimodalEncoderItemMetadata,
+    MultimodalItemMetadata, MultimodalItemPartition, MultimodalParams,
+    get_multimodal_encoder_item_metadata)
 
 from ..._utils import async_tensor_h2d, nvtx_range, prefer_pinned
 from ...inputs import (BaseMultimodalDummyInputsBuilder,
@@ -247,11 +247,11 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
     def dtype(self) -> torch.dtype:
         return self._dtype
 
-    def get_mm_encoder_item_metadata(
+    def _build_mm_item_metadata(
         self,
         prompt_token_ids: List[int],
         multimodal_data: Dict[str, Any],
-    ) -> Optional[MultimodalEncoderItemMetadata]:
+    ) -> Optional[MultimodalItemMetadata]:
         """Return prompt-ordered Qwen vision items and pre-merger costs."""
         grids_by_modality: Dict[str, torch.Tensor] = {}
         for modality, grid_key in (("image", "image_grid_thw"),
@@ -379,10 +379,22 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
             token_length // self.spatial_merge_unit
             for token_length in encoder_token_lengths
         ]
-        return MultimodalEncoderItemMetadata(
+        if any(length <= 0 for length in output_embedding_lengths):
+            raise ValueError(
+                "Processed Qwen items must produce positive embedding lengths")
+        return MultimodalItemMetadata(
             item_refs=item_refs,
             encoder_token_lengths=encoder_token_lengths,
             output_embedding_lengths=output_embedding_lengths)
+
+    def get_mm_encoder_item_metadata(
+        self, prompt_token_ids: List[int],
+        multimodal_data: Dict[str,
+                              Any]) -> Optional[MultimodalEncoderItemMetadata]:
+        metadata = self._build_mm_item_metadata(prompt_token_ids,
+                                                multimodal_data)
+        return get_multimodal_encoder_item_metadata(
+            {MULTIMODAL_ENCODER_ITEM_METADATA_KEY: metadata})
 
     def get_mm_item_metadata(
         self,
@@ -390,8 +402,13 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
         multimodal_data: Dict[str, Any],
         mm_item_order: Optional[List[Dict[str, Any]]] = None,
     ) -> Optional[MultimodalItemMetadata]:
-        metadata = super().get_mm_item_metadata(prompt_token_ids,
-                                                multimodal_data, mm_item_order)
+        metadata = (
+            self._build_mm_item_metadata(prompt_token_ids, multimodal_data)
+            if multimodal_data.get("multimodal_embedding") is None else None)
+        if metadata is None:
+            metadata = super().get_mm_item_metadata(prompt_token_ids,
+                                                    multimodal_data,
+                                                    mm_item_order)
         if metadata is not None:
             for modality in ("image", "video"):
                 if isinstance(multimodal_data.get(modality), dict):

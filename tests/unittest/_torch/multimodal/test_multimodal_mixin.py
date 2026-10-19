@@ -117,7 +117,7 @@ class CountingEncoderMultimodalModel(DummyMultimodalModel):
             if param.multimodal_runtime is not None:
                 total_rows += param.multimodal_runtime.total_embeds_in_request
             else:
-                total_rows += sum(param.multimodal_data["multimodal_embedding_lengths"])
+                total_rows += sum(param.get_item_layout()[1])
         return torch.full(
             (total_rows, self.embedding.embedding_dim),
             float(self.encode_calls),

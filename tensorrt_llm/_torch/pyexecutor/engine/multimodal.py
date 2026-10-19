@@ -506,6 +506,7 @@ class MultimodalItemScheduler:
             multimodal_param = MultimodalParams(
                 multimodal_data=request.py_multimodal_params.multimodal_data
             )
+            embedding_lengths = state.embedding_lengths
             for item_idx in item_indices:
                 cache_key = state.item_cache_keys[item_idx]
                 if cache_key is None:
@@ -515,7 +516,7 @@ class MultimodalItemScheduler:
                     )
                 scheduled_cache_keys.add(cache_key)
                 encoder_items.append((multimodal_param, item_idx))
-                output_targets.append((item_idx, cache_key, state.embedding_lengths[item_idx]))
+                output_targets.append((item_idx, cache_key, embedding_lengths[item_idx]))
 
         # A batch-level error cannot be traced to one output, so fail only the
         # scheduled producers. Requests that only share a scheduled entry keep

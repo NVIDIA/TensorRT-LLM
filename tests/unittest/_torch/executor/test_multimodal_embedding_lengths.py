@@ -73,18 +73,15 @@ def test_multimodal_embedding_lengths_uses_item_metadata(legacy_lengths):
 @pytest.mark.cpu_only
 def test_multimodal_embedding_lengths_rejects_conflicting_item_metadata():
     """A direct Params caller cannot export a different item layout."""
-    params = MultimodalParams(
-        multimodal_data={
-            MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
-                [("image", 0)], output_embedding_lengths=[2]
-            ),
-            "multimodal_embedding_lengths": [3],
-        }
-    )
-    req = SimpleNamespace(multimodal_lengths=[4], py_multimodal_data=params.multimodal_data)
-
-    with pytest.raises(ValueError, match="item output lengths must match"):
-        get_multimodal_embedding_lengths(req)
+    with pytest.raises(ValueError, match="output lengths do not match"):
+        MultimodalParams(
+            multimodal_data={
+                MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+                    [("image", 0)], output_embedding_lengths=[2]
+                ),
+                "multimodal_embedding_lengths": [3],
+            }
+        )
 
 
 @pytest.mark.parametrize(
@@ -127,10 +124,10 @@ def test_multimodal_embedding_lengths_rejects_conflicting_item_metadata():
         (
             SimpleNamespace(
                 multimodal_lengths=[4],
-                py_multimodal_data={"multimodal_embedding_lengths": (4,)},
+                py_multimodal_data={"multimodal_embedding_lengths": (4.0,)},
             ),
             TypeError,
-            "must be a list",
+            "integers",
         ),
         (
             SimpleNamespace(
