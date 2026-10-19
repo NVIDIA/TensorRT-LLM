@@ -9,6 +9,9 @@ cache_transceiver_config:
   kv_transfer_timeout_ms: 600000
   transceiver_runtime: PYTHON
   kv_cache_bounce_size_mb: 2048
+  agent_bounce_params:
+    min_descriptor_count: "1"
+    max_average_descriptor_size: "4MB"
 disable_overlap_scheduler: false
 enable_attention_dp: true
 enable_chunked_prefill: true
