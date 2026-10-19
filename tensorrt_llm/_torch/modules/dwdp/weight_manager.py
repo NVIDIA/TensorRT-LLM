@@ -204,8 +204,9 @@ class DWDPWeightManager:
         # to the copy engine.
         self._use_gather = fabric_gather.is_enabled() and fabric_gather.gather_op() is not None
         if self._use_gather:
-            # Reserve the gather's SMs in the persistent CuTeDSL grids and pin the
-            # dense GEMM to the CLC scheduler unless the user set them explicitly.
+            # Reserve the gather's SMs in the persistent CuTeDSL grids, pin the dense
+            # GEMM to the CLC scheduler and turn off cooperative MoE routing unless the
+            # user set them explicitly.  Runs during setup, before the first forward.
             fabric_gather.apply_compute_side_defaults()
         if fabric_gather.is_enabled() and not self._use_gather:
             logger.warning(

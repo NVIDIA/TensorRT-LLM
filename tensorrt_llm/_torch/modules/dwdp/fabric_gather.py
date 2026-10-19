@@ -100,6 +100,7 @@ def blocks_per_row(rows: int) -> int:
 #: Compute-side knobs the SM gather sets for itself unless the user pinned them.
 _SM_RESERVE_ENV = "TRTLLM_CUTEDSL_SM_RESERVE"
 _DENSE_GEMM_SCHEDULER_ENV = "TRTLLM_CUTEDSL_DENSE_GEMM_SCHEDULER"
+_ROUTING_NO_COOP_ENV = "TLLM_ROUTING_DISABLE_COOP_LAUNCH"
 
 
 def apply_compute_side_defaults() -> None:
@@ -107,7 +108,10 @@ def apply_compute_side_defaults() -> None:
 
     Reserves the gather's block count of SMs (``TRTLLM_CUTEDSL_SM_RESERVE``) and pins the SM107
     dense GEMM to the CLC dynamic scheduler (``TRTLLM_CUTEDSL_DENSE_GEMM_SCHEDULER``) so static
-    persistent grids do not run a second wave on the occupied SMs.  An explicit user setting wins.
+    persistent grids do not run a second wave on the occupied SMs.  Also turns off the
+    grid-cooperative MoE routing kernel (``TLLM_ROUTING_DISABLE_COOP_LAUNCH=1``), which needs every
+    SM co-resident and so would wait behind the gather.  The routing code reads that knob once, at
+    its first launch, so this must run before the first forward.  An explicit user setting wins.
     """
     reserve = str(total_blocks() if THREADS >= 512 else 0)
     applied = []
@@ -115,6 +119,8 @@ def apply_compute_side_defaults() -> None:
         applied.append(f"{_SM_RESERVE_ENV}={reserve}")
     if os.environ.setdefault(_DENSE_GEMM_SCHEDULER_ENV, "clc_dynamic") == "clc_dynamic":
         applied.append(f"{_DENSE_GEMM_SCHEDULER_ENV}=clc_dynamic")
+    if os.environ.setdefault(_ROUTING_NO_COOP_ENV, "1") == "1":
+        applied.append(f"{_ROUTING_NO_COOP_ENV}=1")
     if applied:
         logger.info(f"[DWDP] SM gather on: {' '.join(applied)} (set an explicit value to override)")
 

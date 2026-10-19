@@ -82,15 +82,19 @@ def test_compute_side_defaults_respect_explicit_values(monkeypatch):
     monkeypatch.setenv("TRTLLM_DWDP_GATHER_BLOCKS", "30")
     _unset(monkeypatch, "TRTLLM_CUTEDSL_SM_RESERVE")
     monkeypatch.setenv("TRTLLM_CUTEDSL_DENSE_GEMM_SCHEDULER", "static")
+    monkeypatch.setenv("TLLM_ROUTING_DISABLE_COOP_LAUNCH", "0")
     fabric_gather.apply_compute_side_defaults()
     assert os.environ["TRTLLM_CUTEDSL_SM_RESERVE"] == "30"
     assert os.environ["TRTLLM_CUTEDSL_DENSE_GEMM_SCHEDULER"] == "static"
+    assert os.environ["TLLM_ROUTING_DISABLE_COOP_LAUNCH"] == "0"
 
 
 def test_small_blocks_do_not_reserve_sms(monkeypatch):
     monkeypatch.setattr(fabric_gather, "THREADS", 128)
     _unset(monkeypatch, "TRTLLM_CUTEDSL_SM_RESERVE")
     _unset(monkeypatch, "TRTLLM_CUTEDSL_DENSE_GEMM_SCHEDULER")
+    _unset(monkeypatch, "TLLM_ROUTING_DISABLE_COOP_LAUNCH")
     fabric_gather.apply_compute_side_defaults()
     assert os.environ["TRTLLM_CUTEDSL_SM_RESERVE"] == "0"
     assert os.environ["TRTLLM_CUTEDSL_DENSE_GEMM_SCHEDULER"] == "clc_dynamic"
+    assert os.environ["TLLM_ROUTING_DISABLE_COOP_LAUNCH"] == "1"
