@@ -1783,6 +1783,62 @@ def test_kv_build_failure_reports_safe_pre_submission_failure(monkeypatch) -> No
 
 
 @pytest.mark.cpu_only
+def test_bounce_rejects_unregistered_final_destination_before_build() -> None:
+    rid = 104
+    peer_rank = 2
+    sender = _make_owned_sender()
+    sender._device_id = 0
+    sender._agent = Mock()
+    sender._agent.check_remote_descs.return_value = False
+    sender._bounce = Mock()
+    dealer = Mock()
+    sender._get_result_dealer = Mock(return_value=dealer)
+    task = transfer_mod.KVSendTask(
+        _sole_piece(),
+        DisaggregatedParams(disagg_request_id=rid),
+        slice_id=0,
+    )
+    assert task.begin_physical_operation(peer_rank)
+    sender._sessions = {
+        rid: SimpleNamespace(
+            kv_tasks=[task],
+            lock=threading.Lock(),
+            status=SessionStatus.READY,
+        )
+    }
+    write_meta = transfer_mod.WriteMeta(
+        task=task,
+        expected_transfers=1,
+        peer_name="gen2",
+        peer_rank=peer_rank,
+        peer_endpoint="receiver",
+        unique_rid=rid,
+        src_ptrs=np.array([0x1000], dtype=np.int64),
+        dst_ptrs=np.array([0x2000], dtype=np.int64),
+        sizes=np.array([0x100], dtype=np.int64),
+        dst_device_id=0,
+        slice_id=0,
+        receiver_slice_id=7,
+        is_last_slice=False,
+        bounce_dst_base=0x3000,
+    )
+
+    sender._deliver_kv_to_agent(write_meta)
+
+    peer_name, checked_descs = sender._agent.check_remote_descs.call_args.args
+    assert peer_name == "gen2"
+    assert [(desc.addr, desc.len, desc.device_id) for desc in checked_descs.descs] == [
+        (0x2000, 0x100, 0)
+    ]
+    sender._bounce.build_request.assert_not_called()
+    sender._agent.submit_transfer_requests.assert_not_called()
+    assert task.resources_drained
+    assert task.status == transfer_mod.TaskStatus.ERROR
+    status_code = transfer_mod._KV_RESULT_PREFIX.unpack(dealer.send.call_args.args[0][1])[4]
+    assert transfer_mod._AGENT_RESULT_BY_CODE[status_code] == AgentResult.FAILED
+
+
+@pytest.mark.cpu_only
 def test_owned_kv_build_failure_settles_every_published_peer(monkeypatch) -> None:
     rid = 100
     sender = _make_owned_sender()
