@@ -292,27 +292,43 @@ class Glm5NextGenerationRows:
     per layer. ``positions`` is ``[B]`` for plain decode and ``[B, T]`` while a
     target verifies ``T - 1`` drafts; ``visible[i]`` is row ``i``'s visible
     prefix length and ``num_candidates[i]`` its complete-pool count (int32).
+    With ``first_table`` (the batch's block-table row of the first generation
+    request), verification rows also get ``request_ids[i]``, row ``i``'s
+    block-table row (int32), so kernels index tables instead of copying them.
     """
 
     positions: torch.Tensor
     visible: torch.Tensor
     num_candidates: torch.Tensor
+    request_ids: torch.Tensor | None = None
 
     @classmethod
     def build(
-        cls, kv_lens: torch.Tensor, tokens_per_request: int, kpool: int
+        cls,
+        kv_lens: torch.Tensor,
+        tokens_per_request: int,
+        kpool: int,
+        first_table: int | None = None,
     ) -> Glm5NextGenerationRows:
+        request_ids = None
         if tokens_per_request <= 1:
             positions = kv_lens - 1
             visible = kv_lens
         else:
-            steps = torch.arange(tokens_per_request, device=kv_lens.device)
+            device = kv_lens.device
+            steps = torch.arange(tokens_per_request, device=device)
             positions = (kv_lens - tokens_per_request).unsqueeze(1) + steps
             visible = (positions + 1).reshape(-1)
+            if first_table is not None:
+                tables = torch.arange(
+                    first_table, first_table + kv_lens.shape[0], dtype=torch.int32, device=device
+                )
+                request_ids = tables.repeat_interleave(tokens_per_request)
         return cls(
             positions=positions,
             visible=visible,
             num_candidates=(visible // kpool).to(torch.int32),
+            request_ids=request_ids,
         )
 
 
@@ -362,7 +378,10 @@ class Glm5NextRuntimeContext:
         rows = self.gen_rows_cache.get(kpool)
         if rows is None:
             rows = Glm5NextGenerationRows.build(
-                self.kv_lens[self.num_contexts :], self.gen_tokens_per_request, kpool
+                self.kv_lens[self.num_contexts :],
+                self.gen_tokens_per_request,
+                kpool,
+                first_table=self.num_contexts,
             )
             self.gen_rows_cache[kpool] = rows
         return rows
@@ -1324,7 +1343,8 @@ class Glm5NextSparseAttention(nn.Module):
         """Score pools, select members and tail, then attend to paged latent rows.
 
         visible gives each query's prefix length. Packed context uses request_ids;
-        verification uses rows_per_request. Single-token decode reads live lengths
+        verification uses rows_per_request, and request_ids too when its rows'
+        tables are known. Single-token decode reads live lengths
         from metadata. All device work uses fixed buffer shapes for graph replay.
         max_visible is an optional host bound on visible that limits scoring work;
         num_candidates, if given, is visible // index_kpool as int32.
@@ -1586,6 +1606,7 @@ class Glm5NextSparseAttention(nn.Module):
             AttentionInputType.generation_only,
             rows_per_request=tokens_per_request,
             reduce=reduce,
+            request_ids=rows.request_ids,
             num_candidates=rows.num_candidates,
         )
 
