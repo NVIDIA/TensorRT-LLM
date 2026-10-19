@@ -42,7 +42,7 @@ pytestmark = pytest.mark.cpu_only
 def test_checkpoint_startup_metadata_describes_actual_loader() -> None:
     checkpoint_loader = HfCheckpointLoader()
 
-    metadata = _checkpoint_startup_metadata(checkpoint_loader, "auto")
+    metadata = _checkpoint_startup_metadata(checkpoint_loader, LoadFormat.AUTO)
 
     assert metadata == {
         "checkpoint_loader_kind": "HfCheckpointLoader",
@@ -211,7 +211,7 @@ def test_hf_reader_policy_error_shows_plain_values() -> None:
     [
         # An enum format shows its plain value 'MX' in the reason, not the enum repr.
         ({"checkpoint_format": CheckpointFormat.MX}, "checkpoint_format='HF' (received 'MX')"),
-        ({"load_format": "dummy"}, "load_format='auto'"),
+        ({"load_format": LoadFormat.DUMMY}, "load_format='auto' (received 'DUMMY')"),
         ({"partial_model_loading": True}, "partial model loading"),
     ],
 )
