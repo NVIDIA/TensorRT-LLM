@@ -636,7 +636,8 @@ class Glm5NextForCausalLM(SpecDecOneEngineForCausalLM):
           the indexer's ``[wk | gate | weights_proj]``) collect their separate
           checkpoint tensors first (:attr:`FUSED_LINEARS` on the owning module).
         * Production routed experts go to the fused MoE layer's loader,
-          filtered to ``initial_local_expert_ids``.
+          filtered to ``initial_local_expert_ids`` except for the scalar
+          ``input_scale``, which is passed for every expert.
         * The KDA layer's tensors (the shared mixer's local-width modules) are
           sliced to this rank's head range by the module itself.
         * Everything else (norms, HC, router, embeddings) is an exact-shape
@@ -679,9 +680,13 @@ class Glm5NextForCausalLM(SpecDecOneEngineForCausalLM):
             moe = _FUSED_MOE_RE.match(dest)
             if moe is not None:
                 expert_id = int(moe.group("expert"))
-                if expert_id in local_expert_ids:  # other EP ranks' bytes are never read
-                    suffix = "." + moe.group("tensor")
-                    moe_weights[f"{expert_id}.{proj_to_w[moe.group('proj')]}{suffix}"] = (
+                tensor = moe.group("tensor")
+                # Other EP ranks' weights are never read. Every expert's scalar
+                # input_scale is kept: the loader reduces them over all experts
+                # into the layer-wide activation scale, which must be identical
+                # on every rank because tokens are quantized before dispatch.
+                if expert_id in local_expert_ids or tensor == "input_scale":
+                    moe_weights[f"{expert_id}.{proj_to_w[moe.group('proj')]}.{tensor}"] = (
                         materialize(lazy)
                     )
                 continue
@@ -804,6 +809,9 @@ class Glm5NextForCausalLM(SpecDecOneEngineForCausalLM):
                 QuantAlgo.NVFP4: 12,
             }.get(quant_algo, 3)
             expected = tensors_per_expert * len(local_expert_ids)
+            if quant_algo == QuantAlgo.NVFP4:
+                # One input_scale per projection of every non-local expert.
+                expected += 3 * (experts.num_experts - len(local_expert_ids))
             if len(moe_weights) != expected:
                 raise ValueError(
                     f"glm5_next owner {owner!r}: fused MoE collected {len(moe_weights)} expert "
