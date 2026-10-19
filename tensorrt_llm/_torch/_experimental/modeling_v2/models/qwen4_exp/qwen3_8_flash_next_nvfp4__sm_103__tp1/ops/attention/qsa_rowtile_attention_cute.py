@@ -2,10 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """The row-tile pass of `qsa_sparse_gqa_rowtile` on SM103 tensor cores (CuTe DSL, tcgen05).
 
-Same inputs and output as that op's Triton `_rowtile_attention_kernel`: per group of
-`rows_per_tile` rows of one request, the plan's packed slot list (`slots[group]`, `listed`
-entries), each row's bitmap re-indexed onto it (`packed_bits`, as int32 halves) and
-`group_plan[group] = (tiles, listed)`; groups with `tiles < 0` belong to the lone-row pass.
+Inputs and output: per group of `rows_per_tile` rows of one request, the plan's packed
+slot list (`slots[group]`, `listed` entries), each row's bitmap re-indexed onto it
+(`packed_bits`, as int32 halves) and `group_plan[group] = (tiles, listed)`; groups with
+`tiles < 0` belong to the lone-row pass.
 
 One CTA per (group, KV head), 128 MMA rows = `rows_per_tile` query rows x `group_size`
 heads, 9 warps:
@@ -23,8 +23,7 @@ heads, 9 warps:
 
 Tensor memory: O in columns 0-255, S/P buffers at 256 and 320, Q at 384 (512 columns).
 The tile's row max covers every listed entry, an upper bound of the row's own: a valid
-softmax offset. P is rounded to bf16 for the PV MMA and summed in fp32 unrounded, as the
-Triton kernel does.
+softmax offset. P is rounded to bf16 for the PV MMA and summed in fp32 unrounded.
 """
 
 from __future__ import annotations
@@ -911,12 +910,10 @@ def _aligned(t: torch.Tensor, strides: int) -> bool:
     return t.data_ptr() % 16 == 0 and all(t.stride(i) % 8 == 0 for i in range(strides))
 
 
-def eligible(
-    q: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor, block_m: int, block_n: int
-) -> bool:
-    """Whether a launch fits this pass: SM103, bf16 q and K/V, D = 256, the 128-row tile of
-    64-token tiles, unit-stride head dimension and 16-byte-aligned rows."""
-    if (block_m, block_n) != (BLOCK_M, BLOCK_N) or q.shape[2] != HEAD_DIM:
+def eligible(q: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor) -> bool:
+    """Whether a launch fits this pass: SM103, bf16 q and K/V, D = 256, unit-stride head
+    dimension and 16-byte-aligned rows."""
+    if q.shape[2] != HEAD_DIM:
         return False
     if not (q.dtype == k_cache.dtype == v_cache.dtype == torch.bfloat16):
         return False
@@ -933,7 +930,7 @@ def eligible(
 
 
 class _Launcher:
-    """`rowtile_attention_cute[grid](...)`: grid-indexed like the Triton kernel it stands in for;
+    """`rowtile_attention_cute[grid](...)`: grid-indexed like the entry's Triton launches;
     the grid is `(groups, kv_heads)`."""
 
     def __getitem__(self, grid):

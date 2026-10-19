@@ -51,11 +51,8 @@ def _s(mma_m: int, mma_n: int, split_k: int, ab_stages: int) -> tuple:
 #: bound, and any (N, K) not listed, runs on cuBLAS. Every row below is a
 #: qwen3.8-flash-next-nvfp4 tp1 projection; a target with other shapes adds its
 #: own rows after measuring them. Each choice beat cublas_mm by >= 5% at the
-#: bound's M in
-#: qwen3.8-flash-next-nvfp4-perf-opt/05-iterations/candidates/low-m-gemm/microbench/sweep.json
-#: or, for the attention in-projection concat and the PLE value projection,
-#: .../candidates/lowm-integrate/microbench/sweep_new.json
-#: (GB300, cold L2, graph replay, pdl off). M=3 uses the M=4 choice, and so on.
+#: bound's M in a sweep of these shapes (GB300, cold L2, graph replay, pdl off).
+#: M=3 uses the M=4 choice, and so on.
 _TABLE: dict[tuple[int, int], tuple[tuple[int, tuple], ...]] = {
     # GDN in_qkv: 16 q + 16 k heads x 128, 48 v heads x 128
     (10240, 2560): ((1, _d(64, 1)), (2, _d(64, 2)), (8, _s(128, 8, 1, 6))),

@@ -144,7 +144,7 @@ def _decode_state(m: int):
     buf[:m] = torch.tensor(_slots(m), dtype=torch.int32, device=DEV)
     si_all = buf[:m]
     qsl_long = torch.arange(m + 1, dtype=torch.int64, device=DEV)
-    return (si_all, qsl_long, False, m, 1, None, None), qsl_long
+    return (si_all, False, m, 1, None, None), qsl_long
 
 
 def _prefill_state(ctx_lens: tuple, n_dec: int, has_init: tuple):

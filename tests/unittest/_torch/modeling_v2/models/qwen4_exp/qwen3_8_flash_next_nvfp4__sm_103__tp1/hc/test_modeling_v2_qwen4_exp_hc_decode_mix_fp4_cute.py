@@ -1,22 +1,19 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test for the qwen4_exp_hc_decode_mix_fp4_cute entry: cells against the Triton
-entry's float64 reference in its band (`mixed` and `inject_out` in `rtol = eps`,
+"""GPU test for the qwen4_exp_hc_decode_mix_fp4_cute entry: cells against the entry's
+float64 reference in its band (`mixed` and `inject_out` in `rtol = eps`,
 `atol = eps * max|ref|`; the NVFP4 exact on the returned `mixed` outside the
-reciprocal tie window), agreement with the Triton entry inside the same band, a
-stale-read check under CUDA-graph replay with PDL, the guards."""
+reciprocal tie window), a stale-read check under CUDA-graph replay with PDL, the
+guards."""
 
 import zlib
 
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.hc.qwen4_exp_hc_decode_mix_fp4 import (  # noqa: E501
-    nvfp4_near_tie,
-    nvfp4_reference,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.hc.qwen4_exp_hc_decode_mix_fp4 import (  # noqa: E501
-    qwen4_exp_hc_decode_mix_fp4 as triton_op,
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.quantization.fp4_quantize import (
+    Fp4Quantize,
+    fp4_quantize,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.hc.qwen4_exp_hc_decode_mix_fp4_cute import (  # noqa: E501
     qwen4_exp_hc_decode_mix_fp4_cute as op,
@@ -30,6 +27,18 @@ assert torch.cuda.is_available(), "qwen4_exp_hc_decode_mix_fp4_cute requires a C
 DEV = "cuda"
 HC_COUNT, HIDDEN, RANK, EPS = 4, 2560, 320, 1e-6
 UP_RMS, GAMMA_RMS, GAMMA_ABSMAX = 0.0681, 0.477, 6.625
+
+
+def nvfp4_reference(x, gs):
+    """`fp4_quantize`'s native-torch NVFP4 of `x` `[T, K]` with linear scales:
+    `(packed [T, K/2] uint8, sf [T*K/16] uint8)`."""
+    return fp4_quantize.reference(x, gs, 16, False, False)
+
+
+def nvfp4_near_tie(x, gs):
+    """`[T, K]` bool: elements within `fp4_quantize`'s tie window of an e2m1 midpoint,
+    where the kernels' approximate reciprocals may round either way."""
+    return Fp4Quantize.near_tie(fp4_quantize.scaled(x, gs, 16))
 
 
 def _band(got, want) -> float:
@@ -95,19 +104,6 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — fixture by
     assert out[0].shape == (1, HIDDEN)
     _compare(out, op.reference(*args))
     _check_quant(out[0], out[2], out[3], args[8])
-
-
-@pytest.mark.parametrize("with_inject", [True, False])
-def test_matches_the_triton_entry(with_inject) -> None:
-    """`mixed` / `inject_out` inside the band of the Triton entry's; the NVFP4 of each
-    is exact on its own `mixed`, so where the two `mixed` agree the codes agree."""
-    args = _build(dict(with_inject=with_inject), seed=77)
-    mixed, inj, _, _ = op(*args)
-    t_mixed, t_inj, _, _ = triton_op(*args)
-    assert _band(mixed, t_mixed) <= 1.0
-    if with_inject:
-        assert _band(inj, t_inj) <= 1.0
-    print(f"\n  mixed bitwise the Triton entry's: {(mixed == t_mixed).float().mean().item():.4f}")
 
 
 def test_deterministic() -> None:

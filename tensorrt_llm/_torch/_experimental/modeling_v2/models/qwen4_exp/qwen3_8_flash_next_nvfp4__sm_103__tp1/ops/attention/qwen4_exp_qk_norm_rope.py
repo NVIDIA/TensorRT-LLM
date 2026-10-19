@@ -146,8 +146,8 @@ def _qwen4_exp_qk_norm_rope_kernel(
 def _launch(num_tokens: int) -> Tuple[int, int]:
     """Main-plane heads per program and warps per program, by token count.
 
-    Measured on GB300 (microbench `qk-norm-rope-decode`, CUDA-graph replay, 12
-    rotating layers, us per call; HPB/warps):
+    Measured on GB300 (CUDA-graph replay, 12 rotating layers, us per call;
+    HPB/warps):
 
         tokens   1/2    2/2    2/4    4/4    8/8    32/8
         1        1.76   1.84   1.87   1.99   1.92   2.82

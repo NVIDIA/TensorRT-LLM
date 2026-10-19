@@ -2,9 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """GPU test for the gdn_decode_rows_gated_norm entry.
 
-Cells against the composition's fp64 reference (the recurrence entry's, then the
-gated norm entry's) in the recurrence entry's band: torch's default for the bf16
-output and the fp32 pool, the pool compared whole so slots the call did not name are
+Cells against the composition's fp64 reference (the gated delta rule's recurrence,
+then the gated norm entry's) in torch's default band for the bf16 output and the fp32
+pool, the pool compared whole so slots the call did not name are
 gated too. Beyond the cells: agreement with the unfused composition it replaces
 (FlashInfer's recurrence, then the gated norm entry) at decode batch sizes, PDL on
 and off bitwise, a stale-read check under graph replay (a producer rewrites the
@@ -13,13 +13,10 @@ projection inside the graph right before the op), and the guards.
 
 import zlib
 
+import flashinfer.gdn_decode
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.ssm.gated_delta_rule_decode_pretranspose import (  # noqa: E501
-    _scattered,
-    gated_delta_rule_decode_pretranspose,
-)
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.norm.rms_norm_gated_token_major import (  # noqa: E501
     rms_norm_gated_token_major,
 )
@@ -42,6 +39,13 @@ DEV = "cuda"
 H, HV, K, V = 16, 48, 128, 128
 SLOTS, EPS = 461, 1e-6
 WIDTH = 2 * H * K + 2 * HV * V + 2 * HV
+
+
+def _scattered(n: int, slots: int) -> tuple[int, ...]:
+    """`n` distinct slots of a `slots`-row pool, both ends first, then a stride-37 walk
+    over the interior (37 is coprime to every pool size here)."""
+    rest = tuple((i * 37 + 4) % (slots - 2) + 1 for i in range(max(n - 2, 0)))
+    return ((slots - 1, 0) + rest)[:n]
 
 
 def _build(spec, seed):
@@ -97,7 +101,7 @@ def _unfused(proj, pool, slots, A_log, dt_bias, w, eps, h, k):
     rows = proj.shape[0]
     q, kk, v, z, a, b = torch.split(proj, [h * k, h * k, HV * V, HV * V, HV, HV], 1)
     o = torch.empty(rows, 1, HV, V, dtype=torch.bfloat16, device=DEV)
-    gated_delta_rule_decode_pretranspose(
+    flashinfer.gdn_decode.gated_delta_rule_decode_pretranspose(
         q=q.reshape(rows, 1, h, k),
         k=kk.reshape(rows, 1, h, k),
         v=v.reshape(rows, 1, HV, V),

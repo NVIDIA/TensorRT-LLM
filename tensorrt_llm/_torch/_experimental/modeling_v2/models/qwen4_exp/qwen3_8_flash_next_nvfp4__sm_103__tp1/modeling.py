@@ -27,9 +27,9 @@ Differences from other targets:
   weight, ``ops/hc/qwen4_exp_hc_lowrank_act`` and ``ops/hc/qwen4_exp_hc_up_gate_mean``
   (the up projection as a tcgen05 GEMM whose epilogue applies the sigmoid gate and the
   stream mean). ``DecodeTarget`` mixers run the first projection as one tcgen05 launch
-  (``ops/hc/qwen4_exp_hc_decode_tc_first``, ``_HC_TC_FIRST_MIN_ROWS`` to
-  ``_HC_TC_FIRST_MAX_ROWS`` rows) or, at ``_HC_DECODE_GEMV_MAX_ROWS`` rows, two GEMV
-  launches (``ops/hc/qwen4_exp_hc_decode_first_cute``, ``ops/hc/qwen4_exp_hc_decode_mix``);
+  (``ops/hc/qwen4_exp_hc_decode_tc_first``, up to ``_HC_TC_FIRST_MAX_ROWS`` rows) or, at
+  ``_HC_DECODE_GEMV_MAX_ROWS`` rows, the whole site as two GEMV launches
+  (``ops/hc/qwen4_exp_hc_decode_first_cute``, ``ops/hc/qwen4_exp_hc_decode_mix_fp4_cute``);
   at the 48 MoE sites the mixer's last launch also writes the routed experts' NVFP4
   input. The MTP layer and the prefill PLE block keep the unfused
   ``qwen4_exp_gated_residual`` / ``qwen4_exp_post_inject`` / ``_grouped_norm``.
@@ -128,9 +128,6 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.low_m_bf16_mm im
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.graph.eager_on_graph import (
     eager_on_graph,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.quantization.fp4_quantize import (
-    fp4_quantize,
-)
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.ssm.flashinfer_chunk_gated_delta_rule import (  # noqa: E501
     flashinfer_chunk_gated_delta_rule,
 )
@@ -165,6 +162,7 @@ from .ops.attention.qsa_paged_sparse_gqa_nvfp4 import qsa_paged_sparse_gqa_nvfp4
 from .ops.attention.qsa_prefill_compress import qsa_prefill_compress
 from .ops.attention.qsa_sparse_gqa_rowtile import qsa_sparse_gqa_rowtile
 from .ops.attention.qsa_topk_expand_decode import qsa_topk_expand_decode
+from .ops.attention.qsa_topk_expand_decode import supports as _topk_expand_supports
 from .ops.attention.qsa_topk_select import qsa_topk_select
 from .ops.attention.qwen4_exp_attn_decode_prologue import qwen4_exp_attn_decode_prologue
 from .ops.attention.qwen4_exp_qk_norm_rope import qwen4_exp_qk_norm_rope
@@ -174,13 +172,11 @@ from .ops.gemm.bf16_gemv_pdl import TILING as _GEMV_TILED_K
 from .ops.gemm.bf16_gemv_pdl import bf16_gemv_pdl
 from .ops.hc.qwen4_exp_gated_residual import qwen4_exp_gated_residual
 from .ops.hc.qwen4_exp_hc_decode_first_cute import qwen4_exp_hc_decode_first_cute
-from .ops.hc.qwen4_exp_hc_decode_mix import qwen4_exp_hc_decode_mix
 from .ops.hc.qwen4_exp_hc_decode_mix_fp4_cute import (
     qwen4_exp_hc_decode_mix_cute,
     qwen4_exp_hc_decode_mix_fp4_cute,
 )
 from .ops.hc.qwen4_exp_hc_decode_tc_first import qwen4_exp_hc_decode_tc_first
-from .ops.hc.qwen4_exp_hc_gate_mean import qwen4_exp_hc_gate_mean
 from .ops.hc.qwen4_exp_hc_inject_norm import qwen4_exp_hc_inject_norm
 from .ops.hc.qwen4_exp_hc_lowrank_act import qwen4_exp_hc_lowrank_act
 from .ops.hc.qwen4_exp_hc_up_gate_mean import qwen4_exp_hc_up_gate_mean
@@ -454,10 +450,6 @@ _VISION_CALL_MAX_PATCHES = 32768
 
 # NVFP4 block size: one e4m3 scale per 16 contiguous elements along K.
 _SF_VEC = _weights.SF_VEC
-# The trtllm-gen MoE runner reads activation scales as a *linear* buffer, not the
-# 128x4-swizzled one of a dense NVFP4 GEMM. Byte counts match when num_tokens is a
-# multiple of 128 (every decode graph batch), so the wrong one passes silently.
-_SF_LINEAR = False
 # Routing happens outside (renorm_moe_routing_op), so the runner's routing method is
 # inert, but it must be 1 (Renormalize): the tier table covers (512 experts, 16
 # top-k) only for it, and a tier miss is a logged error with no exception and no
@@ -544,26 +536,17 @@ _MTP_NUM_LAYERS = 1
 _MTP_EMBED_BLOCK_ALL_STREAMS = True
 
 #: Decode batches up to this many rows run each trunk hyper-connection site as
-#: `qwen4_exp_hc_decode_first_cute` + `qwen4_exp_hc_decode_mix` (two GEMV launches);
-#: larger ones as `qwen4_exp_hc_inject_norm` + cuBLAS. A dispatch threshold from the
-#: GB300 micro-bench (the GEMVs win at 1 row and lose from 2), at most the entries'
-#: MAX_ROWS.
+#: `qwen4_exp_hc_decode_first_cute` + `qwen4_exp_hc_decode_mix_cute` (or its NVFP4
+#: variant at an MoE site; two GEMV launches); larger ones as `qwen4_exp_hc_inject_norm`
+#: and the mixer. A dispatch threshold from the GB300 micro-bench (the GEMVs win at 1
+#: row and lose from 2), at most the entries' MAX_ROWS.
 _HC_DECODE_GEMV_MAX_ROWS = 1  # capacity: fixed: dispatch threshold, not a buffer bound
 
-#: Decode row count from which the hyper-connection up projection runs as
-#: `qwen4_exp_hc_up_gate_mean` (gate and stream mean in the GEMM epilogue). The
-#: fused kernel's 80 tiles read the 6.5 MB up weight slower than cuBLAS at
-#: one row (5.8 vs 5.2 us); from 2 rows on the saved launch and logits round
-#: trip win (5.6 vs 6.1 us at 2, 5.5 vs 7.4 at 128; GB300, graph-replayed,
-#: cold weights). Prefill always takes the fused op. Trunk sites at most
-#: `_HC_DECODE_GEMV_MAX_ROWS` rows never reach the mixer (two GEMV launches).
-_HC_FUSED_UP_MIN_ROWS = 2  # capacity: fixed: dispatch threshold, not a buffer bound
-
-#: Decode row counts whose hyper-connection mixer runs its first half (projection
-#: and activations) as the one tcgen05 launch `qwen4_exp_hc_decode_tc_first`
-#: instead of cuBLAS split-K (+ its reduce) + `qwen4_exp_hc_lowrank_act`. The upper
-#: bound is the entry's MAX_ROWS (one 128-row MMA tile); larger batches keep cuBLAS.
-_HC_TC_FIRST_MIN_ROWS = 2  # capacity: fixed: dispatch threshold, not a buffer bound
+#: Decode row counts up to which a hyper-connection mixer (so from
+#: `_HC_DECODE_GEMV_MAX_ROWS + 1` rows) runs its first half (projection and
+#: activations) as the one tcgen05 launch `qwen4_exp_hc_decode_tc_first` instead of
+#: cuBLAS split-K (+ its reduce) + `qwen4_exp_hc_lowrank_act`: the entry's MAX_ROWS
+#: (one 128-row MMA tile); larger batches keep cuBLAS.
 _HC_TC_FIRST_MAX_ROWS = (
     128  # capacity: fixed: dispatch threshold (one MMA tile), not a buffer bound
 )
@@ -2991,14 +2974,13 @@ class PrefillTarget:
             if num_ctx < num_tokens:
                 parts.append((num_ctx, num_tokens, False))
             # Each part's canonical block top-k and its expansion are one launch writing its
-            # rows of the step's selection (QSA's row starts are zero); a score table wider
-            # than that kernel's 4096 columns takes the composition.
+            # rows of the step's selection (QSA's row starts are zero); a score table that
+            # kernel does not serve (wider than its 4096 columns) takes the composition.
             selected = torch.empty(
                 [num_tokens, core.token_topk + core.compress_ratio - 1],
                 dtype=torch.int32,
                 device=proj.device,
             )
-            fused_select = block_table.shape[1] * tokens_per_block // core.compress_ratio <= 4096
             for lo, hi, context_rows in parts:
                 scores = qsa_paged_index_scores(
                     q=q_index[lo:hi],
@@ -3011,7 +2993,7 @@ class PrefillTarget:
                     only_visible_blocks=True,
                     context_rows=context_rows,
                 )
-                if fused_select and scores.shape[1] % 4 == 0:
+                if _topk_expand_supports(scores):
                     qsa_topk_expand_decode(
                         scores,
                         visible_blocks[lo:hi],
@@ -3308,9 +3290,10 @@ class PrefillTarget:
     def _gdn_core_generic(self, proj, out, i) -> None:
         """`_gdn_core` on a verify step or over a bf16 recurrent pool: the conv, the
         post-conv gating and the chunked delta rule over the step's `n` rows, or under
-        speculation the verify path for the generation rows. The q|k|v, a and b columns are
-        copied out of the projection first: these entries are certified on contiguous
-        operands."""
+        speculation the verify path for the generation rows. The q|k|v columns are read in
+        place, as the column view of the projection every consumer here is certified on;
+        the a and b columns are copied out first, as the verify path reads them contiguous.
+        The chunked delta rule writes its rows of `out` directly."""
         core = self.core
         L = self._layers[i]
         step = self._step
@@ -3334,7 +3317,7 @@ class PrefillTarget:
         ) = step.gdn
         num_tokens = step.num_tokens
         mixed_qkv, _, a, b = torch.split(proj[:num_tokens], core.in_proj_split, 1)
-        mixed_qkv, a, b = mixed_qkv.contiguous(), a.contiguous(), b.contiguous()
+        a, b = a.contiguous(), b.contiguous()
 
         conv_states = core._bound.conv[i]
         ssm_states = core._bound.ssm[i]
@@ -3379,7 +3362,7 @@ class PrefillTarget:
                     softplus_threshold=_SOFTPLUS_THRESHOLD,
                 )
                 # q and k are already L2-normalized by the post-conv call.
-                out_p, _ = chunk_gated_delta_rule(
+                chunk_gated_delta_rule(
                     q,
                     k,
                     v,
@@ -3392,12 +3375,11 @@ class PrefillTarget:
                     output_final_state=False,
                     cu_seqlens=qsl_long_p,
                     use_qk_l2norm_in_kernel=False,
-                    output=None,
+                    output=out[:, :num_prefill_tokens],
                 )
                 out_d = self._gdn_verify(
                     mq_d, a_d, b_d, ssm_states, i, L, si_d, int_idx, num_decodes, gen_p, replay
                 )
-                out[:, :num_prefill_tokens].copy_(out_p)
                 out[:, num_prefill_tokens:num_tokens].copy_(out_d)
                 out[:, num_tokens:].zero_()
                 return
@@ -3454,7 +3436,7 @@ class PrefillTarget:
                 softplus_threshold=_SOFTPLUS_THRESHOLD,
             )
         # q and k are already L2-normalized; the recurrence must not repeat it.
-        recurrence, _ = chunk_gated_delta_rule(
+        chunk_gated_delta_rule(
             q,
             k,
             v,
@@ -3467,9 +3449,8 @@ class PrefillTarget:
             output_final_state=False,
             cu_seqlens=qsl_long,
             use_qk_l2norm_in_kernel=False,
-            output=None,
+            output=out[:, :num_tokens],
         )
-        out[:, :num_tokens].copy_(recurrence)
         out[:, num_tokens:].zero_()
 
     def _gdn_prefill_prep(self, mq, a, b, L, i, qsl, si, hi):
@@ -4423,12 +4404,12 @@ class DecodeTarget:
     def _hc_first(self, normed, first, with_inject):
         """The mixer's first half from the site's normed stream: the projection
         over `[down; block_inject; 0]` and the SiLU / injection activations.
-        Returns `(low, inject)`. Between `_HC_TC_FIRST_MIN_ROWS` and
-        `_HC_TC_FIRST_MAX_ROWS` rows (a per-capture constant) one tcgen05 launch,
-        `qwen4_exp_hc_decode_tc_first`; otherwise cuBLAS's fp32 logits and
-        `qwen4_exp_hc_lowrank_act`."""
+        Returns `(low, inject)`. Up to `_HC_TC_FIRST_MAX_ROWS` rows (a per-capture
+        constant) one tcgen05 launch, `qwen4_exp_hc_decode_tc_first`; larger batches
+        cuBLAS's fp32 logits and `qwen4_exp_hc_lowrank_act`. Only sites past
+        `_HC_DECODE_GEMV_MAX_ROWS` rows reach a mixer."""
         core = self.core
-        if _HC_TC_FIRST_MIN_ROWS <= normed.shape[0] <= _HC_TC_FIRST_MAX_ROWS:
+        if normed.shape[0] <= _HC_TC_FIRST_MAX_ROWS:
             return qwen4_exp_hc_decode_tc_first(
                 normed, first, core.hc_lowrank, core.hc_count, with_inject
             )
@@ -4443,21 +4424,16 @@ class DecodeTarget:
     def _hc_mixer(self, normed, first, up, with_inject):
         """One hyper-connection mixer from the site's normed stream: the first
         projection over `[down; block_inject; 0]` (fp32 logits), the SiLU and
-        injection activations, the up projection, and the sigmoid gate with the
-        stream mean. From `_HC_FUSED_UP_MIN_ROWS` rows (a per-capture constant)
-        the up projection carries the gate and the mean in its epilogue; below
-        it cuBLAS's up projection + `qwen4_exp_hc_gate_mean` is faster.
-        Returns `(mixed, inject)`; `inject` is None without `with_inject` (the
-        stack-final mixer).
+        injection activations, then the up projection with the sigmoid gate and the
+        stream mean in its epilogue. Returns `(mixed, inject)`; `inject` is None
+        without `with_inject` (the stack-final mixer).
 
         Neither projection takes the step's `gemm` (`low_m_bf16_mm` under CUDA
         graphs): neither FlashInfer low-M kernel writes the first projection's
         fp32 logits, and the up projection's K = 320 tiles neither of them."""
         core = self.core
         low, inject = self._hc_first(normed, first, with_inject)
-        if normed.shape[0] >= _HC_FUSED_UP_MIN_ROWS:
-            return qwen4_exp_hc_up_gate_mean(low, up, normed, core.hc_count), inject
-        return qwen4_exp_hc_gate_mean(cublas_mm(low, up), normed, core.hc_count), inject
+        return qwen4_exp_hc_up_gate_mean(low, up, normed, core.hc_count), inject
 
     def _hc_site(self, hc, block_out, inject, norm, first, up, with_inject, normed=None, moe=None):
         """One trunk hyper-connection site: the previous block's injection (none at
@@ -4491,8 +4467,9 @@ class DecodeTarget:
                 topk_w,
                 topk_rows,
             )
-            mix = qwen4_exp_hc_decode_mix_cute if hc.shape[0] == 1 else qwen4_exp_hc_decode_mix
-            mixed, inject = mix(part, ss, up, hc, norm, core.eps, core.hc_count, with_inject)
+            mixed, inject = qwen4_exp_hc_decode_mix_cute(
+                part, ss, up, hc, norm, core.eps, core.hc_count, with_inject
+            )
             return hc, mixed, inject
         if normed is None:
             hc, normed = qwen4_exp_hc_inject_norm(
@@ -4514,10 +4491,9 @@ class DecodeTarget:
         """`_hc_site` at an MoE site (always with injection), returning the
         routed experts' NVFP4 input (linear scales, the layer's global scale
         `gscale`) beside the mix, written by the mixer's own last launch: on the
-        GEMV route `qwen4_exp_hc_decode_mix_fp4_cute`, from `_HC_FUSED_UP_MIN_ROWS`
-        rows the fused up projection `qwen4_exp_hc_up_gate_mean_fp4`. Between
-        the two (only if the thresholds leave a gap) `fp4_quantize` reads the
-        mix back. Returns `(hc, mixed, inject, xq, xsf)`."""
+        GEMV route `qwen4_exp_hc_decode_mix_fp4_cute`, otherwise the fused up
+        projection `qwen4_exp_hc_up_gate_mean_fp4`. Returns
+        `(hc, mixed, inject, xq, xsf)`."""
         core = self.core
         if hc.shape[0] <= _HC_DECODE_GEMV_MAX_ROWS:
             hc, part, ss = qwen4_exp_hc_decode_first_cute(
@@ -4528,12 +4504,8 @@ class DecodeTarget:
             )
             return hc, mixed, inject, xq, xsf
         hc, normed = qwen4_exp_hc_inject_norm(hc, block_out, inject, norm, core.eps, core.hc_count)
-        if normed.shape[0] >= _HC_FUSED_UP_MIN_ROWS:
-            low, inject = self._hc_first(normed, first, True)
-            mixed, xq, xsf = qwen4_exp_hc_up_gate_mean_fp4(low, up, normed, core.hc_count, gscale)
-            return hc, mixed, inject, xq, xsf
-        mixed, inject = self._hc_mixer(normed, first, up, True)
-        xq, xsf = fp4_quantize(mixed, gscale, _SF_VEC, False, _SF_LINEAR)
+        low, inject = self._hc_first(normed, first, True)
+        mixed, xq, xsf = qwen4_exp_hc_up_gate_mean_fp4(low, up, normed, core.hc_count, gscale)
         return hc, mixed, inject, xq, xsf
 
     def _grouped_norm(self, x: torch.Tensor, weights: tuple) -> torch.Tensor:
@@ -4616,7 +4588,7 @@ class DecodeTarget:
         attention core joins it before reading either."""
         core = self.core
         num_tokens = proj.shape[0]
-        req_idx, logical, _, _, _, _, block_table, tokens_per_block, _, pos3, coords, _ = qsa
+        req_idx, logical, _, _, _, _, block_table, tokens_per_block, pos3, coords, _ = qsa
         side.wait_stream(torch.cuda.current_stream())
         qwen4_exp_qk_norm_rope(
             proj,
@@ -4718,7 +4690,6 @@ class DecodeTarget:
             topk_row_starts,
             block_table,
             tokens_per_block,
-            pos,
             pos3,
             coords,
             sparse,
@@ -4817,7 +4788,7 @@ class DecodeTarget:
                 use_pdl=fused_prologue,
                 prefetch=fused_prologue and num_tokens <= _SPARSE_DECODE_MAX_ROWS,
             )
-            if scores.shape[1] % 4 == 0 and scores.shape[1] <= 4096:
+            if _topk_expand_supports(scores):
                 # The canonical block top-k and its expansion to tokens in one launch
                 # (QSA's row starts are zero).
                 selected = qsa_topk_expand_decode(
@@ -4988,7 +4959,7 @@ class DecodeTarget:
         Over a bf16 pool the recurrence is `fused_sigmoid_gating_delta_rule_update`'s rows
         form, which is batch-invariant."""
         core = self.core
-        si_all, qsl_long, is_verify, num_decodes, gen_p, int_idx, replay = gdn_state
+        si_all, is_verify, num_decodes, gen_p, int_idx, replay = gdn_state
         num_tokens = x.shape[0]
         ssm_states = core._bound.ssm[i]
         fp32_state = ssm_states.dtype == torch.float32
@@ -5221,7 +5192,6 @@ class DecodeTarget:
         attn_metadata: AttentionMetadata,
         input_ids: torch.IntTensor | None = None,
         position_ids: torch.IntTensor | None = None,
-        inputs_embeds: torch.FloatTensor | None = None,
         **kwargs,
     ):
         core = self.core
@@ -5234,9 +5204,8 @@ class DecodeTarget:
         # (`_decode_projection`); an eager step keeps cuBLAS.
         gemm = _decode_projection if md.is_cuda_graph else cublas_mm
 
-        # Three views of one `[3, 1, T]` buffer (see PrefillTarget.forward): `pos`,
-        # contiguous `pos3`, and `coords`.
-        pos = torch.reshape(torch.split(position_ids, [1, _QSA_POSITION_AXES - 1], 0)[0], [-1])
+        # Two views of one `[3, 1, T]` buffer (see PrefillTarget.forward): contiguous
+        # `pos3` and `coords`.
         coords = torch.transpose(torch.reshape(position_ids, [_QSA_POSITION_AXES, -1]), 0, 1)
         pos3 = torch.empty(
             [_QSA_POSITION_AXES, position_ids.shape[-1]],
@@ -5245,18 +5214,7 @@ class DecodeTarget:
         )
         pos3.copy_(torch.reshape(position_ids, [_QSA_POSITION_AXES, -1]))
 
-        # Spliced vision rows are already the embedding; a lookup would overwrite them.
-        if inputs_embeds is None:
-            h = nn.functional.embedding(input_ids, core.w["embed"])
-        else:
-            assert inputs_embeds.shape[0] == input_ids.shape[0], (
-                f"the spliced embedding carries {inputs_embeds.shape[0]} rows for "
-                f"{input_ids.shape[0]} token ids"
-            )
-            assert inputs_embeds.shape[1] == core.hidden, (
-                f"the spliced embedding is {inputs_embeds.shape[1]} wide, not {core.hidden}"
-            )
-            h = inputs_embeds
+        h = nn.functional.embedding(input_ids, core.w["embed"])
         num_tokens = h.shape[0]
         dt = h.dtype
         dev = h.device
@@ -5311,7 +5269,7 @@ class DecodeTarget:
             int_idx = core._bound.int_idx[:batch]
             if core._bound.replay is not None:
                 replay = _replay_work(core, mm, batch)
-        gdn_state = (si_all, qsl_long, is_verify, batch, gen_p, int_idx, replay)
+        gdn_state = (si_all, is_verify, batch, gen_p, int_idx, replay)
 
         # Every generation sequence carries its n-gram history; the engine's
         # `has_initial_states` covers the context prefix only (empty here).
@@ -5346,7 +5304,6 @@ class DecodeTarget:
             md.qsa_topk_row_starts[:num_tokens],
             md.qsa_block_table,
             md.tokens_per_block,
-            pos,
             pos3,
             coords,
             sparse,

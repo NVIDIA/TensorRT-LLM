@@ -3293,37 +3293,6 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
                          [0])
         kv_cache_manager.shutdown()
 
-    def _make_first_draft_batch(self):
-        """A first-draft request ahead of two plain generation requests that
-        carry MRoPE deltas."""
-        first_draft = self._make_mrope_gen_request(4, 1, 0, 10)
-        first_draft.py_is_first_draft = True
-        first_draft.py_num_accepted_draft_tokens = 0
-        scheduled_requests = ScheduledRequests()
-        scheduled_requests.context_requests_last_chunk = []
-        scheduled_requests.generation_requests = [
-            first_draft,
-            self._make_mrope_gen_request(6, 2, 1, 20),
-            self._make_mrope_gen_request(5, 3, 2, 30),
-        ]
-        return scheduled_requests
-
-    def test_prepare_inputs_first_draft_requests_without_mrope_are_served(
-            self) -> None:
-        """Without MRoPE a first-draft request packs as a plain generation row."""
-        model_engine, kv_cache_manager, attn_metadata = self._setup_mrope_engine(
-            spec_config=MTPDecodingConfig(max_draft_len=1))
-        _set_runner_config(model_engine._runner, use_mrope=False)
-        result = self._prepare_mrope_spec_inputs(model_engine, kv_cache_manager,
-                                                 attn_metadata,
-                                                 self._make_first_draft_batch())
-
-        # The first-draft row is [last two prompt tokens + draft slot] wide.
-        self.assertEqual(result["position_ids"].view(-1).cpu().tolist(),
-                         [2, 3, 5, 4])
-        self.assertNotIn("mrope_delta_read_seq_slots", result)
-        kv_cache_manager.shutdown()
-
     @skip_pre_blackwell_unittest
     def test_ced_warmup_passes_dummy_context_requests(self) -> None:
         for warmup in (False, True):

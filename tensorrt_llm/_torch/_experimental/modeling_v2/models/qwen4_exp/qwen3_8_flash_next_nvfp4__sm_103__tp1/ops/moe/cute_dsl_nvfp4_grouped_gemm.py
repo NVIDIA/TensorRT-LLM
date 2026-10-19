@@ -12,8 +12,7 @@ import torch
 import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtllm.*
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 
-#: e2m1 magnitudes by 3-bit code.
-_E2M1 = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
+from .cute_dsl_nvfp4_gather_grouped_gemm_act_fusion import _dequant, unswizzle
 
 
 def _ckpt(
@@ -428,30 +427,6 @@ class CuteDslNvfp4GroupedGemm(OpWrapper):
                 f"{name} must be contiguous; the kernel reads it from data_ptr() as a "
                 "dense row-major buffer and silently reads the wrong elements"
             )
-
-
-# ── native-torch NVFP4 helpers for reference() and the test's compare ────────
-
-
-def unswizzle(buf: torch.Tensor, rows: int, cols: int) -> torch.Tensor:
-    """128x4-swizzled scale bytes -> `[rows, cols]` (rows % 128 == 0, cols % 4 == 0).
-
-    Byte `(r, c)` sits at `(r // 128) * 128 * cols + (c // 4) * 512 + (r % 32) * 16
-    + ((r % 128) // 32) * 4 + c % 4`.
-    """
-    return buf.reshape(rows // 128, cols // 4, 32, 4, 4).permute(0, 3, 2, 1, 4).reshape(rows, cols)
-
-
-def _dequant(packed: torch.Tensor, sf: torch.Tensor, vec: int) -> torch.Tensor:
-    """`[R, K/2]` packed e2m1 (element 2j in the low nibble) and `[R, K/vec]` e4m3
-    bytes -> float64 `[R, K]`. Exact."""
-    nibble = torch.tensor(_E2M1, dtype=torch.float64, device=packed.device)
-    nibble = torch.cat([nibble, -nibble])
-    byte = torch.arange(256, device=packed.device)
-    pair = torch.stack([nibble[byte & 0xF], nibble[byte >> 4]], dim=1)
-    vals = pair[packed.long()].reshape(packed.shape[0], -1)
-    scales = sf.to(torch.uint8).view(torch.float8_e4m3fn).double()
-    return vals * scales.repeat_interleave(vec, dim=1)
 
 
 cute_dsl_nvfp4_grouped_gemm = CuteDslNvfp4GroupedGemm()

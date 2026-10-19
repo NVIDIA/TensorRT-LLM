@@ -4,9 +4,10 @@
 the rank-`R` bottleneck and the block-injection weights, from the first
 projection's fp32 logits, in one Triton row kernel.
 
-Tier 5 (Triton written for this target). Used where the up projection runs on
-cuBLAS (prefill-sized row counts), between `cublas_mm` (first projection) and
-`cublas_mm` (up projection) + `qwen4_exp_hc_gate_mean`.
+Tier 5 (Triton written for this target). Used where the first projection runs on
+cuBLAS (prefill, and decode batches past `qwen4_exp_hc_decode_tc_first`'s rows),
+between `cublas_mm` (first projection) and the fused up projection
+`qwen4_exp_hc_up_gate_mean` (or its NVFP4 variant).
 """
 
 from __future__ import annotations

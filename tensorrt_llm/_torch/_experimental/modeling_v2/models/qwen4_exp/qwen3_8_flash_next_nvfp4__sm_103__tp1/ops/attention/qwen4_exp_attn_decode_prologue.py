@@ -21,7 +21,6 @@ after it a program reads only the projection row.
 
 from __future__ import annotations
 
-import os
 from typing import Optional, Tuple
 
 import torch
@@ -29,6 +28,7 @@ import triton
 import triton.language as tl
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
 
 from .qsa_paged_index_store import qsa_paged_index_store as _index_store
 from .qsa_paged_kv_store import qsa_paged_kv_store as _kv_store
@@ -336,10 +336,6 @@ def _attn_decode_prologue_kernel(
             tl.store(index_cache + page * s_ic_page + slot * s_ic_slot + dims, stored_k)
 
 
-def _pdl() -> bool:
-    return os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1"
-
-
 class Qwen4ExpAttnDecodePrologue(OpWrapper):
     """`qwen4_exp_qk_norm_rope`, `qsa_paged_kv_store`, `qsa_paged_index_store` and
     `qsa_prefill_compress` of one sparse decode attention layer, in one launch.
@@ -422,7 +418,7 @@ class Qwen4ExpAttnDecodePrologue(OpWrapper):
         hpb, warps = _qk_launch(num_tokens)
         main_programs = triton.cdiv(num_heads_q + num_heads_k, hpb)
         section = compress_mrope_section or (0, 0, 0)
-        pdl = _pdl()
+        pdl = get_env_enable_pdl()
         _attn_decode_prologue_kernel[(num_tokens, main_programs + 2)](
             proj,
             proj.stride(0),

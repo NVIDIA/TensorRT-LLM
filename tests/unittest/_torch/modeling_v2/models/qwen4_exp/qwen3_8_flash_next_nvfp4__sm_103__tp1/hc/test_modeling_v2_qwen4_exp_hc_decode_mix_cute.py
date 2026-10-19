@@ -1,18 +1,15 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """GPU test for the qwen4_exp_hc_decode_mix_cute entry (the plain build of the CuTe mix
-kernel): cells against the Triton entry's float64 reference in its band (`mixed` and
-`inject_out` in `rtol = eps`, `atol = eps * max|ref|`), agreement with the Triton entry
-inside the same band, a stale-read check under CUDA-graph replay with PDL, the guards."""
+kernel): cells against the entry's float64 reference in its band (`mixed` and
+`inject_out` in `rtol = eps`, `atol = eps * max|ref|`), a stale-read check under
+CUDA-graph replay with PDL, the guards."""
 
 import zlib
 
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.hc.qwen4_exp_hc_decode_mix import (  # noqa: E501
-    qwen4_exp_hc_decode_mix as triton_op,
-)
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.hc.qwen4_exp_hc_decode_mix_fp4_cute import (  # noqa: E501
     qwen4_exp_hc_decode_mix_cute as op,
 )
@@ -72,17 +69,6 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — fixture by
     out = op(*args)
     assert out[0].shape == (1, HIDDEN)
     _compare(out, op.reference(*args))
-
-
-@pytest.mark.parametrize("with_inject", [True, False])
-def test_matches_the_triton_entry(with_inject) -> None:
-    args = _build(dict(with_inject=with_inject), seed=77)
-    mixed, inj = op(*args)
-    t_mixed, t_inj = triton_op(*args)
-    assert _band(mixed, t_mixed) <= 1.0
-    if with_inject:
-        assert _band(inj, t_inj) <= 1.0
-    print(f"\n  mixed bitwise the Triton entry's: {(mixed == t_mixed).float().mean().item():.4f}")
 
 
 def test_deterministic() -> None:

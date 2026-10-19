@@ -82,9 +82,8 @@ ROW_ULP, RMS_ULP, STATE_ULP = 2.0, 0.1, 2.0
 #: The per-element row-max gate is a tail statistic, and a context-shaped cell
 #: draws ~100x more elements than a 128-row one. Against the same float64
 #: reference over three seeds at 16384 rows, the composition this replaces
-#: reaches 2.91 row-max ulp (normed) and the op 2.94; at 8192 rows 1.89 / 1.89
-#: (`microbench/diag_band.py` in the candidate dir). Cells above 1024 rows are
-#: therefore gated at 4; the RMS gate is unchanged.
+#: reaches 2.91 row-max ulp (normed) and the op 2.94; at 8192 rows 1.89 / 1.89.
+#: Cells above 1024 rows are therefore gated at 4; the RMS gate is unchanged.
 CONTEXT_ROWS, CONTEXT_ROW_ULP = 1024, 4.0
 
 

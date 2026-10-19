@@ -2,13 +2,12 @@
 # SPDX-License-Identifier: Apache-2.0
 """GPU test for the qwen4_exp_hc_decode_first_cute entry.
 
-Cells against the Triton entry's float64 reference, in the Triton entry's bands:
-`hc_out` within one ulp (plus the combine's and the finalize's own rounding at the
-MoE sites), `part` within `2^-16` of the reference relative to its scale, `ss` to
-fp32 accuracy. Beyond the cells: `hc_out` bitwise the Triton entry's (the same fp32
-arithmetic), `part` / `ss` inside the band of it; a stale-read check under CUDA-graph
-replay with PDL, where a kernel that read its activations before
-`griddepcontrol.wait` would see the previous replay's; determinism; the guards.
+Cells against the entry's float64 reference: `hc_out` within one ulp (plus the
+combine's and the finalize's own rounding at the MoE sites), `part` within `2^-16` of
+the reference relative to its scale, `ss` to fp32 accuracy. Beyond the cells: a
+stale-read check under CUDA-graph replay with PDL, where a kernel that read its
+activations before `griddepcontrol.wait` would see the previous replay's; determinism;
+the guards.
 """
 
 import zlib
@@ -16,9 +15,6 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.hc.qwen4_exp_hc_decode_first import (  # noqa: E501
-    qwen4_exp_hc_decode_first as triton_op,
-)
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.hc.qwen4_exp_hc_decode_first_cute import (  # noqa: E501
     qwen4_exp_hc_decode_first_cute as op,
 )
@@ -70,7 +66,7 @@ def _routed(block_out, topk_weights, topk_rows):
 def _hc_band_ratio(
     hc, ref_hc, block_out, inject, shared, gate, topk_weights=None, topk_rows=None
 ) -> float:
-    """The Triton entry's `hc_out` band at the MoE sites: one ulp of `hc_out`, plus one
+    """The `hc_out` band at the MoE sites: one ulp of `hc_out`, plus one
     ulp of the combine (and with the fold, of the routed row) times `|inject|`."""
     feps, tiny = torch.finfo(ref_hc.dtype).eps, torch.finfo(ref_hc.dtype).tiny
     routed = _routed(block_out, topk_weights, topk_rows)
@@ -94,7 +90,7 @@ def _compare_moe(args, out, ref) -> None:
 
 
 def _build(spec, seed):
-    """The Triton entry's test operands at one row."""
+    """The test operands at one row."""
     rows, hc_count, hidden, dtype = 1, HC_COUNT, HIDDEN, torch.bfloat16
     width = hc_count * hidden
     n_cols = spec.get("n_cols", RANK + hc_count)
@@ -164,32 +160,6 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — fixture by
         _compare(out, op.reference(*args))
     else:
         _compare_moe(args, out, op.reference(*args))
-
-
-@pytest.mark.parametrize(
-    "spec",
-    [
-        dict(),
-        dict(moe=True),
-        dict(moe=True, fold=10),
-        dict(moe=True, fold=10, drop=True),
-        dict(inject=False),
-    ],
-    ids=["inject", "combine", "fold", "fold-drop", "norm-only"],
-)
-def test_matches_the_triton_entry(spec) -> None:
-    """`hc_out` bitwise (same fp32 arithmetic and rounding); `part` and `ss` reduce in
-    another order, inside the band of the Triton entry's values."""
-    args = _build(spec, seed=4242)
-    hc, part, ss = op(*args)
-    t_hc, t_part, t_ss = triton_op(*args)
-    assert torch.equal(hc, t_hc), "hc_out"
-    assert _band(part, t_part, PART_EPS) <= 1.0, "part"
-    assert torch.allclose(ss, t_ss, rtol=1e-5, atol=0), "ss"
-    print(
-        f"\n  {spec}: part bitwise {(part == t_part).float().mean().item():.3f} "
-        f"({_band(part, t_part, PART_EPS):.3g}x the band apart)"
-    )
 
 
 def test_deterministic() -> None:

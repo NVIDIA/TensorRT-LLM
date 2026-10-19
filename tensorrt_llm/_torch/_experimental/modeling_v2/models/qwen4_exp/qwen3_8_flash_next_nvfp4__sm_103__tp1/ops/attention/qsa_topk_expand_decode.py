@@ -20,7 +20,6 @@ NaN ranks above everything).
 from __future__ import annotations
 
 import functools
-import os
 
 import cuda.bindings.driver as cuda_drv
 import cutlass
@@ -31,11 +30,14 @@ from cutlass.cute import experimental as cute_ext
 from cutlass.cute.runtime import from_dlpack
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
 
 from .qsa_expand_block_indices import qsa_expand_block_indices as _expand
 
 #: Consecutive scores a thread holds (one 16-byte load).
 KPT = 4
+#: Score columns a row may have: `KPT` a thread, at most 1024 threads a CTA.
+MAX_WIDTH = KPT * 1024
 #: CTAs an SM the register allocation is held to. At the 2592-wide score table a row is 672
 #: threads, which the per-subpartition register file holds once an SM at the compiler's own
 #: 48 registers a thread; at three (32 a thread) rows overlap each other's barriers and
@@ -51,13 +53,6 @@ _I32_MAX = 0x7FFFFFFF
 CAP = 128
 #: Threads that own the 2048 bins of a scan, four each.
 _SCAN_THREADS = _HIST // 4
-
-
-@functools.lru_cache(maxsize=None)
-def pdl_enabled(device_index: int) -> bool:
-    """Programmatic dependent launch: sm_90+ unless TRTLLM_ENABLE_PDL=0."""
-    props = torch.cuda.get_device_properties(device_index)
-    return props.major >= 9 and os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1"
 
 
 def _threads(width: int) -> int:
@@ -415,7 +410,7 @@ def launch(
         sel = torch.empty((rows, token_topk + compress_ratio - 1), dtype=torch.int32, device=dev)
     if rows == 0:
         return sel
-    pdl = pdl and pdl_enabled(dev.index if dev.index is not None else torch.cuda.current_device())
+    pdl = pdl and get_env_enable_pdl()
     fn = _compiled(
         rows,
         width,
@@ -438,6 +433,11 @@ def launch(
         stream,
     )
     return sel
+
+
+def supports(scores) -> bool:
+    """Whether a score table this wide is one this entry serves (see `is_valid`)."""
+    return scores.shape[1] % KPT == 0 and scores.shape[1] <= MAX_WIDTH
 
 
 class QsaTopkExpandDecode(OpWrapper):
@@ -569,7 +569,7 @@ class QsaTopkExpandDecode(OpWrapper):
         assert scores.dtype == torch.float32 and scores.stride(1) == 1, (
             "fp32 scores, unit column stride"
         )
-        assert scores.shape[1] % KPT == 0 and scores.shape[1] <= KPT * 1024, "W % 4 == 0, W <= 4096"
+        assert scores.shape[1] % KPT == 0 and scores.shape[1] <= MAX_WIDTH, "W % 4 == 0, W <= 4096"
         assert scores.stride(0) % KPT == 0 and scores.data_ptr() % 16 == 0, "16-byte aligned rows"
         assert topk_indices.dtype == torch.int32 and topk_indices.is_contiguous(), (
             "int32 topk_indices"
