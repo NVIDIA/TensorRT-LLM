@@ -19,7 +19,7 @@ import enum
 import importlib
 import traceback
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import (Any, Callable, ClassVar, Dict, List, Mapping, Optional,
                     Protocol, Tuple, Type, TypeVar, Union)
 
@@ -34,19 +34,17 @@ from ..logger import logger
 from ..sampling_params import SamplingParams
 from .content_format import ContentFormat
 from .data import TextPrompt
-from .multimodal import MULTIMODAL_ENCODER_ITEM_METADATA_KEY
-from .multimodal import \
-    MultimodalEncoderItemMetadata as MultimodalEncoderItemMetadata
-from .multimodal import (MultimodalInput, MultimodalItemMetadata,
-                         _as_cpu_tensor, _compute_mm_masks,
+# yapf: disable
+from .multimodal import (MULTIMODAL_ENCODER_ITEM_METADATA_KEY, MultimodalInput,
+                         MultimodalItemMetadata, _as_cpu_tensor,
+                         _compute_mm_masks,
                          _find_mm_embedding_lengths_from_masks,
                          _find_mm_token_runs_from_mask,
                          _find_mm_token_start_pos_from_masks, apply_mm_hashes,
-                         default_hasher, find_mm_token_lengths)
-from .multimodal import \
-    get_multimodal_encoder_item_metadata as get_multimodal_encoder_item_metadata
-from .multimodal import (hexdigest_to_int32, normalize_multimodal_item_metadata,
+                         default_hasher, find_mm_token_lengths,
+                         get_multimodal_item_metadata, hexdigest_to_int32,
                          validate_mm_inputs)
+# yapf: enable
 from .multimodal_data import MEDIA_MODALITIES, serialize_item
 from .prefix_token_cache import create_prefix_token_cache
 from .tokenization import tokenize_prompt
@@ -64,6 +62,29 @@ def _hash_mm_processor_kwargs(mm_processor_kwargs: Dict[str, Any],
     except (TypeError, ValueError, RuntimeError):
         return None
     return hasher.hexdigest()
+
+
+def _merge_mm_item_metadata(
+    prepared: MultimodalItemMetadata | None,
+    metadata: MultimodalItemMetadata | None,
+) -> MultimodalItemMetadata | None:
+    """Combine prompt layout with model costs and partitions at input preparation."""
+    if metadata is None:
+        return prepared
+    if prepared is None or prepared is metadata:
+        return metadata
+    if metadata.item_refs != prepared.item_refs:
+        raise ValueError(
+            "Multimodal item references do not match the prompt item order")
+    known_rows = prepared.output_embedding_lengths
+    if known_rows is not None:
+        if metadata.output_embedding_lengths is None:
+            return replace(metadata, output_embedding_lengths=known_rows)
+        if metadata.output_embedding_lengths != known_rows:
+            raise ValueError(
+                "Computed item output lengths do not match the prompt embedding slots"
+            )
+    return metadata
 
 
 class InputProcessor(Protocol):
@@ -152,42 +173,18 @@ class BaseMultimodalInputProcessor(ABC):
     # uses `_init_tokenization_cache` and `_encode_with_tokenization_cache`.
     supports_tokenization_cache: ClassVar[bool] = False
 
-    def get_mm_encoder_item_metadata(
-        self,
-        prompt_token_ids: List[int],
-        multimodal_data: Dict[str, Any],
-    ) -> Optional[MultimodalEncoderItemMetadata]:
-        """Return item refs, physical costs, and encoder output lengths.
-
-        Models opting into runtime MM encoder scheduling override this hook.
-        The default keeps legacy multimodal processors unchanged.
-        """
-        return None
-
     def get_mm_item_metadata(
         self,
         prompt_token_ids: List[int],
         multimodal_data: Dict[str, Any],
         mm_item_order: Optional[List[Dict[str, Any]]] = None,
     ) -> Optional[MultimodalItemMetadata]:
-        """Describe processed items independently of encoder scheduling support.
+        """Read the processed item record, independently of scheduling support.
 
-        Keep legacy encoder-cost producers at this boundary. Precomputed
-        embeddings and other models can supply order and rows without costs.
+        The framework supplies prompt order and output rows during input
+        preparation. Model processors add encoder costs and input partitions.
         """
-        if (multimodal_data.get("multimodal_embedding") is None and any(
-                isinstance(multimodal_data.get(m), dict)
-                for m in MEDIA_MODALITIES)):
-            metadata = self.get_mm_encoder_item_metadata(
-                prompt_token_ids, multimodal_data)
-            if metadata is not None:
-                if not isinstance(metadata, MultimodalEncoderItemMetadata):
-                    raise TypeError(
-                        "get_mm_encoder_item_metadata() must return a "
-                        "MultimodalEncoderItemMetadata or None")
-                return MultimodalItemMetadata.from_encoder_metadata(metadata)
-        return normalize_multimodal_item_metadata(multimodal_data,
-                                                  mm_item_order)
+        return get_multimodal_item_metadata(multimodal_data)
 
     def __init__(self,
                  model_path,
@@ -1324,7 +1321,6 @@ def create_input_processor_with_hash(
                 "mm_processor_kwargs_hash"] = _hash_mm_processor_kwargs(
                     inputs.get("mm_processor_kwargs") or {}, hash_lib)
 
-        # TODO: here we assume there is only one modality for now
         num_mm_tokens_by_key = find_mm_token_lengths(
             mm_data,
             input_processor,
@@ -1344,13 +1340,25 @@ def create_input_processor_with_hash(
         # index items at the same offsets — project into prompt order via the
         # manifest.
         mm_item_order = inputs.get("mm_item_order")
+        metadata = get_multimodal_item_metadata(multimodal_data)
         if mm_item_order:
-            num_mm_tokens = [
-                num_mm_tokens_by_key[e["modality"]][e["index"]]
-                for e in mm_item_order
-            ]
+            item_refs = tuple(
+                (entry["modality"], entry["index"]) for entry in mm_item_order)
+        elif metadata is not None:
+            item_refs = metadata.item_refs
         else:
-            num_mm_tokens = next(iter(num_mm_tokens_by_key.values()))
+            present = [
+                m for m, lengths in num_mm_tokens_by_key.items() if lengths
+            ]
+            if len(present) != 1:
+                raise ValueError(
+                    "Mixed multimodal inputs require prompt-ordered item metadata"
+                )
+            modality = present[0]
+            item_refs = tuple(
+                (modality, i)
+                for i in range(len(num_mm_tokens_by_key[modality])))
+        num_mm_tokens = [num_mm_tokens_by_key[m][i] for m, i in item_refs]
         if len(num_mm_tokens) <= 0:
             raise ValueError("multimodal hashing produced an empty multimodal "
                              "token-length list.")
@@ -1387,37 +1395,21 @@ def create_input_processor_with_hash(
             multimodal_embedding_lengths = (
                 _find_mm_embedding_lengths_from_masks(mm_mask, embed_mask,
                                                       num_mm_tokens))
-        extra_processed_inputs["multimodal_data"][
-            "multimodal_embedding_lengths"] = multimodal_embedding_lengths
+        prepared_metadata = MultimodalItemMetadata(
+            item_refs, output_embedding_lengths=multimodal_embedding_lengths)
+        multimodal_data[
+            MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = _merge_mm_item_metadata(
+                prepared_metadata,
+                get_multimodal_item_metadata(multimodal_data))
         # Store special token offsets if available
         if len(start_special_token_positions
                ) > 0 and mm_special_token_ids is not None:
             extra_processed_inputs["multimodal_data"][
                 "special_token_offsets"] = start_special_token_positions
-        # Same prompt-order projection as `num_mm_tokens` above — the cache
-        # key indexes each item's digest by its `start_positions` offset.
-        mm_item_order = inputs.get("mm_item_order")
-        if mm_item_order:
-            mm_hashes_flat = [
-                mm_hashes[e["modality"]][e["index"]] for e in mm_item_order
-            ]
-        else:
-            mm_hashes_flat = [
-                h for hashes in mm_hashes.values() for h in hashes
-            ]
-        # `MultimodalInput.multimodal_uuids` must index in lockstep with
-        # `multimodal_hashes`, so project through the same manifest.
-        if mm_uuids_by_key is None:
-            mm_uuid_list = None
-        elif mm_item_order:
-            mm_uuid_list = [
-                mm_uuids_by_key[e["modality"]][e["index"]]
-                for e in mm_item_order
-            ]
-        else:
-            mm_uuid_list = [
-                u for uuids in mm_uuids_by_key.values() for u in uuids
-            ]
+        # Hashes, UUIDs and token spans use the same prompt-ordered item refs.
+        mm_hashes_flat = [mm_hashes[m][i] for m, i in item_refs]
+        mm_uuid_list = (None if mm_uuids_by_key is None else
+                        [mm_uuids_by_key[m][i] for m, i in item_refs])
         validate_mm_inputs(prompt_token_ids, mm_hashes_flat, start_positions,
                            num_mm_tokens)
         mm_hashes_int32 = [hexdigest_to_int32(h) for h in mm_hashes_flat
@@ -1501,43 +1493,28 @@ def create_input_processor_with_hash(
         if not isinstance(multimodal_data, dict):
             return prompt_token_ids, extra_processed_inputs
 
-        mm_item_order = inputs.get("mm_item_order")
+        prepared_metadata = get_multimodal_item_metadata(multimodal_data)
         get_item_metadata = getattr(input_processor, "get_mm_item_metadata",
                                     None)
-        if get_item_metadata is not None:
-            item_metadata = get_item_metadata(prompt_token_ids, multimodal_data,
-                                              mm_item_order)
-        else:
-            # Registered processors inherit the generic hook. Accept older
-            # standalone processors at the same boundary.
-            get_encoder_metadata = getattr(input_processor,
-                                           "get_mm_encoder_item_metadata", None)
-            if (get_encoder_metadata is not None
-                    and multimodal_data.get("multimodal_embedding") is None
-                    and any(
-                        isinstance(multimodal_data.get(m), dict)
-                        for m in MEDIA_MODALITIES)):
-                legacy_metadata = get_encoder_metadata(prompt_token_ids,
-                                                       multimodal_data)
-                if legacy_metadata is not None:
-                    if not isinstance(legacy_metadata,
-                                      MultimodalEncoderItemMetadata):
-                        raise TypeError(
-                            "get_mm_encoder_item_metadata() must return a "
-                            "MultimodalEncoderItemMetadata or None")
-                    multimodal_data[
-                        MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = legacy_metadata
-            item_metadata = normalize_multimodal_item_metadata(
-                multimodal_data, mm_item_order)
-        if item_metadata is None:
-            return prompt_token_ids, extra_processed_inputs
-        if not isinstance(item_metadata, MultimodalItemMetadata):
+        item_metadata = (get_item_metadata(prompt_token_ids, multimodal_data,
+                                           inputs.get("mm_item_order")) if
+                         get_item_metadata is not None else prepared_metadata)
+        if item_metadata is not None and not isinstance(item_metadata,
+                                                        MultimodalItemMetadata):
             raise TypeError(
                 "get_mm_item_metadata() must return a MultimodalItemMetadata or None"
             )
+        item_metadata = _merge_mm_item_metadata(prepared_metadata,
+                                                item_metadata)
+        if item_metadata is None:
+            return prompt_token_ids, extra_processed_inputs
+        mm_item_order = inputs.get("mm_item_order")
+        if mm_item_order and item_metadata.item_refs != tuple(
+            (entry["modality"], entry["index"]) for entry in mm_item_order):
+            raise ValueError(
+                "Multimodal item references do not match the prompt item order")
         item_metadata.validate()
         multimodal_data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = item_metadata
-        normalize_multimodal_item_metadata(multimodal_data, mm_item_order)
         return prompt_token_ids, extra_processed_inputs
 
     return input_processor_wrapper

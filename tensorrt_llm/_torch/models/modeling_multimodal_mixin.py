@@ -45,7 +45,6 @@ from tensorrt_llm.inputs.multimodal import (
     MultimodalItemPartition,
     MultimodalParams,
     MultimodalRuntimeData,
-    normalize_multimodal_item_metadata,
     select_multimodal_fields,
 )
 from tensorrt_llm.logger import logger
@@ -91,8 +90,7 @@ class EncoderGroup:
     Batching all items in a group into one encoder invocation amortizes
     fixed costs (kernel launches, dispatch) across items. The framework
     splits the output back per-modality and reorders it into prompt order
-    via each request's `MultimodalItemMetadata.item_refs` manifest,
-    falling back to `mm_item_order` for legacy processors.
+    via each request's `MultimodalItemMetadata.item_refs` manifest.
 
     Contract between `build_batched_input` and `encoder_fn`:
 
@@ -129,7 +127,7 @@ class EncoderGroup:
 
 
 def _lengths_by_modality(
-    item_layouts: Sequence[tuple[list[tuple[str, int]], list[int]]],
+    item_layouts: Sequence[tuple[Sequence[tuple[str, int]], Sequence[int]]],
     modalities: Tuple[str, ...],
 ) -> Dict[str, List[int]]:
     """Split resolved output lengths into each group's payload-local order.
@@ -163,7 +161,7 @@ def _lengths_by_modality(
 
 
 def _reorder_embeds_by_manifest(
-    item_layouts: Sequence[tuple[list[tuple[str, int]], list[int]]],
+    item_layouts: Sequence[tuple[Sequence[tuple[str, int]], Sequence[int]]],
     per_modality_embeds: Dict[str, torch.Tensor],
     per_modality_lengths: Dict[str, List[int]],
 ) -> torch.Tensor:
@@ -240,8 +238,7 @@ def encode_multimodal_by_groups(
     items across all requests belonging to that group's modalities
     (arithmetic-intensity win). The output is split back per-modality using
     the prompt-ordered output lengths in `MultimodalItemMetadata`,
-    then reordered by the same metadata's `item_refs`. Legacy processors
-    fall back to `multimodal_embedding_lengths` and `mm_item_order`.
+    then reordered by the same metadata's `item_refs`.
 
     Shared entry point for both the aggregated (`MultimodalModelMixin`) and
     mm-encoder-only (`Qwen3VisionModelBase.forward`) paths so the ordering
@@ -420,7 +417,7 @@ class MultimodalModelMixin:
     supports_mm_encoder_item_scheduling: ClassVar[bool] = False
     """Whether the model supports item-level MM encoder scheduling: it implements the item-encode
     forward and pairs with a processor that overrides
-    `BaseMultimodalInputProcessor.get_mm_encoder_item_metadata`. This is the executor-layer gate for
+    `BaseMultimodalInputProcessor.get_mm_item_metadata`. This is the executor-layer gate for
     item scheduling."""
 
     model_config: ModelConfig
@@ -550,10 +547,6 @@ class MultimodalModelMixin:
                     if multimodal_param is run_param
                     else multimodal_param.item_metadata
                 )
-                if metadata is None:
-                    metadata = normalize_multimodal_item_metadata(
-                        multimodal_param.multimodal_data, multimodal_param.mm_item_order
-                    )
             except (TypeError, ValueError) as error:
                 raise MultimodalEncoderContractError(str(error)) from error
             if metadata is None or metadata.output_embedding_lengths is None:
@@ -1133,8 +1126,7 @@ class MultimodalModelMixin:
     def _initialize_multimodal_encoder_cache(self, max_bytes: int) -> Optional[TensorLRUCache]:
         """Initialize the model-owned multimodal encoder-output cache once.
 
-        The cache stores per-item embeddings for params that can be represented by one modality.
-        See `_encoder_cache_keys` for the mixed-modality skip path and its technical limitation.
+        The cache stores per-item embeddings keyed by the common item metadata.
         `ModelEngine` resolves `max_bytes` as the larger of the item-scheduling
         output budget and persistent-reuse capacity before runtime access.
         Zero leaves the cache disabled.
@@ -1188,8 +1180,8 @@ class MultimodalModelMixin:
         """Return the single modality represented by `param`, if cacheable.
 
         `None` means the params either do not identify a modality or contain
-        multiple modality inputs. The persistent encoder cache deliberately does
-        not cache mixed-modality params today.
+        multiple modality inputs. Per-item operations use the common item refs
+        when one request contains several modalities.
         """
         mm_data = param.multimodal_data or {}
         modalities = [key for key in _MM_DATA_INPUT_MODALITY_KEYS if key in mm_data]
@@ -1204,11 +1196,7 @@ class MultimodalModelMixin:
                 return modality
 
         if len(modalities) != 1:
-            # Mixed-modality params are skipped because the cache key metadata is request-item
-            # oriented: `multimodal_hashes` and `multimodal_embedding_lengths` are parallel per
-            # item, but there is no parallel per-item modality list. Without that, a cache key
-            # cannot unambiguously distinguish, for example, an image item from an audio item inside
-            # the same params object.
+            # A whole-param modality is ambiguous for mixed inputs.
             logger.debug(
                 f"{_MM_ENCODER_CACHE_LOG_NAME}: skipping params with {len(modalities)} detected "
                 "modalities."
@@ -1221,16 +1209,7 @@ class MultimodalModelMixin:
         cls,
         param: MultimodalParams,
     ) -> Optional[list[Hashable]]:
-        """Build per-item encoder cache keys for `param`.
-
-        The returned keys split one request's concatenated encoder output by
-        `multimodal_embedding_lengths`.
-
-        When the request carries atomic-item metadata, each key takes its modality from
-        that item's `item_refs` entry, so mixed-modality requests are keyable per item.
-        Without that metadata the whole param must resolve to one modality, since there
-        is nothing else that says which item is which.
-        """
+        """Build per-item keys from content hashes and the common item record."""
         mm_input = param.multimodal_input
         mm_data = param.multimodal_data or {}
         if mm_input is None:
@@ -1240,55 +1219,21 @@ class MultimodalModelMixin:
             return None
 
         item_metadata = param.item_metadata
-        if item_metadata is not None:
-            if item_metadata.output_embedding_lengths is None:
-                return None
-            item_modalities = {modality for modality, _ in item_metadata.item_refs}
-            if any(
-                modality not in item_modalities
-                for modality in _MM_DATA_INPUT_MODALITY_KEYS
-                if mm_data.get(modality) is not None
-            ):
-                # A legacy caller may add another raw modality after its
-                # original single-modality metadata was normalized.
-                return None
-            return cls.build_encoder_cache_item_keys(
-                mm_input.multimodal_hashes,
-                item_metadata.item_refs,
-                item_metadata.output_embedding_lengths,
-                mm_data.get("mm_processor_kwargs_hash"),
-            )
-
-        modality = cls._encoder_cache_modality(param)
-        embedding_lengths = mm_data.get("multimodal_embedding_lengths")
-        kwargs_hash = mm_data.get("mm_processor_kwargs_hash")
-        if modality is None or not isinstance(embedding_lengths, list) or kwargs_hash is None:
-            logger.debug(
-                f"{_MM_ENCODER_CACHE_LOG_NAME}: skipping unkeyable params, "
-                f"has_modality={modality is not None}, "
-                f"has_embedding_lengths={isinstance(embedding_lengths, list)}, "
-                f"has_processor_kwargs_hash={kwargs_hash is not None}"
-            )
+        if item_metadata is None or item_metadata.output_embedding_lengths is None:
             return None
-        if len(mm_input.multimodal_hashes) != len(embedding_lengths):
-            logger.debug(
-                f"{_MM_ENCODER_CACHE_LOG_NAME}: skipping params with mismatched "
-                "multimodal_hashes and multimodal_embedding_lengths counts"
-            )
+        item_modalities = {modality for modality, _ in item_metadata.item_refs}
+        if any(
+            modality not in item_modalities
+            for modality in _MM_DATA_INPUT_MODALITY_KEYS
+            if mm_data.get(modality) is not None
+        ):
             return None
-
-        # The item hash, embedding row count, processor kwargs, and modality fully describe a
-        # reusable item embedding. Request order is excluded so the same item can be reused from a
-        # different request layout; the current request order is restored when cached item tensors
-        # are concatenated below.
-        return [
-            cls._encoder_cache_item_key(modality, item_hash, embedding_length, kwargs_hash)
-            for item_hash, embedding_length in zip(
-                mm_input.multimodal_hashes,
-                embedding_lengths,
-                strict=True,
-            )
-        ]
+        return cls.build_encoder_cache_item_keys(
+            mm_input.multimodal_hashes,
+            item_metadata.item_refs,
+            item_metadata.output_embedding_lengths,
+            mm_data.get("mm_processor_kwargs_hash"),
+        )
 
     @staticmethod
     def _encoder_cache_item_key(
@@ -1412,14 +1357,11 @@ class MultimodalModelMixin:
         the parallel per-item metadata slice so every model gets it identically.
         """
         metadata = item_metadata if item_metadata is not None else source.item_metadata
-        if metadata is not None:
-            selected = metadata.select(item_indices)
-            residual.multimodal_data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = selected
-        else:
-            source_lengths = source.multimodal_data["multimodal_embedding_lengths"]
-            residual.multimodal_data["multimodal_embedding_lengths"] = [
-                source_lengths[i] for i in item_indices
-            ]
+        if metadata is None:
+            raise MultimodalEncoderContractError("Item selection requires multimodal item metadata")
+        residual.multimodal_data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = metadata.select(
+            item_indices
+        )
         if residual.multimodal_input is not None and source.multimodal_input is not None:
             source_hashes = source.multimodal_input.multimodal_hashes
             residual.multimodal_input.multimodal_hashes = [source_hashes[i] for i in item_indices]
@@ -1695,7 +1637,6 @@ def _dispatch_cross_iter_prefetch(
                 chunk_end_pos=cumsum.numel(),
                 embed_mask_cumsum=cumsum,
             ),
-            mm_item_order=req.py_mm_item_order,
         )
         for req, mm_data, cumsum in candidates
     ]

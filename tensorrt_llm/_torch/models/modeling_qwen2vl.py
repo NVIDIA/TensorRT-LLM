@@ -30,10 +30,9 @@ from tensorrt_llm._torch.models.modeling_multimodal_utils import _is_mm_disagg
 from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm.functional import PositionEmbeddingType
-from tensorrt_llm.inputs.multimodal import (
-    MULTIMODAL_ENCODER_ITEM_METADATA_KEY, MultimodalEncoderItemMetadata,
-    MultimodalItemMetadata, MultimodalItemPartition, MultimodalParams,
-    get_multimodal_encoder_item_metadata)
+from tensorrt_llm.inputs.multimodal import (MultimodalItemMetadata,
+                                            MultimodalItemPartition,
+                                            MultimodalParams)
 
 from ..._utils import async_tensor_h2d, nvtx_range, prefer_pinned
 from ...inputs import (BaseMultimodalDummyInputsBuilder,
@@ -386,15 +385,6 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
             item_refs=item_refs,
             encoder_token_lengths=encoder_token_lengths,
             output_embedding_lengths=output_embedding_lengths)
-
-    def get_mm_encoder_item_metadata(
-        self, prompt_token_ids: List[int],
-        multimodal_data: Dict[str,
-                              Any]) -> Optional[MultimodalEncoderItemMetadata]:
-        metadata = self._build_mm_item_metadata(prompt_token_ids,
-                                                multimodal_data)
-        return get_multimodal_encoder_item_metadata(
-            {MULTIMODAL_ENCODER_ITEM_METADATA_KEY: metadata})
 
     def get_mm_item_metadata(
         self,

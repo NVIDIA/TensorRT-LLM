@@ -28,6 +28,8 @@ from tensorrt_llm._torch.models.modeling_nemotron_h_multimodal import (
     video_to_pixel_values,
 )
 from tensorrt_llm.inputs.multimodal import (
+    MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
+    MultimodalItemMetadata,
     MultimodalParams,
     MultimodalRuntimeData,
     _compute_mm_masks,
@@ -2568,13 +2570,17 @@ class TestNemotronEpdEvs:
             MultimodalParams(
                 multimodal_data={
                     "video": {"video_size": [(3, 1, 32, 32), (5, 1, 32, 32)]},
-                    "multimodal_embedding_lengths": [3, 4],
+                    MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+                        [("video", 0), ("video", 1)], output_embedding_lengths=[3, 4]
+                    ),
                 }
             ),
             MultimodalParams(
                 multimodal_data={
                     "image": {},
-                    "multimodal_embedding_lengths": [1],
+                    MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+                        [("image", 0)], output_embedding_lengths=[1]
+                    ),
                 }
             ),
         ]

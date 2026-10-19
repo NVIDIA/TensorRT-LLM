@@ -79,8 +79,8 @@ from tensorrt_llm._torch.models.modeling_multimodal_utils import (  # noqa: E402
 )
 from tensorrt_llm.inputs.multimodal import (  # noqa: E402
     MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
-    MultimodalEncoderItemMetadata,
     MultimodalInput,
+    MultimodalItemMetadata,
     MultimodalParams,
     MultimodalRuntimeData,
 )
@@ -208,7 +208,10 @@ def _make_keyed_image_param(
                 "image_position_ids": image_position_ids,
                 "image_seq_lens": [1] * item_count,
             },
-            "multimodal_embedding_lengths": embedding_lengths,
+            MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+                [("image", i) for i in range(len(embedding_lengths))],
+                output_embedding_lengths=embedding_lengths,
+            ),
             "mm_processor_kwargs_hash": "kwargs-a",
         },
         multimodal_runtime=MultimodalRuntimeData(
@@ -230,7 +233,10 @@ def _make_keyed_video_param(item_hashes: list[list[int]]) -> MultimodalParams:
         ),
         multimodal_data={
             "video": {"pixel_values": torch.arange(item_count).reshape(item_count, 1, 1)},
-            "multimodal_embedding_lengths": embedding_lengths,
+            MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+                [("video", i) for i in range(len(embedding_lengths))],
+                output_embedding_lengths=embedding_lengths,
+            ),
             "mm_processor_kwargs_hash": "kwargs-a",
         },
         multimodal_runtime=MultimodalRuntimeData(
@@ -255,7 +261,10 @@ def _make_keyed_audio_param(item_hashes: list[list[int]]) -> MultimodalParams:
                 "audio_features": torch.arange(item_count * 2).reshape(item_count, 1, 2),
                 "audio_features_mask": torch.ones(item_count, 1),
             },
-            "multimodal_embedding_lengths": embedding_lengths,
+            MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+                [("audio", i) for i in range(len(embedding_lengths))],
+                output_embedding_lengths=embedding_lengths,
+            ),
             "mm_processor_kwargs_hash": "kwargs-a",
         },
         multimodal_runtime=MultimodalRuntimeData(
@@ -957,7 +966,9 @@ class TestGemma4ForConditionalGeneration(unittest.TestCase):
                     "audio_features_mask": audio_mask,
                     "shared_stats": shared_stats,
                 },
-                "multimodal_embedding_lengths": [1, 1, 1],
+                MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+                    [("audio", 0), ("audio", 1), ("audio", 2)], output_embedding_lengths=[1, 1, 1]
+                ),
             }
         )
 
@@ -1100,7 +1111,7 @@ class TestGemma4ForConditionalGeneration(unittest.TestCase):
         param = MultimodalParams(
             multimodal_data={
                 "audio": {"audio_features": features},
-                MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalEncoderItemMetadata(
+                MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
                     [("audio", 0), ("audio", 1), ("audio", 2)], [8, 8, 8], [1, 1, 1]
                 ),
             }

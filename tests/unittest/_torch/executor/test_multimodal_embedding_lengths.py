@@ -33,16 +33,22 @@ from tensorrt_llm.mapping import Mapping
         (
             SimpleNamespace(
                 multimodal_lengths=[6, 5],
-                py_multimodal_data={"multimodal_embedding_lengths": [5, 3]},
+                py_multimodal_data={
+                    MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+                        [("image", 0), ("image", 1)], output_embedding_lengths=[5, 3]
+                    )
+                },
             ),
-            [5, 3],
+            (5, 3),
         ),
         (
             SimpleNamespace(
                 multimodal_lengths=[6, 5],
                 py_multimodal_data={
                     "layout_metadata": {
-                        "multimodal_embedding_lengths": [6, 4],
+                        MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+                            [("image", 0), ("image", 1)], output_embedding_lengths=[6, 4]
+                        ),
                     },
                 },
             ),
@@ -56,32 +62,15 @@ def test_multimodal_embedding_lengths_returns_top_level_metadata(req, expected):
     assert get_multimodal_embedding_lengths(req) == expected
 
 
-@pytest.mark.parametrize("legacy_lengths", [None, [2]])
 @pytest.mark.cpu_only
-def test_multimodal_embedding_lengths_uses_item_metadata(legacy_lengths):
+def test_multimodal_embedding_lengths_uses_item_metadata():
     """Encoder output export uses the same rows as model input assembly."""
     metadata = MultimodalItemMetadata([("image", 0)], output_embedding_lengths=[2])
     data = {MULTIMODAL_ENCODER_ITEM_METADATA_KEY: metadata}
-    if legacy_lengths is not None:
-        data["multimodal_embedding_lengths"] = legacy_lengths
     params = MultimodalParams(multimodal_data=data)
     req = SimpleNamespace(multimodal_lengths=[4], py_multimodal_data=params.multimodal_data)
 
     assert get_multimodal_embedding_lengths(req) is params.get_item_layout()[1]
-
-
-@pytest.mark.cpu_only
-def test_multimodal_embedding_lengths_rejects_conflicting_item_metadata():
-    """A direct Params caller cannot export a different item layout."""
-    with pytest.raises(ValueError, match="output lengths do not match"):
-        MultimodalParams(
-            multimodal_data={
-                MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
-                    [("image", 0)], output_embedding_lengths=[2]
-                ),
-                "multimodal_embedding_lengths": [3],
-            }
-        )
 
 
 @pytest.mark.parametrize(
@@ -90,7 +79,11 @@ def test_multimodal_embedding_lengths_rejects_conflicting_item_metadata():
         (
             SimpleNamespace(
                 multimodal_lengths=[4],
-                py_multimodal_data={"multimodal_embedding_lengths": [3, 1]},
+                py_multimodal_data={
+                    MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+                        [("image", 0), ("image", 1)], output_embedding_lengths=[3, 1]
+                    )
+                },
             ),
             ValueError,
             "length must match",
@@ -98,7 +91,11 @@ def test_multimodal_embedding_lengths_rejects_conflicting_item_metadata():
         (
             SimpleNamespace(
                 multimodal_lengths=[4],
-                py_multimodal_data={"multimodal_embedding_lengths": [5]},
+                py_multimodal_data={
+                    MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+                        [("image", 0)], output_embedding_lengths=[5]
+                    )
+                },
             ),
             ValueError,
             "exceeds",
@@ -106,7 +103,11 @@ def test_multimodal_embedding_lengths_rejects_conflicting_item_metadata():
         (
             SimpleNamespace(
                 multimodal_lengths=[4],
-                py_multimodal_data={"multimodal_embedding_lengths": [-1]},
+                py_multimodal_data={
+                    MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+                        [("image", 0)], output_embedding_lengths=[-1]
+                    )
+                },
             ),
             ValueError,
             "non-negative",
@@ -115,16 +116,23 @@ def test_multimodal_embedding_lengths_rejects_conflicting_item_metadata():
             SimpleNamespace(
                 multimodal_lengths=[4],
                 py_multimodal_data={
-                    "multimodal_embedding_lengths": torch.tensor([4]),
+                    MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+                        [("image", i) for i in range(len(torch.tensor([4])))],
+                        output_embedding_lengths=torch.tensor([4]),
+                    ),
                 },
             ),
             TypeError,
-            "must be a list",
+            "must contain only integers",
         ),
         (
             SimpleNamespace(
                 multimodal_lengths=[4],
-                py_multimodal_data={"multimodal_embedding_lengths": (4.0,)},
+                py_multimodal_data={
+                    MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+                        [("image", 0)], output_embedding_lengths=(4.0,)
+                    )
+                },
             ),
             TypeError,
             "integers",
@@ -135,7 +143,7 @@ def test_multimodal_embedding_lengths_rejects_conflicting_item_metadata():
                 py_multimodal_data=["multimodal_embedding_lengths", [4]],
             ),
             TypeError,
-            "py_multimodal_data must be a dict",
+            "multimodal_data must be a dict",
         ),
     ],
 )

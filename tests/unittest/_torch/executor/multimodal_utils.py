@@ -22,10 +22,7 @@ from tensorrt_llm._torch.pyexecutor.llm_request import (
 from tensorrt_llm._torch.tensor_lru_cache import TensorLRUCache
 from tensorrt_llm.bindings import SamplingConfig
 from tensorrt_llm.inputs.multimodal import MULTIMODAL_ENCODER_ITEM_METADATA_KEY
-from tensorrt_llm.inputs.registry import (
-    BaseMultimodalDummyInputsBuilder,
-    MultimodalEncoderItemMetadata,
-)
+from tensorrt_llm.inputs.registry import BaseMultimodalDummyInputsBuilder, MultimodalItemMetadata
 
 
 def bare_mm_item_scheduler(
@@ -86,12 +83,11 @@ def make_mm_request(
         embedding_lengths = [1] * len(costs)
     multimodal_data = {
         "image": {"pixel_values": torch.empty(len(costs), 1)},
-        MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalEncoderItemMetadata(
+        MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
             item_refs=[("image", item_idx) for item_idx in range(len(costs))],
             encoder_token_lengths=costs,
             output_embedding_lengths=list(embedding_lengths),
         ),
-        "multimodal_embedding_lengths": list(embedding_lengths),
     }
     input_tokens = None
     if interleaved:

@@ -1074,7 +1074,7 @@ class BaseLLM:
                         'multimodal_input'),
                     multimodal_data=extra_processed_inputs.get(
                         'multimodal_data'),
-                    mm_item_order=inputs.get("mm_item_order"))
+                )
                 # Only pass it if it has content
                 if not multimodal_params.has_content():
                     multimodal_params = None

@@ -13,7 +13,10 @@ from _torch.executor.multimodal_utils import (
     record_output,
 )
 
-from tensorrt_llm._torch.models.modeling_multimodal_mixin import MultimodalModelMixin
+from tensorrt_llm._torch.models.modeling_multimodal_mixin import (
+    MultimodalEncoderContractError,
+    MultimodalModelMixin,
+)
 from tensorrt_llm._torch.pyexecutor.executor_request_queue import RequestQueueItem
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import (
@@ -45,7 +48,6 @@ from tensorrt_llm.inputs.multimodal import (
     MultimodalParams,
     strip_mm_encoder_inputs,
 )
-from tensorrt_llm.inputs.registry import MultimodalEncoderItemMetadata
 from tensorrt_llm.llmapi.llm_args import (
     CapacitySchedulerPolicy,
     ContextChunkingPolicy,
@@ -67,11 +69,6 @@ def test_multimodal_request_aliases_share_one_aggregate():
     params = request.py_multimodal_params
     assert request.py_multimodal_data is params.multimodal_data
     assert request.py_mm_encoder_state is params.encoder_state
-    order = [{"modality": "image", "index": 0}, {"modality": "image", "index": 1}]
-    request.py_mm_item_order = order
-    assert params.mm_item_order is order
-    params.mm_item_order = list(reversed(order))
-    assert request.py_mm_item_order is params.mm_item_order
     event = object()
     request.py_mm_encoder_event = event
     assert params.encoder_event is event
@@ -87,7 +84,6 @@ def test_multimodal_request_aliases_share_one_aggregate():
         name not in request.__dict__
         for name in (
             "py_multimodal_data",
-            "py_mm_item_order",
             "py_mm_encoder_state",
             "py_mm_encoder_event",
         )
@@ -98,7 +94,6 @@ def test_text_requests_do_not_allocate_multimodal_params():
     request = make_llm_request(1)
     request.py_mm_encoder_state = None
     request.py_mm_encoder_event = None
-    request.py_mm_item_order = None
     request.py_multimodal_data = None
     assert request.py_multimodal_params is None
 
@@ -109,7 +104,6 @@ def test_generic_metadata_does_not_enable_item_scheduling():
         1,
         {
             "image": {"pixel_values": torch.zeros(1, 2)},
-            "multimodal_embedding_lengths": [1],
             MULTIMODAL_ENCODER_ITEM_METADATA_KEY: metadata,
         },
     )
@@ -318,6 +312,7 @@ def test_mm_encoder_token_lengths_distinguishes_missing_and_invalid_data():
 
     with pytest.raises(TypeError, match="multimodal_data must be a dict"):
         request.py_multimodal_data = []
+        get_multimodal_encoder_token_lengths(request)
 
 
 def test_mm_encoder_readiness_is_derived_from_item_state():
@@ -447,12 +442,11 @@ def test_admission_rejects_requests_larger_than_output_budget():
         1,
         multimodal_data={
             "video": {"pixel_values_videos": torch.empty(3, 1)},
-            MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalEncoderItemMetadata(
+            MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
                 item_refs=[("video", 0)],
                 encoder_token_lengths=[12],
                 output_embedding_lengths=[3],
             ),
-            "multimodal_embedding_lengths": [3],
         },
     )
     with pytest.raises(ValueError, match="raise encoder_max_num_tokens") as exc_info:
@@ -812,7 +806,7 @@ def test_forward_multimodal_encoder_step_contains_model_contract_error():
 
     def fail_encoder(*_):
         raise MultimodalEncoderRequestError(
-            "multimodal_encoder_item_metadata must be a MultimodalEncoderItemMetadata"
+            "multimodal_encoder_item_metadata must be a MultimodalItemMetadata"
         )
 
     engine = SimpleNamespace(forward_multimodal_encoder_items=fail_encoder)
@@ -833,7 +827,7 @@ def test_forward_multimodal_encoder_step_contains_model_contract_error():
     assert scheduled_requests.context_requests == [unrelated]
     assert scheduled_requests.scheduled_mm_encoder_items is None
     assert len(handled) == 1
-    assert "must be a MultimodalEncoderItemMetadata" in handled[0][0]
+    assert "must be a MultimodalItemMetadata" in handled[0][0]
     assert handled[0][1] == {"requests": [failed], "charge_budget": False}
 
 
@@ -914,12 +908,11 @@ def _waiting_item(request_id, costs=None):
     multimodal_data = None
     if costs is not None:
         multimodal_data = {
-            MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalEncoderItemMetadata(
+            MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
                 item_refs=[("image", item_idx) for item_idx in range(len(costs))],
                 encoder_token_lengths=costs,
                 output_embedding_lengths=[1] * len(costs),
             ),
-            "multimodal_embedding_lengths": [1] * len(costs),
         }
     return RequestQueueItem(
         request_id,
@@ -1030,12 +1023,11 @@ def test_item_encoder_slices_and_restores_selected_item_order():
                 "pixel_values": torch.arange(5).unsqueeze(1),
                 "image_grid_thw": torch.tensor([[1, 1, 2], [1, 1, 3]]),
             },
-            MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalEncoderItemMetadata(
+            MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
                 item_refs=[("image", 0), ("image", 1)],
                 encoder_token_lengths=[2, 3],
                 output_embedding_lengths=[2, 3],
             ),
-            "multimodal_embedding_lengths": [2, 3],
         }
     )
 
@@ -1058,12 +1050,11 @@ def test_prepare_multimodal_encoder_inputs_slices_before_device_transfer():
                 "pixel_values": torch.arange(5).unsqueeze(1),
                 "image_grid_thw": torch.tensor([[1, 1, 2], [1, 1, 3]]),
             },
-            MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalEncoderItemMetadata(
+            MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
                 item_refs=[("image", 0), ("image", 1)],
                 encoder_token_lengths=[2, 3],
                 output_embedding_lengths=[2, 3],
             ),
-            "multimodal_embedding_lengths": [2, 3],
         }
     )
 
@@ -1079,13 +1070,9 @@ def test_prepare_multimodal_encoder_inputs_slices_before_device_transfer():
 
 
 def test_prepare_multimodal_encoder_inputs_rejects_invalid_metadata_types():
-    with pytest.raises(TypeError, match="must be a MultimodalItemMetadata"):
-        MultimodalParams(
-            multimodal_data={
-                MULTIMODAL_ENCODER_ITEM_METADATA_KEY: ("image", 0),
-                "multimodal_embedding_lengths": [1],
-            }
-        )
+    params = MultimodalParams(multimodal_data={MULTIMODAL_ENCODER_ITEM_METADATA_KEY: ("image", 0)})
+    with pytest.raises(MultimodalEncoderContractError, match="must be a MultimodalItemMetadata"):
+        MultimodalModelMixin().prepare_multimodal_encoder_inputs([(params, 0)])
 
 
 def test_strip_mm_encoder_inputs_preserves_embedding_and_runtime_metadata():

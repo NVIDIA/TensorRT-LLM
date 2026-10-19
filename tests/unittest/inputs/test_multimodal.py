@@ -13,7 +13,6 @@ import torch
 from tensorrt_llm.inputs.media_io import MEDIA_IO_REGISTRY, MediaModality
 from tensorrt_llm.inputs.multimodal import (
     MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
-    MultimodalEncoderItemMetadata,
     MultimodalInput,
     MultimodalItemMetadata,
     MultimodalItemPartition,
@@ -150,14 +149,17 @@ class _ItemMetadataFakeProcessor:
         return [101, 102], {
             "multimodal_data": {
                 "image": {},
-                "multimodal_embedding_lengths": self.existing_embedding_lengths,
+                MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+                    [("image", i) for i in range(len(self.existing_embedding_lengths))],
+                    output_embedding_lengths=self.existing_embedding_lengths,
+                ),
             }
         }
 
-    def get_mm_encoder_item_metadata(self, prompt_token_ids, multimodal_data):
+    def get_mm_item_metadata(self, prompt_token_ids, multimodal_data, mm_item_order=None):
         assert prompt_token_ids == [101, 102]
         assert "image" in multimodal_data
-        return MultimodalEncoderItemMetadata(
+        return MultimodalItemMetadata(
             item_refs=[("image", 0)],
             encoder_token_lengths=[4],
             output_embedding_lengths=[2],
@@ -208,7 +210,7 @@ def test_mm_item_metadata_none_falls_back_to_non_item_path():
     # Generic item order does not imply that physical encoder costs or
     # item scheduling are supported.
     class NoMetadataProcessor(_ItemMetadataFakeProcessor):
-        def get_mm_encoder_item_metadata(self, prompt_token_ids, multimodal_data):
+        def get_mm_item_metadata(self, prompt_token_ids, multimodal_data, mm_item_order=None):
             return None
 
     input_processor = create_input_processor_with_hash(NoMetadataProcessor([2]))
@@ -224,24 +226,13 @@ def test_mm_item_metadata_none_falls_back_to_non_item_path():
 def test_mm_item_metadata_rejects_wrong_return_type():
     # A non-None, non-metadata return is a genuine contract violation.
     class BadMetadataProcessor(_ItemMetadataFakeProcessor):
-        def get_mm_encoder_item_metadata(self, prompt_token_ids, multimodal_data):
+        def get_mm_item_metadata(self, prompt_token_ids, multimodal_data, mm_item_order=None):
             return ("image", 0)
 
     input_processor = create_input_processor_with_hash(BadMetadataProcessor([2]))
 
     with pytest.raises(TypeError, match="must return a"):
         input_processor({"prompt": "unused"}, sampling_params=None)
-
-
-def test_mm_item_metadata_retains_three_field_tuple_contract() -> None:
-    metadata = MultimodalEncoderItemMetadata([("image", 0)], [4], [2])
-
-    item_refs, encoder_lengths, output_lengths = metadata
-
-    assert metadata._fields == ("item_refs", "encoder_token_lengths", "output_embedding_lengths")
-    assert item_refs == [("image", 0)]
-    assert encoder_lengths == [4]
-    assert output_lengths == [2]
 
 
 @pytest.mark.parametrize(
@@ -255,7 +246,7 @@ def test_mm_item_metadata_retains_three_field_tuple_contract() -> None:
 def test_mm_item_metadata_selection_rebases_refs_without_mutating_source(
     selected, expected_refs, expected_costs, expected_lengths
 ) -> None:
-    metadata = MultimodalEncoderItemMetadata(
+    metadata = MultimodalItemMetadata(
         [("image", 1), ("video", 0), ("image", 0), ("audio", 0)],
         [20, 50, 30, 40],
         [2, 5, 3, 4],
@@ -263,25 +254,11 @@ def test_mm_item_metadata_selection_rebases_refs_without_mutating_source(
 
     subset = metadata.select(selected)
 
-    assert subset == MultimodalEncoderItemMetadata(expected_refs, expected_costs, expected_lengths)
-    assert metadata.item_refs == [("image", 1), ("video", 0), ("image", 0), ("audio", 0)]
-    assert metadata.encoder_token_lengths == [20, 50, 30, 40]
-    assert metadata.output_embedding_lengths == [2, 5, 3, 4]
-    assert all(
-        selected_field is not source_field for selected_field, source_field in zip(subset, metadata)
-    )
-
-
-def test_mm_item_metadata_legacy_import_and_pickle() -> None:
-    import pickle
-
-    from tensorrt_llm.inputs.registry import MultimodalEncoderItemMetadata as LegacyItemMetadata
-
-    assert LegacyItemMetadata is MultimodalEncoderItemMetadata
-    # Existing serialized records resolve the original registry module path.
-    legacy_class = pickle.loads(b"ctensorrt_llm.inputs.registry\nMultimodalEncoderItemMetadata\n.")
-    metadata = legacy_class([("audio", 0)], [8], [2])
-    assert pickle.loads(pickle.dumps(metadata)) == metadata
+    assert subset == MultimodalItemMetadata(expected_refs, expected_costs, expected_lengths)
+    assert metadata.item_refs == (("image", 1), ("video", 0), ("image", 0), ("audio", 0))
+    assert metadata.encoder_token_lengths == (20, 50, 30, 40)
+    assert metadata.output_embedding_lengths == (2, 5, 3, 4)
+    assert subset is not metadata
 
 
 @pytest.mark.parametrize("indices", [[3, 0, 2], [2, 0], [-1, 0], [], [1, 1]])
@@ -327,6 +304,48 @@ def test_unknown_item_costs_and_rows_remain_explicit() -> None:
         params.get_item_layout()
 
 
+@pytest.mark.parametrize("modality", MEDIA_MODALITIES)
+def test_prepared_metadata_fills_unknown_model_rows(modality) -> None:
+    partitions = {modality: {"features": MultimodalItemPartition()}}
+    original = MultimodalItemMetadata([(modality, 0)], input_partitions=partitions)
+
+    class Processor(_ItemMetadataFakeProcessor):
+        def __call__(self, inputs, sampling_params):
+            return [101, 102], {
+                "multimodal_data": {
+                    modality: {},
+                    MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+                        [(modality, 0)], output_embedding_lengths=[2]
+                    ),
+                }
+            }
+
+        def get_mm_item_metadata(self, prompt_token_ids, multimodal_data, mm_item_order=None):
+            return original
+
+    _, extra = create_input_processor_with_hash(Processor(None))({"prompt": "unused"}, None)
+    params = MultimodalParams(multimodal_data=extra["multimodal_data"])
+    assert params.get_item_layout() == (((modality, 0),), (2,))
+    assert params.item_metadata.encoder_token_lengths is None
+    assert params.item_metadata.input_partitions is partitions
+    assert original.output_embedding_lengths is None
+    assert "multimodal_embedding_lengths" not in params.multimodal_data
+    assert (
+        MultimodalParams(multimodal_data=params.multimodal_data).item_metadata
+        is params.item_metadata
+    )
+
+
+@pytest.mark.parametrize("lengths", [[2, 3], [-1], ["2"]])
+def test_prepared_metadata_validates_model_rows(lengths) -> None:
+    class Processor(_ItemMetadataFakeProcessor):
+        def get_mm_item_metadata(self, prompt_token_ids, multimodal_data, mm_item_order=None):
+            return MultimodalItemMetadata([("image", 0)], output_embedding_lengths=lengths)
+
+    with pytest.raises((TypeError, ValueError)):
+        create_input_processor_with_hash(Processor([2]))({"prompt": "unused"}, None)
+
+
 def test_item_metadata_roundtrips_with_shared_tensor_handles() -> None:
     import pickle
 
@@ -352,25 +371,24 @@ def test_item_metadata_roundtrips_with_shared_tensor_handles() -> None:
 
 
 @pytest.mark.parametrize("precomputed", [False, True])
-def test_generic_metadata_normalizes_mixed_order_without_encoder_costs(precomputed) -> None:
+def test_generic_metadata_keeps_mixed_order_without_encoder_costs(precomputed) -> None:
     from tensorrt_llm.inputs.registry import BaseMultimodalInputProcessor
 
     class Processor(_ItemMetadataFakeProcessor):
         get_mm_item_metadata = BaseMultimodalInputProcessor.get_mm_item_metadata
 
         def __call__(self, inputs, sampling_params):
+            refs = [(entry["modality"], entry["index"]) for entry in inputs["mm_item_order"]]
             return [101, 102], {
                 "multimodal_data": {
                     "image": {},
                     "audio": {},
-                    "multimodal_embedding_lengths": [1, 1],
+                    MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+                        refs, output_embedding_lengths=[1, 1]
+                    ),
                     **({"multimodal_embedding": torch.zeros(2, 4)} if precomputed else {}),
                 }
             }
-
-        def get_mm_encoder_item_metadata(self, prompt_token_ids, multimodal_data):
-            assert not precomputed
-            return None
 
     order = [{"modality": "audio", "index": 0}, {"modality": "image", "index": 0}]
     _, extra = create_input_processor_with_hash(Processor(None))(
@@ -422,7 +440,7 @@ def test_existing_mm_cumsum_preserves_storage_and_backfills_block_alignment(
     assert data["mm_bidirectional_blocks"] is True
 
 
-def test_tokenized_multimodal_overwrites_stale_embedding_lengths():
+def test_tokenized_multimodal_builds_metadata_from_final_embedding_slots():
     """Final expanded prompt layout wins over dummy-placeholder metadata."""
 
     class FakeProcessor:
@@ -445,7 +463,9 @@ def test_tokenized_multimodal_overwrites_stale_embedding_lengths():
             return expanded_ids, {
                 "multimodal_data": {
                     # Stale dummy-placeholder value; recomputed to [3] downstream.
-                    "multimodal_embedding_lengths": [999],
+                    MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+                        [("image", 0)], output_embedding_lengths=None
+                    ),
                 }
             }
 
@@ -478,7 +498,9 @@ def test_tokenized_multimodal_overwrites_stale_embedding_lengths():
     )
 
     assert prompt_token_ids == [10, 101, 102, 200, 103, 20]
-    assert extra["multimodal_data"]["multimodal_embedding_lengths"] == [3]
+    assert extra["multimodal_data"][
+        MULTIMODAL_ENCODER_ITEM_METADATA_KEY
+    ].output_embedding_lengths == (3,)
 
 
 class _KwargsHashFakeProcessor:
@@ -576,17 +598,19 @@ def test_mm_item_metadata_rejects_conflicting_prompt_order(hashing_enabled: bool
                 "multimodal_data": {
                     "image": {},
                     "video": {},
-                    "multimodal_embedding_lengths": [2, 2],
+                    MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+                        [("video", 0), ("image", 0)], output_embedding_lengths=[2, 2]
+                    ),
                 }
             }
 
         def get_num_tokens_per_video(self, *, video: list[np.ndarray], **kwargs: object) -> int:
             return 2
 
-        def get_mm_encoder_item_metadata(
-            self, prompt_token_ids: list[int], multimodal_data: dict
-        ) -> MultimodalEncoderItemMetadata:
-            return MultimodalEncoderItemMetadata([("video", 0), ("image", 0)], [4, 4], [2, 2])
+        def get_mm_item_metadata(
+            self, prompt_token_ids: list[int], multimodal_data: dict, mm_item_order=None
+        ) -> MultimodalItemMetadata:
+            return MultimodalItemMetadata([("video", 0), ("image", 0)], [4, 4], [2, 2])
 
     processor = Processor()
     inputs = {
@@ -606,6 +630,7 @@ def test_mm_item_metadata_rejects_conflicting_prompt_order(hashing_enabled: bool
 
 @pytest.mark.parametrize("hashing_enabled", [False, True], ids=["fallback", "hashing"])
 @pytest.mark.parametrize("use_uuids", [False, True], ids=["content", "uuid"])
+@pytest.mark.parametrize("frontend_order", [False, True], ids=["record-order", "frontend-order"])
 @pytest.mark.parametrize(
     "modalities,token_ids,explicit_ids,special_ids,expected_cumsum,expected_runs",
     [
@@ -674,6 +699,7 @@ def test_multimodal_input_contract_snapshot(
     expected_runs: tuple[list[int], list[int], list[int]],
     hashing_enabled: bool,
     use_uuids: bool,
+    frontend_order: bool,
 ) -> None:
     """Pin framework metadata independently of model-specific media encoding."""
     item_refs = [(modality, 0) for modality in modalities]
@@ -687,7 +713,9 @@ def test_multimodal_input_contract_snapshot(
             return list(token_ids), {
                 "multimodal_data": {
                     **{modality: {} for modality in modalities},
-                    "multimodal_embedding_lengths": [2] * num_items,
+                    MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+                        item_refs, output_embedding_lengths=[2] * num_items
+                    ),
                 }
             }
 
@@ -706,10 +734,10 @@ def test_multimodal_input_contract_snapshot(
         def get_mm_special_token_ids(self) -> torch.Tensor | None:
             return torch.tensor(special_ids) if special_ids is not None else None
 
-        def get_mm_encoder_item_metadata(
-            self, prompt_token_ids: list[int], multimodal_data: dict
-        ) -> MultimodalEncoderItemMetadata:
-            return MultimodalEncoderItemMetadata(item_refs, [4] * num_items, [2] * num_items)
+        def get_mm_item_metadata(
+            self, prompt_token_ids: list[int], multimodal_data: dict, mm_item_order=None
+        ) -> MultimodalItemMetadata:
+            return MultimodalItemMetadata(item_refs, [4] * num_items, [2] * num_items)
 
     media = {
         "image": [np.array([1], dtype=np.uint8)],
@@ -724,6 +752,8 @@ def test_multimodal_input_contract_snapshot(
             for modality in modalities
         ],
     }
+    if not frontend_order:
+        inputs.pop("mm_item_order")
     if use_uuids:
         inputs["multi_modal_uuids"] = {modality: [f"{modality}-id"] for modality in modalities}
 
@@ -1084,18 +1114,15 @@ def test_normalized_params_keep_one_order_and_output_length_record():
     metadata = MultimodalItemMetadata(refs, costs, rows)
     data = {
         MULTIMODAL_ENCODER_ITEM_METADATA_KEY: metadata,
-        "multimodal_embedding_lengths": list(rows),
     }
     params = MultimodalParams(
         multimodal_data=data,
-        mm_item_order=[{"modality": m, "index": i} for m, i in refs],
     )
     refs.reverse()
     costs[0] = 100
     rows[0] = 100
 
     assert params.item_metadata is metadata
-    assert params.mm_item_order is None
     assert "multimodal_embedding_lengths" not in data
     assert metadata.item_refs == (("audio", 0), ("image", 0))
     assert metadata.encoder_token_lengths == (4, 8)
@@ -1106,8 +1133,7 @@ def test_normalized_params_keep_one_order_and_output_length_record():
         metadata.encoder_token_lengths = (100, 8)
 
 
-def test_unknown_item_layout_preserves_legacy_order_at_input_boundary():
-    order = [{"modality": "audio", "index": 0}]
-    params = MultimodalParams(multimodal_data={"audio": {}}, mm_item_order=order)
+def test_params_do_not_infer_item_layout_from_raw_buckets():
+    params = MultimodalParams(multimodal_data={"audio": {}, "image": {}})
     assert params.item_metadata is None
-    assert params.mm_item_order is order
+    assert params.get_item_layout() == ((), ())
