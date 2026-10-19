@@ -73,8 +73,12 @@ add_library(tllm::kv_cache_host_memory ALIAS tllm_kv_cache_host_memory)
 target_include_directories(tllm_kv_cache_host_memory
                            PUBLIC ${KV_CACHE_MANAGER_V2_INCLUDE_DIR})
 target_link_libraries(
-  tllm_kv_cache_host_memory PUBLIC tllm::common_logging CUDA::cuda_driver
-                                   Threads::Threads)
+  tllm_kv_cache_host_memory
+  PUBLIC tllm::common_logging CUDA::cuda_driver Threads::Threads
+  PRIVATE tllm::runtime_topology)
+if(NOT WIN32)
+  target_link_libraries(tllm_kv_cache_host_memory PRIVATE NUMA::NUMA)
+endif()
 
 add_library(tllm_kv_cache STATIC ${KV_CACHE_MANAGER_V2_SRCS}
                                  ${KV_CACHE_COMPRESSION_SRCS})
