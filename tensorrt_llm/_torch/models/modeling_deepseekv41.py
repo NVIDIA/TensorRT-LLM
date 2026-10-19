@@ -131,6 +131,10 @@ class DeepseekV41Attention(CSA2Attention):
         params = sparse_config.to_sparse_params(pretrained_config=config)
         positional = _deepseek_v41_pos_embd_params(config, model_config, layer_idx)
         projection_quantization = "mxfp8" if supports_native_mxfp8() else "bf16"
+        logger.info_once(
+            f"DeepSeek-V4.1 CSA2 attention projections: {projection_quantization}",
+            key="deepseek_v41_csa2_projection_quantization",
+        )
         super().__init__(
             params.layout,
             layer_idx,

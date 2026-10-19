@@ -3061,6 +3061,7 @@ def test_attention_projection_quantization_follows_device_capability(
     monkeypatch, capability, gemm_compiled, expected
 ):
     requested = []
+    logged = []
 
     def record_csa2_init(self, *args, projection_quantization, **kwargs):
         nn.Module.__init__(self)
@@ -3070,8 +3071,12 @@ def test_attention_projection_quantization_follows_device_capability(
     model_config, _ = _tiny_v41_model_config()
     _mock_csa2_device(monkeypatch, capability, gemm_compiled)
     monkeypatch.setattr(v41.CSA2Attention, "__init__", record_csa2_init)
+    monkeypatch.setattr(v41.logger, "_appeared_keys", set())
+    monkeypatch.setattr(v41.logger, "log", lambda severity, *msg: logged.append((severity, msg)))
     DeepseekV41Attention(model_config, layer_idx=0)
-    assert requested == [expected]
+    DeepseekV41Attention(model_config, layer_idx=1)
+    assert requested == [expected, expected]
+    assert logged == [(v41.logger.INFO, (f"DeepSeek-V4.1 CSA2 attention projections: {expected}",))]
 
 
 @pytest.mark.parametrize(
