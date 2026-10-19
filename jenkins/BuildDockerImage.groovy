@@ -979,7 +979,7 @@ pipeline {
         booleanParam(
             name: "useWheelFromBuildStage",
             defaultValue: false,
-            description: "Install the build-stage wheel instead of compiling inside the image. Nightly releases request this explicitly; other callers default to false. SBSA release images with boltOptimizeWheel enabled require the build-stage wheel independently of this flag."
+            description: "Install the build-stage wheel instead of compiling inside the image. The declared job default is false; the nightly release caller explicitly enables this option. SBSA release images with boltOptimizeWheel enabled require the build-stage wheel independently of this flag."
         )
         booleanParam(
             name: "boltOptimizeWheel",

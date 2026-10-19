@@ -1776,10 +1776,8 @@ def add_arguments(parser: ArgumentParser):
     )
     parser.add_argument(
         "--version-override",
-        default=os.getenv("TRTLLM_BUILD_VERSION"),
         help="Package version override. A leading '.' or '+' appends to the "
-        "current version; any other value replaces it. "
-        "Defaults to TRTLLM_BUILD_VERSION when set.",
+        "current version; any other value replaces it.",
     )
 
 

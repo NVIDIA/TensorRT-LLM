@@ -183,10 +183,13 @@ RUN --mount=type=cache,target=/root/.cache/pip --mount=type=cache,target=${CCACH
     # Authenticates `git submodule update` and the CMake FetchContent clones
     # (3rdparty/fetch_content.json) that this build pulls from github.com.
     . docker/common/github_auth.sh && \
+    set -- ${BUILD_WHEEL_ARGS} && \
+    if [ "${BUILD_WHEEL_SCRIPT}" = "scripts/build_wheel.py" ] && [ -n "${TRT_LLM_VER}" ]; then \
+      set -- "$@" --version-override "${TRT_LLM_VER}"; \
+    fi && \
     TRTLLM_BUILD_SOURCE_COMMIT=${GIT_COMMIT} \
-    TRTLLM_BUILD_VERSION="${TRT_LLM_VER}" \
     GITHUB_MIRROR=${GITHUB_MIRROR} \
-    python3 ${BUILD_WHEEL_SCRIPT} ${BUILD_WHEEL_ARGS}
+    python3 ${BUILD_WHEEL_SCRIPT} "$@"
 
 FROM ${DEVEL_IMAGE} AS release
 
