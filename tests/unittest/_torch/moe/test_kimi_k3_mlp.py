@@ -330,6 +330,37 @@ def test_kimi_k3_shared_expert_parallel_construction(
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize(
+    "value,shares_requests,expected",
+    [
+        (None, False, True),
+        ("0", True, False),
+        ("legacy", True, True),
+        (" Legacy ", False, False),
+    ],
+)
+def test_kimi_k3_router_gemm_dtype_env(monkeypatch, value, shares_requests, expected):
+    """KIMI_K3_ROUTER_BF16: unset = bf16, off = upcast, legacy = bf16 only where the TP group
+    shares requests."""
+    from tensorrt_llm._torch.models import modeling_kimi_linear
+
+    if value is None:
+        monkeypatch.delenv("KIMI_K3_ROUTER_BF16", raising=False)
+    else:
+        monkeypatch.setenv("KIMI_K3_ROUTER_BF16", value)
+    assert modeling_kimi_linear._k3_router_gemm_bf16(shares_requests) is expected
+
+
+@pytest.mark.cpu_only
+def test_kimi_k3_router_gemm_dtype_env_rejects_unknown_values(monkeypatch):
+    from tensorrt_llm._torch.models import modeling_kimi_linear
+
+    monkeypatch.setenv("KIMI_K3_ROUTER_BF16", "bf16")
+    with pytest.raises(ValueError, match="KIMI_K3_ROUTER_BF16.*, or legacy"):
+        modeling_kimi_linear._k3_router_gemm_bf16(True)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
     "defer,multi_stream,is_compiling,has_aux_stream",
     [
         (False, True, False, True),
