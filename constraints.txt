@@ -8,3 +8,5 @@
 jupyterlab>=4.6.4
 # WAR against https://github.com/advisories/GHSA-6966-vjj6-99xv
 notebook>=7.6.3
+# WAR against https://github.com/advisories/GHSA-27vj-qcqg-25rc
+fsspec>=2026.6.0
