@@ -53,6 +53,7 @@ from benchmark_utils import (
     AGGREGATED_DISAGG_YAML_MODES,
     DISAGG_BENCHMARK_MODES,
     GEN_ONLY_NO_CONTEXT_MODE,
+    add_eplb_shm_mount,
     gen_only_no_context_server_counts,
     gen_only_no_context_world_size,
     is_gen_only_no_context,
@@ -907,6 +908,13 @@ def main():
     with open(args.srun_args, "r") as f:
         srun_args_content = f.read()
     srun_args_lines = srun_args_content.split()
+    mounts_prefix = "--container-mounts="
+    srun_args_lines = [
+        mounts_prefix + add_eplb_shm_mount(line[len(mounts_prefix) :], config, args.llm_src)
+        if line.startswith(mounts_prefix)
+        else line
+        for line in srun_args_lines
+    ]
 
     (
         agg_pytest_command,
