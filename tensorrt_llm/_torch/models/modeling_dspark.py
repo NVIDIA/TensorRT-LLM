@@ -220,6 +220,212 @@ def _mla_block_write_kernel(
     )
 
 
+# TLLM_DSPARK_MLA_SPLIT_QKV_STREAMS=1, read per call, kernel block-decode paths
+# only: every drafter layer runs its kv path (kv_a GEMM -> RMSNorm/RoPE -> block
+# write into the pool) on an aux stream while the q path (q_a -> q_a_layernorm
+# -> q_b -> rope_into -> k absorption) runs on the main stream, joined before
+# attention. On the cute_dsl variant the RMSNorm/RoPE kernel stores the block
+# latents straight into the pool (pool[pages[r], offsets[r]]) instead of a
+# staging buffer and a scatter. Same kernels, same arithmetic: bit-exact with
+# the replaced code.
+def _split_qkv_streams_on() -> bool:
+    return os.environ.get("TLLM_DSPARK_MLA_SPLIT_QKV_STREAMS", "0") == "1"
+
+
+def _split_qkv_use_aux_stream() -> bool:
+    """The aux-stream half of the split (a seam: tests turn it off to measure the pool write alone)."""
+    return True
+
+
+def _split_qkv_direct_pool_write() -> bool:
+    """The direct pool-write half of the split (a seam: tests turn it off to measure the aux stream alone)."""
+    return True
+
+
+def _fork_to(main: torch.cuda.Stream, aux: torch.cuda.Stream) -> None:
+    ev = torch.cuda.Event()
+    ev.record(main)
+    aux.wait_event(ev)
+
+
+def _join_on(main: torch.cuda.Stream, ev: torch.cuda.Event) -> None:
+    main.wait_event(ev)
+
+
+if IS_CUTLASS_DSL_AVAILABLE:
+    import cutlass  # noqa: E402
+    import cutlass.cute as cute  # noqa: E402
+
+    from ..cute_dsl_kernels.blackwell.dspark_rmsnorm_rope import (
+        DSparkRMSNormRoPEKernel,  # noqa: E402
+    )
+
+    try:
+        from cuda.bindings import driver as _cuda_driver  # noqa: E402
+    except ImportError:
+        from cuda import cuda as _cuda_driver  # noqa: E402
+
+    class _RMSNormRoPEPoolWriteKernel(DSparkRMSNormRoPEKernel):
+        """DSparkRMSNormRoPEKernel (weight, RMSNorm over norm_dim, one head) whose row r lands in
+        pool[pages[r], offsets[r]] instead of output[r]; the body is the base kernel's, only the store index differs."""
+
+        def __init__(self, hidden_dim: int, rope_dim: int, eps: float, norm_dim: int):
+            super().__init__(hidden_dim, rope_dim, 1, eps, True, True, False, norm_dim=norm_dim)
+
+        @cute.jit
+        def __call__(
+            self,
+            x: cute.Tensor,
+            weight: cute.Tensor,
+            freqs: cute.Tensor,
+            pool: cute.Tensor,
+            pages: cute.Tensor,
+            offsets: cute.Tensor,
+            stream: _cuda_driver.CUstream,
+        ):
+            self.kernel(x, weight, freqs, pool, pages, offsets).launch(
+                grid=[x.shape[0], 1, 1],
+                block=[self.num_threads, 1, 1],
+                stream=stream,
+            )
+
+        @cute.kernel
+        def kernel(
+            self,
+            x: cute.Tensor,
+            weight: cute.Tensor,
+            freqs: cute.Tensor,
+            pool: cute.Tensor,
+            pages: cute.Tensor,
+            offsets: cute.Tensor,
+        ):
+            tidx, _, _ = cute.arch.thread_idx()
+            row, _, _ = cute.arch.block_idx()
+            page = pages[row]
+            off = offsets[row]
+
+            inverse_rms = cutlass.Float32(1.0)
+            if cutlass.const_expr(self.apply_rmsnorm):
+                sum_sq = cutlass.Float32(0.0)
+                for item in cutlass.range_constexpr(self.norm_elements_per_thread):
+                    dim = tidx + item * self.num_threads
+                    value = cutlass.Float32(x[row, dim])
+                    sum_sq += value * value
+                sum_sq = cute.arch.warp_reduction_sum(sum_sq)
+                inverse_rms = cute.math.rsqrt(sum_sq / self.norm_dim + self.eps)
+
+            if cutlass.const_expr(self.write_nope):
+                for item in cutlass.range_constexpr(self.nope_elements_per_thread):
+                    dim = tidx + item * self.num_threads
+                    value = cutlass.Float32(x[row, dim]) * inverse_rms
+                    if cutlass.const_expr(self.apply_weight):
+                        value *= cutlass.Float32(weight[dim])
+                    pool[page, off, dim] = value.to(pool.element_type)
+
+            if cutlass.const_expr(self.rope_pairs > 0):
+                freq_row = row // self.num_heads
+                for item in cutlass.range_constexpr(self.pairs_per_thread):
+                    pair = tidx + item * self.num_threads
+                    real_dim = self.nope_dim + pair * 2
+                    imag_dim = real_dim + 1
+                    out_real = self.out_rope_offset + pair * 2
+                    out_imag = out_real + 1
+                    real = cutlass.Float32(x[row, real_dim])
+                    imag = cutlass.Float32(x[row, imag_dim])
+                    if cutlass.const_expr(self.norm_covers_rope):
+                        real *= inverse_rms
+                        imag *= inverse_rms
+                        if cutlass.const_expr(self.apply_weight):
+                            real *= cutlass.Float32(weight[real_dim])
+                            imag *= cutlass.Float32(weight[imag_dim])
+                    cos = cutlass.Float32(freqs[freq_row, pair, 0])
+                    sin = cutlass.Float32(freqs[freq_row, pair, 1])
+                    if cutlass.const_expr(self.inverse_rope):
+                        sin = -sin
+                    pool[page, off, out_real] = (real * cos - imag * sin).to(pool.element_type)
+                    pool[page, off, out_imag] = (imag * cos + real * sin).to(pool.element_type)
+
+    @lru_cache(maxsize=None)
+    def _compile_rmsnorm_rope_pool_write(hidden_dim: int, rope_dim: int, eps: float, norm_dim: int):
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "DSpark RMSNorm/RoPE pool write must be warmed up before CUDA graph capture"
+            )
+        rows = cute.sym_int()
+        x_fake = cute.runtime.make_fake_compact_tensor(
+            cutlass.BFloat16, (rows, hidden_dim), stride_order=(1, 0)
+        )
+        weight_fake = cute.runtime.make_fake_compact_tensor(
+            cutlass.BFloat16, (norm_dim,), stride_order=(0,)
+        )
+        freqs_fake = cute.runtime.make_fake_compact_tensor(
+            cutlass.Float32, (cute.sym_int(), cute.sym_int(), 2), stride_order=(2, 1, 0)
+        )
+        pool_fake = cute.runtime.make_fake_tensor(
+            cutlass.BFloat16,
+            (cute.sym_int(), cute.sym_int(), hidden_dim),
+            stride=(cute.sym_int64(), hidden_dim, 1),
+        )
+        pages_fake = cute.runtime.make_fake_compact_tensor(
+            cutlass.Int64, (rows,), stride_order=(0,)
+        )
+        offsets_fake = cute.runtime.make_fake_compact_tensor(
+            cutlass.Int64, (rows,), stride_order=(0,)
+        )
+        stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+        kernel = _RMSNormRoPEPoolWriteKernel(hidden_dim, rope_dim, eps, norm_dim)
+        return cute.compile(
+            kernel,
+            x_fake,
+            weight_fake,
+            freqs_fake,
+            pool_fake,
+            pages_fake,
+            offsets_fake,
+            stream_fake,
+            options="--opt-level 2 --enable-tvm-ffi",
+        )
+
+
+def _rmsnorm_rope_pool_write(
+    blk_latent, weight, eps, rope_head_dim, freqs_cis, layer_cache, fixup, norm_dim
+) -> bool:
+    """_rmsnorm_rope_batched(blk_latent, ..., norm_dim) stored at pool[fixup.pages, fixup.offsets].
+
+    Returns False, writing nothing, when the inputs do not fit the kernel.
+    """
+    if not (IS_CUTLASS_DSL_AVAILABLE and is_sm_100f()):
+        return False
+    freqs_real = torch.view_as_real(freqs_cis).reshape(-1, freqs_cis.shape[-1], 2)
+    if not is_fused_dspark_rmsnorm_rope_supported(
+        blk_latent, weight, freqs_real, 1, rope_head_dim, norm_dim
+    ):
+        return False
+    pool = layer_cache[:, 0, 0]
+    x = blk_latent.view(-1, blk_latent.shape[-1])
+    pages, offsets = fixup.pages.reshape(-1), fixup.offsets.reshape(-1)
+    if not (
+        x.is_contiguous()
+        and freqs_real.is_contiguous()
+        and freqs_real.shape[0] == x.shape[0]
+        and weight.is_contiguous()
+        and pool.dtype == x.dtype == torch.bfloat16
+        and pool.shape[-1] == x.shape[-1]
+        and pool.stride(1) == pool.shape[-1]
+        and pool.stride(2) == 1
+        and pages.dtype == offsets.dtype == torch.int64
+        and pages.is_contiguous()
+        and offsets.is_contiguous()
+        and pages.numel() == x.shape[0]
+        and x.shape[0] > 0
+    ):
+        return False
+    _compile_rmsnorm_rope_pool_write(x.shape[-1], rope_head_dim, eps, norm_dim)(
+        x, weight, freqs_real, pool, pages, offsets
+    )
+    return True
+
+
 # ----------------------------------------------------------------------------
 # Captured-context attention primitives.
 # ----------------------------------------------------------------------------
@@ -3251,7 +3457,43 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
         else:
             pool[fixup.pages.reshape(-1), fixup.offsets.reshape(-1)] = src
 
-    def _mla_paged_attention(self, query, blk_kv, layer_cache, fixup, block_size, max_kv_len):
+    def _block_kv_to_pool(
+        self, attn, hs_normed, batch, block_size, blk_freqs, layer_cache, fixup, variant
+    ):
+        """The kv path: block latents -> RMSNorm/RoPE -> pool.
+
+        Returns blk_kv, or None when it was stored straight into the pool.
+        """
+        blk_latent = attn.kv_a_proj_with_mqa(hs_normed).view(batch, block_size, -1)
+        if (
+            variant == "cute_dsl"
+            and _split_qkv_direct_pool_write()
+            and _rmsnorm_rope_pool_write(
+                blk_latent,
+                attn.kv_a_layernorm.weight,
+                attn.kv_a_layernorm.variance_epsilon,
+                self.qk_rope_head_dim,
+                blk_freqs,
+                layer_cache,
+                fixup,
+                self.kv_lora_rank,
+            )
+        ):
+            return None
+        blk_kv = _rmsnorm_rope_batched(
+            blk_latent,
+            attn.kv_a_layernorm.weight,
+            attn.kv_a_layernorm.variance_epsilon,
+            self.qk_rope_head_dim,
+            blk_freqs,
+            norm_dim=self.kv_lora_rank,
+        )
+        self._write_block_latents(blk_kv, layer_cache, fixup)
+        return blk_kv
+
+    def _mla_paged_attention(
+        self, query, blk_kv, layer_cache, fixup, block_size, max_kv_len, block_written=False
+    ):
         """Absorbed-MLA block attention: paged kernel + a block-local fixup.
 
         The kernel is causal across the query block and takes no mask (measured,
@@ -3266,6 +3508,7 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
         log-sum-exp. ``dflash_allocated_ctx_limit`` reserves the room.
 
         Returns the latent-space output ``[B, block, heads, kv_lora_rank]``.
+        ``block_written``: the caller already stored the block; ``blk_kv`` may then be None on cute_dsl.
         """
         decode = self._mla_decode_op()
         batch, _, num_heads, _ = query.shape
@@ -3274,7 +3517,8 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
         # --- the block's own latents into the pool, then one causal pass ---
         # Must precede BOTH decode paths: each reads the block back out of the
         # pool, so writing it afterwards would attend uninitialised slots.
-        self._write_block_latents(blk_kv, layer_cache, fixup)
+        if not block_written:
+            self._write_block_latents(blk_kv, layer_cache, fixup)
 
         if self._mla_block_decode_variant(paged=True) == "cute_dsl":
             return self._cute_dsl_block_decode(query, layer_cache, fixup, block_size)
@@ -3590,6 +3834,31 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
                 hs_normed, res_flat = layer.input_layernorm(hs_flat, res_flat)
                 residual = res_flat.reshape(batch, block_size, -1)
 
+            # The kv path on the aux stream, concurrent with the q path below.  Fork after hs_normed, join
+            # before attention; everything the aux stream touches is created before the fork or consumed after the
+            # join, and the next layer's fork orders aux after this layer's main-stream work.
+            split_qkv = use_kernel and _split_qkv_streams_on()
+            kv_on_aux = split_qkv and _split_qkv_use_aux_stream()
+            if kv_on_aux:
+                main_stream = torch.cuda.current_stream()
+                aux_stream = getattr(self, "_kv_path_stream", None)
+                if aux_stream is None:
+                    aux_stream = self._kv_path_stream = torch.cuda.Stream(device=device)
+                _fork_to(main_stream, aux_stream)
+                with torch.cuda.stream(aux_stream):
+                    blk_kv = self._block_kv_to_pool(
+                        attn,
+                        hs_normed,
+                        batch,
+                        block_size,
+                        blk_freqs,
+                        ctx_kv_cache[layer_idx],
+                        fixup,
+                        variant,
+                    )
+                    kv_done = torch.cuda.Event()
+                    kv_done.record(aux_stream)
+
             q = attn.q_b_proj(attn.q_a_layernorm(attn.q_a_proj(hs_normed)))
             q = q.view(batch, block_size, num_heads, self.qk_nope_head_dim + self.qk_rope_head_dim)
             # One buffer rather than cat([absorbed, rope]): q's rope half is a 64-slice
@@ -3632,21 +3901,35 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
                 .transpose(0, 1),
             )
 
-            # The block's own latent comes from the draft hidden; the context's
-            # from the projected target hidden (precompute_context_kv). That
-            # dual-source split is the DFlash contract, not an MLA detail.
-            blk_latent = attn.kv_a_proj_with_mqa(hs_normed).view(batch, block_size, -1)
-            # RMSNorm over the latent, RoPE over k_pe, one kernel. norm_dim keeps
-            # k_pe out of the reduction, which is what DeepSeek-style MLA wants
-            # and what DSpark's own convention (whole row) does not do.
-            blk_kv = _rmsnorm_rope_batched(
-                blk_latent,
-                attn.kv_a_layernorm.weight,
-                attn.kv_a_layernorm.variance_epsilon,
-                self.qk_rope_head_dim,
-                blk_freqs,
-                norm_dim=latent_dim,
-            )
+            if kv_on_aux:
+                _join_on(main_stream, kv_done)
+            elif split_qkv:
+                blk_kv = self._block_kv_to_pool(
+                    attn,
+                    hs_normed,
+                    batch,
+                    block_size,
+                    blk_freqs,
+                    ctx_kv_cache[layer_idx],
+                    fixup,
+                    variant,
+                )
+            else:
+                # The block's own latent comes from the draft hidden; the context's
+                # from the projected target hidden (precompute_context_kv). That
+                # dual-source split is the DFlash contract, not an MLA detail.
+                blk_latent = attn.kv_a_proj_with_mqa(hs_normed).view(batch, block_size, -1)
+                # RMSNorm over the latent, RoPE over k_pe, one kernel. norm_dim keeps
+                # k_pe out of the reduction, which is what DeepSeek-style MLA wants
+                # and what DSpark's own convention (whole row) does not do.
+                blk_kv = _rmsnorm_rope_batched(
+                    blk_latent,
+                    attn.kv_a_layernorm.weight,
+                    attn.kv_a_layernorm.variance_epsilon,
+                    self.qk_rope_head_dim,
+                    blk_freqs,
+                    norm_dim=latent_dim,
+                )
             if use_kernel:
                 ctx_out = self._mla_paged_attention(
                     query,
@@ -3655,6 +3938,7 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
                     fixup,
                     block_size,
                     capacity,
+                    block_written=split_qkv,
                 )
             else:
                 if page_tables is None:
