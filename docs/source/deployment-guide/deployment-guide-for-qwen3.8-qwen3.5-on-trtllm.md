@@ -306,7 +306,10 @@ GDN state snapshots, chunked prefill, full-graph compilation, and piecewise CUDA
 graphs. The [decode YAML](../../../examples/configs/curated/qwen3.5-gb300-agentic-decode.yaml)
 sets MTP6, padded CUDA graphs, a no-eviction scheduler, and `stream_interval: 20`.
 Both use KV cache manager V2, native host offload, NIXL with the Python
-transceiver, and a 2048 MiB bounce buffer for this colocated profile.
+transceiver, and a 2048 MiB C++ transfer-agent bounce buffer for this
+colocated profile. Its gate is relaxed (`agent_bounce_params`): each KV
+write also carries the GDN state, whose large descriptors would otherwise
+keep the write on standard NIXL.
 
 Both workers use `--publish-metrics` with `enable_iter_perf_stats: true`,
 `iter_perf_stats_interval: 40`, and
@@ -363,10 +366,11 @@ revisit it when your conversation-length distribution changes.
 | 3P1D | 3 × P4-DEP | 1 × D16-B8 | 7 |
 | 3P2D | 3 × P4-DEP | 2 × D4-B32 | 5 |
 
-For the two colocated 1P1D profiles, retain
-`cache_transceiver_config.kv_cache_bounce_size_mb: 2048` on both roles and
+For the two colocated 1P1D profiles, retain the bounce settings
+(`cache_transceiver_config.kv_cache_bounce_size_mb: 2048` and
+`agent_bounce_params`) on both roles and
 `TRT_LLM_DISABLE_LOAD_WEIGHTS_IN_PARALLEL=1` on both workers. For the other
-profiles, remove that bounce-size override and unset the weight-loading variable
+profiles, remove those bounce settings and unset the weight-loading variable
 to use the pinned runtime's defaults. Launch each TP8 worker across two
 four-GPU nodes and each TP16 worker across four nodes, with one MPI rank per GPU.
 Replicas share discovery endpoints, namespace, served model name, and the
