@@ -17,10 +17,11 @@ Two levels, on purpose:
   architecture family does.
 * The routing module's ``route`` owns the rest of the decision as one
   forward-reading tree over the facts that fix which code runs: the
-  checkpoint's config, the parallel mapping, the GPU's compute capability and
-  the speculative-decoding config. It returns the target class, or raises
-  :class:`NoTarget` with the reason in words. Reading that one file tells you
-  where any configuration lands.
+  checkpoint's config, the parallel mapping, the GPU's compute capability, the
+  speculative-decoding config, the KV-cache algorithm the engine will run with
+  and the engine choices in :class:`EngineFacts`. It returns the target class,
+  or raises :class:`NoTarget` with the reason in words. Reading that one file
+  tells you where any configuration lands.
 
 Tuning knobs -- ``max_batch_size``, ``max_num_tokens``, CUDA graph settings --
 are deliberately not routing inputs. They do not change which code runs, so a
@@ -37,7 +38,7 @@ from __future__ import annotations
 import enum
 import os
 from importlib import import_module
-from typing import TYPE_CHECKING, Optional, Tuple
+from typing import TYPE_CHECKING, Any, NamedTuple, Optional, Tuple
 
 from tensorrt_llm.logger import logger
 
@@ -165,6 +166,43 @@ def _kv_cache_quant_algo(config: "ModelConfig", llm_args: "TorchLlmArgs"):
     return {"fp8": QuantAlgo.FP8, "nvfp4": QuantAlgo.NVFP4}.get(dtype, dtype)
 
 
+class EngineFacts(NamedTuple):
+    """Engine choices that fix which code runs but are not in the checkpoint's config.
+
+    A target's constructor refuses what it cannot run, but by then ``route`` has
+    already claimed the deployment and ``auto`` can no longer fall back; a route
+    that reads these declines first.
+    """
+
+    torch_dtype: Any  # torch.dtype the engine runs the model in
+    kv_cache_quant_algo: Any  # QuantAlgo or None: the checkpoint's under "auto", else the override
+    moe_backend: str  # `moe_config.backend` as requested, before AUTO resolves
+    mamba_ssm_cache_dtype: Any  # torch.dtype of the recurrent-state cache
+    gdn_replay: bool  # TRTLLM_USE_GDN_REPLAY, which the engine reads for eligible MTP workloads
+    prefill_cuda_graph_backend: str  # `prefill_cuda_graph_backend`: disabled, piecewise, breakable
+
+
+def engine_facts(config: "ModelConfig", llm_args: "TorchLlmArgs") -> EngineFacts:
+    # Imported here: the model loader imports this module.
+    from tensorrt_llm._torch.pyexecutor.model_loader import (
+        effective_kv_cache_quant,
+        effective_mamba_ssm_cache_dtype,
+    )
+    from tensorrt_llm._torch.utils import is_gdn_replay_enabled
+
+    kv_cache_config = llm_args.kv_cache_config
+    return EngineFacts(
+        torch_dtype=config.torch_dtype,
+        kv_cache_quant_algo=effective_kv_cache_quant(config, kv_cache_config.dtype),
+        moe_backend=config.moe_backend_requested,
+        mamba_ssm_cache_dtype=effective_mamba_ssm_cache_dtype(
+            config, kv_cache_config.mamba_ssm_cache_dtype
+        ),
+        gdn_replay=is_gdn_replay_enabled(),
+        prefill_cuda_graph_backend=str(llm_args.prefill_cuda_graph_backend.value),
+    )
+
+
 def modeling_v2_resolve(config: "ModelConfig", llm_args: "TorchLlmArgs") -> Optional[type]:
     """Decide which modeling_v2 target, if any, this deployment builds.
 
@@ -195,6 +233,7 @@ def modeling_v2_resolve(config: "ModelConfig", llm_args: "TorchLlmArgs") -> Opti
             _device_compute_capability(),
             config.spec_config,
             _kv_cache_quant_algo(config, llm_args),
+            engine=engine_facts(config, llm_args),
         )
     except NoTarget as why:
         if mode is ModelingV2Mode.REQUIRE:

@@ -133,16 +133,22 @@ def _validate_and_adjust_mamba_snapshot_config(config: ModelConfig,
         kv_cache_config.enable_block_reuse = False
 
 
+def effective_mamba_ssm_cache_dtype(config: ModelConfig,
+                                    mamba_ssm_cache_dtype: str) -> torch.dtype:
+    """The recurrent-state cache dtype the engine runs with."""
+    if mamba_ssm_cache_dtype == "auto":
+        return resolve_auto_ssm_cache_dtype(config.pretrained_config,
+                                            config.torch_dtype)
+    return str_dtype_to_torch(mamba_ssm_cache_dtype)
+
+
 def validate_and_set_mamba_ssm_cache_dtype(
         config: ModelConfig,
         mamba_ssm_cache_dtype: str,
         mamba_ssm_stochastic_rounding: bool = False,
         mamba_ssm_philox_rounds: int = 10) -> None:
-    if mamba_ssm_cache_dtype == "auto":
-        mamba_ssm_cache_dtype = resolve_auto_ssm_cache_dtype(
-            config.pretrained_config, config.torch_dtype)
-    else:
-        mamba_ssm_cache_dtype = str_dtype_to_torch(mamba_ssm_cache_dtype)
+    mamba_ssm_cache_dtype = effective_mamba_ssm_cache_dtype(
+        config, mamba_ssm_cache_dtype)
     validate_kimi_kda_state_dtype(config.pretrained_config,
                                   mamba_ssm_cache_dtype,
                                   mamba_ssm_stochastic_rounding)
@@ -150,6 +156,15 @@ def validate_and_set_mamba_ssm_cache_dtype(
     config.quant_config.mamba_ssm_cache_dtype = mamba_ssm_cache_dtype
     config.quant_config.mamba_ssm_stochastic_rounding = mamba_ssm_stochastic_rounding
     config.quant_config.mamba_ssm_philox_rounds = mamba_ssm_philox_rounds
+
+
+def effective_kv_cache_quant(model_config: ModelConfig,
+                             pyt_kv_cache_dtype: str):
+    """The KV cache quantization the engine runs with: the checkpoint's under
+    "auto", otherwise what the explicit dtype maps to."""
+    if pyt_kv_cache_dtype == "auto":
+        return model_config.quant_config.kv_cache_quant_algo
+    return _KV_CACHE_MAP.get(pyt_kv_cache_dtype, None)
 
 
 def validate_and_set_kv_cache_quant(model_config: ModelConfig,
@@ -163,9 +178,8 @@ def validate_and_set_kv_cache_quant(model_config: ModelConfig,
     valid_pyt_quant = bool(pyt_kv_cache_dtype in _VALID_KV_CACHE_DTYPES)
     mapped_pyt_quant = _KV_CACHE_MAP.get(pyt_kv_cache_dtype, None)
 
-    effective_kv_cache_quant = (kv_cache_quant if pyt_kv_cache_dtype == "auto"
-                                else mapped_pyt_quant)
-    if (effective_kv_cache_quant in (QuantAlgo.NVFP4, QuantAlgo.NVFP4.value)
+    effective_quant = effective_kv_cache_quant(model_config, pyt_kv_cache_dtype)
+    if (effective_quant in (QuantAlgo.NVFP4, QuantAlgo.NVFP4.value)
             and not supports_fp4_mla_attention(model_config)
             and torch.cuda.is_available() and get_sm_version() == 107):
         logger.warning(
