@@ -154,6 +154,12 @@ def _validate_resolved_address(address: str) -> None:
         )
 
 
+def _dns_resolution_error(host: str, error: OSError) -> RuntimeError:
+    if isinstance(error, socket.gaierror) and error.errno == socket.EAI_AGAIN:
+        return MediaFetchError(f"Could not resolve hostname {host!r}")
+    return RuntimeError(f"Could not resolve hostname {host!r}")
+
+
 class _ValidatingResolver(aiohttp.abc.AbstractResolver):
     """Reject unsafe addresses in the DNS result used by the TCP connector."""
 
@@ -166,7 +172,7 @@ class _ValidatingResolver(aiohttp.abc.AbstractResolver):
         try:
             addresses = await self._resolver.resolve(host, port, family)
         except OSError as exc:
-            raise MediaFetchError(f"Could not resolve hostname {host!r}") from exc
+            raise _dns_resolution_error(host, exc) from exc
         for address in addresses:
             _validate_resolved_address(address["host"])
         return addresses
@@ -200,7 +206,7 @@ def _validate_url(url: str) -> None:
     try:
         infos = socket.getaddrinfo(hostname, None, proto=socket.IPPROTO_TCP)
     except socket.gaierror as exc:
-        raise MediaFetchError(f"Could not resolve hostname {hostname!r}") from exc
+        raise _dns_resolution_error(hostname, exc) from exc
 
     for _family, _type, _proto, _canon, sockaddr in infos:
         _validate_resolved_address(sockaddr[0])
@@ -277,11 +283,8 @@ async def _read_aiohttp_content(response: aiohttp.ClientResponse) -> bytes:
         content.write(chunk)
 
 
-async def _safe_aiohttp_get(
-    url: str, timeout_sec: int = 30, session: Optional[aiohttp.ClientSession] = None
-) -> bytes:
+async def _safe_aiohttp_get(url: str, timeout_sec: int = 30) -> bytes:
     """Aiohttp GET wrapper that validates every redirect hop before following."""
-    del session  # Kept for API compatibility; fetches must use the validating connector.
     await asyncio.to_thread(_validate_url, url)
     timeout = aiohttp.ClientTimeout(total=timeout_sec)
 
