@@ -104,8 +104,9 @@ When `@support_multimodal_disaggregated` is set and the deployment uses `TLLM_MU
 This item-scheduled cache path currently applies only when the encoder and LLM
 run in the same process. `mm_encoder_only` / EPD keeps its existing
 shared-handle transfer path. Item scheduling also rejects side-stream encoder
-prefetch today. LLM prefill waits only for the items its current context chunk
-uses, and an item's output is released once prefill moves past it.
+prefetch today. In the co-located item-scheduled path, LLM prefill waits only
+for the items its current context chunk uses, and an item's output is released
+once prefill moves past it.
 Item scheduling does not support pipeline parallelism yet: with
 `pipeline_parallel_size > 1`, `encoder_scheduling_policy=DEFAULT` (also the
 value when unset) logs a warning and falls back to the inline encoder path,

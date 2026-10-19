@@ -10,6 +10,39 @@ import torch
 pytestmark = pytest.mark.cpu_only
 
 
+@pytest.mark.parametrize("early_prepared", [False, True])
+def test_kt_context_reservation_is_not_repeated(early_prepared, monkeypatch):
+    """Reserve KT tokens once while preserving fresh contexts and decode growth."""
+    from tensorrt_llm._torch.attention.backends.sparse.rocket import cache_manager as module
+
+    manager = object.__new__(module.RocketKVCacheManager)
+    manager.page_size = 4
+    manager._preprepared_context_requests = None
+    manager.kt_cache_manager = module.BlockManager(16, tokens_per_block=1)
+    first = SimpleNamespace(py_request_id=1, prompt_len=8)
+    second = SimpleNamespace(py_request_id=2, prompt_len=8)
+    generation = SimpleNamespace(py_request_id=3, max_beam_num_tokens=8)
+
+    def prepare_parent(self, batch):
+        if self._preprepared_context_requests is not None:
+            for request in batch.context_requests:
+                self._preprepared_context_requests.pop(request.py_request_id, None)
+
+    monkeypatch.setattr(module.KVCacheManager, "prepare_resources", prepare_parent)
+    if early_prepared:
+        manager.prepare_resources(SimpleNamespace(context_requests=[first], generation_requests=[]))
+        manager._preprepared_context_requests = {first.py_request_id: first}
+    manager.kt_cache_manager.add_tokens(generation.py_request_id, 2)
+
+    manager.prepare_resources(
+        SimpleNamespace(context_requests=[first, second], generation_requests=[generation])
+    )
+
+    assert manager.kt_cache_manager.num_sequences == {1: 2, 2: 2, 3: 3}
+    assert [len(manager.kt_cache_manager.block_ids[rid]) for rid in (1, 2, 3)] == [2, 2, 3]
+    assert not manager._preprepared_context_requests
+
+
 def test_kt_pool_uses_local_heads():
     """Match KT allocation and budget for distinct per-layer heads with TP=4."""
     from tensorrt_llm._torch.attention.backends.sparse.rocket import cache_manager as module

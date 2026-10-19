@@ -156,9 +156,12 @@ class RocketKVCacheManager(KVCacheManager):
         self.kt_cache_manager.copy_block_offsets(request_ids, block_offsets)
 
     def prepare_resources(self, scheduled_batch):
+        preprepared_context_ids = set(self._preprepared_context_requests or ())
         super().prepare_resources(scheduled_batch)
         for req in scheduled_batch.context_requests:
             request_id = req.py_request_id
+            if request_id in preprepared_context_ids:
+                continue
             num_tokens = req.prompt_len
             kt_token_num = math.ceil(num_tokens / self.page_size)
             self.kt_cache_manager.add_tokens(request_id, kt_token_num)

@@ -424,6 +424,42 @@ def test_first_chunk_reclaims_an_output_another_request_is_consuming():
     assert second.py_mm_encoder_state.item_cache_keys == [None, None]
 
 
+@pytest.mark.parametrize(("held_bytes", "shared"), [(4, False), (8, True)])
+def test_failed_reclamation_preserves_other_requests_outputs(held_bytes, shared):
+    scheduler = _scheduler(
+        max_batch_size=1, max_num_tokens=8, cache_capacity=12, context_chunk_unit_size=1
+    )
+    owner = make_mm_request(1, [1], embedding_lengths=[held_bytes // 4])
+    target = make_mm_request(2, [1], embedding_lengths=[2])
+    cache = scheduler.encoder_cache
+    held_key = _item_cache_keys(owner)[0]
+    cache.acquire(held_key, held_bytes, retain_after_release=False)
+    cache.commit(held_key, torch.ones(held_bytes // 4))
+    owner.py_mm_encoder_state.set_item_cache_key(0, held_key, ready=True)
+    if shared:
+        cache.acquire(held_key, held_bytes, retain_after_release=False)
+    cache.acquire("external-reservation", 12 - held_bytes)
+    original_output = cache.get(held_key, record_stats=False)
+    before = cache.stats()
+
+    result = scheduler._reclaim_and_acquire_item_cache_entry(
+        target.py_mm_encoder_state,
+        0,
+        _item_cache_keys(target)[0],
+        False,
+        [owner, target],
+        set(),
+        scheduler._new_encoder_step(),
+    )
+
+    assert result is None
+    assert owner.py_mm_encoder_state.item_cache_keys == [held_key]
+    assert owner.py_mm_encoder_state.item_ready == [True]
+    assert cache.get(held_key, record_stats=False) is original_output
+    assert cache.stats() == before
+    assert target.py_mm_encoder_state.item_cache_keys == [None]
+
+
 def test_request_whose_next_chunk_exceeds_one_encoder_step_keeps_its_items():
     # Both items share the first 4-token chunk unit, but one encoder step fits
     # only one item: keep both entries so the outputs accumulate.
@@ -465,8 +501,9 @@ def test_admission_checks_only_outputs_resident_at_once(context_chunk_unit_size,
         initialize_multimodal_encoder_request(request, **budget)
         assert request.py_mm_encoder_state.embedding_lengths == [1, 1]
     else:
-        with pytest.raises(ValueError, match="raise encoder_max_num_tokens"):
+        with pytest.raises(ValueError, match="raise encoder_max_num_tokens") as error:
             initialize_multimodal_encoder_request(request, **budget)
+        assert ("enable chunked prefill" in str(error.value)) == (context_chunk_unit_size is None)
 
 
 def test_completed_context_chunk_releases_only_consumed_items():
@@ -868,6 +905,7 @@ def _executor_for_mm_admission(active_requests, *, max_batch_size=8, max_num_tok
     executor.max_num_active_requests = 8
     executor.is_benchmark_disagg = False
     executor._mm_encoder_item_scheduling_enabled = True
+    executor.scheduler = SimpleNamespace(context_chunk_unit_size=None, prepares_future_items=False)
     executor.model_engine = SimpleNamespace(
         encoder_batch_size=max_batch_size,
         encoder_max_num_tokens=max_num_tokens,
@@ -902,6 +940,24 @@ def test_mm_admission_does_not_charge_ready_active_request():
 
     assert [item.id for item in admitted] == [2]
     assert not waiting
+
+
+@pytest.mark.parametrize(
+    ("chunk_unit", "eager", "expected_admitted"),
+    [(2, False, [2]), (None, False, []), (2, True, [])],
+)
+def test_mm_admission_charges_only_eligible_active_items(chunk_unit, eager, expected_admitted):
+    active = make_mm_request(1, [4, 4], interleaved=True)
+    active.context_chunk_size = 2
+    waiting = FCFSWaitingQueue([_waiting_item(2, [4])])
+    executor = _executor_for_mm_admission([active], max_batch_size=2, max_num_tokens=8)
+    executor.scheduler.context_chunk_unit_size = chunk_unit
+    executor.scheduler.prepares_future_items = eager
+
+    admitted = executor._pop_from_waiting_queue(waiting, 1)
+
+    assert [item.id for item in admitted] == expected_admitted
+    assert [item.id for item in waiting] == ([] if expected_admitted else [2])
 
 
 def test_mm_admission_passes_oversized_request_to_validation():

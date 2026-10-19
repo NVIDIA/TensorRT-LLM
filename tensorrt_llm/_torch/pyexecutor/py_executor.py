@@ -101,6 +101,7 @@ from .kv_cache_stats import append_kv_cache_iteration_stats
 from .llm_request import (ATTENTION_DP_DUMMY_REQUEST_ID, ExecutorRequest,
                           LlmRequest, LlmRequestState, LlmResponse,
                           MultimodalEncoderRequestError, get_draft_token_length,
+                          get_mm_context_chunk_start, get_mm_items_for_chunk,
                           get_mm_pending_items,
                           initialize_multimodal_encoder_request,
                           is_mm_context_chunk_ready, release_consumed_mm_items)
@@ -6564,10 +6565,11 @@ class PyExecutor:
             new_requests: List[RequestQueueItem]) -> List[RequestQueueItem]:
         """Apply MM encoder item/token budgets to capacity-admitted requests.
 
-        Active requests consume this iteration's encoder budget first. New
-        requests then preserve waiting-queue FCFS order: once the head request
-        cannot make encoder progress, all later requests are deferred and
-        prepended to the waiting queue.
+        Active requests consume this iteration's encoder budget first.
+        Chunked DEFAULT scheduling charges only the current chunk; EAGER
+        also charges future items. New requests preserve waiting-queue FCFS
+        order: once the head cannot make encoder progress, later requests
+        are deferred and prepended to the waiting queue.
         """
         remaining_batch_slots = self.model_engine.encoder_batch_size
         remaining_tokens = self.model_engine.encoder_max_num_tokens
@@ -6587,11 +6589,22 @@ class PyExecutor:
             return progressed
 
         for request in self.active_requests:
-            pending_item_indices = get_mm_pending_items(request)
+            state = request.py_mm_encoder_state
+            if state is None:
+                continue
+            if (self.scheduler.context_chunk_unit_size is not None
+                    and not self.scheduler.prepares_future_items):
+                begin = get_mm_context_chunk_start(request)
+                pending_item_indices = [
+                    item_idx for item_idx in get_mm_items_for_chunk(
+                        request, begin, begin + request.context_chunk_size)
+                    if not state.item_ready[item_idx]
+                ]
+            else:
+                pending_item_indices = get_mm_pending_items(request)
             if pending_item_indices:
-                consume_pending(
-                    request.py_mm_encoder_state.encoder_token_lengths,
-                    pending_item_indices)
+                consume_pending(state.encoder_token_lengths,
+                                pending_item_indices)
 
         admitted = []
         deferred = []

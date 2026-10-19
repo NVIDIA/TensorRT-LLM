@@ -1125,10 +1125,19 @@ class MultimodalScheduler(RequestScheduler):
         protected_items: set[tuple[int, int]],
         step: _MultimodalEncoderStep,
     ) -> CacheAcquireResult | None:
-        """Release later outputs of active requests until one item's entry fits."""
-        for candidate_request, candidate_idx in self._get_reclaimable_items(
-            active_requests, protected_items, step
-        ):
+        """Release later outputs only when they can make the target entry fit."""
+        candidates = self._get_reclaimable_items(active_requests, protected_items, step)
+        stats = self.encoder_cache.stats()
+        available_bytes = stats.max_bytes - stats.reserved_bytes - stats.in_use_bytes
+        releasable_bytes = self.encoder_cache.releasable_bytes(
+            candidate_request.py_mm_encoder_state.item_cache_keys[candidate_idx]
+            for candidate_request, candidate_idx in candidates
+        )
+        expected_bytes = state.embedding_lengths[item_idx] * self.bytes_per_encoder_embedding
+        if expected_bytes > available_bytes + releasable_bytes:
+            return None
+
+        for candidate_request, candidate_idx in candidates:
             candidate_state = cast(
                 MultimodalEncoderRequestState, candidate_request.py_mm_encoder_state
             )
