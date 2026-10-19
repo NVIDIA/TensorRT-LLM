@@ -110,6 +110,7 @@ def _make_server(
     # The loop's default executor; a test that checks the dedicated metrics
     # thread installs (and shuts down) its own.
     server._metrics_stats_executor = None
+    server._metrics_stats_read = None
     return server
 
 
@@ -181,24 +182,49 @@ async def test_metrics_endpoint_does_not_block_the_event_loop():
 
 
 @pytest.mark.asyncio
-async def test_metrics_stats_reads_stay_off_the_default_executor():
-    """Waiting scrapes queue on the server's metrics thread.
-
-    On the default executor they would hold threads that request handling
-    also needs, one per concurrent scrape.
-    """
-    server = _make_server([[{"iter": 8}], [{"iter": 9}]], with_stats_buffer=False, stats_delay=0.1)
+async def test_metrics_stats_read_runs_on_the_metrics_thread():
+    """The waiting read stays off the default executor, which request handling uses."""
+    server = _make_server([[{"iter": 8}]], with_stats_buffer=False, stats_delay=0.1)
     server._metrics_stats_executor = ThreadPoolExecutor(
         max_workers=1, thread_name_prefix=_METRICS_STATS_THREAD
     )
     try:
-        responses = await asyncio.gather(server.get_iteration_stats(), server.get_iteration_stats())
+        response = await server.get_iteration_stats()
     finally:
         server._metrics_stats_executor.shutdown(wait=True)
 
-    assert sorted(_response_content(r)[0]["iter"] for r in responses) == [8, 9]
-    assert len(server.generator.stats_threads) == 2
-    assert all(name.startswith(_METRICS_STATS_THREAD) for name in server.generator.stats_threads)
+    assert _response_content(response) == [{"iter": 8}]
+    assert len(server.generator.stats_threads) == 1
+    assert server.generator.stats_threads[0].startswith(_METRICS_STATS_THREAD)
+
+
+@pytest.mark.asyncio
+async def test_sustained_scraping_keeps_one_stats_read_in_flight():
+    """Scrapes that arrive during a read return at once instead of queueing.
+
+    Queued reads on an idle server each wait the full timeout, so scraping
+    faster than one read per timeout would grow the backlog without bound.
+    """
+    delay = 0.3
+    server = _make_server(
+        [[{"iter": 8}], [{"iter": 9}]], with_stats_buffer=False, stats_delay=delay
+    )
+
+    start = time.monotonic()
+    responses = await asyncio.gather(*(server.get_iteration_stats() for _ in range(5)))
+    elapsed = time.monotonic() - start
+
+    contents = [_response_content(r) for r in responses]
+    assert contents.count([{"iter": 8}]) == 1
+    assert contents.count([]) == 4
+    assert len(server.generator.stats_timeouts) == 1
+    # Five queued reads would take 5 * delay.
+    assert elapsed < 2 * delay
+
+    # Once the read finishes, the next scrape reads again.
+    response = await server.get_iteration_stats()
+    assert _response_content(response) == [{"iter": 9}]
+    assert len(server.generator.stats_timeouts) == 2
 
 
 @pytest.mark.asyncio

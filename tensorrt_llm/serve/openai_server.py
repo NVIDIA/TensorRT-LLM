@@ -774,13 +774,14 @@ class OpenAIServer(_VideoRoutesMixin):
         )
         BaseMediaIO.set_executor(self._media_load_executor)
         # /metrics reads iteration stats with a blocking call that waits up to
-        # 2 s. One dedicated thread keeps those waits off the default executor,
-        # which request handling also uses, however many scrapes arrive at
-        # once; concurrent scrapes queue on this thread instead.
+        # 2 s. A dedicated thread keeps those waits off the default executor,
+        # which request handling also uses; get_iteration_stats runs at most
+        # one read on it at a time.
         self._metrics_stats_executor = ThreadPoolExecutor(
             max_workers=1,
             thread_name_prefix="trtllm_metrics_stats",
         )
+        self._metrics_stats_read: Optional[asyncio.Future] = None
 
         model_dir = Path(model)
         if model_dir.exists() and model_dir.is_dir():
@@ -1845,9 +1846,20 @@ class OpenAIServer(_VideoRoutesMixin):
         # The read waits up to 2 s for stats inside a blocking executor call,
         # so it runs on the metrics thread; on the event loop it would stall
         # every response being streamed for as long as it waits.
+        # One read at a time: a scrape that arrives while a read is in flight
+        # returns no stats instead of queueing behind it, so scraping an idle
+        # server faster than one read per 2 s cannot build a backlog. The read
+        # in flight still hands everything it drains to its own caller.
+        if (self._metrics_stats_read is not None
+                and not self._metrics_stats_read.done()):
+            return JSONResponse(content=[])
+        read = asyncio.get_running_loop().run_in_executor(
+            self._metrics_stats_executor, self.generator.get_stats, 2)
+        self._metrics_stats_read = read
         try:
-            stats = await asyncio.get_running_loop().run_in_executor(
-                self._metrics_stats_executor, self.generator.get_stats, 2)
+            # Shielded so a cancelled caller leaves the read marked in flight
+            # until its thread actually finishes.
+            stats = await asyncio.shield(read)
         except RPCError as e:
             # The executor is unreachable, e.g. while it shuts down.
             logger.debug(f"Failed to fetch iteration stats: {e}")
