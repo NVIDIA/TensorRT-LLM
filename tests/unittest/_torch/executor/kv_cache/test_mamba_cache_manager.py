@@ -5669,7 +5669,9 @@ def test_v2_kda_admission_slot_updates_without_sync(device):
     mgr.local_num_mamba_layers = num_layers
     mgr.prev_num_accepted_tokens = torch.arange(1, num_slots + 1, dtype=torch.int32, device=device)
     # Stale device indices: the reset must take its slots from _host_state_indices.
-    mgr.cuda_state_indices = torch.full((num_slots,), 7, dtype=torch.int32, device=device)
+    mgr._state_indices_buffer = DeviceCopyBuffer(
+        torch.full((num_slots,), 7, dtype=torch.int32, device=device)
+    )
     mgr._host_state_indices = torch.tensor([5, 1, 0, 0, 0, 0, 0, 0], dtype=torch.int32)
     mgr._request_id_to_state_index = {10: 4, 11: 2}
     mgr._kda_replay_unseeded = set()
