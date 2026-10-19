@@ -105,21 +105,29 @@ def test_split_kv_plan_is_launched_once_per_step(monkeypatch) -> None:
     assert mod.CuteDslMlaFmha._split_kv_plan(meta, cache_seqs, 2000, 8, 96) is None
 
 
+@pytest.mark.parametrize("reduction", ["default", "prefetch", "prefetch-4band"])
 @pytest.mark.parametrize("input_dtype", [torch.bfloat16, torch.float8_e4m3fn])
 @pytest.mark.parametrize("empty_request", [False, True])
 def test_runner_variable_split_matches_uniform_split(
-    input_dtype: torch.dtype, empty_request: bool
+    monkeypatch, input_dtype: torch.dtype, empty_request: bool, reduction: str
 ) -> None:
     """Per-request splits under a 16-slot grid reproduce the uniform-split output and Helix stats.
 
     Covers requests planned onto one split (stored directly by the split
     kernel), onto several, onto more splits than KV tiles, and a request
-    without local KV (the reduction's canonical empty result).
+    without local KV (the reduction's canonical empty result). The
+    prefetching reduction (one or four D bands per row) is bitwise the
+    default one.
     """
     import cutlass
 
     from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import CuteDSLNVMlaDecodeBlackwellRunner
 
+    prefetch = reduction != "default"
+    monkeypatch.setattr(CuteDSLNVMlaDecodeBlackwellRunner, "_REDUCTION_PREFETCH", prefetch)
+    # 4 * B * S * H rows always fit this many waves: four D bands.
+    max_waves = 10**6 if reduction == "prefetch-4band" else 0
+    monkeypatch.setattr(CuteDSLNVMlaDecodeBlackwellRunner, "_REDUCTION_D_BAND_MAX_WAVES", max_waves)
     torch.manual_seed(5)
     device = torch.device("cuda")
     batch_size, seq_len_q, num_heads = 4, 2, 96
@@ -203,6 +211,11 @@ def test_runner_variable_split_matches_uniform_split(
         ([1, 1, 1, 1], 16),
     ):
         out, stats = run(plan, split_kv)
+        if prefetch:
+            monkeypatch.setattr(CuteDSLNVMlaDecodeBlackwellRunner, "_REDUCTION_PREFETCH", False)
+            out_default, stats_default = run(plan, split_kv)
+            monkeypatch.setattr(CuteDSLNVMlaDecodeBlackwellRunner, "_REDUCTION_PREFETCH", True)
+            assert torch.equal(out, out_default) and torch.equal(stats, stats_default)
         tol = 2e-2 if input_dtype == torch.float8_e4m3fn else 1e-2
         torch.testing.assert_close(out, ref_out, rtol=tol, atol=tol)
         log_partition = stats[:, :, 0] + stats[:, :, 1].log()
