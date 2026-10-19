@@ -4,6 +4,7 @@
 
 import threading
 from contextlib import nullcontext
+from dataclasses import fields
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -162,6 +163,8 @@ def test_failed_executor_cannot_resume_with_new_resources(executor, error_field)
 
 def test_rebind_resets_phase_state_and_profile_windows(executor, monkeypatch):
     ex, _ = executor
+    create_waiting_queue = Mock(wraps=executor_module.create_waiting_queue)
+    monkeypatch.setattr(executor_module, "create_waiting_queue", create_waiting_queue)
     monkeypatch.setenv("TLLM_PROFILE_START_STOP", "2-4")
     executor_module._load_iteration_indexes.cache_clear()
     monkeypatch.setattr(torch.cuda, "Stream", Mock())
@@ -249,6 +252,24 @@ def test_rebind_resets_phase_state_and_profile_windows(executor, monkeypatch):
     old_shutdown_event = ex.shutdown_event
     engine, stream = ex.model_engine, ex.execution_stream
     ex.release_resources()
+    bound_fields = {
+        "resource_manager",
+        "scheduler",
+        "kv_cache_transceiver",
+        "peft_cache_config",
+        "virtual_memory_pools",
+        "kv_connector_manager",
+        "dwdp_manager",
+        "max_seq_len",
+    }
+    # Queue policy constructs a queue; sequence capacity comes from the engine.
+    assert {field.name for field in fields(PyExecutorResources)} == bound_fields | {
+        "waiting_queue_policy",
+        "max_num_sequences",
+    }, "New phase inputs need binding and lifecycle coverage in this test."
+    # Stale values also catch omitted assignments for optional resources set to None.
+    for name in bound_fields:
+        setattr(ex, name, object())
     ex._disagg_coordinator = object()
     ex.start_worker = Mock()
     try:
@@ -261,7 +282,10 @@ def test_rebind_resets_phase_state_and_profile_windows(executor, monkeypatch):
         assert not ex.worker_started
         assert ex.shutdown_event is not old_shutdown_event
         assert not ex.shutdown_event.is_set()
-        assert ex.resource_manager is resources.resource_manager
+        for name in bound_fields:
+            assert getattr(ex, name) is getattr(resources, name), name
+        create_waiting_queue.assert_called_once_with(resources.waiting_queue_policy)
+        assert ex.max_num_active_requests == engine.get_max_num_sequences.return_value
         assert ex.kv_cache_manager is cache
         assert ex.model_engine is engine and ex.execution_stream is stream
         assert not ex._resources_released
