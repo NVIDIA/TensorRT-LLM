@@ -14,6 +14,7 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from tensorrt_llm._torch.configs.deepseek_v41 import DeepseekV41VisionConfig
+from tensorrt_llm._torch.models import deepseek_v41_vision
 from tensorrt_llm._torch.models.deepseek_v41_processor import DeepseekV41InputProcessor
 from tensorrt_llm._torch.models.deepseek_v41_vision import (
     DeepseekV41Aligner,
@@ -201,6 +202,59 @@ def test_complete_vision_and_aligner_match_reference(
             assert parameter.dtype == torch.float32
             torch.testing.assert_close(parameter, norm_weights[name], rtol=0, atol=0)
     assert model(patches.bfloat16(), 4, 5).dtype == torch.bfloat16
+
+
+def _sdpa_flags() -> dict[str, bool]:
+    return {
+        "cudnn": torch.backends.cuda.cudnn_sdp_enabled(),
+        "flash": torch.backends.cuda.flash_sdp_enabled(),
+        "efficient": torch.backends.cuda.mem_efficient_sdp_enabled(),
+        "math": torch.backends.cuda.math_sdp_enabled(),
+    }
+
+
+@pytest.mark.parametrize(
+    ("device", "capability", "cudnn_version", "excludes_cudnn"),
+    [
+        ("cuda:0", (10, 7), 92400, True),
+        ("cuda:0", (10, 7), 92500, False),
+        ("cuda:0", (10, 0), 92400, False),
+        ("cuda:0", (10, 3), 92400, False),
+        ("cpu", (10, 7), 92400, False),
+    ],
+)
+def test_vision_sdpa_skips_cudnn_only_on_sm107_with_old_cudnn(
+    monkeypatch, device, capability, cudnn_version, excludes_cudnn
+) -> None:
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda index=None: capability)
+    monkeypatch.setattr(torch.backends.cudnn, "version", lambda: cudnn_version)
+    deepseek_v41_vision._excludes_cudnn_sdpa.cache_clear()
+    try:
+        before = _sdpa_flags()
+        with deepseek_v41_vision._vision_sdpa_context(torch.device(device)):
+            inside = _sdpa_flags()
+        assert _sdpa_flags() == before
+        if excludes_cudnn:
+            assert inside == {**before, "cudnn": False}
+        else:
+            assert inside == before
+    finally:
+        deepseek_v41_vision._excludes_cudnn_sdpa.cache_clear()
+
+
+def test_vision_sdpa_keeps_backends_the_caller_disabled(monkeypatch) -> None:
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda index=None: (10, 7))
+    monkeypatch.setattr(torch.backends.cudnn, "version", lambda: 92400)
+    deepseek_v41_vision._excludes_cudnn_sdpa.cache_clear()
+    try:
+        with torch.nn.attention.sdpa_kernel(
+            [torch.nn.attention.SDPBackend.CUDNN_ATTENTION, torch.nn.attention.SDPBackend.MATH]
+        ):
+            with deepseek_v41_vision._vision_sdpa_context(torch.device("cuda:0")):
+                inside = _sdpa_flags()
+        assert inside == {"cudnn": False, "flash": False, "efficient": False, "math": True}
+    finally:
+        deepseek_v41_vision._excludes_cudnn_sdpa.cache_clear()
 
 
 def test_wrapper_encodes_image_spans_and_tracks_active_positions(

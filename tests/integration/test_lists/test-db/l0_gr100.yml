@@ -14,3 +14,4 @@ l0_gr100:
       backend: pytorch
   tests:
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16_flashinfer[enable_chunked_prefill=True]
+  - unittest/_torch/modeling/test_deepseek_v41_vision_sm107.py

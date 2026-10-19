@@ -4,17 +4,54 @@
 
 from __future__ import annotations
 
+import contextlib
+import functools
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 import torch
 import torch.nn.functional as F
 from torch import nn
+from torch.nn.attention import SDPBackend, sdpa_kernel
 
 if TYPE_CHECKING:
     from ..configs.deepseek_v41 import DeepseekV41VisionConfig
 
 __all__ = ["DeepseekV41VisionModel", "DeepseekV41Aligner"]
+
+# PyTorch dispatches SDPA to cuDNN first on SM 10.x and does not fall back when
+# plan building fails. cuDNN before 9.25 has no SM 10.7 SDPA forward engine that
+# builds: its runtime-compiled candidates all fail NVRTC compilation.
+_NON_CUDNN_SDPA_BACKENDS = [
+    SDPBackend.FLASH_ATTENTION,
+    SDPBackend.EFFICIENT_ATTENTION,
+    SDPBackend.MATH,
+]
+_FIRST_CUDNN_WITH_SM107_SDPA = 92500
+
+
+@functools.cache
+def _excludes_cudnn_sdpa(device_index: int) -> bool:
+    cudnn_version = torch.backends.cudnn.version() or 0
+    return (
+        torch.cuda.get_device_capability(device_index) == (10, 7)
+        and cudnn_version < _FIRST_CUDNN_WITH_SM107_SDPA
+    )
+
+
+def _vision_sdpa_context(device: torch.device) -> contextlib.AbstractContextManager:
+    """Disable only cuDNN SDPA where it cannot build a plan; keep the caller's other backends."""
+    if device.type != "cuda" or not _excludes_cudnn_sdpa(
+        device.index if device.index is not None else torch.cuda.current_device()
+    ):
+        return contextlib.nullcontext()
+    enabled = {
+        SDPBackend.FLASH_ATTENTION: torch.backends.cuda.flash_sdp_enabled(),
+        SDPBackend.EFFICIENT_ATTENTION: torch.backends.cuda.mem_efficient_sdp_enabled(),
+        SDPBackend.MATH: torch.backends.cuda.math_sdp_enabled(),
+    }
+    backends = [backend for backend in _NON_CUDNN_SDPA_BACKENDS if enabled[backend]]
+    return sdpa_kernel(backends) if backends else contextlib.nullcontext()
 
 
 def _get_vision_cos_sin(
@@ -82,11 +119,12 @@ class _DeepseekV41VisionAttention(nn.Module):
         )
         query = _apply_vision_rotary(query, cos, sin)
         key = _apply_vision_rotary(key, cos, sin)
-        attended = F.scaled_dot_product_attention(
-            query.transpose(0, 1).unsqueeze(0),
-            key.transpose(0, 1).unsqueeze(0),
-            value.transpose(0, 1).unsqueeze(0),
-        )
+        with _vision_sdpa_context(query.device):
+            attended = F.scaled_dot_product_attention(
+                query.transpose(0, 1).unsqueeze(0),
+                key.transpose(0, 1).unsqueeze(0),
+                value.transpose(0, 1).unsqueeze(0),
+            )
         return self.wo(attended.squeeze(0).transpose(0, 1).reshape(num_patches, -1))
 
 
