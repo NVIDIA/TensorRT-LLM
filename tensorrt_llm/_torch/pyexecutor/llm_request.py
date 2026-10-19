@@ -1260,9 +1260,8 @@ def get_multimodal_encoder_token_lengths(
         request: LlmRequest) -> Optional[Sequence[int]]:
     """Return per-item physical encoder attention-token costs.
 
-    Field-level validation happens inside
-    `MultimodalItemMetadata.validate`; only the request-level
-    cross-check against `output_embedding_lengths` lives here.
+    Validate item metadata and check output rows against the request's
+    prompt spans.
     """
     item_metadata = get_multimodal_item_metadata(request.py_multimodal_data)
     if item_metadata is None:
@@ -1270,12 +1269,8 @@ def get_multimodal_encoder_token_lengths(
     item_metadata.validate()
     if item_metadata.encoder_token_lengths is None:
         return None
-    embedding_lengths = get_multimodal_embedding_lengths(request)
-    if embedding_lengths is None:
+    if get_multimodal_embedding_lengths(request) is None:
         raise ValueError("Multimodal encoder item scheduling requires "
-                         "output_embedding_lengths")
-    if item_metadata.output_embedding_lengths != tuple(embedding_lengths):
-        raise ValueError("Multimodal encoder item output lengths must match "
                          "output_embedding_lengths")
     return item_metadata.encoder_token_lengths
 

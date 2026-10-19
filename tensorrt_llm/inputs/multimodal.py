@@ -794,7 +794,7 @@ class MultimodalParams:
     """Processed multimodal inputs and views used by model execution.
 
     `item_metadata` reads the request's shared item record from processed data;
-    `get_item_layout` resolves its prompt order, including legacy formats.
+    `get_item_layout` reads prompt order and output rows from that record.
     Runtime data describes the current forward or chunk rather than encoder
     readiness and cache ownership, which belong to the request Params.
 
