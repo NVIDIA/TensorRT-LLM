@@ -6777,7 +6777,6 @@ class MixedPrecisionKVCacheManager(KVCacheManagerV2):
             raise NotImplementedError("Mixed-precision NVFP4 KV requires Blackwell")
         self.first_n = first_n
         self.last_n = last_n
-        self.high_dtype = dtype
         self.low_dtype = low_dtype
         self.high_low_pool_ratio = high_low_pool_ratio
         self.high_layers: dict[int, int] = {}
@@ -6798,16 +6797,6 @@ class MixedPrecisionKVCacheManager(KVCacheManagerV2):
 
         self.mixed_precision_buffers = Buffers()
         super().__init__(*args, dtype=dtype, **kwargs)
-        if self.kv_factor == 2:
-            for layer in self.high_layers:
-                key = self.impl.get_mem_pool_base_address(
-                    layer, Role.KEY_BLOCK_SCALE, PageIndexMode.SHARED
-                )
-                value = self.impl.get_mem_pool_base_address(
-                    layer, Role.VALUE_BLOCK_SCALE, PageIndexMode.SHARED
-                )
-                if key + self.impl.get_page_stride(layer, Role.KEY_BLOCK_SCALE) != value:
-                    raise ValueError("Mixed-precision KV requires adjacent K/V block-scale pages")
 
     # KVCacheManagerV2 overrides.
 
@@ -6865,16 +6854,11 @@ class MixedPrecisionKVCacheManager(KVCacheManagerV2):
             layer_id = int(layer.layer_id)
             if self.low_dtype == DataType.NVFP4 and self.head_dim_per_layer[layer_id] % 16:
                 raise ValueError("NVFP4 mixed-precision KV requires head_dim divisible by 16")
-            elements_per_page = (
-                self.tokens_per_block
-                * self.num_kv_heads_per_layer[layer_id]
-                * self.head_dim_per_layer[layer_id]
+            page_bytes = self.tokens_per_block * super().get_layer_bytes_per_token(
+                layer_id, Role.KEY
             )
             buffers = [
-                BufferConfig(
-                    role=buffer.role,
-                    size=get_size_in_bytes(elements_per_page, self.high_dtype),
-                )
+                BufferConfig(role=buffer.role, size=page_bytes)
                 for buffer in layer.buffers
                 if buffer.role in (Role.KEY, Role.VALUE)
             ]
@@ -6893,14 +6877,13 @@ class MixedPrecisionKVCacheManager(KVCacheManagerV2):
                     reuse_policy=AttentionReusePolicy.REQUIRED,
                 )
             )
-            largest_page = max(largest_page, self.kv_factor * elements_per_page)
+            largest_page = max(largest_page, self.kv_factor * page_bytes)
 
         if not self.high_layers:
             return config
         # Layers share one native KV view.
         pages = self.max_batch_size * math.ceil(self.max_seq_len / self.tokens_per_block)
-        elements = pages * largest_page
-        self._staging_bytes = get_size_in_bytes(elements, self.high_dtype)
+        self._staging_bytes = pages * largest_page
         reserve = self._staging_bytes
         # Page tables are per layer; lengths are shared by the batch.
         reserve += len(self.high_layers) * 3 * pages * 4
@@ -6908,13 +6891,10 @@ class MixedPrecisionKVCacheManager(KVCacheManagerV2):
         # TRTLLM uses at most 32 tokens per staging page and two offsets even for MLA.
         view_pages = math.ceil(self.max_seq_len / min(self.tokens_per_block, 32))
         reserve += len(self.high_layers) * self.max_batch_size * 2 * view_pages * 4
-        tiers = []
-        for tier in config.cache_tiers:
-            if isinstance(tier, GpuCacheTierConfig):
-                if tier.quota <= reserve:
-                    raise ValueError("KV budget cannot cover mixed-precision Attention staging")
-                tier = GpuCacheTierConfig(quota=tier.quota - reserve)
-            tiers.append(tier)
+        quota = config.cache_tiers[0].quota - reserve
+        if quota <= 0:
+            raise ValueError("KV budget cannot cover mixed-precision Attention staging")
+        tiers = [GpuCacheTierConfig(quota=quota), *config.cache_tiers[1:]]
         ratio = self._split_mixed_precision_pool_ratio(config)
         return replace(config, layers=layers, cache_tiers=tiers, initial_pool_ratio=ratio)
 
@@ -6932,7 +6912,7 @@ class MixedPrecisionKVCacheManager(KVCacheManagerV2):
         width = self.head_dim_per_layer[local]
         layer, role, dtype, width = {
             "low": (local, Role.KEY, torch.uint8, width // 2),
-            "high": (self.high_layers[local], Role.KEY, self.high_dtype, width),
+            "high": (self.high_layers[local], Role.KEY, self.dtype, width),
             "scales": (local, Role.KEY_BLOCK_SCALE, torch.uint8, width // 16),
         }[mixed_precision_pool]
         address = self.impl.get_mem_pool_base_address(layer, role, PageIndexMode.SHARED)

@@ -49,16 +49,13 @@ class MixedPrecisionKVView:
         self.block_size = manager.tokens_per_block
         # Native BF16 paged-context FMHA uses 32-token pages.
         self.tokens_per_block = min(self.block_size, 32) if trtllm else self.block_size
-        self.history = manager.get_buffers(layer_idx, kv_layout=metadata.kv_layout)
-        self.high = manager.get_buffers(layer_idx, metadata.kv_layout, mixed_precision_pool="high")
-        self.scales = manager.get_buffers(
-            layer_idx, metadata.kv_layout, mixed_precision_pool="scales"
+        pools = (
+            manager.get_buffers(layer_idx, metadata.kv_layout, mixed_precision_pool=pool)
+            for pool in ("low", "scales", "high")
         )
-        if self.layout != metadata.kv_layout:
-            # Reinterpret pool strides without moving stored KV.
-            self.history = self.history.transpose(2, 3)
-            self.high = self.high.transpose(2, 3)
-            self.scales = self.scales.transpose(2, 3)
+        self.pools = tuple(
+            pool if self.layout == metadata.kv_layout else pool.transpose(2, 3) for pool in pools
+        )
         self.max_seq_len = manager.max_seq_len
         self.max_blocks_per_seq = (
             self.max_seq_len + self.tokens_per_block - 1
@@ -68,10 +65,10 @@ class MixedPrecisionKVView:
         self.max_attention_window_vec = (None,)
         # Fixed per-request spans keep addresses unchanged as sequences grow.
         self.page_starts = [row * self.max_blocks_per_seq for row in range(metadata.num_seqs + 1)]
-        shape = [self.page_starts[-1], *self.high.shape[1:]]
+        shape = [self.page_starts[-1], *self.pools[-1].shape[1:]]
         shape[3 if self.layout == "HND" else 2] = self.tokens_per_block
-        self.pool = manager.get_staging_buffer(shape, self.high.dtype)
-        self.dtype = manager.high_dtype
+        self.pool = manager.get_staging_buffer(shape, self.pools[-1].dtype)
+        self.dtype = manager.dtype
         self.kv_cache_pool_pointers = torch.tensor([[self.pool.data_ptr(), 0]], dtype=torch.int64)
         self.kv_cache_pool_mapping = torch.zeros((1, 2), dtype=torch.int32)
         self.metadata = None
@@ -158,9 +155,7 @@ class MixedPrecisionKVView:
 
         materialize_mixed_precision_kv(
             self.pool,
-            self.history,
-            self.scales,
-            self.high,
+            *self.pools,
             self.page_tables,
             self.lengths,
             self.layout,
@@ -202,9 +197,7 @@ class MixedPrecisionKVView:
 
         writeback_mixed_precision_kv(
             self.pool,
-            self.history,
-            self.scales,
-            self.high,
+            *self.pools,
             self.page_tables,
             self.lengths,
             self.max_new_tokens_per_request,

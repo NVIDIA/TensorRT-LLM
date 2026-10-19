@@ -68,7 +68,7 @@ def test_extra_pool_uses_existing_dtype_layout(manager):
     """High pages use the configured native KV dtype without block scales."""
     high = manager.kv_cache_manager_py_config.layers[1]
     for buffer in high.buffers:
-        expected = get_size_in_bytes(2 * 64 * 128, manager.high_dtype)
+        expected = get_size_in_bytes(2 * 64 * 128, manager.dtype)
         assert buffer.size == expected
         assert manager.impl.get_page_stride(high.layer_id, buffer.role) >= expected
     assert all(buffer.role in (Role.KEY, Role.VALUE) for buffer in high.buffers)
