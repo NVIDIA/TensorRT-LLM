@@ -132,96 +132,67 @@ DETACHED_JOBS = """\
 ## Long-running commands — launch them detached
 
 Your session can be stopped and restarted (the orchestrator itself is
-restarted). A blocking `srun`, long build or long eval dies with the session.
-For anything longer than a few minutes, launch it detached through the
-framework wrapper, which records it in your task's `jobs.json` so it survives
-a restart:
-
-    python -m agent_flow.jobs.run_detached \\
-      --registry <your jobs.json> \\
-      --handle <stable logical key, e.g. gsm8k-tp4> \\
-      --kind slurm --name <task id>-<handle> \\
-      -- <your sbatch script and args>
-
-Use `--kind local` with the plain command when there is no Slurm. Use a
-**stable** `--handle` that names what the job computes (no timestamps).
+restarted). A command that blocks your session dies with it. Launch anything
+longer than a few minutes detached through `agent_flow.jobs.run_detached`
+(its `--help` gives the usage). It records the job in your task's `jobs.json`
+so a restarted session finds it. Give each job a **stable** handle that names
+what it computes (no timestamps).
 
 `jobs.json` belongs to the wrapper: never write or edit it yourself. Keep
 your own notes about jobs in another file of your node directory.
 
-**Re-attach before you submit.** Read your `jobs.json` first. If a job is
-already recorded under the handle, check it yourself (`squeue -j <id>`, then
-`sacct -j <id> -o State,ExitCode`): still running → keep polling it; finished
-→ collect its output; gone or failed → resubmit with the same `--handle`.
-Never resubmit a live job.
+**Re-attach before you launch.** Read your `jobs.json` first. A job already
+recorded under the handle that is still running is polled, not relaunched; a
+finished one is collected; only a gone or failed one is launched again under
+the same handle.
 """
 
 GPU_POOL = """\
 ## Running GPU work: the run's GPU pool
 
-The run holds a pool of GPU nodes for its workers. Run every command that
-needs a GPU through it with the command your turn prompt names; never submit
-your own `srun` or `sbatch`. It waits until GPUs are free for you — work on
-the way to the first accuracy result is served first — then runs the command
-as a step of a pool job: inside the run's container, in your worktree
-(mounted at its own path, as are the workspace and the checkout), with
-`CUDA_VISIBLE_DEVICES` set to your GPUs. It exits with the command's status
-and frees the GPUs when the command ends.
+The run holds a pool of GPU nodes for its workers. Every command that needs a
+GPU goes through the pool, with the entry point your turn prompt names; never
+submit your own Slurm jobs. The pool waits until GPUs are free for you (work
+on the way to the first accuracy result is served first), runs the command in
+the run's container and your worktree with only your GPUs visible, and frees
+them when the command ends.
 
-- `--gpus` is how many GPUs the command uses, `--minutes` how long it may
-  run; ask for no more than it needs.
-- Run anything longer than a few minutes detached with `--kind local` (see
-  below), so it survives a restart of your session.
+- Ask for no more GPUs and time than the command needs.
+- A long pool command is launched detached (see below), so it survives a
+  restart of your session.
 - Never run TensorRT-LLM code on the login node: only a pool command is
   evidence.
 
 A fresh worktree has no native build artifacts, and the container knows
-nothing of the run's Python environment or model paths. The run's
-environment task writes a wrapper that prepares both and records it in
-`test_commands.md`: run your commands through it (`<gpu_run ...> bash
-<wrapper> <command...>`); if it is not recorded yet, write code and wait for
-it rather than building your own. `test_commands.md` in the workspace is a
-cache of commands other tasks have **verified** to work: read it before
-drafting a command, add or update an entry after one works (a one-line
-purpose, then the exact command), and delete entries you find broken. Other
-tasks edit it concurrently, so edit it in place with small changes.
+nothing of the run's Python environment or model paths. The run's environment
+task records the way to prepare both in `test_commands.md`; use it, and if it
+is not recorded yet, write code and wait for it rather than building your
+own. `test_commands.md` in the workspace is a cache of commands other tasks
+have **verified** to work: read it before drafting a command, record one after
+it works, and delete entries you find broken. Other tasks edit it
+concurrently, so edit it in place with small changes.
 """
 
 SLURM_ENVIRONMENT = """\
 ## Running GPU work on Slurm
 
-`task.yaml` contains a `slurm-environment` section. Use its `slurm_partition`
-and `docker_image` verbatim; do not invent another partition or image, and do
-not fall back to a local run. If a value is unusable, report it as a blocker.
+`task.yaml` contains a `slurm-environment` section. Use its partition and
+container image as given; do not invent others, and do not fall back to a
+local run. If a value is unusable, report it as a blocker.
 
-Every command that runs TensorRT-LLM code runs inside that container, with
-the code **you are testing** mounted at its own absolute path:
-
-- mount your task's worktree (it is a git worktree of `trtllm_repo_path`, so
-  also mount `trtllm_repo_path` itself — the worktree's `.git` points into
-  it) and the run's workspace, each at the same path inside the container;
-- `cd` into your worktree inside the container before running anything.
+Every command that runs TensorRT-LLM code runs inside that container, from
+the code **you are testing**: your task's worktree, the checkout it belongs
+to and the run's workspace are mounted at their own paths, and the command
+runs in your worktree. A TensorRT-LLM command on the login node, or in a
+container without the code under test, is not evidence.
 
 A fresh worktree has no native build artifacts. When `implements_tips` or
-`test_commands.md` give a way to reuse an existing build (for example linking
-a built checkout's compiled artifacts into your worktree), use it: it takes
-seconds, and is valid as long as your task changes no C++ or CUDA source.
-Otherwise each fresh container session bootstraps the checkout it runs from:
+`test_commands.md` give a way to reuse an existing build, use it; it is valid
+as long as your task changes no C++ or CUDA source. Otherwise the checkout is
+built inside the same job as the command it serves.
 
-```bash
-cd <your worktree>
-./scripts/build_wheel.py --trt_root /usr/local/tensorrt --benchmarks --skip_building_wheel -f --nvtx --use_ccache
-pip install -e .[devel]
-```
-
-Run the bootstrap in the same `srun`/`sbatch` invocation as the command it
-serves (`srun --partition=<slurm_partition> --container-image=<docker_image>
---container-mounts=<mounts> ...`). A TensorRT-LLM command on the login node,
-or in a container that did not mount the code under test, is not evidence.
-
-`test_commands.md` in the workspace is a cache of Slurm commands other tasks
-have **verified** to work. Read it before drafting a command; after a command
-works, add or update its entry (a one-line purpose, then the exact command).
-Delete entries you find broken. Other tasks edit it concurrently, so edit it
-in place with small changes rather than rewriting the file.
+`test_commands.md` in the workspace is a cache of commands other tasks have
+**verified** to work: read it before drafting a command, record one after it
+works, and delete entries you find broken. Other tasks edit it concurrently,
+so edit it in place with small changes.
 """
