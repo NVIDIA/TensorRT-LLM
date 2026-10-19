@@ -93,6 +93,25 @@ HuggingFace Model → LLM API → PyTorch Executor
 - **Disaggregated serving**: separates prefill (context) and decode (generation) across GPUs
   - KV cache exchange via NIXL (default), UCX, or MPI
 
+### Multimodal request data
+
+Read the [multimodal data contracts](docs/source/torch/arch_overview.md#multimodal-request-data)
+before changing multimodal preprocessing, item selection, or request ownership.
+- Reuse `MultimodalParams` in `inputs/multimodal.py`; the executor's request aggregate is
+  `LlmRequest.py_multimodal_params`. Legacy request properties alias this aggregate.
+- `item_metadata` reads one record in `multimodal_data`. Its `input_partitions` describe
+  how processed fields are selected by item; model hooks retain batching and padding policy.
+  Keep prompt token counts, encoder costs, and output embedding rows distinct.
+- Only request Params own `encoder_state` cache references. Encoder selection and LLM chunk
+  Params are separate views; cleanup remains in the executor and the cache remains model-owned.
+- E/P processor hooks return `(prompt_token_ids, MultimodalParams)`; use
+  `MultimodalParams.from_embeddings` for embedding handoffs. `DisaggregatedParams` remains
+  the transport envelope. Do not serialize live encoder state or CUDA events in a new wire format.
+- When changing an E/P contract, check external callers such as Dynamo separately from
+  local processor hooks: wire compatibility and Python API compatibility are distinct.
+- Validate producer/admission contracts at their boundaries. Preserve legacy adapters and
+  model capabilities without adding repeated full-metadata validation to selection or forward.
+
 ## Key Files
 
 | File | Role |
