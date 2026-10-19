@@ -452,7 +452,7 @@ def test_mixed_precision_paged_conversion(dtype, width, layout):
         ].transpose(0, 1)
     expected_high[1] = values[:128].transpose(0, 1)
     pools = tuple(t.transpose(2, 3) if layout == "HND" else t for t in (pool, low, scales, high))
-    convert_mixed_precision_kv(True, 130, *pools, tables, lengths, layout)
+    convert_mixed_precision_kv(True, 130, *pools, tables, lengths, layout, low_dtype=DataType.NVFP4)
     for actual, expected in ((low, expected_low), (scales, expected_scales), (high, expected_high)):
         torch.testing.assert_close(
             actual.view(torch.uint8), expected.view(torch.uint8), rtol=0, atol=0
@@ -465,7 +465,9 @@ def test_mixed_precision_paged_conversion(dtype, width, layout):
     expected[:128] = values[:128]
     expected[128:130] = restored[128:130].to(dtype)
     lengths[0].fill_(130)
-    convert_mixed_precision_kv(False, 192, *pools, tables, lengths, layout)
+    convert_mixed_precision_kv(
+        False, 192, *pools, tables, lengths, layout, low_dtype=DataType.NVFP4
+    )
     actual = pool.transpose(1, 2).reshape_as(values)
     torch.testing.assert_close(actual.view(torch.uint8), expected.view(torch.uint8), rtol=0, atol=0)
 

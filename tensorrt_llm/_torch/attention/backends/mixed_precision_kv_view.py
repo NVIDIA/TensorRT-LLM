@@ -72,6 +72,7 @@ class MixedPrecisionKVView:
             self.pools[layer_idx] = (staging, *pools)
         self.layer_offsets = dict.fromkeys(self.pools, 0)
         self.dtype = manager.dtype
+        self.low_dtype = manager.low_dtype
         self.kv_cache_pool_pointers = torch.tensor([[storage.data_ptr(), 0]], dtype=torch.int64)
         self.kv_cache_pool_mapping = torch.zeros((1, 2), dtype=torch.int32)
         self.metadata = None
@@ -164,6 +165,7 @@ class MixedPrecisionKVView:
             self.page_tables[layer_idx],
             self.lengths,
             self.layout,
+            low_dtype=self.low_dtype,
         )
 
     def get_buffers(self, layer_idx: int, kv_layout: str = "NHD") -> torch.Tensor:
