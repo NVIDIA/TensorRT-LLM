@@ -200,8 +200,9 @@ class TestClassicFrontendProxyEndToEnd:
         The worker fans a per-lane None sentinel to every frontend (see
         notify_proxy_threads_to_quit). Frontend shutdown deliberately leaves
         the thread to process teardown, which the threadleak checker would
-        report as a leak.
+        report as a leak. The request sender thread is stopped the same way.
         """
+        proxy._close_request_sender()
         import zmq
 
         from tensorrt_llm.executor.ipc import FusedIpcQueue
