@@ -231,10 +231,9 @@ The disaggregated server also serves `/v1/responses`, with both `context_first` 
 - A request with `previous_response_id` is rejected with a 400, because a stored response lives in one worker's memory and a later request may reach another worker. Send the earlier turns in `input` instead.
 - `store` is ignored: nothing is persisted, and the server logs a warning once when a client asks for it.
 
-Two limitations apply to `/v1/responses` on every server, disaggregated or not:
+One limitation applies to `/v1/responses` on every server, disaggregated or not:
 
 - `parallel_tool_calls: false`, and a `tool_choice` other than `auto` or `none` on non-Harmony models, are accepted but not enforced. The server logs a warning once.
-- An image in the input, in a message or in a tool output, is replaced by a text placeholder that names what was dropped, since the endpoint accepts text only.
 
 #### Launching disaggregated servers on SLURM clusters
 

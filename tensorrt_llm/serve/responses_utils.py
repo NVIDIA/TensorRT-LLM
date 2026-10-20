@@ -59,7 +59,6 @@ from tensorrt_llm.executor import (EngineDeadError, GenerationResult,
                                    RequestError)
 from tensorrt_llm.inputs import PromptInputs, prompt_inputs
 from tensorrt_llm.inputs.multimodal import MultimodalServerConfig
-from tensorrt_llm.inputs.registry import MULTIMODAL_PLACEHOLDER_REGISTRY
 from tensorrt_llm.inputs.utils import (async_apply_chat_template,
                                        resolve_hf_chat_template)
 from tensorrt_llm.llmapi import SamplingParams
@@ -89,7 +88,6 @@ from tensorrt_llm.serve.openai_protocol import (ChatCompletionMessageParam,
                                                 StreamingResponsesResponse,
                                                 UCompletionRequest,
                                                 UCompletionResponse,
-                                                input_image_placeholder,
                                                 to_disaggregated_params)
 from tensorrt_llm.serve.responses_web_search import is_web_search_tool
 from tensorrt_llm.serve.tool_parser.base_tool_parser import (
@@ -1131,65 +1129,14 @@ async def _create_input_messages(
     request: ResponsesRequest,
     prev_msgs: list[ChatCompletionMessageParam],
 ) -> list[ChatCompletionMessageParam]:
-    return chat_messages_from_responses_input(request,
-                                              prev_msgs,
-                                              keep_images=True)
-
-
-def _reads_images(request: ResponsesRequest,
-                  model_config: PretrainedConfig) -> bool:
-    """Whether an image in ``request`` can be shown to the model.
-
-    Not when the model takes no image input, nor for a disaggregated request,
-    whose context and generation workers exchange token ids only.
-    """
-    if request.disaggregated_params is not None:
-        return False
-    return MULTIMODAL_PLACEHOLDER_REGISTRY.is_valid(
-        resolve_top_level_model_type(model_config), "image")
-
-
-def _has_image_parts(messages: list[ChatCompletionMessageParam]) -> bool:
-    return any(
-        isinstance(part, dict) and part.get("type") == "image_url"
-        for message in messages if isinstance(message.get("content"), list)
-        for part in message["content"])
-
-
-def _without_image_parts(
-    messages: list[ChatCompletionMessageParam]
-) -> list[ChatCompletionMessageParam]:
-    """``messages`` with each image part replaced by a text placeholder."""
-
-    def _part(part):
-        if isinstance(part, dict) and part.get("type") == "image_url":
-            return {
-                "type":
-                "text",
-                "text":
-                input_image_placeholder({
-                    "type": "input_image",
-                    "image_url": part.get("image_url")
-                })["text"],
-            }
-        return part
-
-    return [{
-        **message, "content": [_part(part) for part in message["content"]]
-    } if isinstance(message.get("content"), list) else message
-            for message in messages]
+    return chat_messages_from_responses_input(request, prev_msgs)
 
 
 def chat_messages_from_responses_input(
     request: ResponsesRequest,
     prev_msgs: list[ChatCompletionMessageParam],
-    *,
-    keep_images: bool = False,
 ) -> list[ChatCompletionMessageParam]:
-    """Convert a Responses request's instructions, history and input to chat messages.
-
-    An image becomes a text placeholder unless ``keep_images`` is set.
-    """
+    """Convert a Responses request's instructions, history and input to chat messages."""
     messages: list[ChatCompletionMessageParam] = []
     if request.instructions:
         messages.append({
@@ -1227,7 +1174,7 @@ def chat_messages_from_responses_input(
                 continue
             messages.append(message)
 
-    return messages if keep_images else _without_image_parts(messages)
+    return messages
 
 
 def _stored_tool_arguments(call) -> str:
@@ -1460,8 +1407,6 @@ async def _create_input_tokens(
         request=request,
         prev_msgs=prev_msgs,
     )
-    if _has_image_parts(messages) and not _reads_images(request, model_config):
-        messages = _without_image_parts(messages)
 
     if enable_store and request.store:
         await conversation_store.store_messages(request.request_id, messages,

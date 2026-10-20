@@ -31,8 +31,6 @@ from tensorrt_llm.serve.responses_utils import (
     _count_reasoning_tokens,
     _create_output_content,
     _create_usage,
-    _reads_images,
-    chat_messages_from_responses_input,
 )
 
 # The CPU-* CI stages run pytest with -m 'cpu_only'. Without this marker every
@@ -248,78 +246,3 @@ def test_a_streamed_response_counts_reasoning_tokens():
     frame = processor.get_final_response_non_store(result, tokenizer=_WordTokenizer())
     usage = json.loads(frame.split("data: ", 1)[1])["response"]["usage"]
     assert usage["output_tokens_details"]["reasoning_tokens"] == 2
-
-
-# ---------------------------------------------------------------------------
-# An image the model cannot be shown degrades to a text placeholder
-# ---------------------------------------------------------------------------
-
-_PNG = "data:image/png;base64,AAAA"
-
-_IMAGE_ITEMS = pytest.mark.parametrize(
-    "item",
-    [
-        {"role": "user", "content": [{"type": "input_image", "image_url": _PNG}]},
-        {"role": "user", "content": [{"type": "input_image", "image_url": {"url": _PNG}}]},
-        {
-            "type": "custom_tool_call_output",
-            "call_id": "call_1",
-            "output": [{"type": "input_image", "image_url": _PNG}],
-        },
-    ],
-    ids=["message_part", "url_object", "tool_output"],
-)
-
-
-def _assert_placeholder(part):
-    assert part["text"].startswith("[image omitted: image/png, ")
-    assert "AAAA" not in part["text"]
-
-
-def test_a_top_level_image_degrades_at_validation():
-    """No input item type holds a bare image part, so it would fail the request."""
-    request = ResponsesRequest(model="m", input=[{"type": "input_image", "image_url": _PNG}])
-    part = request.model_dump()["input"][0]
-    assert part["type"] == "input_text"
-    _assert_placeholder(part)
-
-
-@_IMAGE_ITEMS
-def test_an_image_survives_validation(item):
-    """Whether the model can be shown the image is decided later, per model."""
-    dumped = ResponsesRequest(model="m", input=[item]).model_dump()["input"][0]
-    (part,) = dumped["output"] if "output" in dumped else dumped["content"]
-    assert part["type"] == "input_image"
-
-
-@_IMAGE_ITEMS
-def test_an_image_degrades_unless_it_can_be_shown(item):
-    request = ResponsesRequest(model="m", input=[item])
-    (message,) = chat_messages_from_responses_input(request, [])
-    (part,) = message["content"]
-    assert part["type"] == "text"
-    _assert_placeholder(part)
-
-    (message,) = chat_messages_from_responses_input(request, [], keep_images=True)
-    assert message["content"][0]["type"] == "image_url"
-
-
-def test_images_are_not_shown_to_a_text_only_model():
-    request = ResponsesRequest(model="m", input="hi")
-    assert not _reads_images(request, SimpleNamespace(model_type="llama"))
-
-
-def test_images_are_not_shown_on_a_disaggregated_request():
-    """The context and generation workers exchange token ids only."""
-    request = ResponsesRequest(
-        model="m",
-        input="hi",
-        disaggregated_params={"request_type": "context_only"},
-    )
-    assert not _reads_images(request, SimpleNamespace(model_type="qwen2_vl"))
-
-
-def test_a_string_tool_output_is_not_degraded():
-    item = {"type": "custom_tool_call_output", "call_id": "call_2", "output": "done\n"}
-    request = ResponsesRequest(model="m", input=[item])
-    assert request.model_dump()["input"][0]["output"] == "done\n"

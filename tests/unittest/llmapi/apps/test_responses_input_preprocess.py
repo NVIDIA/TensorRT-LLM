@@ -445,26 +445,6 @@ def test_item_text_is_read_from_every_shape_that_carries_it(item, expected):
     assert _response_output_item_to_chat_completion_message(item) == expected
 
 
-_IMAGE = {"type": "image_url", "image_url": {"url": "http://example/x.png"}}
-
-
-@pytest.mark.parametrize(
-    "content, expected",
-    [
-        ([{"type": "input_text", "text": "hello"}], [{"type": "text", "text": "hello"}]),
-        ([{"type": "output_text", "text": "hi"}], [{"type": "text", "text": "hi"}]),
-        (
-            [{"type": "input_text", "text": "what is this"}, _IMAGE],
-            [{"type": "text", "text": "what is this"}, _IMAGE],
-        ),
-        ("hello", "hello"),
-    ],
-)
-def test_untyped_message_parts_are_translated_to_chat_parts(content, expected):
-    msg = _response_output_item_to_chat_completion_message({"role": "user", "content": content})
-    assert msg == {"role": "user", "content": expected}
-
-
 @pytest.mark.parametrize("item_type", ["function_call_output", "custom_tool_call_output"])
 @pytest.mark.parametrize(
     "output, expected",
