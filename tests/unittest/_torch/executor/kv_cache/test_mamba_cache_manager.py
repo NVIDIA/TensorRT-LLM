@@ -2606,6 +2606,8 @@ def _make_v2_conversation_request(
 def _run_v2_hybrid_context(
     manager: MambaHybridCacheManagerV2,
     request: LlmRequest,
+    *,
+    state_value: int | None = None,
 ) -> None:
     manager.prepare_expect_snapshot_points([request])
     assert manager.prepare_context(request)
@@ -2615,6 +2617,10 @@ def _run_v2_hybrid_context(
     batch = ScheduledRequests()
     batch.append_context_request(request)
     manager.prepare_resources(batch)
+    if state_value is not None:
+        state_index = manager.get_state_indices([request.py_request_id], [False])[0]
+        for buffer in (*manager.all_ssm_states, *manager.all_conv_states):
+            buffer[state_index].fill_(state_value)
     request.context_current_position = request.prompt_len
     assert request.context_remaining_length == 0
     manager.update_context_resources(batch)
@@ -3061,12 +3067,18 @@ def test_v2_hybrid_retains_configured_number_of_conversation_turns():
         request_b_after_eviction,
     ]
 
+    def assert_reused_state(request: LlmRequest, value: int) -> None:
+        state_index = mgr.get_state_indices([request.py_request_id], [False])[0]
+        # Reuse preserves payloads even when cache offload/onboard moves their slots.
+        for buffer in (*mgr.all_ssm_states, *mgr.all_conv_states):
+            torch.testing.assert_close(
+                buffer[state_index], torch.full_like(buffer[state_index], value), rtol=0, atol=0
+            )
+
     try:
-        _run_v2_hybrid_context(mgr, request_a)
-        request_a_state_index = mgr.get_state_indices([request_a.py_request_id], [False])[0]
+        _run_v2_hybrid_context(mgr, request_a, state_value=1)
         mgr.free_resources(request_a)
-        _run_v2_hybrid_context(mgr, request_b)
-        request_b_state_index = mgr.get_state_indices([request_b.py_request_id], [False])[0]
+        _run_v2_hybrid_context(mgr, request_b, state_value=2)
         mgr.free_resources(request_b)
 
         mgr.prepare_expect_snapshot_points([request_a_probe])
@@ -3075,9 +3087,7 @@ def test_v2_hybrid_retains_configured_number_of_conversation_turns():
         probe_batch.append_context_request(request_a_probe)
         mgr.prepare_resources(probe_batch)
         assert request_a_probe.prepopulated_prompt_len == request_a_probe.prompt_len - 1
-        assert mgr.get_state_indices([request_a_probe.py_request_id], [False]) == [
-            request_a_state_index
-        ]
+        assert_reused_state(request_a_probe, 1)
         mgr.free_resources(request_a_probe)
 
         mgr.prepare_expect_snapshot_points([request_b_probe])
@@ -3086,12 +3096,10 @@ def test_v2_hybrid_retains_configured_number_of_conversation_turns():
         probe_batch.append_context_request(request_b_probe)
         mgr.prepare_resources(probe_batch)
         assert request_b_probe.prepopulated_prompt_len == request_b_probe.prompt_len - 1
-        assert mgr.get_state_indices([request_b_probe.py_request_id], [False]) == [
-            request_b_state_index
-        ]
+        assert_reused_state(request_b_probe, 2)
         mgr.free_resources(request_b_probe)
 
-        _run_v2_hybrid_context(mgr, request_c)
+        _run_v2_hybrid_context(mgr, request_c, state_value=3)
         mgr.free_resources(request_c)
 
         mgr.prepare_expect_snapshot_points([request_a_after_eviction])
@@ -3107,9 +3115,7 @@ def test_v2_hybrid_retains_configured_number_of_conversation_turns():
             request_b_after_eviction.prepopulated_prompt_len
             == request_b_after_eviction.prompt_len - 1
         )
-        assert mgr.get_state_indices([request_b_after_eviction.py_request_id], [False]) == [
-            request_b_state_index
-        ]
+        assert_reused_state(request_b_after_eviction, 2)
     finally:
         for request in requests:
             if request.py_request_id in mgr.kv_cache_map:
