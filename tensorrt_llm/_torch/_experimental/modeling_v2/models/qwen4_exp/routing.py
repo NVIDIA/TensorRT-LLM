@@ -12,14 +12,18 @@ mirrored fields are unreliable.
 
 from __future__ import annotations
 
-from typing import Any, Optional, Tuple
+from typing import TYPE_CHECKING, Any, NamedTuple, Optional, Tuple
 
 import torch
 
 from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 
-from ..._router_index import EngineFacts, NoTarget
+from ..._router_index import NoTarget
+
+if TYPE_CHECKING:
+    from tensorrt_llm._torch.model_config import ModelConfig
+    from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 
 # (layers, hidden, experts, attention heads, linear value heads, vocab). Shape-sniffing
 # also matches fine-tunes; the accuracy gate pins identity.
@@ -44,8 +48,36 @@ _MAX_CUTEDSL_DRAFT_LEN = 3
 _SSM_STATE_DTYPES = (torch.float32, torch.bfloat16)
 
 
+class EngineChoices(NamedTuple):
+    """Engine choices that fix which code the target runs but are not in the checkpoint's
+    config, as the engine will resolve them."""
+
+    torch_dtype: torch.dtype  # the dtype the engine runs the model in
+    moe_backend: str  # `moe_config.backend` as requested, before AUTO resolves
+    mamba_ssm_cache_dtype: torch.dtype  # the recurrent-state cache's dtype
+    gdn_replay: bool  # TRTLLM_USE_GDN_REPLAY, which the engine reads for eligible MTP workloads
+    prefill_cuda_graph_backend: str  # `prefill_cuda_graph_backend`: disabled, piecewise, breakable
+
+
+def engine_choices(model_config: ModelConfig, llm_args: TorchLlmArgs) -> EngineChoices:
+    # Imported on the claimed branch only, as the target is.
+    from tensorrt_llm._torch.pyexecutor.model_loader import effective_mamba_ssm_cache_dtype
+    from tensorrt_llm._torch.utils import is_gdn_replay_enabled
+
+    kv_cache_config = llm_args.kv_cache_config
+    return EngineChoices(
+        torch_dtype=model_config.torch_dtype,
+        moe_backend=model_config.moe_backend_requested,
+        mamba_ssm_cache_dtype=effective_mamba_ssm_cache_dtype(
+            model_config, kv_cache_config.mamba_ssm_cache_dtype
+        ),
+        gdn_replay=is_gdn_replay_enabled(),
+        prefill_cuda_graph_backend=str(llm_args.prefill_cuda_graph_backend.value),
+    )
+
+
 def _check_engine(
-    spec_config: Optional[Any], kv_cache_quant_algo: Optional[Any], engine: Optional[EngineFacts]
+    spec_config: Optional[Any], kv_cache_quant_algo: Optional[Any], engine: Optional[EngineChoices]
 ) -> None:
     """Decline what the target's constructor or first forward would refuse.
 
@@ -108,7 +140,8 @@ def route(
     compute_capability: Tuple[int, int],
     spec_config: Optional[Any],
     kv_cache_quant_algo: Optional[Any],
-    engine: Optional[EngineFacts] = None,
+    model_config: Optional[ModelConfig] = None,
+    llm_args: Optional[TorchLlmArgs] = None,
 ) -> type:
     """Return the target class for this deployment, or raise ``NoTarget`` saying why none fits.
 
@@ -116,7 +149,8 @@ def route(
     (see ``_router_index._kv_cache_quant_algo``), not the checkpoint's alone.
 
     The target is imported where it is returned, so declining costs no import
-    of modeling code.
+    of modeling code. With ``model_config`` and ``llm_args`` it also declines the
+    engine choices (`EngineChoices`) the target's constructor would refuse.
     """
     text = getattr(pretrained_config, "text_config", None)
     vision = getattr(pretrained_config, "vision_config", None)
@@ -179,6 +213,11 @@ def route(
         # isort: on
         # fmt: on
 
+        engine = (
+            engine_choices(model_config, llm_args)
+            if model_config is not None and llm_args is not None
+            else None
+        )
         _check_engine(spec_config, kv_cache_quant_algo, engine)
         return ModelingV2Qwen38FlashNextNvfp4Sm103Tp1
 

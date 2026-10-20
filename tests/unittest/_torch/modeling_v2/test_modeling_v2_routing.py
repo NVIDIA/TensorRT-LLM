@@ -33,7 +33,6 @@ from transformers import PretrainedConfig
 
 from tensorrt_llm._torch._experimental.modeling_v2._router_index import (
     NoTarget,
-    engine_facts,
     modeling_v2_resolve,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp import (
@@ -564,7 +563,9 @@ def _qwen4_exp_sm(_on_sm10x):
     ],
     ids=["no-spec", "mtp1", "mtp3", "mtp7"],
 )
-def test_qwen4_exp_tp1_matches(spec_config):
+def test_qwen4_exp_tp1_matches(monkeypatch, spec_config):
+    # mtp7 needs the GDN cached replay, which TRTLLM_USE_GDN_REPLAY=0 turns off.
+    monkeypatch.delenv("TRTLLM_USE_GDN_REPLAY", raising=False)
     config = _model_config(_qwen4_exp_config(), spec_config=spec_config)
     # The recurrent-state cache at either dtype the target serves; `auto` is bf16 here.
     for dtype in ("float32", "bfloat16", "auto"):
@@ -655,9 +656,11 @@ def test_qwen4_exp_quantized_kv_cache_dtypes_match(algo):
 @pytest.mark.usefixtures("_qwen4_exp_sm")
 @pytest.mark.parametrize("algo", [QuantAlgo.INT8, QuantAlgo.FP8_BLOCK_SCALES])
 def test_qwen4_exp_other_kv_cache_algorithms_are_declined(algo):
-    facts = engine_facts(_model_config(_qwen4_exp_config()), _llm_args("auto"))
-    with pytest.raises(NoTarget, match="kv_cache_quant_algo"):
-        qwen4_exp_routing._check_engine(None, facts._replace(kv_cache_quant_algo=algo))
+    choices = qwen4_exp_routing.engine_choices(
+        _model_config(_qwen4_exp_config()), _llm_args("auto")
+    )
+    with pytest.raises(NoTarget, match="KV cache"):
+        qwen4_exp_routing._check_engine(None, algo, choices)
 
 
 @pytest.mark.usefixtures("_qwen4_exp_sm")
