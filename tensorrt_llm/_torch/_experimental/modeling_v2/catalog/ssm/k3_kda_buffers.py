@@ -15,7 +15,7 @@ from dataclasses import dataclass
 
 import torch
 
-from tensorrt_llm._torch.cute_dsl_kernels.k3_kda_attn import op as _op
+from tensorrt_llm._torch.kernels.k3_kda_attn import op as _op
 
 CTAS = _op.CTAS  # k3_kda_qkvg's grid: 26 clusters of 4 CTAs
 FUSED_CTAS = _op.FUSED_CTAS  # k3_kda_attn's and k3_kda_decode_attn's grid

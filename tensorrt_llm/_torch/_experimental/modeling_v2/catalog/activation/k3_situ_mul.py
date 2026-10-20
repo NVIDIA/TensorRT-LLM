@@ -4,7 +4,7 @@
 
 import torch
 
-import tensorrt_llm._torch.cute_dsl_kernels.k3_ctm_gemv.op  # noqa: F401  (registers torch.ops.trtllm.k3_situ_mul)
+import tensorrt_llm._torch.kernels.k3_ctm_gemv.op  # noqa: F401  (registers torch.ops.trtllm.k3_situ_mul)
 
 
 def k3_situ_mul(

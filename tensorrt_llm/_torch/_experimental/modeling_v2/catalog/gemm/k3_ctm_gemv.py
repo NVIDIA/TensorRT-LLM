@@ -4,7 +4,7 @@
 
 import torch
 
-import tensorrt_llm._torch.cute_dsl_kernels.k3_ctm_gemv.op  # noqa: F401  (registers torch.ops.trtllm.k3_ctm_gemv*)
+import tensorrt_llm._torch.kernels.k3_ctm_gemv.op  # noqa: F401  (registers torch.ops.trtllm.k3_ctm_gemv*)
 
 
 def k3_ctm_gemv(

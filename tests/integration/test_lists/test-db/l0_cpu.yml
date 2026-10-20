@@ -45,8 +45,8 @@ l0_cpu:
   - unittest/_torch/attention
   - unittest/_torch/cute_dsl/test_kimi_k3_kda_ptx_patch.py
   # Kimi K3 MLA decode view from the attention metadata: every test is cpu_only (CPU tensors).
-  - unittest/_torch/cute_dsl_kernels/kimi_k3/test_k3_mla_decode_view.py
-  - unittest/_torch/cute_dsl_kernels/kimi_k3/test_k3_mla_launch.py
+  - unittest/_torch/kernels/kimi_k3/test_k3_mla_decode_view.py
+  - unittest/_torch/kernels/kimi_k3/test_k3_mla_launch.py
   - unittest/_torch/compilation/test_auto_multi_stream.py
   - unittest/_torch/compilation/test_phase_selective_forward.py
   - unittest/_torch/compilation/test_remove_copy_pass.py::test_remove_copy_preserves_minimax_producer_outputs
@@ -105,7 +105,7 @@ l0_cpu:
   - unittest/_torch/test_model_config.py
   - unittest/_torch/test_route_capture.py
   - unittest/_torch/test_utils.py
-  - unittest/_torch/thop/parallel_hw_agnostic
+  - unittest/_torch/kernels/parallel_hw_agnostic
   - unittest/_torch/visual_gen/multi_gpu/test_attn2d_attention.py
   - unittest/_torch/visual_gen/multi_gpu/test_token_sharded_tp_collectives.py
   - unittest/_torch/visual_gen/multi_gpu/test_ulysses_replicated_kv.py

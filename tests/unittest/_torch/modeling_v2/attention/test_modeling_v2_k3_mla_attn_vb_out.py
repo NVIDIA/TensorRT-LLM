@@ -40,7 +40,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.k3_mla_attn
 )
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.attention.backends.utils import create_attention
-from tensorrt_llm._torch.cute_dsl_kernels.k3_mla.decode_view import k3_mla_decode_view
+from tensorrt_llm._torch.kernels.k3_mla.decode_view import k3_mla_decode_view
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.bindings import DataType
@@ -79,7 +79,7 @@ def _no_cluster(num_requests: int, heads: int) -> bool:
     fit on the SMs at once."""
     import cuda.bindings.driver as cuda_driver
 
-    from tensorrt_llm._torch.cute_dsl_kernels.k3_mla import k3_mla_attn_kernel as kernel
+    from tensorrt_llm._torch.kernels.k3_mla import k3_mla_attn_kernel as kernel
 
     clusters = num_requests * heads // H
     if clusters <= kernel.CLUSTER_WAVE:
@@ -249,7 +249,7 @@ def _max_rel(a, b, tokens: int) -> float:
 
 def _counters(workspace: K3MlaAttnWorkspace) -> torch.Tensor:
     """The no-cluster arrival counters, [8 requests, groups, 2] (the (m, l) exchange's and the drain's)."""
-    from tensorrt_llm._torch.cute_dsl_kernels.k3_mla import k3_mla_attn_kernel as kernel
+    from tensorrt_llm._torch.kernels.k3_mla import k3_mla_attn_kernel as kernel
 
     g = workspace.groups
     slots = kernel.MAX_REQUESTS * g * kernel.CLUSTER

@@ -50,15 +50,15 @@ from ..attention.backends.interface import (
 )
 from ..distributed import AllReduce
 from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
-from ..model_config import ModelConfig
-from ..modules.decoder_layer import DecoderLayer
-from ..modules.embedding import Embedding
-from ..modules.fused_ops.gelu_tanh_mul_fp4_quant import gelu_tanh_mul_fp4_quant
-from ..modules.fused_ops.rmsnorm_fp4_quant import rmsnorm_fp4_quant, rmsnorm_fp4_quant_available
-from ..modules.fused_ops.rmsnorm_residual_add import (
+from ..kernels.fused_ops.gelu_tanh_mul_fp4_quant import gelu_tanh_mul_fp4_quant
+from ..kernels.fused_ops.rmsnorm_fp4_quant import rmsnorm_fp4_quant, rmsnorm_fp4_quant_available
+from ..kernels.fused_ops.rmsnorm_residual_add import (
     rmsnorm_residual_add,
     rmsnorm_residual_add_scale,
 )
+from ..model_config import ModelConfig
+from ..modules.decoder_layer import DecoderLayer
+from ..modules.embedding import Embedding
 from ..modules.gated_mlp import GatedMLP
 from ..modules.gemma4.fused_qkv import gemma4_fused_qkv_norm_rope_quant
 from ..modules.linear import Linear, TensorParallelMode, WeightMode, WeightsLoadingConfig

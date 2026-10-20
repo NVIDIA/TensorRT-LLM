@@ -10,7 +10,7 @@ and schedule, eagerly, before any CUDA-graph capture. The contract is the ``## S
 import torch
 
 # Importing the op module also registers torch.ops.trtllm.k3_head_gemv.
-from tensorrt_llm._torch.cute_dsl_kernels.k3_head_gemv.op import K3HeadGemvWorkspace
+from tensorrt_llm._torch.kernels.k3_head_gemv.op import K3HeadGemvWorkspace
 
 __all__ = ["K3HeadGemvWorkspace", "k3_head_gemv"]
 
