@@ -308,7 +308,8 @@ the manager, the storage manager, or the radix tree.
   (`setCapacity` -> `resize`, or the cached-token attribution drop methods ->
   `markStatsDirty`/`clearStatsDirty`) does not take it either.
 - Internal statistics accumulators (`commitStats`, `commitSsmSnapshotIterationStats`,
-  `commitReusedBlocksByLevel`, `commitCachedTokensByLevel`, and `recordDiskPrefetchBlocks`)
+  `commitReusedBlocksByLevel`, `commitConnectorReusedBlocks`, `commitCachedTokensByLevel`,
+  `commitConnectorCachedTokens`, and `recordDiskPrefetchBlocks`)
   use the caller's exclusive lock. `commitPendingStats()` and `prefetch()` provide it;
   direct C++ callers, including tests, must do the same.
 - `std::shared_mutex` is not recursive, but public APIs call each other freely

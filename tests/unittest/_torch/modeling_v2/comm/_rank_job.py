@@ -36,6 +36,29 @@ _LAUNCHER_GRACE_S = 300
 """Headroom over the entry's own deadline, so its message wins the race."""
 
 
+def adopt_srun_env() -> int:
+    """Take this rank's identity from the srun step that started it, and
+    return the node-local device it owns.
+
+    The spawning launcher reaches only the devices of one node. A world that
+    spans GB300 trays is started instead as one srun task per rank,
+    ``python <matrix> --srun``, with ``MASTER_ADDR`` and ``MASTER_PORT``
+    naming the first node. A failing rank exits nonzero and
+    ``srun --kill-on-bad-exit=1`` stops its siblings, which is the job the
+    spawning launcher's deadline does on one node.
+
+    The device is returned rather than left in ``LOCAL_RANK`` for the rank
+    body to read: on the spawning path every rank inherits one shared
+    ``LOCAL_RANK`` from the launching shell, and reading it there put all
+    ranks on one GPU.
+    """
+    for key in ("MASTER_ADDR", "MASTER_PORT"):
+        assert os.environ.get(key), f"--srun needs {key} set to the first node's rendezvous"
+    os.environ["RANK"] = os.environ["SLURM_PROCID"]
+    os.environ["WORLD_SIZE"] = os.environ["SLURM_NTASKS"]
+    os.environ.setdefault("TLLM_DISABLE_MPI", "1")
+    return int(os.environ["SLURM_LOCALID"])
+
 def _devices(world_size: int) -> str:
     visible = os.environ.get("CUDA_VISIBLE_DEVICES")
     if visible:
