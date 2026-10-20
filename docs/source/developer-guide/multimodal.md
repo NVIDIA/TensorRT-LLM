@@ -109,6 +109,11 @@ encoder costs or inferring item axes from matching tensor sizes.
 | Item scheduling | Exact positive `encoder_token_lengths`, output row counts, and an item-selection implementation. |
 | Persistent item caching | Output row counts and stable content/processor hashes. Partial hits also require correct item selection. |
 
+Startup profiling calls `get_dummy_mm_data` directly, bypassing the normal
+processor wrapper. For grouped encoders, its returned data must include the
+common `MultimodalItemMetadata` record with item references and exact output
+row counts.
+
 For example, a processor for a full-request audio encoder can return:
 
 ```python

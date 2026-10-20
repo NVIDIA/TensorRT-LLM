@@ -388,6 +388,10 @@ Subclass **both** `BaseMultimodalInputProcessor` (drives every real request) and
 - `get_mm_max_tokens_per_item(max_num_encoder_tokens=None) -> {modality: tokens}` — report bounded startup maxima when the argument is `None`, or the largest legal item per modality under a concrete runtime token budget.
 - `get_dummy_mm_data(*, max_num_encoder_tokens, mm_counts, dtype) -> multimodal_data` — build the profiler-selected per-modality item counts **directly** as processed encoder tensors (no PIL image + HF-processor round-trip).
 
+For grouped encoders, include `MultimodalItemMetadata` with item references and
+exact output rows in the returned dummy data. Profiling bypasses the normal
+processor wrapper, so it does not call `get_mm_item_metadata` for you.
+
 Following vLLM's separation of common budgeting from model processing geometry, the profiler selects the largest legal runtime workload and computes its repetition count under `encoder_max_num_tokens` and `encoder_max_batch_size`. It passes the resulting plan (for example, `{"image": 8}`) to the concrete processor's `get_dummy_mm_data`; the processor owns only geometry and tensor layout. Qwen builds `pixel_values`/`*_grid_thw`; Mistral builds `pixel_values`/`image_sizes` and uses its private `_vit_tokens` helper so the LLM-side Pixtral hashing count is unchanged. A model without the contract falls back to a text-only dummy (encoder memory unaccounted). Don't hardcode the encoder attention workspace (`max_num_*=8192`): inherit `MultimodalEncoderMixin` and let the engine size it via `setup_attn_metadata` at load.
 
 The workspace dimension comes from `encoder_max_num_tokens`, falling back to the LLM-side `max_num_tokens` when unset. `encoder_max_batch_size` independently bounds the number of atomic items in a multimodal encoder iteration and falls back to `max_batch_size`. The profiler resolves both limits into `mm_counts` before calling `get_dummy_mm_data`. Model-internal attention sequence counts are not the item batch size; they are derived separately from the token budget and model geometry.

@@ -30,9 +30,9 @@ from tensorrt_llm._torch.models.modeling_multimodal_utils import _is_mm_disagg
 from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm.functional import PositionEmbeddingType
-from tensorrt_llm.inputs.multimodal import (MultimodalItemMetadata,
-                                            MultimodalItemPartition,
-                                            MultimodalParams)
+from tensorrt_llm.inputs.multimodal import (
+    MULTIMODAL_ENCODER_ITEM_METADATA_KEY, MultimodalItemMetadata,
+    MultimodalItemPartition, MultimodalParams)
 
 from ..._utils import async_tensor_h2d, nvtx_range, prefer_pinned
 from ...inputs import (BaseMultimodalDummyInputsBuilder,
@@ -862,6 +862,8 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
 
         mm_data: Dict[str, Any] = {}
         total_tokens = 0
+        item_refs: list[tuple[str, int]] = []
+        encoder_token_lengths: list[int] = []
         for modality, num_items in mm_counts.items():
             if modality not in ("image", "video"):
                 raise ValueError(f"Unsupported vision modality: {modality}")
@@ -878,7 +880,8 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
                 raise ValueError(
                     f"Qwen {modality} dummy does not fit within "
                     f"max_num_encoder_tokens={max_num_encoder_tokens}")
-            total_tokens += num_items * math.prod(grid)
+            item_tokens = math.prod(grid)
+            total_tokens += num_items * item_tokens
             if total_tokens > max_num_encoder_tokens:
                 raise ValueError(
                     "Requested multimodal dummy items exceed "
@@ -890,6 +893,22 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
                     num_items=num_items,
                     dtype=dtype,
                 ))
+            item_refs.extend((modality, i) for i in range(num_items))
+            encoder_token_lengths.extend([item_tokens] * num_items)
+        if item_refs:
+            metadata = MultimodalItemMetadata(
+                item_refs,
+                encoder_token_lengths,
+                [
+                    tokens // self.spatial_merge_unit
+                    for tokens in encoder_token_lengths
+                ],
+            )
+            for modality in mm_data:
+                metadata.input_partitions[
+                    modality] = _qwen_vision_input_partitions(
+                        mm_data, modality, metadata)
+            mm_data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = metadata
         return mm_data
 
     def _dummy_mm_data_for_size(
