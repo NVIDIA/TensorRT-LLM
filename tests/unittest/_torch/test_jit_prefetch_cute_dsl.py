@@ -542,6 +542,87 @@ def test_fp8_gemm_export_is_what_the_runner_runs(tmp_path):
         assert torch.equal(got[key], value), key
 
 
+def test_fp8_bmm_loads_the_gemm_tactic_exports(tmp_path):
+    """The grouped FP8 O-LoRA projection of DeepSeek-V4 / V4.1 attention (an
+    FP8 ``o_a_proj`` of shape (groups, o_lora_rank, group_dim)) runs the FP8
+    blockwise GEMM's kernel as a batched GEMM: Fp8GemmProvider plans its
+    (n, k) = (o_lora_rank, group_dim), and every tactic the BMM runner
+    benchmarks, compiled by the helper and loaded through the GEMM loader,
+    gives bitwise the runner's own output for several batch and row counts,
+    and the runner compiles nothing."""
+    from tensorrt_llm._torch.custom_ops import cute_dsl_custom_ops as ops
+
+    groups, n, k = 4, 1024, 512  # (groups, o_lora_rank, group_dim)
+    model = torch.nn.Module()
+    model.attn = torch.nn.Module()
+    model.attn.o_a_proj = torch.nn.Parameter(
+        torch.empty(groups, n, k, dtype=torch.float8_e4m3fn, device="cuda"), requires_grad=False
+    )
+    # A BF16 O-LoRA projection runs no FP8 BMM.
+    model.bf16 = torch.nn.Module()
+    model.bf16.o_a_proj = torch.nn.Parameter(torch.empty(groups, 256, k), requires_grad=False)
+    provider = jcd.Fp8GemmProvider(model)
+    assert provider.shapes == [(n, k)]
+    specs = provider.enumerate_specs()
+    runner = ops.CuteDSLFp8BlackwellBmmRunner(output_dtype=torch.bfloat16, use_tvm_ffi=True)
+    g = torch.Generator(device="cuda").manual_seed(0)
+
+    def inputs(b, m):
+        x = torch.randn(m, b, k, generator=g, device="cuda").to(torch.bfloat16)
+        a, a_sf = torch.ops.trtllm.fp8_batched_quantize_1x128_permute102(x)
+        w = (torch.randn(b, n, k, generator=g, device="cuda") * 0.5).to(torch.float8_e4m3fn)
+        w_sf = torch.rand(b, n // 128, k // 128, generator=g, device="cuda") + 0.5
+        out = torch.empty(m, b, n, dtype=torch.bfloat16, device="cuda")
+        return [a, w, a_sf, w_sf, out.transpose(0, 1)]
+
+    tactics = set()
+    data = {}
+    for b in (1, groups):
+        for m in (1, 37, 1000):
+            data[(b, m)] = inputs(b, m)
+            tactics.update(map(tuple, runner.get_valid_tactics(data[(b, m)], None)))
+    planned = {
+        (s["use_2cta"], tuple(s["mma_tiler"]), tuple(s["cluster"])) for s in map(json.loads, specs)
+    }
+    assert tactics == planned, tactics ^ planned
+    replies = _helper_build(str(tmp_path / "aot"), specs)
+    assert all(r["ok"] and r["built"] for r in replies), [r for r in replies if not r["ok"]][:3]
+
+    def run():
+        out = {}
+        for t in sorted(tactics):
+            for c, x in data.items():
+                x[4].zero_()
+                runner(x, tactic=t)
+                out[(t, c)] = x[4].clone()
+        torch.cuda.synchronize()
+        return out
+
+    saved = dict(ops.CuteDSLFp8BlackwellBmmRunner.kernel_cache)
+    try:
+        ops.CuteDSLFp8BlackwellBmmRunner.kernel_cache.clear()
+        ops.fp8_gemm_loader = None
+        ref = run()
+        ops.CuteDSLFp8BlackwellBmmRunner.kernel_cache.clear()
+        loads = []
+
+        def loader(spec):
+            fn = jcd.load(spec, str(tmp_path / "aot"))
+            loads.append((fn is not None, spec))
+            return fn
+
+        assert jcd.install_fp8_gemm_loader(loader)
+        got = run()
+    finally:
+        ops.fp8_gemm_loader = None
+        ops.CuteDSLFp8BlackwellBmmRunner.kernel_cache.clear()
+        ops.CuteDSLFp8BlackwellBmmRunner.kernel_cache.update(saved)
+    missing = [spec for ok, spec in loads if not ok]
+    assert len(loads) == len(tactics) and not missing, f"tactics not prefetched: {missing}"
+    for key, value in ref.items():
+        assert torch.equal(got[key], value), key
+
+
 def test_start_model_builds_queues_the_gemm_tactics_before_warmup(monkeypatch):
     """Right after model construction (no weights, no quant method yet) the
     FP8 GEMM provider already sees the block-FP8 Linear layers that opt out of

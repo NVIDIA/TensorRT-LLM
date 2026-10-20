@@ -385,8 +385,9 @@ def start_model_builds(model, rank: int = 0, llm_args=None) -> bool:
       module that knows of such modules lists them (GLM-5.3-Flash's and
       MiniMax-M3's TRTLLM-GEN attention launcher ``fmha_gen``);
     * the CuTe DSL FP8 blockwise GEMM tactics the autotuner benchmarks
-      (``jit_prefetch_cute_dsl.Fp8GemmProvider``) and the KDA prefill kernel
-      (``KdaPrefillProvider``);
+      (``jit_prefetch_cute_dsl.Fp8GemmProvider``: block-FP8 Linear layers
+      without DeepGEMM, and the batched GEMM of DeepSeek-V4's grouped FP8
+      O-LoRA projection) and the KDA prefill kernel (``KdaPrefillProvider``);
     * MiniMax-M3's MSA ``fmha_sm100`` kernels (:class:`FmhaSm100Builds`),
       whose plan also needs the KV cache's page size and dtypes, taken from
       ``llm_args``. Without it they start at the beginning of warmup instead.
@@ -1442,8 +1443,9 @@ class JitPrefetcher:
         return True
 
     def enable_fp8_gemm(self, gemm_provider) -> bool:
-        """Compile the CuTe DSL FP8 blockwise GEMM tactics the model's Linear
-        layers reach in the CuTe DSL helpers, and have the runner load them.
+        """Compile the CuTe DSL FP8 blockwise GEMM tactics the model's layers
+        reach in the CuTe DSL helpers, and have the GEMM and batched-GEMM
+        runners load them.
 
         Called right after the model is constructed (``start_model_builds``),
         before warmup: the autotuner's first pass compiles every tactic it
@@ -1461,7 +1463,7 @@ class JitPrefetcher:
         for spec in gemm_provider.enumerate_specs():
             self._submit(spec, spec, "cute_dsl", _PRIO_BATCH, kind=jcd.KIND)
         self._event(
-            f"CuTe DSL FP8 GEMM prefetch: {len(gemm_provider.shapes)} Linear shape(s), "
+            f"CuTe DSL FP8 GEMM prefetch: {len(gemm_provider.shapes)} GEMM shape(s), "
             f"{len(gemm_provider.specs)} tactic(s)"
         )
         return True

@@ -1138,12 +1138,14 @@ class PyTorchModelEngine(ModelEngine):
                 max_m,
                 int(rf.chunk_size or 0) *
                 int(rf.chunked_prefill_buffer_batch_size or 1))
-        # Every CUDA graph shape's token count, built first: warmup and graph
-        # capture launch them all before serving.
+        # Built first, as warmup and graph capture launch them all before
+        # serving: every CUDA graph shape's token count, and max_num_tokens,
+        # the general warmup's (and the autotuner's) pure-context shape.
         tokens_per_request = 1 + self.original_max_total_draft_tokens
         graph_bs = self._cuda_graph_batch_sizes or []
         graph_ms = sorted({bs * tokens_per_request
-                           for bs in graph_bs} | set(graph_bs))
+                           for bs in graph_bs} | set(graph_bs)
+                          | {self.max_num_tokens})
         dg_provider = jdg.FP8LinearDeepGemmProvider(self.model,
                                                     max_num_tokens=max_m,
                                                     priority_ms=graph_ms)

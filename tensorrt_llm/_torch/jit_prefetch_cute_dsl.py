@@ -47,6 +47,10 @@ Covered kernels, each a builder in ``_BUILDERS`` / ``_PRECOMPILED``:
   engine-fixed top_k / next_n / dtype (``TopKProvider``).
 * CSA2's candidate publication (``Csa2PublishProvider``), keyed on the
   layer's block geometry and the power-of-two block capacity.
+* the FP8 blockwise GEMM's autotune tactics (``Fp8GemmProvider``), for the
+  block-FP8 Linear layers that opt out of DeepGEMM and for the grouped FP8
+  O-LoRA projection of DeepSeek-V4 / V4.1 attention, whose batched GEMM is
+  the same TVM-FFI kernel.
 
 A spec is canonical JSON naming the kernel and its compile-time arguments;
 its SHA-1 is the file name, so helper and executor agree without sharing
@@ -808,7 +812,7 @@ class KdaPrefillProvider:
 
 
 class Fp8GemmProvider:
-    """Every TVM-FFI FP8 blockwise GEMM tactic the model's Linear layers reach.
+    """Every TVM-FFI FP8 blockwise GEMM tactic the model's layers reach.
 
     A block-FP8 ``Linear`` that opts out of DeepGEMM (``disable_deep_gemm`` or
     ``use_cute_dsl_blockscaling_mm``) runs ``trtllm::cute_dsl_fp8_gemm_blackwell``
@@ -819,9 +823,19 @@ class Fp8GemmProvider:
     set follows from the device alone; every tactic valid for some layer's
     ``(n, k)`` is enumerated, with the cluster occupancy of this device, before
     the first forward.
+
+    The grouped FP8 O-LoRA projection of DeepSeek-V4 / V4.1 attention (an FP8
+    ``o_a_proj`` of shape ``(groups, o_lora_rank, group_dim)``) runs the same
+    kernel as a batched GEMM (``trtllm::cute_dsl_fp8_bmm_blackwell``, one batch
+    per group; the batch count is a runtime scalar too), so those layers add
+    their ``(n, k) = (o_lora_rank, group_dim)``. CSA2 takes that path for
+    128-block checkpoint scales (DeepSeek-V4.1-Flash's), which are known only
+    once the weights load, so every FP8 ``o_a_proj`` is planned.
     """
 
     def __init__(self, model):
+        import torch
+
         from .._utils import get_sm_version
         from .modules.linear import Linear
 
@@ -831,6 +845,14 @@ class Fp8GemmProvider:
             return
         shapes = set()
         for mod in model.modules():
+            o_a_proj = getattr(mod, "o_a_proj", None)
+            if (
+                isinstance(o_a_proj, torch.Tensor)
+                and o_a_proj.dim() == 3
+                and o_a_proj.dtype == torch.float8_e4m3fn
+            ):
+                shapes.add((int(o_a_proj.shape[1]), int(o_a_proj.shape[2])))
+                continue
             if not isinstance(mod, Linear):
                 continue
             if not (
@@ -892,8 +914,9 @@ class Fp8GemmProvider:
 
 
 def install_fp8_gemm_loader(loader: Callable[[str], Optional[Callable]]) -> bool:
-    """Route ``CuteDSLFp8BlackwellRunner``'s TVM-FFI compiles through
-    ``loader(spec)``; returns False if CuTe DSL is unavailable."""
+    """Route the TVM-FFI compiles of ``CuteDSLFp8BlackwellRunner`` and
+    ``CuteDSLFp8BlackwellBmmRunner`` through ``loader(spec)``; returns False if
+    CuTe DSL is unavailable."""
     try:
         from .custom_ops import cute_dsl_custom_ops as ops
     except ImportError:

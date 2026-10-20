@@ -1045,6 +1045,35 @@ class TestWarmupCleanup(unittest.TestCase):
                     self.assertIsNone(runner.before_warmup_forwards_callable)
 
     @pytest.mark.cpu_only
+    def test_jit_prefetch_deep_gemm_priority_token_counts(self) -> None:
+        """The DeepGEMM FP8 Linear provider builds first every token count
+        warmup and graph capture launch: each CUDA graph batch size, times the
+        tokens per decode step, and max_num_tokens, the general warmup's and
+        the autotuner's pure-context shape."""
+        model_engine = object.__new__(PyTorchModelEngine)
+        model_engine.model = torch.nn.Module()
+        model_engine.max_num_tokens = 9216
+        model_engine.original_max_total_draft_tokens = 5
+        model_engine._cuda_graph_batch_sizes = [1, 2, 4]
+        model_engine.attn_runtime_features = SimpleNamespace(
+            chunked_prefill=False, cache_reuse=False, chunk_size=0,
+            chunked_prefill_buffer_batch_size=1,
+        )  # fmt: skip
+        captured = {}
+
+        def provider(model, max_num_tokens, priority_ms):
+            captured.update(max_num_tokens=max_num_tokens, priority_ms=sorted(priority_ms))
+            return Mock()
+
+        with (
+            patch("tensorrt_llm._torch.jit_prefetch_deep_gemm.FP8LinearDeepGemmProvider", provider),
+            patch("tensorrt_llm._torch.jit_prefetch_deep_gemm.DeepGemmMoEProvider"),
+        ):
+            model_engine._deep_gemm_providers()
+        self.assertEqual(captured["max_num_tokens"], 9216)
+        self.assertEqual(captured["priority_ms"], [1, 2, 4, 6, 12, 24, 9216])
+
+    @pytest.mark.cpu_only
     def test_decoder_runner_warmup_sampling_and_kv_cache_cleanup(self) -> None:
         """Verify sampling warmup coverage and KV-cache cleanup timing within total warmup."""
         runner = object.__new__(DecoderRunner)
