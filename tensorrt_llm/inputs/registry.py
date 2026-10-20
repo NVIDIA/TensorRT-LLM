@@ -1355,13 +1355,21 @@ def create_input_processor_with_hash(
                 m for m, lengths in num_mm_tokens_by_key.items() if lengths
             ]
             if len(present) != 1:
-                raise ValueError(
-                    "Mixed multimodal inputs require prompt-ordered item metadata"
-                )
-            modality = present[0]
-            item_refs = tuple(
-                (modality, i)
-                for i in range(len(num_mm_tokens_by_key[modality])))
+                get_item_metadata = getattr(input_processor,
+                                            "get_mm_item_metadata", None)
+                metadata = (get_item_metadata(prompt_token_ids, multimodal_data,
+                                              None)
+                            if get_item_metadata is not None else None)
+                if metadata is None:
+                    raise ValueError(
+                        "Mixed multimodal inputs require prompt-ordered item metadata"
+                    )
+                item_refs = metadata.item_refs
+            else:
+                modality = present[0]
+                item_refs = tuple(
+                    (modality, i)
+                    for i in range(len(num_mm_tokens_by_key[modality])))
         num_mm_tokens = [num_mm_tokens_by_key[m][i] for m, i in item_refs]
         if len(num_mm_tokens) <= 0:
             raise ValueError("multimodal hashing produced an empty multimodal "
@@ -1403,8 +1411,7 @@ def create_input_processor_with_hash(
             item_refs, output_embedding_lengths=multimodal_embedding_lengths)
         multimodal_data[
             MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = _merge_mm_item_metadata(
-                prepared_metadata,
-                get_multimodal_item_metadata(multimodal_data))
+                prepared_metadata, metadata)
         # Store special token offsets if available
         if len(start_special_token_positions
                ) > 0 and mm_special_token_ids is not None:
