@@ -9294,8 +9294,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
     class CuteDSLMiniMaxM3IndexDecodeScoreRunner:
         """Runner for the MiniMax-M3 indexer decode block-scoring kernel.
 
-        Caches compiled kernels keyed on the static params
-        (dtype, num_heads, max_decode_query_len, head_dim); batch, query-token
+        Caches compiled kernels keyed on the static params (dtype, num_heads,
+        max_decode_query_len, head_dim, shard_world, split_k); batch, query-token
         count, page count and block-table width stay symbolic, so one compile
         covers every decode step of a given model shape.
         """
@@ -9333,10 +9333,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
         @classmethod
         def _compile(cls, q_dtype: torch.dtype, num_heads: int,
-                     max_decode_query_len: int, head_dim: int,
-                     shard_world: int):
+                     max_decode_query_len: int, head_dim: int, shard_world: int,
+                     split_k: int):
             key = (q_dtype, num_heads, max_decode_query_len, head_dim,
-                   shard_world)
+                   shard_world, split_k)
             if key in cls.kernel_cache:
                 return
 
@@ -9392,7 +9392,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 cute_dtype,
                 num_heads,
                 max_decode_query_len,
-                cls.SPLIT_K,
+                split_k,
                 head_dim,
                 shard_world,
             )
@@ -9431,12 +9431,21 @@ if IS_CUTLASS_DSL_AVAILABLE:
             captures will replay.
             """
             _, num_heads, head_dim = idx_q.shape
+            # Split, a CTA walks groups of W blocks; from 16 requests on, half
+            # the CTAs amortize their prologue better.
+            split_k = (cls.SPLIT_K // 2 if recv_bases.numel() > 1
+                       and seq_lens.shape[0] >= 16 else cls.SPLIT_K)
             key = (idx_q.dtype, num_heads, max_decode_query_len, head_dim,
-                   recv_bases.numel())
+                   recv_bases.numel(), split_k)
             if key not in cls.kernel_cache:
                 cls._compile(*key)
             cls.kernel_cache[key](idx_q, index_k_cache, block_table, score,
                                   seq_lens, recv_bases, shard_rank)
+
+    @functools.lru_cache(maxsize=None)
+    def _no_recv_bases(device: torch.device) -> torch.Tensor:
+        """Unsplit, the kernel never reads the bases; one dummy per device."""
+        return torch.zeros(1, dtype=torch.int64, device=device)
 
     @torch.library.custom_op("trtllm::cute_dsl_minimax_m3_index_decode_score",
                              mutates_args=("score", ),
@@ -9468,13 +9477,13 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 passed without a copy.
             max_decode_query_len: compile-time bound on decode_query_len;
                 num_index_heads * max_decode_query_len must not exceed 32.
-            recv_bases: [W] int64 base addresses of every TP rank's receive
-                slots, for the TP split: index_k_cache then holds the
-                page_size / W rows shard_rank, shard_rank + W, ... of each page,
-                and the partials of head h go to rank h // (num_index_heads / W)
-                at the offset of (shard_rank, h % (num_index_heads / W), token,
-                block) in score, this rank's [W, num_index_heads / W, total_q,
-                max_blocks] receive slots.
+            recv_bases: [W] int64 base addresses of the TP ranks' receive
+                slots (TP split only). index_k_cache then holds rows
+                shard_rank, shard_rank + W, ... of each page, score is this
+                rank's [W, num_index_heads / W, total_q, max_blocks] slots
+                (blocks innermost, 4 * W-byte aligned, other strides multiples
+                of W), and head h's partials go to rank h // (num_index_heads / W).
+            shard_rank: this rank's TP rank (TP split only).
         """
         if not is_sm_100f():
             raise ValueError(
@@ -9499,8 +9508,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             seq_lens,
             score,
             max_decode_query_len,
-            # Unsplit, the kernel ignores the bases.
-            seq_lens.new_empty(1, dtype=torch.int64)
+            _no_recv_bases(seq_lens.device)
             if recv_bases is None else recv_bases,
             shard_rank,
         )

@@ -1176,13 +1176,10 @@ class MiniMaxM3Attention(Attention):
                     use_cute_dsl_blockscaling_mm=old_qkv_proj.use_cute_dsl_blockscaling_mm,
                     replicate_index_q=sparse_runtime_cfg.index_tp_split,
                 )
-                # index_k_tp_shard: rank r of W stores index-K rows r, r + W, ...
-                mapping = self.qkv_proj.mapping
-                self.index_shard_rank, self.index_shard_world = (
-                    (mapping.tp_rank, mapping.tp_size)
-                    if sparse_runtime_cfg.index_k_tp_shard
-                    else (0, 1)
-                )
+                # index_k_tp_shard: TP rank r stores index-K rows r, r + TP, ...
+                shard = sparse_runtime_cfg.index_k_tp_shard
+                self.index_shard_rank = self.qkv_proj.tp_rank if shard else 0
+                self.index_shard_world = self.qkv_proj.tp_size if shard else 1
                 self.sparse_num_index_heads = self.qkv_proj.local_num_index_heads
             else:
                 # Use the same KV-group ownership as the five-way projection.
@@ -2225,6 +2222,9 @@ class MiniMaxM3Attention(Attention):
                 q, idx_q = horizontal
                 o = self._forward_attention_core(q, None, None, idx_q, None, attn_metadata)
                 return self.o_proj(o, all_reduce_params=all_reduce_params)
+            if self.index_shard_world > 1:
+                # The fallback writes whole 128-row index-K pages.
+                raise RuntimeError("MiniMax-M3 index_k_tp_shard requires the fused QKV producer.")
             main_size = self.q_size + 2 * self.kv_size
             packed_qkv, packed_idx_qk = packed.split(
                 [main_size, self.index_q_size + self.index_k_size], dim=-1

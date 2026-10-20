@@ -12,6 +12,7 @@ index-K.
 
 import math
 import os
+from typing import Dict, List, Sequence, Tuple
 
 import torch
 import triton
@@ -23,13 +24,13 @@ from tensorrt_llm._torch.distributed import allgather
 from tensorrt_llm._torch.distributed.communicator import Distributed
 from tensorrt_llm.mapping import Mapping
 
-# A NaN no score takes: marks a slot nothing was pushed to.
+# int32 bits of a NaN no score takes: marks a slot nothing was pushed to.
 _EMPTY = tl.constexpr(-1)
 _NUM_SETS = 3
 
 
 # The slot strides are fixed per process; the rest change from step to step.
-@triton.jit(do_not_specialize=["dql", "out_head_stride", "out_block_stride"])
+@triton.jit(do_not_specialize=["seq_lens", "dql", "out_head_stride", "out_token_stride"])
 def _reduce_kernel(
     recv,
     out,
@@ -37,66 +38,92 @@ def _reduce_kernel(
     dql,
     src_stride,
     head_stride,
-    block_stride,
+    token_stride,
     out_head_stride,
-    out_block_stride,
+    out_token_stride,
     W: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    # One program per (local head, request). No griddepcontrol.wait: under PDL
+    # Programs (local head, request, slice). No griddepcontrol.wait: under PDL
     # this grid starts only after every scorer CTA passed its own wait.
-    head, req = tl.program_id(0), tl.program_id(1)
-    n = tl.cdiv(tl.load(seq_lens + req), 128) * dql
-    for start in range(0, n, BLOCK):
+    head, req, part = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    blocks = tl.cdiv(tl.load(seq_lens + req), 128)
+    for start in range(part * BLOCK, blocks * dql, tl.num_programs(2) * BLOCK):
         i = start + tl.arange(0, BLOCK)
-        mask = i < n
-        block, token = i // dql, req * dql + i % dql
+        mask = i < blocks * dql
+        token, block = req * dql + i // blocks, i % blocks
+        slot = recv + head * head_stride + token * token_stride + block
+        # Every pass reloads all W sources, so the last one is complete.
         acc = tl.full([BLOCK], float("-inf"), tl.float32)
+        pending = 1
+        while pending != 0:
+            acc = tl.full([BLOCK], float("-inf"), tl.float32)
+            missing = tl.zeros([BLOCK], tl.int32)
+            for src in tl.static_range(W):
+                bits = tl.load(slot + src * src_stride, mask=mask, other=0, volatile=True)
+                missing += (bits == _EMPTY).to(tl.int32)
+                acc = tl.maximum(acc, bits.to(tl.float32, bitcast=True))
+            pending = tl.sum(missing, axis=0)
         for src in tl.static_range(W):
-            slot = recv + src * src_stride + head * head_stride + block * block_stride + token
-            bits = tl.load(slot, mask=mask, other=0, volatile=True)
-            while tl.max(((bits == _EMPTY) & mask).to(tl.int32), axis=0) != 0:
-                bits = tl.load(slot, mask=mask, other=0, volatile=True)
-            acc = tl.maximum(acc, bits.to(tl.float32, bitcast=True))
-            tl.store(slot, tl.full([BLOCK], _EMPTY, tl.int32), mask=mask)
-        tl.store(out + head * out_head_stride + block * out_block_stride + token, acc, mask=mask)
+            tl.store(slot + src * src_stride, tl.full([BLOCK], _EMPTY, tl.int32), mask=mask)
+        tl.store(out + head * out_head_stride + token * out_token_stride + block, acc, mask=mask)
 
 
 class IndexTpSplit:
-    """Receive slots of a TP group: [sets, W sources, heads / W, blocks, tokens] per rank.
+    """Receive slots of a TP group: [sets, W sources, heads / W, tokens, blocks] per rank.
 
     Consecutive sparse layers, the wrap from the last to the first included,
-    use different sets, so a rank refills a set only after its owner's reduce
-    of the layer in between has seen that rank's pushes.
+    use different sets. A rank pushes into a set again only after its own
+    reduce of the layer in between has received every rank's pushes, and each
+    rank made those only after its reduce of the set's previous layer had
+    emptied the set.
     """
 
-    _instances = {}
+    _instances: Dict[Tuple[int, int, int], "IndexTpSplit"] = {}
     # Every split stays allocated: CUDA graphs captured with it address its slots.
-    _alive = []
+    _alive: List["IndexTpSplit"] = []
 
     @classmethod
-    def get(cls, mapping: Mapping, layer_ids, num_heads: int, max_blocks: int, max_tokens: int):
+    def get(
+        cls,
+        mapping: Mapping,
+        layer_ids: Sequence[int],
+        num_heads: int,
+        max_blocks: int,
+        max_tokens: int,
+    ) -> "IndexTpSplit":
         """The process's split of this TP group; created, collectively, on first use or growth."""
         key = (mapping.pp_rank, mapping.tp_rank, mapping.tp_size)
         split = cls._instances.get(key)
-        if split is None or split.recv.shape[3] < max_blocks or split.recv.shape[4] < max_tokens:
+        if split is None or split.recv.shape[3] < max_tokens or split.recv.shape[4] < max_blocks:
             split = cls._instances[key] = cls(mapping, layer_ids, num_heads, max_blocks, max_tokens)
             cls._alive.append(split)
         return split
 
     def __init__(
-        self, mapping: Mapping, layer_ids, num_heads: int, max_blocks: int, max_tokens: int
-    ):
-        if not can_access_peer(mapping):
-            raise RuntimeError(
-                "MiniMax-M3 index_tp_split needs CUDA peer access between the TP ranks."
+        self,
+        mapping: Mapping,
+        layer_ids: Sequence[int],
+        num_heads: int,
+        max_blocks: int,
+        max_tokens: int,
+    ) -> None:
+        if (
+            mapping.enable_attention_dp
+            or mapping.tp_size not in (2, 4)
+            or not can_access_peer(mapping)
+        ):
+            raise ValueError(
+                "MiniMax-M3 index_tp_split needs TP 2 or 4 with CUDA peer access and no attention DP."
             )
         self.mapping, self.rank, self.world = mapping, mapping.tp_rank, mapping.tp_size
         heads = num_heads // self.world
         self.heads = slice(self.rank * heads, (self.rank + 1) * heads)
         n = len(layer_ids)
         self.sets = {layer: i % _NUM_SETS or int(i == n - 1) for i, layer in enumerate(layer_ids)}
-        shape = (_NUM_SETS, self.world, heads, max_blocks, max_tokens)
+        # Rows of whole groups: the scorer pushes a group's W blocks as one vector.
+        blocks = -(-max_blocks // self.world) * self.world
+        shape = (_NUM_SETS, self.world, heads, max_tokens, blocks)
         nbytes = math.prod(shape) * 4
         self._ipc = IpcMemory(mapping, nbytes)
         ptrs = self._ipc.peer_ptrs
@@ -115,11 +142,19 @@ class IndexTpSplit:
         Distributed.get(mapping).tp_barrier()
 
     def score(
-        self, layer_idx, idx_q, idx_k_cache, block_table, seq_lens, max_score, decode_query_len
-    ):
-        """Fill max_score [heads / W, blocks, tokens] for the decode tokens of idx_q [tokens, heads, dim].
+        self,
+        layer_idx: int,
+        idx_q: torch.Tensor,
+        idx_k_cache: torch.Tensor,
+        block_table: torch.Tensor,
+        seq_lens: torch.Tensor,
+        max_score: torch.Tensor,
+        decode_query_len: int,
+    ) -> torch.Tensor:
+        """Score the decode tokens of idx_q [tokens, heads, dim] into max_score [heads / W, blocks, tokens].
 
-        Nothing may run between the two kernels: PDL overlaps them.
+        Returns the view of max_score's storage that holds the scores, blocks
+        innermost. Nothing may run between the two kernels: PDL overlaps them.
         """
         recv = self.recv[self.sets[layer_idx]]
         torch.ops.trtllm.cute_dsl_minimax_m3_index_decode_score(
@@ -130,29 +165,34 @@ class IndexTpSplit:
             else idx_k_cache[:, 0, self.rank :: self.world],
             block_table,
             seq_lens,
-            recv.transpose(2, 3),
+            recv,
             decode_query_len,
             self.bases[self.sets[layer_idx]],
             self.rank,
         )
-        _reduce_kernel[(recv.shape[1], seq_lens.shape[0])](
+        # Blocks innermost, like the slots: the selector reads such rows as vectors.
+        heads, blocks, tokens = max_score.shape
+        out = max_score.view(heads, tokens, blocks)
+        _reduce_kernel[(heads, seq_lens.shape[0], 16)](
             recv.view(torch.int32),
-            max_score,
+            out,
             seq_lens,
             decode_query_len,
             *recv.stride()[:3],
-            *max_score.stride()[:2],
+            *out.stride()[:2],
             W=self.world,
             BLOCK=512,
             launch_pdl=os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1",
         )
+        return out.transpose(1, 2)
 
-    def gather(self, idx_k_cache, pages):
-        """Full [P, 1, 128, dim] index-K pages from every rank's row shard of `pages` (TP collective).
+    def gather(self, idx_k_cache: torch.Tensor, pages: torch.Tensor) -> torch.Tensor:
+        """Full index-K pages [P, 1, 128, dim] from every rank's row shard (TP collective).
 
         `pages` holds this rank's ids of the same logical pages, in the same order on every rank.
         """
         rows, dim = idx_k_cache.shape[2:]
         shards = allgather(idx_k_cache.index_select(0, pages), self.mapping, dim=0)
         # shards[r * P + p, 0, i] is token i * W + r of page p.
-        return shards.view(self.world, -1, rows, dim).permute(1, 2, 0, 3).reshape(-1, 1, 128, dim)
+        shards = shards.view(self.world, -1, rows, dim).permute(1, 2, 0, 3)
+        return shards.reshape(-1, 1, rows * self.world, dim)

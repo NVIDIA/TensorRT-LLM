@@ -5351,7 +5351,7 @@
         },
         "index_tp_split": {
           "default": false,
-          "description": "Split the decode indexer across the TP ranks: each rank scores every index head on 1/TP of the index-K rows and the ranks exchange the partial block maxima over NVLink. Replicates index-Q on every rank. Requires fuse_qkv_index_projection and TP 2 or 4 on one node without attention DP.",
+          "description": "Split the decode indexer across the TP ranks: each rank scores every index head on 1/TP of the index-K rows and the ranks exchange the partial block maxima over NVLink. Replicates index-Q on every rank. Requires fuse_qkv_index_projection, TP 2 or 4 on one node without attention DP, and at most 7 draft tokens.",
           "status": "prototype",
           "title": "Index Tp Split",
           "type": "boolean"

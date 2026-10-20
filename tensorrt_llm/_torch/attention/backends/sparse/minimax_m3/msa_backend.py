@@ -542,10 +542,6 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
                 capture_graph=capture_graph,
             )
             if params.index_tp_split:
-                if self.mapping.enable_attention_dp or self.mapping.tp_size not in (2, 4):
-                    raise ValueError(
-                        "MiniMax-M3 index_tp_split needs TP 2 or 4 without attention DP."
-                    )
                 self.msa_index_split = IndexTpSplit.get(
                     self.mapping,
                     list(self.msa_layer_cache_tensors),
@@ -1545,10 +1541,10 @@ class MiniMaxM3MsaSparseAttention(TrtllmAttention):
             )
         split = metadata.msa_index_split
         if split is not None:
-            # idx_q carries every index head: all of them score the generation
-            # span across the ranks, this rank's own the proxy and selection.
+            # idx_q holds every index head: the split scores all of them on the
+            # generation span; the proxy and the selection take this rank's heads.
             if span is not None:
-                split.score(
+                max_score = split.score(
                     self.layer_idx,
                     idx_q_view[gen_first:],
                     idx_k_cache,
@@ -1559,10 +1555,10 @@ class MiniMaxM3MsaSparseAttention(TrtllmAttention):
                 )
             idx_q_view = idx_q_view[:, split.heads]
         kv_indices = metadata.msa_kv_indices
-        if split is not None and idx_k_cache.shape[2] < 128 and (span is None or ctx_rows > 0):
+        if split is not None and idx_k_cache.shape[2] < 128 and metadata.num_contexts > 0:
             # The proxy scores the context rows on full pages, which the ranks'
             # index-K row shards hold only together.
-            kv_lens = metadata.msa_kv_lens_cpu[: ctx_rows if span is not None else None]
+            kv_lens = metadata.msa_kv_lens_cpu[: metadata.num_contexts]
             num_pages = int(((kv_lens + 127) // 128).sum())
             idx_k_cache = split.gather(idx_k_cache, kv_indices[:num_pages])
             kv_indices = torch.arange(num_pages, dtype=torch.int32, device=idx_k_cache.device)

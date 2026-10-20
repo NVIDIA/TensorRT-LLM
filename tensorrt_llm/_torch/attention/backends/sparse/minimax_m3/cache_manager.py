@@ -45,6 +45,7 @@ from tensorrt_llm.bindings.internal.batch_manager import CacheType as CacheTypeC
 from tensorrt_llm.bindings.internal.batch_manager.kv_cache_manager_v2_utils import (
     copy_batch_block_offsets_to_device,
 )
+from tensorrt_llm.llmapi.llm_args import MiniMaxM3SparseAttentionConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     BAD_PAGE_INDEX,
@@ -334,12 +335,12 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
                 "MiniMax M3 indexer_kv_dtype must be 'bf16' or 'fp8', got "
                 f"{self.indexer_kv_dtype!r}."
             )
-        # index_k_tp_shard: TP rank r stores tokens r, r + W, ... of every block.
-        self.index_k_shard_world = (
-            kwargs["mapping"].tp_size
-            if getattr(sparse_attention_config, "index_k_tp_shard", False)
-            else 1
+        # index_k_tp_shard: TP rank r stores tokens r, r + TP, ... of every block.
+        shard = (
+            isinstance(sparse_attention_config, MiniMaxM3SparseAttentionConfig)
+            and sparse_attention_config.index_k_tp_shard
         )
+        self.index_k_shard_world = kwargs["mapping"].tp_size if shard else 1
         # Filled at the end of __init__; the base __init__ may already call get_buffers.
         self._kv_buffers: dict[tuple[int, str], torch.Tensor] = {}
         self._block_scale_buffers: dict[tuple[int, str], torch.Tensor] = {}
@@ -359,7 +360,7 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
             )
 
         self._draft_kv_cache_view: Optional["MiniMaxM3DraftKVCacheView"] = None
-        # Only the fused FP8/NVFP4 producer writes, and disagg transfers, a sharded index-K.
+        # Only the fused FP8/NVFP4 producer writes a sharded index-K; disagg maps it as replicated.
         if self.index_k_shard_world > 1 and (
             self.is_disagg or self.dtype not in (DataType.FP8, DataType.NVFP4)
         ):
@@ -641,7 +642,7 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         """Register a per-sparse-layer ``Role.INDEX_KEY`` :class:`BufferConfig`.
 
         ``size`` is bytes per **block**: ``1 * sparse_index_dim *
-        elem_bytes * tokens_per_block``. Keyed by **local** layer id —
+        elem_bytes * tokens_per_block // index_k_shard_world``. Keyed by **local** layer id —
         the base ``_build_base_config`` iterates local ids, so keying
         by global ids would silently skip registration on non-trivial
         PP ranks.

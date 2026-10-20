@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""MiniMax-M3 index decode scoring split across two TP ranks (index_tp_split)."""
+"""MiniMax-M3 index decode scoring split across two TP ranks (index_tp_split, index_k_tp_shard)."""
 
 import pickle
 import sys
@@ -46,10 +46,19 @@ def _run_rank(world: int) -> bool:
     split = IndexTpSplit(mapping, range(5), 4, max_blocks, 5 * dql)
     # Every slot set, the wrap from the last layer to the first and set reuse, back to back.
     scores = [torch.full_like(expected[split.heads], float("nan")) for _ in range(15)]
-    for i, got in enumerate(scores):
+    scores = [
         split.score(i % 5, idx_q, cache, block_table, seq_lens, got, dql)
+        for i, got in enumerate(scores)
+    ]
+    # index_k_tp_shard: this rank's rows of every page, under page ids of its own.
+    g = torch.Generator(device="cuda").manual_seed(1 + rank)
+    perm = torch.randperm(cache.shape[0], generator=g, device="cuda")
+    local = cache[:, :, rank::world].index_select(0, perm.argsort())
+    got = torch.full_like(expected[split.heads], float("nan"))
+    scores.append(split.score(0, idx_q, local, perm[block_table.long()].int(), seq_lens, got, dql))
+    pages = split.gather(local, perm[:9])
     torch.cuda.synchronize()
-    return all(
+    return torch.equal(pages.view(torch.uint8), cache[:9].view(torch.uint8)) and all(
         torch.equal(got.view(torch.int32), expected[split.heads].view(torch.int32))
         for got in scores
     )
@@ -57,7 +66,10 @@ def _run_rank(world: int) -> bool:
 
 @pytest.mark.skip_less_device(2)
 def test_minimax_m3_index_tp_split_matches_unsplit() -> None:
-    """Two ranks scoring half the index-K rows each give the unsplit scores bit for bit."""
+    """Two ranks scoring half the index-K rows each give the unsplit scores bit for bit.
+
+    Also from row-sharded caches with per-rank page ids, whose gather rebuilds the full pages.
+    """
     if get_sm_version() not in (100, 103):
         pytest.skip("the MiniMax-M3 index scorer needs SM100/SM103")
     with MPIPoolExecutor(max_workers=2) as executor:
