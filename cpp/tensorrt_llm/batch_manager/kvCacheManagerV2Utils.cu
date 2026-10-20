@@ -60,8 +60,8 @@ void copyBasePageRowsToDevice(ITensor const& input, ITensor& output, SizeType32 
         return;
     }
 
-    auto const* srcPtr = bufferCast<SizeType32 const>(input);
-    auto* dstPtr = bufferCast<SizeType32>(output);
+    auto const* srcPtr = input.getBufferPtr<SizeType32 const>();
+    auto* dstPtr = output.getBufferPtr<SizeType32>();
     auto const numPools = srcShape.d[0];
     auto const numBlocks = srcShape.d[3];
     auto const rowStride = static_cast<size_t>(kKvFactor) * static_cast<size_t>(numBlocks);
