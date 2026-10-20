@@ -3259,7 +3259,7 @@ pipeline {
                                 }
                             },
                         ]
-                        releaseCheckStages.failFast = true
+                        releaseCheckStages.failFast = enableFailFast
                         parallel releaseCheckStages
                     } else {
                         // globalVars[CACHED_CHANGED_FILE_LIST] is only used in setupPipelineEnvironment

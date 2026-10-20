@@ -59,8 +59,9 @@ def getSMVersion():
     try:
         err, = cuda.cuInit(0)
     except RuntimeError as exc:
-        # Missing/broken driver. Returning inf makes skip_pre_* true and
-        # skip_post_* false so collection can proceed on CPU hosts.
+        # Missing/broken driver (e.g. CPU-only collection hosts). Returning inf
+        # keeps every SM-gated parametrization, so collection sees the superset
+        # of test IDs; no GPU test can run on such a host anyway.
         print(f"WARNING: CUDA driver init failed in getSMVersion(): {exc}")
         return math.inf
     if err == cuda.CUresult.CUDA_ERROR_NO_DEVICE:

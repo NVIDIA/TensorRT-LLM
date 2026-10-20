@@ -4464,7 +4464,12 @@ def renderTestDB(pipeline, testContext, llmSrc, stageName, preDefinedMakoOpts=nu
              "Test-db blocks conditioned on those properties (e.g. linux_distribution_name: ubuntu*) " +
              "will NOT be selected."
     }
-    def ciVersions = readProperties file: "${llmSrc}/jenkins/ci_versions.properties"
+    // Artifacts built before ci_versions.properties existed (e.g. via reuse_build)
+    // lack the file; fall back to the version those artifacts were pinned to.
+    def ciVersionsPath = "${llmSrc}/jenkins/ci_versions.properties"
+    def ciVersions = fileExists(ciVersionsPath)
+        ? readProperties(file: ciVersionsPath)
+        : [TRT_TEST_DB_VERSION: "1.8.5+bc6df7"]
     sh "pip3 install --extra-index-url https://urm.nvidia.com/artifactory/api/pypi/sw-tensorrt-pypi/simple --ignore-installed trt-test-db==${ciVersions.TRT_TEST_DB_VERSION}"
     // CBTS Layer 3: download the pre-built cbts_test_db/ tarball that the
     // orchestrator uploaded to Artifactory (see getCbtsResult in
