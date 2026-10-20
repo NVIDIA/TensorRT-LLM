@@ -2800,11 +2800,14 @@ class SpecWorkerBase(nn.Module, ABC):
         filters (``no_topk_no_topp``; the reference path ignores per-request
         top-k / top-p in that mode too). They also need a shared draft/target
         vocabulary, full-vocab fp32 logits and no synthetic acceptance override.
-        Host-side checks only, so the decision is CUDA-graph safe.
+        Host-side checks only, so the decision is CUDA-graph safe. With the flag
+        off nothing else is read, so the reference dispatch is unchanged.
         """
+        if not fast_rs_enabled():
+            return False
         mode = spec_metadata.advanced_sampling_mode
-        return (fast_rs_enabled() and mode.skips_top_k and mode.skips_top_p
-                and self._d2t is None and self.force_num_accepted_tokens == 0.0
+        return (mode.skips_top_k and mode.skips_top_p and self._d2t is None
+                and self.force_num_accepted_tokens == 0.0
                 and not isinstance(logits, VocabShardedLogits)
                 and fast_rs_supported(logits, spec_metadata.draft_probs,
                                       stored_vocab))
