@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Experimental TP8 fabric gather for column-sharded MuseSpark projections.
+"""Experimental TP4/TP8 fabric gather for column-sharded MuseSpark projections.
 
 Calls on a workspace must form one ordered CUDA execution chain, with identical
 shapes and collective order on every rank. Separate workspaces are required for
@@ -29,7 +29,8 @@ from tensorrt_llm._torch.distributed.communicator import Distributed
 from tensorrt_llm.mapping import Mapping
 
 _PROGRAMS = 32
-_WORLD_SIZE = 8
+# TP4 on one four-GPU GB300 node or TP8 over two.
+_WORLD_SIZES = (4, 8)
 _MAX_TOKENS = 128
 _MAX_COLUMNS = 8192
 _PAYLOAD_WORD_BYTES = 8
@@ -101,7 +102,7 @@ class _ProjectionMnnvlMemory(MnnvlMemory):
 
 
 class ProjectionGatherWorkspace:
-    """Own TP8 payload and synchronization memory for ordered CUDA calls.
+    """Own TP4/TP8 payload and synchronization memory for ordered CUDA calls.
 
     All ranks must use identical shapes and collective order. CUDA dependencies
     must serialize calls, including graph replay and transitions between
@@ -111,23 +112,28 @@ class ProjectionGatherWorkspace:
     """
 
     def __init__(self, mapping: Mapping) -> None:
-        if mapping.tp_size != _WORLD_SIZE or mapping.enable_attention_dp or mapping.cp_size != 1:
-            raise ValueError("Projection gather requires TP8 without attention DP or CP")
+        if (
+            mapping.tp_size not in _WORLD_SIZES
+            or mapping.enable_attention_dp
+            or mapping.cp_size != 1
+        ):
+            raise ValueError("Projection gather requires TP4 or TP8 without attention DP or CP")
         if not all(Distributed.get(mapping).tp_allgather(MnnvlMemory.supports_mnnvl())):
             raise ValueError("Projection gather requires NVLink on every TP rank")
         MnnvlMemory.initialize()
         self.mapping = mapping
+        self.world = mapping.tp_size
         self.device = torch.cuda.current_device()
         self.programs = _PROGRAMS
         # Double buffering: publishing epoch E+2 requires consuming E+1 from
         # every peer. Each peer can publish E+1 only after its entire E launch
         # finished on the owning stream, so E's inbox is then safe to reuse.
-        self.slot_words = _MAX_TOKENS * (_MAX_COLUMNS // _WORLD_SIZE) // 2
+        self.slot_words = _MAX_TOKENS * (_MAX_COLUMNS // self.world) // 2
         self.data_owner = _ProjectionMnnvlMemory(
-            mapping, 2 * _WORLD_SIZE * self.slot_words * _PAYLOAD_WORD_BYTES
+            mapping, 2 * self.world * self.slot_words * _PAYLOAD_WORD_BYTES
         )
         record = type(self.data_owner).allocated_map[self.data_owner.ptr]
-        if record.comm_size != _WORLD_SIZE or record.comm_rank != mapping.tp_rank:
+        if record.comm_size != self.world or record.comm_rank != mapping.tp_rank:
             raise RuntimeError("Projection gather allocation does not match TP group")
         self.data = self.data_owner.as_torch_strided_tensor(torch.int64)
         self.data[mapping.tp_rank].zero_()
@@ -136,7 +142,7 @@ class ProjectionGatherWorkspace:
         Distributed.get(mapping).tp_allgather(True)
 
     def gather(self, local: torch.Tensor) -> torch.Tensor:
-        """Gather contiguous BF16 ``[M, N/8]`` columns, preserving rank order."""
+        """Gather contiguous BF16 ``[M, N/TP]`` columns, preserving rank order."""
         if not (
             local.is_cuda
             and local.device.index == self.device
@@ -144,11 +150,11 @@ class ProjectionGatherWorkspace:
             and local.ndim == 2
             and local.is_contiguous()
             and 1 <= local.shape[0] <= _MAX_TOKENS
-            and local.shape[1] in (4096 // _WORLD_SIZE, 8192 // _WORLD_SIZE)
+            and local.shape[1] in (4096 // self.world, 8192 // self.world)
         ):
             raise ValueError("Unsupported projection gather tensor contract")
         output = torch.empty(
-            (local.shape[0], local.shape[1] * _WORLD_SIZE), dtype=local.dtype, device=local.device
+            (local.shape[0], local.shape[1] * self.world), dtype=local.dtype, device=local.device
         )
         _gather_columns[(self.programs,)](
             local.view(torch.int32),
@@ -158,7 +164,7 @@ class ProjectionGatherWorkspace:
             self.data.stride(0),
             self.slot_words,
             self.mapping.tp_rank,
-            _WORLD_SIZE,
+            self.world,
             local.shape[1] // 2,
             local.numel() // 2,
             self.programs,

@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""GB300 finalize parity, including mutated CUDA graph inputs.
+"""Finalize parity, including mutated CUDA graph inputs.
 
 Run with four local MPI ranks, or eight ranks across two NVLink-connected
 four-GPU nodes to exercise the experimental fabric workspace.
@@ -24,7 +24,10 @@ from mpi4py import MPI
 
 import tensorrt_llm
 from tensorrt_llm._torch.distributed import AllReduce
-from tensorrt_llm._torch.models.modeling_musespark_open import post_expert_norm_combine
+from tensorrt_llm._torch.models.modeling_musespark_open import (
+    fused_kernels_supported,
+    post_expert_norm_combine,
+)
 from tensorrt_llm._torch.models.musespark_open_finalize_ar import HAS_CUTEDSL, FinalizeIpcWorkspace
 from tensorrt_llm.functional import AllReduceStrategy
 from tensorrt_llm.mapping import Mapping
@@ -42,8 +45,8 @@ def test_finalize_allreduce_graph_parity(tokens: int, case: str) -> None:
         pytest.skip("Requires four or eight MPI ranks, CUDA and CuTe DSL")
     rank = tensorrt_llm.mpi_rank()
     torch.cuda.set_device(rank % 4)
-    if torch.cuda.get_device_capability() != (10, 3):
-        pytest.skip("GB300 required")
+    if not fused_kernels_supported(torch.cuda.get_device_capability()):
+        pytest.skip("Requires SM103, or SM107 with MUSESPARK_OPEN_SM107_FUSED_KERNELS=1")
     mapping = Mapping(world_size=world_size, tp_size=world_size, rank=rank, gpus_per_node=4)
     workspace = FinalizeIpcWorkspace(mapping, use_mnnvl=world_size == 8)
     nccl = AllReduce(mapping, strategy=AllReduceStrategy.NCCL).cuda()
@@ -111,8 +114,8 @@ def _require_group():
         pytest.skip("Requires four or eight MPI ranks, CUDA and CuTe DSL")
     rank = tensorrt_llm.mpi_rank()
     torch.cuda.set_device(rank % 4)
-    if torch.cuda.get_device_capability() != (10, 3):
-        pytest.skip("GB300 required")
+    if not fused_kernels_supported(torch.cuda.get_device_capability()):
+        pytest.skip("Requires SM103, or SM107 with MUSESPARK_OPEN_SM107_FUSED_KERNELS=1")
     mapping = Mapping(world_size=world_size, tp_size=world_size, rank=rank, gpus_per_node=4)
     return world_size, rank, mapping
 

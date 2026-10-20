@@ -753,8 +753,13 @@ class FinalizeIpcWorkspace:
                 return _UNSUPPORTED, "this system has no usable NVLink fabric"
         elif self._ranks != 4 or ranks_per_node != 1:
             return _UNSUPPORTED, "IPC fusion needs TP4 on one node"
-        if torch.cuda.get_device_capability(self._device) != (10, 3):
-            return _UNSUPPORTED, "the kernel is validated on SM103 only"
+        from .modeling_musespark_open import fused_kernels_supported
+
+        if not fused_kernels_supported(torch.cuda.get_device_capability(self._device)):
+            return _UNSUPPORTED, (
+                "the kernel is validated on SM103 (SM107 needs "
+                "MUSESPARK_OPEN_SM107_FUSED_KERNELS=1)"
+            )
         try:
             pdl = _pdl_enabled()
             for cluster in sorted({c for _, c in _CLUSTER_TABLES[self._ranks]}):
@@ -970,6 +975,67 @@ class FinalizeIpcWorkspace:
             num_tokens,
             float(eps),
         )
+        return out
+
+    def finalize_chunked(
+        self,
+        gemm2_output: torch.Tensor,
+        indices: torch.Tensor,
+        routing_weights: torch.Tensor,
+        norm_weight: torch.Tensor,
+        eps: float,
+        num_tokens: int,
+    ) -> torch.Tensor:
+        """``finalize`` for any ``num_tokens >= 1``, as consecutive calls of at most 128 tokens.
+
+        Tokens ``[a, a + n)`` are one ``finalize`` call on the matching slices
+        of ``indices`` and ``routing_weights``, written into rows ``[a, a + n)``
+        of one ``[num_tokens, 4096]`` BF16 result. A token's result depends only
+        on that token's slots, so every row is bitwise what a single call
+        covering it returns. Each chunk is one launch of the existing kernel and
+        one turn of the workspace's double-buffered receive slabs, exactly as
+        consecutive ``finalize`` calls; every rank must make the matching call.
+        Same requirements as ``finalize`` otherwise.
+        """
+        if self._closed:
+            raise RuntimeError("this MuseSparkOpen finalize workspace is closed")
+        if isinstance(num_tokens, bool) or not isinstance(num_tokens, int) or num_tokens < 1:
+            raise ValueError(f"num_tokens must be a positive int, got {num_tokens!r}")
+        if num_tokens <= _MAX_TOKENS:
+            return self.finalize(
+                gemm2_output, indices, routing_weights, norm_weight, eps, num_tokens
+            )
+        flat_indices = indices.reshape(-1)
+        flat_weights = routing_weights.reshape(-1)
+        expected = num_tokens * _TOP_K
+        if flat_indices.numel() != expected or flat_weights.numel() != expected:
+            raise ValueError(
+                f"indices and routing_weights must hold {expected} entries for {num_tokens} tokens"
+            )
+        # Every chunk is checked before the first launch, so a rejected call
+        # launches nothing on any rank.
+        chunks = []
+        for begin in range(0, num_tokens, _MAX_TOKENS):
+            count = min(_MAX_TOKENS, num_tokens - begin)
+            slots = slice(begin * _TOP_K, (begin + count) * _TOP_K)
+            rows, row_stride = self._validate(
+                gemm2_output, flat_indices[slots], flat_weights[slots], norm_weight, eps, count
+            )
+            chunks.append((begin, count, slots))
+        out = torch.empty((num_tokens, _HIDDEN), dtype=torch.bfloat16, device=self._device)
+        for begin, count, slots in chunks:
+            self._launch(
+                self._kernels[_cluster_for_tokens(count, self._ranks)],
+                gemm2_output.data_ptr() if rows > 0 else 0,
+                flat_indices[slots].data_ptr(),
+                flat_weights[slots].data_ptr(),
+                norm_weight.data_ptr(),
+                out[begin : begin + count].data_ptr(),
+                rows,
+                row_stride,
+                count,
+                float(eps),
+            )
         return out
 
     def _validate(self, gemm2_output, indices, routing_weights, norm_weight, eps, num_tokens):

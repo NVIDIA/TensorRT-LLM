@@ -206,6 +206,13 @@ package_data += [
     'grpc/openengine/_generated/*.pyi',
     'grpc/openengine/proto/manifest.json',
     'grpc/openengine/proto/openengine/v1/*.proto',
+    # CUDA sources compiled at first use with torch.utils.cpp_extension.
+    '_torch/_experimental/modeling_v2/models/musespark_open/'
+    'muse_spark_open_816b_a42b_nvfp4__sm_103__tep/ops/spec/_head_sampler/*.cu',
+    '_torch/_experimental/modeling_v2/models/musespark_open/'
+    'muse_spark_open_816b_a42b_nvfp4__sm_103__tep/ops/spec/_head_sampler/*.cuh',
+    '_torch/_experimental/modeling_v2/models/musespark_open/'
+    'muse_spark_open_816b_a42b_nvfp4__sm_103__tep/ops/spec/_head_sampler/*.h',
 ]
 
 

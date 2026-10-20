@@ -1,0 +1,809 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+// The MuseSparkOpen target head's token sampler, split over two kernels, and the
+// head's vocabulary gather folded into the first of them (ops/spec/head_sampler.py).
+//
+// The built-in head rounds the LM-head GEMM to BF16, all-gathers the eight vocabulary
+// shards, concatenates them, widens them to FP32, applies the soft cap in four
+// elementwise kernels (x * m, * fp32(1/cap), tanh, cap * t) and samples each row with
+// fusedSamplingKernel<float, 1024, true, false> (one CTA of 1024 threads per row).
+// For a row with no top-k / top-p / min-p filter, that kernel folds thread t's
+// elements 4 (t + 1024 j) + {0, 1, 2, 3} into one online-softmax state in that order,
+// block-reduces the 1024 states, rebases each onto the row max, scans them, draws a
+// Philox uniform and lets the thread whose span holds the target walk its elements
+// again until the running sum passes it.
+//
+// Here kernel A (splitFoldKernel) runs the same 1024 per-thread folds, with 128 of them
+// per CTA and 8 CTAs per row, reading BF16 logits and applying the soft cap in
+// registers with the torch chain's rounding statements; kernel B (splitDrawKernel), one
+// 1024-thread CTA per row, runs the shipped block reduce, scan, Philox draw and walk on
+// those states. Each virtual thread folds the same elements in the same order with the
+// same operations, so every state, every reduction and every token is the built-in's.
+// A row that enables a filter runs the shipped kernel body inside kernel B on the BF16
+// logits, reading them through CapBf16 (the soft cap applied on every read).
+//
+// With the gather, each rank's LM-head GEMM writes its [rows, shard] BF16 output into
+// its slot of a multicast buffer whose every word holds a sentinel (0xFFFF in both
+// BF16 halves, a NaN no GEMM epilogue produces) between calls. Kernel A polls this
+// rank's copy of the buffer, word by word, copies each published vector into the
+// [rows, vocab] BF16 row that kernel B and the step's logits output read, and resets
+// the word to the sentinel. No -0 canonicalization: the gathered row is the GEMM's
+// bits.
+
+#include "fusedSamplingKernelsCommon.cuh"
+
+#include <ATen/ATen.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAException.h>
+#include <c10/cuda/CUDAGuard.h>
+#include <torch/library.h>
+
+#include <cstdint>
+#include <optional>
+
+namespace tensorrt_llm
+{
+namespace kernels
+{
+namespace fusedSampling
+{
+
+//! The soft cap's three FP32 constants: multiplier m, 1/cap (rounded once to FP32, as
+//! ATen's division by a scalar multiplies by it) and cap.
+struct SplitCap
+{
+    float multiplier;
+    float invCap;
+    float cap;
+};
+
+//! The torch chain logits.float() * m, / cap, tanh, cap * t, statement for statement.
+__device__ __forceinline__ float capOf(float x, SplitCap const& c)
+{
+    float y = __fmul_rn(x, c.multiplier);
+    y = __fmul_rn(y, c.invCap);
+    y = tanhf(y);
+    return __fmul_rn(c.cap, y);
+}
+
+//! The constants for reads through CapBf16 inside the shipped body: kernel B stores its
+//! argument here before anything reads a logit.
+__shared__ SplitCap sSplitCap;
+
+//! A BF16 LM-head logit read as the soft-capped FP32 logit.
+struct CapBf16
+{
+    __nv_bfloat16 v;
+};
+
+__device__ inline float toFloat(CapBf16 v)
+{
+    return capOf(__bfloat162float(v.v), sSplitCap);
+}
+
+//! forEachLogit<float>'s traversal of a row of soft-capped logits held as BF16: vector v
+//! (4 elements) on thread v % blockDim.x, in increasing v, read as 8 bytes instead of
+//! 16. The FP32 rows the built-in samples are 16-byte aligned, so the shipped sweep takes
+//! its vector path; this one always does.
+template <typename Fn>
+__device__ inline void forEachLogit(CapBf16 const* row, int vocabSize, Fn fn)
+{
+    int const vecCount = vocabSize / 4;
+    uint2 const* vrow = reinterpret_cast<uint2 const*>(row);
+    for (int v = threadIdx.x; v < vecCount; v += blockDim.x)
+    {
+        uint2 const packed = vrow[v];
+        __nv_bfloat16 const* elems = reinterpret_cast<__nv_bfloat16 const*>(&packed);
+#pragma unroll
+        for (int j = 0; j < 4; ++j)
+        {
+            fn(v * 4 + j, capOf(__bfloat162float(elems[j]), sSplitCap));
+        }
+    }
+    for (int i = vecCount * 4 + threadIdx.x; i < vocabSize; i += blockDim.x)
+    {
+        fn(i, toFloat(row[i]));
+    }
+}
+
+//! The shipped single-CTA block for at most kWideBlockMaxRows rows; kernel A spreads
+//! its threads, kernel B is one of it per row.
+constexpr int kSplitBlock = kWideBlock;
+//! Loads kernel A issues before folding them, per virtual thread.
+constexpr int kSplitPrefetch = 16;
+//! Vectors of one virtual thread kernel B's walk stages in shared memory.
+constexpr int kSplitWalkVectors = 64;
+//! Two BF16 halves of 0xFFFF: the value of every unpublished word of the inbox.
+constexpr uint32_t kSplitSentinel = 0xFFFFFFFFu;
+//! Status bit: a poll waited past the timeout (the kernel then traps).
+constexpr int kSplitPollTimeout = 1;
+
+struct SplitFoldParams
+{
+    //! Row params (temperature), as FusedSamplingParams; logits unused with the gather.
+    FusedSamplingParams fs;
+    //! Without the gather: the BF16 [numRows, vocabSize] logits.
+    uint2 const* plain{nullptr};
+    //! With the gather: this rank's copy of the multicast inbox, [ranks][slotRows][shardVecs].
+    uint2* inbox{nullptr};
+    //! With the gather: the gathered BF16 [numRows, vocabSize] row, written here.
+    uint2* gathered{nullptr};
+    //! Per-virtual-thread online-softmax states, [numRows][kSplitBlock].
+    OnlineSoftmax* states{nullptr};
+    int* status{nullptr};
+    SplitCap cap{};
+    int shardVecs{0};
+    int slotRows{0};
+    unsigned long long timeoutNs{0};
+};
+
+__device__ __forceinline__ void gridDependencyWait()
+{
+    asm volatile("griddepcontrol.wait;" ::: "memory");
+}
+
+__device__ __forceinline__ void gridDependencyTrigger()
+{
+    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+}
+
+__device__ __forceinline__ uint2 loadRelaxedSys(uint2 const* address)
+{
+    uint2 value;
+    asm volatile("ld.relaxed.sys.global.v2.b32 {%0, %1}, [%2];"
+                 : "=r"(value.x), "=r"(value.y)
+                 : "l"(address)
+                 : "memory");
+    return value;
+}
+
+__device__ __forceinline__ void storeRelaxedSys(uint2* address, uint2 value)
+{
+    asm volatile("st.relaxed.sys.global.v2.b32 [%0], {%1, %2};" ::"l"(address), "r"(value.x), "r"(value.y) : "memory");
+}
+
+__device__ __forceinline__ unsigned long long globalTimerNs()
+{
+    unsigned long long t;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+    return t;
+}
+
+//! Whether every BF16 half of the 8-byte word has been published (none is the sentinel).
+__device__ __forceinline__ bool published(uint2 word)
+{
+    return (__vcmpeq2(word.x, kSplitSentinel) | __vcmpeq2(word.y, kSplitSentinel)) == 0u;
+}
+
+//! This rank's inbox word of (row, vector v) of the full vocabulary.
+__device__ __forceinline__ uint2* inboxAt(SplitFoldParams const& p, int row, int v)
+{
+    int const rank = v / p.shardVecs;
+    return p.inbox + (static_cast<size_t>(rank) * p.slotRows + row) * p.shardVecs + (v - rank * p.shardVecs);
+}
+
+//! Spin until the word at `address` is published. A wait past the timeout is a protocol
+//! failure (a peer that never published): record it and trap rather than return data.
+__device__ __noinline__ uint2 awaitPublished(uint2* address, int* status, unsigned long long timeoutNs)
+{
+    unsigned long long const start = globalTimerNs();
+    for (int spins = 0;; ++spins)
+    {
+        uint2 const word = loadRelaxedSys(address);
+        if (published(word))
+        {
+            return word;
+        }
+        if (spins >= 64)
+        {
+            __nanosleep(64);
+            if (globalTimerNs() - start > timeoutNs)
+            {
+                atomicOr(status, kSplitPollTimeout);
+                __threadfence_system();
+                __trap();
+            }
+        }
+    }
+}
+
+//! Kernel A: (optionally) gather, then (optionally) fold. Grid (numRows, kSplitBlock /
+//! THREADS); block THREADS; virtual thread vt = blockIdx.y * THREADS + threadIdx.x of
+//! the shipped 1024-thread block.
+//!
+//! PDL: waits on its predecessor before its first read of anything, so every input,
+//! the inbox included, is read after the predecessor grid (the LM-head GEMM) completed.
+//! Peer slots are published by the peers' GEMMs and are read through the Lamport
+//! protocol, not through that edge.
+template <bool GATHER, bool FOLD, int THREADS>
+__global__ void __launch_bounds__(THREADS) splitFoldKernel(SplitFoldParams p)
+{
+    gridDependencyWait();
+    int const row = blockIdx.x;
+    int const vt = blockIdx.y * THREADS + threadIdx.x;
+    int const vecCount = p.fs.vocabSize / 4;
+    float tempInv = 1.0f;
+    if constexpr (FOLD)
+    {
+        tempInv = loadRowParams(p.fs, row).tempInv;
+    }
+    OnlineSoftmax st{-FLT_MAX, 0.0f, 0};
+    uint2 const* plainRow = GATHER ? nullptr : p.plain + static_cast<size_t>(row) * vecCount;
+    uint2* gatheredRow = GATHER ? p.gathered + static_cast<size_t>(row) * vecCount : nullptr;
+    for (int v0 = vt; v0 < vecCount; v0 += kSplitPrefetch * kSplitBlock)
+    {
+        uint2 buf[kSplitPrefetch];
+#pragma unroll
+        for (int u = 0; u < kSplitPrefetch; ++u)
+        {
+            int const v = v0 + u * kSplitBlock;
+            if (v < vecCount)
+            {
+                if constexpr (GATHER)
+                {
+                    buf[u] = loadRelaxedSys(inboxAt(p, row, v));
+                }
+                else
+                {
+                    buf[u] = __ldg(plainRow + v);
+                }
+            }
+        }
+#pragma unroll
+        for (int u = 0; u < kSplitPrefetch; ++u)
+        {
+            int const v = v0 + u * kSplitBlock;
+            if (v < vecCount)
+            {
+                if constexpr (GATHER)
+                {
+                    uint2* const slot = inboxAt(p, row, v);
+                    if (!published(buf[u]))
+                    {
+                        buf[u] = awaitPublished(slot, p.status, p.timeoutNs);
+                    }
+                    gatheredRow[v] = buf[u];
+                    storeRelaxedSys(slot, make_uint2(kSplitSentinel, kSplitSentinel));
+                }
+                if constexpr (FOLD)
+                {
+                    __nv_bfloat16 const* elems = reinterpret_cast<__nv_bfloat16 const*>(&buf[u]);
+#pragma unroll
+                    for (int j = 0; j < 4; ++j)
+                    {
+                        float const logit = capOf(__bfloat162float(elems[j]), p.cap);
+                        st = combineOnlineSoftmax(st, OnlineSoftmax{__fmul_rn(logit, tempInv), 1.0f, v * 4 + j});
+                    }
+                }
+            }
+        }
+    }
+    if constexpr (FOLD)
+    {
+        p.states[static_cast<size_t>(row) * kSplitBlock + vt] = st;
+    }
+    gridDependencyTrigger();
+}
+
+//! Kernel B: one 1024-thread CTA per row. `params.logits` is the BF16 row (gathered or
+//! not); the soft cap is applied on every read.
+//!
+//! A row without top-k / top-p / min-p takes the shipped tokens-only rejection path's
+//! first round from the states kernel A wrote: cub BlockReduce of the 1024 states, each
+//! thread's mass rebased onto the row max, cub BlockScan, tid 0's Philox draw, and the
+//! walk of the thread whose span holds the target -- its elements' weights computed in
+//! parallel, then summed by one thread in the original order (when two spans overlap
+//! around the target, every claimant walks, as in the shipped kernel). Any other row
+//! runs the shipped body itself.
+//!
+//! PDL: waits on kernel A before reading anything.
+__global__ void __launch_bounds__(kSplitBlock, 1)
+    splitDrawKernel(FusedSamplingParams params, OnlineSoftmax const* states, SplitCap cap)
+{
+    __shared__ FusedSamplingShared<kSplitBlock> shared;
+    __shared__ __align__(16) float wbuf[4 * kSplitWalkVectors];
+    __shared__ int sWalker;
+    __shared__ float sBase;
+    __shared__ unsigned long long sLastCrossing;
+    int const row = blockIdx.x;
+    int const tid = threadIdx.x;
+    if (tid == 0)
+    {
+        sSplitCap = cap;
+    }
+    __syncthreads();
+    gridDependencyWait();
+    int const vocabSize = params.vocabSize;
+    RowParams const rp = loadRowParams(params, row);
+    if (rp.needTopK || rp.needTopP || rp.needMinP)
+    {
+        fusedSamplingBody<CapBf16, kSplitBlock, true, false>(params, shared);
+        return;
+    }
+    using BlockReduceOnline = cub::BlockReduce<OnlineSoftmax, kSplitBlock>;
+    using BlockScanF = cub::BlockScan<float, kSplitBlock>;
+    OnlineSoftmax const cachedThreadStats = states[static_cast<size_t>(row) * kSplitBlock + tid];
+    OnlineSoftmax const rowStats
+        = BlockReduceOnline(shared.temp.reduceOnline).Reduce(cachedThreadStats, OnlineSoftmaxOp());
+    if (tid == 0)
+    {
+        shared.maxScaled = rowStats.max;
+        shared.argmax = rowStats.argmax;
+        shared.totalMass = rowStats.sum;
+        sWalker = -1;
+    }
+    __syncthreads();
+    float const maxScaled = shared.maxScaled;
+    float const cachedLocalMass = cachedThreadStats.sum * __expf(cachedThreadStats.max - maxScaled);
+    if (tid == 0)
+    {
+        initRowRng(params, row, &shared.rejectRng);
+        shared.pivot = -1.0f;
+        shared.token = -1;
+    }
+    __syncthreads();
+    float const localMass = cachedLocalMass;
+    float base = 0.0f;
+    float supportMass = 0.0f;
+    BlockScanF(shared.temp.scanF).ExclusiveSum(localMass, base, supportMass);
+    __syncthreads();
+    if (tid == 0)
+    {
+        shared.massTarget = rp.topP * supportMass;
+        shared.target = curand_uniform(&shared.rejectRng) * supportMass;
+        shared.candIdx = -1;
+        sLastCrossing = 0ull;
+    }
+    __syncthreads();
+    float const target = shared.target;
+    // The shipped kernel lets every thread whose span holds the target walk. Usually that
+    // is one thread; it is more when two spans of the float scan overlap (an exclusive
+    // prefix and the previous prefix plus its mass are rounded differently) and the target
+    // lies in the overlap.
+    bool const claims = target >= base && target < base + localMass;
+    if (claims)
+    {
+        sWalker = tid;
+        sBase = base;
+    }
+    int const claimants = __syncthreads_count(claims);
+    int const vecCount = vocabSize / 4;
+    __nv_bfloat16 const* rowLogits
+        = static_cast<__nv_bfloat16 const*>(params.logits) + static_cast<size_t>(row) * vocabSize;
+    if (claimants == 1)
+    {
+        // One walker (it alone wrote sWalker and sBase): its elements' weights in
+        // parallel, summed by one thread in the shipped walk's order.
+        int const walker = sWalker;
+        int const walkVectors = (vecCount - walker + kSplitBlock - 1) / kSplitBlock;
+        if (tid < walkVectors)
+        {
+            uint2 const packed = reinterpret_cast<uint2 const*>(rowLogits)[walker + tid * kSplitBlock];
+            __nv_bfloat16 const* elems = reinterpret_cast<__nv_bfloat16 const*>(&packed);
+#pragma unroll
+            for (int j = 0; j < 4; ++j)
+            {
+                wbuf[tid * 4 + j] = __expf(__fmul_rn(capOf(__bfloat162float(elems[j]), cap), rp.tempInv) - maxScaled);
+            }
+        }
+        __syncthreads();
+        if (tid == 0)
+        {
+            // Four weights per shared load, still added one at a time in order.
+            float running = sBase;
+            int cand = -1;
+            float candWeight = 0.0f;
+            float4 const* w4 = reinterpret_cast<float4 const*>(wbuf);
+            for (int q = 0; q < walkVectors && cand < 0; ++q)
+            {
+                float4 const quad = w4[q];
+                float const ws[4] = {quad.x, quad.y, quad.z, quad.w};
+#pragma unroll
+                for (int j = 0; j < 4; ++j)
+                {
+                    float const w = ws[j];
+                    // supportFloor 0 and pivot -1 in the shipped walk's membership test.
+                    if (cand < 0 && w >= 0.0f && w > -1.0f)
+                    {
+                        running += w;
+                        if (running > target)
+                        {
+                            cand = (walker + q * kSplitBlock) * 4 + j;
+                            candWeight = w;
+                        }
+                    }
+                }
+            }
+            if (cand >= 0)
+            {
+                shared.candIdx = cand;
+                shared.candWeight = candWeight;
+            }
+        }
+    }
+    else if (claimants > 1)
+    {
+        // Every claimant walks its own elements from its own base, as in the shipped
+        // kernel, where each walk that crosses the target writes the candidate and the
+        // last write stands: the walk that crosses at the later position. Here that
+        // choice is made deterministically -- the later crossing position, then the
+        // higher thread -- instead of by the order the writes land.
+        int crossIdx = -1;
+        float crossWeight = 0.0f;
+        unsigned long long crossing = 0ull;
+        if (claims)
+        {
+            float running = base;
+            int position = 0;
+            for (int v = tid; v < vecCount && crossIdx < 0; v += kSplitBlock)
+            {
+                uint2 const packed = reinterpret_cast<uint2 const*>(rowLogits)[v];
+                __nv_bfloat16 const* elems = reinterpret_cast<__nv_bfloat16 const*>(&packed);
+                for (int j = 0; j < 4; ++j)
+                {
+                    float const w = __expf(__fmul_rn(capOf(__bfloat162float(elems[j]), cap), rp.tempInv) - maxScaled);
+                    ++position;
+                    if (!(w >= 0.0f && w > -1.0f))
+                    {
+                        continue;
+                    }
+                    running += w;
+                    if (running > target)
+                    {
+                        crossIdx = v * 4 + j;
+                        crossWeight = w;
+                        crossing = (static_cast<unsigned long long>(position) << 32)
+                            | static_cast<unsigned long long>(tid + 1);
+                        break;
+                    }
+                }
+            }
+            if (crossIdx >= 0)
+            {
+                atomicMax(&sLastCrossing, crossing);
+            }
+        }
+        __syncthreads();
+        if (crossIdx >= 0 && crossing == sLastCrossing)
+        {
+            shared.candIdx = crossIdx;
+            shared.candWeight = crossWeight;
+        }
+    }
+    __syncthreads();
+    if (tid == 0)
+    {
+        int const cand = shared.candIdx;
+        params.outputTokens[row] = cand >= 0 ? cand : shared.argmax;
+    }
+}
+
+//! Test reference: the shipped pass 1 of a neutral tokens-only row, verbatim, on FP32
+//! soft-capped logits; stores each of the 1024 threads' online-softmax state.
+__global__ void __launch_bounds__(kSplitBlock, 1) splitRefFoldKernel(FusedSamplingParams params, OnlineSoftmax* states)
+{
+    int const row = blockIdx.x;
+    int const tid = threadIdx.x;
+    float const* rowLogits = static_cast<float const*>(params.logits) + static_cast<size_t>(row) * params.vocabSize;
+    RowParams const rp = loadRowParams(params, row);
+    OnlineSoftmax cachedThreadStats{-FLT_MAX, 0.0f, 0};
+    forEachLogit(rowLogits, params.vocabSize,
+        [&](int i, float logit) {
+            cachedThreadStats
+                = combineOnlineSoftmax(cachedThreadStats, OnlineSoftmax{__fmul_rn(logit, rp.tempInv), 1.0f, i});
+        });
+    states[static_cast<size_t>(row) * kSplitBlock + tid] = cachedThreadStats;
+}
+
+//! Test reference: capOf over a BF16 tensor.
+__global__ void splitCapKernel(__nv_bfloat16 const* x, float* y, int64_t n, SplitCap cap)
+{
+    int64_t const i = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x;
+    if (i < n)
+    {
+        y[i] = capOf(__bfloat162float(x[i]), cap);
+    }
+}
+
+//! Test probe: records, per 32-bit word of `buf`, the first value it sees with both BF16
+//! halves published, while a producer kernel on another stream writes `buf`. Exits when
+//! every word was seen or after `timeoutNs`.
+__global__ void splitWatchKernel(uint32_t const* buf, uint32_t* firstSeen, int64_t words, unsigned long long timeoutNs)
+{
+    int64_t const stride = static_cast<int64_t>(gridDim.x) * blockDim.x;
+    int64_t const start = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x;
+    unsigned long long const t0 = globalTimerNs();
+    for (;;)
+    {
+        bool pending = false;
+        for (int64_t i = start; i < words; i += stride)
+        {
+            if (firstSeen[i] != kSplitSentinel)
+            {
+                continue;
+            }
+            uint32_t v;
+            asm volatile("ld.relaxed.sys.global.b32 %0, [%1];" : "=r"(v) : "l"(buf + i) : "memory");
+            if (__vcmpeq2(v, kSplitSentinel) == 0u)
+            {
+                firstSeen[i] = v;
+            }
+            else
+            {
+                pending = true;
+            }
+        }
+        if (!pending || globalTimerNs() - t0 > timeoutNs)
+        {
+            return;
+        }
+    }
+}
+
+} // namespace fusedSampling
+} // namespace kernels
+} // namespace tensorrt_llm
+
+namespace
+{
+
+namespace fs = tensorrt_llm::kernels::fusedSampling;
+namespace tk = tensorrt_llm::kernels;
+
+template <typename Kernel, typename... Args>
+void launch(Kernel kernel, dim3 grid, dim3 block, bool pdl, Args... args)
+{
+    cudaLaunchConfig_t config{};
+    config.gridDim = grid;
+    config.blockDim = block;
+    config.dynamicSmemBytes = 0;
+    config.stream = at::cuda::getCurrentCUDAStream();
+    cudaLaunchAttribute attribute[1];
+    attribute[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attribute[0].val.programmaticStreamSerializationAllowed = pdl ? 1 : 0;
+    config.attrs = attribute;
+    config.numAttrs = 1;
+    C10_CUDA_CHECK(cudaLaunchKernelEx(&config, kernel, args...));
+}
+
+void checkRowVector(at::Tensor const& t, char const* name, at::ScalarType dtype, int64_t rows)
+{
+    TORCH_CHECK(t.is_cuda(), name, " must be a CUDA tensor");
+    TORCH_CHECK(t.scalar_type() == dtype, name, " has the wrong dtype");
+    TORCH_CHECK(t.dim() == 1 && t.size(0) >= rows, name, " must be a 1D tensor of at least numRows entries");
+    TORCH_CHECK(t.is_contiguous(), name, " must be contiguous");
+}
+
+//! The shipped op's parameter checks (thop/fusedSamplingOp.cpp buildParams), on a BF16 row.
+tk::FusedSamplingParams rowParams(at::Tensor const& logits, at::Tensor const& temperatures, at::Tensor const& topKs,
+    at::Tensor const& topPs, at::Tensor const& minPs, std::optional<at::Tensor> const& seed,
+    std::optional<at::Tensor> const& offset)
+{
+    TORCH_CHECK(logits.dim() == 2, "logits must be [numRows, vocabSize]");
+    TORCH_CHECK(logits.is_cuda() && logits.is_contiguous(), "logits must be a contiguous CUDA tensor");
+    auto const numRows = logits.size(0);
+    TORCH_CHECK(numRows >= 1 && numRows <= fs::kWideBlockMaxRows, "1..", fs::kWideBlockMaxRows, " rows");
+    TORCH_CHECK(logits.size(1) % 4 == 0, "the vocabulary must be a whole number of 4-element vectors");
+    TORCH_CHECK(reinterpret_cast<uintptr_t>(logits.data_ptr()) % 8 == 0, "logits must be 8-byte aligned");
+    checkRowVector(temperatures, "temperatures", at::kFloat, numRows);
+    checkRowVector(topKs, "top_ks", at::kInt, numRows);
+    checkRowVector(topPs, "top_ps", at::kFloat, numRows);
+    checkRowVector(minPs, "min_ps", at::kFloat, numRows);
+    tk::FusedSamplingParams params;
+    params.logits = logits.data_ptr();
+    params.temperatures = temperatures.data_ptr<float>();
+    params.topKs = topKs.data_ptr<int32_t>();
+    params.topPs = topPs.data_ptr<float>();
+    params.minPs = minPs.data_ptr<float>();
+    params.numRows = static_cast<int32_t>(numRows);
+    params.vocabSize = static_cast<int32_t>(logits.size(1));
+    TORCH_CHECK(seed.has_value() == offset.has_value(), "seed and offset must be provided together");
+    if (seed.has_value())
+    {
+        auto const& s = seed.value();
+        auto const& o = offset.value();
+        TORCH_CHECK(s.is_cuda() && o.is_cuda(), "seed and offset must be CUDA tensors");
+        TORCH_CHECK(s.scalar_type() == at::kLong && o.scalar_type() == at::kLong, "seed and offset must be int64");
+        TORCH_CHECK(s.numel() == o.numel(), "seed and offset must have the same length");
+        TORCH_CHECK(s.numel() == 1 || s.numel() >= numRows, "seed/offset must hold 1 or numRows entries");
+        params.seed = reinterpret_cast<uint64_t const*>(s.data_ptr<int64_t>());
+        params.offset = reinterpret_cast<uint64_t const*>(o.data_ptr<int64_t>());
+        params.perRowRng = s.numel() >= numRows;
+    }
+    return params;
+}
+
+fs::SplitCap softCap(double multiplier, double invCap, double cap)
+{
+    // Python floats holding FP32 values: the conversions are exact.
+    return fs::SplitCap{static_cast<float>(multiplier), static_cast<float>(invCap), static_cast<float>(cap)};
+}
+
+void checkStates(at::Tensor const& states, int64_t rows)
+{
+    TORCH_CHECK(states.is_cuda() && states.is_contiguous() && states.scalar_type() == at::kInt,
+        "states must be a contiguous int32 CUDA tensor");
+    TORCH_CHECK(states.numel() >= rows * fs::kSplitBlock * 3, "states holds 3 words per virtual thread");
+}
+
+template <bool GATHER, bool FOLD>
+void launchFold(fs::SplitFoldParams const& p, int64_t threads, bool pdl)
+{
+    if (threads == 128)
+    {
+        launch(fs::splitFoldKernel<GATHER, FOLD, 128>, dim3(p.fs.numRows, fs::kSplitBlock / 128), dim3(128), pdl, p);
+    }
+    else
+    {
+        TORCH_CHECK(threads == 64, "kernel A runs 64 or 128 threads per CTA");
+        launch(fs::splitFoldKernel<GATHER, FOLD, 64>, dim3(p.fs.numRows, fs::kSplitBlock / 64), dim3(64), pdl, p);
+    }
+}
+
+//! Kernel A on a plain BF16 row (no gather).
+void foldPlain(at::Tensor const& logits, at::Tensor const& temperatures, at::Tensor const& states, double multiplier,
+    double invCap, double cap, int64_t threads, bool pdl)
+{
+    TORCH_CHECK(logits.scalar_type() == at::kBFloat16, "logits must be BF16");
+    at::cuda::CUDAGuard guard(logits.device());
+    fs::SplitFoldParams p;
+    TORCH_CHECK(logits.dim() == 2 && logits.is_contiguous() && logits.size(1) % 4 == 0, "logits [rows, vocab]");
+    TORCH_CHECK(reinterpret_cast<uintptr_t>(logits.data_ptr()) % 8 == 0, "logits must be 8-byte aligned");
+    checkRowVector(temperatures, "temperatures", at::kFloat, logits.size(0));
+    checkStates(states, logits.size(0));
+    p.fs.temperatures = temperatures.data_ptr<float>();
+    p.fs.numRows = static_cast<int32_t>(logits.size(0));
+    p.fs.vocabSize = static_cast<int32_t>(logits.size(1));
+    p.plain = reinterpret_cast<uint2 const*>(logits.data_ptr());
+    p.cap = softCap(multiplier, invCap, cap);
+    p.states = reinterpret_cast<fs::OnlineSoftmax*>(states.data_ptr());
+    launchFold<false, true>(p, threads, pdl);
+}
+
+//! Kernel A with the gather: poll this rank's inbox copy, write `gathered`, reset the
+//! inbox; fold too when `fold`.
+void foldGather(at::Tensor const& inbox, at::Tensor const& gathered, at::Tensor const& temperatures,
+    at::Tensor const& states, at::Tensor const& status, double multiplier, double invCap, double cap, int64_t shardVecs,
+    int64_t slotRows, int64_t timeoutS, bool fold, int64_t threads, bool pdl)
+{
+    TORCH_CHECK(gathered.scalar_type() == at::kBFloat16 && gathered.dim() == 2 && gathered.is_contiguous(),
+        "gathered must be a contiguous BF16 [rows, vocab] tensor");
+    auto const rows = gathered.size(0);
+    auto const vocab = gathered.size(1);
+    TORCH_CHECK(vocab % 4 == 0 && (vocab / 4) % shardVecs == 0, "the vocabulary is a whole number of shards");
+    auto const ranks = (vocab / 4) / shardVecs;
+    TORCH_CHECK(rows >= 1 && rows <= slotRows, "rows must fit the inbox slots");
+    TORCH_CHECK(inbox.is_cuda() && inbox.is_contiguous() && inbox.device() == gathered.device(), "inbox on device");
+    TORCH_CHECK(inbox.numel() * inbox.element_size() >= ranks * slotRows * shardVecs * 8, "inbox too small");
+    TORCH_CHECK(reinterpret_cast<uintptr_t>(inbox.data_ptr()) % 8 == 0, "inbox must be 8-byte aligned");
+    TORCH_CHECK(status.is_cuda() && status.scalar_type() == at::kInt && status.numel() >= 1, "status int32[1]");
+    at::cuda::CUDAGuard guard(gathered.device());
+    fs::SplitFoldParams p;
+    p.fs.numRows = static_cast<int32_t>(rows);
+    p.fs.vocabSize = static_cast<int32_t>(vocab);
+    if (fold)
+    {
+        checkRowVector(temperatures, "temperatures", at::kFloat, rows);
+        checkStates(states, rows);
+        p.fs.temperatures = temperatures.data_ptr<float>();
+        p.states = reinterpret_cast<fs::OnlineSoftmax*>(states.data_ptr());
+    }
+    p.inbox = reinterpret_cast<uint2*>(inbox.data_ptr());
+    p.gathered = reinterpret_cast<uint2*>(gathered.data_ptr());
+    p.status = status.data_ptr<int32_t>();
+    p.cap = softCap(multiplier, invCap, cap);
+    p.shardVecs = static_cast<int>(shardVecs);
+    p.slotRows = static_cast<int>(slotRows);
+    p.timeoutNs = static_cast<unsigned long long>(timeoutS) * 1000000000ull;
+    if (fold)
+    {
+        launchFold<true, true>(p, threads, pdl);
+    }
+    else
+    {
+        launchFold<true, false>(p, threads, pdl);
+    }
+}
+
+//! Kernel B. `logits` is the BF16 row kernel A read (or wrote, with the gather).
+at::Tensor draw(at::Tensor const& logits, at::Tensor const& temperatures, at::Tensor const& topKs,
+    at::Tensor const& topPs, at::Tensor const& minPs, std::optional<at::Tensor> const& seed,
+    std::optional<at::Tensor> const& offset, at::Tensor const& states, double multiplier, double invCap, double cap,
+    bool pdl)
+{
+    TORCH_CHECK(logits.scalar_type() == at::kBFloat16, "logits must be BF16");
+    at::cuda::CUDAGuard guard(logits.device());
+    auto params = rowParams(logits, temperatures, topKs, topPs, minPs, seed, offset);
+    TORCH_CHECK(params.vocabSize / 4 <= fs::kSplitWalkVectors * fs::kSplitBlock, "vocabulary too wide for the walk");
+    checkStates(states, logits.size(0));
+    auto tokens = at::empty({logits.size(0)}, logits.options().dtype(at::kInt));
+    params.outputTokens = tokens.data_ptr<int32_t>();
+    launch(fs::splitDrawKernel, dim3(params.numRows), dim3(fs::kSplitBlock), pdl, params,
+        reinterpret_cast<fs::OnlineSoftmax const*>(states.data_ptr()), softCap(multiplier, invCap, cap));
+    return tokens;
+}
+
+void refFold(at::Tensor const& capped, at::Tensor const& temperatures, at::Tensor const& states)
+{
+    TORCH_CHECK(capped.scalar_type() == at::kFloat && capped.dim() == 2 && capped.is_contiguous(), "FP32 rows");
+    at::cuda::CUDAGuard guard(capped.device());
+    checkRowVector(temperatures, "temperatures", at::kFloat, capped.size(0));
+    checkStates(states, capped.size(0));
+    tk::FusedSamplingParams params;
+    params.logits = capped.data_ptr();
+    params.temperatures = temperatures.data_ptr<float>();
+    params.numRows = static_cast<int32_t>(capped.size(0));
+    params.vocabSize = static_cast<int32_t>(capped.size(1));
+    launch(fs::splitRefFoldKernel, dim3(params.numRows), dim3(fs::kSplitBlock), false, params,
+        reinterpret_cast<fs::OnlineSoftmax*>(states.data_ptr()));
+}
+
+at::Tensor capRows(at::Tensor const& x, double multiplier, double invCap, double cap)
+{
+    TORCH_CHECK(x.scalar_type() == at::kBFloat16 && x.is_cuda() && x.is_contiguous(), "BF16 CUDA tensor");
+    at::cuda::CUDAGuard guard(x.device());
+    auto y = at::empty(x.sizes(), x.options().dtype(at::kFloat));
+    int64_t const n = x.numel();
+    if (n > 0)
+    {
+        launch(fs::splitCapKernel, dim3(static_cast<unsigned>((n + 255) / 256)), dim3(256), false,
+            reinterpret_cast<__nv_bfloat16 const*>(x.data_ptr()), y.data_ptr<float>(), n,
+            softCap(multiplier, invCap, cap));
+    }
+    return y;
+}
+
+void watch(at::Tensor const& buf, at::Tensor const& firstSeen, int64_t blocks, int64_t timeoutMs)
+{
+    TORCH_CHECK(buf.is_cuda() && buf.is_contiguous() && firstSeen.is_cuda() && firstSeen.is_contiguous(), "CUDA");
+    TORCH_CHECK(firstSeen.scalar_type() == at::kInt && firstSeen.numel() * 4 == buf.numel() * buf.element_size(),
+        "first_seen is one int32 per 32-bit word of buf");
+    at::cuda::CUDAGuard guard(buf.device());
+    launch(fs::splitWatchKernel, dim3(static_cast<unsigned>(blocks)), dim3(256), false,
+        reinterpret_cast<uint32_t const*>(buf.data_ptr()), reinterpret_cast<uint32_t*>(firstSeen.data_ptr()),
+        firstSeen.numel(), static_cast<unsigned long long>(timeoutMs) * 1000000ull);
+}
+
+} // namespace
+
+TORCH_LIBRARY(musespark_open_head_sampler, m)
+{
+    m.def(
+        "fold_plain(Tensor logits, Tensor temperatures, Tensor(a!) states, float multiplier, float inv_cap, "
+        "float cap, int threads, bool pdl) -> ()");
+    m.def(
+        "fold_gather(Tensor(a!) inbox, Tensor(b!) gathered, Tensor temperatures, Tensor(c!) states, "
+        "Tensor(d!) status, float multiplier, float inv_cap, float cap, int shard_vecs, int slot_rows, "
+        "int timeout_s, bool fold, int threads, bool pdl) -> ()");
+    m.def(
+        "draw(Tensor logits, Tensor temperatures, Tensor top_ks, Tensor top_ps, Tensor min_ps, Tensor? seed, "
+        "Tensor? offset, Tensor states, float multiplier, float inv_cap, float cap, bool pdl) -> Tensor");
+    m.def("ref_fold(Tensor capped, Tensor temperatures, Tensor(a!) states) -> ()");
+    m.def("cap(Tensor x, float multiplier, float inv_cap, float cap) -> Tensor");
+    m.def("watch(Tensor buf, Tensor(a!) first_seen, int blocks, int timeout_ms) -> ()");
+}
+
+TORCH_LIBRARY_IMPL(musespark_open_head_sampler, CUDA, m)
+{
+    m.impl("fold_plain", &foldPlain);
+    m.impl("fold_gather", &foldGather);
+    m.impl("draw", &draw);
+    m.impl("ref_fold", &refFold);
+    m.impl("cap", &capRows);
+    m.impl("watch", &watch);
+}
