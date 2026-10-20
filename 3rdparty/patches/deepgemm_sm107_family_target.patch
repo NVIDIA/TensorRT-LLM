@@ -1,0 +1,13 @@
+--- a/csrc/runtime/jit.hpp
++++ b/csrc/runtime/jit.hpp
+@@ -30,6 +30,10 @@
+         // Preserve the existing 12.x family target when DeepJIT derives a different minor target.
+         if (runtime->device.get_arch_major() == 12 and runtime->device.get_arch_minor() != 0)
+             runtime->default_compiler_options.arch = "120f";
++        // DeepJIT derives sm_107f for SM 10.7, a target this CUTLASS defines no feature macros for (no TMA
++        // or tcgen05). Build the SM 10.x family target there instead, as DeepGEMM did before DeepJIT.
++        if (runtime->device.get_arch_major() == 10 and runtime->device.get_arch_minor() == 7)
++            runtime->default_compiler_options.arch = "100f";
+         return runtime;
+     });
+ }
