@@ -228,13 +228,13 @@ def test_a_decode_target_never_reads_the_phase_back():
 
 
 def test_decode_step_args_state_the_zero_rather_than_reading_it():
-    """The one place the two gpt_oss targets actually differ.
+    """The one place the gpt_oss default target's prefill and decode targets differ.
 
     Decode's routing already guarantees no context rows, so it says so instead
     of reading the field back. That is what makes the source gate in
     test_modeling_v2_claims.py meaningful on this target rather than vacuous.
     """
-    source = (_ROOT / "models/gpt_oss/gpt_oss_120b__sm_103__tp1/modeling.py").read_text()
+    source = (_ROOT / "models/gpt_oss/gpt_oss_120b__sm_10x__default/modeling.py").read_text()
     decode = next(
         n
         for n in ast.walk(ast.parse(source))

@@ -1,0 +1,21 @@
+# Lightricks/LTX-2  ·  LTX2Pipeline / LTX2TwoStagesPipeline  ·  t2v
+# guidance_scale · max_sequence_length: pipeline defaults.
+backend: openai-videos
+
+common_params:
+  width: 1280
+  height: 768
+  num_frames: 121
+  frame_rate: 24.0
+  num_inference_steps: 40
+  guidance_scale: 4.0
+  max_sequence_length: 1024
+  seed: 42
+
+requests:
+  - prompt: A cat walks through a field of flowers
+
+# 9 extra_params, all left at their defaults:
+#   output_type=pt · guidance_rescale=0.0 · image_cond_strength=1.0 · stg_scale=0.0
+#   stg_blocks=None · modality_scale=1.0 · rescale_scale=0.0 · guidance_skip_step=0
+#   enhance_prompt=False
