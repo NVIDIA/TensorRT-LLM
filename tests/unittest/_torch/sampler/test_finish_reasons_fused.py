@@ -199,18 +199,18 @@ def test_compact_stop_words_storage_and_finish_precedence() -> None:
     assert not handler.has_stop_word_history
     many = admit(2, [[i] for i in range(1024)], [1, 2, 3])
     assert not handler.has_stop_word_history
-    allocation = handler._stop_word_allocations[2][1]
+    allocation = handler._stop_word_allocations[2].tensor
     snapshot = allocation.clone()
     long = admit(3, [list(range(256))], list(range(255)))
     assert handler.has_stop_word_history
-    assert handler._stop_word_allocations[2][1] is allocation
+    assert handler._stop_word_allocations[2].tensor is allocation
     torch.testing.assert_close(allocation, snapshot)
     total_bytes = handler.store.stop_words_metadata_cuda.nbytes + sum(
-        value.nbytes for _, value in handler._stop_word_allocations.values()
+        entry.tensor.nbytes for entry in handler._stop_word_allocations.values()
     )
     # Metadata plus actual rules and per-request windows; no 1024 x 1024 x 256 tensor.
     assert total_bytes < 64 * 1024
-    assert handler._stop_word_allocations[3][1].numel() == 2 + 256 + 2 * 256
+    assert handler._stop_word_allocations[3].tensor.numel() == 2 + 256 + 2 * 256
 
     slots = torch.tensor([2], device="cuda", dtype=torch.int64)
     tokens = torch.zeros((1, 1025, 1), device="cuda", dtype=torch.int32)
@@ -255,9 +255,9 @@ def test_compact_stop_words_storage_and_finish_precedence() -> None:
 
     old = admit(4, [[7, 8]], [7])
     replacement = admit(4, [[8, 9]], [8])
-    replacement_allocation = handler._stop_word_allocations[4][1]
+    replacement_allocation = handler._stop_word_allocations[4].tensor
     handler.release_request(old)
-    assert handler._stop_word_allocations[4][1] is replacement_allocation
+    assert handler._stop_word_allocations[4].tensor is replacement_allocation
     handler.release_request(replacement)
 
     # Releasing one request preserves other live requests and is idempotent.
