@@ -9333,13 +9333,15 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
         @classmethod
         def _compile(cls, q_dtype: torch.dtype, num_heads: int,
-                     max_decode_query_len: int, head_dim: int):
-            key = (q_dtype, num_heads, max_decode_query_len, head_dim)
+                     max_decode_query_len: int, head_dim: int,
+                     shard_world: int):
+            key = (q_dtype, num_heads, max_decode_query_len, head_dim,
+                   shard_world)
             if key in cls.kernel_cache:
                 return
 
             cute_dtype = _M3_TORCH_TO_CUTE_DTYPE[q_dtype]
-            page_size = cls.SUPPORTED_PAGE_SIZE
+            page_size = cls.SUPPORTED_PAGE_SIZE // shard_world
 
             sym_total_tokens = cute.sym_int()
             sym_batch = cute.sym_int()
@@ -9366,9 +9368,18 @@ if IS_CUTLASS_DSL_AVAILABLE:
             # Every stride is symbolic because production passes a transposed
             # view of the [heads, blocks, tokens] selector buffer, whose
             # innermost logical stride is the token count rather than 1.
+            # Split, it is this rank's receive slots [W, heads / W, tokens,
+            # blocks], whose layout every rank's slots share.
+            score_shape = (num_heads, sym_total_tokens, cute.sym_int())
+            if shard_world > 1:
+                score_shape = (shard_world, num_heads // shard_world,
+                               cute.sym_int(), cute.sym_int())
             score_fake = cute.runtime.make_fake_tensor(
-                cutlass.Float32, (num_heads, sym_total_tokens, cute.sym_int()),
-                stride=(cute.sym_int64(), cute.sym_int64(), cute.sym_int64()))
+                cutlass.Float32,
+                score_shape,
+                stride=tuple(cute.sym_int64() for _ in score_shape))
+            bases_fake = cute.runtime.make_fake_compact_tensor(
+                cutlass.Int64, (shard_world, ), stride_order=(0, ))
 
             sl_fake = cute.runtime.make_fake_compact_tensor(cutlass.Int32,
                                                             (sym_batch, ),
@@ -9383,6 +9394,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 max_decode_query_len,
                 cls.SPLIT_K,
                 head_dim,
+                shard_world,
             )
             cls.kernel_cache[key] = cute.compile(
                 kernel,
@@ -9391,6 +9403,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 bt_fake,
                 score_fake,
                 sl_fake,
+                bases_fake,
+                cutlass.Int32(0),
                 fake_stream,
                 options="--enable-tvm-ffi",
             )
@@ -9406,6 +9420,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             seq_lens: torch.Tensor,
             score: torch.Tensor,
             max_decode_query_len: int,
+            recv_bases: torch.Tensor,
+            shard_rank: int,
         ) -> None:
             """Score one decode step, compiling the kernel on first use.
 
@@ -9415,12 +9431,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
             captures will replay.
             """
             _, num_heads, head_dim = idx_q.shape
-            key = (idx_q.dtype, num_heads, max_decode_query_len, head_dim)
+            key = (idx_q.dtype, num_heads, max_decode_query_len, head_dim,
+                   recv_bases.numel())
             if key not in cls.kernel_cache:
-                cls._compile(idx_q.dtype, num_heads, max_decode_query_len,
-                             head_dim)
+                cls._compile(*key)
             cls.kernel_cache[key](idx_q, index_k_cache, block_table, score,
-                                  seq_lens)
+                                  seq_lens, recv_bases, shard_rank)
 
     @torch.library.custom_op("trtllm::cute_dsl_minimax_m3_index_decode_score",
                              mutates_args=("score", ),
@@ -9432,6 +9448,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
         seq_lens: torch.Tensor,
         score: torch.Tensor,
         max_decode_query_len: int,
+        recv_bases: Optional[torch.Tensor] = None,
+        shard_rank: int = 0,
     ) -> None:
         """Write per-block max index scores for one decode step, in place.
 
@@ -9450,6 +9468,13 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 passed without a copy.
             max_decode_query_len: compile-time bound on decode_query_len;
                 num_index_heads * max_decode_query_len must not exceed 32.
+            recv_bases: [W] int64 base addresses of every TP rank's receive
+                slots, for the TP split: index_k_cache then holds the
+                page_size / W rows shard_rank, shard_rank + W, ... of each page,
+                and the partials of head h go to rank h // (num_index_heads / W)
+                at the offset of (shard_rank, h % (num_index_heads / W), token,
+                block) in score, this rank's [W, num_index_heads / W, total_q,
+                max_blocks] receive slots.
         """
         if not is_sm_100f():
             raise ValueError(
@@ -9474,6 +9499,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
             seq_lens,
             score,
             max_decode_query_len,
+            # Unsplit, the kernel ignores the bases.
+            seq_lens.new_empty(1, dtype=torch.int64)
+            if recv_bases is None else recv_bases,
+            shard_rank,
         )
 
     @torch.library.register_fake(
@@ -9485,6 +9514,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
         seq_lens: torch.Tensor,
         score: torch.Tensor,
         max_decode_query_len: int,
+        recv_bases: Optional[torch.Tensor] = None,
+        shard_rank: int = 0,
     ) -> None:
         return None
 
