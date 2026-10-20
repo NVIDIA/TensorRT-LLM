@@ -73,6 +73,15 @@ __inline__ __device__ float block_reduce_sum(float val, float* ws)
     return val;
 }
 
+// bf16(p + bf16(a + b)) with IEEE round-to-nearest fp32 adds (no flush to zero
+// under --use_fast_math), i.e. the result of two bf16 tensor additions.
+__device__ __forceinline__ bf16_t add_rn(bf16_t a, bf16_t b)
+{
+    float sum;
+    asm("add.rn.f32 %0, %1, %2;" : "=f"(sum) : "f"(__bfloat162float(a)), "f"(__bfloat162float(b)));
+    return __float2bfloat16_rn(sum);
+}
+
 __device__ __forceinline__ bf16_t apply_output_rms_norm(bf16_t value, float rsigma, bf16_t weight)
 {
     // Preserve KimiK3RMSNorm semantics: normalize in FP32, round to the
@@ -1041,12 +1050,14 @@ static void launch_fwd(bf16_t const* block_residual, bf16_t const* layer_residua
 // N=2/3/4, packed BF16 V remains in registers across the statistics/softmax
 // boundary. The fused output is retained in registers for the trailing
 // RMSNorm, preserving the BF16 boundary without a shared-memory round trip.
-template <int N, bool FUSE_OUTPUT_RMS_NORM = false, bool FUSE_LAYER_ADD = false, bool ENABLE_PDL = false>
+template <int N, bool FUSE_OUTPUT_RMS_NORM = false, bool FUSE_LAYER_ADD = false, bool ENABLE_PDL = false,
+    bool FUSE_LAYER_ADD2 = false>
 __global__ void __launch_bounds__(256, 1) attn_res_fwd_s1_single_cta_kernel(bf16_t const* __restrict__ block_res,
-    bf16_t const* __restrict__ layer_res, bf16_t const* __restrict__ layer_res_add, bf16_t const* __restrict__ res_w,
-    bf16_t const* __restrict__ rms_w, bf16_t const* __restrict__ output_rms_w, bf16_t* __restrict__ updated_layer_res,
-    bf16_t* __restrict__ output, float* __restrict__ rsigma_out, float* __restrict__ probs_out,
-    float* __restrict__ logits_out, float rms_eps, float output_rms_eps, int num_tokens)
+    bf16_t const* __restrict__ layer_res, bf16_t const* __restrict__ layer_res_add,
+    bf16_t const* __restrict__ layer_res_add2, bf16_t const* __restrict__ res_w, bf16_t const* __restrict__ rms_w,
+    bf16_t const* __restrict__ output_rms_w, bf16_t* __restrict__ updated_layer_res, bf16_t* __restrict__ output,
+    float* __restrict__ rsigma_out, float* __restrict__ probs_out, float* __restrict__ logits_out, float rms_eps,
+    float output_rms_eps, int num_tokens)
 {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
     if constexpr (ENABLE_PDL)
@@ -1081,6 +1092,10 @@ __global__ void __launch_bounds__(256, 1) attn_res_fwd_s1_single_cta_kernel(bf16
     if constexpr (FUSE_LAYER_ADD)
     {
         layer_res_add += (size_t) token * H;
+        if constexpr (FUSE_LAYER_ADD2)
+        {
+            layer_res_add2 += (size_t) token * H;
+        }
         updated_layer_res += (size_t) token * H;
     }
     if (rsigma_out != nullptr)
@@ -1123,7 +1138,14 @@ __global__ void __launch_bounds__(256, 1) attn_res_fwd_s1_single_cta_kernel(bf16
             {
                 if (n == N - 1)
                 {
-                    packed_v = __float2bfloat16_rn(__bfloat162float(packed_v) + __bfloat162float(layer_res_add[h]));
+                    if constexpr (FUSE_LAYER_ADD2)
+                    {
+                        packed_v = add_rn(packed_v, add_rn(layer_res_add[h], layer_res_add2[h]));
+                    }
+                    else
+                    {
+                        packed_v = __float2bfloat16_rn(__bfloat162float(packed_v) + __bfloat162float(layer_res_add[h]));
+                    }
                     updated_layer_res[h] = packed_v;
                 }
             }
@@ -1331,15 +1353,17 @@ __global__ void __launch_bounds__(256, 1) attn_res_fwd_s1_single_cta_kernel(bf16
 #endif
 }
 
-template <int N, bool FUSE_OUTPUT_RMS_NORM = false, bool FUSE_LAYER_ADD = false>
+template <int N, bool FUSE_OUTPUT_RMS_NORM = false, bool FUSE_LAYER_ADD = false, bool FUSE_LAYER_ADD2 = false>
 static void launch_s1_single_cta(bf16_t const* block_residual, bf16_t const* layer_residual,
-    bf16_t const* layer_residual_add, bf16_t const* res_weight, bf16_t const* rms_weight,
-    bf16_t const* output_rms_weight, bf16_t* updated_layer_residual, bf16_t* output, float* rsigma, float* probs,
-    float* logits, float rms_eps, float output_rms_eps, int num_tokens, cudaStream_t stream)
+    bf16_t const* layer_residual_add, bf16_t const* layer_residual_add2, bf16_t const* res_weight,
+    bf16_t const* rms_weight, bf16_t const* output_rms_weight, bf16_t* updated_layer_residual, bf16_t* output,
+    float* rsigma, float* probs, float* logits, float rms_eps, float output_rms_eps, int num_tokens,
+    cudaStream_t stream)
 {
     if (tensorrt_llm::common::getEnvEnablePDL())
     {
-        auto kernel = &attn_res_fwd_s1_single_cta_kernel<N, FUSE_OUTPUT_RMS_NORM, FUSE_LAYER_ADD, true>;
+        auto kernel
+            = &attn_res_fwd_s1_single_cta_kernel<N, FUSE_OUTPUT_RMS_NORM, FUSE_LAYER_ADD, true, FUSE_LAYER_ADD2>;
         cudaLaunchConfig_t config{};
         config.gridDim = dim3(num_tokens);
         config.blockDim = dim3(256);
@@ -1349,16 +1373,16 @@ static void launch_s1_single_cta(bf16_t const* block_residual, bf16_t const* lay
         attribute.val.programmaticStreamSerializationAllowed = 1;
         config.attrs = &attribute;
         config.numAttrs = 1;
-        cudaLaunchKernelEx(&config, kernel, block_residual, layer_residual, layer_residual_add, res_weight, rms_weight,
-            output_rms_weight, updated_layer_residual, output, rsigma, probs, logits, rms_eps, output_rms_eps,
-            num_tokens);
+        cudaLaunchKernelEx(&config, kernel, block_residual, layer_residual, layer_residual_add, layer_residual_add2,
+            res_weight, rms_weight, output_rms_weight, updated_layer_residual, output, rsigma, probs, logits, rms_eps,
+            output_rms_eps, num_tokens);
     }
     else
     {
-        attn_res_fwd_s1_single_cta_kernel<N, FUSE_OUTPUT_RMS_NORM, FUSE_LAYER_ADD, false>
-            <<<num_tokens, 256, 0, stream>>>(block_residual, layer_residual, layer_residual_add, res_weight, rms_weight,
-                output_rms_weight, updated_layer_residual, output, rsigma, probs, logits, rms_eps, output_rms_eps,
-                num_tokens);
+        attn_res_fwd_s1_single_cta_kernel<N, FUSE_OUTPUT_RMS_NORM, FUSE_LAYER_ADD, false, FUSE_LAYER_ADD2>
+            <<<num_tokens, 256, 0, stream>>>(block_residual, layer_residual, layer_residual_add, layer_residual_add2,
+                res_weight, rms_weight, output_rms_weight, updated_layer_residual, output, rsigma, probs, logits,
+                rms_eps, output_rms_eps, num_tokens);
     }
 }
 
@@ -1367,20 +1391,21 @@ static void launch_s1_single_cta(bf16_t const* block_residual, bf16_t const* lay
     bf16_t const* rms_weight, bf16_t* output, float* rsigma, float* probs, float* logits, float rms_eps, int num_tokens,
     cudaStream_t stream)
 {
-    launch_s1_single_cta<N, false, false>(block_residual, layer_residual, nullptr, res_weight, rms_weight, nullptr,
-        nullptr, output, rsigma, probs, logits, rms_eps, 0.f, num_tokens, stream);
+    launch_s1_single_cta<N, false, false>(block_residual, layer_residual, nullptr, nullptr, res_weight, rms_weight,
+        nullptr, nullptr, output, rsigma, probs, logits, rms_eps, 0.f, num_tokens, stream);
 }
 
 // Single-token split-K specialization.  The complete grid is one CTA cluster:
 // rank g owns a disjoint H/GROUPS slice, keeps that slice of FP32 V in its
 // rank-local shared memory, and exchanges only (square, dot) partials via DSM.
 template <int N, int GROUPS = 8, bool FUSE_OUTPUT_RMS_NORM = false, bool FUSE_LAYER_ADD = false,
-    bool ENABLE_PDL = false>
+    bool ENABLE_PDL = false, bool FUSE_LAYER_ADD2 = false>
 __global__ void __launch_bounds__(256, 1) attn_res_fwd_s1_splitk_kernel(bf16_t const* __restrict__ block_res,
-    bf16_t const* __restrict__ layer_res, bf16_t const* __restrict__ layer_res_add, bf16_t const* __restrict__ res_w,
-    bf16_t const* __restrict__ rms_w, bf16_t const* __restrict__ output_rms_w, bf16_t* __restrict__ updated_layer_res,
-    bf16_t* __restrict__ output, float* __restrict__ rsigma_out, float* __restrict__ probs_out,
-    float* __restrict__ logits_out, float rms_eps, float output_rms_eps, int num_tokens)
+    bf16_t const* __restrict__ layer_res, bf16_t const* __restrict__ layer_res_add,
+    bf16_t const* __restrict__ layer_res_add2, bf16_t const* __restrict__ res_w, bf16_t const* __restrict__ rms_w,
+    bf16_t const* __restrict__ output_rms_w, bf16_t* __restrict__ updated_layer_res, bf16_t* __restrict__ output,
+    float* __restrict__ rsigma_out, float* __restrict__ probs_out, float* __restrict__ logits_out, float rms_eps,
+    float output_rms_eps, int num_tokens)
 {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
     if constexpr (ENABLE_PDL)
@@ -1422,6 +1447,10 @@ __global__ void __launch_bounds__(256, 1) attn_res_fwd_s1_splitk_kernel(bf16_t c
     if constexpr (FUSE_LAYER_ADD)
     {
         layer_res_add += (size_t) token * H;
+        if constexpr (FUSE_LAYER_ADD2)
+        {
+            layer_res_add2 += (size_t) token * H;
+        }
         updated_layer_res += (size_t) token * H;
     }
     if (rsigma_out != nullptr)
@@ -1455,7 +1484,14 @@ __global__ void __launch_bounds__(256, 1) attn_res_fwd_s1_splitk_kernel(bf16_t c
             {
                 if (n == N - 1)
                 {
-                    packed_v = __float2bfloat16_rn(__bfloat162float(packed_v) + __bfloat162float(layer_res_add[h]));
+                    if constexpr (FUSE_LAYER_ADD2)
+                    {
+                        packed_v = add_rn(packed_v, add_rn(layer_res_add[h], layer_res_add2[h]));
+                    }
+                    else
+                    {
+                        packed_v = __float2bfloat16_rn(__bfloat162float(packed_v) + __bfloat162float(layer_res_add[h]));
+                    }
                     updated_layer_res[h] = packed_v;
                 }
             }
@@ -1648,19 +1684,22 @@ __global__ void __launch_bounds__(256, 1) attn_res_fwd_s1_splitk_kernel(bf16_t c
 #endif
 }
 
-template <int N, int GROUPS = 8, bool FUSE_OUTPUT_RMS_NORM = false, bool FUSE_LAYER_ADD = false>
+template <int N, int GROUPS = 8, bool FUSE_OUTPUT_RMS_NORM = false, bool FUSE_LAYER_ADD = false,
+    bool FUSE_LAYER_ADD2 = false>
 static void launch_s1_splitk(bf16_t const* block_residual, bf16_t const* layer_residual,
-    bf16_t const* layer_residual_add, bf16_t const* res_weight, bf16_t const* rms_weight,
-    bf16_t const* output_rms_weight, bf16_t* updated_layer_residual, bf16_t* output, float* rsigma, float* probs,
-    float* logits, float rms_eps, float output_rms_eps, int num_tokens, cudaStream_t stream)
+    bf16_t const* layer_residual_add, bf16_t const* layer_residual_add2, bf16_t const* res_weight,
+    bf16_t const* rms_weight, bf16_t const* output_rms_weight, bf16_t* updated_layer_residual, bf16_t* output,
+    float* rsigma, float* probs, float* logits, float rms_eps, float output_rms_eps, int num_tokens,
+    cudaStream_t stream)
 {
     constexpr int K_PER_CTA = 7168 / GROUPS;
     constexpr int WARPS = 8;
     constexpr size_t smem_size
         = (size_t) N * K_PER_CTA * sizeof(float) + (size_t) WARPS * N * sizeof(float2) + (size_t) N * sizeof(float);
     bool const enable_pdl = tensorrt_llm::common::getEnvEnablePDL();
-    auto kernel = enable_pdl ? &attn_res_fwd_s1_splitk_kernel<N, GROUPS, FUSE_OUTPUT_RMS_NORM, FUSE_LAYER_ADD, true>
-                             : &attn_res_fwd_s1_splitk_kernel<N, GROUPS, FUSE_OUTPUT_RMS_NORM, FUSE_LAYER_ADD, false>;
+    auto kernel = enable_pdl
+        ? &attn_res_fwd_s1_splitk_kernel<N, GROUPS, FUSE_OUTPUT_RMS_NORM, FUSE_LAYER_ADD, true, FUSE_LAYER_ADD2>
+        : &attn_res_fwd_s1_splitk_kernel<N, GROUPS, FUSE_OUTPUT_RMS_NORM, FUSE_LAYER_ADD, false, FUSE_LAYER_ADD2>;
     static std::once_flag attrs_set[2][64];
     int dev = 0;
     TLLM_CUDA_CHECK(cudaGetDevice(&dev));
@@ -1676,9 +1715,9 @@ static void launch_s1_splitk(bf16_t const* block_residual, bf16_t const* layer_r
         set_attr();
     }
     void* args[] = {const_cast<bf16_t**>(&block_residual), const_cast<bf16_t**>(&layer_residual),
-        const_cast<bf16_t**>(&layer_residual_add), const_cast<bf16_t**>(&res_weight), const_cast<bf16_t**>(&rms_weight),
-        const_cast<bf16_t**>(&output_rms_weight), &updated_layer_residual, &output, &rsigma, &probs, &logits, &rms_eps,
-        &output_rms_eps, &num_tokens};
+        const_cast<bf16_t**>(&layer_residual_add), const_cast<bf16_t**>(&layer_residual_add2),
+        const_cast<bf16_t**>(&res_weight), const_cast<bf16_t**>(&rms_weight), const_cast<bf16_t**>(&output_rms_weight),
+        &updated_layer_residual, &output, &rsigma, &probs, &logits, &rms_eps, &output_rms_eps, &num_tokens};
     cudaLaunchConfig_t config{};
     // One cluster per token. clusterDim stays GROUPS, so clusters are contiguous
     // spans of the grid and each token's DSM exchange stays within its own.
@@ -1706,8 +1745,8 @@ static void launch_s1_splitk(bf16_t const* block_residual, bf16_t const* layer_r
     bf16_t const* rms_weight, bf16_t* output, float* rsigma, float* probs, float* logits, float rms_eps, int num_tokens,
     cudaStream_t stream)
 {
-    launch_s1_splitk<N, GROUPS, false, false>(block_residual, layer_residual, nullptr, res_weight, rms_weight, nullptr,
-        nullptr, output, rsigma, probs, logits, rms_eps, 0.f, num_tokens, stream);
+    launch_s1_splitk<N, GROUPS, false, false>(block_residual, layer_residual, nullptr, nullptr, res_weight, rms_weight,
+        nullptr, nullptr, output, rsigma, probs, logits, rms_eps, 0.f, num_tokens, stream);
 }
 
 template <int H, int TB_TILE>
@@ -1880,45 +1919,48 @@ void invokeAttnResFwd(AttnResFwdParams const& params, cudaStream_t stream)
     }
 }
 
-template <int N, bool FUSE_LAYER_ADD>
+template <int N, bool FUSE_LAYER_ADD, bool FUSE_LAYER_ADD2>
 static void launchAttnResDecodeRmsNorm(AttnResFwdParams const& params, cudaStream_t stream)
 {
     using namespace sm100::fwd_prod_v2;
 
     auto const* layer_residual_add = FUSE_LAYER_ADD ? params.layerResidualAdd : nullptr;
+    auto const* layer_residual_add2 = FUSE_LAYER_ADD2 ? params.layerResidualAdd2 : nullptr;
     auto* updated_layer_residual = FUSE_LAYER_ADD ? params.updatedLayerResidual : nullptr;
 
     if constexpr (N <= 4)
     {
-        launch_s1_single_cta<N, true, FUSE_LAYER_ADD>(params.blockResidual, params.layerResidual, layer_residual_add,
-            params.resWeight, params.rmsWeight, params.outputRmsWeight, updated_layer_residual, params.output, nullptr,
-            nullptr, nullptr, params.rmsEps, params.outputRmsEps, params.seqLen, stream);
+        launch_s1_single_cta<N, true, FUSE_LAYER_ADD, FUSE_LAYER_ADD2>(params.blockResidual, params.layerResidual,
+            layer_residual_add, layer_residual_add2, params.resWeight, params.rmsWeight, params.outputRmsWeight,
+            updated_layer_residual, params.output, nullptr, nullptr, nullptr, params.rmsEps, params.outputRmsEps,
+            params.seqLen, stream);
     }
     else
     {
-        launch_s1_splitk<N, 8, true, FUSE_LAYER_ADD>(params.blockResidual, params.layerResidual, layer_residual_add,
-            params.resWeight, params.rmsWeight, params.outputRmsWeight, updated_layer_residual, params.output, nullptr,
-            nullptr, nullptr, params.rmsEps, params.outputRmsEps, params.seqLen, stream);
+        launch_s1_splitk<N, 8, true, FUSE_LAYER_ADD, FUSE_LAYER_ADD2>(params.blockResidual, params.layerResidual,
+            layer_residual_add, layer_residual_add2, params.resWeight, params.rmsWeight, params.outputRmsWeight,
+            updated_layer_residual, params.output, nullptr, nullptr, nullptr, params.rmsEps, params.outputRmsEps,
+            params.seqLen, stream);
     }
 }
 
-template <bool FUSE_LAYER_ADD>
+template <bool FUSE_LAYER_ADD, bool FUSE_LAYER_ADD2 = false>
 static void invokeAttnResDecodeRmsNorm(AttnResFwdParams const& params, cudaStream_t stream)
 {
     switch (params.numCandidates)
     {
-    case 1: launchAttnResDecodeRmsNorm<1, FUSE_LAYER_ADD>(params, stream); break;
-    case 2: launchAttnResDecodeRmsNorm<2, FUSE_LAYER_ADD>(params, stream); break;
-    case 3: launchAttnResDecodeRmsNorm<3, FUSE_LAYER_ADD>(params, stream); break;
-    case 4: launchAttnResDecodeRmsNorm<4, FUSE_LAYER_ADD>(params, stream); break;
-    case 5: launchAttnResDecodeRmsNorm<5, FUSE_LAYER_ADD>(params, stream); break;
-    case 6: launchAttnResDecodeRmsNorm<6, FUSE_LAYER_ADD>(params, stream); break;
-    case 7: launchAttnResDecodeRmsNorm<7, FUSE_LAYER_ADD>(params, stream); break;
-    case 8: launchAttnResDecodeRmsNorm<8, FUSE_LAYER_ADD>(params, stream); break;
-    case 9: launchAttnResDecodeRmsNorm<9, FUSE_LAYER_ADD>(params, stream); break;
-    case 10: launchAttnResDecodeRmsNorm<10, FUSE_LAYER_ADD>(params, stream); break;
-    case 11: launchAttnResDecodeRmsNorm<11, FUSE_LAYER_ADD>(params, stream); break;
-    case 12: launchAttnResDecodeRmsNorm<12, FUSE_LAYER_ADD>(params, stream); break;
+    case 1: launchAttnResDecodeRmsNorm<1, FUSE_LAYER_ADD, FUSE_LAYER_ADD2>(params, stream); break;
+    case 2: launchAttnResDecodeRmsNorm<2, FUSE_LAYER_ADD, FUSE_LAYER_ADD2>(params, stream); break;
+    case 3: launchAttnResDecodeRmsNorm<3, FUSE_LAYER_ADD, FUSE_LAYER_ADD2>(params, stream); break;
+    case 4: launchAttnResDecodeRmsNorm<4, FUSE_LAYER_ADD, FUSE_LAYER_ADD2>(params, stream); break;
+    case 5: launchAttnResDecodeRmsNorm<5, FUSE_LAYER_ADD, FUSE_LAYER_ADD2>(params, stream); break;
+    case 6: launchAttnResDecodeRmsNorm<6, FUSE_LAYER_ADD, FUSE_LAYER_ADD2>(params, stream); break;
+    case 7: launchAttnResDecodeRmsNorm<7, FUSE_LAYER_ADD, FUSE_LAYER_ADD2>(params, stream); break;
+    case 8: launchAttnResDecodeRmsNorm<8, FUSE_LAYER_ADD, FUSE_LAYER_ADD2>(params, stream); break;
+    case 9: launchAttnResDecodeRmsNorm<9, FUSE_LAYER_ADD, FUSE_LAYER_ADD2>(params, stream); break;
+    case 10: launchAttnResDecodeRmsNorm<10, FUSE_LAYER_ADD, FUSE_LAYER_ADD2>(params, stream); break;
+    case 11: launchAttnResDecodeRmsNorm<11, FUSE_LAYER_ADD, FUSE_LAYER_ADD2>(params, stream); break;
+    case 12: launchAttnResDecodeRmsNorm<12, FUSE_LAYER_ADD, FUSE_LAYER_ADD2>(params, stream); break;
     // Previously `default: break;`, which launched nothing and returned success:
     // the output buffer kept whatever it already held and the failure surfaced,
     // if at all, as wrong numbers far downstream. N is bounded by the bank size
@@ -1940,6 +1982,11 @@ void invokeAttnResRmsNormFwd(AttnResFwdParams const& params, cudaStream_t stream
 void invokeAttnResAddRmsNormFwd(AttnResFwdParams const& params, cudaStream_t stream)
 {
     invokeAttnResDecodeRmsNorm<true>(params, stream);
+}
+
+void invokeAttnResAdd2RmsNormFwd(AttnResFwdParams const& params, cudaStream_t stream)
+{
+    invokeAttnResDecodeRmsNorm<true, true>(params, stream);
 }
 
 } // namespace kernels::kimiK3AttnRes
