@@ -22,8 +22,8 @@ from tensorrt_llm._torch.moe.fused_moe import (
     RenormalizeNaiveMoeRoutingMethod, SparseMixerMoeRoutingMethod,
     StaticMoeRoutingMethod, create_load_balanced_logits, create_moe)
 from tensorrt_llm._torch.moe.fused_moe import routing as moe_routing
-from tensorrt_llm._torch.moe.fused_moe.routing import \
-    get_cached_perfect_router_logits
+from tensorrt_llm._torch.moe.fused_moe.routing import (
+    get_cached_perfect_router_expert_ids, get_cached_perfect_router_logits)
 from tensorrt_llm._torch.nccl_window_tensor_scope import \
     discard_nccl_window_tensor_outputs
 from tensorrt_llm._utils import mpi_rank
@@ -634,6 +634,70 @@ def test_perfect_router_get_cached_logits_e2e(routing_name, shape):
                                                 dtype=dtype,
                                                 routing_method=routing)
     assert torch.equal(logits, logits_2)
+
+
+@pytest.mark.parametrize(
+    "num_experts,top_k,moe_ep_size",
+    [
+        pytest.param(64, 6, 4, id="small"),
+        pytest.param(384, 6, 8, id="dsv4_pro_ep8"),
+    ],
+)
+def test_perfect_router_expert_ids_balanced(num_experts, top_k, moe_ep_size):
+    """ENABLE_PERFECT_ROUTER=expert_ids: balanced ids for any token count.
+
+    Checks, on CPU, for every sender rank and a range of token counts:
+      - every EP rank and every expert receives an equal share of the routes,
+        within one;
+      - a token's routes land on distinct EP ranks and distinct experts;
+      - the ids for fewer tokens are a view of the leading rows of the cached
+        table, also after the table grows.
+    """
+    device = torch.device("cpu")
+    experts_per_rank = num_experts // moe_ep_size
+    moe_routing._PERFECT_ROUTER_EXPERT_IDS_CACHE.clear()
+
+    for ep_rank in range(moe_ep_size):
+        largest = None
+        for num_tokens in [1, 3, 7, 100, 1000, 8191]:
+            ids = get_cached_perfect_router_expert_ids(num_tokens=num_tokens,
+                                                       num_experts=num_experts,
+                                                       experts_per_token=top_k,
+                                                       moe_ep_size=moe_ep_size,
+                                                       ep_rank=ep_rank,
+                                                       device=device)
+            assert ids.shape == (num_tokens, top_k)
+            assert ids.dtype == torch.int32
+            assert ids.is_contiguous()
+
+            rank_counts = torch.bincount(ids.flatten() // experts_per_rank,
+                                         minlength=moe_ep_size)
+            assert rank_counts.max() - rank_counts.min() <= 1
+            expert_counts = torch.bincount(ids.flatten(), minlength=num_experts)
+            assert expert_counts.max() - expert_counts.min() <= 1
+
+            if top_k <= moe_ep_size:
+                ranks = ids // experts_per_rank
+                assert all(len(set(row)) == top_k for row in ranks.tolist())
+            assert all(len(set(row)) == top_k for row in ids.tolist())
+            largest = ids
+
+        # Growing the table keeps the leading rows, so cached views stay valid.
+        grown = get_cached_perfect_router_expert_ids(
+            num_tokens=2 * moe_routing._PERFECT_ROUTER_EXPERT_IDS_MIN_ROWS + 1,
+            num_experts=num_experts,
+            experts_per_token=top_k,
+            moe_ep_size=moe_ep_size,
+            ep_rank=ep_rank,
+            device=device)
+        assert torch.equal(grown[:largest.shape[0]], largest)
+        again = get_cached_perfect_router_expert_ids(num_tokens=5,
+                                                     num_experts=num_experts,
+                                                     experts_per_token=top_k,
+                                                     moe_ep_size=moe_ep_size,
+                                                     ep_rank=ep_rank,
+                                                     device=device)
+        assert again.data_ptr() == grown.data_ptr()
 
 
 # -----------------------------------------------------------------

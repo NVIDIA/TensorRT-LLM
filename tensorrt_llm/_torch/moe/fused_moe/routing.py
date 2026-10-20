@@ -15,6 +15,12 @@ from tensorrt_llm.llmapi.utils import enable_llm_debug
 
 # Global cache for perfect router logits shared across MoE modules
 _PERFECT_ROUTER_LOGITS_CACHE = {}
+# Global cache for perfect router expert-id tables shared across MoE modules,
+# keyed by expert geometry, sender rank and device
+_PERFECT_ROUTER_EXPERT_IDS_CACHE = {}
+# Initial expert-id table rows, enough for the per-rank token counts of typical
+# prefill chunks, so the table is normally built once, during warmup
+_PERFECT_ROUTER_EXPERT_IDS_MIN_ROWS = 16384
 
 
 def _get_perfect_router_cache_signature(routing_method):
@@ -232,6 +238,54 @@ def get_cached_perfect_router_logits(num_tokens: int, num_experts: int,
 
         _PERFECT_ROUTER_LOGITS_CACHE[cache_key] = logits
         return logits
+
+
+def get_cached_perfect_router_expert_ids(num_tokens: int, num_experts: int,
+                                         experts_per_token: int,
+                                         moe_ep_size: int, ep_rank: int,
+                                         device: torch.device) -> torch.Tensor:
+    """
+    Return perfectly balanced expert ids for ``num_tokens`` local tokens.
+
+    This is the ``ENABLE_PERFECT_ROUTER=expert_ids`` counterpart of
+    ``get_cached_perfect_router_logits``: instead of synthesizing logits for
+    the routing method to consume, it replaces the routed expert ids after
+    routing. It therefore also covers routers whose ids do not come from the
+    logits (DeepSeek-V4 hash layers) and needs no per-token-count planning.
+
+    The ids follow ``FlatTopKPerfectRouterPlanner._get_balanced_expert_indices``:
+    slot ``t * experts_per_token + j``, rotated by ``ep_rank``, goes to EP rank
+    ``slot % moe_ep_size`` and to expert ``(slot // moe_ep_size) %
+    (num_experts // moe_ep_size)`` on it. A slot's expert depends only on its
+    own index, so the ids for ``n`` tokens are the leading ``n`` rows of any
+    longer table. One table per geometry and device is built on first use and
+    grown by doubling; every call returns a view of its leading rows, with no
+    kernel launch.
+
+    Args:
+        num_tokens: Number of local tokens on the current EP rank.
+        num_experts: Total number of experts across all EP ranks.
+        experts_per_token: Number of experts selected for each token.
+        moe_ep_size: Number of EP ranks.
+        ep_rank: Sender EP rank used to rotate the assignment stream.
+        device: Device of the routed expert ids.
+
+    Returns:
+        torch.Tensor: Contiguous int32 expert ids of shape
+        ``[num_tokens, experts_per_token]``.
+    """
+    cache_key = (num_experts, experts_per_token, moe_ep_size, ep_rank, device)
+    table = _PERFECT_ROUTER_EXPERT_IDS_CACHE.get(cache_key)
+    if table is None or table.shape[0] < num_tokens:
+        if table is None:
+            num_rows = _PERFECT_ROUTER_EXPERT_IDS_MIN_ROWS
+        else:
+            num_rows = 2 * table.shape[0]
+        table = FlatTopKPerfectRouterPlanner._get_balanced_expert_indices(
+            max(num_rows, num_tokens), num_experts, experts_per_token,
+            moe_ep_size, ep_rank, device).to(torch.int32)
+        _PERFECT_ROUTER_EXPERT_IDS_CACHE[cache_key] = table
+    return table[:num_tokens]
 
 
 # The type of method in top-K routing, for use in torch custom op
