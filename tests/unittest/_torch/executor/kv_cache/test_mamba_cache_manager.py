@@ -5359,8 +5359,8 @@ def _v2_gdn_mtp_replay_stub() -> MambaHybridCacheManagerV2:
     mgr.kv_cache_map = {}
     mgr.ssm_layer_group_id = 0
     mgr._host_state_indices = torch.zeros(4, dtype=torch.int32)
-    mgr.cuda_state_indices = torch.zeros(4, dtype=torch.int32)
-    mgr._dummy_request_mask = None
+    mgr._state_indices_buffer = DeviceCopyBuffer(torch.zeros(4, dtype=torch.int32))
+    mgr._dummy_request_mask_buffer = None
     mgr.prev_num_accepted_tokens = torch.zeros(4, dtype=torch.int32)
     mgr.old_x, mgr.old_B, mgr.old_dt = [torch.zeros(1, 4, 2, 4) for _ in range(3)]
     mgr.all_conv_states = [torch.zeros(4, 6, 3)]
@@ -5453,7 +5453,9 @@ def test_v2_gdn_replay_flush_precedes_slot_release(indirect: bool, resume_slot: 
         -torch.rand(layers, slots, value_heads, capacity, device="cuda") * 0.1, dim=-1
     )
     mgr.prev_num_accepted_tokens = torch.zeros(slots, device="cuda", dtype=torch.int32)
-    mgr.cuda_state_indices = torch.zeros(slots, device="cuda", dtype=torch.int32)
+    mgr._state_indices_buffer = DeviceCopyBuffer(
+        torch.zeros(slots, device="cuda", dtype=torch.int32)
+    )
     mgr.replay_history_size = window
     mgr._stream = torch.cuda.Stream()
     mgr.local_num_mamba_layers = layers
