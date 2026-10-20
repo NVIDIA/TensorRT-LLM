@@ -248,11 +248,18 @@ the sender rank. The routing scales are left as computed.
 Use it where logits cannot steer the routing, for example the DeepSeek-V4 hash
 layers, which pick experts from the token IDs, or where the token count changes
 every iteration, as in context-only benchmarks: the IDs come from one cached
-table per expert geometry, so no logits are synthesized per token count.
+table per expert geometry, sized to `max_num_tokens`, so no logits are
+synthesized per token count.
 
-It applies to MoE backends that route through `ConfigurableMoE`, including
-`MEGAMOE_CUTEDSL`. With the load balancer off, the gap to a plain run bounds
-what any MoE load balancer can gain:
+It applies where the MoE scheduler computes the routed expert IDs outside the
+MoE kernel: always with `MEGAMOE_CUTEDSL`, `CUTLASS`, `DEEPGEMM` and `CUTEDSL`,
+and with other backends under attention DP or with DeepSeek-V4 routing. A
+backend that routes inside its kernel, such as `TRTLLM` without attention DP,
+has no routed expert IDs to replace: the mode logs a warning and has no effect
+there, so use `ENABLE_PERFECT_ROUTER=1` instead.
+
+With the load balancer off, the gap to a plain run bounds what any MoE load
+balancer can gain:
 
 ```bash
 # Learned routing, load balancer off
@@ -262,7 +269,8 @@ ENABLE_PERFECT_ROUTER=expert_ids trtllm-bench ...
 ```
 
 The layer-wise benchmarks (`examples/layer_wise_benchmarks`) accept the same
-environment variable with `--balance-method NotModified`.
+environment variable with `--balance-method NotModified` and without
+`--replay-file-path`, whose recorded routing would replace the balanced IDs.
 
 ### Supported Models
 

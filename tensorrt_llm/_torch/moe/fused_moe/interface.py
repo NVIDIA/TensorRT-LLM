@@ -392,7 +392,7 @@ class MoE(MoEExecutionContractMixin, MoEWeightOwnerMixin,
         # un-overridden default would be ``expert_size_per_partition =
         # num_experts`` (each rank allocating storage for every expert).
         self._init_dwdp_expert_layout()
-        self._init_perfect_router()
+        self._init_perfect_router(model_config)
 
     def _init_dwdp_expert_layout(self):
         """Override expert layout when DWDP is enabled.
@@ -466,13 +466,17 @@ class MoE(MoEExecutionContractMixin, MoEWeightOwnerMixin,
             return torch.float32
         return self.dtype if self.dtype is not None else torch.float32
 
-    def _init_perfect_router(self):
+    def _init_perfect_router(self, model_config: ModelConfig):
         # ENABLE_PERFECT_ROUTER=1 replaces the router logits before routing;
         # ENABLE_PERFECT_ROUTER=expert_ids replaces the routed expert ids after
         # routing. Both are for performance analysis only.
         perfect_router = os.environ.get("ENABLE_PERFECT_ROUTER", "0")
         self._enable_perfect_router = perfect_router == "1"
         self._enable_perfect_router_expert_ids = perfect_router == "expert_ids"
+        # No MoE call routes more local tokens than this. It sizes the
+        # expert-id table, which is built on the first call, not here: the
+        # module may still be on the meta device.
+        self._perfect_router_max_num_tokens = model_config.max_num_tokens
         if not self._enable_perfect_router:
             return
 
@@ -520,6 +524,7 @@ class MoE(MoEExecutionContractMixin, MoEWeightOwnerMixin,
             experts_per_token=experts_per_token,
             moe_ep_size=self.ep_size,
             ep_rank=self.ep_rank,
+            max_num_tokens=self._perfect_router_max_num_tokens,
             device=token_selected_experts.device)
 
     def _init_load_balancer(
