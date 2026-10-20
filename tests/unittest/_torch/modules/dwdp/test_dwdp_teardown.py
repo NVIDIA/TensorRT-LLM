@@ -22,6 +22,8 @@ import torch.nn as nn
 from tensorrt_llm._torch.modules.dwdp.setup import teardown_dwdp
 from tensorrt_llm._torch.modules.dwdp.weight_manager import DWDPWeightManager
 
+pytestmark = pytest.mark.cpu_only
+
 
 def test_weight_manager_release_is_ordered_and_idempotent():
     manager = DWDPWeightManager.__new__(DWDPWeightManager)
