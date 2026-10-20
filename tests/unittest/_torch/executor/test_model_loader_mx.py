@@ -34,7 +34,7 @@ from tensorrt_llm._torch.models.modeling_utils import get_registered_model_class
 from tensorrt_llm._torch.modules.linear import Linear, WeightMode
 from tensorrt_llm._torch.pyexecutor import model_loader as model_loader_mod
 from tensorrt_llm._torch.pyexecutor.model_loader import ModelLoader
-from tensorrt_llm._torch.pyexecutor.weight_sources import model_hooks
+from tensorrt_llm._torch.pyexecutor.weight_sources import model_hooks, post_transform
 from tensorrt_llm._torch.weight_sharing import (
     ARTIFACT_IDENTITY_FORMAT_VERSION,
     LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1,
@@ -49,11 +49,12 @@ from tensorrt_llm._torch.weight_sharing import (
     PostTransformRuntimeConfig,
     PostTransformRuntimeConstraints,
     PostTransformTransferScope,
+    SourceIdentity,
     load_weight_manifest,
 )
 from tensorrt_llm.llmapi.llm_args import LoadFormat
 
-_SOURCE_IDENTITY = model_loader_mod.SourceIdentity(
+_SOURCE_IDENTITY = SourceIdentity(
     format_version=SOURCE_IDENTITY_FORMAT_VERSION,
     artifact_identity=ArtifactIdentity(
         format_version=ARTIFACT_IDENTITY_FORMAT_VERSION,
@@ -538,7 +539,7 @@ def _tiny_profile_registry(*, speculative_mode: str | None = None) -> PostTransf
                 architecture="TinyForCausalLM",
                 model_type="tiny",
                 speculative_mode=speculative_mode,
-                protocol_version=(ModelLoader._MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION),
+                protocol_version=(post_transform.MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION),
                 transform_abi_id=LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1,
                 transfer_scope=PostTransformTransferScope.TARGET_MODEL,
                 runtime_constraints=PostTransformRuntimeConstraints(),
@@ -585,7 +586,7 @@ def _make_loader(monkeypatch, *, events, spec_config=None):
         return _SOURCE_IDENTITY.artifact_identity
 
     monkeypatch.setattr(
-        model_loader_mod.ArtifactIdentity,
+        ArtifactIdentity,
         "from_checkpoint",
         classmethod(_build_artifact_identity),
     )
@@ -598,7 +599,7 @@ def _make_loader(monkeypatch, *, events, spec_config=None):
         )
 
     monkeypatch.setattr(
-        model_loader_mod.SourceIdentity,
+        SourceIdentity,
         "from_model_config",
         classmethod(_build_source_identity),
     )
@@ -683,7 +684,7 @@ def _documented_dense_constraints(profile: PostTransformProfile) -> str:
 
 @pytest.mark.cpu_only
 def test_public_support_table_matches_qualified_profile_registry() -> None:
-    profiles = ModelLoader._post_transform_profile_registry().profiles
+    profiles = post_transform.POST_TRANSFORM_PROFILE_REGISTRY.profiles
     documentation = (Path(__file__).parents[4] / "docs/source/features/model-express.md").read_text(
         encoding="utf-8"
     )
@@ -718,8 +719,8 @@ def test_mx_success_initializes_mapper_skips_weight_mapping_and_reload_works(
     events = []
     loader = _make_loader(monkeypatch, events=events)
     monkeypatch.setattr(
-        ModelLoader,
-        "_POST_TRANSFORM_PROFILE_REGISTRY",
+        post_transform,
+        "POST_TRANSFORM_PROFILE_REGISTRY",
         _tiny_profile_registry(),
     )
     checkpoint_loader = MagicMock(name="checkpoint_loader")
@@ -741,7 +742,7 @@ def test_mx_success_initializes_mapper_skips_weight_mapping_and_reload_works(
     assert kwargs["load_config"] is loader.llm_args
     assert (
         kwargs["post_transform_protocol_version"]
-        == ModelLoader._MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION
+        == post_transform.MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION
     )
     assert kwargs["allow_post_transform_weights"] is True
     assert loader._source_identity.transform_abi_id == LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1
@@ -858,8 +859,8 @@ def test_mx_partial_fallback_merges_returned_weights(
     events = []
     loader = _make_loader(monkeypatch, events=events)
     monkeypatch.setattr(
-        ModelLoader,
-        "_POST_TRANSFORM_PROFILE_REGISTRY",
+        post_transform,
+        "POST_TRANSFORM_PROFILE_REGISTRY",
         _tiny_profile_registry(),
     )
     checkpoint_loader = MagicMock(name="checkpoint_loader")
@@ -924,8 +925,8 @@ def test_mx_post_transform_receiver_uses_staged_path_when_qualified(
     events = []
     loader = _make_loader(monkeypatch, events=events)
     monkeypatch.setattr(
-        ModelLoader,
-        "_POST_TRANSFORM_PROFILE_REGISTRY",
+        post_transform,
+        "POST_TRANSFORM_PROFILE_REGISTRY",
         _tiny_profile_registry(),
     )
     checkpoint_loader = _PostTransformMxLoader(post_transform=True)
@@ -942,7 +943,7 @@ def test_mx_post_transform_receiver_uses_staged_path_when_qualified(
     assert kwargs["load_config"] is loader.llm_args
     assert (
         kwargs["post_transform_protocol_version"]
-        == ModelLoader._MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION
+        == post_transform.MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION
     )
     assert callable(kwargs["prepare_post_transform_receiver"])
     checkpoint_loader.post_load_publish.assert_called_once_with(
@@ -970,7 +971,7 @@ def test_default_profile_qualifies_real_tiny_llama_lifecycle(
             monkeypatch,
             model_class=_UnqualifiedLlamaForCausalLM,
         ),
-        qualify_model=lambda model: ModelLoader._qualify_post_transform_profile(
+        qualify_model=lambda model: post_transform.qualify_post_transform_profile(
             model,
             speculative_mode=None,
             loads_draft_weights=False,
@@ -1008,7 +1009,7 @@ def test_default_profile_qualifies_real_tiny_llama_tp2_rank_lifecycle(
             tp_size=2,
             rank=rank,
         ),
-        qualify_model=lambda model: ModelLoader._qualify_post_transform_profile(
+        qualify_model=lambda model: post_transform.qualify_post_transform_profile(
             model,
             speculative_mode=None,
             loads_draft_weights=False,
@@ -1035,7 +1036,7 @@ def test_qwen2_dense_profile_qualifies_full_staged_lifecycle() -> None:
         unqualified_model_factory=lambda: _tiny_qwen2_model(
             model_class=_UnqualifiedQwen2ForCausalLM
         ),
-        qualify_model=lambda model: ModelLoader._qualify_post_transform_profile(
+        qualify_model=lambda model: post_transform.qualify_post_transform_profile(
             model,
             speculative_mode=None,
             loads_draft_weights=False,
@@ -1072,7 +1073,7 @@ def test_qwen2_dense_profile_rejects_effective_unfused_rope() -> None:
         kv_cache_compression_config=SimpleNamespace(changes_physical_kv_length=True)
     )
 
-    decision = ModelLoader._qualify_post_transform_profile(
+    decision = post_transform.qualify_post_transform_profile(
         model,
         speculative_mode=None,
         loads_draft_weights=False,
@@ -1099,7 +1100,7 @@ def test_qwen2_dense_profile_qualifies_tp2_rank_lifecycle(
             tp_size=2,
             rank=rank,
         ),
-        qualify_model=lambda model: ModelLoader._qualify_post_transform_profile(
+        qualify_model=lambda model: post_transform.qualify_post_transform_profile(
             model,
             speculative_mode=None,
             loads_draft_weights=False,
@@ -1134,7 +1135,7 @@ def test_qwen3_dense_profile_qualifies_full_staged_lifecycle(
             monkeypatch,
             model_class=_UnqualifiedQwen3ForCausalLM,
         ),
-        qualify_model=lambda model: ModelLoader._qualify_post_transform_profile(
+        qualify_model=lambda model: post_transform.qualify_post_transform_profile(
             model,
             speculative_mode=None,
             loads_draft_weights=False,
@@ -1188,7 +1189,7 @@ def test_qwen3_dense_profile_qualifies_tp2_rank_lifecycle(
             tp_size=2,
             rank=rank,
         ),
-        qualify_model=lambda model: ModelLoader._qualify_post_transform_profile(
+        qualify_model=lambda model: post_transform.qualify_post_transform_profile(
             model,
             speculative_mode=None,
             loads_draft_weights=False,
@@ -1221,7 +1222,7 @@ def test_mistral_dense_profile_qualifies_full_staged_lifecycle() -> None:
         unqualified_model_factory=lambda: _tiny_mistral_model(
             model_class=_UnqualifiedMistralForCausalLM
         ),
-        qualify_model=lambda model: ModelLoader._qualify_post_transform_profile(
+        qualify_model=lambda model: post_transform.qualify_post_transform_profile(
             model,
             speculative_mode=None,
             loads_draft_weights=False,
@@ -1268,7 +1269,7 @@ def test_mistral_dense_profile_qualifies_tp2_rank_lifecycle(
             tp_size=2,
             rank=rank,
         ),
-        qualify_model=lambda model: ModelLoader._qualify_post_transform_profile(
+        qualify_model=lambda model: post_transform.qualify_post_transform_profile(
             model,
             speculative_mode=None,
             loads_draft_weights=False,
@@ -1313,7 +1314,7 @@ def test_mistral_dense_profile_rejects_sliding_window_models(
 ) -> None:
     model = _tiny_mistral_model(sliding_window=sliding_window, layer_types=layer_types)
 
-    decision = ModelLoader._qualify_post_transform_profile(
+    decision = post_transform.qualify_post_transform_profile(
         model,
         speculative_mode=None,
         loads_draft_weights=False,
@@ -1334,7 +1335,7 @@ def test_mistral_dense_profile_qualifies_full_attention_layer_types() -> None:
         layer_types=("full_attention", "full_attention"),
     )
 
-    decision = ModelLoader._qualify_post_transform_profile(
+    decision = post_transform.qualify_post_transform_profile(
         model,
         speculative_mode=None,
         loads_draft_weights=False,
@@ -1354,12 +1355,12 @@ def test_legacy_llama_file_mistral_root_is_not_qualified() -> None:
         get_registered_model_class("MistralForCausalLM") is modeling_mistral_mod.MistralForCausalLM
     )
 
-    decision = ModelLoader._post_transform_profile_registry().qualify(
+    decision = post_transform.POST_TRANSFORM_PROFILE_REGISTRY.qualify(
         root_model_class=legacy_root,
         architecture="MistralForCausalLM",
         model_type="mistral",
         speculative_mode=None,
-        protocol_version=ModelLoader._MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION,
+        protocol_version=post_transform.MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION,
         transfer_scope=PostTransformTransferScope.TARGET_MODEL,
         runtime_config=_bf16_dense_runtime_config(sliding_window="none"),
     )
@@ -1370,12 +1371,12 @@ def test_legacy_llama_file_mistral_root_is_not_qualified() -> None:
 
 @pytest.mark.cpu_only
 def test_mistral_dense_profile_rejects_native_format_model_type() -> None:
-    decision = ModelLoader._post_transform_profile_registry().qualify(
+    decision = post_transform.POST_TRANSFORM_PROFILE_REGISTRY.qualify(
         root_model_class=modeling_mistral_mod.MistralForCausalLM,
         architecture="MistralForCausalLM",
         model_type="mistral_common",
         speculative_mode=None,
-        protocol_version=ModelLoader._MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION,
+        protocol_version=post_transform.MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION,
         transfer_scope=PostTransformTransferScope.TARGET_MODEL,
         runtime_config=_bf16_dense_runtime_config(sliding_window="none"),
     )
@@ -1493,12 +1494,12 @@ def test_bf16_dense_profiles_reject_unqualified_runtime_variants(
     supported_rope_fusion: bool,
     supported_sliding_window: str | None,
 ) -> None:
-    decision = ModelLoader._post_transform_profile_registry().qualify(
+    decision = post_transform.POST_TRANSFORM_PROFILE_REGISTRY.qualify(
         root_model_class=root_model_class,
         architecture=architecture,
         model_type=model_type,
         speculative_mode=None,
-        protocol_version=ModelLoader._MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION,
+        protocol_version=post_transform.MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION,
         transfer_scope=PostTransformTransferScope.TARGET_MODEL,
         runtime_config=_bf16_dense_runtime_config(
             rope_fusion=supported_rope_fusion,
@@ -1565,12 +1566,12 @@ def test_bf16_dense_profiles_reject_wrong_realized_dimension(
     realized_overrides: dict[str, object],
     expected_dimension: str,
 ) -> None:
-    decision = ModelLoader._post_transform_profile_registry().qualify(
+    decision = post_transform.POST_TRANSFORM_PROFILE_REGISTRY.qualify(
         root_model_class=root_model_class,
         architecture=architecture,
         model_type=model_type,
         speculative_mode=None,
-        protocol_version=ModelLoader._MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION,
+        protocol_version=post_transform.MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION,
         transfer_scope=PostTransformTransferScope.TARGET_MODEL,
         runtime_config=_bf16_dense_runtime_config(**realized_overrides),
     )
@@ -1641,12 +1642,12 @@ def test_bf16_dense_profiles_ignore_moe_only_runtime_dimensions(
     supported_rope_fusion: bool,
     supported_sliding_window: str | None,
 ) -> None:
-    decision = ModelLoader._post_transform_profile_registry().qualify(
+    decision = post_transform.POST_TRANSFORM_PROFILE_REGISTRY.qualify(
         root_model_class=root_model_class,
         architecture=architecture,
         model_type=model_type,
         speculative_mode=None,
-        protocol_version=ModelLoader._MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION,
+        protocol_version=post_transform.MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION,
         transfer_scope=PostTransformTransferScope.TARGET_MODEL,
         runtime_config=_bf16_dense_runtime_config(
             rope_fusion=supported_rope_fusion,
@@ -1682,12 +1683,12 @@ def test_separate_draft_model_is_not_qualified_by_target_only_profile(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
-        ModelLoader,
-        "_POST_TRANSFORM_PROFILE_REGISTRY",
+        post_transform,
+        "POST_TRANSFORM_PROFILE_REGISTRY",
         _tiny_profile_registry(speculative_mode="eagle3_one_model"),
     )
 
-    decision = ModelLoader._qualify_post_transform_profile(
+    decision = post_transform.qualify_post_transform_profile(
         _TinyModel([]),
         speculative_mode="eagle3_one_model",
         loads_draft_weights=True,
@@ -1742,12 +1743,12 @@ def test_one_engine_speculative_mode_is_not_qualified_by_target_only_profile(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
-        ModelLoader,
-        "_POST_TRANSFORM_PROFILE_REGISTRY",
+        post_transform,
+        "POST_TRANSFORM_PROFILE_REGISTRY",
         _tiny_profile_registry(),
     )
 
-    decision = ModelLoader._qualify_post_transform_profile(
+    decision = post_transform.qualify_post_transform_profile(
         _TinyModel([]),
         speculative_mode="mtp",
         loads_draft_weights=False,
@@ -1764,17 +1765,17 @@ def test_speculative_mode_name_is_canonical_and_fails_closed(
 ) -> None:
     warning = MagicMock()
     monkeypatch.setattr(model_loader_mod.logger, "warning", warning)
-    assert ModelLoader._speculative_mode_name(None) is None
+    assert post_transform.speculative_mode_name(None) is None
     warning.assert_not_called()
     assert (
-        ModelLoader._speculative_mode_name(
+        post_transform.speculative_mode_name(
             SimpleNamespace(spec_dec_mode=SimpleNamespace(name="MTP"))
         )
         == "mtp"
     )
     warning.assert_not_called()
     assert (
-        ModelLoader._speculative_mode_name(SimpleNamespace(spec_dec_mode=SimpleNamespace()))
+        post_transform.speculative_mode_name(SimpleNamespace(spec_dec_mode=SimpleNamespace()))
         == "unknown"
     )
     warning.assert_called_once_with(
@@ -1797,8 +1798,8 @@ def test_mx_post_transform_receiver_falls_back_for_unqualified_model(
     loader = _make_loader(monkeypatch, events=events)
     if qualification_case == "locality_domain-feature":
         monkeypatch.setattr(
-            ModelLoader,
-            "_POST_TRANSFORM_PROFILE_REGISTRY",
+            post_transform,
+            "POST_TRANSFORM_PROFILE_REGISTRY",
             _tiny_profile_registry(),
         )
         model = _TinyModel(events)
@@ -1833,8 +1834,8 @@ def test_load_qualifies_with_preconstruction_identity_after_model_normalization(
     loader = _make_loader(monkeypatch, events=events)
     registry = MagicMock(wraps=_tiny_profile_registry())
     monkeypatch.setattr(
-        ModelLoader,
-        "_POST_TRANSFORM_PROFILE_REGISTRY",
+        post_transform,
+        "POST_TRANSFORM_PROFILE_REGISTRY",
         registry,
     )
     normalized_model = _TinyModel(events)
@@ -1883,8 +1884,8 @@ def test_mx_fallback_runs_standard_weight_mapping(
     events = []
     loader = _make_loader(monkeypatch, events=events)
     monkeypatch.setattr(
-        ModelLoader,
-        "_POST_TRANSFORM_PROFILE_REGISTRY",
+        post_transform,
+        "POST_TRANSFORM_PROFILE_REGISTRY",
         _tiny_profile_registry(),
     )
     checkpoint_loader = MagicMock(name="checkpoint_loader")
@@ -1910,21 +1911,21 @@ def test_mx_artifact_identity_failure_falls_back_to_disk(monkeypatch):
     events = []
     loader = _make_loader(monkeypatch, events=events)
     monkeypatch.setattr(
-        ModelLoader,
-        "_POST_TRANSFORM_PROFILE_REGISTRY",
+        post_transform,
+        "POST_TRANSFORM_PROFILE_REGISTRY",
         _tiny_profile_registry(),
     )
     artifact_error = ValueError(
         "Checkpoint manifests do not support nested symlinked directories: /ckpt/shards"
     )
     monkeypatch.setattr(
-        model_loader_mod.ArtifactIdentity,
+        ArtifactIdentity,
         "from_checkpoint",
         MagicMock(side_effect=artifact_error),
     )
     source_identity_factory = MagicMock()
     monkeypatch.setattr(
-        model_loader_mod.SourceIdentity,
+        SourceIdentity,
         "from_model_config",
         source_identity_factory,
     )
