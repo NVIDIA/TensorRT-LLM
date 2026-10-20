@@ -13,7 +13,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import atexit
+import collections
 import concurrent.futures
+import copy
 import json
 import os
 import shutil
@@ -21,7 +23,7 @@ import tempfile
 import threading
 import time
 import weakref
-from queue import Empty
+from queue import Empty, Queue
 from typing import Dict, List, Optional, Union
 
 import torch
@@ -98,6 +100,70 @@ def _check_collective_rpc_guard(
         raise NotImplementedError(
             "unique_reply_rank and target_ranks are not supported; "
             "this shim only reaches rank-0.")
+
+
+class _RequestSender:
+    """Send a proxy's requests to the rank-0 worker from one background thread.
+
+    ``send`` may be called from any thread. The sender thread sends everything
+    queued since its previous send as one list, so a burst of requests costs
+    the rank-0 worker one IPC message to receive and unpickle instead of one per
+    request, while a lone request is still sent right away. The request queue's
+    socket, which is not thread-safe, also gets a single writer. The thread
+    starts on the first ``send``.
+    """
+
+    MAX_BATCH_SIZE = 1024
+
+    def __init__(self, request_queue: IpcQueue, error_queue: Queue):
+        self._request_queue = request_queue
+        self._error_queue = error_queue
+        self._pending = collections.deque()
+        self._cond = threading.Condition()
+        self._closed = False
+        self._thread: Optional[threading.Thread] = None
+
+    def send(self, item) -> None:
+        """Queue ``item`` for the worker; it is pickled later, on the sender thread.
+
+        Items sent after ``close`` are dropped: the proxy is shutting down.
+        """
+        with self._cond:
+            if self._closed:
+                return
+            if self._thread is None:
+                self._thread = threading.Thread(target=self._run,
+                                                daemon=True,
+                                                name="proxy_request_sender")
+                self._thread.start()
+            self._pending.append(item)
+            self._cond.notify()
+
+    def close(self, timeout: Optional[float] = None) -> None:
+        """Send everything queued, then stop the sender thread."""
+        with self._cond:
+            self._closed = True
+            self._cond.notify()
+            thread = self._thread
+        if thread is not None:
+            thread.join(timeout)
+
+    def _run(self) -> None:
+        while True:
+            with self._cond:
+                while not self._pending and not self._closed:
+                    self._cond.wait()
+                if not self._pending:
+                    return
+                batch = [
+                    self._pending.popleft()
+                    for _ in range(min(len(self._pending), self.MAX_BATCH_SIZE))
+                ]
+            try:
+                self._request_queue.put(batch[0] if len(batch) == 1 else batch)
+            except Exception as e:
+                # The proxy treats errors on its error queue as fatal.
+                self._error_queue.put_nowait(e)
 
 
 class GenerationExecutorProxy(GenerationExecutor):
@@ -254,10 +320,7 @@ class GenerationExecutorProxy(GenerationExecutor):
         # time /stop_profile returns 200" contract is preserved without
         # any ZMQ socket op leaking into the FastAPI thread pool.
         #
-        # NOTE: ``request_queue`` is also written from ``submit()`` /
-        # ``abort_request()`` on user-caller threads — that pre-existing
-        # cross-thread access is out of scope for this change. The fix
-        # here narrowly targets the new profile-control path.
+        # ``request_queue`` itself is written only by ``_request_sender``.
         self._profile_control_executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="proxy_profile_control")
 
@@ -487,6 +550,8 @@ class GenerationExecutorProxy(GenerationExecutor):
                                           is_server=False,
                                           socket_type=zmq.PUSH,
                                           name="proxy_request_queue")
+            self._request_sender = _RequestSender(self.request_queue,
+                                                  self._error_queue)
             self.result_queue = FusedIpcQueue(frontend_result_addrs[0],
                                               is_server=True,
                                               fuse_message=False,
@@ -496,6 +561,8 @@ class GenerationExecutorProxy(GenerationExecutor):
             request_addr = None
             self.request_queue = IpcQueue(is_server=True,
                                           name="proxy_request_queue")
+            self._request_sender = _RequestSender(self.request_queue,
+                                                  self._error_queue)
             # TODO[chunweiy]: Unify IpcQueue and FusedIpcQueue
             # Use PULL mode when enable_postprocess_parallel as there are
             # multiple senders from multiple processes.
@@ -584,7 +651,7 @@ class GenerationExecutorProxy(GenerationExecutor):
         # NOTE, it just sends a cancelling request to the request queue, but it
         # may take a while for the request to be cancelled in the worker and
         # send back a finished result.
-        self.request_queue.put(CancellingRequest(request_id))
+        self._request_sender.send(CancellingRequest(request_id))
 
     # Per-call timeouts for the synchronous worker round-trip. The stop
     # path can take up to 30s because PyExecutor.stop_profile itself
@@ -660,12 +727,12 @@ class GenerationExecutorProxy(GenerationExecutor):
     def _profile_control_call(self, kind: str, request, timeout: float) -> None:
         """Worker-side body of ``start_profile`` / ``stop_profile``.
 
-        Runs on ``_profile_control_executor`` so all profile-related
-        ZMQ socket ops (``request_queue.put`` and ``profile_ack_queue.get``
-        via ``_wait_profile_ack``) happen on a single owning thread.
+        Runs on ``_profile_control_executor`` so all ``profile_ack_queue``
+        ZMQ socket ops (via ``_wait_profile_ack``) happen on a single owning
+        thread; the request itself goes out through ``_request_sender``.
         """
         request.ack_addr = self._ensure_profile_ack_queue()
-        self.request_queue.put(request)
+        self._request_sender.send(request)
         self._wait_profile_ack(kind, timeout)
 
     def _submit_profile_control(self, kind: str, request,
@@ -1047,8 +1114,17 @@ class GenerationExecutorProxy(GenerationExecutor):
         # empty list and therefore covered case (a) by accident.  Switching
         # to bare ``any(...)`` to better handle partial crashes regressed
         # case (a); keep both behaviours explicit.
+        # The sentinel must follow every queued request, so flush the sender
+        # first; after that this thread is the queue's only writer.
+        self._close_request_sender()
         if not self.mpi_futures or any(not f.done() for f in self.mpi_futures):
             self.request_queue.put_noblock(None, retry=4)
+
+    def _close_request_sender(self) -> None:
+        """Flush and stop the request sender, if this proxy got that far."""
+        sender = getattr(self, "_request_sender", None)
+        if sender is not None:
+            sender.close(timeout=5.0)
 
     def _get_next_client_id(self) -> int:
         client_id = super()._get_next_client_id()
@@ -1072,6 +1148,7 @@ class GenerationExecutorProxy(GenerationExecutor):
 
     def shutdown(self):
         if not self.workers_started:
+            self._close_request_sender()
             self._cleanup_multi_frontend_ipc_dir()
             return
 
@@ -1210,7 +1287,10 @@ class GenerationExecutorProxy(GenerationExecutor):
             raise EngineDeadError(self._fatal_error)
 
         with nvtx_range_debug("request_queue.put"):
-            self.request_queue.put(request)
+            # The sender pickles the request later, on its own thread, and
+            # callers may drop fields right after submit (generate_async
+            # deletes multimodal_params), so it gets a shallow copy.
+            self._request_sender.send(copy.copy(request))
 
         self._handle_background_error()
 
@@ -1526,6 +1606,8 @@ class GenerationExecutorFrontendProxy(GenerationExecutorProxy):
             is_server=False,
             socket_type=zmq.PUSH,
             name=f"frontend_{frontend_id}_request_queue")
+        self._request_sender = _RequestSender(self.request_queue,
+                                              self._error_queue)
         self.result_queue = FusedIpcQueue(
             (attach_info["result_addrs"][frontend_id], hmac_key),
             is_server=True,
@@ -1575,6 +1657,8 @@ class GenerationExecutorFrontendProxy(GenerationExecutorProxy):
 
     def shutdown(self):
         self.pre_shutdown()
+        # Send the cancels queued by pre_shutdown before the lane goes idle.
+        self._close_request_sender()
         if self.rpc_client is not None:
             self.rpc_client.close()
             self.rpc_client = None
