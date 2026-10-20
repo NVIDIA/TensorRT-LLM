@@ -34,6 +34,7 @@ from tensorrt_llm._torch.models.modeling_utils import get_registered_model_class
 from tensorrt_llm._torch.modules.linear import Linear, WeightMode
 from tensorrt_llm._torch.pyexecutor import model_loader as model_loader_mod
 from tensorrt_llm._torch.pyexecutor.model_loader import ModelLoader
+from tensorrt_llm._torch.pyexecutor.weight_sources import model_hooks
 from tensorrt_llm._torch.weight_sharing import (
     ARTIFACT_IDENTITY_FORMAT_VERSION,
     LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1,
@@ -556,8 +557,10 @@ def _make_loader(monkeypatch, *, events, spec_config=None):
         max_num_tokens=128,
         max_seq_len=128,
     )
-    loader._call_load_weights = MagicMock(
-        side_effect=lambda fn, weights, mapper, **kwargs: fn(weights, mapper)
+    monkeypatch.setattr(
+        model_hooks,
+        "call_load_weights",
+        MagicMock(side_effect=lambda fn, weights, mapper, **kwargs: fn(weights, mapper)),
     )
     loader._load_and_validate_config = MagicMock(
         return_value=SimpleNamespace(
@@ -742,7 +745,7 @@ def test_mx_success_initializes_mapper_skips_weight_mapping_and_reload_works(
     )
     assert kwargs["allow_post_transform_weights"] is True
     assert loader._source_identity.transform_abi_id == LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1
-    assert loader._call_load_weights.call_count == 0
+    assert model_hooks.call_load_weights.call_count == 0
     checkpoint_loader.get_initialized_weight_mapper.assert_called_once()
     assert loader.weight_mapper is checkpoint_loader.get_initialized_weight_mapper.return_value
     checkpoint_loader.post_load_publish.assert_called_once_with(
@@ -757,7 +760,7 @@ def test_mx_success_initializes_mapper_skips_weight_mapping_and_reload_works(
     model._weights_transformed = True
     model.linear._weights_transformed = True
     loader.reload(model, {"reloaded": MagicMock()})
-    assert loader._call_load_weights.call_count == 1
+    assert model_hooks.call_load_weights.call_count == 1
     assert model._weights_transformed is False
     assert model.linear._weights_transformed is False
     assert events == ["post_load_weights", "load_weights"]
@@ -841,8 +844,8 @@ def test_reload_partial_loading_preserves_weights_transformed_flags(monkeypatch)
 
     loader.reload(model, {"reloaded": MagicMock()}, allow_partial_loading=True)
 
-    assert loader._call_load_weights.call_count == 1
-    assert loader._call_load_weights.call_args.kwargs["allow_partial_loading"] is True
+    assert model_hooks.call_load_weights.call_count == 1
+    assert model_hooks.call_load_weights.call_args.kwargs["allow_partial_loading"] is True
     assert model._weights_transformed is True
     assert model.linear._weights_transformed is True
     assert events == ["load_weights"]
@@ -867,8 +870,8 @@ def test_mx_partial_fallback_merges_returned_weights(
 
     model, _ = loader.load("/ckpt", checkpoint_loader)
 
-    assert loader._call_load_weights.call_count == 1
-    load_fn, weights, mapper = loader._call_load_weights.call_args.args
+    assert model_hooks.call_load_weights.call_count == 1
+    load_fn, weights, mapper = model_hooks.call_load_weights.call_args.args
     assert load_fn == model.load_weights
     assert weights is fallback_weights
     assert mapper is loader.weight_mapper
@@ -929,7 +932,7 @@ def test_mx_post_transform_receiver_uses_staged_path_when_qualified(
 
     model, _ = loader.load("/ckpt", checkpoint_loader)
 
-    loader._call_load_weights.assert_not_called()
+    model_hooks.call_load_weights.assert_not_called()
     _args, kwargs = checkpoint_loader.load_weights.call_args
     assert kwargs["allow_post_transform_weights"] is True
     assert (
@@ -1661,13 +1664,13 @@ def test_staged_llama_finalization_preserves_mx_tensor_catalog(
     model = _tiny_llama_model(monkeypatch)
 
     # MX discovers and registers tensors after receiver alias preparation.
-    ModelLoader._setup_aliases(model)
+    model_hooks.setup_aliases(model)
     registered_catalog = _mx_canonical_parameter_catalog(model)
 
     # This is the receiver-side finalization sequence after RDMA completes.
-    ModelLoader._setup_aliases(model)
-    ModelLoader._mark_weights_transformed(model)
-    ModelLoader._walk_cache_state(model)
+    model_hooks.setup_aliases(model)
+    model_hooks.mark_weights_transformed(model)
+    model_hooks.walk_cache_state(model)
     published_catalog = _mx_canonical_parameter_catalog(model)
 
     assert registered_catalog
@@ -1813,8 +1816,8 @@ def test_mx_post_transform_receiver_falls_back_for_unqualified_model(
     assert kwargs["allow_post_transform_weights"] is False
     assert "prepare_post_transform_receiver" not in kwargs
     assert checkpoint_loader.is_weights_preloaded() is False
-    assert loader._call_load_weights.call_count == 1
-    load_fn, weights, mapper = loader._call_load_weights.call_args.args
+    assert model_hooks.call_load_weights.call_count == 1
+    load_fn, weights, mapper = model_hooks.call_load_weights.call_args.args
     assert load_fn == model.load_weights
     assert weights == {"disk.weight": checkpoint_loader._disk_weight}
     assert mapper is loader.weight_mapper
@@ -1892,7 +1895,7 @@ def test_mx_fallback_runs_standard_weight_mapping(
 
     model, _ = loader.load("/ckpt", checkpoint_loader)
 
-    assert loader._call_load_weights.call_count == 1
+    assert model_hooks.call_load_weights.call_count == 1
     assert events[0] == "load_weights"
     assert "post_load_weights" in events
     checkpoint_loader.post_load_publish.assert_called_once_with(
@@ -1994,7 +1997,7 @@ def test_staged_hook_setup_aliases_walks_skip_removed_modules():
     events = []
     model = _HookModel(events)
 
-    ModelLoader._setup_aliases(model)
+    model_hooks.setup_aliases(model)
 
     assert events == [
         ("model", "setup_aliases"),
@@ -2008,9 +2011,9 @@ def test_staged_hook_walks_skip_removed_and_transformed_modules():
     events = []
     model = _HookModel(events)
 
-    ModelLoader._walk_transform(model)
-    ModelLoader._walk_cache_state(model)
-    ModelLoader._walk_full_post_load(model)
+    model_hooks.walk_transform(model)
+    model_hooks.walk_cache_state(model)
+    model_hooks.walk_full_post_load(model)
 
     assert events == [
         ("model", "transform_weights"),
@@ -2031,7 +2034,7 @@ def test_reset_weights_transformed_only_resets_existing_flags():
     model._weights_transformed = True
     model.child._weights_transformed = True
 
-    ModelLoader._reset_weights_transformed(model)
+    model_hooks.reset_weights_transformed(model)
 
     assert model._weights_transformed is False
     assert model.child._weights_transformed is False
@@ -2046,7 +2049,7 @@ def test_mark_weights_transformed_only_sets_existing_flags():
     model._weights_transformed = False
     model.child._weights_transformed = False
 
-    ModelLoader._mark_weights_transformed(model)
+    model_hooks.mark_weights_transformed(model)
 
     assert model._weights_transformed is True
     assert model.child._weights_transformed is True
