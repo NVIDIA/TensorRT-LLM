@@ -26,7 +26,7 @@ from diffusers.utils.torch_utils import randn_tensor
 from diffusers.video_processor import VideoProcessor
 from transformers import AutoTokenizer, UMT5EncoderModel
 
-from tensorrt_llm._torch.visual_gen.attention_backend.sparse.vsa import (
+from tensorrt_llm._torch.visual_gen.attention.backends.sparse.vsa import (
     VSAMetadataBuilder,
     set_vsa_forward_context,
 )
@@ -170,7 +170,14 @@ class WanPipeline(BasePipeline):
         # The forward path receives normalized timesteps. TeaCache coefficients
         # were calibrated against WAN's raw scheduler timestep scale.
         timestep_for_embedding = timestep * self.scheduler.config.num_train_timesteps
+        if timestep_for_embedding.ndim == 2:
+            timestep_seq_len = timestep_for_embedding.shape[1]
+            timestep_for_embedding = timestep_for_embedding.flatten()
+        else:
+            timestep_seq_len = None
         t_freq = ce.timesteps_proj(timestep_for_embedding)
+        if timestep_seq_len is not None:
+            t_freq = t_freq.unflatten(0, (-1, timestep_seq_len))
 
         # Cast to embedder's dtype (avoid int8 quantized layers)
         te_dtype = next(iter(ce.time_embedder.parameters())).dtype

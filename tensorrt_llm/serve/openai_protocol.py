@@ -1504,6 +1504,29 @@ def _materialize_validator_iterators(value, _depth=0):
     return value
 
 
+def input_image_placeholder(part: Any) -> Any:
+    """Replace an ``input_image`` part with a text placeholder; keep others.
+
+    Used where an image cannot reach the model; the placeholder says what was
+    dropped, so the model does not answer as if it had seen nothing.
+    """
+    if isinstance(part, dict) and part.get("type") == "input_image":
+        url = part.get("image_url") or ""
+        if isinstance(url, dict):
+            url = url.get("url") or ""
+        if not isinstance(url, str):
+            url = ""
+        kind = url.split(";", 1)[0].removeprefix("data:") or "image"
+        return {
+            "type":
+            "input_text",
+            "text":
+            "[image omitted: %s, %d bytes as sent; this "
+            "model accepts text only]" % (kind, len(url)),
+        }
+    return part
+
+
 class ResponsesRequest(OpenAIBaseModel):
     # Ordered by official OpenAI API documentation
     # https://platform.openai.com/docs/api-reference/responses/create
@@ -1556,38 +1579,25 @@ class ResponsesRequest(OpenAIBaseModel):
                 return {**part, "annotations": []}
             return part
 
-        def _degrade_image(part: Any) -> Any:
-            """Replace an ``input_image`` part with a text placeholder.
-
-            The vendored input union has no image member, so an image would
-            fail the whole request; the placeholder says what was dropped.
-            """
-            if isinstance(part, dict) and part.get("type") == "input_image":
-                url = part.get("image_url") or ""
-                if isinstance(url, dict):
-                    url = url.get("url") or ""
-                if not isinstance(url, str):
-                    url = ""
-                kind = url.split(";", 1)[0].removeprefix("data:") or "image"
-                return {
-                    "type":
-                    "input_text",
-                    "text":
-                    "[image omitted: %s, %d bytes as sent; this "
-                    "model accepts text only]" % (kind, len(url)),
-                }
+        def _with_image_detail(part):
+            """A tool result's input_image requires detail; clients omit it."""
+            if (isinstance(part, dict) and part.get("type") == "input_image"
+                    and "detail" not in part):
+                return {**part, "detail": "auto"}
             return part
 
         cleaned = []
         for item in value:
             # A client may send a bare content part as a top-level item, not
-            # only nested inside a message.
-            item = _with_annotations(_degrade_image(item))
-            # Message parts live under "content", tool-result parts under
-            # "output".
-            for key in ("content", "output"):
-                if isinstance(item, dict) and isinstance(item.get(key), list):
-                    item = {**item, key: [_degrade_image(p) for p in item[key]]}
+            # only nested inside a message. No input item type holds a bare
+            # image, so one is kept as a placeholder rather than failing the
+            # whole request.
+            item = _with_annotations(input_image_placeholder(item))
+            if isinstance(item, dict) and isinstance(item.get("output"), list):
+                item = {
+                    **item, "output":
+                    [_with_image_detail(part) for part in item["output"]]
+                }
             if isinstance(item, dict) and item.get("type") in (None, "message"):
                 role = item.get("role")
                 if "id" in item and role in _ID_STRIPPED_ROLES:
@@ -1979,6 +1989,12 @@ class MemoryUpdateRequest(OpenAIBaseModel):
     tags: list[str] = Field(
         min_length=1,
         description="Memory tags to release/resume, e.g. ['model', 'kv_cache']")
+
+
+class RuntimeMemoryUpdateRequest(OpenAIBaseModel):
+    tags: Optional[List[str]] = Field(
+        default=None,
+        description="Memory tags to release/resume; omit to select defaults")
 
 
 class UpdateWeightsRequest(OpenAIBaseModel):

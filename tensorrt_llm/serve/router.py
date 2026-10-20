@@ -34,9 +34,8 @@ from tensorrt_llm.serve.openai_protocol import (ChatCompletionRequest,
 from tensorrt_llm.serve.router_utils import (  # noqa: F401
     KV_CACHE_HASH_ALGO_DEFAULT, KV_CACHE_HASH_ALGO_V1, KV_CACHE_HASH_ALGO_V2,
     KV_CACHE_HASH_ALGO_V2_SHA256_64, KV_CACHE_HASH_ALGOS, BlockHash,
-    BlockHashMixin, OpenAIRequest, block_key_hasher, get_cache_salt_id,
-    get_request_num_tokens, hash_v1_block_key, responses_request_text,
-    truncate_sha256_hash_to_int64)
+    BlockHashMixin, OpenAIRequest, block_key_hasher, get_request_num_tokens,
+    hash_v1_block_key, responses_request_text, truncate_sha256_hash_to_int64)
 
 _MSGPACK_HEADERS = {"Content-Type": "application/msgpack"}
 COORDINATOR_SELECT_MAX_ATTEMPTS = 2
@@ -1021,7 +1020,7 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
         Tokenization and per-algorithm block hashing are CPU-bound and run in a
         thread. The returned plain dict can be sent over HTTP unchanged.
         """
-        cache_salt_id = self._get_request_cache_salt_id(request)
+        cache_salt = self._get_request_cache_salt(request)
         # Hash for every algo any server might use (usually one).
         algos = ({self._routing_hash_algo}
                  if self._routing_hash_algo is not None else {
@@ -1034,7 +1033,7 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
                 "synchronize it with the coordinator before routing")
         token_lists, block_hashes_by_algo = \
             self._tokenize_and_compute_block_hashes_by_algo(
-                request, algos, cache_salt_id)
+                request, algos, cache_salt)
         return {
             "block_hashes_by_algo": block_hashes_by_algo,
             "conv_key": self._content_affinity_key(request),

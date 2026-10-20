@@ -198,7 +198,7 @@ async def _preprocess(monkeypatch, store_flag):
 
     captured = {}
 
-    def fake_parse(messages, model_config):
+    def fake_parse(messages, model_config, multimodal_server_config=None):
         captured["messages"] = list(messages)
 
         async def mm():
@@ -260,6 +260,7 @@ def _server_up_to_preprocess(monkeypatch):
     server.tokenizer = None
     server.model_config = None
     server.processor = None
+    server.multimodal_server_config = None
     server.tool_parser = None
     server.metrics_collector = None
     server.generator = SimpleNamespace(

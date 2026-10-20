@@ -741,6 +741,36 @@
       "path": "kv_cache_config.kv_events_config.publisher"
     },
     {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "kv_cache_config.kv_pool_rebalance_config.check_interval"
+    },
+    {
+      "capture_policy": "float",
+      "kind": "value",
+      "path": "kv_cache_config.kv_pool_rebalance_config.cooldown_secs"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "kv_cache_config.kv_pool_rebalance_config.min_sampled_kv_caches"
+    },
+    {
+      "capture_policy": "float",
+      "kind": "value",
+      "path": "kv_cache_config.kv_pool_rebalance_config.moving_average_decay"
+    },
+    {
+      "capture_policy": "float",
+      "kind": "value",
+      "path": "kv_cache_config.kv_pool_rebalance_config.ratio_tolerance"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "kv_cache_config.kv_pool_rebalance_config.target_ratio_update_interval"
+    },
+    {
       "allowed_values": [
         "auto",
         "float16",
@@ -959,6 +989,16 @@
       "capture_policy": "bool",
       "kind": "value",
       "path": "mm_encoder_only"
+    },
+    {
+      "allowed_values": [
+        "off",
+        "auto",
+        "require"
+      ],
+      "capture_policy": "literal",
+      "kind": "categorical",
+      "path": "modeling_v2"
     },
     {
       "capture_policy": "int|none",
@@ -1368,6 +1408,11 @@
       "capture_policy": "bool",
       "kind": "value",
       "path": "sparse_attention_config.fuse_qkv_index_projection"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "sparse_attention_config.gvr_deterministic_topk"
     },
     {
       "allowed_values": [
@@ -1799,6 +1844,11 @@
       "path": "speculative_config.skip_ctx_buffer_budget_check"
     },
     {
+      "capture_policy": "int|none",
+      "kind": "value",
+      "path": "speculative_config.spec_dec_variant"
+    },
+    {
       "capture_policy": "list[int]|none",
       "kind": "value",
       "path": "speculative_config.target_layer_ids"
@@ -1869,6 +1919,11 @@
       "capture_policy": "list[int]|none",
       "kind": "value",
       "path": "torch_compile_config.capture_num_tokens"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "torch_compile_config.compile_only_piecewise_graphs"
     },
     {
       "capture_policy": "bool",

@@ -63,6 +63,10 @@ NEMOTRON_SUPER_MODELS = {
 }
 
 KIMI_K3_MODELS = {"kimi_k3"}
+DEEPSEEK_V41_MODELS = {
+    "deepseek_v41_flash_nvfp4",
+    "deepseek_v41_flash_nvfp4_dspark",
+}
 QWEN38_MTP_MODELS = {
     "qwen3.8_max_fp4_mtp",
     "qwen3.8_flash_next_fp8_mtp",
@@ -73,6 +77,7 @@ KIMI_K3_SERVER_ENV = {
 }
 
 TRUST_REMOTE_CODE_MODELS = {  # these models require explicit trust_remote_code=True
+    *DEEPSEEK_V41_MODELS,
     *QWEN38_MTP_MODELS,
     "kimi_k2.5_fp4",
     "kimi_k3",
@@ -106,8 +111,12 @@ OPENAI_CHAT_BACKEND_MODELS = {
     "nemotron_3_nano_omni_nvfp4_image",
 }
 
-# Spec-dec models real dataset in serve perf tests.
+# Spec-dec models and their non-speculative controls use real text in serve tests.
 SPEC_DEC_REAL_DATASET_MODELS = {
+    **{
+        model: "cnn_dailymail"
+        for model in DEEPSEEK_V41_MODELS
+    },
     "nemotron_3_super_120b_nvfp4_mtp": "cnn_dailymail",
     "nemotron_3.5_lightning_30b_nvfp4_mtp": "cnn_dailymail",
     "nemotron_3.5_lightning_30b_bf16_mtp": "cnn_dailymail",
@@ -1230,10 +1239,18 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
         from transformers import AutoTokenizer
 
         model_dir = self.get_trtllm_bench_model()
-        tokenizer = AutoTokenizer.from_pretrained(
-            model_dir,
-            trust_remote_code=self._config.model_name
-            in TRUST_REMOTE_CODE_MODELS)
+        model_config = self._get_model_yaml_config()
+        custom_tokenizer = model_config.get('custom_tokenizer')
+        trust_remote_code = self._config.model_name in TRUST_REMOTE_CODE_MODELS
+        if custom_tokenizer:
+            from tensorrt_llm.tokenizer import load_custom_tokenizer
+            tokenizer = load_custom_tokenizer(
+                custom_tokenizer,
+                model_dir,
+                trust_remote_code=trust_remote_code)
+        else:
+            tokenizer = AutoTokenizer.from_pretrained(
+                model_dir, trust_remote_code=trust_remote_code)
         dataset = load_dataset(os.path.join(llm_models_root(), "datasets",
                                             "cnn_dailymail"),
                                "3.0.0",
@@ -1266,6 +1283,23 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                         prompt_ids = prompt_ids[:input_len]
                 prompt_text = tokenizer.decode(prompt_ids,
                                                skip_special_tokens=False)
+                if self._config.model_name in DEEPSEEK_V41_MODELS:
+                    prompt_text = tokenizer.apply_chat_template(
+                        [{
+                            "role": "user",
+                            "content": prompt_text
+                        }],
+                        tokenize=False,
+                        enable_thinking=False,
+                        add_generation_prompt=True,
+                    )
+                    prompt_ids = tokenizer.encode(prompt_text,
+                                                  add_special_tokens=False)
+                    max_seq_len = model_config['max_seq_len']
+                    if len(prompt_ids) + output_len > max_seq_len:
+                        raise ValueError(
+                            "Rendered V4.1 prompt and output cap exceed max_seq_len"
+                        )
 
                 sample = {
                     "input": {
@@ -1315,6 +1349,18 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             "--percentile-metrics",
             "ttft,tpot,itl,e2el",
         ]
+        custom_tokenizer = self._get_model_yaml_config().get('custom_tokenizer')
+        if custom_tokenizer:
+            client_cmd += ["--custom-tokenizer", custom_tokenizer]
+        if self._config.model_name in DEEPSEEK_V41_MODELS:
+            client_cmd += [
+                "--save-result",
+                "--save-detailed",
+                "--result-dir",
+                engine_dir,
+                "--result-filename",
+                f"result_{input_len}_{output_len}.json",
+            ]
         # --ignore-eos must be off for spec-decoding models: forcing generation
         # past EOS produces unstable acceptance rates.
         if self._config.model_name not in SPEC_DEC_MODELS:
@@ -1414,12 +1460,24 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                 server_env["TLLM_ALLOW_LONG_MAX_MODEL_LEN"] = "1"
             if self._config.model_name in KIMI_K3_MODELS:
                 server_env.update(KIMI_K3_SERVER_ENV)
+            if self._config.model_name in DEEPSEEK_V41_MODELS:
+                # Compare real acceptance with the same bounded-replay policy.
+                server_env = {
+                    name: value
+                    for name, value in server_env.items()
+                    if not name.startswith("TRTLLM_V41_")
+                }
+                server_env.pop("TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS",
+                               None)
+                server_env["TRTLLM_V41_DECODER_BOUNDED_REPLAY"] = "1"
             if self._config.model_name in QWEN38_MTP_MODELS:
                 server_timeout = 5400
             elif self._config.model_name in NEMOTRON_SUPER_MODELS:
                 server_timeout = 3600
             elif self._config.model_name in KIMI_K3_MODELS:
                 server_timeout = 5400
+            elif self._config.model_name in DEEPSEEK_V41_MODELS:
+                server_timeout = 3600
             elif self._config.model_name == "deepseek_v4_pro_base_fp8":
                 # Allow time for model loading and executor warmup.
                 server_timeout = 1800
@@ -1577,6 +1635,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
         outputs = {}
         result_states = {}
         errors = []
+        copy_error = None
 
         if self._config.runtime == 'bench':
             print_info(f"Running command for generating dataset")
@@ -1643,7 +1702,24 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             if isinstance(commands, PerfServeScriptTestCmds):
                 print_info("Stopping serve server")
                 commands.stop_server()
-            shutil.rmtree(self._get_engine_dir(), ignore_errors=True)
+            engine_dir = self._get_engine_dir()
+            if (self._config.model_name in DEEPSEEK_V41_MODELS
+                    and os.path.isdir(engine_dir)):
+                # Preserve raw results, prompts and config before workspace cleanup.
+                result_dir = os.path.join(output_dir, "detailed_results",
+                                          os.path.basename(engine_dir))
+                try:
+                    shutil.copytree(engine_dir, result_dir, dirs_exist_ok=True)
+                except OSError as error:
+                    copy_error = error
+                    print_warning(
+                        f"Failed to preserve detailed results in {result_dir}: {error}"
+                    )
+            if copy_error is None:
+                shutil.rmtree(engine_dir, ignore_errors=True)
+
+        if copy_error is not None:
+            errors.append(copy_error)
 
         def add_myelin_time_pass_to(input_env):
             time_pass_flag = r" -time_pass=on"
@@ -1656,7 +1732,8 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
         llm_venv._new_env["__LUNOWUD"] = old_llm_venv
 
         # Check if any commands failed.
-        if not all([result_states[idx] == "valid" for idx in result_states]):
+        if errors or not all(
+            [result_states[idx] == "valid" for idx in result_states]):
             # If there is only one error, throw it directly.
             if len(errors) == 1:
                 raise errors[0]

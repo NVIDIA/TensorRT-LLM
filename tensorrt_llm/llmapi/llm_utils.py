@@ -574,9 +574,25 @@ def _resolve_kv_cache_manager_v2_auto(llm_args: 'TorchLlmArgs',
     ``use_kv_cache_manager_v2``. Models routed to a V2 manager unconditionally
     -- sparse attention picks its class from the algorithm alone -- keep a V2
     manager after the demotion, so the arm does not protect them.
+
+    A model whose ``requires_kv_cache_manager_v2`` hook returns True has no
+    supported V1 route: the disaggregated-serving arm raises instead of
+    demoting, and an explicit ``use_kv_cache_manager_v2=False`` is rejected.
     """
+    model_name = getattr(model_cls, "__name__", "the model")
+    requires_v2 = False
+    if model_cls is not None:
+        get_required = getattr(model_cls, 'requires_kv_cache_manager_v2', None)
+        if get_required is not None:
+            requires_v2 = bool(get_required(pretrained_config))
+
     setting = llm_args.kv_cache_config.use_kv_cache_manager_v2
     if setting != "auto":
+        if requires_v2 and setting is False:
+            raise ValueError(
+                f"{model_name} requires KV cache manager v2; "
+                "kv_cache_config.use_kv_cache_manager_v2=False is not supported "
+                "for this model.")
         return setting
 
     preferred_version = None
@@ -590,7 +606,7 @@ def _resolve_kv_cache_manager_v2_auto(llm_args: 'TorchLlmArgs',
             f"{model_cls.__name__}.get_preferred_kv_cache_manager_version() "
             f"must return 'V1', 'V2', or None, got {preferred_version!r}.")
 
-    use_v2 = preferred_version == "V2"
+    use_v2 = preferred_version == "V2" or requires_v2
 
     transceiver_config = llm_args.cache_transceiver_config
     if (use_v2 and transceiver_config is not None
@@ -598,6 +614,14 @@ def _resolve_kv_cache_manager_v2_auto(llm_args: 'TorchLlmArgs',
         effective_backend, _ = transceiver_config._resolve_default_backend()
         runtime = transceiver_config.transceiver_runtime
         if effective_backend != "NIXL" or runtime != "PYTHON":
+            if requires_v2:
+                raise ValueError(
+                    f"{model_name} requires KV cache manager v2, which "
+                    "disaggregated serving keeps only on backend='NIXL' with "
+                    "transceiver_runtime='PYTHON'; this run uses "
+                    f"transceiver_runtime={runtime!r} with "
+                    f"backend={effective_backend!r}. Configure the cache "
+                    "transceiver for NIXL with the Python runtime.")
             logger.info(
                 "KV cache manager V2 is the model preference, but disaggregated "
                 "serving uses transceiver_runtime=%r with backend=%r; "

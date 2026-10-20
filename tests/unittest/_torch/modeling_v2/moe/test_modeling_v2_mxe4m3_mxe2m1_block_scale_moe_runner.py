@@ -3,12 +3,17 @@
 """GPU test for the mxe4m3_mxe2m1_block_scale_moe_runner catalog entry."""
 
 import math
+import zlib
 
+import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.mxe4m3_mxe2m1_block_scale_moe_runner import (
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.mxe4m3_mxe2m1_block_scale_moe_runner import (  # noqa: E501
     mxe4m3_mxe2m1_block_scale_moe_runner as moe,
 )
+
+__extra_import_path__ = [".."]
+from _validating import validating  # noqa: E402 — needs the path declared above
 
 assert torch.cuda.is_available(), "mxe4m3_mxe2m1_block_scale_moe_runner requires a CUDA device"
 
@@ -49,6 +54,36 @@ SV = 32  # mx block size: one e8m0 scale per 32 elements along K
 WEIGHT_ALIGN = 128  # TMA row alignment for both GEMMs
 HIDDEN_ALIGN = 512  # extra alignment on FC1's K axis
 E4M3_MAX = 448.0  # largest finite e4m3 magnitude
+
+
+def _compare(out: torch.Tensor, ref: torch.Tensor) -> None:
+    """8 ulp per element against the row's own scale, 4 ulp relative RMS.
+
+    Kernel and reference consume bit-identical mxfp4 weights and MXFP8
+    activations and model the same FC1-output requantization, so they differ
+    only in accumulation order and in whether a marginal FC1 value rounds to
+    the same e4m3 code. Torch's default band cannot express that: its bf16
+    `atol` of 1e-5 sits three orders of magnitude below one output ulp of a
+    two-GEMM chain, and per-element `rtol` is meaningless where cancellation
+    drives `|ref|` to zero.
+
+    Both numbers are measured. Worst over every configuration the entry's
+    test covers: 2.0 ulp element-wise (128 experts, 8192 tokens, H=I=2880)
+    and 0.87 ulp RMS -- so this gate sits at 4x and 4.6x the observed
+    maxima. Both were sized against deliberately wrong computations: a
+    reference skipping the FC1 requantization lands at 19.6 / 10.6 ulp, and
+    a gate/up swap or an unshuffled operand past 100.
+    """
+    assert out.dtype == ref.dtype == torch.bfloat16, (out.dtype, ref.dtype)
+    assert out.shape == ref.shape, (out.shape, ref.shape)
+    ulp = 2.0**-8
+    row = ref.float().abs().amax(dim=1, keepdim=True).clamp_min(1e-9)
+    torch.testing.assert_close(out.float() / row, ref.float() / row, rtol=0.0, atol=8 * ulp)
+    rel_rms = (
+        (out.float() - ref.float()).pow(2).mean().sqrt()
+        / ref.float().pow(2).mean().sqrt().clamp_min(1e-9)
+    ).item() / ulp
+    assert rel_rms <= 4.0, f"relative RMS {rel_rms:.2f} ulp > 4 ulp"
 
 
 def _pad_up(x: int, a: int) -> int:
@@ -203,10 +238,14 @@ def _prep_fc2(dn_p, dn_s, dn_b, h2_pad, i_pad):
     )
 
 
-def _build(num_experts: int, hidden: int, inter: int, seed: int):
-    """Build one MoE layer: kernel-ready tensors plus the reference operands."""
+def _build(num_experts: int, hidden: int, inter: int, seed: int, i_pad: int | None = None):
+    """Build one MoE layer: kernel-ready tensors plus the reference operands.
+
+    `i_pad` overrides the padded intermediate width, for a MoE TP shard whose
+    real columns are fewer than the width every rank declares."""
     gen = torch.Generator(device=DEV).manual_seed(seed)
-    i_pad = _pad_up(inter, WEIGHT_ALIGN)
+    i_pad = _pad_up(inter, WEIGHT_ALIGN) if i_pad is None else i_pad
+    assert i_pad >= inter and i_pad % WEIGHT_ALIGN == 0, (inter, i_pad)
     h1_pad = _pad_up(hidden, HIDDEN_ALIGN)
     h2_pad = _pad_up(hidden, WEIGHT_ALIGN)
     up_p, up_s, up_c = _rand_mxfp4(num_experts, inter, hidden, gen)
@@ -255,55 +294,58 @@ def _call(data, sf, args, num_experts, top_k, **kw):
     kw.setdefault("valid_hidden_size", args["valid_hidden_size"])
     kw.setdefault("valid_intermediate_size", args["valid_intermediate_size"])
     kw.setdefault("intermediate_size", args["intermediate_size"])
-    return moe(
-        kw.pop("routing_logits"),
-        kw.pop("routing_bias"),
-        data,
-        sf,
-        args["gemm1_weights"],
-        args["gemm1_weights_scale"],
-        args["gemm1_bias"],
-        kw.pop("gemm1_alpha"),
-        kw.pop("gemm1_beta"),
-        kw.pop("gemm1_clamp_limit"),
-        args["gemm2_weights"],
-        args["gemm2_weights_scale"],
-        args["gemm2_bias"],
-        num_experts,
-        top_k,
-        kw.pop("n_group"),
-        kw.pop("topk_group"),
-        kw.pop("intermediate_size"),
-        kw.pop("valid_hidden_size"),
-        kw.pop("valid_intermediate_size"),
-        kw.pop("local_expert_offset"),
-        kw.pop("local_num_experts"),
-        kw.pop("routed_scaling_factor"),
-        kw.pop("routing_method_type"),
-        kw.pop("act_type"),
-        **kw,
-    )
+    # _call is the single call site: run the guard over every call it makes.
+    # The negative cases reach the raw op directly when they want it unguarded.
+    with validating(moe):
+        return moe(
+            kw.pop("routing_logits"),
+            kw.pop("routing_bias"),
+            data,
+            sf,
+            args["gemm1_weights"],
+            args["gemm1_weights_scale"],
+            args["gemm1_bias"],
+            kw.pop("gemm1_alpha"),
+            kw.pop("gemm1_beta"),
+            kw.pop("gemm1_clamp_limit"),
+            args["gemm2_weights"],
+            args["gemm2_weights_scale"],
+            args["gemm2_bias"],
+            num_experts,
+            top_k,
+            kw.pop("n_group"),
+            kw.pop("topk_group"),
+            kw.pop("intermediate_size"),
+            kw.pop("valid_hidden_size"),
+            kw.pop("valid_intermediate_size"),
+            kw.pop("local_expert_offset"),
+            kw.pop("local_num_experts"),
+            kw.pop("routed_scaling_factor"),
+            kw.pop("routing_method_type"),
+            kw.pop("act_type"),
+            **kw,
+        )
 
 
 # ── reference ─────────────────────────────────────────────────────────────
 
 
-# The FC1 epilogue's block-scale recipe is architecture-specific, and the
+# The FC1 epilogue's block-scale recipe is set per architecture, and the
 # difference is bit-exact rather than a tolerance: trtllm-gen ships one cubin
 # per architecture. Measured on each, with an identity down-projection reading
 # the intermediate out element by element (test_intermediate_is_mxfp8_quantized):
 #
-#   sm_100   e8m0 = floor(log2(amax)) - 8      "OCP scale"
-#   sm_103   e8m0 = ceil(log2(amax / 448))     "round-up scale"
+#   OCP scale        e8m0 = floor(log2(amax)) - 8
+#   round-up scale   e8m0 = ceil(log2(amax / 448))
 #
-# The round-up form is the one `torch.ops.trtllm.mxfp8_quantize` has always
-# used, so sm_103 makes the MoE epilogue and the standalone quantizer agree.
-# Both are named here, and each architecture's test refutes the other's recipe,
-# so a future cubin that switches back cannot pass silently.
+# sm_100 (GB200, B200) and sm_103 (GB300, B300) both measure the round-up
+# scale, the one `torch.ops.trtllm.mxfp8_quantize` has always used. Both forms
+# are named here, and the test refutes the recipe the table does not name, so
+# a future cubin that switches to the OCP form cannot pass silently.
 _OCP_SCALE, _ROUND_UP_SCALE = "ocp", "round_up"
 
 _SCALE_RECIPE_BY_SM = {
-    (10, 0): _OCP_SCALE,
+    (10, 0): _ROUND_UP_SCALE,
     (10, 3): _ROUND_UP_SCALE,
 }
 
@@ -1554,3 +1596,112 @@ def test_determinism_and_purity():
     assert torch.equal(data, data_snap) and torch.equal(sf, sf_snap)
     assert torch.equal(ids, ids_snap) and torch.equal(wts, wts_snap)
     print("  test_determinism_and_purity OK")
+
+
+def _window(args, ref, offset: int, num_local: int):
+    """The `(args, ref)` pair narrowed to one expert-parallel window."""
+    sub = dict(args)
+    for key in (
+        "gemm1_weights",
+        "gemm1_weights_scale",
+        "gemm1_bias",
+        "gemm2_weights",
+        "gemm2_weights_scale",
+        "gemm2_bias",
+    ):
+        sub[key] = args[key][offset : offset + num_local].contiguous()
+    sub_ref = dict(ref)
+    for role in ("up", "gate", "down"):
+        c, s, b = ref[role]
+        sub_ref[role] = (
+            c[offset : offset + num_local],
+            s[offset : offset + num_local],
+            b[offset : offset + num_local],
+        )
+    return sub, sub_ref
+
+
+@pytest.mark.parametrize("cell", moe.CELLS, ids=[c.why[:44] for c in moe.CELLS])
+def test_certified_cells(cell):
+    """Drive every configuration the entry claims, through the entry's own
+    reference and its own gate.
+
+    The cases above test the op; this one tests the *claim*. A cell list that
+    nothing executes reads as coverage and is not.
+
+    Each cell cross-checks `moe.reference` against this file's `_ref_moe`
+    before either is used to gate the kernel. Two references disagreeing is a
+    different failure from the kernel moving, and collapsing them into one
+    assert loses which happened. That cross-check earns its keep here: both
+    references model the FC1 epilogue's architecture-specific block-scale
+    recipe, and a disagreement there is bit-exact rather than a tolerance.
+
+    `routed_by_kernel` is honoured rather than approximated. The gpt-oss target
+    hands the call logits and lets it route, so those cells do too; the expected
+    routing is recomputed here the way Renormalize defines it (top-k, then
+    softmax over the kept logits), which is what makes the reference comparable
+    at all.
+    """
+    spec = cell.spec
+    if spec["intermediate"] == 2880 and "intermediate_pad" not in spec:
+        args, ref = _gpt_oss()
+    else:
+        # A MoE TP shard: this rank's real intermediate columns, declared at
+        # the padded width the default target gives every rank.
+        args, ref = _build(
+            spec["num_experts"],
+            spec["hidden"],
+            spec["intermediate"],
+            seed=101,
+            i_pad=spec.get("intermediate_pad"),
+        )
+    off, n = spec["local_expert_offset"], spec["local_num_experts"]
+    num_experts, hidden, top_k = spec["num_experts"], spec["hidden"], spec["top_k"]
+    gen = torch.Generator(device=DEV).manual_seed(zlib.crc32(cell.why.encode()) % 2**31)
+
+    data, sf, xv = _rand_mxfp8(spec["tokens"], hidden, ref["h1_pad"], gen)
+    alpha, beta, limit = _swiglu_params(n)
+    sub_args, sub_ref = (args, ref) if n == num_experts else _window(args, ref, off, n)
+
+    if spec["routed_by_kernel"]:
+        logits = _logits(spec["tokens"], num_experts, gen)
+        top_v, top_i = torch.topk(logits.float(), top_k, dim=-1)
+        ids, wts = top_i.to(torch.int32), torch.softmax(top_v, dim=-1)
+        entry = dict(routing_logits=logits, routing_method_type=1)  # Renormalize
+    else:
+        ids, wts = _routing(spec["tokens"], num_experts, top_k, gen)
+        entry = dict(topk_ids=ids, topk_weights=wts)
+
+    # 1. The entry's reference against this file's, on identical inputs.
+    entry_ref = moe.reference(
+        xv,
+        ids,
+        wts,
+        sub_ref["up"],
+        sub_ref["gate"],
+        sub_ref["down"],
+        alpha=alpha,
+        beta=beta,
+        clamp_limit=limit,
+        local_expert_offset=off,
+        local_num_experts=n,
+    )
+    local_ref = _ref_moe(xv, ids, wts, sub_ref, alpha, beta, limit, offset=off, num_local=n)
+    torch.testing.assert_close(entry_ref, local_ref, rtol=0.0, atol=0.0)
+
+    # 2. The entry's reference against the kernel, through the entry's gate.
+    y = _call(
+        data,
+        sf,
+        sub_args,
+        num_experts,
+        top_k,
+        local_expert_offset=off,
+        local_num_experts=n,
+        gemm1_alpha=alpha,
+        gemm1_beta=beta,
+        gemm1_clamp_limit=limit,
+        **entry,
+    )
+    assert y.shape == (spec["tokens"], hidden), y.shape
+    _compare(y, entry_ref.to(torch.bfloat16))

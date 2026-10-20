@@ -123,7 +123,6 @@ from .modeling_speculative import (
     DSparkConfidenceHead,
     SpecDecOneEngineForCausalLM,
     build_markov_head,
-    confident_prefix_length,
     dspark_markov_chain_logits,
 )
 from .modeling_utils import DecoderModel, register_auto_model, register_draft_model
@@ -768,29 +767,35 @@ def dspark_propose(
     confidence_head: Optional[nn.Module],
     block_size: int,
     temperature: float = 0.0,
-    confidence_threshold: float = 0.0,
+    return_confidence: bool = False,
     return_logits: bool = False,
+    confidence_hidden: Optional[torch.Tensor] = None,
 ) -> tuple:
     """Produce DSpark draft tokens for one block (functional-first, static length).
+
+    Always proposes the full block: confidence scoring does not shorten the
+    parallel draft pass. The verification scheduler consumes the scores and
+    decides how many draft tokens are worth sending to the target.
 
     Args:
         base_logits: ``[batch, block_size, vocab]`` from the backbone + lm_head.
         bonus_token_ids: ``[batch]`` the token preceding the first draft position.
-        block_hidden: ``[batch, block_size, hidden]`` backbone hidden (feeds the
-            confidence head, and the RNN-head variant).
+        block_hidden: ``[batch, block_size, hidden]`` proposal-head hidden.
+        confidence_hidden: Optional separate pre-normalization confidence input.
+            Defaults to ``block_hidden`` for callers without a separate input.
         markov_head / confidence_head: the validated DSpark heads (may be None).
+        return_confidence: Compute fixed-shape per-position confidence logits.
+            This is a run-constant flag so CUDA-graph execution cannot diverge.
     Returns:
         draft_tokens: ``[batch, block_size]`` sampled tokens (full block; callers
             keep the tensor fixed-width for CUDA-graph safety).
-        num_proposed: ``[batch]`` int32 — how many leading tokens survive the
-            static confidence-threshold truncation (== block_size when no head /
-            threshold<=0).
+        confidence: ``[batch, block_size]`` fp32 raw confidence logits, or None
+            when scoring is disabled. Apply the confidence head's STS
+            calibration before computing prefix survival.
     """
-    batch = base_logits.shape[0]
     # ``draft_logits`` are the per-position distributions the draft token is drawn
     # from (markov-corrected when a head is present, else the raw base logits).
-    # Surfaced under ``return_logits`` for the §7.9 probabilistic-acceptance
-    # (1-TV) measurement; the normal path ignores them.
+    # Surfaced under ``return_logits`` for rejection sampling.
     draft_logits = base_logits
     if markov_head is not None:
         draft_tokens, corrected = markov_head.sample_block_tokens(
@@ -805,36 +810,26 @@ def dspark_propose(
 
         draft_tokens = greedy_or_sample(base_logits, temperature)
 
-    # Scaffolding: confidence-based dynamic drafting is NOT enabled in this PR.
-    # The worker always calls with confidence_threshold=0.0, so the block below is
-    # inert and num_proposed stays == block_size (the full block is proposed). The
-    # returned num_proposed is intentionally not yet consumed by the speculative
-    # scheduler/verifier; wiring it through is a follow-up (see PR description).
-    num_proposed = torch.full(
-        (batch,), int(block_size), dtype=torch.int32, device=base_logits.device
-    )
-    if confidence_head is not None and confidence_threshold > 0.0:
+    # Branch-free, fixed-shape confidence scoring keeps the full draft path
+    # CUDA-graph capturable.
+    confidence = None
+    if return_confidence and confidence_head is not None:
+        scoring_hidden = block_hidden if confidence_hidden is None else confidence_hidden
         # prev token at position k is [bonus, draft_0, ..., draft_{k-1}]
         prev_ids = torch.cat([bonus_token_ids.unsqueeze(1), draft_tokens[:, :-1]], dim=1)
         prev_emb = (
             markov_head.get_prev_embeddings(prev_ids)
-            if (markov_head is not None and getattr(confidence_head, "with_markov", False))
+            if (markov_head is not None and confidence_head.with_markov)
             else None
         )
-        conf_logits = (
-            confidence_head(block_hidden, prev_embeddings=prev_emb)
+        confidence = (
+            confidence_head(scoring_hidden, prev_embeddings=prev_emb)
             if prev_emb is not None
-            else confidence_head(block_hidden)
+            else confidence_head(scoring_hidden)
         )
-        # Per-request prefix truncation (batch handled row-wise to stay simple;
-        # functional-first scope typically runs batch=1 for the draft).
-        for b in range(batch):
-            num_proposed[b] = confident_prefix_length(
-                conf_logits[b : b + 1], block_size=block_size, threshold=confidence_threshold
-            )
     if return_logits:
-        return draft_tokens, num_proposed, draft_logits
-    return draft_tokens, num_proposed
+        return draft_tokens, confidence, draft_logits
+    return draft_tokens, confidence
 
 
 # ----------------------------------------------------------------------------
@@ -1036,6 +1031,7 @@ class DSv4DSparkBlock(DeepseekV4DecoderLayer):
         stage_id: int,
         num_stages: int,
         num_capture_layers: int,
+        block_size: int = 0,
     ):
         # The inherited attention uses a draft-local layer index, while the
         # decoder layer keeps its model-level index for weights and captures.
@@ -1102,6 +1098,8 @@ class DSv4DSparkBlock(DeepseekV4DecoderLayer):
                 # markov_rank <= 0); otherwise dspark_propose passes no
                 # prev_embeddings and DSparkConfidenceHead.forward would assert.
                 with_markov=self.markov_rank > 0,
+                # Sizes the per-position STS calibration table once, up front.
+                block_size=int(block_size),
             )
 
     @property
@@ -1229,6 +1227,7 @@ class DSv4DSparkDraftModel(nn.Module):
                     stage_id=s,
                     num_stages=self.num_stages,
                     num_capture_layers=self.num_capture_layers,
+                    block_size=self.block_size,
                 )
                 for s in range(self.num_stages)
             ]
@@ -1802,7 +1801,7 @@ class DSv4DSparkDraftModel(nn.Module):
         *,
         kv_windows: Optional[torch.Tensor] = None,
         temperature: float = 0.0,
-        confidence_threshold: float = 0.0,
+        return_confidence: bool = False,
         return_logits: bool = False,
         all_rank_num_tokens: Optional[List[int]] = None,
     ) -> tuple:
@@ -1822,7 +1821,7 @@ class DSv4DSparkDraftModel(nn.Module):
                 worker; updated in place each call. ``None`` allocates fresh zero
                 windows (single-shot golden / test path).
         Returns:
-            ``(draft_tokens [T, block], num_proposed [T])`` from ``forward_head``.
+            ``(draft_tokens [T, block], confidence [T, block] or None)``.
         """
         assert start_pos > 0, "DSpark draft runs at generation (start_pos > 0)"
         if getattr(self.mtp_layers[0], "_dspark_attn", None) is None:
@@ -1857,7 +1856,7 @@ class DSv4DSparkDraftModel(nn.Module):
             h,
             bonus_token_ids,
             temperature=temperature,
-            confidence_threshold=confidence_threshold,
+            return_confidence=return_confidence,
             return_logits=return_logits,
             pre_mix=pre_mix,
         )
@@ -1872,7 +1871,7 @@ class DSv4DSparkDraftModel(nn.Module):
         slots: torch.Tensor,
         valid_len: Optional[torch.Tensor] = None,
         temperature: float = 0.0,
-        confidence_threshold: float = 0.0,
+        return_confidence: bool = False,
         return_logits: bool = False,
         all_rank_num_tokens: Optional[List[int]] = None,
     ) -> tuple:
@@ -1884,9 +1883,9 @@ class DSv4DSparkDraftModel(nn.Module):
         graph). ``start_pos`` is a ``[G]`` tensor (one absolute decode position per
         gen request); the rolling captured-context windows are written/read through
         ``slots`` into the worker-owned ``kv_windows`` buffer; RoPE phases are
-        gathered from a fixed table. ``forward_head`` is run with
-        ``confidence_threshold == 0`` (the worker proposes the full block), which is
-        the graph-safe branch of :func:`dspark_propose`.
+        gathered from a fixed table. ``forward_head`` always proposes the full
+        block; ``return_confidence`` only adds a fixed-shape scoring matmul, so
+        both settings stay capturable.
 
         Args:
             main_hidden: ``[G, num_capture * hidden]`` captured target context.
@@ -1897,7 +1896,7 @@ class DSv4DSparkDraftModel(nn.Module):
             slots: ``[G]`` int tensor mapping each request to its ``kv_windows`` row.
             valid_len: ``[G]`` count of actually written rolling-window entries.
         Returns:
-            ``(draft_tokens [G, block], num_proposed [G])`` from ``forward_head``.
+            ``(draft_tokens [G, block], confidence [G, block] or None)``.
         """
         if getattr(self.mtp_layers[0], "_dspark_attn", None) is None:
             raise RuntimeError(
@@ -1933,7 +1932,7 @@ class DSv4DSparkDraftModel(nn.Module):
             h,
             bonus_token_ids,
             temperature=temperature,
-            confidence_threshold=confidence_threshold,
+            return_confidence=return_confidence,
             return_logits=return_logits,
             pre_mix=pre_mix,
         )
@@ -1995,15 +1994,15 @@ class DSv4DSparkDraftModel(nn.Module):
         bonus_token_ids: torch.Tensor,
         *,
         temperature: float = 0.0,
-        confidence_threshold: float = 0.0,
+        return_confidence: bool = False,
         return_logits: bool = False,
         pre_mix: Optional[torch.Tensor] = None,
     ) -> tuple:
         """Block-draft head: hc_head + norm + lm_head -> markov refine + confidence.
 
         ``block_hidden`` is the last stage's mHC residual ``[*, block, hc_mult, hidden]``.
-        Returns (draft_tokens [*, block], num_proposed [*]); with ``return_logits``
-        also returns the per-position draft logits [*, block, vocab] (§7.9 1-TV).
+        Returns (draft_tokens [*, block], confidence [*, block] or None); with ``return_logits``
+        also returns the per-position draft logits [*, block, vocab].
         """
         last = self.mtp_layers[-1]
         if self.uses_lagged_pre:
@@ -2012,6 +2011,7 @@ class DSv4DSparkDraftModel(nn.Module):
             h = last.hc_ffn.collapse(block_hidden, pre_mix)
         else:
             h = last.hc_head(block_hidden)
+        confidence_hidden = h if return_confidence and last.confidence_head is not None else None
         normalized = last.norm(h)
         base_logits = self.lm_head(normalized)
         proposal_hidden = normalized if self.confidence_uses_normalized_hidden else h
@@ -2023,8 +2023,9 @@ class DSv4DSparkDraftModel(nn.Module):
             confidence_head=last.confidence_head,
             block_size=self.block_size,
             temperature=temperature,
-            confidence_threshold=confidence_threshold,
+            return_confidence=return_confidence,
             return_logits=return_logits,
+            confidence_hidden=confidence_hidden,
         )
 
 
@@ -2101,6 +2102,15 @@ class DSv4DSparkForCausalLM(nn.Module):
             main_hidden, positions, slots, mask, kv_windows
         )
 
+    def _prepare_confidence_head_for_load(self, weights: Dict) -> None:
+        """Match the projection's optional bias to the checkpoint before loading."""
+        head = self.dspark_model.mtp_layers[-1].confidence_head
+        bias_key = f"mtp_layers.{self.num_stages - 1}.confidence_head.proj.bias"
+        if head is not None and bias_key in weights and head.proj.bias is None:
+            # This runs before weight loading and graph capture. Empty storage
+            # avoids consuming RNG or reinitializing the existing projection.
+            head.proj.bias = nn.Parameter(head.proj.weight.new_empty(head.proj.out_features))
+
     def load_weights(self, weights: Dict, weight_mapper=None, **kwargs):
         """Load the ``mtp.*`` draft weights from the (full) checkpoint dict.
 
@@ -2109,6 +2119,7 @@ class DSv4DSparkForCausalLM(nn.Module):
         remap (``remap_dspark_draft_keys``) onto the shared V4 weight loader.
         """
         remapped = remap_dspark_draft_keys(weights, num_stages=self.num_stages)
+        self._prepare_confidence_head_for_load(remapped)
         logger.info(
             f"[DSpark] loading {len(remapped)} draft params across {self.num_stages} stages"
         )
@@ -2735,14 +2746,74 @@ class GQADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
     # _paged_ctx_cache is False here, so VANILLA is the only route to the arena.
     _default_attention_backend = "TRTLLM"
 
-    def __init__(self, draft_config, *, dflash_attention_backend: str = "AUTO"):
+    def __init__(
+        self,
+        draft_config,
+        *,
+        dflash_attention_backend: str = "AUTO",
+        spec_mask_token_id: Optional[int] = None,
+    ):
         super().__init__(draft_config, dflash_attention_backend=dflash_attention_backend)
+        # The worker embeds the speculative config's mask id when it has one, and that config also reads keys the
+        # drafter config resolution does not (``dspark_noise_token_id``). Adopting it keeps the trained row of the id
+        # the worker uses.
+        if spec_mask_token_id is not None and int(spec_mask_token_id) != self.mask_token_id:
+            logger.info(
+                f"{type(self).__name__}: mask_token_id {int(spec_mask_token_id)} from the speculative config "
+                f"(the drafter config resolves {self.mask_token_id})."
+            )
+            self.mask_token_id = int(spec_mask_token_id)
         self._init_dspark_heads(draft_config.pretrained_config)
 
     def load_weights(self, weights: Dict, weight_mapper=None, **kwargs):
         """Take the DSpark head weights, then hand the rest to DFlash."""
         weights, _ = self._take_dspark_head_weights(weights)
-        return super().load_weights(weights, weight_mapper=weight_mapper, **kwargs)
+        # Checked before the load so a bad row fails early; placed after it, once ``fc`` (its device) exists.
+        mask_row = self._trained_mask_row(weights)
+        loaded = super().load_weights(weights, weight_mapper=weight_mapper, **kwargs)
+        if mask_row is not None:
+            self.mask_token_embedding = mask_row.to(
+                device=self.fc.weight.device, dtype=self.model_config.torch_dtype
+            )
+        return loaded
+
+    def _trained_mask_row(self, weights: Dict) -> Optional[torch.Tensor]:
+        """The checkpoint's own embedding row for the mask token, [hidden_size]; None if it ships no embedding.
+
+        This drafter takes the target's embedding (``load_weights_from_target_model``). A drafter checkpoint that ships
+        an embedding has trained the mask token's row, which the target's embedding does not have: the block decode
+        reads ``mask_token_embedding`` for every masked slot instead of the shared lookup. Only that row is kept: in
+        the Kimi K3 drafter (RedHatAI/Kimi-K3-speculator.dspark) it is the only row of the shipped embedding that
+        differs from the target's, and the shipped ``lm_head`` is bit-exact with the target's.
+
+        Raises:
+            ValueError: the embedding is not ``[rows, hidden_size]``, or the mask id in use is not one of its rows.
+        """
+        names = [k for k in ("embed_tokens.weight", "model.embed_tokens.weight") if k in weights]
+        if not names:
+            return None
+        name = names[0]
+        weight = weights[name]
+        hidden_size = self.config.hidden_size
+        if weight.dim() != 2 or weight.shape[1] != hidden_size:
+            raise ValueError(
+                f"{type(self).__name__}: the checkpoint's {name} has shape {list(weight.shape)}, "
+                f"expected [rows, hidden_size={hidden_size}]."
+            )
+        if 0 <= self.mask_token_id < weight.shape[0]:
+            return weight[self.mask_token_id]
+        if self.mask_token_id == self.config.vocab_size:
+            # DFlash's default id, used when no config names a mask token.
+            logger.warning(
+                f"{type(self).__name__}: the checkpoint ships {name}, but mask_token_id is DFlash's default "
+                f"({self.mask_token_id} = vocab_size, outside its {weight.shape[0]} rows): no trained mask row is "
+                "kept, and the masked slots use the shared embedding's row."
+            )
+            return None
+        raise ValueError(
+            f"{type(self).__name__}: mask_token_id {self.mask_token_id} is not a row of the checkpoint's {name} "
+            f"({weight.shape[0]} rows)."
+        )
 
 
 class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
@@ -2773,10 +2844,13 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
     # head, head_dim 576) would fail both. The backend NAME still selects, via
     # _mla_block_decode_variant below.
     _uses_worker_attention_backend = False
-    # Selectable but not the default: needs a cute_dsl_mla_decode_fp16_blackwell
-    # taking per-token kv_bounds, absent on this branch. Worth 35.7% off the
-    # drafter region (947.50 -> 608.95 us/iter, jobs 3006025/3006026).
-    _default_attention_backend = "TRTLLM"
+    # CUTEDSL by default: one cute-dsl pass over context and block through the
+    # per-token kv_bounds of cute_dsl_mla_decode_fp16_blackwell, with no
+    # upper-triangle fixup -- 35.7% off the drafter region (947.50 -> 608.95
+    # us/iter) at unchanged acceptance and accuracy. It does not degrade (see
+    # _auto_fallback_attention_backend): a build without the kernel raises in
+    # __init__ with the reason from cute_dsl_mla_decode_unavailability_reason.
+    _default_attention_backend = "CUTEDSL"
     _supported_attention_backends = ("VANILLA", "TRTLLM", "CUTEDSL")
     # No AUTO degrade. This drafter needs a 288 GB Blackwell part to hold the
     # target at all, so a build that cannot run its kernels cannot run the
@@ -2962,8 +3036,7 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
                 f"attention_backend='CUTEDSL' cannot serve this shape: batch={batch}, "
                 f"block_size={block_size}, page_size={page_size}, "
                 f"num_heads={self._num_heads}, dtype={dtype}. Use "
-                f"attention_backend='TRTLLM', or set kv_cache_config.tokens_per_block "
-                f"to a divisor of 128 other than 1."
+                f"attention_backend='TRTLLM'."
             )
         self._cute_dsl_checked_shape = key
 
@@ -3490,12 +3563,16 @@ def _build_dspark_draft(model_config, draft_config, lm_head, model):
     # (``DFlashForCausalLM.__init__``) already resolves the backbone through the
     # model registry, so keying on model_type a second time would force a new
     # entry for every GQA family that already works.
-    drafter_cls = (
-        MLADSparkForCausalLM if is_mla(draft_config.pretrained_config) else GQADSparkForCausalLM
-    )
-    return drafter_cls(
+    if is_mla(draft_config.pretrained_config):
+        return MLADSparkForCausalLM(
+            draft_config,
+            dflash_attention_backend=model_config.spec_config.attention_backend,
+        )
+    # The drafter's own ModelConfig has no spec_config, so the worker's mask id is handed over here.
+    return GQADSparkForCausalLM(
         draft_config,
         dflash_attention_backend=model_config.spec_config.attention_backend,
+        spec_mask_token_id=model_config.spec_config.mask_token_id,
     )
 
 
