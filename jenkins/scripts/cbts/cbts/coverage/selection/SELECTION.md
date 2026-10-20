@@ -1,3 +1,6 @@
+<!-- SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved. -->
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+
 # CBTS Coverage Selection
 
 How the touch DB is turned into a decision about which cases to run. Collection side:
@@ -154,6 +157,14 @@ for a module-level change. A file whose whole diff survives that stripping as em
 executable line — neither added nor removed, since `-` lines anchor at the following post-image
 line — so it contributes no impacted tests at all. Tier 1's rules already read diffs through the
 same stripping, so this introduces no assumption the pipeline does not already make.
+
+Verified literal docstring edits have a separate `DocsRule` contribution. For a
+mixed file, coverage uses its executable selection diff to compute changed lines
+and deletions, while reconstructing the pre-image from the original patch.
+Docstring edits therefore do not add function, class, or module impact here;
+the remaining code changes retain the same narrowing and decline policies.
+The resulting stage set unions with every rule contribution, including
+`CPU-Build_Docs`, which is not represented by a test-db block.
 
 ## 6. Tests that are never skipped
 
