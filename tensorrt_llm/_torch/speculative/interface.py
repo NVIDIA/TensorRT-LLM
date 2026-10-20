@@ -50,6 +50,8 @@ from ..pyexecutor.sampler.ops import flashinfer as flashinfer_sampling
 from ..pyexecutor.sampler.ops.vanilla import greedy_search_sampling_batch
 from .fast_rejection_sampling import (fast_rs_draft_block, fast_rs_enabled,
                                       fast_rs_supported, fast_rs_verify)
+from .fast_topp_rejection_sampling import (fast_topp_rs_draft_block,
+                                           fast_topp_rs_verify)
 from .fused_accept import MAX_DRAFT_LEN, fused_strict_accept
 from .greedy_argmax import greedy_argmax
 from .spec_tail_kernels import strict_accept
@@ -2816,21 +2818,24 @@ class SpecWorkerBase(nn.Module, ABC):
                          site: str = "verify") -> bool:
         """Whether the fused rejection-sampling kernels cover this step.
 
-        ``TLLM_SPEC_FAST_RS=1`` opts in. The kernels implement temperature-only
-        sampling, so the deploy-time ``advanced_sampling_mode`` must disable both
-        filters (``no_topk_no_topp``; the reference path ignores per-request
-        top-k / top-p in that mode too). They also need a shared draft/target
-        vocabulary, full-vocab fp32 logits, no synthetic acceptance override
-        and no guided decoding (not validated with the fused path). Host-side
-        checks only, so the decision is CUDA-graph safe. With the flag off
-        nothing else is read, so the reference dispatch is unchanged. The first
-        decision of each call site (``site``) is logged once per worker, so a
-        run's log shows which path the opt-in took.
+        ``TLLM_SPEC_FAST_RS=1`` opts in. The kernels implement temperature
+        sampling with an optional top-p nucleus, so the deploy-time
+        ``advanced_sampling_mode`` must disable top-k: ``no_topk_no_topp`` (pure
+        temperature, the original fused kernels) or ``no_topk`` (top-p honoured,
+        the nucleus kernels of `fast_topp_rejection_sampling`; the reference
+        path applies the same per-request filters in these modes). They also
+        need a shared draft/target vocabulary, full-vocab fp32 logits, no
+        synthetic acceptance override and no guided decoding (not validated
+        with the fused path). Host-side checks only, so the decision is CUDA-
+        graph safe. With the flag off nothing else is read, so the reference
+        dispatch is unchanged. The first decision of each call site (``site``)
+        is logged once per worker, so a run's log shows which path the opt-in
+        took.
         """
         if not fast_rs_enabled():
             return False
         mode = spec_metadata.advanced_sampling_mode
-        applies = (mode.skips_top_k and mode.skips_top_p and self._d2t is None
+        applies = (mode.skips_top_k and self._d2t is None
                    and self.guided_decoder is None
                    and self.force_num_accepted_tokens == 0.0
                    and not isinstance(logits, VocabShardedLogits)
@@ -2843,14 +2848,16 @@ class SpecWorkerBase(nn.Module, ABC):
             reported.add(site)
             if applies:
                 logger.info("TLLM_SPEC_FAST_RS=1: fused rejection sampling "
-                            f"active ({site}).")
+                            f"active ({site}; "
+                            f"{'temperature' if mode.skips_top_p else 'top-p'}"
+                            " kernels).")
             else:
                 logger.warning(
                     "TLLM_SPEC_FAST_RS=1 but the fused rejection sampling does "
                     f"not cover this step ({site}; it needs advanced_sampling_"
-                    "mode=no_topk_no_topp, a shared draft/target vocabulary, "
-                    "full-vocab fp32 logits and no guided decoding; mode="
-                    f"{mode.name}); using the reference path.")
+                    "mode=no_topk or no_topk_no_topp, a shared draft/target "
+                    "vocabulary, full-vocab fp32 logits and no guided decoding; "
+                    f"mode={mode.name}); using the reference path.")
         return applies
 
     @staticmethod
@@ -2882,9 +2889,11 @@ class SpecWorkerBase(nn.Module, ABC):
             num_contexts,
             batch_size,
             slot=spec_metadata.rng_accept_slot)
-        gen_accepted, gen_num_accepted = fast_rs_verify(
+        rows_args = (
             logits[num_contexts:gen_end],
             spec_metadata.temperatures[num_contexts:gen_end],
+        )
+        req_args = (
             draft_tokens.to(torch.int32).contiguous(),
             spec_metadata.batch_slot_ids[num_contexts:batch_size],
             self._fast_rs_dummy_row(spec_metadata),
@@ -2892,6 +2901,14 @@ class SpecWorkerBase(nn.Module, ABC):
             seed,
             offset,
         )
+        if spec_metadata.advanced_sampling_mode.skips_top_p:
+            gen_accepted, gen_num_accepted = fast_rs_verify(
+                *rows_args, *req_args)
+        else:
+            # Top-p honoured (no_topk): verify against the targets' nuclei.
+            gen_accepted, gen_num_accepted = fast_topp_rs_verify(
+                rows_args[0], rows_args[1],
+                spec_metadata.top_ps[num_contexts:gen_end], *req_args)
         if num_contexts == 0:
             return gen_accepted, gen_num_accepted
         accepted_tokens = torch.empty((batch_size, runtime_draft_len + 1),
@@ -3294,16 +3311,28 @@ class SpecWorkerBase(nn.Module, ABC):
             # Fused: the proposals go straight to draft_probs[slot, 0:K]; draft
             # position i of request b draws from subsequence b * K + i at
             # offset + 1 (see the Philox layout in fast_rejection_sampling).
-            tokens = fast_rs_draft_block(
-                flat_view,
-                spec_metadata.request_temperatures[num_contexts:batch_size],
+            req_temps = spec_metadata.request_temperatures[
+                num_contexts:batch_size]
+            req_args = (
                 spec_metadata.batch_slot_ids[num_contexts:batch_size],
                 self._fast_rs_dummy_row(spec_metadata),
                 spec_metadata.draft_probs,
                 spec_metadata.request_seeds[num_contexts:batch_size],
                 spec_metadata.request_offsets[num_contexts:batch_size],
-                step_offset=1,
             )
+            if spec_metadata.advanced_sampling_mode.skips_top_p:
+                tokens = fast_rs_draft_block(flat_view,
+                                             req_temps,
+                                             *req_args,
+                                             step_offset=1)
+            else:
+                # Top-p honoured (no_topk): sample from, and store, the nucleus.
+                tokens = fast_topp_rs_draft_block(
+                    flat_view,
+                    req_temps,
+                    spec_metadata.request_top_ps[num_contexts:batch_size],
+                    *req_args,
+                    step_offset=1)
             spec_metadata.draft_probs_last_dim = vocab
             return tokens.reshape(num_gens, K)
 

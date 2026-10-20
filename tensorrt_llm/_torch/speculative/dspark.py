@@ -38,6 +38,7 @@ from ..pyexecutor.llm_request import ATTENTION_DP_DUMMY_REQUEST_ID
 from .dflash import DFlashWorker, VocabParallelDraftTokens, dflash_draft_slot_ids
 from .dspark_schedule import NEUTRAL_CONFIDENCE_LOGIT
 from .fast_rejection_sampling import fast_rs_draft_markov_feedback
+from .fast_topp_rejection_sampling import fast_topp_rs_draft_markov_feedback
 from .interface import SpecMetadata, SpecWorkerBase
 from .vocab_parallel import tp_pair_exchange
 
@@ -1347,7 +1348,7 @@ class DSparkWorker(DFlashWorker):
 
         Needs the opt-in (``TLLM_DSPARK_MARKOV_SAMPLED_FEEDBACK=1``), a Markov head, a
         rejection-sampling batch (the drafts are drawn, not argmaxed) and the fused
-        rejection-sampling path (``TLLM_SPEC_FAST_RS=1`` with a filter-free sampling mode) over
+        rejection-sampling path (``TLLM_SPEC_FAST_RS=1`` with a top-k-free sampling mode) over
         full-vocab fp32 logits. Otherwise the greedy chain stays, which is lossless too (the
         proposal is then conditioned on the argmax tokens).
         """
@@ -1381,8 +1382,8 @@ class DSparkWorker(DFlashWorker):
             else:
                 logger.warning(
                     "TLLM_DSPARK_MARKOV_SAMPLED_FEEDBACK=1 needs TLLM_SPEC_FAST_RS=1, "
-                    "advanced_sampling_mode=no_topk_no_topp and full-vocab draft logits; "
-                    "keeping the greedy Markov chain for the rejection proposal."
+                    "advanced_sampling_mode=no_topk or no_topk_no_topp and full-vocab draft "
+                    "logits; keeping the greedy Markov chain for the rejection proposal."
                 )
         return applies
 
@@ -1404,19 +1405,31 @@ class DSparkWorker(DFlashWorker):
         not apply."""
         if not self._markov_sampled_feedback_applies(draft_model, gen_logits, spec_metadata):
             return None
-        tokens = fast_rs_draft_markov_feedback(
+        chain_args = (
             gen_logits,
             inputs["first_prev_tokens"],
             draft_model.markov_w1,
             draft_model.markov_w2,
             spec_metadata.request_temperatures[num_contexts:batch_size],
+        )
+        req_args = (
             spec_metadata.batch_slot_ids[num_contexts:batch_size],
             self._fast_rs_dummy_row(spec_metadata),
             spec_metadata.draft_probs,
             spec_metadata.request_seeds[num_contexts:batch_size],
             spec_metadata.request_offsets[num_contexts:batch_size],
-            step_offset=1,
         )
+        if spec_metadata.advanced_sampling_mode.skips_top_p:
+            tokens = fast_rs_draft_markov_feedback(*chain_args, *req_args, step_offset=1)
+        else:
+            # Top-p honoured (no_topk): the chain advances on tokens drawn from the nuclei the
+            # verifier's targets are filtered to, and each stored proposal is its nucleus.
+            tokens = fast_topp_rs_draft_markov_feedback(
+                *chain_args,
+                spec_metadata.request_top_ps[num_contexts:batch_size],
+                *req_args,
+                step_offset=1,
+            )
         spec_metadata.draft_probs_last_dim = gen_logits.shape[-1]
         return tokens
 
