@@ -28,6 +28,6 @@ measured: []
 - **Apply via:** enable CUDA-graph padding with the spec config (MTP path in `pyexecutor/model_engine.py`); attention-DP equalization in `py_executor.py` (`expected_num_active_requests`). Delegate to **perf-torch-cuda-graphs**.
 - **Expected effect:** higher CUDA-graph hit rate (fewer eager fallbacks) under MTP and uneven DP → lower per-step launch overhead; no number — measured Δ to be recorded from run.
 - **Accuracy risk:** lossless — padding adds dummy requests/tokens that are discarded. Care: dummies must be cleaned up (`_finish_dummy_request`) with reserved non-conflicting IDs.
-- **Verify:** confirm CUDA graph used instead of eager on MTP / uneven-DP steps (nsys, ad-conf-check); padded dummy width == `1 + max_draft_tokens`; outputs/accuracy unchanged.
+- **Verify:** confirm CUDA graph used instead of eager on MTP / uneven-DP steps (nsys, config/log inspection); padded dummy width == `1 + max_draft_tokens`; outputs/accuracy unchanged.
 - **Rollback:** disable CUDA-graph padding (eager on mismatched steps). Trigger: dummy-request lifecycle bugs or DP rank-balancing regressions.
 - **Prior art:** PRs #3096, #3010. Files: `_torch/pyexecutor/model_engine.py`, `pyexecutor/py_executor.py`, `pyexecutor/resource_manager.py`. Owning specialist: **perf-torch-cuda-graph-specialist**.

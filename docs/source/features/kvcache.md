@@ -206,7 +206,9 @@ snapshots only.
 
 KV cache salting provides a security mechanism to control which requests can reuse cached KV states. When a `cache_salt` parameter is provided with a request, the KV cache system will only allow reuse of cached blocks given the same cache salt value. This prevents potential security issues such as prompt theft attacks, where malicious users might try to infer information from cached states of other users' requests.
 
-To use cache salting, specify the `cache_salt` parameter as a string when creating requests. Only requests with matching cache salt values can share cached KV blocks. The salt value can be any non-empty string, such as a user ID, tenant ID, or hash string.
+To use cache salting, specify the `cache_salt` parameter as a string when creating requests. Only requests with matching cache salt values can share cached KV blocks. The salt value can be a user ID, tenant ID, or hash string. V2 uses the complete UTF-8 string in its reuse scope; an empty string is distinct from an omitted salt.
+
+V2 stored events report the scope's string in `cache_salt`. For ordinary requests this is the supplied value. CSA2 with encoder replay enabled adds its encoder-replay namespace to the scope, so its events report that effective namespace. The integer salt conversion used by `v1_block_key` events is confined to event hashing and matches the router; it does not affect V2 reuse identity.
 
 This isolation is enforced entirely by the block-key hash: the salt is mixed into the hashed input and prefix matching is decided by digest equality alone (blocks are not re-compared token-by-token). The block-key hash is therefore required to be a cryptographic hash with strong collision resistance and a 256-bit digest (SHA-256 provides ~128-bit collision resistance, which is ample here); substituting a non-cryptographic hash would allow crafted collisions to bypass salt isolation and must not be done.
 

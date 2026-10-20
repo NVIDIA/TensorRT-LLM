@@ -15,9 +15,10 @@
 """TrtllmCutedslFusedFc12Nvfp4Impl: ``trtllm.cutedsl.fused_fc12.nvfp4``.
 
 FC1+FC2-fused CuteDSL NVFP4 MoE backend for Rubin (SM107). One persistent kernel
-(``trtllm::cute_dsl_nvfp4_fc12_fused_rubin``) does gather + FC1 GEMM + SwiGLU +
-requant + FC2 GEMM + finalize (scatter-add into ``moe_output``), so the FC1->FC2
-intermediate never round-trips through global memory.
+(``trtllm::cute_dsl_nvfp4_fc12_fused_rubin``) does gather + FC1 GEMM + gated
+epilogue (SwiGLU, or SiTU for Kimi K3) + requant + FC2 GEMM + finalize
+(scatter-add into ``moe_output``), so the FC1->FC2 intermediate never
+round-trips through global memory.
 
 A leaf in the ``MoEImplBase`` sense: it declares its ``descriptor``, registers
 itself, and owns the four abstract methods. The NVFP4 weight layout, quant method
@@ -106,7 +107,7 @@ class TrtllmCutedslFusedFc12Nvfp4Impl(MoEImplBase):
             supports_apply_router_weight_on_input=True,
         ),
         input_requirement=MoEInputRequirement(routing_scales_dtype=torch.float32),
-        doc="Rubin (SM107) NVFP4 fused FC1 + SwiGLU + FC2 + finalize persistent "
+        doc="Rubin (SM107) NVFP4 fused FC1 + SwiGLU/SiTU + FC2 + finalize persistent "
         "CuTe DSL grouped GEMM.",
     )
     # Taken off the descriptor rather than restated: the scheduler reads these
@@ -116,11 +117,14 @@ class TrtllmCutedslFusedFc12Nvfp4Impl(MoEImplBase):
     capabilities = descriptor.capabilities
     input_requirement = descriptor.input_requirement
 
-    # The fused FC12 kernel has no activation selector: FC1 weights are the
-    # gate/up pair and the epilogue is SwiGLU (+ clamp). Relu2 is not gated and
-    # is not supported, so the resolver turns such layers down here.
+    # FC1 weights are the gate/up pair and the epilogue is a trace-time
+    # specialization of SwiGLU (+ clamp) or SiTU, whose two soft-caps arrive as
+    # the uniform-scalar alpha/beta pair (``SiTuActivation.constants()``). Relu2
+    # is not gated and is not supported, so the resolver turns such layers down
+    # here.
     activation_support = MoEActivationSupport(
-        kinds=frozenset({ActivationType.Swiglu}),
+        kinds=frozenset({ActivationType.Swiglu, ActivationType.SiTu}),
+        alpha_beta=ActivationParamShape.UNIFORM_SCALAR,
         limit=ActivationParamShape.UNIFORM_SCALAR,
         limit_when_absent=float("inf"),
     )
@@ -380,6 +384,9 @@ class TrtllmCutedslFusedFc12Nvfp4Impl(MoEImplBase):
             local_expert_offset=weight_view.slot_start,
             enable_finalize_fusion=self.use_fused_finalize,
             enable_alltoall=enable_alltoall,
+            # The inner kernel cache keys on the epilogue; the outer AutoTuner
+            # unique_id must too, or SwiGLU and SiTU layers share a tactic.
+            workload_identity=self._epilogue_identity(),
         )
         inputs = [x, token_selected_experts, token_final_scales, x_sf, moe_output, weight_view]
         _, best_tactic = tuner.choose_one(
@@ -389,6 +396,19 @@ class TrtllmCutedslFusedFc12Nvfp4Impl(MoEImplBase):
             inputs,
         )
         return runner(inputs, tactic=best_tactic)
+
+    def _situ_betas(self) -> tuple[float, float]:
+        """``(situ_beta, situ_linear_beta)`` for the fused op; -1 disables them.
+
+        ``SiTuActivation.constants()`` lands gate_softcap in ``act_alpha`` and
+        linear_softcap in ``act_beta``, the same mapping CuteDslFusedMoE uses.
+        """
+        if self.activation_type != ActivationType.SiTu:
+            return -1.0, -1.0
+        return float(self.act_alpha), float(self.act_beta)
+
+    def _epilogue_identity(self) -> tuple[int, float, float]:
+        return (int(self.activation_type), *self._situ_betas())
 
     def run_moe_nvfp4_impl(
         self,
@@ -417,6 +437,7 @@ class TrtllmCutedslFusedFc12Nvfp4Impl(MoEImplBase):
         )
         effective_top_k = token_selected_experts.size(1)
         esp = weight_view.expert_size_per_partition
+        situ_beta, situ_linear_beta = self._situ_betas()
         slot_start = weight_view.slot_start
 
         (
@@ -436,8 +457,9 @@ class TrtllmCutedslFusedFc12Nvfp4Impl(MoEImplBase):
             tile_tokens_dim=tile_size,
         )
 
-        # One fused op: gather + FC1 GEMM + SwiGLU + requant + FC2 GEMM +
-        # finalize (scatter-add into moe_output = a2a combine workspace).
+        # One fused op: gather + FC1 GEMM + gated act (SwiGLU or SiTU) + requant
+        # + FC2 GEMM + finalize (scatter-add into moe_output = a2a combine
+        # workspace).
         # fc1_alpha/fc2_alpha map 1:1 to the two-op path's per-expert global
         # scales (the kernel takes split alphas). The three atomic counters are
         # allocated + memset inside the op runner. The moe_output zeroing memset
@@ -471,6 +493,9 @@ class TrtllmCutedslFusedFc12Nvfp4Impl(MoEImplBase):
             ep_size=self.mapping.moe_ep_size,
             enable_alltoall=enable_alltoall,
             scaling_vector_size=16,
+            activation_type=int(self.activation_type),
+            situ_beta=situ_beta,
+            situ_linear_beta=situ_linear_beta,
         )
         return moe_output
 

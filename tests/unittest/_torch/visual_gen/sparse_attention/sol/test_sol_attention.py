@@ -41,22 +41,24 @@ from tensorrt_llm._torch.attention.backends.sparse.hooks import prepare_sparse_r
 from tensorrt_llm._torch.attention.backends.sparse.params import BlockSparseForwardInputs
 from tensorrt_llm._torch.attention.backends.sparse.timestep_phase import graph_phase_for_timestep
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention as CoreTrtllmAttention
-from tensorrt_llm._torch.visual_gen.attention_backend import CuTeDSLAttention
-from tensorrt_llm._torch.visual_gen.attention_backend.sparse.sol import backend as sol_backend
-from tensorrt_llm._torch.visual_gen.attention_backend.sparse.sol import predictor as sol_predictor
-from tensorrt_llm._torch.visual_gen.attention_backend.sparse.sol.backend import (
+from tensorrt_llm._torch.visual_gen.attention import attention as attention_module
+from tensorrt_llm._torch.visual_gen.attention.attention import Attention, QKVMode
+from tensorrt_llm._torch.visual_gen.attention.backends import CuTeDSLAttention
+from tensorrt_llm._torch.visual_gen.attention.backends.sparse.sol import backend as sol_backend
+from tensorrt_llm._torch.visual_gen.attention.backends.sparse.sol import predictor as sol_predictor
+from tensorrt_llm._torch.visual_gen.attention.backends.sparse.sol.backend import (
     SOLCuTeDSLAttention,
     SOLTrtllmAttention,
 )
-from tensorrt_llm._torch.visual_gen.attention_backend.sparse.sol.params import SolParams
-from tensorrt_llm._torch.visual_gen.attention_backend.sparse.sol.predictor import (
+from tensorrt_llm._torch.visual_gen.attention.backends.sparse.sol.params import SolParams
+from tensorrt_llm._torch.visual_gen.attention.backends.sparse.sol.predictor import (
     SolPredictorOutputs,
 )
-from tensorrt_llm._torch.visual_gen.attention_backend.trtllm import (
+from tensorrt_llm._torch.visual_gen.attention.backends.trtllm import (
     TrtllmAttention,
     TrtllmAttentionMetadata,
 )
-from tensorrt_llm._torch.visual_gen.attention_backend.utils import create_attention
+from tensorrt_llm._torch.visual_gen.attention.backends.utils import create_attention
 from tensorrt_llm._torch.visual_gen.config import (
     DiffusionModelConfig,
     create_attention_metadata_state,
@@ -68,8 +70,6 @@ from tensorrt_llm._torch.visual_gen.cuda_graph_runner import (
     resolved_extra_keys_scope,
 )
 from tensorrt_llm._torch.visual_gen.models.modeling import BaseDiffusionModel
-from tensorrt_llm._torch.visual_gen.modules import attention as attention_module
-from tensorrt_llm._torch.visual_gen.modules.attention import Attention, QKVMode
 from tensorrt_llm.visual_gen import SolAttentionConfig
 from tensorrt_llm.visual_gen.args import AttentionConfig, QuantAttentionConfig
 

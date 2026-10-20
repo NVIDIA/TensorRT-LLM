@@ -30,11 +30,30 @@ if TYPE_CHECKING:
 class BaseDiffusionModel(nn.Module):
     """Base class for TRT-LLM VisualGen model components."""
 
+    # Set to True by models that implement parallel_config.tp_layout='token_sharded'.
+    _supports_token_sharded_tp = False
+
     def __init__(self, model_config: DiffusionModelConfig):
         super().__init__()
+        if model_config.parallel.token_sharded_tp and not self._supports_token_sharded_tp:
+            raise ValueError(
+                "parallel_config.tp_layout='token_sharded' is not implemented for "
+                f"{type(self).__name__}; unset tp_layout to use all-reduce tensor parallelism."
+            )
         self.model_config = model_config
         self.component_name = model_config.component_name
         self.pretrained_config = model_config.pretrained_config
+
+    def _apply_tp_layout(self) -> None:
+        """Apply ``parallel_config.tp_layout``; call at the end of ``__init__``."""
+        if not self.model_config.parallel.token_sharded_tp:
+            return
+        from ..parallel.token_sharded_modules import convert_to_token_sharded_tp
+        from ..parallel.token_sharded_tp import TokenShardedSequenceSharder, TokenShardedTP
+
+        tp = TokenShardedTP.from_model_config(self.model_config)
+        self.sharder = TokenShardedSequenceSharder(tp)
+        convert_to_token_sharded_tp(self, tp)
 
     def forward(self, *args, timestep: torch.Tensor | None = None, **kwargs):
         """Run the diffusion transformer.

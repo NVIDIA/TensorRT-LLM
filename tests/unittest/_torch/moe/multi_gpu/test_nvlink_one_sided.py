@@ -532,8 +532,8 @@ def _run(case: Case, pools: dict[tuple[int, bool], MPIPoolExecutor]) -> None:
         "TRTLLM_NVLINK_ONE_SIDED_A2A_CFT_MAX_BATCH_FOR_COMBINE": "128",
         "TRTLLM_NVLINK_ONE_SIDED_A2A_WORKSPACE_MB": "",
         "TRTLLM_ENABLE_PDL": "1" if case.pdl else "0",
-        "TRTLLM_NVLINK_ONE_SIDED_A2A_TIMEOUT_SEC": "30",
-        "TRTLLM_NVLINK_ONE_SIDED_A2A_WARMUP_TIMEOUT_SEC": "60",
+        "TRTLLM_MOE_COMM_TIMEOUT_SEC": "30",
+        "TRTLLM_MOE_COMM_WARMUP_TIMEOUT_SEC": "60",
     }
     key = (case.ep_size, case.pdl)
     if key not in pools:

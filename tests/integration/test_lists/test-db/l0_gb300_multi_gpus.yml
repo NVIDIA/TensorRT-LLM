@@ -17,9 +17,17 @@ l0_gb300_multi_gpus:
   tests:
   # One ordered sequence in one job: the cases share module-global rank state.
   - unittest/_torch/modeling_v2/comm
-  - accuracy/test_modeling_v2_deepseek_v3.py::TestModelingV2DeepseekR10528Nvfp4Sm103Dep4::test_gsm8k_identity_vs_mtp3
-  - accuracy/test_modeling_v2_deepseek_v3.py::TestModelingV2DeepseekR10528Nvfp4Sm103Dep4::test_mtp3_acceptance[modeling_v2]
-  - accuracy/test_modeling_v2_deepseek_v3.py::TestModelingV2DeepseekR10528Nvfp4Sm103Dep4::test_mtp3_acceptance[stock]
+  - accuracy/modeling_v2/test_deepseek_v3.py::TestModelingV2DeepseekR10528Nvfp4Sm10xDefault::test_gsm8k_identity_vs_mtp3[dep4]
+  - accuracy/modeling_v2/test_deepseek_v3.py::TestModelingV2DeepseekR10528Nvfp4Sm10xDefault::test_mtp3_acceptance[modeling_v2-dep4]
+  - accuracy/modeling_v2/test_deepseek_v3.py::TestModelingV2DeepseekR10528Nvfp4Sm10xDefault::test_mtp3_acceptance[stock-dep4]
+  - accuracy/modeling_v2/test_gpt_oss.py::TestModelingV2GptOss120bSm10xDefault::test_gsm8k[tp2]
+  - accuracy/modeling_v2/test_gpt_oss.py::TestModelingV2GptOss120bSm10xDefault::test_gsm8k[tp4_ep4]
+  - accuracy/modeling_v2/test_gpt_oss.py::TestModelingV2GptOss120bSm10xDefault::test_gsm8k[dep4_moetp2_ep2]
+  - accuracy/modeling_v2/test_deepseek_v3.py::TestModelingV2DeepseekR10528Nvfp4Sm10xDefault::test_gsm8k[tp4]
+  - accuracy/modeling_v2/test_deepseek_v3.py::TestModelingV2DeepseekR10528Nvfp4Sm10xDefault::test_gsm8k[tp4_ep4]
+  - accuracy/modeling_v2/test_deepseek_v3.py::TestModelingV2DeepseekR10528Nvfp4Sm10xDefault::test_gsm8k[dep4_moetp4]
+  - accuracy/modeling_v2/test_deepseek_v3.py::TestModelingV2DeepseekR10528Nvfp4Sm10xDefault::test_gsm8k_chunked_prefill[tp4_ep4]
+  - accuracy/modeling_v2/test_deepseek_v3.py::TestModelingV2DeepseekR10528Nvfp4Sm10xDefault::test_gsm8k_chunked_prefill[dep4]
   # Covers tests/unittest/_torch/attention/. Two sub-trees moved in here from elsewhere
   # under tests/unittest/_torch/ and have no entry of their own on any list, so this entry
   # is what picks them up:
@@ -30,8 +38,10 @@ l0_gb300_multi_gpus:
   #               every stage that collects them, including where the tests themselves skip.
   - unittest/_torch/attention TIMEOUT (120)
   - unittest/_torch/thop/parallel
+  - unittest/_torch/kernels/parallel
   - unittest/_torch/visual_gen/kernels/parallel
   - unittest/_torch/thop/serial
+  - unittest/_torch/kernels/serial
   - unittest/_torch/executor
   - unittest/_torch/disaggregation
   # GLM-5.3-Flash: ADP/MTP/FP8-KV and non-speculative prefix reuse.
@@ -67,6 +77,7 @@ l0_gb300_multi_gpus:
   # round-trip. Both are single-device cases that use GPU 0 only.
   - unittest/_torch/modules/kimi_kda/test_kda_host_metadata.py
   - unittest/_torch/modules/kimi_kda/test_kimi_kda_bf16_state_pool.py
+  - unittest/_torch/modules/kimi_kda/test_kda_mixed_batch_core_layout.py
   # Kimi K3 MoE routing shape on the TRTLLM backend (random weights, no
   # checkpoint; the case moved out of the skipped TestMoeFp4 class).
   - unittest/_torch/moe/test_moe_backend.py -k "kimi_k3_shape"
