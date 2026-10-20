@@ -19,11 +19,19 @@ placeholder per media item, so it goes to the input processor marked
 ``chat_template_applied``; a pre-tokenized request does not.
 """
 
+import base64
+import io
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+from PIL import Image
 
 from tensorrt_llm.serve.openai_server import OpenAIServer
+
+from .openai_server_stub import make_stub_openai_server
 
 pytestmark = pytest.mark.cpu_only
 
@@ -60,3 +68,81 @@ def test_item_order_is_attached_only_when_given():
         prompt, SimpleNamespace(prompt_token_ids=None), {"image": [object()]}, []
     )
     assert "mm_item_order" not in prompt
+
+
+class _StubModelConfig:
+    model_type = "qwen3_vl"
+    vocab_size = 1024
+
+
+class _StubTokenizer:
+    """Renders every conversation to one fixed prompt."""
+
+    RENDERED = "<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|>describe<|im_end|>\n"
+
+    def __init__(self):
+        self.tokenizer = self
+        self.vocab_size = _StubModelConfig.vocab_size
+        self.name_or_path = None
+        self.template_calls = 0
+
+    def apply_chat_template(self, *args, **kwargs) -> str:
+        self.template_calls += 1
+        return self.RENDERED
+
+    def encode(self, text, **kwargs):
+        return [1, 2, 3]
+
+
+def test_rendered_image_request_reaches_the_engine_marked_templated(tmp_path):
+    """Without ``prompt_token_ids`` the chat route renders the prompt itself.
+
+    The engine must receive that rendered prompt, the decoded image, and
+    ``chat_template_applied`` so the input processor does not render the
+    template a second time.
+    """
+    captured = {}
+
+    def generate_async(*, inputs, **kwargs):
+        captured["inputs"] = inputs
+        return SimpleNamespace(prompt_token_ids=[7, 11], finished=True)
+
+    tokenizer = _StubTokenizer()
+    server = make_stub_openai_server(
+        tmp_path, "test-vlm", _StubModelConfig(), generate_async, tokenizer=tokenizer
+    )
+    server.await_disconnected = AsyncMock()
+    server._create_chat_response = AsyncMock(
+        return_value=SimpleNamespace(model_dump=lambda: {"ok": True})
+    )
+    app = FastAPI()
+    app.add_api_route("/v1/chat/completions", server.openai_chat, methods=["POST"])
+
+    with io.BytesIO() as buf:
+        Image.new("RGB", (8, 8), (0, 128, 255)).save(buf, format="PNG")
+        image_url = "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
+    body = {
+        "model": "test-vlm",
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "describe"},
+                    {"type": "image_url", "image_url": {"url": image_url}},
+                ],
+            }
+        ],
+        "max_tokens": 4,
+    }
+    response = TestClient(app).post("/v1/chat/completions", json=body)
+    assert response.status_code == 200, response.text
+
+    prompt = captured["inputs"]
+    assert tokenizer.template_calls == 1
+    assert prompt["prompt"] == _StubTokenizer.RENDERED
+    assert "prompt_token_ids" not in prompt
+    assert prompt["chat_template_applied"] is True
+    assert len(prompt["multi_modal_data"]["image"]) == 1
+    (item,) = prompt["mm_item_order"]
+    assert (item["modality"], item["index"]) == ("image", 0)
+    assert item["placeholder"] in _StubTokenizer.RENDERED

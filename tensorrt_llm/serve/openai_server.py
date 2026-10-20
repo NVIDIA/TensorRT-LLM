@@ -2288,15 +2288,14 @@ class OpenAIServer(_VideoRoutesMixin):
             if request.prompt_token_ids is not None:
                 mm_data, mm_embeddings = await mm_coroutines
             if mm_data:
-                self._attach_multimodal_data(prompt, request, mm_data)
+                self._attach_multimodal_data(prompt, request, mm_data,
+                                             mm_item_order)
             if mm_embeddings:
                 prompt["multi_modal_embeddings"] = mm_embeddings
             if mm_data and mm_embeddings:
                 raise ValueError(
                     "Passing 'multi_modal_data' and 'multi_modal_embeddings' at the same time is not supported."
                 )
-            if mm_data and mm_item_order:
-                prompt["mm_item_order"] = mm_item_order
 
             if request.mm_processor_kwargs:
                 prompt["mm_processor_kwargs"] = request.mm_processor_kwargs
