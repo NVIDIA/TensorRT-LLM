@@ -55,6 +55,25 @@ def test_batched_item_partition_selects_items_and_preserves_views(
     assert shares_storage is is_view
 
 
+@pytest.mark.parametrize("targeted", [False, True])
+def test_audio_geometry_stays_on_cpu_during_nested_device_staging(targeted: bool) -> None:
+    audio = {
+        "input_audio_features": torch.zeros(3, 4, 2),
+        "audio_num_clips": torch.tensor([2, 1]),
+        "audio_output_lengths": torch.tensor([4, 2, 3]),
+    }
+    params = MultimodalParams(multimodal_data={"video": {"audio": audio}})
+    targets = [f"video.audio.{name}" for name in audio] if targeted else None
+
+    params.to_device("multimodal_data", "meta", target_keywords=targets)
+
+    staged = params.multimodal_data["video"]["audio"]
+    assert staged["input_audio_features"].device.type == "meta"
+    for name in ("audio_num_clips", "audio_output_lengths"):
+        assert staged[name] is audio[name]
+        assert staged[name].device.type == "cpu"
+
+
 @pytest.mark.parametrize("axis", [0, 1, -1])
 @pytest.mark.parametrize(
     ("indices", "is_view"),
