@@ -122,7 +122,7 @@ extern "C"
      * Slice j spans [j*8192,min((j+1)*8192,bytes)) in its virtual byte stream and can
      * cross any number of segments. It keeps ONE GPU/CTA/warp owner throughout.
      * This rank owns floor((first_slice+j*slice_stride)/slice_divisor). Uniform
-     * routing uses divisor=1, reciprocal=0 and retains the original integer path.
+     * routing uses divisor=1, reciprocal=0 and skips the division.
      * Otherwise reciprocal=UINT64_MAX/divisor enables an exact mulhi+correction.
      * prefix_end compacts rank-local slices across ranges for SM/worker round-robin.
      * No reset at weight boundaries.
