@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Paged K/V cache for a causal video rollout.
+"""Paged K/V cache for a block-causal video rollout.
 
 One rollout is one logical sequence laid out as
 
@@ -20,7 +20,7 @@ One rollout is one logical sequence laid out as
 
 held in a single pool of ``KVCacheManagerV2``. The manager provides the pool
 and the pages; this class owns the page table and the sliding window. Nothing
-here uses the manager's own sliding-window eviction, block reuse, or request
+here uses the manager's own sliding-window eviction, page reuse, or request
 scheduling, and no ``LlmRequest`` is ever created.
 
 The fixed region is the first ``pin_tokens`` tokens of the sequence, declared
@@ -35,13 +35,13 @@ history tokens share its last page, and after a rotation the fixed region's
 tail is copied into the page that now starts the history.
 
 Attention reads exactly what the model's window says. A paged kernel reads
-whole pages in table order and cuts only at the end, so every causal block of a
-forward gets its own table row: all pages the block attends to in full, then a
-few private pages holding copies of the tokens it attends to on its partial pages
-(committed_private and current_private), followed by the block's own tokens.
-The kernel is told the cached length up to
-the block's own tokens and reads nothing older than the window and nothing
-of later blocks. See ``_CausalBlockLayout``.
+whole pages in list order and cuts only at the end, so every causal block of a
+forward gets its own page list: all pages the causal block attends to in full,
+then a few private pages holding copies of the tokens it attends to on its partial
+pages (committed_private and current_private), followed by its own tokens. The
+kernel is told the cached length up to the causal block's own tokens and reads
+nothing older than the window and nothing of later causal blocks. See
+``_CausalBlockLayout``.
 
 Rotary positions are the caller's business and are absolute over the rollout;
 storage positions here never grow past the resident capacity.
@@ -81,47 +81,51 @@ class _CausalBlockLayout:
     """Everything a forward that cuts the staged tokens into causal blocks of one size
     reads.
 
-    Block ``i`` holds staged tokens ``[i*block_size, (i+1)*block_size)`` and attends to
-    the fixed region, the ``window_tokens`` before it, the earlier blocks and itself. Its
-    table row lists every page it attends to in full, then its ``num_private_pages``
-    private pages. These hold, in order, copies of the tokens it attends to on its
-    partial pages (at most three: where the fixed region ends, where the window starts,
-    where the block starts), then the block's own tokens. ``cached_tokens`` counts the
-    keys before each block's own tokens.
+    Causal block ``i`` holds staged tokens ``[i*causal_block_size,
+    (i+1)*causal_block_size)`` and attends to the fixed region, the ``window_tokens``
+    before it, the earlier causal blocks and itself. Its page list holds every page it
+    attends to in full, then its ``num_private_pages`` private pages. These hold, in
+    order, copies of the tokens it attends to on its partial pages (at most three:
+    where the fixed region ends, where the window starts, where the causal block
+    starts), then its own tokens. ``cached_tokens`` counts the keys before each causal
+    block's own tokens.
 
     The copies on partial pages come in two kinds. committed_private: committed tokens
-    (fixed or history), copied at ``commit``. current_private: earlier blocks' tokens of
-    the same forward, written by every ``write_staged``, as are the block's own tokens.
-    All device tensors are persistent views into the cache's packed buffers, rewritten
-    in place on the device by ``commit``, never on the forward path.
+    (fixed or history), copied at ``commit``. current_private: earlier causal blocks'
+    tokens of the same forward, written by every ``write_staged``, as are each causal
+    block's own tokens. All device tensors are persistent views into the cache's packed
+    buffers, rewritten in place on the device by ``commit``, never on the forward path.
     """
 
-    num_blocks: int
-    block_size: int
+    num_causal_blocks: int
+    causal_block_size: int
     num_private_pages: int
-    private_pages: torch.Tensor  # [num_blocks, num_private_pages] int32 layer-0 view indices
+    # [num_causal_blocks, num_private_pages] int32 layer-0 view indices
+    private_pages: torch.Tensor
     host_private_pages: np.ndarray  # the same on the host, for host-addressed edits
-    rows: torch.Tensor  # [num_blocks, row_len] int32 layer-0 view indices, 0-padded
-    # The rows in the TRTLLM attention op's block-offset encoding, K plane then V
-    # plane: ``row * kv_factor`` and ``+ kv_offset``. The op reads this tensor directly.
-    block_offsets: torch.Tensor  # [1, num_blocks, 2, row_len] int32
-    seq_len_q: torch.Tensor  # [num_blocks] int32, all block_size
-    seq_len_kv: torch.Tensor  # [num_blocks] int32, cached + block_size
+    # [num_causal_blocks, max_pages] int32 layer-0 view indices, 0-padded: each causal
+    # block's page list.
+    causal_block_pages: torch.Tensor
+    # The page lists in the TRTLLM attention op's offset encoding, K plane then V
+    # plane: ``page * kv_factor`` and ``+ kv_offset``. The op reads this tensor directly.
+    causal_block_offsets: torch.Tensor  # [1, num_causal_blocks, 2, max_pages] int32
+    seq_len_q: torch.Tensor  # [num_causal_blocks] int32, all causal_block_size
+    seq_len_kv: torch.Tensor  # [num_causal_blocks] int32, cached + causal_block_size
     # Slot ids (``view_page * tokens_per_page + slot``) of the private slots holding
-    # each staged token as one of its block's own tokens.
-    own_slots: torch.Tensor  # [num_blocks*block_size] int64
-    # current_private: earlier blocks' tokens of this forward on a block's partial pages
-    # (at most two: where its window starts and where it starts), as the staged token
-    # and the private slot it goes to. A fixed 2*(tpb-1) entries per block, padded
-    # with a harmless repeat of the block's own first token, so the first ``n``
-    # blocks' entries are a prefix and a captured forward replays them.
-    current_private_src: torch.Tensor  # [num_blocks*2*(tpb-1)] int64 staged token index
-    current_private_dst: torch.Tensor  # [num_blocks*2*(tpb-1)] int64 slot id
-    # committed_private: committed tokens on a block's partial pages, copied into its
-    # private pages at commit. 3*(tpb-1) entries per block, (source pool row,
+    # each staged token as one of its causal block's own tokens.
+    own_slots: torch.Tensor  # [num_causal_blocks*causal_block_size] int64
+    # current_private: earlier causal blocks' tokens of this forward on a causal block's
+    # partial pages (at most two: where its window starts and where it starts), as the
+    # staged token and the private slot it goes to. A fixed 2*(tpb-1) entries per causal
+    # block, padded with a harmless repeat of its own first token, so the first ``n``
+    # causal blocks' entries are a prefix and a captured forward replays them.
+    current_private_src: torch.Tensor  # [num_causal_blocks*2*(tpb-1)] int64 staged token index
+    current_private_dst: torch.Tensor  # [num_causal_blocks*2*(tpb-1)] int64 slot id
+    # committed_private: committed tokens on a causal block's partial pages, copied into
+    # its private pages at commit. 3*(tpb-1) entries per causal block, (source pool row,
     # destination pool row), -1 past the used ones.
-    committed_private_src: torch.Tensor  # [num_blocks*3*(tpb-1)] int64
-    committed_private_dst: torch.Tensor  # [num_blocks*3*(tpb-1)] int64
+    committed_private_src: torch.Tensor  # [num_causal_blocks*3*(tpb-1)] int64
+    committed_private_dst: torch.Tensor  # [num_causal_blocks*3*(tpb-1)] int64
 
 
 @dataclass
@@ -143,17 +147,38 @@ class _GeometryState:
     refill_src: torch.Tensor
     refill_dst: torch.Tensor
     # [max_staged_tokens] maps each staged token's logical position to its home slot id
-    # (view_page * tokens_per_page + slot) on the shared pages, where later blocks and
-    # later commits read it.
+    # (view_page * tokens_per_page + slot) on the shared pages, where later causal blocks
+    # and later commits read it.
     staged_slots: torch.Tensor
 
 
-class CausalKVCacheManager(KVCacheManagerV2):
-    """``KVCacheManagerV2`` driven as one long-lived sequence with a caller-owned table.
+class BlockCausalKVCacheManager(KVCacheManagerV2):
+    """``KVCacheManagerV2`` driven as one long-lived sequence with a caller-owned page
+    table.
 
     The constructor allocates the page pool; ``open`` lays a rollout's geometry out
     inside it: the pinned prefix, the sliding window, the staged tokens (written by
     forwards, not yet committed) and the causal blocks' private pages.
+
+    Terms, used the same way in this cache, its attention backends and its kernels.
+    "Block" alone is never used: in the LLM code it means a page.
+
+    - page: the pool's unit of storage, ``tokens_per_page`` tokens. ``KVCacheManagerV2``
+      and the TRTLLM attention op call it a block (``tokens_per_block``,
+      ``kv_cache_block_offsets``).
+    - page table: the cache's map from logical pages to pool pages, ``page_table()``.
+    - chunk: the frames one forward processes. Their tokens are the staged tokens.
+    - causal block: a run of staged tokens with full attention among themselves,
+      causal to earlier causal blocks and to the cache. One request in the TRTLLM
+      attention metadata. A denoising step is one causal block of the whole chunk; the
+      clean pass is one causal block per frame.
+    - causal block pages: the pages one causal block reads, in key order: those it
+      attends to in full, then its private pages. ``causal_block_pages(size)``.
+    - private pages: pages owned by one causal block. They hold copies of the tokens
+      it attends to on its partial pages, then its own tokens.
+    - partial page: a page the causal block attends to only in part; at most three,
+      where the fixed region ends, where the window starts and where the causal block
+      starts. The tokens it attends to on one such page form a segment.
 
     Args:
         num_layers: attention layers that persist K/V (the generator tower).
@@ -169,10 +194,10 @@ class CausalKVCacheManager(KVCacheManagerV2):
     """
 
     @staticmethod
-    def _private_pages_per_block(tokens_per_page: int, block_size: int) -> int:
+    def _private_pages_per_causal_block(tokens_per_page: int, causal_block_size: int) -> int:
         """Private pages one causal block needs: up to three partial pages' worth of
         visible slots plus its own tokens."""
-        return ceil_div(3 * (tokens_per_page - 1) + block_size, tokens_per_page)
+        return ceil_div(3 * (tokens_per_page - 1) + causal_block_size, tokens_per_page)
 
     @staticmethod
     def _geometry_pages(
@@ -200,7 +225,8 @@ class CausalKVCacheManager(KVCacheManagerV2):
             )
         resident = ceil_div(pin_tokens + window_tokens + max_staged_tokens, tpb) + 1
         private = sum(
-            (max_staged_tokens // b) * CausalKVCacheManager._private_pages_per_block(tpb, b)
+            (max_staged_tokens // b)
+            * BlockCausalKVCacheManager._private_pages_per_causal_block(tpb, b)
             for b in sizes
         )
         return resident, private, sizes
@@ -215,9 +241,9 @@ class CausalKVCacheManager(KVCacheManagerV2):
         causal_block_sizes: Sequence[int],
     ) -> int:
         """Pool tokens a geometry needs: resident pages (pinned prefix, window, staged
-        tokens, one spare) plus the private pages of every block size. A pool of at
+        tokens, one spare) plus the private pages of every causal block size. A pool of at
         least this many tokens can ``open`` the geometry."""
-        resident, private, _ = CausalKVCacheManager._geometry_pages(
+        resident, private, _ = BlockCausalKVCacheManager._geometry_pages(
             tokens_per_page, pin_tokens, window_tokens, max_staged_tokens, causal_block_sizes
         )
         return (resident + private) * tokens_per_page
@@ -253,8 +279,8 @@ class CausalKVCacheManager(KVCacheManagerV2):
         causal_block_sizes: Sequence[int],
     ) -> int:
         """Device bytes a pool sized for this geometry takes from the GPU."""
-        return CausalKVCacheManager.bytes_for_pool_tokens(
-            CausalKVCacheManager.pool_tokens_for(
+        return BlockCausalKVCacheManager.bytes_for_pool_tokens(
+            BlockCausalKVCacheManager.pool_tokens_for(
                 tokens_per_page=tokens_per_page,
                 pin_tokens=pin_tokens,
                 window_tokens=window_tokens,
@@ -295,7 +321,7 @@ class CausalKVCacheManager(KVCacheManagerV2):
         stream: Optional[torch.cuda.Stream] = None,
     ) -> None:
         if dtype not in _DTYPES:
-            raise ValueError(f"CausalKVCacheManager supports bf16/fp16 K/V, got {dtype}")
+            raise ValueError(f"BlockCausalKVCacheManager supports bf16/fp16 K/V, got {dtype}")
         if tokens_per_page <= 0 or tokens_per_page & (tokens_per_page - 1):
             # The commit-time layout kernel computes pages and slots with shifts and masks.
             raise ValueError(f"tokens_per_page must be a power of two, got {tokens_per_page}")
@@ -308,13 +334,15 @@ class CausalKVCacheManager(KVCacheManagerV2):
         self._kv_dtype = dtype
         self._pool_tokens = pool_tokens
         self._pool_pages = pool_tokens // tpb
-        # current_private entries per block: earlier blocks' tokens of the same forward on
-        # at most two partial pages, where the block's window starts and where it starts.
+        # current_private entries per causal block: earlier causal blocks' tokens of the
+        # same forward on at most two partial pages, where its window starts and where it
+        # starts.
         self._current_private = 2 * (tpb - 1)
 
         kv_cache_config = KvCacheConfig(
             max_tokens=pool_tokens,
             max_attention_window=[pool_tokens],
+            tokens_per_block=tpb,
             enable_block_reuse=False,
             host_cache_size=0,  # nothing is ever suspended, so no host tier
             max_util_for_resume=1.0,  # and no resume headroom: the pool is exactly the tokens
@@ -357,7 +385,7 @@ class CausalKVCacheManager(KVCacheManagerV2):
         self._buffers: List[torch.Tensor] = []
         self._shut_down = False
         # Metadata attention backends build over this cache, keyed by backend and
-        # blocking. Kept here, not by the backend, so the cache's lifetime is the
+        # causal block size. Kept here, not by the backend, so the cache's lifetime is the
         # caller's; the entries hold the cache, so shutdown() clears them.
         self.attention_metadata: Dict[Tuple, object] = {}
         # The open geometry; set by open().
@@ -374,13 +402,13 @@ class CausalKVCacheManager(KVCacheManagerV2):
         # on the forward path, so a CUDA graph captured around a forward keeps
         # reading correct values after the cache moves.
         #
-        # The table: layer-0 view indices in logical order, the fixed region's full
+        # The page table: layer-0 view indices in logical order, the fixed region's full
         # pages first (never rotated), then the ring: the page the fixed region's
         # tail shares with the first history tokens (if any), history, free pages.
         # Sized for the whole pool; a geometry uses the first num_pages entries.
         self._table: Optional[torch.Tensor] = None  # [pool_pages] int32
         self._fixed_pages = 0
-        # Host copy of the resident table, rotated in lockstep with the device one, so
+        # Host copy of the resident page table, rotated in lockstep with the device one, so
         # that nothing is ever read back; and the private pages' view indices.
         self._host_table: Optional[np.ndarray] = None  # [num_pages] int64
         self._host_private: Optional[np.ndarray] = None  # [pool_pages] int64
@@ -392,10 +420,10 @@ class CausalKVCacheManager(KVCacheManagerV2):
         self._refill_src: Optional[torch.Tensor] = None
         self._refill_dst: Optional[torch.Tensor] = None
         self._staged_slots: Optional[torch.Tensor] = None
-        self._block_offsets_size: Optional[int] = None
+        self._offsets_causal_block_size: Optional[int] = None
         self._kv_heads_local = 0
         self._rows_per_page = 0  # pool rows of head_dim per view page: 2 * H * tpb
-        self._kv_offset = 0  # the V plane's offset in the op's block-offset encoding
+        self._kv_offset = 0  # the V plane's offset in the TRTLLM op's offset encoding
 
     # ------------------------------------------------------------------ lifecycle
 
@@ -413,17 +441,17 @@ class CausalKVCacheManager(KVCacheManagerV2):
             pin_tokens: the first tokens committed become the fixed region: always
                 visible, never evicted. Commit them like any other tokens; a commit
                 may exceed ``max_staged_tokens`` as long as the excess is pinned.
-            window_tokens: history each block may see before itself, in tokens
+            window_tokens: history each causal block may see before itself, in tokens
                 (``(window_frames - 1) * tokens_per_frame``).
             max_staged_tokens: most tokens a forward may write before a commit
                 (``chunk_frames * tokens_per_frame``); a forward may write fewer.
             causal_block_sizes: every causal block size a forward may use, at most
-                ``max_staged_tokens``. A forward of ``T`` tokens cut into blocks of
-                size ``b`` needs ``b`` declared and ``T`` a multiple of ``b`` within
-                ``max_staged_tokens``: all staged tokens as one block is a denoising
-                step, one frame per block is the clean pass, a shorter final chunk as
-                one block is its own size. Each size gets its own private pages,
-                ``max_staged_tokens // b`` blocks' worth.
+                ``max_staged_tokens``. A forward of ``T`` tokens cut into causal blocks
+                of size ``b`` needs ``b`` declared and ``T`` a multiple of ``b`` within
+                ``max_staged_tokens``: all staged tokens as one causal block is a
+                denoising step, one frame per causal block is the clean pass, a shorter
+                final chunk as one causal block is its own size. Each size gets its own
+                private pages, ``max_staged_tokens // b`` causal blocks' worth.
 
         The geometry must fit the pool: ``pool_tokens_for`` of it at most
         ``pool_tokens``. Device state is allocated per geometry the first time it is
@@ -440,7 +468,7 @@ class CausalKVCacheManager(KVCacheManagerV2):
         if needed > self._pool_tokens:
             raise ValueError(
                 f"geometry needs {needed} pool tokens (pin {pin_tokens}, window {window_tokens}, "
-                f"staged {max_staged_tokens}, blocks {sizes}); the pool holds {self._pool_tokens}"
+                f"staged {max_staged_tokens}, causal block sizes {sizes}); the pool holds {self._pool_tokens}"
             )
 
         kv_cache = self._create_kv_cache(_ROLLOUT_REQUEST_ID, None, None, is_dummy=True)
@@ -548,7 +576,7 @@ class CausalKVCacheManager(KVCacheManagerV2):
         self._bind_state(state)
         for layout in self._layouts.values():
             layout.private_pages.copy_(torch.from_numpy(layout.host_private_pages.astype(np.int32)))
-        self._block_offsets_size = None
+        self._offsets_causal_block_size = None
         self._refresh_device_state()
 
     def close(self) -> None:
@@ -557,7 +585,7 @@ class CausalKVCacheManager(KVCacheManagerV2):
         self._kv_cache = None
         # Device state outlives the sequence so that forwards captured in a CUDA
         # graph before close() stay valid after the next open().
-        self._block_offsets_size = None
+        self._offsets_causal_block_size = None
         self._remove_kv_cache(_ROLLOUT_REQUEST_ID)
 
     def shutdown(self) -> None:
@@ -580,8 +608,7 @@ class CausalKVCacheManager(KVCacheManagerV2):
 
     @property
     def tokens_per_page(self) -> int:
-        """Page size of the K/V pool. The parent class calls it ``tokens_per_block``;
-        in this cache and its backends "block" is only ever a causal block."""
+        """Page size of the K/V pool; the parent class calls it ``tokens_per_block``."""
         return self.tokens_per_block
 
     @property
@@ -597,7 +624,7 @@ class CausalKVCacheManager(KVCacheManagerV2):
 
     @property
     def fixed_tokens(self) -> int:
-        """Tokens every block sees for the whole rollout; logical ``[0, fixed_tokens)``."""
+        """Tokens every causal block sees for the whole rollout; logical ``[0, fixed_tokens)``."""
         return self._fixed_tokens
 
     @property
@@ -615,8 +642,8 @@ class CausalKVCacheManager(KVCacheManagerV2):
 
     @property
     def table(self) -> torch.Tensor:
-        """``[num_pages]`` int32 device table of layer-0 view indices in logical order
-        (a view of the pool-sized table a captured graph holds)."""
+        """``[num_pages]`` int32 device page table of layer-0 view indices in logical
+        order (a view of the pool-sized table a captured graph holds)."""
         self._require_open()
         return self._table[: self.num_pages]
 
@@ -625,9 +652,9 @@ class CausalKVCacheManager(KVCacheManagerV2):
         one rollout sequence."""
         return [_ROLLOUT_REQUEST_ID] * num_causal_blocks
 
-    def block_table(self) -> List[int]:
-        """Every base page in logical order, from the host copy of the table. For
-        ``write_range`` and for tests; kernels read ``page_table`` directly."""
+    def page_table(self) -> List[int]:
+        """The page table: every resident base page in logical order, from the host
+        copy. For ``write_range`` and for tests; kernels read ``causal_block_pages``."""
         self._require_open()
         return (self._host_table // self.page_view_scale).tolist()
 
@@ -681,13 +708,14 @@ class CausalKVCacheManager(KVCacheManagerV2):
         for size in sizes:
             n, num_private_pages = (
                 max_staged_tokens // size,
-                self._private_pages_per_block(tpb, size),
+                self._private_pages_per_causal_block(tpb, size),
             )
             i32 = {
-                # A row holds a block's full pages then its private pages, never more than
-                # the pool has; sized for the pool so every geometry's rows agree.
-                "rows": (n, self._pool_pages),
-                "block_offsets": (1, n, 2, self._pool_pages),
+                # A page list holds a causal block's full pages then its private pages,
+                # never more than the pool has; sized for the pool so every geometry's
+                # lists agree.
+                "causal_block_pages": (n, self._pool_pages),
+                "causal_block_offsets": (1, n, 2, self._pool_pages),
                 "seq_len_q": (n,),
                 "seq_len_kv": (n,),
             }
@@ -698,7 +726,7 @@ class CausalKVCacheManager(KVCacheManagerV2):
             }
             specs.append((size, n, num_private_pages, i32, i64))
         # Copies made at commit: the fixed tail's refill (one page of entries), then each
-        # block's committed_private (at most three partial pages); contiguous, so one
+        # causal block's committed_private (at most three partial pages); contiguous, so one
         # launch copies all.
         commit_copy_capacity = tpb + sum(n * 3 * (tpb - 1) for _, n, _, _, _ in specs)
         numel_i32 = sum(int(np.prod(shape)) for *_, i32, _ in specs for shape in i32.values())
@@ -728,8 +756,8 @@ class CausalKVCacheManager(KVCacheManagerV2):
             first_private += n * num_private_pages
             num_committed = n * 3 * (tpb - 1)
             layouts[size] = _CausalBlockLayout(
-                num_blocks=n,
-                block_size=size,
+                num_causal_blocks=n,
+                causal_block_size=size,
                 num_private_pages=num_private_pages,
                 private_pages=torch.zeros(n, num_private_pages, dtype=torch.int32, device=device),
                 host_private_pages=host_private_pages.reshape(n, num_private_pages),
@@ -778,12 +806,12 @@ class CausalKVCacheManager(KVCacheManagerV2):
         return max(self.max_staged_tokens // b for b in self.causal_block_sizes)
 
     def causal_block_lengths(self, causal_block_size: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Per-block int32 device tensors ``(seq_len_q, seq_len_kv)`` for every block of
-        that size when all ``max_staged_tokens`` are staged; a forward of fewer tokens
-        uses the leading ones.
+        """Per-causal-block int32 device tensors ``(seq_len_q, seq_len_kv)`` for every
+        causal block of that size when all ``max_staged_tokens`` are staged; a forward
+        of fewer tokens uses the leading ones.
 
-        ``seq_len_kv[i]`` is the number of keys in block ``i``'s table row: the fixed
-        region, the window before the block, the earlier blocks and the block itself.
+        ``seq_len_kv[i]`` is the number of keys in causal block ``i``'s page list: the
+        fixed region, the window before it, the earlier causal blocks and itself.
         Persistent, refreshed by ``commit``, so a captured forward keeps
         reading the right lengths.
         """
@@ -791,24 +819,24 @@ class CausalKVCacheManager(KVCacheManagerV2):
         return layout.seq_len_q, layout.seq_len_kv
 
     def cached_tokens(self, causal_block_size: int) -> List[int]:
-        """Keys in each block's row before the block's own tokens (host ints, from the
-        host model of the layout)."""
-        blk = self._layout(causal_block_size)
-        return [self._host_block(blk, i)[0] for i in range(blk.num_blocks)]
+        """Keys in each causal block's page list before its own tokens (host ints, from
+        the host model of the layout)."""
+        layout = self._layout(causal_block_size)
+        return [self._host_causal_block(layout, i)[0] for i in range(layout.num_causal_blocks)]
 
-    def page_table(self, causal_block_size: int) -> torch.Tensor:
-        """``[num_blocks, row_len]`` int32 device table of layer-0 view indices.
+    def causal_block_pages(self, causal_block_size: int) -> torch.Tensor:
+        """``[num_causal_blocks, max_pages]`` int32 device tensor of layer-0 view indices.
 
-        Row ``i`` is block ``i``'s key sequence; entries past its length are 0 and
-        never read. Persistent, refreshed in place by ``commit``.
+        Row ``i`` is causal block ``i``'s page list, in key order; entries past its
+        length are 0 and never read. Persistent, refreshed in place by ``commit``.
         """
-        return self._layout(causal_block_size).rows
+        return self._layout(causal_block_size).causal_block_pages
 
     @staticmethod
     def causal_blocks(num_tokens: int, causal_block_size: Optional[int]) -> Tuple[int, int]:
-        """The block size and block count a forward of ``num_tokens`` real tokens uses:
-        one block of all of them when ``causal_block_size`` is None; otherwise the size
-        must be positive and divide ``num_tokens``. Shared by the cache and the
+        """The causal block size and count a forward of ``num_tokens`` real tokens uses:
+        one causal block of all of them when ``causal_block_size`` is None; otherwise
+        the size must be positive and divide ``num_tokens``. Shared by the cache and the
         attention backends so they agree on the contract."""
         size = num_tokens if causal_block_size is None else int(causal_block_size)
         if size <= 0 or num_tokens % size:
@@ -817,28 +845,29 @@ class CausalKVCacheManager(KVCacheManagerV2):
             )
         return size, num_tokens // size
 
-    def block_offsets(self, causal_block_size: int) -> torch.Tensor:
-        """``[1, num_blocks, 2, row_len]`` int32 device tensor: ``page_table`` in the
-        TRTLLM attention op's block-offset encoding (K plane, then V plane), the
-        layout its ``kv_cache_block_offsets`` argument has. Persistent, refreshed in
-        place by ``commit``, so a kernel bound to it reads the current rows without
-        any metadata refresh."""
-        return self._layout(causal_block_size).block_offsets
+    def causal_block_offsets(self, causal_block_size: int) -> torch.Tensor:
+        """``[1, num_causal_blocks, 2, max_pages]`` int32 device tensor:
+        ``causal_block_pages`` in the TRTLLM attention op's offset encoding (K plane,
+        then V plane), the layout its ``kv_cache_block_offsets`` argument has.
+        Persistent, refreshed in place by ``commit``, so a kernel bound to it reads the
+        current page lists without any metadata refresh."""
+        return self._layout(causal_block_size).causal_block_offsets
 
     def set_causal_block_size(self, causal_block_size: int) -> None:
-        """Declare the block size the next ``copy_batch_block_offsets`` describes."""
+        """Declare the causal block size the next ``copy_batch_block_offsets`` describes."""
         self._layout(causal_block_size)
-        self._block_offsets_size = causal_block_size
+        self._offsets_causal_block_size = causal_block_size
 
     # ------------------------------------------------------------------ device state
 
     def _refresh_device_state(self, drop_pages: int = 0) -> None:
-        """Rewrite page tables and private-page contents for the next forward.
+        """Rewrite the causal block page lists and private-page contents for the next
+        forward.
 
-        For each declared causal-block size, one kernel is launched. The first launch
+        For each declared causal block size, one kernel is launched. The first launch
         also computes the shared resident staging slots and pinned-tail copy indices.
 
-        Then launch one kernel to copy committed boundary tokens into private
+        Then launch one kernel to copy committed partial-page tokens into private
         pages and, if needed, restore the pinned tail in resident storage.
 
         ``drop_pages`` is the number of pages ``commit()`` rotated to the ring's end.
@@ -848,22 +877,22 @@ class CausalKVCacheManager(KVCacheManagerV2):
         All output tensors are updated in place, preserving CUDA graph references.
         """
         shared = True
-        for blk in self._layouts.values():
-            torch.ops.trtllm.causal_layout_(
+        for layout in self._layouts.values():
+            torch.ops.trtllm.block_causal_layout_(
                 self._table,
-                blk.private_pages,
-                blk.rows,
-                blk.block_offsets,
-                blk.seq_len_kv,
-                blk.own_slots,
-                blk.current_private_src,
-                blk.current_private_dst,
-                blk.committed_private_src,
-                blk.committed_private_dst,
+                layout.private_pages,
+                layout.causal_block_pages,
+                layout.causal_block_offsets,
+                layout.seq_len_kv,
+                layout.own_slots,
+                layout.current_private_src,
+                layout.current_private_dst,
+                layout.committed_private_src,
+                layout.committed_private_dst,
                 self._staged_slots if shared else None,
                 self._refill_src if shared else None,
                 self._refill_dst if shared else None,
-                blk.block_size,
+                layout.causal_block_size,
                 self.tokens_per_page,
                 self.staging_offset,
                 self._fixed_tokens,
@@ -887,16 +916,17 @@ class CausalKVCacheManager(KVCacheManagerV2):
     # The host model of the layouts: the arithmetic the layout kernel performs, for
     # host-addressed edits of committed tokens and for ``cached_tokens``.
 
-    def _host_block(self, blk: _CausalBlockLayout, i: int) -> Tuple[int, np.ndarray]:
-        """Block ``i``: ``(keys before its own tokens, visible positions on its partial
-        pages, ascending)``; the ``k``-th such position occupies private slot ``k``."""
-        spans = self._visible_spans(self.staging_offset + i * blk.block_size)
+    def _host_causal_block(self, layout: _CausalBlockLayout, i: int) -> Tuple[int, np.ndarray]:
+        """Causal block ``i``: ``(keys before its own tokens, visible positions on its
+        partial pages, ascending)``; the ``k``-th such position occupies private slot
+        ``k``."""
+        spans = self._visible_spans(self.staging_offset + i * layout.causal_block_size)
         runs = self._whole_page_runs(spans)
         partial = self._partial_page_positions(spans, runs)
         return sum(b - a for a, b in runs) * self.tokens_per_page + partial.size, partial
 
     def _visible_spans(self, start: int) -> List[Tuple[int, int]]:
-        """Logical positions a block starting at ``start`` sees before its own tokens:
+        """Logical positions a causal block starting at ``start`` sees before its own tokens:
         the fixed region and the window before it; one span when they touch."""
         fixed = self._fixed_tokens
         win_start = max(fixed, start - self.window_tokens)
@@ -913,7 +943,7 @@ class CausalKVCacheManager(KVCacheManagerV2):
     ) -> np.ndarray:
         """Visible positions on pages the spans cover only partly, ascending. At most
         three such pages: where the fixed region ends, where the window starts and
-        where the block starts."""
+        where the causal block starts."""
         tpb = self.tokens_per_page
         edges = sorted({p for lo, hi in spans for p in (lo // tpb, (hi - 1) // tpb)})
         pages = [p for p in edges if not any(a <= p < b for a, b in runs)]
@@ -926,7 +956,7 @@ class CausalKVCacheManager(KVCacheManagerV2):
     def _private_slot(
         self, private_pages: np.ndarray, k: np.ndarray
     ) -> Tuple[np.ndarray, np.ndarray]:
-        """View page and slot of a block's ``k``-th private slots."""
+        """View page and slot of a causal block's ``k``-th private slots."""
         return private_pages[k // self.tokens_per_page], k % self.tokens_per_page
 
     # ------------------------------------------------------------------ direct pool access
@@ -944,7 +974,7 @@ class CausalKVCacheManager(KVCacheManagerV2):
 
         Eager, host-addressed: a partial page at either end is one copy each, whole
         pages go one group of physically consecutive pages at a time. Committed tokens
-        that block rows read through a private copy are updated in those copies too.
+        that causal blocks read through a private copy are updated in those copies too.
         For the fixed region and for tests; the per-forward write is ``write_staged``.
         """
         if v.shape != k.shape:
@@ -969,7 +999,7 @@ class CausalKVCacheManager(KVCacheManagerV2):
     def zero_values(self, layer_idx: int, start: int, num_tokens: int) -> None:
         """Zero the V vectors (all heads) of logical ``[start, start + num_tokens)`` in
         one layer, leaving K as written, in the home slots and in every private copy
-        block rows read. Eager, host-addressed, like ``write_range``."""
+        causal blocks read. Eager, host-addressed, like ``write_range``."""
         buf = self.kv_buffer(layer_idx)
         vs = self.page_view_scale
 
@@ -993,14 +1023,14 @@ class CausalKVCacheManager(KVCacheManagerV2):
         tpb, rpp = self.tokens_per_page, self._rows_per_page
         stop = min(start + num_tokens, self.staging_offset)
         homes, copies = [], []
-        for blk in self._layouts.values():
-            for i in range(blk.num_blocks):
-                _, partial = self._host_block(blk, i)
+        for layout in self._layouts.values():
+            for i in range(layout.num_causal_blocks):
+                _, partial = self._host_causal_block(layout, i)
                 k = np.flatnonzero((partial >= start) & (partial < stop))
                 if k.size == 0:
                     continue
                 pos = partial[k]
-                page, slot = self._private_slot(blk.host_private_pages[i], k)
+                page, slot = self._private_slot(layout.host_private_pages[i], k)
                 homes.append(self._host_table[pos // tpb] * rpp + pos % tpb)
                 copies.append(page * rpp + slot)
         if not homes:
@@ -1032,7 +1062,7 @@ class CausalKVCacheManager(KVCacheManagerV2):
         if not 0 <= start <= start + n <= self.capacity:
             raise ValueError(f"[{start}, {start + n}) outside the cache's {self.capacity} tokens")
         tpb = self.tokens_per_page
-        table = self.block_table()
+        table = self.page_table()
         end = start + n
         first_whole, end_whole = ceil_div(start, tpb), end // tpb  # whole pages [first, end)
         if first_whole > end_whole:  # the whole range lies inside one page
@@ -1080,16 +1110,16 @@ class CausalKVCacheManager(KVCacheManagerV2):
         own_tokens: bool = True,
     ) -> None:
         """Stage ``T`` tokens of K/V, the forward's new tokens, cut into causal blocks
-        of ``causal_block_size`` (default: one block of ``T``).
+        of ``causal_block_size`` (default: one causal block of ``T``).
 
         ``k``/``v`` are ``[T, num_kv_heads, head_dim]`` with a contiguous ``head_dim``;
         token and head strides are free, so slices of a fused QKV projection go in
         without a copy. They go to the logical positions from ``staging_offset`` (where
-        later blocks and, after commit, later forwards read them) and to the blocks'
-        private pages: current_private (earlier blocks' tokens on each block's partial
-        pages) and, with ``own_tokens``, each block's own tokens. One scatter kernel reads
-        K/V once for the logical and own-token slots, a second (several blocks only)
-        handles the partial pages; both are driven by slot ids rebuilt on
+        later causal blocks and, after commit, later forwards read them) and to the causal
+        blocks' private pages: current_private (earlier causal blocks' tokens on each
+        causal block's partial pages) and, with ``own_tokens``, each causal block's own
+        tokens. One scatter kernel reads K/V once for the logical and own-token slots, a
+        second (several causal blocks only) handles the partial pages; both are driven by slot ids rebuilt on
         ``commit``, so the write replays correctly inside a CUDA graph.
         A kernel that writes the new tokens into the private pages itself (trtllm-gen)
         passes ``own_tokens=False``.
@@ -1106,11 +1136,11 @@ class CausalKVCacheManager(KVCacheManagerV2):
             )
         if k.dtype != buf.dtype or v.dtype != buf.dtype:
             raise TypeError(f"K/V dtype {k.dtype} does not match the cache's {buf.dtype}")
-        size, num_blocks = self.causal_blocks(num_tokens, causal_block_size)
+        size, num_causal_blocks = self.causal_blocks(num_tokens, causal_block_size)
         layout = self._layout(size)
-        if num_blocks > layout.num_blocks:
+        if num_causal_blocks > layout.num_causal_blocks:
             raise ValueError(
-                f"{num_tokens} tokens are more than the {layout.num_blocks} causal blocks of "
+                f"{num_tokens} tokens are more than the {layout.num_causal_blocks} causal blocks of "
                 f"{size} this geometry stages"
             )
         torch.ops.trtllm.scatter_kv_slots_(
@@ -1120,8 +1150,8 @@ class CausalKVCacheManager(KVCacheManagerV2):
             self._staged_slots[:num_tokens],
             layout.own_slots[:num_tokens] if own_tokens else None,
         )
-        if num_blocks > 1:
-            num_current = num_blocks * self._current_private
+        if num_causal_blocks > 1:
+            num_current = num_causal_blocks * self._current_private
             torch.ops.trtllm.scatter_kv_slots_(
                 buf,
                 k,
@@ -1141,13 +1171,13 @@ class CausalKVCacheManager(KVCacheManagerV2):
         num_seqs: int,
         max_blocks: Optional[int] = None,
     ) -> None:
-        """Hand the attention metadata *our* rows instead of the manager's.
+        """Hand the attention metadata *our* page lists instead of the manager's.
 
         ``dst_tensor`` is ``[num_pools, max_num_sequences, 2, max_blocks_per_seq]``
         of int32: K offsets then V offsets per sequence, each ``page * index_scale``
         (+ ``kv_offset`` for V) -- the same encoding the manager's device copy uses.
         Every request is a causal block of the size declared with
-        ``set_causal_block_size``; row ``i`` is that block's key sequence.
+        ``set_causal_block_size``; sequence ``i`` gets causal block ``i``'s page list.
         """
         ids = list(request_ids)
         if (
@@ -1157,18 +1187,18 @@ class CausalKVCacheManager(KVCacheManagerV2):
             or beam_width != 1
         ):
             raise ValueError(
-                f"CausalKVCacheManager serves one sequence (id {_ROLLOUT_REQUEST_ID}) in up to "
+                f"BlockCausalKVCacheManager serves one sequence (id {_ROLLOUT_REQUEST_ID}) in up to "
                 f"{self.max_causal_blocks} causal blocks; got request_ids={ids}, "
                 f"num_seqs={num_seqs}, beam_width={beam_width}"
             )
-        size = self._block_offsets_size
-        if size is None or num_seqs > self._layouts[size].num_blocks:
+        size = self._offsets_causal_block_size
+        if size is None or num_seqs > self._layouts[size].num_causal_blocks:
             raise ValueError(
-                f"block offsets for {num_seqs} sequences need set_causal_block_size "
-                f"first with a size that cuts the staged tokens into at least that many blocks; "
+                f"page offsets for {num_seqs} sequences need set_causal_block_size "
+                f"first with a size that cuts the staged tokens into at least that many causal blocks; "
                 f"declared: {size}"
             )
-        offsets = self._layouts[size].block_offsets[0, :num_seqs]
+        offsets = self._layouts[size].causal_block_offsets[0, :num_seqs]
         n = offsets.shape[-1]
         dst_tensor[0, :num_seqs, :, :n] = offsets
         if n < dst_tensor.shape[-1]:
@@ -1180,7 +1210,7 @@ class CausalKVCacheManager(KVCacheManagerV2):
         layer_idx: Optional[int] = None,
         num_blocks_per_seq: Optional[Sequence[int]] = None,
     ) -> List[List[int]]:
-        """The rotated table in V2's per-layer view units, one row per request.
+        """The rotated page table in V2's per-layer view units, one list per request.
 
         Overrides the inherited accessor, which would report the pages in
         allocation order and disagree with what the attention backends read.
@@ -1189,7 +1219,7 @@ class CausalKVCacheManager(KVCacheManagerV2):
         ids = list(request_ids)
         if any(r != _ROLLOUT_REQUEST_ID for r in ids):
             raise ValueError(
-                f"CausalKVCacheManager serves request {_ROLLOUT_REQUEST_ID} only; got {ids}"
+                f"BlockCausalKVCacheManager serves request {_ROLLOUT_REQUEST_ID} only; got {ids}"
             )
         row = self._host_table.tolist()
         widths = [len(row)] * len(ids) if num_blocks_per_seq is None else list(num_blocks_per_seq)

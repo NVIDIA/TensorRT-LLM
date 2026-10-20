@@ -14,7 +14,7 @@
 # limitations under the License.
 """One layer of causal-rollout attention at Cosmos3-Nano geometry, four ways.
 
-    trtllm       TRTLLM backend over CausalKVCacheManager: one fused paged trtllm-gen call
+    trtllm       TRTLLM backend over BlockCausalKVCacheManager: one fused paged trtllm-gen call
     cudnn_paged  cuDNN backend over the same cache: run-copy of the new K/V + paged SDPA
     slab         one contiguous K/V buffer per layer: in-place write + cuDNN dense SDPA
     naive        materialised torch.cat of all K/V + SDPA (the VANILLA path shipping today)
@@ -25,12 +25,12 @@ is cross-checked against an fp32 dense reference before anything is timed, so a
 silent kernel fallback (one that drops the cached prefix) fails here rather than
 being measured.
 
-    python tests/microbenchmarks/bench_kv_causal_attention.py --prompt-len 512   # a denoising step
-    python tests/microbenchmarks/bench_kv_causal_attention.py --prompt-len 512 --causal-block-size 394   # clean pass
-    python tests/microbenchmarks/bench_kv_causal_attention.py --chunk-cycle --layers 36   # a chunk + commit
+    python tests/microbenchmarks/bench_block_causal_attention.py --prompt-len 512   # a denoising step
+    python tests/microbenchmarks/bench_block_causal_attention.py --prompt-len 512 --causal-block-size 394   # clean pass
+    python tests/microbenchmarks/bench_block_causal_attention.py --chunk-cycle --layers 36   # a chunk + commit
 
 The paged variants read exactly the model's window (the prompt, ``window``
-tokens before each block, the earlier blocks, the block) and are checked
+tokens before each causal block, the earlier causal blocks, the causal block) and are checked
 against that; the dense variants read the whole resident history, stale tokens
 included, and are checked against that.
 """
@@ -50,11 +50,11 @@ import torch.nn.functional as F
 
 from tensorrt_llm._torch.visual_gen.attention.backends.cudnn import CuDNNAttention
 from tensorrt_llm._torch.visual_gen.attention.backends.trtllm import TrtllmAttention
-from tensorrt_llm._torch.visual_gen.cache import CausalKVCacheManager
+from tensorrt_llm._torch.visual_gen.cache import BlockCausalKVCacheManager
 
 # The fp32 reference shared with the unit tests lives in the unittest tree.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "unittest"))
-from utils.kv_causal_reference import exact_reference  # noqa: E402
+from utils.block_causal_reference import exact_reference  # noqa: E402
 
 NUM_HEADS, NUM_KV_HEADS, HEAD_DIM = 32, 8, 128
 TOKENS_PER_FRAME, FRAMES_PER_CHUNK = 394, 4
@@ -201,13 +201,13 @@ def build_cache(
         max_staged_tokens=CHUNK,
         causal_block_sizes=(CHUNK, TOKENS_PER_FRAME),
     )
-    mgr = CausalKVCacheManager(
+    mgr = BlockCausalKVCacheManager(
         num_layers=num_layers,
         num_kv_heads=NUM_KV_HEADS,
         head_dim=HEAD_DIM,
         dtype=DTYPE,
         tokens_per_page=tokens_per_page,
-        pool_tokens=CausalKVCacheManager.pool_tokens_for(
+        pool_tokens=BlockCausalKVCacheManager.pool_tokens_for(
             tokens_per_page=tokens_per_page, pin_tokens=prompt_len, **geometry
         ),
     )
@@ -268,10 +268,16 @@ def chunk_cycle(args, gen) -> None:
             for i in range(layers)
         ]
 
-        def forward(block):
+        def forward(causal_block_size):
             for attn in attns:
                 attn.forward(
-                    q4, k4, v4, batch_size=1, seq_len=CHUNK, kv_cache=mgr, causal_block_size=block
+                    q4,
+                    k4,
+                    v4,
+                    batch_size=1,
+                    seq_len=CHUNK,
+                    kv_cache=mgr,
+                    causal_block_size=causal_block_size,
                 )
     else:
         attns = [
@@ -285,31 +291,39 @@ def chunk_cycle(args, gen) -> None:
             for i in range(layers)
         ]
 
-        def forward(block):
+        def forward(causal_block_size):
             for attn in attns:
-                attn.forward(q4, k4, v4, kv_cache=mgr, causal_block_size=block)
+                attn.forward(q4, k4, v4, kv_cache=mgr, causal_block_size=causal_block_size)
 
     print(
         f"chunk cycle: {layers} layers, backend {args.backend}, prompt {args.prompt_len}, "
         f"history {mgr.history_tokens} [{max(0, mgr.history_tokens - window)} stale], "
-        f"chunk {CHUNK}, clean pass in {CHUNK // TOKENS_PER_FRAME} blocks of {TOKENS_PER_FRAME}"
+        f"chunk {CHUNK}, clean pass in {CHUNK // TOKENS_PER_FRAME} causal blocks of {TOKENS_PER_FRAME}"
     )
     # Correctness first, on the last layer (every layer holds the same values): a
     # denoising forward and the clean pass against the exact window.
-    for block in (CHUNK, TOKENS_PER_FRAME):
+    for causal_block_size in (CHUNK, TOKENS_PER_FRAME):
         out = (
             attns[-1]
-            .forward(q4, k4, v4, batch_size=1, seq_len=CHUNK, kv_cache=mgr, causal_block_size=block)
+            .forward(
+                q4,
+                k4,
+                v4,
+                batch_size=1,
+                seq_len=CHUNK,
+                kv_cache=mgr,
+                causal_block_size=causal_block_size,
+            )
             .reshape(CHUNK, NUM_HEADS, HEAD_DIM)
         )
         ref = torch.cat(
             [
-                exact_reference(q.float(), kp, vp, hk, hv, k, v, lo, lo + block, window)
-                for lo in range(0, CHUNK, block)
+                exact_reference(q.float(), kp, vp, hk, hv, k, v, lo, lo + causal_block_size, window)
+                for lo in range(0, CHUNK, causal_block_size)
             ]
         )
         err = (out.float() - ref).abs().max().item()
-        name = "denoising" if block == CHUNK else "clean pass"
+        name = "denoising" if causal_block_size == CHUNK else "clean pass"
         print(f"check {name:10s} max|err| vs fp32 exact window = {err:.4f}")
         if err > 2e-2:
             raise SystemExit(f"chunk cycle: {name} deviates from the exact window by {err}")
@@ -384,7 +398,7 @@ def main() -> None:
         type=int,
         default=0,
         help="cut the chunk into causal blocks causal across each other (394 = the clean "
-        "pass, one block per frame); 0 = one causal block (a denoising step)",
+        "pass, one causal block per frame); 0 = one causal block (a denoising step)",
     )
     ap.add_argument("--no-l2-flush", action="store_true")
     ap.add_argument("--no-graph", action="store_true")
@@ -408,7 +422,7 @@ def main() -> None:
     if CHUNK % causal_block_size:
         raise SystemExit(f"--causal-block-size must divide the chunk of {CHUNK} tokens")
     num_causal_blocks = CHUNK // causal_block_size
-    blocks = [
+    causal_blocks = [
         (i * causal_block_size, (i + 1) * causal_block_size) for i in range(num_causal_blocks)
     ]
 
@@ -444,25 +458,31 @@ def main() -> None:
         layer_idx=0, num_heads=NUM_HEADS, head_dim=HEAD_DIM, num_kv_heads=NUM_KV_HEADS, dtype=DTYPE
     )
     q4, k4, v4 = q[None], k[None], v[None]
-    block_arg = causal_block_size if num_causal_blocks > 1 else None
+    causal_block_arg = causal_block_size if num_causal_blocks > 1 else None
 
     def run_trtllm():
         return trtllm_attn.forward(
-            q4, k4, v4, batch_size=1, seq_len=CHUNK, kv_cache=mgr, causal_block_size=block_arg
+            q4,
+            k4,
+            v4,
+            batch_size=1,
+            seq_len=CHUNK,
+            kv_cache=mgr,
+            causal_block_size=causal_block_arg,
         )
 
     def run_cudnn_paged():
-        return cudnn_attn.forward(q4, k4, v4, kv_cache=mgr, causal_block_size=block_arg)
+        return cudnn_attn.forward(q4, k4, v4, kv_cache=mgr, causal_block_size=causal_block_arg)
 
-    # Dense paths have no per-row key count, so causal blocks cost them one launch each:
+    # Dense paths have no per-causal-block key count, so causal blocks cost them one launch each:
     # that is the per-frame clean pass as the reference runs it.
     def per_block(attend):
         if num_causal_blocks == 1:
             return attend(q, seq_len)
-        return torch.cat([attend(q[lo:hi], start + hi) for lo, hi in blocks])
+        return torch.cat([attend(q[lo:hi], start + hi) for lo, hi in causal_blocks])
 
     # Slab: what a contiguous per-layer buffer would cost. Prompt and the resident
-    # history (stale tokens included: a slab has no per-block start) are already in
+    # history (stale tokens included: a slab has no per-causal-block start) are already in
     # place; a call writes the new tokens and attends over a slice.
     slab_k = torch.empty(mgr.capacity, NUM_KV_HEADS, HEAD_DIM, device=DEV, dtype=DTYPE)
     slab_v = torch.empty_like(slab_k)
@@ -494,12 +514,15 @@ def main() -> None:
     # causal block that sees the causal blocks after it, shows up here.
     all_k, all_v = torch.cat((resident_k, k)).float(), torch.cat((resident_v, v)).float()
     ref_resident = torch.cat(
-        [sdpa(q[lo:hi].float(), all_k[: start + hi], all_v[: start + hi]) for lo, hi in blocks]
+        [
+            sdpa(q[lo:hi].float(), all_k[: start + hi], all_v[: start + hi])
+            for lo, hi in causal_blocks
+        ]
     )
     ref_exact = torch.cat(
         [
             exact_reference(q.float(), kp, vp, k_hist, v_hist, k, v, lo, hi, window)
-            for lo, hi in blocks
+            for lo, hi in causal_blocks
         ]
     )
     chunk_only = sdpa(q.float(), k.float(), v.float())

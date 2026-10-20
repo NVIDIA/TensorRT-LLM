@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""CausalKVCacheManager under Ulysses: two ranks, each holding a head slice of the cache.
+"""BlockCausalKVCacheManager under Ulysses: two ranks, each holding a head slice of the cache.
 
 Every rank builds the same random full-head q/k/v, feeds the wrapper its token
 slice, and checks its token slice of the output against a full-head dense
@@ -32,14 +32,14 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
-from utils.kv_causal_reference import exact_reference
+from utils.block_causal_reference import exact_reference
 
 from tensorrt_llm._torch.distributed import all_to_all_4d
 from tensorrt_llm._torch.visual_gen.attention.attention import Attention
 from tensorrt_llm._torch.visual_gen.attention.backends import UlyssesAttention
 from tensorrt_llm._torch.visual_gen.attention.backends.cudnn import CuDNNAttention
 from tensorrt_llm._torch.visual_gen.attention.backends.trtllm import TrtllmAttention
-from tensorrt_llm._torch.visual_gen.cache import CausalKVCacheManager
+from tensorrt_llm._torch.visual_gen.cache import BlockCausalKVCacheManager
 from tensorrt_llm._torch.visual_gen.config import (
     DiffusionModelConfig,
     create_attention_metadata_state,
@@ -112,13 +112,13 @@ def make_cache(chunk, prompt=PROMPT, window=WINDOW, kv_heads=NUM_KV_HEADS // WOR
         max_staged_tokens=chunk,
         causal_block_sizes=sizes if sizes is not None else (chunk, chunk // 4),
     )
-    cache = CausalKVCacheManager(
+    cache = BlockCausalKVCacheManager(
         num_layers=1,
         num_kv_heads=kv_heads,
         head_dim=HEAD_DIM,
         dtype=DTYPE,
         tokens_per_page=TPB,
-        pool_tokens=CausalKVCacheManager.pool_tokens_for(
+        pool_tokens=BlockCausalKVCacheManager.pool_tokens_for(
             tokens_per_page=TPB, pin_tokens=prompt, **geometry
         ),
     )
@@ -261,11 +261,11 @@ def _logic_causal_blocks(
 
 
 def _logic_padded_first_chunk(rank, world_size, backend):
-    """A one-block first chunk whose length does not divide by the rank count: the
+    """A first chunk of one causal causal_block_size whose length does not divide by the rank count: the
     model pads it, passes the real ``seq_len``, and the padding is neither
     attended nor written."""
     torch.manual_seed(2)  # same tensors on every rank
-    chunk, block = 44, 11  # 11 real tokens on 2 ranks: padded to 12
+    chunk, causal_block_size = 44, 11  # 11 real tokens on 2 ranks: padded to 12
     cache = make_cache(chunk)
     attn, group = make_ulysses(rank, world_size, backend, chunk)
     try:
@@ -273,25 +273,34 @@ def _logic_padded_first_chunk(rank, world_size, backend):
         _, pk, pv = rand_qkv(PROMPT)
         cache.write_range(0, 0, to_head_layout(pk, rank, group), to_head_layout(pv, rank, group))
         cache.commit(PROMPT)
-        q, k, v = rand_qkv(block)
-        pad = (-block) % world_size
+        q, k, v = rand_qkv(causal_block_size)
+        pad = (-causal_block_size) % world_size
         padded = [torch.cat([x, torch.randn_like(x[:pad])]) for x in (q, k, v)]
-        out = forward(attn, cache, *padded, rank, causal_block_size=block, seq_len=block)
+        out = forward(
+            attn,
+            cache,
+            *padded,
+            rank,
+            causal_block_size=causal_block_size,
+            seq_len=causal_block_size,
+        )
         torch.cuda.synchronize()
 
         empty = pk.new_zeros((0, NUM_KV_HEADS, HEAD_DIM))
-        full = exact_reference(q, pk, pv, empty, empty, k, v, 0, block, WINDOW)
+        full = exact_reference(q, pk, pv, empty, empty, k, v, 0, causal_block_size, WINDOW)
         full = torch.cat([full, full.new_zeros((pad, NUM_HEADS, HEAD_DIM))])
-        per = (block + pad) // world_size
+        per = (causal_block_size + pad) // world_size
         expected = full[rank * per : (rank + 1) * per]
         torch.testing.assert_close(out, expected, rtol=2e-2, atol=2e-2)
 
-        positions = torch.arange(cache.staging_offset, cache.staging_offset + block, device="cuda")
+        positions = torch.arange(
+            cache.staging_offset, cache.staging_offset + causal_block_size, device="cuda"
+        )
         k_back, v_back = read_kv(cache, positions)
         torch.testing.assert_close(k_back, head_slice(k, rank))
         torch.testing.assert_close(v_back, head_slice(v, rank))
-        cache.commit(block)
-        assert cache.history_tokens == block
+        cache.commit(causal_block_size)
+        assert cache.history_tokens == causal_block_size
     finally:
         cache.shutdown()
 
@@ -316,7 +325,7 @@ def _logic_through_the_attention_module(rank, world_size, backend):
     """The model's path: the shared Attention module builds the Ulysses wrapper and
     must hand the caller's real token count through, padding included."""
     torch.manual_seed(3)
-    chunk = 44  # declares blocks of 11, the padded single-frame chunk below
+    chunk = 44  # declares causal blocks of 11, the padded single-frame chunk below
     vgm = VisualGenMapping(world_size=world_size, rank=rank, ulysses_size=world_size)
     config = DiffusionModelConfig(
         pretrained_config=SimpleNamespace(

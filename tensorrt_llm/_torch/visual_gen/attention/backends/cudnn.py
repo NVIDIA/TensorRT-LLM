@@ -44,7 +44,7 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.visual_gen.args import QuantAttentionConfig
 
 from ....attention.backends.interface import PredefinedAttentionMask
-from ...cache import CausalKVCacheManager
+from ...cache import BlockCausalKVCacheManager
 from .interface import AttentionBackend, AttentionTensorLayout
 
 
@@ -212,7 +212,7 @@ class _CuDNNProblemShape:
     v_strides: Tuple[int, ...]
     o_strides: Tuple[int, ...]
     num_pages: int = 0  # pages in the pool view (K/V container length)
-    table_len: int = 0  # entries per page-table row (the sequence's own pages)
+    table_len: int = 0  # page-list length per sequence (cuDNN's per-sequence page table)
     tokens_per_page: int = 0
     page_strides: Tuple[int, ...] = ()
 
@@ -601,7 +601,7 @@ class CuDNNAttention(AttentionBackend):
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        kv_cache: CausalKVCacheManager,
+        kv_cache: BlockCausalKVCacheManager,
         causal_block_size: Optional[int],
         attention_mask: PredefinedAttentionMask,
         key_padding_mask: Optional[torch.Tensor],
@@ -646,13 +646,13 @@ class CuDNNAttention(AttentionBackend):
             raise TypeError(f"q is {q.dtype} but the cache holds {buf.dtype}")
         # Write ``k``/``v`` to the KV cache at ``staging_offset``.
         kv_cache.write_staged(self.layer_idx, k[0], v[0], causal_block_size)
-        # The cache keeps lengths and page-table rows for every causal block of its
+        # The cache keeps lengths and page lists for every causal block of its
         # max_staged_tokens, in device tensors that commit() refreshes in place.
         seq_len_q, seq_len_kv = kv_cache.causal_block_lengths(causal_block_size)
         seq_len_q, seq_len_kv = seq_len_q[:num_causal_blocks], seq_len_kv[:num_causal_blocks]
 
         q_seg = q.view(num_causal_blocks, causal_block_size, num_heads, head_dim)
-        page_table = kv_cache.page_table(causal_block_size)[:num_causal_blocks]
+        causal_block_pages = kv_cache.causal_block_pages(causal_block_size)[:num_causal_blocks]
         num_pages, _, h_kv, tokens_per_page, _ = buf.shape
         shape = _CuDNNProblemShape(
             b=num_causal_blocks,
@@ -665,10 +665,11 @@ class CuDNNAttention(AttentionBackend):
             q_strides=(q_seg.stride(0), q_seg.stride(2), q_seg.stride(1), q_seg.stride(3)),
             k_strides=(),
             v_strides=(),
-            # The output lands in an [S, H, D] buffer per block, described as [B, H, S, D].
+            # The output lands in an [S, H, D] buffer per causal block, described as
+            # [B, H, S, D].
             o_strides=(causal_block_size * num_heads * head_dim, head_dim, num_heads * head_dim, 1),
             num_pages=num_pages,
-            table_len=page_table.shape[1],
+            table_len=causal_block_pages.shape[1],
             tokens_per_page=tokens_per_page,
             page_strides=tuple(buf[:, 0].stride()),
         )
@@ -689,7 +690,7 @@ class CuDNNAttention(AttentionBackend):
             bundle.inputs["q"]: q_seg,
             bundle.inputs["k"]: buf[:, 0],
             bundle.inputs["v"]: buf[:, 1],
-            bundle.inputs["page_table"]: page_table,
+            bundle.inputs["page_table"]: causal_block_pages,
             bundle.inputs["seq_len_q"]: seq_len_q,
             bundle.inputs["seq_len_kv"]: seq_len_kv,
             bundle.outputs["o"]: output.view(
@@ -920,7 +921,7 @@ class CuDNNAttention(AttentionBackend):
         *,
         attention_mask: PredefinedAttentionMask = PredefinedAttentionMask.FULL,
         key_padding_mask: Optional[torch.Tensor] = None,
-        kv_cache: Optional[CausalKVCacheManager] = None,
+        kv_cache: Optional[BlockCausalKVCacheManager] = None,
         **kwargs,
     ) -> torch.Tensor:
         """Run attention.
@@ -931,7 +932,7 @@ class CuDNNAttention(AttentionBackend):
             v: Value tensor ``[B, S_kv, H_kv, D_v]``.
             attention_mask: ``CAUSAL`` or ``FULL``.
             key_padding_mask: Not supported by this backend.
-            kv_cache: A ``CausalKVCacheManager``. When given, ``k``/``v`` are the new
+            kv_cache: A ``BlockCausalKVCacheManager``. When given, ``k``/``v`` are the new
                 tokens only: they are written at ``staging_offset`` and attention runs
                 over everything cached before them plus themselves.
             seq_len: Number of real tokens when ``kv_cache`` is given; all ``S_q`` rows
@@ -939,11 +940,11 @@ class CuDNNAttention(AttentionBackend):
                 padding added so the sequence splits evenly across ranks; they are
                 neither written to the cache nor attended, and their output rows are zero.
             causal_block_size: Specifies how the real tokens are cut into consecutive
-                causal blocks: full attention within a block, causal across blocks.
-                Requires ``kv_cache``; passing it without one raises. Use it when the
-                cache must hold each block's K/V as if the blocks had been generated one
-                at a time, so later blocks never leak into earlier ones. Absent: one
-                causal block.
+                causal blocks: full attention within a causal block, causal across causal
+                blocks. Requires ``kv_cache``; passing it without one raises. Use it when
+                the cache must hold each causal block's K/V as if the causal blocks had
+                been generated one at a time, so later ones never leak into earlier ones.
+                Absent: one causal block.
 
         Returns:
             Output tensor ``[B, S_q, H, D_v]``.

@@ -12,13 +12,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""CausalKVCacheManager: pages, the fixed region, the rolling window, and the
-per-block rows attention reads."""
+"""BlockCausalKVCacheManager: pages, the fixed region, the rolling window, and the
+causal block page lists attention reads."""
 
 import pytest
 import torch
 
-from tensorrt_llm._torch.visual_gen.cache import CausalKVCacheManager
+from tensorrt_llm._torch.visual_gen.cache import BlockCausalKVCacheManager
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 
@@ -37,13 +37,13 @@ def make_cache_for(tpb, *, max_pin_tokens, window_tokens, max_staged_tokens, cau
         max_staged_tokens=max_staged_tokens,
         causal_block_sizes=causal_block_sizes,
     )
-    cache = CausalKVCacheManager(
+    cache = BlockCausalKVCacheManager(
         num_layers=NUM_LAYERS,
         num_kv_heads=NUM_KV_HEADS,
         head_dim=HEAD_DIM,
         dtype=DTYPE,
         tokens_per_page=tpb,
-        pool_tokens=CausalKVCacheManager.pool_tokens_for(
+        pool_tokens=BlockCausalKVCacheManager.pool_tokens_for(
             tokens_per_page=tpb, pin_tokens=max_pin_tokens, **geometry
         ),
     )
@@ -61,7 +61,7 @@ def make_cache(tokens_per_page: int):
         max_pin_tokens=tpb + 8,
         window_tokens=2 * tpb,
         max_staged_tokens=tpb + 8,
-        causal_block_sizes=(tpb + 8, (tpb + 8) // 4),  # all staged tokens, and four blocks
+        causal_block_sizes=(tpb + 8, (tpb + 8) // 4),  # all staged tokens, and four causal blocks
     )
 
 
@@ -130,14 +130,14 @@ def open_with_fixed(cache, fixed_len):
     return per_layer
 
 
-def row_keys(cache, layer, block_size, i):
-    """The K stamps block ``i``'s row presents to the kernel, in row order."""
+def page_list_keys(cache, layer, causal_block_size, i):
+    """The K stamps causal block ``i``'s page list presents to the kernel, in order."""
     buf = cache.kv_buffer(layer)
-    rows = cache.page_table(block_size)
-    _, kv_len = cache.causal_block_lengths(block_size)
+    pages = cache.causal_block_pages(causal_block_size)
+    _, kv_len = cache.causal_block_lengths(causal_block_size)
     n = int(kv_len[i])
     pos = torch.arange(n, device=DEVICE)
-    page = rows[i].long()[pos // cache.tokens_per_page]
+    page = pages[i].long()[pos // cache.tokens_per_page]
     slot = pos % cache.tokens_per_page
     return buf[page, 0, 0, slot, 0].float()
 
@@ -156,7 +156,7 @@ def test_geometry_holds_fixed_window_stale_and_chunk(cache):
 def test_open_backs_every_page_once_and_publishes_the_table(cache):
     open_cache(cache)
     assert cache.fixed_tokens == cache.history_tokens == cache.staging_offset == 0
-    table = cache.block_table()
+    table = cache.page_table()
     assert len(table) == cache.num_pages
     assert len(set(table)) == cache.num_pages, "pages must be distinct"
     assert min(table) >= 0
@@ -182,7 +182,7 @@ def test_reopen_keeps_device_state_in_place(cache):
         t.data_ptr()
         for t in (
             cache.table,
-            cache.page_table(size),
+            cache.causal_block_pages(size),
             cache.causal_block_lengths(size)[1],
             cache._staged_slots,
             cache._layout(size).own_slots,
@@ -196,7 +196,7 @@ def test_reopen_keeps_device_state_in_place(cache):
         t.data_ptr()
         for t in (
             cache.table,
-            cache.page_table(size),
+            cache.causal_block_pages(size),
             cache.causal_block_lengths(size)[1],
             cache._staged_slots,
             cache._layout(size).own_slots,
@@ -283,7 +283,7 @@ def test_write_range_matches_indexed_write(cache):
     layer = NUM_LAYERS - 1
     buf = cache.kv_buffer(layer)
     assert buf.shape[1:] == (2, NUM_KV_HEADS, tpb, HEAD_DIM)
-    table = cache.block_table()
+    table = cache.page_table()
     positions = torch.arange(cache.capacity, device=DEVICE)
     k_back, _ = read_kv(cache, layer, positions)
     for t in (0, 19, 20, tpb - 1, tpb, cache.capacity - 1):
@@ -315,21 +315,21 @@ def test_zero_values_clears_v_of_the_range_only(cache):
             torch.testing.assert_close(v_back, v_want, rtol=0, atol=0)
 
 
-def row_stamps(cache, layer, size, i, plane):
-    """Stamps block ``i``'s row presents to the kernel for its cached tokens, in row
-    order, from the K (0) or V (1) plane."""
+def page_list_stamps(cache, layer, size, i, plane):
+    """Stamps causal block ``i``'s page list presents to the kernel for its cached
+    tokens, in order, from the K (0) or V (1) plane."""
     buf = cache.kv_buffer(layer)
-    rows = cache.page_table(size)
+    pages = cache.causal_block_pages(size)
     n = cache.cached_tokens(size)[i]
     pos = torch.arange(n, device=DEVICE)
-    page = rows[i].long()[pos // cache.tokens_per_page]
+    page = pages[i].long()[pos // cache.tokens_per_page]
     slot = pos % cache.tokens_per_page
     return buf[page, plane, 0, slot, 0].float()
 
 
 def test_edits_to_committed_tokens_reach_the_private_copies(cache):
     """write_range and zero_values on committed tokens update the private copies the
-    block rows read, not only the home slots. Chunk tokens and other layers stay."""
+    causal blocks read, not only the home slots. Chunk tokens and other layers stay."""
     chunk = cache.test_geometry["max_staged_tokens"]
     sizes = (chunk, chunk // 4)
     open_with_fixed(cache, 20)
@@ -344,26 +344,27 @@ def test_edits_to_committed_tokens_reach_the_private_copies(cache):
         cache.write_staged(layer, k[past:], v[past:])
     cache.commit(cache.max_staged_tokens)  # the copies are rebuilt here: the known-good path
     past = cache.staging_offset
-    for layer in range(NUM_LAYERS):  # the next chunk, so the earlier-block copies hold real tokens
+    # The next chunk, so the earlier-causal-block copies hold real tokens.
+    for layer in range(NUM_LAYERS):
         k, v = stamped_kv(torch.arange(past, past + chunk, device=DEVICE), layer)
         for size in sizes:
             cache.write_staged(layer, -k, -v, size)  # negative K stamps mark staged tokens
     before = {
-        (layer, size, i, plane): row_stamps(cache, layer, size, i, plane)
+        (layer, size, i, plane): page_list_stamps(cache, layer, size, i, plane)
         for layer in range(NUM_LAYERS)
         for size in sizes
         for i in range(chunk // size)
         for plane in (0, 1)
     }
 
-    def committed(layer, size, i):  # row entries holding committed tokens: positive K stamps
+    def committed(layer, size, i):  # page-list entries holding committed tokens: positive K stamps
         return before[(layer, size, i, 0)] > 0
 
     edited = 1
     k_now, v_now = read_kv(cache, edited, torch.arange(past, device=DEVICE))
     cache.write_range(edited, 0, -k_now, -v_now)
     for (layer, size, i, plane), old in before.items():
-        new = row_stamps(cache, layer, size, i, plane)
+        new = page_list_stamps(cache, layer, size, i, plane)
         want = old.clone()
         if layer == edited:
             want[committed(layer, size, i)] *= -1
@@ -371,7 +372,7 @@ def test_edits_to_committed_tokens_reach_the_private_copies(cache):
 
     cache.zero_values(edited, 0, past)
     for (layer, size, i, plane), old in before.items():
-        new = row_stamps(cache, layer, size, i, plane)
+        new = page_list_stamps(cache, layer, size, i, plane)
         want = old.clone()
         if layer == edited:
             hit = committed(layer, size, i)
@@ -384,7 +385,7 @@ def test_eviction_keeps_the_window_and_the_fixed_region(cache):
     fixed = 13
     prompts = open_with_fixed(cache, fixed)
     tpb, chunk, window = cache.tokens_per_page, cache.max_staged_tokens, cache.window_tokens
-    allocated = sorted(cache.block_table())
+    allocated = sorted(cache.page_table())
     written = []  # one stamp per committed generator token, oldest first
     saw_stale = saw_rotation = False
 
@@ -394,10 +395,10 @@ def test_eviction_keeps_the_window_and_the_fixed_region(cache):
                 (chunk, NUM_KV_HEADS, HEAD_DIM), float(c + 64 * layer), device=DEVICE, dtype=DTYPE
             )
             cache.write_range(layer, cache.staging_offset, stamp, -stamp)
-        before = cache.block_table()
+        before = cache.page_table()
         cache.commit(cache.max_staged_tokens)
         written.extend([c] * chunk)
-        saw_rotation |= cache.block_table() != before
+        saw_rotation |= cache.page_table() != before
 
         # Whole-page eviction leaves fewer than one page of stale tokens resident.
         assert cache.history_tokens <= window + tpb - 1
@@ -420,7 +421,7 @@ def test_eviction_keeps_the_window_and_the_fixed_region(cache):
             torch.testing.assert_close(v_p, prompts[layer][1])
 
         # Eviction recycles pages; it never allocates or frees any.
-        table = cache.block_table()
+        table = cache.page_table()
         # The host copy of the table rotates in lockstep with the device one.
         assert table == (cache.table // cache.page_view_scale).tolist()
         assert sorted(table) == allocated
@@ -430,13 +431,13 @@ def test_eviction_keeps_the_window_and_the_fixed_region(cache):
     assert saw_rotation, "test geometry should rotate the table"
 
 
-def check_rows_present_exactly_the_window(cache, fixed, size, steps=8, expect_stale=True):
-    """Every block's row holds the fixed region, exactly ``window_tokens`` of history
-    before the block (or fewer while the window fills), the earlier blocks it may see
-    and itself; nothing stale, nothing later, nothing twice. Checked by stamping
+def check_page_lists_present_exactly_the_window(cache, fixed, size, steps=8, expect_stale=True):
+    """Every causal block's page list holds the fixed region, exactly ``window_tokens``
+    of history before it (or fewer while the window fills), the earlier causal blocks it
+    may see and itself; nothing stale, nothing later, nothing twice. Checked by stamping
     every token with its position and layer."""
     chunk, window = cache.test_geometry["max_staged_tokens"], cache.test_geometry["window_tokens"]
-    num_blocks = chunk // size
+    num_causal_blocks = chunk // size
     open_cache(cache, pin_tokens=fixed)
     for layer in range(NUM_LAYERS):
         cache.write_range(layer, 0, *stamped_kv(torch.arange(fixed, device=DEVICE), layer))
@@ -458,18 +459,19 @@ def check_rows_present_exactly_the_window(cache, fixed, size, steps=8, expect_st
         )
         return sorted(t + layer * LAYER_STAMP for t in stamps)
 
-    def check_rows(block, count, step):
-        cached = cache.cached_tokens(block)
-        _, kv_len = cache.causal_block_lengths(block)
+    def check_page_lists(causal_block_size, count, step):
+        cached = cache.cached_tokens(causal_block_size)
+        _, kv_len = cache.causal_block_lengths(causal_block_size)
         for i in range(count):
-            start = cache.staging_offset + i * block
+            start = cache.staging_offset + i * causal_block_size
             for layer in range(NUM_LAYERS):
-                expected = expected_stamps(start, start + block, layer)
+                expected = expected_stamps(start, start + causal_block_size, layer)
+                where = f"step {step} causal block {i}"
                 if layer == 0:
-                    assert cached[i] == len(expected) - block, f"step {step} block {i}"
-                    assert int(kv_len[i]) == len(expected), f"step {step} block {i}"
-                got = sorted(row_keys(cache, layer, block, i).tolist())
-                assert got == expected, f"step {step} block {i} layer {layer}"
+                    assert cached[i] == len(expected) - causal_block_size, where
+                    assert int(kv_len[i]) == len(expected), where
+                got = sorted(page_list_keys(cache, layer, causal_block_size, i).tolist())
+                assert got == expected, f"{where} layer {layer}"
 
     saw_stale = False
     for step in range(steps):  # from empty history through saturation and several rotations
@@ -477,20 +479,20 @@ def check_rows_present_exactly_the_window(cache, fixed, size, steps=8, expect_st
         positions = torch.arange(past, past + chunk, device=DEVICE)
         for layer in range(NUM_LAYERS):
             cache.write_staged(layer, *stamped_kv(positions, layer), size)
-        assert cache.page_table(size).shape[0] == num_blocks
-        check_rows(size, num_blocks, step)
-        # A one-block forward reads the whole chunk with the same window.
+        assert cache.causal_block_pages(size).shape[0] == num_causal_blocks
+        check_page_lists(size, num_causal_blocks, step)
+        # A forward of one causal block reads the whole chunk with the same window.
         for layer in range(NUM_LAYERS):
             cache.write_staged(layer, *stamped_kv(positions, layer), chunk)
-        check_rows(chunk, 1, step)
-        # A shorter forward of the same block size uses the leading blocks only.
-        if num_blocks > 1:
-            half = (num_blocks // 2) * size
+        check_page_lists(chunk, 1, step)
+        # A shorter forward of the same causal block size uses the leading ones only.
+        if num_causal_blocks > 1:
+            half = (num_causal_blocks // 2) * size
             for layer in range(NUM_LAYERS):
                 k, v = stamped_kv(positions[:half], layer)
                 cache.write_staged(layer, k, v, size)
-            check_rows(size, num_blocks // 2, step)
-        # The shared pages hold the chunk too, for later blocks and chunks.
+            check_page_lists(size, num_causal_blocks // 2, step)
+        # The shared pages hold the chunk too, for later causal blocks and chunks.
         for layer in range(NUM_LAYERS):
             k_back, _ = read_kv(cache, layer, positions)
             torch.testing.assert_close(k_back, stamped_kv(positions, layer)[0])
@@ -500,42 +502,49 @@ def check_rows_present_exactly_the_window(cache, fixed, size, steps=8, expect_st
     assert saw_stale or not expect_stale, "test geometry should hold stale tokens at some step"
 
 
-def host_model_rows(cache, size):
-    """Every block's row and key count as the host computes them from the host table:
-    whole pages of the fixed region and the window, then the private pages, then zeros."""
-    blk = cache._layout(size)
-    rows, lengths = [], []
-    for i in range(blk.num_blocks):
+def host_model_page_lists(cache, size):
+    """Every causal block's page list and key count as the host computes them from the
+    host page table: whole pages of the fixed region and the window, then the private
+    pages, then zeros."""
+    layout = cache._layout(size)
+    page_lists, lengths = [], []
+    for i in range(layout.num_causal_blocks):
         spans = cache._visible_spans(cache.staging_offset + i * size)
         runs = cache._whole_page_runs(spans)
-        cached, _ = cache._host_block(blk, i)
+        cached, _ = cache._host_causal_block(layout, i)
         whole = [int(cache._host_table[p]) for a, b in runs for p in range(a, b)]
-        row = whole + blk.host_private_pages[i].tolist()
-        rows.append(row + [0] * (cache._table.numel() - len(row)))
+        pages = whole + layout.host_private_pages[i].tolist()
+        page_lists.append(pages + [0] * (cache._table.numel() - len(pages)))
         lengths.append(cached + size)
-    return rows, lengths
+    return page_lists, lengths
 
 
 def test_device_layout_matches_the_host_model(cache):
-    """The layout kernel's rows, lengths and committed_private copies agree with the host model across
+    """The layout kernel's page lists, lengths and committed_private copies agree with the host model across
     commits, with and without eviction and with a fixed tail on a shared page."""
     chunk = cache.test_geometry["max_staged_tokens"]
     open_with_fixed(cache, 13)
     for _ in range(5):
         for size in (chunk, chunk // 4):
-            rows, lengths = host_model_rows(cache, size)
-            assert cache.page_table(size).tolist() == rows
+            page_lists, lengths = host_model_page_lists(cache, size)
+            assert cache.causal_block_pages(size).tolist() == page_lists
             assert cache.causal_block_lengths(size)[1].tolist() == lengths
-            offsets = cache.block_offsets(size)[0]
-            assert offsets[:, 0].tolist() == [[r * cache.kv_factor for r in row] for row in rows]
+            offsets = cache.causal_block_offsets(size)[0]
+            assert offsets[:, 0].tolist() == [
+                [p * cache.kv_factor for p in pages] for pages in page_lists
+            ]
             # committed_private: the host model names each resident token's home and the private
             # slot its copy goes to. After a rotation the device reads the fixed tail
             # from the moved page (the same launch refills the tail's new home from it),
             # so translate that page to the new home before comparing.
             rpp = cache._rows_per_page
-            blk = cache._layout(size)
+            layout = cache._layout(size)
             device = {
-                (s, d) for s, d in zip(blk.committed_private_src.tolist(), blk.committed_private_dst.tolist()) if s >= 0
+                (s, d)
+                for s, d in zip(
+                    layout.committed_private_src.tolist(), layout.committed_private_dst.tolist()
+                )
+                if s >= 0
             }
             moved = {
                 s // rpp: d // rpp
@@ -544,16 +553,16 @@ def test_device_layout_matches_the_host_model(cache):
             }
             device = {(moved.get(s // rpp, s // rpp) * rpp + s % rpp, d) for s, d in device}
             home, copy = cache._committed_private_rows(0, cache.staging_offset)
-            private = set(blk.host_private_pages.reshape(-1).tolist())
+            private = set(layout.host_private_pages.reshape(-1).tolist())
             host = {(h, c) for h, c in zip(home.tolist(), copy.tolist()) if c // rpp in private}
             assert device == host
         cache.commit(cache.max_staged_tokens)
     assert cache.history_tokens > cache.window_tokens  # eviction happened
 
 
-def test_block_rows_present_exactly_the_window(cache):
+def test_causal_block_page_lists_present_exactly_the_window(cache):
     chunk = cache.test_geometry["max_staged_tokens"]
-    check_rows_present_exactly_the_window(cache, fixed=13, size=chunk // 4)
+    check_page_lists_present_exactly_the_window(cache, fixed=13, size=chunk // 4)
     with pytest.raises(ValueError, match="not declared"):
         cache.causal_block_lengths(chunk // 2)
     with pytest.raises(ValueError, match="not declared"):
@@ -564,12 +573,12 @@ def test_block_rows_present_exactly_the_window(cache):
     "tpb, chunk, size, window, stale",
     [
         (16, 24, 4, 20, True),  # window starts on the page holding past: chunk on two pages
-        (16, 32, 8, 12, True),  # window shorter than the chunk: starts inside earlier blocks
+        (16, 32, 8, 12, True),  # window shorter than the chunk: starts inside earlier causal blocks
         (32, 40, 40, 8, True),  # window shorter than a page
-        (32, 128, 64, 96, False),  # two blocks of two whole pages; eviction is page-aligned
+        (32, 128, 64, 96, False),  # two causal blocks of two whole pages; eviction is page-aligned
     ],
 )
-def test_block_rows_in_odd_geometries(tpb, chunk, size, window, stale):
+def test_causal_block_page_lists_in_odd_geometries(tpb, chunk, size, window, stale):
     cache = make_cache_for(
         tpb,
         max_pin_tokens=16,
@@ -578,7 +587,7 @@ def test_block_rows_in_odd_geometries(tpb, chunk, size, window, stale):
         causal_block_sizes=tuple(dict.fromkeys((chunk, size))),
     )
     try:
-        check_rows_present_exactly_the_window(
+        check_page_lists_present_exactly_the_window(
             cache, fixed=13, size=size, steps=10, expect_stale=stale
         )
     finally:
@@ -595,13 +604,13 @@ def test_causal_block_lengths_follow_the_exact_window(cache):
 
     size = chunk // 4
 
-    def exact(history):  # block i sees fixed + min(window, history + i*size) + itself
+    def exact(history):  # causal block i sees fixed + min(window, history + i*size) + itself
         return [3 + min(window, history + i * size) + size for i in range(4)]
 
     q4, kv4 = cache.causal_block_lengths(size)
     assert q4.tolist() == [size] * 4
     assert kv4.tolist() == exact(0)
-    assert cache.causal_block_lengths(size)[1] is kv4, "one persistent pair per block size"
+    assert cache.causal_block_lengths(size)[1] is kv4, "one persistent pair per causal block size"
 
     cache.commit(cache.max_staged_tokens)
     # Refreshed in place by commit(), without anyone asking for them again.
@@ -611,7 +620,7 @@ def test_causal_block_lengths_follow_the_exact_window(cache):
     for _ in range(4):
         cache.commit(cache.max_staged_tokens)
     assert cache.history_tokens > window
-    # Saturated: exactly the window before each block, however many stale tokens are resident.
+    # Saturated: exactly the window before each causal block, however many stale tokens are resident.
     assert kv.tolist() == [3 + window + chunk]
     assert kv4.tolist() == [3 + window + size] * 4
 
@@ -619,34 +628,36 @@ def test_causal_block_lengths_follow_the_exact_window(cache):
         cache.causal_block_lengths(7)
 
 
-def test_copy_batch_block_offsets_encodes_the_block_rows(cache):
+def test_copy_batch_block_offsets_encodes_the_causal_block_pages(cache):
     open_with_fixed(cache, 3)
     for _ in range(5):
         cache.commit(cache.max_staged_tokens)
     chunk = cache.max_staged_tokens
-    num_blocks, size = 3, chunk // 4  # three of the four blocks: a shorter forward
+    num_causal_blocks, size = 3, chunk // 4  # three of the four causal blocks: a shorter forward
     dst = torch.full((1, 4, 2, cache.max_blocks_per_seq), -7, dtype=torch.int32, device="cuda")
-    with pytest.raises(ValueError):  # the block size must be declared first
+    with pytest.raises(ValueError):  # the causal block size must be declared first
         cache.copy_batch_block_offsets(
-            dst, cache.request_ids(num_blocks), 1, num_blocks, num_blocks
+            dst, cache.request_ids(num_causal_blocks), 1, num_causal_blocks, num_causal_blocks
         )
     cache.set_causal_block_size(size)
-    cache.copy_batch_block_offsets(dst, cache.request_ids(num_blocks), 1, num_blocks, num_blocks)
+    cache.copy_batch_block_offsets(
+        dst, cache.request_ids(num_causal_blocks), 1, num_causal_blocks, num_causal_blocks
+    )
     torch.cuda.synchronize()
-    rows = cache.page_table(size)
-    n = rows.shape[1]
+    pages = cache.causal_block_pages(size)
+    n = pages.shape[1]
     kv_offset = int(cache.kv_offset[0])
-    for i in range(num_blocks):
-        torch.testing.assert_close(dst[0, i, 0, :n], rows[i] * cache.kv_factor)
-        torch.testing.assert_close(dst[0, i, 1, :n], rows[i] * cache.kv_factor + kv_offset)
+    for i in range(num_causal_blocks):
+        torch.testing.assert_close(dst[0, i, 0, :n], pages[i] * cache.kv_factor)
+        torch.testing.assert_close(dst[0, i, 1, :n], pages[i] * cache.kv_factor + kv_offset)
         assert torch.count_nonzero(dst[0, i, :, n:]) == 0, "unused entries are the safe page 0"
-    assert (dst[0, 3] == -7).all(), "rows beyond num_seqs are untouched"
+    assert (dst[0, 3] == -7).all(), "sequences beyond num_seqs are untouched"
 
     with pytest.raises(ValueError):
         cache.copy_batch_block_offsets(dst, [1], 1, 1, 1)
     with pytest.raises(ValueError):
         cache.copy_batch_block_offsets(dst, cache.request_ids(1) + [1], 1, 2, 2)
-    with pytest.raises(ValueError):  # more blocks than the declared size cuts the chunk into
+    with pytest.raises(ValueError):  # more causal blocks than the declared size cuts the chunk into
         cache.copy_batch_block_offsets(dst, cache.request_ids(5), 1, 5, 5)
 
 
@@ -687,14 +698,14 @@ def test_rejects_bad_geometry():
     pool = dict(num_layers=1, num_kv_heads=1, head_dim=16, dtype=torch.float16)
     for tpb in (0, 12, 24, 100):
         with pytest.raises(ValueError, match="power of two"):
-            CausalKVCacheManager(tokens_per_page=tpb, pool_tokens=320, **pool)
+            BlockCausalKVCacheManager(tokens_per_page=tpb, pool_tokens=320, **pool)
     with pytest.raises(ValueError, match="multiple"):
-        CausalKVCacheManager(tokens_per_page=32, pool_tokens=100, **pool)
+        BlockCausalKVCacheManager(tokens_per_page=32, pool_tokens=100, **pool)
     with pytest.raises(ValueError):
-        CausalKVCacheManager(
+        BlockCausalKVCacheManager(
             tokens_per_page=32, pool_tokens=320, **{**pool, "dtype": torch.float32}
         )
-    cache = CausalKVCacheManager(tokens_per_page=32, pool_tokens=320, **pool)
+    cache = BlockCausalKVCacheManager(tokens_per_page=32, pool_tokens=320, **pool)
     try:
         with pytest.raises(ValueError, match="at most"):
             cache.open(window_tokens=64, max_staged_tokens=40, causal_block_sizes=(40, 41))
@@ -722,7 +733,7 @@ def test_failed_open_leaves_the_cache_closed(cache, monkeypatch):
         cache.table
     monkeypatch.undo()
     open_cache(cache, pin_tokens=9)
-    assert cache.is_open and len(set(cache.block_table())) == cache.num_pages
+    assert cache.is_open and len(set(cache.page_table())) == cache.num_pages
 
 
 def test_each_geometry_keeps_its_device_state(cache):
@@ -734,7 +745,7 @@ def test_each_geometry_keeps_its_device_state(cache):
     open_cache(cache, pin_tokens=9)
     wide = cache.test_geometry
     size = wide["causal_block_sizes"][-1]
-    rows_a, (_, lkv_a) = cache.page_table(size), cache.causal_block_lengths(size)
+    pages_a, (_, lkv_a) = cache.causal_block_pages(size), cache.causal_block_lengths(size)
     table_ptr = cache.table.data_ptr()
     cache.write_range(0, 0, *rand_kv(9))
     cache.commit(9)
@@ -745,21 +756,21 @@ def test_each_geometry_keeps_its_device_state(cache):
 
     cache.open(pin_tokens=5, **narrow)
     assert cache.geometry == (tpb, tpb, (tpb, tpb // 2))
-    assert cache.page_table(tpb // 2).data_ptr() != rows_a.data_ptr()
+    assert cache.causal_block_pages(tpb // 2).data_ptr() != pages_a.data_ptr()
     cache.commit(5)
     cache.commit(tpb)
     assert cache.table.data_ptr() == table_ptr
     cache.close()
 
     open_cache(cache, pin_tokens=9)
-    assert cache.page_table(size).data_ptr() == rows_a.data_ptr()
+    assert cache.causal_block_pages(size).data_ptr() == pages_a.data_ptr()
     assert cache.causal_block_lengths(size)[1].data_ptr() == lkv_a.data_ptr()
     cache.write_range(0, 0, *rand_kv(9))
     cache.commit(9)
     for _ in range(3):
         cache.commit(cache.max_staged_tokens)
     assert cache.cached_tokens(size) == cached_a
-    assert len(set(cache.block_table())) == cache.num_pages
+    assert len(set(cache.page_table())) == cache.num_pages
 
 
 def test_commit_takes_the_tokens_actually_written(cache):
@@ -793,13 +804,15 @@ def test_pool_bytes_for_is_what_the_gpu_loses():
     )
     previous = 0
     for window_tokens in (600, 6000, 60000):  # each step crosses an allocator chunk
-        expected = CausalKVCacheManager.pool_bytes_for(
+        expected = BlockCausalKVCacheManager.pool_bytes_for(
             window_tokens=window_tokens, **pool, **geometry
         )
-        pool_tokens = CausalKVCacheManager.pool_tokens_for(window_tokens=window_tokens, **geometry)
+        pool_tokens = BlockCausalKVCacheManager.pool_tokens_for(
+            window_tokens=window_tokens, **geometry
+        )
         torch.cuda.synchronize()
         free_before, _ = torch.cuda.mem_get_info()
-        cache = CausalKVCacheManager(tokens_per_page=32, pool_tokens=pool_tokens, **pool)
+        cache = BlockCausalKVCacheManager(tokens_per_page=32, pool_tokens=pool_tokens, **pool)
         try:
             torch.cuda.synchronize()
             free_after, _ = torch.cuda.mem_get_info()

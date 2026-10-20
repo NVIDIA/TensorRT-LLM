@@ -12,13 +12,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Attention backends over CausalKVCacheManager against a dense SDPA reference.
+"""Attention backends over BlockCausalKVCacheManager against a dense SDPA reference.
 
 Random inputs; the reference keeps its own dense copy of every K/V ever written
 and attends over exactly what the model's window allows: the fixed region (the
-prompt), the ``WINDOW`` tokens before each block, the earlier blocks of the chunk
-and the block itself. Stale tokens the whole-page eviction keeps resident must
-not be seen.
+prompt), the ``WINDOW`` tokens before each causal block, the earlier causal blocks
+of the chunk and the causal block itself. Stale tokens the whole-page eviction keeps
+resident must not be seen.
 """
 
 import gc
@@ -28,14 +28,14 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from utils.kv_causal_reference import exact_reference as _exact_reference
-from utils.kv_causal_reference import reference_attention
+from utils.block_causal_reference import exact_reference as _exact_reference
+from utils.block_causal_reference import reference_attention
 
 from tensorrt_llm._torch.attention.backends.interface import PredefinedAttentionMask
 from tensorrt_llm._torch.visual_gen.attention.attention import Attention
 from tensorrt_llm._torch.visual_gen.attention.backends.cudnn import CuDNNAttention
 from tensorrt_llm._torch.visual_gen.attention.backends.trtllm import TrtllmAttention
-from tensorrt_llm._torch.visual_gen.cache import CausalKVCacheManager
+from tensorrt_llm._torch.visual_gen.cache import BlockCausalKVCacheManager
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm._torch.visual_gen.cuda_graph_runner import CUDAGraphRunner, CUDAGraphRunnerConfig
 from tensorrt_llm.visual_gen.args import AttentionConfig
@@ -57,13 +57,13 @@ GEOMETRY = dict(
 
 def make_cache(tokens_per_page, pin_tokens=PROMPT_CAPACITY, geometry=GEOMETRY):
     """A cache whose pool is sized for ``geometry`` with up to ``pin_tokens`` pinned."""
-    return CausalKVCacheManager(
+    return BlockCausalKVCacheManager(
         num_layers=1,
         num_kv_heads=NUM_KV_HEADS,
         head_dim=HEAD_DIM,
         dtype=DTYPE,
         tokens_per_page=tokens_per_page,
-        pool_tokens=CausalKVCacheManager.pool_tokens_for(
+        pool_tokens=BlockCausalKVCacheManager.pool_tokens_for(
             tokens_per_page=tokens_per_page, pin_tokens=pin_tokens, **geometry
         ),
     )
@@ -196,8 +196,8 @@ def test_rollout_matches_dense_reference(cache, backend, prompt_len):
 
 
 def check_causal_blocks(attn, cache, prompt_k, prompt_v, hk, hv, num_causal_blocks, chunk):
-    """One call cut into causal blocks: block i sees the prompt, its own window of
-    history, the blocks before it and itself. ``hk``/``hv``: all committed history."""
+    """One call cut into causal blocks: causal block i sees the prompt, its own window
+    of history, the causal blocks before it and itself. ``hk``/``hv``: all committed history."""
     causal_block_size = chunk // num_causal_blocks
     q, k, v = rand_qkv(chunk)
     out = run(attn, cache, q, k, v, causal_block_size=causal_block_size)
@@ -276,7 +276,7 @@ def test_each_block_sees_exactly_its_window(cache, backend, num_causal_blocks, c
     hist = commits * CHUNK
     total = prompt + hist + CHUNK
     # Watch the prompt, up to the last 79 committed tokens (window edges of every
-    # block and stale tokens), the whole chunk, and ids that never exist: one per
+    # causal block and stale tokens), the whole chunk, and ids that never exist: one per
     # (K/V head, dimension).
     ids = torch.cat(
         [
@@ -309,7 +309,7 @@ def test_each_block_sees_exactly_its_window(cache, backend, num_causal_blocks, c
     torch.cuda.synchronize()
 
     token = torch.arange(CHUNK, device=DEVICE)
-    start = token // size * size  # each query's block start within the chunk
+    start = token // size * size  # each query's causal block start within the chunk
     end = start + size
     # Ids are sequence positions before any eviction: fixed [0, fixed), then history.
     g = watch.repeat_interleave(NUM_HEADS // NUM_KV_HEADS, dim=0)[None]  # [1, H, D]
@@ -432,7 +432,7 @@ def test_graph_replay_survives_commit(cache, backend):
 def test_graph_runner_keys_cached_forwards(backend):
     """Through VisualGen's CUDAGraphRunner, the way a model runs: with the real token
     count, the causal block size and the cache registered as extra keys, forwards of
-    equal tensor shapes but different block sizes get their own graphs, and commits
+    equal tensor shapes but different causal block sizes get their own graphs, and commits
     between forwards replay them (the cache's device state needs no recapture)."""
     torch.manual_seed(7)
     cache = make_cache(32)
@@ -476,7 +476,7 @@ def test_graph_runner_keys_cached_forwards(backend):
             cache.commit(CHUNK)
             history_k.append(k)
             history_v.append(v)
-        assert len(runner.graphs) == 2, "one graph per block size, replayed across commits"
+        assert len(runner.graphs) == 2, "one graph per causal block size, replayed across commits"
     finally:
         runner.clear()
         cache.shutdown()
@@ -666,11 +666,11 @@ def test_padding_with_causal_blocks_over_stale_history(cache, backend):
     torch.testing.assert_close(v_back, v[:CHUNK])
 
 
-@pytest.mark.parametrize("block", [32, 64])
+@pytest.mark.parametrize("causal_block_size", [32, 64])
 @pytest.mark.parametrize("backend", BACKENDS)
-def test_blocks_of_one_and_two_whole_pages(backend, block):
+def test_causal_blocks_of_one_and_two_whole_pages(backend, causal_block_size):
     """Causal blocks exactly one page and exactly two pages long, several per chunk, so
-    block starts and ends fall on page boundaries, through several rotations."""
+    their starts and ends fall on page boundaries, through several rotations."""
     torch.manual_seed(10)
     prompt, window, chunk = 8, 96, 128
     geometry = dict(window_tokens=window, max_staged_tokens=chunk, causal_block_sizes=(128, 64, 32))
@@ -682,15 +682,15 @@ def test_blocks_of_one_and_two_whole_pages(backend, block):
         empty = pk.new_zeros((0, NUM_KV_HEADS, HEAD_DIM))
         for step in range(6):
             q, k, v = rand_qkv(chunk)
-            out = run(attn, cache, q, k, v, causal_block_size=block)
+            out = run(attn, cache, q, k, v, causal_block_size=causal_block_size)
             torch.cuda.synchronize()
             hk = torch.cat(history_k) if history_k else empty
             hv = torch.cat(history_v) if history_v else empty
             keys, values = torch.cat([pk, hk, k]), torch.cat([pv, hv, v])
             pos = torch.arange(keys.shape[0], device=DEVICE)
             expected = []
-            for start in range(0, chunk, block):
-                end = start + block
+            for start in range(0, chunk, causal_block_size):
+                end = start + causal_block_size
                 visible = (pos < prompt) | (
                     (pos >= prompt + hk.shape[0] + start - window)
                     & (pos < prompt + hk.shape[0] + end)

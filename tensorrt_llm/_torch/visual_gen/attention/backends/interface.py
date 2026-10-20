@@ -68,12 +68,12 @@ class AttentionBackend(ABC):
           are padding added so the sequence splits evenly across ranks, and they
           are neither written to the cache nor attended, and come back zero.
         * ``attention_mask``, ``key_padding_mask``: the mask, if the backend takes one.
-        * ``kv_cache``: a ``CausalKVCacheManager``; only backends whose
+        * ``kv_cache``: a ``BlockCausalKVCacheManager``; only backends whose
           ``support_kv_cache()`` is true accept it. ``k``/``v`` are then this call's
           new tokens, staged into the cache and attended together with what the
           cache holds before them.
         * ``causal_block_size``: with ``kv_cache``, cuts the new tokens into causal
-          blocks, full attention within a block and causal across blocks.
+          blocks, full attention within a causal block and causal across causal blocks.
 
         Under CUDA graphs a captured forward belongs to (cache, geometry, ``seq_len``,
         ``causal_block_size``) besides the tensor shapes: those are host values baked
@@ -109,7 +109,7 @@ class AttentionBackend(ABC):
         return False
 
     def support_kv_cache(self) -> bool:
-        """Whether ``forward`` accepts a ``CausalKVCacheManager`` as ``kv_cache``. A backend
+        """Whether ``forward`` accepts a ``BlockCausalKVCacheManager`` as ``kv_cache``. A backend
         without support would silently drop the keyword through ``**kwargs``, so callers
         must check before passing one."""
         return False
@@ -117,7 +117,7 @@ class AttentionBackend(ABC):
     def support_kv_cache_page_size(
         self, tokens_per_page: int, dtype: Optional[torch.dtype] = None
     ) -> bool:
-        """Whether ``forward`` can attend over a ``CausalKVCacheManager`` with
+        """Whether ``forward`` can attend over a ``BlockCausalKVCacheManager`` with
         ``tokens_per_page``-token pages holding ``dtype`` K/V (default: the backend's
         dtype) on the current GPU. A caller sizing a cache asks this before building it;
         ``forward`` refuses an unsupported cache either way."""

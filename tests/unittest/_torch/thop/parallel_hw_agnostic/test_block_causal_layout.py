@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""trtllm::causal_layout_ on a geometry small enough to lay out by hand. The cache's
+"""trtllm::block_causal_layout_ on a geometry small enough to lay out by hand. The cache's
 own tests cover it on real geometries against the host model."""
 
 import pytest
@@ -25,8 +25,8 @@ DEV = torch.device("cuda")
 
 TPB = 4
 TABLE = [10, 11, 12, 13, 14, 15]  # view page of each logical page
-PRIVATE_PAGES = [20, 21, 22, 23]  # one block's private pages
-RPP = 2 * 1 * TPB  # pool rows per view page with one K/V head
+PRIVATE_PAGES = [20, 21, 22, 23]  # one causal block's private pages
+RPP = 2 * 1 * TPB  # pool causal_block_pages per view page with one K/V head
 KV_FACTOR, KV_OFFSET = 2, 1
 
 
@@ -38,30 +38,30 @@ def i32(values):
     return torch.tensor(values, dtype=torch.int32, device=DEV)
 
 
-def layout(block_size=4, drop_pages=0, past=6, fixed=2, window=3, shared=True):
-    """One block of ``block_size`` staged at ``past``; returns the written tensors."""
-    n, row_len = 1, len(TABLE)
+def layout(causal_block_size=4, drop_pages=0, past=6, fixed=2, window=3, shared=True):
+    """One causal block of ``causal_block_size`` staged at ``past``; returns the written tensors."""
+    n, max_pages = 1, len(TABLE)
     out = dict(
-        rows=torch.full((n, row_len), -7, dtype=torch.int32, device=DEV),
-        block_offsets=torch.full((1, n, 2, row_len), -7, dtype=torch.int32, device=DEV),
+        causal_block_pages=torch.full((n, max_pages), -7, dtype=torch.int32, device=DEV),
+        causal_block_offsets=torch.full((1, n, 2, max_pages), -7, dtype=torch.int32, device=DEV),
         seq_len_kv=torch.zeros(n, dtype=torch.int32, device=DEV),
-        own_slots=torch.zeros(n * block_size, dtype=torch.int64, device=DEV),
+        own_slots=torch.zeros(n * causal_block_size, dtype=torch.int64, device=DEV),
         current_private_src=torch.zeros(n * 2 * (TPB - 1), dtype=torch.int64, device=DEV),
         current_private_dst=torch.zeros(n * 2 * (TPB - 1), dtype=torch.int64, device=DEV),
         committed_private_src=torch.zeros(n * 3 * (TPB - 1), dtype=torch.int64, device=DEV),
         committed_private_dst=torch.zeros(n * 3 * (TPB - 1), dtype=torch.int64, device=DEV),
     )
-    commit_block = dict(
-        staged_slots=torch.zeros(block_size, dtype=torch.int64, device=DEV),
+    once_per_commit = dict(
+        staged_slots=torch.zeros(causal_block_size, dtype=torch.int64, device=DEV),
         refill_src=torch.zeros(TPB, dtype=torch.int64, device=DEV),
         refill_dst=torch.zeros(TPB, dtype=torch.int64, device=DEV),
     )
-    torch.ops.trtllm.causal_layout_(
+    torch.ops.trtllm.block_causal_layout_(
         i32(TABLE),
         i32([PRIVATE_PAGES]),
         *out.values(),
-        *(commit_block.values() if shared else (None, None, None)),
-        block_size,
+        *(once_per_commit.values() if shared else (None, None, None)),
+        causal_block_size,
         TPB,
         past,
         fixed,
@@ -72,22 +72,28 @@ def layout(block_size=4, drop_pages=0, past=6, fixed=2, window=3, shared=True):
         KV_OFFSET,
         RPP,
     )
-    out.update(commit_block)
+    out.update(once_per_commit)
     return {k: v.tolist() for k, v in out.items()}
 
 
 def test_hand_layout():
-    # past 6, fixed 2, window 3: block 0 starts at 6, sees [0, 2) and [3, 6). No whole
+    # past 6, fixed 2, window 3: causal block 0 starts at 6, sees [0, 2) and [3, 6). No whole
     # page; partial pages 0 (positions 0, 1, 3) and 1 (positions 4, 5); all resident.
     got = layout()
-    assert got["rows"] == [[20, 21, 22, 23, 0, 0]]
-    assert got["block_offsets"] == [[[[40, 42, 44, 46, 0, 0], [41, 43, 45, 47, 1, 1]]]]
+    assert got["causal_block_pages"] == [[20, 21, 22, 23, 0, 0]]
+    assert got["causal_block_offsets"] == [[[[40, 42, 44, 46, 0, 0], [41, 43, 45, 47, 1, 1]]]]
     assert got["seq_len_kv"] == [0 * TPB + 5 + 4]
     # Own tokens take private slots 5..8: page 21 slots 1-3, then page 22 slot 0.
     assert got["own_slots"] == [21 * TPB + 1, 21 * TPB + 2, 21 * TPB + 3, 22 * TPB + 0]
     # committed_private: positions 0, 1, 3 (page 10) and 4, 5 (page 11) into private slots 0..4.
-    assert got["committed_private_src"] == [10 * RPP + 0, 10 * RPP + 1, 10 * RPP + 3, 11 * RPP + 0, 11 * RPP + 1] + [-1] * 4
-    assert got["committed_private_dst"] == [20 * RPP + 0, 20 * RPP + 1, 20 * RPP + 2, 20 * RPP + 3, 21 * RPP + 0] + [-1] * 4
+    assert (
+        got["committed_private_src"]
+        == [10 * RPP + 0, 10 * RPP + 1, 10 * RPP + 3, 11 * RPP + 0, 11 * RPP + 1] + [-1] * 4
+    )
+    assert (
+        got["committed_private_dst"]
+        == [20 * RPP + 0, 20 * RPP + 1, 20 * RPP + 2, 20 * RPP + 3, 21 * RPP + 0] + [-1] * 4
+    )
     # No staged token on a partial page: every current_private entry is the padding (own first token).
     assert got["current_private_src"] == [0] * 6
     assert got["current_private_dst"] == [21 * TPB + 1] * 6
@@ -102,38 +108,60 @@ def test_rotation_reads_the_fixed_tail_from_the_moved_page():
     got = layout(drop_pages=1)
     assert got["refill_src"] == [15 * RPP + 0, 15 * RPP + 1, -1, -1]
     assert got["refill_dst"] == [10 * RPP + 0, 10 * RPP + 1, -1, -1]
-    assert got["committed_private_src"][:2] == [15 * RPP + 0, 15 * RPP + 1]  # the fixed tail, from the old page
-    assert got["committed_private_src"][2:5] == [10 * RPP + 3, 11 * RPP + 0, 11 * RPP + 1]  # history, as mapped now
+    # The fixed tail, from the old page; then history, as mapped now.
+    assert got["committed_private_src"][:2] == [15 * RPP + 0, 15 * RPP + 1]
+    assert got["committed_private_src"][2:5] == [10 * RPP + 3, 11 * RPP + 0, 11 * RPP + 1]
 
 
 def test_staged_tokens_on_a_partial_page_become_current_private():
-    # Two blocks of 2: block 1 starts at 8 and sees [0, 2) and [5, 8); positions 6, 7 are
-    # block 0's staged tokens on block 1's start page (page 1 holds 4..7).
-    n, block_size, row_len = 2, 2, len(TABLE)
+    # Two causal blocks of 2: causal block 1 starts at 8 and sees [0, 2) and [5, 8);
+    # positions 6, 7 are causal block 0's staged tokens on causal block 1's start page
+    # (page 1 holds 4..7).
+    n, causal_block_size, max_pages = 2, 2, len(TABLE)
     private_pages = i32([PRIVATE_PAGES, [30, 31, 32, 33]])
     out = dict(
-        rows=torch.zeros(n, row_len, dtype=torch.int32, device=DEV),
-        block_offsets=torch.zeros(1, n, 2, row_len, dtype=torch.int32, device=DEV),
+        causal_block_pages=torch.zeros(n, max_pages, dtype=torch.int32, device=DEV),
+        causal_block_offsets=torch.zeros(1, n, 2, max_pages, dtype=torch.int32, device=DEV),
         seq_len_kv=torch.zeros(n, dtype=torch.int32, device=DEV),
-        own_slots=torch.zeros(n * block_size, dtype=torch.int64, device=DEV),
+        own_slots=torch.zeros(n * causal_block_size, dtype=torch.int64, device=DEV),
         current_private_src=torch.zeros(n * 2 * (TPB - 1), dtype=torch.int64, device=DEV),
         current_private_dst=torch.zeros(n * 2 * (TPB - 1), dtype=torch.int64, device=DEV),
         committed_private_src=torch.zeros(n * 3 * (TPB - 1), dtype=torch.int64, device=DEV),
         committed_private_dst=torch.zeros(n * 3 * (TPB - 1), dtype=torch.int64, device=DEV),
     )
-    torch.ops.trtllm.causal_layout_(
-        i32(TABLE), private_pages, *out.values(), None, None, None, block_size, TPB, 6, 2, 3,
-        len(TABLE), 0, KV_FACTOR, KV_OFFSET, RPP,
+    torch.ops.trtllm.block_causal_layout_(
+        i32(TABLE),
+        private_pages,
+        *out.values(),
+        None,
+        None,
+        None,
+        causal_block_size,
+        TPB,
+        6,
+        2,
+        3,
+        len(TABLE),
+        0,
+        KV_FACTOR,
+        KV_OFFSET,
+        RPP,
     )
     got = {k: v.tolist() for k, v in out.items()}
-    # Block 1: partial positions 0, 1 (page 0), 5 (page 1, resident), 6, 7 (page 1, staged).
-    assert got["seq_len_kv"][1] == 5 + block_size
+    # Causal block 1: partial positions 0, 1 (page 0), 5 (page 1, resident), 6, 7 (page 1, staged).
+    assert got["seq_len_kv"][1] == 5 + causal_block_size
     assert got["committed_private_src"][9:12] == [10 * RPP + 0, 10 * RPP + 1, 11 * RPP + 1]
     assert got["committed_private_src"][12:18] == [-1] * 6
-    current_private_src, current_private_dst = got["current_private_src"][6:], got["current_private_dst"][6:]
+    current_private_src, current_private_dst = (
+        got["current_private_src"][6:],
+        got["current_private_dst"][6:],
+    )
     assert current_private_src[:2] == [0, 1]  # staged tokens 6 - past, 7 - past
     assert current_private_dst[:2] == [30 * TPB + 3, 31 * TPB + 0]  # private slots 3 and 4
-    assert current_private_src[2:] == [block_size * 1] * 4 and current_private_dst[2:] == [31 * TPB + 1] * 4
+    assert (
+        current_private_src[2:] == [causal_block_size * 1] * 4
+        and current_private_dst[2:] == [31 * TPB + 1] * 4
+    )
 
 
 def test_bad_arguments():
@@ -144,14 +172,34 @@ def test_bad_arguments():
     with pytest.raises(RuntimeError, match="end past page"):
         layout(past=22)
     with pytest.raises(RuntimeError, match="cannot hold"):
-        layout(block_size=8)
+        layout(causal_block_size=8)
     with pytest.raises(RuntimeError, match="go together"):
-        n, row_len = 1, len(TABLE)
+        n, max_pages = 1, len(TABLE)
         z = lambda *shape, dtype=torch.int64: torch.zeros(*shape, dtype=dtype, device=DEV)  # noqa: E731
-        torch.ops.trtllm.causal_layout_(
-            i32(TABLE), i32([PRIVATE_PAGES]), z(n, row_len, dtype=torch.int32),
-            z(1, n, 2, row_len, dtype=torch.int32), z(n, dtype=torch.int32), z(4), z(6), z(6),
-            z(9), z(9), None, z(TPB), None, 4, TPB, 6, 2, 3, len(TABLE), 0, KV_FACTOR, KV_OFFSET, RPP,
+        torch.ops.trtllm.block_causal_layout_(
+            i32(TABLE),
+            i32([PRIVATE_PAGES]),
+            z(n, max_pages, dtype=torch.int32),
+            z(1, n, 2, max_pages, dtype=torch.int32),
+            z(n, dtype=torch.int32),
+            z(4),
+            z(6),
+            z(6),
+            z(9),
+            z(9),
+            None,
+            z(TPB),
+            None,
+            4,
+            TPB,
+            6,
+            2,
+            3,
+            len(TABLE),
+            0,
+            KV_FACTOR,
+            KV_OFFSET,
+            RPP,
         )
 
 
@@ -159,13 +207,13 @@ def test_page_size_must_be_a_power_of_two():
     def z(*shape, dtype=torch.int64):
         return torch.zeros(*shape, dtype=dtype, device=DEV)
 
-    row_len = len(TABLE)
+    max_pages = len(TABLE)
     with pytest.raises(RuntimeError, match="power of two"):
-        torch.ops.trtllm.causal_layout_(
+        torch.ops.trtllm.block_causal_layout_(
             i32(TABLE),
             i32([PRIVATE_PAGES]),
-            z(1, row_len, dtype=torch.int32),
-            z(1, 1, 2, row_len, dtype=torch.int32),
+            z(1, max_pages, dtype=torch.int32),
+            z(1, 1, 2, max_pages, dtype=torch.int32),
             z(1, dtype=torch.int32),
             z(4),
             z(4),
@@ -180,7 +228,7 @@ def test_page_size_must_be_a_power_of_two():
             6,
             2,
             3,
-            row_len,
+            max_pages,
             0,
             KV_FACTOR,
             KV_OFFSET,

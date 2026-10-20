@@ -31,12 +31,12 @@ def _register_fake():
     ) -> None:
         return None
 
-    @torch.library.register_fake("trtllm::causal_layout_")
-    def causal_layout_(
+    @torch.library.register_fake("trtllm::block_causal_layout_")
+    def block_causal_layout_(
         table: torch.Tensor,
         private_pages: torch.Tensor,
-        rows: torch.Tensor,
-        block_offsets: torch.Tensor,
+        causal_block_pages: torch.Tensor,
+        causal_block_offsets: torch.Tensor,
         seq_len_kv: torch.Tensor,
         own_slots: torch.Tensor,
         current_private_src: torch.Tensor,
@@ -46,7 +46,7 @@ def _register_fake():
         staged_slots: Optional[torch.Tensor],
         refill_src: Optional[torch.Tensor],
         refill_dst: Optional[torch.Tensor],
-        block_size: int,
+        causal_block_size: int,
         tokens_per_page: int,
         past: int,
         fixed_tokens: int,
