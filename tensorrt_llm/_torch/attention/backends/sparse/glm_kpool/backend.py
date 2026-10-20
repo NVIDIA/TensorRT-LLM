@@ -205,9 +205,11 @@ class GlmKpoolSparseAttention(TrtllmAttention):
         #: score scale is unchanged.
         self.softmax_scale = float(self.qk_nope_head_dim) ** -0.5
         self._native_decode = GlmKpoolNativeDecode()
-        #: ``softmax_scale * kv_scale_quant_orig`` for the native FP8 kernel, computed
-        #: once outside CUDA graph capture (the KV scale is fixed after construction).
-        self._native_bmm1_scale: torch.Tensor | None = None
+        #: ``softmax_scale * kv_scale_quant_orig`` for the native FP8 kernel, read to
+        #: the host once outside CUDA graph capture (the KV scale is fixed after
+        #: construction). A float lets the kernel take it as an argument, without a
+        #: per-call device multiply.
+        self._native_bmm1_scale: float | None = None
 
     @classmethod
     def support_fused_rope(cls) -> bool:
@@ -662,7 +664,7 @@ class GlmKpoolSparseAttention(TrtllmAttention):
                 and self._native_bmm1_scale is None
                 and not torch.cuda.is_current_stream_capturing()
             ):
-                self._native_bmm1_scale = self.kv_scale_quant_orig * self.softmax_scale
+                self._native_bmm1_scale = float(self.kv_scale_quant_orig) * self.softmax_scale
             out = self._native_decode(
                 q,
                 kv_rows,
