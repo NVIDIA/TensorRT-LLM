@@ -904,8 +904,8 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
 
         # Cross-iter MM encoder prefetch event: stamped by the side-stream
         # producer in `modeling_multimodal_mixin._dispatch_cross_iter_prefetch`
-        # and consumed (then cleared) in `DecoderRunner._prepare_inputs` when
-        # the request is next scheduled.
+        # and consumed (then cleared) in `DecoderInputPreparer.prepare_inputs`
+        # when the request is next scheduled.
         self.py_mm_encoder_event: Optional[torch.cuda.Event] = None
 
         if llm_request is not None:
@@ -1132,7 +1132,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         # flow, already holds the NEXT step's drafts by response time.
         self.py_num_draft_tokens_verified = 0
         # One-model rejection: set per-iteration by _handle_dynamic_draft_len when
-        # this gen request produced 0 real draft tokens, so _prepare_tp_inputs
+        # this gen request produced 0 real draft tokens, so _pack_extend_requests
         # one-hots its stale draft_probs slot. Consumed (and cleared) there.
         self.py_needs_onehot_draft_probs = False
         self.py_num_accepted_draft_tokens_indices = []

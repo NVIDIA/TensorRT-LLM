@@ -6,7 +6,7 @@ from unittest.mock import Mock
 
 import pytest
 
-from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.speculative import (
+from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.metadata import (
     set_spec_metadata_all_rank_num_tokens,
     update_spec_metadata,
 )

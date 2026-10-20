@@ -103,6 +103,34 @@ def test_fp8_quantize_blackwell(dtype, m, k):
                                rtol=1e-1)
 
 
+@pytest.mark.skipif(
+    getSMVersion() != 100 and getSMVersion() != 90,
+    reason="Only test on Blackwell and Hopper",
+)
+@pytest.mark.parametrize("use_ue8m0", [False, True])
+def test_fp8_quantize_1x128_vectorized_matches_elementwise(use_ue8m0):
+    # A 16-byte aligned input takes the vectorized kernel, one 4 bytes past the
+    # boundary the element-wise kernel; both give the same bytes and scales.
+    # K = 576 ends in a partial group, M = 37 pads the scale rows.
+    m, k = 37, 576
+    torch.random.manual_seed(0)
+    a = torch.randn((m, k), device='cuda', dtype=torch.bfloat16)
+    a_offset = torch.empty(m * k + 2, device='cuda',
+                           dtype=torch.bfloat16)[2:].view(m, k)
+    a_offset.copy_(a)
+    fp8_a, scale_a = torch.ops.trtllm.fp8_quantize_1x128(a, use_ue8m0)
+    fp8_b, scale_b = torch.ops.trtllm.fp8_quantize_1x128(a_offset, use_ue8m0)
+    assert torch.equal(fp8_a.view(torch.uint8), fp8_b.view(torch.uint8))
+    # Hopper returns the scale buffer with unwritten padding rows.
+    num_blocks, m_padded = (k + 127) // 128, (m + 3) // 4 * 4
+    rows = m if scale_a.numel() == num_blocks * m else m_padded
+
+    def written(scale):
+        return scale.flatten()[:num_blocks * rows].view(num_blocks, rows)[:, :m]
+
+    assert torch.equal(written(scale_a), written(scale_b))
+
+
 def mxfp8_quantize_check_accuracy(a, b, atol, rtol, percent):
     if torch.any(torch.isnan(a)):
         raise Exception("NaN in a")
