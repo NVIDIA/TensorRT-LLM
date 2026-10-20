@@ -4288,8 +4288,7 @@ class NVFP4MegaMoECuteDslMethod(NVFP4FusedMoEMethod):
     def _live_weight_bundle_layout(hidden: int,
                                    intermediate: int,
                                    expand_intermediate: Optional[int] = None):
-        from ...cute_dsl_kernels.megamoe_scheduler.sami.geometry import \
-            BundleLayout
+        from ..kernels.megamoe_scheduler.sami.geometry import BundleLayout
 
         return BundleLayout.create(
             hidden=int(hidden),

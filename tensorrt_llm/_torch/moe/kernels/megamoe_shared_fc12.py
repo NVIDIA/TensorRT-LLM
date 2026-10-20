@@ -7,7 +7,7 @@ from threading import Condition, RLock
 
 import torch
 
-from ..autotuner import AutoTuner, DynamicTensorSpec, TunableRunner, TuningConfig
+from ...autotuner import AutoTuner, DynamicTensorSpec, TunableRunner, TuningConfig
 
 __all__ = [
     "release_shared_fc12_cache",

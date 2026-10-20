@@ -1,30 +1,30 @@
-"""Rubin inference kernels."""
+"""Blackwell MegaMoE inference kernels and issue helpers."""
 
-from .mega import (
+from .block_scaled_swap_ab_fc12_extension import (
     BlockScaledSwapAbFc12Extension,
-    BlockScaledSwapAbFc12Mainloop,
-    BlockScaledSwapAbFc12MainloopGenSpecialized,
-    BlockScaledSwapAbGenphaseMoeKernel,
-    BlockScaledSwapAbMegaMoeKernel,
-    GatedActEpilogueArgs,
-    GenphaseTokenComm,
-    GenphaseTokenCommArgs,
-    SwapABGatedActEpilogue,
     TensorRole,
-    dynamic_mainloop,
+)
+from .block_scaled_swap_ab_fc12_epilogue import (
+    GatedActEpilogueArgs,
+    SwapABGatedActEpilogue,
+)
+from .block_scaled_swap_ab_fc12_kernel import (
+    BlockScaledSwapAbFc12Kernel,
+)
+from .block_scaled_swap_ab_fc12_mainloop import (
+    BlockScaledSwapAbFc12Mainloop,
+)
+from .block_scaled_swap_ab_mega_moe_kernel import (
+    BlockScaledSwapAbMegaMoeKernel,
 )
 
 
 __all__ = [
     "BlockScaledSwapAbFc12Extension",
+    "BlockScaledSwapAbFc12Kernel",
     "BlockScaledSwapAbFc12Mainloop",
-    "BlockScaledSwapAbFc12MainloopGenSpecialized",
-    "BlockScaledSwapAbGenphaseMoeKernel",
     "BlockScaledSwapAbMegaMoeKernel",
-    "GenphaseTokenComm",
-    "GenphaseTokenCommArgs",
     "GatedActEpilogueArgs",
     "SwapABGatedActEpilogue",
     "TensorRole",
-    "dynamic_mainloop",
 ]

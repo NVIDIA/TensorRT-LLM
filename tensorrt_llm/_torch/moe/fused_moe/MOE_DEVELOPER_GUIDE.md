@@ -438,9 +438,9 @@ literal also selects, descend from the CUTLASS family and stay in
 | `KERNEL_INTERNALS.html` | Reference for the underlying DeepGEMM kernel layout |
 
 The exported CuteDSL kernel sources for `TrtllmCutedslMegaMoeNvfp4Impl` live under
-`tensorrt_llm/_torch/moe/kernels/cutedsl_megamoe/`, vendored from upstream as
-recorded in `3rdparty/vendor_sources.lock.yaml`; keep local edits out of that
-directory. `moe/kernels/megamoe_kernels.py` exposes the `KernelClass` entry
+`tensorrt_llm/_torch/moe/kernels/cutedsl_megamoe/`, a copy of the upstream
+cutedsl_megamoe sources maintained in-tree; update it by copying newer upstream
+code in. `moe/kernels/megamoe_kernels.py` exposes the `KernelClass` entry
 points. The runner constructs
 `ProblemDesc` and `ImplDesc` and dispatches internally; the public backend
 remains `MEGAMOE_CUTEDSL`. Rubin's smaller token buckets use the genphase

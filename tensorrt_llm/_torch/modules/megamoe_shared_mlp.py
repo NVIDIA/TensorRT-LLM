@@ -229,7 +229,7 @@ class MegaMoESharedMLP(GatedMLP):
         self.prepare_fc12_weights()
         if x.device != self._fc12_fc1_weight.device:
             raise ValueError("Shared FC12 input and weights must be on the same device")
-        from ..cute_dsl_kernels.megamoe_shared_fc12 import run_shared_fc12
+        from ..moe.kernels.megamoe_shared_fc12 import run_shared_fc12
 
         return run_shared_fc12(
             x,

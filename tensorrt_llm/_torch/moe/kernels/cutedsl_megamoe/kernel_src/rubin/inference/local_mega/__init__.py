@@ -1,31 +1,6 @@
-"""Scheduler protocols and implementations."""
+"""Rubin Local MegaMoE inference kernel."""
 
-from .base import SchedulerBase, SchedulerConsumer, SchedulerWorkTileBase, WorkIdAcquisitionMode
-from .clc_mixed_cga import ClcMixedCgaSchedulerWorker
-from .fc12_mapping import (
-    BlockPhase,
-    Fc12WorkTileState,
-    NonSwapAbFc12WorkTileInfo,
-    SwapAbFc12WorkTileInfo,
-    peek_ready_bit,
-)
-from .fc12_scheduler import BlackwellFusedFc12Scheduler, PhaseInterleavedFc12Scheduler
-from .non_clc_mixed_cga import NonClcMixedCgaConfig, NonClcMixedCgaSchedulerWorker
+from .block_scaled_swap_ab_local_mega_moe_kernel import BlockScaledSwapAbLocalMegaMoeKernel
 
 
-__all__ = [
-    "BlackwellFusedFc12Scheduler",
-    "BlockPhase",
-    "ClcMixedCgaSchedulerWorker",
-    "Fc12WorkTileState",
-    "NonSwapAbFc12WorkTileInfo",
-    "NonClcMixedCgaConfig",
-    "NonClcMixedCgaSchedulerWorker",
-    "PhaseInterleavedFc12Scheduler",
-    "SchedulerBase",
-    "SchedulerConsumer",
-    "SchedulerWorkTileBase",
-    "SwapAbFc12WorkTileInfo",
-    "WorkIdAcquisitionMode",
-    "peek_ready_bit",
-]
+__all__ = ["BlockScaledSwapAbLocalMegaMoeKernel"]

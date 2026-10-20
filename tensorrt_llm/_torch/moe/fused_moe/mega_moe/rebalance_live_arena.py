@@ -246,8 +246,8 @@ class _Vmm:
     def __init__(self, device: int, group_sizes: Tuple[int, ...]) -> None:
         from cuda.bindings import driver as cuda
 
-        from tensorrt_llm._torch.cute_dsl_kernels.megamoe_scheduler.sami._util import check_cuda
-        from tensorrt_llm._torch.cute_dsl_kernels.megamoe_scheduler.sami.fabric import (
+        from tensorrt_llm._torch.moe.kernels.megamoe_scheduler.sami._util import check_cuda
+        from tensorrt_llm._torch.moe.kernels.megamoe_scheduler.sami.fabric import (
             FABRIC,
             _allocation_properties,
             _read_write_access,
@@ -549,9 +549,7 @@ class _SharedSlotPool:
         comm: Any,
         owner_registry: List["_SharedSlotPool"],
     ) -> None:
-        from tensorrt_llm._torch.cute_dsl_kernels.megamoe_scheduler.sami import (
-            hierarchy_group_sizes,
-        )
+        from tensorrt_llm._torch.moe.kernels.megamoe_scheduler.sami import hierarchy_group_sizes
 
         torch.cuda.set_device(device)
         self.world = world
@@ -790,7 +788,7 @@ class _SharedSlotPool:
     def build_layer(self, comm: Any) -> Tuple[Any, Dict[str, torch.Tensor], _SharedLayer, int]:
         """Collectively map one layer; returns its arena, framework views,
         owner and own allocation bytes."""
-        from tensorrt_llm._torch.cute_dsl_kernels.megamoe_scheduler.sami import (
+        from tensorrt_llm._torch.moe.kernels.megamoe_scheduler.sami import (
             HierarchicalLiveWeightArena,
             LivePlaneView,
             LiveTerminalView,
