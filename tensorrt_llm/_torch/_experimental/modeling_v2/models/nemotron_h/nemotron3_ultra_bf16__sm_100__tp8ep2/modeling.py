@@ -60,6 +60,9 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.flashinfer_fused
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.flashinfer_rmsnorm import (
     flashinfer_rmsnorm,
 )
+from tensorrt_llm._torch._experimental.modeling_v2.models.nemotron_h.ops.gemm.flashinfer_direct_bf16_gemm import (  # noqa: E501
+    flashinfer_direct_bf16_gemm,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.models.nemotron_h.ops.moe.fused_moe import (
     ACTIVATION_RELU2,
     fused_moe,
@@ -85,6 +88,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.nemotron_h.ops.ssm.sel
 from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.distributed.ops import MNNVLAllReduce
+from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_utils import DecoderModel, DecoderModelForCausalLM
 from tensorrt_llm.bindings import DataType
@@ -98,6 +102,11 @@ _SM = (10, 0)
 
 # An empty slot in the recurrent-state pools (padding rows of a captured batch).
 _PAD_SLOT_ID = -1
+# Decode steps of up to this many rows run the K = 8192 projections (mamba in_proj, qkv,
+# shared-expert up, fc1_latent) through FlashInfer's register-prefetch kernel instead of
+# cublas_mm: 1.3-2.3x faster at one row on those shapes, still ahead at two, not from four
+# rows on (see flashinfer_direct_bf16_gemm).
+_LOWM_MAX_ROWS = 2
 # The decode step runs FlashInfer's kernel from this many rows on and the Triton kernel below:
 # at this rank's shapes FlashInfer's is the faster from 32 rows (1.17x there, 1.36x at 256, in
 # CUDA-graph replay) and the slower below (0.87x at 8 rows, 0.73x at one). A mixed step's
@@ -344,6 +353,8 @@ class NemotronUltraBf16Tp8ep2ModelingV2(DecoderModel):
                     else self.ar_strategy.name
                 )
             )
+        # Whether kernels that take the choice launch as programmatic dependents.
+        self.pdl = get_env_enable_pdl()
         # The shared expert runs on this stream beside the routed experts.
         self.side_stream = torch.cuda.Stream()
         self._prefill = PrefillTarget(self)
@@ -821,7 +832,10 @@ class DecodeTarget:
             if isinstance(L, _Mamba):
                 conv_state = bound.conv[i]
                 ssm_state = bound.ssm[i]
-                zxbcdt = cublas_mm(x, L.in_w)
+                if num_tokens <= _LOWM_MAX_ROWS:
+                    zxbcdt = flashinfer_direct_bf16_gemm(x, L.in_w, core.pdl)
+                else:
+                    zxbcdt = cublas_mm(x, L.in_w)
                 z = zxbcdt[:, :din]
                 xbc = zxbcdt[:, din : din + conv_c]
                 dt = zxbcdt[:, din + conv_c :]
@@ -867,7 +881,10 @@ class DecodeTarget:
                 )
                 out = cublas_mm(yn, L.out_w)
             elif isinstance(L, _Attention):
-                qkv = cublas_mm(x, L.qkv)
+                if num_tokens <= _LOWM_MAX_ROWS:
+                    qkv = flashinfer_direct_bf16_gemm(x, L.qkv, core.pdl)
+                else:
+                    qkv = cublas_mm(x, L.qkv)
                 attn_out = thop_attention(
                     q=qkv,
                     output=attn_out,
@@ -887,12 +904,18 @@ class DecodeTarget:
                 main = torch.cuda.current_stream()
                 side.wait_stream(main)
                 with torch.cuda.stream(side):
-                    u = cublas_mm(x, L.sh_up)
+                    if num_tokens <= _LOWM_MAX_ROWS:
+                        u = flashinfer_direct_bf16_gemm(x, L.sh_up, core.pdl)
+                    else:
+                        u = cublas_mm(x, L.sh_up)
                     a = torch.square(torch.relu(u))
                     shared = cublas_mm(a, L.sh_down)
                 logits = cublas_mm(x, L.gate, out_dtype=torch.float32)
                 topk_w, topk_ids = noaux_tc_op(logits, L.gate_bias, 1, 1, d.top_k, d.routed_scale)
-                xl = cublas_mm(x, L.fc1_lat)
+                if num_tokens <= _LOWM_MAX_ROWS:
+                    xl = flashinfer_direct_bf16_gemm(x, L.fc1_lat, core.pdl)
+                else:
+                    xl = cublas_mm(x, L.fc1_lat)
                 routed = fused_moe(
                     xl,
                     topk_ids,
