@@ -308,7 +308,7 @@ class TestProtocolConformance:
         assert isinstance(backend, GPUMemoryBackend)
 
     def test_protocol_method_set(self):
-        # The protocol must keep the methods that model_loader.py invokes
+        # The protocol must keep the methods that weight_load_strategies/gms.py invokes
         # so a different backend (e.g. CudaIpcBackend) can be plugged in.
         required = {
             "connect",

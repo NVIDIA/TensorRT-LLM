@@ -25,14 +25,22 @@ from tensorrt_llm._torch.models.checkpoints.weight_load_plan import (
 )
 from tensorrt_llm._torch.pyexecutor import model_loader as model_loader_module
 from tensorrt_llm._torch.pyexecutor.model_loader import (
-    ModelLoader,
     _checkpoint_startup_metadata,
-    _open_checkpoint_weight_session,
     _resolve_checkpoint_io_policy,
-    _timed_checkpoint_weight_session,
     construct_checkpoint_loader,
 )
-from tensorrt_llm._torch.pyexecutor.weight_load_strategies import model_hooks
+from tensorrt_llm._torch.pyexecutor.weight_load_strategies import (
+    CheckpointLoadStrategy,
+    WeightLoadContext,
+    model_hooks,
+)
+from tensorrt_llm._torch.pyexecutor.weight_load_strategies import (
+    checkpoint as checkpoint_strategy_mod,
+)
+from tensorrt_llm._torch.pyexecutor.weight_load_strategies.checkpoint import (
+    _open_checkpoint_weight_session,
+    _timed_checkpoint_weight_session,
+)
 from tensorrt_llm.checkpoint_format import CheckpointFormat
 from tensorrt_llm.llmapi.llm_args import CheckpointIOPolicy, LoadFormat
 from tensorrt_llm.mapping import Mapping
@@ -400,13 +408,33 @@ class _SessionCheckpointLoader:
         finally:
             self.events.append("session_exit")
 
-    def is_weights_preloaded(self) -> bool:
-        return False
-
     def get_initialized_weight_mapper(self, model: object, config: object) -> object:
         del model, config
         self.events.append("mapper_init")
         return object()
+
+
+def _checkpoint_load_strategy(
+    checkpoint_loader: object, *, spec_config: object = None
+) -> CheckpointLoadStrategy:
+    """Return a checkpoint load strategy for ``/checkpoint`` with fresh metrics."""
+    return CheckpointLoadStrategy(
+        WeightLoadContext(
+            checkpoint_dir="/checkpoint",
+            checkpoint_loader=checkpoint_loader,
+            llm_args=SimpleNamespace(load_format=LoadFormat.AUTO),
+            mapping=object(),
+            spec_config=spec_config,
+            metrics={},
+        )
+    )
+
+
+def _model_without_llm_checkpoint_dir() -> MagicMock:
+    """Return a mock model that reads its weights from the main checkpoint."""
+    model = MagicMock()
+    del model.llm_checkpoint_dir
+    return model
 
 
 def test_legacy_weight_session_defers_load_until_enter() -> None:
@@ -438,7 +466,7 @@ def test_checkpoint_session_times_preparation_and_finalization_separately(
             metric_values[metric_name] = 1.0
             events.append(f"{metric_name}_end")
 
-    monkeypatch.setattr(model_loader_module, "timing_metric", record_timing)
+    monkeypatch.setattr(checkpoint_strategy_mod, "timing_metric", record_timing)
 
     with _timed_checkpoint_weight_session(
         checkpoint_loader,
@@ -466,33 +494,28 @@ def test_model_loader_session_spans_mapper_and_materialization(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     events = []
-    model = MagicMock()
-    checkpoint_loader = _SessionCheckpointLoader(events)
-    loader = ModelLoader.__new__(ModelLoader)
-    loader._metrics = {}
+    weight_load_strategy = _checkpoint_load_strategy(_SessionCheckpointLoader(events))
     monkeypatch.setattr(
         model_hooks,
         "call_load_weights",
         MagicMock(side_effect=lambda *_args, **_kwargs: events.append("materialize")),
     )
-    weights_preloaded = loader._materialize_checkpoint_weights(
-        checkpoint_loader,
-        "/checkpoint",
-        model,
-        object(),
-        {"mapping": object()},
+    weights_preloaded = weight_load_strategy.load_weights(
+        _model_without_llm_checkpoint_dir(), object()
     )
 
     assert not weights_preloaded
+    assert weight_load_strategy.loaded_checkpoint_tensors
     assert events == [
         "session_enter",
         "mapper_init",
         "materialize",
         "session_exit",
     ]
-    assert "checkpoint_preparation_seconds" in loader.metrics
-    assert "weight_population_seconds" in loader.metrics
-    assert "checkpoint_finalization_seconds" in loader.metrics
+    metrics = weight_load_strategy.context.metrics
+    assert "checkpoint_preparation_seconds" in metrics
+    assert "weight_population_seconds" in metrics
+    assert "checkpoint_finalization_seconds" in metrics
 
 
 def test_shadow_plan_disabled_does_not_call_inspection_hooks(
@@ -502,7 +525,7 @@ def test_shadow_plan_disabled_does_not_call_inspection_hooks(
     checkpoint_loader = SimpleNamespace(build_checkpoint_catalog=MagicMock())
     weight_mapper = SimpleNamespace(build_weight_load_plan=MagicMock())
 
-    result = model_loader_module._inspect_shadow_weight_load_plan(
+    result = checkpoint_strategy_mod._inspect_shadow_weight_load_plan(
         checkpoint_loader, "/checkpoint", weight_mapper, mapping=object()
     )
 
@@ -535,21 +558,14 @@ def test_shadow_plan_is_advisory_and_preserves_materialization_order(
     checkpoint_loader.get_initialized_weight_mapper = MagicMock(
         side_effect=lambda *_args: events.append("mapper_init") or weight_mapper
     )
-    model = MagicMock()
-    loader = ModelLoader.__new__(ModelLoader)
-    loader._metrics = {}
     monkeypatch.setattr(
         model_hooks,
         "call_load_weights",
         MagicMock(side_effect=lambda *_args, **_kwargs: events.append("materialize")),
     )
 
-    loader._materialize_checkpoint_weights(
-        checkpoint_loader,
-        "/checkpoint",
-        model,
-        object(),
-        {"mapping": object()},
+    _checkpoint_load_strategy(checkpoint_loader).load_weights(
+        _model_without_llm_checkpoint_dir(), object()
     )
 
     assert events == [
@@ -587,7 +603,7 @@ def test_shadow_plan_failure_warns_and_continues(
         )
     )
 
-    result = model_loader_module._inspect_shadow_weight_load_plan(
+    result = checkpoint_strategy_mod._inspect_shadow_weight_load_plan(
         checkpoint_loader, "/checkpoint", weight_mapper
     )
 
@@ -620,10 +636,9 @@ def test_draft_session_spans_mapper_and_materialization(
     model.draft_config = SimpleNamespace(
         pretrained_config=SimpleNamespace(architectures=["DraftForCausalLM"])
     )
-    loader = ModelLoader.__new__(ModelLoader)
-    loader._metrics = {}
-    loader.spec_config = SimpleNamespace(speculative_model="/draft")
-    loader.mapping = object()
+    weight_load_strategy = _checkpoint_load_strategy(
+        checkpoint_loader, spec_config=SimpleNamespace(speculative_model="/draft")
+    )
     monkeypatch.setattr(
         model_hooks,
         "call_load_weights",
@@ -633,10 +648,10 @@ def test_draft_session_spans_mapper_and_materialization(
     draft_mapper.init_model_and_config.side_effect = lambda *_args: events.append("mapper_init")
     draft_mapper.build_weight_load_plan.side_effect = lambda _catalog: events.append("plan") or plan
     monkeypatch.setattr(
-        model_loader_module.AutoCheckpointMapper, "get", MagicMock(return_value=draft_mapper)
+        checkpoint_strategy_mod.AutoCheckpointMapper, "get", MagicMock(return_value=draft_mapper)
     )
 
-    loader._materialize_draft_checkpoint_weights(checkpoint_loader, model)
+    weight_load_strategy.load_draft_weights(model)
 
     assert events == [
         "session_enter",
@@ -646,9 +661,10 @@ def test_draft_session_spans_mapper_and_materialization(
         "materialize",
         "session_exit",
     ]
-    assert "draft_checkpoint_preparation_seconds" in loader.metrics
-    assert "draft_weight_population_seconds" in loader.metrics
-    assert "draft_checkpoint_finalization_seconds" in loader.metrics
+    metrics = weight_load_strategy.context.metrics
+    assert "draft_checkpoint_preparation_seconds" in metrics
+    assert "draft_weight_population_seconds" in metrics
+    assert "draft_checkpoint_finalization_seconds" in metrics
 
 
 def test_mtp_draft_session_reuses_target_mapper_during_materialization(
@@ -671,11 +687,10 @@ def test_mtp_draft_session_reuses_target_mapper_during_materialization(
     )
     model = MagicMock()
     model.draft_config = None
-    loader = ModelLoader.__new__(ModelLoader)
-    loader._metrics = {}
-    loader.spec_config = SimpleNamespace(speculative_model="/draft")
-    loader.mapping = object()
-    loader.weight_mapper = SimpleNamespace(
+    weight_load_strategy = _checkpoint_load_strategy(
+        checkpoint_loader, spec_config=SimpleNamespace(speculative_model="/draft")
+    )
+    weight_load_strategy.weight_mapper = SimpleNamespace(
         build_weight_load_plan=MagicMock(side_effect=lambda _catalog: events.append("plan") or plan)
     )
     monkeypatch.setattr(
@@ -684,9 +699,9 @@ def test_mtp_draft_session_reuses_target_mapper_during_materialization(
         MagicMock(side_effect=lambda *_args, **_kwargs: events.append("materialize")),
     )
 
-    loader._materialize_draft_checkpoint_weights(checkpoint_loader, model)
+    weight_load_strategy.load_draft_weights(model)
 
-    assert model_hooks.call_load_weights.call_args.args[2] is loader.weight_mapper
+    assert model_hooks.call_load_weights.call_args.args[2] is weight_load_strategy.weight_mapper
     assert events == [
         "session_enter",
         "catalog",
@@ -694,6 +709,7 @@ def test_mtp_draft_session_reuses_target_mapper_during_materialization(
         "materialize",
         "session_exit",
     ]
-    assert "draft_checkpoint_preparation_seconds" in loader.metrics
-    assert "draft_weight_population_seconds" in loader.metrics
-    assert "draft_checkpoint_finalization_seconds" in loader.metrics
+    metrics = weight_load_strategy.context.metrics
+    assert "draft_checkpoint_preparation_seconds" in metrics
+    assert "draft_weight_population_seconds" in metrics
+    assert "draft_checkpoint_finalization_seconds" in metrics

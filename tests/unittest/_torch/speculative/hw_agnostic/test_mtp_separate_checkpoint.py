@@ -552,12 +552,10 @@ def test_separate_mtp_target_load_skips_heads_without_partial_loading(monkeypatc
 
 
 @pytest.mark.cpu_only
-@pytest.mark.parametrize("materialize", [False, True])
 @pytest.mark.parametrize("pp_size,owns_layer", [(1, True), (2, True), (2, False)])
 def test_qwen4_replacement_loads_mtp_and_hyper_connection(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
-    materialize: bool,
     pp_size: int,
     owns_layer: bool,
 ) -> None:
@@ -565,7 +563,10 @@ def test_qwen4_replacement_loads_mtp_and_hyper_connection(
     from tensorrt_llm._torch.models.checkpoints.hf.qwen4_exp_weight_mapper import (
         Qwen4ExpHfWeightMapper,
     )
-    from tensorrt_llm._torch.pyexecutor.model_loader import ModelLoader
+    from tensorrt_llm._torch.pyexecutor.weight_load_strategies import (
+        CheckpointLoadStrategy,
+        WeightLoadContext,
+    )
 
     captured = {}
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
@@ -617,19 +618,22 @@ def test_qwen4_replacement_loads_mtp_and_hyper_connection(
         "mtp.layers.0.attn_hyper_connection.block_inject_weight.weight": inject,
         "mtp.hyper_connection_mixer.input_mix_weight_down.weight": final_down,
     }
-    loader = ModelLoader.__new__(ModelLoader)
-    loader._metrics = {}
-    loader.spec_config = model.spec_config
-    loader.mapping = config.mapping
-    loader.weight_mapper = object()
     checkpoint_loader = SimpleNamespace(
         checkpoint_format="HF", load_weights=lambda *args, **kwargs: weights
     )
+    weight_load_strategy = CheckpointLoadStrategy(
+        WeightLoadContext(
+            checkpoint_dir="/target",
+            checkpoint_loader=checkpoint_loader,
+            llm_args=None,
+            mapping=config.mapping,
+            spec_config=model.spec_config,
+            metrics={},
+        )
+    )
+    weight_load_strategy.weight_mapper = object()
 
-    if materialize:
-        loader._materialize_draft_checkpoint_weights(checkpoint_loader, model)
-    else:
-        loader._load_separate_draft_weights(model, checkpoint_loader)
+    weight_load_strategy.load_draft_weights(model)
 
     assert isinstance(captured["mapper"], Qwen4ExpHfWeightMapper)
     assert captured["mapper"].config is config
@@ -937,10 +941,12 @@ def test_replacement_post_init_isolates_quantization_across_module_aliases(monke
 
 
 @pytest.mark.cpu_only
-@pytest.mark.parametrize("materialize", [False, True])
-def test_replacement_loader_initializes_independent_architecture_mapper(monkeypatch, materialize):
+def test_replacement_loader_initializes_independent_architecture_mapper(monkeypatch):
     from tensorrt_llm._torch.models import modeling_utils
-    from tensorrt_llm._torch.pyexecutor.model_loader import ModelLoader
+    from tensorrt_llm._torch.pyexecutor.weight_load_strategies import (
+        CheckpointLoadStrategy,
+        WeightLoadContext,
+    )
 
     captured = {}
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
@@ -966,25 +972,28 @@ def test_replacement_loader_initializes_independent_architecture_mapper(monkeypa
     model.draft_model.model_config = config
     model.draft_model.config = config.pretrained_config
     model.draft_model.owns_lm_head = False
-    loader = ModelLoader.__new__(ModelLoader)
-    loader._metrics = {}
-    loader.spec_config = model.spec_config
-    loader.mapping = config.mapping
-    loader.weight_mapper = object()
     checkpoint_loader = SimpleNamespace(
         checkpoint_format="HF",
         load_weights=lambda *args, **kwargs: _nemotron_style_mtp_weights(include_shared_head=False),
     )
+    weight_load_strategy = CheckpointLoadStrategy(
+        WeightLoadContext(
+            checkpoint_dir="/target",
+            checkpoint_loader=checkpoint_loader,
+            llm_args=None,
+            mapping=config.mapping,
+            spec_config=model.spec_config,
+            metrics={},
+        )
+    )
+    weight_load_strategy.weight_mapper = object()
 
-    if materialize:
-        loader._materialize_draft_checkpoint_weights(checkpoint_loader, model)
-    else:
-        loader._load_separate_draft_weights(model, checkpoint_loader)
+    weight_load_strategy.load_draft_weights(model)
 
     assert isinstance(captured["mapper"], NemotronHHfWeightMapper)
     assert captured["mapper"].config is config
     assert captured["mapper"].model is model.draft_model
-    assert captured["mapper"] is not loader.weight_mapper
+    assert captured["mapper"] is not weight_load_strategy.weight_mapper
     assert captured["model"] is model.draft_model
     assert "mtp_layers.0.layers.0.enorm.weight" in captured["weights"]
     assert captured["allow_partial_loading"] is False
