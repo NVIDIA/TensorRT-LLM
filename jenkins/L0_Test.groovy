@@ -1133,10 +1133,12 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
                     imageForSlurm = LLM_DOCKER_IMAGE
                         .replace("${ARTIFACTORY_DOCKER_HOST}/", "${ARTIFACTORY_DOCKER_HOST}#")
                 }
-                def submitPartition = SlurmConfig.withSlurmPlacementArgs(
-                    pipeline, remote, partition,
-                    placementContext?.excludedSlurmNodeListsByCluster?.get(partition.clusterName)
-                )
+                def clusterExcludes = placementContext?.excludedSlurmNodeListsByCluster?.get(partition.clusterName)
+                if (clusterExcludes) {
+                    echo "[INFRA-RETRY] ${stageName}: requesting SLURM retry placement exclusion: ${trtllm_utils.buildSlurmExcludeArg(clusterExcludes)}"
+                }
+                def submitPartition = SlurmConfig.withSlurmPlacementArgs(pipeline, remote, partition, clusterExcludes)
+
                 def slurmCommand = SlurmConfig.generateCommand(cluster, submitPartition, nodeSecret, nodeName, Jenkins.instance.rootUrl, imageForSlurm, mounts)
 
                 def slurmSubmitCommand = slurmCommand
@@ -2172,10 +2174,11 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 if (SlurmConfig.needsIdleGpuExemption(cluster)) {
                     exemptionComment = "--comment='${SlurmConfig.IDLE_GPU_EXEMPTION_PAYLOAD}'"
                 }
-                def submitPartition = SlurmConfig.withSlurmPlacementArgs(
-                    pipeline, remote, partition,
-                    placementContext?.excludedSlurmNodeListsByCluster?.get(partition.clusterName)
-                )
+                def clusterExcludes = placementContext?.excludedSlurmNodeListsByCluster?.get(partition.clusterName)
+                if (clusterExcludes) {
+                    echo "[INFRA-RETRY] ${stageName}: requesting SLURM retry placement exclusion: ${trtllm_utils.buildSlurmExcludeArg(clusterExcludes)}"
+                }
+                def submitPartition = SlurmConfig.withSlurmPlacementArgs(pipeline, remote, partition, clusterExcludes)
 
                 def envExportStatements = envVarsToExport.collect { varName, varValue ->
                     def escapedValue = varValue?.toString() ?: ''
