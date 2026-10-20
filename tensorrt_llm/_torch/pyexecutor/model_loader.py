@@ -2,7 +2,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import copy
-import inspect
 import os
 import sys
 import traceback
@@ -10,7 +9,7 @@ import warnings
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import replace
 from enum import Enum
-from typing import Any, Callable, Iterator, Optional, Tuple
+from typing import Any, Iterator, Optional, Tuple
 
 import torch
 
@@ -61,6 +60,7 @@ from .config_utils import (is_hybrid_linear, is_mla,
                            resolve_auto_ssm_cache_dtype,
                            supports_fp4_mla_attention, uses_fp4_mla_attention,
                            validate_kimi_kda_state_dtype)
+from .weight_sources import model_hooks
 
 _KV_CACHE_MAP = {
     "fp8": QuantAlgo.FP8.value,
@@ -1136,7 +1136,7 @@ class ModelLoader:
                         "allow_post_transform_weights"] = post_transform_qualification.qualified
                     if post_transform_qualification.qualified:
                         load_weights_kwargs[
-                            "prepare_post_transform_receiver"] = self._setup_aliases
+                            "prepare_post_transform_receiver"] = model_hooks.setup_aliases
 
                 weights_checkpoint_dir = (model.llm_checkpoint_dir if hasattr(
                     model, 'llm_checkpoint_dir') else checkpoint_dir)
@@ -1240,7 +1240,7 @@ class ModelLoader:
                                     "allow_post_transform_weights"] = post_transform_qualification.qualified
                                 if post_transform_qualification.qualified:
                                     load_weights_kwargs[
-                                        "prepare_post_transform_receiver"] = self._setup_aliases
+                                        "prepare_post_transform_receiver"] = model_hooks.setup_aliases
                             with timing_metric(
                                     ModelLoaderMetricNames.
                                     CHECKPOINT_PREPARATION_SECONDS.value,
@@ -1269,7 +1269,7 @@ class ModelLoader:
                                         ModelLoaderMetricNames.
                                         WEIGHT_POPULATION_SECONDS.value,
                                         self._metrics):
-                                    self._call_load_weights(
+                                    model_hooks.call_load_weights(
                                         model.load_weights, weights,
                                         self.weight_mapper)
                                     if torch.cuda.is_available():  # CPU guard
@@ -1306,11 +1306,11 @@ class ModelLoader:
                                     weights_preloaded=weights_preloaded,
                                     qualification=post_transform_qualification)
                                 if mx_staged_receiver_path:
-                                    self._setup_aliases(model)
-                                    self._mark_weights_transformed(model)
-                                    self._walk_cache_state(model)
+                                    model_hooks.setup_aliases(model)
+                                    model_hooks.mark_weights_transformed(model)
+                                    model_hooks.walk_cache_state(model)
                                 else:
-                                    self._walk_full_post_load(model)
+                                    model_hooks.walk_full_post_load(model)
 
                                 # Defensive last-mile sweep: catches strays from
                                 # C++ ops that bypassed the active torch
@@ -1373,7 +1373,7 @@ class ModelLoader:
                             checkpoint_loader.post_load_apply(
                                 model, weights_preloaded=True)
 
-                            self._setup_aliases(model)
+                            model_hooks.setup_aliases(model)
 
                             # Pre-materialize compatibility gate. GMS has no
                             # disk-fallback path, so a mismatch raises under STRICT
@@ -1381,7 +1381,7 @@ class ModelLoader:
                             self._check_gms_source_identity(gms_backend)
 
                             gms_backend.materialize_module(model)
-                            self._walk_cache_state(model)
+                            model_hooks.walk_cache_state(model)
 
                             self._post_load_publish(
                                 checkpoint_loader,
@@ -1431,11 +1431,11 @@ class ModelLoader:
                         weights_preloaded=weights_preloaded,
                         qualification=post_transform_qualification)
                     if mx_staged_receiver_path:
-                        self._setup_aliases(model)
-                        self._mark_weights_transformed(model)
-                        self._walk_cache_state(model)
+                        model_hooks.setup_aliases(model)
+                        model_hooks.mark_weights_transformed(model)
+                        model_hooks.walk_cache_state(model)
                     else:
-                        self._walk_full_post_load(model)
+                        model_hooks.walk_full_post_load(model)
                     self._post_load_publish(
                         checkpoint_loader,
                         model,
@@ -1612,8 +1612,8 @@ class ModelLoader:
         with timing_metric(
                 ModelLoaderMetricNames.DRAFT_WEIGHT_POPULATION_SECONDS.value,
                 self._metrics):
-            self._call_load_weights(model.load_draft_weights, draft_weights,
-                                    draft_weight_mapper)
+            model_hooks.call_load_weights(model.load_draft_weights,
+                                          draft_weights, draft_weight_mapper)
             if torch.cuda.is_available():  # CPU guard
                 torch.cuda.synchronize()
 
@@ -1699,124 +1699,6 @@ class ModelLoader:
             kwargs["source_identity"] = self._source_identity
         checkpoint_loader.post_load_publish(model, **kwargs)
 
-    @staticmethod
-    def _mark_weights_transformed(model: DecoderModelForCausalLM) -> None:
-        """Mark modules with transform guards as already transformed.
-
-        Post-transform sharing paths skip transform_weights() because the
-        incoming bytes already use the final runtime layout. Preserve that
-        lifecycle state on modules that participate in the transform guard
-        protocol so a later orchestrator/refactor does not treat them as raw
-        checkpoint bytes.
-        """
-        for module in model.modules():
-            if hasattr(module, '_weights_transformed') and not getattr(
-                    module, '_weights_removed', False):
-                module._weights_transformed = True
-
-    @staticmethod
-    def _setup_aliases(model: DecoderModelForCausalLM) -> None:
-        """Run structural alias setup on eligible modules.
-
-        The walk is duck-typed so modules can opt in without inheriting a
-        shared base class. Modules whose weights were removed are skipped,
-        matching the legacy full post-load walk.
-
-        Args:
-            model: Root decoder model whose module tree should be visited.
-
-        Returns:
-            None.
-        """
-        for module in model.modules():
-            setup_aliases: Optional[Callable[[], None]] = getattr(
-                module, 'setup_aliases', None)
-            if setup_aliases is not None and not getattr(
-                    module, '_weights_removed', False):
-                setup_aliases()
-
-    @staticmethod
-    def _walk_transform(model: DecoderModelForCausalLM) -> None:
-        """Run one-shot weight transforms on eligible modules.
-
-        The walk is duck-typed so modules can opt in without inheriting a shared
-        base class. Modules whose weights were removed are skipped, and modules
-        already marked `_weights_transformed` are left untouched until an
-        orchestrator resets the flag after rebinding fresh weight bytes.
-
-        Args:
-            model: Root decoder model whose module tree should be visited.
-
-        Returns:
-            None.
-        """
-        for module in model.modules():
-            transform_weights: Optional[Callable[[], None]] = getattr(
-                module, 'transform_weights', None)
-            if transform_weights is not None and not getattr(
-                    module, '_weights_removed', False) and not getattr(
-                        module, '_weights_transformed', False):
-                transform_weights()
-
-    @staticmethod
-    def _walk_cache_state(model: DecoderModelForCausalLM) -> None:
-        """Recompute derived Python-side state on eligible modules.
-
-        This walk is separate from weight transforms so callers that already
-        have transformed weight bytes can refresh local Python state without
-        mutating tensor layouts again.
-
-        Args:
-            model: Root decoder model whose module tree should be visited.
-
-        Returns:
-            None.
-        """
-        for module in model.modules():
-            cache_derived_state: Optional[Callable[[], None]] = getattr(
-                module, 'cache_derived_state', None)
-            if cache_derived_state is not None and not getattr(
-                    module, '_weights_removed', False):
-                cache_derived_state()
-
-    @staticmethod
-    def _walk_full_post_load(model: DecoderModelForCausalLM) -> None:
-        """Run the backward-compatible post-load hook on eligible modules.
-
-        This preserves the previous `ModelLoader` behavior for standard load
-        paths while staged-hook migration proceeds incrementally.
-
-        Args:
-            model: Root decoder model whose module tree should be visited.
-
-        Returns:
-            None.
-        """
-        for module in model.modules():
-            post_load_weights: Optional[Callable[[], None]] = getattr(
-                module, 'post_load_weights', None)
-            if post_load_weights is not None and not getattr(
-                    module, '_weights_removed', False):
-                post_load_weights()
-
-    @staticmethod
-    def _reset_weights_transformed(model: DecoderModelForCausalLM) -> None:
-        """Mark transformed modules as needing a new transform pass.
-
-        Orchestrators call this before rebinding fresh, untransformed weights.
-        The reset only touches modules that already carry the flag so unrelated
-        modules do not grow staged-hook state eagerly.
-
-        Args:
-            model: Root decoder model whose module tree should be visited.
-
-        Returns:
-            None.
-        """
-        for module in model.modules():
-            if hasattr(module, '_weights_transformed'):
-                module._weights_transformed = False
-
     def reload(self,
                model: DecoderModelForCausalLM,
                weights: dict,
@@ -1846,11 +1728,12 @@ class ModelLoader:
                 "This can happen when the initial load used GMS, MX P2P, or "
                 "VISION_ONLY, which bypass the standard weight mapping path.")
         if not allow_partial_loading:
-            self._reset_weights_transformed(model)
-        self._call_load_weights(model.load_weights,
-                                weights,
-                                self.weight_mapper,
-                                allow_partial_loading=allow_partial_loading)
+            model_hooks.reset_weights_transformed(model)
+        model_hooks.call_load_weights(
+            model.load_weights,
+            weights,
+            self.weight_mapper,
+            allow_partial_loading=allow_partial_loading)
         if torch.cuda.is_available():  # CPU guard
             torch.cuda.current_stream().synchronize()
 
@@ -2096,8 +1979,8 @@ class ModelLoader:
                 with timing_metric(
                         ModelLoaderMetricNames.WEIGHT_POPULATION_SECONDS.value,
                         self._metrics):
-                    self._call_load_weights(model.load_weights, weights,
-                                            self.weight_mapper)
+                    model_hooks.call_load_weights(model.load_weights, weights,
+                                                  self.weight_mapper)
                     if torch.cuda.is_available():  # CPU guard
                         torch.cuda.synchronize()
         return weights_preloaded
@@ -2133,23 +2016,7 @@ class ModelLoader:
             with timing_metric(
                     ModelLoaderMetricNames.DRAFT_WEIGHT_POPULATION_SECONDS.
                     value, self._metrics):
-                self._call_load_weights(model.load_draft_weights, weights,
-                                        draft_weight_mapper)
+                model_hooks.call_load_weights(model.load_draft_weights, weights,
+                                              draft_weight_mapper)
                 if torch.cuda.is_available():  # CPU guard
                     torch.cuda.synchronize()
-
-    def _call_load_weights(self,
-                           load_method: Callable,
-                           weights,
-                           weight_mapper,
-                           allow_partial_loading: bool = False):
-        """Calls the model's weight loading method with the correct arguments."""
-        args = inspect.getfullargspec(load_method).args
-        kargs = {}
-        if "weight_mapper" in args:
-            kargs["weight_mapper"] = weight_mapper
-        if "allow_partial_loading" in args:
-            kargs["allow_partial_loading"] = allow_partial_loading
-        else:
-            assert allow_partial_loading is False, "allow_partial_loading is not supported for this model"
-        load_method(weights, **kargs)
