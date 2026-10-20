@@ -44,8 +44,8 @@ coverage selector's core-Python eligibility rules.
 ## When it runs
 
 `jenkins/L0_MergeRequest.groovy` decides pipeline-level eligibility and propagates it through
-`testFilter[cbts_coverage]`: the `ENABLE_CBTS_COVERAGE` kill switch plus the post-merge gate, so
-coverage runs on the official post-merge pipeline only.
+`testFilter[cbts_coverage]`: the `ENABLE_CBTS_COVERAGE` kill switch enables collection in both
+pre-merge and post-merge pipelines. Infrastructure dry runs skip collection.
 
 `isCbtsStage()` in `jenkins/L0_Test.groovy` gates each stage on that flag plus:
 
