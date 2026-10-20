@@ -106,7 +106,7 @@ class KvCacheConfigV2:
     disk_cache_path: Optional[str] = None
     onboard_blocks: bool = True
     cross_kv_cache_fraction: Optional[float] = None
-    secondary_offload_min_priority: Optional[int] = None
+    cold_tier_offload_min_priority: Optional[int] = None
     event_buffer_max_size: int = 0
     kv_cache_event_hash_algo: str = "auto"
     max_gpu_total_bytes: Optional[int] = None
