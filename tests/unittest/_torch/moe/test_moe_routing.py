@@ -650,25 +650,34 @@ def test_perfect_router_expert_ids_balanced(num_experts, top_k, moe_ep_size):
       - every EP rank and every expert receives an equal share of the routes,
         within one;
       - a token's routes land on distinct EP ranks and distinct experts;
-      - the ids for fewer tokens are a view of the leading rows of the cached
-        table, also after the table grows.
+      - every call returns a view of the same table, sized to the token bound;
+      - a call above the bound raises instead of growing the table.
     """
     device = torch.device("cpu")
     experts_per_rank = num_experts // moe_ep_size
+    max_num_tokens = 8192
     moe_routing._PERFECT_ROUTER_EXPERT_IDS_CACHE.clear()
 
+    def get_ids(num_tokens, ep_rank):
+        return get_cached_perfect_router_expert_ids(
+            num_tokens=num_tokens,
+            num_experts=num_experts,
+            experts_per_token=top_k,
+            moe_ep_size=moe_ep_size,
+            ep_rank=ep_rank,
+            max_num_tokens=max_num_tokens,
+            device=device)
+
     for ep_rank in range(moe_ep_size):
-        largest = None
-        for num_tokens in [1, 3, 7, 100, 1000, 8191]:
-            ids = get_cached_perfect_router_expert_ids(num_tokens=num_tokens,
-                                                       num_experts=num_experts,
-                                                       experts_per_token=top_k,
-                                                       moe_ep_size=moe_ep_size,
-                                                       ep_rank=ep_rank,
-                                                       device=device)
+        table_ptr = None
+        for num_tokens in [1, 3, 7, 100, 1000, max_num_tokens]:
+            ids = get_ids(num_tokens, ep_rank)
             assert ids.shape == (num_tokens, top_k)
             assert ids.dtype == torch.int32
             assert ids.is_contiguous()
+            if table_ptr is None:
+                table_ptr = ids.data_ptr()
+            assert ids.data_ptr() == table_ptr
 
             rank_counts = torch.bincount(ids.flatten() // experts_per_rank,
                                          minlength=moe_ep_size)
@@ -680,24 +689,11 @@ def test_perfect_router_expert_ids_balanced(num_experts, top_k, moe_ep_size):
                 ranks = ids // experts_per_rank
                 assert all(len(set(row)) == top_k for row in ranks.tolist())
             assert all(len(set(row)) == top_k for row in ids.tolist())
-            largest = ids
 
-        # Growing the table keeps the leading rows, so cached views stay valid.
-        grown = get_cached_perfect_router_expert_ids(
-            num_tokens=2 * moe_routing._PERFECT_ROUTER_EXPERT_IDS_MIN_ROWS + 1,
-            num_experts=num_experts,
-            experts_per_token=top_k,
-            moe_ep_size=moe_ep_size,
-            ep_rank=ep_rank,
-            device=device)
-        assert torch.equal(grown[:largest.shape[0]], largest)
-        again = get_cached_perfect_router_expert_ids(num_tokens=5,
-                                                     num_experts=num_experts,
-                                                     experts_per_token=top_k,
-                                                     moe_ep_size=moe_ep_size,
-                                                     ep_rank=ep_rank,
-                                                     device=device)
-        assert again.data_ptr() == grown.data_ptr()
+        with pytest.raises(ValueError, match="max_num_tokens"):
+            get_ids(max_num_tokens + 1, ep_rank)
+
+    assert len(moe_routing._PERFECT_ROUTER_EXPERT_IDS_CACHE) == moe_ep_size
 
 
 # -----------------------------------------------------------------

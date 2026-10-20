@@ -51,6 +51,7 @@ from tensorrt_llm._torch.modules.multi_stream_utils import do_multi_stream
 from tensorrt_llm._torch.moe.expert_statistic import ExpertStatistic
 from tensorrt_llm._torch.route_capture import get_active_route_capture  # R3
 from tensorrt_llm._torch.utils import EventType, Fp4QuantizedTensor
+from tensorrt_llm.logger import logger
 from tensorrt_llm.tools.layer_wise_benchmarks import get_calibrator
 
 from .communication import DeepEP, DeepEPLowLatency, NcclEP, NVLinkOneSided, NVLinkTwoSided
@@ -543,6 +544,16 @@ class ExternalCommMoEScheduler(MoEScheduler):
                 f"EPLB is enabled but backend {moe.backend.__class__.__name__} "
                 f"has fused routing (does not support routing separation)"
             )
+            if moe._enable_perfect_router_expert_ids:
+                logger.warning_once(
+                    "ENABLE_PERFECT_ROUTER=expert_ids has no effect on "
+                    f"{moe.backend.__class__.__name__} here: it routes inside its "
+                    "kernel, so there are no routed expert ids to replace. Use "
+                    "ENABLE_PERFECT_ROUTER=1 instead; for TRTLLM, setting "
+                    "TLLM_TRTLLMGEN_FORCE_SEPARATED_ROUTING=1 in every compared run "
+                    "also works.",
+                    key="perfect_router_expert_ids_fused_routing",
+                )
             token_selected_experts = None
             token_final_scales = None
 
