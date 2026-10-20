@@ -822,6 +822,11 @@ class UlyssesAttention(AttentionBackend):
     def support_kv_cache(self) -> bool:
         return self.inner_backend.support_kv_cache()
 
+    def support_kv_cache_page_size(
+        self, tokens_per_page: int, dtype: Optional[torch.dtype] = None
+    ) -> bool:
+        return self.inner_backend.support_kv_cache_page_size(tokens_per_page, dtype)
+
 
 class Attention2DAttention(AttentionBackend):
     """

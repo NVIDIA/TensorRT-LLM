@@ -20,6 +20,7 @@ Defines shared types, enums, and the abstract base class for attention backends.
 
 from abc import ABC, abstractmethod
 from enum import Enum
+from typing import Optional
 
 import torch
 
@@ -112,3 +113,12 @@ class AttentionBackend(ABC):
         without support would silently drop the keyword through ``**kwargs``, so callers
         must check before passing one."""
         return False
+
+    def support_kv_cache_page_size(
+        self, tokens_per_page: int, dtype: Optional[torch.dtype] = None
+    ) -> bool:
+        """Whether ``forward`` can attend over a ``CausalKVCacheManager`` with
+        ``tokens_per_page``-token pages holding ``dtype`` K/V (default: the backend's
+        dtype) on the current GPU. A caller sizing a cache asks this before building it;
+        ``forward`` refuses an unsupported cache either way."""
+        return self.support_kv_cache()

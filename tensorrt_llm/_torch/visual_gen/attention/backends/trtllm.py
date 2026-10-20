@@ -19,10 +19,13 @@ Wraps TrtllmAttention with simplified metadata for visual generation (diffusion)
 Handles the specifics of no-KV-cache operation and fused QKV requirements.
 """
 
+import functools
 from typing import Optional, Union
 
 import torch
 
+from tensorrt_llm._utils import torch_dtype_to_binding
+from tensorrt_llm.bindings.internal import thop
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.visual_gen.args import QuantAttentionConfig
@@ -41,10 +44,24 @@ from ...cache import CausalKVCacheManager
 from ...cuda_graph_runner import resolved_extra_key
 from .interface import AttentionBackend, AttentionTensorLayout
 
-# The only page size with shipped trtllm-gen paged context kernels: every paged
-# context cubin under kernels/trtllmGenKernels/fmha/cubin is a ``P32`` variant,
-# so any other value has no kernel and the attention op refuses the configuration.
-TRTLLM_GEN_TOKENS_PER_PAGE = 32
+
+@functools.lru_cache(maxsize=None)
+def _paged_context_kernel_exists(
+    head_dim: int, dtype: torch.dtype, tokens_per_page: int, device: int
+) -> bool:
+    """Whether this build has a fused paged context attention kernel for this head size,
+    K/V and output dtype and page size on ``device``'s GPU. Which page sizes exist
+    depends on the GPU family and on the kernels compiled in, so the build is asked.
+    The lookup probes a causal configuration; the full-attention kernels the cache path
+    runs come from the same kernel sets. A missing kernel would make the op fall back to
+    an unfused path that ignores the cached keys, so callers refuse instead."""
+    with torch.cuda.device(device):
+        # The lookup loads cubins through the driver, which needs a current context.
+        torch.empty(1, device="cuda")
+        binding = torch_dtype_to_binding(dtype)
+        return bool(
+            thop.fused_context_fmha_kernel_exists(head_dim, binding, tokens_per_page, binding)
+        )
 
 
 class TrtllmAttentionMetadata:
@@ -314,6 +331,7 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
 
         # TRTLLM expects flat [B*S, H*D] format
         self._preferred_layout = AttentionTensorLayout.NHD
+        self._dtype = dtype
 
         self.metadata = TrtllmAttentionMetadata(
             attention_metadata_state=attention_metadata_state,
@@ -571,12 +589,12 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
             v = packed[:, :, self.num_heads + kv_heads :]
         elif k is None or v is None:
             raise ValueError("K/V cache attention needs separate q, k, v, or one packed qkv.")
-        if kv_cache.tokens_per_page != TRTLLM_GEN_TOKENS_PER_PAGE:
+        if not self.support_kv_cache_page_size(kv_cache.tokens_per_page, q.dtype):
             raise NotImplementedError(
-                f"The TRTLLM backend ships paged context kernels for "
-                f"{TRTLLM_GEN_TOKENS_PER_PAGE}-token pages only; the cache uses "
-                f"{kv_cache.tokens_per_page}. Build the cache with "
-                f"tokens_per_page={TRTLLM_GEN_TOKENS_PER_PAGE} or use the CUDNN backend."
+                f"This build has no fused paged context attention kernel for "
+                f"{kv_cache.tokens_per_page}-token pages with head_dim {self.head_dim} and "
+                f"{q.dtype} on this GPU. Build the cache with a page size "
+                f"support_kv_cache_page_size() accepts, or use the CUDNN backend."
             )
         batch, num_rows, _, _ = q.shape
         if batch != 1 or batch_size != 1 or k.shape[1] != num_rows:
@@ -636,3 +654,13 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
 
     def support_kv_cache(self) -> bool:
         return True
+
+    def support_kv_cache_page_size(
+        self, tokens_per_page: int, dtype: Optional[torch.dtype] = None
+    ) -> bool:
+        dtype = dtype or self._dtype
+        if dtype is None:
+            raise ValueError("support_kv_cache_page_size needs a dtype: the backend has none")
+        return _paged_context_kernel_exists(
+            self.head_dim, dtype, tokens_per_page, torch.cuda.current_device()
+        )

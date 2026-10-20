@@ -142,6 +142,11 @@ def open_with_prompt(cache, prompt_len, geometry=GEOMETRY):
 BACKENDS = ["cudnn", "trtllm"]
 
 
+def lacks_kernel(backend, cache):
+    """Whether this build has no attention kernel for the cache's page size on this GPU."""
+    return not make_backend(backend).support_kv_cache_page_size(cache.tokens_per_page)
+
+
 @pytest.mark.parametrize("backend", BACKENDS)
 @pytest.mark.parametrize(
     "prompt_len", [0, 17, 64], ids=["no-prompt", "unaligned-prompt", "page-exact-prompt"]
@@ -150,11 +155,10 @@ def test_rollout_matches_dense_reference(cache, backend, prompt_len):
     torch.manual_seed(0)
     prompt_k, prompt_v = open_with_prompt(cache, prompt_len)
     attn = make_backend(backend)
-    if backend == "trtllm" and cache.tokens_per_page != 32:
-        # trtllm-gen has paged context kernels for 32-token pages only; other sizes
-        # would silently drop the prefix, so the backend must refuse them.
+    if lacks_kernel(backend, cache):
+        # Without a kernel the op would silently drop the prefix, so the backend refuses.
         q, k, v = rand_qkv(CHUNK)
-        with pytest.raises(NotImplementedError, match="32-token"):
+        with pytest.raises(NotImplementedError, match="no fused paged context attention kernel"):
             run(attn, cache, q, k, v)
         return
 
@@ -222,8 +226,8 @@ def test_causal_blocks_at_any_alignment(cache, backend):
     """The clean pass: one launch, four causal blocks of 10 sharing pages mid-way,
     each with its own window start, over a rotated table with stale tokens."""
     torch.manual_seed(3)
-    if backend == "trtllm" and cache.tokens_per_page != 32:
-        pytest.skip("trtllm-gen: 32-token pages only")
+    if lacks_kernel(backend, cache):
+        pytest.skip("no paged context kernel for this page size in this build")
     pk, pv = open_with_prompt(cache, 9)
     history_k, history_v = [], []
     for _ in range(3):  # 120 tokens committed, one page dropped: 88 resident, 24 stale
@@ -262,8 +266,8 @@ def test_each_block_sees_exactly_its_window(cache, backend, num_causal_blocks, c
     read, or a key read twice shows up as a 1, a 0 or a 2 where it should not.
     Covers the window filling (0 and 1 commits) and full (3), and ``sink`` generated
     tokens pinned with the prompt by the first commit."""
-    if backend == "trtllm" and cache.tokens_per_page != 32:
-        pytest.skip("trtllm-gen: 32-token pages only")
+    if lacks_kernel(backend, cache):
+        pytest.skip("no paged context kernel for this page size in this build")
     torch.manual_seed(7)
     prompt = 9
     fixed = prompt + (sink if commits else 0)
@@ -322,8 +326,8 @@ def test_each_block_sees_exactly_its_window(cache, backend, num_causal_blocks, c
 @pytest.mark.parametrize("backend", BACKENDS)
 def test_padding_tokens_are_neither_written_nor_attended(cache, backend):
     """``seq_len`` counts the real tokens: a padded chunk behaves like the unpadded one."""
-    if backend == "trtllm" and cache.tokens_per_page != 32:
-        pytest.skip("trtllm-gen: 32-token pages only")
+    if lacks_kernel(backend, cache):
+        pytest.skip("no paged context kernel for this page size in this build")
     torch.manual_seed(6)
     pk, pv = open_with_prompt(cache, 9)
     attn = make_backend(backend)
@@ -355,8 +359,8 @@ def test_padding_tokens_are_neither_written_nor_attended(cache, backend):
 @pytest.mark.parametrize("backend", BACKENDS)
 def test_dirty_steps_overwrite_in_place(cache, backend):
     """Several forwards at the same ``past`` leave only the last K/V in the cache."""
-    if backend == "trtllm" and cache.tokens_per_page != 32:
-        pytest.skip("trtllm-gen: 32-token pages only")
+    if lacks_kernel(backend, cache):
+        pytest.skip("no paged context kernel for this page size in this build")
     torch.manual_seed(1)
     open_with_prompt(cache, 9)
     attn = make_backend(backend)
@@ -378,8 +382,8 @@ def test_graph_replay_survives_commit(cache, backend):
     """A forward captured in a CUDA graph stays correct after commit() moves the cache,
     including across a page rotation: writes land on the new pages and attention
     reads the new lengths, with nothing refreshed between commit and replay."""
-    if backend == "trtllm" and cache.tokens_per_page != 32:
-        pytest.skip("trtllm-gen: 32-token pages only")
+    if lacks_kernel(backend, cache):
+        pytest.skip("no paged context kernel for this page size in this build")
     torch.manual_seed(5)
     pk, pv = open_with_prompt(cache, 9)
     attn = make_backend(backend)
@@ -602,12 +606,26 @@ def test_backend_without_cache_support_refuses_a_cache(cache):
         attn._attn_impl(q, q, q, kv_cache=cache)
 
 
+def test_trtllm_refuses_a_page_size_without_a_kernel(cache, monkeypatch):
+    """Where the build has no paged context kernel for the cache's page size, the TRTLLM
+    backend reports it and refuses the cache instead of running the unfused fallback."""
+    from tensorrt_llm._torch.visual_gen.attention.backends import trtllm as trtllm_backend
+
+    open_with_prompt(cache, 9)
+    attn = make_backend("trtllm")
+    monkeypatch.setattr(trtllm_backend, "_paged_context_kernel_exists", lambda *a: False)
+    assert not attn.support_kv_cache_page_size(cache.tokens_per_page)
+    q, k, v = rand_qkv(CHUNK)
+    with pytest.raises(NotImplementedError, match="no fused paged context attention kernel"):
+        run(attn, cache, q, k, v)
+
+
 @pytest.mark.parametrize("backend", BACKENDS)
 def test_padding_with_causal_blocks_over_stale_history(cache, backend):
     """Ulysses padding during the clean pass: four causal blocks over a rotated table
     with stale tokens, plus padding rows that are neither written nor attended."""
-    if backend == "trtllm" and cache.tokens_per_page != 32:
-        pytest.skip("trtllm-gen: 32-token pages only")
+    if lacks_kernel(backend, cache):
+        pytest.skip("no paged context kernel for this page size in this build")
     torch.manual_seed(9)
     pk, pv = open_with_prompt(cache, 9)
     history_k, history_v = [], []
@@ -690,8 +708,8 @@ def test_blocks_of_one_and_two_whole_pages(backend, block):
 @pytest.mark.parametrize("backend", BACKENDS)
 def test_cache_path_refusals(cache, backend):
     """What the cache path does not support raises instead of computing something else."""
-    if backend == "trtllm" and cache.tokens_per_page != 32:
-        pytest.skip("trtllm-gen: 32-token pages only")
+    if lacks_kernel(backend, cache):
+        pytest.skip("no paged context kernel for this page size in this build")
     open_with_prompt(cache, 9)
     attn = make_backend(backend)
     q, k, v = rand_qkv(CHUNK)
