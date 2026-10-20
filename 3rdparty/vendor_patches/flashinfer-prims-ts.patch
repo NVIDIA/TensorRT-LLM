@@ -242,7 +242,7 @@ index b22f0f413b7312bab9a5f8e296255fe9aeabe901..a4a87200ca5d3ace5cf899caa9672a1a
  from .helpers_common import (
      _TASK_CACHE_TMEM_BASE_OFFSET,
 diff --git a/mla_decode.py b/mla_decode.py
-index b62bd1081fbae0e18e0950008bae87c8986677b4..e64fc538c768f08cc4d51ce12e74e00ac59cd692 100644
+index b62bd1081fbae0e18e0950008bae87c8986677b4..0555e277288fdeef25e85de1de4415a578cfe743 100644
 --- a/mla_decode.py
 +++ b/mla_decode.py
 @@ -1,3 +1,4 @@
@@ -263,7 +263,25 @@ index b62bd1081fbae0e18e0950008bae87c8986677b4..e64fc538c768f08cc4d51ce12e74e00a
  
  from .decode import (
      _WorkspaceSection,
-@@ -1637,7 +1634,7 @@ class BatchMLADecodePagedTSWrapper:
+@@ -1459,11 +1456,12 @@ def _launch_mla_decode(
+         runtime.sparse_inputs,
+         runtime.bmm1_scale,
+         runtime.bmm2_scale,
+-        **(
+-            {"output_quant_args": runtime.output_quant_args}
+-            if runtime.output_quant_args is not None
+-            else {}
+-        ),
++        # Passed positionally and also when None. The kernel was compiled with
++        # ``output_quant_args`` in its signature (``None`` for unquantized
++        # output), and a kernel reloaded from the persistent compile cache is
++        # a positional TVM-FFI entry with no Python defaults: it rejects both
++        # a missing parameter and a keyword argument.
++        runtime.output_quant_args,
+     )
+     return runtime.out
+ 
+@@ -1637,7 +1635,7 @@ class BatchMLADecodePagedTSWrapper:
              split_kv=int(dict(policy)["split_kv"]),
          )
  
@@ -272,7 +290,7 @@ index b62bd1081fbae0e18e0950008bae87c8986677b4..e64fc538c768f08cc4d51ce12e74e00a
      def run(
          self,
          query: torch.Tensor,
-@@ -1742,7 +1739,7 @@ class BatchMLADecodePagedTSWrapper:
+@@ -1742,7 +1740,7 @@ class BatchMLADecodePagedTSWrapper:
          )
  
  
@@ -281,7 +299,7 @@ index b62bd1081fbae0e18e0950008bae87c8986677b4..e64fc538c768f08cc4d51ce12e74e00a
  def batch_mla_decode_with_paged_kv_cache(
      query: torch.Tensor,
      kv_cache: torch.Tensor,
-@@ -2119,17 +2116,17 @@ def _resolve_sparse_mla_plan(
+@@ -2119,17 +2117,17 @@ def _resolve_sparse_mla_plan(
  ):
      """Resolve sparse geometry and scratch sizing without allocation/compilation."""
      import cutlass

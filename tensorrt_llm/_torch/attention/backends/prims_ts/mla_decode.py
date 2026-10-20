@@ -1456,11 +1456,12 @@ def _launch_mla_decode(
         runtime.sparse_inputs,
         runtime.bmm1_scale,
         runtime.bmm2_scale,
-        **(
-            {"output_quant_args": runtime.output_quant_args}
-            if runtime.output_quant_args is not None
-            else {}
-        ),
+        # Passed positionally and also when None. The kernel was compiled with
+        # ``output_quant_args`` in its signature (``None`` for unquantized
+        # output), and a kernel reloaded from the persistent compile cache is
+        # a positional TVM-FFI entry with no Python defaults: it rejects both
+        # a missing parameter and a keyword argument.
+        runtime.output_quant_args,
     )
     return runtime.out
 
