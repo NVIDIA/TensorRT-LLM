@@ -147,6 +147,19 @@ def drop_decoder_context_requests_waiting_for_encoder_output(
     return filtered_requests
 
 
+def clear_context_output_reuse_estimates(requests: RequestList) -> None:
+    """Charge requests that return context logits for their whole prompt.
+
+    Capacity scheduling credits their cached prefix in ``estimated_reusable_tokens``,
+    but the KV cache manager re-prefills them from position 0 so every prompt token
+    gets a logit (``KVCacheManager._maybe_rewind_context_output_requests``). Leaving
+    the credit would admit more tokens than the forward pass can hold.
+    """
+    for req in requests:
+        if req.py_return_context_logits and req.estimated_reusable_tokens:
+            req.estimated_reusable_tokens = 0
+
+
 def split_encoder_from_decoder_context_requests(
     requests: RequestList,
 ) -> tuple[RequestList, RequestList]:
@@ -575,6 +588,7 @@ class SimpleScheduler(RequestScheduler):
         fitting_requests, fitting_disagg_gen_init_requests, paused_requests = (
             self.capacity_scheduler.schedule_request(active_requests)
         )
+        clear_context_output_reuse_estimates(fitting_requests)
 
         encoder_requests, context_requests, generation_requests = (
             self.micro_batch_scheduler.schedule(fitting_requests, inflight_request_ids)
@@ -2519,6 +2533,7 @@ class SimpleUnifiedScheduler(RequestScheduler):
         fitting_requests, fitting_disagg_gen_init, paused_requests = (
             self.capacity_scheduler.schedule_request(active_requests)
         )
+        clear_context_output_reuse_estimates(fitting_requests)
 
         # Step 2: MicroBatch Check (Who fits in token budget? + Chunking)
         encoder_requests, context_requests, generation_requests = (

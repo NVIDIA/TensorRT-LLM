@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 import time
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -14,9 +15,9 @@ from utils.llm_data import llm_models_root
 from utils.util import skip_single_gpu
 # isort: on
 
-from tensorrt_llm.executor.base_worker import BaseWorker
+from tensorrt_llm.executor.base_worker import BaseWorker, _maybe_wrap_response
 from tensorrt_llm.executor.request import GenerationRequest, LoRARequest
-from tensorrt_llm.executor.utils import RequestError
+from tensorrt_llm.executor.utils import ErrorResponse, RequestError
 from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 from tensorrt_llm.sampling_params import SamplingParams
 
@@ -80,6 +81,39 @@ def test_get_startup_metrics_promotes_model_engine_stages() -> None:
             "total_model_loading_seconds": 0.75
         },
     }
+
+
+@pytest.mark.cpu_only
+def test_short_context_logits_fail_the_request_instead_of_misaligning() -> None:
+    """Short context logits fail the request instead of shifting scores.
+
+    Prompt logprob row t scores prompt token t + 1. Context logits covering only
+    an uncached suffix cannot be aligned, so the request fails and is aborted.
+    """
+    client_id = 7
+    generation_result = SimpleNamespace(
+        _logprob_params=SimpleNamespace(prompt_logprobs=2,
+                                        prompt_logprobs_simple_format=False,
+                                        drop_context_logits=True),
+        _streaming=True,
+        _generation_request=SimpleNamespace(prompt_token_ids=[1, 2, 3, 4]),
+    )
+    response = SimpleNamespace(
+        client_id=client_id,
+        request_id=70,
+        # Two rows: a suffix past a 2-token reused prefix of a 4-token prompt.
+        result=SimpleNamespace(context_logits=torch.zeros(2, 8),
+                               is_final=False),
+    )
+    worker = SimpleNamespace(_results={client_id: generation_result},
+                             abort_request=Mock())
+
+    wrapped = _maybe_wrap_response(worker, response, is_pytorch_backend=True)
+
+    assert isinstance(wrapped, ErrorResponse)
+    assert wrapped.client_id == client_id
+    assert "all 4 prompt tokens, got 2" in wrapped.error_msg
+    worker.abort_request.assert_called_once_with(client_id)
 
 
 @pytest.mark.cpu_only

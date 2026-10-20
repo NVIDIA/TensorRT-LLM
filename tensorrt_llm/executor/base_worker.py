@@ -1614,6 +1614,10 @@ def _get_params_for_first_rsp(
     return None, None, None
 
 
+class IncompleteContextLogitsError(RuntimeError):
+    """Context logits do not cover the whole prompt, so prompt logprobs cannot be aligned."""
+
+
 def _compute_pytorch_prompt_logprobs(
         generation_result: GenerationResult,
         response: LlmResponse) -> Optional[LogProbsResult]:
@@ -1628,6 +1632,16 @@ def _compute_pytorch_prompt_logprobs(
             )  # generation logprobs, if requested, is provided directly in response.result.log_probs from the sampler.
     context_logits = response.result.context_logits
     assert context_logits is not None, "context_logits must not be None when prompt_logprobs is requested."
+    # Row t scores prompt token t + 1, so a short tensor (a reused prefix the
+    # forward pass skipped) cannot be aligned; scoring it would attribute the
+    # suffix's logprobs to the leading prompt tokens.
+    num_prompt_tokens = len(
+        generation_result._generation_request.prompt_token_ids)
+    if context_logits.shape[-2] < num_prompt_tokens:
+        raise IncompleteContextLogitsError(
+            f"prompt logprobs need context logits for all {num_prompt_tokens} "
+            f"prompt tokens, got {context_logits.shape[-2]} (a reused KV cache "
+            "prefix is not rescored on this configuration)")
     result = response.result.get_result()
     assert result is not None, "result must not be None when prompt_logprobs is requested."
     # Single element list
@@ -1788,11 +1802,20 @@ def _send_rsp(
 
 
 def _maybe_wrap_response(
-        worker,
-        response: tllm.Response,
-        is_pytorch_backend=False) -> Union[tllm.Response, ResponseWrapper]:
+    worker,
+    response: tllm.Response,
+    is_pytorch_backend=False
+) -> Union[tllm.Response, ResponseWrapper, ErrorResponse]:
 
-    logprobs_result = _get_logprobs(worker, response, is_pytorch_backend)
+    try:
+        logprobs_result = _get_logprobs(worker, response, is_pytorch_backend)
+    except IncompleteContextLogitsError as error:
+        # Fail only this request, and stop the engine generating for a client
+        # that has already been answered.
+        if not response.result.is_final:
+            worker.abort_request(response.client_id)
+        return ErrorResponse(response.client_id, str(error),
+                             response.request_id)
     req_perf_metrics = get_metrics_dict(response)
     if logprobs_result or req_perf_metrics:
         response = ResponseWrapper(response, logprobs_result, req_perf_metrics)

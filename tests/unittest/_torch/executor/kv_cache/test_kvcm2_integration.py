@@ -1530,6 +1530,7 @@ class _ContextRequest:
     is_generation_only_request: bool = False
     is_dummy_request: bool = False
     return_perf_metrics: bool = False
+    py_return_context_logits: bool = False
     context_current_position: int = 0
     py_served_prefix_end: int = 0
     py_num_connector_matched_tokens: int = 0
@@ -2191,6 +2192,48 @@ def _drive_context_chunks(
         request.context_remaining_length = request.prompt_len - position
         _update_context_resources(manager, batch)
         request.is_first_context_chunk = False
+
+
+def test_a_context_logits_request_claims_no_reuse_but_commits_its_blocks() -> None:
+    """Context logits exist only for computed tokens, so a request returning them
+    re-prefills a cached prompt. Its blocks are still committed, and a request
+    without context logits keeps reusing the cache.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    torch.cuda.init()
+    manager = _make_spec_recompute_manager("all_reusable", context_recompute_tail=0)
+    prompt = list(range(MAX_SEQ_LEN))
+    warmup = _ContextRequest(1, prompt, MAX_SEQ_LEN, "conv-1", use_conversation_params=False)
+    scored = _ContextRequest(
+        2,
+        prompt,
+        MAX_SEQ_LEN,
+        "conv-2",
+        use_conversation_params=False,
+        py_return_context_logits=True,
+    )
+    plain = _ContextRequest(3, prompt, MAX_SEQ_LEN, "conv-3", use_conversation_params=False)
+    try:
+        _run_context(manager, warmup)
+
+        batch = _prepare_context_resources(manager, scored)
+        assert manager.prepare_context(scored)
+        assert manager.kv_cache_map[scored.py_request_id].num_committed_tokens == 0
+        assert scored.context_current_position == 0
+        assert scored.prepopulated_prompt_len == 0
+        _drive_context_chunks(manager, batch, scored)
+        assert manager.kv_cache_map[scored.py_request_id].num_committed_tokens == MAX_SEQ_LEN
+
+        _prepare_context_resources(manager, plain)
+        assert manager.prepare_context(plain)
+        assert plain.context_current_position > 0
+        assert plain.prepopulated_prompt_len == plain.context_current_position
+    finally:
+        _free_if_active(manager, plain)
+        _free_if_active(manager, scored)
+        _free_if_active(manager, warmup)
+        manager.shutdown()
 
 
 @pytest.mark.parametrize("policy", ["per_request", "per_conversation"])

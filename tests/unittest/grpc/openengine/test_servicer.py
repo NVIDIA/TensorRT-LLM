@@ -1606,3 +1606,123 @@ def test_detokenize_extension_rejects_string_boolean() -> None:
     request.extra.update({"detokenize": "false"})
     with pytest.raises(ValueError, match="extra.detokenize must be a boolean"):
         sampling_params_from_request(request)
+
+
+def _prompt_logprob_result(prompt_logprobs: list[Any]) -> SimpleNamespace:
+    output = SimpleNamespace(
+        index=0,
+        token_ids=[10],
+        text="A",
+        logprobs=[],
+        prompt_logprobs=prompt_logprobs,
+        finish_reason=None,
+        stop_reason=None,
+    )
+    return SimpleNamespace(
+        prompt_token_ids=[1, 2, 3], outputs=[output], cached_tokens=0, error=None
+    )
+
+
+def test_complete_prompt_logprobs_keep_the_first_token_convention() -> None:
+    """Entry i scores prompt token i + 1; only the first token lacks a logprob."""
+    result = _prompt_logprob_result(
+        [{2: _logprob(-0.5, 1)}, {3: _logprob(-0.25, 1)}, {10: _logprob(-0.1, 1)}]
+    )
+    state = oe_streaming._OpenEngineFormatState(
+        request_id="r",
+        sampling_params=SamplingParams(prompt_logprobs=0),
+        tokenizer=_FakeTokenizer(),
+    )
+
+    responses = oe_streaming._format_result(result, state)
+
+    tokens = responses[0].prompt.tokens
+    assert [token.token_id for token in tokens] == [1, 2, 3]
+    assert not tokens[0].HasField("logprob")
+    assert [token.logprob for token in tokens[1:]] == [-0.5, -0.25]
+
+
+def test_incomplete_prompt_logprobs_are_refused_not_padded() -> None:
+    """A prompt logprob list with holes fails the request.
+
+    Scores missing past the first token cannot be told apart from the
+    first-token convention, so the request fails instead of sending holes.
+    """
+    result = _prompt_logprob_result([{2: _logprob(-0.5, 1)}])
+    state = oe_streaming._OpenEngineFormatState(
+        request_id="r",
+        sampling_params=SamplingParams(prompt_logprobs=0),
+        tokenizer=_FakeTokenizer(),
+    )
+
+    responses = oe_streaming._format_result(result, state)
+
+    assert [response.WhichOneof("event") for response in responses] == ["error"]
+    assert responses[0].error.code == openengine_servicer.error_pb2.ERROR_CODE_INTERNAL
+    assert "1 prompt tokens" in responses[0].error.message
+
+
+def test_generate_aborts_the_engine_after_refusing_prompt_logprobs() -> None:
+    """An error event ends the stream and stops the engine request."""
+    llm = _FakeLlm([_prompt_logprob_result([{2: _logprob(-0.5, 1)}])] * 2)
+    servicer = OpenEngineInferenceServicer(llm, model="test-model")
+    request = generation_pb2.GenerateRequest(
+        request_id="request-short-prompt-logprobs",
+        model="test-model",
+        prompt="hello",
+        stopping=generation_pb2.StoppingOptions(max_tokens=4),
+        response=generation_pb2.ResponseOptions(return_prompt_logprobs=True),
+    )
+
+    async def collect_responses() -> list[generation_pb2.GenerateResponse]:
+        return [response async for response in servicer.Generate(request, FakeServicerContext())]
+
+    responses = asyncio.run(collect_responses())
+
+    assert [response.WhichOneof("event") for response in responses] == ["error"]
+    assert llm.result_handle.aborted
+
+
+def test_generation_only_leg_does_not_request_prompt_logprobs() -> None:
+    """The generation_only leg does not compute prompt logprobs.
+
+    The context_only leg's PromptOutput carries the prompt scores; the
+    generation_only leg receives prompt KV and never computes prompt logits.
+    """
+    final_output = SimpleNamespace(
+        index=0,
+        token_ids=[10],
+        text="A",
+        logprobs=[],
+        prompt_logprobs=None,
+        finish_reason="length",
+        stop_reason=None,
+    )
+    llm = _FakeLlm(
+        [
+            SimpleNamespace(
+                prompt_token_ids=[1, 2], outputs=[final_output], cached_tokens=0, error=None
+            )
+        ]
+    )
+    servicer = OpenEngineInferenceServicer(llm, model="test-model")
+    request = generation_pb2.GenerateRequest(
+        request_id="request-gen",
+        model="test-model",
+        prompt="hello",
+        stopping=generation_pb2.StoppingOptions(max_tokens=1),
+        response=generation_pb2.ResponseOptions(return_prompt_logprobs=True),
+    )
+    request.kv.session.session_id = "42"
+    request.kv.session.attributes_struct.update(
+        {"opaque_state": base64.b64encode(b"kvstate").decode(), "first_gen_tokens": [10]}
+    )
+
+    async def collect_responses() -> list[generation_pb2.GenerateResponse]:
+        return [response async for response in servicer.Generate(request, FakeServicerContext())]
+
+    responses = asyncio.run(collect_responses())
+
+    assert llm.generate_kwargs["sampling_params"].prompt_logprobs is None
+    assert llm.generate_kwargs["disaggregated_params"].request_type == "generation_only"
+    assert "prompt" not in [response.WhichOneof("event") for response in responses]

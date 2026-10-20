@@ -16,6 +16,7 @@ from .formatting import (
     _engine_error_response,
     _finish_event,
     _logprob_shortfall,
+    _missing_prompt_logprobs,
     _prompt_output,
     _StopPrefixTracker,
     _token_holdback,
@@ -90,6 +91,19 @@ def _format_result(
                     "response.prompt_candidates or shorten the prompt",
                     result,
                     code=error_pb2.ERROR_CODE_INVALID_ARGUMENT,
+                )
+            )
+            return responses
+        missing = _missing_prompt_logprobs(result)
+        if missing:
+            # Holes cannot be told apart from the first-token convention by a
+            # client; refuse rather than send scores it would misread.
+            args.prompt_sent = True
+            responses.append(
+                _engine_error_response(
+                    request_id,
+                    f"engine returned no prompt logprob for {missing} prompt tokens",
+                    result,
                 )
             )
             return responses

@@ -713,16 +713,9 @@ def llm_return_logprobs_test_harness(prompt_logprobs: Optional[int],
                                      tp_size=1,
                                      streaming=False,
                                      backend=None):
-    kv_cache_args_extra = {}
-    if streaming:
-        # need this so that context_logits / prompt_logprobs are not dropped
-        # in the 2nd reuse of llm.generate() in streaming mode
-        kv_cache_args_extra["enable_block_reuse"] = False
-
     llm = LLM(
         llama_model_path,
-        kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4,
-                                      **kv_cache_args_extra),
+        kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4),
         tensor_parallel_size=tp_size,
         gather_generation_logits=True,
     )

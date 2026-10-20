@@ -1200,6 +1200,7 @@ class TestKVCacheManagerConnectorReporting(unittest.TestCase):
     @staticmethod
     def _context_batch() -> ScheduledRequests:
         request = SimpleNamespace(py_request_id=1,
+                                  py_return_context_logits=False,
                                   prompt_len=64,
                                   py_beam_width=1,
                                   py_draft_tokens=[],
