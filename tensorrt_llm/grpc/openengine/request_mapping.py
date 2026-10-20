@@ -283,13 +283,18 @@ def _base_input_from_request(
     raise ValueError("exactly one of prompt or token_ids must be set")
 
 
-def _media_io_for_model(llm: Any, modality: str, media_io_type: type[Any]) -> Any:
+def _media_io_for_model(
+    llm: Any,
+    modality: str,
+    media_io_type: type[Any],
+    runtime_kwargs: dict[str, Any] | None = None,
+) -> Any:
     input_processor = getattr(llm, "input_processor", None)
     defaults = None
     if isinstance(input_processor, BaseMultimodalInputProcessor):
         preferences = input_processor.get_preferred_media_io_kwargs() or {}
         defaults = preferences.get(modality)
-    return media_io_type.create(defaults, None)
+    return media_io_type.create(defaults, runtime_kwargs)
 
 
 async def _load_media_item(
@@ -338,7 +343,12 @@ def _image_loader_factory(llm: Any) -> _MediaLoader:
 
 
 def _video_loader_factory(llm: Any) -> _MediaLoader:
-    video_io = _media_io_for_model(llm, "video", VideoMediaIO)
+    video_io = _media_io_for_model(
+        llm,
+        "video",
+        VideoMediaIO,
+        {"max_decoded_frame_bytes": _MAX_TOTAL_DECODED_MEDIA_BYTES},
+    )
 
     async def load(item: generation_pb2.MediaItem, index: int) -> Any:
         return await _load_media_item(item, video_io, index, "video")

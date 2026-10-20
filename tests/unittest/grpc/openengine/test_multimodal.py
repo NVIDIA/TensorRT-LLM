@@ -458,7 +458,11 @@ async def test_image_and_video_sources_preserve_global_order(image_video_llm, mo
     mapped = await request_mapping._input_from_request(request, image_video_llm)
 
     assert created_with == [
-        ("video", {"format": "np", "num_frames": 4}, None),
+        (
+            "video",
+            {"format": "np", "num_frames": 4},
+            {"max_decoded_frame_bytes": request_mapping._MAX_TOTAL_DECODED_MEDIA_BYTES},
+        ),
         ("image", {"format": "np"}, None),
     ]
     assert [video.metadata["source"] for video in mapped["multi_modal_data"]["video"]] == [

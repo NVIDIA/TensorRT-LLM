@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+from unittest.mock import patch
+
 import numpy as np
 import pytest
 import torch
@@ -66,3 +68,24 @@ def test_np_format_hits_hf_video_processor_fast_path(sample_video_path: str) -> 
 
     assert len(batched) == 1
     assert np.shares_memory(video.frames, batched[0])
+
+
+@pytest.mark.parametrize(
+    ("format", "dtype"), [("np", np.uint8), ("pil", np.uint8), ("pt", np.float32)]
+)
+def test_decode_limit_is_checked_before_frame_stack_allocation(
+    sample_video_path: str, format: str, dtype: type[np.generic]
+) -> None:
+    decoded_bytes = 10 * 64 * 64 * 3 * np.dtype(dtype).itemsize
+
+    with patch("tensorrt_llm.inputs.media_io.np.empty") as allocate:
+        with pytest.raises(ValueError, match=f"require {decoded_bytes} bytes"):
+            _load_video_by_cv2(
+                sample_video_path,
+                num_frames=10,
+                fps=-1,
+                format=format,
+                max_decoded_frame_bytes=decoded_bytes - 1,
+            )
+
+    allocate.assert_not_called()

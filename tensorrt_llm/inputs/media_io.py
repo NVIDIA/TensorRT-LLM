@@ -739,6 +739,7 @@ def _load_video_by_cv2(
     extract_audio: bool = False,
     cv2_backend: Optional[int] = None,
     raw_bytes_hash: Optional[str] = None,
+    max_decoded_frame_bytes: Optional[int] = None,
 ) -> VideoData:
     """Decode a video and return sampled frames as a list.
 
@@ -756,6 +757,10 @@ def _load_video_by_cv2(
                 contiguous 4D buffer that HF video processors pass through
                 without an extra frame-by-frame copy.
       `"pil"` - list[PIL.Image], one per sampled frame.
+
+    When `max_decoded_frame_bytes` is set, the selected output representation
+    is sized from the first decoded frame and rejected before the frame stack
+    is allocated.
     """
     assert format in ("pt", "np", "pil"), "format must be one of 'pt', 'np', 'pil'"
 
@@ -829,6 +834,17 @@ def _load_video_by_cv2(
                     fh, fw = bgr_scratch.shape[:2]
                     if stacked_rgb is None:
                         H, W = fh, fw
+                        output_dtype = np.float32 if format == "pt" else np.uint8
+                        output_item_size = np.dtype(output_dtype).itemsize
+                        decoded_frame_bytes = num_frames_to_sample * H * W * 3 * output_item_size
+                        if (
+                            max_decoded_frame_bytes is not None
+                            and decoded_frame_bytes > max_decoded_frame_bytes
+                        ):
+                            raise ValueError(
+                                f"Decoded video frames require {decoded_frame_bytes} bytes, "
+                                f"exceeding the limit of {max_decoded_frame_bytes} bytes."
+                            )
                         stacked_rgb = np.empty((num_frames_to_sample, H, W, 3), dtype=np.uint8)
                     if (fh, fw) == (H, W):
                         cv2.cvtColor(
@@ -1161,17 +1177,21 @@ class VideoMediaIO(BaseMediaIO[VideoData]):
         format: str = "pt",
         device: str = "cpu",
         extract_audio: bool = False,
+        max_decoded_frame_bytes: Optional[int] = None,
     ) -> None:
         # `"pt"` is the safe default every video model handles; models tuned
         # for the uint8-HWC path opt into `"np"` via
         # InputProcessor.get_preferred_media_io_kwargs().
         if format not in _SUPPORTED_VIDEO_FORMATS:
             raise ValueError(f"format must be one of {_SUPPORTED_VIDEO_FORMATS}, got {format!r}")
+        if max_decoded_frame_bytes is not None and max_decoded_frame_bytes <= 0:
+            raise ValueError("max_decoded_frame_bytes must be positive")
         self._num_frames = num_frames
         self._fps = fps
         self._format = format
         self._device = device
         self._extract_audio = extract_audio
+        self._max_decoded_frame_bytes = max_decoded_frame_bytes
 
     @classmethod
     def merge_kwargs(
@@ -1210,6 +1230,7 @@ class VideoMediaIO(BaseMediaIO[VideoData]):
                 extract_audio=self._extract_audio,
                 cv2_backend=cv2_backend,
                 raw_bytes_hash=raw_bytes_hash,
+                max_decoded_frame_bytes=self._max_decoded_frame_bytes,
             )
         with tempfile.NamedTemporaryFile(suffix=".mp4", dir=_VIDEO_TEMPFILE_DIR) as tmp:
             tmp.write(data)
@@ -1222,6 +1243,7 @@ class VideoMediaIO(BaseMediaIO[VideoData]):
                 self._device,
                 extract_audio=self._extract_audio,
                 raw_bytes_hash=raw_bytes_hash,
+                max_decoded_frame_bytes=self._max_decoded_frame_bytes,
             )
 
     def load_base64(self, media_type: str, data: str) -> VideoData:
