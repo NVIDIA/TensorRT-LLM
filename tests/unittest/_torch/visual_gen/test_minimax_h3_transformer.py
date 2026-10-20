@@ -25,6 +25,7 @@ from diffusers.models.transformers.transformer_minimax_h3 import (
     MiniMaxH3Transformer3DModel as HFMiniMaxH3Transformer3DModel,
 )
 
+from tensorrt_llm._torch.visual_gen.attention import attention as attention_module
 from tensorrt_llm._torch.visual_gen.attention.attention import QKVMode
 from tensorrt_llm._torch.visual_gen.attention.backends.interface import AttentionTensorLayout
 from tensorrt_llm._torch.visual_gen.config import (
@@ -32,7 +33,6 @@ from tensorrt_llm._torch.visual_gen.config import (
     create_attention_metadata_state,
 )
 from tensorrt_llm._torch.visual_gen.models.minimax_h3 import transformer_minimax_h3 as h3
-from tensorrt_llm._torch.visual_gen.modules import attention as attention_module
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
@@ -1507,3 +1507,46 @@ def test_async_ulysses_projections_match_the_sync_path(monkeypatch: pytest.Monke
         )
     assert recorder.captured["kwargs"]["key_padding_mask"] is mask
     torch.testing.assert_close(async_out, sync_out, rtol=0, atol=0)
+
+
+def test_load_weights_accepts_diffusers_layout_with_async_ulysses(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The separate to_q / to_k / to_v modules load straight from the checkpoint's keys."""
+    monkeypatch.setattr(attention_module, "wrap_parallel_attention", lambda attn, **kwargs: attn)
+    config = _make_model_config(num_layers=1, num_refiner_layers=1)
+    config.visual_gen_mapping = SimpleNamespace(
+        ulysses_size=2,
+        cp_size=1,
+        ring_size=1,
+        cfg_size=1,
+        seq_size=2,
+        seq_rank=0,
+        seq_group=lambda: object(),
+    )
+    config.parallel = ParallelConfig(ulysses_size=2, async_ulysses=True)
+    model = h3.MiniMaxH3Transformer3DModel(config)
+    attention_modules = [m for m in model.modules() if isinstance(m, h3.MiniMaxH3Attention)]
+    assert attention_modules and all(m.use_async_ulysses for m in attention_modules)
+
+    # The released Diffusers layout: to_q / to_k / to_v (no qkv_proj) and ff.net.{0.proj,2}
+    # with SwiGLU stored as [up, gate].
+    checkpoint: dict[str, torch.Tensor] = {}
+    for name, value in model.state_dict().items():
+        value = torch.randn_like(value) if value.is_floating_point() else value.clone()
+        if ".ff.gate_up_proj." in name:
+            gate, up = value.chunk(2, dim=0)
+            checkpoint[name.replace(".ff.gate_up_proj.", ".ff.net.0.proj.")] = torch.cat((up, gate))
+        elif ".ff.down_proj." in name:
+            checkpoint[name.replace(".ff.down_proj.", ".ff.net.2.")] = value
+        else:
+            checkpoint[name] = value
+    assert not any("qkv_proj" in key for key in checkpoint)
+    assert any(key.endswith("attn.to_k.weight") for key in checkpoint)
+
+    model.load_weights(checkpoint)
+
+    for name, parameter in model.named_parameters():
+        if ".ff." in name:
+            continue
+        torch.testing.assert_close(parameter, checkpoint[name].to(parameter.dtype), rtol=0, atol=0)

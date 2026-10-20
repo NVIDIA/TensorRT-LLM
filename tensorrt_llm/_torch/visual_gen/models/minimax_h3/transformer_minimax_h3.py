@@ -129,16 +129,12 @@ class MiniMaxH3Attention(Attention):
         model_config: DiffusionModelConfig,
         layer_idx: int,
         module_name: str,
-        enable_sequence_parallel: bool = True,
     ) -> None:
         vgm = model_config.visual_gen_mapping
         ulysses_size = vgm.ulysses_size if vgm is not None else 1
         # With ulysses_size > 1 and parallel.async_ulysses, use separate Q/K/V projections so
-        # each one is pushed to the peers while the next is computed (forward_async). Attention
-        # built with enable_sequence_parallel=False keeps the fused projection.
-        use_async_ulysses = bool(
-            enable_sequence_parallel and ulysses_size > 1 and model_config.parallel.async_ulysses
-        )
+        # each one is pushed to the peers while the next is computed (forward_async).
+        use_async_ulysses = bool(ulysses_size > 1 and model_config.parallel.async_ulysses)
         super().__init__(
             hidden_size=hidden_size,
             num_attention_heads=num_attention_heads,
@@ -155,7 +151,6 @@ class MiniMaxH3Attention(Attention):
             config=model_config,
             layer_idx=layer_idx,
             module_name=module_name,
-            enable_sequence_parallel=enable_sequence_parallel,
             async_ulysses=use_async_ulysses,
             separate_qkv_is_self_attention=True,
         )
@@ -206,11 +201,6 @@ class MiniMaxH3Attention(Attention):
         computed: V, then Q and K with their per-head norm and RoPE, run on the
         compute stream while the previous tensor's push runs on the side stream
         (``UlyssesAttention.forward_async``)."""
-        if not hasattr(self.attn, "forward_async"):
-            raise ValueError(
-                "MiniMaxH3Attention.forward_async requires a UlyssesAttention built with "
-                "async_ulysses=True (ParallelConfig(ulysses_size > 1, async_ulysses=True))."
-            )
         batch_size, sequence_length = hidden_states.shape[:2]
         head_dim = self.head_dim
 
