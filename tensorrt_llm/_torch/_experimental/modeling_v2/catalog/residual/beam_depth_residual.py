@@ -10,10 +10,13 @@ import torch
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 
-#: Block 0's two adds as (branch, residual) scales: (1, sqrt(n - 1)) / sqrt(n) for the
-#: n-th add of the residual stream, n = 2 for the attention add and 3 for the feed-forward.
+#: A block's two adds as (branch, residual) scales: (1, sqrt(n - 1)) / sqrt(n) for the n-th
+#: add of the residual stream. Block i's attention add is n = 2(i + 1) and its feed-forward
+#: add the next one: n = 2 and 3 for block 0, n = 8 and 9 for block 3.
 _ATTENTION_ADD = (1.0 / math.sqrt(2.0), math.sqrt(1.0) / math.sqrt(2.0))
 _FEED_FORWARD_ADD = (1.0 / math.sqrt(3.0), math.sqrt(2.0) / math.sqrt(3.0))
+_BLOCK3_ATTENTION_ADD = (1.0 / math.sqrt(8.0), math.sqrt(7.0) / math.sqrt(8.0))
+_BLOCK3_FEED_FORWARD_ADD = (1.0 / math.sqrt(9.0), math.sqrt(8.0) / math.sqrt(9.0))
 
 _HIDDEN = dict(hidden=5120, dtype=torch.bfloat16)
 
@@ -40,6 +43,14 @@ class BeamDepthResidual(OpWrapper):
         Cell(
             why="block 0 feed-forward add, 129 tokens: the longest context",
             spec=dict(_HIDDEN, tokens=129, scales=_FEED_FORWARD_ADD),
+        ),
+        Cell(
+            why="block 3 attention add, 17 tokens",
+            spec=dict(_HIDDEN, tokens=17, scales=_BLOCK3_ATTENTION_ADD),
+        ),
+        Cell(
+            why="block 3 feed-forward add, 17 tokens",
+            spec=dict(_HIDDEN, tokens=17, scales=_BLOCK3_FEED_FORWARD_ADD),
         ),
     )
 

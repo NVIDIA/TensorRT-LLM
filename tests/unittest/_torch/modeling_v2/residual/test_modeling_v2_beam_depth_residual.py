@@ -8,11 +8,11 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.beam.dense_block_bf16__sm_103__tp1.ops.residual.beam_depth_residual import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.residual.beam_depth_residual import (
     beam_depth_residual as op,
 )
 
-__extra_import_path__ = ["../../../.."]
+__extra_import_path__ = [".."]
 from _validating import certifying, validating  # noqa: E402,F401 — path above; fixture by name
 
 assert torch.cuda.is_available(), "beam_depth_residual requires a CUDA device"
@@ -39,11 +39,18 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — pytest res
 
 
 def test_scales_are_the_source_depth_coefficients() -> None:
-    """The cells carry block 0's coefficients: the n-th residual add scales by
-    (1, sqrt(n - 1)) / sqrt(n), n = 2 for attention and 3 for the feed-forward."""
+    """The cells carry blocks 0 and 3's coefficients: the n-th residual add scales by
+    (1, sqrt(n - 1)) / sqrt(n); block i's attention add is n = 2(i + 1), its feed-forward
+    add n = 2(i + 1) + 1."""
     scales = {cell.why.split(",")[0]: cell.spec["scales"] for cell in op.CELLS}
     assert scales["block 0 attention add"] == (1 / math.sqrt(2), 1 / math.sqrt(2))
     assert scales["block 0 feed-forward add"] == (1 / math.sqrt(3), math.sqrt(2) / math.sqrt(3))
+    assert scales["block 3 attention add"] == (1 / math.sqrt(8), math.sqrt(7) / math.sqrt(8))
+    assert scales["block 3 feed-forward add"] == (1 / 3, math.sqrt(8) / 3)
+    for block, (attention, feed_forward) in ((0, (2, 3)), (3, (8, 9))):
+        for kind, n in (("attention", attention), ("feed-forward", feed_forward)):
+            branch, residual = scales[f"block {block} {kind} add"]
+            assert (branch, residual) == (1 / math.sqrt(n), math.sqrt(n - 1) / math.sqrt(n))
 
 
 def test_fused_fp32_add_is_a_different_answer() -> None:

@@ -56,6 +56,12 @@ import tensorrt_llm._torch.models.modeling_beam as builtin_beam
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.activation.flashinfer_silu_and_mul import (  # noqa: E501
     flashinfer_silu_and_mul,
 )
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.beam_neox_rope import (
+    beam_neox_rope,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.beam_output_gate import (
+    beam_output_gate,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.thop_attention import (
     thop_attention,
 )
@@ -63,20 +69,15 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.cublas_mm import
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.flashinfer_rmsnorm import (
     flashinfer_rmsnorm,
 )
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.residual.beam_depth_residual import (
+    beam_depth_residual,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.beam import _sliding_attention
 from tensorrt_llm._torch._experimental.modeling_v2.models.beam.dense_block_bf16__sm_103__tp1 import (  # noqa: E501
     block as block_module,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.beam.dense_block_bf16__sm_103__tp1.block import (  # noqa: E501
     BeamDenseBlockBf16Sm103Tp1,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.models.beam.dense_block_bf16__sm_103__tp1.ops.attention.beam_neox_rope import (  # noqa: E501
-    beam_neox_rope,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.models.beam.dense_block_bf16__sm_103__tp1.ops.attention.beam_output_gate import (  # noqa: E501
-    beam_output_gate,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.models.beam.dense_block_bf16__sm_103__tp1.ops.residual.beam_depth_residual import (  # noqa: E501
-    beam_depth_residual,
 )
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.metadata import KVCacheParams
@@ -493,6 +494,8 @@ def replay(
     w = dict(blk.checkpoint_tensors())
     positions = src["positions"].view(length).cuda()
     step = blk.step_args(md)
+    # Logical block 0 is the manager's local slot 0: the core call indexes the slot.
+    assert step["local_layer_idx"] == md.kv_cache_manager.layer_offsets[LAYER_IDX] == 0
 
     def flat(name: str, width: int) -> torch.Tensor:
         # Dense row-major: the GEMM and norm entries read their input that way.
@@ -551,13 +554,12 @@ def replay(
     core = thop_attention(
         q=qkv,
         output=core,
-        local_layer_idx=LAYER_IDX,
         num_heads=heads,
         num_kv_heads=kv_heads,
         head_size=d,
         attention_window_size=BLOCK_CONFIG["sliding_window"],
         **step,
-        **block_module._CALL_CONSTANTS,
+        **_sliding_attention.CALL_CONSTANTS,
     )
     # No rule of its own: the attention core is judged through the attention module below.
     out.append(check("attention_core", None, core, "attention_core"))
@@ -1031,6 +1033,12 @@ def test_forward_runs_the_component_path(seed, length, ieee_fp32) -> None:
                 out = blk(x, positions, md)
                 torch.cuda.synchronize()
         keys, values = cache_rows(md, length)
+        mgr = md.kv_cache_manager
+        cache_mapping = {
+            "layer_offsets": dict(mgr.layer_offsets),
+            "num_local_layers": mgr.num_local_layers,
+            "num_layers": mgr.num_layers,
+        }
     events = prof.events()
     kernels = [e.name for e in events if e.device_type == torch.autograd.DeviceType.CUDA]
     cpu_ops = sorted({e.name for e in events if e.device_type == torch.autograd.DeviceType.CPU})
@@ -1047,7 +1055,7 @@ def test_forward_runs_the_component_path(seed, length, ieee_fp32) -> None:
         "cuda_kernels": kernels,
         "attention_kernels": [k for k in kernels if _ATTENTION_KERNEL.search(k)],
         "sdpa_cpu_ops": [n for n in cpu_ops if _SDPA_OPS.search(n)],
-        "kv_cache": dict(KV_CACHE, manager=type(md.kv_cache_manager).__name__),
+        "kv_cache": dict(KV_CACHE, manager=type(md.kv_cache_manager).__name__, **cache_mapping),
         "environment": _environment(ieee_fp32),
     }
     _write_evidence(f"path-seed{seed}-T{length}", record)
@@ -1068,6 +1076,9 @@ def test_forward_runs_the_component_path(seed, length, ieee_fp32) -> None:
     assert call["num_contexts"] == 1 and call["num_ctx_tokens"] == length
     assert call["use_paged_context_fmha"] is False and call["quant_mode"] == 0
     assert isinstance(md.kv_cache_manager, KVCacheManagerV2)
+    # Logical block 0 in a one-layer manager: slot 0, which the core call indexes.
+    assert cache_mapping == {"layer_offsets": {0: 0}, "num_local_layers": 1, "num_layers": 1}
+    assert call["local_layer_idx"] == 0
     assert record["attention_kernels"], "no attention kernel ran on the GPU"
     assert not record["sdpa_cpu_ops"], record["sdpa_cpu_ops"]
     assert torch.cuda.get_device_capability(x.device) == SM

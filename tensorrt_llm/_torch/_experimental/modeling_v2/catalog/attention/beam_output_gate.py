@@ -8,7 +8,7 @@ import torch
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 
-#: Block 0's gate: 48 heads of 128, bf16.
+#: Block 0's gate: 48 heads of 128, bf16. Block 3's gate has the same geometry.
 _BLOCK0 = dict(num_heads=48, head_dim=128, dtype=torch.bfloat16)
 
 

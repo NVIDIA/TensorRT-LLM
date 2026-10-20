@@ -9,6 +9,7 @@ import torch
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 
 #: Block 0's sliding-attention layer: 48 q heads and 8 kv heads of 128, theta 10000, factor 1.
+#: Block 3's sliding-attention layer has the same geometry and RoPE parameters.
 _BLOCK0 = dict(
     num_heads=48, num_kv_heads=8, head_dim=128, theta=10000.0, factor=1.0, dtype=torch.bfloat16
 )

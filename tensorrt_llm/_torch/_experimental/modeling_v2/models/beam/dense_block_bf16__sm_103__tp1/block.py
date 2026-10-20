@@ -6,8 +6,9 @@ A component, not a routed target. There is no ``routing.py``, no router-index en
 no ``ForCausalLM``: nothing in the engine builds this class, and it serves no request.
 A caller constructs it from the checkpoint's configuration, loads the block's fifteen
 tensors and runs one fresh BF16 context through it, with the attention batch state
-prepared on a ``KVCacheManagerV2``. The forward is assembled from catalog entries and
-this component's own ``ops/``, and it does not call the built-in Beam modeling.
+prepared on a ``KVCacheManagerV2``. The forward is assembled from catalog entries, with
+the attention sublayer shared with the sparse block component in ``../_sliding_attention.py``,
+and it does not call the built-in Beam modeling.
 
 The block::
 
@@ -37,20 +38,16 @@ from torch import nn
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.activation.flashinfer_silu_and_mul import (  # noqa: E501
     flashinfer_silu_and_mul,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.thop_attention import (
-    STANDARD,
-    thop_attention,
-)
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.cublas_mm import cublas_mm
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.flashinfer_rmsnorm import (
     flashinfer_rmsnorm,
 )
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.residual.beam_depth_residual import (
+    beam_depth_residual,
+)
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
-from tensorrt_llm.bindings import DataType
 
-from .ops.attention.beam_neox_rope import beam_neox_rope
-from .ops.attention.beam_output_gate import beam_output_gate
-from .ops.residual.beam_depth_residual import beam_depth_residual
+from .. import _sliding_attention
 
 #: The configuration this component computes, as the checkpoint's config.json states it.
 #: Anything else is rejected at construction rather than computed approximately.
@@ -73,64 +70,6 @@ SUPPORTED_ROPE = {"rope_type": "default", "rope_theta": 10000.0}
 MAX_TOKENS = 129
 
 _SM = (10, 3)
-
-#: thop_attention arguments that do not change with the step on this block: packed q|k|v,
-#: append-and-attend, causal, bf16 pool, no quantization, and RoPE applied before the
-#: call -- the rope_* values are inert placeholders the op requires, not this model's RoPE.
-_CALL_CONSTANTS = dict(
-    k=None,
-    v=None,
-    output_sf=None,
-    is_fused_qkv=True,
-    update_kv_cache=True,
-    predicted_tokens_per_seq=1,
-    attention_input_type=STANDARD,
-    is_mla_enable=False,
-    mask_type=1,
-    q_scaling=1.0,
-    quant_mode=0,
-    kv_scale_orig_quant=None,
-    kv_scale_quant_orig=None,
-    attention_sinks=None,
-    position_embedding_type=0,
-    rotary_inv_freq=None,
-    rotary_cos_sin=None,
-    rope_dim=0,
-    rope_base=10000.0,
-    rope_scale_type=0,
-    rope_scale=1.0,
-    rope_short_m_scale=1.0,
-    rope_long_m_scale=1.0,
-    rope_max_positions=1024,
-    rope_original_max_positions=1024,
-    out_scale=None,
-    latent_cache=None,
-    q_pe=None,
-    q_lora_rank=None,
-    kv_lora_rank=None,
-    qk_nope_head_dim=None,
-    qk_rope_head_dim=None,
-    v_head_dim=None,
-    rope_append=None,
-    chunked_prefill_buffer_batch_size=1,
-    attention_chunk_size=None,
-    softmax_stats_tensor=None,
-    sparse_kv_indices=None,
-    sparse_kv_offsets=None,
-    sparse_attn_indices=None,
-    sparse_attn_offsets=None,
-    sparse_attn_indices_block_size=0,
-    mrope_rotary_cos_sin=None,
-    mrope_position_deltas=None,
-    helix_position_offsets=None,
-    helix_is_inactive_rank=None,
-    cross_kv=None,
-    relative_attention_bias=None,
-    relative_attention_max_distance=0,
-    kv_norm_weight=None,
-    kv_norm_eps=1e-6,
-    skip_correction_threshold=0.0,
-)
 
 
 def weight_shapes(config) -> "OrderedDict[str, tuple[int, ...]]":
@@ -206,9 +145,10 @@ class BeamDenseBlockBf16Sm103Tp1(nn.Module):
     ``forward(hidden_states [1, T, 5120] bf16, position_ids [1, T], attn_metadata)``
     returns ``[1, T, 5120]`` bf16 for 1 <= T <= 129, positions ``arange(T)`` and a
     prepared ``TrtllmAttentionMetadata`` holding exactly that one context request on a
-    single-layer BF16 ``KVCacheManagerV2`` (8 kv heads of 128, no cached prefix). Inputs
-    outside that are rejected before any kernel runs; decode, cached prefixes, chunked
-    prefill, batches and other blocks are not computed here.
+    single-layer BF16 ``KVCacheManagerV2`` (8 kv heads of 128, no cached prefix) that
+    holds logical layer 0. Inputs outside that are rejected before any kernel runs;
+    decode, cached prefixes, chunked prefill, batches and other blocks are not computed
+    here.
     """
 
     def __init__(
@@ -258,158 +198,47 @@ class BeamDenseBlockBf16Sm103Tp1(nn.Module):
         self, hidden_states: torch.Tensor, position_ids: torch.Tensor, md: TrtllmAttentionMetadata
     ) -> None:
         """Raise ValueError on anything this block would otherwise compute wrongly."""
-        if not isinstance(hidden_states, torch.Tensor) or hidden_states.dtype != torch.bfloat16:
-            raise ValueError("hidden_states must be a torch.bfloat16 tensor")
-        if (
-            hidden_states.dim() != 3
-            or hidden_states.shape[0] != 1
-            or hidden_states.shape[2] != self.hidden_size
-        ):
-            raise ValueError(
-                f"hidden_states must be [1, T, {self.hidden_size}], got {tuple(hidden_states.shape)}"
-            )
-        if hidden_states.device != self.input_layernorm.device or not hidden_states.is_contiguous():
-            raise ValueError("hidden_states must be contiguous on the block's device")
-        num_tokens = hidden_states.shape[1]
-        if not 1 <= num_tokens <= MAX_TOKENS:
-            raise ValueError(f"supported context lengths are 1..{MAX_TOKENS}, got {num_tokens}")
-        if (
-            not isinstance(position_ids, torch.Tensor)
-            or position_ids.is_floating_point()
-            or tuple(position_ids.shape) != (1, num_tokens)
-            or position_ids.device != hidden_states.device
-        ):
-            raise ValueError(
-                f"position_ids must be an integer [1, {num_tokens}] tensor on the block's device"
-            )
-        expected = torch.arange(num_tokens, dtype=position_ids.dtype, device=position_ids.device)
-        if not torch.equal(position_ids[0], expected):
-            raise ValueError("a fresh context must have positions 0..T-1")
-        if not isinstance(md, TrtllmAttentionMetadata):
-            raise ValueError(
-                f"attn_metadata must be TrtllmAttentionMetadata, got {type(md).__name__}"
-            )
-        mgr = md.kv_cache_manager
-        if mgr is None:
-            raise ValueError("attn_metadata needs a KV cache manager for the paged append")
-        if md.num_seqs != 1 or md.num_contexts != 1 or md.num_ctx_tokens != num_tokens:
-            raise ValueError(
-                f"one context request of {num_tokens} tokens is supported; metadata has "
-                f"{md.num_seqs} sequences, {md.num_contexts} contexts, {md.num_ctx_tokens} context tokens"
-            )
-        if (
-            int(md.kv_lens_runtime[0]) != num_tokens
-            or int(md.prompt_lens_cpu_runtime[0]) != num_tokens
-        ):
-            raise ValueError(
-                "a cached prefix is not supported: the request must start at an empty cache"
-            )
-        if (
-            md.use_paged_context_fmha
-            or md.is_cross
-            or md.is_spec_decoding_enabled
-            or md.beam_width != 1
-        ):
-            raise ValueError(
-                "paged-context FMHA, cross attention, speculative decoding and beams are not supported"
-            )
-        heads = getattr(mgr, "num_kv_heads_per_layer", None) or [None]
-        if (
-            mgr.dtype != DataType.BF16
-            or heads[self.layer_idx] != self.num_kv_heads
-            or mgr.head_dim != self.head_dim
-        ):
-            raise ValueError(
-                f"the KV cache must be BF16 with {self.num_kv_heads} kv heads of {self.head_dim}; "
-                f"got {mgr.dtype}, {heads}, head_dim {mgr.head_dim}"
-            )
+        _sliding_attention.check_step(
+            hidden_states,
+            position_ids,
+            md,
+            layer_idx=self.layer_idx,
+            hidden_size=self.hidden_size,
+            num_kv_heads=self.num_kv_heads,
+            head_dim=self.head_dim,
+            device=self.input_layernorm.device,
+            max_tokens=MAX_TOKENS,
+        )
 
     @property
     def hidden_size(self) -> int:
         return self._shapes["input_layernorm.weight"][0]
 
-    @staticmethod
-    def step_args(md: TrtllmAttentionMetadata) -> dict:
+    def step_args(self, md: TrtllmAttentionMetadata) -> dict:
         """Project the prepared metadata onto thop_attention's explicit batch state."""
-        return dict(
-            sequence_length=md.kv_lens_cuda_runtime,
-            host_past_key_value_lengths=md.kv_lens_runtime,
-            host_total_kv_lens=md.host_total_kv_lens,
-            context_lengths=md.prompt_lens_cuda_runtime,
-            host_context_lengths=md.prompt_lens_cpu_runtime,
-            host_request_types=md.host_request_types_runtime,
-            kv_cache_block_offsets=md.kv_cache_block_offsets,
-            host_kv_cache_pool_pointers=md.host_kv_cache_pool_pointers,
-            host_kv_cache_pool_mapping=md.host_kv_cache_pool_mapping,
-            workspace_=md.effective_workspace,
-            tokens_per_block=md.tokens_per_block,
-            max_num_requests=md.max_num_requests,
-            max_context_length=md.max_context_length,
-            max_seq_len=md.max_seq_len,
-            num_contexts=md.num_contexts,
-            num_ctx_tokens=md.num_ctx_tokens,
-            trtllm_gen_jit_warmup=md.trtllm_gen_jit_warmup,
-            use_paged_context_fmha=md.use_paged_context_fmha,
-            beam_width=md.effective_beam_width,
-            cache_indirection=md.cache_indirection,
-            block_ids_per_seq=md.block_ids_per_seq,
-            max_context_q_len_override=md.max_context_q_len_override,
-            is_cross=md.is_cross,
-            is_spec_decoding_enabled=md.is_spec_decoding_enabled,
-            use_spec_decoding=md.use_spec_decoding,
-            is_spec_dec_tree=md.is_spec_dec_tree,
-            spec_decoding_generation_lengths=md.spec_decoding_generation_lengths,
-            spec_decoding_position_offsets_for_cpp=md.spec_decoding_position_offsets_for_cpp,
-            spec_decoding_packed_mask=md.spec_decoding_packed_mask,
-            spec_decoding_bl_tree_mask_offset=md.spec_decoding_bl_tree_mask_offset,
-            spec_decoding_bl_tree_mask=md.spec_decoding_bl_tree_mask,
-            spec_decoding_target_max_draft_tokens=md.max_total_draft_tokens,
-            spec_bl_tree_first_sparse_mask_offset_kv=md.spec_bl_tree_first_sparse_mask_offset_kv,
-            num_sparse_topk=md.num_sparse_topk,
-            flash_mla_tile_scheduler_metadata=md.flash_mla_tile_scheduler_metadata,
-            flash_mla_num_splits=md.flash_mla_num_splits,
-            max_num_sequences=md.max_num_sequences,
-            force_prepare_spec_dec_tree_mask=md.force_prepare_spec_dec_tree_mask,
-        )
+        return _sliding_attention.step_args(md, self.layer_idx)
 
     def attention(self, h: torch.Tensor, positions: torch.Tensor, step: dict) -> torch.Tensor:
         """Normalized input [T, hidden] -> attention output [T, hidden], before post_attention_layernorm."""
-        num_tokens = h.shape[0]
-        heads, kv_heads, d = self.num_heads, self.num_kv_heads, self.head_dim
-        q = cublas_mm(h, self.self_attn_q_proj.t())
-        k = cublas_mm(h, self.self_attn_k_proj.t())
-        v = cublas_mm(h, self.self_attn_v_proj.t())
-        gate = cublas_mm(h, self.self_attn_gate_proj.t())
-        q = flashinfer_rmsnorm(q.view(num_tokens * heads, d), self.self_attn_q_norm, self.eps)
-        k = flashinfer_rmsnorm(k.view(num_tokens * kv_heads, d), self.self_attn_k_norm, self.eps)
-        q, k = beam_neox_rope(
-            q.view(num_tokens, heads, d),
-            k.view(num_tokens, kv_heads, d),
+        return _sliding_attention.attention(
+            h,
             positions,
-            self.rope_theta,
-            1.0,
+            step,
+            q_proj=self.self_attn_q_proj,
+            k_proj=self.self_attn_k_proj,
+            v_proj=self.self_attn_v_proj,
+            gate_proj=self.self_attn_gate_proj,
+            o_proj=self.self_attn_o_proj,
+            q_norm=self.self_attn_q_norm,
+            k_norm=self.self_attn_k_norm,
+            gate_bias=self.self_attn_gate_bias,
+            num_heads=self.num_heads,
+            num_kv_heads=self.num_kv_heads,
+            head_dim=self.head_dim,
+            eps=self.eps,
+            rope_theta=self.rope_theta,
+            window=self.window,
         )
-        qkv = torch.cat(
-            (q.view(num_tokens, heads * d), k.view(num_tokens, kv_heads * d), v), dim=-1
-        )
-        core = torch.empty(num_tokens, heads * d, dtype=h.dtype, device=h.device)
-        core = thop_attention(
-            q=qkv,
-            output=core,
-            local_layer_idx=self.layer_idx,
-            num_heads=heads,
-            num_kv_heads=kv_heads,
-            head_size=d,
-            attention_window_size=self.window,
-            **step,
-            **_CALL_CONSTANTS,
-        )
-        gated = beam_output_gate(
-            core.view(num_tokens, heads, d),
-            gate.view(num_tokens, heads, d),
-            self.self_attn_gate_bias,
-        )
-        return cublas_mm(gated.view(num_tokens, heads * d), self.self_attn_o_proj.t())
 
     def feed_forward(self, h: torch.Tensor) -> torch.Tensor:
         """Normalized input [T, hidden] -> dense SwiGLU output [T, hidden], before its post-norm."""
