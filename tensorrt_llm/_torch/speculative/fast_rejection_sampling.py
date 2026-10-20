@@ -38,14 +38,26 @@ Verify (``K`` stored proposals + ``K + 1`` target rows per request):
      ``[K + 1]`` output row (accepted drafts, the drawn token, ``-1`` padding).
 
 Semantics are flashinfer's ``AdvancedSamplingMode.NO_TOPK_NO_TOPP`` path (temperature-only
-softmax, ``chain_speculative_sampling``, ``sampling_from_probs``), including its random
-stream: every launch draws from Philox4x32-10 keyed by element 0 of the seed / offset tensors
-with the launch row as the subsequence, and consumes the draws in the same order (accept test
-``i`` uses draw ``i``; the residual uses draw ``K + 1`` after a rejection, ``K`` after full
-acceptance; the draft draw is draw 0 of row ``b * K + i`` at offset + 1). Given the same seed
-and offset the decisions and tokens therefore equal the reference ones, except where a float
-sum computed in a different order straddles a threshold (the mass sums and the softmax
-denominator are reduced per chunk here and per block there).
+softmax, ``chain_speculative_sampling``, ``sampling_from_probs``) with cuRAND's Philox4x32-10
+draws (``curand_init(seed, subsequence, offset)`` + ``curand_uniform``), assigned so that no
+uniform is ever used twice for one request:
+
+* each request uses its own seed and offset (``seed[b]``, ``offset[b]``; flashinfer reads
+  element 0 for every row, so a request's stream follows whichever request is in row 0 and can
+  revisit words it already used when that request changes);
+* the verify of request ``b`` (subsequence ``b``) uses draw ``i`` for accept test ``i`` and
+  draw ``K`` for the residual or bonus token: ``K + 1`` words, exactly the
+  ``max_draft_len + 1`` window ``_populate_request_rng_state`` advances the offset by per step
+  (flashinfer's residual after a rejection is draw ``K + 1``, the next step's draw 0);
+* the draft draws (draw 0 of subsequence ``b * K + i`` at offset + 1) use the key
+  ``seed ^ DRAFT_KEY_XOR``, so they never coincide with a verify draw (same key, subsequence
+  ``b * K + i == b'``, word offset + 1 = accept test 1 of request ``b'``).
+
+The accept decisions therefore equal ``chain_speculative_sampling``'s given the same seed and
+offset, and every drawn token equals flashinfer's inverse-CDF rule applied to that draw, except
+where a float sum computed in a different order straddles a threshold (the mass sums and the
+softmax denominator are reduced per chunk here and per block there). Logits of ``-inf``
+(masked tokens) get probability 0, including chunks with no finite logit.
 
 Everything is static-shaped and host-sync free, so it captures into CUDA graphs. All
 reductions run in a fixed order (no atomics), so every tensor-parallel rank holding the same
@@ -68,6 +80,20 @@ _NUM_WARPS = 8
 # @triton.jit code may only read module globals that are tl.constexpr.
 _U32_TO_UNIFORM_SCALE = tl.constexpr(2.3283064365386963e-10)
 _U32_TO_UNIFORM_BIAS = tl.constexpr(1.1641532182693481e-10)
+# Philox layout. The kernels draw cuRAND Philox4x32-10 uniforms (curand_init(seed, subsequence,
+# offset) + curand_uniform) so that no uniform is used twice for one request:
+# - Each request uses its own seed[b] and offset[b]. flashinfer reads element 0 for every row, so
+#   there a request's stream follows whichever request is in row 0 and can revisit words it already
+#   used when that request changes.
+# - The verify of request b uses subsequence b: draw i for accept test i and draw K for the
+#   residual or bonus token (flashinfer uses draw K + 1 for the residual after a rejection). These
+#   K + 1 words sit at the start of the request's per-step offset window, which
+#   SpecMetadata._take_rng_window_offsets makes wider than that.
+# - Draft position i of request b uses draw 0 of subsequence b * K + i at word offset + 1, keyed
+#   with seed ^ DRAFT_KEY_XOR. With the plain seed it would be accept test 1 of request
+#   b' = b * K + i.
+DRAFT_KEY_XOR = 0x3C6EF372FE94F82B
+_DRAFT_KEY_XOR = tl.constexpr(DRAFT_KEY_XOR)
 
 
 def fast_rs_enabled() -> bool:
@@ -106,7 +132,9 @@ def _row_max_sum(pmax_ptr, psum_ptr, row, num_chunks, NC_POW2: tl.constexpr):
     m = tl.load(pmax_ptr + row * num_chunks + offs, mask=mask, other=float("-inf"))
     s = tl.load(psum_ptr + row * num_chunks + offs, mask=mask, other=0.0)
     big_m = tl.max(m, 0)
-    scale = tl.where(mask, tl.exp(m - big_m), 0.0)
+    # A chunk with no finite logit has m = -inf and s = 0; keep exp(m - big_m) defined.
+    safe_m = tl.where(big_m == float("-inf"), 0.0, big_m)
+    scale = tl.where(mask, tl.exp(m - safe_m), 0.0)
     big_s = tl.sum(s * scale, 0)
     return big_m, big_s
 
@@ -163,7 +191,9 @@ def _rs_row_stats_kernel(
     )
     x = tl.where(mask, x, float("-inf"))
     m = tl.max(x, 0)
-    s = tl.sum(tl.where(mask, tl.exp(x - m), 0.0), 0)
+    # All -inf (masked) chunk: m stays -inf and the chunk adds nothing (exp(-inf - 0) = 0).
+    safe_m = tl.where(m == float("-inf"), 0.0, m)
+    s = tl.sum(tl.where(mask, tl.exp(x - safe_m), 0.0), 0)
     tl.store(pmax_ptr + row * num_chunks + ch, m)
     tl.store(psum_ptr + row * num_chunks + ch, s)
 
@@ -255,8 +285,8 @@ def _rs_draft_pick_kernel(
     row = tl.program_id(0).to(tl.int64)
     req = row // rows_per_req
     step = step0 + row % rows_per_req
-    seed = tl.load(seed_ptr)
-    offset = tl.load(offset_ptr) + step_offset
+    seed = tl.load(seed_ptr + req) ^ _DRAFT_KEY_XOR
+    offset = tl.load(offset_ptr + req) + step_offset
     # The block sampler's row (request-major, K per request) is the Philox subsequence; a
     # per-step launch (Markov feedback chain) keeps the same stream for each draft position.
     u = _curand_uniform(seed, offset, req * steps_total + step, 0)
@@ -372,8 +402,8 @@ def _rs_verify_resid_kernel(
 ):
     req = tl.program_id(0).to(tl.int64)
     ch = tl.program_id(1)
-    seed = tl.load(seed_ptr)
-    offset = tl.load(offset_ptr)
+    seed = tl.load(seed_ptr + req)
+    offset = tl.load(offset_ptr + req)
     slot = tl.load(slot_ptr + req)
     is_pad = slot == dummy_row
     pos = _rs_accept_pos(
@@ -446,15 +476,15 @@ def _rs_verify_pick_kernel(
     KP1_POW2: tl.constexpr,
 ):
     req = tl.program_id(0).to(tl.int64)
-    seed = tl.load(seed_ptr)
-    offset = tl.load(offset_ptr)
+    seed = tl.load(seed_ptr + req)
+    offset = tl.load(offset_ptr + req)
     slot = tl.load(slot_ptr + req)
     is_pad = slot == dummy_row
     pos = tl.load(pos_ptr + req)
     has_draft = pos < num_draft
-    # Draws 0..pos (accept loop) and pos+1..K (flashinfer keeps drawing for its stats) precede
-    # the residual draw.
-    u = _curand_uniform(seed, offset, req, num_draft + has_draft.to(tl.int64))
+    # Draw K, after the accept draws 0..K-1, for the residual and the bonus token alike: the
+    # step then uses K + 1 words, the per-step offset window (see the module docstring).
+    u = _curand_uniform(seed, offset, req, num_draft)
     total = 0.0
     for k in range(num_chunks):
         total = total + tl.load(rsum_ptr + req * num_chunks + k)
@@ -495,10 +525,13 @@ def _rs_verify_pick_kernel(
 class FastRejectionWorkspace:
     """Grow-only scratch buffers, one flat allocation per name. Smaller shapes are views of the
     same storage, so a buffer first sized by the largest CUDA-graph batch keeps one stable
-    address for every captured batch size and for eager steps."""
+    address for every captured batch size and for eager steps. A buffer outgrown later (an
+    eager step or a capture larger than any before) is retired, never freed: graphs captured
+    with it keep reading and writing its address."""
 
     def __init__(self):
         self._bufs = {}
+        self._retired = []
 
     def get(
         self, name: str, shape: Tuple[int, ...], dtype: torch.dtype, device: torch.device
@@ -509,6 +542,8 @@ class FastRejectionWorkspace:
         key = (name, dtype, torch.device(device))
         buf = self._bufs.get(key)
         if buf is None or buf.numel() < numel:
+            if buf is not None:
+                self._retired.append(buf)
             buf = torch.empty((max(numel, 1),), dtype=dtype, device=device)
             self._bufs[key] = buf
         return buf[:numel].view(shape)
@@ -578,6 +613,7 @@ def _draft_rows(
     rows, vocab = logits.shape
     num_gens = slot_ids.shape[0]
     rows_per_req = rows // num_gens
+    _check_request_args(temperatures, slot_ids, seed, offset, num_gens, num_gens)
     nc, nc_pow2 = _num_chunks(vocab)
     # Per (row, chunk): online max and sum of exp(x / T - max).
     pmax, psum = _row_stats(
@@ -641,6 +677,23 @@ def _check_draft_args(logits: torch.Tensor, draft_probs: torch.Tensor) -> None:
     assert draft_probs.shape[2] == logits.shape[-1]
 
 
+def _check_request_args(
+    temperatures: torch.Tensor,
+    slot_ids: torch.Tensor,
+    seed: torch.Tensor,
+    offset: torch.Tensor,
+    num_temps: int,
+    num_gens: int,
+) -> None:
+    """The kernels index ``temperatures[r]``, ``slot_ids[b]``, ``seed[b]`` and ``offset[b]``
+    directly (int64 slot ids keep ``slot * stride`` in 64 bits)."""
+    assert temperatures.dtype == torch.float32 and temperatures.stride(0) == 1
+    assert temperatures.numel() >= num_temps
+    for t in (slot_ids, seed, offset):
+        assert t.dtype == torch.int64 and t.dim() == 1 and t.stride(0) == 1
+        assert t.numel() >= num_gens
+
+
 def fast_rs_draft_block(
     logits: torch.Tensor,
     temperatures: torch.Tensor,
@@ -660,8 +713,9 @@ def fast_rs_draft_block(
         dummy_row: slot of CUDA-graph padding requests (their logits are treated as zeros);
             ``-1`` when there is none.
         draft_probs: ``[slots, max_draft_len, vocab]`` fp32; rows ``[slot, 0:K, :]`` are written.
-        seed, offset: int64 tensors; element 0 keys the Philox stream (flashinfer semantics).
-        step_offset: added to ``offset[0]`` (1 for the block draft sampler).
+        seed, offset: ``[num_gens]`` int64 per-request Philox seed and offset (the draft stream
+            is keyed ``seed[b] ^ DRAFT_KEY_XOR``).
+        step_offset: added to ``offset[b]`` (1 for the block draft sampler).
     Returns:
         ``[num_gens * K]`` int32 tokens, distributed as ``softmax(logits / T)``.
     """
@@ -783,7 +837,7 @@ def fast_rs_verify(
         slot_ids: ``[num_gens]`` int64 ``draft_probs`` slot of each request.
         dummy_row: slot of CUDA-graph padding requests (their logits are treated as zeros).
         draft_probs: ``[slots, >= K, vocab]`` fp32 proposals stored by the previous draft step.
-        seed, offset: int64 tensors; element 0 keys the Philox stream (flashinfer semantics).
+        seed, offset: ``[num_gens]`` int64 per-request Philox seed and offset.
     Returns:
         ``accepted_tokens [num_gens, K + 1]`` int32 (accepted drafts, the drawn token, then
         ``-1``) and ``num_accepted [num_gens]`` int32 (accepted drafts + 1).
@@ -800,6 +854,7 @@ def fast_rs_verify(
     assert draft_probs.dtype == torch.float32 and draft_probs.stride(2) == 1
     assert draft_probs.shape[2] == vocab and draft_probs.shape[1] >= k
     assert draft_tokens.stride(1) == 1
+    _check_request_args(temperatures, slot_ids, seed, offset, rows, num_gens)
     nc, nc_pow2 = _num_chunks(vocab)
     # Row statistics of the K + 1 target rows.
     pmax, psum = _row_stats(logits, temperatures, 1, slot_ids, dummy_row, k + 1, "target")
