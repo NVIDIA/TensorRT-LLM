@@ -50,6 +50,7 @@ import contextlib
 import functools
 import importlib
 import os
+import tempfile
 import threading
 import time
 from collections import defaultdict
@@ -621,7 +622,7 @@ def install_host_timers(executor) -> None:
     state = _HostTimers(
         lo,
         hi,
-        os.environ.get("TRTLLM_HOST_TIMERS_OUT", "/tmp"),
+        os.environ.get("TRTLLM_HOST_TIMERS_OUT", tempfile.gettempdir()),
         _rank(),
         os.environ.get("TRTLLM_HOST_TIMERS_BY_BATCH") == "1",
     )

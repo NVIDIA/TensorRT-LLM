@@ -46,6 +46,7 @@ Enabled by ``TRTLLM_Q35_MOE_FUSED_FRONT=1`` (default off).
 """
 
 import os
+import tempfile
 from typing import Optional, Tuple
 
 import torch
@@ -2926,7 +2927,8 @@ def _q35_stats_dump():
 
     rank = os.environ.get("OMPI_COMM_WORLD_RANK", os.environ.get("SLURM_PROCID", "0"))
     path = os.environ.get(
-        "TRTLLM_Q35_MOE_STATS_PATH", "/tmp/q35_moe_stats_rank{rank}.json"
+        "TRTLLM_Q35_MOE_STATS_PATH",
+        os.path.join(tempfile.gettempdir(), "q35_moe_stats_rank{rank}.json"),
     ).replace("{rank}", str(rank))
     out = {"ep_sizes": list(_Q35_STATS_EP), "layers": {}}
     for dev, st in _q35_stats.items():
