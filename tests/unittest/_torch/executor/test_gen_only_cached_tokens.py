@@ -3,7 +3,7 @@
 """``cached_tokens`` for disaggregated generation-only requests.
 
 A generation-only request never takes the context branch of
-``_prepare_tp_inputs`` on the generation worker, so
+``DecoderInputPreparer._pack_context_requests`` on the generation worker, so
 ``PyExecutor._prepare_disagg_gen_resources`` latches ``cached_tokens`` from
 ``prepopulated_prompt_len`` right after allocation. Driven by a real
 ``LlmRequest`` so the C++ ``prepopulated_prompt_len`` and the Python set-once
