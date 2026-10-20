@@ -1112,14 +1112,17 @@ def _align(t):
     return t.data_ptr() % 16
 
 
-def _layout_key(t):
-    return (tuple(t.shape), tuple(t.stride()), t.dtype)
+def _layout_key(t, *, dynamic_dim=None, dynamic_stride=None):
+    """Keep only layout properties that specialize the convolution."""
+    shape = tuple(None if i == dynamic_dim else n for i, n in enumerate(t.shape))
+    stride = tuple(None if i == dynamic_stride else s for i, s in enumerate(t.stride()))
+    return (shape, stride, t.dtype)
 
 
 @cache
 def compile_prefill_conv(
     device: torch.device,
-    layouts: tuple[tuple[tuple[int, ...], tuple[int, ...], torch.dtype], ...],
+    layouts: tuple[tuple[tuple[int | None, ...], tuple[int | None, ...], torch.dtype], ...],
     tokens_per_warp: int,
     unroll: int,
     depth: int,
@@ -1140,9 +1143,17 @@ def compile_prefill_conv(
             torch.int32: (cutlass.Int32, 4),
             torch.bool: (cutlass.Boolean, 1),
         }
+        tokens, batch, pool, offsets = (cute.sym_int() for _ in range(4))
+        # starts has B + 1 entries; its length is validated by the caller.
+        extents = (tokens, None, pool, offsets, batch, batch, tokens, tokens, tokens)
         args = [
-            make_fake_tensor(dtypes[dtype][0], shape, stride=stride, assumed_align=dtypes[dtype][1])
-            for shape, stride, dtype in layouts
+            make_fake_tensor(
+                dtypes[dtype][0],
+                tuple(extent if n is None else n for n in shape),
+                stride=tuple(cute.sym_int() if s is None else s for s in stride),
+                assumed_align=dtypes[dtype][1],
+            )
+            for (shape, stride, dtype), extent in zip(layouts, extents)
         ]
         op = KdaConv(
             layouts[1][0][0] // 384,
@@ -1241,11 +1252,20 @@ def fused_prefill_conv(src, weight, conv_state, starts, slots, has_init, max_seq
     run_tokens = L * W
     grid_y = min((seqlen_bound + run_tokens - 1) // run_tokens, MAX_GRID_YZ)
     seq_loop = batch > MAX_GRID_YZ  # shape-only choice
-    tensors = (src, weight, conv_state, starts, slots, has_init, q, k, v)
-
+    # Token count, batch size and pool capacity are runtime extents. The
+    # singleton leading output stride also varies with the token count.
+    layouts = (
+        _layout_key(src, dynamic_dim=0),
+        _layout_key(weight),
+        _layout_key(conv_state, dynamic_dim=0),
+        _layout_key(starts, dynamic_dim=0),
+        _layout_key(slots, dynamic_dim=0),
+        _layout_key(has_init, dynamic_dim=0),
+        *(_layout_key(t, dynamic_dim=1, dynamic_stride=0) for t in (q, k, v)),
+    )
     fn = compile_prefill_conv(
         src.device,
-        tuple(_layout_key(t) for t in tensors),
+        layouts,
         L,
         U,
         D,
