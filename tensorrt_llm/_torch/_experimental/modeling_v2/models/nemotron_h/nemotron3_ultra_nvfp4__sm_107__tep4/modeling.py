@@ -35,6 +35,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.thop_attent
     QM_FP8_KV_CACHE,
     thop_attention,
 )
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm.allreduce import allreduce
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.cublas_mm import cublas_mm
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.cublas_scaled_mm import (
     cublas_scaled_mm,
@@ -79,7 +80,6 @@ from tensorrt_llm._torch.models.modeling_utils import DecoderModel, DecoderModel
 from tensorrt_llm.functional import AllReduceStrategy
 
 from . import weights as _weights
-from .ops.comm.allreduce import allreduce
 
 # The certification is per GPU architecture: this code was gated on sm_107 only.
 _SM = (10, 7)

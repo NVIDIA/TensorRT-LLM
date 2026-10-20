@@ -248,7 +248,8 @@ built from entries driven on sm_107 at both targets' call sites:
 * shared, sm_107 only (promoted from tep4 when dep4 arrived):
   `static_quantize_e4m3_per_tensor`, `cublas_scaled_mm`,
   `mamba_chunk_scan_combined`, `selective_state_update`, `rms_norm_gated_grouped`;
-* owned by tep4: `allreduce`.
+* shared with the sm_100 BF16 tep8 target below, certified on sm_107 and sm_100
+  (promoted from tep4 when tep8 arrived): `allreduce`.
 
 What the sm_107 cells surfaced, each written up in its entry:
 
@@ -324,19 +325,21 @@ Entries: `Arch.SM_100` is declared on every shared entry the target calls, each 
 whole on sm_100: `thop_attention`, `cublas_mm`, `flashinfer_rmsnorm`,
 `flashinfer_fused_add_rmsnorm`, `rms_norm_gated_grouped`, `noaux_tc_op`,
 `causal_conv1d_fwd`, `causal_conv1d_update`, `mamba_chunk_scan_combined`,
-`selective_state_update` and the promoted `fused_moe`. The cells added for tep8 -- the
-rank's in_proj, qkv, o_proj and shared-expert GEMM shapes; 8 q / 1 kv head over a bf16
-pool, including rows 4 and 55 of a real `MambaHybridCacheManagerV2`'s 60-row mapping;
-conv, scan and decode-step shapes at 32 heads in one group over an fp32 state pool; one
-group of 2048 for the gated norm; Relu2 over a window of 64 experts -- were driven on
-sm_100 only, so on an entry that also lists sm_103 or sm_107 they are not a claim about
-those.
+`selective_state_update` and the two promoted ones, `fused_moe` and `allreduce`. The
+cells added for tep8 -- the rank's in_proj, qkv, o_proj and shared-expert GEMM shapes;
+8 q / 1 kv head over a bf16 pool, including rows 4 and 55 of a real
+`MambaHybridCacheManagerV2`'s 60-row mapping; conv, scan and decode-step shapes at 32
+heads in one group over an fp32 state pool; one group of 2048 for the gated norm; Relu2
+over a window of 64 experts -- were driven on sm_100 only, so on an entry that also lists
+sm_103 or sm_107 they are not a claim about those.
 
-The target owns two all-reduce entries under its `ops/comm/`, each with a multi-rank
-matrix beside its tests. `allreduce` (the IPC / NCCL sum, `ARCHS` sm_100) runs at 8 ranks
-where the node has 8 GPUs and at 4 where it has 4; it was driven at 4 ranks (one GB200
-node), so the one-shot / two-shot kernels at 8 ranks inside one node -- an HGX B200 --
-are not covered by any run yet. `mnnvl_fusion_allreduce` (the sum, the residual add and
+The target calls two all-reduce entries, each with a multi-rank matrix. `allreduce` (the
+IPC / NCCL sum) is the catalog's, shared with tep4; its matrix sits with the catalog's
+other collectives, runs only on the architectures its `ARCHS` names (sm_100, sm_107) and
+skips elsewhere, and runs at 8 ranks where the node has 8 GPUs and at 4 where it has 4. It
+was driven at 4 ranks (one GB200 node), so the one-shot / two-shot kernels at 8 ranks
+inside one node -- an HGX B200 -- are not covered by any run yet. The target owns the
+other under its `ops/comm/`: `mnnvl_fusion_allreduce` (the sum, the residual add and
 the next RMSNorm in one op over the multicast workspace; `ARCHS` sm_100, NVL72 only) was
 driven at 4 ranks on one GB200 node and at 8 ranks over two: both kernels, told apart by
 the stage count the workspace records rather than by the payload size; exact payloads

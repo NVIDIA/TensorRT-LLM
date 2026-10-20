@@ -28,6 +28,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from typing import Sequence
 
 WORLD_SIZE = 4
 """dep4's world size -- the topology these entries are certified for."""
@@ -36,7 +37,8 @@ _LAUNCHER_GRACE_S = 300
 """Headroom over the entry's own deadline, so its message wins the race."""
 
 
-def _devices() -> str:
+def _devices(world_sizes: Sequence[int] = (WORLD_SIZE,)) -> str:
+    """The first devices for the largest of ``world_sizes`` the visible devices allow."""
     visible = os.environ.get("CUDA_VISIBLE_DEVICES")
     if visible:
         devices = [d for d in visible.split(",") if d.strip()]
@@ -44,11 +46,12 @@ def _devices() -> str:
         import torch
 
         devices = [str(i) for i in range(torch.cuda.device_count())]
-    assert len(devices) >= WORLD_SIZE, (
-        f"this entry is certified at world size {WORLD_SIZE}; only "
+    fits = [w for w in world_sizes if w <= len(devices)]
+    assert fits, (
+        f"this matrix runs at world size {' or '.join(str(w) for w in world_sizes)}; only "
         f"{len(devices)} device(s) are visible"
     )
-    return ",".join(devices[:WORLD_SIZE])
+    return ",".join(devices[: max(fits)])
 
 
 def _load_launcher_constants(launcher: Path):
@@ -65,10 +68,11 @@ def _load_launcher_constants(launcher: Path):
     return module
 
 
-def run(entry: str) -> None:
-    """Run ``_<entry>_op_matrix``'s launcher over ``WORLD_SIZE`` devices."""
+def run(entry: str, world_sizes: Sequence[int] = (WORLD_SIZE,)) -> None:
+    """Run ``_<entry>_op_matrix``'s launcher over ``WORLD_SIZE`` devices, or over the largest
+    of ``world_sizes`` the node has for a matrix that names several."""
     launcher = Path(__file__).resolve().with_name(f"_{entry}_op_matrix.py")
-    env = dict(os.environ, CUDA_VISIBLE_DEVICES=_devices())
+    env = dict(os.environ, CUDA_VISIBLE_DEVICES=_devices(world_sizes))
 
     # The ranks import tensorrt_llm absolutely, and a source checkout is not
     # necessarily installed. tests/unittest/_torch/modeling_v2/comm -> repo root.

@@ -66,9 +66,11 @@ class Allreduce(OpWrapper):
       ascending rank order and rounds once, which is exactly `reference`.
     * TWOSHOT -- reduce-scatter then all-gather inside one kernel, same
       arithmetic as ONESHOT; with fewer rows than ranks it runs ONESHOT.
-    * AUTO -- chosen per call from the op's SM100 table. Which of the three it
-      picks depends on the group size and the row count; the cells below name
-      the kernel each one certifies.
+    * AUTO -- chosen per call from the op's SM100 table, which sm_107 reads
+      too. Which of the three it picks depends on the group size and the row
+      count (measured on sm_107 at four ranks and hidden 8192: ONESHOT up to
+      256 rows, TWOSHOT from 512 to 2048, NCCL from 4096); the cells below
+      name the kernel each one certifies.
 
     ONESHOT, TWOSHOT and AUTO need `workspace`, the engine's IPC buffer table:
     `tensorrt_llm._torch.distributed.ops.get_allreduce_workspace(mapping)`,
@@ -92,11 +94,13 @@ class Allreduce(OpWrapper):
     can see.
     """
 
-    ARCHS = frozenset({Arch.SM_100})
+    ARCHS = frozenset({Arch.SM_100, Arch.SM_107})
 
-    # One all-reduce per layer: the attention o_proj partial, the mamba
-    # out_proj partial, and the MoE latent-plus-shared partial, all bf16
-    # [T, 8192] over the eight TP ranks. The row counts are a decode token, the
+    # One all-reduce per layer of the two Nemotron-3 Ultra TP targets that call
+    # it: the attention o_proj partial, the mamba out_proj partial, and the MoE
+    # latent-plus-shared partial, all bf16 [T, 8192] over the TP ranks -- four
+    # in nemotron3_ultra_nvfp4__sm_107__tep4, eight in
+    # nemotron3_ultra_bf16__sm_100__tep8. The row counts are a decode token, the
     # largest captured decode batch and a full prefill chunk; AUTO adds the
     # middle of its TWOSHOT band, since it changes kernel with T.
     CELLS: tuple[Cell, ...] = (
@@ -128,11 +132,12 @@ class Allreduce(OpWrapper):
     about a third of the elements of a random payload (0.329 to 0.330 on every
     NCCL cell) -- its per-hop bf16 rounding -- and stays inside the
     sequential-summation bound gamma_{n-1} * sum|x_r| (bf16 unit roundoff
-    2^-8), the worst element at 0.90 of it (the 8192-row cell; 0.61 at one
-    row). The custom kernels sit at 0.33 of it. All of this was measured at
-    4 ranks on one GB200 node (sm_100); the 8-rank, one-node case is not
-    covered by any run. On payloads whose partial sums are all exact, every
-    strategy returns the exact sum.
+    2^-8), the worst element at 0.90 of it on sm_100 (the 8192-row cell; 0.61
+    at one row) and at 0.95 on sm_107. The custom kernels sit at 0.33 of it
+    (sm_100). Both architectures were driven at 4 ranks inside one node --
+    sm_100 on a GB200 node, sm_107 over NVLink; the 8-rank, one-node case is
+    not covered by any run. On payloads whose partial sums are all exact,
+    every strategy returns the exact sum.
 
     The one-shot kernel treats a 32-bit word equal to fp32 -0.0 as its
     empty-slot marker and rewrites it to +0.0 on the way in, so a bf16 -0.0 at
@@ -145,6 +150,9 @@ class Allreduce(OpWrapper):
     eager calls between graph replays share it safely (the matrix runs eager
     NCCL, one-shot and two-shot calls between replays of one-shot graphs).
 
+    Measured per call inside a CUDA graph, 4 x sm_107 over NVLink, MPI
+    symbol: NCCL 15 / 16 / 268 us at 1 / 32 / 8192 rows; ONESHOT 3.9 / 6.1
+    us at 1 / 32 rows; TWOSHOT 97 us at 2048 rows. Perf is not gated.
 
     Not certified: other dtypes (allowed by the guard, exercised by nothing),
     MIN_LATENCY / NCCL_SYMMETRIC / UB / LOWPRECISION, the fusion operands

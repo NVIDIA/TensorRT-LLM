@@ -1,6 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU certification matrix for the Nemotron-3 Ultra tep4 target's allreduce entry.
+"""GPU certification matrix for the shared allreduce entry (catalog/comm/allreduce.py).
+
+Its callers are the two Nemotron-3 Ultra TP targets: nemotron3_ultra_nvfp4__sm_107__tep4 at
+four ranks and nemotron3_ultra_bf16__sm_100__tep8 at eight. The entry was owned by each of
+them until the second one arrived; this matrix is the merge of their two, which differed
+only in the world size they ran at.
 
 A collective cannot be exercised in one process, so this script is its own
 launcher: run it plainly and it spawns one worker process per device, with one
@@ -9,7 +14,7 @@ enforces by killing the whole process group. A wedged collective hangs rather
 than raising, so the deadline is what keeps a broken kernel from taking the
 calling run down with it.
 
-    CUDA_VISIBLE_DEVICES=0,1,2,3 python _allreduce_op_matrix.py
+    CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python _allreduce_op_matrix.py   # 4 or 8 devices
 
 The ranks reach the op through the `_pg` symbol on a torch.distributed NCCL
 group, as the other collective matrices do, and set up what the engine's
@@ -19,7 +24,7 @@ with the C++ side (allreduce_pg reads the world group on every call), and
 -- allocates the IPC workspace the ONESHOT / TWOSHOT / AUTO strategies need.
 
 Not a pytest module, despite the `check_*` bodies. They are one fixed sequence
-inside a single 4-rank job rather than independent cases: each reads
+inside a single job over every named device rather than independent cases: each reads
 module-global rank state that only `_run_one_rank` binds. Neither this file's
 name nor its function names match pytest's collection patterns.
 
@@ -49,7 +54,7 @@ assert torch.cuda.is_available(), "allreduce requires CUDA devices"
 _WORKER_FLAG = "--rank-worker"
 DEADLINE_S = 1800
 
-HIDDEN = 8192  # Ultra's hidden size: every all-reduce this target makes is [T, 8192] bf16
+HIDDEN = 8192  # Ultra's hidden size: every all-reduce its targets make is [T, 8192] bf16
 
 # The decode graphs the Ultra accuracy gate captures:
 # CudaGraphConfig(max_batch_size=32, enable_padding=True) gives these seven,
@@ -82,8 +87,8 @@ WORKSPACE: Optional[torch.Tensor] = None
 def _payload(rank: int, rows: int, seed: int) -> torch.Tensor:
     """One rank's contribution, exact: multiples of 1/8 with |x| <= 31/8.
 
-    bf16 holds k/8 exactly for |k| <= 255, and a sum of WORLD of these reaches
-    |k| <= 124, so **every partial sum is exact in every summation order** --
+    bf16 holds k/8 exactly for |k| <= 255, and a sum of WORLD <= 8 of these reaches
+    |k| <= 248, so **every partial sum is exact in every summation order** --
     which is what lets every assertion on these payloads be bitwise, whatever
     order a strategy adds in. Every rank can regenerate every other rank's
     payload (cuRAND is deterministic for a given seed and shape), so the
@@ -128,7 +133,7 @@ def _assert_within_summation_bound(
     Any summation order -- sequential, ring or tree -- rounding to nearest at
     each step lands within gamma_{n-1} * sum|x_r| of the exact sum, gamma_k =
     k*u / (1 - k*u), u = 2^-8 for bf16. The exact sum is formed in float64,
-    where four bf16 values add without rounding.
+    where up to eight bf16 values add without rounding.
     """
     exact = sum(x.double() for x in xs)
     absum = sum(x.double().abs() for x in xs)
@@ -137,6 +142,8 @@ def _assert_within_summation_bound(
     err = (out.double() - exact).abs()
     over = (err > budget).sum().item()
     worst = (err / budget.clamp_min(1e-300)).max().item()
+    if os.environ.get("ALLREDUCE_MATRIX_VERBOSE") == "1" and RANK == 0:
+        print(f"  [bound] {where}: worst element at {worst:.3f} of the bound", flush=True)
     assert over == 0, (
         f"{where}: {over} elements outside the summation bound, worst at {worst:.3f} of it"
     )
@@ -155,7 +162,8 @@ def _assert_kernel_arithmetic(
 
     Discrimination, measured by mutating the run rather than this file: with
     ALL_REDUCE_FUSION_KERNEL_ACC_FP32=0 (the custom kernels add in bf16) the
-    first ONESHOT cell failed on all four ranks with 33.2% of elements wrong;
+    first ONESHOT cell failed on every rank of the 4-rank sm_100 job (one GB200 node) with 33.2% of
+    elements wrong;
     with TRTLLM_ALLREDUCE_FUSION_WORKSPACE_SIZE=4096 (every custom call falls
     back to NCCL) it failed with 32.6% wrong -- against a gate of 0.
     """
@@ -166,6 +174,10 @@ def _assert_kernel_arithmetic(
     else:
         assert kernel == "nccl", kernel
         differs = (out != ref).float().mean().item()
+        if os.environ.get("ALLREDUCE_MATRIX_VERBOSE") == "1" and RANK == 0:
+            print(
+                f"  [nccl] {where}: {differs:.4f} of elements differ from `reference`", flush=True
+            )
         assert differs > 0.05, (
             f"{where}: only {differs:.4f} of elements differ from the fp32 sum rounded once; "
             "that is not NCCL's per-hop rounding -- a different kernel ran"
@@ -616,9 +628,7 @@ def _run_one_rank() -> int:
     # that measurably wedges a watchdog at exit.
     dist.init_process_group("nccl", init_method="env://", device_id=torch.device("cuda", rank))
 
-    from tensorrt_llm._torch._experimental.modeling_v2.models.nemotron_h.nemotron3_ultra_nvfp4__sm_107__tep4.ops.comm import (  # noqa: E501
-        allreduce as entry,
-    )
+    from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm import allreduce as entry
     from tensorrt_llm._torch.distributed import communicator
     from tensorrt_llm._torch.distributed.ops import get_allreduce_workspace
     from tensorrt_llm._utils import torch_pybind11_abi
@@ -652,8 +662,8 @@ def _run_one_rank() -> int:
 
     # A spawned worker, not collected by pytest, so `__extra_import_path__` is
     # not in play; the mutation is confined to these rank processes.
-    # comm -> <target> -> nemotron_h -> models -> modeling_v2, where _validating lives.
-    sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
+    # comm -> modeling_v2, where _validating lives.
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
     from _validating import validating as _validating_cm
 
     validating = _validating_cm
