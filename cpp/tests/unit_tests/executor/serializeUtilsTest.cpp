@@ -100,7 +100,13 @@ TEST(SerializeUtilsTest, ZeroSizeArrayRoundtrip)
 TEST(SerializeUtilsTest, RejectMalformedAgentDescLengths)
 {
     using texec::kv_cache::AgentDesc;
-    EXPECT_THROW(AgentDesc::deserialize(std::string((1U << 20) + 1, '\0')), tensorrt_llm::common::TllmException);
+    constexpr size_t kMiB = 1024 * 1024;
+
+    auto const largeBackend = std::string(2 * kMiB, 'x');
+    auto const largeDesc = AgentDesc::deserialize(AgentDesc{largeBackend}.serialize());
+    EXPECT_EQ(largeDesc.getBackendAgentDesc(), largeBackend);
+
+    EXPECT_THROW(AgentDesc::deserialize(std::string(64 * kMiB + 1, '\0')), tensorrt_llm::common::TllmException);
 
     for (auto const count : {size_t{1} << 32, std::numeric_limits<size_t>::max()})
     {
