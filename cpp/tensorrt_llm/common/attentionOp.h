@@ -255,6 +255,7 @@ public:
         int32_t spec_decoding_max_generation_length = 1;
         int64_t* spec_decoding_bl_tree_mask_offset = nullptr;
         uint32_t* spec_decoding_bl_tree_mask = nullptr;
+        int64_t spec_decoding_bl_tree_mask_capacity = 0;
         int32_t* spec_bl_tree_first_sparse_mask_offset_kv = nullptr;
         // optional when fuse_fp4_quant is enabled
         int32_t start_token_idx_sf = 0;
