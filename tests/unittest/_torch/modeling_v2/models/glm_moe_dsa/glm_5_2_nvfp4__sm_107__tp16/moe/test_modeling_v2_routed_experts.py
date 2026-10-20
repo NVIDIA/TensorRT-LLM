@@ -251,7 +251,7 @@ def _case(tokens: int, seed: int, clear_margin: bool = False) -> dict:
 # ── the call ──────────────────────────────────────────────────────────────
 
 
-def _call(
+def _call_args(
     case: dict,
     *,
     hidden_states: torch.Tensor,
@@ -262,6 +262,7 @@ def _call(
     gemm2_k128: bool,
     do_finalize: bool = False,
     routing_logits=None,
+    output=None,
 ):
     """The target's call, every argument explicit."""
     stack = _stack()
@@ -272,7 +273,7 @@ def _call(
         routing_logits = (
             torch.randn(tokens, EXPERTS, device=DEV) if fused_router else case["logits"]
         )
-    return op(
+    return dict(
         routing_logits=routing_logits,
         routing_bias=case["routing_bias"],
         hidden_states=hidden_states,
@@ -302,7 +303,7 @@ def _call(
         act_type=ACT_TYPE_SWIGLU,
         topk_weights=None,
         topk_ids=None,
-        output=None,
+        output=output,
         tune_max_num_tokens=8192,
         use_dp=False,
         hidden_states_ready_event=None if event is None else event.cuda_event,
@@ -311,6 +312,10 @@ def _call(
         router_workspace=workspace if fused_router else None,
         prefer_gemm2_k128=gemm2_k128,
     )
+
+
+def _call(case: dict, **kwargs):
+    return op(**_call_args(case, **kwargs))
 
 
 def _quantize_aside(case: dict, side: torch.cuda.Stream, delay: bool, out=None):
@@ -377,6 +382,118 @@ def _k128_covers(tokens: int) -> bool:
 
 
 # ── tests ─────────────────────────────────────────────────────────────────
+
+
+_MUTATION_CASES = [
+    pytest.param(False, False, False, id="no_mutable_inputs"),
+    pytest.param(True, False, False, id="workspace"),
+    pytest.param(False, True, False, id="finalized"),
+    pytest.param(False, True, True, id="caller_output"),
+    pytest.param(True, True, True, id="workspace_and_caller_output"),
+]
+
+
+def _mutation_case_args(fused_router, do_finalize, caller_output):
+    case = _case(2, seed=4800)
+    return _call_args(
+        case,
+        hidden_states=case["xq"],
+        hidden_states_scale=case["xsf"],
+        fused_router=fused_router,
+        workspace=make_fused_router_workspace(DEV) if fused_router else None,
+        gemm2_k128=True,
+        do_finalize=do_finalize,
+        routing_logits=case["logits"],
+        output=torch.zeros(2, HIDDEN, device=DEV, dtype=torch.bfloat16) if caller_output else None,
+    )
+
+
+@pytest.mark.parametrize("fused_router,do_finalize,caller_output", _MUTATION_CASES)
+def test_custom_op_mutation_schema_and_fake(
+    fused_router, do_finalize, caller_output, monkeypatch
+) -> None:
+    """Optional mutations and all return modes agree with the registered schema and fake."""
+    args = _mutation_case_args(fused_router, do_finalize, caller_output)
+    # SchemaCheckMode compares every input with allclose, whose float8 CUDA
+    # arithmetic is unsupported. Cast only its comparison operands; the op
+    # must receive the original float8 scales to satisfy its dtype contract.
+    allclose = torch.allclose
+
+    def allclose_with_float8(actual, expected, *comparison_args, **comparison_kwargs):
+        if actual.dtype == expected.dtype == torch.float8_e4m3fn:
+            actual, expected = actual.float(), expected.float()
+        return allclose(actual, expected, *comparison_args, **comparison_kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(torch, "allclose", allclose_with_float8)
+        torch.library.opcheck(
+            torch.ops.trtllm.glm_routed_experts.default,
+            (),
+            args,
+            test_utils=("test_schema",),
+        )
+    torch.library.opcheck(
+        torch.ops.trtllm.glm_routed_experts.default,
+        (),
+        args,
+        test_utils=("test_faketensor",),
+    )
+
+    workspace = args["router_workspace"]
+    epoch = None if workspace is None else workspace[_EPOCH_WORD].item()
+    actual = op(**args)
+    assert isinstance(actual, list)
+    assert len(actual) == (1 if do_finalize else 3)
+    if caller_output:
+        assert actual[0].shape == (0,)
+        # The public result remains an alias-free sentinel; the supplied buffer
+        # contains the same values as a call that allocates its finalized output.
+        expected = op(**{**args, "output": None})[0]
+        torch.testing.assert_close(args["output"], expected, rtol=0, atol=0)
+    elif do_finalize:
+        assert actual[0].shape == (2, HIDDEN)
+    else:
+        assert actual[0].shape[1] == HIDDEN
+        assert actual[1].dtype == torch.bfloat16
+    if workspace is not None:
+        assert workspace[_EPOCH_WORD].item() == epoch + 1 + int(caller_output)
+
+
+@pytest.mark.parametrize("fused_router,do_finalize,caller_output", _MUTATION_CASES)
+def test_custom_op_functionalization(fused_router, do_finalize, caller_output) -> None:
+    """AOT keeps both mutations and subsequent reads, including repeated calls."""
+    eager_args = _mutation_case_args(fused_router, do_finalize, caller_output)
+    compiled_args = dict(eager_args)
+    for name in ("router_workspace", "output"):
+        if eager_args[name] is not None:
+            compiled_args[name] = eager_args[name].clone()
+
+    def run(**args):
+        result = op(**args)
+        if not do_finalize:
+            # Padding rows are uninitialized; only mapped rows have defined values.
+            values = _valid_rows(result)
+        elif caller_output:
+            values = (args["output"].clone(), result[0])
+        else:
+            values = tuple(result)
+        if fused_router:
+            values = (*values, args["router_workspace"][_EPOCH_WORD].clone())
+        return values
+
+    # The unfinalized row capacity depends on an opaque autotuned tile.
+    with torch._dynamo.config.patch(capture_dynamic_output_shape_ops=not do_finalize):
+        compiled = torch.compile(run, backend="aot_eager", fullgraph=True)
+        for launch in (1, 2):
+            expected = run(**eager_args)
+            actual = compiled(**compiled_args)
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+            if caller_output:
+                torch.testing.assert_close(
+                    compiled_args["output"], eager_args["output"], rtol=0, atol=0
+                )
+            if fused_router:
+                assert compiled_args["router_workspace"][_EPOCH_WORD].item() == launch
 
 
 @pytest.mark.parametrize("cell", op.CELLS, ids=[c.why[:44] for c in op.CELLS])

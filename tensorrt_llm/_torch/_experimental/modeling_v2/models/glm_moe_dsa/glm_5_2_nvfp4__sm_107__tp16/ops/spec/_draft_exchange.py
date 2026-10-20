@@ -126,7 +126,8 @@ class DraftExchangeWorkspace:
                 )
             torch.cuda.synchronize()
             state = (handle, buffer, flags)
-        except (RuntimeError, ValueError) as e:
+        except Exception as e:
+            # Every ordinary setup failure must reach the group vote.
             error = e
         if not _all_succeeded(comm, error is None):
             raise RuntimeError(

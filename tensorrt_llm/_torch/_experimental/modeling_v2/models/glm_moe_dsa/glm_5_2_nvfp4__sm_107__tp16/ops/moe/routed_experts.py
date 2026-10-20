@@ -32,7 +32,6 @@ from tensorrt_llm._torch.autotuner import AutoTuner
 from tensorrt_llm._torch.custom_ops.trtllm_gen_custom_ops import (
     FP4BlockScaleMoEInputs,
     FP4BlockScaleMoERunner,
-    fp4_block_scale_fake_output_without_finalize,
     prepare_dummy_topk_and_hook,
 )
 
@@ -180,7 +179,7 @@ class _RoutedExpertsTunableRunner(FP4BlockScaleMoERunner):
         )
 
 
-@torch.library.custom_op("trtllm::glm_routed_experts", mutates_args=())
+@torch.library.custom_op("trtllm::glm_routed_experts", mutates_args=("output", "router_workspace"))
 def _glm_routed_experts(
     routing_logits: Optional[torch.Tensor],
     routing_bias: Optional[torch.Tensor],
@@ -219,7 +218,7 @@ def _glm_routed_experts(
     router_weight: Optional[torch.Tensor],
     router_workspace: Optional[torch.Tensor],
     prefer_gemm2_k128: bool,
-) -> List[torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """The op behind `GlmRoutedExperts.__call__` (see there). The autotuner
     profiles it routed from logits, as it profiles the TRTLLM-Gen FP4 MoE op."""
     tuner = AutoTuner.get()
@@ -294,11 +293,13 @@ def _glm_routed_experts(
         router_weight=router_weight,
         router_workspace=router_workspace,
     )
-    # A finalized call into `output` writes it in place; returning it would
-    # alias an input.
-    if output is not None and do_finalize:
-        return [torch.empty(0, device=output.device, dtype=output.dtype)]
-    return result
+    if not do_finalize:
+        return result[0], result[1], result[2]
+    # Mutable custom ops need individual Tensor returns for auto-functionalization.
+    # Finalized calls pad the internal tuple; the public wrapper drops the padding.
+    # A caller-provided output is written in place and cannot alias a return.
+    finalized = result[0] if output is None else output.new_empty(0)
+    return finalized, finalized.new_empty(0), finalized.new_empty(0)
 
 
 @_glm_routed_experts.register_fake
@@ -340,15 +341,23 @@ def _(
     router_weight,
     router_workspace,
     prefer_gemm2_k128,
-) -> List[torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     if do_finalize:
-        return [
+        finalized = (
             hidden_states.new_empty(
                 (hidden_states.shape[0], hidden_states.shape[1] * 2), dtype=torch.bfloat16
             )
-        ]
-    return fp4_block_scale_fake_output_without_finalize(
-        hidden_states, num_experts, top_k, routing_bias
+            if output is None
+            else output.new_empty(0)
+        )
+        return finalized, finalized.new_empty(0), finalized.new_empty(0)
+    # The autotuned tile determines the padded row count. Only the map's rows
+    # are initialized; the packed input's width is half the bf16 output width.
+    padded_rows = torch.library.get_ctx().new_dynamic_size()
+    return (
+        hidden_states.new_empty((padded_rows, hidden_states.shape[1] * 2), dtype=torch.bfloat16),
+        hidden_states.new_empty((hidden_states.shape[0], top_k), dtype=torch.bfloat16),
+        hidden_states.new_empty((hidden_states.shape[0], top_k), dtype=torch.int32),
     )
 
 
@@ -439,6 +448,11 @@ class GlmRoutedExperts(OpWrapper):
     order; the kernel leaves the exchange buffer of the next launch idle and
     advances the epoch word. `tune_max_num_tokens` is an autotuner bucket hint.
 
+    The unfinalized output's padded row count depends on the autotuned tile.
+    Dynamo fullgraph tracing of that mode requires
+    `torch._dynamo.config.capture_dynamic_output_shape_ops = True`; finalized
+    calls have static output shapes and do not require that setting.
+
     The caller owns the weight layout -- FC1 rows `[up ; gate]` interleaved and
     32-row block shuffled, FC2 rows block shuffled, both scale stacks 128x4
     swizzled -- as the catalog `fp4_block_scale_moe_runner` entry describes.
@@ -484,7 +498,7 @@ class GlmRoutedExperts(OpWrapper):
         router_workspace: Optional[torch.Tensor],
         prefer_gemm2_k128: bool,
     ) -> list[torch.Tensor]:
-        return torch.ops.trtllm.glm_routed_experts(
+        result = torch.ops.trtllm.glm_routed_experts(
             routing_logits,
             routing_bias,
             hidden_states,
@@ -523,6 +537,7 @@ class GlmRoutedExperts(OpWrapper):
             router_workspace,
             prefer_gemm2_k128,
         )
+        return [result[0]] if do_finalize else list(result)
 
     def reference(
         self,

@@ -941,16 +941,25 @@ class DecodeTarget:
         manager = attn_metadata.kv_cache_manager
         if self._hist_workspace is None or attn_metadata.num_seqs != 1:
             return False
-        if self._hist_buffers is None:
-            capacity = shard_capacity(manager.max_seq_len, self.mapping.tp_size)
-            if capacity > MAX_SHARD:
-                return False
-            device = self._unit_scale.device
-            tokens_per_block = manager.tokens_per_block
+        capacity = shard_capacity(manager.max_seq_len, self.mapping.tp_size)
+        if capacity > MAX_SHARD:
+            return False
+        device = self._unit_scale.device
+        tokens_per_block = manager.tokens_per_block
+        buffers = self._hist_buffers
+        # The model outlives the profiling KV manager. Compatible buffers keep
+        # their addresses for captured graphs; a larger or different layout needs new storage.
+        if (
+            buffers is None
+            or buffers["capacity"] < capacity
+            or buffers["tokens_per_block"] != tokens_per_block
+            or buffers["logits"].device != device
+        ):
             rows = FUSED_A_MAX_TOKENS
             sms = num_sms(device.index)
             self._hist_buffers = dict(
                 capacity=capacity,
+                tokens_per_block=tokens_per_block,
                 shard_ctx=torch.zeros(1, dtype=torch.int32, device=device),
                 shard_block_table=torch.zeros(
                     (1, -(-capacity // tokens_per_block)), dtype=torch.int32, device=device
