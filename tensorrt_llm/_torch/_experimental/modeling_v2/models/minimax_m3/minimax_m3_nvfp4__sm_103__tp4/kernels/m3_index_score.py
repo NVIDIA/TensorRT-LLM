@@ -5,7 +5,7 @@
 # https://github.com/vllm-project/vllm/blob/6f91edf96d3f3272945809c04702380053bff4de/vllm/models/minimax_m3/nvidia/ops/index_decode_score.py
 """MiniMax-M3 index decode block scorer (CuTe DSL, Blackwell) with its pre-wait schedule.
 
-The kernel of ``tensorrt_llm/_torch/cute_dsl_kernels/blackwell/minimax_m3_index_decode_score.py`` (the same scores, bit
+The kernel of ``tensorrt_llm/_torch/attention/kernels/blackwell/minimax_m3_index_decode_score.py`` (the same scores, bit
 for bit) with two schedule options this target compiles in:
 
 * ``prefetch_old``: before the grid-dependency wait, the TMA warp L2-prefetches this CTA's index-K pages that hold only
@@ -29,16 +29,13 @@ from cutlass.cute.nvgpu import cpasync, warp
 from cutlass.cutlass_dsl import dsl_user_op
 from cutlass.utils.smem_allocator import SmemAllocator
 
-from tensorrt_llm._torch.cute_dsl_kernels.blackwell.cute_ptx_utils import (
+from tensorrt_llm._torch.kernels.blackwell.cute_ptx_utils import (
     EVICT_FIRST,
     fp8x4_to_fp16x4,
     mma_sync,
     simple_tma_copy,
 )
-from tensorrt_llm._torch.cute_dsl_kernels.blackwell.utils import (
-    TRTLLM_ENABLE_PDL,
-    griddepcontrol_wait,
-)
+from tensorrt_llm._torch.kernels.blackwell.utils import TRTLLM_ENABLE_PDL, griddepcontrol_wait
 
 __all__ = ["IndexDecodeScoreKernel", "IndexScoreRunner"]
 
@@ -559,9 +556,7 @@ class IndexScoreRunner:
         page_size: int,
         max_decode_query_len: int,
     ) -> bool:
-        from tensorrt_llm._torch.cute_dsl_kernels.blackwell.cute_ptx_utils import (
-            TORCH_TO_CUTE_DTYPE,
-        )
+        from tensorrt_llm._torch.kernels.blackwell.cute_ptx_utils import TORCH_TO_CUTE_DTYPE
         from tensorrt_llm._utils import is_sm_100f
 
         return (
@@ -583,9 +578,7 @@ class IndexScoreRunner:
         split_k: int,
         early: bool,
     ) -> None:
-        from tensorrt_llm._torch.cute_dsl_kernels.blackwell.cute_ptx_utils import (
-            TORCH_TO_CUTE_DTYPE,
-        )
+        from tensorrt_llm._torch.kernels.blackwell.cute_ptx_utils import TORCH_TO_CUTE_DTYPE
 
         key = (q_dtype, num_heads, max_decode_query_len, head_dim, split_k, early)
         if key in cls.kernel_cache:
