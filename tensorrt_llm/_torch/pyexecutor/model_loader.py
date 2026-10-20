@@ -17,14 +17,8 @@ from tensorrt_llm._torch.models.checkpoints.base_checkpoint_loader import (
     AutoCheckpointMapper, BaseCheckpointLoader)
 from tensorrt_llm._torch.peft.lora.config import LoraConfig
 from tensorrt_llm._torch.weight_sharing import (
-    LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1,
-    MISTRAL_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
-    QWEN2_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
-    QWEN3_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1, ArtifactIdentity,
-    IdentityCheckPolicy, LazyRootModelIdentity, PostTransformConfigIdentity,
-    PostTransformFeature, PostTransformProfile, PostTransformProfileRegistry,
-    PostTransformQualificationDecision, PostTransformRuntimeConfig,
-    PostTransformRuntimeConstraints, PostTransformTransferScope, SourceIdentity,
+    IdentityCheckPolicy, PostTransformConfigIdentity,
+    PostTransformQualificationDecision, SourceIdentity,
     WeightManifestWriteResult, check_weight_sharing_compatibility,
     maybe_write_weight_manifest)
 from tensorrt_llm._utils import get_sm_version, str_dtype_to_torch
@@ -60,7 +54,7 @@ from .config_utils import (is_hybrid_linear, is_mla,
                            resolve_auto_ssm_cache_dtype,
                            supports_fp4_mla_attention, uses_fp4_mla_attention,
                            validate_kimi_kda_state_dtype)
-from .weight_load_strategies import model_hooks
+from .weight_load_strategies import model_hooks, post_transform
 
 _KV_CACHE_MAP = {
     "fp8": QuantAlgo.FP8.value,
@@ -70,39 +64,6 @@ _KV_CACHE_MAP = {
 }
 _VALID_KV_CACHE_DTYPES = ("fp8", "fp8_ds_mla", "nvfp4", "auto")
 _SHADOW_WEIGHT_LOAD_PLAN_ENV = "TRTLLM_SHADOW_WEIGHT_LOAD_PLAN"
-
-# Dense models do not consume the MoE backend or MoE mapping dimensions. Their
-# runtime topology remains bounded by the general and attention dimensions.
-_MX_BF16_DENSE_RUNTIME_CONSTRAINTS = PostTransformRuntimeConstraints(
-    dtypes=frozenset({"bfloat16"}),
-    quant_algorithms=frozenset({"none"}),
-    kv_cache_quant_algorithms=frozenset({"none"}),
-    layerwise_quantization=frozenset({False}),
-    force_dynamic_quantization=frozenset({False}),
-    lora_enabled=frozenset({False}),
-    sparse_attention_enabled=frozenset({False}),
-    attention_backends=frozenset({"TRTLLM"}),
-    tp_sizes=frozenset({1, 2}),
-    pp_sizes=frozenset({1}),
-    cp_sizes=frozenset({1}),
-    attention_tp_sizes=frozenset({1, 2}),
-    attention_cp_sizes=frozenset({1}),
-    attention_dp=frozenset({False}),
-    multi_node=frozenset({False}),
-    tied_word_embeddings=frozenset({False}),
-    rope_types=frozenset({"default"}),
-    rope_fusion=frozenset({True}),
-)
-_MX_QWEN3_BF16_DENSE_RUNTIME_CONSTRAINTS = replace(
-    _MX_BF16_DENSE_RUNTIME_CONSTRAINTS,
-    rope_fusion=frozenset({False}),
-)
-# Mistral realizes a per-layer attention window from its checkpoint config.
-# The dense profile is qualified only when every layer runs full attention.
-_MX_MISTRAL_BF16_DENSE_RUNTIME_CONSTRAINTS = replace(
-    _MX_BF16_DENSE_RUNTIME_CONSTRAINTS,
-    sliding_windows=frozenset({"none"}),
-)
 
 
 def _validate_and_adjust_mamba_snapshot_config(config: ModelConfig,
@@ -663,68 +624,6 @@ class ModelLoader:
     Handles the loading, configuration, and weight initialization of a PyTorch model.
     This class isolates model loading logic from the main execution engine.
     """
-    _MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION = 1
-
-    # Root classes are named rather than held, so this table costs no model-zoo
-    # import; qualify() resolves only the profile whose class name matches the
-    # model being loaded.
-    _POST_TRANSFORM_PROFILE_REGISTRY = PostTransformProfileRegistry(profiles=(
-        PostTransformProfile(
-            profile_id="llama-for-causal-lm-target-v1",
-            root_model_class=LazyRootModelIdentity(
-                "tensorrt_llm._torch.models.modeling_llama",
-                "LlamaForCausalLM"),
-            architecture="LlamaForCausalLM",
-            model_type="llama",
-            speculative_mode=None,
-            protocol_version=_MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION,
-            transform_abi_id=LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1,
-            transfer_scope=PostTransformTransferScope.TARGET_MODEL,
-            runtime_constraints=_MX_BF16_DENSE_RUNTIME_CONSTRAINTS,
-        ),
-        PostTransformProfile(
-            profile_id="qwen2-for-causal-lm-bf16-target-v1",
-            root_model_class=LazyRootModelIdentity(
-                "tensorrt_llm._torch.models.modeling_qwen", "Qwen2ForCausalLM"),
-            architecture="Qwen2ForCausalLM",
-            model_type="qwen2",
-            speculative_mode=None,
-            protocol_version=_MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION,
-            transform_abi_id=QWEN2_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
-            transfer_scope=PostTransformTransferScope.TARGET_MODEL,
-            runtime_constraints=_MX_BF16_DENSE_RUNTIME_CONSTRAINTS,
-        ),
-        PostTransformProfile(
-            profile_id="qwen3-for-causal-lm-bf16-target-v1",
-            root_model_class=LazyRootModelIdentity(
-                "tensorrt_llm._torch.models.modeling_qwen3",
-                "Qwen3ForCausalLM"),
-            architecture="Qwen3ForCausalLM",
-            model_type="qwen3",
-            speculative_mode=None,
-            protocol_version=_MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION,
-            transform_abi_id=QWEN3_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
-            transfer_scope=PostTransformTransferScope.TARGET_MODEL,
-            runtime_constraints=_MX_QWEN3_BF16_DENSE_RUNTIME_CONSTRAINTS,
-        ),
-        PostTransformProfile(
-            profile_id="mistral-for-causal-lm-bf16-target-v1",
-            root_model_class=LazyRootModelIdentity(
-                "tensorrt_llm._torch.models.modeling_mistral",
-                "MistralForCausalLM"),
-            architecture="MistralForCausalLM",
-            model_type="mistral",
-            speculative_mode=None,
-            protocol_version=_MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION,
-            transform_abi_id=MISTRAL_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
-            transfer_scope=PostTransformTransferScope.TARGET_MODEL,
-            runtime_constraints=_MX_MISTRAL_BF16_DENSE_RUNTIME_CONSTRAINTS,
-        ),
-    ))
-
-    @classmethod
-    def _post_transform_profile_registry(cls) -> PostTransformProfileRegistry:
-        return cls._POST_TRANSFORM_PROFILE_REGISTRY
 
     def __init__(self,
                  llm_args: TorchLlmArgs,
@@ -893,41 +792,6 @@ class ModelLoader:
         """
         return load_format == LoadFormat.GMS or checkpoint_loader.checkpoint_format == CheckpointFormat.MX
 
-    @staticmethod
-    def _build_source_identity(
-        config: ModelConfig,
-        model: DecoderModelForCausalLM,
-        *,
-        checkpoint_dir: str,
-        model_name: str,
-        transform_abi_id: Optional[str],
-        fallback_on_artifact_error: bool,
-    ) -> Optional[SourceIdentity]:
-        """Build the local identity without weakening artifact validation.
-
-        Artifact construction remains fail-closed. MX may convert an artifact
-        error into an unavailable local identity so its compatibility gate
-        falls back to disk; GMS propagates the error because it has no fallback.
-        """
-        try:
-            artifact_identity = ArtifactIdentity.from_checkpoint(checkpoint_dir)
-        except (OSError, RuntimeError, ValueError) as error:
-            if not fallback_on_artifact_error:
-                raise
-            logger.warning(
-                "Unable to build checkpoint artifact identity for MX checkpoint "
-                f"{checkpoint_dir}; falling back to regular checkpoint loading: {error}"
-            )
-            return None
-
-        return SourceIdentity.from_model_config(
-            config,
-            model,
-            artifact_identity=artifact_identity,
-            model_name=model_name,
-            transform_abi_id=transform_abi_id,
-        )
-
     def load(
         self,
         checkpoint_dir: str,
@@ -1001,8 +865,9 @@ class ModelLoader:
             loads_draft_weights = (
                 self.spec_config is not None
                 and self.spec_config.needs_separate_draft_weights)
-            speculative_mode = self._speculative_mode_name(self.spec_config)
-            post_transform_qualification = self._qualify_post_transform_profile(
+            speculative_mode = post_transform.speculative_mode_name(
+                self.spec_config)
+            post_transform_qualification = post_transform.qualify_post_transform_profile(
                 model,
                 config_identity=post_transform_config_identity,
                 speculative_mode=speculative_mode,
@@ -1016,7 +881,7 @@ class ModelLoader:
                 # ground truth; building it here (post-construction,
                 # pre-weight-load) gives producer and consumer a common,
                 # comparable lifecycle point.
-                self._source_identity = self._build_source_identity(
+                self._source_identity = post_transform.build_source_identity(
                     config,
                     model,
                     checkpoint_dir=checkpoint_dir,
@@ -1127,7 +992,7 @@ class ModelLoader:
                     load_weights_kwargs["model_config"] = config
                     load_weights_kwargs["load_config"] = self.llm_args
                     load_weights_kwargs[
-                        "post_transform_protocol_version"] = self._MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION
+                        "post_transform_protocol_version"] = post_transform.MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION
                     # If a separate draft model still needs a raw disk load,
                     # do not accept post-transform bytes for only the target
                     # model. Enable this only after target and draft subgraphs
@@ -1235,7 +1100,7 @@ class ModelLoader:
                                 load_weights_kwargs[
                                     "load_config"] = self.llm_args
                                 load_weights_kwargs[
-                                    "post_transform_protocol_version"] = self._MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION
+                                    "post_transform_protocol_version"] = post_transform.MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION
                                 load_weights_kwargs[
                                     "allow_post_transform_weights"] = post_transform_qualification.qualified
                                 if post_transform_qualification.qualified:
@@ -1537,7 +1402,7 @@ class ModelLoader:
                 "(transform protocol v%d, layout ABI %s).",
                 profile.profile_id,
                 type(model).__name__,
-                cls._MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION,
+                post_transform.MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION,
                 profile.transform_abi_id,
             )
             return True
@@ -1555,26 +1420,10 @@ class ModelLoader:
         raise RuntimeError(
             f"MX receiver got post-transform weights for {type(model).__name__}, "
             "but the load does not match a qualified staged post-load profile "
-            f"for protocol v{cls._MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION}: "
+            f"for protocol v{post_transform.MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION}: "
             f"reason={qualification.reason.value}{feature_detail}{runtime_detail}. "
             "Refusing to run the full post-load path on already-transformed "
             "weights.")
-
-    @staticmethod
-    def _speculative_mode_name(
-            spec_config: Optional[DecodingBaseConfig]) -> Optional[str]:
-        if spec_config is None:
-            return None
-        spec_dec_mode = getattr(spec_config, "spec_dec_mode", None)
-        mode_name = getattr(spec_dec_mode, "name", None)
-        if not isinstance(mode_name, str):
-            logger.warning(
-                "Unable to identify the speculative decoding mode from %s; "
-                "post-transform sharing is disabled for this load.",
-                type(spec_dec_mode).__name__,
-            )
-            return "unknown"
-        return mode_name.lower()
 
     def _load_separate_draft_weights(
             self, model: DecoderModelForCausalLM,
@@ -1616,37 +1465,6 @@ class ModelLoader:
                                           draft_weights, draft_weight_mapper)
             if torch.cuda.is_available():  # CPU guard
                 torch.cuda.synchronize()
-
-    @classmethod
-    def _qualify_post_transform_profile(
-            cls,
-            model: DecoderModelForCausalLM,
-            *,
-            config_identity: Optional[PostTransformConfigIdentity] = None,
-            speculative_mode: Optional[str],
-            loads_draft_weights: bool) -> PostTransformQualificationDecision:
-        if config_identity is None:
-            config_identity = PostTransformConfigIdentity.from_model_config(
-                model.model_config)
-        enabled_features = set()
-        if loads_draft_weights:
-            enabled_features.add(PostTransformFeature.SEPARATE_DRAFT_MODEL)
-        locality_domain_policy = getattr(model.model_config,
-                                         "locality_domain_policy", None)
-        if getattr(locality_domain_policy, "enabled", False):
-            enabled_features.add(
-                PostTransformFeature.LOCALITY_DOMAIN_LOCALIZED_WEIGHTS)
-        return cls._post_transform_profile_registry().qualify(
-            root_model_class=type(model),
-            architecture=config_identity.architecture,
-            model_type=config_identity.model_type,
-            speculative_mode=speculative_mode,
-            protocol_version=cls._MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION,
-            transfer_scope=PostTransformTransferScope.TARGET_MODEL,
-            enabled_features=frozenset(enabled_features),
-            runtime_config=PostTransformRuntimeConfig.from_model_config(
-                model.model_config, model=model),
-        )
 
     def _dump_final_weight_manifest(
             self, checkpoint_loader: BaseCheckpointLoader,
