@@ -271,7 +271,8 @@ def _run_parallel_tuning_then_window_allreduce(tp_size, tp_rank, seq_len, hidden
 
     allreduce = AllReduce(mapping=mapping, strategy=AllReduceStrategy.NCCL_SYMMETRIC)
     with discard_nccl_window_tensor_outputs(ref):
-        out, _ = _allocate(ref, mapping.tp_group)
+        out, actual_kind_int = _allocate(ref, mapping.tp_group)
+        assert actual_kind_int == int(BufferKind.NCCL_WINDOW)
         out.copy_(ref)
         result = allreduce(out, all_reduce_params=AllReduceParams(fusion_op=AllReduceFusionOp.NONE))
         torch.testing.assert_close(result, torch.full_like(result, tp_size), atol=1e-2, rtol=1e-2)
