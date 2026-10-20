@@ -45,6 +45,16 @@ _BF16_SM = (10, 0)
 # non-expert weights (attention DP) would put about 63 GiB of them on every rank
 # beside 120 GiB of experts.
 _BF16_TEP8 = (8, False, 1, 8)  # routed experts in eight 64-expert windows
+# The same 8 ranks with the routed experts in two 256-expert windows, each expert's
+# intermediate width split over the 4 ranks of its window: a different expert layout,
+# hence a different target.
+_BF16_TP8EP2 = (8, False, 4, 2)
+
+# The KV cache algorithms each BF16 layout was gated with (None: the checkpoint's bf16).
+_BF16_KV_ALGOS = {
+    _BF16_TEP8: (None,),
+    _BF16_TP8EP2: (None,),
+}
 
 # The MoE backends the targets stand for: they run their own fused_moe, so a
 # request for another backend does not route here.
@@ -161,10 +171,11 @@ def route(
             f"parallel layout {split} with attn_tp_size={mapping.attn_tp_size}; the targets "
             "split the heads over the whole TP group"
         )
-    if layout != _BF16_TEP8:
+    if layout not in _BF16_KV_ALGOS:
         raise NoTarget(
             f"parallel layout {split}; the BF16 targets are gated on tp8 with the routed "
-            "experts expert-parallel over the 8 ranks (tep8)"
+            "experts expert-parallel over the 8 ranks (tep8: moe_ep 8) or in two expert-parallel "
+            "windows of four tensor-parallel ranks (tp8ep2: moe_ep 2, moe_tp 4)"
         )
     # Only two GB200 trays (4 GPUs each, one NVLink domain) were measured; an 8-GPU node
     # runs the intra-node all-reduce path nobody has gated.
@@ -214,9 +225,11 @@ def route(
             "which the targets do not implement"
         )
     kv_cache_quant_algo = engine_kv_cache_quant_algo(model_config, llm_args)
-    if kv_cache_quant_algo is not None:
+    if kv_cache_quant_algo not in _BF16_KV_ALGOS[layout]:
+        served = " or ".join("bf16" if a is None else str(a) for a in _BF16_KV_ALGOS[layout])
         raise NoTarget(
-            f"KV cache {kv_cache_quant_algo}; the tep8 target reads a bf16 KV cache only"
+            f"KV cache {kv_cache_quant_algo} at parallel layout {split}; the target reads and "
+            f"writes a {served} KV cache"
         )
     # Imported here: the loader module is heavy and routing modules hold no engine code.
     from tensorrt_llm._torch.pyexecutor.model_loader import effective_mamba_ssm_cache_dtype
@@ -231,6 +244,16 @@ def route(
         )
 
     # Nemotron-3 Ultra 550B-A55B BF16 on 8 sm_100 GPUs, tep8.
-    from .nemotron3_ultra_bf16__sm_100__tep8.modeling import ModelingV2Nemotron3UltraBf16Sm100Tep8
+    if layout == _BF16_TEP8:
+        from .nemotron3_ultra_bf16__sm_100__tep8.modeling import (
+            ModelingV2Nemotron3UltraBf16Sm100Tep8,
+        )
 
-    return ModelingV2Nemotron3UltraBf16Sm100Tep8
+        return ModelingV2Nemotron3UltraBf16Sm100Tep8
+
+    # Nemotron-3 Ultra 550B-A55B BF16 on 8 sm_100 GPUs, tp8ep2: moe_ep 2 x moe_tp 4.
+    from .nemotron3_ultra_bf16__sm_100__tp8ep2.modeling import (
+        ModelingV2Nemotron3UltraBf16Sm100Tp8ep2,
+    )
+
+    return ModelingV2Nemotron3UltraBf16Sm100Tp8ep2

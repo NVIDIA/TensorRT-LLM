@@ -35,6 +35,10 @@ tests:
     launch:
       mode: mpi
       world_size: 8
+  - case: accuracy/modeling_v2/nemotron_h/nemotron3_ultra_bf16__sm_100__tp8ep2/test_accuracy.py::TestModelingV2Nemotron3UltraBf16Sm100Tp8ep2::test_gsm8k
+    launch:
+      mode: mpi
+      world_size: 8
   - case: accuracy/test_disaggregated_multinode.py::TestDeepSeekV4ProDSparkMultinode::test_gsm8k_1p1d_dep4
     launch:
       mode: per_node
