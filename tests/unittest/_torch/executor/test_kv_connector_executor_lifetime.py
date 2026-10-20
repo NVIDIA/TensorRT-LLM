@@ -27,6 +27,8 @@ pytestmark = pytest.mark.cpu_only
 
 def _executor() -> PyExecutor:
     executor = object.__new__(PyExecutor)
+    executor._closed = False
+    executor._resources_released = False
     executor.kv_connector_manager = Mock(spec=KvCacheConnectorManager)
     # Set explicitly: `capacity_only` is not on the spec, so a double that
     # leaves it unset fails loudly rather than silently lifting the executor
