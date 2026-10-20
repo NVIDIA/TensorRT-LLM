@@ -197,12 +197,19 @@ def _compile_fused_dspark_rmsnorm_rope(
     apply_rmsnorm: bool,
     inverse_rope: bool,
     norm_dim: int,
+    strided_rows: bool = False,
 ):
+    """Compile the fused RMSNorm+RoPE kernel."""
     rows = cute.sym_int()
     freq_rows = cute.sym_int()
-    x_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.BFloat16, (rows, hidden_dim), stride_order=(1, 0)
-    )
+    if strided_rows:
+        x_fake = cute.runtime.make_fake_tensor(
+            cutlass.BFloat16, (rows, hidden_dim), stride=(cute.sym_int64(), 1)
+        )
+    else:
+        x_fake = cute.runtime.make_fake_compact_tensor(
+            cutlass.BFloat16, (rows, hidden_dim), stride_order=(1, 0)
+        )
     # None, not a fake tensor, when the kernel does not scale by a weight: the
     # operand then does not exist in the compiled signature, so the call site
     # has nothing to pass and nothing to allocate.
@@ -490,6 +497,7 @@ def cute_dsl_dspark_rmsnorm_rope(
         apply_rmsnorm,
         inverse_rope,
         x.shape[-1] if norm_dim is None else norm_dim,
+        strided_rows=x_flat.stride(0) != x_flat.shape[1],
     )
     compiled(x_flat, weight, freqs, output)
     return output.view(original_shape)
