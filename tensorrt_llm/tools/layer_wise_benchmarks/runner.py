@@ -9,7 +9,7 @@ import os
 import weakref
 from dataclasses import replace
 from enum import IntEnum
-from typing import Literal, Optional
+from typing import Any, Dict, Literal, Optional, Union
 
 import torch
 
@@ -22,7 +22,12 @@ from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_utils import PostInitCaller, remove_weights, skip_forward
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
+from tensorrt_llm._torch.modules.mhc.hyper_connection import HCState
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_trtllm_gen import TRTLLMGenFusedMoE
+from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import (
+    BaseMoeLoadBalancer,
+    MoeLoadBalancerIterContext,
+)
 from tensorrt_llm._torch.pyexecutor._util import _mamba_conv_layout_kwargs, get_kv_cache_manager_cls
 from tensorrt_llm._torch.pyexecutor.config_utils import (
     extract_mamba_kv_cache_params,
@@ -410,6 +415,7 @@ class Runner:
         use_cuda_graph: bool,
         spec_config: Optional[DecodingBaseConfig] = None,
         vision_config: Optional[str] = None,
+        moe_load_balancer: Optional[Union[str, Dict[str, Any]]] = None,
     ) -> None:
         super().__init__()
 
@@ -427,6 +433,7 @@ class Runner:
                 max_num_tokens=moe_max_num_tokens,
                 disable_finalize_fusion=False,
                 use_low_precision_moe_combine=use_low_precision_moe_combine,
+                load_balancer=moe_load_balancer,
             ),
             attn_backend="TRTLLM",
             kv_cache_config=KvCacheConfig(
@@ -447,7 +454,7 @@ class Runner:
             self.vision_config_ctx(vision_config),
             self.skip_unused_layers_ctx(layer_indices),
         ):
-            model, _ = model_loader.load(
+            model, load_balancer = model_loader.load(
                 checkpoint_dir=pretrained_model_name_or_path, checkpoint_loader=checkpoint_loader
             )
 
@@ -503,6 +510,11 @@ class Runner:
 
         self.model_config = model.model_config
         self.model = model
+        # The executor drives the load balancer's iterations and teardown; this
+        # harness does it in `create_run_pack` and `shutdown_moe_load_balancer`.
+        self.moe_load_balancer = (
+            load_balancer if isinstance(load_balancer, BaseMoeLoadBalancer) else None
+        )
         self.layer_indices = layer_indices
 
     @staticmethod
@@ -757,6 +769,11 @@ class Runner:
         hc_mult = getattr(pretrained_config, "hc_mult", None)
         if hc_mult is not None:
             hidden_states = hidden_states.unsqueeze(1).expand(-1, hc_mult, -1).contiguous()
+            # Only layer 0 takes the plain residual. A slice starting mid-model
+            # enters with the resolved state that the previous layer returns.
+            first_layer = self.model.model.layers[self.layer_indices[0]]
+            if not getattr(first_layer, "is_first_layer", True):
+                hidden_states = HCState.resolved(hidden_states)
             kwargs["input_ids"] = torch.randint(
                 0,
                 pretrained_config.vocab_size,
@@ -778,7 +795,7 @@ class Runner:
         def run_pack(*, check=False):
             with model_extra_attrs(self.model_config.extra_attrs):
                 get_model_extra_attrs()["attention_metadata"] = weakref.ref(attn_metadata)
-                with torch.inference_mode():
+                with torch.inference_mode(), MoeLoadBalancerIterContext(self.moe_load_balancer):
                     hidden_states_out, residual_out = self.model(
                         position_ids, hidden_states, attn_metadata, residual, **kwargs
                     )
@@ -792,6 +809,12 @@ class Runner:
             return hidden_states_out, residual_out
 
         return run_pack
+
+    def shutdown_moe_load_balancer(self) -> None:
+        """Release the MoE load balancer's resources; collective over the EP ranks."""
+        if self.moe_load_balancer is not None:
+            self.moe_load_balancer.shutdown(local_safe=True)
+            self.moe_load_balancer = None
 
     @contextlib.contextmanager
     def replace_routing_method_ctx(self, balance_method: BalanceMethod, balance_ratio: float):
