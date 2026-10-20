@@ -495,6 +495,80 @@ def red_add_relaxed_sys_v2_bf16x2(
     )
 
 
+@dsl_user_op
+def f32x2_pack(lo, hi, *, loc: Optional[ir.Location] = None, ip: Optional[ir.InsertionPoint] = None) -> Int64:
+    """Pack two f32 into one b64 f32x2 operand (low word ``lo``, high word ``hi``)."""
+    packed = llvm.inline_asm(
+        T.i64(),
+        [Float32(lo).ir_value(loc=loc, ip=ip), Float32(hi).ir_value(loc=loc, ip=ip)],
+        "mov.b64 $0, {$1, $2};",
+        "=l,f,f",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return Int64(packed)
+
+
+@dsl_user_op
+def fma_rn_f32x2_bf16x2(
+    word, scale2, acc2, *, loc: Optional[ir.Location] = None, ip: Optional[ir.InsertionPoint] = None
+) -> Int64:
+    """``acc2 + word * scale2`` on a packed bf16x2 / f32x2 pair (``fma.rn.f32x2.bf16x2.f32x2.f32x2``, one rounding
+    per lane; scale 1.0 gives an exact ``acc + bf16``)."""
+    result = llvm.inline_asm(
+        T.i64(),
+        [
+            Int32(word).ir_value(loc=loc, ip=ip),
+            Int64(scale2).ir_value(loc=loc, ip=ip),
+            Int64(acc2).ir_value(loc=loc, ip=ip),
+        ],
+        "fma.rn.f32x2.bf16x2.f32x2.f32x2 $0, $1, $2, $3;",
+        "=l,r,l,l",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return Int64(result)
+
+
+@dsl_user_op
+def cvt_rn_bf16x2_f32x2(acc2, *, loc: Optional[ir.Location] = None, ip: Optional[ir.InsertionPoint] = None) -> Int32:
+    """Round a packed f32x2 (low word -> low bf16 half) to one bf16x2 word with RN rounding (one F2FP)."""
+    packed = llvm.inline_asm(
+        T.i32(),
+        [Int64(acc2).ir_value(loc=loc, ip=ip)],
+        "{\n  .reg .f32 lo, hi;\n  mov.b64 {lo, hi}, $1;\n  cvt.rn.bf16x2.f32 $0, hi, lo;\n}",
+        "=r,l",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return Int32(packed)
+
+
+@dsl_user_op
+def fence_proxy_async_global(*, loc: Optional[ir.Location] = None, ip: Optional[ir.InsertionPoint] = None) -> None:
+    """Order this thread's generic-proxy global accesses before its later async-proxy (TMA) accesses."""
+    llvm.inline_asm(
+        None,
+        [],
+        "fence.proxy.async.global;",
+        "",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
 @cute.jit
 def cvt_f32x4_to_f8x4_pack_i32(fp32x4: cute.Tensor, fp8_type, *, loc=None, ip=None) -> Int32:
     """Round four f32 lanes to the selected FP8 format and pack them into one i32."""
@@ -759,4 +833,9 @@ __all__ = [
     "stg_e8m0x8_from_f32",
     "stg_f32",
     "tma_load_1d",
+    "fence_acq_rel_gpu",
+    "fence_proxy_async_global",
+    "f32x2_pack",
+    "fma_rn_f32x2_bf16x2",
+    "cvt_rn_bf16x2_f32x2",
 ]

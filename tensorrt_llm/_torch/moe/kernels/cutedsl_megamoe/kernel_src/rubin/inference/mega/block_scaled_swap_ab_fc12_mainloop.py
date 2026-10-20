@@ -241,6 +241,8 @@ class BlockScaledSwapAbFc12Mainloop(KernelComponent):
     def register_smem_regions(self, smem_workspace: SmemWorkspace) -> None:
         """Register the selected Rubin mainloop SMEM plan."""
         smem_workspace.register_mbarrier(self.ab_pipeline_mbarriers_region, self.num_ab_pipeline_stages * 2)
+        # Register the 4 B holding word before the 128 B-aligned stage tensors so it lands in the alignment gap.
+        smem_workspace.register_tensor(self.tmem_holding_buffer_region, cutlass.Int32, (1,), byte_alignment=8)
         for region_name, region in (
             (self.a_smem_tensor_region, self.a_smem_region),
             (self.b_smem_tensor_region, self.b_smem_region),
@@ -257,7 +259,6 @@ class BlockScaledSwapAbFc12Mainloop(KernelComponent):
             )
         smem_workspace.register_mbarrier(self.acc_pipeline_mbarriers_region, self.num_accumulator_pipeline_stages * 2)
         smem_workspace.register_mbarrier(self.tmem_deallocation_mbarrier_region, 1)
-        smem_workspace.register_tensor(self.tmem_holding_buffer_region, cutlass.Int32, (1,), byte_alignment=8)
 
     def _select_ab_stage_plan(self) -> None:
         stage_one_regions = make_smem_layouts(
@@ -287,7 +288,9 @@ class BlockScaledSwapAbFc12Mainloop(KernelComponent):
         )
         mbarrier_bytes = int(cutlass.Int64.width) // 8
         ab_stage_cost_bytes = self.ab_stage_payload_bytes + 2 * mbarrier_bytes
-        plan_tail_bytes = (2 * self.num_accumulator_pipeline_stages + 2) * mbarrier_bytes
+        # Accumulator + TMEM-deallocation mbarriers plus the 8 B-aligned TMEM holding word.
+        tmem_holding_buffer_bytes = 8
+        plan_tail_bytes = (2 * self.num_accumulator_pipeline_stages + 2) * mbarrier_bytes + tmem_holding_buffer_bytes
         self.num_ab_pipeline_stages = (self.mainloop_smem_budget_bytes - plan_tail_bytes) // ab_stage_cost_bytes
         if self.num_ab_pipeline_stages < 1:
             raise ValueError(

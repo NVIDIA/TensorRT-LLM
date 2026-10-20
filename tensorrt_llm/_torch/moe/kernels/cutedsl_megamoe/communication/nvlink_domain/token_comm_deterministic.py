@@ -274,6 +274,11 @@ class _MetadataPushRouter(KernelComponent):
             value = getattr(self, field_name)
             if value <= 0:
                 raise ValueError(f"{field_name} must be positive, got {value}.")
+        if self.max_tokens_per_rank > TokenSrcMetadata.MAX_TOKENS:
+            raise ValueError(
+                f"TokenSrcMetadata keeps the token index in {TokenSrcMetadata.TOKEN_BITS} bits; "
+                f"max_tokens_per_rank must be <= {TokenSrcMetadata.MAX_TOKENS}, got {self.max_tokens_per_rank}."
+            )
         if self.expert_count % self.world_size != 0:
             raise ValueError(
                 f"expert_count must be divisible by world_size, got {self.expert_count} and {self.world_size}."
@@ -833,8 +838,11 @@ class _MetadataPushRouter(KernelComponent):
                         physical_store,
                     )
                     if cutlass.const_expr(self.input_dedup_mode != "off"):
-                        source_token = Int32(metadata & Int64(0xFFFFFFFF))
-                        source_slot = Int32((metadata >> Int64(32)) & Int64(0xFFFF))
+                        # Decode through the protocol class: the record layout changed (token:u16 | topk:u8 |
+                        # rank:u8 | order:u8 | cnt:u8) and a hand-rolled mask here silently indexed the wrong route.
+                        decoded = TokenSrcMetadata.unpack(Int64(metadata))
+                        source_token = decoded.src_token
+                        source_slot = decoded.src_topk
                         route_index = (self._router_local_rank * Int32(self.max_tokens_per_rank) + source_token) * Int32(self.topk) + source_slot
                         token_in_expert = destination_position - pool_begin
                         sf_position = sf_begin + token_in_expert

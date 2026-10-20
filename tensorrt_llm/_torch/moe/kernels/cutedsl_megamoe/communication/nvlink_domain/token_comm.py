@@ -38,7 +38,7 @@ from ..token_protocol import TokenSrcMetadata
 from .symmetric_buffer import SymmetricBufferDevice
 
 
-TokenBackMode = Literal["epi_warps", "standalone_warps", "reuse_dispatch_warps"]
+TokenBackMode = Literal["epi_warps", "standalone_warps", "reuse_dispatch_warps", "hybrid_warps"]
 TokenBackScheduleMode = Literal["static", "atomic_counter"]
 
 
@@ -217,6 +217,11 @@ class _MetadataPushRouter(KernelComponent):
             value = getattr(self, field_name)
             if value <= 0:
                 raise ValueError(f"{field_name} must be positive, got {value}.")
+        if self.max_tokens_per_rank > TokenSrcMetadata.MAX_TOKENS:
+            raise ValueError(
+                f"TokenSrcMetadata keeps the token index in {TokenSrcMetadata.TOKEN_BITS} bits; "
+                f"max_tokens_per_rank must be <= {TokenSrcMetadata.MAX_TOKENS}, got {self.max_tokens_per_rank}."
+            )
         if self.expert_count % self.world_size != 0:
             raise ValueError(
                 f"expert_count must be divisible by world_size, got {self.expert_count} and {self.world_size}."

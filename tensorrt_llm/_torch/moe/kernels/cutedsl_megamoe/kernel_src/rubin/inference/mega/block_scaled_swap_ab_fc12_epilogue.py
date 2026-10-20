@@ -33,10 +33,12 @@ from .....helpers.constants import Nvfp4E2M1RcpLimit, Fp8E4M3RcpLimit, Fp8E5M2Rc
 from .....helpers.cute_py_helpers import tcgen05_block_scaled_acc_dtype
 from .....helpers.dsl_helpers import mark_alignment
 from .....helpers.flag_batch import make_flag_batch_tracker
+from .....helpers.iket_compat import iket
 from .....helpers.ptx_helpers import (
     cp_async_bulk_s2g,
     cp_reduce_async_bulk_add_bf16_s2g,
     cvt_f32_to_fp8_to_f32,
+    fence_proxy_async_global,
     movmatrix_b16,
     red_add_relaxed_sys_v2_bf16x2,
 )
@@ -920,6 +922,10 @@ class SwapABGatedActEpilogue(KernelComponent):
             "token_back_ready_granularity": OptionalRequirement(str),
         }
 
+    def _make_fc2_epilogue(self, *args) -> "SwapABFc2Epilogue":
+        """Device-side FC2 epilogue factory; variants substitute their own ``SwapABFc2Epilogue`` subclass."""
+        return SwapABFc2Epilogue(self, *args)
+
     @staticmethod
     def _resolve_situ_betas(problem_desc: ProblemDesc) -> Tuple[Optional[float], Optional[float]]:
         """Resolve the SiTU (Kimi K3) betas from the ProblemDesc; ``(None, None)`` means SwiGLU.
@@ -1286,8 +1292,7 @@ class SwapABGatedActEpilogue(KernelComponent):
             fc1_done_counter,
             optional_epi_args,
         )
-        fc2_epi = SwapABFc2Epilogue(
-            self,
+        fc2_epi = self._make_fc2_epilogue(
             tidx,
             fc2_smem_tensor,
             tma_atom_fc2_output,
@@ -2112,12 +2117,17 @@ class SwapABFc2Epilogue(_ImmutableAfterInit):
         alpha_val: Optional[cutlass.Float32],
     ):
         process_pipeline = self.process_pipeline
+        iket.range_push("fc2.tmem_load")
         loaded = process_pipeline.tmem_acc_load(tmem_subtile_tensor=tmem_subtile_tensor, epi=self)
+        iket.range_pop()
 
+        iket.range_push("fc2.f2fp_reorder")
         casted = process_pipeline.f2fp(*loaded, alpha_val=alpha_val)
         # reorder returns a bare RMEM fragment in the store's expected pre-store
         # distribution; reorder + store are paired 1:1 inside the pipeline.
         pre_store = process_pipeline.post_f2fp_reorder(casted=casted, tmem_subtile_view=tmem_subtile_tensor)
+        iket.range_pop()
+        iket.range_push("fc2.store")
         process_pipeline.store_function(
             epi=self,
             subtile=pre_store,
@@ -2126,6 +2136,7 @@ class SwapABFc2Epilogue(_ImmutableAfterInit):
             subtile_idx=subtile_idx,
             fc2_output_router=fc2_output_router,
         )
+        iket.range_pop()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -2603,6 +2614,9 @@ def fc2_stg_store_function(
             src_i = cute.make_tensor(copy_src[None, local_iter].iterator, single_copy_layout)
             dst_i = cute.make_tensor(dst_ptr, single_copy_layout)
             cute.copy(copy_atom_vec, cute.recast_tensor(src_i, cutlass.Int32), cute.recast_tensor(dst_i, cutlass.Int32))
+    if cutlass.const_expr(epi.token_back_push_data):
+        # Generic-proxy pool rows are read back by the combine warps' TMA: fence before the fc2_done release.
+        fence_proxy_async_global()
 
 
 @cute.jit

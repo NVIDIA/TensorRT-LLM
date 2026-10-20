@@ -159,6 +159,11 @@ class NonClcMixedCgaSchedulerWorker:
         # when some clusters only communicate. Atomic claims do not use this.
         self.work_id_stride = work_id_stride
 
+    @property
+    def max_fallback_cluster_count(self) -> int:
+        """Upper bound on physical fallback clusters: every preferred-cluster slot of the launch split."""
+        return self.config.launch_cluster_cnt_merge_as_preferred * self.config.split_factor
+
     def register_smem_regions(self, smem_workspace: SmemWorkspace) -> None:
         """Register the cluster-local claim broadcast channel."""
         if self.work_id_mode == "atomic_counter":
@@ -183,10 +188,12 @@ class NonClcMixedCgaSchedulerWorker:
                     buffer_space="local",
                     reset="tail_reset",
                 )
+                # Under PDL more slots can split into fallback clusters than the host plan assumed: size the group
+                # table for every slot splitting.
                 device_workspace.register(
                     self.fallback_group_token_region,
                     cutlass.Int64,
-                    (self.config.fallback_cluster_count,),
+                    (self.max_fallback_cluster_count,),
                     buffer_space="local",
                     reset="tail_reset",
                 )
@@ -262,7 +269,7 @@ class NonClcMixedCgaSchedulerWorker:
                     registration_counter_pointer=device_workspace.ptr(self.fallback_registration_counter_region),
                     group_token_pointer=device_workspace.ptr(self.fallback_group_token_region),
                     split_factor=self.config.split_factor,
-                    fallback_cluster_count=self.config.fallback_cluster_count,
+                    fallback_cluster_count=self.max_fallback_cluster_count,
                     is_fallback_cluster=is_fallback_cluster,
                     fallback_group_idx=Int32(0),
                     in_group_idx=Int32(0),
