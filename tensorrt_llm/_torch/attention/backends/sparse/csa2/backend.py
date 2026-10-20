@@ -85,7 +85,9 @@ def _point_padding_at_staged_rows(metadata: CSA2TrtllmMetadata) -> None:
     ``t * E + p - 128`` in the extra pool) and zero-fills the ones past its
     selection, so each padding slot addresses its own token's row for that slot.
     A shared context bank has no per-token rows; its row 0 is reserved and
-    zeroed by every staging, so the padding addresses that row.
+    zeroed by every staging, so the padding addresses that row. Native per-token
+    staging (``stage_selected_rows``) publishes this padding itself, so only the
+    shared bank and the PyTorch staging need it here.
     """
     indices = metadata.prepared_indices[: metadata.num_tokens]
     if metadata.shared_plan is not None:
@@ -511,7 +513,7 @@ class CSA2TrtllmAttention(TrtllmAttention):
                 # Q's pair is the staging pair read backwards: dequant_q = 1 / dequant_kv.
                 forward_args.kv_scale_orig_quant = stage_quant_orig
                 forward_args.kv_scale_quant_orig = stage_orig_quant
-            metadata.stage_selected(
+            padded_in_pool = metadata.stage_selected(
                 inputs,
                 kv_scale_orig_quant=stage_orig_quant,
                 kv_scale_quant_orig=stage_quant_orig,
@@ -535,7 +537,9 @@ class CSA2TrtllmAttention(TrtllmAttention):
             elif forward_args.attention_input_type == AttentionInputType.context_only:
                 forward_args.quant_scale_qkv = forward_args.kv_scale_orig_quant
         else:
-            metadata.stage_selected(inputs, main_logical=inputs.main_logical_indices)
+            padded_in_pool = metadata.stage_selected(
+                inputs, main_logical=inputs.main_logical_indices
+            )
         sparse = forward_args.sparse_runtime_params
         sparse.sparse_attn_kv_lens = metadata.prepared_lens
         sparse.aux_kv_cache_pool_ptr = (
@@ -555,7 +559,8 @@ class CSA2TrtllmAttention(TrtllmAttention):
             else metadata.swa_pool[:, 0]
         )
         forward_args.q_pe = q.view(metadata.num_tokens, self.num_heads, _HEAD_DIM)[..., 448:]
-        _point_padding_at_staged_rows(metadata)
+        if not padded_in_pool:
+            _point_padding_at_staged_rows(metadata)
         return metadata.prepared_indices, None
 
     def _supports_packed(self, q, inputs, forward_args) -> bool:

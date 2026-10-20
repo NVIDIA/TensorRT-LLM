@@ -714,7 +714,12 @@ def _stage_fixture(queries, swa_width, main_width, *, empty_pool=False, extra_wi
     )
 
 
-def _stage_oracle(metadata, inputs):
+def _stage_oracle(metadata, inputs, *, native=True):
+    """Expected staged pools, lengths and indices.
+
+    Native staging points the index slots past each length at the token's own
+    zero-filled staging rows; the PyTorch staging leaves ``-1`` there.
+    """
     sources = [(inputs.swa_pool, inputs.swa_indices, "swa")]
     if inputs.topk_indices is not None:
         sources.append((inputs.main_pool, inputs.topk_indices, "main"))
@@ -738,8 +743,9 @@ def _stage_oracle(metadata, inputs):
         query * 128 + columns,
         query * (metadata.num_sparse_topk - 128) + columns - 128,
     )
-    indices = torch.where(columns < lengths[:, None], indices, -1).int()
-    return primary, extra, lengths, indices
+    if not native:
+        indices = torch.where(columns < lengths[:, None], indices, -1)
+    return primary, extra, lengths, indices.int()
 
 
 def _check_stage(metadata, expected):
@@ -781,13 +787,14 @@ def test_native_staging_exact(queries, swa_width, main_width, empty_pool, extra_
     metadata, inputs = _stage_fixture(
         queries, swa_width, main_width, empty_pool=empty_pool, extra_width=extra_width
     )
-    expected = _stage_oracle(metadata, inputs)
+    native = metadata.num_sparse_topk <= 4096
+    expected = _stage_oracle(metadata, inputs, native=native)
     metadata.swa_pool.fill_(13)
     metadata.extra_pool.fill_(17)
     metadata.prepared_counter.fill_(19)
-    metadata.stage_selected(inputs)
+    assert metadata.stage_selected(inputs) is native
     _check_stage(metadata, expected)
-    assert bool(calls) == (metadata.num_sparse_topk <= 4096)
+    assert bool(calls) == native
 
 
 @skip_pre_blackwell
@@ -885,11 +892,11 @@ def test_native_staging_validation_and_fallback(monkeypatch):
     backing = torch.empty(inputs.swa_pool.shape[0], 1056, dtype=torch.uint8, device="cuda")
     backing[:, ::2].copy_(inputs.swa_pool)
     inputs.swa_pool = backing[:, ::2]
-    expected = _stage_oracle(metadata, inputs)
+    expected = _stage_oracle(metadata, inputs, native=False)
     monkeypatch.setattr(
         kernel, "stage_selected_rows", lambda *args: pytest.fail("Expected fallback")
     )
-    metadata.stage_selected(inputs)
+    assert metadata.stage_selected(inputs) is False
     _check_stage(metadata, expected)
     # The unsupported zero-query direct invocation still resets the counter.
     metadata._num_tokens = 0

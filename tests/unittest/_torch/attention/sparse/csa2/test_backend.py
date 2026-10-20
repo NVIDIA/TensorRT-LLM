@@ -223,16 +223,31 @@ def test_native_padding_points_into_the_staging_pools(width, shared):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("kv_cache_dtype", ["auto", "fp8"])
 @pytest.mark.parametrize("extra_width", [0, 17, 512])
+@pytest.mark.parametrize("native_staging", [True, False])
 @torch.inference_mode()
-def test_native_padding_reads_zero_rows_of_its_own_token(kv_cache_dtype, extra_width, monkeypatch):
+def test_native_padding_reads_zero_rows_of_its_own_token(
+    kv_cache_dtype, extra_width, native_staging, monkeypatch
+):
     """The FMHA loads index slots past the prepared length inside the last partial KV tile.
 
     Each such slot must address a zero-filled staging row of its own token, and the
-    output must not depend on which in-pool row the padding addresses.
+    output must not depend on which in-pool row the padding addresses. Native
+    staging publishes that padding itself; after the PyTorch staging the backend
+    rewrites its ``-1`` padding.
     """
-    from tensorrt_llm._torch.attention.backends.sparse.csa2 import backend
+    from tensorrt_llm._torch.attention.backends.sparse.csa2 import backend, quantization
     from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
 
+    if not native_staging:
+        monkeypatch.setattr(quantization, "_fused_gather_supported", lambda index: False)
+    padded = []
+    point_padding = backend._point_padding_at_staged_rows
+
+    def record_padding(m):
+        padded.append(True)
+        point_padding(m)
+
+    monkeypatch.setattr(backend, "_point_padding_at_staged_rows", record_padding)
     torch.manual_seed(452)
     heads, count = 64, 4
     attn = _backend(heads, kv_cache_dtype=kv_cache_dtype)
@@ -257,6 +272,7 @@ def test_native_padding_reads_zero_rows_of_its_own_token(kv_cache_dtype, extra_w
         return out.clone()
 
     out = run()
+    assert padded == ([] if native_staging else [True])
     width = metadata.num_sparse_topk
     lens = metadata.prepared_lens[:count].long()
     indices = metadata.prepared_indices[:count].long()
@@ -269,14 +285,18 @@ def test_native_padding_reads_zero_rows_of_its_own_token(kv_cache_dtype, extra_w
         rows = torch.cat((rows, extra_rows))
     assert (rows.view(torch.uint8) == 0).all()
 
-    def pad_with_last_selected_row(m):
-        lens = m.prepared_lens[: m.num_tokens].long()
-        indices = m.prepared_indices[: m.num_tokens]
+    stage_selected = metadata.stage_selected
+
+    def stage_and_pad_with_last_selected_row(*args, **kwargs):
+        padded_in_pool = stage_selected(*args, **kwargs)
+        lens = metadata.prepared_lens[:count].long()
+        indices = metadata.prepared_indices[:count]
         last = indices.gather(1, (lens - 1)[:, None]).expand_as(indices)
         slot = torch.arange(indices.shape[1], device=indices.device)[None, :]
         indices.copy_(torch.where(slot >= lens[:, None], last, indices))
+        return padded_in_pool
 
-    monkeypatch.setattr(backend, "_point_padding_at_staged_rows", pad_with_last_selected_row)
+    monkeypatch.setattr(metadata, "stage_selected", stage_and_pad_with_last_selected_row)
     assert torch.equal(run().view(torch.int16), out.view(torch.int16))
 
 
