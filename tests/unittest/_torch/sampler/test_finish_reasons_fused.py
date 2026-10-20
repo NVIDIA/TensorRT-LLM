@@ -104,12 +104,54 @@ def test_compact_stop_words_history_and_slot_reuse() -> None:
         previous = None
         for iteration in range(4):
             accepted_host = [1, steps, max(1, steps - 1)]
+            if steps > 1 and iteration == 2:
+                accepted_host[0] = steps
             if previous is not None:
                 for request_idx in range(3):
                     for beam in range(beams):
                         histories[request_idx][beam].extend(
                             previous[: accepted_host[request_idx], request_idx, beam].tolist()
                         )
+            if steps > 1 and iteration == 2:
+                retained = [handler._stop_word_allocations[slot] for slot in (5, 1)]
+                retained_data = [entry.tensor.clone() for entry in retained]
+                retained_metadata = handler.store.stop_words_metadata_cuda[slots[:2]].clone()
+                handler.release_request(requests[2])
+                words[2] = [[6, 7], [5, 6, 7]]
+                requests[2] = SimpleNamespace(
+                    **{
+                        **vars(requests[2]),
+                        "py_stop_words_list": words[2],
+                        "py_orig_prompt_len": 2,
+                        "get_tokens": lambda: [[5, 6] for _ in range(beams)],
+                    }
+                )
+                handler.setup_new_request_handling()
+                handler.prepare_for_new_request(requests[2])
+                handler.update_for_new_request(
+                    seq_slots_cuda_long=slots[2:],
+                    max_lengths_cuda=torch.full_like(slots[2:], 100, dtype=torch.int32),
+                    end_ids_cuda=torch.full_like(slots[2:], 99, dtype=torch.int32),
+                    seq_slots_host=slots_host[2:],
+                )
+                for slot, entry, before in zip((5, 1), retained, retained_data):
+                    assert handler._stop_word_allocations[slot] is entry
+                    torch.testing.assert_close(entry.tensor, before)
+                torch.testing.assert_close(
+                    handler.store.stop_words_metadata_cuda[slots[:2]], retained_metadata
+                )
+                replacement = handler._stop_word_allocations[8]
+                assert replacement.request is requests[2]
+                assert handler.store.stop_words_metadata_cuda[8].tolist() == [
+                    replacement.tensor.data_ptr(),
+                    2,
+                    8,
+                    steps + 2,
+                    beams,
+                ]
+                assert handler.store.max_stop_word_lengths_host[8].item() == 3
+                histories[2] = [[5, 6] for _ in range(beams)]
+                accepted_host[2] = 1
             if beams > 1:
                 parents_host = torch.tensor([[2, 0, 0], [1, 1, 0], [0, 2, 1]])
                 reorder_compact_stop_word_history(
@@ -124,6 +166,8 @@ def test_compact_stop_words_history_and_slot_reuse() -> None:
             ) % 10
             if beams > 1 and iteration < 2:
                 tokens_host[0, 2] = torch.tensor([5, 7, 4] if iteration == 0 else [5, 5, 5])
+            if steps > 1 and iteration == 2:
+                tokens_host[0, 2] = 7
             tokens = tokens_host.cuda().int()
             accepted = torch.tensor(accepted_host, dtype=torch.int32, device="cuda")
             if iteration == 0:
