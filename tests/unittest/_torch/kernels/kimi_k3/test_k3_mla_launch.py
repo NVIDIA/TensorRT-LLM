@@ -7,9 +7,7 @@ from pathlib import Path
 import cuda.bindings.driver as cuda_driver
 import pytest
 
-source = (
-    Path(__file__).resolve().parents[5] / "tensorrt_llm/_torch/kernels/k3_mla/_launch.py"
-)
+source = Path(__file__).resolve().parents[5] / "tensorrt_llm/_torch/kernels/k3_mla/_launch.py"
 spec = importlib.util.spec_from_file_location("_k3_mla_launch_test", source)
 launch = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(launch)

@@ -6,9 +6,7 @@ densely."""
 
 import torch
 
-from tensorrt_llm._torch.kernels.k3_mla import (  # noqa: F401 — registers the ops
-    op as _k3_mla_op,
-)
+from tensorrt_llm._torch.kernels.k3_mla import op as _k3_mla_op  # noqa: F401 — registers the ops
 
 
 def k3_mla_qkv(

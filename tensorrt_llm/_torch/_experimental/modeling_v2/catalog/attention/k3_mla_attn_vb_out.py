@@ -7,9 +7,7 @@ from typing import Optional
 
 import torch
 
-from tensorrt_llm._torch.kernels.k3_mla import (  # noqa: F401 — registers the ops
-    op as _k3_mla_op,
-)
+from tensorrt_llm._torch.kernels.k3_mla import op as _k3_mla_op  # noqa: F401 — registers the ops
 
 from .k3_mla_attn_workspace import K3MlaAttnWorkspace
 
