@@ -18,6 +18,7 @@ from stat import S_ISREG
 from types import MappingProxyType
 from typing import (
     Any,
+    Callable,
     ClassVar,
     Dict,
     Generic,
@@ -25,6 +26,7 @@ from typing import (
     Literal,
     Mapping,
     Optional,
+    Protocol,
     Tuple,
     Type,
     TypeVar,
@@ -47,6 +49,47 @@ from tensorrt_llm.logger import logger
 
 class MediaFetchError(RuntimeError):
     """A transient failure while fetching remote media."""
+
+
+class _DecodedMemoryReservation(Protocol):
+    def commit(self, retained_bytes: int) -> None: ...
+
+    def release(self) -> None: ...
+
+
+_DecodedMemoryReserver = Callable[[int], _DecodedMemoryReservation]
+
+
+def _decoded_video_bytes(video: Any) -> int:
+    """Return bytes retained by decoded video frames and optional audio."""
+    if not isinstance(video, VideoData):
+        raise TypeError(f"unsupported decoded video type: {type(video).__name__}")
+
+    if isinstance(video.frames, np.ndarray):
+        total = video.frames.nbytes
+    elif isinstance(video.frames, list):
+        total = 0
+        for frame in video.frames:
+            if isinstance(frame, torch.Tensor):
+                total += frame.numel() * frame.element_size()
+            elif isinstance(frame, np.ndarray):
+                total += frame.nbytes
+            elif isinstance(frame, Image.Image):
+                total += frame.width * frame.height * len(frame.getbands())
+            else:
+                raise TypeError(f"unsupported decoded video frame type: {type(frame).__name__}")
+    else:
+        raise TypeError(f"unsupported decoded video frames type: {type(video.frames).__name__}")
+
+    if video.audio is not None:
+        samples = video.audio.samples
+        if isinstance(samples, torch.Tensor):
+            total += samples.numel() * samples.element_size()
+        elif isinstance(samples, np.ndarray):
+            total += samples.nbytes
+        else:
+            raise TypeError(f"unsupported decoded audio type: {type(samples).__name__}")
+    return total
 
 
 def rgba_to_rgb(
@@ -740,6 +783,7 @@ def _load_video_by_cv2(
     cv2_backend: Optional[int] = None,
     raw_bytes_hash: Optional[str] = None,
     max_decoded_frame_bytes: Optional[int] = None,
+    decoded_memory_reserver: Optional[_DecodedMemoryReserver] = None,
 ) -> VideoData:
     """Decode a video and return sampled frames as a list.
 
@@ -758,9 +802,11 @@ def _load_video_by_cv2(
                 without an extra frame-by-frame copy.
       `"pil"` - list[PIL.Image], one per sampled frame.
 
-    When `max_decoded_frame_bytes` is set, the selected output representation
-    is sized from the first decoded frame and rejected before the frame stack
-    is allocated.
+    When `max_decoded_frame_bytes` or `decoded_memory_reserver` is set, the
+    counted peak frame buffers are sized from the first decoded frame and
+    checked before the frame stack is allocated. This covers buffers allocated
+    here, not codec state, compressed input, Python overhead, or the process's
+    complete memory peak.
     """
     assert format in ("pt", "np", "pil"), "format must be one of 'pt', 'np', 'pil'"
 
@@ -784,6 +830,7 @@ def _load_video_by_cv2(
     else:
         vidcap = cv2.VideoCapture(video)
 
+    decoded_memory_reservation: Optional[_DecodedMemoryReservation] = None
     try:
         if not vidcap.isOpened():
             src_repr = (
@@ -834,16 +881,34 @@ def _load_video_by_cv2(
                     fh, fw = bgr_scratch.shape[:2]
                     if stacked_rgb is None:
                         H, W = fh, fw
-                        output_dtype = np.float32 if format == "pt" else np.uint8
-                        output_item_size = np.dtype(output_dtype).itemsize
-                        decoded_frame_bytes = num_frames_to_sample * H * W * 3 * output_item_size
+                        frame_values = num_frames_to_sample * H * W * 3
+                        if format == "pt":
+                            # uint8 RGB stack + float32 NumPy normalization
+                            # buffer + contiguous float32 CHW tensor. A
+                            # non-CPU destination briefly adds another tensor.
+                            peak_item_size = (
+                                np.dtype(np.uint8).itemsize + 2 * np.dtype(np.float32).itemsize
+                            )
+                            peak_item_size += (
+                                np.dtype(np.float32).itemsize
+                                if torch.device(device).type != "cpu"
+                                else 0
+                            )
+                        else:
+                            peak_item_size = np.dtype(np.uint8).itemsize
+                        peak_decoded_frame_bytes = frame_values * peak_item_size
                         if (
                             max_decoded_frame_bytes is not None
-                            and decoded_frame_bytes > max_decoded_frame_bytes
+                            and peak_decoded_frame_bytes > max_decoded_frame_bytes
                         ):
                             raise ValueError(
-                                f"Decoded video frames require {decoded_frame_bytes} bytes, "
+                                "Decoded video frame buffers require "
+                                f"{peak_decoded_frame_bytes} bytes, "
                                 f"exceeding the limit of {max_decoded_frame_bytes} bytes."
+                            )
+                        if decoded_memory_reserver is not None:
+                            decoded_memory_reservation = decoded_memory_reserver(
+                                peak_decoded_frame_bytes
                             )
                         stacked_rgb = np.empty((num_frames_to_sample, H, W, 3), dtype=np.uint8)
                     if (fh, fw) == (H, W):
@@ -878,6 +943,9 @@ def _load_video_by_cv2(
             if device != "cpu":
                 tensor_nchw = tensor_nchw.to(device)
             loaded_frames = list(torch.unbind(tensor_nchw, dim=0))
+            del tensor_nchw
+            del stacked_f32
+            del stacked_rgb
         elif format == "np":
             loaded_frames = stacked_rgb
         else:  # "pil"
@@ -889,36 +957,54 @@ def _load_video_by_cv2(
             "duration": duration,
             "frames_indices": valid_indices,
         }
+    except BaseException:
+        if decoded_memory_reservation is not None:
+            decoded_memory_reservation.release()
+        raise
     finally:
         # Release the OpenCV handle before any downstream re-open (e.g. PyAV
         # audio extraction on Windows) and to avoid leaking descriptors.
         vidcap.release()
 
-    audio = None
-    if extract_audio:
-        # extract_audio_from_video accepts Union[str, BytesIO]. When the
-        # in-memory cv2 path was taken, `video` is still the original
-        # bytes parameter — wrap in a fresh BytesIO (the one consumed by
-        # cv2 is at end-of-stream). When the tempfile fallback was used,
-        # `video` is the file path string and is passed through as-is.
-        audio_source = (
-            BytesIO(bytes(video)) if isinstance(video, (bytes, bytearray, memoryview)) else video
-        )
-        try:
-            audio_samples, audio_sample_rate = extract_audio_from_video(audio_source)
-            audio = AudioData(samples=audio_samples, sample_rate=audio_sample_rate)
-        except ValueError as e:
-            if "No audio stream found" in str(e):
-                logger.warning("Video has no audio track, skipping audio extraction.")
-            else:
-                raise
+    try:
+        audio = None
+        if extract_audio:
+            # extract_audio_from_video accepts Union[str, BytesIO]. When the
+            # in-memory cv2 path was taken, `video` is still the original
+            # bytes parameter — wrap in a fresh BytesIO (the one consumed by
+            # cv2 is at end-of-stream). When the tempfile fallback was used,
+            # `video` is the file path string and is passed through as-is.
+            audio_source = (
+                BytesIO(bytes(video))
+                if isinstance(video, (bytes, bytearray, memoryview))
+                else video
+            )
+            try:
+                audio_samples, audio_sample_rate = extract_audio_from_video(audio_source)
+                audio = AudioData(samples=audio_samples, sample_rate=audio_sample_rate)
+            except ValueError as e:
+                if "No audio stream found" in str(e):
+                    logger.warning("Video has no audio track, skipping audio extraction.")
+                else:
+                    raise
+    except BaseException:
+        if decoded_memory_reservation is not None:
+            decoded_memory_reservation.release()
+        raise
 
-    return VideoData(
+    video_data = VideoData(
         frames=loaded_frames,
         metadata=metadata,
         audio=audio,
         raw_bytes_hash=raw_bytes_hash,
     )
+    if decoded_memory_reservation is not None:
+        try:
+            decoded_memory_reservation.commit(_decoded_video_bytes(video_data))
+        except Exception:
+            decoded_memory_reservation.release()
+            raise
+    return video_data
 
 
 def _normalize_file_uri(uri: str) -> str:
@@ -1178,6 +1264,7 @@ class VideoMediaIO(BaseMediaIO[VideoData]):
         device: str = "cpu",
         extract_audio: bool = False,
         max_decoded_frame_bytes: Optional[int] = None,
+        decoded_memory_reserver: Optional[_DecodedMemoryReserver] = None,
     ) -> None:
         # `"pt"` is the safe default every video model handles; models tuned
         # for the uint8-HWC path opt into `"np"` via
@@ -1192,6 +1279,7 @@ class VideoMediaIO(BaseMediaIO[VideoData]):
         self._device = device
         self._extract_audio = extract_audio
         self._max_decoded_frame_bytes = max_decoded_frame_bytes
+        self._decoded_memory_reserver = decoded_memory_reserver
 
     @classmethod
     def merge_kwargs(
@@ -1231,6 +1319,7 @@ class VideoMediaIO(BaseMediaIO[VideoData]):
                 cv2_backend=cv2_backend,
                 raw_bytes_hash=raw_bytes_hash,
                 max_decoded_frame_bytes=self._max_decoded_frame_bytes,
+                decoded_memory_reserver=self._decoded_memory_reserver,
             )
         with tempfile.NamedTemporaryFile(suffix=".mp4", dir=_VIDEO_TEMPFILE_DIR) as tmp:
             tmp.write(data)
@@ -1244,6 +1333,7 @@ class VideoMediaIO(BaseMediaIO[VideoData]):
                 extract_audio=self._extract_audio,
                 raw_bytes_hash=raw_bytes_hash,
                 max_decoded_frame_bytes=self._max_decoded_frame_bytes,
+                decoded_memory_reserver=self._decoded_memory_reserver,
             )
 
     def load_base64(self, media_type: str, data: str) -> VideoData:

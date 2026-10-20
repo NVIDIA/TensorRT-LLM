@@ -70,22 +70,76 @@ def test_np_format_hits_hf_video_processor_fast_path(sample_video_path: str) -> 
     assert np.shares_memory(video.frames, batched[0])
 
 
-@pytest.mark.parametrize(
-    ("format", "dtype"), [("np", np.uint8), ("pil", np.uint8), ("pt", np.float32)]
-)
+@pytest.mark.parametrize(("format", "peak_bytes_per_value"), [("np", 1), ("pil", 1), ("pt", 9)])
 def test_decode_limit_is_checked_before_frame_stack_allocation(
-    sample_video_path: str, format: str, dtype: type[np.generic]
+    sample_video_path: str, format: str, peak_bytes_per_value: int
 ) -> None:
-    decoded_bytes = 10 * 64 * 64 * 3 * np.dtype(dtype).itemsize
+    peak_bytes = 10 * 64 * 64 * 3 * peak_bytes_per_value
 
     with patch("tensorrt_llm.inputs.media_io.np.empty") as allocate:
-        with pytest.raises(ValueError, match=f"require {decoded_bytes} bytes"):
+        with pytest.raises(ValueError, match=f"require {peak_bytes} bytes"):
             _load_video_by_cv2(
                 sample_video_path,
                 num_frames=10,
                 fps=-1,
                 format=format,
-                max_decoded_frame_bytes=decoded_bytes - 1,
+                max_decoded_frame_bytes=peak_bytes - 1,
             )
 
     allocate.assert_not_called()
+
+
+def test_pt_decode_reserves_peak_then_commits_retained_bytes(sample_video_path: str) -> None:
+    class _Reservation:
+        committed = None
+        released = False
+
+        def commit(self, retained_bytes: int) -> None:
+            self.committed = retained_bytes
+
+        def release(self) -> None:
+            self.released = True
+
+    reservation = _Reservation()
+    reserved = []
+
+    def reserve(peak_bytes: int) -> _Reservation:
+        reserved.append(peak_bytes)
+        return reservation
+
+    _load_video_by_cv2(
+        sample_video_path,
+        num_frames=10,
+        fps=-1,
+        format="pt",
+        decoded_memory_reserver=reserve,
+    )
+
+    assert reserved == [10 * 64 * 64 * 3 * 9]
+    assert reservation.committed == 10 * 64 * 64 * 3 * 4
+    assert reservation.released is False
+
+
+def test_decode_releases_reservation_after_allocation_failure(sample_video_path: str) -> None:
+    class _Reservation:
+        released = False
+
+        def commit(self, retained_bytes: int) -> None:
+            raise AssertionError("failed decode must not commit")
+
+        def release(self) -> None:
+            self.released = True
+
+    reservation = _Reservation()
+
+    with patch("tensorrt_llm.inputs.media_io.np.empty", side_effect=MemoryError("allocation")):
+        with pytest.raises(MemoryError, match="allocation"):
+            _load_video_by_cv2(
+                sample_video_path,
+                num_frames=10,
+                fps=-1,
+                format="np",
+                decoded_memory_reserver=lambda _peak_bytes: reservation,
+            )
+
+    assert reservation.released is True
