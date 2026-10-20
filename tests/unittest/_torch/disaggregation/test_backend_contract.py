@@ -351,10 +351,21 @@ def test_outcome_for_view_with_masks_and_a_fault():
     outcome.check_mask_shapes(view)
 
 
+def _read_only(array: np.ndarray) -> np.ndarray:
+    array.flags.writeable = False
+    return array
+
+
 @pytest.mark.parametrize(
     "mask",
-    [np.array([0, 1, 2]), np.array([0.0, 1.0, 1.0]), [1, 0, 1]],
-    ids=["int", "float", "list_of_ints"],
+    [
+        np.array([0, 1, 2]),
+        np.array([0.0, 1.0, 1.0]),
+        [1, 0, 1],
+        _read_only(np.array([0, 1, 2])),
+        _read_only(np.array([0.0, 1.0, 1.0])),
+    ],
+    ids=["int", "float", "list_of_ints", "read_only_int", "read_only_float"],
 )
 def test_outcome_refuses_a_mask_that_is_not_bool(mask):
     """A status code read as truthiness would turn a failed row into a delivered one."""
@@ -362,8 +373,8 @@ def test_outcome_refuses_a_mask_that_is_not_bool(mask):
         Outcome.for_view(_keyed_view(3), [mask])
 
 
-def test_outcome_masks_are_read_only_copies():
-    """A backend may go on writing the masks it gave; the outcome does not change."""
+def test_outcome_copies_writable_masks():
+    """A backend may go on writing the writable masks it gave; the outcome does not change."""
     view = _keyed_view(3)
     masks = view.row_masks(True)
     outcome = Outcome.for_view(view, masks)
@@ -374,6 +385,26 @@ def test_outcome_masks_are_read_only_copies():
         assert not mask.flags.writeable
         with pytest.raises(ValueError):
             mask[0] = False
+
+
+def test_outcome_keeps_read_only_bool_masks():
+    """A read-only bool array is kept as given, not copied; a writable one beside it is copied."""
+    kept, written = _read_only(np.ones(2, dtype=bool)), np.ones(3, dtype=bool)
+    outcome = Outcome.for_view(_keyed_view(2, 3), [kept, written])
+    assert outcome.delivered_masks[0] is kept
+    assert outcome.delivered_masks[1] is not written
+    assert not outcome.delivered_masks[1].flags.writeable
+
+
+def test_outcome_copies_a_read_only_subclass_into_a_plain_array():
+    """``all()`` on a masked array skips masked rows, so a failed row there would read as
+    delivered; the outcome holds a plain array of the data instead."""
+    mask = _read_only(np.ma.MaskedArray([True, False], mask=[False, True]))
+    assert mask.all()
+    held = Outcome.for_view(_keyed_view(2), [mask]).delivered_masks[0]
+    assert type(held) is np.ndarray
+    assert held.tolist() == [True, False]
+    assert not held.flags.writeable
 
 
 @pytest.mark.parametrize(

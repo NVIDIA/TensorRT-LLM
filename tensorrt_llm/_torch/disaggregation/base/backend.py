@@ -232,12 +232,15 @@ class Capabilities:
             raise ValueError("a backend implements at least one of fetch and publish")
 
 
-def _readonly_bool_copy(mask: np.ndarray) -> np.ndarray:
-    """A read-only copy of ``mask``, which must be a ``bool`` array.
+def _delivery_mask(mask: np.ndarray) -> np.ndarray:
+    """``mask`` itself if it is a read-only ``bool`` array whose type is exactly ``numpy.ndarray``;
+    otherwise a read-only copy of it.
 
     Raises:
         TypeError: ``mask`` is not of dtype ``bool``.
     """
+    if type(mask) is np.ndarray and mask.dtype == np.bool_ and not mask.flags.writeable:
+        return mask
     copy = np.array(mask)
     if copy.dtype != np.bool_:
         raise TypeError(f"a delivery mask is bool, not {copy.dtype}")
@@ -259,11 +262,13 @@ class Outcome:
 
     Attributes:
         delivered_masks: One read-only ``bool`` mask of shape ``[len(group)]`` per group of the
-            view, in order, copied from the masks given.
+            view, in order. A read-only mask of dtype ``bool`` whose type is exactly
+            ``numpy.ndarray`` is kept as it is, and its giver writes neither it nor memory it
+            shares afterwards; any other mask is copied.
         fault: What went wrong, or ``None``.
 
     Raises:
-        TypeError: A mask given is not a ``bool`` array.
+        TypeError: A mask given is not of dtype ``bool``.
     """
 
     delivered_masks: tuple[np.ndarray, ...]
@@ -273,7 +278,7 @@ class Outcome:
         object.__setattr__(
             self,
             "delivered_masks",
-            tuple(_readonly_bool_copy(mask) for mask in self.delivered_masks),
+            tuple(_delivery_mask(mask) for mask in self.delivered_masks),
         )
 
     @classmethod
