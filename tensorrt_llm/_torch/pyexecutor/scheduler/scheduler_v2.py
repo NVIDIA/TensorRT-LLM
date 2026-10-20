@@ -264,6 +264,81 @@ class KVCacheV2Scheduler(RequestScheduler):
         # Registered by PyExecutor; see set_async_transfer_manager.
         self._async_transfer_manager = None
 
+        # Long-prefill demotion (opt-in). Context scheduling is FCFS, so a
+        # multi-hundred-k-token prefill takes the whole token budget for as many
+        # iterations as it needs while the short cached turns behind it wait. A
+        # context request already mid-prefill with more than this many tokens
+        # left goes to the tail of the iteration's context order (FCFS within
+        # each class) and takes whatever budget the others leave: reordered,
+        # never capped, so its chunks do not shrink. Before prepare_context has
+        # run the length is pre-reuse and says nothing about the work left, so
+        # a request's first chunk is always scheduled FCFS.
+        demote_uncached = int(os.environ.get("TLLM_V2_CTX_DEMOTE_UNCACHED_TOKENS", "0"))
+        self._ctx_demote_uncached_tokens = max(0, demote_uncached) if self.chunking_enabled else 0
+        # A request demoted this many consecutive iterations is let through in
+        # arrival order until it gets scheduled (0 = no bound).
+        self._ctx_demote_max_iters = max(
+            0, int(os.environ.get("TLLM_V2_CTX_DEMOTE_MAX_ITERS", "0"))
+        )
+        self._ctx_demote_skips: dict[int, int] = {}
+        if self._ctx_demote_uncached_tokens:
+            logger.info(
+                f"KVCacheV2Scheduler: demoting context requests with more than "
+                f"{self._ctx_demote_uncached_tokens} uncached tokens left "
+                f"(max consecutive iterations: {self._ctx_demote_max_iters or 'unbounded'})"
+            )
+
+    def _is_long_context(self, req: LlmRequest) -> bool:
+        """Whether a context request past prepare_context has more than the
+        threshold left to compute. No radix probe here: it would walk the whole
+        prompt for every request on every iteration."""
+        if req.state_value == self._encoder_init_state_value:
+            return False
+        return (
+            req.context_current_position > 0
+            and req.context_remaining_length > self._ctx_demote_uncached_tokens
+        )
+
+    def _defer_long_context(
+        self, pending_ctx: RequestList
+    ) -> tuple[RequestList, set[int], set[int]]:
+        """Move long requests to the tail of this iteration's context order.
+
+        Returns the new order, the ids demoted, and the ids the aging bound let
+        through in arrival order.
+        """
+        keep: RequestList = []
+        deferred: RequestList = []
+        let_through: set[int] = set()
+        for req in pending_ctx:
+            if self._is_long_context(req):
+                aged_out = (
+                    self._ctx_demote_max_iters > 0
+                    and self._ctx_demote_skips.get(req.py_request_id, 0)
+                    >= self._ctx_demote_max_iters
+                )
+                if not aged_out:
+                    deferred.append(req)
+                    continue
+                let_through.add(req.py_request_id)
+            keep.append(req)
+        return keep + deferred, {req.py_request_id for req in deferred}, let_through
+
+    def _update_demote_skips(
+        self, demoted_ids: set[int], let_through_ids: set[int], scheduled_ctx: RequestList
+    ) -> None:
+        """Count consecutive iterations spent demoted; a let-through request
+        keeps its count until it is scheduled. Rebuilt every iteration from the
+        requests seen this iteration, so it cannot leak."""
+        scheduled_ids = {req.py_request_id for req in scheduled_ctx}
+        self._ctx_demote_skips = {
+            rid: self._ctx_demote_skips.get(rid, 0) + 1 for rid in demoted_ids
+        } | {
+            rid: self._ctx_demote_skips.get(rid, 0)
+            for rid in let_through_ids
+            if rid not in scheduled_ids
+        }
+
     def set_async_transfer_manager(self, mgr) -> None:
         """Register the AsyncTransferManager the deadlock detector consults.
 
@@ -566,6 +641,13 @@ class KVCacheV2Scheduler(RequestScheduler):
         # is itself the progress in that case.
         deferred_behind_contributor = False
 
+        # Reorder here rather than on requests_list: phase 1 walks that list by
+        # index, pending_ctx is this scheduler's own.
+        demoted_ids: set[int] = set()
+        let_through_ids: set[int] = set()
+        if self._ctx_demote_uncached_tokens:
+            pending_ctx, demoted_ids, let_through_ids = self._defer_long_context(pending_ctx)
+
         for req in pending_ctx:
             if budget.requests_full:
                 break
@@ -668,6 +750,9 @@ class KVCacheV2Scheduler(RequestScheduler):
             return self._schedule_loop(
                 requests_list, inflight_request_ids, defer_remote_tail_context=True
             )
+
+        if self._ctx_demote_uncached_tokens:
+            self._update_demote_skips(demoted_ids, let_through_ids, scheduled_ctx)
 
         # Phase and frozen-membership deferrals are not KV capacity stalls.
         self._detect_deadlock(

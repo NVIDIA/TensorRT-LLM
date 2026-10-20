@@ -5038,3 +5038,63 @@ def test_rewind_context_after_cache_drop_handles_empty_rank_local_prompt(
     assert request.context_chunk_size == prompt_len
     assert request.estimated_reusable_tokens == 0
     assert request.py_ctx_pre_resize_cap is None
+
+
+class TestLongContextDemotion:
+    """TLLM_V2_CTX_DEMOTE_UNCACHED_TOKENS: a mid-prefill request with more than
+    the threshold left goes to the tail of the iteration's context order."""
+
+    ENV = {"TLLM_V2_CTX_DEMOTE_UNCACHED_TOKENS": "1024"}
+
+    def _make(self, env=None, max_num_tokens=1024):
+        with patch.dict("os.environ", env or {"TLLM_V2_CTX_DEMOTE_UNCACHED_TOKENS": "0"}):
+            return make_scheduler(
+                make_kv_cache_manager(tokens_per_block=64),
+                max_num_tokens=max_num_tokens,
+                ctx_chunk_config=(None, 64),
+            )
+
+    def _req(self, request_id, remaining, kv_start=64):
+        """kv_start > 0: prepare_context already ran, remaining is post-reuse."""
+        req = make_ctx_request(request_id, context_remaining_length=remaining)
+        req.context_current_position = kv_start
+        return req
+
+    def test_disabled_without_env(self):
+        long_req, short = self._req(0, 10_000), self._req(1, 256)
+        out = self._make().schedule_request([long_req, short], set())
+        assert ids(out.context_requests) == [0]
+        assert long_req.context_chunk_size == 1024
+
+    def test_long_request_moved_to_tail_and_keeps_the_leftover_budget(self):
+        long_req, short = self._req(0, 10_000), self._req(1, 256)
+        out = self._make(self.ENV).schedule_request([long_req, short], set())
+        assert ids(out.context_requests) == [1, 0]
+        assert short.context_chunk_size == 256
+        assert long_req.context_chunk_size == 768
+        # Alone in the queue it still gets everything: reordered, not capped.
+        alone = self._req(0, 10_000)
+        self._make(self.ENV).schedule_request([alone], set())
+        assert alone.context_chunk_size == 1024
+
+    def test_first_chunk_is_never_demoted(self):
+        """Before prepare_context the length is pre-reuse: plain FCFS."""
+        fresh_long, short = self._req(0, 10_000, kv_start=0), self._req(1, 256)
+        out = self._make(self.ENV).schedule_request([fresh_long, short], set())
+        assert ids(out.context_requests) == [0]
+
+    def test_aging_bound_lets_a_demoted_request_through(self):
+        sched = self._make(dict(self.ENV, TLLM_V2_CTX_DEMOTE_MAX_ITERS="2"))
+        long_req = self._req(0, 10_000)
+        # At the threshold (`> T` is false): never demoted, leaves 64 tokens.
+        hog = self._req(1, 960)
+        for _ in range(2):
+            out = sched.schedule_request([long_req, hog], set())
+            assert ids(out.context_requests) == [1, 0]
+            assert long_req.context_chunk_size == 64  # crumbs do not reset the count
+        out = sched.schedule_request([long_req, hog], set())
+        assert ids(out.context_requests) == [0]  # let through in arrival order
+        assert long_req.context_chunk_size == 1024
+        assert sched._ctx_demote_skips == {}  # served: count restarts
+        sched.schedule_request([hog], set())
+        assert sched._ctx_demote_skips == {}  # finished requests leave no entry
