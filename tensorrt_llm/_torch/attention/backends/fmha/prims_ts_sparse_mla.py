@@ -17,18 +17,19 @@
 
 Serves the DeepSeek-V4 generation phase on SM100 with the Blackwell
 task-scheduled two-source sparse MLA decode kernel
-(``BatchSparseMLADecodePagedTSWrapper``). The sliding-window pool is the
-primary source and, for compressing layers, the compressed pool is the extra
-source. Both lists feed one softmax, exactly like the TRTLLM-Gen sparse MLA
-kernel the fallback library runs.
+(``BatchSparseMLADecodePagedTSWrapper``, flashinfer-ai/flashinfer#5434). The
+sliding-window pool is the primary source and, for compressing layers, the
+compressed pool is the extra source. Both lists feed one softmax, exactly like
+the TRTLLM-Gen sparse MLA kernel the fallback library runs.
 
 The adapter consumes the dual-pool global indices that
 ``DeepseekV4TrtllmAttention.sparse_attn_predict`` already produces: SWA slots
 are storage rows of the SWA pool and compressed slots are storage rows of the
-layer's compress pool, so no page-table conversion happens here. The fused
-DSv4 epilogue (conjugate RoPE on ``D[448:512]`` + 1x128 block-scaled E4M3
-output in the group-major ``[G, T, (H/G)*512]`` layout with FP32 scales
-``[G, (H/G)*4, pad4(T)]``) maps one-to-one onto the kernel's
+layer's compress pool, so no page-table conversion happens here. The kernel
+takes the two index lists and their live lengths directly and masks ``-1``
+holes itself. The fused DSv4 epilogue (conjugate RoPE on ``D[448:512]`` +
+1x128 block-scaled E4M3 output in the group-major ``[G, T, (H/G)*512]`` layout
+with FP32 scales ``[G, (H/G)*4, pad4(T)]``) maps one-to-one onto the kernel's
 ``output_quant_block_size=128`` / ``out_scale_format="fp32"`` mode, so the
 ``o_a_proj`` BMM consumes the attention output without a separate quant
 kernel.
@@ -49,8 +50,6 @@ from importlib.metadata import PackageNotFoundError, version
 from typing import TYPE_CHECKING, Optional
 
 import torch
-import triton
-import triton.language as tl
 from packaging.version import InvalidVersion, Version
 
 from tensorrt_llm._torch.attention.backends.interface import (
@@ -65,7 +64,6 @@ from .interface import Fmha
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention.backends.prims_ts.mla_decode import (
         BatchSparseMLADecodePagedTSWrapper,
-        SparseMLAPreparedMetadata,
     )
     from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.cache_manager import (
         DeepseekV4CacheManager,
@@ -83,8 +81,6 @@ _MIN_CUTLASS_DSL_VERSION = Version("4.7.0")
 _LATENT_DIM = 512
 _ROPE_DIM = 64
 _FUSED_OUTPUT_BLOCK = 128
-_ROUTE_INVALID = 0x7FFFFFFF
-_ROUTE_EXTRA_BIT = -2147483648
 
 
 def get_prims_ts_toolchain_unsupported_reason() -> Optional[str]:
@@ -104,74 +100,18 @@ def get_prims_ts_toolchain_unsupported_reason() -> Optional[str]:
     return None
 
 
-@triton.jit
-def _pack_sparse_mla_metadata(
-    swa_indices,
-    extra_indices,
-    swa_lengths,
-    extra_lengths,
-    routes,
-    execution_lengths,
-    valid_counts,
-    scale_params,
-    sinks,
-    bmm1_scale,
-    bmm2_scale,
-    KS: tl.constexpr,
-    KC: tl.constexpr,
-    ROWS: tl.constexpr,
-    HEADS: tl.constexpr,
-    CAP: tl.constexpr,
-    BLOCK: tl.constexpr,
-    HEAD_BLOCK: tl.constexpr,
-):
-    """Build the combined route words and scale rows for one shared-scale pass.
-
-    Mirrors the ``SparseMLAPreparedMetadata`` contract: each source span is
-    rounded to 128 slots, extra-pool rows carry bit 31, ``0x7fffffff`` marks an
-    inactive slot, and the scale row holds ``[bmm1, bmm2, sinks[H], counts[rows]]``.
-    """
-    row = tl.program_id(0)
-    ls = tl.load(swa_lengths + row)
-    lc = tl.load(extra_lengths + row) if KC else 0
-    span_s = tl.cdiv(ls, 128) * 128
-    span_c = tl.cdiv(lc, 128) * 128
-    col = tl.arange(0, BLOCK)
-    for start in range(0, CAP, BLOCK):
-        p = start + col
-        a = tl.load(swa_indices + row * KS + p, (p < ls) & (p < CAP), 0x7FFFFFFF)
-        local = p - span_s
-        if KC:
-            b = tl.load(
-                extra_indices + row * KC + local,
-                (local >= 0) & (local < lc) & (p < CAP),
-                0x7FFFFFFF,
-            )
-        else:
-            b = tl.full((BLOCK,), 0x7FFFFFFF, tl.int32)
-        b = b | -2147483648
-        word = tl.where(p < span_s, a, b)
-        tl.store(routes + row * CAP + p, word, p < CAP)
-    tl.store(execution_lengths + row, tl.maximum(span_s + span_c, 1))
-    tl.store(valid_counts + row, ls + lc)
-    tl.store(scale_params + 2 + HEADS + row, (ls + lc).to(tl.float32))
-    if row == 0:
-        tl.store(scale_params, bmm1_scale)
-        tl.store(scale_params + 1, bmm2_scale)
-        h = tl.arange(0, HEAD_BLOCK)
-        sink = tl.load(sinks + h, h < HEADS, 0)
-        tl.store(scale_params + 2 + h, sink, h < HEADS)
-
-
 @dataclass
 class _SparsePlan:
-    """One planned wrapper plus the caller-owned metadata buffers it binds."""
+    """One planned wrapper plus the live-length buffers it reads on every launch.
+
+    The index lists come straight from ``sparse_attn_predict``'s metadata
+    buffer; only the per-row live lengths are derived here, into buffers whose
+    addresses stay stable for CUDA graph replay.
+    """
 
     wrapper: "BatchSparseMLADecodePagedTSWrapper"
-    metadata: "SparseMLAPreparedMetadata"
-    default_sinks: torch.Tensor
-    rows: int
-    capacity: int
+    lengths: torch.Tensor
+    extra_lengths: Optional[torch.Tensor]
     validated: bool = False
 
 
@@ -303,6 +243,8 @@ class PrimsTSSparseMlaFmha(Fmha):
             return "dual-pool sparse indices are required."
         if indices.ndim != 2 or indices.dtype != torch.int32 or indices.shape[0] != rows:
             return "sparse indices must be int32 [rows, window + compressed]."
+        if indices.stride(-1) != 1:
+            return "sparse index rows must be contiguous."
         window = int(attn.sparse_attention_config.window_size)
         extra = self._extra_capacity(metadata)
         if indices.shape[1] != window + extra:
@@ -476,7 +418,6 @@ class PrimsTSSparseMlaFmha(Fmha):
     ) -> _SparsePlan:
         from tensorrt_llm._torch.attention.backends.prims_ts.mla_decode import (
             BatchSparseMLADecodePagedTSWrapper,
-            SparseMLAPreparedMetadata,
         )
 
         attn = self.attn
@@ -517,27 +458,12 @@ class PrimsTSSparseMlaFmha(Fmha):
                 else {}
             ),
         )
-        capacity = int(wrapper._state["capacity"])
-
-        def empty(shape, dtype=torch.int32):
-            return torch.empty(shape, device=device, dtype=dtype)
-
-        metadata = SparseMLAPreparedMetadata(
-            indices=empty((rows, window)),
-            lengths=empty((rows,)),
-            extra_indices=empty((rows, extra)) if extra else None,
-            extra_lengths=empty((rows,)) if extra else None,
-            routes=empty((1, rows, capacity)),
-            execution_lengths=empty((1, rows)),
-            valid_counts=empty((1, rows)),
-            scale_params=empty((1, 2 + heads + rows), torch.float32),
-        )
         plan = _SparsePlan(
             wrapper=wrapper,
-            metadata=metadata,
-            default_sinks=torch.full((heads,), -torch.inf, device=device, dtype=torch.float32),
-            rows=rows,
-            capacity=capacity,
+            lengths=torch.empty((rows,), device=device, dtype=torch.int32),
+            extra_lengths=(
+                torch.empty((rows,), device=device, dtype=torch.int32) if extra else None
+            ),
         )
         self._plans[key] = plan
         return plan
@@ -572,7 +498,6 @@ class PrimsTSSparseMlaFmha(Fmha):
         output = forward_args.output
         groups = int(output.shape[0]) if fused else None
 
-        softmax_scale = self._softmax_scale(attn)
         if is_fp8:
             # The MLA preprocessing quantizes Q with the KV-cache scale, so both
             # descales equal the layer's kv_scale_quant_orig (see
@@ -587,9 +512,12 @@ class PrimsTSSparseMlaFmha(Fmha):
         else:
             q_scale = kv_scale = 1.0
             query = q.view(rows, 1, heads, _LATENT_DIM)
-        output_scale = 1.0
-        bmm1_scale = softmax_scale * q_scale * kv_scale
-        bmm2_scale = output_scale * kv_scale
+        # The kernel takes the combined scales: the softmax scale carries the Q
+        # and KV descales, the output scale carries the KV descale (both pools
+        # share it). They are per-layer constants, so the wrapper's static-scale
+        # kernel serves them without a device scalar.
+        softmax_scale = self._softmax_scale(attn) * q_scale * kv_scale
+        output_scale = kv_scale
 
         sinks = self._sinks(forward_args)
         plan = self._get_plan(
@@ -600,49 +528,27 @@ class PrimsTSSparseMlaFmha(Fmha):
             has_sinks=sinks is not None,
             fused_groups=groups,
         )
-        prepared = plan.metadata
 
         # Storage-row indices straight from sparse_attn_predict: the window
         # slots address the SWA pool and the compressed slots address the
-        # compress pool, both relative to their pool base.
+        # compress pool, both relative to their pool base. The live window
+        # length is the token's position within the window; the compressed
+        # length is what the indexer's top-k selected beyond the window.
         indices = forward_args.sparse_runtime_params.sparse_attn_indices
         positions = metadata.token_positions_cuda[start:end]
-        prepared.indices.copy_(indices[:, :window])
-        torch.add(positions, 1, out=prepared.lengths)
-        prepared.lengths.clamp_(max=window)
-        if extra:
-            prepared.extra_indices.copy_(indices[:, window:])
-            topk_lens = metadata.sparse_mla_topk_lens[ratio][start:end]
-            torch.sub(topk_lens, window, out=prepared.extra_lengths)
-            prepared.extra_lengths.clamp_(min=0, max=extra)
-        _pack_sparse_mla_metadata[(rows,)](
-            prepared.indices,
-            prepared.extra_indices if extra else prepared.indices,
-            prepared.lengths,
-            prepared.extra_lengths if extra else prepared.lengths,
-            prepared.routes,
-            prepared.execution_lengths,
-            prepared.valid_counts,
-            prepared.scale_params,
-            plan.default_sinks if sinks is None else sinks,
-            bmm1_scale,
-            bmm2_scale,
-            window,
-            extra,
-            rows,
-            heads,
-            plan.capacity,
-            256,
-            triton.next_power_of_2(heads),
-            num_warps=4,
-        )
-
+        torch.add(positions, 1, out=plan.lengths)
+        plan.lengths.clamp_(max=window)
         swa_pool = self._pool_view(manager, DeepseekV4AttentionType.SWA, 1)
-        extra_pool = (
-            self._pool_view(manager, DeepseekV4AttentionType.COMPRESS, ratio) if extra else None
-        )
-
+        extra_pool = None
         run_kwargs = {}
+        if extra:
+            topk_lens = metadata.sparse_mla_topk_lens[ratio][start:end]
+            torch.sub(topk_lens, window, out=plan.extra_lengths)
+            plan.extra_lengths.clamp_(min=0, max=extra)
+            extra_pool = self._pool_view(manager, DeepseekV4AttentionType.COMPRESS, ratio)
+            run_kwargs["extra_indices"] = indices[:, window:]
+            run_kwargs["extra_lengths"] = plan.extra_lengths
+
         if fused:
             # TRT-LLM's fused epilogue buffers are group-major [G, T, C] with
             # FP32 scales [G, (H/G)*4, pad4(T)]; the kernel takes their
@@ -656,18 +562,16 @@ class PrimsTSSparseMlaFmha(Fmha):
         else:
             run_kwargs["out"] = output.view(rows, 1, heads, _LATENT_DIM)
 
-        # Validate the metadata contract once per plan while still eager; graph
+        # Validate the index contract once per plan while still eager; graph
         # replay must keep validation off because it synchronizes.
         validate = not plan.validated and not torch.cuda.is_current_stream_capturing()
         plan.wrapper.run(
             query,
             swa_pool,
-            prepared,
+            indices[:, :window],
+            plan.lengths,
             extra_pool,
             softmax_scale=softmax_scale,
-            q_scale=q_scale,
-            kv_scale=kv_scale,
-            extra_kv_scale=kv_scale,
             output_scale=output_scale,
             sinks=sinks,
             validate=validate,

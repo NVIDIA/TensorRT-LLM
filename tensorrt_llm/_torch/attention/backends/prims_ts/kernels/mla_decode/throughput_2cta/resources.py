@@ -58,6 +58,7 @@ from cutlass.experimental.task_scheduling.enums import WorkAttr
 from ...mask import kv_tile_needs_right_mask
 from ...tensor_map import transform_ragged_coords
 
+from ..helpers.sparse_indices import SparseKVIndices, SparseSourceTile
 from ..helpers.gather import (
     gather4_cached,
     load_sparse_rows,
@@ -714,10 +715,13 @@ class PageOffsetWindowResource(HighThroughputMlaResource):
     @producer_work(work_attrs=WorkAttr.AUXILIARY)
     @cute.jit
     def bind_sparse_request(self, stage_info: StageInfo):
-        if cutlass.const_expr(hasattr(self.page_offsets, "for_request")):
+        if cutlass.const_expr(
+            isinstance(self.page_offsets, SparseKVIndices)
+            and not self.page_offsets.is_bound
+        ):
             row = stage_info.work_tile.tile_idx[2]
-            self.request_lengths[0] = Int32(self.page_offsets.sl[row])
-            self.request_lengths[1] = Int32(self.page_offsets.cl[row])
+            self.request_lengths[0] = Int32(self.page_offsets.primary_lengths[row])
+            self.request_lengths[1] = Int32(self.page_offsets.extra_lengths[row])
 
     @producer_work
     @cute.jit
@@ -726,8 +730,11 @@ class PageOffsetWindowResource(HighThroughputMlaResource):
         k_index = stage_info.work_tile.k_index_base + Int32(stage_info.loop_offset)
         token = k_index * Int32(128) + lane * Int32(4)
         row = stage_info.work_tile.tile_idx[2]
-        if cutlass.const_expr(hasattr(self.page_offsets, "for_request")):
-            routes = self.page_offsets.for_request(
+        if cutlass.const_expr(
+            isinstance(self.page_offsets, SparseKVIndices)
+            and not self.page_offsets.is_bound
+        ):
+            routes = self.page_offsets.bind_query_row(
                 row, self.request_lengths[0], self.request_lengths[1]
             )
         else:
@@ -852,18 +859,47 @@ class PageOffsetWindowResource(HighThroughputMlaResource):
         global_k_index = work_tile.k_index_base + local_k_index
         if cutlass.const_expr(cfg.page_size == 1):
             cta = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
-            new_k = load_sparse_rows(
-                self.page_offsets,
-                blk_coord[2],
-                global_k_index * cfg.tokens_per_k_tile + cta * cfg.tokens_per_k_cta,
-                fragments=cfg.tokens_per_k_cta // WARP_LANES,
+            # K and pending V cover the same source-aligned BK128 tile.
+            # Bind its source once, not again for every lane/fragment.
+            routes = (
+                self.page_offsets.select_source_tile(
+                    global_k_index * cfg.tokens_per_k_tile, blk_coord[2]
+                )
+                if cutlass.const_expr(isinstance(self.page_offsets, SparseKVIndices))
+                else self.page_offsets
             )
-            new_v = load_sparse_rows(
-                self.page_offsets,
-                blk_coord[2],
-                global_k_index * cfg.tokens_per_v_tile,
-                fragments=cfg.tokens_per_v_tile // WARP_LANES,
-            )
+            if cutlass.const_expr(isinstance(routes, SparseSourceTile)):
+                new_v = load_sparse_rows(
+                    routes,
+                    blk_coord[2],
+                    global_k_index * cfg.tokens_per_v_tile,
+                    fragments=cfg.tokens_per_v_tile // WARP_LANES,
+                )
+                # K is one CTA half of this freshly loaded pending-V window.
+                # cached_v_pages instead belongs to the previous K tile.
+                fragments_k = cfg.tokens_per_k_cta // WARP_LANES
+                new_k = cutlass.Array(
+                    Int32, fragments_k, space=cutlass.AddressSpace.rmem
+                )
+                for fragment in cutlass.range_constexpr(fragments_k):
+                    new_k[fragment] = (
+                        new_v[fragment]
+                        if cta == Int32(0)
+                        else new_v[fragment + fragments_k]
+                    )
+            else:
+                new_k = load_sparse_rows(
+                    routes,
+                    blk_coord[2],
+                    global_k_index * cfg.tokens_per_k_tile + cta * cfg.tokens_per_k_cta,
+                    fragments=cfg.tokens_per_k_cta // WARP_LANES,
+                )
+                new_v = load_sparse_rows(
+                    routes,
+                    blk_coord[2],
+                    global_k_index * cfg.tokens_per_v_tile,
+                    fragments=cfg.tokens_per_v_tile // WARP_LANES,
+                )
             # Expand only current K/V coordinates once per tile. "Uniform"
             # means identical across lanes, not consecutive physical KV rows.
             # Reuse across D slices trades register capacity for fewer shuffles.
@@ -2250,10 +2286,13 @@ class TmemSResource(HighThroughputMlaResource):
     @cute.jit
     def bind_sparse_request(self, stage_info: StageInfo):
         """Cache live source lengths once per query tile, including graph replay."""
-        if cutlass.const_expr(hasattr(self.page_offsets, "for_request")):
+        if cutlass.const_expr(
+            isinstance(self.page_offsets, SparseKVIndices)
+            and not self.page_offsets.is_bound
+        ):
             row = stage_info.work_tile.tile_idx[2]
-            self.request_lengths[0] = Int32(self.page_offsets.sl[row])
-            self.request_lengths[1] = Int32(self.page_offsets.cl[row])
+            self.request_lengths[0] = Int32(self.page_offsets.primary_lengths[row])
+            self.request_lengths[1] = Int32(self.page_offsets.extra_lengths[row])
 
     @producer_work
     @cute.jit
@@ -2496,8 +2535,11 @@ class TmemSResource(HighThroughputMlaResource):
 
         if cutlass.const_expr(cfg.page_size == 1):
             group_needs_mask = True
-        if cutlass.const_expr(hasattr(self.page_offsets, "for_request")):
-            mask_page_offsets = self.page_offsets.for_request(
+        if cutlass.const_expr(
+            isinstance(self.page_offsets, SparseKVIndices)
+            and not self.page_offsets.is_bound
+        ):
+            mask_page_offsets = self.page_offsets.bind_query_row(
                 work_tile.tile_idx[2], self.request_lengths[0], self.request_lengths[1]
             )
         else:
@@ -2510,8 +2552,10 @@ class TmemSResource(HighThroughputMlaResource):
                 group_needs_mask = (cached_mask_low | cached_mask_high) != Int32(0)
         else:
             raw_mask_routes = (
-                mask_page_offsets.mask_for_tile(tile_offset_k, work_tile.tile_idx[2])
-                if cutlass.const_expr(hasattr(self.page_offsets, "mask_for_tile"))
+                mask_page_offsets.select_source_tile(
+                    tile_offset_k, work_tile.tile_idx[2], for_mask=True
+                )
+                if cutlass.const_expr(isinstance(mask_page_offsets, SparseKVIndices))
                 else self.page_offsets
             )
             mask_routes = (
@@ -3712,11 +3756,13 @@ class GmemOResource(HighThroughputMlaResource):
     ):
         # Sparse launch flattens queries into batch rows; each CTA owns 64 heads.
         head_tile_idx, _, token, _ = stage_info.work_tile.tile_idx
-        # Group-major output: the 64-head tile starts at this group.
+        # A tile can span groups or lie inside the single H128 group.
         heads_per_group = cutlass.const_expr(
             self.output_quant.num_heads // self.output_quant.num_groups
         )
-        group = head_tile_idx * (64 // heads_per_group)
+        head_start = head_tile_idx * Int32(64)
+        group = head_start // heads_per_group
+        head_in_group = head_start % heads_per_group
         if prims.elect_sync():
             for half in cutlass.range_constexpr(2):
                 prims.cp_async_bulk_tensor_global_shared_cta(
@@ -3724,7 +3770,7 @@ class GmemOResource(HighThroughputMlaResource):
                     self.smem_o.subview(
                         stage_info.stage_idx * OUTPUT_TMA_STAGE_BYTES + half * 8192
                     ),
-                    (iter_n * 256 + half * 128, 0, token, group),
+                    (iter_n * 256 + half * 128, head_in_group, token, group),
                 )
         prims.cp_async_bulk_commit_group()
         # Release the stage only after TMA has consumed its shared source.

@@ -29,9 +29,6 @@ class SparseMlaProfile:
     reduction: str = "gmem_separate"
     head_dim_ctas: int = 1
     gather_issue_warps: int = 4
-    # Separate lists help qualified small decode grids; premerged tagged
-    # routes remain selected where their simpler loader improves throughput.
-    direct_inputs: bool = True
     balanced_registers: bool = False
     reuse_kv: bool = False
     reuse_kv_stages: int = 0
@@ -78,7 +75,6 @@ def _base_fp8(rows, heads, capacity, sm_count):
         # tiles saves V reloads; uniform coordinates amortize repeated D slices.
         return SparseMlaProfile(
             family="keep",
-            direct_inputs=False,
             reuse_kv=True,
             reuse_kv_stages=10,
             uniform_offset_cache=True,
@@ -249,19 +245,16 @@ def _choose_fp8(rows, heads, query_length, capacity, sm_count):
         return SparseMlaProfile(
             family="keep",
             gather_issue_warps=8,
-            direct_inputs=False,
             reuse_kv=True,
             reuse_kv_stages=10,
             uniform_offset_cache=True,
             scheduler="clc",
             paired_correction=True,
         )
-    if heads == 128 and capacity >= 256 and (rows * 2 >= sm_count):
-        # The FP8 2CTA family uses its qualified static persistent scheduler;
-        # BF16's CLC choice below is a separate measured schedule. Short lists
-        # (capacity 256-384, e.g. HCA at moderate context) run this schedule
-        # too: one 2CTA tile covers H128 with a single KV stream, where the
-        # M64 keep fallback repeats it per head tile (B200: 2.4x faster).
+    if heads == 128 and rows * 2 >= sm_count:
+        # Planned capacity is at least 256. Once the two-CTA grid fills a
+        # device wave, share KV across H128 even for short selected lists.
+        # BF16's CLC choice below is a separately qualified schedule.
         return SparseMlaProfile(family="2cta", scheduler="static", gather_issue_warps=1)
     if (
         heads <= 16
@@ -276,7 +269,6 @@ def _choose_fp8(rows, heads, query_length, capacity, sm_count):
         # Smaller grids retain M8/M16 to preserve independent work.
         return SparseMlaProfile(
             family="keep",
-            direct_inputs=False,
             reuse_kv=True,
             reuse_kv_stages=10,
             uniform_offset_cache=True,
@@ -328,7 +320,6 @@ def _choose_bf16(rows, heads, query_length, capacity, sm_count):
         return SparseMlaProfile(
             family="keep" if keep else "swap",
             tile_size_q=64 if keep else 8 if heads <= 8 else 16,
-            direct_inputs=False,
             balanced_registers=not keep,
             reuse_kv=True,
             reuse_kv_stages=5 if keep else 6,
@@ -388,7 +379,6 @@ def _choose_bf16(rows, heads, query_length, capacity, sm_count):
             kv_pipeline_stages=8,
             uniform_offset_cache=heads == 128,
             scheduler="clc" if heads == 128 and rows >= sm_count else "nonpersistent",
-            direct_inputs=False,
         )
     return _base_bf16(rows, heads, capacity, sm_count)
 
@@ -419,7 +409,7 @@ def _size_buffers(profile, *, rows, heads, query_length, capacity, dtype, sm_cou
             defer_max_update=True,
         )
         if query_length <= 8 and rows >= 2 * sm_count:
-            profile = replace(profile, scheduler="clc", direct_inputs=True)
+            profile = replace(profile, scheduler="clc")
         if (
             heads == 32
             and query_length <= 8
@@ -451,7 +441,6 @@ def _size_buffers(profile, *, rows, heads, query_length, capacity, dtype, sm_cou
             page_pipeline_stages=2,
             gather_issue_warps=8,
             uniform_offset_cache=True,
-            direct_inputs=True,
             scheduler="clc",
             defer_max_update=True,
         )

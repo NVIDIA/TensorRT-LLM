@@ -36,7 +36,6 @@ from ...tensor_map import (
 )
 from cutlass.experimental import cuda
 from cutlass.experimental import primitives as prims
-from cutlass.utils.static_persistent_tile_scheduler import WorkTileInfo
 
 from cutlass.experimental.task_scheduling.enums import PipelineType, SignalingThreads
 from cutlass.experimental.task_scheduling.memory import (
@@ -49,6 +48,7 @@ from cutlass.experimental.task_scheduling.resources import (
     PipelineConfig,
     TileSchedulerConfig,
     WorkQueue,
+    WorkTileInfo,
 )
 from cutlass.experimental.task_scheduling.task_manager import TaskManager
 
@@ -367,19 +367,6 @@ def _default_scales(scale_softmax_log2, output_scale):
     if output_scale is None:
         output_scale = Float32(1.0)
     return scale_softmax_log2, output_scale
-
-
-def _atten_sinks_view(cfg, epilogue_params):
-    """Bind only sinks; packed scale/count metadata remains a separate input."""
-    if epilogue_params is None or not (
-        cfg.fuse_sparse_epilogue or cfg.fuse_sparse_cluster_epilogue
-    ):
-        return None
-    if cfg.sparse_direct:
-        return epilogue_params
-    return cute.make_tensor(
-        epilogue_params.iterator + 2, cute.make_layout(cfg.logical_num_heads_q)
-    )
 
 
 def _check_persistent_scheduler_modes(
@@ -834,8 +821,7 @@ def build_throughput_latency_mla_task_manager(
         inst_id=0,
         scale_softmax_log2=scale_softmax_log2,
         output_scale=output_scale,
-        sparse_epilogue_params=sparse_epilogue_params,
-        atten_sinks=_atten_sinks_view(cfg, sparse_epilogue_params),
+        atten_sinks=sparse_epilogue_params,
         output_quant=output_quant,
         output_quant_args=output_quant_args,
         o_tensor=o_tensor,
@@ -856,8 +842,7 @@ def build_throughput_latency_mla_task_manager(
         inst_id=1,
         scale_softmax_log2=scale_softmax_log2,
         output_scale=output_scale,
-        sparse_epilogue_params=sparse_epilogue_params,
-        atten_sinks=_atten_sinks_view(cfg, sparse_epilogue_params),
+        atten_sinks=sparse_epilogue_params,
         output_quant=output_quant,
         output_quant_args=output_quant_args,
         o_tensor=o_tensor,
@@ -1439,8 +1424,7 @@ def _make_single_kv_pipe_task_graph(
         inst_id=1,
         scale_softmax_log2=scale_softmax_log2,
         output_scale=output_scale,
-        sparse_epilogue_params=sparse_epilogue_params,
-        atten_sinks=_atten_sinks_view(cfg, sparse_epilogue_params),
+        atten_sinks=sparse_epilogue_params,
         output_quant=output_quant,
         output_quant_args=output_quant_args,
         o_tensor=o_tensor,
@@ -1693,7 +1677,6 @@ class ThroughputLatencyMlaDecodeTs:
         explicit_split_kv: int | None = None,
         explicit_persistent: bool | None = None,
         mask_type: MaskType | str = MaskType.CAUSAL,
-        device_scales: bool = False,
         sparse_profile=None,
         finalize_output: bool = False,
     ):
@@ -1724,13 +1707,13 @@ class ThroughputLatencyMlaDecodeTs:
         self.explicit_split_kv = explicit_split_kv
         self.explicit_persistent = explicit_persistent
         self.mask_type = normalize_mask_type(mask_type)
-        self.device_scales = device_scales
         self.sparse_profile = sparse_profile
         self.finalize_output = finalize_output
         self.output_quant = None
-        # Separate prepared source lists, rather than a premerged tagged list.
-        # Both representations reuse the same metadata staging and KV loaders.
+        # Sparse attention binds separate source lists; dense attention uses
+        # the ordinary page table. Both reuse the staged KV loaders.
         self.direct_sparse = False
+        self.assume_valid_prefix = False
         self.direct_static_scales = False
         self.direct_sparse_capacities = (0, 0)
 
@@ -1873,6 +1856,7 @@ class ThroughputLatencyMlaDecodeTs:
                 self.sparse_profile,
                 finalize_output=self.finalize_output,
                 direct_inputs=self.direct_sparse,
+                assume_valid_prefix=self.assume_valid_prefix,
                 static_scales=self.direct_static_scales,
                 source_capacities=self.direct_sparse_capacities,
             )
@@ -2283,13 +2267,7 @@ class ThroughputLatencyMlaDecodeTs:
                 reducer_cfg, topology, elements = self._parallel_reduction_setup(cfg)
                 atten_sinks = None
                 if cutlass.const_expr(cfg.fuse_sparse_reduction):
-                    if cutlass.const_expr(cfg.sparse_direct):
-                        atten_sinks = block_split_kvs[-1]
-                    else:
-                        atten_sinks = cute.make_tensor(
-                            block_split_kvs.iterator + 2,
-                            cute.make_layout(cfg.logical_num_heads_q),
-                        )
+                    atten_sinks = block_split_kvs[-1]
                 reduction_grid, reduction_cluster = (
                     parallel_gmem_reduction_launch_shape(
                         reducer_cfg,
@@ -2386,40 +2364,34 @@ class ThroughputLatencyMlaDecodeTs:
         softmax_scale_log2: cutlass.Float32,
         output_scale: cutlass.Float32,
         tile_sched_params: object,
-        sparse_scale_params: object,
+        sparse_inputs: object,
         output_quant_args=None,
     ):
         """Execute one flat-Q, batch, KV-split, and V head-dimension tile."""
         cfg = self._make_config()
 
         if cutlass.const_expr(cfg.sparse_direct):
-            from ..sparse_views import bind_sparse_views
+            from ..helpers.sparse_indices import bind_sparse_kv_indices
 
-            si, ci, sl, cl, sm, qs, ss, os, sinks = sparse_scale_params
+            si, ci, sl, cl, sm, os, sinks = sparse_inputs
             request = None
             if cutlass.const_expr(cfg.use_persistent_scheduler != 1):
                 request = cutlass.Int64(cute.arch.block_idx()[2])
-            page_offsets, cache_seqs = bind_sparse_views(
+            page_offsets, cache_seqs = bind_sparse_kv_indices(
                 si,
                 ci,
                 sl,
                 cl,
                 cfg.total_kv_tiles * cfg.tile_size_kv,
-                request=request,
+                query_row=request,
+                assume_valid_prefix=cfg.sparse_valid_prefix,
+                has_extra=cfg.sparse_direct_capacities[1] > 0,
             )
             if cutlass.const_expr(not cfg.sparse_static_scales):
-                softmax_scale_log2 = (
-                    cutlass.Float32(sm[0])
-                    * cutlass.Float32(qs[0])
-                    * cutlass.Float32(ss[0])
-                    * LOG2_E
-                )
-                output_scale = cutlass.Float32(os[0]) * cutlass.Float32(ss[0])
+                # Caller scales already include Q/K/V descales.
+                softmax_scale_log2 = cutlass.Float32(sm[0]) * LOG2_E
+                output_scale = cutlass.Float32(os[0])
             sparse_epilogue_params = sinks
-        elif cutlass.const_expr(self.device_scales):
-            softmax_scale_log2 = cutlass.Float32(sparse_scale_params[0]) * LOG2_E
-            output_scale = cutlass.Float32(sparse_scale_params[1])
-            sparse_epilogue_params = sparse_scale_params
         else:
             sparse_epilogue_params = None
 

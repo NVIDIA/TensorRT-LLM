@@ -472,7 +472,9 @@ class TmemSResource(MlaResource):
         tile_offset_k = tile_idx * Int32(cfg.tile_size_kv)
         next_tile_offset_k = tile_offset_k + Int32(cfg.tile_size_kv)
         raw_mask_routes = (
-            self.page_offsets.mask_for_tile(tile_offset_k, batch_idx)
+            self.page_offsets.select_source_tile(
+                tile_offset_k, batch_idx, for_mask=True
+            )
             if cutlass.const_expr(cfg.sparse_direct)
             else self.page_offsets
         )

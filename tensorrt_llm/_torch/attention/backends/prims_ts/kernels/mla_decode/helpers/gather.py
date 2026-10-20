@@ -23,6 +23,7 @@ from cutlass.cutlass_dsl import dsl_user_op
 from cutlass.experimental import primitives as prims
 
 from .constants import TMA_GATHER_ROWS
+from .sparse_indices import SparseKVIndices, SparseSourceTile
 
 
 @dsl_user_op
@@ -50,7 +51,9 @@ def load_sparse_rows(routes, request, offset, *, fragments: cutlass.Constexpr[in
     for fragment in cutlass.range_constexpr(fragments):
         index = offset + lane + Int32(fragment * 32)
         value = Int32(0x7FFFFFFF)
-        if index < routes.shape[0]:
+        if cutlass.const_expr(isinstance(routes, SparseSourceTile)):
+            value = routes.load_row(index)
+        elif index < routes.shape[0]:
             value = Int32(routes[index, request])
         rows[fragment] = value
     return rows
@@ -59,10 +62,10 @@ def load_sparse_rows(routes, request, offset, *, fragments: cutlass.Constexpr[in
 @cute.jit
 def load_sparse_quad(routes, request, offset):
     """Keep one contiguous row quadruple in its issuing lane's registers."""
+    if cutlass.const_expr(isinstance(routes, SparseKVIndices)):
+        source = routes.select_source_tile(offset, request)
+        return source.load_quad(offset)
     rows = cutlass.Array(Int32, 4, space=cutlass.AddressSpace.rmem)
-    if cutlass.const_expr(hasattr(routes, "routes_for_tile")):
-        tile_routes = routes.routes_for_tile(offset, request)
-        return tile_routes.mapped_quad(offset)
     for j in cutlass.range_constexpr(4):
         rows[j] = Int32(0x7FFFFFFF)
     if offset + Int32(3) < routes.shape[0]:
@@ -91,6 +94,8 @@ def decode_sparse_quad(primary, extra, raw):
         # reserved sentinel is already an out-of-bounds TMA coordinate;
         # retaining it gives zero fill without a compare/select per row.
         rows[j] = raw[j] & Int32(0x7FFFFFFF)
+    # Internally generated invalid coordinates retain the source bit: the
+    # first coordinate selects the shared descriptor even when it is invalid.
     return select_gather_map(primary, extra, raw[0] < 0), rows
 
 
@@ -150,6 +155,7 @@ def gather4_cached(
         )
         row = raw & Int32(0x7FFFFFFF)
         rows[j] = row if row != Int32(0x7FFFFFFF) else Int32(-1)
+    # The same source-tag invariant applies to cached invalid anchors.
     descriptor = select_gather_map(primary, extra, raw0 < 0)
     if prims.elect_sync():
         gather4(
@@ -174,7 +180,9 @@ def invalid_sparse_token(
     Bit 31 selects the source; bits 0..30 hold its TMA row coordinate.
     All-one low bits denote an invalid row for either source.
     """
-    if cutlass.const_expr(sparse and hasattr(routes, "is_invalid")):
+    if cutlass.const_expr(
+        sparse and isinstance(routes, (SparseSourceTile, CachedSparseMask))
+    ):
         return (token >= length) | routes.is_invalid(token, request)
     invalid = token >= length
     if cutlass.const_expr(sparse):
@@ -272,7 +280,7 @@ def cache_sparse_mask(
 ):
     lane = cute.arch.thread_idx()[0] % 32
     warp = cute.arch.thread_idx()[0] % 128 // 32
-    if cutlass.const_expr(hasattr(routes, "prefix_mask32")):
+    if cutlass.const_expr(isinstance(routes, SparseSourceTile) and routes.valid_prefix):
         low, high = Int32(0), Int32(0)
         if not routes.tile_is_full(tile_offset, length):
             if cutlass.const_expr(swaps):

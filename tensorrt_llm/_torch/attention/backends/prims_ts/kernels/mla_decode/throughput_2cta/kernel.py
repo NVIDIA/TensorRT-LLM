@@ -831,7 +831,6 @@ class MlaDecodeTs:
         seq_len_q=1,
         batch_size=1,
         mask_type: MaskType | str = MaskType.CAUSAL,
-        device_scales: bool = False,
     ):
         """
         Parameters
@@ -914,12 +913,11 @@ class MlaDecodeTs:
             raise ValueError("batch_size must be positive")
         self.batch_size = batch_size
         self.mask_type = normalize_mask_type(mask_type)
-        self.device_scales = device_scales
         self.fuse_sparse_reduction = False
         self.fuse_sparse_epilogue = False
         self.output_quant = None
-        # Separate prepared source lists, rather than a premerged tagged list.
-        # Both representations reuse the same metadata staging and KV loaders.
+        # Sparse attention binds separate source lists; dense attention uses
+        # the ordinary page table. Both reuse the staged KV loaders.
         self.direct_sparse = False
         self.sparse_gather_warps = 1
         self.sparse_kv_stages = 0
@@ -1090,8 +1088,6 @@ class MlaDecodeTs:
             and cfg.is_fp8_qkv()
             and cfg.page_size == 1
             and self.num_heads == 128
-            # A 64-head TMA box spans whole head groups of the group-major output.
-            and 64 % (self.num_heads // self.output_quant.num_groups) == 0
             and self.seq_len_q == 1
             and cfg.mma_pv_tiler_mn == (128, 256)
         )
@@ -1377,12 +1373,12 @@ class MlaDecodeTs:
             flat_o = output_quant_args[0]
             output_rows = cute.size(flat_o) // (128 * 512)
             # Group-major [G, T, (H/G) * 512] output viewed as (channel, head in
-            # group, token, group). A 64-head box covers 64 / (H/G) whole groups
-            # and fills 64 shared-memory rows in head order, so the staging
-            # layout matches the flat head-major view.
+            # group, token, group). A box spans whole groups, or half of the
+            # single H128 group, retaining the same 64 shared-memory rows.
             heads_per_group = (
                 self.output_quant.num_heads // self.output_quant.num_groups
             )
+            box_heads = cutlass.const_expr(min(heads_per_group, 64))
             output_view = cute.make_tensor(
                 flat_o.iterator,
                 cute.make_layout(
@@ -1397,7 +1393,7 @@ class MlaDecodeTs:
             )
             tma_desc_o = create_tensor_map_tiled_from_view(
                 output_view,
-                box_dims=(128, heads_per_group, 1, 64 // heads_per_group),
+                box_dims=(128, box_heads, 1, 64 // box_heads),
                 stride_order=(0, 1, 2, 3),
                 swizzle=cuda.TensorMapSwizzle.s128b,
                 l2_promotion=cuda.TensorMapL2Promotion.l2_128b,
@@ -1578,9 +1574,9 @@ class MlaDecodeTs:
     ) -> None:
         """MLA decode TS kernel: persistent tile-scheduled execution."""
         if cutlass.const_expr(self.direct_sparse):
-            from ..sparse_views import bind_sparse_views
+            from ..helpers.sparse_indices import bind_sparse_kv_indices
 
-            si, ci, sl, cl, sm, qs, ss, os, sinks = block_split_kvs
+            si, ci, sl, cl, sm, os, sinks = block_split_kvs
             capacity = cutlass.const_expr(
                 max(
                     256,
@@ -1599,32 +1595,20 @@ class MlaDecodeTs:
                     tile_sched_params.problem_shape_b_fdd,
                 )
                 request = Int64(row)
-            page_offsets, cache_seqs = bind_sparse_views(
+            page_offsets, cache_seqs = bind_sparse_kv_indices(
                 si,
                 ci,
                 sl,
                 cl,
                 capacity,
-                request=request,
+                query_row=request,
                 assume_valid_prefix=self.assume_valid_prefix,
+                has_extra=self.direct_sparse_capacities[1] > 0,
             )
             if cutlass.const_expr(not self.direct_static_scales):
-                softmax_scale_log2 = (
-                    Float32(sm[0]) * Float32(qs[0]) * Float32(ss[0]) * LOG2_E
-                )
-                output_scale = Float32(os[0]) * Float32(ss[0])
-        else:
-            if cutlass.const_expr(self.device_scales):
-                softmax_scale_log2 = cutlass.Float32(block_split_kvs[0]) * LOG2_E
-                output_scale = cutlass.Float32(block_split_kvs[1])
-            if cutlass.const_expr(self.fuse_sparse_epilogue):
-                # A host-scale caller can bind sinks alone. Device-scale
-                # metadata starts with QK/PV scales, followed by sinks.
-                sink_offset = 2 if self.device_scales else 0
-                sinks = cute.make_tensor(
-                    block_split_kvs.iterator + sink_offset,
-                    cute.make_layout(self.num_heads),
-                )
+                # Caller scales already include Q/K/V descales.
+                softmax_scale_log2 = Float32(sm[0]) * LOG2_E
+                output_scale = Float32(os[0])
         cfg = self._make_config()
         num_query_tiles = self.num_q_tiles
         use_clc_dynamic = self.is_persistent and not cfg.is_fp8_qkv()
@@ -2229,12 +2213,7 @@ class MlaDecodeTs:
             prims.griddepcontrol(kind=prims.GridDepAction.WAIT)
         atten_sinks = None
         if cutlass.const_expr(self.fuse_sparse_reduction):
-            if cutlass.const_expr(self.direct_sparse):
-                atten_sinks = block_split_kvs[-1]
-            else:
-                atten_sinks = cute.make_tensor(
-                    block_split_kvs.iterator + 2, cute.make_layout(self.num_heads)
-                )
+            atten_sinks = block_split_kvs[-1]
             block_split_kvs = None
         topology = self._reduction_topology()
         run_parallel_reduction_kernel(

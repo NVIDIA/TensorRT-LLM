@@ -537,23 +537,26 @@ class SmemPageOffsetsResource(MlaResource):
             )
             tile_idx = global_kv_tile_idx(cfg, local_tile_idx, seq_len_kv, cta_idx_kv)
             tile_start = tile_idx * pages_per_tile
-            routes = self.page_offsets.routes_for_tile(tile_start, batch_idx)
+            routes = self.page_offsets.select_source_tile(tile_start, batch_idx)
             position = lane_idx * Int32(4)
             smem_offset = (
                 stage_info.stage_idx * Int32(cfg.page_offsets_entries_per_stage)
                 + position
             )
-            if cutlass.const_expr(cfg.tile_size_kv < 128):
-                if position < pages_per_tile:
-                    quad = routes.mapped_quad(tile_start + position)
+            if position < pages_per_tile:
+                # Source selection is tile-wide. Hoist the bounds decision out
+                # of individual quads so full tiles take one uniform branch;
+                # index values still mask holes even in an in-bounds tile.
+                if tile_start + pages_per_tile <= routes.origin + routes.length:
+                    quad = routes.load_full_quad(tile_start + position)
                     self._smem_page_offsets.data_ptr(smem_offset).store(
                         quad.load(0, 4), alignment=16
                     )
-            else:
-                quad = routes.mapped_quad(tile_start + position)
-                self._smem_page_offsets.data_ptr(smem_offset).store(
-                    quad.load(0, 4), alignment=16
-                )
+                else:
+                    quad = routes.load_quad(tile_start + position)
+                    self._smem_page_offsets.data_ptr(smem_offset).store(
+                        quad.load(0, 4), alignment=16
+                    )
             cute.arch.fence_view_async_shared()
             return
         for fragment in cutlass.range_constexpr((cfg.pages_per_kv_tile + 31) // 32):
@@ -672,6 +675,8 @@ class SmemPageOffsetsResource(MlaResource):
             # full valid prefix can still contain random rows. Eight quads
             # (32 rows) are needed for bulk; smaller issuer shares use gather4.
             if cutlass.const_expr(groups_per_warp >= 8):
+                # A chunk stays within one source. Invalid coordinates retain
+                # its tag because the first coordinate selects the shared map.
                 first = Int32(
                     prims.shfl_sync(
                         thread_mask=0xFFFFFFFF,

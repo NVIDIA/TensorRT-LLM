@@ -7,12 +7,10 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-import triton
 
 from tensorrt_llm._torch.attention.backends.fmha import registry
 from tensorrt_llm._torch.attention.backends.fmha.prims_ts_sparse_mla import (
     PrimsTSSparseMlaFmha,
-    _pack_sparse_mla_metadata,
     get_prims_ts_toolchain_unsupported_reason,
 )
 from tensorrt_llm._utils import get_sm_version
@@ -116,53 +114,6 @@ def _random_indices(rows: int, capacity: int, pool_rows: int, device: torch.devi
     return indices, lengths
 
 
-def _prepare_metadata(wrapper, indices, lengths, extra_indices, extra_lengths, heads, bmm1, bmm2):
-    """Build SparseMLAPreparedMetadata exactly like the FMHA adapter does."""
-    from tensorrt_llm._torch.attention.backends.prims_ts.mla_decode import SparseMLAPreparedMetadata
-
-    rows, ks = indices.shape
-    kc = 0 if extra_indices is None else extra_indices.shape[1]
-    capacity = int(wrapper._state["capacity"])
-    device = indices.device
-
-    def empty(shape, dtype=torch.int32):
-        return torch.empty(shape, dtype=dtype, device=device)
-
-    prepared = SparseMLAPreparedMetadata(
-        indices=indices.contiguous(),
-        lengths=lengths.contiguous(),
-        extra_indices=None if kc == 0 else extra_indices.contiguous(),
-        extra_lengths=None if kc == 0 else extra_lengths.contiguous(),
-        routes=empty((1, rows, capacity)),
-        execution_lengths=empty((1, rows)),
-        valid_counts=empty((1, rows)),
-        scale_params=empty((1, 2 + heads + rows), torch.float32),
-    )
-    sinks = torch.full((heads,), -torch.inf, dtype=torch.float32, device=device)
-    _pack_sparse_mla_metadata[(rows,)](
-        prepared.indices,
-        prepared.extra_indices if kc else prepared.indices,
-        prepared.lengths,
-        prepared.extra_lengths if kc else prepared.lengths,
-        prepared.routes,
-        prepared.execution_lengths,
-        prepared.valid_counts,
-        prepared.scale_params,
-        sinks,
-        bmm1,
-        bmm2,
-        ks,
-        kc,
-        rows,
-        heads,
-        capacity,
-        256,
-        triton.next_power_of_2(heads),
-        num_warps=4,
-    )
-    return prepared
-
-
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn], ids=["bf16", "fp8"])
 @pytest.mark.parametrize(
     "rows,heads,groups,topk,extra_topk",
@@ -210,19 +161,15 @@ def test_fused_output_matches_trtllm_inverse_rope_quant(
 
     softmax_scale = LATENT**-0.5
     descale = 0.75 if dtype == torch.float8_e4m3fn else 1.0
-    bmm1 = softmax_scale * descale * descale
-    bmm2 = descale
-    run_scales = dict(
-        softmax_scale=softmax_scale, q_scale=descale, kv_scale=descale, extra_kv_scale=descale
-    )
+    # The kernel takes the combined scales (attention x Q descale x KV descale
+    # on the softmax, the KV descale on the output), as the adapter passes them.
+    run_scales = dict(softmax_scale=softmax_scale * descale * descale, output_scale=descale)
+    sources = dict(extra_indices=extra_indices, extra_lengths=extra_lengths) if extra_topk else {}
     plan_args = dict(max_topk=topk, max_extra_topk=extra_topk, max_seq_len_q=1, q_data_type=dtype)
 
     reference = BatchSparseMLADecodePagedTSWrapper()
     reference.plan(device, rows, heads, **plan_args)
-    metadata = _prepare_metadata(
-        reference, indices, lengths, extra_indices, extra_lengths, heads, bmm1, bmm2
-    )
-    out_bf16 = reference.run(query, pool, metadata, extra_pool, **run_scales)
+    out_bf16 = reference.run(query, pool, indices, lengths, extra_pool, **sources, **run_scales)
     heads_per_group = heads // groups
     ref_fp8, ref_scale = torch.ops.trtllm.fused_inv_rope_fp8_quant_vllm_port(
         out_bf16.view(rows, heads, LATENT),
@@ -246,9 +193,6 @@ def test_fused_output_matches_trtllm_inverse_rope_quant(
         num_output_groups=groups,
         **plan_args,
     )
-    metadata = _prepare_metadata(
-        fused, indices, lengths, extra_indices, extra_lengths, heads, bmm1, bmm2
-    )
     channels = heads_per_group * LATENT
     padded_rows = (rows + 3) // 4 * 4
     # The exact buffers TRT-LLM's fused DSv4 epilogue allocates.
@@ -259,8 +203,10 @@ def test_fused_output_matches_trtllm_inverse_rope_quant(
     fused_out, fused_scale = fused.run(
         query,
         pool,
-        metadata,
+        indices,
+        lengths,
         extra_pool,
+        **sources,
         out=out_buf.transpose(0, 1),
         out_scale=scale_buf.permute(2, 0, 1)[:rows],
         token_positions=positions.view(rows, 1),
