@@ -102,6 +102,7 @@ def _build_replay_work_items_triton(state_indices, prev_num_accepted_tokens,
     )
 
 
+@torch.compile(dynamic=True, fullgraph=True)
 def _build_replay_work_items_torch(state_indices, prev_num_accepted_tokens,
                                    cache_buf_idx, work_items, n_writes,
                                    replay_step_width, replay_history_size):
