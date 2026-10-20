@@ -13,6 +13,8 @@ Weight source                 Chosen when                     Where the weights 
 ============================  ==============================  ===================================
 `CheckpointWeightSource`      ``load_format="auto"``          checkpoint files, via the loader
 `MxWeightSource`              ``checkpoint_format="MX"``      a running donor over RDMA, or files
+`ModelStreamerWeightSource`   ``checkpoint_io_policy=``       files, streamed by Run:ai Model
+                              ``"model_streamer"``            Streamer (Kimi K3 only)
 `GmsWeightSource`             ``load_format="gms"``           a GPU memory pool shared on a node
 `DummyWeightSource`           ``load_format="dummy"``         random values, for tests
 `VisionOnlyWeightSource`      ``load_format="vision_only"``   nothing; vision weights load early
@@ -21,16 +23,19 @@ Weight source                 Chosen when                     Where the weights 
 `select_weight_source()` picks the source, and `WeightSource` lists the steps
 `ModelLoader.load()` runs on it. Helpers shared by several sources live in
 `model_hooks` (module post-load hooks) and `post_transform` (whether MX and
-GMS loads may share already-transformed weights).
+GMS loads may share already-transformed weights). `model_streamer` also holds
+`ModelStreamerPlan`, which a model's ``plan_model_streamer_load()`` returns to
+say which tensors it needs and how to load them.
 """
 
 from tensorrt_llm.checkpoint_format import CheckpointFormat
-from tensorrt_llm.llmapi.llm_args import LoadFormat
+from tensorrt_llm.llmapi.llm_args import CheckpointIOPolicy, LoadFormat
 
 from .base import ModelLoaderMetricNames, WeightLoadContext, WeightSource
 from .checkpoint import CheckpointWeightSource
 from .dummy import DummyWeightSource, VisionOnlyWeightSource, initialize_dummy_weights
 from .gms import GmsWeightSource
+from .model_streamer import ModelStreamerWeightSource
 from .mx import MxWeightSource
 
 __all__ = [
@@ -38,6 +43,7 @@ __all__ = [
     "DummyWeightSource",
     "GmsWeightSource",
     "ModelLoaderMetricNames",
+    "ModelStreamerWeightSource",
     "MxWeightSource",
     "VisionOnlyWeightSource",
     "WeightLoadContext",
@@ -50,8 +56,10 @@ __all__ = [
 def select_weight_source(context: WeightLoadContext) -> WeightSource:
     """Pick the weight source for ``context.llm_args.load_format``.
 
-    For ``load_format="auto"`` and the GMS writer, MX checkpoints get
-    `MxWeightSource` and every other format gets `CheckpointWeightSource`.
+    For ``load_format="auto"``, ``checkpoint_io_policy="model_streamer"``
+    gets `ModelStreamerWeightSource`. Otherwise, for ``load_format="auto"``
+    and the GMS writer, MX checkpoints get `MxWeightSource` and every other
+    format gets `CheckpointWeightSource`.
     Under GMS the MX source raises when the checkpoint cannot be
     fingerprinted, because a GMS reader has no disk fallback.
 
@@ -60,6 +68,8 @@ def select_weight_source(context: WeightLoadContext) -> WeightSource:
     """
     load_format = context.llm_args.load_format
     if load_format == LoadFormat.AUTO:
+        if context.llm_args.checkpoint_io_policy == CheckpointIOPolicy.MODEL_STREAMER:
+            return ModelStreamerWeightSource(context)
         return _checkpoint_source(context, fallback_on_artifact_error=True)
     if load_format == LoadFormat.GMS:
         return GmsWeightSource(
