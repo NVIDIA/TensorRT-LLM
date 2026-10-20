@@ -24,7 +24,12 @@
  * Per-bank alternating tickets protect slot metadata and shared-memory reuse.
  * This permits every allocated slot to participate even when one warp owns
  * many slots, without exceeding the ISA's outstanding bulk-group limit.
+ *
+ * The copy runs as the second phase of one kernel whose first phase is the
+ * HALO-Q scheduler that produces its plan.
  */
+#include "tensorrt_llm/kernels/moe/loadBalance/dynamicEplb/moeRebalanceHaloQ.h"
+#include "tensorrt_llm/kernels/moe/loadBalance/dynamicEplb/moeRebalanceHaloQKernel.cuh"
 #include "tensorrt_llm/kernels/moe/loadBalance/dynamicEplb/moeRebalancePlanPolicy.h"
 #include "tensorrt_llm/kernels/moe/loadBalance/dynamicEplb/moeRebalanceTma.h"
 #include "tensorrt_llm/kernels/moe/loadBalance/dynamicEplb/moeRebalanceTmaGpuPlanBuilder.cuh"
@@ -492,12 +497,14 @@ __device__ __forceinline__ void tma_copy_body(MegamoeTmaCopySegment const* segme
     int const physical_warp = threadIdx.x / 32, lane = threadIdx.x % 32;
     int const warp = physical_warp / 2; // logical RR worker, shared by its two warps
     bool const producer = (physical_warp & 1) == 0;
+    // Warps beyond the 2 * warps copy workers only join the CTA barriers.
+    bool const worker = warp < warps;
     int const slots_per_warp = megamoe_tma_warp_slot_count(total_slots, warps, warp);
     int const first_slot = megamoe_tma_warp_slot_begin(total_slots, warps, warp);
     SlotControl* control = reinterpret_cast<SlotControl*>(smem + static_cast<size_t>(total_slots) * kSlotDataBytes);
     SlotControl* warp_control = control + first_slot;
     unsigned char* warp_buffer = smem + static_cast<size_t>(first_slot) * kSlotDataBytes;
-    if (producer && lane == 0)
+    if (worker && producer && lane == 0)
     {
         for (int slot = 0; slot < slots_per_warp; ++slot)
             initialize_barrier(warp_control + slot);
@@ -505,7 +512,7 @@ __device__ __forceinline__ void tma_copy_body(MegamoeTmaCopySegment const* segme
     }
     __syncthreads();
     // Elect once for the entire pipeline so ptxas can prove one TMA issuer per warp.
-    if (cuda::ptx::elect_sync(0xffffffffu))
+    if (worker && cuda::ptx::elect_sync(0xffffffffu))
     {
         // CTA/SM is the fastest-varying dimension, then warp, then sequence.
         const uint64_t ordinal_base = megamoe_tma_worker_first_slice(blockIdx.x, gridDim.x, warp);
@@ -601,7 +608,7 @@ struct GpuDirectStorage
     MegamoeTmaGpuPlanResult* results;
 };
 
-__global__ void tma_copy_gpu_direct_kernel(GpuDirectStorage direct, int warps, int total_slots,
+__device__ __forceinline__ void tma_copy_gpu_direct_body(GpuDirectStorage const& direct, int warps, int total_slots,
     unsigned* completed_ctas, uint64_t flag_mc, uint64_t generation)
 {
     auto const& c = direct.config;
@@ -663,6 +670,83 @@ __global__ void tma_copy_gpu_direct_kernel(GpuDirectStorage direct, int warps, i
         flag_mc, generation);
 }
 
+// Scheduler arguments of the fused launch, as halo_q_scheduler_body takes them.
+struct FusedSchedulerArgs
+{
+    int const* routes;
+    int* out_slots;
+    int* out_ids;
+    int* out_levels;
+    int* out_owners;
+    unsigned long long const* peer_bases;
+    int* status;
+    int* partial;
+    int* route_aux;
+    int* grid_sync;
+    int* plan;
+    int* route_prefix;
+    unsigned long long spin_cycles;
+    int ep;
+    int experts;
+    int helpers;
+    int local_rank;
+    int route_capacity;
+    int capacity;
+    int route_count;
+};
+
+/* HALO-Q and the GPU-direct copy of its plan in one grid of config.sms CTAs.
+ * Every CTA first takes its scheduler role (CTA 0 plans, the others write
+ * routes) and then adds one to route_epoch. Route consumers on other streams
+ * wait until route_epoch reaches route_target with a stream memory wait, which
+ * holds no SM. The kernel runs in the remote memory-sync domain while its
+ * consumers run in the default one, so the release is system-scope. Each CTA
+ * also waits for route_target before it reads the plan, which CTA 0 finishes
+ * last, with the scheduler's spin bound. */
+template <int FixedEp, int FixedExperts, int FixedHelpers>
+__global__ void __launch_bounds__(512, 1) halo_q_tma_fused_kernel(FusedSchedulerArgs const scheduler,
+    GpuDirectStorage const direct, int warps, int total_slots, unsigned* completed_ctas, uint64_t flag_mc,
+    uint64_t generation, unsigned long long* route_epoch, unsigned long long route_target)
+{
+    tensorrt_llm::kernels::halo_q_scheduler_body<FixedEp, FixedExperts, FixedHelpers>(scheduler.routes,
+        scheduler.out_slots, scheduler.out_ids, scheduler.out_levels, scheduler.out_owners, scheduler.peer_bases,
+        scheduler.status, scheduler.partial, scheduler.route_aux, scheduler.grid_sync, scheduler.plan,
+        scheduler.route_prefix, nullptr, scheduler.ep, scheduler.experts, scheduler.helpers, scheduler.local_rank,
+        scheduler.route_capacity, static_cast<int>(gridDim.x), 0, scheduler.spin_cycles, 0, 0, 0, scheduler.capacity,
+        scheduler.route_count);
+    // Orders every thread's scheduler writes before thread 0's release.
+    __syncthreads();
+    if (threadIdx.x == 0)
+    {
+        unsigned long long observed;
+        asm volatile("atom.release.sys.global.add.u64 %0, [%1], 1;" : "=l"(observed) : "l"(route_epoch) : "memory");
+        long long const start = clock64();
+        for (++observed; static_cast<long long>(observed - route_target) < 0;)
+        {
+            // A CTA that never became resident would hang the copy; fail like a stale plan.
+            if (clock64() - start > static_cast<long long>(scheduler.spin_cycles))
+            {
+                printf("GPU-direct in-switch copy: route epoch timeout; no READY published\n");
+                asm volatile("trap;" ::: "memory");
+            }
+            __nanosleep(32);
+            asm volatile("ld.acquire.sys.global.u64 %0, [%1];" : "=l"(observed) : "l"(route_epoch) : "memory");
+        }
+    }
+    __syncthreads();
+    tma_copy_gpu_direct_body(direct, warps, total_slots, completed_ctas, flag_mc, generation);
+}
+
+// HALO-Q is specialized for 384 experts with 4 helpers at EP4 and EP8.
+void const* select_fused_kernel(MegamoeTmaGpuPlanConfig const& config)
+{
+    if (config.global_experts == 384 && config.helper_count == 4 && config.world == 8)
+        return reinterpret_cast<void const*>(&halo_q_tma_fused_kernel<8, 384, 4>);
+    if (config.global_experts == 384 && config.helper_count == 4 && config.world == 4)
+        return reinterpret_cast<void const*>(&halo_q_tma_fused_kernel<4, 384, 4>);
+    return reinterpret_cast<void const*>(&halo_q_tma_fused_kernel<0, 0, 0>);
+}
+
 } // namespace
 
 struct MegamoeTmaCopyState
@@ -676,8 +760,81 @@ struct MegamoeTmaCopyState
     uint64_t* direct_tables = nullptr;
     bool direct_configured = false;
     bool direct_bound = false;
+    // The fused kernel of the bound geometry, prepared by megamoe_tma_copy_bind_gpu_direct.
+    void const* fused_kernel = nullptr;
+    int fused_total_slots = 0;
+    int fused_dynamic_bytes = 0;
+    cudaLaunchAttribute fused_attributes[2]{};
+    unsigned fused_attribute_count = 0;
     std::mutex submit_mutex;
 };
+
+namespace
+{
+
+// Every fused launch has one HALO-Q CTA of this size per SM.
+constexpr int kFusedThreads = 512;
+
+/* Loads the fused kernel and reserves its local memory at cold setup: doing
+ * either at the first launch waits for the device, which deadlocks against
+ * kernels that spin on work enqueued after that launch. Also resolves the slots
+ * that fit beside both phases' static shared memory; HALO-Q reuses the same
+ * dynamic allocation before the copy initializes its slots. */
+cudaError_t prepare_fused_launch(MegamoeTmaCopyState& state)
+{
+    auto const& c = state.config;
+    auto const& plan = state.direct.config;
+    void const* kernel = select_fused_kernel(plan);
+    cudaFuncAttributes attributes{};
+    cudaError_t error = cudaFuncGetAttributes(&attributes, kernel);
+    if (error != cudaSuccess)
+        return error;
+    size_t stack = 0;
+    error = cudaDeviceGetLimit(&stack, cudaLimitStackSize);
+    if (error == cudaSuccess && stack < attributes.localSizeBytes)
+        error = cudaDeviceSetLimit(cudaLimitStackSize, attributes.localSizeBytes);
+    if (error != cudaSuccess)
+        return error;
+    int const static_bytes = static_cast<int>(attributes.sharedSizeBytes);
+    int const slots = megamoe_tma_copy_total_slots(c.device_optin_shared_bytes - static_bytes);
+    int const capacity = tensorrt_llm::kernels::broadcast_capacity(plan.world, plan.global_experts, plan.helper_count);
+    int const scheduler_bytes = static_cast<int>(sizeof(int))
+        * tensorrt_llm::kernels::halo_q_shared_ints(plan.world, plan.global_experts, capacity, kFusedThreads);
+    int const slot_bytes = static_cast<int>((slots * (kSlotDataBytes + kSlotControlBytes) + 127) & ~127U);
+    int const bytes = std::max(slot_bytes, scheduler_bytes);
+    if (attributes.maxThreadsPerBlock < kFusedThreads || slots < 2 * c.warps
+        || bytes + static_bytes > c.device_optin_shared_bytes)
+        return cudaErrorInvalidConfiguration;
+    error = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes);
+    if (error == cudaSuccess)
+        error = cudaFuncSetAttribute(
+            kernel, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
+    int active = 0;
+    if (error == cudaSuccess)
+        error = cudaOccupancyMaxActiveBlocksPerMultiprocessor(&active, kernel, kFusedThreads, bytes);
+    if (error != cudaSuccess)
+        return error;
+    if (active != 1)
+        return cudaErrorNotSupported;
+    state.fused_kernel = kernel;
+    state.fused_total_slots = slots;
+    state.fused_dynamic_bytes = bytes;
+    // The copy's NVLink traffic runs in the remote memory-sync domain, so fences
+    // and completions of kernels in the default domain do not wait for it.
+    int domains = 0;
+    if (cudaDeviceGetAttribute(&domains, cudaDevAttrMemSyncDomainCount, c.device) == cudaSuccess && domains >= 2)
+    {
+        state.fused_attributes[0].id = cudaLaunchAttributeMemSyncDomain;
+        state.fused_attributes[0].val.memSyncDomain = cudaLaunchMemSyncDomainRemote;
+        state.fused_attributes[1].id = cudaLaunchAttributeMemSyncDomainMap;
+        state.fused_attributes[1].val.memSyncDomainMap.default_ = 0;
+        state.fused_attributes[1].val.memSyncDomainMap.remote = 1;
+        state.fused_attribute_count = 2;
+    }
+    return cudaSuccess;
+}
+
+} // namespace
 
 extern "C" int megamoe_tma_copy_destroy(MegamoeTmaCopyState** state_ptr)
 {
@@ -770,7 +927,7 @@ extern "C" int megamoe_tma_copy_create(uint64_t max_segments, int sms, int warps
     config.device_sm_count = prop.multiProcessorCount;
     config.sms = megamoe_tma_copy_sm_count(sms, prop.multiProcessorCount);
     config.warps = warps ? warps : 7;
-    config.threads_per_cta = config.warps * MEGAMOE_TMA_COPY_THREADS_PER_WORKER;
+    config.threads_per_cta = kFusedThreads;
     config.slice_bytes = kSlice;
     config.max_segments = max_segments;
     config.compute_major = prop.major;
@@ -785,8 +942,11 @@ extern "C" int megamoe_tma_copy_create(uint64_t max_segments, int sms, int warps
         &config.device_shared_bytes_per_sm, cudaDevAttrMaxSharedMemoryPerMultiprocessor, config.device);
     if (error != cudaSuccess)
         return fail(error);
+    // The generic fused kernel bounds the geometry; binding prepares the
+    // specialization of the bound plan geometry.
+    void const* kernel = reinterpret_cast<void const*>(&halo_q_tma_fused_kernel<0, 0, 0>);
     cudaFuncAttributes attributes{};
-    error = cudaFuncGetAttributes(&attributes, tma_copy_gpu_direct_kernel);
+    error = cudaFuncGetAttributes(&attributes, kernel);
     if (error != cudaSuccess)
         return fail(error);
     const size_t available = config.device_optin_shared_bytes > attributes.sharedSizeBytes
@@ -807,16 +967,15 @@ extern "C" int megamoe_tma_copy_create(uint64_t max_segments, int sms, int warps
     config.bank0_slots_per_warp = (config.slots_per_warp + 1) / 2;
     config.bank1_slots_per_warp = config.slots_per_warp / 2;
     config.dynamic_shared_bytes = static_cast<int>(dynamic_bytes);
-    error = cudaFuncSetAttribute(
-        tma_copy_gpu_direct_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, config.dynamic_shared_bytes);
+    error = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, config.dynamic_shared_bytes);
     if (error != cudaSuccess)
         return fail(error);
-    error = cudaFuncSetAttribute(
-        tma_copy_gpu_direct_kernel, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
+    error
+        = cudaFuncSetAttribute(kernel, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
     if (error != cudaSuccess)
         return fail(error);
-    error = cudaOccupancyMaxActiveBlocksPerMultiprocessor(&config.max_active_ctas_per_sm, tma_copy_gpu_direct_kernel,
-        config.threads_per_cta, config.dynamic_shared_bytes);
+    error = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        &config.max_active_ctas_per_sm, kernel, config.threads_per_cta, config.dynamic_shared_bytes);
     if (error != cudaSuccess)
         return fail(error);
     if (config.max_active_ctas_per_sm != 1)
@@ -1010,25 +1169,37 @@ extern "C" int megamoe_tma_copy_bind_gpu_direct(MegamoeTmaCopyState* state, uint
     d.status = reinterpret_cast<int const*>(status);
     d.grid_sync = reinterpret_cast<int const*>(grid_sync);
     d.capacity = capacity;
+    error = prepare_fused_launch(*state);
+    if (error != cudaSuccess)
+        return error;
     state->direct_bound = true;
     return cudaSuccess;
 }
 
-extern "C" int megamoe_tma_copy_submit_gpu_direct(
-    MegamoeTmaCopyState* state, uint64_t flag_mc, uint64_t generation, void* cuda_stream)
+int megamoe_tma_copy_submit_fused(MegamoeTmaCopyState* state,
+    tensorrt_llm::kernels::MoeRebalanceHaloQParams const& scheduler, uint64_t* route_epoch, uint64_t route_target,
+    uint64_t flag_mc, uint64_t generation, void* cuda_stream)
 {
-    if (!state || !flag_mc || (flag_mc & 7) || !generation)
+    if (!state || !route_epoch || (reinterpret_cast<uintptr_t>(route_epoch) & 7) || !flag_mc || (flag_mc & 7)
+        || !generation)
         return cudaErrorInvalidValue;
     std::lock_guard<std::mutex> lock(state->submit_mutex);
     if (state->poison != cudaSuccess)
         return state->poison;
-    if (!state->direct_bound)
+    auto const& c = state->config;
+    auto const& d = state->direct;
+    // The copy reads the bound scheduler outputs, so the scheduler must write exactly those.
+    if (!state->direct_bound || scheduler.ctas != c.sms || scheduler.threads != kFusedThreads
+        || scheduler.planChannel != nullptr || scheduler.outIds != d.ids || scheduler.outLevels != d.levels
+        || scheduler.outOwners != d.owners || scheduler.planWorkspace != d.workspace || scheduler.status != d.status
+        || scheduler.gridSync != d.grid_sync || scheduler.ep != d.config.world
+        || scheduler.experts != d.config.global_experts || scheduler.helpers != d.config.helper_count)
         return cudaErrorInvalidValue;
     int device = -1;
     cudaError_t error = cudaGetDevice(&device);
     if (error != cudaSuccess)
         return error;
-    if (device != state->config.device)
+    if (device != c.device)
         return cudaErrorInvalidDevice;
     auto stream = reinterpret_cast<cudaStream_t>(cuda_stream);
     cudaStreamCaptureStatus capture;
@@ -1037,18 +1208,34 @@ extern "C" int megamoe_tma_copy_submit_gpu_direct(
         return error;
     if (capture != cudaStreamCaptureStatusNone)
         return cudaErrorStreamCaptureUnsupported;
-    // Raw direct ABI also fixes one stream: protecting descriptor scratch on a
-    // different stream would not protect HALO-Q's already-enqueued output writes.
+    // One stream orders the scheduler workspace and the plan scratch.
     if (state->work_queued && stream != state->last_stream)
         return cudaErrorInvalidValue;
+    FusedSchedulerArgs scheduler_args{scheduler.routes, scheduler.outSlots, scheduler.outIds, scheduler.outLevels,
+        scheduler.outOwners, reinterpret_cast<unsigned long long const*>(scheduler.peerBases), scheduler.status,
+        scheduler.partial, scheduler.routeAux, scheduler.gridSync, scheduler.planWorkspace, scheduler.routePrefix,
+        static_cast<unsigned long long>(scheduler.spinCycles), scheduler.ep, scheduler.experts, scheduler.helpers,
+        scheduler.localRank, scheduler.routeCapacity,
+        tensorrt_llm::kernels::broadcast_capacity(scheduler.ep, scheduler.experts, scheduler.helpers),
+        scheduler.validRouteCount};
+    GpuDirectStorage direct = d;
+    int warps = c.warps;
+    int total_slots = state->fused_total_slots;
+    unsigned* completed_ctas = state->completed_ctas;
+    auto* epoch = reinterpret_cast<unsigned long long*>(route_epoch);
+    unsigned long long target = route_target;
+    void* arguments[]
+        = {&scheduler_args, &direct, &warps, &total_slots, &completed_ctas, &flag_mc, &generation, &epoch, &target};
+    cudaLaunchConfig_t launch{};
+    launch.gridDim = dim3(c.sms, 1, 1);
+    launch.blockDim = dim3(kFusedThreads, 1, 1);
+    launch.dynamicSmemBytes = state->fused_dynamic_bytes;
+    launch.stream = stream;
+    launch.attrs = state->fused_attributes;
+    launch.numAttrs = state->fused_attribute_count;
     state->last_stream = stream;
     state->work_queued = true;
-    auto const& c = state->config;
-    // Keep this an ordinary same-stream launch: programmatic stream serialization
-    // could observe a stale matching modular epoch before HALO-Q publishes.
-    tma_copy_gpu_direct_kernel<<<c.sms, c.threads_per_cta, c.dynamic_shared_bytes, stream>>>(
-        state->direct, c.warps, c.total_slots, state->completed_ctas, flag_mc, generation);
-    error = cudaGetLastError();
+    error = cudaLaunchKernelExC(&launch, state->fused_kernel, arguments);
     if (error != cudaSuccess)
     {
         state->poison = error;

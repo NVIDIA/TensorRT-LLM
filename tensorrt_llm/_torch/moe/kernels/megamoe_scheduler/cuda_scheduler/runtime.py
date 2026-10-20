@@ -410,9 +410,9 @@ class CudaPhysicalSlotScheduler:
     def bind_gpu_direct(self, stream: object) -> None:
         """Bind a copy consumer to the existing outputs/workspace, without publication.
 
-        The consumer must enqueue on this static stream, then call
-        ``release_plan_channel`` before the next scheduler submission.
-        No additional plan allocation or GPU/host transfer is performed.
+        The consumer launches this scheduler with its copy on this static
+        stream through ``fused_submit_args``. No additional plan allocation or
+        GPU/host transfer is performed.
         """
         with self._plan_channel_lock:
             if self._plan_channel_bound:
@@ -485,35 +485,43 @@ class CudaPhysicalSlotScheduler:
         state = enter_cuda_stream(stream)
         try:
             torch.ops.trtllm.moe_rebalance_halo_q(
-                routes,
-                self.outputs.physical_slot_ids,
-                self.outputs.hot_expert_ids,
-                self.outputs.hot_expert_group_level,
-                self.outputs.hot_expert_source_ranks,
-                self.peer_base,
-                self.status,
-                self.partial,
-                self.route_aux,
-                self.grid_sync,
-                self.plan_workspace,
-                self.route_prefix,
-                self._plan_channel_ptr,
-                self.cfg.ep_size,
-                self.cfg.logical_expert_count,
-                self.cfg.extra_slots_per_rank,
-                self.cfg.local_rank,
-                self.cfg.route_count,
-                self.cfg.ctas,
-                self.cfg.threads,
-                self.cfg.enable_pdl,
-                SPIN_CYCLES,
-                self._plan_channel_abi_version,
-                self._plan_channel_words,
-                self._plan_channel_route_features,
-                valid_route_count,
+                *self._halo_q_args(routes, valid_route_count, enable_pdl=self.cfg.enable_pdl)
             )
         finally:
             exit_cuda_stream(state)
+
+    def _halo_q_args(
+        self, routes: torch.Tensor, valid_route_count: int, *, enable_pdl: bool
+    ) -> tuple:
+        """Positional moe_rebalance_halo_q arguments, shared by the fused copy op."""
+        return (
+            routes,
+            self.outputs.physical_slot_ids,
+            self.outputs.hot_expert_ids,
+            self.outputs.hot_expert_group_level,
+            self.outputs.hot_expert_source_ranks,
+            self.peer_base,
+            self.status,
+            self.partial,
+            self.route_aux,
+            self.grid_sync,
+            self.plan_workspace,
+            self.route_prefix,
+            self._plan_channel_ptr,
+            self.cfg.ep_size,
+            self.cfg.logical_expert_count,
+            self.cfg.extra_slots_per_rank,
+            self.cfg.local_rank,
+            self.cfg.route_count,
+            self.cfg.ctas,
+            self.cfg.threads,
+            enable_pdl,
+            SPIN_CYCLES,
+            self._plan_channel_abi_version,
+            self._plan_channel_words,
+            self._plan_channel_route_features,
+            valid_route_count,
+        )
 
     def submit(
         self, routes: torch.Tensor, stream_handle: int, *,
@@ -555,10 +563,40 @@ class CudaPhysicalSlotScheduler:
                 self._plan_channel_pending = True
         return self.outputs
 
+    def fused_submit_args(self, routes: torch.Tensor, stream_handle: int) -> tuple:
+        """Scheduler arguments of the bound GPU-direct copy's fused launch.
+
+        The input and stream contract is ``submit()``'s. The copy endpoint
+        launches this scheduler together with its copy, so no plan publication
+        becomes pending and the launch triggers no programmatic dependency.
+        """
+        with self._plan_channel_lock:
+            if not self._gpu_direct_bound:
+                raise RuntimeError("a fused launch requires a bound GPU-direct copy")
+            if stream_handle != self._plan_channel_stream_handle:
+                raise RuntimeError("bound plan channel requires its static stream")
+            if self._launch_stream_handle is None:
+                self._launch_stream_handle = stream_handle
+            elif stream_handle != self._launch_stream_handle:
+                raise RuntimeError(
+                    "CUDA scheduler uses one static stream because its workspace "
+                    "and reusable barrier epochs are shared"
+                )
+            valid_tokens = self._check_routes(routes, None)
+            return self._halo_q_args(routes, valid_tokens * self.cfg.topk, enable_pdl=False)
+
     def _submit_routes(
         self, routes: torch.Tensor, stream_handle: int, *,
         valid_tokens: int | None = None,
     ) -> None:
+        valid_tokens = self._check_routes(routes, valid_tokens)
+        self._launch_op(
+            routes,
+            stream_handle,
+            valid_route_count=valid_tokens * self.cfg.topk,
+        )
+
+    def _check_routes(self, routes: torch.Tensor, valid_tokens: int | None) -> int:
         if not isinstance(routes, torch.Tensor):
             raise TypeError("routes must be a torch.Tensor")
         if (routes.ndim != 2 or routes.shape[1] != self.cfg.topk
@@ -572,11 +610,7 @@ class CudaPhysicalSlotScheduler:
             valid_tokens = routes.shape[0]
         if type(valid_tokens) is not int or not 0 <= valid_tokens <= routes.shape[0]:
             raise ValueError("valid_tokens must be an int in [0,T]")
-        self._launch_op(
-            routes,
-            stream_handle,
-            valid_route_count=valid_tokens * self.cfg.topk,
-        )
+        return valid_tokens
 
     def run(
         self,

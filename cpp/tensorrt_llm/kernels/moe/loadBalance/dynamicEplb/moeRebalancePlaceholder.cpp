@@ -28,6 +28,11 @@ TRTLLM_NAMESPACE_BEGIN
 namespace kernels
 {
 
+void checkMoeRebalanceHaloQParams(MoeRebalanceHaloQParams const&)
+{
+    TLLM_THROW("Per-layer dynamic EPLB HALO-Q requires a requested SM100, SM103, or SM107 target");
+}
+
 void invokeMoeRebalanceHaloQ(MoeRebalanceHaloQParams const&, cudaStream_t)
 {
     TLLM_THROW("Per-layer dynamic EPLB HALO-Q requires a requested SM100, SM103, or SM107 target");
@@ -69,7 +74,8 @@ extern "C" int megamoe_tma_copy_bind_gpu_direct(
     return unsupported();
 }
 
-extern "C" int megamoe_tma_copy_submit_gpu_direct(MegamoeTmaCopyState*, uint64_t, uint64_t, void*)
+int megamoe_tma_copy_submit_fused(MegamoeTmaCopyState*, tensorrt_llm::kernels::MoeRebalanceHaloQParams const&,
+    uint64_t*, uint64_t, uint64_t, uint64_t, void*)
 {
     return unsupported();
 }
