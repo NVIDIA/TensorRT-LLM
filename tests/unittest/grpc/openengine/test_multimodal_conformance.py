@@ -5,6 +5,7 @@
 
 import asyncio
 import base64
+import importlib
 from pathlib import Path
 
 import pytest
@@ -153,7 +154,10 @@ def test_image_capability_agrees_with_generate(vlm):
 
 
 def test_video_capability_agrees_with_generate(vlm):
-    pytest.importorskip("cv2", reason="video decoding requires optional OpenCV")
+    try:
+        importlib.import_module("cv2")
+    except (ImportError, OSError) as error:
+        pytest.fail(f"video conformance requires a working OpenCV install: {error}", pytrace=False)
     inference, control = _servicers(vlm)
     info = _model_info(control)
     assert info.supports_multimodal is True

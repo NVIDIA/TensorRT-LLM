@@ -406,6 +406,27 @@ class TestSafeAiohttpGet:
             with pytest.raises(MediaFetchError, match="fetch failed"):
                 self._run(_safe_aiohttp_get("http://example.com/file.bin"))
 
+    @pytest.mark.parametrize(
+        "error",
+        [
+            aiohttp.InvalidURL("not a URL"),
+            aiohttp.ClientSSLError(MagicMock(), OSError("TLS failed")),
+        ],
+    )
+    @patch("tensorrt_llm.inputs.media_io.socket.getaddrinfo", return_value=PUBLIC_DNS)
+    def test_preserves_permanent_client_error(self, _, error):
+        class _FakeSession:
+            def get(self, url, **kwargs):
+                raise error
+
+        with patch(
+            "tensorrt_llm.inputs.media_io._get_aiohttp_session",
+            new=AsyncMock(return_value=_FakeSession()),
+        ):
+            with pytest.raises(type(error)) as raised:
+                self._run(_safe_aiohttp_get("http://example.com/file.bin"))
+        assert raised.value is error
+
     @patch("tensorrt_llm.inputs.media_io.socket.getaddrinfo", return_value=PUBLIC_DNS)
     def test_preserves_non_retryable_http_error(self, _):
         with patch(
