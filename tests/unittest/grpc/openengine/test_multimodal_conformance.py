@@ -215,6 +215,8 @@ def test_audio_capability_agrees_with_generate(whisper):
     )
 
     assert info.supports_multimodal is True
+    assert info.supports_text_input is True
+    assert info.supports_token_ids_input is False
     assert list(info.extra["trtllm_supported_modalities"]) == ["audio"]
 
     audio_uri = (

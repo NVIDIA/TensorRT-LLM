@@ -86,6 +86,9 @@ def _llm(**overrides):
         args=args,
         llm_id="instance-1",
         tokenizer=overrides.get("_tokenizer", object()),
+        input_processor=SimpleNamespace(
+            supports_token_ids_input=overrides.get("_supports_token_ids_input", True)
+        ),
         _executor=executor,
         _check_health=lambda: executor.check_health(),
     )
@@ -545,6 +548,15 @@ async def test_text_input_is_not_advertised_without_a_tokenizer():
 async def test_text_input_is_advertised_when_a_tokenizer_exists():
     info = await _servicer().GetModelInfo(model_pb2.GetModelInfoRequest(), FakeServicerContext())
     assert info.supports_text_input is True
+
+
+@pytest.mark.asyncio
+async def test_token_ids_are_not_advertised_when_the_processor_ignores_them():
+    info = await _servicer(_supports_token_ids_input=False).GetModelInfo(
+        model_pb2.GetModelInfoRequest(), FakeServicerContext()
+    )
+    assert info.supports_text_input is True
+    assert info.supports_token_ids_input is False
 
 
 @pytest.mark.asyncio

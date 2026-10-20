@@ -41,6 +41,7 @@ def _ignore_synthetic_decoded_size(monkeypatch) -> None:
             handler.loader_factory,
             lambda _decoded: 0,
             handler.runtime_available,
+            handler.reserves_decoded_bytes,
         ),
     )
 
@@ -55,6 +56,7 @@ def _set_video_runtime_available(monkeypatch, available: bool) -> None:
             handler.loader_factory,
             handler.decoded_bytes,
             lambda: available,
+            handler.reserves_decoded_bytes,
         ),
     )
 
@@ -334,6 +336,15 @@ def test_decoded_audio_bytes_count_samples_and_reject_unknown_types():
         request_mapping._decoded_audio_bytes(object())
 
 
+def test_decoded_media_budget_settles_peak_to_retained_bytes():
+    budget = request_mapping._DecodedMediaBudget(20)
+
+    first = budget.reserve(15)
+    first.commit(5)
+    second = budget.reserve(15)
+    second.release()
+
+
 def test_media_capability_rejects_a_malformed_placeholder_at_startup(image_llm, monkeypatch):
     llm, _ = image_llm
     monkeypatch.setattr(
@@ -350,7 +361,7 @@ def test_media_capability_rejects_a_malformed_placeholder_at_startup(image_llm, 
 async def test_handler_table_drives_capability_and_mapping(image_llm, monkeypatch):
     llm, _ = image_llm
 
-    def video_loader_factory(_llm):
+    def video_loader_factory(_llm, _budget):
         async def load(item, index):
             return f"video-{index}:{bytes(item.raw_bytes).decode()}"
 
@@ -405,6 +416,15 @@ async def test_text_only_input_mapping_is_unchanged():
     assert await request_mapping._input_from_request(token_ids, llm) == {
         "prompt_token_ids": [1, 2, 3]
     }
+
+
+@pytest.mark.asyncio
+async def test_token_ids_are_rejected_when_the_processor_does_not_consume_them():
+    llm = SimpleNamespace(input_processor=SimpleNamespace(supports_token_ids_input=False))
+    request = generation_pb2.GenerateRequest(token_ids=generation_pb2.TokenIds(ids=[1, 2, 3]))
+
+    with pytest.raises(UnsupportedFeatureError, match="send a text prompt"):
+        await request_mapping._input_from_request(request, llm)
 
 
 @pytest.mark.asyncio
@@ -535,11 +555,14 @@ async def test_media_sources_preserve_global_order(image_video_audio_llm, monkey
 
     mapped = await request_mapping._input_from_request(request, image_video_audio_llm)
 
-    assert created_with == [
-        ("video", {"format": "np", "num_frames": 4}, None),
-        ("image", {"format": "np"}, None),
-        ("audio", None, None),
-    ]
+    assert len(created_with) == 3
+    video_modality, video_defaults, video_runtime = created_with[0]
+    assert video_modality == "video"
+    assert video_defaults == {"format": "np", "num_frames": 4}
+    assert set(video_runtime) == {"decoded_memory_reserver"}
+    assert callable(video_runtime["decoded_memory_reserver"])
+    assert created_with[1] == ("image", {"format": "np"}, None)
+    assert created_with[2] == ("audio", None, None)
     assert audio_sources == ["https://example.com/audio.wav"]
     assert mapped["multi_modal_data"]["audio"][0][1] == 16000
     assert [video.metadata["source"] for video in mapped["multi_modal_data"]["video"]] == [
@@ -713,6 +736,45 @@ async def test_total_decoded_image_bytes_are_bounded(image_llm, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_concurrent_video_loads_share_budget_before_allocation(image_video_llm, monkeypatch):
+    allocations = []
+
+    class _VideoIo:
+        def __init__(self, reserver):
+            self._reserver = reserver
+
+        @classmethod
+        def create(cls, defaults, runtime):
+            return cls(runtime["decoded_memory_reserver"])
+
+        async def async_load_bytes(self, data):
+            reservation = self._reserver(12)
+            allocations.append(bytes(data))
+            try:
+                await asyncio.Future()
+            finally:
+                reservation.release()
+
+    monkeypatch.setattr(request_mapping, "VideoMediaIO", _VideoIo)
+    monkeypatch.setattr(request_mapping, "_MAX_TOTAL_DECODED_MEDIA_BYTES", 20)
+    request = generation_pb2.GenerateRequest(
+        prompt="videos",
+        media=[
+            generation_pb2.MediaItem(
+                modality=generation_pb2.MODALITY_VIDEO,
+                raw_bytes=value,
+            )
+            for value in (b"first", b"second")
+        ],
+    )
+
+    with pytest.raises(ValueError, match="decoded media exceeds"):
+        await request_mapping._input_from_request(request, image_video_llm)
+
+    assert allocations == [b"first"]
+
+
+@pytest.mark.asyncio
 async def test_image_mapping_supports_token_ids(image_llm, monkeypatch):
     llm, _ = image_llm
 
@@ -782,6 +844,67 @@ async def test_generate_submits_image_and_reports_expanded_prompt_usage(image_ll
 
 
 @pytest.mark.asyncio
+async def test_duplicate_request_id_is_reserved_while_media_loads(image_llm, monkeypatch):
+    capability_llm, _ = image_llm
+    llm = _ImageLlm(
+        capability_llm.input_processor,
+        capability_llm._hf_model_config,
+    )
+    load_started = asyncio.Event()
+    release_load = asyncio.Event()
+    load_count = 0
+
+    class _ImageIo:
+        @classmethod
+        def create(cls, defaults, runtime):
+            return cls()
+
+        async def async_load_bytes(self, data):
+            nonlocal load_count
+            load_count += 1
+            load_started.set()
+            await release_load.wait()
+            return np.zeros((1, 1, 3), dtype=np.uint8)
+
+    monkeypatch.setattr(request_mapping, "ImageMediaIO", _ImageIo)
+    servicer = OpenEngineInferenceServicer(llm, model="image-model")
+    request = generation_pb2.GenerateRequest(
+        request_id="duplicate-image-request",
+        model="image-model",
+        prompt="<image_1>",
+        media=[
+            generation_pb2.MediaItem(
+                modality=generation_pb2.MODALITY_IMAGE,
+                raw_bytes=b"image",
+            )
+        ],
+    )
+
+    async def collect(context):
+        return [response async for response in servicer.Generate(request, context)]
+
+    first_context = FakeServicerContext()
+    first = asyncio.create_task(collect(first_context))
+    await load_started.wait()
+    duplicate_context = FakeServicerContext()
+    try:
+        with pytest.raises(AbortError):
+            await asyncio.wait_for(collect(duplicate_context), timeout=1)
+        assert duplicate_context.abort_code == grpc.StatusCode.ALREADY_EXISTS
+        assert load_count == 1
+        assert servicer.active_request_count() == 1
+        assert servicer.abort_request_by_id(request.request_id)
+    finally:
+        release_load.set()
+        first_outcome = await asyncio.gather(first, return_exceptions=True)
+
+    assert isinstance(first_outcome[0], AbortError)
+    assert first_context.abort_code == grpc.StatusCode.CANCELLED
+    assert llm.generate_kwargs is None
+    assert servicer.active_request_count() == 0
+
+
+@pytest.mark.asyncio
 async def test_generate_maps_media_errors_to_grpc_statuses(image_llm):
     capability_llm, _ = image_llm
     llm = _ImageLlm(
@@ -823,6 +946,7 @@ async def test_generate_maps_media_errors_to_grpc_statuses(image_llm):
         async for _ in servicer.Generate(file_request, malformed_context):
             pass
     assert malformed_context.abort_code == grpc.StatusCode.INVALID_ARGUMENT
+    assert servicer.active_request_count() == 0
 
 
 @pytest.mark.asyncio
