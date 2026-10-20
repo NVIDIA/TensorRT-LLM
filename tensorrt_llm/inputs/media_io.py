@@ -312,6 +312,8 @@ async def _safe_aiohttp_get(url: str, timeout_sec: int = 30) -> bytes:
                         f"remote media server returned HTTP {error.status}"
                     ) from error
                 raise
+            except (aiohttp.InvalidURL, aiohttp.ClientSSLError):
+                raise
             except (aiohttp.ClientError, asyncio.TimeoutError) as error:
                 raise MediaFetchError(f"remote media fetch failed: {error}") from error
         raise RuntimeError("Too many redirects")
