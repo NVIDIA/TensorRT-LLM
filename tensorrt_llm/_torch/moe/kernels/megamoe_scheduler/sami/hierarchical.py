@@ -605,9 +605,10 @@ class HierarchicalSamiWeightBroadcast:
         with self._lock:
             if self._handoff_aborted or self._scheduler is None:
                 raise RuntimeError("hierarchical scheduler handoff is not operational")
+            # bind_generation_reuse_authority() validated this single-assignment
+            # authority, so identity suffices on the per-layer path.
             if authority is not self._reuse_authority:
                 raise PermissionError("generation reuse authority identity mismatch")
-            self._validate_reuse_authority(authority)
             if generation != self._active_generation:
                 raise ValueError("generation is not the active live bank")
             if self._local_release_generation != generation:
@@ -617,9 +618,9 @@ class HierarchicalSamiWeightBroadcast:
             self._collective_safe_generation = generation
 
     def _require_live_bank_reusable(self) -> None:
+        # The bound authority was validated once, when it was bound.
         if self._reuse_authority is None:
             raise RuntimeError("single live bank has no bound collective reuse authority")
-        self._validate_reuse_authority(self._reuse_authority)
         if (
             self._active_generation
             and self._collective_safe_generation < self._active_generation
