@@ -19,6 +19,7 @@ import json
 import os
 import pickle  # nosec B403
 import shutil
+import sys
 import tempfile
 import threading
 import time
@@ -130,6 +131,9 @@ class _RequestSender:
         self._cond = threading.Condition()
         self._closed = False
         self._thread: Optional[threading.Thread] = None
+        # Bound here because ``close`` can run from a finalizer during
+        # interpreter teardown, when module globals may already be None.
+        self._is_finalizing = sys.is_finalizing
 
     def send(self, payload: bytes) -> None:
         """Queue a pickled request for the worker.
@@ -148,13 +152,23 @@ class _RequestSender:
             self._cond.notify()
 
     def close(self, timeout: Optional[float] = None) -> None:
-        """Send everything queued, then stop the sender thread."""
+        """Send everything queued, then stop the sender thread.
+
+        Calls after the thread has stopped return at once. During interpreter
+        finalization this returns without doing anything: the daemon thread
+        can no longer run, the ZMQ context may be gone, and joining a thread
+        there fails.
+        """
+        if self._is_finalizing():
+            return
         with self._cond:
             self._closed = True
             self._cond.notify()
             thread = self._thread
         if thread is not None:
             thread.join(timeout)
+            if not thread.is_alive():
+                self._thread = None
 
     def _run(self) -> None:
         while True:

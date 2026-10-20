@@ -40,9 +40,19 @@ class _RecordingQueue:
             self.release_first_put.wait(timeout=10)
         self.messages.append(msg)
 
+    def put_noblock(self, msg, *, retry=1, wait_time=0.001):
+        self.messages.append(msg)
+
 
 def _payloads(*items):
     return [pickle.dumps(item) for item in items]
+
+
+def _bare_proxy():
+    proxy = GenerationExecutorProxy.__new__(GenerationExecutorProxy)
+    # Keeps the __del__ -> shutdown() path a no-op at GC time.
+    proxy.workers_started = False
+    return proxy
 
 
 def test_batching_is_opt_in(monkeypatch):
@@ -90,6 +100,57 @@ def test_close_flushes_queued_requests_and_drops_later_ones():
     assert request_queue.messages == [_payloads("first"), _payloads("queued")]
 
 
+def test_close_is_idempotent():
+    request_queue = _RecordingQueue()
+    sender = _RequestSender(request_queue, queue.Queue())
+    sender.send(pickle.dumps("a"))
+    sender.close(timeout=10)
+    assert sender._thread is None
+    sender.close(timeout=10)
+    assert request_queue.messages == [_payloads("a")]
+
+
+def test_close_during_interpreter_finalization_does_not_join():
+    request_queue = _RecordingQueue(block_first_put=True)
+    sender = _RequestSender(request_queue, queue.Queue())
+    sender.send(pickle.dumps("first"))
+    assert request_queue.first_put_started.wait(timeout=10)
+    sender.send(pickle.dumps("queued"))
+    # Joining would wait for the blocked send; at teardown close() must return at once.
+    sender._is_finalizing = lambda: True
+    sender.close()
+    assert sender._thread is not None
+    # Outside finalization the same sender still flushes and stops.
+    sender._is_finalizing = lambda: False
+    request_queue.release_first_put.set()
+    sender.close(timeout=10)
+    assert sender._thread is None
+    assert request_queue.messages == [_payloads("first"), _payloads("queued")]
+
+
+def test_pre_shutdown_flushes_batched_requests_before_the_sentinel():
+    request_queue = _RecordingQueue(block_first_put=True)
+    proxy = _bare_proxy()
+    proxy.request_queue = request_queue
+    proxy._request_sender = _RequestSender(request_queue, queue.Queue())
+    proxy._send_request("first")
+    assert request_queue.first_put_started.wait(timeout=10)
+    proxy._send_request("queued")
+
+    proxy.workers_started = True
+    proxy.doing_shutdown = False
+    proxy._worker_process_monitor = SimpleNamespace(close=lambda: None)
+    proxy._results = {}
+    proxy.mpi_futures = []
+    shutdown = threading.Thread(target=proxy.pre_shutdown)
+    shutdown.start()
+    request_queue.release_first_put.set()
+    shutdown.join(timeout=10)
+    assert not shutdown.is_alive()
+    proxy.workers_started = False
+    assert request_queue.messages == [_payloads("first"), _payloads("queued"), None]
+
+
 def test_transport_error_reaches_error_queue():
     class _FailingQueue:
         def put(self, msg):
@@ -105,7 +166,7 @@ def test_transport_error_reaches_error_queue():
 
 
 def test_batched_request_is_captured_when_sent():
-    proxy = GenerationExecutorProxy.__new__(GenerationExecutorProxy)
+    proxy = _bare_proxy()
     sent = []
     proxy._request_sender = SimpleNamespace(send=sent.append)
 
@@ -122,7 +183,7 @@ def test_batched_request_is_captured_when_sent():
 
 
 def test_unbatched_request_is_put_directly():
-    proxy = GenerationExecutorProxy.__new__(GenerationExecutorProxy)
+    proxy = _bare_proxy()
     request_queue = _RecordingQueue()
     proxy.request_queue = request_queue
     proxy._send_request("a")
