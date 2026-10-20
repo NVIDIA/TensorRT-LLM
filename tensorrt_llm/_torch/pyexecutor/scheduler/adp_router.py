@@ -538,6 +538,10 @@ class KVCacheAwareADPRouter(ADPRouter):
         # empty fetch cycles.
         self.account_for_in_transfer = account_for_in_transfer
         self.async_transfer_manager = async_transfer_manager
+        # While scheduler_v2's long-prefill demotion is on, publish each
+        # request's uncached prefill on its chosen rank (prompt minus the
+        # probed prefix match) for the scheduler to rank it by.
+        self._publish_uncached_estimate = UncachedPrefillEstimator.enabled_by_env()
 
     def create_rank_state(
         self,
@@ -648,6 +652,10 @@ class KVCacheAwareADPRouter(ADPRouter):
         matches = self._all_ranks_prefix_matches
         return matches[rank].get(req_id, 0) if rank < len(matches) else 0
 
+    def _publish_uncached(self, req_item, uncached_tokens: int) -> None:
+        if self._publish_uncached_estimate and req_item.request is not None:
+            req_item.request.py_uncached_prefill_tokens = uncached_tokens
+
     def route_requests(
         self,
         all_rank_states: list[RankState],
@@ -696,6 +704,7 @@ class KVCacheAwareADPRouter(ADPRouter):
                     0,
                 )
                 all_ranks_num_active_tokens[target_dp_rank] += effective
+                self._publish_uncached(req_item, effective)
                 scheduled = True
                 all_ranks_new_requests[target_dp_rank].append(req_item)
                 # Only mark a rank as warmed once a request actually landed
@@ -787,6 +796,7 @@ class KVCacheAwareADPRouter(ADPRouter):
 
             effective_added = max(req_tokens - match_lens[best_rank], 0)
             all_ranks_num_active_tokens[best_rank] += effective_added
+            self._publish_uncached(req_item, effective_added)
 
             # Progressive eviction: rank leaves eligibility once it hits
             # the cap for the rest of this batch.

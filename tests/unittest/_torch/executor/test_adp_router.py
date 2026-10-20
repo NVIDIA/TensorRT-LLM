@@ -1242,6 +1242,28 @@ class TestKVCacheAwareADPRouterRouting:
         assert result[0] == []
         assert result[1] == [req]
 
+    def test_uncached_prefill_published_for_the_chosen_rank(self, monkeypatch):
+        """While demotion is on, the request carries its prompt minus the
+        prefix match on the rank it was routed to; off, nothing is set."""
+        monkeypatch.setenv("TLLM_V2_CTX_DEMOTE_UNCACHED_TOKENS", "1024")
+        router = self._make_router(tp_size=2, lbw=0.5)
+        req = _make_request_item(req_id=1, num_tokens=100)
+        result, _ = router.route_requests(self._rank_states(2), [req], max_num_active_requests=10)
+        assert result[1] == [req]
+        assert req.request.py_uncached_prefill_tokens == 50
+        # An explicit rank is honoured, and the estimate follows that rank.
+        pinned = _make_request_item(req_id=1, num_tokens=100, target_dp_rank=0)
+        pinned.request.py_scheduling_params.attention_dp_relax = False
+        router.route_requests(self._rank_states(2), [pinned], max_num_active_requests=10)
+        assert pinned.request.py_uncached_prefill_tokens == 100
+
+        monkeypatch.delenv("TLLM_V2_CTX_DEMOTE_UNCACHED_TOKENS")
+        off = _make_request_item(req_id=1, num_tokens=100)
+        self._make_router(tp_size=2, lbw=0.5).route_requests(
+            self._rank_states(2), [off], max_num_active_requests=10
+        )
+        assert not isinstance(off.request.py_uncached_prefill_tokens, int)
+
     def test_default_attention_dp_relax_is_relaxed(self):
         router = self._make_router(tp_size=2)
         req_relax = _make_request_item(1, target_dp_rank=0)
