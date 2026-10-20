@@ -62,7 +62,7 @@ from tensorrt_llm._torch.weight_sharing import (
     SourceIdentity,
     load_weight_manifest,
 )
-from tensorrt_llm.llmapi.llm_args import LoadFormat
+from tensorrt_llm.llmapi.llm_args import CheckpointIOPolicy, LoadFormat
 
 _SOURCE_IDENTITY = SourceIdentity(
     format_version=SOURCE_IDENTITY_FORMAT_VERSION,
@@ -559,7 +559,9 @@ def _tiny_profile_registry(*, speculative_mode: str | None = None) -> PostTransf
 
 
 def _make_loader(monkeypatch, *, events, spec_config=None):
-    llm_args = SimpleNamespace(load_format=LoadFormat.AUTO)
+    llm_args = SimpleNamespace(
+        load_format=LoadFormat.AUTO, checkpoint_io_policy=CheckpointIOPolicy.NATIVE
+    )
     loader = ModelLoader(
         llm_args=llm_args,
         mapping=MagicMock(name="mapping"),

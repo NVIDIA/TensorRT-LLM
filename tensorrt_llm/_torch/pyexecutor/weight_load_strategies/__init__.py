@@ -13,6 +13,8 @@ Load strategy                 Chosen when                     Where the weights 
 ============================  ==============================  ===================================
 `CheckpointLoadStrategy`      ``load_format="auto"``          checkpoint files, via the loader
 `MxLoadStrategy`              ``checkpoint_format="MX"``      a running donor over RDMA, or files
+`ModelStreamerLoadStrategy`   ``checkpoint_io_policy=``       files, streamed by Run:ai Model
+                              ``"model_streamer"``            Streamer (Kimi K3 only)
 `GmsLoadStrategy`             ``load_format="gms"``           a GPU memory pool shared on a node
 `DummyLoadStrategy`           ``load_format="dummy"``         random values, for tests
 `VisionOnlyLoadStrategy`      ``load_format="vision_only"``   nothing; vision weights load early
@@ -21,16 +23,19 @@ Load strategy                 Chosen when                     Where the weights 
 `select_weight_load_strategy()` picks the strategy, and `WeightLoadStrategy` lists the steps
 `ModelLoader.load()` runs on it. Helpers shared by several strategies live in
 `model_hooks` (module post-load hooks) and `post_transform` (whether MX and
-GMS loads may share already-transformed weights).
+GMS loads may share already-transformed weights). `model_streamer` also holds
+`ModelStreamerPlan`, which a model's ``plan_model_streamer_load()`` returns to
+say which tensors it needs and how to load them.
 """
 
 from tensorrt_llm.checkpoint_format import CheckpointFormat
-from tensorrt_llm.llmapi.llm_args import LoadFormat
+from tensorrt_llm.llmapi.llm_args import CheckpointIOPolicy, LoadFormat
 
 from .base import ModelLoaderMetricNames, WeightLoadContext, WeightLoadStrategy
 from .checkpoint import CheckpointLoadStrategy
 from .dummy import DummyLoadStrategy, VisionOnlyLoadStrategy, initialize_dummy_weights
 from .gms import GmsLoadStrategy
+from .model_streamer import ModelStreamerLoadStrategy
 from .mx import MxLoadStrategy
 
 __all__ = [
@@ -38,6 +43,7 @@ __all__ = [
     "DummyLoadStrategy",
     "GmsLoadStrategy",
     "ModelLoaderMetricNames",
+    "ModelStreamerLoadStrategy",
     "MxLoadStrategy",
     "VisionOnlyLoadStrategy",
     "WeightLoadContext",
@@ -50,8 +56,10 @@ __all__ = [
 def select_weight_load_strategy(context: WeightLoadContext) -> WeightLoadStrategy:
     """Pick the load strategy for ``context.llm_args.load_format``.
 
-    For ``load_format="auto"`` and the GMS writer, MX checkpoints get
-    `MxLoadStrategy` and every other format gets `CheckpointLoadStrategy`.
+    For ``load_format="auto"``, ``checkpoint_io_policy="model_streamer"``
+    gets `ModelStreamerLoadStrategy`. Otherwise, for ``load_format="auto"``
+    and the GMS writer, MX checkpoints get `MxLoadStrategy` and every other
+    format gets `CheckpointLoadStrategy`.
     Under GMS the MX strategy raises when the checkpoint cannot be
     fingerprinted, because a GMS reader has no disk fallback.
 
@@ -60,6 +68,8 @@ def select_weight_load_strategy(context: WeightLoadContext) -> WeightLoadStrateg
     """
     load_format = context.llm_args.load_format
     if load_format == LoadFormat.AUTO:
+        if context.llm_args.checkpoint_io_policy == CheckpointIOPolicy.MODEL_STREAMER:
+            return ModelStreamerLoadStrategy(context)
         return _checkpoint_load_strategy(context, fallback_on_artifact_error=True)
     if load_format == LoadFormat.GMS:
         return GmsLoadStrategy(
