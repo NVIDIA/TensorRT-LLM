@@ -410,6 +410,7 @@ def test_cute_dsl_fp8_paged_mqa_logits_kernel_split(
     torch.testing.assert_close(dsl, ref, atol=5e-5, rtol=1e-5)
 
 
+@skip_not_sm100
 @pytest.mark.parametrize("batch_size", [1, 4])
 @pytest.mark.parametrize("next_n", [1, 2, 3, 4])
 @pytest.mark.parametrize("num_heads", [64])

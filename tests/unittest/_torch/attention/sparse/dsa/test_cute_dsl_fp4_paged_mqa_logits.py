@@ -547,6 +547,7 @@ def test_cute_dsl_fp4_paged_mqa_logits(
     )
 
 
+@skip_not_sm100
 @pytest.mark.parametrize(
     "next_n,num_next_n_atoms,atom,num_heads",
     [
