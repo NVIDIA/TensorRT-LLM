@@ -23,15 +23,16 @@ import dataclasses
 import pytest
 import torch
 from topp_rs_test_utils import (
+    _NUC_MASS_TOL,
     DEV,
     KINDS,
     Nucleus,
     V,
-    diff_mass,
     kernel_kept,
     make_rows,
     scaled,
     support_diff_ok,
+    target_error,
 )
 
 from tensorrt_llm._torch.speculative import fast_topp_rejection_sampling as ftp
@@ -57,23 +58,19 @@ def _check_nucleus(logits, temps, tps, cfg=None):
     assert bool((status == 0).all()), status.nonzero().flatten().tolist()
     nuc = Nucleus(logits, temps, tps)
     same = (kept == nuc.kept).all(dim=1)
-    bad = [
-        r
-        for r in (~same).nonzero().flatten().tolist()
-        if not support_diff_ok(nuc, r, kept[r], nuc.kept[r])
-    ]
+    errs = {r: target_error(nuc, r, kept[r]) for r in (~same).nonzero().flatten().tolist()}
+    bad = {r: e for r, e in errs.items() if e > _NUC_MASS_TOL}
     assert not bad, [
-        (r, float(temps[r]), float(tps[r]), int(kept[r].sum()), int(nuc.kept[r].sum()),
-         float(nuc.gap[r]), diff_mass(nuc, r, kept[r], nuc.kept[r]))
-        for r in bad
-    ]  # fmt: skip
+        (r, float(temps[r]), float(tps[r]), int(kept[r].sum()), int(nuc.kept[r].sum()), e)
+        for r, e in bad.items()
+    ]
     zrel = ((rec[:, 1].double() - nuc.mass).abs() / nuc.mass)[same]
     srel = (rec[:, 2].double() - nuc.s).abs() / nuc.s
     # Weights are exp(z - max) with z rounded to float32: |z| * 2^-24 relative error each.
     tol = _MASS_TOL + 6e-8 * float(nuc.z.abs().max())
     assert float(zrel.max()) <= tol, float(zrel.max())
     assert float(srel.max()) <= tol, float(srel.max())
-    return int((~same).sum())
+    return len(errs), max(errs.values(), default=0.0)
 
 
 # Runs the single-program kernel for every row, without the chunk-parallel pipeline.
@@ -93,9 +90,10 @@ def test_nucleus_matches_oracle(kind, bf16, fast):
     logits = make_rows(kind, len(combos), V, gen, bf16)
     temps = torch.tensor([t for t, _ in combos], dtype=torch.float32, device=DEV)
     tps = torch.tensor([p for _, p in combos], dtype=torch.float32, device=DEV)
-    differing = _check_nucleus(logits, temps, tps, None if fast else SINGLE_PROGRAM)
+    differing, worst = _check_nucleus(logits, temps, tps, None if fast else SINGLE_PROGRAM)
     print(
-        f"nucleus {kind} bf16={bf16} fast={fast}: {logits.shape[0]} rows, {differing} within rounding"
+        f"nucleus {kind} bf16={bf16} fast={fast}: {logits.shape[0]} rows, {differing} within "
+        f"rounding (worst target error {worst:.2e}, allowed {_NUC_MASS_TOL:.0e})"
     )
 
 
@@ -315,3 +313,150 @@ def test_records_are_bitwise_reproducible(kind):
             logits[r : r + 1].contiguous(), temps[r : r + 1], tps[r : r + 1]
         )
         assert torch.equal(base[r : r + 1], alone), r
+
+
+def _cluster_row(n_top, n_mid, mid_logit, low_logit, gen, contiguous=False):
+    """One row: ``n_top`` tokens at logit 0 (one exact tie group), ``n_mid`` at ``mid_logit``, the rest at
+    ``low_logit``; the tokens of the groups are the lowest ids (``contiguous``) or scattered."""
+    x = torch.full((V,), low_logit, device=DEV)
+    ids = (
+        torch.arange(V, device=DEV) if contiguous else torch.randperm(V, generator=gen, device=DEV)
+    )
+    x[ids[:n_top]] = 0.0
+    x[ids[n_top : n_top + n_mid]] = mid_logit
+    return x
+
+
+def _adversarial_cases(gen):
+    """(name, row, temperatures, top-ps) cases: tie clusters of the candidate cap's size and several times it,
+    with and without a second level (the first case puts the groups at the lowest token ids), and a tie group
+    at the pivot below a sharp head."""
+    cap = ftp.DEFAULT_NUCLEUS.cap
+    repro = _cluster_row(14706, 49, -7.98, -27.8, gen, contiguous=True)
+    cases = [("contiguous 14706 tied + 49 below", repro, (1.7, 2.0, 1.0), (0.9999,))]
+    for n_top in (cap // 2, cap, 2 * cap, 4 * cap, 14706):
+        for n_mid, mid in ((0, 0.0), (49, -7.98), (4000, -3.0)):
+            row = _cluster_row(n_top, n_mid, mid, -27.8, gen)
+            ps = (0.9, 0.99, 0.9999, 0.99999, 0.99999994)
+            cases.append((f"{n_top} tied + {n_mid} below", row, (1.0, 1.7, 2.0), ps))
+    for n_tied in (cap // 2, cap, 3 * cap):
+        x = torch.full((V,), -30.0, device=DEV)
+        ids = torch.randperm(V, generator=gen, device=DEV)
+        x[ids[:40]] = 8.0 + torch.randn(40, generator=gen, device=DEV)
+        x[ids[40 : 40 + n_tied]] = 0.0
+        cases.append(
+            (f"40-token head, {n_tied} tied at the pivot", x, (1.0, 1.7), (0.95, 0.99, 0.9999))
+        )
+    return cases
+
+
+def test_tie_clusters_and_thin_tails_stay_in_the_sandwich():
+    """Adversarial tie structures (`_adversarial_cases`) at the production vocabulary, with targets up to
+    ``1 - 6e-8`` of the total mass (top-p 0.99999994), which leave a tail of ~1e-5 of the mass to decide the
+    nucleus. Every kept-set must lie within `_NUC_MASS_TOL` of the oracle's target: only a token boundary
+    inside that tolerance is a rounding difference. Rows up to top-p 0.9999 must resolve exactly (status 0).
+    Above it the target is too close to the total for the mass sums to certify a zone, so the row keeps a
+    superset of the last certified zone (status 1 or 2), still inside the sandwich."""
+    gen = torch.Generator(device=DEV).manual_seed(88)
+    for name, row, temps, tps in _adversarial_cases(gen):
+        combos = [(t, p) for t in temps for p in tps]
+        logits = row.unsqueeze(0).expand(len(combos), V).contiguous()
+        t = torch.tensor([c[0] for c in combos], dtype=torch.float32, device=DEV)
+        p = torch.tensor([c[1] for c in combos], dtype=torch.float32, device=DEV)
+        kept, rec = kernel_kept(logits, t, p)
+        nuc = Nucleus(logits, t, p)
+        for r, (temp, top_p) in enumerate(combos):
+            err = target_error(nuc, r, kept[r])
+            ctx = (
+                name,
+                temp,
+                top_p,
+                int(rec[r, 3]),
+                int(kept[r].sum()),
+                int(nuc.kept[r].sum()),
+                err,
+            )
+            assert err <= _NUC_MASS_TOL, ctx
+            assert top_p > 0.9999 or rec[r, 3] == 0, ctx
+
+
+def test_acceptance_criterion_rejects_a_wrong_nucleus():
+    """The criterion is not vacuous. A flat row carries ~6e-6 of its mass per token, so a clause that excuses "a
+    pivot near a cumulative boundary" would accept almost any nucleus there. ``target_error`` does not: nuclei
+    that miss the target mass by twice the tolerance, a nucleus that splits a tie group, one with a hole and one
+    without its maximum are all rejected, while the kernel's own nucleus and those of a target moved by half the
+    tolerance pass."""
+    gen = torch.Generator(device=DEV).manual_seed(19)
+    rows = 8
+    logits = make_rows("very_flat", rows, V, gen)
+    temps = torch.ones(rows, device=DEV)
+    tps = torch.full((rows,), 0.95, device=DEV)
+    kept, _ = kernel_kept(logits, temps, tps)
+    nuc = Nucleus(logits, temps, tps)
+    for r in range(rows):
+        z, w = nuc.z[r], nuc.w[r]
+        zs, order = torch.sort(z, descending=True)
+        cum = torch.cumsum(w[order], 0)
+        target = float(nuc.target[r])
+
+        def first_beyond(mass):
+            return min(
+                int(torch.searchsorted(cum, torch.tensor([mass], dtype=cum.dtype, device=DEV))),
+                V - 1,
+            )
+
+        assert target_error(nuc, r, kept[r]) <= _NUC_MASS_TOL
+        for scale in (1.0 - 0.5 * _NUC_MASS_TOL, 1.0 + 0.5 * _NUC_MASS_TOL):
+            assert target_error(nuc, r, z >= zs[first_beyond(target * scale)]) <= _NUC_MASS_TOL
+        # Ten tokens short of the target by more than the tolerance / ten tokens past it by more than it.
+        short = z >= zs[max(first_beyond(target * (1.0 - 2 * _NUC_MASS_TOL)) - 10, 0)]
+        long = z >= zs[min(first_beyond(target * (1.0 + 2 * _NUC_MASS_TOL)) + 10, V - 1)]
+        assert target_error(nuc, r, short) > 2 * _NUC_MASS_TOL
+        assert target_error(nuc, r, long) > 2 * _NUC_MASS_TOL
+        hole = kept[r].clone()
+        hole[int(z.argmax())] = False
+        assert target_error(nuc, r, hole) == float("inf")
+        assert target_error(nuc, r, torch.zeros_like(kept[r])) == float("inf")
+    # A tie group is kept whole or not at all.
+    x = torch.full((2, V), 1.25, device=DEV)
+    x[1, : V // 3] = 2.0
+    ones, half = torch.ones(2, device=DEV), torch.full((2,), 0.5, device=DEV)
+    nuc = Nucleus(x, ones, half)
+    all_kept = torch.ones(V, dtype=torch.bool, device=DEV)
+    assert target_error(nuc, 0, all_kept) == 0.0
+    assert target_error(nuc, 0, torch.arange(V, device=DEV) < V // 2) == float("inf")
+    top_group = torch.arange(V, device=DEV) < V // 3
+    assert target_error(nuc, 1, top_group) == 0.0
+    assert target_error(nuc, 1, torch.arange(V, device=DEV) < V // 6) == float("inf")
+
+
+def test_low_token_ids_holding_the_nucleus_stay_on_the_fast_path():
+    """Frequent BPE tokens have the lowest ids, so the nucleus of a row can sit inside one 4,096-token chunk
+    and hold more than its 256 candidate slots (rows of agentic traces do). The gather reads 256-token
+    segments spread over the vocabulary, so no chunk overflows and no row reaches the single-program kernel;
+    the contiguous layout (``gather_seg=0``) overflows on the same rows and hands them over (still exact)."""
+    gen = torch.Generator(device=DEV).manual_seed(23)
+    # Nuclei of tens to ~a thousand tokens, all at the lowest ids.
+    alphas = (
+        1.7,
+        1.6,
+        1.5,
+        1.45,
+        1.4,
+    )
+    ids = torch.log1p(torch.arange(V, dtype=torch.float32, device=DEV))
+    noise = 0.05 * torch.randn(len(alphas), V, generator=gen, device=DEV)
+    logits = (noise - torch.tensor(alphas, device=DEV).unsqueeze(1) * ids).contiguous()
+    temps = torch.ones(len(alphas), device=DEV)
+    tps = torch.full((len(alphas),), 0.95, device=DEV)
+    contiguous = dataclasses.replace(ftp.DEFAULT_NUCLEUS, gather_seg=0)
+    _check_nucleus(logits, temps, tps)
+    _check_nucleus(logits, temps, tps, contiguous)
+    _, path = ftp.fast_topp_nucleus(logits, temps, tps, return_path=True)
+    _, path_contiguous = ftp.fast_topp_nucleus(logits, temps, tps, contiguous, return_path=True)
+    print(
+        f"low-id rows, path codes: interleaved {path.tolist()}, contiguous {path_contiguous.tolist()}"
+    )
+    assert bool(((path == 1) | (path == 7) | (path == 8) | (path == 9)).all()), path.tolist()
+    # Path code 4: a chunk overflowed and the single-program kernel resolved the row.
+    assert bool((path_contiguous == 4).any()), path_contiguous.tolist()

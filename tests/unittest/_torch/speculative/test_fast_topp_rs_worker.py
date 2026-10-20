@@ -156,6 +156,83 @@ def test_worker_paths_fast_topp(monkeypatch):
     assert same >= ngen - 2
 
 
+def test_worker_mixed_per_request_temperature_and_top_p(monkeypatch):
+    """A batch whose requests carry different temperatures and top-ps, with two context requests ahead of the
+    generation ones (they shift the per-token arrays): every request's stored proposals, drawn tokens and
+    accept / residual decisions follow its own nucleus. A slicing slip between the request-level arrays of the
+    draft step and the token-level arrays of the verify step would hand a request its neighbour's top-p."""
+    monkeypatch.setenv(frs.FAST_RS_ENV_VAR, "1")
+    mbs, nctx, ngen, seed, offset = 16, 2, 9, 71, 4
+    bsz = nctx + ngen
+    slots = range(3, 3 + bsz)
+    real = slice(3 + nctx, 2 + bsz)  # generation slots without the padding request
+    nreal = ngen - 1
+    temps_req = torch.tensor(
+        [1.0, 1.0, 1.0, 0.6, 1.7, 1.0, 0.8, 1.3, 0.6, 1.7, 1.0], dtype=torch.float32, device=DEV
+    )
+    tps_req = torch.tensor(
+        [0.95, 0.95, 0.95, 1.0, 0.5, 0.9, 0.99, 0.2, 0.95, 1.0, 0.999],
+        dtype=torch.float32,
+        device=DEV,
+    )
+    assert temps_req.numel() == tps_req.numel() == bsz
+    ntok = torch.tensor([1] * nctx + [K + 1] * ngen, device=DEV)  # tokens per request
+    md = _worker_metadata(mbs, slots, seed, offset)
+    md.request_temperatures[:bsz] = temps_req
+    md.request_top_ps[:bsz] = tps_req
+    md.temperatures[: int(ntok.sum())] = temps_req.repeat_interleave(ntok)
+    md.top_ps[: int(ntok.sum())] = tps_req.repeat_interleave(ntok)
+    temps_gen, tps_gen = temps_req[nctx:], tps_req[nctx:]
+    gen = torch.Generator(device=DEV).manual_seed(29)
+    tgt_gen, drf = _correlated_case(ngen, gen, 0.5)
+    logits = torch.cat([peaked_logits(nctx, V, gen), tgt_gen], dim=0).contiguous()
+    out = _Worker().sample_draft_tokens(drf, md, bsz, num_contexts=nctx)
+    drafts = out.view(ngen, K).contiguous()
+    gaps = _Gaps()
+    # The stored proposals: each request's own nucleus of its own draft rows.
+    stored = md.draft_probs[real].reshape(nreal * K, V)
+    temps_d, tps_d = (
+        temps_gen.repeat_interleave(K)[: nreal * K],
+        tps_gen.repeat_interleave(K)[: nreal * K],
+    )
+    nuc_d = Nucleus(drf.reshape(ngen * K, V)[: nreal * K], temps_d, tps_d)
+    kept_s = stored > 0
+    for r in range(nreal * K):
+        assert support_diff_ok(nuc_d, r, kept_s[r], nuc_d.kept[r]), (
+            r,
+            float(temps_d[r]),
+            float(tps_d[r]),
+        )
+    want = nuc_d.probs(kept_s)
+    big = (want > 1e-6) & kept_s
+    rel = ((stored.double() - want).abs() / want.clamp_min(1e-300))[big]
+    assert float(rel.max()) < 1e-5 + 6e-8 * float(nuc_d.z.abs().max()), float(rel.max())
+    q = stored.double().reshape(nreal, K, V).cpu().numpy()
+    _check_drafts(drafts[:nreal].cpu().numpy(), q, [seed] * ngen, [offset] * ngen, K, gaps)
+    # The verify step: each request's accept / residual decisions against its own target nuclei.
+    md.draft_tokens = drafts.reshape(-1)
+    acc, num = _Worker()._accept_draft_tokens(logits, drafts, nctx, bsz, md)
+    tgt_rows = logits[nctx:]
+    temps_t, tps_t = temps_gen.repeat_interleave(K + 1), tps_gen.repeat_interleave(K + 1)
+    kept_k, rec = kernel_kept(tgt_rows, temps_t, tps_t)
+    assert bool((rec[:, 3] == 0).all())
+    nuc_t = Nucleus(tgt_rows, temps_t, tps_t)
+    for r in range(nreal * (K + 1)):
+        assert support_diff_ok(nuc_t, r, kept_k[r], nuc_t.kept[r]), (
+            r,
+            float(temps_t[r]),
+            float(tps_t[r]),
+        )
+    p = nuc_t.probs(kept_k).reshape(ngen, K + 1, V).cpu().numpy()
+    real_gens = slice(nctx, bsz - 1)
+    _check_verify(
+        acc[real_gens].cpu().numpy(), num[real_gens].cpu().numpy(), p[:nreal], q,
+        drafts[:nreal].cpu().numpy(), [seed] * ngen, [offset] * ngen, K, gaps,
+    )  # fmt: skip
+    print(f"mixed batch: worst {gaps.worst}; accepted counts {num[real_gens].tolist()}")
+    gaps.check(nreal)
+
+
 @pytest.mark.parametrize(
     "mode,variant",
     [
@@ -212,6 +289,7 @@ def test_gate_and_dispatch_follow_the_sampling_mode(monkeypatch, mode, variant):
             setattr(worker, attr, value)
             assert not worker._fast_rs_applies(md, logits, V)
             setattr(worker, attr, saved)
+        assert not worker._fast_rs_applies(md, itf.VocabShardedLogits(None, logits), V)
         assert worker._fast_rs_applies(md, logits, V)
         monkeypatch.setenv(frs.FAST_RS_ENV_VAR, "0")
         assert not worker._fast_rs_applies(md, logits, V)

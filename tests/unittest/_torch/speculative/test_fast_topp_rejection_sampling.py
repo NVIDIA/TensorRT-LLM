@@ -43,6 +43,7 @@ from topp_rs_test_utils import (
     kernel_kept,
     make_rows,
     support_diff_ok,
+    target_error,
 )
 
 from tensorrt_llm._torch.pyexecutor.sampler.ops.flashinfer import (
@@ -66,7 +67,7 @@ def test_draft_block_matches_flashinfer(kind, num_gens, temperature, bf16):
     rows are rounded to bfloat16 first (what the lm_head produces), so exact ties abound."""
     gen = torch.Generator(device=DEV).manual_seed(11 + num_gens)
     mism = total = support_rows = 0
-    worst_gap = worst_rel = 0.0
+    worst_gap = worst_rel = worst_err = worst_fi_err = 0.0
     for trial in range(30):
         logits = make_rows(kind, num_gens * K, V, gen, bf16)
         temps = torch.full((num_gens,), temperature, dtype=torch.float32, device=DEV)
@@ -95,6 +96,9 @@ def test_draft_block_matches_flashinfer(kind, num_gens, temperature, bf16):
         for r in differs.nonzero().flatten().tolist():
             assert support_diff_ok(nuc, r, kept_k[r], nuc.kept[r])
             assert fi_support_ok(nuc, r, float(tps_rows[r]), kept_k[r], kept_ref[r])
+            worst_err = max(worst_err, target_error(nuc, r, kept_k[r]))
+            if float(tps_rows[r]) < 1.0:
+                worst_fi_err = max(worst_fi_err, target_error(nuc, r, kept_ref[r]))
         support_rows += int(differs.sum())
         same = ~differs
         big = (ref_probs > 1e-6) & kept_k & same.unsqueeze(1)
@@ -112,7 +116,8 @@ def test_draft_block_matches_flashinfer(kind, num_gens, temperature, bf16):
     print(
         f"draft block {kind} bf16={bf16} G={num_gens} T={temperature}: {mism}/{total} tokens differ, all "
         f"within {worst_gap:.2e} of a CDF boundary (or in one of the {support_rows} rows whose "
-        f"nucleus differs within rounding); max rel prob diff {worst_rel:.2e}"
+        f"nucleus differs within rounding); max rel prob diff {worst_rel:.2e}; worst target error: "
+        f"kernel {worst_err:.2e}, flashinfer {worst_fi_err:.2e}"
     )
     assert worst_gap <= _CDF_TOL
     assert mism <= 0.02 * total
@@ -172,6 +177,7 @@ def test_verify_matches_flashinfer(kind, accept_bias, bf16):
     gen = torch.Generator(device=DEV).manual_seed(101 + int(accept_bias * 10))
     model, decisions = _Gaps(), _Gaps()
     total = same_num = support_rows = 0
+    worst_err = worst_fi_err = 0.0
     hist = np.zeros(K + 1, dtype=np.int64)
     temps_req = torch.ones(num_gens, dtype=torch.float32, device=DEV)
     temps_tok = torch.ones(num_gens * (K + 1), dtype=torch.float32, device=DEV)
@@ -203,6 +209,9 @@ def test_verify_matches_flashinfer(kind, accept_bias, bf16):
         ):
             assert support_diff_ok(nuc, r, kept_k[r], nuc.kept[r])
             assert fi_support_ok(nuc, r, float(tps_tok[r]), kept_k[r], kept_ref[r])
+            worst_err = max(worst_err, target_error(nuc, r, kept_k[r]))
+            if float(tps_tok[r]) < 1.0:
+                worst_fi_err = max(worst_fi_err, target_error(nuc, r, kept_ref[r]))
             support_rows += 1
         _, ref_num = rejection_sampling_one_model(
             buf[slots], drafts, tprobs.view(num_gens, K + 1, V), deterministic=True, seed=seeds,
@@ -237,7 +246,8 @@ def test_verify_matches_flashinfer(kind, accept_bias, bf16):
         f"{same_num}; differences explained by rounding in {decisions.count} rows (worst accept "
         f"{decisions.worst['accept']:.2e} rel); vs the float64 model {model.count} rows (worst "
         f"accept {model.worst['accept']:.2e}, token {model.worst['token']:.2e}); rows with a "
-        f"rounding-level nucleus difference {support_rows}; accepted-length histogram {hist.tolist()}"
+        f"rounding-level nucleus difference {support_rows} (worst target error: kernel {worst_err:.2e}, "
+        f"flashinfer {worst_fi_err:.2e}); accepted-length histogram {hist.tolist()}"
     )
     assert total >= 2000
     decisions.check(total)

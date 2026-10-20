@@ -45,7 +45,9 @@ verify kernels classify every token by the same comparison ``z >= z_pivot``:
    ``[z_lo, z_hi]`` and the mass above ``z_hi`` is summed exactly (mode 2), when at most ``CAP``
    candidates result.
 3. :func:`_topp_gather_kernel`: each chunk compacts its zone tokens (at most ``CHUNK_CAP``, counted
-   exactly) and, in mode 2, the mass above and inside the zone.
+   exactly) and, in mode 2, the mass above and inside the zone. A chunk is a set of interleaved
+   256-token segments spread over the vocabulary (the probable tokens of a language model cluster at
+   the lowest ids, which would overflow one contiguous chunk long before ``CAP`` candidates).
 4. :func:`_topp_resolve_kernel` (one program per row): concatenates the candidates, sorts them
    (three size classes) and takes as pivot the first one, in descending order, at which the running mass
    (started at the exact mass above the zone) reaches the target. ``Z`` is the mass of every token at or
@@ -61,7 +63,11 @@ verify kernels classify every token by the same comparison ``z >= z_pivot``:
    pending (a chunk overflowed, more than ``CAP`` candidates, or the candidate mass is short of the
    target) refines the histogram zone pass by pass (each refinement narrows the zone by about
    ``NB / 5``). A violated certificate (only possible for non-finite input) or exhausted iterations
-   set ``status != 0`` and the row keeps the whole vocabulary. Rows the pipeline resolved exit at once.
+   set ``status != 0``; the row then keeps every token at or above the lowest ``z`` of the last
+   certified zone (a superset of the exact nucleus), the whole vocabulary when no zone was certified.
+   After its first pass the search knows the exact mass inside the window, so it bounds the mass
+   below the window by ``S - mass above - mass inside`` instead of by counting each token below at the
+   window's edge weight. Rows the pipeline resolved exit at once.
 
 Exactness. The record is exact up to the rounding of float32 mass sums: a zone is accepted only when
 the mass above it is below the target and the mass through it reaches the target, both compared with
@@ -152,6 +158,14 @@ class NucleusConfig:
     bin_min: int = 256  # candidate lists longer than this are narrowed to one bin before the sort
     sub_bins: int = 32  # equal-width bins of that narrowing (a power of two)
     sub_slab: int = 128  # candidates per iteration of the bin-mass loop (a power of two)
+    gather_seg: int = 256  # tokens per gathered segment, spread over the vocabulary (0: one chunk)
+
+    def __post_init__(self):
+        seg = self.gather_seg
+        if seg < 0 or (seg > 0 and (seg & (seg - 1) or self.hg_chunk % seg)):
+            raise ValueError(
+                f"gather_seg {seg} must be 0 or a power of two dividing hg_chunk {self.hg_chunk}"
+            )
 
     @property
     def small(self) -> int:
@@ -203,18 +217,31 @@ def _sort_resolve(zz_row_ptr, n_mem, a_above, target, big_m, SIZE: tl.constexpr)
 
     ``a_above`` is the mass of the tokens above the zone. Returns ``(z_pivot, kept, ok)``. If the
     running mass falls short of the target by float rounding (``_MASS_TOL``), the zone's last token is
-    the pivot."""
+    the pivot. Lanes past ``n_mem`` are padding (``-inf``, weight 0): a parallel scan may round their
+    running mass to the other side of the target than the last real lane's, so only real lanes can
+    be the pivot."""
     oi = tl.arange(0, SIZE)
     zv = tl.load(zz_row_ptr + oi, mask=oi < n_mem, other=float("-inf"))
     zs = tl.sort(zv, descending=True)
     ws = tl.exp(zs - big_m)
     cum = a_above + tl.cumsum(ws, axis=0)
-    k = tl.min(tl.where(cum >= target, oi, SIZE), axis=0)
+    k = tl.min(tl.where((cum >= target) & (oi < n_mem), oi, SIZE), axis=0)
     total = a_above + tl.sum(ws, axis=0)
     k = tl.where((k >= SIZE) & (total >= target - _MASS_TOL * target), n_mem - 1, k)
     z_pivot = tl.sum(tl.where(oi == k, zs, 0.0), axis=0)
     kept = a_above + tl.sum(tl.where(zs >= z_pivot, ws, 0.0), axis=0)
     return z_pivot, kept, (k < SIZE).to(tl.int32)
+
+
+@triton.jit
+def _zone_certified(a_above, m_zone, n_mem, target):
+    """Whether a zone of ``n_mem`` tokens, with the exact mass ``a_above`` above it and ``m_zone``
+    inside it, brackets the target: the mass above it does not exceed the target and the mass through
+    it reaches it (both to the float32 rounding of the sums, ``_MASS_TOL``), so the pivot is one of its
+    tokens. ``<=`` keeps a zone that starts at the maximum (``a_above = 0``) valid for ``top_p = 0``,
+    whose target is 0."""
+    tol = _MASS_TOL * target
+    return (a_above <= target + tol) & (a_above + m_zone >= target - tol) & (n_mem > 0)
 
 
 @triton.jit
@@ -508,10 +535,17 @@ def _topp_gather_kernel(
     num_chunks,
     CHUNK: tl.constexpr,
     CHUNK_CAP: tl.constexpr,
+    SEG: tl.constexpr,
     HAS_BIAS: tl.constexpr,
 ):
     """Gathers the tokens of the zone (one program per ``(row, chunk)``; at most ``CHUNK_CAP`` per
-    chunk, counted exactly); in mode 2 it also sums the mass above the zone and inside it."""
+    chunk, counted exactly); in mode 2 it also sums the mass above the zone and inside it.
+
+    With ``SEG > 0`` a program reads ``CHUNK / SEG`` segments of ``SEG`` contiguous tokens spaced
+    ``num_chunks * SEG`` apart instead of one contiguous chunk: the probable tokens of a language
+    model cluster at the lowest ids (frequent tokens come first in a BPE vocabulary), and a contiguous
+    chunk then overflows ``CHUNK_CAP`` for a nucleus of a few hundred tokens, which sends the row to
+    the slow single-program kernel; interleaved, every program holds about the same share."""
     row = tl.program_id(0).to(tl.int64)
     ch = tl.program_id(1)
     if tl.load(rd_ptr + row * 16 + 4) > 1.5:
@@ -521,7 +555,11 @@ def _topp_gather_kernel(
             z_lo = tl.load(zone)
             z_hi = tl.load(zone + 1)
             inv_t, is_pad, big_m, _s, _mode, _lo, _depth, _target, _ties = _rd_load(rd_ptr, row)
-            offs = ch * CHUNK + tl.arange(0, CHUNK)
+            if SEG > 0:
+                i = tl.arange(0, CHUNK)
+                offs = tl.max_contiguous((ch + (i // SEG) * num_chunks) * SEG + (i % SEG), SEG)
+            else:
+                offs = ch * CHUNK + tl.arange(0, CHUNK)
             mask = offs < vocab
             z = _load_scaled(
                 logits_ptr, row, stride_row, bias_ptr, row, stride_bias, offs, mask, inv_t, is_pad,
@@ -612,12 +650,7 @@ def _topp_resolve_kernel(
                 m_zone = tl.sum(tl.load(pb + 1, mask=cmask, other=0.0), axis=0)
                 z_min = tl.min(tl.load(pb + 2, mask=cmask, other=float("inf")), axis=0)
                 z_max = tl.max(tl.load(pb + 3, mask=cmask, other=float("-inf")), axis=0)
-                tol = _MASS_TOL * target
-                valid = (
-                    ((a_above < target + tol) | (a_above <= 0.0))
-                    & (a_above + m_zone >= target - tol)
-                    & (n_tot > 0)
-                )
+                valid = _zone_certified(a_above, m_zone, n_tot, target)
             code = tl.where(c_max > CHUNK_CAP, 4.0, 5.0)
             code = tl.where(valid, code, 6.0)
             if valid & (z_max <= z_min) & (mode > 1.5):
@@ -702,7 +735,7 @@ def _topp_nucleus_kernel(
 
     # Rows the chunk-parallel pipeline resolved keep their record (status 0).
     need = tl.load(rec_ptr + row * 8 + 3) != 0.0
-    # Defaults: keep the whole vocabulary (padding rows, T = 0, top_p >= 1, or a failed search).
+    # Defaults: keep the whole vocabulary (padding rows, T = 0, top_p >= 1, or no certified zone).
     z_pivot = big_m * 0.0 - float("inf")
     z_kept = big_s
     status = big_m * 0.0
@@ -710,12 +743,19 @@ def _topp_nucleus_kernel(
         hi = big_m
         a0 = big_m * 0.0  # mass of the tokens above [lo, hi]
         n_above = 0  # their number
+        m_win = (
+            big_m * 0.0 - 1.0
+        )  # exact mass of the tokens inside [lo, hi] once a pass has summed it
         cnt = tl.zeros([NB], tl.int32)
         have_cnt = 0
         found = 0
         failed = 0
         z_pivot = big_m * 0.0 - float("inf")
         z_kept = big_s
+        # Fallback nucleus if the search ends without a pivot: every token at or above the lowest z of
+        # the last certified zone (a superset of the exact nucleus), the whole vocabulary before any.
+        z_fb = big_m * 0.0 - float("inf")
+        kept_fb = big_s
         zrow = row * CAP
         idx = tl.arange(0, NB)
         for _it in range(ITERS):
@@ -740,6 +780,12 @@ def _topp_nucleus_kernel(
                 # the target is near S. Tokens below `lo` weigh at most exp(lo - max) each.
                 n_below = vocab - n_above - tl.sum(cnt, axis=0)
                 below_max = n_below.to(tl.float32) * tl.exp(lo - big_m)
+                # Once the window's mass is known exactly so is the mass below it: S - a0 - m_win (and
+                # the three sums' rounding). The count bound above charges every token below the
+                # window at its edge weight, which is hopelessly loose for a window cut into the
+                # tokens of a huge tie group (their weight is ~1, the tokens below weigh ~0).
+                below_exact = tl.maximum(big_s - a0 - m_win, 0.0) + _MASS_TOL * big_s
+                below_max = tl.where(m_win >= 0.0, tl.minimum(below_max, below_exact), below_max)
                 bot_min = tl.cumsum(f_min, axis=0) - f_min
                 bot_max = tl.cumsum(f_max, axis=0) - f_max
                 ub = tl.minimum(a0 + tl.cumsum(f_max, axis=0, reverse=True), big_s - bot_min)
@@ -794,12 +840,7 @@ def _topp_nucleus_kernel(
                         z_min = tl.minimum(z_min, tl.min(tl.where(mem, z, float("inf")), axis=0))
                         z_max = tl.maximum(z_max, tl.max(tl.where(mem, z, float("-inf")), axis=0))
                     tl.debug_barrier()
-                    tol = _MASS_TOL * target
-                    valid = (
-                        ((a_above < target + tol) | (a_above <= 0.0))
-                        & (a_above + m_zone >= target - tol)
-                        & (n_mem > 0)
-                    )
+                    valid = _zone_certified(a_above, m_zone, n_mem, target)
                     if valid:
                         if z_max <= z_min:
                             # One tied group: the pivot, and every token of the zone, is kept.
@@ -821,7 +862,11 @@ def _topp_nucleus_kernel(
                             found = ok_sort
                             failed = 1 - ok_sort
                         else:
-                            # Zone too big: refine inside it.
+                            # Zone too big: refine inside it. The zone is certified, so every token at
+                            # or above its lowest z holds the nucleus: the fallback if refining stalls.
+                            z_fb = z_min
+                            kept_fb = a_above + m_zone
+                            m_win = m_zone
                             a0 = a_above
                             n_above = c_above
                             if compact:
@@ -836,8 +881,8 @@ def _topp_nucleus_kernel(
                     else:
                         failed = 1
         if found == 0:
-            z_pivot = big_m * 0.0 - float("inf")
-            z_kept = big_s
+            z_pivot = z_fb
+            z_kept = kept_fb
             status = tl.where(failed == 1, 1.0, 2.0)
     if need:
         base = rec_ptr + row * 8
@@ -1206,7 +1251,7 @@ def _nucleus_records(
         )  # fmt: skip
         _topp_gather_kernel[(rows, ncg)](
             logits, logits.stride(0), bias_arg, bias_stride, rd, zone, cand, cnt, part, vocab, ncg,
-            CHUNK=cfg.hg_chunk, CHUNK_CAP=cfg.chunk_cap, HAS_BIAS=has_bias,
+            CHUNK=cfg.hg_chunk, CHUNK_CAP=cfg.chunk_cap, SEG=cfg.gather_seg, HAS_BIAS=has_bias,
             num_warps=cfg.pipe_warps, **_reg_cap(cfg.gather_maxnreg),
         )  # fmt: skip
         _topp_resolve_kernel[(rows,)](
@@ -1245,8 +1290,10 @@ def fast_topp_nucleus(
         top_ps: ``[rows]`` fp32.
     Returns:
         ``[rows, 4]`` fp32 ``(z_pivot, Z, S, status)`` per row (a copy): keep ``z >= z_pivot`` with
-        ``z = logits / T`` (as ``_load_scaled``); ``Z`` is the kept mass in units of ``exp(z -
-        max z)``, ``S`` the total; ``status`` is 0 unless the search fell back to the whole vocab.
+        ``z = logits / T`` (as `_load_scaled`); ``Z`` is the kept mass in units of
+        ``exp(z - max z)``, ``S`` the total; ``status`` is 0 unless the search ended without a pivot
+        (non-finite input or an adversarial tie structure): the row then keeps a superset of the
+        nucleus.
         With ``return_path`` also ``[rows]`` fp32 path codes: 1 the chunk-parallel gather resolved the
         row, 8 the zone sums did, 7 a tied zone did, 9 the maximum alone reached the target; 2 no
         zone; 3 zone too big; 4 a chunk

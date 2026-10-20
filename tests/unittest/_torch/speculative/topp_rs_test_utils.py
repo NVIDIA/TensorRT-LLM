@@ -19,9 +19,13 @@ logit ``z``, at which the cumulative mass reaches ``top_p * sum``; every token w
 ties included).
 
 Every disagreement with flashinfer or with the oracle must be explained by float32 rounding: a draw within
-``_CDF_TOL`` of an inverse-CDF boundary, an accept threshold within ``_ACCEPT_TOL``, a nucleus whose pivot
-falls within ``_NUC_GAP`` (relative mass) of a cumulative boundary, or two nuclei that differ by tokens of
-total mass below ``_NUC_MASS_TOL`` (float32 sums cannot separate them; flashinfer's float atomics neither).
+``_CDF_TOL`` of an inverse-CDF boundary, an accept threshold within ``_ACCEPT_TOL``, or a nucleus inside the
+oracle's sandwich: ``target_error`` is the relative change of the target mass ``fl32(p) * S`` that would make a
+kept-set the exact nucleus (0 inside the exact interval, infinite for a set that is not a ``z >= threshold`` set,
+so one that splits a tie group), and the kernels' sets must stay within ``_NUC_MASS_TOL`` of it (flashinfer's
+approximate float32 search within ``_FI_MASS_TOL``). That is exact for tie groups, and it cannot excuse a pivot
+that is off by more than float32 rounding, however thin the tokens around it are (a flat row of 163,840 tokens
+has ~6e-6 per token).
 """
 
 import math
@@ -47,7 +51,9 @@ _ACCEPT_TOL = 1e-5
 # p = 0.999 the boundary tokens of a 1e5-token nucleus weigh 4e-8 each, so one to three of them differ
 # in most rows).
 _NUC_MASS_TOL = 4e-6
-_NUC_GAP = 2 * _NUC_MASS_TOL
+# flashinfer's top-p search is a float32 ternary search with float atomics: its mass decisions are good to a few
+# 1e-6, so its nuclei are held to a sandwich three times as wide (they are not under test, the kernels' are).
+_FI_MASS_TOL = 3 * _NUC_MASS_TOL
 
 _M32 = 0xFFFFFFFF
 _M64 = (1 << 64) - 1
@@ -167,7 +173,7 @@ class _Gaps:
 
     def check(self, total):
         assert self.worst["accept"] <= _ACCEPT_TOL and self.worst["token"] <= _CDF_TOL
-        assert self.worst["nucleus"] <= _NUC_GAP, self.worst
+        assert self.worst["nucleus"] <= _NUC_MASS_TOL, self.worst
         assert self.count <= max(2, int(0.02 * total)), (self.count, total)
 
 
@@ -258,10 +264,11 @@ def scaled(logits, temps):
 
 
 class Nucleus:
-    """float64 oracle of the flashinfer top-p rule for each row of ``logits``: the pivot is the
-    first token, descending in ``z``, whose cumulative float64 mass reaches ``fl32(p) * S``; every
-    token with ``z >= z_pivot`` is kept. ``gap`` is the relative distance of the target from the
-    cumulative boundaries of the pivot's group (how close the decision was to rounding)."""
+    """float64 oracle of flashinfer's top-p rule for each row of ``logits``.
+
+    The pivot is the first token, in descending ``z``, whose cumulative float64 mass reaches
+    ``fl32(p) * S``; every token with ``z >= z_pivot`` is kept, ties included. `target_error`
+    measures a kept-set against ``target`` and ``full``."""
 
     def __init__(self, logits, temps, top_ps):
         self.z = scaled(logits, temps)
@@ -273,10 +280,12 @@ class Nucleus:
         self.s = self.w.sum(1)
         zs, order = torch.sort(zd, dim=1, descending=True, stable=True)
         cum = torch.cumsum(torch.gather(self.w, 1, order), dim=1)
-        target = top_ps.float().double() * self.s
+        # The target mass fl32(p) * S of each row.
+        target = self.target = top_ps.float().double() * self.s
         k = torch.searchsorted(cum, target.unsqueeze(1)).clamp(max=vocab - 1)
         self.z_pivot = torch.gather(zs, 1, k).squeeze(1)
-        full = top_ps >= 1.0
+        # Rows with top_p >= 1 keep the whole vocabulary.
+        full = self.full = top_ps >= 1.0
         self.z_pivot = torch.where(full, torch.full_like(self.z_pivot, -math.inf), self.z_pivot)
         first = (zs > self.z_pivot.unsqueeze(1)).sum(1)
         last = (zs >= self.z_pivot.unsqueeze(1)).sum(1) - 1
@@ -314,13 +323,41 @@ def diff_mass(nuc, r, kept_a, kept_b):
     return float(nuc.w[r][diff].sum() / nuc.s[r])
 
 
+def target_error(nuc, r, kept):
+    """How far row ``r``'s kept-set ``kept`` is from the oracle's nucleus, as a relative change of the target mass.
+
+    A set ``{z >= z_k}`` is the nucleus of every target in (mass strictly above ``z_k``, mass through ``z_k``],
+    so the error is how far the oracle's target lies outside that interval (0 inside it). A set that is not a
+    threshold set (a hole, a split tie group, nothing kept) is infinitely far, and rows with ``top_p >= 1``
+    must keep every token. The measure is exact for tie groups, and it does not excuse a pivot that is off by
+    more than float32 rounding, however little mass the tokens around it carry (a flat row of 163,840 tokens
+    has ~6e-6 per token)."""
+    if bool(nuc.full[r]):
+        return 0.0 if bool(kept.all()) else math.inf
+    if not bool(kept.any()):
+        return math.inf
+    z, w = nuc.z[r], nuc.w[r]
+    z_k = z[kept].min()
+    if bool((kept != (z >= z_k)).any()):
+        return math.inf
+    target = float(nuc.target[r])
+    excess = max(float(w[z > z_k].sum()) - target, target - float(w[kept].sum()), 0.0)
+    if excess <= 0.0:
+        return 0.0
+    return excess / target if target > 0.0 else math.inf
+
+
+def sandwich_ok(nuc, r, kept, tol=_NUC_MASS_TOL):
+    """Whether the kept-set ``kept`` of row ``r`` is the nucleus of the oracle's target to float32 rounding:
+    it holds every token of the nucleus of the target ``(1 - tol)`` times the exact one and none outside the
+    nucleus of ``(1 + tol)`` times it (nuclei grow with the target, ties included)."""
+    return target_error(nuc, r, kept) <= tol
+
+
 def support_diff_ok(nuc, r, kept_a, kept_b):
-    """Whether two kept-sets of row ``r`` (a kernel's, the oracle's, flashinfer's) agree to float
-    precision: they differ by tokens of total mass at most ``_NUC_MASS_TOL``, or the oracle's target is
-    within ``_NUC_GAP`` of a cumulative boundary (either side is then a correct answer)."""
-    if not bool((kept_a != kept_b).any()):
-        return True
-    return diff_mass(nuc, r, kept_a, kept_b) <= _NUC_MASS_TOL or float(nuc.gap[r]) <= _NUC_GAP
+    """Whether two kept-sets of row ``r`` (a kernel's, the oracle's, another launch configuration's)
+    both lie in the oracle's sandwich (`sandwich_ok`), so they agree to float32 rounding."""
+    return sandwich_ok(nuc, r, kept_a) and sandwich_ok(nuc, r, kept_b)
 
 
 # flashinfer's top_p_renorm_probs at top_p == 1 is not "keep everything": it zeroes low-probability tokens
@@ -331,9 +368,14 @@ _FI_FULL_DROP_P = 2.0**-23 * 1.01
 
 
 def fi_support_ok(nuc, r, top_p, kept_a, kept_fi):
-    """``support_diff_ok`` for a kept-set ``kept_fi`` computed by flashinfer for a row with ``top_p``."""
-    if top_p < 1.0 or not bool((kept_a != kept_fi).any()):
-        return support_diff_ok(nuc, r, kept_a, kept_fi)
+    """Whether the kernel's kept-set ``kept_a`` and flashinfer's ``kept_fi`` of row ``r`` agree to rounding.
+
+    ``kept_a`` must pass the strict sandwich and ``kept_fi`` the wider `_FI_MASS_TOL` one; at ``top_p == 1``
+    the rule of `_FI_FULL_DROP_P` applies instead."""
+    if top_p < 1.0:
+        return sandwich_ok(nuc, r, kept_a) and sandwich_ok(nuc, r, kept_fi, _FI_MASS_TOL)
+    if not bool((kept_a != kept_fi).any()):
+        return True
     diff = kept_a != kept_fi
     tiny = bool(((nuc.w[r][diff] / nuc.s[r]) <= _FI_FULL_DROP_P).all())
     return (tiny and bool(kept_a[diff].all())) or diff_mass(
