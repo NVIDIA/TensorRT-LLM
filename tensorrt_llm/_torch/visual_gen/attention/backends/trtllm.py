@@ -227,6 +227,21 @@ class TrtllmAttentionMetadata:
         views of the cache's device tensors, ``kv_lens_runtime`` and
         ``host_total_kv_lens`` by bounds at the pool's capacity. Every other field keeps
         the value ``prepare()`` computed.
+
+        Mapping onto the LLM attention metadata: each causal block is one context
+        request whose cached past is the fixed region and its window.
+        - ``chunked_prefill=True`` matters only because it turns on
+          ``use_paged_context_fmha``, so the kernel reads cached K/V from the pool
+          through the block offsets. Without it, a block would attend only to its own
+          tokens.
+        - ``max_num_requests = max_num_sequences = max_causal_blocks``: one request per
+          causal block, sized for the most blocks any declared block size cuts the
+          staged tokens into. At the Cosmos geometry that is 4: 1 per denoising forward,
+          4 in the clean pass.
+        Unlike LLM chunked prefill, the requests are synthetic (no ``LlmRequest``) and
+        all carry request id 0, the mask is FULL within a block, and the past is bounded
+        by the window rather than a growing prefix. The total video length is never
+        needed: ``num_causal_blocks`` counts blocks per forward.
         """
         cache_key = ("trtllm", kv_cache.geometry, num_causal_blocks, causal_block_size)
         cached = kv_cache.attention_metadata.get(cache_key)
