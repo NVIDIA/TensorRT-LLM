@@ -1,9 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Beam-search response handling must materialize pybind properties once.
+"""Beam-search response handling must materialize C++ binding properties once.
 
 ``LlmResult.output_token_ids`` is not in ``py_result_properties``, so it falls
-through to the pybind ``Result``, which rebuilds the whole (beams, tokens)
+through to the C++ binding for ``Result``, which rebuilds the whole (beams, tokens)
 nested list on every access. ``_handle_response`` calls ``_handle_sequence``
 once per beam, so reading it there costs N full rebuilds per response -- and
 because each rebuild is itself O(N), the waste is quadratic in beam width.
@@ -57,6 +57,8 @@ class StubGenerationResult(GenerationResultBase):
 
     def __init__(self, sampling_params: SamplingParams, n_outputs: int):
         super().__init__(id=0, sampling_params=sampling_params)
+        # Seed minimal response state and bypass tracing/speculative metrics
+        # below to isolate token materialization without a full executor.
         self._outputs = [CompletionOutput(index=i) for i in range(n_outputs)]
         self._streaming = False
         self._multimodal_hashes = None
@@ -93,7 +95,7 @@ def test_beam_response_materializes_output_token_ids_once():
     assert counted.reads == 1, (
         f"output_token_ids was materialized {counted.reads} times for "
         f"{BEAMS} beams; each access rebuilds the full (beams, tokens) list "
-        f"across the pybind boundary, so it must be hoisted out of the loop"
+        f"across the C++ binding boundary, so it must be hoisted out of the loop"
     )
     for beam in range(BEAMS):
         expected = [1000 + beam + t for t in range(TOKENS)]

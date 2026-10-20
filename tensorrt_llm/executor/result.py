@@ -373,12 +373,13 @@ class GenerationResultBase:
                          logprobs_result=None,
                          req_perf_metrics_dict: Optional[dict[str,
                                                               float]] = None,
-                         output_token_ids=None):
+                         output_token_ids: Optional[list[list[int]]] = None):
         """Handle a single sequence in the response.
 
         ``output_token_ids`` lets the caller pass an already-materialized copy:
-        the pybind ``Result`` rebuilds the whole (beams, tokens) nested list on
-        every access, and the beam-search path calls this once per beam.
+        the C++ binding for ``Result`` rebuilds the whole (beams, tokens)
+        nested list on every access, and the beam-search path calls this once
+        per beam.
         """
         seq_idx = sequence_index
         src_idx = sequence_index if self.sampling_params.use_beam_search else 0
