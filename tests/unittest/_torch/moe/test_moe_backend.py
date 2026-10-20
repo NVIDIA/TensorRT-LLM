@@ -2212,6 +2212,92 @@ def test_megamoe_replica_plan_supplies_launch_facts_and_route_wait():
 
 
 @pytest.mark.cpu_only
+def test_megamoe_staging_widens_int32_routes_after_the_route_wait():
+    moe = MegaMoECuteDsl.__new__(MegaMoECuteDsl)
+    torch.nn.Module.__init__(moe)
+    moe._last_staged_T = {8: 6}
+    trace = []
+    moe._wait_rebalance_routes = lambda replica_plan=None: trace.append(("wait", replica_plan))
+    bufs = SimpleNamespace(
+        activation=torch.zeros(8, 16, dtype=torch.uint8),
+        activation_sf=torch.zeros(8, 4, dtype=torch.uint8),
+        topk_weights=torch.ones(8, 4, dtype=torch.float32),
+        topk_idx_local=torch.full((8, 4), 5, dtype=torch.int64),
+    )
+    routes = torch.tensor([[0, 3, -1, 2**31 - 1], [7, 6, 5, 4], [1, 1, 1, 1]], dtype=torch.int32)
+    weights = torch.full((3, 4), 0.25, dtype=torch.float32)
+
+    moe._stage_inputs(
+        bufs=bufs,
+        x=torch.ones(3, 16, dtype=torch.uint8),
+        x_sf=torch.ones(3, 4, dtype=torch.uint8),
+        topk_idx=routes,
+        topk_weights=weights,
+        num_tokens=3,
+        top_k=4,
+        stage_activation=True,
+        replica_plan="plan",
+    )
+
+    # One copy widens the int32 routes into the int64 kernel index buffer.
+    assert bufs.topk_idx_local.dtype == torch.int64
+    assert torch.equal(bufs.topk_idx_local[:3], routes.to(torch.int64))
+    # Rows a previous launch wrote, and only those, are reset to -1.
+    assert torch.equal(bufs.topk_idx_local[3:6], torch.full((3, 4), -1, dtype=torch.int64))
+    assert torch.equal(bufs.topk_idx_local[6:], torch.full((2, 4), 5, dtype=torch.int64))
+    assert torch.equal(bufs.topk_weights[:3], weights)
+    assert not bufs.topk_weights[3:].any()
+    assert trace == [("wait", "plan")]
+
+
+@pytest.mark.cpu_only
+def test_megamoe_run_moe_hands_routes_to_staging_unconverted():
+    moe = MegaMoECuteDsl.__new__(MegaMoECuteDsl)
+    torch.nn.Module.__init__(moe)
+    moe.ep_size = 1
+    moe._weights_created = True
+    moe.quant_method = object()
+    moe.hidden_size = 16
+    moe.dtype = torch.bfloat16
+    moe._topk_idx_dtype = torch.int64
+    moe._build_weight_view = lambda: "weights"
+    moe._wait_rebalance_routes = MagicMock()
+    captured = {}
+    moe._run_moe = lambda **kwargs: captured.update(kwargs) or "out"
+    routes = torch.zeros(3, 4, dtype=torch.int32)
+    scales = torch.ones(3, 4, dtype=torch.float32)
+
+    out = moe.run_moe(
+        MoERunContext(
+            token_selected_experts=routes,
+            token_final_scales=scales,
+            x=torch.zeros(3, 8, dtype=torch.uint8),
+            x_sf=torch.zeros(3, 4, dtype=torch.uint8),
+            output_dtype=torch.bfloat16,
+        )
+    )
+
+    assert out == "out"
+    # No conversion kernel and no early route wait: staging reads the routes.
+    assert captured["topk_idx"] is routes
+    assert captured["topk_weights"] is scales
+    moe._wait_rebalance_routes.assert_not_called()
+
+    half_scales = scales.to(torch.float16)
+    moe.run_moe(
+        MoERunContext(
+            token_selected_experts=routes,
+            token_final_scales=half_scales,
+            x=torch.zeros(3, 8, dtype=torch.uint8),
+            x_sf=torch.zeros(3, 4, dtype=torch.uint8),
+            output_dtype=torch.bfloat16,
+        )
+    )
+    assert captured["topk_weights"].dtype == torch.float32
+    assert torch.equal(captured["topk_weights"], scales)
+
+
+@pytest.mark.cpu_only
 def test_megamoe_replica_plan_rejects_unallocated_geometry():
     moe = MegaMoECuteDsl.__new__(MegaMoECuteDsl)
     torch.nn.Module.__init__(moe)

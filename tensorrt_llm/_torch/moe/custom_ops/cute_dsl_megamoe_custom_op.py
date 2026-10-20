@@ -1551,18 +1551,59 @@ if IS_MEGAMOE_OP_AVAILABLE:
 
         return to_cute, to_cute_ptr, SymBufferHost, cute
 
+    def _cute_view_key(t: torch.Tensor, assumed_align: int) -> Tuple:
+        """Everything a cute view of ``t`` encodes."""
+        return (t.data_ptr(), tuple(t.shape), t.stride(), t.dtype, t.device.index, assumed_align)
+
     def _to_cute_cached(cache: dict, t: torch.Tensor, assumed_align: int = 16):
         """Return the cute view of ``t`` from ``cache``, converting it on a miss.
 
         The key holds everything the view encodes, so a hit equals a fresh
         conversion even if the address was reused. Only for tensors whose
-        layout is fixed (module weights): one entry per tensor.
+        layout is fixed (module weights, launch buffers): one entry per tensor.
         """
-        key = (t.data_ptr(), tuple(t.shape), t.stride(), t.dtype, t.device.index, assumed_align)
+        key = _cute_view_key(t, assumed_align)
         cute_tensor = cache.get(key)
         if cute_tensor is None:
             cute_tensor = cache[key] = _cute_launch_helpers()[0](t, assumed_align)
         return cute_tensor
+
+    def _to_cute_slot(cache: dict, slot: str, t: torch.Tensor, assumed_align: int = 16):
+        """Like ``_to_cute_cached`` but keep only the latest view under ``slot``.
+
+        For a buffer whose live row count changes between iterations but not
+        between the layers of one iteration.
+        """
+        key = _cute_view_key(t, assumed_align)
+        entry = cache.get(slot)
+        if entry is None or entry[0] != key:
+            entry = cache[slot] = (key, _cute_launch_helpers()[0](t, assumed_align))
+        return entry[1]
+
+    # cute pointers by (address, alignment): a pointer encodes nothing else, so
+    # a hit equals a fresh ``make_ptr``. Bounded because tuning visits many
+    # workspaces; a pointer holds no tensor reference.
+    _MEGAMOE_CUTE_PTR_CACHE: dict = {}
+    _MEGAMOE_CUTE_PTR_CACHE_MAX_ENTRIES = 256
+
+    def _to_cute_ptr_cached(t: torch.Tensor, assumed_align: int = 16):
+        key = (t.data_ptr(), assumed_align)
+        ptr = _MEGAMOE_CUTE_PTR_CACHE.get(key)
+        if ptr is None:
+            if len(_MEGAMOE_CUTE_PTR_CACHE) >= _MEGAMOE_CUTE_PTR_CACHE_MAX_ENTRIES:
+                _MEGAMOE_CUTE_PTR_CACHE.clear()
+            ptr = _MEGAMOE_CUTE_PTR_CACHE[key] = _cute_launch_helpers()[1](t, assumed_align)
+        return ptr
+
+    # cuda-python stream wrappers by raw handle.
+    _MEGAMOE_CU_STREAMS: dict = {}
+
+    def _current_cu_stream():
+        handle = torch._C._cuda_getCurrentRawStream(torch._C._cuda_getDevice())
+        stream = _MEGAMOE_CU_STREAMS.get(handle)
+        if stream is None:
+            stream = _MEGAMOE_CU_STREAMS[handle] = cuda.CUstream(handle)
+        return stream
 
     def _evict_latched_tuning_workspaces() -> None:
         """Pop every tuning-latched local workspace and prune its fence keys.
@@ -1654,7 +1695,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
         # (max_T, 1, hidden): both reduction forms collapse the top-k axis in-op.
         combine_output: torch.Tensor
         shared_workspace: torch.Tensor  # (shared_ws_bytes,) uint8
-        peer_offsets: List[int]  # symmetric peer-pointer deltas
+        peer_offsets: Tuple[int, ...]  # symmetric peer-pointer deltas
         rank: int
         world_size: int
 
@@ -1775,6 +1816,13 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 peer_ptr = int(self._handle.buffer_ptrs[r])
                 self.peer_offsets.append(peer_ptr - local_base)
 
+            # Built on first use per inference-mode state: a view made under
+            # inference mode cannot be updated in place outside it.
+            self._regions: dict = {}
+            # Cute views of these regions, shared by every layer launching on
+            # this provider (set as the op's buffer cache by the backend).
+            self.cute_views: dict = {}
+
             logger.debug(
                 "[MegaMoeSymmMemProvider] group=%s rank=%d/%d total_bytes=%d "
                 "(activation=%d sf=%d topk_weights=%d combine=%d shared=%d)",
@@ -1801,6 +1849,13 @@ if IS_MEGAMOE_OP_AVAILABLE:
             return byte_view.view(dtype).view(shape)
 
         def get_regions(self) -> MegaMoeSymmRegions:
+            inference_mode = torch.is_inference_mode_enabled()
+            regions = self._regions.get(inference_mode)
+            if regions is None:
+                regions = self._regions[inference_mode] = self._build_regions()
+            return regions
+
+        def _build_regions(self) -> MegaMoeSymmRegions:
             hidden = self.hidden_size
             max_t = self.max_tokens_per_rank
             top_k = self.num_topk
@@ -1825,7 +1880,8 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 shared_workspace=self._region_view(
                     "shared_workspace", (self._region_sizes["shared_workspace"],), torch.uint8
                 ),
-                peer_offsets=list(self.peer_offsets),
+                # A tuple: the regions object is shared across launches.
+                peer_offsets=tuple(self.peer_offsets),
                 rank=self.rank,
                 world_size=self.world_size,
             )
@@ -1952,6 +2008,17 @@ if IS_MEGAMOE_OP_AVAILABLE:
         """Set (``None`` clears) the calling module's cute weight-view cache."""
         global _ACTIVE_MEGAMOE_CUTE_WEIGHT_CACHE
         _ACTIVE_MEGAMOE_CUTE_WEIGHT_CACHE = cache
+
+    # Cute views of the symmetric launch buffers, set by the backend only
+    # when activation, activation_sf, topk_weights and the combine output are
+    # its provider's regions and topk_idx is its own staging buffer. The
+    # provider owns the dict; topk_idx views go to the module's weight cache.
+    _ACTIVE_MEGAMOE_CUTE_BUFFER_CACHE: Optional[dict] = None
+
+    def set_active_megamoe_cute_buffer_cache(cache: Optional[dict]) -> None:
+        """Set (``None`` clears) the active provider's cute launch-buffer cache."""
+        global _ACTIVE_MEGAMOE_CUTE_BUFFER_CACHE
+        _ACTIVE_MEGAMOE_CUTE_BUFFER_CACHE = cache
 
     def set_active_megamoe_profiling_scratch(regions) -> None:
         """Set (``None`` clears) the :class:`MegaMoeSymmRegions` used for
@@ -2252,7 +2319,14 @@ if IS_MEGAMOE_OP_AVAILABLE:
             # local_rank is intentionally excluded: every EP rank must run the
             # SAME tactic and MERGE merges timings by cache key across ranks,
             # so the key MUST be rank-identical. world_size stays so
-            # single-rank and multi-rank never share entries.
+            # single-rank and multi-rank never share entries. The key depends
+            # only on constructor inputs, so each runner builds it once.
+            key = self.__dict__.get("_unique_id")
+            if key is None:
+                key = self._unique_id = self._build_unique_id()
+            return key
+
+        def _build_unique_id(self):
             return _megamoe_problem_key(
                 sm_version=self.sm_version,
                 world_size=self.world_size,
@@ -2805,10 +2879,13 @@ if IS_MEGAMOE_OP_AVAILABLE:
             # uint8 workspaces MUST be cute.Pointer, NOT cute.Tensor: the
             # 32-bit memref shape field overflows once shared_workspace passes
             # 2 GiB (the kernel addresses by raw base + Int64 byte offset).
-            _to_cute, _to_cute_ptr, SymBufferHost, cute = _cute_launch_helpers()
-            # Weights reuse the calling module's cute views; tuning launches convert afresh.
-            weight_cache = _ACTIVE_MEGAMOE_CUTE_WEIGHT_CACHE
-            if weight_cache is None or AutoTuner.get().is_tuning_mode:
+            _to_cute, _, SymBufferHost, cute = _cute_launch_helpers()
+            # Weights reuse the calling module's cute views and the symmetric
+            # launch buffers the active provider's; tuning launches convert afresh.
+            tuning = AutoTuner.get().is_tuning_mode
+            weight_cache = None if tuning else _ACTIVE_MEGAMOE_CUTE_WEIGHT_CACHE
+            buffer_cache = None if tuning else _ACTIVE_MEGAMOE_CUTE_BUFFER_CACHE
+            if weight_cache is None:
                 _to_cute_w = _to_cute
             else:
                 _to_cute_w = functools.partial(_to_cute_cached, weight_cache)
@@ -2817,9 +2894,23 @@ if IS_MEGAMOE_OP_AVAILABLE:
             # present K stride-1 via a transpose VIEW (DLPack carries the
             # strides); do NOT ``.contiguous()``.
             output_activation = combine_output.reshape(combine_output.shape[0], self.hidden_size)
+            if buffer_cache is None:
+                cute_activation = _to_cute(activation)
+                cute_activation_sf = _to_cute(activation_sf)
+                cute_topk_weights = _to_cute(topk_weights)
+                cute_output = _to_cute(output_activation)
+                cute_topk_idx = _to_cute(topk_idx)
+            else:
+                cute_activation = _to_cute_cached(buffer_cache, activation)
+                cute_activation_sf = _to_cute_cached(buffer_cache, activation_sf)
+                cute_topk_weights = _to_cute_cached(buffer_cache, topk_weights)
+                # Its live rows change per iteration, not between the layers of one.
+                cute_output = _to_cute_slot(buffer_cache, "output_activation", output_activation)
+                # topk_idx is the calling module's own staging buffer.
+                cute_topk_idx = _to_cute_w(topk_idx)
             runtime_kwargs = dict(
-                activation=_to_cute(activation),
-                activation_sf=_to_cute(activation_sf),
+                activation=cute_activation,
+                activation_sf=cute_activation_sf,
                 fc1_weight=_to_cute_w(fc1_weight.transpose(1, 2)),
                 fc1_weight_sf=_to_cute_w(fc1_weight_sf),
                 fc2_weight=_to_cute_w(fc2_weight.transpose(1, 2)),
@@ -2827,14 +2918,14 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 fc1_alpha=_to_cute_w(fc1_alpha, assumed_align=4),
                 fc2_alpha=_to_cute_w(fc2_alpha, assumed_align=4),
                 fc1_norm_const=_to_cute_w(fc1_norm_const, assumed_align=4),
-                output_activation=_to_cute(output_activation),
-                local_workspace=_to_cute_ptr(local_workspace),
-                shared_workspace=_to_cute_ptr(shared_workspace),
-                stream=cuda.CUstream(torch.cuda.current_stream().cuda_stream),
+                output_activation=cute_output,
+                local_workspace=_to_cute_ptr_cached(local_workspace),
+                shared_workspace=_to_cute_ptr_cached(shared_workspace),
+                stream=_current_cu_stream(),
             )
             runtime_kwargs.update(
-                topk_indices=_to_cute(topk_idx),
-                topk_scores=_to_cute(topk_weights),
+                topk_indices=cute_topk_idx,
+                topk_scores=cute_topk_weights,
                 peer_rank_ptr_mapper_host=SymBufferHost(
                     base_address=int(activation.untyped_storage().data_ptr()),
                     offsets=tuple(int(off) for off in peer_offsets),
@@ -2846,8 +2937,6 @@ if IS_MEGAMOE_OP_AVAILABLE:
             # Contract: with S > 0 both values must be supplied. Fail loudly
             # here rather than hand the kernel an unarmed gate.
             if self.helper_expert_count > 0:
-                import cutlass
-
                 if self._helper_ready_flags is None:
                     raise RuntimeError(
                         "MegaMoE-CuteDSL: helper_expert_count > 0 requires "
@@ -2866,7 +2955,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
                         f"hold at least world_size={self.world_size} uint64 "
                         f"cells; got numel={self._helper_ready_flags.numel()}."
                     )
-                runtime_kwargs["hot_expert_weight_ready_flags"] = _to_cute_ptr(
+                runtime_kwargs["hot_expert_weight_ready_flags"] = _to_cute_ptr_cached(
                     self._helper_ready_flags
                 )
                 runtime_kwargs["hot_expert_weight_ready_generation"] = cutlass.Uint64(
