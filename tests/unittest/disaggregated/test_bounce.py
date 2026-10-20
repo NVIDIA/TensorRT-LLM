@@ -188,6 +188,14 @@ class TestResultTail:
         # non-bounced result: only [msg_type, prefix] -> no tail.
         assert btr.decode_result_tail([b"KV_AGENT_RESULT", b"prefix"]) == (None, None, None)
 
+    def test_extra_frames_are_ignored(self):
+        wm = self._wm([100], [16], 0xABCD)
+        message = [b"KV_AGENT_RESULT", b"prefix", *btr.encode_result_tail(wm), b"extra"]
+        dst, sizes, src_base = btr.decode_result_tail(message)
+        assert np.array_equal(dst, wm.dst_ptrs)
+        assert np.array_equal(sizes, wm.sizes)
+        assert src_base == 0xABCD
+
     def test_encode_tail_handles_unset_base(self):
         wm = self._wm([1, 2], [8, 8], None)
         tail = btr.encode_result_tail(wm)
@@ -296,6 +304,7 @@ class TestNoBounce:
         assert nb.reserve(SimpleNamespace()) is False
         assert nb.build_request(SimpleNamespace()) is None
         assert nb.writer_base(("r", 0), 1) is None
+        assert nb.writer_span(("r", 0), 1) is None
         assert nb.is_bounced(("r", 0)) is False
         nb.record_result(("r", 0), 1)  # no-op, must not raise
         nb.record_failure(("r", 0), 1)  # no-op, must not raise
@@ -464,6 +473,9 @@ class TestFanInReserve:
         # writer i lands at base + i * (total // num_writers); per_writer = 100.
         assert t.writer_base((req.unique_rid, req.slice_id), 0) == 0x100000
         assert t.writer_base((req.unique_rid, req.slice_id), 1) == 0x100000 + 100
+        assert t.writer_span((req.unique_rid, req.slice_id), 0) == (0x100000, 100)
+        assert t.writer_span((req.unique_rid, req.slice_id), 1) == (0x100000 + 100, 100)
+        assert t.writer_span((req.unique_rid, req.slice_id), 2) is None
 
     def test_reserve_uneven_fanin_falls_back(self, monkeypatch):
         t = _make_transport(monkeypatch, block_bytes_per_group=[3])

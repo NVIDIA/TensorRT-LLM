@@ -25,18 +25,28 @@ from unittest.mock import Mock
 import numpy as np
 import pytest
 
+import tensorrt_llm._torch.disaggregation.native.bounce as bounce_mod
 import tensorrt_llm._torch.disaggregation.native.transfer as transfer_mod
 import tensorrt_llm._torch.disaggregation.transceiver as transceiver_mod
 from tensorrt_llm import DisaggregatedParams
 from tensorrt_llm._torch.disaggregation.base import CacheExtent, CacheKind, Chunk, TokenRange
 from tensorrt_llm._torch.disaggregation.base.transfer import SessionStatus, WaitResult
 from tensorrt_llm._torch.disaggregation.native.bounce.core import TransferContext
+from tensorrt_llm._torch.disaggregation.native.receive_bounds import ReceiveBounds
 from tensorrt_llm._torch.disaggregation.native.transfer import (
     AgentResult,
     KVRecvTask,
     MessageType,
     Receiver,
     RxSession,
+)
+from tensorrt_llm._torch.disaggregation.resource.page import (
+    BUFFER_ENTRY_DTYPE,
+    AttentionLayerGroup,
+    KVCachePageTable,
+    PhysicalPool,
+    PhysicalPoolGroup,
+    PoolView,
 )
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
@@ -53,6 +63,25 @@ def _sole_piece(block_ids_per_layer_groups=None, *, tokens=0, is_last=True) -> C
         kind_per_layer_group=[CacheKind.PAGED] * len(groups),
         token_range=TokenRange(start=0, end=tokens),
         is_last=is_last,
+    )
+
+
+def _paged_receive_table(num_slots: int = 1) -> KVCachePageTable:
+    return KVCachePageTable(
+        tokens_per_block=8,
+        layer_groups=[
+            AttentionLayerGroup(
+                pool_group_idx=0,
+                pool_views=[
+                    PoolView(pool_idx=0, buffer_entries=np.array([], dtype=BUFFER_ENTRY_DTYPE))
+                ],
+            )
+        ],
+        pool_groups=[
+            PhysicalPoolGroup(
+                pools=[PhysicalPool(base_address=0x2000, slot_bytes=0x100, num_slots=num_slots)]
+            )
+        ],
     )
 
 
@@ -85,6 +114,11 @@ class _BounceProbe:
 
     def is_bounced(self, _rid_slice: tuple[int, int]) -> bool:
         return False
+
+    def writer_span(
+        self, _rid_slice: tuple[int, int], _writer_index: int
+    ) -> tuple[int, int] | None:
+        return None
 
 
 class _LateReservationBounce(_BounceProbe):
@@ -122,6 +156,12 @@ class _PartialFanInBounce(_BounceProbe):
         if self.context is None or self.context.rid_slice != rid_slice:
             return None
         return self.context.writer_base(writer_index)
+
+    def writer_span(self, rid_slice: tuple[int, int], writer_index: int) -> tuple[int, int] | None:
+        base = self.writer_base(rid_slice, writer_index)
+        if base is None or self.context is None:
+            return None
+        return base, self.context.per_writer_bytes
 
     def is_bounced(self, rid_slice: tuple[int, int]) -> bool:
         return self.context is not None and self.context.rid_slice == rid_slice
@@ -252,6 +292,7 @@ class _ReceiverProbe:
     def dispatch_task(self, task: KVRecvTask) -> None:
         assert self._session is not None
         task.expected_transfers = 2
+        task._receive_bounds = ReceiveBounds.from_chunk(task._chunk, None, {0: None, 1: None})
         self._session.mark_transferring(task.slice_id, writer_cohort={0, 1})
 
     def send_cancel_to_senders(self, _unique_rid: int, _sender_endpoints: set[str]) -> None:
@@ -579,6 +620,118 @@ def test_non_terminal_writer_result_does_not_authorize_reuse() -> None:
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("peer_rank", "slice_id", "dst_ptr", "src_base", "error"),
+    [
+        (0, 0, 0x2100, 0x1000, "outside this receive piece"),
+        (0, 0, 0x2000, 0x1100, "different bounce source"),
+        (1, 0, 0x2000, 0x1000, "not assigned to this receive piece"),
+        (0, -1, 0x2000, 0x1000, "receiver_slice_id=-1"),
+    ],
+)
+def test_rejected_result_does_not_claim_writer_before_valid_result(
+    monkeypatch: pytest.MonkeyPatch,
+    peer_rank: int,
+    slice_id: int,
+    dst_ptr: int,
+    src_base: int,
+    error: str,
+) -> None:
+    receiver = _ReceiverProbe()
+    receiver._enforce_physical_ownership = False
+    receiver._registrar = SimpleNamespace(
+        self_rank_info=SimpleNamespace(instance_name="gen", instance_rank=0)
+    )
+    session = _make_rx_session(receiver, rid=104)
+    chunk = _sole_piece([np.array([0], dtype=np.int64)])
+    session.receive(chunk)
+    task = session._kv_tasks[0]
+    task.expected_transfers = 1
+    task._receive_bounds = ReceiveBounds.from_chunk(
+        chunk, _paged_receive_table(), {0: (0x1000, 0x100)}
+    )
+
+    def finish_scatter(
+        _bounce: object,
+        _rid_slice: tuple[int, int],
+        _rank: int,
+        _ptrs: np.ndarray | None,
+        _sizes: np.ndarray | None,
+        _source: int | None,
+        on_done: Callable[[bool], None] | None,
+    ) -> None:
+        if on_done is not None:
+            on_done(True)
+
+    scatter = Mock(side_effect=finish_scatter)
+    monkeypatch.setattr(bounce_mod, "scatter_write_result", scatter)
+    with pytest.raises(ValueError, match=error):
+        session.process_kv_agent_result(
+            peer_rank=peer_rank,
+            receiver_slice_id=slice_id,
+            is_last_slice=True,
+            status=AgentResult.SUCCESS,
+            dst_ptrs=np.array([dst_ptr], dtype=np.int64),
+            sizes=np.array([8], dtype=np.int64),
+            src_base=src_base,
+            transfer_size=8,
+        )
+
+    assert task._writer_reports == {}
+    assert session.kv_cache_size_bytes == 0
+    scatter.assert_not_called()
+
+    session.process_kv_agent_result(
+        peer_rank=0,
+        receiver_slice_id=0,
+        is_last_slice=True,
+        status=AgentResult.SUCCESS,
+        dst_ptrs=np.array([0x2000], dtype=np.int64),
+        sizes=np.array([8], dtype=np.int64),
+        src_base=0x1000,
+        transfer_size=8,
+    )
+    assert task._writer_reports == {0: True}
+    assert session.kv_cache_size_bytes == 8
+    assert task.status == transfer_mod.TaskStatus.TRANSFERRED
+    scatter.assert_called_once()
+
+
+@pytest.mark.cpu_only
+def test_result_uses_the_destination_bounds_of_its_own_slice(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    receiver = _ReceiverProbe()
+    receiver._enforce_physical_ownership = False
+    session = _make_rx_session(receiver, rid=105)
+    table = _paged_receive_table(num_slots=2)
+    for slot, is_last in ((0, False), (1, True)):
+        chunk = _sole_piece([np.array([slot], dtype=np.int64)], is_last=is_last)
+        session.receive(chunk)
+        task = session._kv_tasks[-1]
+        task.expected_transfers = 1
+        task._receive_bounds = ReceiveBounds.from_chunk(chunk, table, {0: (0x1000, 0x100)})
+
+    scatter = Mock()
+    monkeypatch.setattr(bounce_mod, "scatter_write_result", scatter)
+    with pytest.raises(ValueError, match="outside this receive piece"):
+        session.process_kv_agent_result(
+            peer_rank=0,
+            receiver_slice_id=0,
+            is_last_slice=True,
+            status=AgentResult.SUCCESS,
+            dst_ptrs=np.array([0x2100], dtype=np.int64),
+            sizes=np.array([8], dtype=np.int64),
+            src_base=0x1000,
+            transfer_size=8,
+        )
+
+    assert session.kv_cache_size_bytes == 0
+    assert all(task._writer_reports == {} for task in session._kv_tasks)
+    scatter.assert_not_called()
+
+
+@pytest.mark.cpu_only
 def test_gen_first_no_retry_adp_count_seal_waits_for_one_writer_group() -> None:
     rid = 94
     receiver = object.__new__(Receiver)
@@ -697,7 +850,7 @@ def test_partial_bounced_publication_waits_for_queued_writer_success(
     )
     receiver._registrar = SimpleNamespace(
         get_peer_overlap=Mock(return_value=overlap),
-        self_extractor=SimpleNamespace(page_table=None),
+        self_extractor=SimpleNamespace(page_table=_paged_receive_table()),
         self_rank_info=SimpleNamespace(instance_name="gen", instance_rank=0, cp_size=1),
     )
     receiver._get_sender_info = Mock(
@@ -741,7 +894,7 @@ def test_partial_bounced_publication_waits_for_queued_writer_success(
     )
 
     with pytest.raises(RuntimeError, match="writer 1 publication failed"):
-        session.receive(_sole_piece())
+        session.receive(_sole_piece([np.array([0], dtype=np.int64)]))
 
     assert queued_endpoints == ["tcp://sender-0"]
     if not writer_settles_before_failure:
@@ -780,6 +933,7 @@ def test_aborted_publication_cannot_complete_during_failure_unwind() -> None:
         def dispatch_task(self, task: KVRecvTask) -> None:
             assert self._session is not None
             task.expected_transfers = 1
+            task._receive_bounds = ReceiveBounds.from_chunk(task._chunk, None, {0: None})
             original_abort = task.abort_publication
 
             def abort_then_deliver_success(writers: set[int]) -> None:
@@ -822,7 +976,7 @@ def test_out_of_cohort_writer_cannot_authorize_reuse() -> None:
     session = _make_rx_session(receiver, rid=82)
     session.receive(_sole_piece())
 
-    with pytest.raises(RuntimeError, match="outside the sealed cohort"):
+    with pytest.raises(ValueError, match="not assigned to this receive piece"):
         session.process_kv_agent_result(
             peer_rank=2,
             receiver_slice_id=0,
@@ -1975,6 +2129,7 @@ def test_receiver_in_doubt_retains_destination_and_closes_admission(
     task = session.prepare_receive(_sole_piece())
     assert task is not None
     task.expected_transfers = 1
+    task._receive_bounds = ReceiveBounds.from_chunk(task._chunk, None, {0: None})
     assert session.try_begin_transfer(task.slice_id, set(), writer_cohort={0})
 
     if auxiliary:

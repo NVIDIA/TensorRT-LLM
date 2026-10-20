@@ -27,6 +27,7 @@ import pytest
 from tensorrt_llm import DisaggregatedParams
 from tensorrt_llm._torch.disaggregation.base import CacheExtent, CacheKind, Chunk, TokenRange
 from tensorrt_llm._torch.disaggregation.base.transfer import SessionStatus, WaitResult
+from tensorrt_llm._torch.disaggregation.native.receive_bounds import ReceiveBounds
 from tensorrt_llm._torch.disaggregation.native.transfer import (
     AgentResult,
     KVSendTask,
@@ -107,6 +108,7 @@ def _make_rx_session(num_slices: int, rid: int = 42, prompt_len: int = 8) -> RxS
             is_last=(i == num_slices - 1),
         )
         session.receive(s)
+        session._kv_tasks[-1]._receive_bounds = ReceiveBounds.from_chunk(s, None, {0: None})
     return session
 
 
@@ -341,7 +343,7 @@ def test_process_kv_agent_result_rejects_unknown_receiver_slice_id():
     """Indexing is bounded by the receiver's own task count."""
     session = _make_rx_session(1)
 
-    with pytest.raises(AssertionError, match=r"receiver_slice_id=2"):
+    with pytest.raises(ValueError, match=r"receiver_slice_id=2"):
         session.process_kv_agent_result(
             peer_rank=0,
             receiver_slice_id=2,

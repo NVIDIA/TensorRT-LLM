@@ -69,6 +69,7 @@ from tensorrt_llm._torch.disaggregation.native.mixers.ssm.peer import (
 from tensorrt_llm._torch.disaggregation.native.peer import PeerOverlap, PeerRegistrar
 from tensorrt_llm._torch.disaggregation.native.perf_logger import PerfTimer, perf_log_manager
 from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
+from tensorrt_llm._torch.disaggregation.native.receive_bounds import ReceiveBounds
 from tensorrt_llm._torch.disaggregation.native.utils import get_local_ip
 from tensorrt_llm._torch.disaggregation.nixl.agent import NixlTransferAgent
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
@@ -2309,6 +2310,7 @@ class KVRecvTask(_LogicalTask):
         self.expected_transfers = 0
         # One terminal result per writer rank, keyed by the rank the result frame carries.
         self._writer_reports: dict[int, bool] = {}
+        self._receive_bounds: Optional[ReceiveBounds] = None
 
         self._unique_rid = unique_rid
         self._chunk = chunk
@@ -2360,7 +2362,6 @@ class KVRecvTask(_LogicalTask):
         repeat is refused outright, so the caller settles the piece once rather than once per frame.
         Callers hold ``RxSession.lock``, which serializes the writes.
         """
-        # TODO: a report from a rank outside the authorized writer set is counted, not rejected.
         if peer_rank in self._writer_reports:
             previous = self._writer_reports[peer_rank]
             if previous != succeeded:
@@ -2744,6 +2745,10 @@ class Receiver(ReceiverBase):
         )
         session = self._get_session(task._unique_rid)
         if session is None:
+            if bounced:
+                self._bounce.release_idle_reservation(
+                    (receiver_req.unique_rid, receiver_req.slice_id)
+                )
             raise RuntimeError(
                 f"dispatch_task: RxSession {task._unique_rid} not found; "
                 "session may have been closed before dispatch"
@@ -2752,25 +2757,48 @@ class Receiver(ReceiverBase):
         # Fan-in: each sender gets its own sub-region base (writers must not overwrite); else serialize once.
         fanin_bounce = bounced and task.expected_transfers > 1
         key = (receiver_req.unique_rid, receiver_req.slice_id)
+        writer_spans: dict[int, Optional[tuple[int, int]]] = {}
+        try:
+            for i, rank in enumerate(peer_overlap.ranks):
+                writer_index = i if fanin_bounce else 0
+                span = self._bounce.writer_span(key, writer_index) if bounced else None
+                if bounced and span is None:
+                    raise RuntimeError(f"missing bounce region for request {key}, writer {rank}")
+                writer_spans[rank] = span
+            task._receive_bounds = ReceiveBounds.from_chunk(
+                task._chunk, self._registrar.self_extractor.page_table, writer_spans
+            )
+        except Exception:
+            if bounced:
+                self._bounce.release_idle_reservation(key)
+            raise
         receiver_req_bytes = None if fanin_bounce else receiver_req.to_bytes()
         if not self._enforce_physical_ownership:
             session.mark_transferring(task.slice_id)
             # Cache sender endpoints so cancel() can send CANCEL_SESSION to them.
             session._sender_endpoints.update(sender_endpoints)
-            for i, rank in enumerate(peer_overlap.ranks):
+            for rank in peer_overlap.ranks:
                 if task._perf_timer is not None:
                     task._perf_timer.record_task_start(rank)
                 if fanin_bounce:
-                    receiver_req.bounce_dst_base = self._bounce.writer_base(key, i)
+                    span = writer_spans[rank]
+                    if span is None:
+                        raise RuntimeError(
+                            f"missing bounce region for request {key}, writer {rank}"
+                        )
+                    receiver_req.bounce_dst_base = span[0]
                     receiver_req_bytes = receiver_req.to_bytes()
                 self._request_sender_data(peer_infos.sender_endpoints[rank], receiver_req_bytes)
             return
 
         peer_ranks = list(peer_overlap.ranks)
         serialized_requests: list[tuple[int, bytes]] = []
-        for i, rank in enumerate(peer_ranks):
+        for rank in peer_ranks:
             if fanin_bounce:
-                receiver_req.bounce_dst_base = self._bounce.writer_base(key, i)
+                span = writer_spans[rank]
+                if span is None:
+                    raise RuntimeError(f"missing bounce region for request {key}, writer {rank}")
+                receiver_req.bounce_dst_base = span[0]
                 payload = receiver_req.to_bytes()
             else:
                 assert receiver_req_bytes is not None
@@ -3258,12 +3286,13 @@ class RxSession(RxSessionBase):
         transfer_size: int = 0,
     ):
         with self._ownership_evidence_guard(), self.lock:
-            assert receiver_slice_id < len(self._kv_tasks), (
-                f"Receiver got receiver_slice_id={receiver_slice_id} but only has "
-                f"{len(self._kv_tasks)} receive task(s) for request {self.request_id}. "
-                f"The sender echoes this index back from RecvReqInfo, so it must "
-                f"address a task this receiver posted."
-            )
+            if not 0 <= receiver_slice_id < len(self._kv_tasks):
+                raise ValueError(
+                    f"Receiver got receiver_slice_id={receiver_slice_id} but only has "
+                    f"{len(self._kv_tasks)} receive task(s) for request {self.request_id}. "
+                    f"The sender echoes this index back from RecvReqInfo, so it must "
+                    f"address a task this receiver posted."
+                )
             task = self._kv_tasks[receiver_slice_id]
             if status not in (
                 AgentResult.SUCCESS,
@@ -3273,6 +3302,18 @@ class RxSession(RxSessionBase):
                 raise ValueError(
                     f"Session {self.request_id} received unknown task status: {status.value}"
                 )
+            bounds = task._receive_bounds
+            if bounds is None:
+                raise RuntimeError("receive task has no published bounds")
+            if transfer_size < 0:
+                raise ValueError("transfer size must be nonnegative")
+            dst_ptrs, sizes, src_base = bounds.validate_result(
+                peer_rank,
+                status == AgentResult.SUCCESS,
+                dst_ptrs,
+                sizes,
+                src_base,
+            )
             if status == AgentResult.IN_DOUBT:
                 if not self._enforce_physical_ownership:
                     raise RuntimeError(

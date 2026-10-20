@@ -39,6 +39,7 @@ from tensorrt_llm._torch.disaggregation.base import (
 from tensorrt_llm._torch.disaggregation.base.transfer import WaitResult
 from tensorrt_llm._torch.disaggregation.native.fetch import PeerFetch
 from tensorrt_llm._torch.disaggregation.native.handle import TaskHandle
+from tensorrt_llm._torch.disaggregation.native.receive_bounds import ReceiveBounds
 from tensorrt_llm._torch.disaggregation.native.transfer import (
     AgentResult,
     KVRecvTask,
@@ -100,6 +101,9 @@ def _receiving_from(
     session.receive(_sole_piece())
     task = session._kv_tasks[0]
     task.expected_transfers = writers
+    task._receive_bounds = ReceiveBounds.from_chunk(
+        task._chunk, None, {rank: None for rank in range(writers)}
+    )
     cohort = set(range(writers)) if owns_transfers else None
     session.mark_transferring(task.slice_id, cohort)
     return session, TaskHandle(session, task, TOKENS)
@@ -593,6 +597,7 @@ def test_a_transferring_piece_the_peer_cancelled_says_who_asked():
     session.receive(_sole_piece())
     task = session._kv_tasks[0]
     task.expected_transfers = 1
+    task._receive_bounds = ReceiveBounds.from_chunk(task._chunk, None, {0: None})
     session.mark_transferring(task.slice_id)
 
     _cancel_off_the_wire(receiver, 18)
@@ -716,6 +721,7 @@ def test_receive_aux_failure_precedes_late_kv_success() -> None:
     session.receive(_sole_piece())
     task = session._kv_tasks[0]
     task.expected_transfers = 1
+    task._receive_bounds = ReceiveBounds.from_chunk(task._chunk, None, {0: None})
     session.mark_transferring(task.slice_id)
     handle = TaskHandle(session, task, TOKENS)
 

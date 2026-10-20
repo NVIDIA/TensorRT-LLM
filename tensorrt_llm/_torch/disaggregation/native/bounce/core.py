@@ -245,6 +245,10 @@ class BounceTransport(ABC):
         """Where the given fan-in writer writes in the region."""
 
     @abstractmethod
+    def writer_span(self, rid_slice, writer_index: int) -> Optional[tuple[int, int]]:
+        """Return the base address and byte capacity assigned to a writer."""
+
+    @abstractmethod
     def is_bounced(self, rid_slice) -> bool:
         """Whether this request and slice name a live bounced region."""
 
