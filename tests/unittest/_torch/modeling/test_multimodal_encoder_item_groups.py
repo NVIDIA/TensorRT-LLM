@@ -365,6 +365,59 @@ def test_grouped_encoder_rejects_raw_payload_without_item_layout(empty_record: b
     assert model.encoder_calls == []
 
 
+@pytest.mark.parametrize(
+    "mm_counts,expected_refs,expected_costs,expected_rows",
+    [
+        ({"image": 2}, (("image", 0), ("image", 1)), (8, 8), (2, 2)),
+        ({"video": 2}, (("video", 0), ("video", 1)), (16, 16), (4, 4)),
+        (
+            {"video": 1, "image": 2},
+            (("video", 0), ("image", 0), ("image", 1)),
+            (16, 8, 8),
+            (4, 2, 2),
+        ),
+    ],
+    ids=["images", "videos", "mixed"],
+)
+def test_qwen_profiling_dummy_supports_grouped_encoding(
+    mm_counts: dict[str, int],
+    expected_refs: tuple[tuple[str, int], ...],
+    expected_costs: tuple[int, ...],
+    expected_rows: tuple[int, ...],
+) -> None:
+    from tensorrt_llm._torch.models.modeling_qwen3vl import Qwen3VLInputProcessorBase
+
+    class Processor(Qwen3VLInputProcessorBase):
+        def _get_dummy_grid_for_modality(
+            self, modality: str, max_num_encoder_tokens: int
+        ) -> tuple[int, int, int]:
+            return {"image": (1, 2, 4), "video": (2, 2, 4)}[modality]
+
+    processor = object.__new__(Processor)
+    processor._config = SimpleNamespace(
+        vision_config=SimpleNamespace(spatial_merge_size=2, patch_size=1, in_channels=HIDDEN)
+    )
+    data = processor.get_dummy_mm_data(
+        max_num_encoder_tokens=64, mm_counts=mm_counts, dtype=torch.float16
+    )
+    params = MultimodalParams(multimodal_data=data)
+    metadata = params.item_metadata
+    assert metadata is not None
+    metadata.validate()
+    assert metadata.item_refs == expected_refs
+    assert metadata.encoder_token_lengths == expected_costs
+    assert metadata.output_embedding_lengths == expected_rows
+
+    group = EncoderGroup(
+        modalities=("image", "video"),
+        encoder_fn=lambda pixel_values: pixel_values[::4],
+        build_batched_input=_GroupedEncoderModel._build_batched_input,
+    )
+    output = encode_multimodal_by_groups([group], [params])
+    assert output.shape == (sum(expected_rows), HIDDEN)
+    assert output.dtype == torch.float16
+
+
 def test_common_metadata_shares_executor_and_encoder_layout():
     from tensorrt_llm._torch.pyexecutor.llm_request import get_multimodal_embedding_lengths
 

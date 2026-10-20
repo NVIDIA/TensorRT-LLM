@@ -603,6 +603,50 @@ _UUID_HASH_SNAPSHOT = {
 }
 
 
+def test_mixed_hashing_uses_processor_metadata_without_frontend_order() -> None:
+    class Processor(_KwargsHashFakeProcessor):
+        multimodal_hashing_supported = None
+
+        def __call__(self, inputs: dict, sampling_params: object) -> tuple[list[int], dict]:
+            return [10, 101, 102, 20, 101, 102, 30], {"multimodal_data": {"image": {}, "video": {}}}
+
+        def get_num_tokens_per_video(self, *, video: VideoData, **kwargs: object) -> int:
+            return 2
+
+        def get_mm_item_metadata(
+            self,
+            prompt_token_ids: list[int],
+            multimodal_data: dict,
+            mm_item_order: list[dict[str, object]] | None = None,
+        ) -> MultimodalItemMetadata:
+            return MultimodalItemMetadata([("video", 0), ("image", 0)], [16, 8], [2, 2])
+
+    processor = Processor()
+    wrapped = create_input_processor_with_hash(processor)
+    inputs = {
+        "prompt": "unused",
+        "multi_modal_data": {
+            "image": [np.array([1], dtype=np.uint8)],
+            "video": [VideoData(frames=[np.full((2, 2, 3), 2, dtype=np.uint8)], metadata={})],
+        },
+    }
+
+    # Exercise both the first hashing probe and a subsequent enabled request.
+    for _ in range(2):
+        _, extra = wrapped(inputs, None)
+        assert processor.multimodal_hashing_supported is True
+        mm_input = extra["multimodal_input"]
+        assert mm_input.multimodal_hashes == [
+            _CONTENT_HASH_SNAPSHOT["video"],
+            _CONTENT_HASH_SNAPSHOT["image"],
+        ]
+        assert mm_input.multimodal_positions == [1, 4]
+        metadata = extra["multimodal_data"][MULTIMODAL_ENCODER_ITEM_METADATA_KEY]
+        assert metadata.item_refs == (("video", 0), ("image", 0))
+        assert metadata.encoder_token_lengths == (16, 8)
+        assert metadata.output_embedding_lengths == (2, 2)
+
+
 @pytest.mark.parametrize("hashing_enabled", [False, True])
 def test_mm_item_metadata_rejects_conflicting_prompt_order(hashing_enabled: bool) -> None:
     class Processor(_KwargsHashFakeProcessor):
