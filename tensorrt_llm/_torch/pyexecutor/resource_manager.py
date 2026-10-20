@@ -757,6 +757,10 @@ class KVCacheManager(BaseResourceManager):
 
         self.enable_indexer_k_cache = enable_indexer_k_cache
 
+        cold_tier_offload_min_priority = (
+            kv_cache_config.secondary_offload_min_priority if isinstance(
+                kv_cache_config, tensorrt_llm.bindings.executor.KvCacheConfig)
+            else kv_cache_config.cold_tier_offload_min_priority)
         kwargs = {
             'num_kv_heads_per_layer': self.num_kv_heads_per_layer,
             'size_per_head': head_dim,
@@ -772,8 +776,7 @@ class KVCacheManager(BaseResourceManager):
             'chunk_size': min(max_num_tokens, self.max_seq_len),
             'enable_block_reuse': kv_cache_config.enable_block_reuse,
             'cache_type': kv_cache_type,
-            'secondary_offload_min_priority':
-            kv_cache_config.secondary_offload_min_priority,
+            'secondary_offload_min_priority': cold_tier_offload_min_priority,
             'enable_partial_reuse': kv_cache_config.enable_partial_reuse,
             'copy_on_partial_reuse': kv_cache_config.copy_on_partial_reuse,
             'kv_connector_manager': self.kv_connector_manager,
@@ -3194,10 +3197,13 @@ class ResourceManager:
         scheduled_batch: ScheduledRequests,
         attn_metadata: Optional["AttentionMetadata"] = None,
         kv_cache_dtype_byte_size: Optional[float] = None,
+        skip_kv_cache_manager: bool = False,
     ):
         for resource_type, resource_manager in self.resource_managers.items():
             if hasattr(resource_manager, "update_resources"):
                 if resource_type == ResourceManagerType.KV_CACHE_MANAGER:
+                    if skip_kv_cache_manager:
+                        continue
                     resource_manager.update_resources(scheduled_batch,
                                                       attn_metadata,
                                                       kv_cache_dtype_byte_size)

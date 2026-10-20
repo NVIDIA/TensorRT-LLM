@@ -766,11 +766,19 @@ def test_gate_library_content(tmp_path):
         pcfg.gate_library_content("/nowhere/draft.sh", str(tmp_path / "empty"))
 
 
+@pytest.mark.parametrize("driver_status", (None, "PASS", "RUNNING", "FAIL"))
 @pytest.mark.parametrize(
     ("exit_code", "expected_verdict"),
     ((124, "EXTERNAL_TIMEOUT"), (137, "EXTERNAL_KILL")),
 )
-def test_gate_records_external_timeout_verdict(tmp_path, exit_code, expected_verdict):
+def test_gate_records_external_timeout_verdict(
+    tmp_path, exit_code, expected_verdict, driver_status
+):
+    """A killed step gets the gate's verdict unless the driver already wrote a FAIL verdict.
+
+    A stale PASS or a RUNNING status left by a dead driver is replaced, and the junit excerpt
+    still shows the driver's error markers after they scrolled out of the log tail.
+    """
     gate = os.path.join(
         os.path.dirname(_PRECHECK_DIR),
         "..",
@@ -785,7 +793,18 @@ def test_gate_records_external_timeout_verdict(tmp_path, exit_code, expected_ver
     gate = os.path.abspath(gate)
     shell_script = f"""
 source {shlex.quote(gate)}
-timeout() {{ return {exit_code}; }}
+timeout() {{
+    local name="${{DISAGG_SERVING_TYPE/_PRECHECK_/_}}"
+    name="${{name,,}}"  # GEN_PRECHECK_0 -> gen_0
+    if [ -n "{driver_status or ""}" ]; then
+        echo "{driver_status} $name" > "$precheckDir/status/$name.status"
+    fi
+    echo "[precheck $name r0] UNHANDLED_ERROR: FileExistsError: [Errno 17] File exists"
+    echo "[precheck $name] STATUS_WRITE_ERROR: OSError: [Errno 5] Input/output error"
+    seq 100  # later output pushes the marker out of the log tail
+    printf '\\0'  # an aborted MPI job can leave a NUL byte in the log
+    return {exit_code}
+}}
 sleep() {{ :; }}
 cleanup_on_failure() {{ :; }}
 ctPrecheckEnabled=1
@@ -814,14 +833,19 @@ run_cache_transceiver_precheck
     status_dir = tmp_path / "output" / "cache_transceiver_precheck" / "status"
     for name in ("gen_0", "ctx_0"):
         verdict = (status_dir / f"{name}.status").read_text()
+        if driver_status == "FAIL":
+            assert verdict == f"FAIL {name}\n"  # the driver's root cause wins over the exit code
+            continue
         assert verdict.startswith(f"{expected_verdict} {name}:")
         if exit_code == 124:
             assert "1200s total-runtime backstop" in verdict
         else:
             assert "possibly timeout -k escalation" in verdict
     junit = (tmp_path / "workspace" / "results-ct-precheck.xml").read_text()
-    assert expected_verdict in junit
+    assert ("FAIL gen_0" if driver_status == "FAIL" else expected_verdict) in junit
     assert "NO_STATUS" not in junit
+    assert "UNHANDLED_ERROR: FileExistsError: [Errno 17] File exists" in junit
+    assert "STATUS_WRITE_ERROR: OSError: [Errno 5] Input/output error" in junit
 
 
 def test_gate_scopes_precheck_launch_environment(tmp_path):
