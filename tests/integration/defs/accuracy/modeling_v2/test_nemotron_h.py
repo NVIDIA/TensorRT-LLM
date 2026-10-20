@@ -152,3 +152,41 @@ class TestModelingV2Nemotron3UltraBf16Sm100Tep8(LlmapiAccuracyTestHarness):
         ) as llm:
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm, extra_evaluator_kwargs=self.extra_evaluator_kwargs)
+
+
+@pytest.mark.skip_less_mpi_world_size(8)
+@pytest.mark.skip_less_device_memory(180000)
+class TestModelingV2Nemotron3UltraBf16Sm100Tp8ep2(LlmapiAccuracyTestHarness):
+    """Nemotron-3 Ultra 550B-A55B BF16 / sm_100 / tp8ep2.
+
+    tep8's layout with the routed experts in two expert-parallel windows of four tensor-parallel
+    ranks instead of eight windows.
+    """
+
+    MODEL_NAME = "nvidia/Nemotron-Ultra-V3"
+    MODEL_PATH = f"{llm_models_root()}/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16"
+
+    # The protocol TestNemotronV3Ultra gates the NVFP4 checkpoint with: thinking off.
+    extra_evaluator_kwargs = dict(chat_template_kwargs=dict(enable_thinking=False))
+
+    @skip_not_sm100
+    def test_gsm8k(self):
+        # tep8's configuration (see above) but for moe_expert_parallel_size 2, which with
+        # tensor_parallel_size 8 leaves moe_tensor_parallel_size 4.
+        max_batch_size = 256
+        with LLM(
+            self.MODEL_PATH,
+            modeling_v2="require",
+            env_overrides={MODELING_V2_VALIDATE_ENV: "1"},
+            kv_cache_config=KvCacheConfig(
+                enable_block_reuse=False,
+                free_gpu_memory_fraction=0.5,
+            ),
+            max_batch_size=max_batch_size,
+            tensor_parallel_size=8,
+            moe_expert_parallel_size=2,
+            enable_attention_dp=False,
+            cuda_graph_config=CudaGraphConfig(max_batch_size=max_batch_size, enable_padding=True),
+        ) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm, extra_evaluator_kwargs=self.extra_evaluator_kwargs)

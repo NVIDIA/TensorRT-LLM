@@ -381,7 +381,7 @@ def run_rank() -> bool:
         os.environ["TLLM_TEST_MNNVL"] = "1"
         os.environ["TRTLLM_FORCE_MNNVL_AR"] = "1"
 
-    from tensorrt_llm._torch._experimental.modeling_v2.models.nemotron_h.nemotron3_ultra_bf16__sm_100__tep8.ops.comm import (  # noqa: E501
+    from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm import (  # noqa: E501
         mnnvl_fusion_allreduce as entry_module,
     )
     from tensorrt_llm.mapping import Mapping
@@ -393,7 +393,7 @@ def run_rank() -> bool:
 
     # A spawned worker, not collected by pytest, so `__extra_import_path__` is not in play.
     # comm -> <target> -> nemotron_h -> models -> modeling_v2, where _validating lives.
-    sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
     from _validating import validating as _validating_cm
 
     validating = _validating_cm

@@ -226,6 +226,9 @@ def test_certified_cells(cell, _weights_for) -> None:
     kwargs = dict(
         ep_size=spec["ep_size"], ep_rank=spec["ep_rank"], activation_type=spec["activation_type"]
     )
+    # A tensor-parallel cell hands the op its rank's slices and its tp coordinates; the
+    # reference needs neither: it computes the partial sum over the slices it is given.
+    kwargs.update({k: spec[k] for k in ("tp_size", "tp_rank") if k in spec})
     with validating(fused_moe):
         out = fused_moe(x, ids, scales, w1, None, w2, None, torch.bfloat16, [], **kwargs)[0]
     _compare(

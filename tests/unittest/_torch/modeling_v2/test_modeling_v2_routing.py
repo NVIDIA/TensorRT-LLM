@@ -359,6 +359,11 @@ _ULTRA_BF16_TARGET = (
     "ModelingV2Nemotron3UltraBf16Sm100Tep8"
 )
 _TEP8 = dict(world_size=8, tp_size=8, moe_ep_size=8, moe_tp_size=1, enable_attention_dp=False)
+_ULTRA_BF16_TP8EP2_TARGET = (
+    "models.nemotron_h.nemotron3_ultra_bf16__sm_100__tp8ep2.modeling."
+    "ModelingV2Nemotron3UltraBf16Sm100Tp8ep2"
+)
+_TP8EP2 = dict(world_size=8, tp_size=8, moe_ep_size=2, moe_tp_size=4, enable_attention_dp=False)
 
 
 def _ultra_config(**overrides):
@@ -528,6 +533,31 @@ def test_ultra_bf16_on_another_architecture_does_not_match(capability, text, mon
 def test_ultra_bf16_with_speculative_decoding_does_not_match(_on_sm100):
     config = _model_config(_ultra_bf16_config(), spec_config=_NGRAM, **_TEP8)
     assert modeling_v2_resolve(config, _llm_args("auto")) is None
+
+
+@pytest.mark.parametrize("mode", ["auto", "require"])
+def test_ultra_bf16_tp8ep2_matches(mode, _on_sm100):
+    """Two expert windows of four tensor-parallel ranks select the tp8ep2 target."""
+    config = _model_config(_ultra_bf16_config(), **_TP8EP2)
+    assert _qualified(modeling_v2_resolve(config, _llm_args(mode))) == _ULTRA_BF16_TP8EP2_TARGET
+
+
+@pytest.mark.parametrize(
+    "mapping_kwargs, missed",
+    [
+        # attention data parallel: the replicated non-expert weights would not fit
+        (dict(_TP8EP2, enable_attention_dp=True), "attention_dp=True"),
+        # four windows of two: a layout neither target was built for
+        (dict(_TP8EP2, moe_ep_size=4, moe_tp_size=2), "moe_ep=4"),
+        # every expert split over all 8 ranks
+        (dict(_TP8EP2, moe_ep_size=1, moe_tp_size=8), "moe_ep=1"),
+    ],
+)
+def test_ultra_bf16_tp8ep2_near_misses_do_not_match(mapping_kwargs, missed, _on_sm100):
+    config = _model_config(_ultra_bf16_config(), **mapping_kwargs)
+    assert modeling_v2_resolve(config, _llm_args("auto")) is None
+    with pytest.raises(ValueError, match=missed):
+        modeling_v2_resolve(config, _llm_args("require"))
 
 
 def test_ultra_nvfp4_does_not_route_on_sm100(_on_sm100):

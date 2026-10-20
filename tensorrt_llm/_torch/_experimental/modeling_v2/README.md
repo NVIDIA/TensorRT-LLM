@@ -332,7 +332,8 @@ Entries: `Arch.SM_100` is declared on every shared entry the target calls, each 
 whole on sm_100: `thop_attention`, `cublas_mm`, `flashinfer_rmsnorm`,
 `flashinfer_fused_add_rmsnorm`, `rms_norm_gated_grouped`, `noaux_tc_op`,
 `causal_conv1d_fwd`, `causal_conv1d_update`, `mamba_chunk_scan_combined`,
-`selective_state_update` and the two promoted ones, `fused_moe` and `allreduce`. The
+`selective_state_update` and the promoted ones, `fused_moe`, `allreduce` and
+`mnnvl_fusion_allreduce`. The
 cells added for tep8 -- the rank's in_proj, qkv, o_proj and shared-expert GEMM shapes;
 8 q / 1 kv head over a bf16 pool, including rows 4 and 55 of a real
 `MambaHybridCacheManagerV2`'s 60-row mapping; conv, scan and decode-step shapes at 32
@@ -345,9 +346,11 @@ IPC / NCCL sum) is the catalog's, shared with tep4; its matrix sits with the cat
 other collectives, runs only on the architectures its `ARCHS` names (sm_100, sm_107) and
 skips elsewhere, and runs at 8 ranks where the node has 8 GPUs and at 4 where it has 4. It
 was driven at 4 ranks (one GB200 node), so the one-shot / two-shot kernels at 8 ranks
-inside one node -- an HGX B200 -- are not covered by any run yet. The target owns the
-other under its `ops/comm/`: `mnnvl_fusion_allreduce` (the sum, the residual add and
-the next RMSNorm in one op over the multicast workspace; `ARCHS` sm_100, NVL72 only) was
+inside one node -- an HGX B200 -- are not covered by any run yet. The other,
+`mnnvl_fusion_allreduce` (the sum, the residual add and the next RMSNorm in one op over
+the multicast workspace; `ARCHS` sm_100, NVL72 only), was this target's own under its
+`ops/comm/` and moved to `catalog/comm/` when the tp8ep2 sibling below arrived calling
+it too; its matrix moved beside the other collectives' and skips off sm_100. It was
 driven at 4 ranks on one GB200 node and at 8 ranks over two: both kernels, told apart by
 the stage count the workspace records rather than by the payload size; exact payloads
 bitwise on `residual_out` and inside a derived band on `norm_out`; a 108-call decode graph
@@ -390,6 +393,37 @@ The target is gated by
 reads the BF16 release as `NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16` under
 `LLM_MODELS_ROOT`, and its reference entry is the one `references/gsm8k.yaml` carries for
 `nvidia/Nemotron-Ultra-V3` with neither a `quant_algo` nor a `kv_cache_quant_algo`.
+
+#### The tp8ep2 sibling
+
+`models/nemotron_h/nemotron3_ultra_bf16__sm_100__tp8ep2` is the tep8 target with the routed
+experts laid out the way the engine's mapping lays them out for `moe_expert_parallel_size` 2
+under `tensor_parallel_size` 8: two windows of 256 experts, each expert's 5120-wide
+intermediate split over the four ranks of its window -- rank r runs window r % 2 and slice
+r // 2 (FC1 rows and FC2 columns [1280 t, 1280 t + 1280)). The weight bytes per rank are
+tep8's, and so is every call, shape for shape, except `fused_moe`, which is handed the rank's
+slices of its 256 experts and its tp coordinates; the all-reduce that completes a MoE block
+sums the windows and the slices at once.
+
+Why a second layout: a decode step's tokens do not spread evenly over tep8's eight windows,
+and the all-reduce after every MoE block waits for the rank that drew the most -- in a rank-0
+profile it runs 3-5x longer than the one after a mamba block, about 1 / 4.4 / 5.2 ms per step
+at 1 / 32 / 128 concurrent requests. On the built-in implementation, two GB200 nodes, one
+allocation (`max_batch_size` 256, ISL/OSL 1k/1k), moe_ep 2 x moe_tp 4 delivers 3.5 / 6.3 /
+5.3% more output throughput than moe_ep 8 at 1 / 32 / 128 concurrent requests for 1.4% more
+time to first token. Splitting every expert over all eight ranks instead (moe_ep 1) gains as
+much at 32 but less at 1 and 128, and costs 12-13% time to first token: its 640-wide slices
+leave the prefill's grouped GEMMs short.
+
+Routing claims it for the BF16 checkpoint on sm_100 at tp 8 with moe_ep 2 / moe_tp 4 and
+attention DP off. `fused_moe` carries six cells for the layout (decode at 1 / 32 / 256 rows, a
+300-row chunk and an 8192-row prefill, over both windows and all four slices); its reference
+needs no tp coordinates -- the partial sum over the slices it is given -- which those cells
+confirm. Every other entry is called exactly as tep8 calls it, and `mnnvl_fusion_allreduce`,
+now called by both, moved to the catalog. The target is gated by
+`tests/integration/defs/accuracy/modeling_v2/test_nemotron_h.py::TestModelingV2Nemotron3UltraBf16Sm100Tp8ep2`
+(gsm8k at `max_batch_size` 256, the tep8 gate's protocol and reference): 94.579 against the
+reference's 94.769.
 
 ### What replaced the version pin
 

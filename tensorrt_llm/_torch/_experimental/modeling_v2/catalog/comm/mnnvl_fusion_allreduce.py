@@ -18,7 +18,8 @@ from tensorrt_llm.functional import AllReduceFusionOp
 #: and four quantizing patterns; none of them is called by a target and none is certified here.
 FUSION_RESIDUAL_RMS_NORM = int(AllReduceFusionOp.RESIDUAL_RMS_NORM)
 
-#: Nemotron-3 Ultra's hidden size: every all-reduce this target makes is `[T, 8192]` bf16.
+#: Nemotron-3 Ultra's hidden size: every all-reduce its BF16 targets (tep8, tp8ep2) make is
+#: `[T, 8192]` bf16.
 HIDDEN = 8192
 
 #: The op switches kernel at `rows * hidden * ranks * itemsize` bytes (1 MiB, the constant

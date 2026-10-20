@@ -36,6 +36,10 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.thop_attent
     thop_attention,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm.allreduce import allreduce
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm.mnnvl_fusion_allreduce import (  # noqa: E501
+    FUSION_RESIDUAL_RMS_NORM,
+    mnnvl_fusion_allreduce,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.cublas_mm import cublas_mm
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.fused_moe import (
     ACTIVATION_RELU2,
@@ -77,7 +81,6 @@ from tensorrt_llm.functional import AllReduceStrategy
 from tensorrt_llm.logger import logger
 
 from . import weights as _weights
-from .ops.comm.mnnvl_fusion_allreduce import FUSION_RESIDUAL_RMS_NORM, mnnvl_fusion_allreduce
 
 # The certification is per GPU architecture: this code was gated on sm_100 only.
 _SM = (10, 0)

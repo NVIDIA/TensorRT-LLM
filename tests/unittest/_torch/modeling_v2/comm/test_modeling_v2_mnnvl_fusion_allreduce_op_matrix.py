@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Collected entry point for this target's MNNVL fused all-reduce certification matrix.
+"""Collected entry point for the MNNVL fused all-reduce's certification matrix (the entry
+the Nemotron-3 Ultra BF16 tep8 and tp8 targets both call).
 
 The matrix is ``_mnnvl_fusion_allreduce_op_matrix.py`` beside this file: one MPI process per rank,
 because the engine builds an MNNVL workspace from an MPI communicator. This starts four such ranks
@@ -23,6 +24,9 @@ import pytest
 import torch
 from mpi4py import MPI
 
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm.mnnvl_fusion_allreduce import (  # noqa: E501
+    MnnvlFusionAllreduce,
+)
 from tensorrt_llm._torch.distributed.mnnvl_memory import MnnvlMemory
 
 cloudpickle.register_pickle_by_value(sys.modules[__name__])
@@ -35,6 +39,8 @@ assert torch.cuda.is_available(), "the MNNVL all-reduce requires CUDA devices"
 
 _MATRIX = Path(__file__).resolve().with_name("_mnnvl_fusion_allreduce_op_matrix.py")
 _RANKS = 4
+_ARCH = "sm_{}{}".format(*torch.cuda.get_device_capability())
+_CERTIFIED = sorted(arch.value for arch in MnnvlFusionAllreduce.ARCHS)
 
 
 def _rank_main(matrix_path: str) -> bool:
@@ -57,6 +63,11 @@ def _rank_main(matrix_path: str) -> bool:
     or torch.cuda.device_count() < _RANKS
     or not MnnvlMemory.supports_mnnvl(),
     reason=f"MNNVL all-reduce needs an NVL72-class aarch64 node with {_RANKS} devices",
+)
+@pytest.mark.skipif(
+    _ARCH not in _CERTIFIED,
+    reason=f"certified on {', '.join(_CERTIFIED)}, not {_ARCH}: certify an architecture by running "
+    "the matrix on it, then add it to ARCHS",
 )
 @pytest.mark.parametrize("mpi_pool_executor", [_RANKS], indirect=True)
 def test_mnnvl_fusion_allreduce_op_matrix(mpi_pool_executor) -> None:

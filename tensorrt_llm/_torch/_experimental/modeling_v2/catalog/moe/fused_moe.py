@@ -58,6 +58,21 @@ _ULTRA = dict(
     routing="sigmoid_x5",
 )
 
+#: The same experts as the tp8ep2 target issues them (moe_ep 2 x moe_tp 4): a rank runs one of
+#: two 256-expert windows, each expert on its quarter of the intermediate width (FC1 rows and FC2
+#: columns [1280 t, 1280 t + 1280) of 5120). The op is handed the rank's slices and its tp
+#: coordinates; its output is the partial sum over the window and the slice.
+_ULTRA_TP8EP2 = dict(
+    hidden=2048,
+    inter=1280,
+    experts_local=256,
+    ep_size=2,
+    tp_size=4,
+    topk=22,
+    activation_type=ACTIVATION_RELU2,
+    routing="sigmoid_x5",
+)
+
 
 class FusedMoe(OpWrapper):
     """One MoE layer over pre-routed tokens; returns a fresh `[T, hidden]`.
@@ -150,6 +165,30 @@ class FusedMoe(OpWrapper):
             why="Ultra prefill at 8192 rows, rank 7",
             spec=dict(**_ULTRA, num_tokens=8192, ep_rank=7),
         ),
+        Cell(
+            why="Ultra tp8ep2 ep0/tp0, 1 row: a 256-expert window, each expert's 1280 of 5120",
+            spec=dict(**_ULTRA_TP8EP2, num_tokens=1, ep_rank=0, tp_rank=0),
+        ),
+        Cell(
+            why="Ultra tp8ep2 ep1/tp3, 1 row: the upper window (ids 256-511), the last slice",
+            spec=dict(**_ULTRA_TP8EP2, num_tokens=1, ep_rank=1, tp_rank=3),
+        ),
+        Cell(
+            why="Ultra tp8ep2 ep1/tp1, decode batch 32",
+            spec=dict(**_ULTRA_TP8EP2, num_tokens=32, ep_rank=1, tp_rank=1),
+        ),
+        Cell(
+            why="Ultra tp8ep2 ep0/tp2, 256 rows: the serving envelope's decode ceiling",
+            spec=dict(**_ULTRA_TP8EP2, num_tokens=256, ep_rank=0, tp_rank=2),
+        ),
+        Cell(
+            why="Ultra tp8ep2 ep1/tp0, prefill chunk of 300 rows",
+            spec=dict(**_ULTRA_TP8EP2, num_tokens=300, ep_rank=1, tp_rank=0),
+        ),
+        Cell(
+            why="Ultra tp8ep2 ep1/tp3, prefill at 8192 rows: the engine's default chunk",
+            spec=dict(**_ULTRA_TP8EP2, num_tokens=8192, ep_rank=1, tp_rank=3),
+        ),
     )
 
     note = """
@@ -159,6 +198,13 @@ class FusedMoe(OpWrapper):
     reference reproduces it.
 
     Repeated ids in one token\'s top-k are summed, not deduplicated.
+
+    Tensor parallelism inside the experts (`tp_size` / `tp_rank`, the
+    tp8ep2 cells) is the caller\'s slicing: it hands the op each expert\'s
+    slice of the intermediate width (Relu2 FC1 rows, FC2 columns) and gets
+    back the partial sum over that slice, which the ranks\' all-reduce
+    completes. The coordinates do not change the result on the certified
+    path, so the reference takes neither.
 
     The autotuner\'s hot path is exercised by test_autotuned_tactics, and the
     whole tactic space by test_tactic_space, each at both geometries, rather

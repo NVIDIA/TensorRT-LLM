@@ -106,6 +106,16 @@ def route(
         and mapping.moe_ep_size == 8
         and mapping.moe_tp_size == 1
     )
+    # The same 8 ranks with the routed experts split two ways at once: two 256-expert windows,
+    # every expert's intermediate width split over the 4 ranks of its window. Same weight bytes
+    # per rank as tep8; a different expert layout, hence a different target.
+    eight_rank_ep2 = (
+        mapping.world_size == 8
+        and mapping.tp_size == 8
+        and mapping.pp_size == 1
+        and mapping.moe_ep_size == 2
+        and mapping.moe_tp_size == 4
+    )
     ultra_shape = (
         shape == (8192, 256, 64, 8, 128, 64, 2, 128, 512, 22, 5120, 2048, 10240)
         and kinds == _ULTRA_BLOCK_KINDS
@@ -148,6 +158,16 @@ def route(
 
         return ModelingV2Nemotron3UltraBf16Sm100Tep8
 
+    # Nemotron-3 Ultra 550B-A55B BF16 on 8 sm_100 GPUs, tp8ep2: moe_ep 2 x moe_tp 4.
+    if ultra_bf16 and eight_rank_ep2 and not mapping.enable_attention_dp:
+        # fmt: off
+        # isort: off
+        from .nemotron3_ultra_bf16__sm_100__tp8ep2.modeling import ModelingV2Nemotron3UltraBf16Sm100Tp8ep2
+        # isort: on
+        # fmt: on
+
+        return ModelingV2Nemotron3UltraBf16Sm100Tp8ep2
+
     raise NoTarget(
         f"compute capability {compute_capability}, config shape {shape}, "
         f"block kinds {sorted(kinds)}, quantization {quant}, "
@@ -158,6 +178,8 @@ def route(
         "the nemotron_h targets are Nemotron-3 Ultra 550B-A55B without speculative "
         "decoding: NVFP4 (MIXED_PRECISION, FP8 KV) on sm_107, 4 ranks with expert-parallel "
         "MoE, either tep4 (tensor-parallel attention and mamba) or dep4 (attention data "
-        "parallel); and BF16 (no quantization) on sm_100, 8 ranks with expert-parallel MoE "
-        "and tensor-parallel attention and mamba (tep8)"
+        "parallel); and BF16 (no quantization) on sm_100, 8 ranks with tensor-parallel "
+        "attention and mamba and the routed experts either expert-parallel (tep8: moe_ep 8) or "
+        "in two expert-parallel windows of four tensor-parallel ranks (tp8ep2: moe_ep 2, "
+        "moe_tp 4)"
     )
