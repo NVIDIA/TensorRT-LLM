@@ -54,9 +54,13 @@ import functools
 import math
 from dataclasses import dataclass
 
+from typing import Any
+
 import torch
 
 
+# The head dimension the preparation kernels and the attention plans support.
+VC_HEAD_DIM = 128
 # The K/V tile whose value mean the kernel restores, its only supported size.
 VC_K_BLOCK_SIZE = 128
 # Q tokens per E4M3 Q scale of VC-Attention-QK8, powers of two up to the Q tile.
@@ -403,12 +407,12 @@ def vc_token_permutation(
 # ---------------------------------------------------------------------------
 def _check_prepare_inputs(x: torch.Tensor) -> None:
     if (
-        x.shape[-1] != 128
+        x.shape[-1] != VC_HEAD_DIM
         or x.dtype not in (torch.bfloat16, torch.float16)
         or not x.is_cuda
     ):
         raise ValueError(
-            "VC-Attention preparation needs CUDA bf16/fp16 inputs with head_dim 128, "
+            f"VC-Attention preparation needs CUDA bf16/fp16 inputs with head_dim {VC_HEAD_DIM}, "
             f"got {x.dtype} {tuple(x.shape)} on {x.device}"
         )
 
@@ -546,13 +550,13 @@ def vc_quantize_repair(
 
     s_k = k.shape[1]
     repair_tiles = vc_repair_tiles(s_k, budget)
-    selected = max(1, round(budget * s_k))
+    repair_tokens = max(1, round(budget * s_k))
     q8, k_all, v_all, q_scale, k_scale, v_scale = vc_prepare_repair(
         None if q is None else q.contiguous(),
         k.contiguous(),
         v.contiguous(),
         repair_tiles=repair_tiles,
-        selected=selected,
+        repair_tokens=repair_tokens,
     )
     return VCAttentionOperands(
         k=k_all,
@@ -604,7 +608,7 @@ class VCAttentionPreprocessor:
         self.kmeans_clusters = kmeans_clusters
         self.kmeans_iters = kmeans_iters
         # Per (batch, seq_len_k, num_kv_heads): perm, centroids, step of the last refresh.
-        self._groupings: dict[tuple[int, int, int], dict[str, object]] = {}
+        self._groupings: dict[tuple[int, int, int], dict[str, Any]] = {}
 
     @torch.no_grad()
     @torch.compiler.disable
@@ -647,12 +651,20 @@ class VCAttentionPreprocessor:
                     iters=self.kmeans_iters,
                     init_centroids=None if entry is None else entry["centroids"],
                 )
-                entry = {
-                    "perm": perm.to(torch.int32),
-                    "centroids": centroids,
-                    "step": None if denoise_step is None else denoise_step[0],
-                }
-                self._groupings[key] = entry
+                step = None if denoise_step is None else denoise_step[0]
+                if entry is None:
+                    entry = {
+                        "perm": perm.to(torch.int32),
+                        "centroids": centroids,
+                        "step": step,
+                    }
+                    self._groupings[key] = entry
+                else:
+                    # The buffers keep their addresses, so a CUDA graph captured around one call
+                    # reads the grouping that later calls or replays write into them.
+                    entry["perm"].copy_(perm.to(torch.int32))
+                    entry["centroids"].copy_(centroids)
+                    entry["step"] = step
             perm = entry["perm"]
         elif entry is not None:
             # V-Smooth off (paper Section 3.4). The plain kernel runs on the last
@@ -720,6 +732,7 @@ def vc_reference(
 
 __all__ = [
     "E4M3_MAX",
+    "VC_HEAD_DIM",
     "VC_K_BLOCK_SIZE",
     "VC_KMEANS_CLUSTERS",
     "VC_KMEANS_ITERS",
