@@ -1312,6 +1312,92 @@ def test_mla_dspark_block_decode_matches_unabsorbed_reference(monkeypatch, paged
     )
 
 
+@pytest.mark.parametrize("raw, expected", [(None, 0), ("", 0), ("0", 0), ("1", 1), (" 4 ", 4)])
+def test_mla_dspark_split_cap_env(raw, expected, monkeypatch):
+    import tensorrt_llm._torch.models.modeling_dspark as md
+
+    if raw is None:
+        monkeypatch.delenv("TLLM_DSPARK_MLA_MAX_SPLIT_KV", raising=False)
+    else:
+        monkeypatch.setenv("TLLM_DSPARK_MLA_MAX_SPLIT_KV", raw)
+    assert md._dspark_mla_max_split_kv() == expected
+
+
+@pytest.mark.parametrize("raw", ["-1", "one", "1.5"])
+def test_mla_dspark_split_cap_env_rejects_bad_values(raw, monkeypatch):
+    import tensorrt_llm._torch.models.modeling_dspark as md
+
+    monkeypatch.setenv("TLLM_DSPARK_MLA_MAX_SPLIT_KV", raw)
+    with pytest.raises(ValueError, match="TLLM_DSPARK_MLA_MAX_SPLIT_KV"):
+        md._dspark_mla_max_split_kv()
+
+
+@needs_cuda
+@needs_absorbed_mla
+def test_mla_dspark_cute_dsl_split_cap_matches_reference(monkeypatch):
+    """Drafter attention capped by ``TLLM_DSPARK_MLA_MAX_SPLIT_KV=1`` matches the reference.
+
+    With the cap, a batch of ``_SPLIT_CAP_MIN_BATCH`` requests runs unsplit. That
+    changes only the FP32 reduction order, so the capped and uncapped decodes meet
+    the same bf16 bound against the un-absorbed reference and agree with each other
+    to that bound.
+    """
+    import tensorrt_llm._torch.models.modeling_dspark as md
+
+    reason = md.cute_dsl_mla_decode_unavailability_reason()
+    if reason is not None:
+        pytest.skip(f"cute-dsl MLA decode unavailable: {reason}")
+    from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import (
+        CuteDSLNVMlaDecodeBlackwellRunner as Runner,
+    )
+
+    # Record what the runner does with each split, so the test cannot pass
+    # with a cap that never reached the kernel.
+    seen = []
+    capped_split_kv = Runner._capped_split_kv
+
+    def _recorded(runner, split_kv, batch_size):
+        result = capped_split_kv(runner, split_kv, batch_size)
+        seen.append((runner.max_split_kv, split_kv, result))
+        return result
+
+    monkeypatch.setattr(Runner, "_capped_split_kv", _recorded)
+    torch.manual_seed(0)
+    weights = _tiny_mla_weights()
+    g = torch.Generator().manual_seed(43)
+    requests = [
+        (
+            torch.randn(L, MLA_HIDDEN * NUM_CAPTURE, generator=g) * 0.5,
+            torch.randn(MLA_BLOCK, MLA_HIDDEN, generator=g) * 0.5,
+        )
+        for L in range(20, 20 + 2 * Runner._SPLIT_CAP_MIN_BATCH, 2)
+    ]
+    expected = torch.stack(
+        [
+            _reference_mla_block_decode(weights, c.to(torch.bfloat16), n.to(torch.bfloat16))
+            for c, n in requests
+        ]
+    )
+    outs = {}
+    for cap in (0, 1):
+        monkeypatch.setenv("TLLM_DSPARK_MLA_MAX_SPLIT_KV", str(cap))
+        drafter = _build_mla_drafter(weights, dflash_attention_backend="CUTEDSL")
+        assert drafter._mla_max_split_kv == cap
+        outs[cap] = _run_mla_block_decode(drafter, requests, paged=True)
+
+    assert any(c == 1 and s > 1 and r == 1 for c, s, r in seen), seen
+    assert all(r == s for c, s, r in seen if c == 0), seen
+    # 2**-6 is one bf16 ULP at this output magnitude (see
+    # test_mla_dspark_block_decode_matches_unabsorbed_reference). Over 16 requests the
+    # uncapped decode already reaches 2 ULP (0.03125) somewhere, so allow 3 ULP.
+    bound = 3 * 2.0**-6
+    for cap, out in outs.items():
+        diff = (out - expected).abs().max().item()
+        assert diff <= bound, f"split cap {cap}: max abs diff {diff} vs reference"
+    diff = (outs[1] - outs[0]).abs().max().item()
+    assert diff <= bound, f"capped vs uncapped: max abs diff {diff}"
+
+
 @needs_cuda
 def test_mla_dspark_loads_the_torchspec_spelling_and_keeps_its_embedding():
     """Loads unconverted, and does not adopt the target's embedding.
