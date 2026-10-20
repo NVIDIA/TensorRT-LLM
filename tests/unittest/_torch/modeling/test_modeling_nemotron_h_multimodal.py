@@ -980,7 +980,8 @@ class TestEncodeAudio:
             mask[i, :vl] = 1
         return {"input_audio_features": features, "feature_attention_mask": mask}
 
-    def test_batched_matches_per_input(self):
+    @pytest.mark.parametrize("precomputed_lengths", [False, True])
+    def test_batched_matches_per_input(self, precomputed_lengths):
         """Bucket output equals N singleton `_encode_audio` calls.
 
         Compares ``encode([a1, a2])`` against ``[encode([a1])[0], encode([a2])[0]]``
@@ -996,6 +997,12 @@ class TestEncodeAudio:
         # Two inputs with different time / clip counts.
         a1 = self._make_audio_data(num_clips=2, time_len=10, valid_lens=[10, 6])
         a2 = self._make_audio_data(num_clips=1, time_len=14, valid_lens=[12])
+        if precomputed_lengths:
+            a1["audio_output_lengths"] = torch.tensor([5, 3])
+            a2["audio_output_lengths"] = torch.tensor([6])
+            model.sound_encoder.encoder._get_subsampling_output_length = mock.Mock(
+                side_effect=AssertionError("Forward must reuse host output lengths")
+            )
 
         per_input_results = [
             NemotronHMultimodalModel._encode_audio(model, [a1])[0],
@@ -1004,6 +1011,7 @@ class TestEncodeAudio:
         batched_results = NemotronHMultimodalModel._encode_audio(model, [a1, a2])
 
         assert len(batched_results) == 2
+        assert [counts for _, counts in batched_results] == [[5, 3], [6]]
         for (b_emb, b_counts), (s_emb, s_counts) in zip(batched_results, per_input_results):
             assert b_counts == s_counts
             assert torch.allclose(b_emb, s_emb, atol=1e-6, rtol=1e-6)

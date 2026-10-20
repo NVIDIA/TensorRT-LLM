@@ -946,7 +946,6 @@ class Gemma4MultimodalModelBase(MultimodalModelMixin, PreTrainedModel):
             "video.pixel_values",
             "video.image_position_ids",
             "audio.audio_features",
-            "audio.audio_features_mask",
         ]
 
     # TODO(TRTLLM-14981): Implement finer-grained caching for videos.
@@ -1536,11 +1535,21 @@ class Gemma4ForConditionalGeneration(Gemma4MultimodalModelBase):
         that it can be concatenated with image features before being fused
         into the LLM input embeddings.
         """
+        num_audio_tokens = None
+        if (
+            audio_features_mask is not None
+            and audio_features_mask.device.type == "cpu"
+            and audio_features_mask.dtype == torch.bool
+        ):
+            # The audio tower samples the mask through two stride-2 stages.
+            # Read its output size before H2D, avoiding CUDA nonzero's host sync.
+            num_audio_tokens = int(audio_features_mask[:, ::4].sum().item())
         target_dtype = self.embed_audio.embedding_projection.weight.dtype
         with torch.autocast(device_type="cuda", dtype=self.model_dtype):
             if audio_features_mask is not None:
                 output = self.audio_tower(
-                    audio_features, attention_mask=audio_features_mask.to(audio_features.device)
+                    audio_features,
+                    attention_mask=audio_features_mask.to(audio_features.device, non_blocking=True),
                 )
             else:
                 output = self.audio_tower(audio_features)
@@ -1548,8 +1557,19 @@ class Gemma4ForConditionalGeneration(Gemma4MultimodalModelBase):
             projected = self.embed_audio(hidden.to(target_dtype))  # (B, T, H_text)
         # Optionally drop padding frames reported by the audio tower.
         tower_mask = getattr(output, "attention_mask", None)
-        if tower_mask is not None and tower_mask.dtype == torch.bool:
-            projected = projected[tower_mask]
+        if (
+            tower_mask is not None
+            and tower_mask.dtype == torch.bool
+            and audio_features_mask is not None
+        ):
+            if num_audio_tokens is None:
+                # Direct callers may already have placed the mask on CUDA.
+                projected = projected[tower_mask]
+            else:
+                indices = torch.nonzero_static(
+                    tower_mask.reshape(-1), size=num_audio_tokens
+                ).flatten()
+                projected = projected.reshape(-1, projected.shape[-1]).index_select(0, indices)
         else:
             projected = projected.reshape(-1, projected.shape[-1])
         return projected.contiguous()

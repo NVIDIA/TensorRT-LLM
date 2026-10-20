@@ -1177,13 +1177,16 @@ class NemotronHMultimodalInputProcessor(
             clip_counts = audio.get("audio_num_clips")
             if clip_counts is None:
                 return metadata
-            clips = tuple(clip_counts.cpu().tolist())
+            clip_counts = clip_counts.cpu()
+            audio["audio_num_clips"] = clip_counts
+            clips = tuple(clip_counts.tolist())
             item_count = sum(m == "audio" for m, _ in metadata.item_refs)
             if len(clips) == item_count:
                 packed = MultimodalItemPartition(item_lengths=clips)
                 metadata.input_partitions["audio"] = {
                     "input_audio_features": packed,
                     "feature_attention_mask": packed,
+                    "audio_output_lengths": packed,
                     "audio_num_clips": MultimodalItemPartition(),
                 }
         return metadata
@@ -3294,9 +3297,15 @@ class NemotronHMultimodalModel(MultimodalModelMixin, transformers.PreTrainedMode
         padded_features: List[torch.Tensor] = []
         padded_masks: List[torch.Tensor] = []
         clips_per_input: List[int] = []
+        valid_output_lens: List[int] = []
+        has_output_lengths = all(
+            ad.get("audio_output_lengths") is not None for ad in audio_data_list
+        )
         for audio_data in audio_data_list:
             features = audio_data["input_audio_features"].to(dtype=self.model_dtype)
             mask = audio_data["feature_attention_mask"]
+            if has_output_lengths:
+                valid_output_lens.extend(audio_data["audio_output_lengths"].tolist())
             pad_amount = max_time - features.shape[1]
             if pad_amount > 0:
                 features = torch.nn.functional.pad(features, (0, 0, 0, pad_amount))
@@ -3310,10 +3319,12 @@ class NemotronHMultimodalModel(MultimodalModelMixin, transformers.PreTrainedMode
 
         sound_embeds = self.sound_encoder(all_features, all_masks)
 
-        valid_input_lens = all_masks.sum(dim=1)
-        valid_output_lens = self.sound_encoder.encoder._get_subsampling_output_length(
-            valid_input_lens
-        ).tolist()
+        if not has_output_lengths:
+            # Compatibility for feature dicts not built by ParakeetExtractor.
+            # Keep one batched readback rather than synchronizing per input.
+            valid_output_lens = self.sound_encoder.encoder._get_subsampling_output_length(
+                all_masks.sum(dim=1)
+            ).tolist()
 
         per_clip_embeds: List[torch.Tensor] = []
         per_clip_counts: List[int] = []

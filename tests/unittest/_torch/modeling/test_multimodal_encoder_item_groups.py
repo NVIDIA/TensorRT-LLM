@@ -240,6 +240,7 @@ def test_nemotron_audio_keeps_clip_groups_and_video_audio_relationship():
         "input_audio_features": torch.arange(30).reshape(3, 5, 2),
         "feature_attention_mask": torch.ones(3, 5),
         "audio_num_clips": torch.tensor([2, 1]),
+        "audio_output_lengths": torch.tensor([1, 3, 2]),
     }
     data = {
         "audio": audio,
@@ -259,6 +260,8 @@ def test_nemotron_audio_keeps_clip_groups_and_video_audio_relationship():
         selected.multimodal_data["audio"]["input_audio_features"],
         audio["input_audio_features"][[2, 0, 1]],
     )
+    assert selected.multimodal_data["audio"]["audio_num_clips"].tolist() == [1, 2]
+    assert selected.multimodal_data["audio"]["audio_output_lengths"].tolist() == [2, 1, 3]
     assert selected.encoder_state is None
     video = {"audio": audio, "video_size": [[2, 1, 32, 32]]}
     video_data = {
@@ -271,6 +274,37 @@ def test_nemotron_audio_keeps_clip_groups_and_video_audio_relationship():
     assert video_metadata.item_refs == (("video", 0),)
     assert "audio" not in video_metadata.input_partitions
     assert video_data["video"]["audio"] is audio
+
+
+@pytest.mark.parametrize("with_mask", [False, True])
+def test_gemma_audio_compacts_valid_rows_in_input_order(with_mask: bool):
+    from tensorrt_llm._torch.models.modeling_gemma4mm import Gemma4ForConditionalGeneration
+
+    hidden = torch.arange(40, dtype=torch.float32).reshape(2, 5, 4)
+    mask = torch.tensor(
+        [[True, False, True, True, False], [False, True, True, False, True]]
+    ).repeat_interleave(4, dim=1)[:, :17]
+
+    class Projection(torch.nn.Identity):
+        embedding_projection = SimpleNamespace(weight=torch.zeros(1))
+
+    def tower(features, attention_mask=None):
+        del features
+        return SimpleNamespace(
+            last_hidden_state=hidden,
+            attention_mask=(
+                attention_mask[:, ::4]
+                if attention_mask is not None
+                else torch.ones(2, 5, dtype=torch.bool)
+            ),
+        )
+
+    model = SimpleNamespace(model_dtype=torch.bfloat16, audio_tower=tower, embed_audio=Projection())
+    actual = Gemma4ForConditionalGeneration._get_audio_features(
+        model, torch.zeros(2, 17, 4), mask if with_mask else None
+    )
+    expected = hidden[mask[:, ::4]] if with_mask else hidden.reshape(-1, 4)
+    torch.testing.assert_close(actual, expected)
 
 
 @pytest.mark.parametrize("full_prompt_ids", [False, True])
