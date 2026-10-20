@@ -90,7 +90,7 @@ def test_pre_image_module_alias_consumer_remains_fail_closed() -> None:
 
 
 def test_repository_gvr_module_alias_constant_change_remains_fail_closed() -> None:
-    path = "tensorrt_llm/_torch/cute_dsl_kernels/blackwell/top_k/gvr_topk_decode_self_sampling.py"
+    path = "tensorrt_llm/_torch/kernels/blackwell/top_k/gvr_topk_decode_self_sampling.py"
     before = (REPO_ROOT / path).read_text()
     source = before.replace("SENT_LO = -3.0e38", "SENT_LO = -2.0e38", 1)
     assert source != before
