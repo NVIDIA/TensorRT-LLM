@@ -107,6 +107,7 @@ def test_minimax_disagg_role_mapper_kinds(
         self.layer_offsets = {}
         self.max_batch_size = 1
         self.max_seq_len = 1
+        self.mapping = Mapping(world_size=2, tp_size=2)
 
     monkeypatch.setattr(KVCacheManagerV2, "__init__", fake_base_init)
     manager = MiniMaxM3KVCacheManagerV2(
@@ -123,11 +124,51 @@ def test_minimax_disagg_role_mapper_kinds(
         Role.ALL: expected_main_mapper,
         Role.INDEX_KEY: MapperKind.REPLICATED,
     }
+    # Whichever layout the main K/V uses, index-K stays the one role a KV
+    # connector may store once for the whole TP group.
+    assert manager.get_replicated_roles() == frozenset({Role.INDEX_KEY})
+
+
+@pytest.mark.parametrize(
+    "mapping,shared",
+    [
+        (Mapping(world_size=2, tp_size=2), True),
+        (Mapping(world_size=2, tp_size=2, enable_attention_dp=True), False),
+        (Mapping(world_size=1, tp_size=1), False),
+    ],
+    ids=["tp2", "attention_dp", "tp1"],
+)
+def test_minimax_index_k_moves_to_the_pool_tail_only_under_attention_tp(
+    monkeypatch, mapping, shared
+) -> None:
+    # A single attention shard stores nothing once per group, so the pool keeps
+    # the layout it had before index-K was deduplicated.
+    def fake_base_init(self, *args, **kwargs):
+        self.is_disagg = False
+        self.dtype = DataType.BF16
+        self.layer_offsets = {3: 0}
+        self.max_batch_size = 1
+        self.max_seq_len = 1
+        self.mapping = mapping
+
+    monkeypatch.setattr(KVCacheManagerV2, "__init__", fake_base_init)
+    manager = MiniMaxM3KVCacheManagerV2(
+        num_layers=4,
+        sparse_layer_ids=[3],
+        sparse_index_dim=INDEX_DIM,
+    )
+
+    ((buffer,),) = manager._extra_buffers_per_layer(tokens_per_block=TOKENS_PER_BLOCK).values()
+    assert buffer.role == Role.INDEX_KEY
+    assert buffer.coalesce_last is shared
+    expected_roles = frozenset({Role.INDEX_KEY}) if shared else frozenset()
+    assert manager.get_replicated_roles() == expected_roles
 
 
 def test_minimax_disagg_rejects_unmanaged_index_value(monkeypatch) -> None:
     def fake_base_init(self, *args, **kwargs):
         self.is_disagg = kwargs.get("is_disagg", False)
+        self.dtype = DataType.BF16
         self.layer_offsets = {layer_id: layer_id for layer_id in range(kwargs["num_layers"])}
 
     monkeypatch.setattr(KVCacheManagerV2, "__init__", fake_base_init)
@@ -215,17 +256,17 @@ def test_minimax_m3_pool_view_scheme_coalesced_vs_separate() -> None:
     """Pool composition varies with TP; the view scheme must not.
 
     TP=2 makes kv_heads_per_rank == 1, so K == V == INDEX_KEY bytes per
-    block and V2 coalesces all three into one pool whose slot interleaves
-    the sparse layer's index-K between K/V regions (non-uniform layer
-    stride). TP=1 doubles K/V, so index-K gets its own pool and strides are
-    uniform. Both layouts must yield the same two per-class views.
+    block and V2 coalesces all three into one pool. Index-K is replicated
+    across the TP group, so it sits at the slot tail after every K/V region
+    and the K/V layer stride stays uniform. TP=1 doubles K/V, so index-K gets
+    its own pool. Both layouts must yield the same two per-class views.
     """
     from tensorrt_llm._torch.disaggregation.resource.kv_extractor import (
         build_page_table_from_manager,
     )
     from tensorrt_llm._torch.disaggregation.resource.utils import get_layer_byte_ranges
 
-    # --- TP=2: coalesced, interleaved slot ---
+    # --- TP=2: coalesced slot, index-K at the tail ---
     manager = _create_manager(
         Mapping(world_size=2, rank=0, tp_size=2, pp_size=1), DataType.BF16, sparse_layers=[1]
     )
@@ -240,11 +281,10 @@ def test_minimax_m3_pool_view_scheme_coalesced_vs_separate() -> None:
         assert kv_view.pool_idx == idx_view.pool_idx
         starts, bytes_per_layer = get_layer_byte_ranges(kv_view)
         unit = bytes_per_layer // 2  # one K or V buffer per block
-        # Slot: L0K L0V L1K L1V L1IDX L2K L2V L3K L3V — the sparse layer's
-        # index-K makes the K/V layer stride non-uniform.
-        assert starts == {0: 0, 1: 2 * unit, 2: 5 * unit, 3: 7 * unit}
+        # Slot: L0K L0V L1K L1V L2K L2V L3K L3V L1IDX
+        assert starts == {i: 2 * i * unit for i in range(NUM_LAYERS)}
         idx_starts, idx_bytes_per_layer = get_layer_byte_ranges(idx_view)
-        assert idx_starts == {1: 4 * unit}
+        assert idx_starts == {1: 2 * NUM_LAYERS * unit}
         assert idx_bytes_per_layer == unit
     finally:
         manager.shutdown()
