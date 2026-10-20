@@ -2232,7 +2232,7 @@ def test_decode_graph_defers_derived_uploads_and_refreshes_all_outputs(
     manager_requests, monkeypatch, batch_size
 ):
     from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDA_GRAPH_DUMMY_REQUEST_ID
-    from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner import DecoderRunner
+    from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.inputs import DecoderInputPreparer
     from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
     from tensorrt_llm.bindings import SamplingConfig
 
@@ -2254,15 +2254,15 @@ def test_decode_graph_defers_derived_uploads_and_refreshes_all_outputs(
     starts = [127] * batch_size
     _prepare_decode_metadata(metadata, selected, starts, deferred=True)
     assert metadata._csa2_deferred_decode_outputs
-    engine = object.__new__(DecoderRunner)
-    engine.guided_decoder = None
+    inputs = object.__new__(DecoderInputPreparer)
+    inputs.guided_decoder = None
     pointers = {
         name: tensor.data_ptr() for name, tensor in _decode_derived_outputs(metadata).items()
     }
 
     def forward():
         # The real engine's preprocessing is captured ahead of every consumer.
-        engine._preprocess_inputs(
+        inputs.preprocess_inputs(
             {"attn_metadata": metadata}, enable_spec_decode=False, runtime_draft_len=0
         )
         return {name: tensor.clone() for name, tensor in _decode_derived_outputs(metadata).items()}

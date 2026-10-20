@@ -21,7 +21,9 @@ Programmatic access to Nsight Compute profiling reports via the `ncu_report` Pyt
 
 ## Setup
 
-Located in `extras/python/` of the Nsight Compute installation. Requires Python 3.7+.
+Located in `extras/python/` of the Nsight Compute installation (add it to `PYTHONPATH`).
+Requires Python 3.7+. Since Nsight Compute 2026.1 it is also on PyPI as `pip install ncu-report`;
+the PyPI release can trail the installed tool, and it does not include `ncu_occupancy`.
 
 ```python
 import ncu_report
@@ -57,11 +59,12 @@ action = range_obj[0]               # First action
 for action in range_obj:            # Iterate actions
     ...
 
-# Filter by NVTX
-actions = range_obj.actions_by_nvtx(
+# Filter by NVTX: returns a tuple of indices into the range, not actions
+indices = range_obj.actions_by_nvtx(
     includes=["training/"],
     excludes=["warmup/"]
 )
+actions = [range_obj.action_by_idx(i) for i in indices]
 ```
 
 ### IAction — Profiling Result
@@ -87,8 +90,10 @@ nvtx = action.nvtx_state()
 rules = action.rule_results()
 rules_dicts = action.rule_results_as_dicts()       # As Python dicts
 
-# Source correlation
-source = action.source_info(address)
+# Source correlation. Addresses are the correlation IDs of per-instruction
+# metrics, such as inst_executed from the SourceCounters section.
+address = action["inst_executed"].correlation_ids().as_uint64(0)
+source = action.source_info(address)   # ISourceInfo: file_name(), line()
 ptx = action.ptx_by_pc(address)
 sass = action.sass_by_pc(address)
 ```
@@ -108,7 +113,7 @@ float_val = metric.as_double()
 metric.name()                        # Metric identifier
 metric.metric_type()                 # COUNTER, RATIO, THROUGHPUT, OTHER
 metric.metric_subtype()              # Specialized classification
-metric.unit()                        # e.g., "nanosecond", "percent"
+metric.unit()                        # e.g., "ns", "%", "inst"
 metric.description()                 # Human-readable explanation
 metric.rollup_operation()            # AVG, MAX, MIN, SUM
 
@@ -148,19 +153,19 @@ for rule in action.rule_results():
 ### MetricType
 
 ```python
-ncu_report.MetricType_COUNTER
-ncu_report.MetricType_RATIO
-ncu_report.MetricType_THROUGHPUT
-ncu_report.MetricType_OTHER
+ncu_report.IMetric.MetricType_COUNTER
+ncu_report.IMetric.MetricType_RATIO
+ncu_report.IMetric.MetricType_THROUGHPUT
+ncu_report.IMetric.MetricType_OTHER
 ```
 
 ### RollupOperation
 
 ```python
-ncu_report.RollupOperation_AVG
-ncu_report.RollupOperation_MAX
-ncu_report.RollupOperation_MIN
-ncu_report.RollupOperation_SUM
+ncu_report.IMetric.RollupOperation_AVG
+ncu_report.IMetric.RollupOperation_MAX
+ncu_report.IMetric.RollupOperation_MIN
+ncu_report.IMetric.RollupOperation_SUM
 ```
 
 ### MsgType (Rule Messages)
@@ -190,8 +195,9 @@ ctx = ncu_report.load_report("report.ncu-rep")
 for rng in ctx:
     for action in rng:
         name = action.name()
+        # SpeedOfLight's "Compute (SM) Throughput" and "Memory Throughput"
         compute = action["sm__throughput.avg.pct_of_peak_sustained_elapsed"].as_double()
-        memory = action["dram__throughput.avg.pct_of_peak_sustained_elapsed"].as_double()
+        memory = action["gpu__compute_memory_throughput.avg.pct_of_peak_sustained_elapsed"].as_double()
         duration = action["gpu__time_duration.sum"].as_uint64()
         print(f"{name}: compute={compute:.1f}%, memory={memory:.1f}%, duration={duration}ns")
 ```
@@ -211,7 +217,7 @@ def get_kernel_metrics(report_path, kernel_regex):
                     "name": action.name(),
                     "duration": action["gpu__time_duration.sum"].as_uint64(),
                     "compute_sol": action["sm__throughput.avg.pct_of_peak_sustained_elapsed"].as_double(),
-                    "memory_sol": action["dram__throughput.avg.pct_of_peak_sustained_elapsed"].as_double(),
+                    "memory_sol": action["gpu__compute_memory_throughput.avg.pct_of_peak_sustained_elapsed"].as_double(),
                 })
     return results
 
@@ -239,16 +245,12 @@ import ncu_report
 
 ctx = ncu_report.load_report("report.ncu-rep")
 for rng in ctx:
-    training_actions = rng.actions_by_nvtx(
-        includes=["training/forward/"],
-        excludes=[]
-    )
-    for action in training_actions:
-        print(action.name())
+    for idx in rng.actions_by_nvtx(includes=["training/forward/"], excludes=[]):
+        print(rng.action_by_idx(idx).name())
 ```
 
 ## Report File Format
 
 - `.ncu-rep` — Standard report (binary + Protocol Buffer)
-- `.ncu-repz` — Compressed with zstd
+- `.ncu-repz` — Compressed with zstd; what `ncu -o report` writes from Nsight Compute 2026.3 on
 - Proto definitions: `extras/FileFormat/` directory

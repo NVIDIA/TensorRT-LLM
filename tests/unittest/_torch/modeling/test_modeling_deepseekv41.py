@@ -2135,21 +2135,23 @@ def test_adp_replay_counts_follow_final_execution(monkeypatch, mode, speculative
     )
     peer_rows = 0 if mode == "all_empty" else 513 if mode in ("unprepared", "decode_graph") else 128
     if speculative:
-        from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner import DecoderRunner
+        from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.inputs import (
+            DecoderInputPreparer,
+        )
 
         gather = Mock(
             return_value=torch.tensor(
                 [[local_rows, decoder_rows, 6, 1, 1], [513, peer_rows, 9, 2, 2]]
             )
         )
-        engine = SimpleNamespace(
+        inputs = SimpleNamespace(
             _config=SimpleNamespace(enable_attention_dp=True),
             mapping=metadata.mapping,
             dist=SimpleNamespace(tp_cp_allgather_int64=gather),
         )
         spec = SimpleNamespace(dp_num_tokens=lambda: 6, seq_lens=[6], num_generations=1)
         metadata.all_rank_num_tokens, spec_counts = (
-            DecoderRunner._get_all_rank_num_tokens_and_spec_counts(engine, metadata, spec)
+            DecoderInputPreparer._get_all_rank_num_tokens_and_spec_counts(inputs, metadata, spec)
         )
         assert spec_counts == [[6, 9], [1, 2], [1, 2]]
         gather.assert_called_once_with([local_rows, decoder_rows, 6, 1, 1])
