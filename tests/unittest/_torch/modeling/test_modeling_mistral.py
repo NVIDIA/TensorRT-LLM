@@ -475,7 +475,7 @@ def test_mistral_3_vlm_allclose_to_hf(mistral_small_3_1_24b_config, backend, use
                     "position_ids": position_ids,
                     "attn_metadata": attn_metadata,
                 }
-                key = (1, 0, False)
+                key = (1, 0)
                 graph_runner.capture(key, lambda inputs: mistral.forward(**inputs), inputs)
 
                 for _ in range(2):

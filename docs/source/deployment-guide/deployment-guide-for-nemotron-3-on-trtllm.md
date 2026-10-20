@@ -157,6 +157,8 @@ trtllm-serve nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4 --host 0.0.0.0 --por
 
 The `nemotron-v3` and `nano-v3` reasoning parsers are aliases for the same Nemotron v3 parser and are interchangeable. Reasoning can be toggled per request by passing `enable_thinking` through `chat_template_kwargs` in the request body, for example `{"chat_template_kwargs": {"enable_thinking": true}}` (set it to `false` to disable reasoning).
 
+The `qwen3_coder` tool parser handles the function/parameter format shared by Qwen3-Coder, Nemotron 3 Super, and Nemotron 3 Ultra. See {ref}`tool-parser-selection` for the format and official chat-template references.
+
 After the server is set up, the client can now send prompt requests to the server and receive results.
 
 ### LLM API Options (YAML Configuration)

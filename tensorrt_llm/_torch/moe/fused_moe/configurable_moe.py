@@ -250,8 +250,14 @@ class ConfigurableMoE(MoE):
             self.event_dict = None
 
         # Validate configuration
-        self.validate_config()
-        self.validate_backend(self.backend)
+        validated = False
+        try:
+            self.validate_config()
+            self.validate_backend(self.backend)
+            validated = True
+        finally:
+            if not validated and self.comm is not None:
+                self.comm.destroy()
 
         # Mark as _weights_removed to skip ConfigurableMoE's post_load_weights in model_loader
         # The backend's post_load_weights will be called directly by model_loader
@@ -640,6 +646,7 @@ class ConfigurableMoE(MoE):
             use_flashinfer=self.use_flashinfer,
             hidden_size=self.hidden_size,
             communication_method=self.communication_method,
+            allow_alltoall=self.backend.supports_alltoall,
         )
 
     def forward_impl(
@@ -652,6 +659,7 @@ class ConfigurableMoE(MoE):
         all_rank_num_tokens: Optional[List[int]] = None,
         use_dp_padding: Optional[bool] = None,
         lora_params: Optional[Dict] = None,
+        input_ready_event: Optional[torch.cuda.Event] = None,
         **kwargs,
     ) -> torch.Tensor:
         """Forward entry point.
@@ -665,6 +673,9 @@ class ConfigurableMoE(MoE):
         4. Advances the EPLB ``repeat_idx``.
 
         DP-padding handling and chunking live in the scheduler.
+
+        ``input_ready_event``: ``x`` is written on another stream; the join is
+        deferred to the first kernel that reads ``x``, so routing overlaps it.
         """
         input_ids = kwargs.get("input_ids")
         routing_aux = kwargs.get("routing_aux")
@@ -695,6 +706,7 @@ class ConfigurableMoE(MoE):
             input_ids=input_ids,
             lora_params=lora_params,
             routing_aux=routing_aux,
+            input_ready_event=input_ready_event,
         )
 
         # DWDP: record compute and trigger next prefetch (per-layer, not per-chunk).

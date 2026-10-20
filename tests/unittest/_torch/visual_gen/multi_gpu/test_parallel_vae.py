@@ -19,7 +19,6 @@ from typing import Callable
 import pytest
 import torch
 import torch.distributed as dist
-import torch.multiprocessing as mp
 from diffusers.models.autoencoders.autoencoder_kl_wan import AutoencoderKLWan
 
 from tensorrt_llm._torch.visual_gen.models.wan.parallel_vae import (
@@ -28,6 +27,8 @@ from tensorrt_llm._torch.visual_gen.models.wan.parallel_vae import (
 )
 from tensorrt_llm._torch.visual_gen.models.wan.wan_vae import WanVAE, WanVAEConfig
 from tensorrt_llm._torch.visual_gen.modules.vae.parallel_vae_interface import ParallelVAEFactory
+
+from ._worker_pool import run_distributed
 
 
 @pytest.fixture(autouse=True, scope="module")
@@ -41,46 +42,10 @@ def _cleanup_mpi_env():
 # ---------------------------------------------------------------------------
 
 
-def _init_worker(rank: int, world_size: int, port: int):
-    os.environ["MASTER_ADDR"] = "localhost"
-    os.environ["MASTER_PORT"] = str(port)
-    os.environ["RANK"] = str(rank)
-    os.environ["WORLD_SIZE"] = str(world_size)
-    torch.cuda.set_device(rank % torch.cuda.device_count())
-    dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
-
-
-def _cleanup():
-    if dist.is_initialized():
-        dist.destroy_process_group()
-
-
-def _distributed_worker(rank, world_size, test_fn, port):
-    try:
-        _init_worker(rank, world_size, port)
-        test_fn(rank, world_size)
-    except Exception as e:
-        print(f"Rank {rank} failed: {e}")
-        raise
-    finally:
-        _cleanup()
-
-
 def _run(world_size: int, test_fn: Callable):
     if torch.cuda.device_count() < world_size:
         pytest.skip(f"Need {world_size} GPUs, have {torch.cuda.device_count()}")
-    # Spawn distributed workers via a helper that retries with a fresh master
-    # port when the c10d rendezvous TCPStore loses the bind race (EADDRINUSE).
-    from ._visual_gen_dist_utils import spawn_with_retry
-
-    spawn_with_retry(
-        lambda port: mp.spawn(
-            _distributed_worker,
-            args=(world_size, test_fn, port),
-            nprocs=world_size,
-            join=True,
-        )
-    )
+    run_distributed(world_size, test_fn, dist_backend="nccl", preload=("tensorrt_llm",))
 
 
 # ---------------------------------------------------------------------------

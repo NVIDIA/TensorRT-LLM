@@ -299,6 +299,7 @@ bool AttentionOp::convertMMHAParamsToXQAParams(tensorrt_llm::kernels::XQAParams&
     xqaParams.spec_decoding_max_generation_length = generationsParams.spec_decoding_max_generation_length;
     xqaParams.spec_decoding_bl_tree_mask_offset = generationsParams.spec_decoding_bl_tree_mask_offset;
     xqaParams.spec_decoding_bl_tree_mask = generationsParams.spec_decoding_bl_tree_mask;
+    xqaParams.spec_decoding_bl_tree_mask_capacity = generationsParams.spec_decoding_bl_tree_mask_capacity;
     xqaParams.spec_bl_tree_first_sparse_mask_offset_kv = generationsParams.spec_bl_tree_first_sparse_mask_offset_kv;
     xqaParams.mrope_position_deltas = generationsParams.mrope_position_deltas;
     xqaParams.helix_position_offsets = generationsParams.helix_position_offsets;
@@ -1208,10 +1209,9 @@ int AttentionOp::mlaGeneration(
         // Not used in the generation kernels as contiguous_kv or paged_kv layouts are used.
         tllmRunnerParams.mSumOfSeqLensKv = int(batch_beam * tllmRunnerParams.mMaxSeqLenKv);
 
-        // The attention window size.
-        tllmRunnerParams.mAttentionWindowSize = generation_params.cyclic_attention_window_size;
-        // The chunked attention size.
-        tllmRunnerParams.mChunkedAttentionSize = INT_MAX;
+        tllmRunnerParams.mLeftSlidingWindow = -1;
+        tllmRunnerParams.mRightSlidingWindow = -1;
+        tllmRunnerParams.mChunkedAttentionSize = 0;
 
         // The scaleQ that will be applied to the BMM1 output.
         tllmRunnerParams.mScaleQ = mQScaling * sqrt((float) (mMLAParams.qk_nope_head_dim + mMLAParams.qk_rope_head_dim))

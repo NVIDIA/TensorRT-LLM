@@ -1,3 +1,6 @@
+<!-- SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved. -->
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+
 # TensorRT-LLM Perf Sanity Test (`test_perf_sanity.py`)
 
 Performance sanity testing scripts for TensorRT-LLM with configuration-driven test cases supporting single-node, multi-node aggregated, and multi-node disaggregated architectures.
@@ -225,9 +228,23 @@ There are two modes for perf sanity tests: aggregated (aggr) and disaggregated (
 
 **File Naming**: `xxx.yaml` (can contain `-` hyphen).
 
-**Example**: `deepseek-r1-fp4_1k1k_ctx1_gen1_dep8_bs768_eplb0_mtp0_ccb-UCX.yaml`
+**Example**: `gb200_deepseek-r1-fp4_1k1k_con1_ctx1_dep4_gen1_tep8_eplb0_mtp3_ccb-NIXL.yaml`
 
 **Use Case**: Disaggregated architecture where model runs across multiple nodes with separate context (prefill) and generation (decode) servers.
+
+Keep valid default-based settings in both `worker_config.ctx` and
+`worker_config.gen`, for example:
+
+```yaml
+cache_transceiver_config:
+  backend: DEFAULT
+```
+
+The standard PyTorch loading path currently resolves this to NIXL/Python
+under normal defaults. Tests of a specific backend/runtime may select it
+explicitly. Set `max_tokens_in_buffer` only on workers with `pipeline_parallel_size > 1`,
+where the generation executor still uses it as the KV transfer admission window. NIXL may still use
+UCX as its underlying transport; `ccb-NIXL` identifies the transceiver backend.
 
 **Optional `benchmark_config` keys**: `benchmark_client` selects a non-default load
 generator (see [Benchmark Clients](#benchmark-clients)); `client_env_var` passes
@@ -292,6 +309,32 @@ perf/test_perf_sanity.py::test_e2e[disagg_upload-e2e-{disagg config file base na
 ```
 perf/test_perf_sanity.py::test_e2e[disagg_upload-e2e-deepseek-r1-fp4_1k1k_ctx1_gen1_dep8]
 ```
+
+#### Connection warmup
+
+Before the measured clients, the harness (`DisaggTestCmds._run_connection_warmup`)
+sends `2 x (ctx servers x ctx attention-DP size) x (gen servers x gen attention-DP size)`
+short requests (ISL 100, OSL 10), where a server's attention-DP size is its TP size with
+attention DP and 1 without. They open the ctx<->gen KV-cache transfer connections
+outside the measured window. `examples/disaggregated/slurm/benchmark/submit.py` sizes
+the same warmup as `ucx_warmup_requests`. Without it, each ctx rank loads a gen rank's
+transfer agent the first time that gen rank requests KV from its ctx server, one agent
+at a time on a single listener thread, and the first measured requests wait behind that
+queue (nvbugs/6564113). Notes:
+- e2e only, and skipped when every client is AgentX (which runs its own warmup) or
+  accuracy-only.
+- If only some warmup requests fail, the harness logs a warning and the measured
+  clients still run. The test fails instead, rather than letting the lane run cold or
+  hang, if the warmup's benchmark_serving exits non-zero, runs past
+  `CONNECTION_WARMUP_TIMEOUT` (capped by the test timeout), or every warmup request
+  fails.
+- Client log: `trtllm-connection-warmup.<server_idx>.log`, not parsed for metrics.
+  The servers' perf_metrics records of the warmup requests are excluded from the time
+  breakdown (see below).
+- Iteration-based nsys ranges (`local/submit.py --ctx-nsys-start-stop` /
+  `--gen-nsys-start-stop`) count from server start, so they begin with the
+  connection-warmup iterations; start the range later to profile only measured
+  iterations.
 
 ### The optional instrumentation modifier
 
@@ -363,6 +406,17 @@ row uploads green. For the same reason a malformed line (a partial write caught
 mid-record) costs only that line, never the whole file: dropping the disagg server's
 file would silently reroute the per-request groups to same-role worker fallbacks,
 which produce plausible values for the wrong phase.
+
+The servers also append records of the e2e connection warmup's requests to these
+files. The harness therefore waits until the largest file holds a record for every
+successful warmup request and the files hold still, then notes each file's line count; the aggregation skips those leading lines and leaves
+them out of the census. Unlike the measured run's census, this one is a failure: if
+the count is not reached within `PERF_METRICS_SETTLE_TIMEOUT`, the test fails rather
+than mixing late warmup records into the breakdown. The log line
+`Time breakdown: excluded connection-warmup records from {...}` prints the counts as
+JSON. To reproduce the uploaded numbers offline, run
+`time_breakdown_metrics.py --mode e2e --output-dir <test output dir>/perf_metrics
+--drop-warmup-request --leading-lines-to-skip '<that JSON>'`.
 
 ## CI Test Database
 
@@ -520,7 +574,7 @@ Config files live in `tests/scripts/perf-sanity/disaggregated/`. The filename en
 {gpu_type}_{model}-{precision}_{ISL}k{OSL}k_con{concurrency}_ctx{ctx_count}_tp{ctx_tp}_gen{gen_count}_{gen_parallelism}_eplb{N}_mtp{N}_ccb-{transport}.yaml
 ```
 
-Example: `gb200_qwen3-235b-fp4_8k1k_con64_ctx1_tp1_gen1_tep4_eplb0_mtp0_ccb-UCX.yaml`
+Example: `gb200_qwen3-235b-fp4_8k1k_con64_ctx1_tp1_gen1_tep4_eplb0_mtp0_ccb-NIXL.yaml`
 
 The **base name** (filename without `.yaml`) is used as the test case ID in the test-db.
 
@@ -616,13 +670,13 @@ Search `tests/integration/test_lists/waives.txt` for the exact test case string.
 
 ### Worked Example
 
-Adding back `qwen3-235b-fp4_8k1k_con64_ctx1_tp1_gen1_tep4_eplb0_mtp0_ccb-UCX` as a gen_only test:
+Checking the existing `qwen3-235b-fp4_8k1k_con64_ctx1_tp1_gen1_tep4_eplb0_mtp0_ccb-NIXL` gen_only test, or re-enabling it if it has been disabled:
 
-1. Config file: `tests/scripts/perf-sanity/disaggregated/gb200_qwen3-235b-fp4_8k1k_con64_ctx1_tp1_gen1_tep4_eplb0_mtp0_ccb-UCX.yaml`
+1. Config file: `tests/scripts/perf-sanity/disaggregated/gb200_qwen3-235b-fp4_8k1k_con64_ctx1_tp1_gen1_tep4_eplb0_mtp0_ccb-NIXL.yaml`
 2. From config: `gpus_per_node=4`, `ctx_tp=1`, `gen_tp=4`, `num_ctx=1`, `num_gen=1`
 3. Nodes per ctx = `ceil(1/4)=1`, nodes per gen = `ceil(4/4)=1`, total nodes = 2, total GPUs = 8
 4. Test-db file: `l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu1_gen1_node1_gpu4.yml`
-5. Uncomment the line: `- perf/test_perf_sanity.py::test_e2e[disagg_upload-gen_only-gb200_qwen3-235b-fp4_8k1k_con64_ctx1_tp1_gen1_tep4_eplb0_mtp0_ccb-UCX] TIMEOUT (120)`
-6. Count active tests in that file (now 4)
-7. In `L0_Test.groovy`, find the existing `buildStageConfigs` for `l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu1_gen1_node1_gpu4`, update `testCount` from 3 to 4
-8. Check `waives.txt` — no matching entry, done
+5. Locate `perf/test_perf_sanity.py::test_e2e[disagg_upload-gen_only-gb200_qwen3-235b-fp4_8k1k_con64_ctx1_tp1_gen1_tep4_eplb0_mtp0_ccb-NIXL]`. It is currently active with `TIMEOUT (90)`; do not add a duplicate. Uncomment it only if it has been disabled.
+6. Recount the active tests after any edits.
+7. In `L0_Test.groovy`, find the `buildStageConfigs` for `l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu1_gen1_node1_gpu4` and set `testCount` to that count, preserving it if unchanged.
+8. Check `waives.txt` for the exact test ID before enabling the test.
