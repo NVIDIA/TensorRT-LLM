@@ -447,7 +447,10 @@ class DeepseekV4Tokenizer(TransformersTokenizer):
         conversation = kwargs.get("conversation", messages)
         messages = list(conversation)
         if tools:
-            messages.insert(0, {"role": "system", "tools": tools})
+            if messages and messages[0].get("role") == "system":
+                messages[0] = {**messages[0], "tools": tools}
+            else:
+                messages.insert(0, {"role": "system", "tools": tools})
 
         rendered = _encode_messages(
             messages=messages,

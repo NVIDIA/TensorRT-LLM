@@ -335,6 +335,23 @@ def test_tools_argument_is_folded_into_a_leading_system_message():
     assert "## Tools" in prompt
 
 
+def test_tools_argument_is_attached_to_an_existing_leading_system_message():
+    """``tools=`` renders as if the tools were set on the caller's system message."""
+    tokenizer = DeepseekV41Tokenizer(_DummyTokenizer())
+    messages = [
+        {"role": "system", "content": "You are terse."},
+        {"role": "user", "content": "weather?"},
+    ]
+
+    prompt = tokenizer.apply_chat_template(messages, tools=_TOOL)
+
+    assert prompt == encode_messages(
+        [{**messages[0], "tools": _TOOL}, messages[1]], thinking_mode="chat"
+    )
+    assert prompt.count("<｜System｜>") == 1
+    assert "tools" not in messages[0]
+
+
 def test_server_chat_template_path_uses_v41_custom_tokenizer():
     tokenizer = DeepseekV41Tokenizer(_DummyTokenizer())
 
