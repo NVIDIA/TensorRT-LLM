@@ -169,8 +169,12 @@ def sharded_state(gen, batch: int, vocab: int) -> dict:
 
 def base_kernel():
     """The unmodified kernel module of the installed base package (``$K3_BASE_TRTLLM``), for before/after timing."""
-    path = os.path.join(os.environ["K3_BASE_TRTLLM"], "_torch", "kernels", "k3_spec_accept",
-                        "k3_spec_accept_kernel.py")  # fmt: skip
+    root = os.path.join(os.environ["K3_BASE_TRTLLM"], "_torch")
+    candidates = [
+        os.path.join(root, kernels_dir, "k3_spec_accept", "k3_spec_accept_kernel.py")
+        for kernels_dir in ("kernels", "cute_dsl_kernels")
+    ]
+    path = next(p for p in candidates if os.path.exists(p))
     spec = importlib.util.spec_from_file_location("k3_spec_accept_kernel_base", path)
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
