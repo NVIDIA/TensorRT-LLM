@@ -16,7 +16,27 @@ from ..geometry import MAX_EP, MIN_EP, hierarchy_group_sizes
 MAX_EXPERTS = 384
 MAX_CTAS = 128
 MAX_BROADCASTS = MAX_EXPERTS
+# Default bound, in SM clock cycles, of the scheduler's grid barrier and
+# cross-rank waits; a timeout records a status flag. Each launch takes its bound
+# as an argument, so callers can allow more peer skew while ranks warm up.
 SPIN_CYCLES = 8_000_000_000
+# Nominal clock64 rate that converts a timeout in seconds to SM cycles, as the
+# MoE all-to-all kernels assume. SPIN_CYCLES is about 4 s at this rate.
+ASSUMED_CLOCK_HZ = 2_000_000_000
+
+
+def spin_cycles_for_timeout(seconds: int | None) -> int:
+    """Spin bound for a timeout in seconds; ``None`` selects ``SPIN_CYCLES``."""
+    if seconds is None:
+        return SPIN_CYCLES
+    if type(seconds) is not int or seconds <= 0:
+        raise ValueError("scheduler timeout must be a positive exact int of seconds")
+    return seconds * ASSUMED_CLOCK_HZ
+
+
+def _check_spin_cycles(spin_cycles: int) -> None:
+    if type(spin_cycles) is not int or spin_cycles <= 0:
+        raise ValueError("spin_cycles must be a positive exact int")
 
 def _plan_channel_word_count(*, abi_version: int, channel_words: int | None,
                              route_features: int, ep: int, helpers: int) -> int:
@@ -442,7 +462,10 @@ class CudaPhysicalSlotScheduler:
                 raise RuntimeError("plan channel has no pending publication")
             self._plan_channel_pending = False
 
-    def launch(self, stream: object | None = None) -> CudaSchedulerOutputs:
+    def launch(
+        self, stream: object | None = None, *, spin_cycles: int = SPIN_CYCLES
+    ) -> CudaSchedulerOutputs:
+        _check_spin_cycles(spin_cycles)
         if not self._connected:
             raise RuntimeError("EP peer bases are not connected")
         with self._plan_channel_lock:
@@ -467,6 +490,7 @@ class CudaPhysicalSlotScheduler:
                 self.logical_expert_ids,
                 int(handle),
                 valid_route_count=self.cfg.route_count,
+                spin_cycles=spin_cycles,
             )
             if self._plan_channel_bound:
                 self._plan_channel_pending = True
@@ -478,6 +502,7 @@ class CudaPhysicalSlotScheduler:
         stream_handle: int,
         *,
         valid_route_count: int,
+        spin_cycles: int,
     ) -> None:
         stream = self._plan_channel_torch_stream
         if stream is None or _stream_handle(stream) != stream_handle:
@@ -485,13 +510,18 @@ class CudaPhysicalSlotScheduler:
         state = enter_cuda_stream(stream)
         try:
             torch.ops.trtllm.moe_rebalance_halo_q(
-                *self._halo_q_args(routes, valid_route_count, enable_pdl=self.cfg.enable_pdl)
+                *self._halo_q_args(
+                    routes,
+                    valid_route_count,
+                    enable_pdl=self.cfg.enable_pdl,
+                    spin_cycles=spin_cycles,
+                )
             )
         finally:
             exit_cuda_stream(state)
 
     def _halo_q_args(
-        self, routes: torch.Tensor, valid_route_count: int, *, enable_pdl: bool
+        self, routes: torch.Tensor, valid_route_count: int, *, enable_pdl: bool, spin_cycles: int
     ) -> tuple:
         """Positional moe_rebalance_halo_q arguments, shared by the fused copy op."""
         return (
@@ -516,7 +546,7 @@ class CudaPhysicalSlotScheduler:
             self.cfg.ctas,
             self.cfg.threads,
             enable_pdl,
-            SPIN_CYCLES,
+            spin_cycles,
             self._plan_channel_abi_version,
             self._plan_channel_words,
             self._plan_channel_route_features,
@@ -526,6 +556,7 @@ class CudaPhysicalSlotScheduler:
     def submit(
         self, routes: torch.Tensor, stream_handle: int, *,
         valid_tokens: int | None = None,
+        spin_cycles: int = SPIN_CYCLES,
     ) -> CudaSchedulerOutputs:
         """Read a caller-owned CUDA int32[T,K] tensor without input staging.
 
@@ -545,6 +576,7 @@ class CudaPhysicalSlotScheduler:
         with changing pointers/lengths use eager submit; stage()+launch() remains
         available for a fixed-capacity graph input buffer.
         """
+        _check_spin_cycles(spin_cycles)
         with self._plan_channel_lock:
             if self._plan_channel_bound:
                 if self._plan_channel_pending:
@@ -558,18 +590,24 @@ class CudaPhysicalSlotScheduler:
                     "CUDA scheduler uses one static stream because its workspace "
                     "and reusable barrier epochs are shared"
                 )
-            self._submit_routes(routes, stream_handle, valid_tokens=valid_tokens)
+            self._submit_routes(
+                routes, stream_handle, valid_tokens=valid_tokens, spin_cycles=spin_cycles
+            )
             if self._plan_channel_bound:
                 self._plan_channel_pending = True
         return self.outputs
 
-    def fused_submit_args(self, routes: torch.Tensor, stream_handle: int) -> tuple:
+    def fused_submit_args(
+        self, routes: torch.Tensor, stream_handle: int, *, spin_cycles: int
+    ) -> tuple:
         """Scheduler arguments of the bound GPU-direct copy's fused launch.
 
         The input and stream contract is ``submit()``'s. The copy endpoint
         launches this scheduler together with its copy, so no plan publication
         becomes pending and the launch triggers no programmatic dependency.
+        ``spin_cycles`` bounds this launch's cross-rank waits.
         """
+        _check_spin_cycles(spin_cycles)
         with self._plan_channel_lock:
             if not self._gpu_direct_bound:
                 raise RuntimeError("a fused launch requires a bound GPU-direct copy")
@@ -583,17 +621,20 @@ class CudaPhysicalSlotScheduler:
                     "and reusable barrier epochs are shared"
                 )
             valid_tokens = self._check_routes(routes, None)
-            return self._halo_q_args(routes, valid_tokens * self.cfg.topk, enable_pdl=False)
+            return self._halo_q_args(
+                routes, valid_tokens * self.cfg.topk, enable_pdl=False, spin_cycles=spin_cycles
+            )
 
     def _submit_routes(
         self, routes: torch.Tensor, stream_handle: int, *,
-        valid_tokens: int | None = None,
+        valid_tokens: int | None, spin_cycles: int,
     ) -> None:
         valid_tokens = self._check_routes(routes, valid_tokens)
         self._launch_op(
             routes,
             stream_handle,
             valid_route_count=valid_tokens * self.cfg.topk,
+            spin_cycles=spin_cycles,
         )
 
     def _check_routes(self, routes: torch.Tensor, valid_tokens: int | None) -> int:
@@ -618,6 +659,7 @@ class CudaPhysicalSlotScheduler:
         stream: object | None = None,
         *,
         validate_values: bool = False,
+        spin_cycles: int = SPIN_CYCLES,
     ) -> CudaSchedulerOutputs:
         if stream is not None and not self._plan_channel_bound:
             with torch.cuda.device(self.device):
@@ -628,7 +670,7 @@ class CudaPhysicalSlotScheduler:
                     self.stage(logical_expert_ids, validate_values=validate_values)
         else:
             self.stage(logical_expert_ids, validate_values=validate_values)
-        return self.launch(stream)
+        return self.launch(stream, spin_cycles=spin_cycles)
 
     def check_status(self) -> None:
         """Raise if any generation faulted since the last `reset_status()`.
@@ -663,9 +705,12 @@ class CudaPhysicalSlotScheduler:
 
 
 __all__ = [
+    "ASSUMED_CLOCK_HZ",
+    "SPIN_CYCLES",
     "CudaPhysicalSlotScheduler",
     "CudaSchedulerConfig",
     "CudaSchedulerOutputs",
     "recommend_cuda_scheduler_ctas",
+    "spin_cycles_for_timeout",
     "symmetric_buffer_ints",
 ]
