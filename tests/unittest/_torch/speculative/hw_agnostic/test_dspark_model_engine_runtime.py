@@ -373,7 +373,7 @@ def test_model_engine_delegates_ragged_state_to_decoder_owner() -> None:
     inputs._dspark_exact_identity_words = tuple(range(8))
     inputs.fit_ragged_verify_lens = lambda *args, **kwargs: (args, kwargs)
     worker = object()
-    runner.model = SimpleNamespace(spec_worker=worker)
+    runner._model = SimpleNamespace(spec_worker=worker)
     engine = object.__new__(PyTorchModelEngine)
     engine._cleanup_done = True
     engine._runner = runner
@@ -440,7 +440,7 @@ def test_metadata_helper_keeps_native_constructor_kwargs(explicit_false):
     metadata_module.build_attention_metadata(model, **kwargs)
 
     assert "enable_ragged_verification" not in seen[0]
-    assert seen[0]["num_heads_per_kv"] == 4
+    assert seen[0]["max_num_heads_per_kv"] == 4
 
 
 def test_metadata_helper_enables_only_supported_ragged_metadata():
@@ -481,6 +481,7 @@ def test_decoder_enables_ragged_metadata_during_construction(monkeypatch, enable
         **kwargs, spec_config=SimpleNamespace(enable_confidence_scheduling=enabled)
     )
     decoder.mapping = kwargs["mapping"]
+    decoder._attention_runtime_features = kwargs["attention_runtime_features"]
     decoder._buffers = SimpleNamespace(cache_indirection=None)
     monkeypatch.setattr(decoder_metadata_module, "resolve_mamba_metadata_cls", lambda _model: None)
     kv = object()
@@ -498,7 +499,7 @@ def test_decoder_enables_ragged_metadata_during_construction(monkeypatch, enable
 @pytest.mark.parametrize("graph_type", [CUDAGraphRunner, DSparkCUDAGraphRunner])
 def test_current_main_warmup_keeps_serving_timeout_only_for_capture(monkeypatch, graph_type):
     graph = graph_type.__new__(graph_type)
-    graph.clear = lambda: None
+    graph.clear = lambda **_kwargs: None
     graph._capture_allowed = False
     graph.padding_dummy_requests = {5: object()}
     if graph_type is DSparkCUDAGraphRunner:
@@ -569,12 +570,16 @@ def test_confidence_without_an_sps_table_is_eager_only() -> None:
         graphs._get_graphs_to_capture([1, 4])
 
 
+@pytest.mark.parametrize("use_fused_gather", [False, True])
 @pytest.mark.parametrize(
     ("trims", "prefix_window", "previous_windows"),
     [(True, 1, [3, 3]), (True, 1, [1, 2]), (False, None, [None, None])],
 )
 def test_overlap_offsets_follow_the_packed_prefix(
-    trims: bool, prefix_window: int | None, previous_windows: list[int | None]
+    trims: bool,
+    prefix_window: int | None,
+    previous_windows: list[int | None],
+    use_fused_gather: bool,
 ) -> None:
     """Exercise the full input packer with CPU buffers and metadata-only leaves."""
     decoder = object.__new__(DecoderInputPreparer)
@@ -618,6 +623,27 @@ def test_overlap_offsets_follow_the_packed_prefix(
     decoder._mm_item_scheduler = None
     decoder._pinned_host_cache = {}
     decoder._pinned_host_active = {}
+    decoder._staged_previous_batch_indices = None
+    decoder._staged_previous_pos_indices = None
+    gather_calls = []
+
+    def gather(*args) -> bool:
+        # A CPU kernel leaf verifies the production caller's packed offsets.
+        new, draft, lens, slots, positions, rows, width, draft_width = args[:8]
+        ids, input_begin, drafts, draft_begin, pos, pos_begin, kv, kv_begin = args[8:]
+        selected_slots = slots[:rows].long()
+        gather_calls.append((input_begin, pos_begin, kv_begin))
+        ids[input_begin : input_begin + rows * width].copy_(
+            new.transpose(0, 1)[selected_slots, :width].flatten()
+        )
+        drafts[draft_begin : draft_begin + rows * draft_width].copy_(
+            draft[selected_slots, :draft_width].flatten()
+        )
+        pos[pos_begin : pos_begin + rows * width].copy_(lens[positions[: rows * width].long()])
+        kv[kv_begin : kv_begin + rows].copy_(lens[selected_slots] - width)
+        return True
+
+    decoder._step_input_gather = SimpleNamespace(gather=gather) if use_fused_gather else None
     decoder._ragged_gather_indices = lambda slots, lengths: tuple(
         torch.tensor(indices, dtype=torch.long)
         for indices in ragged_gather_index_lists(slots, lengths)
@@ -626,7 +652,6 @@ def test_overlap_offsets_follow_the_packed_prefix(
     for name in (
         "input_ids_cuda",
         "draft_tokens_cuda",
-        "num_accepted_draft_tokens_cuda",
         "previous_pos_id_offsets_cuda",
         "previous_kv_lens_offsets_cuda",
         "previous_pos_indices_cuda",
@@ -635,6 +660,7 @@ def test_overlap_offsets_follow_the_packed_prefix(
         "gather_ids_cuda",
     ):
         setattr(decoder._buffers, name, torch.full((32,), -99, dtype=torch.int32))
+    decoder._gather_ids_buffer = decoder_module.DeviceCopyBuffer(decoder._buffers.gather_ids_cuda)
     windows = [prefix_window, *previous_windows]
     requests = [
         SimpleNamespace(
@@ -699,3 +725,87 @@ def test_overlap_offsets_follow_the_packed_prefix(
     assert metadata.kv_cache_params.num_extra_kv_tokens == 2
     assert gather_ids.tolist() == list(range(sum(lengths)))
     assert draft_len == 3
+    assert gather_calls == (
+        [(prefix_len, prefix_len, 1)] if use_fused_gather and previous_lengths == [4, 4] else []
+    )
+
+
+@pytest.mark.parametrize("trims", [False, True])
+def test_graph_overlap_offset_zeroing_preserves_ragged_bucket_padding(trims: bool) -> None:
+    decoder = object.__new__(DecoderInputPreparer)
+    decoder._config = SimpleNamespace(
+        max_num_tokens=16, max_beam_width=1, disable_overlap_scheduler=False
+    )
+    decoder._dspark_trims_submitted_tokens = trims
+    decoder._staged_previous_batch_indices = None
+    decoder._staged_previous_pos_indices = None
+    decoder._step_input_gather = None
+    decoder.get_runtime_tokens_per_gen_step = lambda _length: 4
+    decoder._ragged_gather_indices = lambda slots, lengths: tuple(
+        torch.tensor(indices, dtype=torch.long)
+        for indices in ragged_gather_index_lists(slots, lengths)
+    )
+    decoder._buffers = SimpleNamespace(
+        **{
+            name: torch.full((16,), -99, dtype=torch.int32)
+            for name in (
+                "input_ids_cuda",
+                "draft_tokens_cuda",
+                "previous_batch_indices_cuda",
+                "previous_pos_indices_cuda",
+                "previous_pos_id_offsets_cuda",
+                "previous_kv_lens_offsets_cuda",
+            )
+        }
+    )
+    lengths = [1, 2] if trims else [4, 4]
+    host = SimpleNamespace(
+        lists=SimpleNamespace(
+            input_ids=[],
+            draft_tokens=[],
+            draft_lens=[],
+            position_ids=list(range(sum(lengths))),
+            previous_batch_indices=[0, 1],
+            previous_pos_indices=[0] * lengths[0] + [1] * lengths[1],
+            extend_requests=[object(), object()],
+            extend_dummy_requests=[],
+            generation_requests=[],
+            unwritten_input_id_rows=[],
+        ),
+        previous_batch_tokens_per_request=lengths if trims else None,
+        previous_batch_token_start=0,
+    )
+    decoder._copy_token_ids_to_device(
+        host,
+        SimpleNamespace(is_attention_dp_phase_idle=False, num_context_requests=0),
+        torch.arange(8, dtype=torch.int32).reshape(4, 2, 1),
+        torch.tensor([1, 2], dtype=torch.int32),
+        torch.arange(6, dtype=torch.int32).reshape(2, 3),
+        3,
+        attn_metadata=SimpleNamespace(is_cuda_graph=True),
+        enable_spec_decode=True,
+    )
+    expected_tail = 0 if trims else -99
+    assert decoder._buffers.previous_pos_id_offsets_cuda[sum(lengths) :].tolist() == [
+        expected_tail
+    ] * (16 - sum(lengths))
+    assert decoder._buffers.previous_kv_lens_offsets_cuda[2:].tolist() == [expected_tail] * 14
+
+
+@pytest.mark.parametrize("release_owners", [False, True])
+def test_graph_release_preserves_nccl_window_owner_choice(release_owners: bool) -> None:
+    calls = []
+    graphs = object.__new__(DecoderCudaGraphs)
+    graphs.cuda_graph_runner = SimpleNamespace(
+        clear=lambda **kwargs: calls.append(("native", kwargs))
+    )
+    graphs.breakable_cuda_graph_runner = SimpleNamespace(
+        clear=lambda **kwargs: calls.append(("breakable", kwargs))
+    )
+
+    graphs.release(release_nccl_window_owners=release_owners)
+
+    assert calls == [
+        ("native", {"release_nccl_window_owners": release_owners}),
+        ("breakable", {"release_nccl_window_owners": release_owners}),
+    ]
