@@ -791,6 +791,8 @@ class LlmResult:
         # totals from the PyTorch executor; used to backfill
         # RequestPerfMetrics.speculative_decoding on the client side
         # (GenerationResultBase._handle_sequence). None when no drafting ran.
+        self.per_pos_drafted: Optional[List[int]] = None
+        self.per_pos_accepted: Optional[List[int]] = None
         self.spec_dec_totals = None
         # Context-worker usage for gen-first disagg, delivered via the
         # KV-transfer aux buffer (see _maybe_attach_ctx_usage).
