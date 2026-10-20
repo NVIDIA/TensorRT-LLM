@@ -1418,11 +1418,15 @@ PrefixReuseSummary BlockManager::analyzePrefixReuse(
 PrefixReuseSummary WindowBlockManager::analyzePrefixReuse(
     VecUniqueTokens const& uniqueTokens, LlmRequest const& llmRequest) const
 {
+    PrefixReuseSummary summary;
+    if (llmRequest.getSkipPrefixReuse())
+    {
+        return summary;
+    }
+
     auto blockedUniqueTokens
         = chopVectorIntoBlocks<UniqueToken>(uniqueTokens, uniqueTokens.size(), mTokensPerBlock, false);
     auto blockKeys = buildBlockKeys(blockedUniqueTokens, llmRequest);
-
-    PrefixReuseSummary summary;
 
     std::lock_guard<std::recursive_mutex> lock(mLookupTree->getMutex());
     auto reuseMatches = findReusableBlockMatches(
@@ -1617,8 +1621,10 @@ WindowBlockManager::ClaimResult WindowBlockManager::claimMatchingBlocks(Generati
     result.numSharedContextBlocks
         = (beamWidth > 1 && !isShareLastContextBlock) ? numContextBlocks - 1 : numContextBlocks;
     result.shareLastContextBlockAmongBeams = result.numSharedContextBlocks == numContextBlocks;
-    auto reuseMatches = findReusableBlockMatches(
-        result.blockKeys, mEnablePartialReuse, mCopyOnPartialReuse, sequence.getCurrentPrepopulatedPromptLen());
+    auto reuseMatches = llmRequest.getSkipPrefixReuse()
+        ? ReuseMatchResult{}
+        : findReusableBlockMatches(
+            result.blockKeys, mEnablePartialReuse, mCopyOnPartialReuse, sequence.getCurrentPrepopulatedPromptLen());
     result.totalMatchedTokens = reuseMatches.totalMatchedTokens;
 
     for (int bi = 0; bi < result.numSharedContextBlocks && bi < static_cast<int>(reuseMatches.matches.size()); ++bi)
@@ -1963,7 +1969,7 @@ SizeType32 WindowBlockManager::onboardAndAllocateBlocks(
     }
 
     SizeType32 numConnectorMatchedTokens = 0;
-    if (mKvCacheConnectorManager && !llmRequest.isDummyRequest())
+    if (mKvCacheConnectorManager && !llmRequest.isDummyRequest() && !llmRequest.getSkipPrefixReuse())
     {
         numConnectorMatchedTokens
             = mKvCacheConnectorManager->getNumNewMatchedTokens(llmRequest, sequence.getCurrentPrepopulatedPromptLen());

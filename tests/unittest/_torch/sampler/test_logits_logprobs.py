@@ -374,8 +374,12 @@ def test_sampled_token_always_in_prompt_logprobs(logprobs_k: int, simple_llm: LL
 _REUSE_TOKENS_PER_BLOCK: Final = 32
 
 
-@pytest.fixture(scope="module", params=[False, True], ids=["kvcm_v1", "kvcm_v2"])
+@pytest.fixture(scope="module", params=["kvcm_v1", "kvcm_v2", "kvcm_v1_swa"])
 def reuse_llm(request) -> Generator[LLM, None, None]:
+    extra_kv_cache_args = {}
+    if request.param == "kvcm_v1_swa":
+        # A window shorter than the test prompts, so their early blocks fall out of it.
+        extra_kv_cache_args["max_attention_window"] = [4 * _REUSE_TOKENS_PER_BLOCK]
     llm = LLM(
         model=os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B"),
         max_batch_size=8,
@@ -383,7 +387,8 @@ def reuse_llm(request) -> Generator[LLM, None, None]:
             max_tokens=10000,
             enable_block_reuse=True,
             tokens_per_block=_REUSE_TOKENS_PER_BLOCK,
-            use_kv_cache_manager_v2=request.param,
+            use_kv_cache_manager_v2=request.param == "kvcm_v2",
+            **extra_kv_cache_args,
         ),
     )
     with llm:

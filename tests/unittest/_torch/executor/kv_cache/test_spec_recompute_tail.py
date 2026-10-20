@@ -197,7 +197,7 @@ class _ConnectorReq:
         self.py_request_id = 1
         self.prompt_len = prompt_len
         self.is_dummy = False
-        self.py_return_context_logits = False
+        self.skip_prefix_reuse = False
         self.is_first_context_chunk = True
         self.py_connector_allocation_reported = False
         self.py_connector_served_position = 0

@@ -978,6 +978,10 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         # Router Replay: attach routed_experts to this request's output.
         self.py_return_routed_experts = return_routed_experts
         self.py_return_context_logits = return_context_logits
+        # Context logits exist only for tokens the forward pass computes, so
+        # the KV cache manager allocates the whole prompt instead of claiming
+        # a cached prefix.
+        self.skip_prefix_reuse = return_context_logits
         self.py_return_generation_logits = return_generation_logits
         self.py_return_logits_device_memory = return_logits_device_memory
         self.py_additional_outputs = additional_outputs

@@ -1194,13 +1194,6 @@ class KVCacheManager(BaseResourceManager):
                 scheduled_batch, is_cross=False)
 
             if batch_request_infos:
-                # The chunk each context-logits request was admitted with,
-                # before add_sequence_batch shifts it past any reused prefix.
-                scheduled_chunks = {
-                    req.py_request_id: req.context_chunk_size
-                    for req in batch_llm_requests
-                    if req.py_return_context_logits
-                }
                 self.impl.add_sequence_batch(batch_request_infos,
                                              batch_llm_requests)
                 for req in batch_llm_requests:
@@ -1218,8 +1211,6 @@ class KVCacheManager(BaseResourceManager):
                             req, block_ids)
 
                 self._maybe_apply_spec_recompute_tail(batch_llm_requests)
-                self._maybe_rewind_context_output_requests(
-                    batch_llm_requests, scheduled_chunks)
 
             for req in scheduled_batch.generation_requests:
                 if self.mapping.has_cp_helix():
@@ -1337,54 +1328,6 @@ class KVCacheManager(BaseResourceManager):
                 # values; a full re-prefill must reset it explicitly.
                 req.context_current_position = 0
             req.context_chunk_size = prompt_len - target
-
-    def _has_windowed_attention(self) -> bool:
-        # Entries <= 0 are not attention windows (recurrent-state sentinels).
-        return any(window is not None and 0 < window < self.max_seq_len
-                   for window in self.max_attention_window_vec)
-
-    def _maybe_rewind_context_output_requests(
-            self, batch_llm_requests: List[LlmRequest],
-            scheduled_chunks: Dict[int, int]) -> None:
-        """Fully re-prefill cache-hit requests that return context logits.
-
-        Context logits (and the prompt logprobs derived from them) exist only
-        for tokens that pass through the forward pass, so a reused prefix leaves
-        those positions unscored. Rewinding to position 0 keeps the reused
-        blocks and scores every prompt token. The recompute rewrites those
-        shared blocks with the same K/V up to kernel numerics, which other
-        requests reading the prefix may observe. The scheduler admitted these requests without a
-        reuse discount (``clear_context_output_reuse_estimates``), so restoring
-        the admitted chunk from position 0 stays within the token budget.
-
-        A sliding-window layer detaches out-of-window blocks, so the rewound
-        cursor would cross spans with no pages behind them. There the request
-        keeps its reuse, and the worker rejects the incomplete context logits
-        rather than misaligning them.
-        """
-        if self.is_draft or not scheduled_chunks:
-            return
-        rewind = [
-            req for req in batch_llm_requests
-            if req.py_request_id in scheduled_chunks and not req.is_dummy
-            and req.prepopulated_prompt_len > 0
-        ]
-        if not rewind:
-            return
-        if self._has_windowed_attention():
-            logger.warning_once(
-                "Requests returning context logits or prompt logprobs cannot "
-                "bypass KV cache reuse with sliding-window attention on this "
-                "KV cache manager, so cache hits among them will fail. Use "
-                "kv_cache_config.use_kv_cache_manager_v2=True or disable "
-                "block reuse.",
-                key="context_output_rewind_unsupported")
-            return
-        for req in rewind:
-            # The C++ setter only advances the position for nonzero values.
-            req.set_prepopulated_prompt_len(0, self.tokens_per_block)
-            req.context_current_position = 0
-            req.context_chunk_size = scheduled_chunks[req.py_request_id]
 
     def report_batch_to_connector(self,
                                   scheduled_batch: ScheduledRequests) -> None:

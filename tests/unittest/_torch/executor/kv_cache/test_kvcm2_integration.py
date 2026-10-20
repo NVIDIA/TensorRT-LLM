@@ -1530,7 +1530,7 @@ class _ContextRequest:
     is_generation_only_request: bool = False
     is_dummy_request: bool = False
     return_perf_metrics: bool = False
-    py_return_context_logits: bool = False
+    skip_prefix_reuse: bool = False
     context_current_position: int = 0
     py_served_prefix_end: int = 0
     py_num_connector_matched_tokens: int = 0
@@ -2194,10 +2194,10 @@ def _drive_context_chunks(
         request.is_first_context_chunk = False
 
 
-def test_a_context_logits_request_claims_no_reuse_but_commits_its_blocks() -> None:
-    """Context logits exist only for computed tokens, so a request returning them
+def test_a_prefix_reuse_skipping_request_claims_nothing_but_commits_its_blocks() -> None:
+    """A request that skips prefix reuse, such as one returning context logits,
     re-prefills a cached prompt. Its blocks are still committed, and a request
-    without context logits keeps reusing the cache.
+    that does not skip keeps reusing the cache.
     """
     if not torch.cuda.is_available():
         pytest.skip("requires CUDA")
@@ -2211,7 +2211,7 @@ def test_a_context_logits_request_claims_no_reuse_but_commits_its_blocks() -> No
         MAX_SEQ_LEN,
         "conv-2",
         use_conversation_params=False,
-        py_return_context_logits=True,
+        skip_prefix_reuse=True,
     )
     plain = _ContextRequest(3, prompt, MAX_SEQ_LEN, "conv-3", use_conversation_params=False)
     try:

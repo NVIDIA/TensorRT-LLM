@@ -1096,12 +1096,10 @@ class KVCacheV2Scheduler(RequestScheduler):
         Doing this up front rather than claim-then-reconcile keeps the mismatch
         path (free the draft pages and re-claim shallower) off the common case.
         """
-        from ..kv_cache.kv_cache_manager_v2 import _context_output_claim_limit
-
         draft_manager = self._joint_draft_manager
         if draft_manager is None:
             return None
-        if _context_output_claim_limit(req) == 0:
+        if req.skip_prefix_reuse:
             return 0
         draft_match = draft_manager.probe_context_reuse(req)
         target_match = self.kv_cache_manager.probe_context_reuse(req)
