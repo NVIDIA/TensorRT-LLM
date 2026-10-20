@@ -2,6 +2,8 @@
 This script is used to start the MPICommSession in the rank0 and wait for the
 MPI Proxy process to connect and get the MPI task to run.
 '''
+import sys
+import time
 from typing import Literal
 
 import click
@@ -50,6 +52,9 @@ def stop_server_main(ack_timeout: float = STOP_ACK_TIMEOUT_SECONDS,
     (the engine, which has just exited) is gone. A request sent before then is
     dropped, so each attempt uses a new connection and the request is resent
     until the server replies with ``RemoteMpiCommSessionServer.SHUTDOWN_ACK``.
+    The server also sends worker results and errors to whichever client is
+    attached, so an attempt reads past those messages until the
+    acknowledgment arrives or ``ack_timeout`` runs out.
 
     Returns:
         True if the server acknowledged, False if every attempt timed out.
@@ -66,9 +71,11 @@ def stop_server_main(ack_timeout: float = STOP_ACK_TIMEOUT_SECONDS,
                 f"RemoteMpiCommSessionClient [rank{global_mpi_rank()}] send shutdown signal to server (attempt {attempt})\n",
                 "green")
             queue.put(None)  # ask RemoteMpiCommSessionServer to shutdown
-            if (queue.poll(ack_timeout)
-                    and queue.get() == RemoteMpiCommSessionServer.SHUTDOWN_ACK):
-                return True
+            deadline = time.monotonic() + ack_timeout
+            while ((remaining := deadline - time.monotonic()) > 0
+                   and queue.poll(remaining)):
+                if queue.get() == RemoteMpiCommSessionServer.SHUTDOWN_ACK:
+                    return True
         except zmq.error.ZMQError as e:
             logger_debug(
                 f"Error during RemoteMpiCommSessionClient shutdown: {e}\n",
@@ -97,7 +104,8 @@ def main(action: Literal["start", "stop"] = "start"):
     if action == "start":
         launch_server_main()
     elif action == "stop":
-        stop_server_main()
+        if not stop_server_main():
+            sys.exit(1)
     else:
         raise ValueError(f"Invalid action: {action}")
 

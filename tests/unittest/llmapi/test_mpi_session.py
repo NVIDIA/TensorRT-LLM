@@ -933,6 +933,36 @@ def test_stop_request_reaches_server_still_waiting_for_workers(
 
 
 @pytest.mark.cpu_only
+def test_stop_request_reads_past_other_messages_to_the_ack(
+        _spawn_proxy_ipc) -> None:
+    """A worker message sent to the stop client must not hide the ack."""
+    from tensorrt_llm.llmapi.mgmn_leader_node import stop_server_main
+    from tensorrt_llm.llmapi.mpi_session import RemoteWorkerDeath
+
+    addr, hmac_key = _spawn_proxy_ipc
+    server = _bare_server_on(addr, hmac_key)
+    stopped = threading.Event()
+
+    def answer_stop_request():
+        assert server.queue.get() is None
+        server.queue.put(
+            RemoteWorkerDeath.from_exception(RuntimeError("rank 1 failed")))
+        server.queue.put(RemoteMpiCommSessionServer.SHUTDOWN_ACK)
+        stopped.set()
+
+    server_thread = threading.Thread(target=answer_stop_request, daemon=True)
+    server_thread.start()
+    try:
+        # One attempt only: a client that read just the first message would
+        # miss the ack and give up.
+        assert stop_server_main(ack_timeout=5.0, max_attempts=1)
+        assert stopped.wait(10)
+    finally:
+        server_thread.join(10)
+        server.queue.close()
+
+
+@pytest.mark.cpu_only
 def test_stop_request_gives_up_without_a_server(_spawn_proxy_ipc) -> None:
     from tensorrt_llm.llmapi.mgmn_leader_node import stop_server_main
 
@@ -940,6 +970,20 @@ def test_stop_request_gives_up_without_a_server(_spawn_proxy_ipc) -> None:
     assert not stop_server_main(ack_timeout=0.1, max_attempts=3)
     # Every attempt is dropped with linger 0, so nothing blocks the exit.
     assert time.monotonic() - start < 5
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("acknowledged, exit_code", [(True, 0), (False, 1)])
+def test_stop_cli_exit_code_reports_the_ack(monkeypatch, acknowledged,
+                                            exit_code) -> None:
+    from click.testing import CliRunner
+
+    from tensorrt_llm.llmapi import mgmn_leader_node
+
+    monkeypatch.setattr(mgmn_leader_node, "stop_server_main",
+                        lambda: acknowledged)
+    result = CliRunner().invoke(mgmn_leader_node.main, ["--action", "stop"])
+    assert result.exit_code == exit_code
 
 
 @pytest.mark.cpu_only

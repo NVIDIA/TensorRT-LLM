@@ -990,15 +990,13 @@ class RemoteMpiCommSessionServer():
     def _wait_for_pending_futures(self, pending_futures: list) -> list:
         """Wait for a previous task's worker futures, servicing the socket.
 
-        The control socket is a PAIR socket, which talks to one peer at a time.
-        The shutdown request comes from a second client (``mgmn_leader_node
-        --action stop``) after the task's client process has exited, and a
-        PAIR socket only accepts it once it has processed the first client's
-        disconnect. That takes a zmq call on this socket, so a wait that made
-        none kept the exited client attached: every shutdown request sent
-        during it was dropped, and the server never returned. Servicing the
-        socket here lets a retried request (see ``stop_server_main``) get
-        through while the workers are still tearing down.
+        The control socket is a PAIR socket, which talks to one peer at a time
+        and takes a new client only after a zmq call on it has processed the
+        previous client's disconnect. The wait polls the socket every
+        ``PENDING_POLL_SECONDS``, so a client that connects after the task's
+        client has exited, such as the stop client (``stop_server_main``),
+        is accepted and its messages are read while the workers are still
+        running.
 
         Returns:
             Messages received during the wait, in arrival order, for the caller
