@@ -1,5 +1,6 @@
 --extra-index-url https://download.pytorch.org/whl/cu132
 -c constraints.txt
+# WAR against https://nvd.nist.gov/vuln/detail/CVE-2026-69112
 accelerate>=1.15.0
 build
 colored
