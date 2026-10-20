@@ -267,11 +267,12 @@ class KVCacheV2Scheduler(RequestScheduler):
         # Long-prefill demotion (opt-in). Context scheduling is FCFS, so a
         # multi-hundred-k-token prefill takes the whole token budget for as many
         # iterations as it needs while the short cached turns behind it wait. A
-        # request whose uncached prefill the attention-DP router estimates above
-        # this many tokens (py_uncached_prefill_tokens) goes to the tail of the
-        # iteration's context order from its first chunk on, FCFS within each
-        # class, and takes whatever budget the others leave: reordered, never
-        # capped. Without an estimate a request is never demoted; once the
+        # request whose estimated uncached prefill (py_uncached_prefill_tokens,
+        # published by the conversation-aware or KV-cache-aware attention-DP
+        # router, or by the executor without attention DP) is above this many
+        # tokens goes to the tail of the iteration's context order from its
+        # first chunk on, FCFS within each class, and takes whatever budget the
+        # others leave: reordered, never capped. Without an estimate a request is never demoted; once the
         # prefix is matched the exact remainder decides instead of the estimate.
         # Gating at the door (not from the second chunk on) keeps long requests
         # from parking mid-prefill with their KV blocks held.
@@ -283,6 +284,14 @@ class KVCacheV2Scheduler(RequestScheduler):
             0, int(os.environ.get("TLLM_V2_CTX_DEMOTE_MAX_ITERS", "0"))
         )
         self._ctx_demote_skips: dict[int, int] = {}
+        # Set by the context pass for the duration of one iteration: whether a
+        # request kept short on the router's estimate is re-checked on its
+        # exact remainder once prepare_context has matched the prefix (see
+        # _late_demote), the ids already demoted this iteration, and whether
+        # the last _try_schedule_context call skipped its request for that.
+        self._ctx_late_check = False
+        self._ctx_demoted_now: set[int] = set()
+        self._ctx_late_demoted = False
         if self._ctx_demote_uncached_tokens:
             logger.info(
                 f"KVCacheV2Scheduler: demoting context requests with more than "
@@ -306,6 +315,22 @@ class KVCacheV2Scheduler(RequestScheduler):
         if req.context_current_position > 0:
             return req.context_remaining_length > self._ctx_demote_uncached_tokens
         return estimate > self._ctx_demote_uncached_tokens
+
+    def _late_demote(self, req: LlmRequest) -> bool:
+        """Whether a request the router's estimate kept short has more than the
+        threshold left now that its prefix is matched. A total prefix miss
+        leaves context_current_position at 0, so _is_long_context keeps trusting
+        the estimate (prompt growth over the previous turn) and the request
+        would take the whole budget for its first chunk. Called after
+        prepare_context, when context_remaining_length is exact."""
+        if req.py_uncached_prefill_tokens is None or req.py_request_id in self._ctx_demoted_now:
+            return False
+        if req.context_remaining_length <= self._ctx_demote_uncached_tokens:
+            return False
+        return not (
+            self._ctx_demote_max_iters > 0
+            and self._ctx_demote_skips.get(req.py_request_id, 0) >= self._ctx_demote_max_iters
+        )
 
     def _defer_long_context(
         self, pending_ctx: RequestList
@@ -655,8 +680,15 @@ class KVCacheV2Scheduler(RequestScheduler):
         let_through_ids: set[int] = set()
         if self._ctx_demote_uncached_tokens:
             pending_ctx, demoted_ids, let_through_ids = self._defer_long_context(pending_ctx)
+        # A request found long only once its prefix is matched is appended to
+        # ctx_order and retried after every other context request, like the
+        # ones demoted up front; demoted_ids then covers it, so it is not
+        # demoted twice. Iterating a list that grows is intended here.
+        ctx_order: RequestList = list(pending_ctx)
+        self._ctx_late_check = bool(self._ctx_demote_uncached_tokens)
+        self._ctx_demoted_now = demoted_ids
 
-        for req in pending_ctx:
+        for req in ctx_order:
             if budget.requests_full:
                 break
             # A radix probe cannot affect admission once the chunk token budget
@@ -719,6 +751,9 @@ class KVCacheV2Scheduler(RequestScheduler):
                 if action is ScheduleAction.STOP:
                     break
                 if action is ScheduleAction.SKIP:
+                    if self._ctx_late_demoted:
+                        demoted_ids.add(req.py_request_id)
+                        ctx_order.append(req)
                     continue
                 has_chunking = has_chunking or chunking_flag
                 scheduled_ctx.append(req)
@@ -738,6 +773,9 @@ class KVCacheV2Scheduler(RequestScheduler):
                 # either inflight_request_ids or scheduled_ctx non-empty.
                 if first_new_block is not None:
                     contributed_blocks.add(first_new_block)
+
+        self._ctx_late_check = False
+        self._ctx_demoted_now = set()
 
         made_progress = bool(
             scheduled_gen
@@ -954,6 +992,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         A loading request remains outside the schedulable state range.
         """
         first_chunk = req.is_first_context_chunk
+        self._ctx_late_demoted = False
         if self.chunking_enabled:
             result = self._try_schedule_context_chunked(req, budget, preempt_for_pages)
         else:
@@ -1076,6 +1115,10 @@ class KVCacheV2Scheduler(RequestScheduler):
         # Prepare context (create _KVCache, block reuse, resume — no resize)
         if not self._prepare_context_pair(req):
             logger.debug(f"prepare_context failed for chunked context request {req.py_request_id}")
+            return ScheduleAction.SKIP, 0, False
+
+        if self._ctx_late_check and self._late_demote(req):
+            self._ctx_late_demoted = True
             return ScheduleAction.SKIP, 0, False
 
         # Calculate chunk size from remaining budget

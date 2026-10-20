@@ -5109,10 +5109,53 @@ class TestLongContextDemotion:
         short = self._req(1, 256, estimate=256)
         out = self._make(self.ENV).schedule_request([missed, short], set())
         assert ids(out.context_requests) == [1, 0]
-        # Before the prefix is matched only the estimate is known: not demoted.
+        # A total miss leaves the position at 0: prepare_context reveals the
+        # exact remainder, and the request runs after the short ones.
         fresh = self._req(0, 10_000, estimate=256)
         out = self._make(self.ENV).schedule_request([fresh, short], set())
+        assert ids(out.context_requests) == [1, 0]
+        assert short.context_chunk_size == 256
+        assert fresh.context_chunk_size == 768  # leftover, not a full first chunk
+
+    def test_prefix_match_keeps_a_short_remainder_in_order(self):
+        """Estimated short and the matched prefix confirms it: arrival order."""
+
+        def prepare(req):
+            req.context_current_position = 9_000
+            req.context_remaining_length = 1_000
+            return True
+
+        with patch.dict("os.environ", self.ENV):
+            sched = make_scheduler(
+                make_kv_cache_manager(tokens_per_block=64, prepare_context_fn=prepare),
+                max_num_tokens=1024,
+                ctx_chunk_config=(None, 64),
+            )
+        hit = make_ctx_request(0, context_remaining_length=10_000, prompt_len=10_000)
+        hit.py_uncached_prefill_tokens = 1_000
+        other = make_ctx_request(1, context_remaining_length=10_000, prompt_len=10_000)
+        other.py_uncached_prefill_tokens = 1_000
+        out = sched.schedule_request([hit, other], set())
+        assert ids(out.context_requests)[0] == 0
+        assert hit.context_chunk_size == 1_000
+
+    def test_late_demotion_counts_toward_the_aging_bound(self):
+        sched = self._make(dict(self.ENV, TLLM_V2_CTX_DEMOTE_MAX_ITERS="2"))
+        missed = self._req(0, 10_000, estimate=256)
+        hog = self._req(1, 960, estimate=960)
+        for _ in range(2):
+            out = sched.schedule_request([missed, hog], set())
+            assert ids(out.context_requests) == [1, 0]
+            assert missed.context_chunk_size == 64
+        out = sched.schedule_request([missed, hog], set())
+        assert ids(out.context_requests) == [0]  # let through in arrival order
+        assert missed.context_chunk_size == 1024
+
+    def test_no_late_demotion_without_threshold(self):
+        missed, short = self._req(0, 10_000, estimate=256), self._req(1, 256, estimate=256)
+        out = self._make().schedule_request([missed, short], set())
         assert ids(out.context_requests) == [0]
+        assert missed.context_chunk_size == 1024
 
     def test_aging_bound_lets_a_demoted_request_through(self):
         sched = self._make(dict(self.ENV, TLLM_V2_CTX_DEMOTE_MAX_ITERS="2"))
