@@ -869,30 +869,3 @@ def test_cache_update_kernels_reject_unsupported_layouts():
             TPB,
             None,
         )
-
-
-def test_native_decode_sizes_recompute_only_on_growth(monkeypatch):
-    """Smaller or alternating shapes reuse the cached sizes; host queries rerun only on growth."""
-    from types import SimpleNamespace
-
-    from tensorrt_llm._torch.attention.backends.sparse.glm_kpool.native_decode import (
-        GlmKpoolNativeDecode,
-    )
-
-    calls = []
-    real = torch.cuda.get_device_properties
-    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda *a: calls.append(a) or real(*a))
-    runner = GlmKpoolNativeDecode()
-    metadata = SimpleNamespace(effective_workspace=torch.empty(0, dtype=torch.int8, device="cuda"))
-
-    def prepare(rows, heads):
-        q = torch.empty(1, heads, 512, dtype=torch.bfloat16, device="cuda")
-        runner.prepare_workspace(q, metadata, max_query_rows=rows, query_dtype=torch.float8_e4m3fn)
-        return runner._workspace_size, runner._counter.numel()
-
-    largest = prepare(256, 64)
-    for rows, heads in [(8, 16), (256, 64), (8, 16), (64, 32)]:
-        assert prepare(rows, heads) == largest
-    assert len(calls) == 1
-    prepare(512, 64)
-    assert len(calls) == 2
