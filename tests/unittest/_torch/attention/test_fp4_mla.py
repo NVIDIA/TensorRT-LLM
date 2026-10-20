@@ -1265,7 +1265,7 @@ def _materialize_reference_cache_tokens(
 
 @pytest.mark.skipif(
     _is_cutedsl_unavailable(),
-    reason="requires Rubin SM107 and the CTM/CuTeDSL runtime",
+    reason="requires Rubin SM107 and the CuTeDSL runtime",
 )
 @pytest.mark.parametrize("inactive_rank", [False, True], ids=["active", "inactive"])
 def test_fp4_mla_helix_scatter_uses_global_rope_and_local_cache_position(
@@ -1935,7 +1935,7 @@ def _assert_fp4_mla_attention_decode_accuracy(
 
 @pytest.mark.skipif(
     _is_cutedsl_unavailable(),
-    reason="requires Rubin SM107 and the CTM/CuTeDSL runtime",
+    reason="requires Rubin SM107 and the CuTeDSL runtime",
 )
 @pytest.mark.parametrize(
     "fused_v_transpose",
@@ -1961,7 +1961,7 @@ def test_fp4_mla_attention_decode_cutedsl_matches_reference(
 
 @pytest.mark.skipif(
     _is_cutedsl_unavailable(),
-    reason="requires Rubin SM107 and the CTM/CuTeDSL runtime",
+    reason="requires Rubin SM107 and the CuTeDSL runtime",
 )
 @pytest.mark.parametrize(
     "fused_v_transpose",
@@ -1986,7 +1986,7 @@ def test_fp4_mla_attention_decode_cutedsl_helix_mtp5_matches_reference(
 
 @pytest.mark.skipif(
     _is_cutedsl_unavailable(),
-    reason="requires Rubin SM107 and the CTM/CuTeDSL runtime",
+    reason="requires Rubin SM107 and the CuTeDSL runtime",
 )
 def test_fp4_mla_attention_decode_cutedsl_block_reuse_repack_matches_reference(
     monkeypatch,
@@ -2289,7 +2289,7 @@ def _resolve_v_repack_generation_page_ids(
 
 @pytest.mark.skipif(
     _is_cutedsl_unavailable(),
-    reason="requires Rubin SM107 and the CTM/CuTeDSL runtime",
+    reason="requires Rubin SM107 and the CuTeDSL runtime",
 )
 def test_fp4_mla_v_repack_full_pages_matches_reference() -> None:
     from tensorrt_llm._torch.attention.backends.fp4_mla import fp4_mla_cutedsl_v_repack
@@ -2318,7 +2318,7 @@ def test_fp4_mla_v_repack_full_pages_matches_reference() -> None:
 
 @pytest.mark.skipif(
     _is_cutedsl_unavailable(),
-    reason="requires Rubin SM107 and the CTM/CuTeDSL runtime",
+    reason="requires Rubin SM107 and the CuTeDSL runtime",
 )
 def test_fp4_mla_v_repack_selected_pages_preserves_untouched_page() -> None:
     from tensorrt_llm._torch.attention.backends.fp4_mla import fp4_mla_cutedsl_v_repack
@@ -2352,7 +2352,7 @@ def test_fp4_mla_v_repack_selected_pages_preserves_untouched_page() -> None:
 
 @pytest.mark.skipif(
     _is_cutedsl_unavailable(),
-    reason="requires Rubin SM107 and the CTM/CuTeDSL runtime",
+    reason="requires Rubin SM107 and the CuTeDSL runtime",
 )
 def test_fp4_mla_v_repack_generation_csr_crosses_page_boundary() -> None:
     from tensorrt_llm._torch.attention.backends.fp4_mla import fp4_mla_cutedsl_v_repack

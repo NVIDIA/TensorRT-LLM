@@ -13,7 +13,7 @@ transceiver under heavy mid-flight cancellation).
 
 ## Status
 
-The registered QA stress entry now launches a real C++/V1 DeepSeek
+The registered QA stress entry now launches a real Python/V1 DeepSeek
 disaggregated cluster in `log_only` mode. That mode sends normal
 non-cancel completion probes through the front-end and scans saved
 worker/server logs for UAF, broken-promise, and segmentation-fault
@@ -40,7 +40,7 @@ Thread bodies:
 
 Component-level coverage: `test_log_scanner.py`, `test_metrics_thread.py`,
 `test_injector.py`, `test_canary.py`, `test_load_thread.py`. The
-parametrized C++/V1 DeepSeek run is registered in the QA stress test
+parametrized Python/V1 DeepSeek run is registered in the QA stress test
 list as a real `log_only` guardrail.
 
 ## File layout
@@ -58,7 +58,7 @@ tests/integration/defs/stress_test/disagg_cancel/
 ├── test_load_thread.py             (load_thread unit tests)
 └── configs/
     ├── README.md                   (YAML schema + how to add a config)
-    ├── marathon_cpp_v1_deepseek.yaml
+    ├── marathon_python_v1_deepseek.yaml
 ```
 
 Future additions:
@@ -67,13 +67,13 @@ Future additions:
 - `configs/stress_canary_prompts.json` — canary prompts + recorded
   reference token IDs for `full_cancel_poison`.
 - Per-scenario YAMLs covering additional axes: 1P1D, 4P2D,
-  V1+Python, UCX, block-reuse-off, overlap-off, aggressive-timeout,
+  V2 KV cache, block-reuse-off, overlap-off, aggressive-timeout,
   multi-node (all Python-only test-side configuration).
 
 ## Mode Switch
 
 The active mode is controlled by
-`configs/marathon_cpp_v1_deepseek.yaml`:
+`configs/marathon_python_v1_deepseek.yaml`:
 
 ```yaml
 stress_config:
@@ -105,7 +105,7 @@ features are ready:
 
 ### Scheduled QA stress run
 
-The C++/V1 DeepSeek marathon is registered in
+The Python/V1 DeepSeek marathon is registered in
 `tests/integration/test_lists/qa/llm_function_stress.txt`, which makes
 it eligible for the QA/Jenkins job that consumes that stress list. This
 PR does not create or modify the scheduler for that job; the exact
@@ -117,7 +117,7 @@ not define a file-specific cadence for `llm_function_stress.txt`.
 The registered entry is:
 
 ```text
-stress_test/disagg_cancel/test_disagg_cancel_stress.py::test_disagg_cancellation_marathon[marathon_cpp_v1_deepseek.yaml] TIMEOUT (45)
+stress_test/disagg_cancel/test_disagg_cancel_stress.py::test_disagg_cancellation_marathon[marathon_python_v1_deepseek.yaml] TIMEOUT (45)
 ```
 
 The integration test-list parser interprets `TIMEOUT (45)` in
@@ -274,7 +274,7 @@ When the regular guardrail fails:
 
 1. Confirm the YAML parses:
    ```bash
-   python -c "from harness import StressConfig; StressConfig.from_yaml_path('configs/marathon_cpp_v1_deepseek.yaml')"
+   python -c "from harness import StressConfig; StressConfig.from_yaml_path('configs/marathon_python_v1_deepseek.yaml')"
    ```
 2. Check the `failure_reason` field in `collect_results()` output.
 3. Inspect the log tails printed by `disagg_test_utils.terminate()`

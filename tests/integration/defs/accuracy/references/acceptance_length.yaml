@@ -96,16 +96,17 @@ disagg::TestNemotron3Super120B::test_auto_dtype:
 TestQwen3_8_27B::test_dflash2:
   ref_al: 5.899181450085933
   min_al: 5.604222377581636
-# Shared by both legs of TestModelingV2DeepseekR10528Nvfp4Sm103Dep4::
-# test_mtp3_acceptance. Keyed by target and variant rather than by test
-# function, because that is what the number is a property of, and because the
-# modeling_v2 and stock legs are read against the same minimum on purpose:
-# modeling_v2 failing while stock passes means the draft path regressed; both
-# failing means this anchor is stale. Populated from the STOCK leg -- taking it
-# from the target's own number would make the gate self-referential.
-ModelingV2DeepseekR10528Nvfp4Sm103Dep4::mtp3:
+# Shared by both legs of TestModelingV2DeepseekR10528Nvfp4Sm10xDefault::
+# test_mtp3_acceptance, at every layout it runs. Keyed by target and variant
+# rather than by test function or layout, because that is what the number is a
+# property of, and because the modeling_v2 and stock legs are read against the
+# same minimum on purpose: modeling_v2 failing while stock passes means the
+# draft path regressed; both failing means this anchor is stale. Populated
+# from the STOCK leg -- taking it from the target's own number would make the
+# gate self-referential.
+ModelingV2DeepseekR10528Nvfp4Sm10xDefault::mtp3:
   ref_al: 3.020
-  # Hand-set, not the automatic 95%. Measured on GB300 over three runs each:
+  # Hand-set, not the automatic 95%. Measured at dep4 on GB300 over three runs each:
   # stock 3.020 / 2.998 / 3.009 / 3.014, modeling_v2 2.921 / 2.938 / 2.933. Each
   # side is stable to ~0.7%, and the two ranges do not overlap -- modeling_v2
   # runs about 2.6% under stock on this workload, consistently rather than as
@@ -124,7 +125,7 @@ TestGLM53FlashFP8::test_mtp:
   min_al: 3.215
 # Read by TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1::
 # test_mtp1_gsm8k_and_acceptance. Keyed by target and variant for the same
-# reason as the ModelingV2DeepseekR10528Nvfp4Sm103Dep4::mtp3 entry above.
+# reason as the ModelingV2DeepseekR10528Nvfp4Sm10xDefault::mtp3 entry above.
 #
 # max_draft_len is 1 on this checkpoint (`mtp_num_hidden_layers: 1`, one module
 # replayed once per step), so acceptance length lives in [1.0, 2.0]: 1.0 is a
