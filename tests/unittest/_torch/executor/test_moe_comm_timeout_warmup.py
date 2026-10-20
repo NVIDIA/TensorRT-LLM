@@ -16,7 +16,7 @@ from tensorrt_llm._torch.moe.fused_moe.moe_comm_timeout_guard import (
     DEFAULT_WARMUP_TIMEOUT_SEC,
     MoECommTimeoutGuard,
 )
-from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner import DecoderRunner
+from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.graphs import DecoderCudaGraphs
 from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
 
 pytestmark = pytest.mark.cpu_only
@@ -61,7 +61,7 @@ class _GraphRunnerStub:
         yield
 
 
-class _CaptureRunnerStub:
+class _CaptureGraphsStub(DecoderCudaGraphs):
     """Records the runner mode and the timeout guard state of each CUDA-graph warmup pass."""
 
     def __init__(self, guard: MoECommTimeoutGuard) -> None:
@@ -69,7 +69,7 @@ class _CaptureRunnerStub:
         self.passes: list[tuple[bool, bool]] = []
         self._guard = guard
 
-    def _run_cuda_graph_warmup(self, resource_manager: object) -> None:
+    def run_cuda_graph_warmup(self, resource_manager: object) -> None:
         self.passes.append((self.cuda_graph_runner.is_warmup_only, self._guard.in_warmup))
 
 
@@ -88,11 +88,11 @@ def test_is_warmup_setter_switches_the_timeouts_both_ways(guard: MoECommTimeoutG
 
 
 def test_only_the_capturing_pass_uses_the_serving_timeouts(guard: MoECommTimeoutGuard) -> None:
-    runner = _CaptureRunnerStub(guard)
+    graphs = _CaptureGraphsStub(guard)
     guard.set_warmup(True)
 
-    DecoderRunner._warmup_and_capture_cuda_graphs(runner, resource_manager=None)
+    graphs.warmup_and_capture(resource_manager=None)
 
-    assert runner.passes == [(True, True), (False, False)]
+    assert graphs.passes == [(True, True), (False, False)]
     assert guard.in_warmup
-    assert runner.cuda_graph_runner.padding_dummy_requests == {}
+    assert graphs.cuda_graph_runner.padding_dummy_requests == {}

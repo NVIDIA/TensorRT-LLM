@@ -206,51 +206,37 @@ curl http://localhost:8000/server_info
 }
 ```
 
-
-## Tips and Troubleshooting
-
-The following tips typically assist new LLM API users who are familiar with other APIs that are part of TensorRT-LLM:
-
-### RuntimeError: only rank 0 can start multi-node session, got 1
-
-  There is no need to add an `mpirun` prefix for launching single node multi-GPU inference with the LLM API.
-
-  For example, you can run `python llm_inference_distributed.py` to perform multi-GPU on a single node.
-
-### Hang issue on Slurm Node
-
-  If you experience a hang or other issue on a node managed with Slurm, add prefix `mpirun -n 1 --oversubscribe --allow-run-as-root` to your launch script.
-
-  For example, try `mpirun -n 1 --oversubscribe --allow-run-as-root python llm_inference_distributed.py`.
-
-### MPI_ABORT was invoked on rank 1 in communicator MPI_COMM_WORLD with errorcode 1.
-
-  Because the LLM API relies on the `mpi4py` library, put the LLM class in a function and protect the main entrypoint to the program under the `__main__` namespace to avoid a [recursive spawn](https://mpi4py.readthedocs.io/en/stable/mpi4py.futures.html#mpipoolexecutor) process in `mpi4py`.
-
-  This limitation is applicable for multi-GPU inference only.
-
-### Unified compiled-artifact cache
+## Unified Cache for Compiled Artifacts
 
 Set `TRTLLM_CACHE_DIR` before importing TensorRT-LLM to place its compiled
 artifact caches under a single root. TensorRT-LLM supplies the following
 defaults. Except for the isolation behavior described below, an individually
 configured environment variable takes precedence.
 
-| Environment variable | Default under `TRTLLM_CACHE_DIR` |
-|----------------------|------------------------------------|
-| `TLLM_AUTOTUNER_CACHE_PATH` | `autotuner/cache.json` |
-| `TORCHINDUCTOR_CACHE_DIR` | `inductor` |
-| `TRITON_CACHE_DIR` | `triton` |
-| `TORCH_EXTENSIONS_DIR` | `torch_extensions` |
-| `FLASHINFER_WORKSPACE_BASE` | `flashinfer` |
-| `CUTE_DSL_CACHE_DIR` | `cute_dsl` |
-| `DG_JIT_CACHE_DIR` | `deep_gemm` |
-| `TRTLLM_DG_CACHE_DIR` | `trtllm_deep_gemm` |
-| `CUDA_CACHE_PATH` | `cuda` |
+| Environment variable | Default cache path | Default under `TRTLLM_CACHE_DIR` |
+|----------------------|--------------------|------------------------------------|
+| `TLLM_AUTOTUNER_CACHE_PATH` | Disabled | `autotuner/cache.json` |
+| `TORCHINDUCTOR_CACHE_DIR` | `/tmp/torchinductor_$USER` | `inductor` |
+| `TRITON_CACHE_DIR` | `$HOME/.triton/cache` | `triton` |
+| `TORCH_EXTENSIONS_DIR` | `$HOME/.cache/torch_extensions` | `torch_extensions` |
+| `FLASHINFER_WORKSPACE_BASE` | `$HOME/.cache/flashinfer` | `flashinfer` |
+| `CUTE_DSL_CACHE_DIR` | `/tmp/$USER/cutlass_python_cache` | `cute_dsl` |
+| `DG_JIT_CACHE_DIR` | `$HOME/.deep_gemm` | `deep_gemm` |
+| `TRTLLM_DG_CACHE_DIR` | Disabled | `trtllm_deep_gemm` |
+| `CUDA_CACHE_PATH` | `$HOME/.nv/ComputeCache` | `cuda` |
+
+**Important note**: while some of the caches controlled by `TRTLLM_CACHE_DIR`
+are enabled and persisted by default (e.g., `FLASHINFER_WORKSPACE_BASE`),
+others are disabled or with a path defaulting to `/tmp` (e.g., `CUTE_DSL_CACHE_DIR`
+or `TLLM_AUTOTUNER_CACHE_PATH`). These caches are not validated for sharing
+across model instances or long-term persistence, which may lead to errors 
+and other unintended behavior. As such, we recommend using distinct 
+`TRTLLM_CACHE_DIR` caches for different models, and invalidating them anytime 
+a component in the software stack changes.
 
 The directories are created by their respective consumers when needed.
-TensorRT-LLM does not add cache locking, cleanup, or per-rank isolation for
-these unified defaults (with the exceptions described below). The
+TensorRT-LLM does not add cache locking or cleanup; per-rank isolation is
+enabled only for the exceptions described below. The
 configured values are forwarded to dynamically spawned MPI workers.
 
 Configuring `TRTLLM_DG_CACHE_DIR`, either directly or through
@@ -300,6 +286,28 @@ ranks; populate it before the multi-rank launch, either by installing the
 `flashinfer-cubin` package matching `flashinfer-python` or with a single-rank
 warm-up run, and set `FLASHINFER_NO_DOWNLOAD=1` so a missing artifact fails
 instead of being downloaded concurrently into the shared directory.
+
+## Tips and Troubleshooting
+
+The following tips typically assist new LLM API users who are familiar with other APIs that are part of TensorRT-LLM:
+
+### RuntimeError: only rank 0 can start multi-node session, got 1
+
+  There is no need to add an `mpirun` prefix for launching single node multi-GPU inference with the LLM API.
+
+  For example, you can run `python llm_inference_distributed.py` to perform multi-GPU on a single node.
+
+### Hang issue on Slurm Node
+
+  If you experience a hang or other issue on a node managed with Slurm, add prefix `mpirun -n 1 --oversubscribe --allow-run-as-root` to your launch script.
+
+  For example, try `mpirun -n 1 --oversubscribe --allow-run-as-root python llm_inference_distributed.py`.
+
+### MPI_ABORT was invoked on rank 1 in communicator MPI_COMM_WORLD with errorcode 1.
+
+  Because the LLM API relies on the `mpi4py` library, put the LLM class in a function and protect the main entrypoint to the program under the `__main__` namespace to avoid a [recursive spawn](https://mpi4py.readthedocs.io/en/stable/mpi4py.futures.html#mpipoolexecutor) process in `mpi4py`.
+
+  This limitation is applicable for multi-GPU inference only.
 
 ### Cannot quit after generation
 

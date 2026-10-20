@@ -5,8 +5,8 @@
 from copy import copy, deepcopy
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import (TYPE_CHECKING, Any, Container, Dict, Hashable, Iterable,
-                    List, Optional, Union, cast)
+from typing import (Any, Container, Dict, Hashable, Iterable, List, Optional,
+                    Union, cast)
 
 import torch
 
@@ -224,10 +224,6 @@ class MultimodalEncoderRequestState:
         self.item_cache_keys = [None] * len(self.item_cache_keys)
         self.item_ready = [False] * len(self.item_ready)
         return cache_keys
-
-
-if TYPE_CHECKING:
-    from .sampler.sampler_strategy import Strategy
 
 
 @dataclass(slots=True)
@@ -865,15 +861,12 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             seq_slot: Optional[int] = None,
             target_seq_slot: Optional[int] = None,
             num_logprobs: int = 0,
-            is_first_draft: bool = False,
             use_chunked_generation_logits: bool = True,
             logits_chunk_size: int = 8,
             logprobs_mode: LogprobMode = LogprobMode.RAW,
             logprobs_simple_format: bool = False,
             return_routed_experts: bool = False,
             **kwargs):
-        self.py_sampling_strategy: "Strategy | None" = None
-
         self.py_logits_post_processors = kwargs.pop("py_logits_post_processors",
                                                     None)
         # Owned entirely on the Python side: the TorchSampler is the only
@@ -911,8 +904,8 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
 
         # Cross-iter MM encoder prefetch event: stamped by the side-stream
         # producer in `modeling_multimodal_mixin._dispatch_cross_iter_prefetch`
-        # and consumed (then cleared) in `DecoderRunner._prepare_inputs` when
-        # the request is next scheduled.
+        # and consumed (then cleared) in `DecoderInputPreparer.prepare_inputs`
+        # when the request is next scheduled.
         self.py_mm_encoder_event: Optional[torch.cuda.Event] = None
 
         if llm_request is not None:
@@ -941,8 +934,6 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         # Manager-owned helix decode-step counter; see
         # KVCacheManagerV2._set_helix_rank_fields.
         self.py_helix_decode_group_index = 0
-        self.py_draft_logits = None
-        self.py_target_probs = None
         self.py_per_pos_drafted = [0] * MAX_SPEC_DECODE_POSITIONS
         self.py_per_pos_accepted = [0] * MAX_SPEC_DECODE_POSITIONS
         # Cumulative spec-decode counters backing
@@ -996,8 +987,6 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         # If the request is a draft request, target_seq_slot is the sequence slot ID of its target request.
         self.py_target_seq_slot = target_seq_slot
         self.use_draft_model = is_draft
-        # Whether the request is for the first forward of the draft model.
-        self.py_is_first_draft = is_first_draft
         self.d2t = None
         self.py_disable_speculative_decoding = False
 
@@ -1143,7 +1132,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         # flow, already holds the NEXT step's drafts by response time.
         self.py_num_draft_tokens_verified = 0
         # One-model rejection: set per-iteration by _handle_dynamic_draft_len when
-        # this gen request produced 0 real draft tokens, so _prepare_tp_inputs
+        # this gen request produced 0 real draft tokens, so _pack_extend_requests
         # one-hots its stale draft_probs slot. Consumed (and cleared) there.
         self.py_needs_onehot_draft_probs = False
         self.py_num_accepted_draft_tokens_indices = []
