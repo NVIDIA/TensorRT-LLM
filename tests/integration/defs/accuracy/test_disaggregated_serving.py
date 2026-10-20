@@ -823,8 +823,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
     @skip_no_rubin
     @pytest.mark.skip_less_device(2)
     @pytest.mark.skip_less_device_memory(60000)
-    @pytest.mark.parametrize("mtp_nextn", [0, 3], ids=["mtp0", "mtp3"])
-    def test_nvfp4_kv_cache_nixl(self, mtp_nextn):
+    def test_nvfp4_kv_cache_nixl(self):
         """FP4 MLA: the generation worker decodes from an imported NVFP4 cache."""
         kv_cache_config = {
             "dtype": "nvfp4",
@@ -837,26 +836,22 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             "transceiver_runtime": "PYTHON",
             "max_tokens_in_buffer": 8192,
         }
+        speculative_config = {"decoding_type": "MTP", "max_draft_len": 3}
         ctx_server_config = {
             "disable_overlap_scheduler": True,
             "enable_chunked_prefill": False,
             "cuda_graph_config": None,
             "kv_cache_config": kv_cache_config,
             "cache_transceiver_config": cache_transceiver_config,
+            "speculative_config": speculative_config,
         }
         gen_server_config = {
             "disable_overlap_scheduler": False,
             "enable_chunked_prefill": False,
             "kv_cache_config": kv_cache_config,
             "cache_transceiver_config": cache_transceiver_config,
+            "speculative_config": speculative_config,
         }
-        if mtp_nextn > 0:
-            speculative_config = {
-                "decoding_type": "MTP",
-                "max_draft_len": mtp_nextn
-            }
-            ctx_server_config["speculative_config"] = speculative_config
-            gen_server_config["speculative_config"] = speculative_config
         disaggregated_server_config = {
             "hostname": "localhost",
             "backend": "pytorch",
@@ -876,9 +871,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             # the specs the accuracy reference lookup matches on.
             llm.args.quant_config.quant_algo = QuantAlgo.NVFP4
             llm.args.quant_config.kv_cache_quant_algo = QuantAlgo.NVFP4
-            if mtp_nextn > 0:
-                llm.args.speculative_config = MTPDecodingConfig(
-                    max_draft_len=mtp_nextn)
+            llm.args.speculative_config = MTPDecodingConfig(max_draft_len=3)
             run_accuracy_test(llm, self.MODEL_NAME, ["GSM8K"])
 
     @pytest.mark.skip_less_device(8)

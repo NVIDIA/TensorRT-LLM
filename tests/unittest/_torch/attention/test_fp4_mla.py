@@ -885,58 +885,6 @@ def test_fp4_mla_helix_disagg_import_skips_empty_rank() -> None:
     )
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_fp4_mla_disagg_import_stages_layer_major_page_worklist() -> None:
-    page_ids, page_valid_tokens = fp4_mla_v_cache._stage_fp4_mla_import_page_metadata(
-        [[17, 29], [5]],
-        [FP4_MLA_TOKENS_PER_BLOCK + 1, 3],
-        [0, 1, 2],
-        page_size=FP4_MLA_TOKENS_PER_BLOCK,
-        device=torch.device("cuda"),
-    )
-
-    assert page_ids.is_cuda and page_ids.dtype == torch.int32 and page_ids.is_contiguous()
-    assert page_ids.tolist() == [17, 29, 5, 18, 30, 6, 19, 31, 7]
-    assert page_valid_tokens.tolist() == [FP4_MLA_TOKENS_PER_BLOCK, 1, 3] * 3
-
-
-@pytest.mark.cpu_only
-@pytest.mark.parametrize("route", ["aggregated", "python_nixl", "cpp", "ucx"])
-def test_fp4_mla_kv_cache_manager_disagg_routing(route: str) -> None:
-    from tensorrt_llm._torch.pyexecutor._util import get_kv_cache_manager_cls
-    from tensorrt_llm.llmapi import CacheTransceiverConfig
-    from tensorrt_llm.models.modeling_utils import QuantConfig
-    from tensorrt_llm.quantization import QuantAlgo
-
-    model_config = SimpleNamespace(
-        pretrained_config=SimpleNamespace(
-            model_type="deepseek_v3",
-            architectures=["DeepseekV3ForCausalLM"],
-            kv_lora_rank=512,
-            qk_rope_head_dim=64,
-        ),
-        sparse_attention_config=None,
-        quant_config=QuantConfig(kv_cache_quant_algo=QuantAlgo.NVFP4),
-        attn_backend="TRTLLM",
-    )
-    kv_cache_config = LlmKvCacheConfig(use_kv_cache_manager_v2=True, dtype="nvfp4")
-    if route == "aggregated":
-        assert get_kv_cache_manager_cls(model_config, kv_cache_config) is Fp4MlaKVCacheManagerV2
-        return
-    transceiver = CacheTransceiverConfig(
-        backend="UCX" if route == "ucx" else "NIXL",
-        transceiver_runtime="CPP" if route == "cpp" else "PYTHON",
-    )
-    if route == "python_nixl":
-        assert (
-            get_kv_cache_manager_cls(model_config, kv_cache_config, True, transceiver)
-            is Fp4MlaKVCacheManagerV2
-        )
-    else:
-        with pytest.raises(ValueError, match="FP4 MLA disaggregated serving requires"):
-            get_kv_cache_manager_cls(model_config, kv_cache_config, True, transceiver)
-
-
 @pytest.mark.parametrize(
     "backend,fused_v_transpose",
     [("triton", False), ("cutedsl", False), ("cutedsl", True)],

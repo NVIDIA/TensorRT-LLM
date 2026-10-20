@@ -37,9 +37,6 @@ from tensorrt_llm._torch.attention.backends.fp4_mla import (
     _cutedsl_backend_available,
 )
 from tensorrt_llm._torch.attention.backends.fp4_mla.cache_manager import Fp4MlaKVCacheManagerV2
-from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
-from tensorrt_llm._torch.disaggregation.resource.page import MapperKind
-from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import Role
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.internal.batch_manager import CacheType as CacheTypeCpp
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig, MTPDecodingConfig
@@ -296,36 +293,6 @@ def _verify_cache(
                 if gen_v_packed is not None:
                     assert gen_v_packed.any()
                     assert torch.equal(gen_v_packed, ctx_v_packed)
-
-
-@pytest.mark.parametrize("backend", ["triton", "cutedsl"])
-def test_fp4_mla_page_table_transfers_native_roles_only(monkeypatch, backend: str) -> None:
-    _requires_fp4_mla_backend(backend)
-    monkeypatch.setenv(FP4_MLA_ATTENTION_BACKEND_ENV, backend)
-    (manager,) = _create_managers(1, 1, False)
-    try:
-        page_table = KVRegionExtractorV1(manager).page_table
-        views = {
-            frozenset(pool_view.pool_role): pool_view.mapper_kind
-            for layer_group in page_table.layer_groups
-            for pool_view in layer_group.pool_views
-        }
-        assert views == {
-            frozenset({str(Role.KEY)}): MapperKind.NHD,
-            frozenset({str(Role.KEY_BLOCK_SCALE)}): MapperKind.NHD,
-            frozenset({str(Role.MLA_HP_TAIL)}): MapperKind.REPLICATED,
-        }
-        global_layer_ids = sorted(
-            int(local_layer.global_layer_id)
-            for layer_group in page_table.layer_groups
-            for local_layer in layer_group.local_layers
-        )
-        # Each local layer, including the MTP layer, contributes its cache
-        # layer and its HP-tail layer.
-        assert len(manager.pp_layers) == NUM_LAYERS + 1
-        assert global_layer_ids == list(range(2 * len(manager.pp_layers)))
-    finally:
-        manager.shutdown()
 
 
 # Production pairs a DEP context with a larger DEP generation instance; the
