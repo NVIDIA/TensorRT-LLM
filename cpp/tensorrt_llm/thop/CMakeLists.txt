@@ -161,7 +161,13 @@ add_th_common_family(
   sageQuantizeOp.cpp
   blockCausalLayoutOp.cpp
   rotateRowsOp.cpp
-  scatterKvSlotsOp.cpp)
+  scatterKvSlotsOp.cpp
+  denseFp8FmhaOp.cpp
+  fusedDiTQKNormRopeFp8Op.cpp)
+# denseFp8FmhaOp.cpp includes the trtllm-gen FMHA runner headers; the interface
+# target carries the compile definitions those headers need to match the
+# library's struct layouts.
+target_link_libraries(th_common_visual_gen PRIVATE trtllm_gen_fmha_interface)
 
 add_th_common_family(
   th_common_decoding

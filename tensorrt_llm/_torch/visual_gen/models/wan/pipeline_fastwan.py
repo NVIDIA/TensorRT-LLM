@@ -124,8 +124,8 @@ class WanDMDPipeline(WanPipeline):
             raise ValueError("FastWan is CFG-free and does not support negative prompts.")
         prompt_embeds, _ = self._encode_prompt(prompt, "", max_sequence_length)
 
-        if self._fixed_latent is not None:
-            latents = self._fixed_latent.to(device=self.device, dtype=self.dtype)
+        if (fixed_latent := self._get_fixed_latent()) is not None:
+            latents = fixed_latent.to(device=self.device, dtype=self.dtype)
         else:
             latents = self._prepare_latents(batch_size, height, width, num_frames, generator)
 
