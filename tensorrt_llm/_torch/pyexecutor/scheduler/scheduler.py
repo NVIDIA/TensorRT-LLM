@@ -1162,7 +1162,7 @@ class MultimodalScheduler(RequestScheduler):
         paused_request_ids: set[int],
         step: _MultimodalEncoderStep,
     ) -> None:
-        """Spend leftover encoder budget on later items of active requests, in FCFS order."""
+        """Spend leftover encoder budget on later items in context-chunk mode, in FCFS order."""
         for request in active_requests:
             state = request.py_mm_encoder_state
             if state is None or request.request_id in paused_request_ids:
@@ -1228,7 +1228,16 @@ class MultimodalScheduler(RequestScheduler):
                 if self._is_ready_after_encoder_step(request, step)
             ]
             if self.prepares_future_items:
-                self._select_future_items(active_requests, paused_ids, step)
+                # Whole-request contexts hold every output until prefill ends.
+                # Reserve their outputs together so partial claims cannot block each other.
+                self._select_items(
+                    [
+                        request
+                        for request in active_requests
+                        if request.request_id not in paused_ids
+                    ],
+                    step,
+                )
         else:
             context_requests = self._select_items_for_context_chunks(
                 chunks,

@@ -455,6 +455,63 @@ def test_eager_scheduler_encodes_request_rejected_by_llm_capacity():
     assert output.context_requests == [text_request]
 
 
+@pytest.mark.parametrize("max_batch_size", [1, 3])
+def test_eager_whole_requests_finish_without_fragmenting_output_capacity(
+    max_batch_size: int,
+) -> None:
+    scheduler = _scheduler(
+        max_batch_size=max_batch_size,
+        max_num_tokens=40,
+        cache_capacity=40,  # Ten float32 embedding rows.
+        scheduler_cls=MultimodalEagerEncoderScheduler,
+    )
+    requests = [
+        make_mm_request(
+            request_id,
+            [4 * rows for rows in lengths],
+            embedding_lengths=lengths,
+            prompt_len=sum(lengths),
+        )
+        for request_id, lengths in enumerate(([4], [4, 6], [2, 6]), start=1)
+    ]
+    for request in requests:
+        initialize_multimodal_encoder_request(
+            request,
+            max_num_tokens=40,
+            max_output_bytes=40,
+            bytes_per_encoder_embedding=4,
+        )
+
+    active = list(requests)
+    finished = []
+    for _ in range(8):
+        output = scheduler.schedule_request(active, set())
+        assert output.context_requests or output.scheduled_mm_encoder_items, "Prefill stalled"
+        by_id = {request.request_id: request for request in active}
+        for request_id, item_indices in (output.scheduled_mm_encoder_items or {}).items():
+            state = by_id[request_id].py_mm_encoder_state
+            for item_idx in item_indices:
+                cache_key = state.item_cache_keys[item_idx]
+                scheduler.encoder_cache.commit(
+                    cache_key, torch.zeros(state.embedding_lengths[item_idx])
+                )
+                state.mark_cache_key_ready(cache_key)
+        for request in output.context_requests:
+            assert is_multimodal_encoder_ready(request)
+            request.move_to_next_context_chunk()
+            assert request.context_remaining_length == 0
+            for cache_key in request.py_mm_encoder_state.pop_all_cache_keys():
+                scheduler.encoder_cache.release(cache_key)
+            active.remove(request)
+            finished.append(request.request_id)
+        if not active:
+            break
+
+    assert finished == [1, 2, 3]
+    assert scheduler.encoder_cache.stats().reserved_bytes == 0
+    assert scheduler.encoder_cache.stats().in_use_bytes == 0
+
+
 @pytest.mark.parametrize(
     ("scheduler_cls", "max_num_tokens", "chunk_size", "reusable_tokens", "expected_items"),
     [
