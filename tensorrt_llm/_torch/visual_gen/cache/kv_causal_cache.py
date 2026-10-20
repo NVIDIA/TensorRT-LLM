@@ -480,7 +480,7 @@ class CausalKVCacheManager(KVCacheManagerV2):
         self._buffers = buffers
         self._kv_cache = kv_cache
         try:
-            self._lay_out(
+            self._open_with_geometry(
                 kv_cache,
                 pages,
                 buf,
@@ -499,7 +499,7 @@ class CausalKVCacheManager(KVCacheManagerV2):
             self._remove_kv_cache(_ROLLOUT_REQUEST_ID)
             raise
 
-    def _lay_out(
+    def _open_with_geometry(
         self,
         kv_cache,
         pages: np.ndarray,
