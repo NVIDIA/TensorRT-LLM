@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Fused convolution raw Q/K/V, state ownership, and CUDA graph parity."""
 
+import random
 from itertools import accumulate
 from types import SimpleNamespace
 
@@ -12,6 +13,7 @@ from kda_module_test_utils import clone_pool, make_batch
 
 from tensorrt_llm._torch.attention.kernels.blackwell.kimi_k3_kda.fused_prefill_conv import (
     _conv_layouts,
+    _grid_runs,
     _specialization,
     compile_prefill_conv,
     fused_prefill_conv,
@@ -442,3 +444,64 @@ def test_fused_conv_layout_key_ignores_batch_shape() -> None:
     assert {key(t, n, p) for t in (1, 2, 33, 32768) for n in (1, 2, 64) for p in (2, 70)} == {base}
     # What the kernel bakes into its address arithmetic must still select a compilation.
     assert key(4096, 8, 10, heads=3, src_stride=4 * 3 * 128) != base
+
+
+def test_grid_y_balances_the_longest_chain_against_idle_ctas() -> None:
+    run, channels = 32, 3 * 96 * 128
+    # One sequence, or equal ones: a CTA per run, nothing idles.
+    assert _grid_runs(24576, 1, 24576, channels, run) == 768
+    assert _grid_runs(24576, 8, 3072, channels, run) == 96
+    assert _grid_runs(24576, 64, 384, channels, run) == 12
+    assert _grid_runs(32000, 2, 24000, channels, run) == 250  # the other sequence has 250 runs
+    # Skewed batches: far fewer CTAs than the longest sequence has runs (359, 938, 127).
+    assert _grid_runs(32768, 32, 11469, channels, run) == 25
+    assert _grid_runs(30063, 64, 30000, channels, run) == 28
+    assert _grid_runs(4096, 64, 4033, channels, run) == 11
+    # Fewer heads mean fewer channel blocks per run, so more CTAs per sequence are needed.
+    assert _grid_runs(32768, 32, 11469, 3 * 12 * 128, run) == 70
+    assert _grid_runs(4096, 64, 4033, 3 * 12 * 128, run) == 29
+    # Degenerate shapes: a bound below the mean wins, the launch limit caps.
+    assert _grid_runs(64, 64, 1, channels, run) == 1
+    assert _grid_runs(1000, 4, 10, channels, run) == 1
+    assert _grid_runs(100, 1, 100, channels, run) == 4
+    assert _grid_runs(10_000_000, 1, 10_000_000, channels, run) == 65535
+
+
+def test_grid_y_never_exceeds_the_longest_sequence() -> None:
+    """grid.y stays between one CTA and one CTA per run of the longest sequence."""
+    rng = random.Random(20261020)
+    for _ in range(2000):
+        tokens, batch = rng.randint(1, 40000), rng.randint(1, 80)
+        bound, channels = rng.randint(1, 40000), 384 * rng.choice([1, 3, 12, 24, 96])
+        longest = -(-min(bound, tokens) // 32)
+        assert 1 <= _grid_runs(tokens, batch, bound, channels, 32) <= min(longest, 65535)
+
+
+@pytest.mark.parametrize("lengths", [[40, 24], [3000, 100, 5], [1024], [1] * 33 + [700]])
+@torch.inference_mode()
+def test_fused_conv_grid_y_only_sets_parallelism(lengths: list[int]) -> None:
+    """Any grid.y >= 1 covers every token with the same bits: CTAs loop over their sequence's runs."""
+    batch, src, weight, qkv = _conv_inputs(heads=3, lengths=lengths, seed=970)
+    seed_state = clone_pool(batch.conv)
+    operands = (
+        src,
+        weight,
+        batch.conv,
+        batch.metadata.query_start_loc,
+        batch.indices,
+        batch.metadata.has_initial_states,
+        *qkv,
+    )
+    spec, grid_y = _specialization(src, weight, batch.conv, *qkv, len(lengths), max(lengths))
+    kernel = compile_prefill_conv(src.device, _conv_layouts(*operands), *spec)
+    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    runs = -(-max(lengths) // 32)
+    reference = None
+    for grid in sorted({1, 2, 3, max(1, runs // 2), grid_y, runs, runs + 5}):
+        batch.conv.copy_(seed_state)
+        for out in qkv:
+            out.fill_(float("nan"))
+        kernel(*operands, grid, stream)
+        result = [_bits(t).clone() for t in (*qkv, batch.conv)]
+        reference = reference or result
+        assert all(torch.equal(a, b) for a, b in zip(result, reference)), f"grid.y={grid}"

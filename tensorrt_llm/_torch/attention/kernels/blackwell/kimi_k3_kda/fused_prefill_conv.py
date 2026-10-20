@@ -38,11 +38,14 @@ again, except that a batch of more than 65535 sequences takes the second special
 
 Launch: one-warp CTAs on grid (channel blocks, runs, sequences). Every CTA
 grid-strides over the runs of its sequence with the run count taken from the
-device-side length (starts), so max_seqlen only sizes grid.y (parallelism), never
-which tokens are processed: an understated or overstated bound still covers every
-token. grid.y is also capped at 65535. Only when B > 65535 does a shape-selected
-specialization grid-stride over sequences as well. A max_seqlen that is a CUDA tensor
-is never read on the host (T is used as the bound).
+device-side length (starts), so grid.y only sets parallelism, never which tokens are
+processed or how: any grid.y >= 1 covers every token and gives the same bits. The grid
+is a rectangle, so the host picks grid.y from the batch shape to balance the serial chain
+of the longest sequence against the CTAs that shorter sequences launch only to exit (see
+`_grid_runs`). max_seqlen is only an upper bound on that longest sequence. grid.y is
+also capped at 65535. Only when B > 65535 does a shape-selected specialization
+grid-stride over sequences as well. A max_seqlen that is a CUDA tensor is never read on
+the host (T is used as the bound).
 
 State pool: run 0 of each sequence (one warp per 256 channels) owns the slot's rows for
 its channels: it reads the old history, then writes the final three raw inputs after
@@ -60,6 +63,7 @@ semantics would need a cross-sequence ordering of state reads and writes that on
 launch does not provide.
 """
 
+import math
 from collections.abc import Callable
 from functools import cache
 
@@ -1216,6 +1220,47 @@ def compile_prefill_conv(
         return cute.compile(op, *args, cutlass.Int32(1), stream, options="--enable-tvm-ffi")
 
 
+# Ratio used by `_grid_runs`: the latency of one run of a CTA that has the GPU to itself,
+# divided by the launch cost of a CTA that exits at once. On SM107 (212 SMs) it is about
+# 3.4 us / 0.45 ns, and the rule scores about the same for ratios from 5000 to 9000. SM100
+# and SM103 are not measured: they have fewer SMs and less HBM bandwidth, so their best
+# grid.y is somewhat smaller.
+GRID_RUN_LATENCY_RATIO = 7500
+
+
+def _grid_runs(tokens: int, batch: int, max_seqlen: int, channels: int, run_tokens: int) -> int:
+    """Return grid.y, the CTAs per (channel block, sequence) of the launch.
+
+    Each CTA loops over the rest of its sequence's runs. The grid is a rectangle, so grid.y
+    trades two costs:
+
+    - With few CTAs per sequence, the longest sequence is a serial chain of
+      ceil(longest / grid.y) runs.
+    - With many, every shorter sequence launches CTAs that exit at once,
+      grid.y * (batch - 1) * channel_blocks of them.
+
+    The sum is smallest at sqrt(GRID_RUN_LATENCY_RATIO * longest / (channel_blocks * (batch - 1))).
+    The mean run count of the other sequences is the lower bound: below it, fewer CTAs save
+    nothing on average (idle CTAs appear only for sequences shorter than the mean) and only
+    lengthen the chains of the others. One sequence, or equal ones, get a CTA per run.
+
+    Args:
+        tokens: token count of the batch.
+        batch: sequence count.
+        max_seqlen: upper bound on the longest sequence.
+        channels: convolution channels, 3 * heads * 128.
+        run_tokens: tokens in one run of a CTA.
+    """
+    # Run counts round up. No sequence is longer than the batch's token count.
+    longest = -(-max(1, min(max_seqlen, tokens)) // run_tokens)
+    if batch < 2:
+        return min(longest, MAX_GRID_YZ)
+    blocks = -(-channels // WARP_CH)
+    others = -(-max(-(-tokens // run_tokens) - longest, 0) // (batch - 1))
+    balanced = math.ceil(math.sqrt(GRID_RUN_LATENCY_RATIO * longest / (blocks * (batch - 1))))
+    return min(longest, max(others, balanced), MAX_GRID_YZ)
+
+
 def _specialization(
     src: torch.Tensor,
     weight: torch.Tensor,
@@ -1247,11 +1292,7 @@ def _specialization(
     # a 16-byte-aligned base and a slot stride divisible by 8 elements.
     ss = conv_state.stride()
     st_vec = ss[1] == 3 and ss[2] == 1 and ss[0] % 8 == 0 and _align(conv_state) == 0
-    # grid.y only sets parallelism (CTAs loop over the device-side run count): no
-    # sequence is longer than T, so a looser bound only adds idle CTAs and an
-    # understated one only makes CTAs loop.
-    seqlen_bound = max(1, min(max_seqlen, src.shape[0]))
-    grid_y = min((seqlen_bound + L * W - 1) // (L * W), MAX_GRID_YZ)
+    grid_y = _grid_runs(src.shape[0], batch, max_seqlen, weight.shape[0], L * W)
     seq_loop = batch > MAX_GRID_YZ  # shape-only choice
     spec = (L, U, D, W, FORCE_MB, src_vec, w_vec, out_vec, st_vec, seq_loop)
     return spec, grid_y
