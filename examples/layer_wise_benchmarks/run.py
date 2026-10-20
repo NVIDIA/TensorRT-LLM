@@ -80,7 +80,9 @@ parser.add_argument(
     "--moe-load-balancer",
     type=str,
     help="MoeConfig.load_balancer: a YAML file path, or a mapping when set in the config"
-    " file, e.g. {mode: per_layer_dynamic, num_slots: 408}. Default: no load balancer.",
+    " file, e.g. {mode: per_layer_dynamic, num_slots: 408}. Supports per_layer_dynamic"
+    " without CUDA graphs, and static standard EPLB (layer_updates_per_iter 0)."
+    " Default: no load balancer.",
 )
 parser.add_argument(
     "--spec-max-draft-len",
@@ -185,6 +187,11 @@ if args.use_cuda_graph is None:
     args.use_cuda_graph = False
 if (args.replay_start_iter is None) != (args.replay_stop_iter is None):
     parser.error("Both --replay-start-iter and --replay-stop-iter must be provided or none")
+if args.replay_file_path and os.environ.get("ENABLE_PERFECT_ROUTER") == "expert_ids":
+    parser.error(
+        "--replay-file-path replays the recorded expert IDs over the ones that"
+        " ENABLE_PERFECT_ROUTER=expert_ids substitutes; run the perfect-router arm without it"
+    )
 if args.replay_verify_metadata is None:
     args.replay_verify_metadata = True
 if args.spec_max_draft_len is not None:
