@@ -5342,6 +5342,13 @@
           "title": "Implementation",
           "type": "string"
         },
+        "index_k_tp_shard": {
+          "default": false,
+          "description": "Also shard the index-K cache across the TP ranks: each rank stores only its 1/TP of the index-K rows, which frees KV-cache memory. Requires index_tp_split; not supported with disaggregated serving.",
+          "status": "prototype",
+          "title": "Index K Tp Shard",
+          "type": "boolean"
+        },
         "index_tp_split": {
           "default": false,
           "description": "Split the decode indexer across the TP ranks: each rank scores every index head on 1/TP of the index-K rows and the ranks exchange the partial block maxima over NVLink. Replicates index-Q on every rank. Requires fuse_qkv_index_projection and TP 2 or 4 on one node without attention DP.",

@@ -278,7 +278,8 @@ std::tuple<torch::Tensor, torch::Tensor> minimaxM3Fp8QKVIndexerNormRopeKVInsert(
     torch::Tensor& kvCache, torch::Tensor& indexKCache, torch::Tensor const& outCacheLoc, int64_t numHeadsQ,
     int64_t numHeadsKV, int64_t numHeadsIndex, int64_t headDim, int64_t rotaryDim, double eps,
     torch::Tensor const& qWeight, torch::Tensor const& kWeight, torch::Tensor const& indexQWeight,
-    torch::Tensor const& indexKWeight, torch::Tensor const& rotaryCosSin, torch::Tensor const& positionIds)
+    torch::Tensor const& indexKWeight, torch::Tensor const& rotaryCosSin, torch::Tensor const& positionIds,
+    int64_t indexShardRank)
 {
     constexpr int64_t kHeadDim = 128;
     constexpr int64_t kRotaryDim = 64;
@@ -307,9 +308,11 @@ std::tuple<torch::Tensor, torch::Tensor> minimaxM3Fp8QKVIndexerNormRopeKVInsert(
     TORCH_CHECK(kvCache.size(3) == kPageSize, "MiniMax-M3 horizontal producer requires page_size=128");
     TORCH_CHECK(indexKCache.is_cuda() && indexKCache.scalar_type() == at::ScalarType::Float8_e4m3fn,
         "Index-K cache must be CUDA torch.float8_e4m3fn");
-    TORCH_CHECK(indexKCache.dim() == 4 && indexKCache.size(1) == 1 && indexKCache.size(2) == kPageSize
-            && indexKCache.size(3) == kHeadDim,
-        "Index-K cache must be HND [num_pages, 1, 128, 128]");
+    // Rank r of a TP-sharded index-K cache keeps 128 / W rows per page.
+    TORCH_CHECK(indexKCache.dim() == 4 && indexKCache.size(1) == 1 && indexKCache.size(2) > 0
+            && kPageSize % indexKCache.size(2) == 0 && indexKCache.size(3) == kHeadDim && indexShardRank >= 0
+            && indexShardRank < kPageSize / indexKCache.size(2),
+        "Index-K cache must be HND [num_pages, 1, 128 / W, 128] with index_shard_rank < W");
     TORCH_CHECK(indexKCache.stride(3) == 1 && indexKCache.stride(2) == kHeadDim,
         "Index-K cache must have contiguous token rows");
     TORCH_CHECK(indexKCache.stride(1) >= indexKCache.size(2) * indexKCache.stride(2)
@@ -362,7 +365,7 @@ std::tuple<torch::Tensor, torch::Tensor> minimaxM3Fp8QKVIndexerNormRopeKVInsert(
         static_cast<int>(numHeadsQ), static_cast<int>(numHeadsKV), static_cast<int>(numHeadsIndex),
         static_cast<int>(headDim), static_cast<int>(rotaryDim), epsFloat, qWeight.data_ptr(), kWeight.data_ptr(),
         indexQWeight.data_ptr(), indexKWeight.data_ptr(), rotaryCosSin.data_ptr<float>(), positionIds.data_ptr<int>(),
-        stream);
+        static_cast<int>(indexShardRank), static_cast<int>(kPageSize / indexKCache.size(2)), stream);
     return {qOut, indexQOut};
 }
 
@@ -371,7 +374,7 @@ std::tuple<torch::Tensor, torch::Tensor> minimaxM3Nvfp4QKVIndexerNormRopeKVInser
     torch::Tensor const& outCacheLoc, torch::Tensor const& kvQuantScale, int64_t numHeadsQ, int64_t numHeadsKV,
     int64_t numHeadsIndex, int64_t headDim, int64_t rotaryDim, double eps, torch::Tensor const& qWeight,
     torch::Tensor const& kWeight, torch::Tensor const& indexQWeight, torch::Tensor const& indexKWeight,
-    torch::Tensor const& rotaryCosSin, torch::Tensor const& positionIds)
+    torch::Tensor const& rotaryCosSin, torch::Tensor const& positionIds, int64_t indexShardRank)
 {
     constexpr int64_t kHeadDim = 128;
     constexpr int64_t kRotaryDim = 64;
@@ -403,9 +406,11 @@ std::tuple<torch::Tensor, torch::Tensor> minimaxM3Nvfp4QKVIndexerNormRopeKVInser
     TORCH_CHECK(kvQuantScale.numel() >= 3, "NVFP4 K/V quantization scale must contain [Q, K, V]");
     TORCH_CHECK(indexKCache.is_cuda() && indexKCache.scalar_type() == at::ScalarType::Float8_e4m3fn,
         "Index-K cache must be CUDA torch.float8_e4m3fn");
-    TORCH_CHECK(indexKCache.dim() == 4 && indexKCache.size(1) == 1 && indexKCache.size(2) == kPageSize
-            && indexKCache.size(3) == kHeadDim,
-        "Index-K cache must be HND [num_pages, 1, 128, 128]");
+    // Rank r of a TP-sharded index-K cache keeps 128 / W rows per page.
+    TORCH_CHECK(indexKCache.dim() == 4 && indexKCache.size(1) == 1 && indexKCache.size(2) > 0
+            && kPageSize % indexKCache.size(2) == 0 && indexKCache.size(3) == kHeadDim && indexShardRank >= 0
+            && indexShardRank < kPageSize / indexKCache.size(2),
+        "Index-K cache must be HND [num_pages, 1, 128 / W, 128] with index_shard_rank < W");
     TORCH_CHECK(indexKCache.size(0) == kvDataCache.size(0),
         "Index-K and main NVFP4 caches must contain the same number of pages");
     TORCH_CHECK(indexKCache.stride(3) == 1 && indexKCache.stride(2) == kHeadDim,
@@ -457,7 +462,7 @@ std::tuple<torch::Tensor, torch::Tensor> minimaxM3Nvfp4QKVIndexerNormRopeKVInser
         static_cast<int>(numHeadsKV), static_cast<int>(numHeadsIndex), static_cast<int>(headDim),
         static_cast<int>(rotaryDim), static_cast<float>(eps), qWeight.data_ptr(), kWeight.data_ptr(),
         indexQWeight.data_ptr(), indexKWeight.data_ptr(), rotaryCosSin.data_ptr<float>(), positionIds.data_ptr<int>(),
-        stream);
+        static_cast<int>(indexShardRank), static_cast<int>(kPageSize / indexKCache.size(2)), stream);
     return {qOut, indexQOut};
 }
 
@@ -483,13 +488,13 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "minimax_m3_fp8_qkv_indexer_norm_rope_kv_insert(Tensor packed, Tensor(a!) kv_cache, Tensor(b!) "
         "index_k_cache, Tensor out_cache_loc, int num_heads_q, int num_heads_kv, int num_heads_index, int head_dim, "
         "int rotary_dim, float eps, Tensor q_weight, Tensor k_weight, Tensor index_q_weight, Tensor index_k_weight, "
-        "Tensor rotary_cos_sin, Tensor position_ids) -> (Tensor, Tensor)");
+        "Tensor rotary_cos_sin, Tensor position_ids, int index_shard_rank=0) -> (Tensor, Tensor)");
     m.def(
         "minimax_m3_nvfp4_qkv_indexer_norm_rope_kv_insert(Tensor packed, Tensor(a!) kv_data_cache, Tensor(b!) "
         "kv_scale_cache, Tensor(c!) index_k_cache, Tensor out_cache_loc, Tensor kv_quant_scale, int num_heads_q, "
         "int num_heads_kv, int num_heads_index, int head_dim, int rotary_dim, float eps, Tensor q_weight, Tensor "
-        "k_weight, Tensor index_q_weight, Tensor index_k_weight, Tensor rotary_cos_sin, Tensor position_ids) -> "
-        "(Tensor, Tensor)");
+        "k_weight, Tensor index_q_weight, Tensor index_k_weight, Tensor rotary_cos_sin, Tensor position_ids, int "
+        "index_shard_rank=0) -> (Tensor, Tensor)");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)

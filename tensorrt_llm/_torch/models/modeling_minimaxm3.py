@@ -1176,6 +1176,13 @@ class MiniMaxM3Attention(Attention):
                     use_cute_dsl_blockscaling_mm=old_qkv_proj.use_cute_dsl_blockscaling_mm,
                     replicate_index_q=sparse_runtime_cfg.index_tp_split,
                 )
+                # index_k_tp_shard: rank r of W stores index-K rows r, r + W, ...
+                mapping = self.qkv_proj.mapping
+                self.index_shard_rank, self.index_shard_world = (
+                    (mapping.tp_rank, mapping.tp_size)
+                    if sparse_runtime_cfg.index_k_tp_shard
+                    else (0, 1)
+                )
                 self.sparse_num_index_heads = self.qkv_proj.local_num_index_heads
             else:
                 # Use the same KV-group ownership as the five-way projection.
@@ -1587,10 +1594,10 @@ class MiniMaxM3Attention(Attention):
             index_k_cache.is_cuda
             and index_k_cache.dtype == torch.float8_e4m3fn
             and index_k_cache.dim() == 4
-            and tuple(index_k_cache.shape[1:]) == (1, 128, 128)
+            and tuple(index_k_cache.shape[1:]) == (1, 128 // self.index_shard_world, 128)
             and index_k_cache.stride(3) == 1
             and index_k_cache.stride(2) == 128
-            and index_k_cache.stride(1) >= 128 * 128
+            and index_k_cache.stride(1) >= index_k_cache.shape[2] * 128
             and index_k_cache.stride(0) >= index_k_cache.stride(1)
             and index_k_cache.stride(0) % 4 == 0
             and index_k_cache.stride(1) % 4 == 0
@@ -1631,6 +1638,7 @@ class MiniMaxM3Attention(Attention):
             self.index_k_norm.weight,
             rotary_cos_sin,
             position_ids.reshape(-1).contiguous().to(torch.int32),
+            self.index_shard_rank,
         )
         if layer_uses_nvfp4:
             q, index_q = torch.ops.trtllm.minimax_m3_nvfp4_qkv_indexer_norm_rope_kv_insert(

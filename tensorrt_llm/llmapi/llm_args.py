@@ -1137,6 +1137,14 @@ class MiniMaxM3SparseAttentionConfig(BaseSparseAttentionConfig):
         "attention DP.",
         status="prototype",
     )
+    index_k_tp_shard: bool = Field(
+        default=False,
+        description=
+        "Also shard the index-K cache across the TP ranks: each rank stores "
+        "only its 1/TP of the index-K rows, which frees KV-cache memory. "
+        "Requires index_tp_split; not supported with disaggregated serving.",
+        status="prototype",
+    )
     num_attention_heads: Optional[int] = Field(
         default=None,
         description=
@@ -1183,6 +1191,10 @@ class MiniMaxM3SparseAttentionConfig(BaseSparseAttentionConfig):
         if self.index_tp_split and not self.fuse_qkv_index_projection:
             raise ValueError("MiniMax-M3 index_tp_split=True requires "
                              "fuse_qkv_index_projection=True.")
+        if self.index_k_tp_shard and not self.index_tp_split:
+            raise ValueError(
+                "MiniMax-M3 index_k_tp_shard=True requires index_tp_split=True."
+            )
         return self
 
     def supports_backend(self, backend: str) -> bool:

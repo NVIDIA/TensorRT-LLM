@@ -1558,11 +1558,19 @@ class MiniMaxM3MsaSparseAttention(TrtllmAttention):
                     decode_query_len,
                 )
             idx_q_view = idx_q_view[:, split.heads]
+        kv_indices = metadata.msa_kv_indices
+        if split is not None and idx_k_cache.shape[2] < 128 and (span is None or ctx_rows > 0):
+            # The proxy scores the context rows on full pages, which the ranks'
+            # index-K row shards hold only together.
+            kv_lens = metadata.msa_kv_lens_cpu[: ctx_rows if span is not None else None]
+            num_pages = int(((kv_lens + 127) // 128).sum())
+            idx_k_cache = split.gather(idx_k_cache, kv_indices[:num_pages])
+            kv_indices = torch.arange(num_pages, dtype=torch.int32, device=idx_k_cache.device)
         return self.indexer.select_blocks(
             idx_q_view,
             idx_k_cache,
             idx_sm_scale=idx_sm_scale,
-            kv_indices=metadata.msa_kv_indices,
+            kv_indices=kv_indices,
             qo_lens_cpu=metadata.msa_qo_lens_cpu,
             kv_lens_cpu=metadata.msa_kv_lens_cpu,
             qo_offset_cpu=metadata.msa_qo_offset_cpu,

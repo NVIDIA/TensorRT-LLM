@@ -1429,6 +1429,11 @@
       "path": "sparse_attention_config.index_head_dim"
     },
     {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "sparse_attention_config.index_k_tp_shard"
+    },
+    {
       "capture_policy": "int|none",
       "kind": "value",
       "path": "sparse_attention_config.index_n_heads"

@@ -19,6 +19,7 @@ import triton.language as tl
 
 from tensorrt_llm._dlpack_utils import pack_strided_memory
 from tensorrt_llm._ipc_utils import IpcMemory, can_access_peer
+from tensorrt_llm._torch.distributed import allgather
 from tensorrt_llm._torch.distributed.communicator import Distributed
 from tensorrt_llm.mapping import Mapping
 
@@ -90,7 +91,7 @@ class IndexTpSplit:
             raise RuntimeError(
                 "MiniMax-M3 index_tp_split needs CUDA peer access between the TP ranks."
             )
-        self.rank, self.world = mapping.tp_rank, mapping.tp_size
+        self.mapping, self.rank, self.world = mapping, mapping.tp_rank, mapping.tp_size
         heads = num_heads // self.world
         self.heads = slice(self.rank * heads, (self.rank + 1) * heads)
         n = len(layer_ids)
@@ -123,7 +124,10 @@ class IndexTpSplit:
         recv = self.recv[self.sets[layer_idx]]
         torch.ops.trtllm.cute_dsl_minimax_m3_index_decode_score(
             idx_q,
-            idx_k_cache[:, 0, self.rank :: self.world],
+            # This rank's rows: a sharded page holds only them.
+            idx_k_cache[:, 0]
+            if idx_k_cache.shape[2] < 128
+            else idx_k_cache[:, 0, self.rank :: self.world],
             block_table,
             seq_lens,
             recv.transpose(2, 3),
@@ -142,3 +146,13 @@ class IndexTpSplit:
             BLOCK=512,
             launch_pdl=os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1",
         )
+
+    def gather(self, idx_k_cache, pages):
+        """Full [P, 1, 128, dim] index-K pages from every rank's row shard of `pages` (TP collective).
+
+        `pages` holds this rank's ids of the same logical pages, in the same order on every rank.
+        """
+        rows, dim = idx_k_cache.shape[2:]
+        shards = allgather(idx_k_cache.index_select(0, pages), self.mapping, dim=0)
+        # shards[r * P + p, 0, i] is token i * W + r of page p.
+        return shards.view(self.world, -1, rows, dim).permute(1, 2, 0, 3).reshape(-1, 1, 128, dim)
