@@ -321,10 +321,6 @@ class KVCacheV2Scheduler(RequestScheduler):
             has_chunking,
         ) = self._schedule_loop(active_requests, inflight_request_ids)
 
-        if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
-            with disagg_diagnostics.suppress_diagnostic_errors():
-                self._emit_disagg_kv_pool_snapshot(active_requests, disagg_candidates)
-
         # Sort by LoRA task ID
         scheduled_encoder.sort(key=_get_lora_task_id)
         self._sort_requests(scheduled_ctx, scheduled_gen, has_chunking)
@@ -381,54 +377,6 @@ class KVCacheV2Scheduler(RequestScheduler):
                 # Keep transfer admission and terminal PEFT accounting alive.
                 eligible.append(req)
         return eligible
-
-    def _emit_disagg_kv_pool_snapshot(
-        self,
-        active_requests: RequestList,
-        disagg_candidates: RequestList,
-    ) -> None:
-        """Emit one post-scheduler physical KV-pool snapshot when relevant."""
-        if not disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
-            return
-
-        with disagg_diagnostics.suppress_diagnostic_errors():
-            init_requests = sum(
-                request.is_disagg_generation_init_state for request in active_requests
-            )
-            transfers_in_progress = sum(
-                request.is_disagg_generation_transmission_in_progress for request in active_requests
-            )
-            transfers_complete = sum(
-                request.is_disagg_generation_transmission_complete for request in active_requests
-            )
-            if not (init_requests or transfers_in_progress or transfers_complete):
-                return
-
-            stats = self.kv_cache_manager.get_kv_cache_stats()
-            mapping = self.kv_cache_manager.mapping
-            index_mapper = getattr(self.kv_cache_manager, "index_mapper", None)
-            num_free_slots = getattr(index_mapper, "num_free_slots", None)
-            disagg_diagnostics.emit_event(
-                "gen_kv_pool_snapshot",
-                side="gen",
-                request_id=None,
-                rank=mapping.rank,
-                init_requests=init_requests,
-                transfers_in_progress=transfers_in_progress,
-                transfers_complete=transfers_complete,
-                kv_admitted_this_iteration=len(disagg_candidates),
-                decode_requests=sum(
-                    request.state == LlmRequestState.GENERATION_IN_PROGRESS
-                    for request in active_requests
-                ),
-                kv_pool_max_blocks=stats.max_num_blocks,
-                kv_pool_free_blocks=stats.free_num_blocks,
-                kv_pool_used_blocks=stats.used_num_blocks,
-                index_free_slots=(num_free_slots() if callable(num_free_slots) else None),
-                tp_rank=mapping.tp_rank,
-                pp_rank=mapping.pp_rank,
-                cp_rank=mapping.cp_rank,
-            )
 
     # ---- Main scheduling loop ----
 

@@ -123,8 +123,7 @@ from .resource_manager import (NoFreeSlotsError, ResourceManager,
                                ResourceManagerType, request_context)
 from .sampler import (AsyncWorkerMixin, Sampler, SamplerEvent, SampleState,
                       SampleStateTensors)
-from .scheduler import (KVCacheV2Scheduler, MultimodalScheduler,
-                        RequestScheduler, ScheduledRequests,
+from .scheduler import (RequestScheduler, ScheduledRequests,
                         SerializableSchedulerOutput, WaitingQueue,
                         create_waiting_queue)
 from .scheduler.adp_router import (ADPRouter, RankIterStatsPayload, RankState,
@@ -1098,7 +1097,6 @@ class PyExecutor:
         if kv_cache_transceiver is not None:
             self.hang_detector.register_status_provider(
                 kv_cache_transceiver.get_status_dump)
-        self._emit_disagg_diagnostic_capabilities()
         cache_transceiver_config = getattr(self.llm_args,
                                            "cache_transceiver_config", None)
         max_tokens_in_buffer = getattr(cache_transceiver_config,
@@ -1221,25 +1219,6 @@ class PyExecutor:
         """
         connector = getattr(self, "kv_connector_manager", None)
         return connector is not None and not connector.capacity_only
-
-    def _emit_disagg_diagnostic_capabilities(self) -> None:
-        """Declare this executor's event groups once, before serving requests."""
-        if (not disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED
-                or self.kv_cache_transceiver is None):
-            return
-        with disagg_diagnostics.suppress_diagnostic_errors():
-            scheduler = self.scheduler
-            while isinstance(scheduler, MultimodalScheduler):
-                scheduler = scheduler.scheduler
-            disagg_diagnostics.emit_event(
-                "diagnostic_capabilities",
-                side="runtime",
-                request_id=None,
-                rank=self.global_rank,
-                capability_schema_version=1,
-                executor_events=True,
-                scheduler_kv_admission_events=isinstance(
-                    scheduler, KVCacheV2Scheduler))
 
     def _maybe_init_kv_connector_manager(self):
         if self.kv_connector_manager is not None:

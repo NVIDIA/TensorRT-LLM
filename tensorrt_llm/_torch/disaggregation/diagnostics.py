@@ -19,6 +19,13 @@ GEN workers in one diagnostic launch. Use a new UUID for each launch. An unset
 or invalid value limits analysis to individual process lifetimes. Cross-process
 joins also require an explicit disaggregated request ID; fallback IDs are local
 to an engine and remain process-scoped even with a shared run UUID.
+
+The qualified analysis profile is the native Python transfer path with Scheduler
+V2. Other paths may emit common executor events, but are not assessed as complete
+traces. REQUEST_DATA events identify receiver slices; sender queue/backend events
+identify source slices and carry a separate receiver_slice_id. Native session
+wait deadlines and executor deadlines are distinct observations, not resource-
+retirement deadlines or proof that physical accesses have stopped.
 """
 
 from __future__ import annotations

@@ -651,8 +651,6 @@ def test_gen_first_no_retry_adp_count_seal_waits_for_one_writer_group(
             rank = kwargs["peer_rank"]
             assert kwargs["request_id"] == rid
             assert kwargs["request_id_scope"] == "run"
-            assert kwargs["writer_cohort_known"] is False
-            assert kwargs["expected_writers"] == 2
             assert kwargs["timestamp"] == publication_timestamps[rank]
             assert kwargs["timestamp"][0] < fast_response_timestamps[rank][0]
             publication_order.append(("emit", rank))
@@ -817,8 +815,6 @@ def test_partial_bounced_publication_waits_for_queued_writer_success(
     assert len(request_data_events) == 1
     assert request_data_events[0].kwargs["request_id"] == rid
     assert request_data_events[0].kwargs["peer_rank"] == 0
-    assert request_data_events[0].kwargs["ownership_enabled"] is True
-    assert request_data_events[0].kwargs["writer_cohort_known"] is True
     if not writer_settles_before_failure:
         assert bounce.context is not None
         assert bounce.release_count == 0
@@ -1419,7 +1415,6 @@ def _make_owned_sender() -> transfer_mod.Sender:
     sender._peer_requests_lock = threading.Lock()
     sender._peer_requests = {}
     sender._peer_requests_timestamps = {}
-    sender._peer_requests_ready_timestamps = {}
     sender._pre_cancelled_rids = {}
     sender._shutdown = sender._shutdown_requested = False
     sender._ownership_poisoned, sender._ownership_poison_lock = None, threading.Lock()
@@ -1430,82 +1425,6 @@ def _make_owned_sender() -> transfer_mod.Sender:
     sender._pending_session_quiescence = {}
     sender._send_task_queues = [queue.Queue()]
     return sender
-
-
-@pytest.mark.cpu_only
-@pytest.mark.parametrize("canonical_request_id", [None, 107])
-def test_gen_first_ready_timestamp_survives_until_sender_session_setup(
-    monkeypatch: pytest.MonkeyPatch,
-    canonical_request_id: int | None,
-) -> None:
-    rid = 107
-    received_timestamp = (100, 400)
-    ready_timestamp = (123, 456)
-    sender = _make_owned_sender()
-    sender._registrar = SimpleNamespace(
-        self_rank_info=SimpleNamespace(instance_name="ctx", instance_rank=0),
-        get_peer_rank_info=Mock(return_value=SimpleNamespace(dp_rank=0)),
-        get_peer_overlap=Mock(return_value=SimpleNamespace(ranks=[2])),
-    )
-    info = transfer_mod.RecvReqInfo(
-        sender_req_id=18,
-        instance_name="gen",
-        instance_rank=2,
-        block_ids_per_layer_groups=[],
-        unique_rid=rid,
-        slice_id=0,
-    )
-    capture_timestamp = Mock(side_effect=[received_timestamp, ready_timestamp])
-    emit_event = Mock()
-    monkeypatch.setattr(
-        transfer_mod.disagg_diagnostics,
-        "DISAGG_TRANSFER_DIAGNOSTICS_ENABLED",
-        True,
-    )
-    monkeypatch.setattr(
-        transfer_mod.disagg_diagnostics,
-        "capture_timestamp",
-        capture_timestamp,
-    )
-    monkeypatch.setattr(transfer_mod.disagg_diagnostics, "emit_event", emit_event)
-
-    sender._respond_with_kv(b"receiver", [MessageType.REQUEST_DATA, info.to_bytes()])
-
-    assert sender._sessions == {}
-    assert sender._peer_requests_ready_timestamps[rid] == ready_timestamp
-    received_event = emit_event.call_args_list[0]
-    assert received_event.args == ("ctx_request_data_received",)
-    assert received_event.kwargs["request_id"] == rid
-    assert received_event.kwargs["request_id_scope"] == "unknown"
-    assert received_event.kwargs["timestamp"] == received_timestamp
-    tx_session = SimpleNamespace(
-        disagg_request_id=rid,
-        request_id=19,
-        lock=threading.Lock(),
-        receiver_ready=False,
-        _base_args=SimpleNamespace(
-            params=DisaggregatedParams(disagg_request_id=canonical_request_id)
-        ),
-    )
-
-    sender.setup_session(tx_session)
-
-    assert tx_session.receiver_ready
-    assert capture_timestamp.call_count == 2
-    ready_events = [
-        call for call in emit_event.call_args_list if call.args == ("ctx_all_receivers_ready",)
-    ]
-    assert len(ready_events) == 1
-    assert ready_events[0].kwargs["timestamp"] == ready_timestamp
-    assert ready_events[0].kwargs["request_id"] == rid
-    assert ready_events[0].kwargs["request_id_scope"] == (
-        "run" if canonical_request_id is not None else "process"
-    )
-
-    sender.clear_session(rid)
-
-    assert rid not in sender._peer_requests
-    assert rid not in sender._peer_requests_ready_timestamps
 
 
 @pytest.mark.cpu_only
@@ -1557,8 +1476,10 @@ def test_kv_payload_snapshot_is_shared_and_survives_same_peer_redispatch(
         get_kv_map=Mock(return_value=SimpleNamespace(map=Mock(return_value=regions))),
     )
     sizes = Mock(size=2)
-    sizes.sum.side_effect = [0x180, 0x300]
-    monkeypatch.setattr(transfer_mod.np, "repeat", Mock(return_value=sizes))
+    sizes.sum.return_value = 0x180
+    next_sizes = Mock(size=2)
+    next_sizes.sum.return_value = 0x300
+    monkeypatch.setattr(transfer_mod.np, "repeat", Mock(side_effect=[sizes, next_sizes]))
     monkeypatch.setattr(transfer_mod.perf_log_manager, "_perf_enabled", perf_enabled)
     perf_log = Mock()
     monkeypatch.setattr(transfer_mod.perf_log_manager, "log_task_perf", perf_log)
@@ -1618,8 +1539,11 @@ def test_kv_payload_snapshot_is_shared_and_survives_same_peer_redispatch(
     sender._process_task_queue(0)
 
     result = transfer_mod._KV_RESULT_PREFIX.unpack(dealer.send.call_args.args[0][1])
-    assert result[5] == (0x180 if perf_enabled else 0)
-    assert sizes.sum.call_count == (2 if measured else 0)
+    # Successful wire reports attest the completed descriptor's bytes even
+    # when neither diagnostics nor performance logging is enabled.
+    assert result[5] == 0x180
+    assert sizes.sum.call_count == 1 + int(measured)
+    assert next_sizes.sum.call_count == int(measured)
     assert task.status == transfer_mod.TaskStatus.TRANSFERRED
     assert perf_log.call_count == int(perf_enabled)
     if diagnostics_enabled:
@@ -2029,7 +1953,7 @@ def test_late_request_data_to_terminal_sender_settles_aux(
         unique_rid=rid,
     )
     sender = _make_owned_sender()
-    sender._save_peer_req_info = Mock(return_value=(False, None))
+    sender._save_peer_req_info = Mock()
     sender._send_failed_result_to_receiver = Mock()
     session = SimpleNamespace(
         lock=threading.Lock(),

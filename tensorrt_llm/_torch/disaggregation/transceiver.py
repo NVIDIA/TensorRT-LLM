@@ -947,7 +947,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         session: Optional[object],
         outcome: str,
     ) -> None:
-        """Report a transfer only after its session has been physically retired."""
+        """Report the caller-proven retirement without polling lifecycle state."""
         with disagg_diagnostics.suppress_diagnostic_errors():
             request_id_scope = "unknown"
             if req is not None:
@@ -969,8 +969,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 rank=self._mapping.rank,
                 instance=self._instance_name,
                 outcome=outcome,
-                session_status=(session.status.value if session is not None else None),
-                resources_drained=(session is None or not session.has_transferring_tasks()),
+                resources_drained=True,
                 tp_rank=self._mapping.tp_rank,
                 pp_rank=self._mapping.pp_rank,
                 cp_rank=self._mapping.cp_rank,
@@ -1403,16 +1402,18 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             if diagnostic_session is not None:
                 self._emit_transfer_settled("ctx", rid, req, diagnostic_session, "completed")
 
-        failed_records = []
+        failed_records = None
         if diagnostics_enabled:
             with disagg_diagnostics.suppress_diagnostic_errors():
+                failed_records = []
                 for rid in failed:
                     session = self._send_sessions.get(rid)
                     if session is not None:
                         failed_records.append((rid, self._send_reqs.get(rid), session))
         self._close_failed_sessions(self._send_sessions, self._send_reqs, failed, mark_retired=True)
-        for rid, req, session in failed_records:
-            self._emit_transfer_settled("ctx", rid, req, session, "failed")
+        if failed_records:
+            for rid, req, session in failed_records:
+                self._emit_transfer_settled("ctx", rid, req, session, "failed")
 
         # Sweep orphaned RecvReqInfo entries from ADP broadcast on non-assigned
         # DP ranks (entries that will never have a TxSession created for them).
@@ -1533,16 +1534,18 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 f"Disagg gen transfer FAILED rank={self._dist.rank} "
                 f"rids={failed} gen_need_sync={self._gen_need_sync}"
             )
-        failed_records = []
+        failed_records = None
         if diagnostics_enabled:
             with disagg_diagnostics.suppress_diagnostic_errors():
+                failed_records = []
                 for rid in failed:
                     session = self._recv_sessions.get(rid)
                     if session is not None:
                         failed_records.append((rid, self._recv_reqs.get(rid), session))
         self._close_failed_sessions(self._recv_sessions, self._recv_reqs, failed)
-        for rid, req, session in failed_records:
-            self._emit_transfer_settled("gen", rid, req, session, "failed")
+        if failed_records:
+            for rid, req, session in failed_records:
+                self._emit_transfer_settled("gen", rid, req, session, "failed")
 
         return GenTransferStatus(completed, failed, cancelled_reqs)
 
@@ -1640,7 +1643,6 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                         side=side,
                         dist=self._mapping,
                         instance=self._instance_name,
-                        session_status=sessions[rid].status.value,
                         dp_rank=self._dp_rank,
                     )
 
