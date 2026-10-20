@@ -219,8 +219,9 @@ def test_disagg_preprocess_keeps_processor_params_and_mrope(monkeypatch, deepsta
     assert params.multimodal_data["mrope_config"]["mrope_position_deltas"] is mrope_deltas
     cumsum = params.multimodal_data["multimodal_embed_mask_cumsum"]
     assert cumsum.device.type == "cpu"
+    # Only video embedding positions advance the mask; framing and text do not.
+    assert cumsum.tolist() == [0, 0, 1, 2, 3, 3, 3]
     assert cumsum.numel() == len(tokens)
-    assert cumsum[-1].item() == 3
     assert params.encoder_state is None
     assert params.encoder_event is None
 
@@ -267,7 +268,7 @@ def test_external_embeddings_reuse_common_item_metadata(model):
     )
     params = MultimodalParams(multimodal_data=extra["multimodal_data"])
 
-    assert len(tokens) == 16
+    assert tokens == [11, *([_IMAGE_TOKEN_ID] * 4), 12, *([_IMAGE_TOKEN_ID] * 9), 13]
     assert params.get_item_layout() == ((("image", 0), ("image", 1)), (4, 9))
     assert params.multimodal_data["multimodal_embedding"] is embeddings
     assert params.multimodal_data["mrope_config"] is mrope_config
