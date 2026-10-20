@@ -256,8 +256,8 @@ __device__ void local_histogram_pass(int const* routes, int* partial, int route_
     int const begin = cta_begin + warp * warp_span;
     int const end = imin(cta_end, begin + warp_span);
     /* Issue a small load group before consuming it to expose memory-level
-     * parallelism. The binning is unchanged, and atomicAdd regrouping is
-     * safe because integer addition commutes. */
+     * parallelism. Batching does not change which bin a route lands in, and
+     * atomicAdd order does not matter because integer addition commutes. */
     constexpr int kBatch = 4;
     for (int base_index = begin; base_index < end; base_index += 32 * kBatch)
     {

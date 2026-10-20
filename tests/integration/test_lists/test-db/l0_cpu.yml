@@ -53,7 +53,6 @@ l0_cpu:
   # contributes only the marked files under attention/, in these sub-trees or elsewhere.
   - unittest/_torch/attention
   - unittest/_torch/cute_dsl/test_kimi_k3_kda_ptx_patch.py
-  - unittest/_torch/moe/test_megamoe_shared_fc12_autotune.py
   - unittest/_torch/compilation/test_auto_multi_stream.py
   - unittest/_torch/compilation/test_phase_selective_forward.py
   - unittest/_torch/compilation/test_remove_copy_pass.py::test_remove_copy_preserves_minimax_producer_outputs
