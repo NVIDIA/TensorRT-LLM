@@ -612,3 +612,103 @@ def test_terminate_request_defers_free_while_transfer_holds_a_claim():
     executor.async_transfer_manager.requests_in_transfer.return_value = {}
     PyExecutor._terminate_request(executor, request)
     executor._do_terminate_request.assert_called_once_with(request)
+
+
+# ---------------------------------------------------------------------------
+# TP-wide forward-failure agreement (_agree_on_forward_failure)
+# ---------------------------------------------------------------------------
+
+
+def _agreeing_executor(tp_size=2, enable_attention_dp=False):
+    """Executor shell exposing only what _agree_on_forward_failure touches."""
+    executor = object.__new__(PyExecutor)
+    executor.dist = Mock(tp_size=tp_size, world_size=tp_size)
+    executor.enable_attention_dp = enable_attention_dp
+    executor._handle_errors = Mock()
+    return executor
+
+
+def test_agreement_is_skipped_without_tp():
+    executor = _agreeing_executor(tp_size=1)
+    outputs = {"logits": object()}
+    assert PyExecutor._agree_on_forward_failure(executor, outputs) is outputs
+    executor.dist.tp_allgather.assert_not_called()
+
+
+def test_agreement_is_skipped_under_attention_dp():
+    """ADP has its own symmetry handling (buffered responses + synced flush)."""
+    executor = _agreeing_executor(enable_attention_dp=True)
+    outputs = {"logits": object()}
+    assert PyExecutor._agree_on_forward_failure(executor, outputs) is outputs
+    executor.dist.tp_allgather.assert_not_called()
+
+
+def test_agreement_failing_rank_broadcasts_its_error():
+    """The failing rank contributes its message so rank 0 can emit responses."""
+    executor = _agreeing_executor()
+    executor._last_forward_error_msg = "boom on rank 1"
+    executor.dist.tp_allgather.return_value = [None, "boom on rank 1"]
+
+    assert PyExecutor._agree_on_forward_failure(executor, None) is None
+
+    executor.dist.tp_allgather.assert_called_once_with("boom on rank 1", small_payload=True)
+    # _forward_step already ran _handle_errors on this rank.
+    executor._handle_errors.assert_not_called()
+
+
+def test_agreement_healthy_rank_joins_peer_failure():
+    executor = _agreeing_executor()
+    executor.dist.tp_allgather.return_value = [None, "boom on rank 1"]
+
+    result = PyExecutor._agree_on_forward_failure(executor, {"logits": object()})
+
+    assert result is None
+    executor.dist.tp_allgather.assert_called_once_with(None, small_payload=True)
+    executor._handle_errors.assert_called_once_with("TP peer forward failure: boom on rank 1")
+
+
+def test_agreement_passes_through_a_healthy_iteration():
+    executor = _agreeing_executor()
+    executor.dist.tp_allgather.return_value = [None, None]
+    outputs = {"logits": object()}
+
+    assert PyExecutor._agree_on_forward_failure(executor, outputs) is outputs
+    executor._handle_errors.assert_not_called()
+
+
+def _tp_loop_executor(monkeypatch):
+    """Loop executor under plain TP=2 whose healthy forward meets a peer failure."""
+    executor = _loop_executor(monkeypatch)
+    executor.dist = Mock(tp_size=2, world_size=2)
+    executor.dist.tp_allgather.return_value = [None, "peer forward failure"]
+    executor._forward_step = Mock(return_value={"logits": Mock()})
+    executor._handle_errors = Mock()
+    return executor
+
+
+def test_executor_loop_joins_tp_peer_failure(monkeypatch):
+    """The non-overlap loop joins a TP peer's reported forward failure."""
+    executor = _tp_loop_executor(monkeypatch)
+
+    PyExecutor._executor_loop(executor)
+
+    executor._forward_step.assert_called_once()
+    executor.dist.tp_allgather.assert_called_once()
+    executor._handle_errors.assert_called_once_with("TP peer forward failure: peer forward failure")
+    executor._sample_async.assert_not_called()
+    executor._update_request_states.assert_not_called()
+    assert executor._event_loop_completed
+
+
+def test_executor_loop_overlap_joins_tp_peer_failure(monkeypatch):
+    """The overlap loop joins a TP peer's failure, dropping the previous batch."""
+    executor = _tp_loop_executor(monkeypatch)
+
+    PyExecutor._executor_loop_overlap(executor)
+
+    executor._forward_step.assert_called_once()
+    executor.dist.tp_allgather.assert_called_once()
+    executor._handle_errors.assert_called_once_with("TP peer forward failure: peer forward failure")
+    executor._sample_async.assert_not_called()
+    assert executor.previous_batch is None
+    assert executor._event_loop_completed

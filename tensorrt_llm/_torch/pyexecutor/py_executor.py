@@ -5395,6 +5395,11 @@ class PyExecutor:
                                 self.dwdp_manager.prefetch_first_layers()
                             batch_outputs = self._forward_step(scheduled_batch)
 
+                        # Under plain TP, agree with peers on whether any
+                        # rank's forward failed before acting on the result.
+                        batch_outputs = self._agree_on_forward_failure(
+                            batch_outputs)
+
                         # None: _forward_step hit an exception and
                         # _handle_errors already failed the affected requests
                         # and enqueued their error responses. Skip this
@@ -6344,6 +6349,11 @@ class PyExecutor:
                         with self._step_scope(scheduled_batch):
                             batch_outputs = self._forward_step(
                                 scheduled_batch, previous_tensors_device)
+
+                    # Under plain TP, agree with peers on whether any rank's
+                    # forward failed before acting on the result.
+                    batch_outputs = self._agree_on_forward_failure(
+                        batch_outputs)
 
                     if batch_outputs is None:
                         # _forward_step hit an exception; _handle_errors
@@ -9003,8 +9013,52 @@ class PyExecutor:
                 # unblock peers without another connector collective. TP1 has
                 # no peers and retains its unsafe executor until process exit.
                 self._kv_connector_fail(error_msg)
+            # Kept for _agree_on_forward_failure, which forwards the message
+            # to healthy TP peers so rank 0 can emit the client responses.
+            self._last_forward_error_msg = error_msg
             self._handle_errors(error_msg)
             return None
+
+    def _agree_on_forward_failure(self, batch_outputs):
+        """Reach TP-wide agreement on a survivable forward failure.
+
+        Under plain TP (no attention DP) every rank runs the same batch,
+        rank 0 schedules and broadcasts the schedule, and only rank 0
+        enqueues responses. A forward exception handled on one rank alone
+        therefore desynchronizes the group: the failing rank frees its
+        requests while rank 0 keeps scheduling them, and a non-zero failing
+        rank's error responses never reach the client. Every rank enters
+        this allgather once per forward step; if any rank failed, the
+        healthy ranks join the failure so the whole group takes the
+        survival path together (and the per-rank error budgets stay in
+        lockstep, keeping the fatal classification rank-uniform).
+
+        Collectives pair by call order, so on the gated path this gather is
+        unconditional per forward step. A failure raised inside the model
+        forward while peers are blocked in one of its collectives cannot be
+        recovered by this agreement (those peers never return to enter it);
+        that class still ends in the fatal/hang-detector path, as before.
+
+        Returns batch_outputs, or None when the group agreed on a failure.
+        """
+        if self.dist.tp_size == 1 or self.enable_attention_dp:
+            return batch_outputs
+        local_error = None
+        if batch_outputs is None:
+            local_error = (getattr(self, "_last_forward_error_msg", None)
+                           or "forward failure on a TP peer")
+        gathered = self.dist.tp_allgather(local_error, small_payload=True)
+        if batch_outputs is None:
+            # This rank failed; _forward_step already ran _handle_errors.
+            return None
+        peer_error = next((e for e in gathered if e is not None), None)
+        if peer_error is None:
+            return batch_outputs
+        logger.error(
+            "A TP peer hit a survivable forward failure; joining it to keep "
+            f"the group aligned: {peer_error}")
+        self._handle_errors(f"TP peer forward failure: {peer_error}")
+        return None
 
     def _update_generation_requests_that_will_complete_next_iteration(
             self, generation_requests: list[LlmRequest]):
