@@ -94,6 +94,7 @@ def route(
     mapping: Any,
     compute_capability: Tuple[int, int],
     spec_config: Optional[Any],
+    kv_cache_quant_algo: Optional[Any],
 ) -> type:
     """Return the target class for this deployment, or raise ``NoTarget`` saying why none fits.
 
