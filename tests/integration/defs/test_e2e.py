@@ -39,6 +39,7 @@ _MINIMAX_M3_EVAL_CONFIG = {
     # This is required for minimax M3.
     "sparse_attention_config": {
         "algorithm": "minimax_m3",
+        "implementation": "msa",
     },
     # The below are to prevent OOMs in CI - the model's 1M context length is too large.
     "kv_cache_config": {
