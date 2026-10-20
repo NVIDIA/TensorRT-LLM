@@ -25,6 +25,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import aiohttp
 import pytest
 
+from tensorrt_llm.inputs import media_io as media_io_module
 from tensorrt_llm.inputs.media_io import (
     _MAX_REDIRECTS,
     MediaFetchError,
@@ -386,6 +387,35 @@ class TestSafeRequestGet:
 class TestSafeAiohttpGet:
     def _run(self, coro):
         return asyncio.run(coro)
+
+    def test_shared_session_uses_validating_resolver(self):
+        async def check():
+            session = await media_io_module._get_aiohttp_session()
+            try:
+                assert isinstance(session.connector._resolver, _ValidatingResolver)
+            finally:
+                await session.close()
+                media_io_module._global_aiohttp_session = None
+                media_io_module._global_aiohttp_session_loop = None
+
+        self._run(check())
+
+    def test_shared_session_is_recreated_for_a_new_event_loop(self):
+        async def get_session():
+            return await media_io_module._get_aiohttp_session()
+
+        first = self._run(get_session())
+        second = None
+        try:
+            second = self._run(get_session())
+            assert second is not first
+            assert first.closed
+        finally:
+            session = second or first
+            if not session.closed:
+                self._run(session.close())
+            media_io_module._global_aiohttp_session = None
+            media_io_module._global_aiohttp_session_loop = None
 
     @patch("tensorrt_llm.inputs.media_io.socket.getaddrinfo", return_value=PUBLIC_DNS)
     def test_maps_timeout_to_fetch_error(self, _):
