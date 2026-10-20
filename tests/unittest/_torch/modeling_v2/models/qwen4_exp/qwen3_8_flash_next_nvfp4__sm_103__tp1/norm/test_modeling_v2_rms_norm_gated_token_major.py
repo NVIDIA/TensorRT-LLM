@@ -177,3 +177,12 @@ def test_rejects_z_that_does_not_cover_x() -> None:
         op(x, z[:, :7, :].contiguous(), weight, eps, None, act)
     with pytest.raises(ValueError, match="not enough values to unpack"):
         op(x, z.reshape(32, 128), weight, eps, None, act)
+
+
+def test_prefill_launch_rejects_z_that_does_not_cover_x() -> None:
+    """From 32768 rows the op runs its own multi-row launch; a `z` one token short
+    still reaches the registered op's check instead of being read past its end."""
+    x, z, weight, eps, _, act = _build(dict(op.CELLS[1].spec, tokens=683), seed=12)
+    assert x.shape[0] >= 32768, x.shape
+    with pytest.raises(AssertionError, match="does not match x shape"):
+        op(x, z[:-1], weight, eps, None, act)

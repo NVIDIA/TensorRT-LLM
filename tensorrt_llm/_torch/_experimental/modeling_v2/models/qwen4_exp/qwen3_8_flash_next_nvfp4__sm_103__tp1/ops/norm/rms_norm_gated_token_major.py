@@ -29,9 +29,12 @@ _PREFILL_ROWS = 8
 
 
 def _prefill_multirow(x: torch.Tensor, z: torch.Tensor, gate_activation: str) -> bool:
+    # A `z` that does not cover `x` goes to the registered op, which rejects it.
     n = x.shape[-1]
     return (
         x.shape[0] >= _PREFILL_MIN_ROWS
+        and x.shape[0] == z.shape[0] * z.shape[1]
+        and z.shape[2] == n
         and x.stride(-1) == 1
         and z.stride(2) == 1
         and z.stride(1) == n
