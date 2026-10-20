@@ -236,6 +236,25 @@ class DisaggTransferCoordinator:
             self._cancel_timed_out_gen_transfers()
             self._check_gen_transfer_errors_consensus()
 
+    def _describe_transfer_timeout(self, request: LlmRequest) -> str:
+        """Get optional native progress only when an existing deadline expires.
+
+        Args:
+            request: Request whose executor timeout is being reported.
+
+        Returns:
+            Owner and observation-time progress, without changing timeout policy.
+        """
+        owner = "deadline_owner=executor_request"
+        describe = getattr(self._transceiver, "_describe_transfer_timeout", None)
+        if not callable(describe):
+            return f"{owner} progress_at_observation=unavailable(transceiver)"
+        try:
+            progress = describe(request)
+        except Exception:  # noqa: BLE001 - reporting must not prevent timeout handling
+            return f"{owner} progress_at_observation=unavailable(snapshot_failed)"
+        return f"{owner} {progress}"
+
     @nvtx_range("check_transfer_timeouts")
     def check_transfer_timeouts(self, only_with_context_sends: bool = False) -> None:
         """Flag transfers that exceeded ``kv_transfer_timeout_ms``.
@@ -262,7 +281,8 @@ class DisaggTransferCoordinator:
                 logger.warning(
                     f"{verb} {kind} request {req.py_request_id} due to KV cache "
                     f"transfer timeout: elapsed {elapsed_ms:.0f}ms > "
-                    f"kv_transfer_timeout_ms={timeout_ms}ms"
+                    f"kv_transfer_timeout_ms={timeout_ms}ms; "
+                    f"{self._describe_transfer_timeout(req)}"
                 )
                 req.py_kv_transfer_timed_out = True
 
@@ -732,7 +752,8 @@ class DisaggTransferCoordinator:
             if elapsed_ms > timeout_ms and not request.py_kv_transfer_timed_out:
                 logger.warning(
                     f"Requesting cancellation for generation request "
-                    f"{request.py_request_id} due to KV cache transfer timeout"
+                    f"{request.py_request_id} due to KV cache transfer timeout; "
+                    f"{self._describe_transfer_timeout(request)}"
                 )
                 request.py_kv_transfer_timed_out = True
 
