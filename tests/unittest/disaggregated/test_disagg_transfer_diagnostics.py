@@ -359,7 +359,7 @@ def test_sink_records_validated_run_identity(
     )
     # Leak detection runs before fixture teardown, so stop the writer in the test body.
     with closing(diagnostics._get_sink(os.getpid())) as sink:
-        sink.submit({"event": "diagnostic_capabilities", "request_id": None})
+        sink.submit({"event": "diagnostic_profile", "request_id": None})
         sink.flush()
 
     assert not sink._thread.is_alive()
@@ -390,7 +390,7 @@ def test_event_identity_is_cached_and_cannot_be_overridden(monkeypatch: pytest.M
             diagnostics, "os", SimpleNamespace(getpid=os.getpid, getenv=unexpected_call)
         )
 
-        for event in ("diagnostic_capabilities", "ctx_send_ready"):
+        for event in ("diagnostic_profile", "ctx_send_ready"):
             diagnostics.emit_event(
                 event,
                 side="ctx",

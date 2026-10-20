@@ -574,9 +574,6 @@ class Sender(SenderBase):
         self._retirement_watchdog = retirement_watchdog
         self._peer_requests: dict = {}
         self._peer_requests_timestamps: dict[int, float] = {}  # unique_rid -> insert time
-        self._peer_requests_ready_timestamps: dict[
-            int, Optional[disagg_diagnostics.DiagnosticTimestamp]
-        ] = {}
         self._peer_requests_lock = threading.Lock()
         self._messenger = ZMQMessenger(mode="ROUTER")
         self._dealers = {}  # used by listener thread only (single-threaded path)
@@ -640,24 +637,6 @@ class Sender(SenderBase):
                 return False
             return len(requests) == expected_count
 
-    def _get_req_ready_state(
-        self, unique_rid: int, expected_count: int
-    ) -> tuple[bool, Optional[disagg_diagnostics.DiagnosticTimestamp]]:
-        """Return readiness and preserve the timestamp of its first observation."""
-        with self._peer_requests_lock:
-            requests = self._peer_requests.get(unique_rid)
-            ready = bool(requests) and len(requests) == expected_count
-            if not ready or not disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
-                return ready, None
-            if unique_rid not in self._peer_requests_ready_timestamps:
-                ready_timestamp = None
-                with disagg_diagnostics.suppress_diagnostic_errors():
-                    ready_timestamp = disagg_diagnostics.capture_timestamp()
-                self._peer_requests_ready_timestamps[unique_rid] = ready_timestamp
-            else:
-                ready_timestamp = self._peer_requests_ready_timestamps[unique_rid]
-            return True, ready_timestamp
-
     def _get_req_info(self, unique_rid: Optional[int]) -> Optional[dict]:
         with self._peer_requests_lock:
             return self._peer_requests.get(unique_rid)
@@ -673,7 +652,6 @@ class Sender(SenderBase):
         with self._peer_requests_lock:
             self._peer_requests.pop(unique_rid, None)
             self._peer_requests_timestamps.pop(unique_rid, None)
-            self._peer_requests_ready_timestamps.pop(unique_rid, None)
 
     def sweep_stale_req_infos(self):
         """Evict RecvReqInfo entries that have no matching TxSession and exceed the TTL.
@@ -696,7 +674,6 @@ class Sender(SenderBase):
                 if rid not in self._sessions and rid in self._peer_requests:
                     self._peer_requests.pop(rid, None)
                     self._peer_requests_timestamps.pop(rid, None)
-                    self._peer_requests_ready_timestamps.pop(rid, None)
                     logger.debug(f"Swept stale RecvReqInfo for rid={rid}")
 
     def setup_session(self, tx_session: "TxSession"):
@@ -749,31 +726,9 @@ class Sender(SenderBase):
                 req_info.instance_name, req_info.instance_rank
             )
             expected_count = len(self._registrar.get_peer_overlap(peer_ri, peer_ri.dp_rank).ranks)
-            ready, ready_timestamp = self._get_req_ready_state(unique_rid, expected_count)
-            if ready:
-                became_ready = False
+            if self._is_req_ready(unique_rid, expected_count):
                 with tx_session.lock:
-                    if not tx_session.receiver_ready:
-                        tx_session.receiver_ready = True
-                        became_ready = True
-                if (
-                    became_ready
-                    and ready_timestamp is not None
-                    and disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED
-                ):
-                    with disagg_diagnostics.suppress_diagnostic_errors():
-                        disagg_diagnostics.emit_event(
-                            "ctx_all_receivers_ready",
-                            side="ctx",
-                            request_id=unique_rid,
-                            request_id_scope=disagg_diagnostics.get_request_id_scope(
-                                tx_session._base_args.params
-                            ),
-                            local_request_id=tx_session.request_id,
-                            rank_info=self._registrar.self_rank_info,
-                            expected_receivers=expected_count,
-                            timestamp=ready_timestamp,
-                        )
+                    tx_session.receiver_ready = True
         return
 
     def _get_session(self, unique_rid: Optional[int]) -> Optional["TxSession"]:
@@ -1865,7 +1820,7 @@ class Sender(SenderBase):
                     terminal = True
                     include_aux = bool(session._claim_unsubmitted_aux_failures_locked((info,)))
                 else:
-                    became_ready, ready_timestamp = self._save_peer_req_info(info)
+                    self._save_peer_req_info(info)
                     tasks = list(session.kv_tasks)
                     terminal = session.has_failed()
                     include_aux = terminal and bool(
@@ -1877,28 +1832,6 @@ class Sender(SenderBase):
             if terminal:
                 self._send_failed_result_to_receiver(info, include_aux=include_aux)
                 return
-        if (
-            became_ready
-            and ready_timestamp is not None
-            and disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED
-        ):
-            with disagg_diagnostics.suppress_diagnostic_errors():
-                peer_ri = self._registrar.get_peer_rank_info(info.instance_name, info.instance_rank)
-                expected_transfers = len(
-                    self._registrar.get_peer_overlap(peer_ri, peer_ri.dp_rank).ranks
-                )
-                disagg_diagnostics.emit_event(
-                    "ctx_all_receivers_ready",
-                    side="ctx",
-                    request_id=info.unique_rid,
-                    request_id_scope=disagg_diagnostics.get_request_id_scope(
-                        session._base_args.params
-                    ),
-                    local_request_id=session.request_id,
-                    rank_info=self._registrar.self_rank_info,
-                    expected_receivers=expected_transfers,
-                    timestamp=ready_timestamp,
-                )
         for task in tasks:
             self._dispatch_task_to_peer(task, info)
 
@@ -2031,21 +1964,15 @@ class Sender(SenderBase):
             self._dealers[endpoint] = ZMQMessenger(mode="DEALER", endpoint=endpoint)
         return self._dealers[endpoint]
 
-    def _save_peer_req_info(
-        self, peer_transfer_req_info: RecvReqInfo
-    ) -> tuple[bool, Optional[disagg_diagnostics.DiagnosticTimestamp]]:
+    def _save_peer_req_info(self, peer_transfer_req_info: RecvReqInfo):
         req_info = peer_transfer_req_info
         self._add_req_info(req_info.unique_rid, req_info.instance_rank, req_info)
         peer_ri = self._registrar.get_peer_rank_info(req_info.instance_name, req_info.instance_rank)
         expected_transfers = len(self._registrar.get_peer_overlap(peer_ri, peer_ri.dp_rank).ranks)
-        became_ready = False
-        ready, ready_timestamp = self._get_req_ready_state(req_info.unique_rid, expected_transfers)
-        if ready:
+        if self._is_req_ready(req_info.unique_rid, expected_transfers):
             session = self._get_session(req_info.unique_rid)
             if session is not None and not session.receiver_ready:
                 session.receiver_ready = True
-                became_ready = True
-        return became_ready, ready_timestamp
 
     def has_all_peer_req_infos(self, unique_rid: int) -> bool:
         req_info = self._get_first_req_info(unique_rid)
@@ -2248,6 +2175,35 @@ class TxSession(TxSessionBase):
             return SessionStatus.TRANSFERRING
         return SessionStatus.READY if self.receiver_ready else SessionStatus.INIT
 
+    def _emit_deadline_event(self, event: str, timer_start_s: float | None = None) -> None:
+        """Observe the native wait deadline without changing its policy.
+
+        Args:
+            event: Deadline-creation or expiry-observation event name.
+            timer_start_s: Existing monotonic clock reading that anchored the deadline.
+        """
+        with disagg_diagnostics.suppress_diagnostic_errors():
+            deadline = self._deadline_monotonic_s
+            if deadline is None:
+                return
+            timeout_s = self._overall_timeout_s
+            if timeout_s is None or timeout_s <= 0:
+                timeout_s = _FALLBACK_TX_OVERALL_TIMEOUT_S
+            disagg_diagnostics.emit_event(
+                event,
+                side="ctx",
+                request_id=self.disagg_request_id,
+                request_id_scope=disagg_diagnostics.get_request_id_scope(self._base_args.params),
+                local_request_id=self.request_id,
+                rank_info=self._sender._registrar.self_rank_info,
+                timeout_owner="native_tx_session",
+                timer_start_monotonic_ns=(
+                    int(timer_start_s * 1_000_000_000) if timer_start_s is not None else None
+                ),
+                deadline_monotonic_ns=int(deadline * 1_000_000_000),
+                timeout_ms=timeout_s * 1000,
+            )
+
     def send(self, chunk: Chunk) -> None:
         if self.transfer_start_time is None:
             self.transfer_start_time = tensorrt_llm.bindings.global_steady_clock_now()
@@ -2258,7 +2214,10 @@ class TxSession(TxSessionBase):
                 overall_timeout_s = self._overall_timeout_s
                 if overall_timeout_s is None or overall_timeout_s <= 0:
                     overall_timeout_s = _FALLBACK_TX_OVERALL_TIMEOUT_S
-                self._deadline_monotonic_s = time.monotonic() + overall_timeout_s
+                timeout_start = time.monotonic()
+                self._deadline_monotonic_s = timeout_start + overall_timeout_s
+                if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
+                    self._emit_deadline_event("ctx_native_deadline_started", timeout_start)
             params = self._base_args.params
             slice_id = len(self.kv_tasks)
             task = KVSendTask(
@@ -2483,7 +2442,10 @@ class TxSession(TxSessionBase):
                 overall_timeout_s = _FALLBACK_TX_OVERALL_TIMEOUT_S
             with self.lock:
                 if self._deadline_monotonic_s is None:
-                    self._deadline_monotonic_s = time.monotonic() + overall_timeout_s
+                    timeout_start = time.monotonic()
+                    self._deadline_monotonic_s = timeout_start + overall_timeout_s
+                    if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
+                        self._emit_deadline_event("ctx_native_deadline_started", timeout_start)
 
         # ``_timeout_s`` bounds one scheduler wait slice. The separate absolute
         # deadline is shared by every KV task and aux; it is never reset by a
@@ -2516,6 +2478,8 @@ class TxSession(TxSessionBase):
                                 if self.has_failed()
                                 else WaitResult.COMPLETED
                             )
+                        if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
+                            self._emit_deadline_event("ctx_native_deadline_observed")
                         return WaitResult.TIMEOUT
                 timeout_s = wait_slice_s if remaining_s is None else min(wait_slice_s, remaining_s)
                 task.wait(timeout=timeout_s)
@@ -3125,11 +3089,6 @@ class Receiver(ReceiverBase):
                             rank_info=self._registrar.self_rank_info,
                             slice_id=receiver_req.slice_id,
                             peer_rank=rank,
-                            expected_writers=task.expected_transfers,
-                            writer_cohort_known=(
-                                sender_dp_rank is not None or peer_infos.dp_size == 1
-                            ),
-                            ownership_enabled=False,
                             timestamp=send_timestamp,
                         )
             return
@@ -3197,11 +3156,6 @@ class Receiver(ReceiverBase):
                             rank_info=self._registrar.self_rank_info,
                             slice_id=receiver_req.slice_id,
                             peer_rank=rank,
-                            expected_writers=task.expected_transfers,
-                            writer_cohort_known=(
-                                sender_dp_rank is not None or peer_infos.dp_size == 1
-                            ),
-                            ownership_enabled=True,
                             timestamp=send_timestamp,
                         )
         return
@@ -4480,6 +4434,15 @@ class TransferWorker:
         self._setup_transfer_engine()
         if self._retirement_watchdog is not None:
             self._retirement_watchdog.start()
+        if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
+            with disagg_diagnostics.suppress_diagnostic_errors():
+                disagg_diagnostics.emit_event(
+                    "diagnostic_profile",
+                    side="runtime",
+                    request_id=None,
+                    rank_info=self._rank_info,
+                    profile="native_v1",
+                )
 
     def _on_quiescence_fatal(self, event: QuiescenceFatalEvent) -> None:
         """Forward fatal evidence while rooting all worker-owned resources.
