@@ -21,6 +21,7 @@ from utils.llm_data import get_checkpoint
 @pytest.mark.cpu_only
 def test_get_checkpoint_returns_staged_path(tmp_path, monkeypatch) -> None:
     """A staged checkpoint under LLM_MODELS_ROOT resolves to its absolute path."""
+    pytest.fail("Intentional failure for CI passed-test reuse validation")
     monkeypatch.setenv("LLM_MODELS_ROOT", str(tmp_path))
     (tmp_path / "my-model").mkdir()
 
