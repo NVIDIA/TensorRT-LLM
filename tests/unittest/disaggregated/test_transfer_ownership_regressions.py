@@ -1826,21 +1826,13 @@ def test_cleared_session_failure_reaches_the_waiting_receive(
     assert transceiver.check_gen_transfer_status(None) == ([], [], [])
 
 
-@pytest.mark.cpu_only
-@pytest.mark.parametrize("sibling", ["succeeds", "fails", "cancels"])
-def test_failed_receive_is_kept_until_every_writer_has_reported(
-    sibling: str, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """One writer's FAILED must not free pages that another writer may still be writing.
+def _two_writer_receive_failed_by_one(rid: int, timeout_s: float | None = None):
+    """A receive written by context ranks 3 and 4, after rank 3 answered FAILED.
 
-    Two context ranks write this receive. Rank 3 answers FAILED for its cleared
-    session while rank 4 is still writing, so the receive stays open, on every
-    poll path, until rank 4 has reported, whatever it reports. A CANCEL_SESSION
-    from rank 4 ends the wait as before.
+    Rank 3's session was cleared, so it answers through the real reply path;
+    rank 4 has not reported yet. Returns the receiver, the receive, a
+    transceiver polling it and the request it carries.
     """
-    monkeypatch.setattr(transfer_mod.tensorrt_llm.bindings, "global_steady_clock_now", lambda: 0)
-    rid = 115
-
     receiver = object.__new__(Receiver)
     receiver._enforce_physical_ownership = False
     receiver._sessions_lock = threading.Lock()
@@ -1848,7 +1840,12 @@ def test_failed_receive_is_kept_until_every_writer_has_reported(
     receiver._pre_cancelled_rids = {}
     receiver._shutdown = False
     receiver._bounce = _BounceProbe()
-    session = _make_rx_session(receiver, rid)
+    session = RxSession(
+        request_id=rid,
+        params=DisaggregatedParams(disagg_request_id=rid),
+        receiver=receiver,
+        timeout_s=timeout_s,
+    )
 
     def publish(task: KVRecvTask) -> None:
         task.expected_transfers = 2
@@ -1886,8 +1883,26 @@ def test_failed_receive_is_kept_until_every_writer_has_reported(
     transceiver._gen_allgather = Mock()
     transceiver._recv_sessions = {rid: session}
     transceiver._recv_reqs = {rid: request}
-
     assert session.status == SessionStatus.ERROR
+    return receiver, session, transceiver, request
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("sibling", ["succeeds", "fails", "cancels"])
+def test_failed_receive_is_kept_until_every_writer_has_reported(
+    sibling: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One writer's FAILED must not free pages that another writer may still be writing.
+
+    Two context ranks write this receive. Rank 3 answers FAILED for its cleared
+    session while rank 4 is still writing, so the receive stays open, on every
+    poll path, until rank 4 has reported, whatever it reports. A CANCEL_SESSION
+    from rank 4 ends the wait as before.
+    """
+    monkeypatch.setattr(transfer_mod.tensorrt_llm.bindings, "global_steady_clock_now", lambda: 0)
+    rid = 115
+    receiver, session, transceiver, request = _two_writer_receive_failed_by_one(rid)
+
     assert session.failed_receive_awaits_writers()
     assert session.wait_complete() is None
     for at_least in (0, None):
@@ -1909,6 +1924,94 @@ def test_failed_receive_is_kept_until_every_writer_has_reported(
         assert request.state == LlmRequestState.DISAGG_TRANS_ERROR
     assert rid not in receiver._sessions
     assert transceiver._recv_sessions == {}
+
+
+@pytest.mark.cpu_only
+def test_failed_receive_stops_waiting_for_a_silent_writer(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A writer that never reports (e.g. its process died) does not pin the receive for good.
+
+    A live writer is ended by its own context-side deadline well within two
+    transfer timeouts, so past that the failed receive is retired without it:
+    a worker that never acts on its own receive timeout (PP, or idle) would
+    otherwise hold its pages and slot forever.
+    """
+    monkeypatch.setattr(transfer_mod.tensorrt_llm.bindings, "global_steady_clock_now", lambda: 0)
+    clock = {"t": 500.0}
+    monkeypatch.setattr(transfer_mod.time, "monotonic", lambda: clock["t"])
+    rid = 116
+    timeout_s = 10.0
+    receiver, session, transceiver, request = _two_writer_receive_failed_by_one(rid, timeout_s)
+
+    assert transceiver.check_gen_transfer_status(0) == ([], [], [])  # the wait starts here
+    clock["t"] += 2 * timeout_s
+    assert session.failed_receive_awaits_writers()
+    assert transceiver.check_gen_transfer_status(None) == ([], [], [])
+    assert transceiver._recv_sessions == {rid: session}
+
+    clock["t"] += 0.5
+    assert not session.failed_receive_awaits_writers()
+    assert transceiver.check_gen_transfer_status(None) == ([], [rid], [])
+    assert request.state == LlmRequestState.DISAGG_TRANS_ERROR
+    assert rid not in receiver._sessions
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("dp_size", "session_live", "answered"),
+    [(1, False, True), (2, False, False), (1, True, False)],
+)
+def test_stale_request_data_is_answered_when_swept_without_attention_dp(
+    dp_size: int, session_live: bool, answered: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A REQUEST_DATA no session took within the TTL is answered FAILED, not dropped.
+
+    Dropping it leaves the peer's receive waiting for good, e.g. when it asks
+    after the cleared-session markers expire. Under attention DP the entries of
+    non-assigned DP ranks are expected and stay silent; a FAILED from them would
+    fail a receive the assigned ranks are still writing. An entry whose session
+    is live is neither dropped nor answered.
+    """
+    rid = 117
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(transfer_mod.time, "monotonic", lambda: clock["t"])
+    make_result = Mock(return_value=[MessageType.KV_AGENT_RESULT, b"failed"])
+    monkeypatch.setattr(transfer_mod, "_make_kv_result_msg", make_result)
+    sender = object.__new__(transfer_mod.Sender)
+    sender._sessions_lock = threading.Lock()
+    sender._sessions = {rid: object()} if session_live else {}
+    sender._retired_rids = {}
+    sender._peer_requests_lock = threading.Lock()
+    sender._instance_rank = 5
+    sender._num_threads = 1
+    sender._send_task_queues = [queue.Queue()]
+    sender._registrar = SimpleNamespace(
+        self_rank_info=SimpleNamespace(dp_size=dp_size),
+        get_peer_rank_info=Mock(return_value=SimpleNamespace(self_endpoint="gen")),
+    )
+    info = transfer_mod.RecvReqInfo(
+        sender_req_id=rid,
+        instance_name="gen",
+        instance_rank=0,
+        block_ids_per_layer_groups=[],
+        unique_rid=rid,
+        slice_id=0,
+    )
+    sender._peer_requests = {rid: {info.instance_rank: info}}
+    sender._peer_requests_timestamps = {rid: clock["t"]}
+
+    clock["t"] += transfer_mod.Sender._STALE_REQ_INFO_TTL_S + 1.0
+    sender.sweep_stale_req_infos()
+
+    queued = []
+    while not sender._send_task_queues[0].empty():
+        queued.append(sender._send_task_queues[0].get_nowait())
+    if answered:
+        make_result.assert_called_once_with(5, rid, 0, True, AgentResult.FAILED)
+        assert queued == [("gen", [MessageType.KV_AGENT_RESULT, b"failed"])]
+    else:
+        make_result.assert_not_called()
+        assert queued == []
+    assert (rid in sender._peer_requests) is session_live
 
 
 @pytest.mark.cpu_only

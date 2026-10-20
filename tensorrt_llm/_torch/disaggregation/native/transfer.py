@@ -786,9 +786,10 @@ class Sender(SenderBase):
     def sweep_stale_req_infos(self):
         """Evict RecvReqInfo entries that have no matching TxSession and exceed the TTL.
 
-        Called opportunistically from the listener thread when a new REQUEST_DATA
-        arrives. With gen-first ADP broadcast, non-assigned DP ranks accumulate
-        entries that are never consumed; this sweep prevents unbounded growth.
+        Called from the executor's context-status poll. With gen-first ADP
+        broadcast, non-assigned DP ranks accumulate entries that are never
+        consumed; this sweep prevents unbounded growth. Without attention DP an
+        evicted entry's peer is answered FAILED.
         """
         now = time.monotonic()
         with self._sessions_lock:
@@ -806,12 +807,28 @@ class Sender(SenderBase):
             ]
         if not stale_rids:
             return
+        # Without attention DP no request is broadcast, so an entry this old is a peer still
+        # waiting on a session that is long gone or never came, and it must be told: dropping
+        # it silently leaves the peer's receive unresolved for good. Under attention DP the
+        # entries of non-assigned DP ranks are expected and must stay silent, since a FAILED
+        # from them would fail a receive the assigned ranks are still writing.
+        answer_peers = getattr(self._registrar.self_rank_info, "dp_size", 1) == 1
+        swept: list[RecvReqInfo] = []
         for rid in stale_rids:
             with self._sessions_lock, self._peer_requests_lock:
                 if rid not in self._sessions and rid in self._peer_requests:
-                    self._peer_requests.pop(rid, None)
+                    infos = self._peer_requests.pop(rid, None) or {}
                     self._peer_requests_timestamps.pop(rid, None)
                     logger.debug(f"Swept stale RecvReqInfo for rid={rid}")
+                    if answer_peers:
+                        swept.extend(infos.values())
+        for info in swept:
+            logger.warning(
+                f"Answering FAILED to a REQUEST_DATA for rid={info.unique_rid} that no TxSession "
+                f"took within {self._STALE_REQ_INFO_TTL_S:.0f}s"
+            )
+            # Queue it on a worker: this runs on the executor thread, not the listener's.
+            self._send_failed_result_to_receiver(info, defer_to_worker=True)
 
     def setup_session(self, tx_session: "TxSession"):
         unique_rid = tx_session.disagg_request_id
@@ -3081,6 +3098,10 @@ class RxSession(RxSessionBase):
         self._exception: Optional[Exception] = None
         self._closed = False
         self._terminal_status: Optional[SessionStatus] = None
+        # When this failed receive started waiting on its remaining writers, and whether that
+        # wait has run out (see failed_receive_awaits_writers).
+        self._writer_wait_start: Optional[float] = None
+        self._writer_wait_expired = False
         self.transfer_start_time = None
         self.transfer_end_time = None
         self.kv_cache_size_bytes: int = 0
@@ -3632,17 +3653,41 @@ class RxSession(RxSessionBase):
         """
         return not self.resources_drained()
 
+    # A failed receive waits at most this many transfer timeouts for its remaining writers.
+    _WRITER_WAIT_TIMEOUT_MULTIPLIER = 2
+
     def failed_receive_awaits_writers(self) -> bool:
         """Whether this failed receive must stay open for writers that have not stopped.
 
         Without physical ownership the first writer's FAILED fails the receive, while the
         other writers it asked may still be writing into its pages, so retiring it then could
-        hand those pages to another request mid-write. Each writer that was asked ends with
-        a result or a CANCEL_SESSION, so the wait ends. A cancelled receive is not held.
+        hand those pages to another request mid-write. A live writer ends with a result or a
+        CANCEL_SESSION, at the latest when its own context-side transfer deadline expires,
+        which comes before ``_WRITER_WAIT_TIMEOUT_MULTIPLIER`` transfer timeouts. A writer
+        still silent then is presumed gone (e.g. its process died), and the receive is let go
+        rather than pinning its pages and slot on a worker that may never act on its own
+        receive timeout. A cancelled receive is not held. Polled from the executor thread.
         """
         if self._enforce_physical_ownership or self.status != SessionStatus.ERROR:
             return False
-        return any(task.reports_outstanding for task in self._kv_tasks)
+        if self._writer_wait_expired:
+            return False
+        if not any(task.reports_outstanding for task in self._kv_tasks):
+            return False
+        if self._timeout_s is None or self._timeout_s <= 0:
+            return True
+        now = time.monotonic()
+        if self._writer_wait_start is None:
+            self._writer_wait_start = now
+        waited_s = now - self._writer_wait_start
+        if waited_s <= self._timeout_s * self._WRITER_WAIT_TIMEOUT_MULTIPLIER:
+            return True
+        self._writer_wait_expired = True
+        logger.warning(
+            f"RxSession {self.disagg_request_id}: a writer has not reported {waited_s:.0f}s "
+            "after the receive failed; retiring it without that writer's result"
+        )
+        return False
 
     def _failed_wait_result(self) -> Optional[WaitResult]:
         if not self._enforce_physical_ownership:
