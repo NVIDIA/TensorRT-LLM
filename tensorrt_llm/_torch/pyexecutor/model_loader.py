@@ -31,6 +31,7 @@ from tensorrt_llm._torch.weight_sharing import (
 from tensorrt_llm._utils import get_sm_version, str_dtype_to_torch
 from tensorrt_llm.llmapi.llm_args import (DecodingBaseConfig,
                                           ExecutorMemoryType,
+                                          MiniMaxM3SparseAttentionConfig,
                                           ModelExpressConfig,
                                           SparseAttentionConfig, TorchLlmArgs)
 from tensorrt_llm.llmapi.llm_utils import (_resolve_kv_cache_manager_v2_auto,
@@ -165,9 +166,16 @@ def validate_and_set_kv_cache_quant(model_config: ModelConfig,
 
     effective_kv_cache_quant = (kv_cache_quant if pyt_kv_cache_dtype == "auto"
                                 else mapped_pyt_quant)
+    # MiniMax-M3 MSA keeps NVFP4 only on its sparse layers, which MSA and
+    # Triton serve; its dense and draft layers stay FP8 for trtllm-gen.
+    sparse_config = model_config.sparse_attention_config
+    uses_minimax_m3_msa = (isinstance(sparse_config,
+                                      MiniMaxM3SparseAttentionConfig)
+                           and sparse_config.implementation == "msa")
     if (effective_kv_cache_quant in (QuantAlgo.NVFP4, QuantAlgo.NVFP4.value)
             and not supports_fp4_mla_attention(model_config)
-            and torch.cuda.is_available() and get_sm_version() == 107):
+            and not uses_minimax_m3_msa and torch.cuda.is_available()
+            and get_sm_version() == 107):
         logger.warning(
             "NVFP4 KV cache is not supported by trtllm-gen on SM107; "
             "using FP8 KV cache instead.")

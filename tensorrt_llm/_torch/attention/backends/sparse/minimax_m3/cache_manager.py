@@ -28,6 +28,7 @@ Provides:
 
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING, List, Optional, Sequence, Tuple
 
 import torch
@@ -227,6 +228,11 @@ def extend_attention_op_pools_for_shared_draft_layers(
     )
 
 
+# Zero every KV pool view (NVFP4 + FP8 K/V, NVFP4 block scales, paged index keys) once at allocation, so no reader
+# ever sees uninitialized bytes. Kill switch (diagnostics only): TRTLLM_M3_KV_POOL_ZERO_INIT=0.
+_KV_POOL_ZERO_INIT = os.environ.get("TRTLLM_M3_KV_POOL_ZERO_INIT", "1") == "1"
+
+
 class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
     """KVCacheManagerV2 subclass with a V2-managed paged index-K cache
     per sparse layer.
@@ -399,6 +405,19 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
                 self._block_scale_buffers[layer_idx, kv_layout] = self.get_block_scale_buffers(
                     layer_idx, kv_layout
                 )
+        if _KV_POOL_ZERO_INIT:
+            # The KV pools are written only at live slots, and readers that consume a whole block or page (the CSR
+            # sparse prefill's V dequant, the full-context decode on a last page's tail) would turn uninitialized
+            # bytes into 0 * NaN = NaN. Zero every layer's K/V bytes (NVFP4 sparse, FP8 dense, the drafter's in its
+            # own manager), the NVFP4 block scales and the paged index keys once, before any request runs: every
+            # byte a kernel writes is unchanged.
+            for view in (
+                *self._kv_buffers.values(),
+                *self._block_scale_buffers.values(),
+                *self._index_k_buffers.values(),
+            ):
+                if view is not None:
+                    view.zero_()
 
     def _validate_speculative_config(self, spec_config: DecodingBaseConfig | None) -> None:
         # Dynamic-tree relocation moves packed K/V bytes without their NVFP4
