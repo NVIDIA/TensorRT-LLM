@@ -173,7 +173,7 @@ def schemas(tmp_path_factory: pytest.TempPathFactory) -> dict[str, dict]:
         ),
         (
             generator.SERVE_SCHEMA,
-            {"multimodal_config": {"encoder_data_parallel_size": 2}},
+            {"tensor_parallel_size": 2, "multimodal_config": {"encoder_data_parallel_size": 2}},
             True,
         ),
         (
@@ -284,7 +284,12 @@ def schemas(tmp_path_factory: pytest.TempPathFactory) -> dict[str, dict]:
         ),
         (
             generator.DISAGG_SCHEMA,
-            {"context_servers": {"multimodal_config": {"encoder_data_parallel_size": 2}}},
+            {
+                "context_servers": {
+                    "tensor_parallel_size": 2,
+                    "multimodal_config": {"encoder_data_parallel_size": 2},
+                }
+            },
             True,
         ),
         (
@@ -1172,6 +1177,16 @@ def test_encoder_attention_backend_schema(
 ) -> None:
     config = {"multimodal_config": {"encoder_attention_backend": {"vision": backend}}}
     errors = list(Draft202012Validator(schemas[generator.SERVE_SCHEMA]).iter_errors(config))
+    assert (not errors) == valid, [error.message for error in errors]
+
+
+@pytest.mark.parametrize("filename", [generator.SERVE_SCHEMA, generator.DISAGG_SCHEMA])
+@pytest.mark.parametrize("value,valid", [(None, True), (1, True), (0, False), (1.5, False)])
+def test_dflash_spec_dec_variant_schema(schemas, filename, value, valid) -> None:
+    config = {"speculative_config": {"decoding_type": "DFlash", "spec_dec_variant": value}}
+    if filename == generator.DISAGG_SCHEMA:
+        config = {"context_servers": config}
+    errors = list(Draft202012Validator(schemas[filename]).iter_errors(config))
     assert (not errors) == valid, [error.message for error in errors]
 
 

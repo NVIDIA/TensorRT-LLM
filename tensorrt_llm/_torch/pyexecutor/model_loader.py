@@ -1403,6 +1403,15 @@ class ModelLoader:
         self._checkpoint_loader = checkpoint_loader
         config: ModelConfig = self._load_and_validate_config(
             checkpoint_dir, checkpoint_loader)
+        multimodal_config = getattr(config, "multimodal_config", None)
+        if (multimodal_config is not None
+                and multimodal_config.encoder_data_parallel_size > 1):
+            model_cls = AutoModelForCausalLM._resolve_class(config)
+            if model_cls is not None and not getattr(
+                    model_cls, "supports_encoder_data_parallel", False):
+                raise NotImplementedError(
+                    f"{model_cls.__name__} does not support multimodal encoder data parallelism."
+                )
         load_format = self.llm_args.load_format
         gms_loading.check_gms_locality_domain_compat(load_format, config)
         self._startup_metadata = _checkpoint_startup_metadata(
