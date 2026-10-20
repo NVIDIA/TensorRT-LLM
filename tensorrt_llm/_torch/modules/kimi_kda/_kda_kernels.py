@@ -614,7 +614,7 @@ def is_kda_mtp_verify_available() -> bool:
 
 def kda_mtp_max_num_spec() -> int:
     """Largest draft count the fused multi-token verify kernel supports."""
-    from tensorrt_llm._torch.cute_dsl_kernels.blackwell.kimi_k3_kda.kda_mtp_decode import (
+    from tensorrt_llm._torch.attention.kernels.blackwell.kimi_k3_kda.kda_mtp_decode import (
         MAX_NUM_SPEC,
     )
 

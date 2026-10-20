@@ -2319,7 +2319,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         writes."""
         from tensorrt_llm._torch.attention.backends.trtllm import \
             TrtllmAttentionMetadata
-        from tensorrt_llm._torch.cute_dsl_kernels.spec_step_copies import \
+        from tensorrt_llm._torch.kernels.spec_step_copies import \
             op as spec_step_copies
         if not spec_step_copies.is_supported():
             self.skipTest("the step-copy kernels run on SM 100")
