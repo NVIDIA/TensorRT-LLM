@@ -121,6 +121,20 @@ NP=4 ./mpi_launch.sh ./run.sh config_gen.yaml --model $K3 --layer-indices 4,5,6,
 # Run Kimi K3 at the serving parallelism (DEP16, see examples/kimi_k3/eval_extra_llm_options.yaml)
 NP=16 ./mpi_launch.sh ./run.sh config_gen.yaml --model $K3 --layer-indices 4,5,6,7 --tokens-per-block 64 --moe-backend TRTLLM --seq-len-q 1 --moe-max-num-tokens 33024 --use-low-precision-moe-combine
 
+# Run DeepSeek-V4 with MegaMoE, $DSV4 being a local checkpoint directory, as three arms:
+# load balancer off, per-layer dynamic EPLB (num_slots = experts + helper slots per rank * EP,
+# here 384 + 3 * 8), and perfectly balanced routing with the load balancer off (the upper
+# bound for any MoE load balancer). MEGAMOE_CUTEDSL is not in the balance-method whitelist,
+# so the arms use --balance-method NotModified. To replay the routing of an end-to-end run,
+# add --replay-file-path (see "Performance alignment" below); the third arm replaces the
+# routed expert IDs either way. A slice may start mid-model (here 7,8).
+NP=8 ./mpi_launch.sh ./run.sh config_ctx.yaml --model $DSV4 --layer-indices 7,8 --moe-backend MEGAMOE_CUTEDSL --balance-method NotModified
+NP=8 ./mpi_launch.sh ./run.sh config_ctx.yaml --model $DSV4 --layer-indices 7,8 --moe-backend MEGAMOE_CUTEDSL --balance-method NotModified --moe-load-balancer eplb_per_layer_dynamic.yaml
+NP=8 ./mpi_launch.sh -x ENABLE_PERFECT_ROUTER=expert_ids ./run.sh config_ctx.yaml --model $DSV4 --layer-indices 7,8 --moe-backend MEGAMOE_CUTEDSL --balance-method NotModified
+# with eplb_per_layer_dynamic.yaml holding:
+#   mode: per_layer_dynamic
+#   num_slots: 408
+
 # Run with DeepEP A2A
 NP=4 ./mpi_launch.sh -x TRTLLM_FORCE_COMM_METHOD=DEEPEP ./run.sh config_ctx.yaml --moe-backend CUTEDSL
 NP=4 ./mpi_launch.sh -x TRTLLM_FORCE_COMM_METHOD=DEEPEP ./run.sh config_gen.yaml --moe-backend CUTEDSL
