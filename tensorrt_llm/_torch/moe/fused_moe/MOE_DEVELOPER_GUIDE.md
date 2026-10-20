@@ -911,11 +911,14 @@ set wrong has a test that catches it:
   handle's `allocate_arena` and exposes `live_weight_arena`,
   `ep_process_group`, and `max_tokens_per_rank_capacity` to `bind_backend`
   instead of private attributes.
-- Per-layer dynamic EPLB selects the fused shared FC12 kernel only when the routed
-  backend declares per-layer dynamic support and the final projection
-  quantization, hardware, and graph mode support that kernel. Other runs keep
-  the model's existing shared-MLP backend. The active configuration supplies
-  the optional SM budget only to the fused kernel.
+- DeepSeek-V4 selects the fused shared FC12 kernel when the routed backend
+  declares per-layer dynamic support, the final projection quantization and
+  hardware (SM100 family) support that kernel, and the model runs eagerly
+  (`cuda_graph_config: null`). Per-layer dynamic EPLB is not a condition, but it
+  requires eager mode, so an EPLB-off baseline runs the same shared kernel only
+  with `cuda_graph_config: null`. Other runs keep the model's existing shared-MLP
+  backend. With per-layer dynamic EPLB, the active configuration supplies the
+  fused kernel an SM budget that leaves the copy kernel its auxiliary SMs.
 
 ## Canonical Examples
 
