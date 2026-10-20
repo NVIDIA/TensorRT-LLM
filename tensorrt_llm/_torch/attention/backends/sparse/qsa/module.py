@@ -374,6 +374,7 @@ def select_qsa_paged_tokens(
     visible_blocks: torch.Tensor | None = None,
     context_rows: bool = False,
     mtp_share_slot: int | None = None,
+    expand_blocks: bool = True,
 ) -> torch.Tensor:
     """Select tokens with packed, fixed-width paged scoring.
 
@@ -386,6 +387,9 @@ def select_qsa_paged_tokens(
     steps rebuild their rows from it without running the indexer at all. It is
     the calling layer's row in the shared buffers, and ``None`` turns the reuse
     off.
+
+    ``expand_blocks=False`` returns the ``[rows, block_topk]`` compressed-block
+    IDs for consumers that resolve blocks and the causal tail themselves.
     """
     from .kernels import triton_qsa_mtp_reuse_topk, triton_qsa_paged_index_scores
 
@@ -406,6 +410,8 @@ def select_qsa_paged_tokens(
             visible_blocks=visible_blocks,
             output=top_k_output[: q.shape[0]],
         )
+        if not expand_blocks:
+            return indices
         return expand_qsa_block_indices(
             indices,
             query_positions,
@@ -464,6 +470,8 @@ def select_qsa_paged_tokens(
             )
     if mtp_share_slot is not None:
         _capture_mtp_shared_topk(metadata, mtp_share_slot, indices, visible_blocks)
+    if not expand_blocks:
+        return indices
     return expand_qsa_block_indices(
         indices,
         query_positions,
@@ -629,7 +637,32 @@ class QSASparseHooks(AttentionSparseHooks):
                 tokens_per_block,
             )
 
-        if attn_metadata.num_contexts == 0:
+        softmax_scale = 1.0 / (attention.q_scaling * attention.head_dim**0.5)
+        is_decode = attn_metadata.num_contexts == 0
+        if params.sparse_core_backend == "triton":
+            core_backend = "triton"
+        else:
+            from .prims_ts_core import resolve_sparse_core_backend
+
+            core_backend = resolve_sparse_core_backend(
+                params,
+                q=q,
+                k_cache=k_cache,
+                page_size=tokens_per_block,
+                is_decode=is_decode,
+                num_rows=num_tokens,
+            )
+        use_prims_ts = core_backend == "prims_ts"
+        if use_prims_ts:
+            from .prims_ts_core import prims_ts_sparse_gqa
+
+            logger.info_once(
+                "QSA PrimTS sparse core attention is active",
+                key="qsa_prims_ts_sparse_core_active",
+            )
+            max_seq_len_kv = attn_metadata.qsa_block_table.shape[1] * tokens_per_block
+
+        if is_decode:
             index_cache = attn_metadata.kv_cache_manager.get_index_k_buffer(attention.layer_idx)
             if index_cache is None:
                 raise RuntimeError(
@@ -661,32 +694,48 @@ class QSASparseHooks(AttentionSparseHooks):
                 top_k_row_starts=attn_metadata.qsa_topk_row_starts,
                 visible_blocks=attn_metadata.qsa_visible_blocks[:num_tokens],
                 mtp_share_slot=mtp_share_slot,
+                expand_blocks=not use_prims_ts,
             )
             fuse_output_gate = False
-            if output_gate is not None:
-                from .kernels import can_fuse_qsa_splitk_output_gate
-
-                fuse_output_gate = can_fuse_qsa_splitk_output_gate(
+            if use_prims_ts:
+                output = prims_ts_sparse_gqa(
                     q,
                     k_cache,
+                    v_cache,
+                    attn_metadata.qsa_block_table,
                     selected,
-                    output_gate,
+                    req_idx,
+                    logical,
+                    page_size=tokens_per_block,
+                    max_seq_len_kv=max_seq_len_kv,
+                    softmax_scale=softmax_scale,
+                    is_decode=True,
                 )
-                if fuse_output_gate:
-                    logger.info_once(
-                        "QSA split-K merge fuses the attention output gate",
-                        key="qsa_fused_output_gate_active",
+            else:
+                if output_gate is not None:
+                    from .kernels import can_fuse_qsa_splitk_output_gate
+
+                    fuse_output_gate = can_fuse_qsa_splitk_output_gate(
+                        q,
+                        k_cache,
+                        selected,
+                        output_gate,
                     )
-            output = qsa_sparse_gqa(
-                q=q,
-                k_cache=k_cache,
-                v_cache=v_cache,
-                selected_tokens=selected,
-                request_indices=req_idx,
-                metadata=attn_metadata,
-                softmax_scale=1.0 / (attention.q_scaling * attention.head_dim**0.5),
-                output_gate=output_gate if fuse_output_gate else None,
-            )
+                    if fuse_output_gate:
+                        logger.info_once(
+                            "QSA split-K merge fuses the attention output gate",
+                            key="qsa_fused_output_gate_active",
+                        )
+                output = qsa_sparse_gqa(
+                    q=q,
+                    k_cache=k_cache,
+                    v_cache=v_cache,
+                    selected_tokens=selected,
+                    request_indices=req_idx,
+                    metadata=attn_metadata,
+                    softmax_scale=softmax_scale,
+                    output_gate=output_gate if fuse_output_gate else None,
+                )
             output = output.reshape(num_tokens, -1)
             if output_gate is not None and not fuse_output_gate:
                 output = attention.apply_output_gate(output, output_gate)
@@ -717,7 +766,23 @@ class QSASparseHooks(AttentionSparseHooks):
                 top_k_row_starts=attn_metadata.qsa_topk_row_starts[packed_slice],
                 visible_blocks=attn_metadata.qsa_visible_blocks[packed_slice],
                 context_rows=True,
+                expand_blocks=not use_prims_ts,
             )
+            if use_prims_ts:
+                output[packed_slice] = prims_ts_sparse_gqa(
+                    q[packed_slice],
+                    k_cache,
+                    v_cache,
+                    attn_metadata.qsa_block_table,
+                    selected,
+                    req_idx[packed_slice],
+                    logical[packed_slice],
+                    page_size=tokens_per_block,
+                    max_seq_len_kv=max_seq_len_kv,
+                    softmax_scale=softmax_scale,
+                    is_decode=False,
+                )
+                continue
             output[packed_slice] = qsa_sparse_gqa(
                 q=q[packed_slice],
                 k_cache=k_cache,
@@ -725,7 +790,7 @@ class QSASparseHooks(AttentionSparseHooks):
                 selected_tokens=selected,
                 request_indices=req_idx[packed_slice],
                 metadata=attn_metadata,
-                softmax_scale=1.0 / (attention.q_scaling * attention.head_dim**0.5),
+                softmax_scale=softmax_scale,
                 query_positions=logical[packed_slice],
                 compress_ratio=params.compress_ratio,
             )
