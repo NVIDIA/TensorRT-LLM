@@ -1761,6 +1761,39 @@ def test_megamoe_symmetric_regions_are_built_once_per_mode():
     assert built == [True, False]
 
 
+def test_megamoe_tuning_config_is_built_once_per_runner():
+    configs = []
+
+    def tuning_config(**kwargs):
+        configs.append(kwargs)
+        return SimpleNamespace(**kwargs)
+
+    runner_cls = _extract_class(
+        _TORCH_ROOT / "moe/custom_ops/cute_dsl_megamoe_custom_op.py",
+        "Sm100MegaMoENvfp4Runner",
+        {"get_tuning_config", "_autotuner_inputs_pre_hook"},
+        {
+            "TuningConfig": tuning_config,
+            "DynamicTensorSpec": lambda *args: args,
+            "ConstraintSpec": lambda *args: args,
+            "DistributedTuningStrategy": SimpleNamespace(MERGE="merge"),
+            "get_last_power_of_2_num_tokens_buckets": None,
+            "last_positive_power_of_2": None,
+            "_megamoe_autotune_num_tokens": None,
+        },
+    )
+    first, second = runner_cls(), runner_cls()
+    for runner in (first, second):
+        runner.max_tokens_per_rank = 8192
+
+    config = first.get_tuning_config()
+    assert first.get_tuning_config() is config
+    # The profiling pre-hook stays bound to the runner that built the config.
+    assert config.inputs_pre_hook.__self__ is first
+    assert second.get_tuning_config().inputs_pre_hook.__self__ is second
+    assert len(configs) == 2
+
+
 def test_megamoe_runner_identity_is_built_once():
     runner_cls = _extract_class(
         _TORCH_ROOT / "moe/custom_ops/cute_dsl_megamoe_custom_op.py",
@@ -1942,7 +1975,9 @@ def test_megamoe_runner_cache_reuses_only_production_runners():
             self._profiling_scratch_factory = object()
             created.append(self)
 
+    tuner = SimpleNamespace(is_tuning_mode=False)
     namespace = {
+        "AutoTuner": SimpleNamespace(get=lambda: tuner),
         "Sm100MegaMoENvfp4Runner": FakeRunner,
         "_MEGAMOE_RUNNER_CACHE": {},
     }
@@ -1983,10 +2018,25 @@ def test_megamoe_runner_cache_reuses_only_production_runners():
     assert production._profiling_scratch is None
     assert production._profiling_scratch_factory is None
 
+    # While the AutoTuner profiles, an autotune opt-in gets a fresh runner
+    # that owns its profiling scratch.
+    tuner.is_tuning_mode = True
     first_tuning = get_runner(**kwargs, tactic_autotune=True)
     second_tuning = get_runner(**kwargs, tactic_autotune=True)
     assert first_tuning is not second_tuning
+    assert first_tuning is not production
     assert len(created) == 3
+
+    # Outside tuning mode it only looks up its tactic: one runner is reused,
+    # separate from the opted-out production runner.
+    tuner.is_tuning_mode = False
+    serving = get_runner(**kwargs, tactic_autotune=True)
+    serving._profiling_scratch = "stale"
+    assert get_runner(**kwargs, tactic_autotune=True) is serving
+    assert serving is not production
+    assert serving._profiling_scratch is None
+    assert get_runner(**kwargs, tactic_autotune=False) is production
+    assert len(created) == 4
 
 
 def test_on_autotune_uses_distinct_tactics():

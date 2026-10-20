@@ -1522,8 +1522,9 @@ if IS_MEGAMOE_OP_AVAILABLE:
     # freed when the next one allocates (only the winner is reused).
     _MEGAMOE_TUNING_WORKSPACE_KEYS: set = set()
 
-    # Cache runners by constructor inputs only outside tactic autotuning.
-    # Reset profiling scratch on reuse and overwrite READY inputs for every call;
+    # Cache runners by constructor inputs, except while the AutoTuner profiles
+    # an autotune opt-in. Reset profiling scratch on reuse and overwrite READY
+    # inputs for every call.
     _MEGAMOE_RUNNER_CACHE: dict = {}
 
     @functools.lru_cache(maxsize=1)
@@ -2488,13 +2489,15 @@ if IS_MEGAMOE_OP_AVAILABLE:
             autotuner does not double-enumerate tile sizes for
             independent token axes.
 
-            Rebuilt on every call, NEVER cached across runners:
+            Built once per runner and NEVER shared across runners:
             ``inputs_pre_hook`` is bound to THIS runner's ``_profiling_scratch``;
-            a cached hook bound to a dead runner would mix non-symmetric
-            profiling tensors with the live runner's peer offsets (IMA + hang).
+            a hook bound to another runner would mix non-symmetric profiling
+            tensors with the live runner's peer offsets (IMA + hang).
             """
-
-            config = TuningConfig(
+            config = self.__dict__.get("_tuning_config")
+            if config is not None:
+                return config
+            config = self._tuning_config = TuningConfig(
                 dynamic_tensor_specs=(
                     DynamicTensorSpec(
                         0, 0, get_last_power_of_2_num_tokens_buckets, last_positive_power_of_2
@@ -3041,8 +3044,10 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 helper_expert_count=helper_expert_count,
             )
 
-        # Autotuning runners own profiling scratch and are not reused.
-        if tactic_autotune:
+        # A runner that may profile owns profiling scratch, so tuning-mode calls
+        # with the autotune opt-in get a fresh one. Outside tuning mode
+        # choose_one only looks up the tuned tactic, and the runner is reused.
+        if tactic_autotune and AutoTuner.get().is_tuning_mode:
             return _make()
         runner = _MEGAMOE_RUNNER_CACHE.get(args)
         if runner is None:
@@ -3243,12 +3248,15 @@ if IS_MEGAMOE_OP_AVAILABLE:
             runner._profiling_scratch = None
             runner._profiling_scratch_factory = None
         # Real run always uses the caller's staging buffer + peer_offsets.
-        runner(
-            inputs,
-            tactic=best_tactic,
-            peer_offsets=peer_offsets,
-            shared_workspace=shared_workspace,
-        )
+        try:
+            runner(
+                inputs,
+                tactic=best_tactic,
+                peer_offsets=peer_offsets,
+                shared_workspace=shared_workspace,
+            )
+        finally:
+            runner._helper_ready_flags = None
 
     # Eager callers may call ``run_cute_dsl_megamoe_nvfp4_blackwell`` directly
     # and skip the custom-op dispatch; traced code must use the registered op.
