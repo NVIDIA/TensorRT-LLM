@@ -705,8 +705,9 @@ def test_kimi_k3_near_misses_do_not_match(text_overrides, mapping_kwargs, missed
         modeling_v2_resolve(config, _llm_args("require"))
 
 
-def test_kimi_k3_on_another_sm_does_not_match():
-    """The autouse fixture routes as a GB300 (sm 10.3); the K3 targets are sm 10.0 only."""
+def test_kimi_k3_on_another_sm_does_not_match(monkeypatch):
+    """Routed as a GB300 (sm 10.3), the K3 targets, sm 10.0 only, match nothing."""
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **k: (10, 3))
     config = _model_config(_k3_config(), **_TP16_MOETP4EP4)
     assert modeling_v2_resolve(config, _llm_args("auto")) is None
     with pytest.raises(ValueError, match=r"compute capability \(10, 3\)"):
