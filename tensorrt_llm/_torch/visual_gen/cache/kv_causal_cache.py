@@ -823,16 +823,20 @@ class CausalKVCacheManager(KVCacheManagerV2):
     # ------------------------------------------------------------------ device state
 
     def _refresh_device_state(self, drop_pages: int = 0) -> None:
-        """Rewrite every kernel-facing device tensor for the current table, fixed region
-        and ``staging_offset``: one layout launch per block size (the first also writes
-        the staged slot ids and the fixed tail's refill), then one launch making every
-        commit copy: the refill and each block's committed_private. Runs in ``open``
-        and ``commit``, never on the forward path. Nothing
-        crosses from the host but kernel arguments, so the host never waits for the
-        device here.
+        """Rewrite page tables and private-page contents for the next forward.
 
-        ``drop_pages`` is what the rotation before this call moved to the ring's tail;
-        the layout kernel reads the fixed tail from the moved page's old view."""
+        For each declared causal-block size, one kernel is launched. The first launch
+        also computes the shared resident staging slots and pinned-tail copy indices.
+
+        Then launch one kernel to copy committed boundary tokens into private
+        pages and, if needed, restore the pinned tail in resident storage.
+
+        ``drop_pages`` is the number of pages ``commit()`` rotated to the ring's end.
+        If the pinned prefix ends mid-page, its tail remains in a moved page;
+        copy it from there into the page now holding that logical position.
+
+        All output tensors are updated in place, preserving CUDA graph references.
+        """
         shared = True
         for blk in self._layouts.values():
             torch.ops.trtllm.causal_layout_(
