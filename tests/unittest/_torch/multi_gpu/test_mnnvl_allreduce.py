@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import functools
 import gc
 import os
 import pickle
@@ -677,6 +678,7 @@ def row_linear_residual_norm_fusion_forward(
     fusion: bool,
     reference_output_list: list[tuple[torch.Tensor, ...]],
     strategy: AllReduceStrategy,
+    compile: bool = False,
 ):
 
     # Move all tensors to GPU
@@ -724,6 +726,12 @@ def row_linear_residual_norm_fusion_forward(
             output = allreduce(input)
             return (output, )
 
+    if compile:
+        # aot_eager runs Dynamo and AOT functionalization, the parts of the
+        # production compile path that see the all-reduce, without Inductor.
+        torch._dynamo.reset()
+        func = torch.compile(func, fullgraph=True, backend="aot_eager")
+
     try:
         # Process each sequence length using the same AllReduce instance
         for i, (x, residual, reference_output) in enumerate(
@@ -749,8 +757,13 @@ def row_linear_residual_norm_fusion_forward(
         torch.cuda.empty_cache()
 
 
-def _run_row_linear_residual_norm_fusion(seq_len, hidden_size, dtype, strategy,
-                                         fusion, mpi_pool_executor):
+def _run_row_linear_residual_norm_fusion(seq_len,
+                                         hidden_size,
+                                         dtype,
+                                         strategy,
+                                         fusion,
+                                         mpi_pool_executor,
+                                         compile=False):
     torch.manual_seed(42)
     tensor_parallel_size = mpi_pool_executor.num_workers
 
@@ -778,12 +791,15 @@ def _run_row_linear_residual_norm_fusion(seq_len, hidden_size, dtype, strategy,
         residual_list.append(residual)
         reference_output_list.append(reference_output)
 
+    forward = row_linear_residual_norm_fusion_forward
+    if compile:
+        forward = functools.partial(forward, compile=True)
     results = mpi_pool_executor.map(
         run_single_rank,
         *zip(*[
             (
                 tensor_parallel_size,
-                row_linear_residual_norm_fusion_forward,
+                forward,
                 [x[i, :, :] for x in x_list
                  ],  # Extract the i-th rank's data from each sequence length
                 residual_list,
@@ -799,6 +815,23 @@ def _run_row_linear_residual_norm_fusion(seq_len, hidden_size, dtype, strategy,
     )
     for r in results:
         assert r is True
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2,
+                    reason="needs 2 GPUs to run this test")
+@pytest.mark.parametrize("fusion", FUSION_CASES, ids=["fusion", "no_fusion"])
+@pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
+def test_mnnvl_row_linear_residual_norm_fusion_compiled(fusion,
+                                                        mpi_pool_executor):
+    """The MNNVL all-reduce inside a torch.compile(fullgraph=True) region: the
+    workspace lookup must trace and the kernel's custom op must functionalize."""
+    _run_row_linear_residual_norm_fusion(SEQ_LEN_CASES[0],
+                                         8192,
+                                         torch.bfloat16,
+                                         AllReduceStrategy.MNNVL,
+                                         fusion,
+                                         mpi_pool_executor,
+                                         compile=True)
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2,

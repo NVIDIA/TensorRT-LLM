@@ -13,8 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import ctypes
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -294,3 +296,43 @@ def test_checkpoint_restore_communicator_duplication_failure_is_terminal(monkeyp
     assert not handle.restore_pending
     assert handle.complete_count == 1
     assert workspace["comm"] is None
+
+
+@pytest.mark.cpu_only
+def test_workspace_lookup_traces_under_fullgraph(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A cached workspace lookup must be traceable by Dynamo with fullgraph=True.
+
+    The MNNVL all-reduce runs inside torch.compile'd decoder layers whenever TP spans nodes.
+    The workspace handle is a nanobind object whose methods Dynamo cannot trace, and the CUDA
+    graph capture query returns a plain bool, so neither may be reached while compiling. The
+    compiled graph keeps the buffers as constants, which counts as captured.
+    """
+    mapping = Mapping(world_size=1, tp_size=1, rank=0)
+    _patch_workspace_dependencies(monkeypatch)
+    monkeypatch.setattr(ops_module, "McastGPUBuffer", lambda *args, **kwargs: _FakeMcastBuffer())
+    workspace = get_or_scale_allreduce_mnnvl_workspace(mapping, torch.float32)
+    # A C-implemented callable with no Python __call__, like the nanobind bound method of the real handle.
+    untraceable_is_mapped = ctypes.pythonapi.PyGILState_Check
+    untraceable_is_mapped.restype = ctypes.c_int
+    workspace["handle"] = SimpleNamespace(is_mapped=untraceable_is_mapped)
+    monkeypatch.undo()  # the real capture query is back; the traced path must not call it
+    monkeypatch.setattr(MNNVLAllReduce, "allreduce_mnnvl_workspaces", {mapping: workspace})
+    monkeypatch.setattr(MNNVLAllReduce, "_allreduce_mnnvl_workspace_locks", {})
+
+    def lookup(x: torch.Tensor) -> torch.Tensor:
+        cached = get_or_scale_allreduce_mnnvl_workspace(
+            mapping, torch.float32, buffer_size_bytes=16
+        )
+        return x + cached["buffer_flags"][0].float()
+
+    torch._dynamo.reset()
+    try:
+        compiled = torch.compile(lookup, fullgraph=True, backend="eager")(torch.ones(2))
+    finally:
+        torch._dynamo.reset()
+    assert compiled.tolist() == [1.0, 1.0]
+    assert workspace["captured"] is True
+
+    workspace["handle"] = SimpleNamespace(is_mapped=lambda: False)
+    with pytest.raises(RuntimeError, match="not attached"):
+        get_or_scale_allreduce_mnnvl_workspace(mapping, torch.float32, buffer_size_bytes=16)

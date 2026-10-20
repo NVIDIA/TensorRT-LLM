@@ -245,6 +245,19 @@ def _mnnvl_workspace_all_succeeded(comm, local_success: bool) -> bool:
     return comm.allreduce(int(local_success)) == comm.Get_size()
 
 
+def _check_mnnvl_workspace_attached(workspace: _MnnvlWorkspace) -> None:
+    """Raise if the workspace handles were detached by checkpoint_prepare.
+
+    The handle is a nanobind object, so Dynamo cannot trace ``is_mapped``; under
+    torch.compile the check is skipped, which only drops a trace-time assertion:
+    the compiled graph never re-runs this Python either way.
+    """
+    if torch.compiler.is_compiling():
+        return
+    if not workspace["handle"].is_mapped():
+        raise RuntimeError("MNNVL workspace handles are not attached")
+
+
 def get_or_scale_allreduce_mnnvl_workspace(
         mapping: Mapping,
         dtype: torch.dtype,
@@ -257,8 +270,7 @@ def get_or_scale_allreduce_mnnvl_workspace(
     allreduce_mnnvl_workspaces = MNNVLAllReduce.allreduce_mnnvl_workspaces
     if mapping in allreduce_mnnvl_workspaces:
         workspace = allreduce_mnnvl_workspaces[mapping]
-        if not workspace["handle"].is_mapped():
-            raise RuntimeError("MNNVL workspace handles are not attached")
+        _check_mnnvl_workspace_attached(workspace)
         if workspace["buffer_size_bytes"] >= (buffer_size_bytes or 0):
             return _mark_if_capturing(workspace)
 
@@ -270,8 +282,17 @@ def get_or_scale_allreduce_mnnvl_workspace(
 
 
 def _mark_if_capturing(workspace: _MnnvlWorkspace) -> _MnnvlWorkspace:
-    """Record that a CUDA graph being captured launches on this workspace."""
-    if not workspace["captured"] and torch.cuda.is_current_stream_capturing():
+    """Record that a CUDA graph being captured launches on this workspace.
+
+    A graph traced by torch.compile holds the workspace buffers as constants and
+    may be captured into a CUDA graph later, when this Python no longer runs, so
+    it counts as captured at trace time. Dynamo also cannot trace the capture
+    query itself (a torch.* call that returns a bool).
+    """
+    if workspace["captured"]:
+        return workspace
+    compiling = torch.compiler.is_compiling()
+    if compiling or torch.cuda.is_current_stream_capturing():
         workspace["captured"] = True
     return workspace
 
@@ -289,8 +310,7 @@ def _get_or_scale_allreduce_mnnvl_workspace(
 
     if mapping in allreduce_mnnvl_workspaces:
         workspace = allreduce_mnnvl_workspaces[mapping]
-        if not workspace["handle"].is_mapped():
-            raise RuntimeError("MNNVL workspace handles are not attached")
+        _check_mnnvl_workspace_attached(workspace)
 
     # A safe method to get the element size of the dtype
     elem_size = torch.tensor([], dtype=dtype).element_size()

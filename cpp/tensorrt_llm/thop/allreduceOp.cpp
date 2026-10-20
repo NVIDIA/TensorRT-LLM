@@ -2323,8 +2323,11 @@ TRTLLM_NAMESPACE_END
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def(
+        // comm_buffer and buffer_flags are workspaces the kernel updates, declared like allreduce's workspace:
+        // functionalization under torch.compile rejects a custom op that returns Tensor[] while annotating an
+        // input as mutated.
         "mnnvl_fusion_allreduce(Tensor input, Tensor? gamma, Tensor? residual, "
-        "float? epsilon, Tensor(a!) comm_buffer, Tensor buffer_flags, bool rmsnorm_fusion, "
+        "float? epsilon, Tensor comm_buffer, Tensor buffer_flags, bool rmsnorm_fusion, "
         "Tensor? scale=None, int fusion_op=0) -> "
         "Tensor[]");
     m.def(
