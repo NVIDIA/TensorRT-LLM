@@ -39,8 +39,9 @@ def _extract_class(
     bases: Tuple[str, ...] = (),
 ):
     tree = ast.parse(path.read_text())
+    # Breadth-first, so a module-level class wins over a nested one of the same name.
     original = next(
-        node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == name
+        node for node in ast.walk(tree) if isinstance(node, ast.ClassDef) and node.name == name
     )
     if methods is None:
         selected = original
@@ -1587,11 +1588,14 @@ def test_megamoe_cute_weight_cache_keys_every_view_field():
         conversions.append((t, assumed_align))
         return ("cute", len(conversions))
 
-    to_cute_cached = _extract_function(
-        _TORCH_ROOT / "moe/custom_ops/cute_dsl_megamoe_custom_op.py",
-        "_to_cute_cached",
-        {"torch": SimpleNamespace(Tensor=object), "_cute_launch_helpers": lambda: (to_cute,)},
-    )
+    source = _TORCH_ROOT / "moe/custom_ops/cute_dsl_megamoe_custom_op.py"
+    namespace = {
+        "torch": SimpleNamespace(Tensor=object),
+        "Tuple": Tuple,
+        "_cute_launch_helpers": lambda: (to_cute,),
+    }
+    _extract_function(source, "_cute_view_key", namespace)
+    to_cute_cached = _extract_function(source, "_to_cute_cached", namespace)
 
     def weight(ptr=4096, shape=(8, 16), stride=(16, 1), dtype="fp4", device=0):
         return SimpleNamespace(
@@ -1619,6 +1623,48 @@ def test_megamoe_cute_weight_cache_keys_every_view_field():
     assert len(conversions) == 7
     # The cache belongs to the caller: another module's dict starts empty.
     assert to_cute_cached({}, weight()) is not first
+
+    # A slot keeps only the latest view of a buffer whose live rows change.
+    to_cute_slot = _extract_function(source, "_to_cute_slot", namespace)
+    slots = {}
+    conversions.clear()
+    rows_8 = to_cute_slot(slots, "output", weight(shape=(8, 16)))
+    assert to_cute_slot(slots, "output", weight(shape=(8, 16))) is rows_8
+    rows_4 = to_cute_slot(slots, "output", weight(shape=(4, 16)))
+    assert rows_4 is not rows_8 and len(slots) == 1
+    assert to_cute_slot(slots, "output", weight(shape=(8, 16))) is not rows_8
+    assert len(conversions) == 3
+
+
+def test_megamoe_cute_pointer_cache_keys_address_and_alignment():
+    made = []
+
+    def to_cute_ptr(t, assumed_align):
+        made.append((t.data_ptr(), assumed_align))
+        return ("ptr", len(made))
+
+    source = _TORCH_ROOT / "moe/custom_ops/cute_dsl_megamoe_custom_op.py"
+    cache = {}
+    namespace = {
+        "torch": SimpleNamespace(Tensor=object),
+        "_cute_launch_helpers": lambda: (None, to_cute_ptr),
+        "_MEGAMOE_CUTE_PTR_CACHE": cache,
+        "_MEGAMOE_CUTE_PTR_CACHE_MAX_ENTRIES": 2,
+    }
+    to_cute_ptr_cached = _extract_function(source, "_to_cute_ptr_cached", namespace)
+
+    def buffer(ptr):
+        return SimpleNamespace(data_ptr=lambda: ptr)
+
+    first = to_cute_ptr_cached(buffer(4096))
+    # Another tensor at the same address gets the same pointer.
+    assert to_cute_ptr_cached(buffer(4096)) is first
+    assert to_cute_ptr_cached(buffer(4096), assumed_align=4) is not first
+    assert len(made) == 2
+    # The cache is bounded: a third entry starts it over.
+    to_cute_ptr_cached(buffer(8192))
+    assert len(cache) == 1
+    assert to_cute_ptr_cached(buffer(4096)) is not first
 
 
 def test_route_wait_occurs_after_independent_staging():
@@ -1664,6 +1710,71 @@ def test_route_wait_occurs_after_independent_staging():
     assert "wait" not in trace
     assert not any("topk_idx_local" in item for item in trace)
     assert owner._last_staged_T[8] == 8
+
+
+def test_megamoe_launch_buffers_are_built_once_per_bucket_and_mode():
+    inference = SimpleNamespace(enabled=True)
+    fake_torch = SimpleNamespace(is_inference_mode_enabled=lambda: inference.enabled)
+    impl = _extract_class(
+        _TORCH_ROOT / "moe/fused_moe/mega_moe/mega_moe_cute_dsl.py",
+        "TrtllmCutedslMegaMoeNvfp4Impl",
+        {"_acquire_buffers"},
+        {"torch": fake_torch},
+    )
+    built = []
+    owner = impl()
+    owner._launch_buffers = {}
+
+    def build_buffers(**kwargs):
+        built.append((kwargs["launch_max_T"], inference.enabled))
+        return object()
+
+    owner._build_buffers = build_buffers
+    args = dict(top_k=6, hidden=7168, device="cuda:0", output_dtype="bf16")
+
+    first = owner._acquire_buffers(**args, launch_max_T=8192)
+    assert owner._acquire_buffers(**args, launch_max_T=8192) is first
+    assert owner._acquire_buffers(**args, launch_max_T=4096) is not first
+    # Views made under inference mode are kept apart from normal-mode views.
+    inference.enabled = False
+    assert owner._acquire_buffers(**args, launch_max_T=8192) is not first
+    assert built == [(8192, True), (4096, True), (8192, False)]
+
+
+def test_megamoe_symmetric_regions_are_built_once_per_mode():
+    inference = SimpleNamespace(enabled=True)
+    provider_cls = _extract_class(
+        _TORCH_ROOT / "moe/custom_ops/cute_dsl_megamoe_custom_op.py",
+        "MegaMoeSymmMemProvider",
+        {"get_regions"},
+        {"torch": SimpleNamespace(is_inference_mode_enabled=lambda: inference.enabled)},
+    )
+    provider = provider_cls()
+    provider._regions = {}
+    built = []
+    provider._build_regions = lambda: built.append(inference.enabled) or object()
+
+    regions = provider.get_regions()
+    assert provider.get_regions() is regions
+    inference.enabled = False
+    assert provider.get_regions() is not regions
+    assert built == [True, False]
+
+
+def test_megamoe_runner_identity_is_built_once():
+    runner_cls = _extract_class(
+        _TORCH_ROOT / "moe/custom_ops/cute_dsl_megamoe_custom_op.py",
+        "Sm100MegaMoENvfp4Runner",
+        {"unique_id"},
+        {},
+    )
+    runner = runner_cls()
+    builds = []
+    runner._build_unique_id = lambda: builds.append(1) or (100, 8, 6)
+
+    assert runner.unique_id() == (100, 8, 6)
+    assert runner.unique_id() == (100, 8, 6)
+    assert builds == [1]
 
 
 def test_warmup_owner_handoff_uses_deduplicated_manager_public_api():
