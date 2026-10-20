@@ -61,21 +61,28 @@ def _whisper_model_path() -> Path:
     raise FileNotFoundError(f"whisper-tiny not found under {root}")
 
 
-def _whisper_audio_path() -> Path:
+def _whisper_audio_path(model_path: Path) -> Path:
     root = llm_models_root(check=True)
-    for checkpoint in ("large-v3", "large-v2"):
-        candidate = root / f"whisper-models/{checkpoint}/1221-135766-0002.wav"
+    filename = "1221-135766-0002.wav"
+    candidates = [
+        model_path / filename,
+        root / f"whisper-models/large-v3/{filename}",
+        root / f"whisper-models/large-v2/{filename}",
+    ]
+    for candidate in candidates:
         if candidate.exists():
             return candidate
-    raise FileNotFoundError(f"Whisper test audio not found under {root}/whisper-models")
+    raise FileNotFoundError(f"Whisper test audio not found; tried {candidates}")
 
 
 @pytest.fixture
 def whisper():
     if not torch.cuda.is_available():
         pytest.skip("requires a GPU to run a real Whisper engine")
+    model_path = _whisper_model_path()
+    audio_path = _whisper_audio_path(model_path)
     engine = LLM(
-        model=str(_whisper_model_path()),
+        model=str(model_path),
         disable_overlap_scheduler=True,
         enable_chunked_prefill=False,
         kv_cache_config=KvCacheConfig(
@@ -90,7 +97,7 @@ def whisper():
         scheduler_config=SchedulerConfig(use_python_scheduler=True),
     )
     try:
-        yield engine
+        yield engine, audio_path
     finally:
         engine.shutdown()
 
@@ -205,6 +212,7 @@ class TestVlmMediaConformance:
 
 
 def test_audio_capability_agrees_with_generate(whisper):
+    whisper, audio_path = whisper
     inference = OpenEngineInferenceServicer(whisper, WHISPER_MODEL_NAME)
     control = OpenEngineControlServicer(whisper, WHISPER_MODEL_NAME, inference)
     info = asyncio.run(
@@ -219,9 +227,7 @@ def test_audio_capability_agrees_with_generate(whisper):
     assert info.supports_token_ids_input is False
     assert list(info.extra["trtllm_supported_modalities"]) == ["audio"]
 
-    audio_uri = (
-        "data:audio/wav;base64," + base64.b64encode(_whisper_audio_path().read_bytes()).decode()
-    )
+    audio_uri = "data:audio/wav;base64," + base64.b64encode(audio_path.read_bytes()).decode()
     request = generation_pb2.GenerateRequest(
         request_id="openengine-audio-conformance",
         model=WHISPER_MODEL_NAME,
@@ -232,7 +238,6 @@ def test_audio_capability_agrees_with_generate(whisper):
             generation_pb2.MediaItem(
                 modality=generation_pb2.MODALITY_AUDIO,
                 data_uri=audio_uri,
-                uuid="librispeech-1221-135766-0002",
             )
         ],
     )

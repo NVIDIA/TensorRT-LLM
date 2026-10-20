@@ -114,6 +114,15 @@ class _AudioInputProcessor:
         raise NotImplementedError
 
 
+class _NonCallableRegisteredInputProcessor:
+    """Malformed registration used to verify capability discovery fails closed."""
+
+    _registered_model_type = _ImageConfig.model_type
+
+    def __init__(self, config: _ImageConfig) -> None:
+        self.config = config
+
+
 class _Tokenizer:
     def convert_ids_to_tokens(
         self, token_ids: Sequence[int], skip_special_tokens: bool = False
@@ -283,6 +292,17 @@ def test_media_capability_accepts_a_registered_non_base_processor(monkeypatch):
     )
 
     assert request_mapping.media_capabilities_for_model(llm).modalities == {"audio"}
+
+
+def test_media_capability_rejects_a_registered_non_callable_processor(monkeypatch):
+    config = _ImageConfig()
+    monkeypatch.setattr(MULTIMODAL_PLACEHOLDER_REGISTRY, "is_valid", lambda *_args: True)
+    llm = SimpleNamespace(
+        _hf_model_config=config,
+        input_processor=_NonCallableRegisteredInputProcessor(config),
+    )
+
+    assert request_mapping.media_capabilities_for_model(llm).modalities == set()
 
 
 def test_media_capabilities_are_hashable():

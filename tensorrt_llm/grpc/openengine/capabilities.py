@@ -84,7 +84,9 @@ def resolve_media_capabilities(
         return MediaCapabilities({})
     if not isinstance(input_processor, BaseMultimodalInputProcessor):
         registered_model_type = getattr(type(input_processor), "_registered_model_type", None)
-        if registered_model_type != model_type or not callable(input_processor):
+        if registered_model_type != model_type:
+            return MediaCapabilities({})
+        if not callable(input_processor):
             return MediaCapabilities({})
 
     placeholders = {
