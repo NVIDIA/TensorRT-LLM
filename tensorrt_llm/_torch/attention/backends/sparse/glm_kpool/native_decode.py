@@ -26,8 +26,9 @@ class GlmKpoolNativeDecode:
         self._counter: torch.Tensor | None = None
         self._workspace_size = 0
         self._counter_size = 0
-        # Largest (query rows, query heads) the sizes cover, per query dtype.
-        self._covered: dict[torch.dtype, tuple[int, int]] = {}
+        # Largest query rows and heads the sizes cover.
+        self._covered_rows = 0
+        self._covered_heads = 0
 
     def prepare_workspace(
         self,
@@ -42,22 +43,17 @@ class GlmKpoolNativeDecode:
         from ...fmha.flashinfer_trtllm_gen import _get_generation_workspace_layout
 
         capturing = torch.cuda.is_current_stream_capturing()
-        dtype = query_dtype or q.dtype
-        covered_rows, covered_heads = self._covered.get(dtype, (0, 0))
-        if max_query_rows > covered_rows or q.shape[1] > covered_heads:
+        rows = max(max_query_rows, self._covered_rows)
+        heads = max(q.shape[1], self._covered_heads)
+        if (rows, heads) != (self._covered_rows, self._covered_heads):
             # Host-side queries; rerun only when the rows or heads outgrow the sizes.
-            rows = max(max_query_rows, covered_rows)
-            heads = max(q.shape[1], covered_heads)
-            layout = _get_generation_workspace_layout(dtype, rows, rows, heads, 512, 1, 0)
+            layout = _get_generation_workspace_layout(
+                query_dtype or q.dtype, rows, rows, heads, 512, 1, 0
+            )
             sm_count = torch.cuda.get_device_properties(q.device).multi_processor_count
-            self._workspace_size = max(
-                self._workspace_size, int(layout["trtllm_gen_workspace_size"])
-            )
-            self._counter_size = max(
-                self._counter_size,
-                get_trtllm_gen_multi_ctas_kv_counter_bytes(rows, heads, sm_count),
-            )
-            self._covered[dtype] = (rows, heads)
+            self._workspace_size = int(layout["trtllm_gen_workspace_size"])
+            self._counter_size = get_trtllm_gen_multi_ctas_kv_counter_bytes(rows, heads, sm_count)
+            self._covered_rows, self._covered_heads = rows, heads
         workspace = metadata.effective_workspace
         if workspace is None:
             raise RuntimeError("glm_kpool native decode requires prepared attention workspace")
