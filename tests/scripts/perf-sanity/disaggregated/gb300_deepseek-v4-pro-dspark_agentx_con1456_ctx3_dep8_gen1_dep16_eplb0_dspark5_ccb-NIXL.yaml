@@ -2,6 +2,10 @@ metadata:
   model_name: deepseek_v4_pro_nvfp4_dspark
   precision: fp4
   model_dir_name: DeepSeek-V4-Pro-nvfp4-DSpark
+  # Keeps the cache-transceiver precheck's KV-manager/runtime "auto"
+  # resolvable where these weights are not staged (see its README).
+  architectures:
+  - DeepseekV4ForCausalLM
   supported_gpus:
   - GB300
   script_file: disaggr_torch.slurm

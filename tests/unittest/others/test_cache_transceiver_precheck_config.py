@@ -253,6 +253,34 @@ def test_side_plan_views():
     assert gen_view["cache_transceiver_config"]["max_tokens_in_buffer"] == 16384
 
 
+@pytest.mark.parametrize(
+    ("declared", "expected"),
+    (
+        (None, []),
+        ("DeepseekV4ForCausalLM", ["DeepseekV4ForCausalLM"]),
+        (["DeepseekV4ForCausalLM"], ["DeepseekV4ForCausalLM"]),
+    ),
+    ids=("absent", "bare-string", "list"),
+)
+def test_declared_architectures_reach_both_side_plans(declared, expected):
+    """metadata.architectures must survive into each per-role view.
+
+    resolve_model_prefs reads it from there to keep manager-version and
+    transceiver-runtime "auto" resolvable on a cluster where the checkpoint is
+    not staged; absent -> empty, and the driver then fails closed.
+    """
+    metadata = {"model_name": "deepseek_v4_pro_nvfp4_dspark"}
+    if declared is not None:
+        metadata["architectures"] = declared
+    plan = pcfg.resolve_plan(_disagg_yaml(metadata=metadata))
+    assert plan["architectures"] == expected
+    for role in ("ctx", "gen"):
+        assert pcfg.side_plan(plan, role)["architectures"] == expected
+    # Metadata, not a ctx/gen transfer contract: declaring it must not shift
+    # the fingerprint the two sides compare before transferring.
+    assert plan["fingerprint"] == pcfg.resolve_plan(_disagg_yaml())["fingerprint"]
+
+
 class TestControlWireFormat:
     """run_precheck's HMAC-JSON control frames (importable without torch)."""
 
