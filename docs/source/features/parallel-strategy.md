@@ -151,7 +151,7 @@ Wide-EP introduces the concept of **expert slots** that are decoupled from speci
 #### 3. Expert Parallelism Load Balancer (EPLB)
 - **Offline EPLB**: Pre-computed expert placement based on historical workload statistics
 - **Online EPLB**: Dynamic expert placement that adapts to real-time traffic patterns
-- **Per-layer dynamic EPLB**: Expert placement re-planned for every MoE layer on every forward pass, with hot-expert weights copied into shared helper slots on the GPU (`MEGAMOE_CUTEDSL` backend only)
+- **Per-layer dynamic EPLB**: Expert placement re-planned for every MoE layer on every forward pass, with hot-expert weights copied into helper slots on the GPU (`MEGAMOE_CUTEDSL` backend only)
 - Layer-wise weight redistribution to minimize inference disruption
 
 ### Architecture Overview

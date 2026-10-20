@@ -276,9 +276,9 @@ The hottest rank is now at 70.0 against a mean of 65, so the imbalance drops fro
 
 Offline EPLB keeps one expert placement for the whole run, and online EPLB refreshes `layer_updates_per_iter` layers per iteration from decayed statistics. Per-layer dynamic EPLB instead re-plans every MoE layer on every forward pass, from the routing of that pass:
 
-1. Each rank keeps its own `num_experts / ep_size` experts and has `(num_slots - num_experts) / ep_size` helper slots. The helper slots live in two banks that all MoE layers share, rather than in per-layer replicas.
+1. Each rank keeps its own `num_experts / ep_size` experts and has `(num_slots - num_experts) / ep_size` helper slots. By default (`helper_slot_mode: per_layer_resident`) every MoE layer has its own helper slots; with `shared_banks`, all MoE layers alternate between two shared helper banks.
 2. Before a layer's experts run, a GPU scheduler (HALO-Q) exchanges routed-token counts across the EP ranks, picks the hot experts to copy into helper slots, and maps every routed token to a resident or helper slot.
-3. The same kernel then moves the picked expert weights over NVLink on a high-priority auxiliary stream, while the main stream runs other work such as input quantization and, for DeepSeek-V4, the shared experts. By default each layer keeps its own helper slots, and an expert that a helper slot already holds from the previous forward pass is not copied again.
+3. The same kernel then moves the picked expert weights over NVLink on a high-priority auxiliary stream, while the main stream runs other work such as input quantization and, for DeepSeek-V4, the shared experts. By default, an expert that a helper slot already holds from that layer's previous forward pass is not copied again.
 4. The MoE kernel reads a helper slot only after its weights are marked ready.
 
 Expert weights are not staged in host shared memory, so the GDRCopy and shared-memory setup that online EPLB needs does not apply.
