@@ -1,3 +1,6 @@
+.. SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+.. SPDX-License-Identifier: Apache-2.0
+
 .. TensorRT LLM documentation master file, created by
    sphinx-quickstart on Wed Sep 20 08:35:21 2023.
    You can adapt this file completely to your liking, but it should at least
@@ -65,6 +68,7 @@ Welcome to TensorRT LLM's Documentation!
    features/feature-combination-matrix.md
    features/attention.md
    features/disagg-serving.md
+   features/subagent-routing.md
    features/embeddings.md
    features/kvcache.md
    features/kv-cache-compression.md
@@ -82,13 +86,14 @@ Welcome to TensorRT LLM's Documentation!
    features/speculative-decoding.md
    features/checkpoint-loading.md
    features/model-express.md
-   features/auto_deploy/auto-deploy.md
-   features/auto_deploy/transforms.rst
+   features/sleep-wakeup.md
    features/ray-orchestrator.md
    features/torch_compile_and_piecewise_cuda_graph.md
    features/helix.md
    features/kv-cache-connector.md
    features/sparse-attention.md
+   features/visual-generation.md
+   features/prefix-tokenization-cache.md
 
 
 .. toctree::
@@ -98,6 +103,7 @@ Welcome to TensorRT LLM's Documentation!
    developer-guide/overview.md
    developer-guide/perf-analysis.md
    developer-guide/perf-benchmarking.md
+   developer-guide/moe-perf-guide.md
    developer-guide/ci-overview.md
    developer-guide/dev-containers.md
    developer-guide/api-change.md

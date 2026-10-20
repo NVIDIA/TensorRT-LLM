@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
 import importlib
 import os
 import pickle  # nosec B403
@@ -44,6 +45,8 @@ TOKENIZER_ALIASES = {
     "tensorrt_llm.tokenizer.deepseek_v32.DeepseekV32Tokenizer",
     "deepseek_v4":
     "tensorrt_llm.tokenizer.deepseek_v4.DeepseekV4Tokenizer",
+    "deepseek_v41":
+    "tensorrt_llm.tokenizer.deepseek_v41.DeepseekV41Tokenizer",
     "mistral_common":
     "tensorrt_llm._torch.models.checkpoints.mistral.tokenizer.MistralTokenizer",
 }
@@ -200,6 +203,27 @@ def maybe_fix_byte_level_tokenizer(tokenizer, pretrained_model_dir: str,
                                                    **fast_kwargs)
 
 
+def _hf_remote_code_guard(trust_remote_code: bool):
+    """Return the remote-code lock, or a no-op when nothing can be written.
+
+    A tokenizer load reaches remote code even when the tokenizer class itself is
+    built in: ``AutoTokenizer.from_pretrained`` resolves that class through
+    ``AutoConfig.from_pretrained``, so a checkpoint whose config.json carries an
+    ``auto_map`` publishes its .py files into ``HF_MODULES_CACHE`` from here too,
+    not only from the model-config and input-processor paths.
+    ``hf_remote_code_lock`` documents why racing that publish breaks the import,
+    and asks every caller to share the one lock instead of defining its own.
+
+    The import is deferred to call time because a module-scope one would cycle:
+    ``_torch.model_config`` imports ``llmapi.llm_args``, which imports this
+    package back.
+    """
+    if not trust_remote_code:
+        return contextlib.nullcontext()
+    from tensorrt_llm._torch.model_config import hf_remote_code_lock
+    return hf_remote_code_lock()
+
+
 class TransformersTokenizer(TokenizerBase):
     ''' A wrapper for the Transformers' tokenizer.
 
@@ -296,21 +320,26 @@ class TransformersTokenizer(TokenizerBase):
     @classmethod
     def from_pretrained(cls, pretrained_model_dir: str, **kwargs):
         try:
-            tokenizer = AutoTokenizer.from_pretrained(pretrained_model_dir,
-                                                      **kwargs)
+            with _hf_remote_code_guard(kwargs.get('trust_remote_code', False)):
+                tokenizer = AutoTokenizer.from_pretrained(
+                    pretrained_model_dir, **kwargs)
         except Exception as e:
-            # Two transformers 5.x regressions for model_types not registered
-            # in CONFIG_MAPPING_NAMES. PreTrainedTokenizerFast reads
-            # tokenizer.json directly and skips AutoConfig, so it sidesteps
-            # both:
+            # Three transformers 5.x regressions for model_types not
+            # registered in CONFIG_MAPPING_NAMES. PreTrainedTokenizerFast reads
+            # tokenizer.json directly and skips AutoConfig, so it sidesteps all
+            # three:
             #  - deepseek_v32: bare PreTrainedConfig fallback hits
             #    modeling_rope_utils → self.max_position_embeddings →
             #    AttributeError (PreTrainedConfig is now a dataclass with
             #    declared fields). See deepseek-ai/DeepSeek-V3#1207.
             #  - glm_moe_dsa: layer_types=['deepseek_sparse_attention', ...] is
             #    rejected by validate_layer_type (not in ALLOWED_LAYER_TYPES).
+            #  - nemotron_h: layers_block_type carries the transformers 5.13
+            #    vocabulary, rejected by validate_layers_block_type.
             msg = str(e)
-            if "max_position_embeddings" not in msg and "layer_types" not in msg:
+            if ("max_position_embeddings" not in msg
+                    and "layer_types" not in msg
+                    and "layers_block_type" not in msg):
                 raise
             tokenizer = _fallback_to_fast_tokenizer(pretrained_model_dir, e,
                                                     **kwargs)
@@ -440,6 +469,7 @@ class TransformersTokenizer(TokenizerBase):
                 token_ids,
                 prev_text,
                 states,
+                flush=flush,
                 skip_special_tokens=skip_special_tokens,
                 clean_up_tokenization_spaces=clean_up_tokenization_spaces)
 
@@ -507,9 +537,20 @@ class TransformersTokenizer(TokenizerBase):
         prev_text: Optional[str] = None,
         states: Optional[dict] = None,
         *,
+        flush: bool = False,
         skip_special_tokens: bool = False,
         clean_up_tokenization_spaces: Optional[bool] = None
     ) -> Tuple[str, dict]:
+        """Incremental detokenization with the HF ``DecodeStream``.
+
+        ``DecodeStream.step`` returns ``None`` while a token cannot be decoded
+        on its own yet (e.g. the first byte-level piece of a multi-byte UTF-8
+        character), and has no way to release what it is holding. The ids it
+        holds are tracked in ``states['pending_ids']``, along with the last id
+        that did produce text, so that ``flush`` -- set on the final response
+        of a request -- can emit the held-back text the way a full decode of
+        the output would, instead of silently dropping it.
+        """
         if states is None:
             states = {
                 'decode_stream':
@@ -517,6 +558,7 @@ class TransformersTokenizer(TokenizerBase):
             }
 
         decode_stream = states.get('decode_stream')
+        pending_ids = states.setdefault('pending_ids', [])
         results = []
         for tid in token_ids:
             try:
@@ -532,9 +574,20 @@ class TransformersTokenizer(TokenizerBase):
                 decode_stream = DecodeStream(
                     skip_special_tokens=skip_special_tokens)
                 states['decode_stream'] = decode_stream
+                pending_ids.clear()
+                states.pop('last_decoded_id', None)
                 result = decode_stream.step(self.tokenizer._tokenizer, tid)
-            if result is not None:
+            if result is None:
+                pending_ids.append(tid)
+            else:
                 results.append(result)
+                pending_ids.clear()
+                states['last_decoded_id'] = tid
+        if flush and pending_ids:
+            results.append(
+                self._decode_pending_tail(states.get('last_decoded_id'),
+                                          pending_ids, skip_special_tokens))
+            pending_ids.clear()
         curr_new_text = "".join(results)
         if clean_up_tokenization_spaces is None:
             clean_up_tokenization_spaces = self.clean_up_tokenization_spaces
@@ -545,6 +598,29 @@ class TransformersTokenizer(TokenizerBase):
             return curr_new_text, states
         else:
             return prev_text + curr_new_text, states
+
+    def _decode_pending_tail(self, last_decoded_id: Optional[int],
+                             pending_ids: List[int],
+                             skip_special_tokens: bool) -> str:
+        """Text a full decode would add for the ids ``DecodeStream`` still holds.
+
+        The ids are decoded after the last id that already produced text, and
+        only the part past that id's own text is returned, so decoders that
+        depend on the previous token (e.g. a leading-space rule) see the same
+        context the stream did. Space clean-up is left to the caller, which
+        applies it to the streamed text as a whole.
+        """
+        kwargs = {
+            'skip_special_tokens': skip_special_tokens,
+            'clean_up_tokenization_spaces': False,
+        }
+        if last_decoded_id is None:
+            return self.tokenizer.decode(pending_ids, **kwargs)
+        prefix = self.tokenizer.decode([last_decoded_id], **kwargs)
+        text = self.tokenizer.decode([last_decoded_id] + pending_ids, **kwargs)
+        if text.startswith(prefix):
+            return text[len(prefix):]
+        return self.tokenizer.decode(pending_ids, **kwargs)
 
 
 def tokenizer_factory(obj: Optional[Union[str, Path, PreTrainedTokenizerBase,
@@ -730,6 +806,7 @@ def load_custom_tokenizer(
     model_dir: Union[str, Path],
     trust_remote_code: bool = True,
     use_fast: bool = True,
+    **kwargs,
 ) -> TokenizerBase:
     """Load a custom tokenizer class by import path or alias.
 
@@ -740,14 +817,27 @@ def load_custom_tokenizer(
         model_dir: The model directory to load the tokenizer from.
         trust_remote_code: Whether to trust remote code.
         use_fast: Whether to use the fast tokenizer.
+        **kwargs: Forwarded to the tokenizer class's `from_pretrained`
+            (e.g. `padding_side`).
 
     Returns:
         An instance of the custom tokenizer class.
 
     Raises:
-        ValueError: If the tokenizer cannot be loaded due to invalid identifier,
-            import failure, or missing class.
+        ValueError: If the identifier is neither a registered alias nor a
+            dotted import path, or if the tokenizer cannot be loaded due to
+            an import failure or a missing class.
     """
+    # A dotless identifier that is not a registered alias would otherwise
+    # be split as an import path and fail inside `rsplit` with an unhelpful
+    # "not enough values to unpack"; name the actual problem instead.
+    if (tokenizer_identifier not in TOKENIZER_ALIASES
+            and '.' not in tokenizer_identifier):
+        raise ValueError(
+            f"Failed to load custom tokenizer '{tokenizer_identifier}': "
+            f"unknown alias. Known aliases: {sorted(TOKENIZER_ALIASES)}. "
+            "Expected format: 'module.path.ClassName' or a recognized alias.")
+
     # Resolve aliases to full import paths
     import_path = TOKENIZER_ALIASES.get(tokenizer_identifier,
                                         tokenizer_identifier)
@@ -757,7 +847,10 @@ def load_custom_tokenizer(
         module = importlib.import_module(module_path)
         tokenizer_class = getattr(module, class_name)
         return tokenizer_class.from_pretrained(
-            model_dir, trust_remote_code=trust_remote_code, use_fast=use_fast)
+            model_dir,
+            trust_remote_code=trust_remote_code,
+            use_fast=use_fast,
+            **kwargs)
     except (ValueError, ImportError, AttributeError) as e:
         raise ValueError(
             f"Failed to load custom tokenizer '{tokenizer_identifier}': {e}. "

@@ -50,7 +50,7 @@ including mixed batches.
 
 | Parameter | Support |
 |---|---|
-| GPU architecture | SM90, SM100, SM103, SM120, and SM121 |
+| GPU architecture | SM90, SM100, SM103, SM107, SM120, and SM121 |
 | Compute phase | Packed prefill and generation, including mixed batches |
 | Attention type | MLA |
 | Head counts | Checkpoint-defined |
@@ -148,6 +148,53 @@ Backend developers can use
 [`test_sparse_mha.py`](../../../tests/unittest/_torch/attention/sparse/test_sparse_mha.py)
 as an executable integration example.
 
+<a id="block-sparse-mha-mqa-gqa"></a>
+
+### Block-sparse MHA/MQA/GQA
+
+The generic block-sparse path executes attention over KV blocks that a sparse
+algorithm selects for each KV head. The algorithm hands its routes to the core
+forward through the `block_sparse_attn_predict` hook as
+`BlockSparseForwardInputs`: canonical BSR (`block_indptr` plus `block_indices`)
+or a packed block bitmask, optionally with K/V block summaries so unselected
+blocks contribute a proxy instead of being dropped. Only the block-sparse FMHA
+library declares `supports_block_sparse_inputs`, so a request that carries
+routes is never served by a dense kernel. Both the contiguous prefill path,
+used by diffusion models that keep no KV cache, and the paged generation path
+are provided by the vendored PrimTS kernels.
+
+This is an attention capability, not a standalone public
+`SparseAttentionConfig` algorithm. A user-facing algorithm must also provide
+the selector, metadata, and backend integration.
+
+| Parameter | Contiguous prefill | Paged generation |
+|---|---|---|
+| GPU architecture | SM100 and SM103 | SM100 and SM103 |
+| Compute phase | Prefill with separate Q/K/V and no KV cache | Generation with a fixed per-request query length |
+| Attention type | MHA, MQA, and GQA | MHA, MQA, and GQA |
+| Head counts | Q heads must be divisible by KV heads; no other discrete limit | Q heads must be divisible by KV heads; no other discrete limit |
+| Q heads per KV head | Any divisor of the Q head count | Any divisor of the Q head count |
+| Head dimensions | Q/K/V: `128` | Q/K/V: `128` |
+| Input dtype | BF16 or FP16 | BF16 or FP16 |
+| Input layout | Separate Q `[tokens, q_heads, 128]` and K/V `[tokens, kv_heads, 128]` | Fused QKV |
+| Output dtype | Model dtype | Model dtype |
+| KV-cache dtype | No KV cache | Model dtype |
+| KV-cache layout | No KV cache | Paged HND cache; page size `64` or `128` |
+| Sparse granularity | Q blocks of `q_block_size` tokens by KV blocks of `8`, `16`, `32`, or a positive multiple of `64` tokens, selected per KV head | KV blocks of a positive multiple of `64` tokens, selected per KV head |
+| Sparse routes | BSR or packed bitmask; optional K/V block summaries (proxy routes); optional packed `kv_valid_bits` for ragged KV tails | BSR; live per-request KV lengths and page tables |
+| Attention semantics | Dense or causal self-attention; proxy routes require dense | Causal self-attention |
+
+Routes are validated against the kernel's static profile on every call, and an
+unsupported request raises instead of degrading to dense attention. A paged
+request needs a page that holds at least one 64-token route fragment, which is
+why page sizes below `64` are rejected.
+
+Backend developers can use
+[`test_prims_ts_block_sparse.py`](../../../tests/unittest/_torch/attention/sparse/test_prims_ts_block_sparse.py)
+as an executable integration example; it covers MHA, GQA, and MQA head
+topologies, both model dtypes, KV block sizes `64` and `128`, page sizes `64`
+and `128`, proxy routes, token-validity masks, and CUDA Graph replay.
+
 <a id="framework-level-sparse-attention"></a>
 
 ## Supported Algorithms
@@ -160,22 +207,23 @@ selector, runtime metadata, cache management, and attention implementation.
 | `rocket` | `RocketSparseAttentionConfig` | Prompt KV eviction, then page-level Top-K selection during decode | TRTLLM or Vanilla | Training-free sparsity for MHA/MQA/GQA models |
 | `dsa` | `DeepSeekSparseAttentionConfig` | Learned token-level indexer followed by sparse MLA | TRTLLM | DeepSeek-V3.2 and compatible model-native DSA architectures |
 | `deepseek_v4` | `DeepSeekV4SparseAttentionConfig` | Sliding-window attention plus compressed sparse or compressed dense history | TRTLLM | DeepSeek-V4 hybrid attention |
+| `csa2` | `CSA2SparseAttentionConfig` | Sliding-window attention plus compressed history with shared KV/index sources | TRTLLM, with hardware-selected Flash helpers | DeepSeek-V4.1 |
 | `minimax_m3` | `MiniMaxM3SparseAttentionConfig` | Learned block selection followed by sparse GQA | Dedicated Triton or packaged block-sparse implementation | MiniMax-M3 sparse layers |
 | `skip_softmax` | `SkipSoftmaxAttentionConfig` | Dynamically skips eligible softmax work inside the FMHA kernel | TRTLLM | Existing full-attention models with calibrated or direct thresholds |
 
-All five configs are supported only by the PyTorch execution backend. The
+These configs are supported only by the PyTorch execution backend. The
 "attention implementation" column refers to the attention kernel/backend used
 inside that execution backend.
 
 ### Capability Comparison
 
-| Capability | RocketKV | DSA | DeepSeek-V4 | MiniMax-M3 | Skip Softmax |
-|---|---:|---:|---:|---:|---:|
-| Sparse prefill computation | No | Yes | Yes | Yes | Yes |
-| Sparse decode computation | Yes | Yes | Yes | Yes | Yes |
-| Reduces retained main KV history | Yes | No | Yes, through model-native compression | No | No |
-| Requires a model-trained selector | No | Yes | Yes | Yes | No |
-| Selection granularity | Token eviction and pages | Tokens | Compressed entries | Blocks | Kernel tiles |
+| Capability | RocketKV | DSA | DeepSeek-V4 | CSA2 | MiniMax-M3 | Skip Softmax |
+|---|---:|---:|---:|---:|---:|---:|
+| Sparse prefill computation | No | Yes | Yes | Yes | Yes | Yes |
+| Sparse decode computation | Yes | Yes | Yes | Yes | Yes | Yes |
+| Reduces retained main KV history | Yes | No | Yes, through model-native compression | Yes, through model-native compression | No | No |
+| Requires a model-trained selector | No | Yes | Yes | Yes | Yes | No |
+| Selection granularity | Token eviction and pages | Tokens | Compressed entries | Compressed entries | Blocks | Kernel tiles |
 
 "No" for RocketKV prefill means that prompt attention is still computed
 densely. RocketKV selects which prompt KV entries to retain, so it reduces cache
@@ -259,7 +307,7 @@ sparse_attention_config:
 ```
 
 See the
-[DeepSeek V3/V3.2 example](../../../examples/models/core/deepseek_v3/README.md)
+[DeepSeek V3/V3.2 example](source:examples/models/core/deepseek_v3/README.md)
 for model precision, hardware, parallelism, MTP, chunked-prefill, cache-reuse,
 and disaggregated-serving support.
 
@@ -288,8 +336,45 @@ sparse_attention_config:
 ```
 
 See the
-[DeepSeek-V4 example](../../../examples/models/core/deepseek_v4/README.md) for
+[DeepSeek-V4 example](source:examples/models/core/deepseek_v4/README.md) for
 checkpoint-derived configuration and deployment constraints.
+
+#### DeepSeek-V4.1 CSA2
+
+DeepSeek-V4.1 selects `CSA2SparseAttentionConfig` from its checkpoint. Keep
+checkpoint compression ratios, KV/index source ownership, window and Top-K
+geometry intact; CSA2 is model-native rather than a switch for arbitrary MLA models.
+
+```yaml
+sparse_attention_config:
+  algorithm: csa2
+```
+
+| Constraint | CSA2 support |
+|---|---|
+| Hardware | SM90: FlashMLA BF16; SM100 family: native trtllm-gen; SM120/121: FlashInfer BF16 FA2 |
+| Attention shape | One KV head, 512-dimensional queries/values, 448 non-RoPE and 64 RoPE channels; checkpoint-defined Q heads |
+| Compression | Ratios `0` (SWA only), `1`, `2`; checkpoint-defined shared KV/index sources |
+| KV-cache block size | `128` or `256` tokens |
+| Persistent cache | Fixed E4M3 SWA, NVFP4 main/index records; `dtype` selects compute staging |
+| Staging | BF16; FP8 on native trtllm-gen without packed attention via `dtype: fp8` or `fp8_ds_mla` |
+| Parallelism | TP/EP and attention DP; PP/CP and disabled-layer masks unsupported |
+| Runtime | Chunked prefill, prefix reuse, overlap and CUDA graphs; embedded DSpark linear verification; tree verification unsupported |
+
+Decoder bounded replay is an **approximation enabled by default** for eligible
+CED layouts. It computes a trailing Decoder window while the Encoder produces
+the complete GLOBAL history. Set `TRTLLM_V41_DECODER_BOUNDED_REPLAY=0` before
+starting workers to use full Decoder prefill. Encoder replay is opt-in via
+`TRTLLM_V41_ENCODER_REPLAY=1` and requires Decoder bounded replay; it permits
+eviction and recovery of OPTIONAL Encoder SWA state. Set these consistently
+for all workers. Replay eligibility and output requirements can retain full
+prefill, as described in the [CSA2 implementation guide](../../../tensorrt_llm/_torch/attention/backends/sparse/csa2/README.md).
+
+Validate task accuracy against full prefill on the intended checkpoint before
+deploying bounded replay or optional packed/approximate selector paths. Include
+fresh prompts, reused prefixes, chunk boundaries and speculative verification;
+component tests of cache bytes and graph replay do not establish whole-model
+accuracy or end-to-end disaggregated-serving support.
 
 #### MiniMax-M3 Block-Sparse GQA
 
@@ -306,8 +391,10 @@ sparse_attention_config:
 
 Two implementations are available:
 
-- `triton` is the default reference implementation.
-- `msa` uses `fmha_sm100` kernels and requires an SM100-family GPU (SM100 or
+- `triton` is the legacy reference implementation and remains the configuration
+  default. Selecting it logs a recommendation to use `msa`. It does not support
+  NVFP4 KV cache.
+- `msa` is the recommended implementation and requires an SM100-family GPU (SM100 or
   SM103), the `fmha_sm100` package, and `sparse_block_size=128`.
 
 ```yaml
@@ -316,8 +403,29 @@ sparse_attention_config:
   implementation: msa
 ```
 
-The sparse path currently has no dense fallback and does not support KV-cache
-reuse or MTP. See the
+For NVFP4 KV cache, select MSA explicitly:
+
+```yaml
+kv_cache_config:
+  dtype: nvfp4
+  enable_block_reuse: false
+sparse_attention_config:
+  algorithm: minimax_m3
+  implementation: msa
+  indexer_kv_dtype: fp8
+```
+
+With NVFP4 KV cache, sparse target layers use packed E2M1 data and FP8 block
+scales. Dense target layers and the shared Eagle3 draft layer keep FP8 caches.
+Prefill uses MSA kernels; decode uses TensorRT LLM's Triton sparse kernels
+within the MSA backend. This does not select `implementation: triton`.
+The optional `fuse_qkv_index_projection: true` supports FP8 and NVFP4 main
+caches with an FP8 indexer.
+
+The sparse path has no dense fallback and does not support KV-cache reuse.
+Eagle3 supports one shared draft layer and linear drafting; other MTP/tree
+configurations are unsupported. NVFP4 KV with piecewise CUDA graphs is not
+qualified by the existing FP8-KV PCG tests. See the
 [MiniMax-M3 deployment guide](../deployment-guide/deployment-guide-for-minimax-m3-on-trtllm.md)
 for supported checkpoints and parallel deployment settings.
 
@@ -397,6 +505,14 @@ The formula is a [numexpr](https://numexpr.readthedocs.io/) expression over
 fnmatch layer patterns. At most one checkpoint config group may use the
 `skip_softmax` algorithm.
 
+TRT-LLM imports NumExpr only when it needs to consume a checkpoint formula.
+During package bootstrap, TRT-LLM defaults `NUMEXPR_NUM_THREADS` to `1` without
+overriding an explicit environment setting. This evaluates the scalar formulas
+without creating a NumExpr worker pool while allowing applications with
+substantial NumExpr work to opt into parallel evaluation. This setting controls
+only NumExpr and does not replace workload-specific OpenMP tuning. Applications
+that import NumExpr before TRT-LLM must configure it before process startup.
+
 Skip Softmax Attention requires the TRTLLM attention backend. Other attention
 backends do not apply it.
 
@@ -452,7 +568,7 @@ trtllm-bench --model deepseek-ai/DeepSeek-V3.2 throughput \
 Use a local checkpoint path in place of the Hugging Face model ID when needed.
 Other sparse algorithms use the same YAML entry point with their own
 `algorithm` discriminator and settings. See the
-[DeepSeek V3/V3.2 example](../../../examples/models/core/deepseek_v3/README.md)
+[DeepSeek V3/V3.2 example](source:examples/models/core/deepseek_v3/README.md)
 for model precision, hardware, parallelism, MTP, chunked-prefill, cache-reuse,
 and disaggregated-serving configurations.
 

@@ -26,12 +26,11 @@ from cutlass import Float32, Int32, Uint32
 from cutlass.experimental import primitives as prims
 
 from ..fmha_decode_config import FmhaDecodeConfig
+from ..fmha_decode_constants import FP8_P_QUANT_SCALE
 from .helpers_common import (
     Constexpr,
     fadd2,
     ffma2,
-    fmul2,
-    _fp8_log2_quant_scale,
     _neg_max_f32,
     _q_row_token_and_local_head,
 )
@@ -72,10 +71,74 @@ def _pack_float4_to_fp8_e4m3_inline(
 
 
 @cute.jit
+def _combine_int_frac_ex2(
+    x_rounded: Float32, frac_ex2: Float32, *, loc=None, ip=None
+) -> Float32:
+    """Scale ``frac_ex2`` by ``2**floor(x)`` through the FP32 exponent bits.
+
+    ``x_rounded`` still carries the magic rounding constant, so its low
+    mantissa bits hold ``floor(x)``; shifting them into the exponent field and
+    adding the bits of the polynomial result multiplies by the integer power.
+    """
+    return cute.arch.inline_ptx(
+        "{\n"
+        "  .reg .b32 xi;\n"
+        "  .reg .b32 fi;\n"
+        "  .reg .b32 xe;\n"
+        "  .reg .b32 oi;\n"
+        "  mov.b32 xi, {$r0};\n"
+        "  mov.b32 fi, {$r1};\n"
+        "  shl.b32 xe, xi, 23;\n"
+        "  add.s32 oi, xe, fi;\n"
+        "  mov.b32 {$w0}, oi;\n"
+        "}",
+        write_only_types=[Float32],
+        read_only_args=[x_rounded, frac_ex2],
+        loc=loc,
+        ip=ip,
+    )
+
+
+@cute.jit
+def _ex2_emulation_packed_f32x2(x: Float32, y: Float32) -> tuple[Float32, Float32]:
+    """Evaluate ``2**x`` and ``2**y`` on the FMA pipe instead of MUFU.
+
+    Inputs are non-positive scaled scores minus the row maximum. The integer
+    part is split off with a magic-constant rounding add, the fraction in
+    [0, 1) goes through a degree-3 minimax polynomial, and the two parts are
+    recombined through the exponent bits. The relative error stays below the
+    BF16 rounding of the P operand, matching the emulation used by the dense
+    Blackwell FMHA kernels.
+    """
+    fp32_round_int = float(2**23 + 2**22)
+    xy_clamped = (cute.arch.fmax(x, -127.0), cute.arch.fmax(y, -127.0))
+    xy_rounded = cute.arch.add_packed_f32x2(
+        xy_clamped, (fp32_round_int, fp32_round_int), rnd="rm"
+    )
+    xy_rounded_back = cute.arch.sub_packed_f32x2(
+        xy_rounded, (fp32_round_int, fp32_round_int)
+    )
+    xy_frac = cute.arch.sub_packed_f32x2(xy_clamped, xy_rounded_back)
+    coeff = (
+        1.0,
+        0.695146143436431884765625,
+        0.227564394474029541015625,
+        0.077119089663028717041015625,
+    )
+    out = (coeff[3], coeff[3])
+    for degree in cutlass.range_constexpr(2, -1, -1):
+        out = cute.arch.fma_packed_f32x2(out, xy_frac, (coeff[degree], coeff[degree]))
+    return (
+        _combine_int_frac_ex2(xy_rounded[0], out[0]),
+        _combine_int_frac_ex2(xy_rounded[1], out[1]),
+    )
+
+
+@cute.jit
 def _compute_fp8_p_regs_and_local_sums(
     scale_softmax_log2: Float32,
-    new_max_0: Float32,
-    new_max_1: Float32,
+    addend_0: Float32,
+    addend_1: Float32,
     s0: Float32,
     s1: Float32,
     s2: Float32,
@@ -85,40 +148,29 @@ def _compute_fp8_p_regs_and_local_sums(
     s6: Float32,
     s7: Float32,
 ) -> tuple[Int32, Int32, Float32, Float32]:
-    """Compute masked FP8 P registers and local softmax sums."""
-    # Safe path: masked tiles can produce NEG_FLT_MAX as new_max. Treat that
-    # as zero for the exponent offset so invalid rows generate zero P instead
-    # of NaNs while local sums remain zero.
-    safe_new_max_0 = new_max_0
-    safe_new_max_1 = new_max_1
-    if safe_new_max_0 == _neg_max_f32():
-        safe_new_max_0 = Float32(0.0)
-    if safe_new_max_1 == _neg_max_f32():
-        safe_new_max_1 = Float32(0.0)
-    neg_scaled_max_pair = ffma2(
-        (safe_new_max_0, safe_new_max_1),
-        (-scale_softmax_log2, -scale_softmax_log2),
-        (_fp8_log2_quant_scale(), _fp8_log2_quant_scale()),
-    )
+    """Exponentiate two scale groups of four scores into packed FP8 P and sums.
 
-    # Scale S by log2(e) * softmax_scale and include the FP8 quantization
-    # shift. The packed f32x2 operations keep paired scale groups aligned.
+    Every probability is ``exp2(c * s + addend)`` with the group's exponent
+    addend (``SmemPResource._exponent_addend``), so no mask logic is needed:
+    a masked score at ``-FLT_MAX`` exponentiates to zero.
+    """
+    addend_pair = (addend_0, addend_1)
     scaled_pair_01 = ffma2(
         (s0, s1),
         (scale_softmax_log2, scale_softmax_log2),
-        neg_scaled_max_pair,
+        addend_pair,
     )
     scaled_pair_23 = ffma2(
         (s2, s3),
         (scale_softmax_log2, scale_softmax_log2),
-        neg_scaled_max_pair,
+        addend_pair,
     )
     prob0 = cute.math.exp2(scaled_pair_01[0], fastmath=True)
     prob1 = cute.math.exp2(scaled_pair_01[1], fastmath=True)
     scaled_pair_45 = ffma2(
         (s4, s5),
         (scale_softmax_log2, scale_softmax_log2),
-        neg_scaled_max_pair,
+        addend_pair,
     )
     prob2 = cute.math.exp2(scaled_pair_23[0], fastmath=True)
     prob3 = cute.math.exp2(scaled_pair_23[1], fastmath=True)
@@ -128,7 +180,7 @@ def _compute_fp8_p_regs_and_local_sums(
     scaled_pair_67 = ffma2(
         (s6, s7),
         (scale_softmax_log2, scale_softmax_log2),
-        neg_scaled_max_pair,
+        addend_pair,
     )
     prob4 = cute.math.exp2(scaled_pair_45[0], fastmath=True)
     prob5 = cute.math.exp2(scaled_pair_45[1], fastmath=True)
@@ -142,69 +194,10 @@ def _compute_fp8_p_regs_and_local_sums(
 
 
 @cute.jit
-def _compute_fp8_p_regs_and_local_sums_dense(
+def _compute_p_values_and_local_sums(
     scale_softmax_log2: Float32,
-    new_max_0: Float32,
-    new_max_1: Float32,
-    s0: Float32,
-    s1: Float32,
-    s2: Float32,
-    s3: Float32,
-    s4: Float32,
-    s5: Float32,
-    s6: Float32,
-    s7: Float32,
-) -> tuple[Int32, Int32, Float32, Float32]:
-    """Compute dense FP8 P registers and local softmax sums."""
-    # Dense path: all S entries are valid, so no NEG_FLT_MAX guard is needed.
-    neg_scaled_max_pair = ffma2(
-        (new_max_0, new_max_1),
-        (-scale_softmax_log2, -scale_softmax_log2),
-        (_fp8_log2_quant_scale(), _fp8_log2_quant_scale()),
-    )
-
-    scaled_pair_01 = ffma2(
-        (s0, s1),
-        (scale_softmax_log2, scale_softmax_log2),
-        neg_scaled_max_pair,
-    )
-    scaled_pair_23 = ffma2(
-        (s2, s3),
-        (scale_softmax_log2, scale_softmax_log2),
-        neg_scaled_max_pair,
-    )
-    prob0 = cute.math.exp2(scaled_pair_01[0], fastmath=True)
-    prob1 = cute.math.exp2(scaled_pair_01[1], fastmath=True)
-    scaled_pair_45 = ffma2(
-        (s4, s5),
-        (scale_softmax_log2, scale_softmax_log2),
-        neg_scaled_max_pair,
-    )
-    prob2 = cute.math.exp2(scaled_pair_23[0], fastmath=True)
-    prob3 = cute.math.exp2(scaled_pair_23[1], fastmath=True)
-    local_sum_pair_01 = fadd2((prob0, prob1), (prob2, prob3))
-    packed_p_0 = _pack_float4_to_fp8_e4m3(prob0, prob1, prob2, prob3)
-    scaled_pair_67 = ffma2(
-        (s6, s7),
-        (scale_softmax_log2, scale_softmax_log2),
-        neg_scaled_max_pair,
-    )
-    prob4 = cute.math.exp2(scaled_pair_45[0], fastmath=True)
-    prob5 = cute.math.exp2(scaled_pair_45[1], fastmath=True)
-    prob6 = cute.math.exp2(scaled_pair_67[0], fastmath=True)
-    prob7 = cute.math.exp2(scaled_pair_67[1], fastmath=True)
-    local_sum_pair_45 = fadd2((prob4, prob5), (prob6, prob7))
-    packed_p_1 = _pack_float4_to_fp8_e4m3(prob4, prob5, prob6, prob7)
-    local_sum_pair = fadd2(local_sum_pair_01, local_sum_pair_45)
-
-    return packed_p_0, packed_p_1, local_sum_pair[0], local_sum_pair[1]
-
-
-@cute.jit
-def _compute_p_values_and_local_sums_dense(
-    scale_softmax_log2: Float32,
-    new_max_0: Float32,
-    new_max_1: Float32,
+    addend_0: Float32,
+    addend_1: Float32,
     s0: Float32,
     s1: Float32,
     s2: Float32,
@@ -225,36 +218,36 @@ def _compute_p_values_and_local_sums_dense(
     Float32,
     Float32,
 ]:
-    """Compute dense 16-bit P values and paired local softmax sums."""
-    # Dense 16-bit path: compute eight P values and the two local sums without
-    # per-row validity checks.
-    neg_scaled_max_pair = fmul2(
-        (new_max_0, new_max_1),
-        (-scale_softmax_log2, -scale_softmax_log2),
-    )
+    """Exponentiate two scale groups of four scores into FP32 P and paired sums.
+
+    Straight-line twin of ``_compute_fp8_p_regs_and_local_sums`` for 16-bit
+    P: the same ``exp2(c * s + addend)`` per score, returned unpacked so the
+    caller can choose the P storage format.
+    """
+    addend_pair = (addend_0, addend_1)
     scaled_pair_01 = ffma2(
         (s0, s1),
         (scale_softmax_log2, scale_softmax_log2),
-        neg_scaled_max_pair,
+        addend_pair,
     )
     scaled_pair_23 = ffma2(
         (s2, s3),
         (scale_softmax_log2, scale_softmax_log2),
-        neg_scaled_max_pair,
+        addend_pair,
     )
     prob0 = cute.math.exp2(scaled_pair_01[0], fastmath=True)
     prob1 = cute.math.exp2(scaled_pair_01[1], fastmath=True)
     scaled_pair_45 = ffma2(
         (s4, s5),
         (scale_softmax_log2, scale_softmax_log2),
-        neg_scaled_max_pair,
+        addend_pair,
     )
     prob2 = cute.math.exp2(scaled_pair_23[0], fastmath=True)
     prob3 = cute.math.exp2(scaled_pair_23[1], fastmath=True)
     scaled_pair_67 = ffma2(
         (s6, s7),
         (scale_softmax_log2, scale_softmax_log2),
-        neg_scaled_max_pair,
+        addend_pair,
     )
     prob4 = cute.math.exp2(scaled_pair_45[0], fastmath=True)
     prob5 = cute.math.exp2(scaled_pair_45[1], fastmath=True)
@@ -418,8 +411,8 @@ def _attention_sink_for_local_head(
         sink_val * Float32(1.4426950408889634) - max_val * scale_softmax_log2,
         fastmath=True,
     )
-    if cutlass.const_expr(cfg.use_fp8_qkv):
-        sink_exp = sink_exp * Float32(448.0)
+    if cutlass.const_expr(cfg.use_fp8_pv):
+        sink_exp = sink_exp * Float32(FP8_P_QUANT_SCALE)
     return sink_exp
 
 

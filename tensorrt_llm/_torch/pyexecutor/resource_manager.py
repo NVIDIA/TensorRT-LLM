@@ -65,6 +65,8 @@ PeftCacheManagerCpp = tensorrt_llm.bindings.internal.batch_manager.PeftCacheMana
 WorldConfig = tensorrt_llm.bindings.WorldConfig
 
 if TYPE_CHECKING:
+    from transformers import PretrainedConfig
+
     from tensorrt_llm._torch.attention.backends.interface import \
         AttentionMetadata
     from tensorrt_llm.llmapi.llm_args import (DecodingBaseConfig,
@@ -350,6 +352,17 @@ def _populate_dummy_mrope_config(req: LlmRequest, token_num: int,
 
 
 class KVCacheManager(BaseResourceManager):
+    # Declared on the class so it is present even when an instance is built
+    # without running __init__ (which overwrites it from the spec config);
+    # prepare_resources reads it on such test-built instances. Zero disables
+    # the spec recompute tail.
+    _spec_recompute_tail: int = 0
+    # Whether this manager also holds recurrent (conv/SSM) state. Hybrid
+    # Mamba/GDN managers override this: a reused request's recurrent slot
+    # already summarizes the matched prefix, so a partial rewind would apply
+    # the tokens between the rewind target and the matched length to that
+    # state a second time. Only a full re-prefill (rewind target 0) is safe.
+    _has_recurrent_state: bool = False
 
     def __init__(
         self,
@@ -499,8 +512,28 @@ class KVCacheManager(BaseResourceManager):
         # Import here to avoid circular imports
         from ..speculative import get_num_extra_kv_tokens
         self.num_extra_kv_tokens = get_num_extra_kv_tokens(spec_config)
+        # Recompute tail for hidden-state-conditioned drafters with block
+        # reuse: rewind cache-hit context requests so at least this many
+        # prompt tokens pass through the target forward. Resolved from the
+        # draft model config (or set explicitly) on the spec config; see
+        # _maybe_rewind_reused_context for why drafters need it. None means
+        # the auto value never resolved; recompute everything rather than
+        # silently serving a degraded drafter.
+        tail = getattr(spec_config, "context_recompute_tail", 0)
+        tail = -1 if tail is None else int(tail)
+        if tail > 0 and self._has_recurrent_state:
+            # A partial rewind double-applies the rewound span to the
+            # recurrent state (see _has_recurrent_state); only a full
+            # re-prefill rebuilds that state from scratch.
+            logger.warning(
+                "context_recompute_tail > 0 is unsupported on recurrent-state "
+                "cache managers: a partial rewind would apply reused tokens "
+                "to the conv/SSM state twice. Forcing a full re-prefill "
+                "(context_recompute_tail=-1).")
+            tail = -1
+        self._spec_recompute_tail = tail
         # Kept so prepare_resources can re-validate the per-step token budget
-        # (the forward-pass scratch size enforced in _prepare_tp_inputs).
+        # (the forward-pass scratch size enforced in DecoderInputPreparer.prepare_inputs).
         self.max_num_tokens = max_num_tokens
         # Whether chunked prefill is enabled for this engine. Gates the shrink
         # path in fit_token_budget: a context request may only be shrunk into a
@@ -724,6 +757,10 @@ class KVCacheManager(BaseResourceManager):
 
         self.enable_indexer_k_cache = enable_indexer_k_cache
 
+        cold_tier_offload_min_priority = (
+            kv_cache_config.secondary_offload_min_priority if isinstance(
+                kv_cache_config, tensorrt_llm.bindings.executor.KvCacheConfig)
+            else kv_cache_config.cold_tier_offload_min_priority)
         kwargs = {
             'num_kv_heads_per_layer': self.num_kv_heads_per_layer,
             'size_per_head': head_dim,
@@ -739,8 +776,7 @@ class KVCacheManager(BaseResourceManager):
             'chunk_size': min(max_num_tokens, self.max_seq_len),
             'enable_block_reuse': kv_cache_config.enable_block_reuse,
             'cache_type': kv_cache_type,
-            'secondary_offload_min_priority':
-            kv_cache_config.secondary_offload_min_priority,
+            'secondary_offload_min_priority': cold_tier_offload_min_priority,
             'enable_partial_reuse': kv_cache_config.enable_partial_reuse,
             'copy_on_partial_reuse': kv_cache_config.copy_on_partial_reuse,
             'kv_connector_manager': self.kv_connector_manager,
@@ -965,16 +1001,17 @@ class KVCacheManager(BaseResourceManager):
         ``context_chunk_size`` still spans the reusable KV prefix and this
         over-counts by up to the whole cached prefix.
 
-        Mirrors ``_prepare_tp_inputs``: a context request contributes
+        Mirrors ``DecoderInputPreparer._pack_context_requests``: a context request contributes
         ``all_prompt_tokens[pos : pos + chunk]``, which Python slicing clamps to
         what is left of the prompt, plus draft tokens on the last chunk only.
         """
         draft_len = get_draft_token_length(req)
         if is_context:
+            from .ced_replay import encoder_replay_tokens
             materialized = min(req.context_chunk_size,
                                req.context_remaining_length)
-            return materialized + (draft_len
-                                   if req.is_last_context_chunk else 0)
+            return materialized + encoder_replay_tokens(req) + (
+                draft_len if req.is_last_context_chunk else 0)
         # Generation: one position per beam for the new token, plus draft tokens
         # (speculative verification) per beam.
         return req.py_beam_width * (1 + draft_len)
@@ -1022,7 +1059,7 @@ class KVCacheManager(BaseResourceManager):
         ``prepopulated_prompt_len``, computed later inside ``addSequence``. When
         the real reuse comes in lower than the estimate, the forward pass
         materializes more tokens than were charged and trips the
-        ``total_num_tokens <= max_num_tokens`` assert in ``_prepare_tp_inputs``
+        ``total_num_tokens <= max_num_tokens`` assert in ``DecoderInputPreparer.prepare_inputs``
         -- which fails every request in the batch and charges the executor's
         error budget (GitHub issue #13318).
 
@@ -1168,10 +1205,15 @@ class KVCacheManager(BaseResourceManager):
                     for _ in range(get_draft_token_length(req)):
                         self.impl.add_token(req.py_request_id)
 
-                    if self.kv_connector_manager is not None:
+                    # A capacity-only connector cannot reach these blocks, so
+                    # gathering their indices would be for nothing.
+                    if (self.kv_connector_manager is not None
+                            and not self.kv_connector_manager.capacity_only):
                         block_ids = self.get_cache_indices(req)
                         self.kv_connector_manager.update_state_after_alloc(
                             req, block_ids)
+
+                self._maybe_apply_spec_recompute_tail(batch_llm_requests)
 
             for req in scheduled_batch.generation_requests:
                 if self.mapping.has_cp_helix():
@@ -1198,8 +1240,100 @@ class KVCacheManager(BaseResourceManager):
         # reuse, so we rebuild the context request lists here.
         scheduled_batch.reset_context_requests()
 
-    def publish_connector_scheduler_output(
-            self, scheduled_batch: ScheduledRequests) -> None:
+    def _maybe_apply_spec_recompute_tail(
+            self, batch_llm_requests: List[LlmRequest]) -> None:
+        """Gate and apply the spec-recompute rewind for this batch.
+
+        Target manager only: the rewind restores target-forward coverage for
+        drafter hidden-state capture, and the V2 counterpart
+        (_spec_recompute_claim_limit) no-ops on draft pools for the same
+        reason. The gates run here rather than in __init__ because
+        enable_chunked_prefill and the final attention windows are settled
+        after construction.
+        """
+        if not self._spec_recompute_tail or self.is_draft:
+            return
+        # Entries <= 0 are not attention windows (recurrent-state sentinels).
+        if any(window is not None and 0 < window < self.max_seq_len
+               for window in self.max_attention_window_vec):
+            # The rewind reattaches no blocks, and a sliding-window layer
+            # detaches out-of-window blocks (placeholder page-list slots), so
+            # a rewound cursor would read and write spans with no pages behind
+            # them. Unlike the V2 manager, which caps the reuse claim instead
+            # of rewinding, this manager cannot shorten the C++ match.
+            logger.warning(
+                "context_recompute_tail is unsupported with sliding-window "
+                "attention layers on this KV cache manager: a rewound cursor "
+                "would cross spans whose out-of-window blocks are detached. "
+                "Disabling the spec recompute tail.")
+            self._spec_recompute_tail = 0
+            return
+        if not self.enable_chunked_prefill:
+            # The scheduler admits cache-hit requests at their reuse-discounted
+            # token cost, so a rewound batch can exceed max_num_tokens; only
+            # chunked prefill (fit_token_budget) can shrink it back under the
+            # budget.
+            logger.warning("context_recompute_tail requires chunked prefill: "
+                           "without it a batch of rewound cache-hit requests "
+                           "can exceed max_num_tokens. Disabling the spec "
+                           "recompute tail.")
+            self._spec_recompute_tail = 0
+            return
+        self._maybe_rewind_reused_context(batch_llm_requests)
+
+    def _maybe_rewind_reused_context(
+            self, batch_llm_requests: List[LlmRequest]) -> None:
+        """Recompute a tail of reused prompt tokens for drafter capture.
+
+        Hidden-state-conditioned drafters (DFlash/DSpark) capture target
+        hidden states only for tokens that physically pass through a target
+        forward. A prefix-cache hit skips the reused tokens, so the drafter's
+        cross-attention context never sees them and acceptance length drops
+        (measured -15% AL at a 100% prefix-hit rate). Rewinding the context
+        position after ``add_sequence_batch`` keeps the blocks reused (the
+        allocation/dedup win stays, and the recompute rewrites them with
+        identical values) while restoring the drafter's inputs.
+
+        Driven by the spec config's ``context_recompute_tail`` (0 — off — by
+        default; an explicit None resolves from the draft model config): each
+        cache-hit request is rewound
+        so at least that many prompt tokens (block-aligned start) are
+        recomputed. For a drafter whose context attention is windowed (e.g.
+        DFlash2 ``swa_window_size``), a tail of the window size reproduces
+        the no-reuse drafter inputs exactly. ``-1`` forces a full re-prefill
+        (needed for non-windowed drafters). Chunked prefill is required and
+        enforced by the caller: the micro-batch scheduler admits on estimated
+        reuse, and ``fit_token_budget`` needs chunking to trim the extra
+        compute tokens when a batch of rewound requests exceeds
+        ``max_num_tokens``.
+        """
+        tail = self._spec_recompute_tail
+        tokens_per_block = self.tokens_per_block
+        for req in batch_llm_requests:
+            prepopulated = req.prepopulated_prompt_len
+            if prepopulated <= 0:
+                continue
+            prompt_len = req.prompt_len
+            if tail < 0:
+                target = 0
+            else:
+                if prompt_len - prepopulated >= tail:
+                    continue  # already recomputing at least the tail
+                target = max(0, (prompt_len - tail) // tokens_per_block *
+                             tokens_per_block)
+            if target >= prepopulated:
+                continue
+            # Reuses the C++ setter so context_current_position and the
+            # first-chunk invariant (position == prepopulated) stay coherent.
+            req.set_prepopulated_prompt_len(target, tokens_per_block)
+            if target == 0:
+                # The C++ setter only advances the position for nonzero
+                # values; a full re-prefill must reset it explicitly.
+                req.context_current_position = 0
+            req.context_chunk_size = prompt_len - target
+
+    def report_batch_to_connector(self,
+                                  scheduled_batch: ScheduledRequests) -> None:
         """Report the batch to the KV connector.
 
         Driven by ``ResourceManager.prepare_resources`` *after* the token-budget
@@ -1306,6 +1440,8 @@ class KVCacheManager(BaseResourceManager):
                 if capture_sampling_params is not None else None,
                 top_p=capture_sampling_params.top_p
                 if capture_sampling_params is not None else None,
+                min_p=capture_sampling_params.min_p
+                if capture_sampling_params is not None else None,
             )
             # Here 1+max_num_draft_tokens is used to extend the prompt length to
             # a non-zero number to skip illegal memory access issue in MLA kernel
@@ -1313,7 +1449,7 @@ class KVCacheManager(BaseResourceManager):
             token_num = token_nums[
                 i] if token_nums is not None else 1 + max_num_draft_tokens
             # Helix active rank sets past_seen_token_num = seqlen_this_rank_cp - 1
-            # in _prepare_tp_inputs; need token_num >= 2 so that doesn't go negative.
+            # in _pack_generation_requests; need token_num >= 2 so that doesn't go negative.
             if self.mapping.has_cp_helix():
                 token_num = max(token_num, 2)
             encoder_output_len = (encoder_output_lens[i]
@@ -1771,10 +1907,8 @@ class KVCacheManager(BaseResourceManager):
         request_ids: List[int],
         layer_idx: Optional[int] = None,
         window_size: Optional[int] = None,
-        beam_width: Optional[int] = 1,
         num_blocks_per_seq: Optional[Sequence[int]] = None,
     ) -> List[List[int]]:
-        beam_width = beam_width or 1
         if window_size is None:
             if layer_idx is None:
                 window_size = self._resolve_window_size(
@@ -1789,12 +1923,7 @@ class KVCacheManager(BaseResourceManager):
 
         result = self.impl.get_batch_cache_block_ids(request_ids, window_size)
         for i in range(len(result)):
-            beams = [list(beam) for beam in result[i]]
-            assert len(beams) == beam_width, (
-                f"Expected {beam_width} index arrays per request, got {len(beams)}"
-            )
-            result[i] = beams[
-                0] if beam_width == 1 else self._pack_beam_cache_indices(beams)
+            result[i] = list(result[i][0])
             if num_blocks_per_seq is not None:
                 result[i] = result[i][:num_blocks_per_seq[i]]
         return result
@@ -1818,22 +1947,6 @@ class KVCacheManager(BaseResourceManager):
         for block_ids, n in zip(block_ids_per_seq, num_blocks):
             indices_list.extend(block_ids[:n])
         return torch.tensor(indices_list, dtype=torch.int32)
-
-    @staticmethod
-    def _pack_beam_cache_indices(beams: List[List[int]]) -> List[int]:
-        """Pack beam-search blocks into a flat beam-0 layout.
-
-        The first beam owns the shared prompt blocks. For every other beam,
-        append only the final block when it differs from beam 0's final block.
-        """
-        if not beams:
-            return []
-        packed = list(beams[0])
-        beam0_last = beams[0][-1] if beams[0] else None
-        for beam in beams[1:]:
-            if beam and beam[-1] != beam0_last:
-                packed.append(beam[-1])
-        return packed
 
     def get_num_free_blocks(self) -> int:
         if self.is_linear_attention:
@@ -2808,8 +2921,14 @@ class KVCacheCompressionManager(BaseResourceManager):
     uses_iteration_lifecycle = True
     provides_cold_page_codec = False
 
-    def __init__(self, config: "KvCacheCompressionConfig") -> None:
+    def __init__(
+        self,
+        config: "KvCacheCompressionConfig",
+        *,
+        pretrained_config: Optional["PretrainedConfig"] = None,
+    ) -> None:
         self.config = config
+        self.pretrained_config = pretrained_config
         self.kv_cache_manager: Optional["KVCacheManagerV2"] = None
         self.draft_kv_cache_manager: Optional["KVCacheManagerV2"] = None
 
@@ -3066,11 +3185,11 @@ class ResourceManager:
         self.maybe_fit_token_budget(scheduled_batch)
         # Strictly after the trim: the connector is told how many tokens the
         # forward pass will compute, which is only settled once the trim has
-        # run. See KVCacheManager.publish_connector_scheduler_output.
+        # run. See `report_batch_to_connector`.
         kv_cache_manager = self.resource_managers.get(
             ResourceManagerType.KV_CACHE_MANAGER)
-        if hasattr(kv_cache_manager, "publish_connector_scheduler_output"):
-            kv_cache_manager.publish_connector_scheduler_output(scheduled_batch)
+        if hasattr(kv_cache_manager, "report_batch_to_connector"):
+            kv_cache_manager.report_batch_to_connector(scheduled_batch)
 
     @nvtx_range("update_resources")
     def update_resources(
@@ -3078,10 +3197,13 @@ class ResourceManager:
         scheduled_batch: ScheduledRequests,
         attn_metadata: Optional["AttentionMetadata"] = None,
         kv_cache_dtype_byte_size: Optional[float] = None,
+        skip_kv_cache_manager: bool = False,
     ):
         for resource_type, resource_manager in self.resource_managers.items():
             if hasattr(resource_manager, "update_resources"):
                 if resource_type == ResourceManagerType.KV_CACHE_MANAGER:
+                    if skip_kv_cache_manager:
+                        continue
                     resource_manager.update_resources(scheduled_batch,
                                                       attn_metadata,
                                                       kv_cache_dtype_byte_size)
@@ -3089,6 +3211,7 @@ class ResourceManager:
                     resource_manager.update_resources(scheduled_batch)
 
     def free_resources(self, request: LlmRequest):
+        request.py_ced_replay = None
         for resource_type, resource_manager in reversed(
                 self.resource_managers.items()):
             if hasattr(resource_manager, "free_resources"):

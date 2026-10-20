@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import asyncio
 import copy
 import random
@@ -11,11 +14,10 @@ import msgpack
 import pytest
 
 from tensorrt_llm.llmapi.disagg_utils import RouterConfig
-from tensorrt_llm.runtime.kv_cache_hash import (get_cache_salt_id,
-                                                hash_v1_block_key,
+from tensorrt_llm.runtime.kv_cache_hash import (hash_v1_block_key,
                                                 truncate_sha256_hash_to_int64)
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
-    ReuseScope, sequence_to_blockchain_keys)
+    KVCacheEventManager, ReuseScope, sequence_to_blockchain_keys)
 # yapf: disable
 from tensorrt_llm.serve.openai_protocol import (ChatCompletionRequest,
                                                 ChatCompletionToolsParam,
@@ -197,6 +199,29 @@ async def test_coordinator_select_does_not_retry_error_status():
         await router._post_select({"role": "generation"})
 
     assert session.post.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_coordinator_renew_posts_existing_request_id():
+    router = _delegating_router()
+    session = mock.MagicMock()
+    session.post = mock.MagicMock(return_value=_msgpack_response(200, {}))
+    session.close = mock.AsyncMock()
+    router._session = session
+    request = CompletionRequest(
+        model="m",
+        prompt="hi",
+        disaggregated_params=DisaggregatedParams(request_type="generation_only",
+                                                 ctx_request_id=123),
+    )
+
+    await router.renew_request(request)
+
+    assert msgpack.unpackb(session.post.call_args.kwargs["data"],
+                           raw=False) == {
+                               "role": "generation",
+                               "req_id": 123,
+                           }
 
 
 @pytest.mark.asyncio
@@ -474,18 +499,18 @@ def test_v2_sha256_64_block_hashes_match_truncated_kv_cache_manager_v2(servers):
     assert all(isinstance(block_hash, int) for block_hash in block_hashes[0])
 
 
-def test_cache_aware_router_block_hashes_include_cache_salt_id(servers):
+@pytest.mark.parametrize("cache_salt", ["", "tenant-a", "租户", "a\0b"])
+def test_cache_aware_router_block_hashes_include_cache_salt(
+        servers, cache_salt):
     tokens_per_block = 4
-    cache_salt_id = 123
+    cache_salt_id = KVCacheEventManager._hash_cache_salt(cache_salt)
     token_lists = [[1, 2, 3, 4, 5, 6, 7, 8, 9, 10]]
     router = KvCacheAwareRouter(server_role=None,
                                 servers=servers,
                                 tokens_per_block=tokens_per_block)
 
     salted_v1_block_hashes = router._compute_block_hashes(
-        token_lists,
-        hash_algo=KV_CACHE_HASH_ALGO_V1,
-        cache_salt_id=cache_salt_id)
+        token_lists, hash_algo=KV_CACHE_HASH_ALGO_V1, cache_salt=cache_salt)
     expected_v1_block_hashes = []
     parent_hash = None
     for t in range(0, len(token_lists[0]) - 1, tokens_per_block):
@@ -497,10 +522,8 @@ def test_cache_aware_router_block_hashes_include_cache_salt_id(servers):
         expected_v1_block_hashes.append(parent_hash)
 
     salted_v2_block_hashes = router._compute_block_hashes(
-        token_lists,
-        hash_algo=KV_CACHE_HASH_ALGO_V2,
-        cache_salt_id=cache_salt_id)
-    reuse_scope = ReuseScope(salt=cache_salt_id)
+        token_lists, hash_algo=KV_CACHE_HASH_ALGO_V2, cache_salt=cache_salt)
+    reuse_scope = ReuseScope(salt=cache_salt)
     expected_v2_block_hashes = [
         block_key.hex()
         for token_block, block_key in sequence_to_blockchain_keys(
@@ -510,7 +533,7 @@ def test_cache_aware_router_block_hashes_include_cache_salt_id(servers):
     salted_v2_64_block_hashes = router._compute_block_hashes(
         token_lists,
         hash_algo=KV_CACHE_HASH_ALGO_V2_SHA256_64,
-        cache_salt_id=cache_salt_id)
+        cache_salt=cache_salt)
     expected_v2_64_block_hashes = [
         truncate_sha256_hash_to_int64(block_key)
         for token_block, block_key in sequence_to_blockchain_keys(
@@ -526,16 +549,6 @@ def test_cache_aware_router_block_hashes_include_cache_salt_id(servers):
         token_lists, hash_algo=KV_CACHE_HASH_ALGO_V2)
     assert salted_v2_64_block_hashes != router._compute_block_hashes(
         token_lists, hash_algo=KV_CACHE_HASH_ALGO_V2_SHA256_64)
-
-
-def test_cache_salt_id_derivation_matches_worker_path():
-    from tensorrt_llm.inputs.utils import \
-        get_cache_salt_id as worker_get_cache_salt_id
-
-    assert get_cache_salt_id("abc") == 3697813978277427044
-    assert get_cache_salt_id("tenant-a") == get_cache_salt_id("tenant-a")
-    assert get_cache_salt_id("tenant-a") != get_cache_salt_id("tenant-b")
-    assert get_cache_salt_id("tenant-a") == worker_get_cache_salt_id("tenant-a")
 
 
 @pytest.mark.asyncio
@@ -640,8 +653,7 @@ async def test_kv_cache_aware_router_routes_to_v2_server(servers):
 
 
 @pytest.mark.asyncio
-async def test_kv_cache_aware_router_routes_with_cache_salt(
-        servers, monkeypatch):
+async def test_kv_cache_aware_router_routes_with_cache_salt(servers):
 
     class SaltedRequest:
         model = "TinyLlama"
@@ -651,15 +663,12 @@ async def test_kv_cache_aware_router_routes_with_cache_salt(
             self.prompt = prompt
 
     tokens_per_block = 4
-    cache_salt_id = 123
     token_lists = [[1000, 1001, 1002, 1003, 1004, 1005, 1006, 1007, 1008]]
     router = KvCacheAwareRouter(server_role=None,
                                 servers=servers,
                                 use_tokens=False,
                                 max_batch_size=32,
                                 tokens_per_block=tokens_per_block)
-    monkeypatch.setattr("tensorrt_llm.serve.router_utils.get_cache_salt_id",
-                        lambda cache_salt: cache_salt_id)
     for server in servers:
         router._server_info[server] = {
             "kv_cache_hash_algo": KV_CACHE_HASH_ALGO_V2
@@ -668,7 +677,7 @@ async def test_kv_cache_aware_router_routes_with_cache_salt(
     salted_block_hashes = router._compute_block_hashes(
         token_lists,
         hash_algo=KV_CACHE_HASH_ALGO_V2,
-        cache_salt_id=cache_salt_id)
+        cache_salt=SaltedRequest.cache_salt)
     unsalted_block_hashes = router._compute_block_hashes(
         token_lists, hash_algo=KV_CACHE_HASH_ALGO_V2)
     salted_server = servers[1]
@@ -2148,7 +2157,9 @@ def test_tokenize_forwards_tools_and_chat_template_kwargs(router_class):
 
     tok = _mock_tokenizer()
     documents = [{"title": "Paris", "text": "Paris is in France."}]
-    chat_template = "{% for message in messages %}{{ message.content }}{% endfor %}"
+    chat_template = (
+        "{% if thinking %}<think>{% endif %}"
+        "{% for message in messages %}{{ message.content }}{% endfor %}")
     with mock.patch.object(router, "_get_tokenizer", return_value=tok):
         req = ChatCompletionRequest(
             model="TinyLlama",
@@ -2177,6 +2188,30 @@ def test_tokenize_forwards_tools_and_chat_template_kwargs(router_class):
     assert kwargs.get("thinking") is True
     assert kwargs["documents"] == documents
     assert kwargs["chat_template"] == chat_template
+
+
+@pytest.mark.parametrize("router_class",
+                         [KvCacheAwareRouter, ConversationRouter])
+def test_tokenize_rejects_kwargs_the_template_never_reads(router_class):
+    router = router_class(server_role=None,
+                          servers=["server1"],
+                          use_tokens=False,
+                          max_batch_size=32,
+                          tokens_per_block=32)
+    tok = _mock_tokenizer()
+    request = ChatCompletionRequest(
+        model="test-model",
+        messages=[{
+            "role": "user",
+            "content": "hello"
+        }],
+        chat_template="{{ messages[0].content }}",
+        chat_template_kwargs={"disable_reasoning": True},
+    )
+    with mock.patch.object(router, "_get_tokenizer", return_value=tok):
+        with pytest.raises(ValueError, match="disable_reasoning"):
+            router._tokenize(request)
+    tok.apply_chat_template.assert_not_called()
 
 
 @pytest.mark.parametrize("router_class",
@@ -2456,3 +2491,72 @@ async def test_conversation_affinity_pins_across_load(servers):
                                          "content": "v1"
                                      }])
         assert (await router.get_next_server(req3))[0] != home
+
+
+# Frozen expectations for the V2 routing hash. Derived from the format itself -- a
+# SHA-256 chain seeded with the reuse-scope digest, each block folding in its token ids
+# as 4-byte little-endian -- not by recording what the implementation currently emits.
+# The router hashes token_list[:-1] and drops the root, so a 10-token prompt at
+# tokens_per_block=4 yields blocks of 4, 4 and 1.
+_V2_GOLDEN_BOUNDARY_EXACT = [
+    "e432228522a304ab556d66e6e40979ad05575f28b19b554264dd3c6277aaf073",
+    "78c7ad438ce9372cfaedc888ad7a907162dd57ea7ab540fd3ad0c3c7c97d9c06",
+]
+_V2_GOLDEN_PARTIAL_TAIL = [
+    "e432228522a304ab556d66e6e40979ad05575f28b19b554264dd3c6277aaf073",
+    "756b1d258c63ccc0cbd6284ab33b043c81175086163f9d2821f5764079efb75c",
+    "2c2a73c72b0bccbf74a5d46d131499ca726b1d2a650836cb548a10fb3c8acf2e",
+]
+_V2_GOLDEN_SALTED = [
+    "a4d74f1c7ca3c3fb866d0fb1751a3e4431cc384c95dbe6539b858939667f311c",
+    "dc54b040e0ffc44a80522d97de70e1c399ceaf3d9d48fca3f2acae3de49e15d6",
+    "05267ddc7c6829554466d192b19827fa7be6a1db807a60d89cb6a6978dabed11",
+]
+
+
+@pytest.mark.parametrize(
+    "tokens,cache_salt,expected",
+    [
+        ([1, 2, 3, 4, 5, 6, 7, 8], None, _V2_GOLDEN_BOUNDARY_EXACT),
+        ([1, 2, 3, 4, 5, 6, 7, 8, 9, 10], None, _V2_GOLDEN_PARTIAL_TAIL),
+        ([1, 2, 3, 4, 5, 6, 7, 8, 9, 10], "4242", _V2_GOLDEN_SALTED),
+    ],
+    ids=["boundary_exact", "partial_tail", "salted"],
+)
+def test_v2_block_hashes_match_frozen_wire_values(servers, tokens, cache_salt,
+                                                  expected):
+    """Pin the V2 routing hash to fixed values, not to whatever the engine computes.
+
+    The other V2 cases here build their expectation with the same
+    sequence_to_blockchain_keys the router calls, so they check the wiring -- the root
+    skip and the final-token exclusion -- but move with the hash if its format ever
+    changes. Routing compares these against hashes the engine produced, so the format is
+    a cross-language wire contract: freeze it here so a change has to be deliberate.
+    """
+    router = KvCacheAwareRouter(server_role=None,
+                                servers=servers,
+                                tokens_per_block=4)
+
+    block_hashes = router._compute_block_hashes([tokens],
+                                                hash_algo=KV_CACHE_HASH_ALGO_V2,
+                                                cache_salt=cache_salt)
+
+    assert block_hashes == [expected]
+
+
+def test_v2_sha256_64_block_hashes_are_big_endian_prefix_of_frozen_values(
+        servers):
+    """The 64-bit variant is the first 8 bytes of the same key, read big-endian."""
+    router = KvCacheAwareRouter(server_role=None,
+                                servers=servers,
+                                tokens_per_block=4)
+
+    block_hashes = router._compute_block_hashes(
+        [[1, 2, 3, 4, 5, 6, 7, 8, 9, 10]],
+        hash_algo=KV_CACHE_HASH_ALGO_V2_SHA256_64)
+
+    expected = [
+        int.from_bytes(bytes.fromhex(key)[:8], "big")
+        for key in _V2_GOLDEN_PARTIAL_TAIL
+    ]
+    assert block_hashes == [expected]

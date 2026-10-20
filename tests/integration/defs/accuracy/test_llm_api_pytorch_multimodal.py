@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import os
 from typing import ClassVar
 
 import pytest
@@ -32,12 +33,20 @@ from tensorrt_llm.llmapi.llm_args import MultimodalConfig, MultimodalEncoderCuda
 from tensorrt_llm.quantization import QuantAlgo
 
 from ..conftest import (
+    get_sm_version,
     llm_models_root,
     skip_post_blackwell_ultra,
     skip_pre_blackwell,
     skip_pre_hopper,
 )
-from .accuracy_core import MMMU, LlmapiAccuracyTestHarness, VideoMME, VoxPopuli
+from .accuracy_core import (
+    MMMU,
+    LlmapiAccuracyTestHarness,
+    VideoMME,
+    VoxPopuli,
+    assert_acceptance_length_for_llm,
+    assert_guided_decoding_regex,
+)
 
 
 class TestExaone4_5_33B(LlmapiAccuracyTestHarness):
@@ -150,11 +159,37 @@ class TestGemma4_26B_A4B(LlmapiAccuracyTestHarness):
             enable_chunked_prefill=True,
             speculative_config=MTPDecodingConfig(
                 max_draft_len=3,
-                mtp_eagle_one_model=True,
                 speculative_model=self.MTP_MODEL_PATH,
             ),
+            max_stats_len=-1,
+            enable_iter_perf_stats=True,
         ) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
+            task = MMMU(self.MODEL_NAME)
+            task.evaluate(
+                llm,
+                sampling_params=self.sampling_params,
+                extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS,
+            )
+            assert_acceptance_length_for_llm(
+                "TestGemma4_26B_A4B::test_nvfp4",
+                llm,
+            )
+
+    def test_nvfp4_no_mtp(self):
+        # Same checkpoint without MTP drafting.
+        # SM121 (GB10) needs FlashInfer set explicitly; other GPUs use the model default.
+        extra_kwargs = {"attn_backend": "FLASHINFER"} if get_sm_version() == 121 else {}
+        with LLM(
+            self.MODEL_PATH,
+            max_batch_size=16,
+            kv_cache_config=self.kv_cache_config,
+            enable_chunked_prefill=True,
+            guided_decoding_backend="xgrammar",
+            **extra_kwargs,
+        ) as llm:
+            assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
+            assert_guided_decoding_regex(llm)
             task = MMMU(self.MODEL_NAME)
             task.evaluate(
                 llm,
@@ -162,21 +197,25 @@ class TestGemma4_26B_A4B(LlmapiAccuracyTestHarness):
                 extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS,
             )
 
-    def test_nvfp4_no_mtp(self):
-        # Same checkpoint without MTP drafting.
+
+@skip_pre_hopper
+@pytest.mark.skip_less_device_memory(40000)
+class TestGemma4Unified12B(LlmapiAccuracyTestHarness):
+    MODEL_PATH = f"{llm_models_root()}/gemma/gemma-4-12B-it"
+
+    def test_guided_decoding(self):
+        if not os.path.exists(self.MODEL_PATH):
+            pytest.skip(f"Model directory {self.MODEL_PATH} does not exist")
         with LLM(
             self.MODEL_PATH,
-            max_batch_size=16,
-            kv_cache_config=self.kv_cache_config,
-            enable_chunked_prefill=True,
+            disable_mm_encoder=True,
+            max_batch_size=1,
+            max_seq_len=512,
+            max_num_tokens=512,
+            attn_backend="FLASHINFER",
+            guided_decoding_backend="xgrammar",
         ) as llm:
-            assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
-            task = MMMU(self.MODEL_NAME)
-            task.evaluate(
-                llm,
-                sampling_params=self.sampling_params,
-                extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS,
-            )
+            assert_guided_decoding_regex(llm)
 
 
 class TestQwen3VL_MOE(LlmapiAccuracyTestHarness):
@@ -604,7 +643,7 @@ class TestMistralSmall24B(LlmapiAccuracyTestHarness):
         ids=["forced_chunked_prefill"],
     )
     def test_auto_dtype(self, max_num_tokens):
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75)
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75, use_kv_cache_manager_v2=True)
         with LLM(
             self.MODEL_PATH,
             kv_cache_config=kv_cache_config,

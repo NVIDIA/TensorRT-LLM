@@ -472,11 +472,22 @@ def mpi_comm():
     return comm
 
 
-local_comm = mpi_comm().Split_type(split_type=OMPI_COMM_TYPE_HOST)
+_local_comm = None
 
 
 def local_mpi_comm():
-    return local_comm
+    # Split lazily instead of at import time. Splitting needs an MPI runtime
+    # that supports it, and `import tensorrt_llm` must not require one: a
+    # CPU-only build container can complete MPI_Init and handle Comm.Dup,
+    # Comm.Split and Create_group, yet still fail Split_type with
+    # MPI_ERR_OTHER — for the portable MPI_COMM_TYPE_SHARED just as much as for
+    # OMPI_COMM_TYPE_HOST — which turned the import itself into a hard error.
+    # Every consumer of this communicator is already lazy, so nothing needs it
+    # before first use.
+    global _local_comm
+    if _local_comm is None:
+        _local_comm = mpi_comm().Split_type(split_type=OMPI_COMM_TYPE_HOST)
+    return _local_comm
 
 
 # Global TorchDist instance for Ray orchestrator
@@ -541,7 +552,7 @@ def local_mpi_rank():
 
 
 def local_mpi_size():
-    return local_comm.Get_size() if ENABLE_MULTI_DEVICE else 1
+    return local_mpi_comm().Get_size() if ENABLE_MULTI_DEVICE else 1
 
 
 def default_gpus_per_node():
@@ -560,7 +571,7 @@ def mpi_barrier():
 
 def local_mpi_barrier():
     if ENABLE_MULTI_DEVICE:
-        local_comm.Barrier()
+        local_mpi_comm().Barrier()
 
 
 def mpi_broadcast(obj, root=0):
@@ -735,13 +746,23 @@ def is_sm_100f(sm_version=None):
 
 
 @lru_cache(maxsize=1)
-def is_flashinfer_gdn_supported_arch(sm_version=None):
-    """Whether FlashInfer ships GDN (gated-delta-rule) kernels for this arch.
+def is_flashinfer_gdn_prefill_supported_arch(sm_version=None):
+    """Whether FlashInfer ships the GDN (gated-delta-rule) chunk-prefill kernel.
 
-    FlashInfer's GDN chunk-prefill and bf16-state decode kernels are built only
-    for Hopper (SM90) and datacenter Blackwell (SM100/SM103). On consumer
-    Blackwell (SM120) and other architectures the kernels abort at launch, so
-    callers must fall back to the vendored Triton kernels.
+    FlashInfer builds the chunk-prefill kernel for Hopper (SM90) and Blackwell
+    (SM100/SM103/SM120/SM121). On other architectures the kernel aborts at launch,
+    so callers must fall back to the vendored Triton kernels.
+    """
+    if sm_version is None:
+        sm_version = get_sm_version()
+    return sm_version in (90, 100, 103, 120, 121)
+
+
+@lru_cache(maxsize=1)
+def is_flashinfer_gdn_decode_supported_arch(sm_version=None):
+    """Whether FlashInfer ships the GDN bf16-state decode / MTP-verify kernels.
+
+    These are built only for Hopper (SM90) and datacenter Blackwell (SM100/SM103).
     """
     if sm_version is None:
         sm_version = get_sm_version()
@@ -828,6 +849,10 @@ class QuantModeWrapper:
         self.objs = objs
 
     def __getattr__(self, name):
+        # Missing Python protocol hooks must not be forwarded as quantization
+        # queries: reducing __deepcopy__ results turns the wrapper into an int.
+        if name.startswith("__") and name.endswith("__"):
+            raise AttributeError(name)
 
         def method_wrapper(*args, **kwargs):
             result = False
@@ -870,10 +895,26 @@ def customized_gc_thresholds(gen0_threshold: Optional[int] = None):
             )
 
 
-@contextmanager
-def _null_context_manager():
-    yield
+class _NullRange:
+    """Disabled NVTX range: a no-op context manager and an identity decorator.
 
+    A contextlib-based null context used as a decorator re-creates its
+    generator context manager on every call of the decorated function, which
+    the LLM API result path pays once per streamed response.
+    """
+    __slots__ = ()
+
+    def __enter__(self):
+        return None
+
+    def __exit__(self, *exc_info):
+        return False
+
+    def __call__(self, func):
+        return func
+
+
+_NULL_RANGE = _NullRange()
 
 _T = TypeVar("_T")
 
@@ -917,14 +958,16 @@ def nvtx_range_debug(msg: str,
         category (str, optional): The category for the range. Defaults to None.
 
     Returns:
-        contextmanager: A context manager that either marks the NVTX range if enabled,
-                        or a null context manager that does nothing if disabled.
+        contextmanager: A context manager that marks the NVTX range if enabled.
+                        If disabled, a shared, stateless no-op (``_NULL_RANGE``)
+                        that is both a context manager and an identity
+                        decorator; it is safe for concurrent and nested use.
     """
     if os.getenv("TLLM_LLMAPI_ENABLE_NVTX", "0") == "1" or \
             os.getenv("TLLM_NVTX_DEBUG", "0") == "1":
         return nvtx_range(msg, color=color, domain=domain, category=category)
     else:
-        return _null_context_manager()
+        return _NULL_RANGE
 
 
 def nvtx_mark_debug(msg: str,

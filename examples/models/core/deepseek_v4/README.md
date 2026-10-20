@@ -63,7 +63,7 @@ for larger KV cache budgets, longer context windows, or higher throughput target
 `--tp_size`, `--ep_size`, `--max_num_tokens`, and the KV cache memory fraction for your deployment
 target.
 
-Hopper (`SM90`) and Blackwell (`SM100`) support 128- or 256-token blocks. Hopper uses the
+Hopper (`SM90`) and Blackwell/Rubin (`SM100`, `SM103`, `SM107`) support 128- or 256-token blocks. Hopper uses the
 `fp8_ds_mla` cache layout; on `SM120`/`SM121`, this layout requires 256-token blocks.
 
 
@@ -182,8 +182,7 @@ python quickstart_advanced.py \
   --max_seq_len 4096 \
   --kv_cache_fraction 0.5 \
   --spec_decode_algo MTP \
-  --spec_decode_max_draft_len N \
-  --use_one_model
+  --spec_decode_max_draft_len N
 ```
 
 `N` is the number of draft tokens to predict. Start with `N=1` for bring-up, then increase it after

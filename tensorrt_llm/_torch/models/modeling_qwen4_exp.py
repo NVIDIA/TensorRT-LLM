@@ -15,7 +15,7 @@
 """TensorRT-LLM text implementation for Qwen3.8-Flash-Next checkpoints."""
 
 from collections.abc import Sequence
-from typing import TYPE_CHECKING, Dict, List, Literal, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, List, Literal, Optional
 
 import torch
 from torch import nn
@@ -51,7 +51,7 @@ from ..utils import AuxStreamType, EventType, create_lm_head_tp_mapping
 from .checkpoints.base_weight_mapper import BaseWeightMapper
 from .modeling_qwen3 import Qwen3Attention
 from .modeling_qwen3_5 import _normalize_qwen35_exclude_modules, _normalize_qwen35_quant_config_dict
-from .modeling_qwen3_next import Qwen3NextSparseMoeBlock
+from .modeling_qwen3_next import Qwen3NextSparseMoeBlock, _DeferredSharedExpertFinalize
 from .modeling_qwen3vl import (
     Qwen3VisionModel,
     Qwen3VisionModelBase,
@@ -65,6 +65,9 @@ from .modeling_utils import (
     register_vision_encoder,
     remove_weights,
 )
+
+_PendingBlockOutput = torch.Tensor | _DeferredSharedExpertFinalize
+_PendingCombine = tuple[_PendingBlockOutput, HCResidual]
 
 
 def _qwen4_exp_tp_output_reduction_enabled(mapping) -> bool:
@@ -288,10 +291,10 @@ class Qwen4ExpDecoderLayer(DecoderLayer):
         ple_state: Optional[tuple] = None,
         spec_metadata=None,
         lora_params: Optional[dict] = None,
-        pending_combine: Optional[Tuple[torch.Tensor, HCResidual]] = None,
+        pending_combine: Optional[_PendingCombine] = None,
         defer_combine: bool = False,
         **kwargs,
-    ) -> Tuple[Optional[torch.Tensor], Optional[Tuple[torch.Tensor, HCResidual]]]:
+    ) -> tuple[Optional[torch.Tensor], Optional[_PendingCombine]]:
         """Run one decoder layer, returning ``(bundle, pending_combine)``.
 
         ``pending_combine`` carries a preceding layer's MoE output and residual
@@ -305,9 +308,21 @@ class Qwen4ExpDecoderLayer(DecoderLayer):
             # The preceding layer's MoE combine and this layer's grouped norm
             # form one exact fusion boundary, the same one combine_and_mix
             # already exploits between attention and MLP.
-            hidden_states, mixed, residual = self.attn_hyper_connection.combine_and_mix(
-                *pending_combine
-            )
+            block_output, previous_residual = pending_combine
+            if isinstance(block_output, _DeferredSharedExpertFinalize):
+                hidden_states, mixed, residual = (
+                    self.attn_hyper_connection.combine_deferred_moe_and_mix(
+                        block_output.routed_output,
+                        block_output.shared_output,
+                        block_output.shared_gate_logits,
+                        previous_residual,
+                    )
+                )
+            else:
+                hidden_states, mixed, residual = self.attn_hyper_connection.combine_and_mix(
+                    block_output,
+                    previous_residual,
+                )
         else:
             # Expand a token embedding into the configured Hyper-Connection
             # residual streams. Later layers already receive the widened bundle.
@@ -361,6 +376,11 @@ class Qwen4ExpDecoderLayer(DecoderLayer):
             attn_metadata,
             all_reduce_params=AllReduceParams(enable_allreduce=self.enable_tp_output_reduction),
             lora_params=lora_params,
+            # The next layer's attn_hyper_connection consumes these operands;
+            # it re-checks eligibility and falls back on its own.
+            defer_shared_expert_finalize=(
+                defer_combine and self.mlp_hyper_connection.can_fuse_deferred_moe(mixed)
+            ),
         )
         if defer_combine:
             return None, (moe_out, residual)
@@ -371,9 +391,9 @@ class Qwen4ExpDecoderLayer(DecoderLayer):
         position_ids: torch.IntTensor,
         hidden_states: Optional[torch.Tensor],
         attn_metadata: AttentionMetadata,
-        pending_combine: Optional[Tuple[torch.Tensor, HCResidual]] = None,
+        pending_combine: Optional[_PendingCombine] = None,
         **kwargs,
-    ) -> Tuple[Optional[torch.Tensor], Optional[Tuple[torch.Tensor, HCResidual]]]:
+    ) -> tuple[Optional[torch.Tensor], Optional[_PendingCombine]]:
         """Pipeline-parallel no-op, in this layer's two-value return contract."""
         return hidden_states, pending_combine
 

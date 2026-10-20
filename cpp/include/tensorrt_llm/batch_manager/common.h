@@ -38,6 +38,8 @@ using RequestIdType = std::uint64_t;
 using RequestVector = std::vector<std::shared_ptr<LlmRequest>>;
 using ReqIdsSet = std::unordered_set<RequestIdType>;
 
+inline constexpr int kDefaultColdTierOffloadMinPriority = 30;
+
 class ScheduledRequests
 {
 public:

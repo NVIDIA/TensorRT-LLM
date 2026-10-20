@@ -29,6 +29,7 @@ from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.module import (
 )
 from tensorrt_llm._torch.attention.mla import MLA
 from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.functional import PositionEmbeddingType
 
 
@@ -240,9 +241,15 @@ def test_dsv4_epilogue_fusion_supports_mixed_batch() -> None:
     metadata = SimpleNamespace(num_contexts=1, num_generations=1)
     hidden_states = torch.empty(8, 16)
 
-    with patch(
-        "tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.module.is_sm_100f",
-        return_value=True,
+    with (
+        patch(
+            "tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.module.is_sm_100f",
+            return_value=True,
+        ),
+        patch(
+            "tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.module.get_sm_version",
+            return_value=100,
+        ),
     ):
         outputs = prepare_sparse_attn_outputs(mla_layer, hidden_states, metadata)
 
@@ -252,14 +259,44 @@ def test_dsv4_epilogue_fusion_supports_mixed_batch() -> None:
     mla_layer.create_output.assert_not_called()
 
 
+@pytest.mark.parametrize(("num_contexts", "num_generations"), [(1, 0), (0, 1), (1, 1)])
+def test_dsv4_epilogue_fusion_rejects_sm107(num_contexts: int, num_generations: int) -> None:
+    mla_layer = _make_dsv4_epilogue_layer()
+    fallback = torch.empty(8, 16)
+    mla_layer.create_output.return_value = fallback
+    metadata = SimpleNamespace(num_contexts=num_contexts, num_generations=num_generations)
+    hidden_states = torch.empty(8, 16)
+
+    with (
+        patch(
+            "tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.module.is_sm_100f",
+            return_value=True,
+        ),
+        patch(
+            "tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.module.get_sm_version",
+            return_value=107,
+        ),
+    ):
+        outputs = prepare_sparse_attn_outputs(mla_layer, hidden_states, metadata)
+
+    assert outputs == [fallback]
+    mla_layer.create_output.assert_called_once_with(hidden_states, num_contexts)
+
+
 def test_dsv4_fusion_create_output_uses_bucket_token_count() -> None:
     mla_layer = _make_dsv4_epilogue_layer()
     metadata = SimpleNamespace(num_contexts=1, num_generations=0)
     hidden_states = torch.empty(8, 16)
 
-    with patch(
-        "tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.module.is_sm_100f",
-        return_value=True,
+    with (
+        patch(
+            "tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.module.is_sm_100f",
+            return_value=True,
+        ),
+        patch(
+            "tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.module.get_sm_version",
+            return_value=100,
+        ),
     ):
         output = prepare_sparse_attn_outputs(mla_layer, hidden_states, metadata)[0]
 
@@ -317,9 +354,10 @@ def test_dsv4_epilogue_bmm_writes_only_phase_ranges(
     def fake_bmm(_attn_fp8, _weight, attn_scale, _weight_scale, phase_output):
         phase_output.fill_(attn_scale.item())
 
+    bmm_op = "cute_dsl_fp8_bmm_rubin" if get_sm_version() == 107 else "cute_dsl_fp8_bmm_blackwell"
     with patch.object(
         torch.ops.trtllm,
-        "cute_dsl_fp8_bmm_blackwell",
+        bmm_op,
         side_effect=fake_bmm,
     ) as bmm:
         context_epilogue = None

@@ -52,6 +52,8 @@ MODEL_PATH_DICT = {
     # Nemotron-3-Nano-Omni-30B (text + image multimodal)
     "nemotron_3_nano_omni_nvfp4": "NVIDIA-Nemotron-3-Nano-Omni-30B-A3B-Reasoning-NVFP4",
     "nemotron_3_nano_omni_nvfp4_image": "NVIDIA-Nemotron-3-Nano-Omni-30B-A3B-Reasoning-NVFP4",
+    "nemotron_3.5_lightning_30b_nvfp4_mtp": "NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4",
+    "nemotron_3.5_lightning_30b_bf16_mtp": "NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16",
     # MiniMax M3 (block-sparse MoE, MXFP8 weights, BF16 activations + KV cache)
     "minimax_m3_mxfp8": "MiniMax-M3-MXFP8",
     # Qwen3.5 dense + MoE
@@ -65,13 +67,24 @@ MODEL_PATH_DICT = {
     # benchmarked with one-model MTP drafting, so the two can be compared.
     "qwen3.6_35b_a3b_fp4": "Qwen3.6-35B-A3B-NVFP4",
     "qwen3.6_35b_a3b_fp4_mtp": "Qwen3.6-35B-A3B-NVFP4",
+    # Qwen3.8 checkpoint paths from accuracy PRs #18071 and #18585.
+    "qwen3.8_max_fp4_mtp": "Inferact-Qwen3.8-2.4T-A95B-NVFP4",
+    "qwen3.8_flash_next_fp8_mtp": "Qwen3.8-Flash-Next-FP8",
+    "qwen3.8_flash_next_fp4_mtp": "Inferact-Qwen3.8-Flash-Next-NVFP4",
     # DeepSeek V4
     "deepseek_v4_pro_fp4": "DeepSeek-V4-Pro",
+    "deepseek_v4_pro_base_fp8": "DeepSeek-V4-Pro-Base",
     "deepseek_v4_flash": "DeepSeek-V4-Flash",
     "deepseek_v4_flash_base_fp8": "DeepSeek-V4-Flash-Base",
     "deepseek_v4_pro_dspark": "DeepSeek-V4-Pro-DSpark",
     # NVFP4 routed experts (MIXED_PRECISION); the -DSpark entry above is FP8.
     "deepseek_v4_pro_nvfp4_dspark": "DeepSeek-V4-Pro-nvfp4-DSpark",
+    # DeepSeek V4.1 Flash (CSA2 sparse attention, MXFP4 routed experts). The
+    # DSpark draft stages are embedded in this checkpoint, so it is also the
+    # `speculative_model` of the DSpark perf-sanity cases.
+    "deepseek_v41_flash": "DeepSeek-V4.1-Flash",
+    "deepseek_v41_flash_nvfp4": "DeepSeek-V4.1-Flash-NVFP4",
+    "deepseek_v41_flash_nvfp4_dspark": "DeepSeek-V4.1-Flash-NVFP4",
     # GLM-5 FP8 (MoE)
     "glm_5_fp8": "GLM-5-FP8",
     # GLM-5.2 NVFP4 (MoE, MLA + DSA on the DeepSeek-V3.2 code path)
@@ -83,10 +96,13 @@ MODEL_PATH_DICT = {
     "kimi_k2.5_fp4": "Kimi-K2.5-NVFP4",
     # Kimi K3 (KDA linear attention + MLA MoE, MXFP4 routed experts)
     "kimi_k3": "Kimi-K3",
+    # Kimi K3 NVFP4 requant (MIXED_PRECISION routed experts). Its DSpark drafter
+    # is the separate Inferact-Kimi-K3-DSpark checkpoint, given per config as
+    # `speculative_model`.
+    "kimi_k3_nvfp4": "Kimi-K3-NVFP4",
     # Keys below are sanity-side aliases; some point to the same weights as
     # entries above but are kept under sanity's historical naming.
     "deepseek_v32_fp4": "DeepSeek-V3.2-Exp-FP4-v2",
-    "k2_thinking_fp4": "Kimi-K2-Thinking-NVFP4",
     "k25_thinking_fp4": "Kimi-K2.5-NVFP4",
     "super_nvfp4": "NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4",
     "super_fp8": "NVIDIA-Nemotron-3-Super-120B-A12B-FP8",

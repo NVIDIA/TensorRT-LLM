@@ -35,7 +35,8 @@ TensorRT LLM's sparse attention algorithms fall into two categories.
   shared `AttentionOp`, while a dedicated backend can own prediction and
   sparse computation end to end. Examples: **RocketKV** (token-level prompt
   eviction plus page-level MHA/MQA/GQA decode selection), **DSA**
-  (token-level MLA), and **MiniMax-M3** (block-level GQA).
+  (token-level MLA), **CSA2** (compressed sparse MLA with shared sources),
+  and **MiniMax-M3** (block-level GQA).
 - **Kernel-level**: sparsity is implemented entirely inside the
   attention kernel — there is no external prediction or gather step.
   The kernel decides what to skip from runtime values such as Softmax
@@ -117,7 +118,10 @@ The shared `AttentionOp` path is built around three layers:
 <p align="center"><sub><em>Figure 1: Framework support for sparse attention in TensorRT LLM.</em></sub></p>
 
 Hook-based `TrtllmAttention` implementations supply `sparse_kv_predict` /
-`sparse_attn_predict` and reuse the shared `AttentionOp` stack. RocketKV's
+`sparse_attn_predict` and reuse the shared `AttentionOp` stack. Algorithms that
+select whole KV blocks instead supply `block_sparse_attn_predict`; their routes
+bypass `AttentionOp` and run on the generic block-sparse FMHA described in the
+[feature guide](../features/sparse-attention.md#block-sparse-mha-mqa-gqa). RocketKV's
 `VanillaAttention` implementation instead uses per-request Python hooks. A
 dedicated backend can implement sparse computation directly; MiniMax-M3's
 default Triton backend follows this model. Different attention layers within a
@@ -131,24 +135,82 @@ The current capability matrix is:
 | MQA / GQA | sparse KV cache and sparse computation (token-level) | sparse computation (token- or page-level) |
 | MHA | sparse KV cache | sparse computation (page-level) |
 | MLA | sparse computation (token-level) | sparse computation (token-level) |
+| Block-sparse MHA / MQA / GQA | sparse computation (block-level, contiguous Q/K/V without a KV cache) | sparse computation (block-level, paged) |
 
 Dynamic generation-phase KV eviction is tracked as future work.
 
+### CSA2 integration reference
+
+| Integration | CSA2 implementation |
+|---|---|
+| Public config / lowering | `CSA2SparseAttentionConfig(algorithm="csa2")` → `CSA2Params`, `CSA2MetadataParams`; checkpoint-owned `CSA2Layout` |
+| Registry | TRTLLM sparse backend → `CSA2TrtllmAttention`; cache manager → `CSA2CacheManager` (V2) |
+| Module | Typed MLA adapter in `sparse/csa2/module.py`; compression, shared KV/index source routing and per-phase prediction |
+| Metadata | `CSA2TrtllmMetadata`; SWA slots/visibility, owner page tables, compressor inputs, graph-stable index descriptors and query tiles |
+| Compute | SM100-family trtllm-gen; SM90 FlashMLA BF16 and SM120/121 FlashInfer BF16 helpers |
+
+CSA2 GLOBAL pages couple 288-byte main and 68-byte index records under one
+physical lifecycle and `REQUIRED` reuse policy. Encoder SWA is `REQUIRED` or
+`OPTIONAL` when Encoder recovery is enabled; eligible bounded Decoder replay
+uses `PRIVATE` SWA. Replay planning must preserve GLOBAL publication and refresh
+SWA read floors before attention. Graph capture owns its reserved buffers;
+eager shape changes evict only uncaptured tiles/arenas.
+
+The workspace contract has two parts: a complete-prefix index-gather rate
+with `runtime_workspace_is_chunked_prefill_bounded=False`, and fixed native
+index/radix arenas sized from serving batch, sequence and draft capacities.
+The estimator conservatively reserves the full fixed capacity alongside the
+profiled peak, covering a decode arena allocated after peak prefill. Do not
+use an attended-KV admission cap to bound a graph arena.
+See the [attention developer guide](../../../tensorrt_llm/_torch/attention/ATTENTION_DEVELOPER_GUIDE.md#23-backend-contract)
+and [CSA2 implementation guide](../../../tensorrt_llm/_torch/attention/backends/sparse/csa2/README.md)
+for ownership, hardware/shape limits, replay flags and accuracy validation.
+
 ### Prediction hooks
 
-`TrtllmAttention`-based sparse backends expose two prediction methods that
+`TrtllmAttention`-based sparse backends expose three prediction methods that
 algorithm-specific subclasses override:
 
 ```python
 sparse_kv_indices, sparse_kv_offsets = self.sparse_kv_predict(q, k, metadata, forward_args)
 sparse_attn_indices, sparse_attn_offsets = self.sparse_attn_predict(q, k, metadata, forward_args)
+block_sparse_inputs = self.block_sparse_attn_predict(q, k, v, metadata, forward_args)
 ```
 
-`hooks.py` writes these results to `SparseRuntimeParams`. SkipSoftmax writes
-its thresholds to the same runtime interface consumed by `AttentionOp`.
-`AttentionForwardArgs.sparse_backend_args` carries algorithm inputs from the
-module to the backend, while `sparse_runtime_params` carries lowered inputs
-from the backend to `AttentionOp`.
+`prepare_sparse_runtime_params` in `sparse/hooks.py` runs all three hooks once
+per call regardless of whether the backend carries `SparseParams`, applies the
+SkipSoftmax threshold schedule when the backend carries `SkipSoftmaxParams`,
+and returns a new per-call `SparseRuntimeParams` built from the caller's
+`AttentionForwardArgs.sparse_runtime_params` plus the hook results. The core
+forward assigns the returned carrier back to that field before FMHA dispatch.
+Backends that need runtime state outside the three hooks (DSA's auxiliary pool
+pointer, DeepSeek-V4's per-token KV lengths) write it into the caller's carrier
+before or inside their hooks, and `prepare_sparse_runtime_params` carries those
+fields over.
+`AttentionForwardArgs.sparse_backend_args` carries
+algorithm inputs from the module to the backend, while
+`AttentionForwardArgs.sparse_runtime_params` carries the complete lowered state
+from the backend through FMHA dispatch to `AttentionOp`.
+
+`SparseRuntimeParams.block_sparse_inputs` is the nested carrier for optional,
+algorithm-neutral `BlockSparseForwardInputs`. `Fmha.is_supported()` rejects a
+request that carries routes for every library that does not declare
+`supports_block_sparse_inputs`, so a dense kernel never silently ignores them;
+the selected block-sparse FMHA then validates and consumes the field. `AttentionForwardArgs` defaults
+the field to an empty `SparseRuntimeParams()`; the core forward always
+overwrites it with the carrier prepared for the current call.
+
+`block_sparse_attn_predict` runs even when the backend has no `SparseParams`.
+Its default implementation hands through
+`SparseBackendForwardArgs.block_sparse_inputs`, so an attention module that
+predicts routes before the core forward only needs to place the complete
+payload in `sparse_backend_args`. Algorithms that predict inside the backend
+override the hook, read `metadata` for the batch layout and `forward_args` for
+per-call state such as `timestep`, and return `None` for dense phases.
+
+The core contract owns this runtime transport and general block-sparse FMHA
+execution. Algorithm integrations own their prediction policy, effective Q/K/V
+preparation, and any post-processing around the normal core forward.
 
 Different KV heads are allowed to emit different sparse index sets; Q
 heads that map to the same KV head share the KV head's sparse pattern.
@@ -250,8 +312,8 @@ the bottom of the file.
 ### 2. Prediction module
 
 Create a new backend class inheriting from `TrtllmAttention` in
-`tensorrt_llm/_torch/attention/backends/sparse/`. Override one or both
-prediction methods. A `VanillaAttention` implementation instead overrides
+`tensorrt_llm/_torch/attention/backends/sparse/`. Override one or more of the
+three prediction methods. A `VanillaAttention` implementation instead overrides
 `_single_request_sparse_kv_predict` and
 `_single_request_sparse_attn_predict` with its per-request Python contract.
 
@@ -287,6 +349,19 @@ prediction methods. A `VanillaAttention` implementation instead overrides
 - **Constraint**: token-sparse MQA/GQA and page-sparse MHA/MQA/GQA use
   different index layouts. Match the selected kernel contract; do not
   pass request-local block indices to the physical-token path.
+
+**`block_sparse_attn_predict(self, q, k, v, metadata, forward_args)`**
+
+- **Behavior**: return the `BlockSparseForwardInputs` consumed by the
+  general block-sparse FMHA, or `None` for a dense call.
+- **Outputs**: block geometry plus exactly one route representation
+  (BSR `block_indptr`/`block_indices` or a packed `exact_block_bits`
+  bitmask), optional K/V summaries for proxy routes, and optional
+  `kv_valid_bits` masking ragged KV tails.
+- **Default**: hands through `SparseBackendForwardArgs.block_sparse_inputs`,
+  so modules that predict before the core forward do not override it.
+  Override it to predict inside the backend from the flattened Q/K/V,
+  the batch layout in `metadata`, and per-call state in `forward_args`.
 
 Prediction is on the critical path and can dominate latency in
 low-latency scenarios. Plan for custom kernels (Triton or CUDA) rather

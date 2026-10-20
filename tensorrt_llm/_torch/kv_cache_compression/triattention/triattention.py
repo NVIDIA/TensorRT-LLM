@@ -153,7 +153,7 @@ class TriAttentionCompressionManager(KVCacheCompressionManager):
         *,
         pretrained_config: "PretrainedConfig",
     ) -> None:
-        super().__init__(config)
+        super().__init__(config, pretrained_config=pretrained_config)
         self.budget = config.budget
         self.beta = config.beta
         self.eviction_mode = config.eviction_mode
@@ -161,7 +161,6 @@ class TriAttentionCompressionManager(KVCacheCompressionManager):
             logger.warning("TriAttention union mode enables score normalization")
         self.normalize_scores = self.eviction_mode == "union" or config.normalize_scores
         # Prompt always pinned; budget counts decode tokens only.
-        self.pretrained_config = pretrained_config
         self.calibration_path = config.calibration_path
         self._load_calibration()
 

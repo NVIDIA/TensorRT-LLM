@@ -99,6 +99,7 @@ class RefSlotSpec(StrictBaseModel):
 if TYPE_CHECKING:
     from .cache import CacheAccelerator
     from .config import DiffusionPipelineConfig
+    from .sleep import SleepRestoreMode
 
 
 class BasePipeline(nn.Module):
@@ -424,6 +425,16 @@ class BasePipeline(nn.Module):
 
     def forward(self, *args, **kwargs):
         raise NotImplementedError
+
+    def _sleep_loading_context(
+        self, restore_mode: "SleepRestoreMode", *, device: torch.device
+    ) -> contextlib.AbstractContextManager[None]:
+        """Capture persistent allocations for pipelines that explicitly support sleep.
+
+        The loader calls this hook only when sleep is requested, before tensor
+        materialization, and exits the context before inference warmup.
+        """
+        raise ValueError("Pipeline sleep is currently not supported for this model")
 
     def load_transformer_weights(self, checkpoint_dir: str) -> Dict[str, torch.Tensor]:
         """Load transformer weights from checkpoint.
@@ -1224,6 +1235,7 @@ class BasePipeline(nn.Module):
         scheduler,
         extra_stream_schedulers,
         scheduler_step_kwargs=None,
+        extra_stream_timesteps=None,
     ):
         """Execute scheduler step for all streams."""
         step_kwargs = scheduler_step_kwargs or {}
@@ -1235,7 +1247,7 @@ class BasePipeline(nn.Module):
             if name in extra_stream_schedulers:
                 extra_stream_latents[name] = extra_stream_schedulers[name].step(
                     noise_extra,
-                    timestep,
+                    (extra_stream_timesteps or {}).get(name, timestep),
                     extra_stream_latents[name],
                     return_dict=False,
                     **step_kwargs,
@@ -1262,6 +1274,7 @@ class BasePipeline(nn.Module):
         guidance_interval: Optional[Tuple[float, float]] = None,
         post_step_fn: Optional[Callable] = None,
         scheduler_step_kwargs: Optional[Dict[str, Any]] = None,
+        extra_stream_timesteps: dict[str, torch.Tensor] | None = None,
     ):
         """Execute denoising loop with optional CFG parallel and TeaCache support.
 
@@ -1302,6 +1315,9 @@ class BasePipeline(nn.Module):
                          Use for constraints that must hold throughout denoising.
             scheduler_step_kwargs: Extra keyword arguments forwarded to every
                          scheduler's ``step()`` call.
+            extra_stream_timesteps: Optional native timestep schedules keyed by extra
+                         stream name. Each must match the primary schedule length.
+                         Omitted streams use the primary timestep, as before.
 
         Returns:
             Single latents if no extra_streams
@@ -1312,6 +1328,11 @@ class BasePipeline(nn.Module):
 
         total_steps = len(timesteps)
         has_extra_streams = extra_streams is not None and len(extra_streams) > 0
+        for name, stream_timesteps in (extra_stream_timesteps or {}).items():
+            if name not in (extra_streams or {}):
+                raise ValueError(f"Timestep schedule provided for unknown stream: {name}")
+            if stream_timesteps.ndim != 1 or len(stream_timesteps) != total_steps:
+                raise ValueError(f"Timestep schedule for {name} must have {total_steps} entries.")
 
         # Reset cache acceleration state for new generation (TeaCache / Cache-DiT)
         if getattr(self, "cache_accelerator", None) and self.cache_accelerator.is_enabled():
@@ -1405,6 +1426,9 @@ class BasePipeline(nn.Module):
                 scheduler,
                 extra_stream_schedulers,
                 scheduler_step_kwargs=scheduler_step_kwargs,
+                extra_stream_timesteps={
+                    name: schedule[i] for name, schedule in (extra_stream_timesteps or {}).items()
+                },
             )
 
             if post_step_fn is not None:

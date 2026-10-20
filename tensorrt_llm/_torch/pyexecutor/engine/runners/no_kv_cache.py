@@ -1,0 +1,311 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Shared execution template for model families that do not use a KV cache."""
+
+from abc import abstractmethod
+from dataclasses import dataclass
+from typing import Any
+
+import torch
+from torch import nn
+
+from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
+from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
+from tensorrt_llm._torch.attention.backends.vanilla import VanillaAttentionMetadata
+from tensorrt_llm._torch.distributed import Distributed
+from tensorrt_llm._torch.models.modeling_multimodal_mixin import _build_request_multimodal_input
+from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import (
+    MoeLoadBalancer,
+    MoeLoadBalancerIterContext,
+)
+from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager, ResourceManagerType
+from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
+from tensorrt_llm._torch.utils import with_model_extra_attrs
+from tensorrt_llm._utils import prefer_pinned
+from tensorrt_llm.inputs.multimodal import MultimodalParams
+from tensorrt_llm.llmapi.llm_args import PrefillCudaGraphBackend
+from tensorrt_llm.mapping import Mapping
+
+from ..input_buffers import InputBuffers
+from ..lora import LoraParamBuilder
+from ..metadata import build_attention_metadata
+from .common import (
+    apply_position_id_offset,
+    get_all_rank_num_tokens,
+    pad_input_tokens,
+    prepare_multimodal_indices,
+    ship_multimodal_indices,
+    token_model_inputs,
+)
+from .interface import PreparedInputs, RunnerConfig, ScheduledInputs, ScheduledModelRunner
+
+
+@dataclass(frozen=True)
+class NoKVCacheRunnerConfig(RunnerConfig):
+    """Settings used to prepare scheduled requests without a KV cache."""
+
+    enable_attention_dp: bool
+    prefill_cuda_graph_backend: PrefillCudaGraphBackend
+    prefill_cuda_graph_num_tokens: list[int]
+    mm_encoder_cache_enabled: bool
+
+
+class NoKVCacheRunner(ScheduledModelRunner):
+    """Common execution template for model families that do not use a KV cache."""
+
+    def __init__(
+        self,
+        model: nn.Module,
+        config: NoKVCacheRunnerConfig,
+        *,
+        mapping: Mapping,
+        dist: Distributed | None,
+        moe_load_balancer: MoeLoadBalancer | None,
+    ) -> None:
+        self._model = model
+        self._mapping = mapping
+        self._dist = dist
+        self._moe_load_balancer = moe_load_balancer
+        self._buffers = InputBuffers.allocate(
+            max_num_tokens=config.max_num_tokens,
+            max_batch_size=config.max_batch_size,
+            max_beam_width=config.max_beam_width,
+            max_seq_len=config.max_seq_len,
+            use_cache_indirection=config.attention_backend.Metadata is TrtllmAttentionMetadata,
+        )
+        self._config = config
+        self._lora = LoraParamBuilder(
+            attn_backend=config.attention_backend,
+            cuda_graph_manager=None,
+        )
+        self._attn_metadata: AttentionMetadata | None = None
+
+    def setup_attn_metadata(self) -> AttentionMetadata:
+        if self._attn_metadata is not None:
+            return self._attn_metadata
+
+        self._attn_metadata = build_attention_metadata(
+            self._model.model_config,
+            max_batch_size=self._config.max_batch_size,
+            max_num_tokens=self._config.max_num_tokens,
+            max_beam_width=self._config.max_beam_width,
+            attention_backend=self._config.attention_backend,
+            attention_runtime_features=self._config.attention_runtime_features,
+            mapping=self._mapping,
+            cache_indirection=self._buffers.cache_indirection,
+            kv_cache_manager=None,
+        )
+        self._attn_metadata.block_ids_per_seq = None
+        self._attn_metadata.kv_block_ids_per_seq = None
+        return self._attn_metadata
+
+    def prepare_inputs(
+        self,
+        scheduled_requests: ScheduledRequests,
+        *,
+        resource_manager: ResourceManager,
+    ) -> PreparedInputs:
+        runner_config = self._config
+        attn_metadata = self.setup_attn_metadata()
+
+        sequence_lengths = []
+        input_ids = []
+        position_ids = []
+        request_ids = []
+        multimodal_params_list = []
+
+        for request in scheduled_requests.context_requests:
+            prompt_tokens = request.get_tokens(0)
+            # Start offset of this request's tokens within the flattened
+            # input_ids (see DecoderInputPreparer._pack_context_requests for rationale).
+            context_start_idx = len(input_ids)
+            input_ids.extend(prompt_tokens)
+            request_ids.append(request.py_request_id)
+            if request.py_position_ids is None:
+                position_ids.extend(range(len(prompt_tokens)))
+            else:
+                position_ids.extend(request.py_position_ids)
+            sequence_lengths.append(len(prompt_tokens))
+
+            # Multimodal
+            if request.py_multimodal_data is not None:
+                multimodal_params = MultimodalParams(
+                    multimodal_input=_build_request_multimodal_input(
+                        request,
+                        runner_config.mm_encoder_cache_enabled,
+                    ),
+                    multimodal_data=request.py_multimodal_data,
+                    mm_item_order=getattr(request, "py_mm_item_order", None),
+                    input_ids_start_offset=context_start_idx,
+                )
+                multimodal_params.to_device(
+                    "multimodal_data",
+                    "cuda",
+                    pin_memory=prefer_pinned(),
+                )
+                multimodal_params_list.append(multimodal_params)
+
+            request.py_batch_idx = request.py_seq_slot
+
+        num_tokens = len(input_ids)
+        assert num_tokens <= runner_config.max_num_tokens, (
+            "num_tokens should be less than or equal to max_num_tokens"
+        )
+        # Compute MM/text token indices on CPU input_ids so that
+        # fuse_input_embeds can skip its torch.where host sync. Must run before
+        # the input_ids list is rebound to a tensor below. Skipped when
+        # ``model`` is a vision encoder (no ``config.vocab_size`` to filter
+        # against, and its forward doesn't consume the indices anyway); this
+        # is a structural check on the model rather than a flag lookup, so it
+        # naturally extends to any future "LLM-less" engine setup.
+        _model_config = getattr(self._model, "config", None)
+        if (
+            len(multimodal_params_list) > 0
+            and getattr(_model_config, "vocab_size", None) is not None
+        ):
+            text_token_indices_cpu, mm_token_indices_cpu = prepare_multimodal_indices(
+                input_ids,
+                model=self._model,
+            )
+        else:
+            text_token_indices_cpu = None
+            mm_token_indices_cpu = None
+        input_ids = torch.tensor(
+            input_ids,
+            dtype=torch.int,
+            pin_memory=prefer_pinned(),
+        )
+        self._buffers.input_ids_cuda[:num_tokens].copy_(input_ids, non_blocking=True)
+
+        position_ids = apply_position_id_offset(position_ids, model=self._model)
+        position_ids = torch.tensor(
+            position_ids,
+            dtype=torch.int,
+            pin_memory=prefer_pinned(),
+        )
+        self._buffers.position_ids_cuda[:num_tokens].copy_(position_ids, non_blocking=True)
+
+        if not attn_metadata.is_cuda_graph:
+            # No need to overwrite seq lens when using CUDA graphs -
+            # CUDA graphs are only used for pure decoding batches
+            # and have static batch size, so the seqlens never change.
+            # Note that it's important to not free the seq_lens_cuda
+            # buffer once the graph has been captured also - this will invalidate
+            # the graph and force an expensive recapture.
+            attn_metadata.seq_lens = torch.tensor(
+                sequence_lengths,
+                dtype=torch.int,
+                pin_memory=prefer_pinned(),
+            )
+
+        attn_metadata.num_contexts = scheduled_requests.num_context_requests
+
+        attn_all_rank_num_tokens = get_all_rank_num_tokens(
+            attn_metadata,
+            enable_attention_dp=runner_config.enable_attention_dp,
+            mapping=self._mapping,
+            dist=self._dist,
+        )
+        virtual_num_tokens = pad_input_tokens(
+            attn_metadata,
+            num_tokens,
+            attn_metadata.num_contexts,
+            attn_all_rank_num_tokens,
+            input_ids=self._buffers.input_ids_cuda,
+            position_ids=self._buffers.position_ids_cuda,
+            dist=self._dist,
+            enable_attention_dp=runner_config.enable_attention_dp,
+            prefill_cuda_graph_backend=runner_config.prefill_cuda_graph_backend,
+            prefill_cuda_graph_num_tokens=runner_config.prefill_cuda_graph_num_tokens,
+        )
+
+        # This is for no-KV-cache attention, not for dummy attention.
+        if attn_metadata.kv_cache_manager is None:
+            assert isinstance(
+                attn_metadata,
+                (VanillaAttentionMetadata, TrtllmAttentionMetadata),
+            ), (
+                "Only vanilla and trtllm attention metadata are supported for "
+                "no-KV-cache attention for now"
+            )
+            attn_metadata.max_seq_len = runner_config.max_seq_len
+            attn_metadata.request_ids = request_ids
+            attn_metadata.prepare()
+
+        lora_params = self._lora.build(scheduled_requests, attn_metadata)
+
+        inputs = token_model_inputs(
+            attn_metadata,
+            resource_manager,
+            input_ids=self._buffers.input_ids_cuda,
+            position_ids=self._buffers.position_ids_cuda,
+            num_tokens=virtual_num_tokens,
+            multimodal_params=multimodal_params_list,
+        )
+
+        if mm_token_indices_cpu is not None:
+            # No extend/draft tokens in the no-KV-cache path, so num_tokens covers
+            # the full range and the helper's arange/cat branch is skipped.
+            ship_multimodal_indices(
+                inputs,
+                mm_token_indices_cpu=mm_token_indices_cpu,
+                text_token_indices_cpu=text_token_indices_cpu,
+                num_ctx_tokens=num_tokens,
+                total_num_tokens=num_tokens,
+            )
+
+        if bool(lora_params):
+            inputs["lora_params"] = lora_params
+
+        # support attention dp
+        if runner_config.enable_attention_dp:
+            assert self._dist is not None, "attention DP requires a distributed communicator"
+            all_rank_num_tokens = self._dist.tp_cp_allgather_int64([attn_metadata.num_tokens])
+            attn_metadata.all_rank_num_tokens = all_rank_num_tokens[:, 0].tolist()
+
+        return PreparedInputs(inputs)
+
+    def _validate_resources(self, resource_manager: ResourceManager) -> None:
+        kv_cache_manager = resource_manager.get_resource_manager(
+            ResourceManagerType.KV_CACHE_MANAGER
+        )
+        assert kv_cache_manager is None, (
+            "a no-KV-cache runner was initialized, but a KV cache manager was allocated"
+        )
+
+    def warmup(self, resource_manager: ResourceManager) -> None:
+        """Validate the resources used by this runner before execution."""
+        self._validate_resources(resource_manager)
+
+    @torch.inference_mode()
+    @with_model_extra_attrs(lambda self: self._model.extra_attrs)
+    def forward(
+        self,
+        inputs: ScheduledInputs,
+        *,
+        resource_manager: ResourceManager,
+        is_dummy: bool = False,
+    ) -> dict[str, Any]:
+        del is_dummy
+        batch = inputs.batch
+        self._validate_resources(resource_manager)
+        prepared = self.prepare_inputs(batch, resource_manager=resource_manager)
+        with MoeLoadBalancerIterContext(self._moe_load_balancer):
+            return self._forward_step(
+                prepared.kwargs,
+                batch,
+                gather_ids=prepared.gather_ids,
+                gather_context_logits=inputs.gather_context_logits,
+            )
+
+    @abstractmethod
+    def _forward_step(
+        self,
+        inputs: dict[str, Any],
+        scheduled_requests: ScheduledRequests,
+        *,
+        gather_ids: torch.Tensor | None = None,
+        gather_context_logits: bool = False,
+    ) -> dict[str, Any]:
+        """Run the model-family-specific forward step."""

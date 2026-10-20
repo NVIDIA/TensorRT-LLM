@@ -50,21 +50,22 @@ from ..attention.backends.interface import (
 )
 from ..distributed import AllReduce
 from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
-from ..model_config import ModelConfig
-from ..modules.decoder_layer import DecoderLayer
-from ..modules.embedding import Embedding
-from ..modules.fused_ops.gelu_tanh_mul_fp4_quant import gelu_tanh_mul_fp4_quant
-from ..modules.fused_ops.rmsnorm_fp4_quant import rmsnorm_fp4_quant, rmsnorm_fp4_quant_available
-from ..modules.fused_ops.rmsnorm_residual_add import (
+from ..kernels.fused_ops.gelu_tanh_mul_fp4_quant import gelu_tanh_mul_fp4_quant
+from ..kernels.fused_ops.rmsnorm_fp4_quant import rmsnorm_fp4_quant, rmsnorm_fp4_quant_available
+from ..kernels.fused_ops.rmsnorm_residual_add import (
     rmsnorm_residual_add,
     rmsnorm_residual_add_scale,
 )
+from ..model_config import ModelConfig
+from ..modules.decoder_layer import DecoderLayer
+from ..modules.embedding import Embedding
 from ..modules.gated_mlp import GatedMLP
 from ..modules.gemma4.fused_qkv import gemma4_fused_qkv_norm_rope_quant
 from ..modules.linear import Linear, TensorParallelMode, WeightMode, WeightsLoadingConfig
 from ..modules.rms_norm import RMSNorm
 from ..speculative.interface import SpecMetadata
 from ..utils import ActivationType, Fp4QuantizedTensor, is_torch_compiling
+from .modeling_gemma3 import build_gemma_attention_mask
 from .modeling_speculative import (
     _SPECULATIVE_POSITION_HEADROOM,
     SpecDecOneEngineForCausalLM,
@@ -1330,86 +1331,17 @@ class Gemma4ForCausalLM(SpecDecOneEngineForCausalLM[Gemma4TextModel, Gemma4TextC
         """Prefer the Python transceiver so disaggregated serving over NIXL keeps V2."""
         return "PYTHON"
 
-    def _get_token_type_mask(self, mm_token_type_ids: torch.Tensor):
-        """Build bidirectional attention mask from mm_token_type_ids.
-
-        mm_token_type_ids: 0=text, 1=image, 2=video, 3=audio. Only VISION
-        tokens (image/video) attend bidirectionally within their contiguous
-        blob; text and audio stay causal. Matches HF Gemma4, where
-        ``is_vision = (mm_token_type_ids == 1) | (mm_token_type_ids == 2)`` and
-        audio is left causal.
-        """
-        device = mm_token_type_ids.device
-        token_type_ids = mm_token_type_ids.clone()
-        # Only vision tokens (image=1, video=2) get the bidirectional mask;
-        # audio (3) stays causal, matching HF Gemma4 (audio is not in is_vision).
-        is_mm = (token_type_ids == 1) | (token_type_ids == 2)
-
-        # Detect blob boundaries: positions where type changes or goes 0->nonzero
-        padded = torch.cat(
-            (
-                torch.tensor([0], device=device, dtype=mm_token_type_ids.dtype),
-                mm_token_type_ids,
-            )
-        )
-        # A new blob starts whenever the type changes and the current is nonzero
-        changes = (padded[1:] != padded[:-1]) & is_mm
-        blob_ids = torch.cumsum(changes.int(), dim=0)
-        # Mask out text tokens
-        blob_ids = blob_ids * is_mm.int()
-
-        # Tokens with the same non-zero blob_id attend bidirectionally
-        token_type_mask = blob_ids.unsqueeze(0) == blob_ids.unsqueeze(1)
-        token_type_mask.logical_and_(is_mm.unsqueeze(0))
-        token_type_mask.logical_and_(is_mm.unsqueeze(1))
-
-        return token_type_mask
-
     def get_context_mask(
         self,
         mm_token_type_ids: torch.Tensor,
         effective_sliding_window: Optional[int] = None,
         prefix_len: int = 0,
-    ):
-        """Build context mask with causal + bidirectional for MM tokens.
-
-        Returns a [extend_len, prefix_len + extend_len] mask where:
-        - The first `prefix_len` columns (cached/paged history) apply the
-          sliding window using absolute token positions. Bidirectional MM
-          across the prefix/extend boundary is NOT supported here; callers
-          must ensure chunk boundaries do not split a multimodal block.
-        - The last `extend_len` columns follow the original causal +
-          (optional) sliding window + MM-bidirectional logic.
-        """
-        device = mm_token_type_ids.device
-        extend_len = len(mm_token_type_ids)
-
-        pos = torch.arange(extend_len, device=device)
-        causal_mask = pos.unsqueeze(0) <= pos.unsqueeze(1)
-
-        if effective_sliding_window is not None and effective_sliding_window < extend_len:
-            causal_mask.logical_and_(pos.unsqueeze(0) > pos.unsqueeze(1) - effective_sliding_window)
-
-        token_type_mask = self._get_token_type_mask(mm_token_type_ids)
-        causal_mask = causal_mask.masked_fill(token_type_mask, True)
-
-        if prefix_len > 0:
-            if (
-                effective_sliding_window is not None
-                and effective_sliding_window < prefix_len + extend_len
-            ):
-                query_pos = prefix_len + pos
-                prefix_pos = torch.arange(prefix_len, device=device)
-                prefix_block = (
-                    prefix_pos.unsqueeze(0) > query_pos.unsqueeze(1) - effective_sliding_window
-                )
-            else:
-                prefix_block = torch.ones(
-                    extend_len, prefix_len, dtype=causal_mask.dtype, device=device
-                )
-            causal_mask = torch.cat([prefix_block, causal_mask], dim=1)
-
-        return causal_mask
+    ) -> torch.Tensor:
+        """Build a context mask; chunk boundaries must not split vision blobs."""
+        length = len(mm_token_type_ids)
+        return build_gemma_attention_mask(
+            mm_token_type_ids, [length], [prefix_len], effective_sliding_window
+        ).view(length, prefix_len + length)
 
     def get_attention_mask(
         self,
@@ -1432,18 +1364,9 @@ class Gemma4ForCausalLM(SpecDecOneEngineForCausalLM[Gemma4TextModel, Gemma4TextC
         else:
             cached_token_lens = [0] * num_contexts
 
-        context_mask_list = []
-        token_offset = 0
-        for context_len, prefix_len in zip(context_lens, cached_token_lens, strict=True):
-            context_end = token_offset + context_len
-            mask_i = self.get_context_mask(
-                mm_token_type_ids=mm_token_type_ids[token_offset:context_end],
-                effective_sliding_window=effective_sliding_window,
-                prefix_len=prefix_len,
-            )
-            context_mask_list.append(mask_i.flatten())
-            token_offset = context_end
-        return torch.cat(context_mask_list, dim=0).contiguous()
+        return build_gemma_attention_mask(
+            mm_token_type_ids, context_lens, cached_token_lens, effective_sliding_window
+        )
 
     def _forward_speculative(
         self,
@@ -1666,6 +1589,9 @@ class Gemma4AssistantForCausalLM(DecoderModelForCausalLM[Gemma4TextModel, Gemma4
             pretrained_config=assistant_text_config,
             spec_config=None,
         )
+        # extra_attrs is init=False and would otherwise be reset by replace(),
+        # disconnecting the assistant's custom-op registries from the engine.
+        text_model_config.extra_attrs = model_config.extra_attrs
         super().__init__(
             Gemma4TextModel(text_model_config),
             config=model_config,

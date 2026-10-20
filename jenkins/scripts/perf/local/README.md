@@ -1,3 +1,6 @@
+<!-- SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved. -->
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+
 # Local SLURM Launch Scripts
 
 ## Overview
@@ -29,6 +32,8 @@ slurm_launch.sh  (generated)
 - `--test-list`: Test string, e.g., `perf/test_perf_sanity.py::test_e2e[aggr-config-test_name]`. If both `--test-list` and `--config-file` are provided, `--test-list` takes precedence.
 - `--config-file`: Path to config YAML file.
 - `--test-name`: Test name (only used for aggregated mode when `--config-file` is provided).
+- `--benchmark-mode`: `e2e` | `gen_only` | `ctx_only` (only used for a disagg `--config-file`; with `--test-list` the mode is read off the test id).
+- `--time-breakdown`: Also record the per-request lifecycle breakdown. This adds the `time_breakdown` modifier segment to the generated test id (`disagg-e2e-time_breakdown-<yaml-stem>`); the modifier is orthogonal to `--benchmark-mode` and does not change the workload.
 - `--time`: SLURM time limit (default: `02:00:00`).
 - `--mounts`: Container mounts.
 - `--work-dir`: Work directory (used for both workdir and container-workdir).
@@ -85,7 +90,7 @@ python3 submit.py --test-list "perf/test_perf_sanity.py::test_e2e[aggr-deepseek_
 ### Disaggregated Mode
 
 ```bash
-python3 submit.py --test-list "perf/test_perf_sanity.py::test_e2e[disagg-e2e-gb200_deepseek-r1-fp4_1k1k_con1_ctx1_dep4_gen1_tep8_eplb0_mtp3_ccb-UCX]" \
+python3 submit.py --test-list "perf/test_perf_sanity.py::test_e2e[disagg-e2e-gb200_deepseek-r1-fp4_1k1k_con1_ctx1_dep4_gen1_tep8_eplb0_mtp3_ccb-NIXL]" \
     --draft-launch-sh $trtllm/jenkins/scripts/perf/disaggregated/slurm_launch_draft.sh \
     --launch-sh $work_dir/slurm_launch.sh \
     --install-sh $trtllm/jenkins/scripts/perf/local/slurm_install.sh \

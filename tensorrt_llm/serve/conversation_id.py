@@ -15,6 +15,9 @@
 
 from typing import Any, Mapping, Optional, Protocol
 
+# Disagg edge-to-worker routing key, independent of conversation history.
+SUBAGENT_AFFINITY_HEADER = "x-trtllm-subagent-affinity-id"
+
 # Supported HTTP header protocol for external clients, gateways, or proxies
 # that carry a stable multi-turn identifier outside the JSON body. Body
 # ``conversation_params.conversation_id`` is canonical when both body and
@@ -46,6 +49,50 @@ class RequestWithConversationParams(Protocol):
 def get_request_conversation_id(request: RequestWithConversationParams) -> Optional[str]:
     conversation_params = request.conversation_params
     return None if conversation_params is None else conversation_params.conversation_id
+
+
+def get_request_subagent_affinity_id(
+    request: RequestWithConversationParams,
+) -> Optional[str]:
+    """Return the parent-session routing key set by the disagg edge."""
+    conversation_params = request.conversation_params
+    if conversation_params is None:
+        return None
+    return getattr(conversation_params, "subagent_affinity_id", None)
+
+
+def get_request_routing_id(request: RequestWithConversationParams) -> Optional[str]:
+    """Return the parent affinity key when present, else the conversation id."""
+    return get_request_subagent_affinity_id(request) or get_request_conversation_id(request)
+
+
+def extract_subagent_parent_id(
+    headers: Optional[Mapping[str, str]],
+    subagent_affinity_header: Optional[str],
+) -> Optional[str]:
+    """Read the parent-session id from the configured gateway header."""
+    if not subagent_affinity_header or headers is None:
+        return None
+    lower_headers = {str(key).lower(): value for key, value in headers.items()}
+    parent_id = lower_headers.get(str(subagent_affinity_header).strip().lower())
+    if parent_id is None:
+        return None
+    parent_id = str(parent_id).strip()
+    return parent_id or None
+
+
+def extract_subagent_affinity_id_from_headers(
+    headers: Optional[Mapping[str, str]],
+) -> Optional[str]:
+    """Read the parent affinity key forwarded by the disagg edge."""
+    if headers is None:
+        return None
+    lower_headers = {str(key).lower(): value for key, value in headers.items()}
+    affinity_id = lower_headers.get(SUBAGENT_AFFINITY_HEADER)
+    if affinity_id is None:
+        return None
+    affinity_id = str(affinity_id).strip()
+    return affinity_id or None
 
 
 def extract_conversation_id_from_headers(headers: Optional[Mapping[str, str]]) -> Optional[str]:

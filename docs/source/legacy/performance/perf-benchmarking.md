@@ -1,3 +1,7 @@
+---
+orphan: true
+---
+
 (perf-benchmarking)=
 
 # TensorRT-LLM Benchmarking

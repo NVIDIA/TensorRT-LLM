@@ -26,7 +26,6 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Float32, Int32
 from cutlass.experimental import primitives as prims
-
 from cutlass.experimental.task_scheduling.enums import WorkAttr
 from cutlass.experimental.task_scheduling.memory import SmemAllocation, TmemAllocation
 from cutlass.experimental.task_scheduling.resources import (
@@ -36,18 +35,22 @@ from cutlass.experimental.task_scheduling.resources import (
     producer_work,
 )
 
-from ..fmha_decode_constants import KV_INST0
 from ..fmha_decode_config import FmhaDecodeConfig
+from ..fmha_decode_constants import (
+    KV_INST0,
+    SMEM_DESC_UNIT_BYTES,
+    SWIZZLE_128B_ROW_BYTES,
+)
 from ...tcgen05_compat import tcgen05_mma_ws
 from .helpers_common import (
+    _TASK_CACHE_TMEM_BASE_OFFSET,
     Constexpr,
     DecodeGenResourceBase,
     DescriptorValue,
-    _TASK_CACHE_TMEM_BASE_OFFSET,
     _decode_gen_task_cache,
     _freeze_smem_descriptor,
-    _mma_k_step,
-    _mma_kind_for_qkv,
+    _mma_k_step_pv,
+    _mma_kind_for_pv,
 )
 
 
@@ -59,12 +62,15 @@ def _pv_mma_operand_contract_for_config(
         cfg.headdim if cfg.head_dim_per_stage_kv == 0 else cfg.head_dim_kv_stage
     )
     if cfg.use_keeps_mma_ab:
-        if cfg.tile_size_kv == 256:
+        if cfg.uses_ws_2x2_datapath:
             # The WS 2x2 PV instruction exposes two spatial D128 partials as
             # one physical KV256 operation. Correction merges those spatial
             # halves after the two temporal decode streams are complete.
             return True, cfg.tile_size_q, cfg.tile_size_kv, 0, 1
         return True, cfg.tile_size_q, active_head_dim, 0, 1
+    if cfg.store_transformed_kv_in_tmem:
+        # Transposed TMEM V is operand A in K-major layout; P remains SMEM B.
+        return False, active_head_dim, cfg.tile_size_q, 0, 0
     return False, active_head_dim, cfg.tile_size_q, 1, 0
 
 
@@ -196,7 +202,7 @@ class TmemOResource(DecodeGenResourceBase):
         p_tmem_addr: Int32,
         fragment_idx: Constexpr[int],
     ) -> None:
-        """Issue one K32 fragment of a KV256 loop PV tile."""
+        """Issue one K32 fragment of a streamed loop PV tile."""
         self._vp_mma_fragment(
             stage_info,
             v_desc=v_desc,
@@ -215,7 +221,7 @@ class TmemOResource(DecodeGenResourceBase):
         p_tmem_addr: Int32,
         fragment_idx: Constexpr[int],
     ) -> None:
-        """Issue one K32 fragment of the final KV256 PV tile."""
+        """Issue one K32 fragment of the final streamed PV tile."""
         self._vp_mma_fragment(
             stage_info,
             v_desc=v_desc,
@@ -234,14 +240,19 @@ class TmemOResource(DecodeGenResourceBase):
         fragment_idx: Constexpr[int],
         initial_scale_d,
     ) -> None:
-        """Issue the two WS MMA steps covered by one KV256 P fragment.
+        """Issue the MMA K-steps covered by one streamed P fragment.
 
         ``p_tmem_addr`` is already the base of the fragment selected by
-        ``wait_p_fragment``. Only the two local K-step offsets are added here;
-        ``fragment_idx`` must not be applied to the TMEM address again.
+        ``wait_p_fragment``. Only the local K-step offsets are added here;
+        ``fragment_idx`` must not be applied to the TMEM address again. A K32
+        fragment is two K16 steps for 16-bit operands and one K32 step for
+        FP8. KV256 issues the WS 2x2 instruction over its two spatial halves,
+        whose V is staged as KV64 blocks; KV128 issues the plain M=128
+        instruction over one contiguous V tile. Every K step spans
+        ``mma_k_step`` swizzled 128-byte V rows.
         """
         cfg = self.cfg
-        assert cfg.tile_size_kv == 256 and cfg.uses_two_inst_tmem_p
+        assert cfg.streams_tmem_p_fragments
         v_desc = _freeze_smem_descriptor(v_desc)
 
         task_cache = _decode_gen_task_cache(stage_info)
@@ -252,33 +263,59 @@ class TmemOResource(DecodeGenResourceBase):
             Float32,
         )
         _, mma_m, mma_n, a_major, b_major = _pv_mma_operand_contract_for_config(cfg)
+        # P and V use the effective PV precision after any KV transformation.
         idesc = prims.Tcgen05InstrDesc.build(
             c_dtype=Float32,
-            a_dtype=cfg.q_dtype,
-            b_dtype=cfg.q_dtype,
+            a_dtype=cfg.pv_dtype,
+            b_dtype=cfg.pv_dtype,
             a_major=a_major,
             b_major=b_major,
             n_dim=mma_n,
             m_dim=mma_m,
         )
-        first_k_step = fragment_idx * 2
+        mma_k_step = _mma_k_step_pv(cfg)
+        k_steps_per_fragment = cfg.pv_mma_steps_per_fragment
+        first_k_step = fragment_idx * k_steps_per_fragment
+        # One K step covers ``mma_k_step`` swizzled V rows.
+        k_step_desc_units = mma_k_step * SWIZZLE_128B_ROW_BYTES // SMEM_DESC_UNIT_BYTES
+        p_cols_per_k_step = cfg.p_cols_per_mma_k_step
         if prims.elect_sync():
-            for local_k_step in cutlass.range_constexpr(2):
+            for local_k_step in cutlass.range_constexpr(k_steps_per_fragment):
                 k_step = first_k_step + local_k_step
                 p_operand = prims.make_tmem_ptr(
-                    p_tmem_addr + Int32(local_k_step * 8), Int32
+                    p_tmem_addr + Int32(local_k_step * p_cols_per_k_step), Int32
                 )
-                iter_v_desc = v_desc + Int32(
-                    (k_step // 4) * cfg.headdim * 16 + (k_step % 4) * 128
-                )
-                tcgen05_mma_ws(
-                    _mma_kind_for_qkv(cfg),
-                    tmem_col,
-                    p_operand,
-                    iter_v_desc,
-                    idesc,
-                    initial_scale_d or fragment_idx != 0 or local_k_step != 0,
-                )
+                scale_d = initial_scale_d or fragment_idx != 0 or local_k_step != 0
+                if cutlass.const_expr(cfg.uses_ws_2x2_datapath):
+                    # V holds four KV64 blocks in two spatial pairs; jump to
+                    # the next pair once the K steps have covered 64 tokens.
+                    k_steps_per_block = 64 // mma_k_step
+                    block_pair_desc_units = (
+                        2 * 64 * cfg.headdim * cfg.v_dtype_bytes // SMEM_DESC_UNIT_BYTES
+                    )
+                    iter_v_desc = v_desc + Int32(
+                        (k_step // k_steps_per_block) * block_pair_desc_units
+                        + (k_step % k_steps_per_block) * k_step_desc_units
+                    )
+                    tcgen05_mma_ws(
+                        _mma_kind_for_pv(cfg),
+                        tmem_col,
+                        p_operand,
+                        iter_v_desc,
+                        idesc,
+                        scale_d,
+                    )
+                else:
+                    iter_v_desc = v_desc + Int32(k_step * k_step_desc_units)
+                    prims.tcgen05_mma(
+                        _mma_kind_for_pv(cfg),
+                        prims.CTAGroup.CTA_1,
+                        tmem_col,
+                        p_operand,
+                        iter_v_desc,
+                        idesc,
+                        scale_d,
+                    )
 
     @cute.jit
     def _vp_mma(
@@ -311,7 +348,10 @@ class TmemOResource(DecodeGenResourceBase):
             v_desc = v_desc_1
             p_desc = p_desc_1
             p_tmem_addr = p_tmem_addr_1
-        v_desc = _freeze_smem_descriptor(v_desc)
+        if cutlass.const_expr(cfg.store_transformed_kv_in_tmem):
+            v_operand = prims.make_tmem_ptr(v_desc, Int32)
+        else:
+            v_operand = _freeze_smem_descriptor(v_desc)
         if cutlass.const_expr(not cfg.uses_tmem_p):
             p_desc = _freeze_smem_descriptor(p_desc)
         task_cache = _decode_gen_task_cache(stage_info)
@@ -332,8 +372,8 @@ class TmemOResource(DecodeGenResourceBase):
             )
             idesc = prims.Tcgen05InstrDesc.build(
                 c_dtype=Float32,
-                a_dtype=cfg.q_dtype,
-                b_dtype=cfg.q_dtype,
+                a_dtype=cfg.pv_dtype,
+                b_dtype=cfg.pv_dtype,
                 a_major=a_major,
                 b_major=b_major,
                 n_dim=mma_n,
@@ -344,7 +384,7 @@ class TmemOResource(DecodeGenResourceBase):
                 # Accumulate into O after the first K/V tile for this output
                 # stage; the first wave overwrites the TMEM O stage.
                 scale_d = initial_scale_d
-                pv_k_steps = cfg.tile_size_kv // _mma_k_step(cfg)
+                pv_k_steps = cfg.tile_size_kv // _mma_k_step_pv(cfg)
                 for ki in cutlass.range_constexpr(pv_k_steps):
                     # Keeps computes P x V (A=P, B=V); Swaps computes the
                     # transposed V^T x P^T tile (A=V, B=P).
@@ -352,19 +392,18 @@ class TmemOResource(DecodeGenResourceBase):
                         # TMEM P stores two 16-bit values per column (or four
                         # FP8 values), so each 16-wide MMA-K step advances by
                         # the corresponding packed-column count.
-                        p_cols_per_k_step = _mma_k_step(cfg) * cfg.q_dtype_bytes // 4
                         p_operand = prims.make_tmem_ptr(
-                            p_tmem_addr + Int32(ki * p_cols_per_k_step),
+                            p_tmem_addr + Int32(ki * cfg.p_cols_per_mma_k_step),
                             Int32,
                         )
                     else:
                         p_operand = p_desc
                     if cutlass.const_expr(p_is_a):
-                        a_desc, b_desc = p_operand, v_desc
+                        a_desc, b_desc = p_operand, v_operand
                     else:
-                        a_desc, b_desc = v_desc, p_operand
+                        a_desc, b_desc = v_operand, p_operand
                     prims.tcgen05_mma(
-                        _mma_kind_for_qkv(cfg),
+                        _mma_kind_for_pv(cfg),
                         prims.CTAGroup.CTA_1,
                         tmem_col,
                         a_desc,
@@ -377,12 +416,18 @@ class TmemOResource(DecodeGenResourceBase):
                         # Advance V and P descriptors to the next MMA-K
                         # slice, including the 16-bit 128-token jump across
                         # split SMEM rows.
-                        v_desc = v_desc + Int32(
-                            (cfg.headdim * 2) if cfg.use_fp8_qkv else 128
-                        )
+                        if cutlass.const_expr(cfg.store_transformed_kv_in_tmem):
+                            v_operand = prims.make_tmem_ptr(
+                                v_desc + Int32((ki + 1) * _mma_k_step_pv(cfg) // 4),
+                                Int32,
+                            )
+                        else:
+                            v_operand = v_operand + Int32(
+                                (cfg.headdim * 2) if cfg.use_fp8_pv else 128
+                            )
                         if cutlass.const_expr(not cfg.uses_tmem_p):
                             if cutlass.const_expr(
-                                not cfg.use_fp8_qkv
+                                not cfg.use_fp8_pv
                                 and cfg.tile_size_kv == 128
                                 and ki == 3
                             ):
@@ -412,8 +457,8 @@ class TmemOResource(DecodeGenResourceBase):
             )
             idesc = prims.Tcgen05InstrDesc.build(
                 c_dtype=Float32,
-                a_dtype=cfg.q_dtype,
-                b_dtype=cfg.q_dtype,
+                a_dtype=cfg.pv_dtype,
+                b_dtype=cfg.pv_dtype,
                 a_major=a_major,
                 b_major=b_major,
                 n_dim=mma_n,
@@ -424,21 +469,22 @@ class TmemOResource(DecodeGenResourceBase):
                 # Issue one MMA per K step. The first wave may overwrite the
                 # slice, while later loop/tail waves accumulate into it.
                 scale_d = initial_scale_d
-                for ki in cutlass.range_constexpr(cfg.tile_size_kv // _mma_k_step(cfg)):
+                for ki in cutlass.range_constexpr(
+                    cfg.tile_size_kv // _mma_k_step_pv(cfg)
+                ):
                     if cutlass.const_expr(cfg.uses_tmem_p):
-                        p_cols_per_k_step = _mma_k_step(cfg) * cfg.q_dtype_bytes // 4
                         p_operand = prims.make_tmem_ptr(
-                            p_tmem_addr + Int32(ki * p_cols_per_k_step),
+                            p_tmem_addr + Int32(ki * cfg.p_cols_per_mma_k_step),
                             Int32,
                         )
                     else:
                         p_operand = p_desc
                     if cutlass.const_expr(p_is_a):
-                        a_desc, b_desc = p_operand, v_desc
+                        a_desc, b_desc = p_operand, v_operand
                     else:
-                        a_desc, b_desc = v_desc, p_operand
+                        a_desc, b_desc = v_operand, p_operand
                     prims.tcgen05_mma(
-                        _mma_kind_for_qkv(cfg),
+                        _mma_kind_for_pv(cfg),
                         prims.CTAGroup.CTA_1,
                         tmem_col,
                         a_desc,
@@ -448,16 +494,22 @@ class TmemOResource(DecodeGenResourceBase):
                     )
                     scale_d = True
                     if cutlass.const_expr(
-                        ki + 1 < cfg.tile_size_kv // _mma_k_step(cfg)
+                        ki + 1 < cfg.tile_size_kv // _mma_k_step_pv(cfg)
                     ):
                         # Advance V and P to the next MMA-K slice inside the
                         # staged head-dim tile.
-                        v_desc = v_desc + Int32(
-                            (cfg.head_dim_kv_stage * 2) if cfg.use_fp8_qkv else 128
-                        )
+                        if cutlass.const_expr(cfg.store_transformed_kv_in_tmem):
+                            v_operand = prims.make_tmem_ptr(
+                                v_desc + Int32((ki + 1) * _mma_k_step_pv(cfg) // 4),
+                                Int32,
+                            )
+                        else:
+                            v_operand = v_operand + Int32(
+                                (cfg.head_dim_kv_stage * 2) if cfg.use_fp8_pv else 128
+                            )
                         if cutlass.const_expr(not cfg.uses_tmem_p):
                             if cutlass.const_expr(
-                                not cfg.use_fp8_qkv
+                                not cfg.use_fp8_pv
                                 and cfg.tile_size_kv == 128
                                 and ki == 3
                             ):

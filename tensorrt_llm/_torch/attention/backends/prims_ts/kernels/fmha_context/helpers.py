@@ -17,7 +17,7 @@
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Int32, Int64
+from cutlass import Float32, Int32, Int64
 
 
 @cute.jit
@@ -29,7 +29,7 @@ def variable_window_cta_min_start(
     q_stride: int | Int32,
     tile_size_q: cutlass.Constexpr[int],
 ) -> Int32:
-    """Load the plan-time minimum variable-window start for one Q CTA."""
+    """Load the per-run minimum variable-window start for one Q CTA."""
     num_seq_tiles = cute.ceil_div(q_stride, tile_size_q)
     return Int32(cta_starts[batch_coord * num_seq_tiles + seq_coord])
 
@@ -93,4 +93,25 @@ def freeze_smem_descriptor(desc):
         "mov.b64 {$w0}, {$r0};",
         write_only_types=[Int64],
         read_only_args=[desc],
+    )
+
+
+_LDTM32_MAX_PTX = (
+    "tcgen05.ld.red.sync.aligned.32x32b.x32.f32.max {"
+    + ", ".join(f"{{$w{i}}}" for i in range(32))
+    + "}, {$w32}, [{$r0}];"
+)
+
+
+@cute.jit
+def load_tmem_32x32b_max(tmem_addr: Int32) -> tuple:
+    """Load 32 FP32 scores and their maximum on SM103/SM107 (PTX 8.8).
+
+    Compatibility wrapper for CUTLASS DSL 4.7. The caller gates the GPU
+    architecture and completes the TMEM loads before publishing/reusing data.
+    """
+    return cute.arch.inline_ptx(
+        _LDTM32_MAX_PTX,
+        write_only_types=[Float32] * 33,
+        read_only_args=[tmem_addr],
     )

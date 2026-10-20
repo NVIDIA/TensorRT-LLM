@@ -16,19 +16,24 @@
 
 from dataclasses import dataclass
 import math
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 import torch
 
-from .._tensor_aliasing import _validate_out_does_not_overlap_inputs
 from ..decode import (
     PagedKVCache,
     _normalize_paged_kv_cache,
     _validate_16byte_alignment,
+    _validate_block_table_metadata,
     _validate_exact_compact_strides,
     _validate_scale,
 )
-from .common import _SIGNED_INT32_MAX
+from ..sage import SageAttentionParams, sage_adapter_slots, validate_sage_params
+from .common import (
+    _SIGNED_INT32_MAX,
+    _num_sparse_pattern_heads,
+    _validate_dense_contiguous_plan_inputs,
+)
 
 if TYPE_CHECKING:
     from .plan import _BlockSparsePlanState
@@ -47,8 +52,7 @@ class _PagedKVStorage:
     """Paged K/V storage and request metadata consumed by one live run."""
 
     paged_kv_cache: PagedKVCache
-    paged_kv_indptr: torch.Tensor
-    paged_kv_indices: torch.Tensor
+    block_tables: torch.Tensor
     seq_lens_kv: torch.Tensor
 
 
@@ -56,12 +60,25 @@ class _PagedKVStorage:
 class _PagedKVLaunchPayload:
     """Launch-only live paged metadata derived during shared validation."""
 
-    paged_kv_indptr: torch.Tensor
-    paged_kv_indices: torch.Tensor
+    block_tables: torch.Tensor
+    block_table_row_stride: int
     seq_lens_kv: torch.Tensor
     num_physical_kv_pages: int
     k_page_stride: int
     v_page_stride: int
+
+
+@dataclass(frozen=True)
+class _ValidatedPagedKV:
+    """Zero-copy paged K/V views, cache geometry, and launch metadata of one run."""
+
+    k: torch.Tensor
+    v: torch.Tensor
+    num_kv_heads: int
+    page_size: int
+    head_dim: int
+    table_capacity: int
+    payload: _PagedKVLaunchPayload
 
 
 @dataclass(frozen=True)
@@ -72,12 +89,18 @@ class _BlockSparseRunArgs:
     k: torch.Tensor
     v: torch.Tensor
     out: torch.Tensor
-    block_indptr: torch.Tensor
-    block_indices: torch.Tensor
-    kv_valid_bits: torch.Tensor
+    block_indptr: torch.Tensor | None
+    block_indices: torch.Tensor | None
+    # ``None`` for a dense run.
+    kv_valid_bits: torch.Tensor | None
     kv_valid_bits_is_live: bool
     sm_scale: float
     paged_kv: _PagedKVLaunchPayload | None
+    exact_block_bits: torch.Tensor | None = None
+    k_summary: torch.Tensor | None = None
+    v_summary: torch.Tensor | None = None
+    # Sage scale tensors in adapter ABI order; ``None`` for unused slots.
+    sage_slots: tuple[torch.Tensor | None, ...] = sage_adapter_slots({})
 
 
 def _validate_metadata_tensor(
@@ -113,36 +136,71 @@ def _validate_metadata_tensor(
 
 
 def validate_block_sparse_metadata(
-    block_indptr: torch.Tensor,
-    block_indices: torch.Tensor,
-    kv_valid_bits: torch.Tensor | None,
     *,
+    sparse_format: Literal["bsr", "bitmask"],
+    block_indptr: torch.Tensor | None,
+    block_indices: torch.Tensor | None,
+    exact_block_bits: torch.Tensor | None,
+    kv_valid_bits: torch.Tensor | None,
     device: torch.device,
     batch_size: int,
     seq_len_q: int,
     seq_len_kv: int,
     num_kv_heads: int,
     q_block_size: int,
+    kv_block_size: int,
     use_kv_valid_bits: bool,
 ) -> None:
-    """Validate raw runtime routing without reading device-side values."""
+    """Validate the planned route frontend without reading tensor values."""
 
     num_q_blocks = (seq_len_q + q_block_size - 1) // q_block_size
-    _validate_metadata_tensor(
-        block_indptr,
-        "block_indptr",
-        ndim=3,
-        dtype=torch.int32,
-        expected_device=device,
-        expected_shape=(batch_size, num_kv_heads, num_q_blocks + 1),
-    )
-    _validate_metadata_tensor(
-        block_indices,
-        "block_indices",
-        ndim=1,
-        dtype=torch.int32,
-        expected_device=device,
-    )
+    if sparse_format == "bsr":
+        if block_indptr is None or block_indices is None:
+            raise ValueError(
+                "block_indptr and block_indices are required by a BSR plan"
+            )
+        if exact_block_bits is not None:
+            raise ValueError("exact_block_bits is valid only for a bitmask plan")
+        _validate_metadata_tensor(
+            block_indptr,
+            "block_indptr",
+            ndim=3,
+            dtype=torch.int32,
+            expected_device=device,
+            expected_shape=(batch_size, num_kv_heads, num_q_blocks + 1),
+        )
+        _validate_metadata_tensor(
+            block_indices,
+            "block_indices",
+            ndim=1,
+            dtype=torch.int32,
+            expected_device=device,
+        )
+    elif sparse_format == "bitmask":
+        if (
+            exact_block_bits is None
+            or block_indptr is not None
+            or block_indices is not None
+        ):
+            raise ValueError(
+                "runtime route inputs must match planned sparse_format='bitmask'"
+            )
+        num_kv_blocks = (seq_len_kv + kv_block_size - 1) // kv_block_size
+        _validate_metadata_tensor(
+            exact_block_bits,
+            "exact_block_bits",
+            ndim=4,
+            dtype=torch.uint32,
+            expected_device=device,
+            expected_shape=(
+                batch_size,
+                num_kv_heads,
+                num_q_blocks,
+                (num_kv_blocks + 31) // 32,
+            ),
+        )
+    else:
+        raise AssertionError(f"unsupported sparse format {sparse_format!r}")
 
     if use_kv_valid_bits:
         if kv_valid_bits is None:
@@ -157,31 +215,6 @@ def validate_block_sparse_metadata(
         )
     elif kv_valid_bits is not None:
         raise ValueError("kv_valid_bits must be None when use_kv_valid_bits=False")
-
-
-def validate_paged_kv_metadata(
-    paged_kv_indptr: torch.Tensor,
-    paged_kv_indices: torch.Tensor,
-    seq_lens_kv: torch.Tensor,
-    *,
-    device: torch.device,
-    batch_size: int,
-) -> None:
-    """Validate the shared structural ABI for live paged request metadata."""
-
-    for tensor, name, shape in (
-        (paged_kv_indptr, "paged_kv_indptr", (batch_size + 1,)),
-        (paged_kv_indices, "paged_kv_indices", None),
-        (seq_lens_kv, "seq_lens_kv", (batch_size,)),
-    ):
-        _validate_metadata_tensor(
-            tensor,
-            name,
-            ndim=1,
-            dtype=torch.int32,
-            expected_device=device,
-            expected_shape=shape,
-        )
 
 
 def _validate_bshd_tensor(
@@ -209,16 +242,89 @@ def _validate_bshd_tensor(
     _validate_16byte_alignment(tensor, name)
 
 
+def validate_paged_kv_storage(
+    kv_storage: _PagedKVStorage,
+    *,
+    expected_device: torch.device,
+    expected_batch_size: int,
+    seq_len_kv: int,
+) -> _ValidatedPagedKV:
+    """Validate paged K/V structure and page-table metadata for one run.
+
+    The cache is normalized into zero-copy HND views, and the page table and
+    K/V lengths are checked structurally; both must sit on ``expected_device``
+    with one row per request, and every row must cover ``seq_len_kv`` tokens.
+    Agreement of the cache geometry and dtype with a plan stays with the
+    caller, because the one-shot entry point derives its plan from the values
+    returned here.
+    """
+
+    (
+        k,
+        v,
+        num_physical_kv_pages,
+        num_kv_heads,
+        page_size,
+        head_dim,
+        k_page_stride,
+        v_page_stride,
+    ) = _normalize_paged_kv_cache(
+        kv_storage.paged_kv_cache,
+        expected_device=expected_device,
+    )
+    metadata_device, metadata_batch_size, table_capacity = (
+        _validate_block_table_metadata(
+            kv_storage.block_tables,
+            kv_storage.seq_lens_kv,
+        )
+    )
+    if metadata_device != expected_device:
+        raise ValueError(
+            f"paged-KV metadata must be on {expected_device}, got {metadata_device}"
+        )
+    if metadata_batch_size != expected_batch_size:
+        raise ValueError(
+            "seq_lens_kv must have one entry per request: "
+            f"expected {expected_batch_size}, got {metadata_batch_size}"
+        )
+    if table_capacity * page_size < seq_len_kv:
+        raise ValueError(
+            "block_tables must cover the planned K/V capacity: expected at "
+            f"least {(seq_len_kv + page_size - 1) // page_size} columns, "
+            f"got {table_capacity}"
+        )
+    return _ValidatedPagedKV(
+        k=k,
+        v=v,
+        num_kv_heads=num_kv_heads,
+        page_size=page_size,
+        head_dim=head_dim,
+        table_capacity=table_capacity,
+        payload=_PagedKVLaunchPayload(
+            block_tables=kv_storage.block_tables,
+            block_table_row_stride=kv_storage.block_tables.stride(0),
+            seq_lens_kv=kv_storage.seq_lens_kv,
+            num_physical_kv_pages=num_physical_kv_pages,
+            k_page_stride=k_page_stride,
+            v_page_stride=v_page_stride,
+        ),
+    )
+
+
 def validate_block_sparse_run(
     q: torch.Tensor,
     kv_storage: _ContiguousKVStorage | _PagedKVStorage,
     *,
     state: "_BlockSparsePlanState",
-    block_indptr: torch.Tensor,
-    block_indices: torch.Tensor,
+    block_indptr: torch.Tensor | None,
+    block_indices: torch.Tensor | None,
+    exact_block_bits: torch.Tensor | None = None,
+    k_summary: torch.Tensor | None = None,
+    v_summary: torch.Tensor | None = None,
     kv_valid_bits: torch.Tensor | None,
     sm_scale: float | None,
     out: torch.Tensor | None,
+    sage: SageAttentionParams | None = None,
 ) -> _BlockSparseRunArgs:
     """Validate one run and allocate only an omitted output tensor.
 
@@ -226,25 +332,73 @@ def validate_block_sparse_run(
     Contiguous K/V use compact ``[B, Skv, Hkv, D]`` directly. Paged K/V are
     normalized once into zero-copy HND cache views plus launch metadata. An
     explicit output is returned by identity and may not overlap any live launch
-    input. ``sm_scale=None`` is materialized as ``1 / sqrt(D)``.
+    input or plan-owned buffer. Storage overlap is a caller precondition and
+    is not checked. ``sm_scale=None`` is materialized as ``1 / sqrt(D)``.
     """
 
-    validate_block_sparse_metadata(
-        block_indptr,
-        block_indices,
-        kv_valid_bits,
-        device=state.device,
-        batch_size=state.batch_size,
-        seq_len_q=state.seq_len_q,
-        seq_len_kv=state.seq_len_kv,
-        num_kv_heads=state.num_kv_heads,
-        q_block_size=state.q_block_size,
-        use_kv_valid_bits=state.use_kv_valid_bits,
-    )
+    use_proxy_routes = state.use_proxy_routes
+    num_kv_blocks = (state.seq_len_kv + state.kv_block_size - 1) // state.kv_block_size
+    if not state.use_block_sparse:
+        # A dense plan takes no routing inputs.
+        _validate_dense_contiguous_plan_inputs(
+            (name, value, None)
+            for name, value in (
+                ("block_indptr", block_indptr),
+                ("block_indices", block_indices),
+                ("exact_block_bits", exact_block_bits),
+                ("k_summary", k_summary),
+                ("v_summary", v_summary),
+                ("kv_valid_bits", kv_valid_bits),
+            )
+        )
+    else:
+        validate_block_sparse_metadata(
+            sparse_format=state.sparse_format,
+            block_indptr=block_indptr,
+            block_indices=block_indices,
+            exact_block_bits=exact_block_bits,
+            kv_valid_bits=kv_valid_bits,
+            device=state.device,
+            batch_size=state.batch_size,
+            seq_len_q=state.seq_len_q,
+            seq_len_kv=state.seq_len_kv,
+            num_kv_heads=_num_sparse_pattern_heads(
+                state.num_kv_heads, state.share_pattern_across_kv_heads
+            ),
+            q_block_size=state.q_block_size,
+            kv_block_size=state.kv_block_size,
+            use_kv_valid_bits=state.use_kv_valid_bits,
+        )
+        if use_proxy_routes:
+            if k_summary is None or v_summary is None:
+                raise ValueError(
+                    "K/V summaries are required when proxy routes are enabled"
+                )
+            summary_shape = (
+                state.batch_size,
+                num_kv_blocks,
+                state.num_kv_heads,
+                state.head_dim,
+            )
+            for tensor, name, dtype in (
+                (k_summary, "k_summary", state.kv_dtype),
+                (v_summary, "v_summary", state.v_dtype),
+            ):
+                _validate_bshd_tensor(
+                    tensor,
+                    name,
+                    expected_shape=summary_shape,
+                    expected_dtype=dtype,
+                    expected_device=state.device,
+                )
+        elif k_summary is not None or v_summary is not None:
+            raise ValueError("summaries are valid only when proxy routes are enabled")
+
+    effective_kv_valid_bits: torch.Tensor | None = None
     if state.use_kv_valid_bits:
         assert kv_valid_bits is not None
         effective_kv_valid_bits = kv_valid_bits
-    else:
+    elif state.use_block_sparse:
         effective_kv_valid_bits = state.dummy_kv_valid_bits
         if effective_kv_valid_bits is None:
             raise RuntimeError("unmasked block-sparse plan is missing its dummy mask")
@@ -258,7 +412,6 @@ def validate_block_sparse_run(
         expected_device=state.device,
     )
     paged_kv: _PagedKVLaunchPayload | None = None
-    overlap_inputs: tuple[tuple[str, torch.Tensor], ...]
     if isinstance(kv_storage, _ContiguousKVStorage):
         if state.page_size is not None:
             raise TypeError("contiguous K/V storage requires a contiguous plan state")
@@ -268,96 +421,59 @@ def validate_block_sparse_run(
             state.num_kv_heads,
             state.head_dim,
         )
-        for tensor, name in ((kv_storage.k, "k"), (kv_storage.v, "v")):
+        for tensor, name, dtype in (
+            (kv_storage.k, "k", state.kv_dtype),
+            (kv_storage.v, "v", state.v_dtype),
+        ):
             _validate_bshd_tensor(
                 tensor,
                 name,
                 expected_shape=kv_shape,
-                expected_dtype=state.kv_dtype,
+                expected_dtype=dtype,
                 expected_device=state.device,
             )
         k = kv_storage.k
         v = kv_storage.v
-        overlap_inputs = (
-            ("q", q),
-            ("k", k),
-            ("v", v),
-            ("block_indptr", block_indptr),
-            ("block_indices", block_indices),
-            ("kv_valid_bits", effective_kv_valid_bits),
-            ("row_route_offsets", state.row_route_offsets),
-            ("route_workspace", state.route_workspace),
-        )
     elif isinstance(kv_storage, _PagedKVStorage):
         page_size = state.page_size
         if page_size is None:
             raise TypeError("paged K/V storage requires a paged plan state")
-        (
-            k,
-            v,
-            num_physical_kv_pages,
-            runtime_num_kv_heads,
-            runtime_page_size,
-            runtime_head_dim,
-            k_page_stride,
-            v_page_stride,
-        ) = _normalize_paged_kv_cache(
-            kv_storage.paged_kv_cache,
+        paged = validate_paged_kv_storage(
+            kv_storage,
             expected_device=state.device,
+            expected_batch_size=state.batch_size,
+            seq_len_kv=state.seq_len_kv,
         )
-        runtime_geometry = (
-            runtime_num_kv_heads,
-            runtime_page_size,
-            runtime_head_dim,
-        )
-        expected_geometry = (
-            state.num_kv_heads,
-            page_size,
-            state.head_dim,
-        )
+        runtime_geometry = (paged.num_kv_heads, paged.page_size, paged.head_dim)
+        expected_geometry = (state.num_kv_heads, page_size, state.head_dim)
         if runtime_geometry != expected_geometry:
             raise ValueError(
                 "paged_kv_cache geometry does not match the plan: expected "
                 f"Hkv/page/D={expected_geometry}, got {runtime_geometry}"
             )
-        if k.dtype != state.kv_dtype:
+        if paged.k.dtype != state.kv_dtype:
             raise ValueError(
-                f"K/V dtype must match the plan ({state.kv_dtype}), got {k.dtype}"
+                f"K/V dtype must match the plan ({state.kv_dtype}), got {paged.k.dtype}"
             )
-        validate_paged_kv_metadata(
-            kv_storage.paged_kv_indptr,
-            kv_storage.paged_kv_indices,
-            kv_storage.seq_lens_kv,
-            device=state.device,
-            batch_size=state.batch_size,
-        )
-        paged_kv = _PagedKVLaunchPayload(
-            paged_kv_indptr=kv_storage.paged_kv_indptr,
-            paged_kv_indices=kv_storage.paged_kv_indices,
-            seq_lens_kv=kv_storage.seq_lens_kv,
-            num_physical_kv_pages=num_physical_kv_pages,
-            k_page_stride=k_page_stride,
-            v_page_stride=v_page_stride,
-        )
-        overlap_inputs = (
-            ("q", q),
-            ("k_cache", k),
-            ("v_cache", v),
-            ("block_indptr", block_indptr),
-            ("block_indices", block_indices),
-            ("kv_valid_bits", effective_kv_valid_bits),
-            ("paged_kv_indptr", kv_storage.paged_kv_indptr),
-            ("paged_kv_indices", kv_storage.paged_kv_indices),
-            ("seq_lens_kv", kv_storage.seq_lens_kv),
-            ("row_route_offsets", state.row_route_offsets),
-            ("route_workspace", state.route_workspace),
-        )
+        k = paged.k
+        v = paged.v
+        paged_kv = paged.payload
     else:
         raise TypeError("kv_storage must be _ContiguousKVStorage or _PagedKVStorage")
 
-    effective_scale = _validate_scale(
-        1.0 / math.sqrt(state.head_dim) if sm_scale is None else sm_scale,
-        "sm_scale",
+    if (sage is None) != (state.sage is None):
+        raise ValueError(
+            "sage=SageAttentionParams(...) is required by a Sage plan and "
+            "rejected by a plan without Sage attention"
+        )
+    if sage is not None:
+        assert state.sage_scale_shapes is not None
+        validate_sage_params(sage, state.sage_scale_shapes, device=state.device)
+
+    effective_scale = (
+        1.0 / math.sqrt(state.head_dim)
+        if sm_scale is None
+        else _validate_scale(sm_scale, "sm_scale")
     )
     if out is None:
         out = torch.empty(q_shape, device=state.device, dtype=state.output_dtype)
@@ -369,7 +485,6 @@ def validate_block_sparse_run(
             expected_dtype=state.output_dtype,
             expected_device=state.device,
         )
-        _validate_out_does_not_overlap_inputs(out, *overlap_inputs)
     return _BlockSparseRunArgs(
         q=q,
         k=k,
@@ -377,10 +492,87 @@ def validate_block_sparse_run(
         out=out,
         block_indptr=block_indptr,
         block_indices=block_indices,
+        exact_block_bits=exact_block_bits,
+        k_summary=k_summary,
+        v_summary=v_summary,
         kv_valid_bits=effective_kv_valid_bits,
         kv_valid_bits_is_live=state.use_kv_valid_bits,
         sm_scale=effective_scale,
         paged_kv=paged_kv,
+        sage_slots=sage_adapter_slots({} if sage is None else vars(sage)),
+    )
+
+
+def prepare_block_sparse_run_unchecked(
+    q: torch.Tensor,
+    kv_storage: _ContiguousKVStorage | _PagedKVStorage,
+    *,
+    state: "_BlockSparsePlanState",
+    block_indptr: torch.Tensor | None,
+    block_indices: torch.Tensor | None,
+    exact_block_bits: torch.Tensor | None = None,
+    k_summary: torch.Tensor | None = None,
+    v_summary: torch.Tensor | None = None,
+    kv_valid_bits: torch.Tensor | None,
+    sm_scale: float | None,
+    out: torch.Tensor | None,
+    sage: SageAttentionParams | None = None,
+) -> _BlockSparseRunArgs:
+    """Canonicalize one trusted run without invoking explicit validators.
+
+    Only the work every launch needs happens here: K/V view selection, the
+    plan-owned dummy token mask when the plan disabled token bits, the default
+    softmax scale, and allocation of an omitted output tensor.
+    """
+
+    paged_kv: _PagedKVLaunchPayload | None = None
+    if isinstance(kv_storage, _ContiguousKVStorage):
+        k = kv_storage.k
+        v = kv_storage.v
+    else:
+        paged_kv_cache = kv_storage.paged_kv_cache
+        if isinstance(paged_kv_cache, torch.Tensor):
+            k = paged_kv_cache[:, 0]
+            v = paged_kv_cache[:, 1]
+        else:
+            k, v = paged_kv_cache
+        paged_kv = _PagedKVLaunchPayload(
+            block_tables=kv_storage.block_tables,
+            block_table_row_stride=kv_storage.block_tables.stride(0),
+            seq_lens_kv=kv_storage.seq_lens_kv,
+            num_physical_kv_pages=int(k.shape[0]),
+            k_page_stride=int(k.stride(0)),
+            v_page_stride=int(v.stride(0)),
+        )
+    if state.use_kv_valid_bits:
+        effective_kv_valid_bits = kv_valid_bits
+    else:
+        effective_kv_valid_bits = state.dummy_kv_valid_bits
+    if state.use_block_sparse:
+        assert effective_kv_valid_bits is not None
+    if out is None:
+        out = torch.empty(
+            (state.batch_size, state.seq_len_q, state.num_qo_heads, state.head_dim),
+            device=state.device,
+            dtype=state.output_dtype,
+        )
+    return _BlockSparseRunArgs(
+        q=q,
+        k=k,
+        v=v,
+        out=out,
+        block_indptr=block_indptr,
+        block_indices=block_indices,
+        exact_block_bits=exact_block_bits,
+        k_summary=k_summary,
+        v_summary=v_summary,
+        kv_valid_bits=effective_kv_valid_bits,
+        kv_valid_bits_is_live=state.use_kv_valid_bits,
+        sm_scale=1.0 / math.sqrt(state.head_dim)
+        if sm_scale is None
+        else float(sm_scale),
+        paged_kv=paged_kv,
+        sage_slots=sage_adapter_slots({} if sage is None else vars(sage)),
     )
 
 
@@ -390,17 +582,27 @@ def record_block_sparse_run_args(
 ) -> None:
     """Extend tensor lifetimes for the asynchronous launch currently in flight."""
 
-    run_args.q.record_stream(stream)
-    run_args.k.record_stream(stream)
-    run_args.v.record_stream(stream)
+    for tensor in (run_args.q, run_args.k, run_args.v):
+        tensor.record_stream(stream)
+    if run_args.k_summary is not None:
+        run_args.k_summary.record_stream(stream)
+        assert run_args.v_summary is not None
+        run_args.v_summary.record_stream(stream)
     run_args.out.record_stream(stream)
-    run_args.block_indptr.record_stream(stream)
-    run_args.block_indices.record_stream(stream)
+    if run_args.block_indptr is not None:
+        run_args.block_indptr.record_stream(stream)
+        assert run_args.block_indices is not None
+        run_args.block_indices.record_stream(stream)
+    elif run_args.exact_block_bits is not None:
+        run_args.exact_block_bits.record_stream(stream)
     if run_args.kv_valid_bits_is_live:
+        assert run_args.kv_valid_bits is not None
         run_args.kv_valid_bits.record_stream(stream)
+    for tensor in run_args.sage_slots:
+        if tensor is not None:
+            tensor.record_stream(stream)
     if run_args.paged_kv is not None:
-        run_args.paged_kv.paged_kv_indptr.record_stream(stream)
-        run_args.paged_kv.paged_kv_indices.record_stream(stream)
+        run_args.paged_kv.block_tables.record_stream(stream)
         run_args.paged_kv.seq_lens_kv.record_stream(stream)
 
 
@@ -409,9 +611,14 @@ def launch_block_sparse(
     *,
     state: "_BlockSparsePlanState",
 ) -> torch.Tensor:
-    """Invoke the exact contiguous or paged ABI chosen by validated payload."""
+    """Invoke the adapter ABI chosen by the frozen plan.
 
-    if run_args.paged_kv is None:
+    Contiguous plans share one adapter; unused optional slots are ``None``.
+    """
+
+    if run_args.paged_kv is not None:
+        assert run_args.block_indptr is not None
+        assert run_args.block_indices is not None
         state.compiled(
             run_args.q,
             run_args.k,
@@ -420,9 +627,15 @@ def launch_block_sparse(
             run_args.block_indptr,
             run_args.block_indices,
             run_args.kv_valid_bits,
+            run_args.paged_kv.block_tables,
+            run_args.paged_kv.seq_lens_kv,
             state.row_route_offsets,
             state.route_workspace,
             state.max_blocks_per_row,
+            run_args.paged_kv.num_physical_kv_pages,
+            run_args.paged_kv.block_table_row_stride,
+            run_args.paged_kv.k_page_stride,
+            run_args.paged_kv.v_page_stride,
             run_args.sm_scale,
         )
     else:
@@ -430,19 +643,17 @@ def launch_block_sparse(
             run_args.q,
             run_args.k,
             run_args.v,
+            run_args.k_summary,
+            run_args.v_summary,
             run_args.out,
             run_args.block_indptr,
             run_args.block_indices,
+            run_args.exact_block_bits,
             run_args.kv_valid_bits,
-            run_args.paged_kv.paged_kv_indptr,
-            run_args.paged_kv.paged_kv_indices,
-            run_args.paged_kv.seq_lens_kv,
             state.row_route_offsets,
             state.route_workspace,
-            state.max_blocks_per_row,
-            run_args.paged_kv.num_physical_kv_pages,
-            run_args.paged_kv.k_page_stride,
-            run_args.paged_kv.v_page_stride,
+            0 if state.max_blocks_per_row is None else state.max_blocks_per_row,
+            *run_args.sage_slots,
             run_args.sm_scale,
         )
     return run_args.out
@@ -453,9 +664,11 @@ __all__ = [
     "_ContiguousKVStorage",
     "_PagedKVLaunchPayload",
     "_PagedKVStorage",
+    "_ValidatedPagedKV",
     "launch_block_sparse",
+    "prepare_block_sparse_run_unchecked",
     "record_block_sparse_run_args",
     "validate_block_sparse_metadata",
     "validate_block_sparse_run",
-    "validate_paged_kv_metadata",
+    "validate_paged_kv_storage",
 ]

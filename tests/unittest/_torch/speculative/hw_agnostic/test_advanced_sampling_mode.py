@@ -19,11 +19,14 @@ mode resolution, a CUDA check that NO_TOPK yields the same distribution as FULL
 when top_k is disabled, and native greedy handling (greedy rows return argmax).
 """
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
 from tensorrt_llm._torch.pyexecutor.sampler.ops import flashinfer as su
 from tensorrt_llm._torch.pyexecutor.sampler.ops.vanilla import GREEDY_TEMPERATURE_THRESHOLD
+from tensorrt_llm._torch.speculative.utils import get_spec_metadata
 from tensorrt_llm.llmapi.llm_args import AdvancedSamplingMode, DecodingBaseConfig, MTPDecodingConfig
 
 
@@ -155,6 +158,19 @@ def test_advanced_mode_accepted_on_all_spec_paths():
         ),
     )
     assert args.speculative_config.advanced_sampling_mode == AdvancedSamplingMode.NO_TOPK
+
+
+@pytest.mark.parametrize("mode", list(AdvancedSamplingMode))
+def test_metadata_carries_the_configured_sampling_mode(mode):
+    """Losing the assignment is silent: admission reads the mode off the config, while the
+    buffer fill and the dispatcher read it off the metadata."""
+    metadata = get_spec_metadata(
+        MTPDecodingConfig(num_nextn_predict_layers=1, advanced_sampling_mode=mode),
+        SimpleNamespace(num_hidden_layers=32, hidden_size=128, vocab_size=1024, torch_dtype=None),
+        max_num_requests=4,
+        max_num_tokens=64,
+    )
+    assert metadata.advanced_sampling_mode == mode
 
 
 if __name__ == "__main__":

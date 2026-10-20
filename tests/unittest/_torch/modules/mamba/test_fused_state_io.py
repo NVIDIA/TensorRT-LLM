@@ -48,6 +48,26 @@ def _ref_cast_scatter(src_vk, dst, scatter_indices):
 # Forward kernel: gather + cast (vk -> fp32 vk) ----------------------------
 
 
+@pytest.mark.parametrize("invalid", ["shape", "dtype", "device"])
+def test_gather_cast_rejects_invalid_output(monkeypatch, invalid):
+    """Reject invalid caller-provided output before launching the gather kernel."""
+    from unittest.mock import Mock
+
+    import tensorrt_llm._torch.modules.fla.fused_state_io as state_io
+
+    kernel = Mock()
+    monkeypatch.setattr(state_io, "_gather_cast_vk_to_fp32_vk_kernel", kernel)
+    state = torch.empty(2, 2, 4, 4, dtype=torch.bfloat16)
+    output = torch.empty(
+        (2, 2, 4, 3) if invalid == "shape" else state.shape,
+        dtype=torch.bfloat16 if invalid == "dtype" else torch.float32,
+        device="meta" if invalid == "device" else "cpu",
+    )
+    with pytest.raises(AssertionError):
+        state_io.gather_cast_vk_to_fp32_vk(state, None, output=output)
+    assert kernel.mock_calls == []
+
+
 @skip_unsupported
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
 @pytest.mark.parametrize(

@@ -24,11 +24,13 @@ import torch
 from _torch.helpers import per_block_cast_to_fp8_e8m0, per_token_cast_to_fp8_e8m0
 from utils.util import skip_pre_blackwell
 
+from tensorrt_llm._torch import cute_dsl_utils
 from tensorrt_llm._torch.attention.backends.interface import PositionalEmbeddingParams, RopeParams
+from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4 import module as dsv4
 from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.module import (
     project_sparse_attn_output,
 )
-from tensorrt_llm._torch.attention.mla import MLA
+from tensorrt_llm._torch.attention.mla import MLA, _is_cute_dsl_fp8_bmm_available
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_deepseekv3 import weight_dequant
 from tensorrt_llm._utils import get_sm_version
@@ -64,6 +66,7 @@ def calculate_reference_deepseek_v4_o_proj(
     qk_rope_head_dim,
     device,
     is_fp8: bool = False,
+    quantize_o_a_input: bool = False,
 ):
     """
     Reference implementation for DeepSeek-V4 output projection based on ref/model.py.
@@ -78,6 +81,7 @@ def calculate_reference_deepseek_v4_o_proj(
         qk_rope_head_dim: Dimension of positional part
         device: Device to run on
         is_fp8: Whether test fp8 or bf16
+        quantize_o_a_input: Whether o_a_proj consumes block-scaled FP8 input
 
     Returns:
         output: [num_tokens, hidden_size] projected output
@@ -90,7 +94,7 @@ def calculate_reference_deepseek_v4_o_proj(
 
     # Reshape for grouped projection
     attn_out_grouped = attn_out_latent.view(num_tokens, n_local_groups, -1)
-    if is_fp8:
+    if quantize_o_a_input:
         attn_out_grouped = _per_token_fp8_quant_dequant(
             attn_out_grouped.transpose(0, 1).contiguous()
         ).transpose(0, 1)
@@ -122,6 +126,7 @@ def test_deepseek_v4_o_proj(num_tokens: int, dtype_str: str):
 
     device = torch.device("cuda")
     dtype = torch.bfloat16
+    sm_version = get_sm_version()
 
     # Model configuration matching the reference model
     num_heads = 64
@@ -182,7 +187,11 @@ def test_deepseek_v4_o_proj(num_tokens: int, dtype_str: str):
         pretrained_config=pretrained_config,
         sparse_attention_config=sparse_config,
         quant_config=quant_config,
-        use_cute_dsl_blockscaling_mm=dtype_str == "fp8",
+        # Mirror the production predicate exactly, so the test does not enable
+        # the cute-dsl path on a box where the DSL package is absent.
+        use_cute_dsl_blockscaling_mm=(
+            dtype_str == "fp8" and _is_cute_dsl_fp8_bmm_available(sm_version)
+        ),
     )
 
     # Setup positional embedding params
@@ -217,6 +226,12 @@ def test_deepseek_v4_o_proj(num_tokens: int, dtype_str: str):
     assert not hasattr(mla, "v_b_proj")
     assert not hasattr(mla, "o_proj")
 
+    has_native_fp8_o_proj = _is_cute_dsl_fp8_bmm_available(sm_version)
+    if dtype_str == "fp8" and has_native_fp8_o_proj:
+        assert mla.o_a_proj.dtype == torch.float8_e4m3fn
+        assert mla.o_a_proj_dequant is None
+        assert not mla.use_cute_dsl_blockscaling_bmm
+
     # Initialize weights
     nn_init_std = 0.02
     with torch.no_grad():
@@ -243,12 +258,8 @@ def test_deepseek_v4_o_proj(num_tokens: int, dtype_str: str):
             fp8_a_weight = fp8_a_weight.reshape(n_local_groups, o_lora_rank, dim)
             mla.o_a_proj.data = fp8_a_weight
             mla.o_a_proj_scale.data = fp8_a_scale
-            # mla.o_a_proj_dequant is None for DSv4 on SM100: PR #14254
-            # decouples the FP8-native o_a_proj path from
-            # use_cute_dsl_blockscaling_bmm, so DSv4 unconditionally uses the
-            # fused inv-RoPE + FP8 quant + cute-dsl BMM chain and never needs
-            # the bf16-dequant fallback buffer. The reference path below uses
-            # o_a_proj_bf16 directly.
+            if not has_native_fp8_o_proj:
+                mla.o_a_proj_dequant.data = o_a_proj_bf16
 
         # Initialize o_b_proj weights
         if dtype_str == "bf16":
@@ -270,6 +281,8 @@ def test_deepseek_v4_o_proj(num_tokens: int, dtype_str: str):
             fp8_b_weight_dequant = weight_dequant(fp8_b_weight, fp8_b_scale).bfloat16()
             mla.o_b_proj.weight.data = fp8_b_weight
             mla.o_b_proj.weight_scale.data = fp8_b_scale
+            # SM107 re-lays weight_scale to UE8M0 K32 at load time; mirror the loader.
+            mla.o_b_proj.quant_method.post_load_weights(mla.o_b_proj)
 
     # Generate test inputs
     # Note: for deepseek_v4, kv_lora_rank equals qk_head_dim
@@ -285,16 +298,19 @@ def test_deepseek_v4_o_proj(num_tokens: int, dtype_str: str):
         o_a_proj_ref = mla.o_a_proj.data
         o_b_proj_weight_ref = mla.o_b_proj.weight.data
     else:
-        # Match the FP8-native o_a_proj path: the runtime BMM consumes
-        # quantized o_a_proj plus block scales, not the original BF16 weight.
-        o_a_proj_ref = (
-            weight_dequant(
-                fp8_a_weight.reshape(-1, dim).contiguous(),
-                fp8_a_scale.contiguous(),
+        if has_native_fp8_o_proj:
+            # Match the native path, which consumes the quantized weight and
+            # its block scales rather than the original BF16 values.
+            o_a_proj_ref = (
+                weight_dequant(
+                    fp8_a_weight.reshape(-1, dim).contiguous(),
+                    fp8_a_scale.contiguous(),
+                )
+                .bfloat16()
+                .reshape(o_a_proj_bf16.shape)
             )
-            .bfloat16()
-            .reshape(o_a_proj_bf16.shape)
-        )
+        else:
+            o_a_proj_ref = o_a_proj_bf16
         o_b_proj_weight_ref = fp8_b_weight_dequant
 
     freqs_cis = precompute_freqs_cis(
@@ -317,6 +333,7 @@ def test_deepseek_v4_o_proj(num_tokens: int, dtype_str: str):
         qk_rope_head_dim=qk_rope_head_dim,
         device=device,
         is_fp8=dtype_str == "fp8",
+        quantize_o_a_input=dtype_str == "fp8" and has_native_fp8_o_proj,
     )
 
     # Validate output shapes
@@ -343,3 +360,160 @@ def test_deepseek_v4_o_proj(num_tokens: int, dtype_str: str):
     else:
         torch.testing.assert_close(output, reference_output, rtol=0.1, atol=0.1)
         print(f"  ✓ Test passed for num_tokens={num_tokens}, dtype={dtype_str}\n")
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "sm,dsl,rubin,expected",
+    [
+        (100, True, False, "blackwell"),
+        (103, True, True, "blackwell"),
+        (107, True, True, "rubin"),
+        (107, True, False, None),
+        (107, False, True, None),
+        (100, False, False, None),
+        (90, True, True, None),
+        (120, True, True, None),
+    ],
+)
+def test_dsv4_q_b_dispatch(
+    monkeypatch: pytest.MonkeyPatch, sm: int, dsl: bool, rubin: bool, expected: str | None
+) -> None:
+    """Select the correct GEMM independently of the host GPU and installed DSL."""
+    torch.manual_seed(42)
+    monkeypatch.setattr(dsv4, "get_sm_version", lambda: sm)
+    monkeypatch.setattr(dsv4, "IS_CUTLASS_DSL_AVAILABLE", dsl)
+    monkeypatch.setattr(dsv4, "IS_CUTLASS_DSL_RUBIN_AVAILABLE", rubin)
+    # Exercise the contiguous conversion as well as dispatch.
+    q = torch.randn(32, 7, dtype=torch.bfloat16).t()
+    weight = torch.randn(32, 16, dtype=torch.bfloat16).t()
+    calls = []
+
+    def gemm(name: str, a: torch.Tensor, b: torch.Tensor, out: torch.Tensor) -> None:
+        assert a.is_contiguous() and b.is_contiguous()
+        calls.append(name)
+        out.copy_(torch.nn.functional.linear(a, b))
+
+    for arch in ("blackwell", "rubin"):
+        monkeypatch.setattr(
+            torch.ops.trtllm,
+            f"cute_dsl_bf16_gemm_{arch}",
+            lambda a, b, out, name=arch: gemm(name, a, b, out),
+            raising=False,
+        )
+    output = dsv4._q_b_proj_cute_dsl_bf16(q, weight)
+    torch.testing.assert_close(output, torch.nn.functional.linear(q, weight))
+    assert calls == ([] if expected is None else [expected])
+
+
+def _output_projection(
+    device: str, enabled: bool, rank: int = 16, dim: int = 32
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        num_heads_tp=2,
+        n_local_groups=2,
+        qk_nope_head_dim=dim - 8,
+        qk_rope_head_dim=8,
+        o_lora_rank=rank,
+        o_a_proj=torch.randn(2, rank, dim, dtype=torch.bfloat16, device=device),
+        o_b_proj=torch.nn.Identity(),
+        use_cute_dsl_bf16_bmm=enabled,
+        inverse_rotary_emb=SimpleNamespace(rotary_cos_sin=None, is_neox=False),
+    )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "sm,enabled,rubin,rank,dim,expected",
+    [
+        (107, True, True, 16, 32, "rubin"),
+        (107, False, True, 16, 32, "bmm"),
+        (107, True, False, 16, 32, "bmm"),
+        (107, True, True, 15, 32, "bmm"),
+        (107, True, True, 16, 30, "bmm"),
+        (100, True, True, 16, 32, "bmm"),
+        (90, True, True, 16, 32, "bmm"),
+    ],
+)
+def test_dsv4_o_a_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+    sm: int,
+    enabled: bool,
+    rubin: bool,
+    rank: int,
+    dim: int,
+    expected: str,
+) -> None:
+    """Check each Rubin BMM gate and preserve the transposed output layout."""
+    torch.manual_seed(42)
+    monkeypatch.setattr(dsv4, "get_sm_version", lambda: sm)
+    monkeypatch.setattr(dsv4, "IS_CUTLASS_DSL_RUBIN_AVAILABLE", rubin)
+    monkeypatch.setattr(torch.ops.trtllm, "mla_rope_inplace", lambda *args: None)
+    calls = []
+
+    def bmm(name: str, a: torch.Tensor, b: torch.Tensor, out: torch.Tensor) -> None:
+        calls.append(name)
+        assert not out.is_contiguous()
+        out.copy_(torch.bmm(a, b))
+
+    monkeypatch.setattr(torch.ops.trtllm, "bmm_out", lambda a, b, out: bmm("bmm", a, b, out))
+    monkeypatch.setattr(
+        torch.ops.trtllm,
+        "cute_dsl_bf16_bmm_rubin",
+        lambda a, b, out: bmm("rubin", a, b.transpose(1, 2), out),
+        raising=False,
+    )
+    model = _output_projection("cpu", enabled, rank, dim)
+    attn = torch.randn(7, 2 * dim, dtype=torch.bfloat16)
+    output = dsv4.project_sparse_attn_output(model, [attn], torch.arange(7))
+    reference = (
+        torch.bmm(attn.view(7, 2, dim).transpose(0, 1), model.o_a_proj.transpose(1, 2))
+        .transpose(0, 1)
+        .flatten(1)
+    )
+    torch.testing.assert_close(output, reference)
+    assert calls == [expected]
+
+
+@pytest.mark.parametrize("num_tokens", [1, 17, 256])
+@pytest.mark.parametrize("use_cuda_graph", [False, True])
+def test_dsv4_rubin_bf16_projections(
+    monkeypatch: pytest.MonkeyPatch, num_tokens: int, use_cuda_graph: bool
+) -> None:
+    """Compare real Rubin projections with linear/BMM in eager and CUDA graphs."""
+    torch.manual_seed(42)
+    if not torch.cuda.is_available() or get_sm_version() != 107:
+        pytest.skip("requires SM107")
+    if not cute_dsl_utils.IS_CUTLASS_DSL_RUBIN_AVAILABLE:
+        pytest.skip("requires Rubin CuTe DSL")
+    # Isolate the projections; RoPE numerics have separate DSV4 output-projection coverage.
+    monkeypatch.setattr(torch.ops.trtllm, "mla_rope_inplace", lambda *args: None)
+    model = _output_projection("cuda", True)
+    q = torch.randn(num_tokens, 32, dtype=torch.bfloat16, device="cuda")
+    weight = torch.randn(64, 32, dtype=torch.bfloat16, device="cuda")
+    attn = torch.randn(num_tokens, 64, dtype=torch.bfloat16, device="cuda")
+    positions = torch.arange(num_tokens, device="cuda")
+
+    def run() -> tuple[torch.Tensor, torch.Tensor]:
+        return (
+            dsv4._q_b_proj_cute_dsl_bf16(q, weight),
+            dsv4.project_sparse_attn_output(model, [attn], positions),
+        )
+
+    if use_cuda_graph:
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            run()
+        torch.cuda.current_stream().wait_stream(stream)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            q_out, o_out = run()
+        graph.replay()
+    else:
+        q_out, o_out = run()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(q_out, torch.nn.functional.linear(q, weight), atol=0.0625, rtol=0.01)
+    model.use_cute_dsl_bf16_bmm = False
+    reference_o = dsv4.project_sparse_attn_output(model, [attn], positions)
+    torch.testing.assert_close(o_out, reference_o, atol=0.0625, rtol=0.01)

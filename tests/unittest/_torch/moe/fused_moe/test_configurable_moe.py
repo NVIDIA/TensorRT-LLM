@@ -15,18 +15,26 @@
 
 from unittest.mock import Mock, patch
 
+import pytest
 import torch
 
 from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._torch.models.modeling_utils import DecoderModelForCausalLM
+from tensorrt_llm._torch.models.modeling_utils import apply_quant_config_exclude_modules
 from tensorrt_llm._torch.moe.fused_moe.activation import (
     DEFAULT_MOE_ACTIVATION,
     ActivationParamShape,
     MoEActivationSupport,
+    SiTuActivation,
 )
 from tensorrt_llm._torch.moe.fused_moe.configurable_moe import _BACKEND_SYNC_ATTRS, ConfigurableMoE
 from tensorrt_llm._torch.utils import ActivationType
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
+
+# Nothing here allocates: the quant-config tests drive ``create_weights`` with
+# construction stubbed out, and the activation test only builds a carrier. The
+# marker is also what makes the file reachable: the CPU stage lists this
+# directory but collects only files that carry it.
+pytestmark = pytest.mark.cpu_only
 
 
 def _wrapper() -> ConfigurableMoE:
@@ -155,10 +163,26 @@ def test_exclusions_only_recreate_matching_moe_weights() -> None:
     )
     root.experts = wrapper
 
-    DecoderModelForCausalLM.apply_quant_config_exclude_modules(root)
+    apply_quant_config_exclude_modules(root.model_config, root.named_modules())
 
     assert not backend._weights_created
     wrapper.create_weights()
     assert wrapper.quant_config.quant_algo is None
     assert backend.quant_config.quant_algo is None
     backend.create_weights.assert_called_once_with()
+
+
+@pytest.mark.parametrize("missing", ["gate_softcap", "linear_softcap"])
+def test_situ_activation_rejects_a_missing_soft_cap(missing: str) -> None:
+    """Absence is a rejection for a soft cap, unlike for a clamp.
+
+    ``swiglu_limit`` has a value that encodes "unclamped", so omitting it is
+    how a caller asks for plain SwiGLU. A soft cap has no such value -- the
+    kernel divides by it -- so the two neighbouring constants cannot be given
+    one rule.
+    """
+    caps = {"gate_softcap": 1.0, "linear_softcap": 1.0}
+    caps[missing] = None
+
+    with pytest.raises(ValueError, match=f"SiTu {missing}"):
+        SiTuActivation(**caps)

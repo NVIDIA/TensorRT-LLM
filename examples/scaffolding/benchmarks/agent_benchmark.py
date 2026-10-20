@@ -88,7 +88,7 @@ async def create_agent_resources(args):
         client, args.model, getattr(args, "kv_cache_hint_agent", False)
     )
 
-    mcp_worker = MCPWorker.init_with_urls(["http://0.0.0.0:8082/sse"])
+    mcp_worker = MCPWorker.init_with_urls(["http://127.0.0.1:8082/mcp"])
     await mcp_worker.init_in_asyncio_event_loop()
 
     llm = create_open_deep_research_scaffolding_llm(
