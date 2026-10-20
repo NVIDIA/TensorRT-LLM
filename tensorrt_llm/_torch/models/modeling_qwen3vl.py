@@ -20,6 +20,7 @@ from transformers.activations import ACT2FN as HF_ACT2FN
 from transformers.models.qwen3_vl.modeling_qwen3_vl import (
     Qwen3VLVisionPatchEmbed as HFQwen3VLVisionPatchEmbed,
 )
+from transformers.models.qwen3_vl.processing_qwen3_vl import Qwen3VLProcessorKwargs
 from transformers.video_utils import VideoMetadata
 
 from tensorrt_llm._torch.models.modeling_multimodal_utils import (
@@ -374,34 +375,31 @@ class Qwen3VLInputProcessorBase(Qwen2VLInputProcessorBase):
             )
         do_rescale = not (image_is_pre if images else video_is_pre)
 
-        do_sample_frames = _decide_do_sample_frames(video_datas, mm_processor_kwargs)
-
-        # Pass `do_sample_frames` plus, when sampling is needed, the
-        # caller's `num_frames` / `fps` target. Everything else the caller
-        # supplied (resize, normalize knobs, etc.) flows through unchanged.
-        proc_kwargs: Dict[str, Any] = {"do_sample_frames": do_sample_frames}
-        for k, v in mm_processor_kwargs.items():
-            if k in ("num_frames", "fps", "do_sample_frames"):
-                continue
-            proc_kwargs[k] = v
-        if do_sample_frames:
-            if "num_frames" in mm_processor_kwargs:
-                proc_kwargs["num_frames"] = mm_processor_kwargs["num_frames"]
-            if "fps" in mm_processor_kwargs:
-                proc_kwargs["fps"] = mm_processor_kwargs["fps"]
-            elif "num_frames" in mm_processor_kwargs:
-                # HF's `sample_frames` honors `num_frames` only when `fps` is
-                # not also set; the class-default `fps=2` would otherwise cap
-                # the returned count below the caller's requested
-                # `num_frames` for short clips. Null `fps` so `num_frames` is
-                # respected verbatim.
-                proc_kwargs["fps"] = None
+        # Resolve modality kwargs with HF's precedence before sampling, and
+        # keep the sampling switch in the same modality dict for the HF call.
+        proc_kwargs = self.processor._merge_kwargs(
+            Qwen3VLProcessorKwargs,
+            tokenizer_init_kwargs=self.processor.tokenizer.init_kwargs,
+            padding=True,
+            do_rescale=do_rescale,
+            return_tensors="pt",
+            **mm_processor_kwargs,
+        )
+        video_kwargs = proc_kwargs["videos_kwargs"]
 
         # Sample in decoded-frame coordinates, then map the selected indices
         # back to the source timeline. HF otherwise overwrites frames_indices
         # with decoded offsets and uses them as source timestamps.
         video_metadata: Optional[List[Dict[str, Any]]] = None
         if video_datas:
+            video_processor = self.processor.video_processor
+            sampling_kwargs = dict(video_kwargs)
+            if video_processor.do_sample_frames is False:
+                sampling_kwargs.setdefault("do_sample_frames", False)
+            num_frames = video_kwargs.get("num_frames", video_processor.num_frames)
+            fps = video_kwargs.get("fps", video_processor.fps)
+            if "num_frames" in video_kwargs and "fps" not in video_kwargs:
+                fps = None
             videos = []
             video_metadata = []
             for vd in video_datas:
@@ -412,8 +410,14 @@ class Qwen3VLInputProcessorBase(Qwen2VLInputProcessorBase):
                     source_indices = list(range(n_decoded))
                 if len(source_indices) != n_decoded:
                     raise ValueError("video frames_indices must match the decoded frame count")
+                if m.get("total_num_frames") is None:
+                    m["total_num_frames"] = (
+                        round(m["duration"] * m["fps"])
+                        if m.get("duration") and m.get("fps")
+                        else max(source_indices) + 1
+                    )
                 frames = vd.frames
-                if _decide_do_sample_frames([vd], mm_processor_kwargs):
+                if _decide_do_sample_frames([vd], sampling_kwargs):
                     sampling_metadata = VideoMetadata(total_num_frames=n_decoded, fps=m.get("fps"))
                     source_total = m.get("total_num_frames")
                     if (
@@ -426,29 +430,29 @@ class Qwen3VLInputProcessorBase(Qwen2VLInputProcessorBase):
                         sampling_metadata.fps = n_decoded / m["duration"]
                     selected = self.processor.video_processor.sample_frames(
                         metadata=sampling_metadata,
-                        num_frames=proc_kwargs.get("num_frames"),
-                        fps=proc_kwargs.get("fps"),
+                        num_frames=num_frames,
+                        fps=fps,
                     )
                     frames = [vd.frames[i] for i in selected]
                     source_indices = [source_indices[i] for i in selected]
-                m["total_num_frames"] = len(frames)
                 m["frames_indices"] = list(source_indices)
                 videos.append(frames)
                 video_metadata.append(m)
             # All videos have already been sampled independently, so a mixed
             # batch cannot pull IO-sampled videos through HF's scalar switch.
-            proc_kwargs["do_sample_frames"] = False
-            proc_kwargs.pop("num_frames", None)
-            proc_kwargs.pop("fps", None)
+            video_kwargs["do_sample_frames"] = False
+            video_kwargs["video_metadata"] = video_metadata
+            video_kwargs.pop("num_frames", None)
+            video_kwargs.pop("fps", None)
 
+        # Qwen3VLProcessor reads this flag from the outer kwargs while using
+        # its default return_metadata=True internally to build timestamps.
+        video_kwargs.pop("return_metadata", None)
         return self.processor(
             text=[text],
             images=images,
             videos=videos,
-            padding=True,
-            do_rescale=do_rescale,
-            return_tensors="pt",
-            video_metadata=video_metadata,
+            return_metadata=mm_processor_kwargs.get("return_metadata", False),
             **proc_kwargs,
         )
 
