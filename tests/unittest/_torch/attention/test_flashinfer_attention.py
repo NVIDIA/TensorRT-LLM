@@ -349,6 +349,10 @@ class TestFlashInferAttention(unittest.TestCase):
             kv_cache_manager.add_dummy_requests([0], [32],
                                                 is_gen=True,
                                                 max_num_draft_tokens=3)
+            # V2 dummy token_nums is the complete capacity; reserve draft slots
+            # explicitly while keeping the logical generation length at 32.
+            cache = kv_cache_manager.kv_cache_map[0]
+            assert cache.resize(35)
             reserved_blocks = kv_cache_manager.get_batch_cache_indices([0])
             self.assertEqual(len(reserved_blocks[0]), 2)
 
@@ -506,6 +510,9 @@ class TestFlashInferAttention(unittest.TestCase):
             draft_manager.add_dummy_requests([0, 1], [31, 45],
                                              is_gen=True,
                                              max_num_draft_tokens=3)
+            for request_id in (0, 1):
+                cache = draft_manager.kv_cache_map[request_id]
+                assert cache.resize(cache.capacity + 3)
             metadata = FlashInferAttentionMetadata(
                 seq_lens=torch.ones(2, dtype=torch.int32),
                 num_contexts=0,
