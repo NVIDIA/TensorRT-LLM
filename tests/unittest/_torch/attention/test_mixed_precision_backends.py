@@ -18,7 +18,7 @@ from tensorrt_llm._torch.attention.backends.interface import (
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention
 from tensorrt_llm._torch.memory_buffer_utils import Buffers
 from tensorrt_llm._torch.metadata import KVCacheParams
-from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import MixedPrecisionKVCacheManager
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._utils import binding_to_torch_dtype
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.internal.batch_manager import CacheType
@@ -68,8 +68,16 @@ def test_optimized_two_pool_prefill_and_decode(
     native_interleave = backend is FlashInferAttention or block == 32
     request_ids = list(range(batch))
     high_torch_dtype = binding_to_torch_dtype(high_dtype)
-    manager = MixedPrecisionKVCacheManager(
-        KvCacheConfig(max_tokens=65536, enable_block_reuse=True),
+    manager = KVCacheManagerV2(
+        KvCacheConfig(
+            max_tokens=65536,
+            enable_block_reuse=True,
+            dtype="mixed_nvfp4_fp8" if high_dtype == DataType.FP8 else "mixed_nvfp4_bfloat16",
+            first_n=block,
+            last_n=block,
+            # Full-history (low) group, then the retained-token (high) group.
+            pool_ratio=[0.75, 0.25],
+        ),
         CacheType.SELF,
         num_layers=4 if native_interleave else 2,
         num_kv_heads=heads,
@@ -79,10 +87,6 @@ def test_optimized_two_pool_prefill_and_decode(
         max_batch_size=batch,
         mapping=Mapping(world_size=1, tp_size=1, rank=0),
         dtype=high_dtype,
-        low_dtype=DataType.NVFP4,
-        high_low_pool_ratio=1 / 3,
-        first_n=block,
-        last_n=block,
         pretrained_config=SimpleNamespace(
             num_hidden_layers=4,
             num_kv_shared_layers=1,
@@ -355,6 +359,188 @@ def _reference_dequant(packed, scales, scale):
     return table[codes] * block_scales * scale
 
 
+@pytest.mark.parametrize("backend", (TrtllmAttention, FlashInferAttention))
+@torch.no_grad()
+def test_mla_cached_context_and_decode(backend):
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] not in (10, 12):
+        pytest.skip("Mixed-precision NVFP4 KV requires Blackwell")
+    from test_attention_mla import apply_mla_rope
+
+    from tensorrt_llm._torch.attention.backends.interface import (
+        PositionalEmbeddingParams,
+        RopeParams,
+    )
+    from tensorrt_llm._torch.attention.mla import MLA
+    from tensorrt_llm._torch.model_config import ModelConfig
+    from tensorrt_llm.functional import PositionEmbeddingType
+
+    torch.manual_seed(123)
+    heads, rank, nope, rope_dim, block = 16, 512, 128, 64, 128
+    length, prefix = 640, 512
+    mapping = Mapping(world_size=1, tp_size=1, rank=0)
+    rope = RopeParams(dim=rope_dim, max_positions=1024, duplicate_data=True)
+    model = MLA(
+        hidden_size=128,
+        num_attention_heads=heads,
+        num_key_value_heads=heads,
+        qk_nope_head_dim=nope,
+        qk_rope_head_dim=rope_dim,
+        v_head_dim=nope,
+        q_lora_rank=None,
+        kv_lora_rank=rank,
+        predicted_tokens_per_seq=1,
+        max_position_embeddings=1024,
+        bias=False,
+        layer_idx=0,
+        dtype=torch.bfloat16,
+        pos_embd_params=PositionalEmbeddingParams(
+            type=PositionEmbeddingType.rope_gptj, rope=rope, is_neox=False
+        ),
+        config=ModelConfig(
+            mapping=mapping,
+            attn_backend="TRTLLM" if backend is TrtllmAttention else "FLASHINFER",
+        ),
+    ).cuda()
+    for parameter in model.parameters():
+        if parameter.ndim == 1:
+            parameter.fill_(1)
+        else:
+            parameter.normal_(std=parameter.shape[-1] ** -0.5)
+    key_weight, value_weight = model.kv_b_proj.weight.split(heads * nope)
+    model.k_b_proj_trans.copy_(key_weight.view(heads, nope, rank).transpose(1, 2))
+    model.v_b_proj.copy_(value_weight.view(heads, nope, rank))
+    hidden = torch.randn(length + 1, 128, dtype=torch.bfloat16, device="cuda")
+
+    # Independent projections, RoPE and contiguous NVFP4 codec form the oracle.
+    query = torch.nn.functional.linear(hidden, model.q_b_proj.weight).view(
+        -1, heads, nope + rope_dim
+    )
+    latent, key_rope = torch.nn.functional.linear(hidden, model.kv_a_proj_with_mqa.weight).split(
+        (rank, rope_dim), dim=-1
+    )
+    latent = (
+        latent.float() * torch.rsqrt(latent.float().square().mean(-1, keepdim=True) + 1e-6)
+    ).to(hidden.dtype)
+    rope_table = rope.create_rope_const_params()[1].view(1024, -1, 2).transpose(1, 2)
+    positions = list(range(length + 1))
+    query_rope = apply_mla_rope(query[..., nope:], positions, rope_table)
+    key_rope = apply_mla_rope(key_rope, positions, rope_table)
+    if backend is FlashInferAttention:
+        # External GPT-J RoPE keeps pairs interleaved; native MLA uses split halves.
+        query_rope = query_rope.unflatten(-1, (2, -1)).transpose(-2, -1).flatten(-2)
+        key_rope = key_rope.unflatten(-1, (2, -1)).transpose(-2, -1).flatten(-2)
+    query[..., nope:] = query_rope
+    latent = torch.cat((latent, key_rope), dim=-1)
+    scale = torch.ones(1, device="cuda")
+    packed, scales = _reference_quant(latent, scale)
+    low_latent = _reference_dequant(packed, scales, scale).to(hidden.dtype)
+
+    manager = KVCacheManagerV2(
+        KvCacheConfig(
+            max_tokens=65536,
+            enable_block_reuse=True,
+            dtype="mixed_nvfp4_bfloat16",
+            first_n=block,
+            last_n=block,
+            pool_ratio=[0.75, 0.25],
+        ),
+        CacheType.SELFKONLY,
+        num_layers=1,
+        num_kv_heads=1,
+        head_dim=rank + rope_dim,
+        tokens_per_block=block,
+        max_seq_len=1024,
+        max_batch_size=1,
+        mapping=mapping,
+        dtype=DataType.BF16,
+    )
+    try:
+        assert manager.kv_factor == 1
+        manager.add_dummy_requests([0], [prefix], is_gen=False)
+        for begin, end, context in (
+            (0, prefix, True),
+            (prefix, length, True),
+            (length, length + 1, False),
+        ):
+            if begin:
+                cache = manager.kv_cache_map[0]
+                assert cache.resize(None, begin)
+                cache.suspend()
+                assert cache.resume(
+                    torch.cuda.current_stream().cuda_stream, is_decoding=not context
+                )
+                assert cache.resize(end)
+                manager._restore_page_index_bufs(0, cache)
+            metadata = backend.Metadata(
+                seq_lens=torch.tensor([end - begin], dtype=torch.int32),
+                num_contexts=int(context),
+                kv_cache_params=KVCacheParams(use_cache=True, num_cached_tokens_per_seq=[begin]),
+                max_num_requests=1,
+                max_num_tokens=length + 1,
+                kv_cache_manager=manager,
+                request_ids=[0],
+                prompt_lens=[end - begin if context else length],
+                kv_layout="NHD",
+                mapping=mapping,
+                enable_context_mla_with_cached_kv=True,
+                runtime_features=AttentionRuntimeFeatures(
+                    chunked_prefill=True,
+                    cache_reuse=True,
+                    chunk_size=prefix,
+                    chunked_prefill_buffer_batch_size=1,
+                ),
+            )
+            metadata.prepare()
+            if backend is TrtllmAttention:
+                view = metadata.mixed_precision_kv_views[0]
+                paged_context_fmha = metadata.use_paged_context_fmha
+                native_kv = metadata._swap_mixed_precision_kv(view)
+                assert metadata.kv_cache_manager is view
+                assert metadata.use_paged_context_fmha == paged_context_fmha
+                metadata._restore_mixed_precision_kv(native_kv)
+                assert metadata.kv_cache_manager is manager
+                assert metadata.use_paged_context_fmha == paged_context_fmha
+            _, high_pages = manager.get_mixed_precision_page_tables([0], 0)
+            if begin:
+                assert high_pages[0][0] >= 0 and high_pages[0][1] == kv.BAD_PAGE_INDEX
+            high_mask = (
+                torch.tensor(high_pages[0], device="cuda")[
+                    torch.arange(end, device="cuda") // block
+                ]
+                >= 0
+            )
+            history = low_latent[:end].clone()
+            history[high_mask] = latent[:end][high_mask]
+            history[begin:] = latent[begin:end]
+            keys = torch.nn.functional.linear(history[:, :rank], key_weight).view(end, heads, nope)
+            keys = torch.cat((keys, history[:, None, rank:].expand(-1, heads, -1)), dim=-1)
+            values = torch.nn.functional.linear(history[:, :rank], value_weight).view(
+                end, heads, nope
+            )
+            mask = torch.ones(end - begin, end, dtype=torch.bool, device="cuda").tril(begin)
+            expected = (
+                torch.nn.functional.scaled_dot_product_attention(
+                    query[begin:end].transpose(0, 1).float(),
+                    keys.transpose(0, 1).float(),
+                    values.transpose(0, 1).float(),
+                    attn_mask=mask,
+                    scale=model.softmax_scale,
+                )
+                .transpose(0, 1)
+                .reshape(end - begin, -1)
+            )
+            output = torch.empty(end - begin, heads * nope, dtype=hidden.dtype, device="cuda")
+            model.forward_impl(
+                torch.arange(begin, end, device="cuda"), hidden[begin:end], metadata, [output]
+            )
+            assert metadata.kv_cache_manager is manager
+            # BF16 MLA with a 512-wide latent accumulates more rounding than the
+            # dense cases; the TRTLLM kernel lands within 0.03 of the reference.
+            torch.testing.assert_close(output.float(), expected, atol=0.03, rtol=0.03)
+    finally:
+        manager.shutdown()
+
+
 @pytest.mark.parametrize("layout", ("HND", "NHD"))
 @pytest.mark.parametrize(
     "dtype,width", [(torch.float16, 64), (torch.bfloat16, 80), (torch.float8_e4m3fn, 96)]
@@ -419,78 +605,76 @@ def test_mixed_precision_paged_conversion(dtype, width, layout):
 def test_mixed_precision_public_options():
     from pydantic import ValidationError
 
-    assert KvCacheConfig().high_low_pool_ratio == 1 / 5
-    config = KvCacheConfig(enable_mix_precision="nvfp4", dtype="fp8", high_low_pool_ratio=0.25)
+    assert KvCacheConfig().mixed_precision_dtypes is None
+    assert KvCacheConfig(dtype="fp8").attention_dtype == "fp8"
+    config = KvCacheConfig(dtype="mixed_nvfp4_fp8")
+    assert config.mixed_precision_dtypes == ("nvfp4", "fp8")
+    assert config.attention_dtype == "fp8"
     assert config.first_n == config.last_n == 256
-    assert config.dtype == "fp8"
+    assert config.pool_ratio is None
+    for high in ("auto", "float16", "bfloat16"):
+        assert KvCacheConfig(dtype=f"mixed_nvfp4_{high}").attention_dtype == high
     for invalid in (
-        {"enable_mix_precision": "int4"},
-        {"first_n": -1},
-        {"high_low_pool_ratio": 0},
-        {"high_low_pool_ratio": None},
-        {"enable_mix_precision": "nvfp4", "first_n": 0, "last_n": 0},
+        {"dtype": "mixed_int4_fp8"},
+        {"dtype": "mixed_nvfp4_nvfp4"},
+        {"dtype": "mixed_nvfp4_fp8", "first_n": -1},
+        {"dtype": "mixed_nvfp4_fp8", "last_n": -1},
+        {"dtype": "mixed_nvfp4_fp8", "first_n": 0, "last_n": 0},
+        {"mixed_precision_config": {"first_n": 1}},
     ):
         with pytest.raises(ValidationError):
             KvCacheConfig(**invalid)
     for first_n, last_n in ((0, 1), (1, 0)):
-        KvCacheConfig(enable_mix_precision="nvfp4", first_n=first_n, last_n=last_n)
+        KvCacheConfig(dtype="mixed_nvfp4_fp8", first_n=first_n, last_n=last_n)
     KvCacheConfig(first_n=0, last_n=0)
 
 
-@pytest.mark.parametrize("backend", ("TRTLLM", "FLASHINFER"))
-@pytest.mark.parametrize("mixed_precision,use_v2", ((None, False), (None, True), ("nvfp4", True)))
-@pytest.mark.cpu_only
-def test_mixed_precision_manager_routing(backend, mixed_precision, use_v2):
-    from tensorrt_llm._torch.pyexecutor import _util
-
-    model_config = SimpleNamespace(
-        pretrained_config=SimpleNamespace(), sparse_attention_config=None, attn_backend=backend
-    )
-    config = KvCacheConfig(enable_mix_precision=mixed_precision, use_kv_cache_manager_v2=use_v2)
-    expected = (
-        MixedPrecisionKVCacheManager
-        if mixed_precision is not None
-        else _util.KVCacheManagerV2
-        if use_v2
-        else _util.KVCacheManager
-    )
-    assert _util.get_kv_cache_manager_cls(model_config, config) is expected
-
-
 @pytest.mark.parametrize(
-    "model_overrides,use_v2,error,match",
+    "overrides,error,match",
     [
-        ({}, False, ValueError, "requires use_kv_cache_manager_v2=True"),
         (
-            {"pretrained_config": SimpleNamespace(architectures=["Qwen3NextForCausalLM"])},
-            True,
-            NotImplementedError,
-            "sparse and recurrent",
-        ),
-        (
-            {"sparse_attention_config": SimpleNamespace(algorithm="dsa")},
-            True,
-            NotImplementedError,
-            "sparse and recurrent",
-        ),
-        ({"attn_backend": "FLASH_ATTN"}, True, NotImplementedError, "TRTLLM or FlashInfer"),
-        (
-            {"quant_config": QuantConfig(kv_cache_quant_algo="NVFP4")},
-            True,
+            {
+                "kv_cache_config": KvCacheConfig(
+                    dtype="mixed_nvfp4_fp8", use_kv_cache_manager_v2=False
+                )
+            },
             ValueError,
-            "requires FP16/BF16/FP8 high KV",
+            "use_kv_cache_manager_v2=True",
         ),
+        (
+            {
+                "kv_cache_config": KvCacheConfig(
+                    dtype="mixed_nvfp4_fp8", use_kv_cache_manager_v2="auto"
+                )
+            },
+            ValueError,
+            "use_kv_cache_manager_v2=True",
+        ),
+        ({"attn_backend": "VANILLA"}, NotImplementedError, "TRTLLM and FLASHINFER"),
+        ({"sparse_attention_config": {"algorithm": "rocket"}}, NotImplementedError, "sparse"),
+        (
+            {"speculative_config": {"decoding_type": "NGram", "max_draft_len": 2}},
+            ValueError,
+            "single-beam",
+        ),
+        (
+            {"kv_cache_compression_config": {"algorithm": "quantization_for_cold_page"}},
+            ValueError,
+            "single-beam",
+        ),
+        ({"max_beam_width": 2}, ValueError, "single-beam"),
     ],
-    ids=("v1", "mamba", "sparse", "backend", "high_dtype"),
+    ids=("v1", "auto_v2", "backend", "sparse", "speculative", "compression", "beam"),
 )
 @pytest.mark.cpu_only
-def test_mixed_precision_manager_rejects_unsupported_routes(model_overrides, use_v2, error, match):
-    from tensorrt_llm._torch.pyexecutor._util import get_kv_cache_manager_cls
+def test_mixed_precision_llm_args_validation(overrides, error, match):
+    from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 
-    model_config = SimpleNamespace(
-        pretrained_config=SimpleNamespace(), sparse_attention_config=None, attn_backend="TRTLLM"
+    kwargs = dict(
+        model="/tmp/mixed-precision-nonexistent-model",
+        kv_cache_config=KvCacheConfig(dtype="mixed_nvfp4_fp8", use_kv_cache_manager_v2=True),
     )
-    vars(model_config).update(model_overrides)
-    config = KvCacheConfig(enable_mix_precision="nvfp4", use_kv_cache_manager_v2=use_v2)
+    TorchLlmArgs(**kwargs)
+    kwargs.update(overrides)
     with pytest.raises(error, match=match):
-        get_kv_cache_manager_cls(model_config, config)
+        TorchLlmArgs(**kwargs)

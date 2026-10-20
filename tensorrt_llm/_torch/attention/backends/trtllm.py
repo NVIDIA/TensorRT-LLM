@@ -50,7 +50,6 @@ from .interface import (AttentionBackend, AttentionForwardArgs,
                         KVCacheParams, MLAParams, PositionalEmbeddingParams,
                         PredefinedAttentionMask, RopeParams,
                         merge_attention_forward_args)
-from .mixed_precision_kv_view import MixedPrecisionKVView
 from .sparse.hooks import prepare_sparse_runtime_params
 from .sparse.params import BlockSparseForwardInputs, SparseParams
 from .sparse.skip_softmax import SkipSoftmaxParams
@@ -138,7 +137,9 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     fmha_plan_caches: Dict[str, dict] = field(default_factory=dict,
                                               init=False,
                                               repr=False)
-    mixed_precision_kv_views: dict[int, MixedPrecisionKVView] | None = field(
+    # Block offsets of the mixed-precision staging cache, swapped in for
+    # kv_cache_block_offsets while a mixed-precision layer runs.
+    _mixed_precision_block_offsets: Optional[torch.Tensor] = field(
         init=False, default=None, repr=False, compare=False)
 
     @property
@@ -371,8 +372,6 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         # CUDA-graph metadata is a shallow copy that re-runs this method; give it
         # its own plan caches so each captured batch size plans its own wrappers.
         self.fmha_plan_caches = {}
-        self.mixed_precision_kv_views = ({} if getattr(
-            self.kv_cache_manager, "high_layers", None) else None)
         # Each copy records and restores its own draft swaps.
         self.draft_replay_swapped_attrs = {}
         self._post_init_with_buffers(self.cuda_graph_buffers)
@@ -1142,7 +1141,41 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             self.fp4_mla_state.prepare(self, kv_lens)
 
         if self.mixed_precision_kv_views is not None:
-            MixedPrecisionKVView.prepare_batch(self)
+            # Native BF16 paged-context FMHA reads 32-token pages.
+            self.prepare_mixed_precision_kv(
+                "HND", min(self.kv_cache_manager.tokens_per_block, 32))
+
+    def _on_mixed_precision_kv_prepared(self, view) -> None:
+        """Lay out the staging pages as TRTLLM block offsets for this batch."""
+        ordinals = torch.arange(view.max_blocks_per_seq, dtype=torch.int32)
+        pages = torch.tensor(view.page_starts[:-1],
+                             dtype=torch.int32)[:, None] + ordinals
+        offsets = torch.stack((view.kv_factor * pages,
+                               view.kv_factor * pages + view.kv_factor - 1),
+                              dim=1)
+        valid = ordinals < torch.tensor(view.page_counts,
+                                        dtype=torch.int32)[:, None]
+        block_offsets = self.kv_cache_manager.mixed_precision_buffers.get_buffer(
+            (1, self.kv_cache_manager.max_batch_size, 2,
+             view.max_blocks_per_seq),
+            torch.int32,
+            "mixed_block_offsets",
+            self.is_cuda_graph,
+        )[:, :len(view.page_counts)]
+        block_offsets.copy_(maybe_pin_memory(
+            offsets.masked_fill(~valid[:, None], -1).unsqueeze(0)),
+                            non_blocking=True)
+        self._mixed_precision_block_offsets = block_offsets
+
+    def _swap_mixed_precision_kv(self, view) -> tuple:
+        saved = (*super()._swap_mixed_precision_kv(view),
+                 self.kv_cache_block_offsets)
+        self.kv_cache_block_offsets = self._mixed_precision_block_offsets
+        return saved
+
+    def _restore_mixed_precision_kv(self, saved: tuple) -> None:
+        super()._restore_mixed_precision_kv(saved[:2])
+        self.kv_cache_block_offsets = saved[2]
 
     def prepare_encoder_decoder_from_precomputed_lengths(
             self, prompt_lens: torch.Tensor, kv_lens: torch.Tensor,

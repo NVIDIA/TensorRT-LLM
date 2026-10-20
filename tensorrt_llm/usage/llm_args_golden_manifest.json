@@ -649,7 +649,11 @@
         "float32",
         "fp8",
         "fp8_ds_mla",
-        "nvfp4"
+        "nvfp4",
+        "mixed_nvfp4_auto",
+        "mixed_nvfp4_fp8",
+        "mixed_nvfp4_float16",
+        "mixed_nvfp4_bfloat16"
       ],
       "capture_policy": "allowlist",
       "kind": "categorical",
@@ -664,14 +668,6 @@
       "capture_policy": "bool",
       "kind": "value",
       "path": "kv_cache_config.enable_kv_pool_rebalance"
-    },
-    {
-      "allowed_values": [
-        "nvfp4"
-      ],
-      "capture_policy": "literal|none",
-      "kind": "categorical",
-      "path": "kv_cache_config.enable_mix_precision"
     },
     {
       "capture_policy": "bool",
@@ -702,11 +698,6 @@
       "capture_policy": "float|none",
       "kind": "value",
       "path": "kv_cache_config.free_gpu_memory_fraction"
-    },
-    {
-      "capture_policy": "float",
-      "kind": "value",
-      "path": "kv_cache_config.high_low_pool_ratio"
     },
     {
       "capture_policy": "int|none",

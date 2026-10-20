@@ -32,9 +32,8 @@ import torch
 import yaml
 from pydantic import AliasChoices, BaseModel, ConfigDict
 from pydantic import Field as PydanticField
-from pydantic import (NonNegativeFloat, NonNegativeInt, PositiveFloat,
-                      PositiveInt, PrivateAttr, StrictInt, field_validator,
-                      model_validator)
+from pydantic import (NonNegativeFloat, NonNegativeInt, PositiveInt,
+                      PrivateAttr, StrictInt, field_validator, model_validator)
 from strenum import StrEnum
 from transformers import PreTrainedTokenizerBase
 
@@ -4780,6 +4779,16 @@ class KvPoolRebalanceConfig(StrictBaseModel):
         "should be attempted.")
 
 
+# Mixed-precision KV dtype: "mixed_<history dtype>_<retained dtype>". The
+# first/last retained tokens and the attention inputs use the second dtype;
+# the full history is stored in the first. Requires KV cache manager V2.
+_MIXED_PRECISION_KV_DTYPE = re.compile(
+    r"^mixed_(?P<low>nvfp4)_(?P<high>auto|fp8|float16|bfloat16)$")
+_MIXED_PRECISION_KV_DTYPES = tuple(f"mixed_nvfp4_{high}"
+                                   for high in ("auto", "fp8", "float16",
+                                                "bfloat16"))
+
+
 @PybindMirror.mirror_pybind_fields(_KvCacheConfig)
 class KvCacheConfig(StrictBaseModel, PybindMirror):
     """Configuration for the KV cache."""
@@ -4889,40 +4898,30 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         "own KV-cache quantization metadata untouched (quant_config.kv_cache_quant_algo "
         "is inherited as-is); 'fp8', 'fp8_ds_mla', or 'nvfp4' override it explicitly. "
         "'fp8_ds_mla' selects the packed FP8 cache used by sparse MLA on SM90/SM120/SM121. "
+        "'mixed_nvfp4_<dtype>' (prototype) stores the full KV history in NVFP4 and "
+        "keeps the first_n/last_n tokens of every sequence in <dtype> "
+        "('auto', 'fp8', 'float16' or 'bfloat16'); requires KV cache manager V2. "
         "Resolved at "
         "LLM-construction time, including when set via trtllm-serve "
         "--extra_llm_api_options.",
         telemetry=TelemetryField.categorical("auto", "float16", "bfloat16",
                                              "float32", "fp8", "fp8_ds_mla",
-                                             "nvfp4"))
+                                             "nvfp4",
+                                             *_MIXED_PRECISION_KV_DTYPES))
 
-    enable_mix_precision: Optional[Literal["nvfp4"]] = Field(
-        default=None,
-        status="prototype",
-        description="Store ordinary full-history KV in NVFP4 with an additional "
-        "First/Last cache at the existing KV dtype. Requires KV cache manager V2."
-    )
     first_n: NonNegativeInt = Field(
         default=256,
         status="prototype",
         description=
-        "First tokens retained at the KV dtype when mixed precision is enabled. "
-        "Accepts any nonnegative count; retention follows native page granularity."
-    )
+        "Mixed-precision KV only: number of leading tokens per sequence kept at the "
+        "retained dtype. Retention follows the cache page granularity.")
+
     last_n: NonNegativeInt = Field(
         default=256,
         status="prototype",
         description=
-        "Recent tokens retained at the KV dtype when mixed precision is enabled. "
-        "Accepts any nonnegative count; retention follows native page granularity."
-    )
-    high_low_pool_ratio: PositiveFloat = Field(
-        default=1 / 5,
-        status="prototype",
-        description=
-        "High-to-low KV byte-budget ratio when mixed precision is enabled. "
-        "Defaults to low:high=5:1. Splits the selected original KV groups "
-        "without changing other groups' shares.")
+        "Mixed-precision KV only: number of most recent tokens per sequence kept at "
+        "the retained dtype. Retention follows the cache page granularity.")
 
     # This is a pure python field, not a pybind field. It is only for the Pytorch backend.
     mamba_ssm_cache_dtype: Literal[
@@ -5117,19 +5116,29 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         if v in ("auto", "fp8", "fp8_ds_mla",
                  "nvfp4") or v in _str_to_torch_dtype_dict.keys():
             return v
+        if _MIXED_PRECISION_KV_DTYPE.match(v):
+            return v
 
         raise ValueError(
             'kv_cache_config.dtype must be one of "auto", "fp8", "fp8_ds_mla", '
-            '"nvfp4", or valid torch.dtype string')
+            '"nvfp4", "mixed_nvfp4_<auto|fp8|float16|bfloat16>", or valid '
+            'torch.dtype string')
 
-    @model_validator(mode='after')
-    def validate_mixed_precision(self) -> 'KvCacheConfig':
-        if (self.enable_mix_precision is not None
-                and self.first_n == self.last_n == 0):
-            raise ValueError(
-                "Mixed-precision KV requires first_n or last_n to be greater than zero."
-            )
-        return self
+    @property
+    def mixed_precision_dtypes(self) -> Optional[Tuple[str, str]]:
+        """(history dtype, retained dtype) of a mixed-precision KV cache, else None."""
+        match = _MIXED_PRECISION_KV_DTYPE.match(self.dtype)
+        return None if match is None else (match["low"], match["high"])
+
+    @property
+    def attention_dtype(self) -> str:
+        """KV dtype that attention reads and writes.
+
+        For a mixed-precision cache this is the retained dtype; the NVFP4
+        history is converted to it before attention runs.
+        """
+        mixed = self.mixed_precision_dtypes
+        return self.dtype if mixed is None else mixed[1]
 
     @model_validator(mode='after')
     def reject_fp8_ds_mla_pool_rebalance(self) -> 'KvCacheConfig':
@@ -5250,6 +5259,15 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
                     "kv_cache_config.max_attention_window values must be positive or LinearCacheType.RECURRENT_STATES.value"
                 )
         return v
+
+    @model_validator(mode='after')
+    def validate_mixed_precision_retention(self) -> 'KvCacheConfig':
+        if (self.mixed_precision_dtypes is not None
+                and self.first_n == self.last_n == 0):
+            raise ValueError(
+                "Mixed-precision KV requires first_n or last_n to be greater than zero."
+            )
+        return self
 
     @field_validator('pool_ratio')
     @classmethod
@@ -6985,8 +7003,20 @@ class TorchLlmArgs(BaseLlmArgs):
 
     @model_validator(mode="after")
     def validate_mixed_precision_kv(self) -> 'TorchLlmArgs':
-        if self.kv_cache_config.enable_mix_precision is None:
+        if self.kv_cache_config.mixed_precision_dtypes is None:
             return self
+        if self.kv_cache_config.use_kv_cache_manager_v2 is not True:
+            raise ValueError(
+                "Mixed-precision KV requires kv_cache_config.use_kv_cache_manager_v2=True."
+            )
+        if self.attn_backend not in ("TRTLLM", "FLASHINFER"):
+            raise NotImplementedError(
+                "Mixed-precision KV supports the TRTLLM and FLASHINFER attention "
+                f"backends; got attn_backend={self.attn_backend!r}.")
+        if self.sparse_attention_config is not None:
+            raise NotImplementedError(
+                "Mixed-precision KV is not supported together with sparse attention."
+            )
         if (self.speculative_config is not None
                 or self.kv_cache_compression_config is not None
                 or self.max_beam_width != 1):
@@ -7716,11 +7746,12 @@ class TorchLlmArgs(BaseLlmArgs):
             return self
 
         assert self.quant_config is not None
-        if self.kv_cache_config.dtype == "auto":
+        kv_cache_dtype = self.kv_cache_config.attention_dtype
+        if kv_cache_dtype == "auto":
             return self
-        elif self.kv_cache_config.dtype in ('fp8', 'fp8_ds_mla'):
+        elif kv_cache_dtype in ('fp8', 'fp8_ds_mla'):
             self.quant_config.kv_cache_quant_algo = QuantAlgo.FP8
-        elif self.kv_cache_config.dtype == 'nvfp4':
+        elif kv_cache_dtype == 'nvfp4':
             self.quant_config.kv_cache_quant_algo = QuantAlgo.NVFP4
         else:
             logger.warning(

@@ -2254,7 +2254,7 @@
         },
         "kv_cache_dtype": {
           "default": "auto",
-          "description": "The data type for the KV cache. 'auto' (default) leaves the checkpoint's own KV-cache quantization metadata untouched (quant_config.kv_cache_quant_algo is inherited as-is); 'fp8', 'fp8_ds_mla', or 'nvfp4' override it explicitly. 'fp8_ds_mla' selects the packed FP8 cache used by sparse MLA on SM90/SM120/SM121. Resolved at LLM-construction time, including when set via trtllm-serve --extra_llm_api_options.",
+          "description": "The data type for the KV cache. 'auto' (default) leaves the checkpoint's own KV-cache quantization metadata untouched (quant_config.kv_cache_quant_algo is inherited as-is); 'fp8', 'fp8_ds_mla', or 'nvfp4' override it explicitly. 'fp8_ds_mla' selects the packed FP8 cache used by sparse MLA on SM90/SM120/SM121. 'mixed_nvfp4_<dtype>' (prototype) stores the full KV history in NVFP4 and keeps the first_n/last_n tokens of every sequence in <dtype> ('auto', 'fp8', 'float16' or 'bfloat16'); requires KV cache manager V2. Resolved at LLM-construction time, including when set via trtllm-serve --extra_llm_api_options.",
           "telemetry": {
             "allowed_values": [
               "auto",
@@ -2263,7 +2263,11 @@
               "float32",
               "fp8",
               "fp8_ds_mla",
-              "nvfp4"
+              "nvfp4",
+              "mixed_nvfp4_auto",
+              "mixed_nvfp4_fp8",
+              "mixed_nvfp4_float16",
+              "mixed_nvfp4_bfloat16"
             ]
           },
           "title": "Dtype",
@@ -4325,7 +4329,7 @@
         },
         "dtype": {
           "default": "auto",
-          "description": "The data type for the KV cache. 'auto' (default) leaves the checkpoint's own KV-cache quantization metadata untouched (quant_config.kv_cache_quant_algo is inherited as-is); 'fp8', 'fp8_ds_mla', or 'nvfp4' override it explicitly. 'fp8_ds_mla' selects the packed FP8 cache used by sparse MLA on SM90/SM120/SM121. Resolved at LLM-construction time, including when set via trtllm-serve --extra_llm_api_options.",
+          "description": "The data type for the KV cache. 'auto' (default) leaves the checkpoint's own KV-cache quantization metadata untouched (quant_config.kv_cache_quant_algo is inherited as-is); 'fp8', 'fp8_ds_mla', or 'nvfp4' override it explicitly. 'fp8_ds_mla' selects the packed FP8 cache used by sparse MLA on SM90/SM120/SM121. 'mixed_nvfp4_<dtype>' (prototype) stores the full KV history in NVFP4 and keeps the first_n/last_n tokens of every sequence in <dtype> ('auto', 'fp8', 'float16' or 'bfloat16'); requires KV cache manager V2. Resolved at LLM-construction time, including when set via trtllm-serve --extra_llm_api_options.",
           "telemetry": {
             "allowed_values": [
               "auto",
@@ -4334,7 +4338,11 @@
               "float32",
               "fp8",
               "fp8_ds_mla",
-              "nvfp4"
+              "nvfp4",
+              "mixed_nvfp4_auto",
+              "mixed_nvfp4_fp8",
+              "mixed_nvfp4_float16",
+              "mixed_nvfp4_bfloat16"
             ]
           },
           "title": "Dtype",
@@ -4348,7 +4356,7 @@
         },
         "enable_kv_pool_rebalance": {
           "default": false,
-          "description": "Opt in to the KVCacheManagerV2 auto-tuner (``adjust()``) for rebalancing pool-group ratios between iterations. When True the PyExecutor calls ``adjust()`` opportunistically; the auto-tuner itself remains gated by V2's internal 2000-sample / 120s cooldown. When False (default) the rebalance hook is skipped entirely and pool ratios remain at their warmup-derived values. Beta: enable at your own risk. Only used when using KV cache manager v2 (experimental). This option is incompatible with dtype='fp8_ds_mla'.",
+          "description": "Opt in to the KVCacheManagerV2 auto-tuner (``adjust()``) for rebalancing pool-group ratios between iterations. When True the PyExecutor calls ``adjust()`` opportunistically; the auto-tuner itself remains gated by the ``kv_pool_rebalance_config`` thresholds (2000 samples / 120s by default). When False (default) the rebalance hook is skipped entirely and pool ratios remain at their warmup-derived values. Beta: enable at your own risk. Only used when using KV cache manager v2 (experimental). This option is incompatible with dtype='fp8_ds_mla'.",
           "status": "prototype",
           "title": "Enable Kv Pool Rebalance",
           "type": "boolean"
@@ -4370,6 +4378,14 @@
           "default": 0,
           "description": "Maximum size of the event buffer. If set to 0, the event buffer will not be used.",
           "title": "Event Buffer Max Size",
+          "type": "integer"
+        },
+        "first_n": {
+          "default": 256,
+          "description": "Mixed-precision KV only: number of leading tokens per sequence kept at the retained dtype. Retention follows the cache page granularity.",
+          "minimum": 0,
+          "status": "prototype",
+          "title": "First N",
           "type": "integer"
         },
         "fp8_context_mla_kv_len_cap": {
@@ -4446,6 +4462,19 @@
           "default": null,
           "description": "Streaming (push-based) KV cache event publishing (KV cache manager V2 only). When set, each rank publishes its own events directly (e.g. over ZeroMQ) instead of the buffered event_buffer_max_size gather/poll path.",
           "status": "prototype"
+        },
+        "kv_pool_rebalance_config": {
+          "$ref": "#/$defs/KvPoolRebalanceConfig",
+          "description": "Tuning for the KVCacheManagerV2 pool rebalance auto-tuner. Only used when ``enable_kv_pool_rebalance`` is True.",
+          "status": "prototype"
+        },
+        "last_n": {
+          "default": 256,
+          "description": "Mixed-precision KV only: number of most recent tokens per sequence kept at the retained dtype. Retention follows the cache page granularity.",
+          "minimum": 0,
+          "status": "prototype",
+          "title": "Last N",
+          "type": "integer"
         },
         "mamba_ssm_cache_dtype": {
           "default": "auto",
@@ -4707,6 +4736,63 @@
         }
       },
       "title": "KvCacheConnectorConfig",
+      "type": "object"
+    },
+    "KvPoolRebalanceConfig": {
+      "additionalProperties": false,
+      "description": "Tuning for the KV cache manager v2 pool rebalance auto-tuner.\n\nOnly used when ``kv_cache_config.enable_kv_pool_rebalance`` is True.",
+      "properties": {
+        "check_interval": {
+          "default": 10,
+          "description": "Number of PyExecutor iterations between checks of whether a pool rebalance should be attempted.",
+          "exclusiveMinimum": 0,
+          "status": "prototype",
+          "title": "Check Interval",
+          "type": "integer"
+        },
+        "cooldown_secs": {
+          "default": 120.0,
+          "description": "Minimum time, in seconds, between successive rebalance adjustments.",
+          "minimum": 0,
+          "status": "prototype",
+          "title": "Cooldown Secs",
+          "type": "number"
+        },
+        "min_sampled_kv_caches": {
+          "default": 2000,
+          "description": "Minimum number of sampled (closed) KvCaches observed before the auto-tuner will consider making an adjustment.",
+          "minimum": 0,
+          "status": "prototype",
+          "title": "Min Sampled Kv Caches",
+          "type": "integer"
+        },
+        "moving_average_decay": {
+          "default": 0.9999,
+          "description": "Decay factor for the exponential moving averages (reused length, capacity, history length) used to compute target pool ratios. Higher values react more slowly to change.",
+          "exclusiveMaximum": 1,
+          "exclusiveMinimum": 0,
+          "status": "prototype",
+          "title": "Moving Average Decay",
+          "type": "number"
+        },
+        "ratio_tolerance": {
+          "default": 0.25,
+          "description": "How far a pool group's current ratio may drift from its target before a rebalance is triggered, as a fraction of the smaller of the two. The comparison is symmetric, so 0.25 means a rebalance is triggered once one of the two exceeds the other by more than 25%.",
+          "exclusiveMinimum": 0,
+          "status": "prototype",
+          "title": "Ratio Tolerance",
+          "type": "number"
+        },
+        "target_ratio_update_interval": {
+          "default": 100,
+          "description": "Number of newly sampled KvCaches between recomputations of the target pool-group ratios.",
+          "exclusiveMinimum": 0,
+          "status": "prototype",
+          "title": "Target Ratio Update Interval",
+          "type": "integer"
+        }
+      },
+      "title": "KvPoolRebalanceConfig",
       "type": "object"
     },
     "LayerwiseBenchmarksConfig": {
@@ -8412,7 +8498,7 @@
     },
     "kv_cache_dtype": {
       "default": "auto",
-      "description": "The data type for the KV cache. 'auto' (default) leaves the checkpoint's own KV-cache quantization metadata untouched (quant_config.kv_cache_quant_algo is inherited as-is); 'fp8', 'fp8_ds_mla', or 'nvfp4' override it explicitly. 'fp8_ds_mla' selects the packed FP8 cache used by sparse MLA on SM90/SM120/SM121. Resolved at LLM-construction time, including when set via trtllm-serve --extra_llm_api_options.",
+      "description": "The data type for the KV cache. 'auto' (default) leaves the checkpoint's own KV-cache quantization metadata untouched (quant_config.kv_cache_quant_algo is inherited as-is); 'fp8', 'fp8_ds_mla', or 'nvfp4' override it explicitly. 'fp8_ds_mla' selects the packed FP8 cache used by sparse MLA on SM90/SM120/SM121. 'mixed_nvfp4_<dtype>' (prototype) stores the full KV history in NVFP4 and keeps the first_n/last_n tokens of every sequence in <dtype> ('auto', 'fp8', 'float16' or 'bfloat16'); requires KV cache manager V2. Resolved at LLM-construction time, including when set via trtllm-serve --extra_llm_api_options.",
       "telemetry": {
         "allowed_values": [
           "auto",
@@ -8421,7 +8507,11 @@
           "float32",
           "fp8",
           "fp8_ds_mla",
-          "nvfp4"
+          "nvfp4",
+          "mixed_nvfp4_auto",
+          "mixed_nvfp4_fp8",
+          "mixed_nvfp4_float16",
+          "mixed_nvfp4_bfloat16"
         ]
       },
       "title": "Dtype",

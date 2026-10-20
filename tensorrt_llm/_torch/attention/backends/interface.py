@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import contextlib
 import copy
 import weakref
 from collections import namedtuple
@@ -15,6 +16,8 @@ from typing_extensions import Self
 if TYPE_CHECKING:
     from ...model_config import ModelConfig
     from ...modules.mamba.mamba2_metadata import Mamba2Metadata
+    from ...pyexecutor.kv_cache.mixed_precision_staging import \
+        MixedPrecisionKVStaging
     from ...speculative.interface import SpecMetadata
     from ...speculative.spec_tree_manager import SpecTreeManager
 
@@ -203,7 +206,19 @@ class AttentionMetadata:
     see `TokensPrompt` for details.
     """
 
+    # Mixed-precision KV: the batch's native-dtype staging cache, keyed by every
+    # layer it serves. None when the KV cache manager has no mixed-precision
+    # layers. See prepare_mixed_precision_kv().
+    mixed_precision_kv_views: Optional[Dict[int,
+                                            "MixedPrecisionKVStaging"]] = field(
+                                                init=False,
+                                                default=None,
+                                                repr=False,
+                                                compare=False)
+
     def __post_init__(self) -> None:
+        self.mixed_precision_kv_views = ({} if self._has_mixed_precision_kv()
+                                         else None)
         if self.is_cross:
             assert self.cross is None or self.cross is self, "Cross attention metadata should not have sub metadata"
             self.cross = self
@@ -342,6 +357,79 @@ class AttentionMetadata:
         Hook to be called before the forward step of the model.
         """
         self._prepare_mamba_metadata()
+
+    def _has_mixed_precision_kv(self) -> bool:
+        # isinstance guards against mocks and against V1 managers, which have
+        # no mixed-precision layers.
+        high_layers = getattr(self.kv_cache_manager, "high_layers", None)
+        return isinstance(high_layers, dict) and bool(high_layers)
+
+    def prepare_mixed_precision_kv(self, layout: str,
+                                   tokens_per_block: int) -> None:
+        """Refresh the mixed-precision staging cache for this batch.
+
+        Backends call this from prepare() with the paged layout their kernels
+        read. CUDA graph metadata keeps its staging object so the captured
+        addresses stay valid; only the page tables and lengths are reloaded.
+        """
+        from ...pyexecutor.kv_cache.mixed_precision_staging import \
+            MixedPrecisionKVStaging
+
+        view = next(iter(self.mixed_precision_kv_views.values()), None)
+        if view is None or not self.is_cuda_graph:
+            view = MixedPrecisionKVStaging(self.kv_cache_manager,
+                                           layout=layout,
+                                           pool_layout=self.kv_layout,
+                                           tokens_per_block=tokens_per_block,
+                                           num_seqs=self.num_seqs)
+            self.mixed_precision_kv_views = dict.fromkeys(view.pools, view)
+        view.update(self.request_ids,
+                    self.kv_cache_params.num_cached_tokens_per_seq,
+                    self.seq_lens.tolist(),
+                    capture_graph=self.is_cuda_graph)
+        self._on_mixed_precision_kv_prepared(view)
+
+    def _on_mixed_precision_kv_prepared(
+            self, view: "MixedPrecisionKVStaging") -> None:
+        """Backend hook: refresh backend-specific views of the staging cache."""
+
+    def get_mixed_precision_kv_view(
+            self, layer_idx: int) -> Optional["MixedPrecisionKVStaging"]:
+        """Return the staging cache of a mixed-precision layer, else None."""
+        views = self.mixed_precision_kv_views
+        return None if views is None else views.get(layer_idx)
+
+    @contextlib.contextmanager
+    def mixed_precision_kv_staging(self, layer_idx: int):
+        """Run attention for ``layer_idx`` against its native-dtype staging cache.
+
+        Converts the layer's mixed-precision pools into staging, points this
+        metadata at the staging cache for the duration of the block, restores
+        the metadata, and writes the new tokens back only if the block
+        completed. A no-op for layers without mixed-precision KV.
+        """
+        view = self.get_mixed_precision_kv_view(layer_idx)
+        if view is None:
+            yield None
+            return
+        view.convert(layer_idx)
+        saved = self._swap_mixed_precision_kv(view)
+        try:
+            yield view
+        finally:
+            self._restore_mixed_precision_kv(saved)
+        view.convert(layer_idx, writeback=True)
+
+    def _swap_mixed_precision_kv(self,
+                                 view: "MixedPrecisionKVStaging") -> tuple:
+        """Point this metadata at the staging cache; return what to restore."""
+        saved = (self.kv_cache_manager, self.kv_layout)
+        self.kv_cache_manager = view
+        self.kv_layout = view.layout
+        return saved
+
+    def _restore_mixed_precision_kv(self, saved: tuple) -> None:
+        self.kv_cache_manager, self.kv_layout = saved
 
     def prepare_encoder_only(self) -> None:
         """Hook for encoder-only (no-KV-cache) forward setup.

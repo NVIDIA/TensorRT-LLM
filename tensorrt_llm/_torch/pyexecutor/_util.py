@@ -65,8 +65,7 @@ from .config_utils import (MambaKVCacheParams, _is_sliding_attention_layer,
 from .connectors.kv_cache_connector import KvCacheConnectorManager
 from .dwdp import DwdpManager
 from .guided_decoder import GuidedDecoder
-from .kv_cache.kv_cache_manager_v2 import (KVCacheManagerV2,
-                                           MixedPrecisionKVCacheManager)
+from .kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from .kv_cache.mamba_cache_manager import (BaseMambaCacheManager,
                                            CppMambaHybridCacheManager,
                                            MambaHybridCacheManagerV2,
@@ -107,8 +106,6 @@ def _non_hybrid_kv_cache_manager_cls(config, kv_cache_config: KvCacheConfig):
     # require KVCacheManagerV2 for per-layer buffer sizes.
     needs_v2 = (kv_cache_config.use_kv_cache_manager_v2 is True
                 or is_gemma4_hybrid(config))
-    if kv_cache_config.enable_mix_precision is not None:
-        return MixedPrecisionKVCacheManager
     return KVCacheManagerV2 if needs_v2 else KVCacheManager
 
 
@@ -200,19 +197,6 @@ def get_kv_cache_manager_cls(
     sparse_attn_config = model_config.sparse_attention_config
     sparse_attn_algorithm = getattr(sparse_attn_config, "algorithm", None)
     quant_config = getattr(model_config, "quant_config", None)
-    if kv_cache_config.enable_mix_precision is not None:
-        if kv_cache_config.use_kv_cache_manager_v2 is False:
-            raise ValueError(
-                "Mixed-precision KV requires use_kv_cache_manager_v2=True.")
-        if (sparse_attn_config is not None or is_hybrid_linear(config)
-                or model_config.attn_backend not in ("TRTLLM", "FLASHINFER")):
-            raise NotImplementedError(
-                "Mixed-precision KV currently supports dense Attention/MLA with "
-                "TRTLLM or FlashInfer; sparse and recurrent models are not wired yet."
-            )
-        if (quant_config is not None
-                and quant_config.quant_mode.has_fp4_kv_cache()):
-            raise ValueError("Mixed precision requires FP16/BF16/FP8 high KV")
     if (sparse_attn_config is None and is_mla(config)
             and quant_config is not None
             and quant_config.quant_mode.has_fp4_kv_cache()):
@@ -3286,13 +3270,6 @@ def _create_kv_cache_manager(
             num_key_value_heads, num_hidden_layers, spec_config,
             draft_config_for_kv)
     manager_extra_kwargs = {}
-    if issubclass(kv_cache_manager_cls, MixedPrecisionKVCacheManager):
-        manager_extra_kwargs.update(
-            first_n=kv_cache_config.first_n,
-            last_n=kv_cache_config.last_n,
-            high_low_pool_ratio=None
-            if estimating_kv_cache else kv_cache_config.high_low_pool_ratio,
-        )
     if issubclass(kv_cache_manager_cls, KVCacheManagerV2):
         manager_extra_kwargs["max_cuda_graph_batch_size"] = (
             model_engine._max_cuda_graph_batch_size

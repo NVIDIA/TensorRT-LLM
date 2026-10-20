@@ -134,7 +134,7 @@ class ModelLoader:
         Returns:
             prequantized (bool): Whether the checkpoint is pre-quantized.
         """
-        kv_cache_dtype = self.llm_args.kv_cache_config.dtype
+        kv_cache_dtype = self.llm_args.kv_cache_config.attention_dtype
         explicit_kv_cache_quant_algo = {
             "fp8": QuantAlgo.FP8,
             "fp8_ds_mla": QuantAlgo.FP8,

@@ -28,7 +28,6 @@ from .backends import (AttentionForwardArgs, AttentionMetadata,
 from .backends.interface import (AttentionMask, CustomAttentionMask,
                                  PositionalEmbeddingParams,
                                  PredefinedAttentionMask)
-from .backends.mixed_precision_kv_view import get_mixed_precision_kv_view
 from .backends.sparse.hooks import get_sparse_attention_hooks
 from .backends.utils import create_attention, get_attention_backend
 from .rotary_embedding import MRotaryEmbedding, RotaryEmbedding
@@ -1002,22 +1001,12 @@ class Attention(nn.Module):
             relative_attention_bias=relative_attention_bias,
             relative_attention_max_distance=relative_attention_max_distance,
         )
-        mixed_precision_kv_view = get_mixed_precision_kv_view(
-            attn_metadata, self.attn.layer_idx)
-        if mixed_precision_kv_view is not None:
-            mixed_precision_kv_view.convert(self.attn.layer_idx)
-            native_kv = mixed_precision_kv_view.swap_staging(attn_metadata)
-        try:
+        with attn_metadata.mixed_precision_kv_staging(self.attn.layer_idx):
             attn_output = self.attn.forward(q,
                                             k,
                                             v,
                                             attn_metadata,
                                             forward_args=forward_args)
-        finally:
-            if mixed_precision_kv_view is not None:
-                mixed_precision_kv_view.swap_staging(attn_metadata, native_kv)
-        if mixed_precision_kv_view is not None:
-            mixed_precision_kv_view.convert(self.attn.layer_idx, writeback=True)
         if isinstance(attn_output, tuple):
             assert len(
                 attn_output

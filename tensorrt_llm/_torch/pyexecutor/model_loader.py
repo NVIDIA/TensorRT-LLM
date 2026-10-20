@@ -1976,7 +1976,7 @@ class ModelLoader:
         config.extra_attrs[
             'nvfp4_gemm_allowed_backends'] = config.nvfp4_gemm_allowed_backends
         config.extra_attrs[
-            'kv_cache_dtype'] = self.llm_args.kv_cache_config.dtype
+            'kv_cache_dtype'] = self.llm_args.kv_cache_config.attention_dtype
         config.extra_attrs["bounded_replay_on_generation"] = (
             self.llm_args.bounded_replay_on_generation)
         # Store allreduce pre-allocation config for AllReduce module access.
@@ -2002,8 +2002,8 @@ class ModelLoader:
         validate_encoder_decoder_tp_scope(config)
         validate_encoder_decoder_kv_cache_config(config,
                                                  self.llm_args.kv_cache_config)
-        validate_and_set_kv_cache_quant(config,
-                                        self.llm_args.kv_cache_config.dtype)
+        validate_and_set_kv_cache_quant(
+            config, self.llm_args.kv_cache_config.attention_dtype)
         validate_fp4_mla_config(config, self.llm_args)
         validate_and_set_mamba_ssm_cache_dtype(
             config, self.llm_args.kv_cache_config.mamba_ssm_cache_dtype,
