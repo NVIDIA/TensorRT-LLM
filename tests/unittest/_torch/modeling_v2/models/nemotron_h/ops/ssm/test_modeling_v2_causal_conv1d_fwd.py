@@ -10,6 +10,7 @@ import pytest
 import torch
 
 from tensorrt_llm._torch._experimental.modeling_v2.models.nemotron_h.ops.ssm.causal_conv1d_fwd import (  # noqa: E501
+    ULTRA_TEP8_SLOTS_256,
     ULTRA_TP4_SLOTS,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.nemotron_h.ops.ssm.causal_conv1d_fwd import (  # noqa: E501
@@ -17,7 +18,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.nemotron_h.ops.ssm.cau
 )
 
 # Cells sized at an engine pool get a non-vacuity check below.
-assert ULTRA_TP4_SLOTS == 35
+assert ULTRA_TP4_SLOTS == 35 and ULTRA_TEP8_SLOTS_256 == 271
 
 __extra_import_path__ = ["../../../.."]
 from _validating import certifying, validating  # noqa: E402,F401 — path above; fixture by name
@@ -171,7 +172,7 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — pytest res
         expected = _backing(args[3]).clone()
         _view_of(expected, args[3]).copy_(ref[1])
         assert torch.equal(_backing(pool), expected), "only this layer's named slots may move"
-    if cell.spec["pool_slots"] in (ULTRA_TP4_SLOTS,):
+    if cell.spec["pool_slots"] in (ULTRA_TP4_SLOTS, ULTRA_TEP8_SLOTS_256):
         # The whole-pool bitwise gate above already locks the unnamed slots;
         # this keeps it from being vacuous on the engine-sized pools.
         pad = cell.spec.get("pad_slot_id", PAD_SLOT_ID)

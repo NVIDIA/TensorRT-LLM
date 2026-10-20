@@ -102,6 +102,10 @@ class RmsNormGatedGrouped(OpWrapper):
             spec=dict(_TEP8_CALL_SITE, tokens=1),
         ),
         Cell(why="tep8 decode batch 32", spec=dict(_TEP8_CALL_SITE, tokens=32)),
+        Cell(
+            why="tep8 decode batch 256, the serving envelope's ceiling",
+            spec=dict(_TEP8_CALL_SITE, tokens=256),
+        ),
         Cell(why="tep8 prefill 4101 tokens", spec=dict(_TEP8_CALL_SITE, tokens=4101)),
         Cell(why="tep8 prefill at the 8192-token ceiling", spec=dict(_TEP8_CALL_SITE, tokens=8192)),
         Cell(
