@@ -143,7 +143,7 @@ def test_cutedsl_kernel_rejects_unusable_situ_betas(situ_beta, situ_linear_beta)
     against NaN is false, and an infinity is positive.
     """
     pytest.importorskip("cutlass")
-    from tensorrt_llm._torch.cute_dsl_kernels.blackwell.blockscaled_contiguous_gather_grouped_gemm_act_fusion import (  # noqa: E501
+    from tensorrt_llm._torch.moe.kernels.blackwell.blockscaled_contiguous_gather_grouped_gemm_act_fusion import (  # noqa: E501
         BlockScaledContiguousGatherGroupedGemmKernel,
     )
     from tensorrt_llm._torch.utils import ActivationType

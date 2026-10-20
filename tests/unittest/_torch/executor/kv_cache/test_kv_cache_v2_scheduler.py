@@ -2840,6 +2840,26 @@ class TestEncoder:
         )
         cross_mgr.kv_cache_map[ctx_req.py_request_id].resize.assert_called_once_with(80)
 
+    def test_cross_pool_reuse_is_scoped_by_cache_salt(self):
+        """Cross-KV blocks share the self pool's per-request salt namespace."""
+        self_mgr = make_kv_cache_manager()
+        cross_mgr = make_kv_cache_manager(enable_block_reuse=True)
+        sched = make_encoder_scheduler(
+            self_mgr, cross_kv_cache_manager=cross_mgr, max_num_tokens=1000
+        )
+        ctx_req = make_ctx_request(0, context_remaining_length=50, encoder_output_len=80)
+        ctx_req.cache_salt = "tenant-a"
+
+        out = sched.schedule_request([ctx_req], set())
+
+        assert ids(out.context_requests) == [0]
+        cross_mgr._create_kv_cache.assert_called_once_with(
+            ctx_req.py_request_id,
+            ctx_req.lora_task_id,
+            ctx_req.get_encoder_unique_tokens.return_value,
+            cache_salt="tenant-a",
+        )
+
     def test_later_context_chunk_reuses_cross_pool_without_resizing(self):
         """Later decoder chunks read existing cross-KV without reallocation."""
         self_mgr = make_kv_cache_manager()
@@ -2945,7 +2965,9 @@ class TestCrossKVAllocationFailures:
         ]
         retry_cache = cross_mgr.kv_cache_map[0]
         assert retry_cache is not failed_cache
-        cross_mgr._create_kv_cache.assert_any_call(0, blocked.lora_task_id, None)
+        cross_mgr._create_kv_cache.assert_any_call(
+            0, blocked.lora_task_id, None, cache_salt=blocked.cache_salt
+        )
         cross_mgr._resume_and_restore.assert_called_with(0, retry_cache)
         retry_cache.resize.assert_called_once_with(82)
         for manager in (self_mgr, cross_mgr):
