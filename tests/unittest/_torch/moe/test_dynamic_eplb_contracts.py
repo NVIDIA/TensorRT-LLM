@@ -173,6 +173,66 @@ def test_shared_slot_provider_pool_key_includes_complete_bundle():
     assert [pool.bundle for pool in FakePool.instances] == [first_bundle, second_bundle]
 
 
+def test_hierarchical_fused_submit_launches_bound_scheduler_and_copy():
+    source = _TORCH_ROOT / "moe/kernels/megamoe_scheduler/sami/hierarchical.py"
+    launches = []
+
+    def submit_fused(ctx, flags_mc, route_epoch, route_target, *scheduler_args):
+        launches.append((ctx, flags_mc, route_epoch, route_target, scheduler_args))
+
+    torch = SimpleNamespace(
+        cuda=SimpleNamespace(device=lambda _: nullcontext(), stream=lambda _: nullcontext()),
+        ops=SimpleNamespace(trtllm=SimpleNamespace(moe_rebalance_tma_submit_fused=submit_fused)),
+    )
+    ticket_cls = _extract_class(
+        source,
+        "HierarchicalCopyTicket",
+        None,
+        {"dataclass": dataclasses.dataclass, "field": dataclasses.field},
+    )
+    broadcast_cls = _extract_class(
+        source,
+        "HierarchicalSamiWeightBroadcast",
+        {"submit_fused", "_require_live_bank_reusable"},
+        {"torch": torch, "HierarchicalCopyTicket": ticket_cls},
+    )
+    outputs = object()
+    requests = []
+
+    def fused_submit_args(routes, stream_handle):
+        requests.append((routes, stream_handle))
+        return ("scheduler", routes)
+
+    broadcast = broadcast_cls.__new__(broadcast_cls)
+    broadcast._lock = nullcontext()
+    broadcast._handoff_aborted = False
+    broadcast._outputs = outputs
+    broadcast._scheduler = SimpleNamespace(fused_submit_args=fused_submit_args)
+    broadcast._reuse_authority = object()
+    broadcast._validate_reuse_authority = lambda authority: None
+    broadcast._active_generation = 0
+    broadcast._collective_safe_generation = 0
+    broadcast._generation = 1
+    broadcast._stream = 19
+    broadcast._stream_owner = object()
+    broadcast.device = 0
+    broadcast.ctx = "ctx"
+    broadcast.flags_mc = 4096
+    broadcast.terminal_flags = "terminals"
+
+    ticket = broadcast.submit_fused(outputs, "routes", "epoch", 8)
+
+    assert requests == [("routes", 19)]
+    assert launches == [("ctx", 4096, "epoch", 8, ("scheduler", "routes"))]
+    assert (ticket.generation, ticket.command_count) == (1, 1)
+    assert (broadcast._active_generation, broadcast._generation) == (1, 2)
+    # The bank stays leased until the consumer of generation 1 is proven done.
+    with pytest.raises(RuntimeError, match="still leased"):
+        broadcast.submit_fused(outputs, "routes", "epoch", 16)
+    with pytest.raises(RuntimeError, match="bound CUDA scheduler"):
+        broadcast.submit_fused(object(), "routes", "epoch", 16)
+
+
 @pytest.mark.parametrize(
     (
         "hidden",
@@ -1056,7 +1116,8 @@ def test_launch_queue_setup_sees_env_overrides_before_runtime_initialization(mon
     assert args.env_overrides == configured
 
 
-def test_direct_submit_orders_generations_and_defers_the_route_wait():
+@pytest.mark.parametrize("auxiliary_sms", [4, 8])
+def test_fused_submit_orders_generations_and_defers_the_route_wait(auxiliary_sms):
     trace = []
     state = SimpleNamespace(device=0, thread=7)
     main = SimpleNamespace(cuda_stream=44, priority=0)
@@ -1081,6 +1142,7 @@ def test_direct_submit_orders_generations_and_defers_the_route_wait():
         "_finished_generation",
         "_scheduled_generation",
         "_route_wait_generation",
+        "_route_target",
         "plan_calls",
     ):
         setattr(group, name, 0)
@@ -1092,12 +1154,15 @@ def test_direct_submit_orders_generations_and_defers_the_route_wait():
     group.device = 0
     group.topk = 6
     group.max_tokens_per_rank = 8192
+    group.auxiliary_sms = auxiliary_sms
     group.copy_stream = group.scheduler_stream = copy
     group._stream_handle = 19
     group._input_ready_handle = 1
-    group._plan_ready_handle = 2
     group._consumer_done_handle = 3
     group._consumer_done = SimpleNamespace(cuda_event=3)
+    route_epoch = object()
+    group._route_epoch = route_epoch
+    group._route_epoch_ptr = 77
 
     def driver_call(*entry):
         trace.append(entry)
@@ -1105,30 +1170,24 @@ def test_direct_submit_orders_generations_and_defers_the_route_wait():
 
     group._driver = SimpleNamespace(
         CUresult=SimpleNamespace(CUDA_SUCCESS=0),
+        CUstreamWaitValue_flags=SimpleNamespace(CU_STREAM_WAIT_VALUE_GEQ="geq"),
         cuEventRecord=lambda event, stream: driver_call("record", event, stream),
         cuStreamWaitEvent=lambda stream, event, flags: driver_call("wait", stream, event),
+        cuStreamWaitValue64=lambda stream, address, value, flags: driver_call(
+            "wait_value", stream, address, value, flags
+        ),
     )
     outputs = SimpleNamespace(physical_slot_ids=_Routes(8192, trace))
-    pending = False
 
-    def submit(routes, handle):
-        nonlocal pending
-        assert not pending and handle == 19
-        pending = True
-        trace.append(("HALO", routes.shape[0], id(routes)))
-        return outputs
-
-    def copy_submit(result):
-        nonlocal pending
-        assert pending and result is outputs
-        pending = False
+    def submit_fused(result, routes, epoch, target):
+        assert result is outputs and epoch is route_epoch
         generation = group._scheduled_generation
-        trace.append(("TMA", generation))
+        trace.append(("FUSED", routes.shape[0], target, generation))
         return SimpleNamespace(generation=generation)
 
-    group.scheduler = SimpleNamespace(device="cuda:0", submit=submit)
+    group.scheduler = SimpleNamespace(device="cuda:0", outputs=outputs)
     group.broadcaster = SimpleNamespace(
-        submit=copy_submit,
+        submit_fused=submit_fused,
         release_generation_after=lambda generation, event: trace.append(
             ("consumer_release", generation, event.cuda_event)
         ),
@@ -1139,18 +1198,25 @@ def test_direct_submit_orders_generations_and_defers_the_route_wait():
     for generation, rows in enumerate((16, 0), 1):
         trace.clear()
         routes = _Routes(rows, trace)
+        target = generation * auxiliary_sms
+        route_wait = ("wait_value", 44, 77, target, "geq")
         part = group.plan_schedule(routes)
         physical, actual_generation = group.plan_finish(part, defer_wait=True)
         assert physical.shape == (rows, 6)
         assert actual_generation == generation
-        assert not any(entry[0] == "wait" and entry[1:] == (44, 2) for entry in trace)
+        assert route_wait not in trace
         group.wait_for_routes()
         group.wait_for_routes()
         group.finish()
-        assert sum(entry == ("wait", 44, 2) for entry in trace) == 1
-        assert trace.index(("HALO", rows, id(routes))) < trace.index(("TMA", generation))
-        assert trace.index(("TMA", generation)) < trace.index(("wait", 44, 2))
+        assert trace.count(route_wait) == 1
+        assert trace.index(("wait", 19, 1)) < trace.index(("FUSED", rows, target, generation))
+        assert trace.index(("FUSED", rows, target, generation)) < trace.index(route_wait)
         assert trace[-2:] == [("record", 3, 44), ("consumer_release", generation, 3)]
+        if generation > 1:
+            # The previous consumer is proven reusable before the next launch.
+            assert trace.index(("lease", generation - 1)) < trace.index(
+                ("FUSED", rows, target, generation)
+            )
 
     # The bound-owner fast path still rejects another thread, stream or device.
     state.thread = 8
@@ -1174,7 +1240,7 @@ def test_direct_submit_orders_generations_and_defers_the_route_wait():
     group._driver.cuStreamWaitEvent = lambda *args: (17,)
     with pytest.raises(RuntimeError, match="cuStreamWaitEvent"):
         group.plan_schedule(_Routes(8, trace))
-    assert not any(entry[0] == "HALO" for entry in trace)
+    assert not any(entry[0] == "FUSED" for entry in trace)
     assert group._plan_part is None
 
 

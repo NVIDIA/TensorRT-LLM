@@ -478,9 +478,9 @@ class HierarchicalSamiWeightBroadcast:
                 if stream_device != scheduler_device:
                     raise ValueError("scheduler stream and output devices differ")
             bind = getattr(scheduler, "bind_gpu_direct", None)
-            release = getattr(scheduler, "release_plan_channel", None)
-            if not callable(bind) or not callable(release):
-                raise TypeError("scheduler lacks the copy handoff lifecycle")
+            fused_args = getattr(scheduler, "fused_submit_args", None)
+            if not callable(bind) or not callable(fused_args):
+                raise TypeError("scheduler lacks the fused copy launch lifecycle")
             workspace = getattr(scheduler, "plan_workspace", None)
             status = getattr(scheduler, "status", None)
             grid_sync = getattr(scheduler, "grid_sync", None)
@@ -616,15 +616,15 @@ class HierarchicalSamiWeightBroadcast:
                 "single live bank is still leased by the previous generation"
             )
 
-    def submit(
-        self,
-        outputs: object,
-        *,
-        start_event: object | None = None,
-        end_event: object | None = None,
-        payload_end_event: object | None = None,
+    def submit_fused(
+        self, outputs: object, routes: torch.Tensor, route_epoch: torch.Tensor, route_target: int
     ) -> HierarchicalCopyTicket:
-        """Enqueue the fused GPU-direct TMA copy and READY publication."""
+        """Enqueue the bound scheduler and this GPU-direct copy as one kernel.
+
+        Each scheduler CTA adds one to ``route_epoch`` once its routes are
+        written, which makes it reach ``route_target``; the copy and its READY
+        publication follow in the same CTAs.
+        """
 
         with self._lock:
             if self._handoff_aborted:
@@ -635,31 +635,22 @@ class HierarchicalSamiWeightBroadcast:
                 raise RuntimeError("outputs are not from the bound CUDA scheduler")
             self._require_live_bank_reusable()
             try:
+                scheduler_args = self._scheduler.fused_submit_args(routes, self._stream)
                 state = enter_cuda_stream(self._stream_owner)
                 try:
-                    if start_event is not None:
-                        start_event.record()
-                    commands = int(
-                        torch.ops.trtllm.moe_rebalance_tma_submit_gpu_direct(
-                            self.ctx, self.flags_mc
-                        )
+                    torch.ops.trtllm.moe_rebalance_tma_submit_fused(
+                        self.ctx, self.flags_mc, route_epoch, route_target, *scheduler_args
                     )
-                    if payload_end_event is not None:
-                        payload_end_event.record()
-                    if end_event is not None:
-                        end_event.record()
                 finally:
                     exit_cuda_stream(state)
                 self._active_generation = self._generation
-                release = getattr(self._scheduler, "release_plan_channel")
-                release()
             except BaseException:
                 self._handoff_aborted = True
                 raise
             ticket = HierarchicalCopyTicket(
                 generation=self._generation,
                 terminal_flags=self.terminal_flags,
-                command_count=commands + 1,
+                command_count=1,
             )
             self._generation += 1
             return ticket

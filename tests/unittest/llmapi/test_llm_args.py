@@ -326,21 +326,18 @@ class TestMoeConfigPerLayerDynamicEplb:
         with pytest.raises(ValidationError, match=field):
             MoeConfig(load_balancer=values)
 
-    def test_per_layer_dynamic_requires_eight_auxiliary_sms(self) -> None:
+    @pytest.mark.parametrize("auxiliary_sms", [1, 4])
+    def test_per_layer_dynamic_accepts_smaller_auxiliary_sm_budget(
+            self, auxiliary_sms: int) -> None:
         values = self._per_layer_dynamic()
-        values["auxiliary_sms"] = 7
-        with pytest.raises(ValidationError, match="auxiliary_sms"):
-            MoeConfig(load_balancer=values)
-
-    def test_per_layer_dynamic_accepts_larger_auxiliary_sm_budget(self) -> None:
-        values = self._per_layer_dynamic()
-        values["auxiliary_sms"] = 12
+        values["auxiliary_sms"] = auxiliary_sms
         config = MoeConfig(load_balancer=values)
-        assert config.load_balancer.auxiliary_sms == 12
+        assert config.load_balancer.auxiliary_sms == auxiliary_sms
 
-    def test_per_layer_dynamic_rejects_more_than_halo_q_cta_limit(self) -> None:
+    def test_per_layer_dynamic_rejects_more_than_fused_copy_sm_limit(
+            self) -> None:
         values = self._per_layer_dynamic()
-        values["auxiliary_sms"] = 129
+        values["auxiliary_sms"] = 9
         with pytest.raises(ValidationError, match="auxiliary_sms"):
             MoeConfig(load_balancer=values)
 

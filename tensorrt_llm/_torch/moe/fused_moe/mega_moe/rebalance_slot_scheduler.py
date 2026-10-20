@@ -3,14 +3,16 @@
 """Single-main-thread HALO-Q and in-switch TMA weight-copy integration.
 
 One highest-priority stream is shared across layers. plan_schedule() enqueues
-HALO-Q, records route completion, and enqueues TMA copy before returning to the
-shared-expert hook. plan_finish() can lend routes before the route event;
-the first route consumer calls wait_for_routes(). MegaMoE's
-system-acquire READY gate protects helper reads while TMA finishes concurrently.
+one kernel that runs HALO-Q and then the TMA copy of its plan on the auxiliary
+SMs, before returning to the shared-expert hook. Each CTA of that kernel raises
+a device route epoch once its routes are written. plan_finish() can lend routes
+before they exist; the first route consumer calls wait_for_routes(), a stream
+memory wait on that epoch that holds no SM. MegaMoE's system-acquire READY gate
+protects helper reads while the copy finishes concurrently.
 
 For each rank and generation g:
     MAIN: MegaMoE(g) -> consumer_done(g)
-    COPY: wait consumer_done(g) -> HALO-Q(g+1) EP exchange -> TMA(g+1)
+    COPY: wait consumer_done(g) -> [HALO-Q(g+1) EP exchange -> TMA(g+1)]
 All ranks enter the bounded EP exchange after their own previous consumer, so no
 next-generation overwrite can precede any previous-generation consumer. No host
 collective or auxiliary copy submitter is needed in the serving path.
@@ -27,18 +29,15 @@ from tensorrt_llm.logger import logger
 
 __all__ = ["RebalanceSlotSchedulerGroup", "build_rebalance_slot_scheduler_group"]
 
-# Shared-expert persistent grids use the same capacity hint as the copy grid.
-TMA_COPY_SM_COUNT = 8
-
 
 class _LiveBankLeaseProvider:
     """Authorize ordered reuse, not a claim of completed GPU work on the host.
 
     release_generation_after() enqueues the local consumer wait on COPY.
-    prove() is legal only after the next HALO-Q launch on that same stream.
-    Its all-rank count exchange is bounded and precedes plan publication; TMA
-    waits for that publication and executes after HALO-Q. Therefore a delayed
-    peer consumer blocks every rank's overwrite without a host-side barrier.
+    prove() is legal right before the next fused HALO-Q + TMA launch on that
+    same stream. The launch's bounded all-rank count exchange precedes its plan,
+    and its copy follows the plan in the same CTAs. Therefore a delayed peer
+    consumer blocks every rank's overwrite without a host-side barrier.
     """
 
     collective_safe = True
@@ -109,10 +108,6 @@ class RebalanceSlotSchedulerGroup:
         self.topk = int(topk)
         self.max_tokens_per_rank = int(max_tokens_per_rank)
         self.auxiliary_sms = int(auxiliary_sms)
-        if self.auxiliary_sms < TMA_COPY_SM_COUNT:
-            raise ValueError(
-                f"auxiliary_sms must be at least {TMA_COPY_SM_COUNT}; got {self.auxiliary_sms}"
-            )
         if copy_stream.device.index != self.device:
             raise ValueError("copy stream device does not match scheduler device")
         self.arena = arena
@@ -143,8 +138,8 @@ class RebalanceSlotSchedulerGroup:
 
         logical_expert_count = self.home_experts * ep_size
 
-        # Use the EP rank, not the CUDA ordinal. HALO-Q shares the configured
-        # copy-stream launch budget with TMA.
+        # Use the EP rank, not the CUDA ordinal. HALO-Q and the TMA copy run in
+        # the same CTAs, one per auxiliary SM.
         cfg = CudaSchedulerConfig(
             ep_size=ep_size,
             logical_expert_count=logical_expert_count,
@@ -164,16 +159,28 @@ class RebalanceSlotSchedulerGroup:
         self._stream_handle = int(self.copy_stream.cuda_stream)
         self._driver = driver
         self._input_ready = torch.cuda.Event()
-        self._plan_ready = torch.cuda.Event()
         self._consumer_done = torch.cuda.Event()
         # Materialize each lazily created event once. The steady path uses its
         # cached driver handle, without per-plan stream guards or allocation.
         with torch.cuda.device(self.device):
-            for event in (self._input_ready, self._plan_ready, self._consumer_done):
+            for event in (self._input_ready, self._consumer_done):
                 event.record(self.copy_stream)
         self._input_ready_handle = int(self._input_ready.cuda_event)
-        self._plan_ready_handle = int(self._plan_ready.cuda_event)
         self._consumer_done_handle = int(self._consumer_done.cuda_event)
+        error, cu_device = driver.cuDeviceGet(self.device)
+        supported = 0
+        if error == driver.CUresult.CUDA_SUCCESS:
+            error, supported = driver.cuDeviceGetAttribute(
+                driver.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_CAN_USE_64_BIT_STREAM_MEM_OPS,
+                cu_device,
+            )
+        if error != driver.CUresult.CUDA_SUCCESS or not supported:
+            raise RuntimeError("MoE rebalance requires 64-bit CUDA stream memory operations")
+        # CTAs of the fused launches whose routes are written, and its value
+        # after the latest launch. Only those launches change it.
+        self._route_epoch = torch.zeros(1, dtype=torch.int64, device=f"cuda:{self.device}")
+        self._route_epoch_ptr = int(self._route_epoch.data_ptr())
+        self._route_target = 0
 
         # Every peer address must be connected before either warmup or submit;
         # HALO-Q performs an all-rank exchange on the COPY stream.
@@ -210,7 +217,7 @@ class RebalanceSlotSchedulerGroup:
             helper_count=self.helper_slots,
             global_expert_count=logical_expert_count,
             arena_provider=arena.provider,
-            tma_sm_count=TMA_COPY_SM_COUNT,
+            tma_sm_count=self.auxiliary_sms,
             tma_warps=7,
             tma_route="plan",
         )
@@ -320,6 +327,16 @@ class RebalanceSlotSchedulerGroup:
         if error != self._driver.CUresult.CUDA_SUCCESS:
             raise RuntimeError(f"cuStreamWaitEvent(rebalance) failed: {error!r}")
 
+    def _wait_route_epoch(self, stream_handle: int) -> None:
+        (error,) = self._driver.cuStreamWaitValue64(
+            stream_handle,
+            self._route_epoch_ptr,
+            self._route_target,
+            self._driver.CUstreamWaitValue_flags.CU_STREAM_WAIT_VALUE_GEQ,
+        )
+        if error != self._driver.CUresult.CUDA_SUCCESS:
+            raise RuntimeError(f"cuStreamWaitValue64(rebalance) failed: {error!r}")
+
     def plan_schedule(self, logical_expert_ids: torch.Tensor) -> Tuple[Any, int]:
         """Submit contiguous CUDA int32 routes [tokens, topk] without staging.
 
@@ -348,23 +365,22 @@ class RebalanceSlotSchedulerGroup:
         logical_expert_ids.record_stream(self.copy_stream)
         self._record_event(self._input_ready_handle, self._execution_stream_handle)
         self._wait_event(self._stream_handle, self._input_ready_handle)
-        outputs = self.scheduler.submit(logical_expert_ids, self._stream_handle)
+        outputs = self.scheduler.outputs
         self._scheduled_generation = self._generation + 1
-        self._record_event(self._plan_ready_handle, self._stream_handle)
-        part = (outputs, num_tokens)
-        self._plan_part = part
         if self._pending_release is not None:
             self.lease.prove(self._pending_release[0])
             self._pending_release = None
-        self._submit_copy(outputs)
-        return part
-
-    def _submit_copy(self, outputs: object) -> None:
-        """Consume the HALO-Q plan and enqueue its TMA kernel on COPY."""
-        ticket = self.broadcaster.submit(outputs)
+        route_target = self._route_target + self.auxiliary_sms
+        ticket = self.broadcaster.submit_fused(
+            outputs, logical_expert_ids, self._route_epoch, route_target
+        )
         if int(ticket.generation) != self._scheduled_generation:
             raise RuntimeError("TMA and HALO-Q generation mismatch")
+        self._route_target = route_target
         self._generation = int(ticket.generation)
+        part = (outputs, num_tokens)
+        self._plan_part = part
+        return part
 
     def plan_finish(
         self, part: Tuple[Any, int], *, defer_wait: bool = False
@@ -387,7 +403,7 @@ class RebalanceSlotSchedulerGroup:
         if self._generation <= 0:
             raise RuntimeError("No scheduler generation is available")
         if self._route_wait_generation != self._generation:
-            self._wait_event(self._execution_stream_handle, self._plan_ready_handle)
+            self._wait_route_epoch(self._execution_stream_handle)
             self._route_wait_generation = self._generation
 
     def plan(

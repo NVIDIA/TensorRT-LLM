@@ -872,9 +872,11 @@ set wrong has a test that catches it:
   validation and CUDA initialization/device probes, and propagates it to MPI,
   direct, and Ray workers. Applications that initialize CUDA before TensorRT-LLM
   must set it at process startup.
-- HALO-Q and the in-switch TMA copy run on the higher-priority copy stream.
-  The main stream may enqueue shared-expert work and input quantization before
-  it waits for the plan at the first routed-expert use. A single CPU submitter
+- HALO-Q and the in-switch TMA copy run as one kernel on the higher-priority
+  copy stream, one CTA per auxiliary SM. Each CTA raises a device route epoch
+  once its routes are written. The main stream may enqueue shared-expert work
+  and input quantization before its first routed-expert use, where a stream
+  memory wait on that epoch orders it after the routes. A single CPU submitter
   owns both streams; the path does not require a CUDA green context or a
   steady-state host wait.
 - HALO-Q and TMA follow the native-operator path under

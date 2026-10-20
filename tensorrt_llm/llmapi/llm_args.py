@@ -1957,10 +1957,10 @@ class MoePerLayerDynamicLoadBalancerConfig(_MoeLoadBalancerConfigBase):
         status="prototype")
     auxiliary_sms: int = Field(
         default=8,
-        ge=8,
-        le=128,
+        ge=1,
+        le=8,
         description=
-        "Number of SMs that the routed-input quantization and shared-expert FC12 kernels leave free for the HALO-Q scheduler and the in-switch copy kernel, which run one after the other on the copy stream. Must be smaller than the device SM count.",
+        "Number of SMs that the routed-input quantization and shared-expert FC12 kernels leave free for the kernel that runs the HALO-Q scheduler and then the in-switch copy of its plan on the copy stream, one CTA per SM. Must be smaller than the device SM count.",
         status="prototype")
 
     def validate_expert_capacity(self, num_experts: int) -> None:

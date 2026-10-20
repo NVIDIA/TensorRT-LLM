@@ -209,12 +209,12 @@ def test_branch_snapshot_field_types(
     [
         ({"num_slots": 288}, True),
         ({"mode": "standard", "num_slots": 288, "layer_updates_per_iter": 1}, True),
-        ({"mode": "per_layer_dynamic", "num_slots": 320, "auxiliary_sms": 16}, True),
+        ({"mode": "per_layer_dynamic", "num_slots": 320, "auxiliary_sms": 4}, True),
         # A mapping without mode is standard EPLB, which has no auxiliary_sms.
-        ({"num_slots": 320, "auxiliary_sms": 16}, False),
+        ({"num_slots": 320, "auxiliary_sms": 4}, False),
         ({"mode": "per_layer_dynamic"}, False),
         ({"mode": "per_layer_dynamic", "num_slots": 320, "layer_updates_per_iter": 1}, False),
-        ({"mode": "per_layer_dynamic", "num_slots": 320, "auxiliary_sms": 4}, False),
+        ({"mode": "per_layer_dynamic", "num_slots": 320, "auxiliary_sms": 9}, False),
         ({"mode": "dynamic", "num_slots": 320}, False),
     ],
 )

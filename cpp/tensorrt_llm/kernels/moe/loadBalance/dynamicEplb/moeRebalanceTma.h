@@ -183,12 +183,11 @@ extern "C"
      * Submit is stream-ordered and does not read or wait for plan data on the CPU.
      * All bound tensors must remain alive and only be reused on the same stream
      * after the copy kernel has read them. The Python endpoint enforces this lease.
+     * Binding also loads the fused scheduler + copy kernel.
      */
     int megamoe_tma_copy_configure_gpu_plan(MegamoeTmaCopyState* state, MegamoeTmaGpuPlanConfig const* config);
     int megamoe_tma_copy_bind_gpu_direct(MegamoeTmaCopyState* state, uint64_t ids, uint64_t levels, uint64_t owners,
         uint64_t workspace, uint64_t status, uint64_t grid_sync, int capacity);
-    int megamoe_tma_copy_submit_gpu_direct(
-        MegamoeTmaCopyState* state, uint64_t flag_mc, uint64_t generation, void* cuda_stream);
     /* Explicit diagnostic only: synchronizes last work and copies one small result. */
     int megamoe_tma_copy_gpu_plan_result(MegamoeTmaCopyState* state, MegamoeTmaGpuPlanResult* result);
     /* Nulls *state once ownership is consumed. If device activation fails before
@@ -199,5 +198,20 @@ extern "C"
 
 #ifdef __cplusplus
 }
+
+#include "tensorrt_llm/kernels/moe/loadBalance/dynamicEplb/moeRebalanceHaloQ.h"
+
+/* Launches HALO-Q and the GPU-direct copy of its plan as one kernel of config.sms
+ * CTAs. scheduler must pass checkMoeRebalanceHaloQParams, use config.sms CTAs and
+ * no plan channel, and write the outputs bound by megamoe_tma_copy_bind_gpu_direct.
+ * route_epoch is a caller-owned uint64 that only fused launches change: each CTA
+ * adds one with a system-scope release once its routes are written, and
+ * route_target is its value after this launch. A cuStreamWaitValue64 (GEQ
+ * route_target) on another stream orders that stream after the routes. READY is
+ * published as by the copy alone.
+ */
+int megamoe_tma_copy_submit_fused(MegamoeTmaCopyState* state,
+    tensorrt_llm::kernels::MoeRebalanceHaloQParams const& scheduler, uint64_t* route_epoch, uint64_t route_target,
+    uint64_t flag_mc, uint64_t generation, void* cuda_stream);
 #endif
 #endif

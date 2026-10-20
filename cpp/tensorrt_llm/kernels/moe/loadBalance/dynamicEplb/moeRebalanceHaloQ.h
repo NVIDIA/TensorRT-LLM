@@ -58,6 +58,9 @@ struct MoeRebalanceHaloQParams
     int validRouteCount;
 };
 
+// Throws unless params describe a valid scheduler launch.
+void checkMoeRebalanceHaloQParams(MoeRebalanceHaloQParams const& params);
+
 void invokeMoeRebalanceHaloQ(MoeRebalanceHaloQParams const& params, cudaStream_t stream);
 
 } // namespace kernels
