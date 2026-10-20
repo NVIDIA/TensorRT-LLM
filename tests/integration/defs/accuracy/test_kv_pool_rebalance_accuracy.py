@@ -39,8 +39,10 @@ from ..conftest import llm_models_root, skip_pre_hopper
 # Tokens every in-flight request must have generated before the forced
 # rebalance fires.  Late enough that adjust() migrates live KV for requests
 # that are mid-decode, early enough that most of each output is decoded
-# after it.
-_REBALANCE_AFTER_TOKENS = 8
+# after it.  Also well ahead of prompt 1's known near-tie at token 10 (see
+# _NEAR_TIE_LOGPROB_MARGIN), so a flip there always lands after the rebalance
+# step, even when the overlap scheduler delays the rebalance by a token or two.
+_REBALANCE_AFTER_TOKENS = 4
 
 
 def _arm_mid_generation_rebalance(llm: LLM, *, skew: float = 2.0) -> list[dict[int, int]]:
