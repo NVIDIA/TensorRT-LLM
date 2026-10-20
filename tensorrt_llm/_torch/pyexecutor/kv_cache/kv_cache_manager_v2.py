@@ -1224,6 +1224,8 @@ def _spec_recompute_claim_limit(
 
 
 class KVCacheManagerV2(BaseResourceManager):
+    # Leading tokens every sliding-window layer keeps live; set by the constructor.
+    _num_sink_tokens: int = 0
     # Sparse managers attach a metadata batch during initialization.
     sparse_metadata_batch: Batch | None = None
     # Filled lazily by _cold_pool_group_membership(); the grouping is fixed after construction.
@@ -1290,10 +1292,15 @@ class KVCacheManagerV2(BaseResourceManager):
         cold_page_codec_provider: Optional[object] = None,
         joint_kv_cache_reuse: bool = False,
         max_cuda_graph_batch_size: Optional[int] = None,
+        num_sink_tokens: int = 0,
         **kwargs,
     ) -> None:
         self.mapping = mapping
         self.dtype = dtype
+        # Leading tokens every sliding-window layer keeps live however far the window has
+        # moved on. Eviction stays whole-page, so the page holding the last sink token
+        # stays resident.
+        self._num_sink_tokens = num_sink_tokens
         self._validate_speculative_config(spec_config)
         self.is_disagg = is_disagg
         self.kv_connector_manager = kv_connector_manager
@@ -3002,7 +3009,7 @@ class KVCacheManagerV2(BaseResourceManager):
                     layer_id=layer_id,
                     buffers=buffers,
                     sliding_window_size=self.max_attention_window_vec[layer_id],
-                    num_sink_tokens=None,
+                    num_sink_tokens=self._num_sink_tokens or None,
                 )
             )
 
@@ -5753,19 +5760,25 @@ class KVCacheManagerV2(BaseResourceManager):
         # both leak and let a recycled page skip its fill.
         self._fresh_pages_filled.pop(request.py_request_id, None)
         self._disagg_receive_ready.pop(request.py_request_id, None)
-        kv_cache = self.kv_cache_map.pop(request.py_request_id, None)
+        self._remove_kv_cache(request.py_request_id)
+
+    def _remove_kv_cache(self, request_id: int) -> None:
+        """Forget a sequence made by `_create_kv_cache`: drop it from the map, close it,
+        clear its stats exclusion and free its index slot. Calling this again for the same
+        id does nothing."""
+        kv_cache = self.kv_cache_map.pop(request_id, None)
         if kv_cache is None:
-            self.impl.clear_stats_excluded(request.py_request_id)
+            self.impl.clear_stats_excluded(request_id)
             return
         kv_cache.discard_pending_stats()
         if self._sharing is not None:
-            self._sharing._on_free(request.py_request_id, kv_cache)
+            self._sharing._on_free(request_id, kv_cache)
         kv_cache.close()
-        self.impl.clear_stats_excluded(request.py_request_id)
-        if request.py_request_id in self._early_freed_index_requests:
-            self._early_freed_index_requests.discard(request.py_request_id)
+        self.impl.clear_stats_excluded(request_id)
+        if request_id in self._early_freed_index_requests:
+            self._early_freed_index_requests.discard(request_id)
         else:
-            self.index_mapper.remove_sequence(request.py_request_id)
+            self.index_mapper.remove_sequence(request_id)
 
     def _after_shrink(self, request_id: int, kv_cache: _KVCache) -> None:
         """Tell the lender, if one is attached, that ``kv_cache`` may have shrunk in place: blocks
