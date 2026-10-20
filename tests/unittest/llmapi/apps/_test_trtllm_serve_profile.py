@@ -101,7 +101,7 @@ def test_start_profile_backend_error_returns_500(server_with_mock_generator):
     # A RuntimeError whose message contains neither "already in progress"
     # nor "pending" is treated as a generic backend failure (500). The
     # backend-side rejection that produces those messages is covered by
-    # tests/unittest/_torch/executor/test_profile_endpoints.py; the
+    # tests/unittest/_torch/pyexecutor/test_profile_endpoints.py; the
     # HTTP-side 409 mapping is covered below.
     server.generator.start_profile.side_effect = RuntimeError("boom")
     response = asyncio.run(server.start_profile(StartProfileRequest()))

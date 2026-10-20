@@ -114,7 +114,7 @@ When a top-level profiled function shows >80% time in a single sub-call, drill d
 
 | Modified File | Primary Test File | Key Tests |
 |---|---|---|
-| `model_engine.py` | `tests/unittest/_torch/executor/test_pytorch_model_engine.py` | `test_position_id_preparation`, `test_pad_generation_requests`, `test_warmup` |
-| `sampler.py` | `tests/unittest/_torch/executor/test_sampler.py` | Sampler-related tests |
-| `py_executor.py` | `tests/unittest/_torch/executor/test_py_executor.py` | Executor loop tests |
-| `resource_manager.py` | `tests/unittest/_torch/executor/test_resource_manager.py` | KV cache tests |
+| `model_engine.py` | `tests/unittest/_torch/pyexecutor/test_pytorch_model_engine.py` | `test_position_id_preparation`, `test_pad_generation_requests`, `test_warmup` |
+| `sampler.py` | `tests/unittest/_torch/pyexecutor/test_sampler.py` | Sampler-related tests |
+| `py_executor.py` | `tests/unittest/_torch/pyexecutor/test_py_executor.py` | Executor loop tests |
+| `resource_manager.py` | `tests/unittest/_torch/pyexecutor/test_resource_manager.py` | KV cache tests |

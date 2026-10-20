@@ -302,7 +302,7 @@ class TestValidPageSlots(unittest.TestCase):
         self.assertEqual(list(valid_page_slots([])), [])
 
 
-# The classes below call `torch.cuda.init()`. `unittest/_torch/executor` is
+# The classes below call `torch.cuda.init()`. `unittest/_torch/pyexecutor` is
 # listed in the GPU-less l0_cpu stage, so the requirement is declared rather
 # than left to fail there. It is per class, not module-level: the arithmetic
 # and filter tests above are pure Python and must keep running.
