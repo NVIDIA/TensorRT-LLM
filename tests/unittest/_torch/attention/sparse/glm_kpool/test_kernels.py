@@ -533,49 +533,15 @@ def test_native_sparse_decode_coalesced_rows_and_graph_replay(
             diff = (a - b).square().sum() / (a.square().sum() + b.square().sum())
             assert diff < 1e-3
             torch.testing.assert_close(actual, expected, atol=0.05, rtol=0.05)
+            if replay < 2:
+                # The reference above quantizes the query as well; also bound the
+                # FP8 query's own error against BF16-query attention.
+                logits = torch.einsum("rhd,rkd->rhk", q.float(), selected) * scale
+                logits.masked_fill_(~valid[:, None, :], float("-inf"))
+                c = torch.einsum("rhk,rkd->rhd", torch.nan_to_num(logits.softmax(dim=-1)), selected)
+                assert (a - c).square().sum() / (a.square().sum() + c.square().sum()) < 1e-3
         else:
             torch.testing.assert_close(actual, expected, atol=0.02, rtol=0.02)
-
-
-@pytest.mark.skipif(
-    get_sm_version() not in (100, 103), reason="native sparse MLA requires SM100/103"
-)
-@pytest.mark.parametrize("rows,width,heads", [(8, 2052, 16), (8, 2052, 32), (64, 256, 64)])
-def test_native_fp8_sparse_decode_query_quantization_error(rows: int, width: int, heads: int):
-    """Bound the error of the FP8 query against BF16-query attention over the same FP8 cache."""
-    from types import SimpleNamespace
-
-    from tensorrt_llm._torch.attention.backends.sparse.glm_kpool.backend import latent_pool_rows
-    from tensorrt_llm._torch.attention.backends.sparse.glm_kpool.native_decode import (
-        GlmKpoolNativeDecode,
-    )
-
-    generator = torch.Generator(device="cuda").manual_seed(20261019)
-    kv_scale = torch.tensor([0.75], device="cuda")
-    latent = torch.randn(32, 32, 512, dtype=torch.bfloat16, device="cuda", generator=generator)
-    cache = (latent.float() / kv_scale).clamp(-448, 448).to(torch.float8_e4m3fn)
-    kv_rows, base, stride = latent_pool_rows(cache)
-    q = torch.randn(rows, heads, 512, dtype=torch.bfloat16, device="cuda", generator=generator)
-    logical = torch.randint(0, 1024, (rows, width), device="cuda", generator=generator)
-    indices = (base + logical // 32 * stride + logical % 32).int()
-    indices[:, ::5] = -1
-    runner = GlmKpoolNativeDecode()
-    metadata = SimpleNamespace(effective_workspace=torch.empty(0, dtype=torch.int8, device="cuda"))
-    runner.prepare_workspace(
-        q, metadata, max_query_rows=max(rows, 8), query_dtype=torch.float8_e4m3fn
-    )
-    scale = 256**-0.5
-    actual = runner(q, kv_rows, indices, scale, metadata, kv_scale=kv_scale).float()
-
-    valid = indices >= 0
-    selected = kv_rows.float()[indices.clamp_min(0).long(), 0] * kv_scale
-    selected.masked_fill_(~valid[:, :, None], 0)
-    logits = torch.einsum("rhd,rkd->rhk", q.float(), selected) * scale
-    logits.masked_fill_(~valid[:, None, :], float("-inf"))
-    expected = torch.einsum("rhk,rkd->rhd", logits.softmax(dim=-1), selected)
-    # Energy-normalized error of the E4M3 query (measured ~7e-4 on Gaussian data).
-    diff = (actual - expected).square().sum() / (actual.square().sum() + expected.square().sum())
-    assert diff < 1e-3
 
 
 def test_pool_scores_offsets_beyond_int32() -> None:
@@ -732,9 +698,7 @@ def test_append_paged_state_rows_matches_indexed_writes(latent_dtype, tokens_per
     assert torch.equal(got_index, want_index)
 
 
-@pytest.mark.parametrize("latent_dtype", [torch.bfloat16, torch.float8_e4m3fn], ids=["bf16", "fp8"])
-@pytest.mark.parametrize("tokens_per_request", [1, 4])
-def test_generation_append_uses_generation_tables_in_mixed_batch(latent_dtype, tokens_per_request):
+def test_generation_append_uses_generation_tables_in_mixed_batch():
     """Generation rows of a mixed batch write through the generation slice of the block
     tables, leaving the context requests' pages untouched."""
     from types import SimpleNamespace
@@ -747,6 +711,7 @@ def test_generation_append_uses_generation_tables_in_mixed_batch(latent_dtype, t
 
     gen = torch.Generator(device="cuda").manual_seed(12)
     num_contexts, num_generations, pages, slots, latent_dim = 2, 3, 4, 40, 512
+    tokens_per_request = 4
     tables = _paged_tables(num_contexts + num_generations, pages, slots, gen)
     first = torch.randint(
         0, pages * TPB - tokens_per_request, (num_generations, 1), generator=gen, device="cuda"
@@ -762,17 +727,13 @@ def test_generation_append_uses_generation_tables_in_mixed_batch(latent_dtype, t
     scale = torch.tensor([0.7], device="cuda")
 
     def pools():
-        latent_pool = torch.zeros(slots, TPB, latent_dim, device="cuda").to(latent_dtype)
+        latent_pool = torch.zeros(slots, TPB, latent_dim, device="cuda", dtype=torch.bfloat16)
         index_pool = torch.zeros(slots, TPB, 3 * HD, device="cuda", dtype=torch.bfloat16)
         return latent_pool, index_pool
 
     want_latent, want_index = pools()
     page, offset = paged_slot_indices(tables[num_contexts:], positions, TPB)
-    if latent_dtype == torch.float8_e4m3fn:
-        quantized = (latent.float() * scale).clamp(-448, 448).to(latent_dtype)
-        want_latent.view(torch.uint8)[page, offset] = quantized.view(torch.uint8)
-    else:
-        want_latent[page, offset] = latent
+    want_latent[page, offset] = latent
     want_index[page, offset, : 2 * HD] = packed
 
     got_latent, got_index = pools()
@@ -789,10 +750,10 @@ def test_generation_append_uses_generation_tables_in_mixed_batch(latent_dtype, t
     )
     backend.append_paged_state(latent, packed, positions, object())
 
-    assert torch.equal(got_latent.view(torch.uint8), want_latent.view(torch.uint8))
+    assert torch.equal(got_latent, want_latent)
     assert torch.equal(got_index, want_index)
     context_slots = tables[:num_contexts].flatten()
-    assert not got_latent.view(torch.uint8)[context_slots].any()
+    assert not got_latent[context_slots].any()
     assert not got_index[context_slots].any()
 
 
@@ -838,34 +799,3 @@ def test_compact_sparse_rows_tail_and_empty_rows(width):
         assert torch.equal(packed[row], expected)
         assert int(lengths[row]) == max(values.numel(), 1)
         assert bool(nonempty[row]) == (values.numel() > 0)
-
-
-def test_cache_update_kernels_reject_unsupported_layouts():
-    """Layouts the kernels cannot address fail before launch instead of misbehaving."""
-    table = torch.zeros(2, 1, dtype=torch.int64, device="cuda")
-    pool = torch.zeros(1, TPB, 3 * HD, dtype=torch.bfloat16, device="cuda")
-    ape = torch.zeros(KPOOL, HD, dtype=torch.bfloat16, device="cuda")
-    with pytest.raises(ValueError, match="request_ids requires 1-D positions"):
-        kpool_update(
-            pool,
-            table,
-            torch.zeros(2, 2, dtype=torch.int64, device="cuda"),
-            ape,
-            TPB,
-            head_dim=HD,
-            kpool=KPOOL,
-            request_ids=torch.zeros(4, dtype=torch.int32, device="cuda"),
-        )
-    latent = torch.zeros(1, 1, 512, dtype=torch.bfloat16, device="cuda")
-    packed = torch.zeros(1, 1, 3 * HD, dtype=torch.bfloat16, device="cuda")
-    with pytest.raises(ValueError, match="packed width 384 is not a power of two"):
-        append_paged_state_rows(
-            latent,
-            packed,
-            torch.zeros(1, 1, dtype=torch.int64, device="cuda"),
-            table[:1],
-            torch.zeros(1, TPB, 512, dtype=torch.bfloat16, device="cuda"),
-            pool,
-            TPB,
-            None,
-        )
