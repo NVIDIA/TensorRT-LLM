@@ -5265,6 +5265,7 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
 
     @model_validator(mode='after')
     def validate_mixed_precision_retention(self) -> 'KvCacheConfig':
+        """A mixed-precision cache must retain at least one token per sequence."""
         if (self.mixed_precision_dtypes is not None
                 and self.first_n == self.last_n == 0):
             raise ValueError(
@@ -7006,6 +7007,7 @@ class TorchLlmArgs(BaseLlmArgs):
 
     @model_validator(mode="after")
     def validate_mixed_precision_kv(self) -> 'TorchLlmArgs':
+        """Reject runtime features the mixed-precision KV cache does not support."""
         if self.kv_cache_config.mixed_precision_dtypes is None:
             return self
         if self.kv_cache_config.use_kv_cache_manager_v2 is not True:

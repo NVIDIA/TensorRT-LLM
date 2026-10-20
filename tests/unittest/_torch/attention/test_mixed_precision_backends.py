@@ -604,6 +604,16 @@ def test_mixed_precision_paged_conversion(dtype, width, layout):
 
 
 @pytest.mark.cpu_only
+def test_conversion_kernel_imports_pinned_flashinfer_symbols():
+    """The kernel relies on internal FlashInfer modules; a bump that drops them fails here."""
+    import importlib
+
+    module = importlib.import_module("tensorrt_llm._torch.cute_dsl_kernels.mixed_precision_kv")
+    assert callable(module.convert_mixed_precision_kv)
+    assert module.get_mixed_precision_kv_row_bytes(DataType.NVFP4, 128) == 72
+
+
+@pytest.mark.cpu_only
 def test_mixed_precision_public_options():
     from pydantic import ValidationError
 

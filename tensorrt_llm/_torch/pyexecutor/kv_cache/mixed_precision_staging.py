@@ -93,6 +93,7 @@ class MixedPrecisionKVStaging:
         self.page_tables: Dict[int, torch.Tensor] = {}
         self.lengths: Optional[torch.Tensor] = None
         self.max_new_tokens_per_request = 0
+        self.read_capacity = 0
 
     def update(
         self,
@@ -136,6 +137,11 @@ class MixedPrecisionKVStaging:
             non_blocking=True,
         )
         self.max_new_tokens_per_request = max(seq_lens, default=0)
+        # A captured graph bakes the launch geometry in, so it converts the full
+        # span; eager batches only convert up to their longest sequence.
+        self.read_capacity = (
+            self.max_blocks_per_seq if capture_graph else max(self.page_counts, default=0)
+        ) * self.tokens_per_block
 
     def convert(self, layer_idx: int, *, writeback: bool = False) -> None:
         """Gather both pools into staging, or write the new tokens back to them."""
@@ -147,9 +153,7 @@ class MixedPrecisionKVStaging:
         staging = staging[: len(self.page_counts) * self.max_blocks_per_seq]
         convert_mixed_precision_kv(
             writeback,
-            self.max_new_tokens_per_request
-            if writeback
-            else self.max_blocks_per_seq * self.tokens_per_block,
+            self.max_new_tokens_per_request if writeback else self.read_capacity,
             staging,
             low,
             high,
@@ -160,16 +164,20 @@ class MixedPrecisionKVStaging:
         )
 
     def get_buffers(self, layer_idx: int, kv_layout: str = "NHD") -> torch.Tensor:
+        """Return the staging cache of ``layer_idx`` in the requested layout."""
         staging = self.pools[layer_idx][0]
         return staging if kv_layout == self.layout else staging.transpose(2, 3)
 
     def get_attention_op_num_blocks(self, local_layer_idx: int) -> int:
+        """Number of staging pages addressable by the TRTLLM attention op."""
         return self.page_starts[-1] * self.kv_factor
 
     def get_attention_op_kv_page_offset(self, local_layer_idx: int) -> int:
+        """Offset of the value page from the key page within a staging block."""
         return self.kv_factor - 1
 
     def get_batch_cache_indices(self, request_ids: List[int], layer_idx: int) -> List[List[int]]:
+        """Per-request staging page lists, in request order."""
         return [
             list(range(start, start + count))
             for start, count in zip(self.page_starts, self.page_counts)
@@ -178,6 +186,7 @@ class MixedPrecisionKVStaging:
     def get_batch_cache_indices_flat(
         self, request_ids: List[int], num_blocks: List[int], layer_idx: Optional[int] = None
     ) -> torch.Tensor:
+        """Concatenated staging page table for FlashInfer, trimmed to ``num_blocks``."""
         return torch.tensor(
             [
                 page

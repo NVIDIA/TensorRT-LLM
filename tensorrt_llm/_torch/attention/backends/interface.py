@@ -359,6 +359,7 @@ class AttentionMetadata:
         self._prepare_mamba_metadata()
 
     def _has_mixed_precision_kv(self) -> bool:
+        """Whether the KV cache manager holds mixed-precision layers."""
         # isinstance guards against mocks and against V1 managers, which have
         # no mixed-precision layers.
         high_layers = getattr(self.kv_cache_manager, "high_layers", None)
@@ -382,6 +383,7 @@ class AttentionMetadata:
             # the KV budget profiling run already accounts for it.
             buffers = (self.cuda_graph_buffers if self.cuda_graph_buffers
                        is not None else get_memory_buffers())
+            pooled = bool(buffers.buffers.get("mixed_kv_staging"))
             view = MixedPrecisionKVStaging(self.kv_cache_manager,
                                            buffers,
                                            rows=self.max_num_sequences
@@ -396,6 +398,16 @@ class AttentionMetadata:
                 f"{view.max_page_bytes} B ({layout}, {tokens_per_block} "
                 "tokens per page)",
                 key="mixed_precision_kv_staging")
+            if not pooled and not getattr(self.kv_cache_manager,
+                                          "is_estimating_kv_cache", False):
+                # The budget profiling run normally allocates this block; a
+                # first allocation here means profiling was skipped and the KV
+                # pools were sized without it.
+                logger.warning_once(
+                    "Mixed-precision KV staging was allocated after the KV "
+                    "cache budget was fixed; the budget did not account for "
+                    f"its {view.staging_bytes / (1 << 20):.1f} MiB.",
+                    key="mixed_precision_kv_staging_unprofiled")
             self.mixed_precision_kv_views = dict.fromkeys(view.pools, view)
         view.update(self.request_ids,
                     self.kv_cache_params.num_cached_tokens_per_seq,
@@ -443,6 +455,7 @@ class AttentionMetadata:
         return saved
 
     def _restore_mixed_precision_kv(self, saved: tuple) -> None:
+        """Undo _swap_mixed_precision_kv."""
         self.kv_cache_manager, self.kv_layout = saved
 
     def prepare_encoder_only(self) -> None:

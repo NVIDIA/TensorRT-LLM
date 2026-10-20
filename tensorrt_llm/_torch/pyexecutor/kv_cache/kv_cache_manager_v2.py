@@ -3175,6 +3175,7 @@ class KVCacheManagerV2(BaseResourceManager):
     def _init_mixed_precision(
         self, kv_cache_config: KvCacheConfig, pretrained_config, max_seq_len: int, dtype: DataType
     ) -> None:
+        """Record the mixed-precision layout requested through kv_cache_config.dtype."""
         # Local layer id -> layer id of its retained-token (high-precision) twin.
         self.high_layers: dict[int, int] = {}
         self.low_precision_dtype: Optional[DataType] = None
@@ -3210,6 +3211,7 @@ class KVCacheManagerV2(BaseResourceManager):
                     )
 
     def _is_mixed_precision_layer(self, local_layer_idx: int) -> bool:
+        """Whether this local layer stores its history in the low-precision pool."""
         return (
             self.low_precision_dtype is not None
             and self.num_kv_heads_per_layer[local_layer_idx] > 0
@@ -3218,6 +3220,7 @@ class KVCacheManagerV2(BaseResourceManager):
         )
 
     def _mixed_precision_layer_bytes_per_token(self, local_layer_idx: int, data_role: Role) -> int:
+        """Bytes per token of the low-precision pool, scales included."""
         from ...cute_dsl_kernels.mixed_precision_kv import get_mixed_precision_kv_row_bytes
 
         return (

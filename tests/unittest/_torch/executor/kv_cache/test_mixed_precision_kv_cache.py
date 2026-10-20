@@ -211,12 +211,13 @@ def test_automatic_pool_sizing_covers_retained_group(make_manager, estimating):
     assert high_pages < low_pages
 
 
-def test_native_common_reuse_and_window_retention(make_manager):
-    manager = make_manager()
+@pytest.mark.parametrize("policy,reused_tokens", [("per_request", 128), ("all_reusable", 512)])
+def test_native_common_reuse_and_window_retention(make_manager, policy, reused_tokens):
+    manager = make_manager(config=mixed_config(block_reuse_config={"policy": policy}))
     config = manager.kv_cache_manager_py_config
     assert [layer.reuse_policy for layer in config.layers] == [kv.AttentionReusePolicy.REQUIRED] * 2
     assert (config.layers[1].num_sink_tokens, config.layers[1].sliding_window_size) == (1, 66)
-    assert config.commit_min_snapshot
+    assert config.commit_min_snapshot == (policy == "per_request")
     native = manager.impl
     stream = torch.cuda.current_stream().cuda_stream
     tokens = list(range(640))
@@ -233,8 +234,9 @@ def test_native_common_reuse_and_window_retention(make_manager):
         assert full.num_committed_tokens == 640
         assert full.resume(stream)
     with closing(native.create_kv_cache(None, tokens[:512])) as shortened:
-        # The required high tail limits per-request reuse to the first snapshot.
-        assert shortened.num_committed_tokens == 128
+        # Per-request snapshots keep only the first page reusable because the
+        # required high tail must be complete; all-reusable commits every page.
+        assert shortened.num_committed_tokens == reused_tokens
         assert shortened.resume(stream)
 
 

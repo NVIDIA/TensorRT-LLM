@@ -7,6 +7,12 @@ import cutlass.cute as cute
 import torch
 from cutlass.base_dsl.dsl import BaseDSL
 from cutlass.cute.runtime import from_dlpack, make_fake_stream
+
+# These FlashInfer modules are internal, not public API. requirements.txt pins
+# flashinfer-python==0.6.18; a bump must keep get_ptr_as_int64, st_global_u64 and
+# the three process_nvfp4_block_* codecs, or update this module. The CPU-only
+# import test in tests/unittest/_torch/attention/test_mixed_precision_backends.py
+# fails fast on a bump that drops them.
 from flashinfer.cute_dsl.fp4_common import get_ptr_as_int64, st_global_u64
 from flashinfer.quantization.quantization_cute_dsl_utils import (
     process_nvfp4_block_bfloat,
@@ -26,6 +32,8 @@ def _copy_native(source: cute.Tensor, destination: cute.Tensor) -> None:
 
 
 class _NVFP4Codec:
+    """NVFP4 (E2M1 values, FP8 scale per 16 elements) record codec for one head."""
+
     group_size = 16
     packed_group_size = 8
 
@@ -54,6 +62,7 @@ class _NVFP4Codec:
         destination: cute.Tensor,
         group: cutlass.Int64,
     ) -> None:
+        """Quantize one 16-element group of ``source`` into ``destination``."""
         scale, packed = self.quantize(
             source, cutlass.Int32(group * self.group_size), cutlass.Float32(self.scale)
         )
@@ -69,6 +78,7 @@ class _NVFP4Codec:
         group: cutlass.Int64,
         destination: cute.Tensor,
     ) -> None:
+        """Dequantize one 16-element group of ``source`` into ``destination``."""
         packed = cute.make_rmem_tensor((self.packed_group_size,), cutlass.Uint8)
         cute.autovec_copy(cute.local_tile(source, (self.packed_group_size,), (group,)), packed)
         values = cute.recast_tensor(packed, cutlass.Float4E2M1FN).load().to(cutlass.Float32)
@@ -86,6 +96,8 @@ class _NVFP4Codec:
 
 
 class _PagedMixedPrecisionKV:
+    """Paged gather (read) or scatter (write) between staging and the two pools."""
+
     def __init__(self, write: bool, codec: object) -> None:
         self.write = write
         self.codec = codec
@@ -101,6 +113,7 @@ class _PagedMixedPrecisionKV:
         capacity: cutlass.Int32,
         stream,
     ):
+        """Launch one thread per (token, kv, head, 16-element group) of the staging span."""
         groups = (
             cutlass.Int64(capacity)
             * pool.shape[1]
@@ -121,6 +134,7 @@ class _PagedMixedPrecisionKV:
         lengths: cute.Tensor,
         capacity: cutlass.Int32,
     ):
+        """Move one 16-element group between its staging row and its pool page."""
         thread, _, _ = cute.arch.thread_idx()
         block, request, _ = cute.arch.block_idx()
         index = cutlass.Int64(block) * 128 + thread

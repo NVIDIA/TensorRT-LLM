@@ -1168,12 +1168,14 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         self._mixed_precision_block_offsets = block_offsets
 
     def _swap_mixed_precision_kv(self, view) -> tuple:
+        """Also point the block offsets at the staging pages."""
         saved = (*super()._swap_mixed_precision_kv(view),
                  self.kv_cache_block_offsets)
         self.kv_cache_block_offsets = self._mixed_precision_block_offsets
         return saved
 
     def _restore_mixed_precision_kv(self, saved: tuple) -> None:
+        """Undo _swap_mixed_precision_kv, block offsets included."""
         super()._restore_mixed_precision_kv(saved[:2])
         self.kv_cache_block_offsets = saved[2]
 
