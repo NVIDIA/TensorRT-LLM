@@ -177,10 +177,11 @@ class DataParallelEncoderMultimodalModel(DummyMultimodalModel):
         return torch.cat(rows, dim=0)
 
     def _allreduce_encoder_dp_tensor(self, tensor: torch.Tensor) -> torch.Tensor:
-        if tensor.dtype == torch.int32:
-            return tensor
         assert self.peer_output is not None
         return tensor + self.peer_output
+
+    def _any_encoder_dp_rank_failed(self, local_failed: bool) -> bool:
+        return local_failed
 
 
 def make_cached_multimodal_param(mm_embeds: torch.Tensor) -> MultimodalParams:
@@ -284,12 +285,14 @@ def test_make_multimodal_encoder_model_config_replicates_encoder_mapping(world_s
 
 
 @pytest.mark.cpu_only
-def test_attention_dp_replicates_encoder_mapping_without_explicit_encoder_dp():
+@pytest.mark.parametrize("pp_size", [1, 2])
+def test_attention_dp_replicates_encoder_mapping_without_explicit_encoder_dp(pp_size):
     model_config = ModelConfig(
         mapping=Mapping(
-            world_size=2,
+            world_size=2 * pp_size,
             rank=0,
             tp_size=2,
+            pp_size=pp_size,
             enable_attention_dp=True,
         ),
         multimodal_config=MultimodalConfig(),

@@ -80,6 +80,16 @@ def schemas(tmp_path_factory: pytest.TempPathFactory) -> dict[str, dict]:
         (generator.SERVE_SCHEMA, {"env_overrides": {"FLAG": 1, "OTHER": True}}, True),
         (generator.SERVE_SCHEMA, {"telemetry_config": {"disabled": True}}, True),
         (generator.SERVE_SCHEMA, {"multimodal_config": None}, True),
+        (
+            generator.SERVE_SCHEMA,
+            {"multimodal_config": {"encoder_data_parallel_size": 2}},
+            True,
+        ),
+        (
+            generator.SERVE_SCHEMA,
+            {"multimodal_config": {"encoder_data_parallel_size": 0}},
+            False,
+        ),
         (generator.SERVE_SCHEMA, {"num_serve_frontends": 0}, False),
         (generator.SERVE_SCHEMA, {"cuda_graph_config": {}}, True),
         (generator.SERVE_SCHEMA, {"cuda_graph_config": {"batch_sizes": [1, 2, 4]}}, True),
@@ -96,6 +106,11 @@ def schemas(tmp_path_factory: pytest.TempPathFactory) -> dict[str, dict]:
             True,
         ),
         (generator.DISAGG_SCHEMA, {"context_servers": {"env_overrides": {"FLAG": 1}}}, True),
+        (
+            generator.DISAGG_SCHEMA,
+            {"context_servers": {"multimodal_config": {"encoder_data_parallel_size": 2}}},
+            True,
+        ),
         (
             generator.DISAGG_SCHEMA,
             {"context_servers": {"moe_config": {"backend_typo": "CUTLASS"}}},

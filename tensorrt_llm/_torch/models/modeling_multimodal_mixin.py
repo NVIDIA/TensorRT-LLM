@@ -36,7 +36,7 @@ from typing import (
 
 import torch
 
-from tensorrt_llm._torch.distributed import AllReduce, AllReduceStrategy
+from tensorrt_llm._torch.distributed import AllReduce, AllReduceStrategy, Distributed
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.tensor_lru_cache import TensorLRUCache
 from tensorrt_llm._utils import prefer_pinned
@@ -366,12 +366,12 @@ def make_multimodal_encoder_model_config(model_config: ModelConfig) -> ModelConf
     if not replicate_encoder:
         return encoder_config
 
-    if mapping.pp_size != 1 or mapping.cp_size != 1:
+    if encoder_dp_size > 1 and (mapping.pp_size != 1 or mapping.cp_size != 1):
         raise NotImplementedError(
             "Multimodal encoder data parallelism currently requires pipeline "
             "parallel size 1 and context parallel size 1."
         )
-    if not mapping.enable_attention_dp and encoder_dp_size != mapping.tp_size:
+    if encoder_dp_size > 1 and encoder_dp_size != mapping.tp_size:
         raise ValueError(
             "multimodal_config.encoder_data_parallel_size must equal the tensor "
             f"parallel size ({mapping.tp_size}), got {encoder_dp_size}."
@@ -782,6 +782,10 @@ class MultimodalModelMixin:
     def _allreduce_encoder_dp_tensor(self, tensor: torch.Tensor) -> torch.Tensor:
         return self._get_encoder_dp_allreduce()(tensor)
 
+    def _any_encoder_dp_rank_failed(self, local_failed: bool) -> bool:
+        """Exchange CPU status without waiting for queued encoder CUDA work."""
+        return bool(Distributed.get(self.model_config.mapping).tp_allreduce(int(local_failed)))
+
     def _build_encoder_dp_items(
         self,
         multimodal_params: Sequence[MultimodalParams],
@@ -897,6 +901,7 @@ class MultimodalModelMixin:
                 num_ranks=mapping.tp_size,
                 prepare_local_inputs=prepare_local_inputs,
                 encode_local_inputs=encode_local_inputs,
+                any_rank_failed=self._any_encoder_dp_rank_failed,
                 allreduce=self._allreduce_encoder_dp_tensor,
                 output_dim=self.embedding_dim,
                 output_dtype=self.embedding_dtype,
@@ -912,19 +917,11 @@ class MultimodalModelMixin:
         try:
             local_output = self.encode_multimodal_inputs(params, **encoder_kwargs)
         except Exception as error:
-            # Every rank must reach the status collective; otherwise a local
-            # preprocessing/encoder failure would strand its peers in the data
-            # collective below.
+            # Every rank must reach the status collective so profiling failures
+            # are reported consistently before language-model execution.
             local_error = error
 
-        embedding_weight = self.text_embedding_layer.weight
-        error_flag = torch.tensor(
-            [local_error is not None],
-            dtype=torch.int32,
-            device=embedding_weight.device,
-        )
-        any_error = self._allreduce_encoder_dp_tensor(error_flag)
-        if bool(any_error.item()):
+        if self._any_encoder_dp_rank_failed(local_error is not None):
             if local_error is not None:
                 raise RuntimeError("Multimodal encoder data-parallel rank failed.") from local_error
             raise RuntimeError("Multimodal encoder data-parallel peer rank failed.")

@@ -4227,6 +4227,14 @@
           "status": "prototype",
           "title": "Encoder Cuda Graph"
         },
+        "encoder_data_parallel_size": {
+          "default": 1,
+          "description": "Number of ranks used to distribute multimodal encoder items. A value greater than 1 currently uses the model's full tensor-parallel group, replicates the encoder on those ranks, and requires pipeline- and context-parallel sizes of 1.",
+          "exclusiveMinimum": 0,
+          "status": "prototype",
+          "title": "Encoder Data Parallel Size",
+          "type": "integer"
+        },
         "encoder_scheduling_policy": {
           "$ref": "#/$defs/MultimodalEncoderSchedulingPolicy",
           "default": "DEFAULT",

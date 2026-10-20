@@ -15,6 +15,8 @@
 
 import pickle
 import sys
+from contextlib import nullcontext
+from unittest.mock import patch
 
 import cloudpickle
 import pytest
@@ -131,8 +133,47 @@ def _run_encoder_dp_rank(enable_attention_dp: bool):
         param = _make_param([10, 20, 30], [4, 1, 3])
 
     output = model._run_multimodal_encoder([param])
+    model.encoded_item_ids.clear()
+    previous_sync_debug_mode = torch.cuda.get_sync_debug_mode()
+    try:
+        torch.cuda.set_sync_debug_mode("error")
+        output = model._run_multimodal_encoder([param])
+    finally:
+        torch.cuda.set_sync_debug_mode(previous_sync_debug_mode)
     torch.cuda.synchronize()
     return rank, model.encoded_item_ids, output.cpu()
+
+
+@torch.inference_mode()
+def _run_encoder_dp_failure_rank(_):
+    rank = tensorrt_llm.mpi_rank()
+    torch.cuda.set_device(rank)
+    model = _EncoderDpModel(rank, enable_attention_dp=False)
+    param = _make_param([10, 20, 30], [4, 1, 3])
+    failure = (
+        patch.object(model, "encode_multimodal_inputs", side_effect=ValueError("encoder failed"))
+        if rank == 0
+        else nullcontext()
+    )
+    with failure, pytest.raises(RuntimeError) as error:
+        model._run_multimodal_encoder([param])
+    message = str(error.value)
+    cause = type(error.value.__cause__).__name__
+
+    output = model._run_multimodal_encoder([param])
+    return rank, message, cause, output.cpu()
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs 2 GPUs")
+@pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
+def test_encoder_dp_propagates_rank_failure_and_recovers(mpi_pool_executor):
+    results = sorted(mpi_pool_executor.map(_run_encoder_dp_failure_rank, [None, None]))
+
+    assert "rank failed" in results[0][1]
+    assert results[0][2] == "ValueError"
+    assert "peer rank failed" in results[1][1]
+    torch.testing.assert_close(results[0][3], results[1][3])
+    assert results[0][3].shape == (8, 2)
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs 2 GPUs")
