@@ -271,8 +271,8 @@ class KVCacheV2Scheduler(RequestScheduler):
         # this many tokens (py_uncached_prefill_tokens) goes to the tail of the
         # iteration's context order from its first chunk on, FCFS within each
         # class, and takes whatever budget the others leave: reordered, never
-        # capped. Without an estimate a request is never demoted; mid-prefill
-        # the exact remainder releases it once less than the threshold is left.
+        # capped. Without an estimate a request is never demoted; once the
+        # prefix is matched the exact remainder decides instead of the estimate.
         # Gating at the door (not from the second chunk on) keeps long requests
         # from parking mid-prefill with their KV blocks held.
         demote_uncached = int(os.environ.get("TLLM_V2_CTX_DEMOTE_UNCACHED_TOKENS", "0"))
@@ -291,19 +291,21 @@ class KVCacheV2Scheduler(RequestScheduler):
             )
 
     def _is_long_context(self, req: LlmRequest) -> bool:
-        """Whether the router's uncached-prefill estimate exceeds the threshold
-        and, once mid-prefill, more than the threshold is actually left. A
-        request without an estimate is never long. No radix probe here: it
-        would walk the whole prompt for every request on every iteration."""
+        """Whether more than the threshold of uncached prefill is left: the
+        router's estimate before the prefix is matched, the exact remainder
+        once it is (context_current_position > 0). The exact remainder wins in
+        both directions, so a follow-up whose cached prefix missed is demoted
+        although the router estimated it short. A request without an estimate
+        is never long. No radix probe here: it would walk the whole prompt for
+        every request on every iteration."""
         if req.state_value == self._encoder_init_state_value:
             return False
         estimate = req.py_uncached_prefill_tokens
-        if estimate is None or estimate <= self._ctx_demote_uncached_tokens:
+        if estimate is None:
             return False
-        return not (
-            req.context_current_position > 0
-            and req.context_remaining_length <= self._ctx_demote_uncached_tokens
-        )
+        if req.context_current_position > 0:
+            return req.context_remaining_length > self._ctx_demote_uncached_tokens
+        return estimate > self._ctx_demote_uncached_tokens
 
     def _defer_long_context(
         self, pending_ctx: RequestList

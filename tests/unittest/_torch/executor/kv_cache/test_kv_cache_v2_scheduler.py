@@ -5102,6 +5102,18 @@ class TestLongContextDemotion:
         out = self._make(self.ENV).schedule_request([still_long, short], set())
         assert ids(out.context_requests) == [1, 0]
 
+    def test_exact_remainder_demotes_a_missed_prefix(self):
+        """The router estimated a short follow-up, but its cached prefix
+        missed: once the remainder is known it is demoted like any long one."""
+        missed = self._req(0, 9_000, estimate=256, kv_start=1_000)
+        short = self._req(1, 256, estimate=256)
+        out = self._make(self.ENV).schedule_request([missed, short], set())
+        assert ids(out.context_requests) == [1, 0]
+        # Before the prefix is matched only the estimate is known: not demoted.
+        fresh = self._req(0, 10_000, estimate=256)
+        out = self._make(self.ENV).schedule_request([fresh, short], set())
+        assert ids(out.context_requests) == [0]
+
     def test_aging_bound_lets_a_demoted_request_through(self):
         sched = self._make(dict(self.ENV, TLLM_V2_CTX_DEMOTE_MAX_ITERS="2"))
         long_req = self._req(0, 10_000, estimate=10_000)
