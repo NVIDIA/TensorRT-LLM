@@ -21,7 +21,7 @@ from cutlass.cutlass_dsl import T, dsl_user_op
 
 import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtllm.*
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
-from tensorrt_llm._torch.cute_dsl_kernels.blackwell.utils import make_ptr
+from tensorrt_llm._torch.kernels.blackwell.utils import make_ptr
 
 #: This checkpoint's GDN `[q|k|v]` width; the conv is width 4 over a 3-column pool.
 CKPT_DIM = 10240

@@ -37,12 +37,9 @@ from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
-from tensorrt_llm._torch.cute_dsl_kernels.blackwell.custom_pipeline import (
-    PipelineTmaUmma,
-    PipelineUmmaAsync,
-)
-from tensorrt_llm._torch.cute_dsl_kernels.blackwell.utils import make_ptr
 from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
+from tensorrt_llm._torch.kernels.blackwell.custom_pipeline import PipelineTmaUmma, PipelineUmmaAsync
+from tensorrt_llm._torch.kernels.blackwell.utils import make_ptr
 
 #: Largest row count this entry is certified for: one 128-row MMA tile.
 MAX_ROWS = 128

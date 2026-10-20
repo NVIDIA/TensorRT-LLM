@@ -28,7 +28,7 @@ from cutlass.cute.runtime import from_dlpack
 from cutlass.cutlass_dsl import T, dsl_user_op
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
-from tensorrt_llm._torch.cute_dsl_kernels.blackwell.utils import make_ptr
+from tensorrt_llm._torch.kernels.blackwell.utils import make_ptr
 
 #: This checkpoint's linear-attention geometry at tp1.
 NUM_K_HEADS, HEAD_K_DIM, NUM_V_HEADS, HEAD_V_DIM = 16, 128, 48, 128

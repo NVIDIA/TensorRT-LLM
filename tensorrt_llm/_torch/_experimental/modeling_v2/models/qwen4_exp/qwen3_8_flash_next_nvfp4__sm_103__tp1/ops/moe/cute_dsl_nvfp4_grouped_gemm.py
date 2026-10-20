@@ -207,7 +207,7 @@ class CuteDslNvfp4GroupedGemm(OpWrapper):
 
     note = """
     Path certified: the CuTe DSL kernel `Sm100BlockScaledContiguousGroupedGemmKernel`
-    (`_torch/cute_dsl_kernels/blackwell/blockscaled_contiguous_grouped_gemm.py`),
+    (`_torch/moe/kernels/blackwell/blockscaled_contiguous_grouped_gemm.py`),
     built by `Sm100BlockScaledContiguousGroupedGemmRunner`
     (`_torch/custom_ops/cute_dsl_custom_ops.py`), which JIT-compiles it with
     `cute.compile` on the first call per (tile, tactic) and keeps it for the

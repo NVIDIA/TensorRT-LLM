@@ -27,8 +27,8 @@ from cutlass.cute.runtime import from_dlpack
 from cutlass.cutlass_dsl import T, dsl_user_op
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
-from tensorrt_llm._torch.cute_dsl_kernels.blackwell.utils import make_ptr
 from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
+from tensorrt_llm._torch.kernels.blackwell.utils import make_ptr
 
 from .qsa_paged_sparse_gqa import qsa_paged_sparse_gqa as _per_row_entry
 from .qsa_rowtile_attention_cute import BLOCK_M, BLOCK_N
