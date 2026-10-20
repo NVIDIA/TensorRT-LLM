@@ -95,6 +95,11 @@ class MultimodalItemPartition(NamedTuple):
                         for i in indices
                     ]
                 return torch.cat(pieces, dim=axis)
+            if value.is_cuda:
+                # Python-list indexing copies an index tensor to CUDA and
+                # synchronizes the host. These host-known spans need no indices.
+                return torch.cat([value.narrow(axis, i, 1) for i in indices],
+                                 dim=axis)
             # With no packed lengths, tensor indexing selects one row per item.
             if axis == 0:
                 return value[indices]
@@ -801,6 +806,8 @@ class MultimodalRuntimeData:
 # Extend only after auditing each key's consumers.
 _CPU_ONLY_MULTIMODAL_DATA_KEYS = frozenset({
     "multimodal_embed_mask_cumsum",
+    "audio_num_clips",
+    "audio_output_lengths",
     MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
 })
 
