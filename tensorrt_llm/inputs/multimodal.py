@@ -52,6 +52,9 @@ class MultimodalItemPartition(NamedTuple):
     def select(self, value: Any, item_indices: Sequence[int]) -> Any:
         """Select items in the requested order, preserving tensor dtype/device.
 
+        ``item_indices`` contains modality-local payload indices, for example
+        ``[2, 0]`` selects the third item followed by the first. For a packed
+        field, each index selects its whole span from ``item_lengths``.
         Contiguous tensor selections return views that callers must treat as
         read-only. Other selections copy only the selected items; shared values
         retain identity.
@@ -76,12 +79,14 @@ class MultimodalItemPartition(NamedTuple):
                 return value.narrow(axis, 0, 0)
             if indices == list(range(indices[0], indices[0] + len(indices))):
                 start, end = indices[0], indices[-1] + 1
+                # Packed items map to row spans; batched items already use row indices.
                 if offsets is not None:
                     start, end = offsets[start], offsets[end]
                 if axis == 0:
                     return value[start:end]
                 return value.narrow(axis, start, end - start)
             if offsets is not None:
+                # Reordered packed items need concatenation; each may occupy several rows.
                 if axis == 0:
                     pieces = [value[offsets[i]:offsets[i + 1]] for i in indices]
                 else:
@@ -90,6 +95,7 @@ class MultimodalItemPartition(NamedTuple):
                         for i in indices
                     ]
                 return torch.cat(pieces, dim=axis)
+            # With no packed lengths, tensor indexing selects one row per item.
             if axis == 0:
                 return value[indices]
             index: list[slice | list[int]] = [slice(None)] * value.ndim
@@ -126,6 +132,10 @@ class MultimodalItemMetadata:
 
     Encoder costs and output rows are optional: their presence does not enable
     item scheduling. Models keep their existing scheduling capabilities.
+
+    Request state shares this record, so refs and lengths cannot be reassigned.
+    Input partitions are completed by producers before admission. This is a
+    runtime data record, not a user-facing configuration model.
     """
 
     item_refs: Sequence[tuple[str, int]]
@@ -142,6 +152,8 @@ class MultimodalItemMetadata:
         input_partitions: dict[str, dict[str, MultimodalItemPartition]]
         | None = None,
     ) -> None:
+        """Normalize lists while initializing each frozen field once."""
+        # Frozen dataclasses require object.__setattr__ during construction.
         object.__setattr__(self, "item_refs", tuple(item_refs))
         object.__setattr__(
             self, "encoder_token_lengths", None
@@ -202,7 +214,11 @@ class MultimodalItemMetadata:
                         )
 
     def select(self, item_indices: Sequence[int]) -> "MultimodalItemMetadata":
-        """Select items and rebase their refs and packed lengths to the view."""
+        """Select prompt-order positions in ``item_refs`` and rebase the view.
+
+        These indices span all modalities; payload partitions instead take
+        modality-local indices.
+        """
         if len(item_indices) == 0:
             return MultimodalItemMetadata(
                 (), None if self.encoder_token_lengths is None else (),

@@ -92,6 +92,96 @@ Custom processors must use this common hook and type. The former
 `get_mm_encoder_item_metadata` hook, `MultimodalEncoderItemMetadata` tuple, and
 Params order/length fallbacks have been removed.
 
+## Onboarding a Model
+
+Start with full-request encoding and add item scheduling only when the model
+can encode its items independently. Use these contracts rather than inventing
+encoder costs or inferring item axes from matching tensor sizes.
+
+| Capability | Required information |
+|---|---|
+| Common request metadata | `item_refs` in prompt order. Unknown encoder costs and output rows stay `None`. |
+| Grouped output assembly | Exact `output_embedding_lengths`; `EncoderGroup` needs them to split and reorder rows. |
+| Item scheduling | Exact positive `encoder_token_lengths`, output row counts, and an item-selection implementation. |
+| Persistent item caching | Output row counts and stable content/processor hashes. Partial hits also require correct item selection. |
+
+For example, a processor for a full-request audio encoder can return:
+
+```python
+return MultimodalItemMetadata(
+    item_refs=[("audio", 0)],
+    encoder_token_lengths=None,
+    output_embedding_lengths=[num_output_rows],
+)
+```
+
+This supports output assembly without declaring schedulable encoder costs.
+If output row counts are unknown too, the model must resolve them before using
+grouped assembly or item caching. A model-specific full-request encoder can
+compute those counts from its result. Metadata alone never enables scheduling.
+
+To opt in, the model sets `supports_mm_encoder_item_scheduling = True` and
+implements `encode_multimodal_inputs` and item selection. The engine also
+checks `disable_mm_encoder`, the scheduling policy, and supported combinations
+in `mm_item_scheduling_enabled()` and
+`validate_mm_encoder_scheduling_compatibility()`. Under item scheduling, missing
+costs or output rows fail admission; they do not silently switch one request to
+full-request encoding. Keep the capability disabled until the model can supply
+the complete scheduling contract.
+
+### Selecting Unusual Payloads
+
+Declare `input_partitions` for ordinary batched, packed, and shared fields.
+For example, two audio items with two and one clips use:
+
+```python
+input_partitions = {
+    "audio": {
+        "input_audio_features": MultimodalItemPartition(item_lengths=(2, 1)),
+        "feature_attention_mask": MultimodalItemPartition(item_lengths=(2, 1)),
+        "audio_num_clips": MultimodalItemPartition(),
+    },
+}
+```
+
+If a payload has multiple item axes, nested variable-length structures, or
+selection that must rebuild sibling fields, override
+`build_multimodal_encoder_input(param, local_item_indices, modality)`. Return a
+new execution `MultimodalParams` view and leave the request's payload and cache
+references intact. The mixin then slices the common item metadata and hashes
+using prompt-global indices. Payload indices and prompt indices can differ:
+for `[('video', 0), ('image', 0)]`, the image has local index `0` and prompt
+index `1`.
+
+Returning `None` from `get_multimodal_item_partitions` uses the existing
+packed/stacked compatibility selector. New models should declare partitions or
+override selection explicitly; the compatibility selector cannot describe an
+arbitrary model layout. An empty partition dict means every field is shared,
+so it is appropriate only when selecting an item requires no payload changes.
+
+### Item Boundaries and Model Hooks
+
+An item is the smallest independently encodable unit, not necessarily one
+uploaded media object. Several crops, frames, or audio clips can belong to one
+item. A common item reference names one modality. Keep coupled audio/video
+data in one model-owned payload under that item's modality, or keep full-request
+encoding if independent item execution is not possible. Separate audio and
+video references imply that either may be selected independently.
+
+Use `after_full_multimodal_embeddings` for request-level preparation after
+cache lookup or encoding. Its tensors are not always full-request tensors: a
+mixed batch containing item-scheduled chunk outputs already gathers active
+rows. Use `after_active_multimodal_embeddings` for row-dependent transforms,
+such as splitting Qwen3-VL deepstack features, immediately before fusion.
+
+Model-specific auxiliary values belong in `multimodal_data`. Declare their
+selection rules alongside the primary fields, or rebuild them in the custom
+selection hook. Add a field to `MultimodalItemMetadata` only when shared
+preprocessing/execution consumers need it, and update validation, `select()`,
+producer merging, and process-handoff tests together. Keep lengths and
+partitions as host metadata; CUDA-to-host copies can synchronize even when
+written as `.cpu().tolist()`.
+
 ## Encoder/Prefill Handoff
 
 For encoder/prefill disaggregation (E/P), model processor hooks return

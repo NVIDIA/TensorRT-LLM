@@ -227,7 +227,23 @@ def _gemma4_input_partitions(
         item_count = sum(m == modality for m, _ in metadata.item_refs)
         value = data.get(fields[0])
         if isinstance(value, torch.Tensor) and value.ndim > 0 and value.shape[0] == item_count:
-            partitions[modality] = {name: MultimodalItemPartition() for name in fields}
+            modality_partitions = {}
+            for name in fields:
+                value = data.get(name)
+                if value is None:
+                    continue
+                if isinstance(value, torch.Tensor):
+                    size = value.shape[0] if value.ndim > 0 else None
+                elif isinstance(value, (list, tuple)):
+                    size = len(value)
+                else:
+                    size = None
+                if size != item_count:
+                    raise ValueError(
+                        f"{modality}.{name} must have {item_count} items on its leading axis"
+                    )
+                modality_partitions[name] = MultimodalItemPartition()
+            partitions[modality] = modality_partitions
     return partitions
 
 

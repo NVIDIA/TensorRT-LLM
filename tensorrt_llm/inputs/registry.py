@@ -1282,6 +1282,10 @@ def create_input_processor_with_hash(
     Returns:
         A wrapped processor that modifies prompts before processing.
     """
+    if callable(getattr(input_processor, "get_mm_encoder_item_metadata", None)):
+        raise TypeError(
+            "get_mm_encoder_item_metadata() has been removed; implement "
+            "get_mm_item_metadata() returning MultimodalItemMetadata instead.")
 
     def multimodal_hashing_process(
         inputs: TextPrompt, sampling_params: SamplingParams
