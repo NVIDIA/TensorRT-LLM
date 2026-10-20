@@ -34,6 +34,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from PIL import Image
 
+from tensorrt_llm.inputs.media_io import BaseMediaIO
 from tensorrt_llm.serve.openai_protocol import (
     ChatCompletionResponse,
     ChatCompletionResponseChoice,
@@ -138,43 +139,72 @@ def _stub_response() -> ChatCompletionResponse:
     )
 
 
+def make_stub_openai_server(tmp_path, model_config, generate_async) -> OpenAIServer:
+    """An ``OpenAIServer`` built by its real constructor on an engine stub.
+
+    The generator stands in for ``LLM``: it carries the ``args`` the server
+    reads, a tokenizer, and ``generate_async`` recording what reaches the
+    engine. The model directory is empty, so the constructor loads no HF
+    processor or config and ``model_config`` is set to the given stub.
+    """
+    generator = SimpleNamespace(
+        args=SimpleNamespace(
+            backend="pytorch",
+            reasoning_parser=None,
+            gather_generation_logits=False,
+            guided_decoding_backend=None,
+            num_postprocess_workers=0,
+            cache_transceiver_config=None,
+            trust_remote_code=False,
+            checkpoint_format=None,
+            return_perf_metrics=False,
+            perf_metrics_output_dir=None,
+            speculative_config=None,
+            post_processor_hook=None,
+            sleep_config=None,
+            num_serve_frontends=1,
+            enable_iter_perf_stats=False,
+        ),
+        tokenizer=SimpleNamespace(tokenizer=SimpleNamespace(vocab_size=model_config.vocab_size)),
+        input_processor=None,
+        llm_id="stub",
+        _hf_model_dir=str(tmp_path),
+        _executor=SimpleNamespace(resource_governor_queue=None),
+        generate_async=generate_async,
+    )
+    previous_media_executor = BaseMediaIO._executor
+    server = OpenAIServer(
+        generator=generator,
+        model=MODEL,
+        tool_parser=None,
+        server_role=None,
+        metadata_server_cfg=None,
+    )
+    server.model_config = model_config
+    # The constructor publishes a media-decode pool process-wide. In-process
+    # tests decode on the event loop's default executor instead, so put the
+    # previous pool back and retire the server's unused pools before they
+    # start any worker thread.
+    BaseMediaIO.set_executor(previous_media_executor)
+    server._media_load_executor.shutdown(wait=False)
+    server._input_proc_executor.shutdown(wait=False)
+    return server
+
+
 @pytest.fixture
-def route_client():
+def route_client(tmp_path):
     """`openai_chat` on a bare app, with everything past prompt-building cut.
 
-    The server is built with `object.__new__` and hand-set attributes, so the
-    handler runs for real and the engine never does.
+    The engine is a stub behind the real server constructor, so the handler
+    runs for real and the engine never does.
     """
-    server = object.__new__(OpenAIServer)
     captured = {}
 
     def generate_async(*, inputs, **kwargs):
         captured["inputs"] = inputs
         return SimpleNamespace(prompt_token_ids=RELAYED_TOKEN_IDS, finished=True)
 
-    server.model = MODEL
-    server.allow_request_chat_template = False
-    server.model_config = _StubModelConfig()
-    server.processor = None
-    server.tokenizer = SimpleNamespace(
-        tokenizer=SimpleNamespace(vocab_size=_StubModelConfig.vocab_size)
-    )
-    server.chat_template = None
-    server.tool_parser = None
-    server.tool_call_id_type = "random"
-    server.multimodal_server_config = None
-    # No `preprocess` attribute, so the handler skips the input-processor
-    # executor; `num_postprocess_workers=0` keeps post-processing in-process.
-    server.generator = SimpleNamespace(
-        args=SimpleNamespace(
-            gather_generation_logits=False,
-            reasoning_parser=None,
-            backend="pytorch",
-            guided_decoding_backend=None,
-            num_postprocess_workers=0,
-        ),
-        generate_async=generate_async,
-    )
+    server = make_stub_openai_server(tmp_path, _StubModelConfig(), generate_async)
     server.await_disconnected = AsyncMock()
     server._create_chat_response = AsyncMock(return_value=_stub_response())
 
