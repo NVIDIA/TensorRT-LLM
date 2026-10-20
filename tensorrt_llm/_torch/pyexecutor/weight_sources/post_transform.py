@@ -28,7 +28,7 @@ runtime layout. This module answers that question in two steps:
 """
 
 from dataclasses import replace
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 from tensorrt_llm._torch.weight_sharing import (
     LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1,
@@ -52,6 +52,9 @@ from tensorrt_llm.logger import logger
 
 from ...model_config import ModelConfig
 from ...models.modeling_utils import DecoderModelForCausalLM
+
+if TYPE_CHECKING:
+    from .base import WeightLoadContext
 
 # Version of the receiver-side post-load sequence for post-transform bytes:
 # `setup_aliases()`, then mark weights transformed, then
@@ -251,3 +254,60 @@ def build_source_identity(
         model_name=model_name,
         transform_abi_id=transform_abi_id,
     )
+
+
+def qualify_for_weight_sharing(
+    model: DecoderModelForCausalLM,
+    config: ModelConfig,
+    *,
+    config_identity: PostTransformConfigIdentity,
+    context: "WeightLoadContext",
+    fallback_on_artifact_error: bool,
+) -> tuple[PostTransformQualificationDecision, Optional[SourceIdentity]]:
+    """Qualify ``model`` and build its `SourceIdentity`, as MX and GMS loads need.
+
+    `MxWeightSource.prepare()` and `GmsWeightSource.prepare()` call this after
+    the model is built and before it receives any weights:
+
+    1. `qualify_post_transform_profile()` decides whether this load may share
+       post-transform bytes.
+    2. `build_source_identity()` fingerprints the load and records the
+       qualified profile's transform-layout ABI, so donor and receiver only
+       match when both use the same post-transform layout.
+
+    Args:
+        model: The freshly constructed model.
+        config: The final config the model was built from.
+        config_identity: Architecture and model type captured before the
+            model constructor ran (see `qualify_post_transform_profile()`).
+        context: The current load; provides the checkpoint directory, model
+            name, speculative decoding and draft settings.
+        fallback_on_artifact_error: True for MX, which falls back to reading
+            the checkpoint when the files cannot be fingerprinted; False for
+            GMS, which raises.
+
+    Returns:
+        The qualification decision and the identity, which is ``None`` only
+        when MX could not fingerprint the checkpoint files.
+    """
+    qualification = qualify_post_transform_profile(
+        model,
+        config_identity=config_identity,
+        speculative_mode=speculative_mode_name(context.spec_config),
+        loads_draft_weights=context.loads_draft_weights,
+    )
+    # Receiver's local SourceIdentity, built once from the final
+    # ModelConfig and the freshly constructed module. The module's
+    # realized parameter/buffer (shape, dtype) map is the layout
+    # ground truth; building it here (post-construction,
+    # pre-weight-load) gives producer and consumer a common,
+    # comparable lifecycle point.
+    source_identity = build_source_identity(
+        config,
+        model,
+        checkpoint_dir=context.checkpoint_dir,
+        model_name=str(getattr(context.llm_args, "model", None) or context.checkpoint_dir),
+        transform_abi_id=qualification.transform_abi_id,
+        fallback_on_artifact_error=fallback_on_artifact_error,
+    )
+    return qualification, source_identity
