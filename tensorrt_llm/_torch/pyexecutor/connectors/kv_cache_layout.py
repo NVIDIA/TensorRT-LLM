@@ -47,7 +47,7 @@ the unsplit aggregation; otherwise it is described as before, every byte in
 regions, and the connector stores it per rank.
 """
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import torch
@@ -254,30 +254,6 @@ def _regions_for(
 #: that pool's shard-specific bytes in two. A fragmented split (one region per
 #: layer) is far above this and falls back to per-rank storage.
 MAX_EXTRA_REGIONS_FOR_REPLICATION = 2
-
-
-def fold_replicated_regions(layout: "KvCacheLayout") -> "KvCacheLayout":
-    """Describe every byte as shard-specific, for a consumer with one attention shard.
-
-    Replicated regions exist so a connector can store bytes that every shard
-    holds once per group. With a single shard (attention DP, where each owner
-    holds complete attention KV, or TP=1) there is no second copy to save, and
-    the split only turns one key per page into two. Folding keeps one page and
-    one key, exactly as if no role had been declared.
-    """
-    if not any(group.replicated_regions for group in layout.groups):
-        return layout
-    return replace(
-        layout,
-        groups=tuple(
-            replace(
-                group,
-                regions=(*group.regions, *group.replicated_regions),
-                replicated_regions=(),
-            )
-            for group in layout.groups
-        ),
-    )
 
 
 def build_kv_cache_layout_v2(manager: "KVCacheManagerV2") -> KvCacheLayout:

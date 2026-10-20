@@ -423,27 +423,29 @@ class TestCoalesceLast(unittest.TestCase):
             )
 
 
-class TestFoldReplicatedRegions(unittest.TestCase):
-    """One attention shard has no second copy to save, so the split is undone."""
+class TestSingleAttentionShard(unittest.TestCase):
+    """Attention DP declares no replicated role and keeps index-K interleaved."""
 
-    def test_fold_restores_a_single_page_with_every_byte(self):
-        layout, _ = build_layout(2, tail=True)
-        folded = layout_mod.fold_replicated_regions(layout)
-        (group,), (split,) = folded.groups, layout.groups
+    def test_layout_matches_the_logged_adp_page(self):
+        # The manager reports no replicated role and no pool tail here.
+        layout, _ = build_layout(1, replicated=())
+        group = layout.groups[0]
         self.assertEqual(group.replicated_regions, ())
-        self.assertEqual(group.regions, (*split.regions, *split.replicated_regions))
-        self.assertEqual(group.bytes_per_page, split.bytes_per_page + split.replicated_bytes_per_page)
         self.assertEqual(len(group.regions), 4)
+        self.assertEqual(group.bytes_per_page, 5660672)  # logged by the ADP benchmark
 
-    def test_fold_matches_the_unsplit_page_size(self):
-        # The pre-PR page of the same pool: nothing declared replicated.
-        unsplit, _ = build_layout(2, tail=True, replicated=())
-        folded = layout_mod.fold_replicated_regions(build_layout(2, tail=True)[0])
-        self.assertEqual(folded.groups[0].bytes_per_page, unsplit.groups[0].bytes_per_page)
-
-    def test_fold_without_replicated_regions_is_the_same_layout(self):
-        layout, _ = build_layout(2, tail=True, replicated=())
-        self.assertIs(layout_mod.fold_replicated_regions(layout), layout)
+    def test_regions_are_the_plain_v2_aggregation(self):
+        # Before replicated roles existed, a group's regions were V2's
+        # aggregation of all of its buffers, listed layer by layer.
+        layout, impl = build_layout(1, replicated=())
+        buffers = list(impl.all_buffer_ids)
+        aggregated = impl.get_aggregated_pages(
+            [b for layer in impl.layer_grouping[0] for b in buffers if b.layer_id == layer]
+        )
+        self.assertEqual(
+            [(r.base, r.size, r.stride) for r in layout.groups[0].regions],
+            [(int(d.base), int(d.size), int(d.stride)) for d in aggregated],
+        )
 
 
 class TestDescriptorTable(unittest.TestCase):

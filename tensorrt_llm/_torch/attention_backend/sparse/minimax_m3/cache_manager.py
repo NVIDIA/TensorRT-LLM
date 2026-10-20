@@ -494,14 +494,16 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         elem_bytes = torch.tensor([], dtype=torch_dtype).element_size()
         bytes_per_token = 1 * self.sparse_index_dim * elem_bytes
         size_per_block = bytes_per_token * tokens_per_block
+        # Index-K is identical on every TP rank, so a KV connector stores it
+        # once per group. That costs one extra region per page only when the
+        # replicated bytes are contiguous, so under attention TP place every
+        # layer's index-K after the other buffers of its size instead of between
+        # each layer's K/V. With one attention shard nothing is stored once per
+        # group, and the pool keeps its interleaved layout.
+        coalesce_last = self._attention_tp_size() > 1
         return {
             self.layer_offsets[layer_id]: [
-                # Index-K is identical on every TP rank, so a KV connector stores it
-                # once per group. That costs one extra region per page only when the
-                # replicated bytes are contiguous, so place every layer's index-K after
-                # the other buffers of its size instead of between each layer's K/V.
-                # Accessors resolve addresses per buffer and are unaffected.
-                BufferConfig(role=Role.INDEX_KEY, size=size_per_block, coalesce_last=True)
+                BufferConfig(role=Role.INDEX_KEY, size=size_per_block, coalesce_last=coalesce_last)
             ]
             for layer_id in self.sparse_layer_ids
             if layer_id in self.layer_offsets

@@ -62,7 +62,7 @@ from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 from tensorrt_llm.logger import logger
 
 from ..kv_cache_connector import KvCacheConnectorWorker
-from ..kv_cache_layout import KvCacheLayout, fold_replicated_regions
+from ..kv_cache_layout import KvCacheLayout
 from .addressing import PageAddressing
 from .config import CONFIG_PATH_ENV, MooncakeStoreConnectorConfig, pool_config
 from .gpudirect import REGISTRATION_DEBUG_ENV, format_diagnosis
@@ -409,10 +409,6 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
             )
             return
 
-        if self._attention_world_size == 1:
-            # One attention shard holds every byte, so there is nothing to store
-            # once per group; keep a single page and key per block.
-            layout = fold_replicated_regions(layout)
         validate_layout(layout)
         addressing = PageAddressing(layout)
         # Torch's current device is thread-local, so read it here on the

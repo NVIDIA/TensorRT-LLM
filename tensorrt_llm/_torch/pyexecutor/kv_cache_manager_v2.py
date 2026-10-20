@@ -1932,12 +1932,26 @@ class KVCacheManagerV2(BaseResourceManager):
         A KV connector uses this to give replicated bytes a single
         rank-independent store key. A role with no registered buffers
         contributes nothing, so declaring one is harmless.
+
+        With a single attention shard (attention DP, or TP=1) no other rank
+        holds a copy, so nothing is reported and every byte is described as
+        shard-specific, exactly as if no role had been declared.
         """
+        if self._attention_tp_size() == 1:
+            return frozenset()
         return frozenset(
             role
             for role, kind in self.get_disagg_role_mapper_kinds().items()
             if role != Role.ALL and kind is MapperKind.REPLICATED
         )
+
+    def _attention_tp_size(self) -> int:
+        """How many attention shards split each layer's KV.
+
+        Attention DP gives every rank complete attention KV, so it counts as one
+        shard whatever the TP size.
+        """
+        return 1 if self.mapping.enable_attention_dp else self.mapping.tp_size
 
     @property
     def blocks_in_primary_pool(self) -> int:

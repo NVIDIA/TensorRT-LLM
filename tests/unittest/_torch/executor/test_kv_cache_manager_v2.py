@@ -565,6 +565,7 @@ def test_replicated_roles_follow_the_disagg_declaration():
     from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import Role
 
     manager = object.__new__(KVCacheManagerV2)
+    manager.mapping = Mapping(world_size=2, tp_size=2)
     assert manager.get_replicated_roles() == frozenset({Role.INDEX_KEY})
 
     # A subclass declaring a new replicated side cache is picked up on its own.
@@ -591,5 +592,22 @@ def test_replicated_roles_never_include_the_fallback():
     # Role.ALL names the fallback for roles without an entry, not a role whose
     # buffers exist, so it must never be reported replicated.
     manager = object.__new__(KVCacheManagerV2)
+    manager.mapping = Mapping(world_size=2, tp_size=2)
     manager.get_disagg_role_mapper_kinds = lambda: {Role.ALL: MapperKind.REPLICATED}
+    assert manager.get_replicated_roles() == frozenset()
+
+
+@pytest.mark.parametrize(
+    "mapping",
+    [
+        Mapping(world_size=2, tp_size=2, enable_attention_dp=True),
+        Mapping(world_size=1, tp_size=1),
+    ],
+    ids=["attention_dp", "tp1"],
+)
+def test_single_attention_shard_reports_no_replicated_roles(mapping):
+    # No other rank holds a copy, so the declaration has nothing to share and
+    # a KV connector sees the manager exactly as if none had been made.
+    manager = object.__new__(KVCacheManagerV2)
+    manager.mapping = mapping
     assert manager.get_replicated_roles() == frozenset()
