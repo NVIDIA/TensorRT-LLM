@@ -3,12 +3,13 @@
 """GPU test for the gdn_decode_rows_gated_norm entry.
 
 Cells against the composition's fp64 reference (the gated delta rule's recurrence,
-then the gated norm entry's) in torch's default band for the bf16 output and the fp32
-pool, the pool compared whole so slots the call did not name are
-gated too. Beyond the cells: agreement with the unfused composition it replaces
-(FlashInfer's recurrence, then the gated norm entry) at decode batch sizes, PDL on
-and off bitwise, a stale-read check under graph replay (a producer rewrites the
-projection inside the graph right before the op), and the guards.
+then the gated norm entry's) in torch's default band for the bf16 output and the pool's
+dtype (fp32 or bf16), the pool compared whole so slots the call did not name are
+gated too. Beyond the cells: agreement with the unfused compositions it replaces
+(FlashInfer's recurrence over an fp32 pool, the Triton rows form over a bf16 pool, then
+the gated norm entry) at decode batch sizes, a fixed row bitwise across batch sizes over
+a bf16 pool, PDL on and off bitwise, a stale-read check under graph replay (a producer
+rewrites the projection inside the graph right before the op), and the guards.
 """
 
 import zlib
@@ -19,6 +20,9 @@ import torch
 
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.norm.rms_norm_gated_token_major import (  # noqa: E501
     rms_norm_gated_token_major,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.ssm.fused_sigmoid_gating_delta_rule_update import (  # noqa: E501
+    fused_sigmoid_gating_delta_rule_update as triton_rows,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.ssm.gdn_decode_rows_gated_norm import (  # noqa: E501
     gdn_decode_rows as rows_op,
@@ -51,22 +55,23 @@ def _scattered(n: int, slots: int) -> tuple[int, ...]:
 def _build(spec, seed):
     g = torch.Generator(device=DEV).manual_seed(seed)
     rows = spec["rows"]
+    state = torch.bfloat16 if spec.get("state") == "bf16" else torch.float32
     proj = torch.randn(rows, WIDTH, generator=g, device=DEV).to(torch.bfloat16)
     if spec.get("pool") == "coalesced":
         # The KV-cache-v2 manager's view: every GDN layer's state of a slot in one page,
         # this layer's state one sub-page of it, so the slot stride is 36 layers' states
         # and slot 100 sits ~2.8G elements past the base (past int32).
         layers, slots = 36, 102
-        page = torch.empty(slots * layers * HV * V * K, device=DEV)
+        page = torch.empty(slots * layers * HV * V * K, device=DEV, dtype=state)
         page[: HV * V * K * 4].normal_(0.0, 0.05, generator=g)
         pool = page.as_strided((slots, HV, V, K), (layers * HV * V * K, V * K, K, 1))
         for s in (100, 101):
             pool[s].copy_(torch.randn(HV, V, K, generator=g, device=DEV) * 0.05)
     elif spec.get("pool") == "layer_view":
-        cache = torch.randn(3, SLOTS, HV, V, K, generator=g, device=DEV) * 0.05
+        cache = (torch.randn(3, SLOTS, HV, V, K, generator=g, device=DEV) * 0.05).to(state)
         pool = cache[1]
     else:
-        pool = torch.randn(SLOTS, HV, V, K, generator=g, device=DEV) * 0.05
+        pool = (torch.randn(SLOTS, HV, V, K, generator=g, device=DEV) * 0.05).to(state)
     if spec.get("pool") == "coalesced":
         slots = torch.tensor([100, 101][:rows], dtype=torch.int32, device=DEV)
     else:
@@ -122,17 +127,82 @@ def _unfused(proj, pool, slots, A_log, dt_bias, w, eps, h, k):
     ).reshape(rows, HV * V)
 
 
+def _unfused_bf16(proj, pool, slots, A_log, dt_bias, w, eps, h, k):
+    """The composition the target ran over a bf16 pool: the Triton rows form (q/k/v split
+    from a contiguous `[T, 1, 80, 128]` block, `cu_seqlens` None), then the gated norm."""
+    rows = proj.shape[0]
+    mixed, z, a, b = torch.split(proj, [2 * h * k + HV * V, HV * V, HV, HV], 1)
+    qkv = mixed.contiguous().reshape(rows, 1, -1, k)
+    q, kk, v = torch.split(qkv, [h, h, HV], 2)
+    o = triton_rows(
+        A_log=A_log,
+        a=a.contiguous().reshape(rows, 1, HV),
+        dt_bias=dt_bias,
+        softplus_beta=1.0,
+        softplus_threshold=20.0,
+        q=q,
+        k=kk,
+        v=v,
+        b=b.contiguous().reshape(rows, 1, HV),
+        initial_state_source=pool,
+        initial_state_indices=slots,
+        scale=None,
+        use_qk_l2norm_in_kernel=True,
+        cu_seqlens=None,
+        output=None,
+    )
+    return rms_norm_gated_token_major(
+        o.reshape(-1, V), z.reshape(rows, HV, V), w, eps, None, "sigmoid"
+    ).reshape(rows, HV * V)
+
+
+@pytest.mark.parametrize("state", ["fp32", "bf16"])
 @pytest.mark.parametrize("rows", [3, 64, 128])
-def test_matches_the_unfused_composition(rows) -> None:
-    args = _build(dict(rows=rows), seed=900 + rows)
+def test_matches_the_unfused_composition(rows, state) -> None:
+    args = _build(dict(rows=rows, state=state), seed=900 + rows)
     pool_unfused = args[1].clone()
-    want = _unfused(args[0], pool_unfused, *args[2:])
+    want = (_unfused if state == "fp32" else _unfused_bf16)(args[0], pool_unfused, *args[2:])
     got = op(*args)
     torch.testing.assert_close(got, want)
     torch.testing.assert_close(args[1], pool_unfused)
     print(
-        f"\n  rows {rows}: output bitwise the composition's {(got == want).float().mean().item():.4f}"
+        f"\n  rows {rows}, {state} pool: output bitwise the composition's "
+        f"{(got == want).float().mean().item():.4f}, pool "
+        f"{(args[1] == pool_unfused).float().mean().item():.4f}"
     )
+
+
+#: Decode batch sizes up to the engine's largest CUDA-graph batch.
+_BATCHES = (1, 2, 4, 5, 16, 33, 128, 256)
+_FIXED_SLOT = 301
+
+
+def test_bf16_pool_is_batch_invariant() -> None:
+    """The property the bf16 decode step relies on: a row's output and state are bitwise
+    independent of the batch it rides in. One fixed row (its projection and slot 301 of a
+    bf16 pool) sits first and last in random batches of every size."""
+    gen = torch.Generator(device=DEV).manual_seed(3)
+    cpu = torch.Generator().manual_seed(3)
+    pool0 = (torch.randn(SLOTS, HV, V, K, generator=gen, device=DEV) * 0.05).to(torch.bfloat16)
+    row = torch.randn(WIDTH, generator=gen, device=DEV).to(torch.bfloat16)
+    rest = _build(dict(rows=1), seed=3)[3:]
+    first = None
+    for n in _BATCHES:
+        for pos in sorted({0, n - 1}):
+            g = torch.Generator(device=DEV).manual_seed(1000 * n + pos)
+            proj = torch.randn(n, WIDTH, generator=g, device=DEV).to(torch.bfloat16)
+            proj[pos] = row
+            others = [s for s in torch.randperm(SLOTS, generator=cpu).tolist() if s != _FIXED_SLOT]
+            others = others[:n]
+            others[pos] = _FIXED_SLOT
+            slots = torch.tensor(others, dtype=torch.int32, device=DEV)
+            pool = pool0.clone()
+            out = op(proj, pool, slots, *rest)
+            got = (out[pos].clone(), pool[_FIXED_SLOT].clone())
+            first = first or got
+            assert torch.equal(got[0], first[0]) and torch.equal(got[1], first[1]), (
+                f"the fixed row differs at batch {n}, position {pos}"
+            )
 
 
 def test_pdl_on_and_off_agree_bitwise() -> None:
@@ -179,7 +249,7 @@ def test_reads_after_the_wait_under_graph_replay() -> None:
 def test_guards() -> None:
     args = _build(dict(rows=4), seed=5)
     with validating(op), pytest.raises(AssertionError):
-        op(args[0], args[1].to(torch.bfloat16), *args[2:])
+        op(args[0], args[1].to(torch.float16), *args[2:])
     with validating(op), pytest.raises(AssertionError):
         op(args[0], args[1], args[2].long(), *args[3:])
     with validating(op), pytest.raises(AssertionError):

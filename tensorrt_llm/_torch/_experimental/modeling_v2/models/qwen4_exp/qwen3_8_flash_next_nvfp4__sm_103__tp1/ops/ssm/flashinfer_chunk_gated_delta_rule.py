@@ -7,9 +7,11 @@ Wraps the in-tree module callable
 (tier-2 sourcing), the adapter in front of the installed FlashInfer's
 ``flashinfer.chunk_gated_delta_rule`` (CuTe-DSL tcgen05 kernel on sm_100/103).
 One call is: ``g -> exp(g)``, a Triton gather of the indexed pool slots into a
-packed fp32 ``[N, HV, V, K]`` buffer, the FlashInfer kernel, and a Triton
-scatter of the final states back into the same slots. Call-compatible with the
-vendored Triton ``chunk_gated_delta_rule`` (``modules/fla/chunk``).
+packed ``[N, HV, V, K]`` buffer in the pool's dtype (the sm_100/103 kernel keeps
+the state in fp32 inside and reads and writes it in that dtype), the FlashInfer
+kernel, and a Triton scatter of the final states back into the same slots.
+Call-compatible with the vendored Triton ``chunk_gated_delta_rule``
+(``modules/fla/chunk``).
 
 FlashInfer API: ``flashinfer.chunk_gated_delta_rule`` (``flashinfer.gdn_prefill``),
 reached through the adapter above.
@@ -73,9 +75,10 @@ class FlashinferChunkGatedDeltaRule(OpWrapper):
     ARCHS = frozenset({Arch.SM_103})
 
     # spec: geometry (H, HV, K, V); seqlens; `slots`-row pool with `indices`
-    # (or _engine_slots); inplace (True); output_final_state; output (None |
-    # "buffer"); l2norm (False) with normalize_qk (True: caller-normalized).
-    # Every cell but the last is qwen3.8-flash-next-nvfp4's geometry.
+    # (or _engine_slots); pool_dtype (fp32); inplace (True); output_final_state;
+    # output (None | "buffer"); l2norm (False) with normalize_qk (True:
+    # caller-normalized). Every cell but the HV/H = 2 one is
+    # qwen3.8-flash-next-nvfp4's geometry.
     CELLS: tuple[Cell, ...] = tuple(
         Cell(
             why=f"qwen3.8 prefill, 461-slot pool, seqlens {list(s)}",
@@ -133,6 +136,36 @@ class FlashinferChunkGatedDeltaRule(OpWrapper):
             why="HV/H = 2 (16 q/k heads, 32 v heads), seqlens [200, 37]",
             spec=dict(geometry=(16, 32, 128, 128), seqlens=(200, 37), slots=4, indices=(3, 0)),
         ),
+        Cell(
+            why="bf16 pool (mamba_ssm_cache_dtype), 461 slots, seqlens [200, 37, 91]",
+            spec=dict(
+                geometry=QWEN38_GEOMETRY,
+                seqlens=(200, 37, 91),
+                slots=ENGINE_SLOTS,
+                indices=_engine_slots(3),
+                pool_dtype=torch.bfloat16,
+            ),
+        ),
+        Cell(
+            why="bf16 pool (mamba_ssm_cache_dtype), 461 slots, seqlens [8192]",
+            spec=dict(
+                geometry=QWEN38_GEOMETRY,
+                seqlens=(8192,),
+                slots=ENGINE_SLOTS,
+                indices=_engine_slots(1),
+                pool_dtype=torch.bfloat16,
+            ),
+        ),
+        Cell(
+            why="bf16 pool (mamba_ssm_cache_dtype), 461 slots, seqlens [2048, 2048, 2048, 2048]",
+            spec=dict(
+                geometry=QWEN38_GEOMETRY,
+                seqlens=(2048, 2048, 2048, 2048),
+                slots=ENGINE_SLOTS,
+                indices=_engine_slots(4),
+                pool_dtype=torch.bfloat16,
+            ),
+        ),
     )
 
     note = """
@@ -150,8 +183,9 @@ class FlashinferChunkGatedDeltaRule(OpWrapper):
     (`gdn_decode.gated_delta_rule_decode_pretranspose`) instead (both halves
     plus the concatenation).
 
-    Memory per call: a packed fp32 copy of the named slots in and out (2 x
-    3 MiB per sequence), `exp(g)`, and the output. q/k/v/beta are not copied
+    Memory per call: a packed copy of the named slots in and out in the pool's
+    dtype (2 x 3 MiB per sequence fp32, half that bf16), `exp(g)`, and the
+    output. q/k/v/beta are not copied
     when already contiguous / fp32.
 
     JIT and streams: the first call per process compiles the CuTe-DSL
@@ -162,8 +196,9 @@ class FlashinferChunkGatedDeltaRule(OpWrapper):
     Numerics (measured vs an fp64 recurrence, 1 x 8192 tokens, qwen3.8
     geometry): o rel-L2 4.06e-3, max abs 1.26e-3; state rel-L2 3.31e-3 --
     the Triton op's are
-    4.00e-3 / 1.13e-3 / 3.26e-3. Not bitwise to it. No cold-call defect:
-    nothing in the call is autotuned.
+    4.00e-3 / 1.13e-3 / 3.26e-3. Not bitwise to it. A bf16 pool rounds each
+    sequence's state to bf16 once per call, on the scatter. No cold-call
+    defect: nothing in the call is autotuned.
 
     Loud, from the callable: `head_first=True`, `q.shape[0] != 1`, H_q != H_k,
     fp32 q, non-fp32 `g`, `cu_seqlens` or `initial_state` None, in-place
@@ -172,7 +207,7 @@ class FlashinferChunkGatedDeltaRule(OpWrapper):
     Not checked: indices distinct and in `[0, S)`; q/k unit-norm (by the
     caller or the flag).
 
-    Not certified: `state_workspace=`, bf16/fp16 pool, `scale` other than the
+    Not certified: `state_workspace=`, an fp16 pool, `scale` other than the
     default, fp16 operands, K or V other than 128.
 
     Hard limits
