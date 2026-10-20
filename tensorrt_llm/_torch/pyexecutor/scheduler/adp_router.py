@@ -65,6 +65,55 @@ def _num_input_tokens(request) -> int:
     return len(getattr(request, "input_token_ids", []))
 
 
+def request_conversation_id(request) -> "str | None":
+    """The request's own ``conversation_params.conversation_id``, or None."""
+    if request is None:
+        return None
+    conversation_params = getattr(request, "py_conversation_params", None)
+    if conversation_params is None:
+        return None
+    return conversation_params.conversation_id
+
+
+class UncachedPrefillEstimator:
+    """Uncached-prefill estimate for the V2 scheduler's long-prefill demotion
+    (``TLLM_V2_CTX_DEMOTE_UNCACHED_TOKENS``): within a conversation the prompt
+    only grows and the previous turn's prompt is what the cache holds, so
+    uncached ~= prompt_len - previous prompt_len; an unseen conversation, or a
+    request without a conversation id, is an opener (uncached == prompt_len).
+
+    Keyed by the request's own conversation id (not a routing-affinity key
+    that several conversations may share). One int per conversation; the
+    least recently seen conversation is evicted beyond ``max_sessions``.
+    """
+
+    def __init__(self, max_sessions: int):
+        self._last_prompt: "OrderedDict[str, int]" = OrderedDict()
+        self._max_sessions = max(1, int(max_sessions))
+
+    @staticmethod
+    def enabled_by_env() -> bool:
+        """Whether scheduler_v2's long-prefill demotion is on (threshold > 0)."""
+        return int(os.environ.get("TLLM_V2_CTX_DEMOTE_UNCACHED_TOKENS", "0")) > 0
+
+    def __len__(self) -> int:
+        return len(self._last_prompt)
+
+    def publish(self, request) -> None:
+        """Set ``request.py_uncached_prefill_tokens`` and remember the prompt."""
+        if request is None:
+            return
+        conv_id = request_conversation_id(request)
+        prompt = _num_input_tokens(request)
+        prev = self._last_prompt.get(conv_id) if conv_id is not None else None
+        request.py_uncached_prefill_tokens = prompt if prev is None else max(prompt - prev, 0)
+        if conv_id is not None:
+            self._last_prompt[conv_id] = prompt
+            self._last_prompt.move_to_end(conv_id)
+            while len(self._last_prompt) > self._max_sessions:
+                self._last_prompt.popitem(last=False)
+
+
 def is_retiring_request(request) -> bool:
     """True if ``request`` has produced its final token and is being torn down."""
     return request.state == LlmRequestState.GENERATION_TO_COMPLETE
@@ -775,17 +824,14 @@ class ConversationAwareADPRouter(ADPRouter):
     ):
         super().__init__(dist, has_seq_slot_headroom=has_seq_slot_headroom)
         self._conv_to_rank: "OrderedDict[str, int]" = OrderedDict()
-        # Uncached-prefill estimate for the V2 scheduler's long-prefill
-        # demotion: within a conversation the prompt only grows and the
-        # previous turn's prompt is what the cache holds, so uncached ~=
-        # prompt_len - previous prompt_len; an unseen conversation is an
-        # opener (uncached == prompt_len). One int per conversation, evicted
-        # with _conv_to_rank. Published only while demotion is enabled.
-        self._publish_uncached_estimate_enabled = (
-            int(os.environ.get("TLLM_V2_CTX_DEMOTE_UNCACHED_TOKENS", "0")) > 0
-        )
-        self._conv_last_prompt: "OrderedDict[str, int]" = OrderedDict()
         self._max_sessions = max(1, int(max_sessions))
+        # Uncached-prefill estimate for the V2 scheduler's long-prefill
+        # demotion (see UncachedPrefillEstimator); only while demotion is on.
+        self._uncached_estimator: Optional[UncachedPrefillEstimator] = (
+            UncachedPrefillEstimator(self._max_sessions)
+            if UncachedPrefillEstimator.enabled_by_env()
+            else None
+        )
         self._fair_share_multiplier = max(1.0, float(fair_share_multiplier))
         self._new_conv_placement = (
             new_conv_placement
@@ -829,22 +875,12 @@ class ConversationAwareADPRouter(ADPRouter):
         self._conv_to_rank[conv_id] = rank
         self._conv_to_rank.move_to_end(conv_id)
         while len(self._conv_to_rank) > self._max_sessions:
-            evicted, _ = self._conv_to_rank.popitem(last=False)
-            self._conv_last_prompt.pop(evicted, None)
+            self._conv_to_rank.popitem(last=False)
 
-    def _publish_uncached_estimate(self, req_item, conv_id: "str | None") -> None:
-        """Estimate the request's uncached prefill from the conversation's
-        previous prompt length and publish it on the request (see __init__)."""
-        if not self._publish_uncached_estimate_enabled or req_item.request is None:
-            return
-        prompt = _num_input_tokens(req_item.request)
-        prev = self._conv_last_prompt.get(conv_id) if conv_id is not None else None
-        req_item.request.py_uncached_prefill_tokens = (
-            prompt if prev is None else max(prompt - prev, 0)
-        )
-        if conv_id is not None:
-            self._conv_last_prompt[conv_id] = prompt
-            self._conv_last_prompt.move_to_end(conv_id)
+    def _publish_uncached_estimate(self, req_item) -> None:
+        """Publish the request's uncached-prefill estimate while demotion is on."""
+        if self._uncached_estimator is not None:
+            self._uncached_estimator.publish(req_item.request)
 
     def _assign_new_conversation_explicit_dp_ranks(
         self,
@@ -875,7 +911,7 @@ class ConversationAwareADPRouter(ADPRouter):
                 and all_ranks_num_active_requests[target_dp_rank] < max_num_active_requests
             ):
                 all_ranks_num_active_requests[target_dp_rank] += 1
-                self._publish_uncached_estimate(req_item, conv_id)
+                self._publish_uncached_estimate(req_item)
                 all_ranks_new_requests[target_dp_rank].append(req_item)
                 if conv_id is not None:
                     self._record_target_rank(conv_id, target_dp_rank)
@@ -995,7 +1031,7 @@ class ConversationAwareADPRouter(ADPRouter):
                     # Bind this new conversation to its first-turn rank.
                     self._record_target_rank(conv_id, rank)
 
-            self._publish_uncached_estimate(req_item, conv_id)
+            self._publish_uncached_estimate(req_item)
             all_ranks_new_requests[rank].append(req_item)
             all_ranks_num_active_requests[rank] += 1
             if self._new_conv_placement == "least_tokens":

@@ -38,6 +38,7 @@ from tensorrt_llm._torch.pyexecutor.scheduler.adp_router import (
     KVCacheAwareADPRouter,
     RankIterStatsPayload,
     RankState,
+    UncachedPrefillEstimator,
     _num_input_tokens,
     build_active_requests_for_overlap,
     count_retiring_requests,
@@ -1482,6 +1483,30 @@ class TestConversationAwareADPRouter:
         self._route(self._router(tp_size=2), self._states(2), [off])
         assert not isinstance(off.request.py_uncached_prefill_tokens, int)
 
+    def test_uncached_prefill_estimate_is_bounded_by_max_sessions(self, monkeypatch):
+        monkeypatch.setenv("TLLM_V2_CTX_DEMOTE_UNCACHED_TOKENS", "1024")
+        router = self._router(tp_size=2, max_sessions=1)
+        self._route(router, self._states(2), [_make_conv_request_item(0, "A", num_tokens=5000)])
+        self._route(router, self._states(2), [_make_conv_request_item(1, "B", num_tokens=4000)])
+        assert len(router._uncached_estimator) == 1
+        # A was evicted: its next turn is an opener again.
+        again = _make_conv_request_item(2, "A", num_tokens=5300)
+        self._route(router, self._states(2), [again])
+        assert again.request.py_uncached_prefill_tokens == 5300
+
+    def test_uncached_prefill_estimate_is_per_conversation_not_per_affinity(self, monkeypatch):
+        """Sub-agents share a routing-affinity key but each has its own prompt
+        history: the estimate follows the request's own conversation id."""
+        monkeypatch.setenv("TLLM_V2_CTX_DEMOTE_UNCACHED_TOKENS", "1024")
+        router = self._router(tp_size=2)
+        a1 = _make_conv_request_item(0, "child-a", subagent_affinity_id="parent", num_tokens=5000)
+        b1 = _make_conv_request_item(1, "child-b", subagent_affinity_id="parent", num_tokens=800)
+        a2 = _make_conv_request_item(2, "child-a", subagent_affinity_id="parent", num_tokens=5200)
+        for item in (a1, b1, a2):
+            self._route(router, self._states(2), [item])
+        assert b1.request.py_uncached_prefill_tokens == 800
+        assert a2.request.py_uncached_prefill_tokens == 200
+
     def test_no_conversation_id_falls_back_and_is_not_recorded(self):
         router = self._router(tp_size=4)
         items = [_make_conv_request_item(i, None) for i in range(8)]
@@ -1787,3 +1812,66 @@ class TestNumInputTokens:
                 raise AssertionError("input_token_ids must not be materialized")
 
         assert _num_input_tokens(_Req()) == 1234
+
+
+class TestUncachedPrefillEstimator:
+    """Shared by ConversationAwareADPRouter and the non-attention-DP executor."""
+
+    @staticmethod
+    def _req(num_tokens, conversation_id=None):
+        req = _MockRequest()
+        req.input_token_ids = list(range(num_tokens))
+        req.py_conversation_params = (
+            ConversationParams(conversation_id=conversation_id) if conversation_id else None
+        )
+        return req
+
+    def test_unseen_conversation_is_the_whole_prompt(self):
+        est = UncachedPrefillEstimator(max_sessions=8)
+        req = self._req(5000, "A")
+        est.publish(req)
+        assert req.py_uncached_prefill_tokens == 5000
+
+    def test_seen_conversation_is_the_growth_since_the_previous_turn(self):
+        est = UncachedPrefillEstimator(max_sessions=8)
+        est.publish(self._req(5000, "A"))
+        turn2 = self._req(5300, "A")
+        est.publish(turn2)
+        assert turn2.py_uncached_prefill_tokens == 300
+        # A shorter prompt (e.g. a truncated history) never goes negative.
+        shrunk = self._req(1000, "A")
+        est.publish(shrunk)
+        assert shrunk.py_uncached_prefill_tokens == 0
+        # Other conversations are independent.
+        other = self._req(700, "B")
+        est.publish(other)
+        assert other.py_uncached_prefill_tokens == 700
+
+    def test_no_conversation_id_is_the_whole_prompt_and_not_recorded(self):
+        est = UncachedPrefillEstimator(max_sessions=8)
+        for _ in range(2):
+            req = self._req(4000)
+            est.publish(req)
+            assert req.py_uncached_prefill_tokens == 4000
+        assert len(est) == 0
+        est.publish(None)  # no request: no-op
+        assert len(est) == 0
+
+    def test_lru_bound(self):
+        est = UncachedPrefillEstimator(max_sessions=2)
+        est.publish(self._req(100, "A"))
+        est.publish(self._req(100, "B"))
+        est.publish(self._req(200, "A"))  # touch A: B is now the oldest
+        est.publish(self._req(100, "C"))
+        assert len(est) == 2
+        b = self._req(150, "B")
+        est.publish(b)  # B was evicted -> opener
+        assert b.py_uncached_prefill_tokens == 150
+
+    def test_enabled_by_env(self, monkeypatch):
+        monkeypatch.delenv("TLLM_V2_CTX_DEMOTE_UNCACHED_TOKENS", raising=False)
+        assert not UncachedPrefillEstimator.enabled_by_env()
+        monkeypatch.setenv("TLLM_V2_CTX_DEMOTE_UNCACHED_TOKENS", "0")
+        assert not UncachedPrefillEstimator.enabled_by_env()
+        monkeypatch.setenv("TLLM_V2_CTX_DEMOTE_UNCACHED_TOKENS", "8192")
+        assert UncachedPrefillEstimator.enabled_by_env()

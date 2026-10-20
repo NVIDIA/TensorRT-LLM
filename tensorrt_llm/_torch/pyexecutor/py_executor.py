@@ -119,7 +119,9 @@ from .sampler import (AsyncWorkerMixin, Sampler, SamplerEvent, SampleState,
 from .scheduler import (RequestScheduler, ScheduledRequests,
                         SerializableSchedulerOutput, WaitingQueue,
                         create_waiting_queue)
-from .scheduler.adp_router import (ADPRouter, RankIterStatsPayload, RankState,
+from .scheduler.adp_router import (ADPRouter, ConversationAwareADPRouter,
+                                   RankIterStatsPayload, RankState,
+                                   UncachedPrefillEstimator,
                                    count_retiring_requests)
 from .scheduler.scheduler import RemoteTailPhase
 from .scheduler.scheduler_v2 import KVCacheV2Scheduler
@@ -816,6 +818,16 @@ class PyExecutor:
             attention_dp_config=self.llm_args.attention_dp_config,
             async_transfer_manager=self.async_transfer_manager,
         )
+        # Without attention DP no router publishes the uncached-prefill
+        # estimate that scheduler_v2's long-prefill demotion needs, so this
+        # server estimates it itself from each conversation's previous prompt.
+        # Only while demotion is enabled; otherwise requests stay untouched.
+        self._uncached_prefill_estimator: Optional[
+            UncachedPrefillEstimator] = None
+        if (not self.enable_attention_dp
+                and UncachedPrefillEstimator.enabled_by_env()):
+            self._uncached_prefill_estimator = UncachedPrefillEstimator(
+                max_sessions=ConversationAwareADPRouter.DEFAULT_MAX_SESSIONS)
 
         self.previous_batch: Optional[BatchState] = None
         self.has_previous_draft_tokens = False
@@ -6796,6 +6808,8 @@ class PyExecutor:
             self.num_fetch_requests_cur_rank += len(new_requests_cur_rank)
 
             new_requests = new_requests_cur_rank
+        elif getattr(self, "_uncached_prefill_estimator", None) is not None:
+            self._publish_uncached_prefill_estimates(new_requests)
 
         # 7. Merge requests
         if self._kv_load_tracker.enabled and new_requests:
@@ -6806,6 +6820,18 @@ class PyExecutor:
                               cp_size=self.dist.cp_size,
                               exclude_last_generation_logits=self.
                               _should_exclude_last_generation_logits())
+
+    def _publish_uncached_prefill_estimates(
+            self, new_requests: List[RequestQueueItem]) -> None:
+        """Non-attention-DP counterpart of the ADP routers' estimate: set
+        py_uncached_prefill_tokens on each new context request. Every TP rank
+        sees the same new requests, so the estimates agree across ranks."""
+        for req_item in new_requests:
+            request = req_item.request
+            if (request is None or request.request_type
+                    == RequestType.REQUEST_TYPE_GENERATION_ONLY):
+                continue
+            self._uncached_prefill_estimator.publish(request)
 
     def _handle_special_queue_items(
             self,

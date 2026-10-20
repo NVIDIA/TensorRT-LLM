@@ -2726,6 +2726,37 @@ def test_pad_still_warns_on_a_genuine_routable_surplus():
     assert "exceeds expected_num_active_requests" in mock_logger.warning.call_args[0][0]
 
 
+def test_non_adp_publishes_uncached_prefill_estimates():
+    """Without attention DP the executor itself publishes the estimate that
+    scheduler_v2's long-prefill demotion reads; generation-only requests are
+    left alone."""
+    from tensorrt_llm._torch.pyexecutor.scheduler.adp_router import UncachedPrefillEstimator
+    from tensorrt_llm.bindings.executor import RequestType
+    from tensorrt_llm.conversation_params import ConversationParams
+
+    stub = types.SimpleNamespace(_uncached_prefill_estimator=UncachedPrefillEstimator(8))
+
+    def item(request_type, num_tokens, conversation_id="A"):
+        request = Mock(
+            request_type=request_type,
+            num_input_tokens=num_tokens,
+            py_conversation_params=ConversationParams(conversation_id=conversation_id),
+            py_uncached_prefill_tokens=None,
+        )
+        return types.SimpleNamespace(request=request)
+
+    ctx = RequestType.REQUEST_TYPE_CONTEXT_AND_GENERATION
+    opener, gen_only = item(ctx, 5000), item(RequestType.REQUEST_TYPE_GENERATION_ONLY, 9000)
+    PyExecutor._publish_uncached_prefill_estimates(
+        stub, [opener, gen_only, types.SimpleNamespace(request=None)]
+    )
+    assert opener.request.py_uncached_prefill_tokens == 5000
+    assert gen_only.request.py_uncached_prefill_tokens is None
+    follow_up = item(ctx, 5300)
+    PyExecutor._publish_uncached_prefill_estimates(stub, [follow_up])
+    assert follow_up.request.py_uncached_prefill_tokens == 300
+
+
 def _run_non_adp_fetch(active_requests, *, exclude_retiring_requests, max_num_active_requests=4):
     """Drive the non-attention-DP branch of ``_fetch_new_requests``.
 
