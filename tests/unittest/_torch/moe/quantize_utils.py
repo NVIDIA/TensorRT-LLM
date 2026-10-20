@@ -390,7 +390,7 @@ class RefMLPFusedMoE(nn.Module):
         for expert in range(self.num_experts):
             self._load_expert_weights_with_scales(weights, expert)
 
-        # Match production (pyexecutor/model_loader.py): finalize quant-method
+        # Match production (pyexecutor/weight_load_strategies/model_hooks.py): finalize quant-method
         # scale layouts after load. Without this the FP8BlockScales ref keeps
         # raw float32 scales and fp8_swap_ab_gemm on sm107 explodes to inf.
         # No-op for methods without a post_load_weights override.
