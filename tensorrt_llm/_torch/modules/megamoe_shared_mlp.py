@@ -20,6 +20,8 @@ from collections.abc import Callable
 import torch
 import torch.nn.functional as F
 
+from tensorrt_llm.quantization.utils.fp8_utils import transform_k128_scales_to_cutedsl_mxfp8_layout
+
 from ..distributed import AllReduceParams
 from ..model_config import ModelConfig
 from .gated_mlp import GatedMLP
@@ -116,8 +118,8 @@ class MegaMoESharedMLP(GatedMLP):
             overridden_tp_size=overridden_tp_size,
             reduce_output=False,
             layer_idx=layer_idx,
-            # This selects the existing Linear post-load UE8M0 conversion, including when
-            # the caller's dense GEMM preference is unset.
+            # On SM107 this selects Linear's post-load CuTe DSL MXFP8 conversion. On
+            # SM100/103 Linear then keeps FP32 K128 scales instead of DeepGEMM's layout.
             use_cute_dsl_blockscaling_mm=True,
             disable_deep_gemm=disable_deep_gemm,
             is_shared_expert=is_shared_expert,
@@ -126,6 +128,9 @@ class MegaMoESharedMLP(GatedMLP):
             swiglu_beta=swiglu_beta,
         )
         self._validate_fp8_quantization()
+        # The fused kernel reads UE8M0 scales; Linear rounds FP32 block scales at load.
+        for projection in (self.gate_up_proj, self.down_proj):
+            projection.round_block_scales_to_ue8m0 = True
         self._fc12_reserved_sms = fc12_reserved_sms
         self._fc12_max_tokens = int(config.max_num_tokens)
         if self._fc12_max_tokens <= 0:
@@ -198,6 +203,14 @@ class MegaMoESharedMLP(GatedMLP):
             )
         if any(t.device != fc1.device for t in sources):
             raise ValueError("Shared FC12 weights and scales must be on the same device")
+        if fc1_sf.dtype == torch.float32 and fc2_sf.dtype == torch.float32:
+            # Linear kept UE8M0-valued FP32 K128 scales (SM100/103).
+            fc1_sf = transform_k128_scales_to_cutedsl_mxfp8_layout(
+                fc1_sf, mn=fc1.shape[0], k=fc1.shape[1]
+            )
+            fc2_sf = transform_k128_scales_to_cutedsl_mxfp8_layout(
+                fc2_sf, mn=fc2.shape[0], k=fc2.shape[1]
+            )
         logical_fc1_sf = _unpack_r128c4(fc1_sf, 2 * intermediate, self.hidden_size // 32)
         _unpack_r128c4(fc2_sf, self.hidden_size, intermediate // 32)
         # Byte views keep packing independent of PyTorch FP8 indexing support.
