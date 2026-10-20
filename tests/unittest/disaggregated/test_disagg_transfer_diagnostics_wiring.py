@@ -26,7 +26,7 @@ import pytest
 import tensorrt_llm._torch.disaggregation.native.transfer as transfer_module
 import tensorrt_llm._torch.disaggregation.transceiver as python_transceiver_module
 from tensorrt_llm import DisaggregatedParams
-from tensorrt_llm._torch.disaggregation import diagnostics, kv_cache_transceiver
+from tensorrt_llm._torch.disaggregation import diagnostics
 from tensorrt_llm._torch.disaggregation.base import CacheExtent, Chunk, TokenRange
 from tensorrt_llm._torch.disaggregation.base.transfer import SessionStatus, WaitResult
 from tensorrt_llm._torch.disaggregation.native.transfer import (
@@ -46,9 +46,7 @@ from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
-from tensorrt_llm._torch.pyexecutor.scheduler import MultimodalScheduler, SimpleScheduler
 from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import KVCacheV2Scheduler, ScheduleAction
-from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig
 
 pytestmark = pytest.mark.cpu_only
 
@@ -104,158 +102,6 @@ def _coordinator(
     )
 
 
-@pytest.mark.parametrize("diagnostic_mode", ["disabled", "enabled", "failing"])
-@pytest.mark.parametrize(
-    ("configured_runtime", "pipelined", "expected_runtime"),
-    [
-        ("PYTHON", False, "PYTHON"),
-        ("CPP", False, "CPP"),
-        (None, False, "CPP"),
-        ("auto", False, "CPP"),
-        ("auto", True, "PYTHON"),
-    ],
-)
-def test_factory_reports_effective_diagnostic_capabilities(
-    monkeypatch: pytest.MonkeyPatch,
-    diagnostic_mode: str,
-    configured_runtime: str | None,
-    pipelined: bool,
-    expected_runtime: str,
-) -> None:
-    config = CacheTransceiverConfig(
-        backend="NIXL",
-        transceiver_runtime=configured_runtime,
-        enable_pipelined_transfer=pipelined,
-    )
-    transceiver = object()
-    constructors = {
-        "PYTHON": Mock(return_value=transceiver),
-        "CPP": Mock(return_value=transceiver),
-    }
-    monkeypatch.setattr(python_transceiver_module, "KvCacheTransceiverV2", constructors["PYTHON"])
-    monkeypatch.setattr(kv_cache_transceiver, "BindKvCacheTransceiver", constructors["CPP"])
-    monkeypatch.setattr(kv_cache_transceiver, "is_disagg_inflight_cancel_enabled", lambda: False)
-    monkeypatch.setattr(
-        diagnostics, "DISAGG_TRANSFER_DIAGNOSTICS_ENABLED", diagnostic_mode != "disabled"
-    )
-
-    def record_capabilities(*_args, **_kwargs) -> None:
-        constructors[expected_runtime].assert_called_once()
-        if diagnostic_mode == "failing":
-            raise RuntimeError("diagnostic emission failed")
-
-    emit_event = Mock(side_effect=record_capabilities)
-    monkeypatch.setattr(diagnostics, "emit_event", emit_event)
-
-    result = kv_cache_transceiver.create_kv_cache_transceiver(
-        SimpleNamespace(rank=4), Mock(), Mock(), Mock(), config
-    )
-
-    assert result is transceiver
-    constructors[expected_runtime].assert_called_once()
-    constructors["CPP" if expected_runtime == "PYTHON" else "PYTHON"].assert_not_called()
-    if diagnostic_mode == "disabled":
-        emit_event.assert_not_called()
-    else:
-        emit_event.assert_called_once_with(
-            "diagnostic_capabilities",
-            side="runtime",
-            request_id=None,
-            rank=4,
-            capability_schema_version=1,
-            transceiver_runtime=expected_runtime,
-            python_transfer_events=expected_runtime == "PYTHON",
-        )
-
-
-@pytest.mark.parametrize("runtime", ["PYTHON", "CPP"])
-def test_factory_does_not_report_capabilities_when_construction_fails(
-    monkeypatch: pytest.MonkeyPatch, runtime: str
-) -> None:
-    constructor = Mock(side_effect=RuntimeError("transceiver construction failed"))
-    monkeypatch.setattr(python_transceiver_module, "KvCacheTransceiverV2", constructor)
-    monkeypatch.setattr(kv_cache_transceiver, "BindKvCacheTransceiver", constructor)
-    monkeypatch.setattr(kv_cache_transceiver, "is_disagg_inflight_cancel_enabled", lambda: False)
-    monkeypatch.setattr(diagnostics, "DISAGG_TRANSFER_DIAGNOSTICS_ENABLED", True)
-    emit_event = Mock()
-    monkeypatch.setattr(diagnostics, "emit_event", emit_event)
-
-    with pytest.raises(RuntimeError, match="transceiver construction failed"):
-        kv_cache_transceiver.create_kv_cache_transceiver(
-            SimpleNamespace(rank=4),
-            Mock(),
-            Mock(),
-            Mock(),
-            CacheTransceiverConfig(backend="NIXL", transceiver_runtime=runtime),
-        )
-
-    constructor.assert_called_once()
-    emit_event.assert_not_called()
-
-
-@pytest.mark.parametrize("diagnostic_mode", ["disabled", "enabled", "failing"])
-@pytest.mark.parametrize("scheduler_v2", [False, True])
-@pytest.mark.parametrize("wrapped", [False, True])
-def test_executor_reports_scheduler_capabilities_independently_of_transceiver(
-    monkeypatch: pytest.MonkeyPatch,
-    diagnostic_mode: str,
-    scheduler_v2: bool,
-    wrapped: bool,
-) -> None:
-    scheduler = object.__new__(KVCacheV2Scheduler if scheduler_v2 else SimpleScheduler)
-    if wrapped:
-        wrapper = object.__new__(MultimodalScheduler)
-        wrapper.scheduler = scheduler
-        scheduler = wrapper
-    executor = object.__new__(PyExecutor)
-    executor.scheduler = scheduler
-    # Deliberately do not correlate scheduler V2 with the Python runtime.
-    executor.kv_cache_transceiver = SimpleNamespace(consumes_transfer_buffer=scheduler_v2)
-    executor.global_rank = 4
-    monkeypatch.setattr(
-        diagnostics, "DISAGG_TRANSFER_DIAGNOSTICS_ENABLED", diagnostic_mode != "disabled"
-    )
-    emit_event = Mock(
-        side_effect=RuntimeError("diagnostic emission failed")
-        if diagnostic_mode == "failing"
-        else None
-    )
-    monkeypatch.setattr(diagnostics, "emit_event", emit_event)
-
-    executor._emit_disagg_diagnostic_capabilities()
-
-    if diagnostic_mode == "disabled":
-        emit_event.assert_not_called()
-    else:
-        emit_event.assert_called_once_with(
-            "diagnostic_capabilities",
-            side="runtime",
-            request_id=None,
-            rank=4,
-            capability_schema_version=1,
-            executor_events=True,
-            scheduler_kv_admission_events=scheduler_v2,
-        )
-
-
-def test_capability_reporting_skips_disabled_transceiver(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(diagnostics, "DISAGG_TRANSFER_DIAGNOSTICS_ENABLED", True)
-    emit_event = Mock()
-    monkeypatch.setattr(diagnostics, "emit_event", emit_event)
-    executor = object.__new__(PyExecutor)
-    executor.kv_cache_transceiver = None
-
-    assert (
-        kv_cache_transceiver.create_kv_cache_transceiver(Mock(), Mock(), Mock(), Mock(), None)
-        is None
-    )
-    executor._emit_disagg_diagnostic_capabilities()
-
-    emit_event.assert_not_called()
-
-
 def test_sender_reports_worker_dequeue_before_transfer_preparation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -277,6 +123,7 @@ def test_sender_reports_worker_dequeue_before_transfer_preparation(
     sender = object.__new__(Sender)
     sender._device_id = 0
     sender._send_task_queues = [task_queue]
+    sender._pending_settlements = [{}]
     sender._registrar = SimpleNamespace(self_rank_info=SimpleNamespace())
     sender._thread_local = threading.local()
     operations = []
@@ -400,83 +247,6 @@ def test_scheduler_emits_admitted_and_deferred_kv_admission_results(
     assert deferred_event.kwargs["capacity_block_equivalent"] is None
 
 
-def test_scheduler_kv_pool_snapshot_reports_pressure_and_skips_irrelevant_batches(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    get_stats = Mock(
-        return_value=SimpleNamespace(
-            max_num_blocks=100,
-            free_num_blocks=40,
-            used_num_blocks=60,
-        ),
-    )
-    manager = SimpleNamespace(
-        get_kv_cache_stats=get_stats,
-        mapping=SimpleNamespace(rank=3, tp_rank=1, pp_rank=0, cp_rank=0),
-        index_mapper=SimpleNamespace(num_free_slots=lambda: 7),
-    )
-    scheduler = object.__new__(KVCacheV2Scheduler)
-    scheduler.kv_cache_manager = manager
-    emit_event = Mock()
-    monkeypatch.setattr(diagnostics, "DISAGG_TRANSFER_DIAGNOSTICS_ENABLED", True)
-    monkeypatch.setattr(diagnostics, "emit_event", emit_event)
-
-    decode = SimpleNamespace(
-        is_disagg_generation_init_state=False,
-        is_disagg_generation_transmission_in_progress=False,
-        is_disagg_generation_transmission_complete=False,
-        state=LlmRequestState.GENERATION_IN_PROGRESS,
-    )
-    scheduler._emit_disagg_kv_pool_snapshot([decode], [])
-
-    get_stats.assert_not_called()
-    emit_event.assert_not_called()
-
-    pending = SimpleNamespace(
-        is_disagg_generation_init_state=True,
-        is_disagg_generation_transmission_in_progress=False,
-        is_disagg_generation_transmission_complete=False,
-        state=LlmRequestState.DISAGG_GENERATION_INIT,
-    )
-    transferring = SimpleNamespace(
-        is_disagg_generation_init_state=False,
-        is_disagg_generation_transmission_in_progress=True,
-        is_disagg_generation_transmission_complete=False,
-        state=LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS,
-    )
-    transferred = SimpleNamespace(
-        is_disagg_generation_init_state=False,
-        is_disagg_generation_transmission_in_progress=False,
-        is_disagg_generation_transmission_complete=True,
-        state=LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE,
-    )
-    scheduler._emit_disagg_kv_pool_snapshot(
-        [pending, transferring, transferred, decode],
-        [pending],
-    )
-
-    get_stats.assert_called_once_with()
-    event = emit_event.call_args
-    assert event.args == ("gen_kv_pool_snapshot",)
-    assert event.kwargs == {
-        "side": "gen",
-        "request_id": None,
-        "rank": 3,
-        "init_requests": 1,
-        "transfers_in_progress": 1,
-        "transfers_complete": 1,
-        "kv_admitted_this_iteration": 1,
-        "decode_requests": 1,
-        "kv_pool_max_blocks": 100,
-        "kv_pool_free_blocks": 40,
-        "kv_pool_used_blocks": 60,
-        "index_free_slots": 7,
-        "tp_rank": 1,
-        "pp_rank": 0,
-        "cp_rank": 0,
-    }
-
-
 def test_gen_timeout_start_and_observation_share_request_identity(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -570,6 +340,7 @@ def test_gen_decode_ready_requires_successful_handoff_and_uses_full_cp_prompt_le
 
     executor._setup_sampler_step = Mock(side_effect=prepare_sampler)
     executor.model_engine = SimpleNamespace(enable_spec_decode=False)
+    executor.draft_model_engine = None
     executor.kv_cache_transceiver = SimpleNamespace(commit_blocks_for_reuse=Mock())
     executor._update_sampler_state_for_disagg_gen_request = Mock(return_value=True)
     executor._maybe_prepend_logprobs_and_logits = Mock()
@@ -786,7 +557,6 @@ def test_bridge_validation_rejection_emits_failed_ctx_settlement_after_release(
     assert settlement["request_id"] == 3032
     assert settlement["local_request_id"] == 32
     assert settlement["outcome"] == "failed"
-    assert settlement["session_status"] is None
     assert settlement["resources_drained"] is True
     assert request.py_kv_transfer_start_time is None
 
@@ -822,9 +592,11 @@ def test_sync_receive_emits_start_and_terminal_settlement(
         wait_complete=Mock(side_effect=lambda blocking: operations.append("wait") or wait_result),
         has_transferring_tasks=Mock(return_value=False),
         close=Mock(side_effect=lambda: operations.append("close") or True),
+        kv_write_verified=Mock(return_value=True),
     )
 
-    def receive(_chunk: Chunk) -> None:
+    def receive(_chunk: Chunk, *, expected_write_bytes: int) -> None:
+        assert expected_write_bytes == 64
         operations.append("receive")
         session._kv_tasks.append(SimpleNamespace(status=TaskStatus.TRANSFERRED))
 
@@ -874,7 +646,6 @@ def test_sync_receive_emits_start_and_terminal_settlement(
     assert receive_start["transfer_bytes"] == 128
     assert receive_start["timeout_expected"] is False
     assert settlement["outcome"] == outcome
-    assert settlement["session_status"] == session_status.value
     assert settlement["resources_drained"] is True
     assert request.state == request_state
     assert transceiver._recv_sessions == {}
@@ -900,7 +671,7 @@ def test_sync_receive_does_not_report_settlement_while_close_is_refused(
         close=Mock(return_value=False),
     )
     session.receive = Mock(
-        side_effect=lambda _chunk: session._kv_tasks.append(
+        side_effect=lambda _chunk, **_kwargs: session._kv_tasks.append(
             SimpleNamespace(status=TaskStatus.TRANSFERRING)
         )
     )
@@ -947,7 +718,7 @@ def test_sync_receive_disabled_diagnostics_preserves_receive_failure_order(
     transceiver._transfer_worker = SimpleNamespace(create_rx_session=Mock(return_value=session))
     extent = _extent(4045)
     transceiver._create_cache_extent = Mock(return_value=extent)
-    transceiver._chunk_num_bytes = Mock(side_effect=AssertionError("must not size before receive"))
+    transceiver._chunk_num_bytes = Mock(return_value=64)
 
     monkeypatch.setattr(diagnostics, "DISAGG_TRANSFER_DIAGNOSTICS_ENABLED", False)
 
@@ -955,9 +726,9 @@ def test_sync_receive_disabled_diagnostics_preserves_receive_failure_order(
         transceiver.request_and_receive_sync(request)
 
     transceiver._create_cache_extent.assert_called_once_with(request)
-    session.receive.assert_called_once_with(extent.local)
+    session.receive.assert_called_once_with(extent.local, expected_write_bytes=64)
     session.fail_admission.assert_called_once()
-    transceiver._chunk_num_bytes.assert_not_called()
+    transceiver._chunk_num_bytes.assert_called_once_with(extent.local)
     assert request.state == LlmRequestState.DISAGG_TRANS_ERROR
     assert transceiver._recv_sessions == {}
     assert transceiver._recv_reqs == {}
@@ -1018,7 +789,7 @@ def test_fallback_identity_matches_session_without_changing_local_table_keys(
         close=Mock(return_value=True),
     )
     session.receive = Mock(
-        side_effect=lambda _chunk: session._kv_tasks.append(
+        side_effect=lambda _chunk, **_kwargs: session._kv_tasks.append(
             SimpleNamespace(status=TaskStatus.TRANSFERRING)
         )
     )
@@ -1057,7 +828,6 @@ def test_fallback_identity_matches_session_without_changing_local_table_keys(
     session.close.assert_called_once_with()
     assert [call.args[0] for call in emit_event.call_args_list] == [
         "gen_kv_admission_result",
-        "gen_transfer_window_result",
         "gen_receive_start",
         "transfer_cancel_requested",
         "gen_transfer_settled",
@@ -1123,18 +893,25 @@ def test_settlement_without_request_or_session_reports_unknown_identity_scope(
 
 
 @pytest.mark.parametrize("side", ("ctx", "gen"))
-def test_fast_cancel_emits_one_terminal_settlement(
-    monkeypatch: pytest.MonkeyPatch,
-    side: str,
+@pytest.mark.parametrize("inflight", [False, True])
+def test_cancel_diagnostics_do_not_poll_session_status(
+    monkeypatch: pytest.MonkeyPatch, side: str, inflight: bool
 ) -> None:
+    """Observe cancellation without advancing state through a status getter."""
+    status_poll = Mock(side_effect=AssertionError("diagnostics polled session status"))
+
+    class Session(SimpleNamespace):
+        @property
+        def status(self) -> SessionStatus:
+            return status_poll()
+
     request = _disagg_request(42, 4042)
     request.py_kv_send_session_retired = False
-    session = SimpleNamespace(
-        status=SessionStatus.READY,
-        has_transferring_tasks=Mock(return_value=False),
+    session = Session(
+        cancel=Mock(),
+        has_transferring_tasks=Mock(return_value=inflight),
         close=Mock(return_value=True),
     )
-    session.cancel = Mock(side_effect=lambda: setattr(session, "status", SessionStatus.CANCELLED))
     transceiver = _diagnostic_transceiver()
     transceiver._wait_reqs = {}
     transceiver._send_sessions = {4042: session} if side == "ctx" else {}
@@ -1142,198 +919,55 @@ def test_fast_cancel_emits_one_terminal_settlement(
     transceiver._recv_sessions = {4042: session} if side == "gen" else {}
     transceiver._recv_reqs = {4042: request} if side == "gen" else {}
 
-    emitted = []
+    settlement_cleanup: list[bool] = []
 
-    def emit_event(event: str, **kwargs) -> None:
+    def record_settlement_cleanup(event: str, **_fields: object) -> None:
+        """Capture cleanup ordering for assertions outside diagnostic suppression."""
         if event.endswith("_transfer_settled"):
-            assert 4042 not in transceiver._send_sessions
-            assert 4042 not in transceiver._recv_sessions
-        emitted.append((event, kwargs))
+            settlement_cleanup.append(
+                not any(
+                    (
+                        transceiver._send_sessions,
+                        transceiver._recv_sessions,
+                        transceiver._send_reqs,
+                        transceiver._recv_reqs,
+                    )
+                )
+            )
 
+    emit = Mock(side_effect=record_settlement_cleanup)
     monkeypatch.setattr(diagnostics, "DISAGG_TRANSFER_DIAGNOSTICS_ENABLED", True)
-    monkeypatch.setattr(diagnostics, "emit_event", emit_event)
+    monkeypatch.setattr(diagnostics, "emit_event", emit)
 
-    assert transceiver.cancel_request(request) is True
-    assert transceiver.cancel_request(request) is True
-
-    assert [event for event, _kwargs in emitted] == [
-        "transfer_cancel_requested",
-        f"{side}_transfer_settled",
-    ]
-    settlement = emitted[1][1]
-    assert settlement["outcome"] == "cancelled"
-    assert settlement["session_status"] == SessionStatus.CANCELLED.value
-    assert settlement["resources_drained"] is True
-    session.close.assert_called_once_with()
-    sessions = transceiver._send_sessions if side == "ctx" else transceiver._recv_sessions
-    requests = transceiver._send_reqs if side == "ctx" else transceiver._recv_reqs
-    assert sessions == {}
-    assert requests == {}
-    if side == "ctx":
-        assert request.py_kv_send_session_retired is True
-
-
-@pytest.mark.parametrize("side", ("ctx", "gen"))
-def test_active_cancel_does_not_emit_terminal_settlement(
-    monkeypatch: pytest.MonkeyPatch,
-    side: str,
-) -> None:
-    request = _disagg_request(43, 4043)
-    session = SimpleNamespace(
-        status=SessionStatus.TRANSFERRING,
-        cancel=Mock(),
-        has_transferring_tasks=Mock(return_value=True),
-        close=Mock(),
-    )
-    transceiver = _diagnostic_transceiver()
-    transceiver._wait_reqs = {}
-    transceiver._send_sessions = {4043: session} if side == "ctx" else {}
-    transceiver._send_reqs = {4043: request} if side == "ctx" else {}
-    transceiver._recv_sessions = {4043: session} if side == "gen" else {}
-    transceiver._recv_reqs = {4043: request} if side == "gen" else {}
-
-    emit_event = Mock()
-    monkeypatch.setattr(diagnostics, "DISAGG_TRANSFER_DIAGNOSTICS_ENABLED", True)
-    monkeypatch.setattr(diagnostics, "emit_event", emit_event)
-
-    assert transceiver.cancel_request(request) is False
-
-    assert [call.args[0] for call in emit_event.call_args_list] == ["transfer_cancel_requested"]
-    session.close.assert_not_called()
-
-
-def test_bypassed_transfer_window_reports_legacy_budget_counterfactual(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    active = _disagg_request(20, 2020, prompt_len=32)
-    active.is_disagg_generation_transmission_in_progress = True
-    candidates = [
-        _disagg_request(21, 2021, prompt_len=64),
-        _disagg_request(22, 2022, prompt_len=32),
-    ]
-    controller = DisaggTransferAdmissionController(
-        max_tokens_in_buffer=64,
-        tokens_per_block=32,
-    )
-    coordinator = _coordinator(controller=controller, active_requests=[active])
-    monkeypatch.delenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY", raising=False)
-    monkeypatch.delenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP", raising=False)
-
-    emit_event = Mock()
-    monkeypatch.setattr(diagnostics, "DISAGG_TRANSFER_DIAGNOSTICS_ENABLED", True)
-    monkeypatch.setattr(diagnostics, "emit_event", emit_event)
-
-    admitted, wait_for_progress = coordinator.admit(candidates)
-
-    assert admitted == candidates
-    assert wait_for_progress is False
-    assert emit_event.call_count == 2
-    for event, request in zip(emit_event.call_args_list, candidates):
-        assert event.args == ("gen_transfer_window_result",)
-        assert event.kwargs["request_id"] == request.py_disaggregated_params.disagg_request_id
-        assert event.kwargs["outcome"] == "admitted"
-        assert event.kwargs["policy"] == "bypassed"
-        assert event.kwargs["legacy_budget_outcome"] == "deferred"
-        assert event.kwargs["legacy_active_transfer_blocks"] == 1
-        assert event.kwargs["legacy_admitted_transfer_blocks"] == 0
-        assert event.kwargs["legacy_limited_by_budget"] is True
-        assert event.kwargs["transfer_block_budget"] == 2
-
-
-def test_transfer_window_result_uses_full_cp_prompt_length(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    request = _disagg_request(23, 2023, prompt_len=1)
-    request.total_input_len_cp = 257
-    controller = DisaggTransferAdmissionController(
-        max_tokens_in_buffer=512,
-        tokens_per_block=32,
-    )
-    coordinator = _coordinator(controller=controller)
-    coordinator._dist.cp_rank = 3
-
-    emit_event = Mock()
-    monkeypatch.setattr(diagnostics, "DISAGG_TRANSFER_DIAGNOSTICS_ENABLED", True)
-    monkeypatch.setattr(diagnostics, "emit_event", emit_event)
-
-    coordinator._emit_disagg_transfer_window_results(
-        [request],
-        [request],
-        policy="enforced",
-        controller=controller,
-        active_transfer_blocks=0,
-        admitted_transfer_blocks=9,
-    )
-
-    event = emit_event.call_args
-    assert event.args == ("gen_transfer_window_result",)
-    assert event.kwargs["prompt_tokens"] == 257
-    assert event.kwargs["request_blocks"] == 9
-    assert event.kwargs["cp_rank"] == 3
-
-
-def test_disabled_diagnostics_do_not_evaluate_bypass_counterfactual(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    candidate = _disagg_request(21, 2021)
-    controller = Mock()
-    controller.enabled.return_value = True
-    controller.select.side_effect = AssertionError(
-        "disabled diagnostics evaluated the legacy transfer window"
-    )
-    coordinator = _coordinator(controller=controller)
-    monkeypatch.delenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY", raising=False)
-    monkeypatch.delenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP", raising=False)
-    monkeypatch.setattr(diagnostics, "DISAGG_TRANSFER_DIAGNOSTICS_ENABLED", False)
-
-    admitted, wait_for_progress = coordinator.admit([candidate])
-
-    assert admitted == [candidate]
-    assert wait_for_progress is False
-    controller.select.assert_not_called()
-
-
-def test_diagnostic_preparation_failure_does_not_change_bypassed_admission(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    class _BrokenLegacyResult:
-        @property
-        def admitted_requests(self) -> list:
-            raise RuntimeError("diagnostic counterfactual inspection failed")
-
-    candidate = _disagg_request(21, 2021)
-    controller = Mock()
-    controller.enabled.return_value = True
-    controller.select.return_value = _BrokenLegacyResult()
-    coordinator = _coordinator(controller=controller)
-    monkeypatch.delenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY", raising=False)
-    monkeypatch.delenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP", raising=False)
-    monkeypatch.setattr(diagnostics, "DISAGG_TRANSFER_DIAGNOSTICS_ENABLED", True)
-
-    admitted, wait_for_progress = coordinator.admit([candidate])
-
-    assert admitted == [candidate]
-    assert wait_for_progress is False
-    controller.select.assert_called_once_with([], [candidate])
-
-
-def test_transfer_window_helper_contains_diagnostic_preparation_failure(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    class _OpaqueCandidate:
-        @property
-        def py_request_id(self) -> int:
-            raise RuntimeError("diagnostic request inspection failed")
-
-    candidate = _OpaqueCandidate()
-    coordinator = _coordinator()
-    monkeypatch.setattr(diagnostics, "DISAGG_TRANSFER_DIAGNOSTICS_ENABLED", True)
-
-    coordinator._emit_disagg_transfer_window_results(
-        [candidate],
-        [candidate],
-        policy="bypassed",
-    )
+    assert transceiver.cancel_request(request) is not inflight
+    session.cancel.assert_called_once_with()
+    session.has_transferring_tasks.assert_called_once_with()
+    status_poll.assert_not_called()
+    expected = ["transfer_cancel_requested"]
+    if not inflight:
+        assert transceiver.cancel_request(request) is True
+        expected.append(f"{side}_transfer_settled")
+        session.close.assert_called_once_with()
+        settlement = emit.call_args_list[-1].kwargs
+        assert settlement["outcome"] == "cancelled"
+        assert settlement["resources_drained"] is True
+        assert not transceiver._send_sessions
+        assert not transceiver._recv_sessions
+        if side == "ctx":
+            assert request.py_kv_send_session_retired is True
+    else:
+        session.close.assert_not_called()
+        sessions = transceiver._send_sessions if side == "ctx" else transceiver._recv_sessions
+        requests = transceiver._send_reqs if side == "ctx" else transceiver._recv_reqs
+        assert sessions == {4042: session}
+        assert requests == {4042: request}
+    assert [call.args[0] for call in emit.call_args_list] == expected
+    assert settlement_cleanup == ([] if inflight else [True])
+    for call in emit.call_args_list:
+        assert call.kwargs["request_id"] == 4042
+        assert call.kwargs["local_request_id"] == 42
+        assert call.kwargs["request_id_scope"] == "run"
+        assert "session_status" not in call.kwargs
 
 
 def test_admission_rollback_continues_when_diagnostic_emission_fails(
@@ -1358,7 +992,6 @@ def test_admission_rollback_continues_when_diagnostic_emission_fails(
     assert admitted == [candidates[0]]
     assert wait_for_progress is False
     coordinator._effects.revert_ctx_alloc.assert_called_once_with([candidates[1]])
-    assert emit_event.call_args_list[0].args == ("gen_transfer_window_result",)
     assert emit_event.call_args_list[-1].args == ("gen_kv_rollback",)
     assert emit_event.call_args_list[-1].kwargs["reason"] == "transfer_window"
 
@@ -1511,6 +1144,7 @@ def test_gen_settlement_continues_when_diagnostic_emission_fails(
         status=SessionStatus.READY,
         transfer_end_time=None,
         kv_cache_size_bytes=0,
+        kv_write_verified=Mock(return_value=True),
         has_transferring_tasks=Mock(return_value=False),
     )
     request = _disagg_request(5, request_id)
@@ -1523,7 +1157,7 @@ def test_gen_settlement_continues_when_diagnostic_emission_fails(
     transceiver._collect_done = Mock(return_value=([request_id], []))
     transceiver._gen_consensus = Mock(side_effect=lambda request_ids: request_ids)
     transceiver._build_to_process = Mock(return_value=[request_id])
-    transceiver._gen_consensus_outcome = Mock(return_value=([], [], [request_id]))
+    transceiver._gen_consensus_outcome = Mock(return_value=([], [], [request_id], [request_id]))
     transceiver._need_aux_transfer = Mock(return_value=False)
     transceiver._assert_disagg_history_declared = Mock()
     transceiver._close_session_or_raise = Mock()
@@ -1554,6 +1188,8 @@ def test_gen_settlement_continues_when_diagnostic_emission_fails(
     assert status.error_request_ids == []
     assert status.cancelled_requests == []
     assert emitted_events == [("gen_transfer_settled", (), ())]
+    session.kv_write_verified.assert_called_once_with()
+    assert request.py_kv_transfer_verified is True
     request.set_kv_cache_size.assert_called_once_with(0)
     transceiver._close_session_or_raise.assert_called_once_with(
         session,
@@ -1614,6 +1250,10 @@ def test_request_cleanup_continues_when_diagnostic_emission_fails(
     executor.resource_manager = SimpleNamespace(free_resources=Mock())
     executor._prefetched_request_ids = {request.py_request_id}
     executor._disagg_coordinator = SimpleNamespace(forget_request=Mock())
+    executor.model_engine = SimpleNamespace(model=SimpleNamespace(release_request_state=Mock()))
+    executor.draft_model_engine = SimpleNamespace(
+        model=SimpleNamespace(release_request_state=Mock())
+    )
     executor.global_rank = 4
     executor.dist = SimpleNamespace(tp_rank=1, pp_rank=0, cp_rank=0)
     monkeypatch.setattr(diagnostics, "DISAGG_TRANSFER_DIAGNOSTICS_ENABLED", True)
@@ -1626,6 +1266,8 @@ def test_request_cleanup_continues_when_diagnostic_emission_fails(
     executor.resource_manager.free_resources.assert_called_once_with(request)
     assert request.py_request_id not in executor._prefetched_request_ids
     executor._disagg_coordinator.forget_request.assert_called_once_with(request.py_request_id)
+    for engine in (executor.model_engine, executor.draft_model_engine):
+        engine.model.release_request_state.assert_called_once_with(request.py_request_id)
 
 
 def test_source_unpin_continues_when_diagnostic_inspection_fails(
@@ -1778,3 +1420,103 @@ def test_native_writer_result_precedes_local_destination_completion(
     assert destination_event["outcome"] == "completed"
     assert destination_event["timestamp"] == destination_timestamp
     assert session.close()
+
+
+@pytest.mark.parametrize("mode", ["disabled", "enabled", "failing"])
+@pytest.mark.parametrize("anchor", ["send", "fallback"])
+def test_native_deadline_diagnostics_preserve_fixed_nonterminal_timeout(
+    monkeypatch: pytest.MonkeyPatch, mode: str, anchor: str
+) -> None:
+    """Observe both existing anchors without rearming or retiring the session."""
+    now = [10.0]
+    sender = SimpleNamespace(
+        setup_session=Mock(),
+        clear_session=Mock(),
+        dispatch_task=Mock(),
+        _get_req_info=lambda _rid: {},
+        _enforce_physical_ownership=False,
+        _registrar=SimpleNamespace(self_rank_info=SimpleNamespace(instance_rank=0)),
+    )
+    emit = Mock(side_effect=RuntimeError("diagnostics failed") if mode == "failing" else None)
+    monkeypatch.setattr(diagnostics, "DISAGG_TRANSFER_DIAGNOSTICS_ENABLED", mode != "disabled")
+    monkeypatch.setattr(diagnostics, "emit_event", emit)
+    monkeypatch.setattr(transfer_module.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(transfer_module.tensorrt_llm.bindings, "global_steady_clock_now", lambda: 0)
+    session = transfer_module.TxSession(
+        request_id=7,
+        params=DisaggregatedParams(disagg_request_id=7007),
+        sender=sender,
+        timeout_s=0.1,
+        overall_timeout_s=1.0,
+    )
+    session.send(_extent(7).local)
+    session.send(_extent(7).local)
+    assert session._deadline_monotonic_s == 11.0
+    assert sender.dispatch_task.call_count == 2
+
+    if anchor == "fallback":
+        session._deadline_monotonic_s = None
+        emit.reset_mock()
+        clock = iter((10.0, 12.0, 12.0))
+        monkeypatch.setattr(transfer_module.time, "monotonic", lambda: next(clock))
+    else:
+        now[0] = 12.0
+    assert session.wait_complete() is WaitResult.TIMEOUT
+    assert session.wait_complete() is WaitResult.TIMEOUT
+    assert session._deadline_monotonic_s == 11.0
+    assert session._terminal_status is None
+    assert not session._closed
+    assert all(task.status is TaskStatus.INIT for task in session.kv_tasks)
+    assert session.close()
+    if mode == "disabled":
+        emit.assert_not_called()
+        return
+    assert [call.args[0] for call in emit.call_args_list] == [
+        "ctx_native_deadline_started",
+        "ctx_native_deadline_observed",
+        "ctx_native_deadline_observed",
+    ]
+    for call in emit.call_args_list:
+        assert call.kwargs["request_id"] == 7007
+        assert call.kwargs["request_id_scope"] == "run"
+        assert call.kwargs["timeout_owner"] == "native_tx_session"
+        assert call.kwargs["deadline_monotonic_ns"] == 11_000_000_000
+    assert emit.call_args_list[0].kwargs["timer_start_monotonic_ns"] == 10_000_000_000
+
+
+@pytest.mark.parametrize("mode", ["disabled", "enabled", "failing"])
+def test_native_profile_diagnostics_do_not_affect_worker_setup(
+    monkeypatch: pytest.MonkeyPatch, mode: str
+) -> None:
+    """Declare only native-path identity after successful worker setup."""
+    rank_info = SimpleNamespace(instance_rank=0)
+    monkeypatch.setattr(transfer_module, "_make_aux_buffer", lambda *_args: None)
+    monkeypatch.setattr(transfer_module.RankInfo, "from_kv_cache_manager", lambda *_args: rank_info)
+    setup_peer = Mock()
+    setup_engine = Mock()
+    monkeypatch.setattr(transfer_module.TransferWorker, "_setup_peer_infrastructure", setup_peer)
+    monkeypatch.setattr(transfer_module.TransferWorker, "_setup_transfer_engine", setup_engine)
+    emit = Mock(side_effect=RuntimeError("diagnostics failed") if mode == "failing" else None)
+    monkeypatch.setattr(diagnostics, "DISAGG_TRANSFER_DIAGNOSTICS_ENABLED", mode != "disabled")
+    monkeypatch.setattr(diagnostics, "emit_event", emit)
+    config = transfer_module.TransferWorkerConfig(
+        kv_cache_manager=object(),
+        max_concurrent_sessions=1,
+        max_draft_len=0,
+        instance_name="test-native",
+        device_id=0,
+    )
+    worker = transfer_module.TransferWorker(config)
+    assert worker._rank_info is rank_info
+    setup_peer.assert_called_once_with(config.kv_cache_manager)
+    setup_engine.assert_called_once_with()
+    if mode == "disabled":
+        emit.assert_not_called()
+    else:
+        emit.assert_called_once_with(
+            "diagnostic_profile",
+            side="runtime",
+            request_id=None,
+            rank_info=rank_info,
+            profile="native_v1",
+        )

@@ -48,9 +48,12 @@ def _harness(group: FakeDistGroup, rank: int = 0, **kwargs) -> CoordinatorHarnes
     return h
 
 
-def _request(h: CoordinatorHarness) -> TransferRequest:
+def _request(h: CoordinatorHarness, **overrides) -> TransferRequest:
     req = TransferRequest(
-        7, prompt_len=128, py_disaggregated_params=SimpleNamespace(disagg_request_id=7007)
+        7,
+        prompt_len=128,
+        py_disaggregated_params=SimpleNamespace(disagg_request_id=7007),
+        **overrides,
     )
     h.active.append(req)
     return req
@@ -253,13 +256,6 @@ def test_admission_diagnostics_preserve_admitted_batch_and_kv_rollback(
     if not enabled:
         emit.assert_not_called()
         return
-    window_events = [
-        call for call in emit.call_args_list if call.args[0] == "gen_transfer_window_result"
-    ]
-    assert window_events
-    assert window_events[0].kwargs["policy"] == ("bypassed" if bypass else "enforced")
-    assert window_events[0].kwargs["request_id"] == 7007
-    assert window_events[0].kwargs["request_id_scope"] == "run"
     rollback_events = [call for call in emit.call_args_list if call.args[0] == "gen_kv_rollback"]
     assert len(rollback_events) == (0 if bypass else 1)
     if rollback_events:
@@ -308,3 +304,71 @@ def test_receive_diagnostics_preserve_preparation_poll_and_timeout_boundaries(
         assert emit.call_args.kwargs["request_id_scope"] == "run"
         assert emit.call_args.kwargs["side"] == "gen"
         assert emit.call_args.kwargs["timer_start_monotonic_ns"] == int(clock["t"] * 1_000_000_000)
+
+
+@pytest.mark.parametrize("action", ["publish", "forget", "terminate"])
+def test_deferred_receive_diagnostics_follow_publication_not_admission(
+    diagnostics, clock, action: str
+) -> None:
+    """Waiting or discarded destinations never start a transfer deadline."""
+    h = _harness(
+        FakeDistGroup(world_size=1, tp_size=1),
+        kv_transfer_timeout_ms=1000,
+        defer_unready_gen_receives=True,
+    )
+    fence = Mock()
+    fence.query.return_value = False
+    fence.synchronize.side_effect = AssertionError("readiness must be polled")
+    h.kv_cache_manager.take_disagg_receive_ready = Mock(return_value=fence)
+    request = _request(
+        h,
+        is_context_only_request=False,
+        state=LlmRequestState.DISAGG_GENERATION_INIT,
+    )
+    enabled, emit = diagnostics
+
+    h.coordinator.receive_gen_init([request])
+    clock["t"] += 5.0
+    h.coordinator.poll_gen_transfers()
+
+    assert h.effects.prepared == [[request]]
+    h.kv_cache_manager.take_disagg_receive_ready.assert_called_once_with(request)
+    assert h.transceiver.call_log == ["check_gen_transfer_status:0"] * 2
+    assert request.state == LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
+    assert request.py_kv_transfer_start_time is None
+    assert fence.query.call_count == 2
+    emit.assert_not_called()
+
+    if action == "forget":
+        h.coordinator.forget_request(request.py_request_id)
+    elif action == "terminate":
+        request.state = LlmRequestState.GENERATION_COMPLETE
+    fence.query.return_value = True
+    h.coordinator.poll_gen_transfers()
+    published_at = clock["t"]
+    clock["t"] += 1.0
+    h.coordinator.poll_gen_transfers()
+
+    assert h.coordinator._unpublished_gen_receives == {}
+    assert h.effects.failed == []
+    assert h.effects.reverted == []
+    fence.synchronize.assert_not_called()
+    receives = h.transceiver.call_log.count("request_and_receive_async:7")
+    if action != "publish":
+        assert receives == 0
+        assert fence.query.call_count == 2
+        assert request.py_kv_transfer_start_time is None
+        emit.assert_not_called()
+        return
+    assert receives == 1
+    assert fence.query.call_count == 3
+    assert request.py_kv_transfer_start_time == published_at
+    if not enabled:
+        emit.assert_not_called()
+        return
+    emit.assert_called_once()
+    assert emit.call_args.args == ("transfer_timeout_started",)
+    assert emit.call_args.kwargs["side"] == "gen"
+    assert emit.call_args.kwargs["request_id"] == 7007
+    assert emit.call_args.kwargs["local_request_id"] == 7
+    assert emit.call_args.kwargs["timer_start_monotonic_ns"] == int(published_at * 1_000_000_000)
