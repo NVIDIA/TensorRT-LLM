@@ -39,12 +39,12 @@ struct GpuCacheTierConfig
 {
     size_t quota = 0; // bytes
 
-    CacheTier tier() const noexcept
+    [[nodiscard]] CacheTier tier() const noexcept
     {
         return CacheTier::GPU_MEM;
     }
 
-    void assertValid() const
+    void validate() const
     {
         if (quota == 0)
             throw std::invalid_argument("GpuCacheTierConfig: quota must be > 0");
@@ -55,15 +55,42 @@ struct HostCacheTierConfig
 {
     size_t quota = 0; // bytes
 
-    CacheTier tier() const noexcept
+    //! Upper bound this tier may ever be resized to, in bytes.
+    //!
+    //! The address range is reserved once at this size so that growing the tier
+    //! only commits more of it and never moves the base address. Reserving costs
+    //! address space, not memory. A resize past this bound is rejected.
+    //!
+    //! Defaults to the host memory the OS reports, which no allocation can
+    //! exceed anyway.
+    std::optional<size_t> maxQuota;
+
+    //! Whether a page may come from a NUMA node other than the one the GPU
+    //! attaches to, when the local node cannot satisfy it.
+    //!
+    //! False keeps every page local, at the cost of capping the tier at one
+    //! node's memory: a quota sized from total system memory cannot then be
+    //! filled. True accepts a remote page, which the GPU reaches more slowly,
+    //! rather than failing the allocation.
+    //!
+    //! False additionally requires that a memory policy be settable. Where the
+    //! host tier is mmap-backed, a container without CAP_SYS_NICE cannot set
+    //! one, and the tier refuses to start rather than fall back to first touch
+    //! -- which prefers the local node but takes a remote page instead of
+    //! failing, and so would not be the strictness that was asked for.
+    bool allowRemoteNumaFallback = true;
+
+    [[nodiscard]] CacheTier tier() const noexcept
     {
         return CacheTier::HOST_MEM;
     }
 
-    void assertValid() const
+    void validate() const
     {
         if (quota == 0)
             throw std::invalid_argument("HostCacheTierConfig: quota must be > 0");
+        if (maxQuota.has_value() && *maxQuota < quota)
+            throw std::invalid_argument("HostCacheTierConfig: maxQuota must be >= quota");
     }
 };
 
@@ -72,12 +99,12 @@ struct DiskCacheTierConfig
     size_t quota = 0; // bytes
     std::string path; // directory for temp files
 
-    CacheTier tier() const noexcept
+    [[nodiscard]] CacheTier tier() const noexcept
     {
         return CacheTier::DISK;
     }
 
-    void assertValid() const;
+    void validate() const;
 };
 
 // Variant holding any tier config.
@@ -92,6 +119,15 @@ inline CacheTier cacheTierOf(CacheTierConfig const& cfg)
 inline size_t cacheTierQuota(CacheTierConfig const& cfg)
 {
     return std::visit([](auto const& c) { return c.quota; }, cfg);
+}
+
+//! The configured ceiling on this tier's quota, where it has one. Only the host
+//! tier reserves address space up front and so carries a maximum; the others are
+//! bounded by the device or the filesystem.
+inline std::optional<size_t> cacheTierMaxQuota(CacheTierConfig const& cfg)
+{
+    auto const* host = std::get_if<HostCacheTierConfig>(&cfg);
+    return host != nullptr ? host->maxQuota : std::nullopt;
 }
 
 // ---------------------------------------------------------------------------
