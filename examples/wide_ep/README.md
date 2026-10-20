@@ -82,7 +82,7 @@ Attention DP (`enable_attention_dp: true`) is not part of this gate, so EPLB is 
 Load-balancing mode, `standard` or `per_layer_dynamic`. Configs without `mode` are treated as `standard`.
 
 * `standard`: offline or online EPLB, selected by [`layer_updates_per_iter`](#layer_updates_per_iter).
-* `per_layer_dynamic`: per-layer dynamic EPLB, which re-plans the expert replicas of every MoE layer on every forward pass from that pass's routing. It requires the `MEGAMOE_CUTEDSL` backend (`AUTO` resolves to it) and accepts only `num_slots` and `auxiliary_sms` besides `mode`. See [Per-Layer Dynamic EP Load Balancer](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/wide_ep/ep_load_balancer#per-layer-dynamic-ep-load-balancer) for an example and its constraints.
+* `per_layer_dynamic`: per-layer dynamic EPLB, which re-plans the expert replicas of every MoE layer on every forward pass from that pass's routing. It requires the `MEGAMOE_CUTEDSL` backend (`AUTO` resolves to it) and accepts only `num_slots`, `auxiliary_sms` and `helper_slot_mode` besides `mode`. See [Per-Layer Dynamic EP Load Balancer](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/wide_ep/ep_load_balancer#per-layer-dynamic-ep-load-balancer) for an example and its constraints.
 
 #### `num_slots`
 
@@ -92,7 +92,7 @@ Total number of expert slots. It must be ≥ total experts, and divisible by the
 2. Set to number of total experts + EP size, such as 288 for DeepSeek R1, 32-way EP.
    * This means there is 1 extra expert on each EP rank, so that there is more room for the per-rank token distribution to be more balanced.
 
-With `mode: per_layer_dynamic`, `num_slots` is required and must be greater than the total expert count, which must itself be divisible by the EP size. Each rank keeps its `num_experts / ep_size` experts and gets `(num_slots - num_experts) / ep_size` extra slots. Unlike `standard` mode, the extra slots are shared helper banks rather than per-layer replicas: all MoE layers alternate between the same two helper banks, and each layer refills its bank with copies of its hot experts on every forward pass. For example, 384 experts with `num_slots: 416` on 8 EP ranks give each rank 48 experts and 4 helper slots.
+With `mode: per_layer_dynamic`, `num_slots` is required and must be greater than the total expert count, which must itself be divisible by the EP size. Each rank keeps its `num_experts / ep_size` experts and gets `(num_slots - num_experts) / ep_size` extra slots. Unlike `standard` mode, the extra slots are helper slots rather than static replicas: each layer refills them with copies of its hot experts on every forward pass. By default (`helper_slot_mode: per_layer_resident`) each layer has its own helper slots and skips experts they already hold; `shared_banks` has all MoE layers alternate between two shared helper banks. For example, 384 experts with `num_slots: 416` on 8 EP ranks give each rank 48 experts and 4 helper slots.
 
 To disable MoE load balancing, omit the whole `load_balancer` section. EPLB is enabled by the presence of `load_balancer`, so setting `num_slots` to 0 does not disable it.
 

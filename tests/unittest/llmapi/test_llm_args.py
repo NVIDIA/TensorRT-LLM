@@ -275,6 +275,7 @@ class TestMoeConfigPerLayerDynamicEplb:
                           MoePerLayerDynamicLoadBalancerConfig)
         assert config.backend == "MEGAMOE_CUTEDSL"
         assert config.load_balancer.auxiliary_sms == 8
+        assert config.load_balancer.helper_slot_mode == "per_layer_resident"
 
     @pytest.mark.parametrize(
         "num_experts, message",
@@ -340,6 +341,29 @@ class TestMoeConfigPerLayerDynamicEplb:
         values["auxiliary_sms"] = 9
         with pytest.raises(ValidationError, match="auxiliary_sms"):
             MoeConfig(load_balancer=values)
+
+    @pytest.mark.parametrize("mode", ["per_layer_resident", "shared_banks"])
+    def test_per_layer_dynamic_accepts_helper_slot_modes(self,
+                                                         mode: str) -> None:
+        values = self._per_layer_dynamic()
+        values["helper_slot_mode"] = mode
+        config = MoeConfig(load_balancer=values)
+        assert config.load_balancer.helper_slot_mode == mode
+
+    def test_per_layer_dynamic_rejects_unknown_helper_slot_mode(self) -> None:
+        values = self._per_layer_dynamic()
+        values["helper_slot_mode"] = "per_layer"
+        with pytest.raises(ValidationError, match="helper_slot_mode"):
+            MoeConfig(load_balancer=values)
+
+    def test_standard_mode_rejects_helper_slot_mode(self) -> None:
+        with pytest.raises(ValidationError, match="helper_slot_mode"):
+            MoeConfig(backend="CUTLASS",
+                      load_balancer={
+                          "mode": "standard",
+                          "num_slots": 64,
+                          "helper_slot_mode": "shared_banks",
+                      })
 
     def test_per_layer_dynamic_disables_decode_cuda_graph(self) -> None:
         args = TorchLlmArgs(

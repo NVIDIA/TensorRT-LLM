@@ -173,6 +173,54 @@ def test_shared_slot_provider_pool_key_includes_complete_bundle():
     assert [pool.bundle for pool in FakePool.instances] == [first_bundle, second_bundle]
 
 
+@pytest.mark.parametrize("per_layer_helper_sets", [False, True])
+def test_shared_slot_provider_pool_key_includes_helper_set_mode(per_layer_helper_sets):
+    source = _TORCH_ROOT / "moe/fused_moe/mega_moe/rebalance_live_arena.py"
+
+    class FakePool:
+        instances = []
+
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            self._closed = False
+            self.group_sizes = ()
+            self.instances.append(self)
+
+        def build_layer(self, comm):
+            return object(), {}, object(), 0
+
+    provider_cls = _extract_class(
+        source,
+        "SharedSlotArenaProvider",
+        {"__init__", "build_hierarchical_live_arena"},
+        {
+            "Any": Any,
+            "Dict": dict,
+            "Optional": Optional,
+            "Tuple": Tuple,
+            "_SharedSlotPool": FakePool,
+        },
+    )
+    owner = SimpleNamespace(
+        _rebalance_shared_slot_pools={},
+        _rebalance_shared_slot_pool_order=[],
+    )
+    kwargs = dict(world=8, rank=0, home_count=4, helper_count=1, bundle="bundle", device=0)
+    provider_cls(owner, per_layer_helper_sets=per_layer_helper_sets).build_hierarchical_live_arena(
+        comm=object(), **kwargs
+    )
+    provider_cls(
+        owner, per_layer_helper_sets=not per_layer_helper_sets
+    ).build_hierarchical_live_arena(comm=object(), **kwargs)
+
+    # One pool per mode: a per-layer pool never hands out a shared bank.
+    assert [pool.kwargs["per_layer_sets"] for pool in FakePool.instances] == [
+        per_layer_helper_sets,
+        not per_layer_helper_sets,
+    ]
+    assert len(owner._rebalance_shared_slot_pools) == 2
+
+
 def test_hierarchical_fused_submit_launches_bound_scheduler_and_copy():
     source = _TORCH_ROOT / "moe/kernels/megamoe_scheduler/sami/hierarchical.py"
     launches = []

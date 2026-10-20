@@ -2,11 +2,12 @@
 # SPDX-License-Identifier: Apache-2.0
 """EP-scoped live-weight storage for HALO-Q and hierarchical SAMI copies.
 
-Every layer owns its home-expert storage and maps one of two shared helper-slot
-banks directly after it in virtual address space. Layers alternate banks, while
-per-layer READY terminals and small planes remain independent. Allocation and
-binding are collective across the EP group; vendor imports stay lazy until the
-rebalance path is enabled.
+Every layer owns its home-expert storage and maps a helper-slot set directly
+after it in virtual address space: either its own set, which lets helper experts
+stay resident across forwards, or one of two banks that all layers alternate
+between. Per-layer READY terminals and small planes remain independent.
+Allocation and binding are collective across the EP group; vendor imports stay
+lazy until the rebalance path is enabled.
 """
 
 import math
@@ -525,13 +526,15 @@ class _SharedLayer:
 
 
 class _SharedSlotPool:
-    """Helper-slot sets shared by every MoE layer of one geometry.
+    """Helper-slot sets of every MoE layer of one geometry.
 
     Layer ``i`` maps helper set ``i % sets`` directly after its home rows, so
-    each plane is still one contiguous ``[H + S]`` kernel view. Only the home
-    rows are per layer. No extra synchronization guards reuse: layer ``i``'s
-    copy follows HALO-Q's all-rank exchange, which every rank enters only after
-    MAIN finished the previous layers' MegaMoE.
+    each plane is still one contiguous ``[H + S]`` kernel view. With
+    ``per_layer_sets`` the pool adds one set per layer as the layers are built,
+    so only a layer's own copies write its helper rows; otherwise every layer
+    shares two sets. No extra synchronization guards reuse of a shared set:
+    layer ``i``'s copy follows HALO-Q's all-rank exchange, which every rank
+    enters only after MAIN finished the previous layers' MegaMoE.
 
     READY terminals stay per layer because one forward shares its generation
     across layers. They and the fp32 planes live in per-layer records.
@@ -548,6 +551,7 @@ class _SharedSlotPool:
         device: int,
         comm: Any,
         owner_registry: List["_SharedSlotPool"],
+        per_layer_sets: bool,
     ) -> None:
         from tensorrt_llm._torch.moe.kernels.megamoe_scheduler.sami import hierarchy_group_sizes
 
@@ -600,10 +604,12 @@ class _SharedSlotPool:
         self.pages: List[_RecordPage] = []
         self.layer_count = 0
         self.sets: Tuple[_HelperSet, ...] = ()
+        self.per_layer_sets = per_layer_sets
         self._construction_complete = False
         self._owner_registry = owner_registry
         self._owner_registry.append(self)
-        self.sets = self._create_sets(comm)
+        if not per_layer_sets:
+            self.sets = self._create_sets(_HELPER_BANK_COUNT, comm)
         self._construction_complete = True
 
     def register_producer(self, producer: Any) -> None:
@@ -715,14 +721,11 @@ class _SharedSlotPool:
         finally:
             self._closing = False
 
-    def _create_sets(self, comm: Any) -> Tuple[_HelperSet, ...]:
+    def _create_sets(self, count: int, comm: Any) -> Tuple[_HelperSet, ...]:
         if not self.large:
-            return tuple(
-                _HelperSet({}, tuple({} for _ in self.groups), ())
-                for _ in range(_HELPER_BANK_COUNT)
-            )
+            return tuple(_HelperSet({}, tuple({} for _ in self.groups), ()) for _ in range(count))
         sets, specs = [], []
-        for _ in range(_HELPER_BANK_COUNT):
+        for _ in range(count):
             chunks = {p.name: self.vmm.create(self.helper_bytes[p.name])[0] for p in self.large}
             level_bases, level_specs = [], []
             for members in self.groups:
@@ -801,6 +804,8 @@ class _SharedSlotPool:
             self.pages.append(self._create_page(comm))
         page = self.pages[-1]
         record = (index % self.records_per_page) * self.record_stride
+        if self.per_layer_sets:
+            self.sets += self._create_sets(1, comm)
         helper_set = self.sets[index % len(self.sets)]
         layer = _SharedLayer(self, index % len(self.sets))
         self.layer_count += 1
@@ -886,13 +891,15 @@ class _SharedSlotPool:
 
 
 class SharedSlotArenaProvider:
-    """Provide one layer's arena over the two shared helper-slot banks.
+    """Provide one layer's arena over its helper-slot set.
 
-    The broadcaster requests the arena again after Parameters are bound, so a
-    provider memoizes its first build and requires identical geometry.
+    ``per_layer_helper_sets`` gives the layer its own helper set; otherwise it
+    maps one of the two banks shared by all layers. The broadcaster requests
+    the arena again after Parameters are bound, so a provider memoizes its
+    first build and requires identical geometry.
     """
 
-    def __init__(self, owner: Any) -> None:
+    def __init__(self, owner: Any, *, per_layer_helper_sets: bool = False) -> None:
         # The model-level per-layer dynamic manager owns both the geometry cache
         # and creation order. No Mapping attribute or process-global registry
         # participates in allocation lifetime.
@@ -903,6 +910,7 @@ class SharedSlotArenaProvider:
             raise TypeError("SharedSlotArenaProvider owner must expose model-local pool state")
         self._pools = pools
         self._pool_order = order
+        self._per_layer_helper_sets = bool(per_layer_helper_sets)
         self.buffer_bytes = 0
         self.group_sizes: Tuple[int, ...] = ()
         self.pool: Optional[_SharedSlotPool] = None
@@ -929,6 +937,7 @@ class SharedSlotArenaProvider:
             int(helper_count),
             int(device),
             bundle,
+            self._per_layer_helper_sets,
         )
         if self._built is not None:
             if self._signature != signature:
@@ -960,6 +969,7 @@ class SharedSlotArenaProvider:
                 device=int(device),
                 comm=comm,
                 owner_registry=self._pool_order,
+                per_layer_sets=self._per_layer_helper_sets,
             )
             self._pools[key] = pool
         self._built, self._tekit_views, self.layer, self.buffer_bytes = pool.build_layer(comm)

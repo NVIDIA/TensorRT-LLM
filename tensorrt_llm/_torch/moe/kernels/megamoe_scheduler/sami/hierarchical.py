@@ -210,6 +210,7 @@ class HierarchicalSamiWeightBroadcast:
         tma_warps: int | None = None,
         tma_route: str = "plan",
         tma_source_load_factor: float = 1.0,
+        helper_residency: bool = False,
     ) -> None:
         for name, value in (("tma_sm_count", tma_sm_count), ("tma_warps", tma_warps)):
             if value is not None and (type(value) is not int or value <= 0):
@@ -220,6 +221,11 @@ class HierarchicalSamiWeightBroadcast:
             raise ValueError("tma_warps must be at most 32; device shared-memory limits also apply")
         if tma_route not in ("plan", "source", "scatter"):
             raise ValueError("tma_route must be 'plan', 'source', or 'scatter'")
+        if type(helper_residency) is not bool:
+            raise ValueError("helper_residency must be a bool")
+        # Residency skips copies into helper rows that already hold the planned
+        # expert, so only this layer's copies may write those rows.
+        self.helper_residency = helper_residency
         if (type(tma_source_load_factor) not in (int, float) or
                 not 0.01 <= tma_source_load_factor < 2.0 or
                 abs(100 * tma_source_load_factor - round(100 * tma_source_load_factor)) > 1e-9):
@@ -501,7 +507,13 @@ class HierarchicalSamiWeightBroadcast:
             try:
                 bind(handle)
                 torch.ops.trtllm.moe_rebalance_tma_bind_gpu_direct(
-                    self.ctx, *tensors[1:], workspace, status, grid_sync, capacity
+                    self.ctx,
+                    *tensors[1:],
+                    workspace,
+                    status,
+                    grid_sync,
+                    capacity,
+                    self.helper_residency,
                 )
             except BaseException:
                 self._handoff_aborted = True
