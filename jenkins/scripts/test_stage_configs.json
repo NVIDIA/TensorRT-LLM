@@ -608,7 +608,7 @@
       "slurm": true,
       "platform": "auto:gb200-x4",
       "testDB": "l0_gb200_multi_gpus_perf_sanity",
-      "splits": 6,
+      "splits": 5,
       "gpuCount": 4
     },
     {
@@ -617,7 +617,7 @@
       "slurm": true,
       "platform": "auto:gb300-x4",
       "testDB": "l0_gb300_multi_gpus_perf_sanity",
-      "splits": 5,
+      "splits": 7,
       "gpuCount": 4,
       "nodeCount": 1,
       "runWithSbatch": true
@@ -684,7 +684,7 @@
       "target": "multiNodesSBSA",
       "platform": "auto:gb200-flex",
       "testDB": "l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu1_gen1_node1_gpu4",
-      "splits": 6,
+      "splits": 2,
       "gpuCount": 8,
       "nodeCount": 2
     },
@@ -761,7 +761,7 @@
       "target": "multiNodesSBSA",
       "platform": "auto:gb300-flex",
       "testDB": "l0_gb300_multi_nodes_perf_sanity_node2_gpu8",
-      "splits": 2,
+      "splits": 4,
       "gpuCount": 8,
       "nodeCount": 2
     },
@@ -816,7 +816,7 @@
       "target": "multiNodesSBSA",
       "platform": "gb300-flex-aws-cmh",
       "testDB": "l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen4_node2_gpu8",
-      "splits": 3,
+      "splits": 2,
       "gpuCount": 36,
       "nodeCount": 9
     },
