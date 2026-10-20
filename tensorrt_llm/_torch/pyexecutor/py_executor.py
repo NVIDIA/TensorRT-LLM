@@ -404,6 +404,31 @@ class PendingEncoderStep:
     result: Optional[EncoderStepResult] = None
 
 
+def _release_consumed_batch_indices(consumed: ScheduledRequests,
+                                    current: Optional[ScheduledRequests]) -> None:
+    """Send requests that left the overlap pipeline back to the host token path.
+
+    Once ``_update_requests`` has consumed a batch, its device tensors are gone.
+    A request that was in that batch but is not in this iteration's forward
+    (skipped by the V2 scheduler under KV pressure, paused, finished) must read
+    its next input from host tokens, which ``_prepare_tp_inputs`` does when
+    ``py_batch_idx`` is None; requests present in both batches already received
+    ``py_batch_idx = py_seq_slot`` from ``_forward_step``.
+
+    Both request lists of the consumed batch are covered. A context request
+    whose last chunk ran in that batch is a generation request now and carries
+    the batch index ``_prepare_tp_inputs`` set for it; left in place, its first
+    decode step would take the device path and re-read the token that
+    ``_update_requests`` just appended on host, one position off. ``current``
+    is None when nothing was scheduled this iteration.
+    """
+    keep = (set() if current is None else
+            {id(r) for r in (*current.context_requests, *current.generation_requests)})
+    for r in (*consumed.context_requests, *consumed.generation_requests):
+        if id(r) not in keep:
+            r.py_batch_idx = None
+
+
 class PyExecutor:
     # Minimum number of async micro batches for async PP execution.
     # This is a trade-off between memory usage and performance.
@@ -5471,6 +5496,7 @@ class PyExecutor:
         if self.previous_batch is None:
             return
         self._update_requests(self.previous_batch.sample_state)
+        _release_consumed_batch_indices(self.previous_batch.scheduled_requests, None)
         self._send_kv_async(
             self.previous_batch.scheduled_requests.all_requests())
         self._flush_pending_transfer_responses()
@@ -5917,6 +5943,9 @@ class PyExecutor:
 
                 if self.previous_batch is not None and should_process_previous_batch:
                     self._update_requests(self.previous_batch.sample_state)
+                    _release_consumed_batch_indices(
+                        self.previous_batch.scheduled_requests,
+                        scheduled_batch if can_queue else None)
                     # Turning off speculative decoding when Acceptance Rate is low.
                     # In overlap scheduler path, it will do an extra iter with spec decode on.
                     if self.speculation_gate is not None:
