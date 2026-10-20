@@ -28,6 +28,7 @@ lengths provide the same cache contract for prefill, decode and verification.
 from __future__ import annotations
 
 import os
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 import torch
@@ -137,6 +138,27 @@ class GlmKpoolSparseAttention(TrtllmAttention):
     # Bound selected-KV staging independently of the configured context length.
     # At the published 2112-entry selection this uses 132 MiB of BF16 rows.
     _FP8_QUERY_CHUNK_SIZE = 64
+
+    # FP32 elements one packed-context scoring call may hold: logits, their row
+    # copy and gathered pool keys grow with the visible pools, which a fresh-prompt
+    # profiling forward does not reach. plan_context_scores tiles calls to this
+    # bound and runtime_workspace_fixed_bytes reserves it in KV-cache sizing.
+    _CONTEXT_SCORE_ELEMENTS = 1 << 26
+
+    @classmethod
+    def runtime_workspace_fixed_bytes(
+        cls,
+        model_config,
+        mapping,
+        *,
+        max_batch_size: int,
+        max_num_tokens: int,
+        max_seq_len: int,
+        enable_cuda_graph: bool,
+    ) -> int:
+        if max_num_tokens <= 0 or max_seq_len <= 0:
+            return 0
+        return min(cls._CONTEXT_SCORE_ELEMENTS, max_num_tokens * max_seq_len) * 4
 
     def __init__(
         self,
@@ -379,6 +401,62 @@ class GlmKpoolSparseAttention(TrtllmAttention):
             request_ids=request_ids,
         )
 
+    def plan_context_scores(
+        self, metadata, spans: Sequence[tuple[int, int]]
+    ) -> list[tuple[int, int, int, int, int]]:
+        """Split packed context scoring into calls within ``_CONTEXT_SCORE_ELEMENTS``.
+
+        spans lists ``(rows, visible bound)`` of each context request in packed
+        order. Each returned ``(row_start, row_end, table_start, table_end,
+        max_kv_len)`` scores rows ``row_start:row_end`` against context tables
+        ``table_start:table_end``. Consecutive requests share a call while it
+        fits; a request that does not fit alone is split by rows. Costs count
+        only the transients that grow with the visible pools.
+        """
+        state = self._cache_state(metadata)
+        kpool = self.sparse_params.index_kpool
+        budget = self._CONTEXT_SCORE_ELEMENTS
+        # The BF16 scorer writes every pool column of the configured capacity.
+        capacity_pools = -(-state.block_tables.shape[1] * state.tokens_per_block // kpool)
+        # Gathered BF16 pool keys plus their FP8 copy, in FP32 elements.
+        key_elements = self.sparse_params.index_head_dim * 3 // 4
+
+        def cost(rows: int, tables: int, pools: int) -> int:
+            if not self._indexer_fp8 or pools == 0:
+                return rows * capacity_pools
+            logits = -(-tables * pools // 256) * 256
+            copy = max(1024, -(-pools // 64) * 64) if tables > 1 else 0
+            return rows * (logits + copy) + tables * pools * key_elements
+
+        calls: list[tuple[int, int, int, int, int]] = []
+        group: list[int] | None = None  # [row_start, rows, table_start, tables, max visible]
+        row_start = 0
+        for table, (rows, visible) in enumerate(spans):
+            if group is not None:
+                merged = max(group[4], visible)
+                if cost(group[1] + rows, group[3] + 1, merged // kpool) <= budget:
+                    group[1] += rows
+                    group[3] += 1
+                    group[4] = merged
+                    row_start += rows
+                    continue
+                calls.append(
+                    (group[0], group[0] + group[1], group[2], group[2] + group[3], group[4])
+                )
+                group = None
+            if cost(rows, 1, visible // kpool) <= budget:
+                group = [row_start, rows, table, 1, visible]
+            else:
+                fixed = cost(0, 1, visible // kpool)
+                tile = max(1, (budget - fixed) // max(1, cost(1, 1, visible // kpool) - fixed))
+                for start in range(row_start, row_start + rows, tile):
+                    end = min(start + tile, row_start + rows)
+                    calls.append((start, end, table, table + 1, visible))
+            row_start += rows
+        if group is not None:
+            calls.append((group[0], group[0] + group[1], group[2], group[2] + group[3], group[4]))
+        return calls
+
     def score_pools(
         self,
         q: torch.Tensor,
@@ -391,6 +469,7 @@ class GlmKpoolSparseAttention(TrtllmAttention):
         rows_per_request: int = 1,
         request_ids: torch.Tensor | None = None,
         max_kv_len: int | None = None,
+        table_range: tuple[int, int] | None = None,
     ) -> torch.Tensor:
         """Score complete pools into FP32 [rows, pool_capacity].
 
@@ -403,26 +482,28 @@ class GlmKpoolSparseAttention(TrtllmAttention):
         only reachable pools are scored; columns past it are left unwritten and
         the top-k must scan only each row's complete pools. Packed context rows
         with such a bound use the FP8 scorer on SM100-family GPUs, whose result
-        may be a strided view.
+        may be a strided view. table_range, from :meth:`plan_context_scores`,
+        names the context tables those rows' request_ids fall in.
         """
         state = self._cache_state(metadata)
         tables, gen_lens = self._rows(state, rows_per_request, request_ids=request_ids)
         capacity = state.block_tables.shape[1] * state.tokens_per_block
         kpool = self.sparse_params.index_kpool
         if self._indexer_fp8 and request_ids is not None and max_kv_len is not None:
+            # Packed context rows only reference the context requests' tables.
+            first, last = (0, state.num_contexts) if table_range is None else table_range
             scores = kpool_score_fp8(
                 q,
                 weights,
                 state.index_pool,
-                # Packed context rows only reference the context requests' tables.
-                tables[: state.num_contexts],
+                tables[first:last],
                 kv_lens,
                 state.tokens_per_block,
                 head_dim=self.sparse_params.index_head_dim,
                 kpool=kpool,
                 q_scale=q_scale,
                 w_scale=w_scale,
-                request_ids=request_ids,
+                request_ids=request_ids - first if first else request_ids,
                 max_kv_len=max_kv_len,
             )
             if scores is not None:

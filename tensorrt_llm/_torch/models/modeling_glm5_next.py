@@ -1339,6 +1339,7 @@ class Glm5NextSparseAttention(nn.Module):
         request_ids: torch.Tensor | None = None,
         max_visible: int | None = None,
         num_candidates: torch.Tensor | None = None,
+        context_spans: Sequence[tuple[int, int]] | None = None,
     ) -> torch.Tensor:
         """Score pools, select members and tail, then attend to paged latent rows.
 
@@ -1347,7 +1348,9 @@ class Glm5NextSparseAttention(nn.Module):
         tables are known. Single-token decode reads live lengths
         from metadata. All device work uses fixed buffer shapes for graph replay.
         max_visible is an optional host bound on visible that limits scoring work;
-        num_candidates, if given, is visible // index_kpool as int32.
+        num_candidates, if given, is visible // index_kpool as int32. Packed context
+        passes context_spans, each request's (rows, visible bound), so scoring
+        runs in calls of bounded memory.
         """
         indexer = self.indexer
         rows = q_resid.shape[0]
@@ -1356,30 +1359,42 @@ class Glm5NextSparseAttention(nn.Module):
         # each request contributes several rows (context or verification).
         plain_decode = request_ids is None and rows_per_request == 1
         kv_lens = None if plain_decode else visible
-        scores = self.attn_backend.score_pools(
-            q_index,
-            index_weights,
-            metadata,
-            q_scale=indexer.softmax_scale,
-            w_scale=indexer.head_mix_scale,
-            kv_lens=kv_lens,
-            rows_per_request=rows_per_request,
-            request_ids=request_ids,
-            max_kv_len=max_visible,
-        )
         num_cand = (
             (visible // indexer.index_kpool).to(torch.int32)
             if num_candidates is None
             else num_candidates
         )
-        selected = torch.empty(rows, indexer.select_k, dtype=torch.int32, device=scores.device)
-        indexer.pool_top_k(
-            scores,
-            selected,
-            is_prefill=False,
-            sequence_lengths=num_cand,
-            scan_lengths=num_cand,
-        )
+        selected = torch.empty(rows, indexer.select_k, dtype=torch.int32, device=q_index.device)
+        # Each call scores and selects its own rows; scores are dropped before the next.
+        if context_spans is None:
+            calls = [(slice(None), max_visible, None)]
+        else:
+            calls = [
+                (slice(start, end), max_kv_len, (first, last))
+                for start, end, first, last, max_kv_len in self.attn_backend.plan_context_scores(
+                    metadata, context_spans
+                )
+            ]
+        for part, max_kv_len, table_range in calls:
+            scores = self.attn_backend.score_pools(
+                q_index[part],
+                index_weights[part],
+                metadata,
+                q_scale=indexer.softmax_scale,
+                w_scale=indexer.head_mix_scale,
+                kv_lens=None if kv_lens is None else kv_lens[part],
+                rows_per_request=rows_per_request,
+                request_ids=None if request_ids is None else request_ids[part],
+                max_kv_len=max_kv_len,
+                table_range=table_range,
+            )
+            indexer.pool_top_k(
+                scores,
+                selected[part],
+                is_prefill=False,
+                sequence_lengths=num_cand[part],
+                scan_lengths=num_cand[part],
+            )
         topk_rows = self.attn_backend.expand_selection(
             selected,
             metadata,
@@ -1435,10 +1450,14 @@ class Glm5NextSparseAttention(nn.Module):
                 request_ids=rows.final_request_ids,
             )
         query = self.q_b_proj(q_resid).view(-1, self.num_heads, self.qk_head_dim)
-        max_visible = max(
-            int(cached_lens[i]) + int(cu_seqlens[i + 1]) - int(cu_seqlens[i])
+        spans = [
+            (
+                int(cu_seqlens[i + 1]) - int(cu_seqlens[i]),
+                int(cached_lens[i]) + int(cu_seqlens[i + 1]) - int(cu_seqlens[i]),
+            )
             for i in range(len(cu_seqlens) - 1)
-        )
+        ]
+        max_visible = max(visible for _, visible in spans)
         return self._select_and_attend_paged(
             q_resid,
             query,
@@ -1449,6 +1468,7 @@ class Glm5NextSparseAttention(nn.Module):
             reduce=reduce,
             request_ids=rows.request_ids,
             max_visible=max_visible,
+            context_spans=spans,
         )
 
     def forward_decode(
