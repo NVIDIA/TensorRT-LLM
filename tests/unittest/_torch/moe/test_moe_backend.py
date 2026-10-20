@@ -1406,7 +1406,7 @@ def test_marlin_override_quant_config_degrades_per_layer():
 # same ``gemm1_alpha`` / ``gemm1_beta`` slots SwiGLU's constants use, and only
 # the activation kind separates them. Kernel-level coverage -- tactic
 # availability, launch evidence and SiTu-vs-SwiGLU numerics -- lives in
-# test_kimi_k3_situ_moe.py (and thop/serial/test_moe.py for the runner). These
+# test_kimi_k3_situ_moe.py (and moe/kernels/serial/test_moe.py for the runner). These
 # are the contracts that hold without running a cubin.
 
 _situ_supported = pytest.mark.skipif(
@@ -3518,7 +3518,7 @@ def test_trtllm_bf16_dsv3_routing_kimi_k3_shape(seq_len):
 
 # =====================================================================
 # TRTLLM-Gen shared-expert fusion (migrated from deprecated
-# tests/unittest/_torch/thop/serial/test_moe.py::TestMoeFP8 fusion coverage)
+# tests/unittest/_torch/moe/kernels/serial/test_moe.py::TestMoeFP8 fusion coverage)
 # =====================================================================
 # TRTLLMGenFusedMoE can fold n_shared_experts into the routed grouped GEMM as
 # always-selected experts (opt-in via TLLM_MOE_ENABLE_SHARED_EXPERT_FUSION=1;
