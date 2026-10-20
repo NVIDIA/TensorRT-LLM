@@ -399,3 +399,26 @@ def test_non_video_processing_matches_hf(adapter, processor, with_image):
     assert result.keys() == reference.keys()
     for key in result:
         assert torch.equal(result[key], reference[key])
+
+
+@pytest.mark.parametrize("kwargs", [{}, {"return_metadata": False}, {"return_metadata": True}])
+def test_metadata_output_filter_preserves_prompt_timestamps(
+    adapter, processor, monkeypatch, kwargs
+):
+    prompts = []
+    tokenize = type(processor.tokenizer).__call__
+
+    def capture_prompt(tokenizer, text=None, **tokenizer_kwargs):
+        prompts.extend(text)
+        return tokenize(tokenizer, text=text, **tokenizer_kwargs)
+
+    monkeypatch.setattr(type(processor.tokenizer), "__call__", capture_prompt)
+    video = _video(list(range(0, 192, 24)))
+    result = adapter.preprocess(
+        SimpleNamespace(processor=processor), "<|video_pad|>", {"video": [video]}, kwargs
+    )
+    assert result["video_grid_thw"][0, 0].item() == 4
+    assert [float(t) for t in re.findall(r"<([0-9.]+) seconds>", prompts[0])] == pytest.approx(
+        [0.5, 2.5, 4.5, 6.5]
+    )
+    assert ("video_metadata" in result) == kwargs.get("return_metadata", False)
