@@ -30,4 +30,4 @@ class TestModelingV2Nemotron3UltraBf16Sm100Tep8(NemotronHBf16Target):
     MOE_EP = 8
 
     def test_gsm8k(self):
-        self._gsm8k(max_batch_size=32)
+        self._gsm8k(max_batch_size=256)
