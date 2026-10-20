@@ -18,8 +18,10 @@
 """TRT-LLM VisualGen pipeline for MiniMax-H3 FL2VA and Ref2VA checkpoints."""
 
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager, nullcontext
 from io import BytesIO
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 import numpy as np
 import torch
@@ -69,6 +71,9 @@ from .packing import (
 from .parallel_vae import TiledAutoencoderKLMiniMaxH3
 from .ref2va import load_references, prepare_references, validate_reference_order
 from .transformer_minimax_h3 import MiniMaxH3Transformer3DModel
+
+if TYPE_CHECKING:
+    from ...sleep import PipelineSleepManager, SleepRestoreMode
 
 
 def _prepare_vae_decoder(vae: TiledAutoencoderKLMiniMaxH3) -> None:
@@ -219,7 +224,61 @@ class MiniMaxH3Pipeline(BasePipeline):
         self.audio_vae = None
         self.audio_scheduler = None
         self.processor = None
+        self._sleep_manager: Optional["PipelineSleepManager"] = None
         super().__init__(pipeline_config)
+
+    def _check_sleep_world_size(self) -> None:
+        config = self.pipeline_config
+        vgm = config.visual_gen_mapping
+        if (
+            self.mapping.world_size != 1
+            or config.parallel.n_workers != 1
+            or (vgm is not None and vgm.world_size != 1)
+        ):
+            raise ValueError("MiniMax-H3 sleep/wake currently requires world_size=1")
+
+    @contextmanager
+    def _sleep_loading_context(
+        self, restore_mode: "SleepRestoreMode", *, device: torch.device
+    ) -> Iterator[None]:
+        """Back persistent H3 allocations while keeping warmup outside the pool."""
+        config = self.pipeline_config
+        self._check_sleep_world_size()
+        if config.cpu_offload_config.enable or config.cuda_graph.enable:
+            raise ValueError(
+                "MiniMax-H3 sleep cannot be combined with CPU offloading or CUDA graphs"
+            )
+        if config.cache is not None or config.runtime_lora is not None:
+            raise ValueError(
+                "MiniMax-H3 sleep does not yet support cache acceleration or runtime LoRA"
+            )
+        if self._sleep_manager is not None:
+            raise RuntimeError("Pipeline sleep was already enabled during loading")
+
+        from ...sleep import PipelineSleepManager
+
+        manager = PipelineSleepManager(restore_mode, device)
+        with manager.loading():
+            yield
+        self._sleep_manager = manager
+
+    def sleep(self) -> None:
+        """Reject new generation and wait for the active call before releasing GPU memory."""
+        if self._sleep_manager is None:
+            raise RuntimeError("Pipeline sleep was not enabled during loading")
+        self._check_sleep_world_size()
+        self._sleep_manager.sleep()
+
+    def wake_up(self) -> None:
+        """Restore managed GPU memory before admitting more inference."""
+        if self._sleep_manager is None:
+            raise RuntimeError("Pipeline sleep was not enabled during loading")
+        self._check_sleep_world_size()
+        self._sleep_manager.wake_up()
+
+    @property
+    def is_sleeping(self) -> bool:
+        return self._sleep_manager is not None and self._sleep_manager.is_sleeping
 
     def setup_parallel_vae(self) -> None:
         """Use the shared VAE group for independent spatial tile decoding."""
@@ -794,6 +853,35 @@ class MiniMaxH3Pipeline(BasePipeline):
 
     @torch.inference_mode()
     def forward(
+        self,
+        *,
+        prompt: str,
+        seed: int,
+        height: int,
+        width: int,
+        num_frames: int,
+        frame_rate: float,
+        num_inference_steps: int,
+        keyframes: Optional[list[Image.Image]] = None,
+        keyframe_anchors: Optional[tuple[str, ...]] = None,
+        references: Optional[list] = None,
+    ) -> PipelineOutput:
+        manager = getattr(self, "_sleep_manager", None)
+        with manager.generation() if manager is not None else nullcontext():
+            return self._forward(
+                prompt=prompt,
+                seed=seed,
+                height=height,
+                width=width,
+                num_frames=num_frames,
+                frame_rate=frame_rate,
+                num_inference_steps=num_inference_steps,
+                keyframes=keyframes,
+                keyframe_anchors=keyframe_anchors,
+                references=references,
+            )
+
+    def _forward(
         self,
         *,
         prompt: str,

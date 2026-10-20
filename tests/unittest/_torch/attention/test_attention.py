@@ -142,7 +142,7 @@ def kv_cache_manager_from(
         kv_cache: torch.Tensor,
         request_ids: list[int],
         token_nums: list[int],
-        use_kv_cache_manager_v2: bool = False) -> KVCacheManager:
+        use_kv_cache_manager_v2: bool = True) -> KVCacheManager:
     paged = paged_backends[Attention]
 
     num_blocks = s.max_num_pages if paged else s.batch_size
@@ -186,18 +186,23 @@ def kv_cache_manager_from(
         dtype=kv_cache_dtype,
     )
 
-    kv_cache_manager.add_dummy_requests(request_ids, token_nums)
+    try:
+        kv_cache_manager.add_dummy_requests(request_ids, token_nums)
 
-    for i in range(s.num_layers):
-        buffer = kv_cache_manager.get_buffers(i)
-        block_ids = [
-            block_id
-            for req_block_ids in kv_cache_manager.get_batch_cache_indices(
-                request_ids, i) for block_id in req_block_ids
-            if block_id is not -1
-        ]
-        for idx, block_id in enumerate(block_ids):
-            buffer[block_id].view_as(kv_cache[i][idx]).copy_(kv_cache[i][idx])
+        for i in range(s.num_layers):
+            buffer = kv_cache_manager.get_buffers(i)
+            block_ids = [
+                block_id
+                for req_block_ids in kv_cache_manager.get_batch_cache_indices(
+                    request_ids, i) for block_id in req_block_ids
+                if block_id is not -1
+            ]
+            for idx, block_id in enumerate(block_ids):
+                buffer[block_id].view_as(kv_cache[i][idx]).copy_(
+                    kv_cache[i][idx])
+    except Exception:
+        kv_cache_manager.shutdown()
+        raise
     return kv_cache_manager
 
 
@@ -206,7 +211,7 @@ def produce_outputs(
     q_at_layer: torch.Tensor,
     kv: Optional[torch.Tensor],
     s: Scenario,
-    use_kv_cache_manager_v2: bool = False,
+    use_kv_cache_manager_v2: bool = True,
     *,
     kv_cache: torch.Tensor,
     num_cached_tokens: Callable[[int], int] | int,
@@ -230,38 +235,41 @@ def produce_outputs(
     kv_cache_manager = kv_cache_manager_from(Attention, s, kv_cache,
                                              request_ids, token_nums,
                                              use_kv_cache_manager_v2)
+    try:
 
-    metadata = Attention.Metadata(
-        num_contexts=num_contexts if num_contexts is not None else s.batch_size,
-        kv_cache_params=kv_cache_params,
-        seq_lens=seq_lens,
-        seq_lens_kv=seq_lens_kv,
-        max_num_requests=s.batch_size,
-        max_num_tokens=8192,
-        kv_cache_manager=kv_cache_manager,
-        request_ids=request_ids,
-        prompt_lens=token_nums,
-    )
-    metadata.prepare()
-    mask = PredefinedAttentionMask.CAUSAL if s.causal else PredefinedAttentionMask.FULL
-    outputs = []
-    for i in range(s.num_layers):
-        q = q_at_layer[i]
-        if kv is not None:
-            k, v = kv[i][0], kv[i][1]
-        else:
-            k, v = None, None
-        attention = Attention(
-            layer_idx=i,
-            num_heads=s.num_heads,
-            num_kv_heads=s.num_kv_heads,
-            head_dim=s.head_dim,
-            quant_config=quant_config,
+        metadata = Attention.Metadata(
+            num_contexts=num_contexts
+            if num_contexts is not None else s.batch_size,
+            kv_cache_params=kv_cache_params,
+            seq_lens=seq_lens,
+            seq_lens_kv=seq_lens_kv,
+            max_num_requests=s.batch_size,
+            max_num_tokens=8192,
+            kv_cache_manager=kv_cache_manager,
+            request_ids=request_ids,
+            prompt_lens=token_nums,
         )
-        o = attention.forward(q, k, v, metadata, attention_mask=mask)
-        assert list(o.shape) == [s.nnz_qo, s.num_heads * s.head_dim]
-        outputs.append(o)
-    kv_cache_manager.shutdown()
+        metadata.prepare()
+        mask = PredefinedAttentionMask.CAUSAL if s.causal else PredefinedAttentionMask.FULL
+        outputs = []
+        for i in range(s.num_layers):
+            q = q_at_layer[i]
+            if kv is not None:
+                k, v = kv[i][0], kv[i][1]
+            else:
+                k, v = None, None
+            attention = Attention(
+                layer_idx=i,
+                num_heads=s.num_heads,
+                num_kv_heads=s.num_kv_heads,
+                head_dim=s.head_dim,
+                quant_config=quant_config,
+            )
+            o = attention.forward(q, k, v, metadata, attention_mask=mask)
+            assert list(o.shape) == [s.nnz_qo, s.num_heads * s.head_dim]
+            outputs.append(o)
+    finally:
+        kv_cache_manager.shutdown()
     return outputs
 
 

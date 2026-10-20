@@ -972,11 +972,12 @@ class Runner:
                 # Multi-token verify reads per-slot replay caches when the fused
                 # kernel is available, else the legacy per-step buffers.
                 from tensorrt_llm._torch.modules.kimi_kda._kda_kernels import (
-                    is_kda_mtp_verify_available,
+                    kda_mtp_replay_num_spec,
                 )
 
-                if is_kda_mtp_verify_available():
-                    kimi_extra_kwargs["kda_replay_num_spec"] = spec_config.tokens_per_gen_step - 1
+                kda_replay_num_spec = kda_mtp_replay_num_spec(spec_config.tokens_per_gen_step - 1)
+                if kda_replay_num_spec is not None:
+                    kimi_extra_kwargs["kda_replay_num_spec"] = kda_replay_num_spec
             kv_cache_manager = kv_cache_manager_cls(
                 # mamba (KDA) cache parameters
                 mamba_params.state_size,

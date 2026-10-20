@@ -459,36 +459,42 @@ class PyExecutor:
     PIPELINE_DEPTH = 2
 
     def __init__(
-            self,
-            resource_manager,
-            scheduler: RequestScheduler,
-            model_engine: ModelEngine,
-            sampler: Sampler,
-            dist: Distributed,
-            max_num_sequences: int,
-            drafter: Optional[Drafter] = None,
-            disable_overlap_scheduler: bool = False,
-            enable_early_first_token_response: bool = False,
-            max_input_len: int = 0x7fffffff,
-            max_batch_size: int = 8,
-            max_beam_width: int = 1,
-            max_draft_len: int = 0,
-            max_total_draft_tokens: int = 0,
-            kv_cache_transceiver: Optional[KvCacheTransceiver] = None,
-            guided_decoder: Optional[GuidedDecoder] = None,
-            garbage_collection_gen0_threshold: Optional[int] = None,
-            start_worker: bool = True,
-            kv_connector_manager: Optional[KvCacheConnectorManager] = None,
-            resource_governor_queue=None,
-            max_seq_len: Optional[int] = None,
-            peft_cache_config: Optional[PeftCacheConfig] = None,
-            virtual_memory_pools: Optional[dict] = None,
-            hang_detection_timeout: Optional[int] = None,
-            execution_stream: Optional[torch.cuda.Stream] = None,
-            waiting_queue_policy: WaitingQueuePolicy = WaitingQueuePolicy.FCFS,
-            adp_router: Optional[ADPRouter] = None,
-            dwdp_manager: Optional[DwdpManager] = None,
-            enable_kv_pool_rebalance: bool = False):
+        self,
+        resource_manager,
+        scheduler: RequestScheduler,
+        model_engine: ModelEngine,
+        sampler: Sampler,
+        dist: Distributed,
+        max_num_sequences: int,
+        drafter: Optional[Drafter] = None,
+        disable_overlap_scheduler: bool = False,
+        enable_early_first_token_response: bool = False,
+        max_input_len: int = 0x7fffffff,
+        max_batch_size: int = 8,
+        max_beam_width: int = 1,
+        max_draft_len: int = 0,
+        max_total_draft_tokens: int = 0,
+        kv_cache_transceiver: Optional[KvCacheTransceiver] = None,
+        guided_decoder: Optional[GuidedDecoder] = None,
+        garbage_collection_gen0_threshold: Optional[int] = None,
+        start_worker: bool = True,
+        kv_connector_manager: Optional[KvCacheConnectorManager] = None,
+        resource_governor_queue=None,
+        max_seq_len: Optional[int] = None,
+        peft_cache_config: Optional[PeftCacheConfig] = None,
+        virtual_memory_pools: Optional[dict] = None,
+        hang_detection_timeout: Optional[int] = None,
+        execution_stream: Optional[torch.cuda.Stream] = None,
+        waiting_queue_policy: WaitingQueuePolicy = WaitingQueuePolicy.FCFS,
+        adp_router: Optional[ADPRouter] = None,
+        dwdp_manager: Optional[DwdpManager] = None,
+        enable_kv_pool_rebalance: bool = False,
+        kv_pool_rebalance_check_interval: int = KV_POOL_REBALANCE_CHECK_INTERVAL
+    ):
+        if kv_pool_rebalance_check_interval <= 0:
+            raise ValueError(
+                "kv_pool_rebalance_check_interval must be positive, got "
+                f"{kv_pool_rebalance_check_interval}")
         super(PyExecutor, self).__init__()
         self._metrics: dict[str, float | dict[str, float]] = {}
         self.device_id = torch.cuda.current_device()
@@ -601,7 +607,7 @@ class PyExecutor:
         self.enable_kv_pool_rebalance = enable_kv_pool_rebalance
         # Iteration throttle for the KV pool rebalance check.  See
         # _can_pause_for_rebalance / _agreed_need_adjustment.
-        self._rebalance_check_interval = KV_POOL_REBALANCE_CHECK_INTERVAL
+        self._rebalance_check_interval = kv_pool_rebalance_check_interval
         # Countdown of drain iterations remaining before a pipeline-parallel
         # rebalance can run; None when no rebalance is pending.  Only
         # _executor_loop_pp uses it -- see _start_pp_rebalance_drain.
@@ -3261,7 +3267,7 @@ class PyExecutor:
                     can_queue = False
                 if not can_queue:
                     self._revert_gen_alloc(scheduled_batch)
-                if not can_queue:
+                    self._finalize_adp_dummy_allocation(False)
                     logger.debug(
                         f"microbatch {microbatch_id} cannot be queued, skipping"
                     )
@@ -3897,9 +3903,10 @@ class PyExecutor:
 
                 scheduled_requests = executed_batch.scheduled_requests
                 if self._is_kv_manager_v2:
-                    # Finalize V2 context KV before disagg transfer/response
-                    # handling can terminate the request.
+                    # Finalize V2 KV before transfer/response handling can
+                    # terminate the request.
                     self._update_v2_context_resources(scheduled_requests)
+                    self._update_v2_generation_resources(scheduled_requests)
                 if self.kv_cache_transceiver:
                     finished_ctx_reqs = scheduled_requests.context_requests_last_chunk
                     self._send_kv_async(finished_ctx_reqs)
@@ -3917,8 +3924,10 @@ class PyExecutor:
                                                    'kv_cache_dtype_byte_size',
                                                    None)
                 self.resource_manager.update_resources(
-                    sample_state_scheduled_requests, attn_metadata,
-                    kv_cache_dtype_byte_size)
+                    sample_state_scheduled_requests,
+                    attn_metadata,
+                    kv_cache_dtype_byte_size,
+                    skip_kv_cache_manager=self._is_kv_manager_v2)
 
                 self._remove_inflight_ids(scheduled_requests)
 
@@ -4121,6 +4130,21 @@ class PyExecutor:
             ResourceManagerType.CROSS_KV_CACHE_MANAGER)
         if cross_kv_cache_manager is not None:
             cross_kv_cache_manager.update_context_resources(scheduled_batch)
+
+    def _terminate_attention_dp_dummy_requests(self) -> None:
+        """Terminate every local attention-DP dummy without assuming its position.
+
+        Requests activated after the dummy was appended can follow it in
+        ``active_requests``; a dummy left behind keeps its KV cache and blocks
+        the next iteration from padding again.
+        """
+        for request in list(self.active_requests):
+            if not request.is_attention_dp_dummy:
+                continue
+            request.state = LlmRequestState.GENERATION_COMPLETE
+            self.inflight_req_ids.erase(request.py_request_id)
+            self._terminate_request(request)
+            self.active_requests.remove(request)
 
     def _finalize_adp_dummy_allocation(self, can_queue: bool) -> None:
         """Commit or roll back this iteration's tentative ADP dummy.
@@ -5078,9 +5102,10 @@ class PyExecutor:
                             iteration_id=self.iter_counter)
 
                     if self._is_kv_manager_v2:
-                        # Finalize V2 context KV before disagg transfer/response
-                        # handling can terminate the request.
+                        # Finalize V2 KV before transfer/response handling can
+                        # terminate the request.
                         self._update_v2_context_resources(scheduled_batch)
+                        self._update_v2_generation_resources(scheduled_batch)
                     self._send_kv_async(scheduled_batch.all_requests())
 
                     self._handle_canceled_requests()
@@ -5097,8 +5122,10 @@ class PyExecutor:
                     kv_cache_dtype_byte_size = getattr(
                         self.model_engine, 'kv_cache_dtype_byte_size', None)
                     self.resource_manager.update_resources(
-                        scheduled_batch, attn_metadata,
-                        kv_cache_dtype_byte_size)
+                        scheduled_batch,
+                        attn_metadata,
+                        kv_cache_dtype_byte_size,
+                        skip_kv_cache_manager=self._is_kv_manager_v2)
                     if self.enable_kv_cache_events:
                         self._add_kv_cache_events()
 
@@ -5769,7 +5796,7 @@ class PyExecutor:
                 # modifying any host memory copied to GPU. Scheduler V2
                 # modifies the host page table, so wait before scheduling.
                 # This wait is also needed for legacy scheduler, but it can
-                # be pushed later, e.g. before DecoderRunner._prepare_inputs().
+                # be pushed later, e.g. before DecoderInputPreparer.prepare_inputs().
                 self._wait_for_model_engine_input_copy()
                 scheduled_batch, iter_stats = self._prepare_and_schedule_batch()
 
@@ -6431,6 +6458,17 @@ class PyExecutor:
 
         return result_tensors, num_accepted_tokens
 
+    def _update_v2_generation_resources(
+            self, scheduled_requests: ScheduledRequests) -> None:
+        if not self._is_kv_manager_v2:
+            return
+        attn_metadata = getattr(self.model_engine, 'attn_metadata', None)
+        kv_cache_dtype_byte_size = getattr(self.model_engine,
+                                           'kv_cache_dtype_byte_size', None)
+        self.kv_cache_manager.update_resources(scheduled_requests,
+                                               attn_metadata,
+                                               kv_cache_dtype_byte_size)
+
     def _process_previous_batch(self, batch_state: Optional[BatchState] = None):
         """Process a completed batch's outputs: cancel/response handling,
         KV cache resource update, and iter stats.
@@ -6444,18 +6482,27 @@ class PyExecutor:
         ``BatchState`` here explicitly.
         """
         batch_state = batch_state if batch_state is not None else self.previous_batch
+        scheduled_requests = batch_state.scheduled_requests
+        # A request that finishes here may still be in the in-flight next
+        # batch, which writes KV past the committed prefix after commit/close.
+        # This is safe: the radix tree trusts only each page's committed token
+        # count, and the write is enqueued on execution_stream before close()
+        # records the page release that eviction and reuse wait on.
+        self._update_v2_generation_resources(scheduled_requests)
         self._handle_canceled_requests()
         # Skip iter-1 emission when `_emit_first_token_responses` already
         # handled it.
         finished_requests = self._handle_responses(
             emit_first_iter=not self.enable_early_first_token_response)
-        scheduled_requests = batch_state.scheduled_requests
+
         attn_metadata = getattr(self.model_engine, 'attn_metadata', None)
         kv_cache_dtype_byte_size = getattr(self.model_engine,
                                            'kv_cache_dtype_byte_size', None)
-        self.resource_manager.update_resources(scheduled_requests,
-                                               attn_metadata,
-                                               kv_cache_dtype_byte_size)
+        self.resource_manager.update_resources(
+            scheduled_requests,
+            attn_metadata,
+            kv_cache_dtype_byte_size,
+            skip_kv_cache_manager=self._is_kv_manager_v2)
         if self.enable_kv_cache_events:
             self._add_kv_cache_events()
 
@@ -7033,8 +7080,14 @@ class PyExecutor:
             total_num_live_requests = total_num_active_requests + sum(
                 s.num_retiring_requests for s in all_rank_states)
         else:
-            total_num_active_requests = len(active_requests)
-            total_num_live_requests = total_num_active_requests
+            total_num_live_requests = len(active_requests)
+            total_num_active_requests = total_num_live_requests
+            if self.adp_router.exclude_retiring_requests:
+                # Retiring requests hold a seat from the overlap headroom, not
+                # one that admission hands out (see
+                # should_enable_overlap_headroom). They still count as live.
+                total_num_active_requests -= count_retiring_requests(
+                    active_requests)
             all_ranks_num_active_requests = None
             all_rank_states = None
 
@@ -8300,7 +8353,7 @@ class PyExecutor:
                     resource_mgr_type].prepare_resources(
                         disagg_gen_init_to_prepare)
 
-        # These requests skip the context branch of _prepare_tp_inputs (their
+        # These requests skip DecoderInputPreparer._pack_context_requests (their
         # context phase ran on another worker); latch cached_tokens from the
         # prefix this worker just matched in its own cache.
         for req in requests:
@@ -8804,14 +8857,8 @@ class PyExecutor:
             strip_mm_data_for_generation(mm_data)
 
     def _update_request_states_tp(self, scheduled_requests: ScheduledRequests):
-        # handle potential attention dp dummy request
-        if self.active_requests and self.active_requests[
-                -1].is_attention_dp_dummy:
-            request = self.active_requests[-1]
-            request.state = LlmRequestState.GENERATION_COMPLETE
-            self.inflight_req_ids.erase(request.py_request_id)
-            self._terminate_request(request)
-            self.active_requests.remove(request)
+        # handle potential attention dp dummy requests
+        self._terminate_attention_dp_dummy_requests()
 
         for request in scheduled_requests.context_requests:
             if request.state != LlmRequestState.GENERATION_COMPLETE:  # skip failed requests

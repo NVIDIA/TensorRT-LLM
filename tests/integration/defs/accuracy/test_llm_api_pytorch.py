@@ -229,7 +229,6 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         kv_cache_config = KvCacheConfig(
             free_gpu_memory_fraction=0.75,
             tokens_per_block=32,
-            use_kv_cache_manager_v2=False,
         )
         # Keep the TP=1 worker in this process so the call counter observes the
         # real PrimTS launch. Compile Inductor kernels synchronously because its
@@ -3774,7 +3773,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
     def test_guided_decoding(self):
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7,
                                         dtype="auto",
-                                        use_kv_cache_manager_v2=False)
+                                        use_kv_cache_manager_v2=True)
         with self._create_1gpu_llm(
                 kv_cache_config=kv_cache_config,
                 moe_backend="CUTLASS",
