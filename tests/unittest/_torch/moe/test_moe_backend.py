@@ -373,6 +373,53 @@ def test_fused_comm_scheduler_indexes_full_ep_token_metadata():
     assert had_meta
 
 
+def _split_chunk(tokens, chunks):
+    return [tokens // chunks + 1] * (tokens % chunks) + [tokens // chunks] * (
+        chunks - tokens % chunks
+    )
+
+
+@pytest.mark.cpu_only
+def test_fused_comm_scheduler_passes_unpadded_single_chunk_inputs_through():
+    moe = SimpleNamespace(
+        mapping=SimpleNamespace(moe_ep_rank=1, moe_ep_size=2),
+        moe_max_num_tokens=8,
+        split_chunk=_split_chunk,
+    )
+    scheduler = FusedCommMoEScheduler(moe)
+    x = torch.randn(6, 8)
+    router_logits = torch.randn(6, 4)
+    input_ids = torch.arange(6)
+
+    x_real, rl_real, ids_real, counts, ep_rank, had_meta = scheduler._strip_adp_padding(
+        x, router_logits, input_ids, [4, 6]
+    )
+    # This rank carries no ADP padding and fits one chunk: no view is taken.
+    assert x_real is x and rl_real is router_logits and ids_real is input_ids
+    assert (counts, ep_rank, had_meta) == ([4, 6], 1, True)
+    num_chunks, x_chunks, rl_chunks, chunk_sizes = scheduler._compute_chunk_layout(
+        x_real, rl_real, counts, ep_rank
+    )
+    assert num_chunks == 1
+    assert x_chunks[0] is x and rl_chunks[0] is router_logits
+    assert chunk_sizes == [[4], [6]]
+
+    # Padding is still stripped and several chunks are still split.
+    x_real, rl_real, _, counts, ep_rank, _ = scheduler._strip_adp_padding(
+        x, router_logits, None, [4, 5]
+    )
+    assert x_real.shape[0] == 5 and torch.equal(x_real, x[:5])
+    moe.moe_max_num_tokens = 2
+    num_chunks, x_chunks, rl_chunks, chunk_sizes = scheduler._compute_chunk_layout(
+        x_real, rl_real, counts, ep_rank
+    )
+    assert num_chunks == 3
+    assert [chunk.shape[0] for chunk in x_chunks] == [2, 2, 1]
+    assert torch.equal(torch.cat(x_chunks), x[:5])
+    assert torch.equal(torch.cat(rl_chunks), router_logits[:5])
+    assert chunk_sizes == [[2, 1, 1], [2, 2, 1]]
+
+
 def test_fused_comm_scheduler_rejects_partial_ep_token_metadata():
     mapping = SimpleNamespace(moe_ep_rank=1, moe_ep_size=4)
     scheduler = FusedCommMoEScheduler(SimpleNamespace(mapping=mapping))

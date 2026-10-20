@@ -71,6 +71,18 @@ if TYPE_CHECKING:
     from .configurable_moe import ConfigurableMoE
 
 
+def _leading_rows(t: torch.Tensor, rows: int) -> torch.Tensor:
+    """Return ``t[:rows]``, or ``t`` itself when it already has ``rows`` rows."""
+    return t if t.shape[0] == rows else t[:rows]
+
+
+def _split_rows(t: torch.Tensor, sizes: List[int]) -> List[torch.Tensor]:
+    """Return ``list(t.split(sizes))``; one chunk covering ``t`` is ``t`` itself."""
+    if len(sizes) == 1 and sizes[0] == t.shape[0]:
+        return [t]
+    return list(t.split(sizes))
+
+
 def _wait_input_ready(event: Optional[torch.cuda.Event]) -> None:
     """Join a pending ``input_ready_event`` before the first read of ``x``.
 
@@ -1234,12 +1246,12 @@ class FusedCommMoEScheduler(MoEScheduler):
         if input_ids_real is not None:
             chunk_size_list = all_rank_chunk_size_list[ep_rank]
             input_ids_chunks = (
-                list(input_ids_real.split(chunk_size_list)) if input_ids_real.numel() > 0 else []
+                _split_rows(input_ids_real, chunk_size_list) if input_ids_real.numel() > 0 else []
             )
         routing_aux_chunks = []
         if routing_aux is not None and x_real.shape[0] > 0:
-            routing_aux_chunks = list(
-                routing_aux[: x_real.shape[0]].split(all_rank_chunk_size_list[ep_rank])
+            routing_aux_chunks = _split_rows(
+                _leading_rows(routing_aux, x_real.shape[0]), all_rank_chunk_size_list[ep_rank]
             )
         outputs = self._run_chunks(
             x_chunks,
@@ -1326,9 +1338,9 @@ class FusedCommMoEScheduler(MoEScheduler):
         )
         # ADP padding stripped before split, else trailing rows silently
         # drift into chunk-0 or torch.split shape-errors.
-        x_real = x[:real_local]
-        rl_real = router_logits[:real_local]
-        input_ids_real = input_ids[:real_local] if input_ids is not None else None
+        x_real = _leading_rows(x, real_local)
+        rl_real = _leading_rows(router_logits, real_local)
+        input_ids_real = _leading_rows(input_ids, real_local) if input_ids is not None else None
         return x_real, rl_real, input_ids_real, real_all_rank_num_tokens, ep_rank, had_meta
 
     def _compute_chunk_layout(
@@ -1368,8 +1380,8 @@ class FusedCommMoEScheduler(MoEScheduler):
         # ``else []`` shortcut for real_local == 0: equivalent to
         # x_real.split([0]*num_chunks) but skips the no-op torch call. The
         # zero-token fallback in ``_run_chunks`` then fires for every chunk.
-        x_chunks = list(x_real.split(chunk_size_list)) if real_local > 0 else []
-        rl_chunks = list(rl_real.split(chunk_size_list)) if real_local > 0 else []
+        x_chunks = _split_rows(x_real, chunk_size_list) if real_local > 0 else []
+        rl_chunks = _split_rows(rl_real, chunk_size_list) if real_local > 0 else []
         return num_chunks, x_chunks, rl_chunks, all_rank_chunk_size_list
 
     def _run_chunks(
@@ -1490,9 +1502,11 @@ class FusedCommMoEScheduler(MoEScheduler):
             num_tokens = x.shape[0]
         assert num_tokens <= x.shape[0], f"num_tokens ({num_tokens}) > x.shape[0] ({x.shape[0]})"
 
-        x_chunk_real = x[:num_tokens]
-        router_logits_chunk_real = router_logits[:num_tokens]
-        input_ids_chunk_real = input_ids[:num_tokens] if input_ids is not None else None
+        x_chunk_real = _leading_rows(x, num_tokens)
+        router_logits_chunk_real = _leading_rows(router_logits, num_tokens)
+        input_ids_chunk_real = (
+            _leading_rows(input_ids, num_tokens) if input_ids is not None else None
+        )
 
         # ----- EPLB: drain previous CPU rebalance -----
         # Static EPLB early-returns inside the helper; only the dynamic
@@ -1509,15 +1523,20 @@ class FusedCommMoEScheduler(MoEScheduler):
                 )
             else:
                 token_selected_experts, token_final_scales = moe.routing_method.apply_with_aux(
-                    router_logits_chunk_real, input_ids_chunk_real, routing_aux[:num_tokens]
+                    router_logits_chunk_real,
+                    input_ids_chunk_real,
+                    _leading_rows(routing_aux, num_tokens),
                 )
+            if token_selected_experts.dtype != torch.int32:
+                token_selected_experts = token_selected_experts.to(torch.int32)
             token_selected_experts = moe._maybe_get_perfect_router_expert_ids(
-                token_selected_experts.to(torch.int32)
+                token_selected_experts
             )
             route_capture = get_active_route_capture()
             if route_capture is not None:  # R3: in-graph device-buffer capture
                 route_capture.capture(moe.layer_idx, token_selected_experts, row_offset)
-            token_final_scales = token_final_scales.to(torch.float32)
+            if token_final_scales.dtype != torch.float32:
+                token_final_scales = token_final_scales.to(torch.float32)
         else:
             device = x.device
             token_selected_experts = torch.empty(
