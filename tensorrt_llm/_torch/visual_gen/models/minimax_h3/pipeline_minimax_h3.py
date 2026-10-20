@@ -75,6 +75,7 @@ from .parallel_vae import TiledAutoencoderKLMiniMaxH3
 from .ref2va import load_references, prepare_references, validate_reference_order
 from .text_encoder_tp import MiniMaxH3TensorParallelTextEncoder
 from .transformer_minimax_h3 import MiniMaxH3Transformer3DModel
+from .vsa import build_h3_vsa_metadata, set_h3_vsa_context
 
 if TYPE_CHECKING:
     from ...sleep import PipelineSleepManager, SleepRestoreMode
@@ -1249,6 +1250,31 @@ class MiniMaxH3Pipeline(BasePipeline):
             self.scheduler.timesteps, self.audio_scheduler.timesteps
         )
 
+        _attn_cfg = self.pipeline_config.primary_model_config.attention
+        _sparse_cfg = getattr(_attn_cfg, "sparse_attention_config", None)
+        _vsa_active = (
+            getattr(_attn_cfg, "backend", "VANILLA") in ("CUTEDSL", "TRTLLM")
+            and _sparse_cfg is not None
+            and getattr(_sparse_cfg, "algorithm", None) == "vsa"
+        )
+        _vsa_sparsity = _sparse_cfg.vsa_sparsity if _vsa_active else 0.0
+        vsa_metadata = None
+        if _vsa_active:
+            if self.workflow == "ref2va" or keyframes:
+                raise ValueError("MiniMax-H3 VSA currently supports text-to-video only.")
+            patch = self.transformer.config.patch_size
+            grid = tuple(
+                size // p
+                for size, p in zip(
+                    (num_latent_frames, latent_height, latent_width), patch, strict=True
+                )
+            )
+            vsa_metadata = build_h3_vsa_metadata(
+                (text_indices.numel(), audio_indices.numel(), grid),
+                _vsa_sparsity,
+                self.device,
+            )
+
         def forward_fn(
             video_latents: torch.Tensor,
             extra_stream_latents: dict[str, torch.Tensor],
@@ -1259,7 +1285,7 @@ class MiniMaxH3Pipeline(BasePipeline):
         ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
             del timestep, encoder_hidden_states, extra_tensors
             unique_timesteps, timestep_indices = row_timestep_plan[index]
-            video_velocity, audio_velocity = self.transformer(
+            transformer_kwargs = dict(
                 hidden_states=torch.cat((condition_prefix, video_latents), dim=1),
                 audio_hidden_states=torch.cat(
                     (audio_condition_prefix, extra_stream_latents["audio"]), dim=1
@@ -1276,6 +1302,11 @@ class MiniMaxH3Pipeline(BasePipeline):
                 return_dict=False,
                 static_context=static_context,
             )
+            if _vsa_active:
+                with set_h3_vsa_context(vsa_metadata):
+                    video_velocity, audio_velocity = self.transformer(**transformer_kwargs)
+            else:
+                video_velocity, audio_velocity = self.transformer(**transformer_kwargs)
             # A silent all-zero / non-finite velocity has been observed once in
             # practice: the run completed, reported success, and wrote a black
             # video with silent audio.  The cause was never reproduced, so fail
