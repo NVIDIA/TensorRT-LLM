@@ -14,13 +14,11 @@ from typing import TYPE_CHECKING
 import numpy as np
 import torch
 
-from tensorrt_llm._torch.disaggregation.resource.page import MapperKind
 from tensorrt_llm._torch.host_staging import copy_host_to_device
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     _RESERVED_REQUEST_IDS,
     GPU_LEVEL,
     KVCacheManagerV2,
-    Role,
     _estimate_full_attn_size_per_token,
     _estimate_swa_cache_size,
     _fill_kv_pages,
@@ -1096,12 +1094,6 @@ class CSA2CacheManager(KVCacheManagerV2):
             )
             for size, window in zip(sizes, windows)
         )
-
-    def get_disagg_role_mapper_kinds(self):
-        return {
-            Role.ALL: MapperKind.REPLICATED,
-            **{role.role: MapperKind.REPLICATED for role in CSA2CacheRole},
-        }
 
     def get_disagg_pool_view_partition(self, layer_id: LayerId, role: DataRole):
         """Keep remote-tail SWA independently selectable in the transfer layout."""

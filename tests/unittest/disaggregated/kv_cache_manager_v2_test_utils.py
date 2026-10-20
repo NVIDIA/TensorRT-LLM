@@ -5,8 +5,8 @@
 
 import torch
 
+from tensorrt_llm._torch.disaggregation.cache_kinds import memory_registration_descs
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import build_page_table_from_manager
-from tensorrt_llm._torch.disaggregation.resource.utils import get_unique_pool_memory_descs
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor, get_size_in_bytes
@@ -15,7 +15,7 @@ from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor, get_size
 def initialize_cache(manager: KVCacheManagerV2, seed: int | None = None) -> None:
     """Fill each physical pool once, using matching seeds for replicated ranks."""
     page_table = build_page_table_from_manager(manager)
-    pools = get_unique_pool_memory_descs(page_table, torch.cuda.current_device())
+    pools = memory_registration_descs(page_table, torch.cuda.current_device())
     element_bytes = get_size_in_bytes(1, manager.dtype)
     for pool_idx, (address, size_bytes, _, _) in enumerate(pools):
         buffer = convert_to_torch_tensor(

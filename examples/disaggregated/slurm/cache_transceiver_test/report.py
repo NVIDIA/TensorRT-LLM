@@ -86,8 +86,9 @@ def build_cases(cfg):
     cases = []
     for combination in combinations:
         for ver in versions:
-            # The V2 cache manager only supports the Python cache transceiver.
-            if ver == "V2" and combination["runtime"] == "CPP":
+            # The V2 cache manager only supports the Python cache transceiver, and the Python cache
+            # transceiver only supports the V2 cache manager.
+            if (ver == "V2") != (combination["runtime"] == "PYTHON"):
                 continue
             cases.append(
                 {

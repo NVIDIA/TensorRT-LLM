@@ -25,9 +25,9 @@ from unittest.mock import Mock, call
 
 import pytest
 
-import tensorrt_llm._torch.disaggregation.transceiver as transceiver_mod
 from tensorrt_llm._torch.disaggregation.base import Cancelled, Chunk, TokenRange
 from tensorrt_llm._torch.disaggregation.base.transfer import SessionStatus
+from tensorrt_llm._torch.disaggregation.cache_kinds.kinds import _ownership
 from tensorrt_llm._torch.disaggregation.native.bounce.impl import NoBounceTransport
 from tensorrt_llm._torch.disaggregation.native.handle import TaskHandle
 from tensorrt_llm._torch.disaggregation.native.transfer import AgentResult, KVRecvTask, RxSession
@@ -95,12 +95,12 @@ def _profile(monkeypatch: pytest.MonkeyPatch, enabled: bool) -> tuple[SimpleName
         kv_cache_bounce_size_mb=0,
         enable_pipelined_transfer=False,
     )
-    monkeypatch.setenv(transceiver_mod._FP4_MLA_OWNERSHIP_BRIDGE_ENV, "1" if enabled else "0")
+    monkeypatch.setenv(_ownership.OWNERSHIP_BRIDGE_ENV, "1" if enabled else "0")
     monkeypatch.setenv("TRTLLM_DISAGG_NO_RETRY", "1")
     monkeypatch.delenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP", raising=False)
     monkeypatch.delenv("TRTLLM_DISAGG_LAYERWISE", raising=False)
-    monkeypatch.setattr(transceiver_mod, "use_pure_python_transfer_agent", lambda: False)
-    ownership = transceiver_mod._validate_fp4_mla_bridge_profile(mapping, manager, config)
+    monkeypatch.setattr(_ownership, "use_pure_python_transfer_agent", lambda: False)
+    ownership = _ownership.requires_physical_ownership(manager, mapping, config)
     assert ownership is enabled
     return mapping, ownership
 
@@ -159,7 +159,7 @@ class _ReceiveCase:
         self.handle = TaskHandle(self.session, self.session._kv_tasks[0], token_end=1)
         assert self.handle.poll() is None
         self.transceiver = object.__new__(KvCacheTransceiverV2)
-        self.transceiver._fp4_mla_bridge_enabled = ownership
+        self.transceiver._ownership_bridge_enabled = ownership
         self.transceiver.kv_transfer_timeout_ms = 1000
         self.transceiver._ever_had_recv_session = True
         self.transceiver._gen_need_sync = False

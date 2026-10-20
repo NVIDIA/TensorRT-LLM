@@ -46,8 +46,9 @@ itself flows over UCX/NIXL.
 - **Transceiver combinations** (`test_matrix.combinations`): C++ UCX, C++ NIXL,
   Python NIXL (each entry is a `{backend, runtime}` pair).
 - **Cache managers** (`test_matrix.cache_manager_versions`): `V1` and/or `V2`.
-  The full matrix is combinations × versions; **V2 only supports the Python
-  transceiver**, so `V2 + CPP` cases are skipped automatically. (In `results.json`
+  The full matrix is combinations × versions; **V2 runs only with the Python
+  transceiver and V1 only with the C++ one**, so `V2 + CPP` and `V1 + PYTHON` cases
+  are skipped automatically. (In `results.json`
   a "combination" is the full `backend/runtime/version` tested unit.)
 - **Request lengths** (`test_matrix.request_lengths`): e.g. 100 / 1k / 8k tokens.
   One transceiver + cache manager is built per case and reused across all lengths.

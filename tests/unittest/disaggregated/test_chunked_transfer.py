@@ -27,6 +27,7 @@ import pytest
 from tensorrt_llm import DisaggregatedParams
 from tensorrt_llm._torch.disaggregation.base import CacheExtent, CacheKind, Chunk, TokenRange
 from tensorrt_llm._torch.disaggregation.base.transfer import SessionStatus, WaitResult
+from tensorrt_llm._torch.disaggregation.cache_kinds import PageTable, UnitSpace
 from tensorrt_llm._torch.disaggregation.native.transfer import (
     AgentResult,
     KVSendTask,
@@ -133,12 +134,28 @@ def _projection_token_range(start_block: int, end_block: int) -> TokenRange:
     return TokenRange(start=start_block * _PROJECTION_TPB, end=end_block * _PROJECTION_TPB)
 
 
-def _make_projection_sender() -> Sender:
-    """Create a Sender wired to a stub registrar with two full-attention layer groups.
+def _attention_page_table(tokens_per_block: int, *windows) -> PageTable:
+    """A page table of paged attention spaces, one per window (``None``: full attention).
 
-    Full attention is spelled as a window the prompt never outgrows, which is
-    how both extractor paths build it; they read max_attention_window_vec, so an
-    attention group never carries None.
+    Selection reads only a space's kind, unit and params, so the spaces carry no regions.
+    """
+    return PageTable(
+        spaces=[
+            UnitSpace(
+                kind="attention",
+                unit=CacheKind.PAGED,
+                params={"tokens_per_block": tokens_per_block, "window": window},
+            )
+            for window in windows
+        ]
+    )
+
+
+def _make_projection_sender() -> Sender:
+    """Create a Sender wired to a stub registrar with two full-attention unit spaces.
+
+    Full attention is spelled as a window the prompt never outgrows, so pairing must not
+    depend on whether a space carries a window.
     """
     peer_ri = SimpleNamespace(
         dp_rank=0,
@@ -151,15 +168,11 @@ def _make_projection_sender() -> Sender:
     )
 
     extractor = MagicMock()
-    extractor.page_table = SimpleNamespace(
-        tokens_per_block=_PROJECTION_TPB,
-        layer_groups=[
-            SimpleNamespace(kind=CacheKind.PAGED, sliding_window_size=_PROJECTION_PROMPT_TOKENS),
-            SimpleNamespace(kind=CacheKind.PAGED, sliding_window_size=_PROJECTION_PROMPT_TOKENS),
-        ],
+    extractor.page_table = _attention_page_table(
+        _PROJECTION_TPB, _PROJECTION_PROMPT_TOKENS, _PROJECTION_PROMPT_TOKENS
     )
-    # extract(region_ids, layer_group_id, pool_idx) - the caller passes the
-    # layer-group and pool indices positionally, so swallow them.
+    # extract(region_ids, pool_idx) - the caller passes the pool index
+    # positionally, so swallow it.
     extractor.extract.side_effect = lambda block_ids, *_, **__: SimpleNamespace(
         memory=SimpleNamespace(
             ptrs=np.asarray(block_ids, dtype=np.int64),
@@ -167,24 +180,24 @@ def _make_projection_sender() -> Sender:
         )
     )
 
-    mapper = MagicMock()
-    mapper.map.side_effect = lambda src_region, dst_region: SimpleNamespace(
-        src=src_region,
-        dst=dst_region,
-    )
+    # One whole-slot run per unit: every paired unit is one fragment.
+    plan = MagicMock()
+    plan.map.side_effect = lambda src_region, dst_region: [
+        SimpleNamespace(src=src_region, dst=dst_region)
+    ]
+    groups = [
+        SimpleNamespace(self_space=space, peer_space=space, self_pool=0, peer_pool=0, plan=plan)
+        for space in range(2)
+    ]
 
     registrar = MagicMock()
     registrar.self_rank_info = SimpleNamespace(cp_size=1, cp_rank=0)
     registrar.self_extractor = extractor
     registrar.get_peer_rank_info.return_value = peer_ri
     registrar.get_peer_overlap.return_value = SimpleNamespace(ranks=[0])
-    registrar.should_send_kv.return_value = True
-    registrar.get_pool_mapping.return_value = {
-        (0, 0): (0, 0),
-        (1, 0): (1, 0),
-    }
+    registrar.owns.return_value = True
+    registrar.transfer_groups.return_value = groups
     registrar.peer_extractor.return_value = extractor
-    registrar.get_kv_map.return_value = mapper
 
     sender = Sender.__new__(Sender)
     sender._registrar = registrar
@@ -192,7 +205,7 @@ def _make_projection_sender() -> Sender:
 
 
 def _make_projection_task(slice_id: int = 1) -> KVSendTask:
-    # Chunk [4, 8) of an 8-block prompt. Group 1 is a short (windowed) group
+    # Chunk [4, 8) of an 8-block prompt. Space 1 is a short (windowed) space
     # that only holds ordinals 5..7.
     return KVSendTask(
         Chunk(
@@ -225,7 +238,7 @@ def _make_projection_req_info(slice_id=None) -> RecvReqInfo:
 
 
 def test_build_kv_write_meta_pairs_holes_by_ordinal():
-    """Each group pairs only the ordinals both tables hold; -1 entries are skipped."""
+    """Each space pairs only the ordinals both tables hold; -1 entries are skipped."""
     sender = _make_projection_sender()
 
     write_meta = sender._build_kv_write_meta(_make_projection_task(), _make_projection_req_info())
@@ -247,9 +260,7 @@ def test_build_kv_write_meta_pairs_holes_by_ordinal():
 def test_final_swa_slice_keeps_the_receivers_complete_active_window():
     """The final SWA transfer is not projected down to the final context chunk."""
     sender = _make_projection_sender()
-    sender._registrar.self_extractor.page_table.layer_groups[0].sliding_window_size = (
-        6 * _PROJECTION_TPB
-    )
+    sender._registrar.self_extractor.page_table.spaces[0].params["window"] = 6 * _PROJECTION_TPB
     task = KVSendTask(
         Chunk(
             block_ids_per_layer_groups=[
@@ -487,6 +498,7 @@ def test_pipelined_transfer_allows_pipeline_parallelism_at_initialization():
     transceiver = object.__new__(KvCacheTransceiverV2)
     transceiver._mapping = SimpleNamespace(pp_size=2, cp_size=1)
     transceiver._kv_cache_manager = MagicMock()
+    transceiver._page_table = None
     cache_transceiver_config = CacheTransceiverConfig(
         backend="NIXL",
         enable_pipelined_transfer=True,
@@ -502,6 +514,7 @@ def test_pipelined_transfer_rejects_bounce_buffer():
     transceiver = object.__new__(KvCacheTransceiverV2)
     transceiver._mapping = SimpleNamespace(pp_size=1, cp_size=1)
     transceiver._kv_cache_manager = MagicMock()
+    transceiver._page_table = None
     cache_transceiver_config = CacheTransceiverConfig(
         backend="NIXL",
         enable_pipelined_transfer=True,
@@ -526,6 +539,7 @@ def test_pipelined_transfer_allows_agent_bounce_buffer():
     transceiver = object.__new__(KvCacheTransceiverV2)
     transceiver._mapping = SimpleNamespace(pp_size=1, cp_size=1)
     transceiver._kv_cache_manager = MagicMock()
+    transceiver._page_table = None
     cache_transceiver_config = CacheTransceiverConfig(
         backend="NIXL",
         enable_pipelined_transfer=True,
@@ -537,13 +551,22 @@ def test_pipelined_transfer_allows_agent_bounce_buffer():
 
 
 def test_pipelined_transfer_rejects_mamba_cache_manager():
-    """Pipelined transfer does not support recurrent-state cache managers."""
+    """Pipelined transfer refuses cache kinds that move once per request (recurrent state)."""
     from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
-    from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManager
 
     transceiver = object.__new__(KvCacheTransceiverV2)
     transceiver._mapping = SimpleNamespace(pp_size=1, cp_size=1)
-    transceiver._kv_cache_manager = MagicMock(spec=MambaHybridCacheManager)
+    transceiver._kv_cache_manager = MagicMock()
+    transceiver._page_table = PageTable(
+        spaces=[
+            UnitSpace(
+                kind="mamba",
+                unit=CacheKind.PAGED,
+                params={"tokens_per_block": 32, "window": None},
+            ),
+            UnitSpace(kind="mamba", unit=CacheKind.STATE),
+        ]
+    )
     cache_transceiver_config = CacheTransceiverConfig(
         backend="NIXL",
         enable_pipelined_transfer=True,
@@ -551,7 +574,7 @@ def test_pipelined_transfer_rejects_mamba_cache_manager():
 
     with pytest.raises(
         ValueError,
-        match="not supported with a Mamba/hybrid cache manager",
+        match=r"not supported with cache kinds sent once per request \(mamba\)",
     ):
         KvCacheTransceiverV2._resolve_pipelined_transfer(transceiver, cache_transceiver_config)
 
@@ -588,6 +611,7 @@ def test_pipelined_transfer_rejects_context_parallelism():
     transceiver = object.__new__(KvCacheTransceiverV2)
     transceiver._mapping = SimpleNamespace(pp_size=1, cp_size=2)
     transceiver._kv_cache_manager = MagicMock()
+    transceiver._page_table = None
     cache_transceiver_config = CacheTransceiverConfig(
         backend="NIXL",
         enable_pipelined_transfer=True,
@@ -938,17 +962,15 @@ def test_pipelined_multiple_chunks_use_real_builder_and_tx_session():
     transceiver._ever_had_send_session = False
     transceiver._transfer_worker = SimpleNamespace(create_tx_session=lambda _req: session)
 
-    def _unexpected_get_block_ids(_req, _idx, _lg):
+    def _unexpected_get_block_ids(_req, _idx):
         raise AssertionError("context-side transfer must use get_block_ordinals, not get_block_ids")
 
     transceiver._reuse_adapter = SimpleNamespace(
         tokens_per_block=tokens_per_block,
         get_block_ids=_unexpected_get_block_ids,
-        get_block_ordinals=lambda _req, _idx, _lg: source_block_ids,
+        get_block_ordinals=lambda _req, _idx: source_block_ids,
     )
-    transceiver._page_table = SimpleNamespace(
-        layer_groups=[SimpleNamespace(kind=CacheKind.PAGED, sliding_window_size=None)]
-    )
+    transceiver._page_table = _attention_page_table(tokens_per_block, None)
     transceiver._kv_cache_manager = SimpleNamespace(tokens_per_block=tokens_per_block)
     transceiver._dp_rank = 0
     transceiver._context_info_endpoint = "ctx"
@@ -1020,12 +1042,10 @@ def _build_prefill_chunk_tokens_for(
     the rest are -1 holes. ``resident_blocks`` defaults to the block holding
     ``chunk_end_pos``. ``source_block_ids`` overrides the whole table.
 
-    ``sliding_window_size`` defaults to a full-attention layer as the V1
-    extractor actually builds one: its groups come from max_attention_window_vec
-    (resource_manager._get_window_size_to_layers), which has no None to hand
-    out, so a full-attention group carries max_attention_window. V2 spells the
-    same thing as None. Passing a window shorter than the prompt makes the group
-    genuinely windowed.
+    ``sliding_window_size`` defaults to a full-attention layer spelled as a
+    window the prompt never outgrows (a max_attention_window cap); ``None`` is
+    the other spelling of full attention. Passing a window shorter than the
+    prompt makes the space genuinely windowed.
     """
     from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
 
@@ -1044,11 +1064,7 @@ def _build_prefill_chunk_tokens_for(
     transceiver = MagicMock()
     transceiver._kv_cache_manager.tokens_per_block = _REUSE_TPB
     transceiver._describe_local = MagicMock(return_value=whole)
-    transceiver._page_table = SimpleNamespace(
-        layer_groups=[
-            SimpleNamespace(kind=CacheKind.PAGED, sliding_window_size=sliding_window_size)
-        ]
-    )
+    transceiver._page_table = _attention_page_table(_REUSE_TPB, sliding_window_size)
     transceiver._send_reqs = {}
 
     req = MagicMock()
@@ -1160,16 +1176,16 @@ def test_swa_blocks_are_deferred_until_the_complete_final_window():
 @pytest.mark.parametrize(
     "window_tokens",
     [None, _REUSE_TOTAL_BLOCKS * _REUSE_TPB, _REUSE_TOTAL_BLOCKS * _REUSE_TPB + _REUSE_TPB],
-    ids=["no_window_v2", "window_equals_prompt", "window_exceeds_prompt"],
+    ids=["no_window", "window_equals_prompt", "window_exceeds_prompt"],
 )
 def test_window_covering_the_whole_prompt_streams_like_full_attention(window_tokens):
     """A window the prompt never outgrows evicts nothing, so its chunks stream.
 
-    The two managers describe a full-attention layer differently: V2 uses None
-    while V1 hands over max_attention_window, so a group is only genuinely
-    windowed when its window cuts the prompt short. Deferring on a non-None
-    window alone would hold every V1 group back to the last chunk and silently
-    disable pipelining. All three spellings must behave identically.
+    A full-attention layer may carry no window or a window capped at
+    max_attention_window, so a space is only genuinely windowed when its window
+    cuts the prompt short. Deferring on a non-None window alone would hold every
+    capped space back to the last chunk and silently disable pipelining. All
+    three spellings must behave identically.
     """
     chunk = _build_prefill_chunk_tokens_for(
         prepopulated_tokens=0,

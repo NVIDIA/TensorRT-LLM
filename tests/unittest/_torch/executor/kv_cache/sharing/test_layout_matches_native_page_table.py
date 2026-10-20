@@ -14,24 +14,21 @@
 # limitations under the License.
 """``derive_layout`` against the page table native builds from the same live manager, for three
 model shapes with small caches and no checkpoint: each transferred buffer's layer, pool, offset,
-size and mapper, and each layer group's kind, window, heads, pools and view roles; and each
-buffer's offset and size against the runtime's address and page size of its layer and role."""
+size and mapper, and each layer group's kind, window, heads, pools and roles against the unit
+space of its life cycle; and each buffer's offset and size against the runtime's address and page
+size of its layer and role."""
 
 from __future__ import annotations
 
 import dataclasses
-from collections import defaultdict
 
 import pytest
 import torch
 
+from tensorrt_llm._torch.disaggregation.base import CacheKind
+from tensorrt_llm._torch.disaggregation.cache_kinds import BufferDecl
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import build_page_table_from_manager
-from tensorrt_llm._torch.disaggregation.resource.page import CacheKind, MapperKind
-from tensorrt_llm._torch.pyexecutor.kv_cache.sharing._layout import (
-    BufferMapper,
-    ShardDesc,
-    derive_layout,
-)
+from tensorrt_llm._torch.pyexecutor.kv_cache.sharing._layout import ShardDesc, derive_layout
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.internal.batch_manager import CacheType
 from tensorrt_llm.mapping import Mapping
@@ -62,41 +59,34 @@ SHAPES = {
 }
 
 
-def _as_list(values):
-    return None if values is None else [int(v) for v in values]
-
-
 def native_groups(page_table):
-    """What native's page table says per layer group. Pools are named by base address, layers by
-    the global ids of ``local_layers``; order-free parts are sorted."""
+    """What native's page table says per unit space (one per layer group, indexed alike): each
+    region as ``(layer, pool base, offset, size, declarations)``. Pools are named by base address;
+    order-free parts are sorted."""
     out = []
-    for lg in page_table.layer_groups:
+    for space in page_table.spaces:
         pools = [
             (int(p.base_address), int(p.slot_bytes), int(p.num_slots))
-            for p in page_table.pool_groups[lg.pool_group_idx].pools
+            for p in (page_table.pools[i] for i in space.pools)
         ]
-        global_of = {int(ll.local_layer_id): int(ll.global_layer_id) for ll in lg.local_layers}
-        state = lg.kind == CacheKind.STATE
-        rows, roles, geometry = [], {}, {}
-        for pv in lg.pool_views:
-            key = (pools[pv.pool_idx][0], MapperKind(int(pv.mapper_kind)).name)
-            assert key not in roles, f"two views of pool and mapper {key}"
-            roles[key] = sorted(pv.pool_role)
-            if state:
-                geometry[key] = (_as_list(pv.section_bytes), pv.bytes_per_head)
-            for e in pv.buffer_entries:
-                layer = global_of[int(e["local_layer_id"])]
-                rows.append((layer, key[0], int(e["offset"]), int(e["size"]), key[1]))
+        state = space.unit == CacheKind.STATE
+        rows = [
+            (
+                region.layer,
+                int(page_table.pools[region.pool].base_address),
+                region.offset,
+                region.nbytes,
+                region.buffers,
+            )
+            for region in space.regions
+        ]
         out.append(
             {
                 "kind": "state" if state else "attention",
-                "window": None if state else lg.sliding_window_size,
-                "heads": None if state else int(lg.kv_head_num_per_rank),
-                "layers": sorted(global_of.values()),
+                "window": None if state else space.params["window"],
+                "layers": space.layers,
                 "pools": pools,
-                "rows": sorted(rows),
-                "roles": roles,
-                "state_geometry": geometry,
+                "rows": sorted(rows, key=lambda row: row[:4]),
             }
         )
     return out
@@ -104,43 +94,32 @@ def native_groups(page_table):
 
 def layout_groups(geometry):
     """The same per layer group from ``derive_layout``'s result, without local-only buffers (native
-    skips ignored roles); transferred buffers no group claims are listed last. Attention heads are
-    the head-sharded buffers' ``num_heads``: native's attention views have no per-head size."""
+    skips ignored roles); transferred buffers no group claims are listed last. A group's pools are
+    those of its device pool group its transferred buffers sit in, as native's unit space lists only
+    the pools its regions use."""
     layout = geometry.layout
     out, claimed = [], set()
     for desc in layout.layer_groups:
         g = desc.pool_group
-        pools = [(p.base, p.slot_bytes, p.num_slots) for p in geometry.device_pools[g]]
-        assert layout.pool_groups[g] == tuple(w for _, w, _ in pools)
-        base_of = {p.index: p.base for p in geometry.device_pools[g]}
-        state = desc.kind == "state"
-        rows, roles, geometries, heads = [], defaultdict(list), defaultdict(set), set()
+        device_pools = geometry.device_pools[g]
+        assert layout.pool_groups[g] == tuple(p.slot_bytes for p in device_pools)
+        base_of = {p.index: p.base for p in device_pools}
+        rows = []
         for i, b in enumerate(layout.buffers):
             if b.layer not in desc.layers or b.pool[0] != g or not b.transfer:
                 continue
             assert b.expansion == 1, "native reads no expansion"
             claimed.add(i)
-            key = (base_of[b.pool[1]], b.mapper.name)
-            rows.append((b.layer, key[0], b.offset, b.size, key[1]))
-            roles[key].append(b.role)
-            if state:
-                section = b.geometry.section_bytes
-                section = None if section is None else tuple(section)
-                geometries[key].add((section, b.geometry.bytes_per_head))
-            elif b.mapper in (BufferMapper.INDEXED, BufferMapper.NHD):
-                heads.add(b.geometry.num_heads)
-        assert all(len(v) == 1 for v in geometries.values()), f"roles disagree: {dict(geometries)}"
-        assert len(heads) <= 1, heads
+            rows.append((b.layer, base_of[b.pool[1]], b.offset, b.size, b.decls))
+        used = {base for _, base, _, _, _ in rows}
+        pools = [(p.base, p.slot_bytes, p.num_slots) for p in device_pools if p.base in used]
         out.append(
             {
                 "kind": desc.kind,
                 "window": desc.window,
-                "heads": None if state else (heads.pop() if heads else 0),
                 "layers": sorted(desc.layers),
                 "pools": pools,
-                "rows": sorted(rows),
-                "roles": {k: sorted(set(v)) for k, v in roles.items()},
-                "state_geometry": {k: (_as_list(s), h) for k, ((s, h),) in geometries.items()},
+                "rows": sorted(rows, key=lambda row: row[:4]),
             }
         )
     stray = [
@@ -165,13 +144,17 @@ def lies(geometry):
             for i, d in enumerate(layout.layer_groups)
         )
 
+    # The first buffer split differently: replicated if it is sharded, sharded if replicated.
+    domain = first.decls[0].domain
     other = (
-        BufferMapper.INDEXED if first.mapper is BufferMapper.REPLICATED else BufferMapper.REPLICATED
+        (BufferDecl(first.size, domain, (("byte", first.size),), "byte"),)
+        if first.replicated
+        else (BufferDecl(first.size, domain),)
     )
     out = {
         "offset": {"buffers": buffers(offset=first.offset + first.size)},
         "layer": {"buffers": buffers(layer=first.layer + 1000)},
-        "mapper": {"buffers": buffers(mapper=other)},
+        "split": {"buffers": buffers(decls=other)},
         "extra buffer": {
             "buffers": layout.buffers + (dataclasses.replace(first, layer=first.layer + 1000),)
         },
@@ -195,7 +178,9 @@ def test_layout_matches_the_page_table_native_builds(real_manager, hybrid_manage
         derived = layout_groups(geometry)
 
         layout = geometry.layout
-        assert layout.tokens_per_block == page_table.tokens_per_block
+        paged = [s for s in page_table.spaces if s.unit == CacheKind.PAGED]
+        assert paged
+        assert all(s.params["tokens_per_block"] == layout.tokens_per_block for s in paged)
         assert len(derived) == len(native), derived[len(native) :]
         assert all(group["rows"] for group in native)
         for lg, (ours, theirs) in enumerate(zip(derived, native)):
@@ -212,12 +197,12 @@ def test_layout_matches_the_page_table_native_builds(real_manager, hybrid_manage
             lie = dataclasses.replace(geometry, layout=dataclasses.replace(layout, **change))
             assert layout_groups(lie) != native, f"the {name} lie went unnoticed"
 
-        # Every buffer sits where the runtime keeps its layer and role. Native's views list roles
-        # per pool and mapper, so a layer's K and V trading places shows only here.
+        # Every buffer sits where the runtime keeps its layer and role. The rows above carry no
+        # role, so a layer's K and V trading places shows only here.
         internal = {
-            int(ll.global_layer_id): int(ll.local_layer_id)
-            for lg in page_table.layer_groups
-            for ll in lg.local_layers
+            region.layer: region.local_layer
+            for space in page_table.spaces
+            for region in space.regions
         }
         base = {(p.group, p.index): p.base for ps in geometry.device_pools.values() for p in ps}
         for b in layout.buffers:

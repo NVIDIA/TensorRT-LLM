@@ -475,8 +475,9 @@ class DisaggTransferCoordinator:
         if not request.is_disagg_generation_transmission_complete:
             return False
         request.state = LlmRequestState.GENERATION_IN_PROGRESS
-        # commit_blocks_for_reuse requires the position to be at the prompt end.
-        request.context_current_position = request.prompt_len
+        # commit_blocks_for_reuse requires the position to be where every received cache kind is
+        # valid (the prompt end for attention and recurrent state alike).
+        request.context_current_position = self._transceiver.resume_position_after_receive(request)
         self._transceiver.commit_blocks_for_reuse(request)
         request.py_kv_transfer_start_time = None
         request.py_kv_transfer_timed_out = False
@@ -486,7 +487,7 @@ class DisaggTransferCoordinator:
         """Start async KV sends for finished context-only requests."""
         # Do not send more chunks after an in-flight cancellation.
         cancel_pending_ids = set(self._registry.canceled_request_ids())
-        bridge_enabled = getattr(self._transceiver, "_fp4_mla_bridge_enabled", False) is True
+        bridge_enabled = getattr(self._transceiver, "_ownership_bridge_enabled", False) is True
         for req in requests:
             if not req.is_context_only_request or req.is_finished_due_to_cancellation:
                 continue

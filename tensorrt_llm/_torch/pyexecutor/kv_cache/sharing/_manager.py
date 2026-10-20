@@ -190,22 +190,22 @@ def declared_global_layer_ids(manager: KVCacheManagerV2) -> dict[int, int] | Non
     return table
 
 
-def disagg_declaration(manager: KVCacheManagerV2, name: str) -> dict[str, object]:
-    """Role-keyed layout declarations from the named manager getter."""
-    getter = getattr(manager, name, None)
-    if getter is None:
-        return {}
-    return {str(role): value for role, value in dict(getter()).items()}
+def buffer_layout(
+    manager: KVCacheManagerV2, role: str, size: int, *, state: bool, heads: int
+) -> tuple:
+    """The ``BufferDecl``s of one buffer, as the cache kind describing the manager lays it out for
+    the native transfer (``disaggregation.cache_kinds``)."""
+    from tensorrt_llm._torch.disaggregation.base import CacheKind
+    from tensorrt_llm._torch.disaggregation.cache_kinds import role_layout
 
-
-def role_mapper_kinds(manager: KVCacheManagerV2) -> dict[str, object]:
-    """The manager's per-role disaggregation mapper declarations."""
-    return disagg_declaration(manager, "get_disagg_role_mapper_kinds")
-
-
-def role_layouts(manager: KVCacheManagerV2) -> dict[str, object]:
-    """The manager's per-role disaggregation layout declarations."""
-    return disagg_declaration(manager, "get_disagg_role_layouts")
+    return role_layout(
+        manager,
+        CacheKind.STATE if state else CacheKind.PAGED,
+        role,
+        size,
+        heads=heads,
+        tokens_per_block=int(manager.tokens_per_block),
+    )
 
 
 def ignored_roles(manager: KVCacheManagerV2) -> frozenset[str]:

@@ -41,13 +41,13 @@ The control plane — discovery, per-request metadata, and completion notices �
 
 `native/messenger.py` wraps ZeroMQ `ROUTER`/`DEALER` sockets and owns a listener thread per socket. `native/transfer.py` builds the actual endpoints on top: `Sender` on the context side, `Receiver` on the generation side, and a rendezvous server on rank 0. Listener handlers mutate session state and enqueue work; they never block on a transfer.
 
-### Peer Registrar and Mappers
+### Peer Registrar and Cache Kinds
 
-`native/peer.py` resolves which peer ranks hold the same layers when context and generation use different TP/PP/DP configurations, and elects exactly one owner per destination so nothing is transferred twice. `native/mixers/` holds the per-architecture layout policies that turn a matched pool pair into `(src_ptrs, dst_ptrs, sizes)` — separate mappers for matching head counts, for head-major and token-major mismatches, for replicated pools, and for Mamba conv and SSM state.
+`native/peer.py` keeps per-peer state and caches; what it caches comes from `cache_kinds/`. Each cache variant (standard attention, MiniMax M3, DeepSeek-V4, CSA2, FP4 MLA, hybrid Mamba, QSA, ...) is one class in `cache_kinds/kinds/variants.py` that claims its cache-manager classes, describes their memory, and owns the variant's rules: which of a request's units move, which regions a request leaves out, how much history moves, and what to check on a peer. One generic algorithm (`cache_kinds/correspondence.py`) maps any two sides' memory onto each other: it matches regions by `(kind, layer, role)`, intersects the two ranks' shard spans to get `(src_ptrs, dst_ptrs, sizes)`, and elects exactly one sender among ranks holding identical bytes, so nothing is transferred twice. `cache_kinds/topology.py` resolves which peer ranks hold the same layers when context and generation use different TP/PP/CP/DP configurations.
 
 ### Page Table
 
-`resource/page.py` describes a rank's KV storage independently of which cache manager produced it, which is what lets a V1 context worker talk to a V2 generation worker. `resource/kv_extractor.py` builds it from either manager generation and turns block IDs into slot pointers; `resource/cache_reuse.py` reports the cached prefix length uniformly, so context-side reuse, generation-side reuse, and sliding-window stale prefixes all resolve without a special case.
+`cache_kinds/page_table.py` describes a rank's KV storage independently of which cache manager produced it. It has a fixed, kind-free shape: pools (where memory is), unit spaces (memory one per-request list of block or slot ids indexes; one per `KVCacheManagerV2` life cycle), regions (one per `(layer, role)` buffer: its pool and offset inside a unit's slot), and each region's layout declaration (`BufferDecl`: byte size, axes, the axis it is split along, and the shard domain that splits it). A new cache adds rows to this table, not fields. The kind that claims the manager builds it (`cache_kinds/build.py`); `resource/kv_extractor.py` turns unit ids into slot pointers; `resource/cache_reuse.py` reports the cached prefix length per unit space, so context-side reuse, generation-side reuse, and sliding-window stale prefixes all resolve without a special case. The Python transceiver transfers `KVCacheManagerV2`-based caches only; V1 managers use the C++ transceiver.
 
 ### Transfer Agent
 
@@ -63,9 +63,9 @@ Note also that `cpp/tensorrt_llm/executor/cache_transmission/nixl_utils/` outliv
 
 ### Supporting a New Cache Layout
 
-A new storage layout usually means a new mapper under `native/mixers/` plus a page-table builder change in `resource/kv_extractor.py`. Both peers must agree: pool role and mapper kind are matched exactly, and a mismatch raises rather than silently transferring a subset.
+How each role of a cache is laid out and split across ranks is declared by its cache kind, not by the cache manager: a new role of an existing cache is a line in that kind's class. A new cache variant is one new class in `cache_kinds/kinds/variants.py` that subclasses `CacheKindSpec` (usually through `kinds._base.StandardSpec`) and names its manager class; nothing in `native/`, the transceiver, or the page table changes. See `tensorrt_llm/_torch/disaggregation/cache_kinds/CACHE_KINDS_DEVELOPER_GUIDE.md`. Both peers must agree: they must run the same kinds, matched regions must declare the same layout, an unknown kind is rejected, and a mismatch raises rather than silently transferring a subset.
 
-Unit tests for these seams live in `tests/unittest/disaggregated/` — byte-level transfer checks, topology and mapper selection, page-table construction, and multi-process end-to-end coverage.
+Unit tests for these seams live in `tests/unittest/disaggregated/` — byte-level transfer checks, topology and transfer groups, page-table construction, resharding checks of every cache kind, and multi-process end-to-end coverage.
 
 ## Current Limitations
 

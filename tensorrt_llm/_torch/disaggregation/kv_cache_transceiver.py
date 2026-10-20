@@ -155,11 +155,12 @@ def create_kv_cache_transceiver(
         logger.info("cache_transceiver is disabled")
         return None
 
-    if (cache_transceiver_config.transceiver_runtime != "PYTHON"
-            and isinstance(mamba_cache_manager, MixedMambaHybridCacheManager)):
+    if isinstance(mamba_cache_manager, MixedMambaHybridCacheManager):
         raise ValueError(
-            "MixedMambaHybridCacheManager requires the Python transceiver "
-            "runtime in disaggregated serving.")
+            "MixedMambaHybridCacheManager is not supported in disaggregated "
+            "serving: the C++ transceiver cannot move its recurrent state and "
+            "the Python transceiver transfers KV cache manager V2 caches only. "
+            "Set kv_cache_config.use_kv_cache_manager_v2=True.")
 
     # Runs while backend may still be "DEFAULT", which it rejects as ambiguous.
     _validate_disagg_inflight_cancel_config(cache_transceiver_config)
@@ -212,6 +213,11 @@ def create_kv_cache_transceiver(
                 "kv_cache_config.use_kv_cache_manager_v2=False, or select "
                 "the V2 manager "
                 "with use_kv_cache_manager_v2=True.")
+        if not uses_v2_manager:
+            raise ValueError(
+                "transceiver_runtime='PYTHON' transfers KV cache manager V2 "
+                "caches only. Set kv_cache_config.use_kv_cache_manager_v2="
+                "True, or use transceiver_runtime='CPP' for a V1 manager.")
         # DEFAULT has already been resolved above, so Python must see NIXL.
         if cache_transceiver_config.backend != "NIXL":
             raise ValueError(
@@ -223,7 +229,6 @@ def create_kv_cache_transceiver(
         from tensorrt_llm._torch.disaggregation.transceiver import \
             KvCacheTransceiverV2
         logger.info("Using KvCacheTransceiverV2")
-        # MixedMambaHybridCacheManager contains both the KV and Mamba pools.
         return KvCacheTransceiverV2(mapping, dist, kv_cache_manager,
                                     cache_transceiver_config)
 
@@ -460,6 +465,10 @@ class KvCacheTransceiver(ABC):
 
     def commit_blocks_for_reuse(self, req: LlmRequest) -> None:
         """Commit received KV blocks to the radix tree for prefix reuse. No-op by default."""
+
+    def resume_position_after_receive(self, req: LlmRequest) -> int:
+        """Position a request resumes from once its prompt cache arrived."""
+        return req.prompt_len
 
     def get_data_transceiver_state(self) -> bytes:
         """Get the serialized DataTransceiverState (CacheState + CommState)."""

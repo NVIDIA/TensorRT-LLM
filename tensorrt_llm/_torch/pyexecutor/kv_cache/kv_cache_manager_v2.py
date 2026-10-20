@@ -36,7 +36,6 @@ import numpy as np
 import torch
 from strenum import StrEnum
 
-from tensorrt_llm._torch.disaggregation.resource.page import MapperKind, RoleLayout
 from tensorrt_llm._torch.distributed.communicator import Distributed, ReduceOp
 from tensorrt_llm._torch.utils import helix_local_len, maybe_compile
 from tensorrt_llm._utils import (
@@ -3120,50 +3119,6 @@ class KVCacheManagerV2(BaseResourceManager):
         new roles do not require C++ changes.
         """
         return None
-
-    def get_disagg_role_mapper_kinds(self) -> dict[DataRole, MapperKind]:
-        """Map native cache roles to disaggregation mapper kinds.
-
-        ``Role.ALL`` is the required fallback for roles without an explicit
-        entry. The default is the head-major (HND) ``INDEXED`` layout written
-        by the TRTLLM attention kernels — correct for V1 and standard V2
-        managers. ``Role.INDEX_KEY`` defaults to ``REPLICATED``: every
-        index-key side cache shipped so far (DSA indexer-K on V1, MiniMax M3
-        on V2) computes its projection replicated across TP ranks, so the
-        cache bytes are identical per rank; the entry is inert unless a
-        subclass actually registers ``INDEX_KEY`` buffers via
-        ``_extra_buffers_per_layer``. Model-specific managers may declare
-        logical layouts without requiring the shared extractor to inspect
-        private attributes or role names. MiniMax M3, for example, maps
-        ordinary K/V to ``HND`` for its MSA backend and ``NHD`` for its
-        Triton backend, while keeping index-key ``REPLICATED``.
-
-        This declaration does not influence storage pooling: V2 storage
-        coalesces buffers purely by ``(life_cycle, buffer size)``, so roles
-        with different transfer semantics may share a pool slot when their
-        per-block sizes coincide (e.g. MiniMax M3 at TP degrees where
-        K == V == INDEX_KEY bytes per block). The disagg page-table builder
-        splits each physical pool into one logical view per mapper kind, so
-        transfer correctness never depends on the coalescing outcome.
-
-        Pool memory is layout-agnostic; this declaration describes what the
-        manager's paired attention backend actually writes. A static mapping
-        is valid only for a fixed manager/backend pair. A manager whose backend
-        selects the layout at runtime must derive the mapping from that
-        backend's configuration.
-        """
-        return {Role.ALL: MapperKind.INDEXED, Role.INDEX_KEY: MapperKind.REPLICATED}
-
-    def get_disagg_role_layouts(self) -> dict[DataRole, RoleLayout]:
-        """Resharding geometry for roles whose mapper kind needs it.
-
-        SECTIONED roles declare ``section_bytes``; INDEXED roles whose head
-        count is not derivable from the attention topology declare
-        ``bytes_per_head``. Attention K/V and replicated roles need none, so
-        the base manager declares nothing. The page-table builder copies the
-        layout onto the role's ``PoolView``.
-        """
-        return {}
 
     def get_disagg_ignored_roles(self) -> frozenset[DataRole]:
         """Return local-only buffer roles excluded from disaggregation.

@@ -865,7 +865,7 @@ def test_transceiver_activates_fail_stop_only_for_ownership_bridge(
 
     monkeypatch.setattr(
         transceiver_module,
-        "_validate_fp4_mla_bridge_profile",
+        "requires_physical_ownership",
         lambda *_args: ownership_enabled,
     )
     communicator = Mock()

@@ -7,7 +7,6 @@ from typing import TYPE_CHECKING, Dict, List, Optional
 
 import torch
 
-from tensorrt_llm._torch.disaggregation.resource.page import MapperKind
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import Role
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManagerV2
 from tensorrt_llm._utils import TensorWrapper, binding_to_torch_dtype, convert_to_torch_tensor
@@ -77,16 +76,6 @@ class QSAMambaHybridCacheManagerV2(MambaHybridCacheManagerV2):
         ]
         self.qsa_position_layer_id: Optional[int] = None
         super().__init__(*args, layer_mask=layer_mask, **kwargs)
-
-    def get_disagg_role_mapper_kinds(self) -> Dict[DataRole, MapperKind]:
-        """Index positions are request-wide coordinates, so every rank holds
-        the same bytes. They carry no head axis, and the INDEXED fallback would
-        divide their size by the rank's KV-head count, which only cancels out
-        when both peers shard heads the same way."""
-        return {
-            **super().get_disagg_role_mapper_kinds(),
-            QSA_INDEX_POSITION: MapperKind.REPLICATED,
-        }
 
     @cached_property
     def qsa_local_sparse_layer_ids(self) -> List[int]:

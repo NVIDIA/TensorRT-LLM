@@ -13,36 +13,45 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import numpy as np
 import pytest
 
-from tensorrt_llm._torch.disaggregation.resource.page import (
-    BUFFER_ENTRY_DTYPE,
-    AttentionLayerGroup,
-    KVCachePageTable,
-    LayerGroup,
-    LocalLayer,
-    MapperKind,
-    PhysicalPool,
-    PhysicalPoolGroup,
-    PoolView,
+from tensorrt_llm._torch.disaggregation.base import CacheKind
+from tensorrt_llm._torch.disaggregation.cache_kinds import (
+    ATTENTION_TP,
+    STATE_TP,
+    BufferDecl,
+    PageTable,
+    Pool,
+    Region,
+    UnitSpace,
 )
 
 pytestmark = pytest.mark.cpu_only
 
 
-def _make_buffer_entries():
-    return np.array(
-        [
-            (0, 0, 128),  # local_layer_id=0, offset=0, size=128
-            (0, 128, 128),  # local_layer_id=0, offset=128, size=128
-        ],
-        dtype=BUFFER_ENTRY_DTYPE,
+def _hnd(nbytes=128, heads=8):
+    return BufferDecl(nbytes, ATTENTION_TP, (("head", heads),), "head")
+
+
+def _kv_regions(layer, offset, local_layer=0, pool=0, nbytes=128):
+    """K then V of one layer, back to back from ``offset``."""
+    return [
+        Region(pool, layer, "key", offset, (_hnd(nbytes),), local_layer=local_layer),
+        Region(pool, layer, "value", offset + nbytes, (_hnd(nbytes),), local_layer=local_layer),
+    ]
+
+
+def _attention_space(regions, window=None, tokens_per_block=64):
+    return UnitSpace(
+        kind="attention",
+        unit=CacheKind.PAGED,
+        regions=regions,
+        params={"tokens_per_block": tokens_per_block, "window": window},
     )
 
 
 def test_physical_pool_construction():
-    pool = PhysicalPool(base_address=0x10000, slot_bytes=256, num_slots=4)
+    pool = Pool(base_address=0x10000, slot_bytes=256, num_slots=4)
     assert pool.base_address == 0x10000
     assert pool.slot_bytes == 256
     assert pool.num_slots == 4
@@ -51,7 +60,7 @@ def test_physical_pool_construction():
 
 
 def test_physical_pool_roundtrip():
-    pool = PhysicalPool(
+    pool = Pool(
         base_address=0x10000,
         slot_bytes=256,
         num_slots=4,
@@ -59,7 +68,7 @@ def test_physical_pool_roundtrip():
         layer_stride_bytes=512,
     )
     d = pool.to_dict()
-    restored = PhysicalPool.from_dict(d)
+    restored = Pool.from_dict(d)
     assert restored.base_address == pool.base_address
     assert restored.slot_bytes == pool.slot_bytes
     assert restored.num_slots == pool.num_slots
@@ -67,174 +76,127 @@ def test_physical_pool_roundtrip():
     assert restored.layer_stride_bytes == pool.layer_stride_bytes
 
 
-def test_pool_view_roundtrip():
-    entries = _make_buffer_entries()
-    pv = PoolView(pool_idx=0, buffer_entries=entries)
-    d = pv.to_dict()
-    restored = PoolView.from_dict(d)
-    assert restored.pool_idx == 0
-    assert len(restored.buffer_entries) == 2
-    assert restored.buffer_entries[0]["offset"] == 0
-    assert restored.buffer_entries[1]["offset"] == 128
+def test_physical_pool_rejects_strides_smaller_than_slot():
+    with pytest.raises(ValueError, match="slot_stride_bytes"):
+        Pool(base_address=0, slot_bytes=256, num_slots=4, slot_stride_bytes=128)
+    with pytest.raises(ValueError, match="layer_stride_bytes"):
+        Pool(base_address=0, slot_bytes=256, num_slots=4, layer_stride_bytes=128)
 
 
-def test_pool_view_kind_roundtrip():
-    """REPLICATED / NHD kinds survive serialization; default stays INDEXED."""
-    entries = _make_buffer_entries()
-    for kind in (MapperKind.REPLICATED, MapperKind.NHD):
-        view = PoolView(
-            pool_idx=2,
-            buffer_entries=entries,
-            pool_role=frozenset({"index_key"}),
-            mapper_kind=kind,
-        )
-        restored = PoolView.from_dict(view.to_dict())
-        assert restored.mapper_kind == kind
-        assert restored.pool_role == frozenset({"index_key"})
-
-    legacy = PoolView(pool_idx=0, buffer_entries=entries).to_dict()
-    assert PoolView.from_dict(legacy).mapper_kind == MapperKind.INDEXED
+def test_region_roundtrip():
+    """Each (layer, role) buffer is one region; its pool, offset and ids survive the wire."""
+    space = _attention_space(_kv_regions(layer=5, offset=0, local_layer=0))
+    restored = UnitSpace.from_dict(space.to_dict())
+    assert restored.regions == space.regions
+    key, value = restored.regions
+    assert (key.pool, key.layer, key.role, key.offset, key.local_layer) == (0, 5, "key", 0, 0)
+    assert (value.pool, value.layer, value.role, value.offset) == (0, 5, "value", 128)
+    assert key.key == (5, "key")
+    assert key.nbytes == value.nbytes == 128
 
 
-def test_local_layer_roundtrip():
-    ll = LocalLayer(local_layer_id=0, global_layer_id=5)
-    d = ll.to_dict()
-    restored = LocalLayer.from_dict(d)
-    assert restored.local_layer_id == 0
-    assert restored.global_layer_id == 5
+@pytest.mark.parametrize(
+    "buffers",
+    [
+        pytest.param((BufferDecl(128, ATTENTION_TP),), id="replicated"),
+        pytest.param(
+            (BufferDecl(128, ATTENTION_TP, (("token", 4), ("head", 8)), "head"),), id="nhd"
+        ),
+        pytest.param((_hnd(),), id="hnd"),
+    ],
+)
+def test_region_layout_roundtrip(buffers):
+    """Replicated / token-major / head-major declarations survive serialization."""
+    space = _attention_space([Region(2, 0, "index_key", 64, buffers)])
+    restored = UnitSpace.from_dict(space.to_dict()).regions[0]
+    assert restored.buffers == buffers
+    assert restored.role == "index_key"
+    assert restored.replicated == all(b.split_axis is None for b in buffers)
 
 
-def test_layer_group_roundtrip():
-    entries = _make_buffer_entries()
-    lg = AttentionLayerGroup(
-        pool_group_idx=0,
-        kv_head_num_per_rank=8,
-        sliding_window_size=None,
-        local_layers=[LocalLayer(0, 5), LocalLayer(1, 6)],
-        pool_views=[PoolView(pool_idx=0, buffer_entries=entries)],
+def test_unit_space_roundtrip():
+    space = _attention_space(
+        _kv_regions(layer=5, offset=0, local_layer=0) + _kv_regions(6, 256, local_layer=1),
+        window=512,
     )
-    d = lg.to_dict()
-    restored = LayerGroup.from_dict(d)
-    assert restored.pool_group_idx == 0
-    assert restored.kv_head_num_per_rank == 8
-    assert restored.sliding_window_size is None
-    assert len(restored.local_layers) == 2
-    assert len(restored.pool_views) == 1
+    restored = UnitSpace.from_dict(space.to_dict())
+    assert restored.kind == "attention"
+    assert restored.unit == CacheKind.PAGED
+    assert restored.params == {"tokens_per_block": 64, "window": 512}
+    assert restored.layers == [5, 6]
+    assert restored.pools == [0]
+    assert len(restored.regions) == 4
+
+
+def test_unit_space_sends_each_distinct_layout_once():
+    regions = _kv_regions(layer=0, offset=0) + [
+        Region(0, 0, "index_key", 256, (BufferDecl(64, ATTENTION_TP),))
+    ]
+    d = _attention_space(regions).to_dict()
+    # K and V share one declaration; the replicated index key has its own.
+    assert len(d["layouts"]) == 2
+    assert [row[4] for row in d["regions"]] == [0, 0, 1]
 
 
 def test_kv_cache_page_table_roundtrip():
-    entries = _make_buffer_entries()
-    page_table = KVCachePageTable(
-        tokens_per_block=64,
-        layer_groups=[
-            AttentionLayerGroup(
-                pool_group_idx=0,
-                kv_head_num_per_rank=8,
-                sliding_window_size=None,
-                local_layers=[LocalLayer(0, 5)],
-                pool_views=[PoolView(pool_idx=0, buffer_entries=entries)],
-            )
-        ],
-        pool_groups=[
-            PhysicalPoolGroup(
-                pools=[PhysicalPool(base_address=0x10000, slot_bytes=256, num_slots=4)]
-            )
-        ],
+    page_table = PageTable(
+        pools=[Pool(base_address=0x10000, slot_bytes=256, num_slots=4)],
+        spaces=[_attention_space(_kv_regions(layer=5, offset=0))],
     )
     d = page_table.to_dict()
-    restored = KVCachePageTable.from_dict(d)
-    assert restored.tokens_per_block == 64
-    assert len(restored.layer_groups) == 1
-    assert len(restored.pool_groups) == 1
-    assert restored.pool_groups[0].pools[0].base_address == 0x10000
+    restored = PageTable.from_dict(d)
+    assert len(restored.spaces) == 1
+    assert len(restored.pools) == 1
+    assert restored.pools[0].base_address == 0x10000
+    assert restored.spaces[0].params["tokens_per_block"] == 64
+    assert restored.pool_of(restored.spaces[0].regions[0]) is restored.pools[0]
 
 
 # ---------------------------------------------------------------------------
-# bytes_per_layer serialization and get_layer_byte_ranges geometry
+# Region and buffer declaration geometry
 # ---------------------------------------------------------------------------
 
 
-def test_pool_view_bytes_per_layer_roundtrip():
-    entries = _make_buffer_entries()
-    view = PoolView(
-        pool_idx=1,
-        buffer_entries=entries,
-        pool_role=frozenset({"key", "value"}),
-        mapper_kind=MapperKind.NHD,
-        bytes_per_layer=256,
-    )
-    restored = PoolView.from_dict(view.to_dict())
-    assert restored.bytes_per_layer == 256
-
-    # None (INDEXED views) survives the roundtrip too.
-    legacyless = PoolView(pool_idx=0, buffer_entries=entries)
-    assert PoolView.from_dict(legacyless.to_dict()).bytes_per_layer is None
+def test_region_nbytes_sums_buffers():
+    sections = tuple(BufferDecl(s, STATE_TP, (("byte", s),), "byte") for s in (512, 256, 256))
+    region = Region(0, 3, "conv_state", 0, sections)
+    assert region.nbytes == 1024
+    assert not region.replicated
 
 
-def _view(entries, bytes_per_layer=None):
-    return PoolView(
-        pool_idx=0,
-        buffer_entries=np.array(entries, dtype=BUFFER_ENTRY_DTYPE),
-        pool_role=frozenset({"key", "value"}),
-        mapper_kind=MapperKind.NHD,
-        bytes_per_layer=bytes_per_layer,
-    )
+def test_buffer_decl_rows_and_units():
+    # NHD: the head axis repeats once per token.
+    nhd = BufferDecl(256, ATTENTION_TP, (("token", 4), ("head", 8)), "head")
+    assert (nhd.rows, nhd.units, nhd.unit_bytes("nhd")) == (4, 8, 8)
+    # HND: one contiguous head-major slice.
+    hnd = _hnd(nbytes=256, heads=8)
+    assert (hnd.rows, hnd.units, hnd.unit_bytes("hnd")) == (1, 8, 32)
+    # Replicated: a single unit.
+    replicated = BufferDecl(256, ATTENTION_TP)
+    assert (replicated.rows, replicated.units) == (1, 1)
 
 
-def test_layer_byte_ranges_uniform_stride():
-    from tensorrt_llm._torch.disaggregation.resource.utils import get_layer_byte_ranges
-
-    # Dedicated K/V pool: dense layers, uniform stride.
-    starts, bytes_per_layer = get_layer_byte_ranges(
-        _view([(0, 0, 128), (0, 128, 128), (1, 256, 128), (1, 384, 128)])
-    )
-    assert starts == {0: 0, 1: 256}
-    assert bytes_per_layer == 256
+def test_buffer_decl_unit_not_byte_aligned_raises():
+    decl = BufferDecl(100, ATTENTION_TP, (("head", 8),), "head")
+    with pytest.raises(ValueError, match="not evenly divisible"):
+        decl.unit_bytes("odd")
 
 
-def test_layer_byte_ranges_non_uniform_stride():
-    from tensorrt_llm._torch.disaggregation.resource.utils import get_layer_byte_ranges
-
-    # Coalesced slot: another role class interleaves 64B after layer 0,
-    # so the layer stride is non-uniform while sizes stay uniform.
-    starts, bytes_per_layer = get_layer_byte_ranges(
-        _view([(0, 0, 128), (0, 128, 128), (1, 320, 128), (1, 448, 128)])
-    )
-    assert starts == {0: 0, 1: 320}
-    assert bytes_per_layer == 256
+def test_buffer_decl_split_axis_must_be_an_axis():
+    with pytest.raises(ValueError, match="split axis 'head' is not one of the axes"):
+        BufferDecl(128, ATTENTION_TP, (("token", 4),), "head")
 
 
-def test_layer_byte_ranges_noncontiguous_layer_raises():
-    import pytest
-
-    from tensorrt_llm._torch.disaggregation.resource.utils import get_layer_byte_ranges
-
-    with pytest.raises(ValueError, match="not contiguous"):
-        get_layer_byte_ranges(_view([(0, 0, 128), (0, 192, 128)]))
+def test_buffer_decl_empty_raises():
+    with pytest.raises(ValueError, match="at least one byte"):
+        BufferDecl(0, ATTENTION_TP)
 
 
-def test_layer_byte_ranges_nonuniform_size_raises():
-    import pytest
-
-    from tensorrt_llm._torch.disaggregation.resource.utils import get_layer_byte_ranges
-
-    with pytest.raises(ValueError, match="not uniform"):
-        get_layer_byte_ranges(_view([(0, 0, 128), (1, 128, 64)]))
+def test_region_negative_offset_raises():
+    with pytest.raises(ValueError, match="negative offset"):
+        Region(0, 0, "key", -1, (_hnd(),))
 
 
-def test_layer_byte_ranges_declared_size_mismatch_raises():
-    import pytest
-
-    from tensorrt_llm._torch.disaggregation.resource.utils import get_layer_byte_ranges
-
-    with pytest.raises(ValueError, match="declares bytes_per_layer"):
-        get_layer_byte_ranges(_view([(0, 0, 128)], bytes_per_layer=256))
-
-
-def test_layer_byte_ranges_empty_view_raises():
-    import pytest
-
-    from tensorrt_llm._torch.disaggregation.resource.utils import get_layer_byte_ranges
-
-    with pytest.raises(ValueError, match="no buffer entries"):
-        get_layer_byte_ranges(_view([]))
+def test_region_without_buffers_raises():
+    with pytest.raises(ValueError, match="declares no buffers"):
+        Region(0, 0, "key", 0, ())

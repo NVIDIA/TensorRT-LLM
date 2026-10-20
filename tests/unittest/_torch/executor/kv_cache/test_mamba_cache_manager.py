@@ -10,12 +10,9 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 
+from tensorrt_llm._torch.disaggregation.base import CacheKind
+from tensorrt_llm._torch.disaggregation.cache_kinds import PageTable, UnitSpace
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import build_page_table_from_manager
-from tensorrt_llm._torch.disaggregation.resource.page import (
-    MAMBA_CONV_ROLE,
-    AttentionLayerGroup,
-    MambaLayerGroup,
-)
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
 from tensorrt_llm._torch.pyexecutor._util import (
@@ -1116,7 +1113,7 @@ def test_v2_disagg_slice_skips_state_index_on_mamba_free_pp_rank():
     transceiver = object.__new__(KvCacheTransceiverV2)
     transceiver._kv_cache_manager = manager
     transceiver._reuse_adapter = SimpleNamespace(tokens_per_block=32)
-    transceiver._page_table = SimpleNamespace(layer_groups=[])
+    transceiver._page_table = PageTable()
     request = SimpleNamespace(
         is_generation_only_request=False,
         prompt_len=0,
@@ -1125,7 +1122,7 @@ def test_v2_disagg_slice_skips_state_index_on_mamba_free_pp_rank():
 
     chunk = transceiver._create_chunk(request)
 
-    # No mamba layer group → no STATE entries in block_ids
+    # No mamba unit space -> no STATE entries in block_ids
     assert all(ids.size == 0 for ids in chunk.block_ids_per_layer_groups)
 
 
@@ -1143,20 +1140,18 @@ def test_v2_disagg_gen_init_without_local_mamba_layers_keeps_complete_blocks():
 
 
 def test_v2_disagg_slice_reads_state_index_without_refreshing_batch_mask():
-    from tensorrt_llm._torch.disaggregation.resource.page import CacheKind
-
     manager = object.__new__(MambaHybridCacheManagerV2)
     manager.local_num_mamba_layers = 1
     manager._request_id_to_state_index = {123: 7}
     manager.get_state_indices = MagicMock(
         side_effect=AssertionError("state-index lookup must not refresh the dummy mask")
     )
-    # Provide a mamba layer group so _create_chunk places the slot ID
-    mamba_lg = SimpleNamespace(kind=CacheKind.STATE)
+    # Provide a mamba state space so _create_chunk places the slot ID
+    mamba_space = UnitSpace(kind="mamba", unit=CacheKind.STATE)
     transceiver = object.__new__(KvCacheTransceiverV2)
     transceiver._kv_cache_manager = manager
     transceiver._reuse_adapter = SimpleNamespace(tokens_per_block=32)
-    transceiver._page_table = SimpleNamespace(layer_groups=[mamba_lg])
+    transceiver._page_table = PageTable(spaces=[mamba_space])
     request = SimpleNamespace(
         is_generation_only_request=False,
         prompt_len=0,
@@ -1165,7 +1160,7 @@ def test_v2_disagg_slice_reads_state_index_without_refreshing_batch_mask():
 
     chunk = transceiver._create_chunk(request)
 
-    # Slot index 7 should be in the STATE group's block_ids
+    # Slot index 7 should be in the STATE space's block_ids
     assert chunk.block_ids_per_layer_groups[0][0] == 7
     manager.get_state_indices.assert_not_called()
 
@@ -3601,9 +3596,11 @@ def test_v2_hybrid_disagg_page_table_preserves_lifecycle_indices():
     try:
         page_table = build_page_table_from_manager(mgr)
 
-        assert len(page_table.layer_groups) == len(mgr.impl.layer_grouping)
-        assert isinstance(page_table.layer_groups[0], MambaLayerGroup)
-        assert isinstance(page_table.layer_groups[1], AttentionLayerGroup)
+        # One unit space per life cycle, indexed by life-cycle id.
+        assert len(page_table.spaces) == len(mgr.impl.layer_grouping)
+        assert [space.kind for space in page_table.spaces[:2]] == ["mamba", "mamba"]
+        assert page_table.spaces[0].unit == CacheKind.STATE
+        assert page_table.spaces[1].unit == CacheKind.PAGED
 
         requests = mgr.add_dummy_requests([123], token_nums=[64], is_gen=False)
         assert len(requests) == 1
@@ -3623,13 +3620,15 @@ def test_v2_hybrid_disagg_page_table_uses_qwen3_next_conv_sections():
     )
     try:
         page_table = build_page_table_from_manager(mgr)
-        mamba_group = page_table.layer_groups[0]
+        mamba_space = page_table.spaces[0]
 
-        assert isinstance(mamba_group, MambaLayerGroup)
+        assert mamba_space.unit == CacheKind.STATE
         d_conv_m1 = mgr.conv_state_shape[1]
         conv_elem_size = mgr.all_conv_states[0].element_size()
-        conv_view = next(pv for pv in mamba_group.pool_views if pv.pool_role == MAMBA_CONV_ROLE)
-        assert conv_view.section_bytes == [
+        conv_region = next(r for r in mamba_space.regions if r.role == MambaRole.CONV_STATE)
+        # A sectioned conv state is one BufferDecl per section, each sharded along its bytes.
+        assert all(b.split_axis == "byte" for b in conv_region.buffers)
+        assert [b.nbytes for b in conv_region.buffers] == [
             dim * d_conv_m1 * conv_elem_size for dim in mgr.conv_section_dims
         ]
         assert mgr.conv_section_dims == [8, 8, 32]

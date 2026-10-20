@@ -13,7 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """The layout of a manager's blocks as the lender needs it, and ``layout_id``, the digest of how a
-block's bytes are laid out. Read from the manager's public layout surface and declarations."""
+block's bytes are laid out. Read from the manager's public layout surface; how each buffer's bytes
+split across ranks is the native transfer's declaration (``disaggregation.cache_kinds``)."""
 
 from __future__ import annotations
 
@@ -35,61 +36,7 @@ if TYPE_CHECKING:
 
 # A new field left out at its default keeps the version; changing the encoding or the meaning of
 # an existing field bumps it.
-LAYOUT_ID_VERSION = 2
-
-# The fallback entry of the manager's per-role declarations (``Role.ALL``).
-_ALL_ROLE = "all"
-
-
-class BufferMapper(enum.IntEnum):
-    """How a buffer's bytes split across tensor-parallel ranks; the values of the mapper kinds
-    managers declare per role, read by value."""
-
-    INDEXED = 0  # head-major K/V, the default: a head range is one contiguous range per buffer
-    REPLICATED = 1  # bytes identical on every TP rank
-    NHD = 2  # token-major [token, head, dim] K/V: a head range is a slice inside every token
-    SECTIONED = 3  # [Sec0|Sec1|...], each section sharded independently (recurrent conv state)
-
-
-@dataclass(frozen=True)
-class BufferGeometry:
-    """Resharding geometry of one buffer; all ``None`` means no head axis. ``section_bytes`` sum to
-    the buffer's size; ``bytes_per_head * num_heads`` equals it."""
-
-    section_bytes: tuple[int, ...] | None = None
-    bytes_per_head: int | None = None
-    num_heads: int | None = None
-
-    def validate(self) -> BufferGeometry:
-        """A copy with ``section_bytes`` as ints; ``ValueError`` unless every size given is
-        positive."""
-        sections = self.section_bytes
-        if sections is not None:
-            sections = tuple(int(s) for s in sections)
-            if any(s <= 0 for s in sections):
-                raise ValueError(f"section sizes must be positive, got {sections}")
-        for name in ("bytes_per_head", "num_heads"):
-            value = getattr(self, name)
-            if value is not None and int(value) <= 0:
-                raise ValueError(f"{name} must be positive, got {value}")
-        return BufferGeometry(sections, self.bytes_per_head, self.num_heads)
-
-    def check_size(self, size: int) -> None:
-        """``ValueError`` unless this geometry describes a buffer of ``size`` bytes."""
-        if self.section_bytes is not None and sum(self.section_bytes) != size:
-            raise ValueError(f"sections {self.section_bytes} do not sum to {size} bytes")
-        if self.bytes_per_head is not None and size % self.bytes_per_head:
-            raise ValueError(
-                f"{size} bytes is not a whole number of {self.bytes_per_head}-byte heads"
-            )
-        if (
-            self.bytes_per_head is not None
-            and self.num_heads is not None
-            and self.bytes_per_head * self.num_heads != size
-        ):
-            raise ValueError(
-                f"{self.num_heads} heads of {self.bytes_per_head} bytes is not {size} bytes"
-            )
+LAYOUT_ID_VERSION = 3
 
 
 @dataclass(frozen=True)
@@ -122,16 +69,17 @@ class LayerGroupDesc:
 @dataclass(frozen=True)
 class BufferDesc:
     """One buffer of one layer (global id) in a page: ``size`` bytes at ``offset`` in the slot of
-    ``pool`` = (pool group, pool index), how its bytes split across ranks, whether peers transfer
-    it, and its sub-pages per block. ``ValueError`` for a non-positive size or expansion."""
+    ``pool`` = (pool group, pool index), how its bytes split across ranks (``decls``, the
+    ``cache_kinds.BufferDecl``s that tile it; empty for a buffer peers do not transfer), whether
+    peers transfer it, and its sub-pages per block. ``ValueError`` for a non-positive size or
+    expansion, or declarations that do not tile the buffer."""
 
     layer: int
     role: str
     pool: tuple[int, int]
     offset: int
     size: int
-    mapper: BufferMapper = BufferMapper.INDEXED
-    geometry: BufferGeometry = BufferGeometry()
+    decls: tuple = ()
     # False for local-only buffers peers skip; they still ride along wherever whole slots are
     # copied.
     transfer: bool = True
@@ -141,14 +89,22 @@ class BufferDesc:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "role", str(self.role))
-        object.__setattr__(self, "mapper", BufferMapper(self.mapper))
-        if not isinstance(self.geometry, BufferGeometry):
-            raise ValueError(f"geometry must be a buffer geometry, got {self.geometry!r}")
+        object.__setattr__(self, "decls", tuple(self.decls))
         if self.size <= 0 or self.offset < 0:
             raise ValueError(f"buffer at offset {self.offset} of {self.size} bytes")
         if int(self.expansion) < 1:
             raise ValueError(f"expansion must be a positive integer, got {self.expansion}")
-        self.geometry.check_size(self.size)
+        if self.decls and sum(int(d.nbytes) for d in self.decls) != self.size:
+            raise ValueError(
+                f"buffer ({self.layer}, {self.role}): declarations of "
+                f"{[int(d.nbytes) for d in self.decls]} bytes do not tile its {self.size} bytes"
+            )
+
+    @property
+    def replicated(self) -> bool:
+        """Peers transfer the buffer and every rank holds the same bytes (its declarations split
+        along no axis)."""
+        return bool(self.decls) and all(d.split_axis is None for d in self.decls)
 
 
 @dataclass(frozen=True)
@@ -223,14 +179,6 @@ def canonical_order(layers: Sequence[Sequence[int]]) -> list[int]:
     return canonical
 
 
-def _geometry_document(geometry: BufferGeometry) -> dict:
-    return {
-        "section_bytes": None if geometry.section_bytes is None else list(geometry.section_bytes),
-        "bytes_per_head": geometry.bytes_per_head,
-        "num_heads": geometry.num_heads,
-    }
-
-
 def _buffer_document(layout: Layout, b: BufferDesc) -> dict:
     # A buffer's position in the page: the slot widths of the pools before it in its group, plus
     # its offset inside the slot.
@@ -244,11 +192,8 @@ def _buffer_document(layout: Layout, b: BufferDesc) -> dict:
         "size": int(b.size),
     }
     # Fields at their defaults are left out, so a new defaulted field keeps existing ids.
-    if b.mapper is not BufferMapper.INDEXED:
-        doc["mapper"] = b.mapper.name
-    geometry = {k: v for k, v in _geometry_document(b.geometry).items() if v is not None}
-    if geometry:
-        doc["geometry"] = geometry
+    if b.decls:
+        doc["decls"] = [d.to_dict() for d in b.decls]
     if not b.transfer:
         doc["transfer"] = False
     if int(b.expansion) != 1:
@@ -429,24 +374,6 @@ class _Heads:
         return ShardDesc(self.tp_size, self.tp_rank) if self.tp_size > 1 else ShardDesc()
 
 
-def _buffer_geometry(
-    declared: object, mapper: BufferMapper, size: int, heads: int, state: bool
-) -> BufferGeometry:
-    """A buffer's head geometry: declared sections or head size, completed per buffer.
-    ``ValueError`` if the declared or completed geometry has a size that is not positive."""
-    declared = BufferGeometry(
-        getattr(declared, "section_bytes", None), getattr(declared, "bytes_per_head", None)
-    ).validate()
-    if mapper in (BufferMapper.REPLICATED, BufferMapper.SECTIONED):
-        return declared
-    bytes_per_head = declared.bytes_per_head
-    if bytes_per_head is None and not state and heads > 0 and size % heads == 0:
-        bytes_per_head = size // heads
-    if bytes_per_head is None or size % bytes_per_head:
-        return declared
-    return BufferGeometry(declared.section_bytes, bytes_per_head, size // bytes_per_head).validate()
-
-
 # A layer group is whole when every transferred buffer holds the same bytes on every rank
 # (replicated, or one KV head shared by all ranks); else it is the share this rank holds.
 def _group_shard(shards: Sequence[ShardDesc], fallback: ShardDesc) -> ShardDesc:
@@ -475,14 +402,6 @@ def derive_layout(manager: KVCacheManagerV2) -> ManagerLayout:
         if _manager.is_recurrent_layer(layer_cfg[layer_ids[0]]):
             state_groups.add(lg)
 
-    # TODO: the base manager declares head-major K/V whichever attention backend writes its pages,
-    # so a manager paired with a token-major backend gets the head-major layout_id unless it
-    # declares its layout itself.
-    mappers = {
-        role: BufferMapper(int(kind)) for role, kind in _manager.role_mapper_kinds(manager).items()
-    }
-    default_mapper = mappers.get(_ALL_ROLE, BufferMapper.INDEXED)
-    role_layouts = _manager.role_layouts(manager)
     ignored = _manager.ignored_roles(manager)
     heads = _Heads(manager)
     expansions = {lid: _expansions(cfg, tokens_per_block) for lid, cfg in layer_cfg.items()}
@@ -509,8 +428,14 @@ def derive_layout(manager: KVCacheManagerV2) -> ManagerLayout:
                 for j, buffer_id in enumerate(coalesced.buffer_ids):
                     lid = int(buffer_id.layer_id)
                     role = str(buffer_id.role)
-                    mapper = mappers.get(role, default_mapper)
                     transfer = role not in ignored
+                    decls = (
+                        _manager.buffer_layout(
+                            manager, role, size, state=state, heads=heads.per_rank(lid)
+                        )
+                        if transfer
+                        else ()
+                    )
                     buffers.append(
                         BufferDesc(
                             layer=global_of.get(lid, lid),
@@ -518,15 +443,12 @@ def derive_layout(manager: KVCacheManagerV2) -> ManagerLayout:
                             pool=(g, pool_index),
                             offset=j * size,
                             size=size,
-                            mapper=mapper,
-                            geometry=_buffer_geometry(
-                                role_layouts.get(role), mapper, size, heads.per_rank(lid), state
-                            ),
+                            decls=decls,
                             transfer=transfer,
                             expansion=expansions.get(lid, {}).get(role, 1),
                         )
                     )
-                    if not transfer or mapper is BufferMapper.REPLICATED:
+                    if not transfer or buffers[-1].replicated:
                         continue
                     shards[lg].append(heads.state_shard() if state else heads.attention_shard(lid))
 

@@ -2605,22 +2605,6 @@ def test_cold_pool_group_iteration_stats_sum_all_cold_levels() -> None:
     assert cold_group.stats.secondary_peak_evictable_num_blocks == 5
 
 
-def test_disagg_role_mapper_kinds_default_to_indexed():
-    from tensorrt_llm._torch.disaggregation.resource.page import MapperKind
-    from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import Role
-
-    manager = object.__new__(KVCacheManagerV2)
-
-    # K/V default to the TRTLLM head-major layout; the index-key side cache
-    # defaults to REPLICATED (every shipped index-K — DSA V1, MiniMax M3 —
-    # is TP-replicated). The INDEX_KEY entry is inert unless a subclass
-    # registers such buffers.
-    assert manager.get_disagg_role_mapper_kinds() == {
-        Role.ALL: MapperKind.INDEXED,
-        Role.INDEX_KEY: MapperKind.REPLICATED,
-    }
-
-
 def _index_mapper_capacity_for(
     *,
     max_batch_size: int,

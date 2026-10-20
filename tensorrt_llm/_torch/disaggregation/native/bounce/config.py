@@ -25,7 +25,7 @@ _MIB = 1024 * 1024
 
 # Test/advanced overrides for the size gates below (users only tune the bounce size). Read on the
 # generation side, so set them there; unset uses the defaults.
-# - min_bytes gates payloads that carry recurrent (mamba/KDA) state: the fallback cost scales
+# - min_bytes gates payloads that carry recurrent state: the fallback cost scales
 #   with bytes, not block count, so the gate is byte-denominated.
 # - min_blocks is the legacy plain-KV gate, kept so existing bounce deployments see no behavior
 #   change.
@@ -109,7 +109,7 @@ def fit_within_free(
     return capacity_bytes
 
 
-# Byte gate for transfers that carry recurrent (mamba/KDA) state. The cost this gate guards scales
+# Byte gate for transfers that carry recurrent state. The cost this gate guards scales
 # with BYTES, not blocks: the block-count gate (96 blocks, calibrated for 128-token blocks)
 # silently skipped a 433 MiB Kimi-K3 transfer (67 blocks of 32 tokens plus the non-paged KDA state)
 # and dropped it onto the ~0.4 GB/s host-staged fallback, a ~1000x cliff. Break-even is small:

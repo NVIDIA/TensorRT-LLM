@@ -86,7 +86,7 @@ def test_bridge_rejection_releases_the_claim_only_without_a_physical_owner(
     is released on the spot; a rejection with a live session, or a failure
     without the bridge, stays claimed until the reap and the error path."""
     h = _Harness(kv_transfer_timeout_ms=1000)
-    h.transceiver._fp4_mla_bridge_enabled = bridge_enabled
+    h.transceiver._ownership_bridge_enabled = bridge_enabled
     h.transceiver.has_inflight_transfer = lambda _req: has_inflight
     h.transceiver.respond_and_send_async = lambda req: setattr(
         req, "state", LlmRequestState.DISAGG_TRANS_ERROR

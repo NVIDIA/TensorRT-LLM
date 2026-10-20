@@ -12,27 +12,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""Checks a cache kind runs in its own tests (no GPU, no manager needed)."""
 
-from dataclasses import asdict, dataclass
+from .conformance import all_ranks, check_page_table_round_trip, check_resharding
 
-
-# [numLayers, kv_factor, heads, tokens, dims_per_head]
-@dataclass
-class AttentionInfo:
-    kv_heads_per_rank: int
-    tokens_per_block: int
-    dims_per_head: int
-    element_bytes: int | float
-    enable_attention_dp: bool
-    is_mla: bool
-
-    @property
-    def kv_factor(self) -> int:
-        return 2 if not self.is_mla else 1
-
-    def to_dict(self) -> dict:
-        return asdict(self)
-
-    @classmethod
-    def from_dict(cls, data: dict) -> "AttentionInfo":
-        return cls(**data)
+__all__ = ["all_ranks", "check_page_table_round_trip", "check_resharding"]

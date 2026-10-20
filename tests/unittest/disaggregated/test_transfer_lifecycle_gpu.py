@@ -378,21 +378,21 @@ def _regions(transceiver: KvCacheTransceiverV2, request: LlmRequest) -> list[tor
     result = []
     seen = set()
     roles = set()
-    for group, blocks in enumerate(chunk.block_ids_per_layer_groups):
-        for pool in range(len(extractor.page_table.layer_groups[group].pool_views)):
-            memory = extractor.extract(blocks, group, pool).memory
-            view = extractor.page_table.layer_groups[group].pool_views[pool]
-            assert len(memory.ptrs) > 0 and len(view.buffer_entries) > 0
-            roles.update(view.pool_role)
+    for space_index, blocks in enumerate(chunk.block_ids_per_layer_groups):
+        space = extractor.page_table.spaces[space_index]
+        assert len(space.regions) > 0
+        for region in space.regions:
+            memory = extractor.extract(blocks, region.pool).memory
+            assert len(memory.ptrs) > 0
+            roles.add(region.role)
             for pointer in memory.ptrs:
-                for entry in view.buffer_entries:
-                    key = (int(pointer) + int(entry["offset"]), int(entry["size"]))
-                    assert key[0] > 0 and key[1] > 0, "allocated role extent must be nonempty"
-                    if key not in seen:
-                        seen.add(key)
-                        result.append(
-                            convert_to_torch_tensor(TensorWrapper(key[0], torch.uint8, [key[1]]))
-                        )
+                key = (int(pointer) + region.offset, region.nbytes)
+                assert key[0] > 0 and key[1] > 0, "allocated role extent must be nonempty"
+                if key not in seen:
+                    seen.add(key)
+                    result.append(
+                        convert_to_torch_tensor(TensorWrapper(key[0], torch.uint8, [key[1]]))
+                    )
     assert roles == {str(Role.KEY), str(Role.KEY_BLOCK_SCALE)}
     assert len(result) == 2, "one allocated block must expose both key and block-scale storage"
     return result
@@ -473,7 +473,7 @@ def _worker(args: argparse.Namespace) -> None:
         ),
     )
     worker = transceiver._transfer_worker
-    assert transceiver._fp4_mla_bridge_enabled
+    assert transceiver._ownership_bridge_enabled
     assert isinstance(worker._agent, BindingsNixlTransferAgent)
     assert not worker._agent.bounce_enabled
     assert {registration.type for registration in worker._registered_mem} == {"VRAM", "DRAM"}

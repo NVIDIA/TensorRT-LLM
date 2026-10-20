@@ -18,12 +18,33 @@ from typing import List, Optional
 
 import msgpack
 
+from tensorrt_llm._torch.disaggregation.cache_kinds.page_table import PageTable
 from tensorrt_llm._torch.disaggregation.native.auxiliary import AuxBufferMeta
-from tensorrt_llm._torch.disaggregation.native.mixers.attention.spec import AttentionInfo
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import build_page_table_from_manager
-from tensorrt_llm._torch.disaggregation.resource.page import KVCachePageTable
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._utils import get_size_in_bytes
+
+
+# [numLayers, kv_factor, heads, tokens, dims_per_head]
+@dataclass
+class AttentionInfo:
+    kv_heads_per_rank: int
+    tokens_per_block: int
+    dims_per_head: int
+    element_bytes: int | float
+    enable_attention_dp: bool
+    is_mla: bool
+
+    @property
+    def kv_factor(self) -> int:
+        return 2 if not self.is_mla else 1
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "AttentionInfo":
+        return cls(**data)
 
 
 @dataclass
@@ -47,7 +68,7 @@ class RankInfo:
 
     attention: Optional[AttentionInfo] = None
     aux_meta: Optional[AuxBufferMeta] = None
-    page_table: Optional[KVCachePageTable] = None
+    page_table: Optional[PageTable] = None
     bounded_replay_on_generation: bool = False
 
     @property
@@ -75,9 +96,9 @@ class RankInfo:
         kvm = kv_cache_manager
         enable_attention_dp = m.enable_attention_dp
         # Keep AttentionInfo on attention-free PP stages so it can still carry
-        # the attention-DP topology used by Mamba transfers.  A zero head count
-        # means that this rank has no local attention cache; AttentionPolicy
-        # must not perform head-ratio arithmetic for such ranks.
+        # the attention-DP topology used by recurrent-state transfers.  A zero head count
+        # means that this rank has no local attention cache; no head-ratio
+        # arithmetic applies to such ranks.
         kv_heads_per_rank = next((h for h in kvm.num_kv_heads_per_layer if h > 0), 0)
         # Eight is the smallest element count guaranteed to occupy whole bytes
         # for every supported sub-byte cache dtype (including NVFP4).
@@ -122,7 +143,7 @@ class RankInfo:
         if unpacked.get("attention") is not None:
             unpacked["attention"] = AttentionInfo.from_dict(unpacked["attention"])
         if unpacked.get("page_table") is not None:
-            unpacked["page_table"] = KVCachePageTable.from_dict(unpacked["page_table"])
+            unpacked["page_table"] = PageTable.from_dict(unpacked["page_table"])
         if unpacked.get("aux_meta") is not None:
             unpacked["aux_meta"] = AuxBufferMeta.from_dict(unpacked["aux_meta"])
         return cls(**unpacked)

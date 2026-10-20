@@ -38,9 +38,16 @@ import tensorrt_llm._torch.disaggregation.native.transfer as transfer_mod
 from tensorrt_llm import DisaggregatedParams
 from tensorrt_llm._torch.disaggregation.base import CacheKind, Chunk, TokenRange
 from tensorrt_llm._torch.disaggregation.base.transfer import SessionStatus
-from tensorrt_llm._torch.disaggregation.native.mixers.attention.peer import (
-    IntactMapper,
-    ReplicatedMapper,
+from tensorrt_llm._torch.disaggregation.cache_kinds import (
+    ATTENTION_TP,
+    BufferDecl,
+    PageTable,
+    PairContext,
+    Pool,
+    Region,
+    UnitSpace,
+    plan_transfers,
+    spec_for,
 )
 from tensorrt_llm._torch.disaggregation.native.transfer import (
     AgentResult,
@@ -49,17 +56,6 @@ from tensorrt_llm._torch.disaggregation.native.transfer import (
     TaskStatus,
 )
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
-from tensorrt_llm._torch.disaggregation.resource.page import (
-    BUFFER_ENTRY_DTYPE,
-    AttentionLayerGroup,
-    KVCachePageTable,
-    LocalLayer,
-    MapperKind,
-    PhysicalPool,
-    PhysicalPoolGroup,
-    PoolView,
-)
-from tensorrt_llm._torch.disaggregation.resource.utils import get_layer_byte_ranges
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
 
 pytestmark = pytest.mark.cpu_only
@@ -407,131 +403,113 @@ class TestSenderAttestation:
 _UNIT = 64  # bytes of one K, V, or index-K buffer per (layer, block)
 
 
-def _make_block_chunk(num_blocks: int) -> Chunk:
+_TOKENS_PER_BLOCK = 16
+
+
+def _make_block_chunk(num_blocks: int, excluded_regions=frozenset()) -> Chunk:
     return Chunk(
         block_ids_per_layer_groups=[np.arange(num_blocks, dtype=np.int64)],
         kind_per_layer_group=[CacheKind.PAGED],
-        token_range=TokenRange(start=0, end=num_blocks * 16),
+        token_range=TokenRange(start=0, end=num_blocks * _TOKENS_PER_BLOCK),
         is_last=True,
+        excluded_regions=frozenset(excluded_regions),
     )
 
 
-def _coalesced_page_table() -> KVCachePageTable:
+def _attention_space(regions) -> UnitSpace:
+    return UnitSpace(
+        kind="attention",
+        unit=CacheKind.PAGED,
+        regions=sorted(regions, key=lambda r: (r.pool, r.offset)),
+        params={"tokens_per_block": _TOKENS_PER_BLOCK, "window": None},
+    )
+
+
+# Region indices of the coalesced layout below, in slot order.
+_COALESCED_KV_REGIONS = (0, 1, 2, 3, 5, 6, 7, 8)
+_COALESCED_INDEX_REGION = 4
+
+
+def _coalesced_page_table() -> PageTable:
     """Coalesced-pool page table mirroring the MiniMax M3 TP=2 layout.
 
     K == V == index-K bytes per block, so V2 coalesces all three roles into
     one physical pool. The slot interleaves the sparse layer's index-K
     between K/V regions (L0K L0V L1K L1V L1IDX L2K L2V L3K L3V), yielding
-    two views over the same pool: an NHD K/V view with a non-uniform layer
-    stride and a REPLICATED index-K view. Mirrors
+    token-major (NHD) K/V regions with a non-uniform layer stride and a
+    REPLICATED index-K region over the same pool. Mirrors
     test_minimax_m3_pool_view_scheme_coalesced_vs_separate.
     """
     u = _UNIT
-    kv_entries = np.array(
-        [
-            (0, 0 * u, u),
-            (0, 1 * u, u),
-            (1, 2 * u, u),
-            (1, 3 * u, u),
-            (2, 5 * u, u),
-            (2, 6 * u, u),
-            (3, 7 * u, u),
-            (3, 8 * u, u),
-        ],
-        dtype=BUFFER_ENTRY_DTYPE,
-    )
-    idx_entries = np.array([(1, 4 * u, u)], dtype=BUFFER_ENTRY_DTYPE)
-    layer_group = AttentionLayerGroup(
-        pool_group_idx=0,
-        local_layers=[LocalLayer(i, i) for i in range(4)],
-        pool_views=[
-            PoolView(
-                pool_idx=0,
-                buffer_entries=kv_entries,
-                pool_role=frozenset({"key", "value"}),
-                mapper_kind=MapperKind.NHD,
-                bytes_per_layer=2 * u,
-            ),
-            PoolView(
-                pool_idx=0,
-                buffer_entries=idx_entries,
-                pool_role=frozenset({"index_key"}),
-                mapper_kind=MapperKind.REPLICATED,
-                bytes_per_layer=u,
-            ),
-        ],
-        kv_head_num_per_rank=1,
-    )
-    pool = PhysicalPool(base_address=0x10000, slot_bytes=9 * u, num_slots=8)
-    return KVCachePageTable(
-        tokens_per_block=16,
-        layer_groups=[layer_group],
-        pool_groups=[PhysicalPoolGroup(pools=[pool])],
-    )
+    nhd = (BufferDecl(u, ATTENTION_TP, (("token", _TOKENS_PER_BLOCK), ("head", 1)), "head"),)
+    replicated = (BufferDecl(u, ATTENTION_TP),)
+    offsets = {0: 0, 1: 2, 2: 5, 3: 7}  # in units: K at offset, V right after it
+    regions = []
+    for layer, off in offsets.items():
+        regions.append(Region(pool=0, layer=layer, role="key", offset=off * u, buffers=nhd))
+        regions.append(Region(pool=0, layer=layer, role="value", offset=(off + 1) * u, buffers=nhd))
+    regions.append(Region(pool=0, layer=1, role="index_key", offset=4 * u, buffers=replicated))
+    pool = Pool(base_address=0x10000, slot_bytes=9 * u, num_slots=8)
+    return PageTable(pools=[pool], spaces=[_attention_space(regions)])
 
 
-def _ignored_role_page_table() -> KVCachePageTable:
-    """Page table whose slot holds regions no view transfers.
+def _ignored_role_page_table() -> PageTable:
+    """Page table whose slot holds bytes no region transfers.
 
     The slot interleaves a local-only ignored-role buffer after each layer's
     K region (L0K L0LOCAL L1K L1LOCAL). Ignored roles occupy slot offsets
-    but appear in no view, so no writer ever covers them.
+    but get no region, so no writer ever covers them.
     """
     u = _UNIT
-    entries = np.array([(0, 0 * u, u), (1, 2 * u, u)], dtype=BUFFER_ENTRY_DTYPE)
-    layer_group = AttentionLayerGroup(
-        pool_group_idx=0,
-        local_layers=[LocalLayer(0, 0), LocalLayer(1, 1)],
-        pool_views=[
-            PoolView(
-                pool_idx=0,
-                buffer_entries=entries,
-                pool_role=frozenset({"key"}),
-                mapper_kind=MapperKind.INDEXED,
-                bytes_per_layer=u,
-            ),
-        ],
-        kv_head_num_per_rank=1,
-    )
-    pool = PhysicalPool(base_address=0x20000, slot_bytes=4 * u, num_slots=8)
-    return KVCachePageTable(
-        tokens_per_block=16,
-        layer_groups=[layer_group],
-        pool_groups=[PhysicalPoolGroup(pools=[pool])],
-    )
+    hnd = (BufferDecl(u, ATTENTION_TP, (("head", 1),), "head"),)
+    regions = [
+        Region(pool=0, layer=0, role="key", offset=0, buffers=hnd),
+        Region(pool=0, layer=1, role="key", offset=2 * u, buffers=hnd),
+    ]
+    pool = Pool(base_address=0x20000, slot_bytes=4 * u, num_slots=8)
+    return PageTable(pools=[pool], spaces=[_attention_space(regions)])
 
 
-def _expected_write_bytes(page_table: KVCachePageTable, chunk: Chunk) -> int:
+def _expected_write_bytes(page_table: PageTable, chunk: Chunk) -> int:
     """The receiver-side expectation, exactly as the transceiver computes it."""
     return KvCacheTransceiverV2._chunk_num_bytes(SimpleNamespace(_page_table=page_table), chunk)
 
 
-def _summed_sender_bytes(page_table: KVCachePageTable, chunk: Chunk) -> int:
+def _summed_sender_bytes(page_table: PageTable, chunk: Chunk) -> int:
     """Destination bytes a matched-layout, head-matched sender submits for *chunk*.
 
-    The extract -> mapper -> WriteMeta.sizes path of
-    Sender._build_kv_write_meta, run per pool view against itself as the
-    peer. This is the quantity each writer attests on completion and the
-    receiver sums into verified_write_bytes.
+    The transfer groups -> pair_units -> extract -> RunPlan.map -> WriteMeta.sizes
+    path of Sender._build_kv_write_meta, run against itself as the peer. This is
+    the quantity each writer attests on completion and the receiver sums into
+    verified_write_bytes.
     """
+    # One rank against an identical one: every region pair is a whole-region copy.
+    rank_info = SimpleNamespace(
+        tp_size_per_dp_group=1,
+        tp_rank=0,
+        dp_rank=0,
+        cp_size=1,
+        cp_rank=0,
+        attention=SimpleNamespace(kv_heads_per_rank=1, tokens_per_block=_TOKENS_PER_BLOCK),
+    )
     extractor = KVRegionExtractorV1(page_table)
     total = 0
-    for lg_idx, block_ids in enumerate(chunk.block_ids_per_layer_groups):
-        layer_group = page_table.layer_groups[lg_idx]
-        for view_idx, pool_view in enumerate(layer_group.pool_views):
-            if (lg_idx, view_idx) in chunk.excluded_pool_views:
-                continue
-            # Offsets in physical slot order, as get_kv_map builds them.
-            starts, bytes_per_layer = get_layer_byte_ranges(pool_view)
-            offsets = np.array(sorted(starts.values()), dtype=np.int64)
-            mapper_cls = (
-                ReplicatedMapper if pool_view.mapper_kind == MapperKind.REPLICATED else IntactMapper
-            )
-            mapper = mapper_cls(offsets, offsets, bytes_per_layer, bytes_per_layer)
-            region = extractor.extract(block_ids, lg_idx, view_idx)
-            pairs = mapper.map(region, region)
-            for pair in pairs if isinstance(pairs, list) else [pairs]:
-                total += int(pair.src.memory.ptrs.size) * int(pair.src.memory.bytes_per_region)
+    for group in plan_transfers(
+        rank_info, rank_info, page_table, page_table, chunk.excluded_regions
+    ):
+        space = page_table.spaces[group.self_space]
+        units = chunk.block_ids_per_layer_groups[group.self_space]
+        src_units, dst_units = spec_for(space).pair_units(
+            units,
+            chunk.block_ids_per_layer_groups[group.peer_space],
+            PairContext(self_ri=rank_info, peer_ri=rank_info, space=space, dst_start_token=None),
+        )
+        if src_units.size == 0:
+            continue
+        src_region = extractor.extract(src_units, group.self_pool)
+        dst_region = extractor.extract(dst_units, group.peer_pool)
+        for pair in group.plan.map(src_region, dst_region):
+            total += int(pair.src.memory.ptrs.size) * int(pair.src.memory.bytes_per_region)
     return total
 
 
@@ -540,28 +518,29 @@ class TestExpectedWriteBytesMatchSenderBytes:
 
     Otherwise verified-reuse admission marks every successful receive
     unverified and its blocks never enter the reuse tree. Regression:
-    computing the expectation as physical slot_bytes per pool view double
-    counts a coalesced slot (one slot, one view per role class) and counts
-    ignored-role regions no view transfers.
+    computing the expectation as physical slot_bytes per region double
+    counts a coalesced slot (one slot, many regions) and counts ignored-role
+    bytes no region transfers.
     """
 
     @pytest.mark.parametrize(
-        "excluded_pool_views,units_per_block",
+        "excluded_regions,units_per_block",
         [
-            pytest.param(set(), 9, id="all-views"),
-            pytest.param({(0, 0)}, 1, id="index-only"),
-            pytest.param({(0, 1)}, 8, id="kv-only"),
-            pytest.param({(0, 0), (0, 1)}, 0, id="no-views"),
+            pytest.param((), 9, id="all-regions"),
+            pytest.param(_COALESCED_KV_REGIONS, 1, id="index-only"),
+            pytest.param((_COALESCED_INDEX_REGION,), 8, id="kv-only"),
+            pytest.param(_COALESCED_KV_REGIONS + (_COALESCED_INDEX_REGION,), 0, id="no-regions"),
         ],
     )
-    def test_coalesced_pool_layout(self, excluded_pool_views, units_per_block):
+    def test_coalesced_pool_layout(self, excluded_regions, units_per_block):
         page_table = _coalesced_page_table()
-        chunk = _make_block_chunk(num_blocks=2)
-        chunk.excluded_pool_views = excluded_pool_views
+        chunk = _make_block_chunk(
+            num_blocks=2, excluded_regions={(0, region) for region in excluded_regions}
+        )
         expected = _expected_write_bytes(page_table, chunk)
         assert expected == _summed_sender_bytes(page_table, chunk)
-        # Both views share physical pool 0. Remote-tail exclusions name the
-        # view index, so each included region contributes exactly once.
+        # Every region shares physical pool 0. Remote-tail exclusions name the
+        # region index, so each included region contributes exactly once.
         assert expected == 2 * units_per_block * _UNIT
 
     def test_ignored_role_layout(self):

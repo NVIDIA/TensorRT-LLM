@@ -9,7 +9,6 @@ from typing import TYPE_CHECKING, Iterable, List, Optional
 
 import torch
 
-from tensorrt_llm._torch.disaggregation.resource.page import MapperKind
 from tensorrt_llm._torch.kimi_k3_cache_policy import get_kimi_k3_bf16_kv_layer_ids
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2, Role
 from tensorrt_llm._torch.pyexecutor.resource_manager import CacheTypeCpp, DataType, KVCacheManager
@@ -210,7 +209,6 @@ class Fp4MlaV2CacheLayoutPolicy:
             "get_mla_v_packed_pool_base",
             "get_mla_v_packed_page_offset",
             "get_fp4_mla_hp_pool",
-            "get_disagg_role_mapper_kinds",
             "get_disagg_transfer_roles",
             "get_disagg_global_layer_ids",
             "_get_runtime_cache_size_layer_components",
@@ -887,12 +885,6 @@ class Fp4MlaV2CacheLayoutPolicy:
                 * self.head_dim_per_layer[self._fp4_mla_compact_to_local[0]],
             ),
         ).permute(1, 0, 2, 3)
-
-    def get_disagg_role_mapper_kinds(self) -> dict[DataRole, MapperKind]:
-        return {
-            Role.ALL: MapperKind.NHD,
-            Role.MLA_HP_TAIL: MapperKind.REPLICATED,
-        }
 
     def get_disagg_transfer_roles(self) -> Optional[frozenset[DataRole]]:
         return frozenset((Role.KEY, Role.KEY_BLOCK_SCALE, Role.MLA_HP_TAIL))

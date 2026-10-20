@@ -13,13 +13,12 @@ from tensorrt_llm._torch.attention.backends.sparse.csa2.cache_manager import (
     CSA2CacheRole,
 )
 from tensorrt_llm._torch.attention.backends.sparse.csa2.params import CSA2Layout
+from tensorrt_llm._torch.disaggregation.cache_kinds import match_regions
 from tensorrt_llm._torch.disaggregation.native.peer import PeerRegistrar
 from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
 from tensorrt_llm._torch.disaggregation.native.transfer import RecvReqInfo, Sender
 from tensorrt_llm._torch.disaggregation.resource.cache_reuse import create_cache_reuse_adapter
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
-from tensorrt_llm._torch.disaggregation.resource.page import MapperKind
-from tensorrt_llm._torch.disaggregation.resource.utils import get_pool_view_global_layer_ids
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestType
 from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor
@@ -174,21 +173,15 @@ def test_context_only_physical_cache_transfer_preserves_logical_owners(
         assert receiver_registrar.get_peer_overlap(source_info, source_info.dp_rank).ranks == [
             source_info.instance_rank
         ]
-        pool_mapping = registrar.get_pool_mapping(target_info)
+        region_mapping = match_regions(source_info.page_table, target_info.page_table)
         matched_global_ids = set()
-        for (src_group, src_view), (dst_group, dst_view) in pool_mapping.items():
-            source_group = source_info.page_table.layer_groups[src_group]
-            target_group = target_info.page_table.layer_groups[dst_group]
-            assert source_group.pool_views[src_view].mapper_kind == MapperKind.REPLICATED
-            assert target_group.pool_views[dst_view].mapper_kind == MapperKind.REPLICATED
-            source_ids = set(
-                get_pool_view_global_layer_ids(source_group.pool_views[src_view], source_group)
-            )
-            target_ids = set(
-                get_pool_view_global_layer_ids(target_group.pool_views[dst_view], target_group)
-            )
-            assert source_ids == target_ids
-            matched_global_ids.update(source_ids)
+        for (src_space, src_region), (dst_space, dst_region) in region_mapping.items():
+            source_region = source_info.page_table.spaces[src_space].regions[src_region]
+            target_region = target_info.page_table.spaces[dst_space].regions[dst_region]
+            assert source_region.replicated
+            assert target_region.replicated
+            assert source_region.key == target_region.key
+            matched_global_ids.add(source_region.layer)
         expected_global_ids = {
             layer * 3 + kind.value for layer, kind in source._layer_attn_to_layer_id
         }
@@ -202,8 +195,8 @@ def test_context_only_physical_cache_transfer_preserves_logical_owners(
         )
 
         source_slice, target_slice = _slice(source, source_request), _slice(target, target_request)
-        assert source_slice.excluded_pool_views == set()
-        assert len(target_slice.excluded_pool_views) == 20
+        assert source_slice.excluded_regions == frozenset()
+        assert len(target_slice.excluded_regions) == 20
         sender = Sender.__new__(Sender)
         sender._registrar = registrar
         task = SimpleNamespace(

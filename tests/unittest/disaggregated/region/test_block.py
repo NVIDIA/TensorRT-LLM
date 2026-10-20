@@ -16,17 +16,22 @@
 import numpy as np
 import pytest
 
+from tensorrt_llm._torch.disaggregation.base import CacheKind
 from tensorrt_llm._torch.disaggregation.base.region import (
     MemRegionGroup,
     SpecRegion,
     SpecRegionPair,
 )
-from tensorrt_llm._torch.disaggregation.native.mixers.attention.peer import (
-    HNDHeadMismatchMapper,
-    IntactMapper,
+from tensorrt_llm._torch.disaggregation.cache_kinds import (
+    ATTENTION_TP,
+    BufferDecl,
+    PageTable,
+    Pool,
+    Region,
+    UnitSpace,
+    plan_transfers,
 )
-from tensorrt_llm._torch.disaggregation.native.mixers.attention.spec import AttentionInfo
-from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
+from tensorrt_llm._torch.disaggregation.native.rank_info import AttentionInfo, RankInfo
 
 pytestmark = pytest.mark.cpu_only
 
@@ -97,22 +102,61 @@ def test_spec_region_and_spec_region_pair():
     assert pair.dst.spec == "spec_dst"
 
 
-def test_intact_mapper_identity_degenerate():
+def _kv_table(layer_offsets, bytes_per_layer, kv_heads):
+    """One attention space whose global layer ``i`` sits at ``layer_offsets[i]`` (K then V)."""
+    half = bytes_per_layer // 2
+    buffers = (BufferDecl(half, ATTENTION_TP, (("head", kv_heads),), "head"),)
+    regions = []
+    for gid, offset in enumerate(layer_offsets):
+        if offset is None:
+            continue
+        lid = len(regions) // 2
+        regions.append(Region(0, gid, "key", offset, buffers, local_layer=lid))
+        regions.append(Region(0, gid, "value", offset + half, buffers, local_layer=lid))
+    slot = max(o for o in layer_offsets if o is not None) + bytes_per_layer
+    return PageTable(
+        pools=[Pool(0, slot_bytes=slot, num_slots=4)],
+        spaces=[
+            UnitSpace(
+                kind="attention",
+                unit=CacheKind.PAGED,
+                regions=regions,
+                params={"tokens_per_block": 4, "window": None},
+            )
+        ],
+    )
+
+
+def _plan(self_ri, peer_ri, self_offsets, peer_offsets, self_bpl, peer_bpl):
+    groups = plan_transfers(
+        self_ri,
+        peer_ri,
+        _kv_table(self_offsets, self_bpl, self_ri.attention.kv_heads_per_rank),
+        _kv_table(peer_offsets, peer_bpl, peer_ri.attention.kv_heads_per_rank),
+    )
+    assert len(groups) == 1
+    return groups[0].plan
+
+
+def test_whole_copy_identity_degenerate():
     """Full contiguous overlap degrades to a whole-region pass-through copy."""
     src_group = MemRegionGroup(ptrs=np.array([100, 200], dtype=np.int64), bytes_per_region=32)
     dst_group = MemRegionGroup(ptrs=np.array([300, 400], dtype=np.int64), bytes_per_region=32)
     src_spec = SpecRegion(memory=src_group, spec="a")
     dst_spec = SpecRegion(memory=dst_group, spec="b")
-    mapper = IntactMapper([0, 16], [0, 16], 16, 16)
-    result = mapper.map(src_spec, dst_spec)
+    ri = make_rankinfo()
+    plan = _plan(ri, ri, [0, 16], [0, 16], 16, 16)
+    # Runs of equal length come back as one fragment array.
+    (result,) = plan.map(src_spec, dst_spec)
     assert isinstance(result, SpecRegionPair)
     np.testing.assert_array_equal(result.src.memory.ptrs, [100, 200])
     np.testing.assert_array_equal(result.dst.memory.ptrs, [300, 400])
     assert result.src.memory.bytes_per_region == 32
     assert result.dst.memory.bytes_per_region == 32
+    assert result.src.spec == "a" and result.dst.spec == "b"
 
 
-def test_intact_mapper_partial_layers():
+def test_whole_copy_partial_layers():
     """Selecting a contiguous layer subset yields one shifted fragment."""
     self_ri = make_rankinfo(kv_heads_per_rank=2)
     # bytes_per_layer = kv_factor * kv_heads * tokens_per_block * dims_per_head * element_bytes
@@ -127,13 +171,19 @@ def test_intact_mapper_partial_layers():
     dst_group = MemRegionGroup(ptrs=np.array([30, 40], dtype=np.int64), bytes_per_region=1)
     src_spec = SpecRegion(memory=src_group, spec="srcspec")
     dst_spec = SpecRegion(memory=dst_group, spec="dstspec")
-    # Self selects layers 1..2 of its slot; the peer stores the same class at
-    # layers 2..3. Distinct src/dst layer offsets make the test fail if the
-    # mapper ever applies one side's offset to the other.
-    src_offsets = [bytes_per_layer, 2 * bytes_per_layer]
-    dst_offsets = [2 * bytes_per_layer, 3 * bytes_per_layer]
-    mapper = IntactMapper(src_offsets, dst_offsets, bytes_per_layer, bytes_per_layer)
-    result = mapper.map(src_spec, dst_spec)
+    # Self holds global layers 1..2 at slot positions 1..2; the peer stores them at
+    # positions 2..3. Distinct src/dst layer offsets make the test fail if the plan
+    # ever applies one side's offset to the other.
+    plan = _plan(
+        self_ri,
+        self_ri,
+        [None, bytes_per_layer, 2 * bytes_per_layer],
+        [None, 2 * bytes_per_layer, 3 * bytes_per_layer],
+        bytes_per_layer,
+        bytes_per_layer,
+    )
+    # Runs of equal length come back as one fragment array.
+    (result,) = plan.map(src_spec, dst_spec)
     # Both sides are internally contiguous, so the two layers merge into a
     # single fragment shifted by each side's own first-layer offset.
     expected_bytes = 2 * bytes_per_layer
@@ -147,17 +197,17 @@ def test_intact_mapper_partial_layers():
     assert result.dst.memory.bytes_per_region == expected_bytes
 
 
-def test_head_mismatch_mapper():
-    # Self holds 2 KV heads at TP=2; the peer holds 4 KV heads at TP=4. Using
-    # peer tp_rank=1 (not 2) forces a *nonzero* source-side head offset, so an
-    # incorrect head-offset computation cannot pass silently.
-    self_ri = make_rankinfo(kv_heads_per_rank=2, tp_size=2, tp_rank=1)
-    peer_ri = make_rankinfo(kv_heads_per_rank=4, tp_size=4, tp_rank=1)
+def test_head_mismatch_slices_heads():
+    # Self holds 2 of 4 KV heads at TP=2; the peer holds 1 KV head at TP=4. Peer
+    # tp_rank=1 needs head 1, inside self rank 0's pair, so the source-side head offset is
+    # *nonzero* and an incorrect head-offset computation cannot pass silently.
+    self_ri = make_rankinfo(kv_heads_per_rank=2, tp_size=2, tp_rank=0)
+    peer_ri = make_rankinfo(kv_heads_per_rank=1, tp_size=4, tp_rank=1)
     buffers_per_layer = 2  # K and V
     # buffer bytes = heads * tokens_per_block * dims_per_head * element_bytes
     self_buffer_bytes = 2 * 4 * 2 * 1
-    peer_buffer_bytes = 4 * 4 * 2 * 1
-    self_bytes_per_layer = buffers_per_layer * self_buffer_bytes  # kv_factor x K-buffer bytes
+    peer_buffer_bytes = 1 * 4 * 2 * 1
+    self_bytes_per_layer = buffers_per_layer * self_buffer_bytes
     peer_bytes_per_layer = buffers_per_layer * peer_buffer_bytes
     bytes_per_head = self_buffer_bytes // self_ri.attention.kv_heads_per_rank  # equals peer side
     src_base, dst_base = 111, 222
@@ -165,28 +215,24 @@ def test_head_mismatch_mapper():
     dst_group = MemRegionGroup(ptrs=np.array([dst_base], dtype=np.int64), bytes_per_region=32)
     src_spec = SpecRegion(memory=src_group, spec="srcspec")
     dst_spec = SpecRegion(memory=dst_group, spec="dstspec")
-    peer_layer_off = peer_bytes_per_layer  # copy targets layer 1 on the peer side
-    mapper = HNDHeadMismatchMapper(
-        src_layer_offsets=[0],
-        dst_layer_offsets=[peer_layer_off],
-        self_ri=self_ri,
-        peer_ri=peer_ri,
-        self_bytes_per_layer=self_bytes_per_layer,
-        peer_bytes_per_layer=peer_bytes_per_layer,
-        self_buffers_per_layer=buffers_per_layer,
-        peer_buffers_per_layer=buffers_per_layer,
+    # Global layer 0 sits at the start of the local slot and at layer position 1 on the peer.
+    peer_layer_off = peer_bytes_per_layer
+    plan = _plan(
+        self_ri,
+        peer_ri,
+        [0],
+        [peer_layer_off],
+        self_bytes_per_layer,
+        peer_bytes_per_layer,
     )
-    result = mapper.map(src_spec, dst_spec)
+    # Runs of equal length come back as one fragment array.
+    (result,) = plan.map(src_spec, dst_spec)
     assert isinstance(result, SpecRegionPair)
     assert isinstance(result.src.memory.ptrs, np.ndarray)
     assert isinstance(result.dst.memory.ptrs, np.ndarray)
-    # Source head offset for self rank 1 slicing into the peer's 4-head layout:
-    #   (peer_tp_rank * self_kv_heads * self_tp) // peer_tp % self_kv_heads
-    #   = (1 * 2 * 2) // 4 % 2 = 1 head -> 1 * bytes_per_head. The peer side is
-    # the coarser layout, so its head offset is 0.
+    # Head 1 is one head into self's span [0, 2); the peer's span is just [1, 2).
     src_head_off = 1 * bytes_per_head
     # One fragment per (layer, K/V buffer), buffers back-to-back within a layer.
-    # Source layer offset is 0; the peer layer offset is nonzero.
     expected_src_ptrs = [
         src_base + src_head_off + buf * self_buffer_bytes for buf in range(buffers_per_layer)
     ]
@@ -195,13 +241,9 @@ def test_head_mismatch_mapper():
     ]
     np.testing.assert_array_equal(result.src.memory.ptrs, expected_src_ptrs)
     np.testing.assert_array_equal(result.dst.memory.ptrs, expected_dst_ptrs)
-    # Each fragment copies min(self_heads, peer_heads) contiguous heads.
-    cont_heads_bytes = (
-        min(self_ri.attention.kv_heads_per_rank, peer_ri.attention.kv_heads_per_rank)
-        * bytes_per_head
-    )
-    assert result.src.memory.bytes_per_region == cont_heads_bytes
-    assert result.dst.memory.bytes_per_region == cont_heads_bytes
+    # Each fragment copies the heads both sides share: the peer's one head.
+    assert result.src.memory.bytes_per_region == bytes_per_head
+    assert result.dst.memory.bytes_per_region == bytes_per_head
 
 
 def test_rankinfo_kv_factor():

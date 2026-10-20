@@ -19,9 +19,9 @@ import numpy as np
 import pytest
 
 from tensorrt_llm import bindings
+from tensorrt_llm._torch.disaggregation.cache_kinds import ShardGrid, state_grid
 from tensorrt_llm._torch.disaggregation.native import rank_info as rank_info_module
 from tensorrt_llm._torch.disaggregation.native.auxiliary import AuxBufferMeta
-from tensorrt_llm._torch.disaggregation.native.mixers.ssm.peer import MambaPolicy
 from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
 
 pytestmark = pytest.mark.cpu_only
@@ -164,7 +164,7 @@ def test_from_kv_cache_manager_preserves_attention_dp_on_attention_free_stage(
     assert info.attention is not None
     assert info.attention.kv_heads_per_rank == 0
     assert info.attention.enable_attention_dp
-    assert MambaPolicy._mamba_tp(info) == (1, 0)
+    assert state_grid(info) == ShardGrid(size=1, rank=0)
 
 
 @pytest.mark.parametrize(
