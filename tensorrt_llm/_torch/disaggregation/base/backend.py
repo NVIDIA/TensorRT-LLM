@@ -191,7 +191,8 @@ class View(Protocol):
     def groups(self) -> Sequence[LayerGroupRows]: ...
 
     def row_masks(self, fill_value: bool = False) -> tuple[np.ndarray, ...]:
-        """One writable ``bool`` mask of shape ``[len(group)]`` per group, in :attr:`groups` order.
+        """One new writable ``bool`` mask of shape ``[len(group)]`` per group, in :attr:`groups`
+        order.
 
         Args:
             fill_value: What every entry starts as.
