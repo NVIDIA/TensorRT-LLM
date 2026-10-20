@@ -32,36 +32,30 @@ shared perf regression pipeline. It is responsible for:
 | `MINIMIZE_METRICS` | `d_mean_latency`, `d_median_latency`, `d_p90_latency`, `d_p99_latency`, `d_mean_generation`, `d_median_generation`, `d_p90_generation`, `d_p99_generation` |
 | `REGRESSION_METRICS` | `d_median_generation` |
 
-Latency and generation metrics are read from the VisualGen benchmark JSON in
-seconds. Generation uses client-side timing; synchronous image routes have no
-separate generation-complete observation. Server timings are diagnostic only.
-
-`s_generation_timing_source` records the measurement source without changing
-metric names or match keys:
+Latency/generation metrics use seconds and client timing; server timings are diagnostic only.
+`s_generation_timing_source` identifies the measurement without changing metric
+names or match keys. Synchronous image routes have no separately observable client
+generation window:
 
 | Backend | Generation metric path | Timing source |
 |---------|------------------------|---------------|
 | `openai-videos` | `gen_latency` | `client_gen_latency` |
 | `openai-images`, `openai-image-edits` | `e2e_latency` | `client_e2e_latency` |
 
-`get_generation_metric_path` in `tests/test_common/visual_gen_perf_history.py`
-defines the shared backend-to-path mapping for extraction, source metadata, and
-history selection. Change this mapping to switch measurement paths; reassess
-compatibility explicitly if timing semantics change under the same path.
+`tests/test_common/visual_gen_perf_history.py::get_generation_metric_path` shares
+one mapping across validation, extraction, metadata, and history selection.
+Update it to switch paths; reassess compatibility if semantics change within a path.
 
-CI excludes missing or incompatible sources before latest-main and baseline
-selection, preserving compatible fixed baselines, threshold overrides, and stored
-records. Without a fixed baseline it uses the shared rolling baseline algorithm.
-Defaults remain 10% pre-merge and 5% post-merge; the shared
-baseline algorithm is described in `README_perf_regression_system.md`.
+CI excludes missing/incompatible sources before latest-main and baseline lookup,
+retaining compatible fixed baselines and threshold overrides without mutating history.
+Without a fixed baseline it uses the shared rolling baseline; defaults remain 10% pre-merge and
+5% post-merge (see `README_perf_regression_system.md`).
 
-Existing client results need source-verified timing metadata backfill before
-reuse; dates alone do not establish compatibility. In the same atomic document
-update that adds source metadata, validate the baseline's timing source or clear
-unverified `d_baseline_*` fields without changing measurements. Audit custom
-thresholds and retain applicable overrides or obtain approval for resets.
-Backfill is separate from CI. Without compatible history, the first run has no
-usable baseline; verify that a subsequent run uses the uploaded client history.
+Reusing existing client results requires separate, source-verified metadata backfill,
+not a date cutoff. Atomically tag each record and validate or clear its unverified
+`d_baseline_*` fields, preserving measurements. Retain applicable custom thresholds;
+resets require approval. Without backfill or compatible history, the first run has
+no baseline; verify the next run uses the uploaded client history.
 
 ## Match Keys
 

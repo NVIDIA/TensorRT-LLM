@@ -66,6 +66,28 @@ def _client_row(value: float, timestamp: str, **fields: object) -> dict:
     )
 
 
+def _entry(producer: types.ModuleType, backend: str) -> dict:
+    return producer.build_visual_gen_db_entry(
+        gpu_type="b200",
+        model_name="flux2",
+        server_name="flux2",
+        server_config={},
+        client_config={"backend": backend, "num_inference_steps": 50, "max_concurrency": 1},
+        result_data=_benchmark_result(backend),
+    )
+
+
+@pytest.fixture
+def pipeline_kwargs() -> dict:
+    return dict(
+        match_keys=["s_test_case_name", "s_gpu_type", "s_runtime", "s_backend"],
+        maximize_metrics=[],
+        minimize_metrics=["d_median_generation"],
+        regression_metrics=["d_median_generation"],
+        history_transform=transform_visual_gen_history,
+    )
+
+
 def test_untagged_client_history_needs_explicit_backfill() -> None:
     record = _row(_CLIENT_COMMIT, 0.9433, "2026-09-14T00:00:00Z")
     assert transform_visual_gen_history(record) is None
@@ -80,29 +102,6 @@ def test_missing_or_different_source_is_excluded(source: str | None) -> None:
         0.94,
         "2026-10-14T00:00:00Z",
         s_generation_timing_source=source,
-    )
-    assert transform_visual_gen_history(record) is None
-
-
-@pytest.mark.parametrize(
-    ("backend", "source"),
-    [
-        ("openai-videos", "client_gen_latency"),
-        ("openai-images", "client_e2e_latency"),
-    ],
-)
-def test_source_must_match_backend(backend: str, source: str) -> None:
-    assert get_generation_timing_source(backend) == source
-    record = _row(
-        _CLIENT_COMMIT,
-        0.94,
-        "2026-10-14T00:00:00Z",
-        s_backend=backend,
-        s_generation_timing_source=source,
-    )
-    assert transform_visual_gen_history(record) == record
-    record["s_generation_timing_source"] = (
-        "client_e2e_latency" if source == "client_gen_latency" else "client_gen_latency"
     )
     assert transform_visual_gen_history(record) is None
 
@@ -217,6 +216,7 @@ def test_end_to_end_false_regression_is_removed_and_real_regression_remains(
     modules: _Modules,
     monkeypatch: pytest.MonkeyPatch,
     post_merge: bool,
+    pipeline_kwargs: dict,
 ) -> None:
     _, pipeline, search = modules
     old = _row(_SERVER_COMMIT, 1.2, "2026-10-14T00:00:00Z", d_baseline_median_generation=0.8554)
@@ -227,13 +227,9 @@ def test_end_to_end_false_regression_is_removed_and_real_regression_remains(
         current = _client_row(value, "2026-10-14T00:00:00Z")
         kwargs = dict(
             new_data_dict={0: current},
-            match_keys=["s_test_case_name", "s_gpu_type", "s_runtime", "s_backend"],
-            maximize_metrics=[],
-            minimize_metrics=["d_median_generation"],
-            regression_metrics=["d_median_generation"],
             upload_to_db=False,
             fail_on_regression=True,
-            history_transform=transform_visual_gen_history,
+            **pipeline_kwargs,
         )
         if should_fail and not post_merge:
             with pytest.raises(RuntimeError, match="Regression"):
@@ -244,7 +240,7 @@ def test_end_to_end_false_regression_is_removed_and_real_regression_remains(
 
 
 def test_fixed_client_baseline_and_custom_threshold_remain_effective(
-    modules: _Modules, monkeypatch: pytest.MonkeyPatch
+    modules: _Modules, monkeypatch: pytest.MonkeyPatch, pipeline_kwargs: dict
 ) -> None:
     _, pipeline, search = modules
     good = _client_row(
@@ -258,12 +254,8 @@ def test_fixed_client_baseline_and_custom_threshold_remain_effective(
     current = _client_row(1.03, "2026-10-15T00:00:00Z")
     pipeline.process_and_upload_test_results(
         new_data_dict={0: current},
-        match_keys=["s_test_case_name", "s_gpu_type", "s_runtime", "s_backend"],
-        maximize_metrics=[],
-        minimize_metrics=["d_median_generation"],
-        regression_metrics=["d_median_generation"],
         upload_to_db=False,
-        history_transform=transform_visual_gen_history,
+        **pipeline_kwargs,
     )
     assert current["b_is_regression"] is True
     assert current["d_baseline_median_generation"] == 1.0
@@ -273,17 +265,13 @@ def test_fixed_client_baseline_and_custom_threshold_remain_effective(
 
 
 def test_first_post_merge_upload_becomes_compatible_history_for_next_run(
-    modules: _Modules, monkeypatch: pytest.MonkeyPatch, producer: types.ModuleType
+    modules: _Modules,
+    monkeypatch: pytest.MonkeyPatch,
+    producer: types.ModuleType,
+    pipeline_kwargs: dict,
 ) -> None:
     db, pipeline, search = modules
-    first = producer.build_visual_gen_db_entry(
-        gpu_type="b200",
-        model_name="flux2",
-        server_name="flux2",
-        server_config={},
-        client_config={"backend": "openai-images", "num_inference_steps": 50, "max_concurrency": 1},
-        result_data=_benchmark_result("openai-images"),
-    )
+    first = _entry(producer, "openai-images")
     history = [
         _row(
             _SERVER_COMMIT,
@@ -306,14 +294,7 @@ def test_first_post_merge_upload_becomes_compatible_history_for_next_run(
     monkeypatch.setattr(
         pipeline, "get_job_info", lambda: {"b_is_post_merge": True, "s_commit": _CLIENT_COMMIT}
     )
-    kwargs = dict(
-        match_keys=["s_test_case_name", "s_gpu_type", "s_runtime", "s_backend"],
-        maximize_metrics=[],
-        minimize_metrics=["d_median_generation"],
-        regression_metrics=["d_median_generation"],
-        history_transform=transform_visual_gen_history,
-    )
-    pipeline.process_and_upload_test_results(new_data_dict={0: first}, **kwargs)
+    pipeline.process_and_upload_test_results(new_data_dict={0: first}, **pipeline_kwargs)
     assert first["b_is_regression"] is False
     assert "@timestamp" not in first and "ts_created" not in first
     assert "baseline=" not in first["s_regression_info"]
@@ -321,7 +302,10 @@ def test_first_post_merge_upload_becomes_compatible_history_for_next_run(
     assert len(history) == 2
     assert history[-1]["s_generation_timing_source"] == "client_e2e_latency"
     latest, _, compatible = db.get_history_data(
-        {0: first}, kwargs["match_keys"], {}, history_transform=transform_visual_gen_history
+        {0: first},
+        pipeline_kwargs["match_keys"],
+        {},
+        history_transform=transform_visual_gen_history,
     )
     assert latest[0]["s_commit"] == _CLIENT_COMMIT
     assert len(compatible[0]) == 1
@@ -330,7 +314,7 @@ def test_first_post_merge_upload_becomes_compatible_history_for_next_run(
     slower = {**first, "d_median_generation": 1.2}
     with pytest.raises(RuntimeError, match="Regression"):
         pipeline.process_and_upload_test_results(
-            new_data_dict={0: slower}, upload_to_db=False, **kwargs
+            new_data_dict={0: slower}, upload_to_db=False, **pipeline_kwargs
         )
     assert slower["b_is_regression"] is True
     assert "baseline=0.9400" in slower["s_regression_info"]
@@ -382,18 +366,16 @@ def harness(
 def test_producer_source_agrees_with_extracted_metrics_without_changing_match_keys(
     producer: types.ModuleType, backend: str, source: str, generation: float
 ) -> None:
-    row = producer.build_visual_gen_db_entry(
-        gpu_type="b200",
-        model_name="flux2",
-        server_name="flux2",
-        server_config={},
-        client_config={"backend": backend, "num_inference_steps": 50, "max_concurrency": 1},
-        result_data=_benchmark_result(backend),
-    )
+    row = _entry(producer, backend)
+    assert get_generation_timing_source(backend) == source
     assert row["s_generation_timing_source"] == source
     assert row["d_median_generation"] == generation
     assert transform_visual_gen_history(row) == row
     assert "s_generation_timing_source" not in producer.get_visual_gen_match_keys()
+    row["s_generation_timing_source"] = (
+        "client_e2e_latency" if source == "client_gen_latency" else "client_gen_latency"
+    )
+    assert transform_visual_gen_history(row) is None
 
 
 @pytest.mark.parametrize(
@@ -424,14 +406,7 @@ def test_one_path_change_updates_extraction_metadata_and_history_selection(
         result_path="test-only.json",
     )
     validate(None, **validation_kwargs)
-    row = producer.build_visual_gen_db_entry(
-        gpu_type="b200",
-        model_name="test-model",
-        server_name="test-server",
-        server_config={},
-        client_config={"backend": backend, "num_inference_steps": 50, "max_concurrency": 1},
-        result_data=_benchmark_result(backend),
-    )
+    row = _entry(producer, backend)
     assert producer.result_metric_paths(backend)["d_median_generation"] == f"{new_path}.median"
     assert row["d_median_generation"] == new_value
     assert row["s_generation_timing_source"] == f"client_{new_path}"
