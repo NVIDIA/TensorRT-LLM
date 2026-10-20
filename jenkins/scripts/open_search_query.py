@@ -22,9 +22,9 @@
 # skip redundant test execution in subsequent runs.
 #
 # Main functionality:
-# - queryJobEvents: Queries distinct names with cursor pagination
-# - getPassedTestList: Retrieves a sorted, deduplicated passed-test list
-# - writeTestListToFile: Writes test list to a file for further processing
+# - query_job_events: Queries distinct names with cursor pagination
+# - get_passed_test_list: Retrieves a sorted, deduplicated passed-test list
+# - write_test_list_to_file: Writes test list to a file for further processing
 #
 # =============================================================================
 
@@ -44,18 +44,18 @@ class _IncompleteQueryError(RuntimeError):
         self.test_names = test_names
 
 
-def queryJobEvents(commitID="", stageNamePattern="", onlySuccess=True) -> list[str]:
+def query_job_events(commit_id="", stage_name_pattern="", only_success=True) -> list[str]:
     """Query distinct test names using composite aggregation pagination."""
-    mustConditions = []
-    if commitID:
-        mustConditions.append({"term": {"s_trigger_mr_commit": commitID}})
-    if not stageNamePattern:
-        raise ValueError("stageNamePattern cannot be empty")
-    mustConditions.append({"regexp": {"s_stage_name": stageNamePattern}})
-    if onlySuccess:
-        mustConditions.append({"term": {"s_status": "PASSED"}})
+    must_conditions = []
+    if commit_id:
+        must_conditions.append({"term": {"s_trigger_mr_commit": commit_id}})
+    if not stage_name_pattern:
+        raise ValueError("stage_name_pattern cannot be empty")
+    must_conditions.append({"regexp": {"s_stage_name": stage_name_pattern}})
+    if only_success:
+        must_conditions.append({"term": {"s_status": "PASSED"}})
 
-    testSet = set()
+    test_set = set()
     page_size = 1000
     after_key = None
     try:
@@ -66,14 +66,14 @@ def queryJobEvents(commitID="", stageNamePattern="", onlySuccess=True) -> list[s
             }
             if after_key is not None:
                 composite["after"] = after_key
-            requestBody = {
-                "query": {"bool": {"must": mustConditions}},
+            request_body = {
+                "query": {"bool": {"must": must_conditions}},
                 "size": 0,
                 "aggs": {"passed_tests": {"composite": composite}},
             }
-            formattedRequestBody = json.dumps(requestBody)
+            formatted_request_body = json.dumps(request_body)
             response = OpenSearchDB.queryFromOpenSearchDB(
-                formattedRequestBody, "swdl-trtllm-infra-ci-prod-test_info"
+                formatted_request_body, "swdl-trtllm-infra-ci-prod-test_info"
             )
             if response is None:
                 raise RuntimeError("OpenSearch passed-test query failed")
@@ -93,39 +93,39 @@ def queryJobEvents(commitID="", stageNamePattern="", onlySuccess=True) -> list[s
             ):
                 raise RuntimeError("OpenSearch passed-test pagination cursor did not advance")
             page_names = {bucket["key"]["test_name"] for bucket in buckets}
-            testSet.update(page_names)
-            print(f"Fetched {len(testSet)} distinct passed test names...")
+            test_set.update(page_names)
+            print(f"Fetched {len(test_set)} distinct passed test names...")
 
             if not next_after_key:
                 break
             after_key = next_after_key
     except (RuntimeError, OSError, ValueError, KeyError, TypeError) as error:
-        raise _IncompleteQueryError(str(error), sorted(testSet)) from error
+        raise _IncompleteQueryError(str(error), sorted(test_set)) from error
 
-    return sorted(testSet)
+    return sorted(test_set)
 
 
-def writeTestListToFile(testList, fileName):
-    os.makedirs(os.path.dirname(fileName), exist_ok=True)
+def write_test_list_to_file(test_list, file_name):
+    os.makedirs(os.path.dirname(file_name), exist_ok=True)
 
-    with open(fileName, "w") as f:
-        for test in testList:
+    with open(file_name, "w") as f:
+        for test in test_list:
             f.write(test + "\n")
 
 
-def getPassedTestList(commitID, stageNamePattern, outputFile) -> bool:
+def get_passed_test_list(commit_id, stage_name_pattern, output_file) -> bool:
     """Write confirmed passed tests and return whether the query was complete."""
     try:
-        testList = queryJobEvents(commitID, stageNamePattern)
+        test_list = query_job_events(commit_id, stage_name_pattern)
     except _IncompleteQueryError as error:
-        writeTestListToFile(error.test_names, outputFile)
+        write_test_list_to_file(error.test_names, output_file)
         print(
             f"WARNING: OpenSearch query incomplete; retained {len(error.test_names)} "
             f"test names from successful pages: {error}",
             file=sys.stderr,
         )
         return False
-    writeTestListToFile(testList, outputFile)
+    write_test_list_to_file(test_list, output_file)
     return True
 
 
@@ -141,9 +141,9 @@ if __name__ == "__main__":
     args = parser.parse_args(sys.argv[1:])
     if not args.stage_name_pattern:
         parser.error("--stage-name-pattern cannot be empty")
-    complete = getPassedTestList(
-        commitID=args.commit_id,
-        stageNamePattern=args.stage_name_pattern,
-        outputFile=args.output_file,
+    complete = get_passed_test_list(
+        commit_id=args.commit_id,
+        stage_name_pattern=args.stage_name_pattern,
+        output_file=args.output_file,
     )
     sys.exit(0 if complete else PARTIAL_QUERY_EXIT_CODE)
