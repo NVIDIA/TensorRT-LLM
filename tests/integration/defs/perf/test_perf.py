@@ -1635,6 +1635,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
         outputs = {}
         result_states = {}
         errors = []
+        copy_error = None
 
         if self._config.runtime == 'bench':
             print_info(f"Running command for generating dataset")
@@ -1710,10 +1711,15 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                 try:
                     shutil.copytree(engine_dir, result_dir, dirs_exist_ok=True)
                 except OSError as error:
+                    copy_error = error
                     print_warning(
                         f"Failed to preserve detailed results in {result_dir}: {error}"
                     )
-            shutil.rmtree(engine_dir, ignore_errors=True)
+            if copy_error is None:
+                shutil.rmtree(engine_dir, ignore_errors=True)
+
+        if copy_error is not None:
+            errors.append(copy_error)
 
         def add_myelin_time_pass_to(input_env):
             time_pass_flag = r" -time_pass=on"
@@ -1726,7 +1732,8 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
         llm_venv._new_env["__LUNOWUD"] = old_llm_venv
 
         # Check if any commands failed.
-        if not all([result_states[idx] == "valid" for idx in result_states]):
+        if errors or not all(
+            [result_states[idx] == "valid" for idx in result_states]):
             # If there is only one error, throw it directly.
             if len(errors) == 1:
                 raise errors[0]
