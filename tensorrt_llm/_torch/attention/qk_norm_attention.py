@@ -164,7 +164,7 @@ class QKNormRoPEAttention(Attention):
         attn_output_gate: Optional[bool] = None,
         is_qk_norm: bool = True,
         reduce_output: bool = True,
-        rope_fusion: bool = True,
+        rope_fusion: Optional[bool] = True,
         mapping_with_cp: Optional[Mapping] = None,
         head_dim: Optional[int] = None,
     ):
@@ -178,9 +178,11 @@ class QKNormRoPEAttention(Attention):
         self._fuse_qk_norm_rope_gate = False
 
         # If fuse_qk_norm_rope is true, do not apply fused RoPE in attention OP, and self.rotary_emb
-        # will be skipped in the overridden apply_rope.
-        rope_fusion &= (not self.fuse_qk_norm_rope and not skip_rope
-                        and not attn_output_gate and not use_gemma_rms_norm)
+        # will be skipped in the overridden apply_rope. rope_fusion=None lets
+        # the attention backend decide.
+        if (self.fuse_qk_norm_rope or skip_rope or attn_output_gate
+                or use_gemma_rms_norm):
+            rope_fusion = False
         self.is_qk_norm = is_qk_norm
         assert not (fuse_qk_norm_rope and skip_rope
                     ), "Fusing qk norm and skipping rope is not supported"
