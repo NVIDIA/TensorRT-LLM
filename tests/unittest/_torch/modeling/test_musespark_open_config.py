@@ -239,7 +239,10 @@ def test_load_pretrained_config_translates_the_composite_config(tmp_path):
 )
 def test_the_released_checkpoints_load(checkpoint):
     path = os.path.join(llm_models_root(), checkpoint)
-    if not os.path.isfile(os.path.join(path, "config.json")):
+    # An absent or empty directory is a checkpoint not synced to this machine
+    # (a submodule's directory exists before its contents arrive). A synced
+    # checkpoint must load.
+    if not os.path.isdir(path) or not os.listdir(path):
         pytest.skip(f"{checkpoint} is not under LLM_MODELS_ROOT")
     config = load_pretrained_config(path)
     assert isinstance(config, MuseSparkOpenConfig)

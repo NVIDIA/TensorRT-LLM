@@ -57,8 +57,12 @@ RAW_PROMPTS = [
 @pytest.fixture(scope="module", params=CHECKPOINTS)
 def checkpoint_dir(request):
     path = os.path.join(llm_models_root(), request.param)
-    if not os.path.isfile(os.path.join(path, "tokenizer.json")):
+    # An absent or empty directory is a checkpoint not synced to this machine
+    # (a submodule's directory exists before its contents arrive). A synced
+    # checkpoint must be complete.
+    if not os.path.isdir(path) or not os.listdir(path):
         pytest.skip(f"{request.param} is not under LLM_MODELS_ROOT")
+    assert os.path.isfile(os.path.join(path, "tokenizer.json")), f"{path} has no tokenizer.json"
     return path
 
 
