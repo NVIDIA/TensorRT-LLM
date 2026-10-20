@@ -704,7 +704,7 @@ class TestResponsesInputTokens:
         request.store = False
 
         async def tokens(chat_template):
-            ids, _mm = await responses_utils._create_input_tokens(
+            return await responses_utils._create_input_tokens(
                 request=request,
                 prev_response=None,
                 prev_msgs=None,
@@ -715,7 +715,6 @@ class TestResponsesInputTokens:
                 processor=None,
                 chat_template=chat_template,
             )
-            return ids
 
         with_template = await tokens(SERVER_TEMPLATE)
         without = await tokens(None)

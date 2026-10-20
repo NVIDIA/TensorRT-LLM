@@ -268,17 +268,19 @@ async def test_coordinator_publishes_worker_render_fingerprints_to_the_frontend(
     fingerprint = {
         "digest": "d",
         "compared": {"tokenizer": {"complete": True, "vocab_sha256": "big"}},
-        "info": {"tool_parser": None},
+        "info": {"tool_parser": None, "reasoning_parser": "poolside_v1"},
     }
     coordinator.ctx_router._server_info = {ctx_server: {"render_fingerprint": fingerprint}}
 
     info = await coordinator.cluster_info()
 
-    # Only what the match reads is published, not the whole fingerprint.
+    # Only what the match reads is published, not the whole fingerprint; the worker's
+    # reasoning parser rides along for the router's decision about forwarding ids.
     assert info["render_fingerprints"]["context"] == {
         ctx_server: {
             "digest": "d",
             "compared": {"use_harmony": False, "tokenizer": {"complete": True}},
+            "reasoning_parser": "poolside_v1",
         }
     }
     assert info["render_fingerprints"]["generation"] == {}
