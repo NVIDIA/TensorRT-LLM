@@ -332,8 +332,8 @@ Entries: `Arch.SM_100` is declared on every shared entry the target calls, each 
 whole on sm_100: `thop_attention`, `cublas_mm`, `flashinfer_rmsnorm`,
 `flashinfer_fused_add_rmsnorm`, `rms_norm_gated_grouped`, `noaux_tc_op`,
 `causal_conv1d_fwd`, `causal_conv1d_update`, `mamba_chunk_scan_combined`,
-`selective_state_update` and the promoted ones, `fused_moe`, `allreduce` and
-`mnnvl_fusion_allreduce`. The
+`selective_state_update`, `flashinfer_selective_state_update` (new, sm_100 only) and the
+promoted ones, `fused_moe`, `allreduce` and `mnnvl_fusion_allreduce`. The
 cells added for tep8 -- the rank's in_proj, qkv, o_proj and shared-expert GEMM shapes;
 8 q / 1 kv head over a bf16 pool, including rows 4 and 55 of a real
 `MambaHybridCacheManagerV2`'s 60-row mapping; conv, scan and decode-step shapes at 32
@@ -424,6 +424,32 @@ now called by both, moved to the catalog. The target is gated by
 `tests/integration/defs/accuracy/modeling_v2/test_nemotron_h.py::TestModelingV2Nemotron3UltraBf16Sm100Tp8ep2`
 (gsm8k at `max_batch_size` 256, the tep8 gate's protocol and reference): 94.579 against the
 reference's 94.769.
+
+#### FlashInfer's decode step at high concurrency
+
+From 32 decode rows on, both BF16 targets run the Mamba2 decode step through
+`flashinfer_selective_state_update` (FlashInfer's CUDA kernel) instead of
+`selective_state_update` (Triton). At the rank's shapes -- 32 heads of 64, one group of 128
+states, an fp32 state -- FlashInfer's kernel replays 1.17x as fast at 32 rows, 1.31x at 128 and
+1.36x at 256, and is the slower one below 32 (0.87x at 8 rows, 0.73x at one), hence the
+threshold. What the switch takes:
+
+* The kernel accepts D and dt_bias only in dt's dtype, so the targets keep bf16 copies -- the
+  checkpoint's own values -- beside the fp32 ones the Triton kernel reads.
+* It reads x, B and C through TMA and needs each 128-byte aligned. A decode step's in_proj
+  output is; a mixed step's generation rows are not after an odd number of context rows (8768
+  bytes each), so those stay on the Triton kernel. The kernel refuses a misaligned start
+  loudly, which is how a first version that also took the mixed rows failed its gate.
+* Its softplus and decay use fast intrinsics, so dt carries more error than the Triton
+  kernel's; the entry's test bands it from the intrinsics' documented bounds.
+
+End to end on two GB200 nodes (one allocation, `max_batch_size` 256, ISL/OSL 1k/1k), output
+throughput at 1 / 32 / 128 / 256 concurrent requests moves 0 / +1.5 / +3.4 / +4.9% on tep8 and
+0 / -0.2 / +2.9 / +4.5% on tp8ep2 (at 32 the decode batch straddles the threshold; within the
+noise there), time to first token unchanged; gsm8k 94.617 on tep8 and 94.920 on tp8ep2. With
+both changes the tp8ep2 target serves 145.8 / 2616.9 / 5831.8 / 8309.4 output tok/s where
+tep8 without FlashInfer's step served 138.9 / 2402.1 / 5356.7 / 7671.0 (mean of two runs):
++5.0 / +8.9 / +8.9 / +8.3%.
 
 ### What replaced the version pin
 

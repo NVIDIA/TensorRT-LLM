@@ -69,6 +69,9 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.ssm.causal_conv1d_fwd
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.ssm.causal_conv1d_update import (
     causal_conv1d_update,
 )
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.ssm.flashinfer_selective_state_update import (  # noqa: E501
+    flashinfer_selective_state_update,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.ssm.mamba_chunk_scan_combined import (  # noqa: E501
     mamba_chunk_scan_combined,
 )
@@ -95,6 +98,13 @@ _SM = (10, 0)
 
 # An empty slot in the recurrent-state pools (padding rows of a captured batch).
 _PAD_SLOT_ID = -1
+# The decode step runs FlashInfer's kernel from this many rows on and the Triton kernel below:
+# at this rank's shapes FlashInfer's is the faster from 32 rows (1.17x there, 1.36x at 256, in
+# CUDA-graph replay) and the slower below (0.87x at 8 rows, 0.73x at one). A mixed step's
+# generation rows stay on the Triton kernel: FlashInfer's reads x, B and C through TMA, which
+# needs them 128-byte aligned, and those rows start past the context tokens' in_proj rows
+# (8768 bytes each), only 64-byte aligned after an odd number of them.
+_FI_SSU_MIN_ROWS = 32
 # Within one node AUTO picks the one-shot / two-shot IPC kernels for decode-sized payloads
 # and NCCL for large prefill payloads (it falls back to NCCL past the workspace). Between
 # nodes the IPC kernels have no peers to reach -- the workspace is never opened. On an NVL72
@@ -182,8 +192,10 @@ class _Mamba(NamedTuple):
     A_hd: torch.Tensor
     D: torch.Tensor
     D_hd: torch.Tensor
+    D_hd16: torch.Tensor
     dt_bias: torch.Tensor
     dt_bias_hd: torch.Tensor
+    dt_bias_hd16: torch.Tensor
     gnorm: torch.Tensor
     out_w: torch.Tensor
 
@@ -237,8 +249,12 @@ def _layer_views(core) -> list:
                 A_hd=A[:, None, None].expand(d.heads_r, hd, st),
                 D=D,
                 D_hd=D[:, None].expand(d.heads_r, hd),
+                # FlashInfer's decode kernel takes D and dt_bias only in dt's dtype: the
+                # checkpoint's bf16 values, which the fp32 copies hold exactly.
+                D_hd16=D.to(torch.bfloat16)[:, None].expand(d.heads_r, hd),
                 dt_bias=dtb,
                 dt_bias_hd=dtb[:, None].expand(d.heads_r, hd),
+                dt_bias_hd16=dtb.to(torch.bfloat16)[:, None].expand(d.heads_r, hd),
                 gnorm=w[f"l{i}_gnorm"],
                 out_w=w[f"l{i}_out_proj_w"].t(),
             )
@@ -815,21 +831,38 @@ class DecodeTarget:
                     xbc, conv_state, L.conv_w, L.conv_b, True, None, si, _PAD_SLOT_ID
                 )
                 y = torch.empty([num_tokens, heads, hd], dtype=h.dtype, device=h.device)
-                selective_state_update(
-                    ssm_state,
-                    xbc[:, :din].reshape(num_tokens, heads, hd),
-                    dt[:, :, None].expand(num_tokens, heads, hd),
-                    L.A_hd,
-                    xbc[:, din : din + gn].reshape(num_tokens, groups, st),
-                    xbc[:, din + gn :].reshape(num_tokens, groups, st),
-                    D=L.D_hd,
-                    z=None,
-                    dt_bias=L.dt_bias_hd,
-                    dt_softplus=True,
-                    state_batch_indices=si,
-                    pad_slot_id=_PAD_SLOT_ID,
-                    out=y,
-                )
+                if num_tokens >= _FI_SSU_MIN_ROWS:
+                    flashinfer_selective_state_update(
+                        ssm_state,
+                        xbc[:, :din].reshape(num_tokens, heads, hd),
+                        dt[:, :, None].expand(num_tokens, heads, hd),
+                        L.A_hd,
+                        xbc[:, din : din + gn].reshape(num_tokens, groups, st),
+                        xbc[:, din + gn :].reshape(num_tokens, groups, st),
+                        D=L.D_hd16,
+                        z=None,
+                        dt_bias=L.dt_bias_hd16,
+                        dt_softplus=True,
+                        state_batch_indices=si,
+                        pad_slot_id=_PAD_SLOT_ID,
+                        out=y,
+                    )
+                else:
+                    selective_state_update(
+                        ssm_state,
+                        xbc[:, :din].reshape(num_tokens, heads, hd),
+                        dt[:, :, None].expand(num_tokens, heads, hd),
+                        L.A_hd,
+                        xbc[:, din : din + gn].reshape(num_tokens, groups, st),
+                        xbc[:, din + gn :].reshape(num_tokens, groups, st),
+                        D=L.D_hd,
+                        z=None,
+                        dt_bias=L.dt_bias_hd,
+                        dt_softplus=True,
+                        state_batch_indices=si,
+                        pad_slot_id=_PAD_SLOT_ID,
+                        out=y,
+                    )
                 yn = rms_norm_gated_grouped(
                     y.reshape(num_tokens, din), z, L.gnorm, eps, d.norm_group
                 )
