@@ -36,6 +36,13 @@ def _make_inputs(
     return x, weight, freqs
 
 
+def _with_row_padding(x: torch.Tensor, padding: int = 128) -> torch.Tensor:
+    storage = torch.empty((*x.shape[:-1], x.shape[-1] + padding), device=x.device, dtype=x.dtype)
+    padded = storage[..., : x.shape[-1]]
+    padded.copy_(x)
+    return padded
+
+
 def _reference(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -199,20 +206,45 @@ def test_fused_dspark_rmsnorm_rope_cuda_graph_replay():
     torch.testing.assert_close(captured, expected, rtol=2e-2, atol=2e-2)
 
 
-def test_fused_dspark_rmsnorm_rope_compiles_once_across_batches():
+def test_fused_dspark_rmsnorm_rope_compiles_once_per_row_layout_across_batches():
     from tensorrt_llm._torch.custom_ops.dspark_rmsnorm_rope_custom_op import (
         _compile_fused_dspark_rmsnorm_rope,
         cute_dsl_dspark_rmsnorm_rope,
     )
 
     _compile_fused_dspark_rmsnorm_rope.cache_clear()
-    for batch in (1, 3):
+    for batch, padded in ((1, False), (3, False), (2, True), (4, True)):
         inputs = _make_inputs(batch, 5, 512, 64, 1, seed=batch)
+        if padded:
+            inputs = (_with_row_padding(inputs[0]), *inputs[1:])
         cute_dsl_dspark_rmsnorm_rope(*inputs, 1, 64, 1e-6, True, True, False)
 
+    # Compact rows and row-strided views compile separately; neither recompiles
+    # when the batch changes.
     cache_info = _compile_fused_dspark_rmsnorm_rope.cache_info()
-    assert cache_info.misses == 1
-    assert cache_info.hits == 1
+    assert cache_info.misses == 2
+    assert cache_info.hits == 2
+
+
+def test_fused_dspark_rmsnorm_rope_row_strided_matches_compact_bitwise() -> None:
+    from tensorrt_llm._torch.custom_ops.dspark_rmsnorm_rope_custom_op import (
+        cute_dsl_dspark_rmsnorm_rope,
+    )
+
+    x, weight, freqs = _make_inputs(3, 5, 512, 64, 1, seed=6)
+    args = (1, 64, 1e-6, True, True, False)
+    # Rows that are column slices of wider rows, like a slice of a fused GEMM output.
+    wide = torch.randn(3, 5, 512 + 64, device="cuda", dtype=torch.bfloat16)
+    strided = wide[..., 64:]
+    strided.copy_(x)
+
+    assert strided.stride(1) == 512 + 64
+    torch.testing.assert_close(
+        cute_dsl_dspark_rmsnorm_rope(strided, weight, freqs, *args),
+        cute_dsl_dspark_rmsnorm_rope(x, weight, freqs, *args),
+        rtol=0,
+        atol=0,
+    )
 
 
 @pytest.mark.parametrize("split_norm", [False, True])
