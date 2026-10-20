@@ -1730,12 +1730,12 @@ class DeepseekV4MoE(nn.Module):
             int(load_balancer_config.auxiliary_sms) if self._per_layer_dynamic_eplb_enabled else 0
         )
         rebalance_backend = getattr(self.experts, "backend", self.experts)
-        # The fused shared kernel is part of the opt-in per-layer dynamic path. Ask
-        # the selected routed backend for the capability instead of naming a
-        # concrete implementation here.
+        # The fused shared FC1/activation/FC2 kernel comes with the routed MegaMoE
+        # backend; ask that backend for the capability instead of naming a concrete
+        # implementation here. Per-layer dynamic EPLB is not a condition, but the
+        # kernel runs only in eager mode, which that load balancer requires.
         use_fused_fc12 = (
-            self._per_layer_dynamic_eplb_enabled
-            and self._shared_fc12_backend_supported(rebalance_backend)
+            self._shared_fc12_backend_supported(rebalance_backend)
             and is_sm_100f()
             and self._shared_fc12_quantization_supported(gate_up_quant_config, down_quant_config)
             and not model_config.use_cuda_graph
