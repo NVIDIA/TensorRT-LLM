@@ -1903,13 +1903,25 @@ class MiniMaxM3VLInputProcessor:
         """Float [0, 1] tensors (media_io's ``pt`` format) as uint8 HWC arrays.
 
         The checkpoint's image and video processors rescale by 1/255
-        themselves, so a float [0, 1] input would be rescaled twice. uint8
-        tensors, arrays and PIL images pass through unchanged.
+        themselves, so a float [0, 1] input would be rescaled twice. The only
+        float layout accepted is the one media_io produces, ``[C, H, W]`` with
+        1 or 3 channels and values in [0, 1]; any other float input is
+        rejected rather than guessed at. uint8 tensors, arrays and PIL images
+        pass through unchanged.
         """
         if isinstance(media, torch.Tensor) and media.is_floating_point():
-            if media.dim() == 3 and media.shape[0] in (1, 3):
-                media = media.permute(1, 2, 0)
-            return (media.detach().cpu().clamp(0.0, 1.0) * 255.0).round().to(torch.uint8).numpy()
+            if media.dim() != 3 or media.shape[0] not in (1, 3):
+                raise ValueError(
+                    "MiniMax-M3 VL: float media must be a [C, H, W] tensor with 1 or 3 "
+                    f"channels (media_io's 'pt' format), got shape {tuple(media.shape)}."
+                )
+            media = media.detach().cpu()
+            if float(media.min()) < 0.0 or float(media.max()) > 1.0:
+                raise ValueError(
+                    "MiniMax-M3 VL: float media must be scaled to [0, 1]; pass uint8 data "
+                    "for [0, 255] values."
+                )
+            return (media.permute(1, 2, 0) * 255.0).round().to(torch.uint8).numpy()
         return media
 
     # ----- tokenized + MM fast-path hooks ---------------------------------

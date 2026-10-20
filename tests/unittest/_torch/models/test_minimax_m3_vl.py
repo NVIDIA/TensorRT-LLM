@@ -1797,6 +1797,65 @@ def test_real_checkpoint_processor_video_input_ids_match_trt_build_helper():
         assert oracle_input_ids[j] == video_token_id, (j, oracle_input_ids[j])
 
 
+def _real_checkpoint_input_processor():
+    """The registered input processor on the checkpoint's own tokenizer and HF processor."""
+    checkpoint = _checkpoint_path()
+    if not os.path.isdir(checkpoint):
+        pytest.skip(f"checkpoint not found: {checkpoint}")
+    pytest.importorskip("transformers")
+    config = AutoConfig.from_pretrained(checkpoint, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(checkpoint, trust_remote_code=True)
+    cls = get_minimax_m3_vl_input_processor_cls()
+    return cls(model_path=checkpoint, config=config, tokenizer=tokenizer), tokenizer
+
+
+@pytest.mark.parametrize("num_frames,side", [(3, 230), (4, 224), (7, 300)])
+def test_real_checkpoint_video_fast_path_matches_processor_input_ids(num_frames: int, side: int):
+    """The token-ID fast path expands a video exactly as the checkpoint's processor does.
+
+    The same frames go through the text-prompt path (the HF processor writes
+    ``input_ids`` itself) and the token-ID path (``expand_prompt_token_ids_for_mm``
+    derives the bracket count from the frame count); the two id sequences must
+    match token for token, with one ``VISION_START`` bracket per temporal patch
+    of the processor's ``video_grid_thw``. Odd and even frame counts cover the
+    last-frame padding, and the frame sides are not multiples of the patch
+    size, so the processor's resize is on the path.
+    """
+    proc, tokenizer = _real_checkpoint_input_processor()
+    rng = np.random.default_rng(num_frames)
+    frames = [rng.integers(0, 256, size=(side, side, 3), dtype=np.uint8) for _ in range(num_frames)]
+    prompt = "Watch: ]<]video[>[ then summarize."
+    sampling = SimpleNamespace(add_special_tokens=False, truncate_prompt_tokens=None)
+
+    slow_ids, slow_extra = proc.call_with_text_prompt(
+        {"prompt": prompt, "multi_modal_data": {"video": [frames]}, "chat_template_applied": True},
+        sampling,
+    )
+    fast_ids, fast_extra = proc.call_with_token_ids(
+        {
+            "prompt_token_ids": tokenizer.encode(prompt, add_special_tokens=False),
+            "multi_modal_data": {"video": [frames]},
+        },
+        sampling,
+    )
+
+    # The processor may prepend special tokens of its own; everything after them must match.
+    prefix = slow_ids[: len(slow_ids) - len(fast_ids)]
+    assert all(t in tokenizer.all_special_ids for t in prefix), prefix
+    assert slow_ids[len(prefix) :] == fast_ids
+
+    grid = torch.as_tensor(slow_extra["multimodal_data"]["video"]["video_grid_thw"]).reshape(-1, 3)
+    temporal = int(proc.processor.video_processor.temporal_patch_size)
+    brackets = -(-num_frames // temporal)
+    assert int(grid[0, 0]) == brackets
+    vs_id = tokenizer.convert_tokens_to_ids("]<]start of image[>[")
+    assert fast_ids.count(vs_id) == brackets
+    assert torch.equal(
+        grid,
+        torch.as_tensor(fast_extra["multimodal_data"]["video"]["video_grid_thw"]).reshape(-1, 3),
+    )
+
+
 @pytest.mark.gpu
 @pytest.mark.skipif(not _has_cuda(), reason="processor parity smoke needs CUDA")
 def test_real_checkpoint_processor_full_pipeline_merge_and_pad_parity():
@@ -2698,6 +2757,31 @@ def test_float_tensor_media_reach_the_processor_as_uint8_hwc(monkeypatch):
     for frame in video_frames:
         assert isinstance(frame, np.ndarray) and frame.dtype == np.uint8
         np.testing.assert_array_equal(frame, array)
+
+
+@pytest.mark.cpu_only
+def test_float_media_outside_the_pt_contract_is_rejected(monkeypatch):
+    """Only ``[C, H, W]`` float tensors in [0, 1] are converted; anything else fails loudly.
+
+    An HWC float image or a float tensor holding [0, 255] values would be
+    converted silently into a garbage image, so both are rejected.
+    """
+    proc, _ = _tokenizer_only_processor(monkeypatch, _MediaRecordingProcessor())
+    hwc = torch.rand(28, 42, 3)
+    with pytest.raises(ValueError, match=r"\[C, H, W\] tensor with 1 or 3 channels"):
+        proc.call_with_text_prompt(
+            {"prompt": "look", "multi_modal_data": {"image": [hwc]}}, SimpleNamespace()
+        )
+    unscaled = torch.rand(3, 28, 42) * 255.0
+    with pytest.raises(ValueError, match=r"scaled to \[0, 1\]"):
+        proc.call_with_text_prompt(
+            {"prompt": "look", "multi_modal_data": {"image": [unscaled]}}, SimpleNamespace()
+        )
+    with pytest.raises(ValueError, match=r"\[C, H, W\] tensor"):
+        proc.call_with_text_prompt(
+            {"prompt": "watch", "multi_modal_data": {"video": [[torch.rand(3, 3, 28, 42)]]}},
+            SimpleNamespace(),
+        )
 
 
 @pytest.mark.cpu_only

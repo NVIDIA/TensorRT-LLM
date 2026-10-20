@@ -3183,6 +3183,10 @@ class MiniMaxM3VLForConditionalGeneration(MiniMaxM3ForCausalLM):
                 # A request whose placeholder rows are all cached or beyond
                 # this chunk needs no vision forward; dropping it here keeps
                 # the tower calls and the embedding rows to the active params.
+                # This skip must stay ahead of the append: ``find_input_mm_embeds``
+                # below advances its row cursor once per entry of
+                # ``mm_params_with_data``, so the list that feeds the vision
+                # tower has to be the list whose rows it slices.
                 runtime = getattr(param, "multimodal_runtime", None)
                 if runtime is not None and runtime.num_mm_tokens_in_chunk == 0:
                     continue

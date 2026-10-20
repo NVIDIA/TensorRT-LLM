@@ -43,6 +43,10 @@ l0_b200:
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_unfused_index_projection_tp_construction
   - unittest/_torch/models/test_minimax_m3.py::test_horizontal_producer_explicit_caches_match_manager
   - unittest/_torch/models/test_minimax_m3.py::test_nvfp4_reload_preserves_attention_scale_storage[cuda]
+  # MiniMax-M3 VL checkpoint-backed processor parity (the CPU stage's -m cpu_only leaves these out)
+  - unittest/_torch/models/test_minimax_m3_vl.py::test_real_checkpoint_processor_input_ids_match_trt_build_helper
+  - unittest/_torch/models/test_minimax_m3_vl.py::test_real_checkpoint_processor_video_input_ids_match_trt_build_helper
+  - unittest/_torch/models/test_minimax_m3_vl.py::test_real_checkpoint_video_fast_path_matches_processor_input_ids
   - unittest/others/test_kv_cache_transceiver.py::test_cpp_nixl_sync_transfer_stress
   - unittest/others/test_lora_manager.py
   - accuracy/test_llm_api_pytorch.py::TestLagunaXS::test_nvfp4
