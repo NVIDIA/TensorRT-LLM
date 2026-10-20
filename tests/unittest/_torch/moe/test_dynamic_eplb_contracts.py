@@ -247,7 +247,7 @@ def test_hierarchical_fused_submit_launches_bound_scheduler_and_copy():
     broadcast_cls = _extract_class(
         source,
         "HierarchicalSamiWeightBroadcast",
-        {"submit_fused", "_require_live_bank_reusable"},
+        {"submit_fused", "_require_live_bank_reusable", "mark_collective_reuse_safe"},
         {
             "torch": torch,
             "HierarchicalCopyTicket": ticket_cls,
@@ -267,8 +267,14 @@ def test_hierarchical_fused_submit_launches_bound_scheduler_and_copy():
     broadcast._handoff_aborted = False
     broadcast._outputs = outputs
     broadcast._scheduler = SimpleNamespace(fused_submit_args=fused_submit_args)
-    broadcast._reuse_authority = object()
-    broadcast._validate_reuse_authority = lambda authority: None
+    authority = object()
+    broadcast._reuse_authority = authority
+
+    def revalidate(_authority):
+        raise AssertionError("the bound authority was validated when it was bound")
+
+    # The per-layer path checks the bound authority by identity only.
+    broadcast._validate_reuse_authority = revalidate
     broadcast._active_generation = 0
     broadcast._collective_safe_generation = 0
     broadcast._generation = 1
@@ -293,6 +299,18 @@ def test_hierarchical_fused_submit_launches_bound_scheduler_and_copy():
         broadcast.submit_fused(outputs, "routes", "epoch", 16, spin_cycles=12345)
     with pytest.raises(RuntimeError, match="bound CUDA scheduler"):
         broadcast.submit_fused(object(), "routes", "epoch", 16, spin_cycles=12345)
+
+    # Only the bound authority, after the local consumer release, frees the bank.
+    with pytest.raises(PermissionError, match="identity mismatch"):
+        broadcast.mark_collective_reuse_safe(object(), 1)
+    broadcast._local_release_generation = 0
+    with pytest.raises(RuntimeError, match="local consumer release"):
+        broadcast.mark_collective_reuse_safe(authority, 1)
+    broadcast._local_release_generation = 1
+    broadcast.mark_collective_reuse_safe(authority, 1)
+    assert broadcast._collective_safe_generation == 1
+    ticket = broadcast.submit_fused(outputs, "routes", "epoch", 16, spin_cycles=12345)
+    assert ticket.generation == 2
 
 
 @pytest.mark.parametrize(

@@ -16,6 +16,7 @@ from typing import Any, Callable, Optional, Sequence
 
 import torch
 
+from .impl_contract import MoEReplicaPlan
 from .moe_load_balancer import BaseMoeLoadBalancer
 
 
@@ -300,8 +301,6 @@ class PerLayerDynamicMoeLayerLoadBalancer:
             physical, generation = self._scheduler_group.plan_finish(part, defer_wait=True)
         generation = int(generation)
         self._arena.publish_ready_generation(generation)
-
-        from .impl_contract import MoEReplicaPlan
 
         plan = MoEReplicaPlan(
             resident_experts_per_rank=self.resident_experts_per_rank,
