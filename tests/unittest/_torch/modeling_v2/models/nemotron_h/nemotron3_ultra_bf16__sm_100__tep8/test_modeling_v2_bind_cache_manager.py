@@ -42,7 +42,11 @@ def _bind(kv=DataType.BF16, conv=torch.bfloat16, ssm=torch.float32):
     md = SimpleNamespace(
         kv_cache_manager=cm, effective_beam_width=1, cache_indirection=None, is_cross=False
     )
-    core = SimpleNamespace(_binds=0, _bound=None, dims=_DIMS)
+    # Rank 1: the method logs the pools' depth on rank 0 only.
+    mapping = SimpleNamespace(rank=1)
+    core = SimpleNamespace(
+        _binds=0, _bound=None, dims=_DIMS, model_config=SimpleNamespace(mapping=mapping)
+    )
     M.NemotronUltraBf16Tep8ModelingV2._bind_cache_manager(core, md)
     return core, cm
 

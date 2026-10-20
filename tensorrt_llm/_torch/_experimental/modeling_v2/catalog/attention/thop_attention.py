@@ -134,6 +134,8 @@ _ULTRA_BF16_8_1_128 = dict(
 #: The 32 histories of the batch-32 decode cells: every one past its first page,
 #: from 33 (one row into the second page) up to 512, with page fills that differ.
 _ULTRA_DECODE_HISTORIES = tuple(33 + (i * 97) % 480 for i in range(32))
+#: 256 decode rows (the tep8 target's serving envelope), histories 33..1500.
+_ULTRA_DECODE_HISTORIES_256 = tuple(33 + (i * 97) % 1468 for i in range(256))
 
 
 class ThopAttention(OpWrapper):
@@ -621,6 +623,20 @@ class ThopAttention(OpWrapper):
                 _ULTRA_BF16_8_1_128,
                 cached=_ULTRA_DECODE_HISTORIES,
                 new=(1,) * 32,
+                num_contexts=0,
+                predicted_tokens_per_seq=1,
+            ),
+        ),
+        Cell(
+            why="nemotron_h ultra BF16 tep8 decode, batch 256, the serving envelope's CUDA-graph "
+            "ceiling: histories 33..1500, every one past its first page",
+            spec=dict(
+                _ULTRA_BF16_8_1_128,
+                # 256 sequences of up to 47 pages: 6257 pages in all.
+                max_num_requests=256,
+                num_blocks=6400,
+                cached=_ULTRA_DECODE_HISTORIES_256,
+                new=(1,) * 256,
                 num_contexts=0,
                 predicted_tokens_per_seq=1,
             ),

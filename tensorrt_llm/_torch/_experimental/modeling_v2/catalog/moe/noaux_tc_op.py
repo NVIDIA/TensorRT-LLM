@@ -177,6 +177,21 @@ class NoauxTcOp(OpWrapper):
             ),
         ),
         Cell(
+            why="layer 107's BF16-release bias at 256 tokens, the tep8 serving envelope's "
+            "decode ceiling and the last row count the small-batch top-k serves",
+            spec=dict(
+                tokens=256,
+                experts=512,
+                n_group=1,
+                topk_group=1,
+                topk=22,
+                scale=5.0,
+                logits_dtype=torch.float32,
+                logit_std=1.3,
+                bias=("checkpoint", 107, "bf16"),
+            ),
+        ),
+        Cell(
             why="layer 107's bias in the BF16 release (37.83 to 38.18, 394 levels) on the "
             "decode path, where the fp32 add keeps the score only to 2^-18",
             spec=dict(

@@ -100,6 +100,24 @@ class CublasMm(OpWrapper):
                 (8192, ", a max_num_tokens prefill step"),
             )
         ),
+        # ... and at 256 rows, the tep8 target's serving envelope (decode graphs up to 256
+        # rows), with the rank-count-independent shapes beside them.
+        *(
+            Cell(
+                why=f"nemotron_h BF16 tep8 {what}, T=256, the serving envelope's decode ceiling",
+                spec=dict(m=256, k=k, n=n, dtype=torch.bfloat16, bias=False, out_dtype=out_dtype),
+            )
+            for what, k, n, out_dtype in (
+                ("mamba in_proj", 8192, 4384, None),
+                ("qkv", 8192, 1280, None),
+                ("o_proj", 1024, 8192, None),
+                ("shared up", 8192, 1280, None),
+                ("shared down", 1280, 8192, None),
+                ("fc1_latent", 8192, 2048, None),
+                ("fc2_latent / mamba out_proj", 2048, 8192, None),
+                ("router", 8192, 512, torch.float32),
+            )
+        ),
         # nemotron_h's Ultra at dep4: attention is replicated, so a rank runs the
         # unsharded qkv and o_proj over its own tokens.
         *(

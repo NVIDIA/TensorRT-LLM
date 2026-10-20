@@ -27,6 +27,10 @@ TEP8_NHEADS, TEP8_NGROUPS = 32, 1
 #: slot stride 48 * 256 * 64 * 128 -- slots from 22 on lie past 2^31 elements.
 ENGINE_SLOTS = 35
 ENGINE_SLOT_LAYERS = 48
+#: The same pool at max_batch_size 256, the tep8 target's serving envelope: 271 slots. At tep8's
+#: fp32 state a layer's view `[271, 32, 64, 128]` has slot stride 48 * 32 * 64 * 128 = 12.6M
+#: elements, so the slots from 171 on lie past 2^31 elements of the base.
+TEP8_ENGINE_SLOTS_256 = 271
 #: A pool deep enough that its last slot sits past 2^31 elements from the base:
 #: 90 * 48 * 64 * 64 * 128 > 2^31.
 DEEP_SLOTS = 90
@@ -190,6 +194,23 @@ class SelectiveStateUpdate(OpWrapper):
         Cell(
             why="tep8 pad_slot_id -1 rows: pool untouched, out still written",
             spec=dict(_TEP8, batch=7, pads=(1, 4)),
+        ),
+        Cell(
+            why="tep8 decode batch 256, the serving envelope's ceiling: the engine's 271-slot "
+            "fp32 pool, whose slots from 171 on lie past 2^31 elements",
+            spec=dict(
+                _TEP8, batch=256, pool_slots=TEP8_ENGINE_SLOTS_256, pool_layers=ENGINE_SLOT_LAYERS
+            ),
+        ),
+        Cell(
+            why="tep8 decode batch 1 into the 271-slot fp32 pool's last slot, past 2^31 elements",
+            spec=dict(
+                _TEP8,
+                batch=1,
+                pool_slots=TEP8_ENGINE_SLOTS_256,
+                pool_layers=ENGINE_SLOT_LAYERS,
+                slots=(TEP8_ENGINE_SLOTS_256 - 1,),
+            ),
         ),
     )
 

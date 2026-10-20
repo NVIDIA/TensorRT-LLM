@@ -28,6 +28,9 @@ CHUNK_SIZE = 128
 #: slot stride 48 * 256 * 64 * 128 -- slots from 22 on lie past 2^31 elements.
 ENGINE_SLOTS = 35
 ENGINE_SLOT_LAYERS = 48
+#: The same pool at max_batch_size 256, the tep8 target's serving envelope: 271 slots, those
+#: from 171 on past 2^31 elements of tep8's fp32 state (slot stride 48 * 32 * 64 * 128).
+TEP8_ENGINE_SLOTS_256 = 271
 
 _LENGTHS_32 = tuple(1 + (i * 37) % 300 for i in range(32))
 _DEP4 = dict(nheads=DEP4_NHEADS, ngroups=DEP4_NGROUPS)
@@ -172,6 +175,19 @@ class MambaChunkScanCombined(OpWrapper):
                 lengths=_LENGTHS_32,
                 initial=tuple(i % 3 != 0 for i in range(32)),
                 pool_slots=ENGINE_SLOTS,
+                pool_layers=ENGINE_SLOT_LAYERS,
+                pool_dtype=torch.float32,
+            ),
+        ),
+        Cell(
+            why="tep8: 256 rows (the serving envelope's batch ceiling) of up to 32 tokens at the "
+            "engine's 271-slot x 48-layer fp32 pool, whose slots from 171 on lie past 2^31 "
+            "elements",
+            spec=dict(
+                _TEP8,
+                lengths=tuple(1 + (i * 13) % 32 for i in range(256)),
+                initial=tuple(i % 3 != 0 for i in range(256)),
+                pool_slots=TEP8_ENGINE_SLOTS_256,
                 pool_layers=ENGINE_SLOT_LAYERS,
                 pool_dtype=torch.float32,
             ),

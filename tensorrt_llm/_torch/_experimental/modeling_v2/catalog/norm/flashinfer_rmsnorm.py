@@ -64,6 +64,10 @@ class FlashinferRmsnorm(OpWrapper):
             spec=dict(shape=(32, 8192), dtype=torch.bfloat16, eps=1e-5),
         ),
         Cell(
+            why="nemotron_h hidden 8192 at T=256, the tep8 serving envelope's decode ceiling",
+            spec=dict(shape=(256, 8192), dtype=torch.bfloat16, eps=1e-5),
+        ),
+        Cell(
             why="nemotron_h hidden 8192 at T=8192, a max_num_tokens prefill step",
             spec=dict(shape=(8192, 8192), dtype=torch.bfloat16, eps=1e-5),
         ),

@@ -379,6 +379,14 @@ class NemotronUltraBf16Tep8ModelingV2(DecoderModel):
         assert c0.dtype == torch.bfloat16 and s0.dtype == torch.float32, (
             f"conv state {c0.dtype} / ssm state {s0.dtype}: this target needs bf16 / fp32"
         )
+        # The pool depth follows max_batch_size, and with it the largest slot offset the state
+        # kernels index: past 2^31 elements from about 171 slots of this fp32 state on.
+        if self.model_config.mapping.rank == 0:
+            logger.info(
+                f"nemotron3_ultra_bf16__sm_100__tep8: recurrent-state pools of {s0.shape[0]} "
+                f"slots, ssm slot stride {s0.stride(0)} elements ({s0.dtype}), conv slot stride "
+                f"{c0.stride(0)} ({c0.dtype})"
+            )
         assert md.effective_beam_width == 1, "beam search is not implemented"
         assert md.cache_indirection is None, "beam search is not implemented"
         assert not md.is_cross, "cross attention is not implemented"

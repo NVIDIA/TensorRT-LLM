@@ -126,6 +126,14 @@ class FusedMoe(OpWrapper):
             spec=dict(**_ULTRA, num_tokens=32, ep_rank=7),
         ),
         Cell(
+            why="Ultra tep8 decode at the serving envelope's ceiling, 256 rows, rank 0",
+            spec=dict(**_ULTRA, num_tokens=256, ep_rank=0),
+        ),
+        Cell(
+            why="Ultra tep8 decode at the serving envelope's ceiling, 256 rows, rank 7",
+            spec=dict(**_ULTRA, num_tokens=256, ep_rank=7),
+        ),
+        Cell(
             why="Ultra prefill chunk, 300 rows, rank 0: a mid-width FC1 token tile",
             spec=dict(**_ULTRA, num_tokens=300, ep_rank=0),
         ),

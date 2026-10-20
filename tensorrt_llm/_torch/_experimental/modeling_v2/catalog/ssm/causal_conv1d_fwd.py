@@ -51,6 +51,8 @@ ULTRA_DEP4_XBC_OFFSET = 16384
 ULTRA_TEP8_DIM = 2304
 ULTRA_TEP8_PROJ_WIDTH = 4384
 ULTRA_TEP8_XBC_OFFSET = 2048
+#: The engine's pool at max_batch_size 256, the tep8 target's serving envelope: 271 slots.
+ULTRA_TEP8_SLOTS_256 = 271
 
 
 def _engine_batch_slots() -> tuple[int, ...]:
@@ -59,6 +61,15 @@ def _engine_batch_slots() -> tuple[int, ...]:
         (i * 13 + 5) % (QWEN4_EXP_SLOTS - 2) + 1 for i in range(30)
     )
     assert len(set(slots)) == 32
+    return slots
+
+
+def _ultra256_batch_slots() -> tuple[int, ...]:
+    """256 distinct, scattered slots of the 271-slot pool, slot 0 and the last included."""
+    slots = (0, ULTRA_TEP8_SLOTS_256 - 1) + tuple(
+        (i * 7 + 3) % (ULTRA_TEP8_SLOTS_256 - 2) + 1 for i in range(254)
+    )
+    assert len(set(slots)) == 256
     return slots
 
 
@@ -274,6 +285,17 @@ class CausalConv1dFwd(OpWrapper):
                     lengths=tuple(1 + (i * 37) % 255 for i in range(32)),
                     slots=_ultra_batch_slots(),
                     initial=tuple(i % 3 != 0 for i in range(32)),
+                ),
+            ),
+            Cell(
+                why="Mamba2 tep8: 256 sequences (the serving envelope's batch ceiling) of up to "
+                "32 tokens, one 8192-token step, over the 271-slot pool",
+                spec=dict(
+                    _ULTRA_TEP8,
+                    lengths=tuple(1 + (i * 13) % 32 for i in range(256)),
+                    pool_slots=ULTRA_TEP8_SLOTS_256,
+                    slots=_ultra256_batch_slots(),
+                    initial=tuple(i % 3 != 0 for i in range(256)),
                 ),
             ),
             Cell(

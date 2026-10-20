@@ -308,6 +308,13 @@ What differs from the NVFP4 target:
 * TP8 geometry per rank: 8 query heads over one kv head (each of the 2 kv heads is
   replicated on four ranks), 32 mamba heads in the rank's single group, a 1280-wide
   slice of the shared expert, 64 of the 512 experts.
+* The serving envelope is `max_batch_size` 256: decode graphs up to 256 rows, and an
+  engine recurrent-state pool of 271 slots (35 at `max_batch_size` 32; the target logs
+  the depth when it binds the pools). One slot holds the 48 Mamba layers side by side,
+  so a layer's fp32 SSM view has slot stride 48 * 32 * 64 * 128 = 12.6M elements and
+  the slots from 171 on lie past 2^31 elements. Every batch-dependent entry the target
+  calls carries cells at 256 rows, the SSM entries at that pool's last slot, and the
+  accuracy gate runs at `max_batch_size` 256.
 * The all-reduce is `AUTO` inside one node (the IPC one-shot / two-shot kernels for
   decode-sized payloads, NCCL for large ones). Across nodes the IPC workspace has no
   peers, so on an NVL72-class system (aarch64, fabric handles) the target uses the MNNVL

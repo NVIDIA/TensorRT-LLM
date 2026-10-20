@@ -9,6 +9,7 @@ import torch
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.ssm.causal_conv1d_update import (
     QWEN4_EXP_SLOTS,
+    ULTRA_TEP8_SLOTS_256,
     ULTRA_TP4_SLOTS,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.ssm.causal_conv1d_update import (
@@ -165,7 +166,7 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — pytest res
         named = named[:real]
     else:
         _compare((returned, state), (ref_x, ref_state))
-    if spec["pool_slots"] in (QWEN4_EXP_SLOTS, ULTRA_TP4_SLOTS):
+    if spec["pool_slots"] in (QWEN4_EXP_SLOTS, ULTRA_TP4_SLOTS, ULTRA_TEP8_SLOTS_256):
         # Non-vacuity for the engine-sized pools: every named slot moved.
         for slot in named:
             assert not torch.equal(state[slot], args[1][slot]), slot

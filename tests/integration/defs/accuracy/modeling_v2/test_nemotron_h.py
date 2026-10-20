@@ -132,8 +132,10 @@ class TestModelingV2Nemotron3UltraBf16Sm100Tep8(LlmapiAccuracyTestHarness):
         # KV). Block reuse is off and the fraction applies to what is left after about
         # 128 GiB of weights on each 185 GiB GPU. The target checks its step contract on
         # the first forward; it travels as ``env_overrides`` because the check runs where
-        # the metadata does.
-        max_batch_size = 32
+        # the metadata does. The batch ceiling is the target's serving envelope: decode
+        # graphs up to 256 rows, and a recurrent-state pool deep enough that its last slots
+        # lie past 2^31 elements of the fp32 state.
+        max_batch_size = 256
         with LLM(
             self.MODEL_PATH,
             modeling_v2="require",

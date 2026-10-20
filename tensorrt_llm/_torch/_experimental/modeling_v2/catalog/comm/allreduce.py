@@ -111,8 +111,15 @@ class Allreduce(OpWrapper):
             "ONESHOT, decode: 1 row over the IPC workspace", 1, AllReduceStrategy.ONESHOT, "oneshot"
         ),
         _cell("ONESHOT, decode batch: 32 rows", 32, AllReduceStrategy.ONESHOT, "oneshot"),
+        _cell(
+            "ONESHOT, tep8 decode at its 256-row envelope ceiling",
+            256,
+            AllReduceStrategy.ONESHOT,
+            "oneshot",
+        ),
         _cell("AUTO at 1 row: its table picks ONESHOT", 1, AllReduceStrategy.AUTO, "oneshot"),
         _cell("AUTO at 32 rows: its table picks ONESHOT", 32, AllReduceStrategy.AUTO, "oneshot"),
+        _cell("AUTO at 256 rows: its table picks ONESHOT", 256, AllReduceStrategy.AUTO, "oneshot"),
         _cell(
             "AUTO at 2048 rows: its table picks TWOSHOT", 2048, AllReduceStrategy.AUTO, "twoshot"
         ),

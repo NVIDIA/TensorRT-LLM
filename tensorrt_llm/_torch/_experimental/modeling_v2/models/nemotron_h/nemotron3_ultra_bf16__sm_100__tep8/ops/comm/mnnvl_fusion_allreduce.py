@@ -61,7 +61,8 @@ class MnnvlFusionAllreduce(OpWrapper):
     ARCHS = frozenset({Arch.SM_100})
 
     # The row counts a target calls it with: one decode token, the decode batch sizes the CUDA
-    # graphs capture up to the 32-row ceiling, and prefill chunks up to the 8192-token step. The
+    # graphs capture up to the serving envelope's 256-row ceiling, and prefill chunks up to the
+    # 8192-token step. The
     # one-shot / two-shot boundary moves with the group size (8 rows at 8 ranks, 16 at 4), so
     # the cells name the rows on both sides of both boundaries and the test derives the kernel
     # from the world size it runs at.
@@ -71,7 +72,8 @@ class MnnvlFusionAllreduce(OpWrapper):
         _cell("the first two-shot row count at 8 ranks (one-shot at 4)", 9),
         _cell("the last one-shot row count at 4 ranks", 16),
         _cell("the first two-shot row count at 4 ranks", 17),
-        _cell("the decode CUDA-graph ceiling: 32 rows", 32),
+        _cell("the decode CUDA-graph ceiling at max_batch_size 32: 32 rows", 32),
+        _cell("the serving envelope's decode ceiling: 256 rows", 256),
         _cell("a mid prefill chunk: 300 rows", 300),
         _cell("a prefill chunk: 2048 rows", 2048),
         _cell("the engine's token ceiling: 8192 rows, the workspace's largest growth", 8192),

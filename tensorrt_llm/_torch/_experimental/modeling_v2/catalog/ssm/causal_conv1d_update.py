@@ -47,6 +47,8 @@ ULTRA_DEP4_XBC_OFFSET = 16384
 ULTRA_TEP8_DIM = 2304
 ULTRA_TEP8_PROJ_WIDTH = 4384
 ULTRA_TEP8_XBC_OFFSET = 2048
+#: The engine's pool at max_batch_size 256, the tep8 target's serving envelope: 271 slots.
+ULTRA_TEP8_SLOTS_256 = 271
 
 
 def _pinned(batch: int) -> tuple[int, ...]:
@@ -62,6 +64,14 @@ def _ultra_pinned(batch: int) -> tuple[int, ...]:
         return (0,)
     middle = tuple(1 + (i * 7) % (ULTRA_TP4_SLOTS - 2) for i in range(1, batch - 1))
     slots = (0,) + middle + (ULTRA_TP4_SLOTS - 1,)
+    assert len(set(slots)) == batch
+    return slots
+
+
+def _ultra256_pinned(batch: int) -> tuple[int, ...]:
+    """`batch` distinct, scattered slots of the 271-slot pool, 0 and the last pinned in."""
+    middle = tuple(1 + (i * 7) % (ULTRA_TEP8_SLOTS_256 - 2) for i in range(1, batch - 1))
+    slots = (0,) + middle + (ULTRA_TEP8_SLOTS_256 - 1,)
     assert len(set(slots)) == batch
     return slots
 
@@ -208,6 +218,16 @@ class CausalConv1dUpdate(OpWrapper):
             Cell(
                 why="Mamba2 tep8 mixed batch: decode rows below 37 prefill rows",
                 spec=dict(_ULTRA_TEP8, batch=8, rows_ahead=37, slots=_ultra_pinned(8)),
+            ),
+            Cell(
+                why="Mamba2 tep8 decode batch 256, the serving envelope's ceiling: the engine's "
+                "271-slot pool",
+                spec=dict(
+                    _ULTRA_TEP8,
+                    batch=256,
+                    pool_slots=ULTRA_TEP8_SLOTS_256,
+                    slots=_ultra256_pinned(256),
+                ),
             ),
             Cell(
                 why="Mamba2 tep8 graph-padded batch: 3 padding rows share one dummy slot",
