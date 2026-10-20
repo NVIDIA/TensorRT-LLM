@@ -62,7 +62,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.23.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc0';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc1';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -73,13 +73,13 @@
     <link rel="index" title="Index" href="../genindex.html" />
     <link rel="search" title="Search" href="../search.html" />
     <link rel="next" title="Using Dev Containers" href="dev-containers.html" />
-    <link rel="prev" title="TensorRT LLM Benchmarking" href="perf-benchmarking.html" />
+    <link rel="prev" title="MoE Perf Dashboard" href="moe-perf-dashboard.html" />
 
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="color-scheme" content="light dark"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.4.0rc0" />
+  <meta name="docsearch:version" content="1.4.0rc1" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -444,6 +444,9 @@
 <li class="toctree-l1 has-children"><a class="reference internal" href="../llm-api/reference.html">API Reference</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/LLM.html">LLM</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/AsyncLLM.html">AsyncLLM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/ExecutorMemoryType.html">ExecutorMemoryType</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/RuntimeMemoryStatus.html">RuntimeMemoryStatus</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SleepConfig.html">SleepConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/MultimodalEncoder.html">MultimodalEncoder</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CompletionOutput.html">CompletionOutput</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/RequestOutput.html">RequestOutput</a></li>
@@ -533,6 +536,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../features/speculative-decoding.html">Speculative Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/checkpoint-loading.html">Checkpoint Loading</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/model-express.html">ModelExpress (MX) Checkpoint Loading</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/sleep-wakeup.html">Runtime Memory Checkpointing (Prototype)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/ray-orchestrator.html">Ray Orchestrator (Prototype)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/torch_compile_and_piecewise_cuda_graph.html">Torch Compile &amp; Prefill CUDA Graph</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/helix.html">Helix Parallelism</a></li>
@@ -551,6 +555,10 @@
 <li class="toctree-l1"><a class="reference internal" href="overview.html">Architecture Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="perf-analysis.html">Performance Analysis</a></li>
 <li class="toctree-l1"><a class="reference internal" href="perf-benchmarking.html">TensorRT LLM Benchmarking</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="moe-perf-guide.html">MoE Performance Guide</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="moe-perf-dashboard.html">MoE Perf Dashboard</a></li>
+</ul>
+</details></li>
 <li class="toctree-l1 current active"><a aria-current="page" class="current reference internal" href="#">Continuous Integration Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="dev-containers.html">Using Dev Containers</a></li>
 <li class="toctree-l1"><a class="reference internal" href="api-change.html">LLM API Change Guide</a></li>
@@ -562,6 +570,7 @@
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog30_KV_Cache_Compression_in_TensorRT-LLM.html">KV Cache Compression in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog29_GVR_V2_Self_Sampling_Exact_TopK_for_Sparse_Attention.html">GVR V2: Self-Sampling and Multi-Thresholding for Faster Exact Top-K</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog28_Accelerating_Video_Generation_with_GEMM_Quantization_Attention_Quantization_and_Skip_Softmax_Attention_in_TensorRT-LLM.html">Accelerating Video Generation with GEMM Quantization, Attention Quantization and Skip Softmax Attention in TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog27_Evaluating_Agentic_Serving_with_Trace_Replay_and_Job_Level_Metrics.html">Evaluating Agentic Serving with Trace Replay and Job-Level Metrics</a></li>
@@ -692,7 +701,7 @@ limitations under the License.
 </section>
 <section id="ci-pipelines">
 <h2>CI pipelines<a class="headerlink" href="#ci-pipelines" title="Link to this heading">#</a></h2>
-<p>Pull requests do not start testing by themselves. Developers trigger the CI by commenting <code class="docutils literal notranslate"><span class="pre">/bot</span> <span class="pre">run</span></code> (optionally with arguments) on the pull request (see <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/cc63e66/.github/pull_request_template.md">Pull Request Template</a> for more details). That kicks off the <strong>merge-request pipeline</strong> (defined in <code class="docutils literal notranslate"><span class="pre">jenkins/L0_MergeRequest.groovy</span></code>), which runs unit tests and integration tests whose YAML entries specify <code class="docutils literal notranslate"><span class="pre">stage:</span> <span class="pre">pre_merge</span></code>. Once a pull request is merged, a separate <strong>post-merge pipeline</strong> (defined in <code class="docutils literal notranslate"><span class="pre">jenkins/L0_Test.groovy</span></code>) runs every test marked <code class="docutils literal notranslate"><span class="pre">post_merge</span></code> across all supported GPU configurations.</p>
+<p>Pull requests do not start testing by themselves. Developers trigger the CI by commenting <code class="docutils literal notranslate"><span class="pre">/bot</span> <span class="pre">run</span></code> (optionally with arguments) on the pull request (see <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/0372799/.github/pull_request_template.md">Pull Request Template</a> for more details). That kicks off the <strong>merge-request pipeline</strong> (defined in <code class="docutils literal notranslate"><span class="pre">jenkins/L0_MergeRequest.groovy</span></code>), which runs unit tests and integration tests whose YAML entries specify <code class="docutils literal notranslate"><span class="pre">stage:</span> <span class="pre">pre_merge</span></code>. Once a pull request is merged, a separate <strong>post-merge pipeline</strong> (defined in <code class="docutils literal notranslate"><span class="pre">jenkins/L0_Test.groovy</span></code>) runs every test marked <code class="docutils literal notranslate"><span class="pre">post_merge</span></code> across all supported GPU configurations.</p>
 <p><code class="docutils literal notranslate"><span class="pre">stage</span></code> tags live in the YAML files under <code class="docutils literal notranslate"><span class="pre">tests/integration/test_lists/test-db/</span></code>. Searching those files for <code class="docutils literal notranslate"><span class="pre">stage:</span> <span class="pre">pre_merge</span></code> shows exactly which tests the merge-request pipeline covers.</p>
 </section>
 <section id="test-definitions">
@@ -843,12 +852,12 @@ behavior.</p>
                   
 <div class="prev-next-area">
     <a class="left-prev"
-       href="perf-benchmarking.html"
+       href="moe-perf-dashboard.html"
        title="previous page">
       <i class="fa-solid fa-angle-left"></i>
       <div class="prev-next-info">
         <p class="prev-next-subtitle">previous</p>
-        <p class="prev-next-title">TensorRT LLM Benchmarking</p>
+        <p class="prev-next-title">MoE Perf Dashboard</p>
       </div>
     </a>
     <a class="right-next"
@@ -988,9 +997,9 @@ behavior.</p>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on October 09, 2026.</p>
+  <p>Last updated on October 19, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/cc63e66">cc63e66</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/0372799">0372799</a>.</p>
   
 </div></div>
       

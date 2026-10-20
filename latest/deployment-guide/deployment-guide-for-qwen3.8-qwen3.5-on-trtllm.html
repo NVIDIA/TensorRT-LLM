@@ -62,7 +62,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.23.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc0';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc1';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -79,7 +79,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="color-scheme" content="light dark"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.4.0rc0" />
+  <meta name="docsearch:version" content="1.4.0rc1" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -444,6 +444,9 @@
 <li class="toctree-l1 has-children"><a class="reference internal" href="../llm-api/reference.html">API Reference</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/LLM.html">LLM</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/AsyncLLM.html">AsyncLLM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/ExecutorMemoryType.html">ExecutorMemoryType</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/RuntimeMemoryStatus.html">RuntimeMemoryStatus</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SleepConfig.html">SleepConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/MultimodalEncoder.html">MultimodalEncoder</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CompletionOutput.html">CompletionOutput</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/RequestOutput.html">RequestOutput</a></li>
@@ -533,6 +536,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../features/speculative-decoding.html">Speculative Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/checkpoint-loading.html">Checkpoint Loading</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/model-express.html">ModelExpress (MX) Checkpoint Loading</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/sleep-wakeup.html">Runtime Memory Checkpointing (Prototype)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/ray-orchestrator.html">Ray Orchestrator (Prototype)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/torch_compile_and_piecewise_cuda_graph.html">Torch Compile &amp; Prefill CUDA Graph</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/helix.html">Helix Parallelism</a></li>
@@ -551,6 +555,10 @@
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/overview.html">Architecture Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/perf-analysis.html">Performance Analysis</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/perf-benchmarking.html">TensorRT LLM Benchmarking</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../developer-guide/moe-perf-guide.html">MoE Performance Guide</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../developer-guide/moe-perf-dashboard.html">MoE Perf Dashboard</a></li>
+</ul>
+</details></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/ci-overview.html">Continuous Integration Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/dev-containers.html">Using Dev Containers</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/api-change.html">LLM API Change Guide</a></li>
@@ -562,6 +570,7 @@
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog30_KV_Cache_Compression_in_TensorRT-LLM.html">KV Cache Compression in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog29_GVR_V2_Self_Sampling_Exact_TopK_for_Sparse_Attention.html">GVR V2: Self-Sampling and Multi-Thresholding for Faster Exact Top-K</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog28_Accelerating_Video_Generation_with_GEMM_Quantization_Attention_Quantization_and_Skip_Softmax_Attention_in_TensorRT-LLM.html">Accelerating Video Generation with GEMM Quantization, Attention Quantization and Skip Softmax Attention in TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog27_Evaluating_Agentic_Serving_with_Trace_Replay_and_Job_Level_Metrics.html">Evaluating Agentic Serving with Trace Replay and Job-Level Metrics</a></li>
@@ -891,7 +900,7 @@
 -p<span class="w"> </span><span class="m">8000</span>:8000<span class="w"> </span><span class="se">\</span>
 -v<span class="w"> </span>~/.cache:/root/.cache:rw<span class="w"> </span><span class="se">\</span>
 --name<span class="w"> </span>tensorrt_llm<span class="w"> </span><span class="se">\</span>
-nvcr.io/nvidia/tensorrt-llm/release:1.4.0rc0<span class="w"> </span><span class="se">\</span>
+nvcr.io/nvidia/tensorrt-llm/release:1.4.0rc1<span class="w"> </span><span class="se">\</span>
 /bin/bash
 </pre></div>
 </div>
@@ -971,6 +980,356 @@ nvcr.io/nvidia/tensorrt-llm/release:1.4.0rc0<span class="w"> </span><span class=
 </div>
 <p>Qwen3.8 and Qwen3.5 both use the <code class="docutils literal notranslate"><span class="pre">qwen3_5</span></code> reasoning parser (their chat template pre-injects a <code class="docutils literal notranslate"><span class="pre">&lt;think&gt;</span></code> block, so reasoning starts at the beginning of the response). The <code class="docutils literal notranslate"><span class="pre">qwen3</span></code> tool parser handles the Qwen3 function-call format.</p>
 <p>After the server is set up, the client can now send prompt requests to the server and receive results.</p>
+</section>
+</section>
+<section id="qwen3-5-gb300-nvl72-agentic-disaggregated-serving">
+<h2>Qwen3.5 GB300 NVL72 Agentic Disaggregated Serving<a class="headerlink" href="#qwen3-5-gb300-nvl72-agentic-disaggregated-serving" title="Link to this heading">#</a></h2>
+<p>Use this profile for long, multi-turn <strong>text</strong> conversations with
+<code class="docutils literal notranslate"><span class="pre">nvidia/Qwen3.5-397B-A17B-NVFP4-V2</span></code> on GB300 NVL72. It separates prefill and
+decode, enables MTP with six draft tokens on decode, and offloads the KV cache
+to host memory. The earlier Qwen3.5 general-deployment profile and the Qwen3.8
+profiles above target different workloads and checkpoints.</p>
+<p>The serving settings come from <a class="reference external" href="https://github.com/SemiAnalysisAI/InferenceX/pull/4195">InferenceX #4195</a>
+at commit <code class="docutils literal notranslate"><span class="pre">76fde8ec76a8573c350b553f7c2583088bf6558f</span></code>. Its
+<a class="reference external" href="https://github.com/SemiAnalysisAI/InferenceX/actions/runs/39016296529">sweep</a>
+passed nine performance jobs and six applicable eval jobs. The performance
+jobs use synthetic speculative acceptance; these production commands leave
+acceptance to the model. Those throughput results do not establish production
+throughput with natural acceptance, or validate these Docker/MPI launch commands.</p>
+<section id="runtime-and-memory-requirements">
+<h3>Runtime and Memory Requirements<a class="headerlink" href="#runtime-and-memory-requirements" title="Link to this heading">#</a></h3>
+<p>Use the exact versions together:</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Component</p></th>
+<th class="head"><p>Version</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>TensorRT-LLM container</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">nvcr.io/nvidia/tensorrt-llm/release:1.3.0a0.dev202610151219</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">ai-dynamo</span></code> and <code class="docutils literal notranslate"><span class="pre">ai-dynamo-runtime</span></code> wheels</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">1.6.0.dev20261010</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p>Checkpoint</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">nvidia/Qwen3.5-397B-A17B-NVFP4-V2</span></code></p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>This is a development-container profile. Requalify the checkpoint, configuration,
+and transport together when upgrading. The configuration files added to this
+guide must come from your TensorRT-LLM checkout; they are not bundled in the older
+container listed above.</p>
+<p>The starting 1P1D profile uses three GPUs on one four-GPU GB300 node: one prefill
+GPU and two decode GPUs. Each rank reserves <strong>128 GiB of host KV cache</strong>
+(<code class="docutils literal notranslate"><span class="pre">host_cache_size:</span> <span class="pre">137438953472</span></code>), requiring 384 GiB for these caches on that
+node, plus memory for weights, loading, staging, and the operating system. The
+source system has 840 GiB of host memory per four-GPU node. A fully occupied
+four-rank node reserves 512 GiB for host KV cache. Check the remaining host-memory
+budget before increasing worker count or cache size.</p>
+<p>Use a GB300 NVL72 system with working GPU peer access and NIXL/UCX transport.
+For workers spanning nodes, the hosts must share the required NVLink fabric and
+have compatible MPI, drivers, networking, and container mounts. Have reachable
+etcd and NATS services before starting Dynamo; see the
+<a class="reference external" href="https://github.com/ai-dynamo/dynamo/blob/main/docs/fern/pages/cli/installation/install-dynamo.mdx">Dynamo CLI installation guide</a>.</p>
+</section>
+<section id="prepare-the-container">
+<h3>Prepare the Container<a class="headerlink" href="#prepare-the-container" title="Link to this heading">#</a></h3>
+<p>Download the exact V2 checkpoint into a local directory. Run the following from
+the TensorRT-LLM checkout, replacing <code class="docutils literal notranslate"><span class="pre">MODEL_DIR</span></code> with that directory:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nb">export</span><span class="w"> </span><span class="nv">MODEL_DIR</span><span class="o">=</span>/absolute/path/to/Qwen3.5-397B-A17B-NVFP4-V2
+docker<span class="w"> </span>run<span class="w"> </span>--rm<span class="w"> </span>-it<span class="w"> </span>--name<span class="w"> </span>qwen35-gb300<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--gpus<span class="w"> </span>all<span class="w"> </span>--network<span class="w"> </span>host<span class="w"> </span>--ipc<span class="w"> </span>host<span class="w"> </span>--ulimit<span class="w"> </span><span class="nv">memlock</span><span class="o">=</span>-1<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--mount<span class="w"> </span><span class="nv">type</span><span class="o">=</span>bind,src<span class="o">=</span><span class="s2">"</span><span class="nv">$MODEL_DIR</span><span class="s2">"</span>,dst<span class="o">=</span>/models/qwen35,readonly<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--mount<span class="w"> </span><span class="nv">type</span><span class="o">=</span>bind,src<span class="o">=</span><span class="s2">"</span><span class="nv">$PWD</span><span class="s2">"</span>,dst<span class="o">=</span>/opt/trtllm-recipes,readonly<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>nvcr.io/nvidia/tensorrt-llm/release:1.3.0a0.dev202610151219<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>/bin/bash
+</pre></div>
+</div>
+<p>Inside the container, install the matching public wheels:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python3<span class="w"> </span>-m<span class="w"> </span>pip<span class="w"> </span>install<span class="w"> </span>--pre<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--index-url<span class="w"> </span>https://pypi.org/simple<span class="w"> </span>--extra-index-url<span class="w"> </span>https://pypi.nvidia.com<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>ai-dynamo<span class="o">==</span><span class="m">1</span>.6.0.dev20261010<span class="w"> </span>ai-dynamo-runtime<span class="o">==</span><span class="m">1</span>.6.0.dev20261010
+python3<span class="w"> </span>-c<span class="w"> </span><span class="s1">'import importlib.metadata as m; print({p: m.version(p) for p in ("tensorrt-llm", "ai-dynamo", "ai-dynamo-runtime")})'</span>
+</pre></div>
+</div>
+<p>Open a shell in this container for each of the frontend, prefill, and decode
+commands below with <code class="docutils literal notranslate"><span class="pre">docker</span> <span class="pre">exec</span> <span class="pre">-it</span> <span class="pre">qwen35-gb300</span> <span class="pre">/bin/bash</span></code>. Run this setup in
+<strong>each shell</strong>. Replace the service endpoints when they run on another host:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nb">export</span><span class="w"> </span><span class="nv">MODEL_PATH</span><span class="o">=</span>/models/qwen35
+<span class="nb">export</span><span class="w"> </span><span class="nv">CONFIG_DIR</span><span class="o">=</span>/opt/trtllm-recipes/examples/configs/curated
+<span class="nb">export</span><span class="w"> </span><span class="nv">ETCD_ENDPOINTS</span><span class="o">=</span>http://127.0.0.1:2379
+<span class="nb">export</span><span class="w"> </span><span class="nv">NATS_SERVER</span><span class="o">=</span>nats://127.0.0.1:4222
+<span class="nb">export</span><span class="w"> </span><span class="nv">DYN_NAMESPACE</span><span class="o">=</span>qwen35-gb300
+<span class="nb">export</span><span class="w"> </span><span class="nv">DYN_DISCOVERY_BACKEND</span><span class="o">=</span>etcd
+<span class="nb">export</span><span class="w"> </span><span class="nv">DYN_REQUEST_PLANE</span><span class="o">=</span>tcp
+<span class="nb">source</span><span class="w"> </span><span class="s2">"</span><span class="nv">$CONFIG_DIR</span><span class="s2">/qwen3.5-gb300-agentic.env"</span>
+<span class="nb">unset</span><span class="w"> </span>TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS
+</pre></div>
+</div>
+<p>The <a class="reference download internal" download="" href="../_downloads/a5d14217432b7a622082147cc470d7cc/qwen3.5-gb300-agentic.env"><span class="xref download myst">worker environment</span></a>
+preserves the source profile’s allocator, CUDA launch, GC, weight-staging, transfer,
+and conversation-affinity settings. It includes an intentionally empty
+<code class="docutils literal notranslate"><span class="pre">MIMALLOC_PURGE_DELAY</span></code>. Keep the draft head and its precision as shipped with the
+V2 checkpoint. Never set <code class="docutils literal notranslate"><span class="pre">TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS</span></code> in production
+or accuracy runs.</p>
+</section>
+<section id="start-the-frontend-and-workers">
+<h3>Start the Frontend and Workers<a class="headerlink" href="#start-the-frontend-and-workers" title="Link to this heading">#</a></h3>
+<p>In the frontend shell:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nb">export</span><span class="w"> </span><span class="nv">ETCD_LEASE_TTL</span><span class="o">=</span><span class="m">120</span>
+<span class="nb">export</span><span class="w"> </span><span class="nv">DYN_TOKENIZER_CACHE</span><span class="o">=</span><span class="m">1</span>
+<span class="nb">export</span><span class="w"> </span><span class="nv">DYN_TOKENIZER_CACHE_BYTES</span><span class="o">=</span><span class="m">8000000000</span>
+<span class="nb">export</span><span class="w"> </span><span class="nv">DYN_TOKENIZER</span><span class="o">=</span>fastokens
+python3<span class="w"> </span>-m<span class="w"> </span>dynamo.frontend<span class="w"> </span>--http-port<span class="w"> </span><span class="m">8000</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--router-mode<span class="w"> </span>kv<span class="w"> </span>--router-session-affinity-ttl-secs<span class="w"> </span><span class="m">14400</span>
+</pre></div>
+</div>
+<p>In the prefill shell:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nb">export</span><span class="w"> </span><span class="nv">CUDA_VISIBLE_DEVICES</span><span class="o">=</span><span class="m">0</span>
+<span class="nb">export</span><span class="w"> </span><span class="nv">DYN_SYSTEM_PORT</span><span class="o">=</span><span class="m">8081</span>
+<span class="nb">export</span><span class="w"> </span><span class="nv">CUDA_SCALE_LAUNCH_QUEUES</span><span class="o">=</span>4x
+<span class="nb">export</span><span class="w"> </span><span class="nv">TRTLLM_SKIP_KV_CACHE_ESTIMATION</span><span class="o">=</span><span class="m">1</span>
+<span class="nb">export</span><span class="w"> </span><span class="nv">TRT_LLM_DISABLE_LOAD_WEIGHTS_IN_PARALLEL</span><span class="o">=</span><span class="m">1</span>
+mpirun<span class="w"> </span>--allow-run-as-root<span class="w"> </span>-np<span class="w"> </span><span class="m">1</span><span class="w"> </span>--bind-to<span class="w"> </span>none<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>trtllm-llmapi-launch<span class="w"> </span>python3<span class="w"> </span>-m<span class="w"> </span>dynamo.trtllm<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--model-path<span class="w"> </span><span class="s2">"</span><span class="nv">$MODEL_PATH</span><span class="s2">"</span><span class="w"> </span>--disaggregation-mode<span class="w"> </span>prefill<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--extra-engine-args<span class="w"> </span><span class="s2">"</span><span class="nv">$CONFIG_DIR</span><span class="s2">/qwen3.5-gb300-agentic-prefill.yaml"</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--publish-metrics
+</pre></div>
+</div>
+<p>In the decode shell:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nb">export</span><span class="w"> </span><span class="nv">CUDA_VISIBLE_DEVICES</span><span class="o">=</span><span class="m">1</span>,2
+<span class="nb">export</span><span class="w"> </span><span class="nv">DYN_SYSTEM_PORT</span><span class="o">=</span><span class="m">8082</span>
+<span class="nb">export</span><span class="w"> </span><span class="nv">TRT_LLM_DISABLE_LOAD_WEIGHTS_IN_PARALLEL</span><span class="o">=</span><span class="m">1</span>
+mpirun<span class="w"> </span>--allow-run-as-root<span class="w"> </span>-np<span class="w"> </span><span class="m">2</span><span class="w"> </span>--bind-to<span class="w"> </span>none<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>trtllm-llmapi-launch<span class="w"> </span>python3<span class="w"> </span>-m<span class="w"> </span>dynamo.trtllm<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--model-path<span class="w"> </span><span class="s2">"</span><span class="nv">$MODEL_PATH</span><span class="s2">"</span><span class="w"> </span>--disaggregation-mode<span class="w"> </span>decode<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--extra-engine-args<span class="w"> </span><span class="s2">"</span><span class="nv">$CONFIG_DIR</span><span class="s2">/qwen3.5-gb300-agentic-decode.yaml"</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--publish-metrics
+</pre></div>
+</div>
+<p>The container runs as root; omit <code class="docutils literal notranslate"><span class="pre">--allow-run-as-root</span></code> when using a non-root user.
+The rank counts must
+match <code class="docutils literal notranslate"><span class="pre">tensor_parallel_size</span> <span class="pre">*</span> <span class="pre">pipeline_parallel_size</span></code> for each worker; launch a
+separate MPI group for each replica. Use disjoint GPU masks and distinct system
+ports for colocated workers. The source launcher binds worker host-memory
+allocations to NUMA nodes <code class="docutils literal notranslate"><span class="pre">0,1</span></code>; on systems with that same NUMA layout, prefix
+<code class="docutils literal notranslate"><span class="pre">trtllm-llmapi-launch</span></code> with <code class="docutils literal notranslate"><span class="pre">numactl</span> <span class="pre">-m</span> <span class="pre">0,1</span></code>. Check the local CPU/NUMA topology
+before applying that binding on another system.</p>
+<p>The <a class="reference download internal" download="" href="../_downloads/1f6b2edb674c13b63010d3d83334797d/qwen3.5-gb300-agentic-prefill.yaml"><span class="xref download myst">prefill YAML</span></a>
+sets FP8 KV cache, conversation-scoped block reuse with three retained turns,
+GDN state snapshots, chunked prefill, full-graph compilation, and piecewise CUDA
+graphs. The <a class="reference download internal" download="" href="../_downloads/fa95ebae91950f50de3219fb8458acfd/qwen3.5-gb300-agentic-decode.yaml"><span class="xref download myst">decode YAML</span></a>
+sets MTP6, padded CUDA graphs, a no-eviction scheduler, and <code class="docutils literal notranslate"><span class="pre">stream_interval:</span> <span class="pre">20</span></code>.
+Both use KV cache manager V2, native host offload, NIXL with the Python
+transceiver, and a 2048 MiB bounce buffer for this colocated profile.</p>
+<p>Both workers use <code class="docutils literal notranslate"><span class="pre">--publish-metrics</span></code> with <code class="docutils literal notranslate"><span class="pre">enable_iter_perf_stats:</span> <span class="pre">true</span></code>,
+<code class="docutils literal notranslate"><span class="pre">iter_perf_stats_interval:</span> <span class="pre">40</span></code>, and
+<code class="docutils literal notranslate"><span class="pre">kv_cache_config.iteration_stats_interval:</span> <span class="pre">40</span></code>. Keep <code class="docutils literal notranslate"><span class="pre">return_perf_metrics:</span> <span class="pre">false</span></code>
+and <code class="docutils literal notranslate"><span class="pre">kv_cache_config.event_buffer_max_size:</span> <span class="pre">0</span></code>; metrics publication does not
+require KV event publication. This profile uses session affinity with KV events
+off. Send a stable <code class="docutils literal notranslate"><span class="pre">x-dynamo-session-id</span></code> for every turn of a conversation so the
+frontend and attention-DP worker can preserve affinity. The router’s idle TTL is
+14400 seconds; reuse requires the retained cache entries to remain available.</p>
+</section>
+<section id="select-another-topology">
+<h3>Select Another Topology<a class="headerlink" href="#select-another-topology" title="Link to this heading">#</a></h3>
+<p>Start with copies of the two YAML files above and apply the following role
+settings. All workers keep <code class="docutils literal notranslate"><span class="pre">pipeline_parallel_size:</span> <span class="pre">1</span></code>, the common environment,
+and 128 GiB of host cache per rank. <code class="docutils literal notranslate"><span class="pre">TP=EP</span></code> in every row. Attention DP is written
+explicitly because equal TP/EP values alone do not determine attention behavior.</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Prefill profile</p></th>
+<th class="head text-right"><p>GPUs / TP / EP per worker</p></th>
+<th class="head"><p><code class="docutils literal notranslate"><span class="pre">enable_attention_dp</span></code></p></th>
+<th class="head text-right"><p><code class="docutils literal notranslate"><span class="pre">max_num_tokens</span></code></p></th>
+<th class="head"><p>Compile capture sizes</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>P1</p></td>
+<td class="text-right"><p>1</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">true</span></code></p></td>
+<td class="text-right"><p>8192</p></td>
+<td><p>Powers of two from 1 through 8192</p></td>
+</tr>
+<tr class="row-odd"><td><p>P4-TEP</p></td>
+<td class="text-right"><p>4</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">false</span></code></p></td>
+<td class="text-right"><p>32768</p></td>
+<td><p>Powers of two from 1 through 32768</p></td>
+</tr>
+<tr class="row-even"><td><p>P4-DEP</p></td>
+<td class="text-right"><p>4</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">true</span></code></p></td>
+<td class="text-right"><p>8192</p></td>
+<td><p>Powers of two from 1 through 8192</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>Prefill retains <code class="docutils literal notranslate"><span class="pre">max_batch_size:</span> <span class="pre">64</span></code>, <code class="docutils literal notranslate"><span class="pre">max_seq_len:</span> <span class="pre">262144</span></code>,
+<code class="docutils literal notranslate"><span class="pre">kv_cache_config.free_gpu_memory_fraction:</span> <span class="pre">0.8</span></code>, and <code class="docutils literal notranslate"><span class="pre">moe_config.backend:</span> <span class="pre">CUTEDSL</span></code>.
+Set <code class="docutils literal notranslate"><span class="pre">torch_compile_config.capture_num_tokens</span></code> to the complete list indicated
+above. Keep <code class="docutils literal notranslate"><span class="pre">CUDA_SCALE_LAUNCH_QUEUES=4x</span></code> and
+<code class="docutils literal notranslate"><span class="pre">TRTLLM_SKIP_KV_CACHE_ESTIMATION=1</span></code> on every prefill worker.</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Decode profile</p></th>
+<th class="head text-right"><p>GPUs / TP / EP per worker</p></th>
+<th class="head"><p>Attention DP / LM-head TP in ADP</p></th>
+<th class="head text-right"><p><code class="docutils literal notranslate"><span class="pre">max_batch_size</span></code></p></th>
+<th class="head text-right"><p><code class="docutils literal notranslate"><span class="pre">max_num_tokens</span></code></p></th>
+<th class="head"><p>CUDA graph <code class="docutils literal notranslate"><span class="pre">batch_sizes</span></code></p></th>
+<th class="head"><p>MoE backend</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>D2-B8</p></td>
+<td class="text-right"><p>2</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">false</span></code> / <code class="docutils literal notranslate"><span class="pre">false</span></code></p></td>
+<td class="text-right"><p>8</p></td>
+<td class="text-right"><p>56</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">[1,</span> <span class="pre">2,</span> <span class="pre">4,</span> <span class="pre">8]</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">TRTLLM</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p>D2-B4</p></td>
+<td class="text-right"><p>2</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">false</span></code> / <code class="docutils literal notranslate"><span class="pre">false</span></code></p></td>
+<td class="text-right"><p>4</p></td>
+<td class="text-right"><p>28</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">[1,</span> <span class="pre">2,</span> <span class="pre">4]</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">TRTLLM</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p>D8-B4</p></td>
+<td class="text-right"><p>8</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">false</span></code> / <code class="docutils literal notranslate"><span class="pre">false</span></code></p></td>
+<td class="text-right"><p>4</p></td>
+<td class="text-right"><p>28</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">[1,</span> <span class="pre">2,</span> <span class="pre">4]</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">CUTEDSL</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p>D8-B1</p></td>
+<td class="text-right"><p>8</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">false</span></code> / <code class="docutils literal notranslate"><span class="pre">false</span></code></p></td>
+<td class="text-right"><p>1</p></td>
+<td class="text-right"><p>7</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">[1,</span> <span class="pre">2,</span> <span class="pre">4]</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">CUTEDSL</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p>D16-B8</p></td>
+<td class="text-right"><p>16</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">true</span></code> / <code class="docutils literal notranslate"><span class="pre">true</span></code></p></td>
+<td class="text-right"><p>8</p></td>
+<td class="text-right"><p>56</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">[1,</span> <span class="pre">2,</span> <span class="pre">4,</span> <span class="pre">8]</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">CUTEDSL</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p>D4-B32</p></td>
+<td class="text-right"><p>4</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">true</span></code> / <code class="docutils literal notranslate"><span class="pre">true</span></code></p></td>
+<td class="text-right"><p>32</p></td>
+<td class="text-right"><p>224</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">[1,</span> <span class="pre">2,</span> <span class="pre">4,</span> <span class="pre">8,</span> <span class="pre">16,</span> <span class="pre">24,</span> <span class="pre">32]</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">CUTEDSL</span></code></p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>The two booleans set <code class="docutils literal notranslate"><span class="pre">enable_attention_dp</span></code> and <code class="docutils literal notranslate"><span class="pre">enable_lm_head_tp_in_adp</span></code>.
+Decode retains <code class="docutils literal notranslate"><span class="pre">max_seq_len:</span> <span class="pre">262148</span></code>, <code class="docutils literal notranslate"><span class="pre">kv_cache_config.avg_seq_len:</span> <span class="pre">102150</span></code>,
+<code class="docutils literal notranslate"><span class="pre">kv_cache_config.free_gpu_memory_fraction:</span> <span class="pre">0.85</span></code>,
+<code class="docutils literal notranslate"><span class="pre">moe_config.use_low_precision_moe_combine:</span> <span class="pre">true</span></code>, and MTP6.
+The <code class="docutils literal notranslate"><span class="pre">avg_seq_len</span></code> is a cache-sizing input for the source traffic distribution;
+revisit it when your conversation-length distribution changes.</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Topology</p></th>
+<th class="head"><p>Prefill replicas × profile</p></th>
+<th class="head"><p>Decode replicas × profile</p></th>
+<th class="head text-right"><p>Physical four-GPU nodes</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>1P1D, decode batch 8</p></td>
+<td><p>1 × P1</p></td>
+<td><p>1 × D2-B8, colocated</p></td>
+<td class="text-right"><p>1</p></td>
+</tr>
+<tr class="row-odd"><td><p>1P1D, decode batch 4</p></td>
+<td><p>1 × P1</p></td>
+<td><p>1 × D2-B4, colocated</p></td>
+<td class="text-right"><p>1</p></td>
+</tr>
+<tr class="row-even"><td><p>1P2D</p></td>
+<td><p>1 × P4-TEP</p></td>
+<td><p>2 × D8-B4</p></td>
+<td class="text-right"><p>5</p></td>
+</tr>
+<tr class="row-odd"><td><p>1P4D, decode batch 1</p></td>
+<td><p>1 × P4-TEP</p></td>
+<td><p>4 × D8-B1</p></td>
+<td class="text-right"><p>9</p></td>
+</tr>
+<tr class="row-even"><td><p>1P4D, decode batch 4</p></td>
+<td><p>1 × P4-TEP</p></td>
+<td><p>4 × D8-B4</p></td>
+<td class="text-right"><p>9</p></td>
+</tr>
+<tr class="row-odd"><td><p>2P3D</p></td>
+<td><p>2 × P4-TEP</p></td>
+<td><p>3 × D8-B4</p></td>
+<td class="text-right"><p>8</p></td>
+</tr>
+<tr class="row-even"><td><p>3P1D</p></td>
+<td><p>3 × P4-DEP</p></td>
+<td><p>1 × D16-B8</p></td>
+<td class="text-right"><p>7</p></td>
+</tr>
+<tr class="row-odd"><td><p>3P2D</p></td>
+<td><p>3 × P4-DEP</p></td>
+<td><p>2 × D4-B32</p></td>
+<td class="text-right"><p>5</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>For the two colocated 1P1D profiles, retain
+<code class="docutils literal notranslate"><span class="pre">cache_transceiver_config.kv_cache_bounce_size_mb:</span> <span class="pre">2048</span></code> on both roles and
+<code class="docutils literal notranslate"><span class="pre">TRT_LLM_DISABLE_LOAD_WEIGHTS_IN_PARALLEL=1</span></code> on both workers. For the other
+profiles, remove that bounce-size override and unset the weight-loading variable
+to use the pinned runtime’s defaults. Launch each TP8 worker across two
+four-GPU nodes and each TP16 worker across four nodes, with one MPI rank per GPU.
+Replicas share discovery endpoints, namespace, served model name, and the
+frontend; do not combine separate replicas into a single MPI group. Pass the
+same mounts and environment to every rank and use a cluster launcher to allocate
+the indicated nodes before starting those MPI groups.</p>
+</section>
+<section id="verify-responses-and-metrics">
+<h3>Verify Responses and Metrics<a class="headerlink" href="#verify-responses-and-metrics" title="Link to this heading">#</a></h3>
+<p>Wait for worker initialization and model registration. Check readiness and the
+registered model, then issue a chat request through Dynamo:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>curl<span class="w"> </span>--fail<span class="w"> </span>http://localhost:8000/health
+curl<span class="w"> </span>--fail<span class="w"> </span>http://localhost:8000/v1/models
+curl<span class="w"> </span>--fail<span class="w"> </span>http://localhost:8000/v1/chat/completions<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-H<span class="w"> </span><span class="s1">'Content-Type: application/json'</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-H<span class="w"> </span><span class="s1">'x-dynamo-session-id: qwen35-example-session'</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-d<span class="w"> </span><span class="s1">'{"model":"nvidia/Qwen3.5-397B-A17B-NVFP4-V2","messages":[{"role":"user","content":"Write a Python function that adds two integers."}],"max_tokens":256}'</span>
+curl<span class="w"> </span>--fail<span class="w"> </span>http://localhost:8081/metrics
+curl<span class="w"> </span>--fail<span class="w"> </span>http://localhost:8082/metrics
+</pre></div>
+</div>
+<p>After traffic, verify that both worker endpoints expose
+<code class="docutils literal notranslate"><span class="pre">trtllm_kv_cache_utilization</span></code> metrics. Send the full conversation history and the
+same session header on subsequent turns. Measure latency, throughput, host-memory
+use, and natural MTP acceptance on your own traffic before selecting a topology.
+InferenceX runner setup, benchmark-client placement, trace selection, concurrency
+sweeps, Enroot configuration, and synthetic acceptance are not required to run
+these production serving commands.</p>
 </section>
 </section>
 <section id="testing-api-endpoint">
@@ -1195,6 +1554,14 @@ chmod<span class="w"> </span>+x<span class="w"> </span>bench.sh
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#launch-the-tensorrt-llm-server">Launch the TensorRT LLM Server</a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#qwen3-5-gb300-nvl72-agentic-disaggregated-serving">Qwen3.5 GB300 NVL72 Agentic Disaggregated Serving</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#runtime-and-memory-requirements">Runtime and Memory Requirements</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#prepare-the-container">Prepare the Container</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#start-the-frontend-and-workers">Start the Frontend and Workers</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#select-another-topology">Select Another Topology</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#verify-responses-and-metrics">Verify Responses and Metrics</a></li>
+</ul>
+</li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#testing-api-endpoint">Testing API Endpoint</a><ul class="nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#basic-test">Basic Test</a></li>
 </ul>
@@ -1309,9 +1676,9 @@ chmod<span class="w"> </span>+x<span class="w"> </span>bench.sh
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on October 09, 2026.</p>
+  <p>Last updated on October 19, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/cc63e66">cc63e66</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/0372799">0372799</a>.</p>
   
 </div></div>
       

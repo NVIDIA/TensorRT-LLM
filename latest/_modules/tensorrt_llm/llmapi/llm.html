@@ -419,7 +419,7 @@ window.runMermaid = runMermaid;</script>
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.23.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc0';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc1';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -434,7 +434,7 @@ window.runMermaid = runMermaid;</script>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="color-scheme" content="light dark"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.4.0rc0" />
+  <meta name="docsearch:version" content="1.4.0rc1" />
   
     
     <script src="../../../_static/searchtools.js"></script>
@@ -795,6 +795,9 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l1 has-children"><a class="reference internal" href="../../../llm-api/reference.html">API Reference</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/LLM.html">LLM</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/AsyncLLM.html">AsyncLLM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/ExecutorMemoryType.html">ExecutorMemoryType</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/RuntimeMemoryStatus.html">RuntimeMemoryStatus</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/SleepConfig.html">SleepConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/MultimodalEncoder.html">MultimodalEncoder</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/CompletionOutput.html">CompletionOutput</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/RequestOutput.html">RequestOutput</a></li>
@@ -884,6 +887,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/speculative-decoding.html">Speculative Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/checkpoint-loading.html">Checkpoint Loading</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/model-express.html">ModelExpress (MX) Checkpoint Loading</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../features/sleep-wakeup.html">Runtime Memory Checkpointing (Prototype)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/ray-orchestrator.html">Ray Orchestrator (Prototype)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/torch_compile_and_piecewise_cuda_graph.html">Torch Compile &amp; Prefill CUDA Graph</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/helix.html">Helix Parallelism</a></li>
@@ -902,6 +906,10 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l1"><a class="reference internal" href="../../../developer-guide/overview.html">Architecture Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../developer-guide/perf-analysis.html">Performance Analysis</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../developer-guide/perf-benchmarking.html">TensorRT LLM Benchmarking</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../../developer-guide/moe-perf-guide.html">MoE Performance Guide</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../../developer-guide/moe-perf-dashboard.html">MoE Perf Dashboard</a></li>
+</ul>
+</details></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../developer-guide/ci-overview.html">Continuous Integration Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../developer-guide/dev-containers.html">Using Dev Containers</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../developer-guide/api-change.html">LLM API Change Guide</a></li>
@@ -913,6 +921,7 @@ window.runMermaid = runMermaid;</script>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog30_KV_Cache_Compression_in_TensorRT-LLM.html">KV Cache Compression in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog29_GVR_V2_Self_Sampling_Exact_TopK_for_Sparse_Attention.html">GVR V2: Self-Sampling and Multi-Thresholding for Faster Exact Top-K</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog28_Accelerating_Video_Generation_with_GEMM_Quantization_Attention_Quantization_and_Skip_Softmax_Attention_in_TensorRT-LLM.html">Accelerating Video Generation with GEMM Quantization, Attention Quantization and Skip Softmax Attention in TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog27_Evaluating_Agentic_Serving_with_Trace_Replay_and_Job_Level_Metrics.html">Evaluating Agentic Serving with Trace Replay and Job-Level Metrics</a></li>
@@ -1073,7 +1082,8 @@ window.runMermaid = runMermaid;</script>
 <span class="kn">from</span><span class="w"> </span><span class="nn">..scheduling_params</span><span class="w"> </span><span class="kn">import</span> <span class="n">SchedulingParams</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">.llm_args</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span><span class="n">ENCODER_RUNNER_MANAGED_INPUTS</span><span class="p">,</span>
                        <span class="n">TORCH_LLMARGS_EXPLICIT_DOCSTRING</span><span class="p">,</span>
-                       <span class="n">TORCH_LLMARGS_REMOVED_ARGS</span><span class="p">,</span> <span class="n">TorchLlmArgs</span><span class="p">,</span>
+                       <span class="n">TORCH_LLMARGS_REMOVED_ARGS</span><span class="p">,</span> <span class="n">ExecutorMemoryType</span><span class="p">,</span>
+                       <span class="n">RuntimeMemoryStatus</span><span class="p">,</span> <span class="n">TorchLlmArgs</span><span class="p">,</span>
                        <span class="n">validate_token_encoder_bucket_config</span><span class="p">)</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">.llm_utils</span><span class="w"> </span><span class="kn">import</span> <span class="n">CachedModelLoader</span><span class="p">,</span> <span class="n">KvCacheRetentionConfig</span><span class="p">,</span> <span class="n">ModelLoader</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">.mpi_session</span><span class="w"> </span><span class="kn">import</span> <span class="n">MpiPoolSession</span><span class="p">,</span> <span class="n">external_mpi_comm_available</span>
@@ -1082,6 +1092,11 @@ window.runMermaid = runMermaid;</script>
 <span class="c1"># TODO[chunweiy]: move the following symbols back to utils scope, and remove the following import</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">.utils</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span><span class="n">append_docstring</span><span class="p">,</span> <span class="n">exception_handler</span><span class="p">,</span> <span class="n">get_device_count</span><span class="p">,</span>
                     <span class="n">logger_debug</span><span class="p">,</span> <span class="n">set_api_status</span><span class="p">)</span>
+
+<span class="n">_RUNTIME_MEMORY_TYPES</span> <span class="o">=</span> <span class="nb">tuple</span><span class="p">(</span>
+    <span class="n">memory_type</span> <span class="k">for</span> <span class="n">memory_type</span> <span class="ow">in</span> <span class="n">ExecutorMemoryType</span>
+    <span class="k">if</span> <span class="n">memory_type</span> <span class="ow">not</span> <span class="ow">in</span> <span class="p">(</span><span class="n">ExecutorMemoryType</span><span class="o">.</span><span class="n">INIT_KV_CACHE</span><span class="p">,</span>
+                           <span class="n">ExecutorMemoryType</span><span class="o">.</span><span class="n">INIT_EXTRA_RESOURCES</span><span class="p">))</span>
 
 
 <div class="viewcode-block" id="RequestOutput">
@@ -1387,6 +1402,8 @@ window.runMermaid = runMermaid;</script>
                  <span class="o">**</span><span class="n">kwargs</span><span class="p">:</span> <span class="n">Any</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
 
         <span class="bp">self</span><span class="o">.</span><span class="n">_executor_cls</span> <span class="o">=</span> <span class="n">kwargs</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="s2">"executor_cls"</span><span class="p">,</span> <span class="n">GenerationExecutor</span><span class="p">)</span>
+        <span class="n">enable_routing_load</span> <span class="o">=</span> <span class="n">kwargs</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="s2">"_enable_routing_load"</span><span class="p">,</span> <span class="kc">False</span><span class="p">)</span>
+        <span class="n">openengine_discovery</span> <span class="o">=</span> <span class="n">kwargs</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="s2">"_openengine_discovery"</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_orchestrator_type</span> <span class="o">=</span> <span class="n">kwargs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"orchestrator_type"</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_llm_id</span> <span class="o">=</span> <span class="kc">None</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_disaggregated_params</span><span class="p">:</span> <span class="nb">dict</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
@@ -1415,14 +1432,6 @@ window.runMermaid = runMermaid;</script>
                     <span class="sa">f</span><span class="s2">"Unknown backend: </span><span class="si">{</span><span class="n">backend</span><span class="si">!r}</span><span class="s2">. Supported backends are "</span>
                     <span class="s2">"'pytorch'."</span><span class="p">)</span>
 
-            <span class="c1"># TRTLLM_MODELING_V2=require promises the run measured a modeling_v2</span>
-            <span class="c1"># target. Only the pytorch backend reaches the resolver that could</span>
-            <span class="c1"># select one, so on any other backend the promise would be broken</span>
-            <span class="c1"># silently -- the one failure that mode exists to prevent.</span>
-            <span class="kn">from</span><span class="w"> </span><span class="nn">.._torch._experimental.modeling_v2</span><span class="w"> </span><span class="kn">import</span> \
-                <span class="n">assert_backend_can_route</span>
-            <span class="n">assert_backend_can_route</span><span class="p">(</span><span class="n">backend</span><span class="p">)</span>
-
             <span class="c1"># check the kwargs and raise ValueError directly</span>
             <span class="n">valid_keys</span> <span class="o">=</span> <span class="nb">set</span><span class="p">(</span>
                 <span class="nb">list</span><span class="p">(</span><span class="n">llm_args_cls</span><span class="o">.</span><span class="n">model_fields</span><span class="o">.</span><span class="n">keys</span><span class="p">())</span> <span class="o">+</span>
@@ -1446,6 +1455,8 @@ window.runMermaid = runMermaid;</script>
                                      <span class="n">revision</span><span class="o">=</span><span class="n">revision</span><span class="p">,</span>
                                      <span class="n">tokenizer_revision</span><span class="o">=</span><span class="n">tokenizer_revision</span><span class="p">,</span>
                                      <span class="o">**</span><span class="n">kwargs</span><span class="p">)</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">_enable_routing_load</span> <span class="o">=</span> <span class="n">enable_routing_load</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">_openengine_discovery</span> <span class="o">=</span> <span class="n">openengine_discovery</span>
 
             <span class="bp">self</span><span class="o">.</span><span class="n">_capture_usage_startup</span><span class="p">(</span><span class="n">llm_args</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="p">)</span>
 
@@ -1456,6 +1467,18 @@ window.runMermaid = runMermaid;</script>
 
         <span class="k">finally</span><span class="p">:</span>
             <span class="n">logger</span><span class="o">.</span><span class="n">set_level</span><span class="p">(</span><span class="n">log_level</span><span class="p">)</span>  <span class="c1"># restore the log level</span>
+
+        <span class="c1"># Before the ranks these args go to are spawned and before the usage</span>
+        <span class="c1"># report reads them, so that one description of the deployment reaches</span>
+        <span class="c1"># both. Imported behind the check so that no other deployment loads</span>
+        <span class="c1"># this connector's package, which pulls in its worker and scheduler.</span>
+        <span class="c1"># The registry names every preset's module without importing any of</span>
+        <span class="c1"># them, and tolerates an absent connector config.</span>
+        <span class="kn">from</span><span class="w"> </span><span class="nn">.._torch.pyexecutor.connectors.registry</span><span class="w"> </span><span class="kn">import</span> <span class="n">uses_connector</span>
+        <span class="k">if</span> <span class="n">uses_connector</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">kv_connector_config</span><span class="p">,</span> <span class="s2">"mooncake-store"</span><span class="p">):</span>
+            <span class="kn">from</span><span class="w"> </span><span class="nn">.._torch.pyexecutor.connectors.mooncake_store.settings</span><span class="w"> </span><span class="kn">import</span> \
+                <span class="n">apply_effective_settings</span>
+            <span class="n">apply_effective_settings</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="p">)</span>
 
         <span class="n">logger_debug</span><span class="p">(</span><span class="sa">f</span><span class="s2">"LLM.args.mpi_session: </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">mpi_session</span><span class="si">}</span><span class="se">\n</span><span class="s2">"</span><span class="p">,</span>
                      <span class="s2">"yellow"</span><span class="p">)</span>
@@ -1475,9 +1498,9 @@ window.runMermaid = runMermaid;</script>
 
         <span class="c1"># Attached serving frontends connect to an already-running worker:</span>
         <span class="c1"># they must not spawn an MPI session (see GenerationExecutor.create).</span>
-        <span class="n">is_attached_frontend</span> <span class="o">=</span> <span class="n">os</span><span class="o">.</span><span class="n">getenv</span><span class="p">(</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_is_attached_frontend</span> <span class="o">=</span> <span class="n">os</span><span class="o">.</span><span class="n">getenv</span><span class="p">(</span>
             <span class="s2">"TLLM_EXECUTOR_ATTACH_INFO"</span><span class="p">)</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
-        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">parallel_config</span><span class="o">.</span><span class="n">is_multi_gpu</span> <span class="ow">and</span> <span class="ow">not</span> <span class="n">is_attached_frontend</span><span class="p">:</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">parallel_config</span><span class="o">.</span><span class="n">is_multi_gpu</span> <span class="ow">and</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">_is_attached_frontend</span><span class="p">:</span>
             <span class="k">if</span> <span class="n">os</span><span class="o">.</span><span class="n">getenv</span><span class="p">(</span><span class="s2">"RAY_LOCAL_WORLD_SIZE"</span><span class="p">)</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">get_device_count</span><span class="p">(</span>
             <span class="p">)</span> <span class="o">&lt;</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">parallel_config</span><span class="o">.</span><span class="n">world_size_per_node</span><span class="p">:</span>
                 <span class="k">raise</span> <span class="ne">RuntimeError</span><span class="p">(</span>
@@ -2643,8 +2666,10 @@ window.runMermaid = runMermaid;</script>
                 <span class="s2">"(Router Replay): routes are not captured otherwise."</span><span class="p">)</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">_build_model</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
-        <span class="n">model_loader</span> <span class="o">=</span> <span class="n">CachedModelLoader</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="p">,</span>
-                                         <span class="n">mpi_session</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">mpi_session</span><span class="p">)</span>
+        <span class="n">model_loader</span> <span class="o">=</span> <span class="n">CachedModelLoader</span><span class="p">(</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="p">,</span>
+            <span class="n">mpi_session</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">mpi_session</span><span class="p">,</span>
+            <span class="n">is_attached_frontend</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_is_attached_frontend</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_hf_model_dir</span> <span class="o">=</span> <span class="n">model_loader</span><span class="p">()</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">_try_load_tokenizer</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Optional</span><span class="p">[</span><span class="n">TokenizerBase</span><span class="p">]:</span>
@@ -2952,6 +2977,113 @@ window.runMermaid = runMermaid;</script>
                 <span class="sa">f</span><span class="s2">"Executor type </span><span class="si">{</span><span class="nb">type</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_executor</span><span class="p">)</span><span class="si">}</span><span class="s2"> does not support collective RPC."</span>
             <span class="p">)</span>
 
+    <span class="k">def</span><span class="w"> </span><span class="nf">_check_runtime_memory_enabled</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">sleep_config</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                <span class="s2">"Runtime memory checkpointing is not enabled. Set sleep_config "</span>
+                <span class="s2">"when constructing the LLM."</span><span class="p">)</span>
+
+    <span class="nd">@staticmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">_normalize_runtime_memory_tags</span><span class="p">(</span>
+        <span class="n">tags</span><span class="p">:</span> <span class="n">Sequence</span><span class="p">[</span><span class="n">ExecutorMemoryType</span> <span class="o">|</span> <span class="nb">str</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="o">*</span><span class="p">,</span>
+        <span class="n">default_tags</span><span class="p">:</span> <span class="n">Sequence</span><span class="p">[</span><span class="n">ExecutorMemoryType</span><span class="p">],</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="n">ExecutorMemoryType</span><span class="p">]:</span>
+        <span class="k">if</span> <span class="n">tags</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="k">return</span> <span class="nb">list</span><span class="p">(</span><span class="n">default_tags</span><span class="p">)</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="n">tags</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s2">"Runtime memory tags must not be empty."</span><span class="p">)</span>
+
+        <span class="n">normalized</span> <span class="o">=</span> <span class="p">[]</span>
+        <span class="n">seen</span> <span class="o">=</span> <span class="nb">set</span><span class="p">()</span>
+        <span class="k">for</span> <span class="n">tag</span> <span class="ow">in</span> <span class="n">tags</span><span class="p">:</span>
+            <span class="k">try</span><span class="p">:</span>
+                <span class="n">memory_type</span> <span class="o">=</span> <span class="p">(</span><span class="n">tag</span> <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">tag</span><span class="p">,</span> <span class="n">ExecutorMemoryType</span><span class="p">)</span> <span class="k">else</span>
+                               <span class="n">ExecutorMemoryType</span><span class="p">(</span><span class="n">tag</span><span class="p">))</span>
+            <span class="k">except</span> <span class="p">(</span><span class="ne">TypeError</span><span class="p">,</span> <span class="ne">ValueError</span><span class="p">)</span> <span class="k">as</span> <span class="n">error</span><span class="p">:</span>
+                <span class="n">valid</span> <span class="o">=</span> <span class="s2">", "</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="n">item</span><span class="o">.</span><span class="n">value</span> <span class="k">for</span> <span class="n">item</span> <span class="ow">in</span> <span class="n">_RUNTIME_MEMORY_TYPES</span><span class="p">)</span>
+                <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                    <span class="sa">f</span><span class="s2">"Invalid runtime memory tag </span><span class="si">{</span><span class="n">tag</span><span class="si">!r}</span><span class="s2">. Expected one of: </span><span class="si">{</span><span class="n">valid</span><span class="si">}</span><span class="s2">"</span>
+                <span class="p">)</span> <span class="kn">from</span><span class="w"> </span><span class="nn">error</span>
+            <span class="k">if</span> <span class="n">memory_type</span> <span class="ow">in</span> <span class="p">(</span><span class="n">ExecutorMemoryType</span><span class="o">.</span><span class="n">INIT_KV_CACHE</span><span class="p">,</span>
+                               <span class="n">ExecutorMemoryType</span><span class="o">.</span><span class="n">INIT_EXTRA_RESOURCES</span><span class="p">):</span>
+                <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                    <span class="sa">f</span><span class="s2">"Runtime memory tag </span><span class="si">{</span><span class="n">memory_type</span><span class="o">.</span><span class="n">value</span><span class="si">!r}</span><span class="s2"> is an "</span>
+                    <span class="s2">"initialization-only tag and cannot be released."</span><span class="p">)</span>
+            <span class="k">if</span> <span class="n">memory_type</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">seen</span><span class="p">:</span>
+                <span class="n">normalized</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">memory_type</span><span class="p">)</span>
+                <span class="n">seen</span><span class="o">.</span><span class="n">add</span><span class="p">(</span><span class="n">memory_type</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">normalized</span>
+
+    <span class="nd">@set_api_status</span><span class="p">(</span><span class="s2">"prototype"</span><span class="p">)</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">get_memory_status</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">RuntimeMemoryStatus</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Return the authoritative runtime-memory checkpoint status.</span>
+
+<span class="sd">        Returns:</span>
+<span class="sd">            tensorrt_llm.llmapi.llm_args.RuntimeMemoryStatus: The reconciled</span>
+<span class="sd">            state reported by the runtime workers.</span>
+<span class="sd">        """</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_check_runtime_memory_enabled</span><span class="p">()</span>
+        <span class="n">replies</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_collective_rpc</span><span class="p">(</span><span class="s2">"get_memory_status"</span><span class="p">)</span>
+        <span class="n">statuses</span> <span class="o">=</span> <span class="p">[</span>
+            <span class="n">RuntimeMemoryStatus</span><span class="o">.</span><span class="n">model_validate</span><span class="p">(</span><span class="n">reply</span><span class="p">)</span> <span class="k">for</span> <span class="n">reply</span> <span class="ow">in</span> <span class="n">replies</span>
+        <span class="p">]</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="n">statuses</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">RuntimeError</span><span class="p">(</span><span class="s2">"No worker returned runtime-memory status."</span><span class="p">)</span>
+        <span class="n">expected</span> <span class="o">=</span> <span class="n">statuses</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span>
+        <span class="k">if</span> <span class="nb">any</span><span class="p">(</span><span class="n">status</span> <span class="o">!=</span> <span class="n">expected</span> <span class="k">for</span> <span class="n">status</span> <span class="ow">in</span> <span class="n">statuses</span><span class="p">[</span><span class="mi">1</span><span class="p">:]):</span>
+            <span class="k">raise</span> <span class="ne">RuntimeError</span><span class="p">(</span>
+                <span class="s2">"Runtime-memory state diverged across workers: "</span>
+                <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="p">[</span><span class="n">status</span><span class="o">.</span><span class="n">model_dump</span><span class="p">(</span><span class="n">mode</span><span class="o">=</span><span class="s1">'json'</span><span class="p">)</span><span class="w"> </span><span class="k">for</span><span class="w"> </span><span class="n">status</span><span class="w"> </span><span class="ow">in</span><span class="w"> </span><span class="n">statuses</span><span class="p">]</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">expected</span>
+
+    <span class="nd">@set_api_status</span><span class="p">(</span><span class="s2">"prototype"</span><span class="p">)</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">release</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span>
+        <span class="n">tags</span><span class="p">:</span> <span class="n">Sequence</span><span class="p">[</span><span class="n">ExecutorMemoryType</span> <span class="o">|</span> <span class="nb">str</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Checkpoint and release selected GPU runtime memory.</span>
+
+<span class="sd">        Args:</span>
+<span class="sd">            tags (Sequence[tensorrt_llm.llmapi.ExecutorMemoryType | str], optional):</span>
+<span class="sd">                Memory types to release. When omitted, release every</span>
+<span class="sd">                sleep-managed runtime memory type.</span>
+
+<span class="sd">        Returns:</span>
+<span class="sd">            None: The call returns after all selected memory has been released.</span>
+<span class="sd">        """</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_check_runtime_memory_enabled</span><span class="p">()</span>
+        <span class="n">normalized</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_normalize_runtime_memory_tags</span><span class="p">(</span>
+            <span class="n">tags</span><span class="p">,</span> <span class="n">default_tags</span><span class="o">=</span><span class="n">_RUNTIME_MEMORY_TYPES</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_collective_rpc</span><span class="p">(</span><span class="s2">"sleep"</span><span class="p">,</span> <span class="p">([</span><span class="n">tag</span><span class="o">.</span><span class="n">value</span> <span class="k">for</span> <span class="n">tag</span> <span class="ow">in</span> <span class="n">normalized</span><span class="p">],</span> <span class="p">))</span>
+
+    <span class="nd">@set_api_status</span><span class="p">(</span><span class="s2">"prototype"</span><span class="p">)</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">resume</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span>
+        <span class="n">tags</span><span class="p">:</span> <span class="n">Sequence</span><span class="p">[</span><span class="n">ExecutorMemoryType</span> <span class="o">|</span> <span class="nb">str</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Restore selected GPU runtime memory.</span>
+
+<span class="sd">        Args:</span>
+<span class="sd">            tags (Sequence[tensorrt_llm.llmapi.ExecutorMemoryType | str], optional):</span>
+<span class="sd">                Memory types to restore. When omitted, restore every currently</span>
+<span class="sd">                parked memory type.</span>
+
+<span class="sd">        Returns:</span>
+<span class="sd">            None: The call returns after all selected memory has been restored.</span>
+<span class="sd">        """</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_check_runtime_memory_enabled</span><span class="p">()</span>
+        <span class="n">status</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">get_memory_status</span><span class="p">()</span>
+        <span class="k">if</span> <span class="n">status</span><span class="o">.</span><span class="n">state</span> <span class="ow">not</span> <span class="ow">in</span> <span class="p">(</span><span class="s2">"running"</span><span class="p">,</span> <span class="s2">"parked"</span><span class="p">):</span>
+            <span class="k">raise</span> <span class="ne">RuntimeError</span><span class="p">(</span>
+                <span class="sa">f</span><span class="s2">"Cannot resume runtime memory while state is '</span><span class="si">{</span><span class="n">status</span><span class="o">.</span><span class="n">state</span><span class="si">}</span><span class="s2">'."</span>
+            <span class="p">)</span>
+        <span class="n">normalized</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_normalize_runtime_memory_tags</span><span class="p">(</span>
+            <span class="n">tags</span><span class="p">,</span> <span class="n">default_tags</span><span class="o">=</span><span class="n">status</span><span class="o">.</span><span class="n">parked_tags</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">normalized</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_collective_rpc</span><span class="p">(</span><span class="s2">"wakeup"</span><span class="p">,</span>
+                                 <span class="p">([</span><span class="n">tag</span><span class="o">.</span><span class="n">value</span> <span class="k">for</span> <span class="n">tag</span> <span class="ow">in</span> <span class="n">normalized</span><span class="p">],</span> <span class="p">))</span>
+
     <span class="k">def</span><span class="w"> </span><span class="nf">_reject_token_encoder_config_without_buckets</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">"""Reject a bucket-less token-encoder config before weights load.</span>
 
@@ -3077,7 +3209,10 @@ window.runMermaid = runMermaid;</script>
         <span class="c1"># Values of removed args are vetted by TorchLlmArgs._drop_removed_args.</span>
         <span class="n">accepted_keys</span> <span class="o">=</span> <span class="p">(</span><span class="nb">set</span><span class="p">(</span><span class="n">TorchLlmArgs</span><span class="o">.</span><span class="n">model_fields</span><span class="o">.</span><span class="n">keys</span><span class="p">())</span>
                          <span class="o">|</span> <span class="n">TORCH_LLMARGS_REMOVED_ARGS</span>
-                         <span class="o">|</span> <span class="p">{</span><span class="s1">'_mpi_session'</span><span class="p">,</span> <span class="s1">'backend'</span><span class="p">})</span>
+                         <span class="o">|</span> <span class="p">{</span>
+                             <span class="s1">'_mpi_session'</span><span class="p">,</span> <span class="s1">'_enable_routing_load'</span><span class="p">,</span>
+                             <span class="s1">'_openengine_discovery'</span><span class="p">,</span> <span class="s1">'backend'</span>
+                         <span class="p">})</span>
 
         <span class="c1"># Check if any arguments not supported by the PyTorch backend are passed.</span>
         <span class="n">unsupported_args</span> <span class="o">=</span> <span class="p">[</span><span class="n">key</span> <span class="k">for</span> <span class="n">key</span> <span class="ow">in</span> <span class="n">kwargs</span> <span class="k">if</span> <span class="n">key</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">accepted_keys</span><span class="p">]</span>
@@ -3229,9 +3364,9 @@ window.runMermaid = runMermaid;</script>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on October 09, 2026.</p>
+  <p>Last updated on October 19, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/cc63e66">cc63e66</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/0372799">0372799</a>.</p>
   
 </div></div>
       

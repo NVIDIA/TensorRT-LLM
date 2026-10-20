@@ -62,7 +62,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.23.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc0';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc1';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -79,7 +79,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="color-scheme" content="light dark"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.4.0rc0" />
+  <meta name="docsearch:version" content="1.4.0rc1" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -444,6 +444,9 @@
 <li class="toctree-l1 has-children"><a class="reference internal" href="../llm-api/reference.html">API Reference</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/LLM.html">LLM</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/AsyncLLM.html">AsyncLLM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/ExecutorMemoryType.html">ExecutorMemoryType</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/RuntimeMemoryStatus.html">RuntimeMemoryStatus</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SleepConfig.html">SleepConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/MultimodalEncoder.html">MultimodalEncoder</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CompletionOutput.html">CompletionOutput</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/RequestOutput.html">RequestOutput</a></li>
@@ -533,6 +536,7 @@
 <li class="toctree-l1"><a class="reference internal" href="speculative-decoding.html">Speculative Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="checkpoint-loading.html">Checkpoint Loading</a></li>
 <li class="toctree-l1"><a class="reference internal" href="model-express.html">ModelExpress (MX) Checkpoint Loading</a></li>
+<li class="toctree-l1"><a class="reference internal" href="sleep-wakeup.html">Runtime Memory Checkpointing (Prototype)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="ray-orchestrator.html">Ray Orchestrator (Prototype)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="torch_compile_and_piecewise_cuda_graph.html">Torch Compile &amp; Prefill CUDA Graph</a></li>
 <li class="toctree-l1"><a class="reference internal" href="helix.html">Helix Parallelism</a></li>
@@ -551,6 +555,10 @@
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/overview.html">Architecture Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/perf-analysis.html">Performance Analysis</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/perf-benchmarking.html">TensorRT LLM Benchmarking</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../developer-guide/moe-perf-guide.html">MoE Performance Guide</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../developer-guide/moe-perf-dashboard.html">MoE Perf Dashboard</a></li>
+</ul>
+</details></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/ci-overview.html">Continuous Integration Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/dev-containers.html">Using Dev Containers</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/api-change.html">LLM API Change Guide</a></li>
@@ -562,6 +570,7 @@
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog30_KV_Cache_Compression_in_TensorRT-LLM.html">KV Cache Compression in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog29_GVR_V2_Self_Sampling_Exact_TopK_for_Sparse_Attention.html">GVR V2: Self-Sampling and Multi-Thresholding for Faster Exact Top-K</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog28_Accelerating_Video_Generation_with_GEMM_Quantization_Attention_Quantization_and_Skip_Softmax_Attention_in_TensorRT-LLM.html">Accelerating Video Generation with GEMM Quantization, Attention Quantization and Skip Softmax Attention in TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog27_Evaluating_Agentic_Serving_with_Trace_Replay_and_Job_Level_Metrics.html">Evaluating Agentic Serving with Trace Replay and Job-Level Metrics</a></li>
@@ -1044,13 +1053,19 @@ selector, runtime metadata, cache management, and attention implementation.</p>
 <td><p>TRTLLM</p></td>
 <td><p>DeepSeek-V4 hybrid attention</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">minimax_m3</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">csa2</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">CSA2SparseAttentionConfig</span></code></p></td>
+<td><p>Sliding-window attention plus compressed history with shared KV/index sources</p></td>
+<td><p>TRTLLM, with hardware-selected Flash helpers</p></td>
+<td><p>DeepSeek-V4.1</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">minimax_m3</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">MiniMaxM3SparseAttentionConfig</span></code></p></td>
 <td><p>Learned block selection followed by sparse GQA</p></td>
 <td><p>Dedicated Triton or packaged block-sparse implementation</p></td>
 <td><p>MiniMax-M3 sparse layers</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">skip_softmax</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">skip_softmax</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">SkipSoftmaxAttentionConfig</span></code></p></td>
 <td><p>Dynamically skips eligible softmax work inside the FMHA kernel</p></td>
 <td><p>TRTLLM</p></td>
@@ -1059,7 +1074,7 @@ selector, runtime metadata, cache management, and attention implementation.</p>
 </tbody>
 </table>
 </div>
-<p>All five configs are supported only by the PyTorch execution backend. The
+<p>These configs are supported only by the PyTorch execution backend. The
 “attention implementation” column refers to the attention kernel/backend used
 inside that execution backend.</p>
 <section id="capability-comparison">
@@ -1070,6 +1085,7 @@ inside that execution backend.</p>
 <th class="head text-right"><p>RocketKV</p></th>
 <th class="head text-right"><p>DSA</p></th>
 <th class="head text-right"><p>DeepSeek-V4</p></th>
+<th class="head text-right"><p>CSA2</p></th>
 <th class="head text-right"><p>MiniMax-M3</p></th>
 <th class="head text-right"><p>Skip Softmax</p></th>
 </tr>
@@ -1081,8 +1097,10 @@ inside that execution backend.</p>
 <td class="text-right"><p>Yes</p></td>
 <td class="text-right"><p>Yes</p></td>
 <td class="text-right"><p>Yes</p></td>
+<td class="text-right"><p>Yes</p></td>
 </tr>
 <tr class="row-odd"><td><p>Sparse decode computation</p></td>
+<td class="text-right"><p>Yes</p></td>
 <td class="text-right"><p>Yes</p></td>
 <td class="text-right"><p>Yes</p></td>
 <td class="text-right"><p>Yes</p></td>
@@ -1093,6 +1111,7 @@ inside that execution backend.</p>
 <td class="text-right"><p>Yes</p></td>
 <td class="text-right"><p>No</p></td>
 <td class="text-right"><p>Yes, through model-native compression</p></td>
+<td class="text-right"><p>Yes, through model-native compression</p></td>
 <td class="text-right"><p>No</p></td>
 <td class="text-right"><p>No</p></td>
 </tr>
@@ -1101,11 +1120,13 @@ inside that execution backend.</p>
 <td class="text-right"><p>Yes</p></td>
 <td class="text-right"><p>Yes</p></td>
 <td class="text-right"><p>Yes</p></td>
+<td class="text-right"><p>Yes</p></td>
 <td class="text-right"><p>No</p></td>
 </tr>
 <tr class="row-even"><td><p>Selection granularity</p></td>
 <td class="text-right"><p>Token eviction and pages</p></td>
 <td class="text-right"><p>Tokens</p></td>
+<td class="text-right"><p>Compressed entries</p></td>
 <td class="text-right"><p>Compressed entries</p></td>
 <td class="text-right"><p>Blocks</p></td>
 <td class="text-right"><p>Kernel tiles</p></td>
@@ -1187,7 +1208,7 @@ insertion/radix Top-K path.</p>
 </pre></div>
 </div>
 <p>See the
-<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/cc63e66/examples/models/core/deepseek_v3/README.md">DeepSeek V3/V3.2 example</a>
+<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/0372799/examples/models/core/deepseek_v3/README.md">DeepSeek V3/V3.2 example</a>
 for model precision, hardware, parallelism, MTP, chunked-prefill, cache-reuse,
 and disaggregated-serving support.</p>
 </section>
@@ -1214,8 +1235,65 @@ SM121, that cache layout requires 256-token blocks.</p>
 </pre></div>
 </div>
 <p>See the
-<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/cc63e66/examples/models/core/deepseek_v4/README.md">DeepSeek-V4 example</a> for
+<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/0372799/examples/models/core/deepseek_v4/README.md">DeepSeek-V4 example</a> for
 checkpoint-derived configuration and deployment constraints.</p>
+</section>
+<section id="deepseek-v4-1-csa2">
+<h4>DeepSeek-V4.1 CSA2<a class="headerlink" href="#deepseek-v4-1-csa2" title="Link to this heading">#</a></h4>
+<p>DeepSeek-V4.1 selects <code class="docutils literal notranslate"><span class="pre">CSA2SparseAttentionConfig</span></code> from its checkpoint. Keep
+checkpoint compression ratios, KV/index source ownership, window and Top-K
+geometry intact; CSA2 is model-native rather than a switch for arbitrary MLA models.</p>
+<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">sparse_attention_config</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">algorithm</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">csa2</span>
+</pre></div>
+</div>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Constraint</p></th>
+<th class="head"><p>CSA2 support</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>Hardware</p></td>
+<td><p>SM90: FlashMLA BF16; SM100 family: native trtllm-gen; SM120/121: FlashInfer BF16 FA2</p></td>
+</tr>
+<tr class="row-odd"><td><p>Attention shape</p></td>
+<td><p>One KV head, 512-dimensional queries/values, 448 non-RoPE and 64 RoPE channels; checkpoint-defined Q heads</p></td>
+</tr>
+<tr class="row-even"><td><p>Compression</p></td>
+<td><p>Ratios <code class="docutils literal notranslate"><span class="pre">0</span></code> (SWA only), <code class="docutils literal notranslate"><span class="pre">1</span></code>, <code class="docutils literal notranslate"><span class="pre">2</span></code>; checkpoint-defined shared KV/index sources</p></td>
+</tr>
+<tr class="row-odd"><td><p>KV-cache block size</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">128</span></code> or <code class="docutils literal notranslate"><span class="pre">256</span></code> tokens</p></td>
+</tr>
+<tr class="row-even"><td><p>Persistent cache</p></td>
+<td><p>Fixed E4M3 SWA, NVFP4 main/index records; <code class="docutils literal notranslate"><span class="pre">dtype</span></code> selects compute staging</p></td>
+</tr>
+<tr class="row-odd"><td><p>Staging</p></td>
+<td><p>BF16; FP8 on native trtllm-gen without packed attention via <code class="docutils literal notranslate"><span class="pre">dtype:</span> <span class="pre">fp8</span></code> or <code class="docutils literal notranslate"><span class="pre">fp8_ds_mla</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p>Parallelism</p></td>
+<td><p>TP/EP and attention DP; PP/CP and disabled-layer masks unsupported</p></td>
+</tr>
+<tr class="row-odd"><td><p>Runtime</p></td>
+<td><p>Chunked prefill, prefix reuse, overlap and CUDA graphs; embedded DSpark linear verification; tree verification unsupported</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>Decoder bounded replay is an <strong>approximation enabled by default</strong> for eligible
+CED layouts. It computes a trailing Decoder window while the Encoder produces
+the complete GLOBAL history. Set <code class="docutils literal notranslate"><span class="pre">TRTLLM_V41_DECODER_BOUNDED_REPLAY=0</span></code> before
+starting workers to use full Decoder prefill. Encoder replay is opt-in via
+<code class="docutils literal notranslate"><span class="pre">TRTLLM_V41_ENCODER_REPLAY=1</span></code> and requires Decoder bounded replay; it permits
+eviction and recovery of OPTIONAL Encoder SWA state. Set these consistently
+for all workers. Replay eligibility and output requirements can retain full
+prefill, as described in the <span class="xref myst">CSA2 implementation guide</span>.</p>
+<p>Validate task accuracy against full prefill on the intended checkpoint before
+deploying bounded replay or optional packed/approximate selector paths. Include
+fresh prompts, reused prefixes, chunk boundaries and speculative verification;
+component tests of cache bytes and graph replay do not establish whole-model
+accuracy or end-to-end disaggregated-serving support.</p>
 </section>
 <section id="minimax-m3-block-sparse-gqa">
 <h4>MiniMax-M3 Block-Sparse GQA<a class="headerlink" href="#minimax-m3-block-sparse-gqa" title="Link to this heading">#</a></h4>
@@ -1387,7 +1465,7 @@ trtllm-bench<span class="w"> </span>--model<span class="w"> </span>deepseek-ai/D
 <p>Use a local checkpoint path in place of the Hugging Face model ID when needed.
 Other sparse algorithms use the same YAML entry point with their own
 <code class="docutils literal notranslate"><span class="pre">algorithm</span></code> discriminator and settings. See the
-<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/cc63e66/examples/models/core/deepseek_v3/README.md">DeepSeek V3/V3.2 example</a>
+<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/0372799/examples/models/core/deepseek_v3/README.md">DeepSeek V3/V3.2 example</a>
 for model precision, hardware, parallelism, MTP, chunked-prefill, cache-reuse,
 and disaggregated-serving configurations.</p>
 </section>
@@ -1466,6 +1544,7 @@ stored KV representation or retained KV set outside the Attention kernel.</p></l
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#rocketkv">RocketKV</a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#deepseek-sparse-attention">DeepSeek Sparse Attention</a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#deepseek-v4-hybrid-sparse-attention">DeepSeek-V4 Hybrid Sparse Attention</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#deepseek-v4-1-csa2">DeepSeek-V4.1 CSA2</a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#minimax-m3-block-sparse-gqa">MiniMax-M3 Block-Sparse GQA</a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#skip-softmax-attention">Skip Softmax Attention</a></li>
 </ul>
@@ -1565,9 +1644,9 @@ stored KV representation or retained KV set outside the Attention kernel.</p></l
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on October 09, 2026.</p>
+  <p>Last updated on October 19, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/cc63e66">cc63e66</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/0372799">0372799</a>.</p>
   
 </div></div>
       

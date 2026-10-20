@@ -62,7 +62,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.23.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc0';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc1';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -79,7 +79,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="color-scheme" content="light dark"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.4.0rc0" />
+  <meta name="docsearch:version" content="1.4.0rc1" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -444,6 +444,9 @@
 <li class="toctree-l1 has-children"><a class="reference internal" href="../llm-api/reference.html">API Reference</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/LLM.html">LLM</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/AsyncLLM.html">AsyncLLM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/ExecutorMemoryType.html">ExecutorMemoryType</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/RuntimeMemoryStatus.html">RuntimeMemoryStatus</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SleepConfig.html">SleepConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/MultimodalEncoder.html">MultimodalEncoder</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CompletionOutput.html">CompletionOutput</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/RequestOutput.html">RequestOutput</a></li>
@@ -533,6 +536,7 @@
 <li class="toctree-l1"><a class="reference internal" href="speculative-decoding.html">Speculative Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="checkpoint-loading.html">Checkpoint Loading</a></li>
 <li class="toctree-l1"><a class="reference internal" href="model-express.html">ModelExpress (MX) Checkpoint Loading</a></li>
+<li class="toctree-l1"><a class="reference internal" href="sleep-wakeup.html">Runtime Memory Checkpointing (Prototype)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="ray-orchestrator.html">Ray Orchestrator (Prototype)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="torch_compile_and_piecewise_cuda_graph.html">Torch Compile &amp; Prefill CUDA Graph</a></li>
 <li class="toctree-l1"><a class="reference internal" href="helix.html">Helix Parallelism</a></li>
@@ -551,6 +555,10 @@
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/overview.html">Architecture Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/perf-analysis.html">Performance Analysis</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/perf-benchmarking.html">TensorRT LLM Benchmarking</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../developer-guide/moe-perf-guide.html">MoE Performance Guide</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../developer-guide/moe-perf-dashboard.html">MoE Perf Dashboard</a></li>
+</ul>
+</details></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/ci-overview.html">Continuous Integration Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/dev-containers.html">Using Dev Containers</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/api-change.html">LLM API Change Guide</a></li>
@@ -562,6 +570,7 @@
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog30_KV_Cache_Compression_in_TensorRT-LLM.html">KV Cache Compression in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog29_GVR_V2_Self_Sampling_Exact_TopK_for_Sparse_Attention.html">GVR V2: Self-Sampling and Multi-Thresholding for Faster Exact Top-K</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog28_Accelerating_Video_Generation_with_GEMM_Quantization_Attention_Quantization_and_Skip_Softmax_Attention_in_TensorRT-LLM.html">Accelerating Video Generation with GEMM Quantization, Attention Quantization and Skip Softmax Attention in TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog27_Evaluating_Agentic_Serving_with_Trace_Replay_and_Job_Level_Metrics.html">Evaluating Agentic Serving with Trace Replay and Job-Level Metrics</a></li>
@@ -869,9 +878,40 @@ cache:</p>
 <p>Cold-page NVFP4 is different from an active NVFP4 KV cache. The former stores
 NVFP4 only in a cold cache tier and restores the runtime type before Attention;
 the latter sets <code class="docutils literal notranslate"><span class="pre">KvCacheConfig(dtype=&quot;nvfp4&quot;)</span></code> and keeps active GPU KV in
-NVFP4. See <a class="reference internal" href="quantization.html"><span class="std std-doc">Quantization</span></a> for active KV-cache quantization.
-For complete single-GPU and disaggregated-serving configurations, see the
-<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/cc63e66/examples/kv_cache_compression/nvfp4_cold_page.md">NVFP4 cold-page compression example</a>.</p>
+NVFP4. See <a class="reference internal" href="quantization.html"><span class="std std-doc">Quantization</span></a> for active KV-cache quantization.</p>
+<p>For complete single-GPU and disaggregated-serving configurations, see the
+<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/0372799/examples/kv_cache_compression/nvfp4_cold_page.md">NVFP4 cold-page compression example</a>.</p>
+<section id="skipping-rope-quantization">
+<h4>Skipping RoPE Quantization<a class="headerlink" href="#skipping-rope-quantization" title="Link to this heading">#</a></h4>
+<p>In some models, part of each K vector carries positional information (RoPE).
+When NVFP4 cold-page compression is enabled, <code class="docutils literal notranslate"><span class="pre">skip_rope_quantization</span></code> controls
+how that part is stored:</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">false</span></code> (default): quantize RoPE as well. DeepSeek-V4 compressed rows use single
+NVFP4 for NoPE and two FP4 components (2FP4) for RoPE by default; other models
+use single NVFP4.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">true</span></code>: copy the supported target RoPE part unchanged at the hot-cache
+precision, such as FP8 or BF16. The remaining values use NVFP4.</p></li>
+</ul>
+<p>For DeepSeek-V4, <code class="docutils literal notranslate"><span class="pre">nvfp4_residual_dim</span></code> defaults to <code class="docutils literal notranslate"><span class="pre">64</span></code>, using 2FP4 for its
+64 RoPE values. Set it to <code class="docutils literal notranslate"><span class="pre">0</span></code> with <code class="docutils literal notranslate"><span class="pre">skip_rope_quantization:</span> <span class="pre">false</span></code>
+for single NVFP4 throughout the row. Only <code class="docutils literal notranslate"><span class="pre">0</span></code> and <code class="docutils literal notranslate"><span class="pre">64</span></code> are supported. Setting
+<code class="docutils literal notranslate"><span class="pre">skip_rope_quantization</span></code> to <code class="docutils literal notranslate"><span class="pre">true</span></code> preserves RoPE regardless of the residual
+option. See the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/0372799/examples/kv_cache_compression/nvfp4_cold_page.md">DeepSeek-V4 example</a>
+for the three formats.</p>
+<p>Preserving RoPE increases cold-cache storage relative to single NVFP4. These
+formats are exploratory; validate accuracy on your model and workload. Skipping
+RoPE is available for DeepSeek-V4, GLM-5 (<code class="docutils literal notranslate"><span class="pre">glm_moe_dsa</span></code>), and the Qwen3.5 series;
+2FP4 is available only for DeepSeek-V4. To add model support, follow the layout
+requirements in the
+<a class="reference internal" href="../developer-guide/kv-cache-compression-development.html#which-numbers-of-a-k-or-v-vector-become-nvfp4"><span class="std std-ref">development guide</span></a>.</p>
+<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">kv_cache_compression_config</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">algorithm</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">quantization_for_cold_page</span>
+<span class="w">  </span><span class="nt">quant</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">nvfp4</span>
+<span class="w">  </span><span class="nt">skip_rope_quantization</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span>
+</pre></div>
+</div>
+</section>
 </section>
 <section id="triattention">
 <h3>TriAttention<a class="headerlink" href="#triattention" title="Link to this heading">#</a></h3>
@@ -900,7 +940,7 @@ implementation runs over the compacted cache.</p>
 </pre></div>
 </div>
 <p>For calibration, configuration parameters, and current requirements, see the
-<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/cc63e66/examples/kv_cache_compression/triattention.md">detailed TriAttention example</a>.</p>
+<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/0372799/examples/kv_cache_compression/triattention.md">detailed TriAttention example</a>.</p>
 </section>
 </section>
 <section id="support">
@@ -940,7 +980,7 @@ structures. Both share the same general platform requirements.<a class="footnote
 <td><p>Not supported</p></td>
 </tr>
 <tr class="row-even"><td><p>DeepSeek-V4 CSA cache</p></td>
-<td><p>Supported<a class="footnote-reference brackets" href="#deepseek-v4" id="id4" role="doc-noteref"><span class="fn-bracket">[</span>4<span class="fn-bracket">]</span></a>; the NoPE part of the compressed KV is encoded as NVFP4, the RoPE part and the indexer cache are preserved losslessly</p></td>
+<td><p>Supported<a class="footnote-reference brackets" href="#deepseek-v4" id="id4" role="doc-noteref"><span class="fn-bracket">[</span>4<span class="fn-bracket">]</span></a>; NoPE uses NVFP4 and RoPE defaults to 2FP4, or keeps its original precision when <code class="docutils literal notranslate"><span class="pre">skip_rope_quantization</span></code> is <code class="docutils literal notranslate"><span class="pre">true</span></code>; the indexer cache is preserved losslessly</p></td>
 <td><p>Not supported</p></td>
 </tr>
 <tr class="row-odd"><td><p>DeepSeek-V4 SWA, HCA, and compressor state</p></td>
@@ -974,8 +1014,8 @@ examples for method-specific requirements.</p>
 <section id="further-reading">
 <h2>Further Reading<a class="headerlink" href="#further-reading" title="Link to this heading">#</a></h2>
 <ul class="simple">
-<li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/cc63e66/examples/kv_cache_compression/nvfp4_cold_page.md">NVFP4 Cold-Page KV-Cache Compression example</a></p></li>
-<li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/cc63e66/examples/kv_cache_compression/triattention.md">TriAttention KV-Cache Compression example</a></p></li>
+<li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/0372799/examples/kv_cache_compression/nvfp4_cold_page.md">NVFP4 Cold-Page KV-Cache Compression example</a></p></li>
+<li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/0372799/examples/kv_cache_compression/triattention.md">TriAttention KV-Cache Compression example</a></p></li>
 <li><p><a class="reference internal" href="../developer-guide/kv-cache-compression-development.html"><span class="std std-doc">KV Cache Compression Development Guide</span></a></p></li>
 <li><p><a class="reference internal" href="../developer-guide/kv-cache-cold-page-codec.html"><span class="std std-doc">KVCacheManagerV2 Cold-Page Codec Design</span></a></p></li>
 <li><p><a class="reference internal" href="kvcache.html"><span class="std std-doc">KV Cache System</span></a></p></li>
@@ -994,14 +1034,14 @@ KVCM V2, and an NVIDIA GPU with compute capability SM100, SM103, or SM107.</p>
 <span class="label"><span class="fn-bracket">[</span><a role="doc-backlink" href="#id2">2</a><span class="fn-bracket">]</span></span>
 <p>NVFP4 cold-page quantization additionally requires
 the native C++ KVCM V2 backend and a nonzero Host or Disk cache. See the
-<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/cc63e66/examples/kv_cache_compression/nvfp4_cold_page.md">NVFP4 cold-page compression example</a>
+<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/0372799/examples/kv_cache_compression/nvfp4_cold_page.md">NVFP4 cold-page compression example</a>
 for its remaining requirements and validated modes.</p>
 </aside>
 <aside class="footnote brackets" id="triattention-requirements" role="doc-footnote">
 <span class="label"><span class="fn-bracket">[</span><a role="doc-backlink" href="#id3">3</a><span class="fn-bracket">]</span></span>
 <p>TriAttention requires a model-specific offline
 calibration file. See the
-<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/cc63e66/examples/kv_cache_compression/triattention.md">detailed TriAttention example</a>
+<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/0372799/examples/kv_cache_compression/triattention.md">detailed TriAttention example</a>
 for its remaining requirements and validated modes.</p>
 </aside>
 <aside class="footnote brackets" id="deepseek-v4" role="doc-footnote">
@@ -1071,7 +1111,10 @@ is not used.</p>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#compression-methods">Compression Methods</a><ul class="nav section-nav flex-column">
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#cold-page-quantization">Cold-Page Quantization</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#cold-page-quantization">Cold-Page Quantization</a><ul class="nav section-nav flex-column">
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#skipping-rope-quantization">Skipping RoPE Quantization</a></li>
+</ul>
+</li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#triattention">TriAttention</a></li>
 </ul>
 </li>
@@ -1171,9 +1214,9 @@ is not used.</p>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on October 09, 2026.</p>
+  <p>Last updated on October 19, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/cc63e66">cc63e66</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/0372799">0372799</a>.</p>
   
 </div></div>
       

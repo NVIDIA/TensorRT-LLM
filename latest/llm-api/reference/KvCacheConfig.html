@@ -62,7 +62,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.23.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc0';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc1';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -79,7 +79,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="color-scheme" content="light dark"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.4.0rc0" />
+  <meta name="docsearch:version" content="1.4.0rc1" />
   
     
     <script src="../../_static/searchtools.js"></script>
@@ -444,6 +444,9 @@
 <li class="toctree-l1 current active has-children"><a class="reference internal" href="../reference.html">API Reference</a><details open="open"><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul class="current">
 <li class="toctree-l2"><a class="reference internal" href="LLM.html">LLM</a></li>
 <li class="toctree-l2"><a class="reference internal" href="AsyncLLM.html">AsyncLLM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ExecutorMemoryType.html">ExecutorMemoryType</a></li>
+<li class="toctree-l2"><a class="reference internal" href="RuntimeMemoryStatus.html">RuntimeMemoryStatus</a></li>
+<li class="toctree-l2"><a class="reference internal" href="SleepConfig.html">SleepConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="MultimodalEncoder.html">MultimodalEncoder</a></li>
 <li class="toctree-l2"><a class="reference internal" href="CompletionOutput.html">CompletionOutput</a></li>
 <li class="toctree-l2"><a class="reference internal" href="RequestOutput.html">RequestOutput</a></li>
@@ -533,6 +536,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../../features/speculative-decoding.html">Speculative Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/checkpoint-loading.html">Checkpoint Loading</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/model-express.html">ModelExpress (MX) Checkpoint Loading</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/sleep-wakeup.html">Runtime Memory Checkpointing (Prototype)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/ray-orchestrator.html">Ray Orchestrator (Prototype)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/torch_compile_and_piecewise_cuda_graph.html">Torch Compile &amp; Prefill CUDA Graph</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/helix.html">Helix Parallelism</a></li>
@@ -551,6 +555,10 @@
 <li class="toctree-l1"><a class="reference internal" href="../../developer-guide/overview.html">Architecture Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../developer-guide/perf-analysis.html">Performance Analysis</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../developer-guide/perf-benchmarking.html">TensorRT LLM Benchmarking</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../developer-guide/moe-perf-guide.html">MoE Performance Guide</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../developer-guide/moe-perf-dashboard.html">MoE Perf Dashboard</a></li>
+</ul>
+</details></li>
 <li class="toctree-l1"><a class="reference internal" href="../../developer-guide/ci-overview.html">Continuous Integration Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../developer-guide/dev-containers.html">Using Dev Containers</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../developer-guide/api-change.html">LLM API Change Guide</a></li>
@@ -562,6 +570,7 @@
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog30_KV_Cache_Compression_in_TensorRT-LLM.html">KV Cache Compression in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog29_GVR_V2_Self_Sampling_Exact_TopK_for_Sparse_Attention.html">GVR V2: Self-Sampling and Multi-Thresholding for Faster Exact Top-K</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog28_Accelerating_Video_Generation_with_GEMM_Quantization_Attention_Quantization_and_Skip_Softmax_Attention_in_TensorRT-LLM.html">Accelerating Video Generation with GEMM Quantization, Attention Quantization and Skip Softmax Attention in TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog27_Evaluating_Agentic_Serving_with_Trace_Replay_and_Job_Level_Metrics.html">Evaluating Agentic Serving with Trace Replay and Job-Level Metrics</a></li>
@@ -705,7 +714,7 @@
 <dd><em class="sig-param"><span class="n"><span class="pre">mamba_state_cache_interval:</span> <span class="pre">~typing.Annotated[int</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">~annotated_types.Ge(ge=0)]</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">mamba_state_config:</span> <span class="pre">~tensorrt_llm.llmapi.llm_args.MambaStateConfig</span> <span class="pre">=</span> <span class="pre">&lt;factory&gt;</span></span></em>,</dd>
-<dd><em class="sig-param"><span class="n"><span class="pre">use_kv_cache_manager_v2:</span> <span class="pre">bool</span> <span class="pre">|</span> <span class="pre">~typing.Literal['auto']</span> <span class="pre">=</span> <span class="pre">'auto'</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">use_kv_cache_manager_v2:</span> <span class="pre">bool</span> <span class="pre">|</span> <span class="pre">~typing.Literal['auto']</span> <span class="pre">=</span> <span class="pre">True</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">enable_swa_scratch_reuse:</span> <span class="pre">bool</span> <span class="pre">=</span> <span class="pre">False</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">kv_cache_event_hash_algo:</span> <span class="pre">~typing.Literal['auto'</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">'v1_block_key'</span></span></em>,</dd>
@@ -715,6 +724,7 @@
 <dd><em class="sig-param"><span class="n"><span class="pre">~annotated_types.Gt(gt=0)</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">~annotated_types.Le(le=1)]</span> <span class="pre">=</span> <span class="pre">0.95</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">enable_kv_pool_rebalance:</span> <span class="pre">bool</span> <span class="pre">=</span> <span class="pre">False</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">kv_pool_rebalance_config:</span> <span class="pre">~tensorrt_llm.llmapi.llm_args.KvPoolRebalanceConfig</span> <span class="pre">=</span> <span class="pre">&lt;factory&gt;</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">disk_prefetch_num_reqs:</span> <span class="pre">~typing.Annotated[int</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">~annotated_types.Ge(ge=0)]</span> <span class="pre">=</span> <span class="pre">0</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">fp8_context_mla_kv_len_cap:</span> <span class="pre">int</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None</span></span></em>,</dd>
@@ -798,7 +808,7 @@
 <dl class="py attribute pydantic_field">
 <dt class="sig sig-object py" id="tensorrt_llm.llmapi.KvCacheConfig.enable_kv_pool_rebalance">
 <em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">enable_kv_pool_rebalance</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">bool</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">False</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.KvCacheConfig.enable_kv_pool_rebalance" title="Link to this definition">#</a></dt>
-<dd><p>Opt in to the KVCacheManagerV2 auto-tuner (<code class="docutils literal notranslate"><span class="pre">adjust()</span></code>) for rebalancing pool-group ratios between iterations. When True the PyExecutor calls <code class="docutils literal notranslate"><span class="pre">adjust()</span></code> opportunistically; the auto-tuner itself remains gated by V2’s internal 2000-sample / 120s cooldown. When False (default) the rebalance hook is skipped entirely and pool ratios remain at their warmup-derived values. Beta: enable at your own risk. Only used when using KV cache manager v2 (experimental). This option is incompatible with dtype=’fp8_ds_mla’.</p>
+<dd><p>Opt in to the KVCacheManagerV2 auto-tuner (<code class="docutils literal notranslate"><span class="pre">adjust()</span></code>) for rebalancing pool-group ratios between iterations. When True the PyExecutor calls <code class="docutils literal notranslate"><span class="pre">adjust()</span></code> opportunistically; the auto-tuner itself remains gated by the <code class="docutils literal notranslate"><span class="pre">kv_pool_rebalance_config</span></code> thresholds (2000 samples / 120s by default). When False (default) the rebalance hook is skipped entirely and pool ratios remain at their warmup-derived values. Beta: enable at your own risk. Only used when using KV cache manager v2 (experimental). This option is incompatible with dtype=’fp8_ds_mla’.</p>
 </dd></dl>
 
 <dl class="py attribute pydantic_field">
@@ -868,6 +878,12 @@
 <dt class="sig sig-object py" id="tensorrt_llm.llmapi.KvCacheConfig.kv_events_config">
 <em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">kv_events_config</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference internal" href="KVEventsConfig.html#tensorrt_llm.llmapi.KVEventsConfig" title="tensorrt_llm.llmapi.llm_args.KVEventsConfig"><span class="pre">KVEventsConfig</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.KvCacheConfig.kv_events_config" title="Link to this definition">#</a></dt>
 <dd><p>Streaming (push-based) KV cache event publishing (KV cache manager V2 only). When set, each rank publishes its own events directly (e.g. over ZeroMQ) instead of the buffered event_buffer_max_size gather/poll path.</p>
+</dd></dl>
+
+<dl class="py attribute pydantic_field">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.KvCacheConfig.kv_pool_rebalance_config">
+<em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">kv_pool_rebalance_config</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">KvPoolRebalanceConfig</span></em><em class="property"> <span class="pre">[Optional]</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.KvCacheConfig.kv_pool_rebalance_config" title="Link to this definition">#</a></dt>
+<dd><p>Tuning for the KVCacheManagerV2 pool rebalance auto-tuner. Only used when <code class="docutils literal notranslate"><span class="pre">enable_kv_pool_rebalance</span></code> is True.</p>
 </dd></dl>
 
 <dl class="py attribute pydantic_field">
@@ -980,8 +996,8 @@
 
 <dl class="py attribute pydantic_field">
 <dt class="sig sig-object py" id="tensorrt_llm.llmapi.KvCacheConfig.use_kv_cache_manager_v2">
-<em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">use_kv_cache_manager_v2</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">bool</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">Literal</span><span class="p"><span class="pre">[</span></span><span class="s"><span class="pre">'auto'</span></span><span class="p"><span class="pre">]</span></span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">'auto'</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.KvCacheConfig.use_kv_cache_manager_v2" title="Link to this definition">#</a></dt>
-<dd><p>Whether to use the KV cache manager v2 (experimental). ‘auto’ uses the model-specific preference and falls back to False when the model does not declare one.</p>
+<em class="property"><span class="pre">field</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">use_kv_cache_manager_v2</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">bool</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">Literal</span><span class="p"><span class="pre">[</span></span><span class="s"><span class="pre">'auto'</span></span><span class="p"><span class="pre">]</span></span></em><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">True</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.KvCacheConfig.use_kv_cache_manager_v2" title="Link to this definition">#</a></dt>
+<dd><p>Whether to use the KV cache manager v2 (experimental). Defaults to True. Set False to select V1 for models that support it. ‘auto’ uses the model-specific preference and falls back to False when the model does not declare one.</p>
 </dd></dl>
 
 <dl class="py attribute pydantic_field">
@@ -1237,6 +1253,7 @@ pybind instance</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.KvCacheConfig.iteration_stats_interval"><code class="docutils literal notranslate"><span class="pre">iteration_stats_interval</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.KvCacheConfig.kv_cache_event_hash_algo"><code class="docutils literal notranslate"><span class="pre">kv_cache_event_hash_algo</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.KvCacheConfig.kv_events_config"><code class="docutils literal notranslate"><span class="pre">kv_events_config</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.KvCacheConfig.kv_pool_rebalance_config"><code class="docutils literal notranslate"><span class="pre">kv_pool_rebalance_config</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.KvCacheConfig.mamba_ssm_cache_dtype"><code class="docutils literal notranslate"><span class="pre">mamba_ssm_cache_dtype</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.KvCacheConfig.mamba_ssm_philox_rounds"><code class="docutils literal notranslate"><span class="pre">mamba_ssm_philox_rounds</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.KvCacheConfig.mamba_ssm_stochastic_rounding"><code class="docutils literal notranslate"><span class="pre">mamba_ssm_stochastic_rounding</span></code></a></li>
@@ -1370,9 +1387,9 @@ pybind instance</p>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on October 09, 2026.</p>
+  <p>Last updated on October 19, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/cc63e66">cc63e66</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/0372799">0372799</a>.</p>
   
 </div></div>
       

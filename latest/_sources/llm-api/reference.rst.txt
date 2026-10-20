@@ -37,6 +37,9 @@ API Reference
 
     reference/LLM
     reference/AsyncLLM
+    reference/ExecutorMemoryType
+    reference/RuntimeMemoryStatus
+    reference/SleepConfig
     reference/MultimodalEncoder
     reference/CompletionOutput
     reference/RequestOutput
@@ -112,6 +115,21 @@ This page provides a searchable index of API names and parameters. Open an entry
     :no-index:
 
     :doc:`View the full AsyncLLM reference <reference/AsyncLLM>`
+
+.. autoclass:: tensorrt_llm.llmapi.ExecutorMemoryType
+    :no-index:
+
+    :doc:`View the full ExecutorMemoryType reference <reference/ExecutorMemoryType>`
+
+.. autoclass:: tensorrt_llm.llmapi.RuntimeMemoryStatus
+    :no-index:
+
+    :doc:`View the full RuntimeMemoryStatus reference <reference/RuntimeMemoryStatus>`
+
+.. autoclass:: tensorrt_llm.llmapi.SleepConfig
+    :no-index:
+
+    :doc:`View the full SleepConfig reference <reference/SleepConfig>`
 
 .. autoclass:: tensorrt_llm.llmapi.MultimodalEncoder
     :no-index:

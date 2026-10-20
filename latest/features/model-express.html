@@ -62,7 +62,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.23.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc0';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc1';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -72,14 +72,14 @@
 
     <link rel="index" title="Index" href="../genindex.html" />
     <link rel="search" title="Search" href="../search.html" />
-    <link rel="next" title="Ray Orchestrator (Prototype)" href="ray-orchestrator.html" />
+    <link rel="next" title="Runtime Memory Checkpointing (Prototype)" href="sleep-wakeup.html" />
     <link rel="prev" title="Checkpoint Loading" href="checkpoint-loading.html" />
 
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="color-scheme" content="light dark"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.4.0rc0" />
+  <meta name="docsearch:version" content="1.4.0rc1" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -444,6 +444,9 @@
 <li class="toctree-l1 has-children"><a class="reference internal" href="../llm-api/reference.html">API Reference</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/LLM.html">LLM</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/AsyncLLM.html">AsyncLLM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/ExecutorMemoryType.html">ExecutorMemoryType</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/RuntimeMemoryStatus.html">RuntimeMemoryStatus</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SleepConfig.html">SleepConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/MultimodalEncoder.html">MultimodalEncoder</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CompletionOutput.html">CompletionOutput</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/RequestOutput.html">RequestOutput</a></li>
@@ -533,6 +536,7 @@
 <li class="toctree-l1"><a class="reference internal" href="speculative-decoding.html">Speculative Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="checkpoint-loading.html">Checkpoint Loading</a></li>
 <li class="toctree-l1 current active"><a aria-current="page" class="current reference internal" href="#">ModelExpress (MX) Checkpoint Loading</a></li>
+<li class="toctree-l1"><a class="reference internal" href="sleep-wakeup.html">Runtime Memory Checkpointing (Prototype)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="ray-orchestrator.html">Ray Orchestrator (Prototype)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="torch_compile_and_piecewise_cuda_graph.html">Torch Compile &amp; Prefill CUDA Graph</a></li>
 <li class="toctree-l1"><a class="reference internal" href="helix.html">Helix Parallelism</a></li>
@@ -551,6 +555,10 @@
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/overview.html">Architecture Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/perf-analysis.html">Performance Analysis</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/perf-benchmarking.html">TensorRT LLM Benchmarking</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../developer-guide/moe-perf-guide.html">MoE Performance Guide</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../developer-guide/moe-perf-dashboard.html">MoE Perf Dashboard</a></li>
+</ul>
+</details></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/ci-overview.html">Continuous Integration Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/dev-containers.html">Using Dev Containers</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/api-change.html">LLM API Change Guide</a></li>
@@ -562,6 +570,7 @@
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog30_KV_Cache_Compression_in_TensorRT-LLM.html">KV Cache Compression in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog29_GVR_V2_Self_Sampling_Exact_TopK_for_Sparse_Attention.html">GVR V2: Self-Sampling and Multi-Thresholding for Faster Exact Top-K</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog28_Accelerating_Video_Generation_with_GEMM_Quantization_Attention_Quantization_and_Skip_Softmax_Attention_in_TensorRT-LLM.html">Accelerating Video Generation with GEMM Quantization, Attention Quantization and Skip Softmax Attention in TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog27_Evaluating_Agentic_Serving_with_Trace_Replay_and_Job_Level_Metrics.html">Evaluating Agentic Serving with Trace Replay and Job-Level Metrics</a></li>
@@ -866,11 +875,37 @@ row. <code class="docutils literal notranslate"><span class="pre">TRTLLM_MX_E2E_
 baseline worker, receiver worker, and donor-readiness wait; increase it for
 slow model storage or startup.</p>
 <p>The dedicated H100 CI stages own isolated Redis and ModelExpress 0.5.1
-sidecars. The two-GPU TP=1 stage is classified as multi-GPU: it runs
-automatically in post-merge pipelines or when a multi-GPU file changes, while
-direct pre-merge dispatch requires the <code class="docutils literal notranslate"><span class="pre">ci:</span> <span class="pre">full</span> <span class="pre">pre-merge</span> <span class="pre">approved</span></code> label.
-Trigger it directly with:</p>
+sidecars. Coverage is tiered so that pull requests pay for one lightweight
+end-to-end canary while every qualified family still runs on each main commit:</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Stage</p></th>
+<th class="head"><p>When it runs</p></th>
+<th class="head"><p>Rows</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">DGX_H100-2_GPUs-PyTorch-ModelExpress-1</span></code></p></td>
+<td><p>Pre-merge and post-merge</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">llama-bf16-tp1</span></code> and <code class="docutils literal notranslate"><span class="pre">test_mx_source_identity_gate.py</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">DGX_H100-2_GPUs-PyTorch-ModelExpress-Post-Merge-1</span></code></p></td>
+<td><p>Post-merge only</p></td>
+<td><p>The other TP=1 family rows and the accuracy canaries below</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">DGX_H100-4_GPUs-PyTorch-ModelExpress-OnDemand-1</span></code></p></td>
+<td><p>On demand only</p></td>
+<td><p>Every TP=2 row</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>The two-GPU stages are classified as multi-GPU, so running either of them on a
+pull request requires the <code class="docutils literal notranslate"><span class="pre">ci:</span> <span class="pre">full</span> <span class="pre">pre-merge</span> <span class="pre">approved</span></code> label; the pre-merge
+stage is also selected automatically when a multi-GPU file changes. Trigger
+them directly with:</p>
 <div class="highlight-text notranslate"><div class="highlight"><pre><span></span>/bot run --stage-list "DGX_H100-2_GPUs-PyTorch-ModelExpress-1"
+/bot run --stage-list "DGX_H100-2_GPUs-PyTorch-ModelExpress-Post-Merge-1"
 </pre></div>
 </div>
 <p>TP=2 is the minimum evidence for adding or changing a parallel profile. Its
@@ -879,10 +914,81 @@ multi-GPU runs:</p>
 <div class="highlight-text notranslate"><div class="highlight"><pre><span></span>/bot run --stage-list "DGX_H100-4_GPUs-PyTorch-ModelExpress-OnDemand-1"
 </pre></div>
 </div>
-<p>Both stages set <code class="docutils literal notranslate"><span class="pre">TRTLLM_MX_E2E_REQUIRED=1</span></code>, so missing service, model, client,
-or NIXL prerequisites fail instead of skipping. Do not add every model profile
-to recurring coverage: use the harness for representative rows claimed by the
-support table and keep wider matrices in scheduled qualification.</p>
+<p>All three stages set <code class="docutils literal notranslate"><span class="pre">TRTLLM_MX_E2E_REQUIRED=1</span></code>, so missing service, model,
+client, or NIXL prerequisites fail instead of skipping. Do not grow pre-merge
+coverage with each new family: its TP=1 row belongs in the <code class="docutils literal notranslate"><span class="pre">post_merge</span></code> block of
+<code class="docutils literal notranslate"><span class="pre">tests/integration/test_lists/test-db/l0_model_express.yml</span></code> and its TP=2 row
+in the on-demand stage, while the pre-merge block keeps a single
+representative row.</p>
+</section>
+<section id="accuracy-canaries-post-merge">
+<h3>Accuracy Canaries (Post-Merge)<a class="headerlink" href="#accuracy-canaries-post-merge" title="Link to this heading">#</a></h3>
+<p><code class="docutils literal notranslate"><span class="pre">tests/integration/defs/model_express/test_model_express_accuracy.py</span></code> runs
+reference-backed accuracy canaries on an MX receiver. The donor publishes exactly as in the smoke test and never evaluates; the receiver starts
+from the metadata-only snapshot and, right after load, confirms that every rank
+wrote its transfer manifest at the MX P2P success boundary. If any rank did
+not, the receiver exits with status 3 before spending any evaluation time.
+Otherwise it evaluates the task with <code class="docutils literal notranslate"><span class="pre">tensorrt_llm.evaluate</span></code> inside its own
+subprocess and writes the score to JSON. The pytest process never constructs an <code class="docutils literal notranslate"><span class="pre">LLM</span></code>: it loads the
+accuracy reference YAMLs, asserts the same hypothesis-testing threshold as
+<code class="docutils literal notranslate"><span class="pre">tests/integration/defs/accuracy/</span></code>, and additionally requires the transfer
+evidence and the donor/receiver weight manifests to match. There is no paired
+HF baseline evaluation because the reference value is that baseline.</p>
+<p>Current rows (TP=1, BF16; <code class="docutils literal notranslate"><span class="pre">references/*.yaml</span></code> holds the expected values):</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Test ID</p></th>
+<th class="head"><p>Model</p></th>
+<th class="head"><p>Task</p></th>
+<th class="head"><p>Model path override</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">qwen3-8b-gsm8k-tp1</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">Qwen3/Qwen3-8B</span></code></p></td>
+<td><p>GSM8K</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">TRTLLM_MX_QWEN3_MODEL</span></code></p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>A canary needs a bare BF16 reference for its task that was measured on the
+PyTorch backend. The Qwen3 GSM8K entry is the one gated by
+<code class="docutils literal notranslate"><span class="pre">tests/integration/defs/accuracy/test_disaggregated_serving.py::TestQwen3_8B</span></code>,
+so re-run that test to re-measure it if the value drifts. No in-envelope Llama,
+Qwen2, or Mistral checkpoint has such a reference today, so those families are
+covered by their smoke rows until one is added.</p>
+<p>The rows are registered as <code class="docutils literal notranslate"><span class="pre">stage:</span> <span class="pre">post_merge</span></code> entries in
+<code class="docutils literal notranslate"><span class="pre">tests/integration/test_lists/test-db/l0_model_express.yml</span></code>, so they run in
+<code class="docutils literal notranslate"><span class="pre">DGX_H100-2_GPUs-PyTorch-ModelExpress-Post-Merge-1</span></code> on every main commit and
+are never selected automatically in pre-merge pipelines. Trigger the stage on a
+pull request, which requires the <code class="docutils literal notranslate"><span class="pre">ci:</span> <span class="pre">full</span> <span class="pre">pre-merge</span> <span class="pre">approved</span></code> label, with:</p>
+<div class="highlight-text notranslate"><div class="highlight"><pre><span></span>/bot run --stage-list "DGX_H100-2_GPUs-PyTorch-ModelExpress-Post-Merge-1"
+</pre></div>
+</div>
+<p>GSM8K needs the <code class="docutils literal notranslate"><span class="pre">lm_eval</span></code> package from <code class="docutils literal notranslate"><span class="pre">requirements-dev.txt</span></code>; the test checks
+for it and, under <code class="docutils literal notranslate"><span class="pre">TRTLLM_MX_E2E_REQUIRED=1</span></code>, fails instead of skipping when it
+is absent. The receiver gets its own <code class="docutils literal notranslate"><span class="pre">TRTLLM_MX_ACCURACY_TIMEOUT_S</span></code> budget
+(default 3600 seconds) for load, transfer, and the whole evaluation, while
+<code class="docutils literal notranslate"><span class="pre">TRTLLM_MX_E2E_TIMEOUT_S</span></code> still bounds the donor-readiness wait. The reference
+guard <code class="docutils literal notranslate"><span class="pre">test_mx_accuracy_cases_have_references</span></code> needs no GPU and also runs in the
+pre-merge CPU stage, so a pruned reference fails on the pull request that prunes
+it. Each run records the donor and receiver load times, the evaluation
+time, the score, and the threshold as junit properties and as
+<code class="docutils literal notranslate"><span class="pre">model_express_accuracy/&lt;test-id&gt;.json</span></code> under <code class="docutils literal notranslate"><span class="pre">--output-dir</span></code>; load times are
+observed only, not gated. To run one canary locally:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nv">TRTLLM_MX_E2E_REQUIRED</span><span class="o">=</span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
+<span class="nv">MODEL_EXPRESS_URL</span><span class="o">=</span>http://127.0.0.1:8001<span class="w"> </span><span class="se">\</span>
+<span class="nv">LLM_MODELS_ROOT</span><span class="o">=</span>/path/to/llm-models<span class="w"> </span><span class="se">\</span>
+pytest<span class="w"> </span>-v<span class="w"> </span>tests/integration/defs/model_express/test_model_express_accuracy.py<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-k<span class="w"> </span>qwen3-8b-gsm8k-tp1<span class="w"> </span>--output-dir<span class="w"> </span>/path/to/artifacts
+</pre></div>
+</div>
+<p>Adding a canary is one <code class="docutils literal notranslate"><span class="pre">MxAccuracyCase</span></code> row (the model must be inside the
+family’s qualified runtime envelope and have a bare BF16 reference entry for
+the task, measured on the PyTorch backend with the task’s default evaluator
+settings), one line in the <code class="docutils literal notranslate"><span class="pre">post_merge</span></code> block of <code class="docutils literal notranslate"><span class="pre">l0_model_express.yml</span></code>, and a
+row in the table above.</p>
 </section>
 <section id="transform-layout-abi-rules">
 <h3>Transform-Layout ABI Rules<a class="headerlink" href="#transform-layout-abi-rules" title="Link to this heading">#</a></h3>
@@ -1043,11 +1149,11 @@ is already registered.</p></li>
       </div>
     </a>
     <a class="right-next"
-       href="ray-orchestrator.html"
+       href="sleep-wakeup.html"
        title="next page">
       <div class="prev-next-info">
         <p class="prev-next-subtitle">next</p>
-        <p class="prev-next-title">Ray Orchestrator (Prototype)</p>
+        <p class="prev-next-title">Runtime Memory Checkpointing (Prototype)</p>
       </div>
       <i class="fa-solid fa-angle-right"></i>
     </a>
@@ -1075,6 +1181,7 @@ is already registered.</p></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#current-support-scope">Current Support Scope</a><ul class="nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#adding-a-model-family">Adding a Model Family</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#qualification-test">Qualification Test</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#accuracy-canaries-post-merge">Accuracy Canaries (Post-Merge)</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#transform-layout-abi-rules">Transform-Layout ABI Rules</a></li>
 </ul>
 </li>
@@ -1174,9 +1281,9 @@ is already registered.</p></li>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on October 09, 2026.</p>
+  <p>Last updated on October 19, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/cc63e66">cc63e66</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/0372799">0372799</a>.</p>
   
 </div></div>
       

@@ -62,7 +62,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.23.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc0';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc1';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -79,7 +79,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="color-scheme" content="light dark"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.4.0rc0" />
+  <meta name="docsearch:version" content="1.4.0rc1" />
   
     
     <script src="../../_static/searchtools.js"></script>
@@ -444,6 +444,9 @@
 <li class="toctree-l1 current active has-children"><a class="reference internal" href="../reference.html">API Reference</a><details open="open"><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul class="current">
 <li class="toctree-l2 current active"><a aria-current="page" class="current reference internal" href="#">LLM</a></li>
 <li class="toctree-l2"><a class="reference internal" href="AsyncLLM.html">AsyncLLM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ExecutorMemoryType.html">ExecutorMemoryType</a></li>
+<li class="toctree-l2"><a class="reference internal" href="RuntimeMemoryStatus.html">RuntimeMemoryStatus</a></li>
+<li class="toctree-l2"><a class="reference internal" href="SleepConfig.html">SleepConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="MultimodalEncoder.html">MultimodalEncoder</a></li>
 <li class="toctree-l2"><a class="reference internal" href="CompletionOutput.html">CompletionOutput</a></li>
 <li class="toctree-l2"><a class="reference internal" href="RequestOutput.html">RequestOutput</a></li>
@@ -533,6 +536,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../../features/speculative-decoding.html">Speculative Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/checkpoint-loading.html">Checkpoint Loading</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/model-express.html">ModelExpress (MX) Checkpoint Loading</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/sleep-wakeup.html">Runtime Memory Checkpointing (Prototype)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/ray-orchestrator.html">Ray Orchestrator (Prototype)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/torch_compile_and_piecewise_cuda_graph.html">Torch Compile &amp; Prefill CUDA Graph</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/helix.html">Helix Parallelism</a></li>
@@ -551,6 +555,10 @@
 <li class="toctree-l1"><a class="reference internal" href="../../developer-guide/overview.html">Architecture Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../developer-guide/perf-analysis.html">Performance Analysis</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../developer-guide/perf-benchmarking.html">TensorRT LLM Benchmarking</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../developer-guide/moe-perf-guide.html">MoE Performance Guide</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../developer-guide/moe-perf-dashboard.html">MoE Perf Dashboard</a></li>
+</ul>
+</details></li>
 <li class="toctree-l1"><a class="reference internal" href="../../developer-guide/ci-overview.html">Continuous Integration Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../developer-guide/dev-containers.html">Using Dev Containers</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../developer-guide/api-change.html">LLM API Change Guide</a></li>
@@ -562,6 +570,7 @@
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog30_KV_Cache_Compression_in_TensorRT-LLM.html">KV Cache Compression in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog29_GVR_V2_Self_Sampling_Exact_TopK_for_Sparse_Attention.html">GVR V2: Self-Sampling and Multi-Thresholding for Faster Exact Top-K</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog28_Accelerating_Video_Generation_with_GEMM_Quantization_Attention_Quantization_and_Skip_Softmax_Attention_in_TensorRT-LLM.html">Accelerating Video Generation with GEMM Quantization, Attention Quantization and Skip Softmax Attention in TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog27_Evaluating_Agentic_Serving_with_Trace_Replay_and_Job_Level_Metrics.html">Evaluating Agentic Serving with Trace Replay and Job-Level Metrics</a></li>
@@ -720,7 +729,7 @@
 <li><p><strong>peft_cache_config</strong> (<em>Optional</em><em>[</em><em>tensorrt_llm.llmapi.llm_args.PeftCacheConfig</em><em>]</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> PEFT cache config. Defaults to None.</p></li>
 <li><p><strong>scheduler_config</strong> (<a class="reference internal" href="SchedulerConfig.html#tensorrt_llm.llmapi.SchedulerConfig" title="tensorrt_llm.llmapi.llm_args.SchedulerConfig"><em>tensorrt_llm.llmapi.llm_args.SchedulerConfig</em></a>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Scheduler config. Defaults to None.</p></li>
 <li><p><strong>cache_transceiver_config</strong> (<em>Optional</em><em>[</em><a class="reference internal" href="CacheTransceiverConfig.html#tensorrt_llm.llmapi.CacheTransceiverConfig" title="tensorrt_llm.llmapi.llm_args.CacheTransceiverConfig"><em>tensorrt_llm.llmapi.llm_args.CacheTransceiverConfig</em></a><em>]</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Cache transceiver config. Defaults to None.</p></li>
-<li><p><strong>sparse_attention_config</strong> (<em>Union</em><em>[</em><a class="reference internal" href="QSASparseAttentionConfig.html#tensorrt_llm.llmapi.QSASparseAttentionConfig" title="tensorrt_llm.llmapi.llm_args.QSASparseAttentionConfig"><em>tensorrt_llm.llmapi.llm_args.QSASparseAttentionConfig</em></a><em>, </em><a class="reference internal" href="RocketSparseAttentionConfig.html#tensorrt_llm.llmapi.RocketSparseAttentionConfig" title="tensorrt_llm.llmapi.llm_args.RocketSparseAttentionConfig"><em>tensorrt_llm.llmapi.llm_args.RocketSparseAttentionConfig</em></a><em>, </em><a class="reference internal" href="DeepSeekSparseAttentionConfig.html#tensorrt_llm.llmapi.DeepSeekSparseAttentionConfig" title="tensorrt_llm.llmapi.llm_args.DeepSeekSparseAttentionConfig"><em>tensorrt_llm.llmapi.llm_args.DeepSeekSparseAttentionConfig</em></a><em>, </em><a class="reference internal" href="DeepSeekV4SparseAttentionConfig.html#tensorrt_llm.llmapi.DeepSeekV4SparseAttentionConfig" title="tensorrt_llm.llmapi.llm_args.DeepSeekV4SparseAttentionConfig"><em>tensorrt_llm.llmapi.llm_args.DeepSeekV4SparseAttentionConfig</em></a><em>, </em><a class="reference internal" href="SkipSoftmaxAttentionConfig.html#tensorrt_llm.llmapi.SkipSoftmaxAttentionConfig" title="tensorrt_llm.llmapi.llm_args.SkipSoftmaxAttentionConfig"><em>tensorrt_llm.llmapi.llm_args.SkipSoftmaxAttentionConfig</em></a><em>, </em><a class="reference internal" href="MiniMaxM3SparseAttentionConfig.html#tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig" title="tensorrt_llm.llmapi.llm_args.MiniMaxM3SparseAttentionConfig"><em>tensorrt_llm.llmapi.llm_args.MiniMaxM3SparseAttentionConfig</em></a><em>, </em><em>NoneType</em><em>]</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Sparse attention config. Defaults to None.</p></li>
+<li><p><strong>sparse_attention_config</strong> (<em>Union</em><em>[</em><a class="reference internal" href="QSASparseAttentionConfig.html#tensorrt_llm.llmapi.QSASparseAttentionConfig" title="tensorrt_llm.llmapi.llm_args.QSASparseAttentionConfig"><em>tensorrt_llm.llmapi.llm_args.QSASparseAttentionConfig</em></a><em>, </em><a class="reference internal" href="RocketSparseAttentionConfig.html#tensorrt_llm.llmapi.RocketSparseAttentionConfig" title="tensorrt_llm.llmapi.llm_args.RocketSparseAttentionConfig"><em>tensorrt_llm.llmapi.llm_args.RocketSparseAttentionConfig</em></a><em>, </em><a class="reference internal" href="DeepSeekSparseAttentionConfig.html#tensorrt_llm.llmapi.DeepSeekSparseAttentionConfig" title="tensorrt_llm.llmapi.llm_args.DeepSeekSparseAttentionConfig"><em>tensorrt_llm.llmapi.llm_args.DeepSeekSparseAttentionConfig</em></a><em>, </em><a class="reference internal" href="DeepSeekV4SparseAttentionConfig.html#tensorrt_llm.llmapi.DeepSeekV4SparseAttentionConfig" title="tensorrt_llm.llmapi.llm_args.DeepSeekV4SparseAttentionConfig"><em>tensorrt_llm.llmapi.llm_args.DeepSeekV4SparseAttentionConfig</em></a><em>, </em><em>tensorrt_llm.llmapi.llm_args.CSA2SparseAttentionConfig</em><em>, </em><a class="reference internal" href="SkipSoftmaxAttentionConfig.html#tensorrt_llm.llmapi.SkipSoftmaxAttentionConfig" title="tensorrt_llm.llmapi.llm_args.SkipSoftmaxAttentionConfig"><em>tensorrt_llm.llmapi.llm_args.SkipSoftmaxAttentionConfig</em></a><em>, </em><a class="reference internal" href="MiniMaxM3SparseAttentionConfig.html#tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig" title="tensorrt_llm.llmapi.llm_args.MiniMaxM3SparseAttentionConfig"><em>tensorrt_llm.llmapi.llm_args.MiniMaxM3SparseAttentionConfig</em></a><em>, </em><em>NoneType</em><em>]</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Sparse attention config. Defaults to None.</p></li>
 <li><p><strong>kv_cache_compression_config</strong> (<em>Union</em><em>[</em><a class="reference internal" href="ColdPageQuantizationCompressionConfig.html#tensorrt_llm.llmapi.ColdPageQuantizationCompressionConfig" title="tensorrt_llm.llmapi.llm_args.ColdPageQuantizationCompressionConfig"><em>tensorrt_llm.llmapi.llm_args.ColdPageQuantizationCompressionConfig</em></a><em>, </em><a class="reference internal" href="TriAttentionKvCacheCompressionConfig.html#tensorrt_llm.llmapi.TriAttentionKvCacheCompressionConfig" title="tensorrt_llm.llmapi.llm_args.TriAttentionKvCacheCompressionConfig"><em>tensorrt_llm.llmapi.llm_args.TriAttentionKvCacheCompressionConfig</em></a><em>, </em><em>NoneType</em><em>]</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> KV-cache compression config; None disables compression. Defaults to None.</p></li>
 <li><p><strong>speculative_config</strong> (<em>Union</em><em>[</em><a class="reference internal" href="DraftTargetDecodingConfig.html#tensorrt_llm.llmapi.DraftTargetDecodingConfig" title="tensorrt_llm.llmapi.llm_args.DraftTargetDecodingConfig"><em>tensorrt_llm.llmapi.llm_args.DraftTargetDecodingConfig</em></a><em>, </em><a class="reference internal" href="Eagle3DecodingConfig.html#tensorrt_llm.llmapi.Eagle3DecodingConfig" title="tensorrt_llm.llmapi.llm_args.Eagle3DecodingConfig"><em>tensorrt_llm.llmapi.llm_args.Eagle3DecodingConfig</em></a><em>, </em><a class="reference internal" href="EagleDecodingConfig.html#tensorrt_llm.llmapi.EagleDecodingConfig" title="tensorrt_llm.llmapi.llm_args.EagleDecodingConfig"><em>tensorrt_llm.llmapi.llm_args.EagleDecodingConfig</em></a><em>, </em><a class="reference internal" href="MTPDecodingConfig.html#tensorrt_llm.llmapi.MTPDecodingConfig" title="tensorrt_llm.llmapi.llm_args.MTPDecodingConfig"><em>tensorrt_llm.llmapi.llm_args.MTPDecodingConfig</em></a><em>, </em><a class="reference internal" href="NGramDecodingConfig.html#tensorrt_llm.llmapi.NGramDecodingConfig" title="tensorrt_llm.llmapi.llm_args.NGramDecodingConfig"><em>tensorrt_llm.llmapi.llm_args.NGramDecodingConfig</em></a><em>, </em><a class="reference internal" href="SADecodingConfig.html#tensorrt_llm.llmapi.SADecodingConfig" title="tensorrt_llm.llmapi.llm_args.SADecodingConfig"><em>tensorrt_llm.llmapi.llm_args.SADecodingConfig</em></a><em>, </em><a class="reference internal" href="UserProvidedDecodingConfig.html#tensorrt_llm.llmapi.UserProvidedDecodingConfig" title="tensorrt_llm.llmapi.llm_args.UserProvidedDecodingConfig"><em>tensorrt_llm.llmapi.llm_args.UserProvidedDecodingConfig</em></a><em>, </em><a class="reference internal" href="SaveHiddenStatesDecodingConfig.html#tensorrt_llm.llmapi.SaveHiddenStatesDecodingConfig" title="tensorrt_llm.llmapi.llm_args.SaveHiddenStatesDecodingConfig"><em>tensorrt_llm.llmapi.llm_args.SaveHiddenStatesDecodingConfig</em></a><em>, </em><a class="reference internal" href="PARDDecodingConfig.html#tensorrt_llm.llmapi.PARDDecodingConfig" title="tensorrt_llm.llmapi.llm_args.PARDDecodingConfig"><em>tensorrt_llm.llmapi.llm_args.PARDDecodingConfig</em></a><em>, </em><a class="reference internal" href="DFlashDecodingConfig.html#tensorrt_llm.llmapi.DFlashDecodingConfig" title="tensorrt_llm.llmapi.llm_args.DFlashDecodingConfig"><em>tensorrt_llm.llmapi.llm_args.DFlashDecodingConfig</em></a><em>, </em><a class="reference internal" href="DSparkDecodingConfig.html#tensorrt_llm.llmapi.DSparkDecodingConfig" title="tensorrt_llm.llmapi.llm_args.DSparkDecodingConfig"><em>tensorrt_llm.llmapi.llm_args.DSparkDecodingConfig</em></a><em>, </em><a class="reference internal" href="AutoDecodingConfig.html#tensorrt_llm.llmapi.AutoDecodingConfig" title="tensorrt_llm.llmapi.llm_args.AutoDecodingConfig"><em>tensorrt_llm.llmapi.llm_args.AutoDecodingConfig</em></a><em>, </em><em>NoneType</em><em>]</em>) – <code class="tag stable docutils literal notranslate"><span class="pre">stable</span></code> Speculative decoding config. Defaults to None.</p></li>
 <li><p><strong>max_batch_size</strong> (<em>Optional</em><em>[</em><em>int</em><em>]</em>) – <code class="tag stable docutils literal notranslate"><span class="pre">stable</span></code> The maximum batch size. Defaults to 2048.</p></li>
@@ -731,7 +740,7 @@
 <li><p><strong>gather_generation_logits</strong> (<em>bool</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Gather generation logits. Defaults to False.</p></li>
 <li><p><strong>num_postprocess_workers</strong> (<em>int</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> The number of processes used for postprocessing the generated tokens, including detokenization. Defaults to 0.</p></li>
 <li><p><strong>postprocess_tokenizer_dir</strong> (<em>Optional</em><em>[</em><em>str</em><em>]</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> The path to the tokenizer directory for postprocessing. Defaults to None.</p></li>
-<li><p><strong>num_serve_frontends</strong> (<em>int</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> The number of HTTP frontend processes serving one executor. Used by trtllm-serve: values &gt; 1 run additional attached frontend processes that share the serving port via SO_REUSEPORT (classic IPC executor path only). Defaults to 1.</p></li>
+<li><p><strong>num_serve_frontends</strong> (<em>int</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> The number of HTTP or OpenEngine frontend processes serving one executor. Used by trtllm-serve: values &gt; 1 run additional attached frontend processes that share the serving port via SO_REUSEPORT (classic IPC executor path only). Defaults to 1.</p></li>
 <li><p><strong>reasoning_parser</strong> (<em>Optional</em><em>[</em><em>str</em><em>]</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> The parser to separate reasoning content from output. Defaults to None.</p></li>
 <li><p><strong>otlp_traces_endpoint</strong> (<em>Optional</em><em>[</em><em>str</em><em>]</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Target URL to which OpenTelemetry traces will be sent. Defaults to None.</p></li>
 <li><p><strong>return_perf_metrics</strong> (<em>bool</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Allow serving responses to include per-request performance metrics when the request sets X-TRTLLM-return-metrics: 1. Defaults to False.</p></li>
@@ -747,7 +756,7 @@
 <li><p><strong>cuda_graph_config</strong> (<em>Union</em><em>[</em><a class="reference internal" href="DecodeCudaGraphConfig.html#tensorrt_llm.llmapi.DecodeCudaGraphConfig" title="tensorrt_llm.llmapi.llm_args.DecodeCudaGraphConfig"><em>tensorrt_llm.llmapi.llm_args.DecodeCudaGraphConfig</em></a><em>, </em><a class="reference internal" href="EncodeCudaGraphConfig.html#tensorrt_llm.llmapi.EncodeCudaGraphConfig" title="tensorrt_llm.llmapi.llm_args.EncodeCudaGraphConfig"><em>tensorrt_llm.llmapi.llm_args.EncodeCudaGraphConfig</em></a><em>, </em><em>NoneType</em><em>]</em>) – <code class="tag beta docutils literal notranslate"><span class="pre">beta</span></code> CUDA graph config. If true, use CUDA graphs for decoding.         CUDA graphs are only created for the batch sizes in cuda_graph_config.batch_sizes,         and are enabled for batches that consist of decoding requests <em>only</em>         (the reason is that it’s hard to capture a single graph with prefill requests         since the input shapes are a function of the sequence lengths).         Note that each CUDA graph can use up to 200 MB of extra memory. Defaults to None.</p></li>
 <li><p><strong>encoder_cuda_graph_config</strong> (<em>Optional</em><em>[</em><a class="reference internal" href="EncodeCudaGraphConfig.html#tensorrt_llm.llmapi.EncodeCudaGraphConfig" title="tensorrt_llm.llmapi.llm_args.EncodeCudaGraphConfig"><em>tensorrt_llm.llmapi.llm_args.EncodeCudaGraphConfig</em></a><em>]</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> CUDA graph configuration for the encoder forward pass of an encoder-decoder model. Use <cite>cuda_graph_config</cite> for the decoder and this field for the encoder. Encoder CUDA graphs require <cite>encoder_max_batch_size</cite> to be set. Defaults to None.</p></li>
 <li><p><strong>enable_encoder_decoder_mixed_cuda_graph</strong> (<em>bool</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Enable the mixed-batch CUDA graph performance optimization for encoder-decoder models. The graph handles decoder iterations containing both context and generation requests. It is enabled by default when both <cite>cuda_graph_config</cite> and <cite>encoder_cuda_graph_config</cite> produce usable graph shapes. Defaults to True.</p></li>
-<li><p><strong>multimodal_config</strong> (<a class="reference internal" href="MultimodalConfig.html#tensorrt_llm.llmapi.MultimodalConfig" title="tensorrt_llm.llmapi.llm_args.MultimodalConfig"><em>tensorrt_llm.llmapi.llm_args.MultimodalConfig</em></a>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code>  Defaults to None.</p></li>
+<li><p><strong>multimodal_config</strong> (<a class="reference internal" href="MultimodalConfig.html#tensorrt_llm.llmapi.MultimodalConfig" title="tensorrt_llm.llmapi.llm_args.MultimodalConfig"><em>tensorrt_llm.llmapi.llm_args.MultimodalConfig</em></a>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Multimodal model configuration. Defaults to None.</p></li>
 <li><p><strong>attention_dp_config</strong> (<em>Optional</em><em>[</em><a class="reference internal" href="AttentionDpConfig.html#tensorrt_llm.llmapi.AttentionDpConfig" title="tensorrt_llm.llmapi.llm_args.AttentionDpConfig"><em>tensorrt_llm.llmapi.llm_args.AttentionDpConfig</em></a><em>]</em>) – <code class="tag beta docutils literal notranslate"><span class="pre">beta</span></code> Optimized load-balancing for the DP Attention scheduler. Defaults to None.</p></li>
 <li><p><strong>disable_overlap_scheduler</strong> (<em>bool</em>) – <code class="tag beta docutils literal notranslate"><span class="pre">beta</span></code> Disable the overlap scheduler. Defaults to False.</p></li>
 <li><p><strong>enable_return_routed_experts</strong> (<em>bool</em>) – <code class="tag beta docutils literal notranslate"><span class="pre">beta</span></code> Router Replay (R3): capture per-token pre-EPLB logical top-k MoE expert ids so they can be returned on outputs (per request via SamplingParams.return_routed_experts), for train/inference routing alignment in MoE reinforcement learning. Zero overhead when disabled. Separated-routing MoE backends only. Defaults to False.</p></li>
@@ -772,6 +781,7 @@
 <li><p><strong>batch_wait_timeout_ms</strong> (<em>float</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> If greater than 0, the request queue might wait up to batch_wait_timeout_ms to receive max_batch_size requests, if fewer than max_batch_size requests are currently available. If 0, no waiting occurs. Defaults to 0.</p></li>
 <li><p><strong>batch_wait_timeout_iters</strong> (<em>int</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Maximum number of iterations the scheduler will wait to accumulate new coming requests for improved GPU utilization efficiency. If greater than 0, the scheduler will delay batch processing to gather more requests up to the specified iteration limit. If 0, disables timeout-iters-based batching delays. Defaults to 0.</p></li>
 <li><p><strong>batch_wait_max_tokens_ratio</strong> (<em>float</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Token accumulation threshold ratio for batch scheduling optimization. If greater than 0, the scheduler will accumulate requests locally until the total token count reaches batch_wait_max_tokens_ratio * max_num_tokens. This mechanism enhances GPU utilization efficiency by ensuring adequate batch sizes. If 0, disables token-based batching delays. Defaults to 0.</p></li>
+<li><p><strong>bounded_replay_on_generation</strong> (<em>bool</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Run the DeepSeek-V4.1 bounded decoder replay tail on the generation worker in disaggregated serving. Configure both worker roles alike. Defaults to False.</p></li>
 <li><p><strong>torch_compile_config</strong> (<em>Optional</em><em>[</em><a class="reference internal" href="TorchCompileConfig.html#tensorrt_llm.llmapi.TorchCompileConfig" title="tensorrt_llm.llmapi.llm_args.TorchCompileConfig"><em>tensorrt_llm.llmapi.llm_args.TorchCompileConfig</em></a><em>]</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Torch compile config. Defaults to None.</p></li>
 <li><p><strong>prefill_cuda_graph_backend</strong> (<a class="reference internal" href="PrefillCudaGraphBackend.html#tensorrt_llm.llmapi.PrefillCudaGraphBackend" title="tensorrt_llm.llmapi.PrefillCudaGraphBackend"><em>PrefillCudaGraphBackend</em></a>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> CUDA graph implementation used for prefill requests. Defaults to disabled. Defaults to disabled.</p></li>
 <li><p><strong>prefill_capture_num_tokens</strong> (<em>Optional</em><em>[</em><em>List</em><em>[</em><em>int</em><em>]</em><em>]</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Token-count buckets captured by the selected prefill CUDA graph implementation. Defaults to None.</p></li>
@@ -798,15 +808,17 @@ If checkpoint_format and checkpoint_loader are both provided, checkpoint_loader 
 <li><p><strong>ray_worker_extension_cls</strong> (<em>Optional</em><em>[</em><em>str</em><em>]</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> The full worker extension class name including module path. Allows users to extend the functions of the RayGPUWorker class. Defaults to None.</p></li>
 <li><p><strong>ray_placement_config</strong> (<em>Optional</em><em>[</em><em>tensorrt_llm.llmapi.llm_args.RayPlacementConfig</em><em>]</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Placement config for RayGPUWorker. Only used with AsyncLLM and orchestrator_type=’ray’. Defaults to None.</p></li>
 <li><p><strong>ray_worker_nsight_options</strong> (<em>Optional</em><em>[</em><em>dict</em><em>[</em><em>str</em><em>, </em><em>str</em><em>]</em><em>]</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Nsight options. Defaults to None.</p></li>
-<li><p><strong>sleep_config</strong> (<em>Optional</em><em>[</em><em>tensorrt_llm.llmapi.llm_args.SleepConfig</em><em>]</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Configuration for the LLM sleep feature. Sleep feature requires extra setup that may slow down model loading. Only enable it if you intend to use this feature. Defaults to None.</p></li>
+<li><p><strong>sleep_config</strong> (<em>Optional</em><em>[</em><a class="reference internal" href="SleepConfig.html#tensorrt_llm.llmapi.SleepConfig" title="tensorrt_llm.llmapi.llm_args.SleepConfig"><em>tensorrt_llm.llmapi.llm_args.SleepConfig</em></a><em>]</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Configuration for the LLM sleep feature. Sleep feature requires extra setup that may slow down model loading. Only enable it if you intend to use this feature. Defaults to None.</p></li>
 <li><p><strong>reorder_policy_config</strong> (<em>Optional</em><em>[</em><a class="reference internal" href="ReorderRequestPolicyConfig.html#tensorrt_llm.llmapi.ReorderRequestPolicyConfig" title="tensorrt_llm.llmapi.llm_args.ReorderRequestPolicyConfig"><em>tensorrt_llm.llmapi.llm_args.ReorderRequestPolicyConfig</em></a><em>]</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> The request reordering policy to use. Defaults to None.</p></li>
 <li><p><strong>enable_resource_governor</strong> (<em>bool</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Enable the resource governor for runtime cache management operations such as KV cache truncation. This adds a per-iteration broadcast collective. Defaults to False.</p></li>
 <li><p><strong>use_cute_dsl_blockscaling_mm</strong> (<em>bool</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> If true, use CuTe DSL fp8 blockscaling mm implementation. Defaults to False.</p></li>
 <li><p><strong>use_cute_dsl_blockscaling_bmm</strong> (<em>bool</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> If true, use CuTe DSL fp8 blockscaling bmm implementation. Defaults to False.</p></li>
+<li><p><strong>enable_locality_domains</strong> (<em>bool</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Enable locality domain execution for supported PyTorch backend ops. Defaults to False.</p></li>
 <li><p><strong>use_cute_dsl_bf16_bmm</strong> (<em>bool</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> If true, use CuTe DSL BF16 BMM on Blackwell (SM100/SM103) and Rubin (SM107), including the DeepSeek-V4 o_a projection on Rubin when DSL support and dimension alignment permit. Defaults to false; automatically enabled with pipeline_parallel_size &gt; 1 on SM100/SM103/SM107. Defaults to False.</p></li>
 <li><p><strong>use_cute_dsl_bf16_gemm</strong> (<em>bool</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> If true, use CuTe DSL BF16 persistent GEMM for Linear layers on Blackwell (SM100/SM103) and Rubin (SM107) when supported. Defaults to false; automatically enabled with pipeline_parallel_size &gt; 1 on SM100/SM103/SM107. Defaults to False.</p></li>
 <li><p><strong>max_stats_len</strong> (<em>int</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> The max number of performance statistic entries. Set to -1 to keep all entries. Set to 0 to use a minimum buffer size of 1. Defaults to 1000.</p></li>
 <li><p><strong>layer_wise_benchmarks_config</strong> (<em>tensorrt_llm.llmapi.llm_args.LayerwiseBenchmarksConfig</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code>  Defaults to None.</p></li>
+<li><p><strong>modeling_v2</strong> (<em>Literal</em><em>[</em><em>'off'</em><em>, </em><em>'auto'</em><em>, </em><em>'require'</em><em>]</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Whether to build the model from a modeling_v2 target (experimental) instead of the built-in implementation. ‘off’ never does. ‘auto’ uses a target when one claims this deployment and falls back to the built-in implementation otherwise. ‘require’ raises instead of falling back. Defaults to off.</p></li>
 </ul>
 </dd>
 </dl>
@@ -1130,6 +1142,21 @@ e.g., {“maxNumBlocks”: …, “tokensPerBlock”: …, “maxNumTokens”: �
 </dd></dl>
 
 <dl class="py method">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.LLM.get_memory_status">
+<span class="sig-name descname"><span class="pre">get_memory_status</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><a class="reference internal" href="RuntimeMemoryStatus.html#tensorrt_llm.llmapi.RuntimeMemoryStatus" title="tensorrt_llm.llmapi.llm_args.RuntimeMemoryStatus"><span class="pre">RuntimeMemoryStatus</span></a></span></span><a class="headerlink" href="#tensorrt_llm.llmapi.LLM.get_memory_status" title="Link to this definition">#</a></dt>
+<dd><p><code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Return the authoritative runtime-memory checkpoint status.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Returns<span class="colon">:</span></dt>
+<dd class="field-odd"><p>The reconciled
+state reported by the runtime workers.</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference internal" href="RuntimeMemoryStatus.html#tensorrt_llm.llmapi.RuntimeMemoryStatus" title="tensorrt_llm.llmapi.llm_args.RuntimeMemoryStatus">tensorrt_llm.llmapi.llm_args.RuntimeMemoryStatus</a></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
 <dt class="sig sig-object py" id="tensorrt_llm.llmapi.LLM.get_stats">
 <span class="sig-name descname"><span class="pre">get_stats</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">timeout</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">float</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">2</span></span></em><span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><span class="pre">List</span><span class="p"><span class="pre">[</span></span><span class="pre">dict</span><span class="p"><span class="pre">]</span></span></span></span><a class="headerlink" href="#tensorrt_llm.llmapi.LLM.get_stats" title="Link to this definition">#</a></dt>
 <dd><p><code class="tag beta docutils literal notranslate"><span class="pre">beta</span></code> Get iteration statistics from the runtime.
@@ -1206,6 +1233,54 @@ A default one will be used if not provided.</p></li>
 </dd>
 <dt class="field-odd">Return type<span class="colon">:</span></dt>
 <dd class="field-odd"><p>tensorrt_llm.llmapi.llm.PreprocessedInputs</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.LLM.release">
+<span class="sig-name descname"><span class="pre">release</span></span><span class="sig-paren">(</span>
+
+<dl>
+<dd><em class="sig-param"><span class="n"><span class="pre">tags</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">Sequence</span><span class="p"><span class="pre">[</span></span><a class="reference internal" href="ExecutorMemoryType.html#tensorrt_llm.llmapi.ExecutorMemoryType" title="tensorrt_llm.llmapi.llm_args.ExecutorMemoryType"><span class="pre">ExecutorMemoryType</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">str</span><span class="p"><span class="pre">]</span></span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>,</dd>
+</dl>
+
+<span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><span class="pre">None</span></span></span><a class="headerlink" href="#tensorrt_llm.llmapi.LLM.release" title="Link to this definition">#</a></dt>
+<dd><p><code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Checkpoint and release selected GPU runtime memory.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>tags</strong> (<em>Sequence</em><em>[</em><a class="reference internal" href="ExecutorMemoryType.html#tensorrt_llm.llmapi.ExecutorMemoryType" title="tensorrt_llm.llmapi.ExecutorMemoryType"><em>tensorrt_llm.llmapi.ExecutorMemoryType</em></a><em> | </em><em>str</em><em>]</em><em>, </em><em>optional</em>) – Memory types to release. When omitted, release every
+sleep-managed runtime memory type.</p>
+</dd>
+<dt class="field-even">Returns<span class="colon">:</span></dt>
+<dd class="field-even"><p>The call returns after all selected memory has been released.</p>
+</dd>
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>None</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.LLM.resume">
+<span class="sig-name descname"><span class="pre">resume</span></span><span class="sig-paren">(</span>
+
+<dl>
+<dd><em class="sig-param"><span class="n"><span class="pre">tags</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">Sequence</span><span class="p"><span class="pre">[</span></span><a class="reference internal" href="ExecutorMemoryType.html#tensorrt_llm.llmapi.ExecutorMemoryType" title="tensorrt_llm.llmapi.llm_args.ExecutorMemoryType"><span class="pre">ExecutorMemoryType</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">str</span><span class="p"><span class="pre">]</span></span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>,</dd>
+</dl>
+
+<span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><span class="pre">None</span></span></span><a class="headerlink" href="#tensorrt_llm.llmapi.LLM.resume" title="Link to this definition">#</a></dt>
+<dd><p><code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Restore selected GPU runtime memory.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>tags</strong> (<em>Sequence</em><em>[</em><a class="reference internal" href="ExecutorMemoryType.html#tensorrt_llm.llmapi.ExecutorMemoryType" title="tensorrt_llm.llmapi.ExecutorMemoryType"><em>tensorrt_llm.llmapi.ExecutorMemoryType</em></a><em> | </em><em>str</em><em>]</em><em>, </em><em>optional</em>) – Memory types to restore. When omitted, restore every currently
+parked memory type.</p>
+</dd>
+<dt class="field-even">Returns<span class="colon">:</span></dt>
+<dd class="field-even"><p>The call returns after all selected memory has been restored.</p>
+</dd>
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>None</p>
 </dd>
 </dl>
 </dd></dl>
@@ -1361,9 +1436,12 @@ resolves to <code class="docutils literal notranslate"><span class="pre">[&quot;
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.LLM.get_kv_cache_capacity"><code class="docutils literal notranslate"><span class="pre">get_kv_cache_capacity()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.LLM.get_kv_cache_events"><code class="docutils literal notranslate"><span class="pre">get_kv_cache_events()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.LLM.get_kv_cache_events_async"><code class="docutils literal notranslate"><span class="pre">get_kv_cache_events_async()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.LLM.get_memory_status"><code class="docutils literal notranslate"><span class="pre">get_memory_status()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.LLM.get_stats"><code class="docutils literal notranslate"><span class="pre">get_stats()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.LLM.get_stats_async"><code class="docutils literal notranslate"><span class="pre">get_stats_async()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.LLM.preprocess"><code class="docutils literal notranslate"><span class="pre">preprocess()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.LLM.release"><code class="docutils literal notranslate"><span class="pre">release()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.LLM.resume"><code class="docutils literal notranslate"><span class="pre">resume()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.LLM.shutdown"><code class="docutils literal notranslate"><span class="pre">shutdown()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.LLM.start_profile"><code class="docutils literal notranslate"><span class="pre">start_profile()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.LLM.stop_profile"><code class="docutils literal notranslate"><span class="pre">stop_profile()</span></code></a></li>
@@ -1464,9 +1542,9 @@ resolves to <code class="docutils literal notranslate"><span class="pre">[&quot;
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on October 09, 2026.</p>
+  <p>Last updated on October 19, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/cc63e66">cc63e66</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/0372799">0372799</a>.</p>
   
 </div></div>
       

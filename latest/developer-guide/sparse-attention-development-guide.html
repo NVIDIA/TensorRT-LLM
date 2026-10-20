@@ -62,7 +62,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.23.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc0';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc1';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -79,7 +79,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="color-scheme" content="light dark"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.4.0rc0" />
+  <meta name="docsearch:version" content="1.4.0rc1" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -444,6 +444,9 @@
 <li class="toctree-l1 has-children"><a class="reference internal" href="../llm-api/reference.html">API Reference</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/LLM.html">LLM</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/AsyncLLM.html">AsyncLLM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/ExecutorMemoryType.html">ExecutorMemoryType</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/RuntimeMemoryStatus.html">RuntimeMemoryStatus</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SleepConfig.html">SleepConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/MultimodalEncoder.html">MultimodalEncoder</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CompletionOutput.html">CompletionOutput</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/RequestOutput.html">RequestOutput</a></li>
@@ -533,6 +536,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../features/speculative-decoding.html">Speculative Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/checkpoint-loading.html">Checkpoint Loading</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/model-express.html">ModelExpress (MX) Checkpoint Loading</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/sleep-wakeup.html">Runtime Memory Checkpointing (Prototype)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/ray-orchestrator.html">Ray Orchestrator (Prototype)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/torch_compile_and_piecewise_cuda_graph.html">Torch Compile &amp; Prefill CUDA Graph</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/helix.html">Helix Parallelism</a></li>
@@ -551,6 +555,10 @@
 <li class="toctree-l1"><a class="reference internal" href="overview.html">Architecture Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="perf-analysis.html">Performance Analysis</a></li>
 <li class="toctree-l1"><a class="reference internal" href="perf-benchmarking.html">TensorRT LLM Benchmarking</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="moe-perf-guide.html">MoE Performance Guide</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="moe-perf-dashboard.html">MoE Perf Dashboard</a></li>
+</ul>
+</details></li>
 <li class="toctree-l1"><a class="reference internal" href="ci-overview.html">Continuous Integration Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="dev-containers.html">Using Dev Containers</a></li>
 <li class="toctree-l1"><a class="reference internal" href="api-change.html">LLM API Change Guide</a></li>
@@ -562,6 +570,7 @@
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog30_KV_Cache_Compression_in_TensorRT-LLM.html">KV Cache Compression in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog29_GVR_V2_Self_Sampling_Exact_TopK_for_Sparse_Attention.html">GVR V2: Self-Sampling and Multi-Thresholding for Faster Exact Top-K</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog28_Accelerating_Video_Generation_with_GEMM_Quantization_Attention_Quantization_and_Skip_Softmax_Attention_in_TensorRT-LLM.html">Accelerating Video Generation with GEMM Quantization, Attention Quantization and Skip Softmax Attention in TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog27_Evaluating_Agentic_Serving_with_Trace_Replay_and_Job_Level_Metrics.html">Evaluating Agentic Serving with Trace Replay and Job-Level Metrics</a></li>
@@ -698,7 +707,8 @@ sparse indices. A hook-based implementation can pass those indices to the
 shared <code class="docutils literal notranslate"><span class="pre">AttentionOp</span></code>, while a dedicated backend can own prediction and
 sparse computation end to end. Examples: <strong>RocketKV</strong> (token-level prompt
 eviction plus page-level MHA/MQA/GQA decode selection), <strong>DSA</strong>
-(token-level MLA), and <strong>MiniMax-M3</strong> (block-level GQA).</p></li>
+(token-level MLA), <strong>CSA2</strong> (compressed sparse MLA with shared sources),
+and <strong>MiniMax-M3</strong> (block-level GQA).</p></li>
 <li><p><strong>Kernel-level</strong>: sparsity is implemented entirely inside the
 attention kernel — there is no external prediction or gather step.
 The kernel decides what to skip from runtime values such as Softmax
@@ -814,6 +824,49 @@ layer.</p>
 </table>
 </div>
 <p>Dynamic generation-phase KV eviction is tracked as future work.</p>
+<section id="csa2-integration-reference">
+<h3>CSA2 integration reference<a class="headerlink" href="#csa2-integration-reference" title="Link to this heading">#</a></h3>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Integration</p></th>
+<th class="head"><p>CSA2 implementation</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>Public config / lowering</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">CSA2SparseAttentionConfig(algorithm=&quot;csa2&quot;)</span></code> → <code class="docutils literal notranslate"><span class="pre">CSA2Params</span></code>, <code class="docutils literal notranslate"><span class="pre">CSA2MetadataParams</span></code>; checkpoint-owned <code class="docutils literal notranslate"><span class="pre">CSA2Layout</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p>Registry</p></td>
+<td><p>TRTLLM sparse backend → <code class="docutils literal notranslate"><span class="pre">CSA2TrtllmAttention</span></code>; cache manager → <code class="docutils literal notranslate"><span class="pre">CSA2CacheManager</span></code> (V2)</p></td>
+</tr>
+<tr class="row-even"><td><p>Module</p></td>
+<td><p>Typed MLA adapter in <code class="docutils literal notranslate"><span class="pre">sparse/csa2/module.py</span></code>; compression, shared KV/index source routing and per-phase prediction</p></td>
+</tr>
+<tr class="row-odd"><td><p>Metadata</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">CSA2TrtllmMetadata</span></code>; SWA slots/visibility, owner page tables, compressor inputs, graph-stable index descriptors and query tiles</p></td>
+</tr>
+<tr class="row-even"><td><p>Compute</p></td>
+<td><p>SM100-family trtllm-gen; SM90 FlashMLA BF16 and SM120/121 FlashInfer BF16 helpers</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>CSA2 GLOBAL pages couple 288-byte main and 68-byte index records under one
+physical lifecycle and <code class="docutils literal notranslate"><span class="pre">REQUIRED</span></code> reuse policy. Encoder SWA is <code class="docutils literal notranslate"><span class="pre">REQUIRED</span></code> or
+<code class="docutils literal notranslate"><span class="pre">OPTIONAL</span></code> when Encoder recovery is enabled; eligible bounded Decoder replay
+uses <code class="docutils literal notranslate"><span class="pre">PRIVATE</span></code> SWA. Replay planning must preserve GLOBAL publication and refresh
+SWA read floors before attention. Graph capture owns its reserved buffers;
+eager shape changes evict only uncaptured tiles/arenas.</p>
+<p>The workspace contract has two parts: a complete-prefix index-gather rate
+with <code class="docutils literal notranslate"><span class="pre">runtime_workspace_is_chunked_prefill_bounded=False</span></code>, and fixed native
+index/radix arenas sized from serving batch, sequence and draft capacities.
+The estimator conservatively reserves the full fixed capacity alongside the
+profiled peak, covering a decode arena allocated after peak prefill. Do not
+use an attended-KV admission cap to bound a graph arena.
+See the <span class="xref myst">attention developer guide</span>
+and <span class="xref myst">CSA2 implementation guide</span>
+for ownership, hardware/shape limits, replay flags and accuracy validation.</p>
+</section>
 <section id="prediction-hooks">
 <h3>Prediction hooks<a class="headerlink" href="#prediction-hooks" title="Link to this heading">#</a></h3>
 <p><code class="docutils literal notranslate"><span class="pre">TrtllmAttention</span></code>-based sparse backends expose three prediction methods that
@@ -1126,6 +1179,7 @@ inherit KV-cache features (reuse, offloading) by default.</p></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#two-integration-levels">Two integration levels</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#lowered-sparse-parameters">Lowered sparse parameters</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#framework-level-sparse-attention">Framework-level sparse attention</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#csa2-integration-reference">CSA2 integration reference</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#prediction-hooks">Prediction hooks</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#attentionop-behavior">AttentionOp behavior</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#auxiliary-memory-pools">Auxiliary memory pools</a></li>
@@ -1231,9 +1285,9 @@ inherit KV-cache features (reuse, offloading) by default.</p></li>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on October 09, 2026.</p>
+  <p>Last updated on October 19, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/cc63e66">cc63e66</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/0372799">0372799</a>.</p>
   
 </div></div>
       

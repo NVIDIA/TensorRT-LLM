@@ -62,7 +62,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.23.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc0';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc1';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -79,7 +79,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="color-scheme" content="light dark"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.4.0rc0" />
+  <meta name="docsearch:version" content="1.4.0rc1" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -444,6 +444,9 @@
 <li class="toctree-l1 has-children"><a class="reference internal" href="../llm-api/reference.html">API Reference</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/LLM.html">LLM</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/AsyncLLM.html">AsyncLLM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/ExecutorMemoryType.html">ExecutorMemoryType</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/RuntimeMemoryStatus.html">RuntimeMemoryStatus</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SleepConfig.html">SleepConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/MultimodalEncoder.html">MultimodalEncoder</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CompletionOutput.html">CompletionOutput</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/RequestOutput.html">RequestOutput</a></li>
@@ -533,6 +536,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../features/speculative-decoding.html">Speculative Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/checkpoint-loading.html">Checkpoint Loading</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/model-express.html">ModelExpress (MX) Checkpoint Loading</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/sleep-wakeup.html">Runtime Memory Checkpointing (Prototype)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/ray-orchestrator.html">Ray Orchestrator (Prototype)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/torch_compile_and_piecewise_cuda_graph.html">Torch Compile &amp; Prefill CUDA Graph</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/helix.html">Helix Parallelism</a></li>
@@ -551,6 +555,10 @@
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/overview.html">Architecture Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/perf-analysis.html">Performance Analysis</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/perf-benchmarking.html">TensorRT LLM Benchmarking</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../developer-guide/moe-perf-guide.html">MoE Performance Guide</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../developer-guide/moe-perf-dashboard.html">MoE Perf Dashboard</a></li>
+</ul>
+</details></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/ci-overview.html">Continuous Integration Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/dev-containers.html">Using Dev Containers</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/api-change.html">LLM API Change Guide</a></li>
@@ -562,6 +570,7 @@
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog30_KV_Cache_Compression_in_TensorRT-LLM.html">KV Cache Compression in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog29_GVR_V2_Self_Sampling_Exact_TopK_for_Sparse_Attention.html">GVR V2: Self-Sampling and Multi-Thresholding for Faster Exact Top-K</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog28_Accelerating_Video_Generation_with_GEMM_Quantization_Attention_Quantization_and_Skip_Softmax_Attention_in_TensorRT-LLM.html">Accelerating Video Generation with GEMM Quantization, Attention Quantization and Skip Softmax Attention in TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog27_Evaluating_Agentic_Serving_with_Trace_Replay_and_Job_Level_Metrics.html">Evaluating Agentic Serving with Trace Replay and Job-Level Metrics</a></li>
@@ -787,7 +796,7 @@ actively evolving and may change in future releases.</p>
 <th class="head"><p>trtllm-serve</p></th>
 <th class="head"><p>Attention2D</p></th>
 <th class="head"><p>Ring Attention</p></th>
-<th class="head"><p>Tensor Parallelism</p></th>
+<th class="head"><p>Tensor Parallelism*</p></th>
 <th class="head"><p>SOL-Attn</p></th>
 </tr>
 </thead>
@@ -918,8 +927,8 @@ actively evolving and may change in future releases.</p>
 <td><p>No</p></td>
 <td><p>No</p></td>
 <td><p>No</p></td>
-<td><p>No</p></td>
-<td><p>No</p></td>
+<td><p>Yes</p></td>
+<td><p>Yes</p></td>
 <td><p>No</p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
@@ -1033,6 +1042,7 @@ actively evolving and may change in future releases.</p>
 </tbody>
 </table>
 </div>
+<p>* Wan 2.1 and Wan 2.2 (not VSA) also support a token-sharded TP layout (prototype), enabled with <code class="docutils literal notranslate"><span class="pre">parallel_config.tp_layout:</span> <span class="pre">token_sharded</span></code>; see <a class="reference internal" href="#multi-gpu-parallelism">Multi-GPU Parallelism</a>.</p>
 <p>SOL-Attn is a runtime sparse-attention feature of the <code class="docutils literal notranslate"><span class="pre">TRTLLM</span></code> and <code class="docutils literal notranslate"><span class="pre">CUTEDSL</span></code> backends (bfloat16 self-attention with <code class="docutils literal notranslate"><span class="pre">head_dim=128</span></code> on SM100/SM103); it needs no dedicated checkpoint. Video Sparse Attention (VSA) requires a VSA-fine-tuned checkpoint and is therefore listed as its own model, <code class="docutils literal notranslate"><span class="pre">Wan</span> <span class="pre">2.1</span> <span class="pre">VSA</span></code>. See <a class="reference internal" href="../features/visualgen-sparse-attention.html"><span class="std std-doc">VisualGen Sparse Attention</span></a> for both.</p>
 </section>
 </section>
@@ -1165,6 +1175,9 @@ and Tensor Parallelism are not enabled for this pipeline yet.</p>
 </section>
 <section id="minimax-h3-notes">
 <h2>MiniMax-H3 Notes<a class="headerlink" href="#minimax-h3-notes" title="Link to this heading">#</a></h2>
+<p>MiniMax-H3 parallel VAE uses independent spatial tiles via
+<code class="docutils literal notranslate"><span class="pre">parallel_config.parallel_vae_size</span></code>, with size from 1 through the Ulysses world size.
+Tile geometry and blending follow the loaded Diffusers VAE.</p>
 <ul class="simple">
 <li><p>Text-to-video (T2VA), first/last-frame-to-video (FL2VA), and reference-to-video
 with audio (Ref2VA) are supported on one GPU. Enable Ref2VA with
@@ -1447,20 +1460,67 @@ for a Wan 2.2 VAE NVFP4 calibration and checkpoint-generation recipe.</p>
 <li><p><strong>Async Ulysses A2A pipeline</strong> (<code class="docutils literal notranslate"><span class="pre">async_ulysses:</span> <span class="pre">true</span></code> in <code class="docutils literal notranslate"><span class="pre">parallel_config</span></code>): Overlaps per-rank V/Q/K projection compute with the cross-rank all-to-all on a dedicated side stream. Requires <code class="docutils literal notranslate"><span class="pre">ulysses_size</span> <span class="pre">&gt;</span> <span class="pre">1</span></code> and an NVLink-connected GPU domain (uses PyTorch <code class="docutils literal notranslate"><span class="pre">_SymmetricMemory</span></code> with CUDA IPC for peer pushes; not currently supported across nodes without MNNVL). Currently wired for WAN and LTX-2 self-attention.</p></li>
 </ul>
 </li>
-<li><p><strong>Parallel VAE</strong> (<code class="docutils literal notranslate"><span class="pre">parallel_vae_size:</span> <span class="pre">N</span></code>): Shards the final VAE decode along a spatial axis (constraint: <code class="docutils literal notranslate"><span class="pre">parallel_vae_size</span> <span class="pre">≤</span> <span class="pre">world_size</span></code>; WAN/Cosmos3 only).</p></li>
+<li><p><strong>Parallel VAE</strong> (<code class="docutils literal notranslate"><span class="pre">parallel_vae_size:</span> <span class="pre">N</span></code>): Parallelizes the final VAE decode (constraint: <code class="docutils literal notranslate"><span class="pre">parallel_vae_size</span> <span class="pre">≤</span> <span class="pre">world_size</span></code>). WAN/Cosmos3 shard along a spatial axis; LTX-2 and MiniMax-H3 distribute independent tiles.</p></li>
 <li><p><strong>Context Parallel (CP)</strong> — Partitions the sequence into shards so that each rank computes partial attention. Requires an LSE-capable attention backend (<code class="docutils literal notranslate"><span class="pre">FA4</span></code> or <code class="docutils literal notranslate"><span class="pre">CUTEDSL</span></code>). CP can be composed with Ulysses, giving a total sequence-parallel (SP) degree = <code class="docutils literal notranslate"><span class="pre">cp_size</span> <span class="pre">·</span> <span class="pre">ulysses_size</span></code>. The CP degree depends on the implementation below:</p>
 <ul>
 <li><p><strong>Attention2D</strong> (<code class="docutils literal notranslate"><span class="pre">attn2d_size:</span> <span class="pre">[N,</span> <span class="pre">M]</span></code>): Shards the sequence axis across an <code class="docutils literal notranslate"><span class="pre">N</span> <span class="pre">×</span> <span class="pre">M</span></code> device mesh (CP degree = <code class="docutils literal notranslate"><span class="pre">N</span> <span class="pre">·</span> <span class="pre">M</span></code>; total SP degree = <code class="docutils literal notranslate"><span class="pre">N</span> <span class="pre">·</span> <span class="pre">M</span> <span class="pre">·</span> <span class="pre">ulysses_size</span></code>).</p></li>
 <li><p><strong>Ring Attention</strong> (<code class="docutils literal notranslate"><span class="pre">ring_size:</span> <span class="pre">N</span></code>): Shards the sequence axis across a 1D ring of <code class="docutils literal notranslate"><span class="pre">N</span></code> ranks, streaming K/V blocks (CP degree = <code class="docutils literal notranslate"><span class="pre">N</span></code>; total SP degree = <code class="docutils literal notranslate"><span class="pre">N</span> <span class="pre">·</span> <span class="pre">ulysses_size</span></code>; mutually exclusive with Attention2D).</p></li>
 </ul>
 </li>
-<li><p><strong>Tensor Parallelism</strong> (<code class="docutils literal notranslate"><span class="pre">tp_size:</span> <span class="pre">N</span></code>): Splits attention heads and transformer MLPs across GPUs for faster compute and reduced memory usage.</p></li>
+<li><p><strong>Tensor Parallelism</strong> (<code class="docutils literal notranslate"><span class="pre">tp_size:</span> <span class="pre">N</span></code>): Splits attention heads and transformer MLPs across GPUs for faster compute and reduced memory usage.</p>
+<ul>
+<li><p><strong>Token-sharded TP</strong> (<code class="docutils literal notranslate"><span class="pre">tp_layout:</span> <span class="pre">token_sharded</span></code> in <code class="docutils literal notranslate"><span class="pre">parallel_config</span></code>, prototype): Keeps the residual stream sharded by tokens across the TP group, so each all-reduce becomes a reduce-scatter plus an all-gather and the norms, modulation and quantization between projections run on <code class="docutils literal notranslate"><span class="pre">1/tp_size</span></code> of the tokens. Requires <code class="docutils literal notranslate"><span class="pre">tp_size</span> <span class="pre">&gt;</span> <span class="pre">1</span></code>; composes with CFG parallelism, not with Ulysses, Ring Attention, Attention2D or VSA. Supported for Wan 2.1 and Wan 2.2.</p></li>
+</ul>
+</li>
 </ul>
 <p>For multi-node execution, VisualGen relies on the external launcher to terminate
 the remaining ranks when any rank exits. <code class="docutils literal notranslate"><span class="pre">torchrun</span></code> provides this behavior. With
 SLURM, launch the VisualGen rank group with <code class="docutils literal notranslate"><span class="pre">srun</span> <span class="pre">--kill-on-bad-exit=1</span></code>; without
 this option, surviving ranks can continue running and retain GPU memory after a
 peer or the coordinator exits.</p>
+</section>
+</section>
+<section id="experimental-features">
+<h2>Experimental Features<a class="headerlink" href="#experimental-features" title="Link to this heading">#</a></h2>
+<section id="sleep-wake-for-visualgen-models-currently-supported-for-minimax-h3">
+<h3>Sleep/Wake for VisualGen Models (currently supported for MiniMax H3)<a class="headerlink" href="#sleep-wake-for-visualgen-models-currently-supported-for-minimax-h3" title="Link to this heading">#</a></h3>
+<p>Sleep/wake lets a worker switch between large checkpoints on one GPU without
+keeping every model’s weights on the device or repeatedly loading checkpoints
+from disk. An idle MiniMax-H3 pipeline backs its persistent GPU allocations in
+host RAM and releases their GPU memory. Wake restores them at their original
+addresses without reloading or requantizing the checkpoint.</p>
+<p>This feature is disabled by default and available only through the internal,
+single-GPU H3 pipeline. Support for other VisualGen models may be added in the
+future. It is not exposed through public <code class="docutils literal notranslate"><span class="pre">VisualGen</span></code>, HTTP, or Dynamo controls.
+Enable it explicitly during loading:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">pipeline</span> <span class="o">=</span> <span class="n">PipelineLoader</span><span class="p">(</span><span class="n">args</span><span class="p">)</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">sleep_restore_mode</span><span class="o">=</span><span class="s2">"PINNED"</span><span class="p">)</span>
+<span class="n">pipeline</span><span class="o">.</span><span class="n">sleep</span><span class="p">()</span>
+<span class="n">pipeline</span><span class="o">.</span><span class="n">wake_up</span><span class="p">()</span>
+</pre></div>
+</div>
+<p><code class="docutils literal notranslate"><span class="pre">CPU</span></code> uses pageable host backing; <code class="docutils literal notranslate"><span class="pre">PINNED</span></code> uses pinned host backing. Host backups
+remain allocated after wake and are reused on later sleeps. Budget host RAM for
+each instance’s captured allocation pool, which can include cached loading and
+quantization buffers in addition to weights. This is process-local offload:
+the process, CUDA context, host memory, and node must remain alive.</p>
+<p>Sleep rejects new generation and waits for the active call to finish before
+releasing memory. Sleep/wake transitions are serialized per instance; overlapping
+generation calls are rejected rather than queued. A failed transition prevents
+further generation and requires restarting the worker. Callers manage external
+request queues and must not access model tensors directly during transitions.
+Warmup and inference allocations are outside the captured pool; live outputs and
+the CUDA context remain on the GPU, so sleep does not reduce GPU usage to zero.</p>
+<p>Sleep/wake requires <code class="docutils literal notranslate"><span class="pre">world_size=1</span></code>. H3 already rejects CUDA graphs, CPU stage
+offload, and cache acceleration; sleep additionally rejects runtime LoRA because
+that combination has not been validated. Other pipelines retain their ordinary
+loading behavior and reject explicit sleep requests unless they implement the
+internal loading hook and generation coordination.</p>
+<p>Validation covers lifecycle and allocator regressions, unchanged default loading
+for tiny Wan/FLUX checkpoints, and checkpoint-backed H3 restoration of video,
+audio, and parameter addresses. Full-model sleep coverage is FP8 text-to-video/audio
+with pinned backing; keyframe-conditioned, Ref2VA, and non-FP8 sleep configurations remain
+unvalidated. The checkpoint-backed regression is
+<code class="docutils literal notranslate"><span class="pre">tests/integration/defs/visual_gen/test_minimax_h3_sleep.py</span></code>.</p>
 </section>
 </section>
 <section id="developer-guide">
@@ -1628,6 +1688,10 @@ peer or the coordinator exits.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#multi-gpu-parallelism">Multi-GPU Parallelism</a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#experimental-features">Experimental Features</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#sleep-wake-for-visualgen-models-currently-supported-for-minimax-h3">Sleep/Wake for VisualGen Models (currently supported for MiniMax H3)</a></li>
+</ul>
+</li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#developer-guide">Developer Guide</a><ul class="nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#architecture-overview">Architecture Overview</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#implementing-a-new-diffusion-model">Implementing a New Diffusion Model</a><ul class="nav section-nav flex-column">
@@ -1730,9 +1794,9 @@ peer or the coordinator exits.</p>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on October 09, 2026.</p>
+  <p>Last updated on October 19, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/cc63e66">cc63e66</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/0372799">0372799</a>.</p>
   
 </div></div>
       

@@ -64,7 +64,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.23.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc0';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc1';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -81,7 +81,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="color-scheme" content="light dark"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.4.0rc0" />
+  <meta name="docsearch:version" content="1.4.0rc1" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -446,6 +446,9 @@
 <li class="toctree-l1 has-children"><a class="reference internal" href="../llm-api/reference.html">API Reference</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/LLM.html">LLM</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/AsyncLLM.html">AsyncLLM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/ExecutorMemoryType.html">ExecutorMemoryType</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/RuntimeMemoryStatus.html">RuntimeMemoryStatus</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SleepConfig.html">SleepConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/MultimodalEncoder.html">MultimodalEncoder</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CompletionOutput.html">CompletionOutput</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/RequestOutput.html">RequestOutput</a></li>
@@ -535,6 +538,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../features/speculative-decoding.html">Speculative Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/checkpoint-loading.html">Checkpoint Loading</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/model-express.html">ModelExpress (MX) Checkpoint Loading</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/sleep-wakeup.html">Runtime Memory Checkpointing (Prototype)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/ray-orchestrator.html">Ray Orchestrator (Prototype)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/torch_compile_and_piecewise_cuda_graph.html">Torch Compile &amp; Prefill CUDA Graph</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/helix.html">Helix Parallelism</a></li>
@@ -553,6 +557,10 @@
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/overview.html">Architecture Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/perf-analysis.html">Performance Analysis</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/perf-benchmarking.html">TensorRT LLM Benchmarking</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../developer-guide/moe-perf-guide.html">MoE Performance Guide</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../developer-guide/moe-perf-dashboard.html">MoE Perf Dashboard</a></li>
+</ul>
+</details></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/ci-overview.html">Continuous Integration Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/dev-containers.html">Using Dev Containers</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/api-change.html">LLM API Change Guide</a></li>
@@ -564,6 +572,7 @@
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog30_KV_Cache_Compression_in_TensorRT-LLM.html">KV Cache Compression in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog29_GVR_V2_Self_Sampling_Exact_TopK_for_Sparse_Attention.html">GVR V2: Self-Sampling and Multi-Thresholding for Faster Exact Top-K</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog28_Accelerating_Video_Generation_with_GEMM_Quantization_Attention_Quantization_and_Skip_Softmax_Attention_in_TensorRT-LLM.html">Accelerating Video Generation with GEMM Quantization, Attention Quantization and Skip Softmax Attention in TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog27_Evaluating_Agentic_Serving_with_Trace_Replay_and_Job_Level_Metrics.html">Evaluating Agentic Serving with Trace Replay and Job-Level Metrics</a></li>
@@ -730,7 +739,8 @@ server (see <a class="reference internal" href="#launch-the-tensorrt-llm-server"
 <li><p><strong>Weight and KV precision.</strong> BF16, MXFP8, and mixed MXFP8/NVFP4 checkpoints are supported. On SM100/SM103, the MSA backend supports FP8 and NVFP4 KV cache. NVFP4 storage is used in sparse target layers; dense target layers and the shared Eagle3 draft layer use FP8. The curated BF16-KV YAML remains a separate starting configuration.</p></li>
 <li><p><strong>KV cache reuse must be disabled.</strong> KV cache reuse is not supported on the sparse-attention path, so set <code class="docutils literal notranslate"><span class="pre">kv_cache_config.enable_block_reuse:</span> <span class="pre">false</span></code>.</p></li>
 <li><p><strong>Eagle3.</strong> The MSA path supports one shared GQA draft layer with linear Eagle3 drafting. Other MTP and tree-drafting configurations are unsupported. Keep NVFP4 KV and piecewise CUDA graph qualification separate: the existing PCG accuracy cases use FP8 KV.</p></li>
-<li><p><strong><code class="docutils literal notranslate"><span class="pre">max_seq_len</span></code> must be capped for CUDA graphs.</strong> The dense GQA expansion in the first few attention layers and the per-Q FP32 expansion in the sparse decode kernel allocate temporary tensors whose size grows linearly with the warmup decode’s <code class="docutils literal notranslate"><span class="pre">max_k</span></code>. If <code class="docutils literal notranslate"><span class="pre">max_seq_len</span></code> is left at the checkpoint default, that <code class="docutils literal notranslate"><span class="pre">max_k</span></code> follows <code class="docutils literal notranslate"><span class="pre">max_position_embeddings</span></code> (1M for MXFP8, 512K for BF16) and the resulting gigabyte-scale single-allocation request exceeds the caching allocator’s CUDA-graph-safe path, so capture fails with <code class="docutils literal notranslate"><span class="pre">cudaErrorStreamCaptureUnsupported</span></code> / OOM. The curated YAML therefore sets <code class="docutils literal notranslate"><span class="pre">max_seq_len</span></code> to a small value just above ISL+OSL (<code class="docutils literal notranslate"><span class="pre">2068</span></code> for the 1k/1k benchmark) so CUDA graphs can capture cleanly. Raise it for longer-context workloads, but expect a corresponding cut in <code class="docutils literal notranslate"><span class="pre">max_batch_size</span></code>.</p></li>
+<li><p><strong>Use matching builds for disaggregated context and generation workers.</strong> The Triton unquantized main KV cache uses HND physical storage. Builds using the previous NHD storage are not compatible for KV transfer; upgrade both workers together.</p></li>
+<li><p><strong>Size <code class="docutils literal notranslate"><span class="pre">max_seq_len</span></code> for the active attention paths.</strong> On SM100/SM103, supported dense layers with unquantized KV cache in the Triton configuration use native paged attention and do not gather historical KV or expand GQA heads into temporary tensors. The SDPA dense fallback still allocates those buffers when TRTLLM-Gen is unavailable, disabled, ordered after the C++ fallback in <code class="docutils literal notranslate"><span class="pre">TLLM_FMHA_LIBS</span></code>, or the Triton configuration uses FP8/NVFP4 KV. FP8 KV retains SDPA to preserve its existing Q precision. The Triton sparse decode path separately has per-query FP32 temporary buffers that grow with the attended KV length. Keep <code class="docutils literal notranslate"><span class="pre">max_seq_len</span></code> bounded for paths with these allocations: checkpoint defaults (1M for MXFP8, 512K for BF16) can cause OOM or CUDA graph capture failures. The curated YAML sets <code class="docutils literal notranslate"><span class="pre">max_seq_len</span></code> just above ISL+OSL (<code class="docutils literal notranslate"><span class="pre">2068</span></code> for the 1k/1k benchmark); longer-context workloads may require a lower <code class="docutils literal notranslate"><span class="pre">max_batch_size</span></code>. MSA retains its own dense/sparse kernels and cache layout.</p></li>
 <li><p><strong>Parallelism.</strong> MoE experts run with expert parallelism. The attention layers support both Tensor-Expert Parallelism (TEP) and Data-Expert Parallelism (DEP, via <code class="docutils literal notranslate"><span class="pre">enable_attention_dp:</span> <span class="pre">true</span></code>). The overlap scheduler is enabled by default.</p></li>
 <li><p><strong>Multimodal.</strong> <code class="docutils literal notranslate"><span class="pre">MiniMaxM3SparseForConditionalGeneration</span></code> supports text, image, and video inputs. The text decoder is also usable standalone (text-only) via the <code class="docutils literal notranslate"><span class="pre">MiniMaxM3SparseForCausalLM</span></code> architecture.</p></li>
 </ul>
@@ -765,7 +775,7 @@ in place so CUDA-graph replay retains valid addresses.</p>
 <section id="container-image">
 <h3>Container Image<a class="headerlink" href="#container-image" title="Link to this heading">#</a></h3>
 <p>The TensorRT LLM NVIDIA NGC image is used as the Slurm container:</p>
-<div class="highlight-text notranslate"><div class="highlight"><pre><span></span>nvcr.io/nvidia/tensorrt-llm/release:1.4.0rc0
+<div class="highlight-text notranslate"><div class="highlight"><pre><span></span>nvcr.io/nvidia/tensorrt-llm/release:1.4.0rc1
 </pre></div>
 </div>
 <p>Note:</p>
@@ -835,7 +845,7 @@ MiniMax-M3’s automatic backend selection and uses the requested policy.</p>
 srun<span class="w"> </span>-N<span class="w"> </span><span class="m">2</span><span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--ntasks<span class="w"> </span><span class="m">8</span><span class="w"> </span>--ntasks-per-node<span class="w"> </span><span class="m">4</span><span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--mpi<span class="o">=</span>pmix<span class="w"> </span>--gres<span class="o">=</span>gpu:4<span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--container-image<span class="o">=</span>nvcr.io/nvidia/tensorrt-llm/release:1.4.0rc0<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--container-image<span class="o">=</span>nvcr.io/nvidia/tensorrt-llm/release:1.4.0rc1<span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--container-mounts<span class="o">=</span>/models:/models,/workspace:/workspace,<span class="si">${</span><span class="nv">TRTLLM_DIR</span><span class="si">}</span>:<span class="si">${</span><span class="nv">TRTLLM_DIR</span><span class="si">}</span><span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--container-workdir<span class="w"> </span>/workspace<span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>bash<span class="w"> </span>-c<span class="w"> </span><span class="s2">"trtllm-llmapi-launch \</span>
@@ -1251,9 +1261,9 @@ chmod<span class="w"> </span>+x<span class="w"> </span>bench.sh
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on October 09, 2026.</p>
+  <p>Last updated on October 19, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/cc63e66">cc63e66</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/0372799">0372799</a>.</p>
   
 </div></div>
       
