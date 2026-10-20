@@ -52,6 +52,8 @@ def _load_cpp_module():
 
 _cpp = _load_cpp_module()
 
+DEFAULT_COLD_TIER_OFFLOAD_MIN_PRIORITY = _cpp.DEFAULT_COLD_TIER_OFFLOAD_MIN_PRIORITY
+
 AggregatedPageDesc = _cpp.AggregatedPageDesc
 AttentionLayerConfig = _cpp.AttentionLayerConfig
 AttentionReusePolicy = _cpp.AttentionReusePolicy
@@ -133,6 +135,7 @@ class _KVCacheManagerConfigFieldSpec:
     text_only: bool = False
     enable_partial_commit: bool = True
     pool_rebalance: object = None
+    cold_tier_offload_min_priority: int = DEFAULT_COLD_TIER_OFFLOAD_MIN_PRIORITY
 
 
 KVCacheManagerConfig.__dataclass_fields__ = _KVCacheManagerConfigFieldSpec.__dataclass_fields__
@@ -226,6 +229,7 @@ __all__ = [
     "CacheTierConfig",
     "CudaStream",
     "DEFAULT_BEAM_INDEX",
+    "DEFAULT_COLD_TIER_OFFLOAD_MIN_PRIORITY",
     "DataRole",
     "DiskCacheTierConfig",
     "ExpandedBuffer",
