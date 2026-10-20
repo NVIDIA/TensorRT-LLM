@@ -190,7 +190,6 @@ test_e2e.py::test_ptp_quickstart_bert[VANILLA-BertForSequenceClassification-bert
 test_e2e.py::test_trtllm_serve_example SKIP (https://nvbugs/6891165)
 unittest/_torch/attention/test_attention_backends.py::test_attention_backend[qwen2_0_5b_gqa_hd64-ctx-bf16-HND-p32-v1] SKIP (https://nvbugs/6641268)
 unittest/_torch/attention/test_attention_mla.py::test_attention_mla SKIP (https://nvbugs/6862662)
-unittest/_torch/attention/test_cute_dsl_mla.py::test_mla_generation_routes_wide_head_fp8_verify_away_from_trtllm_gen[103-96-1-True-False-cute_dsl_mla] SKIP (https://nvbugs/6948129)
 unittest/_torch/executor/kv_cache/test_kv_cache_v2_vocab_size.py::test_branch_only_enables_multimodal_keys_when_needed[dense-encoder_disable_noop] SKIP (https://nvbugs/6818710)
 unittest/_torch/executor/kv_cache/test_kv_cache_v2_vocab_size.py::test_branch_only_enables_multimodal_keys_when_needed[dense-multimodal] SKIP (https://nvbugs/6818710)
 unittest/_torch/executor/kv_cache/test_kv_cache_v2_vocab_size.py::test_branch_only_enables_multimodal_keys_when_needed[dense-text_only] SKIP (https://nvbugs/6818710)
