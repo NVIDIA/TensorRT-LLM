@@ -213,30 +213,30 @@ class TrtllmAttentionMetadata:
         and the ``i`` earlier blocks already cached (``kv_cache.cached_tokens``). All
         requests are the one sequence; each reads its own row of the cache's table.
 
-        One object per (cache, geometry, blocking) for the life of the cache, shared
-        by every layer through the model-scoped state. It is built once, eagerly, and
+        One object per (geometry, blocking), stored on the cache
+        (``kv_cache.attention_metadata``) and shared by every layer that attends over it;
+        ``CausalKVCacheManager.shutdown`` drops it. It is built once, eagerly, and
         then bound to the cache's own device tensors: the block offsets and the
         per-block key counts read by kernel are owned by the cache, rewritten in place by
         ``commit``. So nothing here changes after a commit, and a CUDA graph captured
         around the forward replays correctly with no refresh. The host-side lengths taken
         by the op bear upper bound values, fixed at the geometry's capacity.
+
+        ``prepare()`` runs exactly once, when the object is built. Right after it, four
+        fields are replaced: ``kv_cache_block_offsets`` and ``kv_lens_cuda_runtime`` by
+        views of the cache's device tensors, ``kv_lens_runtime`` and
+        ``host_total_kv_lens`` by bounds at the pool's capacity. Every other field keeps
+        the value ``prepare()`` computed.
         """
-        cache_key = (
-            "kv_cache",
-            id(kv_cache),
-            kv_cache.geometry,
-            num_causal_blocks,
-            causal_block_size,
-        )
-        cached = self._metadata_cache.get(cache_key)
+        cache_key = ("trtllm", kv_cache.geometry, num_causal_blocks, causal_block_size)
+        cached = kv_cache.attention_metadata.get(cache_key)
         if cached is not None:
-            return cached["metadata"]
+            return cached
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError(
                 "K/V cache attention metadata first needed during CUDA graph capture; "
                 "run the forward eagerly once before capturing"
             )
-        self._drop_metadata_of_shut_down_caches()
         n, size = num_causal_blocks, causal_block_size
         metadata = BaseTrtllmAttentionMetadata(
             max_num_requests=kv_cache.max_causal_blocks,
@@ -269,21 +269,8 @@ class TrtllmAttentionMetadata:
         metadata.kv_lens_runtime = torch.full((n,), bound, dtype=torch.int32)
         metadata.host_total_kv_lens[0] = n * bound
         metadata.host_total_kv_lens[1] = 0
-        self._metadata_cache[cache_key] = {"metadata": metadata}
+        kv_cache.attention_metadata[cache_key] = metadata
         return metadata
-
-    def _drop_metadata_of_shut_down_caches(self) -> None:
-        """Forget metadata built over caches that were shut down.
-
-        A merely closed cache keeps its metadata: it may be
-        reopened, and graphs captured over it still read those buffers."""
-        stale = [
-            key
-            for key, entry in self._metadata_cache.items()
-            if key[0] == "kv_cache" and entry["metadata"].kv_cache_manager.is_shut_down
-        ]
-        for key in stale:
-            del self._metadata_cache[key]
 
 
 class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):

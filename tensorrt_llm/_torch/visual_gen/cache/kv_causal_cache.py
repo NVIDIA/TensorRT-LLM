@@ -356,6 +356,10 @@ class CausalKVCacheManager(KVCacheManagerV2):
         self._kv_cache = None
         self._buffers: List[torch.Tensor] = []
         self._shut_down = False
+        # Metadata attention backends build over this cache, keyed by backend and
+        # blocking. Kept here, not by the backend, so the cache's lifetime is the
+        # caller's; the entries hold the cache, so shutdown() clears them.
+        self.attention_metadata: Dict[Tuple, object] = {}
         # The open geometry; set by open().
         self.window_tokens = 0
         self.max_staged_tokens = 0
@@ -557,7 +561,13 @@ class CausalKVCacheManager(KVCacheManagerV2):
         self._remove_kv_cache(_ROLLOUT_REQUEST_ID)
 
     def shutdown(self) -> None:
+        """Release the pool. Required, like ``free`` after ``malloc``: the cache's GPU
+        memory and the attention metadata built over it are released here. The metadata
+        refers back to the cache, so a cache dropped without ``shutdown()`` is left to
+        Python's cyclic garbage collector. Closes the open rollout first; the cache cannot
+        be reopened afterwards."""
         self.close()
+        self.attention_metadata.clear()
         super().shutdown()
         self._shut_down = True
 

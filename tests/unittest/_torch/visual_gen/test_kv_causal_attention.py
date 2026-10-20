@@ -21,6 +21,8 @@ and the block itself. Stale tokens the whole-page eviction keeps resident must
 not be seen.
 """
 
+import gc
+import weakref
 from functools import partial
 from types import SimpleNamespace
 
@@ -735,42 +737,36 @@ def test_cache_path_refusals(cache, backend):
             attn.forward(q[None], k[None], v[None], batch_size=1, **common)
 
 
-def test_trtllm_forgets_metadata_of_shut_down_caches():
-    """Metadata holds its cache. Once a cache is shut down, building metadata for the
-    next one drops the old entries, so a cache per rollout does not leak. A merely
-    closed cache keeps its metadata: graphs captured over it still read it."""
+def test_trtllm_metadata_lives_on_the_cache():
+    """The TRTLLM backend keeps the metadata it builds over a cache on that cache and
+    holds no reference to the cache itself. A closed cache keeps its metadata, since
+    graphs captured over it still read it; shutdown() drops it. A cache dropped without
+    shutdown() is reclaimed by the cyclic garbage collector."""
     attn = make_backend("trtllm")
-
-    def held():
-        return {
-            id(e["metadata"].kv_cache_manager)
-            for key, e in attn.metadata._metadata_cache.items()
-            if key[0] == "kv_cache"
-        }
-
-    def new_cache():
-        return make_cache(32)
-
-    caches = [new_cache() for _ in range(3)]
+    cache = make_cache(32)
     try:
-        for rollout, cache in enumerate(caches):
-            open_with_prompt(cache, 9)
-            attn.metadata.prepare_with_kv_cache(cache, 1, CHUNK)
-            attn.metadata.prepare_with_kv_cache(cache, 4, CHUNK // 4)
-            assert held() == {id(cache)}, f"rollout {rollout}: metadata of shut-down caches kept"
-            cache.shutdown()
-        reopened, other = new_cache(), new_cache()
-        caches += [reopened, other]
-        open_with_prompt(reopened, 9)
-        attn.metadata.prepare_with_kv_cache(reopened, 1, CHUNK)
-        reopened.close()
-        open_with_prompt(other, 9)
-        attn.metadata.prepare_with_kv_cache(other, 1, CHUNK)
-        assert held() == {id(reopened), id(other)}, "a closed cache must keep its metadata"
+        open_with_prompt(cache, 9)
+        one = attn.metadata.prepare_with_kv_cache(cache, 1, CHUNK)
+        four = attn.metadata.prepare_with_kv_cache(cache, 4, CHUNK // 4)
+        assert len(cache.attention_metadata) == 2
+        assert attn.metadata.prepare_with_kv_cache(cache, 1, CHUNK) is one
+        cache.close()
+        assert len(cache.attention_metadata) == 2
+        open_with_prompt(cache, 9)
+        assert attn.metadata.prepare_with_kv_cache(cache, 4, CHUNK // 4) is four
+        cache.shutdown()
+        assert cache.attention_metadata == {}
     finally:
-        for cache in caches:
-            if not cache.is_shut_down:
-                cache.shutdown()
+        if not cache.is_shut_down:
+            cache.shutdown()
+
+    dropped = make_cache(32)
+    open_with_prompt(dropped, 9)
+    attn.metadata.prepare_with_kv_cache(dropped, 1, CHUNK)
+    ref = weakref.ref(dropped)
+    del dropped
+    gc.collect()
+    assert ref() is None, "the backend keeps a dropped cache alive"
 
 
 def test_packed_qkv_matches_separate_tensors_on_the_cache_path():
