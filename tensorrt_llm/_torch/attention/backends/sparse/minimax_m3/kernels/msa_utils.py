@@ -6,13 +6,14 @@ from __future__ import annotations
 
 import functools
 import importlib.util
+import os
 import types
 from typing import Optional, Tuple
 
 import torch
 
 from tensorrt_llm._torch.attention.backends.interface import AttentionInputType
-from tensorrt_llm._utils import is_sm_100f, maybe_pin_memory
+from tensorrt_llm._utils import get_sm_version, is_sm_100f, maybe_pin_memory
 
 from .paged_cache import write_kv_slots
 
@@ -225,6 +226,45 @@ def build_kv_page_indices(
     return maybe_pin_memory(block_ids_cpu[row, col].to(torch.int32))
 
 
+# per_token_valid_blocks runs on every step's metadata preparation: the same integer arithmetic as one NumPy pass
+# instead of about a dozen small CPU torch ops (the same int64 values, returned as a torch.long tensor).
+# SM107 only. Kill switch: TRTLLM_MSA_PTVB_NUMPY=0.
+_PER_TOKEN_VALID_BLOCKS_NUMPY = os.environ.get("TRTLLM_MSA_PTVB_NUMPY", "1") != "0"
+_PER_TOKEN_VALID_BLOCKS_NUMPY_LOGGED = False
+
+
+def _per_token_valid_blocks_numpy(
+    qo_lens_cpu: torch.Tensor,
+    kv_lens_cpu: torch.Tensor,
+    qo_offset_cpu: Optional[torch.Tensor],
+    *,
+    causal: bool,
+    block_size: int,
+) -> torch.Tensor:
+    import numpy as np
+
+    qo = qo_lens_cpu.numpy().astype(np.int64)
+    total = int(qo.sum())
+    if total == 0:
+        return torch.zeros(0, dtype=torch.long)
+    kv = kv_lens_cpu.numpy().astype(np.int64)
+    batch_row = np.repeat(np.arange(qo.shape[0], dtype=np.int64), qo)
+    starts = np.zeros(qo.shape[0], dtype=np.int64)
+    if qo.shape[0] > 1:
+        starts[1:] = np.cumsum(qo)[:-1]
+    kv_per = kv[batch_row]
+    if causal:
+        intra = np.arange(total, dtype=np.int64) - starts[batch_row]
+        if qo_offset_cpu is not None:
+            off = qo_offset_cpu.numpy().astype(np.int64)[batch_row]
+        else:
+            off = (kv - qo)[batch_row]
+        eff = np.minimum(off + intra + 1, kv_per)
+    else:
+        eff = kv_per
+    return torch.from_numpy((eff + block_size - 1) // block_size)
+
+
 def per_token_valid_blocks(
     qo_lens_cpu: torch.Tensor,
     kv_lens_cpu: torch.Tensor,
@@ -238,6 +278,18 @@ def per_token_valid_blocks(
     Expands per-request lengths and offsets to a per-token vector so block
     selection can honour each query token's own causal extent.
     """
+    if _PER_TOKEN_VALID_BLOCKS_NUMPY and get_sm_version() == 107:
+        global _PER_TOKEN_VALID_BLOCKS_NUMPY_LOGGED
+        if not _PER_TOKEN_VALID_BLOCKS_NUMPY_LOGGED:
+            _PER_TOKEN_VALID_BLOCKS_NUMPY_LOGGED = True
+            from tensorrt_llm.logger import logger
+
+            logger.info(
+                "MSA per_token_valid_blocks: NumPy pass engaged (kill TRTLLM_MSA_PTVB_NUMPY=0)"
+            )
+        return _per_token_valid_blocks_numpy(
+            qo_lens_cpu, kv_lens_cpu, qo_offset_cpu, causal=causal, block_size=block_size
+        )
     qo = qo_lens_cpu.to(torch.long)
     kv = kv_lens_cpu.to(torch.long)
     batch = int(qo.shape[0])

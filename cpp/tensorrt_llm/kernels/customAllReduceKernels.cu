@@ -347,6 +347,107 @@ __global__ void rms_norm_kernel(AllReduceParams params)
 #endif
 }
 
+//! rms_norm_kernel for rows that one CTA covers in a single pass (blockDim.x * kPackedSize >= hidden_size, no smem),
+//! made persistent: each CTA walks rows blockIdx.x, blockIdx.x + gridDim.x, ... with the same thread -> element mapping
+//! and block_reduce_sum tree as rms_norm_kernel, so the output is bitwise the same. The next row's inputs are loaded
+//! before this row's reduction and the weight stays in registers, which keeps more bytes in flight per thread.
+template <typename T, bool Bias, bool Residual, bool Affine>
+__global__ void rms_norm_rows_kernel(AllReduceParams params)
+{
+    static constexpr int kPackedSize = details::kBytesPerAccess / sizeof(T);
+    using PackedStruct = typename PackedOn16Bytes<T>::Type;
+
+    T const* bias_buffer = reinterpret_cast<T const*>(params.fusion_params.bias_buffer);
+    T const* residual_buffer = reinterpret_cast<T const*>(params.fusion_params.residual_buffer);
+    T const* weight_buffer = reinterpret_cast<T const*>(params.fusion_params.weight_buffer);
+    T* local_final_output_buffer = reinterpret_cast<T*>(params.local_output_buffer_ptr);
+    T* intermediate_buffer = reinterpret_cast<T*>(params.fusion_params.intermediate_buffer);
+
+    int const hidden = params.fusion_params.hidden_size;
+    int const rows = params.elts_total / hidden;
+    int const offset = threadIdx.x * kPackedSize;
+    bool const active = offset < hidden;
+
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900) && (__CUDA_ARCH__ < 1200))
+    cudaGridDependencySynchronize();
+#endif
+
+    PackedStruct weight_vec, bias_vec;
+    if (active)
+    {
+        if constexpr (Affine)
+        {
+            weight_vec.packed = *reinterpret_cast<int4 const*>(weight_buffer + offset);
+        }
+        if constexpr (Bias)
+        {
+            bias_vec.packed = *reinterpret_cast<int4 const*>(bias_buffer + offset);
+        }
+    }
+    PackedStruct inter_vec, residual_vec;
+    int row = blockIdx.x;
+    if (active && row < rows)
+    {
+        inter_vec.packed
+            = *reinterpret_cast<int4 const*>(intermediate_buffer + static_cast<int64_t>(row) * hidden + offset);
+        if constexpr (Residual)
+        {
+            residual_vec.packed
+                = *reinterpret_cast<int4 const*>(residual_buffer + static_cast<int64_t>(row) * hidden + offset);
+        }
+    }
+    for (; row < rows; row += gridDim.x)
+    {
+        int64_t const rowOffset = static_cast<int64_t>(row) * hidden + offset;
+        int const next = row + gridDim.x;
+        PackedStruct next_inter_vec, next_residual_vec;
+        if (active && next < rows)
+        {
+            next_inter_vec.packed
+                = *reinterpret_cast<int4 const*>(intermediate_buffer + static_cast<int64_t>(next) * hidden + offset);
+            if constexpr (Residual)
+            {
+                next_residual_vec.packed
+                    = *reinterpret_cast<int4 const*>(residual_buffer + static_cast<int64_t>(next) * hidden + offset);
+            }
+        }
+        float acc = 0.f;
+        if (active)
+        {
+            if constexpr (Bias)
+            {
+                inter_vec.packed = add128b(inter_vec, bias_vec);
+            }
+            if constexpr (Residual)
+            {
+                inter_vec.packed = add128b(inter_vec, residual_vec);
+                *reinterpret_cast<int4*>(intermediate_buffer + rowOffset) = inter_vec.packed;
+            }
+            acc = accumulate<T>(acc, inter_vec);
+        }
+        acc = block_reduce_sum(acc);
+        float denom = rsqrtf(acc / hidden + params.fusion_params.eps);
+        if (active)
+        {
+            PackedStruct out_vec;
+            out_vec.packed = rms_norm<T, Affine>(denom, inter_vec, weight_vec);
+            *reinterpret_cast<int4*>(local_final_output_buffer + rowOffset) = out_vec.packed;
+        }
+        // block_reduce_sum's shared memory is written again by the next row.
+        __syncthreads();
+        inter_vec.packed = next_inter_vec.packed;
+        residual_vec.packed = next_residual_vec.packed;
+    }
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900) && (__CUDA_ARCH__ < 1200))
+    cudaTriggerProgrammaticLaunchCompletion();
+#endif
+}
+
+// Kill switch for the SM107 rms_norm_rows_kernel path of rms_norm_kernel_launcher, and the fewest rows it takes:
+// below that the per-row kernel is as fast, so decode-sized steps keep it.
+constexpr bool kRmsNormRowsSm107 = true;
+constexpr int kRmsNormRowsSm107MinRows = 1024;
+
 template <typename T, bool Bias = false, bool Residual = false, bool Affine = false>
 __global__ void rms_pre_post_norm_kernel(AllReduceParams params) // for gemma2 pre residual + post residual norm
 {
@@ -495,6 +596,24 @@ void rms_norm_kernel_launcher(AllReduceParams& params, cudaStream_t stream, AllR
     }
     else
     {
+        // SM107: a single-pass RMSNorm over many rows runs persistent (rms_norm_rows_kernel, bitwise the same).
+        if (kRmsNormRowsSm107 && fusionOp == AllReduceFusionOp::RESIDUAL_RMS_NORM && cta_num >= kRmsNormRowsSm107MinRows
+            && tensorrt_llm::common::getSMVersion() == 107)
+        {
+            static int const multiProcessorCount = tensorrt_llm::common::getMultiProcessorCount();
+            cudaLaunchConfig_t kernelConfig = {0};
+            kernelConfig.gridDim = std::min(cta_num, multiProcessorCount);
+            kernelConfig.blockDim = cta_size;
+            kernelConfig.dynamicSmemBytes = 0;
+            kernelConfig.stream = stream;
+            cudaLaunchAttribute attribute[1];
+            attribute[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+            attribute[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
+            kernelConfig.attrs = attribute;
+            kernelConfig.numAttrs = 1;
+            TLLM_CUDA_CHECK(cudaLaunchKernelEx(&kernelConfig, rms_norm_rows_kernel<T, Bias, Residual, Affine>, params));
+            return;
+        }
         if (tensorrt_llm::common::getEnvEnablePDL())
         {
             TLLM_LOG_DEBUG("Enable PDL in rms_norm_kernel");

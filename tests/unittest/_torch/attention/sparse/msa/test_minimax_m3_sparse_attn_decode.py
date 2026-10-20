@@ -1330,6 +1330,8 @@ def test_msa_jit_cache_tracks_sources_and_build_modes(
     build_script.write_text("compiler_flags = '-std=c++20'\n")
     monkeypatch.setattr(jit, "_PACKAGE_DIR", package)
     monkeypatch.setattr(jit, "_FMHA_VARLEN_DIR", csrc)
+    # Pin the SM107 default proxy modes; other devices add the kill knobs' directory suffix.
+    monkeypatch.setattr(jit, "_proxy_modes", lambda: (False, False))
     for name in ("GPU_TRACE", "SM_TIMING", "FMHA_GMEM_CHECK"):
         monkeypatch.delenv(name, raising=False)
     cache_root = tmp_path / "cache"

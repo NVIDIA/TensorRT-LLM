@@ -31,6 +31,7 @@ def check_grouped_gemm_leaf(
     p: MoEProblem,
     d: MoEDeployment,
     *leaf_gates: MoEEligibility | None,
+    allow_swiglu_oai: bool = False,
 ) -> MoEEligibility:
     """Run the family gates in order, then the leaf's own, and admit.
 
@@ -42,7 +43,7 @@ def check_grouped_gemm_leaf(
         check_quant_matches_identity(cls, p),
         check_sm(cls, d),
         check_dtype(cls, p),
-        check_grouped_gemm_shared(cls, p, d),
+        check_grouped_gemm_shared(cls, p, d, allow_swiglu_oai=allow_swiglu_oai),
         *leaf_gates,
     ):
         if verdict is not None:
@@ -50,7 +51,9 @@ def check_grouped_gemm_leaf(
     return MoEEligibility.ok()
 
 
-def check_grouped_gemm_shared(cls: type, p: MoEProblem, d: MoEDeployment) -> MoEEligibility | None:
+def check_grouped_gemm_shared(
+    cls: type, p: MoEProblem, d: MoEDeployment, *, allow_swiglu_oai: bool = False
+) -> MoEEligibility | None:
     """Gates both grouped-GEMM leaves share, or ``None`` to admit."""
     sm_version = d.env.sm
 
@@ -60,7 +63,7 @@ def check_grouped_gemm_shared(cls: type, p: MoEProblem, d: MoEDeployment) -> MoE
             f"{cls.__name__} on SM107 requires Rubin support in CuTe DSL",
         )
 
-    if p.swiglu_gptoss_style:
+    if p.swiglu_gptoss_style and not allow_swiglu_oai:
         return _reject(
             MoERejectReason.ACTIVATION_UNSUPPORTED,
             f"{cls.__name__} does not support swiglu_gptoss_style (bias/swiglu with custom alpha/beta/limit)",

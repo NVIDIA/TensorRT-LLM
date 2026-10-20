@@ -1,0 +1,51 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# MiniMax-M3 context worker on Rubin (SM107) for multi-turn agentic traffic
+# (AgentX, 24 concurrent conversations), where most of each prompt is the
+# previous turn's prefix. It keeps that prefix resident:
+# - TP2 attention (no attention DP), so one KV pool holds every conversation;
+# - 95% of free GPU memory for KV, and a 100 GiB per-rank host tier that
+#   evicted blocks move to instead of being dropped (KV cache manager V2);
+# - per_conversation block reuse, paired with the conversation router and
+#   generation workers' reuse settings (see README.md);
+# - 16k-token prefill chunks and the tokenization cache.
+# Export TLLM_FP4_MOE_TACTIC_TABLE=<this dir>/fp4_moe_tactics_tp2ctx_v1.json in
+# this worker to pin the FP4 MoE tactics (output independent of per-start
+# autotuning), and prepend the setup_fa4.sh directory to PYTHONPATH (README.md).
+tensor_parallel_size: 2
+moe_expert_parallel_size: 2
+enable_attention_dp: false
+trust_remote_code: true
+max_seq_len: 1048576
+max_batch_size: 32
+max_num_tokens: 16384
+enable_chunked_prefill: true
+disable_overlap_scheduler: true
+cuda_graph_config: null
+enable_tokenization_cache: true
+enable_iter_perf_stats: true
+scheduler_config:
+  capacity_scheduler_policy: GUARANTEED_NO_EVICT
+kv_cache_config:
+  dtype: nvfp4
+  tokens_per_block: 128
+  use_kv_cache_manager_v2: true
+  enable_block_reuse: true
+  block_reuse_config:
+    policy: per_conversation
+  free_gpu_memory_fraction: 0.95
+  host_cache_size: 107374182400
+cache_transceiver_config:
+  backend: NIXL
+moe_config:
+  backend: TRTLLM
+sparse_attention_config:
+  algorithm: minimax_m3
+  implementation: msa
+  indexer_kv_dtype: fp8
+  fuse_qkv_index_projection: true
+speculative_config:
+  decoding_type: Eagle3
+  max_draft_len: 3
+  speculative_model: /path/to/minimax-m3-eagle3
