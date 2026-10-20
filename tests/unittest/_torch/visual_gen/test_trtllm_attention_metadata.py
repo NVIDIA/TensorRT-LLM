@@ -16,7 +16,7 @@ from tensorrt_llm._torch.attention.backends.sparse.skip_softmax import (
     SkipSoftmaxParams,
     SkipSoftmaxScheduler,
 )
-from tensorrt_llm._torch.visual_gen.attention_backend import trtllm as visual_trtllm
+from tensorrt_llm._torch.visual_gen.attention.backends import trtllm as visual_trtllm
 from tensorrt_llm._torch.visual_gen.config import create_attention_metadata_state
 from tensorrt_llm._torch.visual_gen.cuda_graph_runner import resolved_extra_keys_scope
 

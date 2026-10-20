@@ -46,7 +46,10 @@ from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl import (
     _runner_tactics_match_tile_size,
     cute_dsl_nvfp4_grouped_gemm_ref,
 )
-from tensorrt_llm._torch.moe.fused_moe.quantization import interleave_linear_and_gate
+from tensorrt_llm._torch.moe.fused_moe.quantization import (
+    interleave_gate_and_linear,
+    interleave_linear_and_gate,
+)
 from tensorrt_llm._torch.utils import (
     ActivationType,
     Fp4QuantizedTensor,
@@ -1478,13 +1481,13 @@ def test_nvfp4_gather_grouped_gemm_act_fusion_rubin(
     b_kernel = b
     b_sf_kernel = b_sf
     if is_gated:
-        b_kernel = interleave_linear_and_gate(b.view(torch.uint8), group_size=64, dim=1).view(
+        b_kernel = interleave_gate_and_linear(b.view(torch.uint8), group_size=16, dim=1).view(
             torch.float4_e2m1fn_x2
         )
         b_sf_unswizzled = unswizzle_sf(b_sf, weight_n, hidden_size).view(
             num_local_experts, weight_n, hidden_size // sf_vec_size
         )
-        b_sf_unswizzled = interleave_linear_and_gate(b_sf_unswizzled, group_size=64, dim=1)
+        b_sf_unswizzled = interleave_gate_and_linear(b_sf_unswizzled, group_size=16, dim=1)
         b_sf_kernel = swizzle_sf(b_sf_unswizzled, weight_n, hidden_size).view(
             num_local_experts, weight_n, hidden_size // sf_vec_size
         )
@@ -1696,11 +1699,11 @@ def test_nvfp4_gather_grouped_gemm_act_fusion_rubin_propagates_nan_through_clamp
     b, b_sf = torch.ops.trtllm.fp4_quantize(b, 1 / b_global_sf, sf_vec_size, False)
     b_sf = b_sf.view(1, weight_n, hidden_size // sf_vec_size)
     alpha = a_global_sf * b_global_sf
-    b_kernel = interleave_linear_and_gate(b, group_size=64, dim=1).view(torch.float4_e2m1fn_x2)
+    b_kernel = interleave_gate_and_linear(b, group_size=16, dim=1).view(torch.float4_e2m1fn_x2)
     b_sf_kernel = swizzle_sf(
-        interleave_linear_and_gate(
+        interleave_gate_and_linear(
             unswizzle_sf(b_sf, weight_n, hidden_size).view(1, weight_n, hidden_size // sf_vec_size),
-            group_size=64,
+            group_size=16,
             dim=1,
         ),
         weight_n,
@@ -1812,13 +1815,13 @@ def test_nvfp4_gather_grouped_gemm_situ_rubin(tile_size: int):
     b_sf = b_sf.view(num_local_experts, interm_size * 2, hidden_size // sf_vec_size)
     alpha = a_global_sf * b_global_sf
 
-    b_interleaved = interleave_linear_and_gate(b.view(torch.uint8), group_size=64, dim=1).view(
+    b_interleaved = interleave_gate_and_linear(b.view(torch.uint8), group_size=16, dim=1).view(
         torch.float4_e2m1fn_x2
     )
     b_sf_unswizzled = unswizzle_sf(b_sf, interm_size * 2, hidden_size).view(
         num_local_experts, interm_size * 2, hidden_size // sf_vec_size
     )
-    b_sf_unswizzled_interleaved = interleave_linear_and_gate(b_sf_unswizzled, group_size=64, dim=1)
+    b_sf_unswizzled_interleaved = interleave_gate_and_linear(b_sf_unswizzled, group_size=16, dim=1)
     b_sf_interleaved = swizzle_sf(b_sf_unswizzled_interleaved, interm_size * 2, hidden_size).view(
         num_local_experts, interm_size * 2, hidden_size // sf_vec_size
     )
@@ -2033,13 +2036,13 @@ def test_nvfp4_gather_grouped_gemm_swiglu_rubin_small_tokens(
     b_sf = b_sf.view(num_local_experts, interm_size * 2, hidden_size // sf_vec_size)
     alpha = a_global_sf * b_global_sf
 
-    b_interleaved = interleave_linear_and_gate(b.view(torch.uint8), group_size=64, dim=1).view(
+    b_interleaved = interleave_gate_and_linear(b.view(torch.uint8), group_size=16, dim=1).view(
         torch.float4_e2m1fn_x2
     )
     b_sf_unswizzled = unswizzle_sf(b_sf, interm_size * 2, hidden_size).view(
         num_local_experts, interm_size * 2, hidden_size // sf_vec_size
     )
-    b_sf_unswizzled_interleaved = interleave_linear_and_gate(b_sf_unswizzled, group_size=64, dim=1)
+    b_sf_unswizzled_interleaved = interleave_gate_and_linear(b_sf_unswizzled, group_size=16, dim=1)
     b_sf_interleaved = swizzle_sf(b_sf_unswizzled_interleaved, interm_size * 2, hidden_size).view(
         num_local_experts, interm_size * 2, hidden_size // sf_vec_size
     )
@@ -2577,14 +2580,14 @@ def _create_quantized_locality_domain_weights(
     weight_fp4 = weight_fp4.view(torch.float4_e2m1fn_x2)
     weight_sf = weight_sf.view(num_local_experts, interm_size * 2, hidden_size // sf_vec_size)
 
-    weight_interleaved = interleave_linear_and_gate(
-        weight_fp4.view(torch.uint8), group_size=64, dim=1
+    weight_interleaved = interleave_gate_and_linear(
+        weight_fp4.view(torch.uint8), group_size=16, dim=1
     ).view(torch.float4_e2m1fn_x2)
     weight_sf_unswizzled = unswizzle_sf(weight_sf, interm_size * 2, hidden_size).view(
         num_local_experts, interm_size * 2, hidden_size // sf_vec_size
     )
-    weight_sf_unswizzled_interleaved = interleave_linear_and_gate(
-        weight_sf_unswizzled, group_size=64, dim=1
+    weight_sf_unswizzled_interleaved = interleave_gate_and_linear(
+        weight_sf_unswizzled, group_size=16, dim=1
     )
     weight_sf_interleaved = swizzle_sf(
         weight_sf_unswizzled_interleaved, interm_size * 2, hidden_size
@@ -2744,6 +2747,7 @@ def test_locality_domain_outer_preparation_disables_memset_overlap(
         num_local_experts=1,
         local_expert_offset=0,
         workload_identity=("locality_domain",),
+        prime_inner_tactics=True,
     )
     inputs = [torch.empty(0) for _ in range(num_inputs)]
 
@@ -2755,6 +2759,229 @@ def test_locality_domain_outer_preparation_disables_memset_overlap(
         assert args == tuple(inputs)
         assert kwargs["enable_alltoall"] is False
         assert kwargs["overlap_moe_output_memset"] is False
+
+
+@pytest.mark.parametrize(
+    "module_name,runner_name,num_inputs,output_idx",
+    [
+        ("fused_moe_cute_dsl", "CuteDslFusedMoENvfp4Runner", 5, 4),
+        ("fused_moe_cute_dsl", "CuteDslFusedMoEBF16Runner", 4, 3),
+        # The subclass production instantiates for CUTEDSL_FC12. It overrides
+        # _tile_sizes, so a green result on the parent is not evidence about it.
+        ("fused_moe_cute_dsl_fc12", "CuteDslFc12FusedMoENvfp4Runner", 5, 4),
+    ],
+)
+def test_workload_identity_alone_does_not_prime_inner_tactics(
+    monkeypatch,
+    module_name: str,
+    runner_name: str,
+    num_inputs: int,
+    output_idx: int,
+):
+    """workload_identity is a cache key, not a "forward_impl nests tuning" flag.
+
+    Non-locality-domain backends (e.g. CuteDslFc12FusedMoE, which keys the outer
+    tactic on the activation epilogue) pass a workload_identity, but their
+    ``run_moe_*_impl`` has no ``overlap_moe_output_memset`` parameter; priming
+    them raises TypeError during autotuner warmup.
+    """
+    import importlib
+
+    from tensorrt_llm._torch.moe.fused_moe import fused_moe_cute_dsl
+
+    monkeypatch.setattr(fused_moe_cute_dsl, "get_sm_version", lambda: 107)
+    preparation_calls = []
+
+    def forward_impl(*args, enable_alltoall=False, tile_size=128):
+        # Mirrors the single-op signature: no ``overlap_moe_output_memset``,
+        # so any priming call is a TypeError.
+        preparation_calls.append((args, tile_size))
+        return args[output_idx]
+
+    module = importlib.import_module(f"tensorrt_llm._torch.moe.fused_moe.{module_name}")
+    runner_cls = getattr(module, runner_name)
+    runner = runner_cls(
+        forward_impl,
+        num_experts=1,
+        top_k=1,
+        num_local_experts=1,
+        local_expert_offset=0,
+        workload_identity=(int(ActivationType.SiTu), 1.0, 0.5),
+    )
+    assert runner.prime_inner_tactics is False
+    inputs = [torch.empty(0) for _ in range(num_inputs)]
+
+    result = runner(inputs, tactic=-1, do_preparation=True)
+
+    assert result is inputs[output_idx]
+    assert preparation_calls == []
+
+
+@pytest.mark.parametrize("reason", ["disabled", "not_nvfp4", "no_aux_stream"])
+def test_quantize_input_async_falls_back_to_sync(monkeypatch, reason: str):
+    """Without an aux stream, NVFP4, or with the kill switch off, the async
+    quantization is the synchronous one and hands back no event to join."""
+    from tensorrt_llm._torch.moe.fused_moe import fused_moe_cute_dsl
+
+    monkeypatch.setattr(fused_moe_cute_dsl, "ASYNC_INPUT_QUANT", reason != "disabled")
+    calls = []
+    backend = SimpleNamespace(
+        has_nvfp4=reason != "not_nvfp4",
+        quantize_input=lambda x, post_quant_comm: calls.append(post_quant_comm) or (x, None),
+        _has_moe_output_memset_aux_stream=lambda: reason != "no_aux_stream",
+    )
+    x = torch.empty(2, 4)
+
+    x_q, x_sf, event = fused_moe_cute_dsl.CuteDslFusedMoE.quantize_input_async(backend, x)
+
+    assert x_q is x and x_sf is None and event is None
+    assert calls == [False]
+
+
+def test_join_pending_x_ready_waits_once():
+    from tensorrt_llm._torch.moe.fused_moe import fused_moe_cute_dsl
+
+    waits = []
+    backend = SimpleNamespace(_pending_x_ready_event=SimpleNamespace(wait=lambda: waits.append(1)))
+    join = fused_moe_cute_dsl.CuteDslFusedMoE._join_pending_x_ready
+
+    join(backend)
+    join(backend)
+
+    assert waits == [1]
+    assert backend._pending_x_ready_event is None
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or get_sm_version() < 100,
+    reason="NVFP4 quantization needs SM100+",
+)
+def test_quantize_input_async_matches_sync():
+    """The aux-stream quantization produces the same bytes as the main-stream one."""
+    from tensorrt_llm._torch.moe.fused_moe import fused_moe_cute_dsl
+    from tensorrt_llm._torch.utils import AuxStreamType, EventType
+
+    hidden = 256
+    backend = SimpleNamespace(
+        has_nvfp4=True,
+        hidden_size=hidden,
+        scaling_vector_size=16,
+        fc31_input_scale=torch.tensor([1.0], device="cuda"),
+        aux_stream_dict={AuxStreamType.MoeOutputMemset: torch.cuda.Stream()},
+        event_dict={
+            EventType.Main: torch.cuda.Event(),
+            EventType.MoeOutputMemset: torch.cuda.Event(),
+        },
+        _x_quant_event=torch.cuda.Event(),
+    )
+    cls = fused_moe_cute_dsl.CuteDslFusedMoE
+    backend.quantize_input = cls.quantize_input.__get__(backend)
+    backend._has_moe_output_memset_aux_stream = cls._has_moe_output_memset_aux_stream.__get__(
+        backend
+    )
+    x = torch.randn(8, hidden, dtype=torch.bfloat16, device="cuda")
+
+    ref_q, ref_sf = backend.quantize_input(x, post_quant_comm=False)
+    x_q, x_sf, event = cls.quantize_input_async(backend, x)
+    assert event is backend._x_quant_event
+    event.wait()
+
+    assert torch.equal(x_q.view(torch.uint8), ref_q.view(torch.uint8))
+    assert torch.equal(x_sf.view(torch.uint8), ref_sf.view(torch.uint8))
+
+
+def test_fc12_warmup_preparation_does_not_call_the_fused_impl(monkeypatch):
+    """Drive the real FC12 runner through do_preparation, on CPU.
+
+    The runner is built through ``CuteDslFc12FusedMoE.run_moe_nvfp4`` so the
+    workload_identity and the forward_impl are production's. Priming the
+    fused impl would raise ``TypeError: ... unexpected keyword argument
+    'overlap_moe_output_memset'`` at kwarg binding, before any CUDA work.
+    """
+    import inspect
+
+    from tensorrt_llm._torch.moe.fused_moe import fused_moe_cute_dsl_fc12 as fc12
+
+    captured = {}
+
+    class _SpyRunner(fc12.CuteDslFc12FusedMoENvfp4Runner):
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+            captured["runner"] = self
+            super().__init__(**kwargs)
+
+        def forward(self, inputs, tactic, do_preparation=False):
+            if do_preparation:
+                return super().forward(inputs, tactic=tactic, do_preparation=True)
+            # The steady-state launch needs a GPU and is not on trial.
+            return inputs[4]
+
+    monkeypatch.setattr(fc12, "CuteDslFc12FusedMoENvfp4Runner", _SpyRunner)
+    monkeypatch.setattr(
+        fc12.AutoTuner,
+        "get",
+        staticmethod(
+            lambda: SimpleNamespace(choose_one=lambda op, runners, cfg, inputs: (runners[0], 128))
+        ),
+    )
+
+    num_tokens, hidden = 4, 16
+    impl_calls = []
+    backend = SimpleNamespace(
+        has_nvfp4=True,
+        num_slots=8,
+        hidden_size=hidden,
+        use_fused_finalize=True,
+        activation_type=ActivationType.SiTu,
+        act_alpha=4.0,
+        act_beta=25.0,
+    )
+    for name in ("_situ_betas", "_epilogue_identity"):
+        setattr(backend, name, getattr(fc12.CuteDslFc12FusedMoE, name).__get__(backend))
+    # Bound, like production's ``self.run_moe_nvfp4_impl``.
+    real_impl = fc12.CuteDslFc12FusedMoE.run_moe_nvfp4_impl.__get__(backend)
+
+    def tracking_impl(*args, **kwargs):
+        impl_calls.append(kwargs)
+        return real_impl(*args, **kwargs)
+
+    backend.run_moe_nvfp4_impl = tracking_impl
+    weight_view = SimpleNamespace(expert_size_per_partition=8, slot_start=0)
+
+    inputs = dict(
+        x=torch.empty(num_tokens, hidden, dtype=torch.bfloat16),
+        token_selected_experts=torch.zeros(num_tokens, 2, dtype=torch.int32),
+        token_final_scales=torch.ones(num_tokens, 2),
+        x_sf=torch.empty(0),
+        moe_output=torch.empty(num_tokens, hidden, dtype=torch.bfloat16),
+        weight_view=weight_view,
+    )
+    out = fc12.CuteDslFc12FusedMoE.run_moe_nvfp4(backend, **inputs)
+    assert out.shape == (num_tokens, hidden)
+
+    # Positive control: the activation-keyed identity is non-None.
+    assert captured["workload_identity"] == (int(ActivationType.SiTu), 4.0, 25.0)
+
+    runner = captured["runner"]
+    assert runner.prime_inner_tactics is False
+    ordered = [
+        inputs[k]
+        for k in (
+            "x",
+            "token_selected_experts",
+            "token_final_scales",
+            "x_sf",
+            "moe_output",
+            "weight_view",
+        )
+    ]
+    assert runner(ordered, tactic=-1, do_preparation=True) is ordered[4]
+    assert impl_calls == [], f"warmup priming reached the fused impl with {impl_calls}"
+    # And the reason it must not: the impl cannot take that kwarg.
+    assert (
+        "overlap_moe_output_memset"
+        not in inspect.signature(fc12.CuteDslFc12FusedMoE.run_moe_nvfp4_impl).parameters
+    )
 
 
 def _cute_dsl_eligibility(**deployment_kwargs):
@@ -3982,13 +4209,13 @@ def test_nvfp4_fc12_fused_rubin_matches_two_op_path(mma_n: int):
     fc2_alpha = global_sf * b2_global_sf
 
     # FC1 weights in the interleaved layout both kernels read.
-    b1_kernel = interleave_linear_and_gate(b1, group_size=64, dim=1).view(torch.float4_e2m1fn_x2)
+    b1_kernel = interleave_gate_and_linear(b1, group_size=16, dim=1).view(torch.float4_e2m1fn_x2)
     b1_sf_kernel = swizzle_sf(
-        interleave_linear_and_gate(
+        interleave_gate_and_linear(
             unswizzle_sf(b1_sf, fc1_n, hidden_size).view(
                 num_experts, fc1_n, hidden_size // sf_vec_size
             ),
-            group_size=64,
+            group_size=16,
             dim=1,
         ),
         fc1_n,

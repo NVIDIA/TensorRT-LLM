@@ -12,9 +12,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""MiniMax-M3 shared Eagle3 draft layouts and real heterogeneous page tables.
+"""MiniMax-M3 dense and shared Eagle3 layouts and heterogeneous page tables.
 
-Draft views use an attention-op pool rooted at the draft K page inside the slot.
+Native layers use an attention-op pool rooted at their K page inside the slot.
 """
 
 from types import SimpleNamespace
@@ -62,7 +62,7 @@ DRAFT_K_ADDR = 0x7000_0000
 def test_nvfp4_shared_draft_constructs_and_converts_heterogeneous_page_tables(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Exercise real pool allocation and both target/draft page-table consumers."""
+    """Exercise real pool allocation, the draft page table and the resolved cache views."""
     torch.cuda.init()
     manager = MiniMaxM3KVCacheManagerV2(
         KvCacheConfig(
@@ -95,23 +95,8 @@ def test_nvfp4_shared_draft_constructs_and_converts_heterogeneous_page_tables(
         # Fill two logical request rows; no context scratch is active.
         for row, slot in enumerate((2, 5)):
             manager.host_kv_cache_block_offsets[:, row].fill_(slot)
-        output = torch.empty(
-            (manager.num_attention_op_pools, 2, 2, manager.max_blocks_per_seq),
-            dtype=torch.int32,
-            device="cuda",
-        )
-        manager._copy_batch_block_offsets_per_layer(
-            output, [101, 102], torch.tensor([0, 1], dtype=torch.long), 0, 2
-        )
-        actual = output.cpu()
-        for layer_id in range(manager.num_local_layers):
-            for role_idx, role in enumerate((Role.KEY, Role.VALUE)):
-                converter = manager.impl.get_page_index_converter(layer_id, role)
-                for row, slot in enumerate((2, 5)):
-                    expected = converter(
-                        [slot] * manager.max_blocks_per_seq, PageIndexMode.PER_LAYER
-                    )
-                    assert actual[layer_id, row, role_idx].tolist() == expected
+        assert manager.num_attention_op_pools == 0
+        assert not hasattr(manager, "_device_attention_op_block_offsets_staging")
 
         # The source pool's scale and K/V offset describe its representative
         # layer; poison them so only the view's own values produce the pages below.
@@ -171,6 +156,14 @@ def test_nvfp4_shared_draft_constructs_and_converts_heterogeneous_page_tables(
         # Dense decode stages one sub-page factor for the dense target layers; the
         # NVFP4 layer and the view-read draft layer may sit in other pools.
         assert uniform_subpages_per_slot(manager) == manager.get_kv_subpage_pool(0)[1]
+
+        # Views are resolved at construction: the warmup scrub zeroes K/V outside inference mode.
+        with torch.inference_mode():
+            kv_view = manager.get_buffers(0, "HND")
+            scale_view = manager.get_block_scale_buffers(3, "HND")
+        assert kv_view is manager.get_buffers(0) and not kv_view.is_inference()
+        assert scale_view is manager.get_block_scale_buffers(3) and not scale_view.is_inference()
+        manager.check_invalid_values_in_kv_cache(fill_with_zero=True)
     finally:
         manager.shutdown()
 
@@ -214,7 +207,8 @@ def test_virtual_pool_is_rooted_at_the_draft_k_page():
 
 def test_block_offset_copy_fills_the_virtual_pool_from_the_source_pool(monkeypatch):
     """The base copy fills the storage pools; the override then fills the virtual pool
-    from the source pool's slot ids, and does nothing extra without draft layers.
+    from the source pool's slot ids, does nothing extra without virtual pools, and
+    nothing at all without attention-op pools.
     """
     calls = []
 
@@ -233,6 +227,7 @@ def test_block_offset_copy_fills_the_virtual_pool_from_the_source_pool(monkeypat
 
     manager = MiniMaxM3KVCacheManagerV2.__new__(MiniMaxM3KVCacheManagerV2)
     manager.dtype = DataType.FP8
+    manager.num_attention_op_pools = 2
     manager._draft_op_pools = ((1, 0),)
     manager._draft_index_scales = torch.tensor([SCALE], dtype=torch.int32)
     manager._draft_kv_offsets = torch.tensor([1], dtype=torch.int32)
@@ -255,11 +250,18 @@ def test_block_offset_copy_fills_the_virtual_pool_from_the_source_pool(monkeypat
     assert idx is copy_idx
     assert scales == [SCALE] and offsets == [1] and stream == 1234
 
-    # Non-speculative MiniMax-M3: the base copy is all that runs.
+    # Without native-layer virtual pools, only the base copy runs.
     calls.clear()
     plain = MiniMaxM3KVCacheManagerV2.__new__(MiniMaxM3KVCacheManagerV2)
+    plain.num_attention_op_pools = 1
     plain.copy_batch_block_offsets(dst, [7], 1, 0, 1)
     assert calls == [("base", [7], 1, None)]
+
+    calls.clear()
+    hybrid = MiniMaxM3KVCacheManagerV2.__new__(MiniMaxM3KVCacheManagerV2)
+    hybrid.num_attention_op_pools = 0
+    hybrid.copy_batch_block_offsets(dst, [7], 1, 0, 1)
+    assert calls == []
 
 
 @pytest.mark.parametrize("dtype", [DataType.FP8, DataType.NVFP4])
@@ -293,7 +295,7 @@ def test_per_layer_page_tables_get_no_virtual_pools(monkeypatch, dtype, swa_scra
 
     assert torch.equal(manager.kv_cache_pool_pointers, pointers)
     assert torch.equal(manager.kv_cache_pool_mapping, mapping)
-    assert manager.num_attention_op_pools == 61
+    assert manager.num_attention_op_pools == (0 if dtype == DataType.NVFP4 else 61)
     assert manager._draft_op_pools == ()
     expected_extra_pages = {128} if dtype == DataType.FP8 else set()
     assert manager.trtllm_gen_extra_tokens_per_block == frozenset(expected_extra_pages)
@@ -449,3 +451,77 @@ def test_speculative_validation_precedes_cache_setup(
         setup.assert_not_called()
     else:
         setup.assert_called_once()
+
+
+@pytest.mark.cpu_only
+def test_dense_layers_get_virtual_pools_without_speculation(monkeypatch):
+    """Dense target layers need the same stride correction as draft layers."""
+
+    def fake_base_prepare(self, index_mapper_capacity):
+        self._use_per_layer_page_tables = False
+        self.kv_cache_pool_pointers = torch.tensor([[0x6000_0000, 0]], dtype=torch.int64)
+        self.kv_cache_pool_mapping = torch.tensor([[0, i] for i in range(4)], dtype=torch.int32)
+        self.num_pools = 1
+
+    monkeypatch.setattr(KVCacheManagerV2, "_prepare_page_table_tensor", fake_base_prepare)
+    manager = MiniMaxM3KVCacheManagerV2.__new__(MiniMaxM3KVCacheManagerV2)
+    manager._shared_draft_layer_ids = []
+    manager._dense_native_layer_ids = (0, 1, 2)
+    manager.dtype = DataType.BF16
+    manager.layer_offsets = {i: i for i in range(4)}
+    manager.is_draft = False
+    manager.enable_swa_scratch_reuse = False
+    manager.tokens_per_block = 128
+    manager._kv_slot_geometry = lambda i: (0x7000_0000 + i * 4096, None, 8, 9, None)
+    manager._prepare_page_table_tensor(8)
+    assert manager.kv_cache_pool_mapping.tolist() == [[1, 0], [2, 0], [3, 0], [0, 3]]
+    assert manager.kv_cache_pool_pointers[1:, 0].tolist() == [
+        0x7000_0000 + i * 4096 for i in range(3)
+    ]
+    assert manager._draft_index_scales.tolist() == [9, 9, 9]
+    assert manager._draft_kv_offsets.tolist() == [1, 1, 1]
+    assert manager.num_attention_op_pools == 4
+
+
+@pytest.mark.cpu_only
+def test_sparse_view_writes_native_hnd_storage_without_copy(monkeypatch):
+    from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.paged_cache import (
+        write_kv_slots,
+    )
+
+    # Multiple heads distinguish HND from NHD; include adjacent layer/index pages.
+    heads = 2
+    storage = (torch.arange(3 * 7 * heads * 8 * 16, dtype=torch.float32) + 1).reshape(
+        3, 7, heads, 8, 16
+    )
+    before = storage.clone()
+    manager = MiniMaxM3KVCacheManagerV2.__new__(MiniMaxM3KVCacheManagerV2)
+    manager._kv_buffers = {}
+    manager._kv_slot_geometry = lambda i, layout: (
+        storage.data_ptr(),
+        storage.dtype,
+        3,
+        7,
+        [heads, 8, 16],
+    )
+    monkeypatch.setattr(m3_cache_manager, "convert_to_torch_tensor", lambda wrapper: storage)
+    nhd = manager.get_buffers(0)
+    hnd = manager.get_buffers(0, "HND")
+    assert nhd.data_ptr() == hnd.data_ptr() == storage.data_ptr()
+    slots = torch.tensor([0, 7, 8, 23])
+    values = torch.arange(4 * heads * 16, dtype=storage.dtype).reshape(4, heads, 16)
+    write_kv_slots(nhd[:, 0], slots, values, num_live_tokens=slots.numel())
+    torch.testing.assert_close(hnd[slots // 8, 0, :, slots % 8], values)
+    touched = torch.zeros_like(storage, dtype=torch.bool)
+    touched[slots // 8, 0, :, slots % 8] = True
+    assert torch.equal(storage[~touched], before[~touched])
+    torch.testing.assert_close(nhd, hnd.transpose(2, 3))
+    # Index-K has one head even when main K/V has multiple heads. Its
+    # NHD/HND views must alias the untouched adjacent physical page.
+    index_hnd = storage[:, 2, :1]
+    manager._index_k_buffers = {0: index_hnd.transpose(1, 2)}
+    index_nhd = manager.get_index_k_buffer(0)
+    assert index_nhd.shape == (3, 8, 1, 16)
+    assert index_nhd.data_ptr() == index_hnd.data_ptr()
+    torch.testing.assert_close(manager.get_index_k_buffer(0, "HND"), index_hnd)
+    torch.testing.assert_close(index_hnd, before[:, 2, :1])

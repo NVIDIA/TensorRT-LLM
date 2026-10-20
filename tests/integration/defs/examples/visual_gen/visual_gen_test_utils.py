@@ -784,6 +784,11 @@ def _run_wan_lpips_pipeline(
     with _lpips_deterministic_algorithms(fully_eager=fully_eager):
         args = VisualGenArgs(**args_kwargs)
         pipeline = PipelineLoader(args).load(skip_warmup=True)
+        if args.parallel_config.token_sharded_tp:
+            # Bitwise equal to all-reduce TP at TP2, so LPIPS cannot show the layout engaged.
+            for name in ("transformer", "transformer_2"):
+                transformer = getattr(pipeline, name, None)
+                assert transformer is None or transformer.sharder.token_sharded_tp, name
         try:
             with torch.no_grad():
                 result = pipeline.forward(

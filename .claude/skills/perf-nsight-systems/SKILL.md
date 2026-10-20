@@ -394,4 +394,4 @@ If Tiers 1-2 don't answer:
 - [Analysis Guide](https://docs.nvidia.com/nsight-systems/AnalysisGuide/index.html) — Stats reports, expert systems, recipes
 
 WebFetch or WebSearch these URLs for the latest content. Consider distilling
-new findings back into `references/`.
+new findings back into `references/`. A distilled file opens with a `**Source:**` paragraph above its first `##` section: a markdown link to the original, `Distilled <YYYY-MM-DD>` and the revision distilled, and what the original still answers.
