@@ -72,7 +72,7 @@ import os
 import socket
 import weakref
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
@@ -761,6 +761,8 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         # deferred factory in ``_launch_megamoe_kernel``.
         self._profiling_scratch_provider_ref = None
         self._profiling_scratch_kwargs = None
+        # Cute views of this module's weights, reused across launches.
+        self._cute_weight_cache: Dict[tuple, Any] = {}
         self._weights_loaded = False
         self._weights_created = False
         self.quant_method = None
@@ -1787,6 +1789,8 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         # a later same-process call for a different shape never sees a stale
         # scratch (ownership: see ``_profiling_scratch_provider_ref``).
         from tensorrt_llm._torch.moe.custom_ops.cute_dsl_megamoe_custom_op import (
+            run_cute_dsl_megamoe_nvfp4_blackwell,
+            set_active_megamoe_cute_weight_cache,
             set_active_megamoe_profiling_scratch,
             set_active_megamoe_profiling_scratch_factory,
         )
@@ -1851,8 +1855,16 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         # Quantization, independent staging, output clears, and host setup
         # are already enqueued. The router inside this op first reads routes.
         self._wait_rebalance_routes(replica_plan)
+        # Eager launches call the op's implementation directly: the custom-op
+        # dispatch costs tens of microseconds of host time per layer.
+        megamoe_op = (
+            torch.ops.trtllm.cute_dsl_megamoe_nvfp4_blackwell
+            if torch.compiler.is_compiling()
+            else run_cute_dsl_megamoe_nvfp4_blackwell
+        )
+        set_active_megamoe_cute_weight_cache(self._cute_weight_cache)
         try:
-            torch.ops.trtllm.cute_dsl_megamoe_nvfp4_blackwell(
+            megamoe_op(
                 activation=_as_nvfp4(activation),
                 activation_sf=_as_fp8_sf(activation_sf),
                 topk_idx=topk_idx,
@@ -1902,6 +1914,7 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
             # global alive (its closure strongly references this module).
             set_active_megamoe_profiling_scratch(None)
             set_active_megamoe_profiling_scratch_factory(None)
+            set_active_megamoe_cute_weight_cache(None)
         if num_tokens == 0:
             return torch.empty((0, hidden), dtype=output_dtype, device=combine_output.device)
         # The kernel already collapsed the top-k axis into the (T, 1, hidden)

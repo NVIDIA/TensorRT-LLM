@@ -66,7 +66,7 @@ def _extract_class(
 def _extract_function(path: Path, name: str, namespace: dict):
     tree = ast.parse(path.read_text())
     function = next(
-        node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == name
+        node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef) and node.name == name
     )
     function.decorator_list = []
     module = ast.Module(
@@ -1066,7 +1066,11 @@ def test_direct_submit_orders_generations_and_defers_the_route_wait():
         current_stream=lambda _: main,
         nvtx=SimpleNamespace(range=lambda _: nullcontext()),
     )
-    torch = SimpleNamespace(cuda=cuda, Tensor=_Routes, int32="int32")
+    raw = SimpleNamespace(
+        _cuda_getDevice=lambda: state.device,
+        _cuda_getCurrentRawStream=lambda _: main.cuda_stream,
+    )
+    torch = SimpleNamespace(cuda=cuda, _C=raw, Tensor=_Routes, int32="int32")
     source = _TORCH_ROOT / "moe/fused_moe/mega_moe/rebalance_slot_scheduler.py"
     namespace = {"torch": torch, "threading": SimpleNamespace(get_ident=lambda: state.thread)}
     group_cls = _extract_class(source, "RebalanceSlotSchedulerGroup", None, namespace)
@@ -1148,6 +1152,20 @@ def test_direct_submit_orders_generations_and_defers_the_route_wait():
         assert trace.index(("TMA", generation)) < trace.index(("wait", 44, 2))
         assert trace[-2:] == [("record", 3, 44), ("consumer_release", generation, 3)]
 
+    # The bound-owner fast path still rejects another thread, stream or device.
+    state.thread = 8
+    with pytest.raises(RuntimeError, match="one MAIN thread and stream"):
+        group.plan_schedule(_Routes(8, trace))
+    state.thread = 7
+    main.cuda_stream = 45
+    with pytest.raises(RuntimeError, match="one MAIN thread and stream"):
+        group.plan_schedule(_Routes(8, trace))
+    main.cuda_stream = 44
+    state.device = 1
+    with pytest.raises(RuntimeError, match="bound CUDA device"):
+        group.plan_schedule(_Routes(8, trace))
+    state.device = 0
+
     trace.clear()
     with pytest.raises(ValueError, match="contiguous CUDA int32"):
         group.plan_schedule(_Routes(8, trace, dtype="int64"))
@@ -1158,6 +1176,88 @@ def test_direct_submit_orders_generations_and_defers_the_route_wait():
         group.plan_schedule(_Routes(8, trace))
     assert not any(entry[0] == "HALO" for entry in trace)
     assert group._plan_part is None
+
+
+def test_raw_stream_switch_restores_the_previous_stream_and_device():
+    calls = []
+    current = {"device": 0, "streams": {0: (10, 0, 1), 3: (30, 3, 1)}}
+
+    def exchange_device(index):
+        calls.append(("exchange", index))
+        previous, current["device"] = current["device"], index
+        return previous
+
+    def set_stream(stream_id, device_index, device_type):
+        calls.append(("set", stream_id, device_index))
+        current["streams"][device_index] = (stream_id, device_index, device_type)
+
+    def maybe_exchange_device(index):
+        calls.append(("restore_device", index))
+        current["device"] = index
+        return index
+
+    raw = SimpleNamespace(
+        _cuda_exchangeDevice=exchange_device,
+        _cuda_getCurrentStream=lambda index: current["streams"][index],
+        _cuda_setStream=set_stream,
+        _cuda_maybeExchangeDevice=maybe_exchange_device,
+    )
+    source = _TORCH_ROOT / "moe/kernels/megamoe_scheduler/cuda_scheduler/runtime.py"
+    namespace = {"torch": SimpleNamespace(_C=raw, cuda=SimpleNamespace(Stream=object))}
+    enter = _extract_function(source, "enter_cuda_stream", namespace)
+    leave = _extract_function(source, "exit_cuda_stream", namespace)
+
+    state = enter(SimpleNamespace(device_index=3, stream_id=77, device_type=1))
+    assert current["device"] == 3 and current["streams"][3] == (77, 3, 1)
+    leave(state)
+    assert current == {"device": 0, "streams": {0: (10, 0, 1), 3: (30, 3, 1)}}
+    assert calls == [
+        ("exchange", 3),
+        ("set", 77, 3),
+        ("set", 30, 3),
+        ("restore_device", 0),
+    ]
+
+
+def test_megamoe_cute_weight_cache_keys_every_view_field():
+    conversions = []
+
+    def to_cute(t, assumed_align):
+        conversions.append((t, assumed_align))
+        return ("cute", len(conversions))
+
+    to_cute_cached = _extract_function(
+        _TORCH_ROOT / "moe/custom_ops/cute_dsl_megamoe_custom_op.py",
+        "_to_cute_cached",
+        {"torch": SimpleNamespace(Tensor=object), "_cute_launch_helpers": lambda: (to_cute,)},
+    )
+
+    def weight(ptr=4096, shape=(8, 16), stride=(16, 1), dtype="fp4", device=0):
+        return SimpleNamespace(
+            data_ptr=lambda: ptr,
+            shape=shape,
+            stride=lambda: stride,
+            dtype=dtype,
+            device=SimpleNamespace(index=device),
+        )
+
+    cache = {}
+    first = to_cute_cached(cache, weight())
+    # A new view object of the same memory and layout reuses the cute view.
+    assert to_cute_cached(cache, weight()) is first
+    assert len(conversions) == 1
+    for changed in (
+        weight(ptr=8192),
+        weight(shape=(16, 8)),
+        weight(stride=(1, 8)),
+        weight(dtype="fp8"),
+        weight(device=1),
+    ):
+        assert to_cute_cached(cache, changed) is not first
+    assert to_cute_cached(cache, weight(), assumed_align=4) is not first
+    assert len(conversions) == 7
+    # The cache belongs to the caller: another module's dict starts empty.
+    assert to_cute_cached({}, weight()) is not first
 
 
 def test_route_wait_occurs_after_independent_staging():
