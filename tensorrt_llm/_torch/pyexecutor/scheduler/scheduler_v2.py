@@ -1435,7 +1435,7 @@ class KVCacheV2Scheduler(RequestScheduler):
                 else None
             )
             kv_cache = cross_kv_cache_manager._create_kv_cache(
-                req.py_request_id, req.lora_task_id, input_tokens
+                req.py_request_id, req.lora_task_id, input_tokens, cache_salt=req.cache_salt
             )
             kv_cache.cuda_stream = cross_kv_cache_manager._stream.cuda_stream
 

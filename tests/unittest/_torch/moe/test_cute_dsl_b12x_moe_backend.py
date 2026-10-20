@@ -169,7 +169,7 @@ def test_can_implement_rejects_attention_dp_without_expert_parallelism():
 # --------------------------------------------------------------------------
 # Hybrid CUTLASS-prefill / b12x-decode dispatch predicate tests
 #
-# ``_route_to_cutlass`` is a pure shape predicate on its input ``x``; we test
+# ``_route_to_cutlass`` checks quantization and input shape; we test
 # it via a stub that holds the class constant, sidestepping the full
 # CutlassFusedMoE constructor (which needs a routing method, real model
 # config, etc.).
@@ -182,6 +182,10 @@ class _RoutePredicateStub:
     _PREFILL_VIA_CUTLASS_THRESHOLD = CuteDslB12xFusedMoE._PREFILL_VIA_CUTLASS_THRESHOLD
 
     _route_to_cutlass = CuteDslB12xFusedMoE._route_to_cutlass
+    _prefill_uses_cutlass = CuteDslB12xFusedMoE._prefill_uses_cutlass
+
+    def __init__(self):
+        self.quant_config = QuantConfig(quant_algo=QuantAlgo.NVFP4)
 
 
 def test_dispatch_routes_prefill_shape_via_cutlass():

@@ -31,6 +31,19 @@ skip_pre_blackwell = pytest.mark.skipif(
 )
 
 
+@pytest.mark.parametrize("cache_salt", [None, "", "tenant-中文", "a\x00b"])
+@pytest.mark.parametrize("encoder_replay", [False, True])
+def test_reuse_salt_preserves_string_namespace(cache_salt, encoder_replay):
+    manager = object.__new__(CSA2CacheManager)
+    manager._encoder_replay_enabled = encoder_replay
+    expected = (
+        "deepseek-v41-csa2-encoder:approximate:" + repr(cache_salt)
+        if encoder_replay
+        else cache_salt
+    )
+    assert manager._derive_reuse_salt(cache_salt) == expected
+
+
 @pytest.mark.parametrize("disk_bytes", [0, 1 << 30])
 @pytest.mark.parametrize("custom_codec", [False, True])
 def test_encoder_replay_passes_cold_storage_to_base(
