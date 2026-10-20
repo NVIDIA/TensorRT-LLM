@@ -734,23 +734,13 @@ class Gemma4VisionModel(nn.Module, MultimodalEncoderMixin):
             self.register_buffer("std_scale", torch.ones(self.config.hidden_size, dtype=dtype))
 
         # SigLip-style context-only metadata (kv_cache_manager=None, no decode);
-        # built by the engine via ``setup_attn_metadata`` at the
-        # ``encoder_max_num_tokens`` budget, then re-prepared each pass with the
-        # actual per-image seq lens. The batch axis is the cross-request image
-        # count of one LLM step; ``forward`` splits it into passes that fit
-        # ``max_num_tokens``.
+        # built by the engine via ``MultimodalEncoderMixin.setup_attn_metadata``
+        # at the ``encoder_max_num_tokens`` budget, then re-prepared each
+        # forward with the actual per-image seq
+        # lens. The vision tower runs once per LLM step across all images, so
+        # the batch axis is the cross-request image count.
         self.metadata_cls = get_attention_backend(model_config.attn_backend).Metadata
         self.attn_metadata: Optional[AttentionMetadata] = None
-        self.max_num_tokens: int | None = None
-
-    def setup_attn_metadata(
-        self,
-        max_num_tokens: int,
-        attention_metadata_capacity: dict[str, int] | None = None,
-    ) -> None:
-        """Build the attention metadata and keep the token budget that bounds each pass."""
-        super().setup_attn_metadata(max_num_tokens, attention_metadata_capacity)
-        self.max_num_tokens = max_num_tokens
 
     def _prepare_attn_metadata(self, seq_lens_cpu: torch.Tensor):
         batch_size = int(seq_lens_cpu.numel())
@@ -775,39 +765,6 @@ class Gemma4VisionModel(nn.Module, MultimodalEncoderMixin):
             k = self.config.pooling_kernel_size
             output_length = pixel_values.shape[-2] // (k * k)
 
-        # Every image is padded to the same patch count N. Encode as many whole
-        # images per pass as fit in the encoder token budget (at least one), so
-        # activation memory stays bounded by the budget that memory profiling
-        # reserved, however many images the step carries. Images are independent
-        # attention sequences, so splitting the batch does not change outputs.
-        batch_size, num_patches = pixel_values.shape[:2]
-        images_per_pass = batch_size
-        if self.max_num_tokens is not None:
-            images_per_pass = max(1, self.max_num_tokens // num_patches)
-        if images_per_pass >= batch_size:
-            return self._forward_images(
-                pixel_values, pixel_position_ids, output_length, image_seq_lens
-            )
-
-        hidden_states = []
-        for start in range(0, batch_size, images_per_pass):
-            end = start + images_per_pass
-            output = self._forward_images(
-                pixel_values[start:end],
-                pixel_position_ids[start:end],
-                output_length,
-                image_seq_lens[start:end] if image_seq_lens is not None else None,
-            )
-            hidden_states.append(output.last_hidden_state)
-        return VisionOutput(last_hidden_state=torch.cat(hidden_states, dim=0))
-
-    def _forward_images(
-        self,
-        pixel_values: torch.Tensor,
-        pixel_position_ids: torch.Tensor,
-        output_length: int,
-        image_seq_lens: list[int] | None,
-    ) -> VisionOutput:
         # (B, N) bool: True = padding.
         padding_positions = (pixel_position_ids == -1).all(dim=-1)
         valid = ~padding_positions
