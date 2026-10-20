@@ -381,11 +381,12 @@ class Qwen3VLInputProcessorBase(Qwen2VLInputProcessorBase):
             Qwen3VLProcessorKwargs,
             tokenizer_init_kwargs=self.processor.tokenizer.init_kwargs,
             padding=True,
-            do_rescale=do_rescale,
             return_tensors="pt",
             **mm_processor_kwargs,
         )
         video_kwargs = proc_kwargs["videos_kwargs"]
+        proc_kwargs["images_kwargs"]["do_rescale"] = do_rescale
+        video_kwargs["do_rescale"] = do_rescale
 
         # Sample in decoded-frame coordinates, then map the selected indices
         # back to the source timeline. HF otherwise overwrites frames_indices
