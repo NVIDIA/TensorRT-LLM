@@ -81,11 +81,14 @@ CoalescedBuffer = _cpp.CoalescedBuffer
 CacheTier = _cpp.CacheTier
 CorruptedError = _cpp.CorruptedError
 CuError = _cpp.CuError
+CuOOMError = _cpp.CuOOMError
 DiskCacheTierConfig = _cpp.DiskCacheTierConfig
+DiskOOMError = _cpp.DiskOOMError
 GpuCacheTierConfig = _cpp.GpuCacheTierConfig
 ExpandedBuffer = _cpp.ExpandedBuffer
 HalfOpenRange = _cpp.HalfOpenRange
 HostCacheTierConfig = _cpp.HostCacheTierConfig
+HostOOMError = _cpp.HostOOMError
 KVCacheDesc = _cpp.KVCacheDesc
 KVCacheCreatedData = _cpp.KVCacheCreatedData
 KVCacheEvent = _cpp.KVCacheEvent
@@ -286,6 +289,9 @@ __all__ = [
     "AttnLifeCycle",
     "CorruptedError",
     "CuError",
+    "CuOOMError",
+    "DiskOOMError",
+    "HostOOMError",
     "OutOfMemoryError",
     "_KVCache",
     "create_default_kv_cache_cold_page_codec",
