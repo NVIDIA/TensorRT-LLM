@@ -253,6 +253,7 @@ l0_b200:
   # stream/event, no SM gating), covered on A30 pre-merge; drop that whole
   # function's leaves on Blackwell, keep the rest of the sampler dir.
   - unittest/_torch/sampler -k "not test_speculative_d2h_parity_real_predictor"
+  - unittest/_torch/speculative/test_dflash_prefill_ctx_snapshot.py
   - unittest/_torch/speculative/test_eagle3.py
   - unittest/_torch/speculative/test_lilicorr_loading.py
   - unittest/_torch/speculative/test_dspark_cute_dsl_attention.py
