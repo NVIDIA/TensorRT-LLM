@@ -1827,6 +1827,91 @@ def test_cleared_session_failure_reaches_the_waiting_receive(
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize("sibling", ["succeeds", "fails", "cancels"])
+def test_failed_receive_is_kept_until_every_writer_has_reported(
+    sibling: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One writer's FAILED must not free pages that another writer may still be writing.
+
+    Two context ranks write this receive. Rank 3 answers FAILED for its cleared
+    session while rank 4 is still writing, so the receive stays open, on every
+    poll path, until rank 4 has reported, whatever it reports. A CANCEL_SESSION
+    from rank 4 ends the wait as before.
+    """
+    monkeypatch.setattr(transfer_mod.tensorrt_llm.bindings, "global_steady_clock_now", lambda: 0)
+    rid = 115
+
+    receiver = object.__new__(Receiver)
+    receiver._enforce_physical_ownership = False
+    receiver._sessions_lock = threading.Lock()
+    receiver._sessions = {}
+    receiver._pre_cancelled_rids = {}
+    receiver._shutdown = False
+    receiver._bounce = _BounceProbe()
+    session = _make_rx_session(receiver, rid)
+
+    def publish(task: KVRecvTask) -> None:
+        task.expected_transfers = 2
+        session.mark_transferring(task.slice_id)
+
+    receiver.dispatch_task = publish
+    session.receive(_sole_piece())
+
+    sender = _make_sender_with_cleared_session(rid)
+    del sender._send_failed_result_to_receiver  # use the real reply path
+    sender._instance_rank = 3
+    sender._registrar = SimpleNamespace(
+        get_peer_rank_info=Mock(return_value=SimpleNamespace(self_endpoint="gen"))
+    )
+    dealer = Mock()
+    sender._get_or_connect_dealer = Mock(return_value=dealer)
+    info = transfer_mod.RecvReqInfo(
+        sender_req_id=rid,
+        instance_name="gen",
+        instance_rank=0,
+        block_ids_per_layer_groups=[],
+        unique_rid=rid,
+        slice_id=0,
+    )
+    sender._respond_with_kv(b"gen", [MessageType.REQUEST_DATA, info.to_bytes()])
+    (reply,) = [call.args[0] for call in dealer.send.call_args_list]
+    receiver._process_kv_agent_result(b"ctx", reply)
+
+    request = SimpleNamespace(request_id=rid)
+    transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver._ever_had_recv_session = True
+    transceiver._gen_need_sync = False
+    transceiver._mapping = SimpleNamespace(pp_size=1, enable_attention_dp=False, world_size=1)
+    transceiver._dist = SimpleNamespace(rank=0)
+    transceiver._gen_allgather = Mock()
+    transceiver._recv_sessions = {rid: session}
+    transceiver._recv_reqs = {rid: request}
+
+    assert session.status == SessionStatus.ERROR
+    assert session.failed_receive_awaits_writers()
+    assert session.wait_complete() is None
+    for at_least in (0, None):
+        assert transceiver.check_gen_transfer_status(at_least) == ([], [], [])
+    assert transceiver._recv_sessions == {rid: session}
+    assert rid in receiver._sessions
+    assert not hasattr(request, "state")
+
+    if sibling == "cancels":
+        receiver._handle_cancel_session([MessageType.CANCEL_SESSION, str(rid).encode("ascii")])
+        assert transceiver.check_gen_transfer_status(None) == ([], [], [request])
+    else:
+        result = AgentResult.SUCCESS if sibling == "succeeds" else AgentResult.FAILED
+        receiver._process_kv_agent_result(
+            b"ctx", transfer_mod._make_kv_result_msg(4, rid, 0, True, result)
+        )
+        assert not session.failed_receive_awaits_writers()
+        assert transceiver.check_gen_transfer_status(None) == ([], [rid], [])
+        assert request.state == LlmRequestState.DISAGG_TRANS_ERROR
+    assert rid not in receiver._sessions
+    assert transceiver._recv_sessions == {}
+
+
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     ("status", "receiver_ready", "waiting"),
     [

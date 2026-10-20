@@ -3632,12 +3632,22 @@ class RxSession(RxSessionBase):
         """
         return not self.resources_drained()
 
+    def failed_receive_awaits_writers(self) -> bool:
+        """Whether this failed receive must stay open for writers that have not stopped.
+
+        Without physical ownership the first writer's FAILED fails the receive, while the
+        other writers it asked may still be writing into its pages, so retiring it then could
+        hand those pages to another request mid-write. Each writer that was asked ends with
+        a result or a CANCEL_SESSION, so the wait ends. A cancelled receive is not held.
+        """
+        if self._enforce_physical_ownership or self.status != SessionStatus.ERROR:
+            return False
+        return any(task.reports_outstanding for task in self._kv_tasks)
+
     def _failed_wait_result(self) -> Optional[WaitResult]:
-        return (
-            WaitResult.FAILED
-            if not self._enforce_physical_ownership or self.resources_drained()
-            else None
-        )
+        if not self._enforce_physical_ownership:
+            return None if self.failed_receive_awaits_writers() else WaitResult.FAILED
+        return WaitResult.FAILED if self.resources_drained() else None
 
     def wait_complete(self, blocking: bool = False) -> Optional[WaitResult]:
         """Poll or block until transfer completes.
