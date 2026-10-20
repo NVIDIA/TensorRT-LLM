@@ -18,19 +18,12 @@ l0_dgx_b300:
       stage: post_merge
       backend: pytorch
   tests:
-  # Covers tests/unittest/_torch/attention/. Two sub-trees moved in here from elsewhere
-  # under tests/unittest/_torch/ and have no entry of their own on any list, so this entry
-  # is what picks them up:
-  #   kernels/    fused attention kernels (ex thop/ and custom_ops/)
-  #   multi_gpu/  helix tests -- each case spawns a 2-rank MPIPoolExecutor pinned to GPU 0/1
-  #               by absolute index, and they gate on >= 2 GPUs plus Blackwell. They also
-  #               rebind mpi4py's serializer at import time, which applies process-wide on
-  #               every stage that collects them, including where the tests themselves skip.
-  # The sparse/dsa/test_cute_dsl_* files ignored below keep their own entries (pre-existing).
-  - unittest/_torch/attention --ignore=unittest/_torch/attention/sparse/dsa/test_cute_dsl_fp8_paged_mqa_logits.py --ignore=unittest/_torch/attention/sparse/dsa/test_cute_dsl_fp4_paged_mqa_logits.py --ignore=unittest/_torch/attention/sparse/test_cute_dsl_gvr_topk_decode.py TIMEOUT (120)
-  - unittest/_torch/attention/sparse/dsa/test_cute_dsl_fp8_paged_mqa_logits.py
-  - unittest/_torch/attention/sparse/dsa/test_cute_dsl_fp4_paged_mqa_logits.py
-  - unittest/_torch/attention/sparse/test_cute_dsl_gvr_topk_decode.py TIMEOUT (120)
+  # Single-GPU coverage of tests/unittest/_torch/attention/ on B300 comes from l0_b300
+  # (pre_merge, same GPU), so this 4-GPU stage runs only multi_gpu/, whose cases need
+  # >= 2 GPUs; test_helix_zero_kv.py runs in this list's pre_merge block instead.
+  # No agg_unit_mem_df.csv row matches this entry text, so test_unittests runs it with one
+  # xdist worker and no --lf retry. TIMEOUT (60) bounds the whole entry.
+  - unittest/_torch/attention/multi_gpu --ignore=unittest/_torch/attention/multi_gpu/test_helix_zero_kv.py TIMEOUT (60)
   - unittest/_torch/executor
   - unittest/_torch/disaggregation
   - unittest/_torch/modeling -k "modeling_llama"
