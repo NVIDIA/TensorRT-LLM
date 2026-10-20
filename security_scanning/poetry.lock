@@ -3467,20 +3467,6 @@ files = [
 ]
 
 [[package]]
-name = "nvidia-cuda-nvdisasm"
-version = "13.4.92"
-description = "CUDA nvdisasm"
-optional = false
-python-versions = ">=3"
-groups = ["main"]
-files = [
-    {file = "nvidia_cuda_nvdisasm-13.4.92-py3-none-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:b007c08c8248b29281ed9a174b478d557b58ea8a921ab78369a2843f0718f77d"},
-    {file = "nvidia_cuda_nvdisasm-13.4.92-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:f35a5b6ddb64b6758c22c0b078c5b6ff6d54f7c240cd74bf131ab5bf13b6c3fe"},
-    {file = "nvidia_cuda_nvdisasm-13.4.92-py3-none-win_amd64.whl", hash = "sha256:600c43bde6b323be4d950e33a248aa97ff9cdea28a4b7dae083680f092bdd230"},
-    {file = "nvidia_cuda_nvdisasm-13.4.92-py3-none-win_arm64.whl", hash = "sha256:624a3406572a983079edce35284cc5b6b1a3f23b02a62057b49a79be33d76252"},
-]
-
-[[package]]
 name = "nvidia-cuda-nvrtc"
 version = "13.0.88"
 description = "NVRTC native runtime libraries"
@@ -3687,134 +3673,158 @@ files = [
 
 [[package]]
 name = "nvidia-cutlass-dsl"
-version = "4.8.0.dev0"
+version = "4.8.0"
 description = "NVIDIA CUTLASS Python DSL"
 optional = false
 python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "nvidia_cutlass_dsl-4.8.0.dev0-py3-none-any.whl", hash = "sha256:e1ecaa3fd23be3b3581fc79e59ae1357da90925a12085650a825841016876a84"},
+    {file = "nvidia_cutlass_dsl-4.8.0-py3-none-any.whl", hash = "sha256:24f996e0e5fa88c8b417f4893e615af135bdfdfdbdbed7e239faf36a88df711b"},
 ]
 
 [package.dependencies]
-nvidia-cutlass-dsl-libs-base = "4.8.0.dev0"
-nvidia-cutlass-dsl-libs-cu12 = "4.8.0.dev0"
-nvidia-cutlass-dsl-libs-cu13 = {version = "4.8.0.dev0", optional = true, markers = "extra == \"cu13\""}
+nvidia-cutlass-dsl-libs-base = "4.8.0"
+nvidia-cutlass-dsl-libs-cu12 = "4.8.0"
+nvidia-cutlass-dsl-libs-cu13 = {version = "4.8.0", optional = true, markers = "extra == \"cu13\""}
 
 [package.extras]
-cu13 = ["nvidia-cutlass-dsl-libs-cu13 (==4.8.0.dev0)"]
+cu13 = ["nvidia-cutlass-dsl-libs-cu13 (==4.8.0)"]
+qnx = ["nvidia-cutlass-dsl-libs-qnx-cu12 (==4.8.0)"]
+qnx-cu13 = ["nvidia-cutlass-dsl-libs-qnx-cu13 (==4.8.0)"]
 
 [[package]]
 name = "nvidia-cutlass-dsl-libs-base"
-version = "4.8.0.dev0"
+version = "4.8.0"
 description = "NVIDIA CUTLASS Python DSL"
 optional = false
 python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "nvidia_cutlass_dsl_libs_base-4.8.0.dev0-cp310-cp310-manylinux_2_28_aarch64.whl", hash = "sha256:5370f1336ede03f4ea1f922165ab2e4912da5cf08e97a3206afd65c7dd1dc982"},
-    {file = "nvidia_cutlass_dsl_libs_base-4.8.0.dev0-cp310-cp310-manylinux_2_28_x86_64.whl", hash = "sha256:8e7d298bb7a1e4c5bb106ef54d57df136ea005070200e4f0a41a2abc0ceb0bf3"},
-    {file = "nvidia_cutlass_dsl_libs_base-4.8.0.dev0-cp311-cp311-manylinux_2_28_aarch64.whl", hash = "sha256:8de41076775bec8d858a142984ea8b6018faf8876a4b68605026f78724bc142d"},
-    {file = "nvidia_cutlass_dsl_libs_base-4.8.0.dev0-cp311-cp311-manylinux_2_28_x86_64.whl", hash = "sha256:0042553d809c04e6c74fc51389d2d78d63f505edcd5c09efc48d525591090233"},
-    {file = "nvidia_cutlass_dsl_libs_base-4.8.0.dev0-cp312-cp312-manylinux_2_28_aarch64.whl", hash = "sha256:ab4996d961c4ce69aae71af36ef3d77e3b5e559351208c223290f0b52c25ff48"},
-    {file = "nvidia_cutlass_dsl_libs_base-4.8.0.dev0-cp312-cp312-manylinux_2_28_x86_64.whl", hash = "sha256:673beec61a14f122c6930163e8830adecfe88044fe4998f69974b2ff882a01c7"},
-    {file = "nvidia_cutlass_dsl_libs_base-4.8.0.dev0-cp313-cp313-manylinux_2_28_aarch64.whl", hash = "sha256:45d4cb1714eec7ae65d5ed9fab7825baa536a0b7290726f977b9a51a9c2aa8e0"},
-    {file = "nvidia_cutlass_dsl_libs_base-4.8.0.dev0-cp313-cp313-manylinux_2_28_x86_64.whl", hash = "sha256:00ff4a95cf743d370f1ddfd66d3bb22d9add9e0e43e419ff85b98bc59983c625"},
-    {file = "nvidia_cutlass_dsl_libs_base-4.8.0.dev0-cp314-cp314-manylinux_2_28_aarch64.whl", hash = "sha256:7407e03be07304a6625a41d8f3959b398dad4d9e9b475461b18e64984f478a54"},
-    {file = "nvidia_cutlass_dsl_libs_base-4.8.0.dev0-cp314-cp314-manylinux_2_28_x86_64.whl", hash = "sha256:3b3679328ba94d7880dac5001c287719ef0b477fb8bc03a0790683cf7f46ad4e"},
-    {file = "nvidia_cutlass_dsl_libs_base-4.8.0.dev0-cp314-cp314t-manylinux_2_28_aarch64.whl", hash = "sha256:0ee1c715fb2d4217b9fc69a9125cde06bb75f958dbb989b005477e9c02a926d3"},
-    {file = "nvidia_cutlass_dsl_libs_base-4.8.0.dev0-cp314-cp314t-manylinux_2_28_x86_64.whl", hash = "sha256:6de59175bdd8c09190b7a11ba2447aad43b084485c7f9899eaf946bb8aeeaf25"},
+    {file = "nvidia_cutlass_dsl_libs_base-4.8.0-cp310-cp310-manylinux_2_28_aarch64.whl", hash = "sha256:f6a30ced0fbe961a839603561a03f9fa0b00834b4678301aa8da420774a5cead"},
+    {file = "nvidia_cutlass_dsl_libs_base-4.8.0-cp310-cp310-manylinux_2_28_x86_64.whl", hash = "sha256:4d163033400ac9cdecd2b6bce8063402076c069e8d635dbc4c48d05d072f8f28"},
+    {file = "nvidia_cutlass_dsl_libs_base-4.8.0-cp310-cp310-win_amd64.whl", hash = "sha256:76d0b57505907bd9f718d7f2b15ba38121b04e00661e66dfb9c2cde473d9373d"},
+    {file = "nvidia_cutlass_dsl_libs_base-4.8.0-cp311-cp311-manylinux_2_28_aarch64.whl", hash = "sha256:04de038e0af658b644421c4df4c78f161a1d3c2cf9e5bcdff63b24c727dcd95c"},
+    {file = "nvidia_cutlass_dsl_libs_base-4.8.0-cp311-cp311-manylinux_2_28_x86_64.whl", hash = "sha256:ce3aec4c37b68880e85a7f3f763f8fe4d0503f49516cc855c80012e0fadf92e0"},
+    {file = "nvidia_cutlass_dsl_libs_base-4.8.0-cp311-cp311-win_amd64.whl", hash = "sha256:fa0c5017d8af462fa40dbb01d6d89defa013ac0508ef2e2339227b83b109f0ca"},
+    {file = "nvidia_cutlass_dsl_libs_base-4.8.0-cp312-cp312-manylinux_2_28_aarch64.whl", hash = "sha256:3affcaefb59a976ff5195dd2bff4c13594233cb4941540b74e372b63e497d3f2"},
+    {file = "nvidia_cutlass_dsl_libs_base-4.8.0-cp312-cp312-manylinux_2_28_x86_64.whl", hash = "sha256:5bdc80989b0fbbac3d58960057e74e2ce8676fafa76b852d9422b9c4b9b74bdd"},
+    {file = "nvidia_cutlass_dsl_libs_base-4.8.0-cp312-cp312-win_amd64.whl", hash = "sha256:f3ae1fc18c1353e329dc481a4010e7f738746745a20d6badea2e6035d1493c9a"},
+    {file = "nvidia_cutlass_dsl_libs_base-4.8.0-cp313-cp313-manylinux_2_28_aarch64.whl", hash = "sha256:4d26dd2848b2fa03954151cfd6da92b79e2f4175d87f4d661eedc77c36b7a054"},
+    {file = "nvidia_cutlass_dsl_libs_base-4.8.0-cp313-cp313-manylinux_2_28_x86_64.whl", hash = "sha256:5e36773748f5a8061afe999264f1c3dccc5ff18ec9548a9c769d8e72632c8b00"},
+    {file = "nvidia_cutlass_dsl_libs_base-4.8.0-cp313-cp313-win_amd64.whl", hash = "sha256:49bdb4ac523fb8e618c485c42c451ccc99a2664a6a6996ac64627fcc35a6948c"},
+    {file = "nvidia_cutlass_dsl_libs_base-4.8.0-cp314-cp314-manylinux_2_28_aarch64.whl", hash = "sha256:752f1715d50a4af4704aa2f199986b99653b40dfb574dd0c6aa5cf264dddc800"},
+    {file = "nvidia_cutlass_dsl_libs_base-4.8.0-cp314-cp314-manylinux_2_28_x86_64.whl", hash = "sha256:728abf1bc065fa950ad4f4506928300d7e32f3148312b93f83f3f2e8f756329a"},
+    {file = "nvidia_cutlass_dsl_libs_base-4.8.0-cp314-cp314-win_amd64.whl", hash = "sha256:25f8b98c4d42f3a41c131556616827d49c619a7a79e4884c3e36d15048cc9062"},
+    {file = "nvidia_cutlass_dsl_libs_base-4.8.0-cp314-cp314t-manylinux_2_28_aarch64.whl", hash = "sha256:c137f5b1df0eba5c3bd64f49a2b72ac1748a371c7a75bd461ce4b8602fcced25"},
+    {file = "nvidia_cutlass_dsl_libs_base-4.8.0-cp314-cp314t-manylinux_2_28_x86_64.whl", hash = "sha256:0c9759725b5e3967606bcaa8f28d7218729fed5f90cbb73fdac96802802f1408"},
+    {file = "nvidia_cutlass_dsl_libs_base-4.8.0-cp314-cp314t-win_amd64.whl", hash = "sha256:8701b91be993b621d892796fa252aa9b63cb75fb5a7fe894536fe132b57d554e"},
 ]
 
 [package.dependencies]
 "backports.strenum" = {version = "*", markers = "python_version < \"3.11\""}
-cuda-python = ">=12.8"
-numpy = "*"
-nvidia-cuda-nvdisasm = ">=13.3,<14"
-nvidia-cutlass-dsl-libs-core = "4.8.0.dev0"
+cuda-bindings = ">=12.8"
+nvidia-cutlass-dsl-libs-core = "4.8.0"
 protobuf = ">=4.21.12"
 typing-extensions = ">=4.10.0"
+
+[package.extras]
+sass = ["nvidia-cuda-nvdisasm (>=13.4.0rc1,<14)"]
 
 [[package]]
 name = "nvidia-cutlass-dsl-libs-core"
-version = "4.8.0.dev0"
+version = "4.8.0"
 description = "NVIDIA CUTLASS Python DSL"
 optional = false
 python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "nvidia_cutlass_dsl_libs_core-4.8.0.dev0-py3-none-any.whl", hash = "sha256:8cb315fe07a9fff0005c426e7498a58634c4c4989ac158e9b9f6967c8003f894"},
+    {file = "nvidia_cutlass_dsl_libs_core-4.8.0-py3-none-any.whl", hash = "sha256:b32716d2ed10c185cdbbb6b5c6fca26a3113a60e6e2fe4e2f0cb15966422b621"},
 ]
 
 [package.dependencies]
 "backports.strenum" = {version = "*", markers = "python_version < \"3.11\""}
-cuda-python = ">=12.8"
-numpy = "*"
-nvidia-cuda-nvdisasm = ">=13.3,<14"
+cuda-bindings = ">=12.8"
 protobuf = ">=4.21.12"
 typing-extensions = ">=4.10.0"
+
+[package.extras]
+sass = ["nvidia-cuda-nvdisasm (>=13.4.0rc1,<14)"]
 
 [[package]]
 name = "nvidia-cutlass-dsl-libs-cu12"
-version = "4.8.0.dev0"
+version = "4.8.0"
 description = "NVIDIA CUTLASS Python DSL"
 optional = false
 python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "nvidia_cutlass_dsl_libs_cu12-4.8.0.dev0-cp310-cp310-manylinux_2_28_aarch64.whl", hash = "sha256:684bb236f7fc7192a64bfc251c2164517f63749053a1fd45f8661b2f5d490cf9"},
-    {file = "nvidia_cutlass_dsl_libs_cu12-4.8.0.dev0-cp310-cp310-manylinux_2_28_x86_64.whl", hash = "sha256:55ba2d0d463fc893e15515f1fdb5428fe057573de45ae267905668a8d005c879"},
-    {file = "nvidia_cutlass_dsl_libs_cu12-4.8.0.dev0-cp311-cp311-manylinux_2_28_aarch64.whl", hash = "sha256:5227429864c3e07dd8c83f2dfe9c71ae146faa8fb63eb89dda24a9a8def98716"},
-    {file = "nvidia_cutlass_dsl_libs_cu12-4.8.0.dev0-cp311-cp311-manylinux_2_28_x86_64.whl", hash = "sha256:9b190e81ea626f55a36de895537c008f40daa19326eae5a70b00b7e1dffbf796"},
-    {file = "nvidia_cutlass_dsl_libs_cu12-4.8.0.dev0-cp312-cp312-manylinux_2_28_aarch64.whl", hash = "sha256:2abb60289a790b78fa685dbaf0be0ba95fdb96cafef2fe51a715bb5c203044af"},
-    {file = "nvidia_cutlass_dsl_libs_cu12-4.8.0.dev0-cp312-cp312-manylinux_2_28_x86_64.whl", hash = "sha256:9ecabb9ce5e4194bc180ed8ba9535fe1618e1af9b4115e4a4fbd6af854373bfd"},
-    {file = "nvidia_cutlass_dsl_libs_cu12-4.8.0.dev0-cp313-cp313-manylinux_2_28_aarch64.whl", hash = "sha256:1a87f7d94dd09c591c3885ee9a038669e6cb7e3042eed5f5eddf36eb9c845159"},
-    {file = "nvidia_cutlass_dsl_libs_cu12-4.8.0.dev0-cp313-cp313-manylinux_2_28_x86_64.whl", hash = "sha256:eb8f33fa5882fb6d9e4249e64d5322e700e07d80d31890f68de0f1c279bbb9bc"},
-    {file = "nvidia_cutlass_dsl_libs_cu12-4.8.0.dev0-cp314-cp314-manylinux_2_28_aarch64.whl", hash = "sha256:12ce818970d0afbbcfb4126832365d59e987453c0abafa51913a01bc05a1c034"},
-    {file = "nvidia_cutlass_dsl_libs_cu12-4.8.0.dev0-cp314-cp314-manylinux_2_28_x86_64.whl", hash = "sha256:b3f9526932dfd8f8dc830cc83a07b2ea287c0f428155da956bb2291f4fcc8c7a"},
-    {file = "nvidia_cutlass_dsl_libs_cu12-4.8.0.dev0-cp314-cp314t-manylinux_2_28_aarch64.whl", hash = "sha256:e8b54ef953e7c690bf227aac5b3dec5d8ec3ba88e222e1451c2c3080c05b5a1c"},
-    {file = "nvidia_cutlass_dsl_libs_cu12-4.8.0.dev0-cp314-cp314t-manylinux_2_28_x86_64.whl", hash = "sha256:9e0bb090ecba44419074f6428615b43fa4e962f7f5f74878db9519f08d0d4f13"},
+    {file = "nvidia_cutlass_dsl_libs_cu12-4.8.0-cp310-cp310-manylinux_2_28_aarch64.whl", hash = "sha256:7f4d24b96099ae7ba196a177f8893feca8e9cee0ae34172f5c4346597cd043ec"},
+    {file = "nvidia_cutlass_dsl_libs_cu12-4.8.0-cp310-cp310-manylinux_2_28_x86_64.whl", hash = "sha256:c75cf5efe6776fd5b34ea326d97ad07b78007e58c920fa7cfeec03d3fa5aeeac"},
+    {file = "nvidia_cutlass_dsl_libs_cu12-4.8.0-cp310-cp310-win_amd64.whl", hash = "sha256:3ddb4b003c0229f2434235a5dfff977813253d0258b61f2b070dd0c88e800aaf"},
+    {file = "nvidia_cutlass_dsl_libs_cu12-4.8.0-cp311-cp311-manylinux_2_28_aarch64.whl", hash = "sha256:6f88ae52d6e2aedb4a34fda32c974aa3543064cfeed3fa7e96123c32402ff2ca"},
+    {file = "nvidia_cutlass_dsl_libs_cu12-4.8.0-cp311-cp311-manylinux_2_28_x86_64.whl", hash = "sha256:5dac7aef97fc51df882b68620e1c430e7b4362d0aca17d220727da7681f061df"},
+    {file = "nvidia_cutlass_dsl_libs_cu12-4.8.0-cp311-cp311-win_amd64.whl", hash = "sha256:b0d6bac5f04dfad8fb6c8966b3dd1f1f6d172adcc1a48b86c9a47c8464c39e01"},
+    {file = "nvidia_cutlass_dsl_libs_cu12-4.8.0-cp312-cp312-manylinux_2_28_aarch64.whl", hash = "sha256:32766847abe3bef711eb6052ab78c0f24c090edd1f83322f6e74531d399e8117"},
+    {file = "nvidia_cutlass_dsl_libs_cu12-4.8.0-cp312-cp312-manylinux_2_28_x86_64.whl", hash = "sha256:2374cfdff635ceaf7e2c5bd17b4beb410830420a4fd65b12b7f24b5d5cbb9d4c"},
+    {file = "nvidia_cutlass_dsl_libs_cu12-4.8.0-cp312-cp312-win_amd64.whl", hash = "sha256:d1d942de8ea20dea9ce86fdc5c4dab6c572bab81c9f708f7e8ca54cfd78bddc4"},
+    {file = "nvidia_cutlass_dsl_libs_cu12-4.8.0-cp313-cp313-manylinux_2_28_aarch64.whl", hash = "sha256:08af2b89f33081df69b64be1cad133f9f767274b33669882cbee6a5fa35c5fcc"},
+    {file = "nvidia_cutlass_dsl_libs_cu12-4.8.0-cp313-cp313-manylinux_2_28_x86_64.whl", hash = "sha256:a06ea6a42c921ec66b190f14849e152a95a45f28819214488b9b0aa34168da33"},
+    {file = "nvidia_cutlass_dsl_libs_cu12-4.8.0-cp313-cp313-win_amd64.whl", hash = "sha256:4963300d4242dd5ee122be0367008c57a9bb9fb11fa4d9fc8e0befb491dccecd"},
+    {file = "nvidia_cutlass_dsl_libs_cu12-4.8.0-cp314-cp314-manylinux_2_28_aarch64.whl", hash = "sha256:41f9d49087f18200c4516e00abade67f542795f363c7f195bb53404b81a866f8"},
+    {file = "nvidia_cutlass_dsl_libs_cu12-4.8.0-cp314-cp314-manylinux_2_28_x86_64.whl", hash = "sha256:889918c32fe6cad047ae718343fedb374a9c4275903b4ab2d8f42e811a6a0dac"},
+    {file = "nvidia_cutlass_dsl_libs_cu12-4.8.0-cp314-cp314-win_amd64.whl", hash = "sha256:74e5f9d291eb689422695e36c8c85ae65fca05c743e60d8bce392bdb9dc4f68e"},
+    {file = "nvidia_cutlass_dsl_libs_cu12-4.8.0-cp314-cp314t-manylinux_2_28_aarch64.whl", hash = "sha256:0746ff56576d63abf616d242fd1c3884713012448461d0f2bbf25bc397b410a0"},
+    {file = "nvidia_cutlass_dsl_libs_cu12-4.8.0-cp314-cp314t-manylinux_2_28_x86_64.whl", hash = "sha256:54125669fc51e70ce97e85554ae089cc745c4b2b8d740750b315e5777304ea6c"},
+    {file = "nvidia_cutlass_dsl_libs_cu12-4.8.0-cp314-cp314t-win_amd64.whl", hash = "sha256:bad2b4cab99ebf4211d305f77254b5edaa29421d6e56767b0ae6f1b835d10742"},
 ]
 
 [package.dependencies]
 "backports.strenum" = {version = "*", markers = "python_version < \"3.11\""}
-cuda-python = ">=12.8"
-numpy = "*"
-nvidia-cuda-nvdisasm = ">=13.3,<14"
-nvidia-cutlass-dsl-libs-base = "4.8.0.dev0"
+cuda-bindings = ">=12.8"
+nvidia-cutlass-dsl-libs-base = "4.8.0"
 protobuf = ">=4.21.12"
 typing-extensions = ">=4.10.0"
+
+[package.extras]
+sass = ["nvidia-cuda-nvdisasm (>=13.4.0rc1,<14)"]
 
 [[package]]
 name = "nvidia-cutlass-dsl-libs-cu13"
-version = "4.8.0.dev0"
+version = "4.8.0"
 description = "NVIDIA CUTLASS Python DSL"
 optional = false
 python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "nvidia_cutlass_dsl_libs_cu13-4.8.0.dev0-cp310-cp310-manylinux_2_28_aarch64.whl", hash = "sha256:e7ca941a1cceebd1d122c2c889ea754e617d3a5d731a216b6737a1c613f62eb9"},
-    {file = "nvidia_cutlass_dsl_libs_cu13-4.8.0.dev0-cp310-cp310-manylinux_2_28_x86_64.whl", hash = "sha256:67d044333f520ae129b0dddf2959cb6f1464d6eae93353068764ca728d882d3c"},
-    {file = "nvidia_cutlass_dsl_libs_cu13-4.8.0.dev0-cp311-cp311-manylinux_2_28_aarch64.whl", hash = "sha256:80a539dec13e592ac75cc6362a33ee26c259f2117e7c9c335592ea0383b17262"},
-    {file = "nvidia_cutlass_dsl_libs_cu13-4.8.0.dev0-cp311-cp311-manylinux_2_28_x86_64.whl", hash = "sha256:9e4fbbe0f48260de0568fc04fd316047212d0270352d778f3486421f27d84cc2"},
-    {file = "nvidia_cutlass_dsl_libs_cu13-4.8.0.dev0-cp312-cp312-manylinux_2_28_aarch64.whl", hash = "sha256:c6012a5cae60b0f6045fb4dcde80fa28d32816314d29da92d483cadbd477c65e"},
-    {file = "nvidia_cutlass_dsl_libs_cu13-4.8.0.dev0-cp312-cp312-manylinux_2_28_x86_64.whl", hash = "sha256:df205429c9ac58ccc846a744ce0ab88705b460b0cb91d0ac27e408312d610009"},
-    {file = "nvidia_cutlass_dsl_libs_cu13-4.8.0.dev0-cp313-cp313-manylinux_2_28_aarch64.whl", hash = "sha256:b133dad505c4778ff9ee5d1d9379e5b0df8bfe04166782652bb1b6725c6dc10b"},
-    {file = "nvidia_cutlass_dsl_libs_cu13-4.8.0.dev0-cp313-cp313-manylinux_2_28_x86_64.whl", hash = "sha256:658ec6a8c7a7ed563d13c9f62d325bec1aa3132a5cdc1fbd917964aa9446f81a"},
-    {file = "nvidia_cutlass_dsl_libs_cu13-4.8.0.dev0-cp314-cp314-manylinux_2_28_aarch64.whl", hash = "sha256:76d9859939ca5d26e1650abfee09a6749ab75499f4dec8bd54789f3bf8ba7c69"},
-    {file = "nvidia_cutlass_dsl_libs_cu13-4.8.0.dev0-cp314-cp314-manylinux_2_28_x86_64.whl", hash = "sha256:d11014f21b05a26342fc01bb3c32b6706c820017ea4fc174ed039e05120e8a4d"},
-    {file = "nvidia_cutlass_dsl_libs_cu13-4.8.0.dev0-cp314-cp314t-manylinux_2_28_aarch64.whl", hash = "sha256:def1c07efa139d6d00506a435ab6bba652fdf827e6e90f1a424d9ce4d0d99e47"},
-    {file = "nvidia_cutlass_dsl_libs_cu13-4.8.0.dev0-cp314-cp314t-manylinux_2_28_x86_64.whl", hash = "sha256:24b1715ce8d2a8f77a7a346d0d34f11f5a33a29b2ca67307e22fda81dc226551"},
+    {file = "nvidia_cutlass_dsl_libs_cu13-4.8.0-cp310-cp310-manylinux_2_28_aarch64.whl", hash = "sha256:02a5b208b79cc9dae294365c55b0cb1d5684bfdd220bd11eadeb230d0a75d05e"},
+    {file = "nvidia_cutlass_dsl_libs_cu13-4.8.0-cp310-cp310-manylinux_2_28_x86_64.whl", hash = "sha256:55e036b14a4c999e097b498f73e8612e9ddc4017fdce0015fc1702f052c45c8e"},
+    {file = "nvidia_cutlass_dsl_libs_cu13-4.8.0-cp310-cp310-win_amd64.whl", hash = "sha256:5170d10ea7f0cca7ef07f0c443476e913909d1840841c221f5fbaca3703d8b32"},
+    {file = "nvidia_cutlass_dsl_libs_cu13-4.8.0-cp311-cp311-manylinux_2_28_aarch64.whl", hash = "sha256:ba1ec6d671f008152e73986893509676d0e0102ab242d533491814cde5c8e741"},
+    {file = "nvidia_cutlass_dsl_libs_cu13-4.8.0-cp311-cp311-manylinux_2_28_x86_64.whl", hash = "sha256:1866559c8da5c3c0815047a1fb414e1745f47069b14bac5168885785b8553dc2"},
+    {file = "nvidia_cutlass_dsl_libs_cu13-4.8.0-cp311-cp311-win_amd64.whl", hash = "sha256:bc7c3a1bce134bde5cb99bf06c60cfc541a474e18c25fca2b85bea95d33deb4a"},
+    {file = "nvidia_cutlass_dsl_libs_cu13-4.8.0-cp312-cp312-manylinux_2_28_aarch64.whl", hash = "sha256:d61ebe2416cae8a2d5377889549df9cb5008af006a1692d7d006d8f747e62e6c"},
+    {file = "nvidia_cutlass_dsl_libs_cu13-4.8.0-cp312-cp312-manylinux_2_28_x86_64.whl", hash = "sha256:463cd7f0c452ffeeecb530a15aeb1b10cbbd2c8da6c5aa2fecf65f836258a732"},
+    {file = "nvidia_cutlass_dsl_libs_cu13-4.8.0-cp312-cp312-win_amd64.whl", hash = "sha256:8684f4fef26bedab100931c8f65098e2aa3c3b0e9d730fad3b92780ad2773634"},
+    {file = "nvidia_cutlass_dsl_libs_cu13-4.8.0-cp313-cp313-manylinux_2_28_aarch64.whl", hash = "sha256:5741a783dc09e294dada6844c9b8df8ff14fcc19db20be482055911a4fb9b73f"},
+    {file = "nvidia_cutlass_dsl_libs_cu13-4.8.0-cp313-cp313-manylinux_2_28_x86_64.whl", hash = "sha256:41378cfa94ef3e74084d5157064ea807a92096123d378697a2d58bdbd582240a"},
+    {file = "nvidia_cutlass_dsl_libs_cu13-4.8.0-cp313-cp313-win_amd64.whl", hash = "sha256:cc92f1c5e9bdaa5c6d7e5d0e3a859b3364ae3c5b82726e1d1951d2ee1ad73d14"},
+    {file = "nvidia_cutlass_dsl_libs_cu13-4.8.0-cp314-cp314-manylinux_2_28_aarch64.whl", hash = "sha256:bbdb2b14a74a35d382a30bee6f17e31faf0aabb6d87909b2b99c7d134a6cac10"},
+    {file = "nvidia_cutlass_dsl_libs_cu13-4.8.0-cp314-cp314-manylinux_2_28_x86_64.whl", hash = "sha256:09d17524a55f40df411616a771b7537be8ee056612681abc705424eebb30ba8e"},
+    {file = "nvidia_cutlass_dsl_libs_cu13-4.8.0-cp314-cp314-win_amd64.whl", hash = "sha256:95bd45c1e50b387b2d065b45d87b1ed40a61997ba48f0c1c498b5292a2a5f845"},
+    {file = "nvidia_cutlass_dsl_libs_cu13-4.8.0-cp314-cp314t-manylinux_2_28_aarch64.whl", hash = "sha256:e73a78a79304e71d3832bdfbcbb52a5245e28fe49a8a1a61dbebbfca562184c0"},
+    {file = "nvidia_cutlass_dsl_libs_cu13-4.8.0-cp314-cp314t-manylinux_2_28_x86_64.whl", hash = "sha256:4bd241512a43bb936e34a76fafe9b13f8c282f0fa6041e2cc5fcb6cab47f5097"},
+    {file = "nvidia_cutlass_dsl_libs_cu13-4.8.0-cp314-cp314t-win_amd64.whl", hash = "sha256:74da9cd5ed4c9407d1963a0456107304f26db76b890b2bbd2d057fa5822101d6"},
 ]
 
 [package.dependencies]
 "backports.strenum" = {version = "*", markers = "python_version < \"3.11\""}
-cuda-python = ">=12.8"
-numpy = "*"
-nvidia-cuda-nvdisasm = ">=13.3,<14"
-nvidia-cutlass-dsl-libs-base = "4.8.0.dev0"
+cuda-bindings = ">=12.8"
+nvidia-cutlass-dsl-libs-base = "4.8.0"
 protobuf = ">=4.21.12"
 typing-extensions = ">=4.10.0"
+
+[package.extras]
+sass = ["nvidia-cuda-nvdisasm (>=13.4.0rc1,<14)"]
 
 [[package]]
 name = "nvidia-matmul-heuristics"
@@ -6960,58 +6970,58 @@ files = [
 
 [[package]]
 name = "xgrammar"
-version = "0.2.7"
+version = "0.2.8"
 description = "Efficient, Flexible and Portable Structured Generation"
 optional = false
 python-versions = "<4,>=3.8"
 groups = ["main"]
 files = [
-    {file = "xgrammar-0.2.7-cp310-cp310-macosx_10_14_x86_64.whl", hash = "sha256:00a0ac47cc0cfcce480c7651c14acd3d3ff0d970a745ee75640f0eb6929f9ba2"},
-    {file = "xgrammar-0.2.7-cp310-cp310-macosx_11_0_arm64.whl", hash = "sha256:bc2bc2fa9ff57bbe7dbebf86db8c5c65228d255566e3d31db44aa6d6c64fef8a"},
-    {file = "xgrammar-0.2.7-cp310-cp310-manylinux_2_26_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:846c155ae16add86d66083340aa4d2a074abaefbe6d77d1314b85d6043b045d9"},
-    {file = "xgrammar-0.2.7-cp310-cp310-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:ea74cca223e834dfb4b96b25a3a3b8fc983a49d30dba782146420bb4732b8e52"},
-    {file = "xgrammar-0.2.7-cp310-cp310-win_amd64.whl", hash = "sha256:c75433b3a0d313b3f7bb037f4dbda4ca3d82c3508650403113aec893b2717c58"},
-    {file = "xgrammar-0.2.7-cp310-cp310-win_arm64.whl", hash = "sha256:ffd882a5d87e90b8642d9e4c7c0c5e5069c41af2a807a7e313c506d442fdea99"},
-    {file = "xgrammar-0.2.7-cp311-cp311-macosx_10_14_x86_64.whl", hash = "sha256:6f6277aba512ea484a6f441ca0d10229f9dc9b9a3a5fa21cec7db3d3ddcb16d5"},
-    {file = "xgrammar-0.2.7-cp311-cp311-macosx_11_0_arm64.whl", hash = "sha256:7d0ce000a746cb44e4f3e68f5b0666c68797964087eb28ab07fc707dd709e3a7"},
-    {file = "xgrammar-0.2.7-cp311-cp311-manylinux_2_26_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:45e8fa9458269d44c5b4c439eb073daa2f4105d3bb2b731ae764231ef2ab1049"},
-    {file = "xgrammar-0.2.7-cp311-cp311-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:e3a4cb4214b228d2fecefe46f46d2f2b0d6c8468fd448319250cae6bccb73339"},
-    {file = "xgrammar-0.2.7-cp311-cp311-win_amd64.whl", hash = "sha256:29efe11e90b7ea7e76d9f4f58b93add95e289fcbf2db7a2ffb26a3c23b0e2820"},
-    {file = "xgrammar-0.2.7-cp311-cp311-win_arm64.whl", hash = "sha256:ef1d18d860ea771c656b7d802e4bf944c8dd31b8a0c0b899b892b96f0b06d68a"},
-    {file = "xgrammar-0.2.7-cp312-cp312-macosx_10_14_x86_64.whl", hash = "sha256:b46d814ae80ebab5b89eb67a18118256bd94afbeace8f5d6ccf0ff396aa4a6a1"},
-    {file = "xgrammar-0.2.7-cp312-cp312-macosx_11_0_arm64.whl", hash = "sha256:4957b0ab6c743ee8e178faa6e7804466f9caadccba551b52600720490d591349"},
-    {file = "xgrammar-0.2.7-cp312-cp312-manylinux_2_26_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:2df1a2292f6b1c5cdc4b176ef2f22c58a837ac99fd854d93856160f31f14a4b0"},
-    {file = "xgrammar-0.2.7-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:e4397798f73512ab5abccbadf0a7b6aaf0753ccc4f3171c43b14c4d22df1ed28"},
-    {file = "xgrammar-0.2.7-cp312-cp312-win_amd64.whl", hash = "sha256:397edf3dc6d9634eba1127f83f5f16aff4f06a17dff55cd4d441f35fb680ed5b"},
-    {file = "xgrammar-0.2.7-cp312-cp312-win_arm64.whl", hash = "sha256:0a6ca46cfbeb1ab1cb85a6e1a8ff3f24813a27114626813e0432ac54b3a2efe4"},
-    {file = "xgrammar-0.2.7-cp313-cp313-macosx_11_0_arm64.whl", hash = "sha256:8cca1a85d520fd08675cf5a110b1e7c45f308ed3198e45c31ec38ef400f2d55a"},
-    {file = "xgrammar-0.2.7-cp313-cp313-manylinux_2_26_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:3f63948994cdc1bc0733e74bcb15e38e76a39150695cc15b54653c1931295ce6"},
-    {file = "xgrammar-0.2.7-cp313-cp313-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:3a6bc5efcd80cda89da9a887239cc0d02ef22b3770c7372ab0bb4a56034da35f"},
-    {file = "xgrammar-0.2.7-cp313-cp313-win_amd64.whl", hash = "sha256:e2c21c993f72c28dce0de4a6b81c79837d8ddec9f8fce8515b0709b307691dd4"},
-    {file = "xgrammar-0.2.7-cp313-cp313-win_arm64.whl", hash = "sha256:b90b265f4cb443a99083a42bd19d0a6b561f5dfcd389eb27286215715d3c5417"},
-    {file = "xgrammar-0.2.7-cp314-cp314-macosx_10_15_x86_64.whl", hash = "sha256:f762735b814be83f0cfd9b7b2a62160a95f9a89d455d2975af1b95505561e38b"},
-    {file = "xgrammar-0.2.7-cp314-cp314-macosx_11_0_arm64.whl", hash = "sha256:f70e7e45a7f50229a6b25043eec326458e8360a5a29a49eafe78c07cc3dd07b7"},
-    {file = "xgrammar-0.2.7-cp314-cp314-manylinux_2_26_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:a89fe03bed4bb12e98c4dcaf583cd608aab601a401b9e39142d6de3df6eda873"},
-    {file = "xgrammar-0.2.7-cp314-cp314-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:ebb521bcce85dc832b0e5d21fe0acfea0641fdd66baa2c3295600ea22780582d"},
-    {file = "xgrammar-0.2.7-cp314-cp314-win_amd64.whl", hash = "sha256:afd5fad288da5d3320820e2c015aca8f1a17181064ed74012545ef2e824bfbb7"},
-    {file = "xgrammar-0.2.7-cp314-cp314-win_arm64.whl", hash = "sha256:872e0a00655b5aba15e0ee54a16b503320e4b80c135d4a5ef447bf1e8ccca309"},
-    {file = "xgrammar-0.2.7-cp314-cp314t-macosx_10_15_x86_64.whl", hash = "sha256:51de2f6b59696e5bba2ac7347e5bf02c967fbeb1095885f0d24642b1d2370b21"},
-    {file = "xgrammar-0.2.7-cp314-cp314t-macosx_11_0_arm64.whl", hash = "sha256:d5a8f7e5b7c4039bfd41ff8e7645ecab9e5be077bccf11936601fb799cf40c68"},
-    {file = "xgrammar-0.2.7-cp314-cp314t-manylinux_2_26_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:a5f5fbe2a244aefe72c3c660f2c7ab575f147ae593371920d0f49c9fc121e03b"},
-    {file = "xgrammar-0.2.7-cp314-cp314t-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:8b8bbfeb26995aea634ff6bc6a8eb555e465ee4821da21c684fbab9cfe319413"},
-    {file = "xgrammar-0.2.7-cp314-cp314t-win_amd64.whl", hash = "sha256:32f74c24bb25513a246dd6a02f8fa9e421ca84ccbf09bac8dea08e34b747c0ee"},
-    {file = "xgrammar-0.2.7-cp314-cp314t-win_arm64.whl", hash = "sha256:d230dc7b77c7994583b12731221ccd8de78e844945125681ab7be292cdda7b93"},
-    {file = "xgrammar-0.2.7-cp39-cp39-macosx_10_14_x86_64.whl", hash = "sha256:fdd0971d41b9d99ab8f18862063dd39ffd0852175313d634e948fa45cf514fff"},
-    {file = "xgrammar-0.2.7-cp39-cp39-macosx_11_0_arm64.whl", hash = "sha256:d7695a87c21315af231ca6160956e5acbba101f9f6051d7ff0dd796be5c1aed8"},
-    {file = "xgrammar-0.2.7-cp39-cp39-manylinux_2_26_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:2b78d9ddf89b2da58cb2f06ea0af6b27ee1302fd7b1b2619ecf992c52eee47c0"},
-    {file = "xgrammar-0.2.7-cp39-cp39-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:239cb2e117ee2ba4128349a1cfc5c56c8b4497eb4ff1ebcba9046f9439a4242e"},
-    {file = "xgrammar-0.2.7-cp39-cp39-win_amd64.whl", hash = "sha256:1d1f3343b1eff6a732e4374501c708a5762c46803bff5449254762da03bcebe2"},
-    {file = "xgrammar-0.2.7-cp39-cp39-win_arm64.whl", hash = "sha256:7eebc2703e09d27c906051a92c6dad50c895c9fdba252b2cf3de627c9da42ec8"},
-    {file = "xgrammar-0.2.7.tar.gz", hash = "sha256:7674afeee5e6eff9672627b62d5ab0aa2347ea51674f4d78a5c160029f92bc3e"},
+    {file = "xgrammar-0.2.8-cp310-cp310-macosx_10_14_x86_64.whl", hash = "sha256:9c04f0dafb88b7f55559463a40ad7147f7d62c0a547f7c807054627dc6ed992b"},
+    {file = "xgrammar-0.2.8-cp310-cp310-macosx_11_0_arm64.whl", hash = "sha256:467533c9998566b9bda6889834a7e200cd75228e6b453d8a42abd3aa86158512"},
+    {file = "xgrammar-0.2.8-cp310-cp310-manylinux_2_26_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:ae437044b736797a3a0ad03a06ab5d156903b350f7f0809591f47e0571e27e51"},
+    {file = "xgrammar-0.2.8-cp310-cp310-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:d6576539ade4b2404c38f606f4d04a1d6d22023fa03f9cab98bf894877696024"},
+    {file = "xgrammar-0.2.8-cp310-cp310-win_amd64.whl", hash = "sha256:1a1dba06ff9f8436163ccc688ea0b24e790d99262f628ac4fc46c4fc09e18630"},
+    {file = "xgrammar-0.2.8-cp310-cp310-win_arm64.whl", hash = "sha256:1fe8b3889a9079bc3fbe9187941c7d902da7b9cb2dd915b2a004fa5a5922bcc5"},
+    {file = "xgrammar-0.2.8-cp311-cp311-macosx_10_14_x86_64.whl", hash = "sha256:f56156ca0abdaf089c3f87fcfa7bafeab47df3374f221b67b2e4b4be8c819125"},
+    {file = "xgrammar-0.2.8-cp311-cp311-macosx_11_0_arm64.whl", hash = "sha256:d125a174b609d9d540dcf12dadf9030422597c175f0493ea9ff27dfeae025664"},
+    {file = "xgrammar-0.2.8-cp311-cp311-manylinux_2_26_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:738d967f874dd916ddb73b39e533caf7254b5b81d579f44eddbe205cc59dcee1"},
+    {file = "xgrammar-0.2.8-cp311-cp311-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:885d7468636a8ca829513b9740fef21cbb438239fa3f91cce06e95e31973b8c6"},
+    {file = "xgrammar-0.2.8-cp311-cp311-win_amd64.whl", hash = "sha256:155091c54e3cd5cde6c29e69339a74e5c95da83bb0294acd2abb9a70f85f674e"},
+    {file = "xgrammar-0.2.8-cp311-cp311-win_arm64.whl", hash = "sha256:50f8bc56adc2fccfe008281435ebef30d066977b611652cf51d0b57b16f48ec5"},
+    {file = "xgrammar-0.2.8-cp312-cp312-macosx_10_14_x86_64.whl", hash = "sha256:9b4fb0907e2ae7b32e908e9da97e5410ee1f792d802031a46e4292f2ebe46c33"},
+    {file = "xgrammar-0.2.8-cp312-cp312-macosx_11_0_arm64.whl", hash = "sha256:e01f70fbb788d5a95e6a2ac686b746c2dd03bffc07c7d94f10ec3ca2a95c4447"},
+    {file = "xgrammar-0.2.8-cp312-cp312-manylinux_2_26_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:97732b6e5f11f21fd98a6cd9525241fc5f9d92f415329200a9adf8fc7453d8ec"},
+    {file = "xgrammar-0.2.8-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:4045b096735bb2523e0d874039a55994c1b390620d547c4a0d4f43b9a106177b"},
+    {file = "xgrammar-0.2.8-cp312-cp312-win_amd64.whl", hash = "sha256:dbcf6718e049cbe429742cdb05f85c48135c2e389d45daeafb884af6994bb4a7"},
+    {file = "xgrammar-0.2.8-cp312-cp312-win_arm64.whl", hash = "sha256:2d4a9446b1b3e53fe4efcc5f40fafff0f79407c6b6fbd54a254909978808585e"},
+    {file = "xgrammar-0.2.8-cp313-cp313-macosx_11_0_arm64.whl", hash = "sha256:cb6fec998e8416f3079dcc29c39c5cfded0866ee2433016c4f1170f2fc8d440f"},
+    {file = "xgrammar-0.2.8-cp313-cp313-manylinux_2_26_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:dec7222c239668cbe23fe84bf5faf035b9308983fed03907b6a1837fdad9e9f1"},
+    {file = "xgrammar-0.2.8-cp313-cp313-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:5d24c79b88b3a6aba20d76d15119892f326f7fec85882946d6666b482cf45de4"},
+    {file = "xgrammar-0.2.8-cp313-cp313-win_amd64.whl", hash = "sha256:08c80f20e18402397c11af6cee3c965da41f5116fa033115297bcbdaa877e07a"},
+    {file = "xgrammar-0.2.8-cp313-cp313-win_arm64.whl", hash = "sha256:ec85db49c8a48f2ee9dd8abb10eb09ee1f22d60b79348aefc5f23824e87791f0"},
+    {file = "xgrammar-0.2.8-cp314-cp314-macosx_10_15_x86_64.whl", hash = "sha256:67ceb409708ba95479f833f58e6de963a95d29bf96d9114adcdf246e90afca06"},
+    {file = "xgrammar-0.2.8-cp314-cp314-macosx_11_0_arm64.whl", hash = "sha256:6236c482f9f34f1ce709cc67eff07363e0514b0bcc841210d4cc3b18b26e30f2"},
+    {file = "xgrammar-0.2.8-cp314-cp314-manylinux_2_26_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:45d242227001175bacd70031017ddef80e0c9c5141d11fd04bca5f08abee5417"},
+    {file = "xgrammar-0.2.8-cp314-cp314-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:dadcff0ecab59ffbc782e9db6d16f84f7b8df87bd2f28b9470136fcb4837f098"},
+    {file = "xgrammar-0.2.8-cp314-cp314-win_amd64.whl", hash = "sha256:a9d917bfb075106f54533ee9e21c3791590c9277033ec0719d807a641987ddb0"},
+    {file = "xgrammar-0.2.8-cp314-cp314-win_arm64.whl", hash = "sha256:924626681e106933e90f9790b5d05b7c380acf17317d580d53c364cb4d19eee5"},
+    {file = "xgrammar-0.2.8-cp314-cp314t-macosx_10_15_x86_64.whl", hash = "sha256:4ae12599a1f8ddbf0ca0ab94b620f7e489de31f90c06b8396a9bd29adf22d784"},
+    {file = "xgrammar-0.2.8-cp314-cp314t-macosx_11_0_arm64.whl", hash = "sha256:6b2749c2ce1b73e7367569abd45c21aa359f5d6e7d8d88307b14cf5a8b716072"},
+    {file = "xgrammar-0.2.8-cp314-cp314t-manylinux_2_26_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:47a041d9cb10f6c9da0d33db4aaa7b81163f677500278c4eab3e61b7ede5b2d3"},
+    {file = "xgrammar-0.2.8-cp314-cp314t-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:71bf243b0a7eec297857e8fd8abd0b7ea499968c3748568d5576ccf864ce29bc"},
+    {file = "xgrammar-0.2.8-cp314-cp314t-win_amd64.whl", hash = "sha256:9837e7948212fae1c12abc2b992305a9e333a266a1ae5150504738e1b9327c06"},
+    {file = "xgrammar-0.2.8-cp314-cp314t-win_arm64.whl", hash = "sha256:0c6125fa3dc27b46adde83329571c1dac2ab2474779daee207428ce2e9c6e9b5"},
+    {file = "xgrammar-0.2.8-cp39-cp39-macosx_10_14_x86_64.whl", hash = "sha256:1ddfd9b0a74201b263ba4079cd3b1cd4cdfa3406e3a42953c1c645c3a9463b0d"},
+    {file = "xgrammar-0.2.8-cp39-cp39-macosx_11_0_arm64.whl", hash = "sha256:1c98a832aa28b5c2d1180383f535e8fb6df9524fbbddab705d7a044bdd53111c"},
+    {file = "xgrammar-0.2.8-cp39-cp39-manylinux_2_26_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:ffb6f7cd6e5393ef09d1a4395833e0dfbe359c07c48c2cfb028a9645702079c3"},
+    {file = "xgrammar-0.2.8-cp39-cp39-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:f5a0c18908fd0433f03602bedac21c746ac41ac5a28927f927456ac740ae8b8f"},
+    {file = "xgrammar-0.2.8-cp39-cp39-win_amd64.whl", hash = "sha256:841872a76e56bc442d34d5a62768317e325058503b7bd3870466baf309b44f4f"},
+    {file = "xgrammar-0.2.8-cp39-cp39-win_arm64.whl", hash = "sha256:5a61e65b5c2afc065c771d173e3ed76697325fabea5b76efcea251998e9475de"},
+    {file = "xgrammar-0.2.8.tar.gz", hash = "sha256:8305646fd2b319d6c3003f51a1665e54cbbe9cba1fb636bc41d0b46434ccbb80"},
 ]
 
 [package.dependencies]
-apache-tvm-ffi = ">=0.1.10"
+apache-tvm-ffi = ">=0.1.11"
 numpy = "*"
 pydantic = "*"
 torch = ">=1.10.0"
@@ -7433,4 +7443,4 @@ type = ["pytest-mypy (>=1.0.1) ; platform_python_implementation != \"PyPy\""]
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.10,<3.13"
-content-hash = "a6ca7e7c6e23329b6f4556c02e33eea7350dbfa6144cf1406ee0d7943ca3698b"
+content-hash = "7e4f63315effecce7943be898ca100718ec1b00004307e627b9b07cb61436bd1"
