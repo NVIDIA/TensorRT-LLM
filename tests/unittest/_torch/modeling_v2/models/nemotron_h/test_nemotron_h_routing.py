@@ -30,6 +30,10 @@ _ULTRA_BF16_TARGET = (
     "models.nemotron_h.nemotron3_ultra_bf16__sm_100__tep8.modeling."
     "ModelingV2Nemotron3UltraBf16Sm100Tep8"
 )
+_ULTRA_BF16_TP8EP2_TARGET = (
+    "models.nemotron_h.nemotron3_ultra_bf16__sm_100__tp8ep2.modeling."
+    "ModelingV2Nemotron3UltraBf16Sm100Tp8ep2"
+)
 # Two GB200 trays of four GPUs: the deployment the BF16 targets were gated on.
 _TEP8 = dict(
     world_size=8,
@@ -220,3 +224,35 @@ def test_ultra_bf16_refuses_another_moe_backend():
 def test_ultra_bf16_refuses_an_fp16_engine():
     config = _model_config(_ultra_bf16_config(torch_dtype=torch.float16), **_TEP8)
     _refused(config, "torch.float16")
+
+
+_TP8EP2 = dict(_TEP8, moe_ep_size=2, moe_tp_size=4)
+
+
+@pytest.mark.parametrize("mode", ["auto", "require"])
+def test_ultra_bf16_tp8ep2_matches(mode):
+    """Two expert windows of four tensor-parallel ranks select the tp8ep2 target."""
+    config = _model_config(_ultra_bf16_config(), **_TP8EP2)
+    assert _qualified(modeling_v2_resolve(config, _llm_args(mode))) == _ULTRA_BF16_TP8EP2_TARGET
+
+
+@pytest.mark.parametrize(
+    "mapping_kwargs, missed",
+    [
+        # attention data parallel: the replicated non-expert weights would not fit
+        (dict(_TP8EP2, enable_attention_dp=True), "attention_dp=True"),
+        # four windows of two: a layout neither target was built for
+        (dict(_TP8EP2, moe_ep_size=4, moe_tp_size=2), "moe_ep=4"),
+        # one 8-GPU node
+        (dict(_TP8EP2, gpus_per_node=8), "inside one node"),
+    ],
+    ids=["attention-dp", "moe-ep4-tp2", "single-node"],
+)
+def test_ultra_bf16_tp8ep2_near_misses_do_not_match(mapping_kwargs, missed):
+    config = _model_config(_ultra_bf16_config(), **mapping_kwargs)
+    _refused(config, missed)
+
+
+def test_ultra_bf16_tp8ep2_refuses_an_fp8_kv_cache():
+    config = _model_config(_ultra_bf16_config(), **_TP8EP2)
+    _refused(config, "KV cache", kv_cache_config=_kv(dtype="fp8"))
