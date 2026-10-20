@@ -53,7 +53,7 @@ class MixedPrecisionKVStaging:
         self.layout = layout
         self.block_size = manager.tokens_per_block
         self.tokens_per_block = tokens_per_block
-        self.max_seq_len = manager.max_seq_len
+        self.max_seq_len = manager.mixed_precision_max_seq_len
         self.max_blocks_per_seq = -(-self.max_seq_len // tokens_per_block)
         self.kv_factor = manager.kv_factor
         # Fixed per-request spans keep addresses unchanged as sequences grow.
@@ -141,12 +141,18 @@ class MixedPrecisionKVStaging:
         """Gather both pools into staging, or write the new tokens back to them."""
         from ...cute_dsl_kernels.mixed_precision_kv import convert_mixed_precision_kv
 
+        staging, low, high = self.pools[layer_idx]
+        # The kernel derives each request's staging span from the page count it
+        # is handed, so pass only the rows of this batch.
+        staging = staging[: len(self.page_counts) * self.max_blocks_per_seq]
         convert_mixed_precision_kv(
             writeback,
             self.max_new_tokens_per_request
             if writeback
             else self.max_blocks_per_seq * self.tokens_per_block,
-            *self.pools[layer_idx],
+            staging,
+            low,
+            high,
             self.page_tables[layer_idx],
             self.lengths,
             self.layout,

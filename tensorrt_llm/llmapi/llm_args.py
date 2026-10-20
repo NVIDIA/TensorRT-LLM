@@ -5131,13 +5131,17 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
 
     @property
     def attention_dtype(self) -> str:
-        """KV dtype that attention reads and writes.
+        """The dtype setting the KV quantization plumbing should see.
 
-        For a mixed-precision cache this is the retained dtype; the NVFP4
-        history is converted to it before attention runs.
+        For a mixed-precision cache attention reads and writes the retained
+        dtype: 'fp8' selects FP8 KV quantization, and 'float16'/'bfloat16'
+        are the model dtype, so they map to 'auto' like a plain cache. The
+        manager rejects a checkpoint whose KV dtype resolves differently.
         """
         mixed = self.mixed_precision_dtypes
-        return self.dtype if mixed is None else mixed[1]
+        if mixed is None:
+            return self.dtype
+        return mixed[1] if mixed[1] == "fp8" else "auto"
 
     @model_validator(mode='after')
     def reject_fp8_ds_mla_pool_rebalance(self) -> 'KvCacheConfig':

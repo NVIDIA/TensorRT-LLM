@@ -49,6 +49,7 @@ from tensorrt_llm._utils import (
     mpi_rank,
     nvtx_range,
     prefer_pinned,
+    str_dtype_to_binding,
     str_dtype_to_torch,
 )
 from tensorrt_llm.bindings.internal.batch_manager import KvCacheIterationStats, KvCacheStats
@@ -1312,7 +1313,7 @@ class KVCacheManagerV2(BaseResourceManager):
     ) -> None:
         self.mapping = mapping
         self.dtype = dtype
-        self._init_mixed_precision(kv_cache_config, pretrained_config)
+        self._init_mixed_precision(kv_cache_config, pretrained_config, max_seq_len, dtype)
         self._validate_speculative_config(spec_config)
         self.is_disagg = is_disagg
         self.kv_connector_manager = kv_connector_manager
@@ -3171,12 +3172,18 @@ class KVCacheManagerV2(BaseResourceManager):
     # tokens of each sequence at the attention dtype. Attention reads and
     # writes a native-dtype staging copy prepared by the attention metadata.
 
-    def _init_mixed_precision(self, kv_cache_config: KvCacheConfig, pretrained_config) -> None:
+    def _init_mixed_precision(
+        self, kv_cache_config: KvCacheConfig, pretrained_config, max_seq_len: int, dtype: DataType
+    ) -> None:
         # Local layer id -> layer id of its retained-token (high-precision) twin.
         self.high_layers: dict[int, int] = {}
         self.low_precision_dtype: Optional[DataType] = None
         self.first_n = kv_cache_config.first_n
         self.last_n = kv_cache_config.last_n
+        # The engine's sequence capacity. KV estimation lowers self.max_seq_len
+        # to fit the temporary cache; the attention staging copy is sized from
+        # this value so the profiling run allocates it at its final size.
+        self.mixed_precision_max_seq_len = max_seq_len
         self._shared_kv_layers: set[int] = set()
         mixed = kv_cache_config.mixed_precision_dtypes
         if mixed is None:
@@ -3184,6 +3191,12 @@ class KVCacheManagerV2(BaseResourceManager):
         if torch.cuda.get_device_capability()[0] not in (10, 12):
             raise NotImplementedError("Mixed-precision NVFP4 KV requires Blackwell")
         self.low_precision_dtype = _MIXED_PRECISION_LOW_DTYPES[mixed[0]]
+        retained_dtype = str_dtype_to_binding(mixed[1])
+        if dtype != retained_dtype:
+            raise ValueError(
+                f"kv_cache_config.dtype={kv_cache_config.dtype!r} keeps the retained tokens in "
+                f"{mixed[1]}, but the model's KV cache dtype resolved to {dtype}."
+            )
         if getattr(pretrained_config, "num_kv_shared_layers", 0):
             config = pretrained_config
             first_shared = config.num_hidden_layers - config.num_kv_shared_layers

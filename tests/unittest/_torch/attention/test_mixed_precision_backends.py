@@ -84,7 +84,9 @@ def test_optimized_two_pool_prefill_and_decode(
         head_dim=width,
         tokens_per_block=block,
         max_seq_len=1024,
-        max_batch_size=batch,
+        # More request capacity than the batch: staging rows beyond the batch
+        # must not shift the rows the kernels address.
+        max_batch_size=batch + 1,
         mapping=Mapping(world_size=1, tp_size=1, rank=0),
         dtype=high_dtype,
         pretrained_config=SimpleNamespace(
@@ -143,7 +145,7 @@ def test_optimized_two_pool_prefill_and_decode(
             kv_cache_params=KVCacheParams(
                 use_cache=True, num_cached_tokens_per_seq=[begin] * batch
             ),
-            max_num_requests=batch,
+            max_num_requests=batch + 1,
             max_num_tokens=batch * (length + 1),
             kv_cache_manager=manager,
             request_ids=request_ids,
@@ -613,7 +615,8 @@ def test_mixed_precision_public_options():
     assert config.first_n == config.last_n == 256
     assert config.pool_ratio is None
     for high in ("float16", "bfloat16"):
-        assert KvCacheConfig(dtype=f"mixed_nvfp4_{high}").attention_dtype == high
+        # Model-dtype retention leaves the checkpoint's KV quantization untouched.
+        assert KvCacheConfig(dtype=f"mixed_nvfp4_{high}").attention_dtype == "auto"
     for invalid in (
         {"dtype": "mixed_int4_fp8"},
         {"dtype": "mixed_nvfp4_nvfp4"},
