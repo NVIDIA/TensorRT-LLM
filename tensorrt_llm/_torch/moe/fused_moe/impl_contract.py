@@ -609,6 +609,10 @@ class MoERunContext:
     # produced by quantize_input
     x: torch.Tensor  # activations [num_tokens, hidden_size]
     x_sf: Optional[torch.Tensor]  # scale factors, when the input is quantized
+    # set when x/x_sf were produced on an auxiliary stream (async input
+    # quantization); the impl must wait on it before the first kernel that
+    # reads x/x_sf. None when quantization ran on the main stream.
+    x_ready_event: Optional[torch.cuda.Event] = None
     # produced by the outer forward
     output_dtype: Optional[torch.dtype] = None
     do_finalize: bool = True

@@ -286,6 +286,7 @@ The docs build renders the full table under **Developer Guide > Telemetry**.
 | `torch_compile_config.enable_inductor` | Whether Torch Inductor compilation is enabled. |
 | `moe_config.backend` | MoE backend selection (`AUTO`, `CUTLASS`, `TRTLLM`, ...), an annotation-derived categorical. |
 | `speculative_config.decoding_type` | Speculative decoding mode discriminator (e.g. `User_Provided`); other arms expose their own numeric/boolean knobs under `speculative_config.*`. |
+| `speculative_config.spec_dec_variant` | Integer version of the algorithm within its `decoding_type` family (e.g. DFlash `1` vs. `2`); group by `decoding_type` first. `null` means the draft checkpoint was not read yet, e.g. a startup failure before a Hugging Face drafter finished downloading. |
 | `sparse_attention_config.algorithm` | Sparse attention algorithm discriminator; arm-specific knobs appear under `sparse_attention_config.*`. |
 | `reasoning_parser` | Reasoning parser selection, captured through an allowlist mirroring the `ReasoningParserFactory` registry. |
 

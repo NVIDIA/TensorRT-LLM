@@ -1,5 +1,5 @@
 ---
-name: trtllm-test-specialist
+name: modeling-test-specialist
 description: >
   Runs model-level and module-level tests for TensorRT-LLM. Classifies the test
   scope (module test or model test), builds the appropriate test commands, and

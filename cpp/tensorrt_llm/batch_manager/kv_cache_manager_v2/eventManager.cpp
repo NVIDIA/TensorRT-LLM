@@ -23,6 +23,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <functional>
 #include <iterator>
 #include <stdexcept>
 #include <utility>
@@ -529,6 +530,10 @@ std::optional<EventBlockHash> EventManager::parentHashFromBlock(Block const& blo
 std::optional<KVCacheStoredBlockData> EventManager::storedBlockFromBlock(
     Block const& block, std::optional<std::set<int>> const& lifeCycleIds)
 {
+    if (block.root == nullptr)
+    {
+        throw std::logic_error("Cannot publish an orphan KV cache block");
+    }
     CacheLevel cacheLevel = kHotLevel;
     Priority priority = kPriorityDefault;
     bool foundPage = false;
@@ -559,8 +564,13 @@ std::optional<KVCacheStoredBlockData> EventManager::storedBlockFromBlock(
     {
         tokens.push_back(UniqueToken{std::move(tokenId)});
     }
-    return KVCacheStoredBlockData{
-        hashFromBlock(block), std::move(tokens), cacheLevel.value(), priority, std::move(decoded.mmKeys), std::nullopt};
+    return KVCacheStoredBlockData{hashFromBlock(block), std::move(tokens), cacheLevel.value(), priority,
+        std::move(decoded.mmKeys), block.root->reuseScope.salt};
+}
+
+uint64_t EventManager::hashV1CacheSalt(std::string const& salt)
+{
+    return static_cast<uint64_t>(std::hash<std::string>{}(salt));
 }
 
 uint64_t EventManager::hashV1BlockKey(std::vector<TokenId> const& tokens, uint64_t parentHash,
@@ -614,7 +624,8 @@ uint64_t EventManager::v1HashFromBlock(Block const& block)
     if (current->type() == NodeBase::Type::kROOT_BLOCK)
     {
         auto const& reuseScope = static_cast<RootBlock const*>(current)->reuseScope;
-        rootAttrs = {reuseScope.loraId, reuseScope.salt};
+        rootAttrs = {reuseScope.loraId,
+            reuseScope.salt ? std::optional<uint64_t>(hashV1CacheSalt(*reuseScope.salt)) : std::nullopt};
     }
 
     for (auto chainIter = chain.rbegin(); chainIter != chain.rend(); ++chainIter)
