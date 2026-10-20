@@ -177,10 +177,10 @@ def measurement_gc() -> Iterator[None]:
 
     The benchmark process submits every request and handles every response. A
     full collection over its in-flight and finished requests can stop it long
-    enough for the executors to run out of requests. Like
-    TRTLLM_SERVER_DISABLE_GC and TRTLLM_WORKER_DISABLE_GC for the server and the
-    workers, this collects once, freezes the surviving objects and disables the
-    GC until the measured run ends.
+    enough for the executors to run out of requests. This collects once,
+    freezes the surviving objects and disables the GC until the measured run
+    ends, as TRTLLM_SERVER_DISABLE_GC and TRTLLM_WORKER_DISABLE_GC disable it
+    in the server and the workers.
     """
     if os.getenv("TRTLLM_BENCH_DISABLE_GC", "0") != "1":
         yield

@@ -23,7 +23,6 @@ import concurrent.futures
 import queue
 import threading
 import time
-from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -59,8 +58,6 @@ def bare_proxy():
     # handlers reject control once ``pre_shutdown()`` flips it.
     proxy.doing_shutdown = False
     proxy.request_queue = MagicMock()
-    # Production sends through a background ``_RequestSender``; send synchronously here.
-    proxy._request_sender = SimpleNamespace(send=proxy.request_queue.put)
     # The fix introduces a ``profile_ack_queue`` attribute. Pre-fix this
     # attribute does not exist; we stub it as MagicMock so old code paths
     # accessing it via getattr() see a sentinel.
