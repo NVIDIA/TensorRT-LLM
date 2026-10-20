@@ -80,7 +80,7 @@ def fake_blocks(monkeypatch):
     fake_module = types.ModuleType(_BLOCKS)
     fake_module.YAMLIndex = FakeYAMLIndex
     fake_module.block_matches_stage = lambda block, stage: block.yaml_stem == stage.yaml_stem
-    fake_module.parse_stages_from_groovy = lambda _path, include_post_merge: stages
+    fake_module.parse_stages = lambda _path, include_post_merge: stages
     monkeypatch.setitem(sys.modules, _BLOCKS, fake_module)
     return stages
 
