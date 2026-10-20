@@ -407,9 +407,10 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             return False
 
         sm = get_sm_version()
-        if sm not in (100, 103):
+        if sm not in (100, 103, 107):
             logger.debug(
-                f"FlashInfer TRTLLM-Gen FMHA is unavailable: requires SM100 or SM103, got SM{sm}."
+                "FlashInfer TRTLLM-Gen FMHA is unavailable: "
+                f"requires SM100, SM103 or SM107, got SM{sm}."
             )
             return False
 
@@ -790,12 +791,21 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         if tokens_per_block & (tokens_per_block - 1) != 0:
             return False, f"tokens_per_block ({tokens_per_block}) that is not a power of 2."
         # A KV cache manager may allow extra page sizes, e.g. MiniMax-M3 adds 128.
-        supported_tokens_per_block = self.SUPPORTED_TOKENS_PER_BLOCK | set(
+        extra_tokens_per_block = frozenset(
             getattr(meta.kv_cache_manager, "trtllm_gen_extra_tokens_per_block", ())
         )
+        supported_tokens_per_block = self.SUPPORTED_TOKENS_PER_BLOCK | extra_tokens_per_block
         if tokens_per_block not in supported_tokens_per_block:
             supported = sorted(supported_tokens_per_block)
             return False, f"tokens_per_block ({tokens_per_block}). Supported: {supported}."
+        # On SM107 this library serves only the extra page sizes, which the
+        # fallback thop FMHA has no paged-context kernels for. Every other SM107
+        # request stays on the fallback.
+        if get_sm_version() == 107 and tokens_per_block not in extra_tokens_per_block:
+            return False, (
+                f"tokens_per_block ({tokens_per_block}) on SM107, which uses this library "
+                "only for the KV cache manager's extra page sizes."
+            )
 
         return True, ""
 
