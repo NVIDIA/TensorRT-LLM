@@ -484,7 +484,7 @@ __device__ __forceinline__ void consume_bank(MegamoeTmaCopySegment const* segmen
                 }
             }
             // These exact scalar intervals are disjoint from ALL TMA writes.
-            // No intermediate group drain; final full-write wait/fence is unchanged.
+            // No intermediate group drain: the final full-write wait and fence cover them.
             scalar_words(f, 0, f.scalar_prefix);
             scalar_words(f, f.scalar_prefix + f.bulk_bytes, f.bytes);
         }
