@@ -23,4 +23,5 @@ notebook>=7.6.3
 # WAR against https://github.com/advisories/GHSA-vxq7-64xx-v4gw
 urllib3>=2.8.0
 # WAR against https://github.com/advisories/GHSA-27vj-qcqg-25rc
+# The base image (pytorch:26.09-py3) ships fsspec 2026.2.0; the floor forces a reinstall.
 fsspec>=2026.6.0
