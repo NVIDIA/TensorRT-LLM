@@ -112,9 +112,10 @@ class _RequestSender:
     caller. The sender thread sends every payload queued since its previous
     send as one list in one HMAC-signed message, so a burst of requests costs
     the rank-0 worker one receive and one HMAC check instead of one per
-    request; the worker then unpickles each payload. The request queue's
-    socket, which is not thread-safe, gets a single writer. The thread starts
-    on the first ``send``.
+    request; the worker then unpickles each payload. The thread starts on
+    the first ``send``. From then on it is the only thread that writes to the
+    request queue's socket, which is not thread-safe, and it also sends the
+    worker's shutdown sentinel.
 
     Trade-off: the sender thread must take the GIL before it can send. While
     the submitting thread keeps running Python, for example a busy
@@ -130,6 +131,9 @@ class _RequestSender:
         self._pending = collections.deque()
         self._cond = threading.Condition()
         self._closed = False
+        self._send_sentinel = False
+        # Set by the thread once it has drained the queue and will stop.
+        self._stopping = False
         self._thread: Optional[threading.Thread] = None
         # Bound here because ``close`` can run from a finalizer during
         # interpreter teardown, when module globals may already be None.
@@ -151,24 +155,38 @@ class _RequestSender:
             self._pending.append(payload)
             self._cond.notify()
 
-    def close(self, timeout: Optional[float] = None) -> None:
+    def close(self,
+              timeout: Optional[float] = None,
+              *,
+              send_sentinel: bool = False) -> bool:
         """Send everything queued, then stop the sender thread.
 
-        Calls after the thread has stopped return at once. During interpreter
-        finalization this returns without doing anything: the daemon thread
-        can no longer run, the ZMQ context may be gone, and joining a thread
-        there fails.
+        With ``send_sentinel``, the thread also sends the worker's shutdown
+        sentinel after the last payload, so the request queue keeps a single
+        writer. Calls after the thread has stopped return at once. During
+        interpreter finalization this returns without doing anything: the
+        daemon thread can no longer run, the ZMQ context may be gone, and
+        joining a thread there fails.
+
+        Returns:
+            Whether the caller still has to send the sentinel: true only if
+            ``send_sentinel`` is set and the thread did not send it, because it
+            never started or had already stopped.
         """
         if self._is_finalizing():
-            return
+            return False
         with self._cond:
             self._closed = True
-            self._cond.notify()
             thread = self._thread
+            caller_sends_sentinel = send_sentinel and (thread is None
+                                                       or self._stopping)
+            self._send_sentinel = self._send_sentinel or send_sentinel
+            self._cond.notify()
         if thread is not None:
             thread.join(timeout)
             if not thread.is_alive():
                 self._thread = None
+        return caller_sends_sentinel
 
     def _run(self) -> None:
         while True:
@@ -176,7 +194,9 @@ class _RequestSender:
                 while not self._pending and not self._closed:
                     self._cond.wait()
                 if not self._pending:
-                    return
+                    self._stopping = True
+                    send_sentinel = self._send_sentinel
+                    break
                 batch = [
                     self._pending.popleft()
                     for _ in range(min(len(self._pending), self.MAX_BATCH_SIZE))
@@ -186,6 +206,12 @@ class _RequestSender:
             except Exception as e:
                 # The payloads are already pickled, so this is a transport
                 # error, which the proxy treats as fatal.
+                self._error_queue.put_nowait(e)
+        if send_sentinel:
+            # A bare None, not a batch: the worker stops at a top-level None.
+            try:
+                self._request_queue.put_noblock(None, retry=4)
+            except Exception as e:
                 self._error_queue.put_nowait(e)
 
 
@@ -358,8 +384,9 @@ class GenerationExecutorProxy(GenerationExecutor):
         # ``abort_request()`` on user-caller threads — that pre-existing
         # cross-thread access is out of scope for this change. The fix
         # here narrowly targets the new profile-control path.
-        # With TRTLLM_PROXY_BATCH_REQUESTS=1, ``_request_sender`` is the
-        # queue's only writer instead.
+        # With TRTLLM_PROXY_BATCH_REQUESTS=1, the ``_request_sender`` thread
+        # writes the queue instead once it has started, shutdown sentinel
+        # included.
         self._profile_control_executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="proxy_profile_control")
 
@@ -1155,11 +1182,9 @@ class GenerationExecutorProxy(GenerationExecutor):
         # empty list and therefore covered case (a) by accident.  Switching
         # to bare ``any(...)`` to better handle partial crashes regressed
         # case (a); keep both behaviours explicit.
-        # The sentinel must follow every batched request, so flush the sender
-        # first; after that this thread is the queue's only writer.
-        self._close_request_sender()
-        if not self.mpi_futures or any(not f.done() for f in self.mpi_futures):
-            self.request_queue.put_noblock(None, retry=4)
+        send_sentinel = not self.mpi_futures or any(not f.done()
+                                                    for f in self.mpi_futures)
+        self._close_request_sender(send_sentinel=send_sentinel)
 
     def _send_request(self, request) -> None:
         """Send a request to the rank-0 worker.
@@ -1175,10 +1200,18 @@ class GenerationExecutorProxy(GenerationExecutor):
         else:
             self._request_sender.send(pickle.dumps(request))
 
-    def _close_request_sender(self) -> None:
-        """Flush and stop the request sender, if there is one."""
+    def _close_request_sender(self, send_sentinel: bool = False) -> None:
+        """Stop the request sender, if any, then send the shutdown sentinel if asked.
+
+        The sentinel follows every queued request. It is sent by the thread
+        that has been writing ``request_queue``: the sender thread once it has
+        started, the caller otherwise.
+        """
         if self._request_sender is not None:
-            self._request_sender.close(timeout=5.0)
+            send_sentinel = self._request_sender.close(
+                timeout=5.0, send_sentinel=send_sentinel)
+        if send_sentinel:
+            self.request_queue.put_noblock(None, retry=4)
 
     def _get_next_client_id(self) -> int:
         client_id = super()._get_next_client_id()
