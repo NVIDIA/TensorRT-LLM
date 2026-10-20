@@ -33,8 +33,12 @@ def route(
     mapping: Any,
     compute_capability: Tuple[int, int],
     spec_config: Optional[Any],
+    kv_cache_quant_algo: Optional[Any],
 ) -> type:
     """Return the target class for this deployment, or raise ``NoTarget`` saying why none fits.
+
+    ``kv_cache_quant_algo`` is the KV-cache algorithm the engine will run with
+    (see ``_router_index._kv_cache_quant_algo``), not the checkpoint's alone.
 
     The target is imported where it is returned, so declining costs no import
     of modeling code.
@@ -92,6 +96,8 @@ def route(
         and vshape == _VISION_SHAPE
         and mapping.world_size == 1
         and mtp_eagle_or_none
+        # The target runs the checkpoint's bf16 KV pool only; it asserts so at construction.
+        and kv_cache_quant_algo is None
     ):
         # One line on purpose: the claims suite reads the routed targets off
         # `from .<target>.modeling import <Class>` lines.
@@ -107,7 +113,9 @@ def route(
         f"compute capability {compute_capability}, text shape {shape}, vision shape "
         f"{vshape}, {mapping.world_size} ranks, speculative decoding "
         f"{spec_config.spec_dec_mode.name if spec_config is not None else 'off'}"
-        f"{f' max_draft_len={spec_config.max_draft_len}' if spec_config is not None else ''}; "
+        f"{f' max_draft_len={spec_config.max_draft_len}' if spec_config is not None else ''}, "
+        f"KV cache {kv_cache_quant_algo or 'bf16'}; "
         "the one qwen4_exp target is Qwen3.8-Flash-Next-NVFP4 on sm103, tp1, with "
-        "one-model MTP-Eagle (max_draft_len 1..3) or no speculative decoding"
+        "one-model MTP-Eagle (max_draft_len 1..3) or no speculative decoding, and a "
+        "bf16 KV cache"
     )

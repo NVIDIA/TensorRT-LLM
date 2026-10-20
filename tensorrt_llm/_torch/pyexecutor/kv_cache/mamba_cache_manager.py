@@ -46,6 +46,7 @@ from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._utils import (TensorWrapper, convert_to_torch_tensor,
                                  nvtx_range, prefer_pinned,
                                  torch_dtype_to_binding)
+from tensorrt_llm.bindings.executor import KvCacheRetentionConfig
 from tensorrt_llm.bindings.internal.batch_manager import (
     LinearAttentionMetadata, LinearCacheType)
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
@@ -122,7 +123,7 @@ def _get_num_cuda_graph_padding_dummy_slots(
 
     This is computed before ``ModelEngine`` exists and covers draft lengths
     reachable at every batch size, including the zero-length acceptance-rate
-    fallback. ``DecoderRunner._compute_dynamic_draft_len_mapping`` is created
+    fallback. ``compute_dynamic_draft_len_mapping`` is created
     later and covers only configured CUDA-graph batch sizes, so it cannot size
     this persistent ID set.
     """
@@ -3624,6 +3625,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         is_dummy: bool = False,
         enable_request_stats: bool = False,
         expected_prompt_length: Optional[int] = None,
+        kv_cache_retention_config: Optional[KvCacheRetentionConfig] = None,
     ) -> Optional[_KVCache]:
         kv_cache = super()._create_kv_cache(
             request_id,
@@ -3633,6 +3635,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             is_dummy=is_dummy,
             enable_request_stats=enable_request_stats,
             expected_prompt_length=expected_prompt_length,
+            kv_cache_retention_config=kv_cache_retention_config,
         )
         if (self.mapping.rank == 0 and kv_cache is not None
                 and input_tokens is not None and not is_dummy

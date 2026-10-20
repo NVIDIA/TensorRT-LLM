@@ -193,6 +193,13 @@ The bot-to-bot semantic review workflow is disabled. See
 [.github/semantic-review.md](.github/semantic-review.md) for its current status and
 historical implementation details.
 
+### Vendor source tools and promotion
+
+Use the tools under `scripts/vendor/` to manage locked vendor sources, prepare
+lock-only promotions, and optionally monitor source-update PRs. Read
+[Vendored Sources](3rdparty/vendor-sources.md) for commands, contributor metadata,
+and operator guidance before changing vendor state or publishing promotions.
+
 ### Triggering CI
 
 CI is triggered by posting comments on the PR. Basic commands:

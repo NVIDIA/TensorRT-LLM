@@ -9,6 +9,7 @@ import torch
 
 from tensorrt_llm._torch.attention.backends.interface import AttentionRuntimeFeatures
 from tensorrt_llm._torch.pyexecutor.engine.input_buffers import InputBuffers
+from tensorrt_llm._torch.pyexecutor.engine.runners import common as common_module
 from tensorrt_llm._torch.pyexecutor.engine.runners import no_kv_cache as no_kv_cache_module
 from tensorrt_llm._torch.pyexecutor.engine.runners.no_kv_cache import NoKVCacheRunnerConfig
 from tensorrt_llm._torch.pyexecutor.engine.runners.pooling import PoolingRunner
@@ -131,7 +132,7 @@ def test_no_kv_cache_runner_prepare_inputs_packs_context_requests(
 ) -> None:
     set_prefill_flag = Mock()
     monkeypatch.setattr(
-        no_kv_cache_module,
+        common_module,
         "set_per_request_prefill_cuda_graph_flag",
         set_prefill_flag,
     )
