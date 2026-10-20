@@ -7,7 +7,7 @@ then the expansion entry's reference): the block list and the token selection ex
 Columns past each row's visible count carry garbage (huge values, NaN) that must never
 be read. Beyond the cells: bitwise the composition it replaces (`qsa_topk_select`, then
 `qsa_canonical_selection`, then `qsa_expand_block_indices`) on tie-free and tie-heavy rows;
-a stale-read check under graph replay.
+a stale-read check under graph replay; one compiled kernel for every row count.
 """
 
 import zlib
@@ -20,6 +20,9 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flas
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.attention.qsa_expand_block_indices import (  # noqa: E501
     qsa_expand_block_indices,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.attention.qsa_topk_expand_decode import (  # noqa: E501
+    _COMPILED,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.attention.qsa_topk_expand_decode import (  # noqa: E501
     qsa_topk_expand_decode as op,
@@ -162,3 +165,20 @@ def test_reads_after_the_wait_under_graph_replay() -> None:
         got_topk = args[4].clone()
         sel = op(src.clone(), *args[1:])
         assert torch.equal(graph_sel, sel) and torch.equal(got_topk, args[4]), f"replay {trial}"
+
+
+def test_one_kernel_serves_every_row_count() -> None:
+    """The row count is a runtime argument: an eager step's context rows come in any count,
+    and every count here runs the one kernel compiled for the table, each matching the
+    reference."""
+    compiled = None
+    for rows in (1, 2, 7, 33, 300):
+        g = torch.Generator(device=DEV).manual_seed(rows)
+        pos = torch.randint(0, CR * W, (rows,), generator=g, device=DEV, dtype=torch.int64)
+        args = _build(dict(pos=tuple(pos.tolist())), seed=rows)
+        want_topk, want_sel = op.reference(*args)
+        sel = op(*args)
+        assert torch.equal(args[4], want_topk), f"block list, {rows} rows"
+        assert torch.equal(sel, want_sel.to(torch.int32)), f"token selection, {rows} rows"
+        compiled = len(_COMPILED) if compiled is None else compiled
+        assert len(_COMPILED) == compiled, f"{rows} rows compiled another kernel"
