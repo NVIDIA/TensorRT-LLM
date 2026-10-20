@@ -773,8 +773,33 @@ class TestGemma4Assistant(unittest.TestCase):
 
         self.assertIs(assistant.model.model_config.extra_attrs, target_config.extra_attrs)
         self.assertIs(target.model_config.kv_cache_layer_specs, target_specs)
-        self.assertIs(assistant.model.model_config.kv_cache_layer_specs, target_specs)
+        self.assertIsNone(assistant.model.model_config.kv_cache_layer_specs)
         self.assertIs(assistant.model.model_config.extra_attrs["shared_registry"], registry)
+
+    def test_draft_sharing_extra_attrs_keeps_its_own_kv_cache_layer_specs(self) -> None:
+        target_config = _make_heterogeneous_model_config(
+            num_q_heads=[8] * GEMMA4_SMALL_CONFIG["num_hidden_layers"]
+        )
+        Gemma4ForCausalLM(target_config)
+        target_specs = target_config.kv_cache_layer_specs
+        self.assertIsNotNone(target_specs)
+
+        draft_layers = 3
+        draft_config = _make_heterogeneous_model_config(
+            {**GEMMA4_SMALL_CONFIG, "num_hidden_layers": draft_layers},
+            num_q_heads=[4] * draft_layers,
+        )
+        draft_config.extra_attrs = target_config.extra_attrs
+        # A drafter of another architecture publishes no specs and must not
+        # inherit the target's through the shared registry.
+        self.assertIsNone(draft_config.kv_cache_layer_specs)
+
+        Gemma4ForCausalLM(draft_config)
+
+        self.assertIs(target_config.kv_cache_layer_specs, target_specs)
+        draft_specs = draft_config.kv_cache_layer_specs
+        self.assertEqual(len(draft_specs), draft_layers)
+        self.assertTrue(all(spec.num_q_heads == 4 for spec in draft_specs))
 
     def test_assistant_uses_target_kv_sources(self):
         model_config = _make_assistant_model_config()

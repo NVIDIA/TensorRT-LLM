@@ -392,8 +392,9 @@ class Gemma4Attention(QKNormRoPEAttention):
             # Full-attention layers use proportional RoPE whose active
             # frequencies are paired across the full head. Apply it at the
             # module layer because fused preprocessing cannot represent that
-            # pairing with only the logical rotary dimension.
-            rope_fusion=is_sliding and not self._use_trtllm_fused_qkv_prep,
+            # pairing with only the logical rotary dimension. Sliding layers
+            # let the backend decide whether it can fuse RoPE.
+            rope_fusion=None if is_sliding and not self._use_trtllm_fused_qkv_prep else False,
         )
 
         # Fix proportional RoPE for full-attention layers.
@@ -439,9 +440,9 @@ class Gemma4Attention(QKNormRoPEAttention):
             # the rotate split, matching HF's rotate_half(head_dim//2) pairing.
             self.rotary_emb.head_dim = layer_head_dim
 
-        # When FlashInfer is explicitly selected, use trtllm-gen only on
-        # datacenter Blackwell. The default TRTLLM backend selects phased FMHA
-        # directly and does not expose this FlashInfer option.
+        # With FlashInfer, use trtllm-gen only on datacenter Blackwell and FA2
+        # elsewhere. The TRTLLM backend selects phased FMHA directly and does
+        # not expose this FlashInfer option.
         if hasattr(self.attn, "flashinfer_backend"):
             self.attn.flashinfer_backend = "trtllm-gen" if is_sm_100f() else "fa2"
 
@@ -1374,10 +1375,11 @@ class Gemma4ForCausalLM(SpecDecOneEngineForCausalLM[Gemma4TextModel, Gemma4TextC
     def get_model_defaults(cls, llm_args: "TorchLlmArgs") -> dict:
         """Gemma4-specific defaults.
 
-        Preserve the existing TRTLLM default on datacenter Blackwell. Other
-        architectures use FlashInfer FA2 because the native MMHA backend does
-        not support Gemma4's 512-wide heads. External shared-KV MTP also
-        requires FlashInfer attention metadata.
+        SM100f defaults to TRTLLM; other architectures default to FlashInfer
+        FA2 because the TRTLLM backend's non-trtllm-gen fallback (MMHA)
+        supports head sizes only up to 256, while Gemma4 full-attention layers
+        use 512. External shared-KV MTP also requires FlashInfer attention
+        metadata.
         """
         speculative_config = getattr(llm_args, "speculative_config", None)
         spec_dec_mode = getattr(speculative_config, "spec_dec_mode", None)

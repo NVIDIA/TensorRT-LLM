@@ -1552,7 +1552,10 @@ class KVCacheManagerV2(BaseResourceManager):
                 (num_kv_heads + tp_size - 1) // tp_size for _ in range(self.num_layers)
             ]
         else:
-            assert len(num_kv_heads) == self.num_layers
+            assert len(num_kv_heads) == self.num_layers, (
+                f"num_kv_heads list length ({len(num_kv_heads)}) must match "
+                f"num_layers ({self.num_layers})"
+            )
 
             def append_to_kv_heads_per_layer(
                 num_kv_heads_per_layer: List[int], kv_head: Optional[int]

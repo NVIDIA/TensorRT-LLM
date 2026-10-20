@@ -309,6 +309,14 @@ class ModelConfig(Generic[TConfig]):
 
     extra_attrs: Dict = field(default_factory=dict, repr=False, init=False)
 
+    # Model-provided per-layer KV geometry. It is stored per config rather than
+    # in extra_attrs because one-model drafters share extra_attrs with the
+    # target while sizing their own KV caches.
+    _kv_cache_layer_specs: Optional[Tuple[KVCacheLayerSpec,
+                                          ...]] = field(default=None,
+                                                        repr=False,
+                                                        init=False)
+
     # cute dsl op configs
     use_cute_dsl_blockscaling_mm: bool = False
     use_cute_dsl_blockscaling_bmm: bool = False
@@ -344,12 +352,12 @@ class ModelConfig(Generic[TConfig]):
     @property
     def kv_cache_layer_specs(self) -> Optional[Tuple[KVCacheLayerSpec, ...]]:
         """Return model-provided per-layer KV-cache geometry, if any."""
-        return self.extra_attrs.get("kv_cache_layer_specs")
+        return self._kv_cache_layer_specs
 
     def set_kv_cache_layer_specs(
             self, layer_specs: Sequence[KVCacheLayerSpec]) -> None:
         """Publish unsharded per-layer KV geometry to generic runtime code."""
-        self.extra_attrs["kv_cache_layer_specs"] = tuple(layer_specs)
+        self._kv_cache_layer_specs = tuple(layer_specs)
 
     def __setattr__(self, key, value):
         """
@@ -357,13 +365,14 @@ class ModelConfig(Generic[TConfig]):
         However, we allow modification of 'extra_attrs' attributes for torch.compile
         and 'pretrained_config' attributes for mutimodal models.
         'quant_config' is allowed to be modified to set different quantization for VLM.
+        '_kv_cache_layer_specs' is set by models that publish per-layer KV geometry.
         All the other attributes are frozen.
         This can be bypassed by manually setting '_frozen' to False. The design is
         to discourage modifying the attributes unintentionally.
         """
         if self._frozen:
             if key not in ('_frozen', 'extra_attrs', 'pretrained_config',
-                           'quant_config'):
+                           'quant_config', '_kv_cache_layer_specs'):
                 raise AttributeError(
                     f"Cannot modify ModelConfig.'{key}' - instance is frozen")
         super().__setattr__(key, value)

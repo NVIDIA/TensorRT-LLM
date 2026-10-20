@@ -103,7 +103,7 @@ def test_build_attention_metadata_forwards_shared_and_cache_inputs() -> None:
 
 @pytest.mark.parametrize(
     ("head_pairs", "expected_ratio"),
-    [([(16, 8), (16, 1)], 16), ([(16, 8), (8, 2)], 4)],
+    [([(16, 8), (16, 1)], 16), ([(16, 8), (8, 2)], 4), ([(16, 1), (16, 8)], 16)],
 )
 def test_metadata_gqa_ratio_uses_model_provided_per_layer_heads(
     head_pairs: list[tuple[int, int]], expected_ratio: int
