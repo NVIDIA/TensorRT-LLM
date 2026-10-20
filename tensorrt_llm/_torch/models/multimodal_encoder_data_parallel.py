@@ -143,6 +143,7 @@ def execute_encoder_dp_items(
     num_ranks: int,
     prepare_local_inputs: Callable[[Sequence[EncoderDpItem]], _LocalInputsT],
     encode_local_inputs: Callable[[_LocalInputsT], torch.Tensor],
+    any_rank_failed: Callable[[bool], bool],
     allreduce: Callable[[torch.Tensor], torch.Tensor],
     output_dim: int,
     output_dtype: torch.dtype,
@@ -151,9 +152,10 @@ def execute_encoder_dp_items(
     """Place, execute, and reconstruct atomic multimodal encoder items.
 
     Every rank independently derives the same plan. The callbacks see only the
-    items assigned to the local rank, in global output order. A status
-    collective precedes the output collective so a local preparation, encoder,
-    validation, allocation, or copy failure cannot strand peer ranks.
+    items assigned to the local rank, in global output order. A
+    CPU status collective precedes the output collective so a local preparation,
+    encoder, validation, allocation, or copy failure cannot strand peer ranks.
+    The status callback must not synchronize the encoder's CUDA stream.
 
     The return value is one dense tensor with item row blocks in ordinal order.
     The full-request path consumes it directly; runtime item scheduling splits
@@ -202,13 +204,7 @@ def execute_encoder_dp_items(
         # same status collective before any rank enters the output collective.
         local_error = error
 
-    error_flag = torch.tensor(
-        [local_error is not None],
-        dtype=torch.int32,
-        device=output_device,
-    )
-    any_error = allreduce(error_flag)
-    if bool(any_error.item()):
+    if any_rank_failed(local_error is not None):
         if local_error is not None:
             raise RuntimeError("Multimodal encoder data-parallel rank failed.") from local_error
         raise RuntimeError("Multimodal encoder data-parallel peer rank failed.")

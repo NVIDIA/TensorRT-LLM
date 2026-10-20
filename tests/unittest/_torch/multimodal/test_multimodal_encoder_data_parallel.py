@@ -94,8 +94,6 @@ def test_execute_encoder_dp_items_reconstructs_global_output():
         return torch.cat(rows)
 
     def allreduce(tensor):
-        if tensor.dtype == torch.int32:
-            return tensor
         return tensor + peer_contribution
 
     output = execute_encoder_dp_items(
@@ -104,6 +102,7 @@ def test_execute_encoder_dp_items_reconstructs_global_output():
         num_ranks=2,
         prepare_local_inputs=prepare_local_inputs,
         encode_local_inputs=encode_local_inputs,
+        any_rank_failed=lambda local_failed: local_failed,
         allreduce=allreduce,
         output_dim=1,
         output_dtype=torch.float32,
@@ -120,6 +119,11 @@ def test_execute_encoder_dp_items_reconstructs_global_output():
 def test_execute_encoder_dp_items_synchronizes_local_shape_failure():
     items = [EncoderDpItem(ordinal=0, input_token_count=1, output_row_count=2)]
     collective_dtypes: list[torch.dtype] = []
+    statuses: list[bool] = []
+
+    def any_rank_failed(local_failed):
+        statuses.append(local_failed)
+        return local_failed
 
     def allreduce(tensor):
         collective_dtypes.append(tensor.dtype)
@@ -132,6 +136,7 @@ def test_execute_encoder_dp_items_synchronizes_local_shape_failure():
             num_ranks=1,
             prepare_local_inputs=lambda local_items: local_items,
             encode_local_inputs=lambda _: torch.zeros((1, 1)),
+            any_rank_failed=any_rank_failed,
             allreduce=allreduce,
             output_dim=1,
             output_dtype=torch.float32,
@@ -139,18 +144,22 @@ def test_execute_encoder_dp_items_synchronizes_local_shape_failure():
         )
 
     assert isinstance(error.value.__cause__, ValueError)
-    assert collective_dtypes == [torch.int32]
+    assert statuses == [True]
+    assert collective_dtypes == []
 
 
 def test_execute_encoder_dp_items_keeps_empty_rank_in_collectives():
     items = [EncoderDpItem(ordinal=0, input_token_count=1, output_row_count=2)]
     peer_contribution = torch.full((2, 1), 7.0)
     collective_dtypes: list[torch.dtype] = []
+    statuses: list[bool] = []
+
+    def any_rank_failed(local_failed):
+        statuses.append(local_failed)
+        return local_failed
 
     def allreduce(tensor):
         collective_dtypes.append(tensor.dtype)
-        if tensor.dtype == torch.int32:
-            return tensor
         return tensor + peer_contribution
 
     output = execute_encoder_dp_items(
@@ -163,6 +172,7 @@ def test_execute_encoder_dp_items_keeps_empty_rank_in_collectives():
         encode_local_inputs=lambda _: pytest.fail(
             "An empty encoder-DP rank must not run the encoder."
         ),
+        any_rank_failed=any_rank_failed,
         allreduce=allreduce,
         output_dim=1,
         output_dtype=torch.float32,
@@ -170,7 +180,8 @@ def test_execute_encoder_dp_items_keeps_empty_rank_in_collectives():
     )
 
     torch.testing.assert_close(output, peer_contribution)
-    assert collective_dtypes == [torch.int32, torch.float32]
+    assert statuses == [False]
+    assert collective_dtypes == [torch.float32]
 
 
 def test_execute_encoder_dp_items_stops_before_output_collective_on_peer_failure():
@@ -179,8 +190,6 @@ def test_execute_encoder_dp_items_stops_before_output_collective_on_peer_failure
 
     def allreduce(tensor):
         collective_dtypes.append(tensor.dtype)
-        if tensor.dtype == torch.int32:
-            return torch.ones_like(tensor)
         pytest.fail("Output collective must not run after a peer failure.")
 
     with pytest.raises(RuntimeError, match="peer rank failed"):
@@ -190,10 +199,11 @@ def test_execute_encoder_dp_items_stops_before_output_collective_on_peer_failure
             num_ranks=2,
             prepare_local_inputs=lambda _: [],
             encode_local_inputs=lambda _: torch.empty((0, 1)),
+            any_rank_failed=lambda local_failed: True,
             allreduce=allreduce,
             output_dim=1,
             output_dtype=torch.float32,
             output_device=torch.device("cpu"),
         )
 
-    assert collective_dtypes == [torch.int32]
+    assert collective_dtypes == []

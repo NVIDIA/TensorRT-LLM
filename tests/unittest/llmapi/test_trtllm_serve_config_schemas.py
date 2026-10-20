@@ -171,6 +171,16 @@ def schemas(tmp_path_factory: pytest.TempPathFactory) -> dict[str, dict]:
             },
             False,
         ),
+        (
+            generator.SERVE_SCHEMA,
+            {"multimodal_config": {"encoder_data_parallel_size": 2}},
+            True,
+        ),
+        (
+            generator.SERVE_SCHEMA,
+            {"multimodal_config": {"encoder_data_parallel_size": 0}},
+            False,
+        ),
         (generator.SERVE_SCHEMA, {"num_serve_frontends": 0}, False),
         (generator.SERVE_SCHEMA, {"cuda_graph_config": {}}, True),
         (generator.SERVE_SCHEMA, {"cuda_graph_config": {"batch_sizes": [1, 2, 4]}}, True),
@@ -271,6 +281,11 @@ def schemas(tmp_path_factory: pytest.TempPathFactory) -> dict[str, dict]:
             generator.DISAGG_SCHEMA,
             {"context_servers": {"dwdp_config": {"dwdp_size": 12, "num_experts_per_worker": -1}}},
             False,
+        ),
+        (
+            generator.DISAGG_SCHEMA,
+            {"context_servers": {"multimodal_config": {"encoder_data_parallel_size": 2}}},
+            True,
         ),
         (
             generator.DISAGG_SCHEMA,
