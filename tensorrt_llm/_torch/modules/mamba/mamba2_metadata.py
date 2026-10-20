@@ -27,6 +27,7 @@ from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import \
     CUDA_GRAPH_DUMMY_REQUEST_ID
 from tensorrt_llm._utils import prefer_pinned
 
+
 def steady_mamba_indices_enabled() -> bool:
     """``TRTLLM_Q35_STEADY_MAMBA_INDICES=1`` (default off): see
     ``mamba_cache_manager.steady_mamba_indices_enabled``."""
@@ -406,7 +407,8 @@ class Mamba2Metadata:
             return
         if batch_size != num_contexts:
             raise RuntimeError(
-                "in-forward Mamba snapshot planned for a batch with generation requests")
+                "in-forward Mamba snapshot planned for a batch with generation requests"
+            )
         width = kv_cache_manager.conv_state_shape[-1]
         rows_cap = kv_cache_manager.q35_inforward_rows
         tail_cap = rows_cap * kv_cache_manager.q35_inforward_max_tail
@@ -463,9 +465,10 @@ class Mamba2Metadata:
         ntail = len(vals["tail_tok"])
         if k > rows_cap or ntail > tail_cap:
             raise RuntimeError(
-                f"in-forward Mamba snapshot: {k} requests / {ntail} tail tokens exceed the staging capacity")
-        host = self._q35_buf_host[self._q35_buf_host_i % len(
-            self._q35_buf_host)]
+                f"in-forward Mamba snapshot: {k} requests / {ntail} tail tokens exceed the staging capacity"
+            )
+        host = self._q35_buf_host[self._q35_buf_host_i %
+                                  len(self._q35_buf_host)]
         self._q35_buf_host_i += 1
         offs = self._q35_offs
         flat = []
@@ -548,8 +551,9 @@ class Mamba2Metadata:
                     # only below; a batch that maps to the indices of the last
                     # upload needs neither the upload nor the mirror copy.
                     key = tuple(indices)
-                    steady_indices = key == getattr(
-                        self, "_q35_state_indices_key", None)
+                    steady_indices = key == getattr(self,
+                                                    "_q35_state_indices_key",
+                                                    None)
                 if not steady_indices:
                     self.state_indices_cpu[:batch_size].copy_(
                         torch.as_tensor(indices,

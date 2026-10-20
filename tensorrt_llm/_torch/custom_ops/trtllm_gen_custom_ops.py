@@ -66,7 +66,6 @@ _MOE_AUTOTUNE_DUMMY_DISTRIBUTION_ENV = (
 _BALANCED = "balanced"
 _RANDOM = "random"
 
-
 # Q35 (TRTLLM_Q35_MTP_MOE_QUANT=fp8block: the Qwen3.5 MTP experts quantized to FP8
 # block scales at load time). Small-tile (tileN 8/16) FP8 block-scale MoE tactics
 # are excluded (known issue). TRTLLM_Q35_FP8_MOE_MIN_TILEN is the smallest tileN the
@@ -575,7 +574,8 @@ class FP4BlockScaleMoERunner(TunableRunner):
     @staticmethod
     def supports_prerouted_capped() -> bool:
         """Whether the loaded C++ runner has ``run_moe_prerouted_capped`` (DEA grid cap)."""
-        cached = getattr(FP4BlockScaleMoERunner, "_supports_prerouted_capped", None)
+        cached = getattr(FP4BlockScaleMoERunner, "_supports_prerouted_capped",
+                         None)
         if cached is None:
             runner = torch.classes.trtllm.FP4BlockScaleMoERunner(
                 ActType_TrtllmGen.SwiGlu.value)
@@ -746,7 +746,9 @@ def _q35_moegemm_pin_map() -> dict:
         for group in filter(None, (g.strip() for g in spec.split("|"))):
             shard, entries = group.split(":", 1)
             inter, nl = (int(v) for v in shard.lower().split("x"))
-            for ent in filter(None, (e.strip() for e in entries.replace(";", ",").split(","))):
+            for ent in filter(None,
+                              (e.strip()
+                               for e in entries.replace(";", ",").split(","))):
                 tok, tac = ent.split("=")
                 tile, cfg = (int(v) for v in tac.split("/"))
                 m[(inter, nl, int(tok))] = [tile, cfg]
@@ -765,60 +767,65 @@ def _q35_moegemm_pinned_tactic(runner, num_tokens: int,
     tac = _q35_moegemm_pin_map().get(key)
     if tac is None:
         return None
-    vkey = ("valid", runner.act_type, runner.top_k, hidden_size) + key + tuple(tac)
+    vkey = ("valid", runner.act_type, runner.top_k,
+            hidden_size) + key + tuple(tac)
     ok = _q35_pin_cache.get(vkey)
     if ok is None:
-        valid = runner.get_runner().get_valid_configs(runner.top_k, hidden_size, key[0], key[1], key[2])
+        valid = runner.get_runner().get_valid_configs(runner.top_k, hidden_size,
+                                                      key[0], key[1], key[2])
         ok = any(int(t) == tac[0] and int(c) == tac[1] for t, c in valid)
         _q35_pin_cache[vkey] = ok
         from tensorrt_llm.logger import logger
         if ok:
-            logger.info(f"{_Q35_MOEGEMM_PIN_ENV}: FP4 MoE inter={key[0]} local_experts={key[1]} M={key[2]} "
-                        f"-> tactic {tac}")
+            logger.info(
+                f"{_Q35_MOEGEMM_PIN_ENV}: FP4 MoE inter={key[0]} local_experts={key[1]} M={key[2]} "
+                f"-> tactic {tac}")
         else:
-            logger.warning(f"{_Q35_MOEGEMM_PIN_ENV}: tactic {tac} is not valid for inter={key[0]} "
-                           f"local_experts={key[1]} M={key[2]}; keeping the autotuner's pick")
+            logger.warning(
+                f"{_Q35_MOEGEMM_PIN_ENV}: tactic {tac} is not valid for inter={key[0]} "
+                f"local_experts={key[1]} M={key[2]}; keeping the autotuner's pick"
+            )
     return list(tac) if ok else None
 
 
 @torch.library.custom_op("trtllm::fp4_block_scale_moe_runner", mutates_args=())
-def fp4_block_scale_moe_runner(routing_logits: Optional[torch.Tensor],
-                               routing_bias: Optional[torch.Tensor],
-                               hidden_states: torch.Tensor,
-                               hidden_states_scale: torch.Tensor,
-                               gemm1_weights: torch.Tensor,
-                               gemm1_weights_scale: torch.Tensor,
-                               gemm1_bias: torch.Tensor,
-                               gemm1_alpha: torch.Tensor,
-                               gemm1_beta: torch.Tensor,
-                               gemm1_clamp_limit: torch.Tensor,
-                               gemm2_weights: torch.Tensor,
-                               gemm2_weights_scale: torch.Tensor,
-                               gemm2_bias: torch.Tensor,
-                               output1_scale_scalar: torch.Tensor,
-                               output1_scale_gate_scalar: torch.Tensor,
-                               output2_scale_scalar: torch.Tensor,
-                               num_experts: int,
-                               top_k: int,
-                               n_group: Optional[int],
-                               topk_group: Optional[int],
-                               intermediate_size: int,
-                               local_expert_offset: int,
-                               local_num_experts: int,
-                               routed_scaling_factor: Optional[float],
-                               routing_method_type: int,
-                               do_finalize: bool,
-                               act_type: int = ActType_TrtllmGen.SwiGlu.value,
-                               topk_weights: Optional[torch.Tensor] = None,
-                               topk_ids: Optional[torch.Tensor] = None,
-                               output: Optional[torch.Tensor] = None,
-                               tune_max_num_tokens: int = 8192,
-                               use_dp: bool = False,
-                               prerouted: Optional[torch.Tensor] = None,
-                               prerouted_tile: int = 0,
-                               prerouted_ids: Optional[torch.Tensor] = None,
-                               prerouted_weights: Optional[torch.Tensor] = None
-                               ) -> List[torch.Tensor]:
+def fp4_block_scale_moe_runner(
+        routing_logits: Optional[torch.Tensor],
+        routing_bias: Optional[torch.Tensor],
+        hidden_states: torch.Tensor,
+        hidden_states_scale: torch.Tensor,
+        gemm1_weights: torch.Tensor,
+        gemm1_weights_scale: torch.Tensor,
+        gemm1_bias: torch.Tensor,
+        gemm1_alpha: torch.Tensor,
+        gemm1_beta: torch.Tensor,
+        gemm1_clamp_limit: torch.Tensor,
+        gemm2_weights: torch.Tensor,
+        gemm2_weights_scale: torch.Tensor,
+        gemm2_bias: torch.Tensor,
+        output1_scale_scalar: torch.Tensor,
+        output1_scale_gate_scalar: torch.Tensor,
+        output2_scale_scalar: torch.Tensor,
+        num_experts: int,
+        top_k: int,
+        n_group: Optional[int],
+        topk_group: Optional[int],
+        intermediate_size: int,
+        local_expert_offset: int,
+        local_num_experts: int,
+        routed_scaling_factor: Optional[float],
+        routing_method_type: int,
+        do_finalize: bool,
+        act_type: int = ActType_TrtllmGen.SwiGlu.value,
+        topk_weights: Optional[torch.Tensor] = None,
+        topk_ids: Optional[torch.Tensor] = None,
+        output: Optional[torch.Tensor] = None,
+        tune_max_num_tokens: int = 8192,
+        use_dp: bool = False,
+        prerouted: Optional[torch.Tensor] = None,
+        prerouted_tile: int = 0,
+        prerouted_ids: Optional[torch.Tensor] = None,
+        prerouted_weights: Optional[torch.Tensor] = None) -> List[torch.Tensor]:
 
     tuner = AutoTuner.get()
     kernel_runner = FP4BlockScaleMoERunner(
@@ -923,9 +930,9 @@ def fp4_block_scale_moe_runner(routing_logits: Optional[torch.Tensor],
         # (views of) its inputs. Zero-size placeholders instead; the caller puts its own
         # tensors back (q35_fused_front.q35_prerouted_unfinalized).
         return [
-            result[0],
-            result[0].new_empty((0, ), dtype=prerouted_weights.dtype),
-            result[0].new_empty((0, ), dtype=torch.int32)
+            result[0], result[0].new_empty(
+                (0, ), dtype=prerouted_weights.dtype), result[0].new_empty(
+                    (0, ), dtype=torch.int32)
         ]
     # When output is provided and do_finalize=True, the result is written in-place to output.
     # Return empty tensor to avoid aliasing constraint violation in PyTorch 2.9.1+

@@ -187,9 +187,7 @@ class OpenAIHttpClient(OpenAIClient):
         self._disagg_id_generator = disagg_id_generator
         self._request_perf_metrics = request_perf_metrics
         self._internal_disagg_auth_key = internal_disagg_auth_key
-        self._frontend_affinity = (
-            _ctx_frontend_affinity() if role == ServerRole.CONTEXT else None
-        )
+        self._frontend_affinity = _ctx_frontend_affinity() if role == ServerRole.CONTEXT else None
         if self._frontend_affinity is not None:
             num_frontends, stride = self._frontend_affinity
             logger.info(

@@ -70,7 +70,9 @@ CP_FUSED_CHECK_STATS = {"calls": 0, "max_abs": 0.0}
 
 
 @triton.jit
-def _cp_seg_geometry(L, s, QL: tl.constexpr, S: tl.constexpr, PAGE: tl.constexpr, CP: tl.constexpr, RANK):
+def _cp_seg_geometry(
+    L, s, QL: tl.constexpr, S: tl.constexpr, PAGE: tl.constexpr, CP: tl.constexpr, RANK
+):
     """Pages owned by RANK in the context prefix [0, L - QL), split into S segments; returns (first owned index,
     pages in this segment, tokens in this segment, total prefix pages)."""
     prefix = L - QL
@@ -79,7 +81,9 @@ def _cp_seg_geometry(L, s, QL: tl.constexpr, S: tl.constexpr, PAGE: tl.constexpr
     seg_pages = (n_owned + S - 1) // S
     j0 = s * seg_pages
     npg = tl.maximum(tl.minimum(seg_pages, n_owned - j0), 0)
-    last_tok = prefix - (n_pages - 1) * PAGE  # tokens in the last prefix page (1..PAGE) when n_pages > 0
+    last_tok = (
+        prefix - (n_pages - 1) * PAGE
+    )  # tokens in the last prefix page (1..PAGE) when n_pages > 0
     last_global = (j0 + npg - 1) * CP + RANK
     n = npg * PAGE - tl.where((npg > 0) & (last_global == n_pages - 1), PAGE - last_tok, 0)
     return j0, npg, n, n_pages
@@ -140,26 +144,133 @@ def _q35_cp_prep_kernel(
     pid = tl.program_id(0)
     if DRAFT_OWN:
         if pid >= num_req * S:
-            _cp_prep_draft(pid - num_req * S, q_all, q_stride_src, q_stride_tok, q_stride_head, q_loc,
-                           ql_stride_tok, ql_stride_head, table, table_stride_req, table_stride_kv, seq_lens, rank,
-                           kv_pool, bmm1_ptr, bmm1_val, bmm2_ptr, bmm2_val, extra_o, extra_lse, valid, num_req, QL,
-                           HQL, CP, D, S, PAGE, BQL, HAS_BMM1_PTR, HAS_BMM2_PTR, LAUNCH_WITH_PDL, DRAFT_PRE_WAIT)
+            _cp_prep_draft(
+                pid - num_req * S,
+                q_all,
+                q_stride_src,
+                q_stride_tok,
+                q_stride_head,
+                q_loc,
+                ql_stride_tok,
+                ql_stride_head,
+                table,
+                table_stride_req,
+                table_stride_kv,
+                seq_lens,
+                rank,
+                kv_pool,
+                bmm1_ptr,
+                bmm1_val,
+                bmm2_ptr,
+                bmm2_val,
+                extra_o,
+                extra_lse,
+                valid,
+                num_req,
+                QL,
+                HQL,
+                CP,
+                D,
+                S,
+                PAGE,
+                BQL,
+                HAS_BMM1_PTR,
+                HAS_BMM2_PTR,
+                LAUNCH_WITH_PDL,
+                DRAFT_PRE_WAIT,
+            )
         else:
-            _cp_prep_table(pid, q_all, q_stride_src, q_stride_tok, q_stride_head, table, table_stride_req,
-                           table_stride_kv, seq_lens, seg_q, seg_table, seg_lens, rank, num_req, QL, HQL, CP, D, S,
-                           PAGE, P_SEG, BLOCK_P, BLOCK_Q, LAUNCH_WITH_PDL, COPY_Q, SEG_MAJOR, DEBUG_SPIN_NS)
+            _cp_prep_table(
+                pid,
+                q_all,
+                q_stride_src,
+                q_stride_tok,
+                q_stride_head,
+                table,
+                table_stride_req,
+                table_stride_kv,
+                seq_lens,
+                seg_q,
+                seg_table,
+                seg_lens,
+                rank,
+                num_req,
+                QL,
+                HQL,
+                CP,
+                D,
+                S,
+                PAGE,
+                P_SEG,
+                BLOCK_P,
+                BLOCK_Q,
+                LAUNCH_WITH_PDL,
+                COPY_Q,
+                SEG_MAJOR,
+                DEBUG_SPIN_NS,
+            )
     else:
-        _cp_prep_table(pid, q_all, q_stride_src, q_stride_tok, q_stride_head, table, table_stride_req,
-                       table_stride_kv, seq_lens, seg_q, seg_table, seg_lens, rank, num_req, QL, HQL, CP, D, S,
-                       PAGE, P_SEG, BLOCK_P, BLOCK_Q, LAUNCH_WITH_PDL, COPY_Q, SEG_MAJOR, DEBUG_SPIN_NS)
+        _cp_prep_table(
+            pid,
+            q_all,
+            q_stride_src,
+            q_stride_tok,
+            q_stride_head,
+            table,
+            table_stride_req,
+            table_stride_kv,
+            seq_lens,
+            seg_q,
+            seg_table,
+            seg_lens,
+            rank,
+            num_req,
+            QL,
+            HQL,
+            CP,
+            D,
+            S,
+            PAGE,
+            P_SEG,
+            BLOCK_P,
+            BLOCK_Q,
+            LAUNCH_WITH_PDL,
+            COPY_Q,
+            SEG_MAJOR,
+            DEBUG_SPIN_NS,
+        )
 
 
 @triton.jit
-def _cp_prep_table(pid, q_all, q_stride_src, q_stride_tok, q_stride_head, table, table_stride_req, table_stride_kv,
-                   seq_lens, seg_q, seg_table, seg_lens, rank, num_req, QL: tl.constexpr, HQL: tl.constexpr,
-                   CP: tl.constexpr, D: tl.constexpr, S: tl.constexpr, PAGE: tl.constexpr, P_SEG: tl.constexpr,
-                   BLOCK_P: tl.constexpr, BLOCK_Q: tl.constexpr, LAUNCH_WITH_PDL: tl.constexpr,
-                   COPY_Q: tl.constexpr, SEG_MAJOR: tl.constexpr, DEBUG_SPIN_NS: tl.constexpr):
+def _cp_prep_table(
+    pid,
+    q_all,
+    q_stride_src,
+    q_stride_tok,
+    q_stride_head,
+    table,
+    table_stride_req,
+    table_stride_kv,
+    seq_lens,
+    seg_q,
+    seg_table,
+    seg_lens,
+    rank,
+    num_req,
+    QL: tl.constexpr,
+    HQL: tl.constexpr,
+    CP: tl.constexpr,
+    D: tl.constexpr,
+    S: tl.constexpr,
+    PAGE: tl.constexpr,
+    P_SEG: tl.constexpr,
+    BLOCK_P: tl.constexpr,
+    BLOCK_Q: tl.constexpr,
+    LAUNCH_WITH_PDL: tl.constexpr,
+    COPY_Q: tl.constexpr,
+    SEG_MAJOR: tl.constexpr,
+    DEBUG_SPIN_NS: tl.constexpr,
+):
     """Segment table / length (and the folded q) of FMHA request pid."""
     if SEG_MAJOR:
         s = pid // num_req
@@ -177,8 +288,11 @@ def _cp_prep_table(pid, q_all, q_stride_src, q_stride_tok, q_stride_head, table,
     m = (kv[:, None] < 2) & m1[None, :]
     # Pre-wait: reads of host-uploaded lengths / tables only. Every write comes after the wait: the outputs are fresh
     # allocations, and the caching allocator may hand them a block that a kernel still running before the wait uses.
-    vals = tl.load(table + r.to(tl.int64) * table_stride_req + kv[:, None] * table_stride_kv + gpage[None, :],
-                   mask=m, other=0)
+    vals = tl.load(
+        table + r.to(tl.int64) * table_stride_req + kv[:, None] * table_stride_kv + gpage[None, :],
+        mask=m,
+        other=0,
+    )
     if LAUNCH_WITH_PDL:
         # Kept even without the q copy: the FMHA's wait on this grid must also cover the q producer.
         _gdc_wait_with_memory_clobber()
@@ -199,20 +313,54 @@ def _cp_prep_table(pid, q_all, q_stride_src, q_stride_tok, q_stride_head, table,
         gh = hh % (CP * HQL)
         src_rank = gh // HQL
         h = gh % HQL
-        src = (q_all + src_rank.to(tl.int64) * q_stride_src + (r * QL + t).to(tl.int64) * q_stride_tok
-               + h * q_stride_head + dd)
+        src = (
+            q_all
+            + src_rank.to(tl.int64) * q_stride_src
+            + (r * QL + t).to(tl.int64) * q_stride_tok
+            + h * q_stride_head
+            + dd
+        )
         tl.store(seg_q + pid.to(tl.int64) * HH * D + e, tl.load(src, mask=em), mask=em)
     if LAUNCH_WITH_PDL:
         tl.extra.cuda.gdc_launch_dependents()
 
 
 @triton.jit
-def _cp_prep_draft(dp, q_all, q_stride_src, q_stride_tok, q_stride_head, q_loc, ql_stride_tok, ql_stride_head, table,
-                   table_stride_req, table_stride_kv, seq_lens, rank, kv_pool, bmm1_ptr, bmm1_val, bmm2_ptr, bmm2_val,
-                   extra_o, extra_lse, valid, num_req, QL: tl.constexpr, HQL: tl.constexpr, CP: tl.constexpr,
-                   D: tl.constexpr, S: tl.constexpr, PAGE: tl.constexpr, BQL: tl.constexpr,
-                   HAS_BMM1_PTR: tl.constexpr, HAS_BMM2_PTR: tl.constexpr, LAUNCH_WITH_PDL: tl.constexpr,
-                   DRAFT_PRE_WAIT: tl.constexpr):
+def _cp_prep_draft(
+    dp,
+    q_all,
+    q_stride_src,
+    q_stride_tok,
+    q_stride_head,
+    q_loc,
+    ql_stride_tok,
+    ql_stride_head,
+    table,
+    table_stride_req,
+    table_stride_kv,
+    seq_lens,
+    rank,
+    kv_pool,
+    bmm1_ptr,
+    bmm1_val,
+    bmm2_ptr,
+    bmm2_val,
+    extra_o,
+    extra_lse,
+    valid,
+    num_req,
+    QL: tl.constexpr,
+    HQL: tl.constexpr,
+    CP: tl.constexpr,
+    D: tl.constexpr,
+    S: tl.constexpr,
+    PAGE: tl.constexpr,
+    BQL: tl.constexpr,
+    HAS_BMM1_PTR: tl.constexpr,
+    HAS_BMM2_PTR: tl.constexpr,
+    LAUNCH_WITH_PDL: tl.constexpr,
+    DRAFT_PRE_WAIT: tl.constexpr,
+):
     """Draft-block partial (O, base-2 LSE) of (row, own head h) = divmod(dp, HQL) -> extra_o / extra_lse. The h == 0
     program of each row also writes valid[c, s, row] = (member c's segment s of this row's request is non-empty): an
     empty segment's FMHA request attends to a dummy token and must not be merged."""
@@ -232,9 +380,30 @@ def _cp_prep_draft(dp, q_all, q_stride_src, q_stride_tok, q_stride_head, q_loc, 
     if DRAFT_PRE_WAIT:
         # Only with a q all-gather that releases this grid after ITS wait (see q35_cp_decode_ll): the QKV preprocess
         # (local q, draft K/V, scales) has then completed, so the draft overlaps the exchange. q_loc = this rank's q.
-        o_suf, lse_suf = _cp_draft_block(q_loc, 0, ql_stride_tok, ql_stride_head, kv_pool, blk_k, blk_v, off, jmask,
-                                         row, h, bmm1_ptr, bmm1_val, bmm2_ptr, bmm2_val, d, HQL, PAGE, D,
-                                         HAS_BMM1_PTR, HAS_BMM2_PTR, False)
+        o_suf, lse_suf = _cp_draft_block(
+            q_loc,
+            0,
+            ql_stride_tok,
+            ql_stride_head,
+            kv_pool,
+            blk_k,
+            blk_v,
+            off,
+            jmask,
+            row,
+            h,
+            bmm1_ptr,
+            bmm1_val,
+            bmm2_ptr,
+            bmm2_val,
+            d,
+            HQL,
+            PAGE,
+            D,
+            HAS_BMM1_PTR,
+            HAS_BMM2_PTR,
+            False,
+        )
     if LAUNCH_WITH_PDL:
         _gdc_wait_with_memory_clobber()
     # Writes only after the wait (fresh allocations, see _cp_prep_table).
@@ -245,9 +414,30 @@ def _cp_prep_draft(dp, q_all, q_stride_src, q_stride_tok, q_stride_head, q_loc, 
                 _, _, n_seg, _ = _cp_seg_geometry(L, sg, QL, S, PAGE, CP, c)
                 tl.store(valid + (c * S + sg) * rows + row, (n_seg > 0).to(tl.int32))
     if not DRAFT_PRE_WAIT:
-        o_suf, lse_suf = _cp_draft_block(q_all, q_stride_src, q_stride_tok, q_stride_head, kv_pool, blk_k, blk_v,
-                                         off, jmask, row, rank * HQL + h, bmm1_ptr, bmm1_val, bmm2_ptr, bmm2_val, d,
-                                         HQL, PAGE, D, HAS_BMM1_PTR, HAS_BMM2_PTR, False)
+        o_suf, lse_suf = _cp_draft_block(
+            q_all,
+            q_stride_src,
+            q_stride_tok,
+            q_stride_head,
+            kv_pool,
+            blk_k,
+            blk_v,
+            off,
+            jmask,
+            row,
+            rank * HQL + h,
+            bmm1_ptr,
+            bmm1_val,
+            bmm2_ptr,
+            bmm2_val,
+            d,
+            HQL,
+            PAGE,
+            D,
+            HAS_BMM1_PTR,
+            HAS_BMM2_PTR,
+            False,
+        )
     tl.store(extra_o + (row.to(tl.int64) * HQL + h) * D + d, o_suf.to(extra_o.dtype.element_ty))
     tl.store(extra_lse + row.to(tl.int64) * HQL + h, lse_suf)
     if LAUNCH_WITH_PDL:
@@ -255,10 +445,30 @@ def _cp_prep_draft(dp, q_all, q_stride_src, q_stride_tok, q_stride_head, q_loc, 
 
 
 @triton.jit
-def _cp_draft_block(q_all, q_stride_src, q_stride_tok, q_stride_head, kv_pool, blk_k, blk_v, off, jmask, row, gh,
-                    bmm1_ptr, bmm1_val, bmm2_ptr, bmm2_val, d, HQL: tl.constexpr, PAGE: tl.constexpr,
-                    D: tl.constexpr, HAS_BMM1_PTR: tl.constexpr, HAS_BMM2_PTR: tl.constexpr,
-                    DRAFT_OWNER: tl.constexpr):
+def _cp_draft_block(
+    q_all,
+    q_stride_src,
+    q_stride_tok,
+    q_stride_head,
+    kv_pool,
+    blk_k,
+    blk_v,
+    off,
+    jmask,
+    row,
+    gh,
+    bmm1_ptr,
+    bmm1_val,
+    bmm2_ptr,
+    bmm2_val,
+    d,
+    HQL: tl.constexpr,
+    PAGE: tl.constexpr,
+    D: tl.constexpr,
+    HAS_BMM1_PTR: tl.constexpr,
+    HAS_BMM2_PTR: tl.constexpr,
+    DRAFT_OWNER: tl.constexpr,
+):
     """(O, base-2 LSE) of one (row, group head) over the causal draft block; (0, -inf) where jmask is all false."""
     if HAS_BMM1_PTR:
         bmm1 = tl.load(bmm1_ptr).to(tl.float32)
@@ -270,12 +480,19 @@ def _cp_draft_block(q_all, q_stride_src, q_stride_tok, q_stride_head, kv_pool, b
         bmm2 = bmm2_val
     src_rank = gh // HQL
     h = gh % HQL
-    qv = tl.load(q_all + src_rank.to(tl.int64) * q_stride_src + row.to(tl.int64) * q_stride_tok
-                 + h * q_stride_head + d).to(tl.float32)
-    k_t = tl.load(kv_pool + (blk_k * PAGE + off)[:, None] * D + d[None, :], mask=jmask[:, None],
-                  other=0.0).to(tl.float32)
-    v_t = tl.load(kv_pool + (blk_v * PAGE + off)[:, None] * D + d[None, :], mask=jmask[:, None],
-                  other=0.0).to(tl.float32)
+    qv = tl.load(
+        q_all
+        + src_rank.to(tl.int64) * q_stride_src
+        + row.to(tl.int64) * q_stride_tok
+        + h * q_stride_head
+        + d
+    ).to(tl.float32)
+    k_t = tl.load(
+        kv_pool + (blk_k * PAGE + off)[:, None] * D + d[None, :], mask=jmask[:, None], other=0.0
+    ).to(tl.float32)
+    v_t = tl.load(
+        kv_pool + (blk_v * PAGE + off)[:, None] * D + d[None, :], mask=jmask[:, None], other=0.0
+    ).to(tl.float32)
     s_j = tl.where(jmask, tl.sum(k_t * qv[None, :], axis=1) * bmm1, float("-inf"))
     m_suf = tl.max(s_j, axis=0)
     p = tl.where(jmask, tl.exp(s_j - m_suf), 0.0)
@@ -283,9 +500,14 @@ def _cp_draft_block(q_all, q_stride_src, q_stride_tok, q_stride_head, kv_pool, b
     if DRAFT_OWNER:
         # Heads owned by another rank carry no draft block here (l_suf == 0).
         has_suf = l_suf > 0
-        o_suf = tl.sum(p[:, None] * v_t, axis=0) * tl.where(has_suf, bmm2 / tl.where(has_suf, l_suf, 1.0), 0.0)
-        lse_suf = tl.where(has_suf, m_suf * 1.4426950408889634 + tl.log2(tl.where(has_suf, l_suf, 1.0)),
-                           float("-inf"))
+        o_suf = tl.sum(p[:, None] * v_t, axis=0) * tl.where(
+            has_suf, bmm2 / tl.where(has_suf, l_suf, 1.0), 0.0
+        )
+        lse_suf = tl.where(
+            has_suf,
+            m_suf * 1.4426950408889634 + tl.log2(tl.where(has_suf, l_suf, 1.0)),
+            float("-inf"),
+        )
     else:
         o_suf = tl.sum(p[:, None] * v_t, axis=0) * (bmm2 / l_suf)
         lse_suf = m_suf * 1.4426950408889634 + tl.log2(l_suf)
@@ -366,20 +588,64 @@ def _q35_cp_local_merge_kernel(
         if DRAFT_PRE_WAIT:
             # q (all-gather output), the draft K/V and the scales were complete before this call's prep kernel
             # released its dependents (see q35_segmented._DRAFT_PRE_WAIT): overlap the draft block with the FMHA.
-            o_suf, lse_suf = _cp_draft_block(q_all, q_stride_src, q_stride_tok, q_stride_head, kv_pool, blk_k, blk_v,
-                                             off, jmask, row, gh, bmm1_ptr, bmm1_val, bmm2_ptr, bmm2_val, d, HQL,
-                                             PAGE, D, HAS_BMM1_PTR, HAS_BMM2_PTR, DRAFT_OWNER)
+            o_suf, lse_suf = _cp_draft_block(
+                q_all,
+                q_stride_src,
+                q_stride_tok,
+                q_stride_head,
+                kv_pool,
+                blk_k,
+                blk_v,
+                off,
+                jmask,
+                row,
+                gh,
+                bmm1_ptr,
+                bmm1_val,
+                bmm2_ptr,
+                bmm2_val,
+                d,
+                HQL,
+                PAGE,
+                D,
+                HAS_BMM1_PTR,
+                HAS_BMM2_PTR,
+                DRAFT_OWNER,
+            )
     if LAUNCH_WITH_PDL:
         _gdc_wait_with_memory_clobber()
     seg_rows = (r * S + sv).to(tl.int64) * HH + hh
     lse_s = tl.load(seg_lse + seg_rows, mask=smask, other=float("-inf"))
-    o_s = tl.load(seg_out + seg_rows[:, None] * D + d[None, :], mask=smask[:, None], other=0.0).to(tl.float32)
+    o_s = tl.load(seg_out + seg_rows[:, None] * D + d[None, :], mask=smask[:, None], other=0.0).to(
+        tl.float32
+    )
     m_all = tl.max(lse_s, axis=0)
     if INCLUDE_DRAFT:
         if not DRAFT_PRE_WAIT:
-            o_suf, lse_suf = _cp_draft_block(q_all, q_stride_src, q_stride_tok, q_stride_head, kv_pool, blk_k, blk_v,
-                                             off, jmask, row, gh, bmm1_ptr, bmm1_val, bmm2_ptr, bmm2_val, d, HQL,
-                                             PAGE, D, HAS_BMM1_PTR, HAS_BMM2_PTR, DRAFT_OWNER)
+            o_suf, lse_suf = _cp_draft_block(
+                q_all,
+                q_stride_src,
+                q_stride_tok,
+                q_stride_head,
+                kv_pool,
+                blk_k,
+                blk_v,
+                off,
+                jmask,
+                row,
+                gh,
+                bmm1_ptr,
+                bmm1_val,
+                bmm2_ptr,
+                bmm2_val,
+                d,
+                HQL,
+                PAGE,
+                D,
+                HAS_BMM1_PTR,
+                HAS_BMM2_PTR,
+                DRAFT_OWNER,
+            )
         m_all = tl.maximum(m_all, lse_suf)
     w_s = tl.where(smask, tl.exp2(lse_s - m_all), 0.0)
     acc = tl.sum(w_s[:, None] * o_s, axis=0)
@@ -396,8 +662,10 @@ def _q35_cp_local_merge_kernel(
     lse_out = tl.where(has, m_all + tl.log2(tl.where(has, wsum, 1.0)), float("-inf"))
     dest = (gh // HQL).to(tl.int64)
     hl = gh % HQL
-    tl.store(part_o + dest * o_stride_dest + row.to(tl.int64) * o_stride_row + hl * D + d,
-             res.to(part_o.dtype.element_ty))
+    tl.store(
+        part_o + dest * o_stride_dest + row.to(tl.int64) * o_stride_row + hl * D + d,
+        res.to(part_o.dtype.element_ty),
+    )
     tl.store(part_lse + dest * l_stride_dest + row.to(tl.int64) * l_stride_row + hl, lse_out)
     if LAUNCH_WITH_PDL:
         tl.extra.cuda.gdc_launch_dependents()
@@ -435,8 +703,11 @@ def _q35_cp_combine_kernel(
         tl.extra.cuda.gdc_launch_dependents()
     if LAUNCH_WITH_PDL:
         _gdc_wait_with_memory_clobber()
-    lse = tl.load(parts_lse + c.to(tl.int64) * l_stride_cp + row.to(tl.int64) * l_stride_row + h, mask=cm,
-                  other=float("-inf"))
+    lse = tl.load(
+        parts_lse + c.to(tl.int64) * l_stride_cp + row.to(tl.int64) * l_stride_row + h,
+        mask=cm,
+        other=float("-inf"),
+    )
     o_base = c.to(tl.int64) * o_stride_cp + row.to(tl.int64) * o_stride_row + h * D
     o = tl.load(parts_o + o_base[:, None] + d[None, :], mask=cm[:, None], other=0.0).to(tl.float32)
     m = tl.max(lse, axis=0)
@@ -445,7 +716,9 @@ def _q35_cp_combine_kernel(
     res = tl.where(den > 0, tl.sum(w[:, None] * o, axis=0) / tl.where(den > 0, den, 1.0), 0.0)
     res = res.to(out.dtype.element_ty)
     if HAS_GATE:
-        gv = tl.load(gate + row.to(tl.int64) * gate_stride_tok + h * gate_stride_head + d).to(tl.float32)
+        gv = tl.load(gate + row.to(tl.int64) * gate_stride_tok + h * gate_stride_head + d).to(
+            tl.float32
+        )
         res = (res.to(tl.float32) * tl.sigmoid(gv)).to(out.dtype.element_ty)
     tl.store(out + row.to(tl.int64) * out_stride_tok + h * out_stride_head + d, res)
     if LAUNCH_WITH_PDL and not EARLY_TRIGGER:
@@ -459,7 +732,9 @@ def _cp_fmha_pdl(enable_pdl: bool, fmha_pdl: bool) -> bool:
     return bool(enable_pdl and fmha_pdl and _seg._FMHA_PDL)
 
 
-def _cp_debug_zero(seg_table: torch.Tensor, seg_lens: torch.Tensor, seg_q: Optional[torch.Tensor]) -> None:
+def _cp_debug_zero(
+    seg_table: torch.Tensor, seg_lens: torch.Tensor, seg_q: Optional[torch.Tensor]
+) -> None:
     """PDL hazard probe (tests only, q35_segmented._DEBUG_SPIN_NS > 0): zero the prep kernel's outputs first, so that
     an early read of them by the FMHA sees zeros."""
     if _seg._DEBUG_SPIN_NS > 0:
@@ -518,11 +793,14 @@ def q35_cp_local_partial(
     assert block_tables.dim() == 3 and block_tables.shape[1] == 2 and block_tables.stride(-1) == 1
     assert q_all.stride(-1) == 1
     assert counter.numel() * counter.element_size() >= 4 * max(b * S * HH, sm_count), (
-        "multi-CTA counter buffer too small for the CP-lite call")
+        "multi-CTA counter buffer too small for the CP-lite call"
+    )
     max_pages = math.ceil(max(max_kv_len, 1) / page)
     p_seg = math.ceil(math.ceil(max_pages / CP) / S) + 1
     dev = q_all.device
-    fold_free = (S == 1 and q_all.stride(0) == HQL * D and q_all.stride(1) == GH * D and q_all.stride(2) == D)
+    fold_free = (
+        S == 1 and q_all.stride(0) == HQL * D and q_all.stride(1) == GH * D and q_all.stride(2) == D
+    )
     if fold_free:
         # [b * q_len, GH, D] row-major == [b, q_len * GH, D] with hh = t * GH + gh: the folded layout itself.
         seg_q = q_all.as_strided((b, HH, D), (HH * D, D, 1), q_all.storage_offset())
@@ -538,41 +816,131 @@ def q35_cp_local_partial(
         o_view = part_o.view(num_tokens, CP, HQL, D).permute(1, 0, 2, 3)
         l_view = part_lse.view(num_tokens, CP, HQL).permute(1, 0, 2)
     else:
-        assert tuple(out_o.shape) == (CP, num_tokens, HQL, D) and out_o.stride(3) == 1 and out_o.stride(2) == D
+        assert (
+            tuple(out_o.shape) == (CP, num_tokens, HQL, D)
+            and out_o.stride(3) == 1
+            and out_o.stride(2) == D
+        )
         assert tuple(out_lse.shape) == (CP, num_tokens, HQL) and out_lse.stride(2) == 1
         assert out_lse.dtype == torch.float32
         part_o, part_lse, o_view, l_view = out_o, out_lse, out_o, out_lse
     _cp_debug_zero(seg_table, seg_lens, None if fold_free else seg_q)
     _q35_cp_prep_kernel[(b * S,)](
-        q_all, q_all.stride(0), q_all.stride(1), q_all.stride(2),
-        block_tables, block_tables.stride(0), block_tables.stride(1), seq_lens,
-        seg_q, seg_table, seg_lens, cp_rank,
-        b, seg_lens, seg_lens, 0.0, seg_lens, 0.0, seg_lens, seg_lens, seg_lens, seg_lens, 0, 0,
-        QL=q_len, HQL=HQL, CP=CP, D=D, S=S, PAGE=page, P_SEG=p_seg,
-        BLOCK_P=triton.next_power_of_2(p_seg), BLOCK_Q=triton.next_power_of_2(HH * D),
-        LAUNCH_WITH_PDL=enable_pdl, COPY_Q=not fold_free, DEBUG_SPIN_NS=_seg._DEBUG_SPIN_NS,
-        DEBUG_ENTRY_TRIGGER=_seg._DEBUG_ENTRY_TRIGGER, num_warps=8, launch_pdl=enable_pdl,
+        q_all,
+        q_all.stride(0),
+        q_all.stride(1),
+        q_all.stride(2),
+        block_tables,
+        block_tables.stride(0),
+        block_tables.stride(1),
+        seq_lens,
+        seg_q,
+        seg_table,
+        seg_lens,
+        cp_rank,
+        b,
+        seg_lens,
+        seg_lens,
+        0.0,
+        seg_lens,
+        0.0,
+        seg_lens,
+        seg_lens,
+        seg_lens,
+        seg_lens,
+        0,
+        0,
+        QL=q_len,
+        HQL=HQL,
+        CP=CP,
+        D=D,
+        S=S,
+        PAGE=page,
+        P_SEG=p_seg,
+        BLOCK_P=triton.next_power_of_2(p_seg),
+        BLOCK_Q=triton.next_power_of_2(HH * D),
+        LAUNCH_WITH_PDL=enable_pdl,
+        COPY_Q=not fold_free,
+        DEBUG_SPIN_NS=_seg._DEBUG_SPIN_NS,
+        DEBUG_ENTRY_TRIGGER=_seg._DEBUG_ENTRY_TRIGGER,
+        num_warps=8,
+        launch_pdl=enable_pdl,
     )
     run_func(
-        seg_out, None, seg_q, kv_pool, kv_pool, workspace, counter, seg_table, seg_lens, 1, p_seg * page,
-        bmm1_scale_arg, bmm2_scale, -1.0, -1, 0, b * S, -1, 0, sm_count, _cp_fmha_pdl(enable_pdl, fmha_pdl),
-        workspace.numel() * workspace.element_size(), None, None, kv_scale_pool, kv_scale_pool, None, False,
-        seg_lse, seg_lse.stride(0), seg_lse.stride(1), False,
+        seg_out,
+        None,
+        seg_q,
+        kv_pool,
+        kv_pool,
+        workspace,
+        counter,
+        seg_table,
+        seg_lens,
+        1,
+        p_seg * page,
+        bmm1_scale_arg,
+        bmm2_scale,
+        -1.0,
+        -1,
+        0,
+        b * S,
+        -1,
+        0,
+        sm_count,
+        _cp_fmha_pdl(enable_pdl, fmha_pdl),
+        workspace.numel() * workspace.element_size(),
+        None,
+        None,
+        kv_scale_pool,
+        kv_scale_pool,
+        None,
+        False,
+        seg_lse,
+        seg_lse.stride(0),
+        seg_lse.stride(1),
+        False,
     )
     has_b1 = isinstance(bmm1_scale, torch.Tensor)
     has_b2 = isinstance(bmm2_scale, torch.Tensor)
     _q35_cp_local_merge_kernel[(num_tokens, GH)](
-        seg_out, seg_lse,
-        q_all, q_all.stride(0), q_all.stride(1), q_all.stride(2),
-        kv_pool, block_tables, block_tables.stride(0), block_tables.stride(1), seq_lens,
-        bmm1_scale if has_b1 else seg_lens, 0.0 if has_b1 else float(bmm1_scale),
-        bmm2_scale if has_b2 else seg_lens, 0.0 if has_b2 else float(bmm2_scale),
-        o_view, o_view.stride(0), o_view.stride(1), l_view, l_view.stride(0), l_view.stride(1), cp_rank,
-        QL=q_len, BQL=max(2, triton.next_power_of_2(q_len)), HQL=HQL, CP=CP, D=D, S=S,
-        BS=max(2, triton.next_power_of_2(S)), PAGE=page, INCLUDE_DRAFT=include_draft or draft_owner,
-        HAS_BMM1_PTR=has_b1, HAS_BMM2_PTR=has_b2, LAUNCH_WITH_PDL=enable_pdl, DRAFT_OWNER=draft_owner,
+        seg_out,
+        seg_lse,
+        q_all,
+        q_all.stride(0),
+        q_all.stride(1),
+        q_all.stride(2),
+        kv_pool,
+        block_tables,
+        block_tables.stride(0),
+        block_tables.stride(1),
+        seq_lens,
+        bmm1_scale if has_b1 else seg_lens,
+        0.0 if has_b1 else float(bmm1_scale),
+        bmm2_scale if has_b2 else seg_lens,
+        0.0 if has_b2 else float(bmm2_scale),
+        o_view,
+        o_view.stride(0),
+        o_view.stride(1),
+        l_view,
+        l_view.stride(0),
+        l_view.stride(1),
+        cp_rank,
+        QL=q_len,
+        BQL=max(2, triton.next_power_of_2(q_len)),
+        HQL=HQL,
+        CP=CP,
+        D=D,
+        S=S,
+        BS=max(2, triton.next_power_of_2(S)),
+        PAGE=page,
+        INCLUDE_DRAFT=include_draft or draft_owner,
+        HAS_BMM1_PTR=has_b1,
+        HAS_BMM2_PTR=has_b2,
+        LAUNCH_WITH_PDL=enable_pdl,
+        DRAFT_OWNER=draft_owner,
         DRAFT_PRE_WAIT=_seg._DRAFT_PRE_WAIT,
-        num_warps=4, launch_pdl=enable_pdl,
+        num_warps=4,
+        launch_pdl=enable_pdl,
     )
     return part_o, part_lse
 
@@ -626,11 +994,14 @@ def q35_cp_partial_merge_free(
     assert block_tables.dim() == 3 and block_tables.shape[1] == 2 and block_tables.stride(-1) == 1
     assert q_all.stride(-1) == 1
     assert counter.numel() * counter.element_size() >= 4 * max(b * S * HH, sm_count), (
-        "multi-CTA counter buffer too small for the CP-lite call")
+        "multi-CTA counter buffer too small for the CP-lite call"
+    )
     max_pages = math.ceil(max(max_kv_len, 1) / page)
     p_seg = math.ceil(math.ceil(max_pages / CP) / S) + 1
     dev = q_all.device
-    fold_free = (S == 1 and q_all.stride(0) == HQL * D and q_all.stride(1) == GH * D and q_all.stride(2) == D)
+    fold_free = (
+        S == 1 and q_all.stride(0) == HQL * D and q_all.stride(1) == GH * D and q_all.stride(2) == D
+    )
     if fold_free:
         seg_q = q_all.as_strided((b, HH, D), (HH * D, D, 1), q_all.storage_offset())
     else:
@@ -646,27 +1017,85 @@ def q35_cp_partial_merge_free(
     has_b2 = isinstance(bmm2_scale, torch.Tensor)
     _cp_debug_zero(seg_table, seg_lens, None if fold_free else seg_q)
     _q35_cp_prep_kernel[(b * S + num_tokens * HQL,)](
-        q_all, q_all.stride(0), q_all.stride(1), q_all.stride(2),
-        block_tables, block_tables.stride(0), block_tables.stride(1), seq_lens,
-        seg_q, seg_table, seg_lens, cp_rank,
-        b, kv_pool,
-        bmm1_scale if has_b1 else seg_lens, 0.0 if has_b1 else float(bmm1_scale),
-        bmm2_scale if has_b2 else seg_lens, 0.0 if has_b2 else float(bmm2_scale),
-        extra_o, extra_lse, valid,
-        q_local if q_local is not None else q_all, q_local.stride(0) if q_local is not None else 0,
+        q_all,
+        q_all.stride(0),
+        q_all.stride(1),
+        q_all.stride(2),
+        block_tables,
+        block_tables.stride(0),
+        block_tables.stride(1),
+        seq_lens,
+        seg_q,
+        seg_table,
+        seg_lens,
+        cp_rank,
+        b,
+        kv_pool,
+        bmm1_scale if has_b1 else seg_lens,
+        0.0 if has_b1 else float(bmm1_scale),
+        bmm2_scale if has_b2 else seg_lens,
+        0.0 if has_b2 else float(bmm2_scale),
+        extra_o,
+        extra_lse,
+        valid,
+        q_local if q_local is not None else q_all,
+        q_local.stride(0) if q_local is not None else 0,
         q_local.stride(1) if q_local is not None else 0,
-        QL=q_len, HQL=HQL, CP=CP, D=D, S=S, PAGE=page, P_SEG=p_seg,
-        BLOCK_P=triton.next_power_of_2(p_seg), BLOCK_Q=triton.next_power_of_2(HH * D),
-        LAUNCH_WITH_PDL=enable_pdl, COPY_Q=not fold_free, SEG_MAJOR=True, DRAFT_OWN=True,
-        BQL=max(2, triton.next_power_of_2(q_len)), HAS_BMM1_PTR=has_b1, HAS_BMM2_PTR=has_b2,
-        DRAFT_PRE_WAIT=q_local is not None, DEBUG_SPIN_NS=_seg._DEBUG_SPIN_NS,
-        DEBUG_ENTRY_TRIGGER=_seg._DEBUG_ENTRY_TRIGGER, num_warps=8, launch_pdl=enable_pdl,
+        QL=q_len,
+        HQL=HQL,
+        CP=CP,
+        D=D,
+        S=S,
+        PAGE=page,
+        P_SEG=p_seg,
+        BLOCK_P=triton.next_power_of_2(p_seg),
+        BLOCK_Q=triton.next_power_of_2(HH * D),
+        LAUNCH_WITH_PDL=enable_pdl,
+        COPY_Q=not fold_free,
+        SEG_MAJOR=True,
+        DRAFT_OWN=True,
+        BQL=max(2, triton.next_power_of_2(q_len)),
+        HAS_BMM1_PTR=has_b1,
+        HAS_BMM2_PTR=has_b2,
+        DRAFT_PRE_WAIT=q_local is not None,
+        DEBUG_SPIN_NS=_seg._DEBUG_SPIN_NS,
+        DEBUG_ENTRY_TRIGGER=_seg._DEBUG_ENTRY_TRIGGER,
+        num_warps=8,
+        launch_pdl=enable_pdl,
     )
     run_func(
-        seg_out, None, seg_q, kv_pool, kv_pool, workspace, counter, seg_table, seg_lens, 1, p_seg * page,
-        bmm1_scale_arg, bmm2_scale, -1.0, -1, 0, b * S, -1, 0, sm_count, _cp_fmha_pdl(enable_pdl, fmha_pdl),
-        workspace.numel() * workspace.element_size(), None, None, kv_scale_pool, kv_scale_pool, None, False,
-        seg_lse, seg_lse.stride(0), seg_lse.stride(1), False,
+        seg_out,
+        None,
+        seg_q,
+        kv_pool,
+        kv_pool,
+        workspace,
+        counter,
+        seg_table,
+        seg_lens,
+        1,
+        p_seg * page,
+        bmm1_scale_arg,
+        bmm2_scale,
+        -1.0,
+        -1,
+        0,
+        b * S,
+        -1,
+        0,
+        sm_count,
+        _cp_fmha_pdl(enable_pdl, fmha_pdl),
+        workspace.numel() * workspace.element_size(),
+        None,
+        None,
+        kv_scale_pool,
+        kv_scale_pool,
+        None,
+        False,
+        seg_lse,
+        seg_lse.stride(0),
+        seg_lse.stride(1),
+        False,
     )
     # request s * b + r, folded head hh = t * GH + d * HQL + h  ->  [d, s, r * q_len + t, h]
     o = seg_out.view(S, num_tokens, CP, HQL, D).permute(2, 0, 1, 3, 4)
@@ -674,8 +1103,13 @@ def q35_cp_partial_merge_free(
     return o, lse, extra_o, extra_lse, valid
 
 
-def q35_cp_combine(parts_o: torch.Tensor, parts_lse: torch.Tensor, out: torch.Tensor,
-                   gate: Optional[torch.Tensor] = None, enable_pdl: bool = False) -> None:
+def q35_cp_combine(
+    parts_o: torch.Tensor,
+    parts_lse: torch.Tensor,
+    out: torch.Tensor,
+    gate: Optional[torch.Tensor] = None,
+    enable_pdl: bool = False,
+) -> None:
     """LSE-weighted combine of exchanged partials: parts_o [CP, rows, H, D], parts_lse [CP, rows, H] (any CP / row
     strides, e.g. views of an all-to-all receive buffer) -> out [rows, H, D]; gate (optional, [rows, H, D] or
     [rows, H * D]) applies out * sigmoid(gate)."""
@@ -687,14 +1121,26 @@ def q35_cp_combine(parts_o: torch.Tensor, parts_lse: torch.Tensor, out: torch.Te
         gate = gate.view(rows, H, D)
         assert gate.stride(-1) == 1
     _q35_cp_combine_kernel[(rows, H)](
-        parts_o, parts_o.stride(0), parts_o.stride(1),
-        parts_lse, parts_lse.stride(0), parts_lse.stride(1),
-        out, out.stride(0), out.stride(1),
+        parts_o,
+        parts_o.stride(0),
+        parts_o.stride(1),
+        parts_lse,
+        parts_lse.stride(0),
+        parts_lse.stride(1),
+        out,
+        out.stride(0),
+        out.stride(1),
         gate if gate is not None else out,
         gate.stride(0) if gate is not None else 0,
         gate.stride(1) if gate is not None else 0,
-        CP=CP, BCP=max(2, triton.next_power_of_2(CP)), D=D, HAS_GATE=gate is not None,
-        LAUNCH_WITH_PDL=enable_pdl, EARLY_TRIGGER=_PDL_EARLY_TRIGGER, num_warps=4, launch_pdl=enable_pdl,
+        CP=CP,
+        BCP=max(2, triton.next_power_of_2(CP)),
+        D=D,
+        HAS_GATE=gate is not None,
+        LAUNCH_WITH_PDL=enable_pdl,
+        EARLY_TRIGGER=_PDL_EARLY_TRIGGER,
+        num_warps=4,
+        launch_pdl=enable_pdl,
     )
 
 
@@ -730,11 +1176,21 @@ def _cp_fused_fn():
     return _CP_FUSED_FN or None
 
 
-def _cp_fused_shape_ok(fn, q: torch.Tensor, kv_pool: torch.Tensor, cp: int, q_len: int, sm_count: int) -> bool:
+def _cp_fused_shape_ok(
+    fn, q: torch.Tensor, kv_pool: torch.Tensor, cp: int, q_len: int, sm_count: int
+) -> bool:
     rows, hq, d = q.shape
-    if not (q.dtype == torch.float8_e4m3fn and kv_pool.dtype == torch.float8_e4m3fn and d == 256
-            and kv_pool.dim() == 4 and kv_pool.shape[1] == 1 and kv_pool.shape[2] == 64
-            and 1 <= q_len <= 16 and q_len * cp * hq <= _CP_FUSED_MAX_ROWS and rows % q_len == 0):
+    if not (
+        q.dtype == torch.float8_e4m3fn
+        and kv_pool.dtype == torch.float8_e4m3fn
+        and d == 256
+        and kv_pool.dim() == 4
+        and kv_pool.shape[1] == 1
+        and kv_pool.shape[2] == 64
+        and 1 <= q_len <= 16
+        and q_len * cp * hq <= _CP_FUSED_MAX_ROWS
+        and rows % q_len == 0
+    ):
         return False
     # The kernel module's own limits (batch, combine geometry), when it states them.
     mod = sys.modules.get(getattr(fn, "__module__", None) or "")
@@ -742,11 +1198,21 @@ def _cp_fused_shape_ok(fn, q: torch.Tensor, kv_pool: torch.Tensor, cp: int, q_le
     return supported is None or bool(supported(q_len, cp, hq, rows // q_len, sm_count))
 
 
-def q35_cp_fused_partial_ref(q_all: torch.Tensor, kv_pool: torch.Tensor, block_tables: torch.Tensor,
-                             seq_lens: torch.Tensor, q_len: int, cp_rank: int, cp_size: int,
-                             bmm1_scale: Union[float, torch.Tensor], bmm2_scale: Union[float, torch.Tensor],
-                             out_o: torch.Tensor, out_lse: torch.Tensor, sm_count: int = 0,
-                             enable_pdl: bool = False) -> None:
+def q35_cp_fused_partial_ref(
+    q_all: torch.Tensor,
+    kv_pool: torch.Tensor,
+    block_tables: torch.Tensor,
+    seq_lens: torch.Tensor,
+    q_len: int,
+    cp_rank: int,
+    cp_size: int,
+    bmm1_scale: Union[float, torch.Tensor],
+    bmm2_scale: Union[float, torch.Tensor],
+    out_o: torch.Tensor,
+    out_lse: torch.Tensor,
+    sm_count: int = 0,
+    enable_pdl: bool = False,
+) -> None:
     """Contract of the fused CP partial kernel (TRTLLM_Q35_ATTN_CP_FUSED); FP32 torch reference for tests.
 
     Inputs:
@@ -771,10 +1237,16 @@ def q35_cp_fused_partial_ref(q_all: torch.Tensor, kv_pool: torch.Tensor, block_t
     b = rows // q_len
     page = kv_pool.shape[2]
     dev = q_all.device
-    bmm1 = (bmm1_scale.flatten()[0] if isinstance(bmm1_scale, torch.Tensor) else torch.tensor(
-        float(bmm1_scale), device=dev)).float()
-    bmm2 = (bmm2_scale.flatten()[0] if isinstance(bmm2_scale, torch.Tensor) else torch.tensor(
-        float(bmm2_scale), device=dev)).float()
+    bmm1 = (
+        bmm1_scale.flatten()[0]
+        if isinstance(bmm1_scale, torch.Tensor)
+        else torch.tensor(float(bmm1_scale), device=dev)
+    ).float()
+    bmm2 = (
+        bmm2_scale.flatten()[0]
+        if isinstance(bmm2_scale, torch.Tensor)
+        else torch.tensor(float(bmm2_scale), device=dev)
+    ).float()
     own = torch.arange(cp_rank, block_tables.shape[2], cp_size, device=dev)
     if own.numel() == 0:  # this rank owns no page of the table (tiny contexts)
         out_o.zero_()
@@ -784,11 +1256,18 @@ def q35_cp_fused_partial_ref(q_all: torch.Tensor, kv_pool: torch.Tensor, block_t
     v_blk = block_tables[:b, 1].index_select(1, own).long()
     k = kv_pool[k_blk, 0].float()  # [b, n_own, PAGE, D]
     v = kv_pool[v_blk, 0].float()
-    pos = (own[:, None] * page + torch.arange(page, device=dev)[None, :])  # [n_own, PAGE]
+    pos = own[:, None] * page + torch.arange(page, device=dev)[None, :]  # [n_own, PAGE]
     # queries [b, q_len, G, D], group head g = s * hq + h
-    q = q_all.float().reshape(cp, b, q_len, hq, D).permute(1, 2, 0, 3, 4).reshape(b, q_len, cp * hq, D)
+    q = (
+        q_all.float()
+        .reshape(cp, b, q_len, hq, D)
+        .permute(1, 2, 0, 3, 4)
+        .reshape(b, q_len, cp * hq, D)
+    )
     s = torch.einsum("btgd,bnpd->btgnp", q, k) * bmm1
-    limit = (seq_lens[:b].long()[:, None] - q_len + torch.arange(q_len, device=dev)[None, :] + 1)  # [b, q_len]
+    limit = (
+        seq_lens[:b].long()[:, None] - q_len + torch.arange(q_len, device=dev)[None, :] + 1
+    )  # [b, q_len]
     vis = pos[None, None, :, :] < limit[:, :, None, None]  # [b, q_len, n_own, PAGE]
     s = s.masked_fill(~vis[:, :, None], float("-inf"))
     m = s.amax(dim=(3, 4), keepdim=True)
@@ -797,24 +1276,65 @@ def q35_cp_fused_partial_ref(q_all: torch.Tensor, kv_pool: torch.Tensor, block_t
     den = p.sum(dim=(3, 4))  # [b, q_len, G]
     o = torch.einsum("btgnp,bnpd->btgd", p, v) / den.clamp_min(1e-30)[..., None] * bmm2
     o = torch.where((den > 0)[..., None], o, torch.zeros_like(o))
-    lse = torch.where(den > 0, m.squeeze(-1).squeeze(-1) * 1.4426950408889634 + torch.log2(den.clamp_min(1e-30)),
-                      torch.full_like(den, float("-inf")))
+    lse = torch.where(
+        den > 0,
+        m.squeeze(-1).squeeze(-1) * 1.4426950408889634 + torch.log2(den.clamp_min(1e-30)),
+        torch.full_like(den, float("-inf")),
+    )
     # [b, q_len, cp, hq, ...] -> [cp, rows, hq, ...]
     out_o.copy_(o.reshape(b, q_len, cp, hq, D).permute(2, 0, 1, 3, 4).reshape(cp, rows, hq, D))
     out_lse.copy_(lse.reshape(b, q_len, cp, hq).permute(2, 0, 1, 3).reshape(cp, rows, hq))
 
 
-def _cp_fused_check(exchange, run_func, q, kv_pool, block_tables, seq_lens, max_kv_len, q_len, num_segments,
-                    bmm1_scale, bmm1_scale_arg, bmm2_scale, workspace, counter, sm_count, enable_pdl, out, gate,
-                    fmha_pdl, draft_owner) -> None:
+def _cp_fused_check(
+    exchange,
+    run_func,
+    q,
+    kv_pool,
+    block_tables,
+    seq_lens,
+    max_kv_len,
+    q_len,
+    num_segments,
+    bmm1_scale,
+    bmm1_scale_arg,
+    bmm2_scale,
+    workspace,
+    counter,
+    sm_count,
+    enable_pdl,
+    out,
+    gate,
+    fmha_pdl,
+    draft_owner,
+) -> None:
     """TRTLLM_Q35_ATTN_CP_FUSED_CHECK: the merge-free path on the same inputs into a separate output."""
     global _CP_FUSED
     ref = torch.empty_like(out)
     _CP_FUSED = False
     try:
-        q35_cp_decode_ll(exchange, run_func, q, kv_pool, block_tables, seq_lens, max_kv_len, q_len, num_segments,
-                         bmm1_scale, bmm1_scale_arg, bmm2_scale, workspace, counter, sm_count, enable_pdl, ref,
-                         gate=gate, fmha_pdl=fmha_pdl, draft_owner=draft_owner)
+        q35_cp_decode_ll(
+            exchange,
+            run_func,
+            q,
+            kv_pool,
+            block_tables,
+            seq_lens,
+            max_kv_len,
+            q_len,
+            num_segments,
+            bmm1_scale,
+            bmm1_scale_arg,
+            bmm2_scale,
+            workspace,
+            counter,
+            sm_count,
+            enable_pdl,
+            ref,
+            gate=gate,
+            fmha_pdl=fmha_pdl,
+            draft_owner=draft_owner,
+        )
     finally:
         _CP_FUSED = True
     o32, r32 = out.float(), ref.float()
@@ -823,7 +1343,7 @@ def _cp_fused_check(exchange, run_func, q, kv_pool, block_tables, seq_lens, max_
     worst = int(diff.argmax())
     ref_at = abs(float(r32.flatten()[worst]))
     # bf16 ulp at the reference value of the worst element; relative error vs that row's largest |reference|
-    ulp = 2.0 ** (math.floor(math.log2(max(ref_at, 2.0 ** -126))) - 7)
+    ulp = 2.0 ** (math.floor(math.log2(max(ref_at, 2.0**-126))) - 7)
     row_max = float(r32.abs().amax(dim=-1).flatten()[worst // r32.shape[-1]])
     rel = err / max(row_max, 1e-6)
     st = CP_FUSED_CHECK_STATS
@@ -833,13 +1353,18 @@ def _cp_fused_check(exchange, run_func, q, kv_pool, block_tables, seq_lens, max_
     st["max_ulp"] = max(st.get("max_ulp", 0.0), err / ulp)
     st["sum_mean_abs"] = st.get("sum_mean_abs", 0.0) + float(diff.mean())
     from tensorrt_llm.logger import logger
+
     if not (rel <= 0.05):
-        logger.warning(f"TRTLLM_Q35_ATTN_CP_FUSED_CHECK: max abs {err:.4f} at |ref| {ref_at:.4f} ({err / ulp:.1f} bf16 "
-                       f"ulp, {rel:.4f} of the row max {row_max:.4f}), mean abs {float(diff.mean()):.6f} vs merge-free "
-                       f"(rows {q.shape[0]}, q_len {q_len}, max_kv_len {max_kv_len})")
+        logger.warning(
+            f"TRTLLM_Q35_ATTN_CP_FUSED_CHECK: max abs {err:.4f} at |ref| {ref_at:.4f} ({err / ulp:.1f} bf16 "
+            f"ulp, {rel:.4f} of the row max {row_max:.4f}), mean abs {float(diff.mean()):.6f} vs merge-free "
+            f"(rows {q.shape[0]}, q_len {q_len}, max_kv_len {max_kv_len})"
+        )
     elif st["calls"] % 64 == 1:
-        logger.info(f"TRTLLM_Q35_ATTN_CP_FUSED_CHECK: calls {st['calls']} max_abs {st['max_abs']:.4f} max_rel "
-                    f"{st['max_rel']:.4f} max_ulp {st['max_ulp']:.1f} mean_abs {st['sum_mean_abs'] / st['calls']:.6f}")
+        logger.info(
+            f"TRTLLM_Q35_ATTN_CP_FUSED_CHECK: calls {st['calls']} max_abs {st['max_abs']:.4f} max_rel "
+            f"{st['max_rel']:.4f} max_ulp {st['max_ulp']:.1f} mean_abs {st['sum_mean_abs'] / st['calls']:.6f}"
+        )
 
 
 def q35_cp_decode_ll(
@@ -882,18 +1407,56 @@ def q35_cp_decode_ll(
         # pages, into alltoall_merge's layout) -> all-to-all + merge (+ gate). The kernel reads only host data and the
         # prefix KV before its wait, so the all-gather may release it right after its own wait.
         trigger = "after_wait" if (enable_pdl and _allgather_after_wait(type(exchange))) else False
-        q_all = exchange.allgather(q, channel=0, trigger=trigger).view(rows, cp, hq, d).permute(1, 0, 2, 3)
+        q_all = (
+            exchange.allgather(q, channel=0, trigger=trigger)
+            .view(rows, cp, hq, d)
+            .permute(1, 0, 2, 3)
+        )
         o = torch.empty(cp, rows, hq, d, dtype=out.dtype, device=q.device)
         lse = torch.empty(cp, rows, hq, dtype=torch.float32, device=q.device)
-        fused_fn(q_all, kv_pool, block_tables, seq_lens, q_len, cp_rank, cp, bmm1_scale, bmm2_scale, o, lse,
-                 sm_count=sm_count, enable_pdl=enable_pdl)
+        fused_fn(
+            q_all,
+            kv_pool,
+            block_tables,
+            seq_lens,
+            q_len,
+            cp_rank,
+            cp,
+            bmm1_scale,
+            bmm2_scale,
+            o,
+            lse,
+            sm_count=sm_count,
+            enable_pdl=enable_pdl,
+        )
         merge(o, lse, out.view(rows, hq, d), gate=gate, channel=1)
         if _CP_FUSED_CHECK and not torch.cuda.is_current_stream_capturing():
-            _cp_fused_check(exchange, run_func, q, kv_pool, block_tables, seq_lens, max_kv_len, q_len, num_segments,
-                            bmm1_scale, bmm1_scale_arg, bmm2_scale, workspace, counter, sm_count, enable_pdl, out,
-                            gate, fmha_pdl, draft_owner)
+            _cp_fused_check(
+                exchange,
+                run_func,
+                q,
+                kv_pool,
+                block_tables,
+                seq_lens,
+                max_kv_len,
+                q_len,
+                num_segments,
+                bmm1_scale,
+                bmm1_scale_arg,
+                bmm2_scale,
+                workspace,
+                counter,
+                sm_count,
+                enable_pdl,
+                out,
+                gate,
+                fmha_pdl,
+                draft_owner,
+            )
         return out
-    draft_early = merge_free and enable_pdl and _CP_DRAFT_EARLY and _allgather_after_wait(type(exchange))
+    draft_early = (
+        merge_free and enable_pdl and _CP_DRAFT_EARLY and _allgather_after_wait(type(exchange))
+    )
     # member-major [rows, cp * hq * d] -> [cp, rows, hq, d] (strided view; group head = src * hq + h)
     if draft_early:
         q_all = exchange.allgather(q, channel=0, trigger="after_wait")
@@ -904,21 +1467,72 @@ def q35_cp_decode_ll(
         # No local merge kernel: the FMHA partials (several per member) and the own-head draft partial go straight
         # into the one-launch all-to-all + merge.
         o, lse, extra_o, extra_lse, valid = q35_cp_partial_merge_free(
-            run_func, q_all, kv_pool, block_tables, seq_lens, max_kv_len, q_len, cp, cp_rank, num_segments,
-            bmm1_scale, bmm1_scale_arg, bmm2_scale, workspace, counter, sm_count, None, enable_pdl,
-            out_dtype=out.dtype, fmha_pdl=fmha_pdl, q_local=q if draft_early else None)
-        merge(o, lse, out.view(rows, hq, d), gate=gate, channel=1, extra_o=extra_o, extra_lse=extra_lse,
-              valid=valid)
+            run_func,
+            q_all,
+            kv_pool,
+            block_tables,
+            seq_lens,
+            max_kv_len,
+            q_len,
+            cp,
+            cp_rank,
+            num_segments,
+            bmm1_scale,
+            bmm1_scale_arg,
+            bmm2_scale,
+            workspace,
+            counter,
+            sm_count,
+            None,
+            enable_pdl,
+            out_dtype=out.dtype,
+            fmha_pdl=fmha_pdl,
+            q_local=q if draft_early else None,
+        )
+        merge(
+            o,
+            lse,
+            out.view(rows, hq, d),
+            gate=gate,
+            channel=1,
+            extra_o=extra_o,
+            extra_lse=extra_lse,
+            valid=valid,
+        )
         return out
     o_words = rows * hq * d * out.element_size() // 4
-    assert o_words + rows * hq <= exchange.max_words, "CP-lite partials exceed the exchange's per-pair payload"
+    assert o_words + rows * hq <= exchange.max_words, (
+        "CP-lite partials exceed the exchange's per-pair payload"
+    )
     send = torch.empty(cp, o_words + rows * hq, dtype=torch.int32, device=q.device)
     send_o = send[:, :o_words].view(out.dtype).view(cp, rows, hq, d)
     send_l = send[:, o_words:].view(torch.float32).view(cp, rows, hq)
-    q35_cp_local_partial(run_func, q_all, kv_pool, block_tables, seq_lens, max_kv_len, q_len, cp, cp_rank,
-                         num_segments, bmm1_scale, bmm1_scale_arg, bmm2_scale, workspace, counter, sm_count, None,
-                         enable_pdl, include_draft=(cp_rank == 0 and not draft_owner), out_dtype=out.dtype,
-                         fmha_pdl=fmha_pdl, out_o=send_o, out_lse=send_l, draft_owner=draft_owner)
+    q35_cp_local_partial(
+        run_func,
+        q_all,
+        kv_pool,
+        block_tables,
+        seq_lens,
+        max_kv_len,
+        q_len,
+        cp,
+        cp_rank,
+        num_segments,
+        bmm1_scale,
+        bmm1_scale_arg,
+        bmm2_scale,
+        workspace,
+        counter,
+        sm_count,
+        None,
+        enable_pdl,
+        include_draft=(cp_rank == 0 and not draft_owner),
+        out_dtype=out.dtype,
+        fmha_pdl=fmha_pdl,
+        out_o=send_o,
+        out_lse=send_l,
+        draft_owner=draft_owner,
+    )
     if _CP_A2A == "merge" and hasattr(exchange, "alltoall_merge"):
         exchange.alltoall_merge(send_o, send_l, out.view(rows, hq, d), gate=gate, channel=1)
         return out
@@ -962,11 +1576,36 @@ def q35_cp_decode_nccl(
     q_all = _allgather(q_bytes, group, cp_rank, None, dim=0)
     q_all = q_all.view(torch.uint8).view(cp, rows, hq, d * esz).view(q.dtype)
     part_o, part_lse = q35_cp_local_partial(
-        run_func, q_all, kv_pool, block_tables, seq_lens, max_kv_len, q_len, cp, cp_rank, num_segments, bmm1_scale,
-        bmm1_scale_arg, bmm2_scale, workspace, counter, sm_count, None, enable_pdl, include_draft=False,
-        out_dtype=out.dtype, draft_owner=True)
-    chunks_o = [part_o[:, p * hq:(p + 1) * hq].contiguous() for p in range(cp)]
-    chunks_l = [part_lse[:, p * hq:(p + 1) * hq].contiguous() for p in range(cp)]
+        run_func,
+        q_all,
+        kv_pool,
+        block_tables,
+        seq_lens,
+        max_kv_len,
+        q_len,
+        cp,
+        cp_rank,
+        num_segments,
+        bmm1_scale,
+        bmm1_scale_arg,
+        bmm2_scale,
+        workspace,
+        counter,
+        sm_count,
+        None,
+        enable_pdl,
+        include_draft=False,
+        out_dtype=out.dtype,
+        draft_owner=True,
+    )
+    chunks_o = [part_o[:, p * hq : (p + 1) * hq].contiguous() for p in range(cp)]
+    chunks_l = [part_lse[:, p * hq : (p + 1) * hq].contiguous() for p in range(cp)]
     recv_o, recv_l = alltoall_helix(chunks_o + chunks_l, group)
-    q35_cp_combine(recv_o.contiguous(), recv_l.contiguous(), out.view(rows, hq, d), gate=gate, enable_pdl=enable_pdl)
+    q35_cp_combine(
+        recv_o.contiguous(),
+        recv_l.contiguous(),
+        out.view(rows, hq, d),
+        gate=gate,
+        enable_pdl=enable_pdl,
+    )
     return out

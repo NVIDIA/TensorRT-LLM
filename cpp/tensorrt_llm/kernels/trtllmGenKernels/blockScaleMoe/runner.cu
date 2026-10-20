@@ -756,12 +756,12 @@ std::tuple<int32_t, int32_t> Runner::getWorkspaceSizeInBytes(MoERunnerArgs const
 
     auto const& config = mPassingConfigs[configIndex];
 
-    auto workspace_size_fc1 = static_cast<int32_t>(mPermuteGemm1.getWorkspaceSizeInBytes(totalExpertsPerToken,
-        args.hidden_size, args.intermediate_size, totalLocalExperts, args.num_tokens, config.gemm1Config,
-        args.max_num_ctas_in_batch_dim));
-    auto workspace_size_fc2 = static_cast<int32_t>(mGemm2.getWorkspaceSizeInBytes(totalExpertsPerToken,
-        args.hidden_size, args.intermediate_size, totalLocalExperts, args.num_tokens, config.gemm2Config,
-        args.max_num_ctas_in_batch_dim));
+    auto workspace_size_fc1 = static_cast<int32_t>(
+        mPermuteGemm1.getWorkspaceSizeInBytes(totalExpertsPerToken, args.hidden_size, args.intermediate_size,
+            totalLocalExperts, args.num_tokens, config.gemm1Config, args.max_num_ctas_in_batch_dim));
+    auto workspace_size_fc2 = static_cast<int32_t>(
+        mGemm2.getWorkspaceSizeInBytes(totalExpertsPerToken, args.hidden_size, args.intermediate_size,
+            totalLocalExperts, args.num_tokens, config.gemm2Config, args.max_num_ctas_in_batch_dim));
     return std::make_tuple(workspace_size_fc1, workspace_size_fc2);
 }
 

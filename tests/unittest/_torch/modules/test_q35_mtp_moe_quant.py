@@ -40,10 +40,14 @@ def test_mxfp4_matches_trtllm_dequant():
     packed, scales = m.quantize_mxfp4(w)
     assert packed.shape == (256, 512) and scales.shape == (256, 32)
     ours = m.dequantize_mxfp4(packed, scales)
-    ref = torch.ops.trtllm.mxfp4_dequantize_unswizzled(packed.cpu(), scales.cpu(), 32).float().cuda()
+    ref = (
+        torch.ops.trtllm.mxfp4_dequantize_unswizzled(packed.cpu(), scales.cpu(), 32).float().cuda()
+    )
     assert torch.equal(ours, ref)
     swapped = ((packed >> 4) | (packed << 4)).contiguous()
-    bad = torch.ops.trtllm.mxfp4_dequantize_unswizzled(swapped.cpu(), scales.cpu(), 32).float().cuda()
+    bad = (
+        torch.ops.trtllm.mxfp4_dequantize_unswizzled(swapped.cpu(), scales.cpu(), 32).float().cuda()
+    )
     assert not torch.equal(ours, bad)
     rel = (ours - w.float()).norm() / w.float().norm()
     assert rel < 0.2, float(rel)
@@ -51,15 +55,18 @@ def test_mxfp4_matches_trtllm_dequant():
 
 def test_mxfp4_rounding_grid():
     m = _mod()
-    vals = torch.tensor([0.0, 0.24, 0.25, 0.26, 0.75, 1.25, 2.5, 3.5, 5.0, 5.9, 6.0, -0.75, -5.0],
-                        device="cuda")
+    vals = torch.tensor(
+        [0.0, 0.24, 0.25, 0.26, 0.75, 1.25, 2.5, 3.5, 5.0, 5.9, 6.0, -0.75, -5.0], device="cuda"
+    )
     w = torch.zeros((1, 32), device="cuda")
-    w[0, :vals.numel()] = vals
+    w[0, : vals.numel()] = vals
     w[0, -1] = 6.0  # block amax 6 -> scale 2^0
     packed, scales = m.quantize_mxfp4(w.to(torch.bfloat16))
     assert int(scales[0, 0]) == 127
-    got = m.dequantize_mxfp4(packed, scales)[0, :vals.numel()]
-    expect = torch.tensor([0.0, 0.0, 0.0, 0.5, 1.0, 1.0, 2.0, 4.0, 4.0, 6.0, 6.0, -1.0, -4.0], device="cuda")
+    got = m.dequantize_mxfp4(packed, scales)[0, : vals.numel()]
+    expect = torch.tensor(
+        [0.0, 0.0, 0.0, 0.5, 1.0, 1.0, 2.0, 4.0, 4.0, 6.0, 6.0, -1.0, -4.0], device="cuda"
+    )
     assert torch.equal(got, expect), got
 
 
@@ -70,25 +77,38 @@ def test_wrap_covers_the_configurable_moe_backend():
 
     m = _mod()
     calls = []
-    backend = types.SimpleNamespace(initial_local_expert_ids=[0, 1], layer_load_balancer=None,
-                                    weight_loading_mode=None)
-    backend.load_weights = lambda weights, allow_partial_loading=False: calls.append(("backend", weights[0]))
+    backend = types.SimpleNamespace(
+        initial_local_expert_ids=[0, 1], layer_load_balancer=None, weight_loading_mode=None
+    )
+    backend.load_weights = lambda weights, allow_partial_loading=False: calls.append(
+        ("backend", weights[0])
+    )
     wrapper = types.SimpleNamespace(backend=backend, weight_loading_mode=None)
-    wrapper.load_weights = lambda weights, allow_partial_loading=False: backend.load_weights(weights,
-                                                                                            allow_partial_loading)
+    wrapper.load_weights = lambda weights, allow_partial_loading=False: backend.load_weights(
+        weights, allow_partial_loading
+    )
     m.wrap_experts_loader(wrapper, "fp8block")
-    E, H, I = 2, 256, 128
-    w = {"gate_up_proj": torch.zeros((E, H, 2 * I), dtype=torch.bfloat16),
-         "down_proj": torch.zeros((E, I, H), dtype=torch.bfloat16)}
+    E, H, inter_dim = 2, 256, 128
+    w = {
+        "gate_up_proj": torch.zeros((E, H, 2 * inter_dim), dtype=torch.bfloat16),
+        "down_proj": torch.zeros((E, inter_dim, H), dtype=torch.bfloat16),
+    }
     for target in (wrapper, backend):
         calls.clear()
         target.load_weights([dict(w)])
         assert len(calls) == 1, calls
         got = calls[0][1]
-        assert set(got) == {f"{e}.{n}.{k}" for e in range(E) for n in ("w1", "w3", "w2")
-                            for k in ("weight", "weight_scale_inv")}
-        assert got["0.w1.weight"].dtype == torch.float8_e4m3fn and got["0.w1.weight"].shape == (I, H)
-        assert got["1.w2.weight"].shape == (H, I)
+        assert set(got) == {
+            f"{e}.{n}.{k}"
+            for e in range(E)
+            for n in ("w1", "w3", "w2")
+            for k in ("weight", "weight_scale_inv")
+        }
+        assert got["0.w1.weight"].dtype == torch.float8_e4m3fn and got["0.w1.weight"].shape == (
+            inter_dim,
+            H,
+        )
+        assert got["1.w2.weight"].shape == (H, inter_dim)
 
 
 def _bf16_moe_reference(x, router_logits, w1, w3, w2, top_k):
@@ -109,28 +129,43 @@ def _bf16_moe_reference(x, router_logits, w1, w3, w2, top_k):
 @pytest.mark.parametrize("mode", ["fp8block", "mxfp4"])
 @pytest.mark.parametrize("tokens", [1, 7])
 def test_quantized_trtllm_gen_moe_vs_bf16(mode, tokens, via_backend, monkeypatch):
-    from tensorrt_llm._torch.model_config import ModelConfig
-    from tensorrt_llm._torch.modules.fused_moe import (MoEWeightLoadingMode, RenormalizeMoeRoutingMethod,
-                                                       create_moe)
-    from tensorrt_llm._torch.autotuner import autotune
     from transformers import PretrainedConfig
+
+    from tensorrt_llm._torch.autotuner import autotune
+    from tensorrt_llm._torch.model_config import ModelConfig
+    from tensorrt_llm._torch.modules.fused_moe import (
+        MoEWeightLoadingMode,
+        RenormalizeMoeRoutingMethod,
+        create_moe,
+    )
 
     m = _mod()
     monkeypatch.setenv("TRTLLM_Q35_MTP_MOE_QUANT", mode)  # as in-model (fp8block: tileN >= 32 only)
-    E, H, I, K = 32, 4096, 1024, 4
+    E, H, inter_dim, K = 32, 4096, 1024, 4
     g = torch.Generator(device="cuda").manual_seed(2)
-    w1 = (torch.randn((E, I, H), generator=g, device="cuda") * 0.02).to(torch.bfloat16)
-    w3 = (torch.randn((E, I, H), generator=g, device="cuda") * 0.02).to(torch.bfloat16)
-    w2 = (torch.randn((E, H, I), generator=g, device="cuda") * 0.02).to(torch.bfloat16)
+    w1 = (torch.randn((E, inter_dim, H), generator=g, device="cuda") * 0.02).to(torch.bfloat16)
+    w3 = (torch.randn((E, inter_dim, H), generator=g, device="cuda") * 0.02).to(torch.bfloat16)
+    w2 = (torch.randn((E, H, inter_dim), generator=g, device="cuda") * 0.02).to(torch.bfloat16)
     # checkpoint fused layout after the Qwen3.5 mapper: gate_up [E, H, 2I] (gate first), down [E, I, H]
-    weights = {"gate_up_proj": torch.cat([w1, w3], dim=1).transpose(1, 2).contiguous(),
-               "down_proj": w2.transpose(1, 2).contiguous()}
+    weights = {
+        "gate_up_proj": torch.cat([w1, w3], dim=1).transpose(1, 2).contiguous(),
+        "down_proj": w2.transpose(1, 2).contiguous(),
+    }
     cfg = PretrainedConfig()
-    cfg.num_experts, cfg.hidden_size, cfg.intermediate_size, cfg.torch_dtype = E, H, I, torch.bfloat16
-    moe = create_moe(routing_method=RenormalizeMoeRoutingMethod(top_k=K), reduce_results=False,
-                     model_config=ModelConfig(pretrained_config=cfg, moe_backend="TRTLLM"),
-                     override_quant_config=m.quant_config_for(mode),
-                     weight_loading_mode=MoEWeightLoadingMode.VANILLA, dtype=torch.bfloat16)
+    cfg.num_experts, cfg.hidden_size, cfg.intermediate_size, cfg.torch_dtype = (
+        E,
+        H,
+        inter_dim,
+        torch.bfloat16,
+    )
+    moe = create_moe(
+        routing_method=RenormalizeMoeRoutingMethod(top_k=K),
+        reduce_results=False,
+        model_config=ModelConfig(pretrained_config=cfg, moe_backend="TRTLLM"),
+        override_quant_config=m.quant_config_for(mode),
+        weight_loading_mode=MoEWeightLoadingMode.VANILLA,
+        dtype=torch.bfloat16,
+    )
     m.wrap_experts_loader(moe, mode)
     # via_backend: the model loader's path (the weight mapper hands the expert tensors to the
     # ConfigurableMoE's backend module, which it finds through named_modules()).
@@ -152,29 +187,43 @@ def test_quantized_trtllm_gen_moe_vs_bf16(mode, tokens, via_backend, monkeypatch
     assert rel < (0.10 if mode == "fp8block" else 0.25), float(rel)
 
 
-def _fp8block_shard_moe(E, H, I, K, seed, cuda_first=False):
+def _fp8block_shard_moe(E, H, inter_dim, K, seed, cuda_first=False):
     """FP8-block TRTLLM-gen experts with one rank's MoE TP4 x EP2 shard shapes, loaded from BF16 weights the model
     loader's way. Returns the module and the BF16 weights (w1, w3, w2) for the reference. cuda_first: move the
     module to the GPU before loading, as the model loader does (a later .cuda() copies each parameter's view only)."""
-    from tensorrt_llm._torch.model_config import ModelConfig
-    from tensorrt_llm._torch.modules.fused_moe import (MoEWeightLoadingMode, RenormalizeMoeRoutingMethod,
-                                                       create_moe)
     from transformers import PretrainedConfig
+
+    from tensorrt_llm._torch.model_config import ModelConfig
+    from tensorrt_llm._torch.modules.fused_moe import (
+        MoEWeightLoadingMode,
+        RenormalizeMoeRoutingMethod,
+        create_moe,
+    )
 
     m = _mod()
     g = torch.Generator(device="cuda").manual_seed(seed)
-    w1 = (torch.randn((E, I, H), generator=g, device="cuda") * 0.02).to(torch.bfloat16)
-    w3 = (torch.randn((E, I, H), generator=g, device="cuda") * 0.02).to(torch.bfloat16)
-    w2 = (torch.randn((E, H, I), generator=g, device="cuda") * 0.02).to(torch.bfloat16)
-    weights = {"gate_up_proj": torch.cat([w1, w3], dim=1).transpose(1, 2).contiguous(),
-               "down_proj": w2.transpose(1, 2).contiguous()}
+    w1 = (torch.randn((E, inter_dim, H), generator=g, device="cuda") * 0.02).to(torch.bfloat16)
+    w3 = (torch.randn((E, inter_dim, H), generator=g, device="cuda") * 0.02).to(torch.bfloat16)
+    w2 = (torch.randn((E, H, inter_dim), generator=g, device="cuda") * 0.02).to(torch.bfloat16)
+    weights = {
+        "gate_up_proj": torch.cat([w1, w3], dim=1).transpose(1, 2).contiguous(),
+        "down_proj": w2.transpose(1, 2).contiguous(),
+    }
     cfg = PretrainedConfig()
-    cfg.num_experts, cfg.hidden_size, cfg.intermediate_size, cfg.torch_dtype = E, H, I, torch.bfloat16
-    moe = create_moe(routing_method=RenormalizeMoeRoutingMethod(top_k=K), reduce_results=False,
-                     model_config=ModelConfig(pretrained_config=cfg, moe_backend="TRTLLM",
-                                              max_num_tokens=8192),
-                     override_quant_config=m.quant_config_for("fp8block"),
-                     weight_loading_mode=MoEWeightLoadingMode.VANILLA, dtype=torch.bfloat16)
+    cfg.num_experts, cfg.hidden_size, cfg.intermediate_size, cfg.torch_dtype = (
+        E,
+        H,
+        inter_dim,
+        torch.bfloat16,
+    )
+    moe = create_moe(
+        routing_method=RenormalizeMoeRoutingMethod(top_k=K),
+        reduce_results=False,
+        model_config=ModelConfig(pretrained_config=cfg, moe_backend="TRTLLM", max_num_tokens=8192),
+        override_quant_config=m.quant_config_for("fp8block"),
+        weight_loading_mode=MoEWeightLoadingMode.VANILLA,
+        dtype=torch.bfloat16,
+    )
     m.wrap_experts_loader(moe, "fp8block")
     if cuda_first:
         moe.cuda()
@@ -195,8 +244,8 @@ def test_fp8block_moe_tp4_shard_shapes(tokens, monkeypatch):
     monkeypatch.delenv("TRTLLM_Q35_FP8_MOE_MIN_TILEN", raising=False)
     monkeypatch.setenv("TRTLLM_Q35_MTP_MOE_QUANT", "fp8block")
 
-    E, H, I, K = 256, 4096, 256, 10
-    moe, (w1, w3, w2), g = _fp8block_shard_moe(E, H, I, K, seed=5)
+    E, H, inter_dim, K = 256, 4096, 256, 10
+    moe, (w1, w3, w2), g = _fp8block_shard_moe(E, H, inter_dim, K, seed=5)
     x = (torch.randn((tokens, H), generator=g, device="cuda")).to(torch.bfloat16)
     logits = torch.randn((tokens, E), generator=g, device="cuda").to(torch.bfloat16)
     with torch.inference_mode(), autotune():
@@ -208,7 +257,7 @@ def test_fp8block_moe_tp4_shard_shapes(tokens, monkeypatch):
     n = min(tokens, 64)  # the Python reference is slow; check the first rows
     ref = _bf16_moe_reference(x[:n], logits[:n], w1, w3, w2, K)
     rel = (out[:n] - ref).norm() / ref.norm()
-    print(f"fp8block E{E} I{I} top{K} tokens={tokens}: relative L2 error {float(rel):.4f}")
+    print(f"fp8block E{E} I{inter_dim} top{K} tokens={tokens}: relative L2 error {float(rel):.4f}")
     assert rel < 0.10, float(rel)
 
 
@@ -235,7 +284,9 @@ def test_fp8block_runner_tactics_skip_small_tiles(tokens, monkeypatch):
         # one rank of TEP8 MOE_TP=4 x EP=2 (256 local experts, I 256) and of MOE_TP=2 x EP=4 (128 local, I 512)
         out = set()
         for local, inter, offset in ((256, 256, 256), (128, 512, 384)):
-            runner = ops.FP8BlockScaleMoERunner(512, 10, None, None, None, inter, offset, local, None, 1, 0)
+            runner = ops.FP8BlockScaleMoERunner(
+                512, 10, None, None, None, inter, offset, local, None, 1, 0
+            )
             out |= {int(t[0]) for t in runner.get_valid_tactics(_runner_inputs(tokens), None)}
         return out
 
@@ -259,8 +310,8 @@ def test_quantized_mtp_experts_tune_and_run_large_tiles_only(tokens, monkeypatch
 
     monkeypatch.delenv("TRTLLM_Q35_FP8_MOE_MIN_TILEN", raising=False)
     monkeypatch.setenv("TRTLLM_Q35_MTP_MOE_QUANT", "fp8block")
-    E, H, I, K = 256, 4096, 256, 10
-    moe, (w1, w3, w2), g = _fp8block_shard_moe(E, H, I, K, seed=9)
+    E, H, inter_dim, K = 256, 4096, 256, 10
+    moe, (w1, w3, w2), g = _fp8block_shard_moe(E, H, inter_dim, K, seed=9)
     used = []
     orig_forward = ops.FP8BlockScaleMoERunner.forward
 
@@ -286,7 +337,9 @@ def test_quantized_mtp_experts_tune_and_run_large_tiles_only(tokens, monkeypatch
     n = min(tokens, 64)
     ref = _bf16_moe_reference(x[:n], logits[:n], w1, w3, w2, K)
     rel = (out[:n] - ref).norm() / ref.norm()
-    print(f"fp8block E{E} I{I} top{K} tokens={tokens}: tactic {used[0]}, relative L2 error {float(rel):.4f}")
+    print(
+        f"fp8block E{E} I{inter_dim} top{K} tokens={tokens}: tactic {used[0]}, relative L2 error {float(rel):.4f}"
+    )
     assert rel < 0.10, float(rel)
 
 
@@ -296,8 +349,8 @@ def test_stale_small_tile_tactic_is_replaced(monkeypatch):
     from tensorrt_llm._torch.autotuner import AutoTuner
     from tensorrt_llm._torch.custom_ops import trtllm_gen_custom_ops as ops
 
-    E, H, I, K = 256, 4096, 256, 10
-    moe, _, g = _fp8block_shard_moe(E, H, I, K, seed=11)
+    E, H, inter_dim, K = 256, 4096, 256, 10
+    moe, _, g = _fp8block_shard_moe(E, H, inter_dim, K, seed=11)
     used = []
     orig_forward = ops.FP8BlockScaleMoERunner.forward
 
@@ -305,8 +358,11 @@ def test_stale_small_tile_tactic_is_replaced(monkeypatch):
         used.append(list(tactic))
         if tactic[0] < 32:  # record the choice without launching the excluded small-tile tactic
             x = inputs[2]
-            return output if output is not None else torch.zeros(
-                (x.shape[0], x.shape[1]), dtype=torch.bfloat16, device=x.device)
+            return (
+                output
+                if output is not None
+                else torch.zeros((x.shape[0], x.shape[1]), dtype=torch.bfloat16, device=x.device)
+            )
         return orig_forward(self, inputs, tactic=tactic, output=output)
 
     monkeypatch.setattr(ops.FP8BlockScaleMoERunner, "forward", recording_forward)
@@ -345,7 +401,8 @@ def test_guard_flag_parsing(monkeypatch):
         assert m.mtp_moe_quant_guard("fp8block") == [], off
     monkeypatch.setenv("TRTLLM_Q35_MTP_MOE_QUANT_GUARD", "all")
     assert sorted(m.mtp_moe_quant_guard("fp8block")) == sorted(
-        ["w3_w1_weight", "w3_w1_weight_scaling_factor", "w2_weight", "w2_weight_scaling_factor"])
+        ["w3_w1_weight", "w3_w1_weight_scaling_factor", "w2_weight", "w2_weight_scaling_factor"]
+    )
     monkeypatch.setenv("TRTLLM_Q35_MTP_MOE_QUANT_GUARD", " w2, w31 ,w2")
     assert m.mtp_moe_quant_guard("fp8block") == ["w2_weight", "w3_w1_weight"]
     assert m.mtp_moe_quant_guard("mxfp4") == []
@@ -367,20 +424,29 @@ def test_guard_pad_keeps_parameter_shape_and_values():
 
     m = _mod()
     g = torch.Generator(device="cuda").manual_seed(3)
-    w = torch.nn.Parameter((torch.randn((3, 256, 128), generator=g, device="cuda") * 8).to(torch.float8_e4m3fn),
-                           requires_grad=False)
+    w = torch.nn.Parameter(
+        (torch.randn((3, 256, 128), generator=g, device="cuda") * 8).to(torch.float8_e4m3fn),
+        requires_grad=False,
+    )
     s = torch.nn.Parameter(torch.rand((3, 2, 1), generator=g, device="cuda"), requires_grad=False)
     backend = types.SimpleNamespace(w2_weight=w, w2_weight_scaling_factor=s)
     before_w, before_s = w.data.clone(), s.data.clone()
     slot = w[0].numel() * w.element_size()
     assert w.untyped_storage().nbytes() == 3 * slot
     assert m.guard_pad_expert_params(backend, ["w2_weight", "no_such_tensor"]) == ["w2_weight"]
-    assert backend.w2_weight is w and w.shape == (3, 256, 128) and w.is_contiguous() and w.storage_offset() == 0
+    assert (
+        backend.w2_weight is w
+        and w.shape == (3, 256, 128)
+        and w.is_contiguous()
+        and w.storage_offset() == 0
+    )
     assert torch.equal(w.data.view(torch.uint8), before_w.view(torch.uint8))
     assert w.untyped_storage().nbytes() == 4 * slot
     assert torch.all(_storage_view(w, 4)[3].view(torch.uint8) == 0)
     # untouched tensor: same storage, same values (negative control for the padding)
-    assert s.untyped_storage().nbytes() == s.numel() * s.element_size() and torch.equal(s.data, before_s)
+    assert s.untyped_storage().nbytes() == s.numel() * s.element_size() and torch.equal(
+        s.data, before_s
+    )
 
 
 @pytest.mark.parametrize("tokens", [1, 7])
@@ -390,15 +456,15 @@ def test_guarded_fp8block_experts_match_unguarded(tokens, monkeypatch):
     negative control: the unguarded module has no extra slot."""
     monkeypatch.delenv("TRTLLM_Q35_FP8_MOE_MIN_TILEN", raising=False)
     monkeypatch.setenv("TRTLLM_Q35_MTP_MOE_QUANT", "fp8block")
-    E, H, I, K = 256, 4096, 256, 10
+    E, H, inter_dim, K = 256, 4096, 256, 10
     outs, slots = {}, {}
     for guard in ("w2", "0"):
         monkeypatch.setenv("TRTLLM_Q35_MTP_MOE_QUANT_GUARD", guard)
-        moe, _, g = _fp8block_shard_moe(E, H, I, K, seed=13, cuda_first=True)
+        moe, _, g = _fp8block_shard_moe(E, H, inter_dim, K, seed=13, cuda_first=True)
         backend = getattr(moe, "backend", moe)
         w2 = backend.w2_weight
-        assert w2.shape == (E, H, I)
-        slots[guard] = w2.untyped_storage().nbytes() // (H * I)
+        assert w2.shape == (E, H, inter_dim)
+        slots[guard] = w2.untyped_storage().nbytes() // (H * inter_dim)
         if guard != "0":
             assert torch.all(_storage_view(w2, E + 1)[E].view(torch.uint8) == 0)
         x = (torch.randn((tokens, H), generator=g, device="cuda")).to(torch.bfloat16)
@@ -490,23 +556,44 @@ def test_nvfp4_convert_keys_and_scales(monkeypatch):
     """Per-expert checkpoint-format keys; w1 / w3 share one weight_scale_2; input scales from the AMAX env."""
     m = _mod()
     monkeypatch.setenv("TRTLLM_Q35_MTP_MOE_NVFP4_AMAX", "64,512")
-    E, H, I = 2, 256, 128
+    E, H, inter_dim = 2, 256, 128
     g = torch.Generator(device="cuda").manual_seed(4)
-    gate_up = (torch.randn((E, H, 2 * I), generator=g, device="cuda") * 0.02).to(torch.bfloat16)
+    gate_up = (torch.randn((E, H, 2 * inter_dim), generator=g, device="cuda") * 0.02).to(
+        torch.bfloat16
+    )
     gate_up[1, 0, 0] = 1.0  # w1 of expert 1 has the larger amax -> w3 shares it
-    down = (torch.randn((E, I, H), generator=g, device="cuda") * 0.02).to(torch.bfloat16)
-    out = m.convert_bf16_experts({"gate_up_proj": gate_up, "down_proj": down}, [0, 1], "nvfp4",
-                                 torch.device("cuda"))
-    assert set(out) == {f"{e}.{n}.{k}" for e in range(E) for n in ("w1", "w3", "w2")
-                        for k in ("weight", "weight_scale", "weight_scale_2", "input_scale")}
-    assert out["0.w1.weight"].shape == (I, H // 2) and out["0.w1.weight"].dtype == torch.uint8
-    assert out["0.w1.weight_scale"].shape == (I, H // 16) and out["0.w1.weight_scale"].dtype == torch.float8_e4m3fn
-    assert out["0.w2.weight"].shape == (H, I // 2) and out["0.w2.weight_scale"].shape == (H, I // 16)
-    assert float(out["1.w1.weight_scale_2"]) == float(out["1.w3.weight_scale_2"]) == pytest.approx(1.0 / 2688.0)
+    down = (torch.randn((E, inter_dim, H), generator=g, device="cuda") * 0.02).to(torch.bfloat16)
+    out = m.convert_bf16_experts(
+        {"gate_up_proj": gate_up, "down_proj": down}, [0, 1], "nvfp4", torch.device("cuda")
+    )
+    assert set(out) == {
+        f"{e}.{n}.{k}"
+        for e in range(E)
+        for n in ("w1", "w3", "w2")
+        for k in ("weight", "weight_scale", "weight_scale_2", "input_scale")
+    }
+    assert (
+        out["0.w1.weight"].shape == (inter_dim, H // 2) and out["0.w1.weight"].dtype == torch.uint8
+    )
+    assert (
+        out["0.w1.weight_scale"].shape == (inter_dim, H // 16)
+        and out["0.w1.weight_scale"].dtype == torch.float8_e4m3fn
+    )
+    assert out["0.w2.weight"].shape == (H, inter_dim // 2) and out["0.w2.weight_scale"].shape == (
+        H,
+        inter_dim // 16,
+    )
+    assert (
+        float(out["1.w1.weight_scale_2"])
+        == float(out["1.w3.weight_scale_2"])
+        == pytest.approx(1.0 / 2688.0)
+    )
     assert float(out["0.w1.input_scale"]) == pytest.approx(64.0 / 2688.0)
     assert float(out["0.w2.input_scale"]) == pytest.approx(512.0 / 2688.0)
-    w1 = gate_up[1].transpose(0, 1)[:I].float()
-    d1 = m.dequantize_nvfp4(out["1.w1.weight"], out["1.w1.weight_scale"], out["1.w1.weight_scale_2"])
+    w1 = gate_up[1].transpose(0, 1)[:inter_dim].float()
+    d1 = m.dequantize_nvfp4(
+        out["1.w1.weight"], out["1.w1.weight_scale"], out["1.w1.weight_scale_2"]
+    )
     assert ((d1 - w1).norm() / w1.norm()).item() < 0.15
 
 
@@ -518,8 +605,11 @@ def _nvfp4_moe_emulation(m, weights, x, logits, E, K, fc1_amax, fc2_amax):
 
     def deq(e, n):
         if (e, n) not in cache:
-            cache[(e, n)] = m.dequantize_nvfp4(conv[f"{e}.{n}.weight"], conv[f"{e}.{n}.weight_scale"],
-                                               conv[f"{e}.{n}.weight_scale_2"].to(x.device))
+            cache[(e, n)] = m.dequantize_nvfp4(
+                conv[f"{e}.{n}.weight"],
+                conv[f"{e}.{n}.weight_scale"],
+                conv[f"{e}.{n}.weight_scale_2"].to(x.device),
+            )
         return cache[(e, n)]
 
     xq = m.dequantize_nvfp4(*m.quantize_nvfp4(x.float(), amax=fc1_amax))
@@ -541,28 +631,43 @@ def _nvfp4_moe_emulation(m, weights, x, logits, E, K, fc1_amax, fc2_amax):
 def test_nvfp4_trtllm_gen_moe_vs_bf16(tokens, via_backend, monkeypatch):
     """BF16 experts converted to NVFP4 load into the trtllm-gen FP4 MoE (its own scale reconciliation, shuffles
     and alphas) and match the BF16 reference within NVFP4 weight + activation error."""
+    from transformers import PretrainedConfig
+
     from tensorrt_llm._torch.autotuner import autotune
     from tensorrt_llm._torch.model_config import ModelConfig
-    from tensorrt_llm._torch.modules.fused_moe import (MoEWeightLoadingMode, RenormalizeMoeRoutingMethod,
-                                                       create_moe)
-    from transformers import PretrainedConfig
+    from tensorrt_llm._torch.modules.fused_moe import (
+        MoEWeightLoadingMode,
+        RenormalizeMoeRoutingMethod,
+        create_moe,
+    )
 
     m = _mod()
     monkeypatch.setenv("TRTLLM_Q35_MTP_MOE_QUANT", "nvfp4")
     monkeypatch.setenv("TRTLLM_Q35_MTP_MOE_NVFP4_AMAX", "16,64")
-    E, H, I, K = 64, 4096, 512, 10
+    E, H, inter_dim, K = 64, 4096, 512, 10
     g = torch.Generator(device="cuda").manual_seed(6)
-    w1 = (torch.randn((E, I, H), generator=g, device="cuda") * 0.02).to(torch.bfloat16)
-    w3 = (torch.randn((E, I, H), generator=g, device="cuda") * 0.02).to(torch.bfloat16)
-    w2 = (torch.randn((E, H, I), generator=g, device="cuda") * 0.02).to(torch.bfloat16)
-    weights = {"gate_up_proj": torch.cat([w1, w3], dim=1).transpose(1, 2).contiguous(),
-               "down_proj": w2.transpose(1, 2).contiguous()}
+    w1 = (torch.randn((E, inter_dim, H), generator=g, device="cuda") * 0.02).to(torch.bfloat16)
+    w3 = (torch.randn((E, inter_dim, H), generator=g, device="cuda") * 0.02).to(torch.bfloat16)
+    w2 = (torch.randn((E, H, inter_dim), generator=g, device="cuda") * 0.02).to(torch.bfloat16)
+    weights = {
+        "gate_up_proj": torch.cat([w1, w3], dim=1).transpose(1, 2).contiguous(),
+        "down_proj": w2.transpose(1, 2).contiguous(),
+    }
     cfg = PretrainedConfig()
-    cfg.num_experts, cfg.hidden_size, cfg.intermediate_size, cfg.torch_dtype = E, H, I, torch.bfloat16
-    moe = create_moe(routing_method=RenormalizeMoeRoutingMethod(top_k=K), reduce_results=False,
-                     model_config=ModelConfig(pretrained_config=cfg, moe_backend="TRTLLM", max_num_tokens=8192),
-                     override_quant_config=m.quant_config_for("nvfp4"),
-                     weight_loading_mode=MoEWeightLoadingMode.VANILLA, dtype=torch.bfloat16)
+    cfg.num_experts, cfg.hidden_size, cfg.intermediate_size, cfg.torch_dtype = (
+        E,
+        H,
+        inter_dim,
+        torch.bfloat16,
+    )
+    moe = create_moe(
+        routing_method=RenormalizeMoeRoutingMethod(top_k=K),
+        reduce_results=False,
+        model_config=ModelConfig(pretrained_config=cfg, moe_backend="TRTLLM", max_num_tokens=8192),
+        override_quant_config=m.quant_config_for("nvfp4"),
+        weight_loading_mode=MoEWeightLoadingMode.VANILLA,
+        dtype=torch.bfloat16,
+    )
     m.wrap_experts_loader(moe, "nvfp4")
     moe.cuda()  # as the model loader: parameters on the GPU before load_weights
     (getattr(moe, "backend", moe) if via_backend else moe).load_weights([weights])
@@ -584,8 +689,10 @@ def test_nvfp4_trtllm_gen_moe_vs_bf16(tokens, via_backend, monkeypatch):
     rel = (out - ref).norm() / ref.norm()
     emu = _nvfp4_moe_emulation(m, weights, x, logits, E, K, 16.0, 64.0)
     rel_emu = (out - emu).norm() / emu.norm()
-    print(f"nvfp4 tokens={tokens} via_backend={via_backend}: relative L2 error vs BF16 reference {float(rel):.4f}, "
-          f"vs NVFP4 emulation {float(rel_emu):.4f}")
+    print(
+        f"nvfp4 tokens={tokens} via_backend={via_backend}: relative L2 error vs BF16 reference {float(rel):.4f}, "
+        f"vs NVFP4 emulation {float(rel_emu):.4f}"
+    )
     # vs BF16: four NVFP4 roundings (x, w1 / w3, SwiGLU output, w2; ~9.5 % each on Gaussian data) compound to ~0.23;
     # a wrong layout / scale gives ~1. vs the emulation of the same NVFP4 arithmetic: only accumulation order and rare
     # rounding flips of the SwiGLU-output quantization.
@@ -596,24 +703,43 @@ def test_nvfp4_trtllm_gen_moe_vs_bf16(tokens, via_backend, monkeypatch):
 def test_calib_probe_matches_reference(monkeypatch):
     """TRTLLM_Q35_MTP_MOE_CALIB: x amax and the routed SwiGLU-output amax of a BF16 (CUTLASS) MoE equal a torch
     reference; an input-only record (no logits) leaves the h statistics alone."""
-    from tensorrt_llm._torch.model_config import ModelConfig
-    from tensorrt_llm._torch.modules.fused_moe import (MoEWeightLoadingMode, RenormalizeMoeRoutingMethod,
-                                                       create_moe)
     from transformers import PretrainedConfig
 
+    from tensorrt_llm._torch.model_config import ModelConfig
+    from tensorrt_llm._torch.modules.fused_moe import (
+        MoEWeightLoadingMode,
+        RenormalizeMoeRoutingMethod,
+        create_moe,
+    )
+
     m = _mod()
-    E, H, I, K = 16, 512, 256, 4
+    E, H, inter_dim, K = 16, 512, 256, 4
     g = torch.Generator(device="cuda").manual_seed(8)
-    w1 = (torch.randn((E, I, H), generator=g, device="cuda") * 0.05).to(torch.bfloat16)
-    w3 = (torch.randn((E, I, H), generator=g, device="cuda") * 0.05).to(torch.bfloat16)
-    w2 = (torch.randn((E, H, I), generator=g, device="cuda") * 0.05).to(torch.bfloat16)
+    w1 = (torch.randn((E, inter_dim, H), generator=g, device="cuda") * 0.05).to(torch.bfloat16)
+    w3 = (torch.randn((E, inter_dim, H), generator=g, device="cuda") * 0.05).to(torch.bfloat16)
+    w2 = (torch.randn((E, H, inter_dim), generator=g, device="cuda") * 0.05).to(torch.bfloat16)
     cfg = PretrainedConfig()
-    cfg.num_experts, cfg.hidden_size, cfg.intermediate_size, cfg.torch_dtype = E, H, I, torch.bfloat16
-    moe = create_moe(routing_method=RenormalizeMoeRoutingMethod(top_k=K), reduce_results=False,
-                     model_config=ModelConfig(pretrained_config=cfg, moe_backend="CUTLASS"),
-                     weight_loading_mode=MoEWeightLoadingMode.FUSED_GATE_UP_PROJ, dtype=torch.bfloat16)
-    moe.load_weights([{"gate_up_proj": torch.cat([w1, w3], dim=1).transpose(1, 2).contiguous(),
-                       "down_proj": w2.transpose(1, 2).contiguous()}])
+    cfg.num_experts, cfg.hidden_size, cfg.intermediate_size, cfg.torch_dtype = (
+        E,
+        H,
+        inter_dim,
+        torch.bfloat16,
+    )
+    moe = create_moe(
+        routing_method=RenormalizeMoeRoutingMethod(top_k=K),
+        reduce_results=False,
+        model_config=ModelConfig(pretrained_config=cfg, moe_backend="CUTLASS"),
+        weight_loading_mode=MoEWeightLoadingMode.FUSED_GATE_UP_PROJ,
+        dtype=torch.bfloat16,
+    )
+    moe.load_weights(
+        [
+            {
+                "gate_up_proj": torch.cat([w1, w3], dim=1).transpose(1, 2).contiguous(),
+                "down_proj": w2.transpose(1, 2).contiguous(),
+            }
+        ]
+    )
     moe.cuda()
     x = torch.randn((5, H), generator=g, device="cuda").to(torch.bfloat16)
     logits = torch.randn((5, E), generator=g, device="cuda").to(torch.bfloat16)
@@ -628,7 +754,9 @@ def test_calib_probe_matches_reference(monkeypatch):
     ref = 0.0
     for t in range(x.shape[0]):
         for e in top[t].tolist():
-            h = torch.nn.functional.silu(w1[e].float() @ x[t].float()) * (w3[e].float() @ x[t].float())
+            h = torch.nn.functional.silu(w1[e].float() @ x[t].float()) * (
+                w3[e].float() @ x[t].float()
+            )
             ref = max(ref, float(h.abs().max()))
     assert st60[1] == pytest.approx(ref, rel=0.02)  # bf16 GEMM rounding
     assert st60[5] == x.shape[0] * K and st60[3] == 1 and st60[4] == x.shape[0]

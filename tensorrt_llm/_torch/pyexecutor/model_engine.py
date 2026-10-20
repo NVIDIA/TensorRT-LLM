@@ -4871,19 +4871,18 @@ class PyTorchModelEngine(ModelEngine):
                 self, scheduled_requests, kv_cache_manager, attn_metadata,
                 spec_metadata, new_tensors_device, resource_manager,
                 promoted_context_request_ids,
-                lambda: self._prepare_tp_inputs(
-                    scheduled_requests,
-                    kv_cache_manager,
-                    attn_metadata,
-                    spec_metadata,
-                    new_tensors_device,
-                    cache_indirection_buffer,
-                    num_accepted_tokens_device,
-                    req_id_to_old_request,
-                    resource_manager,
-                    maybe_graph,
-                    promoted_context_request_ids,
-                    _q35_force_full=True))
+                lambda: self._prepare_tp_inputs(scheduled_requests,
+                                                kv_cache_manager,
+                                                attn_metadata,
+                                                spec_metadata,
+                                                new_tensors_device,
+                                                cache_indirection_buffer,
+                                                num_accepted_tokens_device,
+                                                req_id_to_old_request,
+                                                resource_manager,
+                                                maybe_graph,
+                                                promoted_context_request_ids,
+                                                _q35_force_full=True))
             if steady_result is not None:
                 return steady_result
 

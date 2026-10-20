@@ -78,11 +78,9 @@ def _gdc_wait_with_memory_clobber():
 
 @triton.jit
 def _rcp_approx(x):
-    return tl.inline_asm_elementwise("rcp.approx.ftz.f32 $0, $1;",
-                                     "=f,f", [x],
-                                     dtype=tl.float32,
-                                     is_pure=True,
-                                     pack=1)
+    return tl.inline_asm_elementwise(
+        "rcp.approx.ftz.f32 $0, $1;", "=f,f", [x], dtype=tl.float32, is_pure=True, pack=1
+    )
 
 
 @triton.jit
@@ -92,22 +90,20 @@ def _pick_col(x, cols, k: tl.constexpr):
 
 
 @triton.jit
-def _nvfp4_quant_row(x_ptr, x_row_stride, gs_ptr, xq_ptr, xsf_ptr, r,
-                     H: tl.constexpr):
+def _nvfp4_quant_row(x_ptr, x_row_stride, gs_ptr, xq_ptr, xsf_ptr, r, H: tl.constexpr):
     """NVFP4-quantize hidden row r (cvt_warp_fp16_to_fp4 recipe, linear SF)."""
     cols = tl.arange(0, H)
     v = tl.load(x_ptr + r * x_row_stride + cols).to(tl.float32)
     v16 = tl.reshape(v, (H // 16, 16))
     vmax = tl.max(tl.abs(v16), axis=1)
     gs = tl.load(gs_ptr)
-    rcp6 = _rcp_approx(tl.full((H // 16, ), 6.0, tl.float32))
+    rcp6 = _rcp_approx(tl.full((H // 16,), 6.0, tl.float32))
     sf8 = (gs * (vmax * rcp6)).to(tl.float8e4nv)
-    rcpgs = _rcp_approx(tl.full((H // 16, ), 0.0, tl.float32) + gs)
+    rcpgs = _rcp_approx(tl.full((H // 16,), 0.0, tl.float32) + gs)
     osc = _rcp_approx(sf8.to(tl.float32) * rcpgs)
     osc = tl.where(vmax != 0.0, osc, 0.0)
-    tl.store(xsf_ptr + r * (H // 16) + tl.arange(0, H // 16),
-             sf8.to(tl.uint8, bitcast=True))
-    y = tl.reshape(v16 * osc[:, None], (H, ))
+    tl.store(xsf_ptr + r * (H // 16) + tl.arange(0, H // 16), sf8.to(tl.uint8, bitcast=True))
+    y = tl.reshape(v16 * osc[:, None], (H,))
     lo, hi = tl.split(tl.reshape(y, (H // 2, 2)))
     byte = tl.inline_asm_elementwise(
         "{ .reg .b8 t; cvt.rn.satfinite.e2m1x2.f32 t, $2, $1; cvt.u16.u8 $0, t; }",
@@ -161,9 +157,7 @@ def _q35_moe_front_kernel(
         rmask = rows < M
         ecols = tl.arange(0, E)
         lmask = rmask[:, None] & (ecols[None, :] < E)
-        lg = tl.load(logits_ptr + rows[:, None] * E + ecols[None, :],
-                     mask=lmask,
-                     other=0.0)
+        lg = tl.load(logits_ptr + rows[:, None] * E + ecols[None, :], mask=lmask, other=0.0)
         bits = lg.to(tl.int16, bitcast=True).to(tl.int32) & 0xFFFF
         # cub TwiddleIn for bf16 (negative -> ~bits, else bits | sign), then
         # the reduce_topk::TopKRedType packing: twiddled value in the upper
@@ -221,13 +215,11 @@ def _q35_moe_front_kernel(
         lid = tl.where(is_local, lid, 0)
         ecnt = tl.arange(0, NLP)
         emask = ecnt < NL
-        tl.store(scratch_ptr + ecnt, tl.zeros([NLP], dtype=tl.int32),
-                 mask=emask)
+        tl.store(scratch_ptr + ecnt, tl.zeros([NLP], dtype=tl.int32), mask=emask)
         tl.debug_barrier()
-        offs = tl.atomic_add(scratch_ptr + lid,
-                             tl.full([BM, KP], 1, tl.int32),
-                             mask=is_local,
-                             sem="relaxed")
+        offs = tl.atomic_add(
+            scratch_ptr + lid, tl.full([BM, KP], 1, tl.int32), mask=is_local, sem="relaxed"
+        )
         tl.debug_barrier()
         cnt = tl.load(scratch_ptr + ecnt, mask=emask, other=0, volatile=True)
         active = cnt > 0
@@ -235,17 +227,12 @@ def _q35_moe_front_kernel(
         tile_of_e = tl.cumsum(act_i, axis=0) - act_i
         num_tiles = tl.sum(act_i, axis=0)
         tl.store(tile_expert_ptr + tile_of_e, ecnt, mask=active)
-        tl.store(tile_mnlimit_ptr + tile_of_e, tile_of_e * TILE + cnt,
-                 mask=active)
+        tl.store(tile_mnlimit_ptr + tile_of_e, tile_of_e * TILE + cnt, mask=active)
         tl.store(scratch_ptr + NLP + ecnt, tile_of_e * TILE, mask=active)
         tl.debug_barrier()
-        base = tl.load(scratch_ptr + NLP + lid,
-                       mask=is_local,
-                       other=0,
-                       volatile=True)
+        base = tl.load(scratch_ptr + NLP + lid, mask=is_local, other=0, volatile=True)
         perm = base + offs
-        tl.store(exp2perm_ptr + exp_idx, tl.where(is_local, perm, -1),
-                 mask=omask)
+        tl.store(exp2perm_ptr + exp_idx, tl.where(is_local, perm, -1), mask=omask)
         tl.store(perm2exp_ptr + perm, exp_idx, mask=is_local)
         tl.store(total_padded_ptr, num_tiles * TILE)
         tl.store(num_tiles_ptr, num_tiles)
@@ -253,10 +240,8 @@ def _q35_moe_front_kernel(
         # ------ NVFP4 quantization of one row (unless done upstream) ------
         r = (pid - 1).to(tl.int64)
         if QUANT:
-            _nvfp4_quant_row(x_ptr, x_row_stride, gs_ptr, xq_ptr, xsf_ptr, r,
-                             H)
-        tl.store(out_ptr + r * H + tl.arange(0, H),
-                 tl.zeros([H], dtype=tl.bfloat16))
+            _nvfp4_quant_row(x_ptr, x_row_stride, gs_ptr, xq_ptr, xsf_ptr, r, H)
+        tl.store(out_ptr + r * H + tl.arange(0, H), tl.zeros([H], dtype=tl.bfloat16))
 
     if USE_PDL:
         tl.debug_barrier()
@@ -286,11 +271,9 @@ Q35_MOE_GATE_LOWM = os.environ.get("TRTLLM_Q35_MOE_GATE_LOWM", "0") == "1"
 
 @triton.jit
 def _fence_acq_rel_gpu():
-    tl.inline_asm_elementwise("fence.acq_rel.gpu; // dummy $0",
-                              "=r,~{memory}", [],
-                              dtype=tl.int32,
-                              is_pure=False,
-                              pack=1)
+    tl.inline_asm_elementwise(
+        "fence.acq_rel.gpu; // dummy $0", "=r,~{memory}", [], dtype=tl.int32, is_pure=False, pack=1
+    )
 
 
 @triton.jit
@@ -308,24 +291,44 @@ def _q35_top1(key):
 
 
 @triton.jit
-def _q35_store_pick(ids_ptr, w_ptr, rows, rmask, K: tl.constexpr,
-                    j: tl.constexpr, sel, e, ssum):
+def _q35_store_pick(ids_ptr, w_ptr, rows, rmask, K: tl.constexpr, j: tl.constexpr, sel, e, ssum):
     tl.store(ids_ptr + rows * K + j, sel, mask=rmask)
-    tl.store(w_ptr + rows * K + j,
-             tl.extra.cuda.libdevice.div_rn(e, ssum).to(w_ptr.dtype.element_ty),
-             mask=rmask)
+    tl.store(
+        w_ptr + rows * K + j,
+        tl.extra.cuda.libdevice.div_rn(e, ssum).to(w_ptr.dtype.element_ty),
+        mask=rmask,
+    )
 
 
 @triton.jit
-def _q35_route_core(logits_ptr, ids_ptr, w_ptr, e2p_ptr, p2t_ptr,
-                    cta_expert_ptr, cta_limit_ptr, num_ctas_ptr,
-                    num_padded_ptr, M, local_start, n_groups, my_group,
-                    E: tl.constexpr, K: tl.constexpr, KP: tl.constexpr,
-                    MP: tl.constexpr, RB: tl.constexpr, PE: tl.constexpr,
-                    TILE: tl.constexpr, NL: tl.constexpr,
-                    NLP: tl.constexpr, MAX_CTAS_PER_EXPERT: tl.constexpr,
-                    DEA: tl.constexpr, PHASES: tl.constexpr = 3,
-                    SORT: tl.constexpr = True):
+def _q35_route_core(
+    logits_ptr,
+    ids_ptr,
+    w_ptr,
+    e2p_ptr,
+    p2t_ptr,
+    cta_expert_ptr,
+    cta_limit_ptr,
+    num_ctas_ptr,
+    num_padded_ptr,
+    M,
+    local_start,
+    n_groups,
+    my_group,
+    E: tl.constexpr,
+    K: tl.constexpr,
+    KP: tl.constexpr,
+    MP: tl.constexpr,
+    RB: tl.constexpr,
+    PE: tl.constexpr,
+    TILE: tl.constexpr,
+    NL: tl.constexpr,
+    NLP: tl.constexpr,
+    MAX_CTAS_PER_EXPERT: tl.constexpr,
+    DEA: tl.constexpr,
+    PHASES: tl.constexpr = 3,
+    SORT: tl.constexpr = True,
+):
     """Routing of all M (<= MP) tokens in ONE program, no atomics (RB = rows
     per top-K block = min(8, MP), PE = MP * KP).
 
@@ -345,10 +348,12 @@ def _q35_route_core(logits_ptr, ids_ptr, w_ptr, e2p_ptr, p2t_ptr,
     for rb in range(0, M if PHASES != 2 else 0, RB):
         rows = rb + tl.arange(0, RB)
         rmask = rows < M
-        lg = tl.load(logits_ptr + rows[:, None] * E + cols[None, :],
-                     mask=rmask[:, None],
-                     other=0.0,
-                     cache_modifier=".cg")
+        lg = tl.load(
+            logits_ptr + rows[:, None] * E + cols[None, :],
+            mask=rmask[:, None],
+            other=0.0,
+            cache_modifier=".cg",
+        )
         bits = lg.to(tl.int16, bitcast=True).to(tl.int32) & 0xFFFF
         tw = tl.where((bits & 0x8000) != 0, bits ^ 0xFFFF, bits | 0x8000)
         key = ((tw << 16) | (65535 - cols[None, :])) ^ SIGN_BIT
@@ -369,9 +374,12 @@ def _q35_route_core(logits_ptr, ids_ptr, w_ptr, e2p_ptr, p2t_ptr,
             key, s8, v8 = _q35_top1(key)
             key, s9, v9 = _q35_top1(key)
             vmax = tl.maximum(
-                tl.maximum(tl.maximum(tl.maximum(v0, v1), tl.maximum(v2, v3)),
-                           tl.maximum(tl.maximum(v4, v5), tl.maximum(v6, v7))),
-                tl.maximum(v8, v9))
+                tl.maximum(
+                    tl.maximum(tl.maximum(v0, v1), tl.maximum(v2, v3)),
+                    tl.maximum(tl.maximum(v4, v5), tl.maximum(v6, v7)),
+                ),
+                tl.maximum(v8, v9),
+            )
             e0 = tl.extra.cuda.libdevice.exp(v0 - vmax)
             e1 = tl.extra.cuda.libdevice.exp(v1 - vmax)
             e2 = tl.extra.cuda.libdevice.exp(v2 - vmax)
@@ -382,8 +390,7 @@ def _q35_route_core(logits_ptr, ids_ptr, w_ptr, e2p_ptr, p2t_ptr,
             e7 = tl.extra.cuda.libdevice.exp(v7 - vmax)
             e8 = tl.extra.cuda.libdevice.exp(v8 - vmax)
             e9 = tl.extra.cuda.libdevice.exp(v9 - vmax)
-            ssum = (((e0 + e8) + e4) + (e2 + e6)) + (((e1 + e9) + e5) +
-                                                    (e3 + e7))
+            ssum = (((e0 + e8) + e4) + (e2 + e6)) + (((e1 + e9) + e5) + (e3 + e7))
             _q35_store_pick(ids_ptr, w_ptr, rows_r, rmask_r, K, 0, s0, e0, ssum)
             _q35_store_pick(ids_ptr, w_ptr, rows_r, rmask_r, K, 1, s1, e1, ssum)
             _q35_store_pick(ids_ptr, w_ptr, rows_r, rmask_r, K, 2, s2, e2, ssum)
@@ -402,8 +409,7 @@ def _q35_route_core(logits_ptr, ids_ptr, w_ptr, e2p_ptr, p2t_ptr,
                 picked = tl.where(slots[None, :] == k, sel[:, None], picked)
                 vals = tl.where(slots[None, :] == k, v[:, None], vals)
             vmax = tl.max(tl.where(kmask, vals, float("-inf")), axis=1)
-            ex = tl.where(kmask,
-                          tl.extra.cuda.libdevice.exp(vals - vmax[:, None]), 0.0)
+            ex = tl.where(kmask, tl.extra.cuda.libdevice.exp(vals - vmax[:, None]), 0.0)
             e0 = tl.sum(tl.where(slots[None, :] == 0, ex, 0.0), axis=1)
             e1 = tl.sum(tl.where(slots[None, :] == 1, ex, 0.0), axis=1)
             e2 = tl.sum(tl.where(slots[None, :] == 2, ex, 0.0), axis=1)
@@ -414,27 +420,60 @@ def _q35_route_core(logits_ptr, ids_ptr, w_ptr, e2p_ptr, p2t_ptr,
             e7 = tl.sum(tl.where(slots[None, :] == 7, ex, 0.0), axis=1)
             e8 = tl.sum(tl.where(slots[None, :] == 8, ex, 0.0), axis=1)
             e9 = tl.sum(tl.where(slots[None, :] == 9, ex, 0.0), axis=1)
-            ssum = (((e0 + e8) + e4) + (e2 + e6)) + (((e1 + e9) + e5) +
-                                                    (e3 + e7))
+            ssum = (((e0 + e8) + e4) + (e2 + e6)) + (((e1 + e9) + e5) + (e3 + e7))
             wts = tl.extra.cuda.libdevice.div_rn(ex, ssum[:, None])
             m2 = rmask[:, None] & kmask
-            tl.store(ids_ptr + rows[:, None] * K + slots[None, :], picked,
-                     mask=m2)
-            tl.store(w_ptr + rows[:, None] * K + slots[None, :],
-                     wts.to(w_ptr.dtype.element_ty),
-                     mask=m2)
+            tl.store(ids_ptr + rows[:, None] * K + slots[None, :], picked, mask=m2)
+            tl.store(
+                w_ptr + rows[:, None] * K + slots[None, :], wts.to(w_ptr.dtype.element_ty), mask=m2
+            )
     tl.debug_barrier()  # phase 2 reads the ids other threads of this program wrote
     if PHASES != 1:
-        _q35_route_tables_phase(ids_ptr, e2p_ptr, p2t_ptr, cta_expert_ptr, cta_limit_ptr, num_ctas_ptr,
-                                num_padded_ptr, M, local_start, n_groups, my_group, K, PE, TILE, NL, NLP,
-                                MAX_CTAS_PER_EXPERT, DEA, SORT)
+        _q35_route_tables_phase(
+            ids_ptr,
+            e2p_ptr,
+            p2t_ptr,
+            cta_expert_ptr,
+            cta_limit_ptr,
+            num_ctas_ptr,
+            num_padded_ptr,
+            M,
+            local_start,
+            n_groups,
+            my_group,
+            K,
+            PE,
+            TILE,
+            NL,
+            NLP,
+            MAX_CTAS_PER_EXPERT,
+            DEA,
+            SORT,
+        )
 
 
 @triton.jit
-def _q35_route_tables_phase(ids_ptr, e2p_ptr, p2t_ptr, cta_expert_ptr, cta_limit_ptr, num_ctas_ptr,
-                            num_padded_ptr, M, local_start, n_groups, my_group, K: tl.constexpr,
-                            PE: tl.constexpr, TILE: tl.constexpr, NL: tl.constexpr, NLP: tl.constexpr,
-                            MAX_CTAS_PER_EXPERT: tl.constexpr, DEA: tl.constexpr, SORT: tl.constexpr = True):
+def _q35_route_tables_phase(
+    ids_ptr,
+    e2p_ptr,
+    p2t_ptr,
+    cta_expert_ptr,
+    cta_limit_ptr,
+    num_ctas_ptr,
+    num_padded_ptr,
+    M,
+    local_start,
+    n_groups,
+    my_group,
+    K: tl.constexpr,
+    PE: tl.constexpr,
+    TILE: tl.constexpr,
+    NL: tl.constexpr,
+    NLP: tl.constexpr,
+    MAX_CTAS_PER_EXPERT: tl.constexpr,
+    DEA: tl.constexpr,
+    SORT: tl.constexpr = True,
+):
     """Phase 2 of _q35_route_core: the routing tables over the M * K expanded picks.
     SORT=False: each pick's row inside its expert block (expanded-index order, as the stable sort gives) is
     counted directly over chunks of the other picks instead of tl.sort; same tables."""
@@ -450,8 +489,7 @@ def _q35_route_tables_phase(ids_ptr, e2p_ptr, p2t_ptr, cta_expert_ptr, cta_limit
     if DEA:
         present = (count > 0).to(tl.int32)
         ordinal = tl.cumsum(present, axis=0) - present
-        count = tl.where((present > 0) & ((ordinal % n_groups) == my_group),
-                         count, 0)
+        count = tl.where((present > 0) & ((ordinal % n_groups) == my_group), count, 0)
         local = local & (tl.gather(count, tl.where(local, lid, 0), axis=0) > 0)
     num_cta = (count + TILE - 1) // TILE
     offs = tl.cumsum(num_cta, axis=0) - num_cta
@@ -463,11 +501,9 @@ def _q35_route_tables_phase(ids_ptr, e2p_ptr, p2t_ptr, cta_expert_ptr, cta_limit
         s_ei = sk & 4095
         s_local = s_lid < NL
         s_lid0 = tl.where(s_local, s_lid, 0)
-        s_perm = (tl.gather(offs, s_lid0, axis=0) * TILE + ei -
-                  tl.gather(row_start, s_lid0, axis=0))
+        s_perm = tl.gather(offs, s_lid0, axis=0) * TILE + ei - tl.gather(row_start, s_lid0, axis=0)
         tl.store(e2p_ptr + s_ei, s_perm, mask=s_local)
-        tl.store(e2p_ptr + ei, tl.full([PE], -1, tl.int32),
-                 mask=valid & (local == 0))
+        tl.store(e2p_ptr + ei, tl.full([PE], -1, tl.int32), mask=valid & (local == 0))
         tl.store(p2t_ptr + s_perm, s_ei // K, mask=s_local)
     else:
         CH: tl.constexpr = 32 if PE >= 32 else PE
@@ -487,33 +523,73 @@ def _q35_route_tables_phase(ids_ptr, e2p_ptr, p2t_ptr, cta_expert_ptr, cta_limit
         has = expert & (c < num_cta)
         cta = offs + c
         tl.store(cta_expert_ptr + cta, e, mask=has)
-        tl.store(cta_limit_ptr + cta,
-                 tl.minimum((cta + 1) * TILE, offs * TILE + count),
-                 mask=has)
+        tl.store(cta_limit_ptr + cta, tl.minimum((cta + 1) * TILE, offs * TILE + count), mask=has)
     total = tl.sum(num_cta, axis=0)
     tl.store(num_ctas_ptr, total)
     tl.store(num_padded_ptr, total * TILE)
 
 
 @triton.jit
-def _q35_route_cta_kernel(logits_ptr, ids_ptr, w_ptr, e2p_ptr, p2t_ptr,
-                          cta_expert_ptr, cta_limit_ptr, num_ctas_ptr,
-                          num_padded_ptr, M, local_start, n_groups, my_group,
-                          E: tl.constexpr, K: tl.constexpr, KP: tl.constexpr,
-                          MP: tl.constexpr, RB: tl.constexpr, PE: tl.constexpr,
-                          TILE: tl.constexpr,
-                          NL: tl.constexpr, NLP: tl.constexpr,
-                          MAX_CTAS_PER_EXPERT: tl.constexpr, DEA: tl.constexpr,
-                          USE_PDL: tl.constexpr, PHASES: tl.constexpr = 3,
-                          SORT: tl.constexpr = True):
+def _q35_route_cta_kernel(
+    logits_ptr,
+    ids_ptr,
+    w_ptr,
+    e2p_ptr,
+    p2t_ptr,
+    cta_expert_ptr,
+    cta_limit_ptr,
+    num_ctas_ptr,
+    num_padded_ptr,
+    M,
+    local_start,
+    n_groups,
+    my_group,
+    E: tl.constexpr,
+    K: tl.constexpr,
+    KP: tl.constexpr,
+    MP: tl.constexpr,
+    RB: tl.constexpr,
+    PE: tl.constexpr,
+    TILE: tl.constexpr,
+    NL: tl.constexpr,
+    NLP: tl.constexpr,
+    MAX_CTAS_PER_EXPERT: tl.constexpr,
+    DEA: tl.constexpr,
+    USE_PDL: tl.constexpr,
+    PHASES: tl.constexpr = 3,
+    SORT: tl.constexpr = True,
+):
     """Standalone single-program route + tables (PDL dependent of the router)."""
     if USE_PDL:
         _gdc_wait_with_memory_clobber()
-    _q35_route_core(logits_ptr, ids_ptr, w_ptr, e2p_ptr, p2t_ptr,
-                    cta_expert_ptr, cta_limit_ptr, num_ctas_ptr,
-                    num_padded_ptr, M, local_start, n_groups, my_group, E, K,
-                    KP, MP, RB, PE, TILE, NL, NLP, MAX_CTAS_PER_EXPERT, DEA,
-                    PHASES, SORT)
+    _q35_route_core(
+        logits_ptr,
+        ids_ptr,
+        w_ptr,
+        e2p_ptr,
+        p2t_ptr,
+        cta_expert_ptr,
+        cta_limit_ptr,
+        num_ctas_ptr,
+        num_padded_ptr,
+        M,
+        local_start,
+        n_groups,
+        my_group,
+        E,
+        K,
+        KP,
+        MP,
+        RB,
+        PE,
+        TILE,
+        NL,
+        NLP,
+        MAX_CTAS_PER_EXPERT,
+        DEA,
+        PHASES,
+        SORT,
+    )
     if USE_PDL:
         tl.debug_barrier()
         tl.extra.cuda.gdc_launch_dependents()
@@ -591,21 +667,46 @@ def _q35_router_gemm_kernel(
         if QUANT:
             if USE_PDL:
                 _gdc_wait_with_memory_clobber()
-            _nvfp4_quant_row(x_ptr, x_row_stride, gs_ptr, xq_ptr, xsf_ptr,
-                             (pid - NB * SPLITK).to(tl.int64), K)
+            _nvfp4_quant_row(
+                x_ptr, x_row_stride, gs_ptr, xq_ptr, xsf_ptr, (pid - NB * SPLITK).to(tl.int64), K
+            )
             if ROUTE == 2:
                 # acquire: every N block's logits (released before its ticket)
                 done = tl.atomic_add(rcnt_ptr, 0, sem="acquire", scope="gpu")
                 while done < NB:
                     done = tl.atomic_add(rcnt_ptr, 0, sem="acquire", scope="gpu")
                 _fence_acq_rel_gpu()
-                _q35_route_token(pid - NB * SPLITK, out_ptr, ids_ptr, wts_ptr,
-                                 hist_ptr, rank_ptr, counter_ptr, e2p_ptr,
-                                 p2t_ptr, cta_expert_ptr, cta_limit_ptr,
-                                 num_ctas_ptr, num_padded_ptr, rcnt_ptr, M,
-                                 local_start, n_groups, my_group, N, TOPK, KP,
-                                 TILE, NL, NLP, EXPANDED_PAD,
-                                 MAX_CTAS_PER_EXPERT, DEA, True, True)
+                _q35_route_token(
+                    pid - NB * SPLITK,
+                    out_ptr,
+                    ids_ptr,
+                    wts_ptr,
+                    hist_ptr,
+                    rank_ptr,
+                    counter_ptr,
+                    e2p_ptr,
+                    p2t_ptr,
+                    cta_expert_ptr,
+                    cta_limit_ptr,
+                    num_ctas_ptr,
+                    num_padded_ptr,
+                    rcnt_ptr,
+                    M,
+                    local_start,
+                    n_groups,
+                    my_group,
+                    N,
+                    TOPK,
+                    KP,
+                    TILE,
+                    NL,
+                    NLP,
+                    EXPANDED_PAD,
+                    MAX_CTAS_PER_EXPERT,
+                    DEA,
+                    True,
+                    True,
+                )
     else:
         pid_n = pid % NB
         pid_k = pid // NB
@@ -615,12 +716,11 @@ def _q35_router_gemm_kernel(
         w = tl.load(w_ptr + rn[:, None] * K + rk[None, :])  # [BN, KS]
         if USE_PDL:
             _gdc_wait_with_memory_clobber()
-        xt = tl.load(x_ptr + rm[:, None] * x_row_stride + rk[None, :],
-                     mask=(rm < M)[:, None],
-                     other=0.0)  # [BM, KS]
+        xt = tl.load(
+            x_ptr + rm[:, None] * x_row_stride + rk[None, :], mask=(rm < M)[:, None], other=0.0
+        )  # [BM, KS]
         acc = tl.dot(xt, tl.trans(w), out_dtype=tl.float32)  # [BM, BN]
-        tl.store(part_ptr + (pid_k * BM + rm[:, None]) * N + rn[None, :],
-                 acc)
+        tl.store(part_ptr + (pid_k * BM + rm[:, None]) * N + rn[None, :], acc)
         _fence_acq_rel_gpu()
         tl.debug_barrier()
         prev = tl.atomic_add(cnt_ptr + pid_n, 1, sem="acq_rel", scope="gpu")
@@ -628,12 +728,10 @@ def _q35_router_gemm_kernel(
             _fence_acq_rel_gpu()
             tot = tl.zeros([BM, BN], dtype=tl.float32)
             for s in tl.static_range(SPLITK):
-                tot += tl.load(part_ptr + (s * BM + rm[:, None]) * N +
-                               rn[None, :],
-                               volatile=True)
-            tl.store(out_ptr + rm[:, None] * N + rn[None, :],
-                     tot.to(tl.bfloat16),
-                     mask=(rm < M)[:, None])
+                tot += tl.load(part_ptr + (s * BM + rm[:, None]) * N + rn[None, :], volatile=True)
+            tl.store(
+                out_ptr + rm[:, None] * N + rn[None, :], tot.to(tl.bfloat16), mask=(rm < M)[:, None]
+            )
             tl.atomic_xchg(cnt_ptr + pid_n, 0, sem="relaxed", scope="gpu")
             if ROUTE == 2:
                 # release this N block's logits to the token programs (the last of them
@@ -647,12 +745,32 @@ def _q35_router_gemm_kernel(
                 done = tl.atomic_add(rcnt_ptr, 1, sem="acq_rel", scope="gpu")
                 if done == NB - 1:
                     _fence_acq_rel_gpu()
-                    _q35_route_core(out_ptr, ids_ptr, wts_ptr, e2p_ptr,
-                                    p2t_ptr, cta_expert_ptr, cta_limit_ptr,
-                                    num_ctas_ptr, num_padded_ptr, M,
-                                    local_start, n_groups, my_group, N, TOPK,
-                                    KP, MP, RB, PE, TILE, NL, NLP,
-                                    MAX_CTAS_PER_EXPERT, DEA)
+                    _q35_route_core(
+                        out_ptr,
+                        ids_ptr,
+                        wts_ptr,
+                        e2p_ptr,
+                        p2t_ptr,
+                        cta_expert_ptr,
+                        cta_limit_ptr,
+                        num_ctas_ptr,
+                        num_padded_ptr,
+                        M,
+                        local_start,
+                        n_groups,
+                        my_group,
+                        N,
+                        TOPK,
+                        KP,
+                        MP,
+                        RB,
+                        PE,
+                        TILE,
+                        NL,
+                        NLP,
+                        MAX_CTAS_PER_EXPERT,
+                        DEA,
+                    )
                     tl.atomic_xchg(rcnt_ptr, 0, sem="relaxed", scope="gpu")
     if USE_PDL and not EARLY_TRIGGER:
         tl.debug_barrier()
@@ -660,12 +778,12 @@ def _q35_router_gemm_kernel(
 
 
 @triton.jit
-def _q35_quant_rows_kernel(x_ptr, x_row_stride, gs_ptr, xq_ptr, xsf_ptr,
-                           H: tl.constexpr, USE_PDL: tl.constexpr):
+def _q35_quant_rows_kernel(
+    x_ptr, x_row_stride, gs_ptr, xq_ptr, xsf_ptr, H: tl.constexpr, USE_PDL: tl.constexpr
+):
     if USE_PDL:
         _gdc_wait_with_memory_clobber()
-    _nvfp4_quant_row(x_ptr, x_row_stride, gs_ptr, xq_ptr, xsf_ptr,
-                     tl.program_id(0).to(tl.int64), H)
+    _nvfp4_quant_row(x_ptr, x_row_stride, gs_ptr, xq_ptr, xsf_ptr, tl.program_id(0).to(tl.int64), H)
     if USE_PDL:
         tl.debug_barrier()
         tl.extra.cuda.gdc_launch_dependents()
@@ -679,24 +797,19 @@ def q35_nvfp4_quant(x: torch.Tensor, global_scale: torch.Tensor):
     xq = torch.empty((m, h // 2), dtype=torch.uint8, device=x.device)
     xsf = torch.empty((m, h // 16), dtype=torch.uint8, device=x.device)
     use_pdl = _pdl_enabled()
-    _q35_quant_rows_kernel[(m, )](x,
-                                  x.stride(0),
-                                  global_scale,
-                                  xq,
-                                  xsf,
-                                  H=h,
-                                  USE_PDL=use_pdl,
-                                  num_warps=8,
-                                  launch_pdl=use_pdl)
+    _q35_quant_rows_kernel[(m,)](
+        x, x.stride(0), global_scale, xq, xsf, H=h, USE_PDL=use_pdl, num_warps=8, launch_pdl=use_pdl
+    )
     return xq, xsf
 
 
-def q35_lowm_router(x: torch.Tensor,
-                    weight: torch.Tensor,
-                    global_scale: Optional[torch.Tensor] = None):
+def q35_lowm_router(
+    x: torch.Tensor, weight: torch.Tensor, global_scale: Optional[torch.Tensor] = None
+):
     """Router logits on the low-M BF16 GEMM (modules/lowm_linear.py), NVFP4 quant first.
     Returns None when the low-M kernel does not take the shape."""
     from ..lowm_linear import lowm_bf16_gemm
+
     m = x.shape[0]
     tactic = None if m <= 16 else (16, 1)
     q = q35_nvfp4_quant(x, global_scale) if global_scale is not None else None
@@ -721,12 +834,14 @@ class Q35RouterGemm:
         self.hist = None
         self.counter = None
 
-    def __call__(self,
-                 x: torch.Tensor,
-                 weight: torch.Tensor,
-                 global_scale: Optional[torch.Tensor] = None,
-                 route: Optional[tuple] = None,
-                 route_mode: Optional[int] = None):
+    def __call__(
+        self,
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        global_scale: Optional[torch.Tensor] = None,
+        route: Optional[tuple] = None,
+        route_mode: Optional[int] = None,
+    ):
         """logits [M, N] bf16; with ``global_scale`` also returns the NVFP4
         quantization of x: (logits, xq [M, K/2] u8, xsf [M, K/16] u8). With
         ``route`` = (top_k, local_start, num_local, tile, flat tables,
@@ -744,12 +859,8 @@ class Q35RouterGemm:
         bm = 16 if m <= 16 else 32
         dev = x.device
         if self.part is None or self.part.device != dev:
-            self.part = torch.empty((self.SPLITK, 32, n),
-                                    dtype=torch.float32,
-                                    device=dev)
-            self.cnt = torch.zeros((n // self.BN, ),
-                                   dtype=torch.int32,
-                                   device=dev)
+            self.part = torch.empty((self.SPLITK, 32, n), dtype=torch.float32, device=dev)
+            self.cnt = torch.zeros((n // self.BN,), dtype=torch.int32, device=dev)
         out = torch.empty((m, n), dtype=torch.bfloat16, device=dev)
         quant = global_scale is not None
         if quant:
@@ -768,7 +879,7 @@ class Q35RouterGemm:
             top_k, local_start, num_local, tile, flat, dea = route
             assert quant and top_k <= 10 and (n & (n - 1)) == 0
             if self.rcnt is None or self.rcnt.device != dev:
-                self.rcnt = torch.zeros((1, ), dtype=torch.int32, device=dev)
+                self.rcnt = torch.zeros((1,), dtype=torch.int32, device=dev)
             ids = torch.empty((m, top_k), dtype=torch.int32, device=dev)
             wts = torch.empty((m, top_k), dtype=torch.bfloat16, device=dev)
             tables = q35_prerouted_views(flat, m, top_k, num_local, tile)
@@ -776,33 +887,53 @@ class Q35RouterGemm:
             if mode == 2:
                 nlp = triton.next_power_of_2(num_local)
                 if self.hist is None or self.hist.numel() < nlp or self.hist.device != dev:
-                    self.hist = torch.zeros((nlp, ), dtype=torch.int32, device=dev)
-                    self.counter = torch.zeros((1, ), dtype=torch.int32, device=dev)
-                rank = torch.empty((m * top_k, ), dtype=torch.int32, device=dev)
+                    self.hist = torch.zeros((nlp,), dtype=torch.int32, device=dev)
+                    self.counter = torch.zeros((1,), dtype=torch.int32, device=dev)
+                rank = torch.empty((m * top_k,), dtype=torch.int32, device=dev)
                 scratch = (self.hist, rank, self.counter)
             else:
                 nlp = triton.next_power_of_2(num_local + 1)
-                scratch = (self.cnt, ) * 3
-            rkw = dict(TOPK=top_k,
-                       KP=16,
-                       MP=mp,
-                       RB=min(8, mp),
-                       PE=mp * 16,
-                       TILE=tile,
-                       NL=num_local,
-                       NLP=nlp,
-                       MAX_CTAS_PER_EXPERT=triton.cdiv(
-                           Q35_MOE_FUSED_FRONT_MAX_TOKENS, tile),
-                       DEA=dea is not None,
-                       EXPANDED_PAD=triton.next_power_of_2(
-                           Q35_MOE_FUSED_FRONT_MAX_TOKENS * top_k))
-            rargs = (self.rcnt, ids, wts, *tables, *scratch, m, local_start,
-                     dea[0] if dea else 1, dea[1] if dea else 0)
+                scratch = (self.cnt,) * 3
+            rkw = dict(
+                TOPK=top_k,
+                KP=16,
+                MP=mp,
+                RB=min(8, mp),
+                PE=mp * 16,
+                TILE=tile,
+                NL=num_local,
+                NLP=nlp,
+                MAX_CTAS_PER_EXPERT=triton.cdiv(Q35_MOE_FUSED_FRONT_MAX_TOKENS, tile),
+                DEA=dea is not None,
+                EXPANDED_PAD=triton.next_power_of_2(Q35_MOE_FUSED_FRONT_MAX_TOKENS * top_k),
+            )
+            rargs = (
+                self.rcnt,
+                ids,
+                wts,
+                *tables,
+                *scratch,
+                m,
+                local_start,
+                dea[0] if dea else 1,
+                dea[1] if dea else 0,
+            )
         else:
-            rkw = dict(TOPK=1, KP=16, MP=2, RB=2, PE=32, TILE=8, NL=1, NLP=2,
-                       MAX_CTAS_PER_EXPERT=1, DEA=False, EXPANDED_PAD=16)
-            rargs = (self.cnt, ) * 12 + (m, 0, 1, 0)
-        _q35_router_gemm_kernel[(grid, )](
+            rkw = dict(
+                TOPK=1,
+                KP=16,
+                MP=2,
+                RB=2,
+                PE=32,
+                TILE=8,
+                NL=1,
+                NLP=2,
+                MAX_CTAS_PER_EXPERT=1,
+                DEA=False,
+                EXPANDED_PAD=16,
+            )
+            rargs = (self.cnt,) * 12 + (m, 0, 1, 0)
+        _q35_router_gemm_kernel[(grid,)](
             x,
             x.stride(0),
             weight,
@@ -925,30 +1056,78 @@ def _q35_route_tables_kernel(
         _gdc_wait_with_memory_clobber()
     pid = tl.program_id(0)
     if QUANT_H > 0 and pid >= M:
-        _nvfp4_quant_row(x_ptr, x_row_stride, gs_ptr, xq_ptr, xsf_ptr,
-                         (pid - M).to(tl.int64), QUANT_H)
+        _nvfp4_quant_row(
+            x_ptr, x_row_stride, gs_ptr, xq_ptr, xsf_ptr, (pid - M).to(tl.int64), QUANT_H
+        )
     else:
-        _q35_route_token(pid, logits_ptr, ids_ptr, w_ptr, hist_ptr, rank_ptr,
-                         counter_ptr, e2p_ptr, p2t_ptr, cta_expert_ptr,
-                         cta_limit_ptr, num_ctas_ptr, num_padded_ptr,
-                         counter_ptr, M, local_start, n_groups, my_group, E, K,
-                         KP, TILE, NL, NLP, EXPANDED_PAD, MAX_CTAS_PER_EXPERT,
-                         DEA, False, False)
+        _q35_route_token(
+            pid,
+            logits_ptr,
+            ids_ptr,
+            w_ptr,
+            hist_ptr,
+            rank_ptr,
+            counter_ptr,
+            e2p_ptr,
+            p2t_ptr,
+            cta_expert_ptr,
+            cta_limit_ptr,
+            num_ctas_ptr,
+            num_padded_ptr,
+            counter_ptr,
+            M,
+            local_start,
+            n_groups,
+            my_group,
+            E,
+            K,
+            KP,
+            TILE,
+            NL,
+            NLP,
+            EXPANDED_PAD,
+            MAX_CTAS_PER_EXPERT,
+            DEA,
+            False,
+            False,
+        )
     if USE_PDL and not EARLY_TRIGGER:
         tl.debug_barrier()
         tl.extra.cuda.gdc_launch_dependents()
 
 
 @triton.jit
-def _q35_route_token(row, logits_ptr, ids_ptr, w_ptr, hist_ptr, rank_ptr,
-                     counter_ptr, e2p_ptr, p2t_ptr, cta_expert_ptr,
-                     cta_limit_ptr, num_ctas_ptr, num_padded_ptr, reset_ptr,
-                     M, local_start, n_groups, my_group, E: tl.constexpr,
-                     K: tl.constexpr, KP: tl.constexpr, TILE: tl.constexpr,
-                     NL: tl.constexpr, NLP: tl.constexpr,
-                     EXPANDED_PAD: tl.constexpr,
-                     MAX_CTAS_PER_EXPERT: tl.constexpr, DEA: tl.constexpr,
-                     LOGITS_L2: tl.constexpr, RESET: tl.constexpr):
+def _q35_route_token(
+    row,
+    logits_ptr,
+    ids_ptr,
+    w_ptr,
+    hist_ptr,
+    rank_ptr,
+    counter_ptr,
+    e2p_ptr,
+    p2t_ptr,
+    cta_expert_ptr,
+    cta_limit_ptr,
+    num_ctas_ptr,
+    num_padded_ptr,
+    reset_ptr,
+    M,
+    local_start,
+    n_groups,
+    my_group,
+    E: tl.constexpr,
+    K: tl.constexpr,
+    KP: tl.constexpr,
+    TILE: tl.constexpr,
+    NL: tl.constexpr,
+    NLP: tl.constexpr,
+    EXPANDED_PAD: tl.constexpr,
+    MAX_CTAS_PER_EXPERT: tl.constexpr,
+    DEA: tl.constexpr,
+    LOGITS_L2: tl.constexpr,
+    RESET: tl.constexpr,
+):
     """The per-token route + tables work of one program (see
     _q35_route_tables_kernel). LOGITS_L2: the logits were written by other
     programs of this launch (L2 loads after the caller's acquire). RESET: the
@@ -979,11 +1158,13 @@ def _q35_route_token(row, logits_ptr, ids_ptr, w_ptr, hist_ptr, rank_ptr,
     # round trip overlaps the softmax.
     lid = picked - local_start
     local = kmask & (lid >= 0) & (lid < NL)
-    rank = tl.atomic_add(hist_ptr + tl.where(local, lid, 0),
-                         tl.full([KP], 1, tl.int32),
-                         mask=local,
-                         sem="relaxed",
-                         scope="gpu")
+    rank = tl.atomic_add(
+        hist_ptr + tl.where(local, lid, 0),
+        tl.full([KP], 1, tl.int32),
+        mask=local,
+        sem="relaxed",
+        scope="gpu",
+    )
     vmax = tl.max(tl.where(kmask, vals, float("-inf")), axis=0)
     ex = tl.where(kmask, tl.extra.cuda.libdevice.exp(vals - vmax), 0.0)
     e0 = tl.sum(tl.where(slots == 0, ex, 0.0), axis=0)
@@ -1019,17 +1200,16 @@ def _q35_route_token(row, logits_ptr, ids_ptr, w_ptr, hist_ptr, rank_ptr,
         if DEA:
             present = (count > 0).to(tl.int32)
             ordinal = tl.cumsum(present, axis=0) - present
-            count = tl.where((present > 0) & ((ordinal % n_groups) == my_group),
-                             count, 0)
+            count = tl.where((present > 0) & ((ordinal % n_groups) == my_group), count, 0)
         num_cta = (count + TILE - 1) // TILE
         offs = tl.cumsum(num_cta, axis=0) - num_cta
         for c in tl.static_range(MAX_CTAS_PER_EXPERT):
             has = expert & (c < num_cta)
             cta = offs + c
             tl.store(cta_expert_ptr + cta, e, mask=has)
-            tl.store(cta_limit_ptr + cta,
-                     tl.minimum((cta + 1) * TILE, offs * TILE + count),
-                     mask=has)
+            tl.store(
+                cta_limit_ptr + cta, tl.minimum((cta + 1) * TILE, offs * TILE + count), mask=has
+            )
         total = tl.sum(num_cta, axis=0)
         tl.store(num_ctas_ptr, total)
         tl.store(num_padded_ptr, total * TILE)
@@ -1037,8 +1217,7 @@ def _q35_route_token(row, logits_ptr, ids_ptr, w_ptr, hist_ptr, rank_ptr,
         glocal = valid & (glid >= 0) & (glid < NL)
         if DEA:
             # only picks of this group's experts (they have >= 1 CTA)
-            glocal = glocal & (tl.gather(num_cta, tl.where(glocal, glid, 0),
-                                         axis=0) > 0)
+            glocal = glocal & (tl.gather(num_cta, tl.where(glocal, glid, 0), axis=0) > 0)
         permuted = tl.gather(offs, tl.where(glocal, glid, 0), axis=0) * TILE + grank
         tl.store(e2p_ptr + i, tl.where(glocal, permuted, -1), mask=valid)
         tl.store(p2t_ptr + permuted, i // K, mask=glocal)
@@ -1047,14 +1226,12 @@ def _q35_route_token(row, logits_ptr, ids_ptr, w_ptr, hist_ptr, rank_ptr,
             tl.store(reset_ptr, 0)
 
 
-def trtllm_gen_max_padded(num_tokens: int, top_k: int, num_experts: int,
-                          tile: int) -> int:
+def trtllm_gen_max_padded(num_tokens: int, top_k: int, num_experts: int, tile: int) -> int:
     """getMaxPermutedPaddedCount (trtllmGen blockScaleMoe runner.h)."""
     return max_num_tiles(num_tokens, top_k, num_experts, tile) * tile
 
 
-def q35_prerouted_sizes(num_tokens: int, top_k: int, num_local: int,
-                        tile: int):
+def q35_prerouted_sizes(num_tokens: int, top_k: int, num_local: int, tile: int):
     """int32 sizes of the routing tables packed in one flat buffer, in the order
     run_moe_prerouted takes them: expanded -> permuted index, permuted index ->
     token (one tile of slack past the route map), CTA -> local expert, CTA -> row
@@ -1064,10 +1241,9 @@ def q35_prerouted_sizes(num_tokens: int, top_k: int, num_local: int,
     return [num_tokens * top_k, (max_ctas + 1) * tile, max_ctas, max_ctas, 1, 1]
 
 
-def q35_prerouted_views(flat: torch.Tensor, num_tokens: int, top_k: int,
-                        num_local: int, tile: int):
+def q35_prerouted_views(flat: torch.Tensor, num_tokens: int, top_k: int, num_local: int, tile: int):
     sizes = q35_prerouted_sizes(num_tokens, top_k, num_local, tile)
-    return list(torch.split(flat[:sum(sizes)], sizes))
+    return list(torch.split(flat[: sum(sizes)], sizes))
 
 
 # Tile of the tactic the MoE op last ran a table buffer's shape with (by data pointer;
@@ -1091,24 +1267,26 @@ class Q35RouteTables:
         self.hist = None
         self.counter = None
 
-    def __call__(self,
-                 logits: torch.Tensor,
-                 top_k: int,
-                 local_start: int,
-                 num_local: int,
-                 tile: int,
-                 weight_dtype=torch.bfloat16,
-                 flat: Optional[torch.Tensor] = None,
-                 dea_groups: int = 0,
-                 dea_group: int = 0,
-                 single_program: bool = True,
-                 phases: int = 3,
-                 num_warps: int = 4,
-                 rb: Optional[int] = None,
-                 sort: bool = True,
-                 ids_in: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-                 x: Optional[torch.Tensor] = None,
-                 global_scale: Optional[torch.Tensor] = None):
+    def __call__(
+        self,
+        logits: torch.Tensor,
+        top_k: int,
+        local_start: int,
+        num_local: int,
+        tile: int,
+        weight_dtype=torch.bfloat16,
+        flat: Optional[torch.Tensor] = None,
+        dea_groups: int = 0,
+        dea_group: int = 0,
+        single_program: bool = True,
+        phases: int = 3,
+        num_warps: int = 4,
+        rb: Optional[int] = None,
+        sort: bool = True,
+        ids_in: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        x: Optional[torch.Tensor] = None,
+        global_scale: Optional[torch.Tensor] = None,
+    ):
         """dea_groups > 0: dynamic expert assignment (all experts local:
         local_start 0, num_local E), tables for group dea_group of dea_groups.
         single_program: one program routes all tokens (_q35_route_cta_kernel,
@@ -1127,24 +1305,26 @@ class Q35RouteTables:
         dev = logits.device
         nlp = triton.next_power_of_2(num_local)
         if self.hist is None or self.hist.numel() < nlp or self.hist.device != dev:
-            self.hist = torch.zeros((nlp, ), dtype=torch.int32, device=dev)
-            self.counter = torch.zeros((1, ), dtype=torch.int32, device=dev)
+            self.hist = torch.zeros((nlp,), dtype=torch.int32, device=dev)
+            self.counter = torch.zeros((1,), dtype=torch.int32, device=dev)
         if phases == 2:
             ids, wts = ids_in  # tables only (bench diagnostics)
         else:
             ids = torch.empty((m, top_k), dtype=torch.int32, device=dev)
             wts = torch.empty((m, top_k), dtype=weight_dtype, device=dev)
-        rank = torch.empty((m * top_k, ), dtype=torch.int32, device=dev)
+        rank = torch.empty((m * top_k,), dtype=torch.int32, device=dev)
         if flat is None:
             flat = torch.empty(
-                (sum(q35_prerouted_sizes(m, top_k, num_local, tile)), ),
+                (sum(q35_prerouted_sizes(m, top_k, num_local, tile)),),
                 dtype=torch.int32,
-                device=dev)
+                device=dev,
+            )
         e2p, p2t, cta_expert, cta_limit, num_ctas, num_padded = q35_prerouted_views(
-            flat, m, top_k, num_local, tile)
+            flat, m, top_k, num_local, tile
+        )
         use_pdl = _pdl_enabled()
         if single_program:
-            _q35_route_cta_kernel[(1, )](
+            _q35_route_cta_kernel[(1,)](
                 logits,
                 ids,
                 wts,
@@ -1167,8 +1347,7 @@ class Q35RouteTables:
                 TILE=tile,
                 NL=num_local,
                 NLP=triton.next_power_of_2(num_local + 1),
-                MAX_CTAS_PER_EXPERT=triton.cdiv(
-                    Q35_MOE_FUSED_FRONT_MAX_TOKENS, tile),
+                MAX_CTAS_PER_EXPERT=triton.cdiv(Q35_MOE_FUSED_FRONT_MAX_TOKENS, tile),
                 DEA=dea_groups > 0,
                 USE_PDL=use_pdl,
                 PHASES=phases,
@@ -1186,7 +1365,7 @@ class Q35RouteTables:
             qargs = (x, x.stride(0), global_scale, xq, xsf)
         else:
             qargs = (logits, 0, self.counter, self.counter, self.counter)
-        self._compiled = _q35_route_tables_kernel[(2 * m if quant else m, )](
+        self._compiled = _q35_route_tables_kernel[(2 * m if quant else m,)](
             logits,
             ids,
             wts,
@@ -1210,10 +1389,8 @@ class Q35RouteTables:
             TILE=tile,
             NL=num_local,
             NLP=nlp,
-            EXPANDED_PAD=triton.next_power_of_2(
-                Q35_MOE_FUSED_FRONT_MAX_TOKENS * top_k),
-            MAX_CTAS_PER_EXPERT=triton.cdiv(Q35_MOE_FUSED_FRONT_MAX_TOKENS,
-                                            tile),
+            EXPANDED_PAD=triton.next_power_of_2(Q35_MOE_FUSED_FRONT_MAX_TOKENS * top_k),
+            MAX_CTAS_PER_EXPERT=triton.cdiv(Q35_MOE_FUSED_FRONT_MAX_TOKENS, tile),
             DEA=dea_groups > 0,
             USE_PDL=use_pdl,
             EARLY_TRIGGER=Q35_MOE_EARLY_TRIGGER_ROUTE,
@@ -1240,41 +1417,43 @@ class Q35PreRoute:
         self.big = None  # Q35FusedFrontBig (TRTLLM_Q35_MOE_FRONT_BIG=gemm), made on first use
         self.route_big = None  # Q35RouteBig (TRTLLM_Q35_MOE_FRONT_BIG=1), made on first use
 
-    def plan(self,
-             m: int,
-             top_k: int,
-             num_local: int,
-             device,
-             tile_hint: Optional[int] = None):
+    def plan(self, m: int, top_k: int, num_local: int, device, tile_hint: Optional[int] = None):
         """(flat table buffer, tile) for an m-token step. tile_hint: the tile of
         the tactic the autotuner holds for the shape (tables for any other tile
         would make the op fall back to its own routing). A buffer first needed
         during CUDA graph capture comes from the graph's pool and is kept with
         the layer (every rank must pre-route the same steps under DEA)."""
-        tile = (Q35_MOE_PREROUTE_TILE or tile_hint or self.tiles.get(m) or 8)
+        tile = Q35_MOE_PREROUTE_TILE or tile_hint or self.tiles.get(m) or 8
         flat = self.buffers.get((m, tile))
         chosen = q35_prerouted_tile_chosen(flat) if flat is not None else None
-        if (chosen is not None and chosen != tile and not Q35_MOE_PREROUTE_TILE
-                and tile_hint is None):
+        if (
+            chosen is not None
+            and chosen != tile
+            and not Q35_MOE_PREROUTE_TILE
+            and tile_hint is None
+        ):
             self.tiles[m] = tile = chosen
             flat = self.buffers.get((m, tile))
         if flat is None:
             flat = torch.empty(
-                (sum(q35_prerouted_sizes(m, top_k, num_local, tile)), ),
+                (sum(q35_prerouted_sizes(m, top_k, num_local, tile)),),
                 dtype=torch.int32,
-                device=device)
+                device=device,
+            )
             self.buffers[(m, tile)] = flat
         return flat, tile
 
-    def __call__(self,
-                 logits: torch.Tensor,
-                 top_k: int,
-                 local_start: int,
-                 num_local: int,
-                 dea: Optional[Tuple[int, int]] = None,
-                 tile_hint: Optional[int] = None,
-                 x: Optional[torch.Tensor] = None,
-                 global_scale: Optional[torch.Tensor] = None):
+    def __call__(
+        self,
+        logits: torch.Tensor,
+        top_k: int,
+        local_start: int,
+        num_local: int,
+        dea: Optional[Tuple[int, int]] = None,
+        tile_hint: Optional[int] = None,
+        x: Optional[torch.Tensor] = None,
+        global_scale: Optional[torch.Tensor] = None,
+    ):
         """(flat tables, tile, ids, bf16 weights, is_dea), or None. dea =
         (groups, my group) builds dynamic-expert-assignment tables. Separate
         launch of the per-token route + tables kernel (faster than the
@@ -1285,17 +1464,19 @@ class Q35PreRoute:
         if plan is None:
             return None
         flat, tile = plan
-        out = self.route(logits,
-                         top_k,
-                         local_start,
-                         num_local,
-                         tile,
-                         flat=flat,
-                         dea_groups=dea[0] if dea else 0,
-                         dea_group=dea[1] if dea else 0,
-                         single_program=False,
-                         x=x,
-                         global_scale=global_scale)
+        out = self.route(
+            logits,
+            top_k,
+            local_start,
+            num_local,
+            tile,
+            flat=flat,
+            dea_groups=dea[0] if dea else 0,
+            dea_group=dea[1] if dea else 0,
+            single_program=False,
+            x=x,
+            global_scale=global_scale,
+        )
         res = (flat, tile, out[0], out[1], dea is not None)
         return res + (out[8], out[9]) if x is not None else res
 
@@ -1327,6 +1508,7 @@ def q35_front_fused_k_warps(m: int, n: int, k: int) -> Optional[int]:
     tactic up to 16 rows, (16, 1) above), or None when the fused kernel cannot reproduce that GEMM (another
     tile shape or cluster split-K, e.g. through TRTLLM_Q35_LOWM_TACTIC)."""
     from ..lowm_linear import _tactic3, default_tactic
+
     try:
         tactic = default_tactic(m, n, k, False, False, "bf16") if m <= 16 else (16, 1)
     except ValueError:
@@ -1337,17 +1519,39 @@ def q35_front_fused_k_warps(m: int, n: int, k: int) -> Optional[int]:
     return k_warps
 
 
-def q35_front_fused_supported(x: torch.Tensor, weight: torch.Tensor, global_scale: torch.Tensor, num_local: int,
-                              tile: int, top_k: int) -> Optional[int]:
+def q35_front_fused_supported(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    global_scale: torch.Tensor,
+    num_local: int,
+    tile: int,
+    top_k: int,
+) -> Optional[int]:
     """k_warps of the fused front for this call, or None when it does not apply."""
     from ..lowm_linear import _device_supported
-    if not _device_supported() or x.dim() != 2 or x.dtype != torch.bfloat16 or weight.dtype != torch.bfloat16:
+
+    if (
+        not _device_supported()
+        or x.dim() != 2
+        or x.dtype != torch.bfloat16
+        or weight.dtype != torch.bfloat16
+    ):
         return None
     m, k = x.shape
     n = weight.shape[0]
-    if (not 1 <= m <= Q35_MOE_FUSED_FRONT_MAX_TOKENS or n != 512 or top_k != 10 or weight.shape[1] != k
-            or not weight.is_contiguous() or x.stride(1) != 1 or x.stride(0) % 8 or x.data_ptr() % 16
-            or k % 16 or global_scale.dtype != torch.float32 or global_scale.numel() != 1):
+    if (
+        not 1 <= m <= Q35_MOE_FUSED_FRONT_MAX_TOKENS
+        or n != 512
+        or top_k != 10
+        or weight.shape[1] != k
+        or not weight.is_contiguous()
+        or x.stride(1) != 1
+        or x.stride(0) % 8
+        or x.data_ptr() % 16
+        or k % 16
+        or global_scale.dtype != torch.float32
+        or global_scale.numel() != 1
+    ):
         return None
     if num_local % 32 or not 32 <= num_local <= n or tile & (tile - 1) or not 8 <= tile <= 256:
         return None
@@ -1357,8 +1561,20 @@ def q35_front_fused_supported(x: torch.Tensor, weight: torch.Tensor, global_scal
     return k_warps
 
 
-def _q35_front_compile(m: int, k: int, n: int, k_warps: int, num_local: int, tile: int, top_k: int, a_stride: int,
-                       use_pdl: bool, sync_mode: int, topk_mode: int, trace: bool):
+def _q35_front_compile(
+    m: int,
+    k: int,
+    n: int,
+    k_warps: int,
+    num_local: int,
+    tile: int,
+    top_k: int,
+    a_stride: int,
+    use_pdl: bool,
+    sync_mode: int,
+    topk_mode: int,
+    trace: bool,
+):
     key = (m, k, n, k_warps, num_local, tile, top_k, a_stride, use_pdl, sync_mode, topk_mode, trace)
     fn = _Q35_FRONT_COMPILED.get(key)
     if fn is None:
@@ -1370,17 +1586,46 @@ def _q35_front_compile(m: int, k: int, n: int, k_warps: int, num_local: int, til
 
         from ...cute_dsl_kernels.blackwell.q35_moe_front import Q35MoeFrontKernel
         from ..lowm_linear import _cute, _row_view
-        kernel = Q35MoeFrontKernel(num_rows=m, k_extent=k, k_warps=k_warps, use_pdl=use_pdl, num_experts=n,
-                                   top_k=top_k, num_local=num_local, tile=tile, a_stride=a_stride,
-                                   sync_mode=sync_mode, topk_mode=topk_mode, trace=trace)
+
+        kernel = Q35MoeFrontKernel(
+            num_rows=m,
+            k_extent=k,
+            k_warps=k_warps,
+            use_pdl=use_pdl,
+            num_experts=n,
+            top_k=top_k,
+            num_local=num_local,
+            tile=tile,
+            a_stride=a_stride,
+            sync_mode=sync_mode,
+            topk_mode=topk_mode,
+            trace=trace,
+        )
         dev = torch.device("cuda")
         a16 = _row_view(m, k, a_stride, torch.bfloat16, dev)
         w = torch.empty((n, k), dtype=torch.bfloat16, device=dev)
         c = torch.empty((m, n), dtype=torch.bfloat16, device=dev)
         z = cutlass.Int64(0)
         stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-        fn = (cute.compile(kernel, _cute(a16), _cute(w), _cute(c), z, z, z, z, z, z, z, z, cutlass.Int32(0),
-                           stream), kernel.ctas)
+        fn = (
+            cute.compile(
+                kernel,
+                _cute(a16),
+                _cute(w),
+                _cute(c),
+                z,
+                z,
+                z,
+                z,
+                z,
+                z,
+                z,
+                z,
+                cutlass.Int32(0),
+                stream,
+            ),
+            kernel.ctas,
+        )
         _Q35_FRONT_COMPILED[key] = fn
     return fn
 
@@ -1395,9 +1640,20 @@ class Q35FusedFront:
         self.stage = None
         self.trace_buf = None  # last trace build's stamps (debug)
 
-    def __call__(self, x: torch.Tensor, weight: torch.Tensor, global_scale: torch.Tensor, flat: torch.Tensor,
-                 tile: int, local_start: int, num_local: int, top_k: int, sync_mode: Optional[int] = None,
-                 topk_mode: Optional[int] = None, trace: bool = False):
+    def __call__(
+        self,
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        global_scale: torch.Tensor,
+        flat: torch.Tensor,
+        tile: int,
+        local_start: int,
+        num_local: int,
+        top_k: int,
+        sync_mode: Optional[int] = None,
+        topk_mode: Optional[int] = None,
+        trace: bool = False,
+    ):
         """(logits [m, E] bf16, xq [m, H/2] u8, xsf [m, H/16] u8, ids [m, K] int32, bf16 weights [m, K]) with the
         tables written into ``flat`` (q35_prerouted_views layout for (m, top_k, num_local, tile)); None when the
         fused kernel does not apply. sync_mode / topk_mode: TRTLLM_Q35_MOE_FRONT_SYNC / _TOPK by default."""
@@ -1412,8 +1668,20 @@ class Q35FusedFront:
             sync_mode = 0
         assert flat.dtype == torch.int32 and flat.is_contiguous()
         assert flat.numel() >= sum(q35_prerouted_sizes(m, top_k, num_local, tile))
-        compiled = _q35_front_compile(m, k, n, k_warps, num_local, tile, top_k, x.stride(0), _pdl_enabled(),
-                                      sync_mode, topk_mode, trace)
+        compiled = _q35_front_compile(
+            m,
+            k,
+            n,
+            k_warps,
+            num_local,
+            tile,
+            top_k,
+            x.stride(0),
+            _pdl_enabled(),
+            sync_mode,
+            topk_mode,
+            trace,
+        )
         if compiled is None:
             return None
         fn, ctas = compiled
@@ -1421,18 +1689,19 @@ class Q35FusedFront:
         import cutlass
 
         from ..lowm_linear import _cute
+
         dev = x.device
         if sync_mode == 1:
             if self.stage is None or self.stage.device != dev or self.stage.numel() < 32 * n:
-                self.stage = torch.zeros((32 * n, ), dtype=torch.int32, device=dev)
+                self.stage = torch.zeros((32 * n,), dtype=torch.int32, device=dev)
             sync = self.stage
         else:
             if self.ticket is None or self.ticket.device != dev:
-                self.ticket = torch.zeros((1, ), dtype=torch.int32, device=dev)
+                self.ticket = torch.zeros((1,), dtype=torch.int32, device=dev)
             sync = self.ticket
         trace_ptr = 0
         if trace:
-            self.trace_buf = torch.zeros(((ctas + 1) * 8, ), dtype=torch.int64, device=dev)
+            self.trace_buf = torch.zeros(((ctas + 1) * 8,), dtype=torch.int64, device=dev)
             trace_ptr = self.trace_buf.data_ptr()
         logits = torch.empty((m, n), dtype=torch.bfloat16, device=dev)
         xq = torch.empty((m, k // 2), dtype=torch.uint8, device=dev)
@@ -1440,9 +1709,21 @@ class Q35FusedFront:
         ids = torch.empty((m, top_k), dtype=torch.int32, device=dev)
         wts = torch.empty((m, top_k), dtype=torch.bfloat16, device=dev)
         p64 = lambda t: cutlass.Int64(t.data_ptr())  # noqa: E731
-        fn(_cute(x), _cute(weight), _cute(logits), p64(global_scale), p64(xq), p64(xsf), p64(ids), p64(wts),
-           p64(flat), p64(sync), cutlass.Int64(trace_ptr), cutlass.Int32(local_start),
-           cuda.CUstream(torch.cuda.current_stream().cuda_stream))
+        fn(
+            _cute(x),
+            _cute(weight),
+            _cute(logits),
+            p64(global_scale),
+            p64(xq),
+            p64(xsf),
+            p64(ids),
+            p64(wts),
+            p64(flat),
+            p64(sync),
+            cutlass.Int64(trace_ptr),
+            cutlass.Int32(local_start),
+            cuda.CUstream(torch.cuda.current_stream().cuda_stream),
+        )
         return logits, xq, xsf, ids, wts
 
 
@@ -1488,7 +1769,8 @@ Q35_MOE_FRONT_BIG = _Q35_MOE_FRONT_BIG_MODE in ("1", "route", "gemm")
 Q35_MOE_FRONT_BIG_GEMM = _Q35_MOE_FRONT_BIG_MODE == "gemm"
 # Token counts that take it (default 112 and 224: the target verify of CUDA-graph batches 16 and 32).
 Q35_MOE_FRONT_BIG_MS = frozenset(
-    int(v) for v in os.environ.get("TRTLLM_Q35_MOE_FRONT_BIG_MS", "112,224").split(",") if v.strip())
+    int(v) for v in os.environ.get("TRTLLM_Q35_MOE_FRONT_BIG_MS", "112,224").split(",") if v.strip()
+)
 # Router n-tiles (8 columns) per MMA warp of =gemm (0: one per 64 columns of the CTA tile). A/B knob.
 Q35_MOE_FRONT_BIG_TN = int(os.environ.get("TRTLLM_Q35_MOE_FRONT_BIG_TN", "0"))
 # Threads per CTA of the route-only launch (1024: one warp per token up to 256 tokens). A/B knob.
@@ -1501,9 +1783,35 @@ def _num_sms(device) -> int:
     return torch.cuda.get_device_properties(device).multi_processor_count
 
 
-def _q35_front_big_compile(m: int, k: int, n: int, num_local: int, tile: int, top_k: int, a_stride: int,
-                           use_pdl: bool, row_group: int, col_block: int, n_per_warp: int, trace: bool = False):
-    key = ("gemm", m, k, n, num_local, tile, top_k, a_stride, use_pdl, row_group, col_block, n_per_warp, trace)
+def _q35_front_big_compile(
+    m: int,
+    k: int,
+    n: int,
+    num_local: int,
+    tile: int,
+    top_k: int,
+    a_stride: int,
+    use_pdl: bool,
+    row_group: int,
+    col_block: int,
+    n_per_warp: int,
+    trace: bool = False,
+):
+    key = (
+        "gemm",
+        m,
+        k,
+        n,
+        num_local,
+        tile,
+        top_k,
+        a_stride,
+        use_pdl,
+        row_group,
+        col_block,
+        n_per_warp,
+        trace,
+    )
     if key in _Q35_FRONT_BIG_COMPILED:
         return _Q35_FRONT_BIG_COMPILED[key]  # None: the kernel does not take this shape
     if torch.cuda.is_current_stream_capturing():
@@ -1513,22 +1821,47 @@ def _q35_front_big_compile(m: int, k: int, n: int, num_local: int, tile: int, to
     import cutlass.cute as cute
 
     from ...cute_dsl_kernels.blackwell.q35_moe_front_big import Q35MoeFrontBigKernel
+
     try:
-        kernel = Q35MoeFrontBigKernel(num_rows=m, k_extent=k, num_experts=n, top_k=top_k, num_local=num_local,
-                                      tile=tile, a_stride=a_stride, row_group=row_group, col_block=col_block,
-                                      use_pdl=use_pdl, n_per_warp=n_per_warp, trace=trace)
+        kernel = Q35MoeFrontBigKernel(
+            num_rows=m,
+            k_extent=k,
+            num_experts=n,
+            top_k=top_k,
+            num_local=num_local,
+            tile=tile,
+            a_stride=a_stride,
+            row_group=row_group,
+            col_block=col_block,
+            use_pdl=use_pdl,
+            n_per_warp=n_per_warp,
+            trace=trace,
+        )
     except ValueError:
         _Q35_FRONT_BIG_COMPILED[key] = None
         return None
     z = cutlass.Int64(0)
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-    fn = (cute.compile(kernel, z, z, z, z, z, z, z, z, z, z, z, z, cutlass.Int32(0), stream), kernel.ctas)
+    fn = (
+        cute.compile(kernel, z, z, z, z, z, z, z, z, z, z, z, z, cutlass.Int32(0), stream),
+        kernel.ctas,
+    )
     _Q35_FRONT_BIG_COMPILED[key] = fn
     return fn
 
 
-def _q35_route_big_compile(m: int, k: int, n: int, num_local: int, tile: int, top_k: int, a_stride: int,
-                           use_pdl: bool, threads: int, trace: bool = False):
+def _q35_route_big_compile(
+    m: int,
+    k: int,
+    n: int,
+    num_local: int,
+    tile: int,
+    top_k: int,
+    a_stride: int,
+    use_pdl: bool,
+    threads: int,
+    trace: bool = False,
+):
     key = ("route", m, k, n, num_local, tile, top_k, a_stride, use_pdl, threads, trace)
     if key in _Q35_FRONT_BIG_COMPILED:
         return _Q35_FRONT_BIG_COMPILED[key]  # None: the kernel does not take this shape
@@ -1539,10 +1872,20 @@ def _q35_route_big_compile(m: int, k: int, n: int, num_local: int, tile: int, to
     import cutlass.cute as cute
 
     from ...cute_dsl_kernels.blackwell.q35_moe_front_big import Q35MoeRouteBigKernel
+
     try:
-        kernel = Q35MoeRouteBigKernel(num_rows=m, k_extent=k, num_experts=n, top_k=top_k, num_local=num_local,
-                                      tile=tile, a_stride=a_stride, use_pdl=use_pdl, threads=threads,
-                                      trace=trace)
+        kernel = Q35MoeRouteBigKernel(
+            num_rows=m,
+            k_extent=k,
+            num_experts=n,
+            top_k=top_k,
+            num_local=num_local,
+            tile=tile,
+            a_stride=a_stride,
+            use_pdl=use_pdl,
+            threads=threads,
+            trace=trace,
+        )
     except ValueError:
         _Q35_FRONT_BIG_COMPILED[key] = None
         return None
@@ -1560,30 +1903,73 @@ class Q35RouteBig:
     def __init__(self):
         self.trace_buf = None  # last trace build's stamps (debug)
 
-    def compiled(self, x: torch.Tensor, n: int, global_scale: torch.Tensor, tile: int, num_local: int, top_k: int,
-                 threads: Optional[int] = None, trace: bool = False):
+    def compiled(
+        self,
+        x: torch.Tensor,
+        n: int,
+        global_scale: torch.Tensor,
+        tile: int,
+        num_local: int,
+        top_k: int,
+        threads: Optional[int] = None,
+        trace: bool = False,
+    ):
         """The compiled launch for this call, or None when the kernel does not apply (checked before the router
         GEMM runs, so the caller can still take the stock path)."""
         from ..lowm_linear import _device_supported
+
         if not _device_supported() or x.dim() != 2 or x.dtype != torch.bfloat16:
             return None
         m, k = x.shape
-        if (m > 256 or n != 512 or top_k != 10 or k % 16 or x.stride(1) != 1 or x.stride(0) % 8
-                or x.data_ptr() % 16 or global_scale.dtype != torch.float32 or global_scale.numel() != 1):
+        if (
+            m > 256
+            or n != 512
+            or top_k != 10
+            or k % 16
+            or x.stride(1) != 1
+            or x.stride(0) % 8
+            or x.data_ptr() % 16
+            or global_scale.dtype != torch.float32
+            or global_scale.numel() != 1
+        ):
             return None
         if num_local % 32 or not 32 <= num_local <= n or tile & (tile - 1) or not 8 <= tile <= 256:
             return None
-        return _q35_route_big_compile(m, k, n, num_local, tile, top_k, x.stride(0), _pdl_enabled(),
-                                      threads or Q35_MOE_FRONT_BIG_THREADS, trace)
+        return _q35_route_big_compile(
+            m,
+            k,
+            n,
+            num_local,
+            tile,
+            top_k,
+            x.stride(0),
+            _pdl_enabled(),
+            threads or Q35_MOE_FRONT_BIG_THREADS,
+            trace,
+        )
 
-    def __call__(self, fn, logits: torch.Tensor, x: torch.Tensor, global_scale: torch.Tensor, flat: torch.Tensor,
-                 tile: int, local_start: int, num_local: int, top_k: int, trace: bool = False):
+    def __call__(
+        self,
+        fn,
+        logits: torch.Tensor,
+        x: torch.Tensor,
+        global_scale: torch.Tensor,
+        flat: torch.Tensor,
+        tile: int,
+        local_start: int,
+        num_local: int,
+        top_k: int,
+        trace: bool = False,
+    ):
         """(xq [m, H/2] u8, xsf [m, H/16] u8, ids [m, K] int32, bf16 weights [m, K]) with the tables written into
         ``flat`` (q35_prerouted_views layout for (m, top_k, num_local, tile))."""
         import cuda.bindings.driver as cuda
         import cutlass
+
         m, k = x.shape
-        assert logits.dtype == torch.bfloat16 and logits.is_contiguous() and logits.shape == (m, 512)
+        assert (
+            logits.dtype == torch.bfloat16 and logits.is_contiguous() and logits.shape == (m, 512)
+        )
         assert flat.dtype == torch.int32 and flat.is_contiguous()
         assert flat.numel() >= sum(q35_prerouted_sizes(m, top_k, num_local, tile))
         dev = x.device
@@ -1594,11 +1980,22 @@ class Q35RouteBig:
         fn, ctas = fn
         trace_ptr = 0
         if trace:
-            self.trace_buf = torch.zeros((ctas * 8, ), dtype=torch.int64, device=dev)
+            self.trace_buf = torch.zeros((ctas * 8,), dtype=torch.int64, device=dev)
             trace_ptr = self.trace_buf.data_ptr()
         p64 = lambda t: cutlass.Int64(t.data_ptr())  # noqa: E731
-        fn(p64(logits), p64(x), p64(global_scale), p64(xq), p64(xsf), p64(ids), p64(wts), p64(flat),
-           cutlass.Int64(trace_ptr), cutlass.Int32(local_start), cuda.CUstream(torch.cuda.current_stream().cuda_stream))
+        fn(
+            p64(logits),
+            p64(x),
+            p64(global_scale),
+            p64(xq),
+            p64(xsf),
+            p64(ids),
+            p64(wts),
+            p64(flat),
+            cutlass.Int64(trace_ptr),
+            cutlass.Int32(local_start),
+            cuda.CUstream(torch.cuda.current_stream().cuda_stream),
+        )
         return xq, xsf, ids, wts
 
 
@@ -1610,21 +2007,52 @@ class Q35FusedFrontBig:
         self.state = None
         self.trace_buf = None  # last trace build's stamps (debug)
 
-    def __call__(self, x: torch.Tensor, weight: torch.Tensor, global_scale: torch.Tensor, flat: torch.Tensor,
-                 tile: int, local_start: int, num_local: int, top_k: int, n_per_warp: Optional[int] = None,
-                 trace: bool = False):
+    def __call__(
+        self,
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        global_scale: torch.Tensor,
+        flat: torch.Tensor,
+        tile: int,
+        local_start: int,
+        num_local: int,
+        top_k: int,
+        n_per_warp: Optional[int] = None,
+        trace: bool = False,
+    ):
         """(logits [m, E] bf16, xq [m, H/2] u8, xsf [m, H/16] u8, ids [m, K] int32, bf16 weights [m, K]) with the
         tables written into ``flat`` (q35_prerouted_views layout for (m, top_k, num_local, tile)); None when the
         kernel does not apply."""
-        from ...cute_dsl_kernels.blackwell.q35_moe_front_big import MAX_ROWS, STATE_WORDS, big_front_config
+        from ...cute_dsl_kernels.blackwell.q35_moe_front_big import (
+            MAX_ROWS,
+            STATE_WORDS,
+            big_front_config,
+        )
         from ..lowm_linear import _device_supported
-        if not _device_supported() or x.dim() != 2 or x.dtype != torch.bfloat16 or weight.dtype != torch.bfloat16:
+
+        if (
+            not _device_supported()
+            or x.dim() != 2
+            or x.dtype != torch.bfloat16
+            or weight.dtype != torch.bfloat16
+        ):
             return None
         m, k = x.shape
         n = weight.shape[0]
-        if (m > MAX_ROWS or k != 4096 or n != 512 or top_k != 10 or weight.shape[1] != k
-                or not weight.is_contiguous() or x.stride(1) != 1 or x.stride(0) % 8 or x.data_ptr() % 16
-                or weight.data_ptr() % 16 or global_scale.dtype != torch.float32 or global_scale.numel() != 1):
+        if (
+            m > MAX_ROWS
+            or k != 4096
+            or n != 512
+            or top_k != 10
+            or weight.shape[1] != k
+            or not weight.is_contiguous()
+            or x.stride(1) != 1
+            or x.stride(0) % 8
+            or x.data_ptr() % 16
+            or weight.data_ptr() % 16
+            or global_scale.dtype != torch.float32
+            or global_scale.numel() != 1
+        ):
             return None
         if num_local % 32 or not 32 <= num_local <= n or tile & (tile - 1) or not 8 <= tile <= 256:
             return None
@@ -1636,8 +2064,20 @@ class Q35FusedFrontBig:
         tn = Q35_MOE_FRONT_BIG_TN if n_per_warp is None else n_per_warp
         assert flat.dtype == torch.int32 and flat.is_contiguous()
         assert flat.numel() >= sum(q35_prerouted_sizes(m, top_k, num_local, tile))
-        compiled = _q35_front_big_compile(m, k, n, num_local, tile, top_k, x.stride(0), _pdl_enabled(), row_group,
-                                          col_block, tn, trace)
+        compiled = _q35_front_big_compile(
+            m,
+            k,
+            n,
+            num_local,
+            tile,
+            top_k,
+            x.stride(0),
+            _pdl_enabled(),
+            row_group,
+            col_block,
+            tn,
+            trace,
+        )
         if compiled is None:
             return None
         fn, ctas = compiled
@@ -1645,11 +2085,12 @@ class Q35FusedFrontBig:
             return None  # the spin waits need every CTA resident
         import cuda.bindings.driver as cuda
         import cutlass
+
         if self.state is None or self.state.device != dev:
-            self.state = torch.zeros((STATE_WORDS, ), dtype=torch.int32, device=dev)
+            self.state = torch.zeros((STATE_WORDS,), dtype=torch.int32, device=dev)
         scratch = _Q35_FRONT_BIG_SCRATCH.get(dev)
         if scratch is None:
-            scratch = torch.zeros((MAX_ROWS * n * 16, ), dtype=torch.float32, device=dev)
+            scratch = torch.zeros((MAX_ROWS * n * 16,), dtype=torch.float32, device=dev)
             _Q35_FRONT_BIG_SCRATCH[dev] = scratch
         logits = torch.empty((m, n), dtype=torch.bfloat16, device=dev)
         xq = torch.empty((m, k // 2), dtype=torch.uint8, device=dev)
@@ -1659,12 +2100,26 @@ class Q35FusedFrontBig:
         trace_ptr = 0
         if trace:
             from ...cute_dsl_kernels.blackwell.q35_moe_front_big import TRACE_SLOTS
-            self.trace_buf = torch.zeros((ctas * TRACE_SLOTS, ), dtype=torch.int64, device=dev)
+
+            self.trace_buf = torch.zeros((ctas * TRACE_SLOTS,), dtype=torch.int64, device=dev)
             trace_ptr = self.trace_buf.data_ptr()
         p64 = lambda t: cutlass.Int64(t.data_ptr())  # noqa: E731
-        fn(p64(x), p64(weight), p64(logits), p64(global_scale), p64(xq), p64(xsf), p64(ids), p64(wts), p64(flat),
-           p64(self.state), p64(scratch), cutlass.Int64(trace_ptr), cutlass.Int32(local_start),
-           cuda.CUstream(torch.cuda.current_stream().cuda_stream))
+        fn(
+            p64(x),
+            p64(weight),
+            p64(logits),
+            p64(global_scale),
+            p64(xq),
+            p64(xsf),
+            p64(ids),
+            p64(wts),
+            p64(flat),
+            p64(self.state),
+            p64(scratch),
+            cutlass.Int64(trace_ptr),
+            cutlass.Int32(local_start),
+            cuda.CUstream(torch.cuda.current_stream().cuda_stream),
+        )
         return logits, xq, xsf, ids, wts
 
 
@@ -1712,7 +2167,9 @@ def _q35_route_big(moe, gate, x: torch.Tensor, global_scale: torch.Tensor):
     if fn is None:
         return None
     logits = gate(x)
-    xq, xsf, ids, wts = state.route_big(fn, logits, x, global_scale, flat, tile, local_start, num_local, top_k)
+    xq, xsf, ids, wts = state.route_big(
+        fn, logits, x, global_scale, flat, tile, local_start, num_local, top_k
+    )
     backend._q35_prerouted_pending = (flat, tile, ids, wts, False, tactic)
     return logits, xq, xsf
 
@@ -1724,20 +2181,29 @@ def _q35_stock_fp4_inputs(backend, m: int):
     the activations: enough for an autotuner cache lookup with the same key."""
     from ...custom_ops.trtllm_gen_custom_ops import FP4BlockScaleMoERunner
     from ...utils import ActType_TrtllmGen
+
     act_type = backend._to_trtllm_gen_activation_type(backend.activation_type)
-    factor = 1 if act_type in [ActType_TrtllmGen.Relu2, ActType_TrtllmGen.Silu
-                               ] else 2
+    factor = 1 if act_type in [ActType_TrtllmGen.Relu2, ActType_TrtllmGen.Silu] else 2
     inter = backend.w3_w1_weight.shape[-2] // factor
     g1a = backend.situ_alpha if backend.is_situ_activation else backend.swiglu_alpha
     g1b = backend.situ_beta if backend.is_situ_activation else backend.swiglu_beta
-    data = lambda name: (getattr(backend, name).data
-                         if getattr(backend, name, None) is not None else None)
+
+    def data(name):
+        return getattr(backend, name).data if getattr(backend, name, None) is not None else None
+
     per_expert = [
-        backend.w3_w1_weight, backend.w3_w1_weight_scale,
-        backend.w3_w1_bias if backend.bias else None, g1a, g1b,
-        backend.swiglu_limit, backend.w2_weight, backend.w2_weight_scale,
+        backend.w3_w1_weight,
+        backend.w3_w1_weight_scale,
+        backend.w3_w1_bias if backend.bias else None,
+        g1a,
+        g1b,
+        backend.swiglu_limit,
+        backend.w2_weight,
+        backend.w2_weight_scale,
         backend.w2_bias if backend.bias else None,
-        data("fc31_scale_c"), data("fc31_alpha"), data("fc2_alpha")
+        data("fc31_scale_c"),
+        data("fc31_alpha"),
+        data("fc2_alpha"),
     ]
     if backend.__dict__.get("_q35_dea_home") is not None:
         per_expert = q35_dea_home(backend, per_expert)
@@ -1745,24 +2211,34 @@ def _q35_stock_fp4_inputs(backend, m: int):
     else:
         lo, n = backend.slot_start, backend.expert_size_per_partition
     rp = backend._extract_routing_params()
-    runner = FP4BlockScaleMoERunner(backend.num_slots,
-                                    rp.top_k,
-                                    rp.n_group,
-                                    rp.topk_group,
-                                    inter,
-                                    lo,
-                                    n,
-                                    rp.routed_scaling_factor,
-                                    backend.routing_method.routing_method_type,
-                                    True,
-                                    act_type,
-                                    tune_max_num_tokens=backend.max_num_tokens,
-                                    use_dp=backend.use_dp)
+    runner = FP4BlockScaleMoERunner(
+        backend.num_slots,
+        rp.top_k,
+        rp.n_group,
+        rp.topk_group,
+        inter,
+        lo,
+        n,
+        rp.routed_scaling_factor,
+        backend.routing_method.routing_method_type,
+        True,
+        act_type,
+        tune_max_num_tokens=backend.max_num_tokens,
+        use_dp=backend.use_dp,
+    )
     h2 = backend.w3_w1_weight.shape[-1]  # packed fp4: hidden / 2
-    meta = lambda *shape: torch.empty(shape, device="meta")
+
+    def meta(*shape):
+        return torch.empty(shape, device="meta")
+
     inputs = [
-        meta(m, backend.num_slots), rp.routing_bias, meta(m, h2),
-        meta(m * h2 // 8), *per_expert, None, None
+        meta(m, backend.num_slots),
+        rp.routing_bias,
+        meta(m, h2),
+        meta(m * h2 // 8),
+        *per_expert,
+        None,
+        None,
     ]
     return runner, inputs
 
@@ -1771,10 +2247,11 @@ def q35_tuned_tactic(backend, m: int):
     """[tile, cfg] the autotuner holds for the stock FP4 MoE op call of this
     layer at m tokens (the tactic the op will run), or None."""
     from ...custom_ops.trtllm_gen_custom_ops import _q35_moegemm_pinned_tactic
+
     runner, inputs = _q35_stock_fp4_inputs(backend, m)
-    _, tactic = AutoTuner.get().choose_one("trtllm::fp4_block_scale_moe_runner",
-                                           [runner], runner.tuning_config,
-                                           inputs)
+    _, tactic = AutoTuner.get().choose_one(
+        "trtllm::fp4_block_scale_moe_runner", [runner], runner.tuning_config, inputs
+    )
     # TRTLLM_Q35_MOEGEMM_PIN: the op runs the pinned tactic instead of the
     # tuner's pick, the same on every rank; build the tables for its tile.
     pinned = _q35_moegemm_pinned_tactic(runner, m, inputs[2].shape[1] * 2)
@@ -1789,10 +2266,13 @@ def _q35_preroute_state(moe):
     """The layer's Q35PreRoute, or None when pre-routing does not apply."""
     from ...custom_ops.trtllm_gen_custom_ops import FP4BlockScaleMoERunner
     from .routing import RoutingMethodType
+
     backend = moe.backend
-    if (moe.routing_method.routing_method_type != RoutingMethodType.Renormalize
-            or backend.num_slots != backend.num_experts
-            or not FP4BlockScaleMoERunner.supports_prerouted()):
+    if (
+        moe.routing_method.routing_method_type != RoutingMethodType.Renormalize
+        or backend.num_slots != backend.num_experts
+        or not FP4BlockScaleMoERunner.supports_prerouted()
+    ):
         return None
     state = backend.__dict__.get("_q35_preroute")
     if state is None:
@@ -1806,12 +2286,20 @@ def _q35_route_spec(moe):
     dea = backend.__dict__.get("_q35_dea_groups")
     if dea is not None:
         return moe.routing_method.experts_per_token, 0, backend.num_experts, dea
-    return (moe.routing_method.experts_per_token, backend.slot_start,
-            backend.expert_size_per_partition, None)
+    return (
+        moe.routing_method.experts_per_token,
+        backend.slot_start,
+        backend.expert_size_per_partition,
+        None,
+    )
 
 
-def _q35_preroute(moe, logits: torch.Tensor, x: Optional[torch.Tensor] = None,
-                  global_scale: Optional[torch.Tensor] = None):
+def _q35_preroute(
+    moe,
+    logits: torch.Tensor,
+    x: Optional[torch.Tensor] = None,
+    global_scale: Optional[torch.Tensor] = None,
+):
     """Hands the TRTLLM-gen backend the routing of these logits (pre-routed
     tables), with a separate route + tables launch (router not folded). With x
     the launch also NVFP4-quantizes it: returns (xq, xsf), or None when the
@@ -1822,12 +2310,19 @@ def _q35_preroute(moe, logits: torch.Tensor, x: Optional[torch.Tensor] = None,
     backend = moe.backend
     tactic = q35_tuned_tactic(backend, logits.shape[0])
     top_k, local_start, num_local, dea = _q35_route_spec(moe)
-    res = state(logits, top_k, local_start, num_local, dea=dea,
-                tile_hint=tactic[0] if tactic else None, x=x,
-                global_scale=global_scale)
+    res = state(
+        logits,
+        top_k,
+        local_start,
+        num_local,
+        dea=dea,
+        tile_hint=tactic[0] if tactic else None,
+        x=x,
+        global_scale=global_scale,
+    )
     if res is None:
         return None
-    backend._q35_prerouted_pending = res[:5] + (tactic, )
+    backend._q35_prerouted_pending = res[:5] + (tactic,)
     return res[5:] if x is not None else None
 
 
@@ -1839,12 +2334,17 @@ def q35_dea_setup(moe, backend) -> None:
     if not Q35_MOE_DEA:
         return
     from .fused_moe_trtllm_gen import TRTLLMGenFusedMoE
+
     qc = getattr(backend, "quant_config", None)
-    if (type(backend) is not TRTLLMGenFusedMoE or qc is None
-            or not qc.layer_quant_mode.has_nvfp4()
-            or getattr(moe, "layer_load_balancer", None) is not None
-            or getattr(moe, "use_dp", False) or moe.ep_size <= 1
-            or backend.num_slots != backend.num_experts):
+    if (
+        type(backend) is not TRTLLMGenFusedMoE
+        or qc is None
+        or not qc.layer_quant_mode.has_nvfp4()
+        or getattr(moe, "layer_load_balancer", None) is not None
+        or getattr(moe, "use_dp", False)
+        or moe.ep_size <= 1
+        or backend.num_slots != backend.num_experts
+    ):
         return
     backend._q35_dea_home = (backend.slot_start, backend.expert_size_per_partition)
     backend._q35_dea_groups = (moe.ep_size, moe.ep_rank)
@@ -1858,14 +2358,26 @@ def q35_dea_home(backend, tensors):
     lo, n = backend._q35_dea_home
     e = backend.num_experts
     return [
-        t[lo:lo + n] if isinstance(t, torch.Tensor) and t.dim() >= 1
-        and t.shape[0] == e else t for t in tensors
+        t[lo : lo + n] if isinstance(t, torch.Tensor) and t.dim() >= 1 and t.shape[0] == e else t
+        for t in tensors
     ]
 
 
-def q35_dea_run(backend, inputs_full, prerouted, *, top_k, n_group, topk_group,
-                intermediate_size, routed_scaling_factor, routing_method_type,
-                do_finalize, act_type, output):
+def q35_dea_run(
+    backend,
+    inputs_full,
+    prerouted,
+    *,
+    top_k,
+    n_group,
+    topk_group,
+    intermediate_size,
+    routed_scaling_factor,
+    routing_method_type,
+    do_finalize,
+    act_type,
+    output,
+):
     """TRTLLM_Q35_MOE_DEA: run this rank's dealt experts as an all-local
     problem over the replicated weights, with the tactic the op tuned for the
     contiguous-EP problem of the same shape (same tuner key as the stock call on
@@ -1879,6 +2391,7 @@ def q35_dea_run(backend, inputs_full, prerouted, *, top_k, n_group, topk_group,
     a tuned tactic of the tables' tile it runs the first valid config of that
     tile for the all-local problem."""
     from ...custom_ops.trtllm_gen_custom_ops import FP4BlockScaleMoERunner
+
     flat, tile, ids, wts = prerouted[:4]
     tactic = prerouted[5] if len(prerouted) > 5 else None
     e = backend.num_experts
@@ -1887,34 +2400,50 @@ def q35_dea_run(backend, inputs_full, prerouted, *, top_k, n_group, topk_group,
     kw = dict(tune_max_num_tokens=backend.max_num_tokens, use_dp=backend.use_dp)
     if tactic is not None:
         q35_record_prerouted_tile(flat, int(tactic[0]))
-    r_all = FP4BlockScaleMoERunner(e, top_k, n_group, topk_group,
-                                   intermediate_size, 0, e,
-                                   routed_scaling_factor, routing_method_type,
-                                   do_finalize, act_type, **kw)
+    r_all = FP4BlockScaleMoERunner(
+        e,
+        top_k,
+        n_group,
+        topk_group,
+        intermediate_size,
+        0,
+        e,
+        routed_scaling_factor,
+        routing_method_type,
+        do_finalize,
+        act_type,
+        **kw,
+    )
     cache = backend.__dict__.setdefault("_q35_dea_cfg", {})
     key = (m, tile, tuple(tactic) if tactic else None)
     if key not in cache:
         valid = sorted(
-            int(b) for a, b in r_all.get_runner().get_valid_configs(
-                top_k, hidden, intermediate_size, e, m) if int(a) == tile)
+            int(b)
+            for a, b in r_all.get_runner().get_valid_configs(top_k, hidden, intermediate_size, e, m)
+            if int(a) == tile
+        )
         assert valid, f"no valid trtllm-gen config of tile {tile} for the all-local problem"
         tuned = tactic is not None and tactic[0] == tile and tactic[1] in valid
         cache[key] = tactic[1] if tuned else valid[0]
     tables = q35_prerouted_views(flat, m, top_k, e, tile)
-    out = r_all(inputs_full,
-                tactic=[tile, cache[key]],
-                output=output,
-                prerouted=(tables, ids, wts,
-                           q35_dea_max_ctas(m, top_k, e,
-                                            backend._q35_dea_groups[0], tile)),
-                prerouted_tile=tile)
+    out = r_all(
+        inputs_full,
+        tactic=[tile, cache[key]],
+        output=output,
+        prerouted=(
+            tables,
+            ids,
+            wts,
+            q35_dea_max_ctas(m, top_k, e, backend._q35_dea_groups[0], tile),
+        ),
+        prerouted_tile=tile,
+    )
     if not do_finalize:
         out = q35_prerouted_unfinalized(out, flat, top_k, wts)
     return out
 
 
-def q35_prerouted_unfinalized(outputs, flat: torch.Tensor, top_k: int,
-                              wts: torch.Tensor):
+def q35_prerouted_unfinalized(outputs, flat: torch.Tensor, top_k: int, wts: torch.Tensor):
     """do_finalize=False outputs of a pre-routed MoE run, shaped like the stock
     op's: [fc2 rows, [m, K] top-k weights, [m, K] int32 expanded -> permuted
     index (-1: another rank's pick)]. The weights and the index table are the
@@ -1923,15 +2452,10 @@ def q35_prerouted_unfinalized(outputs, flat: torch.Tensor, top_k: int,
     fp4_block_scale_moe_runner). TRTLLM_Q35_FIN_FOLD hands these to the CuTe
     all-reduce, which finalizes in-kernel."""
     m = wts.shape[0]
-    return [
-        outputs[0],
-        wts.view(m, top_k),
-        flat[:m * top_k].view(m, top_k)
-    ]
+    return [outputs[0], wts.view(m, top_k), flat[: m * top_k].view(m, top_k)]
 
 
-def q35_dea_max_ctas(m: int, top_k: int, num_experts: int, n_groups: int,
-                     tile: int) -> int:
+def q35_dea_max_ctas(m: int, top_k: int, num_experts: int, n_groups: int, tile: int) -> int:
     """Bound on the CTAs of one group's DEA share (any routing): the group holds
     A <= ceil(min(E, m*K) / G) experts, each with 1..m picks, so at most
     P = min(A*m, m*K) picks; its tiles sum ceil(c_e / tile) <= A + (P - A) // tile.
@@ -1941,8 +2465,7 @@ def q35_dea_max_ctas(m: int, top_k: int, num_experts: int, n_groups: int,
     return a + (p - a) // tile
 
 
-def max_num_tiles(num_tokens: int, top_k: int, num_local_experts: int,
-                  tile: int) -> int:
+def max_num_tiles(num_tokens: int, top_k: int, num_local_experts: int, tile: int) -> int:
     """Mirror of getMaxNumCgasInBatchDim (trtllmGen blockScaleMoe runner.h)."""
     remaining = num_tokens * top_k
     filled = min(num_local_experts, remaining)
@@ -1995,29 +2518,25 @@ def q35_moe_front(
     dev = x.device
     mt = max_num_tiles(m, top_k, num_local_experts, tile_size)
     if token_selected_experts is None:
-        token_selected_experts = torch.empty((m, top_k),
-                                             dtype=torch.int32,
-                                             device=dev)
+        token_selected_experts = torch.empty((m, top_k), dtype=torch.int32, device=dev)
     if token_final_scales is None:
-        token_final_scales = torch.empty((m, top_k),
-                                         dtype=torch.float32,
-                                         device=dev)
+        token_final_scales = torch.empty((m, top_k), dtype=torch.float32, device=dev)
     if xq is None:
         xq = torch.empty((m, h // 2), dtype=torch.uint8, device=dev)
     if xsf is None:
         xsf = torch.empty((m, h // 16), dtype=torch.uint8, device=dev)
     if moe_output is None:
         moe_output = torch.empty((m, h), dtype=torch.bfloat16, device=dev)
-    tile_expert = torch.empty((mt, ), dtype=torch.int32, device=dev)
-    tile_mnlimit = torch.empty((mt, ), dtype=torch.int32, device=dev)
+    tile_expert = torch.empty((mt,), dtype=torch.int32, device=dev)
+    tile_mnlimit = torch.empty((mt,), dtype=torch.int32, device=dev)
     exp2perm = torch.empty((m, top_k), dtype=torch.int32, device=dev)
-    perm2exp = torch.empty((mt * tile_size, ), dtype=torch.int32, device=dev)
-    total_padded = torch.empty((1, ), dtype=torch.int32, device=dev)
-    num_tiles = torch.empty((1, ), dtype=torch.int32, device=dev)
+    perm2exp = torch.empty((mt * tile_size,), dtype=torch.int32, device=dev)
+    total_padded = torch.empty((1,), dtype=torch.int32, device=dev)
+    num_tiles = torch.empty((1,), dtype=torch.int32, device=dev)
     nlp = triton.next_power_of_2(num_local_experts)
     assert scratch.numel() >= 2 * nlp and scratch.dtype == torch.int32
     use_pdl = _pdl_enabled()
-    _q35_moe_front_kernel[(1 + m, )](
+    _q35_moe_front_kernel[(1 + m,)](
         router_logits,
         x,
         x.stride(0),
@@ -2049,9 +2568,19 @@ def q35_moe_front(
         num_warps=8,
         launch_pdl=use_pdl,
     )
-    return (token_selected_experts, token_final_scales, xq, xsf, tile_expert,
-            tile_mnlimit, exp2perm, perm2exp, total_padded, num_tiles,
-            moe_output)
+    return (
+        token_selected_experts,
+        token_final_scales,
+        xq,
+        xsf,
+        tile_expert,
+        tile_mnlimit,
+        exp2perm,
+        perm2exp,
+        total_padded,
+        num_tiles,
+        moe_output,
+    )
 
 
 def q35_fused_front_eligible(moe, x: torch.Tensor) -> bool:
@@ -2059,6 +2588,7 @@ def q35_fused_front_eligible(moe, x: torch.Tensor) -> bool:
     from .configurable_moe import ConfigurableMoE
     from .fused_moe_cute_dsl import CuteDslFusedMoE
     from .routing import RenormalizeMoeRoutingMethod
+
     if not isinstance(moe, ConfigurableMoE):
         return False
     backend = moe.backend
@@ -2084,15 +2614,18 @@ def q35_fused_front_eligible(moe, x: torch.Tensor) -> bool:
     return True
 
 
-def q35_fused_moe_forward(moe,
-                          x: torch.Tensor,
-                          router_logits: torch.Tensor,
-                          xq: Optional[torch.Tensor] = None,
-                          xsf: Optional[torch.Tensor] = None) -> torch.Tensor:
+def q35_fused_moe_forward(
+    moe,
+    x: torch.Tensor,
+    router_logits: torch.Tensor,
+    xq: Optional[torch.Tensor] = None,
+    xsf: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
     """Routed-expert output of ``moe`` (ConfigurableMoE + CuteDslFusedMoE)
     for decode-sized ``x`` through the fused front end. ``xq``/``xsf``: the
     NVFP4 quantization of x when the router GEMM already produced it."""
     from .fused_moe_cute_dsl import CuteDslFusedMoENvfp4Runner
+
     backend = moe.backend
     m, h = x.shape
     top_k = moe.routing_method.top_k
@@ -2104,7 +2637,7 @@ def q35_fused_moe_forward(moe,
     scratch = getattr(backend, "_q35_front_scratch", None)
     nlp = triton.next_power_of_2(esp)
     if scratch is None or scratch.numel() < 2 * nlp:
-        scratch = torch.zeros((2 * nlp, ), dtype=torch.int32, device=dev)
+        scratch = torch.zeros((2 * nlp,), dtype=torch.int32, device=dev)
         backend._q35_front_scratch = scratch
 
     # Output buffers first: the tile-size tactic lookup only needs shapes.
@@ -2114,9 +2647,7 @@ def q35_fused_moe_forward(moe,
     if quantize:
         xq = torch.empty((m, h // 2), dtype=torch.uint8, device=dev)
         xsf = torch.empty((m, h // 16), dtype=torch.uint8, device=dev)
-    moe_output = torch.empty((m, backend.hidden_size),
-                             dtype=torch.bfloat16,
-                             device=dev)
+    moe_output = torch.empty((m, backend.hidden_size), dtype=torch.bfloat16, device=dev)
     runner = CuteDslFusedMoENvfp4Runner(
         forward_impl=backend.run_moe_nvfp4_impl,
         num_experts=backend.num_slots,
@@ -2132,25 +2663,36 @@ def q35_fused_moe_forward(moe,
         runner.get_tuning_config(),
         [xq, tse, tfs, xsf, moe_output, wv],
     )
-    tile_size = best_tactic if isinstance(best_tactic,
-                                          int) and best_tactic > 0 else 128
+    tile_size = best_tactic if isinstance(best_tactic, int) and best_tactic > 0 else 128
 
-    (tse, tfs, xq, xsf, tile_expert, tile_mnlimit, exp2perm, perm2exp,
-     _total_padded, num_tiles, moe_output) = q35_moe_front(
-         router_logits,
-         x,
-         backend.fc31_input_scale,
-         top_k,
-         slot_start,
-         esp,
-         tile_size,
-         scratch,
-         moe_output=moe_output,
-         xq=xq,
-         xsf=xsf,
-         token_selected_experts=tse,
-         token_final_scales=tfs,
-         quantize=quantize)
+    (
+        tse,
+        tfs,
+        xq,
+        xsf,
+        tile_expert,
+        tile_mnlimit,
+        exp2perm,
+        perm2exp,
+        _total_padded,
+        num_tiles,
+        moe_output,
+    ) = q35_moe_front(
+        router_logits,
+        x,
+        backend.fc31_input_scale,
+        top_k,
+        slot_start,
+        esp,
+        tile_size,
+        scratch,
+        moe_output=moe_output,
+        xq=xq,
+        xsf=xsf,
+        token_selected_experts=tse,
+        token_final_scales=tfs,
+        quantize=quantize,
+    )
     del exp2perm  # consumed only by the (replaced) memset kernel
 
     xa, xa_sf = torch.ops.trtllm.cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_blackwell(
@@ -2195,10 +2737,12 @@ def q35_fused_moe_forward(moe,
     return moe_output
 
 
-def _trtllm_quant_eligible(moe, x: torch.Tensor,
-                           max_tokens: int = Q35_MOE_FUSED_FRONT_MAX_TOKENS) -> bool:
+def _trtllm_quant_eligible(
+    moe, x: torch.Tensor, max_tokens: int = Q35_MOE_FUSED_FRONT_MAX_TOKENS
+) -> bool:
     from .configurable_moe import ConfigurableMoE
     from .fused_moe_trtllm_gen import TRTLLMGenFusedMoE
+
     if not isinstance(moe, ConfigurableMoE):
         return False
     backend = moe.backend
@@ -2236,8 +2780,14 @@ def q35_routed_forward(gate, moe, x: torch.Tensor, **moe_kwargs):
         op skip its routing kernel.
     """
     from ...utils import Fp4QuantizedTensor
-    if (Q35_MOE_FRONT_BIG and x.dim() == 2 and x.shape[0] in Q35_MOE_FRONT_BIG_MS
-            and gate.out_dtype == torch.bfloat16 and _trtllm_quant_eligible(moe, x, max_tokens=256)):
+
+    if (
+        Q35_MOE_FRONT_BIG
+        and x.dim() == 2
+        and x.shape[0] in Q35_MOE_FRONT_BIG_MS
+        and gate.out_dtype == torch.bfloat16
+        and _trtllm_quant_eligible(moe, x, max_tokens=256)
+    ):
         # routing + tables + x quant (and with =gemm the router GEMM) in ONE launch above 32 tokens
         if Q35_MOE_FRONT_BIG_GEMM:
             big = _q35_front_big(moe, gate.weight, x, moe.backend.fc31_input_scale)
@@ -2252,19 +2802,18 @@ def q35_routed_forward(gate, moe, x: torch.Tensor, **moe_kwargs):
             logits, xq, xsf = gate.q35_router(x, moe.backend.fc31_input_scale)
             return q35_fused_moe_forward(moe, x, logits, xq, xsf)
         return q35_fused_moe_forward(moe, x, gate(x))
-    if Q35_MOE_ROUTER_GEMM and _trtllm_quant_eligible(
-            moe, x) and gate.q35_router_ok(x):
+    if Q35_MOE_ROUTER_GEMM and _trtllm_quant_eligible(moe, x) and gate.q35_router_ok(x):
         gs = moe.backend.fc31_input_scale
         state = _q35_preroute_state(moe) if Q35_MOE_PREROUTE else None
         plan = None
         if state is not None and Q35_MOE_PREROUTE_FOLD and not Q35_MOE_ROUTER_LOWM:
             top_k, local_start, num_local, dea = _q35_route_spec(moe)
             tactic = q35_tuned_tactic(moe.backend, x.shape[0])
-            plan = state.plan(x.shape[0], top_k, num_local, x.device,
-                              tile_hint=tactic[0] if tactic else None)
+            plan = state.plan(
+                x.shape[0], top_k, num_local, x.device, tile_hint=tactic[0] if tactic else None
+            )
         quant = None
-        if (plan is None and state is not None and Q35_MOE_PREROUTE_LOWM
-                and not Q35_MOE_ROUTER_LOWM):
+        if plan is None and state is not None and Q35_MOE_PREROUTE_LOWM and not Q35_MOE_ROUTER_LOWM:
             if Q35_MOE_FRONT_FUSED:
                 # the same router GEMM, routing, tables and x quant in ONE launch
                 fused = _q35_front_fused(moe, gate.weight, x, gs)
@@ -2283,9 +2832,9 @@ def q35_routed_forward(gate, moe, x: torch.Tensor, **moe_kwargs):
             # router GEMM + NVFP4 quant + routing + tables in ONE launch
             flat, tile = plan
             logits, xq, xsf, ids, wts = gate.q35_router(
-                x, gs, route=(top_k, local_start, num_local, tile, flat, dea))
-            moe.backend._q35_prerouted_pending = (flat, tile, ids, wts,
-                                                  dea is not None, tactic)
+                x, gs, route=(top_k, local_start, num_local, tile, flat, dea)
+            )
+            moe.backend._q35_prerouted_pending = (flat, tile, ids, wts, dea is not None, tactic)
         else:
             moe.backend.__dict__.pop("_q35_prerouted_pending", None)
             logits, xq, xsf = gate.q35_router(x, gs)
@@ -2321,32 +2870,25 @@ def _q35_stats_buffers(device, num_experts):
         mm = Q35_MOE_FUSED_FRONT_MAX_TOKENS + 1
         st = dict(
             steps=torch.zeros((nl, mm), dtype=torch.float64, device=device),
-            mean=torch.zeros((nl, mm, len(_Q35_STATS_EP)),
-                             dtype=torch.float64,
-                             device=device),
-            busiest=torch.zeros((nl, mm, len(_Q35_STATS_EP)),
-                                dtype=torch.float64,
-                                device=device),
+            mean=torch.zeros((nl, mm, len(_Q35_STATS_EP)), dtype=torch.float64, device=device),
+            busiest=torch.zeros((nl, mm, len(_Q35_STATS_EP)), dtype=torch.float64, device=device),
             num_experts=num_experts,
         )
         if Q35_MOE_STATS_IDS > 0:
             n = Q35_MOE_STATS_IDS
-            st["ids"] = torch.full((nl, n, mm - 1, 16),
-                                   -1,
-                                   dtype=torch.int16,
-                                   device=device)
+            st["ids"] = torch.full((nl, n, mm - 1, 16), -1, dtype=torch.int16, device=device)
             st["ids_m"] = torch.zeros((nl, n), dtype=torch.int16, device=device)
-            st["ids_cnt"] = torch.zeros((nl, ), dtype=torch.int64, device=device)
+            st["ids_cnt"] = torch.zeros((nl,), dtype=torch.int64, device=device)
         _q35_stats[device] = st
         if not _q35_stats.get("_atexit"):
             import atexit
+
             atexit.register(_q35_stats_dump)
             _q35_stats["_atexit"] = True
     return st
 
 
-def q35_moe_stats_record(layer_idx: Optional[int], router_logits: torch.Tensor,
-                         top_k: int) -> None:
+def q35_moe_stats_record(layer_idx: Optional[int], router_logits: torch.Tensor, top_k: int) -> None:
     if layer_idx is None or router_logits.dim() != 2:
         return
     m, e = router_logits.shape
@@ -2354,8 +2896,9 @@ def q35_moe_stats_record(layer_idx: Optional[int], router_logits: torch.Tensor,
         return
     st = _q35_stats_buffers(router_logits.device, e)
     idx = torch.topk(router_logits.float(), top_k, dim=-1).indices
-    used = torch.zeros((m, e), dtype=torch.float32,
-                       device=router_logits.device).scatter_(1, idx, 1.0)
+    used = torch.zeros((m, e), dtype=torch.float32, device=router_logits.device).scatter_(
+        1, idx, 1.0
+    )
     used = used.amax(dim=0)
     means, maxes = [], []
     for ep in _Q35_STATS_EP:
@@ -2367,12 +2910,11 @@ def q35_moe_stats_record(layer_idx: Optional[int], router_logits: torch.Tensor,
     st["busiest"][layer_idx, m] += torch.stack(maxes).double()
     if "ids" in st and top_k <= 16:
         # ring slot on the device (the counter advances on CUDA graph replay too)
-        cnt = st["ids_cnt"][layer_idx:layer_idx + 1]
+        cnt = st["ids_cnt"][layer_idx : layer_idx + 1]
         pos = torch.remainder(cnt, st["ids"].shape[1])
-        row = torch.full((1, st["ids"].shape[2], 16),
-                         -1,
-                         dtype=torch.int16,
-                         device=router_logits.device)
+        row = torch.full(
+            (1, st["ids"].shape[2], 16), -1, dtype=torch.int16, device=router_logits.device
+        )
         row[0, :m, :top_k] = idx.to(torch.int16)
         st["ids"][layer_idx].index_copy_(0, pos, row)
         st["ids_m"][layer_idx].index_fill_(0, pos, m)
@@ -2381,11 +2923,11 @@ def q35_moe_stats_record(layer_idx: Optional[int], router_logits: torch.Tensor,
 
 def _q35_stats_dump():
     import json
-    rank = os.environ.get("OMPI_COMM_WORLD_RANK",
-                          os.environ.get("SLURM_PROCID", "0"))
-    path = os.environ.get("TRTLLM_Q35_MOE_STATS_PATH",
-                          "/tmp/q35_moe_stats_rank{rank}.json").replace(
-                              "{rank}", str(rank))
+
+    rank = os.environ.get("OMPI_COMM_WORLD_RANK", os.environ.get("SLURM_PROCID", "0"))
+    path = os.environ.get(
+        "TRTLLM_Q35_MOE_STATS_PATH", "/tmp/q35_moe_stats_rank{rank}.json"
+    ).replace("{rank}", str(rank))
     out = {"ep_sizes": list(_Q35_STATS_EP), "layers": {}}
     for dev, st in _q35_stats.items():
         if not isinstance(st, dict):
@@ -2419,7 +2961,8 @@ def _q35_stats_dump():
                             "count": st["ids_cnt"].cpu(),
                             "num_experts": st["num_experts"],
                         },
-                        path.rsplit(".", 1)[0] + "_ids.pt")
+                        path.rsplit(".", 1)[0] + "_ids.pt",
+                    )
                 except (OSError, RuntimeError):
                     pass
                 break

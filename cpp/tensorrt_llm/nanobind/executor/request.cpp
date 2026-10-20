@@ -773,7 +773,8 @@ void initRequestBindings(nb::module_& m)
         nb::arg("cache_salt") = nb::none()
     ) // clang-format on
         .def_prop_ro("input_token_ids", &tle::Request::getInputTokenIds)
-        .def_prop_ro("input_token_ids_i32",
+        .def_prop_ro(
+            "input_token_ids_i32",
             [](tle::Request const& self)
             {
                 // Owned int32 copy of the prompt tokens exposed as a 1-D numpy

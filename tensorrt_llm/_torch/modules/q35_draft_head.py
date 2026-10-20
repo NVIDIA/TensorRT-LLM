@@ -54,8 +54,11 @@ def _device_supported() -> bool:
         from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
     except ImportError:
         return False
-    return (IS_CUTLASS_DSL_AVAILABLE and torch.cuda.is_available()
-            and torch.cuda.get_device_capability() in ((10, 0), (10, 3)))
+    return (
+        IS_CUTLASS_DSL_AVAILABLE
+        and torch.cuda.is_available()
+        and torch.cuda.get_device_capability() in ((10, 0), (10, 3))
+    )
 
 
 def _use_pdl() -> bool:
@@ -94,8 +97,9 @@ def quantize_mxfp8_rows(weight: torch.Tensor) -> Tuple[torch.Tensor, torch.Tenso
         blocks = weight[start:end].float().view(end - start, k // 32, 32)
         amax = blocks.abs().amax(-1).clamp_min(2.0**-126)
         exponent = torch.ceil(torch.log2(amax / 448.0)).clamp(-127, 127)
-        values[start:end] = (blocks / torch.exp2(exponent)[..., None]).view(
-            end - start, k).to(torch.float8_e4m3fn)
+        values[start:end] = (
+            (blocks / torch.exp2(exponent)[..., None]).view(end - start, k).to(torch.float8_e4m3fn)
+        )
         scales[start:end] = (exponent + 127).to(torch.uint8)
     return values, scales
 
@@ -130,14 +134,18 @@ def quantize_nvfp4_rows(weight: torch.Tensor) -> Tuple[torch.Tensor, torch.Tenso
         x = torch.where(denom > 0, blocks / torch.where(denom > 0, denom, 1.0), 0.0)
         mag = x.abs().clamp(max=6.0)
         code = torch.bucketize(mag, mids, right=False)  # ties -> lower code
-        code = code + torch.isin(mag, tie_up).to(code.dtype)  # ... except where the upper code is even
+        code = code + torch.isin(mag, tie_up).to(
+            code.dtype
+        )  # ... except where the upper code is even
         code = code | ((x < 0) & (code > 0)).to(code.dtype) << 3
         code = code.to(torch.uint8).view(end - start, k)
         packed[start:end] = code[:, 0::2] | (code[:, 1::2] << 4)
     return packed, scales, g
 
 
-def dequantize_nvfp4_rows(packed: torch.Tensor, scales: torch.Tensor, global_scale: float) -> torch.Tensor:
+def dequantize_nvfp4_rows(
+    packed: torch.Tensor, scales: torch.Tensor, global_scale: float
+) -> torch.Tensor:
     """FP32 ``[N, K]`` from ``quantize_nvfp4_rows`` output (reference / tests)."""
     rows, half = packed.shape
     k = 2 * half
@@ -175,26 +183,36 @@ def _cute(t: torch.Tensor, align: int = 16):
 
 
 @functools.lru_cache(maxsize=None)
-def _compiled(m: int, n: int, k: int, slice_blocks: int, num_ctas: int,
-              use_pdl: bool, early_trigger: bool, argmax: bool,
-              out_dtype: torch.dtype, debug_skip_wait: bool = False,
-              weight_format: str = "mxfp8"):
+def _compiled(
+    m: int,
+    n: int,
+    k: int,
+    slice_blocks: int,
+    num_ctas: int,
+    use_pdl: bool,
+    early_trigger: bool,
+    argmax: bool,
+    out_dtype: torch.dtype,
+    debug_skip_wait: bool = False,
+    weight_format: str = "mxfp8",
+):
     import cuda.bindings.driver as cuda
     import cutlass
     import cutlass.cute as cute
 
-    from ..cute_dsl_kernels.blackwell.q35_draft_head_gemv import \
-        Q35DraftHeadGemvKernel
+    from ..cute_dsl_kernels.blackwell.q35_draft_head_gemv import Q35DraftHeadGemvKernel
 
-    kernel = Q35DraftHeadGemvKernel(num_rows=m,
-                                    k_extent=k,
-                                    num_ctas=num_ctas,
-                                    slice_blocks=slice_blocks,
-                                    use_pdl=use_pdl,
-                                    early_trigger=early_trigger,
-                                    argmax=argmax,
-                                    debug_skip_wait=debug_skip_wait,
-                                    weight_format=weight_format)
+    kernel = Q35DraftHeadGemvKernel(
+        num_rows=m,
+        k_extent=k,
+        num_ctas=num_ctas,
+        slice_blocks=slice_blocks,
+        use_pdl=use_pdl,
+        early_trigger=early_trigger,
+        argmax=argmax,
+        debug_skip_wait=debug_skip_wait,
+        weight_format=weight_format,
+    )
     dev = torch.device("cuda")
     nvfp4 = weight_format == "nvfp4"
     a = torch.empty((m, k), dtype=torch.bfloat16, device=dev)
@@ -205,19 +223,29 @@ def _compiled(m: int, n: int, k: int, slice_blocks: int, num_ctas: int,
     else:
         out = torch.empty((m, n), dtype=out_dtype, device=dev)
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-    return cute.compile(kernel, _cute(a), _cute(b), _cute(s), _cute(out, 8),
-                        cutlass.Int32(0), cutlass.Float32(1.0), stream)
+    return cute.compile(
+        kernel,
+        _cute(a),
+        _cute(b),
+        _cute(s),
+        _cute(out, 8),
+        cutlass.Int32(0),
+        cutlass.Float32(1.0),
+        stream,
+    )
 
 
-def mxfp8_head_gemv(x: torch.Tensor,
-                    values: torch.Tensor,
-                    scales: torch.Tensor,
-                    out: torch.Tensor,
-                    *,
-                    argmax: bool,
-                    vocab_offset: int = 0,
-                    slice_blocks: Optional[int] = None,
-                    _debug_skip_wait: bool = False) -> torch.Tensor:
+def mxfp8_head_gemv(
+    x: torch.Tensor,
+    values: torch.Tensor,
+    scales: torch.Tensor,
+    out: torch.Tensor,
+    *,
+    argmax: bool,
+    vocab_offset: int = 0,
+    slice_blocks: Optional[int] = None,
+    _debug_skip_wait: bool = False,
+) -> torch.Tensor:
     """``argmax=False``: ``out[M, N] = x @ dequant(values, scales).T`` (FP32 or BF16 ``out``).
     ``argmax=True``: ``out`` is ``[M, 2]`` int32 (the words of one int64 key per row, which must hold
     ``INT64_MIN`` before the call); the per-row max key of this shard is folded into it.
@@ -242,25 +270,43 @@ def mxfp8_head_gemv(x: torch.Tensor,
         assert out.shape == (m, n) and out.is_contiguous()
     device = x.device.index if x.device.index is not None else torch.cuda.current_device()
     num_ctas = min(_num_sms(device), -(-n // 8))
-    fn = _compiled(m, n, k, slice_blocks or default_slice_blocks(k), num_ctas,
-                   _use_pdl(), _early_trigger(), argmax,
-                   torch.int32 if argmax else out.dtype, _debug_skip_wait)
+    fn = _compiled(
+        m,
+        n,
+        k,
+        slice_blocks or default_slice_blocks(k),
+        num_ctas,
+        _use_pdl(),
+        _early_trigger(),
+        argmax,
+        torch.int32 if argmax else out.dtype,
+        _debug_skip_wait,
+    )
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-    fn(_cute(x), _cute(values.view(torch.uint8)), _cute(scales), _cute(out, 8),
-       cutlass.Int32(vocab_offset), cutlass.Float32(1.0), stream)
+    fn(
+        _cute(x),
+        _cute(values.view(torch.uint8)),
+        _cute(scales),
+        _cute(out, 8),
+        cutlass.Int32(vocab_offset),
+        cutlass.Float32(1.0),
+        stream,
+    )
     return out
 
 
-def nvfp4_head_gemv(x: torch.Tensor,
-                    packed: torch.Tensor,
-                    scales: torch.Tensor,
-                    global_scale: float,
-                    out: torch.Tensor,
-                    *,
-                    argmax: bool,
-                    vocab_offset: int = 0,
-                    slice_blocks: Optional[int] = None,
-                    _debug_skip_wait: bool = False) -> torch.Tensor:
+def nvfp4_head_gemv(
+    x: torch.Tensor,
+    packed: torch.Tensor,
+    scales: torch.Tensor,
+    global_scale: float,
+    out: torch.Tensor,
+    *,
+    argmax: bool,
+    vocab_offset: int = 0,
+    slice_blocks: Optional[int] = None,
+    _debug_skip_wait: bool = False,
+) -> torch.Tensor:
     """``mxfp8_head_gemv`` for NVFP4 weights: ``packed`` [N, K/2] uint8, ``scales`` [N, K/16] E4M3 (uint8),
     ``global_scale`` the per-tensor FP32 scale (``quantize_nvfp4_rows``)."""
     import cuda.bindings.driver as cuda
@@ -279,30 +325,53 @@ def nvfp4_head_gemv(x: torch.Tensor,
         assert out.shape == (m, n) and out.is_contiguous()
     device = x.device.index if x.device.index is not None else torch.cuda.current_device()
     num_ctas = min(_num_sms(device), -(-n // 8))
-    fn = _compiled(m, n, k, slice_blocks or default_slice_blocks(k), num_ctas,
-                   _use_pdl(), _early_trigger(), argmax,
-                   torch.int32 if argmax else out.dtype, _debug_skip_wait, "nvfp4")
+    fn = _compiled(
+        m,
+        n,
+        k,
+        slice_blocks or default_slice_blocks(k),
+        num_ctas,
+        _use_pdl(),
+        _early_trigger(),
+        argmax,
+        torch.int32 if argmax else out.dtype,
+        _debug_skip_wait,
+        "nvfp4",
+    )
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-    fn(_cute(x), _cute(packed), _cute(scales.view(torch.uint8)), _cute(out, 8),
-       cutlass.Int32(vocab_offset), cutlass.Float32(global_scale), stream)
+    fn(
+        _cute(x),
+        _cute(packed),
+        _cute(scales.view(torch.uint8)),
+        _cute(out, 8),
+        cutlass.Int32(vocab_offset),
+        cutlass.Float32(global_scale),
+        stream,
+    )
     return out
 
 
 # ----------------------------------------------------------------------------------------------
 # Key exchange and decode
 # ----------------------------------------------------------------------------------------------
-def exchange_argmax_keys(keys: torch.Tensor, mapping,
-                         out: Optional[torch.Tensor] = None) -> Optional[torch.Tensor]:
+def exchange_argmax_keys(
+    keys: torch.Tensor, mapping, out: Optional[torch.Tensor] = None
+) -> Optional[torch.Tensor]:
     """Global greedy token ids (int32 [M]) from every TP rank's packed keys ``keys`` [M] int64 with the
     one-launch LL exchange (``TRTLLM_Q35_LL_ARGMAX_EXCHANGE=1``; channel 0), which also
     re-arms ``keys`` (INT64_MIN); None when that exchange is unavailable (caller: NCCL fallback)."""
     from ..distributed import ll_exchange
+
     if not ll_exchange.ll_argmax_exchange_enabled():
         return None
     exchange = ll_exchange.get_tp_key_exchange(mapping)
     if exchange is None or keys.numel() > exchange.MAX_ROWS:
         return None
-    tokens = out if out is not None else torch.empty((keys.numel(), ), dtype=torch.int32, device=keys.device)
+    tokens = (
+        out
+        if out is not None
+        else torch.empty((keys.numel(),), dtype=torch.int32, device=keys.device)
+    )
     exchange.exchange(keys, tokens_out=tokens, reset_keys=True, channel=0)
     return tokens
 
@@ -312,8 +381,9 @@ try:
     import triton.language as tl
 
     @triton.jit
-    def _q35_decode_keys_kernel(gathered_ptr, keys_ptr, tokens_ptr, M,
-                                RANKS: tl.constexpr, BLOCK: tl.constexpr):
+    def _q35_decode_keys_kernel(
+        gathered_ptr, keys_ptr, tokens_ptr, M, RANKS: tl.constexpr, BLOCK: tl.constexpr
+    ):
         offs = tl.arange(0, BLOCK)
         mask = offs < M
         lowest = tl.full([BLOCK], 1, tl.int64) << 63
@@ -332,18 +402,23 @@ except ImportError:  # pragma: no cover
     _TRITON_OK = False
 
 
-def decode_keys(gathered: torch.Tensor, ranks: int, keys: torch.Tensor,
-                out: Optional[torch.Tensor] = None) -> torch.Tensor:
+def decode_keys(
+    gathered: torch.Tensor, ranks: int, keys: torch.Tensor, out: Optional[torch.Tensor] = None
+) -> torch.Tensor:
     """int32 token ids ``[M]`` (into ``out`` if given) = low words of the max key over ``ranks``; resets ``keys``."""
     m = keys.shape[0]
-    tokens = out if out is not None else torch.empty((m, ), dtype=torch.int32, device=keys.device)
+    tokens = out if out is not None else torch.empty((m,), dtype=torch.int32, device=keys.device)
     if _TRITON_OK:
-        _q35_decode_keys_kernel[(1, )](gathered, keys, tokens, m, RANKS=ranks,
-                                       BLOCK=max(16, triton.next_power_of_2(m)))
+        _q35_decode_keys_kernel[(1,)](
+            gathered, keys, tokens, m, RANKS=ranks, BLOCK=max(16, triton.next_power_of_2(m))
+        )
     else:
         best = gathered.view(ranks, m).max(dim=0).values
-        tokens.copy_(torch.where(best == INT64_MIN, torch.zeros_like(best),
-                                 (~best) & 0xFFFFFFFF).to(torch.int32))
+        tokens.copy_(
+            torch.where(best == INT64_MIN, torch.zeros_like(best), (~best) & 0xFFFFFFFF).to(
+                torch.int32
+            )
+        )
         keys.fill_(INT64_MIN)
     return tokens
 
@@ -366,18 +441,20 @@ class Q35DraftHead:
         self.nvfp4 = draft_head_nvfp4_enabled()
         if self.nvfp4:
             self.values, self.scales, self.global_scale = quantize_nvfp4_rows(
-                weight.detach()[:valid].contiguous())
+                weight.detach()[:valid].contiguous()
+            )
         else:
             self.values, self.scales = quantize_mxfp8_rows(weight.detach()[:valid].contiguous())
             self.global_scale = 1.0
         self.k = weight.shape[1]
         self.mapping = mapping
-        self.keys = torch.full((MAX_ROWS, ), INT64_MIN, dtype=torch.int64, device=weight.device)
+        self.keys = torch.full((MAX_ROWS,), INT64_MIN, dtype=torch.int64, device=weight.device)
         self.slice_blocks = default_slice_blocks(self.k)
         logger.info(
             f"[Q35DraftHead] {'NVFP4' if self.nvfp4 else 'MXFP8'} draft head: rows {valid} of {local_vocab} (offset "
             f"{self.vocab_offset}), K {self.k}, {self.values.numel() / 2**20:.1f} MiB values + "
-            f"{self.scales.numel() / 2**20:.1f} MiB scales")
+            f"{self.scales.numel() / 2**20:.1f} MiB scales"
+        )
 
     def supports(self, rows: int) -> bool:
         return 0 < rows <= MAX_ROWS and self.k % 512 == 0
@@ -387,13 +464,26 @@ class Q35DraftHead:
         m = x.shape[0]
         keys = self.keys[:m]
         if getattr(self, "nvfp4", False):  # (getattr: subclasses / stand-ins that skip __init__)
-            nvfp4_head_gemv(x.contiguous(), self.values, self.scales, self.global_scale,
-                            keys.view(torch.int32).view(m, 2), argmax=True,
-                            vocab_offset=self.vocab_offset, slice_blocks=self.slice_blocks)
+            nvfp4_head_gemv(
+                x.contiguous(),
+                self.values,
+                self.scales,
+                self.global_scale,
+                keys.view(torch.int32).view(m, 2),
+                argmax=True,
+                vocab_offset=self.vocab_offset,
+                slice_blocks=self.slice_blocks,
+            )
         else:
-            mxfp8_head_gemv(x.contiguous(), self.values, self.scales,
-                            keys.view(torch.int32).view(m, 2), argmax=True,
-                            vocab_offset=self.vocab_offset, slice_blocks=self.slice_blocks)
+            mxfp8_head_gemv(
+                x.contiguous(),
+                self.values,
+                self.scales,
+                keys.view(torch.int32).view(m, 2),
+                argmax=True,
+                vocab_offset=self.vocab_offset,
+                slice_blocks=self.slice_blocks,
+            )
         return keys
 
     def sample(self, x: torch.Tensor, out: Optional[torch.Tensor] = None) -> torch.Tensor:
@@ -407,6 +497,7 @@ class Q35DraftHead:
             if tokens is not None:
                 return tokens
             from ..distributed import allgather
+
             return decode_keys(allgather(keys, self.mapping, dim=0), tp_size, keys, out)
         return decode_keys(keys, 1, keys, out)
 
@@ -434,7 +525,16 @@ def build_draft_head_if_enabled(lm_head, mapping) -> Optional[Q35DraftHead]:
 
 
 __all__ = [
-    "Q35DraftHead", "build_draft_head_if_enabled", "decode_keys", "draft_fp8_head_enabled",
-    "draft_head_nvfp4_enabled", "dequantize_mxfp8_rows", "dequantize_nvfp4_rows", "exchange_argmax_keys",
-    "mxfp8_head_gemv", "nvfp4_head_gemv", "quantize_mxfp8_rows", "quantize_nvfp4_rows"
+    "Q35DraftHead",
+    "build_draft_head_if_enabled",
+    "decode_keys",
+    "draft_fp8_head_enabled",
+    "draft_head_nvfp4_enabled",
+    "dequantize_mxfp8_rows",
+    "dequantize_nvfp4_rows",
+    "exchange_argmax_keys",
+    "mxfp8_head_gemv",
+    "nvfp4_head_gemv",
+    "quantize_mxfp8_rows",
+    "quantize_nvfp4_rows",
 ]

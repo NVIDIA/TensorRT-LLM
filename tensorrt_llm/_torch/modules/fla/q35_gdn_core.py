@@ -101,9 +101,15 @@ __device__ __forceinline__ u32 word(const U4& v, int i) { return i == 0 ? v.x : 
 __device__ __forceinline__ U4 ld16(const void* p) { return *reinterpret_cast<const U4*>(p); }
 __device__ __forceinline__ void st16(void* p, U4 v) { *reinterpret_cast<U4*>(p) = v; }
 __device__ __forceinline__ U4 zero4() { U4 z; z.x = z.y = z.z = z.w = 0u; return z; }
-__device__ __forceinline__ float sqrt_ap(float x) { float r; asm("sqrt.approx.ftz.f32 %0, %1;" : "=f"(r) : "f"(x)); return r; }
-__device__ __forceinline__ float rcp_ap(float x) { float r; asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(r) : "f"(x)); return r; }
-__device__ __forceinline__ float rsqrt_ap(float x) { float r; asm("rsqrt.approx.ftz.f32 %0, %1;" : "=f"(r) : "f"(x)); return r; }
+__device__ __forceinline__ float sqrt_ap(float x) {
+    float r; asm("sqrt.approx.ftz.f32 %0, %1;" : "=f"(r) : "f"(x)); return r;
+}
+__device__ __forceinline__ float rcp_ap(float x) {
+    float r; asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(r) : "f"(x)); return r;
+}
+__device__ __forceinline__ float rsqrt_ap(float x) {
+    float r; asm("rsqrt.approx.ftz.f32 %0, %1;" : "=f"(r) : "f"(x)); return r;
+}
 __device__ __forceinline__ float rcp_rn(float x) {
   float r;
   asm("div.rn.f32 %0, 0f3F800000, %1;" : "=f"(r) : "f"(x));
@@ -264,7 +270,8 @@ extern "C" __global__ void __launch_bounds__(NW * 32, 1) q35_gdn_core(
     gh[i] = hj[i] ? ghp[jj[i]] : 0.f;
   }
   const float g_start = pn > 0 ? ghp[pn - 1] : 0.f;
-  // uh^T as the A operand of the history outputs: [m-tile][a0..a3] = (v0, j 2q..2q+1), (v1, ..), (v0, j + 8), (v1, j + 8)
+  // uh^T as the A operand of the history outputs:
+  // [m-tile][a0..a3] = (v0, j 2q..2q+1), (v1, ..), (v0, j + 8), (v1, j + 8)
   u32 UA[2][4];
 #pragma unroll
   for (int m = 0; m < 2; ++m) {
@@ -442,8 +449,8 @@ extern "C" __global__ void __launch_bounds__(NW * 32, 1) q35_gdn_core(
     const float bt0 = __shfl_sync(FULL, beta, t0), bt1 = __shfl_sync(FULL, beta, t1);
     const float Gr = __shfl_sync(FULL, Gv, r), br = __shfl_sync(FULL, beta, r);
     const float eG0 = __expf(Gt0), eG1 = __expf(Gt1);
-    STAMP(7, QR[3].w ^ KR[3].w ^ QR[0].x ^ KR[0].x ^ fb(vv[1][3]) ^ fb(zz[1][3]) ^ fb(vv[0][0]) ^ fb(zz[0][0]) ^ fb(eG1) ^
-                 fb(br));
+    STAMP(7, QR[3].w ^ KR[3].w ^ QR[0].x ^ KR[0].x ^ fb(vv[1][3]) ^ fb(zz[1][3]) ^ fb(vv[0][0]) ^ fb(zz[0][0]) ^
+                 fb(eG1) ^ fb(br));
 
     // state products on the raw rows (all warps): rows v, columns = tokens; scaled by 1 / |k_t|, scale / |q_t| later
     float KS[2][4], QS[2][4];
@@ -731,7 +738,9 @@ class _NvrtcKernel:
             size = self._check(nvrtc.nvrtcGetProgramLogSize(prog))
             log = b" " * size
             nvrtc.nvrtcGetProgramLog(prog, log)
-            raise RuntimeError("q35_gdn_core: NVRTC compile failed:\n" + log.decode(errors="replace"))
+            raise RuntimeError(
+                "q35_gdn_core: NVRTC compile failed:\n" + log.decode(errors="replace")
+            )
         cubin = b" " * self._check(nvrtc.nvrtcGetCUBINSize(prog))
         self._check(nvrtc.nvrtcGetCUBIN(prog, cubin))
         ptx = b" " * self._check(nvrtc.nvrtcGetPTXSize(prog))
@@ -747,8 +756,11 @@ class _NvrtcKernel:
         from cuda.bindings import nvrtc
 
         err = res[0]
-        ok = (err == cu.CUresult.CUDA_SUCCESS if isinstance(err, cu.CUresult) else
-              err == nvrtc.nvrtcResult.NVRTC_SUCCESS)
+        ok = (
+            err == cu.CUresult.CUDA_SUCCESS
+            if isinstance(err, cu.CUresult)
+            else err == nvrtc.nvrtcResult.NVRTC_SUCCESS
+        )
         if not ok:
             raise RuntimeError(f"q35_gdn_core: {err}")
         return res[1] if len(res) == 2 else res[1:]
@@ -780,18 +792,43 @@ _LOCK = threading.Lock()
 _KERNELS: dict = {}
 
 
-def _kernel(device: int, t: int, hk: int, hv: int, out_fp8: bool, store_o: bool, trigger: int,
-            prof: bool = False, warm: bool = False, nowait: bool = False) -> _NvrtcKernel:
-    key = (device, t, hk, hv, bool(out_fp8), bool(store_o), int(trigger)) + ((1,) if prof else ()) + (
-        ("warm",) if warm else ()) + (("nowait",) if nowait else ())
+def _kernel(
+    device: int,
+    t: int,
+    hk: int,
+    hv: int,
+    out_fp8: bool,
+    store_o: bool,
+    trigger: int,
+    prof: bool = False,
+    warm: bool = False,
+    nowait: bool = False,
+) -> _NvrtcKernel:
+    key = (
+        (device, t, hk, hv, bool(out_fp8), bool(store_o), int(trigger))
+        + ((1,) if prof else ())
+        + (("warm",) if warm else ())
+        + (("nowait",) if nowait else ())
+    )
     kern = _KERNELS.get(key)
     if kern is None:
         with _LOCK, torch.cuda.device(device):
             kern = _KERNELS.get(key)
             if kern is None:
-                kern = _NvrtcKernel(dict(TT=t, HK=hk, HV=hv, OUT_FP8=int(out_fp8), STORE_O=int(store_o),
-                                         TRIGGER=int(trigger), PROF=int(prof), WARM=int(warm),
-                                         NOWAIT=int(nowait)), device)
+                kern = _NvrtcKernel(
+                    dict(
+                        TT=t,
+                        HK=hk,
+                        HV=hv,
+                        OUT_FP8=int(out_fp8),
+                        STORE_O=int(store_o),
+                        TRIGGER=int(trigger),
+                        PROF=int(prof),
+                        WARM=int(warm),
+                        NOWAIT=int(nowait),
+                    ),
+                    device,
+                )
                 _KERNELS[key] = kern
     return kern
 
@@ -814,9 +851,15 @@ def q35_gdn_core_supported(
     ssm_dtype: torch.dtype,
 ) -> bool:
     """Shapes the CUDA core kernel handles (Qwen3.5 TP8 / TP16 decode at T <= 8); others keep the Triton kernel."""
-    return (2 <= draft_token_num <= Q35_GDN_CORE_MAX_T and history_size == 16 and head_k_dim == 128
-            and head_v_dim == 128 and num_v_heads % num_k_heads == 0 and ssm_dtype == torch.bfloat16
-            and num_decodes >= 1)
+    return (
+        2 <= draft_token_num <= Q35_GDN_CORE_MAX_T
+        and history_size == 16
+        and head_k_dim == 128
+        and head_v_dim == 128
+        and num_v_heads % num_k_heads == 0
+        and ssm_dtype == torch.bfloat16
+        and num_decodes >= 1
+    )
 
 
 def _ptr(t: Optional[torch.Tensor]) -> ctypes.c_uint64:
@@ -870,10 +913,24 @@ def q35_gdn_core_update(
     N, T = num_decodes, draft_token_num
     H, HV, K, V = num_k_heads, num_v_heads, head_k_dim, head_v_dim
     conv_dim = 2 * H * K + HV * V
-    assert K == 128 and V == 128 and history_size == 16 and 2 <= T <= Q35_GDN_CORE_MAX_T and HV % H == 0
-    assert mixed_qkv.dtype == torch.bfloat16 and mixed_qkv.shape[0] == N * T and mixed_qkv.shape[1] >= conv_dim
-    assert mixed_qkv.stride(1) == 1 and mixed_qkv.stride(0) % 8 == 0 and mixed_qkv.data_ptr() % 16 == 0
-    assert a.shape == (N * T, HV) and b.shape == (N * T, HV) and a.stride(1) == 1 and b.stride(1) == 1
+    assert (
+        K == 128
+        and V == 128
+        and history_size == 16
+        and 2 <= T <= Q35_GDN_CORE_MAX_T
+        and HV % H == 0
+    )
+    assert (
+        mixed_qkv.dtype == torch.bfloat16
+        and mixed_qkv.shape[0] == N * T
+        and mixed_qkv.shape[1] >= conv_dim
+    )
+    assert (
+        mixed_qkv.stride(1) == 1 and mixed_qkv.stride(0) % 8 == 0 and mixed_qkv.data_ptr() % 16 == 0
+    )
+    assert (
+        a.shape == (N * T, HV) and b.shape == (N * T, HV) and a.stride(1) == 1 and b.stride(1) == 1
+    )
     assert a.stride(0) == b.stride(0)
     assert z.shape == (N * T, HV, V) and z.stride(2) == 1 and z.stride(1) == V
     assert ssm_states.dtype == torch.bfloat16
@@ -881,29 +938,70 @@ def q35_gdn_core_update(
     assert s3 == 1 and s2 == K and s1 == V * K
     for name, tensor in (("old_u", old_u), ("old_k", old_k), ("old_G", old_G)):
         assert tensor.is_contiguous(), f"{name} must be contiguous"
-    assert norm_weight.numel() == V and norm_weight.is_contiguous() and norm_weight.dtype == torch.bfloat16
+    assert (
+        norm_weight.numel() == V
+        and norm_weight.is_contiguous()
+        and norm_weight.dtype == torch.bfloat16
+    )
     assert state_indices.dtype == torch.int32 and state_indices.is_contiguous()
     out_fp8 = fp8_scale is not None
     out_dtype = torch.float8_e4m3fn if out_fp8 else mixed_qkv.dtype
     if norm_out is None:
         norm_out = torch.empty(N * T, HV * V, dtype=out_dtype, device=mixed_qkv.device)
     else:
-        assert norm_out.dtype == out_dtype and norm_out.shape == (N * T, HV * V) and norm_out.stride(1) == 1
+        assert (
+            norm_out.dtype == out_dtype
+            and norm_out.shape == (N * T, HV * V)
+            and norm_out.stride(1) == 1
+        )
     if output is not None:
-        assert output.is_contiguous() and output.numel() == N * T * HV * V and output.dtype == torch.bfloat16
+        assert (
+            output.is_contiguous()
+            and output.numel() == N * T * HV * V
+            and output.dtype == torch.bfloat16
+        )
     if not launch_with_pdl:
         trigger = 0
-    kern = _kernel(mixed_qkv.device.index if mixed_qkv.device.index is not None else torch.cuda.current_device(),
-                   T, H, HV, out_fp8, output is not None, trigger, _profile is not None, warm, _unsafe_skip_wait)
+    kern = _kernel(
+        mixed_qkv.device.index
+        if mixed_qkv.device.index is not None
+        else torch.cuda.current_device(),
+        T,
+        H,
+        HV,
+        out_fp8,
+        output is not None,
+        trigger,
+        _profile is not None,
+        warm,
+        _unsafe_skip_wait,
+    )
     args = [
-        _ptr(mixed_qkv), ctypes.c_int32(mixed_qkv.stride(0)), _ptr(z), ctypes.c_int32(z.stride(0)),
-        _ptr(a), _ptr(b), ctypes.c_int32(a.stride(0)),
-        _ptr(A_log), _ptr(dt_bias),
-        _ptr(ssm_states), ctypes.c_int64(s0), _ptr(state_indices),
-        _ptr(old_u), _ptr(old_k), _ptr(old_G),
-        _ptr(cache_buf_idx), _ptr(prev_num_accepted_tokens),
-        _ptr(norm_weight), _ptr(fp8_scale), ctypes.c_float(norm_eps), ctypes.c_float(K**-0.5),
-        _ptr(norm_out), ctypes.c_int32(norm_out.stride(0)), _ptr(output), _ptr(_profile),
+        _ptr(mixed_qkv),
+        ctypes.c_int32(mixed_qkv.stride(0)),
+        _ptr(z),
+        ctypes.c_int32(z.stride(0)),
+        _ptr(a),
+        _ptr(b),
+        ctypes.c_int32(a.stride(0)),
+        _ptr(A_log),
+        _ptr(dt_bias),
+        _ptr(ssm_states),
+        ctypes.c_int64(s0),
+        _ptr(state_indices),
+        _ptr(old_u),
+        _ptr(old_k),
+        _ptr(old_G),
+        _ptr(cache_buf_idx),
+        _ptr(prev_num_accepted_tokens),
+        _ptr(norm_weight),
+        _ptr(fp8_scale),
+        ctypes.c_float(norm_eps),
+        ctypes.c_float(K**-0.5),
+        _ptr(norm_out),
+        ctypes.c_int32(norm_out.stride(0)),
+        _ptr(output),
+        _ptr(_profile),
     ]
     kern.launch(N * HV, 128, args, pdl=launch_with_pdl)
     return norm_out

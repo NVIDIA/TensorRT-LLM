@@ -292,7 +292,9 @@ def _mma_asm(shape_types: str):
             loc=loc,
             ip=ip,
         )
-        return tuple(Float32(llvm.extractvalue(T.f32(), out, [i], loc=loc, ip=ip)) for i in range(4))
+        return tuple(
+            Float32(llvm.extractvalue(T.f32(), out, [i], loc=loc, ip=ip)) for i in range(4)
+        )
 
     return _mma
 
@@ -466,8 +468,23 @@ class LowMMmaGemmKernel:
         )
         grid = [(self.fp8_ctas + self.bf16_ctas) * self.ksplit, 1, 1]
         kernel = self.kernel(
-            gA16, gA8, gB, gSw, gSin, gSo, gB2, gC, gC2, gCw, gCs, gSlot, gWin, copy_a16, copy_a8,
-            copy_b, copy_b2
+            gA16,
+            gA8,
+            gB,
+            gSw,
+            gSin,
+            gSo,
+            gB2,
+            gC,
+            gC2,
+            gCw,
+            gCs,
+            gSlot,
+            gWin,
+            copy_a16,
+            copy_a8,
+            copy_b,
+            copy_b2,
         )
         if const_expr(self.ksplit > 1):
             kernel.launch(
@@ -544,23 +561,111 @@ class LowMMmaGemmKernel:
         if const_expr(self.fp8_ctas > 0 and self.bf16_ctas > 0):
             if group < self.fp8_ctas:
                 self._cta(
-                    gA16, gA8, gB, gSw, gSin, gSo, gB2, gC, gC2, gCw, gCs, gSlot, gWin, red, part, xs, copy_a16,
-                    copy_a8, copy_b, copy_b2, tidx, group, kslice, True,
+                    gA16,
+                    gA8,
+                    gB,
+                    gSw,
+                    gSin,
+                    gSo,
+                    gB2,
+                    gC,
+                    gC2,
+                    gCw,
+                    gCs,
+                    gSlot,
+                    gWin,
+                    red,
+                    part,
+                    xs,
+                    copy_a16,
+                    copy_a8,
+                    copy_b,
+                    copy_b2,
+                    tidx,
+                    group,
+                    kslice,
+                    True,
                 )
             else:
                 self._cta(
-                    gA16, gA8, gB, gSw, gSin, gSo, gB2, gC, gC2, gCw, gCs, gSlot, gWin, red, part, xs, copy_a16,
-                    copy_a8, copy_b, copy_b2, tidx, group - self.fp8_ctas, kslice, False,
+                    gA16,
+                    gA8,
+                    gB,
+                    gSw,
+                    gSin,
+                    gSo,
+                    gB2,
+                    gC,
+                    gC2,
+                    gCw,
+                    gCs,
+                    gSlot,
+                    gWin,
+                    red,
+                    part,
+                    xs,
+                    copy_a16,
+                    copy_a8,
+                    copy_b,
+                    copy_b2,
+                    tidx,
+                    group - self.fp8_ctas,
+                    kslice,
+                    False,
                 )
         elif const_expr(self.fp8_ctas > 0):
             self._cta(
-                gA16, gA8, gB, gSw, gSin, gSo, gB2, gC, gC2, gCw, gCs, gSlot, gWin, red, part, xs, copy_a16,
-                copy_a8, copy_b, copy_b2, tidx, group, kslice, True,
+                gA16,
+                gA8,
+                gB,
+                gSw,
+                gSin,
+                gSo,
+                gB2,
+                gC,
+                gC2,
+                gCw,
+                gCs,
+                gSlot,
+                gWin,
+                red,
+                part,
+                xs,
+                copy_a16,
+                copy_a8,
+                copy_b,
+                copy_b2,
+                tidx,
+                group,
+                kslice,
+                True,
             )
         else:
             self._cta(
-                gA16, gA8, gB, gSw, gSin, gSo, gB2, gC, gC2, gCw, gCs, gSlot, gWin, red, part, xs, copy_a16,
-                copy_a8, copy_b, copy_b2, tidx, group, kslice, False,
+                gA16,
+                gA8,
+                gB,
+                gSw,
+                gSin,
+                gSo,
+                gB2,
+                gC,
+                gC2,
+                gCw,
+                gCs,
+                gSlot,
+                gWin,
+                red,
+                part,
+                xs,
+                copy_a16,
+                copy_a8,
+                copy_b,
+                copy_b2,
+                tidx,
+                group,
+                kslice,
+                False,
             )
 
     @cute.jit
@@ -696,9 +801,13 @@ class LowMMmaGemmKernel:
         swap: cutlass.Constexpr = self.swap_ab and n_tiles % 2 == 0
         if const_expr(fp8_mma):
             if const_expr(swap):
-                self._mainloop_fp8_swap(acc, gA16, gA8, w8, factor, copy_a16, copy_a8, k_warp0, r, q, n_tiles)
+                self._mainloop_fp8_swap(
+                    acc, gA16, gA8, w8, factor, copy_a16, copy_a8, k_warp0, r, q, n_tiles
+                )
             else:
-                self._mainloop_fp8(acc, gA16, gA8, w8, factor, copy_a16, copy_a8, k_warp0, r, q, n_tiles)
+                self._mainloop_fp8(
+                    acc, gA16, gA8, w8, factor, copy_a16, copy_a8, k_warp0, r, q, n_tiles
+                )
         else:
             if const_expr(swap):
                 self._mainloop_bf16_swap(acc, gA16, w8, w16, copy_a16, k_warp0, r, q, n_tiles, fp8)
@@ -726,11 +835,32 @@ class LowMMmaGemmKernel:
         if const_expr(conv):
             if cta * out_cols < self.conv_channels:
                 self._conv_epilogue(
-                    gC, gCs, gWin, red, xs, tidx, cta, alpha, out_cols, conv_pairs, cv_req, cv_col, cv_ch,
-                    cv_slot, cv_s0, cv_s1, cv_s2, cv_w0, cv_w1, cv_w2, cv_w3,
+                    gC,
+                    gCs,
+                    gWin,
+                    red,
+                    xs,
+                    tidx,
+                    cta,
+                    alpha,
+                    out_cols,
+                    conv_pairs,
+                    cv_req,
+                    cv_col,
+                    cv_ch,
+                    cv_slot,
+                    cv_s0,
+                    cv_s1,
+                    cv_s2,
+                    cv_w0,
+                    cv_w1,
+                    cv_w2,
+                    cv_w3,
                 )
             else:
-                self._epilogue_k1(gC, gC2, red, tidx, cta, alpha, out_factor, out_cols, out_col0, swiglu)
+                self._epilogue_k1(
+                    gC, gC2, red, tidx, cta, alpha, out_factor, out_cols, out_col0, swiglu
+                )
         elif const_expr(self.ksplit == 1):
             for idx in cutlass.range(tidx, num_rows * out_cols, 32 * k_warps):
                 row = idx // out_cols
@@ -764,7 +894,9 @@ class LowMMmaGemmKernel:
             cute.arch.cluster_wait()
             # ... summed over the cluster in rank order through distributed shared memory; rank r
             # finishes the outputs idx = r (mod ksplit).
-            for idx in cutlass.range(kslice + tidx * self.ksplit, num_rows * out_cols, 32 * k_warps * self.ksplit):
+            for idx in cutlass.range(
+                kslice + tidx * self.ksplit, num_rows * out_cols, 32 * k_warps * self.ksplit
+            ):
                 row = idx // out_cols
                 col = idx % out_cols
                 value = Float32(0.0)
@@ -784,8 +916,19 @@ class LowMMmaGemmKernel:
             griddepcontrol_launch_dependents()
 
     @cute.jit
-    def _epilogue_k1(self, gC, gC2, red, tidx, cta, alpha, out_factor, out_cols: cutlass.Constexpr,
-                     out_col0: cutlass.Constexpr, swiglu: cutlass.Constexpr) -> None:
+    def _epilogue_k1(
+        self,
+        gC,
+        gC2,
+        red,
+        tidx,
+        cta,
+        alpha,
+        out_factor,
+        out_cols: cutlass.Constexpr,
+        out_col0: cutlass.Constexpr,
+        swiglu: cutlass.Constexpr,
+    ) -> None:
         """The ksplit == 1 epilogue (warp sums in order, alpha, store), for CTAs of a conv-epilogue launch
         past the conv channels."""
         num_rows: cutlass.Constexpr = self.num_rows
@@ -810,9 +953,30 @@ class LowMMmaGemmKernel:
             self._finish(gC, gC2, row, out_col0 + cta * out_cols + col, value, out_factor)
 
     @cute.jit
-    def _conv_epilogue(self, gC, gCs, gWin, red, xs, tidx, cta, alpha, out_cols: cutlass.Constexpr,
-                       conv_pairs: cutlass.Constexpr, cv_req, cv_col, cv_ch, cv_slot, cv_s0, cv_s1, cv_s2,
-                       cv_w0, cv_w1, cv_w2, cv_w3) -> None:
+    def _conv_epilogue(
+        self,
+        gC,
+        gCs,
+        gWin,
+        red,
+        xs,
+        tidx,
+        cta,
+        alpha,
+        out_cols: cutlass.Constexpr,
+        conv_pairs: cutlass.Constexpr,
+        cv_req,
+        cv_col,
+        cv_ch,
+        cv_slot,
+        cv_s0,
+        cv_s1,
+        cv_s2,
+        cv_w0,
+        cv_w1,
+        cv_w2,
+        cv_w3,
+    ) -> None:
         """GDN causal conv1d update of this CTA's channels (module doc): BF16 GEMM outputs into shared memory,
         then one thread per (request, channel) writes the conv outputs of all tokens, the windows after every
         token and the conv state after the last one."""
@@ -834,7 +998,9 @@ class LowMMmaGemmKernel:
             for t in cutlass.range_constexpr(conv_t):
                 ext.append(xs[row0 + t, cv_col])
             for t in cutlass.range_constexpr(conv_t):
-                y = _gdn_conv_silu(ext[t], ext[t + 1], ext[t + 2], ext[t + 3], cv_w0, cv_w1, cv_w2, cv_w3)
+                y = _gdn_conv_silu(
+                    ext[t], ext[t + 1], ext[t + 2], ext[t + 3], cv_w0, cv_w1, cv_w2, cv_w3
+                )
                 gC[row0 + t, cv_ch] = y.to(gC.element_type)
             if cv_slot >= 0:
                 for t in cutlass.range_constexpr(conv_t):
@@ -1038,13 +1204,29 @@ class LowMMmaGemmKernel:
                 for j in cutlass.range_constexpr(4):
                     if const_expr(j < 2):
                         c0, c1, c2, c3 = _mma_bf16_m16n8k16(
-                            w_lo[2 * j], w_hi[2 * j], w_lo[2 * j + 1], w_hi[2 * j + 1],
-                            a0_u32[2 * j], a0_u32[2 * j + 1], c0, c1, c2, c3,
+                            w_lo[2 * j],
+                            w_hi[2 * j],
+                            w_lo[2 * j + 1],
+                            w_hi[2 * j + 1],
+                            a0_u32[2 * j],
+                            a0_u32[2 * j + 1],
+                            c0,
+                            c1,
+                            c2,
+                            c3,
                         )
                     else:
                         c0, c1, c2, c3 = _mma_bf16_m16n8k16(
-                            w_lo[2 * j], w_hi[2 * j], w_lo[2 * j + 1], w_hi[2 * j + 1],
-                            a1_u32[2 * j - 4], a1_u32[2 * j - 3], c0, c1, c2, c3,
+                            w_lo[2 * j],
+                            w_hi[2 * j],
+                            w_lo[2 * j + 1],
+                            w_hi[2 * j + 1],
+                            a1_u32[2 * j - 4],
+                            a1_u32[2 * j - 3],
+                            c0,
+                            c1,
+                            c2,
+                            c3,
                         )
                 acc[pair, 0] = c0
                 acc[pair, 1] = c1

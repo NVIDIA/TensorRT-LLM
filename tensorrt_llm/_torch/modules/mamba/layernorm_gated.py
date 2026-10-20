@@ -137,7 +137,8 @@ _MULTIROW_MAX_N = 256
 _Q35_GDN_NORM_PDL = os.environ.get("TRTLLM_Q35_GDN_NORM_PDL", "0") == "1"
 # TRTLLM_Q35_PDL_EARLY_TRIGGER=1: release the dependents (out_proj) at kernel entry instead of after the store, so a
 # PDL-launched GEMM can prefetch its weights while the norm runs (it reads Y only after its griddepcontrol.wait).
-_Q35_PDL_EARLY_TRIGGER = os.environ.get("TRTLLM_Q35_PDL_EARLY_TRIGGER", "0") == "1"
+_Q35_PDL_EARLY_TRIGGER = os.environ.get("TRTLLM_Q35_PDL_EARLY_TRIGGER",
+                                        "0") == "1"
 
 
 @functools.lru_cache(maxsize=None)
@@ -288,7 +289,8 @@ def rms_norm_gated_token_major(
     out = torch.empty_like(x, dtype=out_dtype)
     grid_size = triton.cdiv(M, _MULTIROW_ROWS)
     launch_with_pdl = _multirow_pdl(grid_size, x.device.index)
-    pdl_kwargs = dict(LAUNCH_WITH_PDL=True, launch_pdl=True) if launch_with_pdl else {}
+    pdl_kwargs = dict(LAUNCH_WITH_PDL=True,
+                      launch_pdl=True) if launch_with_pdl else {}
     if _Q35_PDL_EARLY_TRIGGER:
         pdl_kwargs["EARLY_TRIGGER"] = True
     with torch.cuda.device(x.device.index):

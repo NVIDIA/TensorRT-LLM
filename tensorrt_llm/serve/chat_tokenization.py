@@ -242,7 +242,9 @@ class IncrementalTokenizationCache:
             offset_ids = list(encoding["input_ids"])
             offsets = list(encoding["offset_mapping"])
         except (KeyError, NotImplementedError, TypeError, ValueError):
-            return (ids if ids is not None else tokenizer.encode(rendered, add_special_tokens=False)), None
+            return (
+                ids if ids is not None else tokenizer.encode(rendered, add_special_tokens=False)
+            ), None
         if ids is None:
             if len(offset_ids) != len(offsets):
                 return tokenizer.encode(rendered, add_special_tokens=False), None

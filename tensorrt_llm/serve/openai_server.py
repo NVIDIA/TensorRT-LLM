@@ -58,8 +58,8 @@ from tensorrt_llm.metrics.collector import MetricsCollector
 from tensorrt_llm.runtime.kv_cache_hash import \
     get_effective_kv_cache_event_hash_algo
 from tensorrt_llm.sampling_params import GuidedDecodingParams, SamplingParams
-from tensorrt_llm.serve.chat_tokenization import (
-    IncrementalTokenizationCache, tokenize_harmony_chat_request)
+from tensorrt_llm.serve.chat_tokenization import (IncrementalTokenizationCache,
+                                                  tokenize_harmony_chat_request)
 from tensorrt_llm.serve.chat_utils import (load_chat_template,
                                            parse_chat_messages_coroutines,
                                            resolve_top_level_model_type)
@@ -1468,8 +1468,7 @@ class OpenAIServer(_VideoRoutesMixin):
             raise
 
     async def _maybe_incremental_tokenize_chat_prompt(
-            self, prompt: str | list[int],
-            request: ChatCompletionRequest,
+            self, prompt: str | list[int], request: ChatCompletionRequest,
             has_multimodal: bool) -> str | list[int]:
         """Use the shared cache for eligible conversation-keyed text prompts."""
         if (not self._incremental_tokenizer.enabled

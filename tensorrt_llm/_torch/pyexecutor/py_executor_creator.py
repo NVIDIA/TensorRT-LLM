@@ -1115,7 +1115,9 @@ def create_py_executor(
         # replaces a >= 1 GiB buffer) races NIXL/UCX's progress thread on a disagg worker: segfault in
         # cuEventQuery <- ucp_worker_arm <- nixlUcxWorker::arm. Keep the blocks cached from here on.
         torch.cuda.empty_cache = lambda: None
-        logger.info("TRTLLM_Q35_FREEZE_EMPTY_CACHE: torch.cuda.empty_cache() is a no-op while serving")
+        logger.info(
+            "TRTLLM_Q35_FREEZE_EMPTY_CACHE: torch.cuda.empty_cache() is a no-op while serving"
+        )
 
     py_executor.start_worker()
 

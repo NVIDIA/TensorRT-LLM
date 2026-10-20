@@ -77,11 +77,33 @@ def steady_prepare_enabled() -> bool:
 # Integer arguments (B, strides) are not specialized, pointers not on alignment, and SteadyMtpPrepare launches
 # every batch size with one BLOCK: one compiled variant per engine, compiled during the engine warmup
 # (SteadyMtpPrepare.__init__) instead of a JIT stall (up to ~0.3 s) at the first steady step of each new batch size.
-_STAGE_INT_ARGS = ["nnt_tok_stride", "nnt_slot_stride", "nd_slot_stride", "mrope_axis_stride",
-                   "static_pos_axis_stride", "B"]
-_STAGE_PTR_ARGS = ["slab", "next_new_tokens", "next_drafts", "new_lens", "input_ids", "draft_tokens",
-                   "num_accepted", "prev_batch_idx", "prev_pos_idx", "prev_pos_offsets", "prev_kv_offsets",
-                   "positions", "mrope_positions", "gather_ids", "kv_lens_out", "static_ids", "static_pos"]
+_STAGE_INT_ARGS = [
+    "nnt_tok_stride",
+    "nnt_slot_stride",
+    "nd_slot_stride",
+    "mrope_axis_stride",
+    "static_pos_axis_stride",
+    "B",
+]
+_STAGE_PTR_ARGS = [
+    "slab",
+    "next_new_tokens",
+    "next_drafts",
+    "new_lens",
+    "input_ids",
+    "draft_tokens",
+    "num_accepted",
+    "prev_batch_idx",
+    "prev_pos_idx",
+    "prev_pos_offsets",
+    "prev_kv_offsets",
+    "positions",
+    "mrope_positions",
+    "gather_ids",
+    "kv_lens_out",
+    "static_ids",
+    "static_pos",
+]
 
 
 def _stage_jit(**kwargs):
@@ -164,16 +186,27 @@ def _steady_stage_kernel(
     tl.store(draft_tokens + i, dval, mask=drf)
 
 
-def stage_steady_inputs(device_slab: torch.Tensor, b: int, t: int, new_tensors_device, *,
-                        input_ids: torch.Tensor, draft_tokens: torch.Tensor,
-                        num_accepted: torch.Tensor, prev_batch_idx: torch.Tensor,
-                        prev_pos_idx: torch.Tensor, prev_pos_offsets: torch.Tensor,
-                        prev_kv_offsets: torch.Tensor, positions: torch.Tensor,
-                        mrope_positions: Optional[torch.Tensor], gather_ids: torch.Tensor,
-                        kv_lens_cuda: Optional[torch.Tensor] = None,
-                        static_input_ids: Optional[torch.Tensor] = None,
-                        static_position_ids: Optional[torch.Tensor] = None,
-                        block: Optional[int] = None) -> None:
+def stage_steady_inputs(
+    device_slab: torch.Tensor,
+    b: int,
+    t: int,
+    new_tensors_device,
+    *,
+    input_ids: torch.Tensor,
+    draft_tokens: torch.Tensor,
+    num_accepted: torch.Tensor,
+    prev_batch_idx: torch.Tensor,
+    prev_pos_idx: torch.Tensor,
+    prev_pos_offsets: torch.Tensor,
+    prev_kv_offsets: torch.Tensor,
+    positions: torch.Tensor,
+    mrope_positions: Optional[torch.Tensor],
+    gather_ids: torch.Tensor,
+    kv_lens_cuda: Optional[torch.Tensor] = None,
+    static_input_ids: Optional[torch.Tensor] = None,
+    static_position_ids: Optional[torch.Tensor] = None,
+    block: Optional[int] = None,
+) -> None:
     """One launch of the steady staging kernel (slab layout: slots, accepted, positions[, kv lens]).
 
     ``block``: the BLOCK of the launch when it covers the batch (one variant for all batch sizes), else the
@@ -187,7 +220,7 @@ def stage_steady_inputs(device_slab: torch.Tensor, b: int, t: int, new_tensors_d
     new_tokens = new_tensors_device.new_tokens
     next_drafts = new_tensors_device.next_draft_tokens
     has_mrope = mrope_positions is not None
-    _steady_stage_kernel[(1, )](
+    _steady_stage_kernel[(1,)](
         device_slab,
         new_tokens,
         new_tokens.stride(0),
@@ -237,9 +270,13 @@ def _block_counts(kv_cache_manager, request_ids: List[int]) -> Optional[Tuple[An
     kv_map = getattr(kv_cache_manager, "kv_cache_map", None)
     table = getattr(kv_cache_manager, "host_kv_cache_block_offsets", None)
     mapper = getattr(kv_cache_manager, "index_mapper", None)
-    if (kv_map is None or table is None or mapper is None
-            or getattr(kv_cache_manager, "enable_swa_scratch_reuse", False)
-            or getattr(kv_cache_manager, "enable_block_reuse", False)):
+    if (
+        kv_map is None
+        or table is None
+        or mapper is None
+        or getattr(kv_cache_manager, "enable_swa_scratch_reuse", False)
+        or getattr(kv_cache_manager, "enable_block_reuse", False)
+    ):
         return None
     host = getattr(kv_cache_manager, "_q35_host_table_np", None)
     if host is None or host.shape != tuple(table.shape):
@@ -252,12 +289,13 @@ def _block_counts(kv_cache_manager, request_ids: List[int]) -> Optional[Tuple[An
             return None
         n = cache.num_blocks
         row = mapper.get_index(rid) * beam
-        keys.append((n, host[:, row, 0, max(0, n - _TAIL_BLOCKS):n].tobytes()))
+        keys.append((n, host[:, row, 0, max(0, n - _TAIL_BLOCKS) : n].tobytes()))
     return tuple(keys)
 
 
-def _steady_attn_prepare(attn_metadata, kv_lens: List[int], num_extra_kv_tokens: int,
-                         state: "SteadyMtpPrepare") -> None:
+def _steady_attn_prepare(
+    attn_metadata, kv_lens: List[int], num_extra_kv_tokens: int, state: "SteadyMtpPrepare"
+) -> None:
     """TrtllmAttentionMetadata.prepare() of a steady decode step.
 
     The request ids, prompt lengths and request types are those the recording full pass (or the
@@ -284,7 +322,8 @@ def _steady_attn_prepare(attn_metadata, kv_lens: List[int], num_extra_kv_tokens:
     kv_cache_manager = attn_metadata.kv_cache_manager
     assert max_kv_len <= kv_cache_manager.max_seq_len, (
         f"The max KV cache length of input sequences ({max_kv_len}) exceeds the KV cache "
-        f"manager's maximum supported length ({kv_cache_manager.max_seq_len}).")
+        f"manager's maximum supported length ({kv_cache_manager.max_seq_len})."
+    )
     # The block-offset table rows of a steady batch change only at their tails (a block appended, or the last
     # block freed by the draft rewind and re-allocated; no block reuse / SWA on this path): skip the copies while
     # every request's block count and tail pages are those the last copy saw (the recording full pass or an
@@ -293,18 +332,27 @@ def _steady_attn_prepare(attn_metadata, kv_lens: List[int], num_extra_kv_tokens:
     counts = _block_counts(kv_cache_manager, attn_metadata.request_ids)
     state.skipped_block_copy = not (counts is None or counts != rec.block_counts)
     if not state.skipped_block_copy:
-        kv_cache_manager.copy_batch_block_offsets(attn_metadata.kv_cache_block_offsets,
-                                                  attn_metadata.request_ids,
-                                                  attn_metadata.beam_width,
-                                                  attn_metadata.num_contexts, n, max_blocks=None)
+        kv_cache_manager.copy_batch_block_offsets(
+            attn_metadata.kv_cache_block_offsets,
+            attn_metadata.request_ids,
+            attn_metadata.beam_width,
+            attn_metadata.num_contexts,
+            n,
+            max_blocks=None,
+        )
         rec.block_counts = counts if state.skip_block_copies else None
     draft = attn_metadata.draft_kv_cache_manager
     if draft is not None:
         draft_counts = _block_counts(draft, attn_metadata.request_ids)
         if draft_counts is None or draft_counts != rec.draft_block_counts:
-            draft.copy_batch_block_offsets(attn_metadata.draft_kv_cache_block_offsets,
-                                           attn_metadata.request_ids, attn_metadata.beam_width,
-                                           attn_metadata.num_contexts, n, max_blocks=None)
+            draft.copy_batch_block_offsets(
+                attn_metadata.draft_kv_cache_block_offsets,
+                attn_metadata.request_ids,
+                attn_metadata.beam_width,
+                attn_metadata.num_contexts,
+                n,
+                max_blocks=None,
+            )
             rec.draft_block_counts = draft_counts if state.skip_block_copies else None
     attn_metadata._bind_runtime_views(
         kv_lens_cuda=attn_metadata.kv_lens_cuda[:n],
@@ -318,6 +366,7 @@ def _steady_attn_prepare(attn_metadata, kv_lens: List[int], num_extra_kv_tokens:
 @dataclass
 class _Record:
     """What the last qualifying full pass left, keyed by the batch it ran."""
+
     request_ids: List[int]
     slots: List[int]
     prompt_lengths: List[int]
@@ -356,7 +405,9 @@ class SteadyMtpPrepare:
         self.n_fast = 0
         self.n_full = 0
         self.n_verified = 0
-        self.n_realloc_stale = 0  # verified steps where a block-count-only skip key would have left a stale table
+        self.n_realloc_stale = (
+            0  # verified steps where a block-count-only skip key would have left a stale table
+        )
         max_requests = max(1, int(engine.batch_size))
         max_tokens = int(engine.max_num_tokens)
         self.slab_capacity = 3 * max_requests + max_tokens
@@ -385,64 +436,118 @@ class SteadyMtpPrepare:
         dummy = self.device_slab[:1]
         use_mrope = bool(engine.use_mrope)
         stage_steady_inputs(
-            self.device_slab, 0, t,
-            types.SimpleNamespace(new_tokens=dummy.view(1, 1, 1), next_draft_tokens=dummy.view(1, 1),
-                                  new_tokens_lens=dummy),
-            input_ids=dummy, draft_tokens=dummy, num_accepted=dummy, prev_batch_idx=dummy,
-            prev_pos_idx=dummy, prev_pos_offsets=dummy, prev_kv_offsets=dummy, positions=dummy,
-            mrope_positions=dummy.view(1, 1, 1) if use_mrope else None, gather_ids=dummy,
+            self.device_slab,
+            0,
+            t,
+            types.SimpleNamespace(
+                new_tokens=dummy.view(1, 1, 1),
+                next_draft_tokens=dummy.view(1, 1),
+                new_tokens_lens=dummy,
+            ),
+            input_ids=dummy,
+            draft_tokens=dummy,
+            num_accepted=dummy,
+            prev_batch_idx=dummy,
+            prev_pos_idx=dummy,
+            prev_pos_offsets=dummy,
+            prev_kv_offsets=dummy,
+            positions=dummy,
+            mrope_positions=dummy.view(1, 1, 1) if use_mrope else None,
+            gather_ids=dummy,
             kv_lens_cuda=dummy if os.environ.get(ATTN_ENV, "0") == "1" else None,
             static_input_ids=dummy if os.environ.get(STATIC_ENV, "0") == "1" else None,
             static_position_ids=(dummy.view(1, 1, 1) if use_mrope else dummy.view(1, 1))
-            if os.environ.get(STATIC_ENV, "0") == "1" else None,
-            block=self.block)
+            if os.environ.get(STATIC_ENV, "0") == "1"
+            else None,
+            block=self.block,
+        )
 
     # ------------------------------------------------------------------ eligibility
     @staticmethod
     def engine_supported(engine) -> bool:
         spec_config = engine.spec_config
-        return (spec_config is not None and engine.enable_spec_decode
-                and not engine.is_draft_model
-                and spec_config.spec_dec_mode.use_one_engine()
-                and spec_config.is_linear_tree and engine.guided_decoder is None
-                and not engine.enable_attention_dp and not engine.use_beam_search
-                and engine.max_beam_width == 1
-                and not engine._is_encoder_decoder_model()
-                and not engine.mapping.has_cp_helix()
-                and not engine._disable_overlap_scheduler
-                and getattr(engine, "cuda_graph_lora_manager", None) is None)
+        return (
+            spec_config is not None
+            and engine.enable_spec_decode
+            and not engine.is_draft_model
+            and spec_config.spec_dec_mode.use_one_engine()
+            and spec_config.is_linear_tree
+            and engine.guided_decoder is None
+            and not engine.enable_attention_dp
+            and not engine.use_beam_search
+            and engine.max_beam_width == 1
+            and not engine._is_encoder_decoder_model()
+            and not engine.mapping.has_cp_helix()
+            and not engine._disable_overlap_scheduler
+            and getattr(engine, "cuda_graph_lora_manager", None) is None
+        )
 
-    def _batch_matches(self, engine, scheduled_requests, attn_metadata, spec_metadata,
-                       new_tensors_device, promoted_context_request_ids) -> bool:
+    def _batch_matches(
+        self,
+        engine,
+        scheduled_requests,
+        attn_metadata,
+        spec_metadata,
+        new_tensors_device,
+        promoted_context_request_ids,
+    ) -> bool:
         rec = self.record
-        if (rec is None or self.disabled or engine.is_warmup or promoted_context_request_ids
-                or scheduled_requests.num_context_requests != 0
-                or attn_metadata is not rec.attn_metadata
-                or spec_metadata is not rec.spec_metadata
-                or not attn_metadata.is_cuda_graph
-                or engine.runtime_draft_len != rec.runtime_draft_len
-                or new_tensors_device is None
-                or getattr(new_tensors_device, "next_draft_tokens", None) is None
-                or getattr(new_tensors_device, "new_tokens_lens", None) is None):
+        if (
+            rec is None
+            or self.disabled
+            or engine.is_warmup
+            or promoted_context_request_ids
+            or scheduled_requests.num_context_requests != 0
+            or attn_metadata is not rec.attn_metadata
+            or spec_metadata is not rec.spec_metadata
+            or not attn_metadata.is_cuda_graph
+            or engine.runtime_draft_len != rec.runtime_draft_len
+            or new_tensors_device is None
+            or getattr(new_tensors_device, "next_draft_tokens", None) is None
+            or getattr(new_tensors_device, "new_tokens_lens", None) is None
+        ):
             return False
         gen = scheduled_requests.generation_requests
         if len(gen) != len(rec.request_ids):
             return False
         for request, rid, slot in zip(gen, rec.request_ids, rec.slots):
-            if (request.py_request_id != rid or request.py_seq_slot != slot
-                    or request.py_batch_idx != slot or request.is_dummy
-                    or request.py_multimodal_data is not None
-                    or getattr(request, "py_needs_onehot_draft_probs", False)):
+            if (
+                request.py_request_id != rid
+                or request.py_seq_slot != slot
+                or request.py_batch_idx != slot
+                or request.is_dummy
+                or request.py_multimodal_data is not None
+                or getattr(request, "py_needs_onehot_draft_probs", False)
+            ):
                 return False
         return True
 
     # ------------------------------------------------------------------ record
-    def maybe_record(self, engine, *, scheduled_requests, attn_metadata, spec_metadata,
-                     resource_manager, kv_cache_manager, request_ids, prompt_lengths,
-                     sequence_lengths, draft_lens, previous_batch_indices, num_tokens,
-                     num_draft_tokens, extend_requests, extend_dummy_requests,
-                     generation_requests, first_draft_requests, padded, mrope_lists_empty,
-                     has_lora, promoted_context_request_ids) -> None:
+    def maybe_record(
+        self,
+        engine,
+        *,
+        scheduled_requests,
+        attn_metadata,
+        spec_metadata,
+        resource_manager,
+        kv_cache_manager,
+        request_ids,
+        prompt_lengths,
+        sequence_lengths,
+        draft_lens,
+        previous_batch_indices,
+        num_tokens,
+        num_draft_tokens,
+        extend_requests,
+        extend_dummy_requests,
+        generation_requests,
+        first_draft_requests,
+        padded,
+        mrope_lists_empty,
+        has_lora,
+        promoted_context_request_ids,
+    ) -> None:
         """Called at the end of a full _prepare_tp_inputs pass; keeps the record if it qualifies."""
         self.n_full += 1
         self.record = None
@@ -451,20 +556,37 @@ class SteadyMtpPrepare:
         b = len(extend_requests)
         from .resource_manager import ResourceManagerType
 
-        if (resource_manager is None or resource_manager.get_resource_manager(
-                ResourceManagerType.PEFT_CACHE_MANAGER) is not None):
+        if (
+            resource_manager is None
+            or resource_manager.get_resource_manager(ResourceManagerType.PEFT_CACHE_MANAGER)
+            is not None
+        ):
             return
-        if (b == 0 or promoted_context_request_ids or scheduled_requests.num_context_requests
-                or extend_dummy_requests or generation_requests or first_draft_requests
-                or num_tokens or num_draft_tokens or padded or not mrope_lists_empty or has_lora
-                or len(previous_batch_indices) != b or spec_metadata is None
-                or not attn_metadata.is_cuda_graph
-                or engine._get_position_id_offset() != 0):
+        if (
+            b == 0
+            or promoted_context_request_ids
+            or scheduled_requests.num_context_requests
+            or extend_dummy_requests
+            or generation_requests
+            or first_draft_requests
+            or num_tokens
+            or num_draft_tokens
+            or padded
+            or not mrope_lists_empty
+            or has_lora
+            or len(previous_batch_indices) != b
+            or spec_metadata is None
+            or not attn_metadata.is_cuda_graph
+            or engine._get_position_id_offset() != 0
+        ):
             return
         tokens_per_step = engine.get_runtime_tokens_per_gen_step(engine.runtime_draft_len)
-        if (sequence_lengths != [tokens_per_step] * b
-                or draft_lens != [tokens_per_step - 1] * b or tokens_per_step < 2
-                or 2 * b + b * tokens_per_step > self.slab_capacity):
+        if (
+            sequence_lengths != [tokens_per_step] * b
+            or draft_lens != [tokens_per_step - 1] * b
+            or tokens_per_step < 2
+            or 2 * b + b * tokens_per_step > self.slab_capacity
+        ):
             return
         gen = scheduled_requests.generation_requests
         slots = [request.py_seq_slot for request in gen]
@@ -481,31 +603,42 @@ class SteadyMtpPrepare:
         from ..attention_backend.trtllm import TrtllmAttentionMetadata
 
         seq_lens_kv = attn_metadata.seq_lens_kv[:b].tolist()
-        attn_steady = (os.environ.get(ATTN_ENV, "0") == "1"
-                       and type(attn_metadata) is TrtllmAttentionMetadata
-                       and attn_metadata.kv_cache_manager is not None
-                       and not attn_metadata.enable_flash_mla
-                       and not attn_metadata.enable_helix
-                       and not attn_metadata.enable_context_mla_with_cached_kv
-                       and attn_metadata.num_seqs == b
-                       and 3 * b + b * tokens_per_step <= self.slab_capacity)
+        attn_steady = (
+            os.environ.get(ATTN_ENV, "0") == "1"
+            and type(attn_metadata) is TrtllmAttentionMetadata
+            and attn_metadata.kv_cache_manager is not None
+            and not attn_metadata.enable_flash_mla
+            and not attn_metadata.enable_helix
+            and not attn_metadata.enable_context_mla_with_cached_kv
+            and attn_metadata.num_seqs == b
+            and 3 * b + b * tokens_per_step <= self.slab_capacity
+        )
         static_ids = static_pos = None
         runner = getattr(engine, "cuda_graph_runner", None)
         static = getattr(runner, "shared_static_tensors", None) or {}
         n_tokens = b * tokens_per_step
-        if (os.environ.get(STATIC_ENV, "0") == "1" and "input_ids" in static
-                and "position_ids" in static and static["input_ids"].shape[0] >= n_tokens
-                and static["position_ids"].shape[-1] >= n_tokens
-                and static["position_ids"].dim() == (3 if engine.use_mrope else 2)
-                and static["input_ids"].dtype == torch.int32
-                and static["position_ids"].dtype == torch.int32):
+        if (
+            os.environ.get(STATIC_ENV, "0") == "1"
+            and "input_ids" in static
+            and "position_ids" in static
+            and static["input_ids"].shape[0] >= n_tokens
+            and static["position_ids"].shape[-1] >= n_tokens
+            and static["position_ids"].dim() == (3 if engine.use_mrope else 2)
+            and static["input_ids"].dtype == torch.int32
+            and static["position_ids"].dtype == torch.int32
+        ):
             static_ids, static_pos = static["input_ids"], static["position_ids"]
         skip_blocks = self.skip_block_copies and attn_steady
         draft_manager = getattr(attn_metadata, "draft_kv_cache_manager", None)
         self.record = _Record(
-            block_counts=_block_counts(kv_cache_manager, list(request_ids)) if skip_blocks else None,
-            draft_block_counts=(_block_counts(draft_manager, list(request_ids))
-                                if skip_blocks and draft_manager is not None else None),
+            block_counts=_block_counts(kv_cache_manager, list(request_ids))
+            if skip_blocks
+            else None,
+            draft_block_counts=(
+                _block_counts(draft_manager, list(request_ids))
+                if skip_blocks and draft_manager is not None
+                else None
+            ),
             static_ids=static_ids,
             static_pos=static_pos,
             seq_lens_kv=seq_lens_kv,
@@ -522,27 +655,55 @@ class SteadyMtpPrepare:
             spec_metadata=spec_metadata,
             resource_manager=resource_manager,
             kv_cache_manager=kv_cache_manager,
-            has_mamba_chunk_size=hasattr(engine.model.model_config.pretrained_config,
-                                         "chunk_size"),
-            mamba_chunk_size=getattr(engine.model.model_config.pretrained_config, "chunk_size",
-                                     None),
+            has_mamba_chunk_size=hasattr(engine.model.model_config.pretrained_config, "chunk_size"),
+            mamba_chunk_size=getattr(
+                engine.model.model_config.pretrained_config, "chunk_size", None
+            ),
             use_mrope=bool(engine.use_mrope),
         )
 
     # ------------------------------------------------------------------ fast path
-    def try_prepare(self, engine, scheduled_requests, kv_cache_manager, attn_metadata,
-                    spec_metadata, new_tensors_device, resource_manager,
-                    promoted_context_request_ids, full_prepare_fn
-                    ) -> Optional[Tuple[Dict[str, Any], torch.Tensor]]:
-        if not self._batch_matches(engine, scheduled_requests, attn_metadata, spec_metadata,
-                                   new_tensors_device, promoted_context_request_ids):
+    def try_prepare(
+        self,
+        engine,
+        scheduled_requests,
+        kv_cache_manager,
+        attn_metadata,
+        spec_metadata,
+        new_tensors_device,
+        resource_manager,
+        promoted_context_request_ids,
+        full_prepare_fn,
+    ) -> Optional[Tuple[Dict[str, Any], torch.Tensor]]:
+        if not self._batch_matches(
+            engine,
+            scheduled_requests,
+            attn_metadata,
+            spec_metadata,
+            new_tensors_device,
+            promoted_context_request_ids,
+        ):
             return None
-        if (self.verify_every > 0 and (self.n_fast + 1) % self.verify_every == 0):
-            return self._verify(engine, scheduled_requests, kv_cache_manager, attn_metadata,
-                                spec_metadata, new_tensors_device, resource_manager,
-                                full_prepare_fn)
-        return self._fast(engine, scheduled_requests, kv_cache_manager, attn_metadata,
-                          spec_metadata, new_tensors_device, resource_manager)
+        if self.verify_every > 0 and (self.n_fast + 1) % self.verify_every == 0:
+            return self._verify(
+                engine,
+                scheduled_requests,
+                kv_cache_manager,
+                attn_metadata,
+                spec_metadata,
+                new_tensors_device,
+                resource_manager,
+                full_prepare_fn,
+            )
+        return self._fast(
+            engine,
+            scheduled_requests,
+            kv_cache_manager,
+            attn_metadata,
+            spec_metadata,
+            new_tensors_device,
+            resource_manager,
+        )
 
     def _next_slab(self) -> int:
         k = self.ring_pos
@@ -554,8 +715,16 @@ class SteadyMtpPrepare:
             event.synchronize()
         return k
 
-    def _fast(self, engine, scheduled_requests, kv_cache_manager, attn_metadata, spec_metadata,
-              new_tensors_device, resource_manager):
+    def _fast(
+        self,
+        engine,
+        scheduled_requests,
+        kv_cache_manager,
+        attn_metadata,
+        spec_metadata,
+        new_tensors_device,
+        resource_manager,
+    ):
         rec = self.record
         gen = scheduled_requests.generation_requests
         b = len(gen)
@@ -563,7 +732,8 @@ class SteadyMtpPrepare:
         d = t - 1
         n = b * t
         padded_num_tokens, can_run_piecewise, _ = engine._get_padding_params(
-            n, 0, engine._get_all_rank_num_tokens(attn_metadata))
+            n, 0, engine._get_all_rank_num_tokens(attn_metadata)
+        )
         if padded_num_tokens != n:
             return None
         # Host integers of this step (the full pass computes the same values).
@@ -576,23 +746,28 @@ class SteadyMtpPrepare:
             view[i] = rec.slots[i]
             view[b + i] = request.py_num_accepted_draft_tokens
             base = 2 * b + i * t
-            view[base:base + t] = np.arange(past_seen, past_seen + t, dtype=np.int32)
+            view[base : base + t] = np.arange(past_seen, past_seen + t, dtype=np.int32)
             num_cached.append(past_seen + t - request.py_num_compressed_tokens)
             kv_lens.append(num_cached[-1] + rec.seq_lens_kv[i])
             request.cached_tokens = past_seen + t
             request.py_batch_idx = request.py_seq_slot
         used = 2 * b + n
         if rec.attn_steady:
-            view[used:used + b] = kv_lens
+            view[used : used + b] = kv_lens
             used += b
         if self.zero_copy:
-            slab = self.host_slabs[k]  # read by the kernel through the pinned buffer's device mapping
+            slab = self.host_slabs[
+                k
+            ]  # read by the kernel through the pinned buffer's device mapping
         else:
             self.device_slab[:used].copy_(self.host_slabs[k][:used], non_blocking=True)
             slab = self.device_slab
 
         stage_steady_inputs(
-            slab, b, t, new_tensors_device,
+            slab,
+            b,
+            t,
+            new_tensors_device,
             input_ids=engine.input_ids_cuda,
             draft_tokens=engine.draft_tokens_cuda,
             num_accepted=engine.num_accepted_draft_tokens_cuda,
@@ -606,7 +781,8 @@ class SteadyMtpPrepare:
             kv_lens_cuda=attn_metadata.kv_lens_cuda if rec.attn_steady else None,
             static_input_ids=rec.static_ids,
             static_position_ids=rec.static_pos,
-            block=self.block)
+            block=self.block,
+        )
         # The host slot may be rewritten once its reader (the copy, or the kernel itself) has run.
         event = self.slab_events[k]
         if event is None:
@@ -624,7 +800,8 @@ class SteadyMtpPrepare:
         attn_metadata.kv_cache_params = KVCacheParams(
             use_cache=True,
             num_cached_tokens_per_seq=num_cached,
-            num_extra_kv_tokens=rec.num_extra_kv_tokens)
+            num_extra_kv_tokens=rec.num_extra_kv_tokens,
+        )
         attn_metadata.kv_cache_manager = kv_cache_manager
         if rec.has_mamba_chunk_size:
             attn_metadata.mamba_chunk_size = rec.mamba_chunk_size
@@ -640,14 +817,14 @@ class SteadyMtpPrepare:
         else:
             final_position_ids = engine.position_ids_cuda[:n].unsqueeze(0)
         inputs = {
-            'attn_metadata': attn_metadata,
-            'input_ids': engine.input_ids_cuda[:n],
-            'position_ids': final_position_ids,
-            'inputs_embeds': None,
-            'multimodal_params': [],
-            'resource_manager': resource_manager,
+            "attn_metadata": attn_metadata,
+            "input_ids": engine.input_ids_cuda[:n],
+            "position_ids": final_position_ids,
+            "inputs_embeds": None,
+            "multimodal_params": [],
+            "resource_manager": resource_manager,
         }
-        spec_metadata.draft_tokens = engine.draft_tokens_cuda[:b * d]
+        spec_metadata.draft_tokens = engine.draft_tokens_cuda[: b * d]
         spec_metadata.request_ids = rec.request_ids
         spec_metadata.gather_ids = engine.gather_ids_cuda[:n]
         spec_metadata.num_generations = b
@@ -657,18 +834,20 @@ class SteadyMtpPrepare:
         spec_metadata.populate_sampling_params_for_one_model(scheduled_requests.all_requests())
         spec_metadata.prepare()
         spec_metadata.write_padding_onehot_draft_probs([], engine.runtime_draft_len)
-        inputs['spec_metadata'] = spec_metadata
+        inputs["spec_metadata"] = spec_metadata
 
-        engine.iter_states['num_ctx_requests'] = 0
-        engine.iter_states['num_ctx_tokens'] = 0
-        engine.iter_states['num_generation_tokens'] = n
-        engine.iter_states['cached_kv_tokens'] = sum(num_cached)
+        engine.iter_states["num_ctx_requests"] = 0
+        engine.iter_states["num_ctx_tokens"] = 0
+        engine.iter_states["num_generation_tokens"] = n
+        engine.iter_states["cached_kv_tokens"] = sum(num_cached)
         engine.previous_request_ids = list(rec.request_ids)
         engine.has_previous_device_draft = True
         self.n_fast += 1
         if self.stats_every and (self.n_fast + self.n_full) % self.stats_every == 0:
-            logger.info(f"[q35_steady_prepare] fast={self.n_fast} full={self.n_full} "
-                        f"verified={self.n_verified} realloc_stale={self.n_realloc_stale}")
+            logger.info(
+                f"[q35_steady_prepare] fast={self.n_fast} full={self.n_full} "
+                f"verified={self.n_verified} realloc_stale={self.n_realloc_stale}"
+            )
         return inputs, engine.gather_ids_cuda[:n]
 
     # ------------------------------------------------------------------ verification
@@ -677,7 +856,7 @@ class SteadyMtpPrepare:
         n = b * t
         snap = {
             "input_ids": engine.input_ids_cuda[:n].clone(),
-            "draft_tokens": engine.draft_tokens_cuda[:b * (t - 1)].clone(),
+            "draft_tokens": engine.draft_tokens_cuda[: b * (t - 1)].clone(),
             "num_accepted": engine.num_accepted_draft_tokens_cuda[:b].clone(),
             "prev_batch_idx": engine.previous_batch_indices_cuda[:b].clone(),
             "prev_pos_idx": engine.previous_pos_indices_cuda[:n].clone(),
@@ -717,7 +896,9 @@ class SteadyMtpPrepare:
                     snap["mamba." + name] = value[:b].clone()
             for name, value in vars(mamba).items():
                 if name.startswith("replay_"):
-                    snap["mamba." + name] = value.clone() if isinstance(value, torch.Tensor) else value
+                    snap["mamba." + name] = (
+                        value.clone() if isinstance(value, torch.Tensor) else value
+                    )
         manager = attn_metadata.kv_cache_manager
         for name in ("cuda_state_indices", "_dummy_request_mask"):
             value = getattr(manager, name, None)
@@ -734,8 +915,12 @@ class SteadyMtpPrepare:
         mamba = getattr(attn_metadata, "mamba_metadata", None)
         kv_map = getattr(manager, "kv_cache_map", None)
         group = getattr(manager, "ssm_layer_group_id", None)
-        if (not mamba or kv_map is None or group is None
-                or getattr(manager, "local_num_mamba_layers", 0) == 0):
+        if (
+            not mamba
+            or kv_map is None
+            or group is None
+            or getattr(manager, "local_num_mamba_layers", 0) == 0
+        ):
             return []
         b = len(request_ids)
         expected = [kv_map[rid].get_ssm_block_base_index(group) for rid in request_ids]
@@ -762,16 +947,29 @@ class SteadyMtpPrepare:
         for key in a:
             x, y = a[key], b.get(key)
             if isinstance(x, torch.Tensor):
-                same = (isinstance(y, torch.Tensor) and x.shape == y.shape
-                        and x.dtype == y.dtype and torch.equal(x.cpu(), y.cpu()))
+                same = (
+                    isinstance(y, torch.Tensor)
+                    and x.shape == y.shape
+                    and x.dtype == y.dtype
+                    and torch.equal(x.cpu(), y.cpu())
+                )
             else:
                 same = x == y
             if not same:
                 bad.append(key)
         return bad
 
-    def _verify(self, engine, scheduled_requests, kv_cache_manager, attn_metadata,
-                spec_metadata, new_tensors_device, resource_manager, full_prepare_fn):
+    def _verify(
+        self,
+        engine,
+        scheduled_requests,
+        kv_cache_manager,
+        attn_metadata,
+        spec_metadata,
+        new_tensors_device,
+        resource_manager,
+        full_prepare_fn,
+    ):
         rec = self.record
         b, t = len(rec.request_ids), rec.tokens_per_step
         # The block-offset tables as the previous steps left them, and whether the fast path would skip their
@@ -779,10 +977,18 @@ class SteadyMtpPrepare:
         # fresh table equal to the old one. Decided before the full pass, which re-records the keys.
         tables = []
         if rec.attn_steady and self.skip_block_copies:
-            managers = [("block_offsets", kv_cache_manager, "kv_cache_block_offsets", rec.block_counts)]
+            managers = [
+                ("block_offsets", kv_cache_manager, "kv_cache_block_offsets", rec.block_counts)
+            ]
             if attn_metadata.draft_kv_cache_manager is not None:
-                managers.append(("draft_block_offsets", attn_metadata.draft_kv_cache_manager,
-                                 "draft_kv_cache_block_offsets", rec.draft_block_counts))
+                managers.append(
+                    (
+                        "draft_block_offsets",
+                        attn_metadata.draft_kv_cache_manager,
+                        "draft_kv_cache_block_offsets",
+                        rec.draft_block_counts,
+                    )
+                )
             for name, manager, attr, last_key in managers:
                 key = _block_counts(manager, rec.request_ids)
                 if key is None or last_key is None:
@@ -797,15 +1003,23 @@ class SteadyMtpPrepare:
         if self.record is None:
             return full_inputs, full_gather
         reference = self._snapshot(engine, attn_metadata, spec_metadata, b, t)
-        fresh_tables = [(name, old, getattr(attn_metadata, attr).clone()) for name, attr, old in tables]
-        fast = self._fast(engine, scheduled_requests, kv_cache_manager, attn_metadata,
-                          spec_metadata, new_tensors_device, resource_manager)
+        fresh_tables = [
+            (name, old, getattr(attn_metadata, attr).clone()) for name, attr, old in tables
+        ]
+        fast = self._fast(
+            engine,
+            scheduled_requests,
+            kv_cache_manager,
+            attn_metadata,
+            spec_metadata,
+            new_tensors_device,
+            resource_manager,
+        )
         if fast is None:
             return full_inputs, full_gather
         fast_inputs, fast_gather = fast
         torch.cuda.current_stream().synchronize()
-        mismatch = self._diff(reference, self._snapshot(engine, attn_metadata, spec_metadata,
-                                                        b, t))
+        mismatch = self._diff(reference, self._snapshot(engine, attn_metadata, spec_metadata, b, t))
         mismatch += self._mamba_ground_truth(attn_metadata, rec.request_ids)
         for name, old, fresh in fresh_tables:
             old, fresh = old.cpu(), fresh.cpu()
@@ -815,8 +1029,10 @@ class SteadyMtpPrepare:
             if not torch.equal(old, fresh):
                 where = (old != fresh).nonzero()
                 first = tuple(where[0].tolist())
-                mismatch.append(f"skipped_{name}_copy ({where.shape[0]} entries, first {first}: "
-                                f"{int(old[first])} -> {int(fresh[first])})")
+                mismatch.append(
+                    f"skipped_{name}_copy ({where.shape[0]} entries, first {first}: "
+                    f"{int(old[first])} -> {int(fresh[first])})"
+                )
         if rec.static_ids is not None:
             n = b * t
             if not torch.equal(rec.static_ids[:n].cpu(), reference["input_ids"].cpu()):
@@ -824,17 +1040,20 @@ class SteadyMtpPrepare:
             ref_pos = reference["mrope"] if engine.use_mrope else reference["positions"].view(1, -1)
             if not torch.equal(rec.static_pos[..., :n].cpu(), ref_pos.cpu()):
                 mismatch.append("static_position_ids")
-        if (set(full_inputs) != set(fast_inputs)
-                or fast_inputs['input_ids'].data_ptr() != full_inputs['input_ids'].data_ptr()
-                or tuple(fast_inputs['position_ids'].shape) != tuple(
-                    full_inputs['position_ids'].shape)
-                or fast_gather.data_ptr() != full_gather.data_ptr()
-                or fast_gather.shape != full_gather.shape):
+        if (
+            set(full_inputs) != set(fast_inputs)
+            or fast_inputs["input_ids"].data_ptr() != full_inputs["input_ids"].data_ptr()
+            or tuple(fast_inputs["position_ids"].shape) != tuple(full_inputs["position_ids"].shape)
+            or fast_gather.data_ptr() != full_gather.data_ptr()
+            or fast_gather.shape != full_gather.shape
+        ):
             mismatch.append("inputs")
         self.n_verified += 1
         if mismatch:
-            message = (f"[q35_steady_prepare] fast path differs from the full pass in {mismatch} "
-                       f"(batch {rec.request_ids}); steady prepare disabled")
+            message = (
+                f"[q35_steady_prepare] fast path differs from the full pass in {mismatch} "
+                f"(batch {rec.request_ids}); steady prepare disabled"
+            )
             if self.verify_strict:
                 raise RuntimeError(message)
             logger.error(message)

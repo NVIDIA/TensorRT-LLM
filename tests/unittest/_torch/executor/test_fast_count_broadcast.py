@@ -10,7 +10,10 @@ import pytest
 
 from tensorrt_llm._torch.distributed.communicator import MPIDist
 from tensorrt_llm._torch.pyexecutor import request_utils
-from tensorrt_llm._torch.pyexecutor.request_utils import FAST_COUNT_BROADCAST_ENV, RequestBroadcaster
+from tensorrt_llm._torch.pyexecutor.request_utils import (
+    FAST_COUNT_BROADCAST_ENV,
+    RequestBroadcaster,
+)
 
 pytestmark = pytest.mark.cpu_only
 

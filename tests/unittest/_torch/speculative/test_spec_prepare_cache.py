@@ -27,9 +27,12 @@ class _Slots:
 def _metadata(slot_manager, batch_indices=None):
     md = object.__new__(Eagle3OneModelSpecMetadata)
     md.use_rejection_sampling = False
-    md.batch_indices_cuda = (batch_indices if batch_indices is not None
-                             else torch.full((8, ), -1, dtype=torch.int, device="cuda"))
-    md.slot_ids = torch.full((8, ), -1, dtype=torch.long, device="cuda")
+    md.batch_indices_cuda = (
+        batch_indices
+        if batch_indices is not None
+        else torch.full((8,), -1, dtype=torch.int, device="cuda")
+    )
+    md.slot_ids = torch.full((8,), -1, dtype=torch.long, device="cuda")
     md.spec_resource_manager = types.SimpleNamespace(slot_manager=slot_manager)
     md.spec_dec_mode = types.SimpleNamespace(is_mtp_eagle_one_model=lambda: True)
     md.use_dynamic_tree = False
@@ -86,7 +89,7 @@ def test_same_buffers_fewer_uploads(monkeypatch, cache):
 def test_reassigned_slot_and_shared_index_buffer(monkeypatch):
     monkeypatch.setenv(eagle3.SPEC_PREPARE_CACHE_ENV, "1")
     slots = _Slots({5: 2, 6: 0})
-    shared = torch.full((8, ), -1, dtype=torch.int, device="cuda")
+    shared = torch.full((8,), -1, dtype=torch.int, device="cuda")
     md, graph_md = _metadata(slots, shared), _metadata(slots, shared)
     calls = _uploads(monkeypatch)
     md.request_ids = [5, 6]
@@ -107,8 +110,8 @@ def test_new_buffer_is_not_an_old_one(monkeypatch):
     md = _metadata(slots)
     md.request_ids = [5]
     md.prepare()
-    md.batch_indices_cuda = torch.full((8, ), -1, dtype=torch.int, device="cuda")
-    md.slot_ids = torch.full((8, ), -1, dtype=torch.long, device="cuda")
+    md.batch_indices_cuda = torch.full((8,), -1, dtype=torch.int, device="cuda")
+    md.slot_ids = torch.full((8,), -1, dtype=torch.long, device="cuda")
     md.prepare()
     torch.cuda.synchronize()
     assert md.batch_indices_cuda[:1].tolist() == [0]

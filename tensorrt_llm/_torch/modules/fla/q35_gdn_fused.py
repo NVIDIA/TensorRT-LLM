@@ -159,7 +159,9 @@ def _conv_tap(
         )
         if J == 0:
             ss = tl.where(
-                (src == 0)[:, None], s0[None, :], tl.where((src == 1)[:, None], s1[None, :], s2[None, :])
+                (src == 0)[:, None],
+                s0[None, :],
+                tl.where((src == 1)[:, None], s1[None, :], s2[None, :]),
             )
         elif J == 1:
             ss = tl.where((src == 1)[:, None], s1[None, :], s2[None, :])
@@ -283,16 +285,36 @@ def _q35_gdn_fused_kernel(
             hb0 = slot.to(tl.int64) * 2
             m_kh = mask_hist_capacity[:, None] & mask_k[None, :]
             m_uh = mask_hist_capacity[:, None] & mask_v[None, :]
-            kh_0 = tl.load(old_k + hb0 * HIST * H * K + i_h * K + o_hist[:, None] * H * K + o_k[None, :], mask=m_kh, other=0)
+            kh_0 = tl.load(
+                old_k + hb0 * HIST * H * K + i_h * K + o_hist[:, None] * H * K + o_k[None, :],
+                mask=m_kh,
+                other=0,
+            )
             kh_1 = tl.load(
-                old_k + (hb0 + 1) * HIST * H * K + i_h * K + o_hist[:, None] * H * K + o_k[None, :], mask=m_kh, other=0
+                old_k + (hb0 + 1) * HIST * H * K + i_h * K + o_hist[:, None] * H * K + o_k[None, :],
+                mask=m_kh,
+                other=0,
             )
-            uh_0 = tl.load(old_u + hb0 * HIST * HV * V + i_hv * V + o_hist[:, None] * HV * V + o_v[None, :], mask=m_uh, other=0)
+            uh_0 = tl.load(
+                old_u + hb0 * HIST * HV * V + i_hv * V + o_hist[:, None] * HV * V + o_v[None, :],
+                mask=m_uh,
+                other=0,
+            )
             uh_1 = tl.load(
-                old_u + (hb0 + 1) * HIST * HV * V + i_hv * V + o_hist[:, None] * HV * V + o_v[None, :], mask=m_uh, other=0
+                old_u
+                + (hb0 + 1) * HIST * HV * V
+                + i_hv * V
+                + o_hist[:, None] * HV * V
+                + o_v[None, :],
+                mask=m_uh,
+                other=0,
             )
-            gh_0 = tl.load(old_G + (hb0 * HV + i_hv) * HIST + o_hist, mask=mask_hist_capacity, other=0.0)
-            gh_1 = tl.load(old_G + ((hb0 + 1) * HV + i_hv) * HIST + o_hist, mask=mask_hist_capacity, other=0.0)
+            gh_0 = tl.load(
+                old_G + (hb0 * HV + i_hv) * HIST + o_hist, mask=mask_hist_capacity, other=0.0
+            )
+            gh_1 = tl.load(
+                old_G + ((hb0 + 1) * HV + i_hv) * HIST + o_hist, mask=mask_hist_capacity, other=0.0
+            )
             use0 = b_buf == 0
             b_kh = tl.where(is_hist[:, None], tl.where(use0, kh_0, kh_1), 0)
             b_uh = tl.where(is_hist[:, None], tl.where(use0, uh_0, uh_1), 0)
@@ -349,15 +371,33 @@ def _q35_gdn_fused_kernel(
             wv2 = tl.load(conv_w + ch_v * w_stride_dim + 2 * w_stride_width, mask=mask_v, other=0.0)
             wv3 = tl.load(conv_w + ch_v * w_stride_dim + 3 * w_stride_width, mask=mask_v, other=0.0)
             cs_base = conv_state + slot.to(tl.int64) * cs_stride_slot
-            sq0 = tl.load(cs_base + ch_q * cs_stride_dim + 0 * cs_stride_tok, mask=mask_k, other=0.0)
-            sq1 = tl.load(cs_base + ch_q * cs_stride_dim + 1 * cs_stride_tok, mask=mask_k, other=0.0)
-            sq2 = tl.load(cs_base + ch_q * cs_stride_dim + 2 * cs_stride_tok, mask=mask_k, other=0.0)
-            sk0 = tl.load(cs_base + ch_k * cs_stride_dim + 0 * cs_stride_tok, mask=mask_k, other=0.0)
-            sk1 = tl.load(cs_base + ch_k * cs_stride_dim + 1 * cs_stride_tok, mask=mask_k, other=0.0)
-            sk2 = tl.load(cs_base + ch_k * cs_stride_dim + 2 * cs_stride_tok, mask=mask_k, other=0.0)
-            sv0 = tl.load(cs_base + ch_v * cs_stride_dim + 0 * cs_stride_tok, mask=mask_v, other=0.0)
-            sv1 = tl.load(cs_base + ch_v * cs_stride_dim + 1 * cs_stride_tok, mask=mask_v, other=0.0)
-            sv2 = tl.load(cs_base + ch_v * cs_stride_dim + 2 * cs_stride_tok, mask=mask_v, other=0.0)
+            sq0 = tl.load(
+                cs_base + ch_q * cs_stride_dim + 0 * cs_stride_tok, mask=mask_k, other=0.0
+            )
+            sq1 = tl.load(
+                cs_base + ch_q * cs_stride_dim + 1 * cs_stride_tok, mask=mask_k, other=0.0
+            )
+            sq2 = tl.load(
+                cs_base + ch_q * cs_stride_dim + 2 * cs_stride_tok, mask=mask_k, other=0.0
+            )
+            sk0 = tl.load(
+                cs_base + ch_k * cs_stride_dim + 0 * cs_stride_tok, mask=mask_k, other=0.0
+            )
+            sk1 = tl.load(
+                cs_base + ch_k * cs_stride_dim + 1 * cs_stride_tok, mask=mask_k, other=0.0
+            )
+            sk2 = tl.load(
+                cs_base + ch_k * cs_stride_dim + 2 * cs_stride_tok, mask=mask_k, other=0.0
+            )
+            sv0 = tl.load(
+                cs_base + ch_v * cs_stride_dim + 0 * cs_stride_tok, mask=mask_v, other=0.0
+            )
+            sv1 = tl.load(
+                cs_base + ch_v * cs_stride_dim + 1 * cs_stride_tok, mask=mask_v, other=0.0
+            )
+            sv2 = tl.load(
+                cs_base + ch_v * cs_stride_dim + 2 * cs_stride_tok, mask=mask_v, other=0.0
+            )
         g_A_exp = tl.exp(tl.load(A_log + i_hv).to(tl.float32))
         g_dt_bias = tl.load(dt_bias + i_hv).to(tl.float32)
         if FUSE_NORM:
@@ -365,7 +405,10 @@ def _q35_gdn_fused_kernel(
             b_nw = tl.load(norm_w + o_full).to(tl.float32)
 
         if PROFILE:
-            tl.store(p_prof + 1, _tick(tl.max(b_Gh, 0) + g_start + tl.max(tl.max(b_kh.to(tl.float32), 1), 0)))
+            tl.store(
+                p_prof + 1,
+                _tick(tl.max(b_Gh, 0) + g_start + tl.max(tl.max(b_kh.to(tl.float32), 1), 0)),
+            )
         if LAUNCH_WITH_PDL:
             _gdc_wait_with_memory_clobber()
         if TRIGGER == 1:
@@ -408,9 +451,13 @@ def _q35_gdn_fused_kernel(
             )
         if CONV:
             row0 = i_n * T
-            # Depthwise conv taps J = 0..3 (0 = oldest); same bf16 products / fp32 accumulation order as the conv kernel.
+            # Depthwise conv taps J = 0..3 (0 = oldest); same bf16 products / fp32 accumulation order as the
+            # conv kernel.
             acc_q = tl.zeros([BT, BK], dtype=tl.float32)
-            acc_q += _conv_tap(x, x_stride_tok, row0, ch_q, o_t, mask_t, mask_k, sq0, sq1, sq2, 0) * wq0[None, :]
+            acc_q += (
+                _conv_tap(x, x_stride_tok, row0, ch_q, o_t, mask_t, mask_k, sq0, sq1, sq2, 0)
+                * wq0[None, :]
+            )
             tq1 = _conv_tap(x, x_stride_tok, row0, ch_q, o_t, mask_t, mask_k, sq0, sq1, sq2, 1)
             acc_q += tq1 * wq1[None, :]
             tq2 = _conv_tap(x, x_stride_tok, row0, ch_q, o_t, mask_t, mask_k, sq0, sq1, sq2, 2)
@@ -418,7 +465,10 @@ def _q35_gdn_fused_kernel(
             tq3 = _conv_tap(x, x_stride_tok, row0, ch_q, o_t, mask_t, mask_k, sq0, sq1, sq2, 3)
             acc_q += tq3 * wq3[None, :]
             acc_k = tl.zeros([BT, BK], dtype=tl.float32)
-            acc_k += _conv_tap(x, x_stride_tok, row0, ch_k, o_t, mask_t, mask_k, sk0, sk1, sk2, 0) * wk0[None, :]
+            acc_k += (
+                _conv_tap(x, x_stride_tok, row0, ch_k, o_t, mask_t, mask_k, sk0, sk1, sk2, 0)
+                * wk0[None, :]
+            )
             tk1 = _conv_tap(x, x_stride_tok, row0, ch_k, o_t, mask_t, mask_k, sk0, sk1, sk2, 1)
             acc_k += tk1 * wk1[None, :]
             tk2 = _conv_tap(x, x_stride_tok, row0, ch_k, o_t, mask_t, mask_k, sk0, sk1, sk2, 2)
@@ -426,7 +476,10 @@ def _q35_gdn_fused_kernel(
             tk3 = _conv_tap(x, x_stride_tok, row0, ch_k, o_t, mask_t, mask_k, sk0, sk1, sk2, 3)
             acc_k += tk3 * wk3[None, :]
             acc_v = tl.zeros([BT, BV], dtype=tl.float32)
-            acc_v += _conv_tap(x, x_stride_tok, row0, ch_v, o_t, mask_t, mask_v, sv0, sv1, sv2, 0) * wv0[None, :]
+            acc_v += (
+                _conv_tap(x, x_stride_tok, row0, ch_v, o_t, mask_t, mask_v, sv0, sv1, sv2, 0)
+                * wv0[None, :]
+            )
             tv1 = _conv_tap(x, x_stride_tok, row0, ch_v, o_t, mask_t, mask_v, sv0, sv1, sv2, 1)
             acc_v += tv1 * wv1[None, :]
             tv2 = _conv_tap(x, x_stride_tok, row0, ch_v, o_t, mask_t, mask_v, sv0, sv1, sv2, 2)
@@ -446,7 +499,8 @@ def _q35_gdn_fused_kernel(
                     ),
                 )
 
-            # Intermediate conv windows after token t: [ext[t+1], ext[t+2], ext[t+3]] = taps 1..3, one writer per channel.
+            # Intermediate conv windows after token t: [ext[t+1], ext[t+2], ext[t+3]] = taps 1..3, one writer per
+            # channel.
             ic_base = inter_conv + i_n.to(tl.int64) * ic_stride_row
             ic_t = o_t[:, None] * ic_stride_step
             if (i_hv % G == 0) & (i_v == 0):
@@ -469,10 +523,20 @@ def _q35_gdn_fused_kernel(
         if not CONV:
             # q|k|v already convolved (packed rows of width x_stride_tok), e.g. by the in_proj epilogue.
             qkv_row = (i_n * T + o_t[:, None]) * x_stride_tok
-            b_q = tl.load(x + qkv_row + i_h * K + o_k[None, :], mask=mask_t[:, None] & mask_k[None, :], other=0)
-            b_k = tl.load(x + qkv_row + H * K + i_h * K + o_k[None, :], mask=mask_t[:, None] & mask_k[None, :], other=0)
+            b_q = tl.load(
+                x + qkv_row + i_h * K + o_k[None, :],
+                mask=mask_t[:, None] & mask_k[None, :],
+                other=0,
+            )
+            b_k = tl.load(
+                x + qkv_row + H * K + i_h * K + o_k[None, :],
+                mask=mask_t[:, None] & mask_k[None, :],
+                other=0,
+            )
             b_v = tl.load(
-                x + qkv_row + 2 * H * K + i_hv * V + o_v[None, :], mask=mask_t[:, None] & mask_v[None, :], other=0
+                x + qkv_row + 2 * H * K + i_hv * V + o_v[None, :],
+                mask=mask_t[:, None] & mask_v[None, :],
+                other=0,
             )
             if PROFILE:
                 # "conv" phase of the profile = the convolved rows' load latency
@@ -484,7 +548,6 @@ def _q35_gdn_fused_kernel(
                         + tl.max(tl.max(b_v.to(tl.float32), 1), 0)
                     ),
                 )
-
 
         # ---------------- cached replay (the math of _cached_replay_kernel) ----------------
         b_kf = b_k.to(tl.float32)
@@ -551,7 +614,11 @@ def _q35_gdn_fused_kernel(
         if PROFILE:
             tl.store(
                 p_prof + 5,
-                _tick(tl.max(tl.max(b_rhs, 1), 0) + tl.max(tl.max(b_A, 1), 0) + tl.max(tl.max(b_q_hist, 1), 0)),
+                _tick(
+                    tl.max(tl.max(b_rhs, 1), 0)
+                    + tl.max(tl.max(b_A, 1), 0)
+                    + tl.max(tl.max(b_q_hist, 1), 0)
+                ),
             )
         if SOLVE == 2:
             # Forward substitution on a tuple of row vectors: the rows of rhs and the scalars A[r, s] are extracted
@@ -698,7 +765,9 @@ def _q35_gdn_fused_kernel(
                 tl.store(p_prof + 15, cnt.to(tl.int64))
             if cnt == NV - 1:
                 p_on = o + ((i_n * T + o_t[:, None]) * HV + i_hv) * V + o_full[None, :]
-                b_x = tl.load(p_on, mask=mask_t[:, None], other=0.0, cache_modifier=".cg").to(tl.float32)
+                b_x = tl.load(p_on, mask=mask_t[:, None], other=0.0, cache_modifier=".cg").to(
+                    tl.float32
+                )
                 var = tl.sum(b_x * b_x, axis=1) / V
                 rstd = 1.0 / tl.sqrt(var + eps)
                 b_y = b_x * rstd[:, None] * b_nw[None, :]
@@ -827,12 +896,16 @@ def q35_gdn_fused_update(
     N, T = num_decodes, draft_token_num
     H, HV, K, V = num_k_heads, num_v_heads, head_k_dim, head_v_dim
     conv_dim = 2 * H * K + HV * V
-    assert mixed_qkv.shape[0] == N * T and mixed_qkv.shape[1] >= conv_dim and mixed_qkv.stride(1) == 1
+    assert (
+        mixed_qkv.shape[0] == N * T and mixed_qkv.shape[1] >= conv_dim and mixed_qkv.stride(1) == 1
+    )
     assert conv_weight.shape[0] == conv_dim and conv_weight.shape[1] == 4
     assert conv_states.shape[1] == conv_dim and conv_states.shape[2] == 3
     assert intermediate_conv_window.shape[1] == T and intermediate_conv_window.shape[2] == conv_dim
     assert intermediate_conv_window.shape[0] >= N
-    assert a.shape == (N * T, HV) and b.shape == (N * T, HV) and a.stride(1) == 1 and b.stride(1) == 1
+    assert (
+        a.shape == (N * T, HV) and b.shape == (N * T, HV) and a.stride(1) == 1 and b.stride(1) == 1
+    )
     s_h0_0, s_h0_1, s_h0_2, s_h0_3 = ssm_states.stride()
     assert s_h0_3 == 1 and s_h0_2 == K and s_h0_1 == V * K
     for name, tensor in (("old_u", old_u), ("old_k", old_k), ("old_G", old_G)):
@@ -854,9 +927,17 @@ def q35_gdn_fused_update(
         if norm_out is None:
             norm_out = torch.empty(N * T, HV * V, dtype=out_dtype, device=mixed_qkv.device)
         else:
-            assert norm_out.dtype == out_dtype and norm_out.shape == (N * T, HV * V) and norm_out.stride(1) == 1
+            assert (
+                norm_out.dtype == out_dtype
+                and norm_out.shape == (N * T, HV * V)
+                and norm_out.stride(1) == 1
+            )
         z_arg, z_stride, y_arg, y_stride = z, z.stride(0), norm_out, norm_out.stride(0)
-        nw_arg, s_arg, c_arg = norm_weight, (fp8_scale if fp8_scale is not None else A_log), counters
+        nw_arg, s_arg, c_arg = (
+            norm_weight,
+            (fp8_scale if fp8_scale is not None else A_log),
+            counters,
+        )
     else:
         z_arg, z_stride, y_arg, y_stride = mixed_qkv, 0, output, 0
         nw_arg, s_arg, c_arg = A_log, A_log, state_indices
@@ -929,7 +1010,9 @@ def q35_gdn_fused_update(
         ZPRE=z_prefetch,
         NORM_RELOAD=norm_reload and fuse_norm and NV == 1,
         CONV=conv,
-        STORE_O=(not fuse_norm or NV > 1 or norm_reload) if store_o is None else (store_o or norm_reload),
+        STORE_O=(not fuse_norm or NV > 1 or norm_reload)
+        if store_o is None
+        else (store_o or norm_reload),
         PROFILE=_profile is not None,
         num_warps=num_warps,
         num_stages=1,

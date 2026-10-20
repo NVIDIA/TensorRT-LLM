@@ -723,7 +723,8 @@ class CUDAGraphRunner:
         position_ids = current_inputs["position_ids"]
         if self.config.use_mrope:
             if not staged:
-                static_tensors["position_ids"][:, :, :seqlen].copy_(position_ids)
+                static_tensors["position_ids"][:, :, :seqlen].copy_(
+                    position_ids)
             mrope_delta_read_seq_slots = current_inputs.get(
                 'mrope_delta_read_seq_slots')
             if mrope_delta_read_seq_slots is not None:

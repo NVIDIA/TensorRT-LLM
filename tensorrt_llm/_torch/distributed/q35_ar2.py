@@ -24,38 +24,102 @@ from .q35_allreduce import _ctas_per_token, _cute
 
 
 @functools.lru_cache(maxsize=None)
-def _compiled_ar2(m: int, hidden: int, eps: float, nranks: int, ctas: int, use_pdl: bool, se_fold: bool,
-                  norm_out: bool, quant: bool, moe_topk: int, fc2_row: int, proto: str, rotate: str, stamps: bool,
-                  region_bytes: int, lean: bool = True, xchg: str = "cluster", push: str = "mc",
-                  two_shot: bool = False):
+def _compiled_ar2(
+    m: int,
+    hidden: int,
+    eps: float,
+    nranks: int,
+    ctas: int,
+    use_pdl: bool,
+    se_fold: bool,
+    norm_out: bool,
+    quant: bool,
+    moe_topk: int,
+    fc2_row: int,
+    proto: str,
+    rotate: str,
+    stamps: bool,
+    region_bytes: int,
+    lean: bool = True,
+    xchg: str = "cluster",
+    push: str = "mc",
+    two_shot: bool = False,
+):
     import cuda.bindings.driver as cuda
     import cutlass
     import cutlass.cute as cute
 
     from ..cute_dsl_kernels.blackwell.q35_ar2 import Q35Ar2Kernel
 
-    kernel = Q35Ar2Kernel(hidden=hidden, norm_eps=eps, nranks=nranks, ctas=ctas, use_pdl=use_pdl, se_fold=se_fold,
-                          norm_out=norm_out, quant=quant, moe_topk=moe_topk, fc2_row=fc2_row, proto=proto,
-                          rotate=rotate, stamps=stamps, region_bytes=region_bytes,
-                          lean=lean, xchg=xchg, push=push, two_shot=two_shot)
+    kernel = Q35Ar2Kernel(
+        hidden=hidden,
+        norm_eps=eps,
+        nranks=nranks,
+        ctas=ctas,
+        use_pdl=use_pdl,
+        se_fold=se_fold,
+        norm_out=norm_out,
+        quant=quant,
+        moe_topk=moe_topk,
+        fc2_row=fc2_row,
+        proto=proto,
+        rotate=rotate,
+        stamps=stamps,
+        region_bytes=region_bytes,
+        lean=lean,
+        xchg=xchg,
+        push=push,
+        two_shot=two_shot,
+    )
     dev = torch.device("cuda")
     x = torch.empty((m, hidden), dtype=torch.bfloat16, device=dev)
-    gate = torch.empty((m, ), dtype=torch.bfloat16, device=dev)
-    w = torch.empty((hidden, ), dtype=torch.bfloat16, device=dev)
-    scale = torch.empty((1, ), dtype=torch.float32, device=dev)
+    gate = torch.empty((m,), dtype=torch.bfloat16, device=dev)
+    w = torch.empty((hidden,), dtype=torch.bfloat16, device=dev)
+    scale = torch.empty((1,), dtype=torch.float32, device=dev)
     q = torch.empty((m, hidden), dtype=torch.uint8, device=dev)
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     z = cutlass.Int64(0)
-    return cute.compile(kernel, _cute(x), _cute(x), _cute(x), _cute(gate), _cute(x), _cute(w), _cute(scale),
-                        _cute(x), _cute(x), _cute(q), z, z, z, z, z, z, z, z, cutlass.Int32(0), stream)
+    return cute.compile(
+        kernel,
+        _cute(x),
+        _cute(x),
+        _cute(x),
+        _cute(gate),
+        _cute(x),
+        _cute(w),
+        _cute(scale),
+        _cute(x),
+        _cute(x),
+        _cute(q),
+        z,
+        z,
+        z,
+        z,
+        z,
+        z,
+        z,
+        z,
+        cutlass.Int32(0),
+        stream,
+    )
 
 
 class Q35Ar2AllReduce:
     """See the module docstring."""
 
-    def __init__(self, mapping, proto: str = "slot", rotate: str = "end", hidden: int = 4096, ctas: int = 8,
-                 max_rows: int = 64, lean: bool = True, xchg: str = "cluster", push: str = "mc",
-                 two_shot_rows: Optional[int] = None):
+    def __init__(
+        self,
+        mapping,
+        proto: str = "slot",
+        rotate: str = "end",
+        hidden: int = 4096,
+        ctas: int = 8,
+        max_rows: int = 64,
+        lean: bool = True,
+        xchg: str = "cluster",
+        push: str = "mc",
+        two_shot_rows: Optional[int] = None,
+    ):
         if mapping.tp_size not in (2, 4, 8, 16):
             raise ValueError("Q35Ar2AllReduce supports TP 2/4/8/16")
         self.mapping = mapping
@@ -65,6 +129,7 @@ class Q35Ar2AllReduce:
         # slot protocol: calls of >= two_shot_rows rows run two-shot (None: never; "auto" = the CuTe kernel's policy)
         if two_shot_rows == "auto":
             from .q35_allreduce import _two_shot_rows
+
             two_shot_rows = _two_shot_rows(mapping.tp_size) or None
         self.two_shot_rows = two_shot_rows if proto == "slot" else None
         self.peers = 0
@@ -73,6 +138,7 @@ class Q35Ar2AllReduce:
         self.threads = hidden // 8 // ctas
         self.max_ctas = max_rows * ctas
         from ..flashinfer_utils import get_env_enable_pdl
+
         self._pdl = get_env_enable_pdl()
         self._dummies = {}
         dev = torch.device("cuda", torch.cuda.current_device())
@@ -88,6 +154,7 @@ class Q35Ar2AllReduce:
         from tensorrt_llm._utils import mpi_comm
 
         from .ops import _q35_fenced_mcast_buffer
+
         mp = self.mapping
         comm = mpi_comm().Split(int(mp.pp_rank * mp.cp_size + mp.cp_rank), mp.tp_rank)
         use_fabric = os.environ.get("TRTLLM_FORCE_MNNVL_AR", "0") == "1" or mp.is_multi_node()
@@ -95,23 +162,31 @@ class Q35Ar2AllReduce:
         # fenced construction: workaround for a known staging-buffer overrun in the multicast handle exchange;
         # a no-op once the library fix is present
         self.handle = _q35_fenced_mcast_buffer(size, mp, use_fabric, comm)
-        uc = self.handle.get_uc_buffer(mp.tp_rank, (size // 4, ), torch.float32, 0)
+        uc = self.handle.get_uc_buffer(mp.tp_rank, (size // 4,), torch.float32, 0)
         uc.fill_(-0.0)  # every 32-bit word = 0x80000000 = "not written"
-        mc = self.handle.get_mc_buffer((size // 4, ), torch.float32, 0)
-        self.state = torch.zeros((self.max_ctas * 32, ), dtype=torch.int32, device=dev)
+        mc = self.handle.get_mc_buffer((size // 4,), torch.float32, 0)
+        self.state = torch.zeros((self.max_ctas * 32,), dtype=torch.int32, device=dev)
         torch.cuda.synchronize()
         comm.Barrier()
         self._uc, self._mc, self._comm = uc, mc, comm
         self.own, self.mcast, self.ctl = uc.data_ptr(), mc.data_ptr(), self.state.data_ptr()
         # every rank's unicast mapping of the slot workspace (push="uc")
         self.peer_table = torch.tensor(
-            [self.handle.get_uc_buffer(r, (1, ), torch.float32, 0).data_ptr() for r in range(mp.tp_size)],
-            dtype=torch.int64, device=dev)
+            [
+                self.handle.get_uc_buffer(r, (1,), torch.float32, 0).data_ptr()
+                for r in range(mp.tp_size)
+            ],
+            dtype=torch.int64,
+            device=dev,
+        )
         self.peers = self.peer_table.data_ptr()
 
     def _flags_addrs(self, nbytes: int):
         from .ops import get_or_scale_allreduce_mnnvl_workspace
-        ws = get_or_scale_allreduce_mnnvl_workspace(self.mapping, torch.bfloat16, buffer_size_bytes=nbytes)
+
+        ws = get_or_scale_allreduce_mnnvl_workspace(
+            self.mapping, torch.bfloat16, buffer_size_bytes=nbytes
+        )
         if ws is None:
             raise RuntimeError("MNNVL workspace too small")
         if ws is not self._ws:
@@ -128,16 +203,26 @@ class Q35Ar2AllReduce:
         d = self._dummies.get((m, hidden))
         if d is None:
             dev = torch.device("cuda", torch.cuda.current_device())
-            d = (torch.empty((m, ), dtype=torch.bfloat16, device=dev),
-                 torch.empty((m, hidden), dtype=torch.uint8, device=dev),
-                 torch.zeros((1, ), dtype=torch.float32, device=dev))
+            d = (
+                torch.empty((m,), dtype=torch.bfloat16, device=dev),
+                torch.empty((m, hidden), dtype=torch.uint8, device=dev),
+                torch.zeros((1,), dtype=torch.float32, device=dev),
+            )
             self._dummies[(m, hidden)] = d
         return d
 
-    def __call__(self, residual: torch.Tensor, norm_weight: torch.Tensor, eps: float,
-                 x: Optional[torch.Tensor] = None, shared_fold: Optional[Tuple] = None,
-                 scale: Optional[torch.Tensor] = None, norm_out: bool = True,
-                 dbg: Optional[torch.Tensor] = None, two_shot: Optional[bool] = None) -> Tuple[torch.Tensor, ...]:
+    def __call__(
+        self,
+        residual: torch.Tensor,
+        norm_weight: torch.Tensor,
+        eps: float,
+        x: Optional[torch.Tensor] = None,
+        shared_fold: Optional[Tuple] = None,
+        scale: Optional[torch.Tensor] = None,
+        norm_out: bool = True,
+        dbg: Optional[torch.Tensor] = None,
+        two_shot: Optional[bool] = None,
+    ) -> Tuple[torch.Tensor, ...]:
         import cuda.bindings.driver as cuda
         import cutlass
 
@@ -160,32 +245,71 @@ class Q35Ar2AllReduce:
             two_shot = self.two_shot_rows is not None and m >= self.two_shot_rows
         if two_shot and self.proto != "slot":
             raise ValueError("ar2 two-shot needs the slot protocol")
-        fn = _compiled_ar2(m, hidden, float(eps), nranks, ctas, self._pdl, shared_fold is not None, norm_out,
-                           scale is not None, topk, fc2_row, self.proto, self.rotate, dbg is not None,
-                           self.region_bytes, self.lean, self.xchg, self.push, bool(two_shot))
+        fn = _compiled_ar2(
+            m,
+            hidden,
+            float(eps),
+            nranks,
+            ctas,
+            self._pdl,
+            shared_fold is not None,
+            norm_out,
+            scale is not None,
+            topk,
+            fc2_row,
+            self.proto,
+            self.rotate,
+            dbg is not None,
+            self.region_bytes,
+            self.lean,
+            self.xchg,
+            self.push,
+            bool(two_shot),
+        )
         res_out = torch.empty_like(residual)
         norm = torch.empty_like(residual) if norm_out else res_out
-        quant = (torch.empty(residual.shape, dtype=torch.float8_e4m3fn, device=residual.device)
-                 if scale is not None else None)
+        quant = (
+            torch.empty(residual.shape, dtype=torch.float8_e4m3fn, device=residual.device)
+            if scale is not None
+            else None
+        )
         d_gate, d_quant, d_scale = self._dummy(m, hidden)
         fc2_ptr = topw_ptr = perm_ptr = 0
         if shared_fold is not None:
             routed, shared, gate = shared_fold
             if moe is not None:
                 fc2, topw, perm = moe
-                fc2_ptr, topw_ptr, perm_ptr = fc2.data_ptr(), topw.contiguous().data_ptr(), perm.contiguous().data_ptr()
+                fc2_ptr, topw_ptr, perm_ptr = (
+                    fc2.data_ptr(),
+                    topw.contiguous().data_ptr(),
+                    perm.contiguous().data_ptr(),
+                )
                 routed = shared  # unread
             xin, gate = routed, gate.reshape(-1)
         else:
             xin, routed, shared, gate = x, x, x, d_gate
-        fn(_cute(xin.contiguous()), _cute(routed.contiguous()), _cute(shared.contiguous()), _cute(gate.contiguous()),
-           _cute(residual.contiguous()), _cute(norm_weight.reshape(-1)),
-           _cute(scale.reshape(1) if scale is not None else d_scale), _cute(res_out), _cute(norm),
-           _cute(quant.view(torch.uint8) if quant is not None else d_quant), cutlass.Int64(own), cutlass.Int64(mcast),
-           cutlass.Int64(ctl), cutlass.Int64(fc2_ptr), cutlass.Int64(topw_ptr), cutlass.Int64(perm_ptr),
-           cutlass.Int64(dbg.data_ptr() if dbg is not None else 0), cutlass.Int64(self.peers),
-           cutlass.Int32(self.mapping.tp_rank),
-           cuda.CUstream(torch.cuda.current_stream().cuda_stream))
+        fn(
+            _cute(xin.contiguous()),
+            _cute(routed.contiguous()),
+            _cute(shared.contiguous()),
+            _cute(gate.contiguous()),
+            _cute(residual.contiguous()),
+            _cute(norm_weight.reshape(-1)),
+            _cute(scale.reshape(1) if scale is not None else d_scale),
+            _cute(res_out),
+            _cute(norm),
+            _cute(quant.view(torch.uint8) if quant is not None else d_quant),
+            cutlass.Int64(own),
+            cutlass.Int64(mcast),
+            cutlass.Int64(ctl),
+            cutlass.Int64(fc2_ptr),
+            cutlass.Int64(topw_ptr),
+            cutlass.Int64(perm_ptr),
+            cutlass.Int64(dbg.data_ptr() if dbg is not None else 0),
+            cutlass.Int64(self.peers),
+            cutlass.Int32(self.mapping.tp_rank),
+            cuda.CUstream(torch.cuda.current_stream().cuda_stream),
+        )
         if scale is None:
             return norm, res_out
         if norm_out:
@@ -200,10 +324,13 @@ class Q35Ar2Dispatch:
     ``mode``: "fe" (flags protocol, addresses as arguments), "fp" (+ buffer rotation inside the poll loop),
     "sl" (flag-free slot protocol on its own workspace); suffix "m" = st.async + mbarrier norm exchange (fpm, slm)."""
 
-    _MODES = {"fe": dict(proto="flags", rotate="end"), "fp": dict(proto="flags", rotate="poll"),
-              "fpm": dict(proto="flags", rotate="poll", xchg="mbar"),
-              "sl": dict(proto="slot", two_shot_rows="auto"),
-              "slm": dict(proto="slot", xchg="mbar", two_shot_rows="auto")}
+    _MODES = {
+        "fe": dict(proto="flags", rotate="end"),
+        "fp": dict(proto="flags", rotate="poll"),
+        "fpm": dict(proto="flags", rotate="poll", xchg="mbar"),
+        "sl": dict(proto="slot", two_shot_rows="auto"),
+        "slm": dict(proto="slot", xchg="mbar", two_shot_rows="auto"),
+    }
 
     def __init__(self, mapping, cute_ar, mode: str):
         self.mapping = mapping
@@ -214,22 +341,49 @@ class Q35Ar2Dispatch:
         # TRTLLM_Q35_AR2_SLOT_TWOSHOT=1 opts in.
         self.slot_two_shot = os.environ.get("TRTLLM_Q35_AR2_SLOT_TWOSHOT", "0") == "1"
 
-    def __call__(self, residual: torch.Tensor, norm_weight: torch.Tensor, eps: float,
-                 x: Optional[torch.Tensor] = None, shared_fold: Optional[Tuple] = None,
-                 scale: Optional[torch.Tensor] = None, norm_out: bool = True,
-                 two_shot: Optional[bool] = None) -> Tuple[torch.Tensor, ...]:
+    def __call__(
+        self,
+        residual: torch.Tensor,
+        norm_weight: torch.Tensor,
+        eps: float,
+        x: Optional[torch.Tensor] = None,
+        shared_fold: Optional[Tuple] = None,
+        scale: Optional[torch.Tensor] = None,
+        norm_out: bool = True,
+        two_shot: Optional[bool] = None,
+    ) -> Tuple[torch.Tensor, ...]:
         from .q35_allreduce import _two_shot_rows
+
         m = (x if x is not None else shared_fold[1]).shape[0]
         if two_shot is None:
             thr = _two_shot_rows(self.mapping.tp_size)
             two_shot = 0 < thr <= m
         slot = self.ar2.proto == "slot"
-        if ((two_shot and not (slot and self.slot_two_shot)) or m * self.ar2.ctas > self.ar2.max_ctas
-                or residual.shape[-1] != self.ar2.hidden):
-            return self.cute(residual, norm_weight, eps, x=x, shared_fold=shared_fold, scale=scale,
-                             norm_out=norm_out, two_shot=two_shot)
-        return self.ar2(residual, norm_weight, eps, x=x, shared_fold=shared_fold, scale=scale, norm_out=norm_out,
-                        two_shot=bool(two_shot) if slot else None)
+        if (
+            (two_shot and not (slot and self.slot_two_shot))
+            or m * self.ar2.ctas > self.ar2.max_ctas
+            or residual.shape[-1] != self.ar2.hidden
+        ):
+            return self.cute(
+                residual,
+                norm_weight,
+                eps,
+                x=x,
+                shared_fold=shared_fold,
+                scale=scale,
+                norm_out=norm_out,
+                two_shot=two_shot,
+            )
+        return self.ar2(
+            residual,
+            norm_weight,
+            eps,
+            x=x,
+            shared_fold=shared_fold,
+            scale=scale,
+            norm_out=norm_out,
+            two_shot=bool(two_shot) if slot else None,
+        )
 
 
 _DISPATCH = {}

@@ -34,7 +34,6 @@ PP_COMM_TAG_AUTOTUNING = 30000
 _Q35_AUTOTUNE_TRACE = os.environ.get("TRTLLM_Q35_AUTOTUNE_TRACE", "0") == "1"
 _q35_autotune_trace_seen: Set[Tuple] = set()
 
-
 # TRTLLM_Q35_AUTOTUNE_DUMP=1 (default off): at the end of every autotune() session, log the
 # profiling-cache entries that are new or changed since the last dump: op, runner, shape key,
 # chosen runner / tactic and the measured time ([Q35ATD] lines; one grep names a run's tactics).
@@ -43,15 +42,19 @@ _q35_autotune_dumped: Dict[Tuple, Tuple] = {}
 
 
 def _q35_dump_cache(cache: Dict[Tuple, Tuple], rank: int) -> None:
-    changed = [(k, v) for k, v in cache.items() if _q35_autotune_dumped.get(k) != v]
-    logger.info(f"[Q35ATD] rank={rank} entries={len(cache)} new_or_changed={len(changed)}")
+    changed = [(k, v) for k, v in cache.items()
+               if _q35_autotune_dumped.get(k) != v]
+    logger.info(
+        f"[Q35ATD] rank={rank} entries={len(cache)} new_or_changed={len(changed)}"
+    )
     for k, v in sorted(changed, key=lambda kv: str(kv[0])):
         _q35_autotune_dumped[k] = v
         op, runner_cls, runner_uid, profile = (tuple(k) + (None, ) * 4)[:4]
         runner_id, tactic, min_time = (tuple(v) + (None, ) * 3)[:3]
-        logger.info(f"[Q35ATD] rank={rank} op={op} runner={runner_cls}:{runner_uid} "
-                    f"key={profile} -> runner_id={runner_id} tactic={tactic} "
-                    f"time_ms={min_time}")
+        logger.info(
+            f"[Q35ATD] rank={rank} op={op} runner={runner_cls}:{runner_uid} "
+            f"key={profile} -> runner_id={runner_id} tactic={tactic} "
+            f"time_ms={min_time}")
 
 
 def _q35_trace_lookup(custom_op: str, input_shapes: Tuple, is_cache_hit: bool,

@@ -891,8 +891,11 @@ def fused_sigmoid_mul_inplace(
     max_block_size = 1024 if num_tokens < 1024 else 2048
     block_size = min(triton.next_power_of_2(hidden_size), max_block_size)
     grid = (num_tokens, triton.cdiv(hidden_size, block_size))
-    pdl_kwargs = (dict(LAUNCH_WITH_PDL=True, launch_pdl=True)
-                  if _q35_sigmoid_mul_pdl(attention_output.device) else {})
+    pdl_kwargs = (
+        dict(LAUNCH_WITH_PDL=True, launch_pdl=True)
+        if _q35_sigmoid_mul_pdl(attention_output.device)
+        else {}
+    )
     _fused_sigmoid_mul_kernel[grid](
         attention_output,
         attention_output,

@@ -68,15 +68,23 @@ def end(scope, seconds, extra=""):
         _slow_calls[scope] += 1
         if _slow_lines < _MAX_SLOW_LINES:
             _slow_lines += 1
-            detail = ", ".join(f"{p} {v * 1e3:.2f} ms/{_cur_n[scope][p]}"
-                               for p, v in sorted(parts.items(), key=lambda x: -x[1]))
-            logger.info(f"[Q35_SCHED_TIMERS] slow {scope} {seconds * 1e3:.2f} ms ({extra}): {detail}")
+            detail = ", ".join(
+                f"{p} {v * 1e3:.2f} ms/{_cur_n[scope][p]}"
+                for p, v in sorted(parts.items(), key=lambda x: -x[1])
+            )
+            logger.info(
+                f"[Q35_SCHED_TIMERS] slow {scope} {seconds * 1e3:.2f} ms ({extra}): {detail}"
+            )
     if _calls[scope] % _SUMMARY_EVERY == 0:
         tot = _tot[scope]
-        detail = ", ".join(f"{p} {v * 1e3:.1f} ms/{_tot_n[scope][p]}"
-                           for p, v in sorted(tot.items(), key=lambda x: -x[1]))
-        logger.info(f"[Q35_SCHED_TIMERS] {scope}: {_calls[scope]} calls, {_slow_calls[scope]} >= {_SLOW_MS:g} ms; "
-                    f"cumulative {detail}; GEN_ADMIT lean skips {_lean_fired}")
+        detail = ", ".join(
+            f"{p} {v * 1e3:.1f} ms/{_tot_n[scope][p]}"
+            for p, v in sorted(tot.items(), key=lambda x: -x[1])
+        )
+        logger.info(
+            f"[Q35_SCHED_TIMERS] {scope}: {_calls[scope]} calls, {_slow_calls[scope]} >= {_SLOW_MS:g} ms; "
+            f"cumulative {detail}; GEN_ADMIT lean skips {_lean_fired}"
+        )
 
 
 def note_lean_skip():
@@ -85,8 +93,10 @@ def note_lean_skip():
     _lean_fired += 1
     if not _lean_banner:
         _lean_banner = True
-        logger.info("TRTLLM_Q35_GEN_ADMIT=1: skipping the whole-prompt get_tokens(0) copy on cache creation "
-                    "without block reuse (disagg generation admission)")
+        logger.info(
+            "TRTLLM_Q35_GEN_ADMIT=1: skipping the whole-prompt get_tokens(0) copy on cache creation "
+            "without block reuse (disagg generation admission)"
+        )
 
 
 now = time.perf_counter

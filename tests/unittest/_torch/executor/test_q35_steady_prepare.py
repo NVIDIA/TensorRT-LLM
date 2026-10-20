@@ -24,17 +24,17 @@ SLOTS, MAX_TOKENS, MAX_DRAFT, BATCH = 8, 64, 8, 4
 def _buffers():
     i32 = dict(dtype=torch.int32, device="cuda")
     return dict(
-        input_ids=torch.full((MAX_TOKENS, ), -1, **i32),
-        draft_tokens=torch.full((MAX_TOKENS, ), -1, **i32),
-        num_accepted=torch.full((BATCH, ), -1, **i32),
-        prev_batch_idx=torch.full((MAX_TOKENS, ), -1, **i32),
-        prev_pos_idx=torch.full((MAX_TOKENS, ), -1, **i32),
-        prev_pos_offsets=torch.zeros((MAX_TOKENS, ), **i32),
-        prev_kv_offsets=torch.zeros((BATCH, ), **i32),
-        positions=torch.full((MAX_TOKENS, ), -1, **i32),
+        input_ids=torch.full((MAX_TOKENS,), -1, **i32),
+        draft_tokens=torch.full((MAX_TOKENS,), -1, **i32),
+        num_accepted=torch.full((BATCH,), -1, **i32),
+        prev_batch_idx=torch.full((MAX_TOKENS,), -1, **i32),
+        prev_pos_idx=torch.full((MAX_TOKENS,), -1, **i32),
+        prev_pos_offsets=torch.zeros((MAX_TOKENS,), **i32),
+        prev_kv_offsets=torch.zeros((BATCH,), **i32),
+        positions=torch.full((MAX_TOKENS,), -1, **i32),
         mrope_positions=torch.full((3, 1, MAX_TOKENS), -1, **i32),
-        gather_ids=torch.full((MAX_TOKENS, ), -1, **i32),
-        kv_lens_cuda=torch.full((BATCH, ), -1, **i32),
+        gather_ids=torch.full((MAX_TOKENS,), -1, **i32),
+        kv_lens_cuda=torch.full((BATCH,), -1, **i32),
     )
 
 
@@ -50,16 +50,19 @@ def _reference(buf, b, t, slots, accepted, positions, dev, kv_lens=None):
     previous_slots.copy_(pin(slots), non_blocking=True)
     new_tokens = dev.new_tokens.transpose(0, 1)[previous_slots, :t].flatten()
     buf["input_ids"][:n].copy_(new_tokens, non_blocking=True)
-    buf["draft_tokens"][:b * d].copy_(dev.next_draft_tokens[previous_slots, :d].flatten(),
-                                      non_blocking=True)
+    buf["draft_tokens"][: b * d].copy_(
+        dev.next_draft_tokens[previous_slots, :d].flatten(), non_blocking=True
+    )
     kv_len_offsets = dev.new_tokens_lens - t
     buf["prev_pos_idx"][:n].copy_(pin([s for s in slots for _ in range(t)]), non_blocking=True)
-    buf["prev_pos_offsets"][:n].copy_(dev.new_tokens_lens[buf["prev_pos_idx"][:n]],
-                                      non_blocking=True)
+    buf["prev_pos_offsets"][:n].copy_(
+        dev.new_tokens_lens[buf["prev_pos_idx"][:n]], non_blocking=True
+    )
     buf["prev_kv_offsets"][:b].copy_(kv_len_offsets[previous_slots], non_blocking=True)
     buf["positions"][:n].copy_(pin(positions), non_blocking=True)
-    buf["mrope_positions"][:, :, :n].copy_(buf["positions"][:n].view(1, 1, -1).expand(3, 1, -1),
-                                           non_blocking=True)
+    buf["mrope_positions"][:, :, :n].copy_(
+        buf["positions"][:n].view(1, 1, -1).expand(3, 1, -1), non_blocking=True
+    )
     buf["gather_ids"][:n].copy_(pin(list(range(n))), non_blocking=True)
     if kv_lens is not None:  # TrtllmAttentionMetadata.prepare(): kv_lens_cuda[:n] <- pinned kv lens
         buf["kv_lens_cuda"][:b].copy_(pin(kv_lens), non_blocking=True)
@@ -67,8 +70,8 @@ def _reference(buf, b, t, slots, accepted, positions, dev, kv_lens=None):
 
 def _step(gen, b, t):
     slots = torch.randperm(SLOTS, generator=gen)[:b].tolist()
-    accepted = torch.randint(0, t, (b, ), generator=gen).tolist()
-    bases = torch.randint(1000, 200000, (b, ), generator=gen).tolist()
+    accepted = torch.randint(0, t, (b,), generator=gen).tolist()
+    bases = torch.randint(1000, 200000, (b,), generator=gen).tolist()
     positions = [p for base in bases for p in range(base, base + t)]
     return slots, accepted, positions
 
@@ -78,10 +81,11 @@ def _device_tensors(gen):
     flat = rnd(MAX_DRAFT + 1 + SLOTS * 1 + SLOTS * MAX_DRAFT).cuda()
     return types.SimpleNamespace(
         new_tokens=rnd(MAX_DRAFT + 1, SLOTS, 1).cuda(),  # store.next_new_tokens
-        new_tokens_lens=torch.randint(1, MAX_DRAFT + 2, (SLOTS, ), generator=gen,
-                                      dtype=torch.int32).cuda(),
+        new_tokens_lens=torch.randint(
+            1, MAX_DRAFT + 2, (SLOTS,), generator=gen, dtype=torch.int32
+        ).cuda(),
         # a view into a larger buffer, like the fused sampler store
-        next_draft_tokens=flat[MAX_DRAFT + 1 + SLOTS:].view(SLOTS, MAX_DRAFT),
+        next_draft_tokens=flat[MAX_DRAFT + 1 + SLOTS :].view(SLOTS, MAX_DRAFT),
     )
 
 
@@ -98,13 +102,20 @@ def test_staging_kernel_matches_full_pass(b, t, mrope, with_kv, block):
         kv_lens = [p + t for p in positions[::t]] if with_kv else None
         expected, actual = _buffers(), _buffers()
         _reference(expected, b, t, slots, accepted, positions, dev, kv_lens)
-        slab = torch.tensor(slots + accepted + positions + (kv_lens or []), dtype=torch.int32,
-                            device="cuda")
+        slab = torch.tensor(
+            slots + accepted + positions + (kv_lens or []), dtype=torch.int32, device="cuda"
+        )
         kwargs = {k: v for k, v in actual.items() if k not in ("mrope_positions", "kv_lens_cuda")}
-        stage_steady_inputs(slab, b, t, dev,
-                            mrope_positions=actual["mrope_positions"] if mrope else None,
-                            kv_lens_cuda=actual["kv_lens_cuda"] if with_kv else None, block=block,
-                            **kwargs)
+        stage_steady_inputs(
+            slab,
+            b,
+            t,
+            dev,
+            mrope_positions=actual["mrope_positions"] if mrope else None,
+            kv_lens_cuda=actual["kv_lens_cuda"] if with_kv else None,
+            block=block,
+            **kwargs,
+        )
         torch.cuda.synchronize()
         for name in expected:
             if name == "mrope_positions" and not mrope:
@@ -120,12 +131,20 @@ def test_static_graph_inputs_equal_engine_buffers(mrope):
     dev = _device_tensors(gen)
     slots, accepted, positions = _step(gen, b, t)
     actual = _buffers()
-    static_ids = torch.full((32, ), -1, dtype=torch.int32, device="cuda")
+    static_ids = torch.full((32,), -1, dtype=torch.int32, device="cuda")
     static_pos = torch.full((3, 1, 32) if mrope else (1, 32), -1, dtype=torch.int32, device="cuda")
     slab = torch.tensor(slots + accepted + positions, dtype=torch.int32, device="cuda")
     kwargs = {k: v for k, v in actual.items() if k not in ("mrope_positions", "kv_lens_cuda")}
-    stage_steady_inputs(slab, b, t, dev, mrope_positions=actual["mrope_positions"] if mrope else None,
-                        static_input_ids=static_ids, static_position_ids=static_pos, **kwargs)
+    stage_steady_inputs(
+        slab,
+        b,
+        t,
+        dev,
+        mrope_positions=actual["mrope_positions"] if mrope else None,
+        static_input_ids=static_ids,
+        static_position_ids=static_pos,
+        **kwargs,
+    )
     torch.cuda.synchronize()
     n = b * t
     # what CUDAGraphRunner.replay copies
@@ -146,9 +165,14 @@ def test_corrupted_slot_is_caught():
     _reference(expected, b, t, slots, accepted, positions, dev)
     wrong = [(slots[0] + 1) % SLOTS] + slots[1:]
     slab = torch.tensor(wrong + accepted + positions, dtype=torch.int32, device="cuda")
-    stage_steady_inputs(slab, b, t, dev, mrope_positions=actual["mrope_positions"],
-                        **{k: v for k, v in actual.items()
-                           if k not in ("mrope_positions", "kv_lens_cuda")})
+    stage_steady_inputs(
+        slab,
+        b,
+        t,
+        dev,
+        mrope_positions=actual["mrope_positions"],
+        **{k: v for k, v in actual.items() if k not in ("mrope_positions", "kv_lens_cuda")},
+    )
     torch.cuda.synchronize()
     assert not torch.equal(actual["input_ids"], expected["input_ids"])
 
@@ -170,14 +194,24 @@ def test_one_kernel_variant_for_all_batch_sizes():
         dev = _device_tensors(gen)
         slots, accepted, positions = _step(gen, b, t)
         kv_lens = [p + t for p in positions[::t]]
-        slab = torch.tensor(slots + accepted + positions + kv_lens, dtype=torch.int32, device="cuda")
+        slab = torch.tensor(
+            slots + accepted + positions + kv_lens, dtype=torch.int32, device="cuda"
+        )
         actual = _buffers()
-        static_ids = torch.full((MAX_TOKENS, ), -1, dtype=torch.int32, device="cuda")
+        static_ids = torch.full((MAX_TOKENS,), -1, dtype=torch.int32, device="cuda")
         static_pos = torch.full((3, 1, MAX_TOKENS), -1, dtype=torch.int32, device="cuda")
-        stage_steady_inputs(slab, b, t, dev, mrope_positions=actual["mrope_positions"],
-                            kv_lens_cuda=actual["kv_lens_cuda"], static_input_ids=static_ids,
-                            static_position_ids=static_pos, block=block,
-                            **{k: v for k, v in actual.items() if k not in ("mrope_positions", "kv_lens_cuda")})
+        stage_steady_inputs(
+            slab,
+            b,
+            t,
+            dev,
+            mrope_positions=actual["mrope_positions"],
+            kv_lens_cuda=actual["kv_lens_cuda"],
+            static_input_ids=static_ids,
+            static_position_ids=static_pos,
+            block=block,
+            **{k: v for k, v in actual.items() if k not in ("mrope_positions", "kv_lens_cuda")},
+        )
         torch.cuda.synchronize()
         n = b * t
         assert torch.equal(static_ids[:n], actual["input_ids"][:n])
@@ -218,7 +252,9 @@ def _add(m, rid, row, pages):
     m.index_mapper.rows[rid] = row
     m.kv_cache_map[rid] = _Cache(len(pages))
     for pool in range(m.host_kv_cache_block_offsets.shape[0]):
-        m.host_kv_cache_block_offsets[pool, row, 0, :len(pages)] = torch.tensor(pages) + 1000 * pool
+        m.host_kv_cache_block_offsets[pool, row, 0, : len(pages)] = (
+            torch.tensor(pages) + 1000 * pool
+        )
 
 
 def test_block_key_sees_a_reallocated_last_block():
@@ -270,9 +306,16 @@ def test_zero_copy_slab_matches_device_slab(b):
     results = []
     for slab in (host.cuda(), host):
         actual = _buffers()
-        stage_steady_inputs(slab, b, t, dev, mrope_positions=actual["mrope_positions"],
-                            kv_lens_cuda=actual["kv_lens_cuda"], block=64,
-                            **{k: v for k, v in actual.items() if k not in ("mrope_positions", "kv_lens_cuda")})
+        stage_steady_inputs(
+            slab,
+            b,
+            t,
+            dev,
+            mrope_positions=actual["mrope_positions"],
+            kv_lens_cuda=actual["kv_lens_cuda"],
+            block=64,
+            **{k: v for k, v in actual.items() if k not in ("mrope_positions", "kv_lens_cuda")},
+        )
         torch.cuda.synchronize()
         results.append(actual)
     for name in results[0]:
@@ -295,12 +338,17 @@ class _SsmCache:
 def _mamba_setup(device="cuda"):
     i32 = dict(dtype=torch.int32, device=device)
     manager = types.SimpleNamespace(
-        kv_cache_map={5: _SsmCache(11), 6: _SsmCache(4)}, ssm_layer_group_id=3, local_num_mamba_layers=45,
+        kv_cache_map={5: _SsmCache(11), 6: _SsmCache(4)},
+        ssm_layer_group_id=3,
+        local_num_mamba_layers=45,
         cuda_state_indices=torch.tensor([11, 4, 0, 0], **i32),
         _dummy_request_mask=torch.zeros(4, dtype=torch.bool, device=device),
-        _request_id_to_is_dummy={5: False, 6: False})
-    mamba = types.SimpleNamespace(state_indices=torch.tensor([11, 4, 0, 0], **i32),
-                                  state_indices_long=torch.tensor([11, 4], dtype=torch.long, device=device))
+        _request_id_to_is_dummy={5: False, 6: False},
+    )
+    mamba = types.SimpleNamespace(
+        state_indices=torch.tensor([11, 4, 0, 0], **i32),
+        state_indices_long=torch.tensor([11, 4], dtype=torch.long, device=device),
+    )
     return types.SimpleNamespace(kv_cache_manager=manager, mamba_metadata=mamba)
 
 
@@ -310,9 +358,13 @@ def test_verify_checks_mamba_indices_against_the_manager():
     check = steady.SteadyMtpPrepare._mamba_ground_truth
     attn = _mamba_setup()
     assert check(attn, [5, 6]) == []
-    attn.kv_cache_manager.kv_cache_map[6].base = 9  # the request moved to another SSM block, uploads skipped
+    attn.kv_cache_manager.kv_cache_map[
+        6
+    ].base = 9  # the request moved to another SSM block, uploads skipped
     bad = check(attn, [5, 6])
-    assert any("cuda_state_indices" in m for m in bad) and any("mamba.state_indices" in m for m in bad)
+    assert any("cuda_state_indices" in m for m in bad) and any(
+        "mamba.state_indices" in m for m in bad
+    )
     attn = _mamba_setup()
     attn.kv_cache_manager._dummy_request_mask[3] = True  # a stale dummy flag past the batch
     assert any("_dummy_request_mask" in m for m in check(attn, [5, 6]))

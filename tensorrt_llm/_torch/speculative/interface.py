@@ -851,8 +851,8 @@ class SpecMetadata:
             scan_key = (tuple(
                 (request.py_request_id,
                  request.state == LlmRequestState.GENERATION_IN_PROGRESS,
-                 request.py_seq_slot) for request in requests),
-                        self.runtime_draft_len,
+                 request.py_seq_slot)
+                for request in requests), self.runtime_draft_len,
                         getattr(self, '_force_non_greedy_for_capture', False),
                         self.group_all_greedy_sample, self.dummy_slot_row)
             cached = getattr(self, "_q35_scan_cache", None)
@@ -1530,8 +1530,7 @@ class SpecWorkerBase(nn.Module, ABC):
         if frac_part > 0.0 and base_total < max_total:
             self._ensure_force_accept_rng_state(device)
             return (base_total, max_total, frac_part,
-                    self._force_accept_rng_pool,
-                    self._force_accept_rng_counter,
+                    self._force_accept_rng_pool, self._force_accept_rng_counter,
                     _FORCE_ACCEPT_RNG_COUNTER_STRIDE,
                     _FORCE_ACCEPT_RNG_SLOT_STRIDE, _FORCE_ACCEPT_RNG_POOL_SIZE)
         return (base_total, max_total, 0.0, None, None,
@@ -2115,11 +2114,11 @@ class SpecWorkerBase(nn.Module, ABC):
                 if exchange is not None and 1 <= logits.shape[
                         0] <= exchange.MAX_ROWS:
                     local_max, local_argmax = torch.max(logits, dim=-1)
-                    return exchange.argmax_tokens(
-                        local_max,
-                        local_argmax,
-                        mapping.tp_rank * logits.shape[-1],
-                        channel=0)
+                    return exchange.argmax_tokens(local_max,
+                                                  local_argmax,
+                                                  mapping.tp_rank *
+                                                  logits.shape[-1],
+                                                  channel=0)
             from ..distributed.ops import allgather
             combined = self._get_local_max_and_combined(logits)
             gathered = allgather(combined, mapping, dim=-1)

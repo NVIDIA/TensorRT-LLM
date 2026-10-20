@@ -245,8 +245,8 @@ std::vector<torch::Tensor> run_fp4_block_scale_moe_runner(torch::optional<torch:
     at::Tensor expanded_idx_to_permuted_idx = prerouted != nullptr
         ? prerouted->expanded_idx_to_permuted_idx.narrow(0, 0, args.num_tokens * args.top_k)
               .view({args.num_tokens, args.top_k})
-        : at::Tensor(at::detail::empty_cuda(
-            {args.num_tokens, args.top_k}, at::ScalarType::Int, routing_device, std::nullopt));
+        : at::Tensor(
+            at::detail::empty_cuda({args.num_tokens, args.top_k}, at::ScalarType::Int, routing_device, std::nullopt));
 
     at::Tensor permuted_idx_to_token_idx = prerouted != nullptr
         ? prerouted->permuted_idx_to_token_idx

@@ -1484,7 +1484,7 @@ class MambaHybridCacheManager(BaseResourceManager, BaseMambaCacheManager):
         if ring is None or ring[0].numel() < num_contexts:
             n = max(num_contexts, self._host_state_indices.shape[0])
             ring = self._q35_seed_ring = [
-                torch.empty(n, dtype=torch.int64, pin_memory=True)
+                torch.empty(n, dtype=torch.int64, pin_memory=prefer_pinned())
                 for _ in range(8)
             ]
             self._q35_seed_ring_i = 0
@@ -1982,7 +1982,8 @@ def _promote_mamba_state_triton(
 # descriptor table, and folds the replay bookkeeping (PNAT / active history buffer advance, ~10 small torch ops in
 # _advance_replay_state) into the same launch -- instead of one promotion launch per layer (45 for Qwen3.5) plus the
 # torch ops. Same copies and same bookkeeping arithmetic as the default path (bitwise-identical caches).
-_Q35_GDN_PROMOTE_FUSED = os.environ.get("TRTLLM_Q35_GDN_PROMOTE_FUSED", "0") == "1"
+_Q35_GDN_PROMOTE_FUSED = os.environ.get("TRTLLM_Q35_GDN_PROMOTE_FUSED",
+                                        "0") == "1"
 
 # Qwen3.5 switch (default off). TRTLLM_MAMBA_INFORWARD_SNAPSHOT=1: with hybrid block reuse the last reusable Mamba
 # snapshot point P = prompt_len - k (additional_snapshot_offsets_from_end, e.g. k = 2 for a '<think>\n' generation
@@ -1993,10 +1994,14 @@ _Q35_GDN_PROMOTE_FUSED = os.environ.get("TRTLLM_Q35_GDN_PROMOTE_FUSED", "0") == 
 # TRTLLM_MAMBA_INFORWARD_SNAPSHOT_ROWS: requests per batch that can take the path (staging rows; the others keep the
 # split); 0 (default) = as many as fit TRTLLM_MAMBA_INFORWARD_SNAPSHOT_MIB (default 512), at most 8.
 # TRTLLM_MAMBA_INFORWARD_SNAPSHOT_MAX_TAIL (default 16): longest tail.
-_Q35_INFWD_SNAPSHOT = os.environ.get("TRTLLM_MAMBA_INFORWARD_SNAPSHOT", "0") == "1"
-_Q35_INFWD_ROWS = int(os.environ.get("TRTLLM_MAMBA_INFORWARD_SNAPSHOT_ROWS", "0"))
-_Q35_INFWD_MIB = int(os.environ.get("TRTLLM_MAMBA_INFORWARD_SNAPSHOT_MIB", "512"))
-_Q35_INFWD_MAX_TAIL = int(os.environ.get("TRTLLM_MAMBA_INFORWARD_SNAPSHOT_MAX_TAIL", "16"))
+_Q35_INFWD_SNAPSHOT = os.environ.get("TRTLLM_MAMBA_INFORWARD_SNAPSHOT",
+                                     "0") == "1"
+_Q35_INFWD_ROWS = int(
+    os.environ.get("TRTLLM_MAMBA_INFORWARD_SNAPSHOT_ROWS", "0"))
+_Q35_INFWD_MIB = int(
+    os.environ.get("TRTLLM_MAMBA_INFORWARD_SNAPSHOT_MIB", "512"))
+_Q35_INFWD_MAX_TAIL = int(
+    os.environ.get("TRTLLM_MAMBA_INFORWARD_SNAPSHOT_MAX_TAIL", "16"))
 
 # Qwen3.5 switch (default off). TRTLLM_Q35_BRANCH_SNAPSHOT=1: branch-point Mamba snapshots (upstream #18272 + #18724),
 # enabled through the environment rather than kv_cache_config.mamba_state_config.enable_branch_snapshot. A request whose
@@ -2007,7 +2012,8 @@ _Q35_INFWD_MAX_TAIL = int(os.environ.get("TRTLLM_MAMBA_INFORWARD_SNAPSHOT_MAX_TA
 # raw lookup depth (_KVCache._get_num_reusable_tokens_before_pruning); startup fails if they are missing.
 # TRTLLM_Q35_BRANCH_SNAPSHOT_LOG_S (default 60): rank 0 logs the branch snapshot counters at most this often.
 _Q35_BRANCH_SNAPSHOT = os.environ.get("TRTLLM_Q35_BRANCH_SNAPSHOT", "0") == "1"
-_Q35_BRANCH_SNAPSHOT_LOG_S = float(os.environ.get("TRTLLM_Q35_BRANCH_SNAPSHOT_LOG_S", "60"))
+_Q35_BRANCH_SNAPSHOT_LOG_S = float(
+    os.environ.get("TRTLLM_Q35_BRANCH_SNAPSHOT_LOG_S", "60"))
 # Fingerprints of the blocks that end at a branch snapshot (for the hit counter only); the oldest are dropped first.
 _Q35_BRANCH_SNAPSHOT_MAX_KEYS = 1 << 16
 
@@ -2050,10 +2056,14 @@ def _q35_promote_state_layers_kernel(
             pnat = tl.load(replay_pnat_ptr + blk)
             cache_buf_idx = tl.load(replay_cache_buf_idx_ptr + blk)
             wrote_checkpoint = pnat + REPLAY_STEP_WIDTH > REPLAY_HISTORY_SIZE
-            next_pnat = tl.where(wrote_checkpoint, num_accepted_tokens, pnat + num_accepted_tokens)
-            next_cache_buf_idx = tl.where(wrote_checkpoint, 1 - cache_buf_idx, cache_buf_idx)
+            next_pnat = tl.where(wrote_checkpoint, num_accepted_tokens,
+                                 pnat + num_accepted_tokens)
+            next_cache_buf_idx = tl.where(wrote_checkpoint, 1 - cache_buf_idx,
+                                          cache_buf_idx)
             tl.store(replay_pnat_ptr + blk, next_pnat, mask=~is_dummy_request)
-            tl.store(replay_cache_buf_idx_ptr + blk, next_cache_buf_idx, mask=~is_dummy_request)
+            tl.store(replay_cache_buf_idx_ptr + blk,
+                     next_cache_buf_idx,
+                     mask=~is_dummy_request)
 
     desc = dst_desc_ptr + layer * 2
     dst_base = tl.load(desc).to(tl.pointer_type(src_ptr.dtype.element_ty))
@@ -2066,7 +2076,8 @@ def _q35_promote_state_layers_kernel(
     tl.store(dst + offs, v, mask=mask)
 
 
-def _q35_build_state_descriptors(states: List[torch.Tensor]) -> Optional[torch.Tensor]:
+def _q35_build_state_descriptors(
+        states: List[torch.Tensor]) -> Optional[torch.Tensor]:
     """[num_layers, 2] int64 (data_ptr in bytes, slot stride in elements) or None if the views do not qualify.
 
     Every per-layer view must have the same dtype/device/shape and dense inner dimensions (the promotion copies
@@ -2082,26 +2093,28 @@ def _q35_build_state_descriptors(states: List[torch.Tensor]) -> Optional[torch.T
         expected_inner.insert(0, stride)
         stride *= size
     for state in states:
-        if (state.dtype != ref.dtype or state.device != ref.device or list(state.shape[1:]) != inner_shape
+        if (state.dtype != ref.dtype or state.device != ref.device
+                or list(state.shape[1:]) != inner_shape
                 or list(state.stride()[1:]) != expected_inner):
             return None
-    return torch.tensor([(state.data_ptr(), state.stride(0)) for state in states],
+    return torch.tensor([(state.data_ptr(), state.stride(0))
+                         for state in states],
                         dtype=torch.int64,
                         device=ref.device)
 
 
-def _q35_promote_state_layers(
-        dst_descriptors: torch.Tensor,
-        intermediate: torch.Tensor,
-        src_state_indices: torch.Tensor,
-        num_accepted_tokens: torch.Tensor,
-        dst_state_indices: torch.Tensor,
-        replay_pnat: Optional[torch.Tensor] = None,
-        replay_cache_buf_idx: Optional[torch.Tensor] = None,
-        dummy_request_mask: Optional[torch.Tensor] = None,
-        replay_step_width: int = 0,
-        replay_history_size: int = 0,
-        BLOCK: int = 2048) -> None:
+def _q35_promote_state_layers(dst_descriptors: torch.Tensor,
+                              intermediate: torch.Tensor,
+                              src_state_indices: torch.Tensor,
+                              num_accepted_tokens: torch.Tensor,
+                              dst_state_indices: torch.Tensor,
+                              replay_pnat: Optional[torch.Tensor] = None,
+                              replay_cache_buf_idx: Optional[
+                                  torch.Tensor] = None,
+                              dummy_request_mask: Optional[torch.Tensor] = None,
+                              replay_step_width: int = 0,
+                              replay_history_size: int = 0,
+                              BLOCK: int = 2048) -> None:
     """One launch: promote the accepted step of every layer (see _q35_promote_state_layers_kernel)."""
     num_layers = dst_descriptors.shape[0]
     num_gens = src_state_indices.shape[0]
@@ -2113,7 +2126,8 @@ def _q35_promote_state_layers(
         assert replay_cache_buf_idx is not None and dummy_request_mask is not None
         assert replay_step_width > 0 and replay_history_size >= replay_step_width
         assert replay_pnat.dtype == torch.int32 and replay_cache_buf_idx.dtype == torch.int32
-        assert dummy_request_mask.dtype == torch.bool and dummy_request_mask.numel() >= num_gens
+        assert dummy_request_mask.dtype == torch.bool and dummy_request_mask.numel(
+        ) >= num_gens
     else:
         replay_pnat = dst_state_indices
         replay_cache_buf_idx = dst_state_indices
@@ -3356,7 +3370,8 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         self.q35_inforward_min_main = max(1, self.conv_state_shape[-1])
         logger.info(
             "TRTLLM_MAMBA_INFORWARD_SNAPSHOT: in-forward Mamba snapshots, "
-            f"{rows} staging rows ({rows * row_bytes / 2**20:.0f} MiB), tail <= {_Q35_INFWD_MAX_TAIL} tokens")
+            f"{rows} staging rows ({rows * row_bytes / 2**20:.0f} MiB), tail <= {_Q35_INFWD_MAX_TAIL} tokens"
+        )
 
     def q35_stage_views(self, layer_idx: int):
         """This layer's staging rows: ([rows, H, V, K] SSM, [rows, conv_dim, d_conv - 1] conv)."""
@@ -3366,8 +3381,8 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
     def q35_state_index(self, request_id: int) -> int:
         return self._request_id_to_state_index[request_id]
 
-    def _q35_plan_inforward_snapshots(self,
-                                      scheduled_batch: ScheduledRequests) -> None:
+    def _q35_plan_inforward_snapshots(
+            self, scheduled_batch: ScheduledRequests) -> None:
         plan = {}
         context_only = not scheduled_batch.generation_requests
         for req in scheduled_batch.context_requests:
@@ -3393,7 +3408,8 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                 logger.warning(
                     "TRTLLM_MAMBA_INFORWARD_SNAPSHOT: request "
                     f"{req.py_request_id} dropped from the in-forward snapshot plan (P={point}, chunk "
-                    f"[{pos}, {end}), prompt {req.prompt_len}, context-only batch {context_only})")
+                    f"[{pos}, {end}), prompt {req.prompt_len}, context-only batch {context_only})"
+                )
         self.q35_inforward_plan = plan
 
     def _q35_finish_inforward_snapshots(
@@ -3418,7 +3434,8 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                         None, point):
                     raise ValueError(
                         "Failed to resize history length of V2 Mamba cache for request "
-                        f"{request.py_request_id} to the in-forward snapshot point {point}")
+                        f"{request.py_request_id} to the in-forward snapshot point {point}"
+                    )
                 tokens = self._tokens_for_block_reuse(
                     request, kv_cache.num_committed_tokens, point)
                 kv_cache.commit(tokens)
@@ -3431,7 +3448,8 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             slot = kv_cache.get_ssm_block_base_index(self.ssm_layer_group_id)
             if slot < 0:
                 raise RuntimeError(
-                    f"in-forward Mamba snapshot: request {request.py_request_id} lost its live SSM slot")
+                    f"in-forward Mamba snapshot: request {request.py_request_id} lost its live SSM slot"
+                )
             dst += [state[slot] for state in self.all_ssm_states]
             dst += [state[slot] for state in self.all_conv_states]
             src += list(self._q35_stage_ssm[:, row].unbind(0))
@@ -4344,8 +4362,8 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                 state_indices_d,
                 replay_pnat=self.prev_num_accepted_tokens,
                 replay_cache_buf_idx=self.cache_buf_idx,
-                dummy_request_mask=self._dummy_request_mask[
-                    num_contexts:num_contexts + num_gens],
+                dummy_request_mask=self.
+                _dummy_request_mask[num_contexts:num_contexts + num_gens],
                 replay_step_width=self.replay_step_width,
                 replay_history_size=self.replay_history_size)
             return
@@ -4425,11 +4443,11 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         commit_end = min(request.context_current_position, commit_limit)
         if (request.context_current_position in request.expect_snapshot_points
                 and commit_end > kv_cache.num_committed_tokens):
-            tokens = self._tokens_for_block_reuse(
-                request, kv_cache.num_committed_tokens, commit_end)
+            tokens = self._tokens_for_block_reuse(request,
+                                                  kv_cache.num_committed_tokens,
+                                                  commit_end)
             kv_cache.commit(tokens)
-            if (self._enable_branch_snapshot
-                    and self.local_num_mamba_layers > 0
+            if (self._enable_branch_snapshot and self.local_num_mamba_layers > 0
                     and self._branch_snapshot_points.get(
                         request.py_request_id) == commit_end):
                 self._note_branch_snapshot_taken(request, commit_end, tokens)

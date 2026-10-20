@@ -25,7 +25,9 @@ _L2_STREAMING_HEAD_TILES = 8192
 # Decode batches from this size use the partitioned replay + one all-layer checkpoint commit per step; smaller ones
 # commit inside each layer's replay. TRTLLM_Q35_GDN_REPLAY_PARTITION_MIN_BATCH=<n> moves the switch (e.g. 33 with
 # TRTLLM_Q35_GDN_CORE_LARGE=1, whose CUDA core kernel commits in-layer at b16 / b32).
-CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE = int(os.environ.get("TRTLLM_Q35_GDN_REPLAY_PARTITION_MIN_BATCH", "16"))
+CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE = int(
+    os.environ.get("TRTLLM_Q35_GDN_REPLAY_PARTITION_MIN_BATCH", "16")
+)
 
 # Qwen3.5 low-latency switch (default off). TRTLLM_Q35_GDN_REPLAY_TILE=1: use the tuned fine-grained value tiling
 # (BV=16, 2 warps for <= 64 head tiles) for every T in [2, 8], not only T == 4. Measured on GB300 at the Qwen3.5 TP8
@@ -191,7 +193,11 @@ def _cached_replay_kernel(
                 other=0,
             )
             uh1 = tl.load(
-                old_u + (hb0 + 1) * HIST * HV * V + i_hv * V + o_hist[:, None] * HV * V + o_v[None, :],
+                old_u
+                + (hb0 + 1) * HIST * HV * V
+                + i_hv * V
+                + o_hist[:, None] * HV * V
+                + o_v[None, :],
                 mask=hist_m[:, None] & mask_v[None, :],
                 other=0,
             )

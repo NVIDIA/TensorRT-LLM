@@ -557,7 +557,9 @@ class Q35DraftHeadGemvKernel:
                                 gOut[token, row] = value.to(gOut.element_type)
 
         if const_expr(self.argmax):
-            self._reduce_and_publish(gOut, best_v, best_i, sBestV, sBestI, vocab_offset, tidx, warp, lane, q)
+            self._reduce_and_publish(
+                gOut, best_v, best_i, sBestV, sBestI, vocab_offset, tidx, warp, lane, q
+            )
 
         if const_expr(self.use_pdl and not self.early_trigger):
             griddepcontrol_launch_dependents()

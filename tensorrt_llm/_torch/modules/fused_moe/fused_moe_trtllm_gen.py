@@ -898,11 +898,10 @@ class TRTLLMGenFusedMoE(MoE):
 
             per_expert = [
                 self.w3_w1_weight, self.w3_w1_weight_scale,
-                self.w3_w1_bias if self.bias else None, gemm1_alpha,
-                gemm1_beta, self.swiglu_limit, self.w2_weight,
-                self.w2_weight_scale, self.w2_bias if self.bias else None,
-                output1_scale_scalar, output1_scale_gate_scalar,
-                output2_scale_scalar
+                self.w3_w1_bias if self.bias else None, gemm1_alpha, gemm1_beta,
+                self.swiglu_limit, self.w2_weight, self.w2_weight_scale,
+                self.w2_bias if self.bias else None, output1_scale_scalar,
+                output1_scale_gate_scalar, output2_scale_scalar
             ]
             slot_start, num_local = self.slot_start, self.expert_size_per_partition
             outputs = None
@@ -911,7 +910,8 @@ class TRTLLMGenFusedMoE(MoE):
                 # dealt runs as this rank's all-local share; anything else runs contiguous
                 # EP on the home block of the replicated weights, as without the flag.
                 from .q35_fused_front import q35_dea_home, q35_dea_run
-                if prerouted is not None and len(prerouted) > 4 and prerouted[4]:
+                if prerouted is not None and len(
+                        prerouted) > 4 and prerouted[4]:
                     e4m3 = torch.float8_e4m3fn
                     outputs = q35_dea_run(
                         self, [
@@ -928,7 +928,8 @@ class TRTLLMGenFusedMoE(MoE):
                         topk_group=topk_group,
                         intermediate_size=intermediate_size_per_partition_padded,
                         routed_scaling_factor=routed_scaling_factor,
-                        routing_method_type=self.routing_method.routing_method_type,
+                        routing_method_type=self.routing_method.
+                        routing_method_type,
                         do_finalize=do_finalize,
                         act_type=act_type,
                         output=moe_output)

@@ -40,11 +40,12 @@ import torch
 from tensorrt_llm.logger import logger
 
 from ..compilation.utils import get_capture_piecewise_cuda_graph_flag
-from ..utils import (get_model_extra_attrs,
-                     get_per_request_piecewise_cuda_graph_flag, make_weak_ref)
+from ..utils import get_model_extra_attrs, get_per_request_piecewise_cuda_graph_flag, make_weak_ref
 
 ENV = "TRTLLM_Q35_CTX_MTP_GRAPH"
-_WARMUP_CALLS = 3  # eager calls of the split path per bucket before its capture (as PiecewiseRunner)
+_WARMUP_CALLS = (
+    3  # eager calls of the split path per bucket before its capture (as PiecewiseRunner)
+)
 
 
 def ctx_mtp_graph_enabled() -> bool:
@@ -82,11 +83,30 @@ class _AttnSplit:
         self.hit = False
         self.error = None
 
-    def __call__(self, q, k, v, attn_metadata, attention_mask, mrope_rotary_cos_sin, mrope_position_deltas,
-                 attention_window_size, attention_mask_data, output=None, output_sf=None, **kwargs):
+    def __call__(
+        self,
+        q,
+        k,
+        v,
+        attn_metadata,
+        attention_mask,
+        mrope_rotary_cos_sin,
+        mrope_position_deltas,
+        attention_window_size,
+        attention_mask_data,
+        output=None,
+        output_sf=None,
+        **kwargs,
+    ):
         r = self.runner
-        if self.hit or output is None or mrope_rotary_cos_sin is not None or mrope_position_deltas is not None \
-                or attention_mask_data is not None or kwargs.get("has_lora", False):
+        if (
+            self.hit
+            or output is None
+            or mrope_rotary_cos_sin is not None
+            or mrope_position_deltas is not None
+            or attention_mask_data is not None
+            or kwargs.get("has_lora", False)
+        ):
             # Only the custom-op path (output preallocated inside the pre graph) and a call without
             # per-forward side tensors can be replayed; anything else aborts the capture.
             self.error = "unsupported attention call"
@@ -94,12 +114,30 @@ class _AttnSplit:
         self.hit = True
         r._cur_pre.capture_end()
         r._capturing = None
-        weak = lambda t: make_weak_ref(t) if isinstance(t, torch.Tensor) else t
+
+        def weak(t):
+            return make_weak_ref(t) if isinstance(t, torch.Tensor) else t
+
         r._cur_bucket.attn_args = (weak(q), weak(k), weak(v), attention_mask, attention_window_size)
-        r._cur_bucket.attn_kwargs = dict(output=weak(output), output_sf=weak(output_sf),
-                                         **{key: weak(val) for key, val in kwargs.items()})
-        result = self.orig(q, k, v, attn_metadata, attention_mask, None, None, attention_window_size, None,
-                           output=output, output_sf=output_sf, **kwargs)
+        r._cur_bucket.attn_kwargs = dict(
+            output=weak(output),
+            output_sf=weak(output_sf),
+            **{key: weak(val) for key, val in kwargs.items()},
+        )
+        result = self.orig(
+            q,
+            k,
+            v,
+            attn_metadata,
+            attention_mask,
+            None,
+            None,
+            attention_window_size,
+            None,
+            output=output,
+            output_sf=output_sf,
+            **kwargs,
+        )
         r._cur_post.capture_begin(pool=r.pool, capture_error_mode="thread_local")
         r._capturing = r._cur_post
         return result
@@ -130,7 +168,9 @@ class CtxMtpGraphs:
 
     # ---- eligibility -------------------------------------------------------------------------------------------
 
-    def ineligible(self, worker, attn_metadata, spec_metadata, draft_model, input_ids, hidden_states):
+    def ineligible(
+        self, worker, attn_metadata, spec_metadata, draft_model, input_ids, hidden_states
+    ):
         """Reason the stock eager step has to run for this forward, or None."""
         if self.disabled:
             return "disabled"
@@ -161,7 +201,11 @@ class CtxMtpGraphs:
         if attn_metadata.kv_cache_manager is None:
             return "no_kv_cache"
         n = attn_metadata.num_tokens
-        if hidden_states.shape[0] != n or input_ids.shape[0] != n or attn_metadata.num_ctx_tokens != n:
+        if (
+            hidden_states.shape[0] != n
+            or input_ids.shape[0] != n
+            or attn_metadata.num_ctx_tokens != n
+        ):
             return "shape"
         return None
 
@@ -170,10 +214,14 @@ class CtxMtpGraphs:
     def _alloc(self, positions, hidden_states):
         cap = self.max_tokens
         dev = hidden_states.device
-        self.ids = torch.zeros((cap, ), dtype=torch.int32, device=dev)
-        self.pos = torch.zeros(tuple(positions.shape[:-1]) + (cap, ), dtype=positions.dtype, device=dev)
-        self.hid = torch.zeros((cap, hidden_states.shape[-1]), dtype=hidden_states.dtype, device=dev)
-        self.gid = torch.zeros((self.rows, ), dtype=torch.long, device=dev)
+        self.ids = torch.zeros((cap,), dtype=torch.int32, device=dev)
+        self.pos = torch.zeros(
+            tuple(positions.shape[:-1]) + (cap,), dtype=positions.dtype, device=dev
+        )
+        self.hid = torch.zeros(
+            (cap, hidden_states.shape[-1]), dtype=hidden_states.dtype, device=dev
+        )
+        self.gid = torch.zeros((self.rows,), dtype=torch.long, device=dev)
         self.pool = torch.cuda.graph_pool_handle()
         self.stream = torch.cuda.Stream()
 
@@ -181,7 +229,7 @@ class CtxMtpGraphs:
         """The stock draft inputs of a context batch, in the static buffers: token ids shifted left by one with each
         request's sampled target token at its last position, the target hidden states, the positions, and the
         requests' last-token rows."""
-        self.ids[:n - 1].copy_(input_ids[1:n])
+        self.ids[: n - 1].copy_(input_ids[1:n])
         self.ids[gather_ids[:b]] = target_tokens
         self.hid[:n].copy_(hidden_states[:n])
         self.pos[..., :n].copy_(positions[..., :n])
@@ -193,22 +241,28 @@ class CtxMtpGraphs:
         """SpecWorkerBase.greedy_sample_draft_with_tp_gather without the torch.compile'd combine (same tokens:
         global argmax over the vocabulary shards, lowest index on ties)."""
         mapping = worker.mapping
-        if (mapping is not None and getattr(mapping, "tp_size", 1) > 1
-                and worker._draft_logits_are_sharded(logits, spec_metadata)):
+        if (
+            mapping is not None
+            and getattr(mapping, "tp_size", 1) > 1
+            and worker._draft_logits_are_sharded(logits, spec_metadata)
+        ):
             from ..distributed.ops import allgather
+
             gathered = allgather(worker._get_local_max_and_combined(logits), mapping, dim=-1)
             best = torch.argmax(gathered[..., 1::2], dim=-1, keepdim=True)
             return torch.gather(gathered[..., 0::2], -1, best).squeeze(-1).type(torch.int32)
         return torch.argmax(logits, dim=-1).type(torch.int32)
 
     def _body(self, worker, s, attn_metadata, spec_metadata, draft_model):
-        hidden = self.mtp(input_ids=self.ids[:s],
-                          position_ids=self.pos[..., :s],
-                          hidden_states=self.hid[:s],
-                          embed_tokens=draft_model.embed_tokens,
-                          attn_metadata=attn_metadata,
-                          all_rank_num_tokens=spec_metadata.all_rank_num_tokens,
-                          spec_metadata=spec_metadata)
+        hidden = self.mtp(
+            input_ids=self.ids[:s],
+            position_ids=self.pos[..., :s],
+            hidden_states=self.hid[:s],
+            embed_tokens=draft_model.embed_tokens,
+            attn_metadata=attn_metadata,
+            all_rank_num_tokens=spec_metadata.all_rank_num_tokens,
+            spec_metadata=spec_metadata,
+        )
         rows = hidden[torch.clamp(self.gid, max=s - 1)]
         logits = self.mtp.shared_head(rows, draft_model.lm_head, attn_metadata, True)
         return self._greedy_draft(worker, logits, spec_metadata), logits
@@ -252,8 +306,10 @@ class CtxMtpGraphs:
             self._cur_bucket = self._cur_pre = self._cur_post = None
         if failure is not None:
             self.disabled = f"capture failed at {s} tokens: {failure}"
-            logger.warning(f"[q35 ctx mtp graph] rank {self.rank}: {self.disabled}; the eager draft step runs "
-                           "from now on")
+            logger.warning(
+                f"[q35 ctx mtp graph] rank {self.rank}: {self.disabled}; the eager draft step runs "
+                "from now on"
+            )
             return False
         bucket.pre, bucket.post = pre, post
         bucket.draft, bucket.logits = make_weak_ref(draft), make_weak_ref(logits)
@@ -262,7 +318,9 @@ class CtxMtpGraphs:
     def _replay(self, bucket, attn_metadata):
         bucket.pre.replay()
         q, k, v, mask, window = bucket.attn_args
-        self.attn._attn_impl(q, k, v, attn_metadata, mask, None, None, window, None, **bucket.attn_kwargs)
+        self.attn._attn_impl(
+            q, k, v, attn_metadata, mask, None, None, window, None, **bucket.attn_kwargs
+        )
         bucket.post.replay()
         return bucket.draft
 
@@ -275,13 +333,26 @@ class CtxMtpGraphs:
         bucket = self.buckets.get(s)
         if bucket is not None and bucket.post is not None:
             return None
-        if (get_capture_piecewise_cuda_graph_flag() and s <= self.max_tokens
-                and get_per_request_piecewise_cuda_graph_flag()):
+        if (
+            get_capture_piecewise_cuda_graph_flag()
+            and s <= self.max_tokens
+            and get_per_request_piecewise_cuda_graph_flag()
+        ):
             return None
         return "no_graph"
 
-    def draft(self, worker, input_ids, positions, hidden_states, target_tokens, attn_metadata, spec_metadata,
-              draft_model, draft_kv_cache_manager=None):
+    def draft(
+        self,
+        worker,
+        input_ids,
+        positions,
+        hidden_states,
+        target_tokens,
+        attn_metadata,
+        spec_metadata,
+        draft_model,
+        draft_kv_cache_manager=None,
+    ):
         """Draft tokens [rows] int32 of this context batch (rows >= num_seqs; usable() said yes), or None after a
         failed capture. With a separate draft KV cache (non-disaggregated runs) the MTP attention runs on it, as in
         the stock draft loop (draft_kv_cache_context swaps the manager and block offsets in place)."""
@@ -291,7 +362,9 @@ class CtxMtpGraphs:
         if self.ids is None:
             self._alloc(positions, hidden_states)
         bucket = self.buckets.setdefault(s, _Bucket())
-        self._stage(input_ids, positions, hidden_states, target_tokens, spec_metadata.gather_ids, n, b)
+        self._stage(
+            input_ids, positions, hidden_states, target_tokens, spec_metadata.gather_ids, n, b
+        )
         with worker.draft_kv_cache_context(attn_metadata, draft_kv_cache_manager) as meta:
             return self._draft_in_context(worker, bucket, s, meta, spec_metadata, draft_model)
 
@@ -308,6 +381,7 @@ class CtxMtpGraphs:
         # any rank turns the graphs off on all of them. Warmup only, so a host all-gather is fine here.
         try:
             from tensorrt_llm._utils import mpi_allgather
+
             oks = mpi_allgather(ok)
             ok = all(oks) if isinstance(oks, list) else bool(oks)
         except Exception as error:  # noqa: BLE001 (no MPI: this rank's own result)
@@ -315,21 +389,31 @@ class CtxMtpGraphs:
         if not ok:
             if not self.disabled:
                 self.disabled = f"capture failed on another rank at {s} tokens"
-                logger.warning(f"[q35 ctx mtp graph] rank {self.rank}: {self.disabled}; the eager draft step runs "
-                               "from now on")
+                logger.warning(
+                    f"[q35 ctx mtp graph] rank {self.rank}: {self.disabled}; the eager draft step runs "
+                    "from now on"
+                )
             return None
         self.counts["capture"] += 1
-        logger.info(f"[q35 ctx mtp graph] rank {self.rank}: captured the draft step for {s} tokens "
-                    f"({sum(1 for v in self.buckets.values() if v.post is not None)} buckets, graph pool "
-                    f"{self._pool_mib():.0f} MiB)")
+        logger.info(
+            f"[q35 ctx mtp graph] rank {self.rank}: captured the draft step for {s} tokens "
+            f"({sum(1 for v in self.buckets.values() if v.post is not None)} buckets, graph pool "
+            f"{self._pool_mib():.0f} MiB)"
+        )
         return self._replay(bucket, attn_metadata)
 
     def _pool_mib(self) -> float:
         """Reserved size of this runner's private graph pool (allocator segments of that pool; warmup only)."""
         try:
             pool = tuple(self.pool)
-            return sum(seg["total_size"] for seg in torch.cuda.memory_snapshot()
-                       if tuple(seg.get("segment_pool_id", ())) == pool) / 2**20
+            return (
+                sum(
+                    seg["total_size"]
+                    for seg in torch.cuda.memory_snapshot()
+                    if tuple(seg.get("segment_pool_id", ())) == pool
+                )
+                / 2**20
+            )
         except Exception:  # noqa: BLE001 (diagnostics only)
             return float("nan")
 
@@ -337,13 +421,15 @@ class CtxMtpGraphs:
         self.counts[key] += 1
         self.steps += 1
         if self.stats_every and self.rank == 0 and self.steps % self.stats_every == 0:
-            logger.info(f"[q35 ctx mtp graph] {dict(self.counts)}; buckets {sorted(self.buckets)}"
-                        + (f"; disabled: {self.disabled}" if self.disabled else ""))
+            logger.info(
+                f"[q35 ctx mtp graph] {dict(self.counts)}; buckets {sorted(self.buckets)}"
+                + (f"; disabled: {self.disabled}" if self.disabled else "")
+            )
 
     def check_against(self, worker, draft_tokens, ref_next_draft, num_seqs, spec_metadata, s):
         """TRTLLM_Q35_CTX_MTP_GRAPH_CHECK: compare the graph draft tokens with the stock step's (same inputs)."""
         b = num_seqs
-        eq = (draft_tokens[:b] == ref_next_draft[:b, 0].to(torch.int32))
+        eq = draft_tokens[:b] == ref_next_draft[:b, 0].to(torch.int32)
         bucket = self.buckets.get(s)
         gaps = None
         if bucket is not None and bucket.logits is not None:
@@ -351,9 +437,13 @@ class CtxMtpGraphs:
             # local top-2 values (collective; every rank checks the same requests).
             top2 = torch.topk(bucket.logits[:b].float(), 2, dim=-1).values
             mapping = worker.mapping
-            if mapping is not None and getattr(mapping, "tp_size", 1) > 1 and worker._draft_logits_are_sharded(
-                    bucket.logits, spec_metadata):
+            if (
+                mapping is not None
+                and getattr(mapping, "tp_size", 1) > 1
+                and worker._draft_logits_are_sharded(bucket.logits, spec_metadata)
+            ):
                 from ..distributed.ops import allgather
+
                 top2 = allgather(top2.contiguous(), mapping, dim=-1)
             top2 = torch.topk(top2, 2, dim=-1).values
             gaps = (top2[:, 0] - top2[:, 1]).tolist()
@@ -364,14 +454,28 @@ class CtxMtpGraphs:
             for e, g in zip(eq, gaps):
                 if not e:
                     self.check_gaps.append(round(g, 4))
-        if self.rank == 0 and (self.check_counts["rows"] - b) // 50 != self.check_counts["rows"] // 50:
-            logger.info(f"[q35 ctx mtp graph check] rows {self.check_counts['rows']}, equal draft tokens "
-                        f"{self.check_counts['equal']}; top-2 gaps of the mismatches (nats of bf16 logits): "
-                        f"{self.check_gaps[-20:]}")
+        if (
+            self.rank == 0
+            and (self.check_counts["rows"] - b) // 50 != self.check_counts["rows"] // 50
+        ):
+            logger.info(
+                f"[q35 ctx mtp graph check] rows {self.check_counts['rows']}, equal draft tokens "
+                f"{self.check_counts['equal']}; top-2 gaps of the mismatches (nats of bf16 logits): "
+                f"{self.check_gaps[-20:]}"
+            )
 
 
-def q35_ctx_mtp_graph_step(worker, input_ids, position_ids, hidden_states, logits, attn_metadata, spec_metadata,
-                           draft_model, resource_manager=None):
+def q35_ctx_mtp_graph_step(
+    worker,
+    input_ids,
+    position_ids,
+    hidden_states,
+    logits,
+    attn_metadata,
+    spec_metadata,
+    draft_model,
+    resource_manager=None,
+):
     """The draft step of a context-only batch on the bucket's CUDA graphs. Returns the worker outputs, or None
     (nothing done: the caller runs the stock step)."""
     runner = draft_model.__dict__.get("_q35_ctx_mtp_graphs")
@@ -380,7 +484,9 @@ def q35_ctx_mtp_graph_step(worker, input_ids, position_ids, hidden_states, logit
         draft_model.__dict__["_q35_ctx_mtp_graphs"] = runner
     if getattr(worker, "_q35_ctx_mtp_in_check", False):
         return None
-    reason = runner.ineligible(worker, attn_metadata, spec_metadata, draft_model, input_ids, hidden_states)
+    reason = runner.ineligible(
+        worker, attn_metadata, spec_metadata, draft_model, input_ids, hidden_states
+    )
     positions = position_ids.squeeze(0)
     s = attn_metadata.padded_num_tokens or attn_metadata.num_tokens
     if reason is None:
@@ -397,8 +503,17 @@ def q35_ctx_mtp_graph_step(worker, input_ids, position_ids, hidden_states, logit
     accepted_tokens = torch.empty((b, 2), dtype=torch.int, device=logits.device)
     accepted_tokens[:, 0] = target_tokens
     num_accepted_tokens = torch.ones(b, dtype=torch.int, device=logits.device)
-    draft_tokens = runner.draft(worker, input_ids, positions, hidden_states, accepted_tokens[:, 0], attn_metadata,
-                                spec_metadata, draft_model, worker.get_draft_kv_cache_manager(resource_manager))
+    draft_tokens = runner.draft(
+        worker,
+        input_ids,
+        positions,
+        hidden_states,
+        accepted_tokens[:, 0],
+        attn_metadata,
+        spec_metadata,
+        draft_model,
+        worker.get_draft_kv_cache_manager(resource_manager),
+    )
     if draft_tokens is None:
         # A failed capture (logged; graphs off from now on): this forward takes the stock step, which samples the
         # target tokens again (greedy: the same tokens).
@@ -407,8 +522,16 @@ def q35_ctx_mtp_graph_step(worker, input_ids, position_ids, hidden_states, logit
     if runner.check:
         worker._q35_ctx_mtp_in_check = True
         try:
-            ref = worker._forward_impl(input_ids, position_ids, hidden_states, logits, attn_metadata, spec_metadata,
-                                       draft_model, resource_manager)
+            ref = worker._forward_impl(
+                input_ids,
+                position_ids,
+                hidden_states,
+                logits,
+                attn_metadata,
+                spec_metadata,
+                draft_model,
+                resource_manager,
+            )
         finally:
             worker._q35_ctx_mtp_in_check = False
         runner.check_against(worker, draft_tokens, ref["next_draft_tokens"], b, spec_metadata, s)
@@ -419,9 +542,9 @@ def q35_ctx_mtp_graph_step(worker, input_ids, position_ids, hidden_states, logit
     next_new_tokens = torch.cat((accepted_tokens[:, :1], next_draft_tokens), dim=1)
     attn_metadata.use_spec_decoding = True
     return {
-        'logits': raw_logits,
-        'new_tokens': accepted_tokens,
-        'new_tokens_lens': num_accepted_tokens,
-        'next_draft_tokens': next_draft_tokens,
-        'next_new_tokens': next_new_tokens,
+        "logits": raw_logits,
+        "new_tokens": accepted_tokens,
+        "new_tokens_lens": num_accepted_tokens,
+        "next_draft_tokens": next_draft_tokens,
+        "next_new_tokens": next_new_tokens,
     }

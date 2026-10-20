@@ -40,7 +40,9 @@ MAX_BATCH = max(1, min(32, int(os.environ.get("TRTLLM_Q35_ATTN_CP_FUSED_MAX_BATC
 # Same bound for single-token (MTP draft) calls, default 8. In isolation the fused kernel is slower at q_len 1 (b16, 98k
 # contexts: 42.4 us per call vs 39.1 us for prep + trtllm-gen FMHA + LSE; at q_len 7: 44.5 vs 68.6 us), yet in-model
 # (TEP8, MAX_BATCH=32) MAX_BATCH_Q1=32 shortened the b16 decode step, with b8 / b32 unchanged.
-MAX_BATCH_Q1 = max(1, min(MAX_BATCH, int(os.environ.get("TRTLLM_Q35_ATTN_CP_FUSED_MAX_BATCH_Q1", "8"))))
+MAX_BATCH_Q1 = max(
+    1, min(MAX_BATCH, int(os.environ.get("TRTLLM_Q35_ATTN_CP_FUSED_MAX_BATCH_Q1", "8")))
+)
 # Mirror of q35_cp_partial_attn.MAX_COMB_ROWS (rows one CTA's combine chunk may touch).
 _MAX_COMB_ROWS = 32
 LOG2E = 1.4426950408889634
@@ -86,7 +88,9 @@ def cp_partial_geometry(rows: int, n_splits: int) -> dict:
     lse_stride = 4 * ((n_splits + 3) // 4)
     ws_o_elems = n_chunks * n_splits * chunk_pad
     max_cov_rows = (chunk + HEAD_DIM - 2) // HEAD_DIM + 1
-    return dict(chunk=chunk, ws_req_bytes=ws_o_elems * 2 + rows * lse_stride * 4, max_cov_rows=max_cov_rows)
+    return dict(
+        chunk=chunk, ws_req_bytes=ws_o_elems * 2 + rows * lse_stride * 4, max_cov_rows=max_cov_rows
+    )
 
 
 def cp_partial_balanced_ws_bytes(rows: int, n_ctas: int) -> int:
@@ -108,7 +112,10 @@ def balanced_split_plan(seq_lens, cp_rank: int, cp_size: int, n_ctas: int):
     Returns (T, c, ctas): T = the largest tile count of a CTA's block, c[r] = CTAs of request r, ctas[i] = (request,
     index in the request, first tile, tiles) of CTA i (tile k of a request = its owned pages 2k, 2k + 1 on this rank).
     """
-    t = [((((int(L) + PAGE - 1) // PAGE) - cp_rank + cp_size - 1) // cp_size + 1) // 2 for L in seq_lens]
+    t = [
+        ((((int(L) + PAGE - 1) // PAGE) - cp_rank + cp_size - 1) // cp_size + 1) // 2
+        for L in seq_lens
+    ]
     b = len(t)
     assert 1 <= b < n_ctas and b <= 32
     total, tmax = sum(t), max(t)
@@ -147,7 +154,9 @@ def q35_cp_fused_supported(q_len: int, cp_size: int, hq: int, batch: int, sm_cou
     if not (1 <= rows <= MAX_ROWS and 1 <= batch <= max_batch and batch <= sm_count):
         return False
     if _BALANCED:
-        return batch < _num_ctas(sm_count)  # the plan gives every request a CTA; one warp plans <= 32 requests
+        return batch < _num_ctas(
+            sm_count
+        )  # the plan gives every request a CTA; one warp plans <= 32 requests
     return cp_partial_geometry(rows, _num_splits(batch, sm_count))["max_cov_rows"] <= _MAX_COMB_ROWS
 
 
@@ -160,25 +169,39 @@ class _DeviceState:
         need = 0
         for b in range(1, MAX_BATCH + 1):
             if b <= sm_count:
-                need = max(need, b * cp_partial_geometry(MAX_ROWS, _num_splits(b, sm_count))["ws_req_bytes"])
+                need = max(
+                    need,
+                    b * cp_partial_geometry(MAX_ROWS, _num_splits(b, sm_count))["ws_req_bytes"],
+                )
         if _BALANCED:
             need = max(need, cp_partial_balanced_ws_bytes(MAX_ROWS, _num_ctas(sm_count)))
             from tensorrt_llm.logger import logger
-            logger.info(f"TRTLLM_Q35_ATTN_CP_BALANCED_SPLIT=1: CP-lite fused partial attention shares "
-                        f"{_num_ctas(sm_count)} CTAs among the requests by their KV length (device {device})")
+
+            logger.info(
+                f"TRTLLM_Q35_ATTN_CP_BALANCED_SPLIT=1: CP-lite fused partial attention shares "
+                f"{_num_ctas(sm_count)} CTAs among the requests by their KV length (device {device})"
+            )
         self.workspace = torch.empty(need // 4 + 64, dtype=torch.float32, device=device)
         self.ws_balanced = None  # test calls that override the split mode (_balanced_workspace)
         self.balanced_logged = False  # runtime evidence: one INFO line at the first balanced call
         self.counters = torch.zeros(MAX_BATCH + 1, MAX_BATCH, dtype=torch.int64, device=device)
         self.dbg_ring = None
         if _DBG_SLOTS > 0:
-            self.dbg_ring = torch.zeros(_DBG_SLOTS * _DBG_RING_CTAS * 8, dtype=torch.int64, device=device)
+            self.dbg_ring = torch.zeros(
+                _DBG_SLOTS * _DBG_RING_CTAS * 8, dtype=torch.int64, device=device
+            )
             _start_dbg_dump(self.dbg_ring, device)
 
 
 def _dbg_prefix() -> str:
-    rank = next((os.environ[k] for k in ("SLURM_PROCID", "OMPI_COMM_WORLD_RANK", "PMI_RANK", "RANK")
-                 if k in os.environ), "x")
+    rank = next(
+        (
+            os.environ[k]
+            for k in ("SLURM_PROCID", "OMPI_COMM_WORLD_RANK", "PMI_RANK", "RANK")
+            if k in os.environ
+        ),
+        "x",
+    )
     return os.path.join(_DBG_DIR, f"cpdbg_r{rank}_p{os.getpid()}")
 
 
@@ -209,8 +232,10 @@ def _state(device: torch.device, sm_count: int) -> _DeviceState:
     st = _STATES.get(idx)
     if st is None:
         if torch.cuda.is_current_stream_capturing():
-            raise RuntimeError("q35_cp_fused_partial: call q35_cp_fused_prepare() (or one eager call) before CUDA "
-                               "graph capture: the grid-barrier counters must be zero-initialized persistent memory")
+            raise RuntimeError(
+                "q35_cp_fused_partial: call q35_cp_fused_prepare() (or one eager call) before CUDA "
+                "graph capture: the grid-barrier counters must be zero-initialized persistent memory"
+            )
         q35_cp_fused_prepare(device, sm_count)
         st = _STATES[idx]
     return st
@@ -229,15 +254,34 @@ def _balanced_workspace(state: "_DeviceState", need: int) -> torch.Tensor:
         return state.workspace
     if state.ws_balanced is None or state.ws_balanced.numel() * 4 < need:
         if torch.cuda.is_current_stream_capturing():
-            raise RuntimeError("q35_cp_fused_partial(balanced=True): make one eager call before CUDA graph capture")
-        state.ws_balanced = torch.empty(need // 4 + 64, dtype=torch.float32, device=state.workspace.device)
+            raise RuntimeError(
+                "q35_cp_fused_partial(balanced=True): make one eager call before CUDA graph capture"
+            )
+        state.ws_balanced = torch.empty(
+            need // 4 + 64, dtype=torch.float32, device=state.workspace.device
+        )
     return state.ws_balanced
 
 
 @functools.lru_cache(maxsize=None)
-def _compiled(q_len: int, gh: int, hql: int, cp_size: int, n_splits: int, bmm1_from_ptr: bool, bmm2_from_ptr: bool,
-              o_vec16: bool, use_pdl: bool, kv_pre_wait: bool, fresh_margin: int, debug_ts: bool,
-              unsafe_skip_wait: bool, p_shift: float = 5.0, debug_ring: int = 0, balanced: bool = False):
+def _compiled(
+    q_len: int,
+    gh: int,
+    hql: int,
+    cp_size: int,
+    n_splits: int,
+    bmm1_from_ptr: bool,
+    bmm2_from_ptr: bool,
+    o_vec16: bool,
+    use_pdl: bool,
+    kv_pre_wait: bool,
+    fresh_margin: int,
+    debug_ts: bool,
+    unsafe_skip_wait: bool,
+    p_shift: float = 5.0,
+    debug_ring: int = 0,
+    balanced: bool = False,
+):
     import cuda.bindings.driver as cuda
     import cutlass
     import cutlass.cute as cute
@@ -245,18 +289,43 @@ def _compiled(q_len: int, gh: int, hql: int, cp_size: int, n_splits: int, bmm1_f
     from ...cute_dsl_kernels.blackwell.q35_cp_partial_attn import Q35CpPartialAttnKernel
 
     if balanced:
-        kernel = Q35CpPartialAttnKernel(q_len=q_len, gh=gh, hql=hql, cp_size=cp_size, n_splits=n_splits,
-                                        bmm1_from_ptr=bmm1_from_ptr, bmm2_from_ptr=bmm2_from_ptr, o_vec16=o_vec16,
-                                        use_pdl=use_pdl, kv_pre_wait=kv_pre_wait, fresh_margin_pages=fresh_margin,
-                                        debug_ts=debug_ts, unsafe_skip_wait=unsafe_skip_wait, p_shift=p_shift,
-                                        debug_ring=debug_ring, balanced=True)
+        kernel = Q35CpPartialAttnKernel(
+            q_len=q_len,
+            gh=gh,
+            hql=hql,
+            cp_size=cp_size,
+            n_splits=n_splits,
+            bmm1_from_ptr=bmm1_from_ptr,
+            bmm2_from_ptr=bmm2_from_ptr,
+            o_vec16=o_vec16,
+            use_pdl=use_pdl,
+            kv_pre_wait=kv_pre_wait,
+            fresh_margin_pages=fresh_margin,
+            debug_ts=debug_ts,
+            unsafe_skip_wait=unsafe_skip_wait,
+            p_shift=p_shift,
+            debug_ring=debug_ring,
+            balanced=True,
+        )
         assert kernel.ws_bytes == cp_partial_balanced_ws_bytes(q_len * gh, n_splits)
     else:
-        kernel = Q35CpPartialAttnKernel(q_len=q_len, gh=gh, hql=hql, cp_size=cp_size, n_splits=n_splits,
-                                        bmm1_from_ptr=bmm1_from_ptr, bmm2_from_ptr=bmm2_from_ptr, o_vec16=o_vec16,
-                                        use_pdl=use_pdl, kv_pre_wait=kv_pre_wait, fresh_margin_pages=fresh_margin,
-                                        debug_ts=debug_ts, unsafe_skip_wait=unsafe_skip_wait, p_shift=p_shift,
-                                        debug_ring=debug_ring)
+        kernel = Q35CpPartialAttnKernel(
+            q_len=q_len,
+            gh=gh,
+            hql=hql,
+            cp_size=cp_size,
+            n_splits=n_splits,
+            bmm1_from_ptr=bmm1_from_ptr,
+            bmm2_from_ptr=bmm2_from_ptr,
+            o_vec16=o_vec16,
+            use_pdl=use_pdl,
+            kv_pre_wait=kv_pre_wait,
+            fresh_margin_pages=fresh_margin,
+            debug_ts=debug_ts,
+            unsafe_skip_wait=unsafe_skip_wait,
+            p_shift=p_shift,
+            debug_ring=debug_ring,
+        )
         assert kernel.ws_req_bytes == cp_partial_geometry(q_len * gh, n_splits)["ws_req_bytes"]
     dev = torch.device("cuda")
     f32 = torch.empty(1024, dtype=torch.float32, device=dev)
@@ -269,12 +338,33 @@ def _compiled(q_len: int, gh: int, hql: int, cp_size: int, n_splits: int, bmm1_f
     a = _ALIGN
     I32 = cutlass.Int32
     return cute.compile(
-        kernel, _ptr(u8, fp8, a["q"]), _ptr(u8, fp8, a["kv"]), I32(64), _ptr(i32, I32, a["tab"]), I32(2), I32(1),
-        _ptr(i32, I32, a["seq"]), I32(0), _ptr(f32, cutlass.Float32, a["bmm1"]), cutlass.Float32(1.0),
-        _ptr(f32, cutlass.Float32, a["bmm2"]), cutlass.Float32(1.0), _ptr(bf, cutlass.BFloat16, 16 if o_vec16 else 4),
-        I32(HEAD_DIM), I32(HEAD_DIM), I32(HEAD_DIM), _ptr(f32, cutlass.Float32, a["lse"]), I32(1), I32(1), I32(1),
-        _ptr(f32, cutlass.Float32, a["ws"]), _ptr(i64, cutlass.Int64, a["cnt"]), _ptr(i64, cutlass.Int64, a["dbg"]),
-        I32(1), stream)
+        kernel,
+        _ptr(u8, fp8, a["q"]),
+        _ptr(u8, fp8, a["kv"]),
+        I32(64),
+        _ptr(i32, I32, a["tab"]),
+        I32(2),
+        I32(1),
+        _ptr(i32, I32, a["seq"]),
+        I32(0),
+        _ptr(f32, cutlass.Float32, a["bmm1"]),
+        cutlass.Float32(1.0),
+        _ptr(f32, cutlass.Float32, a["bmm2"]),
+        cutlass.Float32(1.0),
+        _ptr(bf, cutlass.BFloat16, 16 if o_vec16 else 4),
+        I32(HEAD_DIM),
+        I32(HEAD_DIM),
+        I32(HEAD_DIM),
+        _ptr(f32, cutlass.Float32, a["lse"]),
+        I32(1),
+        I32(1),
+        I32(1),
+        _ptr(f32, cutlass.Float32, a["ws"]),
+        _ptr(i64, cutlass.Int64, a["cnt"]),
+        _ptr(i64, cutlass.Int64, a["dbg"]),
+        I32(1),
+        stream,
+    )
 
 
 def q35_cp_fused_partial(
@@ -323,12 +413,21 @@ def q35_cp_fused_partial(
     R = q_len * gh
     assert 1 <= R <= MAX_ROWS, f"q_len x group heads = {R} > {MAX_ROWS}"
     assert 0 <= cp_rank < cp_size
-    assert kv_pool.dim() == 4 and kv_pool.shape[1] == 1 and kv_pool.shape[2] == PAGE and kv_pool.shape[3] == HEAD_DIM
+    assert (
+        kv_pool.dim() == 4
+        and kv_pool.shape[1] == 1
+        and kv_pool.shape[2] == PAGE
+        and kv_pool.shape[3] == HEAD_DIM
+    )
     assert kv_pool.is_contiguous() and kv_pool.dtype in (torch.float8_e4m3fn, torch.uint8)
     assert block_tables.dim() == 3 and block_tables.shape[0] >= b and block_tables.shape[1] == 2
     assert block_tables.stride(-1) == 1 and block_tables.dtype == torch.int32
     assert seq_lens.dtype == torch.int32 and seq_lens.numel() >= b and seq_lens.stride(0) == 1
-    assert tuple(out_o.shape) == (cp, rows, hq, D) and out_o.dtype == torch.bfloat16 and out_o.stride(3) == 1
+    assert (
+        tuple(out_o.shape) == (cp, rows, hq, D)
+        and out_o.dtype == torch.bfloat16
+        and out_o.stride(3) == 1
+    )
     assert tuple(out_lse.shape) == (cp, rows, hq) and out_lse.dtype == torch.float32
     assert 1 <= b <= MAX_BATCH
     device = q_all.device
@@ -337,12 +436,18 @@ def q35_cp_fused_partial(
     bal = _BALANCED if balanced is None else bool(balanced)
     if bal:
         splits = n_splits if n_splits else _num_ctas(sms)
-        assert b < splits <= sms, "balanced split: more CTAs than requests, every CTA co-resident (one per SM)"
+        assert b < splits <= sms, (
+            "balanced split: more CTAs than requests, every CTA co-resident (one per SM)"
+        )
     else:
         splits = n_splits if n_splits else _num_splits(b, sms)
-        assert splits * b <= sms, "the in-kernel grid barrier needs every CTA co-resident (one per SM)"
+        assert splits * b <= sms, (
+            "the in-kernel grid barrier needs every CTA co-resident (one per SM)"
+        )
     if n_splits or bal != _BALANCED:
-        assert counters is not None, "a split-count or split-mode override needs its own counters tensor"
+        assert counters is not None, (
+            "a split-count or split-mode override needs its own counters tensor"
+        )
     cnt = state.counters if counters is None else counters
     assert cnt.dtype == torch.int64 and cnt.dim() == 2 and cnt.shape[0] > b and cnt.shape[1] >= b
     assert cnt.is_contiguous()
@@ -351,34 +456,76 @@ def q35_cp_fused_partial(
         if balanced is None and not state.balanced_logged:
             state.balanced_logged = True
             from tensorrt_llm.logger import logger
-            logger.info(f"TRTLLM_Q35_ATTN_CP_BALANCED_SPLIT=1: first balanced call (q_len {q_len}, batch {b}, cp_rank "
-                        f"{cp_rank}, {splits} CTAs)")
+
+            logger.info(
+                f"TRTLLM_Q35_ATTN_CP_BALANCED_SPLIT=1: first balanced call (q_len {q_len}, batch {b}, cp_rank "
+                f"{cp_rank}, {splits} CTAs)"
+            )
     else:
         need = b * cp_partial_geometry(R, splits)["ws_req_bytes"]
         ws = state.workspace
         assert ws.numel() * 4 >= need, "CP partial workspace too small"
     # q: the native all-gather layout is one [b * rows_per_request, 256] matrix read by TMA in place
-    native = (q_all.stride(3) == 1 and q_all.stride(2) == D and q_all.stride(0) == hq * D
-              and q_all.stride(1) == cp * hq * D and q_all.data_ptr() % 16 == 0)
+    native = (
+        q_all.stride(3) == 1
+        and q_all.stride(2) == D
+        and q_all.stride(0) == hq * D
+        and q_all.stride(1) == cp * hq * D
+        and q_all.data_ptr() % 16 == 0
+    )
     q_src = q_all if native else q_all.permute(1, 0, 2, 3).contiguous()
     b1_ptr = isinstance(bmm1_scale, torch.Tensor)
     b2_ptr = isinstance(bmm2_scale, torch.Tensor)
     if b1_ptr:
-        assert bmm1_scale.numel() >= 2 and bmm1_scale.dtype == torch.float32 and bmm1_scale.stride(0) == 1
+        assert (
+            bmm1_scale.numel() >= 2
+            and bmm1_scale.dtype == torch.float32
+            and bmm1_scale.stride(0) == 1
+        )
     if b2_ptr:
         assert bmm2_scale.numel() >= 1 and bmm2_scale.dtype == torch.float32
-    o_vec16 = (out_o.data_ptr() % 16 == 0 and all(out_o.stride(i) % 8 == 0 for i in range(3)))
+    o_vec16 = out_o.data_ptr() % 16 == 0 and all(out_o.stride(i) % 8 == 0 for i in range(3))
     assert out_o.data_ptr() % 4 == 0 and all(out_o.stride(i) % 2 == 0 for i in range(3)), (
-        "out_o: 4-byte aligned rows (alltoall_merge reads it as int32)")
+        "out_o: 4-byte aligned rows (alltoall_merge reads it as int32)"
+    )
     ring = state.dbg_ring if debug is None else None
     if bal:
-        fn = _compiled(q_len, gh, hq, cp, splits, b1_ptr, b2_ptr, o_vec16, bool(enable_pdl), _KV_PRE_WAIT,
-                       _FRESH_MARGIN if fresh_margin is None else fresh_margin, debug is not None, unsafe_skip_wait,
-                       _P_SHIFT if p_shift is None else float(p_shift), _DBG_SLOTS if ring is not None else 0, True)
+        fn = _compiled(
+            q_len,
+            gh,
+            hq,
+            cp,
+            splits,
+            b1_ptr,
+            b2_ptr,
+            o_vec16,
+            bool(enable_pdl),
+            _KV_PRE_WAIT,
+            _FRESH_MARGIN if fresh_margin is None else fresh_margin,
+            debug is not None,
+            unsafe_skip_wait,
+            _P_SHIFT if p_shift is None else float(p_shift),
+            _DBG_SLOTS if ring is not None else 0,
+            True,
+        )
     else:
-        fn = _compiled(q_len, gh, hq, cp, splits, b1_ptr, b2_ptr, o_vec16, bool(enable_pdl), _KV_PRE_WAIT,
-                       _FRESH_MARGIN if fresh_margin is None else fresh_margin, debug is not None, unsafe_skip_wait,
-                       _P_SHIFT if p_shift is None else float(p_shift), _DBG_SLOTS if ring is not None else 0)
+        fn = _compiled(
+            q_len,
+            gh,
+            hq,
+            cp,
+            splits,
+            b1_ptr,
+            b2_ptr,
+            o_vec16,
+            bool(enable_pdl),
+            _KV_PRE_WAIT,
+            _FRESH_MARGIN if fresh_margin is None else fresh_margin,
+            debug is not None,
+            unsafe_skip_wait,
+            _P_SHIFT if p_shift is None else float(p_shift),
+            _DBG_SLOTS if ring is not None else 0,
+        )
     fp8 = cutlass.Float8E4M3FN
     f32 = cutlass.Float32
     I32 = cutlass.Int32
@@ -408,7 +555,11 @@ def q35_cp_fused_partial(
         I32(out_lse.stride(2)),
         _ptr(ws, f32, a["ws"]),
         _ptr(cnt[b], cutlass.Int64, a["cnt"]),
-        _ptr(debug if debug is not None else (ring if ring is not None else cnt[b]), cutlass.Int64, a["dbg"]),
+        _ptr(
+            debug if debug is not None else (ring if ring is not None else cnt[b]),
+            cutlass.Int64,
+            a["dbg"],
+        ),
         I32(b),
         stream,
     )

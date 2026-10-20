@@ -27,6 +27,8 @@ from typing import Dict, Optional, Union
 
 import torch
 
+from tensorrt_llm._utils import prefer_pinned
+
 # Grid splits per request: SMs // batch (one CTA per SM, all CTAs co-resident for the in-kernel grid barrier).
 _SPLITS_OVERRIDE = int(os.environ.get("TRTLLM_Q35_ATTN_FUSED_SPLITS", "0"))
 # Where the grid releases its dependents (o_proj): "entry" (safe with the in-kernel grid barrier: the dependent grid
@@ -34,7 +36,8 @@ _SPLITS_OVERRIDE = int(os.environ.get("TRTLLM_Q35_ATTN_FUSED_SPLITS", "0"))
 # TRTLLM_Q35_PDL_EARLY_TRIGGER unless TRTLLM_Q35_ATTN_FUSED_TRIGGER is set.
 _TRIGGER = os.environ.get(
     "TRTLLM_Q35_ATTN_FUSED_TRIGGER",
-    "entry" if os.environ.get("TRTLLM_Q35_PDL_EARLY_TRIGGER", "0") == "1" else "end")
+    "entry" if os.environ.get("TRTLLM_Q35_PDL_EARLY_TRIGGER", "0") == "1" else "end",
+)
 _KV_PRE_WAIT = os.environ.get("TRTLLM_Q35_ATTN_FUSED_KV_PRE_WAIT", "1") == "1"
 _STAGES = int(os.environ.get("TRTLLM_Q35_ATTN_FUSED_STAGES", "2"))
 # Pages below the new tokens that are still read only after griddepcontrol.wait (default 1).
@@ -68,14 +71,17 @@ def _relax_thread_capture_mode() -> bool:
             from cuda.bindings import driver as cu
         except ImportError:
             from cuda import cuda as cu
-        err, _ = cu.cuThreadExchangeStreamCaptureMode(cu.CUstreamCaptureMode.CU_STREAM_CAPTURE_MODE_RELAXED)
+        err, _ = cu.cuThreadExchangeStreamCaptureMode(
+            cu.CUstreamCaptureMode.CU_STREAM_CAPTURE_MODE_RELAXED
+        )
         return err == cu.CUresult.CUDA_SUCCESS
     except Exception:  # noqa: BLE001 (diagnostics only)
         return False
 
 
-def start_debug_ring_dump(ring: torch.Tensor, device: torch.device, path_prefix: str, slots: int, ctas: int,
-                          name: str) -> None:
+def start_debug_ring_dump(
+    ring: torch.Tensor, device: torch.device, path_prefix: str, slots: int, ctas: int, name: str
+) -> None:
     """Save a kernel debug ring ([slots, ctas, 8] int64, field 6 = launch index * 64 + batch) to
     <path_prefix>_d<k>.pt at the end of every burst of launches (no new launch for one TRTLLM_Q35_ATTN_DBG_PERIOD_S
     period, default 5 s: e.g. one decode phase of a benchmark) and to <path_prefix>_final.pt at exit, from a side thread
@@ -89,7 +95,7 @@ def start_debug_ring_dump(ring: torch.Tensor, device: torch.device, path_prefix:
     sms = torch.cuda.get_device_properties(device).multi_processor_count
     side = torch.cuda.Stream(device=device)
     with torch.inference_mode():
-        host = torch.empty(ring.shape, dtype=ring.dtype, pin_memory=True)
+        host = torch.empty(ring.shape, dtype=ring.dtype, pin_memory=prefer_pinned())
     st = dict(host=host, last=None, dirty=False, k=0)
     lock = threading.Lock()
 
@@ -130,7 +136,10 @@ def start_debug_ring_dump(ring: torch.Tensor, device: torch.device, path_prefix:
     def loop():
         torch.cuda.set_device(device)
         if not _relax_thread_capture_mode():
-            print(f"[{name}] debug ring: relaxed capture mode unavailable; only the exit snapshot is saved", flush=True)
+            print(
+                f"[{name}] debug ring: relaxed capture mode unavailable; only the exit snapshot is saved",
+                flush=True,
+            )
             return
         while not stop.wait(period):
             tick()
@@ -152,13 +161,27 @@ def _dbg_ring(device: torch.device) -> torch.Tensor:
     idx = device.index if device.index is not None else torch.cuda.current_device()
     ring = _DBG_RINGS.get(idx)
     if ring is None:
-        assert not torch.cuda.is_current_stream_capturing(), "allocate the debug ring with an eager call first"
+        assert not torch.cuda.is_current_stream_capturing(), (
+            "allocate the debug ring with an eager call first"
+        )
         ring = torch.zeros(_DBG_SLOTS * _DBG_RING_CTAS * 8, dtype=torch.int64, device=device)
         _DBG_RINGS[idx] = ring
-        rank = next((os.environ[k] for k in ("SLURM_PROCID", "OMPI_COMM_WORLD_RANK", "PMI_RANK", "RANK")
-                     if k in os.environ), "x")
-        start_debug_ring_dump(ring, device, os.path.join(_DBG_DIR, f"q35_fused_decode_dbg_r{rank}_p{os.getpid()}"),
-                              _DBG_SLOTS, _DBG_RING_CTAS, "q35_fused_decode")
+        rank = next(
+            (
+                os.environ[k]
+                for k in ("SLURM_PROCID", "OMPI_COMM_WORLD_RANK", "PMI_RANK", "RANK")
+                if k in os.environ
+            ),
+            "x",
+        )
+        start_debug_ring_dump(
+            ring,
+            device,
+            os.path.join(_DBG_DIR, f"q35_fused_decode_dbg_r{rank}_p{os.getpid()}"),
+            _DBG_SLOTS,
+            _DBG_RING_CTAS,
+            "q35_fused_decode",
+        )
     return ring
 
 
@@ -237,8 +260,24 @@ class _GraphSafeDlpack:
 # Declared alignment (bytes) of each pointer argument, used at compile and at call time (make_ptr checks the address).
 # q and the KV pool are TMA sources and the workspace takes 16-byte stores / bulk copies; everything else is accessed
 # element by element, so only the element size is assumed (callers hand over views such as bmm2 = scales[2:3]).
-_ALIGN = dict(q=16, kv=16, tab=4, seq=4, bmm1=4, bmm2=4, gate=2, out=2, ws=16, cnt=8, dbg=8, qkv=4, nw=4, cs=4,
-              pos=4, kvs=4)
+_ALIGN = dict(
+    q=16,
+    kv=16,
+    tab=4,
+    seq=4,
+    bmm1=4,
+    bmm2=4,
+    gate=2,
+    out=2,
+    ws=16,
+    cnt=8,
+    dbg=8,
+    qkv=4,
+    nw=4,
+    cs=4,
+    pos=4,
+    kvs=4,
+)
 
 
 def _ptr(t: torch.Tensor, dtype, align: int):
@@ -248,24 +287,60 @@ def _ptr(t: torch.Tensor, dtype, align: int):
 
 
 @functools.lru_cache(maxsize=None)
-def _compiled(q_len: int, group: int, has_gate: bool, bmm1_from_ptr: bool, bmm2_from_ptr: bool, use_pdl: bool,
-              trigger: str, kv_pre_wait: bool, debug_ts: bool, unsafe_skip_wait: bool, stages: int,
-              n_splits: int, fresh_margin: int, p_shift: float = 0.0, fold: bool = False, use_mrope: bool = False,
-              mrope_s1: int = 0, mrope_s2: int = 0, pos_i64: bool = False, debug_ring: int = 0):
+def _compiled(
+    q_len: int,
+    group: int,
+    has_gate: bool,
+    bmm1_from_ptr: bool,
+    bmm2_from_ptr: bool,
+    use_pdl: bool,
+    trigger: str,
+    kv_pre_wait: bool,
+    debug_ts: bool,
+    unsafe_skip_wait: bool,
+    stages: int,
+    n_splits: int,
+    fresh_margin: int,
+    p_shift: float = 0.0,
+    fold: bool = False,
+    use_mrope: bool = False,
+    mrope_s1: int = 0,
+    mrope_s2: int = 0,
+    pos_i64: bool = False,
+    debug_ring: int = 0,
+):
     import cuda.bindings.driver as cuda
     import cutlass
     import cutlass.cute as cute
 
     from ...cute_dsl_kernels.blackwell.q35_decode_attn import Q35DecodeAttnKernel
 
-    kernel = Q35DecodeAttnKernel(q_len=q_len, group=group, has_gate=has_gate, bmm1_from_ptr=bmm1_from_ptr,
-                                 bmm2_from_ptr=bmm2_from_ptr, use_pdl=use_pdl, trigger=trigger,
-                                 kv_pre_wait=kv_pre_wait, debug_ts=debug_ts, unsafe_skip_wait=unsafe_skip_wait,
-                                 stages=stages, n_splits=n_splits, fresh_margin_pages=fresh_margin, p_shift=p_shift,
-                                 fold=fold, use_mrope=use_mrope, mrope_s1=mrope_s1, mrope_s2=mrope_s2,
-                                 pos_i64=pos_i64, debug_ring=debug_ring)
+    kernel = Q35DecodeAttnKernel(
+        q_len=q_len,
+        group=group,
+        has_gate=has_gate,
+        bmm1_from_ptr=bmm1_from_ptr,
+        bmm2_from_ptr=bmm2_from_ptr,
+        use_pdl=use_pdl,
+        trigger=trigger,
+        kv_pre_wait=kv_pre_wait,
+        debug_ts=debug_ts,
+        unsafe_skip_wait=unsafe_skip_wait,
+        stages=stages,
+        n_splits=n_splits,
+        fresh_margin_pages=fresh_margin,
+        p_shift=p_shift,
+        fold=fold,
+        use_mrope=use_mrope,
+        mrope_s1=mrope_s1,
+        mrope_s2=mrope_s2,
+        pos_i64=pos_i64,
+        debug_ring=debug_ring,
+    )
     dev = torch.device("cuda")
-    f32 = torch.empty(max(64, _ws_req_floats(q_len * group, n_splits)), dtype=torch.float32, device=dev)
+    f32 = torch.empty(
+        max(64, _ws_req_floats(q_len * group, n_splits)), dtype=torch.float32, device=dev
+    )
     i32 = torch.zeros(64, dtype=torch.int32, device=dev)
     u8 = torch.empty(64 * HEAD_DIM, dtype=torch.uint8, device=dev)
     bf = torch.empty(64, dtype=torch.bfloat16, device=dev)
@@ -274,26 +349,64 @@ def _compiled(q_len: int, group: int, has_gate: bool, bmm1_from_ptr: bool, bmm2_
     fp8 = cutlass.Float8E4M3FN
     a = _ALIGN
     return cute.compile(
-        kernel, _ptr(u8, fp8, a["q"]), _ptr(u8, fp8, a["kv"]), cutlass.Int32(64), _ptr(i32, cutlass.Int32, a["tab"]),
-        cutlass.Int32(2), cutlass.Int32(1), _ptr(i32, cutlass.Int32, a["seq"]), _ptr(f32, cutlass.Float32, a["bmm1"]),
-        cutlass.Float32(1.0), _ptr(f32, cutlass.Float32, a["bmm2"]), cutlass.Float32(1.0),
-        _ptr(bf, cutlass.BFloat16, a["gate"]), cutlass.Int32(HEAD_DIM), _ptr(bf, cutlass.BFloat16, a["out"]),
-        cutlass.Int32(HEAD_DIM), _ptr(f32, cutlass.Float32, a["ws"]), _ptr(i64, cutlass.Int64, a["cnt"]),
-        _ptr(i64, cutlass.Int64, a["dbg"]), cutlass.Int32(1), cutlass.Int32(1), cutlass.Int32(0),
-        *_fold_args(bf, bf, bf, f32, i64 if pos_i64 else i32, f32, f32, 0, 0, 0.0, 0.0), stream)
+        kernel,
+        _ptr(u8, fp8, a["q"]),
+        _ptr(u8, fp8, a["kv"]),
+        cutlass.Int32(64),
+        _ptr(i32, cutlass.Int32, a["tab"]),
+        cutlass.Int32(2),
+        cutlass.Int32(1),
+        _ptr(i32, cutlass.Int32, a["seq"]),
+        _ptr(f32, cutlass.Float32, a["bmm1"]),
+        cutlass.Float32(1.0),
+        _ptr(f32, cutlass.Float32, a["bmm2"]),
+        cutlass.Float32(1.0),
+        _ptr(bf, cutlass.BFloat16, a["gate"]),
+        cutlass.Int32(HEAD_DIM),
+        _ptr(bf, cutlass.BFloat16, a["out"]),
+        cutlass.Int32(HEAD_DIM),
+        _ptr(f32, cutlass.Float32, a["ws"]),
+        _ptr(i64, cutlass.Int64, a["cnt"]),
+        _ptr(i64, cutlass.Int64, a["dbg"]),
+        cutlass.Int32(1),
+        cutlass.Int32(1),
+        cutlass.Int32(0),
+        *_fold_args(bf, bf, bf, f32, i64 if pos_i64 else i32, f32, f32, 0, 0, 0.0, 0.0),
+        stream,
+    )
 
 
-def _fold_args(qkv, qw, kw, cos_sin, positions, kvq, kvd, qkv_stride: int, max_pos: int, host_bmm1: float,
-               eps: float):
+def _fold_args(
+    qkv,
+    qw,
+    kw,
+    cos_sin,
+    positions,
+    kvq,
+    kvd,
+    qkv_stride: int,
+    max_pos: int,
+    host_bmm1: float,
+    eps: float,
+):
     """Trailing kernel arguments of the fold mode (dummies on the stock path)."""
     import cutlass
 
     a = _ALIGN
     pos_t = cutlass.Int64 if positions.dtype == torch.int64 else cutlass.Int32
-    return (_ptr(qkv, cutlass.BFloat16, a["qkv"]), cutlass.Int32(qkv_stride), _ptr(qw, cutlass.BFloat16, a["nw"]),
-            _ptr(kw, cutlass.BFloat16, a["nw"]), _ptr(cos_sin, cutlass.Float32, a["cs"]), cutlass.Int32(max_pos),
-            _ptr(positions, pos_t, a["pos"]), _ptr(kvq, cutlass.Float32, a["kvs"]),
-            _ptr(kvd, cutlass.Float32, a["kvs"]), cutlass.Float32(host_bmm1), cutlass.Float32(eps))
+    return (
+        _ptr(qkv, cutlass.BFloat16, a["qkv"]),
+        cutlass.Int32(qkv_stride),
+        _ptr(qw, cutlass.BFloat16, a["nw"]),
+        _ptr(kw, cutlass.BFloat16, a["nw"]),
+        _ptr(cos_sin, cutlass.Float32, a["cs"]),
+        cutlass.Int32(max_pos),
+        _ptr(positions, pos_t, a["pos"]),
+        _ptr(kvq, cutlass.Float32, a["kvs"]),
+        _ptr(kvd, cutlass.Float32, a["kvs"]),
+        cutlass.Float32(host_bmm1),
+        cutlass.Float32(eps),
+    )
 
 
 def q35_fused_decode(
@@ -334,7 +447,12 @@ def q35_fused_decode(
     group = num_heads
     rows = q_len * group
     assert head_dim == HEAD_DIM and q.dtype == torch.float8_e4m3fn and q.is_contiguous()
-    assert kv_pool.dim() == 4 and kv_pool.shape[1] == 1 and kv_pool.shape[2] == PAGE and kv_pool.shape[3] == HEAD_DIM
+    assert (
+        kv_pool.dim() == 4
+        and kv_pool.shape[1] == 1
+        and kv_pool.shape[2] == PAGE
+        and kv_pool.shape[3] == HEAD_DIM
+    )
     assert kv_pool.is_contiguous()
     assert block_tables.dim() == 3 and block_tables.shape[1] == 2 and block_tables.stride(-1) == 1
     assert block_tables.dtype == torch.int32 and seq_lens.dtype == torch.int32
@@ -342,14 +460,23 @@ def q35_fused_decode(
     out2 = out.view(num_tokens, num_heads * HEAD_DIM) if out.dim() == 3 else out
     assert out2.stride(1) == 1
     splits = n_splits if n_splits else _num_splits(b, sm_count, rows)
-    assert splits * b <= sm_count, "the in-kernel grid barrier needs every CTA co-resident (one per SM)"
+    assert splits * b <= sm_count, (
+        "the in-kernel grid barrier needs every CTA co-resident (one per SM)"
+    )
     assert splits >= rows, "the combine phase assumes at most two rows per CTA"
     need = b * _ws_req_floats(rows, splits) * 4
     assert workspace.numel() * workspace.element_size() >= need, "fused decode workspace too small"
-    assert counters.dtype == torch.int64 and counters.dim() == 2 and counters.shape[0] > b and counters.shape[1] >= b
+    assert (
+        counters.dtype == torch.int64
+        and counters.dim() == 2
+        and counters.shape[0] > b
+        and counters.shape[1] >= b
+    )
     assert b <= 8
     assert counters.is_contiguous()
-    assert debug is None or (debug.dim() == 2 and debug.shape[1] >= DEBUG_COLS and debug.is_contiguous())
+    assert debug is None or (
+        debug.dim() == 2 and debug.shape[1] >= DEBUG_COLS and debug.is_contiguous()
+    )
     cnt_row = counters[b]
     has_gate = gate is not None
     if has_gate:
@@ -361,10 +488,23 @@ def q35_fused_decode(
         assert bmm1_scale.numel() >= 2 and bmm1_scale.dtype == torch.float32
     assert splits <= 256, "the combine reads at most 256 splits"
     ring = _dbg_ring(q.device) if (_DBG_SLOTS > 0 and debug is None) else None
-    fn = _compiled(q_len, group, has_gate, b1_ptr, b2_ptr, bool(enable_pdl), _TRIGGER, _KV_PRE_WAIT,
-                   debug is not None, unsafe_skip_wait, _STAGES, splits,
-                   _FRESH_MARGIN if fresh_margin is None else fresh_margin, _P_SHIFT if p_shift is None else float(p_shift),
-                   debug_ring=_DBG_SLOTS if ring is not None else 0)
+    fn = _compiled(
+        q_len,
+        group,
+        has_gate,
+        b1_ptr,
+        b2_ptr,
+        bool(enable_pdl),
+        _TRIGGER,
+        _KV_PRE_WAIT,
+        debug is not None,
+        unsafe_skip_wait,
+        _STAGES,
+        splits,
+        _FRESH_MARGIN if fresh_margin is None else fresh_margin,
+        _P_SHIFT if p_shift is None else float(p_shift),
+        debug_ring=_DBG_SLOTS if ring is not None else 0,
+    )
     fp8 = cutlass.Float8E4M3FN
     f32 = cutlass.Float32
     dummy_f = workspace.view(torch.float32)
@@ -389,11 +529,17 @@ def q35_fused_decode(
         cutlass.Int32(out2.stride(0)),
         _ptr(workspace, f32, a["ws"]),
         _ptr(cnt_row, cutlass.Int64, a["cnt"]),
-        _ptr(debug if debug is not None else (ring if ring is not None else cnt_row), cutlass.Int64, a["dbg"]),
+        _ptr(
+            debug if debug is not None else (ring if ring is not None else cnt_row),
+            cutlass.Int64,
+            a["dbg"],
+        ),
         cutlass.Int32(b),
         cutlass.Int32(splits),
         cutlass.Int32(0),
-        *_fold_args(dummy_bf, dummy_bf, dummy_bf, dummy_f, seq_lens, dummy_f, dummy_f, 0, 0, 0.0, 0.0),
+        *_fold_args(
+            dummy_bf, dummy_bf, dummy_bf, dummy_f, seq_lens, dummy_f, dummy_f, 0, 0, 0.0, 0.0
+        ),
         stream,
     )
 
@@ -402,9 +548,16 @@ def q35_fused_decode(
 FOLD_ROTARY_DIM = 64
 
 
-def q35_fused_decode_fold_supported(num_heads: int, num_kv_heads: int, head_dim: int, rotary_dim: int,
-                                    q_len: int, qkv: torch.Tensor, positions: torch.Tensor,
-                                    cos_sin: torch.Tensor) -> bool:
+def q35_fused_decode_fold_supported(
+    num_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    rotary_dim: int,
+    q_len: int,
+    qkv: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin: torch.Tensor,
+) -> bool:
     """Shape / layout conditions of q35_fused_decode_fold on top of q35_fused_decode_supported."""
     t = qkv.shape[0] if qkv.dim() == 2 else -1
     return (
@@ -476,12 +629,19 @@ def q35_fused_decode_fold(
     b = num_tokens // q_len
     rows = q_len * num_heads
     use_mrope = positions.numel() == 3 * num_tokens and mrope_section is not None
-    assert q35_fused_decode_fold_supported(num_heads, 1, HEAD_DIM, rotary_dim, q_len, qkv, positions, cos_sin)
+    assert q35_fused_decode_fold_supported(
+        num_heads, 1, HEAD_DIM, rotary_dim, q_len, qkv, positions, cos_sin
+    )
     assert q_weight.dtype == torch.bfloat16 and k_weight.dtype == torch.bfloat16
     assert q_weight.numel() == HEAD_DIM and k_weight.numel() == HEAD_DIM
     assert q_weight.is_contiguous() and k_weight.is_contiguous()
     assert kv_scale_orig_quant.dtype == torch.float32 and kv_scale_quant_orig.dtype == torch.float32
-    assert kv_pool.dim() == 4 and kv_pool.shape[1] == 1 and kv_pool.shape[2] == PAGE and kv_pool.shape[3] == HEAD_DIM
+    assert (
+        kv_pool.dim() == 4
+        and kv_pool.shape[1] == 1
+        and kv_pool.shape[2] == PAGE
+        and kv_pool.shape[3] == HEAD_DIM
+    )
     assert kv_pool.is_contiguous() and kv_pool.dtype == torch.float8_e4m3fn
     assert block_tables.dim() == 3 and block_tables.shape[1] == 2 and block_tables.stride(-1) == 1
     assert block_tables.dtype == torch.int32 and seq_lens.dtype == torch.int32
@@ -489,20 +649,45 @@ def q35_fused_decode_fold(
     out2 = out.view(num_tokens, num_heads * HEAD_DIM) if out.dim() == 3 else out
     assert out2.stride(1) == 1
     splits = n_splits if n_splits else _num_splits(b, sm_count, rows)
-    assert splits * b <= sm_count, "the in-kernel grid barrier needs every CTA co-resident (one per SM)"
+    assert splits * b <= sm_count, (
+        "the in-kernel grid barrier needs every CTA co-resident (one per SM)"
+    )
     assert splits >= rows, "the combine phase assumes at most two rows per CTA"
     assert workspace.numel() * workspace.element_size() >= b * _ws_req_floats(rows, splits) * 4
-    assert counters.dtype == torch.int64 and counters.dim() == 2 and counters.shape[0] > b and counters.shape[1] >= b
+    assert (
+        counters.dtype == torch.int64
+        and counters.dim() == 2
+        and counters.shape[0] > b
+        and counters.shape[1] >= b
+    )
     assert b <= 8 and counters.is_contiguous() and splits <= 256
-    assert debug is None or (debug.dim() == 2 and debug.shape[1] >= DEBUG_COLS and debug.is_contiguous())
+    assert debug is None or (
+        debug.dim() == 2 and debug.shape[1] >= DEBUG_COLS and debug.is_contiguous()
+    )
     cnt_row = counters[b]
     ring = _dbg_ring(qkv.device) if (_DBG_SLOTS > 0 and debug is None) else None
-    fn = _compiled(q_len, num_heads, True, False, False, bool(enable_pdl), _TRIGGER, _KV_PRE_WAIT,
-                   debug is not None, unsafe_skip_wait, _STAGES, splits,
-                   _FRESH_MARGIN if fresh_margin is None else fresh_margin,
-                   _P_SHIFT if p_shift is None else float(p_shift), True, use_mrope,
-                   int(mrope_section[1]) if use_mrope else 0, int(mrope_section[2]) if use_mrope else 0,
-                   positions.dtype == torch.int64, debug_ring=_DBG_SLOTS if ring is not None else 0)
+    fn = _compiled(
+        q_len,
+        num_heads,
+        True,
+        False,
+        False,
+        bool(enable_pdl),
+        _TRIGGER,
+        _KV_PRE_WAIT,
+        debug is not None,
+        unsafe_skip_wait,
+        _STAGES,
+        splits,
+        _FRESH_MARGIN if fresh_margin is None else fresh_margin,
+        _P_SHIFT if p_shift is None else float(p_shift),
+        True,
+        use_mrope,
+        int(mrope_section[1]) if use_mrope else 0,
+        int(mrope_section[2]) if use_mrope else 0,
+        positions.dtype == torch.int64,
+        debug_ring=_DBG_SLOTS if ring is not None else 0,
+    )
     fp8 = cutlass.Float8E4M3FN
     f32 = cutlass.Float32
     dummy_f = workspace.view(torch.float32)
@@ -526,11 +711,26 @@ def q35_fused_decode_fold(
         cutlass.Int32(out2.stride(0)),
         _ptr(workspace, f32, a["ws"]),
         _ptr(cnt_row, cutlass.Int64, a["cnt"]),
-        _ptr(debug if debug is not None else (ring if ring is not None else cnt_row), cutlass.Int64, a["dbg"]),
+        _ptr(
+            debug if debug is not None else (ring if ring is not None else cnt_row),
+            cutlass.Int64,
+            a["dbg"],
+        ),
         cutlass.Int32(b),
         cutlass.Int32(splits),
         cutlass.Int32(0),
-        *_fold_args(qkv, q_weight, k_weight, cos_sin, positions, kv_scale_orig_quant, kv_scale_quant_orig,
-                    qkv.stride(0), cos_sin.shape[0], float(host_bmm1_scale), float(eps)),
+        *_fold_args(
+            qkv,
+            q_weight,
+            k_weight,
+            cos_sin,
+            positions,
+            kv_scale_orig_quant,
+            kv_scale_quant_orig,
+            qkv.stride(0),
+            cos_sin.shape[0],
+            float(host_bmm1_scale),
+            float(eps),
+        ),
         stream,
     )

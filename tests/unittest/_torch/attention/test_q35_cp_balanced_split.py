@@ -41,7 +41,9 @@ def test_balanced_plan_invariants(n_ctas: int, seed: int) -> None:
     for batch in (1, 2, 5, 16, 32):
         if batch >= n_ctas:
             continue
-        lens = [rnd.choice([rnd.randrange(1, 300), rnd.randrange(1, 260_000)]) for _ in range(batch)]
+        lens = [
+            rnd.choice([rnd.randrange(1, 300), rnd.randrange(1, 260_000)]) for _ in range(batch)
+        ]
         for rank in range(CP):
             T, c, ctas = F.balanced_split_plan(lens, rank, CP, n_ctas)
             t = [_tiles(L, rank) for L in lens]
@@ -65,8 +67,24 @@ def test_balanced_plan_invariants(n_ctas: int, seed: int) -> None:
 def test_balanced_plan_ragged_long_context_batch() -> None:
     # a synthetic ragged b16 long-context decode batch (mean ~140k, longest 250k, two ~3k requests): within 6% of the
     # ideal split
-    lens = [190000, 230000, 215000, 135000, 250000, 200000, 90000, 110000, 55000, 180000, 165000, 150000, 70000, 3000,
-            210000, 3200]
+    lens = [
+        190000,
+        230000,
+        215000,
+        135000,
+        250000,
+        200000,
+        90000,
+        110000,
+        55000,
+        180000,
+        165000,
+        150000,
+        70000,
+        3000,
+        210000,
+        3200,
+    ]
     for rank in range(CP):
         T, c, _ = F.balanced_split_plan(lens, rank, CP, 152)
         total = sum(_tiles(L, rank) for L in lens)
@@ -88,22 +106,50 @@ def _make(lens, q_len, seed):
     g = torch.Generator(device="cuda").manual_seed(seed)
     max_pages = max((max(lens) + PAGE - 1) // PAGE, CP)  # the reference needs cp_rank < pages
     nblocks = b * 2 * max_pages + 8
-    kv = (torch.randn(nblocks, 1, PAGE, D, device="cuda", generator=g) * 0.6).to(torch.float8_e4m3fn)
-    tables = torch.randperm(nblocks, device="cuda", generator=g)[:b * 2 * max_pages].to(torch.int32)
+    kv = (torch.randn(nblocks, 1, PAGE, D, device="cuda", generator=g) * 0.6).to(
+        torch.float8_e4m3fn
+    )
+    tables = torch.randperm(nblocks, device="cuda", generator=g)[: b * 2 * max_pages].to(
+        torch.int32
+    )
     tables = tables.view(b, 2, max_pages).contiguous()
     seq = torch.tensor(lens, dtype=torch.int32, device="cuda")
-    q_all = torch.randn(b * q_len, CP, HQ, D, device="cuda", generator=g).to(torch.float8_e4m3fn).permute(1, 0, 2, 3)
+    q_all = (
+        torch.randn(b * q_len, CP, HQ, D, device="cuda", generator=g)
+        .to(torch.float8_e4m3fn)
+        .permute(1, 0, 2, 3)
+    )
     return kv, tables, seq, q_all
 
 
 @pytest.mark.skipif(not _gpu_ok(), reason="the CuTe DSL kernel needs an SM100-family GPU")
 @pytest.mark.parametrize("q_len", [7, 1])
-@pytest.mark.parametrize("lens", [
-    [16384] * 4,
-    [200000],
-    [7, 9000, 33000, 64, 130, 21000, 1, 4000],
-    [3000, 120000, 250000, 64000, 90000, 2000, 180000, 40000, 70000, 110000, 5000, 60000, 150000, 30000, 100000, 8000],
-])
+@pytest.mark.parametrize(
+    "lens",
+    [
+        [16384] * 4,
+        [200000],
+        [7, 9000, 33000, 64, 130, 21000, 1, 4000],
+        [
+            3000,
+            120000,
+            250000,
+            64000,
+            90000,
+            2000,
+            180000,
+            40000,
+            70000,
+            110000,
+            5000,
+            60000,
+            150000,
+            30000,
+            100000,
+            8000,
+        ],
+    ],
+)
 def test_balanced_kernel_vs_reference(q_len: int, lens: list) -> None:
     from tensorrt_llm._torch.attention_backend.fmha.q35_cp import q35_cp_fused_partial_ref
 
@@ -119,17 +165,38 @@ def test_balanced_kernel_vs_reference(q_len: int, lens: list) -> None:
         o = torch.full((CP, b * q_len, HQ, D), float("nan"), dtype=torch.bfloat16, device="cuda")
         lse = torch.full((CP, b * q_len, HQ), float("nan"), dtype=torch.float32, device="cuda")
         dbg = torch.zeros(n_ctas, 16, dtype=torch.int64, device="cuda")
-        F.q35_cp_fused_partial(q_all, kv, tables, seq, q_len, rank, CP, 1.0 / 16, 1.0, o, lse, balanced=True,
-                               counters=counters, debug=dbg)
+        F.q35_cp_fused_partial(
+            q_all,
+            kv,
+            tables,
+            seq,
+            q_len,
+            rank,
+            CP,
+            1.0 / 16,
+            1.0,
+            o,
+            lse,
+            balanced=True,
+            counters=counters,
+            debug=dbg,
+        )
         ref_o, ref_lse = torch.empty_like(o), torch.empty_like(lse)
-        q35_cp_fused_partial_ref(q_all, kv, tables, seq, q_len, rank, CP, 1.0 / 16, 1.0, ref_o, ref_lse)
+        q35_cp_fused_partial_ref(
+            q_all, kv, tables, seq, q_len, rank, CP, 1.0 / 16, 1.0, ref_o, ref_lse
+        )
         torch.cuda.synchronize()
         # the kernel's plan is the host mirror's
         _, c, ctas = F.balanced_split_plan(lens, rank, CP, n_ctas)
         d = dbg.cpu()
         for i, (r, j, k_lo, n_t) in enumerate(ctas):
             pid = int(d[i, 13])
-            assert (pid >> 24, (pid >> 16) & 255, (pid >> 8) & 255, pid & 255) == (r, j, c[r], sum(c[:r])), i
+            assert (pid >> 24, (pid >> 16) & 255, (pid >> 8) & 255, pid & 255) == (
+                r,
+                j,
+                c[r],
+                sum(c[:r]),
+            ), i
             assert (int(d[i, 14]), int(d[i, 15])) == (k_lo, n_t), i
         # FP8 P / FP16 partials: the error level of the equal split (max ~5 % of the row max, mean ~1e-3)
         of, rf = o.float(), ref_o.float()
@@ -138,6 +205,8 @@ def test_balanced_kernel_vs_reference(q_len: int, lens: list) -> None:
         assert rel < 0.07, (rank, rel)
         assert (of - rf).abs().mean().item() < 2e-3
         fin = torch.isfinite(ref_lse)
-        assert torch.equal(torch.isfinite(lse), fin) and torch.equal(torch.isneginf(lse), torch.isneginf(ref_lse))
+        assert torch.equal(torch.isfinite(lse), fin) and torch.equal(
+            torch.isneginf(lse), torch.isneginf(ref_lse)
+        )
         if fin.any():
             assert (lse[fin] - ref_lse[fin]).abs().amax().item() < 0.05

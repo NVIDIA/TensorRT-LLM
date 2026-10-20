@@ -82,8 +82,9 @@ def _q35_direct_call(fn, *args, **kwargs):
 # TRTLLM_Q35_CUSTOM_OP_EAGER=1: run the body of this piecewise-excluded custom op with dynamo's eval-frame hook off.
 # The op executes inside the torch.compile'd region, where every Python frame it creates (backend wrappers, Triton
 # launchers, FlashInfer glue) otherwise goes through dynamo's frame callback.
-_q35_op_call = (torch._dynamo.disable(_q35_direct_call, recursive=True)
-                if os.environ.get("TRTLLM_Q35_CUSTOM_OP_EAGER", "0") == "1" else _q35_direct_call)
+_q35_op_call = (torch._dynamo.disable(
+    _q35_direct_call, recursive=True) if os.environ.get(
+        "TRTLLM_Q35_CUSTOM_OP_EAGER", "0") == "1" else _q35_direct_call)
 
 
 @torch.library.custom_op("trtllm::attn_custom_op_inplace",
@@ -136,14 +137,15 @@ def attn_custom_op_inplace(
 # segments; outside a capture the wrapper is a plain call.
 maybe_bcg_attn_custom_op_inplace = eager_on_graph(attn_custom_op_inplace)
 
-
 # Qwen3.5 low-latency switch (default off), see Attention.forward / fmha/q35_segmented.py.
-_Q35_ATTN_SEG_FUSE_GATE = os.environ.get("TRTLLM_Q35_ATTN_SEG_FUSE_GATE", "0") == "1"
+_Q35_ATTN_SEG_FUSE_GATE = os.environ.get("TRTLLM_Q35_ATTN_SEG_FUSE_GATE",
+                                         "0") == "1"
 # TRTLLM_Q35_ATTN_CP=1: CP-lite generation attention inside each TP KV group (fmha/q35_cp.py); see
 # FlashInferTrtllmGenFmha.run_generation for the batch-size selection.
 _Q35_ATTN_CP = os.environ.get("TRTLLM_Q35_ATTN_CP", "0") == "1"
 # TRTLLM_Q35_CTX_ATTN_PLAN=1|2: see attention_backend/trtllm.py; here it only caches the layer's quantization constants.
-_Q35_CTX_ATTN_PLAN = os.environ.get("TRTLLM_Q35_CTX_ATTN_PLAN", "0") in ("1", "2")
+_Q35_CTX_ATTN_PLAN = os.environ.get("TRTLLM_Q35_CTX_ATTN_PLAN",
+                                    "0") in ("1", "2")
 # TRTLLM_Q35_ATTN_KV_APPEND=1: the fused qk-norm / RoPE / gate preprocessing of a generation-only step also writes the
 # FP8 query and appends the FP8 K / V (QKNormRoPEAttention.preprocess_qkv); the attention metadata is exposed to it
 # for that call only (_q35_attn_metadata) and the hand-over to the backend (attn.q35_kv_appended) is cleared after it.
@@ -739,8 +741,10 @@ class Attention(nn.Module):
         self.attn.q35_cp_mapping = (self.mapping
                                     if self.q35_cp_group is not None else None)
         # MTP / draft layers sit after the target's num_hidden_layers (per-flag opt-out of the Q35 attention paths).
-        num_hidden_layers = getattr(config.pretrained_config, "num_hidden_layers", None)
-        self.attn.q35_is_mtp = bool(self.layer_idx is not None and num_hidden_layers is not None
+        num_hidden_layers = getattr(config.pretrained_config,
+                                    "num_hidden_layers", None)
+        self.attn.q35_is_mtp = bool(self.layer_idx is not None
+                                    and num_hidden_layers is not None
                                     and self.layer_idx >= num_hidden_layers)
 
         self.support_fused_qkv = self.attn.support_fused_qkv()
@@ -843,9 +847,8 @@ class Attention(nn.Module):
         depend only on the loaded quantization config, and each call rebuilds a QuantMode to answer them."""
         consts = self.__dict__.get("_q35_consts")
         if consts is None:
-            consts = (self._use_quantize_output(), self.quant_config
-                      is not None and
-                      self.quant_config.layer_quant_mode.has_fp4_kv_cache())
+            consts = (self._use_quantize_output(), self.quant_config is not None
+                      and self.quant_config.layer_quant_mode.has_fp4_kv_cache())
             self._q35_consts = consts
         return consts
 
@@ -950,9 +953,9 @@ class Attention(nn.Module):
             quantize_output, fp4_kv_cache = self._q35_attn_consts()
         else:
             quantize_output = self._use_quantize_output()
-            fp4_kv_cache = (self.quant_config is not None
-                            and self.quant_config.layer_quant_mode.
-                            has_fp4_kv_cache())
+            fp4_kv_cache = (
+                self.quant_config is not None
+                and self.quant_config.layer_quant_mode.has_fp4_kv_cache())
         if quantize_output and not has_lora:
             out_scale = self.o_proj.inv_input_scale
             out_scale_sf = self.o_proj.input_scale

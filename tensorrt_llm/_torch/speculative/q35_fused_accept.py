@@ -91,14 +91,23 @@ def _q35_strict_accept_kernel(
     for g0 in range(0, num_gens, BLOCK_B):
         g = g0 + tl.arange(0, BLOCK_B)
         g_ok = g < num_gens
-        tgt = tl.load(target_ptr + num_contexts + g[:, None] * (K + 1) + cols[None, :],
-                      mask=g_ok[:, None] & col_ok[None, :], other=0)
+        tgt = tl.load(
+            target_ptr + num_contexts + g[:, None] * (K + 1) + cols[None, :],
+            mask=g_ok[:, None] & col_ok[None, :],
+            other=0,
+        )
         rows = (num_contexts + g).to(tl.int64)
-        tl.store(accepted_ptr + rows[:, None] * accepted_stride + cols[None, :], tgt.to(tl.int32),
-                 mask=g_ok[:, None] & col_ok[None, :])
+        tl.store(
+            accepted_ptr + rows[:, None] * accepted_stride + cols[None, :],
+            tgt.to(tl.int32),
+            mask=g_ok[:, None] & col_ok[None, :],
+        )
         if FORCE == 0:
-            drf = tl.load(draft_ptr + g[:, None] * K + cols[None, :],
-                          mask=g_ok[:, None] & draft_col_ok[None, :], other=0)
+            drf = tl.load(
+                draft_ptr + g[:, None] * K + cols[None, :],
+                mask=g_ok[:, None] & draft_col_ok[None, :],
+                other=0,
+            )
             match = (drf.to(tl.int64) == tgt.to(tl.int64)) & draft_col_ok[None, :]
             # leading matches = index of the first mismatch among the K draft columns
             first_miss = tl.min(tl.where(match, BLOCK_K, cols[None, :]), axis=1)
@@ -115,11 +124,13 @@ def _q35_strict_accept_kernel(
         tl.store(counter_ptr, counter)
 
 
-def fused_strict_accept(target_tokens: torch.Tensor,
-                        draft_tokens: torch.Tensor,
-                        num_contexts: int,
-                        batch_size: int,
-                        force: Optional[tuple] = None) -> tuple:
+def fused_strict_accept(
+    target_tokens: torch.Tensor,
+    draft_tokens: torch.Tensor,
+    num_contexts: int,
+    batch_size: int,
+    force: Optional[tuple] = None,
+) -> tuple:
     """``(accepted_tokens [batch, K + 1] int32, num_accepted_tokens [batch] int32)``.
 
     ``draft_tokens``: [num_gens, K]. ``force``: None (natural acceptance) or
@@ -130,7 +141,7 @@ def fused_strict_accept(target_tokens: torch.Tensor,
     assert k + 1 <= MAX_DRAFT_LEN + 1, k
     device = target_tokens.device
     accepted = torch.empty((batch_size, k + 1), dtype=torch.int32, device=device)
-    num_accepted = torch.empty((batch_size, ), dtype=torch.int32, device=device)
+    num_accepted = torch.empty((batch_size,), dtype=torch.int32, device=device)
     if force is None:
         mode, base_total, max_total, frac = 0, 1, k + 1, 0.0
         pool = counter = num_accepted  # unused
@@ -143,18 +154,42 @@ def fused_strict_accept(target_tokens: torch.Tensor,
         pool_mask = pool_size - 1
     draft = draft_tokens.contiguous() if num_gens > 0 else num_accepted
     block_b = max(16, min(64, triton.next_power_of_2(max(num_gens, num_contexts, 1))))
-    _q35_strict_accept_kernel[(1, )](
-        target_tokens, draft, accepted, num_accepted, pool, counter, num_contexts, num_gens,
-        accepted.stride(0), float(frac),
-        K=k, FORCE=mode, BASE_TOTAL=int(base_total), MAX_TOTAL=int(max_total),
-        COUNTER_STRIDE=int(c_stride), SLOT_STRIDE=int(s_stride), POOL_MASK=int(pool_mask),
-        BLOCK_B=block_b, BLOCK_K=max(8, triton.next_power_of_2(k + 1)), num_warps=1)
+    _q35_strict_accept_kernel[(1,)](
+        target_tokens,
+        draft,
+        accepted,
+        num_accepted,
+        pool,
+        counter,
+        num_contexts,
+        num_gens,
+        accepted.stride(0),
+        float(frac),
+        K=k,
+        FORCE=mode,
+        BASE_TOTAL=int(base_total),
+        MAX_TOTAL=int(max_total),
+        COUNTER_STRIDE=int(c_stride),
+        SLOT_STRIDE=int(s_stride),
+        POOL_MASK=int(pool_mask),
+        BLOCK_B=block_b,
+        BLOCK_K=max(8, triton.next_power_of_2(k + 1)),
+        num_warps=1,
+    )
     return accepted, num_accepted
 
 
 @triton.jit
-def _q35_step0_gather_ids_kernel(seq_lens_ptr, num_accepted_ptr, out_ptr, num_contexts, num_gens,
-                                 num_ctx_tokens, K1: tl.constexpr, BLOCK: tl.constexpr):
+def _q35_step0_gather_ids_kernel(
+    seq_lens_ptr,
+    num_accepted_ptr,
+    out_ptr,
+    num_contexts,
+    num_gens,
+    num_ctx_tokens,
+    K1: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
     offs = tl.arange(0, BLOCK)
     # context requests: their last token, cumsum(seq_lens)[i] - 1
     ctx = offs < num_contexts
@@ -163,27 +198,64 @@ def _q35_step0_gather_ids_kernel(seq_lens_ptr, num_accepted_ptr, out_ptr, num_co
     # generation requests: their last accepted token in the (K + 1)-token block
     gen = offs < num_gens
     acc = tl.load(num_accepted_ptr + num_contexts + offs, mask=gen, other=1).to(tl.int64)
-    tl.store(out_ptr + num_contexts + offs, num_ctx_tokens + offs.to(tl.int64) * K1 + acc - 1, mask=gen)
+    tl.store(
+        out_ptr + num_contexts + offs, num_ctx_tokens + offs.to(tl.int64) * K1 + acc - 1, mask=gen
+    )
 
 
-def step0_gather_ids(seq_lens: torch.Tensor, num_accepted: torch.Tensor, num_contexts: int,
-                     num_gens: int, draft_len: int, num_ctx_tokens: int) -> torch.Tensor:
+def step0_gather_ids(
+    seq_lens: torch.Tensor,
+    num_accepted: torch.Tensor,
+    num_contexts: int,
+    num_gens: int,
+    draft_len: int,
+    num_ctx_tokens: int,
+) -> torch.Tensor:
     """TRTLLM_Q35_FUSED_STEP0: the rows the 1st draft step reads (int64 [num_contexts + num_gens]) in one
     launch, equal to ``concat(cumsum(seq_lens)[:num_contexts] - 1, num_ctx_tokens + arange(num_gens) *
     (draft_len + 1) + num_accepted[num_contexts:] - 1)``."""
-    out = torch.empty((num_contexts + num_gens, ), dtype=torch.int64, device=num_accepted.device)
+    out = torch.empty((num_contexts + num_gens,), dtype=torch.int64, device=num_accepted.device)
     block = max(16, triton.next_power_of_2(max(num_contexts, num_gens, 1)))
-    _q35_step0_gather_ids_kernel[(1, )](seq_lens, num_accepted, out, num_contexts, num_gens,
-                                         num_ctx_tokens, K1=draft_len + 1, BLOCK=block, num_warps=1)
+    _q35_step0_gather_ids_kernel[(1,)](
+        seq_lens,
+        num_accepted,
+        out,
+        num_contexts,
+        num_gens,
+        num_ctx_tokens,
+        K1=draft_len + 1,
+        BLOCK=block,
+        num_warps=1,
+    )
     return out
 
 
 @triton.jit
-def _q35_step0_epilogue_kernel(seq_lens_ptr, num_accepted_ptr, hid_ptr, hid_stride, pos_ptr, pos_row_stride,
-                               ids_out_ptr, hid_out_ptr, pos_out_ptr, seq_lens_w_ptr, kv_lens_ptr, acc_tok_ptr,
-                               acc_tok_stride, last_out_ptr, num_contexts, num_ctx_tokens, batch_size,
-                               K: tl.constexpr, R: tl.constexpr, H: tl.constexpr, BLOCK_C: tl.constexpr,
-                               BLOCK_H: tl.constexpr, LAST: tl.constexpr):
+def _q35_step0_epilogue_kernel(
+    seq_lens_ptr,
+    num_accepted_ptr,
+    hid_ptr,
+    hid_stride,
+    pos_ptr,
+    pos_row_stride,
+    ids_out_ptr,
+    hid_out_ptr,
+    pos_out_ptr,
+    seq_lens_w_ptr,
+    kv_lens_ptr,
+    acc_tok_ptr,
+    acc_tok_stride,
+    last_out_ptr,
+    num_contexts,
+    num_ctx_tokens,
+    batch_size,
+    K: tl.constexpr,
+    R: tl.constexpr,
+    H: tl.constexpr,
+    BLOCK_C: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    LAST: tl.constexpr,
+):
     """One program per request ``i`` (every write is to row ``i`` only; ``seq_lens_ptr`` is never written)."""
     i = tl.program_id(0)
     is_ctx = i < num_contexts
@@ -191,8 +263,11 @@ def _q35_step0_epilogue_kernel(seq_lens_ptr, num_accepted_ptr, hid_ptr, hid_stri
     lens = tl.load(seq_lens_ptr + offs, mask=(offs <= i) & is_ctx, other=0).to(tl.int64)
     acc = tl.load(num_accepted_ptr + i).to(tl.int64)
     # contexts: cumsum(seq_lens)[i] - 1 (last prompt token); generations: last accepted token of the block
-    gid = tl.where(is_ctx, tl.sum(lens, axis=0) - 1,
-                   num_ctx_tokens + (i - num_contexts).to(tl.int64) * (K + 1) + acc - 1)
+    gid = tl.where(
+        is_ctx,
+        tl.sum(lens, axis=0) - 1,
+        num_ctx_tokens + (i - num_contexts).to(tl.int64) * (K + 1) + acc - 1,
+    )
     dkv = tl.where(is_ctx, 1, acc - K)
     tl.store(ids_out_ptr + i, gid)
     h = tl.arange(0, BLOCK_H)
@@ -231,18 +306,33 @@ class Step0Epilogue:
         return self._pos_all[j - 1].view(*self._pos_prefix, b)
 
 
-def step0_epilogue(seq_lens: torch.Tensor, num_accepted: torch.Tensor, hidden_states: torch.Tensor,
-                   position_ids: torch.Tensor, seq_lens_out: torch.Tensor, kv_lens: torch.Tensor,
-                   num_contexts: int, batch_size: int, draft_len: int, num_ctx_tokens: int,
-                   accepted_tokens: Optional[torch.Tensor] = None,
-                   last_out: Optional[torch.Tensor] = None) -> Optional[Step0Epilogue]:
+def step0_epilogue(
+    seq_lens: torch.Tensor,
+    num_accepted: torch.Tensor,
+    hidden_states: torch.Tensor,
+    position_ids: torch.Tensor,
+    seq_lens_out: torch.Tensor,
+    kv_lens: torch.Tensor,
+    num_contexts: int,
+    batch_size: int,
+    draft_len: int,
+    num_ctx_tokens: int,
+    accepted_tokens: Optional[torch.Tensor] = None,
+    last_out: Optional[torch.Tensor] = None,
+) -> Optional[Step0Epilogue]:
     """``seq_lens`` must not alias ``seq_lens_out`` (read the pre-draft-loop copy). With ``accepted_tokens``
     ``[b, >= draft_len + 1]`` and ``last_out`` (contiguous ``[b]``), also ``last_out[i] =
     accepted_tokens[i, num_accepted[i] - 1]``. Returns None when the shapes are not supported (caller keeps the
     stock path)."""
-    if (seq_lens.data_ptr() == seq_lens_out.data_ptr() or hidden_states.dim() != 2
-            or hidden_states.stride(-1) != 1 or position_ids.stride(-1) != 1 or batch_size < 1
-            or batch_size > 4096 or draft_len < 1):
+    if (
+        seq_lens.data_ptr() == seq_lens_out.data_ptr()
+        or hidden_states.dim() != 2
+        or hidden_states.stride(-1) != 1
+        or position_ids.stride(-1) != 1
+        or batch_size < 1
+        or batch_size > 4096
+        or draft_len < 1
+    ):
         return None
     pos2 = position_ids.reshape(-1, position_ids.shape[-1])
     if pos2.dim() != 2 or (pos2.shape[0] > 1 and pos2.stride(0) < pos2.shape[1]):
@@ -250,22 +340,54 @@ def step0_epilogue(seq_lens: torch.Tensor, num_accepted: torch.Tensor, hidden_st
     rows = pos2.shape[0]
     h = hidden_states.shape[1]
     dev = hidden_states.device
-    ids = torch.empty((batch_size, ), dtype=torch.int64, device=dev)
+    ids = torch.empty((batch_size,), dtype=torch.int64, device=dev)
     hid = torch.empty((batch_size, h), dtype=hidden_states.dtype, device=dev)
-    pos_all = torch.empty((max(draft_len - 1, 1), rows, batch_size), dtype=position_ids.dtype, device=dev)
+    pos_all = torch.empty(
+        (max(draft_len - 1, 1), rows, batch_size), dtype=position_ids.dtype, device=dev
+    )
     last = accepted_tokens is not None and last_out is not None
     if last:
-        assert accepted_tokens.stride(-1) == 1 and last_out.is_contiguous() and last_out.numel() >= batch_size
-    _q35_step0_epilogue_kernel[(batch_size, )](
-        seq_lens, num_accepted, hidden_states, hidden_states.stride(0), pos2, pos2.stride(0) if rows > 1 else 0,
-        ids, hid, pos_all, seq_lens_out, kv_lens, accepted_tokens if last else ids,
-        accepted_tokens.stride(0) if last else 0, last_out if last else ids, num_contexts, num_ctx_tokens,
-        batch_size, K=draft_len, R=rows, H=h, BLOCK_C=max(16, triton.next_power_of_2(max(num_contexts, 1))),
-        BLOCK_H=triton.next_power_of_2(h), LAST=last, num_warps=4)
+        assert (
+            accepted_tokens.stride(-1) == 1
+            and last_out.is_contiguous()
+            and last_out.numel() >= batch_size
+        )
+    _q35_step0_epilogue_kernel[(batch_size,)](
+        seq_lens,
+        num_accepted,
+        hidden_states,
+        hidden_states.stride(0),
+        pos2,
+        pos2.stride(0) if rows > 1 else 0,
+        ids,
+        hid,
+        pos_all,
+        seq_lens_out,
+        kv_lens,
+        accepted_tokens if last else ids,
+        accepted_tokens.stride(0) if last else 0,
+        last_out if last else ids,
+        num_contexts,
+        num_ctx_tokens,
+        batch_size,
+        K=draft_len,
+        R=rows,
+        H=h,
+        BLOCK_C=max(16, triton.next_power_of_2(max(num_contexts, 1))),
+        BLOCK_H=triton.next_power_of_2(h),
+        LAST=last,
+        num_warps=4,
+    )
     return Step0Epilogue(ids, hid, pos_all, tuple(position_ids.shape[:-1]))
 
 
 __all__ = [
-    "draft_bookkeeping_enabled", "draft_tail_enabled", "fused_accept_enabled", "fused_step0_enabled", "fused_strict_accept",
-    "step0_epilogue", "step0_gather_ids", "Step0Epilogue"
+    "draft_bookkeeping_enabled",
+    "draft_tail_enabled",
+    "fused_accept_enabled",
+    "fused_step0_enabled",
+    "fused_strict_accept",
+    "step0_epilogue",
+    "step0_gather_ids",
+    "Step0Epilogue",
 ]

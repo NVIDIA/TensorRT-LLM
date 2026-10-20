@@ -57,7 +57,10 @@ ENV_LL_ARGMAX_EXCHANGE = "TRTLLM_Q35_LL_ARGMAX_EXCHANGE"
 # Rows (keys) per rank and launch: decode batch <= 64 at 1 key per request. TRTLLM_Q35_LL_EXCHANGE_MAX_ROWS=<n>
 # (rounded up to a power of two, <= 1024) raises the bound, e.g. 256 for the vocabulary-sharded target sampling of an
 # MTP-6 verify at b16 / b32 (112 / 224 rows), which otherwise takes the stock all-gather + cat + cast + argmax.
-_MAX_ROWS = min(1024, triton.next_power_of_2(max(64, int(os.environ.get("TRTLLM_Q35_LL_EXCHANGE_MAX_ROWS", "64")))))
+_MAX_ROWS = min(
+    1024,
+    triton.next_power_of_2(max(64, int(os.environ.get("TRTLLM_Q35_LL_EXCHANGE_MAX_ROWS", "64")))),
+)
 _WORDS = 2 * _MAX_ROWS  # 32-bit words per rank: (lo, hi) per key
 _NUM_CHANNELS = int(os.environ.get("TRTLLM_Q35_LL_EXCHANGE_CHANNELS", "16"))
 # Constants read inside the Triton kernels must be constexpr globals.
@@ -97,9 +100,25 @@ def _orderable_key_hi(v):
 
 
 @triton.jit
-def _ll_exchange_words(hi_w, lo_w, rows, ok, m, max_out_ptr, gather_out_ptr, tok_out_ptr, state_ptr,
-                       pv, rank, NRANKS: tl.constexpr, WORDS: tl.constexpr, BLOCK_M: tl.constexpr,
-                       DO_MAX: tl.constexpr, DO_GATHER: tl.constexpr, DO_TOKENS: tl.constexpr):
+def _ll_exchange_words(
+    hi_w,
+    lo_w,
+    rows,
+    ok,
+    m,
+    max_out_ptr,
+    gather_out_ptr,
+    tok_out_ptr,
+    state_ptr,
+    pv,
+    rank,
+    NRANKS: tl.constexpr,
+    WORDS: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    DO_MAX: tl.constexpr,
+    DO_GATHER: tl.constexpr,
+    DO_TOKENS: tl.constexpr,
+):
     """Exchange this rank's keys (``hi_w`` / ``lo_w``: int64 [BLOCK_M] holding the 32-bit halves) with
     every rank of the group and write the requested outputs; advances the channel's epoch.
 
@@ -200,12 +219,38 @@ def _tp_key_exchange_kernel(
             tl.store(keys_ptr + rows, tl.full([BLOCK_M], _INT64_MIN, tl.int64), mask=ok)
         hi_w = (key >> 32) & lo_mask
         lo_w = key & lo_mask
-    _ll_exchange_words(hi_w, lo_w, rows, ok, m, max_out_ptr, gather_out_ptr, tok_out_ptr, state_ptr, pv,
-                       rank, NRANKS, WORDS, BLOCK_M, DO_MAX, DO_GATHER, DO_TOKENS)
+    _ll_exchange_words(
+        hi_w,
+        lo_w,
+        rows,
+        ok,
+        m,
+        max_out_ptr,
+        gather_out_ptr,
+        tok_out_ptr,
+        state_ptr,
+        pv,
+        rank,
+        NRANKS,
+        WORDS,
+        BLOCK_M,
+        DO_MAX,
+        DO_GATHER,
+        DO_TOKENS,
+    )
 
 
-@triton.jit(do_not_specialize=["m", "v_shard", "stride_m", "rank", "vocab_offset", "vocab_full",
-                               "greedy_threshold"])
+@triton.jit(
+    do_not_specialize=[
+        "m",
+        "v_shard",
+        "stride_m",
+        "rank",
+        "vocab_offset",
+        "vocab_full",
+        "greedy_threshold",
+    ]
+)
 def _argmax_exchange_kernel(
     logits_ptr,
     stride_m,
@@ -263,8 +308,9 @@ def _argmax_exchange_kernel(
         seed = tl.load(seed_ptr)
     for off in range(start, end, BLOCK_V):
         cols = off + tl.arange(0, BLOCK_V)
-        x = tl.load(logits_ptr + row.to(tl.int64) * stride_m + cols, mask=cols < end,
-                    other=-float("inf")).to(tl.float32)
+        x = tl.load(
+            logits_ptr + row.to(tl.int64) * stride_m + cols, mask=cols < end, other=-float("inf")
+        ).to(tl.float32)
         if GUMBEL:
             if sample:
                 u = tl.rand(seed, row * vocab_full + vocab_offset + cols)
@@ -274,7 +320,9 @@ def _argmax_exchange_kernel(
         take = v > best_v  # strict: an earlier tile keeps a tie
         best_i = tl.where(take, off + i, best_i)
         best_v = tl.where(take, v, best_v)
-    key = (_orderable_key_hi(best_v).to(tl.int64) << 32) | (_LO_MASK - (best_i.to(tl.int64) + vocab_offset))
+    key = (_orderable_key_hi(best_v).to(tl.int64) << 32) | (
+        _LO_MASK - (best_i.to(tl.int64) + vocab_offset)
+    )
     tl.atomic_max(scratch_ptr + row, key, sem="relaxed", scope="gpu")
     ticket = tl.atomic_add(ticket_ptr, 1, sem="acq_rel", scope="gpu")
     if ticket == m * SPLIT - 1:
@@ -284,8 +332,25 @@ def _argmax_exchange_kernel(
         floor = tl.full([BLOCK_M], _INT64_MIN, tl.int64)
         keys = tl.atomic_xchg(scratch_ptr + rows, floor, mask=ok, sem="acquire", scope="gpu")
         tl.store(ticket_ptr, 0)
-        _ll_exchange_words((keys >> 32) & lo_mask, keys & lo_mask, rows, ok, m, max_out_ptr, tok_out_ptr,
-                           tok_out_ptr, state_ptr, pv, rank, NRANKS, WORDS, BLOCK_M, DO_MAX, False, DO_TOKENS)
+        _ll_exchange_words(
+            (keys >> 32) & lo_mask,
+            keys & lo_mask,
+            rows,
+            ok,
+            m,
+            max_out_ptr,
+            tok_out_ptr,
+            tok_out_ptr,
+            state_ptr,
+            pv,
+            rank,
+            NRANKS,
+            WORDS,
+            BLOCK_M,
+            DO_MAX,
+            False,
+            DO_TOKENS,
+        )
 
 
 @triton.jit
@@ -299,12 +364,21 @@ def _pack_argmax_keys_kernel(vals_ptr, lidx_ptr, keys_ptr, m, vocab_offset, BLOC
     tl.store(keys_ptr + rows, key, mask=ok)
 
 
-def pack_argmax_keys(values: torch.Tensor, local_index: torch.Tensor, vocab_offset: int) -> torch.Tensor:
+def pack_argmax_keys(
+    values: torch.Tensor, local_index: torch.Tensor, vocab_offset: int
+) -> torch.Tensor:
     """int64 keys ``(orderable(value) << 32) | (0xFFFFFFFF - (local_index + vocab_offset))``."""
     m = values.numel()
     keys = torch.empty(m, dtype=torch.int64, device=values.device)
-    _pack_argmax_keys_kernel[(1,)](values.reshape(-1), local_index.reshape(-1), keys, m, vocab_offset,
-                                   BLOCK_M=max(16, triton.next_power_of_2(m)), num_warps=1)
+    _pack_argmax_keys_kernel[(1,)](
+        values.reshape(-1),
+        local_index.reshape(-1),
+        keys,
+        m,
+        vocab_offset,
+        BLOCK_M=max(16, triton.next_power_of_2(m)),
+        num_warps=1,
+    )
     return keys
 
 
@@ -315,6 +389,7 @@ def unpack_argmax_tokens(keys: torch.Tensor) -> torch.Tensor:
 
 def _cu_check(ret):
     from cuda.bindings import driver as cu
+
     if isinstance(ret, tuple):
         err, *rest = ret
     else:
@@ -344,6 +419,7 @@ class _FabricPeerMemory:
     @staticmethod
     def _release(base, size, nranks, handles, mapped) -> None:
         from cuda.bindings import driver as cu
+
         for ptr in reversed(mapped):
             try:
                 _cu_check(cu.cuMemUnmap(ptr, size))
@@ -378,6 +454,7 @@ class _FabricPeerMemory:
     @classmethod
     def create(cls, comm, rank: int, nranks: int, nbytes: int) -> Optional["_FabricPeerMemory"]:
         from cuda.bindings import driver as cu
+
         from tensorrt_llm._mnnvl_utils import MnnvlMemory
 
         if "aarch64" not in platform.machine().lower():
@@ -391,7 +468,11 @@ class _FabricPeerMemory:
         data = None
         try:
             handle = _cu_check(cu.cuMemCreate(size, prop, 0))
-            data = bytes(_cu_check(cu.cuMemExportToShareableHandle(handle, prop.requestedHandleTypes, 0)).data)
+            data = bytes(
+                _cu_check(
+                    cu.cuMemExportToShareableHandle(handle, prop.requestedHandleTypes, 0)
+                ).data
+            )
         except Exception as e:  # noqa: BLE001
             logger.warning(f"[ll_exchange] fabric allocation failed on rank {rank}: {e}")
             data = None
@@ -405,13 +486,17 @@ class _FabricPeerMemory:
         base = None
         ok = True
         try:
-            base = int(_cu_check(cu.cuMemAddressReserve(size * nranks, MnnvlMemory.fabric_page_size, 0, 0)))
+            base = int(
+                _cu_check(cu.cuMemAddressReserve(size * nranks, MnnvlMemory.fabric_page_size, 0, 0))
+            )
             desc = cu.CUmemAccessDesc()
             desc.location = prop.location
             desc.flags = cu.CUmemAccess_flags.CU_MEM_ACCESS_FLAGS_PROT_READWRITE
             for r in range(nranks):
                 if r != rank:
-                    handles[r] = _cu_check(cu.cuMemImportFromShareableHandle(all_data[r], prop.requestedHandleTypes))
+                    handles[r] = _cu_check(
+                        cu.cuMemImportFromShareableHandle(all_data[r], prop.requestedHandleTypes)
+                    )
                 ptr = base + r * size
                 _cu_check(cu.cuMemMap(ptr, size, 0, handles[r], 0))
                 mapped.append(ptr)
@@ -436,8 +521,14 @@ class _PeerBuffers:
     rank (the caller keeps its NCCL path), so it never leaves partial mappings behind that could
     break later allocations such as the MNNVL all-reduce workspace growth."""
 
-    def __init__(self, local_ptr: int, peer_ptrs: Sequence[int], nbytes: int, transport: str,
-                 keepalive: object):
+    def __init__(
+        self,
+        local_ptr: int,
+        peer_ptrs: Sequence[int],
+        nbytes: int,
+        transport: str,
+        keepalive: object,
+    ):
         self.local_ptr = local_ptr
         self.peer_ptrs = list(peer_ptrs)
         self.nbytes = nbytes
@@ -464,13 +555,17 @@ class _PeerBuffers:
         if not use_ipc and not (mapping.is_multi_node() and MnnvlMemory.supports_mnnvl()):
             return None
         # The TP group's communicator (ordered by TP rank): all agreement steps run on it.
-        tp_comm = mpi_comm().Split(int(mapping.pp_rank * mapping.cp_size + mapping.cp_rank), mapping.tp_rank)
+        tp_comm = mpi_comm().Split(
+            int(mapping.pp_rank * mapping.cp_size + mapping.cp_rank), mapping.tp_rank
+        )
         try:
             if use_ipc:
                 ok = True
                 ipc = None
                 try:
-                    ipc = IpcMemory(mapping, nbytes, True)  # cudaMalloc + memset 0 + handle all-gather
+                    ipc = IpcMemory(
+                        mapping, nbytes, True
+                    )  # cudaMalloc + memset 0 + handle all-gather
                     ok = ipc.open_ipc
                 except Exception as e:  # noqa: BLE001 - fall back to the caller's NCCL path
                     logger.warning(f"[ll_exchange] IPC peer buffers failed: {e}")
@@ -509,12 +604,17 @@ class TPKeyExchange:
         # Epoch 0 = never sent (the buffers start zeroed); the first launch of a channel uses epoch 1.
         self._state = torch.ones(num_channels, dtype=torch.int32, device=device)
         # argmax_logits: per-channel atomic-max key scratch (INT64_MIN between launches) and ticket.
-        self._scratch = torch.full((num_channels, _MAX_ROWS), -(2**63), dtype=torch.int64, device=device)
+        self._scratch = torch.full(
+            (num_channels, _MAX_ROWS), -(2**63), dtype=torch.int64, device=device
+        )
         self._ticket = torch.zeros(num_channels, dtype=torch.int32, device=device)
         self._num_sms = torch.cuda.get_device_properties(device).multi_processor_count
-        table = [[p + c * self.channel_bytes for p in buffers.peer_ptrs] for c in range(num_channels)]
+        table = [
+            [p + c * self.channel_bytes for p in buffers.peer_ptrs] for c in range(num_channels)
+        ]
         self._peers = torch.tensor(table, dtype=torch.int64, device=device)
         from ..flashinfer_utils import get_env_enable_pdl
+
         self._pdl = get_env_enable_pdl()
 
     @staticmethod
@@ -531,8 +631,12 @@ class TPKeyExchange:
     @classmethod
     def create(cls, mapping, num_channels: int = _NUM_CHANNELS) -> Optional["TPKeyExchange"]:
         """Collective over the TP group; None where peer memory is unavailable (caller keeps NCCL)."""
-        if (mapping.tp_size not in (2, 4, 8, 16) or mapping.enable_attention_dp or mapping.has_pp()
-                or mapping.cp_size > 1):
+        if (
+            mapping.tp_size not in (2, 4, 8, 16)
+            or mapping.enable_attention_dp
+            or mapping.has_pp()
+            or mapping.cp_size > 1
+        ):
             return None
         buffers = _PeerBuffers.create(mapping, cls.buffer_bytes(mapping.tp_size, num_channels))
         if buffers is None:
@@ -545,10 +649,22 @@ class TPKeyExchange:
         if not 0 <= channel < self.num_channels:
             raise ValueError(f"channel {channel} out of range [0, {self.num_channels})")
 
-    def _launch(self, m, channel, keys=None, vals=None, lidx=None, vocab_offset=0, max_out=None,
-                gather_out=None, tok_out=None, wait: Optional[bool] = None, reset_keys: bool = False):
+    def _launch(
+        self,
+        m,
+        channel,
+        keys=None,
+        vals=None,
+        lidx=None,
+        vocab_offset=0,
+        max_out=None,
+        gather_out=None,
+        tok_out=None,
+        wait: Optional[bool] = None,
+        reset_keys: bool = False,
+    ):
         dummy = self._state  # never dereferenced when its constexpr switch is off
-        _tp_key_exchange_kernel[(1, )](
+        _tp_key_exchange_kernel[(1,)](
             keys if keys is not None else dummy,
             vals if vals is not None else dummy,
             lidx if lidx is not None else dummy,
@@ -573,15 +689,17 @@ class TPKeyExchange:
             launch_pdl=self._pdl,
         )
 
-    def exchange(self,
-                 keys: torch.Tensor,
-                 max_out: Optional[torch.Tensor] = None,
-                 gather_out: Optional[torch.Tensor] = None,
-                 channel: int = 0,
-                 want_max: Optional[bool] = None,
-                 tokens_out: Optional[torch.Tensor] = None,
-                 reset_keys: bool = False,
-                 _wait: Optional[bool] = None) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+    def exchange(
+        self,
+        keys: torch.Tensor,
+        max_out: Optional[torch.Tensor] = None,
+        gather_out: Optional[torch.Tensor] = None,
+        channel: int = 0,
+        want_max: Optional[bool] = None,
+        tokens_out: Optional[torch.Tensor] = None,
+        reset_keys: bool = False,
+        _wait: Optional[bool] = None,
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         """Elementwise max over the group (``max_out`` int64 [M]) and/or every rank's keys
         (``gather_out`` int64 [nranks, M], rank-major) of this rank's ``keys`` int64 [M].
 
@@ -595,17 +713,27 @@ class TPKeyExchange:
             want_max = tokens_out is None or max_out is not None
         if want_max and max_out is None:
             max_out = torch.empty_like(keys)
-        self._launch(m, channel, keys=keys, max_out=max_out if want_max else None, gather_out=gather_out,
-                     tok_out=tokens_out, wait=_wait, reset_keys=reset_keys)
+        self._launch(
+            m,
+            channel,
+            keys=keys,
+            max_out=max_out if want_max else None,
+            gather_out=gather_out,
+            tok_out=tokens_out,
+            wait=_wait,
+            reset_keys=reset_keys,
+        )
         return max_out if want_max else None, gather_out
 
-    def argmax_tokens(self,
-                      values: torch.Tensor,
-                      local_index: torch.Tensor,
-                      vocab_offset: int,
-                      tokens_out: Optional[torch.Tensor] = None,
-                      max_out: Optional[torch.Tensor] = None,
-                      channel: int = 0) -> torch.Tensor:
+    def argmax_tokens(
+        self,
+        values: torch.Tensor,
+        local_index: torch.Tensor,
+        vocab_offset: int,
+        tokens_out: Optional[torch.Tensor] = None,
+        max_out: Optional[torch.Tensor] = None,
+        channel: int = 0,
+    ) -> torch.Tensor:
         """Global greedy token (int32 [M]) from each rank's local row maxima ``values`` [M] (any
         float dtype) at ``local_index`` [M] of its vocabulary shard starting at ``vocab_offset``."""
         m = values.numel()
@@ -614,21 +742,29 @@ class TPKeyExchange:
         local_index = local_index.reshape(-1)
         if tokens_out is None:
             tokens_out = torch.empty(m, dtype=torch.int32, device=values.device)
-        self._launch(m, channel, vals=values, lidx=local_index, vocab_offset=vocab_offset, max_out=max_out,
-                     tok_out=tokens_out)
+        self._launch(
+            m,
+            channel,
+            vals=values,
+            lidx=local_index,
+            vocab_offset=vocab_offset,
+            max_out=max_out,
+            tok_out=tokens_out,
+        )
         return tokens_out
 
-
-    def argmax_logits(self,
-                      logits: torch.Tensor,
-                      vocab_offset: int,
-                      tokens_out: Optional[torch.Tensor] = None,
-                      max_out: Optional[torch.Tensor] = None,
-                      channel: int = 1,
-                      split: Optional[int] = None,
-                      temperature: Optional[torch.Tensor] = None,
-                      seed: Optional[torch.Tensor] = None,
-                      greedy_threshold: float = 1e-4) -> torch.Tensor:
+    def argmax_logits(
+        self,
+        logits: torch.Tensor,
+        vocab_offset: int,
+        tokens_out: Optional[torch.Tensor] = None,
+        max_out: Optional[torch.Tensor] = None,
+        channel: int = 1,
+        split: Optional[int] = None,
+        temperature: Optional[torch.Tensor] = None,
+        seed: Optional[torch.Tensor] = None,
+        greedy_threshold: float = 1e-4,
+    ) -> torch.Tensor:
         """Global greedy tokens (int32 [M]) of this rank's vocabulary shard ``logits`` [M, V_shard]
         (bf16 / fp16 / fp32, unit stride in the vocabulary dimension) starting at global column
         ``vocab_offset``: local first maximum, packing and exchange in one launch. Same tokens as
@@ -651,7 +787,7 @@ class TPKeyExchange:
         block_v = max(16, min(4096, triton.next_power_of_2(triton.cdiv(v_shard, split))))
         if tokens_out is None:
             tokens_out = torch.empty(m, dtype=torch.int32, device=logits.device)
-        _argmax_exchange_kernel[(m * split, )](
+        _argmax_exchange_kernel[(m * split,)](
             logits,
             logits.stride(0),
             v_shard,
@@ -689,8 +825,21 @@ class TPKeyExchange:
 
 
 @triton.jit
-def _ll_group_push(src_ptr, pv, ar_g, slot_base, block, epoch, n_words, src_dest_stride, grank, G: tl.constexpr,
-                   SLOT_WORDS: tl.constexpr, BLOCK: tl.constexpr, ALLTOALL: tl.constexpr):
+def _ll_group_push(
+    src_ptr,
+    pv,
+    ar_g,
+    slot_base,
+    block,
+    epoch,
+    n_words,
+    src_dest_stride,
+    grank,
+    G: tl.constexpr,
+    SLOT_WORDS: tl.constexpr,
+    BLOCK: tl.constexpr,
+    ALLTOALL: tl.constexpr,
+):
     slot = (epoch & 1).to(tl.int64) * (G * SLOT_WORDS) + slot_base
     tag = epoch.to(tl.uint32, bitcast=True).to(tl.uint64) << 32
     w = block * BLOCK + tl.arange(0, BLOCK)
@@ -701,14 +850,26 @@ def _ll_group_push(src_ptr, pv, ar_g, slot_base, block, epoch, n_words, src_dest
     for d in tl.static_range(G):
         if ALLTOALL:
             words = tl.load(src_ptr + d * src_dest_stride + w, mask=ok, other=0)
-            packet = (tag | words.to(tl.uint32, bitcast=True).to(tl.uint64)).to(tl.int64, bitcast=True)
+            packet = (tag | words.to(tl.uint32, bitcast=True).to(tl.uint64)).to(
+                tl.int64, bitcast=True
+            )
         dst = tl.sum(tl.where(ar_g == d, pv, 0)).to(tl.uint64).to(tl.pointer_type(tl.int64))
         tl.store(dst + slot + grank * SLOT_WORDS + w, packet, mask=ok)
 
 
 @triton.jit
-def _ll_group_poll(out_ptr, mine, block, epoch, n_words, row_words, out_row_stride, G: tl.constexpr,
-                   SLOT_WORDS: tl.constexpr, BLOCK: tl.constexpr):
+def _ll_group_poll(
+    out_ptr,
+    mine,
+    block,
+    epoch,
+    n_words,
+    row_words,
+    out_row_stride,
+    G: tl.constexpr,
+    SLOT_WORDS: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
     slot = (epoch & 1).to(tl.int64) * (G * SLOT_WORDS)
     src_rank = tl.arange(0, G)
     w = block * BLOCK + tl.arange(0, BLOCK)
@@ -722,7 +883,9 @@ def _ll_group_poll(out_ptr, mine, block, epoch, n_words, row_words, out_row_stri
         waiting = tl.sum((((got >> 32).to(tl.int32) != epoch) & mask).to(tl.int32))
     row = w // row_words
     col = w % row_words
-    out_offs = row[None, :].to(tl.int64) * out_row_stride + src_rank[:, None] * row_words + col[None, :]
+    out_offs = (
+        row[None, :].to(tl.int64) * out_row_stride + src_rank[:, None] * row_words + col[None, :]
+    )
     tl.store(out_ptr + out_offs, got.to(tl.int32), mask=mask)
 
 
@@ -780,19 +943,58 @@ def _ll_group_kernel(
     if num_blocks <= stride:
         # One block per program (the decode sizes): the epoch stays in a register.
         epoch = tl.load(state_ptr + program, volatile=True)
-        _ll_group_push(src_ptr, pv, ar_g, 0, program, epoch, n_words, src_dest_stride, grank, G, SLOT_WORDS,
-                       BLOCK, ALLTOALL)
-        _ll_group_poll(out_ptr, mine, program, epoch, n_words, row_words, out_row_stride, G, SLOT_WORDS, BLOCK)
+        _ll_group_push(
+            src_ptr,
+            pv,
+            ar_g,
+            0,
+            program,
+            epoch,
+            n_words,
+            src_dest_stride,
+            grank,
+            G,
+            SLOT_WORDS,
+            BLOCK,
+            ALLTOALL,
+        )
+        _ll_group_poll(
+            out_ptr, mine, program, epoch, n_words, row_words, out_row_stride, G, SLOT_WORDS, BLOCK
+        )
         nxt = epoch + 1
         tl.store(state_ptr + program, tl.where(nxt == 0, 2, nxt))
     else:
         for block in range(program, num_blocks, stride):
             epoch = tl.load(state_ptr + block, volatile=True)
-            _ll_group_push(src_ptr, pv, ar_g, 0, block, epoch, n_words, src_dest_stride, grank, G, SLOT_WORDS,
-                           BLOCK, ALLTOALL)
+            _ll_group_push(
+                src_ptr,
+                pv,
+                ar_g,
+                0,
+                block,
+                epoch,
+                n_words,
+                src_dest_stride,
+                grank,
+                G,
+                SLOT_WORDS,
+                BLOCK,
+                ALLTOALL,
+            )
         for block in range(program, num_blocks, stride):
             epoch = tl.load(state_ptr + block, volatile=True)
-            _ll_group_poll(out_ptr, mine, block, epoch, n_words, row_words, out_row_stride, G, SLOT_WORDS, BLOCK)
+            _ll_group_poll(
+                out_ptr,
+                mine,
+                block,
+                epoch,
+                n_words,
+                row_words,
+                out_row_stride,
+                G,
+                SLOT_WORDS,
+                BLOCK,
+            )
             nxt = epoch + 1
             tl.store(state_ptr + block, tl.where(nxt == 0, 2, nxt))
 
@@ -890,10 +1092,14 @@ def _ll_merge_kernel(
             for d in tl.static_range(G):
                 dst = tl.sum(tl.where(ar_g == d, pv, 0)).to(tl.uint64).to(tl.pointer_type(tl.int64))
                 ow = tl.load(o_ptr + d * o_sd + p * o_sp + t * o_st + h * DW + w)
-                ow_p = (tag | ow.to(tl.uint32, bitcast=True).to(tl.uint64)).to(tl.int64, bitcast=True)
+                ow_p = (tag | ow.to(tl.uint32, bitcast=True).to(tl.uint64)).to(
+                    tl.int64, bitcast=True
+                )
                 tl.store(dst + slot + pos * DW + w, ow_p)
                 lw = tl.load(lse_ptr + d * l_sd + p * l_sp + t * l_st + h)
-                lw_p = (tag | lw.to(tl.uint32, bitcast=True).to(tl.uint64)).to(tl.int64, bitcast=True)
+                lw_p = (tag | lw.to(tl.uint32, bitcast=True).to(tl.uint64)).to(
+                    tl.int64, bitcast=True
+                )
                 tl.store(dst + slot + LSE_BASE + pos, lw_p)
     c = tl.arange(0, P * DW)  # columns of a row's poll tile: partial c // DW, word c % DW
     cp = c // DW
@@ -914,20 +1120,24 @@ def _ll_merge_kernel(
         arrived = tagc[None, :] + tl.zeros([G, P * DW], dtype=tl.int64)
         got_o = tl.load(mine + o_offs, volatile=True)
         got_l = tl.load(mine + l_offs, mask=lm, other=arrived, volatile=True)
-        waiting = (tl.sum(((got_o >> 32).to(tl.int32) != ecol[None, :]).to(tl.int32)) +
-                   tl.sum(((got_l >> 32).to(tl.int32) != ecol[None, :]).to(tl.int32)))
+        waiting = tl.sum(((got_o >> 32).to(tl.int32) != ecol[None, :]).to(tl.int32)) + tl.sum(
+            ((got_l >> 32).to(tl.int32) != ecol[None, :]).to(tl.int32)
+        )
         while waiting > 0:
             got_o = tl.load(mine + o_offs, volatile=True)
             got_l = tl.load(mine + l_offs, mask=lm, other=arrived, volatile=True)
-            waiting = (tl.sum(((got_o >> 32).to(tl.int32) != ecol[None, :]).to(tl.int32)) +
-                       tl.sum(((got_l >> 32).to(tl.int32) != ecol[None, :]).to(tl.int32)))
+            waiting = tl.sum(((got_o >> 32).to(tl.int32) != ecol[None, :]).to(tl.int32)) + tl.sum(
+                ((got_l >> 32).to(tl.int32) != ecol[None, :]).to(tl.int32)
+            )
         nxt = ecol + 1
         tl.store(state_ptr + r * P + cp, tl.where(nxt == 0, 2, nxt), mask=first)
         # every column of partial p carries that partial's LSE (column p * DW holds the packet)
         lbits = tl.where(lm, got_l.to(tl.int32), 0)
         lse_full = tl.zeros([G, P * DW], dtype=tl.float32)
         for p in tl.static_range(P):
-            lse_p = tl.sum(tl.where(cp[None, :] == p, lbits, 0), axis=1).to(tl.float32, bitcast=True)
+            lse_p = tl.sum(tl.where(cp[None, :] == p, lbits, 0), axis=1).to(
+                tl.float32, bitcast=True
+            )
             lse_full = tl.where(cp[None, :] == p, lse_p[:, None], lse_full)
         ok = lse_full > float("-inf")
         if HAS_VALID:
@@ -981,7 +1191,9 @@ class TPGroupExchange:
     (released once the exchange's own predecessors have completed: the consumer may read their outputs
     before its wait, the exchange output only after it)."""
 
-    def __init__(self, mapping, buffers: _PeerBuffers, group_size: int, max_words: int, num_channels: int):
+    def __init__(
+        self, mapping, buffers: _PeerBuffers, group_size: int, max_words: int, num_channels: int
+    ):
         self.group_size = group_size
         self.group = mapping.tp_rank // group_size
         self.grank = mapping.tp_rank % group_size
@@ -992,27 +1204,41 @@ class TPGroupExchange:
         device = torch.device("cuda", torch.cuda.current_device())
         self.channel_bytes = 2 * group_size * max_words * 8
         members = [self.group * group_size + i for i in range(group_size)]
-        table = [[buffers.peer_ptrs[r] + c * self.channel_bytes for r in members] for c in range(num_channels)]
+        table = [
+            [buffers.peer_ptrs[r] + c * self.channel_bytes for r in members]
+            for c in range(num_channels)
+        ]
         self._peers = torch.tensor(table, dtype=torch.int64, device=device)
         # One epoch per (channel, block of 256 words); 0 = never sent, the first launch uses 1.
-        self._state = torch.ones((num_channels, triton.cdiv(max_words, 256)), dtype=torch.int32, device=device)
+        self._state = torch.ones(
+            (num_channels, triton.cdiv(max_words, 256)), dtype=torch.int32, device=device
+        )
         # alltoall_merge: one epoch per (channel, row position). A channel serves either the block-epoch
         # calls (allgather / alltoall) or alltoall_merge, never both (positions would alias across epochs).
-        self._merge_state = torch.ones((num_channels, _MERGE_MAX_ROWS), dtype=torch.int32, device=device)
+        self._merge_state = torch.ones(
+            (num_channels, _MERGE_MAX_ROWS), dtype=torch.int32, device=device
+        )
         self._channel_kind: Dict[int, str] = {}
         self._num_sms = torch.cuda.get_device_properties(device).multi_processor_count
         from ..flashinfer_utils import get_env_enable_pdl
+
         self._pdl = get_env_enable_pdl()
 
     @classmethod
-    def create(cls, mapping, group_size: int = 4, max_bytes: Optional[int] = None,
-               num_channels: int = 4) -> Optional["TPGroupExchange"]:
+    def create(
+        cls, mapping, group_size: int = 4, max_bytes: Optional[int] = None, num_channels: int = 4
+    ) -> Optional["TPGroupExchange"]:
         """Collective over the whole TP group. ``max_bytes``: largest per-(source, destination) payload
         (default TRTLLM_Q35_CP_EXCHANGE_KB, 256 KiB; CP-lite decode attention at b32 with MTP6 needs ~463 KiB)."""
         if max_bytes is None:
             max_bytes = int(os.environ.get("TRTLLM_Q35_CP_EXCHANGE_KB", "256")) * 1024
-        if (mapping.tp_size % group_size or group_size not in (2, 4, 8) or mapping.enable_attention_dp
-                or mapping.has_pp() or mapping.cp_size > 1):
+        if (
+            mapping.tp_size % group_size
+            or group_size not in (2, 4, 8)
+            or mapping.enable_attention_dp
+            or mapping.has_pp()
+            or mapping.cp_size > 1
+        ):
             return None
         max_words = max_bytes // 4
         buffers = _PeerBuffers.create(mapping, num_channels * 2 * group_size * max_words * 8)
@@ -1032,10 +1258,21 @@ class TPGroupExchange:
             raise ValueError(f"channel {channel} out of range ({self.num_channels} channels)")
         prev = self._channel_kind.setdefault(channel, kind)
         if prev != kind:
-            raise ValueError(f"channel {channel} already carries {prev} exchanges; use another channel for {kind}")
+            raise ValueError(
+                f"channel {channel} already carries {prev} exchanges; use another channel for {kind}"
+            )
 
-    def _launch(self, src_words, out_words, n_words, row_words, out_row_stride, src_dest_stride, channel,
-                trigger=False):
+    def _launch(
+        self,
+        src_words,
+        out_words,
+        n_words,
+        row_words,
+        out_row_stride,
+        src_dest_stride,
+        channel,
+        trigger=False,
+    ):
         self._use_channel(channel, "block")
         if not 0 < n_words <= self.max_words:
             raise ValueError(f"payload of {n_words} words exceeds {self.max_words}")
@@ -1043,7 +1280,7 @@ class TPGroupExchange:
         num_blocks = triton.cdiv(n_words, block)
         # TRTLLM_Q35_CP_GROUP_GRID=<k> (default 1): up to k programs per SM (one block each up to k x SMs blocks)
         grid_mult = int(os.environ.get("TRTLLM_Q35_CP_GROUP_GRID", "1"))
-        _ll_group_kernel[(min(num_blocks, grid_mult * self._num_sms), )](
+        _ll_group_kernel[(min(num_blocks, grid_mult * self._num_sms),)](
             src_words,
             out_words,
             self._state[channel],
@@ -1075,11 +1312,9 @@ class TPGroupExchange:
             return 2
         raise ValueError(f"unknown trigger mode {trigger!r}")
 
-    def allgather(self,
-                  x: torch.Tensor,
-                  out: Optional[torch.Tensor] = None,
-                  channel: int = 0,
-                  trigger=False) -> torch.Tensor:
+    def allgather(
+        self, x: torch.Tensor, out: Optional[torch.Tensor] = None, channel: int = 0, trigger=False
+    ) -> torch.Tensor:
         """``[rows, *rest]`` per member -> ``[rows, G * prod(rest)]`` (member-major along the last dim);
         e.g. q ``[T, 4, 256]`` -> ``[T, 16 * 256]`` (view it as ``[T, 16, 256]``)."""
         assert x.is_contiguous()
@@ -1087,17 +1322,25 @@ class TPGroupExchange:
         row_bytes = x[0].numel() * x.element_size() if rows else 0
         assert row_bytes % 4 == 0
         if out is None:
-            out = torch.empty((rows, self.group_size * x[0].numel()), dtype=x.dtype, device=x.device)
+            out = torch.empty(
+                (rows, self.group_size * x[0].numel()), dtype=x.dtype, device=x.device
+            )
         row_words = row_bytes // 4
-        self._launch(x.view(torch.int32), out.view(torch.int32), rows * row_words, row_words,
-                     self.group_size * row_words, 0, channel, trigger)
+        self._launch(
+            x.view(torch.int32),
+            out.view(torch.int32),
+            rows * row_words,
+            row_words,
+            self.group_size * row_words,
+            0,
+            channel,
+            trigger,
+        )
         return out
 
-    def alltoall(self,
-                 x: torch.Tensor,
-                 out: Optional[torch.Tensor] = None,
-                 channel: int = 1,
-                 trigger=False) -> torch.Tensor:
+    def alltoall(
+        self, x: torch.Tensor, out: Optional[torch.Tensor] = None, channel: int = 1, trigger=False
+    ) -> torch.Tensor:
         """``x`` [G, ...]: chunk ``x[d]`` goes to member ``d``; returns ``out`` [G, ...] with ``out[s]``
         the chunk member ``s`` sent to this rank."""
         assert x.is_contiguous() and x.shape[0] == self.group_size
@@ -1109,16 +1352,18 @@ class TPGroupExchange:
         self._launch(x.view(torch.int32), out.view(torch.int32), n, n, 0, n, channel, trigger)
         return out
 
-    def alltoall_merge(self,
-                       o: torch.Tensor,
-                       lse: torch.Tensor,
-                       out: torch.Tensor,
-                       gate: Optional[torch.Tensor] = None,
-                       channel: int = 1,
-                       early_trigger: Optional[bool] = None,
-                       extra_o: Optional[torch.Tensor] = None,
-                       extra_lse: Optional[torch.Tensor] = None,
-                       valid: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def alltoall_merge(
+        self,
+        o: torch.Tensor,
+        lse: torch.Tensor,
+        out: torch.Tensor,
+        gate: Optional[torch.Tensor] = None,
+        channel: int = 1,
+        early_trigger: Optional[bool] = None,
+        extra_o: Optional[torch.Tensor] = None,
+        extra_lse: Optional[torch.Tensor] = None,
+        valid: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """All-to-all of LSE-weighted partials + their merge, one launch.
 
         ``o`` [G, P, T, Hh, D] BF16 (or [G, T, Hh, D] for P = 1) and ``lse`` [G, P, T, Hh] FP32 (base 2): this
@@ -1137,19 +1382,29 @@ class TPGroupExchange:
             o = o.unsqueeze(1)
         if lse.dim() == 3:
             lse = lse.unsqueeze(1)
-        assert o.dim() == 5 and o.shape[0] == G and o.dtype == torch.bfloat16, "o: [G, P, T, Hh, D] bf16"
+        assert o.dim() == 5 and o.shape[0] == G and o.dtype == torch.bfloat16, (
+            "o: [G, P, T, Hh, D] bf16"
+        )
         _, P, T, HH, D = o.shape
         assert P in (1, 2), "1 or 2 partials per (member, row)"
         assert o.stride(4) == 1 and o.stride(3) == D, "o: Hh / D dims dense"
-        assert D % 2 == 0 and (D // 2) & (D // 2 - 1) == 0 and D >= 32, "D / 2 must be a power of two >= 16"
-        assert tuple(lse.shape) == (G, P, T, HH) and lse.dtype == torch.float32 and lse.stride(3) == 1
+        assert D % 2 == 0 and (D // 2) & (D // 2 - 1) == 0 and D >= 32, (
+            "D / 2 must be a power of two >= 16"
+        )
+        assert (
+            tuple(lse.shape) == (G, P, T, HH) and lse.dtype == torch.float32 and lse.stride(3) == 1
+        )
         assert all(st % 2 == 0 for st in o.stride()[:3]), "o: even BF16 strides"
-        assert tuple(out.shape) == (T, HH, D) and out.dtype == torch.bfloat16 and out.stride(-1) == 1
+        assert (
+            tuple(out.shape) == (T, HH, D) and out.dtype == torch.bfloat16 and out.stride(-1) == 1
+        )
         rows = T * HH
         dw = D // 2
         lse_base = self.max_words - _MERGE_MAX_ROWS
         if rows * P > _MERGE_MAX_ROWS or rows * P * dw > lse_base:
-            raise ValueError(f"alltoall_merge payload of {rows} rows x {P} partials x {D} exceeds the channel slot")
+            raise ValueError(
+                f"alltoall_merge payload of {rows} rows x {P} partials x {D} exceeds the channel slot"
+            )
         if rows == 0:
             return out
         o_w = o.view(torch.int32)
@@ -1165,21 +1420,35 @@ class TPGroupExchange:
         has_extra = extra_o is not None
         if has_extra:
             extra_o = extra_o.view(T, HH, D)
-            assert extra_o.dtype == torch.bfloat16 and extra_o.stride(-1) == 1 and extra_lse is not None
-            assert tuple(extra_lse.shape) == (T, HH) and extra_lse.dtype == torch.float32 and extra_lse.stride(1) == 1
+            assert (
+                extra_o.dtype == torch.bfloat16
+                and extra_o.stride(-1) == 1
+                and extra_lse is not None
+            )
+            assert (
+                tuple(extra_lse.shape) == (T, HH)
+                and extra_lse.dtype == torch.float32
+                and extra_lse.stride(1) == 1
+            )
             xo_w = extra_o.view(torch.int32)
             xl = extra_lse
         else:
             xo_w, xl = dummy_i, out_w.view(torch.float32)
         if valid is not None:
-            assert tuple(valid.shape) == (G, P, T) and valid.dtype == torch.int32 and valid.stride(2) == 1
+            assert (
+                tuple(valid.shape) == (G, P, T)
+                and valid.dtype == torch.int32
+                and valid.stride(2) == 1
+            )
         early = _PDL_EARLY_TRIGGER if early_trigger is None else early_trigger
         # TRTLLM_Q35_CP_MERGE_GRID=<k> (default 1): up to k programs per SM (one wave: every program is resident, so a
         # program polling for a peer's rows never waits on a peer program that is not scheduled);
         # TRTLLM_Q35_CP_MERGE_WARPS=<w> (default up to 4).
         grid_mult = int(os.environ.get("TRTLLM_Q35_CP_MERGE_GRID", "1"))
-        merge_warps = int(os.environ.get("TRTLLM_Q35_CP_MERGE_WARPS", "0")) or max(1, min(4, G * P * dw // 32))
-        _ll_merge_kernel[(min(rows, grid_mult * self._num_sms), )](
+        merge_warps = int(os.environ.get("TRTLLM_Q35_CP_MERGE_WARPS", "0")) or max(
+            1, min(4, G * P * dw // 32)
+        )
+        _ll_merge_kernel[(min(rows, grid_mult * self._num_sms),)](
             o_w,
             o_w.stride(0),
             o_w.stride(1),
@@ -1239,8 +1508,10 @@ def get_tp_group_exchange(mapping, group_size: int = 4) -> Optional[TPGroupExcha
             logger.warning(f"[TPGroupExchange] setup failed: {e}")
             ex = None
         _GROUP_EXCHANGES[key] = ex
-        logger.info(f"[TPGroupExchange] tp_size={mapping.tp_size} group_size={group_size} rank={mapping.tp_rank}: "
-                    f"{'LL exchange over ' + ex.transport if ex is not None else 'unavailable'}")
+        logger.info(
+            f"[TPGroupExchange] tp_size={mapping.tp_size} group_size={group_size} rank={mapping.tp_rank}: "
+            f"{'LL exchange over ' + ex.transport if ex is not None else 'unavailable'}"
+        )
     return _GROUP_EXCHANGES[key]
 
 
@@ -1261,6 +1532,8 @@ def get_tp_key_exchange(mapping) -> Optional[TPKeyExchange]:
             logger.warning(f"[TPKeyExchange] setup failed, keeping NCCL all-gather: {e}")
             ex = None
         _EXCHANGES[key] = ex
-        logger.info(f"[TPKeyExchange] tp_size={mapping.tp_size} rank={mapping.tp_rank}: "
-                    f"{'LL exchange over ' + ex.transport if ex is not None else 'unavailable (NCCL)'}")
+        logger.info(
+            f"[TPKeyExchange] tp_size={mapping.tp_size} rank={mapping.tp_rank}: "
+            f"{'LL exchange over ' + ex.transport if ex is not None else 'unavailable (NCCL)'}"
+        )
     return _EXCHANGES[key]

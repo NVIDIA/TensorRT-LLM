@@ -59,7 +59,7 @@ def test_logits_match_dequantized_reference(m):
     torch.cuda.synchronize()
     ref = _ref_logits(x, values, scales)
     # Exact products, FP32 sums of 4096 terms: bound by a few ulps of sum |x||w|.
-    bound = (x.double().abs() @ mod.dequantize_mxfp8_rows(values, scales).double().abs().T)
+    bound = x.double().abs() @ mod.dequantize_mxfp8_rows(values, scales).double().abs().T
     err = (out.double() - ref).abs()
     assert torch.all(err <= 1e-5 * bound + 1e-6), float((err / (bound + 1e-9)).max())
 
@@ -70,10 +70,11 @@ def test_argmax_keys_match_reference(m):
     w = _weights(N_VOCAB_SHARD, seed=3)
     values, scales = mod.quantize_mxfp8_rows(w)
     x = _acts(m, seed=4)
-    keys = torch.full((m, ), INT64_MIN, dtype=torch.int64, device="cuda")
+    keys = torch.full((m,), INT64_MIN, dtype=torch.int64, device="cuda")
     offset = 5 * N_VOCAB_SHARD
-    mod.mxfp8_head_gemv(x, values, scales, keys.view(torch.int32).view(m, 2), argmax=True,
-                        vocab_offset=offset)
+    mod.mxfp8_head_gemv(
+        x, values, scales, keys.view(torch.int32).view(m, 2), argmax=True, vocab_offset=offset
+    )
     torch.cuda.synchronize()
     ref = _ref_logits(x, values, scales)
     ids = _keys_to_ids(keys) - offset
@@ -100,10 +101,11 @@ def test_keys_match_ll_exchange_packing(m):
     x = _acts(m, seed=42)
     logits = torch.empty((m, N_VOCAB_SHARD), dtype=torch.float32, device="cuda")
     mod.mxfp8_head_gemv(x, values, scales, logits, argmax=False)
-    keys = torch.full((m, ), INT64_MIN, dtype=torch.int64, device="cuda")
+    keys = torch.full((m,), INT64_MIN, dtype=torch.int64, device="cuda")
     offset = 3 * N_VOCAB_SHARD
-    mod.mxfp8_head_gemv(x, values, scales, keys.view(torch.int32).view(m, 2), argmax=True,
-                        vocab_offset=offset)
+    mod.mxfp8_head_gemv(
+        x, values, scales, keys.view(torch.int32).view(m, 2), argmax=True, vocab_offset=offset
+    )
     vmax, imax = torch.max(logits, dim=-1)
     ref = pack_argmax_keys(vmax, imax, offset)
     torch.cuda.synchronize()
@@ -113,8 +115,10 @@ def test_keys_match_ll_exchange_packing(m):
 def test_nvfp4_quantization_grid_and_error():
     """E2M1 rounding to nearest with ties to the even code; block scale = amax / 6 in E4M3 units of g."""
     mod = _mod()
-    vals = torch.tensor([0.0, 0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0, 5.9, -0.75, -6.0, 6.0, 0.1, 1.1, 2.9, 4.4],
-                        device="cuda")
+    vals = torch.tensor(
+        [0.0, 0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0, 5.9, -0.75, -6.0, 6.0, 0.1, 1.1, 2.9, 4.4],
+        device="cuda",
+    )
     # Row 1 sets the tensor amax to 10.5, so g = 10.5 / 2688 = 2^-8 and row 0's block scale (amax 6) is
     # 256 = 2^8 exactly: one E2M1 unit is exactly 1.0 and the ties below are exact ties.
     other = torch.zeros(16, device="cuda")
@@ -125,8 +129,10 @@ def test_nvfp4_quantization_grid_and_error():
     deq = mod.dequantize_nvfp4_rows(packed, scales, g)
     unit = float(scales.view(torch.float8_e4m3fn).float()[0, 0]) * g
     assert unit == 1.0, unit
-    expect = torch.tensor([0.0, 0.0, 1.0, 1.0, 2.0, 2.0, 4.0, 4.0, 6.0, -1.0, -6.0, 6.0, 0.0, 1.0, 3.0, 4.0],
-                          device="cuda")
+    expect = torch.tensor(
+        [0.0, 0.0, 1.0, 1.0, 2.0, 2.0, 4.0, 4.0, 6.0, -1.0, -6.0, 6.0, 0.0, 1.0, 3.0, 4.0],
+        device="cuda",
+    )
     assert torch.equal(deq[0], expect), deq[0]
     # Gaussian rows: NVFP4 relative error ~10 %.
     w = _weights(512, seed=21)
@@ -169,10 +175,11 @@ def test_nvfp4_argmax_keys_match_logits(m):
     x = _acts(m, seed=34)
     logits = torch.empty((m, N_VOCAB_SHARD), dtype=torch.float32, device="cuda")
     mod.nvfp4_head_gemv(x, packed, scales, g, logits, argmax=False)
-    keys = torch.full((m, ), INT64_MIN, dtype=torch.int64, device="cuda")
+    keys = torch.full((m,), INT64_MIN, dtype=torch.int64, device="cuda")
     offset = 2 * N_VOCAB_SHARD
-    mod.nvfp4_head_gemv(x, packed, scales, g, keys.view(torch.int32).view(m, 2), argmax=True,
-                        vocab_offset=offset)
+    mod.nvfp4_head_gemv(
+        x, packed, scales, g, keys.view(torch.int32).view(m, 2), argmax=True, vocab_offset=offset
+    )
     vmax, imax = torch.max(logits, dim=-1)
     ref = pack_argmax_keys(vmax, imax, offset)
     torch.cuda.synchronize()
@@ -186,7 +193,9 @@ def test_nvfp4_draft_head_object(monkeypatch):
     mod = _mod()
     monkeypatch.setenv("TRTLLM_Q35_DRAFT_HEAD_NVFP4", "1")
     w = _weights(N_VOCAB_SHARD, seed=35)
-    head = types.SimpleNamespace(weight=w, out_features=N_VOCAB_SHARD, num_embeddings=N_VOCAB_SHARD, tp_size=1)
+    head = types.SimpleNamespace(
+        weight=w, out_features=N_VOCAB_SHARD, num_embeddings=N_VOCAB_SHARD, tp_size=1
+    )
     dh = mod.Q35DraftHead(head, None)
     assert dh.nvfp4 and dh.values.shape == (N_VOCAB_SHARD, K // 2)
     x = _acts(4, seed=36)
@@ -207,23 +216,24 @@ def test_ties_resolve_to_smallest_id_across_ctas_and_shards():
     w[9000] = win
     w[20000] = win
     values, scales = mod.quantize_mxfp8_rows(w)
-    keys = torch.full((1, ), INT64_MIN, dtype=torch.int64, device="cuda")
+    keys = torch.full((1,), INT64_MIN, dtype=torch.int64, device="cuda")
     mod.mxfp8_head_gemv(x, values, scales, keys.view(torch.int32).view(1, 2), argmax=True)
     torch.cuda.synchronize()
     assert int(_keys_to_ids(keys)[0]) == 9000
     # Shards: the same winner in shards 2 and 6 -> the global id of shard 2.
     shard_keys = []
     for r in range(8):
-        k = torch.full((1, ), INT64_MIN, dtype=torch.int64, device="cuda")
+        k = torch.full((1,), INT64_MIN, dtype=torch.int64, device="cuda")
         wr = _weights(n, seed=100 + r)
         if r in (2, 6):
             wr[123] = win
         v, s = mod.quantize_mxfp8_rows(wr)
-        mod.mxfp8_head_gemv(x, v, s, k.view(torch.int32).view(1, 2), argmax=True,
-                            vocab_offset=r * n)
+        mod.mxfp8_head_gemv(
+            x, v, s, k.view(torch.int32).view(1, 2), argmax=True, vocab_offset=r * n
+        )
         shard_keys.append(k)
     gathered = torch.cat(shard_keys)
-    local = torch.full((1, ), 7, dtype=torch.int64, device="cuda")
+    local = torch.full((1,), 7, dtype=torch.int64, device="cuda")
     tokens = mod.decode_keys(gathered, 8, local)
     torch.cuda.synchronize()
     assert int(tokens[0]) == 2 * n + 123
@@ -241,13 +251,14 @@ def test_sharded_argmax_equals_global_argmax(m, ranks, shard):
     keys = []
     refs = []
     for r in range(ranks):
-        v, s = mod.quantize_mxfp8_rows(w[r * n:(r + 1) * n].contiguous())
-        k = torch.full((m, ), INT64_MIN, dtype=torch.int64, device="cuda")
-        mod.mxfp8_head_gemv(x, v, s, k.view(torch.int32).view(m, 2), argmax=True,
-                            vocab_offset=r * n)
+        v, s = mod.quantize_mxfp8_rows(w[r * n : (r + 1) * n].contiguous())
+        k = torch.full((m,), INT64_MIN, dtype=torch.int64, device="cuda")
+        mod.mxfp8_head_gemv(
+            x, v, s, k.view(torch.int32).view(m, 2), argmax=True, vocab_offset=r * n
+        )
         keys.append(k)
         refs.append(_ref_logits(x, v, s))
-    local = torch.empty((m, ), dtype=torch.int64, device="cuda")
+    local = torch.empty((m,), dtype=torch.int64, device="cuda")
     tokens = mod.decode_keys(torch.cat(keys), ranks, local)
     torch.cuda.synchronize()
     ref = torch.cat(refs, dim=1)
@@ -262,7 +273,7 @@ def test_negative_control_scales_are_used():
     w = _weights(N_VOCAB_SHARD, seed=9)
     x = _acts(1, seed=10)
     values, scales = mod.quantize_mxfp8_rows(w)
-    keys = torch.full((1, ), INT64_MIN, dtype=torch.int64, device="cuda")
+    keys = torch.full((1,), INT64_MIN, dtype=torch.int64, device="cuda")
     mod.mxfp8_head_gemv(x, values, scales, keys.view(torch.int32).view(1, 2), argmax=True)
     base = int(_keys_to_ids(keys)[0])
     ref = _ref_logits(x, values, scales)[0]
@@ -284,14 +295,12 @@ def test_graph_replay_rearms_keys():
     values, scales = mod.quantize_mxfp8_rows(w)
 
     class _Head(mod.Q35DraftHead):
-
         def __init__(self):  # noqa: D401 - test double without an LMHead
             self.values, self.scales = values, scales
             self.vocab_offset = 0
             self.k = K
             self.mapping = None
-            self.keys = torch.full((mod.MAX_ROWS, ), INT64_MIN, dtype=torch.int64,
-                                   device="cuda")
+            self.keys = torch.full((mod.MAX_ROWS,), INT64_MIN, dtype=torch.int64, device="cuda")
             self.slice_blocks = mod.default_slice_blocks(K)
 
     head = _Head()
@@ -329,12 +338,14 @@ def test_pdl_waits_for_a_delayed_producer():
     @triton.jit
     def _late_writer(src, dst, n, delay_ns: tl.constexpr, BLOCK: tl.constexpr):
         gdc_launch_dependents()
-        t0 = tl.inline_asm_elementwise("mov.u64 $0, %globaltimer;", "=l,r", [n], dtype=tl.int64,
-                                       is_pure=False, pack=1)
+        t0 = tl.inline_asm_elementwise(
+            "mov.u64 $0, %globaltimer;", "=l,r", [n], dtype=tl.int64, is_pure=False, pack=1
+        )
         t = t0
         while t - t0 < delay_ns:
-            t = tl.inline_asm_elementwise("mov.u64 $0, %globaltimer;", "=l,r", [n],
-                                          dtype=tl.int64, is_pure=False, pack=1)
+            t = tl.inline_asm_elementwise(
+                "mov.u64 $0, %globaltimer;", "=l,r", [n], dtype=tl.int64, is_pure=False, pack=1
+            )
         offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
         tl.store(dst + offs, tl.load(src + offs, mask=offs < n), mask=offs < n)
 
@@ -347,21 +358,34 @@ def test_pdl_waits_for_a_delayed_producer():
     ref_old = int(_ref_logits(x_old, values, scales).argmax(1)[0])
     assert ref_new != ref_old
     xs = x_old.clone()
-    keys = torch.full((1, ), INT64_MIN, dtype=torch.int64, device="cuda")
+    keys = torch.full((1,), INT64_MIN, dtype=torch.int64, device="cuda")
     mod.mxfp8_head_gemv(xs, values, scales, keys.view(torch.int32).view(1, 2), argmax=True)
+
     def run(skip_wait):
         # Producer and head back to back in one CUDA graph (eager host launch gaps exceed the delay).
-        mod.mxfp8_head_gemv(xs, values, scales, keys.view(torch.int32).view(1, 2), argmax=True,
-                            _debug_skip_wait=skip_wait)
-        _late_writer[(K // 1024, )](x_new, xs, K, delay_ns=200_000, BLOCK=1024)
+        mod.mxfp8_head_gemv(
+            xs,
+            values,
+            scales,
+            keys.view(torch.int32).view(1, 2),
+            argmax=True,
+            _debug_skip_wait=skip_wait,
+        )
+        _late_writer[(K // 1024,)](x_new, xs, K, delay_ns=200_000, BLOCK=1024)
         torch.cuda.synchronize()
         graph = torch.cuda.CUDAGraph()
         stream = torch.cuda.Stream()
         with torch.cuda.stream(stream):
             with torch.cuda.graph(graph, stream=stream):
-                _late_writer[(K // 1024, )](x_new, xs, K, delay_ns=200_000, BLOCK=1024)
-                mod.mxfp8_head_gemv(xs, values, scales, keys.view(torch.int32).view(1, 2),
-                                    argmax=True, _debug_skip_wait=skip_wait)
+                _late_writer[(K // 1024,)](x_new, xs, K, delay_ns=200_000, BLOCK=1024)
+                mod.mxfp8_head_gemv(
+                    xs,
+                    values,
+                    scales,
+                    keys.view(torch.int32).view(1, 2),
+                    argmax=True,
+                    _debug_skip_wait=skip_wait,
+                )
         got = []
         for _ in range(5):
             xs.copy_(x_old)
@@ -386,7 +410,7 @@ def _bench():
     reps = 50
     for m in (1, 2, 4, 8):
         x = _acts(m, seed=32)
-        keys = torch.full((m, ), INT64_MIN, dtype=torch.int64, device="cuda")
+        keys = torch.full((m,), INT64_MIN, dtype=torch.int64, device="cuda")
 
         def bf16():
             logits = torch.nn.functional.linear(x, w)
@@ -401,12 +425,17 @@ def _bench():
             return mod.decode_keys(keys, 1, keys)
 
         def fp8_argmax_only():
-            return mod.mxfp8_head_gemv(x, values, scales, keys.view(torch.int32).view(m, 2),
-                                       argmax=True)
+            return mod.mxfp8_head_gemv(
+                x, values, scales, keys.view(torch.int32).view(m, 2), argmax=True
+            )
 
         res = {}
-        for name, fn in (("bf16_linear+max", bf16), ("fp8_gemv_logits", fp8_logits),
-                         ("fp8_gemv_argmax", fp8_argmax_only), ("fp8_argmax+decode", fp8_argmax)):
+        for name, fn in (
+            ("bf16_linear+max", bf16),
+            ("fp8_gemv_logits", fp8_logits),
+            ("fp8_gemv_argmax", fp8_argmax_only),
+            ("fp8_argmax+decode", fp8_argmax),
+        ):
             fn()
             torch.cuda.synchronize()
             g = torch.cuda.CUDAGraph()
@@ -430,7 +459,9 @@ def _bench():
             ts.sort()
             res[name] = ts[len(ts) // 2]
         print(f"M={m}: " + ", ".join(f"{k} {v:.1f} us" for k, v in res.items()), flush=True)
-    print(f"bytes: bf16 {w.numel() * 2 / 1e6:.1f} MB, fp8 {(values.numel() + scales.numel()) / 1e6:.1f} MB")
+    print(
+        f"bytes: bf16 {w.numel() * 2 / 1e6:.1f} MB, fp8 {(values.numel() + scales.numel()) / 1e6:.1f} MB"
+    )
 
 
 if __name__ == "__main__":

@@ -81,6 +81,7 @@ from ..._utils import binding_to_torch_dtype, mpi_rank, nvtx_range, str_dtype_to
 from ...logger import logger
 from ...mapping import CpType, Mapping
 from ..utils import maybe_compile
+from . import q35_admit_timers
 from .connectors.kv_cache_connector import KvCacheConnectorManager
 from .kv_cache_stats import (
     KVCacheV2IterationStatsReport,
@@ -90,7 +91,6 @@ from .kv_cache_stats import (
     KVCacheV2SsmSnapshotIterationStats,
 )
 from .llm_request import LlmRequest, LlmRequestState, SamplingConfig, get_draft_token_length
-from . import q35_admit_timers
 from .resource_manager import (
     BaseResourceManager,
     CacheTypeCpp,
@@ -2355,7 +2355,8 @@ class KVCacheManagerV2(BaseResourceManager):
                         all_tokens = req.get_tokens(DEFAULT_BEAM_INDEX)
                     else:
                         # TRTLLM_Q35_GEN_ADMIT: without block reuse the prompt tokens are unused; skip the whole-prompt
-                        # C++ -> Python copy (O(prompt) on the executor main thread for every disagg generation arrival).
+                        # C++ -> Python copy (O(prompt) on the executor main thread for every disagg generation
+                        # arrival).
                         all_tokens = None
                         q35_admit_timers.note_lean_skip()
                     if timed:
@@ -2657,7 +2658,9 @@ class KVCacheManagerV2(BaseResourceManager):
                 )
         return tokens
 
-    def _tokens_for_block_reuse(self, req: LlmRequest, start: int, end: int) -> Sequence[TokenIdExt]:
+    def _tokens_for_block_reuse(
+        self, req: LlmRequest, start: int, end: int
+    ) -> Sequence[TokenIdExt]:
         """Beam-0 tokens [start, end) as the radix tree keys them (block commits)."""
         if _Q35_CTX_LEAN_TOKENS and self._q35_is_text_only(req):
             return req.get_tokens_range(DEFAULT_BEAM_INDEX, start, end)

@@ -164,7 +164,12 @@ class HangDetector:
 
     def checkpoint(self):
         """Reset hang detection timer."""
-        if self._checkpoint_min_s > 0 and self.active and self.task is not None and not self.task.done():
+        if (
+            self._checkpoint_min_s > 0
+            and self.active
+            and self.task is not None
+            and not self.task.done()
+        ):
             now = time.monotonic()
             if now - self._last_checkpoint < self._checkpoint_min_s:
                 return

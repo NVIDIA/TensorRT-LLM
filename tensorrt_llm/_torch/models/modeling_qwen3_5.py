@@ -705,7 +705,9 @@ class _Qwen3_5VLModel(Qwen3VLModelBase):
             "mrope_config.mrope_position_deltas",
         ]
 
-    def prepare_mrope_config(self, multimodal_params, num_generation_requests, position_ids, **kwargs):
+    def prepare_mrope_config(
+        self, multimodal_params, num_generation_requests, position_ids, **kwargs
+    ):
         if _Q35_SKIP_MROPE_COS_SIN:
             # position_ids=None skips only the cos/sin table (see _Q35_SKIP_MROPE_COS_SIN).
             position_ids = None

@@ -1131,8 +1131,8 @@ def executor_request_to_llm_request(
         # accessor plus the ctor's ndarray fast path replace both with
         # memcpys (~1.5 ms saved per ~100k-token request on the executor
         # thread). getattr keeps compatibility with older bindings.
-        input_tokens = (getattr(executor_request, "input_token_ids_i32",
-                                None) if _GH18024_BRIDGE_ON else None)
+        input_tokens = (getattr(executor_request, "input_token_ids_i32", None)
+                        if _GH18024_BRIDGE_ON else None)
         global _GH18024_BRIDGE_LOGGED
         if not _GH18024_BRIDGE_LOGGED:
             _GH18024_BRIDGE_LOGGED = True
@@ -1142,7 +1142,8 @@ def executor_request_to_llm_request(
                 if input_tokens is not None else
                 "GH18024: TRTLLM_TOKEN_INGEST_I32=0, token ingest uses the list path"
                 if not _GH18024_BRIDGE_ON else
-                "GH18024: bindings lack input_token_ids_i32, token ingest uses the list path")
+                "GH18024: bindings lack input_token_ids_i32, token ingest uses the list path"
+            )
         if input_tokens is None:
             input_tokens = executor_request.input_token_ids
 

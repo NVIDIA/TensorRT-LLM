@@ -38,11 +38,42 @@ from cutlass import Float32, Int32, Int64, const_expr
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T, dsl_user_op
 
-from .q35_allreduce_norm import (_NEG_ZERO, _PDL_TEST_ENTRY_TRIGGER, VEC, _add, _bf16r, _cluster_sync, _div_rn, _e4m3x2, _fma, _hi,
-                                 _ld_acquire_s32, _ld_s32, _ld_s64, _ld_u16, _ld_v4, _ld_volatile_v4, _lo, _max0, _mul,
-                                 _pack_bf16, _red_release_add_s32, _rsqrt, _sanitize, _sel_ge0, _shfl_bfly,
-                                 _sigmoid_triton, _sink4, _smem_addr, _st_dsmem_f32, _st_s32, _st_shared_f32, _st_v2,
-                                 _st_v4, _ld_shared_f32)
+from .q35_allreduce_norm import (
+    _NEG_ZERO,
+    _PDL_TEST_ENTRY_TRIGGER,
+    VEC,
+    _add,
+    _bf16r,
+    _cluster_sync,
+    _div_rn,
+    _e4m3x2,
+    _fma,
+    _hi,
+    _ld_acquire_s32,
+    _ld_s32,
+    _ld_s64,
+    _ld_shared_f32,
+    _ld_u16,
+    _ld_v4,
+    _ld_volatile_v4,
+    _lo,
+    _max0,
+    _mul,
+    _pack_bf16,
+    _red_release_add_s32,
+    _rsqrt,
+    _sanitize,
+    _sel_ge0,
+    _shfl_bfly,
+    _sigmoid_triton,
+    _sink4,
+    _smem_addr,
+    _st_dsmem_f32,
+    _st_s32,
+    _st_shared_f32,
+    _st_v2,
+    _st_v4,
+)
 from .utils import griddepcontrol_launch_dependents, griddepcontrol_wait
 
 SLOT_STATE_STRIDE = 128  # bytes between per-CTA state words (one L2 line each)
@@ -51,67 +82,141 @@ SLOT_STATE_STRIDE = 128  # bytes between per-CTA state words (one L2 line each)
 @dsl_user_op
 def _globaltimer(*, loc=None, ip=None) -> Int64:
     return Int64(
-        llvm.inline_asm(T.i64(), [], "mov.u64 $0, %globaltimer;", "=l", has_side_effects=True, is_align_stack=False,
-                        asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip))
+        llvm.inline_asm(
+            T.i64(),
+            [],
+            "mov.u64 $0, %globaltimer;",
+            "=l",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
 
 
 @dsl_user_op
 def _st_s64(addr: Int64, value: Int64, *, loc=None, ip=None) -> None:
-    llvm.inline_asm(None, [Int64(addr).ir_value(loc=loc, ip=ip), Int64(value).ir_value(loc=loc, ip=ip)],
-                    "st.global.b64 [$0], $1;", "l,l,~{memory}", has_side_effects=True, is_align_stack=False,
-                    asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip)
+    llvm.inline_asm(
+        None,
+        [Int64(addr).ir_value(loc=loc, ip=ip), Int64(value).ir_value(loc=loc, ip=ip)],
+        "st.global.b64 [$0], $1;",
+        "l,l,~{memory}",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
 
 
 @dsl_user_op
 def _ld_cg_s32(addr: Int64, *, loc=None, ip=None) -> Int32:
     return Int32(
-        llvm.inline_asm(T.i32(), [Int64(addr).ir_value(loc=loc, ip=ip)], "ld.global.cg.b32 $0, [$1];",
-                        "=r,l,~{memory}", has_side_effects=True, is_align_stack=False,
-                        asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip))
+        llvm.inline_asm(
+            T.i32(),
+            [Int64(addr).ir_value(loc=loc, ip=ip)],
+            "ld.global.cg.b32 $0, [$1];",
+            "=r,l,~{memory}",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
 
 
 @dsl_user_op
 def _clock64(*, loc=None, ip=None) -> Int64:
     return Int64(
-        llvm.inline_asm(T.i64(), [], "mov.u64 $0, %clock64;", "=l", has_side_effects=True, is_align_stack=False,
-                        asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip))
+        llvm.inline_asm(
+            T.i64(),
+            [],
+            "mov.u64 $0, %clock64;",
+            "=l",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
 
 
 @dsl_user_op
 def _mbar_init(addr: Int32, count: Int32, *, loc=None, ip=None) -> None:
-    llvm.inline_asm(None, [Int32(addr).ir_value(loc=loc, ip=ip), Int32(count).ir_value(loc=loc, ip=ip)],
-                    "mbarrier.init.shared::cta.b64 [$0], $1;\n\tfence.mbarrier_init.release.cluster;",
-                    "r,r,~{memory}", has_side_effects=True, is_align_stack=False,
-                    asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip)
+    llvm.inline_asm(
+        None,
+        [Int32(addr).ir_value(loc=loc, ip=ip), Int32(count).ir_value(loc=loc, ip=ip)],
+        "mbarrier.init.shared::cta.b64 [$0], $1;\n\tfence.mbarrier_init.release.cluster;",
+        "r,r,~{memory}",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
 
 
 @dsl_user_op
 def _mbar_expect_tx(addr: Int32, nbytes: Int32, *, loc=None, ip=None) -> None:
-    llvm.inline_asm(None, [Int32(addr).ir_value(loc=loc, ip=ip), Int32(nbytes).ir_value(loc=loc, ip=ip)],
-                    "mbarrier.arrive.expect_tx.shared::cta.b64 _, [$0], $1;", "r,r,~{memory}",
-                    has_side_effects=True, is_align_stack=False, asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip)
+    llvm.inline_asm(
+        None,
+        [Int32(addr).ir_value(loc=loc, ip=ip), Int32(nbytes).ir_value(loc=loc, ip=ip)],
+        "mbarrier.arrive.expect_tx.shared::cta.b64 _, [$0], $1;",
+        "r,r,~{memory}",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
 
 
 @dsl_user_op
 def _mbar_try_wait(addr: Int32, parity: Int32, *, loc=None, ip=None) -> Int32:
     return Int32(
-        llvm.inline_asm(T.i32(), [Int32(addr).ir_value(loc=loc, ip=ip), Int32(parity).ir_value(loc=loc, ip=ip)],
-                        "{\n\t.reg .pred p;\n\tmbarrier.try_wait.parity.shared::cta.b64 p, [$1], $2;\n\t"
-                        "selp.u32 $0, 1, 0, p;\n\t}", "=r,r,r,~{memory}", has_side_effects=True,
-                        is_align_stack=False, asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip))
+        llvm.inline_asm(
+            T.i32(),
+            [Int32(addr).ir_value(loc=loc, ip=ip), Int32(parity).ir_value(loc=loc, ip=ip)],
+            "{\n\t.reg .pred p;\n\tmbarrier.try_wait.parity.shared::cta.b64 p, [$1], $2;\n\t"
+            "selp.u32 $0, 1, 0, p;\n\t}",
+            "=r,r,r,~{memory}",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
 
 
 @dsl_user_op
-def _st_async_f32(addr: Int32, mbar: Int32, cta_rank: Int32, value: Float32, *, loc=None, ip=None) -> None:
+def _st_async_f32(
+    addr: Int32, mbar: Int32, cta_rank: Int32, value: Float32, *, loc=None, ip=None
+) -> None:
     """st.async of one f32 into cluster CTA ``cta_rank``'s smem at this CTA's address ``addr``, completing 4 bytes
     of the transaction on that CTA's mbarrier at ``mbar``."""
-    llvm.inline_asm(None, [Int32(addr).ir_value(loc=loc, ip=ip), Int32(mbar).ir_value(loc=loc, ip=ip),
-                           Int32(cta_rank).ir_value(loc=loc, ip=ip), Float32(value).ir_value(loc=loc, ip=ip)],
-                    "{\n\t.reg .b32 ra, rb, v;\n\tmapa.shared::cluster.u32 ra, $0, $2;\n\t"
-                    "mapa.shared::cluster.u32 rb, $1, $2;\n\tmov.b32 v, $3;\n\t"
-                    "st.async.shared::cluster.mbarrier::complete_tx::bytes.b32 [ra], v, [rb];\n\t}",
-                    "r,r,r,f,~{memory}", has_side_effects=True, is_align_stack=False,
-                    asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip)
+    llvm.inline_asm(
+        None,
+        [
+            Int32(addr).ir_value(loc=loc, ip=ip),
+            Int32(mbar).ir_value(loc=loc, ip=ip),
+            Int32(cta_rank).ir_value(loc=loc, ip=ip),
+            Float32(value).ir_value(loc=loc, ip=ip),
+        ],
+        "{\n\t.reg .b32 ra, rb, v;\n\tmapa.shared::cluster.u32 ra, $0, $2;\n\t"
+        "mapa.shared::cluster.u32 rb, $1, $2;\n\tmov.b32 v, $3;\n\t"
+        "st.async.shared::cluster.mbarrier::complete_tx::bytes.b32 [ra], v, [rb];\n\t}",
+        "r,r,r,f,~{memory}",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
 
 
 def _tree_sum_smem(red_addr, n: int):
@@ -135,10 +240,28 @@ class Q35Ar2Kernel:
     ``own`` = this rank's unicast base, ``mcast`` = multicast base, ``ctl`` = buffer_flags (``flags``) or the
     per-CTA state array (``slot``), ``dbg`` = int64 [grid * 8] (``stamps``)."""
 
-    def __init__(self, *, hidden: int, norm_eps: float, nranks: int, ctas: int, use_pdl: bool, se_fold: bool,
-                 norm_out: bool, quant: bool, moe_topk: int = 0, fc2_row: int = 0, proto: str = "slot",
-                 rotate: str = "end", stamps: bool = False, region_bytes: int = 0,
-                 lean: bool = True, xchg: str = "cluster", push: str = "mc", two_shot: bool = False):
+    def __init__(
+        self,
+        *,
+        hidden: int,
+        norm_eps: float,
+        nranks: int,
+        ctas: int,
+        use_pdl: bool,
+        se_fold: bool,
+        norm_out: bool,
+        quant: bool,
+        moe_topk: int = 0,
+        fc2_row: int = 0,
+        proto: str = "slot",
+        rotate: str = "end",
+        stamps: bool = False,
+        region_bytes: int = 0,
+        lean: bool = True,
+        xchg: str = "cluster",
+        push: str = "mc",
+        two_shot: bool = False,
+    ):
         if hidden % (VEC * ctas) or (hidden // VEC // ctas) % 32 or hidden // VEC // ctas > 1024:
             raise ValueError(f"unsupported hidden size {hidden} for {ctas} CTAs per token")
         if nranks not in (2, 4, 8, 16) or ctas not in (1, 2, 4, 8):
@@ -165,7 +288,11 @@ class Q35Ar2Kernel:
         self.region_bytes = region_bytes
         # lean: the CTA-level sum of the warp sums without the butterfly's zero steps (same additions, same order)
         self.lean = lean
-        if xchg not in ("cluster", "mbar") or push not in ("mc", "uc") or (push == "uc" and proto != "slot"):
+        if (
+            xchg not in ("cluster", "mbar")
+            or push not in ("mc", "uc")
+            or (push == "uc" and proto != "slot")
+        ):
             raise ValueError("bad exchange / push options")
         # xchg: the norm's cross-CTA sum by barrier.cluster ("cluster") or st.async + mbarrier ("mbar")
         self.xchg = xchg if ctas > 1 else "cluster"
@@ -179,13 +306,51 @@ class Q35Ar2Kernel:
         self.two_shot = two_shot
 
     @cute.jit
-    def __call__(self, gX: cute.Tensor, gRouted: cute.Tensor, gShared: cute.Tensor, gGate: cute.Tensor,
-                 gRes: cute.Tensor, gW: cute.Tensor, gScale: cute.Tensor, gResOut: cute.Tensor, gOut: cute.Tensor,
-                 gQuant: cute.Tensor, own: Int64, mcast: Int64, ctl: Int64, fc2_ptr: Int64, topw_ptr: Int64,
-                 perm_ptr: Int64, dbg: Int64, peers: Int64, rank: Int32, stream) -> None:
+    def __call__(
+        self,
+        gX: cute.Tensor,
+        gRouted: cute.Tensor,
+        gShared: cute.Tensor,
+        gGate: cute.Tensor,
+        gRes: cute.Tensor,
+        gW: cute.Tensor,
+        gScale: cute.Tensor,
+        gResOut: cute.Tensor,
+        gOut: cute.Tensor,
+        gQuant: cute.Tensor,
+        own: Int64,
+        mcast: Int64,
+        ctl: Int64,
+        fc2_ptr: Int64,
+        topw_ptr: Int64,
+        perm_ptr: Int64,
+        dbg: Int64,
+        peers: Int64,
+        rank: Int32,
+        stream,
+    ) -> None:
         m = cute.size(gRes, mode=[0])
-        self.kernel(gX, gRouted, gShared, gGate, gRes, gW, gScale, gResOut, gOut, gQuant, own, mcast, ctl, fc2_ptr,
-                    topw_ptr, perm_ptr, dbg, peers, rank).launch(
+        self.kernel(
+            gX,
+            gRouted,
+            gShared,
+            gGate,
+            gRes,
+            gW,
+            gScale,
+            gResOut,
+            gOut,
+            gQuant,
+            own,
+            mcast,
+            ctl,
+            fc2_ptr,
+            topw_ptr,
+            perm_ptr,
+            dbg,
+            peers,
+            rank,
+        ).launch(
             grid=[m * self.ctas, 1, 1],
             block=[self.threads, 1, 1],
             cluster=[self.ctas, 1, 1],
@@ -195,10 +360,28 @@ class Q35Ar2Kernel:
         )
 
     @cute.kernel
-    def kernel(self, gX: cute.Tensor, gRouted: cute.Tensor, gShared: cute.Tensor, gGate: cute.Tensor,
-               gRes: cute.Tensor, gW: cute.Tensor, gScale: cute.Tensor, gResOut: cute.Tensor, gOut: cute.Tensor,
-               gQuant: cute.Tensor, own: Int64, mcast: Int64, ctl: Int64, fc2_ptr: Int64, topw_ptr: Int64,
-               perm_ptr: Int64, dbg: Int64, peers: Int64, rank: Int32) -> None:
+    def kernel(
+        self,
+        gX: cute.Tensor,
+        gRouted: cute.Tensor,
+        gShared: cute.Tensor,
+        gGate: cute.Tensor,
+        gRes: cute.Tensor,
+        gW: cute.Tensor,
+        gScale: cute.Tensor,
+        gResOut: cute.Tensor,
+        gOut: cute.Tensor,
+        gQuant: cute.Tensor,
+        own: Int64,
+        mcast: Int64,
+        ctl: Int64,
+        fc2_ptr: Int64,
+        topw_ptr: Int64,
+        perm_ptr: Int64,
+        dbg: Int64,
+        peers: Int64,
+        rank: Int32,
+    ) -> None:
         tidx, _, _ = cute.arch.thread_idx()
         bid, _, _ = cute.arch.block_idx()
         grid, _, _ = cute.arch.grid_dim()
@@ -218,9 +401,9 @@ class Q35Ar2Kernel:
         cbase = dbase + Int64(64)  # clock64 stamps: entry, poll, sums, warp, cta, cluster, out, end
 
         smem = cutlass.utils.SmemAllocator()
-        red = smem.allocate_tensor(Float32, cute.make_layout((num_warps, )), byte_alignment=16)
-        csum = smem.allocate_tensor(Float32, cute.make_layout((ctas, )), byte_alignment=16)
-        fl = smem.allocate_tensor(Int32, cute.make_layout((8, )), byte_alignment=16)
+        red = smem.allocate_tensor(Float32, cute.make_layout((num_warps,)), byte_alignment=16)
+        csum = smem.allocate_tensor(Float32, cute.make_layout((ctas,)), byte_alignment=16)
+        fl = smem.allocate_tensor(Int32, cute.make_layout((8,)), byte_alignment=16)
         red_addr = _smem_addr(red.iterator)
         csum_addr = _smem_addr(csum.iterator)
 
@@ -232,7 +415,7 @@ class Q35Ar2Kernel:
         if const_expr(self.xchg == "mbar"):
             # one transaction barrier per CTA for the norm's cross-CTA sums; initialized cluster-wide before any
             # CTA can send (smem / cluster state only: allowed ahead of the dependency wait)
-            mb = smem.allocate_tensor(Int64, cute.make_layout((1, )), byte_alignment=8)
+            mb = smem.allocate_tensor(Int64, cute.make_layout((1,)), byte_alignment=8)
             mbar_addr = _smem_addr(mb.iterator)
             if tidx == 0:
                 _mbar_init(mbar_addr, Int32(1))
@@ -250,8 +433,8 @@ class Q35Ar2Kernel:
         # ---- ahead of the dependency wait: the norm weight (a parameter) ----
         w0, w1, w2, w3 = _ld_v4(Int64(gW.iterator.toint()) + Int64(vi) * Int64(16))
         topk: cutlass.Constexpr = self.moe_topk
-        pk = cute.make_rmem_tensor((max(topk, 1), ), Int32)
-        wk = cute.make_rmem_tensor((max(topk, 1), ), Int32)
+        pk = cute.make_rmem_tensor((max(topk, 1),), Int32)
+        wk = cute.make_rmem_tensor((max(topk, 1),), Int32)
 
         if const_expr(self.use_pdl):
             griddepcontrol_wait()
@@ -298,23 +481,29 @@ class Q35Ar2Kernel:
         # ---- the shared-expert combine (and the MoE finalize) of the input ----
         if const_expr(self.se_fold):
             if const_expr(topk > 0):
-                ev = cute.make_rmem_tensor((topk * 4, ), Int32)
+                ev = cute.make_rmem_tensor((topk * 4,), Int32)
                 for k in cutlass.range_constexpr(topk):
-                    e0, e1, e2, e3 = _ld_v4(fc2_ptr + (Int64(_max0(pk[k])) * Int64(self.fc2_row) +
-                                                       Int64(vi) * Int64(VEC)) * Int64(2))
+                    e0, e1, e2, e3 = _ld_v4(
+                        fc2_ptr
+                        + (Int64(_max0(pk[k])) * Int64(self.fc2_row) + Int64(vi) * Int64(VEC))
+                        * Int64(2)
+                    )
                     ev[4 * k + 0] = e0
                     ev[4 * k + 1] = e1
                     ev[4 * k + 2] = e2
                     ev[4 * k + 3] = e3
-                acc = cute.make_rmem_tensor((VEC, ), Float32)
+                acc = cute.make_rmem_tensor((VEC,), Float32)
                 for e in cutlass.range_constexpr(VEC):
                     acc[e] = Float32(0.0)
                 for k in cutlass.range_constexpr(topk):
                     wf = _lo(wk[k])
                     for i in cutlass.range_constexpr(4):
-                        acc[2 * i] = _sel_ge0(pk[k], _fma(wf, _lo(ev[4 * k + i]), acc[2 * i]), acc[2 * i])
-                        acc[2 * i + 1] = _sel_ge0(pk[k], _fma(wf, _hi(ev[4 * k + i]), acc[2 * i + 1]),
-                                                  acc[2 * i + 1])
+                        acc[2 * i] = _sel_ge0(
+                            pk[k], _fma(wf, _lo(ev[4 * k + i]), acc[2 * i]), acc[2 * i]
+                        )
+                        acc[2 * i + 1] = _sel_ge0(
+                            pk[k], _fma(wf, _hi(ev[4 * k + i]), acc[2 * i + 1]), acc[2 * i + 1]
+                        )
                 f0 = _pack_bf16(acc[0], acc[1])
                 f1 = _pack_bf16(acc[2], acc[3])
                 f2 = _pack_bf16(acc[4], acc[5])
@@ -356,25 +545,49 @@ class Q35Ar2Kernel:
                 _red_release_add_s32(ctl + Int64(32), Int32(1))
             data_off = Int64(cur) * buf_bytes
             # one multicast store reaches every rank's current buffer ([rank][token][H])
-            _st_v4(mcast + data_off + (Int64(rank) * tot + idx) * Int64(16), _sanitize(x0), _sanitize(x1),
-                   _sanitize(x2), _sanitize(x3))
+            _st_v4(
+                mcast + data_off + (Int64(rank) * tot + idx) * Int64(16),
+                _sanitize(x0),
+                _sanitize(x1),
+                _sanitize(x2),
+                _sanitize(x3),
+            )
             poll_base = own + data_off + idx * Int64(16)
         else:
             slot_cnt = fl[0]
             q = slot_cnt % Int32(3)
-            blk = Int64(bid) * Int64((nranks + 1) * threads * 16)  # [W scatter / one-shot slots][1 broadcast slot]
+            blk = Int64(bid) * Int64(
+                (nranks + 1) * threads * 16
+            )  # [W scatter / one-shot slots][1 broadcast slot]
             data_off = Int64(q) * Int64(self.region_bytes) + blk
             if const_expr(self.two_shot):
-                _st_v4(owner_base + data_off + (Int64(rank) * Int64(threads) + Int64(tidx)) * Int64(16),
-                       _sanitize(x0), _sanitize(x1), _sanitize(x2), _sanitize(x3))
+                _st_v4(
+                    owner_base
+                    + data_off
+                    + (Int64(rank) * Int64(threads) + Int64(tidx)) * Int64(16),
+                    _sanitize(x0),
+                    _sanitize(x1),
+                    _sanitize(x2),
+                    _sanitize(x3),
+                )
             elif const_expr(self.push == "uc"):
                 sx0, sx1, sx2, sx3 = _sanitize(x0), _sanitize(x1), _sanitize(x2), _sanitize(x3)
                 for r in cutlass.range_constexpr(nranks):
-                    _st_v4(pb[r] + data_off + (Int64(rank) * Int64(threads) + Int64(tidx)) * Int64(16), sx0, sx1,
-                           sx2, sx3)
+                    _st_v4(
+                        pb[r] + data_off + (Int64(rank) * Int64(threads) + Int64(tidx)) * Int64(16),
+                        sx0,
+                        sx1,
+                        sx2,
+                        sx3,
+                    )
             else:
-                _st_v4(mcast + data_off + (Int64(rank) * Int64(threads) + Int64(tidx)) * Int64(16), _sanitize(x0),
-                       _sanitize(x1), _sanitize(x2), _sanitize(x3))
+                _st_v4(
+                    mcast + data_off + (Int64(rank) * Int64(threads) + Int64(tidx)) * Int64(16),
+                    _sanitize(x0),
+                    _sanitize(x1),
+                    _sanitize(x2),
+                    _sanitize(x3),
+                )
             poll_base = own + data_off + Int64(tidx) * Int64(16)
         if const_expr(self.stamps):
             if tidx == 0:
@@ -402,9 +615,15 @@ class Q35Ar2Kernel:
             if tidx == 0:
                 _st_s32(ctl + Int64(bid) * Int64(SLOT_STATE_STRIDE), slot_cnt + Int32(1))
             pq = (slot_cnt + Int32(2)) % Int32(3)
-            pbase = own + Int64(pq) * Int64(self.region_bytes) + Int64(bid) * Int64((nranks + 1) * threads * 16) + \
-                Int64(tidx) * Int64(16)
-            for r in cutlass.range_constexpr(nranks + 1):  # one-shot and two-shot slots of that participation
+            pbase = (
+                own
+                + Int64(pq) * Int64(self.region_bytes)
+                + Int64(bid) * Int64((nranks + 1) * threads * 16)
+                + Int64(tidx) * Int64(16)
+            )
+            for r in cutlass.range_constexpr(
+                nranks + 1
+            ):  # one-shot and two-shot slots of that participation
                 _st_v4(pbase + Int64(r * threads * 16), neg0, neg0, neg0, neg0)
         if const_expr(self.stamps):
             if tidx == 0:
@@ -414,7 +633,7 @@ class Q35Ar2Kernel:
         rstride = tot * Int64(16)
         if const_expr(self.proto == "slot"):
             rstride = Int64(threads * 16)
-        got = cute.make_rmem_tensor((nranks * 4, ), Int32)
+        got = cute.make_rmem_tensor((nranks * 4,), Int32)
         rotated = Int32(0)
         pending = Int32(1)
         if const_expr(self.two_shot):
@@ -437,7 +656,7 @@ class Q35Ar2Kernel:
                             pend_o = Int32(1)
                         if d1 == neg0:
                             pend_o = Int32(1)
-                rsum = cute.make_rmem_tensor((4, ), Int32)
+                rsum = cute.make_rmem_tensor((4,), Int32)
                 for i in cutlass.range_constexpr(4):
                     slo = Float32(0.0)
                     shi = Float32(0.0)
@@ -445,8 +664,13 @@ class Q35Ar2Kernel:
                         slo = _add(slo, _lo(got[r * 4 + i]))
                         shi = _add(shi, _hi(got[r * 4 + i]))
                     rsum[i] = _sanitize(_pack_bf16(slo, shi))
-                _st_v4(mcast + data_off + Int64(nranks * threads * 16) + Int64(tidx) * Int64(16), rsum[0], rsum[1],
-                       rsum[2], rsum[3])
+                _st_v4(
+                    mcast + data_off + Int64(nranks * threads * 16) + Int64(tidx) * Int64(16),
+                    rsum[0],
+                    rsum[1],
+                    rsum[2],
+                    rsum[3],
+                )
             # every rank: the reduced vector in its broadcast slot
             while pending != 0:
                 pending = Int32(0)
@@ -502,7 +726,7 @@ class Q35Ar2Kernel:
         # ---- FP32 sum in rank order -> BF16; + residual (BF16) ----
         rw = (r0, r1, r2, r3)
         ww = (w0, w1, w2, w3)
-        res = cute.make_rmem_tensor((VEC, ), Float32)
+        res = cute.make_rmem_tensor((VEC,), Float32)
         if const_expr(self.two_shot):
             for i in cutlass.range_constexpr(4):
                 res[2 * i] = _bf16r(_add(_lo(got[i]), _lo(rw[i])))
@@ -517,8 +741,13 @@ class Q35Ar2Kernel:
                 res[2 * i] = _bf16r(_add(_bf16r(lo), _lo(rw[i])))
                 res[2 * i + 1] = _bf16r(_add(_bf16r(hi), _hi(rw[i])))
         out_off = Int64(gResOut.iterator.toint()) + row_off
-        _st_v4(out_off, _pack_bf16(res[0], res[1]), _pack_bf16(res[2], res[3]), _pack_bf16(res[4], res[5]),
-               _pack_bf16(res[6], res[7]))
+        _st_v4(
+            out_off,
+            _pack_bf16(res[0], res[1]),
+            _pack_bf16(res[2], res[3]),
+            _pack_bf16(res[4], res[5]),
+            _pack_bf16(res[6], res[7]),
+        )
         if const_expr(self.stamps):
             if tidx == 0:
                 _st_s64(cbase + Int64(16), _clock64())
@@ -566,7 +795,7 @@ class Q35Ar2Kernel:
             if tidx == 0:
                 _st_s64(cbase + Int64(40), _clock64())
         rstd = _rsqrt(_add(_div_rn(total, Float32(float(self.hidden))), Float32(self.norm_eps)))
-        y = cute.make_rmem_tensor((VEC, ), Float32)
+        y = cute.make_rmem_tensor((VEC,), Float32)
         for i in cutlass.range_constexpr(4):
             if const_expr(self.two_shot):  # rmsNormLamport: (w * x) * rstd
                 y[2 * i] = _bf16r(_mul(_mul(_lo(ww[i]), res[2 * i]), rstd))
@@ -575,16 +804,24 @@ class Q35Ar2Kernel:
                 y[2 * i] = _bf16r(_mul(_mul(res[2 * i], rstd), _lo(ww[i])))
                 y[2 * i + 1] = _bf16r(_mul(_mul(res[2 * i + 1], rstd), _hi(ww[i])))
         if const_expr(self.norm_out):
-            _st_v4(Int64(gOut.iterator.toint()) + row_off, _pack_bf16(y[0], y[1]), _pack_bf16(y[2], y[3]),
-                   _pack_bf16(y[4], y[5]), _pack_bf16(y[6], y[7]))
+            _st_v4(
+                Int64(gOut.iterator.toint()) + row_off,
+                _pack_bf16(y[0], y[1]),
+                _pack_bf16(y[2], y[3]),
+                _pack_bf16(y[4], y[5]),
+                _pack_bf16(y[6], y[7]),
+            )
         if const_expr(self.quant):
             inv = _div_rn(Float32(1.0), gScale[0])
             q01 = _e4m3x2(_mul(y[0], inv), _mul(y[1], inv))
             q23 = _e4m3x2(_mul(y[2], inv), _mul(y[3], inv))
             q45 = _e4m3x2(_mul(y[4], inv), _mul(y[5], inv))
             q67 = _e4m3x2(_mul(y[6], inv), _mul(y[7], inv))
-            _st_v2(Int64(gQuant.iterator.toint()) + (Int64(tok) * Int64(vecs) + Int64(vi)) * Int64(8),
-                   q01 | (q23 << 16), q45 | (q67 << 16))
+            _st_v2(
+                Int64(gQuant.iterator.toint()) + (Int64(tok) * Int64(vecs) + Int64(vi)) * Int64(8),
+                q01 | (q23 << 16),
+                q45 | (q67 << 16),
+            )
         if const_expr(self.stamps):
             if tidx == 0:
                 _st_s64(dbase + Int64(48), _globaltimer())

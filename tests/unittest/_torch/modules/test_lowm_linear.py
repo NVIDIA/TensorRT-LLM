@@ -49,8 +49,10 @@ def _assert_close(y, ref, tol=1.6e-2):
 
 
 @pytest.mark.parametrize("m", [1, 7, 9, 14, 28])
-@pytest.mark.parametrize("n,k,tactic", [(2560, 4096, (4, 1)), (2560, 4096, (16, 4)),
-                                        (4096, 1024, (8, 2)), (2560, 4096, (8, 2, 1, 1))])
+@pytest.mark.parametrize(
+    "n,k,tactic",
+    [(2560, 4096, (4, 1)), (2560, 4096, (16, 4)), (4096, 1024, (8, 2)), (2560, 4096, (8, 2, 1, 1))],
+)
 def test_fp8_and_in_register_quant(m, n, k, tactic):
     """FP8 activations match the dequantized reference; BF16 activations quantized in registers give the
     same FP8 values as the static quantize kernel (bitwise equal outputs); a different scale changes them."""
@@ -58,11 +60,17 @@ def test_fp8_and_in_register_quant(m, n, k, tactic):
     x = _act(m, k, 2)
     s_in = _scale(x)
     q = _squant(x, s_in)
-    y8 = L.lowm_gemm(x8=q, w_fp8=w, weight_scale=s_w, input_scale=s_in, fp8_act="fp8", tactic=tactic)
+    y8 = L.lowm_gemm(
+        x8=q, w_fp8=w, weight_scale=s_w, input_scale=s_in, fp8_act="fp8", tactic=tactic
+    )
     _assert_close(y8, (q.float() @ w.float().t()) * (s_in * s_w))
-    yq = L.lowm_gemm(x16=x, w_fp8=w, weight_scale=s_w, input_scale=s_in, fp8_act="quant", tactic=tactic)
+    yq = L.lowm_gemm(
+        x16=x, w_fp8=w, weight_scale=s_w, input_scale=s_in, fp8_act="quant", tactic=tactic
+    )
     assert torch.equal(y8, yq)
-    yb = L.lowm_gemm(x16=x, w_fp8=w, weight_scale=s_w, input_scale=s_in * 1.01, fp8_act="quant", tactic=tactic)
+    yb = L.lowm_gemm(
+        x16=x, w_fp8=w, weight_scale=s_w, input_scale=s_in * 1.01, fp8_act="quant", tactic=tactic
+    )
     assert not torch.equal(yb, yq)
 
 
@@ -72,18 +80,30 @@ def test_bf16_segments_and_mixed_launch(m):
     x = _act(m, 4096, 3, outliers=False)
     wb = _bf16_weight(512, 4096, 4)
     _assert_close(L.lowm_gemm(x16=x, w_bf16=wb), x.float() @ wb.float().t())
-    wq = _bf16_weight(2560, 4096, 9)  # MTP qkv: swapped (16, 2) at M <= 8, (8, 2, min_blocks 2) up to 16
+    wq = _bf16_weight(
+        2560, 4096, 9
+    )  # MTP qkv: swapped (16, 2) at M <= 8, (8, 2, min_blocks 2) up to 16
     _assert_close(L.lowm_gemm(x16=x, w_bf16=wq), x.float() @ wq.float().t())
     big = _act(m, 8 * 1024, 5, outliers=False)
-    xs = big[:, 3 * 1024:4 * 1024]
+    xs = big[:, 3 * 1024 : 4 * 1024]
     wf = _bf16_weight(4096, 1024, 6)
     _assert_close(L.lowm_gemm(x16=xs, w_bf16=wf), xs.float() @ wf.float().t())
     w, s_w = _fp8_weight(2560, 4096, 7)
     wba = _bf16_weight(16, 4096, 8)
     s_in = _scale(x)
-    a, b = L.lowm_gemm(x16=x, w_fp8=w, weight_scale=s_w, input_scale=s_in, w_bf16=wba, split_out=2560,
-                       tactic=(16, 4), tactic_bf16=(16, 1))
-    assert torch.equal(a, L.lowm_gemm(x16=x, w_fp8=w, weight_scale=s_w, input_scale=s_in, tactic=(16, 4)))
+    a, b = L.lowm_gemm(
+        x16=x,
+        w_fp8=w,
+        weight_scale=s_w,
+        input_scale=s_in,
+        w_bf16=wba,
+        split_out=2560,
+        tactic=(16, 4),
+        tactic_bf16=(16, 1),
+    )
+    assert torch.equal(
+        a, L.lowm_gemm(x16=x, w_fp8=w, weight_scale=s_w, input_scale=s_in, tactic=(16, 4))
+    )
     assert torch.equal(b, L.lowm_gemm(x16=x, w_bf16=wba, tactic_bf16=(16, 1)))
 
 
@@ -100,11 +120,26 @@ def test_shared_expert_launch(m):
     s_in = _scale(x)
     gate_w = torch.zeros(8, k, dtype=torch.bfloat16, device="cuda")
     gate_w[:1] = _bf16_weight(1, k, 12)
-    gu = torch.ops.trtllm.cublas_scaled_mm(_squant(x, s_in), w_gu.t(), scale_a=s_in.reshape(1),
-                                           scale_b=s_gu.reshape(1), bias=None, out_dtype=torch.bfloat16)
+    gu = torch.ops.trtllm.cublas_scaled_mm(
+        _squant(x, s_in),
+        w_gu.t(),
+        scale_a=s_in.reshape(1),
+        scale_b=s_gu.reshape(1),
+        bias=None,
+        out_dtype=torch.bfloat16,
+    )
     ref_h8 = torch.ops.trtllm.silu_and_mul(gu, scale=s_dn_in.reshape(1), dtype=torch.float8_e4m3fn)
-    h8, gate = L.lowm_gemm(x16=x, w_fp8=L.swiglu_pairs(w_gu), weight_scale=s_gu, input_scale=s_in, swiglu_fp8=True,
-                           w_bf16=gate_w, split_out=inter, n_valid=inter + 1, out_scale=s_dn_in)
+    h8, gate = L.lowm_gemm(
+        x16=x,
+        w_fp8=L.swiglu_pairs(w_gu),
+        weight_scale=s_gu,
+        input_scale=s_in,
+        swiglu_fp8=True,
+        w_bf16=gate_w,
+        split_out=inter,
+        n_valid=inter + 1,
+        out_scale=s_dn_in,
+    )
     assert h8.dtype == torch.float8_e4m3fn and gate.shape == (m, 1) and gate.is_contiguous()
     codes = (h8.view(torch.uint8).int() - ref_h8.view(torch.uint8).int()).abs()
     assert (codes == 0).float().mean().item() > 0.97 and codes.max().item() <= 1
@@ -126,8 +161,12 @@ def test_tp16_shapes_with_table_tactics(m):
         ref = (q.float() @ w.float().t()) * (s_in * s_w)
         assert L.lowm_rows_ok(m, n, kk, "fp8") == (m <= {1280: 32, 1536: 32, 4096: 16}[n])
         assert L.lowm_rows_ok(m, n, kk, "quant") == (m <= 32)
-        _assert_close(L.lowm_gemm(x8=q, w_fp8=w, weight_scale=s_w, input_scale=s_in, fp8_act="fp8"), ref)
-        _assert_close(L.lowm_gemm(x16=x, w_fp8=w, weight_scale=s_w, input_scale=s_in, fp8_act="quant"), ref)
+        _assert_close(
+            L.lowm_gemm(x8=q, w_fp8=w, weight_scale=s_w, input_scale=s_in, fp8_act="fp8"), ref
+        )
+        _assert_close(
+            L.lowm_gemm(x16=x, w_fp8=w, weight_scale=s_w, input_scale=s_in, fp8_act="quant"), ref
+        )
     x = _act(m, k, 42)
     s_in = _scale(x)
     q = _squant(x, s_in)
@@ -137,9 +176,18 @@ def test_tp16_shapes_with_table_tactics(m):
         if not L.lowm_rows_ok(m, 1280, k, mode):
             continue
         tac = L.default_tactic(m, 1280, k, mode=mode)
-        a, b = L.lowm_gemm(x16=x, x8=q if act == "fp8" else None, w_fp8=w, weight_scale=s_w, input_scale=s_in,
-                           fp8_act=act, w_bf16=wba, split_out=1280, tactic=tac,
-                           tactic_bf16=(tac[0], 1, tac[2] if len(tac) > 2 else 1))
+        a, b = L.lowm_gemm(
+            x16=x,
+            x8=q if act == "fp8" else None,
+            w_fp8=w,
+            weight_scale=s_w,
+            input_scale=s_in,
+            fp8_act=act,
+            w_bf16=wba,
+            split_out=1280,
+            tactic=tac,
+            tactic_bf16=(tac[0], 1, tac[2] if len(tac) > 2 else 1),
+        )
         _assert_close(a, (q.float() @ w.float().t()) * (s_in * s_w))
         _assert_close(b, x.float() @ wba.float().t())
     for n, kk in ((8, 4096), (1536, 4096), (4096, 512)):
@@ -163,20 +211,41 @@ def test_shared_expert_module_path(monkeypatch, m, inter):
     from tensorrt_llm.quantization.mode import QuantAlgo
 
     k = 4096  # inter 128 / 64: the per-rank shared expert at TP8 / TP16
-    mlp = GatedMLP(hidden_size=k, intermediate_size=inter, bias=False, dtype=torch.bfloat16,
-                   config=ModelConfig(quant_config=QuantConfig(quant_algo=QuantAlgo.FP8)),
-                   reduce_output=False, is_shared_expert=True).cuda()
+    mlp = GatedMLP(
+        hidden_size=k,
+        intermediate_size=inter,
+        bias=False,
+        dtype=torch.bfloat16,
+        config=ModelConfig(quant_config=QuantConfig(quant_algo=QuantAlgo.FP8)),
+        reduce_output=False,
+        is_shared_expert=True,
+    ).cuda()
     assert mlp.down_proj.lora is not None
     gate = Linear(k, 1, bias=False, dtype=torch.bfloat16, quant_config=None).cuda()
     x = _act(m, k, 30)
     s_in = _scale(x)
     s_w = torch.tensor(1.7e-3, device="cuda").reshape(1)
-    mlp.gate_up_proj.load_weights([{"weight": _fp8_weight(inter, k, seed)[0], "weight_scale": s_w,
-                                    "input_scale": s_in.reshape(1)} for seed in (31, 32)])
+    mlp.gate_up_proj.load_weights(
+        [
+            {
+                "weight": _fp8_weight(inter, k, seed)[0],
+                "weight_scale": s_w,
+                "input_scale": s_in.reshape(1),
+            }
+            for seed in (31, 32)
+        ]
+    )
     gu = mlp.gate_up_proj(x).float()
     s_dn_in = _scale(F.silu(gu[:, :inter]) * gu[:, inter:])
-    mlp.down_proj.load_weights([{"weight": _fp8_weight(k, inter, 33)[0], "weight_scale": s_w,
-                                 "input_scale": s_dn_in.reshape(1)}])
+    mlp.down_proj.load_weights(
+        [
+            {
+                "weight": _fp8_weight(k, inter, 33)[0],
+                "weight_scale": s_w,
+                "input_scale": s_dn_in.reshape(1),
+            }
+        ]
+    )
     gate.load_weights([{"weight": _bf16_weight(1, k, 34)}])
     blk = Qwen3NextSparseMoeBlock.__new__(Qwen3NextSparseMoeBlock)
     torch.nn.Module.__init__(blk)
@@ -208,7 +277,9 @@ def test_ksplit_and_swap_deterministic(tactic):
     y = L.lowm_gemm(x16=x, w_fp8=w, weight_scale=s_w, input_scale=s_in, tactic=tactic)
     _assert_close(y, (q.float() @ w.float().t()) * (s_in * s_w))
     for _ in range(3):
-        assert torch.equal(y, L.lowm_gemm(x16=x, w_fp8=w, weight_scale=s_w, input_scale=s_in, tactic=tactic))
+        assert torch.equal(
+            y, L.lowm_gemm(x16=x, w_fp8=w, weight_scale=s_w, input_scale=s_in, tactic=tactic)
+        )
 
 
 @pytest.mark.parametrize("early", ["0", "1"])
@@ -252,11 +323,14 @@ def test_delayed_producer_pdl():
     @triton.jit
     def _spin_then_copy(dst, src, n, spin_ns, BLOCK: tl.constexpr):
         tl.extra.cuda.gdc_launch_dependents()
-        t0 = tl.inline_asm_elementwise("mov.u64 $0, %globaltimer;", "=l", [], dtype=tl.int64, is_pure=False, pack=1)
+        t0 = tl.inline_asm_elementwise(
+            "mov.u64 $0, %globaltimer;", "=l", [], dtype=tl.int64, is_pure=False, pack=1
+        )
         t = t0
         while t - t0 < spin_ns:
-            t = tl.inline_asm_elementwise("mov.u64 $0, %globaltimer;", "=l", [], dtype=tl.int64, is_pure=False,
-                                          pack=1)
+            t = tl.inline_asm_elementwise(
+                "mov.u64 $0, %globaltimer;", "=l", [], dtype=tl.int64, is_pure=False, pack=1
+            )
         offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
         mask = offs < n
         tl.store(dst + offs, tl.load(src + offs, mask=mask), mask=mask)
@@ -273,8 +347,12 @@ def test_delayed_producer_pdl():
         for _ in range(5):
             x.zero_()
             torch.cuda.synchronize()
-            _spin_then_copy[(triton.cdiv(src.numel(), 1024),)](x, src, src.numel(), 200_000, BLOCK=1024)
-            y = L.lowm_gemm(x16=x, w_fp8=w, weight_scale=s_w, input_scale=s_in, _unsafe_skip_wait=skip)
+            _spin_then_copy[(triton.cdiv(src.numel(), 1024),)](
+                x, src, src.numel(), 200_000, BLOCK=1024
+            )
+            y = L.lowm_gemm(
+                x16=x, w_fp8=w, weight_scale=s_w, input_scale=s_in, _unsafe_skip_wait=skip
+            )
             torch.cuda.synchronize()
             fresh += int(torch.equal(y, expected))
         results[skip] = fresh
@@ -307,20 +385,39 @@ def test_gdn_conv_epilogue_bitwise(tp16, n, pad):
         slots[-1] = -1
     tac = L.default_tactic(m, proj, k, mode="mixed8")
     assert L.lowm_conv_supported(m, tac, cd, t)
-    kw = dict(x16=x, x8=q, w_fp8=w, weight_scale=s_w, input_scale=s_in, fp8_act="fp8", w_bf16=wba,
-              split_out=proj, tactic=tac, tactic_bf16=(tac[0], 1, tac[2] if len(tac) > 2 else 1))
+    kw = dict(
+        x16=x,
+        x8=q,
+        w_fp8=w,
+        weight_scale=s_w,
+        input_scale=s_in,
+        fp8_act="fp8",
+        w_bf16=wba,
+        split_out=proj,
+        tactic=tac,
+        tactic_bf16=(tac[0], 1, tac[2] if len(tac) > 2 else 1),
+    )
     raw, ba = L.lowm_gemm(**kw)
     st_ref = state0.clone()
     win_ref = torch.zeros(n, t, cd, 3, dtype=torch.bfloat16, device="cuda")
-    ref = causal_conv1d_update(raw[:, :cd].reshape(n, t, cd).transpose(1, 2), st_ref, conv_w, None, "silu",
-                               conv_state_indices=slots, intermediate_conv_window=win_ref,
-                               intermediate_state_indices=torch.arange(n, dtype=torch.int32, device="cuda"))
+    ref = causal_conv1d_update(
+        raw[:, :cd].reshape(n, t, cd).transpose(1, 2),
+        st_ref,
+        conv_w,
+        None,
+        "silu",
+        conv_state_indices=slots,
+        intermediate_conv_window=win_ref,
+        intermediate_state_indices=torch.arange(n, dtype=torch.int32, device="cuda"),
+    )
     ref = ref.transpose(1, 2).reshape(m, cd)
     valid = (slots >= 0).repeat_interleave(t)
 
     def epilogue(weight):
         st, win = state0.clone(), torch.zeros_like(win_ref)
-        out, out_ba = L.lowm_gemm(**kw, conv=dict(weight=weight, state=st, slots=slots, windows=win, tokens=t))
+        out, out_ba = L.lowm_gemm(
+            **kw, conv=dict(weight=weight, state=st, slots=slots, windows=win, tokens=t)
+        )
         return out, out_ba, st, win
 
     got, got_ba, st, win = epilogue(conv_w)
@@ -357,12 +454,20 @@ def test_linear_hook(monkeypatch):
     from tensorrt_llm.models.modeling_utils import QuantConfig
     from tensorrt_llm.quantization.mode import QuantAlgo
 
-    lin = Linear(4096, 2560, bias=False, dtype=torch.bfloat16, quant_config=QuantConfig(quant_algo=QuantAlgo.FP8))
+    lin = Linear(
+        4096,
+        2560,
+        bias=False,
+        dtype=torch.bfloat16,
+        quant_config=QuantConfig(quant_algo=QuantAlgo.FP8),
+    )
     lin = lin.cuda()
     w, s_w = _fp8_weight(2560, 4096, 20)
     x = _act(7, 4096, 21)
     s_in = _scale(x)
-    lin.load_weights([{"weight": w, "weight_scale": s_w.reshape(1), "input_scale": s_in.reshape(1)}])
+    lin.load_weights(
+        [{"weight": w, "weight_scale": s_w.reshape(1), "input_scale": s_in.reshape(1)}]
+    )
     ref = lin(x)
     lin._q35_lowm = "test"
     monkeypatch.setenv("TRTLLM_Q35_LOWM_FP8", "1")

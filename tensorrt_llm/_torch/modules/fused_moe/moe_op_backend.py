@@ -410,11 +410,16 @@ class TRTLLMOpBackend(MoEOpBackend):
                     output=output,
                     tune_max_num_tokens=tune_max_num_tokens,
                     use_dp=use_dp,
-                    **(dict(prerouted=prerouted[0],
+                    **(
+                        dict(
+                            prerouted=prerouted[0],
                             prerouted_tile=prerouted[1],
                             prerouted_ids=prerouted[2],
-                            prerouted_weights=prerouted[3])
-                       if prerouted is not None else {}),
+                            prerouted_weights=prerouted[3],
+                        )
+                        if prerouted is not None
+                        else {}
+                    ),
                 )
                 if not do_finalize:
                     if prerouted is not None and outputs[1].numel() == 0:

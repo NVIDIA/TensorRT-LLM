@@ -38,10 +38,33 @@ import cutlass.cute as cute
 from cutlass import BFloat16, Float32, Int32, Int64, Uint8, const_expr
 
 from .lowm_mma_gemm import CHUNK, N_TILE, LowMMmaGemmKernel, _rcp_rn
-from .q35_allreduce_norm import (_PDL_TEST_ENTRY_TRIGGER, VEC, _NEG_ZERO, _add, _bf16r, _div_rn, _e4m3x2, _hi, _ld_acquire_s32, _ld_s64,
-                                 _ld_v4, _ld_volatile_s32, _ld_volatile_v4, _lo, _mul, _pack_bf16,
-                                 _red_release_add_s32, _rsqrt, _sanitize, _shfl_bfly, _sink4, _smem_addr, _st_s32,
-                                 _st_v2, _st_v4)
+from .q35_allreduce_norm import (
+    _NEG_ZERO,
+    _PDL_TEST_ENTRY_TRIGGER,
+    VEC,
+    _add,
+    _bf16r,
+    _div_rn,
+    _e4m3x2,
+    _hi,
+    _ld_acquire_s32,
+    _ld_s64,
+    _ld_v4,
+    _ld_volatile_s32,
+    _ld_volatile_v4,
+    _lo,
+    _mul,
+    _pack_bf16,
+    _red_release_add_s32,
+    _rsqrt,
+    _sanitize,
+    _shfl_bfly,
+    _sink4,
+    _smem_addr,
+    _st_s32,
+    _st_v2,
+    _st_v4,
+)
 from .utils import griddepcontrol_launch_dependents, griddepcontrol_wait
 
 try:
@@ -56,57 +79,119 @@ from cutlass.cutlass_dsl import T, dsl_user_op  # noqa: E402
 @dsl_user_op
 def _ld_volatile_s64(addr: Int64, *, loc=None, ip=None) -> Int64:
     return Int64(
-        llvm.inline_asm(T.i64(), [Int64(addr).ir_value(loc=loc, ip=ip)], "ld.volatile.global.b64 $0, [$1];",
-                        "=l,l,~{memory}", has_side_effects=True, is_align_stack=False,
-                        asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip))
+        llvm.inline_asm(
+            T.i64(),
+            [Int64(addr).ir_value(loc=loc, ip=ip)],
+            "ld.volatile.global.b64 $0, [$1];",
+            "=l,l,~{memory}",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
 
 
 @dsl_user_op
 def _st_s64(addr: Int64, value: Int64, *, loc=None, ip=None) -> None:
-    llvm.inline_asm(None, [Int64(addr).ir_value(loc=loc, ip=ip), Int64(value).ir_value(loc=loc, ip=ip)],
-                    "st.global.b64 [$0], $1;", "l,l,~{memory}", has_side_effects=True, is_align_stack=False,
-                    asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip)
+    llvm.inline_asm(
+        None,
+        [Int64(addr).ir_value(loc=loc, ip=ip), Int64(value).ir_value(loc=loc, ip=ip)],
+        "st.global.b64 [$0], $1;",
+        "l,l,~{memory}",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
 
 
 @dsl_user_op
 def _f32_bits(x: Float32, *, loc=None, ip=None) -> Int32:
     return Int32(
-        llvm.inline_asm(T.i32(), [Float32(x).ir_value(loc=loc, ip=ip)], "mov.b32 $0, $1;", "=r,f",
-                        has_side_effects=False, is_align_stack=False, asm_dialect=llvm.AsmDialect.AD_ATT,
-                        loc=loc, ip=ip))
+        llvm.inline_asm(
+            T.i32(),
+            [Float32(x).ir_value(loc=loc, ip=ip)],
+            "mov.b32 $0, $1;",
+            "=r,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
 
 
 @dsl_user_op
 def _bits_f32(x: Int32, *, loc=None, ip=None) -> Float32:
     return Float32(
-        llvm.inline_asm(T.f32(), [Int32(x).ir_value(loc=loc, ip=ip)], "mov.b32 $0, $1;", "=f,r",
-                        has_side_effects=False, is_align_stack=False, asm_dialect=llvm.AsmDialect.AD_ATT,
-                        loc=loc, ip=ip))
+        llvm.inline_asm(
+            T.f32(),
+            [Int32(x).ir_value(loc=loc, ip=ip)],
+            "mov.b32 $0, $1;",
+            "=f,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
 
 
 @dsl_user_op
 def _packet(epoch: Int32, bits: Int32, *, loc=None, ip=None) -> Int64:
     """(epoch << 32) | bits."""
     return Int64(
-        llvm.inline_asm(T.i64(), [Int32(epoch).ir_value(loc=loc, ip=ip), Int32(bits).ir_value(loc=loc, ip=ip)],
-                        "mov.b64 $0, {$2, $1};", "=l,r,r", has_side_effects=False, is_align_stack=False,
-                        asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip))
+        llvm.inline_asm(
+            T.i64(),
+            [Int32(epoch).ir_value(loc=loc, ip=ip), Int32(bits).ir_value(loc=loc, ip=ip)],
+            "mov.b64 $0, {$2, $1};",
+            "=l,r,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
 
 
 @dsl_user_op
 def _pk_tag(p: Int64, *, loc=None, ip=None) -> Int32:
     return Int32(
-        llvm.inline_asm(T.i32(), [Int64(p).ir_value(loc=loc, ip=ip)], "{\n\t.reg .b32 lo;\n\tmov.b64 {lo, $0}, $1;\n\t}",
-                        "=r,l", has_side_effects=False, is_align_stack=False, asm_dialect=llvm.AsmDialect.AD_ATT,
-                        loc=loc, ip=ip))
+        llvm.inline_asm(
+            T.i32(),
+            [Int64(p).ir_value(loc=loc, ip=ip)],
+            "{\n\t.reg .b32 lo;\n\tmov.b64 {lo, $0}, $1;\n\t}",
+            "=r,l",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
 
 
 @dsl_user_op
 def _pk_val(p: Int64, *, loc=None, ip=None) -> Int32:
     return Int32(
-        llvm.inline_asm(T.i32(), [Int64(p).ir_value(loc=loc, ip=ip)], "{\n\t.reg .b32 hi;\n\tmov.b64 {$0, hi}, $1;\n\t}",
-                        "=r,l", has_side_effects=False, is_align_stack=False, asm_dialect=llvm.AsmDialect.AD_ATT,
-                        loc=loc, ip=ip))
+        llvm.inline_asm(
+            T.i32(),
+            [Int64(p).ir_value(loc=loc, ip=ip)],
+            "{\n\t.reg .b32 hi;\n\tmov.b64 {$0, hi}, $1;\n\t}",
+            "=r,l",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
 
 
 @dsl_user_op
@@ -116,24 +201,51 @@ def _smem_u32(ptr, *, loc=None, ip=None) -> Int32:
 
 @dsl_user_op
 def _st_shared_b32(addr: Int32, v: Int32, *, loc=None, ip=None) -> None:
-    llvm.inline_asm(None, [Int32(addr).ir_value(loc=loc, ip=ip), Int32(v).ir_value(loc=loc, ip=ip)],
-                    "st.shared.b32 [$0], $1;", "r,r,~{memory}", has_side_effects=True, is_align_stack=False,
-                    asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip)
+    llvm.inline_asm(
+        None,
+        [Int32(addr).ir_value(loc=loc, ip=ip), Int32(v).ir_value(loc=loc, ip=ip)],
+        "st.shared.b32 [$0], $1;",
+        "r,r,~{memory}",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
 
 
 @dsl_user_op
 def _ld_shared_b32(addr: Int32, *, loc=None, ip=None) -> Int32:
     return Int32(
-        llvm.inline_asm(T.i32(), [Int32(addr).ir_value(loc=loc, ip=ip)], "ld.shared.b32 $0, [$1];",
-                        "=r,r,~{memory}", has_side_effects=True, is_align_stack=False,
-                        asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip))
+        llvm.inline_asm(
+            T.i32(),
+            [Int32(addr).ir_value(loc=loc, ip=ip)],
+            "ld.shared.b32 $0, [$1];",
+            "=r,r,~{memory}",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
 
 
 @dsl_user_op
 def _globaltimer(*, loc=None, ip=None) -> Int64:
     return Int64(
-        llvm.inline_asm(T.i64(), [], "mov.u64 $0, %globaltimer;", "=l", has_side_effects=True, is_align_stack=False,
-                        asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip))
+        llvm.inline_asm(
+            T.i64(),
+            [],
+            "mov.u64 $0, %globaltimer;",
+            "=l",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
 
 
 MAX_ROWS = 32  # rows of one launch (the partial-sum exchange keeps one FP32 per row per thread)
@@ -143,18 +255,44 @@ PART_SLOT_ROWS = 64  # rows per slot of the partial-sum buffer
 class Q35GemmArNormKernel(LowMMmaGemmKernel):
     """``num_rows`` x K (per rank) @ [H, K].T, all-reduced over ``nranks``, + residual, RMSNorm."""
 
-    def __init__(self, *, num_rows: int, k_extent: int, k_warps: int, n_tiles: int, swap_ab: bool, fp8_act: str,
-                 hidden: int, norm_eps: float, nranks: int, use_pdl: bool, min_blocks: int = 2,
-                 norm_out: bool = True, quant: bool = False, max_ctas: int = 1024, stamps: bool = False,
-                 row_ar: bool = True, two_shot: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        num_rows: int,
+        k_extent: int,
+        k_warps: int,
+        n_tiles: int,
+        swap_ab: bool,
+        fp8_act: str,
+        hidden: int,
+        norm_eps: float,
+        nranks: int,
+        use_pdl: bool,
+        min_blocks: int = 2,
+        norm_out: bool = True,
+        quant: bool = False,
+        max_ctas: int = 1024,
+        stamps: bool = False,
+        row_ar: bool = True,
+        two_shot: bool = False,
+    ) -> None:
         if not 1 <= num_rows <= MAX_ROWS:
             raise ValueError(f"num_rows={num_rows} must be in [1, {MAX_ROWS}]")
         if nranks not in (2, 4, 8, 16):
             raise ValueError("unsupported group size")
         if (N_TILE * n_tiles) % VEC:
             raise ValueError("a CTA's columns must be whole 16-byte vectors")
-        super().__init__(num_rows=num_rows, k_extent=k_extent, k_warps=k_warps, use_pdl=use_pdl, n_fp8=hidden,
-                         n_tiles=n_tiles, fp8_act=fp8_act, swap_ab=swap_ab, min_blocks=min_blocks)
+        super().__init__(
+            num_rows=num_rows,
+            k_extent=k_extent,
+            k_warps=k_warps,
+            use_pdl=use_pdl,
+            n_fp8=hidden,
+            n_tiles=n_tiles,
+            fp8_act=fp8_act,
+            swap_ab=swap_ab,
+            min_blocks=min_blocks,
+        )
         self.hidden = hidden
         self.norm_eps = float(norm_eps)
         self.nranks = nranks
@@ -164,7 +302,9 @@ class Q35GemmArNormKernel(LowMMmaGemmKernel):
         if self.ctas > max_ctas:
             raise ValueError(f"{self.ctas} CTAs exceed the partial-sum buffer ({max_ctas})")
         self.max_ctas = max_ctas
-        self.stamps = stamps  # debug: %globaltimer of 8 phase boundaries per CTA into gDbg [ctas, 8]
+        self.stamps = (
+            stamps  # debug: %globaltimer of 8 phase boundaries per CTA into gDbg [ctas, 8]
+        )
         self.vpr = N_TILE * n_tiles // VEC  # 16-byte vectors of a row in one CTA
         self.threads = 32 * k_warps
         if num_rows * self.vpr > self.threads:
@@ -174,7 +314,9 @@ class Q35GemmArNormKernel(LowMMmaGemmKernel):
         # partial-sum exchange.
         self.row_ar = row_ar
         self.vpt = (hidden // VEC) // self.threads if row_ar else 1
-        if row_ar and ((hidden // VEC) % self.threads or not 1 <= self.vpt <= 4 or num_rows > self.ctas):
+        if row_ar and (
+            (hidden // VEC) % self.threads or not 1 <= self.vpt <= 4 or num_rows > self.ctas
+        ):
             raise ValueError("row_ar: hidden / 8 must be 1-4 vectors per thread, rows <= CTAs")
         # two_shot (row_ar only): the library's / CuTe two-shot data movement. Each GEMM tile row goes (unicast)
         # into the SCATTER stage [t / W][rank][H] of row t's owner (rank t % W), whose row CTA sums the ranks in
@@ -186,20 +328,61 @@ class Q35GemmArNormKernel(LowMMmaGemmKernel):
             raise ValueError("two_shot needs row_ar")
 
     @cute.jit
-    def __call__(self, gA16: cute.Tensor, gA8: cute.Tensor, gB: cute.Tensor, gSw: cute.Tensor, gSin: cute.Tensor,
-                 gRes: cute.Tensor, gW: cute.Tensor, gScale: cute.Tensor, gResOut: cute.Tensor, gOut: cute.Tensor,
-                 gQuant: cute.Tensor, gWs: cute.Tensor, gPart: cute.Tensor, gEpoch: cute.Tensor, gDbg: cute.Tensor,
-                 rank: Int32, stream) -> None:
+    def __call__(
+        self,
+        gA16: cute.Tensor,
+        gA8: cute.Tensor,
+        gB: cute.Tensor,
+        gSw: cute.Tensor,
+        gSin: cute.Tensor,
+        gRes: cute.Tensor,
+        gW: cute.Tensor,
+        gScale: cute.Tensor,
+        gResOut: cute.Tensor,
+        gOut: cute.Tensor,
+        gQuant: cute.Tensor,
+        gWs: cute.Tensor,
+        gPart: cute.Tensor,
+        gEpoch: cute.Tensor,
+        gDbg: cute.Tensor,
+        rank: Int32,
+        stream,
+    ) -> None:
         from .lowm_mma_gemm import _g2r_atom
+
         copy_a16 = _g2r_atom(BFloat16, streaming=False)
         copy_a8 = _g2r_atom(Uint8, streaming=False)
         copy_b = _g2r_atom(Uint8, streaming=True)
         cols = N_TILE * self.n_tiles
-        smem = self.k_warps * self.row_tiles * 16 * cols * 4 + self.row_tiles * 16 * cols * 2 + 64 + 128
+        smem = (
+            self.k_warps * self.row_tiles * 16 * cols * 4
+            + self.row_tiles * 16 * cols * 2
+            + 64
+            + 128
+        )
         if self.row_ar:
             smem += self.k_warps * 4 + 32
-            self.kernel(gA16, gA8, gB, gSw, gSin, gRes, gW, gScale, gResOut, gOut, gQuant, gWs, gPart, gEpoch, gDbg,
-                        rank, copy_a16, copy_a8, copy_b).launch(
+            self.kernel(
+                gA16,
+                gA8,
+                gB,
+                gSw,
+                gSin,
+                gRes,
+                gW,
+                gScale,
+                gResOut,
+                gOut,
+                gQuant,
+                gWs,
+                gPart,
+                gEpoch,
+                gDbg,
+                rank,
+                copy_a16,
+                copy_a8,
+                copy_b,
+            ).launch(
                 grid=[self.ctas, 1, 1],
                 block=[self.threads, 1, 1],
                 smem=smem,
@@ -208,9 +391,32 @@ class Q35GemmArNormKernel(LowMMmaGemmKernel):
                 min_blocks_per_mp=self.min_blocks,
             )
         else:
-            smem += self.num_rows * self.vpr * 4 + (self.k_warps + 1) * MAX_ROWS * 4 + self.num_rows * self.ctas * 4
-            self.kernel(gA16, gA8, gB, gSw, gSin, gRes, gW, gScale, gResOut, gOut, gQuant, gWs, gPart, gEpoch, gDbg,
-                        rank, copy_a16, copy_a8, copy_b).launch(
+            smem += (
+                self.num_rows * self.vpr * 4
+                + (self.k_warps + 1) * MAX_ROWS * 4
+                + self.num_rows * self.ctas * 4
+            )
+            self.kernel(
+                gA16,
+                gA8,
+                gB,
+                gSw,
+                gSin,
+                gRes,
+                gW,
+                gScale,
+                gResOut,
+                gOut,
+                gQuant,
+                gWs,
+                gPart,
+                gEpoch,
+                gDbg,
+                rank,
+                copy_a16,
+                copy_a8,
+                copy_b,
+            ).launch(
                 grid=[self.ctas, 1, 1],
                 block=[self.threads, 1, 1],
                 smem=smem,
@@ -220,10 +426,28 @@ class Q35GemmArNormKernel(LowMMmaGemmKernel):
             )
 
     @cute.kernel
-    def kernel(self, gA16: cute.Tensor, gA8: cute.Tensor, gB: cute.Tensor, gSw: cute.Tensor, gSin: cute.Tensor,
-               gRes: cute.Tensor, gW: cute.Tensor, gScale: cute.Tensor, gResOut: cute.Tensor, gOut: cute.Tensor,
-               gQuant: cute.Tensor, gWs: cute.Tensor, gPart: cute.Tensor, gEpoch: cute.Tensor, gDbg: cute.Tensor,
-               rank: Int32, copy_a16: cute.CopyAtom, copy_a8: cute.CopyAtom, copy_b: cute.CopyAtom) -> None:
+    def kernel(
+        self,
+        gA16: cute.Tensor,
+        gA8: cute.Tensor,
+        gB: cute.Tensor,
+        gSw: cute.Tensor,
+        gSin: cute.Tensor,
+        gRes: cute.Tensor,
+        gW: cute.Tensor,
+        gScale: cute.Tensor,
+        gResOut: cute.Tensor,
+        gOut: cute.Tensor,
+        gQuant: cute.Tensor,
+        gWs: cute.Tensor,
+        gPart: cute.Tensor,
+        gEpoch: cute.Tensor,
+        gDbg: cute.Tensor,
+        rank: Int32,
+        copy_a16: cute.CopyAtom,
+        copy_a8: cute.CopyAtom,
+        copy_b: cute.CopyAtom,
+    ) -> None:
         tidx, _, _ = cute.arch.thread_idx()
         cta, _, _ = cute.arch.block_idx()
         warp = tidx // 32
@@ -248,22 +472,33 @@ class Q35GemmArNormKernel(LowMMmaGemmKernel):
         smem = _SmemAllocator()
         red = smem.allocate_tensor(
             Float32,
-            cute.make_layout((k_warps, row_tiles * 16, cols), stride=(row_tiles * 16 * cols, cols, 1)),
-            byte_alignment=16)
-        tile = smem.allocate_tensor(BFloat16, cute.make_layout((row_tiles * 16, cols), stride=(cols, 1)),
-                                    byte_alignment=16)
-        fl = smem.allocate_tensor(Int32, cute.make_layout((12, )), byte_alignment=16)
+            cute.make_layout(
+                (k_warps, row_tiles * 16, cols), stride=(row_tiles * 16 * cols, cols, 1)
+            ),
+            byte_alignment=16,
+        )
+        tile = smem.allocate_tensor(
+            BFloat16, cute.make_layout((row_tiles * 16, cols), stride=(cols, 1)), byte_alignment=16
+        )
+        fl = smem.allocate_tensor(Int32, cute.make_layout((12,)), byte_alignment=16)
         vpt: cutlass.Constexpr = self.vpt
         row_ar: cutlass.Constexpr = self.row_ar
         two_shot: cutlass.Constexpr = self.two_shot
         if const_expr(row_ar):
-            nred = smem.allocate_tensor(Float32, cute.make_layout((k_warps, )), byte_alignment=16)
+            nred = smem.allocate_tensor(Float32, cute.make_layout((k_warps,)), byte_alignment=16)
         else:
-            vpart = smem.allocate_tensor(Float32, cute.make_layout((num_rows * vpr, )), byte_alignment=16)
-            wsum = smem.allocate_tensor(Float32, cute.make_layout((k_warps + 1, MAX_ROWS), stride=(MAX_ROWS, 1)),
-                                        byte_alignment=16)
-            items: cutlass.Constexpr = num_rows * ctas  # (row, CTA) partial sums of the norm exchange
-            vals = smem.allocate_tensor(Float32, cute.make_layout((items, )), byte_alignment=16)
+            vpart = smem.allocate_tensor(
+                Float32, cute.make_layout((num_rows * vpr,)), byte_alignment=16
+            )
+            wsum = smem.allocate_tensor(
+                Float32,
+                cute.make_layout((k_warps + 1, MAX_ROWS), stride=(MAX_ROWS, 1)),
+                byte_alignment=16,
+            )
+            items: cutlass.Constexpr = (
+                num_rows * ctas
+            )  # (row, CTA) partial sums of the norm exchange
+            vals = smem.allocate_tensor(Float32, cute.make_layout((items,)), byte_alignment=16)
         dbg = Int64(gDbg.iterator.toint()) + Int64(cta) * Int64(64)
         if const_expr(self.stamps):
             if tidx == 0:
@@ -291,7 +526,9 @@ class Q35GemmArNormKernel(LowMMmaGemmKernel):
 
         # ---- ahead of the dependency wait: weights, scales, the norm weight, the workspace table ----
         w8 = cute.make_rmem_tensor(cute.make_layout((n_tiles * chunks, 16), stride=(16, 1)), Uint8)
-        w16 = cute.make_rmem_tensor(cute.make_layout((2 * n_tiles * chunks, 8), stride=(8, 1)), BFloat16)
+        w16 = cute.make_rmem_tensor(
+            cute.make_layout((2 * n_tiles * chunks, 8), stride=(8, 1)), BFloat16
+        )
         gB_vec = cute.logical_divide(gB, (None, 16))
         for nt in cutlass.range_constexpr(n_tiles):
             b_row = n0 + N_TILE * nt + r
@@ -313,10 +550,14 @@ class Q35GemmArNormKernel(LowMMmaGemmKernel):
         if const_expr(two_shot):
             peer = _ld_s64(Int64(tbl) + Int64(24) + Int64(row_c % Int32(nranks)) * Int64(8))
         nw0, nw1, nw2, nw3 = _ld_v4(Int64(gW.iterator.toint()) + Int64(col0) * Int64(2))
-        nwr = cute.make_rmem_tensor((4 * vpt, ), Int32)  # row_ar: norm weight of the thread's vectors
+        nwr = cute.make_rmem_tensor(
+            (4 * vpt,), Int32
+        )  # row_ar: norm weight of the thread's vectors
         if const_expr(row_ar):
             for j in cutlass.range_constexpr(vpt):
-                a0, a1, a2, a3 = _ld_v4(Int64(gW.iterator.toint()) + (Int64(tidx) + Int64(j * nthreads)) * Int64(16))
+                a0, a1, a2, a3 = _ld_v4(
+                    Int64(gW.iterator.toint()) + (Int64(tidx) + Int64(j * nthreads)) * Int64(16)
+                )
                 nwr[4 * j + 0] = a0
                 nwr[4 * j + 1] = a1
                 nwr[4 * j + 2] = a2
@@ -334,10 +575,12 @@ class Q35GemmArNormKernel(LowMMmaGemmKernel):
         # epoch, whose latency the GEMM main loop hides (published by the barrier after it). Dependents are released
         # after that barrier, once the activations and the residual have been consumed (PDL rule) ----
         r0, r1, r2, r3 = _ld_v4(Int64(gRes.iterator.toint()) + row_off)
-        rres = cute.make_rmem_tensor((4 * vpt, ), Int32)  # row_ar: residual of the thread's vectors
+        rres = cute.make_rmem_tensor((4 * vpt,), Int32)  # row_ar: residual of the thread's vectors
         if const_expr(row_ar):
             for j in cutlass.range_constexpr(vpt):
-                a0, a1, a2, a3 = _ld_v4(Int64(gRes.iterator.toint()) + (ar_base + Int64(j * nthreads)) * Int64(16))
+                a0, a1, a2, a3 = _ld_v4(
+                    Int64(gRes.iterator.toint()) + (ar_base + Int64(j * nthreads)) * Int64(16)
+                )
                 rres[4 * j + 0] = a0
                 rres[4 * j + 1] = a1
                 rres[4 * j + 2] = a2
@@ -364,14 +607,20 @@ class Q35GemmArNormKernel(LowMMmaGemmKernel):
                 _st_s64(dbg + Int64(16), _globaltimer())
 
         # ---- GEMM: LowM's main loop and warp-order reduction (the unfused kernel's values) ----
-        acc = cute.make_rmem_tensor(cute.make_layout((n_tiles * row_tiles, 4), stride=(4, 1)), Float32)
+        acc = cute.make_rmem_tensor(
+            cute.make_layout((n_tiles * row_tiles, 4), stride=(4, 1)), Float32
+        )
         acc.fill(0.0)
         swap: cutlass.Constexpr = self.swap_ab and n_tiles % 2 == 0
         if const_expr(fp8_mma):
             if const_expr(swap):
-                self._mainloop_fp8_swap(acc, gA16, gA8, w8, factor, copy_a16, copy_a8, k_warp0, r, q, n_tiles)
+                self._mainloop_fp8_swap(
+                    acc, gA16, gA8, w8, factor, copy_a16, copy_a8, k_warp0, r, q, n_tiles
+                )
             else:
-                self._mainloop_fp8(acc, gA16, gA8, w8, factor, copy_a16, copy_a8, k_warp0, r, q, n_tiles)
+                self._mainloop_fp8(
+                    acc, gA16, gA8, w8, factor, copy_a16, copy_a8, k_warp0, r, q, n_tiles
+                )
         else:
             if const_expr(swap):
                 self._mainloop_bf16_swap(acc, gA16, w8, w16, copy_a16, k_warp0, r, q, n_tiles, True)
@@ -460,12 +709,30 @@ class Q35GemmArNormKernel(LowMMmaGemmKernel):
             x3 = tile_u32[row, v * 4 + 3]
             if const_expr(two_shot):
                 lt_row = row // Int32(nranks)
-                _st_v4(peer + data_off + ((Int64(lt_row) * Int64(nranks) + Int64(rank)) * Int64(vecs) +
-                                          Int64(col0 // VEC)) * Int64(16),
-                       _sanitize(x0), _sanitize(x1), _sanitize(x2), _sanitize(x3))
+                _st_v4(
+                    peer
+                    + data_off
+                    + (
+                        (Int64(lt_row) * Int64(nranks) + Int64(rank)) * Int64(vecs)
+                        + Int64(col0 // VEC)
+                    )
+                    * Int64(16),
+                    _sanitize(x0),
+                    _sanitize(x1),
+                    _sanitize(x2),
+                    _sanitize(x3),
+                )
             else:
-                _st_v4(mcast + data_off + (Int64(rank) * tot + Int64(row) * Int64(vecs) + Int64(col0 // VEC)) *
-                       Int64(16), _sanitize(x0), _sanitize(x1), _sanitize(x2), _sanitize(x3))
+                _st_v4(
+                    mcast
+                    + data_off
+                    + (Int64(rank) * tot + Int64(row) * Int64(vecs) + Int64(col0 // VEC))
+                    * Int64(16),
+                    _sanitize(x0),
+                    _sanitize(x1),
+                    _sanitize(x2),
+                    _sanitize(x3),
+                )
 
         # ---- clear this thread's share of the previous call's buffer (every dirty stage) ----
         neg0 = Int32(_NEG_ZERO)
@@ -491,22 +758,29 @@ class Q35GemmArNormKernel(LowMMmaGemmKernel):
             # order -> BF16, + residual; RMSNorm: BF16 squares summed per thread (vector, then element order),
             # per warp (butterfly), per CTA (butterfly over the warp sums) ----
             if ar_cta:
-                res = cute.make_rmem_tensor((VEC * vpt, ), Float32)
+                res = cute.make_rmem_tensor((VEC * vpt,), Float32)
                 if const_expr(two_shot):
                     half = buf_bytes // Int64(2)  # BROADCAST stage offset within the current buffer
                     lt = cta // Int32(nranks)
                     if cta % Int32(nranks) == rank:
                         # owner: every rank's vectors of this row from the SCATTER stage, FP32 rank-order sum,
                         # BF16, multicast into every rank's BROADCAST stage
-                        gs = cute.make_rmem_tensor((vpt * nranks * 4, ), Int32)
+                        gs = cute.make_rmem_tensor((vpt * nranks * 4,), Int32)
                         pend_o = Int32(1)
                         while pend_o != 0:
                             pend_o = Int32(0)
                             for j in cutlass.range_constexpr(vpt):
                                 for rk in cutlass.range_constexpr(nranks):
                                     a, b, cc2, d = _ld_volatile_v4(
-                                        own + data_off + ((Int64(lt) * Int64(nranks) + Int64(rk)) * Int64(vecs) +
-                                                          Int64(tidx) + Int64(j * nthreads)) * Int64(16))
+                                        own
+                                        + data_off
+                                        + (
+                                            (Int64(lt) * Int64(nranks) + Int64(rk)) * Int64(vecs)
+                                            + Int64(tidx)
+                                            + Int64(j * nthreads)
+                                        )
+                                        * Int64(16)
+                                    )
                                     g0 = (j * nranks + rk) * 4
                                     gs[g0 + 0] = a
                                     gs[g0 + 1] = b
@@ -521,7 +795,7 @@ class Q35GemmArNormKernel(LowMMmaGemmKernel):
                                     if d == neg0:
                                         pend_o = Int32(1)
                         for j in cutlass.range_constexpr(vpt):
-                            rsum = cute.make_rmem_tensor((4, ), Int32)
+                            rsum = cute.make_rmem_tensor((4,), Int32)
                             for i in cutlass.range_constexpr(4):
                                 slo = Float32(0.0)
                                 shi = Float32(0.0)
@@ -529,16 +803,25 @@ class Q35GemmArNormKernel(LowMMmaGemmKernel):
                                     slo = _add(slo, _lo(gs[(j * nranks + rk) * 4 + i]))
                                     shi = _add(shi, _hi(gs[(j * nranks + rk) * 4 + i]))
                                 rsum[i] = _sanitize(_pack_bf16(slo, shi))
-                            _st_v4(mcast + data_off + half + (ar_base + Int64(j * nthreads)) * Int64(16), rsum[0],
-                                   rsum[1], rsum[2], rsum[3])
+                            _st_v4(
+                                mcast
+                                + data_off
+                                + half
+                                + (ar_base + Int64(j * nthreads)) * Int64(16),
+                                rsum[0],
+                                rsum[1],
+                                rsum[2],
+                                rsum[3],
+                            )
                     # every rank: the reduced row from the BROADCAST stage, + residual (BF16)
-                    gb = cute.make_rmem_tensor((vpt * 4, ), Int32)
+                    gb = cute.make_rmem_tensor((vpt * 4,), Int32)
                     pend_b = Int32(1)
                     while pend_b != 0:
                         pend_b = Int32(0)
                         for j in cutlass.range_constexpr(vpt):
-                            a, b, cc2, d = _ld_volatile_v4(own + data_off + half +
-                                                           (ar_base + Int64(j * nthreads)) * Int64(16))
+                            a, b, cc2, d = _ld_volatile_v4(
+                                own + data_off + half + (ar_base + Int64(j * nthreads)) * Int64(16)
+                            )
                             gb[4 * j + 0] = a
                             gb[4 * j + 1] = b
                             gb[4 * j + 2] = cc2
@@ -553,17 +836,24 @@ class Q35GemmArNormKernel(LowMMmaGemmKernel):
                                 pend_b = Int32(1)
                     for j in cutlass.range_constexpr(vpt):
                         for i in cutlass.range_constexpr(4):
-                            res[VEC * j + 2 * i] = _bf16r(_add(_lo(gb[4 * j + i]), _lo(rres[4 * j + i])))
-                            res[VEC * j + 2 * i + 1] = _bf16r(_add(_hi(gb[4 * j + i]), _hi(rres[4 * j + i])))
+                            res[VEC * j + 2 * i] = _bf16r(
+                                _add(_lo(gb[4 * j + i]), _lo(rres[4 * j + i]))
+                            )
+                            res[VEC * j + 2 * i + 1] = _bf16r(
+                                _add(_hi(gb[4 * j + i]), _hi(rres[4 * j + i]))
+                            )
                 else:
-                    got = cute.make_rmem_tensor((vpt * nranks * 4, ), Int32)
+                    got = cute.make_rmem_tensor((vpt * nranks * 4,), Int32)
                     pending = Int32(1)
                     while pending != 0:
                         pending = Int32(0)
                         for j in cutlass.range_constexpr(vpt):
                             for rk in cutlass.range_constexpr(nranks):
-                                a, b, cc2, d = _ld_volatile_v4(own + data_off + (Int64(rk) * tot + ar_base +
-                                                                                 Int64(j * nthreads)) * Int64(16))
+                                a, b, cc2, d = _ld_volatile_v4(
+                                    own
+                                    + data_off
+                                    + (Int64(rk) * tot + ar_base + Int64(j * nthreads)) * Int64(16)
+                                )
                                 g0 = (j * nranks + rk) * 4
                                 got[g0 + 0] = a
                                 got[g0 + 1] = b
@@ -585,11 +875,18 @@ class Q35GemmArNormKernel(LowMMmaGemmKernel):
                                 lo = _add(lo, _lo(got[(j * nranks + rk) * 4 + i]))
                                 hi = _add(hi, _hi(got[(j * nranks + rk) * 4 + i]))
                             res[VEC * j + 2 * i] = _bf16r(_add(_bf16r(lo), _lo(rres[4 * j + i])))
-                            res[VEC * j + 2 * i + 1] = _bf16r(_add(_bf16r(hi), _hi(rres[4 * j + i])))
+                            res[VEC * j + 2 * i + 1] = _bf16r(
+                                _add(_bf16r(hi), _hi(rres[4 * j + i]))
+                            )
                 for j in cutlass.range_constexpr(vpt):
-                    _st_v4(Int64(gResOut.iterator.toint()) + (ar_base + Int64(j * nthreads)) * Int64(16),
-                           _pack_bf16(res[VEC * j + 0], res[VEC * j + 1]), _pack_bf16(res[VEC * j + 2], res[VEC * j + 3]),
-                           _pack_bf16(res[VEC * j + 4], res[VEC * j + 5]), _pack_bf16(res[VEC * j + 6], res[VEC * j + 7]))
+                    _st_v4(
+                        Int64(gResOut.iterator.toint())
+                        + (ar_base + Int64(j * nthreads)) * Int64(16),
+                        _pack_bf16(res[VEC * j + 0], res[VEC * j + 1]),
+                        _pack_bf16(res[VEC * j + 2], res[VEC * j + 3]),
+                        _pack_bf16(res[VEC * j + 4], res[VEC * j + 5]),
+                        _pack_bf16(res[VEC * j + 6], res[VEC * j + 7]),
+                    )
                 if const_expr(self.stamps):
                     if tidx == 0:
                         _st_s64(dbg + Int64(40), _globaltimer())
@@ -614,38 +911,59 @@ class Q35GemmArNormKernel(LowMMmaGemmKernel):
                 if const_expr(self.quant):
                     inv = _div_rn(Float32(1.0), gScale[0])
                 for j in cutlass.range_constexpr(vpt):
-                    y = cute.make_rmem_tensor((VEC, ), Float32)
+                    y = cute.make_rmem_tensor((VEC,), Float32)
                     for i in cutlass.range_constexpr(4):
                         if const_expr(two_shot):  # rmsNormLamport: (w * x) * rstd
-                            y[2 * i] = _bf16r(_mul(_mul(_lo(nwr[4 * j + i]), res[VEC * j + 2 * i]), rstd))
-                            y[2 * i + 1] = _bf16r(_mul(_mul(_hi(nwr[4 * j + i]), res[VEC * j + 2 * i + 1]), rstd))
+                            y[2 * i] = _bf16r(
+                                _mul(_mul(_lo(nwr[4 * j + i]), res[VEC * j + 2 * i]), rstd)
+                            )
+                            y[2 * i + 1] = _bf16r(
+                                _mul(_mul(_hi(nwr[4 * j + i]), res[VEC * j + 2 * i + 1]), rstd)
+                            )
                         else:  # one-shot: (x * rstd) * w
-                            y[2 * i] = _bf16r(_mul(_mul(res[VEC * j + 2 * i], rstd), _lo(nwr[4 * j + i])))
-                            y[2 * i + 1] = _bf16r(_mul(_mul(res[VEC * j + 2 * i + 1], rstd), _hi(nwr[4 * j + i])))
+                            y[2 * i] = _bf16r(
+                                _mul(_mul(res[VEC * j + 2 * i], rstd), _lo(nwr[4 * j + i]))
+                            )
+                            y[2 * i + 1] = _bf16r(
+                                _mul(_mul(res[VEC * j + 2 * i + 1], rstd), _hi(nwr[4 * j + i]))
+                            )
                     vrow = ar_base + Int64(j * nthreads)
                     if const_expr(self.norm_out):
-                        _st_v4(Int64(gOut.iterator.toint()) + vrow * Int64(16), _pack_bf16(y[0], y[1]),
-                               _pack_bf16(y[2], y[3]), _pack_bf16(y[4], y[5]), _pack_bf16(y[6], y[7]))
+                        _st_v4(
+                            Int64(gOut.iterator.toint()) + vrow * Int64(16),
+                            _pack_bf16(y[0], y[1]),
+                            _pack_bf16(y[2], y[3]),
+                            _pack_bf16(y[4], y[5]),
+                            _pack_bf16(y[6], y[7]),
+                        )
                     if const_expr(self.quant):
                         q01 = _e4m3x2(_mul(y[0], inv), _mul(y[1], inv))
                         q23 = _e4m3x2(_mul(y[2], inv), _mul(y[3], inv))
                         q45 = _e4m3x2(_mul(y[4], inv), _mul(y[5], inv))
                         q67 = _e4m3x2(_mul(y[6], inv), _mul(y[7], inv))
-                        _st_v2(Int64(gQuant.iterator.toint()) + vrow * Int64(8), q01 | (q23 << 16), q45 | (q67 << 16))
+                        _st_v2(
+                            Int64(gQuant.iterator.toint()) + vrow * Int64(8),
+                            q01 | (q23 << 16),
+                            q45 | (q67 << 16),
+                        )
         else:
             # ---- wait for this slice of every rank; FP32 sum in rank order -> BF16; + residual ----
-            res = cute.make_rmem_tensor((VEC, ), Float32)
+            res = cute.make_rmem_tensor((VEC,), Float32)
             for e in cutlass.range_constexpr(VEC):
                 res[e] = Float32(0.0)
             psum = Float32(0.0)
             if active:
-                got = cute.make_rmem_tensor((nranks * 4, ), Int32)
+                got = cute.make_rmem_tensor((nranks * 4,), Int32)
                 pending = Int32(1)
                 while pending != 0:
                     pending = Int32(0)
                     for rk in cutlass.range_constexpr(nranks):
-                        a, b, cc2, d = _ld_volatile_v4(own + data_off + (Int64(rk) * tot + Int64(row) * Int64(vecs) +
-                                                                         Int64(col0 // VEC)) * Int64(16))
+                        a, b, cc2, d = _ld_volatile_v4(
+                            own
+                            + data_off
+                            + (Int64(rk) * tot + Int64(row) * Int64(vecs) + Int64(col0 // VEC))
+                            * Int64(16)
+                        )
                         got[rk * 4 + 0] = a
                         got[rk * 4 + 1] = b
                         got[rk * 4 + 2] = cc2
@@ -667,8 +985,13 @@ class Q35GemmArNormKernel(LowMMmaGemmKernel):
                         hi = _add(hi, _hi(got[rk * 4 + i]))
                     res[2 * i] = _bf16r(_add(_bf16r(lo), _lo(rw[i])))
                     res[2 * i + 1] = _bf16r(_add(_bf16r(hi), _hi(rw[i])))
-                _st_v4(Int64(gResOut.iterator.toint()) + row_off, _pack_bf16(res[0], res[1]), _pack_bf16(res[2], res[3]),
-                       _pack_bf16(res[4], res[5]), _pack_bf16(res[6], res[7]))
+                _st_v4(
+                    Int64(gResOut.iterator.toint()) + row_off,
+                    _pack_bf16(res[0], res[1]),
+                    _pack_bf16(res[2], res[3]),
+                    _pack_bf16(res[4], res[5]),
+                    _pack_bf16(res[6], res[7]),
+                )
                 for e in cutlass.range_constexpr(VEC):
                     psum = _add(psum, _bf16r(_mul(res[e], res[e])))
                 vpart[item] = psum
@@ -679,20 +1002,24 @@ class Q35GemmArNormKernel(LowMMmaGemmKernel):
 
             # ---- per-row partial over this CTA's columns -> epoch-tagged packet in the exchange buffer ----
             slot = epoch & Int32(1)
-            part_base = Int64(gPart.iterator.toint()) + Int64(slot) * Int64(PART_SLOT_ROWS * self.max_ctas * 8)
+            part_base = Int64(gPart.iterator.toint()) + Int64(slot) * Int64(
+                PART_SLOT_ROWS * self.max_ctas * 8
+            )
             if tidx < num_rows:
                 rs = Float32(0.0)
                 for vv in cutlass.range_constexpr(vpr):
                     rs = _add(rs, vpart[tidx * vpr + vv])
-                _st_s64(part_base + (Int64(tidx) * Int64(self.max_ctas) + Int64(cta)) * Int64(8),
-                        _packet(epoch, _f32_bits(rs)))
+                _st_s64(
+                    part_base + (Int64(tidx) * Int64(self.max_ctas) + Int64(cta)) * Int64(8),
+                    _packet(epoch, _f32_bits(rs)),
+                )
 
             # ---- every CTA: all CTAs' partials of every row -> rstd. Every (row, CTA) packet has one owning
             # thread, all of a thread's packets are polled together (independent loads, not one round trip per
             # row); the per-row sums run in smem in a fixed order (lane-strided over CTAs, then a butterfly),
             # identical in every CTA, so every CTA gets the same rstd ----
             per_thread: cutlass.Constexpr = (items + nthreads - 1) // nthreads
-            pk = cute.make_rmem_tensor((per_thread, ), Int64)
+            pk = cute.make_rmem_tensor((per_thread,), Int64)
             for j in cutlass.range_constexpr(per_thread):
                 pk[j] = Int64(0)  # tag 0: never an epoch
             pend = Int32(1)
@@ -702,8 +1029,11 @@ class Q35GemmArNormKernel(LowMMmaGemmKernel):
                     it = tidx + j * nthreads
                     if it < items:
                         if _pk_tag(pk[j]) != epoch:
-                            pk[j] = _ld_volatile_s64(part_base + (Int64(it // ctas) * Int64(self.max_ctas) +
-                                                                  Int64(it % ctas)) * Int64(8))
+                            pk[j] = _ld_volatile_s64(
+                                part_base
+                                + (Int64(it // ctas) * Int64(self.max_ctas) + Int64(it % ctas))
+                                * Int64(8)
+                            )
                             pend = Int32(1)
             for j in cutlass.range_constexpr(per_thread):
                 it = tidx + j * nthreads
@@ -722,7 +1052,9 @@ class Q35GemmArNormKernel(LowMMmaGemmKernel):
                     for k in cutlass.range_constexpr(5):
                         s = _add(s, _shfl_bfly(s, Int32(16 >> k)))
                     if lane == 0:
-                        wsum[k_warps, rr] = _rsqrt(_add(_div_rn(s, Float32(float(hidden))), Float32(self.norm_eps)))
+                        wsum[k_warps, rr] = _rsqrt(
+                            _add(_div_rn(s, Float32(float(hidden))), Float32(self.norm_eps))
+                        )
             cute.arch.sync_threads()
             if const_expr(self.stamps):
                 if tidx == 0:
@@ -732,22 +1064,30 @@ class Q35GemmArNormKernel(LowMMmaGemmKernel):
             if active:
                 rstd = wsum[k_warps, row]
                 ww = (nw0, nw1, nw2, nw3)
-                y = cute.make_rmem_tensor((VEC, ), Float32)
+                y = cute.make_rmem_tensor((VEC,), Float32)
                 for i in cutlass.range_constexpr(4):
                     y[2 * i] = _bf16r(_mul(_mul(res[2 * i], rstd), _lo(ww[i])))
                     y[2 * i + 1] = _bf16r(_mul(_mul(res[2 * i + 1], rstd), _hi(ww[i])))
                 if const_expr(self.norm_out):
-                    _st_v4(Int64(gOut.iterator.toint()) + row_off, _pack_bf16(y[0], y[1]), _pack_bf16(y[2], y[3]),
-                           _pack_bf16(y[4], y[5]), _pack_bf16(y[6], y[7]))
+                    _st_v4(
+                        Int64(gOut.iterator.toint()) + row_off,
+                        _pack_bf16(y[0], y[1]),
+                        _pack_bf16(y[2], y[3]),
+                        _pack_bf16(y[4], y[5]),
+                        _pack_bf16(y[6], y[7]),
+                    )
                 if const_expr(self.quant):
                     inv = _div_rn(Float32(1.0), gScale[0])
                     q01 = _e4m3x2(_mul(y[0], inv), _mul(y[1], inv))
                     q23 = _e4m3x2(_mul(y[2], inv), _mul(y[3], inv))
                     q45 = _e4m3x2(_mul(y[4], inv), _mul(y[5], inv))
                     q67 = _e4m3x2(_mul(y[6], inv), _mul(y[7], inv))
-                    _st_v2(Int64(gQuant.iterator.toint()) + (Int64(row) * Int64(vecs) + Int64(col0 // VEC)) * Int64(8),
-                           q01 | (q23 << 16), q45 | (q67 << 16))
-
+                    _st_v2(
+                        Int64(gQuant.iterator.toint())
+                        + (Int64(row) * Int64(vecs) + Int64(col0 // VEC)) * Int64(8),
+                        q01 | (q23 << 16),
+                        q45 | (q67 << 16),
+                    )
 
         if const_expr(self.stamps):
             if tidx == 0:
@@ -764,8 +1104,11 @@ class Q35GemmArNormKernel(LowMMmaGemmKernel):
                 _st_s32(flags + Int64(4), cur)
                 if const_expr(two_shot):
                     _st_s32(flags + Int64(12), Int32(2))
-                    _st_s32(flags + Int64(16), ((Int32(m) + Int32(nranks - 1)) // Int32(nranks)) *
-                            Int32(hidden * nranks * 2))
+                    _st_s32(
+                        flags + Int64(16),
+                        ((Int32(m) + Int32(nranks - 1)) // Int32(nranks))
+                        * Int32(hidden * nranks * 2),
+                    )
                     _st_s32(flags + Int64(20), Int32(m) * Int32(hidden * 2))
                 else:
                     _st_s32(flags + Int64(12), Int32(1))

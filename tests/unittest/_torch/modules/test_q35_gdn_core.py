@@ -45,7 +45,9 @@ def _case(tp16, n, t, pnat, seed):
         dt_bias=(torch.rand(HV, generator=g, device="cuda") * 2 - 1).float(),
         norm_w=(torch.rand(V, generator=g, device="cuda") + 0.5).to(torch.bfloat16),
         fp8_scale=torch.tensor(0.02, dtype=torch.float32, device="cuda"),
-        state_indices=torch.tensor([1, 4, 7, 10, 13, 2, 5, 8][:n], dtype=torch.int32, device="cuda"),
+        state_indices=torch.tensor(
+            [1, 4, 7, 10, 13, 2, 5, 8][:n], dtype=torch.int32, device="cuda"
+        ),
         pnat=torch.full((SLOTS,), pnat, dtype=torch.int32, device="cuda"),
         buf=torch.zeros(SLOTS, dtype=torch.int32, device="cuda"),
     )
@@ -55,7 +57,9 @@ def _case(tp16, n, t, pnat, seed):
     mut = dict(
         ssm=(torch.randn(SLOTS, HV, V, K, generator=g, device="cuda") * 0.05).to(torch.bfloat16),
         old_k=(kh / kh.norm(dim=-1, keepdim=True)).to(torch.bfloat16),
-        old_u=(torch.randn(SLOTS, 2, HIST, HV, V, generator=g, device="cuda") * 0.5).to(torch.bfloat16),
+        old_u=(torch.randn(SLOTS, 2, HIST, HV, V, generator=g, device="cuda") * 0.5).to(
+            torch.bfloat16
+        ),
         old_g=(-torch.cumsum(dec, dim=-1)).float().contiguous(),
     )
     return H, HV, cd, proj, ba, st, mut
@@ -68,11 +72,43 @@ def _run_triton(H, HV, cd, n, t, proj, ba, st, mut):
     conv_s = torch.zeros(SLOTS, cd, 3, dtype=torch.bfloat16, device="cuda")
     inter = torch.zeros(n, t, cd, 3, dtype=torch.bfloat16, device="cuda")
     y = gf.q35_gdn_fused_update(
-        proj, conv_w, conv_s, inter, ba[:, HV:], ba[:, :HV], st["a_log"], st["dt_bias"], m["ssm"], st["state_indices"],
-        m["old_u"], m["old_k"], m["old_g"], st["buf"], st["pnat"], HIST, n, t, H, HV, K, V, output=o,
-        z=proj[:, cd:].view(n * t, HV, V), norm_weight=st["norm_w"], norm_eps=1e-6, fp8_scale=st["fp8_scale"],
-        counters=torch.zeros(64, dtype=torch.int32, device="cuda"), block_v=16, num_warps=4, prefetch_state=True,
-        trigger=2, spec_hist=True, solve=2, conv=False, store_o=True)
+        proj,
+        conv_w,
+        conv_s,
+        inter,
+        ba[:, HV:],
+        ba[:, :HV],
+        st["a_log"],
+        st["dt_bias"],
+        m["ssm"],
+        st["state_indices"],
+        m["old_u"],
+        m["old_k"],
+        m["old_g"],
+        st["buf"],
+        st["pnat"],
+        HIST,
+        n,
+        t,
+        H,
+        HV,
+        K,
+        V,
+        output=o,
+        z=proj[:, cd:].view(n * t, HV, V),
+        norm_weight=st["norm_w"],
+        norm_eps=1e-6,
+        fp8_scale=st["fp8_scale"],
+        counters=torch.zeros(64, dtype=torch.int32, device="cuda"),
+        block_v=16,
+        num_warps=4,
+        prefetch_state=True,
+        trigger=2,
+        spec_hist=True,
+        solve=2,
+        conv=False,
+        store_o=True,
+    )
     return o, y, m
 
 
@@ -80,9 +116,32 @@ def _run_core(H, HV, cd, n, t, proj, ba, st, mut):
     m = {k: v.clone() for k, v in mut.items()}
     o = torch.empty(n, t, HV, V, dtype=torch.bfloat16, device="cuda")
     y = gc.q35_gdn_core_update(
-        proj, ba[:, HV:], ba[:, :HV], st["a_log"], st["dt_bias"], m["ssm"], st["state_indices"], m["old_u"], m["old_k"],
-        m["old_g"], st["buf"], st["pnat"], HIST, n, t, H, HV, K, V, z=proj[:, cd:].view(n * t, HV, V),
-        norm_weight=st["norm_w"], norm_eps=1e-6, fp8_scale=st["fp8_scale"], output=o, trigger=2)
+        proj,
+        ba[:, HV:],
+        ba[:, :HV],
+        st["a_log"],
+        st["dt_bias"],
+        m["ssm"],
+        st["state_indices"],
+        m["old_u"],
+        m["old_k"],
+        m["old_g"],
+        st["buf"],
+        st["pnat"],
+        HIST,
+        n,
+        t,
+        H,
+        HV,
+        K,
+        V,
+        z=proj[:, cd:].view(n * t, HV, V),
+        norm_weight=st["norm_w"],
+        norm_eps=1e-6,
+        fp8_scale=st["fp8_scale"],
+        output=o,
+        trigger=2,
+    )
     return o, y, m
 
 
@@ -120,7 +179,9 @@ def check(tp16, n, pnat, t=7, seed=0):
     o3, _, m3 = _run_core(H, HV, cd, n, t, proj, ba, st, mut2)
     torch.cuda.synchronize()
     assert not torch.equal(o2, o), "negative control (value input) not detected"
-    assert not torch.equal(o3, o) or not torch.equal(m3["ssm"], m["ssm"]), "negative control (state) not detected"
+    assert not torch.equal(o3, o) or not torch.equal(m3["ssm"], m["ssm"]), (
+        "negative control (state) not detected"
+    )
 
 
 if pytest is not None:

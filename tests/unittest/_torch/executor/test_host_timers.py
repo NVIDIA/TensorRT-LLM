@@ -118,8 +118,9 @@ def test_written_at_loop_exit_with_comm_row(monkeypatch, tmp_path, fake_module):
     assert 3.0 <= sync < period
     assert 1.0 <= comm < sync
     # BUSY = PERIOD - SYNC per iteration, so the means (not the medians) subtract exactly
-    assert _row(text, "BUSY (", 2) == pytest.approx(_row(text, "PERIOD (", 2) - _row(text, "SYNC (", 2),
-                                                    abs=0.002)
+    assert _row(text, "BUSY (", 2) == pytest.approx(
+        _row(text, "PERIOD (", 2) - _row(text, "SYNC (", 2), abs=0.002
+    )
     assert busy >= 3.0  # forward + allgather
     assert "PyExecutor._forward_step" in text
     assert "comm:FakeDist.allgather" in text

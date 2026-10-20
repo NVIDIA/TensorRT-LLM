@@ -28,21 +28,27 @@ def _stores(flat):
             next_draft_tokens=torch.full((SLOTS, DRAFT), -1, dtype=torch.int32, device="cuda"),
             new_tokens_lens=torch.full((SLOTS,), -1, dtype=torch.int32, device="cuda"),
         )
-    buffer = torch.full((WIDTH * SLOTS + SLOTS + SLOTS * DRAFT,), -1, dtype=torch.int32, device="cuda")
+    buffer = torch.full(
+        (WIDTH * SLOTS + SLOTS + SLOTS * DRAFT,), -1, dtype=torch.int32, device="cuda"
+    )
     return buffer, types.SimpleNamespace(
-        new_tokens=buffer[:WIDTH * SLOTS].view(WIDTH, SLOTS, 1),
+        new_tokens=buffer[: WIDTH * SLOTS].view(WIDTH, SLOTS, 1),
         next_new_tokens=torch.full((WIDTH, SLOTS, 1), -1, dtype=torch.int32, device="cuda"),
-        next_draft_tokens=buffer[WIDTH * SLOTS + SLOTS:].view(SLOTS, DRAFT),
-        new_tokens_lens=buffer[WIDTH * SLOTS:WIDTH * SLOTS + SLOTS],
+        next_draft_tokens=buffer[WIDTH * SLOTS + SLOTS :].view(SLOTS, DRAFT),
+        new_tokens_lens=buffer[WIDTH * SLOTS : WIDTH * SLOTS + SLOTS],
     )
 
 
 def test_scatter_matches_index_copy_with_strided_sources():
     gen = torch.Generator(device="cuda").manual_seed(0)
     slots = torch.tensor([5, 0, 3], dtype=torch.long, device="cuda")
-    wide = torch.randint(0, 1 << 20, (4, 2 * WIDTH), generator=gen, device="cuda", dtype=torch.int32)
+    wide = torch.randint(
+        0, 1 << 20, (4, 2 * WIDTH), generator=gen, device="cuda", dtype=torch.int32
+    )
     new_tokens = wide[1:, ::2]  # strided rows and columns
-    next_new = torch.randint(0, 1 << 20, (3, WIDTH), generator=gen, device="cuda", dtype=torch.int32)
+    next_new = torch.randint(
+        0, 1 << 20, (3, WIDTH), generator=gen, device="cuda", dtype=torch.int32
+    )
     lens = torch.randint(1, WIDTH, (6,), generator=gen, device="cuda", dtype=torch.int32)[::2]
     drafts = torch.randint(0, 1 << 20, (3, DRAFT), generator=gen, device="cuda", dtype=torch.int32)
     _, expected = _stores(False)
@@ -52,20 +58,31 @@ def test_scatter_matches_index_copy_with_strided_sources():
     expected.next_draft_tokens.index_copy_(0, slots, drafts)
     for flat in (False, True):
         _, store = _stores(flat)
-        spec_store_scatter(slots, new_tokens, next_new, lens, drafts, store.new_tokens.squeeze(-1),
-                           store.next_new_tokens.squeeze(-1), store.new_tokens_lens,
-                           store.next_draft_tokens)
+        spec_store_scatter(
+            slots,
+            new_tokens,
+            next_new,
+            lens,
+            drafts,
+            store.new_tokens.squeeze(-1),
+            store.next_new_tokens.squeeze(-1),
+            store.new_tokens_lens,
+            store.next_draft_tokens,
+        )
         for name in ("new_tokens", "next_new_tokens", "new_tokens_lens", "next_draft_tokens"):
             assert torch.equal(getattr(store, name), getattr(expected, name)), (flat, name)
 
 
 def _step(device):
     requests = [
-        types.SimpleNamespace(py_seq_slot=slot, py_draft_tokens=[0] * 3, py_draft_tokens_effective_len=None)
+        types.SimpleNamespace(
+            py_seq_slot=slot, py_draft_tokens=[0] * 3, py_draft_tokens_effective_len=None
+        )
         for slot in (6, 2)
     ]
-    scheduled = types.SimpleNamespace(context_requests_chunking=[], context_requests_last_chunk=[],
-                                      generation_requests=requests)
+    scheduled = types.SimpleNamespace(
+        context_requests_chunking=[], context_requests_last_chunk=[], generation_requests=requests
+    )
     gen = torch.Generator(device=device).manual_seed(1)
 
     def ints(*shape):
@@ -141,16 +158,24 @@ def test_fused_store_views_keep_store_dtypes_and_shapes(monkeypatch):
     """The flat-buffer views have exactly the dtypes and shapes of the separate store tensors."""
     from tensorrt_llm._torch.pyexecutor.sampler.sampler import TorchSampler
 
-    args = TorchSampler.Args(max_seq_len=128, max_draft_len=DRAFT, max_num_sequences=SLOTS,
-                             max_beam_width=1, max_total_draft_tokens=DRAFT)
+    args = TorchSampler.Args(
+        max_seq_len=128,
+        max_draft_len=DRAFT,
+        max_num_sequences=SLOTS,
+        max_beam_width=1,
+        max_total_draft_tokens=DRAFT,
+    )
     stores = {}
     for value in ("0", "1"):
         monkeypatch.setenv("TRTLLM_SPEC_SAMPLER_FUSED_STORE", value)
         stores[value] = MTPSampler(args, nextn=DRAFT).store
     for name in ("new_tokens", "next_new_tokens", "new_tokens_lens", "next_draft_tokens"):
         separate, view = getattr(stores["0"], name), getattr(stores["1"], name)
-        assert (view.dtype, view.shape, view.device) == (separate.dtype, separate.shape,
-                                                         separate.device), name
+        assert (view.dtype, view.shape, view.device) == (
+            separate.dtype,
+            separate.shape,
+            separate.device,
+        ), name
 
 
 def test_zero_copy_snapshot(monkeypatch):
@@ -176,7 +201,9 @@ def test_zero_copy_snapshot(monkeypatch):
         torch.cuda.synchronize()
         assert torch.equal(state.host.new_tokens[:, slots], expected.host.new_tokens[:, slots])
         assert torch.equal(state.host.new_tokens_lens[slots], expected.host.new_tokens_lens[slots])
-        assert torch.equal(state.host.next_draft_tokens[slots], expected.host.next_draft_tokens[slots])
+        assert torch.equal(
+            state.host.next_draft_tokens[slots], expected.host.next_draft_tokens[slots]
+        )
         for name in ("new_tokens", "new_tokens_lens", "next_draft_tokens"):
             assert torch.equal(getattr(state.device, name), getattr(expected.device, name)), name
         assert state.host.new_tokens_lens.is_pinned()
@@ -208,21 +235,27 @@ def _draft_tail_step(device, transposed):
     """A step whose next_new_tokens / next_draft_tokens are the draft tail's layout (TRTLLM_Q35_DRAFT_TAIL): views
     tok.t() and tok[1:].t() of one [k + 1, b] int32 buffer, i.e. strides (1, b); runtime draft len = store width."""
     requests = [
-        types.SimpleNamespace(py_seq_slot=slot, py_draft_tokens=[0] * DRAFT, py_draft_tokens_effective_len=None)
+        types.SimpleNamespace(
+            py_seq_slot=slot, py_draft_tokens=[0] * DRAFT, py_draft_tokens_effective_len=None
+        )
         for slot in (6, 2, 4)
     ]
-    scheduled = types.SimpleNamespace(context_requests_chunking=[], context_requests_last_chunk=[],
-                                      generation_requests=requests)
+    scheduled = types.SimpleNamespace(
+        context_requests_chunking=[], context_requests_last_chunk=[], generation_requests=requests
+    )
     gen = torch.Generator(device=device).manual_seed(2)
-    tok = torch.randint(0, 1 << 20, (WIDTH, len(requests)), generator=gen, device=device, dtype=torch.int32)
+    tok = torch.randint(
+        0, 1 << 20, (WIDTH, len(requests)), generator=gen, device=device, dtype=torch.int32
+    )
     next_new, next_draft = tok.t(), tok[1:].t()
     if not transposed:
         next_new, next_draft = next_new.contiguous(), next_draft.contiguous()
     else:
         assert next_new.stride() == (1, len(requests)) and next_draft.stride() == (1, len(requests))
     outputs = {
-        "new_tokens": torch.randint(0, 1 << 20, (len(requests), WIDTH), generator=gen, device=device,
-                                    dtype=torch.int32),
+        "new_tokens": torch.randint(
+            0, 1 << 20, (len(requests), WIDTH), generator=gen, device=device, dtype=torch.int32
+        ),
         "new_tokens_lens": torch.tensor([2, 6, 4], dtype=torch.int32, device=device),
         "next_draft_tokens": next_draft,
         "next_new_tokens": next_new,

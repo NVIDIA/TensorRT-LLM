@@ -253,8 +253,7 @@ def resolve_moe_cls(
     # MTP-layer experts of Qwen3.5 instead of falling back to CUTLASS.
     q35_bf16_trtllm = os.environ.get("TRTLLM_Q35_MTP_MOE_BACKEND",
                                      "").upper() == "TRTLLM"
-    if (moe_cls == TRTLLMGenFusedMoE and not has_quant
-            and not q35_bf16_trtllm):
+    if (moe_cls == TRTLLMGenFusedMoE and not has_quant and not q35_bf16_trtllm):
         moe_cls = CutlassFusedMoE
 
     # Routed-expert LoRA is supported only on CutlassFusedMoE with unquantized

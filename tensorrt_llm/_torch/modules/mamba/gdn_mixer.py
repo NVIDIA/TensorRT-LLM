@@ -21,6 +21,11 @@ from tensorrt_llm._torch.modules.fla.cached_replay import (
     fused_recurrent_gated_delta_rule_cached_replay_update,
 )
 from tensorrt_llm._torch.modules.fla.fused_recurrent import fused_recurrent_gated_delta_rule_update
+from tensorrt_llm._torch.modules.fla.fused_sigmoid_gating_recurrent import (
+    _can_use_flashinfer_gdn_verify,
+    _flashinfer_gdn_verify,
+    fused_sigmoid_gating_delta_rule_update,
+)
 from tensorrt_llm._torch.modules.fla.q35_conv_replay import (
     q35_conv_replay_supported,
     q35_conv_replay_update,
@@ -33,11 +38,6 @@ from tensorrt_llm._torch.modules.fla.q35_gdn_core import (
 from tensorrt_llm._torch.modules.fla.q35_gdn_fused import (
     q35_gdn_fused_supported,
     q35_gdn_fused_update,
-)
-from tensorrt_llm._torch.modules.fla.fused_sigmoid_gating_recurrent import (
-    _can_use_flashinfer_gdn_verify,
-    _flashinfer_gdn_verify,
-    fused_sigmoid_gating_delta_rule_update,
 )
 from tensorrt_llm._utils import is_flashinfer_gdn_supported_arch
 from tensorrt_llm.logger import logger
@@ -176,9 +176,11 @@ _Q35_GDN_CORE_MIN_BATCH = int(os.environ.get("TRTLLM_Q35_GDN_CORE_MIN_BATCH", "0
 _Q35_GDN_CORE_LARGE = os.environ.get("TRTLLM_Q35_GDN_CORE_LARGE", "0") == "1"
 _q35_core_min_batch_logged: set = set()
 if _Q35_GDN_CORE_MIN_BATCH:
-    logger.info(f"TRTLLM_Q35_GDN_CORE_MIN_BATCH={_Q35_GDN_CORE_MIN_BATCH} (TRTLLM_Q35_GDN_CORE={_Q35_GDN_CORE}): "
-                f"CUDA core kernel on the separate-conv GDN verify path from b{_Q35_GDN_CORE_MIN_BATCH}"
-                + ("" if _Q35_GDN_CORE == 1 else " [inactive: needs TRTLLM_Q35_GDN_CORE=1]"))
+    logger.info(
+        f"TRTLLM_Q35_GDN_CORE_MIN_BATCH={_Q35_GDN_CORE_MIN_BATCH} (TRTLLM_Q35_GDN_CORE={_Q35_GDN_CORE}): "
+        f"CUDA core kernel on the separate-conv GDN verify path from b{_Q35_GDN_CORE_MIN_BATCH}"
+        + ("" if _Q35_GDN_CORE == 1 else " [inactive: needs TRTLLM_Q35_GDN_CORE=1]")
+    )
 # TRTLLM_Q35_GDN_BA_LATE_JOIN=1 (default off; with TRTLLM_Q35_GDN_FUSE=3/4): when in_proj_ba runs on the aux stream next
 # to the in_proj_qkvz GEMM (the stock projections, i.e. decode batches above the low-M in_proj's rows: TEP8 b >= 5),
 # the main stream joins the aux stream right before the first consumer of a / b (the fused replay kernel, or the stock
@@ -188,9 +190,11 @@ if _Q35_GDN_CORE_MIN_BATCH:
 _Q35_GDN_BA_LATE_JOIN = os.environ.get("TRTLLM_Q35_GDN_BA_LATE_JOIN", "0") == "1"
 _q35_ba_late_join_logged: set = set()
 if _Q35_GDN_BA_LATE_JOIN:
-    logger.info(f"TRTLLM_Q35_GDN_BA_LATE_JOIN=1 (TRTLLM_Q35_GDN_FUSE={_Q35_GDN_FUSE}): GDN in_proj_ba (aux stream) "
-                f"joined after the separate target-verify conv1d update"
-                + ("" if _Q35_GDN_FUSE in (3, 4) else " [inactive: needs TRTLLM_Q35_GDN_FUSE=3 or 4]"))
+    logger.info(
+        f"TRTLLM_Q35_GDN_BA_LATE_JOIN=1 (TRTLLM_Q35_GDN_FUSE={_Q35_GDN_FUSE}): GDN in_proj_ba (aux stream) "
+        f"joined after the separate target-verify conv1d update"
+        + ("" if _Q35_GDN_FUSE in (3, 4) else " [inactive: needs TRTLLM_Q35_GDN_FUSE=3 or 4]")
+    )
 
 
 # FlashInfer GDN prefill is ON by default; set TLLM_USE_FLASHINFER_GDN_PREFILL=0
@@ -350,8 +354,11 @@ def _q35_direct_call(fn, *args, **kwargs):
 # TRTLLM_Q35_CUSTOM_OP_EAGER=1: run the body of this piecewise-excluded custom op with dynamo's eval-frame hook off.
 # The op executes inside the torch.compile'd region, where every Python frame it creates (backend wrappers, Triton
 # launchers, FlashInfer glue) otherwise goes through dynamo's frame callback.
-_q35_op_call = (torch._dynamo.disable(_q35_direct_call, recursive=True)
-                if os.environ.get("TRTLLM_Q35_CUSTOM_OP_EAGER", "0") == "1" else _q35_direct_call)
+_q35_op_call = (
+    torch._dynamo.disable(_q35_direct_call, recursive=True)
+    if os.environ.get("TRTLLM_Q35_CUSTOM_OP_EAGER", "0") == "1"
+    else _q35_direct_call
+)
 
 
 # TRTLLM_Q35_GDN_PREFILL_GRAPH=1: under the piecewise torch.compile path the GDN core (state reset, conv1d,
@@ -370,7 +377,9 @@ _q35_op_call = (torch._dynamo.disable(_q35_direct_call, recursive=True)
 # TRTLLM_Q35_GDN_PREFILL_GRAPH_STATS=N logs the replay / capture counters every N calls.
 _Q35_GDN_PREFILL_GRAPH = os.environ.get("TRTLLM_Q35_GDN_PREFILL_GRAPH", "0") == "1"
 _Q35_GDN_PREFILL_GRAPH_WARMUP = int(os.environ.get("TRTLLM_Q35_GDN_PREFILL_GRAPH_WARMUP", "1"))
-_Q35_GDN_PREFILL_GRAPH_MAX_TOKENS = int(os.environ.get("TRTLLM_Q35_GDN_PREFILL_GRAPH_MAX_TOKENS", "8192"))
+_Q35_GDN_PREFILL_GRAPH_MAX_TOKENS = int(
+    os.environ.get("TRTLLM_Q35_GDN_PREFILL_GRAPH_MAX_TOKENS", "8192")
+)
 _Q35_GDN_PREFILL_GRAPH_STATS = int(os.environ.get("TRTLLM_Q35_GDN_PREFILL_GRAPH_STATS", "0"))
 # TRTLLM_Q35_GDN_GRAPH_LEAN=1 (with TRTLLM_Q35_GDN_PREFILL_GRAPH): the per-call key check reads the layer's state pool
 # addresses from the hybrid manager's per-layer state lists instead of building a mamba_layer_cache() dataclass (two
@@ -403,8 +412,16 @@ def _q35_gdn_state_ptrs(kv_cache_manager, layer_idx: int):
 
 def _q35_gdn_io_sig(mixed_qkv, a, b, output):
     """Addresses and strides of the GDN core's token inputs and output (TRTLLM_Q35_GDN_GRAPH_DIRECT)."""
-    return (mixed_qkv.data_ptr(), mixed_qkv.stride(), a.data_ptr(), a.stride(), b.data_ptr(), b.stride(),
-            output.data_ptr(), output.stride())
+    return (
+        mixed_qkv.data_ptr(),
+        mixed_qkv.stride(),
+        a.data_ptr(),
+        a.stride(),
+        b.data_ptr(),
+        b.stride(),
+        output.data_ptr(),
+        output.stride(),
+    )
 
 
 def _q35_gdn_capture(body, args) -> torch.cuda.CUDAGraph:
@@ -414,14 +431,19 @@ def _q35_gdn_capture(body, args) -> torch.cuda.CUDAGraph:
         _q35_gdn_prefill_graph_pool = torch.cuda.graph_pool_handle()
     import gc
     from unittest.mock import patch
+
     graph = torch.cuda.CUDAGraph()
     # torch.cuda.graph() runs torch.cuda.synchronize(), gc.collect() and torch.cuda.empty_cache() on entry, and
     # these captures happen while serving. gc.collect() is slow (the piecewise runner patches it out the same
     # way), and empty_cache() hands cached blocks back to the driver under the KV transceiver's (NIXL / UCX)
     # memory registrations: a disagg CTX segfaulted in nixlUcxWorker::arm right after its first lazy captures.
-    with patch.object(gc, "collect", lambda *args, **kwargs: 0), patch.object(torch.cuda, "empty_cache",
-                                                                               lambda: None):
-        with torch.cuda.graph(graph, pool=_q35_gdn_prefill_graph_pool, capture_error_mode="thread_local"):
+    with (
+        patch.object(gc, "collect", lambda *args, **kwargs: 0),
+        patch.object(torch.cuda, "empty_cache", lambda: None),
+    ):
+        with torch.cuda.graph(
+            graph, pool=_q35_gdn_prefill_graph_pool, capture_error_mode="thread_local"
+        ):
             body(*args)
     return graph
 
@@ -431,40 +453,57 @@ def _q35_gdn_static_view(role: str, t: torch.Tensor, token_dim: int) -> Optional
 
     One buffer per (role, dtype, device, layout of the other dims); None if t does not fit it.
     """
-    layout = tuple((sz, st) for i, (sz, st) in enumerate(zip(t.shape, t.stride())) if i != token_dim)
+    layout = tuple(
+        (sz, st) for i, (sz, st) in enumerate(zip(t.shape, t.stride())) if i != token_dim
+    )
     row = t.stride(token_dim)
     key = (role, t.dtype, t.device, layout, row)
     buf = _q35_gdn_prefill_static.get(key)
     if buf is None:
         extent = 1 + sum((sz - 1) * st for sz, st in layout)
-        buf = torch.empty((_Q35_GDN_PREFILL_GRAPH_MAX_TOKENS - 1) * row + extent, dtype=t.dtype, device=t.device)
+        buf = torch.empty(
+            (_Q35_GDN_PREFILL_GRAPH_MAX_TOKENS - 1) * row + extent, dtype=t.dtype, device=t.device
+        )
         _q35_gdn_prefill_static[key] = buf
     if 1 + sum((sz - 1) * st for sz, st in zip(t.shape, t.stride())) > buf.numel():
         return None
     return buf.as_strided(t.shape, t.stride())
 
 
-def _q35_gdn_prefill_graphed(gdn_layer, mixed_qkv, a, b, layer_idx, output, attn_metadata, spec_metadata) -> bool:
+def _q35_gdn_prefill_graphed(
+    gdn_layer, mixed_qkv, a, b, layer_idx, output, attn_metadata, spec_metadata
+) -> bool:
     """Run a context-only GDN core through its per-shape CUDA graph; False: not applicable, run it eagerly."""
     num_ctx = attn_metadata.num_contexts
     num_tokens = mixed_qkv.shape[0]
-    if (num_ctx == 0 or attn_metadata.seq_lens.shape[0] != num_ctx
-            or num_tokens > _Q35_GDN_PREFILL_GRAPH_MAX_TOKENS or torch.cuda.is_current_stream_capturing()):
+    if (
+        num_ctx == 0
+        or attn_metadata.seq_lens.shape[0] != num_ctx
+        or num_tokens > _Q35_GDN_PREFILL_GRAPH_MAX_TOKENS
+        or torch.cuda.is_current_stream_capturing()
+    ):
         return False
     stats = _q35_gdn_prefill_stats
     if _Q35_GDN_PREFILL_GRAPH_STATS:
         stats["call"] += 1
         if stats["call"] % _Q35_GDN_PREFILL_GRAPH_STATS == 0:
-            logger.info(f"[q35 gdn prefill graph] {dict(stats)} keys={len(_q35_gdn_prefill_graphs)}")
+            logger.info(
+                f"[q35 gdn prefill graph] {dict(stats)} keys={len(_q35_gdn_prefill_graphs)}"
+            )
     mamba_metadata = attn_metadata.mamba_metadata
     if _Q35_GDN_GRAPH_LEAN:
         conv_ptr, ssm_ptr = _q35_gdn_state_ptrs(attn_metadata.kv_cache_manager, gdn_layer.layer_idx)
     else:
         layer_cache = attn_metadata.kv_cache_manager.mamba_layer_cache(gdn_layer.layer_idx)
         conv_ptr, ssm_ptr = layer_cache.conv.data_ptr(), layer_cache.temporal.data_ptr()
-    meta = (mamba_metadata.has_initial_states.data_ptr(), mamba_metadata.state_indices.data_ptr(),
-            mamba_metadata.query_start_loc.data_ptr(), mamba_metadata.query_start_loc_long.data_ptr(),
-            conv_ptr, ssm_ptr)
+    meta = (
+        mamba_metadata.has_initial_states.data_ptr(),
+        mamba_metadata.state_indices.data_ptr(),
+        mamba_metadata.query_start_loc.data_ptr(),
+        mamba_metadata.query_start_loc_long.data_ptr(),
+        conv_ptr,
+        ssm_ptr,
+    )
     # TRTLLM_MAMBA_INFORWARD_SNAPSHOT: a split batch runs more kernels, sized by (requests split, tail tokens)
     split_sig = getattr(mamba_metadata, "q35_split_sig", 0)
     if split_sig:
@@ -481,7 +520,9 @@ def _q35_gdn_prefill_graphed(gdn_layer, mixed_qkv, a, b, layer_idx, output, attn
         entry = _q35_gdn_prefill_graphs[key] = [0, None, meta, None, None, None, None]
 
     def body(qkv, a_, b_, out):
-        gdn_layer.forward_core(qkv, a_, b_, attn_metadata, mamba_metadata, spec_metadata=spec_metadata, output=out)
+        gdn_layer.forward_core(
+            qkv, a_, b_, attn_metadata, mamba_metadata, spec_metadata=spec_metadata, output=out
+        )
 
     if _Q35_GDN_GRAPH_DIRECT:
         sig = _q35_gdn_io_sig(mixed_qkv, a, b, output)
@@ -510,8 +551,12 @@ def _q35_gdn_prefill_graphed(gdn_layer, mixed_qkv, a, b, layer_idx, output, attn
         body(mixed_qkv, a, b, output)
         return True
     if entry[1] is None:
-        views = (_q35_gdn_static_view("qkv", mixed_qkv, 0), _q35_gdn_static_view("a", a, 0),
-                 _q35_gdn_static_view("b", b, 0), _q35_gdn_static_view("out", output, 1))
+        views = (
+            _q35_gdn_static_view("qkv", mixed_qkv, 0),
+            _q35_gdn_static_view("a", a, 0),
+            _q35_gdn_static_view("b", b, 0),
+            _q35_gdn_static_view("out", output, 1),
+        )
         if any(v is None for v in views):
             stats["no_layout"] += 1
             return False
@@ -542,7 +587,15 @@ def gdn_custom_op_inplace(
 ) -> None:
     attn_metadata, gdn_layer, spec_metadata = _extract_gdn_extra_attrs(layer_idx)
     if _Q35_GDN_PREFILL_GRAPH and _q35_op_call(
-        _q35_gdn_prefill_graphed, gdn_layer, mixed_qkv, a, b, layer_idx, output, attn_metadata, spec_metadata
+        _q35_gdn_prefill_graphed,
+        gdn_layer,
+        mixed_qkv,
+        a,
+        b,
+        layer_idx,
+        output,
+        attn_metadata,
+        spec_metadata,
     ):
         return
     num_tokens = attn_metadata.num_tokens
@@ -631,7 +684,9 @@ def _verify_intermediate_state_indices(
     """
     indices = getattr(kv_cache_manager, "intermediate_state_indices", None)
     if indices is None or indices.shape[0] < num_decodes or indices.device != device:
-        indices = _cached_arange(max(kv_cache_manager.get_max_resource_count(), num_decodes), device)
+        indices = _cached_arange(
+            max(kv_cache_manager.get_max_resource_count(), num_decodes), device
+        )
     return indices[:num_decodes]
 
 
@@ -861,7 +916,9 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         if input_scale is None:
             return None
         tactic = lowm_default_tactic(m, qkvz.weight.shape[0], qkvz.weight.shape[1], mode=mode)
-        if conv is not None and not lowm_conv_supported(m, tactic, conv["weight"].shape[0], conv["tokens"]):
+        if conv is not None and not lowm_conv_supported(
+            m, tactic, conv["weight"].shape[0], conv["tokens"]
+        ):
             return None
         out_qkvz, out_ba = lowm_gemm(
             x16=hidden_states,
@@ -880,10 +937,16 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         if conv is not None:
             # TRTLLM_Q35_GDN_FUSE=4: the conv channels left through the conv1d epilogue (no stock reference).
             return out_qkvz, out_ba
-        lowm_check(f"fp8:gdn.in_proj_qkvz(fused):{act}", out_qkvz,
-                   lambda: stock_fp8_linear(qkvz, h_fp8 if h_fp8 is not None else hidden_states))
-        lowm_check("bf16:gdn.in_proj_ba(fused)", out_ba,
-                   lambda: torch.nn.functional.linear(hidden_states, ba.weight))
+        lowm_check(
+            f"fp8:gdn.in_proj_qkvz(fused):{act}",
+            out_qkvz,
+            lambda: stock_fp8_linear(qkvz, h_fp8 if h_fp8 is not None else hidden_states),
+        )
+        lowm_check(
+            "bf16:gdn.in_proj_ba(fused)",
+            out_ba,
+            lambda: torch.nn.functional.linear(hidden_states, ba.weight),
+        )
         return out_qkvz, out_ba
 
     def _compute_tokenwise_inputs(
@@ -929,8 +992,10 @@ class Qwen3NextGatedDeltaNet(nn.Module):
                 rows = hidden_states.shape[0]
                 if rows not in _q35_ba_late_join_logged:
                     _q35_ba_late_join_logged.add(rows)
-                    logger.info(f"TRTLLM_Q35_GDN_BA_LATE_JOIN: in_proj_ba join deferred at {rows} rows "
-                                f"(layer {self.layer_idx}, first call)")
+                    logger.info(
+                        f"TRTLLM_Q35_GDN_BA_LATE_JOIN: in_proj_ba join deferred at {rows} rows "
+                        f"(layer {self.layer_idx}, first call)"
+                    )
             else:
                 projected_states_qkvz, projected_states_ba = maybe_execute_in_parallel(
                     _compute_projected_states_qkvz,
@@ -1058,7 +1123,9 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         if counters is None:
             if torch.cuda.is_current_stream_capturing():
                 return None
-            self._q35_fuse_counters = counters = torch.zeros(64, dtype=torch.int32, device=ssm_states.device)
+            self._q35_fuse_counters = counters = torch.zeros(
+                64, dtype=torch.int32, device=ssm_states.device
+            )
         conv_weight = self.conv1d.weight
         if conv_weight.dim() == 3:
             conv_weight = conv_weight.view(conv_weight.shape[0], conv_weight.shape[2])
@@ -1097,22 +1164,36 @@ class Qwen3NextGatedDeltaNet(nn.Module):
                 raise RuntimeError(
                     f"TRTLLM_Q35_GDN_CORE_LARGE: the CUDA core kernel does not cover this call "
                     f"({ctx['num_decodes']} requests x {self.num_v_heads_per_tp} value heads, fuse_norm={fuse_norm}, "
-                    f"conv_in_kernel={conv_in_kernel}, mixed_qkv {tuple(mixed_qkv.shape)} {mixed_qkv.stride()})")
+                    f"conv_in_kernel={conv_in_kernel}, mixed_qkv {tuple(mixed_qkv.shape)} {mixed_qkv.stride()})"
+                )
             return y
-        min_batch = (_Q35_GDN_CORE == 1 and not conv_in_inproj and _Q35_GDN_CORE_MIN_BATCH > 0
-                     and ctx["num_decodes"] >= _Q35_GDN_CORE_MIN_BATCH)
-        if (_Q35_GDN_CORE >= 2 or (_Q35_GDN_CORE == 1 and conv_in_inproj) or min_batch) and fuse_norm \
-                and not conv_in_kernel:
+        min_batch = (
+            _Q35_GDN_CORE == 1
+            and not conv_in_inproj
+            and _Q35_GDN_CORE_MIN_BATCH > 0
+            and ctx["num_decodes"] >= _Q35_GDN_CORE_MIN_BATCH
+        )
+        if (
+            (_Q35_GDN_CORE >= 2 or (_Q35_GDN_CORE == 1 and conv_in_inproj) or min_batch)
+            and fuse_norm
+            and not conv_in_kernel
+        ):
             y = self._q35_core_call(ctx, mixed_qkv, z, a, b)
             if y is not None:
                 if min_batch and ctx["num_decodes"] not in _q35_core_min_batch_logged:
                     _q35_core_min_batch_logged.add(ctx["num_decodes"])
-                    logger.info(f"TRTLLM_Q35_GDN_CORE_MIN_BATCH={_Q35_GDN_CORE_MIN_BATCH}: CUDA core kernel on the "
-                                f"separate-conv path at b{ctx['num_decodes']} (first call)")
+                    logger.info(
+                        f"TRTLLM_Q35_GDN_CORE_MIN_BATCH={_Q35_GDN_CORE_MIN_BATCH}: CUDA core kernel on the "
+                        f"separate-conv path at b{ctx['num_decodes']} (first call)"
+                    )
                 return y
         num_decodes = ctx["num_decodes"]
         layer_cache = ctx["layer_cache"]
-        opts = _Q35_GDN_FUSE_OPTS if num_decodes < _Q35_GDN_FUSE_LARGE_FROM else _Q35_GDN_FUSE_OPTS_LARGE
+        opts = (
+            _Q35_GDN_FUSE_OPTS
+            if num_decodes < _Q35_GDN_FUSE_LARGE_FROM
+            else _Q35_GDN_FUSE_OPTS_LARGE
+        )
         common = dict(
             mixed_qkv=mixed_qkv,
             conv_weight=ctx["conv_weight"],
@@ -1263,11 +1344,14 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         out_qkvz, out_ba = res
         num_tokens = out_qkvz.shape[0]
         mixed_qkv = out_qkvz[:, : self.conv_dim_per_tp]
-        z = out_qkvz[:, self.conv_dim_per_tp :].view(num_tokens, self.num_v_heads_per_tp, self.head_v_dim)
+        z = out_qkvz[:, self.conv_dim_per_tp :].view(
+            num_tokens, self.num_v_heads_per_tp, self.head_v_dim
+        )
         b = out_ba[:, : self.num_v_heads_per_tp]
         a = out_ba[:, self.num_v_heads_per_tp :]
-        return self._q35_fused_call(ctx, mixed_qkv, z, a, b, conv_in_kernel=False, fuse_norm=True,
-                                    conv_in_inproj=True)
+        return self._q35_fused_call(
+            ctx, mixed_qkv, z, a, b, conv_in_kernel=False, fuse_norm=True, conv_in_inproj=True
+        )
 
     def _q35_fused_verify(
         self,
@@ -1285,14 +1369,19 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             return None
         num_decodes = ctx["num_decodes"]
         draft_token_num = ctx["draft_token_num"]
-        conv_in_kernel = _Q35_GDN_FUSE in (1, 2)  # 3 (and 4 when it falls back) run the conv kernel here
+        conv_in_kernel = _Q35_GDN_FUSE in (
+            1,
+            2,
+        )  # 3 (and 4 when it falls back) run the conv kernel here
         if not conv_in_kernel:
             # Separate conv1d update (as forward_decode's replay branch: PDL chain conv -> fused replay), then the
             # fused kernel reads the convolved q|k|v rows.
             state_indices = ctx["state_indices"]
             layer_cache = ctx["layer_cache"]
             intermediate_state_indices = (
-                _verify_intermediate_state_indices(ctx["kv_cache_manager"], num_decodes, state_indices.device)
+                _verify_intermediate_state_indices(
+                    ctx["kv_cache_manager"], num_decodes, state_indices.device
+                )
                 if _Q35_GDN_ARANGE_CACHE
                 else torch.arange(num_decodes, dtype=torch.int32, device=state_indices.device)
             )
@@ -2020,7 +2109,9 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         # TRTLLM_Q35_GDN_BA_LATE_JOIN: on the FUSE=3/4 verify path the separate conv1d update does not read a / b, so
         # the aux-stream in_proj_ba is joined after it (_q35_fused_verify) instead of right after the qkvz GEMM.
         defer_ba_join = _Q35_GDN_BA_LATE_JOIN and _Q35_GDN_FUSE in (3, 4)
-        mixed_qkv, z, a, b = self._compute_tokenwise_inputs(hidden_states, h_fp8, defer_ba_join=defer_ba_join)
+        mixed_qkv, z, a, b = self._compute_tokenwise_inputs(
+            hidden_states, h_fp8, defer_ba_join=defer_ba_join
+        )
 
         if _Q35_GDN_FUSE:
             fused = self._q35_fused_verify(mixed_qkv, z, a, b, attn_metadata, spec_metadata)

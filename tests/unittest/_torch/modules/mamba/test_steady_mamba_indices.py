@@ -30,7 +30,8 @@ def _manager(max_batch=4):
         _request_id_to_is_dummy={},
     )
     m._refresh_dummy_request_mask = types.MethodType(
-        MambaHybridCacheManager._refresh_dummy_request_mask, m)
+        MambaHybridCacheManager._refresh_dummy_request_mask, m
+    )
     m.setup = types.MethodType(MambaHybridCacheManagerV2._setup_state_indices, m)
     return m
 
@@ -44,12 +45,16 @@ def _req(rid, dummy=False):
 
 
 def _state(m):
-    return (m.cuda_state_indices.clone(), m._dummy_request_mask.clone(),
-            dict(m._request_id_to_state_index), dict(m._request_id_to_is_dummy))
+    return (
+        m.cuda_state_indices.clone(),
+        m._dummy_request_mask.clone(),
+        dict(m._request_id_to_state_index),
+        dict(m._request_id_to_is_dummy),
+    )
 
 
 def _same(a, b):
-    return (torch.equal(a[0], b[0]) and torch.equal(a[1], b[1]) and a[2] == b[2] and a[3] == b[3])
+    return torch.equal(a[0], b[0]) and torch.equal(a[1], b[1]) and a[2] == b[2] and a[3] == b[3]
 
 
 # (requests, {rid: ssm base}) per step: arrivals, a moved SSM block, a dummy pad, a departure.
@@ -141,13 +146,24 @@ def test_mamba2_metadata_steady_matches_full_path(monkeypatch):
         return types.SimpleNamespace(
             seq_lens=torch.ones(n, dtype=torch.int32),
             seq_lens_cuda=torch.ones(n, dtype=torch.int32, device="cuda"),
-            num_contexts=0, num_ctx_tokens=0, kv_cache_manager=kv, request_ids=list(rids),
-            kv_cache_params=types.SimpleNamespace(num_cached_tokens_per_seq=[100] * n))
+            num_contexts=0,
+            num_ctx_tokens=0,
+            kv_cache_manager=kv,
+            request_ids=list(rids),
+            kv_cache_params=types.SimpleNamespace(num_cached_tokens_per_seq=[100] * n),
+        )
 
     full, steady = Mamba2Metadata(4, 128), Mamba2Metadata(4, 128)
     kv = _Kv()
-    seq = [([5], {5: 40}), ([5], {5: 40}), ([5, 7], {5: 40, 7: 12}), ([5, 7], {5: 40, 7: 12}),
-           ([5, 7], {5: 41, 7: 12}), ([7], {7: 12}), ([7], {7: 12})]
+    seq = [
+        ([5], {5: 40}),
+        ([5], {5: 40}),
+        ([5, 7], {5: 40, 7: 12}),
+        ([5, 7], {5: 40, 7: 12}),
+        ([5, 7], {5: 41, 7: 12}),
+        ([7], {7: 12}),
+        ([7], {7: 12}),
+    ]
     for rids, idx in seq:
         kv.indices = dict(idx)
         monkeypatch.delenv("TRTLLM_Q35_STEADY_MAMBA_INDICES", raising=False)

@@ -21,8 +21,8 @@ from typing import Optional
 from tensorrt_llm.llmapi.llm_args import CapacitySchedulerPolicy, ContextChunkingPolicy
 from tensorrt_llm.logger import logger
 
-from ..llm_request import LlmRequest, LlmRequestState, get_draft_token_length
 from .. import q35_admit_timers
+from ..llm_request import LlmRequest, LlmRequestState, get_draft_token_length
 from .scheduler import (
     RequestList,
     RequestScheduler,
@@ -881,7 +881,10 @@ class KVCacheV2Scheduler(RequestScheduler):
             return None
         if pos + req.context_remaining_length != end:
             return None
-        if end - point > manager.q35_inforward_max_tail or point - pos < manager.q35_inforward_min_main:
+        if (
+            end - point > manager.q35_inforward_max_tail
+            or point - pos < manager.q35_inforward_min_main
+        ):
             return None
         if remaining_budget is not None and end - pos > remaining_budget:
             return None

@@ -127,8 +127,9 @@ def test_negative_controls_variant_not_captured_or_rejection_sampling():
     reqs = [_request(temperature=1.0)]
     _scan(meta, reqs)
     assert meta.q35_temperature_only is False
-    assert _key(meta, reqs) == KeyType(batch_size=1, draft_len=6, is_first_draft=False,
-                                       is_all_greedy_sample=False)
+    assert _key(meta, reqs) == KeyType(
+        batch_size=1, draft_len=6, is_first_draft=False, is_all_greedy_sample=False
+    )
     # Rejection sampling takes its own path; never the sharded sampler.
     meta = _meta(rejection=True)
     _scan(meta, reqs)

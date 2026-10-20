@@ -91,40 +91,82 @@ DBG_RING_CTAS = 256  # CTA stride of the in-model debug ring (>= SMs)
 # inline PTX helpers
 # --------------------------------------------------------------------------------------------------------------------
 def _asm(ret, args, text, cons, side_effects, loc, ip):
-    return llvm.inline_asm(ret, args, text, cons, has_side_effects=side_effects, is_align_stack=False,
-                           asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip)
+    return llvm.inline_asm(
+        ret,
+        args,
+        text,
+        cons,
+        has_side_effects=side_effects,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
 
 
 @dsl_user_op
 def _ex2(x, *, loc=None, ip=None) -> Float32:
-    return Float32(_asm(T.f32(), [Float32(x).ir_value(loc=loc, ip=ip)], "ex2.approx.ftz.f32 $0, $1;", "=f,f",
-                        False, loc, ip))
+    return Float32(
+        _asm(
+            T.f32(),
+            [Float32(x).ir_value(loc=loc, ip=ip)],
+            "ex2.approx.ftz.f32 $0, $1;",
+            "=f,f",
+            False,
+            loc,
+            ip,
+        )
+    )
 
 
 @dsl_user_op
 def _pack_e4m3x4(a, b, c, d, *, loc=None, ip=None) -> Uint32:
     """Four FP32 -> four E4M3 (cvt.rn.satfinite), ``a`` in the low byte."""
-    out = _asm(T.i32(), [Float32(v).ir_value(loc=loc, ip=ip) for v in (a, b, c, d)],
-               "{\n\t.reg .b16 lo, hi;\n\t"
-               "cvt.rn.satfinite.e4m3x2.f32 lo, $2, $1;\n\t"
-               "cvt.rn.satfinite.e4m3x2.f32 hi, $4, $3;\n\t"
-               "mov.b32 $0, {lo, hi};\n\t}\n", "=r,f,f,f,f", False, loc, ip)
+    out = _asm(
+        T.i32(),
+        [Float32(v).ir_value(loc=loc, ip=ip) for v in (a, b, c, d)],
+        "{\n\t.reg .b16 lo, hi;\n\t"
+        "cvt.rn.satfinite.e4m3x2.f32 lo, $2, $1;\n\t"
+        "cvt.rn.satfinite.e4m3x2.f32 hi, $4, $3;\n\t"
+        "mov.b32 $0, {lo, hi};\n\t}\n",
+        "=r,f,f,f,f",
+        False,
+        loc,
+        ip,
+    )
     return Uint32(out)
 
 
 @dsl_user_op
 def _st_shared_v4(addr, a, b, c, d, *, loc=None, ip=None) -> None:
-    _asm(None, [Int32(addr).ir_value(loc=loc, ip=ip)] + [Uint32(v).ir_value(loc=loc, ip=ip) for v in (a, b, c, d)],
-         "st.shared.v4.b32 [$0], {$1, $2, $3, $4};", "r,r,r,r,r", True, loc, ip)
+    _asm(
+        None,
+        [Int32(addr).ir_value(loc=loc, ip=ip)]
+        + [Uint32(v).ir_value(loc=loc, ip=ip) for v in (a, b, c, d)],
+        "st.shared.v4.b32 [$0], {$1, $2, $3, $4};",
+        "r,r,r,r,r",
+        True,
+        loc,
+        ip,
+    )
 
 
 @dsl_user_op
 def _bar_red_or(pred, bar_id: int, nthreads: int, *, loc=None, ip=None) -> Int32:
     """Named barrier over ``nthreads`` threads that also ORs a predicate (``barrier.cta.red.or.pred``)."""
-    return Int32(_asm(T.i32(), [Int32(pred).ir_value(loc=loc, ip=ip)],
-                      "{\n\t.reg .pred pi, po;\n\tsetp.ne.s32 pi, $1, 0;\n\t"
-                      f"barrier.cta.red.or.pred po, {bar_id}, {nthreads}, pi;\n\t"
-                      "selp.s32 $0, 1, 0, po;\n\t}\n", "=r,r", True, loc, ip))
+    return Int32(
+        _asm(
+            T.i32(),
+            [Int32(pred).ir_value(loc=loc, ip=ip)],
+            "{\n\t.reg .pred pi, po;\n\tsetp.ne.s32 pi, $1, 0;\n\t"
+            f"barrier.cta.red.or.pred po, {bar_id}, {nthreads}, pi;\n\t"
+            "selp.s32 $0, 1, 0, po;\n\t}\n",
+            "=r,r",
+            True,
+            loc,
+            ip,
+        )
+    )
 
 
 @dsl_user_op
@@ -139,55 +181,119 @@ def _griddep_launch(*, loc=None, ip=None) -> None:
 
 @dsl_user_op
 def _red_release_add_u64(addr, val, *, loc=None, ip=None) -> None:
-    _asm(None, [Int64(addr).ir_value(loc=loc, ip=ip), Int64(val).ir_value(loc=loc, ip=ip)],
-         "red.release.gpu.global.add.u64 [$0], $1;", "l,l", True, loc, ip)
+    _asm(
+        None,
+        [Int64(addr).ir_value(loc=loc, ip=ip), Int64(val).ir_value(loc=loc, ip=ip)],
+        "red.release.gpu.global.add.u64 [$0], $1;",
+        "l,l",
+        True,
+        loc,
+        ip,
+    )
 
 
 @dsl_user_op
 def _ld_acquire_gpu_u64(addr, *, loc=None, ip=None) -> Int64:
-    return Int64(_asm(T.i64(), [Int64(addr).ir_value(loc=loc, ip=ip)], "ld.acquire.gpu.global.u64 $0, [$1];",
-                      "=l,l", True, loc, ip))
+    return Int64(
+        _asm(
+            T.i64(),
+            [Int64(addr).ir_value(loc=loc, ip=ip)],
+            "ld.acquire.gpu.global.u64 $0, [$1];",
+            "=l,l",
+            True,
+            loc,
+            ip,
+        )
+    )
 
 
 @dsl_user_op
 def _ld_relaxed_gpu_u64(addr, *, loc=None, ip=None) -> Int64:
-    return Int64(_asm(T.i64(), [Int64(addr).ir_value(loc=loc, ip=ip)], "ld.relaxed.gpu.global.u64 $0, [$1];",
-                      "=l,l", True, loc, ip))
+    return Int64(
+        _asm(
+            T.i64(),
+            [Int64(addr).ir_value(loc=loc, ip=ip)],
+            "ld.relaxed.gpu.global.u64 $0, [$1];",
+            "=l,l",
+            True,
+            loc,
+            ip,
+        )
+    )
 
 
 @dsl_user_op
 def _st_shared_f32(addr, v, *, loc=None, ip=None) -> None:
-    _asm(None, [Int32(addr).ir_value(loc=loc, ip=ip), Float32(v).ir_value(loc=loc, ip=ip)],
-         "st.shared.f32 [$0], $1;", "r,f", True, loc, ip)
+    _asm(
+        None,
+        [Int32(addr).ir_value(loc=loc, ip=ip), Float32(v).ir_value(loc=loc, ip=ip)],
+        "st.shared.f32 [$0], $1;",
+        "r,f",
+        True,
+        loc,
+        ip,
+    )
 
 
 @dsl_user_op
 def _ld_shared_v4(addr, *, loc=None, ip=None):
-    out = _asm(llvm.StructType.get_literal([T.f32()] * 4), [Int32(addr).ir_value(loc=loc, ip=ip)],
-               "ld.shared.v4.f32 {$0, $1, $2, $3}, [$4];", "=f,=f,=f,=f,r", True, loc, ip)
+    out = _asm(
+        llvm.StructType.get_literal([T.f32()] * 4),
+        [Int32(addr).ir_value(loc=loc, ip=ip)],
+        "ld.shared.v4.f32 {$0, $1, $2, $3}, [$4];",
+        "=f,=f,=f,=f,r",
+        True,
+        loc,
+        ip,
+    )
     return tuple(Float32(llvm.extractvalue(T.f32(), out, [i], loc=loc, ip=ip)) for i in range(4))
 
 
 @dsl_user_op
 def _st_global_v4(addr, a, b, c, d, *, loc=None, ip=None) -> None:
-    _asm(None, [Int64(addr).ir_value(loc=loc, ip=ip)] + [Float32(v).ir_value(loc=loc, ip=ip) for v in (a, b, c, d)],
-         "st.global.v4.f32 [$0], {$1, $2, $3, $4};", "l,f,f,f,f", True, loc, ip)
+    _asm(
+        None,
+        [Int64(addr).ir_value(loc=loc, ip=ip)]
+        + [Float32(v).ir_value(loc=loc, ip=ip) for v in (a, b, c, d)],
+        "st.global.v4.f32 [$0], {$1, $2, $3, $4};",
+        "l,f,f,f,f",
+        True,
+        loc,
+        ip,
+    )
 
 
 @dsl_user_op
 def _ld_shared_v2(addr, *, loc=None, ip=None):
-    out = _asm(llvm.StructType.get_literal([T.f32()] * 2), [Int32(addr).ir_value(loc=loc, ip=ip)],
-               "ld.shared.v2.f32 {$0, $1}, [$2];", "=f,=f,r", True, loc, ip)
+    out = _asm(
+        llvm.StructType.get_literal([T.f32()] * 2),
+        [Int32(addr).ir_value(loc=loc, ip=ip)],
+        "ld.shared.v2.f32 {$0, $1}, [$2];",
+        "=f,=f,r",
+        True,
+        loc,
+        ip,
+    )
     return tuple(Float32(llvm.extractvalue(T.f32(), out, [i], loc=loc, ip=ip)) for i in range(2))
 
 
 @dsl_user_op
 def _bulk_g2s(dst_smem, src_gmem, nbytes, mbar_smem, *, loc=None, ip=None) -> None:
     """cp.async.bulk global -> shared (16-byte aligned, size a multiple of 16), completion on an mbarrier."""
-    _asm(None, [Int32(dst_smem).ir_value(loc=loc, ip=ip), Int64(src_gmem).ir_value(loc=loc, ip=ip),
-                Int32(nbytes).ir_value(loc=loc, ip=ip), Int32(mbar_smem).ir_value(loc=loc, ip=ip)],
-         "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [$0], [$1], $2, [$3];", "r,l,r,r", True,
-         loc, ip)
+    _asm(
+        None,
+        [
+            Int32(dst_smem).ir_value(loc=loc, ip=ip),
+            Int64(src_gmem).ir_value(loc=loc, ip=ip),
+            Int32(nbytes).ir_value(loc=loc, ip=ip),
+            Int32(mbar_smem).ir_value(loc=loc, ip=ip),
+        ],
+        "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [$0], [$1], $2, [$3];",
+        "r,l,r,r",
+        True,
+        loc,
+        ip,
+    )
 
 
 @dsl_user_op
@@ -217,146 +323,331 @@ def _globaltimer(*, loc=None, ip=None) -> Int64:
 # unrelated earlier store (that serialized the cos / sin table rounds).
 @dsl_user_op
 def _ld_global_b32(addr, *, loc=None, ip=None) -> Uint32:
-    return Uint32(_asm(T.i32(), [Int64(addr).ir_value(loc=loc, ip=ip)], "ld.global.b32 $0, [$1];", "=r,l",
-                       True, loc, ip))
+    return Uint32(
+        _asm(
+            T.i32(),
+            [Int64(addr).ir_value(loc=loc, ip=ip)],
+            "ld.global.b32 $0, [$1];",
+            "=r,l",
+            True,
+            loc,
+            ip,
+        )
+    )
 
 
 @dsl_user_op
 def _ld_global_f32(addr, *, loc=None, ip=None) -> Float32:
-    return Float32(_asm(T.f32(), [Int64(addr).ir_value(loc=loc, ip=ip)], "ld.global.f32 $0, [$1];",
-                        "=f,l", True, loc, ip))
+    return Float32(
+        _asm(
+            T.f32(),
+            [Int64(addr).ir_value(loc=loc, ip=ip)],
+            "ld.global.f32 $0, [$1];",
+            "=f,l",
+            True,
+            loc,
+            ip,
+        )
+    )
 
 
 @dsl_user_op
 def _ld_global_s64(addr, *, loc=None, ip=None) -> Int64:
-    return Int64(_asm(T.i64(), [Int64(addr).ir_value(loc=loc, ip=ip)], "ld.global.s64 $0, [$1];", "=l,l",
-                      True, loc, ip))
+    return Int64(
+        _asm(
+            T.i64(),
+            [Int64(addr).ir_value(loc=loc, ip=ip)],
+            "ld.global.s64 $0, [$1];",
+            "=l,l",
+            True,
+            loc,
+            ip,
+        )
+    )
 
 
 @dsl_user_op
 def _ld_global_s32(addr, *, loc=None, ip=None) -> Int32:
-    return Int32(_asm(T.i32(), [Int64(addr).ir_value(loc=loc, ip=ip)], "ld.global.s32 $0, [$1];", "=r,l",
-                      True, loc, ip))
+    return Int32(
+        _asm(
+            T.i32(),
+            [Int64(addr).ir_value(loc=loc, ip=ip)],
+            "ld.global.s32 $0, [$1];",
+            "=r,l",
+            True,
+            loc,
+            ip,
+        )
+    )
 
 
 @dsl_user_op
 def _bf16_lo(u, *, loc=None, ip=None) -> Float32:
     """Low bf16 of a 32-bit word as FP32 (exact)."""
-    return Float32(_asm(T.f32(), [Uint32(u).ir_value(loc=loc, ip=ip)],
-                        "{\n\t.reg .b16 l, h;\n\tmov.b32 {l, h}, $1;\n\tcvt.f32.bf16 $0, l;\n\t}\n", "=f,r", False,
-                        loc, ip))
+    return Float32(
+        _asm(
+            T.f32(),
+            [Uint32(u).ir_value(loc=loc, ip=ip)],
+            "{\n\t.reg .b16 l, h;\n\tmov.b32 {l, h}, $1;\n\tcvt.f32.bf16 $0, l;\n\t}\n",
+            "=f,r",
+            False,
+            loc,
+            ip,
+        )
+    )
 
 
 @dsl_user_op
 def _bf16_hi(u, *, loc=None, ip=None) -> Float32:
     """High bf16 of a 32-bit word as FP32 (exact)."""
-    return Float32(_asm(T.f32(), [Uint32(u).ir_value(loc=loc, ip=ip)],
-                        "{\n\t.reg .b16 l, h;\n\tmov.b32 {l, h}, $1;\n\tcvt.f32.bf16 $0, h;\n\t}\n", "=f,r", False,
-                        loc, ip))
+    return Float32(
+        _asm(
+            T.f32(),
+            [Uint32(u).ir_value(loc=loc, ip=ip)],
+            "{\n\t.reg .b16 l, h;\n\tmov.b32 {l, h}, $1;\n\tcvt.f32.bf16 $0, h;\n\t}\n",
+            "=f,r",
+            False,
+            loc,
+            ip,
+        )
+    )
 
 
 @dsl_user_op
 def _rn_bf16(x, *, loc=None, ip=None) -> Float32:
     """x rounded to bf16 (round to nearest even), as FP32."""
-    return Float32(_asm(T.f32(), [Float32(x).ir_value(loc=loc, ip=ip)],
-                        "{\n\t.reg .b16 h;\n\tcvt.rn.bf16.f32 h, $1;\n\tcvt.f32.bf16 $0, h;\n\t}\n", "=f,f", False,
-                        loc, ip))
+    return Float32(
+        _asm(
+            T.f32(),
+            [Float32(x).ir_value(loc=loc, ip=ip)],
+            "{\n\t.reg .b16 h;\n\tcvt.rn.bf16.f32 h, $1;\n\tcvt.f32.bf16 $0, h;\n\t}\n",
+            "=f,f",
+            False,
+            loc,
+            ip,
+        )
+    )
 
 
 @dsl_user_op
 def _rn_bf16x2(a, b, *, loc=None, ip=None):
     """(a, b) rounded to bf16 (round to nearest even) with one packed conversion, as FP32."""
-    out = _asm(llvm.StructType.get_literal([T.f32()] * 2),
-               [Float32(a).ir_value(loc=loc, ip=ip), Float32(b).ir_value(loc=loc, ip=ip)],
-               "{\n\t.reg .b32 p;\n\tcvt.rn.bf16x2.f32 p, $3, $2;\n\tshl.b32 $0, p, 16;\n\t"
-               "and.b32 $1, p, 0xffff0000;\n\t}\n", "=f,=f,f,f", False, loc, ip)
-    return (Float32(llvm.extractvalue(T.f32(), out, [0], loc=loc, ip=ip)),
-            Float32(llvm.extractvalue(T.f32(), out, [1], loc=loc, ip=ip)))
+    out = _asm(
+        llvm.StructType.get_literal([T.f32()] * 2),
+        [Float32(a).ir_value(loc=loc, ip=ip), Float32(b).ir_value(loc=loc, ip=ip)],
+        "{\n\t.reg .b32 p;\n\tcvt.rn.bf16x2.f32 p, $3, $2;\n\tshl.b32 $0, p, 16;\n\t"
+        "and.b32 $1, p, 0xffff0000;\n\t}\n",
+        "=f,=f,f,f",
+        False,
+        loc,
+        ip,
+    )
+    return (
+        Float32(llvm.extractvalue(T.f32(), out, [0], loc=loc, ip=ip)),
+        Float32(llvm.extractvalue(T.f32(), out, [1], loc=loc, ip=ip)),
+    )
 
 
 @dsl_user_op
 def _mul_rn(a, b, *, loc=None, ip=None) -> Float32:
-    return Float32(_asm(T.f32(), [Float32(a).ir_value(loc=loc, ip=ip), Float32(b).ir_value(loc=loc, ip=ip)],
-                        "mul.rn.f32 $0, $1, $2;", "=f,f,f", False, loc, ip))
+    return Float32(
+        _asm(
+            T.f32(),
+            [Float32(a).ir_value(loc=loc, ip=ip), Float32(b).ir_value(loc=loc, ip=ip)],
+            "mul.rn.f32 $0, $1, $2;",
+            "=f,f,f",
+            False,
+            loc,
+            ip,
+        )
+    )
 
 
 @dsl_user_op
 def _add_rn(a, b, *, loc=None, ip=None) -> Float32:
-    return Float32(_asm(T.f32(), [Float32(a).ir_value(loc=loc, ip=ip), Float32(b).ir_value(loc=loc, ip=ip)],
-                        "add.rn.f32 $0, $1, $2;", "=f,f,f", False, loc, ip))
+    return Float32(
+        _asm(
+            T.f32(),
+            [Float32(a).ir_value(loc=loc, ip=ip), Float32(b).ir_value(loc=loc, ip=ip)],
+            "add.rn.f32 $0, $1, $2;",
+            "=f,f,f",
+            False,
+            loc,
+            ip,
+        )
+    )
 
 
 @dsl_user_op
 def _fma_rn(a, b, c, *, loc=None, ip=None) -> Float32:
-    return Float32(_asm(T.f32(), [Float32(v).ir_value(loc=loc, ip=ip) for v in (a, b, c)],
-                        "fma.rn.f32 $0, $1, $2, $3;", "=f,f,f,f", False, loc, ip))
+    return Float32(
+        _asm(
+            T.f32(),
+            [Float32(v).ir_value(loc=loc, ip=ip) for v in (a, b, c)],
+            "fma.rn.f32 $0, $1, $2, $3;",
+            "=f,f,f,f",
+            False,
+            loc,
+            ip,
+        )
+    )
 
 
 @dsl_user_op
 def _neg(a, *, loc=None, ip=None) -> Float32:
-    return Float32(_asm(T.f32(), [Float32(a).ir_value(loc=loc, ip=ip)], "neg.f32 $0, $1;", "=f,f", False, loc, ip))
+    return Float32(
+        _asm(
+            T.f32(),
+            [Float32(a).ir_value(loc=loc, ip=ip)],
+            "neg.f32 $0, $1;",
+            "=f,f",
+            False,
+            loc,
+            ip,
+        )
+    )
 
 
 @dsl_user_op
 def _div_full(a, b, *, loc=None, ip=None) -> Float32:
-    return Float32(_asm(T.f32(), [Float32(a).ir_value(loc=loc, ip=ip), Float32(b).ir_value(loc=loc, ip=ip)],
-                        "div.full.f32 $0, $1, $2;", "=f,f,f", False, loc, ip))
+    return Float32(
+        _asm(
+            T.f32(),
+            [Float32(a).ir_value(loc=loc, ip=ip), Float32(b).ir_value(loc=loc, ip=ip)],
+            "div.full.f32 $0, $1, $2;",
+            "=f,f,f",
+            False,
+            loc,
+            ip,
+        )
+    )
 
 
 @dsl_user_op
 def _rsqrt_ftz(a, *, loc=None, ip=None) -> Float32:
-    return Float32(_asm(T.f32(), [Float32(a).ir_value(loc=loc, ip=ip)], "rsqrt.approx.ftz.f32 $0, $1;", "=f,f",
-                        False, loc, ip))
+    return Float32(
+        _asm(
+            T.f32(),
+            [Float32(a).ir_value(loc=loc, ip=ip)],
+            "rsqrt.approx.ftz.f32 $0, $1;",
+            "=f,f",
+            False,
+            loc,
+            ip,
+        )
+    )
 
 
 @dsl_user_op
 def _e4m3x2(a, b, *, loc=None, ip=None) -> Uint32:
     """Two FP32 -> two E4M3 (cvt.rn.satfinite), ``a`` in the low byte, in the low 16 bits of the result."""
-    return Uint32(_asm(T.i32(), [Float32(a).ir_value(loc=loc, ip=ip), Float32(b).ir_value(loc=loc, ip=ip)],
-                       "{\n\t.reg .b16 p;\n\tcvt.rn.satfinite.e4m3x2.f32 p, $2, $1;\n\tcvt.u32.u16 $0, p;\n\t}\n",
-                       "=r,f,f", False, loc, ip))
+    return Uint32(
+        _asm(
+            T.i32(),
+            [Float32(a).ir_value(loc=loc, ip=ip), Float32(b).ir_value(loc=loc, ip=ip)],
+            "{\n\t.reg .b16 p;\n\tcvt.rn.satfinite.e4m3x2.f32 p, $2, $1;\n\tcvt.u32.u16 $0, p;\n\t}\n",
+            "=r,f,f",
+            False,
+            loc,
+            ip,
+        )
+    )
 
 
 @dsl_user_op
 def _selp_f32(pred, a, b, *, loc=None, ip=None) -> Float32:
     """pred != 0 ? a : b (branch-free)."""
-    return Float32(_asm(T.f32(), [Int32(pred).ir_value(loc=loc, ip=ip), Float32(a).ir_value(loc=loc, ip=ip),
-                                  Float32(b).ir_value(loc=loc, ip=ip)],
-                        "{\n\t.reg .pred p;\n\tsetp.ne.s32 p, $1, 0;\n\tselp.f32 $0, $2, $3, p;\n\t}\n",
-                        "=f,r,f,f", False, loc, ip))
+    return Float32(
+        _asm(
+            T.f32(),
+            [
+                Int32(pred).ir_value(loc=loc, ip=ip),
+                Float32(a).ir_value(loc=loc, ip=ip),
+                Float32(b).ir_value(loc=loc, ip=ip),
+            ],
+            "{\n\t.reg .pred p;\n\tsetp.ne.s32 p, $1, 0;\n\tselp.f32 $0, $2, $3, p;\n\t}\n",
+            "=f,r,f,f",
+            False,
+            loc,
+            ip,
+        )
+    )
 
 
 @dsl_user_op
 def _selp_u32(pred, a, b, *, loc=None, ip=None) -> Uint32:
     """pred != 0 ? a : b (branch-free)."""
-    return Uint32(_asm(T.i32(), [Int32(pred).ir_value(loc=loc, ip=ip), Uint32(a).ir_value(loc=loc, ip=ip),
-                                 Uint32(b).ir_value(loc=loc, ip=ip)],
-                       "{\n\t.reg .pred p;\n\tsetp.ne.s32 p, $1, 0;\n\tselp.b32 $0, $2, $3, p;\n\t}\n",
-                       "=r,r,r,r", False, loc, ip))
+    return Uint32(
+        _asm(
+            T.i32(),
+            [
+                Int32(pred).ir_value(loc=loc, ip=ip),
+                Uint32(a).ir_value(loc=loc, ip=ip),
+                Uint32(b).ir_value(loc=loc, ip=ip),
+            ],
+            "{\n\t.reg .pred p;\n\tsetp.ne.s32 p, $1, 0;\n\tselp.b32 $0, $2, $3, p;\n\t}\n",
+            "=r,r,r,r",
+            False,
+            loc,
+            ip,
+        )
+    )
 
 
 @dsl_user_op
 def _st_shared_b16(addr, v, *, loc=None, ip=None) -> None:
-    _asm(None, [Int32(addr).ir_value(loc=loc, ip=ip), Uint32(v).ir_value(loc=loc, ip=ip)],
-         "{\n\t.reg .b16 p;\n\tcvt.u16.u32 p, $1;\n\tst.shared.b16 [$0], p;\n\t}\n", "r,r", True, loc, ip)
+    _asm(
+        None,
+        [Int32(addr).ir_value(loc=loc, ip=ip), Uint32(v).ir_value(loc=loc, ip=ip)],
+        "{\n\t.reg .b16 p;\n\tcvt.u16.u32 p, $1;\n\tst.shared.b16 [$0], p;\n\t}\n",
+        "r,r",
+        True,
+        loc,
+        ip,
+    )
 
 
 @dsl_user_op
 def _st_global_b16(addr, v, *, loc=None, ip=None) -> None:
-    _asm(None, [Int64(addr).ir_value(loc=loc, ip=ip), Uint32(v).ir_value(loc=loc, ip=ip)],
-         "{\n\t.reg .b16 p;\n\tcvt.u16.u32 p, $1;\n\tst.global.b16 [$0], p;\n\t}\n", "l,r,~{memory}", True, loc, ip)
+    _asm(
+        None,
+        [Int64(addr).ir_value(loc=loc, ip=ip), Uint32(v).ir_value(loc=loc, ip=ip)],
+        "{\n\t.reg .b16 p;\n\tcvt.u16.u32 p, $1;\n\tst.global.b16 [$0], p;\n\t}\n",
+        "l,r,~{memory}",
+        True,
+        loc,
+        ip,
+    )
 
 
 @dsl_user_op
 def _shfl_bfly_f32(x, offset: int, *, loc=None, ip=None) -> Float32:
-    return Float32(_asm(T.f32(), [Float32(x).ir_value(loc=loc, ip=ip)],
-                        f"shfl.sync.bfly.b32 $0, $1, {offset}, 31, -1;", "=f,f", True, loc, ip))
+    return Float32(
+        _asm(
+            T.f32(),
+            [Float32(x).ir_value(loc=loc, ip=ip)],
+            f"shfl.sync.bfly.b32 $0, $1, {offset}, 31, -1;",
+            "=f,f",
+            True,
+            loc,
+            ip,
+        )
+    )
 
 
 @dsl_user_op
 def _shfl_idx0_f32(x, *, loc=None, ip=None) -> Float32:
-    return Float32(_asm(T.f32(), [Float32(x).ir_value(loc=loc, ip=ip)], "shfl.sync.idx.b32 $0, $1, 0, 31, -1;",
-                        "=f,f", True, loc, ip))
+    return Float32(
+        _asm(
+            T.f32(),
+            [Float32(x).ir_value(loc=loc, ip=ip)],
+            "shfl.sync.idx.b32 $0, $1, 0, 31, -1;",
+            "=f,f",
+            True,
+            loc,
+            ip,
+        )
+    )
 
 
 # --------------------------------------------------------------------------------------------------------------------
@@ -379,11 +670,31 @@ class Q35DecodeAttnKernel:
                      %globaltimer / clock64 stamps per CTA).
     """
 
-    def __init__(self, *, q_len: int, group: int, has_gate: bool, bmm1_from_ptr: bool, bmm2_from_ptr: bool,
-                 use_pdl: bool = True, trigger: str = "end", kv_pre_wait: bool = True, evict_first: bool = True,
-                 stages: int = 2, debug_ts: bool = False, unsafe_skip_wait: bool = False, n_splits: int = 152,
-                 fresh_margin_pages: int = 1, p_shift: float = 0.0, fold: bool = False, use_mrope: bool = False,
-                 mrope_s1: int = 0, mrope_s2: int = 0, pos_i64: bool = False, debug_ring: int = 0):
+    def __init__(
+        self,
+        *,
+        q_len: int,
+        group: int,
+        has_gate: bool,
+        bmm1_from_ptr: bool,
+        bmm2_from_ptr: bool,
+        use_pdl: bool = True,
+        trigger: str = "end",
+        kv_pre_wait: bool = True,
+        evict_first: bool = True,
+        stages: int = 2,
+        debug_ts: bool = False,
+        unsafe_skip_wait: bool = False,
+        n_splits: int = 152,
+        fresh_margin_pages: int = 1,
+        p_shift: float = 0.0,
+        fold: bool = False,
+        use_mrope: bool = False,
+        mrope_s1: int = 0,
+        mrope_s2: int = 0,
+        pos_i64: bool = False,
+        debug_ring: int = 0,
+    ):
         self.q_len = q_len
         # in-model diagnostics (see q35_cp_partial_attn.py): per launch and CTA (entry, wait done, barrier arrive,
         # barrier release, end, smid, launch * 64 + batch, setup done) into a ring of `debug_ring` launches
@@ -402,7 +713,9 @@ class Q35DecodeAttnKernel:
         if fold:
             assert has_gate and not bmm1_from_ptr and not bmm2_from_ptr
         self.q_full_count = 128 if fold else 1
-        self.fold_rpw = 8 if q_len * group > 16 else 4  # q rows (padded to the MMA N) per softmax warp
+        self.fold_rpw = (
+            8 if q_len * group > 16 else 4
+        )  # q rows (padded to the MMA N) per softmax warp
         # P = exp2(x - m_ref + p_shift) before the E4M3 conversion: the reference max maps to 2^p_shift instead of 1,
         # so small probabilities stay E4M3 normals (>= 2^-6) down to 2^-(6 + p_shift) of the max and flush to 0 only
         # below 2^-(10 + p_shift). O and l carry the same 2^p_shift (the output is unchanged); the lazy rescale moves
@@ -437,12 +750,16 @@ class Q35DecodeAttnKernel:
         # quads = 192 B put 8 lanes on the same banks). The extra columns read past the chunk stay inside the
         # split's partial (its (m, l) block follows the O block).
         self.chunk_pad = self.chunk + (4 if (self.chunk // 4) % 2 == 0 else 0)
-        self.n_chunks = (total + self.chunk - 1) // self.chunk  # CTAs of a request that finalize outputs
+        self.n_chunks = (
+            total + self.chunk - 1
+        ) // self.chunk  # CTAs of a request that finalize outputs
         n_vec = self.chunk // 4
         gps = 32
         while gps > NUM_THREADS // n_vec:
             gps //= 2
-        self.gps = gps  # lanes (power of two, one warp) sharing one float4 output slot in the combine
+        self.gps = (
+            gps  # lanes (power of two, one warp) sharing one float4 output slot in the combine
+        )
         self.combine_maxl = (n_splits + gps - 1) // gps  # splits per combine lane
         # workspace per request (floats): O partials chunk-major [n_chunks][n_splits][chunk_pad], then (m, l, -, -)
         # row-major [rows][n_splits][4]: each finalizing CTA reads one contiguous block per tensor (bulk copies)
@@ -453,50 +770,121 @@ class Q35DecodeAttnKernel:
 
     # ---------------------------------------------------------------- host-side (JIT) entry
     @cute.jit
-    def __call__(self, q_ptr: cute.Pointer, kv_ptr: cute.Pointer, n_kv_rows: Int32, tab_ptr: cute.Pointer,
-                 tab_stride_b: Int32, tab_stride_kv: Int32, seqlen_ptr: cute.Pointer, bmm1_ptr: cute.Pointer,
-                 bmm1_log2: Float32, bmm2_ptr: cute.Pointer, bmm2: Float32, gate_ptr: cute.Pointer,
-                 gate_stride_tok: Int32, out_ptr: cute.Pointer, out_stride_tok: Int32, ws_ptr: cute.Pointer,
-                 cnt_ptr: cute.Pointer, dbg_ptr: cute.Pointer, batch: Int32, n_splits: Int32, debug_spin_ns: Int32,
-                 qkv_ptr: cute.Pointer, qkv_stride: Int32, qw_ptr: cute.Pointer, kw_ptr: cute.Pointer,
-                 cs_ptr: cute.Pointer, max_pos: Int32, pos_ptr: cute.Pointer, kvq_ptr: cute.Pointer,
-                 kvd_ptr: cute.Pointer, host_bmm1: Float32, eps: Float32, stream):
+    def __call__(
+        self,
+        q_ptr: cute.Pointer,
+        kv_ptr: cute.Pointer,
+        n_kv_rows: Int32,
+        tab_ptr: cute.Pointer,
+        tab_stride_b: Int32,
+        tab_stride_kv: Int32,
+        seqlen_ptr: cute.Pointer,
+        bmm1_ptr: cute.Pointer,
+        bmm1_log2: Float32,
+        bmm2_ptr: cute.Pointer,
+        bmm2: Float32,
+        gate_ptr: cute.Pointer,
+        gate_stride_tok: Int32,
+        out_ptr: cute.Pointer,
+        out_stride_tok: Int32,
+        ws_ptr: cute.Pointer,
+        cnt_ptr: cute.Pointer,
+        dbg_ptr: cute.Pointer,
+        batch: Int32,
+        n_splits: Int32,
+        debug_spin_ns: Int32,
+        qkv_ptr: cute.Pointer,
+        qkv_stride: Int32,
+        qw_ptr: cute.Pointer,
+        kw_ptr: cute.Pointer,
+        cs_ptr: cute.Pointer,
+        max_pos: Int32,
+        pos_ptr: cute.Pointer,
+        kvq_ptr: cute.Pointer,
+        kvd_ptr: cute.Pointer,
+        host_bmm1: Float32,
+        eps: Float32,
+        stream,
+    ):
         S = self.stages
         NQ = self.nq
         R = self.rows
         NS = self.n_splits
         CH = self.chunk_pad
-        mQ = cute.make_tensor(q_ptr, cute.make_layout((R, HEAD_DIM, batch), stride=(HEAD_DIM, 1, R * HEAD_DIM)))
-        mKV = cute.make_tensor(kv_ptr, cute.make_layout((n_kv_rows, HEAD_DIM), stride=(HEAD_DIM, 1)))
-        mKVt = cute.make_tensor(kv_ptr, cute.make_layout((HEAD_DIM, n_kv_rows), stride=(1, HEAD_DIM)))
-        mTab = cute.make_tensor(tab_ptr, cute.make_layout((batch, 2, 1 << 24),  # page extent unused (no bounds)
-                                                          stride=(tab_stride_b, tab_stride_kv, 1)))
+        mQ = cute.make_tensor(
+            q_ptr, cute.make_layout((R, HEAD_DIM, batch), stride=(HEAD_DIM, 1, R * HEAD_DIM))
+        )
+        mKV = cute.make_tensor(
+            kv_ptr, cute.make_layout((n_kv_rows, HEAD_DIM), stride=(HEAD_DIM, 1))
+        )
+        mKVt = cute.make_tensor(
+            kv_ptr, cute.make_layout((HEAD_DIM, n_kv_rows), stride=(1, HEAD_DIM))
+        )
+        mTab = cute.make_tensor(
+            tab_ptr,
+            cute.make_layout(
+                (batch, 2, 1 << 24),  # page extent unused (no bounds)
+                stride=(tab_stride_b, tab_stride_kv, 1),
+            ),
+        )
         mSeq = cute.make_tensor(seqlen_ptr, cute.make_layout((batch,)))
         mBmm1 = cute.make_tensor(bmm1_ptr, cute.make_layout((2,)))
         mBmm2 = cute.make_tensor(bmm2_ptr, cute.make_layout((1,)))
         # gate / out rows: token (r * q_len + t), head g -> [token, g * 256 + d]
         if const_expr(self.fold):
             # the gate of head g sits right after its q in the raw QKV projection: [token, g * 512 + 256 + d]
-            mGate = cute.make_tensor(qkv_ptr + HEAD_DIM, cute.make_layout(
-                (batch * self.q_len, self.group, HEAD_DIM), stride=(qkv_stride, 2 * HEAD_DIM, 1)))
+            mGate = cute.make_tensor(
+                qkv_ptr + HEAD_DIM,
+                cute.make_layout(
+                    (batch * self.q_len, self.group, HEAD_DIM), stride=(qkv_stride, 2 * HEAD_DIM, 1)
+                ),
+            )
         else:
-            mGate = cute.make_tensor(gate_ptr, cute.make_layout((batch * self.q_len, self.group * HEAD_DIM),
-                                                                stride=(gate_stride_tok, 1)))
-        mOut = cute.make_tensor(out_ptr, cute.make_layout((batch * self.q_len, self.group * HEAD_DIM),
-                                                          stride=(out_stride_tok, 1)))
+            mGate = cute.make_tensor(
+                gate_ptr,
+                cute.make_layout(
+                    (batch * self.q_len, self.group * HEAD_DIM), stride=(gate_stride_tok, 1)
+                ),
+            )
+        mOut = cute.make_tensor(
+            out_ptr,
+            cute.make_layout(
+                (batch * self.q_len, self.group * HEAD_DIM), stride=(out_stride_tok, 1)
+            ),
+        )
         # workspace: ws_req_floats per request (chunk-major O partials, then (m, l) per row; addressed explicitly)
         mWs = cute.make_tensor(ws_ptr, cute.make_layout((batch * self.ws_req_floats,)))
         mCnt = cute.make_tensor(cnt_ptr, cute.make_layout((8,)))  # grid-barrier epoch per request
         if const_expr(self.debug_ring > 0):
-            mDbg = cute.make_tensor(dbg_ptr, cute.make_layout((self.debug_ring, DBG_RING_CTAS, 8),
-                                                              stride=(DBG_RING_CTAS * 8, 8, 1)))
+            mDbg = cute.make_tensor(
+                dbg_ptr,
+                cute.make_layout(
+                    (self.debug_ring, DBG_RING_CTAS, 8), stride=(DBG_RING_CTAS * 8, 8, 1)
+                ),
+            )
         else:
-            mDbg = cute.make_tensor(dbg_ptr, cute.make_layout((batch * NS, DBG_COLS), stride=(DBG_COLS, 1)))
+            mDbg = cute.make_tensor(
+                dbg_ptr, cute.make_layout((batch * NS, DBG_COLS), stride=(DBG_COLS, 1))
+            )
 
-        mma_qk = sm100_utils.make_trivial_tiled_mma(FP8, FP8, OperandMajorMode.K, OperandMajorMode.K, Float32,
-                                                    tcgen05.CtaGroup.ONE, (TILE_KEYS, NQ))
-        mma_pv = sm100_utils.make_trivial_tiled_mma(FP8, FP8, OperandMajorMode.MN, OperandMajorMode.MN, Float32,
-                                                    tcgen05.CtaGroup.ONE, (128, NQ))
+        mma_qk = sm100_utils.make_trivial_tiled_mma(
+            FP8,
+            FP8,
+            OperandMajorMode.K,
+            OperandMajorMode.K,
+            Float32,
+            tcgen05.CtaGroup.ONE,
+            (TILE_KEYS, NQ),
+        )
+        mma_pv = sm100_utils.make_trivial_tiled_mma(
+            FP8,
+            FP8,
+            OperandMajorMode.MN,
+            OperandMajorMode.MN,
+            Float32,
+            tcgen05.CtaGroup.ONE,
+            (128, NQ),
+        )
         qk_tiler = (TILE_KEYS, NQ, HEAD_DIM)
         pv_tiler = (HEAD_DIM, NQ, TILE_KEYS)
         sK_l = sm100_utils.make_smem_layout_a(mma_qk, qk_tiler, FP8, S)
@@ -504,10 +892,14 @@ class Q35DecodeAttnKernel:
         sQ_l = sm100_utils.make_smem_layout_b(mma_qk, qk_tiler, FP8, 1)
         sP_l = sm100_utils.make_smem_layout_b(mma_pv, pv_tiler, FP8, 2)
         # Same buffers seen by the TMA (one box = one page x 128 B) and by the softmax P^T stores ((n, key, buffer)).
-        sK_tma_l = cute.tiled_divide(sm100_utils.make_smem_layout(OperandMajorMode.K, (TILE_KEYS, HEAD_DIM), FP8, S),
-                                     (PAGE, SW_BYTES))
-        sV_tma_l = cute.tiled_divide(sm100_utils.make_smem_layout(OperandMajorMode.MN, (HEAD_DIM, TILE_KEYS), FP8, S),
-                                     (SW_BYTES, PAGE))
+        sK_tma_l = cute.tiled_divide(
+            sm100_utils.make_smem_layout(OperandMajorMode.K, (TILE_KEYS, HEAD_DIM), FP8, S),
+            (PAGE, SW_BYTES),
+        )
+        sV_tma_l = cute.tiled_divide(
+            sm100_utils.make_smem_layout(OperandMajorMode.MN, (HEAD_DIM, TILE_KEYS), FP8, S),
+            (SW_BYTES, PAGE),
+        )
         sP_nk_l = sm100_utils.make_smem_layout(OperandMajorMode.MN, (NQ, TILE_KEYS), FP8, 2)
         # fold: the same Q buffer seen as (row, d) for the in-kernel q stores (K-major, as the K tile's TMA view)
         sQ_nk_l = sm100_utils.make_smem_layout(OperandMajorMode.K, (NQ, HEAD_DIM), FP8, 1)
@@ -520,19 +912,70 @@ class Q35DecodeAttnKernel:
         cluster_vmnk = cute.tiled_divide(cute.make_layout((1, 1, 1)), (mma_qk.thr_id.shape,))
         sQ_one = cute.slice_(sQ_l, (None, None, None, 0))
         tma_q, gQ_tma = cute.nvgpu.make_tiled_tma_atom_B(
-            sm100_utils.cluster_shape_to_tma_atom_B((1, 1), mma_qk.thr_id), mQ, sQ_one, qk_tiler, mma_qk,
-            cluster_vmnk.shape)
+            sm100_utils.cluster_shape_to_tma_atom_B((1, 1), mma_qk.thr_id),
+            mQ,
+            sQ_one,
+            qk_tiler,
+            mma_qk,
+            cluster_vmnk.shape,
+        )
         q_bytes = cute.size_in_bytes(FP8, sQ_one)
         box_ws = cute.make_layout((CH, NS), stride=(1, CH))
         box_ml = cute.make_layout((4, NS), stride=(1, 4))
 
-        self.kernel(mma_qk, mma_pv, tma_k, gK_tma, tma_v, gV_tma, tma_q, gQ_tma,
-                    box_ws, box_ml, mTab, mSeq, mBmm1, bmm1_log2,
-                    mBmm2, bmm2, mGate, mOut, mWs, mCnt, mDbg, sK_l, sV_l, sQ_l, sP_l, sK_tma_l, sV_tma_l, sP_nk_l,
-                    q_bytes, NS, debug_spin_ns, sQ_nk_l, kv_ptr, qkv_ptr, qkv_stride, qw_ptr, kw_ptr, cs_ptr,
-                    max_pos, pos_ptr, kvq_ptr, kvd_ptr, host_bmm1, eps, batch).launch(
-            grid=[NS, batch, 1], block=[NUM_THREADS, 1, 1], stream=stream, use_pdl=self.use_pdl,
-            min_blocks_per_mp=1)
+        self.kernel(
+            mma_qk,
+            mma_pv,
+            tma_k,
+            gK_tma,
+            tma_v,
+            gV_tma,
+            tma_q,
+            gQ_tma,
+            box_ws,
+            box_ml,
+            mTab,
+            mSeq,
+            mBmm1,
+            bmm1_log2,
+            mBmm2,
+            bmm2,
+            mGate,
+            mOut,
+            mWs,
+            mCnt,
+            mDbg,
+            sK_l,
+            sV_l,
+            sQ_l,
+            sP_l,
+            sK_tma_l,
+            sV_tma_l,
+            sP_nk_l,
+            q_bytes,
+            NS,
+            debug_spin_ns,
+            sQ_nk_l,
+            kv_ptr,
+            qkv_ptr,
+            qkv_stride,
+            qw_ptr,
+            kw_ptr,
+            cs_ptr,
+            max_pos,
+            pos_ptr,
+            kvq_ptr,
+            kvd_ptr,
+            host_bmm1,
+            eps,
+            batch,
+        ).launch(
+            grid=[NS, batch, 1],
+            block=[NUM_THREADS, 1, 1],
+            stream=stream,
+            use_pdl=self.use_pdl,
+            min_blocks_per_mp=1,
+        )
 
     # ---------------------------------------------------------------- device helpers
     # fold-mode row layout (one warp per 256-element row): lane m = 8 * w + i holds the element pairs
@@ -548,7 +991,9 @@ class Q35DecodeAttnKernel:
             xw[j, k] = _ld_global_b32(src + 2 * (e0 + 16 * k))
 
     @cute.jit
-    def _fold_load_static(self, lane, w_ptr: cute.Pointer, kvq_ptr: cute.Pointer, ww: cute.Tensor) -> Float32:
+    def _fold_load_static(
+        self, lane, w_ptr: cute.Pointer, kvq_ptr: cute.Pointer, ww: cute.Tensor
+    ) -> Float32:
         """Static operands (norm weight words of this lane's elements, kv_scale_orig_quant), requested before the
         dependency wait and only consumed after it, so their latency hides behind the predecessor."""
         e0 = 64 * (lane // 8) + 2 * (lane % 8)
@@ -598,8 +1043,18 @@ class Q35DecodeAttnKernel:
                 sCS[idx // 64, idx % 64] = vals[e]
 
     @cute.jit
-    def _fold_tables(self, st, req, batch, L, pos_ptr: cute.Pointer, cs_ptr: cute.Pointer, max_pos,
-                     sPos: cute.Tensor, sCS: cute.Tensor):
+    def _fold_tables(
+        self,
+        st,
+        req,
+        batch,
+        L,
+        pos_ptr: cute.Pointer,
+        cs_ptr: cute.Pointer,
+        max_pos,
+        sPos: cute.Tensor,
+        sCS: cute.Tensor,
+    ):
         """The 128 softmax threads, after the dependency wait: positions of this request's tokens (per mrope section)
         -> sPos; then every sCS entry whose position differs from the prefill's guess is reloaded (per-index mrope
         section, NaN for an out-of-table position, as the Triton kernel). The common case costs one load round."""
@@ -634,8 +1089,20 @@ class Q35DecodeAttnKernel:
         cute.arch.barrier(barrier_id=BAR_SOFTMAX, number_of_threads=128)
 
     @cute.jit
-    def _fold_row_fp8(self, xw: cute.Tensor, j, wp1: cute.Tensor, norm: cutlass.Constexpr, do_rope,
-                      sCS: cute.Tensor, t, lane, sc, eps, out: cute.Tensor):
+    def _fold_row_fp8(
+        self,
+        xw: cute.Tensor,
+        j,
+        wp1: cute.Tensor,
+        norm: cutlass.Constexpr,
+        do_rope,
+        sCS: cute.Tensor,
+        t,
+        lane,
+        sc,
+        eps,
+        out: cute.Tensor,
+    ):
         """Row j of xw (token t of the request) -> 4 FP8 pairs (out[0..3], low 16 bits): Gemma RMS norm (weight + 1 =
         wp1), neox RoPE on the rotary pairs (do_rope: lanes 0-7 of a q / K row; cos / sin from sCS), then
         e4m3(bf16(bf16(y) * sc)), all as the Triton kernel."""
@@ -649,17 +1116,23 @@ class Q35DecodeAttnKernel:
             t1 = _fma_rn(x[2], x[2], _mul_rn(x[3], x[3]))
             t2 = _fma_rn(x[4], x[4], _mul_rn(x[5], x[5]))
             t3 = _fma_rn(x[6], x[6], _mul_rn(x[7], x[7]))
-            b = _add_rn(_add_rn(t0, t2), _add_rn(t1, t3))  # Triton levels 16 (k, k + 2) and 8 (k = 0, 1)
+            b = _add_rn(
+                _add_rn(t0, t2), _add_rn(t1, t3)
+            )  # Triton levels 16 (k, k + 2) and 8 (k = 0, 1)
             b = _add_rn(b, cute.arch.shuffle_sync_bfly(b, offset=4))
             b = _add_rn(b, cute.arch.shuffle_sync_bfly(b, offset=2))
             b = _add_rn(b, cute.arch.shuffle_sync_bfly(b, offset=1))
-            b = _add_rn(b, cute.arch.shuffle_sync_bfly(b, offset=16))  # warps: lane 0 = (p0 + p2) + (p1 + p3)
+            b = _add_rn(
+                b, cute.arch.shuffle_sync_bfly(b, offset=16)
+            )  # warps: lane 0 = (p0 + p2) + (p1 + p3)
             b = _add_rn(b, cute.arch.shuffle_sync_bfly(b, offset=8))
             tot = cute.arch.shuffle_sync(b, offset=0)
             inv = _rsqrt_ftz(_add_rn(_div_full(tot, Float32(256.0)), eps))
             for e in cutlass.range_constexpr(4):
-                y[2 * e], y[2 * e + 1] = _rn_bf16x2(_mul_rn(wp1[2 * e], _mul_rn(inv, x[2 * e])),
-                                                   _mul_rn(wp1[2 * e + 1], _mul_rn(inv, x[2 * e + 1])))
+                y[2 * e], y[2 * e + 1] = _rn_bf16x2(
+                    _mul_rn(wp1[2 * e], _mul_rn(inv, x[2 * e])),
+                    _mul_rn(wp1[2 * e + 1], _mul_rn(inv, x[2 * e + 1])),
+                )
             # RoPE on lanes 0-7 (w = 0), branch-free so that ptxas can interleave rows: every lane computes it with
             # the cos / sin of index 2 * (lane % 8) + h + 16 k (in range) and keeps it only where do_rope
             r1 = cute.make_rmem_tensor((4,), Float32)
@@ -688,15 +1161,35 @@ class Q35DecodeAttnKernel:
             out[k] = _e4m3x2(q0, q1)
 
     @cute.jit
-    def _fold_q(self, sw, st, lane, req, batch, L, qkv_ptr: cute.Pointer, qkv_stride, ww: cute.Tensor, kvq_raw,
-                cs_ptr: cute.Pointer, max_pos, pos_ptr: cute.Pointer, eps, sQ: cute.Tensor,
-                sQ_nk_l: cute.ComposedLayout, sPos: cute.Tensor, sCS: cute.Tensor, cs_ready, mDbg: cute.Tensor,
-                dbg_row):
+    def _fold_q(
+        self,
+        sw,
+        st,
+        lane,
+        req,
+        batch,
+        L,
+        qkv_ptr: cute.Pointer,
+        qkv_stride,
+        ww: cute.Tensor,
+        kvq_raw,
+        cs_ptr: cute.Pointer,
+        max_pos,
+        pos_ptr: cute.Pointer,
+        eps,
+        sQ: cute.Tensor,
+        sQ_nk_l: cute.ComposedLayout,
+        sPos: cute.Tensor,
+        sCS: cute.Tensor,
+        cs_ready,
+        mDbg: cute.Tensor,
+        dbg_row,
+    ):
         """The softmax warps after the dependency wait: q rows sw, sw + 4, ... (row r = token t * group + head h of
         this request) -> FP8 into the GEMM1 B operand; rows R..NQ-1 (MMA padding, zero-filled by the q TMA
         otherwise) are zeroed. Row loads first, then the position / cos-sin tables (shared with warp 2's K rows via
         cs_ready), then the arithmetic."""
-        NQ: cutlass.Constexpr = self.nq
+        NQ: cutlass.Constexpr = self.nq  # noqa: F841
         R: cutlass.Constexpr = self.rows
         QL: cutlass.Constexpr = self.q_len
         G: cutlass.Constexpr = self.group
@@ -705,10 +1198,16 @@ class Q35DecodeAttnKernel:
         qkv_b = qkv_ptr.toint()
         xw = cute.make_rmem_tensor((RPW, 4), Uint32)
         for j in cutlass.range_constexpr(RPW):
-            rc = cutlass.min(sw + 4 * j, R - 1)  # rows >= R (MMA padding) compute row R - 1, zeroed below
+            rc = cutlass.min(
+                sw + 4 * j, R - 1
+            )  # rows >= R (MMA padding) compute row R - 1, zeroed below
             tq = req * QL + rc // G
-            self._fold_load_row(qkv_b + (Int64(tq) * Int64(qkv_stride) + Int64((rc % G) * 2 * HEAD_DIM)) * 2,
-                                xw, j, lane)
+            self._fold_load_row(
+                qkv_b + (Int64(tq) * Int64(qkv_stride) + Int64((rc % G) * 2 * HEAD_DIM)) * 2,
+                xw,
+                j,
+                lane,
+            )
         self._fold_tables(st, req, batch, L, pos_ptr, cs_ptr, max_pos, sPos, sCS)
         wp1 = cute.make_rmem_tensor((8,), Float32)
         self._fold_weights(ww, wp1)
@@ -736,12 +1235,29 @@ class Q35DecodeAttnKernel:
                 f8_all[j, k] = _selp_u32(keep, f8[k], Uint32(0))
         for j in cutlass.range_constexpr(RPW):
             for k in cutlass.range_constexpr(4):
-                _st_shared_b16(sq_b + cute.crd2idx((sw + 4 * j, e0 + 16 * k, 0), sQ_nk_l), f8_all[j, k])
+                _st_shared_b16(
+                    sq_b + cute.crd2idx((sw + 4 * j, e0 + 16 * k, 0), sQ_nk_l), f8_all[j, k]
+                )
 
     @cute.jit
-    def _fold_append(self, kind: cutlass.Constexpr, lane, req, L, k_lo, k_hi, mTab: cute.Tensor,
-                     kv_base: cute.Pointer, qkv_ptr: cute.Pointer, qkv_stride, ww: cute.Tensor, kvq_raw, eps,
-                     sCS: cute.Tensor, cs_ready):
+    def _fold_append(
+        self,
+        kind: cutlass.Constexpr,
+        lane,
+        req,
+        L,
+        k_lo,
+        k_hi,
+        mTab: cute.Tensor,
+        kv_base: cute.Pointer,
+        qkv_ptr: cute.Pointer,
+        qkv_stride,
+        ww: cute.Tensor,
+        kvq_raw,
+        eps,
+        sCS: cute.Tensor,
+        cs_ready,
+    ):
         """The new tokens of this request whose positions fall in this CTA's tiles [k_lo, k_hi): their K (kind 0:
         qk-norm + RoPE, cos / sin from the softmax warps' table) or V (kind 1) row -> FP8 at position L - q_len + t
         of the paged cache, as the Triton kernel (skipped for a negative position or block index). Each position lies
@@ -763,7 +1279,11 @@ class Q35DecodeAttnKernel:
             own[t] = o
             n_own = n_own + o
             if o != 0:
-                src = qkv_b + (Int64(req * QL + t) * Int64(qkv_stride) + Int64((2 * G + kind) * HEAD_DIM)) * 2
+                src = (
+                    qkv_b
+                    + (Int64(req * QL + t) * Int64(qkv_stride) + Int64((2 * G + kind) * HEAD_DIM))
+                    * 2
+                )
                 self._fold_load_row(src, xw, t, lane)
         wp1 = cute.make_rmem_tensor((8,), Float32)
         if const_expr(kind == 0):
@@ -788,8 +1308,24 @@ class Q35DecodeAttnKernel:
                             _st_global_b16(dst + 16 * k, f8[k])
 
     @cute.jit
-    def _produce(self, i, kb0, kb1, vb0, vb1, tma_k: cute.CopyAtom, tKg: cute.Tensor, tKs: cute.Tensor,
-                 tma_v: cute.CopyAtom, tVg: cute.Tensor, tVs: cute.Tensor, full_k, empty_k, full_v, empty_v):
+    def _produce(
+        self,
+        i,
+        kb0,
+        kb1,
+        vb0,
+        vb1,
+        tma_k: cute.CopyAtom,
+        tKg: cute.Tensor,
+        tKs: cute.Tensor,
+        tma_v: cute.CopyAtom,
+        tVg: cute.Tensor,
+        tVs: cute.Tensor,
+        full_k,
+        empty_k,
+        full_v,
+        empty_v,
+    ):
         """TMA of tile i of the ring: pages (pg0, pg0 + 1) of K (blocks kb0, kb1) and V (vb0, vb1)."""
         S: cutlass.Constexpr = self.stages
         s = i % S
@@ -802,24 +1338,52 @@ class Q35DecodeAttnKernel:
         for p in cutlass.range_constexpr(2):
             for kb in cutlass.range_constexpr(2):
                 if const_expr(self.evict_first):
-                    cute.copy(tma_k, tKg[(None, kbs[p], kb)], tKs[(None, p, kb, s)], tma_bar_ptr=full_k + s,
-                              cache_policy=Int64(EVICT_FIRST))
+                    cute.copy(
+                        tma_k,
+                        tKg[(None, kbs[p], kb)],
+                        tKs[(None, p, kb, s)],
+                        tma_bar_ptr=full_k + s,
+                        cache_policy=Int64(EVICT_FIRST),
+                    )
                 else:
-                    cute.copy(tma_k, tKg[(None, kbs[p], kb)], tKs[(None, p, kb, s)], tma_bar_ptr=full_k + s)
+                    cute.copy(
+                        tma_k,
+                        tKg[(None, kbs[p], kb)],
+                        tKs[(None, p, kb, s)],
+                        tma_bar_ptr=full_k + s,
+                    )
         cute.arch.mbarrier_wait(empty_v + s, ph ^ 1)
         with cute.arch.elect_one():
             cute.arch.mbarrier_arrive_and_expect_tx(full_v + s, 2 * PAGE * HEAD_DIM)
         for p in cutlass.range_constexpr(2):
             for h in cutlass.range_constexpr(2):
                 if const_expr(self.evict_first):
-                    cute.copy(tma_v, tVg[(None, h, vbs[p])], tVs[(None, h, p, s)], tma_bar_ptr=full_v + s,
-                              cache_policy=Int64(EVICT_FIRST))
+                    cute.copy(
+                        tma_v,
+                        tVg[(None, h, vbs[p])],
+                        tVs[(None, h, p, s)],
+                        tma_bar_ptr=full_v + s,
+                        cache_policy=Int64(EVICT_FIRST),
+                    )
                 else:
-                    cute.copy(tma_v, tVg[(None, h, vbs[p])], tVs[(None, h, p, s)], tma_bar_ptr=full_v + s)
+                    cute.copy(
+                        tma_v, tVg[(None, h, vbs[p])], tVs[(None, h, p, s)], tma_bar_ptr=full_v + s
+                    )
 
     @cute.jit
-    def _gemm2(self, j, mma_pv: cute.TiledMma, tOtO: cute.Tensor, tCrV: cute.Tensor, tCrP: cute.Tensor, full_v,
-               p_full, empty_v, p_empty, o_done):
+    def _gemm2(
+        self,
+        j,
+        mma_pv: cute.TiledMma,
+        tOtO: cute.Tensor,
+        tCrV: cute.Tensor,
+        tCrP: cute.Tensor,
+        full_v,
+        p_full,
+        empty_v,
+        p_empty,
+        o_done,
+    ):
         """O^T += V^T(tile j) . P^T(tile j); releases the V stage and the P buffer, signals o_done. Returns mma_pv:
         its ACCUMULATE field is updated here, and the caller must rebind it so that the DSL carries the new value out of
         the enclosing dynamic regions."""
@@ -831,8 +1395,13 @@ class Q35DecodeAttnKernel:
         for dm in cutlass.range_constexpr(2):
             for kk in cutlass.range_constexpr(TILE_KEYS // 32):
                 mma_pv.set(tcgen05.Field.ACCUMULATE, (j > 0) or (kk != 0))
-                cute.gemm(mma_pv, tOtO[(None, dm, 0)], tCrV[(None, dm, kk, sj)], tCrP[(None, 0, kk, pb)],
-                          tOtO[(None, dm, 0)])
+                cute.gemm(
+                    mma_pv,
+                    tOtO[(None, dm, 0)],
+                    tCrV[(None, dm, kk, sj)],
+                    tCrP[(None, 0, kk, pb)],
+                    tOtO[(None, dm, 0)],
+                )
         with cute.arch.elect_one():
             tcgen05.commit(empty_v + sj)
             tcgen05.commit(p_empty + pb)
@@ -840,10 +1409,36 @@ class Q35DecodeAttnKernel:
         return mma_pv
 
     @cute.jit
-    def _softmax_tile(self, i, pg0, x: cute.Tensor, m_ref: cute.Tensor, l_acc: cute.Tensor, alpha: cute.Tensor,
-                      tStS: cute.Tensor, tOtO: cute.Tensor, t2r_s, thr_s, t2r_o, thr_o, r2t_o, thr_ro, tSc: cute.Tensor,
-                      sRed: cute.Tensor, bars_sm, sP_base, sP_nk_l: cute.ComposedLayout, st, sw, lane, prefix, n_pages,
-                      scale, mDbg: cute.Tensor, dbg_row):
+    def _softmax_tile(
+        self,
+        i,
+        pg0,
+        x: cute.Tensor,
+        m_ref: cute.Tensor,
+        l_acc: cute.Tensor,
+        alpha: cute.Tensor,
+        tStS: cute.Tensor,
+        tOtO: cute.Tensor,
+        t2r_s,
+        thr_s,
+        t2r_o,
+        thr_o,
+        r2t_o,
+        thr_ro,
+        tSc: cute.Tensor,
+        sRed: cute.Tensor,
+        bars_sm,
+        sP_base,
+        sP_nk_l: cute.ComposedLayout,
+        st,
+        sw,
+        lane,
+        prefix,
+        n_pages,
+        scale,
+        mDbg: cute.Tensor,
+        dbg_row,
+    ):
         """Softmax of tile i (pages pg0, pg0 + 1; thread st = key st of the tile = TMEM lane st): S -> x, mask, lazy
         rescale of (m, l, O), P^T -> SMEM as E4M3."""
         NQ: cutlass.Constexpr = self.nq
@@ -891,8 +1486,9 @@ class Q35DecodeAttnKernel:
                     sRed[sw, k] = mx
             cute.arch.barrier(barrier_id=BAR_SOFTMAX, number_of_threads=128)
             for k in cutlass.range_constexpr(NQ):
-                mt = cute.arch.fmax(cute.arch.fmax(sRed[0, k], sRed[1, k]),
-                                    cute.arch.fmax(sRed[2, k], sRed[3, k]))
+                mt = cute.arch.fmax(
+                    cute.arch.fmax(sRed[0, k], sRed[1, k]), cute.arch.fmax(sRed[2, k], sRed[3, k])
+                )
                 mn = cute.arch.fmax(m_ref[k], mt)
                 a = Float32(1.0)
                 if mn != -Float32.inf:
@@ -939,18 +1535,54 @@ class Q35DecodeAttnKernel:
 
     # ---------------------------------------------------------------- device kernel
     @cute.kernel
-    def kernel(self, mma_qk: cute.TiledMma, mma_pv: cute.TiledMma, tma_k: cute.CopyAtom, gK_tma: cute.Tensor,
-               tma_v: cute.CopyAtom, gV_tma: cute.Tensor, tma_q: cute.CopyAtom, gQ_tma: cute.Tensor,
-               box_ws: cute.Layout, box_ml: cute.Layout, mTab: cute.Tensor, mSeq: cute.Tensor, mBmm1: cute.Tensor,
-               bmm1_log2: Float32, mBmm2: cute.Tensor,
-               bmm2: Float32, mGate: cute.Tensor, mOut: cute.Tensor, mWs: cute.Tensor, mCnt: cute.Tensor,
-               mDbg: cute.Tensor, sK_l: cute.ComposedLayout, sV_l: cute.ComposedLayout, sQ_l: cute.ComposedLayout,
-               sP_l: cute.ComposedLayout, sK_tma_l: cute.ComposedLayout, sV_tma_l: cute.ComposedLayout,
-               sP_nk_l: cute.ComposedLayout, q_bytes: cutlass.Constexpr, n_splits: cutlass.Constexpr,
-               debug_spin_ns: Int32, sQ_nk_l: cute.ComposedLayout, kv_base: cute.Pointer, qkv_ptr: cute.Pointer,
-               qkv_stride: Int32, qw_ptr: cute.Pointer, kw_ptr: cute.Pointer, cs_ptr: cute.Pointer, max_pos: Int32,
-               pos_ptr: cute.Pointer, kvq_ptr: cute.Pointer, kvd_ptr: cute.Pointer, host_bmm1: Float32, eps: Float32,
-               batch: Int32):
+    def kernel(
+        self,
+        mma_qk: cute.TiledMma,
+        mma_pv: cute.TiledMma,
+        tma_k: cute.CopyAtom,
+        gK_tma: cute.Tensor,
+        tma_v: cute.CopyAtom,
+        gV_tma: cute.Tensor,
+        tma_q: cute.CopyAtom,
+        gQ_tma: cute.Tensor,
+        box_ws: cute.Layout,
+        box_ml: cute.Layout,
+        mTab: cute.Tensor,
+        mSeq: cute.Tensor,
+        mBmm1: cute.Tensor,
+        bmm1_log2: Float32,
+        mBmm2: cute.Tensor,
+        bmm2: Float32,
+        mGate: cute.Tensor,
+        mOut: cute.Tensor,
+        mWs: cute.Tensor,
+        mCnt: cute.Tensor,
+        mDbg: cute.Tensor,
+        sK_l: cute.ComposedLayout,
+        sV_l: cute.ComposedLayout,
+        sQ_l: cute.ComposedLayout,
+        sP_l: cute.ComposedLayout,
+        sK_tma_l: cute.ComposedLayout,
+        sV_tma_l: cute.ComposedLayout,
+        sP_nk_l: cute.ComposedLayout,
+        q_bytes: cutlass.Constexpr,
+        n_splits: cutlass.Constexpr,
+        debug_spin_ns: Int32,
+        sQ_nk_l: cute.ComposedLayout,
+        kv_base: cute.Pointer,
+        qkv_ptr: cute.Pointer,
+        qkv_stride: Int32,
+        qw_ptr: cute.Pointer,
+        kw_ptr: cute.Pointer,
+        cs_ptr: cute.Pointer,
+        max_pos: Int32,
+        pos_ptr: cute.Pointer,
+        kvq_ptr: cute.Pointer,
+        kvd_ptr: cute.Pointer,
+        host_bmm1: Float32,
+        eps: Float32,
+        batch: Int32,
+    ):
         S: cutlass.Constexpr = self.stages
         NQ: cutlass.Constexpr = self.nq
         R: cutlass.Constexpr = self.rows
@@ -976,18 +1608,26 @@ class Q35DecodeAttnKernel:
         #      non-PDL torch ops earlier in the graph; safe to read before the dependency wait) ----
         L = mSeq[req]
         n_pages = (L + PAGE - 1) // PAGE
-        T = (n_pages + 1) // 2  # tiles: tile k = pages 2k, 2k + 1 (the last one may hold a single page)
-        ts = cutlass.max((T + n_splits - 1) // n_splits, 1)  # tiles per CTA; >= 1: padded dummy requests may have L = 0
+        T = (
+            n_pages + 1
+        ) // 2  # tiles: tile k = pages 2k, 2k + 1 (the last one may hold a single page)
+        ts = cutlass.max(
+            (T + n_splits - 1) // n_splits, 1
+        )  # tiles per CTA; >= 1: padded dummy requests may have L = 0
         n_valid_splits = (T + ts - 1) // ts
         k_lo = cutlass.min(split * ts, T)  # this CTA's tiles: [k_lo, k_hi)
         k_hi = cutlass.min(k_lo + ts, T)
         prefix = L - QL  # keys < prefix are visible to every row
         # pages >= fresh_page are read only after griddepcontrol.wait (see fresh_margin_pages)
         fresh_page = cutlass.max(prefix // PAGE - self.fresh_margin_pages, 0)
-        new_tile0 = cutlass.max(prefix, 0) // TILE_KEYS  # fold: tiles >= new_tile0 hold this call's new tokens
+        new_tile0 = (
+            cutlass.max(prefix, 0) // TILE_KEYS
+        )  # fold: tiles >= new_tile0 hold this call's new tokens
         # combine geometry: CTA `split` finalizes outputs [o_lo, o_hi) of the request's R x 256 (row-major), in
         # float4 slots; gps lanes (a power of two inside one warp) share slot q and cover splits jg, jg + gps, ...
-        ws_o_base = mWs.iterator.toint() + req * (self.ws_req_floats * 4)  # [n_chunks][n_splits][chunk_pad]
+        ws_o_base = mWs.iterator.toint() + req * (
+            self.ws_req_floats * 4
+        )  # [n_chunks][n_splits][chunk_pad]
         ws_ml_base = ws_o_base + self.ws_o_floats * 4  # [rows][n_splits][4]
         total = R * HEAD_DIM
         chunk: cutlass.Constexpr = self.chunk
@@ -1007,7 +1647,9 @@ class Q35DecodeAttnKernel:
         # ---- shared memory ----
         smem = SmemAllocator()
         bars = smem.allocate_array(Int64, 4 * S + 14)
-        kv_app = bars + 4 * S + 12  # fold: the new tokens' K / V of this CTA's tiles are in the cache (64 arrivals)
+        kv_app = (
+            bars + 4 * S + 12
+        )  # fold: the new tokens' K / V of this CTA's tiles are in the cache (64 arrivals)
         cs_ready = bars + 4 * S + 13  # fold: sPos / sCS written by the softmax warps (128 arrivals)
         full_k = bars
         empty_k = bars + S
@@ -1023,10 +1665,14 @@ class Q35DecodeAttnKernel:
         comb_bar = bars + 4 * S + 11
         tmem_holder = smem.allocate_array(Int32, 4)
         sTab = smem.allocate_tensor(Int32, cute.make_layout((2, TAB_MAX), stride=(TAB_MAX, 1)), 16)
-        sRed = smem.allocate_tensor(Float32, cute.make_layout((4, 32), stride=(32, 1)), 16)  # per-warp row values
+        sRed = smem.allocate_tensor(
+            Float32, cute.make_layout((4, 32), stride=(32, 1)), 16
+        )  # per-warp row values
         sTarget = smem.allocate_tensor(Int64, cute.make_layout((2,)), 16)
         sScal = smem.allocate_tensor(Float32, cute.make_layout((4,)), 16)
-        sDbgT = smem.allocate_tensor(Int64, cute.make_layout((2,)), 16)  # debug ring: wait-done stamp
+        sDbgT = smem.allocate_tensor(
+            Int64, cute.make_layout((2,)), 16
+        )  # debug ring: wait-done stamp
         sComb = smem.allocate_tensor(Float32, box_ws, 128)  # [split][chunk] O chunks (TMA)
         sML0 = smem.allocate_tensor(Float32, box_ml, 128)  # [split][(m, l, -, -)] of row0
         sML1 = smem.allocate_tensor(Float32, box_ml, 128)  # ... of row0 + 1
@@ -1034,14 +1680,22 @@ class Q35DecodeAttnKernel:
         sPos = sTarget
         sCS = sRed
         if const_expr(self.fold):
-            sPos = smem.allocate_tensor(Int64, cute.make_layout((3, 16), stride=(16, 1)), 16)  # [section][token]
-            sCS = smem.allocate_tensor(Float32, cute.make_layout((16, 64), stride=(64, 1)), 16)  # [token][cos | sin]
+            sPos = smem.allocate_tensor(
+                Int64, cute.make_layout((3, 16), stride=(16, 1)), 16
+            )  # [section][token]
+            sCS = smem.allocate_tensor(
+                Float32, cute.make_layout((16, 64), stride=(64, 1)), 16
+            )  # [token][cos | sin]
         sK = smem.allocate_tensor(FP8, sK_l.outer, 1024, sK_l.inner)
         sV = smem.allocate_tensor(FP8, sV_l.outer, 1024, sV_l.inner)
         sQ = smem.allocate_tensor(FP8, sQ_l.outer, 1024, sQ_l.inner)
         sP = smem.allocate_tensor(FP8, sP_l.outer, 1024, sP_l.inner)
-        sK_tma = cute.make_tensor(cute.recast_ptr(sK.iterator, sK_tma_l.inner, dtype=FP8), sK_tma_l.outer)
-        sV_tma = cute.make_tensor(cute.recast_ptr(sV.iterator, sV_tma_l.inner, dtype=FP8), sV_tma_l.outer)
+        sK_tma = cute.make_tensor(
+            cute.recast_ptr(sK.iterator, sK_tma_l.inner, dtype=FP8), sK_tma_l.outer
+        )
+        sV_tma = cute.make_tensor(
+            cute.recast_ptr(sV.iterator, sV_tma_l.inner, dtype=FP8), sV_tma_l.outer
+        )
 
         if warp == 0:
             cpasync.prefetch_descriptor(tma_k)
@@ -1114,8 +1768,23 @@ class Q35DecodeAttnKernel:
                             cute.arch.fence_proxy("async.global")
                             app_waited = Int32(1)
                 jt = 2 * (k - k_lo)
-                self._produce(k - k_lo, sTab[0, jt], sTab[0, jt + 1], sTab[1, jt], sTab[1, jt + 1], tma_k, tKg, tKs,
-                              tma_v, tVg, tVs, full_k, empty_k, full_v, empty_v)
+                self._produce(
+                    k - k_lo,
+                    sTab[0, jt],
+                    sTab[0, jt + 1],
+                    sTab[1, jt],
+                    sTab[1, jt + 1],
+                    tma_k,
+                    tKg,
+                    tKs,
+                    tma_v,
+                    tVg,
+                    tVs,
+                    full_k,
+                    empty_k,
+                    full_v,
+                    empty_v,
+                )
         elif warp == 1:
             # ======================= MMA issuer =======================
             tCrK = mma_qk.make_fragment_A(sK)
@@ -1135,13 +1804,20 @@ class Q35DecodeAttnKernel:
                     cute.arch.mbarrier_wait(s_empty + sb, ((i // 2) & 1) ^ 1)
                     for kk in cutlass.range_constexpr(HEAD_DIM // 32):
                         mma_qk.set(tcgen05.Field.ACCUMULATE, kk != 0)
-                        cute.gemm(mma_qk, tStS[(None, 0, 0, sb)], tCrK[(None, 0, kk, s)], tCrQ[(None, 0, kk, 0)],
-                                  tStS[(None, 0, 0, sb)])
+                        cute.gemm(
+                            mma_qk,
+                            tStS[(None, 0, 0, sb)],
+                            tCrK[(None, 0, kk, s)],
+                            tCrQ[(None, 0, kk, 0)],
+                            tStS[(None, 0, 0, sb)],
+                        )
                     with cute.arch.elect_one():
                         tcgen05.commit(s_full + sb)
                         tcgen05.commit(empty_k + s)
                 if i >= 1:
-                    mma_pv = self._gemm2(i - 1, mma_pv, tOtO, tCrV, tCrP, full_v, p_full, empty_v, p_empty, o_done)
+                    mma_pv = self._gemm2(
+                        i - 1, mma_pv, tOtO, tCrV, tCrP, full_v, p_full, empty_v, p_empty, o_done
+                    )
             with cute.arch.elect_one():
                 tcgen05.commit(o_full)
         elif warp >= SOFTMAX_WARP0:
@@ -1169,8 +1845,29 @@ class Q35DecodeAttnKernel:
             if const_expr(self.fold):
                 # bmm1 * log2(e) exactly as the Triton kernel prepares it: ((s * s) * host_bmm1) * log2e (FP32)
                 scale = _mul_rn(_mul_rn(host_bmm1, _mul_rn(s_qo, s_qo)), Float32(LOG2E))
-                self._fold_q(sw, st, lane, req, batch, L, qkv_ptr, qkv_stride, wwq, kvq_raw, cs_ptr, max_pos, pos_ptr,
-                             eps, sQ, sQ_nk_l, sPos, sCS, cs_ready, mDbg, dbg_row)
+                self._fold_q(
+                    sw,
+                    st,
+                    lane,
+                    req,
+                    batch,
+                    L,
+                    qkv_ptr,
+                    qkv_stride,
+                    wwq,
+                    kvq_raw,
+                    cs_ptr,
+                    max_pos,
+                    pos_ptr,
+                    eps,
+                    sQ,
+                    sQ_nk_l,
+                    sPos,
+                    sCS,
+                    cs_ready,
+                    mDbg,
+                    dbg_row,
+                )
                 if const_expr(self.debug_ts):
                     if st == 0:
                         mDbg[dbg_row, 18] = _clock64()
@@ -1198,9 +1895,35 @@ class Q35DecodeAttnKernel:
             bars_sm = (s_full, s_empty, p_full, p_empty, o_done)
             n_t = k_hi - k_lo
             for i in cutlass.range(n_t):
-                self._softmax_tile(i, 2 * (k_lo + i), x, m_ref, l_acc, alpha, tStS, tOtO, t2r_s, thr_s, t2r_o, thr_o,
-                                   r2t_o, thr_ro, tSc, sRed, bars_sm, sP_base, sP_nk_l, st, sw, lane, prefix, n_pages,
-                                   scale, mDbg, dbg_row)
+                self._softmax_tile(
+                    i,
+                    2 * (k_lo + i),
+                    x,
+                    m_ref,
+                    l_acc,
+                    alpha,
+                    tStS,
+                    tOtO,
+                    t2r_s,
+                    thr_s,
+                    t2r_o,
+                    thr_o,
+                    r2t_o,
+                    thr_ro,
+                    tSc,
+                    sRed,
+                    bars_sm,
+                    sP_base,
+                    sP_nk_l,
+                    st,
+                    sw,
+                    lane,
+                    prefix,
+                    n_pages,
+                    scale,
+                    mDbg,
+                    dbg_row,
+                )
             if const_expr(self.debug_ts):
                 if st == 0:
                     mDbg[dbg_row, 3] = _globaltimer()
@@ -1242,7 +1965,9 @@ class Q35DecodeAttnKernel:
                 _st_shared_f32(stage_o + (k * HEAD_DIM + 128 + st) * 4, o1[k])
             cute.arch.barrier(barrier_id=BAR_SOFTMAX, number_of_threads=128)
             for it in cutlass.range_constexpr((R * 64 + 127) // 128):
-                idx = st + it * 128  # float4 index of the row-major [R][256] partial; never straddles a chunk
+                idx = (
+                    st + it * 128
+                )  # float4 index of the row-major [R][256] partial; never straddles a chunk
                 if idx < R * 64:
                     v4o = _ld_shared_v4(stage_o + idx * 16)
                     ch_i = (4 * idx) // chunk
@@ -1256,21 +1981,43 @@ class Q35DecodeAttnKernel:
                     for k in cutlass.range_constexpr(NQ):
                         if lane == k:
                             mval = m_ref[k]
-                    _st_global_v4(ws_ml_base + ((lane * n_splits + split) * 4) * 4, mval, lsum, Float32(0.0),
-                                  Float32(0.0))
+                    _st_global_v4(
+                        ws_ml_base + ((lane * n_splits + split) * 4) * 4,
+                        mval,
+                        lsum,
+                        Float32(0.0),
+                        Float32(0.0),
+                    )
         elif warp == 2:
             wwk = cute.make_rmem_tensor((4,), Uint32)
             kvq_k = Float32(0.0)
             if const_expr(self.fold):
-                kvq_k = self._fold_load_static(lane, kw_ptr, kvq_ptr, wwk)  # static: before the wait
+                kvq_k = self._fold_load_static(
+                    lane, kw_ptr, kvq_ptr, wwk
+                )  # static: before the wait
             if const_expr(self.use_pdl and not self.unsafe_skip_wait):
                 _griddep_wait()  # the gate and bmm2 come from earlier kernels
             if const_expr(self.debug_ring > 0):
                 if lane == 0:
                     sDbgT[0] = _globaltimer()  # wait done (before the fold's K append)
             if const_expr(self.fold):
-                self._fold_append(0, lane, req, L, k_lo, k_hi, mTab, kv_base, qkv_ptr, qkv_stride, wwk, kvq_k, eps,
-                                  sCS, cs_ready)
+                self._fold_append(
+                    0,
+                    lane,
+                    req,
+                    L,
+                    k_lo,
+                    k_hi,
+                    mTab,
+                    kv_base,
+                    qkv_ptr,
+                    qkv_stride,
+                    wwk,
+                    kvq_k,
+                    eps,
+                    sCS,
+                    cs_ready,
+                )
                 cute.arch.fence_proxy("async.global")
                 cute.arch.mbarrier_arrive(kv_app)
             # epoch target of the grid barrier: the counter grows by n_splits per launch and never resets; fewer than
@@ -1283,7 +2030,9 @@ class Q35DecodeAttnKernel:
                 if const_expr(self.bmm2_from_ptr):
                     b2v = mBmm2[0]
                 if const_expr(self.fold):
-                    b2v = _ld_global_f32(kvd_ptr.toint())  # bmm2 = kv_scale_quant_orig (Triton kernel: scales[4])
+                    b2v = _ld_global_f32(
+                        kvd_ptr.toint()
+                    )  # bmm2 = kv_scale_quant_orig (Triton kernel: scales[4])
                 sScal[0] = b2v
             # sigmoid(gate) of this CTA's output chunk
             if const_expr(self.has_gate):
@@ -1307,15 +2056,39 @@ class Q35DecodeAttnKernel:
             if const_expr(self.use_pdl and not self.unsafe_skip_wait):
                 _griddep_wait()
             if const_expr(self.fold):
-                self._fold_append(1, lane, req, L, k_lo, k_hi, mTab, kv_base, qkv_ptr, qkv_stride, wwv, kvq_v, eps,
-                                  sCS, cs_ready)
+                self._fold_append(
+                    1,
+                    lane,
+                    req,
+                    L,
+                    k_lo,
+                    k_hi,
+                    mTab,
+                    kv_base,
+                    qkv_ptr,
+                    qkv_stride,
+                    wwv,
+                    kvq_v,
+                    eps,
+                    sCS,
+                    cs_ready,
+                )
                 cute.arch.fence_proxy("async.global")
                 cute.arch.mbarrier_arrive(kv_app)
             else:
-                gQ = cute.local_tile(gQ_tma, cute.slice_((TILE_KEYS, NQ, HEAD_DIM), (0, None, None)), (None, None, None))
+                gQ = cute.local_tile(
+                    gQ_tma,
+                    cute.slice_((TILE_KEYS, NQ, HEAD_DIM), (0, None, None)),
+                    (None, None, None),
+                )
                 tCgQ = mma_qk.get_slice(0).partition_B(gQ)
-                tQs, tQg = cpasync.tma_partition(tma_q, 0, cute.make_layout(1), cute.group_modes(sQ, 0, 3),
-                                                 cute.group_modes(tCgQ, 0, 3))
+                tQs, tQg = cpasync.tma_partition(
+                    tma_q,
+                    0,
+                    cute.make_layout(1),
+                    cute.group_modes(sQ, 0, 3),
+                    cute.group_modes(tCgQ, 0, 3),
+                )
                 with cute.arch.elect_one():
                     cute.arch.mbarrier_arrive_and_expect_tx(q_full, q_bytes)
                 cute.copy(tma_q, tQg[(None, 0, 0, req)], tQs[(None, 0)], tma_bar_ptr=q_full)
@@ -1353,17 +2126,33 @@ class Q35DecodeAttnKernel:
             if warp == 0:
                 # this CTA's chunk of every split is one contiguous block (chunk-major workspace), and so are the
                 # (m, l) of each of its (at most two) rows: 2-3 bulk copies issued by one lane
-                cute.arch.fence_proxy("async.global")  # acquire (generic proxy) -> bulk reads (async proxy)
+                cute.arch.fence_proxy(
+                    "async.global"
+                )  # acquire (generic proxy) -> bulk reads (async proxy)
                 if lane == 0:
                     n_ml = row1 - row0 + 1
-                    cute.arch.mbarrier_arrive_and_expect_tx(comb_bar, n_splits * (chunk_pad + 4 * n_ml) * 4)
-                    _bulk_g2s(sComb.iterator.toint(), ws_o_base + (split * n_splits * chunk_pad) * 4,
-                              n_splits * chunk_pad * 4, comb_bar.toint())
-                    _bulk_g2s(sML0.iterator.toint(), ws_ml_base + (row0 * n_splits * 4) * 4, n_splits * 16,
-                              comb_bar.toint())
+                    cute.arch.mbarrier_arrive_and_expect_tx(
+                        comb_bar, n_splits * (chunk_pad + 4 * n_ml) * 4
+                    )
+                    _bulk_g2s(
+                        sComb.iterator.toint(),
+                        ws_o_base + (split * n_splits * chunk_pad) * 4,
+                        n_splits * chunk_pad * 4,
+                        comb_bar.toint(),
+                    )
+                    _bulk_g2s(
+                        sML0.iterator.toint(),
+                        ws_ml_base + (row0 * n_splits * 4) * 4,
+                        n_splits * 16,
+                        comb_bar.toint(),
+                    )
                     if row1 != row0:
-                        _bulk_g2s(sML1.iterator.toint(), ws_ml_base + (row1 * n_splits * 4) * 4, n_splits * 16,
-                                  comb_bar.toint())
+                        _bulk_g2s(
+                            sML1.iterator.toint(),
+                            ws_ml_base + (row1 * n_splits * 4) * 4,
+                            n_splits * 16,
+                            comb_bar.toint(),
+                        )
             # spin (no suspend hint): every lane of a warp must be awake for the shuffles below
             landed = cute.arch.mbarrier_try_wait(comb_bar, 0)
             while not landed:
@@ -1398,7 +2187,9 @@ class Q35DecodeAttnKernel:
                 if tidx == 0:
                     mDbg[dbg_row, 11] = _clock64() - c_land
             for lg in cutlass.range_constexpr(self.gps.bit_length() - 1):
-                mloc = cute.arch.fmax(mloc, cute.arch.shuffle_sync_bfly(mloc, offset=self.gps >> (lg + 1)))
+                mloc = cute.arch.fmax(
+                    mloc, cute.arch.shuffle_sync_bfly(mloc, offset=self.gps >> (lg + 1))
+                )
             if const_expr(self.debug_ts):
                 if tidx == 0:
                     mDbg[dbg_row, 12] = _clock64() - c_land
@@ -1434,7 +2225,9 @@ class Q35DecodeAttnKernel:
                     mDbg[dbg_row, 14] = _clock64() - c_land
             if active:
                 if jg == 0:
-                    scl = Float32(0.0)  # a row without any visible key (padding, L < q_len) gives 0, not NaN
+                    scl = Float32(
+                        0.0
+                    )  # a row without any visible key (padding, L < q_len) gives 0, not NaN
                     if lsum > Float32(0.0):
                         scl = sScal[0] / lsum
                     accs = (a0, a1, a2, a3)

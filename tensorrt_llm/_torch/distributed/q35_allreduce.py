@@ -32,7 +32,6 @@ kernel does. One program (512 threads) per token; hidden % 2048 == 0; TP group o
 from __future__ import annotations
 
 import os
-
 from typing import Optional, Tuple
 
 import torch
@@ -45,8 +44,14 @@ _HI_MASK = tl.constexpr(-65536)  # 0xFFFF0000
 
 @triton.jit
 def _gdc_wait_clobber():
-    tl.inline_asm_elementwise("griddepcontrol.wait; // dummy $0", "=r,~{memory}", [], dtype=tl.int32,
-                              is_pure=False, pack=1)
+    tl.inline_asm_elementwise(
+        "griddepcontrol.wait; // dummy $0",
+        "=r,~{memory}",
+        [],
+        dtype=tl.int32,
+        is_pure=False,
+        pack=1,
+    )
 
 
 @triton.jit
@@ -155,8 +160,11 @@ def _q35_oneshot_ar_kernel(
         stage_base = (dirty.to(tl.int64) * dstages + s_i) * stage_words
         n_words = tl.multiple_of((tl.load(flags_ptr + 4 + s_i, volatile=True) + 15) // 16 * 4, 4)
         for start in range(t * HW, n_words, m * HW):
-            tl.store(uc_ptr + stage_base + start + cols, tl.full([HW], _SENTINEL, tl.int32),
-                     mask=start + cols < n_words)
+            tl.store(
+                uc_ptr + stage_base + start + cols,
+                tl.full([HW], _SENTINEL, tl.int32),
+                mask=start + cols < n_words,
+            )
 
     # ---- wait for the token's row of every rank (one load of all ranks per round) ----
     tok_base = uc_ptr + cur_base + t.to(tl.int64) * W * HW
@@ -168,8 +176,16 @@ def _q35_oneshot_ar_kernel(
     w5 = _load_rank(tok_base, HW, 5, W, cols)
     w6 = _load_rank(tok_base, HW, 6, W, cols)
     w7 = _load_rank(tok_base, HW, 7, W, cols)
-    pending = (_pending(w0, 0, W) + _pending(w1, 1, W) + _pending(w2, 2, W) + _pending(w3, 3, W) +
-               _pending(w4, 4, W) + _pending(w5, 5, W) + _pending(w6, 6, W) + _pending(w7, 7, W))
+    pending = (
+        _pending(w0, 0, W)
+        + _pending(w1, 1, W)
+        + _pending(w2, 2, W)
+        + _pending(w3, 3, W)
+        + _pending(w4, 4, W)
+        + _pending(w5, 5, W)
+        + _pending(w6, 6, W)
+        + _pending(w7, 7, W)
+    )
     while pending > 0:
         w0 = _load_rank(tok_base, HW, 0, W, cols)
         w1 = _load_rank(tok_base, HW, 1, W, cols)
@@ -179,8 +195,16 @@ def _q35_oneshot_ar_kernel(
         w5 = _load_rank(tok_base, HW, 5, W, cols)
         w6 = _load_rank(tok_base, HW, 6, W, cols)
         w7 = _load_rank(tok_base, HW, 7, W, cols)
-        pending = (_pending(w0, 0, W) + _pending(w1, 1, W) + _pending(w2, 2, W) + _pending(w3, 3, W) +
-                   _pending(w4, 4, W) + _pending(w5, 5, W) + _pending(w6, 6, W) + _pending(w7, 7, W))
+        pending = (
+            _pending(w0, 0, W)
+            + _pending(w1, 1, W)
+            + _pending(w2, 2, W)
+            + _pending(w3, 3, W)
+            + _pending(w4, 4, W)
+            + _pending(w5, 5, W)
+            + _pending(w6, 6, W)
+            + _pending(w7, 7, W)
+        )
 
     # ---- FP32 sum in rank order, rounded to BF16 once (the library's deterministic order) ----
     zero = tl.zeros([HW], tl.float32)
@@ -257,14 +281,19 @@ class Q35FusedAllReduce:
         self.mnnvl = MNNVLAllReduce(mapping, dtype)  # creates / shares the workspace
         self._mc_views = {}
         from ..flashinfer_utils import get_env_enable_pdl
+
         self._pdl = get_env_enable_pdl()
 
     def _workspace(self, rows: int, hidden: int):
         from .ops import get_or_scale_allreduce_mnnvl_workspace
-        ws = get_or_scale_allreduce_mnnvl_workspace(self.mapping, self.dtype,
-                                                    buffer_size_bytes=rows * hidden * self.mapping.tp_size * 2)
+
+        ws = get_or_scale_allreduce_mnnvl_workspace(
+            self.mapping, self.dtype, buffer_size_bytes=rows * hidden * self.mapping.tp_size * 2
+        )
         if ws is None:
-            raise RuntimeError(f"MNNVL workspace sized once (TRTLLM_Q35_MNNVL_PRESIZE) is too small for {rows} rows")
+            raise RuntimeError(
+                f"MNNVL workspace sized once (TRTLLM_Q35_MNNVL_PRESIZE) is too small for {rows} rows"
+            )
         uc = ws["uc_buffer"].view(torch.int32)
         key = id(ws["handle"])
         mc = self._mc_views.get(key)
@@ -273,14 +302,16 @@ class Q35FusedAllReduce:
             self._mc_views = {key: mc}
         return uc, mc, ws["buffer_flags"].view(torch.int32)
 
-    def __call__(self,
-                 residual: torch.Tensor,
-                 norm_weight: torch.Tensor,
-                 eps: float,
-                 x: Optional[torch.Tensor] = None,
-                 shared_fold: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
-                 scale: Optional[torch.Tensor] = None,
-                 norm_out: bool = True) -> Tuple[torch.Tensor, ...]:
+    def __call__(
+        self,
+        residual: torch.Tensor,
+        norm_weight: torch.Tensor,
+        eps: float,
+        x: Optional[torch.Tensor] = None,
+        shared_fold: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
+        scale: Optional[torch.Tensor] = None,
+        norm_out: bool = True,
+    ) -> Tuple[torch.Tensor, ...]:
         """``x`` [M, H] BF16 (or ``shared_fold`` = (routed [M, H], shared [M, H], gate logits [M] /
         [M, 1])); returns ``(norm, residual_out)``, ``(norm, fp8, residual_out)`` with ``scale``, or
         ``(fp8, residual_out)`` with ``scale`` and ``norm_out=False`` -- the outputs of the library
@@ -291,8 +322,11 @@ class Q35FusedAllReduce:
         uc, mc, flags = self._workspace(m, hidden)
         norm = torch.empty_like(residual) if norm_out else None
         res_out = torch.empty_like(residual)
-        quant = (torch.empty(residual.shape, dtype=torch.float8_e4m3fn, device=residual.device)
-                 if scale is not None else None)
+        quant = (
+            torch.empty(residual.shape, dtype=torch.float8_e4m3fn, device=residual.device)
+            if scale is not None
+            else None
+        )
         i32 = lambda t: t.contiguous().view(torch.int32)  # noqa: E731
         dummy = flags
         if shared_fold is not None:
@@ -301,7 +335,7 @@ class Q35FusedAllReduce:
         else:
             f = sh = g = dummy
             xin = i32(x)
-        _q35_oneshot_ar_kernel[(m, )](
+        _q35_oneshot_ar_kernel[(m,)](
             xin,
             f,
             sh,
@@ -345,9 +379,13 @@ def get_q35_fused_allreduce(mapping) -> Optional[Q35FusedAllReduce]:
     key = (tuple(mapping.tp_group), mapping.tp_rank)
     if key not in _INSTANCES:
         from .ops import MNNVLAllReduce
+
         inst = None
-        if (mapping.tp_size in (2, 4, 8) and not mapping.enable_attention_dp
-                and MNNVLAllReduce.is_mnnvl(mapping, torch.bfloat16)):
+        if (
+            mapping.tp_size in (2, 4, 8)
+            and not mapping.enable_attention_dp
+            and MNNVLAllReduce.is_mnnvl(mapping, torch.bfloat16)
+        ):
             inst = Q35FusedAllReduce(mapping)
         _INSTANCES[key] = inst
     return _INSTANCES[key]
@@ -373,6 +411,7 @@ class _GraphSafeDlpack:
 
 def _cute(t: torch.Tensor):
     from cutlass.cute.runtime import from_dlpack
+
     return from_dlpack(_GraphSafeDlpack(t), assumed_align=16)
 
 
@@ -394,7 +433,6 @@ def _ctas_per_token(rows: int, hidden: int) -> int:
 
 import functools  # noqa: E402
 
-
 # Rows from which the CuTe kernel uses its fused two-shot mode (0: never). Default by group size from GB300
 # microbenchmarks: TP16 from 12 rows (one-shot ingress doubles: 14 rows one-shot 6.68 / two-shot 6.51 us, 28 rows
 # 9.65 / 7.52), never at TP8 and below (28 rows: one-shot 6.93 / two-shot 7.28). TRTLLM_Q35_FUSED_AR_TWOSHOT_ROWS
@@ -409,28 +447,66 @@ def _two_shot_rows(nranks: int) -> int:
 
 
 @functools.lru_cache(maxsize=None)
-def _compiled_cute_ar(m: int, hidden: int, eps: float, nranks: int, ctas: int, use_pdl: bool, se_fold: bool,
-                      norm_out: bool, quant: bool, moe_topk: int = 0, fc2_row: int = 0, two_shot: bool = False):
+def _compiled_cute_ar(
+    m: int,
+    hidden: int,
+    eps: float,
+    nranks: int,
+    ctas: int,
+    use_pdl: bool,
+    se_fold: bool,
+    norm_out: bool,
+    quant: bool,
+    moe_topk: int = 0,
+    fc2_row: int = 0,
+    two_shot: bool = False,
+):
     import cuda.bindings.driver as cuda
     import cutlass
     import cutlass.cute as cute
 
     from ..cute_dsl_kernels.blackwell.q35_allreduce_norm import Q35AllReduceNormKernel
 
-    kernel = Q35AllReduceNormKernel(hidden=hidden, norm_eps=eps, nranks=nranks, ctas=ctas, use_pdl=use_pdl,
-                                    se_fold=se_fold, norm_out=norm_out, quant=quant, moe_topk=moe_topk,
-                                    fc2_row=fc2_row, two_shot=two_shot)
+    kernel = Q35AllReduceNormKernel(
+        hidden=hidden,
+        norm_eps=eps,
+        nranks=nranks,
+        ctas=ctas,
+        use_pdl=use_pdl,
+        se_fold=se_fold,
+        norm_out=norm_out,
+        quant=quant,
+        moe_topk=moe_topk,
+        fc2_row=fc2_row,
+        two_shot=two_shot,
+    )
     dev = torch.device("cuda")
     x = torch.empty((m, hidden), dtype=torch.bfloat16, device=dev)
-    gate = torch.empty((m, ), dtype=torch.bfloat16, device=dev)
-    w = torch.empty((hidden, ), dtype=torch.bfloat16, device=dev)
-    scale = torch.empty((1, ), dtype=torch.float32, device=dev)
+    gate = torch.empty((m,), dtype=torch.bfloat16, device=dev)
+    w = torch.empty((hidden,), dtype=torch.bfloat16, device=dev)
+    scale = torch.empty((1,), dtype=torch.float32, device=dev)
     q = torch.empty((m, hidden), dtype=torch.uint8, device=dev)
-    table = torch.empty((3 + nranks, ), dtype=torch.int64, device=dev)
+    table = torch.empty((3 + nranks,), dtype=torch.int64, device=dev)
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-    return cute.compile(kernel, _cute(x), _cute(x), _cute(x), _cute(gate), _cute(x), _cute(w), _cute(scale),
-                        _cute(x), _cute(x), _cute(q), _cute(table), cutlass.Int64(0), cutlass.Int64(0),
-                        cutlass.Int64(0), cutlass.Int32(0), stream)
+    return cute.compile(
+        kernel,
+        _cute(x),
+        _cute(x),
+        _cute(x),
+        _cute(gate),
+        _cute(x),
+        _cute(w),
+        _cute(scale),
+        _cute(x),
+        _cute(x),
+        _cute(q),
+        _cute(table),
+        cutlass.Int64(0),
+        cutlass.Int64(0),
+        cutlass.Int64(0),
+        cutlass.Int32(0),
+        stream,
+    )
 
 
 class Q35CuteAllReduce:
@@ -448,10 +524,13 @@ class Q35CuteAllReduce:
         self._ws = None
         self._views = None
         # (local buffer, multicast buffer, flags, every rank's unicast buffer)
-        self.table = torch.zeros((3 + mapping.tp_size, ),
-                                 dtype=torch.int64,
-                                 device=torch.device("cuda", torch.cuda.current_device()))
+        self.table = torch.zeros(
+            (3 + mapping.tp_size,),
+            dtype=torch.int64,
+            device=torch.device("cuda", torch.cuda.current_device()),
+        )
         from ..flashinfer_utils import get_env_enable_pdl
+
         self._pdl = get_env_enable_pdl()
         self._dummies = {}
 
@@ -460,47 +539,75 @@ class Q35CuteAllReduce:
         d = self._dummies.get((m, hidden))
         if d is None:
             dev = self.table.device
-            d = (torch.empty((m, ), dtype=torch.bfloat16, device=dev),
-                 torch.empty((m, hidden), dtype=torch.uint8, device=dev), self.table.view(torch.float32)[:1])
+            d = (
+                torch.empty((m,), dtype=torch.bfloat16, device=dev),
+                torch.empty((m, hidden), dtype=torch.uint8, device=dev),
+                self.table.view(torch.float32)[:1],
+            )
             self._dummies[(m, hidden)] = d
         return d
 
     def _table(self, nbytes: int) -> torch.Tensor:
         from .ops import get_or_scale_allreduce_mnnvl_workspace
-        ws = get_or_scale_allreduce_mnnvl_workspace(self.mapping, self.dtype, buffer_size_bytes=nbytes)
+
+        ws = get_or_scale_allreduce_mnnvl_workspace(
+            self.mapping, self.dtype, buffer_size_bytes=nbytes
+        )
         if ws is None:
-            raise RuntimeError(f"MNNVL workspace sized once (TRTLLM_Q35_MNNVL_PRESIZE) is too small for {nbytes} B")
+            raise RuntimeError(
+                f"MNNVL workspace sized once (TRTLLM_Q35_MNNVL_PRESIZE) is too small for {nbytes} B"
+            )
         if ws is not self._ws:
             if torch.cuda.is_current_stream_capturing():
                 raise RuntimeError("the MNNVL workspace changed during CUDA graph capture")
             local = ws["uc_buffer"]
             mcast = ws["handle"].get_mc_buffer(tuple(local.shape), local.dtype, 0)
             flags = ws["buffer_flags"]
-            peers = [ws["handle"].get_uc_buffer(r, (1, ), torch.float32, 0) for r in range(self.mapping.tp_size)]
+            peers = [
+                ws["handle"].get_uc_buffer(r, (1,), torch.float32, 0)
+                for r in range(self.mapping.tp_size)
+            ]
             self.table.copy_(
-                torch.tensor([local.data_ptr(), mcast.data_ptr(), flags.data_ptr()] + [p.data_ptr() for p in peers],
-                             dtype=torch.int64))
+                torch.tensor(
+                    [local.data_ptr(), mcast.data_ptr(), flags.data_ptr()]
+                    + [p.data_ptr() for p in peers],
+                    dtype=torch.int64,
+                )
+            )
             self._ws = ws
             self._views = (local, mcast, flags, peers)
         return self.table
 
     @staticmethod
-    def moe_fold_supported(fc2: torch.Tensor, topk_weights: torch.Tensor, perm: torch.Tensor, hidden: int) -> bool:
+    def moe_fold_supported(
+        fc2: torch.Tensor, topk_weights: torch.Tensor, perm: torch.Tensor, hidden: int
+    ) -> bool:
         """Can ``shared_fold``'s routed operand be this un-finalized trtllm-gen MoE output?"""
-        return (fc2.dtype == torch.bfloat16 and fc2.dim() == 2 and fc2.stride(1) == 1 and fc2.shape[1] >= hidden
-                and fc2.stride(0) % 8 == 0 and fc2.data_ptr() % 16 == 0 and topk_weights.dtype == torch.bfloat16
-                and perm.dtype == torch.int32 and topk_weights.shape == perm.shape and perm.dim() == 2
-                and 0 < perm.shape[1] <= 16)
+        return (
+            fc2.dtype == torch.bfloat16
+            and fc2.dim() == 2
+            and fc2.stride(1) == 1
+            and fc2.shape[1] >= hidden
+            and fc2.stride(0) % 8 == 0
+            and fc2.data_ptr() % 16 == 0
+            and topk_weights.dtype == torch.bfloat16
+            and perm.dtype == torch.int32
+            and topk_weights.shape == perm.shape
+            and perm.dim() == 2
+            and 0 < perm.shape[1] <= 16
+        )
 
-    def __call__(self,
-                 residual: torch.Tensor,
-                 norm_weight: torch.Tensor,
-                 eps: float,
-                 x: Optional[torch.Tensor] = None,
-                 shared_fold: Optional[Tuple] = None,
-                 scale: Optional[torch.Tensor] = None,
-                 norm_out: bool = True,
-                 two_shot: Optional[bool] = None) -> Tuple[torch.Tensor, ...]:
+    def __call__(
+        self,
+        residual: torch.Tensor,
+        norm_weight: torch.Tensor,
+        eps: float,
+        x: Optional[torch.Tensor] = None,
+        shared_fold: Optional[Tuple] = None,
+        scale: Optional[torch.Tensor] = None,
+        norm_out: bool = True,
+        two_shot: Optional[bool] = None,
+    ) -> Tuple[torch.Tensor, ...]:
         """``shared_fold`` = (routed, shared, gate); ``routed`` may be the un-finalized trtllm-gen MoE
         output ``(fc2 [P, >= H] BF16, topk_weights [M, K] BF16, expanded_idx_to_permuted_idx [M, K]
         int32)`` (do_finalize=False), finalized in-kernel. ``two_shot``: None = by rows and group size
@@ -518,16 +625,33 @@ class Q35CuteAllReduce:
             thr = _two_shot_rows(nranks)
             two_shot = 0 < thr <= m
         # one-shot: [rank][token][H] in one stage; two-shot: two stages of max(scatter, broadcast) each
-        table = self._table(max(m * hidden * nranks * 2, 2 * ((m + nranks - 1) // nranks) * nranks * hidden * 2))
+        table = self._table(
+            max(m * hidden * nranks * 2, 2 * ((m + nranks - 1) // nranks) * nranks * hidden * 2)
+        )
         ctas = _ctas_per_token(m, hidden)
         topk = moe[2].shape[1] if moe is not None else 0
         fc2_row = moe[0].stride(0) if moe is not None else 0
-        fn = _compiled_cute_ar(m, hidden, float(eps), nranks, ctas, self._pdl, shared_fold is not None, norm_out,
-                               scale is not None, topk, fc2_row, bool(two_shot))
+        fn = _compiled_cute_ar(
+            m,
+            hidden,
+            float(eps),
+            nranks,
+            ctas,
+            self._pdl,
+            shared_fold is not None,
+            norm_out,
+            scale is not None,
+            topk,
+            fc2_row,
+            bool(two_shot),
+        )
         res_out = torch.empty_like(residual)
         norm = torch.empty_like(residual) if norm_out else res_out
-        quant = (torch.empty(residual.shape, dtype=torch.float8_e4m3fn, device=residual.device)
-                 if scale is not None else None)
+        quant = (
+            torch.empty(residual.shape, dtype=torch.float8_e4m3fn, device=residual.device)
+            if scale is not None
+            else None
+        )
         d_gate, d_quant, d_scale = self._dummy(m, hidden)
         fc2_ptr = topw_ptr = perm_ptr = 0
         if shared_fold is not None:
@@ -535,17 +659,34 @@ class Q35CuteAllReduce:
             if moe is not None:
                 fc2, topw, perm = moe
                 assert perm.shape[0] == m and self.moe_fold_supported(fc2, topw, perm, hidden)
-                fc2_ptr, topw_ptr, perm_ptr = fc2.data_ptr(), topw.contiguous().data_ptr(), perm.contiguous().data_ptr()
+                fc2_ptr, topw_ptr, perm_ptr = (
+                    fc2.data_ptr(),
+                    topw.contiguous().data_ptr(),
+                    perm.contiguous().data_ptr(),
+                )
                 routed = shared  # unread
             xin, gate = routed, gate.reshape(-1)
         else:
             xin, routed, shared, gate = x, x, x, d_gate
         w = norm_weight.reshape(-1)
-        fn(_cute(xin.contiguous()), _cute(routed.contiguous()), _cute(shared.contiguous()), _cute(gate.contiguous()),
-           _cute(residual.contiguous()), _cute(w), _cute(scale.reshape(1) if scale is not None else d_scale),
-           _cute(res_out), _cute(norm), _cute(quant.view(torch.uint8) if quant is not None else d_quant),
-           _cute(table), cutlass.Int64(fc2_ptr), cutlass.Int64(topw_ptr), cutlass.Int64(perm_ptr),
-           cutlass.Int32(self.mapping.tp_rank), cuda.CUstream(torch.cuda.current_stream().cuda_stream))
+        fn(
+            _cute(xin.contiguous()),
+            _cute(routed.contiguous()),
+            _cute(shared.contiguous()),
+            _cute(gate.contiguous()),
+            _cute(residual.contiguous()),
+            _cute(w),
+            _cute(scale.reshape(1) if scale is not None else d_scale),
+            _cute(res_out),
+            _cute(norm),
+            _cute(quant.view(torch.uint8) if quant is not None else d_quant),
+            _cute(table),
+            cutlass.Int64(fc2_ptr),
+            cutlass.Int64(topw_ptr),
+            cutlass.Int64(perm_ptr),
+            cutlass.Int32(self.mapping.tp_rank),
+            cuda.CUstream(torch.cuda.current_stream().cuda_stream),
+        )
         if scale is None:
             return norm, res_out
         if norm_out:
@@ -560,9 +701,13 @@ def get_q35_cute_allreduce(mapping) -> Optional[Q35CuteAllReduce]:
     key = (tuple(mapping.tp_group), mapping.tp_rank)
     if key not in _CUTE_INSTANCES:
         from .ops import MNNVLAllReduce
+
         inst = None
-        if (mapping.tp_size in (2, 4, 8, 16) and not mapping.enable_attention_dp
-                and MNNVLAllReduce.is_mnnvl(mapping, torch.bfloat16)):
+        if (
+            mapping.tp_size in (2, 4, 8, 16)
+            and not mapping.enable_attention_dp
+            and MNNVLAllReduce.is_mnnvl(mapping, torch.bfloat16)
+        ):
             inst = Q35CuteAllReduce(mapping)
         _CUTE_INSTANCES[key] = inst
     return _CUTE_INSTANCES[key]
@@ -576,37 +721,91 @@ _GEMM_AR_MAX_CTAS = 1024
 
 
 @functools.lru_cache(maxsize=None)
-def _compiled_gemm_ar(m: int, k: int, hidden: int, k_warps: int, n_tiles: int, swap: bool, fp8_act: str,
-                      a_stride: int, eps: float, nranks: int, use_pdl: bool, min_blocks: int, norm_out: bool,
-                      quant: bool, stamps: bool = False, row_ar: bool = True, two_shot: bool = False):
+def _compiled_gemm_ar(
+    m: int,
+    k: int,
+    hidden: int,
+    k_warps: int,
+    n_tiles: int,
+    swap: bool,
+    fp8_act: str,
+    a_stride: int,
+    eps: float,
+    nranks: int,
+    use_pdl: bool,
+    min_blocks: int,
+    norm_out: bool,
+    quant: bool,
+    stamps: bool = False,
+    row_ar: bool = True,
+    two_shot: bool = False,
+):
     import cuda.bindings.driver as cuda
     import cutlass
     import cutlass.cute as cute
 
     from ..cute_dsl_kernels.blackwell.q35_gemm_ar_norm import PART_SLOT_ROWS, Q35GemmArNormKernel
 
-    kernel = Q35GemmArNormKernel(num_rows=m, k_extent=k, k_warps=k_warps, n_tiles=n_tiles, swap_ab=swap,
-                                 fp8_act=fp8_act, hidden=hidden, norm_eps=eps, nranks=nranks, use_pdl=use_pdl,
-                                 min_blocks=min_blocks, norm_out=norm_out, quant=quant,
-                                 max_ctas=_GEMM_AR_MAX_CTAS, stamps=stamps, row_ar=row_ar, two_shot=two_shot)
+    kernel = Q35GemmArNormKernel(
+        num_rows=m,
+        k_extent=k,
+        k_warps=k_warps,
+        n_tiles=n_tiles,
+        swap_ab=swap,
+        fp8_act=fp8_act,
+        hidden=hidden,
+        norm_eps=eps,
+        nranks=nranks,
+        use_pdl=use_pdl,
+        min_blocks=min_blocks,
+        norm_out=norm_out,
+        quant=quant,
+        max_ctas=_GEMM_AR_MAX_CTAS,
+        stamps=stamps,
+        row_ar=row_ar,
+        two_shot=two_shot,
+    )
     dev = torch.device("cuda")
-    a16 = torch.empty((m, a_stride), dtype=torch.bfloat16, device=dev)[:, :k] if fp8_act != "fp8" else \
-        torch.empty((1, 8), dtype=torch.bfloat16, device=dev)
-    a8 = torch.empty((m, a_stride), dtype=torch.uint8, device=dev)[:, :k] if fp8_act == "fp8" else \
-        torch.empty((1, 16), dtype=torch.uint8, device=dev)
+    a16 = (
+        torch.empty((m, a_stride), dtype=torch.bfloat16, device=dev)[:, :k]
+        if fp8_act != "fp8"
+        else torch.empty((1, 8), dtype=torch.bfloat16, device=dev)
+    )
+    a8 = (
+        torch.empty((m, a_stride), dtype=torch.uint8, device=dev)[:, :k]
+        if fp8_act == "fp8"
+        else torch.empty((1, 16), dtype=torch.uint8, device=dev)
+    )
     b = torch.empty((hidden, k), dtype=torch.uint8, device=dev)
-    s = torch.empty((1, ), dtype=torch.float32, device=dev)
+    s = torch.empty((1,), dtype=torch.float32, device=dev)
     x = torch.empty((m, hidden), dtype=torch.bfloat16, device=dev)
-    w = torch.empty((hidden, ), dtype=torch.bfloat16, device=dev)
+    w = torch.empty((hidden,), dtype=torch.bfloat16, device=dev)
     qo = torch.empty((m, hidden), dtype=torch.uint8, device=dev)
-    table = torch.empty((3 + nranks, ), dtype=torch.int64, device=dev)
-    part = torch.empty((2 * PART_SLOT_ROWS * _GEMM_AR_MAX_CTAS, ), dtype=torch.int64, device=dev)
-    epoch = torch.empty((1, ), dtype=torch.int32, device=dev)
-    dbg = torch.empty((kernel.ctas * 8 if stamps else 8, ), dtype=torch.int64, device=dev)
+    table = torch.empty((3 + nranks,), dtype=torch.int64, device=dev)
+    part = torch.empty((2 * PART_SLOT_ROWS * _GEMM_AR_MAX_CTAS,), dtype=torch.int64, device=dev)
+    epoch = torch.empty((1,), dtype=torch.int32, device=dev)
+    dbg = torch.empty((kernel.ctas * 8 if stamps else 8,), dtype=torch.int64, device=dev)
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-    return cute.compile(kernel, _cute(a16), _cute(a8), _cute(b), _cute(s), _cute(s), _cute(x), _cute(w), _cute(s),
-                        _cute(x), _cute(x), _cute(qo), _cute(table), _cute(part), _cute(epoch), _cute(dbg),
-                        cutlass.Int32(0), stream)
+    return cute.compile(
+        kernel,
+        _cute(a16),
+        _cute(a8),
+        _cute(b),
+        _cute(s),
+        _cute(s),
+        _cute(x),
+        _cute(w),
+        _cute(s),
+        _cute(x),
+        _cute(x),
+        _cute(qo),
+        _cute(table),
+        _cute(part),
+        _cute(epoch),
+        _cute(dbg),
+        cutlass.Int32(0),
+        stream,
+    )
 
 
 class Q35GemmArNorm:
@@ -615,14 +814,17 @@ class Q35GemmArNorm:
 
     def __init__(self, mapping):
         from ..cute_dsl_kernels.blackwell.q35_gemm_ar_norm import PART_SLOT_ROWS
+
         self.mapping = mapping
         self.ar = Q35CuteAllReduce(mapping)  # owns the workspace table refresh
         dev = self.ar.table.device
-        self.part = torch.zeros((2 * PART_SLOT_ROWS * _GEMM_AR_MAX_CTAS, ), dtype=torch.int64, device=dev)
-        self.epoch = torch.ones((1, ), dtype=torch.int32, device=dev)
+        self.part = torch.zeros(
+            (2 * PART_SLOT_ROWS * _GEMM_AR_MAX_CTAS,), dtype=torch.int64, device=dev
+        )
+        self.epoch = torch.ones((1,), dtype=torch.int32, device=dev)
         self._sms = torch.cuda.get_device_properties(dev).multi_processor_count
         self._dummy_q = {}
-        self._dbg_dummy = torch.zeros((8, ), dtype=torch.int64, device=dev)
+        self._dbg_dummy = torch.zeros((8,), dtype=torch.int64, device=dev)
 
     def tactic(self, m: int, hidden: int, k: int, fp8_act: str):
         """(k_warps, n_tiles, swap, min_blocks) of the GEMM part, or None when the fused kernel cannot run
@@ -632,6 +834,7 @@ class Q35GemmArNorm:
         overrides)."""
         from ..cute_dsl_kernels.blackwell.q35_gemm_ar_norm import MAX_ROWS
         from ..modules.lowm_linear import default_tactic
+
         if not 0 < m <= MAX_ROWS:
             return None
         env = os.environ.get("TRTLLM_Q35_GEMM_AR_TACTIC")
@@ -644,8 +847,13 @@ class Q35GemmArNorm:
             while n_tiles < 4 and hidden // (8 * n_tiles) > self._sms:
                 n_tiles *= 2
         ctas = hidden // (8 * n_tiles)
-        if (hidden % (8 * n_tiles) or ctas > self._sms or ctas > _GEMM_AR_MAX_CTAS or m * n_tiles > 32 * k_warps
-                or k % (64 * k_warps)):
+        if (
+            hidden % (8 * n_tiles)
+            or ctas > self._sms
+            or ctas > _GEMM_AR_MAX_CTAS
+            or m * n_tiles > 32 * k_warps
+            or k % (64 * k_warps)
+        ):
             return None
         vpt = (hidden // 8) // (32 * k_warps)  # row all-reduce: 16-byte vectors per thread
         if (hidden // 8) % (32 * k_warps) or not 1 <= vpt <= 4 or m > ctas:
@@ -658,11 +866,21 @@ class Q35GemmArNorm:
             return None
         return k_warps, n_tiles, m <= 8 and n_tiles % 2 == 0, 1
 
-    def __call__(self, x: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor,
-                 input_scale: torch.Tensor, residual: torch.Tensor, norm_weight: torch.Tensor, eps: float,
-                 scale: Optional[torch.Tensor] = None, norm_out: bool = True,
-                 tactic=None, dbg: Optional[torch.Tensor] = None,
-                 row_ar: Optional[bool] = None) -> Optional[Tuple[torch.Tensor, ...]]:
+    def __call__(
+        self,
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        weight_scale: torch.Tensor,
+        input_scale: torch.Tensor,
+        residual: torch.Tensor,
+        norm_weight: torch.Tensor,
+        eps: float,
+        scale: Optional[torch.Tensor] = None,
+        norm_out: bool = True,
+        tactic=None,
+        dbg: Optional[torch.Tensor] = None,
+        row_ar: Optional[bool] = None,
+    ) -> Optional[Tuple[torch.Tensor, ...]]:
         """x [M, K] BF16 (``quant``: quantized in registers with ``input_scale``) or E4M3 (``fp8``); weight
         [H, K] E4M3. Returns (norm, residual_out), (norm, quant, residual_out) or (quant, residual_out)
         like the fused all-reduce; None when the shape is not supported. ``dbg`` (debug): int64 [CTAs * 8]
@@ -685,14 +903,35 @@ class Q35GemmArNorm:
         # two-shot (row mode) where the CuTe all-reduce goes two-shot (TP16 from 12 rows)
         thr = _two_shot_rows(nranks)
         two_shot = bool(row_ar) and 0 < thr <= m
-        table = self.ar._table(max(m * hidden * nranks * 2, 2 * ((m + nranks - 1) // nranks) * nranks * hidden * 2))
-        fn = _compiled_gemm_ar(m, k, hidden, k_warps, n_tiles, swap, fp8_act, x.stride(0), float(eps), nranks,
-                               self.ar._pdl, min_blocks, norm_out, scale is not None, dbg is not None, bool(row_ar),
-                               two_shot)
+        table = self.ar._table(
+            max(m * hidden * nranks * 2, 2 * ((m + nranks - 1) // nranks) * nranks * hidden * 2)
+        )
+        fn = _compiled_gemm_ar(
+            m,
+            k,
+            hidden,
+            k_warps,
+            n_tiles,
+            swap,
+            fp8_act,
+            x.stride(0),
+            float(eps),
+            nranks,
+            self.ar._pdl,
+            min_blocks,
+            norm_out,
+            scale is not None,
+            dbg is not None,
+            bool(row_ar),
+            two_shot,
+        )
         res_out = torch.empty_like(residual)
         norm = torch.empty_like(residual) if norm_out else res_out
-        quant = (torch.empty(residual.shape, dtype=torch.float8_e4m3fn, device=residual.device)
-                 if scale is not None else None)
+        quant = (
+            torch.empty(residual.shape, dtype=torch.float8_e4m3fn, device=residual.device)
+            if scale is not None
+            else None
+        )
         d_gate, d_quant, d_scale = self.ar._dummy(m, hidden)
         dev = x.device
         if fp8_act == "fp8":
@@ -701,12 +940,25 @@ class Q35GemmArNorm:
         else:
             a16 = x
             a8 = torch.empty((1, 16), dtype=torch.uint8, device=dev)
-        fn(_cute(a16), _cute(a8), _cute(weight.view(torch.uint8)), _cute(weight_scale.reshape(1).float()),
-           _cute(input_scale.reshape(1).float()), _cute(residual.contiguous()), _cute(norm_weight.reshape(-1)),
-           _cute(scale.reshape(1) if scale is not None else d_scale), _cute(res_out), _cute(norm),
-           _cute(quant.view(torch.uint8) if quant is not None else d_quant), _cute(table), _cute(self.part),
-           _cute(self.epoch), _cute(dbg if dbg is not None else self._dbg_dummy), cutlass.Int32(self.mapping.tp_rank),
-           cuda.CUstream(torch.cuda.current_stream().cuda_stream))
+        fn(
+            _cute(a16),
+            _cute(a8),
+            _cute(weight.view(torch.uint8)),
+            _cute(weight_scale.reshape(1).float()),
+            _cute(input_scale.reshape(1).float()),
+            _cute(residual.contiguous()),
+            _cute(norm_weight.reshape(-1)),
+            _cute(scale.reshape(1) if scale is not None else d_scale),
+            _cute(res_out),
+            _cute(norm),
+            _cute(quant.view(torch.uint8) if quant is not None else d_quant),
+            _cute(table),
+            _cute(self.part),
+            _cute(self.epoch),
+            _cute(dbg if dbg is not None else self._dbg_dummy),
+            cutlass.Int32(self.mapping.tp_rank),
+            cuda.CUstream(torch.cuda.current_stream().cuda_stream),
+        )
         if scale is None:
             return norm, res_out
         if norm_out:

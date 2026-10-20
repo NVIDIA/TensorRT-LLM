@@ -2099,7 +2099,8 @@ def q35_ar_no_nccl_symm() -> bool:
 
 def q35_ar_strategy_without_nccl_symm(strategy: int) -> int:
     """NCCL_SYMMETRIC -> NCCL under TRTLLM_Q35_AR_NO_NCCL_SYMM=1; any other strategy unchanged."""
-    if strategy == AllReduceStrategy.NCCL_SYMMETRIC.value and q35_ar_no_nccl_symm():
+    if strategy == AllReduceStrategy.NCCL_SYMMETRIC.value and q35_ar_no_nccl_symm(
+    ):
         return AllReduceStrategy.NCCL.value
     return strategy
 

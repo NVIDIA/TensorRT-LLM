@@ -60,6 +60,7 @@ from ..modules.decoder_layer import DecoderLayer
 from ..speculative.drafter import Drafter
 from ..speculative.spec_sampler_base import SampleStateTensorsSpec
 from ..speculative.speculation_gate import SpeculationGate
+from . import q35_admit_timers
 from .adp_iter_stats import ADPIterStatsBuffer
 from .connectors.kv_cache_connector import KvCacheConnectorManager
 from .dwdp import DwdpManager
@@ -70,7 +71,6 @@ from .handle_additional_outputs import HandleAdditionalOutputs
 from .handle_logits import HandleLogits
 from .hang_detector import HangDetector, propagate_hard_kill
 from .kv_cache_manager_v2 import KVCacheManagerV2
-from . import q35_admit_timers
 from .kv_cache_stats import append_kv_cache_iteration_stats
 from .kv_cache_transceiver import (KvCacheTransceiver,
                                    is_disagg_inflight_cancel_enabled)
@@ -3776,9 +3776,9 @@ class PyExecutor:
             self._check_disagg_gen_cache_transfer_status(1)
             return
 
-        any_need_check = (merged_need_check if merged_need_check is not None
-                          else self._sync_disagg_ctx_status_entry(
-                              local_need_check))
+        any_need_check = (merged_need_check
+                          if merged_need_check is not None else
+                          self._sync_disagg_ctx_status_entry(local_need_check))
         if any_need_check > 0:
             if local_need_check and not all_gen_first:
                 logger.warning(
@@ -5308,11 +5308,13 @@ class PyExecutor:
             q35_admit_timers.begin("fetch")
             out = []
             try:
-                out = self._fetch_new_requests_impl(waiting_queue, active_requests)
+                out = self._fetch_new_requests_impl(waiting_queue,
+                                                    active_requests)
                 return out
             finally:
                 q35_admit_timers.end(
-                    "fetch", q35_admit_timers.now() - t0,
+                    "fetch",
+                    q35_admit_timers.now() - t0,
                     f"iter {self.iter_counter}, new {len(out)}, prompt tokens "
                     f"{sum(getattr(r, 'prompt_len', 0) for r in out)}")
         return self._fetch_new_requests_impl(waiting_queue, active_requests)
@@ -5414,7 +5416,8 @@ class PyExecutor:
                                 exclude_last_generation_logits=self.
                                 _should_exclude_last_generation_logits())
         if timed:
-            q35_admit_timers.add("merge_requests", q35_admit_timers.now() - t0, len(merged))
+            q35_admit_timers.add("merge_requests",
+                                 q35_admit_timers.now() - t0, len(merged))
         return merged
 
     def _handle_special_queue_items(
@@ -5761,8 +5764,10 @@ class PyExecutor:
                 return self._schedule_impl()
             finally:
                 q35_admit_timers.end(
-                    "schedule", q35_admit_timers.now() - t0,
-                    f"iter {self.iter_counter}, active {len(self.active_requests)}")
+                    "schedule",
+                    q35_admit_timers.now() - t0,
+                    f"iter {self.iter_counter}, active {len(self.active_requests)}"
+                )
         return self._schedule_impl()
 
     def _schedule_impl(self):
@@ -5771,7 +5776,8 @@ class PyExecutor:
                 t0 = q35_admit_timers.now()
                 self.kv_cache_manager.prepare_expect_snapshot_points(
                     self.active_requests)
-                q35_admit_timers.add("snapshot_points", q35_admit_timers.now() - t0)
+                q35_admit_timers.add("snapshot_points",
+                                     q35_admit_timers.now() - t0)
             else:
                 self.kv_cache_manager.prepare_expect_snapshot_points(
                     self.active_requests)
@@ -5780,7 +5786,8 @@ class PyExecutor:
             t0 = q35_admit_timers.now()
             scheduler_output = self.scheduler.schedule_request(
                 self.active_requests, self.inflight_req_ids)
-            q35_admit_timers.add("schedule_request", q35_admit_timers.now() - t0)
+            q35_admit_timers.add("schedule_request",
+                                 q35_admit_timers.now() - t0)
         else:
             scheduler_output = self.scheduler.schedule_request(
                 self.active_requests, self.inflight_req_ids)
@@ -7664,14 +7671,13 @@ class PyExecutor:
             # with stream_interval N its first streamed content would wait for
             # decoding iteration N; TRTLLM_DISAGG_GEN_EMIT_FIRST_STEP=1 streams
             # its first GEN step as well.
-            first_gen_emit = (self.disagg_gen_emit_first_step
-                              and request.is_generation_only_request()
-                              and not getattr(request, "py_gen_first_emitted",
-                                              False))
+            first_gen_emit = (
+                self.disagg_gen_emit_first_step
+                and request.is_generation_only_request()
+                and not getattr(request, "py_gen_first_emitted", False))
             should_emit = (request.py_decoding_iter == 1 or request.is_finished
-                           or first_gen_emit
-                           or request.py_decoding_iter % self.stream_interval
-                           == 0)
+                           or first_gen_emit or
+                           request.py_decoding_iter % self.stream_interval == 0)
             # The early-emit prototype issues the (non-terminal) iter-1
             # response from `_emit_first_token_responses`; suppress it here.
             if (not emit_first_iter and request.py_decoding_iter == 1

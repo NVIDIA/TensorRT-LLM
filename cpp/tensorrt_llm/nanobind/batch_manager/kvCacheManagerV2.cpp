@@ -18,7 +18,6 @@
 #include "tensorrt_llm/nanobind/batch_manager/kvCacheManagerV2.h"
 
 #include "kv_cache_manager_v2/blockRadixTree.h"
-#include "tensorrt_llm/batch_manager/llmRequest.h"
 #include "kv_cache_manager_v2/common.h"
 #include "kv_cache_manager_v2/config.h"
 #include "kv_cache_manager_v2/eventManager.h"
@@ -31,6 +30,7 @@
 #include "kv_cache_manager_v2/stats.h"
 #include "kv_cache_manager_v2/storage/config.h"
 #include "kv_cache_manager_v2/storage/core.h"
+#include "tensorrt_llm/batch_manager/llmRequest.h"
 
 #include <algorithm>
 #include <cassert>
@@ -1823,8 +1823,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             [](std::shared_ptr<kv::KvCacheManager> self, nb::object reuseScopeObj,
                 ::tensorrt_llm::batch_manager::GenericLlmRequest<::tensorrt_llm::runtime::ITensor::SharedPtr> const&
                     request,
-                int numInputTokens,
-                std::optional<kv::RequestIdType> id, std::optional<int> expectedPromptLength)
+                int numInputTokens, std::optional<kv::RequestIdType> id, std::optional<int> expectedPromptLength)
             {
                 kv::ReuseScope reuseScope = castReuseScope(std::move(reuseScopeObj));
                 nb::gil_scoped_release release;
@@ -1840,7 +1839,8 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 {
                     expectedPromptLength = static_cast<int>(count);
                 }
-                return self->createKvCache(std::move(reuseScope), tokens, id, kv::KvCache::PriorityCb{}, expectedPromptLength);
+                return self->createKvCache(
+                    std::move(reuseScope), tokens, id, kv::KvCache::PriorityCb{}, expectedPromptLength);
             },
             nb::arg("reuse_scope"), nb::arg("request"), nb::arg("num_input_tokens"), nb::arg("id") = std::nullopt,
             nb::arg("expected_prompt_length") = std::nullopt)

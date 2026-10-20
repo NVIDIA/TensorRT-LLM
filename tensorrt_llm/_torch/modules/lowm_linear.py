@@ -142,7 +142,13 @@ Tactic = Tuple[int, int, int, int, int]  # (k_warps, n_tiles, ksplit, swap_ab, m
 
 def _tactic3(t) -> Tactic:
     """Normalize a (k_warps, n_tiles[, ksplit[, swap_ab[, min_blocks]]]) tactic to five entries."""
-    return (t[0], t[1], t[2] if len(t) > 2 else 1, t[3] if len(t) > 3 else 0, t[4] if len(t) > 4 else 1)
+    return (
+        t[0],
+        t[1],
+        t[2] if len(t) > 2 else 1,
+        t[3] if len(t) > 3 else 0,
+        t[4] if len(t) > 4 else 1,
+    )
 
 
 @functools.lru_cache(maxsize=None)
@@ -228,16 +234,18 @@ def lowm_conv_supported(m: int, tactic, conv_channels: int, tokens: int) -> bool
     k_warps, n_tiles = tactic[0], tactic[1]
     ksplit = tactic[2] if len(tactic) > 2 else 1
     cols = 8 * n_tiles  # N_TILE columns per tile
-    return (ksplit == 1 and tokens > 0 and m % tokens == 0 and conv_channels % cols == 0
-            and (m // tokens) * cols <= 32 * k_warps)
+    return (
+        ksplit == 1
+        and tokens > 0
+        and m % tokens == 0
+        and conv_channels % cols == 0
+        and (m // tokens) * cols <= 32 * k_warps
+    )
 
 
-def default_tactic(m: int,
-                   n: int,
-                   k: int,
-                   fp8: bool = True,
-                   even_tiles: bool = False,
-                   mode: Optional[str] = None) -> Tactic:
+def default_tactic(
+    m: int, n: int, k: int, fp8: bool = True, even_tiles: bool = False, mode: Optional[str] = None
+) -> Tactic:
     """(k_warps, n_tiles, ksplit) for an ``m x n x k`` GEMM (n = weight rows of the segment);
     ``even_tiles`` for a SwiGLU segment; ``mode`` selects the measured table entry."""
     override = _tactic_overrides(os.environ.get("TRTLLM_Q35_LOWM_TACTIC", "")).get((n, k))
@@ -406,11 +414,18 @@ def _compiled(
         slots = torch.zeros((n_req,), dtype=torch.int32, device=dev)
         win = torch.empty_strided(win_shape, win_stride, dtype=torch.bfloat16, device=dev)
     else:
-        cw, cs, slots, win = _dummy("cw", dev), _dummy("cs", dev), _dummy("slot", dev), _dummy("win", dev)
+        cw, cs, slots, win = (
+            _dummy("cw", dev),
+            _dummy("cs", dev),
+            _dummy("slot", dev),
+            _dummy("win", dev),
+        )
     a16 = _row_view(m, k, a16_stride, torch.bfloat16, dev) if a16_stride else _dummy("a16", dev)
     a8 = _row_view(m, k, a8_stride, torch.uint8, dev) if a8_stride else _dummy("a8", dev)
     b = torch.empty((n_fp8, k), dtype=torch.uint8, device=dev) if n_fp8 else _dummy("b8", dev)
-    b2 = torch.empty((n_bf16, k), dtype=torch.bfloat16, device=dev) if n_bf16 else _dummy("b16", dev)
+    b2 = (
+        torch.empty((n_bf16, k), dtype=torch.bfloat16, device=dev) if n_bf16 else _dummy("b16", dev)
+    )
     s = _dummy("s", dev)
     c = torch.empty((m, n_out), dtype=torch.uint8 if quant_out else out_dtype, device=dev)
     c2 = torch.empty((m, n_out2), dtype=out_dtype, device=dev) if n_out2 else _dummy("c", dev)
@@ -496,10 +511,14 @@ def lowm_gemm(
         assert x16.dtype == torch.bfloat16 and x16.stride(1) == 1 and x16.stride(0) % 8 == 0
     if x8 is not None:
         assert x8.stride(1) == 1 and x8.stride(0) % 16 == 0
-    k_warps, n_tiles, ksplit, swap, min_blocks = _tactic3(tactic or (
-        default_tactic(m, n_fp8, k, True, swiglu_fp8, fp8_act) if n_fp8 else (0, 1, 1, 0, 1)))
-    kw_bf16, n_tiles_bf16, ks_bf16, swap_bf16, mb_bf16 = _tactic3(tactic_bf16 or (
-        default_tactic(m, n_bf16, k, False, swiglu_bf16, "bf16") if n_bf16 else (0, 1, 1, 0, 1)))
+    k_warps, n_tiles, ksplit, swap, min_blocks = _tactic3(
+        tactic
+        or (default_tactic(m, n_fp8, k, True, swiglu_fp8, fp8_act) if n_fp8 else (0, 1, 1, 0, 1))
+    )
+    kw_bf16, n_tiles_bf16, ks_bf16, swap_bf16, mb_bf16 = _tactic3(
+        tactic_bf16
+        or (default_tactic(m, n_bf16, k, False, swiglu_bf16, "bf16") if n_bf16 else (0, 1, 1, 0, 1))
+    )
     if not n_fp8:
         k_warps, ksplit, swap, min_blocks = kw_bf16, ks_bf16, swap_bf16, mb_bf16
     elif n_bf16 and (kw_bf16, ks_bf16) != (k_warps, ksplit):
@@ -518,21 +537,43 @@ def lowm_gemm(
     a8 = x8.view(torch.uint8) if uses_a8 else _dummy("a8", dev)
     conv_args = ()
     if conv is not None:
-        cw, cs, slots, win, tokens = (conv["weight"], conv["state"], conv["slots"], conv["windows"],
-                                      int(conv["tokens"]))
+        cw, cs, slots, win, tokens = (
+            conv["weight"],
+            conv["state"],
+            conv["slots"],
+            conv["windows"],
+            int(conv["tokens"]),
+        )
         assert cw.dim() == 2 and cw.shape[1] == 4 and cw.dtype == torch.bfloat16
         assert cs.dim() == 3 and cs.shape[1:] == (cw.shape[0], 3) and cs.dtype == torch.bfloat16
-        assert win.dim() == 4 and win.shape[1:] == (tokens, cw.shape[0], 3) and win.dtype == torch.bfloat16
+        assert (
+            win.dim() == 4
+            and win.shape[1:] == (tokens, cw.shape[0], 3)
+            and win.dtype == torch.bfloat16
+        )
         assert slots.dtype == torch.int32 and slots.dim() == 1 and m == slots.shape[0] * tokens
         assert slots.is_contiguous()  # no copy kernel between the producer and this PDL launch
         assert win.shape[0] >= slots.shape[0]
         # Layouts are compile-time constants of the kernel: specialize on the shapes and strides.
-        conv_args = (cw.shape[0], tokens, bool(conv.get("write_state", True)),
-                     ((tuple(cw.shape), tuple(cw.stride())), (tuple(cs.shape), tuple(cs.stride())),
-                      slots.shape[0], (tuple(win.shape), tuple(win.stride()))))
+        conv_args = (
+            cw.shape[0],
+            tokens,
+            bool(conv.get("write_state", True)),
+            (
+                (tuple(cw.shape), tuple(cw.stride())),
+                (tuple(cs.shape), tuple(cs.stride())),
+                slots.shape[0],
+                (tuple(win.shape), tuple(win.stride())),
+            ),
+        )
         conv_tensors = (cw, cs, slots, win)
     else:
-        conv_tensors = (_dummy("cw", dev), _dummy("cs", dev), _dummy("slot", dev), _dummy("win", dev))
+        conv_tensors = (
+            _dummy("cw", dev),
+            _dummy("cs", dev),
+            _dummy("slot", dev),
+            _dummy("win", dev),
+        )
     fn = _compiled(
         m,
         k,
@@ -561,7 +602,9 @@ def lowm_gemm(
         min_blocks,
         *conv_args,
     )
-    out = torch.empty((m, n_out), dtype=torch.uint8 if out_scale is not None else out_dtype, device=dev)
+    out = torch.empty(
+        (m, n_out), dtype=torch.uint8 if out_scale is not None else out_dtype, device=dev
+    )
     out2 = torch.empty((m, n_out2), dtype=out_dtype, device=dev) if n_out2 else _dummy("c", dev)
     ones = _dummy("s", dev)
     w_scale = weight_scale.reshape(1) if n_fp8 else ones
@@ -586,10 +629,12 @@ def lowm_gemm(
     return (out, out2) if n_out2 else out
 
 
-def lowm_bf16_gemm(x: torch.Tensor,
-                   weight: torch.Tensor,
-                   out_dtype: torch.dtype = torch.bfloat16,
-                   tactic: Optional[Tuple[int, ...]] = None) -> Optional[torch.Tensor]:
+def lowm_bf16_gemm(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    out_dtype: torch.dtype = torch.bfloat16,
+    tactic: Optional[Tuple[int, ...]] = None,
+) -> Optional[torch.Tensor]:
     """``x @ weight.T`` for a BF16 ``weight [N, K]`` on the low-M kernel (for example the MoE router
     [512, 4096]), output BF16 or FP32; None when it does not apply (device, dtype, shape, or M above
     the measured crossover / TRTLLM_Q35_LOWM_MAX_M). Usable inside CUDA graphs (compile happens on the
@@ -599,8 +644,15 @@ def lowm_bf16_gemm(x: torch.Tensor,
     x2 = _flat_rows(x)
     m, k = x2.shape
     n = weight.shape[0]
-    if (weight.shape[1] != k or k % 64 or n % 8 or x2.stride(1) != 1 or x2.stride(0) % 8
-            or not weight.is_contiguous() or out_dtype not in (torch.bfloat16, torch.float32)):
+    if (
+        weight.shape[1] != k
+        or k % 64
+        or n % 8
+        or x2.stride(1) != 1
+        or x2.stride(0) % 8
+        or not weight.is_contiguous()
+        or out_dtype not in (torch.bfloat16, torch.float32)
+    ):
         return None
     if tactic is None and not lowm_rows_ok(m, n, k, "bf16"):
         return None
@@ -656,9 +708,11 @@ class _Check:
             return
         rank = os.environ.get("OMPI_COMM_WORLD_RANK", os.environ.get("SLURM_PROCID", "?"))
         for kind, (n, rel_max, fro_sum, fro_max, eq_sum) in sorted(self.stats.items()):
-            print(f"[LOWM_CHECK rank {rank}] {kind:24s} calls={n:6d} max|d|/max|ref|={rel_max:.3e} "
-                  f"rel_fro mean={fro_sum / n:.3e} max={fro_max:.3e} bitwise-equal={eq_sum / n:.4f}",
-                  flush=True)
+            print(
+                f"[LOWM_CHECK rank {rank}] {kind:24s} calls={n:6d} max|d|/max|ref|={rel_max:.3e} "
+                f"rel_fro mean={fro_sum / n:.3e} max={fro_max:.3e} bitwise-equal={eq_sum / n:.4f}",
+                flush=True,
+            )
 
 
 _CHECK: Optional[_Check] = None
@@ -681,14 +735,24 @@ def _flat_rows(x: torch.Tensor) -> torch.Tensor:
 def stock_fp8_linear(module: torch.nn.Module, x2: torch.Tensor) -> torch.Tensor:
     """The stock W8A8 path (static activation quantize + cuBLAS FP8 GEMM), for checks."""
     s_in = module.input_scale
-    q = x2 if x2.dtype == torch.float8_e4m3fn else torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
-        x2.contiguous(), s_in)[0]
-    return torch.ops.trtllm.cublas_scaled_mm(q, module.weight.t(), scale_a=s_in, scale_b=module.weight_scale,
-                                             bias=None, out_dtype=module.dtype or torch.bfloat16)
+    q = (
+        x2
+        if x2.dtype == torch.float8_e4m3fn
+        else torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(x2.contiguous(), s_in)[0]
+    )
+    return torch.ops.trtllm.cublas_scaled_mm(
+        q,
+        module.weight.t(),
+        scale_a=s_in,
+        scale_b=module.weight_scale,
+        bias=None,
+        out_dtype=module.dtype or torch.bfloat16,
+    )
 
 
-def maybe_lowm_fp8_linear(module: torch.nn.Module, x: torch.Tensor,
-                          bias: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+def maybe_lowm_fp8_linear(
+    module: torch.nn.Module, x: torch.Tensor, bias: Optional[torch.Tensor]
+) -> Optional[torch.Tensor]:
     """Small-M path of an opted-in FP8 per-tensor (W8A8) ``Linear``; None when it does not apply."""
     if not getattr(module, "_q35_lowm", False) or bias is not None or not lowm_fp8_enabled():
         return None
@@ -711,22 +775,35 @@ def maybe_lowm_fp8_linear(module: torch.nn.Module, x: torch.Tensor,
         if input_scale is None:
             return None
         act = "fp8"
-        out = lowm_gemm(x8=x2, w_fp8=weight, weight_scale=module.weight_scale, input_scale=input_scale,
-                        fp8_act=act, out_dtype=module.dtype or torch.bfloat16)
+        out = lowm_gemm(
+            x8=x2,
+            w_fp8=weight,
+            weight_scale=module.weight_scale,
+            input_scale=input_scale,
+            fp8_act=act,
+            out_dtype=module.dtype or torch.bfloat16,
+        )
     else:
         act = lowm_fp8_act()
         if act == "quant" and input_scale is None:
             return None
-        out = lowm_gemm(x16=x2, w_fp8=weight, weight_scale=module.weight_scale, input_scale=input_scale,
-                        fp8_act=act, out_dtype=module.dtype or torch.bfloat16)
+        out = lowm_gemm(
+            x16=x2,
+            w_fp8=weight,
+            weight_scale=module.weight_scale,
+            input_scale=input_scale,
+            fp8_act=act,
+            out_dtype=module.dtype or torch.bfloat16,
+        )
     lowm_check(f"fp8:{module._q35_lowm}:{act}", out, lambda: stock_fp8_linear(module, x2))
     if x.dim() != 2:
         out = out.reshape(*x.shape[:-1], out.shape[-1])
     return out
 
 
-def maybe_lowm_bf16_linear(module: torch.nn.Module, x: torch.Tensor,
-                           bias: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+def maybe_lowm_bf16_linear(
+    module: torch.nn.Module, x: torch.Tensor, bias: Optional[torch.Tensor]
+) -> Optional[torch.Tensor]:
     """Small-M path of an opted-in BF16 ``Linear``; None when it does not apply."""
     label = getattr(module, "_q35_lowm_bf16", False)
     if not label or bias is not None or not _bf16_label_enabled(label):

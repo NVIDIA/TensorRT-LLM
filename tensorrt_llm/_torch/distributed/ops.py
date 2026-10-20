@@ -51,11 +51,13 @@ _Q35_PROBE_NO_AR: bool = os.environ.get("TRTLLM_Q35_PROBE_NO_AR", "0") == "1"
 # construction is a collective fabric allocation. The one construction left per TP group is fenced
 # (_q35_fenced_mcast_buffer): a workaround for a known staging-buffer overrun in the multicast handle exchange;
 # a no-op once the library fix is present.
-_Q35_MNNVL_PRESIZE: bool = os.environ.get("TRTLLM_Q35_MNNVL_PRESIZE", "0") == "1"
+_Q35_MNNVL_PRESIZE: bool = os.environ.get("TRTLLM_Q35_MNNVL_PRESIZE",
+                                          "0") == "1"
 # TRTLLM_Q35_MCAST_STRAY_LOG=1: DIAGNOSTIC for the same workaround. Before every McastGPUBuffer construction on
 # ranks > 0, log which live pinned torch tensors (and which driver allocation) sit next to the handle-exchange
 # staging buffer; constructions where that memory is not mapped are fenced instead.
-_Q35_MCAST_STRAY_LOG: bool = os.environ.get("TRTLLM_Q35_MCAST_STRAY_LOG", "0") == "1"
+_Q35_MCAST_STRAY_LOG: bool = os.environ.get("TRTLLM_Q35_MCAST_STRAY_LOG",
+                                            "0") == "1"
 # Largest token count for which the zero-residual buffer is used (decode / spec-verify shapes).
 _Q35_ZERO_RESIDUAL_MAX_TOKENS = 1024
 
@@ -91,7 +93,8 @@ def q35_zero_residual(shape, dtype: torch.dtype,
     return buf[:numel].view(shape)
 
 
-def q35_mnnvl_fusable(allreduce: Optional["AllReduce"], num_tokens: int) -> bool:
+def q35_mnnvl_fusable(allreduce: Optional["AllReduce"],
+                      num_tokens: int) -> bool:
     """Whether ``allreduce`` serves fused calls of ``num_tokens`` rows on MNNVL (the zero-residual
     norm folds use it only then, so they never land on the C++ / NCCL fallback)."""
     return (allreduce is not None and allreduce.mnnvl_allreduce is not None
@@ -180,7 +183,8 @@ def _q35_cudart():
         with open("/proc/self/maps") as maps:
             for line in maps:
                 path = line.split()[-1]
-                if "libcudart.so" in os.path.basename(path) and path not in paths:
+                if "libcudart.so" in os.path.basename(
+                        path) and path not in paths:
                     paths.append(path)
         lib = ctypes.CDLL(paths[0] if paths else "libcudart.so")
         lib.cudaMallocHost.argtypes = [
@@ -223,7 +227,8 @@ def _q35_fenced_mcast_buffer(workspace_size_bytes: int, mapping: Mapping,
                 break
             held.append(p.value)
             if len(run) >= 2 and p.value - run[-1] != run[1] - run[0]:
-                run = []  # a new chunk: start the run over (the old blocks stay held)
+                run = [
+                ]  # a new chunk: start the run over (the old blocks stay held)
             if len(run) == 1 and not 0 < p.value - run[0] <= 4096:
                 run = []
             run.append(p.value)
@@ -240,20 +245,25 @@ def _q35_fenced_mcast_buffer(workspace_size_bytes: int, mapping: Mapping,
         if fenced:
             blk = run[0] + mapping.tp_rank * 4096
             pattern = b"\x5a" * size
-            changed = [b for b in run[1:] if ctypes.string_at(b, size) != pattern]
+            changed = [
+                b for b in run[1:] if ctypes.string_at(b, size) != pattern
+            ]
             if not changed:
                 outcome = "none"  # fixed library: no stray write at all
-            elif all(b <= blk < b + size for b in changed) and ctypes.string_at(blk, 64) != pattern[:64]:
+            elif all(b <= blk < b + size for b in changed) and ctypes.string_at(
+                    blk, 64) != pattern[:64]:
                 outcome = "landed"
             else:
                 outcome = "elsewhere"
-                _q35_log_once(("mcast_fence_miss", mapping.tp_rank),
-                              "[Q35 comm] McastGPUBuffer wrote into its fence at an unexpected place",
-                              warn=True)
+                _q35_log_once(
+                    ("mcast_fence_miss", mapping.tp_rank),
+                    "[Q35 comm] McastGPUBuffer wrote into its fence at an unexpected place",
+                    warn=True)
         else:
-            _q35_log_once(("mcast_fence_none", mapping.tp_rank),
-                          "[Q35 comm] could not build a pinned fence for McastGPUBuffer",
-                          warn=True)
+            _q35_log_once(
+                ("mcast_fence_none", mapping.tp_rank),
+                "[Q35 comm] could not build a pinned fence for McastGPUBuffer",
+                warn=True)
         _q35_fence_log.append((mapping.tp_rank, fenced, outcome))
         return buf
     finally:
@@ -283,10 +293,13 @@ def _q35_stray_target_report(mapping: Mapping, staging: int, chunk, target: int,
     try:
         cuda = ctypes.CDLL("libcuda.so.1")
         start, rsize = ctypes.c_uint64(0), ctypes.c_size_t(0)
-        e1 = cuda.cuPointerGetAttribute(ctypes.byref(start), 11, ctypes.c_uint64(target))
-        e2 = cuda.cuPointerGetAttribute(ctypes.byref(rsize), 12, ctypes.c_uint64(target))
-        drv = (f"driver range +{target - start.value} in [{start.value:#x}, +{rsize.value})"
-               if e1 == 0 and e2 == 0 else f"no driver allocation (err {e1}/{e2})")
+        e1 = cuda.cuPointerGetAttribute(ctypes.byref(start), 11,
+                                        ctypes.c_uint64(target))
+        e2 = cuda.cuPointerGetAttribute(ctypes.byref(rsize), 12,
+                                        ctypes.c_uint64(target))
+        drv = (
+            f"driver range +{target - start.value} in [{start.value:#x}, +{rsize.value})"
+            if e1 == 0 and e2 == 0 else f"no driver allocation (err {e1}/{e2})")
     except OSError as e:
         drv = f"no libcuda ({e})"
     owners, chunk_shapes, pinned, in_chunk = [], [], 0, 0
@@ -295,7 +308,9 @@ def _q35_stray_target_report(mapping: Mapping, staging: int, chunk, target: int,
         for o in gc.get_objects():
             # diagnostic scan over arbitrary objects: any object that is not a plain pinned CPU tensor is skipped
             try:
-                if type(o) is not torch.Tensor and not (isinstance(o, torch.Tensor) and type(o).__module__.startswith("torch")):
+                if type(o) is not torch.Tensor and not (
+                        isinstance(o, torch.Tensor)
+                        and type(o).__module__.startswith("torch")):
                     continue
                 if o.device.type != "cpu" or not o.is_pinned():
                     continue
@@ -309,12 +324,15 @@ def _q35_stray_target_report(mapping: Mapping, staging: int, chunk, target: int,
                 if in_chunk <= 8:
                     chunk_shapes.append(f"{tuple(o.shape)}@+{lo - chunk[0]}")
             if lo < target + 64 and lo + n > target:
-                owners.append(f"{tuple(o.shape)} {o.dtype} storage {n} B at +{target - lo}")
-    return (f"staging {staging:#x} at +{staging - chunk[0] if chunk else -1} of "
-            f"{(chunk[1] - chunk[0]) if chunk else 0} B chunk, target +{mapping.tp_rank * 4096}: "
-            f"{'mapped' if mapped else 'UNMAPPED (would SIGSEGV; fenced instead)'}; {drv}; "
-            f"{pinned} live pinned torch tensors, {in_chunk} in the chunk {chunk_shapes}, covering the target: "
-            f"{owners or 'none'}")
+                owners.append(
+                    f"{tuple(o.shape)} {o.dtype} storage {n} B at +{target - lo}"
+                )
+    return (
+        f"staging {staging:#x} at +{staging - chunk[0] if chunk else -1} of "
+        f"{(chunk[1] - chunk[0]) if chunk else 0} B chunk, target +{mapping.tp_rank * 4096}: "
+        f"{'mapped' if mapped else 'UNMAPPED (would SIGSEGV; fenced instead)'}; {drv}; "
+        f"{pinned} live pinned torch tensors, {in_chunk} in the chunk {chunk_shapes}, covering the target: "
+        f"{owners or 'none'}")
 
 
 def _q35_stray_diag_construct(workspace_size_bytes: int, mapping: Mapping,
@@ -337,15 +355,17 @@ def _q35_stray_diag_construct(workspace_size_bytes: int, mapping: Mapping,
         p = ctypes.c_void_p()
         rt.cudaMallocHost(ctypes.byref(p), size)
         staging = p.value
-        rt.cudaFreeHost(staging)  # same-size LIFO reuse: the staging buffer lands here
+        rt.cudaFreeHost(
+            staging)  # same-size LIFO reuse: the staging buffer lands here
         target = staging + mapping.tp_rank * 4096
         chunk = _q35_host_mapping(staging)
         tmap = _q35_host_mapping(target)
         mapped = tmap is not None and tmap[1] >= target + 64
         old = ctypes.string_at(target, 64) if mapped else None
-        tag = (f"[Q35 comm] stray write (rank {mapping.tp_rank}, {workspace_size_bytes} B workspace, "
-               f"t={time.time():.1f}): " +
-               _q35_stray_target_report(mapping, staging, chunk, target, mapped))
+        tag = (
+            f"[Q35 comm] stray write (rank {mapping.tp_rank}, {workspace_size_bytes} B workspace, "
+            f"t={time.time():.1f}): " +
+            _q35_stray_target_report(mapping, staging, chunk, target, mapped))
     except Exception as e:  # noqa: BLE001  (diagnostic only; never skip the collective construction)
         logger.warning(f"[Q35 comm] stray write diagnostic failed: {e!r}")
         return construct()
@@ -355,16 +375,16 @@ def _q35_stray_diag_construct(workspace_size_bytes: int, mapping: Mapping,
                                         use_fabric_handle, comm)
     buf = construct()
     new = ctypes.string_at(target, 64)
-    logger.warning(f"{tag}; target bytes {'CHANGED' if new != old else 'unchanged'} "
-                   f"(before: {old[:16].hex()}..., zero={old == bytes(64)})")
+    logger.warning(
+        f"{tag}; target bytes {'CHANGED' if new != old else 'unchanged'} "
+        f"(before: {old[:16].hex()}..., zero={old == bytes(64)})")
     return buf
 
 
 def get_or_scale_allreduce_mnnvl_workspace(
-    mapping: Mapping,
-    dtype: torch.dtype,
-    buffer_size_bytes: Optional[int] = None
-) -> Optional[Dict]:
+        mapping: Mapping,
+        dtype: torch.dtype,
+        buffer_size_bytes: Optional[int] = None) -> Optional[Dict]:
     """
     WORKSPACE is a entire memory allocation used for allreduce, while BUFFER refers to single lamport buffer.
     Each WORKSPACE contains NUM_LAMPORT_BUFFERS buffers.
@@ -429,16 +449,20 @@ def get_or_scale_allreduce_mnnvl_workspace(
             )
         if _Q35_AR_LOG:
             import traceback
-            stack = " <- ".join(f"{os.path.basename(f.filename)}:{f.lineno}:{f.name}"
-                                for f in reversed(traceback.extract_stack()[-9:-1]))
-            logger.info(f"[Q35 comm] MNNVL workspace {'scaled' if mapping in allreduce_mnnvl_workspaces else 'created'}"
-                        f" (rank {mapping.rank}): {buffer_size_bytes} bytes per buffer; called from {stack}")
+            stack = " <- ".join(
+                f"{os.path.basename(f.filename)}:{f.lineno}:{f.name}"
+                for f in reversed(traceback.extract_stack()[-9:-1]))
+            logger.info(
+                f"[Q35 comm] MNNVL workspace {'scaled' if mapping in allreduce_mnnvl_workspaces else 'created'}"
+                f" (rank {mapping.rank}): {buffer_size_bytes} bytes per buffer; called from {stack}"
+            )
         # Each workspace contains NUM_LAMPORT_BUFFERS buffers.
         workspace_size_bytes = NUM_LAMPORT_BUFFERS * buffer_size_bytes
         # Pass the pre-split MPI communicator's Fortran handle to avoid redundant splitting in C++
         if _Q35_MNNVL_PRESIZE:
-            mcast_buf_handle = _q35_fenced_mcast_buffer(
-                workspace_size_bytes, mapping, use_fabric_handle, comm)
+            mcast_buf_handle = _q35_fenced_mcast_buffer(workspace_size_bytes,
+                                                        mapping,
+                                                        use_fabric_handle, comm)
         elif _Q35_MCAST_STRAY_LOG:
             mcast_buf_handle = _q35_stray_diag_construct(
                 workspace_size_bytes, mapping, use_fabric_handle, comm)
@@ -636,8 +660,8 @@ def allgather(
     group_boxed = mapping.tp_group_pg.boxed() if mpi_disabled() else None
     if _Q35_AR_LOG and len(mapping.tp_group) > 1:
         site = _q35_caller_site()
-        shape = tuple(input.shape) if isinstance(input, torch.Tensor) else len(
-            input)
+        shape = tuple(input.shape) if isinstance(input,
+                                                 torch.Tensor) else len(input)
         _q35_log_once(("allgather", site, shape),
                       f"[Q35 comm] allgather {site}: tp={mapping.tp_size} "
                       f"input={shape} dim={dim} -> NCCL all-gather")
@@ -1145,8 +1169,10 @@ class AllReduce(nn.Module):
             elif self.symm_mem_allreduce is not None:
                 route = "SYMM_MEM for NONE, C++ for fused ops"
             elif multi_node:
-                route = (f"C++ {self.strategy.name} -> NCCL across nodes "
-                         f"[MNNVL not used: {'no dtype' if dtype is None else 'unsupported'}]")
+                route = (
+                    f"C++ {self.strategy.name} -> NCCL across nodes "
+                    f"[MNNVL not used: {'no dtype' if dtype is None else 'unsupported'}]"
+                )
             else:
                 route = f"C++ {self.strategy.name} (IPC kernels / NCCL)"
             _q35_log_once(
@@ -1164,14 +1190,16 @@ class AllReduce(nn.Module):
         if path == "MNNVL":
             nbytes = tokens * hidden * self.mapping.tp_size * input.element_size(
             )
-            path = ("MNNVL one-shot" if nbytes <= _MNNVL_ONE_SHOT_THRESHOLD_BYTES
-                    else "MNNVL two-shot + Lamport RMSNorm"
+            path = ("MNNVL one-shot"
+                    if nbytes <= _MNNVL_ONE_SHOT_THRESHOLD_BYTES else
+                    "MNNVL two-shot + Lamport RMSNorm"
                     if op != AllReduceFusionOp.NONE else "MNNVL two-shot")
-        _q35_log_once(("ar_call", self._q35_site, int(op), tokens, path),
-                      f"[Q35 comm] AllReduce call {self._q35_site}: "
-                      f"op={AllReduceFusionOp(op).name} rows={tokens} hidden={hidden} "
-                      f"dtype={input.dtype} -> {path}",
-                      warn=path.startswith("C++") and self.mapping.is_multi_node())
+        _q35_log_once(
+            ("ar_call", self._q35_site, int(op), tokens, path),
+            f"[Q35 comm] AllReduce call {self._q35_site}: "
+            f"op={AllReduceFusionOp(op).name} rows={tokens} hidden={hidden} "
+            f"dtype={input.dtype} -> {path}",
+            warn=path.startswith("C++") and self.mapping.is_multi_node())
 
     def _q35_probe_local(
         self, input: torch.Tensor, params: Optional[AllReduceParams]
@@ -1180,15 +1208,16 @@ class AllReduce(nn.Module):
         op = params.fusion_op if params is not None else AllReduceFusionOp.NONE
         if op == AllReduceFusionOp.NONE:
             return input
-        from ..custom_ops import flashinfer_fused_add_rmsnorm, flashinfer_rmsnorm
+        from ..custom_ops import (flashinfer_fused_add_rmsnorm,
+                                  flashinfer_rmsnorm)
         if op == AllReduceFusionOp.RMS_NORM:
             return flashinfer_rmsnorm(input, params.norm_weight, params.eps)
         # One in-place fused add + RMSNorm kernel, like the fused all-reduce it replaces (the
         # all-reduce input and the incoming residual are dead after the call); only the shared
         # zero residual is copied first.
         residual = params.residual
-        if any(residual.data_ptr() >= z.data_ptr()
-               and residual.data_ptr() < z.data_ptr() + z.numel() * z.element_size()
+        if any(residual.data_ptr() >= z.data_ptr() and residual.data_ptr() <
+               z.data_ptr() + z.numel() * z.element_size()
                for z in _q35_zero_residuals.values()):
             residual = residual.clone()
         hidden = input

@@ -23,7 +23,9 @@ def _runner():
 
 
 def _tactics(rows, hidden=4096):
-    return list(_runner().get_valid_tactics([torch.empty((rows, hidden), dtype=torch.bfloat16)], None))
+    return list(
+        _runner().get_valid_tactics([torch.empty((rows, hidden), dtype=torch.bfloat16)], None)
+    )
 
 
 @pytest.mark.parametrize("value", [None, "0", "true", ""])
@@ -38,8 +40,13 @@ def test_inert_unless_set_to_one(monkeypatch, value):
 def test_nccl_symmetric_maps_to_nccl(monkeypatch):
     monkeypatch.setenv(tco._Q35_AR_NO_NCCL_SYMM_ENV, "1")
     assert tco.q35_ar_strategy_without_nccl_symm(SYMM) == NCCL
-    for other in (AllReduceStrategy.NCCL, AllReduceStrategy.ONESHOT, AllReduceStrategy.TWOSHOT,
-                  AllReduceStrategy.MNNVL, AllReduceStrategy.AUTO):
+    for other in (
+        AllReduceStrategy.NCCL,
+        AllReduceStrategy.ONESHOT,
+        AllReduceStrategy.TWOSHOT,
+        AllReduceStrategy.MNNVL,
+        AllReduceStrategy.AUTO,
+    ):
         assert tco.q35_ar_strategy_without_nccl_symm(other.value) == other.value
 
 

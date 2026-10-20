@@ -307,7 +307,8 @@ class QKNormRoPEAttention(Attention):
                 plan.fold = fold
                 self.attn.q35_kv_appended = plan
                 num_tokens = qkv.shape[0]
-                packed = (self.num_heads + 2 * self.num_key_value_heads) * self.head_dim
+                packed = (self.num_heads +
+                          2 * self.num_key_value_heads) * self.head_dim
                 # Shape-only stand-ins for the backend's checks: the packed width of the raw projection (its
                 # content is not read on the folded path) and the gate as a strided view of the projection.
                 gate = qkv[:, :2 * self.q_size].view(

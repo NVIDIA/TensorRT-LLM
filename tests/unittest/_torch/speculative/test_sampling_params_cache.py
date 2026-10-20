@@ -10,8 +10,11 @@ import types
 import pytest
 
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
-from tensorrt_llm._torch.speculative.interface import (SAMPLING_PARAMS_CACHE_ENV,
-                                                       SAMPLING_SCAN_CACHE_ENV, SpecMetadata)
+from tensorrt_llm._torch.speculative.interface import (
+    SAMPLING_PARAMS_CACHE_ENV,
+    SAMPLING_SCAN_CACHE_ENV,
+    SpecMetadata,
+)
 
 pytestmark = pytest.mark.cpu_only
 
@@ -19,7 +22,8 @@ pytestmark = pytest.mark.cpu_only
 def _stub():
     stub = types.SimpleNamespace(_sampling_params_signature=[None, None])
     stub.invalidate_sampling_params_cache = types.MethodType(
-        SpecMetadata.invalidate_sampling_params_cache, stub)
+        SpecMetadata.invalidate_sampling_params_cache, stub
+    )
     return stub
 
 
@@ -67,11 +71,18 @@ class _Req:
 
 def _scan(stub, requests):
     result = SpecMetadata._scan_one_model_sampling(stub, requests)
-    return result, (stub.skip_temperature, stub.skip_top_k, stub.skip_top_p, stub.is_all_greedy_sample)
+    return result, (
+        stub.skip_temperature,
+        stub.skip_top_k,
+        stub.skip_top_p,
+        stub.is_all_greedy_sample,
+    )
 
 
 def _scan_stub():
-    return types.SimpleNamespace(runtime_draft_len=6, group_all_greedy_sample=None, dummy_slot_row=8)
+    return types.SimpleNamespace(
+        runtime_draft_len=6, group_all_greedy_sample=None, dummy_slot_row=8
+    )
 
 
 @pytest.mark.parametrize("cache", [False, True])
@@ -89,7 +100,9 @@ def test_scan_cache_same_results(monkeypatch, cache):
     reads = [r.reads for r in requests]
     steps = []
     for _ in range(3):
-        stub.is_all_greedy_sample = stub.skip_top_k = None  # clobbered between scans: restored by the cache
+        stub.is_all_greedy_sample = stub.skip_top_k = (
+            None  # clobbered between scans: restored by the cache
+        )
         steps.append(_scan(stub, requests))
     assert all(step == expected for step in steps)
     new_reads = [r.reads - n for r, n in zip(requests, reads)]
@@ -113,9 +126,11 @@ def test_scan_cache_rescans_on_changes(monkeypatch):
         return requests[0].reads == before + 2  # one cached-arm rescan + the fresh scan
 
     def _scan_stub_like(src):
-        return types.SimpleNamespace(runtime_draft_len=src.runtime_draft_len,
-                                     group_all_greedy_sample=src.group_all_greedy_sample,
-                                     dummy_slot_row=src.dummy_slot_row)
+        return types.SimpleNamespace(
+            runtime_draft_len=src.runtime_draft_len,
+            group_all_greedy_sample=src.group_all_greedy_sample,
+            dummy_slot_row=src.dummy_slot_row,
+        )
 
     def to_context():
         requests[1].state = LlmRequestState.CONTEXT_INIT

@@ -44,7 +44,6 @@ from __future__ import annotations
 import cutlass
 import cutlass.cute as cute
 from cutlass import BFloat16, Float32, Int32, Int64, Uint8, const_expr
-from cutlass._mlir import ir
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T, dsl_user_op
 
@@ -56,7 +55,9 @@ except ImportError:  # older CuTe DSL
     from cutlass.utils import SmemAllocator as _SmemAllocator
 
 
-def _asm(res, operands, text: str, constraints: str, side_effects: bool = True, *, loc=None, ip=None):
+def _asm(
+    res, operands, text: str, constraints: str, side_effects: bool = True, *, loc=None, ip=None
+):
     return llvm.inline_asm(
         res,
         operands,
@@ -112,53 +113,105 @@ def _gdc_launch(*, loc=None, ip=None) -> None:
 # ---------------------------------------------------------------------------------------------------------
 @dsl_user_op
 def _ld_v4(addr: Int64, *, loc=None, ip=None):
-    out = _asm(_struct(4), [_i64(addr, loc, ip)], "ld.global.v4.b32 {$0, $1, $2, $3}, [$4];",
-               "=r,=r,=r,=r,l,~{memory}", loc=loc, ip=ip)
+    out = _asm(
+        _struct(4),
+        [_i64(addr, loc, ip)],
+        "ld.global.v4.b32 {$0, $1, $2, $3}, [$4];",
+        "=r,=r,=r,=r,l,~{memory}",
+        loc=loc,
+        ip=ip,
+    )
     return _unpack(out, 4, loc, ip)
 
 
 @dsl_user_op
 def _ld_cg_v4(addr: Int64, *, loc=None, ip=None):
     """16 bytes from L2 (data other CTAs of this grid released before the ticket)."""
-    out = _asm(_struct(4), [_i64(addr, loc, ip)], "ld.global.cg.v4.b32 {$0, $1, $2, $3}, [$4];",
-               "=r,=r,=r,=r,l,~{memory}", loc=loc, ip=ip)
+    out = _asm(
+        _struct(4),
+        [_i64(addr, loc, ip)],
+        "ld.global.cg.v4.b32 {$0, $1, $2, $3}, [$4];",
+        "=r,=r,=r,=r,l,~{memory}",
+        loc=loc,
+        ip=ip,
+    )
     return _unpack(out, 4, loc, ip)
 
 
 @dsl_user_op
 def _ld_f32(addr: Int64, *, loc=None, ip=None) -> Float32:
-    return Float32(_asm(T.f32(), [_i64(addr, loc, ip)], "ld.global.f32 $0, [$1];", "=f,l,~{memory}", loc=loc,
-                        ip=ip))
+    return Float32(
+        _asm(
+            T.f32(),
+            [_i64(addr, loc, ip)],
+            "ld.global.f32 $0, [$1];",
+            "=f,l,~{memory}",
+            loc=loc,
+            ip=ip,
+        )
+    )
 
 
 @dsl_user_op
 def _st_b32(addr: Int64, value: Int32, *, loc=None, ip=None) -> None:
-    _asm(None, [_i64(addr, loc, ip), _i32(value, loc, ip)], "st.global.b32 [$0], $1;", "l,r,~{memory}", loc=loc,
-         ip=ip)
+    _asm(
+        None,
+        [_i64(addr, loc, ip), _i32(value, loc, ip)],
+        "st.global.b32 [$0], $1;",
+        "l,r,~{memory}",
+        loc=loc,
+        ip=ip,
+    )
 
 
 @dsl_user_op
 def _st_b16(addr: Int64, value: Int32, *, loc=None, ip=None) -> None:
-    _asm(None, [_i64(addr, loc, ip), _i32(value, loc, ip)],
-         "{\n\t.reg .b16 h;\n\tcvt.u16.u32 h, $1;\n\tst.global.b16 [$0], h;\n\t}", "l,r,~{memory}", loc=loc, ip=ip)
+    _asm(
+        None,
+        [_i64(addr, loc, ip), _i32(value, loc, ip)],
+        "{\n\t.reg .b16 h;\n\tcvt.u16.u32 h, $1;\n\tst.global.b16 [$0], h;\n\t}",
+        "l,r,~{memory}",
+        loc=loc,
+        ip=ip,
+    )
 
 
 @dsl_user_op
 def _st_u8(addr: Int64, value: Int32, *, loc=None, ip=None) -> None:
-    _asm(None, [_i64(addr, loc, ip), _i32(value, loc, ip)],
-         "{\n\t.reg .b16 h;\n\tcvt.u16.u32 h, $1;\n\tst.global.u8 [$0], h;\n\t}", "l,r,~{memory}", loc=loc, ip=ip)
+    _asm(
+        None,
+        [_i64(addr, loc, ip), _i32(value, loc, ip)],
+        "{\n\t.reg .b16 h;\n\tcvt.u16.u32 h, $1;\n\tst.global.u8 [$0], h;\n\t}",
+        "l,r,~{memory}",
+        loc=loc,
+        ip=ip,
+    )
 
 
 @dsl_user_op
 def _st_v2(addr: Int64, w0: Int32, w1: Int32, *, loc=None, ip=None) -> None:
-    _asm(None, [_i64(addr, loc, ip), _i32(w0, loc, ip), _i32(w1, loc, ip)], "st.global.v2.b32 [$0], {$1, $2};",
-         "l,r,r,~{memory}", loc=loc, ip=ip)
+    _asm(
+        None,
+        [_i64(addr, loc, ip), _i32(w0, loc, ip), _i32(w1, loc, ip)],
+        "st.global.v2.b32 [$0], {$1, $2};",
+        "l,r,r,~{memory}",
+        loc=loc,
+        ip=ip,
+    )
 
 
 @dsl_user_op
 def _atom_add_acq_rel(addr: Int64, value: Int32, *, loc=None, ip=None) -> Int32:
-    return Int32(_asm(T.i32(), [_i64(addr, loc, ip), _i32(value, loc, ip)],
-                      "atom.acq_rel.gpu.global.add.u32 $0, [$1], $2;", "=r,l,r,~{memory}", loc=loc, ip=ip))
+    return Int32(
+        _asm(
+            T.i32(),
+            [_i64(addr, loc, ip), _i32(value, loc, ip)],
+            "atom.acq_rel.gpu.global.add.u32 $0, [$1], $2;",
+            "=r,l,r,~{memory}",
+            loc=loc,
+            ip=ip,
+        )
+    )
 
 
 @dsl_user_op
@@ -168,19 +221,40 @@ def _smem_addr(ptr, *, loc=None, ip=None) -> Int32:
 
 @dsl_user_op
 def _ld_shared(addr: Int32, *, loc=None, ip=None) -> Int32:
-    return Int32(_asm(T.i32(), [_i32(addr, loc, ip)], "ld.shared.b32 $0, [$1];", "=r,r,~{memory}", loc=loc, ip=ip))
+    return Int32(
+        _asm(
+            T.i32(),
+            [_i32(addr, loc, ip)],
+            "ld.shared.b32 $0, [$1];",
+            "=r,r,~{memory}",
+            loc=loc,
+            ip=ip,
+        )
+    )
 
 
 @dsl_user_op
 def _st_shared(addr: Int32, value: Int32, *, loc=None, ip=None) -> None:
-    _asm(None, [_i32(addr, loc, ip), _i32(value, loc, ip)], "st.shared.b32 [$0], $1;", "r,r,~{memory}", loc=loc,
-         ip=ip)
+    _asm(
+        None,
+        [_i32(addr, loc, ip), _i32(value, loc, ip)],
+        "st.shared.b32 [$0], $1;",
+        "r,r,~{memory}",
+        loc=loc,
+        ip=ip,
+    )
 
 
 @dsl_user_op
 def _red_or_shared(addr: Int32, value: Int32, *, loc=None, ip=None) -> None:
-    _asm(None, [_i32(addr, loc, ip), _i32(value, loc, ip)], "red.shared.or.b32 [$0], $1;", "r,r,~{memory}", loc=loc,
-         ip=ip)
+    _asm(
+        None,
+        [_i32(addr, loc, ip), _i32(value, loc, ip)],
+        "red.shared.or.b32 [$0], $1;",
+        "r,r,~{memory}",
+        loc=loc,
+        ip=ip,
+    )
 
 
 # ---------------------------------------------------------------------------------------------------------
@@ -188,66 +262,136 @@ def _red_or_shared(addr: Int32, value: Int32, *, loc=None, ip=None) -> None:
 # ---------------------------------------------------------------------------------------------------------
 @dsl_user_op
 def _redux_max_u32(x: Int32, *, loc=None, ip=None) -> Int32:
-    return Int32(_asm(T.i32(), [_i32(x, loc, ip)], "redux.sync.max.u32 $0, $1, 0xffffffff;", "=r,r", loc=loc,
-                      ip=ip))
+    return Int32(
+        _asm(
+            T.i32(),
+            [_i32(x, loc, ip)],
+            "redux.sync.max.u32 $0, $1, 0xffffffff;",
+            "=r,r",
+            loc=loc,
+            ip=ip,
+        )
+    )
 
 
 @dsl_user_op
 def _max_u32(a: Int32, b: Int32, *, loc=None, ip=None) -> Int32:
-    return Int32(_asm(T.i32(), [_i32(a, loc, ip), _i32(b, loc, ip)], "max.u32 $0, $1, $2;", "=r,r,r", False,
-                      loc=loc, ip=ip))
+    return Int32(
+        _asm(
+            T.i32(),
+            [_i32(a, loc, ip), _i32(b, loc, ip)],
+            "max.u32 $0, $1, $2;",
+            "=r,r,r",
+            False,
+            loc=loc,
+            ip=ip,
+        )
+    )
 
 
 @dsl_user_op
 def _sel_eq(x: Int32, y: Int32, a: Int32, b: Int32, *, loc=None, ip=None) -> Int32:
     """``a if x == y else b``."""
-    return Int32(_asm(T.i32(), [_i32(x, loc, ip), _i32(y, loc, ip), _i32(a, loc, ip), _i32(b, loc, ip)],
-                      "{\n\t.reg .pred p;\n\tsetp.eq.b32 p, $1, $2;\n\tselp.b32 $0, $3, $4, p;\n\t}", "=r,r,r,r,r",
-                      False, loc=loc, ip=ip))
+    return Int32(
+        _asm(
+            T.i32(),
+            [_i32(x, loc, ip), _i32(y, loc, ip), _i32(a, loc, ip), _i32(b, loc, ip)],
+            "{\n\t.reg .pred p;\n\tsetp.eq.b32 p, $1, $2;\n\tselp.b32 $0, $3, $4, p;\n\t}",
+            "=r,r,r,r,r",
+            False,
+            loc=loc,
+            ip=ip,
+        )
+    )
 
 
 @dsl_user_op
 def _sel_eq_f(x: Int32, y: Int32, a: Float32, b: Float32, *, loc=None, ip=None) -> Float32:
     """``a if x == y else b`` (FP32 operands)."""
-    return Float32(_asm(T.f32(), [_i32(x, loc, ip), _i32(y, loc, ip), _f32(a, loc, ip), _f32(b, loc, ip)],
-                        "{\n\t.reg .pred p;\n\tsetp.eq.b32 p, $1, $2;\n\tselp.f32 $0, $3, $4, p;\n\t}", "=f,r,r,f,f",
-                        False, loc=loc, ip=ip))
+    return Float32(
+        _asm(
+            T.f32(),
+            [_i32(x, loc, ip), _i32(y, loc, ip), _f32(a, loc, ip), _f32(b, loc, ip)],
+            "{\n\t.reg .pred p;\n\tsetp.eq.b32 p, $1, $2;\n\tselp.f32 $0, $3, $4, p;\n\t}",
+            "=f,r,r,f,f",
+            False,
+            loc=loc,
+            ip=ip,
+        )
+    )
 
 
 @dsl_user_op
 def _sel_lt(x: Int32, y: Int32, a: Int32, b: Int32, *, loc=None, ip=None) -> Int32:
     """``a if x < y else b`` (unsigned compare: a negative x is never below y)."""
-    return Int32(_asm(T.i32(), [_i32(x, loc, ip), _i32(y, loc, ip), _i32(a, loc, ip), _i32(b, loc, ip)],
-                      "{\n\t.reg .pred p;\n\tsetp.lt.u32 p, $1, $2;\n\tselp.b32 $0, $3, $4, p;\n\t}", "=r,r,r,r,r",
-                      False, loc=loc, ip=ip))
+    return Int32(
+        _asm(
+            T.i32(),
+            [_i32(x, loc, ip), _i32(y, loc, ip), _i32(a, loc, ip), _i32(b, loc, ip)],
+            "{\n\t.reg .pred p;\n\tsetp.lt.u32 p, $1, $2;\n\tselp.b32 $0, $3, $4, p;\n\t}",
+            "=r,r,r,r,r",
+            False,
+            loc=loc,
+            ip=ip,
+        )
+    )
 
 
 @dsl_user_op
 def _popc(x: Int32, *, loc=None, ip=None) -> Int32:
-    return Int32(_asm(T.i32(), [_i32(x, loc, ip)], "popc.b32 $0, $1;", "=r,r", False, loc=loc, ip=ip))
+    return Int32(
+        _asm(T.i32(), [_i32(x, loc, ip)], "popc.b32 $0, $1;", "=r,r", False, loc=loc, ip=ip)
+    )
 
 
 @dsl_user_op
 def _bit(t: Int32, *, loc=None, ip=None) -> Int32:
     """``1 << t`` (t in [0, 31])."""
-    return Int32(_asm(T.i32(), [_i32(t, loc, ip)], "{\n\t.reg .b32 one;\n\tmov.b32 one, 1;\n\t"
-                      "shl.b32 $0, one, $1;\n\t}", "=r,r", False, loc=loc, ip=ip))
+    return Int32(
+        _asm(
+            T.i32(),
+            [_i32(t, loc, ip)],
+            "{\n\t.reg .b32 one;\n\tmov.b32 one, 1;\n\tshl.b32 $0, one, $1;\n\t}",
+            "=r,r",
+            False,
+            loc=loc,
+            ip=ip,
+        )
+    )
 
 
 @dsl_user_op
 def _below(t: Int32, *, loc=None, ip=None) -> Int32:
     """``(1 << t) - 1`` as a bit mask (t in [0, 31]): the tokens before t."""
-    return Int32(_asm(T.i32(), [_i32(t, loc, ip)], "{\n\t.reg .b32 a;\n\tmov.b32 a, 0xffffffff;\n\tshl.b32 a, a, $1;\n\t"
-                      "not.b32 $0, a;\n\t}", "=r,r", False, loc=loc, ip=ip))
+    return Int32(
+        _asm(
+            T.i32(),
+            [_i32(t, loc, ip)],
+            "{\n\t.reg .b32 a;\n\tmov.b32 a, 0xffffffff;\n\tshl.b32 a, a, $1;\n\t"
+            "not.b32 $0, a;\n\t}",
+            "=r,r",
+            False,
+            loc=loc,
+            ip=ip,
+        )
+    )
 
 
 @dsl_user_op
 def _scan_add(x: Int32, delta: int, *, loc=None, ip=None) -> Int32:
     """One step of a warp inclusive scan: ``x + x[lane - delta]`` for lanes >= delta, else ``x``."""
-    return Int32(_asm(T.i32(), [_i32(x, loc, ip)],
-                      "{\n\t.reg .b32 y;\n\t.reg .pred p;\n\t"
-                      f"shfl.sync.up.b32 y|p, $1, {delta}, 0, 0xffffffff;\n\t"
-                      "@p add.s32 y, y, $1;\n\t@!p mov.b32 y, $1;\n\tmov.b32 $0, y;\n\t}", "=r,r", loc=loc, ip=ip))
+    return Int32(
+        _asm(
+            T.i32(),
+            [_i32(x, loc, ip)],
+            "{\n\t.reg .b32 y;\n\t.reg .pred p;\n\t"
+            f"shfl.sync.up.b32 y|p, $1, {delta}, 0, 0xffffffff;\n\t"
+            "@p add.s32 y, y, $1;\n\t@!p mov.b32 y, $1;\n\tmov.b32 $0, y;\n\t}",
+            "=r,r",
+            loc=loc,
+            ip=ip,
+        )
+    )
 
 
 # ---------------------------------------------------------------------------------------------------------
@@ -258,73 +402,135 @@ def _keys2(word: Int32, idx: Int32, *, loc=None, ip=None):
     """Top-k keys of the two BF16 logits in ``word`` (expert ``idx`` in the low half, ``idx + 1`` in the high
     half): ``twiddle(bits) << 16 | (65535 - expert)``, unsigned order = value order, ties -> smaller expert.
     twiddle: negative -> bits ^ 0xFFFF, else bits | 0x8000."""
-    out = _asm(_struct(2), [_i32(word, loc, ip), _i32(idx, loc, ip)],
-               "{\n\t.reg .b32 lo, hi, t, m, bb;\n\t.reg .pred p;\n\t"
-               "and.b32 lo, $2, 65535;\n\tshr.u32 hi, $2, 16;\n\t"
-               "and.b32 t, lo, 32768;\n\tsetp.ne.u32 p, t, 0;\n\tselp.b32 m, 65535, 32768, p;\n\t"
-               "xor.b32 lo, lo, m;\n\t"
-               "and.b32 t, hi, 32768;\n\tsetp.ne.u32 p, t, 0;\n\tselp.b32 m, 65535, 32768, p;\n\t"
-               "xor.b32 hi, hi, m;\n\t"
-               "mov.b32 bb, 65535;\n\tsub.u32 bb, bb, $3;\n\t"
-               "shl.b32 lo, lo, 16;\n\tor.b32 $0, lo, bb;\n\t"
-               "sub.u32 bb, bb, 1;\n\tshl.b32 hi, hi, 16;\n\tor.b32 $1, hi, bb;\n\t}",
-               "=r,=r,r,r", False, loc=loc, ip=ip)
+    out = _asm(
+        _struct(2),
+        [_i32(word, loc, ip), _i32(idx, loc, ip)],
+        "{\n\t.reg .b32 lo, hi, t, m, bb;\n\t.reg .pred p;\n\t"
+        "and.b32 lo, $2, 65535;\n\tshr.u32 hi, $2, 16;\n\t"
+        "and.b32 t, lo, 32768;\n\tsetp.ne.u32 p, t, 0;\n\tselp.b32 m, 65535, 32768, p;\n\t"
+        "xor.b32 lo, lo, m;\n\t"
+        "and.b32 t, hi, 32768;\n\tsetp.ne.u32 p, t, 0;\n\tselp.b32 m, 65535, 32768, p;\n\t"
+        "xor.b32 hi, hi, m;\n\t"
+        "mov.b32 bb, 65535;\n\tsub.u32 bb, bb, $3;\n\t"
+        "shl.b32 lo, lo, 16;\n\tor.b32 $0, lo, bb;\n\t"
+        "sub.u32 bb, bb, 1;\n\tshl.b32 hi, hi, 16;\n\tor.b32 $1, hi, bb;\n\t}",
+        "=r,=r,r,r",
+        False,
+        loc=loc,
+        ip=ip,
+    )
     return _unpack(out, 2, loc, ip)
 
 
 @dsl_user_op
 def _key_val(key: Int32, *, loc=None, ip=None) -> Float32:
     """The FP32 value of a key's BF16 logit (inverse twiddle)."""
-    return Float32(_asm(T.f32(), [_i32(key, loc, ip)],
-                        "{\n\t.reg .b32 tw, m;\n\t.reg .pred p;\n\tshr.u32 tw, $1, 16;\n\t"
-                        "and.b32 m, tw, 32768;\n\tsetp.ne.u32 p, m, 0;\n\tselp.b32 m, 32768, 65535, p;\n\t"
-                        "xor.b32 tw, tw, m;\n\tshl.b32 tw, tw, 16;\n\tmov.b32 $0, tw;\n\t}", "=f,r", False,
-                        loc=loc, ip=ip))
+    return Float32(
+        _asm(
+            T.f32(),
+            [_i32(key, loc, ip)],
+            "{\n\t.reg .b32 tw, m;\n\t.reg .pred p;\n\tshr.u32 tw, $1, 16;\n\t"
+            "and.b32 m, tw, 32768;\n\tsetp.ne.u32 p, m, 0;\n\tselp.b32 m, 32768, 65535, p;\n\t"
+            "xor.b32 tw, tw, m;\n\tshl.b32 tw, tw, 16;\n\tmov.b32 $0, tw;\n\t}",
+            "=f,r",
+            False,
+            loc=loc,
+            ip=ip,
+        )
+    )
 
 
 @dsl_user_op
 def _exp_tr(x: Float32, *, loc=None, ip=None) -> Float32:
     """libdevice ``__nv_expf`` with FTZ, as Triton compiles ``libdevice.exp`` (route kernel PTX)."""
-    return Float32(_asm(T.f32(), [_f32(x, loc, ip)],
-                        "{\n\t.reg .b32 t, j, k, r, e, s, c0, c1, c2, c3, c4, c5, c6;\n\t"
-                        "mov.b32 c0, 0f3BBB989D;\n\tmov.b32 c1, 0f3F000000;\n\t"
-                        "mov.b32 c2, 0f437C0000;\n\tmov.b32 c3, 0f4B400001;\n\t"
-                        "mov.b32 c4, 0fCB40007F;\n\tmov.b32 c5, 0f3FB8AA3B;\n\tmov.b32 c6, 0f32A57060;\n\t"
-                        "fma.rn.ftz.f32 t, $1, c0, c1;\n\t"
-                        "cvt.ftz.sat.f32.f32 t, t;\n\t"
-                        "fma.rm.ftz.f32 j, t, c2, c3;\n\t"
-                        "add.f32 k, j, c4;\n\t"
-                        "neg.f32 k, k;\n\t"
-                        "fma.rn.ftz.f32 r, $1, c5, k;\n\t"
-                        "fma.rn.ftz.f32 r, $1, c6, r;\n\t"
-                        "shl.b32 s, j, 23;\n\t"
-                        "ex2.approx.ftz.f32 e, r;\n\t"
-                        "mul.f32 $0, e, s;\n\t}", "=f,f", False, loc=loc, ip=ip))
+    return Float32(
+        _asm(
+            T.f32(),
+            [_f32(x, loc, ip)],
+            "{\n\t.reg .b32 t, j, k, r, e, s, c0, c1, c2, c3, c4, c5, c6;\n\t"
+            "mov.b32 c0, 0f3BBB989D;\n\tmov.b32 c1, 0f3F000000;\n\t"
+            "mov.b32 c2, 0f437C0000;\n\tmov.b32 c3, 0f4B400001;\n\t"
+            "mov.b32 c4, 0fCB40007F;\n\tmov.b32 c5, 0f3FB8AA3B;\n\tmov.b32 c6, 0f32A57060;\n\t"
+            "fma.rn.ftz.f32 t, $1, c0, c1;\n\t"
+            "cvt.ftz.sat.f32.f32 t, t;\n\t"
+            "fma.rm.ftz.f32 j, t, c2, c3;\n\t"
+            "add.f32 k, j, c4;\n\t"
+            "neg.f32 k, k;\n\t"
+            "fma.rn.ftz.f32 r, $1, c5, k;\n\t"
+            "fma.rn.ftz.f32 r, $1, c6, r;\n\t"
+            "shl.b32 s, j, 23;\n\t"
+            "ex2.approx.ftz.f32 e, r;\n\t"
+            "mul.f32 $0, e, s;\n\t}",
+            "=f,f",
+            False,
+            loc=loc,
+            ip=ip,
+        )
+    )
 
 
 @dsl_user_op
 def _sub(a: Float32, b: Float32, *, loc=None, ip=None) -> Float32:
-    return Float32(_asm(T.f32(), [_f32(a, loc, ip), _f32(b, loc, ip)], "sub.f32 $0, $1, $2;", "=f,f,f", False,
-                        loc=loc, ip=ip))
+    return Float32(
+        _asm(
+            T.f32(),
+            [_f32(a, loc, ip), _f32(b, loc, ip)],
+            "sub.f32 $0, $1, $2;",
+            "=f,f,f",
+            False,
+            loc=loc,
+            ip=ip,
+        )
+    )
 
 
 @dsl_user_op
 def _add(a: Float32, b: Float32, *, loc=None, ip=None) -> Float32:
-    return Float32(_asm(T.f32(), [_f32(a, loc, ip), _f32(b, loc, ip)], "add.f32 $0, $1, $2;", "=f,f,f", False,
-                        loc=loc, ip=ip))
+    return Float32(
+        _asm(
+            T.f32(),
+            [_f32(a, loc, ip), _f32(b, loc, ip)],
+            "add.f32 $0, $1, $2;",
+            "=f,f,f",
+            False,
+            loc=loc,
+            ip=ip,
+        )
+    )
 
 
 @dsl_user_op
 def _div_bf16(a: Float32, b: Float32, *, loc=None, ip=None) -> Int32:
     """BF16 bits of ``a / b`` (``div.rn.ftz.f32``, then round to nearest even)."""
-    return Int32(_asm(T.i32(), [_f32(a, loc, ip), _f32(b, loc, ip)],
-                      "{\n\t.reg .b32 q;\n\t.reg .b16 h;\n\tdiv.rn.ftz.f32 q, $1, $2;\n\t"
-                      "cvt.rn.bf16.f32 h, q;\n\tcvt.u32.u16 $0, h;\n\t}", "=r,f,f", False, loc=loc, ip=ip))
+    return Int32(
+        _asm(
+            T.i32(),
+            [_f32(a, loc, ip), _f32(b, loc, ip)],
+            "{\n\t.reg .b32 q;\n\t.reg .b16 h;\n\tdiv.rn.ftz.f32 q, $1, $2;\n\t"
+            "cvt.rn.bf16.f32 h, q;\n\tcvt.u32.u16 $0, h;\n\t}",
+            "=r,f,f",
+            False,
+            loc=loc,
+            ip=ip,
+        )
+    )
 
 
 @dsl_user_op
-def _nvfp4_block(w0: Int32, w1: Int32, w2: Int32, w3: Int32, w4: Int32, w5: Int32, w6: Int32, w7: Int32,
-                 gs: Float32, *, loc=None, ip=None):
+def _nvfp4_block(
+    w0: Int32,
+    w1: Int32,
+    w2: Int32,
+    w3: Int32,
+    w4: Int32,
+    w5: Int32,
+    w6: Int32,
+    w7: Int32,
+    gs: Float32,
+    *,
+    loc=None,
+    ip=None,
+):
     """NVFP4 quantization of one 16-element BF16 block (element 2i in the low half of word i): the 8 packed
     E2M1 bytes as two words (byte j = elements 2j | 2j + 1 << 4) and the E4M3 scale byte. Arithmetic of
     ``_nvfp4_quant_row`` (route kernel PTX): vmax = max |x|, sf = e4m3(gs * (vmax * rcp(6))),
@@ -351,82 +557,137 @@ def _nvfp4_block(w0: Int32, w1: Int32, w2: Int32, w3: Int32, w4: Int32, w5: Int3
             pack.append(f"shl.b32 c, c, {8 * (j % 4)};")
             pack.append(f"or.b32 {word}, {word}, c;")
     text = "\n\t".join(
-        ["{",
-         ".reg .b32 " + ", ".join(f"f{j}" for j in range(16)) + ";",
-         ".reg .b32 a, m, t, s, r6, rg, sff, osc, y0, y1, c, u, v, sfw;",
-         ".reg .b16 sfh, h0, h1, hq;",
-         ".reg .b8 q;",
-         ".reg .pred nz;"]
-        + unpack + amax
-        + ["mov.b32 r6, 0f40C00000;",
-           "rcp.approx.ftz.f32 r6, r6;",
-           "mul.f32 t, r6, m;",
-           "mul.f32 s, t, $11;",
-           "cvt.rn.satfinite.e4m3x2.f32 sfh, 0f00000000, s;",
-           "cvt.rn.f16x2.e4m3x2 sfw, sfh;",
-           "mov.b32 {h0, h1}, sfw;",
-           "cvt.f32.f16 sff, h0;",
-           "rcp.approx.ftz.f32 rg, $11;",
-           "mul.f32 t, rg, sff;",
-           "rcp.approx.ftz.f32 osc, t;",
-           "setp.neu.f32 nz, m, 0f00000000;",
-           "selp.f32 osc, osc, 0f00000000, nz;"]
+        [
+            "{",
+            ".reg .b32 " + ", ".join(f"f{j}" for j in range(16)) + ";",
+            ".reg .b32 a, m, t, s, r6, rg, sff, osc, y0, y1, c, u, v, sfw;",
+            ".reg .b16 sfh, h0, h1, hq;",
+            ".reg .b8 q;",
+            ".reg .pred nz;",
+        ]
+        + unpack
+        + amax
+        + [
+            "mov.b32 r6, 0f40C00000;",
+            "rcp.approx.ftz.f32 r6, r6;",
+            "mul.f32 t, r6, m;",
+            "mul.f32 s, t, $11;",
+            "cvt.rn.satfinite.e4m3x2.f32 sfh, 0f00000000, s;",
+            "cvt.rn.f16x2.e4m3x2 sfw, sfh;",
+            "mov.b32 {h0, h1}, sfw;",
+            "cvt.f32.f16 sff, h0;",
+            "rcp.approx.ftz.f32 rg, $11;",
+            "mul.f32 t, rg, sff;",
+            "rcp.approx.ftz.f32 osc, t;",
+            "setp.neu.f32 nz, m, 0f00000000;",
+            "selp.f32 osc, osc, 0f00000000, nz;",
+        ]
         + pack
-        + ["mov.b32 $0, u;",
-           "mov.b32 $1, v;",
-           "cvt.u32.u16 c, sfh;",
-           "and.b32 $2, c, 255;",
-           "}"])
-    out = _asm(_struct(3), [_i32(w, loc, ip) for w in (w0, w1, w2, w3, w4, w5, w6, w7)] + [_f32(gs, loc, ip)],
-               text, "=r,=r,=r,r,r,r,r,r,r,r,r,f", False, loc=loc, ip=ip)
+        + ["mov.b32 $0, u;", "mov.b32 $1, v;", "cvt.u32.u16 c, sfh;", "and.b32 $2, c, 255;", "}"]
+    )
+    out = _asm(
+        _struct(3),
+        [_i32(w, loc, ip) for w in (w0, w1, w2, w3, w4, w5, w6, w7)] + [_f32(gs, loc, ip)],
+        text,
+        "=r,=r,=r,r,r,r,r,r,r,r,r,f",
+        False,
+        loc=loc,
+        ip=ip,
+    )
     return _unpack(out, 3, loc, ip)
 
 
 @dsl_user_op
 def _min_u32(a: Int32, b: Int32, *, loc=None, ip=None) -> Int32:
-    return Int32(_asm(T.i32(), [_i32(a, loc, ip), _i32(b, loc, ip)], "min.u32 $0, $1, $2;", "=r,r,r", False,
-                      loc=loc, ip=ip))
+    return Int32(
+        _asm(
+            T.i32(),
+            [_i32(a, loc, ip), _i32(b, loc, ip)],
+            "min.u32 $0, $1, $2;",
+            "=r,r,r",
+            False,
+            loc=loc,
+            ip=ip,
+        )
+    )
 
 
 @dsl_user_op
 def _key1(word: Int32, idx: Int32, *, loc=None, ip=None) -> Int32:
     """Top-k key of the BF16 logit in the low half of ``word`` (expert ``idx``), as ``_keys2``."""
-    return Int32(_asm(T.i32(), [_i32(word, loc, ip), _i32(idx, loc, ip)],
-                      "{\n\t.reg .b32 bv, t, m;\n\t.reg .pred p;\n\t"
-                      "and.b32 bv, $1, 65535;\n\t"
-                      "and.b32 t, bv, 32768;\n\tsetp.ne.u32 p, t, 0;\n\tselp.b32 m, 65535, 32768, p;\n\t"
-                      "xor.b32 bv, bv, m;\n\tshl.b32 bv, bv, 16;\n\t"
-                      "mov.b32 t, 65535;\n\tsub.u32 t, t, $2;\n\tor.b32 $0, bv, t;\n\t}", "=r,r,r", False,
-                      loc=loc, ip=ip))
+    return Int32(
+        _asm(
+            T.i32(),
+            [_i32(word, loc, ip), _i32(idx, loc, ip)],
+            "{\n\t.reg .b32 bv, t, m;\n\t.reg .pred p;\n\t"
+            "and.b32 bv, $1, 65535;\n\t"
+            "and.b32 t, bv, 32768;\n\tsetp.ne.u32 p, t, 0;\n\tselp.b32 m, 65535, 32768, p;\n\t"
+            "xor.b32 bv, bv, m;\n\tshl.b32 bv, bv, 16;\n\t"
+            "mov.b32 t, 65535;\n\tsub.u32 t, t, $2;\n\tor.b32 $0, bv, t;\n\t}",
+            "=r,r,r",
+            False,
+            loc=loc,
+            ip=ip,
+        )
+    )
 
 
 @dsl_user_op
 def _vote_all_bit16(x: Int32, *, loc=None, ip=None) -> Int32:
     """1 if bit 16 of ``x`` is set in every lane of the warp, else 0."""
-    return Int32(_asm(T.i32(), [_i32(x, loc, ip)],
-                      "{\n\t.reg .b32 a;\n\t.reg .pred p, q;\n\tand.b32 a, $1, 65536;\n\tsetp.ne.u32 p, a, 0;\n\t"
-                      "vote.sync.all.pred q, p, 0xffffffff;\n\tselp.u32 $0, 1, 0, q;\n\t}", "=r,r", loc=loc, ip=ip))
+    return Int32(
+        _asm(
+            T.i32(),
+            [_i32(x, loc, ip)],
+            "{\n\t.reg .b32 a;\n\t.reg .pred p, q;\n\tand.b32 a, $1, 65536;\n\tsetp.ne.u32 p, a, 0;\n\t"
+            "vote.sync.all.pred q, p, 0xffffffff;\n\tselp.u32 $0, 1, 0, q;\n\t}",
+            "=r,r",
+            loc=loc,
+            ip=ip,
+        )
+    )
 
 
 @dsl_user_op
 def _ld_volatile_v4(addr: Int64, *, loc=None, ip=None):
-    out = _asm(_struct(4), [_i64(addr, loc, ip)], "ld.volatile.global.v4.b32 {$0, $1, $2, $3}, [$4];",
-               "=r,=r,=r,=r,l,~{memory}", loc=loc, ip=ip)
+    out = _asm(
+        _struct(4),
+        [_i64(addr, loc, ip)],
+        "ld.volatile.global.v4.b32 {$0, $1, $2, $3}, [$4];",
+        "=r,=r,=r,=r,l,~{memory}",
+        loc=loc,
+        ip=ip,
+    )
     return _unpack(out, 4, loc, ip)
 
 
 @dsl_user_op
 def _st_v4(addr: Int64, w0: Int32, w1: Int32, w2: Int32, w3: Int32, *, loc=None, ip=None) -> None:
-    _asm(None, [_i64(addr, loc, ip)] + [_i32(w, loc, ip) for w in (w0, w1, w2, w3)],
-         "st.global.v4.b32 [$0], {$1, $2, $3, $4};", "l,r,r,r,r,~{memory}", loc=loc, ip=ip)
+    _asm(
+        None,
+        [_i64(addr, loc, ip)] + [_i32(w, loc, ip) for w in (w0, w1, w2, w3)],
+        "st.global.v4.b32 [$0], {$1, $2, $3, $4};",
+        "l,r,r,r,r,~{memory}",
+        loc=loc,
+        ip=ip,
+    )
 
 
 @dsl_user_op
 def _tagged_bf16(x: Float32, *, loc=None, ip=None) -> Int32:
     """Staging word of a logit: ``0x10000 | bf16_rn(x)`` (bit 16 = written in this launch)."""
-    return Int32(_asm(T.i32(), [_f32(x, loc, ip)],
-                      "{\n\t.reg .b16 h;\n\t.reg .b32 w;\n\tcvt.rn.bf16.f32 h, $1;\n\tcvt.u32.u16 w, h;\n\t"
-                      "or.b32 $0, w, 65536;\n\t}", "=r,f", False, loc=loc, ip=ip))
+    return Int32(
+        _asm(
+            T.i32(),
+            [_f32(x, loc, ip)],
+            "{\n\t.reg .b16 h;\n\t.reg .b32 w;\n\tcvt.rn.bf16.f32 h, $1;\n\tcvt.u32.u16 w, h;\n\t"
+            "or.b32 $0, w, 65536;\n\t}",
+            "=r,f",
+            False,
+            loc=loc,
+            ip=ip,
+        )
+    )
 
 
 @dsl_user_op
@@ -437,13 +698,23 @@ def _gtime(*, loc=None, ip=None) -> Int64:
 @dsl_user_op
 def _gtime_after(dep: Int32, *, loc=None, ip=None) -> Int64:
     """%globaltimer read after ``dep`` is available (a data dependency orders it after dep's load)."""
-    return Int64(_asm(T.i64(), [_i32(dep, loc, ip)], "mov.u64 $0, %globaltimer; // $1", "=l,r", loc=loc, ip=ip))
+    return Int64(
+        _asm(
+            T.i64(), [_i32(dep, loc, ip)], "mov.u64 $0, %globaltimer; // $1", "=l,r", loc=loc, ip=ip
+        )
+    )
 
 
 @dsl_user_op
 def _st_u64(addr: Int64, value: Int64, *, loc=None, ip=None) -> None:
-    _asm(None, [_i64(addr, loc, ip), _i64(value, loc, ip)], "st.global.u64 [$0], $1;", "l,l,~{memory}", loc=loc,
-         ip=ip)
+    _asm(
+        None,
+        [_i64(addr, loc, ip), _i64(value, loc, ip)],
+        "st.global.u64 [$0], $1;",
+        "l,l,~{memory}",
+        loc=loc,
+        ip=ip,
+    )
 
 
 def _bitonic_pairs(n: int):
@@ -477,7 +748,9 @@ def max_num_tiles(num_tokens: int, top_k: int, num_local_experts: int, tile: int
 
 
 SYNC_TICKET = 0  # the last router CTA to arrive (atom.acq_rel ticket) routes
-SYNC_STAGE = 1  # a dedicated router CTA polls valid-tagged logits in a persistent staging buffer and routes
+SYNC_STAGE = (
+    1  # a dedicated router CTA polls valid-tagged logits in a persistent staging buffer and routes
+)
 TRACE_SLOTS = 8  # u64 globaltimer stamps per CTA (+ one row for the routing CTA) in trace builds
 
 
@@ -494,11 +767,30 @@ class Q35MoeFrontKernel(LowMMmaGemmKernel):
     shift-pop per round, and two tokens per warp interleaved when M > k_warps. ``trace``: debug builds only,
     %globaltimer stamps of every CTA into ``trace_ptr`` ([ctas + 1, TRACE_SLOTS] u64)."""
 
-    def __init__(self, *, num_rows: int, k_extent: int, k_warps: int, use_pdl: bool, num_experts: int,
-                 top_k: int, num_local: int, tile: int, a_stride: int, sync_mode: int = SYNC_STAGE,
-                 topk_mode: int = 1, trace: bool = False) -> None:
-        super().__init__(num_rows=num_rows, k_extent=k_extent, k_warps=k_warps, use_pdl=use_pdl,
-                         n_bf16=num_experts, n_tiles_bf16=1)
+    def __init__(
+        self,
+        *,
+        num_rows: int,
+        k_extent: int,
+        k_warps: int,
+        use_pdl: bool,
+        num_experts: int,
+        top_k: int,
+        num_local: int,
+        tile: int,
+        a_stride: int,
+        sync_mode: int = SYNC_STAGE,
+        topk_mode: int = 1,
+        trace: bool = False,
+    ) -> None:
+        super().__init__(
+            num_rows=num_rows,
+            k_extent=k_extent,
+            k_warps=k_warps,
+            use_pdl=use_pdl,
+            n_bf16=num_experts,
+            n_tiles_bf16=1,
+        )
         threads = 32 * k_warps
         if num_rows > 32:
             raise ValueError("the token masks hold at most 32 tokens")
@@ -507,7 +799,9 @@ class Q35MoeFrontKernel(LowMMmaGemmKernel):
         if num_experts != 32 * 16:
             raise ValueError("one warp per token holds 16 logits per lane: 512 experts")
         if not 1 <= num_local <= min(num_experts, threads) or num_local % 32:
-            raise ValueError(f"num_local={num_local} must be a multiple of 32 and <= {min(num_experts, threads)}")
+            raise ValueError(
+                f"num_local={num_local} must be a multiple of 32 and <= {min(num_experts, threads)}"
+            )
         if tile & (tile - 1) or not 8 <= tile <= 256:
             raise ValueError(f"tile={tile} must be a power of two in [8, 256]")
         if num_rows * top_k > threads:
@@ -567,10 +861,30 @@ class Q35MoeFrontKernel(LowMMmaGemmKernel):
     ) -> None:
         copy_a16 = _g2r_atom(BFloat16, streaming=False)
         copy_b2 = _g2r_atom(BFloat16, streaming=True)
-        smem = (self.k_warps * self.row_tiles * 16 * N_TILE * 4 + 2 * self.num_local * 4 + self.picks_pad * 4
-                + 32 * 4 + 16 + 256)
-        self.kernel(gA16, gB2, gC, gs_ptr, xq_ptr, xsf_ptr, ids_ptr, wts_ptr, tab_ptr, sync_ptr, trace_ptr,
-                    local_start, copy_a16, copy_b2).launch(
+        smem = (
+            self.k_warps * self.row_tiles * 16 * N_TILE * 4
+            + 2 * self.num_local * 4
+            + self.picks_pad * 4
+            + 32 * 4
+            + 16
+            + 256
+        )
+        self.kernel(
+            gA16,
+            gB2,
+            gC,
+            gs_ptr,
+            xq_ptr,
+            xsf_ptr,
+            ids_ptr,
+            wts_ptr,
+            tab_ptr,
+            sync_ptr,
+            trace_ptr,
+            local_start,
+            copy_a16,
+            copy_b2,
+        ).launch(
             grid=[self.ctas, 1, 1],
             block=[self.threads, 1, 1],
             smem=smem,
@@ -611,27 +925,79 @@ class Q35MoeFrontKernel(LowMMmaGemmKernel):
             ),
             byte_alignment=16,
         )
-        s_mask = smem.allocate_tensor(Int32, cute.make_layout((self.num_local, )), byte_alignment=16)
-        s_offs = smem.allocate_tensor(Int32, cute.make_layout((self.num_local, )), byte_alignment=16)
-        s_pick = smem.allocate_tensor(Int32, cute.make_layout((self.picks_pad, )), byte_alignment=16)
-        s_wsum = smem.allocate_tensor(Int32, cute.make_layout((32, )), byte_alignment=16)
-        s_flag = smem.allocate_tensor(Int32, cute.make_layout((4, )), byte_alignment=16)
-        sm = (_smem_addr(s_mask.iterator), _smem_addr(s_offs.iterator), _smem_addr(s_pick.iterator),
-              _smem_addr(s_wsum.iterator), _smem_addr(s_flag.iterator))
+        s_mask = smem.allocate_tensor(Int32, cute.make_layout((self.num_local,)), byte_alignment=16)
+        s_offs = smem.allocate_tensor(Int32, cute.make_layout((self.num_local,)), byte_alignment=16)
+        s_pick = smem.allocate_tensor(Int32, cute.make_layout((self.picks_pad,)), byte_alignment=16)
+        s_wsum = smem.allocate_tensor(Int32, cute.make_layout((32,)), byte_alignment=16)
+        s_flag = smem.allocate_tensor(Int32, cute.make_layout((4,)), byte_alignment=16)
+        sm = (
+            _smem_addr(s_mask.iterator),
+            _smem_addr(s_offs.iterator),
+            _smem_addr(s_pick.iterator),
+            _smem_addr(s_wsum.iterator),
+            _smem_addr(s_flag.iterator),
+        )
         if const_expr(self.sync_mode == SYNC_STAGE):
             if bidx == 0:
-                self._router_cta(gC, ids_ptr, wts_ptr, tab_ptr, sync_ptr, trace_ptr, local_start, sm, tidx, t_entry)
+                self._router_cta(
+                    gC,
+                    ids_ptr,
+                    wts_ptr,
+                    tab_ptr,
+                    sync_ptr,
+                    trace_ptr,
+                    local_start,
+                    sm,
+                    tidx,
+                    t_entry,
+                )
             elif bidx < self.quant_cta0:
-                self._gemm_cta(gA16, gB2, gC, ids_ptr, wts_ptr, tab_ptr, sync_ptr, trace_ptr, local_start, red, sm,
-                               copy_a16, copy_b2, tidx, bidx - self.gemm_cta0, t_entry)
+                self._gemm_cta(
+                    gA16,
+                    gB2,
+                    gC,
+                    ids_ptr,
+                    wts_ptr,
+                    tab_ptr,
+                    sync_ptr,
+                    trace_ptr,
+                    local_start,
+                    red,
+                    sm,
+                    copy_a16,
+                    copy_b2,
+                    tidx,
+                    bidx - self.gemm_cta0,
+                    t_entry,
+                )
             else:
-                self._quant_cta(gA16, gs_ptr, xq_ptr, xsf_ptr, trace_ptr, tidx, bidx - self.quant_cta0, t_entry)
+                self._quant_cta(
+                    gA16, gs_ptr, xq_ptr, xsf_ptr, trace_ptr, tidx, bidx - self.quant_cta0, t_entry
+                )
         else:
             if bidx < self.gemm_ctas:
-                self._gemm_cta(gA16, gB2, gC, ids_ptr, wts_ptr, tab_ptr, sync_ptr, trace_ptr, local_start, red, sm,
-                               copy_a16, copy_b2, tidx, bidx, t_entry)
+                self._gemm_cta(
+                    gA16,
+                    gB2,
+                    gC,
+                    ids_ptr,
+                    wts_ptr,
+                    tab_ptr,
+                    sync_ptr,
+                    trace_ptr,
+                    local_start,
+                    red,
+                    sm,
+                    copy_a16,
+                    copy_b2,
+                    tidx,
+                    bidx,
+                    t_entry,
+                )
             else:
-                self._quant_cta(gA16, gs_ptr, xq_ptr, xsf_ptr, trace_ptr, tidx, bidx - self.quant_cta0, t_entry)
+                self._quant_cta(
+                    gA16, gs_ptr, xq_ptr, xsf_ptr, trace_ptr, tidx, bidx - self.quant_cta0, t_entry
+                )
 
     # ------------------------------------------------------------------------------------------------- tracing
     @cute.jit
@@ -640,9 +1006,25 @@ class Q35MoeFrontKernel(LowMMmaGemmKernel):
 
     # ------------------------------------------------------------------------------------------------- CTAs
     @cute.jit
-    def _gemm_cta(self, gA16: cute.Tensor, gB2: cute.Tensor, gC: cute.Tensor, ids_ptr: Int64, wts_ptr: Int64,
-                  tab_ptr: Int64, sync_ptr: Int64, trace_ptr: Int64, local_start: Int32, red: cute.Tensor, sm,
-                  copy_a16: cute.CopyAtom, copy_b2: cute.CopyAtom, tidx, cta, t_entry: Int64) -> None:
+    def _gemm_cta(
+        self,
+        gA16: cute.Tensor,
+        gB2: cute.Tensor,
+        gC: cute.Tensor,
+        ids_ptr: Int64,
+        wts_ptr: Int64,
+        tab_ptr: Int64,
+        sync_ptr: Int64,
+        trace_ptr: Int64,
+        local_start: Int32,
+        red: cute.Tensor,
+        sm,
+        copy_a16: cute.CopyAtom,
+        copy_b2: cute.CopyAtom,
+        tidx,
+        cta,
+        t_entry: Int64,
+    ) -> None:
         """The low-M router's BF16 CTA (LowMMmaGemmKernel._cta, BF16 segment, one tile, no split-K / swap), then
         the hand-off of its logits: SYNC_TICKET = arrival ticket (the last CTA routes); SYNC_STAGE = valid-tagged
         words into the staging buffer (the router CTA polls them)."""
@@ -701,8 +1083,11 @@ class Q35MoeFrontKernel(LowMMmaGemmKernel):
             value = value * alpha
             gC[out_row, n0 + out_col] = value.to(gC.element_type)
             if const_expr(self.sync_mode == SYNC_STAGE):
-                _st_b32(sync_ptr + (Int64(out_row) * Int64(self.num_experts) + Int64(n0 + out_col)) * Int64(4),
-                        _tagged_bf16(value))
+                _st_b32(
+                    sync_ptr
+                    + (Int64(out_row) * Int64(self.num_experts) + Int64(n0 + out_col)) * Int64(4),
+                    _tagged_bf16(value),
+                )
         cute.arch.sync_threads()
         t_out = Int64(0)
         if const_expr(self.trace):
@@ -721,8 +1106,19 @@ class Q35MoeFrontKernel(LowMMmaGemmKernel):
                 if tidx == 0:
                     self._stamp(trace_ptr, cta, 3, t_arrived)
             if arrived == Int32(self.gemm_ctas - 1):
-                self._route(gC, ids_ptr, wts_ptr, tab_ptr, sync_ptr, trace_ptr, local_start, sm, tidx, t_entry,
-                            t_arrived)
+                self._route(
+                    gC,
+                    ids_ptr,
+                    wts_ptr,
+                    tab_ptr,
+                    sync_ptr,
+                    trace_ptr,
+                    local_start,
+                    sm,
+                    tidx,
+                    t_entry,
+                    t_arrived,
+                )
         if const_expr(self.trace):
             if tidx == 0:
                 self._stamp(trace_ptr, cta, 0, t_entry)
@@ -734,8 +1130,19 @@ class Q35MoeFrontKernel(LowMMmaGemmKernel):
             _gdc_launch()
 
     @cute.jit
-    def _router_cta(self, gC: cute.Tensor, ids_ptr: Int64, wts_ptr: Int64, tab_ptr: Int64, sync_ptr: Int64,
-                    trace_ptr: Int64, local_start: Int32, sm, tidx, t_entry: Int64) -> None:
+    def _router_cta(
+        self,
+        gC: cute.Tensor,
+        ids_ptr: Int64,
+        wts_ptr: Int64,
+        tab_ptr: Int64,
+        sync_ptr: Int64,
+        trace_ptr: Int64,
+        local_start: Int32,
+        sm,
+        tidx,
+        t_entry: Int64,
+    ) -> None:
         """SYNC_STAGE: block 0 routes from the staging buffer as the router CTAs publish their logits."""
         if tidx < self.num_local:
             _st_shared(sm[0] + tidx * 4, Int32(0))  # token masks (shared memory, before the wait)
@@ -744,14 +1151,38 @@ class Q35MoeFrontKernel(LowMMmaGemmKernel):
         t_wait = Int64(0)
         if const_expr(self.trace):
             t_wait = _gtime()
-        self._route(gC, ids_ptr, wts_ptr, tab_ptr, sync_ptr, trace_ptr, local_start, sm, tidx, t_entry, t_wait)
+        self._route(
+            gC,
+            ids_ptr,
+            wts_ptr,
+            tab_ptr,
+            sync_ptr,
+            trace_ptr,
+            local_start,
+            sm,
+            tidx,
+            t_entry,
+            t_wait,
+        )
         if const_expr(self.use_pdl):
             _gdc_launch()
 
     # ------------------------------------------------------------------------------------------------- routing
     @cute.jit
-    def _route(self, gC: cute.Tensor, ids_ptr: Int64, wts_ptr: Int64, tab_ptr: Int64, sync_ptr: Int64,
-               trace_ptr: Int64, local_start: Int32, sm, tidx, t_entry: Int64, t_start: Int64) -> None:
+    def _route(
+        self,
+        gC: cute.Tensor,
+        ids_ptr: Int64,
+        wts_ptr: Int64,
+        tab_ptr: Int64,
+        sync_ptr: Int64,
+        trace_ptr: Int64,
+        local_start: Int32,
+        sm,
+        tidx,
+        t_entry: Int64,
+        t_start: Int64,
+    ) -> None:
         """Routing of every token and the tables (module doc), by the last GEMM CTA (SYNC_TICKET) or the router
         CTA (SYNC_STAGE)."""
         mask_addr, offs_addr, pick_addr = sm[0], sm[1], sm[2]
@@ -768,8 +1199,9 @@ class Q35MoeFrontKernel(LowMMmaGemmKernel):
         if const_expr(self.topk_mode == 0):
             self._tokens_v1(gC, ids_ptr, wts_ptr, local_start, mask_addr, pick_addr, warp, lane)
         else:
-            t_data, t_topk = self._tokens_v2(gC, ids_ptr, wts_ptr, sync_ptr, local_start, mask_addr, pick_addr,
-                                             warp, lane)
+            t_data, t_topk = self._tokens_v2(
+                gC, ids_ptr, wts_ptr, sync_ptr, local_start, mask_addr, pick_addr, warp, lane
+            )
         cute.arch.sync_threads()
         t_masks = Int64(0)
         if const_expr(self.trace):
@@ -810,16 +1242,25 @@ class Q35MoeFrontKernel(LowMMmaGemmKernel):
         cute.arch.sync_threads()
 
     @cute.jit
-    def _tokens_v1(self, gC: cute.Tensor, ids_ptr: Int64, wts_ptr: Int64, local_start: Int32, mask_addr: Int32,
-                   pick_addr: Int32, warp, lane) -> None:
+    def _tokens_v1(
+        self,
+        gC: cute.Tensor,
+        ids_ptr: Int64,
+        wts_ptr: Int64,
+        local_start: Int32,
+        mask_addr: Int32,
+        pick_addr: Int32,
+        warp,
+        lane,
+    ) -> None:
         """v1 token phase (ticket mode): a warp per token, re-max of the lane's 16 keys every round."""
         num_rows: cutlass.Constexpr = self.num_rows
         top_k: cutlass.Constexpr = self.top_k
         num_experts: cutlass.Constexpr = self.num_experts
         logits = Int64(gC.iterator.toint())
-        keys = cute.make_rmem_tensor(cute.make_layout((16, )), Int32)
-        sel = cute.make_rmem_tensor(cute.make_layout((top_k, )), Int32)
-        val = cute.make_rmem_tensor(cute.make_layout((top_k, )), Float32)
+        keys = cute.make_rmem_tensor(cute.make_layout((16,)), Int32)
+        sel = cute.make_rmem_tensor(cute.make_layout((top_k,)), Int32)
+        val = cute.make_rmem_tensor(cute.make_layout((top_k,)), Float32)
         for tok in cutlass.range(warp, num_rows, self.k_warps):
             src = logits + (Int64(tok) * Int64(num_experts) + Int64(lane) * Int64(16)) * Int64(2)
             a0, a1, a2, a3 = _ld_cg_v4(src)
@@ -843,11 +1284,23 @@ class Q35MoeFrontKernel(LowMMmaGemmKernel):
                     lmax = keys[0]
                     for j in cutlass.range_constexpr(15):
                         lmax = _max_u32(lmax, keys[j + 1])
-            self._finish_token(sel, val, ids_ptr, wts_ptr, local_start, mask_addr, pick_addr, tok, lane, True)
+            self._finish_token(
+                sel, val, ids_ptr, wts_ptr, local_start, mask_addr, pick_addr, tok, lane, True
+            )
 
     @cute.jit
-    def _tokens_v2(self, gC: cute.Tensor, ids_ptr: Int64, wts_ptr: Int64, sync_ptr: Int64, local_start: Int32,
-                   mask_addr: Int32, pick_addr: Int32, warp, lane):
+    def _tokens_v2(
+        self,
+        gC: cute.Tensor,
+        ids_ptr: Int64,
+        wts_ptr: Int64,
+        sync_ptr: Int64,
+        local_start: Int32,
+        mask_addr: Int32,
+        pick_addr: Int32,
+        warp,
+        lane,
+    ):
         """v2 token phase: tokens warp and warp + k_warps (when M > k_warps) interleaved; per token and lane the 16
         keys are bitonic-sorted once and each round pops the head of the lane that owned the maximum.
         Returns the trace stamps (logits in registers, top-k done) of warp 0 lane 0 (0 without trace)."""
@@ -863,11 +1316,15 @@ class Q35MoeFrontKernel(LowMMmaGemmKernel):
             tok1 = warp
             if const_expr(tpw == 2):
                 tok1 = _sel_lt(warp + self.k_warps, Int32(num_rows), warp + self.k_warps, warp)
-            words = cute.make_rmem_tensor(cute.make_layout((16 * tpw, )), Int32)
+            words = cute.make_rmem_tensor(cute.make_layout((16 * tpw,)), Int32)
             if const_expr(stage):
                 # poll the staging rows until every word carries the valid bit (bit 16), then clear them
-                src0 = sync_ptr + (Int64(warp) * Int64(num_experts) + Int64(lane) * Int64(16)) * Int64(4)
-                src1 = sync_ptr + (Int64(tok1) * Int64(num_experts) + Int64(lane) * Int64(16)) * Int64(4)
+                src0 = sync_ptr + (
+                    Int64(warp) * Int64(num_experts) + Int64(lane) * Int64(16)
+                ) * Int64(4)
+                src1 = sync_ptr + (
+                    Int64(tok1) * Int64(num_experts) + Int64(lane) * Int64(16)
+                ) * Int64(4)
                 pending = Int32(1)
                 while pending != 0:
                     for v in cutlass.range_constexpr(4):
@@ -901,7 +1358,9 @@ class Q35MoeFrontKernel(LowMMmaGemmKernel):
                     tk = warp
                     if const_expr(r == 1):
                         tk = tok1
-                    src = logits + (Int64(tk) * Int64(num_experts) + Int64(lane) * Int64(16)) * Int64(2)
+                    src = logits + (
+                        Int64(tk) * Int64(num_experts) + Int64(lane) * Int64(16)
+                    ) * Int64(2)
                     a0, a1, a2, a3 = _ld_cg_v4(src)
                     a4, a5, a6, a7 = _ld_cg_v4(src + Int64(16))
                     packed = (a0, a1, a2, a3, a4, a5, a6, a7)
@@ -912,7 +1371,7 @@ class Q35MoeFrontKernel(LowMMmaGemmKernel):
             if const_expr(self.trace):
                 t_data = _gtime_after(words[0])
             e0 = lane * 16
-            keys = cute.make_rmem_tensor(cute.make_layout((16 * tpw, )), Int32)
+            keys = cute.make_rmem_tensor(cute.make_layout((16 * tpw,)), Int32)
             for r in cutlass.range_constexpr(tpw):
                 for j in cutlass.range_constexpr(16):
                     keys[16 * r + j] = _key1(words[16 * r + j], e0 + j)
@@ -928,8 +1387,8 @@ class Q35MoeFrontKernel(LowMMmaGemmKernel):
                     else:
                         keys[16 * r + i] = lo
                         keys[16 * r + jj] = hi
-            sel = cute.make_rmem_tensor(cute.make_layout((top_k * tpw, )), Int32)
-            val = cute.make_rmem_tensor(cute.make_layout((top_k * tpw, )), Float32)
+            sel = cute.make_rmem_tensor(cute.make_layout((top_k * tpw,)), Int32)
+            val = cute.make_rmem_tensor(cute.make_layout((top_k * tpw,)), Float32)
             for k in cutlass.range_constexpr(top_k):
                 for r in cutlass.range_constexpr(tpw):
                     head = keys[16 * r]
@@ -939,32 +1398,69 @@ class Q35MoeFrontKernel(LowMMmaGemmKernel):
                     if const_expr(k < top_k - 1):
                         # pop: the owner lane's sorted keys move up by one (keys are unique)
                         for j in cutlass.range_constexpr(top_k - 1):
-                            keys[16 * r + j] = _sel_eq(head, g, keys[16 * r + j + 1], keys[16 * r + j])
+                            keys[16 * r + j] = _sel_eq(
+                                head, g, keys[16 * r + j + 1], keys[16 * r + j]
+                            )
             if const_expr(self.trace):
                 t_topk = _gtime_after(sel[top_k * tpw - 1])
             for r in cutlass.range_constexpr(tpw):
                 if const_expr(r == 0):
-                    self._finish_token_v2(sel, val, 0, ids_ptr, wts_ptr, local_start, mask_addr, pick_addr,
-                                          warp, lane, Int32(1))
+                    self._finish_token_v2(
+                        sel,
+                        val,
+                        0,
+                        ids_ptr,
+                        wts_ptr,
+                        local_start,
+                        mask_addr,
+                        pick_addr,
+                        warp,
+                        lane,
+                        Int32(1),
+                    )
                 else:
-                    self._finish_token_v2(sel, val, top_k, ids_ptr, wts_ptr, local_start, mask_addr, pick_addr,
-                                          tok1, lane, _sel_eq(tok1, warp, Int32(0), Int32(1)))
+                    self._finish_token_v2(
+                        sel,
+                        val,
+                        top_k,
+                        ids_ptr,
+                        wts_ptr,
+                        local_start,
+                        mask_addr,
+                        pick_addr,
+                        tok1,
+                        lane,
+                        _sel_eq(tok1, warp, Int32(0), Int32(1)),
+                    )
         return t_data, t_topk
 
     @cute.jit
-    def _finish_token_v2(self, sel: cute.Tensor, val: cute.Tensor, base: cutlass.Constexpr, ids_ptr: Int64,
-                         wts_ptr: Int64, local_start: Int32, mask_addr: Int32, pick_addr: Int32, tok, lane,
-                         active) -> None:
+    def _finish_token_v2(
+        self,
+        sel: cute.Tensor,
+        val: cute.Tensor,
+        base: cutlass.Constexpr,
+        ids_ptr: Int64,
+        wts_ptr: Int64,
+        local_start: Int32,
+        mask_addr: Int32,
+        pick_addr: Int32,
+        tok,
+        lane,
+        active,
+    ) -> None:
         """Renormalization (route kernel arithmetic) of one token's picks sel / val [base, base + K), lane k stores
         pick k (id, BF16 weight) and records a local pick in the token masks; nothing when not ``active``."""
         top_k: cutlass.Constexpr = self.top_k
         num_local: cutlass.Constexpr = self.num_local
         vmax = val[base]
-        ex = cute.make_rmem_tensor(cute.make_layout((top_k, )), Float32)
+        ex = cute.make_rmem_tensor(cute.make_layout((top_k,)), Float32)
         for k in cutlass.range_constexpr(top_k):
             ex[k] = _exp_tr(_sub(val[base + k], vmax))
-        ssum = _add(_add(_add(_add(ex[0], ex[8]), ex[4]), _add(ex[2], ex[6])),
-                    _add(_add(_add(ex[1], ex[9]), ex[5]), _add(ex[3], ex[7])))
+        ssum = _add(
+            _add(_add(_add(ex[0], ex[8]), ex[4]), _add(ex[2], ex[6])),
+            _add(_add(_add(ex[1], ex[9]), ex[5]), _add(ex[3], ex[7])),
+        )
         my_sel = sel[base]
         my_e = ex[0]
         for k in cutlass.range_constexpr(top_k - 1):
@@ -982,10 +1478,22 @@ class Q35MoeFrontKernel(LowMMmaGemmKernel):
                 _st_shared(pick_addr + (tok * top_k + lane) * 4, pick)
 
     @cute.jit
-    def _finish_token(self, sel: cute.Tensor, val: cute.Tensor, ids_ptr: Int64, wts_ptr: Int64, local_start: Int32,
-                      mask_addr: Int32, pick_addr: Int32, tok, lane, active) -> None:
-        self._finish_token_v2(sel, val, 0, ids_ptr, wts_ptr, local_start, mask_addr, pick_addr, tok, lane,
-                              Int32(1))
+    def _finish_token(
+        self,
+        sel: cute.Tensor,
+        val: cute.Tensor,
+        ids_ptr: Int64,
+        wts_ptr: Int64,
+        local_start: Int32,
+        mask_addr: Int32,
+        pick_addr: Int32,
+        tok,
+        lane,
+        active,
+    ) -> None:
+        self._finish_token_v2(
+            sel, val, 0, ids_ptr, wts_ptr, local_start, mask_addr, pick_addr, tok, lane, Int32(1)
+        )
 
     @cute.jit
     def _tables_warp(self, tab_ptr: Int64, mask_addr: Int32, offs_addr: Int32, lane) -> None:
@@ -995,8 +1503,8 @@ class Q35MoeFrontKernel(LowMMmaGemmKernel):
         num_local: cutlass.Constexpr = self.num_local
         tile: cutlass.Constexpr = self.tile
         epl: cutlass.Constexpr = num_local // 32
-        cnt = cute.make_rmem_tensor(cute.make_layout((epl, )), Int32)
-        nct = cute.make_rmem_tensor(cute.make_layout((epl, )), Int32)
+        cnt = cute.make_rmem_tensor(cute.make_layout((epl,)), Int32)
+        nct = cute.make_rmem_tensor(cute.make_layout((epl,)), Int32)
         e0 = lane * epl
         total = Int32(0)
         for j in cutlass.range_constexpr(epl):
@@ -1014,16 +1522,27 @@ class Q35MoeFrontKernel(LowMMmaGemmKernel):
                 if Int32(c) < nct[j]:
                     cta_i = offs + Int32(c)
                     _st_b32(tab_ptr + Int64(self.off_cte + cta_i) * Int64(4), e)
-                    _st_b32(tab_ptr + Int64(self.off_ctl + cta_i) * Int64(4),
-                            cutlass.min((cta_i + 1) * Int32(tile), offs * Int32(tile) + cnt[j]))
+                    _st_b32(
+                        tab_ptr + Int64(self.off_ctl + cta_i) * Int64(4),
+                        cutlass.min((cta_i + 1) * Int32(tile), offs * Int32(tile) + cnt[j]),
+                    )
             offs = offs + nct[j]
         if lane == 31:
             _st_b32(tab_ptr + Int64(self.off_nct) * Int64(4), incl)
             _st_b32(tab_ptr + Int64(self.off_npd) * Int64(4), incl * Int32(tile))
 
     @cute.jit
-    def _quant_cta(self, gA16: cute.Tensor, gs_ptr: Int64, xq_ptr: Int64, xsf_ptr: Int64, trace_ptr: Int64, tidx,
-                   qcta, t_entry: Int64) -> None:
+    def _quant_cta(
+        self,
+        gA16: cute.Tensor,
+        gs_ptr: Int64,
+        xq_ptr: Int64,
+        xsf_ptr: Int64,
+        trace_ptr: Int64,
+        tidx,
+        qcta,
+        t_entry: Int64,
+    ) -> None:
         """NVFP4 quantization of x, one 16-element block per thread (linear scale layout)."""
         bpr: cutlass.Constexpr = self.blocks_per_row
         gs = _ld_f32(gs_ptr)  # static (the experts' input scale): before the wait
@@ -1036,7 +1555,9 @@ class Q35MoeFrontKernel(LowMMmaGemmKernel):
         if b < self.num_rows * bpr:
             row = b // bpr
             cb = b % bpr
-            src = Int64(gA16.iterator.toint()) + (Int64(row) * Int64(self.a_stride) + Int64(cb) * Int64(16)) * Int64(2)
+            src = Int64(gA16.iterator.toint()) + (
+                Int64(row) * Int64(self.a_stride) + Int64(cb) * Int64(16)
+            ) * Int64(2)
             w0, w1, w2, w3 = _ld_v4(src)
             w4, w5, w6, w7 = _ld_v4(src + Int64(16))
             lo, hi, sf = _nvfp4_block(w0, w1, w2, w3, w4, w5, w6, w7, gs)

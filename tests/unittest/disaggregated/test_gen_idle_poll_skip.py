@@ -254,7 +254,9 @@ def test_consensus_outcome_reports_all_idle() -> None:
         ("1", False, 1, 1, False, False),
     ],
 )
-def test_skip_applies_only_to_replicated_tp(monkeypatch, env, adp, pp, cp, need_sync, expected) -> None:
+def test_skip_applies_only_to_replicated_tp(
+    monkeypatch, env, adp, pp, cp, need_sync, expected
+) -> None:
     if env is None:
         monkeypatch.delenv("TRTLLM_DISAGG_GEN_IDLE_POLL_SKIP", raising=False)
     else:
@@ -284,11 +286,14 @@ def _make_receiving_rank(collective: _Collective, rank: int) -> KvCacheTransceiv
 
 
 def test_staggered_transfers_keep_lockstep_and_agreed_flag() -> None:
-    """b4-like traffic on 4 ranks: receives requested in the same iteration on every rank (as the TP scheduler
+    """Staggered transfers keep the ranks in lockstep and agree on the idle flag.
+
+    b4-like traffic on 4 ranks: receives requested in the same iteration on every rank (as the TP scheduler
     does), each rank's shard finishing in a different round, a new receive arriving while others are in flight
     and one in the round the last session retires. Every round must keep the ranks in lockstep (the barrier
     allgather breaks otherwise), report the same completions on every rank, and leave the same agreed flag
-    everywhere; the flag is set only after a round in which no rank held a session."""
+    everywhere; the flag is set only after a round in which no rank held a session.
+    """
     world = 4
     collective = _Collective(world)
     ranks = [_make_receiving_rank(collective, r) for r in range(world)]

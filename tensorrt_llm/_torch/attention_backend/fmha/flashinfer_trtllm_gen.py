@@ -236,8 +236,11 @@ _Q35_ATTN_CP = os.environ.get("TRTLLM_Q35_ATTN_CP", "0") == "1"
 # TRTLLM_Q35_ATTN_CP_MIN_BATCH (default 2 at every layout): the segmented path wins at b1 at TP8 and at TP16 (8-rank
 # microbenchmark seg16 31.5 vs CP 36.4 us/call at 196k; CP is also slower in-model at TEP16 b1).
 try:
-    _Q35_ATTN_CP_MIN_BATCH = (int(os.environ["TRTLLM_Q35_ATTN_CP_MIN_BATCH"])
-                              if "TRTLLM_Q35_ATTN_CP_MIN_BATCH" in os.environ else None)
+    _Q35_ATTN_CP_MIN_BATCH = (
+        int(os.environ["TRTLLM_Q35_ATTN_CP_MIN_BATCH"])
+        if "TRTLLM_Q35_ATTN_CP_MIN_BATCH" in os.environ
+        else None
+    )
     _Q35_ATTN_CP_MAX_BATCH = int(os.environ.get("TRTLLM_Q35_ATTN_CP_MAX_BATCH", "8"))
 except ValueError:
     _Q35_ATTN_CP_MIN_BATCH, _Q35_ATTN_CP_MAX_BATCH = None, 8
@@ -246,6 +249,8 @@ except ValueError:
 def _q35_cp_min_batch(cp_group_size: int) -> int:
     del cp_group_size  # unused: the threshold is 2 at both TP8 and TP16
     return 2 if _Q35_ATTN_CP_MIN_BATCH is None else _Q35_ATTN_CP_MIN_BATCH
+
+
 _Q35_ATTN_CP_SEGMENTS_ENV = os.environ.get("TRTLLM_Q35_ATTN_CP_SEGMENTS", "auto")
 
 
@@ -290,7 +295,9 @@ Q35_KV_APPEND_CHECK_STATS = {"calls": 0, "mismatches": 0}
 class Q35FoldInputs:
     """Raw inputs of the qk-norm / RoPE / gate / KV-append prologue for TRTLLM_Q35_ATTN_FOLD (see q35_fold_inputs)."""
 
-    qkv: torch.Tensor  # raw QKV projection [num_tokens, (2 * Hq + 2 * Hkv) * D] bf16 ((q, gate) per head, K, V)
+    qkv: (
+        torch.Tensor
+    )  # raw QKV projection [num_tokens, (2 * Hq + 2 * Hkv) * D] bf16 ((q, gate) per head, K, V)
     q_weight: torch.Tensor
     k_weight: torch.Tensor
     cos_sin: torch.Tensor
@@ -356,7 +363,9 @@ def _q35_fused_buffers(device: torch.device, sm_count: int, capturing: bool):
     bufs = _Q35_FUSED_BUFFERS.get(key)
     if bufs is None:
         if capturing:
-            raise RuntimeError("The Q35 fused-decode workspace must be allocated before CUDA graph capture.")
+            raise RuntimeError(
+                "The Q35 fused-decode workspace must be allocated before CUDA graph capture."
+            )
         ws = torch.zeros(q35_fused_workspace_floats(sm_count), dtype=torch.float32, device=device)
         # grid-barrier epoch counters: row b serves batch b; zero once, never reset (the kernel keeps them consistent)
         cnt = torch.zeros(_Q35_ATTN_FUSED_MAX_BATCH + 1, 8, dtype=torch.int64, device=device)
@@ -1128,7 +1137,9 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             self._q35_counter_buffer is None or self._q35_counter_buffer.device != q.device
         ):
             if metadata.is_cuda_graph and torch.cuda.is_current_stream_capturing():
-                raise RuntimeError("The Q35 segmented-attention counter buffer must be allocated before capture.")
+                raise RuntimeError(
+                    "The Q35 segmented-attention counter buffer must be allocated before capture."
+                )
             self._q35_counter_buffer = torch.zeros(
                 _Q35_COUNTER_SLOTS, dtype=torch.int32, device=q.device
             )
@@ -1377,8 +1388,12 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         fwd = params.fwd
         consts = self.__dict__.get("_q35_ctx_consts")
         if consts is None or consts[0] is not attn:
-            consts = (attn, self._get_bmm1_scale(attn), self._get_attention_chunk_size(attn),
-                      QuantMode(attn.quant_mode).has_fp4_kv_cache())
+            consts = (
+                attn,
+                self._get_bmm1_scale(attn),
+                self._get_attention_chunk_size(attn),
+                QuantMode(attn.quant_mode).has_fp4_kv_cache(),
+            )
             self._q35_ctx_consts = consts
         _, bmm1_scale_static, attention_chunk_size, has_fp4_kv = consts
         rope_params = attn.rope_params
@@ -1445,8 +1460,11 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             raise RuntimeError("trtllm-gen FP4 KV cache requires KV scale pool.")
         if has_fp4_kv or params.fp8_context_fmha:
             shape = (params.num_tokens, attn.num_heads, attn.head_dim)
-            if (q_processed.dtype == torch.uint8 and tuple(q_processed.shape) == shape
-                    and q_processed.is_contiguous()):
+            if (
+                q_processed.dtype == torch.uint8
+                and tuple(q_processed.shape) == shape
+                and q_processed.is_contiguous()
+            ):
                 q_processed = q_processed.view(torch.float8_e4m3fn)
             else:
                 q_processed = (
@@ -1603,9 +1621,12 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             _Q35_ATTN_CP
             and q35_cp_group is not None
             and not (_Q35_ATTN_CP_SKIP_MTP and getattr(attn, "q35_is_mtp", False))
-            and _q35_cp_min_batch(len(q35_cp_group)) <= params.num_requests <= _Q35_ATTN_CP_MAX_BATCH
+            and _q35_cp_min_batch(len(q35_cp_group))
+            <= params.num_requests
+            <= _Q35_ATTN_CP_MAX_BATCH
             and self._q35_cp_exchange_ok(attn, len(q35_cp_group))
-            and params.num_tokens * attn.num_heads * (attn.head_dim * 2 + 4) <= _Q35_CP_MAX_PAIR_BYTES
+            and params.num_tokens * attn.num_heads * (attn.head_dim * 2 + 4)
+            <= _Q35_CP_MAX_PAIR_BYTES
             and meta.num_contexts == 0
             and not is_multi_token_gen
             and not has_fp4_kv
@@ -2148,7 +2169,9 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         if gate is not None:
             gate = gate[:rows] if gate.shape[0] >= rows else None
         run_func = flashinfer.decode.get_trtllm_gen_fmha_module().trtllm_paged_attention_decode
-        bmm1_arg = _get_bmm1_scale_log2(bmm1_scale) if isinstance(bmm1_scale, torch.Tensor) else bmm1_scale
+        bmm1_arg = (
+            _get_bmm1_scale_log2(bmm1_scale) if isinstance(bmm1_scale, torch.Tensor) else bmm1_scale
+        )
         sm_count = flashinfer.decode.get_device_sm_count(dev)
         ex = None
         if not _Q35_ATTN_CP_NCCL and getattr(attn, "q35_cp_mapping", None) is not None:
@@ -2467,7 +2490,14 @@ def q35_fold_inputs(
         plan.kv_pool.dtype,
         lib._multi_processor_count,
     ) or not q35_fused_decode_fold_supported(
-        attn.num_heads, attn.num_kv_heads, attn.head_dim, rotary_dim, plan.q_len, qkv, positions, cos_sin
+        attn.num_heads,
+        attn.num_kv_heads,
+        attn.head_dim,
+        rotary_dim,
+        plan.q_len,
+        qkv,
+        positions,
+        cos_sin,
     ):
         return None
     if not (

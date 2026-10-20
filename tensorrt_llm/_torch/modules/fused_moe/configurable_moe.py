@@ -363,6 +363,7 @@ class ConfigurableMoE(MoE):
             # TRTLLM_Q35_MOE_DEA (default off): replicate all experts' MoE-TP shards on the
             # backend (dynamic expert assignment); no-op otherwise.
             from .q35_fused_front import q35_dea_setup
+
             q35_dea_setup(self, self.backend)
 
         # Sync done -- now the backend has enough info to allocate weight

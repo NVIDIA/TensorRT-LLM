@@ -120,7 +120,9 @@ def spec_store_scatter(
     ):
         raise ValueError("spec store scatter: host outputs must have the store layouts")
     host_new, host_lens, host_draft = (
-        host_out if host_out is not None else (store_new_tokens, store_new_tokens_lens, store_next_draft_tokens)
+        host_out
+        if host_out is not None
+        else (store_new_tokens, store_new_tokens_lens, store_next_draft_tokens)
     )
     _spec_store_scatter_kernel[(requests,)](
         slots,

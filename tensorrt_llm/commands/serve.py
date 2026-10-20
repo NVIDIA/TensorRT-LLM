@@ -557,8 +557,7 @@ def _bind_affinity_port(host: str, affinity_port: int, address_family: int,
 
 
 def _bind_frontend_affinity_sockets(
-    host: str, port: int, address_family: int,
-    multi_frontend: MultiFrontendMode
+    host: str, port: int, address_family: int, multi_frontend: MultiFrontendMode
 ) -> Tuple[Optional[socket.socket], Dict[int, socket.socket]]:
     """Listening sockets for the per-frontend affinity ports.
 
@@ -609,7 +608,8 @@ def _bind_frontend_affinity_sockets(
             f"(net.ipv4.ip_local_port_range). They are bound before the "
             f"executor starts, but another process on this node can still "
             f"hold one{hint} (change TRTLLM_FRONTEND_AFFINITY_PORT_STRIDE and "
-            f"the orchestrator's TRTLLM_DISAGG_CTX_FRONTEND_AFFINITY together).")
+            f"the orchestrator's TRTLLM_DISAGG_CTX_FRONTEND_AFFINITY together)."
+        )
     sockets = {}
     try:
         for frontend_id, affinity_port in enumerate(ports):

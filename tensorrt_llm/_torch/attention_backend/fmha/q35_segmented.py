@@ -118,8 +118,11 @@ def _q35_seg_prep_kernel(
     src_p = tl.where(valid, s * seg_pages + p, 0)
     m1 = (p < P_SEG) & (((p < seg_pages) & (src_p < n_pages)) | ((~valid) & (p == 0)))
     m = (kv[:, None] < 2) & m1[None, :]
-    vals = tl.load(table + r.to(tl.int64) * table_stride_req + kv[:, None] * table_stride_kv + src_p[None, :],
-                   mask=m, other=0)
+    vals = tl.load(
+        table + r.to(tl.int64) * table_stride_req + kv[:, None] * table_stride_kv + src_p[None, :],
+        mask=m,
+        other=0,
+    )
     if LAUNCH_WITH_PDL:
         # q is written by the QKV preprocessing kernel right before this one.
         _gdc_wait_with_memory_clobber()
@@ -146,9 +149,29 @@ def _q35_seg_prep_kernel(
 
 
 @triton.jit
-def _seg_draft_block(q, q_stride_tok, q_stride_head, kv_pool, blk_k, blk_v, off, jmask, row, head, kvh, bmm1_ptr,
-                     bmm1_val, bmm2_ptr, bmm2_val, d, HKV: tl.constexpr, PAGE: tl.constexpr, D: tl.constexpr,
-                     HAS_BMM1_PTR: tl.constexpr, HAS_BMM2_PTR: tl.constexpr):
+def _seg_draft_block(
+    q,
+    q_stride_tok,
+    q_stride_head,
+    kv_pool,
+    blk_k,
+    blk_v,
+    off,
+    jmask,
+    row,
+    head,
+    kvh,
+    bmm1_ptr,
+    bmm1_val,
+    bmm2_ptr,
+    bmm2_val,
+    d,
+    HKV: tl.constexpr,
+    PAGE: tl.constexpr,
+    D: tl.constexpr,
+    HAS_BMM1_PTR: tl.constexpr,
+    HAS_BMM2_PTR: tl.constexpr,
+):
     """(O, base-2 LSE) of one query row over the causal q_len x q_len draft block, fp32 from the FP8 q / K / V."""
     if HAS_BMM1_PTR:
         bmm1 = tl.load(bmm1_ptr).to(tl.float32)
@@ -244,23 +267,67 @@ def _q35_seg_merge_kernel(
     smask = (sv < S) & (n_s > 0)
     if DRAFT_PRE_WAIT:
         # ---- the draft block and the gate overlap the FMHA (see _DRAFT_PRE_WAIT) ----
-        o_suf, lse_suf = _seg_draft_block(q, q_stride_tok, q_stride_head, kv_pool, blk_k, blk_v, off, jmask, row,
-                                          head, kvh, bmm1_ptr, bmm1_val, bmm2_ptr, bmm2_val, d, HKV, PAGE, D,
-                                          HAS_BMM1_PTR, HAS_BMM2_PTR)
+        o_suf, lse_suf = _seg_draft_block(
+            q,
+            q_stride_tok,
+            q_stride_head,
+            kv_pool,
+            blk_k,
+            blk_v,
+            off,
+            jmask,
+            row,
+            head,
+            kvh,
+            bmm1_ptr,
+            bmm1_val,
+            bmm2_ptr,
+            bmm2_val,
+            d,
+            HKV,
+            PAGE,
+            D,
+            HAS_BMM1_PTR,
+            HAS_BMM2_PTR,
+        )
         if HAS_GATE:
-            gv = tl.load(gate + row.to(tl.int64) * gate_stride_tok + head * gate_stride_head + d).to(tl.float32)
+            gv = tl.load(
+                gate + row.to(tl.int64) * gate_stride_tok + head * gate_stride_head + d
+            ).to(tl.float32)
     if LAUNCH_WITH_PDL:
         # Segment outputs / LSE and scales come from the preceding kernels, q and the draft K/V from the QKV
         # preprocessing.
         _gdc_wait_with_memory_clobber()
     # ---- post-wait: everything in one round trip ----
     if not DRAFT_PRE_WAIT:
-        o_suf, lse_suf = _seg_draft_block(q, q_stride_tok, q_stride_head, kv_pool, blk_k, blk_v, off, jmask, row,
-                                          head, kvh, bmm1_ptr, bmm1_val, bmm2_ptr, bmm2_val, d, HKV, PAGE, D,
-                                          HAS_BMM1_PTR, HAS_BMM2_PTR)
+        o_suf, lse_suf = _seg_draft_block(
+            q,
+            q_stride_tok,
+            q_stride_head,
+            kv_pool,
+            blk_k,
+            blk_v,
+            off,
+            jmask,
+            row,
+            head,
+            kvh,
+            bmm1_ptr,
+            bmm1_val,
+            bmm2_ptr,
+            bmm2_val,
+            d,
+            HKV,
+            PAGE,
+            D,
+            HAS_BMM1_PTR,
+            HAS_BMM2_PTR,
+        )
     seg_rows = (r * S + sv).to(tl.int64) * HH + hh
     lse_s = tl.load(seg_lse + seg_rows, mask=smask, other=float("-inf"))
-    o_s = tl.load(seg_out + seg_rows[:, None] * D + d[None, :], mask=smask[:, None], other=0.0).to(tl.float32)
+    o_s = tl.load(seg_out + seg_rows[:, None] * D + d[None, :], mask=smask[:, None], other=0.0).to(
+        tl.float32
+    )
 
     m_all = tl.maximum(tl.max(lse_s, axis=0), lse_suf)
     w_s = tl.where(smask, tl.exp2(lse_s - m_all), 0.0)
@@ -270,7 +337,9 @@ def _q35_seg_merge_kernel(
     if HAS_GATE:
         # Same arithmetic as the separate _fused_sigmoid_mul_kernel: rounded attention output x sigmoid(gate) in fp32.
         if not DRAFT_PRE_WAIT:
-            gv = tl.load(gate + row.to(tl.int64) * gate_stride_tok + head * gate_stride_head + d).to(tl.float32)
+            gv = tl.load(
+                gate + row.to(tl.int64) * gate_stride_tok + head * gate_stride_head + d
+            ).to(tl.float32)
         res = (res.to(tl.float32) * tl.sigmoid(gv)).to(out.dtype.element_ty)
     tl.store(out + row.to(tl.int64) * out_stride_tok + head * out_stride_head + d, res)
     if LAUNCH_WITH_PDL and not EARLY_TRIGGER:
@@ -344,7 +413,8 @@ def q35_segmented_decode(
     assert block_tables.dim() == 3 and block_tables.shape[1] == 2 and block_tables.stride(-1) == 1
     assert out.stride(-1) == 1 and q.stride(-1) == 1
     assert counter.numel() * counter.element_size() >= 4 * max(b * S * HH, sm_count), (
-        "multi-CTA counter buffer too small for the segmented call")
+        "multi-CTA counter buffer too small for the segmented call"
+    )
     max_pages = math.ceil(max(max_kv_len, 1) / page)
     p_seg = math.ceil(max_pages / S) + 1
     dev = q.device

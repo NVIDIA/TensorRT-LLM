@@ -2456,7 +2456,8 @@ class _WideBoundaryMergingTokenizer(_BoundaryMergingTokenizer):
 @pytest.mark.asyncio
 async def test_ctx_frontend_uses_shared_incremental_tokenizer():
     """CTX frontend tokenization must exercise the same cache as router tokenization."""
-    from tensorrt_llm.serve.chat_tokenization import IncrementalTokenizationCache
+    from tensorrt_llm.serve.chat_tokenization import \
+        IncrementalTokenizationCache
     from tensorrt_llm.serve.openai_server import OpenAIServer
 
     tokenizer = _BoundaryMergingTokenizer()
@@ -2467,8 +2468,12 @@ async def test_ctx_frontend_uses_shared_incremental_tokenizer():
     server._input_proc_executor = None
     request = ChatCompletionRequest(
         model="mock",
-        messages=[{"role": "user", "content": "next request"}],
-        conversation_params=ConversationParams(conversation_id="agentic-session"),
+        messages=[{
+            "role": "user",
+            "content": "next request"
+        }],
+        conversation_params=ConversationParams(
+            conversation_id="agentic-session"),
     )
 
     common = "stable-prefix<|im_end|>\n<|im_start|>assistant"

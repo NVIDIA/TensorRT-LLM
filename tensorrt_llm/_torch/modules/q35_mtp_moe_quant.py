@@ -110,20 +110,33 @@ def _calib_buffers(device, layer_idx: int):
         if torch.cuda.is_current_stream_capturing():
             return None
         # [x amax, routed h amax, all-local h amax, calls, rows, routed pairs, x rows over thr..., pairs over thr...]
-        st = torch.zeros(6 + len(_CALIB_X_THR) + len(_CALIB_H_THR), dtype=torch.float64, device=device)
+        st = torch.zeros(
+            6 + len(_CALIB_X_THR) + len(_CALIB_H_THR), dtype=torch.float64, device=device
+        )
         _calib_state[key] = st
-        if ("thr", device) not in _calib_state:  # created outside graph capture (no H2D copy while capturing)
-            _calib_state[("thr", device)] = (torch.tensor(_CALIB_X_THR, dtype=torch.float64, device=device),
-                                             torch.tensor(_CALIB_H_THR, dtype=torch.float64, device=device))
+        if (
+            "thr",
+            device,
+        ) not in _calib_state:  # created outside graph capture (no H2D copy while capturing)
+            _calib_state[("thr", device)] = (
+                torch.tensor(_CALIB_X_THR, dtype=torch.float64, device=device),
+                torch.tensor(_CALIB_H_THR, dtype=torch.float64, device=device),
+            )
         if not _calib_state.get("_atexit"):
             import atexit
+
             atexit.register(mtp_moe_calib_dump)
             _calib_state["_atexit"] = True
     return st
 
 
-def mtp_moe_calib_record(layer_idx: Optional[int], experts, x: torch.Tensor, router_logits: Optional[torch.Tensor],
-                         top_k: int) -> None:
+def mtp_moe_calib_record(
+    layer_idx: Optional[int],
+    experts,
+    x: torch.Tensor,
+    router_logits: Optional[torch.Tensor],
+    top_k: int,
+) -> None:
     """Record one MoE call (``x`` [M, H] the MoE input; ``router_logits`` [M, E] or None = input only)."""
     if layer_idx is None or x.dim() != 2 or x.shape[0] == 0:
         return
@@ -136,7 +149,7 @@ def mtp_moe_calib_record(layer_idx: Optional[int], experts, x: torch.Tensor, rou
     st[0] = torch.maximum(st[0], xr.amax())
     st[3] += 1
     st[4] += x.shape[0]
-    st[6:6 + nx] += (xr[:, None] > thr_x).sum(dim=0)
+    st[6 : 6 + nx] += (xr[:, None] > thr_x).sum(dim=0)
     backend = getattr(experts, "backend", experts)
     w31 = getattr(backend, "w3_w1_weight", None)
     if router_logits is None or w31 is None or w31.dtype != torch.bfloat16 or w31.dim() != 3:
@@ -146,28 +159,37 @@ def mtp_moe_calib_record(layer_idx: Optional[int], experts, x: torch.Tensor, rou
     start = int(getattr(backend, "slot_start", 0))
     w = w31.view(e_local * two_i, h)
     for c in range(0, x.shape[0], 128):
-        xc = x[c:c + 128]
+        xc = x[c : c + 128]
         gu = torch.matmul(xc, w.t()).float().view(xc.shape[0], e_local, 2, inter)
         # rows [w3; w1]: up first, gate second
-        hmax = (torch.nn.functional.silu(gu[:, :, 1]) * gu[:, :, 0]).abs().amax(dim=-1)  # [m, E_local]
-        lid = router_logits[c:c + 128].float().topk(top_k, dim=-1).indices - start
+        hmax = (
+            (torch.nn.functional.silu(gu[:, :, 1]) * gu[:, :, 0]).abs().amax(dim=-1)
+        )  # [m, E_local]
+        lid = router_logits[c : c + 128].float().topk(top_k, dim=-1).indices - start
         valid = (lid >= 0) & (lid < e_local)
         routed = (hmax.gather(1, lid.clamp(0, e_local - 1)) * valid).double()  # [m, K]
         st[1] = torch.maximum(st[1], routed.amax())
         st[2] = torch.maximum(st[2], hmax.amax().double())
         st[5] += valid.sum()
-        st[6 + nx:] += (routed.reshape(-1)[:, None] > thr_h).sum(dim=0)
+        st[6 + nx :] += (routed.reshape(-1)[:, None] > thr_h).sum(dim=0)
         # per-call ring of (rows, x amax, routed h amax) for the BF16-expert layers (distribution; the warmup's
         # calls come first and can be dropped offline)
         ring = _calib_state.get(("ring", x.device, int(layer_idx)))
         if ring is None and not torch.cuda.is_current_stream_capturing():
-            ring = (torch.zeros((_CALIB_RING, 3), dtype=torch.float32, device=x.device),
-                    torch.zeros((1, ), dtype=torch.int64, device=x.device))
+            ring = (
+                torch.zeros((_CALIB_RING, 3), dtype=torch.float32, device=x.device),
+                torch.zeros((1,), dtype=torch.int64, device=x.device),
+            )
             _calib_state[("ring", x.device, int(layer_idx))] = ring
         if ring is not None:
             buf, cnt = ring
-            row = torch.stack([torch.full((), float(xc.shape[0]), device=x.device),
-                               xr[c:c + 128].amax().float(), routed.amax().float()])
+            row = torch.stack(
+                [
+                    torch.full((), float(xc.shape[0]), device=x.device),
+                    xr[c : c + 128].amax().float(),
+                    routed.amax().float(),
+                ]
+            )
             buf.index_copy_(0, torch.remainder(cnt, _CALIB_RING), row[None])
             cnt.add_(1)
 
@@ -177,6 +199,7 @@ def mtp_moe_calib_dump() -> None:
     if path is None:
         return
     import json
+
     rank = os.environ.get("OMPI_COMM_WORLD_RANK", os.environ.get("SLURM_PROCID", "0"))
     nx = len(_CALIB_X_THR)
     out = {"x_thresholds": list(_CALIB_X_THR), "h_thresholds": list(_CALIB_H_THR), "layers": {}}
@@ -185,13 +208,23 @@ def mtp_moe_calib_dump() -> None:
             continue
         v = st.tolist()
         out["layers"][str(key[1])] = {
-            "x_amax": v[0], "h_amax_routed": v[1], "h_amax_all_local": v[2], "calls": v[3], "rows": v[4],
-            "routed_pairs": v[5], "x_rows_over": v[6:6 + nx], "h_pairs_over": v[6 + nx:]}
+            "x_amax": v[0],
+            "h_amax_routed": v[1],
+            "h_amax_all_local": v[2],
+            "calls": v[3],
+            "rows": v[4],
+            "routed_pairs": v[5],
+            "x_rows_over": v[6 : 6 + nx],
+            "h_pairs_over": v[6 + nx :],
+        }
     try:
         with open(path.replace("{rank}", str(rank)), "w") as f:
             json.dump(out, f)
-        rings = {str(k[2]): (b.cpu(), int(c.item())) for k, (b, c) in _calib_state.items()
-                 if isinstance(k, tuple) and k[0] == "ring"}
+        rings = {
+            str(k[2]): (b.cpu(), int(c.item()))
+            for k, (b, c) in _calib_state.items()
+            if isinstance(k, tuple) and k[0] == "ring"
+        }
         if rings:
             torch.save(rings, path.replace("{rank}", str(rank)).rsplit(".", 1)[0] + "_ring.pt")
     except (OSError, RuntimeError):
@@ -218,8 +251,10 @@ def mtp_moe_quant_guard(mode: Optional[str]) -> List[str]:
         if not t:
             continue
         if t not in _GUARD_TENSORS:
-            raise ValueError(f"{ENV_MTP_MOE_QUANT_GUARD}={v!r}: unknown tensor {t!r}, expected a comma list of "
-                             f"{tuple(_GUARD_TENSORS)} or 0 / all")
+            raise ValueError(
+                f"{ENV_MTP_MOE_QUANT_GUARD}={v!r}: unknown tensor {t!r}, expected a comma list of "
+                f"{tuple(_GUARD_TENSORS)} or 0 / all"
+            )
         if _GUARD_TENSORS[t] not in names:
             names.append(_GUARD_TENSORS[t])
     return names
@@ -260,8 +295,11 @@ def quant_config_for(mode: str, kv_cache_quant_algo=None):
     from tensorrt_llm.quantization.mode import QuantAlgo
 
     if mode == "nvfp4":
-        return QuantConfig(quant_algo=QuantAlgo.NVFP4, kv_cache_quant_algo=kv_cache_quant_algo,
-                           group_size=NVFP4_BLOCK)
+        return QuantConfig(
+            quant_algo=QuantAlgo.NVFP4,
+            kv_cache_quant_algo=kv_cache_quant_algo,
+            group_size=NVFP4_BLOCK,
+        )
     algo = {"fp8block": QuantAlgo.FP8_BLOCK_SCALES, "mxfp4": QuantAlgo.W4A16_MXFP4}[mode]
     return QuantConfig(quant_algo=algo, kv_cache_quant_algo=kv_cache_quant_algo)
 
@@ -273,7 +311,9 @@ def mtp_moe_nvfp4_amax() -> Tuple[float, float]:
         return DEFAULT_MTP_MOE_NVFP4_AMAX
     parts = [float(t) for t in v.split(",")]
     if len(parts) != 2 or not all(p > 0 for p in parts):
-        raise ValueError(f"{ENV_MTP_MOE_NVFP4_AMAX}={v!r}: expected two positive floats '<fc1>,<fc2>'")
+        raise ValueError(
+            f"{ENV_MTP_MOE_NVFP4_AMAX}={v!r}: expected two positive floats '<fc1>,<fc2>'"
+        )
     return parts[0], parts[1]
 
 
@@ -313,8 +353,10 @@ def quantize_mxfp4(w: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     # nearest magnitude; ties -> even code (the lower code when the code is odd)
     dist = (mag[..., None] - grid).abs()
     code = dist.argmin(dim=-1)  # first minimum = lower code on ties
-    tie = torch.isclose(dist.gather(-1, code[..., None]).squeeze(-1),
-                        dist.gather(-1, (code + 1).clamp(max=7)[..., None]).squeeze(-1)) & (code < 7)
+    tie = torch.isclose(
+        dist.gather(-1, code[..., None]).squeeze(-1),
+        dist.gather(-1, (code + 1).clamp(max=7)[..., None]).squeeze(-1),
+    ) & (code < 7)
     code = torch.where(tie & (code % 2 == 1), code + 1, code)
     code = code | ((scaled < 0) & (code > 0)).to(code.dtype) << 3
     code = code.to(torch.uint8).view(n, k)
@@ -340,7 +382,14 @@ def _e2m1_codes(mag: torch.Tensor) -> torch.Tensor:
     cvt.rn.satfinite.e2m1x2 does): boundaries 0.25 / 0.75 / 1.25 / 1.75 / 2.5 / 3.5 / 5, ties at odd-code midpoints
     go down (0.25, 1.25, 2.5, 5) and at even-code midpoints up (0.75, 1.75, 3.5)."""
     code = (mag > 0.25).to(torch.uint8)
-    for thr, inclusive in ((0.75, True), (1.25, False), (1.75, True), (2.5, False), (3.5, True), (5.0, False)):
+    for thr, inclusive in (
+        (0.75, True),
+        (1.25, False),
+        (1.75, True),
+        (2.5, False),
+        (3.5, True),
+        (5.0, False),
+    ):
         code += (mag >= thr if inclusive else mag > thr).to(torch.uint8)
     return code
 
@@ -357,14 +406,16 @@ def _nvfp4_codes(blocks: torch.Tensor, eff: torch.Tensor) -> torch.Tensor:
     """Signed E2M1 codes (uint8, sign in bit 3) of ``blocks`` [..., 16] for per-block multipliers ``eff`` [...]. A
     negative value that rounds to zero keeps its sign (-0, code 8), as cvt.rn.satfinite.e2m1x2 and the TRT-LLM
     quantization kernel produce it (same value as +0)."""
-    scaled = torch.where(eff[..., None] > 0, blocks / eff[..., None].clamp_min(1e-30), torch.zeros_like(blocks))
+    scaled = torch.where(
+        eff[..., None] > 0, blocks / eff[..., None].clamp_min(1e-30), torch.zeros_like(blocks)
+    )
     code = _e2m1_codes(scaled.abs().clamp(max=_E2M1_MAX))
     return code | ((scaled < 0).to(torch.uint8) << 3)
 
 
-def quantize_nvfp4(w: torch.Tensor,
-                   amax: Optional[float] = None,
-                   mse: Optional[bool] = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+def quantize_nvfp4(
+    w: torch.Tensor, amax: Optional[float] = None, mse: Optional[bool] = None
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """``w`` [N, K] -> (packed E2M1 uint8 [N, K/2], E4M3 block scales [N, K/16], FP32 ``weight_scale_2`` 0-d) in
     the ModelOpt NVFP4 checkpoint layout: ``weight_scale_2 = amax / (6 * 448)`` (``amax`` defaults to the tensor's),
     block scale ``e4m3(block_amax / 6 / weight_scale_2)``, ``w ~ e2m1 * block_scale * weight_scale_2``; element ``2j``
@@ -394,14 +445,18 @@ def quantize_nvfp4(w: torch.Tensor,
             else:
                 better = err < best
                 best = torch.where(better, err, best)
-                sf = torch.where(better, sf_f.view(torch.uint8), sf.view(torch.uint8)).view(torch.float8_e4m3fn)
+                sf = torch.where(better, sf_f.view(torch.uint8), sf.view(torch.uint8)).view(
+                    torch.float8_e4m3fn
+                )
                 code = torch.where(better[..., None], code_f, code)
     code = code.view(n, k)
     packed = (code[:, 0::2] | (code[:, 1::2] << 4)).contiguous()
     return packed, sf.contiguous(), ws2.reshape(())
 
 
-def dequantize_nvfp4(packed: torch.Tensor, scales: torch.Tensor, weight_scale_2: torch.Tensor) -> torch.Tensor:
+def dequantize_nvfp4(
+    packed: torch.Tensor, scales: torch.Tensor, weight_scale_2: torch.Tensor
+) -> torch.Tensor:
     n, half = packed.shape
     k = 2 * half
     lo = (packed & 0x0F).to(torch.int64)
@@ -421,8 +476,9 @@ def _quantize(w: torch.Tensor, mode: str) -> Tuple[torch.Tensor, torch.Tensor, s
     return q, s, "weight_scale"
 
 
-def convert_bf16_experts(weights: Dict, expert_ids: List[int], mode: str,
-                         device: torch.device) -> Dict[str, torch.Tensor]:
+def convert_bf16_experts(
+    weights: Dict, expert_ids: List[int], mode: str, device: torch.device
+) -> Dict[str, torch.Tensor]:
     """Per-expert (VANILLA) quantized weights of ``expert_ids`` from the checkpoint's BF16 expert tensors, either
     fused (``gate_up_proj`` [E, H, 2I] gate first, ``down_proj`` [E, I, H], as the Qwen3.5 weight mapper hands
     them over) or per expert (``{e}.w1.weight`` / ``w3`` [I, H], ``{e}.w2.weight`` [H, I])."""
@@ -438,13 +494,19 @@ def convert_bf16_experts(weights: Dict, expert_ids: List[int], mode: str,
             w1, w3 = gu.chunk(2, dim=0)  # gate, up: [I, H]
             w2 = weights["down_proj"][e].to(device=device, dtype=torch.bfloat16).transpose(0, 1)
         else:
-            w1, w3, w2 = (weights[f"{e}.{n}.weight"].to(device=device, dtype=torch.bfloat16)
-                          for n in ("w1", "w3", "w2"))
+            w1, w3, w2 = (
+                weights[f"{e}.{n}.weight"].to(device=device, dtype=torch.bfloat16)
+                for n in ("w1", "w3", "w2")
+            )
         if mode == "nvfp4":
             # w1 / w3 share one per-tensor scale (the fused FC1 GEMM has one alpha per expert); the loader shards
             # the full-expert tensors and keeps the per-tensor scales.
             a13 = torch.maximum(w1.abs().amax(), w3.abs().amax()).float()
-            for name, w, a, in_scale in (("w1", w1, a13, in1), ("w3", w3, a13, in1), ("w2", w2, None, in2)):
+            for name, w, a, in_scale in (
+                ("w1", w1, a13, in1),
+                ("w3", w3, a13, in1),
+                ("w2", w2, None, in2),
+            ):
                 q, sf, ws2 = quantize_nvfp4(w.contiguous(), amax=None if a is None else float(a))
                 out[f"{e}.{name}.weight"] = q
                 out[f"{e}.{name}.weight_scale"] = sf
@@ -475,7 +537,7 @@ def wrap_experts_loader(experts, mode: str, bf16_twin=None) -> None:
     MoE handling), while direct callers use the wrapper; converted (non-BF16) weights pass through unchanged, so
     a wrapper that delegates to its wrapped backend converts once."""
     backend = getattr(experts, "backend", experts)
-    for target in ((experts, ) if backend is experts else (experts, backend)):
+    for target in (experts,) if backend is experts else (experts, backend):
         _wrap_load_weights(target, experts, backend, mode, bf16_twin)
 
 
@@ -511,19 +573,39 @@ def _wrap_load_weights(target, experts, backend, mode: str, bf16_twin=None) -> N
         guarded = guard_pad_expert_params(backend, mtp_moe_quant_guard(mode))
         if guarded:
             from tensorrt_llm.logger import logger
-            logger.info(f"{ENV_MTP_MOE_QUANT}={mode}: zero guard expert slot after the last local expert of "
-                        f"{', '.join(guarded)} ({ENV_MTP_MOE_QUANT_GUARD})")
+
+            logger.info(
+                f"{ENV_MTP_MOE_QUANT}={mode}: zero guard expert slot after the last local expert of "
+                f"{', '.join(guarded)} ({ENV_MTP_MOE_QUANT_GUARD})"
+            )
         return result
 
     target.load_weights = load_weights
 
 
 __all__ = [
-    "ENV_MTP_MOE_QUANT", "ENV_MTP_MOE_QUANT_GUARD", "ENV_MTP_MOE_QUANT_MAX_M", "convert_bf16_experts",
-    "guard_pad_expert_params", "mtp_moe_quant_guard", "mtp_moe_quant_max_m",
-    "experts_unquantized", "dequantize_fp8_block", "dequantize_mxfp4", "dequantize_nvfp4",
-    "ENV_MTP_MOE_NVFP4_AMAX", "ENV_MTP_MOE_NVFP4_MSE", "mtp_moe_nvfp4_amax", "quantize_nvfp4",
+    "ENV_MTP_MOE_QUANT",
+    "ENV_MTP_MOE_QUANT_GUARD",
+    "ENV_MTP_MOE_QUANT_MAX_M",
+    "convert_bf16_experts",
+    "guard_pad_expert_params",
+    "mtp_moe_quant_guard",
+    "mtp_moe_quant_max_m",
+    "experts_unquantized",
+    "dequantize_fp8_block",
+    "dequantize_mxfp4",
+    "dequantize_nvfp4",
+    "ENV_MTP_MOE_NVFP4_AMAX",
+    "ENV_MTP_MOE_NVFP4_MSE",
+    "mtp_moe_nvfp4_amax",
+    "quantize_nvfp4",
     "ENV_MTP_MOE_CALIB",
-    "mtp_moe_calib_dump", "mtp_moe_calib_path", "mtp_moe_calib_record",
-    "mtp_moe_quant_mode", "quant_config_for", "quantize_fp8_block", "quantize_mxfp4", "wrap_experts_loader"
+    "mtp_moe_calib_dump",
+    "mtp_moe_calib_path",
+    "mtp_moe_calib_record",
+    "mtp_moe_quant_mode",
+    "quant_config_for",
+    "quantize_fp8_block",
+    "quantize_mxfp4",
+    "wrap_experts_loader",
 ]

@@ -3182,7 +3182,9 @@ def test_branch_snapshot_interior_point_is_a_plain_chunk_boundary_for_inforward_
     assert request.expect_snapshot_points == [2944, 3998]
 
     scheduler = object.__new__(KVCacheV2Scheduler)
-    scheduler.kv_cache_manager = SimpleNamespace(q35_inforward_max_tail=16, q35_inforward_min_main=3)
+    scheduler.kv_cache_manager = SimpleNamespace(
+        q35_inforward_max_tail=16, q35_inforward_min_main=3
+    )
     scheduler.max_context_length = None
 
     chunk_size = _get_forced_context_chunk_size(request)

@@ -574,12 +574,10 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
                 self.spec_resource_manager.slot_manager.get_slot(rid)
                 for rid in self.request_ids
             ]
-            if not cache or _q35_uploaded_get(
-                    self.slot_ids) != eagle_slot_ids:
-                eagle_slot_ids_tensor = torch.tensor(
-                    eagle_slot_ids,
-                    dtype=torch.int,
-                    pin_memory=prefer_pinned())
+            if not cache or _q35_uploaded_get(self.slot_ids) != eagle_slot_ids:
+                eagle_slot_ids_tensor = torch.tensor(eagle_slot_ids,
+                                                     dtype=torch.int,
+                                                     pin_memory=prefer_pinned())
                 self.slot_ids[:num_seqs].copy_(eagle_slot_ids_tensor,
                                                non_blocking=True)
                 if cache:
@@ -1012,6 +1010,7 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         from .q35_fused_accept import (draft_bookkeeping_enabled,
                                        draft_tail_enabled, fused_step0_enabled,
                                        step0_epilogue, step0_gather_ids)
+
         # TRTLLM_Q35_DRAFT_BOOKKEEPING: the first draft step's gather ids,
         # hidden-row gather, the position inputs of every later pass and the
         # step-0 -> 1 metadata update in one launch (q35_fused_accept.py). It
@@ -1093,10 +1092,11 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                     gather_ids = q35_ep.gather_ids
                 elif i == 0 and q35_step0:
                     # TRTLLM_Q35_FUSED_STEP0: the same rows in one launch.
-                    gather_ids = step0_gather_ids(
-                        step0_seq_lens, num_accepted_tokens, num_contexts,
-                        num_gens, runtime_draft_len,
-                        attn_metadata.num_ctx_tokens)
+                    gather_ids = step0_gather_ids(step0_seq_lens,
+                                                  num_accepted_tokens,
+                                                  num_contexts, num_gens,
+                                                  runtime_draft_len,
+                                                  attn_metadata.num_ctx_tokens)
                 elif i == 0:
                     start_ids_gen = (
                         spec_metadata.batch_indices_cuda[:num_gens] *
@@ -1161,8 +1161,7 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                 q35_head = None
                 if (self.is_mtp_eagle and not lm_head_tp_in_adp_configured
                         and not advanced_draft_sampling
-                        and self.guided_decoder is None
-                        and self._d2t is None):
+                        and self.guided_decoder is None and self._d2t is None):
                     q35_head = getattr(draft_model, "q35_draft_head", None)
                     if q35_head is not None and not q35_head.supports(
                             request_hidden_states.shape[0]):
@@ -1218,12 +1217,11 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                 if q35_head is None:
                     if self.guided_decoder is not None:
                         if self.is_mtp_eagle:
-                            self.guided_decoder.execute_draft_batch(logits,
-                                                                    draft_step=i)
+                            self.guided_decoder.execute_draft_batch(
+                                logits, draft_step=i)
                         else:
-                            self.guided_decoder.execute_draft_batch(logits,
-                                                                    self._d2t,
-                                                                    draft_step=i)
+                            self.guided_decoder.execute_draft_batch(
+                                logits, self._d2t, draft_step=i)
 
                     # ADP+LM-head-TP logits are the LM-head-TP group's row-stacked
                     # batch (each rank's rows padded to max_num_requests, then
@@ -1309,9 +1307,9 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                 else:
                     if hasattr(attn_metadata, 'kv_lens_cuda'):
                         if (q35_ep is not None and build_next
-                                and self.is_mtp_eagle and hasattr(
-                                    draft_model.mtp_layers[0],
-                                    "_q35_stock_fc_input")):
+                                and self.is_mtp_eagle
+                                and hasattr(draft_model.mtp_layers[0],
+                                            "_q35_stock_fc_input")):
                             # TRTLLM_Q35_DRAFT_BOOKKEEPING: the next MTP pass
                             # applies it (in its fused input launch with
                             # TRTLLM_Q35_MTP_FUSED_INPUT, else first thing).

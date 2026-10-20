@@ -218,18 +218,174 @@ def _q35_conv_replay_kernel(
         # ---------------- post-wait: in_proj (x) and ba (g / beta) outputs ----------------
         row0 = i_n * T
         # Window taps J = 0..3 (0 = oldest); same bf16 products / fp32 accumulation order as the conv kernel.
-        q0 = _conv_taps(x, x_stride_tok, cs_base, cs_stride_dim, cs_stride_tok, row0, ch_q, o_t, mask_t, mask_k, T, 0)
-        q1 = _conv_taps(x, x_stride_tok, cs_base, cs_stride_dim, cs_stride_tok, row0, ch_q, o_t, mask_t, mask_k, T, 1)
-        q2 = _conv_taps(x, x_stride_tok, cs_base, cs_stride_dim, cs_stride_tok, row0, ch_q, o_t, mask_t, mask_k, T, 2)
-        q3 = _conv_taps(x, x_stride_tok, cs_base, cs_stride_dim, cs_stride_tok, row0, ch_q, o_t, mask_t, mask_k, T, 3)
-        k0 = _conv_taps(x, x_stride_tok, cs_base, cs_stride_dim, cs_stride_tok, row0, ch_k, o_t, mask_t, mask_k, T, 0)
-        k1 = _conv_taps(x, x_stride_tok, cs_base, cs_stride_dim, cs_stride_tok, row0, ch_k, o_t, mask_t, mask_k, T, 1)
-        k2 = _conv_taps(x, x_stride_tok, cs_base, cs_stride_dim, cs_stride_tok, row0, ch_k, o_t, mask_t, mask_k, T, 2)
-        k3 = _conv_taps(x, x_stride_tok, cs_base, cs_stride_dim, cs_stride_tok, row0, ch_k, o_t, mask_t, mask_k, T, 3)
-        v0 = _conv_taps(x, x_stride_tok, cs_base, cs_stride_dim, cs_stride_tok, row0, ch_v, o_t, mask_t, mask_v, T, 0)
-        v1 = _conv_taps(x, x_stride_tok, cs_base, cs_stride_dim, cs_stride_tok, row0, ch_v, o_t, mask_t, mask_v, T, 1)
-        v2 = _conv_taps(x, x_stride_tok, cs_base, cs_stride_dim, cs_stride_tok, row0, ch_v, o_t, mask_t, mask_v, T, 2)
-        v3 = _conv_taps(x, x_stride_tok, cs_base, cs_stride_dim, cs_stride_tok, row0, ch_v, o_t, mask_t, mask_v, T, 3)
+        q0 = _conv_taps(
+            x,
+            x_stride_tok,
+            cs_base,
+            cs_stride_dim,
+            cs_stride_tok,
+            row0,
+            ch_q,
+            o_t,
+            mask_t,
+            mask_k,
+            T,
+            0,
+        )
+        q1 = _conv_taps(
+            x,
+            x_stride_tok,
+            cs_base,
+            cs_stride_dim,
+            cs_stride_tok,
+            row0,
+            ch_q,
+            o_t,
+            mask_t,
+            mask_k,
+            T,
+            1,
+        )
+        q2 = _conv_taps(
+            x,
+            x_stride_tok,
+            cs_base,
+            cs_stride_dim,
+            cs_stride_tok,
+            row0,
+            ch_q,
+            o_t,
+            mask_t,
+            mask_k,
+            T,
+            2,
+        )
+        q3 = _conv_taps(
+            x,
+            x_stride_tok,
+            cs_base,
+            cs_stride_dim,
+            cs_stride_tok,
+            row0,
+            ch_q,
+            o_t,
+            mask_t,
+            mask_k,
+            T,
+            3,
+        )
+        k0 = _conv_taps(
+            x,
+            x_stride_tok,
+            cs_base,
+            cs_stride_dim,
+            cs_stride_tok,
+            row0,
+            ch_k,
+            o_t,
+            mask_t,
+            mask_k,
+            T,
+            0,
+        )
+        k1 = _conv_taps(
+            x,
+            x_stride_tok,
+            cs_base,
+            cs_stride_dim,
+            cs_stride_tok,
+            row0,
+            ch_k,
+            o_t,
+            mask_t,
+            mask_k,
+            T,
+            1,
+        )
+        k2 = _conv_taps(
+            x,
+            x_stride_tok,
+            cs_base,
+            cs_stride_dim,
+            cs_stride_tok,
+            row0,
+            ch_k,
+            o_t,
+            mask_t,
+            mask_k,
+            T,
+            2,
+        )
+        k3 = _conv_taps(
+            x,
+            x_stride_tok,
+            cs_base,
+            cs_stride_dim,
+            cs_stride_tok,
+            row0,
+            ch_k,
+            o_t,
+            mask_t,
+            mask_k,
+            T,
+            3,
+        )
+        v0 = _conv_taps(
+            x,
+            x_stride_tok,
+            cs_base,
+            cs_stride_dim,
+            cs_stride_tok,
+            row0,
+            ch_v,
+            o_t,
+            mask_t,
+            mask_v,
+            T,
+            0,
+        )
+        v1 = _conv_taps(
+            x,
+            x_stride_tok,
+            cs_base,
+            cs_stride_dim,
+            cs_stride_tok,
+            row0,
+            ch_v,
+            o_t,
+            mask_t,
+            mask_v,
+            T,
+            1,
+        )
+        v2 = _conv_taps(
+            x,
+            x_stride_tok,
+            cs_base,
+            cs_stride_dim,
+            cs_stride_tok,
+            row0,
+            ch_v,
+            o_t,
+            mask_t,
+            mask_v,
+            T,
+            2,
+        )
+        v3 = _conv_taps(
+            x,
+            x_stride_tok,
+            cs_base,
+            cs_stride_dim,
+            cs_stride_tok,
+            row0,
+            ch_v,
+            o_t,
+            mask_t,
+            mask_v,
+            T,
+            3,
+        )
 
         acc_q = tl.zeros([BT, BK], dtype=tl.float32)
         acc_q += q0 * wq0[None, :]
@@ -461,11 +617,15 @@ def q35_conv_replay_update(
     N, T = num_decodes, draft_token_num
     H, HV, K, V = num_k_heads, num_v_heads, head_k_dim, head_v_dim
     conv_dim = 2 * H * K + HV * V
-    assert mixed_qkv.shape[0] == N * T and mixed_qkv.shape[1] >= conv_dim and mixed_qkv.stride(1) == 1
+    assert (
+        mixed_qkv.shape[0] == N * T and mixed_qkv.shape[1] >= conv_dim and mixed_qkv.stride(1) == 1
+    )
     assert conv_weight.shape[0] == conv_dim and conv_weight.shape[1] == 4
     assert conv_states.shape[1] == conv_dim and conv_states.shape[2] == 3
     assert intermediate_conv_window.shape[1] == T and intermediate_conv_window.shape[2] == conv_dim
-    assert a.shape == (N * T, HV) and b.shape == (N * T, HV) and a.stride(1) == 1 and b.stride(1) == 1
+    assert (
+        a.shape == (N * T, HV) and b.shape == (N * T, HV) and a.stride(1) == 1 and b.stride(1) == 1
+    )
     s_h0_0, s_h0_1, s_h0_2, s_h0_3 = ssm_states.stride()
     assert s_h0_3 == 1 and s_h0_2 == K and s_h0_1 == V * K
     for name, tensor in (("old_u", old_u), ("old_k", old_k), ("old_G", old_G)):

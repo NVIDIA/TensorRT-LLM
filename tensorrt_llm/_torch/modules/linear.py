@@ -30,10 +30,10 @@ from tensorrt_llm.quantization.utils.fp8_utils import (
 
 from ..._utils import get_sm_version, is_sm_100f
 from ...models.modeling_utils import QuantConfig
-from .lowm_linear import maybe_lowm_bf16_linear, maybe_lowm_fp8_linear
 from ..utils import (Fp4QuantizedTensor, get_model_extra_attrs,
                      is_nvfp4_marlin_supported_sm,
                      replace_parameter_and_save_metadata, unswizzle_sf)
+from .lowm_linear import maybe_lowm_bf16_linear, maybe_lowm_fp8_linear
 
 
 class WeightMode(str, enum.Enum):

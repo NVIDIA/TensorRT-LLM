@@ -2405,12 +2405,11 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
             return None
         mapping = self.model_config.mapping
         head = self.lm_head
-        temperature_only = (not spec_metadata.is_all_greedy_sample
-                            and spec_metadata.skip_top_k
-                            and spec_metadata.skip_top_p
-                            and not getattr(spec_metadata,
-                                            "use_rejection_sampling", False)
-                            and spec_metadata.temperatures is not None)
+        temperature_only = (
+            not spec_metadata.is_all_greedy_sample and spec_metadata.skip_top_k
+            and spec_metadata.skip_top_p
+            and not getattr(spec_metadata, "use_rejection_sampling", False)
+            and spec_metadata.temperatures is not None)
         if ((not spec_metadata.is_all_greedy_sample and not temperature_only)
                 or not self.spec_config.spec_dec_mode.is_mtp_eagle_one_model()
                 or getattr(self.spec_config,

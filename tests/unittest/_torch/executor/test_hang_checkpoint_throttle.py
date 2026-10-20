@@ -47,7 +47,9 @@ def test_throttled_detector_still_fires_and_resumes_after_pause(monkeypatch):
     hd = HangDetector(timeout=1, on_detected=lambda: fired.append(time.monotonic()))
     with hd:
         start = time.monotonic()
-        while time.monotonic() - start < 0.5:  # steady progress: the timer is rescheduled a few times
+        while (
+            time.monotonic() - start < 0.5
+        ):  # steady progress: the timer is rescheduled a few times
             hd.checkpoint()
             time.sleep(0.01)
         assert 2 <= len(calls) <= 4 and not hd.detected()

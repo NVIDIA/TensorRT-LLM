@@ -303,11 +303,15 @@ class _Window:
                 per_target.append((extra, name))
         per_target.sort(reverse=True)
         attributed = sum(e for e, _ in per_target)
-        out = [f"# spikes{title}: {len(spikes)} of {len(busy)} iterations above {1e3 * limit:.3f} ms, "
-               f"mean excess {1e3 * excess_total / len(spikes):.3f} ms; excess by target (exclusive, ms per spike):"]
+        out = [
+            f"# spikes{title}: {len(spikes)} of {len(busy)} iterations above {1e3 * limit:.3f} ms, "
+            f"mean excess {1e3 * excess_total / len(spikes):.3f} ms; excess by target (exclusive, ms per spike):"
+        ]
         for extra, name in per_target[:8]:
             out.append(f"#   {1e3 * extra / len(spikes):8.3f}  {name}")
-        out.append(f"#   {1e3 * (excess_total - attributed) / len(spikes):8.3f}  (not in a wrapped target: loop body)")
+        out.append(
+            f"#   {1e3 * (excess_total - attributed) / len(spikes):8.3f}  (not in a wrapped target: loop body)"
+        )
         return out
 
     def series(self, want: str) -> Optional[List[float]]:
@@ -518,13 +522,16 @@ class _Registry:
         """``model:<name suffix>[#method]``: wrap that method of one module instance (see the module docstring)."""
         if target in self.installed or target in self.missing:
             return
-        spec = target[len(_MODEL_PREFIX):]
+        spec = target[len(_MODEL_PREFIX) :]
         spec, _, method = spec.partition("#")
         method = method or "forward"
         try:
             model = executor.model_engine.model
-            module = next(m for name, m in model.named_modules(remove_duplicate=False)
-                          if name == spec or name.endswith("." + spec))
+            module = next(
+                m
+                for name, m in model.named_modules(remove_duplicate=False)
+                if name == spec or name.endswith("." + spec)
+            )
             raw = getattr(module, method)
         except (AttributeError, StopIteration):
             self.missing.append(target)
@@ -568,7 +575,9 @@ class _Registry:
         torch.cuda.Stream.synchronize = self.wrap(
             torch.cuda.Stream.synchronize, _SYNC_PREFIX + "Stream.synchronize"
         )
-        torch.cuda.synchronize = self.wrap(torch.cuda.synchronize, _SYNC_PREFIX + "cuda.synchronize")
+        torch.cuda.synchronize = self.wrap(
+            torch.cuda.synchronize, _SYNC_PREFIX + "cuda.synchronize"
+        )
         for method in ("item", "tolist", "cpu"):
             setattr(
                 torch.Tensor,

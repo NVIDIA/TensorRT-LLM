@@ -68,14 +68,19 @@ def _run(monkeypatch, merged, local_fitting, local_wait, peer_gen, peer_ctx, all
     return ex.events, dist.calls
 
 
-@pytest.mark.parametrize("local_fitting, local_wait, peer_gen, peer_ctx, all_gen_first",
-                         list(itertools.product([0, 1], [False, True], [0, 1], [0, 1], [False, True])))
-def test_merged_votes_take_the_same_branches(monkeypatch, local_fitting, local_wait, peer_gen,
-                                             peer_ctx, all_gen_first):
-    sep_events, sep_calls = _run(monkeypatch, False, local_fitting, local_wait, peer_gen, peer_ctx,
-                                 all_gen_first)
-    mrg_events, mrg_calls = _run(monkeypatch, True, local_fitting, local_wait, peer_gen, peer_ctx,
-                                 all_gen_first)
+@pytest.mark.parametrize(
+    "local_fitting, local_wait, peer_gen, peer_ctx, all_gen_first",
+    list(itertools.product([0, 1], [False, True], [0, 1], [0, 1], [False, True])),
+)
+def test_merged_votes_take_the_same_branches(
+    monkeypatch, local_fitting, local_wait, peer_gen, peer_ctx, all_gen_first
+):
+    sep_events, sep_calls = _run(
+        monkeypatch, False, local_fitting, local_wait, peer_gen, peer_ctx, all_gen_first
+    )
+    mrg_events, mrg_calls = _run(
+        monkeypatch, True, local_fitting, local_wait, peer_gen, peer_ctx, all_gen_first
+    )
     assert mrg_events == sep_events
     assert mrg_calls == ["Allreduce"]
     assert sep_calls[0] == "allreduce" and set(sep_calls) <= {"allreduce", "tp_allreduce"}
