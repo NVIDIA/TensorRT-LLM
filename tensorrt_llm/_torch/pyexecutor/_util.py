@@ -96,6 +96,10 @@ GB = 1 << 30
 # accepts. Matches the KvCacheConfig.tokens_per_block default.
 _STANDALONE_DRAFT_TOKENS_PER_BLOCK = 32
 
+# Aggregated helix skips memory profiling, so its default KV fraction leaves
+# room for prefill activations. TODO(TRTLLM-17127): remove once helix profiles.
+_HELIX_AGG_FREE_GPU_MEMORY_FRACTION = 0.6
+
 
 def ceil_div(a: int, b: int) -> int:
     return (a + b - 1) // b
@@ -1728,6 +1732,16 @@ class KvCacheCreator:
                         "the explicitly configured quota.")
             return
         fraction = self._kv_cache_config.free_gpu_memory_fraction
+        default_fraction = KvCacheConfig.model_fields[
+            "free_gpu_memory_fraction"].default
+        if fraction == default_fraction and not self._is_disagg:
+            fraction = _HELIX_AGG_FREE_GPU_MEMORY_FRACTION
+            logger.warning(
+                "Helix CP (aggregated): capacity profiling is unsupported, so "
+                f"the default free_gpu_memory_fraction {default_fraction} is "
+                f"lowered to {fraction} to leave room for prefill "
+                "activations. Set kv_cache_config.max_tokens or "
+                "max_gpu_total_bytes to override.")
         free_mem, _total = torch.cuda.mem_get_info()
         budget_bytes = int(free_mem * fraction)
         if budget_bytes <= 0:
