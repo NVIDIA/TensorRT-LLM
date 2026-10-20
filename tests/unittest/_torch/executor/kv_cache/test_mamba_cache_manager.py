@@ -152,8 +152,6 @@ def _hybrid_model_config():
     return SimpleNamespace(
         pretrained_config=config,
         sparse_attention_config=None,
-        mapping=Mapping(),
-        spec_config=None,
         get_num_mamba_layers=lambda: 1,
     )
 

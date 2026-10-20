@@ -1308,12 +1308,13 @@ class KVCacheManagerV2(BaseResourceManager):
         cold_page_codec_provider: Optional[object] = None,
         joint_kv_cache_reuse: bool = False,
         max_cuda_graph_batch_size: Optional[int] = None,
-        pretrained_config: Optional[object] = None,
         **kwargs,
     ) -> None:
         self.mapping = mapping
         self.dtype = dtype
-        self._init_mixed_precision(kv_cache_config, pretrained_config, max_seq_len, dtype)
+        self._init_mixed_precision(
+            kv_cache_config, kwargs.get("pretrained_config"), max_seq_len, dtype
+        )
         self._validate_speculative_config(spec_config)
         self.is_disagg = is_disagg
         self.kv_connector_manager = kv_connector_manager
