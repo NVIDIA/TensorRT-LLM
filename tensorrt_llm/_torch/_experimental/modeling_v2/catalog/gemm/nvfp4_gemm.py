@@ -51,7 +51,7 @@ class Nvfp4Gemm(OpWrapper):
     global scales the quantization divided out back into the product.
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = frozenset({Arch.SM_100, Arch.SM_103})
 
     # deepseek-r1's dense and shared-expert MLPs are the only callers: hidden
     # 7168 into 2 x intermediate, then back down. K and N here are the real
@@ -72,6 +72,14 @@ class Nvfp4Gemm(OpWrapper):
         Cell(
             why="an M that is not a multiple of the swizzle's 128-row tile",
             spec=dict(m=37, k=7168, n=4096, bias=False),
+        ),
+        Cell(
+            why="deepseek default at attention TP8, shared expert gate+up: 2 x 2048/8 rows",
+            spec=dict(m=16, k=7168, n=512, bias=False),
+        ),
+        Cell(
+            why="deepseek default at attention TP8, shared expert down: K = 2048/8",
+            spec=dict(m=16, k=256, n=7168, bias=False),
         ),
     )
 

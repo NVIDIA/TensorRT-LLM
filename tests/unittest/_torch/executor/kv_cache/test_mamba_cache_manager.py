@@ -439,7 +439,7 @@ def test_kimi_kda_replay_respects_fused_verify_draft_limit(
 
 def test_kda_mtp_max_num_spec_fits_the_kernel_chunk() -> None:
     pytest.importorskip("cutlass")
-    from tensorrt_llm._torch.cute_dsl_kernels.blackwell.kimi_k3_kda.kda_mtp_decode import T_PAD
+    from tensorrt_llm._torch.attention.kernels.blackwell.kimi_k3_kda.kda_mtp_decode import T_PAD
     from tensorrt_llm._torch.modules.kimi_kda._kda_kernels import kda_mtp_max_num_spec
 
     max_num_spec = kda_mtp_max_num_spec()
