@@ -310,18 +310,29 @@ def _resolve_checkpoint_io_policy(
     requested_policy: CheckpointIOPolicy,
     partial_model_loading: bool,
 ) -> tuple[CheckpointIOPolicy, Optional[str]]:
-    """Return the policy to use and the reason for a fallback, if any."""
+    """Return the policy to use and the reason for a fallback, if any.
+
+    CheckpointIOPolicy.MODEL_STREAMER does not support fallback: Will raise ValueError.
+    """
 
     if requested_policy == CheckpointIOPolicy.NATIVE:
         return CheckpointIOPolicy.NATIVE, None
 
-    # requested_policy can be AUTO or RANK_STRIPED_READ_AHEAD:
+    # requested_policy can be AUTO, MODEL_STREAMER or RANK_STRIPED_READ_AHEAD:
     reason = _checkpoint_io_incompatibility_reason(checkpoint_loader,
                                                    checkpoint_format,
                                                    load_format,
                                                    requested_policy,
                                                    partial_model_loading)
 
+    if requested_policy == CheckpointIOPolicy.MODEL_STREAMER:
+        if reason is not None:
+            raise ValueError(
+                f"checkpoint_io_policy='model_streamer' is unsupported: {reason}"
+            )
+        return CheckpointIOPolicy.MODEL_STREAMER, None
+
+    # request_policy is AUTO or RANK_STRIPED_READ_AHEAD
     if reason is None:
         # Compatible: AUTO and RANK_STRIPED_READ_AHEAD both use read-ahead.
         return CheckpointIOPolicy.RANK_STRIPED_READ_AHEAD, None
@@ -375,6 +386,13 @@ def construct_checkpoint_loader(
             )
         return checkpoint_loader
 
+    if checkpoint_io_policy == CheckpointIOPolicy.MODEL_STREAMER:
+        # `ModelStreamerWeightSource` streams the weights into the model
+        # itself. The HF loader still supplies the config and the weight
+        # mapper, and its reader stays native and unused.
+        checkpoint_io_policy = CheckpointIOPolicy.NATIVE
+        requested_checkpoint_io_policy = CheckpointIOPolicy.NATIVE
+
     checkpoint_weight_loader_cls = get_checkpoint_weight_loader(
         checkpoint_format)
     if checkpoint_weight_loader_cls is HfWeightLoader:
@@ -416,8 +434,14 @@ def _apply_to_buffers_only(model: torch.nn.Module, fn):
 def _checkpoint_startup_metadata(
     checkpoint_loader: BaseCheckpointLoader,
     load_format: LoadFormat,
+    weight_source: WeightSource,
 ) -> dict[str, str]:
-    """Describe the concrete checkpoint source selected for this load."""
+    """Describe the concrete checkpoint source selected for this load.
+
+    ``weight_source_kind`` names the `WeightSource`, for example
+    ``"ModelStreamerWeightSource"``, because several sources share the same
+    checkpoint loader.
+    """
     weight_loader = getattr(checkpoint_loader, "weight_loader", None)
     source_kind = getattr(checkpoint_loader, "checkpoint_format", None)
     return {
@@ -430,6 +454,8 @@ def _checkpoint_startup_metadata(
         str(source_kind or "unknown"),
         "load_format":
         load_format.name.lower(),
+        "weight_source_kind":
+        type(weight_source).__name__,
     }
 
 
@@ -631,7 +657,7 @@ class ModelLoader:
         self._weight_source = weight_source
         weight_source.check_config(config)
         self._startup_metadata = _checkpoint_startup_metadata(
-            checkpoint_loader, load_format)
+            checkpoint_loader, load_format, weight_source)
 
         with timing_metric(
                 ModelLoaderMetricNames.TOTAL_MODEL_LOADING_SECONDS.value,
@@ -754,8 +780,8 @@ class ModelLoader:
                 and not weight_source.supports_host_resident_weights):
             raise ValueError(
                 "Host-resident model weights currently require the standard "
-                "Hugging Face AUTO loader; DUMMY, VISION_ONLY, GMS, and MX "
-                "loaders cannot materialize them")
+                "Hugging Face AUTO loader; DUMMY, VISION_ONLY, GMS, MX, and "
+                "Model Streamer loaders cannot materialize them")
 
     def _allocate_weights(self, model: DecoderModelForCausalLM, *,
                           is_meta_init: bool, use_memory_tag: bool) -> None:
