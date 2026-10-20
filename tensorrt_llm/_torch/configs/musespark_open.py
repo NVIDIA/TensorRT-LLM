@@ -302,13 +302,18 @@ def _derive_nope_schedule(
             )
     # NoPE layers sit every ``every_n_layers_nope`` layers counted from the
     # last layer backwards (see layer_uses_rope). Their spacing is the period.
+    if len(nope_layers) < 2:
+        raise ValueError(
+            f"Muse Spark Open format: layer {nope_layers[0]} is the only NoPE layer; "
+            "the NoPE period cannot be inferred from a single layer"
+        )
     spacings = {b - a for a, b in zip(nope_layers, nope_layers[1:])}
-    if len(nope_layers) > 1 and len(spacings) != 1:
+    if len(spacings) != 1:
         raise ValueError(
             f"Muse Spark Open format: NoPE layers {nope_layers} are not equally spaced; "
             "the periodic schedule the runtime implements cannot express this"
         )
-    every_n = spacings.pop() if spacings else num_layers - nope_layers[0]
+    every_n = spacings.pop()
     if nope_layers[-1] != num_layers - 1:
         raise ValueError(
             f"Muse Spark Open format: the last layer ({num_layers - 1}) is not NoPE; "
@@ -639,11 +644,12 @@ class MuseSparkOpenConfig(PretrainedConfig):
           ``mlp_layer_types == "dense"`` layers, of which this model has none
           (asserted). The flat config's ``intermediate_size`` is the routed
           expert width, derived from ``moe_intermediate_size``.
-        * ``quantization_config``: the same information ships in
-          ``hf_quant_config.json``, which is the copy TRT-LLM reads
-          (``ModelConfig.from_pretrained``). Keeping a second copy on the
-          config would hand the modelopt-config path two sources to disagree.
         * ``transformers_version``, ``initializer_range``: bookkeeping.
+
+        ``quantization_config`` is kept as is. ``ModelConfig.from_pretrained``
+        treats ``hf_quant_config.json`` as authoritative, warns when the inline
+        copy disagrees with it, and falls back to the inline copy when the file
+        is absent or sets no global ``quant_algo``.
         """
         text = dict(config_dict.get("text_config") or {})
         if not text:
@@ -734,6 +740,8 @@ class MuseSparkOpenConfig(PretrainedConfig):
             eos_token_id=text.get("eos_token_id"),
             pad_token_id=text.get("pad_token_id"),
         )
+        if config_dict.get("quantization_config") is not None:
+            flat.quantization_config = dict(config_dict["quantization_config"])
 
         # The audio tower is enabled and configured through this dict;
         # audio_config was checked against the same fixed tower above.

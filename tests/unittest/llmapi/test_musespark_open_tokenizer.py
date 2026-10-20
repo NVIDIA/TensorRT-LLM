@@ -28,6 +28,7 @@ import os
 import pytest
 from utils.llm_data import llm_models_root
 
+from tensorrt_llm._torch.pyexecutor.config_utils import load_pretrained_config
 from tensorrt_llm.llmapi.llm_utils import ModelLoader
 from tensorrt_llm.sampling_params import SamplingParams
 from tensorrt_llm.tokenizer import load_hf_tokenizer
@@ -133,3 +134,10 @@ def test_both_eos_ids_stop_generation_and_end_of_message_does_not(checkpoint_dir
 def test_end_of_message_decodes_as_text_only_with_special_tokens_kept(tokenizer):
     assert tokenizer.decode([END_OF_MESSAGE], skip_special_tokens=False) == "<|eom|>"
     assert tokenizer.decode([END_OF_MESSAGE], skip_special_tokens=True) == ""
+
+
+def test_the_config_audio_marker_ids_match_the_tokenizer(checkpoint_dir, tokenizer):
+    """The config hardcodes the audio marker ids; the checkpoint's tokenizer must agree."""
+    args = load_pretrained_config(checkpoint_dir).audio_perception_modality_args
+    assert tokenizer.convert_ids_to_tokens(args["next_audio_token"]) == "<|next_audio|>"
+    assert tokenizer.convert_ids_to_tokens(args["empty_audio_token"]) == "<|empty_audio|>"

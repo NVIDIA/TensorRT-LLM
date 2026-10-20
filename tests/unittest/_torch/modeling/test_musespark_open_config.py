@@ -28,7 +28,9 @@ import pytest
 from utils.llm_data import llm_models_root
 
 from tensorrt_llm._torch.configs import MuseSparkOpenConfig
+from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.pyexecutor.config_utils import load_pretrained_config
+from tensorrt_llm.quantization.mode import QuantAlgo
 
 pytestmark = pytest.mark.cpu_only
 
@@ -121,7 +123,13 @@ def open_format_config_dict():
             "out_hidden_size": 8192,
             "rms_norm_eps": 1e-6,
         },
-        "quantization_config": {"quant_algo": "NVFP4", "group_size": 16},
+        # The NVFP4 checkpoint's, without its 762-entry modules_to_not_convert.
+        "quantization_config": {
+            "quant_method": "modelopt",
+            "quant_algo": "NVFP4",
+            "group_size": 16,
+            "exclude_modules": ["layers.0.", "layers.61.", "self_attn", "lm_head"],
+        },
     }
 
 
@@ -183,6 +191,12 @@ def test_from_open_format_reproduces_flat_config():
     assert flat.torch_dtype == reference.torch_dtype
 
 
+def _only_the_last_layer_is_nope(config):
+    text = config["text_config"]
+    text["layer_rope_theta"] = [500000.0] * (NUM_LAYERS - 1) + [0]
+    text["layer_types"] = ["sliding_attention"] * (NUM_LAYERS - 1) + ["full_attention"]
+
+
 @pytest.mark.parametrize(
     "mutate,match",
     [
@@ -194,6 +208,7 @@ def test_from_open_format_reproduces_flat_config():
         (lambda c: c["text_config"].__setitem__("qk_scale_factor", 1.0), "qk_scale_factor"),
         (lambda c: c["text_config"].__setitem__("output_multiplier", 0.3), "output_multiplier"),
         (lambda c: c["text_config"]["layer_rope_theta"].__setitem__(3, 123.0), "rope"),
+        (_only_the_last_layer_is_nope, "period cannot be inferred"),
         (
             lambda c: c["text_config"]["rope_parameters"].__setitem__("rope_type", "yarn"),
             "rope_type",
@@ -232,6 +247,15 @@ def test_load_pretrained_config_translates_the_composite_config(tmp_path):
     assert config.architectures == ["MuseSparkForConditionalGeneration"]
     assert config.num_hidden_layers == NUM_LAYERS
     assert config.vision_config.num_hidden_layers == NUM_VISION_LAYERS
+    assert config.quantization_config == open_format_config_dict()["quantization_config"]
+
+
+def test_the_inline_quantization_config_is_the_fallback(tmp_path):
+    """Without ``hf_quant_config.json`` the NVFP4 quant config comes from config.json."""
+    (tmp_path / "config.json").write_text(json.dumps(open_format_config_dict()))
+    quant_config = ModelConfig.from_pretrained(str(tmp_path)).quant_config
+    assert quant_config.quant_algo == QuantAlgo.NVFP4
+    assert quant_config.group_size == 16
 
 
 @pytest.mark.parametrize(
@@ -250,3 +274,5 @@ def test_the_released_checkpoints_load(checkpoint):
     assert (config.num_hidden_layers, config.hidden_size) == (NUM_LAYERS, 8192)
     assert (config.num_experts, config.moe_topk, config.sliding_window) == (256, 8, 2048)
     assert config.vision_config.num_hidden_layers == NUM_VISION_LAYERS
+    quant_algo = (getattr(config, "quantization_config", None) or {}).get("quant_algo")
+    assert quant_algo == ("NVFP4" if checkpoint.endswith("-NVFP4") else None)
