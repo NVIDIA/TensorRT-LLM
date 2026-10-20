@@ -3171,7 +3171,9 @@ class KVCacheManagerV2(BaseResourceManager):
 
     def _mixed_precision_layer_bytes_per_token(self, local_layer_idx: int, data_role: Role) -> int:
         """Bytes per token of the low-precision pool, scales included."""
-        from ...attention.kernels.blackwell.mixed_precision_kv import get_mixed_precision_kv_row_bytes
+        from ...attention.kernels.blackwell.mixed_precision_kv import (
+            get_mixed_precision_kv_row_bytes,
+        )
 
         return (
             self.num_kv_heads_per_layer[local_layer_idx]

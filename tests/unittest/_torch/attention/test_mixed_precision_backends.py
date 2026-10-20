@@ -608,7 +608,9 @@ def test_conversion_kernel_imports_pinned_flashinfer_symbols():
     """The kernel relies on internal FlashInfer modules; a bump that drops them fails here."""
     import importlib
 
-    module = importlib.import_module("tensorrt_llm._torch.attention.kernels.blackwell.mixed_precision_kv")
+    module = importlib.import_module(
+        "tensorrt_llm._torch.attention.kernels.blackwell.mixed_precision_kv"
+    )
     assert callable(module.convert_mixed_precision_kv)
     assert module.get_mixed_precision_kv_row_bytes(DataType.NVFP4, 128) == 72
 
