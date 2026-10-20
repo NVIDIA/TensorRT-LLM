@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 from dataclasses import replace
-from typing import Dict, Optional
+from typing import Callable, Dict, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -184,6 +184,37 @@ def dflash2_walk_candidate_paths(
         realized[:, step] = scores
         predecessor = scores.argmax(-1).view(batch, 1, 1)
     return realized
+
+
+def dflash2_sample_candidate_paths(
+    edge_scores: torch.Tensor,
+    sample_step: Callable[[int, torch.Tensor], Tuple[torch.Tensor, torch.Tensor]],
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Sample the scored lattice, scoring each step under the candidate drawn before it.
+
+    The selector is trained on the true previous token, so sampled blocks must not chain
+    through the argmax like :func:`dflash2_walk_candidate_paths`.
+
+    Args:
+        edge_scores: ``[B, K, top_k, top_k]`` from :func:`dflash2_score_edges`.
+        sample_step: ``(step, [B, top_k] scores) -> ([B] index, [B, top_k] probs drawn from)``.
+    Returns:
+        ``[B, K]`` drawn candidate indices and their ``[B, K, top_k]`` distributions.
+    """
+    batch, num_steps, top_k, _ = edge_scores.shape
+    chosen = edge_scores.new_empty(batch, num_steps, dtype=torch.long)
+    proposal = edge_scores.new_empty(batch, num_steps, top_k)
+    # Step 0 replicates the anchor across the predecessor axis, so any row works.
+    predecessor = torch.zeros(batch, 1, 1, dtype=torch.long, device=edge_scores.device)
+    for step in range(num_steps):
+        scores = edge_scores[:, step].gather(1, predecessor.expand(-1, 1, top_k)).squeeze(1)
+        index, probs = sample_step(step, scores)
+        # A degenerate row may yield an out-of-range draw; keep the next gather in bounds.
+        index = index.long().clamp(0, top_k - 1)
+        chosen[:, step] = index
+        proposal[:, step] = probs
+        predecessor = index.view(batch, 1, 1)
+    return chosen, proposal
 
 
 class DFlash2BlockConv(nn.Module):
@@ -816,9 +847,8 @@ class DFlashForCausalLM(nn.Module):
         """Restrict each block position's logits to the selector's chosen path.
 
         Writes ``-inf`` into ``block_logits`` everywhere except each position's
-        candidates, which carry the score row the walk realized. Argmax
-        therefore reproduces the walk, and sampling a row samples the
-        selector's own proposal distribution.
+        candidates, which carry the score row the walk realized, so argmax
+        reproduces the walk. Sampled drafts use :meth:`sample_candidate_path`.
 
         Args:
             block_logits: ``[B, K, vocab_size]`` full-vocab destination.
@@ -835,6 +865,25 @@ class DFlashForCausalLM(nn.Module):
         block_logits.fill_(float("-inf"))
         block_logits.scatter_(-1, candidate_ids, realized_scores.to(block_logits.dtype))
         return block_logits
+
+    def sample_candidate_path(
+        self,
+        candidate_ids: torch.Tensor,
+        unary_logits: torch.Tensor,
+        block_hidden_states: torch.Tensor,
+        anchor_token_ids: torch.Tensor,
+        sample_step: Callable[[int, torch.Tensor], Tuple[torch.Tensor, torch.Tensor]],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Sample a block through the selector; see :func:`dflash2_sample_candidate_paths`.
+
+        Returns the ``[B, K]`` draft tokens and their ``[B, K, top_k]`` distributions over
+        ``candidate_ids``.
+        """
+        edge_scores = self.candidate_selector(
+            candidate_ids, unary_logits, block_hidden_states, anchor_token_ids
+        )
+        chosen, proposal = dflash2_sample_candidate_paths(edge_scores, sample_step)
+        return candidate_ids.gather(-1, chosen.unsqueeze(-1)).squeeze(-1), proposal
 
     def _post_attention_gate(self, attn_output, gate_input, attn_mod, num_heads, head_dim):
         """Hook applied to the block-attention output before o_proj.
