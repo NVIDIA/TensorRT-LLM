@@ -411,7 +411,7 @@ def test_completion_envelope_reaches_every_rank_without_a_compute_batch() -> Non
                 wire["payload"] = deepcopy(value)
             return deepcopy(wire["payload"])
 
-        def broadcast_count(value, root, *, rank=rank):
+        def broadcast_count(value, root, *, rank=rank, prefer_cpu=False):
             assert root == 0
             if rank == 0:
                 wire["count"] = value

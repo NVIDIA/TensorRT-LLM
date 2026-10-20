@@ -1475,7 +1475,8 @@ class TestListenerAbortAndShutdown:
         executor = object.__new__(PyExecutor)
         executor._sleep_wakeup_comm = FakeComm()
         executor.device_id = 0
-        executor.dist = SimpleNamespace(rank=1)
+        executor.dist = SimpleNamespace(rank=1, pp_size=1)
+        executor.disable_overlap_scheduler = True
         executor.control_request_barrier = threading.Event()
         executor.control_action_done = threading.Event()
         executor.control_requests = [RequestQueueItem(id=CONTROL_REQUEST_ID, control_id=op_id)]
