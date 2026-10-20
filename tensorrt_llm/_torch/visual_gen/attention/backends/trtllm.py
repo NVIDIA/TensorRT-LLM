@@ -230,10 +230,8 @@ class TrtllmAttentionMetadata:
 
         Mapping onto the LLM attention metadata: each causal block is one context
         request whose cached past is the fixed region and its window.
-        - ``chunked_prefill=True`` matters only because it turns on
-          ``use_paged_context_fmha``, so the kernel reads cached K/V from the pool
-          through the block offsets. Without it, a block would attend only to its own
-          tokens.
+        - ``chunked_prefill=True`` makes each block attend to the cached tokens (the
+          fixed region, its window and the earlier blocks), not only to its own.
         - ``max_num_requests = max_num_sequences = max_causal_blocks``: one request per
           causal block, sized for the most blocks any declared block size cuts the
           staged tokens into. At the Cosmos geometry that is 4: 1 per denoising forward,
