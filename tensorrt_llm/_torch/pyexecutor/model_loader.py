@@ -964,6 +964,14 @@ class ModelLoader:
         self._checkpoint_loader = checkpoint_loader
         config = self._load_and_validate_config(checkpoint_dir,
                                                 checkpoint_loader)
+        if (config.multimodal_config is not None
+                and config.multimodal_config.encoder_data_parallel_size > 1):
+            model_cls = AutoModelForCausalLM._resolve_class(config)
+            if model_cls is not None and not getattr(
+                    model_cls, "supports_encoder_data_parallel", False):
+                raise NotImplementedError(
+                    f"{model_cls.__name__} does not support multimodal encoder data parallelism."
+                )
         # Some model constructors normalize or rewrite config fields. Capture
         # the registry identity from the resolved input before construction so
         # publication and reception qualify the architecture the user asked

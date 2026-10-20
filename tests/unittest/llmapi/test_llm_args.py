@@ -1714,6 +1714,46 @@ class TestMultimodalConfig:
         assert args.multimodal_config.encoder_scheduling_policy == "DEFAULT"
         assert args.multimodal_config.video_pruning_rate is None
 
+    @pytest.mark.parametrize(
+        "parallel_args,error_match",
+        [
+            ({
+                "tensor_parallel_size": 2,
+                "enable_attention_dp": True
+            }, "cannot be combined"),
+            ({
+                "tensor_parallel_size": 2,
+                "pipeline_parallel_size": 2
+            }, "requires pipeline_parallel_size"),
+            ({
+                "tensor_parallel_size": 2,
+                "context_parallel_size": 2
+            }, "requires pipeline_parallel_size"),
+            ({
+                "tensor_parallel_size": 4
+            }, "must equal tensor_parallel_size"),
+        ],
+    )
+    def test_encoder_dp_rejects_invalid_parallelism_at_startup(
+            self, parallel_args, error_match):
+        with pytest.raises(ValueError, match=error_match):
+            TorchLlmArgs(
+                model=llama_model_path,
+                multimodal_config=MultimodalConfig(
+                    encoder_data_parallel_size=2),
+                **parallel_args,
+            )
+
+    @pytest.mark.parametrize("encoder_dp_size", [1, 2])
+    def test_encoder_dp_accepts_valid_parallelism(self, encoder_dp_size):
+        args = TorchLlmArgs(
+            model=llama_model_path,
+            tensor_parallel_size=2,
+            multimodal_config=MultimodalConfig(
+                encoder_data_parallel_size=encoder_dp_size),
+        )
+        assert args.multimodal_config.encoder_data_parallel_size == encoder_dp_size
+
     def test_disable_mm_encoder_disables_encoder_cache(self):
         multimodal_config = MultimodalConfig(encoder_cache_max_bytes="1MiB")
         args = TorchLlmArgs(

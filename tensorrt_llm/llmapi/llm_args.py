@@ -7062,6 +7062,26 @@ class TorchLlmArgs(BaseLlmArgs):
         return self
 
     @model_validator(mode="after")
+    def validate_encoder_data_parallel(self) -> 'TorchLlmArgs':
+        size = self.multimodal_config.encoder_data_parallel_size
+        if size <= 1:
+            return self
+        if self.enable_attention_dp:
+            raise ValueError(
+                "multimodal_config.encoder_data_parallel_size > 1 cannot be "
+                "combined with enable_attention_dp.")
+        if self.pipeline_parallel_size != 1 or self.context_parallel_size != 1:
+            raise ValueError(
+                "multimodal_config.encoder_data_parallel_size > 1 requires "
+                "pipeline_parallel_size == 1 and context_parallel_size == 1.")
+        if size != self.tensor_parallel_size:
+            raise ValueError(
+                "multimodal_config.encoder_data_parallel_size must equal "
+                f"tensor_parallel_size ({self.tensor_parallel_size}), got {size}."
+            )
+        return self
+
+    @model_validator(mode="after")
     def validate_encode_only_torch_compile_config(self) -> 'TorchLlmArgs':
         if (self.encode_only and self.torch_compile_config is not None
                 and self.torch_compile_config.enable_piecewise_cuda_graph):

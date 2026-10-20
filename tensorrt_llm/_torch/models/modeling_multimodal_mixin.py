@@ -36,7 +36,7 @@ from typing import (
 
 import torch
 
-from tensorrt_llm._torch.distributed import AllReduce, AllReduceStrategy, Distributed
+from tensorrt_llm._torch.distributed import Distributed, allgather
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.tensor_lru_cache import TensorLRUCache
 from tensorrt_llm._utils import prefer_pinned
@@ -60,7 +60,11 @@ from .modeling_multimodal_utils import (
     fuse_input_embeds,
     get_multimodal_embeddings,
 )
-from .multimodal_encoder_data_parallel import EncoderDpItem, execute_encoder_dp_items
+from .multimodal_encoder_data_parallel import (
+    EncoderDpItem,
+    encoder_dp_error_guard,
+    execute_encoder_dp_items,
+)
 
 
 class MultimodalEncoderContractError(ValueError):
@@ -352,7 +356,10 @@ def make_multimodal_encoder_model_config(model_config: ModelConfig) -> ModelConf
     Both modes need an unsharded encoder on every participating rank, while the
     language model keeps the original mapping.
     """
-    encoder_config = copy.deepcopy(model_config)
+    # Encoder submodules register with the execution engine's shared registry.
+    encoder_config = copy.deepcopy(
+        model_config, {id(model_config.extra_attrs): model_config.extra_attrs}
+    )
     mapping = model_config.mapping
     encoder_dp_size = _encoder_data_parallel_size(model_config)
 
@@ -762,25 +769,12 @@ class MultimodalModelMixin:
         """Whether encoder items are distributed over the model's TP group."""
         mapping = self.model_config.mapping
         encoder_dp_size = self.encoder_data_parallel_size
-        if encoder_dp_size > 1 and not self.supports_encoder_data_parallel:
-            raise NotImplementedError(
-                f"{type(self).__name__} does not support multimodal encoder data parallelism."
-            )
         return not mapping.enable_attention_dp and encoder_dp_size > 1
 
-    def _get_encoder_dp_allreduce(self) -> AllReduce:
-        allreduce = getattr(self, "_encoder_dp_allreduce", None)
-        if allreduce is None:
-            allreduce = AllReduce(
-                self.model_config.mapping,
-                strategy=AllReduceStrategy.NCCL,
-                dtype=self.embedding_dtype,
-            )
-            self._encoder_dp_allreduce = allreduce
-        return allreduce
-
-    def _allreduce_encoder_dp_tensor(self, tensor: torch.Tensor) -> torch.Tensor:
-        return self._get_encoder_dp_allreduce()(tensor)
+    def _allgather_encoder_dp_output(
+        self, tensor: torch.Tensor, row_counts: list[int]
+    ) -> torch.Tensor:
+        return allgather(tensor, self.model_config.mapping, dim=0, sizes=row_counts)
 
     def _any_encoder_dp_rank_failed(self, local_failed: bool) -> bool:
         """Exchange CPU status without waiting for queued encoder CUDA work."""
@@ -794,7 +788,9 @@ class MultimodalModelMixin:
 
         Physical input tokens determine placement; output rows determine
         reconstruction. Requests without item metadata stay atomic and use
-        their total output rows as an approximate placement cost.
+        output rows as a fallback cost. This can underestimate physical input
+        work (e.g. spatial merging) and skew placement in mixed batches.
+        Providers should supply encoder_token_lengths for comparable costs.
         """
         items: list[EncoderDpItem] = []
         item_inputs: list[tuple[int, int | None]] = []
@@ -872,12 +868,6 @@ class MultimodalModelMixin:
         if mapping.enable_attention_dp or not self.encoder_data_parallel_active:
             return self.encode_multimodal_inputs(params, **encoder_kwargs)
 
-        if self.encoder_data_parallel_size != mapping.tp_size:
-            raise ValueError(
-                "multimodal_config.encoder_data_parallel_size must equal the tensor "
-                f"parallel size ({mapping.tp_size}), got {self.encoder_data_parallel_size}."
-            )
-
         encoder_dp_inputs = self._build_encoder_dp_items(params)
         if encoder_dp_inputs is not None:
             items, item_inputs = encoder_dp_inputs
@@ -902,7 +892,7 @@ class MultimodalModelMixin:
                 prepare_local_inputs=prepare_local_inputs,
                 encode_local_inputs=encode_local_inputs,
                 any_rank_failed=self._any_encoder_dp_rank_failed,
-                allreduce=self._allreduce_encoder_dp_tensor,
+                allgather=self._allgather_encoder_dp_output,
                 output_dim=self.embedding_dim,
                 output_dtype=self.embedding_dtype,
                 output_device=embedding_weight.device,
@@ -912,22 +902,8 @@ class MultimodalModelMixin:
         # partitioning, so every rank measures the full dummy encoder. Retain a
         # status collective so a rank-local profiling failure is not observed as
         # success by peer ranks.
-        local_error: Optional[Exception] = None
-        local_output: Optional[torch.Tensor] = None
-        try:
+        with encoder_dp_error_guard(self._any_encoder_dp_rank_failed):
             local_output = self.encode_multimodal_inputs(params, **encoder_kwargs)
-        except Exception as error:
-            # Every rank must reach the status collective so profiling failures
-            # are reported consistently before language-model execution.
-            local_error = error
-
-        if self._any_encoder_dp_rank_failed(local_error is not None):
-            if local_error is not None:
-                raise RuntimeError("Multimodal encoder data-parallel rank failed.") from local_error
-            raise RuntimeError("Multimodal encoder data-parallel peer rank failed.")
-
-        if local_output is None:
-            raise RuntimeError("Multimodal encoder profiling produced no output.")
         return local_output
 
     @property
@@ -1217,7 +1193,8 @@ class MultimodalModelMixin:
             modality in ("image", "video")
             and isinstance(modality_data.get("pixel_values"), torch.Tensor)
             and modality_data["pixel_values"].ndim >= 2
-            and (item_count is None or modality_data["pixel_values"].shape[0] == item_count)
+            and item_count is not None
+            and modality_data["pixel_values"].shape[0] == item_count
         ):
             # Stacked layout: dim-0 select from pixel values and parallel metadata.
             n_items = modality_data["pixel_values"].shape[0]

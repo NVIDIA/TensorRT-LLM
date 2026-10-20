@@ -22,6 +22,7 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.models.modeling_auto import AutoModelForCausalLM
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import (
     MultimodalModelMixin,
     _assemble_multimodal_encoder_embeddings,
@@ -29,6 +30,7 @@ from tensorrt_llm._torch.models.modeling_multimodal_mixin import (
     reorder_multimodal_embeddings_by_modality,
 )
 from tensorrt_llm._torch.modules.embedding import Embedding
+from tensorrt_llm._torch.pyexecutor.model_loader import ModelLoader
 from tensorrt_llm.inputs.multimodal import (
     MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
     MultimodalInput,
@@ -176,9 +178,17 @@ class DataParallelEncoderMultimodalModel(DummyMultimodalModel):
                 rows.append(torch.full((length, 2), float(item_id)))
         return torch.cat(rows, dim=0)
 
-    def _allreduce_encoder_dp_tensor(self, tensor: torch.Tensor) -> torch.Tensor:
+    def _allgather_encoder_dp_output(
+        self, tensor: torch.Tensor, row_counts: list[int]
+    ) -> torch.Tensor:
         assert self.peer_output is not None
-        return tensor + self.peer_output
+        outputs = (
+            [tensor, self.peer_output]
+            if self.model_config.mapping.tp_rank == 0
+            else [self.peer_output, tensor]
+        )
+        assert [output.shape[0] for output in outputs] == row_counts
+        return torch.cat(outputs)
 
     def _any_encoder_dp_rank_failed(self, local_failed: bool) -> bool:
         return local_failed
@@ -277,6 +287,8 @@ def test_make_multimodal_encoder_model_config_replicates_encoder_mapping(world_s
 
     encoder_config = make_multimodal_encoder_model_config(model_config)
 
+    assert encoder_config is not model_config
+    assert encoder_config.extra_attrs is model_config.extra_attrs
     assert model_config.mapping.tp_size == world_size
     assert encoder_config.mapping.tp_size == 1
     assert encoder_config.mapping.pp_size == world_size
@@ -342,9 +354,7 @@ def test_encoder_data_parallel_rejects_unsupported_parallelism(mapping, error_ma
 def test_encoder_data_parallel_partitions_items_and_restores_order():
     param = make_encoder_dp_param()
     rank_zero_model = DataParallelEncoderMultimodalModel(rank=0)
-    rank_zero_model.peer_output = (
-        torch.tensor([0.0] * 4 + [20.0] + [30.0] * 3).unsqueeze(1).repeat(1, 2)
-    )
+    rank_zero_model.peer_output = torch.tensor([20.0] + [30.0] * 3).unsqueeze(1).repeat(1, 2)
 
     output = rank_zero_model._run_multimodal_encoder([param])
 
@@ -357,7 +367,7 @@ def test_encoder_data_parallel_partitions_items_and_restores_order():
 def test_item_scheduled_encoder_uses_data_parallel_execution():
     param = make_encoder_dp_param()
     model = DataParallelEncoderMultimodalModel(rank=0)
-    model.peer_output = torch.tensor([20.0, 0.0, 0.0, 0.0]).unsqueeze(1).repeat(1, 2)
+    model.peer_output = torch.tensor([20.0]).unsqueeze(1).repeat(1, 2)
 
     encoder_inputs = model.prepare_multimodal_encoder_inputs([(param, 1), (param, 2)])
     outputs = model.forward_multimodal_encoder_items(encoder_inputs)
@@ -378,7 +388,7 @@ def test_encoder_dp_uses_the_model_item_slicer() -> None:
         "pixel_values"
     )
     model = DataParallelEncoderMultimodalModel(rank=0)
-    model.peer_output = torch.tensor([10.0] * 4 + [0.0] + [30.0] * 3).unsqueeze(1).repeat(1, 2)
+    model.peer_output = torch.tensor([10.0] * 4 + [30.0] * 3).unsqueeze(1).repeat(1, 2)
 
     def slice_tiles(
         source: MultimodalParams,
@@ -418,7 +428,7 @@ def test_encoder_dp_uses_modality_local_indices_in_prompt_order() -> None:
         }
     )
     model = DataParallelEncoderMultimodalModel(rank=0)
-    model.peer_output = torch.tensor([10.0] * 4 + [0.0] + [30.0] * 3).unsqueeze(1).repeat(1, 2)
+    model.peer_output = torch.tensor([10.0] * 4 + [30.0] * 3).unsqueeze(1).repeat(1, 2)
 
     output = model._run_multimodal_encoder([param])
 
@@ -433,7 +443,7 @@ def test_encoder_dp_keeps_requests_atomic_without_item_metadata() -> None:
     param = make_encoder_dp_param()
     del param.multimodal_data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY]
     model = DataParallelEncoderMultimodalModel(rank=0)
-    model.peer_output = torch.zeros(8, 2)
+    model.peer_output = torch.empty(0, 2)
 
     output = model._run_multimodal_encoder([param])
 
@@ -446,7 +456,7 @@ def test_encoder_dp_keeps_requests_atomic_without_item_metadata() -> None:
 def test_encoder_data_parallel_uses_physical_input_token_costs():
     param = make_encoder_dp_param_with_input_costs()
     model = DataParallelEncoderMultimodalModel(rank=0)
-    model.peer_output = torch.tensor([10.0] * 4 + [0.0] + [30.0] * 3).unsqueeze(1).repeat(1, 2)
+    model.peer_output = torch.tensor([10.0] * 4 + [30.0] * 3).unsqueeze(1).repeat(1, 2)
 
     output = model._run_multimodal_encoder([param])
 
@@ -467,15 +477,31 @@ def test_attention_data_parallel_encodes_only_local_requests_without_collective(
 
 
 @pytest.mark.cpu_only
-def test_encoder_data_parallel_requires_model_opt_in():
-    model = DummyMultimodalModel(make_embedding(), torch.tensor([7]))
-    model.model_config = ModelConfig(
+def test_encoder_data_parallel_checks_model_opt_in_before_construction():
+    config = ModelConfig(
         mapping=Mapping(world_size=2, rank=0, tp_size=2),
         multimodal_config=MultimodalConfig(encoder_data_parallel_size=2),
     )
 
-    with pytest.raises(NotImplementedError, match="does not support"):
-        model._run_multimodal_encoder([make_encoder_dp_param()])
+    with (
+        patch.object(AutoModelForCausalLM, "_resolve_class", return_value=DummyMultimodalModel),
+        patch.object(ModelLoader, "_load_and_validate_config", return_value=config),
+        patch.object(AutoModelForCausalLM, "from_config") as constructor,
+    ):
+        with pytest.raises(NotImplementedError, match="does not support"):
+            object.__new__(ModelLoader).load("unused", None)
+        constructor.assert_not_called()
+
+
+@pytest.mark.cpu_only
+def test_encoder_dp_does_not_revalidate_nested_text_submodels():
+    config = ModelConfig(multimodal_config=MultimodalConfig(encoder_data_parallel_size=2))
+    with (
+        patch.object(AutoModelForCausalLM, "_resolve_class", return_value=DummyMultimodalModel),
+        patch.object(DummyMultimodalModel, "__init__", return_value=None) as constructor,
+    ):
+        AutoModelForCausalLM.from_config(config)
+        constructor.assert_called_once_with(config)
 
 
 def test_reorder_modality_grouped_embeddings_restores_prompt_order():
@@ -1203,6 +1229,43 @@ def test_build_multimodal_encoder_input_slices_audio_input_features():
     torch.testing.assert_close(residual_audio["input_features_mask"], mask[[1, 0]])
 
 
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "modality,fields",
+    [
+        (
+            "image",
+            {
+                "pixel_values": torch.arange(24).reshape(3, 4, 2),
+                "image_position_ids": torch.arange(24).reshape(3, 4, 2),
+                "image_seq_lens": [4, 3, 2],
+            },
+        ),
+        (
+            "audio",
+            {
+                "audio_features": torch.arange(24).reshape(3, 4, 2),
+                "audio_features_mask": torch.arange(12).reshape(3, 4),
+            },
+        ),
+    ],
+)
+def test_build_multimodal_encoder_input_slices_item_major_metadata(modality, fields):
+    param = MultimodalParams(
+        multimodal_data={modality: fields, "multimodal_embedding_lengths": [4, 3, 2]}
+    )
+    model = DummyMultimodalModel(make_embedding(hidden_size=1), torch.tensor([0]))
+
+    residual = model.build_multimodal_encoder_input(param, [2, 0])
+
+    for name, source in fields.items():
+        selected = residual.multimodal_data[modality][name]
+        if isinstance(source, torch.Tensor):
+            torch.testing.assert_close(selected, source[[2, 0]])
+        else:
+            assert selected == [source[2], source[0]]
+
+
 @pytest.mark.parametrize(
     "mm_data, expected_match",
     [
@@ -1211,10 +1274,16 @@ def test_build_multimodal_encoder_input_slices_audio_input_features():
         # Modality present but layout is neither pattern A (image_sizes) nor pattern B
         # (grid_thw); default has nothing to dispatch on.
         ({"image": {"pixel_values": torch.zeros(2)}}, "cannot slice image layout"),
+        ({"image": {"pixel_values": torch.zeros(2, 6)}}, "cannot slice image layout"),
         # Audio modality but no `input_features`; default falls through.
         ({"audio": {"nonsense": torch.zeros(2)}}, "cannot slice audio layout"),
     ],
-    ids=["no_modality", "unhandled_image_layout", "unhandled_audio_layout"],
+    ids=[
+        "no_modality",
+        "unhandled_image_layout",
+        "unknown_image_item_count",
+        "unhandled_audio_layout",
+    ],
 )
 def test_build_multimodal_encoder_input_unhandled_layout_raises(mm_data, expected_match):
     param = MultimodalParams(multimodal_data=mm_data)

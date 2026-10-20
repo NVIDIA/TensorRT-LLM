@@ -16,6 +16,7 @@
 import pickle
 import sys
 from contextlib import nullcontext
+from functools import partial
 from unittest.mock import patch
 
 import cloudpickle
@@ -122,7 +123,7 @@ def _make_param(item_ids: list[int], lengths: list[int]) -> MultimodalParams:
 
 
 @torch.inference_mode()
-def _run_encoder_dp_rank(enable_attention_dp: bool):
+def _run_encoder_dp_rank(enable_attention_dp: bool, lengths: list[int] | None = None):
     rank = tensorrt_llm.mpi_rank()
     torch.cuda.set_device(rank)
     model = _EncoderDpModel(rank, enable_attention_dp=enable_attention_dp)
@@ -130,7 +131,8 @@ def _run_encoder_dp_rank(enable_attention_dp: bool):
     if enable_attention_dp:
         param = _make_param([10 + rank], [rank + 1])
     else:
-        param = _make_param([10, 20, 30], [4, 1, 3])
+        lengths = [4, 1, 3] if lengths is None else lengths
+        param = _make_param([10, 20, 30][: len(lengths)], lengths)
 
     output = model._run_multimodal_encoder([param])
     model.encoded_item_ids.clear()
@@ -178,15 +180,25 @@ def test_encoder_dp_propagates_rank_failure_and_recovers(mpi_pool_executor):
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs 2 GPUs")
 @pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
-def test_encoder_dp_partitions_and_reconstructs_with_nccl(mpi_pool_executor):
-    results = mpi_pool_executor.map(_run_encoder_dp_rank, [False, False])
+@pytest.mark.parametrize(
+    "lengths,expected_item_ids",
+    [([4, 1, 3], [[10], [20, 30]]), ([2, 4, 1], [[20], [10, 30]]), ([4], [[10], []])],
+    ids=["equal_rows", "unequal_rows_reordered", "empty_rank"],
+)
+def test_encoder_dp_partitions_and_reconstructs_with_nccl(
+    mpi_pool_executor, lengths, expected_item_ids
+):
+    results = mpi_pool_executor.map(partial(_run_encoder_dp_rank, lengths=lengths), [False, False])
     results = sorted(results)
 
-    assert results[0][1] == [10]
-    assert results[1][1] == [20, 30]
+    assert [result[1] for result in results] == expected_item_ids
     expected = (
         torch.tensor(
-            [10.0] * 4 + [20.0] + [30.0] * 3,
+            [
+                item_id
+                for item_id, length in zip([10.0, 20.0, 30.0], lengths)
+                for _ in range(length)
+            ],
             dtype=torch.bfloat16,
         )
         .unsqueeze(1)
