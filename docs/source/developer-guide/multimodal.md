@@ -94,6 +94,10 @@ Params order/length fallbacks have been removed.
 
 ## Onboarding a Model
 
+Follow [Adding a New Model](../models/adding-new-model.md) for model definition,
+weight loading, and registration. This section covers the additional multimodal
+processor and execution contracts.
+
 Start with full-request encoding and add item scheduling only when the model
 can encode its items independently. Use these contracts rather than inventing
 encoder costs or inferring item axes from matching tensor sizes.
