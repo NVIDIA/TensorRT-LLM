@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test for the low_m_bf16_mm catalog entry.
+"""GPU test for the low_m_bf16_mm entry.
 
 Every cell names the branch `plan` must pick, so a table edit that moves a
 shape to another kernel fails here before it can change a number silently.
@@ -14,12 +14,14 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.low_m_bf16_mm import (
+from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.gemm.low_m_bf16_mm import (  # noqa: E501
     low_m_bf16_mm as op,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.low_m_bf16_mm import plan
+from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.gemm.low_m_bf16_mm import (  # noqa: E501
+    plan,
+)
 
-__extra_import_path__ = [".."]
+__extra_import_path__ = ["../../../.."]
 from _validating import (  # noqa: E402,F401 — path above; fixture by name
     ULP,
     assert_within_ulp,

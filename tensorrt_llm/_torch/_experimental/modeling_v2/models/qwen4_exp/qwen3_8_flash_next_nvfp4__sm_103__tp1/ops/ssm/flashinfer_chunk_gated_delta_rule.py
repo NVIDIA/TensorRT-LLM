@@ -21,11 +21,10 @@ from typing import Optional, Tuple
 
 import torch
 
+from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 from tensorrt_llm._torch.modules.fla.flashinfer_chunk import (
     chunk_gated_delta_rule as _fi_chunk_gated_delta_rule,
 )
-
-from .._op import Arch, Cell, OpWrapper
 
 #: qwen3.8-flash-next-nvfp4's Gated DeltaNet at tp1: (H, HV, K, V) -- 16 q/k
 #: heads, 48 v heads, head dims 128.

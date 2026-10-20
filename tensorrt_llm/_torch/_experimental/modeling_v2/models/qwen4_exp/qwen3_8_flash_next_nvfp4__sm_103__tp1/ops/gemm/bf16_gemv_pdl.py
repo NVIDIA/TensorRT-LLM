@@ -311,7 +311,7 @@ def _cell(why: str, m: int, n: int, k: int, pdl: bool = True) -> Cell:
 class Bf16GemvPdl(OpWrapper):
     """`mat_a @ mat_b` in bf16 with fp32 accumulation, one PDL launch per call.
 
-    A drop-in for `catalog/gemm/low_m_bf16_mm` at decode row counts: `mat_a` is
+    A drop-in for `ops/gemm/low_m_bf16_mm` at decode row counts: `mat_a` is
     dense row-major `[M, K]` with `M <= MAX_ROWS`, `mat_b` the dense column-major
     `[K, N]` view of a stored `[N, K]` weight (its `.t()`), the result a fresh
     row-major `[M, N]` bf16 tensor. With `pdl` (and PDL available) the kernel is

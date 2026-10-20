@@ -46,7 +46,7 @@ Differences from other targets:
   layer's FP8 block-scale experts run on trtllm-gen under either. Under ``TRTLLM`` the
   prefill-sized launches (``_CUTE_DSL_MOE_MIN_ROWS``) run the CuteDSL pipeline over a
   second copy of the experts in its layout. A graph-captured decode step routes its block
-  projections through ``catalog/gemm/low_m_bf16_mm`` (FlashInfer low-M kernels at
+  projections through ``ops/gemm/low_m_bf16_mm`` (FlashInfer low-M kernels at
   M <= 32 on the shapes it lists, cuBLAS otherwise); see ``DecodeTarget.forward``.
 
 Integration facts this file depends on:
@@ -124,12 +124,8 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.thop_attent
     thop_attention,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.cublas_mm import cublas_mm
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.low_m_bf16_mm import low_m_bf16_mm
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.graph.eager_on_graph import (
     eager_on_graph,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.ssm.flashinfer_chunk_gated_delta_rule import (  # noqa: E501
-    flashinfer_chunk_gated_delta_rule,
 )
 from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
@@ -170,6 +166,7 @@ from .ops.attention.vision_rope_2d import vision_rope_2d
 from .ops.embedding.ngram_hash import ngram_hash
 from .ops.gemm.bf16_gemv_pdl import TILING as _GEMV_TILED_K
 from .ops.gemm.bf16_gemv_pdl import bf16_gemv_pdl
+from .ops.gemm.low_m_bf16_mm import low_m_bf16_mm
 from .ops.hc.qwen4_exp_gated_residual import qwen4_exp_gated_residual
 from .ops.hc.qwen4_exp_hc_decode_first_cute import qwen4_exp_hc_decode_first_cute
 from .ops.hc.qwen4_exp_hc_decode_mix_fp4_cute import (
@@ -211,6 +208,7 @@ from .ops.ssm.chunk_gated_delta_rule import chunk_gated_delta_rule
 from .ops.ssm.cu_seqlens_from_seq_lens import cu_seqlens_from_seq_lens
 from .ops.ssm.dilated_short_conv_paged import dilated_short_conv_paged
 from .ops.ssm.extract_transpose_prefill_slice import extract_transpose_prefill_slice
+from .ops.ssm.flashinfer_chunk_gated_delta_rule import flashinfer_chunk_gated_delta_rule
 from .ops.ssm.fused_gdn_gating import fused_gdn_gating
 from .ops.ssm.fused_gdn_post_conv import fused_gdn_post_conv
 from .ops.ssm.fused_recurrent_gated_delta_rule_cached_replay_update import (
