@@ -25,16 +25,21 @@ l0_b300:
   - unittest/_torch/modules/test_engram_replay.py
   - unittest/_torch/speculative/hw_agnostic/test_dspark_v41.py
   - unittest/_torch/modules/test_mhc.py::test_fused_hc_lagged_matches_eager_composition
-  # Covers tests/unittest/_torch/attention/. Two sub-trees moved in here from elsewhere
-  # under tests/unittest/_torch/ and have no entry of their own on any list, so this entry
-  # is what picks them up:
-  #   kernels/    fused attention kernels (ex thop/ and custom_ops/)
-  #   multi_gpu/  helix tests -- each case spawns a 2-rank MPIPoolExecutor pinned to GPU 0/1
-  #               by absolute index, and they gate on >= 2 GPUs plus Blackwell. They also
-  #               rebind mpi4py's serializer at import time, which applies process-wide on
-  #               every stage that collects them, including where the tests themselves skip.
-  # The sparse/dsa/test_cute_dsl_* files ignored below keep their own entries (pre-existing).
-  - unittest/_torch/attention --ignore=unittest/_torch/attention/sparse/dsa/test_cute_dsl_fp8_paged_mqa_logits.py --ignore=unittest/_torch/attention/sparse/dsa/test_cute_dsl_fp4_paged_mqa_logits.py --ignore=unittest/_torch/attention/sparse/test_cute_dsl_gvr_topk_decode.py --ignore=unittest/_torch/attention/sparse/test_cute_dsl_gvr_topk_tiers.py --ignore=unittest/_torch/attention/sparse/msa/test_minimax_m3_sparse_attn_decode.py --ignore=unittest/_torch/attention/sparse/msa/test_msa_proxy_split.py TIMEOUT (90)
+  # Covers tests/unittest/_torch/attention/ on B300. kernels/ has no entry of its own on
+  # any list, so this entry is what runs it; multi_gpu/ has its own entries only in
+  # l0_dgx_b300.
+  # - Width: no agg_unit_mem_df.csv row matches this entry text, so test_unittests runs
+  #   it with one xdist worker and no --lf retry. With no TIMEOUT, the --timeout=3600 that
+  #   CI passes to pytest bounds the whole entry.
+  # - kernels/parallel_hw_agnostic/ is ignored: its cases do not depend on the GPU
+  #   architecture, so they run on H100 (l0_h100), with the cpu_only ones on CPU (l0_cpu).
+  #   GB300 (l0_gb300_multi_gpus) also runs them, to keep its csv match; that post_merge
+  #   stage is the only Blackwell stage that does.
+  # - multi_gpu/ cases need >= 2 GPUs and skip on this 1-GPU stage. Its helix files rebind
+  #   mpi4py's serializer at import time, which applies process-wide on every stage that
+  #   collects them, including where the tests themselves skip.
+  # - The other files ignored here have their own entries below.
+  - unittest/_torch/attention --ignore=unittest/_torch/attention/sparse/dsa/test_cute_dsl_fp8_paged_mqa_logits.py --ignore=unittest/_torch/attention/sparse/dsa/test_cute_dsl_fp4_paged_mqa_logits.py --ignore=unittest/_torch/attention/sparse/test_cute_dsl_gvr_topk_decode.py --ignore=unittest/_torch/attention/sparse/test_cute_dsl_gvr_topk_tiers.py --ignore=unittest/_torch/attention/sparse/msa/test_minimax_m3_sparse_attn_decode.py --ignore=unittest/_torch/attention/sparse/msa/test_msa_proxy_split.py --ignore=unittest/_torch/attention/kernels/parallel_hw_agnostic TIMEOUT (90)
   # Run cold-JIT MSA coverage separately from the attention aggregate.
   # Cold-JIT runs take about 25 minutes; allow a 45-minute budget.
   - unittest/_torch/attention/sparse/msa/test_minimax_m3_sparse_attn_decode.py TIMEOUT (45)
