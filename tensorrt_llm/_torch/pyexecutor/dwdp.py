@@ -180,7 +180,11 @@ class DwdpManager:
         rendezvous; both expose ``allgather`` / ``Barrier`` / ``Free``.
         """
         if self._store_rendezvous:
-            return StoreDwdpGroup.from_env(global_rank=self.rank, dwdp_size=self.dwdp_size)
+            return StoreDwdpGroup.from_env(
+                global_rank=self.rank,
+                dwdp_size=self.dwdp_size,
+                num_groups=self.config.num_groups,
+            )
 
         group_id = self.rank // self.dwdp_size
         group_start = group_id * self.dwdp_size
@@ -270,6 +274,9 @@ class DwdpManager:
             contention_opt=self.config.contention_opt,
         )
         self._model_ref = weakref.ref(model)
+        if self._store_rendezvous:
+            # Lets DWDP rank 0, which serves the store, release it once every group is set up.
+            self.dwdp_group.mark_setup_done()
         return self._weight_manager
 
     # ------------------------------------------------------------------

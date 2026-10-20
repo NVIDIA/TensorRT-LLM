@@ -149,10 +149,10 @@ def test_from_env_reads_port_and_timeout(clean_env):
     clean_env.setenv(DWDP_MASTER_PORT_ENV, "31000")
     clean_env.setenv(DWDP_TIMEOUT_ENV, "60")
     with patch(f"{_MOD}.StoreDwdpGroup.__init__", return_value=None) as mock_init:
-        StoreDwdpGroup.from_env(global_rank=2, dwdp_size=4)
+        StoreDwdpGroup.from_env(global_rank=2, dwdp_size=4, num_groups=3)
     kwargs = mock_init.call_args.kwargs
     assert kwargs["master_addr"] == "node-a"
-    assert (kwargs["master_port"], kwargs["timeout_s"]) == (31000, 60)
+    assert (kwargs["master_port"], kwargs["timeout_s"], kwargs["num_groups"]) == (31000, 60, 3)
 
 
 # ----------------------------------------------------------------------
@@ -246,7 +246,12 @@ def _run_workers(target, ranks):
 def test_two_groups_rendezvous_over_a_localhost_tcpstore():
     """Two groups of two workers share one TCPStore hosted by DWDP rank 0."""
     master = StoreDwdpGroup(
-        global_rank=0, dwdp_size=2, master_addr=_LOCALHOST, master_port=0, timeout_s=60
+        global_rank=0,
+        dwdp_size=2,
+        master_addr=_LOCALHOST,
+        master_port=0,
+        timeout_s=60,
+        num_groups=2,
     )
     port = master._store.port
     groups = {0: master}
@@ -254,7 +259,12 @@ def test_two_groups_rendezvous_over_a_localhost_tcpstore():
 
     def worker(rank):
         group = groups.get(rank) or StoreDwdpGroup(
-            global_rank=rank, dwdp_size=2, master_addr=_LOCALHOST, master_port=port, timeout_s=60
+            global_rank=rank,
+            dwdp_size=2,
+            master_addr=_LOCALHOST,
+            master_port=port,
+            timeout_s=60,
+            num_groups=2,
         )
         groups[rank] = group
         results[rank] = group.allgather(torch.tensor([rank]))
@@ -290,6 +300,81 @@ def test_free_on_rank0_shuts_the_store_down():
     gc.collect()
     with pytest.raises((RuntimeError, TimeoutError)):
         TCPStore(_LOCALHOST, port, is_master=False, timeout=timedelta(seconds=2))
+
+
+def test_rank0_free_keeps_the_store_until_every_group_is_set_up():
+    """Group 0 finishing first must not cut off group 1, which still exchanges handles."""
+    groups = {
+        0: StoreDwdpGroup(
+            global_rank=0,
+            dwdp_size=2,
+            master_addr=_LOCALHOST,
+            master_port=0,
+            timeout_s=60,
+            num_groups=2,
+        )
+    }
+    port = groups[0]._store.port
+    for rank in (1, 2, 3):
+        groups[rank] = StoreDwdpGroup(
+            global_rank=rank,
+            dwdp_size=2,
+            master_addr=_LOCALHOST,
+            master_port=port,
+            timeout_s=60,
+            num_groups=2,
+        )
+
+    # Group 0 is set up and shuts down; rank 0's Free must wait for group 1.
+    groups[1].Free()
+    rank0_free = threading.Thread(target=groups[0].Free, daemon=True)
+    rank0_free.start()
+    rank0_free.join(timeout=1)
+    assert rank0_free.is_alive(), "rank 0 released the store while group 1 was still setting up"
+
+    # Group 1 can still run its setup collectives over the store.
+    results = {}
+
+    def group1_setup(rank):
+        results[rank] = groups[rank].allgather(f"handle-{rank}")
+        groups[rank].mark_setup_done()
+
+    _run_workers(group1_setup, ranks=(2, 3))
+    assert results == {2: ["handle-2", "handle-3"], 3: ["handle-2", "handle-3"]}
+
+    rank0_free.join(timeout=30)
+    assert not rank0_free.is_alive(), "rank 0 never released the store"
+    assert groups[0]._store is None
+    for rank in (3, 2):
+        groups[rank].Free()
+
+
+def test_rank0_free_gives_up_after_the_timeout():
+    store = _FakeStore()
+    group = StoreDwdpGroup(
+        global_rank=0, dwdp_size=2, master_addr="unused", timeout_s=0, store=store, num_groups=2
+    )
+    with patch(f"{_MOD}.logger") as mock_logger:
+        group.Free()
+    assert group._store is None
+    assert store.data["dwdp/setup_done"] == 1
+    mock_logger.warning.assert_called_once()
+
+
+def test_setup_done_counts_each_worker_once():
+    store = _FakeStore()
+    group = _group(1, 2, store)
+    group.mark_setup_done()
+    group.mark_setup_done()
+    group.Free()
+    assert store.data["dwdp/setup_done"] == 1
+
+
+def test_non_positive_num_groups_rejected():
+    with pytest.raises(ValueError, match="num_groups"):
+        StoreDwdpGroup(
+            global_rank=0, dwdp_size=2, master_addr="unused", store=_FakeStore(), num_groups=0
+        )
 
 
 # ----------------------------------------------------------------------
@@ -342,6 +427,7 @@ def test_manager_uses_store_group_without_mpi_world(clean_env, no_global_manager
         group = mgr.dwdp_group
         assert isinstance(group, StoreDwdpGroup)
         assert (group.Get_rank(), group.Get_size(), group._group_id) == (0, 2, 1)
+        assert group._num_workers == 4
         mgr.cleanup()
         mgr.cleanup()
 

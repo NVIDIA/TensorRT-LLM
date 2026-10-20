@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import os
 import pickle  # nosec B403
+import time
 from datetime import timedelta
 from typing import Any, List, Optional
 
@@ -42,6 +43,10 @@ DWDP_TIMEOUT_ENV = "TRTLLM_DWDP_RENDEZVOUS_TIMEOUT_S"
 
 DEFAULT_MASTER_PORT = 29600
 DEFAULT_TIMEOUT_S = 1800
+
+# Counts workers, across all groups, that finished setup or freed their group.
+_SETUP_DONE_KEY = "dwdp/setup_done"
+_SETUP_DONE_POLL_S = 0.1
 
 
 def store_rendezvous_enabled() -> bool:
@@ -80,7 +85,8 @@ class StoreDwdpGroup:
     """The ``allgather`` / ``Barrier`` / ``Free`` subset of an mpi4py communicator, over a TCPStore.
 
     Global DWDP rank 0 hosts the store for every group; keys are namespaced by group id, so
-    groups never see each other's payloads.
+    groups never see each other's payloads. Because the server lives in rank 0's process, rank 0
+    keeps it up on ``Free`` until every worker of every group has finished setup.
     """
 
     def __init__(
@@ -91,13 +97,19 @@ class StoreDwdpGroup:
         master_port: int = DEFAULT_MASTER_PORT,
         timeout_s: int = DEFAULT_TIMEOUT_S,
         store: Optional[Any] = None,
+        num_groups: int = 1,
     ) -> None:
         if dwdp_size <= 0:
             raise ValueError(f"dwdp_size must be positive, got {dwdp_size}")
+        if num_groups <= 0:
+            raise ValueError(f"num_groups must be positive, got {num_groups}")
         if global_rank < 0:
             raise ValueError(f"global_rank must be non-negative, got {global_rank}")
 
         self._size = dwdp_size
+        self._global_rank = global_rank
+        self._num_workers = num_groups * dwdp_size
+        self._setup_done = False
         self._rank = global_rank % dwdp_size
         self._group_id = global_rank // dwdp_size
         self._seq = 0
@@ -134,7 +146,7 @@ class StoreDwdpGroup:
         )
 
     @classmethod
-    def from_env(cls, global_rank: int, dwdp_size: int) -> "StoreDwdpGroup":
+    def from_env(cls, global_rank: int, dwdp_size: int, num_groups: int = 1) -> "StoreDwdpGroup":
         """Build the group from ``TRTLLM_DWDP_*``; see the module docstring."""
         master_addr = os.environ.get(DWDP_MASTER_ADDR_ENV)
         if not master_addr:
@@ -148,6 +160,7 @@ class StoreDwdpGroup:
             master_addr=master_addr,
             master_port=int(os.environ.get(DWDP_MASTER_PORT_ENV, DEFAULT_MASTER_PORT)),
             timeout_s=int(os.environ.get(DWDP_TIMEOUT_ENV, DEFAULT_TIMEOUT_S)),
+            num_groups=num_groups,
         )
 
     def Get_rank(self) -> int:
@@ -177,11 +190,40 @@ class StoreDwdpGroup:
         """Match ``MPI_Barrier``; waiting for every key is the synchronization."""
         self.allgather(None)
 
+    def mark_setup_done(self) -> None:
+        """Record that this worker no longer needs the store for setup. Idempotent."""
+        if self._store is None or self._setup_done:
+            return
+        self._store.add(_SETUP_DONE_KEY, 1)
+        self._setup_done = True
+
     def Free(self) -> None:
         """Match ``MPI_Comm_free``: drop the store. Idempotent.
 
         ``TCPStore`` has no explicit close; releasing the last reference closes this worker's
-        client connection and, on DWDP rank 0, stops the server along with its keys.
+        client connection and, on DWDP rank 0, stops the server along with its keys. Groups set
+        up independently, so rank 0 first waits, bounded by the rendezvous timeout, until every
+        worker has called ``mark_setup_done`` or ``Free``; otherwise its exit would cut off
+        groups still exchanging weight handles.
         """
+        if self._store is None:
+            return
+        self.mark_setup_done()
+        if self._global_rank == 0:
+            self._wait_for_all_setup_done()
         store, self._store = self._store, None
         del store
+
+    def _wait_for_all_setup_done(self) -> None:
+        deadline = time.monotonic() + self._timeout.total_seconds()
+        while True:
+            done = self._store.add(_SETUP_DONE_KEY, 0)
+            if done >= self._num_workers:
+                return
+            if time.monotonic() >= deadline:
+                logger.warning(
+                    f"[DWDP] closing the rendezvous store with {done}/{self._num_workers} "
+                    f"workers set up; groups still in setup will fail"
+                )
+                return
+            time.sleep(_SETUP_DONE_POLL_S)
