@@ -119,7 +119,7 @@ C-semantics notes encoded here:
 
 # ---- dispatch constants (must match the device kernels) ---------------------
 NB = 1024  # register-path histogram bins
-QUADC = 96  # crossing-bin O(mc^2) rank gate (streaming/reg paths, every register plan)
+QUADC = 96  # crossing-bin O(mc^2) rank gate for streaming paths
 SNB = 256  # streaming-path bin count
 CMPC = 4096  # crossing-bin slots per CTA, clustered register path
 BLKC = 1024  # CTA size of the clustered register path
@@ -165,7 +165,6 @@ def route(
     if long_register or short_wide:
         NBSEL = NB
     IMGOFF = NBSEL
-    smem_reg = (NBSEL + 2 * CMP) * 4
 
     def _reg(BLK, VPT, MINB, NBH):
         # Deterministic emitters pack one bit per scalar into a 32-bit mask.
@@ -186,13 +185,13 @@ def route(
                 "npad": npad,
                 "k": k,  # full ABI
                 "CMP": CMP,
-                "IMGOFF": IMGOFF,
+                "IMGOFF": NBH,
                 "QC": QC,
             },
             "grid": (b, 1),
             "cluster": 1,
             "block": BLK,
-            "smem": smem_reg,
+            "smem": (NBH + 2 * CMP) * 4,
             "ws": False,
         }
 
@@ -281,10 +280,7 @@ def route(
                 "ws": False,
             }
 
-    # 4K < n <= 8K (n4 in (1024, 2048]): one-wave register rungs. Wide rows:
-    # BLK=1024 x VPT=2 covers n4 <= 2048 exactly (the VPT=4 plan below carries
-    # two empty float4 slots per thread). num_sms < b <= 2*num_sms: two
-    # BLK=512 CTAs per SM form one wave; taller batches keep the main slab.
+    # 4K < n <= 8K: select register geometry from the row count and K.
     if n4 <= 2048:
         if wide:
             if k == 2048 and sm_version in (100, 103) and n4 <= 1536:
