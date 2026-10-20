@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 import platform
 import sys
 import types
@@ -59,6 +60,23 @@ if platform.system() != "Windows":
             IS_CUTLASS_DSL_RUBIN_AVAILABLE = True
     except ImportError:
         pass
+
+# Capacity of the CuTe DSL MLA decode's variable split-KV reducer
+# (cute_dsl_kernels/blackwell/attention/mla/mla_helpers.MAX_SPLITS).
+_CUTE_DSL_MLA_REDUCER_MAX_SPLITS = 256
+
+
+def get_cute_dsl_mla_max_split_kv() -> int:
+    """Split-KV cap of the CuTe DSL MLA decode: the largest tactic grid and the
+    largest per-request split plan.
+
+    ``TLLM_CUTE_DSL_MLA_MAX_SPLIT_KV`` (read at import of the users; default 32,
+    clamped to 1..256) raises it for long-context decode with few requests,
+    where 32 splits leave most of the GPU idle.
+    """
+    value = os.environ.get("TLLM_CUTE_DSL_MLA_MAX_SPLIT_KV", "")
+    max_split = int(value) if value.strip() else 32
+    return max(1, min(_CUTE_DSL_MLA_REDUCER_MAX_SPLITS, max_split))
 
 
 def install_cutlass_dsl_compatibility() -> None:
