@@ -51,7 +51,7 @@ if TYPE_CHECKING:
     from tensorrt_llm._torch.attention.backends.prims_ts.mla_decode import (
         BatchMLADecodePagedTSWrapper,
     )
-    from tensorrt_llm._torch.attention.backends.prims_ts.vc_attention import VCAttentionPreprocessor
+    from tensorrt_llm._torch.attention.backends.prims_ts.vc_quantization import VCAttentionPreprocessor
     from tensorrt_llm._torch.attention.backends.trtllm import (
         TrtllmAttention,
         TrtllmAttentionMetadata,
@@ -884,7 +884,7 @@ class PrimsTSFmha(PhasedFmha):
             # and E4M3 residuals on the V-Smooth schedule.
             vc_q = q_bshd if forward_args.vc_attention_qk_fp8 else None
             if forward_args.vc_repair_budget:
-                from tensorrt_llm._torch.attention.backends.prims_ts.vc_attention import (
+                from tensorrt_llm._torch.attention.backends.prims_ts.vc_quantization import (
                     vc_quantize_repair,
                 )
 
@@ -896,7 +896,7 @@ class PrimsTSFmha(PhasedFmha):
                 from tensorrt_llm._torch.visual_gen.denoise_step import get_denoise_step
 
                 if self._vc_preprocessor is None:
-                    from tensorrt_llm._torch.attention.backends.prims_ts.vc_attention import (
+                    from tensorrt_llm._torch.attention.backends.prims_ts.vc_quantization import (
                         VCAttentionPreprocessor,
                     )
 

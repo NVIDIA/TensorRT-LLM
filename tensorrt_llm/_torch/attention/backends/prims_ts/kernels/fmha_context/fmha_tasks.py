@@ -797,10 +797,11 @@ def create_load_task(
                 ) = gqkv.compute_coords()
                 smu.try_acquire()
                 smu.acquire()
-                smu.mu_load_last(
+                smu.mu_load(
                     kv_head_coord=kv_head_coord,
                     batch_coord=batch_coord,
                     kv_tile_start=kv_tile_start,
+                    is_tail=True,
                 )
                 smu.commit()
 
@@ -2389,6 +2390,8 @@ def create_softmax_task(
             p_chunk = sp.init_softmax_state()
         scale_softmax_log2 = sp.load_scale_softmax_log2()
 
+        # VC-Attention-QK16 sums the E4M3 probability codes inside the P store,
+        # so vc_store_p returns the row sum and softmax_aux_reduce is skipped.
         vc_state: dict[str, Any] = {
             "prev_sum": None,
             "row_sum": None,
@@ -2436,7 +2439,7 @@ def create_softmax_task(
                         p_chunk=p_chunk,
                         is_tail=is_tail,
                         **{
-                            f"vc_pend{i}": value
+                            f"vc_meansum{i}": value
                             for i, value in enumerate(vc_state["sums"])
                         },
                     )
@@ -2577,6 +2580,35 @@ def create_softmax_task(
                     )
                 # Acquire vec for next iter.
                 vec.acquire()
+
+            def publish_final_stats(row_max: Any, row_sum: Any) -> None:
+                """Store the last mean-group row sums or take the repair denominator, drain
+                the final SP slot and publish the identity stats of the work tile."""
+                if vc_restores_means:
+                    # The last row sums ride a second P handoff to the tail step.
+                    pb.acquire()
+                    sp.vc_store_rowsum_final(
+                        vc_prev_tile_sum=vc_state["prev_sum"],
+                        **{
+                            f"vc_meansum{i}": value
+                            for i, value in enumerate(vc_state["sums"])
+                        },
+                    )
+                    pb.commit()
+                elif vc_repairs_v:
+                    # The repair tiles stay out of the denominator.
+                    row_sum = vc_state["kept"]
+                if not p_in_smem:
+                    sp.wait()
+                    sp.release()
+                old_row_max = sp.softmax_aux_identity(row_max=row_max)
+                vec.store_vec(
+                    old_row_max=old_row_max,
+                    row_max=row_max,
+                    row_sum=row_sum,
+                    final_stats=True,
+                )
+                vec.commit()
 
             if tmem_sp.uses_head_paired_causal_tail_mask:
                 # Head-paired maps Q0/Q1 to adjacent Hq slices at the same S
@@ -2820,59 +2852,10 @@ def create_softmax_task(
                         scale_softmax_log2=scale_softmax_log2,
                     )
                 vec.acquire()
-                if vc_restores_means:
-                    # The last row sums ride a second P handoff to the tail step.
-                    pb.acquire()
-                    sp.vc_store_rowsum_final(
-                        vc_prev_tile_sum=vc_state["prev_sum"],
-                        **{
-                            f"vc_pend{i}": value
-                            for i, value in enumerate(vc_state["sums"])
-                        },
-                    )
-                    pb.commit()
-                elif vc_repairs_v:
-                    # The repair tiles stay out of the denominator.
-                    row_sum = vc_state["kept"]
-                # Cleanup: drain the final SP slot and publish identity stats.
-                if not p_in_smem:
-                    sp.wait()
-                    sp.release()
-                old_row_max = sp.softmax_aux_identity(row_max=row_max)
-                vec.store_vec(
-                    old_row_max=old_row_max,
-                    row_max=row_max,
-                    row_sum=row_sum,
-                    final_stats=True,
-                )
-                vec.commit()
+                publish_final_stats(row_max, row_sum)
             else:
                 # Non-causal tail: no more tiles, just publish the final stats.
-                if vc_restores_means:
-                    # The last row sums ride a second P handoff to the tail step.
-                    pb.acquire()
-                    sp.vc_store_rowsum_final(
-                        vc_prev_tile_sum=vc_state["prev_sum"],
-                        **{
-                            f"vc_pend{i}": value
-                            for i, value in enumerate(vc_state["sums"])
-                        },
-                    )
-                    pb.commit()
-                elif vc_repairs_v:
-                    # The repair tiles stay out of the denominator.
-                    row_sum = vc_state["kept"]
-                if not p_in_smem:
-                    sp.wait()
-                    sp.release()
-                old_row_max = sp.softmax_aux_identity(row_max=row_max)
-                vec.store_vec(
-                    old_row_max=old_row_max,
-                    row_max=row_max,
-                    row_sum=row_sum,
-                    final_stats=True,
-                )
-                vec.commit()
+                publish_final_stats(row_max, row_sum)
 
     @schedule
     def softmax_schedule(

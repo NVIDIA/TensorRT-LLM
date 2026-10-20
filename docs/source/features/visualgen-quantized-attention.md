@@ -31,8 +31,8 @@ A recipe is the tuple `(qk_dtype, v_dtype, (q_block_size, k_block_size, v_block_
 | `TRTLLM` | `fp8` | `fp8` | `(1, 1, 1)`, `(1, 4, 1)` | SageAttention (FP8 QK) for Blackwell |
 | `TRTLLM` | `bf16` | `fp8` | `(0, 0, 0)` | PrimTS QK16PV8 for Blackwell (`TLLM_FMHA_LIBS=+prims_ts`) |
 | `TRTLLM` | `fp8` | `fp8` | `(0, 0, 0)` | PrimTS FP8 for Blackwell (`TLLM_FMHA_LIBS=+prims_ts`) |
-| `TRTLLM` | `bf16` | `fp8` | `(0, 0, 1)` | VC-Attention-QK16 for Blackwell, V as E4M3 tile residuals with per-channel scales (`vc_attention: true`, `TLLM_FMHA_LIBS=+prims_ts`) |
-| `TRTLLM` | `fp8` | `fp8` | `(128, 128, 1)` | VC-Attention-QK8 for Blackwell, Hadamard-rotated E4M3 Q/K scaled per 128 tokens and the same V treatment (`vc_attention: true`, `TLLM_FMHA_LIBS=+prims_ts`) |
+| `TRTLLM` | `bf16` | `fp8` | `(0, 0, 0)` | VC-Attention-QK16 for Blackwell, V as E4M3 tile residuals with per-channel scales (`vc_attention: true`, `TLLM_FMHA_LIBS=+prims_ts`) |
+| `TRTLLM` | `fp8` | `fp8` | `(0, 0, 0)` | VC-Attention-QK8 for Blackwell, Hadamard-rotated E4M3 Q/K scaled per 128 tokens and the same V treatment (`vc_attention: true`, `TLLM_FMHA_LIBS=+prims_ts`) |
 | `CUDNN` | `fp8` | `fp8` | `(0, 0, 0)` | cuDNN FP8 |
 | `CUDNN` | `mxfp8` | `mxfp8` | `(0, 0, 0)` | cuDNN MXFP8 |
 | `CUTEDSL` | `bf16` | `fp8` | `(0, 0, 0)` | QK16PV8 |
@@ -42,7 +42,7 @@ A recipe is the tuple `(qk_dtype, v_dtype, (q_block_size, k_block_size, v_block_
 | `FLASHINFER` | `nvfp4` | `fp8` | `(0, 0, 0)` | NVFP4 Q/K |
 | `FLASHINFER` | `nvfp4` | `nvfp4` | `(0, 0, 0)` | NVFP4 Attention |
 
-The `TRTLLM` backend picks the kernel from the block sizes: SageAttention quantizes per block, and the `(0, 0, 0)` per-tensor recipes run on the PrimTS FMHA library, which `TLLM_FMHA_LIBS=+prims_ts` enables.
+The `TRTLLM` backend picks the kernel from the block sizes: SageAttention quantizes per block, and the `(0, 0, 0)` per-tensor recipes run on the PrimTS FMHA library, which `TLLM_FMHA_LIBS=+prims_ts` enables. VC-Attention keeps the block sizes at `(0, 0, 0)` because the recipe fixes them: fp8 Q/K are scaled per 128 tokens and V per channel.
 
 ### Choosing and Tuning a Recipe
 

@@ -185,26 +185,33 @@ class TestAttentionConfigQuantValidation:
         assert attention.quant_attention_config is not None
 
     @pytest.mark.parametrize("sm_ver", [100, 103])
-    @pytest.mark.parametrize(
-        ("qk_dtype", "q_block_size", "k_block_size"), [("bf16", 0, 0), ("fp8", 128, 128)]
-    )
-    def test_supported_quant_config_vc_attention(
-        self, sm_ver, qk_dtype, q_block_size, k_block_size
-    ):
-        """VC-Attention-QK16 and VC-Attention-QK8 validate on Blackwell."""
+    @pytest.mark.parametrize("qk_dtype", ["bf16", "fp8"])
+    def test_supported_quant_config_vc_attention(self, sm_ver, qk_dtype):
+        """VC-Attention-QK16 and VC-Attention-QK8 validate on Blackwell without block sizes."""
         with patch("tensorrt_llm.visual_gen.args.get_sm_version", return_value=sm_ver):
             attention = AttentionConfig(
                 backend="TRTLLM",
                 quant_attention_config=QuantAttentionConfig(
-                    qk_dtype=qk_dtype,
-                    q_block_size=q_block_size,
-                    k_block_size=k_block_size,
-                    v_block_size=1,
-                    vc_attention=True,
+                    qk_dtype=qk_dtype, vc_attention=True
                 ),
             )
 
         assert attention.quant_attention_config.vc_attention
+
+    def test_vc_attention_rejects_block_sizes(self):
+        """The VC-Attention recipe fixes its block sizes, so the SageAttention fields must stay 0."""
+        with patch("tensorrt_llm.visual_gen.args.get_sm_version", return_value=100):
+            with pytest.raises(ValidationError, match="do not apply to VC-Attention"):
+                AttentionConfig(
+                    backend="TRTLLM",
+                    quant_attention_config=QuantAttentionConfig(
+                        qk_dtype="fp8",
+                        q_block_size=128,
+                        k_block_size=128,
+                        v_block_size=1,
+                        vc_attention=True,
+                    ),
+                )
 
     def test_vc_repair_budget_requires_vc_attention(self):
         """The repair budget belongs to VC-Attention and is rejected elsewhere."""
@@ -212,7 +219,7 @@ class TestAttentionConfigQuantValidation:
             attention = AttentionConfig(
                 backend="TRTLLM",
                 quant_attention_config=QuantAttentionConfig(
-                    qk_dtype="bf16", v_block_size=1, vc_attention=True, vc_repair_budget=0.005
+                    qk_dtype="bf16", vc_attention=True, vc_repair_budget=0.005
                 ),
             )
             assert attention.quant_attention_config.vc_repair_budget == 0.005
