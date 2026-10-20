@@ -258,6 +258,7 @@ unittest/llmapi/test_llm.py::test_generate_with_stop_words SKIP (https://nvbugs/
 unittest/llmapi/test_llm_args.py::TestKvCacheManagerV2AutoResolution::test_required_v2_refuses_incompatible_disagg[nixl-cpp] SKIP (https://nvbugs/6917693)
 unittest/llmapi/test_llm_args.py::TestKvCacheManagerV2AutoResolution::test_required_v2_refuses_incompatible_disagg[ucx-python] SKIP (https://nvbugs/6917693)
 unittest/llmapi/test_llm_kv_cache_events.py::test_llm_api_attention_dp_kv_events SKIP (https://nvbugs/6891163)
+unittest/llmapi/test_llm_kv_cache_events.py::test_llm_kv_events_api SKIP (https://nvbugs/6960771)
 unittest/llmapi/test_llm_multi_gpu_pytorch.py::test_llm_return_logprobs_streaming_tp2[None-1-False-False] SKIP (https://nvbugs/6877252)
 unittest/llmapi/test_llm_multi_gpu_pytorch.py::test_llm_rpc_streaming_tp2 SKIP (https://nvbugs/6859934)
 unittest/llmapi/test_llm_pytorch.py::test_gqa_nemo_lora[None] SKIP (https://nvbugs/6162504)
