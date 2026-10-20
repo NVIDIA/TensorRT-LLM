@@ -23,6 +23,8 @@ from pathlib import Path
 
 import pytest
 
+from ._dataclass_helpers import ADDED_DATACLASS, added_dataclass_change
+
 __extra_import_path__ = ["~/jenkins/scripts/cbts"]
 from cbts.coverage.selection.python_change_analysis import ImportTarget, analyze_python_changes
 from cbts.rules._helpers import (
@@ -1348,35 +1350,13 @@ def test_added_module_function_with_safe_definition_expressions_is_resolved() ->
     assert analysis.new_declaration_bindings == {"helper"}
 
 
-def _added_dataclass_change(
-    declaration: str, *, prefix: str = "from dataclasses import dataclass\n\n"
-) -> tuple[str, str]:
-    helper = "def helper():\n    return Budget(2).doubled\n\n"
-    caller = "def caller():\n    return helper()\n"
-    before = prefix + "def helper():\n    return None\n\n" + caller
-    source = prefix + declaration + "\n" + helper + caller
-    diff = "".join(difflib.unified_diff(before.splitlines(True), source.splitlines(True)))
-    return source, diff
-
-
-_ADDED_DATACLASS = (
-    "@dataclass(frozen=True)\n"
-    "class Budget:\n"
-    '    "A value produced by helper."\n'
-    "    amount: int\n\n"
-    "    @property\n"
-    "    def doubled(self) -> int:\n"
-    "        return self.amount * 2\n"
-)
-
-
 @pytest.mark.parametrize("alias", ("dataclass", "record"))
 @pytest.mark.parametrize("postponed", (False, True))
 def test_added_dataclass_resolves_binding_consumers(alias: str, postponed: bool) -> None:
     prefix = "from __future__ import annotations\n" if postponed else ""
     prefix += f"from dataclasses import dataclass as {alias}\n\n"
-    source, diff = _added_dataclass_change(
-        _ADDED_DATACLASS.replace("@dataclass", f"@{alias}"), prefix=prefix
+    source, diff = added_dataclass_change(
+        ADDED_DATACLASS.replace("@dataclass", f"@{alias}"), prefix=prefix
     )
 
     analysis = _analyze(source, diff)
@@ -1390,7 +1370,7 @@ def test_added_dataclass_resolves_binding_consumers(alias: str, postponed: bool)
 
 @pytest.mark.parametrize("decorator", ("@dataclass", "@dataclass()", "@dataclass(frozen=False)"))
 def test_added_dataclass_accepts_immutable_defaults(decorator: str) -> None:
-    source, diff = _added_dataclass_change(
+    source, diff = added_dataclass_change(
         f"{decorator}\nclass Budget:\n    amount: int = 1\n    offsets: tuple = (1, -2)\n"
     )
 
@@ -1401,7 +1381,7 @@ def test_added_dataclass_annotation_contributes_its_function_consumer() -> None:
     prefix = "from dataclasses import dataclass\n\n"
     before = prefix + "def caller():\n    return None\n"
     source = (
-        prefix + _ADDED_DATACLASS + "\n"
+        prefix + ADDED_DATACLASS + "\n"
         "def helper() -> Budget:\n    return Budget(2)\n\n"
         "def caller():\n    return helper()\n"
     )
@@ -1415,7 +1395,7 @@ def test_added_dataclass_annotation_contributes_its_function_consumer() -> None:
 
 @pytest.mark.parametrize("consumer", ("INSTANCE = Budget(2)\n", "register(Budget)\n"))
 def test_added_dataclass_import_time_consumers_still_decline(consumer: str) -> None:
-    source, diff = _added_dataclass_change(_ADDED_DATACLASS + "\n" + consumer)
+    source, diff = added_dataclass_change(ADDED_DATACLASS + "\n" + consumer)
 
     assert _analyze(source, diff).limitation
 
@@ -1442,7 +1422,7 @@ def test_added_dataclass_import_time_consumers_still_decline(consumer: str) -> N
     ),
 )
 def test_added_dataclass_preserves_unsupported_declaration_effects(declaration: str) -> None:
-    source, diff = _added_dataclass_change(declaration)
+    source, diff = added_dataclass_change(declaration)
 
     assert _analyze(source, diff).limitation == "class/signature import change"
 
@@ -1462,10 +1442,29 @@ def test_added_dataclass_preserves_unsupported_declaration_effects(declaration: 
         "from dataclasses import dataclass\nnamespace = globals\n\n",
         "from dataclasses import dataclass\nfrom builtins import globals as namespace\n\n",
         "from dataclasses import dataclass\ndef discover(fn):\n    return fn.__globals__\n\n",
+        "from dataclasses import dataclass\ndef discover(module):\n    return dir(module)\n\n",
+        "from dataclasses import dataclass\nnamespace = dir\n\n",
+        "from dataclasses import dataclass\nimport builtins\n"
+        "def discover(module):\n    return builtins.dir(module)\n\n",
+        "from dataclasses import dataclass\nfrom builtins import dir as namespace\n\n",
+        "from dataclasses import dataclass\n"
+        "def discover(name):\n    return getattr(__import__(__name__), name)\n\n",
+        "from dataclasses import dataclass\nimport builtins\n"
+        "def discover(name):\n    return getattr(builtins.__import__(__name__), name)\n\n",
+        "from dataclasses import dataclass\nfrom builtins import __import__ as load\n"
+        "def discover(name):\n    return getattr(load(__name__), name)\n\n",
+        "from dataclasses import dataclass\nimport importlib\n"
+        "def discover(name):\n    return getattr(importlib.import_module(__name__), name)\n\n",
+        "from dataclasses import dataclass\nimport importlib as loader\n"
+        "def discover(name):\n    return getattr(loader.import_module(__name__), name)\n\n",
+        "from dataclasses import dataclass\nfrom importlib import import_module\n"
+        "def discover(name):\n    return getattr(import_module(__name__), name)\n\n",
+        "from dataclasses import dataclass\nfrom importlib import import_module as load\n"
+        "def discover(name):\n    return getattr(load(__name__), name)\n\n",
     ),
 )
 def test_added_dataclass_preserves_shadowing_and_namespace_discovery(prefix: str) -> None:
-    source, diff = _added_dataclass_change(_ADDED_DATACLASS, prefix=prefix)
+    source, diff = added_dataclass_change(ADDED_DATACLASS, prefix=prefix)
 
     assert _analyze(source, diff).limitation
 
@@ -1473,14 +1472,14 @@ def test_added_dataclass_preserves_shadowing_and_namespace_discovery(prefix: str
 def test_added_dataclass_cannot_absorb_an_effectful_deletion() -> None:
     prefix = "from dataclasses import dataclass\n\n"
     before = prefix + "register()\n"
-    source = prefix + _ADDED_DATACLASS
+    source = prefix + ADDED_DATACLASS
     diff = "".join(difflib.unified_diff(before.splitlines(True), source.splitlines(True)))
 
     assert _analyze(source, diff).limitation
 
 
 def test_added_dataclass_requires_an_existing_stdlib_import() -> None:
-    source = "from dataclasses import dataclass\n\n" + _ADDED_DATACLASS
+    source = "from dataclasses import dataclass\n\n" + ADDED_DATACLASS
     diff = "".join(difflib.unified_diff([], source.splitlines(True)))
 
     assert _analyze(source, diff).limitation
@@ -1490,7 +1489,7 @@ def test_added_dataclass_does_not_hide_decorated_method_signature_changes() -> N
     prefix = "from dataclasses import dataclass\n\n"
     kernel = "class Kernel:\n    @jit\n    def run(self, value):\n        return value\n"
     before = prefix + kernel
-    source = prefix + _ADDED_DATACLASS + kernel.replace("value):", "value, option=0):")
+    source = prefix + ADDED_DATACLASS + kernel.replace("value):", "value, option=0):")
     diff = "".join(difflib.unified_diff(before.splitlines(True), source.splitlines(True)))
 
     assert _analyze(source, diff).limitation == "class/signature import change"

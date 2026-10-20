@@ -663,8 +663,7 @@ def _safe_added_dataclass(
             not isinstance(statement, ast.ImportFrom)
             or statement.level
             or statement.module != "dataclasses"
-            or statement.end_lineno >= _definition_start(node)
-            and parsed is tree
+            or (statement.end_lineno >= _definition_start(node) and parsed is tree)
             or not any(
                 alias.name == "dataclass" and (alias.asname or alias.name) == decorator.id
                 for alias in statement.names
@@ -677,7 +676,16 @@ def _safe_added_dataclass(
         return False
 
     module_bindings = _direct_scope_bindings(tree.body)
-    namespace_functions = {"globals", "locals", "vars", "eval", "exec"}
+    namespace_functions = {
+        "globals",
+        "locals",
+        "vars",
+        "dir",
+        "eval",
+        "exec",
+        "__import__",
+        "import_module",
+    }
     if "*" in module_bindings or any(
         isinstance(child, ast.Name)
         and isinstance(child.ctx, ast.Load)

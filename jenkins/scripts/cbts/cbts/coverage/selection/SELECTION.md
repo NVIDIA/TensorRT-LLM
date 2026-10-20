@@ -120,6 +120,17 @@ their function declarations already contribute impact. Other import-time uses of
 as registration calls or module-level construction, still decline. Changes to existing decorated
 method signatures remain unsupported even when safe dataclass additions occur in the same file.
 
+The dataclass namespace-discovery check scans the entire post-image, including unchanged functions.
+It rejects `dir`, `__import__`, and `import_module` along with the other namespace APIs, whether
+loaded directly, accessed as attributes, or imported under an alias. Attribute checks match by name
+without resolving the receiver: any `.modules` or `.__dict__` access declines, including an unrelated
+`model.modules()` call. This conservative limit also covers aliases of `sys.modules`.
+
+New classes without local consumers still go through external-reference checks. Registered external
+unit tests are selected; production-code references, unregistered test references, or references with
+unknown locations decline. A class with neither local consumers nor external references can have no
+impacted tests.
+
 The analysis also declines if the binding is consumed by import-executed code. Otherwise its consumers
 are resolved exactly like changed function bodies. If a consumer is new or absent from the DB, Tier 2
 may walk direct, unshadowed local caller edges until every branch reaches a qualname with DB rows. An
