@@ -2173,7 +2173,6 @@ def _make_manifest_loader(
 def _hf_checkpoint_loader() -> MagicMock:
     checkpoint_loader = MagicMock(name="checkpoint_loader")
     checkpoint_loader.checkpoint_format = "HF"
-    checkpoint_loader.is_weights_preloaded.return_value = False
     checkpoint_loader.load_weights.return_value = {"weight": MagicMock()}
     return checkpoint_loader
 

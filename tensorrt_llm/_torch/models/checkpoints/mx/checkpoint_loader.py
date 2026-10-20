@@ -103,9 +103,21 @@ class MXCheckpointLoader(HfCheckpointLoader):
         return self._mx_server_url
 
     def is_weights_preloaded(self) -> bool:
+        """Whether the last load wrote weights directly into the model.
+
+        True after a successful peer-to-peer transfer. `MxLoadStrategy` then
+        skips mapping checkpoint tensors through ``model.load_weights()``.
+        """
         return self._p2p_succeeded
 
     def is_post_transform_weights_preloaded(self) -> bool:
+        """Whether the last direct preload delivered post-transform weights.
+
+        This is narrower than :meth:`is_weights_preloaded`: a loader may write
+        bytes directly into the model while those bytes still use the raw
+        checkpoint layout. Return True only when the source identity was
+        verified and the incoming bytes can safely skip module transform hooks.
+        """
         return (
             self._p2p_succeeded
             and self._post_transform_weights_preloaded
@@ -302,10 +314,11 @@ class MXCheckpointLoader(HfCheckpointLoader):
     ) -> None:
         """Publish through the active MX session.
 
-        `checkpoint_dir` and `source_identity` are retained only for the
-        common checkpoint-loader hook signature; the session captured both at
-        load time. With weight-manifest capture enabled, a natively loaded
-        donor fingerprints its bytes right before publication.
+        `MxLoadStrategy.publish_weights()` calls this after the post-load
+        hooks. The session captured the checkpoint directory at load time, so
+        `checkpoint_dir` is unused; `source_identity`, when given, names the
+        donor in its weight manifest. With weight-manifest capture enabled, a
+        natively loaded donor fingerprints its bytes right before publication.
         """
         if self._mx_loader is None:
             return
@@ -321,21 +334,6 @@ class MXCheckpointLoader(HfCheckpointLoader):
                 raise RuntimeError("MX publish requires the SourceIdentity captured at load time")
             _maybe_write_mx_transfer_manifest(model, rank=identity.rank, boundary="donor_publish")
         self._mx_loader.publish_model(model)
-
-    def post_load_publish(
-        self,
-        model,
-        *,
-        checkpoint_dir: str,
-        weights_preloaded: bool = False,
-        source_identity: Optional[SourceIdentity] = None,
-    ) -> None:
-        """Publish final post-transform weights after any successful load path."""
-        self.publish_as_source(
-            model,
-            checkpoint_dir=checkpoint_dir,
-            source_identity=source_identity,
-        )
 
     def cleanup(self) -> None:
         self._cleanup_mx_loader()
