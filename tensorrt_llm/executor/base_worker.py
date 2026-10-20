@@ -22,7 +22,7 @@ import uuid
 import weakref
 from pathlib import Path
 from queue import Empty, Queue
-from typing import TYPE_CHECKING, Dict, List, Literal, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Dict, List, Literal, Optional, Set, Tuple, Union
 
 import torch
 
@@ -133,6 +133,9 @@ class BaseWorker(GenerationExecutor):
         self._results: Dict[int, GenerationResult] = {}
         # mapping: client_id from Proxy -> request_id returned from runtime backend
         self._client_id_to_request_id: Dict[int, int] = {}
+        # Requests already answered with an error by _maybe_wrap_response and
+        # aborted; their remaining engine responses are dropped.
+        self._refused_client_ids: Set[int] = set()
         self._await_response_helper = AwaitResponseHelper(weakref.proxy(self))
         self._backend = None if llm_args is None else llm_args.backend
         self._is_pytorch_backend = self._backend == "pytorch"
@@ -1531,9 +1534,12 @@ class AwaitResponseHelper:
         async_queues = []
         for response in responses:
             assert response is not None
+            is_error = isinstance(response, ErrorResponse)
+            if not is_error and _drop_refused_response(self.worker, response):
+                continue
             queue = self.worker.return_queue(response.client_id)
 
-            if not response.has_error():
+            if not is_error and not response.has_error():
                 response = _maybe_wrap_response(self.worker, response,
                                                 self.worker._is_pytorch_backend)
 
@@ -1548,7 +1554,8 @@ class AwaitResponseHelper:
             else:
                 queue.put(response)
 
-            if response.has_error() or response.result.is_final:
+            if (isinstance(response, ErrorResponse) or response.has_error()
+                    or response.result.is_final):
                 self.worker._pop_result(response.client_id)
 
         # Notify the events in bulk for performance.
@@ -1571,6 +1578,8 @@ class AwaitResponseHelper:
 
             if isinstance(response, ErrorResponse):
                 pass  # send ErrorResponse directly
+            elif _drop_refused_response(self.worker, response):
+                continue
             elif self.worker._has_background_error():
                 response = self.worker._create_error_response(response)
             elif response.has_error():
@@ -1801,6 +1810,19 @@ def _send_rsp(
         raise ValueError(f"Unknown response type: {response}")
 
 
+def _drop_refused_response(worker, response: tllm.Response) -> bool:
+    """Whether ``response`` belongs to a request already answered with an error.
+
+    Such a request was aborted, so the engine may still emit steps that were in
+    flight and a final cancellation; the client must see none of them.
+    """
+    if response.client_id not in worker._refused_client_ids:
+        return False
+    if response.has_error() or response.result.is_final:
+        worker._refused_client_ids.discard(response.client_id)
+    return True
+
+
 def _maybe_wrap_response(
     worker,
     response: tllm.Response,
@@ -1813,6 +1835,7 @@ def _maybe_wrap_response(
         # Fail only this request, and stop the engine generating for a client
         # that has already been answered.
         if not response.result.is_final:
+            worker._refused_client_ids.add(response.client_id)
             worker.abort_request(response.client_id)
         return ErrorResponse(response.client_id, str(error),
                              response.request_id)

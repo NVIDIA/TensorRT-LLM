@@ -448,7 +448,9 @@ def test_prompt_logprobs_complete_with_kv_cache_reuse(reuse_llm: LLM, streaming:
     plain = _generate_one(reuse_llm, prompt, plain_params, salt, streaming)
     assert plain.cached_tokens > 0
 
+    # Prompt logprobs need every position computed, so the request claims no prefix.
     warm = _generate_one(reuse_llm, prompt, logprob_params, salt, streaming)
+    assert warm.cached_tokens == 0
     _assert_prompt_logprobs_match(warm, cold, prompt, top_k)
 
     # Partial prefix hit: keep 3/4 of the prompt and replace the rest.

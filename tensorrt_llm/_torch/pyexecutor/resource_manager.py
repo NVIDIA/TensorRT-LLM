@@ -1351,8 +1351,9 @@ class KVCacheManager(BaseResourceManager):
         Context logits (and the prompt logprobs derived from them) exist only
         for tokens that pass through the forward pass, so a reused prefix leaves
         those positions unscored. Rewinding to position 0 keeps the reused
-        blocks (the recompute rewrites them with identical values) and scores
-        every prompt token. The scheduler admitted these requests without a
+        blocks and scores every prompt token. The recompute rewrites those
+        shared blocks with the same K/V up to kernel numerics, which other
+        requests reading the prefix may observe. The scheduler admitted these requests without a
         reuse discount (``clear_context_output_reuse_estimates``), so restoring
         the admitted chunk from position 0 stays within the token budget.
 

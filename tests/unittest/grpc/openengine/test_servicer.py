@@ -1608,7 +1608,9 @@ def test_detokenize_extension_rejects_string_boolean() -> None:
         sampling_params_from_request(request)
 
 
-def _prompt_logprob_result(prompt_logprobs: list[Any]) -> SimpleNamespace:
+def _prompt_logprob_result(
+    prompt_logprobs: list[Any], *, finished: bool = False
+) -> SimpleNamespace:
     output = SimpleNamespace(
         index=0,
         token_ids=[10],
@@ -1619,7 +1621,11 @@ def _prompt_logprob_result(prompt_logprobs: list[Any]) -> SimpleNamespace:
         stop_reason=None,
     )
     return SimpleNamespace(
-        prompt_token_ids=[1, 2, 3], outputs=[output], cached_tokens=0, error=None
+        prompt_token_ids=[1, 2, 3],
+        outputs=[output],
+        cached_tokens=0,
+        error=None,
+        finished=finished,
     )
 
 
@@ -1662,9 +1668,10 @@ def test_incomplete_prompt_logprobs_are_refused_not_padded() -> None:
     assert "1 prompt tokens" in responses[0].error.message
 
 
-def test_generate_aborts_the_engine_after_refusing_prompt_logprobs() -> None:
-    """An error event ends the stream and stops the engine request."""
-    llm = _FakeLlm([_prompt_logprob_result([{2: _logprob(-0.5, 1)}])] * 2)
+@pytest.mark.parametrize("finished", [False, True], ids=["running", "finished"])
+def test_generate_aborts_the_engine_after_refusing_prompt_logprobs(finished: bool) -> None:
+    """An error event ends the stream and stops a still-running engine request."""
+    llm = _FakeLlm([_prompt_logprob_result([{2: _logprob(-0.5, 1)}], finished=finished)] * 2)
     servicer = OpenEngineInferenceServicer(llm, model="test-model")
     request = generation_pb2.GenerateRequest(
         request_id="request-short-prompt-logprobs",
@@ -1680,7 +1687,7 @@ def test_generate_aborts_the_engine_after_refusing_prompt_logprobs() -> None:
     responses = asyncio.run(collect_responses())
 
     assert [response.WhichOneof("event") for response in responses] == ["error"]
-    assert llm.result_handle.aborted
+    assert llm.result_handle.aborted is not finished
 
 
 def test_generation_only_leg_does_not_request_prompt_logprobs() -> None:

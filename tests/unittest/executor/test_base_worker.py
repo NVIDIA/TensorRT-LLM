@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 import time
+from queue import Queue
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -15,7 +16,8 @@ from utils.llm_data import llm_models_root
 from utils.util import skip_single_gpu
 # isort: on
 
-from tensorrt_llm.executor.base_worker import BaseWorker, _maybe_wrap_response
+from tensorrt_llm.executor.base_worker import (AwaitResponseHelper, BaseWorker,
+                                               _maybe_wrap_response)
 from tensorrt_llm.executor.request import GenerationRequest, LoRARequest
 from tensorrt_llm.executor.utils import ErrorResponse, RequestError
 from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
@@ -106,6 +108,7 @@ def test_short_context_logits_fail_the_request_instead_of_misaligning() -> None:
                                is_final=False),
     )
     worker = SimpleNamespace(_results={client_id: generation_result},
+                             _refused_client_ids=set(),
                              abort_request=Mock())
 
     wrapped = _maybe_wrap_response(worker, response, is_pytorch_backend=True)
@@ -114,6 +117,96 @@ def test_short_context_logits_fail_the_request_instead_of_misaligning() -> None:
     assert wrapped.client_id == client_id
     assert "all 4 prompt tokens, got 2" in wrapped.error_msg
     worker.abort_request.assert_called_once_with(client_id)
+    assert worker._refused_client_ids == {client_id}
+
+
+class _RefusingWorker:
+    """The slice of BaseWorker the response handlers touch for one request."""
+
+    def __init__(self, client_id: int, *, postproc: bool):
+        self._results = {
+            client_id:
+            SimpleNamespace(
+                queue=Queue(),
+                _logprob_params=SimpleNamespace(
+                    prompt_logprobs=2,
+                    prompt_logprobs_simple_format=False,
+                    drop_context_logits=True),
+                _streaming=True,
+                _generation_request=SimpleNamespace(
+                    prompt_token_ids=[1, 2, 3, 4]),
+                _params_transmitted=False,
+                sampling_params=None,
+                postproc_params=None,
+                disaggregated_params=None,
+            )
+        }
+        self._refused_client_ids = set()
+        self._is_pytorch_backend = True
+        self.result_queue = None
+        self.frontend_result_queues = None
+        self.postproc_queues = [Queue()] if postproc else None
+        self.postproc_config = SimpleNamespace(num_postprocess_workers=1)
+        self.abort_request = Mock()
+
+    def return_queue(self, client_id):
+        return self._results[client_id].queue
+
+    def _pop_result(self, client_id):
+        self._results.pop(client_id, None)
+
+    def _has_background_error(self):
+        return False
+
+
+def _engine_response(client_id, *, is_final, context_rows=None):
+    context_logits = None if context_rows is None else torch.zeros(
+        context_rows, 8)
+    return SimpleNamespace(client_id=client_id,
+                           request_id=client_id * 10,
+                           has_error=lambda: False,
+                           result=SimpleNamespace(context_logits=context_logits,
+                                                  is_final=is_final))
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("postproc", [False, True],
+                         ids=["single_process", "ipc_postproc"])
+def test_a_refused_request_gets_one_error_and_no_trailing_responses(
+        postproc: bool) -> None:
+    """A refused streaming request is answered once; later steps are dropped.
+
+    The refusal aborts the engine request, but steps already in flight and the
+    final cancellation still arrive after the client's record is gone.
+    """
+    client_id = 7
+    worker = _RefusingWorker(client_id, postproc=postproc)
+    helper = AwaitResponseHelper.__new__(AwaitResponseHelper)
+    helper.worker = worker
+    helper.enable_postprocprocess_parallel = postproc
+    helper.temp_error_responses = Queue()
+    queue = worker._results[client_id].queue
+
+    responses = [
+        # Context logits for 2 of 4 prompt tokens: refused.
+        _engine_response(client_id, is_final=False, context_rows=2),
+        _engine_response(client_id, is_final=False),
+        _engine_response(client_id, is_final=True),
+    ]
+    if postproc:
+        helper.handle_for_ipc_batched(responses)
+        [batch] = list(worker.postproc_queues[0].queue)
+        delivered = [inp.rsp for inp in batch]
+    else:
+        helper.handle_for_worker(responses)
+        delivered = list(queue.queue)
+
+    assert len(delivered) == 1
+    assert isinstance(delivered[0], ErrorResponse)
+    assert "all 4 prompt tokens, got 2" in delivered[0].error_msg
+    worker.abort_request.assert_called_once_with(client_id)
+    assert client_id not in worker._results
+    assert not worker._refused_client_ids
 
 
 @pytest.mark.cpu_only

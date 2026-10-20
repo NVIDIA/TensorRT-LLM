@@ -369,9 +369,9 @@ class OpenEngineInferenceServicer(openengine_pb2_grpc.InferenceServicer):
                         )
                         return
                     if resp.HasField("error") and not result.error:
-                        # An error event ends the stream; stop the engine
-                        # generating for a request that has been refused.
-                        abort_request("response formatting refused the result")
+                        # An error event ends the stream; unless the request
+                        # already finished, the finally below aborts it.
+                        engine_terminal = result.finished
                         return
                 if result.error:
                     engine_terminal = True

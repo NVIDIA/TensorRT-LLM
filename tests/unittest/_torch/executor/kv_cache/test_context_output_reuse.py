@@ -30,7 +30,12 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     _tighter_claim_limit,
 )
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
-from tensorrt_llm._torch.pyexecutor.scheduler.scheduler import clear_context_output_reuse_estimates
+from tensorrt_llm._torch.pyexecutor.scheduler import scheduler as scheduler_module
+from tensorrt_llm._torch.pyexecutor.scheduler.scheduler import (
+    BindMicroBatchScheduler,
+    PyMicroBatchScheduler,
+    clear_context_output_reuse_estimates,
+)
 
 pytestmark = pytest.mark.cpu_only
 
@@ -153,3 +158,22 @@ class TestClearContextOutputReuseEstimates:
         clear_context_output_reuse_estimates([scored, plain])
         assert scored.estimated_reusable_tokens == 0
         assert plain.estimated_reusable_tokens == 32
+
+    @pytest.mark.parametrize("scheduler_cls", [BindMicroBatchScheduler, PyMicroBatchScheduler])
+    def test_every_micro_batch_scheduler_clears_before_budgeting(self, monkeypatch, scheduler_cls):
+        # Callers such as the multimodal scheduler invoke the micro-batch
+        # scheduler directly, so the clearing has to happen inside it.
+        class _Cleared(Exception):
+            pass
+
+        seen = []
+
+        def clear(requests):
+            seen.append(requests)
+            raise _Cleared
+
+        monkeypatch.setattr(scheduler_module, "clear_context_output_reuse_estimates", clear)
+        requests = [SimpleNamespace()]
+        with pytest.raises(_Cleared):
+            scheduler_cls.schedule(object.__new__(scheduler_cls), requests, set())
+        assert seen == [requests]

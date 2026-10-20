@@ -555,6 +555,7 @@ class BindMicroBatchScheduler(MicroBatchScheduler):
     def schedule(
         self, active_requests: RequestList, inflight_request_ids: set[int]
     ) -> tuple[list[LlmRequest], list[LlmRequest], list[LlmRequest]]:
+        clear_context_output_reuse_estimates(active_requests)
         encoder_or_context_requests, generation_requests = self.impl(
             active_requests, inflight_request_ids, self.max_batch_size, self.max_num_tokens
         )
@@ -588,7 +589,6 @@ class SimpleScheduler(RequestScheduler):
         fitting_requests, fitting_disagg_gen_init_requests, paused_requests = (
             self.capacity_scheduler.schedule_request(active_requests)
         )
-        clear_context_output_reuse_estimates(fitting_requests)
 
         encoder_requests, context_requests, generation_requests = (
             self.micro_batch_scheduler.schedule(fitting_requests, inflight_request_ids)
@@ -1067,6 +1067,7 @@ class PyMicroBatchScheduler(MicroBatchScheduler):
     def schedule(
         self, active_requests: RequestList, inflight_request_ids: set[int]
     ) -> tuple[RequestList, RequestList, RequestList]:
+        clear_context_output_reuse_estimates(active_requests)
         encoder_requests: RequestList = []
         context_requests: RequestList = []
         generation_requests: RequestList = []
@@ -2533,7 +2534,6 @@ class SimpleUnifiedScheduler(RequestScheduler):
         fitting_requests, fitting_disagg_gen_init, paused_requests = (
             self.capacity_scheduler.schedule_request(active_requests)
         )
-        clear_context_output_reuse_estimates(fitting_requests)
 
         # Step 2: MicroBatch Check (Who fits in token budget? + Chunking)
         encoder_requests, context_requests, generation_requests = (
