@@ -19,18 +19,15 @@ NaN ranks above everything).
 
 from __future__ import annotations
 
-import functools
-
-import cuda.bindings.driver as cuda_drv
 import cutlass
 import cutlass.cute as cute
 import torch
 from cutlass import const_expr
-from cutlass.cute import experimental as cute_ext
 from cutlass.cute.runtime import from_dlpack
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
+from tensorrt_llm._torch.kernels.blackwell.utils import make_ptr
 
 from .qsa_expand_block_indices import qsa_expand_block_indices as _expand
 
@@ -60,9 +57,10 @@ def _threads(width: int) -> int:
 
 
 class _TopkExpandKernel:
-    def __init__(self, *, width, block_topk, compress, token_topk, pdl):
-        self.width, self.k, self.cr, self.token_topk, self.pdl = (
+    def __init__(self, *, width, key_stride, block_topk, compress, token_topk, pdl):
+        self.width, self.key_stride, self.k, self.cr, self.token_topk, self.pdl = (
             width,
+            key_stride,
             block_topk,
             compress,
             token_topk,
@@ -74,8 +72,31 @@ class _TopkExpandKernel:
         self.flag_words = -(-width // 32)
 
     @cute.jit
-    def __call__(self, mKeys, mEnd, mPos, mLen, mTopk, mSel, stream: cuda_drv.CUstream):
-        rows = cute.size(mKeys, mode=[0])
+    def __call__(
+        self,
+        keys_t: cute.Tensor,
+        end_ptr: cute.Pointer,
+        pos_ptr: cute.Pointer,
+        len_ptr: cute.Pointer,
+        topk_ptr: cute.Pointer,
+        sel_ptr: cute.Pointer,
+        rows: cutlass.Int32,
+        stream,
+    ):
+        # The keys arrive as a tensor, as the TVM-FFI entry takes its stream from a GPU
+        # tensor; their layout is rebuilt with the static width and row stride the 16-byte
+        # loads need. The row count is the call's.
+        mKeys = cute.make_tensor(
+            keys_t.iterator, cute.make_layout((rows, self.width), stride=(self.key_stride, 1))
+        )
+        per_row = cute.make_layout((rows,), stride=(1,))
+        mEnd = cute.make_tensor(end_ptr, per_row)
+        mPos = cute.make_tensor(pos_ptr, per_row)
+        mLen = cute.make_tensor(len_ptr, per_row)
+        mTopk = cute.make_tensor(topk_ptr, cute.make_layout((rows, self.k), stride=(self.k, 1)))
+        mSel = cute.make_tensor(
+            sel_ptr, cute.make_layout((rows, self.final), stride=(self.final, 1))
+        )
         ld_keys = cute.make_copy_atom(
             cute.nvgpu.CopyG2ROp(), cutlass.Int32, num_bits_per_copy=32 * KPT
         )
@@ -367,26 +388,10 @@ class _TopkExpandKernel:
                     mSel[row, col] = val
 
 
-def _dl(t: torch.Tensor, align: int = 4):
-    return from_dlpack(t, assumed_align=align)
-
-
-@functools.lru_cache(maxsize=None)
-def _compiled(rows, width, key_stride, block_topk, compress, token_topk, pos_dtype, len_dtype, pdl):
-    kern = _TopkExpandKernel(
-        width=width, block_topk=block_topk, compress=compress, token_topk=token_topk, pdl=pdl
-    )
-    dev = "cuda"
-    keys = torch.empty(rows, key_stride, dtype=torch.int32, device=dev)[:, :width]
-    end = torch.empty(rows, dtype=torch.int32, device=dev)
-    pos = torch.empty(rows, dtype=pos_dtype, device=dev)
-    ln = torch.empty(rows, dtype=len_dtype, device=dev)
-    topk = torch.empty(rows, block_topk, dtype=torch.int32, device=dev)
-    sel = torch.empty(rows, token_topk + compress - 1, dtype=torch.int32, device=dev)
-    stream = cuda_drv.CUstream(torch.cuda.current_stream().cuda_stream)
-    return cute_ext.compile(
-        kern, _dl(keys, 16), _dl(end), _dl(pos), _dl(ln), _dl(topk), _dl(sel), stream
-    )
+#: One compiled launch per score-table geometry, k, compress ratio, token budget, index
+#: dtypes and PDL; the row count is a runtime argument.
+_COMPILED: dict = {}
+_INDEX_TYPES = {torch.int32: cutlass.Int32, torch.int64: cutlass.Int64}
 
 
 def launch(
@@ -404,15 +409,16 @@ def launch(
     token selection `[rows, token_topk + compress_ratio - 1]` int32 (`out` when given)."""
     rows, width = scores.shape
     block_topk = topk_indices.shape[1]
-    dev = scores.device
     sel = out
     if sel is None:
-        sel = torch.empty((rows, token_topk + compress_ratio - 1), dtype=torch.int32, device=dev)
+        sel = torch.empty(
+            (rows, token_topk + compress_ratio - 1), dtype=torch.int32, device=scores.device
+        )
     if rows == 0:
         return sel
-    pdl = pdl and get_env_enable_pdl()
-    fn = _compiled(
-        rows,
+    pdl = bool(pdl and get_env_enable_pdl())
+    keys = scores.view(torch.int32)
+    key = (
         width,
         scores.stride(0),
         block_topk,
@@ -420,18 +426,48 @@ def launch(
         token_topk,
         query_positions.dtype,
         sequence_lengths.dtype,
-        bool(pdl),
+        pdl,
     )
-    stream = cuda_drv.CUstream(torch.cuda.current_stream(dev).cuda_stream)
-    fn(
-        _dl(scores.view(torch.int32), 16),
-        _dl(row_ends),
-        _dl(query_positions),
-        _dl(sequence_lengths),
-        _dl(topk_indices),
-        _dl(sel),
-        stream,
+    ptrs = (
+        row_ends.data_ptr(),
+        query_positions.data_ptr(),
+        sequence_lengths.data_ptr(),
+        topk_indices.data_ptr(),
+        sel.data_ptr(),
     )
+    fn = _COMPILED.get(key)
+    if fn is None:
+        gm = cute.AddressSpace.gmem
+        fn = _COMPILED[key] = cute.compile(
+            _TopkExpandKernel(
+                width=width,
+                key_stride=scores.stride(0),
+                block_topk=block_topk,
+                compress=compress_ratio,
+                token_topk=token_topk,
+                pdl=pdl,
+            ),
+            from_dlpack(keys, assumed_align=16).mark_layout_dynamic(leading_dim=1),
+            make_ptr(cutlass.Int32, ptrs[0], gm, assumed_align=4),
+            make_ptr(
+                _INDEX_TYPES[query_positions.dtype],
+                ptrs[1],
+                gm,
+                assumed_align=query_positions.element_size(),
+            ),
+            make_ptr(
+                _INDEX_TYPES[sequence_lengths.dtype],
+                ptrs[2],
+                gm,
+                assumed_align=sequence_lengths.element_size(),
+            ),
+            make_ptr(cutlass.Int32, ptrs[3], gm, assumed_align=4),
+            make_ptr(cutlass.Int32, ptrs[4], gm, assumed_align=4),
+            cutlass.Int32(rows),
+            cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+            options="--enable-tvm-ffi",
+        )
+    fn(keys, *ptrs, rows)
     return sel
 
 
@@ -495,8 +531,13 @@ class QsaTopkExpandDecode(OpWrapper):
     Metadata consumed: `qsa_visible_blocks` (`row_ends`), the rows' logical positions
     and sequence lengths. Preconditions: zero row starts; `scores` fp32 `[rows, W]`, unit
     column stride, 16-byte aligned rows, `W % 4 == 0` and `W <= 4096` (four keys a thread,
-    at most 1024 threads); `topk_indices` int32 `[rows, K]` contiguous. Ties: the higher
+    at most 1024 threads); `topk_indices` int32 `[rows, K]` contiguous; `row_ends` int32,
+    the positions and lengths int32 or int64, each a contiguous `[rows]`. Ties: the higher
     block at the threshold, as `qsa_canonical_selection` rewrites the CUDA top-k's pick.
+
+    Compiled once per score-table width and row stride (the block table's, fixed for an
+    engine), k, compress ratio, token budget, index dtypes and PDL: the row count is a
+    runtime argument, so an eager step's context rows, any count, reuse the kernel.
     """
 
     def __call__(
@@ -574,8 +615,12 @@ class QsaTopkExpandDecode(OpWrapper):
         assert topk_indices.dtype == torch.int32 and topk_indices.is_contiguous(), (
             "int32 topk_indices"
         )
-        assert row_ends.dtype == torch.int32 and row_ends.shape == (scores.shape[0],), (
-            "int32 row_ends [rows]"
+        rows = scores.shape[0]
+        assert row_ends.dtype == torch.int32 and row_ends.shape == (rows,), "int32 row_ends [rows]"
+        for t in (query_positions, sequence_lengths):
+            assert t.dtype in _INDEX_TYPES and t.shape == (rows,), "int32/int64 [rows]"
+        assert all(t.is_contiguous() for t in (row_ends, query_positions, sequence_lengths)), (
+            "contiguous row_ends, positions and lengths"
         )
         assert token_topk == topk_indices.shape[1] * compress_ratio, (
             "token_topk = k * compress_ratio"
