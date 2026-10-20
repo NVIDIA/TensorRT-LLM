@@ -636,7 +636,8 @@ class Glm5NextForCausalLM(SpecDecOneEngineForCausalLM):
           the indexer's ``[wk | gate | weights_proj]``) collect their separate
           checkpoint tensors first (:attr:`FUSED_LINEARS` on the owning module).
         * Production routed experts go to the fused MoE layer's loader,
-          filtered to ``initial_local_expert_ids``.
+          filtered to ``initial_local_expert_ids`` except for the scalar
+          ``input_scale``, which is passed for every expert.
         * The KDA layer's tensors (the shared mixer's local-width modules) are
           sliced to this rank's head range by the module itself.
         * Everything else (norms, HC, router, embeddings) is an exact-shape
@@ -665,6 +666,12 @@ class Glm5NextForCausalLM(SpecDecOneEngineForCausalLM):
 
         experts = getattr(getattr(module, "mlp", None), "experts", None)
         local_expert_ids = set(experts.initial_local_expert_ids) if experts is not None else set()
+        experts_quant = getattr(experts, "quant_config", None)
+        quant_algo = experts_quant.quant_algo if experts_quant is not None else None
+        # The loader reduces every expert's scalar input_scale into the
+        # layer-wide activation scale, which must be identical on every rank
+        # because tokens are quantized before dispatch.
+        collect_all_expert_input_scales = quant_algo == QuantAlgo.NVFP4
         moe_weights: dict[str, torch.Tensor] = {}
         proj_to_w = {"gate_proj": "w1", "up_proj": "w3", "down_proj": "w2"}
 
@@ -679,9 +686,12 @@ class Glm5NextForCausalLM(SpecDecOneEngineForCausalLM):
             moe = _FUSED_MOE_RE.match(dest)
             if moe is not None:
                 expert_id = int(moe.group("expert"))
-                if expert_id in local_expert_ids:  # other EP ranks' bytes are never read
-                    suffix = "." + moe.group("tensor")
-                    moe_weights[f"{expert_id}.{proj_to_w[moe.group('proj')]}{suffix}"] = (
+                tensor = moe.group("tensor")
+                # Other EP ranks' weights are never read.
+                if expert_id in local_expert_ids or (
+                    collect_all_expert_input_scales and tensor == "input_scale"
+                ):
+                    moe_weights[f"{expert_id}.{proj_to_w[moe.group('proj')]}.{tensor}"] = (
                         materialize(lazy)
                     )
                 continue
@@ -796,14 +806,14 @@ class Glm5NextForCausalLM(SpecDecOneEngineForCausalLM):
                 load_linear(fused_path, [merged])
 
         if experts is not None:
-            quant_algo = (
-                experts.quant_config.quant_algo if experts.quant_config is not None else None
-            )
             tensors_per_expert = {
                 QuantAlgo.FP8_BLOCK_SCALES: 6,
                 QuantAlgo.NVFP4: 12,
             }.get(quant_algo, 3)
             expected = tensors_per_expert * len(local_expert_ids)
+            if collect_all_expert_input_scales:
+                # One input_scale per projection of every non-local expert.
+                expected += len(proj_to_w) * (experts.num_experts - len(local_expert_ids))
             if len(moe_weights) != expected:
                 raise ValueError(
                     f"glm5_next owner {owner!r}: fused MoE collected {len(moe_weights)} expert "
