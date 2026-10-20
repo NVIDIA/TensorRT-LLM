@@ -698,8 +698,11 @@ class MpiPoolSession(MpiSession):
 class MpiCommSession(MpiSession):
 
     def __init__(self, comm=None, n_workers: int = 1):
+        # TODO: MpiCommSession in fact can only run on _utils.comm, so these
+        #  arguments are redundant and should be removed.
         self.comm = comm
         self.n_workers = n_workers
+
         self.mpi_pool: Optional[MPIPoolExecutor] = None
         self.owns_mpi_pool = False  # Track if this instance owns the mpi_pool
         # Shared by every session on the same mpi_pool.
