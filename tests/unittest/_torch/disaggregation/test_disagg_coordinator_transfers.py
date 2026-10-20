@@ -308,7 +308,8 @@ def test_gen_reap_leaves_error_handling_to_the_consensus_path_under_inflight_can
 # -- timeouts ----------------------------------------------------------------
 
 
-def test_timeout_check_flags_both_directions(clock) -> None:
+@pytest.mark.parametrize("reporting", ["native", "unsupported", "failed"])
+def test_timeout_check_flags_both_directions(clock, monkeypatch, reporting: str) -> None:
     h = _Harness(kv_transfer_timeout_ms=1000)
     ctx = _Request(1)
     h.send(ctx)
@@ -325,6 +326,16 @@ def test_timeout_check_flags_both_directions(clock) -> None:
         py_kv_transfer_start_time=clock["t"] + 1.5,
     )
     h.active.extend([gen, fresh])
+    describe = Mock(return_value="progress_at_observation=tx")
+    if reporting != "unsupported":
+        if reporting == "failed":
+            describe.side_effect = RuntimeError("snapshot failed")
+        h.transceiver._describe_transfer_timeout = describe
+    warning = Mock()
+    monkeypatch.setattr(coordinator_module.logger, "warning", warning)
+    h.coordinator.check_transfer_timeouts()
+    describe.assert_not_called()
+    warning.assert_not_called()
     clock["t"] += 2.0
 
     h.coordinator.check_transfer_timeouts()
@@ -332,6 +343,19 @@ def test_timeout_check_flags_both_directions(clock) -> None:
     assert ctx.py_kv_transfer_timed_out
     assert gen.py_kv_transfer_timed_out
     assert not fresh.py_kv_transfer_timed_out
+    assert ctx.py_kv_transfer_start_time == gen.py_kv_transfer_start_time == clock["t"] - 2.0
+    assert h.in_transfer(ctx)
+    h.coordinator.check_transfer_timeouts()
+    assert warning.call_count == 2
+    messages = [call.args[0] for call in warning.call_args_list]
+    assert all("deadline_owner=executor_request" in message for message in messages)
+    expected = {
+        "native": "progress_at_observation=tx",
+        "unsupported": "unavailable(transceiver)",
+        "failed": "unavailable(snapshot_failed)",
+    }[reporting]
+    assert all(expected in message for message in messages)
+    assert describe.call_count == (0 if reporting == "unsupported" else 2)
 
 
 def test_post_batch_timeout_check_is_gated_on_an_inflight_context_send(clock) -> None:
@@ -434,13 +458,15 @@ def _receiving(h: _Harness, rid: int, started_at: float) -> _Request:
 
 
 def test_timed_out_receive_is_cancelled_once_until_the_request_is_forgotten(
-    inflight_cancel, clock
+    inflight_cancel, clock, monkeypatch
 ) -> None:
     """A timed-out receive is cancelled once; later polls do not re-cancel
     while the transceiver still owns it. Once the executor frees the request
     the bookkeeping is dropped so the id can be cancelled again if reused."""
     h = _Harness(kv_transfer_timeout_ms=1000, supports_inflight_cancellation=True)
     req = _receiving(h, 1, started_at=clock["t"])
+    warning = Mock()
+    monkeypatch.setattr(coordinator_module.logger, "warning", warning)
     clock["t"] += 2.0
 
     h.coordinator.poll_gen_transfers()
@@ -448,6 +474,7 @@ def test_timed_out_receive_is_cancelled_once_until_the_request_is_forgotten(
 
     assert req.py_kv_transfer_timed_out
     assert h.transceiver.call_log.count("cancel_request:1") == 1
+    assert any("deadline_owner=executor_request" in call.args[0] for call in warning.call_args_list)
 
     h.coordinator.forget_request(1)
     h.transceiver.request_and_receive_async(req)
