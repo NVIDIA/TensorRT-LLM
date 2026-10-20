@@ -2385,6 +2385,14 @@ class DecodingBaseConfig(StrictBaseModel):
         "any of these penalties is rejected at admission rather than silently decoded "
         "without them.")
 
+    spec_dec_variant: PositiveInt = Field(
+        default=1,
+        description=
+        "Version of the algorithm within its decoding_type family (e.g. DFlash "
+        "1 vs. 2), for versions that share one decoding config. Resolved from "
+        "the draft checkpoint where a family has versions. Do not set manually."
+    )
+
     # If set, drafting uses greedy sampling, irrespective of sampling parameters.
     _allow_greedy_draft_tokens: bool = PrivateAttr(True)
     # Internal: record decoding_type alias used during parsing (for warnings).
@@ -2792,6 +2800,11 @@ class EagleDecodingConfig(DecodingBaseConfig):
     eagle3_model_arch: Literal["llama3", "mistral_large3"] = Field(
         default="llama3",
         description="The model architecture of the eagle3 model.")
+    spec_dec_variant: PositiveInt = Field(
+        default=3,
+        description=
+        "Version of the EAGLE algorithm, 3 for EAGLE3 draft checkpoints. Do "
+        "not set manually.")
 
     @model_validator(mode='after')
     def validate_eagle_config(self) -> 'EagleDecodingConfig':
@@ -3434,6 +3447,25 @@ def translate_speculators_dspark_config(config_dict: dict) -> dict:
     return translated
 
 
+def is_lilicorr_checkpoint(architectures: Optional[List[str]],
+                           dflash_config: dict) -> bool:
+    """Whether a DFlash drafter checkpoint requires the LiLiCorr candidate scorer."""
+    return bool(
+        dflash_config.get("projector_type") == "lilicorr"
+        or dflash_config.get("lilicorr_enabled", False)
+        or "LiLiCorrDraftModel" in (architectures or []))
+
+
+def is_dflash2_checkpoint(architectures: Optional[List[str]],
+                          dflash_config: dict) -> bool:
+    """Whether a DFlash drafter checkpoint declares DFlash 2 features."""
+    return (
+        int(dflash_config.get("conv_kernel_size", 0) or 0) > 0
+        or int(dflash_config.get("selector_rank", 0) or 0) > 0
+        or any("dflash2" in str(arch).lower().replace("_", "").replace("-", "")
+               for arch in (architectures or [])))
+
+
 class DFlashDecodingConfig(DecodingBaseConfig):
     """Configuration for DFlash speculative decoding.
 
@@ -3484,6 +3516,14 @@ class DFlashDecodingConfig(DecodingBaseConfig):
 
     decoding_type: Literal["DFlash"] = Field(default="DFlash")
 
+    spec_dec_variant: Optional[PositiveInt] = Field(
+        default=None,
+        description=
+        "Version of the DFlash algorithm: 2 for a DFlash 2 draft checkpoint, "
+        "1 otherwise. None until the draft checkpoint's config.json has been "
+        "read, which for a HF repo id happens only after download. Do not set "
+        "manually.")
+
     attention_backend: Literal["VANILLA", "TRTLLM", "FA4"] = Field(
         default="VANILLA",
         description=
@@ -3522,8 +3562,8 @@ class DFlashDecodingConfig(DecodingBaseConfig):
         if not os.path.exists(draft_config_path):
             return
         with open(draft_config_path) as f:
-            dflash_cfg = translate_speculators_dspark_config(json.load(f)).get(
-                "dflash_config", {})
+            draft_cfg = translate_speculators_dspark_config(json.load(f))
+        dflash_cfg = draft_cfg.get("dflash_config", {})
 
         if self.target_layer_ids is None:
             layer_ids = dflash_cfg.get("target_layer_ids")
@@ -3533,6 +3573,10 @@ class DFlashDecodingConfig(DecodingBaseConfig):
             mask_id = dflash_cfg.get("mask_token_id")
             if mask_id is not None:
                 self.mask_token_id = mask_id
+        architectures = draft_cfg.get("architectures")
+        self.spec_dec_variant = 2 if (
+            is_dflash2_checkpoint(architectures, dflash_cfg)
+            and not is_lilicorr_checkpoint(architectures, dflash_cfg)) else 1
         if self.context_recompute_tail is None:
             # Reached only when the user explicitly set None (the default is 0,
             # recompute off): auto-resolve the tail from the drafter geometry.
@@ -3647,10 +3691,11 @@ class DSparkDecodingConfig(DecodingBaseConfig):
         "namespace). Ignored by the embedded DeepSeek-V4-Pro draft. Independent "
         "of the backend that builds the drafter's own attention modules.\n\n"
         "AUTO resolves per drafter family and is right unless you are pinning a "
-        "kernel: a GQA backbone degrades when its kernel is missing, an MLA one "
-        "raises. TRTLLM needs FlashInfer and SM100/SM103. CUTEDSL is MLA-only "
-        "and needs a cute-dsl MLA decode taking per-token kv_bounds that is not "
-        "upstream yet. Which kernel each name selects: MLADSparkForCausalLM.")
+        "kernel: TRTLLM for a GQA backbone, which degrades when its kernel is "
+        "missing, and CUTEDSL for an MLA one, which raises. TRTLLM needs "
+        "FlashInfer and SM100/SM103. CUTEDSL is MLA-only: one cute-dsl MLA "
+        "decode pass over context and block, on SM100/SM103/SM107. Which "
+        "kernel each name selects: MLADSparkForCausalLM.")
 
     @model_validator(mode="after")
     def set_max_total_draft_tokens(self):

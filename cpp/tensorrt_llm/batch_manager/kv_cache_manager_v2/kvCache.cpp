@@ -1400,7 +1400,7 @@ void KvCache::_reattachOrphanTreeBlocks(BlockOrdinal lastOrdinal, RootBlock& roo
     {
         auto& sb = mBlocks[ord];
 
-        // detachNext() only cleared `prev` and the parent's map entry, so ordinal, tokens
+        // detachNext() cleared `prev`, `root`, and the parent's map entry, so ordinal, tokens
         // and surviving pages are intact -- re-attaching is enough, nothing to rebuild.
         bool attached = false;
         SharedPtr<Block> inTree = attachOrGetExistingBlock(prevNode, sb.treeBlock, &attached);
