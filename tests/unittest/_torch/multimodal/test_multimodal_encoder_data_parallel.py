@@ -31,6 +31,7 @@ def test_plan_encoder_dp_items_accepts_an_empty_batch():
 
     assert plan.placements == ()
     assert plan.rank_input_token_counts == (0, 0)
+    assert plan.rank_output_row_counts == (0, 0)
     assert plan.total_output_rows == 0
 
 
@@ -45,7 +46,7 @@ def test_plan_encoder_dp_items_uses_input_cost_and_preserves_output_order():
 
     assert plan.rank_input_token_counts == (100, 20)
     assert [placement.rank for placement in plan.placements] == [0, 1, 1]
-    assert [placement.global_row_start for placement in plan.placements] == [0, 1, 101]
+    assert plan.rank_output_row_counts == (1, 200)
     assert plan.total_output_rows == 201
 
 
@@ -76,11 +77,11 @@ def test_plan_encoder_dp_items_rejects_invalid_descriptors(items, error_match):
 
 def test_execute_encoder_dp_items_reconstructs_global_output():
     items = [
-        EncoderDpItem(ordinal=0, input_token_count=4, output_row_count=2),
-        EncoderDpItem(ordinal=1, input_token_count=3, output_row_count=1),
+        EncoderDpItem(ordinal=0, input_token_count=3, output_row_count=2),
+        EncoderDpItem(ordinal=1, input_token_count=4, output_row_count=1),
         EncoderDpItem(ordinal=2, input_token_count=2, output_row_count=2),
     ]
-    peer_contribution = torch.tensor([[0.0], [0.0], [20.0], [30.0], [30.0]])
+    peer_output = torch.tensor([[10.0], [10.0], [30.0], [30.0]])
     prepared_ordinals: list[int] = []
 
     def prepare_local_inputs(local_items):
@@ -93,8 +94,10 @@ def test_execute_encoder_dp_items_reconstructs_global_output():
             rows.append(torch.full((item.output_row_count, 1), float((item.ordinal + 1) * 10)))
         return torch.cat(rows)
 
-    def allreduce(tensor):
-        return tensor + peer_contribution
+    def allgather(tensor, row_counts):
+        assert row_counts == [1, 4]
+        assert tensor.shape == (1, 1)
+        return torch.cat([tensor, peer_output])
 
     output = execute_encoder_dp_items(
         items,
@@ -103,13 +106,13 @@ def test_execute_encoder_dp_items_reconstructs_global_output():
         prepare_local_inputs=prepare_local_inputs,
         encode_local_inputs=encode_local_inputs,
         any_rank_failed=lambda local_failed: local_failed,
-        allreduce=allreduce,
+        allgather=allgather,
         output_dim=1,
         output_dtype=torch.float32,
         output_device=torch.device("cpu"),
     )
 
-    assert prepared_ordinals == [0]
+    assert prepared_ordinals == [1]
     torch.testing.assert_close(
         output,
         torch.tensor([[10.0], [10.0], [20.0], [30.0], [30.0]]),
@@ -125,7 +128,7 @@ def test_execute_encoder_dp_items_synchronizes_local_shape_failure():
         statuses.append(local_failed)
         return local_failed
 
-    def allreduce(tensor):
+    def allgather(tensor, row_counts):
         collective_dtypes.append(tensor.dtype)
         return tensor
 
@@ -137,7 +140,7 @@ def test_execute_encoder_dp_items_synchronizes_local_shape_failure():
             prepare_local_inputs=lambda local_items: local_items,
             encode_local_inputs=lambda _: torch.zeros((1, 1)),
             any_rank_failed=any_rank_failed,
-            allreduce=allreduce,
+            allgather=allgather,
             output_dim=1,
             output_dtype=torch.float32,
             output_device=torch.device("cpu"),
@@ -158,9 +161,11 @@ def test_execute_encoder_dp_items_keeps_empty_rank_in_collectives():
         statuses.append(local_failed)
         return local_failed
 
-    def allreduce(tensor):
+    def allgather(tensor, row_counts):
         collective_dtypes.append(tensor.dtype)
-        return tensor + peer_contribution
+        assert tensor.shape == (0, 1)
+        assert row_counts == [2, 0]
+        return peer_contribution
 
     output = execute_encoder_dp_items(
         items,
@@ -173,7 +178,7 @@ def test_execute_encoder_dp_items_keeps_empty_rank_in_collectives():
             "An empty encoder-DP rank must not run the encoder."
         ),
         any_rank_failed=any_rank_failed,
-        allreduce=allreduce,
+        allgather=allgather,
         output_dim=1,
         output_dtype=torch.float32,
         output_device=torch.device("cpu"),
@@ -188,7 +193,7 @@ def test_execute_encoder_dp_items_stops_before_output_collective_on_peer_failure
     items = [EncoderDpItem(ordinal=0, input_token_count=1, output_row_count=1)]
     collective_dtypes: list[torch.dtype] = []
 
-    def allreduce(tensor):
+    def allgather(tensor, row_counts):
         collective_dtypes.append(tensor.dtype)
         pytest.fail("Output collective must not run after a peer failure.")
 
@@ -200,7 +205,7 @@ def test_execute_encoder_dp_items_stops_before_output_collective_on_peer_failure
             prepare_local_inputs=lambda _: [],
             encode_local_inputs=lambda _: torch.empty((0, 1)),
             any_rank_failed=lambda local_failed: True,
-            allreduce=allreduce,
+            allgather=allgather,
             output_dim=1,
             output_dtype=torch.float32,
             output_device=torch.device("cpu"),

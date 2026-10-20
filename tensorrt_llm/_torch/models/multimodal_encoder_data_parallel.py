@@ -23,8 +23,10 @@ tokens when item metadata provides them; output rows are tracked separately
 for reconstruction.
 """
 
+from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Callable, Sequence, TypeVar
+from itertools import accumulate, pairwise
+from typing import Callable, Iterator, Sequence, TypeVar
 
 import torch
 
@@ -45,11 +47,10 @@ class EncoderDpItem:
 
 @dataclass(frozen=True)
 class EncoderDpPlacement:
-    """The rank and output location assigned to one encoder item."""
+    """The rank assigned to one encoder item."""
 
     item: EncoderDpItem
     rank: int
-    global_row_start: int
 
 
 @dataclass(frozen=True)
@@ -58,6 +59,7 @@ class EncoderDpPlan:
 
     placements: tuple[EncoderDpPlacement, ...]
     rank_input_token_counts: tuple[int, ...]
+    rank_output_row_counts: tuple[int, ...]
     total_output_rows: int
 
     def local_placements(self, rank: int) -> tuple[EncoderDpPlacement, ...]:
@@ -102,6 +104,7 @@ def plan_encoder_dp_items(
             )
 
     rank_input_token_counts = [0] * num_ranks
+    rank_output_row_counts = [0] * num_ranks
     item_ranks: dict[int, int] = {}
     for item in sorted(
         ordered_items,
@@ -113,24 +116,43 @@ def plan_encoder_dp_items(
         )
         item_ranks[item.ordinal] = target_rank
         rank_input_token_counts[target_rank] += item.input_token_count
+        rank_output_row_counts[target_rank] += item.output_row_count
 
     placements: list[EncoderDpPlacement] = []
-    global_row_start = 0
     for item in ordered_items:
         placements.append(
             EncoderDpPlacement(
                 item=item,
                 rank=item_ranks[item.ordinal],
-                global_row_start=global_row_start,
             )
         )
-        global_row_start += item.output_row_count
 
     return EncoderDpPlan(
         placements=tuple(placements),
         rank_input_token_counts=tuple(rank_input_token_counts),
-        total_output_rows=global_row_start,
+        rank_output_row_counts=tuple(rank_output_row_counts),
+        total_output_rows=sum(rank_output_row_counts),
     )
+
+
+@contextmanager
+def encoder_dp_error_guard(any_rank_failed: Callable[[bool], bool]) -> Iterator[None]:
+    """Propagate rank-local Python failures before the next GPU collective.
+
+    The callback exchanges CPU status and must not synchronize encoder CUDA
+    work. It must return true on every rank if any rank reports a failure.
+    """
+    local_error: Exception | None = None
+    try:
+        yield
+    except Exception as error:
+        # Every rank must reach the status exchange even after a local failure.
+        local_error = error
+
+    if any_rank_failed(local_error is not None):
+        if local_error is not None:
+            raise RuntimeError("Multimodal encoder data-parallel rank failed.") from local_error
+        raise RuntimeError("Multimodal encoder data-parallel peer rank failed.")
 
 
 _LocalInputsT = TypeVar("_LocalInputsT")
@@ -144,7 +166,7 @@ def execute_encoder_dp_items(
     prepare_local_inputs: Callable[[Sequence[EncoderDpItem]], _LocalInputsT],
     encode_local_inputs: Callable[[_LocalInputsT], torch.Tensor],
     any_rank_failed: Callable[[bool], bool],
-    allreduce: Callable[[torch.Tensor], torch.Tensor],
+    allgather: Callable[[torch.Tensor, list[int]], torch.Tensor],
     output_dim: int,
     output_dtype: torch.dtype,
     output_device: torch.device,
@@ -152,24 +174,20 @@ def execute_encoder_dp_items(
     """Place, execute, and reconstruct atomic multimodal encoder items.
 
     Every rank independently derives the same plan. The callbacks see only the
-    items assigned to the local rank, in global output order. A
-    CPU status collective precedes the output collective so a local preparation,
-    encoder, validation, allocation, or copy failure cannot strand peer ranks.
-    The status callback must not synchronize the encoder's CUDA stream.
+    items assigned to the local rank, in global output order. A CPU status
+    exchange propagates local preparation and encoder failures before gathering
+    compact per-rank outputs. ``allgather`` concatenates these ``[rows, dim]``
+    tensors in rank order using the supplied per-rank row counts, including zero
+    rows on empty ranks.
 
     The return value is one dense tensor with item row blocks in ordinal order.
     The full-request path consumes it directly; runtime item scheduling splits
     it by ``output_row_count`` and feeds the existing per-item request-state
     ``record`` path.
     """
-    local_error: Exception | None = None
-    local_contribution: torch.Tensor | None = None
-    plan: EncoderDpPlan | None = None
-
-    try:
+    with encoder_dp_error_guard(any_rank_failed):
         plan = plan_encoder_dp_items(items, num_ranks)
         local_placements = plan.local_placements(rank)
-        local_output: torch.Tensor | None = None
         if local_placements:
             local_items = [placement.item for placement in local_placements]
             local_inputs = prepare_local_inputs(local_items)
@@ -185,32 +203,22 @@ def execute_encoder_dp_items(
                     f"expected ({expected_local_rows}, {output_dim}), "
                     f"got {tuple(local_output.shape)}."
                 )
+            local_output = local_output.to(device=output_device, dtype=output_dtype).contiguous()
+        else:
+            local_output = torch.empty((0, output_dim), dtype=output_dtype, device=output_device)
 
-        local_contribution = torch.zeros(
-            (plan.total_output_rows, output_dim),
-            dtype=output_dtype,
-            device=output_device,
-        )
-        local_row_start = 0
-        if local_output is not None:
-            for placement in local_placements:
-                row_count = placement.item.output_row_count
-                local_contribution[
-                    placement.global_row_start : placement.global_row_start + row_count
-                ].copy_(local_output[local_row_start : local_row_start + row_count])
-                local_row_start += row_count
-    except Exception as error:
-        # Collective safety requires converting every local failure into the
-        # same status collective before any rank enters the output collective.
-        local_error = error
-
-    if any_rank_failed(local_error is not None):
-        if local_error is not None:
-            raise RuntimeError("Multimodal encoder data-parallel rank failed.") from local_error
-        raise RuntimeError("Multimodal encoder data-parallel peer rank failed.")
-
-    if local_contribution is None or plan is None:
-        raise RuntimeError("Multimodal encoder data-parallel execution produced no local plan.")
     if plan.total_output_rows == 0:
-        return local_contribution
-    return allreduce(local_contribution)
+        return local_output
+
+    gathered = allgather(local_output, list(plan.rank_output_row_counts))
+    if all(left.rank <= right.rank for left, right in pairwise(plan.placements)):
+        # Rank order already matches prompt order; avoid another full-size copy.
+        return gathered
+    rank_row_starts = list(accumulate(plan.rank_output_row_counts, initial=0))
+    ordered_outputs = []
+    for placement in plan.placements:
+        row_start = rank_row_starts[placement.rank]
+        row_end = row_start + placement.item.output_row_count
+        ordered_outputs.append(gathered[row_start:row_end])
+        rank_row_starts[placement.rank] = row_end
+    return torch.cat(ordered_outputs, dim=0)
