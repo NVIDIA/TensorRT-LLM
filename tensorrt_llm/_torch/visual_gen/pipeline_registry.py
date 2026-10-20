@@ -46,6 +46,7 @@ import json
 import os
 from dataclasses import dataclass, field
 from enum import Enum
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Type
 
 from tensorrt_llm.logger import logger
@@ -230,9 +231,15 @@ class AutoPipeline:
         """Detect pipeline ``_class_name`` from a checkpoint directory.
 
         Resolution order:
-        1. ``model_index.json`` or ``modular_model_index.json``
-        2. Safetensors metadata (LTX-2 native single-file format)
+        1. FLUX.3 image package ``config.json`` (``model=flux-3-image-klein``)
+        2. ``model_index.json`` or ``modular_model_index.json``
+        3. Safetensors metadata (LTX-2 native single-file format)
         """
+        from .config import is_flux3_checkpoint
+
+        if is_flux3_checkpoint(Path(checkpoint_dir)):
+            return "Flux3Pipeline"
+
         index_paths = [
             os.path.join(checkpoint_dir, "model_index.json"),
             os.path.join(checkpoint_dir, "modular_model_index.json"),
@@ -245,6 +252,13 @@ class AutoPipeline:
                 index = json.load(f)
 
             class_name = index.get("_class_name", "")
+
+            if "Flux3" in class_name:
+                from .models.flux3.checkpoint import PACKAGE_LAYOUT
+
+                raise ValueError(
+                    f"Unsupported FLUX.3 checkpoint at {checkpoint_dir}. {PACKAGE_LAYOUT}"
+                )
 
             if class_name in PIPELINE_REGISTRY:
                 return class_name

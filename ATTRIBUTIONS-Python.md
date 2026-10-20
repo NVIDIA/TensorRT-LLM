@@ -5263,6 +5263,42 @@ For more information, please refer to <http://unlicense.org>
 
 ## flashinfer-python (0.6.18)
 
+Also includes the vendored PrimsTS dense GEMM sources in
+`tensorrt_llm/_torch/visual_gen/prims_ts/gemm`, from
+[flashinfer-ai/flashinfer](https://github.com/flashinfer-ai/flashinfer/tree/8b37094e149c27e112d415fc92d1920c950f9ebd/flashinfer/prims_ts/gemm)
+at commit `8b37094e149c27e112d415fc92d1920c950f9ebd`.
+The wrappers retain their FlashInfer copyright and Apache-2.0 notices.
+The device program `kernel.py` retains its NVIDIA copyright and BSD-3-Clause
+license, including the complete conditions and disclaimer in that file.
+TensorRT-LLM adaptations are recorded in
+`3rdparty/vendor_patches/flashinfer-prims-ts-gemm.patch`; original per-file
+licenses are preserved.
+
+The following NOTICE is reproduced from FlashInfer. “This project” and
+“this product” refer to FlashInfer; `licenses/` refers to its upstream directory.
+
+```text
+FlashInfer
+Copyright 2025-2026 NVIDIA
+Copyright 2023-2026 FlashInfer community (https://flashinfer.ai/)
+
+-------------------------------------------------------------------------------------------------
+Some of the code in this project are adapted from other open-source projects with different
+licenses. This product also bundles some third-party components under other open source licenses.
+See licenses/ for text of these licenses.
+
+The persistent CuTe DSL KDA kernels are adapted from humanfia/kda-for-kda-release,
+Copyright (c) 2026 KDA Team, under the MIT License (licenses/LICENSE.kda-for-kda).
+
+The static PTX KDA kernels are adapted from NVlabs/kda (260927-kda-for-kda),
+Copyright (c) 2026 KDA Team, under the MIT License (LICENSE.kda-for-kda.txt).
+
+The TIRx KDA kernels are adapted from NVlabs/kda (260927-kda-for-kda),
+Copyright (c) 2026 KDA Team, under the MIT License (licenses/LICENSE.kda-for-kda).
+The split kernel also retains its original Apache-2.0 TIRx-author attribution.
+Source: https://github.com/NVlabs/kda/tree/260927-kda-for-kda
+```
+
 ### Licenses
 License: `Apache-2.0`
 
