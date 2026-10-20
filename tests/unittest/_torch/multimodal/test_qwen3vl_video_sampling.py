@@ -310,7 +310,7 @@ def test_nested_sampling_preserves_pixels_and_source_timestamps(adapter, process
         [(expected[i] + expected[i + 1]) / 48 for i in range(0, 8, 2)]
     )
     patches = result["pixel_values_videos"].reshape(4, -1, 3, 2, 16, 16)
-    assert patches[:, 0, 0, :, 0, 0].flatten().tolist() == pytest.approx(np.asarray(expected) / 255)
+    assert patches[:, 0, 0, :, 0, 0].flatten().tolist() == pytest.approx(expected)
     assert request == original
 
 
@@ -422,3 +422,34 @@ def test_metadata_output_filter_preserves_prompt_timestamps(
         [0.5, 2.5, 4.5, 6.5]
     )
     assert ("video_metadata" in result) == kwargs.get("return_metadata", False)
+
+
+@pytest.mark.parametrize("format", ["numpy", "pil"])
+def test_nested_uint8_video_is_rescaled_once(adapter, processor, format):
+    video = _video([0, 2, 10, 30, 60, 90, 160, 239])
+    pixels = np.full((8, 32, 32, 3), 128, dtype=np.uint8)
+    video.frames = pixels if format == "numpy" else [Image.fromarray(frame) for frame in pixels]
+    result = adapter.preprocess(
+        SimpleNamespace(processor=processor),
+        "<|video_pad|>",
+        {"video": [video]},
+        {"videos_kwargs": {"num_frames": 4, "do_normalize": False}},
+    )
+    assert result["pixel_values_videos"].mean().item() == pytest.approx(128 / 255)
+
+
+def test_nested_image_and_video_preserve_float_pixel_values(adapter, processor):
+    images = [torch.ones(3, 32, 32)]
+    video = _video(list(range(0, 192, 24)))
+    result = adapter.preprocess(
+        SimpleNamespace(processor=processor),
+        "<|image_pad|><|video_pad|>",
+        {"image": images, "video": [video]},
+        {
+            "images_kwargs": {"do_normalize": False},
+            "videos_kwargs": {"num_frames": 4, "do_normalize": False},
+        },
+    )
+    assert result["pixel_values"].mean().item() == pytest.approx(1.0)
+    patches = result["pixel_values_videos"].reshape(2, -1, 3, 2, 16, 16)
+    assert patches[:, 0, 0, :, 0, 0].flatten().tolist() == pytest.approx([0, 2, 5, 7])
