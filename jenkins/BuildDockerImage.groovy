@@ -743,6 +743,11 @@ pipeline {
             defaultValue: true,
             description: "Build NGC devel and release images (x86_64 and SBSA)"
         )
+        booleanParam(
+            name: "useWheelFromBuildStage",
+            defaultValue: false,
+            description: "Install the build-stage wheel instead of compiling inside the image. The declared job default is false; the nightly release caller explicitly enables this option."
+        )
     }
     options {
         // Check the valid options at: https://www.jenkins.io/doc/book/pipeline/syntax/

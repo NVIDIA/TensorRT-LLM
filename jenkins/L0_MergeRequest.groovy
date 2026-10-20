@@ -1814,6 +1814,9 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
             script {
                 def testStageName = "[Build-Docker-Images] Remote Run"
                 stage(testStageName) {
+                    if (runMode == "nightly_release") {
+                        error "Build-Docker-Images does not support nightly_release; use Build-Release-Docker-Images"
+                    }
                     try {
                         def branch = env.gitlabBranch ? env.gitlabBranch : "main"
                         if (globalVars[GITHUB_PR_API_URL]) {
@@ -1829,23 +1832,10 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                         def additionalParameters = [
                             'branch': branch,
                             'action': "push",
-                            'triggerType': runMode == "nightly_release" ?
-                                "nightly-release" :
-                                (env.JOB_NAME ==~ /.*PostMerge.*/ ? "post-merge" : "pre-merge"),
-                            'runSanityCheck':
-                                runMode == "nightly_release" ||
-                                env.JOB_NAME ==~ /.*PostMerge.*/,
+                            'triggerType': env.JOB_NAME ==~ /.*PostMerge.*/ ? "post-merge" : "pre-merge",
+                            'runSanityCheck': env.JOB_NAME ==~ /.*PostMerge.*/,
                             'defaultTag': defaultTag,
                         ]
-                        if (runMode == "nightly_release") {
-                            additionalParameters += [
-                                'buildInternalRelease': false,
-                                'buildCiImage': false,
-                                'buildNgcRelease': true,
-                                'register_images': true,
-                                'wait_success_seconds': "",
-                            ]
-                        }
 
                         launchJob(pipeline, "/LLM/helpers/BuildDockerImages", false, enableFailFast, globalVars, "x86_64", additionalParameters)
                     } catch (InterruptedException e) {
@@ -1912,6 +1902,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                             additionalParameters += [
                                 'buildNgcRelease': true,
                                 'register_images': true,
+                                'useWheelFromBuildStage': true,
                                 'wait_success_seconds': "",
                             ]
                         } else {
