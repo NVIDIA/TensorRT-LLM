@@ -29,6 +29,7 @@ Losslessness: chi-square of the emitted and the draft tokens against their distr
 
 import math
 import os
+import types
 
 import numpy as np
 import pytest
@@ -507,3 +508,6 @@ def test_cuda_graph_replay_matches_eager():
 def test_flag_defaults_off():
     """The fused path is off unless ``TLLM_SPEC_FAST_RS=1``."""
     assert not frs.fast_rs_enabled()
+    # Flag off: the gate decides before reading the metadata, so a stand-in without the
+    # sampling-mode field (as in test_rejection_buffers_guard) keeps the reference dispatch.
+    assert not _Worker()._fast_rs_applies(types.SimpleNamespace(), None, V)
