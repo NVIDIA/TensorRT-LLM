@@ -30,7 +30,7 @@ _EXPECTED_TRANSCRIPT_FRAGMENT = "thoughts affected hester"
 pytestmark = pytest.mark.threadleak(enabled=False)
 
 
-@pytest.fixture
+@pytest.fixture(scope="class")
 def vlm():
     if not torch.cuda.is_available():
         pytest.skip("requires a GPU to run a real VLM engine")
@@ -58,7 +58,7 @@ def _whisper_model_path() -> Path:
     for candidate in candidates:
         if candidate.exists():
             return candidate
-    pytest.skip(f"whisper-tiny not found under {root}")
+    raise FileNotFoundError(f"whisper-tiny not found under {root}")
 
 
 def _whisper_audio_path() -> Path:
@@ -67,7 +67,7 @@ def _whisper_audio_path() -> Path:
         candidate = root / f"whisper-models/{checkpoint}/1221-135766-0002.wav"
         if candidate.exists():
             return candidate
-    pytest.skip(f"Whisper test audio not found under {root}/whisper-models")
+    raise FileNotFoundError(f"Whisper test audio not found under {root}/whisper-models")
 
 
 @pytest.fixture
@@ -110,93 +110,98 @@ def _model_info(control):
     )
 
 
-def test_image_capability_agrees_with_generate(vlm):
-    inference, control = _servicers(vlm)
-    info = _model_info(control)
+class TestVlmMediaConformance:
+    def test_image_capability_agrees_with_generate(self, vlm):
+        inference, control = _servicers(vlm)
+        info = _model_info(control)
 
-    assert info.supports_multimodal is True
-    assert "image" in info.extra["trtllm_supported_modalities"]
+        assert info.supports_multimodal is True
+        assert "image" in info.extra["trtllm_supported_modalities"]
 
-    prompt = (
-        "<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|>"
-        "Describe this image briefly.<|im_end|>\n<|im_start|>assistant\n"
-    )
-    prompt_token_ids = vlm.tokenizer.encode(prompt)
-    image_path = llm_models_root(check=True) / "multimodals/test_data/seashore.png"
-    image_bytes = image_path.read_bytes()
-    data_uri = "data:image/png;base64," + base64.b64encode(image_bytes).decode()
-    request = generation_pb2.GenerateRequest(
-        request_id="openengine-image-conformance",
-        model=MODEL_NAME,
-        token_ids=generation_pb2.TokenIds(ids=prompt_token_ids),
-        stopping=generation_pb2.StoppingOptions(max_tokens=4),
-        media=[
-            generation_pb2.MediaItem(
-                modality=generation_pb2.MODALITY_IMAGE,
-                data_uri=data_uri,
-                uuid="seashore",
+        prompt = (
+            "<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|>"
+            "Describe this image briefly.<|im_end|>\n<|im_start|>assistant\n"
+        )
+        prompt_token_ids = vlm.tokenizer.encode(prompt)
+        image_path = llm_models_root(check=True) / "multimodals/test_data/seashore.png"
+        image_bytes = image_path.read_bytes()
+        data_uri = "data:image/png;base64," + base64.b64encode(image_bytes).decode()
+        request = generation_pb2.GenerateRequest(
+            request_id="openengine-image-conformance",
+            model=MODEL_NAME,
+            token_ids=generation_pb2.TokenIds(ids=prompt_token_ids),
+            stopping=generation_pb2.StoppingOptions(max_tokens=4),
+            media=[
+                generation_pb2.MediaItem(
+                    modality=generation_pb2.MODALITY_IMAGE,
+                    data_uri=data_uri,
+                    uuid="seashore",
+                )
+            ],
+        )
+
+        async def collect():
+            return [
+                response async for response in inference.Generate(request, FakeServicerContext())
+            ]
+
+        responses = asyncio.run(collect())
+        assert responses
+        assert not any(response.HasField("error") for response in responses)
+        finished = [response for response in responses if response.HasField("finished")]
+        assert len(finished) == 1
+        assert finished[0].usage.prompt_tokens > len(prompt_token_ids)
+        assert finished[0].usage.total_tokens == (
+            finished[0].usage.prompt_tokens + finished[0].usage.completion_tokens
+        )
+
+    def test_video_capability_agrees_with_generate(self, vlm):
+        try:
+            importlib.import_module("cv2")
+        except (ImportError, OSError) as error:
+            pytest.fail(
+                f"video conformance requires a working OpenCV install: {error}", pytrace=False
             )
-        ],
-    )
+        inference, control = _servicers(vlm)
+        info = _model_info(control)
+        assert info.supports_multimodal is True
+        assert "video" in info.extra["trtllm_supported_modalities"]
 
-    async def collect():
-        return [response async for response in inference.Generate(request, FakeServicerContext())]
+        video_path = (
+            Path(__file__).parents[2] / "_torch/visual_gen/test_data/cosmos3_v2v_ref_9f_bframes.mp4"
+        )
 
-    responses = asyncio.run(collect())
-    assert responses
-    assert not any(response.HasField("error") for response in responses)
-    finished = [response for response in responses if response.HasField("finished")]
-    assert len(finished) == 1
-    assert finished[0].usage.prompt_tokens > len(prompt_token_ids)
-    assert finished[0].usage.total_tokens == (
-        finished[0].usage.prompt_tokens + finished[0].usage.completion_tokens
-    )
+        video_prompt = (
+            "<|im_start|>user\n<|vision_start|><|video_pad|><|vision_end|>"
+            "Describe this video briefly.<|im_end|>\n<|im_start|>assistant\n"
+        )
+        video_request = generation_pb2.GenerateRequest(
+            request_id="openengine-video-conformance",
+            model=MODEL_NAME,
+            token_ids=generation_pb2.TokenIds(ids=vlm.tokenizer.encode(video_prompt)),
+            stopping=generation_pb2.StoppingOptions(max_tokens=4),
+            media=[
+                generation_pb2.MediaItem(
+                    modality=generation_pb2.MODALITY_VIDEO,
+                    data_uri="data:video/mp4;base64,"
+                    + base64.b64encode(video_path.read_bytes()).decode(),
+                    uuid="colors",
+                )
+            ],
+        )
 
+        async def collect_video():
+            return [
+                response
+                async for response in inference.Generate(video_request, FakeServicerContext())
+            ]
 
-def test_video_capability_agrees_with_generate(vlm):
-    try:
-        importlib.import_module("cv2")
-    except (ImportError, OSError) as error:
-        pytest.fail(f"video conformance requires a working OpenCV install: {error}", pytrace=False)
-    inference, control = _servicers(vlm)
-    info = _model_info(control)
-    assert info.supports_multimodal is True
-    assert "video" in info.extra["trtllm_supported_modalities"]
-
-    video_path = (
-        Path(__file__).parents[2] / "_torch/visual_gen/test_data/cosmos3_v2v_ref_9f_bframes.mp4"
-    )
-
-    video_prompt = (
-        "<|im_start|>user\n<|vision_start|><|video_pad|><|vision_end|>"
-        "Describe this video briefly.<|im_end|>\n<|im_start|>assistant\n"
-    )
-    video_request = generation_pb2.GenerateRequest(
-        request_id="openengine-video-conformance",
-        model=MODEL_NAME,
-        token_ids=generation_pb2.TokenIds(ids=vlm.tokenizer.encode(video_prompt)),
-        stopping=generation_pb2.StoppingOptions(max_tokens=4),
-        media=[
-            generation_pb2.MediaItem(
-                modality=generation_pb2.MODALITY_VIDEO,
-                data_uri="data:video/mp4;base64,"
-                + base64.b64encode(video_path.read_bytes()).decode(),
-                uuid="colors",
-            )
-        ],
-    )
-
-    async def collect_video():
-        return [
-            response async for response in inference.Generate(video_request, FakeServicerContext())
-        ]
-
-    video_responses = asyncio.run(collect_video())
-    assert video_responses
-    assert not any(response.HasField("error") for response in video_responses)
-    video_finished = [response for response in video_responses if response.HasField("finished")]
-    assert len(video_finished) == 1
-    assert video_finished[0].usage.prompt_tokens > len(video_request.token_ids.ids)
+        video_responses = asyncio.run(collect_video())
+        assert video_responses
+        assert not any(response.HasField("error") for response in video_responses)
+        video_finished = [response for response in video_responses if response.HasField("finished")]
+        assert len(video_finished) == 1
+        assert video_finished[0].usage.prompt_tokens > len(video_request.token_ids.ids)
 
 
 def test_audio_capability_agrees_with_generate(whisper):
