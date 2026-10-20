@@ -2463,19 +2463,17 @@ def _run_megamoe_prologue_helper() -> Callable[[int, bool], torch.Tensor]:
     from cutlass.cutlass_dsl import Boolean, Int32
     from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 
-    from tensorrt_llm._torch.cute_dsl_kernels.cutedsl_megamoe.api import ImplDesc, ProblemDesc
-    from tensorrt_llm._torch.cute_dsl_kernels.cutedsl_megamoe.helpers.device_workspace import (
+    from tensorrt_llm._torch.moe.kernels.cutedsl_megamoe.api import ImplDesc, ProblemDesc
+    from tensorrt_llm._torch.moe.kernels.cutedsl_megamoe.helpers.device_workspace import (
         DeviceWorkspace,
     )
-    from tensorrt_llm._torch.cute_dsl_kernels.cutedsl_megamoe.helpers.smem_workspace import (
-        SmemWorkspace,
-    )
-    from tensorrt_llm._torch.cute_dsl_kernels.cutedsl_megamoe.kernel_src.schedulers.fc12_mapping import (
+    from tensorrt_llm._torch.moe.kernels.cutedsl_megamoe.helpers.smem_workspace import SmemWorkspace
+    from tensorrt_llm._torch.moe.kernels.cutedsl_megamoe.kernel_src.schedulers.fc12_mapping import (
         BlockPhase,
         map_phase_interleaved_fc12_work_id,
         resolve_phase_interleaved_fc1_claim_target,
     )
-    from tensorrt_llm._torch.cute_dsl_kernels.cutedsl_megamoe.kernel_src.schedulers.fc12_scheduler import (
+    from tensorrt_llm._torch.moe.kernels.cutedsl_megamoe.kernel_src.schedulers.fc12_scheduler import (
         PhaseInterleavedFc12Scheduler,
     )
 
