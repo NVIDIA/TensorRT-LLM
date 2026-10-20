@@ -18,6 +18,7 @@ ROOT = Path(__file__).resolve().parents[3]
 
 @pytest.fixture(scope="module")
 def wheel_command() -> str:
+    """Extract the wheel-stage shell command, excluding BuildKit mounts and comments."""
     dockerfile = (ROOT / "docker/Dockerfile.multi").read_text()
     stage = dockerfile.split(" AS wheel\n", 1)[1].split("\nFROM ", 1)[0]
     stage = "\n".join(line for line in stage.splitlines() if not line.lstrip().startswith("#"))
@@ -52,6 +53,7 @@ def test_docker_wheel_arguments(
     extra_args: str,
     expected: str | None,
 ) -> None:
+    """Check Docker argument forwarding against the real builder and download parsers."""
     auth = tmp_path / "docker/common/github_auth.sh"
     auth.parent.mkdir(parents=True)
     auth.write_text("")
@@ -75,6 +77,7 @@ def test_docker_wheel_arguments(
         capture_output=True,
         text=True,
         check=True,
+        timeout=60,
     )
     source_commit, invoked_script, *arguments = result.stdout.splitlines()
     assert source_commit == commit

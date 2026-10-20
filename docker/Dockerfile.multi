@@ -243,8 +243,10 @@ ENV TRT_LLM_GIT_COMMIT=${GIT_COMMIT} \
 
 # Check installed metadata without importing CUDA-linked modules.
 RUN --mount=type=bind,source=docker/common/validate_wheel_metadata.py,target=/tmp/validate_wheel_metadata.py \
+    --mount=type=bind,source=tensorrt_llm/version.py,target=/tmp/trtllm_source_version.py \
     python3 /tmp/validate_wheel_metadata.py \
-        --expected-version "${TRT_LLM_VER}" --expected-commit "${GIT_COMMIT}"
+        --expected-version "${TRT_LLM_VER}" --expected-commit "${GIT_COMMIT}" \
+        --source-version-file /tmp/trtllm_source_version.py
 
 # Generate OSS attribution file for release image
 RUN --mount=type=bind,source=scripts/generate_container_oss_attribution.sh,target=/mnt/gen_attribution.sh \

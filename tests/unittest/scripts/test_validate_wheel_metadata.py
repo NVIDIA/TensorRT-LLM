@@ -36,6 +36,7 @@ SOURCE_URL = f"Source Commit, https://github.com/NVIDIA/TensorRT-LLM/commit/{COM
 def test_installed_metadata(
     tmp_path, installed_version, project_urls, expected_version, expected_commit, error
 ):
+    """Accept matching metadata and reject version or source commit mismatches."""
     if installed_version:
         metadata = tmp_path / "tensorrt_llm-1.4.0a0.dist-info" / "METADATA"
         metadata.parent.mkdir()
@@ -60,6 +61,49 @@ def test_installed_metadata(
         capture_output=True,
         text=True,
         check=False,
+        timeout=60,
+    )
+    if error:
+        assert result.returncode != 0
+        assert error in result.stderr
+    else:
+        assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize(
+    "base_version,override,installed_version,error",
+    [
+        ("1.4.0a0", ".dev202610190100", "1.4.0a0.dev202610190100", None),
+        ("1.4.0a0", "+local", "1.4.0a0+local", None),
+        ("1.4.0a0", ".dev202610190100", "1.3.0a0.dev202610190100", "version mismatch"),
+        ("1.4.0a0", "+local", "1.3.0a0+local", "version mismatch"),
+        ("1.4.0a0.dev202610190100", ".dev202610190100", "1.4.0a0.dev202610190100", None),
+        ("1.4.0a0+local", "+local", "1.4.0a0+local", None),
+    ],
+)
+def test_relative_version(tmp_path, base_version, override, installed_version, error):
+    """Resolve suffixes from the source base, independently of installed metadata."""
+    metadata = tmp_path / "tensorrt_llm-1.4.0a0.dist-info" / "METADATA"
+    metadata.parent.mkdir()
+    metadata.write_text(
+        f"Metadata-Version: 2.1\nName: tensorrt_llm\nVersion: {installed_version}\n"
+    )
+    source_version = tmp_path / "version.py"
+    source_version.write_text(f'__version__ = "{base_version}"\n')
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT),
+            "--expected-version",
+            override,
+            "--source-version-file",
+            str(source_version),
+        ],
+        env={**os.environ, "PYTHONPATH": str(tmp_path)},
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=60,
     )
     if error:
         assert result.returncode != 0

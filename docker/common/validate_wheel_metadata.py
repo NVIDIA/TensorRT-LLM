@@ -5,13 +5,29 @@
 import re
 from argparse import ArgumentParser
 from importlib.metadata import distribution
+from pathlib import Path
 
 from packaging.version import Version
 
 
-def validate_wheel_metadata(expected_version: str, expected_commit: str) -> None:
+def validate_wheel_metadata(
+    expected_version: str, expected_commit: str, source_version_file: Path | None = None
+) -> None:
+    """Check installed metadata, resolving relative versions from the build source file."""
     if not expected_version and not expected_commit:
         return
+    if expected_version.startswith((".", "+")):
+        if source_version_file is None:
+            raise SystemExit("Relative versions require --source-version-file")
+        match = re.search(r'(?m)^__version__ = "([^"]+)"$', source_version_file.read_text())
+        if not match:
+            raise SystemExit(f"Unable to read __version__ from {source_version_file}")
+        base_version = match.group(1)
+        expected_version = (
+            base_version
+            if base_version.endswith(expected_version)
+            else base_version + expected_version
+        )
     wheel = distribution("tensorrt_llm")
     if expected_version and Version(wheel.version) != Version(expected_version):
         raise SystemExit(
@@ -37,5 +53,8 @@ if __name__ == "__main__":
     parser = ArgumentParser(description=__doc__)
     parser.add_argument("--expected-version", default="")
     parser.add_argument("--expected-commit", default="")
+    parser.add_argument(
+        "--source-version-file", type=Path, help="Build-context version.py for relative overrides"
+    )
     args = parser.parse_args()
-    validate_wheel_metadata(args.expected_version, args.expected_commit)
+    validate_wheel_metadata(args.expected_version, args.expected_commit, args.source_version_file)
