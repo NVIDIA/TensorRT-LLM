@@ -44,6 +44,7 @@ signoff-qualified upstream, so it keeps the fallback for now.
 from __future__ import annotations
 
 import math
+import weakref
 from dataclasses import dataclass
 from importlib import import_module
 from importlib.metadata import PackageNotFoundError, version
@@ -129,7 +130,11 @@ class PrimsTSSparseMlaFmha(Fmha):
         # FP8 dequantization scales are fixed per layer; the wrapper takes host
         # scalars, so read them once during eager warmup, never under capture.
         self._kv_dequant_scale: Optional[float] = None
-        # Pool-base-rooted views of the SWA and compress pools, per manager.
+        # Pool-base-rooted views of the SWA and compress pools, owned by the
+        # manager they were built from. The owner is held weakly: a freed
+        # manager (or a new one at the same address) never resolves to a
+        # stale view of released pool memory.
+        self._pool_views_owner: Optional[weakref.ReferenceType] = None
         self._pool_views: dict[tuple[int, int], torch.Tensor] = {}
         self._sinks_cache: Optional[tuple[int, torch.Tensor]] = None
 
@@ -329,7 +334,11 @@ class PrimsTSSparseMlaFmha(Fmha):
             DeepseekV4AttentionType,
         )
 
-        key = (id(manager), int(attn_type.value), compress_ratio)
+        owner = self._pool_views_owner() if self._pool_views_owner is not None else None
+        if owner is not manager:
+            self._pool_views.clear()
+            self._pool_views_owner = weakref.ref(manager)
+        key = (int(attn_type.value), compress_ratio)
         view = self._pool_views.get(key)
         if view is not None:
             return view

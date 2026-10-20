@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for the PrimTS native sparse MLA FMHA library (DeepSeek-V4, SM100)."""
 
+import gc
 import math
 from types import SimpleNamespace
 
@@ -95,6 +96,53 @@ def test_softmax_scale_follows_qk_head_dim() -> None:
     assert PrimsTSSparseMlaFmha._softmax_scale(attn) == pytest.approx(expected, rel=1e-12)
     attn = SimpleNamespace(qk_nope_head_dim=448, qk_rope_head_dim=64, q_scaling=1.0)
     assert PrimsTSSparseMlaFmha._softmax_scale(attn) == pytest.approx(LATENT**-0.5, rel=1e-12)
+
+
+def test_pool_view_cache_follows_the_owning_manager() -> None:
+    """A new cache manager gets fresh pool views, even at the old manager's address.
+
+    The views wrap the raw pool base pointer, so a view cached for a freed
+    manager would alias released memory. The cache is owned through a weak
+    reference and dropped whenever the owner changes.
+    """
+    from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.params import (
+        DeepseekV4AttentionType,
+    )
+
+    class _Owner:  # weak-referenceable stand-ins for TrtllmAttention / the manager
+        pass
+
+    def make_manager(rows: int) -> _Owner:
+        manager = _Owner()
+        manager.pool = torch.empty(rows, 1, LATENT, dtype=torch.bfloat16, device="cuda")
+        manager.swa_pool_ptr = manager.pool.data_ptr()
+        manager.compress_pool_ptrs = {}
+        manager.pp_layers = [0]
+        manager._compress_ratios = {0: 4}
+        manager.dtype = torch.bfloat16
+        manager.get_buffers = lambda layer, attn_type: manager.pool
+        return manager
+
+    attn = _Owner()
+    fmha = PrimsTSSparseMlaFmha(attn)
+    first = make_manager(8)
+    view = fmha._pool_view(first, DeepseekV4AttentionType.SWA, 1)
+    assert view.data_ptr() == first.swa_pool_ptr
+    assert tuple(view.shape) == (8, 1, LATENT)
+    assert fmha._pool_view(first, DeepseekV4AttentionType.SWA, 1) is view
+
+    second = make_manager(16)
+    other = fmha._pool_view(second, DeepseekV4AttentionType.SWA, 1)
+    assert other is not view
+    assert other.data_ptr() == second.swa_pool_ptr
+    assert tuple(other.shape) == (16, 1, LATENT)
+    assert fmha._pool_views_owner() is second
+
+    del second
+    gc.collect()
+    assert fmha._pool_views_owner() is None
+    third = make_manager(4)
+    assert tuple(fmha._pool_view(third, DeepseekV4AttentionType.SWA, 1).shape) == (4, 1, LATENT)
 
 
 def _rope_table(max_positions: int, device: torch.device) -> torch.Tensor:
