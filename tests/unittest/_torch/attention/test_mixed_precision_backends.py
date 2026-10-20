@@ -550,7 +550,7 @@ def test_mla_cached_context_and_decode(backend):
 def test_mixed_precision_paged_conversion(dtype, width, layout):
     if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] not in (10, 12):
         pytest.skip("Mixed-precision NVFP4 KV requires Blackwell")
-    from tensorrt_llm._torch.cute_dsl_kernels import mixed_precision_kv as kernels
+    from tensorrt_llm._torch.attention.kernels.blackwell import mixed_precision_kv as kernels
 
     convert_mixed_precision_kv = kernels.convert_mixed_precision_kv
 
@@ -608,7 +608,7 @@ def test_conversion_kernel_imports_pinned_flashinfer_symbols():
     """The kernel relies on internal FlashInfer modules; a bump that drops them fails here."""
     import importlib
 
-    module = importlib.import_module("tensorrt_llm._torch.cute_dsl_kernels.mixed_precision_kv")
+    module = importlib.import_module("tensorrt_llm._torch.attention.kernels.blackwell.mixed_precision_kv")
     assert callable(module.convert_mixed_precision_kv)
     assert module.get_mixed_precision_kv_row_bytes(DataType.NVFP4, 128) == 72
 

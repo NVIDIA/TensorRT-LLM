@@ -288,6 +288,13 @@
           "description": "MoE backend override for a neural draft model or embedded MTP layers on the PyTorch backend. None inherits the target model's backend. AUTO resolves from the draft checkpoint or embedded MTP layer quantization, and a concrete backend applies only to the draft model or layers. Resolution may fall back based on model, quantization, and hardware support. Replacement-head MTP checkpoints must inherit the target model's MoE backend; leave this option unset. Nemotron-H embedded MTP layers must inherit the target backend because their checkpoint mapper uses a shared backend-dependent layout. Decoding methods without a neural draft model ignore this option.",
           "title": "Moe Backend"
         },
+        "spec_dec_variant": {
+          "default": 1,
+          "description": "Version of the algorithm within its decoding_type family (e.g. DFlash 1 vs. 2), for versions that share one decoding config. Resolved from the draft checkpoint where a family has versions. Do not set manually.",
+          "exclusiveMinimum": 0,
+          "title": "Spec Dec Variant",
+          "type": "integer"
+        },
         "speculative_model": {
           "anyOf": [
             {
@@ -867,6 +874,20 @@
           "title": "Skip Ctx Buffer Budget Check",
           "type": "boolean"
         },
+        "spec_dec_variant": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Version of the DFlash algorithm: 2 for a DFlash 2 draft checkpoint, 1 otherwise. None until the draft checkpoint's config.json has been read, which for a HF repo id happens only after download. Do not set manually.",
+          "title": "Spec Dec Variant"
+        },
         "speculative_model": {
           "anyOf": [
             {
@@ -975,7 +996,7 @@
         },
         "attention_backend": {
           "default": "AUTO",
-          "description": "Block-decode attention backend for a standalone DSpark drafter (one shipped as its own checkpoint, not inside the target's mtp.* namespace). Ignored by the embedded DeepSeek-V4-Pro draft. Independent of the backend that builds the drafter's own attention modules.\n\nAUTO resolves per drafter family and is right unless you are pinning a kernel: a GQA backbone degrades when its kernel is missing, an MLA one raises. TRTLLM needs FlashInfer and SM100/SM103. CUTEDSL is MLA-only and needs a cute-dsl MLA decode taking per-token kv_bounds that is not upstream yet. Which kernel each name selects: MLADSparkForCausalLM.",
+          "description": "Block-decode attention backend for a standalone DSpark drafter (one shipped as its own checkpoint, not inside the target's mtp.* namespace). Ignored by the embedded DeepSeek-V4-Pro draft. Independent of the backend that builds the drafter's own attention modules.\n\nAUTO resolves per drafter family and is right unless you are pinning a kernel: TRTLLM for a GQA backbone, which degrades when its kernel is missing, and CUTEDSL for an MLA one, which raises. TRTLLM needs FlashInfer and SM100/SM103. CUTEDSL is MLA-only: one cute-dsl MLA decode pass over context and block, on SM100/SM103/SM107. Which kernel each name selects: MLADSparkForCausalLM.",
           "enum": [
             "AUTO",
             "VANILLA",
@@ -1152,6 +1173,13 @@
           "default": null,
           "description": "MoE backend override for a neural draft model or embedded MTP layers on the PyTorch backend. None inherits the target model's backend. AUTO resolves from the draft checkpoint or embedded MTP layer quantization, and a concrete backend applies only to the draft model or layers. Resolution may fall back based on model, quantization, and hardware support. Replacement-head MTP checkpoints must inherit the target model's MoE backend; leave this option unset. Nemotron-H embedded MTP layers must inherit the target backend because their checkpoint mapper uses a shared backend-dependent layout. Decoding methods without a neural draft model ignore this option.",
           "title": "Moe Backend"
+        },
+        "spec_dec_variant": {
+          "default": 1,
+          "description": "Version of the algorithm within its decoding_type family (e.g. DFlash 1 vs. 2), for versions that share one decoding config. Resolved from the draft checkpoint where a family has versions. Do not set manually.",
+          "exclusiveMinimum": 0,
+          "title": "Spec Dec Variant",
+          "type": "integer"
         },
         "speculative_model": {
           "anyOf": [
@@ -1747,6 +1775,13 @@
           "description": "MoE backend override for a neural draft model or embedded MTP layers on the PyTorch backend. None inherits the target model's backend. AUTO resolves from the draft checkpoint or embedded MTP layer quantization, and a concrete backend applies only to the draft model or layers. Resolution may fall back based on model, quantization, and hardware support. Replacement-head MTP checkpoints must inherit the target model's MoE backend; leave this option unset. Nemotron-H embedded MTP layers must inherit the target backend because their checkpoint mapper uses a shared backend-dependent layout. Decoding methods without a neural draft model ignore this option.",
           "title": "Moe Backend"
         },
+        "spec_dec_variant": {
+          "default": 1,
+          "description": "Version of the algorithm within its decoding_type family (e.g. DFlash 1 vs. 2), for versions that share one decoding config. Resolved from the draft checkpoint where a family has versions. Do not set manually.",
+          "exclusiveMinimum": 0,
+          "title": "Spec Dec Variant",
+          "type": "integer"
+        },
         "speculative_model": {
           "anyOf": [
             {
@@ -2089,6 +2124,13 @@
           "description": "Optional Suffix Automaton configuration. When set, combines SA drafting with Eagle3 speculative decoding.",
           "status": "beta"
         },
+        "spec_dec_variant": {
+          "default": 3,
+          "description": "Version of the EAGLE algorithm, 3 for EAGLE3 draft checkpoints. Do not set manually.",
+          "exclusiveMinimum": 0,
+          "title": "Spec Dec Variant",
+          "type": "integer"
+        },
         "speculative_model": {
           "anyOf": [
             {
@@ -2366,6 +2408,13 @@
           "default": null,
           "description": "Deprecated TensorRT-only field with different semantics from draft model layer count. Do not use on the PyTorch backend.",
           "title": "Num Eagle Layers"
+        },
+        "spec_dec_variant": {
+          "default": 3,
+          "description": "Version of the EAGLE algorithm, 3 for EAGLE3 draft checkpoints. Do not set manually.",
+          "exclusiveMinimum": 0,
+          "title": "Spec Dec Variant",
+          "type": "integer"
         },
         "speculative_model": {
           "anyOf": [
@@ -2775,7 +2824,7 @@
         },
         "dtype": {
           "default": "auto",
-          "description": "The data type for the KV cache. 'auto' (default) leaves the checkpoint's own KV-cache quantization metadata untouched (quant_config.kv_cache_quant_algo is inherited as-is); 'fp8', 'fp8_ds_mla', or 'nvfp4' override it explicitly. 'fp8_ds_mla' selects the packed FP8 cache used by sparse MLA on SM90/SM120/SM121. 'mixed_nvfp4_<dtype>' (prototype) stores the full KV history in NVFP4 and keeps the first_n/last_n tokens of every sequence in <dtype> ('fp8', 'float16' or 'bfloat16'); requires KV cache manager V2. Resolved at LLM-construction time, including when set via trtllm-serve --extra_llm_api_options.",
+          "description": "The data type for the KV cache. 'auto' (default) leaves the checkpoint's own KV-cache quantization metadata untouched (quant_config.kv_cache_quant_algo is inherited as-is); 'fp8', 'fp8_ds_mla', or 'nvfp4' override it explicitly. 'fp8_ds_mla' selects the packed FP8 cache used by sparse MLA on SM90/SM120/SM121. Resolved at LLM-construction time, including when set via trtllm-serve --extra_llm_api_options.",
           "telemetry": {
             "allowed_values": [
               "auto",
@@ -2784,10 +2833,7 @@
               "float32",
               "fp8",
               "fp8_ds_mla",
-              "nvfp4",
-              "mixed_nvfp4_fp8",
-              "mixed_nvfp4_float16",
-              "mixed_nvfp4_bfloat16"
+              "nvfp4"
             ]
           },
           "title": "Dtype",
@@ -2823,14 +2869,6 @@
           "default": 0,
           "description": "Maximum size of the event buffer. If set to 0, the event buffer will not be used.",
           "title": "Event Buffer Max Size",
-          "type": "integer"
-        },
-        "first_n": {
-          "default": 256,
-          "description": "Mixed-precision KV only: number of leading tokens per sequence kept at the retained dtype. Retention follows the cache page granularity.",
-          "minimum": 0,
-          "status": "prototype",
-          "title": "First N",
           "type": "integer"
         },
         "fp8_context_mla_kv_len_cap": {
@@ -2912,14 +2950,6 @@
           "$ref": "#/$defs/KvPoolRebalanceConfig",
           "description": "Tuning for the KVCacheManagerV2 pool rebalance auto-tuner. Only used when ``enable_kv_pool_rebalance`` is True.",
           "status": "prototype"
-        },
-        "last_n": {
-          "default": 256,
-          "description": "Mixed-precision KV only: number of most recent tokens per sequence kept at the retained dtype. Retention follows the cache page granularity.",
-          "minimum": 0,
-          "status": "prototype",
-          "title": "Last N",
-          "type": "integer"
         },
         "mamba_ssm_cache_dtype": {
           "default": "auto",
@@ -3612,6 +3642,13 @@
           "default": null,
           "description": "Optional Suffix Automaton configuration. When set, combines SA drafting with MTP speculative decoding.",
           "status": "beta"
+        },
+        "spec_dec_variant": {
+          "default": 1,
+          "description": "Version of the algorithm within its decoding_type family (e.g. DFlash 1 vs. 2), for versions that share one decoding config. Resolved from the draft checkpoint where a family has versions. Do not set manually.",
+          "exclusiveMinimum": 0,
+          "title": "Spec Dec Variant",
+          "type": "integer"
         },
         "speculative_model": {
           "anyOf": [
@@ -4451,6 +4488,13 @@
           "description": "MoE backend override for a neural draft model or embedded MTP layers on the PyTorch backend. None inherits the target model's backend. AUTO resolves from the draft checkpoint or embedded MTP layer quantization, and a concrete backend applies only to the draft model or layers. Resolution may fall back based on model, quantization, and hardware support. Replacement-head MTP checkpoints must inherit the target model's MoE backend; leave this option unset. Nemotron-H embedded MTP layers must inherit the target backend because their checkpoint mapper uses a shared backend-dependent layout. Decoding methods without a neural draft model ignore this option.",
           "title": "Moe Backend"
         },
+        "spec_dec_variant": {
+          "default": 1,
+          "description": "Version of the algorithm within its decoding_type family (e.g. DFlash 1 vs. 2), for versions that share one decoding config. Resolved from the draft checkpoint where a family has versions. Do not set manually.",
+          "exclusiveMinimum": 0,
+          "title": "Spec Dec Variant",
+          "type": "integer"
+        },
         "speculative_model": {
           "anyOf": [
             {
@@ -4700,6 +4744,13 @@
           "default": null,
           "description": "Optional Suffix Automaton configuration. When set, combines SA drafting with PARD speculative decoding.",
           "status": "beta"
+        },
+        "spec_dec_variant": {
+          "default": 1,
+          "description": "Version of the algorithm within its decoding_type family (e.g. DFlash 1 vs. 2), for versions that share one decoding config. Resolved from the draft checkpoint where a family has versions. Do not set manually.",
+          "exclusiveMinimum": 0,
+          "title": "Spec Dec Variant",
+          "type": "integer"
         },
         "speculative_model": {
           "anyOf": [
@@ -5402,6 +5453,13 @@
           "description": "MoE backend override for a neural draft model or embedded MTP layers on the PyTorch backend. None inherits the target model's backend. AUTO resolves from the draft checkpoint or embedded MTP layer quantization, and a concrete backend applies only to the draft model or layers. Resolution may fall back based on model, quantization, and hardware support. Replacement-head MTP checkpoints must inherit the target model's MoE backend; leave this option unset. Nemotron-H embedded MTP layers must inherit the target backend because their checkpoint mapper uses a shared backend-dependent layout. Decoding methods without a neural draft model ignore this option.",
           "title": "Moe Backend"
         },
+        "spec_dec_variant": {
+          "default": 1,
+          "description": "Version of the algorithm within its decoding_type family (e.g. DFlash 1 vs. 2), for versions that share one decoding config. Resolved from the draft checkpoint where a family has versions. Do not set manually.",
+          "exclusiveMinimum": 0,
+          "title": "Spec Dec Variant",
+          "type": "integer"
+        },
         "speculative_model": {
           "anyOf": [
             {
@@ -5650,6 +5708,13 @@
           "title": "Output Directory",
           "type": "string"
         },
+        "spec_dec_variant": {
+          "default": 1,
+          "description": "Version of the algorithm within its decoding_type family (e.g. DFlash 1 vs. 2), for versions that share one decoding config. Resolved from the draft checkpoint where a family has versions. Do not set manually.",
+          "exclusiveMinimum": 0,
+          "title": "Spec Dec Variant",
+          "type": "integer"
+        },
         "speculative_model": {
           "anyOf": [
             {
@@ -5734,7 +5799,7 @@
             }
           ],
           "default": null,
-          "description": "The dynamic batch config to use. This only applies for the TensorRT backend and cannot currently be used with the PyTorch backend."
+          "description": "The dynamic batch configuration used by the scheduler to adjust batch size and token limits at runtime. This option currently has no effect since the scheduler does not support dynamic batch adjustments in the pytorch backend."
         },
         "enable_prefix_aware_scheduling": {
           "default": true,
@@ -6136,6 +6201,13 @@
         },
         "resource_manager": {
           "type": "null"
+        },
+        "spec_dec_variant": {
+          "default": 1,
+          "description": "Version of the algorithm within its decoding_type family (e.g. DFlash 1 vs. 2), for versions that share one decoding config. Resolved from the draft checkpoint where a family has versions. Do not set manually.",
+          "exclusiveMinimum": 0,
+          "title": "Spec Dec Variant",
+          "type": "integer"
         },
         "speculative_model": {
           "anyOf": [

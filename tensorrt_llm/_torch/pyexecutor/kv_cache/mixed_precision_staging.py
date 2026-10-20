@@ -145,7 +145,7 @@ class MixedPrecisionKVStaging:
 
     def convert(self, layer_idx: int, *, writeback: bool = False) -> None:
         """Gather both pools into staging, or write the new tokens back to them."""
-        from ...cute_dsl_kernels.mixed_precision_kv import convert_mixed_precision_kv
+        from ...attention.kernels.blackwell.mixed_precision_kv import convert_mixed_precision_kv
 
         staging, low, high = self.pools[layer_idx]
         # The kernel derives each request's staging span from the page count it

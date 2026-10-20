@@ -270,6 +270,11 @@ public:
     void commitReusedBlocksByLevel(ReusedBlocksByLevelByLifeCycle const& byLifeCycle);
     ReusedBlocksByLevelByLifeCycle getAndResetIterationReusedBlocksByLevel();
 
+    // The KV-connector-loaded share of the reused blocks, committed alongside the scalar iteration
+    // stats that already include it.
+    void commitConnectorReusedBlocks(ConnectorReusedBlocksByLifeCycle const& byLifeCycle);
+    ConnectorReusedBlocksByLifeCycle getAndResetIterationConnectorReusedBlocks();
+
     // Count one ACTIVE->SUSPENDED transition for the current iteration window.
     void recordRequestSuspended();
     // Count one preemption recovery for the current iteration window. Only a
@@ -290,6 +295,10 @@ public:
     // Return the per-cache-level cached-token counts accumulated since the last drain and reset
     // them.
     CountsByLevel getAndResetIterationCachedTokensByLevel();
+    // The cached tokens a KV connector loaded from an external store, which sit on no cache level
+    // and so are not in the per-level counts. Committed alongside them.
+    void commitConnectorCachedTokens(int64_t numTokens);
+    int64_t getAndResetIterationConnectorCachedTokens();
     // Return {suspended, resumed} counts since the last drain and reset them.
     // Both counters track the same population, so the running
     // (suspended - resumed) total is the number of requests still parked in
@@ -457,6 +466,7 @@ private:
     IterationStatsByLifeCycle mIterationStatsByLifeCycle;
     SsmSnapshotIterationStatsByLifeCycle mSsmSnapshotIterationStatsByLifeCycle;
     ReusedBlocksByLevelByLifeCycle mIterReusedBlocksByLevel;
+    ConnectorReusedBlocksByLifeCycle mIterConnectorReusedBlocks;
     PeakBlockStatsByCacheLevel mIterationPeakNumBlocksByCacheLevel;
     std::unordered_set<RequestIdType> mDirtyStatsKvCacheIds;
     std::unordered_set<RequestIdType> mStatsExcludedKvCacheIds;
@@ -464,6 +474,7 @@ private:
     int64_t mIterResumedRequests{0};
     int64_t mIterDiskPrefetchBlocks{0};
     CountsByLevel mIterCachedTokensByLevel;
+    int64_t mIterConnectorCachedTokens{0};
 };
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

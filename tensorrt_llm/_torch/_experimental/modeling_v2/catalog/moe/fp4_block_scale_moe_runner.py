@@ -100,8 +100,9 @@ class Fp4BlockScaleMoeRunner(OpWrapper):
     `topk_weights` the combine weights, neither renormalized here. This rank
     answers for `[local_expert_offset, local_expert_offset + local_num_experts)`
     and contributes zero for every other id, so an expert-parallel split is N
-    calls whose outputs sum -- which is what the deepseek dep4 target does;
-    qwen4_exp makes one call over its whole expert stack.
+    calls whose outputs sum -- which is what the deepseek default target does
+    under moe_ep, one call per rank over its window; qwen4_exp makes one call
+    over its whole expert stack.
 
     With `do_finalize=True` the result is a one-element list holding the
     combined `[T, H]` bf16 rows, or an empty tensor when `output` was given.
@@ -109,12 +110,13 @@ class Fp4BlockScaleMoeRunner(OpWrapper):
     unwritten scale buffer, and the expanded-index -> permuted-row map.
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = frozenset({Arch.SM_100, Arch.SM_103})
 
-    # DeepSeek-R1-0528's routed geometry. The dep4 target gathers four ranks'
-    # tokens before the expert call and issues one call per 64-wide window, so
-    # the window cells are the shape it runs and the full stack is the
-    # single-rank one.
+    # DeepSeek-R1-0528's routed geometry. The deepseek default target makes one
+    # call per rank over its moe_ep window at its moe_tp slice of the
+    # intermediate (dep4 with moe ep4: a 64-wide window at the full 2048; tp8:
+    # all 256 experts at 256), so the window and intermediate-slice cells are
+    # the shapes it runs and the full stack is the single-rank one.
     _R1 = dict(hidden=7168, intermediate=2048, num_experts=256, top_k=8)
 
     # qwen4_exp's (Qwen3.8-Flash-Next) routed geometry: many small experts, a
@@ -145,6 +147,41 @@ class Fp4BlockScaleMoeRunner(OpWrapper):
         Cell(
             why="the single-rank shape: all 256 experts local, and one token, the decode row count",
             spec=dict(tokens=1, local_expert_offset=0, local_num_experts=256, **_R1),
+        ),
+        Cell(
+            why="deepseek default at tp2: all 256 experts, intermediate split 2 ways (1024)",
+            spec=dict(
+                tokens=64,
+                local_expert_offset=0,
+                local_num_experts=256,
+                **dict(_R1, intermediate=1024),
+            ),
+        ),
+        Cell(
+            why="deepseek default at tp4: all 256 experts, intermediate split 4 ways (512)",
+            spec=dict(
+                tokens=64,
+                local_expert_offset=0,
+                local_num_experts=256,
+                **dict(_R1, intermediate=512),
+            ),
+        ),
+        Cell(
+            why="deepseek default at tp8: all 256 experts, intermediate split 8 ways (256)",
+            spec=dict(
+                tokens=64,
+                local_expert_offset=0,
+                local_num_experts=256,
+                **dict(_R1, intermediate=256),
+            ),
+        ),
+        Cell(
+            why="deepseek default at ep8 (tp8 + ep8 and dep8): the last 32-wide window",
+            spec=dict(tokens=64, local_expert_offset=224, local_num_experts=32, **_R1),
+        ),
+        Cell(
+            why="deepseek default at dep16: a 16-wide window",
+            spec=dict(tokens=64, local_expert_offset=112, local_num_experts=16, **_R1),
         ),
         Cell(
             why="qwen4_exp decode: one token over 512 experts, top-10 renormalized, H 2560 / I 640",
