@@ -28,6 +28,9 @@ import torch
 from backend_capability import unsupported_reason
 from backend_case import (
     BACKENDS_UNDER_TEST,
+    BF16_ATOL,
+    BF16_RTOL,
+    FP8_ATOL,
     BackendCase,
     generate_inputs,
     generate_mla_context_inputs,
@@ -264,22 +267,32 @@ def _mla_context_v_stride_case() -> BackendCase:
     return case
 
 
-def test_mla_context_v_token_stride_matches_both_input_layouts():
+@pytest.mark.parametrize(
+    "kv_dtype", [torch.bfloat16, torch.float8_e4m3fn], ids=["bf16", "fp8_compute"]
+)
+def test_mla_context_v_token_stride_matches_both_input_layouts(kv_dtype: torch.dtype) -> None:
+    """Check separate-V layouts through BF16 FMHA and the FP8 context input quantizer."""
     case = _mla_context_v_stride_case()
+    fp8_context = kv_dtype == torch.float8_e4m3fn
+    if fp8_context and get_sm_version() not in (90, 100, 103, 107, 120):
+        pytest.skip("requires a GPU supporting FP8 context MLA")
     inputs = generate_mla_context_inputs(case)
     assert inputs["v"].stride(0) > inputs["v"].size(1)
+    expected = run_backend(case, "VANILLA", inputs, kv_dtype=case.compute_dtype, kv_layout="NHD")
+    outputs = []
 
     for make_contiguous in (False, True):
         current_inputs = dict(inputs)
         if make_contiguous:
             current_inputs["v"] = current_inputs["v"].contiguous()
-        expected = run_backend(
-            case, "VANILLA", current_inputs, kv_dtype=case.compute_dtype, kv_layout="NHD"
-        )
         actual = run_backend(
-            case, "TRTLLM", current_inputs, kv_dtype=case.compute_dtype, kv_layout=case.kv_layout
+            case, "TRTLLM", current_inputs, kv_dtype=kv_dtype, kv_layout=case.kv_layout
         )
-        torch.testing.assert_close(actual, expected, atol=3e-2, rtol=3e-3)
+        atol = BF16_ATOL + FP8_ATOL if fp8_context else BF16_ATOL
+        torch.testing.assert_close(actual, expected, atol=atol, rtol=BF16_RTOL)
+        outputs.append(actual)
+
+    torch.testing.assert_close(outputs[0], outputs[1], atol=BF16_ATOL, rtol=BF16_RTOL)
 
 
 @pytest.mark.parametrize(
