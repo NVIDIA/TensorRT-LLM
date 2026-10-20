@@ -51,9 +51,12 @@ _ACCEPT_TOL = 1e-5
 # p = 0.999 the boundary tokens of a 1e5-token nucleus weigh 4e-8 each, so one to three of them differ
 # in most rows).
 _NUC_MASS_TOL = 4e-6
-# flashinfer's top-p search is a float32 ternary search with float atomics: its mass decisions are good to a few
-# 1e-6, so its nuclei are held to a sandwich three times as wide (they are not under test, the kernels' are).
-_FI_MASS_TOL = 3 * _NUC_MASS_TOL
+# Tolerance of `target_error` for flashinfer's nuclei. flashinfer's `top_p_renorm_probs` keeps one extra
+# token beyond the exact nucleus (1.1e-5 of the mass: a flat row has 6e-6 per token) in ~1% of the flat
+# rows at top_p 0.5, with a target error of up to 3.0e-5 (three tokens), while the kernels' sets stay
+# within 6e-7 of the exact nucleus. Only the kernels' nuclei are under test: this wider tolerance only
+# checks that where flashinfer differs, it differs by a token or two at the pivot, not by a bug.
+_FI_MASS_TOL = 1e-4
 
 _M32 = 0xFFFFFFFF
 _M64 = (1 << 64) - 1
