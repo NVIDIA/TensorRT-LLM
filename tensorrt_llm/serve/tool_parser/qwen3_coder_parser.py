@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 # Adapted from: https://raw.githubusercontent.com/sgl-project/sglang/d8fcbaa38da95201914a1277971044ee66837b26/python/sglang/srt/function_call/qwen3_coder_detector.py
 
 import ast
@@ -17,9 +32,14 @@ from tensorrt_llm.serve.tool_parser.core_types import (
 
 
 class Qwen3CoderToolParser(BaseToolParser):
-    """Tool parser for Qwen 3 models.
+    """Parse tool calls with ``<function=...>`` and ``<parameter=...>`` tags.
 
-    Assumes function call format:
+    Qwen3-Coder, Nemotron 3 Nano, Nemotron 3 Super, Nemotron 3 Ultra, and
+    Nemotron 3.5 Super VL chat templates use this format and share the
+    ``qwen3_coder`` parser. Parameter values are converted using the supplied
+    tool schemas.
+
+    Format:
         <tool_call>
         <function=execute_bash>
         <parameter=command>

@@ -8,10 +8,8 @@ import torch
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.kimi_k3_noaux_tc_mxfp8_quant import (
     kimi_k3_noaux_tc_mxfp8_quant,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.deepseek_v3.r1_0528_nvfp4__sm_103__dep4.ops.moe import (
-    noaux_tc_op as noaux_tc,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.models.gpt_oss.gpt_oss_120b__sm_103__tp1.ops.quantization import (
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe import noaux_tc_op as noaux_tc
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.quantization import (
     mxfp8_quantize as mxfp8,
 )
 

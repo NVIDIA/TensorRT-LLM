@@ -59,9 +59,13 @@ l0_cpu:
   - unittest/_torch/memory
   - unittest/_torch/modeling
   # modeling_v2 routing and routing-table claims: config shapes and a monkeypatched
-  # compute capability, no device. The rest of unittest/_torch/modeling_v2 needs a GPU.
+  # compute capability, no device. The default targets' shard tests: small CPU
+  # tensors and the CPU block_scale_interleave. The rest of
+  # unittest/_torch/modeling_v2 needs a GPU.
   - unittest/_torch/modeling_v2/test_modeling_v2_claims.py
   - unittest/_torch/modeling_v2/test_modeling_v2_routing.py
+  - unittest/_torch/modeling_v2/test_modeling_v2_deepseek_default_shards.py
+  - unittest/_torch/modeling_v2/test_modeling_v2_gpt_oss_default_shards.py
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_dense_backend_library_order
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_fp8_indexer_rejects_different_qk_norm_epsilons
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_moe_reduces_only_local_terms
