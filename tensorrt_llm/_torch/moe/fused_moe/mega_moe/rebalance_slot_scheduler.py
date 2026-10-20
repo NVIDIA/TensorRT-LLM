@@ -84,17 +84,17 @@ class RebalanceSlotSchedulerGroup:
     ) -> None:
         from cuda.bindings import driver
 
-        from tensorrt_llm._torch.cute_dsl_kernels.megamoe_scheduler.cuda_scheduler import (
+        from tensorrt_llm._torch.moe.kernels.megamoe_scheduler.cuda_scheduler import (
             CudaPhysicalSlotScheduler,
             CudaSchedulerConfig,
         )
-        from tensorrt_llm._torch.cute_dsl_kernels.megamoe_scheduler.cuda_scheduler.multirank_dist import (
+        from tensorrt_llm._torch.moe.kernels.megamoe_scheduler.cuda_scheduler.multirank_dist import (
             FabricSymmetricBuffer,
         )
-        from tensorrt_llm._torch.cute_dsl_kernels.megamoe_scheduler.cuda_scheduler.runtime import (
+        from tensorrt_llm._torch.moe.kernels.megamoe_scheduler.cuda_scheduler.runtime import (
             symmetric_buffer_ints,
         )
-        from tensorrt_llm._torch.cute_dsl_kernels.megamoe_scheduler.sami import (
+        from tensorrt_llm._torch.moe.kernels.megamoe_scheduler.sami import (
             HierarchicalSamiWeightBroadcast,
         )
 

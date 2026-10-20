@@ -1,22 +1,26 @@
-"""Blackwell inference kernels."""
+"""Kernel source modules independent of repository-only runners."""
 
-from .mega import (
-    BlockScaledSwapAbFc12Extension,
-    BlockScaledSwapAbFc12Kernel,
-    BlockScaledSwapAbFc12Mainloop,
-    BlockScaledSwapAbMegaMoeKernel,
-    GatedActEpilogueArgs,
-    SwapABGatedActEpilogue,
-    TensorRole,
+from .schedulers import (
+    BlackwellFusedFc12Scheduler,
+    BlockPhase,
+    Fc12WorkTileState,
+    NonSwapAbFc12WorkTileInfo,
+    SchedulerBase,
+    SchedulerConsumer,
+    SchedulerWorkTileBase,
+    SwapAbFc12WorkTileInfo,
+    WorkIdAcquisitionMode,
 )
 
 
 __all__ = [
-    "BlockScaledSwapAbFc12Extension",
-    "BlockScaledSwapAbFc12Kernel",
-    "BlockScaledSwapAbFc12Mainloop",
-    "BlockScaledSwapAbMegaMoeKernel",
-    "GatedActEpilogueArgs",
-    "SwapABGatedActEpilogue",
-    "TensorRole",
+    "BlackwellFusedFc12Scheduler",
+    "BlockPhase",
+    "Fc12WorkTileState",
+    "NonSwapAbFc12WorkTileInfo",
+    "SchedulerBase",
+    "SchedulerConsumer",
+    "SchedulerWorkTileBase",
+    "SwapAbFc12WorkTileInfo",
+    "WorkIdAcquisitionMode",
 ]

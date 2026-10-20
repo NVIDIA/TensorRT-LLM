@@ -570,7 +570,7 @@ def test_model_engine_finalizer_never_enters_collective_cleanup():
 
 def test_executor_terminal_cleanup_is_three_phase_and_stream_scoped(monkeypatch):
     events = []
-    module_name = "tensorrt_llm._torch.cute_dsl_kernels.megamoe_shared_fc12"
+    module_name = "tensorrt_llm._torch.moe.kernels.megamoe_shared_fc12"
     monkeypatch.setitem(
         sys.modules,
         module_name,

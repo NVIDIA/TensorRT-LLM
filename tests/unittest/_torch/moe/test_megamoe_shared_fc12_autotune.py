@@ -19,7 +19,7 @@ from unittest.mock import patch
 import pytest
 
 _ROOT = Path(__file__).resolve().parents[4]
-_SOURCE = _ROOT / "tensorrt_llm/_torch/cute_dsl_kernels/megamoe_shared_fc12.py"
+_SOURCE = _ROOT / "tensorrt_llm/_torch/moe/kernels/megamoe_shared_fc12.py"
 _AUTOTUNER = _ROOT / "tensorrt_llm/_torch/autotuner.py"
 
 pytestmark = pytest.mark.cpu_only
