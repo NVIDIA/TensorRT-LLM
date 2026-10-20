@@ -72,6 +72,9 @@ KvCache::KvCache(KvCacheManager& manager, ReuseScope reuseScope, std::optional<B
           expectedPromptLength.has_value() ? std::optional<int>{std::max(*expectedPromptLength, 0)} : std::nullopt)
     , mNumCommittedBlocks(0)
     , mTokensPerBlock(manager.tokensPerBlock())
+    , mNumReusableTokensBeforeHybridPruning(
+          reuseMatch.has_value() ? reuseMatch->numReusableTokensBeforeHybridPruning : 0)
+    , mNumReusableTokensBeforePruning(reuseMatch.has_value() ? reuseMatch->numReusableTokensBeforePruning : 0)
 {
     LifeCycleId numLc = manager.storage().numLifeCycles();
 

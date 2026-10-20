@@ -1,5 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+import os
 from typing import Dict, Optional, Type
 
 import torch
@@ -248,7 +249,12 @@ def resolve_moe_cls(
     has_quant = (effective_quant_config is not None
                  and effective_quant_config.layer_quant_mode.has_any_quant(
                      exclude_kv_cache=True))
-    if (moe_cls == TRTLLMGenFusedMoE and not has_quant):
+    # Q35 (opt-in): keep TRTLLM-gen (FlashInfer trtllm_bf16_moe) for the BF16
+    # MTP-layer experts of Qwen3.5 instead of falling back to CUTLASS.
+    q35_bf16_trtllm = os.environ.get("TRTLLM_Q35_MTP_MOE_BACKEND",
+                                     "").upper() == "TRTLLM"
+    if (moe_cls == TRTLLMGenFusedMoE and not has_quant
+            and not q35_bf16_trtllm):
         moe_cls = CutlassFusedMoE
 
     # Routed-expert LoRA is supported only on CutlassFusedMoE with unquantized

@@ -281,9 +281,11 @@ void causal_conv1d_fwd_launch(ConvParamsBase& params, cudaStream_t stream)
 {
     static constexpr int kNElts = sizeof(input_t) == 4 ? 4 : 8;
     bool const kVarlen = params.query_start_loc_ptr != nullptr;
-    // Enable vectorized 128-bit loads when total tokens are aligned. For varlen with
-    // batch==1 (common prefill), seq_start is always 0 so alignment is guaranteed.
-    bool const canVecLoad = params.seqlen % kNElts == 0 && (!kVarlen || params.batch == 1);
+    // Enable vectorized 128-bit loads when total tokens are aligned. Varlen batches take the element-wise path:
+    // the vector path loads / stores only floor(len / kNElts) vectors per sequence, and with varlen the per-sequence
+    // length comes from query_start_loc, which may be shorter than params.seqlen when the token dimension is padded
+    // (e.g. the Qwen3.5 GDN prefill CUDA graph on a padded token bucket), so a tail of len % kNElts would be dropped.
+    bool const canVecLoad = params.seqlen % kNElts == 0 && !kVarlen;
     BOOL_SWITCH(canVecLoad, kIsVecLoad,
         [&]
         {

@@ -15,7 +15,8 @@
 
 import contextlib
 import math
-from typing import Tuple
+import os
+from typing import NamedTuple, Tuple
 
 import torch
 import triton
@@ -25,6 +26,12 @@ from tensorrt_llm._torch.attention_backend.interface import AttentionMetadata
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import \
     CUDA_GRAPH_DUMMY_REQUEST_ID
 from tensorrt_llm._utils import prefer_pinned
+
+def steady_mamba_indices_enabled() -> bool:
+    """``TRTLLM_Q35_STEADY_MAMBA_INDICES=1`` (default off): see
+    ``mamba_cache_manager.steady_mamba_indices_enabled``."""
+    return os.environ.get("TRTLLM_Q35_STEADY_MAMBA_INDICES", "0") == "1"
+
 
 REPLAY_WORK_POSITION_IN_DECODE_BATCH = 0
 REPLAY_WORK_CACHE_SLOT = 1
@@ -213,6 +220,22 @@ def cu_seqlens_to_chunk_indices_offsets(
     return chunk_indices, chunk_offsets
 
 
+class Q35InforwardSplit(NamedTuple):
+    """In-forward Mamba snapshot split of one step (see Mamba2Metadata._q35_prepare_split)."""
+    k: int
+    ntail: int
+    cu: torch.Tensor
+    gather: torch.Tensor
+    live: torch.Tensor
+    main_rows: torch.Tensor
+    split_rows: torch.Tensor
+    stage_rows: torch.Tensor
+    tail_tok: torch.Tensor
+    cu_tail: torch.Tensor
+    tail_slots: torch.Tensor
+    conv_win: torch.Tensor
+
+
 class Mamba2Metadata:
 
     # Warmup-only knob: when set via ``force_initial_states_for_warmup``,
@@ -290,6 +313,11 @@ class Mamba2Metadata:
                                             dtype=torch.long,
                                             device="cuda")
 
+        # TRTLLM_MAMBA_INFORWARD_SNAPSHOT: split of the planned context requests (see _q35_prepare_split).
+        self.q35_split = None
+        self.q35_split_sig = 0
+        self._q35_buf = None
+
     def _prepare_replay_work_items(self, kv_cache_manager, batch_size: int,
                                    num_contexts: int):
         self.replay_num_decodes = 0
@@ -356,9 +384,110 @@ class Mamba2Metadata:
                                                        active_cache_buf_idx)
         self.replay_n_writes.copy_(n_writes)
 
+    _Q35_SPLIT_FIELDS = ("cu", "gather", "live", "main_rows", "split_rows",
+                         "stage_rows", "tail_tok", "cu_tail", "tail_slots",
+                         "conv_win")
+
+    def _q35_prepare_split(self, attn_metadata: AttentionMetadata,
+                           kv_cache_manager, plan, batch_size: int,
+                           num_contexts: int) -> None:
+        """Index tensors of the in-forward Mamba snapshot split (TRTLLM_MAMBA_INFORWARD_SNAPSHOT).
+
+        Sequence i of a planned request becomes two chunked-prefill sequences, [start, start + before) and the tail
+        [start + before, start + len); both gather the request's live state. The GDN layer writes the first one's
+        final state (the state at P) to the live slot, recomputes the tail from it with the outputs written back at
+        tail_tok, and stages the tail's final state (the state at the prompt end) in the request's row. conv_win
+        holds the token positions of the convolution window that ends at P (the convolution state at P).
+        """
+        request_ids = attn_metadata.request_ids[:num_contexts]
+        entries = [plan.get(rid) for rid in request_ids]
+        k = sum(e is not None for e in entries)
+        if k == 0:
+            return
+        if batch_size != num_contexts:
+            raise RuntimeError(
+                "in-forward Mamba snapshot planned for a batch with generation requests")
+        width = kv_cache_manager.conv_state_shape[-1]
+        rows_cap = kv_cache_manager.q35_inforward_rows
+        tail_cap = rows_cap * kv_cache_manager.q35_inforward_max_tail
+        if self._q35_buf is None:
+            n_cap = self.max_batch_size
+            sizes = (n_cap + rows_cap + 1, n_cap + rows_cap, n_cap, n_cap,
+                     rows_cap, rows_cap, tail_cap, rows_cap + 1, rows_cap,
+                     width * rows_cap)
+            offs = [0]
+            for size in sizes:
+                offs.append(offs[-1] + size)
+            self._q35_offs = offs
+            self._q35_buf = torch.zeros(offs[-1],
+                                        dtype=torch.long,
+                                        device="cuda")
+            # ring of pinned staging buffers: the host runs ahead of the GPU, so a buffer is only rewritten long
+            # after its upload ran (as the seed ring in mamba_cache_manager.py)
+            self._q35_buf_host = [
+                torch.zeros(offs[-1],
+                            dtype=torch.long,
+                            pin_memory=prefer_pinned()) for _ in range(8)
+            ]
+            self._q35_buf_host_i = 0
+        lens = attn_metadata.seq_lens[:num_contexts].tolist()
+        vals = {name: [] for name in self._Q35_SPLIT_FIELDS}
+        vals["cu"].append(0)
+        vals["cu_tail"].append(0)
+        start = 0
+        for rid, length, entry in zip(request_ids, lens, entries):
+            slot = kv_cache_manager.q35_state_index(rid)
+            vals["live"].append(slot)
+            vals["main_rows"].append(len(vals["gather"]))
+            vals["gather"].append(slot)
+            if entry is None:
+                vals["cu"].append(start + length)
+            else:
+                row, _, before, after = entry
+                if before + after != length or before < width:
+                    raise RuntimeError(
+                        f"in-forward Mamba snapshot: request {rid} chunk of {length} tokens does not match the "
+                        f"plan ({before} + {after}, window {width})")
+                vals["split_rows"].append(len(vals["gather"]) - 1)
+                vals["stage_rows"].append(row)
+                vals["cu"].append(start + before)
+                # the tail as its own sequence: its outputs are recomputed from the state at P, its state dropped
+                vals["gather"].append(slot)
+                vals["cu"].append(start + length)
+                vals["tail_tok"].extend(range(start + before, start + length))
+                vals["cu_tail"].append(vals["cu_tail"][-1] + after)
+                vals["tail_slots"].append(slot)
+                vals["conv_win"].extend(
+                    range(start + before - width, start + before))
+            start += length
+        ntail = len(vals["tail_tok"])
+        if k > rows_cap or ntail > tail_cap:
+            raise RuntimeError(
+                f"in-forward Mamba snapshot: {k} requests / {ntail} tail tokens exceed the staging capacity")
+        host = self._q35_buf_host[self._q35_buf_host_i % len(
+            self._q35_buf_host)]
+        self._q35_buf_host_i += 1
+        offs = self._q35_offs
+        flat = []
+        for i, name in enumerate(self._Q35_SPLIT_FIELDS):
+            v = vals[name]
+            flat.extend(v)
+            flat.extend([0] * (offs[i + 1] - offs[i] - len(v)))
+        host.copy_(torch.tensor(flat, dtype=torch.long))
+        self._q35_buf.copy_(host, non_blocking=True)
+        views = {
+            name: self._q35_buf[offs[i]:offs[i] + len(vals[name])]
+            for i, name in enumerate(self._Q35_SPLIT_FIELDS)
+        }
+        self.q35_split = Q35InforwardSplit(k=k, ntail=ntail, **views)
+        self.q35_split_sig = (k, ntail)
+
     def prepare(self, attn_metadata: AttentionMetadata):
         batch_size = attn_metadata.seq_lens.shape[0]
         num_contexts = attn_metadata.num_contexts
+        # TRTLLM_Q35_STEADY_MAMBA_INDICES: True when the device state indices
+        # (and their int64 mirror) already hold this step's values.
+        steady_indices = False
         context_lens = attn_metadata.seq_lens_cuda[:num_contexts]
         num_ctx_tokens = attn_metadata.num_ctx_tokens
 
@@ -399,11 +528,13 @@ class Mamba2Metadata:
                         "are used; got a different address than the first "
                         "call.")
                 self.state_indices = indices
+                self._q35_state_indices_key = None
             elif isinstance(indices, torch.Tensor):
                 # CPU tensor → bulk H2D
                 self.state_indices_cpu[:batch_size].copy_(indices[:batch_size])
                 self.state_indices[:batch_size].copy_(
                     self.state_indices_cpu[:batch_size], non_blocking=True)
+                self._q35_state_indices_key = None
             else:
                 # indices is a Python sequence (e.g. List[int]); data
                 # already lives on host, CPU staging is fine. One bulk
@@ -411,16 +542,27 @@ class Mamba2Metadata:
                 assert len(indices) == batch_size, (
                     f"get_state_indices() returned {len(indices)} entries for "
                     f"a batch of {batch_size} requests.")
-                self.state_indices_cpu[:batch_size].copy_(
-                    torch.as_tensor(indices,
-                                    dtype=self.state_indices_cpu.dtype))
-                self.state_indices[:batch_size].copy_(
-                    self.state_indices_cpu[:batch_size], non_blocking=True)
+                key = None
+                if steady_mamba_indices_enabled():
+                    # The device indices and their int64 mirror are written
+                    # only below; a batch that maps to the indices of the last
+                    # upload needs neither the upload nor the mirror copy.
+                    key = tuple(indices)
+                    steady_indices = key == getattr(
+                        self, "_q35_state_indices_key", None)
+                if not steady_indices:
+                    self.state_indices_cpu[:batch_size].copy_(
+                        torch.as_tensor(indices,
+                                        dtype=self.state_indices_cpu.dtype))
+                    self.state_indices[:batch_size].copy_(
+                        self.state_indices_cpu[:batch_size], non_blocking=True)
+                self._q35_state_indices_key = key
 
         # Refresh the int64 mirror once per step (outside the decode graph)
         # so layers can index pools without a per-layer cast kernel.
-        self._state_indices_long[:batch_size].copy_(
-            self.state_indices[:batch_size])
+        if not steady_indices:
+            self._state_indices_long[:batch_size].copy_(
+                self.state_indices[:batch_size])
         self.state_indices_long = self._state_indices_long[:batch_size]
 
         self._prepare_replay_work_items(kv_cache_manager, batch_size,
@@ -494,6 +636,13 @@ class Mamba2Metadata:
             self.query_start_loc = None
             self.query_start_loc_long = self._arange_buffer_long[:batch_size +
                                                                  1]
+
+        self.q35_split = None
+        self.q35_split_sig = 0
+        plan = getattr(kv_cache_manager, "q35_inforward_plan", None)
+        if plan and num_contexts > 0 and request_ids is not None:
+            self._q35_prepare_split(attn_metadata, kv_cache_manager, plan,
+                                    batch_size, num_contexts)
 
         # Complete any deferred recurrent-state block onboards scheduled by
         # CppMambaHybridCacheManager.prepare_resources(). prepare_resources

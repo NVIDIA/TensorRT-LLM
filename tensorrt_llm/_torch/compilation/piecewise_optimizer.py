@@ -1,4 +1,5 @@
 import dataclasses
+import os
 from typing import Callable, List, Optional, Sequence, Union
 from unittest.mock import patch
 
@@ -18,6 +19,10 @@ from ..utils import (get_model_extra_attrs,
 from .multi_stream.auto_multi_stream import multi_stream_schedule
 from .utils import (get_capture_piecewise_cuda_graph_flag,
                     get_optional_trtllm_op, is_call_function)
+
+
+from tensorrt_llm.logger import logger
+_PIECEWISE_DEBUG = os.environ.get("TRTLLM_PIECEWISE_DEBUG", "0") == "1"
 
 
 def _piecewise_boundary_ops():
@@ -287,6 +292,7 @@ def piecewise_optimizer(
     exclude_modules_id = []
     piecewise_boundary_ops = _piecewise_boundary_ops()
 
+    _debug_pos = 0
     for node in graph.nodes:
         if node.op in ("output", "placeholder"):
             continue
@@ -302,11 +308,25 @@ def piecewise_optimizer(
             if not is_boundary:
                 # We only know it is safe to continue splitting after attention
                 stop_partition = True
+                if _PIECEWISE_DEBUG:
+                    _stack = str(node.meta.get("stack_trace", "")).strip().splitlines()[-4:]
+                    logger.info(f"[piecewise-debug] partition STOP at node #{_debug_pos} {node.name} "
+                                f"target={node.target} (everything after it runs eagerly); source: "
+                                + " | ".join(x.strip() for x in _stack))
             else:
                 idx += 1
         else:
             node_to_graph_id[node] = idx
+        _debug_pos += 1
 
+    if _PIECEWISE_DEBUG:
+        _sizes = {}
+        for _n, _g in node_to_graph_id.items():
+            _sizes[_g] = _sizes.get(_g, 0) + 1
+        _excl_nodes = sum(_sizes.get(i, 0) for i in exclude_modules_id)
+        logger.info(f"[piecewise-debug] {len(node_to_graph_id)} nodes -> {len(_sizes)} submodules, "
+                    f"{len(exclude_modules_id)} excluded (eager) holding {_excl_nodes} nodes; "
+                    f"largest excluded: {sorted(((_sizes.get(i, 0), i) for i in exclude_modules_id), reverse=True)[:3]}")
     gm = split_module(gm,
                       None,
                       lambda node: node_to_graph_id[node],

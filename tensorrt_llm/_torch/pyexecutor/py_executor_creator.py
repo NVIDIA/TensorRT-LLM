@@ -365,6 +365,15 @@ def create_py_executor(
     llm_args, checkpoint_loader = _load_config_and_create_checkpoint_loader(
         llm_args, checkpoint_dir)
 
+    # TRTLLM_DISABLE_OVERLAP_SCHEDULER=1 runs this worker without the overlap
+    # scheduler, e.g. a disagg context worker: with the overlap a request's
+    # first token is only handled after the next iteration has been scheduled
+    # and launched, which adds roughly one iteration of host time to its TTFT.
+    if (os.environ.get("TRTLLM_DISABLE_OVERLAP_SCHEDULER", "0") == "1"
+            and not llm_args.disable_overlap_scheduler):
+        logger.info("TRTLLM_DISABLE_OVERLAP_SCHEDULER=1: overlap scheduler off")
+        llm_args.disable_overlap_scheduler = True
+
     garbage_collection_gen0_threshold = llm_args.garbage_collection_gen0_threshold
     lora_config = llm_args.lora_config
     kv_connector_config = llm_args.kv_connector_config
@@ -1100,6 +1109,13 @@ def create_py_executor(
 
     if mapping.rank == 0:
         logger.info(f"LLM Args:\n{llm_args}")
+
+    if os.environ.get("TRTLLM_Q35_FREEZE_EMPTY_CACHE", "0") == "1":
+        # Returning cached blocks to the driver while serving (e.g. the buffer manager's empty_cache() when it
+        # replaces a >= 1 GiB buffer) races NIXL/UCX's progress thread on a disagg worker: segfault in
+        # cuEventQuery <- ucp_worker_arm <- nixlUcxWorker::arm. Keep the blocks cached from here on.
+        torch.cuda.empty_cache = lambda: None
+        logger.info("TRTLLM_Q35_FREEZE_EMPTY_CACHE: torch.cuda.empty_cache() is a no-op while serving")
 
     py_executor.start_worker()
 

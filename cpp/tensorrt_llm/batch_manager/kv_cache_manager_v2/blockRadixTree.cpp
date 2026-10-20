@@ -25,6 +25,7 @@
 
 #include "tensorrt_llm/common/assert.h"
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 #include <utility>
@@ -145,13 +146,64 @@ Hasher& Hasher::update(TokenIdExt const& tokenExt)
     return *this;
 }
 
+namespace
+{
+// TRTLLM_Q35_CTX_LEAN_TOKENS >= 3: feed a block's token bytes to SHA-256 in one Write per 512-byte chunk instead of
+// one 8-byte Write per token. Same byte stream, so the same digests.
+bool batchedTokenHashing()
+{
+    static bool const enabled = []
+    {
+        char const* v = std::getenv("TRTLLM_Q35_CTX_LEAN_TOKENS");
+        return v != nullptr && std::atoi(v) >= 3;
+    }();
+    return enabled;
+}
+} // namespace
+
 Hasher& Hasher::update(TokenIdExt const* tokens, size_t count)
 {
     // Python uses array("Q", data).tobytes() to reduce per-token interpreter
     // overhead.  In C++ the compiler inlines each update() call, so the loop
     // is already optimal; batching would only add a heap allocation.
+    if (!batchedTokenHashing())
+    {
+        for (size_t i = 0; i < count; ++i)
+            update(tokens[i]);
+        return *this;
+    }
+    unsigned char buf[512];
+    size_t used = 0;
     for (size_t i = 0; i < count; ++i)
-        update(tokens[i]);
+    {
+        if (auto const* id = std::get_if<TokenId>(&tokens[i]))
+        {
+            if (used + 8 > sizeof(buf))
+            {
+                mState.Write(buf, used);
+                used = 0;
+            }
+            auto const value = static_cast<uint64_t>(static_cast<int64_t>(*id));
+            for (int b = 0; b < 8; ++b)
+            {
+                buf[used + b] = static_cast<unsigned char>((value >> (8 * b)) & 0xFFU);
+            }
+            used += 8;
+        }
+        else
+        {
+            if (used > 0)
+            {
+                mState.Write(buf, used);
+                used = 0;
+            }
+            update(tokens[i]);
+        }
+    }
+    if (used > 0)
+    {
+        mState.Write(buf, used);
+    }
     return *this;
 }
 
@@ -780,7 +832,8 @@ std::vector<BlockRadixTree::MatchResult> BlockRadixTree::matchTokenPath(
     return results;
 }
 
-std::vector<BlockRadixTree::MatchResult> BlockRadixTree::pruneMatch(std::vector<MatchResult> matched) const
+std::vector<BlockRadixTree::MatchResult> BlockRadixTree::pruneMatch(
+    std::vector<MatchResult> matched, std::optional<LifeCycleId> ssmLcId) const
 {
     // All blocks except the last must be fully matched (mirrors Python: matched[:-1]).
     TLLM_CHECK_DEBUG(matched.size() <= 1
@@ -788,7 +841,6 @@ std::vector<BlockRadixTree::MatchResult> BlockRadixTree::pruneMatch(std::vector<
             [this](auto const& m) { return m.numMatchedTokens == mTokensPerBlock; }));
 
     auto attnLcs = mLifeCycles.attentionLifeCycles();
-    auto ssmLcId = mLifeCycles.ssmLifeCycleId();
 
     // Fixed-point loop: SSM may select an earlier exact snapshot, while attention may
     // shorten the match to the coverage of a required page. Every retry strictly
@@ -876,10 +928,24 @@ std::vector<BlockRadixTree::MatchResult> BlockRadixTree::pruneMatch(std::vector<
 BlockRadixTree::ReuseMatch BlockRadixTree::match(
     ReuseScope const& reuseScope, std::vector<TokenIdExt> const& tokens, bool enablePartialMatch) const
 {
-    auto const matched = pruneMatch(matchTokenPath(reuseScope, tokens, enablePartialMatch));
+    auto rawMatched = matchTokenPath(reuseScope, tokens, enablePartialMatch);
+    // Content-divergence depth is measured before page or recurrent-snapshot pruning.
+    int const numReusableTokensBeforePruning = numMatchedTokens(rawMatched, mTokensPerBlock);
+    auto const ssmLcId = mLifeCycles.ssmLifeCycleId();
+    // Diagnostic only: re-prune ignoring recurrent-snapshot availability to get
+    // the prefix the attention pages alone support. Only hybrid models pay for
+    // the second pass; without an SSM life cycle the two results are identical.
+    std::optional<int> numReusableTokensBeforeHybridPruning;
+    if (ssmLcId.has_value())
+    {
+        numReusableTokensBeforeHybridPruning = numMatchedTokens(pruneMatch(rawMatched, std::nullopt), mTokensPerBlock);
+    }
+    auto const matched = pruneMatch(std::move(rawMatched), ssmLcId);
     ReuseMatch result{};
     result.numTokens = numMatchedTokens(matched, mTokensPerBlock);
     result.numLookupTokens = static_cast<int>(tokens.size());
+    result.numReusableTokensBeforeHybridPruning = numReusableTokensBeforeHybridPruning.value_or(result.numTokens);
+    result.numReusableTokensBeforePruning = numReusableTokensBeforePruning;
     result.blocks.reserve(BlockOrdinal{static_cast<int>(matched.size())});
     for (auto const& match : matched)
     {

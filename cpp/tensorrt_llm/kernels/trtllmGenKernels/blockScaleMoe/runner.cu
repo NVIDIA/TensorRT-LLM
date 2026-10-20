@@ -413,6 +413,15 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
 }
 } // namespace Routing
 
+namespace
+{
+// TRTLLM_Q35_MOE_DEA: the caller may cap the batch-dim CTA grid below the generic bound.
+inline int32_t cappedMaxNumCgas(int32_t generic, int32_t cap)
+{
+    return cap > 0 ? std::min(generic, cap) : generic;
+}
+} // namespace
+
 namespace PermuteGemm1
 {
 
@@ -480,7 +489,7 @@ void Runner::run(void* hiddenState, void* hiddenStateScale, void* weights, void*
     int32_t numExperts, int32_t numTokens, int32_t* permutedIdxToTokenIdx, int32_t* ptrNumNonExitingCtas,
     int32_t* ptrTotalNumPaddedTokens, int32_t* ptrCtaIdxXyToBatchIdx, int32_t* ptrCtaIdxXyToMnLimit,
     void* bmm1Workspace, bool useRoutingScalesOnInput, int device, cudaStream_t stream, int32_t configIndex,
-    int32_t validHiddenSize, int32_t validIntermediateSize)
+    int32_t validHiddenSize, int32_t validIntermediateSize, int32_t maxNumCtasCap)
 {
     if (mDtypeWeights == btg::Dtype::MxE2m1 && mDtypeAct == btg::Dtype::MxE4m3)
     {
@@ -490,7 +499,8 @@ void Runner::run(void* hiddenState, void* hiddenStateScale, void* weights, void*
         // tensorrt_llm/_torch/modules/fused_moe/quantization.py:MXFP4WeightTRTLLMGenFusedMoEMethod.input_hidden_alignment
         validHiddenSize = tensorrt_llm::common::roundUp(validHiddenSize, 512);
     }
-    auto maxNumCgasInBatchDim = Routing::getMaxNumCgasInBatchDim(numTokens, topK, numExperts, mTileTokensDim);
+    auto maxNumCgasInBatchDim = cappedMaxNumCgas(
+        Routing::getMaxNumCgasInBatchDim(numTokens, topK, numExperts, mTileTokensDim), maxNumCtasCap);
     bool is_gated_activation = tensorrt_llm::kernels::isGatedActType(mActType);
     int32_t intermediateSizeFactor = (is_gated_activation ? 2 : 1);
     mRunner.run(numTokens, intermediateSizeFactor * intermediateSize, hiddenSize, numTokens,
@@ -503,9 +513,10 @@ void Runner::run(void* hiddenState, void* hiddenStateScale, void* weights, void*
 }
 
 size_t Runner::getWorkspaceSizeInBytes(int32_t topK, int32_t hiddenSize, int32_t intermediateSize, int32_t numExperts,
-    int32_t numTokens, int32_t configIndex) const
+    int32_t numTokens, int32_t configIndex, int32_t maxNumCtasCap) const
 {
-    auto maxNumCgasInBatchDim = Routing::getMaxNumCgasInBatchDim(numTokens, topK, numExperts, mTileTokensDim);
+    auto maxNumCgasInBatchDim = cappedMaxNumCgas(
+        Routing::getMaxNumCgasInBatchDim(numTokens, topK, numExperts, mTileTokensDim), maxNumCtasCap);
     int32_t const intermediateSizeFactor = tensorrt_llm::kernels::isGatedActType(mActType) ? 2 : 1;
 
     return mRunner.getWorkspaceSizeInBytes(numTokens, intermediateSizeFactor * intermediateSize, hiddenSize, {},
@@ -580,14 +591,15 @@ void Runner::run(void* permutedHiddenState, void* permutedHiddenStateScale, void
     int32_t intermediateSize, int32_t numExperts, int32_t numTokens, int32_t* ptrNumNonExitingCtas,
     int32_t* ptrTotalNumPaddedTokens, int32_t* ptrCtaIdxXyToBatchIdx, int32_t* ptrCtaIdxXyToMnLimit,
     void* bmm2Workspace, int device, cudaStream_t stream, int32_t configIndex, int32_t validHiddenSize,
-    int32_t validIntermediateSize)
+    int32_t validIntermediateSize, int32_t maxNumCtasCap)
 {
     if (mDtypeWeights == btg::Dtype::MxE2m1 && mDtypeAct == btg::Dtype::MxE4m3)
     {
         // The multiple is no less than 128 as TMA requires it for CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN16B types
         validIntermediateSize = tensorrt_llm::common::roundUp(validIntermediateSize, 128);
     }
-    auto maxNumCgasInBatchDim = Routing::getMaxNumCgasInBatchDim(numTokens, topK, numExperts, mTileTokensDim);
+    auto maxNumCgasInBatchDim = cappedMaxNumCgas(
+        Routing::getMaxNumCgasInBatchDim(numTokens, topK, numExperts, mTileTokensDim), maxNumCtasCap);
     mRunner.run(numTokens, hiddenSize, intermediateSize, numTokens, validHiddenSize, validIntermediateSize, {},
         numTokens, numExperts, maxNumCgasInBatchDim, permutedHiddenState, permutedHiddenStateScale, weights,
         weightsScale, /* perTokensSfA */ nullptr,
@@ -598,9 +610,10 @@ void Runner::run(void* permutedHiddenState, void* permutedHiddenStateScale, void
 }
 
 size_t Runner::getWorkspaceSizeInBytes(int32_t topK, int32_t hiddenSize, int32_t intermediateSize, int32_t numExperts,
-    int32_t numTokens, int32_t configIndex) const
+    int32_t numTokens, int32_t configIndex, int32_t maxNumCtasCap) const
 {
-    auto maxNumCgasInBatchDim = Routing::getMaxNumCgasInBatchDim(numTokens, topK, numExperts, mTileTokensDim);
+    auto maxNumCgasInBatchDim = cappedMaxNumCgas(
+        Routing::getMaxNumCgasInBatchDim(numTokens, topK, numExperts, mTileTokensDim), maxNumCtasCap);
     return mRunner.getWorkspaceSizeInBytes(
         numTokens, hiddenSize, intermediateSize, {}, numTokens, numExperts, maxNumCgasInBatchDim, configIndex);
 }
@@ -744,9 +757,11 @@ std::tuple<int32_t, int32_t> Runner::getWorkspaceSizeInBytes(MoERunnerArgs const
     auto const& config = mPassingConfigs[configIndex];
 
     auto workspace_size_fc1 = static_cast<int32_t>(mPermuteGemm1.getWorkspaceSizeInBytes(totalExpertsPerToken,
-        args.hidden_size, args.intermediate_size, totalLocalExperts, args.num_tokens, config.gemm1Config));
+        args.hidden_size, args.intermediate_size, totalLocalExperts, args.num_tokens, config.gemm1Config,
+        args.max_num_ctas_in_batch_dim));
     auto workspace_size_fc2 = static_cast<int32_t>(mGemm2.getWorkspaceSizeInBytes(totalExpertsPerToken,
-        args.hidden_size, args.intermediate_size, totalLocalExperts, args.num_tokens, config.gemm2Config));
+        args.hidden_size, args.intermediate_size, totalLocalExperts, args.num_tokens, config.gemm2Config,
+        args.max_num_ctas_in_batch_dim));
     return std::make_tuple(workspace_size_fc1, workspace_size_fc2);
 }
 
@@ -818,7 +833,7 @@ void Runner::run(
         workspace.cta_idx_xy_to_batch_idx, workspace.cta_idx_xy_to_mn_limit, workspace.bmm1_workspace,
         args.mUseRoutingScalesOnInput, device, stream, config.gemm1Config,
         args.valid_hidden_size.value_or(args.hidden_size),
-        args.valid_intermediate_size.value_or(args.intermediate_size));
+        args.valid_intermediate_size.value_or(args.intermediate_size), args.max_num_ctas_in_batch_dim);
 
     // We do not fuse activation with FC1 for DeepSeek FP8 due to the weights shuffling constraint.
     void* gemm2_input = workspace.gemm1_output;
@@ -839,7 +854,7 @@ void Runner::run(
         workspace.num_non_exiting_ctas, workspace.total_num_padded_tokens, workspace.cta_idx_xy_to_batch_idx,
         workspace.cta_idx_xy_to_mn_limit, workspace.bmm2_workspace, device, stream, config.gemm2Config,
         args.valid_hidden_size.value_or(args.hidden_size),
-        args.valid_intermediate_size.value_or(args.intermediate_size));
+        args.valid_intermediate_size.value_or(args.intermediate_size), args.max_num_ctas_in_batch_dim);
 
     // Run finalize
     if (args.do_finalize)

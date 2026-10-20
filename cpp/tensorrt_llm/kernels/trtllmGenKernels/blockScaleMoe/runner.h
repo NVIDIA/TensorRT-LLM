@@ -189,7 +189,7 @@ public:
         bool useDeepSeekFp8, int tileTokensDim, ActType actType);
 
     size_t getWorkspaceSizeInBytes(int32_t topK, int32_t hiddenSize, int32_t intermediateSize, int32_t numExperts,
-        int32_t numTokens, int32_t configIndex) const;
+        int32_t numTokens, int32_t configIndex, int32_t maxNumCtasCap = 0) const;
 
     [[nodiscard]] int32_t getDefaultValidConfigIndex(int32_t topK, int32_t hiddenSize, int32_t intermediateSize,
         int32_t numExperts, int32_t numTokens, int32_t validHiddenSize = -1, int32_t validIntermediateSize = -1) const;
@@ -208,7 +208,8 @@ public:
         int32_t intermediateSize, int32_t numExperts, int32_t numTokens, int32_t* permutedIdxToTokenIdx,
         int32_t* ptrNumNonExitingCtas, int32_t* ptrTotalNumPaddedTokens, int32_t* ptrCtaIdxXyToBatchIdx,
         int32_t* ptrCtaIdxXyToMnLimit, void* bmm1Workspace, bool useRoutingScalesOnInput, int device,
-        cudaStream_t stream, int32_t configIndex, int32_t validHiddenSize = -1, int32_t validIntermediateSize = -1);
+        cudaStream_t stream, int32_t configIndex, int32_t validHiddenSize = -1, int32_t validIntermediateSize = -1,
+        int32_t maxNumCtasCap = 0);
 
 private:
     batchedGemm::trtllm::gen::Dtype mDtypeAct;
@@ -228,7 +229,7 @@ public:
         batchedGemm::trtllm::gen::Dtype outputDtype, bool useDeepSeekFp8, int tileTokensDim);
 
     size_t getWorkspaceSizeInBytes(int32_t topK, int32_t hiddenSize, int32_t intermediateSize, int32_t numExperts,
-        int32_t numTokens, int32_t configIndex) const;
+        int32_t numTokens, int32_t configIndex, int32_t maxNumCtasCap = 0) const;
 
     [[nodiscard]] int32_t getDefaultValidConfigIndex(int32_t topK, int32_t hiddenSize, int32_t intermediateSize,
         int32_t numExperts, int32_t numTokens, int32_t validHiddenSize = -1, int32_t validIntermediateSize = -1) const;
@@ -246,7 +247,7 @@ public:
         int32_t intermediateSize, int32_t numExperts, int32_t numTokens, int32_t* ptrNumNonExitingCtas,
         int32_t* ptrTotalNumPaddedTokens, int32_t* ptrCtaIdxXyToBatchIdx, int32_t* ptrCtaIdxXyToMnLimit,
         void* bmm2Workspace, int device, cudaStream_t stream, int32_t configIndex, int32_t validHiddenSize = -1,
-        int32_t validIntermediateSize = -1);
+        int32_t validIntermediateSize = -1, int32_t maxNumCtasCap = 0);
 
 private:
     batchedGemm::trtllm::gen::Dtype mDtypeAct;
@@ -320,6 +321,10 @@ struct MoERunnerArgs
     // Unpadded dimensions.
     std::optional<int32_t> valid_intermediate_size{std::nullopt};
     std::optional<int32_t> valid_hidden_size{std::nullopt};
+
+    // > 0: cap on the expert GEMMs' batch-dim CTA grid (TRTLLM_Q35_MOE_DEA: a rank runs only its dealt share of an
+    // all-local problem, a tighter bound than getMaxNumCgasInBatchDim(numTokens, topK, numLocalExperts)).
+    int32_t max_num_ctas_in_batch_dim{0};
 
     // Apply routing scale factors to input activations
     bool mUseRoutingScalesOnInput{false};

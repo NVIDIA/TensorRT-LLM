@@ -1,0 +1,421 @@
+# Adapted from SGLang's breakable CUDA graph tests (via upstream TensorRT-LLM #16609).
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+
+import logging
+import weakref
+
+import pytest
+import torch
+from torch import nn
+
+from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph import (
+    BreakableCUDAGraph,
+    BreakableCUDAGraphCapture,
+    break_graph,
+    eager_on_graph,
+    is_in_breakable_cuda_graph,
+)
+from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph.breakable_cuda_graph import _copy_output
+from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph_runner import (
+    BreakableCUDAGraphRunner,
+    BreakableCUDAGraphRunnerState,
+)
+from tensorrt_llm._torch.utils import make_weak_ref
+
+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+
+
+def _capture(body):
+    graph = BreakableCUDAGraph()
+    with BreakableCUDAGraphCapture(graph, stream=torch.cuda.Stream()):
+        body()
+    return graph
+
+
+def test_no_break_capture_and_repeated_replay():
+    x = torch.zeros(4, device="cuda")
+    output = torch.zeros_like(x)
+    graph = _capture(lambda: output.copy_(x + 1))
+
+    assert graph.num_segments == 1
+    assert graph.num_breaks == 0
+    for value in (5, 11):
+        x.fill_(value)
+        graph.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(output, torch.full_like(output, value + 1))
+
+
+def test_single_and_multiple_breakpoints():
+    @eager_on_graph
+    def add_one(value):
+        return value + 1
+
+    @eager_on_graph
+    def double(value):
+        return value * 2
+
+    x = torch.zeros(4, device="cuda")
+    output = torch.zeros_like(x)
+
+    def body():
+        value = add_one(x + 1)
+        value = double(value + 1)
+        output.copy_(value)
+
+    graph = _capture(body)
+    assert graph.num_segments == 3
+    assert graph.num_breaks == 2
+
+    x.fill_(5)
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(output, torch.full_like(output, 16))
+
+
+def test_eager_output_storage_survives_allocator_churn():
+    eager_output_ptrs = []
+    eager_output_refs = []
+
+    @eager_on_graph
+    def add_one(value):
+        output = value + 1
+        eager_output_ptrs.append(output.data_ptr())
+        eager_output_refs.append(weakref.ref(output))
+        return output
+
+    stream = torch.cuda.Stream()
+    with torch.cuda.stream(stream):
+        x = torch.zeros(1024, device="cuda")
+        output = torch.zeros_like(x)
+        graph = BreakableCUDAGraph()
+
+        with BreakableCUDAGraphCapture(graph, stream=stream):
+            output.copy_(add_one(x) * 2)
+
+        captured_output_ptr = eager_output_ptrs[0]
+        assert eager_output_refs[0]() is not None
+        churn = [torch.full_like(x, value) for value in range(4)]
+        assert all(tensor.data_ptr() != captured_output_ptr for tensor in churn)
+
+        x.fill_(5)
+        graph.replay()
+
+    stream.synchronize()
+    torch.testing.assert_close(output, torch.full_like(output, 12))
+    for value, tensor in enumerate(churn):
+        torch.testing.assert_close(tensor, torch.full_like(tensor, value))
+
+
+def test_outside_capture():
+    @eager_on_graph
+    def outside(value):
+        return value + 2
+
+    value = torch.tensor([1.0, 2.0], device="cuda")
+    torch.testing.assert_close(outside(value), value + 2)
+
+
+def test_eager_on_graph_during_torch_compile():
+    @eager_on_graph
+    def add_one(value):
+        return value + 1
+
+    compiled_add_one = torch.compile(add_one, backend="eager", fullgraph=True)
+    value = torch.ones(4, device="cuda")
+
+    torch.testing.assert_close(compiled_add_one(value), value + 1)
+
+
+def test_make_weak_ref_supports_value_types_and_rejects_objects():
+    unsupported = object()
+    with pytest.raises(TypeError, match="Invalid type"):
+        make_weak_ref(unsupported)
+
+    value = {"nested": (None, "value", [1, 2.0, True])}
+    assert make_weak_ref(value) == value
+
+    with pytest.raises(TypeError, match="Invalid type"):
+        make_weak_ref({unsupported: "value"})
+
+
+def test_break_graph_inserts_empty_breakpoint():
+    x = torch.zeros(4, device="cuda")
+    output = torch.zeros_like(x)
+
+    def body():
+        value = x + 1
+        break_graph()
+        output.copy_(value + 2)
+
+    graph = _capture(body)
+    assert graph.num_segments == 2
+    assert graph.num_breaks == 1
+    x.fill_(10)
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(output, torch.full_like(output, 13))
+
+
+def test_output_writeback_for_tensor_dict_and_object():
+    class Output:
+        def __init__(self, tensor, label):
+            self.tensor = tensor
+            self.label = label
+
+    tensor = torch.zeros(4, device="cuda")
+    assert _copy_output(tensor, torch.full_like(tensor, 3)) is tensor
+    torch.testing.assert_close(tensor, torch.full_like(tensor, 3))
+
+    output_dict = {"value": torch.zeros(4, device="cuda")}
+    assert _copy_output(output_dict, {"value": torch.ones(4, device="cuda")}) is output_dict
+    torch.testing.assert_close(output_dict["value"], torch.ones(4, device="cuda"))
+
+    output_object = Output(torch.zeros(4, device="cuda"), "old")
+    assert (
+        _copy_output(output_object, Output(torch.full((4,), 2.0, device="cuda"), "new"))
+        is output_object
+    )
+    torch.testing.assert_close(output_object.tensor, torch.full_like(output_object.tensor, 2))
+    assert output_object.label == "new"
+
+
+def test_side_stream_is_joined_before_segment_end():
+    x = torch.ones(4, device="cuda")
+    output = torch.zeros_like(x)
+    side_stream = torch.cuda.Stream()
+
+    def body():
+        side_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side_stream):
+            output.copy_((x + 1) * 2)
+
+    graph = _capture(body)
+    x.fill_(3)
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(output, torch.full_like(output, 8))
+
+
+def test_dropped_wait_stream_logs_callsite(caplog):
+    side_stream = torch.cuda.Stream()
+
+    def body():
+        torch.cuda.current_stream().wait_stream(side_stream)
+
+    with caplog.at_level(
+        logging.WARNING,
+        logger=("tensorrt_llm._torch.pyexecutor.breakable_cuda_graph.breakable_cuda_graph"),
+    ):
+        _capture(body)
+
+    record = next(record for record in caplog.records if "Dropping a wait" in record.message)
+    assert record.funcName == "body"
+
+
+class _Body(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.forward_calls = 0
+
+    def forward(self, value):
+        self.forward_calls += 1
+        return value + 1
+
+
+class _LogitsProcessor(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.forward_calls = 0
+
+    def forward(self, value):
+        self.forward_calls += 1
+        return value * 2
+
+
+def test_runner_warmup_capture_execute_and_shared_output():
+    body = _Body().cuda()
+    logits_processor = _LogitsProcessor().cuda()
+    runner = BreakableCUDAGraphRunner(body)
+    counters = {"outer": 0}
+    inputs = {}
+
+    def engine_forward():
+        counters["outer"] += 1
+        if runner.is_capturing:
+            return runner.capture_model_body(
+                lambda: {"logits": logits_processor(body(inputs["value"]))}
+            )
+        return {"logits": logits_processor(body(inputs["value"]))}
+
+    inputs["value"] = torch.zeros((8, 4), device="cuda")
+    runner.capture(8, engine_forward)
+    first_shared_output = runner._shared_output
+    inputs["value"] = torch.zeros((4, 4), device="cuda")
+    runner.capture(4, engine_forward)
+
+    calls = 2 * (BreakableCUDAGraphRunner._WARMUP_STEPS + 1)
+    assert runner.state == BreakableCUDAGraphRunnerState.IDLE
+    assert counters == {"outer": calls}
+    assert body.forward_calls == calls
+    assert logits_processor.forward_calls == calls
+    assert runner._shared_output is first_shared_output
+
+    original_forward = body.forward
+    inputs["value"].fill_(3)
+    result = runner.execute(4, engine_forward)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(result["logits"], torch.full((4, 4), 8.0, device="cuda"))
+    assert counters == {"outer": calls + 1}
+    assert body.forward_calls == calls
+    assert logits_processor.forward_calls == calls + 1
+    assert body.forward == original_forward
+
+
+def test_runner_flag_covers_the_whole_forward():
+    """Code outside the captured body sees the BCG flag in warm-up, capture and replay alike."""
+    body = _Body().cuda()
+    runner = BreakableCUDAGraphRunner(body)
+    inputs = {"value": torch.zeros((4, 4), device="cuda")}
+    seen = []
+
+    def engine_forward():
+        seen.append((runner.state, is_in_breakable_cuda_graph()))
+        if runner.is_capturing:
+            return runner.capture_model_body(lambda: body(inputs["value"]))
+        return body(inputs["value"])
+
+    runner.capture(4, engine_forward)
+    runner.execute(4, engine_forward)
+    torch.cuda.synchronize()
+    assert [flag for _, flag in seen] == [True] * len(seen)
+    assert [state for state, _ in seen] == (
+        [BreakableCUDAGraphRunnerState.WARMUP] * BreakableCUDAGraphRunner._WARMUP_STEPS
+        + [BreakableCUDAGraphRunnerState.CAPTURE, BreakableCUDAGraphRunnerState.REPLAY]
+    )
+    assert not is_in_breakable_cuda_graph()
+
+
+def test_runner_smaller_bucket_output_does_not_alias_shared_output():
+    """A later, smaller capture must not place its body output inside the shared output buffer.
+
+    The body frees a workspace larger than its output before computing, so its intermediate and its output are carved
+    from one pool segment. If the runner kept only a weak reference to the shared output, the second capture's output
+    would start 16 MB before the shared buffer and overlap it, and the captured copy into the shared buffer would
+    corrupt every row past the first 1024.
+    """
+    rows, cols = 4096, 4096  # 64 MB float32 output, above the allocator's 10 MB small-segment limit
+    output_spans = {}
+
+    class WorkspaceBody(nn.Module):
+        def forward(self, value):
+            workspace = torch.empty(5 * value.numel() // 2, dtype=value.dtype, device=value.device)
+            del workspace
+            output = value * 2 + 1
+            output_spans[value.shape[0]] = (
+                output.data_ptr(),
+                output.numel() * output.element_size(),
+            )
+            return output
+
+    static_input = torch.randn(rows, cols, device="cuda")
+    body = WorkspaceBody().cuda()
+    runner = BreakableCUDAGraphRunner(body)
+    active = {"rows": rows}
+
+    def engine_forward():
+        value = static_input[: active["rows"]]
+        if runner.is_capturing:
+            return runner.capture_model_body(lambda: body(value))
+        return body(value)
+
+    buckets = (rows, 3 * rows // 4)
+    for num_tokens in buckets:
+        active["rows"] = num_tokens
+        runner.capture(num_tokens, engine_forward)
+
+    shared_begin = runner._shared_output.data_ptr()
+    shared_end = shared_begin + runner._shared_output.numel() * runner._shared_output.element_size()
+    output_begin, output_bytes = output_spans[buckets[1]]
+    assert output_begin == shared_begin or not (
+        output_begin < shared_end and shared_begin < output_begin + output_bytes
+    )
+
+    for num_tokens in reversed(buckets):
+        active["rows"] = num_tokens
+        result = runner.execute(num_tokens, engine_forward)
+        torch.cuda.synchronize()
+        torch.testing.assert_close(result, static_input[:num_tokens] * 2 + 1, rtol=0, atol=0)
+
+
+def test_runner_first_bucket_segments_share_one_memory_pool():
+    class BreakableBody(nn.Module):
+        @staticmethod
+        @eager_on_graph
+        def eager_add_one(value):
+            return value + 1
+
+        @staticmethod
+        @eager_on_graph
+        def eager_double(value):
+            return value * 2
+
+        def forward(self, value):
+            value = self.eager_add_one(value + 1)
+            return self.eager_double(value + 1)
+
+    body = BreakableBody().cuda()
+    runner = BreakableCUDAGraphRunner(body)
+    inputs = {"value": torch.zeros((8, 4), device="cuda")}
+
+    def engine_forward():
+        if runner.is_capturing:
+            return runner.capture_model_body(lambda: body(inputs["value"]))
+        return body(inputs["value"])
+
+    runner.capture(8, engine_forward)
+
+    graph = runner._graphs[8]
+    assert graph.num_segments == 3
+    assert runner._memory_pool is not None
+    assert all(segment.pool() == runner._memory_pool for segment in graph._segments)
+
+
+def test_runner_graph_miss_nested_execute_and_exception_recovery():
+    body = _Body().cuda()
+    runner = BreakableCUDAGraphRunner(body)
+    with pytest.raises(KeyError, match="No BCG captured"):
+        runner.execute(4, lambda: None)
+
+    runner._graphs[4] = object()
+    runner._outputs[4] = torch.zeros(1, device="cuda")
+    original_forward = body.forward
+
+    def nested():
+        return runner.execute(4, lambda: None)
+
+    with pytest.raises(RuntimeError, match="while runner is replay"):
+        runner.execute(4, nested)
+    assert runner.state == BreakableCUDAGraphRunnerState.IDLE
+    assert body.forward == original_forward
+
+    def fail():
+        raise ValueError("expected")
+
+    with pytest.raises(ValueError, match="expected"):
+        runner.execute(4, fail)
+    assert runner.state == BreakableCUDAGraphRunnerState.IDLE
+    assert body.forward == original_forward
+
+
+def test_runner_warmup_exception_restores_idle_state():
+    runner = BreakableCUDAGraphRunner(_Body().cuda())
+
+    def fail():
+        raise ValueError("expected")
+
+    with pytest.raises(ValueError, match="expected"):
+        runner.warmup(fail)
+    assert runner.state == BreakableCUDAGraphRunnerState.IDLE

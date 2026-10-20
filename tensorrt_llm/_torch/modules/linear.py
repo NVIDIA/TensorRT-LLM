@@ -30,6 +30,7 @@ from tensorrt_llm.quantization.utils.fp8_utils import (
 
 from ..._utils import get_sm_version, is_sm_100f
 from ...models.modeling_utils import QuantConfig
+from .lowm_linear import maybe_lowm_bf16_linear, maybe_lowm_fp8_linear
 from ..utils import (Fp4QuantizedTensor, get_model_extra_attrs,
                      is_nvfp4_marlin_supported_sm,
                      replace_parameter_and_save_metadata, unswizzle_sf)
@@ -543,6 +544,11 @@ class UnquantizedLinearMethod(LinearMethodBase):
 
     def apply(self, module: Linear, input: torch.Tensor,
               bias: Optional[torch.Tensor]):
+        if getattr(module, "_q35_lowm_bf16", False):
+            # Decode-sized BF16 projections opted in by the model (TRTLLM_Q35_LOWM_BF16).
+            output = maybe_lowm_bf16_linear(module, input, bias)
+            if output is not None:
+                return output
         # CuTe DSL BF16 GEMM path for Blackwell
         if (module.use_cute_dsl_bf16_gemm and is_sm_100f()
                 and module.weight.dtype == torch.bfloat16):
@@ -686,6 +692,12 @@ class FP8QDQLinearMethod(UnquantizedLinearMethod):
 
     def apply(self, module: Linear, input: torch.Tensor,
               bias: Optional[torch.Tensor]):
+        if getattr(module, "_q35_lowm", False):
+            # Decode-sized W8A8 projections opted in by the model (TRTLLM_Q35_LOWM_FP8): one low-M
+            # kernel, the BF16 input quantized in registers with the static input scale.
+            output = maybe_lowm_fp8_linear(module, input, bias)
+            if output is not None:
+                return output
         # Handle multi-dimensional inputs (e.g., 3D: batch, seq, hidden)
         # GEMM ops require 2D matrices
         original_shape = input.shape

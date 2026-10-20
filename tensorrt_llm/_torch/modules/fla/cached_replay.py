@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import os
 from typing import Optional
 
 import torch
@@ -21,7 +22,31 @@ _PIPELINED_COMMIT_HEAD_TILES = 2048
 _TWO_STAGE_REPLAY_HEAD_TILES = 4096
 _L2_STREAMING_HEAD_TILES = 8192
 
-CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE = 16
+# Decode batches from this size use the partitioned replay + one all-layer checkpoint commit per step; smaller ones
+# commit inside each layer's replay. TRTLLM_Q35_GDN_REPLAY_PARTITION_MIN_BATCH=<n> moves the switch (e.g. 33 with
+# TRTLLM_Q35_GDN_CORE_LARGE=1, whose CUDA core kernel commits in-layer at b16 / b32).
+CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE = int(os.environ.get("TRTLLM_Q35_GDN_REPLAY_PARTITION_MIN_BATCH", "16"))
+
+# Qwen3.5 low-latency switch (default off). TRTLLM_Q35_GDN_REPLAY_TILE=1: use the tuned fine-grained value tiling
+# (BV=16, 2 warps for <= 64 head tiles) for every T in [2, 8], not only T == 4. Measured on GB300 at the Qwen3.5 TP8
+# shape (H=2, HV=8, K=V=128, history 16, BF16 state) for T=7/8, N=1/2/4: e.g. N=1 T=7 8.5 -> 6.3 us (no commit),
+# 10.4 -> 6.8 us (commit), cold L2; outputs, histories and committed states bitwise equal to the BV=128 launch.
+_Q35_GDN_REPLAY_TILE = os.environ.get("TRTLLM_Q35_GDN_REPLAY_TILE", "0") == "1"
+# TRTLLM_Q35_GDN_REPLAY_T16=1: allow the cached replay for up to 16 tokens per verify step (MTP k <= 15) instead of 8.
+# Nothing in the kernel needs T <= 8: the token tile is next_pow2(T) and the history stays 16 >= T. Without it k=8
+# (T=9) falls back to the FlashInfer/Triton verify path with intermediate SSM states (~+0.8 ms/step at TEP8 b1).
+Q35_GDN_REPLAY_MAX_T = 16 if os.environ.get("TRTLLM_Q35_GDN_REPLAY_T16", "0") == "1" else 8
+# Small-batch PDL launch options of the cached replay (same values, same math; each default off):
+# TRTLLM_Q35_GDN_REPLAY_PREFETCH=1    fetch the SSM checkpoint state before griddepcontrol.wait;
+# TRTLLM_Q35_GDN_REPLAY_SPEC_HIST=1   load both history buffers speculatively (no load waits on the PNAT / active-buffer
+#                                      loads; GB300 chain bench: slower at T=7, faster at T=9);
+# TRTLLM_Q35_GDN_REPLAY_EARLY_TRIGGER=1  release the dependent gated-norm launch at kernel start.
+_Q35_GDN_REPLAY_PREFETCH = os.environ.get("TRTLLM_Q35_GDN_REPLAY_PREFETCH", "0") == "1"
+_Q35_GDN_REPLAY_SPEC_HIST = os.environ.get("TRTLLM_Q35_GDN_REPLAY_SPEC_HIST", "0") == "1"
+_Q35_GDN_REPLAY_EARLY_TRIGGER = os.environ.get("TRTLLM_Q35_GDN_REPLAY_EARLY_TRIGGER", "0") == "1"
+# TRTLLM_Q35_GDN_QK_NORM_ALIGN=1: replay Q/K L2 normalization as rsqrt(sum + eps) like prefill (port of upstream
+# 3729107c0b; numerics change -> needs the unforced-AL / GSM8K gate).
+_Q35_GDN_QK_NORM_ALIGN = os.environ.get("TRTLLM_Q35_GDN_QK_NORM_ALIGN", "0") == "1"
 
 
 def _default_cached_replay_block_v(
@@ -104,6 +129,10 @@ def _cached_replay_kernel(
     USE_PACKED_QKV: tl.constexpr,
     LAUNCH_WITH_PDL: tl.constexpr,
     ENABLE_STATE_COMMIT: tl.constexpr,
+    PREFETCH_STATE: tl.constexpr = False,
+    EARLY_TRIGGER: tl.constexpr = False,
+    QK_NORM_ALIGN: tl.constexpr = False,
+    SPEC_HISTORY: tl.constexpr = False,
 ):
     """Replay new tokens from cached causal cached updates.
 
@@ -140,38 +169,92 @@ def _cached_replay_kernel(
         wu_base = old_u + (slot.to(tl.int64) * 2 + w_buf) * HIST * HV * V + i_hv * V
         wG_base = old_G + ((slot.to(tl.int64) * 2 + w_buf) * HV + i_hv) * HIST
 
-        if USE_L2_SHARED_INPUTS:
-            b_kh = tl.load(
-                hk_base + o_hist[:, None] * H * K + o_k[None, :],
-                mask=is_hist[:, None] & mask_k[None, :],
+        if SPEC_HISTORY:
+            # Speculatively load both history buffers (addresses depend only on the slot, not on the PNAT / active
+            # buffer loads), then select and mask: same values as the masked loads below, one dependent HBM round
+            # trip less. g_start = G[pnat - 1] is taken from the loaded vector (exact: one nonzero term).
+            hist_m = mask_hist_capacity
+            hb0 = slot.to(tl.int64) * 2
+            kh0 = tl.load(
+                old_k + hb0 * HIST * H * K + i_h * K + o_hist[:, None] * H * K + o_k[None, :],
+                mask=hist_m[:, None] & mask_k[None, :],
                 other=0,
-                cache_modifier=".cg",
             )
+            kh1 = tl.load(
+                old_k + (hb0 + 1) * HIST * H * K + i_h * K + o_hist[:, None] * H * K + o_k[None, :],
+                mask=hist_m[:, None] & mask_k[None, :],
+                other=0,
+            )
+            uh0 = tl.load(
+                old_u + hb0 * HIST * HV * V + i_hv * V + o_hist[:, None] * HV * V + o_v[None, :],
+                mask=hist_m[:, None] & mask_v[None, :],
+                other=0,
+            )
+            uh1 = tl.load(
+                old_u + (hb0 + 1) * HIST * HV * V + i_hv * V + o_hist[:, None] * HV * V + o_v[None, :],
+                mask=hist_m[:, None] & mask_v[None, :],
+                other=0,
+            )
+            gh0 = tl.load(old_G + (hb0 * HV + i_hv) * HIST + o_hist, mask=hist_m, other=0.0)
+            gh1 = tl.load(old_G + ((hb0 + 1) * HV + i_hv) * HIST + o_hist, mask=hist_m, other=0.0)
+            use0 = b_buf == 0
+            b_kh = tl.where(is_hist[:, None], tl.where(use0, kh0, kh1), 0)
+            b_uh = tl.where(is_hist[:, None], tl.where(use0, uh0, uh1), 0)
+            gh_sel = tl.where(use0, gh0, gh1).to(tl.float32)
+            b_Gh = tl.where(is_hist, gh_sel, 0.0)
+            g_start = tl.sum(tl.where((o_hist == b_pnat - 1) & (b_pnat > 0), gh_sel, 0.0), axis=0)
         else:
-            b_kh = tl.load(
-                hk_base + o_hist[:, None] * H * K + o_k[None, :],
-                mask=is_hist[:, None] & mask_k[None, :],
+            if USE_L2_SHARED_INPUTS:
+                b_kh = tl.load(
+                    hk_base + o_hist[:, None] * H * K + o_k[None, :],
+                    mask=is_hist[:, None] & mask_k[None, :],
+                    other=0,
+                    cache_modifier=".cg",
+                )
+            else:
+                b_kh = tl.load(
+                    hk_base + o_hist[:, None] * H * K + o_k[None, :],
+                    mask=is_hist[:, None] & mask_k[None, :],
+                    other=0,
+                )
+            if USE_L2_STREAMING_INPUTS:
+                b_uh = tl.load(
+                    hu_base + o_hist[:, None] * HV * V + o_v[None, :],
+                    mask=is_hist[:, None] & mask_v[None, :],
+                    other=0,
+                    cache_modifier=".cg",
+                )
+            else:
+                b_uh = tl.load(
+                    hu_base + o_hist[:, None] * HV * V + o_v[None, :],
+                    mask=is_hist[:, None] & mask_v[None, :],
+                    other=0,
+                )
+            b_Gh = tl.load(hG_base + o_hist, mask=is_hist, other=0.0).to(tl.float32)
+            g_start = tl.load(
+                hG_base + b_pnat - 1,
+                mask=b_pnat > 0,
+                other=0.0,
+            ).to(tl.float32)
+
+        p_h0 = (
+            h0_source
+            + slot.to(tl.int64) * pool_stride_slot
+            + i_hv * V * K
+            + o_k[:, None]
+            + o_v[None, :] * K
+        )
+        if PREFETCH_STATE:
+            # The checkpoint state is produced in a previous step: fetch it before the dependency wait so its
+            # HBM latency overlaps the producer (conv1d) instead of following it.
+            b_h_pre = tl.load(
+                p_h0,
+                mask=mask_k[:, None] & mask_v[None, :],
                 other=0,
             )
-        if USE_L2_STREAMING_INPUTS:
-            b_uh = tl.load(
-                hu_base + o_hist[:, None] * HV * V + o_v[None, :],
-                mask=is_hist[:, None] & mask_v[None, :],
-                other=0,
-                cache_modifier=".cg",
-            )
-        else:
-            b_uh = tl.load(
-                hu_base + o_hist[:, None] * HV * V + o_v[None, :],
-                mask=is_hist[:, None] & mask_v[None, :],
-                other=0,
-            )
-        b_Gh = tl.load(hG_base + o_hist, mask=is_hist, other=0.0).to(tl.float32)
-        g_start = tl.load(
-            hG_base + b_pnat - 1,
-            mask=b_pnat > 0,
-            other=0.0,
-        ).to(tl.float32)
+        if EARLY_TRIGGER:
+            # The dependent gated-norm kernel reads this kernel's output only after its own griddepcontrol.wait.
+            tl.extra.cuda.gdc_launch_dependents()
 
         if LAUNCH_WITH_PDL:
             _gdc_wait_with_memory_clobber()
@@ -252,8 +335,13 @@ def _cached_replay_kernel(
         if USE_QK_L2NORM_IN_KERNEL:
             b_kf = b_k.to(tl.float32)
             b_qf = b_q.to(tl.float32)
-            inv_k = 1.0 / (tl.sqrt(tl.sum(b_kf * b_kf, 1)) + 1e-6)
-            inv_q = scale / (tl.sqrt(tl.sum(b_qf * b_qf, 1)) + 1e-6)
+            if QK_NORM_ALIGN:
+                # Upstream 3729107c0b: sqrt(sum + eps) as in prefill.
+                inv_k = 1.0 / tl.sqrt(tl.sum(b_kf * b_kf, 1) + 1e-6)
+                inv_q = scale / tl.sqrt(tl.sum(b_qf * b_qf, 1) + 1e-6)
+            else:
+                inv_k = 1.0 / (tl.sqrt(tl.sum(b_kf * b_kf, 1)) + 1e-6)
+                inv_q = scale / (tl.sqrt(tl.sum(b_qf * b_qf, 1)) + 1e-6)
             b_kn = (b_kf * inv_k[:, None]).to(b_k.dtype)
             b_qn = (b_qf * inv_q[:, None]).to(b_q.dtype)
         else:
@@ -263,15 +351,10 @@ def _cached_replay_kernel(
         b_G_local = tl.cumsum(b_g, 0)
         b_G = g_start + b_G_local
 
-        p_h0 = (
-            h0_source
-            + slot.to(tl.int64) * pool_stride_slot
-            + i_hv * V * K
-            + o_k[:, None]
-            + o_v[None, :] * K
-        )
         if STATE_FP32:
-            if USE_L2_STATE_CACHE:
+            if PREFETCH_STATE:
+                b_h = b_h_pre
+            elif USE_L2_STATE_CACHE:
                 b_h = tl.load(
                     p_h0,
                     mask=mask_k[:, None] & mask_v[None, :],
@@ -289,7 +372,9 @@ def _cached_replay_kernel(
             b_kh0 = tl.dot(b_kn, b_h_hi) + tl.dot(b_kn, b_h_lo)
             b_qh0 = tl.dot(b_qn, b_h_hi) + tl.dot(b_qn, b_h_lo)
         else:
-            if USE_L2_STATE_CACHE:
+            if PREFETCH_STATE:
+                b_h = b_h_pre.to(b_kn.dtype)
+            elif USE_L2_STATE_CACHE:
                 b_h = tl.load(
                     p_h0,
                     mask=mask_k[:, None] & mask_v[None, :],
@@ -761,14 +846,21 @@ def fused_recurrent_gated_delta_rule_cached_replay_update(
     BK = triton.next_power_of_2(K)
     # The complete workload mapping is retained for the 4:1 shape; the
     # 2:1 fine tiling is enabled only through the measured low-batch range.
+    head_tiles = N * HV
     use_production_bf16_shape = (
-        T == 4
+        (
+            T == 4
+            or (
+                _Q35_GDN_REPLAY_TILE
+                and 2 <= T <= Q35_GDN_REPLAY_MAX_T
+                and head_tiles <= _BV16_MAX_HEAD_TILES
+            )
+        )
         and history_size <= 16
         and K == 128
         and V == 128
         and ssm_states.dtype == torch.bfloat16
     )
-    head_tiles = N * HV
     use_tuned_bf16_mapping = use_production_bf16_shape and HV == 4 * H
     use_fine_grained_mapping = use_production_bf16_shape and _supports_fine_grained_replay_tiling(
         H, HV, head_tiles
@@ -776,6 +868,9 @@ def fused_recurrent_gated_delta_rule_cached_replay_update(
     use_small_grid_mapping = use_fine_grained_mapping and head_tiles <= _SMALL_GRID_HEAD_TILES
     if block_v is None:
         block_v = _default_cached_replay_block_v(use_fine_grained_mapping, head_tiles, V)
+        if _Q35_GDN_REPLAY_TILE and use_fine_grained_mapping and T > 8 and block_v == 16:
+            # 16-row token tile: BV32 / 2 warps measured best (T=9 N=1: 11.5 -> 7.9 us, commit 13.7 -> 8.6 us).
+            block_v = 32
     if num_warps is None:
         num_warps = (
             2 if use_fine_grained_mapping and (use_small_grid_mapping or launch_with_pdl) else 4
@@ -801,7 +896,7 @@ def fused_recurrent_gated_delta_rule_cached_replay_update(
     BH = triton.next_power_of_2(history_size)
     assert BK == K and triton.next_power_of_2(BV) == BV and BV <= V
     assert main_num_stages > 0
-    assert T <= 8
+    assert T <= Q35_GDN_REPLAY_MAX_T
     assert history_size >= T
     assert BH <= 16
     if scale is None:
@@ -890,6 +985,21 @@ def fused_recurrent_gated_delta_rule_cached_replay_update(
             num_warps=num_warps,
             num_stages=main_num_stages,
             launch_pdl=use_pdl,
+            **(
+                dict(
+                    PREFETCH_STATE=_Q35_GDN_REPLAY_PREFETCH,
+                    SPEC_HISTORY=_Q35_GDN_REPLAY_SPEC_HIST,
+                    EARLY_TRIGGER=_Q35_GDN_REPLAY_EARLY_TRIGGER,
+                )
+                if (
+                    use_pdl
+                    and not use_l2_state_cache
+                    and not use_l2_streaming_inputs
+                    and not use_l2_shared_inputs
+                )
+                else {}
+            ),
+            **({"QK_NORM_ALIGN": True} if _Q35_GDN_QK_NORM_ALIGN else {}),
         )
 
     if replay_work_items is None:

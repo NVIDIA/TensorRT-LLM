@@ -14,7 +14,7 @@ import sys
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Dict, NamedTuple, Optional, Sequence, Set
+from typing import Any, Dict, NamedTuple, Optional, Sequence, Set, Tuple
 
 import click
 import torch
@@ -413,7 +413,10 @@ def _init_multi_frontend_mode(llm_args: dict,
     return mode
 
 
-def _spawn_attached_frontends(llm, num_frontends: int) -> list:
+def _spawn_attached_frontends(
+        llm,
+        num_frontends: int,
+        affinity_sockets: Optional[Dict[int, socket.socket]] = None) -> list:
     """Spawn num_frontends - 1 attached serving frontend processes.
 
     Each child re-execs this trtllm-serve command line with env vars
@@ -427,6 +430,10 @@ def _spawn_attached_frontends(llm, num_frontends: int) -> list:
     failure (or a missed deadline) fails the whole group, terminating
     the children already started, so num_serve_frontends=K never
     silently degrades to fewer frontends.
+
+    affinity_sockets (frontend id -> socket) are the per-frontend affinity
+    ports the launcher bound before the executor started; each child
+    inherits its own and the launcher closes its copy.
     """
     from tensorrt_llm.executor.proxy import GenerationExecutorProxy
 
@@ -452,14 +459,21 @@ def _spawn_attached_frontends(llm, num_frontends: int) -> list:
             read_fd, write_fd = os.pipe()
             ready_fds.append(read_fd)
             env["TLLM_FRONTEND_READY_FD"] = str(write_fd)
+            pass_fds = [write_fd]
+            affinity_sock = (affinity_sockets or {}).pop(frontend_id, None)
+            if affinity_sock is not None:
+                env["TLLM_FRONTEND_AFFINITY_FD"] = str(affinity_sock.fileno())
+                pass_fds.append(affinity_sock.fileno())
             try:
                 child = subprocess.Popen([sys.executable] + sys.argv,
                                          env=env,
-                                         pass_fds=(write_fd, ))  # nosec B603
+                                         pass_fds=tuple(pass_fds))  # nosec B603
             finally:
                 # The child now holds the only write end; its exit before
                 # READY surfaces as EOF on read_fd.
                 os.close(write_fd)
+                if affinity_sock is not None:
+                    affinity_sock.close()  # the child holds its own copy
             children.append(child)
             logger.info(
                 f"Launched attached serving frontend {frontend_id} (pid {child.pid})"
@@ -515,6 +529,101 @@ def _signal_frontend_ready(multi_frontend: MultiFrontendMode) -> None:
     fd = int(ready_fd)
     os.write(fd, b"R")
     os.close(fd)
+
+
+def _ephemeral_port_range() -> Optional[Tuple[int, int]]:
+    """The kernel's range for automatically assigned local ports, if known."""
+    try:
+        with open("/proc/sys/net/ipv4/ip_local_port_range") as f:
+            low, high = (int(v) for v in f.read().split())
+        return low, high
+    except (OSError, ValueError):
+        return None
+
+
+def _bind_affinity_port(host: str, affinity_port: int, address_family: int,
+                        frontend_id: int) -> socket.socket:
+    sock = socket.socket(address_family, socket.SOCK_STREAM)
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind((host, affinity_port))
+    except OSError as e:
+        sock.close()
+        raise RuntimeError(
+            f"Failed to bind the affinity socket of frontend {frontend_id} to "
+            f"{host}:{affinity_port}: {e}. Port holder(s): "
+            f"{_diagnose_port_in_use(affinity_port)}")
+    return sock
+
+
+def _bind_frontend_affinity_sockets(
+    host: str, port: int, address_family: int,
+    multi_frontend: MultiFrontendMode
+) -> Tuple[Optional[socket.socket], Dict[int, socket.socket]]:
+    """Listening sockets for the per-frontend affinity ports.
+
+    With TRTLLM_FRONTEND_AFFINITY_PORT_STRIDE=S and num_serve_frontends=K > 1,
+    frontend i (the launcher is 0) also listens on port + S * (i + 1). The
+    shared SO_REUSEPORT port spreads a conversation's turns over all K
+    processes, so the per-process incremental-tokenization cache rarely holds
+    the previous turn; a disagg orchestrator started with
+    TRTLLM_DISAGG_CTX_FRONTEND_AFFINITY=K:S sends every turn of a conversation
+    to one frontend through these ports instead.
+
+    The launcher binds all K ports before it starts the executor and hands
+    each attached frontend its socket (_spawn_attached_frontends). The
+    attached frontends start only once the executor is up, and by then its
+    outgoing connections (UCX, NCCL, HTTP clients) hold many local ports; a
+    port inside the kernel's ephemeral range could be one of them.
+
+    Returns this frontend's socket (None when affinity is off) and, in the
+    launcher, the sockets reserved for the attached frontends by frontend id.
+    """
+    stride = int(os.getenv("TRTLLM_FRONTEND_AFFINITY_PORT_STRIDE", "0") or 0)
+    num_frontends = multi_frontend.num_frontends
+    if stride <= 0 or num_frontends <= 1:
+        return None, {}
+    if multi_frontend.is_attached_frontend:
+        frontend_id = int(os.environ["TLLM_EXECUTOR_FRONTEND_ID"])
+        inherited_fd = os.environ.pop("TLLM_FRONTEND_AFFINITY_FD", None)
+        if inherited_fd is not None:
+            sock = socket.socket(fileno=int(inherited_fd))
+            sock.set_inheritable(False)
+        else:  # started by a launcher that does not pre-bind
+            sock = _bind_affinity_port(host, port + stride * (frontend_id + 1),
+                                       address_family, frontend_id)
+        logger.info(f"Serving frontend {frontend_id} also listens on its own "
+                    f"port {sock.getsockname()[1]}")
+        return sock, {}
+
+    ports = [port + stride * (i + 1) for i in range(num_frontends)]
+    ephemeral = _ephemeral_port_range()
+    if ephemeral is not None and any(ephemeral[0] <= p <= ephemeral[1]
+                                     for p in ports):
+        max_stride = (ephemeral[0] - 1 - port) // num_frontends
+        hint = (f"; a stride of at most {max_stride} keeps them below it"
+                if max_stride > 0 else "")
+        logger.warning(
+            f"Frontend affinity ports {ports[0]}-{ports[-1]} overlap the "
+            f"ephemeral port range {ephemeral[0]}-{ephemeral[1]} "
+            f"(net.ipv4.ip_local_port_range). They are bound before the "
+            f"executor starts, but another process on this node can still "
+            f"hold one{hint} (change TRTLLM_FRONTEND_AFFINITY_PORT_STRIDE and "
+            f"the orchestrator's TRTLLM_DISAGG_CTX_FRONTEND_AFFINITY together).")
+    sockets = {}
+    try:
+        for frontend_id, affinity_port in enumerate(ports):
+            sockets[frontend_id] = _bind_affinity_port(host, affinity_port,
+                                                       address_family,
+                                                       frontend_id)
+    except BaseException:
+        for sock in sockets.values():
+            sock.close()
+        raise
+    logger.info(f"Serving frontend 0 also listens on its own port {ports[0]}; "
+                f"ports {ports[1]}-{ports[-1]} are reserved for the attached "
+                f"frontends")
+    return sockets.pop(0), sockets
 
 
 def _terminate_attached_frontends(children: list) -> None:
@@ -583,6 +692,12 @@ def launch_server(
                 f"(pid={os.getpid()}): {e}. Current port holder(s): {holder}")
             raise RuntimeError(f"Failed to bind socket to {host}:{port}: {e}. "
                                f"Port holder(s): {holder}")
+        sockets = [s]
+        affinity_socket, attached_affinity_sockets = (
+            _bind_frontend_affinity_sockets(host, port, address_family,
+                                            multi_frontend))
+        if affinity_socket is not None:
+            sockets.append(affinity_socket)
 
         if backend == 'pytorch':
             llm_args.pop("build_config", None)
@@ -606,7 +721,8 @@ def launch_server(
         try:
             if multi_frontend.is_launcher:
                 frontend_children = _spawn_attached_frontends(
-                    llm, multi_frontend.num_frontends)
+                    llm, multi_frontend.num_frontends,
+                    attached_affinity_sockets)
 
             server = OpenAIServer(
                 generator=llm,
@@ -628,10 +744,14 @@ def launch_server(
                 gc.disable()
 
             _signal_frontend_ready(multi_frontend)
-            uvloop.run(server(host, port, sockets=[s]))
+            uvloop.run(server(host, port, sockets=sockets))
         finally:
             if frontend_children:
                 _terminate_attached_frontends(frontend_children)
+            if affinity_socket is not None:
+                affinity_socket.close()
+            for sock in attached_affinity_sockets.values():  # never handed off
+                sock.close()
 
 
 def launch_grpc_server(host: str,

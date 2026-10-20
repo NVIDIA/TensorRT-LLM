@@ -28,6 +28,46 @@ from tensorrt_llm.mapping import Mapping
 # Unique tag to avoid collisions with other comms
 PP_COMM_TAG_AUTOTUNING = 30000
 
+# Debug only (default off): log every distinct inference-time cache lookup
+# (op, input shapes, hit/miss, chosen runner/tactic, whether a CUDA graph is
+# being captured), not just the first miss per op as warning_once does.
+_Q35_AUTOTUNE_TRACE = os.environ.get("TRTLLM_Q35_AUTOTUNE_TRACE", "0") == "1"
+_q35_autotune_trace_seen: Set[Tuple] = set()
+
+
+# TRTLLM_Q35_AUTOTUNE_DUMP=1 (default off): at the end of every autotune() session, log the
+# profiling-cache entries that are new or changed since the last dump: op, runner, shape key,
+# chosen runner / tactic and the measured time ([Q35ATD] lines; one grep names a run's tactics).
+_Q35_AUTOTUNE_DUMP = os.environ.get("TRTLLM_Q35_AUTOTUNE_DUMP", "0") == "1"
+_q35_autotune_dumped: Dict[Tuple, Tuple] = {}
+
+
+def _q35_dump_cache(cache: Dict[Tuple, Tuple], rank: int) -> None:
+    changed = [(k, v) for k, v in cache.items() if _q35_autotune_dumped.get(k) != v]
+    logger.info(f"[Q35ATD] rank={rank} entries={len(cache)} new_or_changed={len(changed)}")
+    for k, v in sorted(changed, key=lambda kv: str(kv[0])):
+        _q35_autotune_dumped[k] = v
+        op, runner_cls, runner_uid, profile = (tuple(k) + (None, ) * 4)[:4]
+        runner_id, tactic, min_time = (tuple(v) + (None, ) * 3)[:3]
+        logger.info(f"[Q35ATD] rank={rank} op={op} runner={runner_cls}:{runner_uid} "
+                    f"key={profile} -> runner_id={runner_id} tactic={tactic} "
+                    f"time_ms={min_time}")
+
+
+def _q35_trace_lookup(custom_op: str, input_shapes: Tuple, is_cache_hit: bool,
+                      runner_id: int, tactic: Any) -> None:
+    key = (custom_op, input_shapes, is_cache_hit)
+    if key in _q35_autotune_trace_seen:
+        return
+    _q35_autotune_trace_seen.add(key)
+    try:
+        capturing = torch.cuda.is_current_stream_capturing()
+    except Exception:
+        capturing = None
+    logger.info(f"[Q35AT] op={custom_op} hit={is_cache_hit} "
+                f"runner={runner_id} tactic={tactic} capturing={capturing} "
+                f"shapes={[tuple(s) for s in input_shapes]}")
+
 
 class DistributedTuningStrategy(enum.Enum):
     """
@@ -329,6 +369,8 @@ def autotune(tune_mode: bool = True,
             if cache_path is not None:
                 logger.info(f"[Autotuner] Saving cache to {cache_path}")
                 autotuner.profiling_cache.save_cache(cache_path, rank)
+            if _Q35_AUTOTUNE_DUMP:
+                _q35_dump_cache(autotuner.profiling_cache.cache, rank)
         finally:
             # Restore the singleton's prior distributed state (see enter) so the
             # temporary full-world state does not persist past this context.
@@ -1146,6 +1188,9 @@ class AutoTuner:
                 logger.warning_once(
                     f"[AutoTuner] {custom_op} using the fallback tactic, due to cache miss on input shapes={input_shapes}",
                     key=(custom_op, "warning_autotuning_cache_miss_fallback"))
+            if _Q35_AUTOTUNE_TRACE:
+                _q35_trace_lookup(custom_op, input_shapes, is_cache_hit,
+                                  best_runner_id, best_tactic)
 
             return (best_runner, best_tactic)
 

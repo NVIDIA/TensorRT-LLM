@@ -502,6 +502,16 @@ def merge_requests(
     return merge_requests_to_llm_requests(new_requests, exclude_last_generation_logits)
 
 
+# TRTLLM_Q35_FAST_COUNT_BCAST=1: the per-iteration request-count broadcast of a
+# non-PP MPI executor is one raw MPI Bcast of an int64 instead of a pickled
+# safe_broadcast (header + payload Bcasts). Default off.
+FAST_COUNT_BROADCAST_ENV = "TRTLLM_Q35_FAST_COUNT_BCAST"
+
+
+def _fast_count_broadcast_enabled() -> bool:
+    return os.environ.get(FAST_COUNT_BROADCAST_ENV, "0") == "1"
+
+
 class RequestBroadcaster:
     """Broadcasts requests across distributed ranks (TP, PP, CP)."""
 
@@ -543,6 +553,10 @@ class RequestBroadcaster:
             return request_count
 
         if not self.dist.has_pp:
+            if FAST_COUNT_BROADCAST_ENV in os.environ and _fast_count_broadcast_enabled():
+                fast = self._fast_count_broadcast(request_count)
+                if fast is not None:
+                    return fast
             return self.dist.broadcast(request_count, root=0)
 
         if self.dist.is_first_pp_rank:
@@ -560,6 +574,26 @@ class RequestBroadcaster:
                 self.dist.send_object(request_count, self.dist.next_pp_rank, tag)
 
         return request_count
+
+    def _fast_count_broadcast(self, request_count: int) -> Optional[int]:
+        """One raw MPI Bcast of an int64 instead of the pickled two-Bcast
+        ``safe_broadcast`` (TRTLLM_Q35_FAST_COUNT_BCAST=1). Same communicator
+        and root as ``MPIDist.broadcast``; None when not on MPIDist."""
+        from ..distributed.communicator import MPIDist
+
+        if not isinstance(self.dist, MPIDist):
+            return None
+        import numpy as np
+        from mpi4py import MPI
+
+        from tensorrt_llm._utils import mpi_comm
+
+        buf = getattr(self, "_count_buf", None)
+        if buf is None:
+            buf = self._count_buf = np.zeros(1, dtype=np.int64)
+        buf[0] = request_count
+        mpi_comm().Bcast([buf, MPI.INT64_T], root=0)
+        return int(buf[0])
 
     def _collect_py_objects(self, new_requests: List) -> Tuple:
         """Collect Python-only objects from requests."""

@@ -170,8 +170,8 @@ def make_weak_ref(x):
     elif isinstance(x, list):
         return [make_weak_ref(i) for i in x]
     elif isinstance(x, dict):
-        return {k: make_weak_ref(v) for k, v in x.items()}
-    elif isinstance(x, (int, float, bool)):
+        return {make_weak_ref(k): make_weak_ref(v) for k, v in x.items()}
+    elif x is None or isinstance(x, (int, float, str, bool)):
         return x
     else:
         raise TypeError(f"Invalid type {type(x)} to make weak ref")

@@ -2087,6 +2087,23 @@ def _(
     return x.new_empty((b, d), dtype=o_dtype)
 
 
+# TRTLLM_Q35_AR_NO_NCCL_SYMM=1 (Qwen3.5, default off): never run the NCCL_SYMMETRIC all-reduce
+# strategy -- it is not tuned, and the cache-miss fallback and cached selections use plain NCCL
+# instead. Avoid NCCL_SYMMETRIC for small unregistered inputs at TP4 (known issue).
+_Q35_AR_NO_NCCL_SYMM_ENV = "TRTLLM_Q35_AR_NO_NCCL_SYMM"
+
+
+def q35_ar_no_nccl_symm() -> bool:
+    return os.environ.get(_Q35_AR_NO_NCCL_SYMM_ENV, "0") == "1"
+
+
+def q35_ar_strategy_without_nccl_symm(strategy: int) -> int:
+    """NCCL_SYMMETRIC -> NCCL under TRTLLM_Q35_AR_NO_NCCL_SYMM=1; any other strategy unchanged."""
+    if strategy == AllReduceStrategy.NCCL_SYMMETRIC.value and q35_ar_no_nccl_symm():
+        return AllReduceStrategy.NCCL.value
+    return strategy
+
+
 class AllReduceRunner(TunableRunner):
     _prealloc_lock: ClassVar[threading.Lock] = threading.Lock()
     _prealloc_done: ClassVar[set] = set()
@@ -2188,6 +2205,9 @@ class AllReduceRunner(TunableRunner):
             AllReduceStrategy.NCCL_SYMMETRIC.value,
             AllReduceStrategy.NCCL.value,
         ]
+        if q35_ar_no_nccl_symm():
+            # TRTLLM_Q35_AR_NO_NCCL_SYMM: never tune NCCL_SYMMETRIC.
+            valid_strategies = [AllReduceStrategy.NCCL.value]
         # Fallback in allreduceOp is set to NCCL_SYMMETRIC as default
         # So we need to check if the workspace size is too large to avoid hanging.
         workspace_size = inputs[0].numel() * inputs[0].element_size()
@@ -2234,6 +2254,8 @@ class AllReduceRunner(TunableRunner):
             # by a cross-rank barrier in NCCLWindowAllocator which falls back
             # to plain NCCL.
             tactic = AllReduceStrategy.NCCL_SYMMETRIC.value
+        # TRTLLM_Q35_AR_NO_NCCL_SYMM: the fallback and a cached NCCL_SYMMETRIC run plain NCCL.
+        tactic = q35_ar_strategy_without_nccl_symm(tactic)
 
         return torch.ops.trtllm.allreduce(
             input,

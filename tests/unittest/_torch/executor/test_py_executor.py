@@ -38,6 +38,7 @@ from tensorrt_llm._torch.pyexecutor.scheduler import (
     ScheduledRequests,
     SerializableSchedulerOutput,
 )
+from tensorrt_llm.runtime.kv_cache_manager_v2 import OutOfPagesError
 
 pytestmark = pytest.mark.cpu_only
 
@@ -1813,6 +1814,28 @@ def test_pad_dummy_allocation_failure_skips_padding():
 
     _run_pad(stub)
 
+    assert len(stub.active_requests) == 1
+    assert not any(r.is_attention_dp_dummy for r in stub.active_requests)
+
+
+@pytest.mark.parametrize("failure", ["none", "empty", "out_of_pages"])
+def test_pad_dummy_allocation_failure_skips_padding_without_dsv4_fixes(failure):
+    # Same contract on the non-DeepSeek-V4 path (e.g. Qwen3.5 DEP CTX / GEN): KV cache manager V2 returns
+    # None from add_dummy_requests when its IndexMapper is saturated or it runs out of pages ("retry next
+    # iteration"), which the free-token capacity check does not catch. The rank must skip padding for
+    # this iteration instead of crashing on an unchecked [0].
+    stub = _StubADPExecutor(enable_dsv4_adp_dummy_fixes=False)
+    stub.active_requests = [_make_adp_request(_STATE_GENERATION_TO_COMPLETE)]
+    stub.expected_num_active_requests = 2
+    stub.kv_cache_manager.add_dummy_requests.side_effect = None
+    if failure == "out_of_pages":
+        stub.kv_cache_manager.add_dummy_requests.side_effect = OutOfPagesError("no free pages")
+    else:
+        stub.kv_cache_manager.add_dummy_requests.return_value = None if failure == "none" else []
+
+    _run_pad(stub)
+
+    stub.kv_cache_manager.add_dummy_requests.assert_called_once()
     assert len(stub.active_requests) == 1
     assert not any(r.is_attention_dp_dummy for r in stub.active_requests)
 

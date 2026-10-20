@@ -17,6 +17,7 @@ import asyncio
 import json
 import os
 import traceback
+import zlib
 from abc import ABC, abstractmethod
 from typing import Any, AsyncGenerator, Awaitable, Callable, List, Optional, Tuple, Type
 
@@ -24,6 +25,7 @@ import aiohttp
 
 from tensorrt_llm.llmapi.disagg_utils import ServerRole
 from tensorrt_llm.logger import logger
+from tensorrt_llm.serve.conversation_id import get_request_conversation_id
 from tensorrt_llm.serve.disagg_auth import (
     build_internal_disagg_auth_headers,
     request_requires_internal_disagg_auth,
@@ -67,6 +69,24 @@ if _MSGSPEC_ENABLED:
             "(listed in requirements.txt)."
         ) from exc
     _msgpack_encoder = msgspec.msgpack.Encoder()
+
+
+def _ctx_frontend_affinity() -> Optional[Tuple[int, int]]:
+    """(num_frontends, port_stride) from TRTLLM_DISAGG_CTX_FRONTEND_AFFINITY="K:S".
+
+    A context server started with num_serve_frontends=K and
+    TRTLLM_FRONTEND_AFFINITY_PORT_STRIDE=S has frontend i also listening on
+    port + S * (i + 1) (commands/serve.py). Sending every turn of a
+    conversation to the same frontend keeps that process's incremental
+    tokenization cache warm; the shared port spreads the turns over all K.
+    """
+    value = os.getenv("TRTLLM_DISAGG_CTX_FRONTEND_AFFINITY", "")
+    if not value:
+        return None
+    num_frontends, stride = (int(x) for x in value.split(":"))
+    if num_frontends <= 1 or stride <= 0:
+        return None
+    return num_frontends, stride
 
 
 def _metrics_phase(role: ServerRole) -> str:
@@ -167,6 +187,27 @@ class OpenAIHttpClient(OpenAIClient):
         self._disagg_id_generator = disagg_id_generator
         self._request_perf_metrics = request_perf_metrics
         self._internal_disagg_auth_key = internal_disagg_auth_key
+        self._frontend_affinity = (
+            _ctx_frontend_affinity() if role == ServerRole.CONTEXT else None
+        )
+        if self._frontend_affinity is not None:
+            num_frontends, stride = self._frontend_affinity
+            logger.info(
+                f"Context requests go to per-conversation frontend ports "
+                f"({num_frontends} frontends, port stride {stride})"
+            )
+
+    def _url_server(self, server: str, request: UCompletionRequest) -> str:
+        """host:port to send this request to (a frontend's own port with affinity)."""
+        if self._frontend_affinity is None:
+            return server
+        conversation_id = get_request_conversation_id(request)
+        if not conversation_id:
+            return server
+        num_frontends, stride = self._frontend_affinity
+        host, _, port = server.rpartition(":")
+        frontend = zlib.crc32(conversation_id.encode()) % num_frontends
+        return f"{host}:{int(port) + stride * (frontend + 1)}"
 
     def _get_request_headers(self, request: UCompletionRequest) -> dict[str, str]:
         if self._role != ServerRole.GENERATION:
@@ -189,7 +230,7 @@ class OpenAIHttpClient(OpenAIClient):
                 server, _ = await self._router.get_next_server(request)
             else:
                 server, _ = await self._router.get_next_server(request, req_id=req_id)
-        url = f"http://{server}/{endpoint}"
+        url = f"http://{self._url_server(server, request)}/{endpoint}"
         # disaggregated_params is None when conditional_disagg bypasses ctx.
         _dp = request.disaggregated_params
         _ctx_rid = _dp.ctx_request_id if _dp is not None else None

@@ -2432,9 +2432,12 @@ def _create_kv_cache_manager(
             logger.info(
                 "GDN replay kernel requires speculative decoding; using "
                 "non-replay path")
-        elif spec_config.tokens_per_gen_step > 8:
+        elif spec_config.tokens_per_gen_step > (
+                16 if os.environ.get("TRTLLM_Q35_GDN_REPLAY_T16", "0") == "1"
+                else 8):
             logger.info("GDN cached replay supports at most 8 tokens per "
-                        "generation step; using non-replay path")
+                        "generation step (16 with TRTLLM_Q35_GDN_REPLAY_T16=1); "
+                        "using non-replay path")
             use_replay = False
 
         # Tree attention: replay assumes a linear token sequence.

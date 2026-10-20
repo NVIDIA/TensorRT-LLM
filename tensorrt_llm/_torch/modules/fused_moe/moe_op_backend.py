@@ -332,7 +332,11 @@ class TRTLLMOpBackend(MoEOpBackend):
         output=None,
         tune_max_num_tokens=8192,
         use_dp=False,
+        prerouted=None,
     ):
+        # prerouted: (flat int32 routing tables, tile, top-k ids, bf16 top-k weights) the Q35
+        # front end computed from router_logits (TRTLLM_Q35_MOE_PREROUTE); the op then skips
+        # its routing kernel when its tactic uses that tile.
         hidden_size = gemm1_weights.shape[-1] * 2
         if gated_act_type == int(ActType_TrtllmGen.SiTu):
             if hidden_states.dtype != torch.float8_e4m3fn or hidden_states_scale is None:
@@ -406,8 +410,20 @@ class TRTLLMOpBackend(MoEOpBackend):
                     output=output,
                     tune_max_num_tokens=tune_max_num_tokens,
                     use_dp=use_dp,
+                    **(dict(prerouted=prerouted[0],
+                            prerouted_tile=prerouted[1],
+                            prerouted_ids=prerouted[2],
+                            prerouted_weights=prerouted[3])
+                       if prerouted is not None else {}),
                 )
                 if not do_finalize:
+                    if prerouted is not None and outputs[1].numel() == 0:
+                        # pre-routed run: the op returned placeholders for its inputs
+                        from .q35_fused_front import q35_prerouted_unfinalized
+
+                        outputs = q35_prerouted_unfinalized(
+                            outputs, prerouted[0], top_k, prerouted[3]
+                        )
                     return outputs
                 else:
                     final_hidden_states = outputs[0]

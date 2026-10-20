@@ -48,6 +48,9 @@ class KeyType(NamedTuple):
     num_contexts: int = 0
     context_query_len: int = 0
     num_encoder_tokens: int = 0
+    # TRTLLM_Q35_TEMPERATURE_GRAPHS: temperature-only advanced-sampling variant
+    # (vocabulary-sharded Gumbel-max target sampling); False unless captured.
+    q35_temperature_only: bool = False
 
 
 def _save_spec_decode_capture_state(
@@ -329,6 +332,8 @@ class CUDAGraphRunner:
         # this field (non-one-engine paths or non-spec batches).
         is_all_greedy_sample = bool(
             getattr(spec_metadata, "is_all_greedy_sample", True))
+        q35_temperature_only = (not is_all_greedy_sample and bool(
+            getattr(spec_metadata, "q35_temperature_only", False)))
 
         if self.config.is_draft_model and spec_resource_manager is not None and isinstance(
                 spec_resource_manager, Eagle3ResourceManager):
@@ -339,7 +344,8 @@ class CUDAGraphRunner:
                           draft_len=draft_len,
                           is_first_draft=spec_resource_manager.is_first_draft,
                           short_seq_len_mode=short_seq_len_mode,
-                          is_all_greedy_sample=is_all_greedy_sample)
+                          is_all_greedy_sample=is_all_greedy_sample,
+                          q35_temperature_only=q35_temperature_only)
         else:
             # With dynamic spec decode, the draft length may be zero even when enable_spec_decode is True,
             # so we need to get the draft length from the batch instead of using enable_spec_decode.
@@ -368,7 +374,8 @@ class CUDAGraphRunner:
                           is_all_greedy_sample=is_all_greedy_sample,
                           num_contexts=num_contexts,
                           context_query_len=context_query_len,
-                          num_encoder_tokens=num_encoder_tokens)
+                          num_encoder_tokens=num_encoder_tokens,
+                          q35_temperature_only=q35_temperature_only)
         return key
 
     def _get_compatible_mixed_encoder_decoder_key(self,
@@ -545,6 +552,9 @@ class CUDAGraphRunner:
             if spec_metadata is not None and getattr(
                     spec_metadata, "_force_non_greedy_for_capture", False):
                 spec_metadata._force_non_greedy_for_capture = False
+                # TRTLLM_Q35_TEMPERATURE_GRAPHS capture pass (only ever set
+                # together with the flag above).
+                spec_metadata._q35_temperature_only_for_capture = False
                 cleared += 1
         return cleared
 
@@ -703,11 +713,17 @@ class CUDAGraphRunner:
 
         input_ids = current_inputs["input_ids"]
         seqlen = input_ids.shape[0]
-        static_tensors["input_ids"][:seqlen].copy_(input_ids)
+        # TRTLLM_Q35_STEADY_PREPARE_STATIC: the steady prepare's staging kernel
+        # already wrote this step's ids and positions into the static buffers.
+        staged = getattr(self, "_q35_static_staged", None) == seqlen
+        self._q35_static_staged = None
+        if not staged:
+            static_tensors["input_ids"][:seqlen].copy_(input_ids)
 
         position_ids = current_inputs["position_ids"]
         if self.config.use_mrope:
-            static_tensors["position_ids"][:, :, :seqlen].copy_(position_ids)
+            if not staged:
+                static_tensors["position_ids"][:, :, :seqlen].copy_(position_ids)
             mrope_delta_read_seq_slots = current_inputs.get(
                 'mrope_delta_read_seq_slots')
             if mrope_delta_read_seq_slots is not None:
@@ -716,7 +732,7 @@ class CUDAGraphRunner:
                                                   shape[0]].copy_(
                                                       mrope_delta_read_seq_slots,
                                                       non_blocking=True)
-        else:
+        elif not staged:
             static_tensors["position_ids"][:, :seqlen].copy_(position_ids)
 
         num_encoder_tokens = key.num_encoder_tokens

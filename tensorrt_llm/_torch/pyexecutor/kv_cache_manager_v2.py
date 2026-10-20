@@ -90,6 +90,7 @@ from .kv_cache_stats import (
     KVCacheV2SsmSnapshotIterationStats,
 )
 from .llm_request import LlmRequest, LlmRequestState, SamplingConfig, get_draft_token_length
+from . import q35_admit_timers
 from .resource_manager import (
     BaseResourceManager,
     CacheTypeCpp,
@@ -105,6 +106,15 @@ from .scheduler import ScheduledRequests
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention_backend.interface import AttentionMetadata
+
+# TRTLLM_Q35_CTX_LEAN_TOKENS=1 (default off): for text-only requests, the first context chunk's block-reuse lookup
+# takes the prompt list built at intake (executor_request_to_llm_request) instead of rebuilding it from the C++
+# request with get_tokens(0) and slicing it, and block commits fetch only the tokens they commit (get_tokens_range)
+# instead of the whole prompt. Same tokens, fewer O(prompt) Python list builds per request. =2 also checks the
+# lookup tokens against get_tokens(0) (validation runs only). =3: the lookup reads the tokens in C++ from the
+# request (KVCacheManager.create_kv_cache_for_request, no Python list and no per-token cast) and the radix tree
+# hashes a block's tokens in 512-byte writes; needs the matching C++ libs, else behaves as =1.
+_Q35_CTX_LEAN_TOKENS = int(os.environ.get("TRTLLM_Q35_CTX_LEAN_TOKENS", "0") or 0)
 
 KV_CACHE_ITERATION_STATS_DELTA_FIELDS = _KV_CACHE_ITERATION_STATS_DELTA_FIELDS
 KV_CACHE_ITERATION_STATS_REUSE_FIELDS = (
@@ -2181,8 +2191,10 @@ class KVCacheManagerV2(BaseResourceManager):
             ctx_draft_tokens = req.context_phase_params.draft_tokens
             if ctx_draft_tokens is not None:
                 draft_len = len(ctx_draft_tokens)
-            if draft_len == 0 and not self.is_draft and not req.py_disable_speculative_decoding:
-                draft_len = self.max_total_draft_tokens
+            if not self.is_draft and not req.py_disable_speculative_decoding:
+                # The GEN pads a CTX draft shorter than its own width (no draft, or a CTX with a smaller
+                # max_draft_len) up to max_total_draft_tokens, so reserve for the padded width.
+                draft_len = max(draft_len, self.max_total_draft_tokens)
         return draft_len
 
     def _required_gen_capacity(self, req: LlmRequest, current_capacity: int) -> int:
@@ -2307,21 +2319,64 @@ class KVCacheManagerV2(BaseResourceManager):
         )
         return self._prepare_context_impl(req)
 
+    def _record_branch_snapshot_point(
+        self,
+        req: LlmRequest,
+        kv_cache: _KVCache,
+        num_lookup_tokens: Optional[int],
+        lookup_tokens: Optional[Sequence[TokenIdExt]] = None,
+    ) -> None:
+        """Hook for recurrent-state managers; attention-only caches have no snapshots."""
+
     def _prepare_context_impl(self, req: LlmRequest) -> bool:
         if req.is_first_context_chunk:
             if self.conversation_manager is not None:
                 self.conversation_manager.prepare_request(req)
             kv_cache = self.kv_cache_map.get(req.py_request_id)
+            # Stays None when the cache was resumed rather than freshly
+            # matched, which is also the case where no branch point applies.
+            num_lookup_tokens = None
+            tokens = None
             if kv_cache is None:
-                all_tokens = req.get_tokens(DEFAULT_BEAM_INDEX)
-                # Last token cannot be recovered, so we don't include it in
-                # the input tokens to look up for the block that can be reused.
-                if self.enable_block_reuse:
-                    tokens = self._augment_tokens_for_block_reuse(
-                        all_tokens, req, end=len(all_tokens) - 1
-                    )
-                else:
-                    tokens = None
+                timed = q35_admit_timers.ENABLED
+                if timed:
+                    t0 = q35_admit_timers.now()
+                tokens = None
+                from_request = None
+                if _Q35_CTX_LEAN_TOKENS:
+                    if _Q35_CTX_LEAN_TOKENS >= 3 and self._q35_can_create_from_request(req):
+                        # The C++ binding reads the lookup tokens from the request itself.
+                        from_request = req
+                        req.py_q35_prompt_tokens = None
+                    else:
+                        tokens = self._q35_lookup_tokens(req)
+                if tokens is None and from_request is None:
+                    if self.enable_block_reuse or not q35_admit_timers.GEN_ADMIT_LEAN:
+                        all_tokens = req.get_tokens(DEFAULT_BEAM_INDEX)
+                    else:
+                        # TRTLLM_Q35_GEN_ADMIT: without block reuse the prompt tokens are unused; skip the whole-prompt
+                        # C++ -> Python copy (O(prompt) on the executor main thread for every disagg generation arrival).
+                        all_tokens = None
+                        q35_admit_timers.note_lean_skip()
+                    if timed:
+                        t1 = q35_admit_timers.now()
+                        q35_admit_timers.add("kvcm.get_tokens", t1 - t0)
+                    # Last token cannot be recovered, so we don't include it in
+                    # the input tokens to look up for the block that can be reused.
+                    if self.enable_block_reuse:
+                        tokens = self._augment_tokens_for_block_reuse(
+                            all_tokens, req, end=len(all_tokens) - 1
+                        )
+                    else:
+                        tokens = None
+                # Taken from the augmented sequence rather than derived as
+                # prompt_len - 1, because augmentation can change the length
+                # for multimodal requests. Stays None on the
+                # TRTLLM_Q35_CTX_LEAN_TOKENS>=3 from-request path (the binding
+                # reads the tokens itself), which skips the branch-point record.
+                num_lookup_tokens = len(tokens) if tokens is not None else None
+                if timed:
+                    t1 = q35_admit_timers.now()
                 kv_cache = self._create_kv_cache(
                     req.py_request_id,
                     req.lora_task_id,
@@ -2329,7 +2384,10 @@ class KVCacheManagerV2(BaseResourceManager):
                     cache_salt=req.cache_salt,
                     is_dummy=req.is_dummy,
                     expected_prompt_length=req.prompt_len - 1,
+                    from_request=from_request,
                 )
+                if timed:
+                    q35_admit_timers.add("kvcm.create_kv_cache", q35_admit_timers.now() - t1)
                 if kv_cache is None:
                     return False
                 kv_cache.cuda_stream = self._stream.cuda_stream
@@ -2341,11 +2399,17 @@ class KVCacheManagerV2(BaseResourceManager):
                 req.set_prepopulated_prompt_len(
                     kv_cache.num_committed_tokens, self.tokens_per_block
                 )
+                self._record_branch_snapshot_point(req, kv_cache, num_lookup_tokens, tokens)
 
             if req.is_disagg_generation_init_state:
                 # Disagg generation receives prompt KV from the context worker;
                 # scratch blocks are only valid for local prefill chunks.
                 kv_cache.enable_swa_scratch_reuse = False
+            if q35_admit_timers.ENABLED:
+                t2 = q35_admit_timers.now()
+                ok = self._resume_and_restore(req.py_request_id, kv_cache)
+                q35_admit_timers.add("kvcm.resume_and_restore", q35_admit_timers.now() - t2)
+                return ok
             return self._resume_and_restore(req.py_request_id, kv_cache)
         else:
             # Subsequent chunk: cache must exist from first chunk.
@@ -2403,7 +2467,13 @@ class KVCacheManagerV2(BaseResourceManager):
         capacity = max(kv_cache.capacity, target)
         pre_cap = kv_cache.capacity
 
-        success = kv_cache.resize(capacity, req.prompt_len)
+        if q35_admit_timers.ENABLED:
+            t0 = q35_admit_timers.now()
+            success = kv_cache.resize(capacity, req.prompt_len)
+            q35_admit_timers.add("kvcm.disagg_resize", q35_admit_timers.now() - t0)
+            q35_admit_timers.add("prompt_tokens", 0.0, req.prompt_len)
+        else:
+            success = kv_cache.resize(capacity, req.prompt_len)
         if not success:
             if req.is_first_context_chunk:
                 kv_cache.suspend()
@@ -2538,6 +2608,62 @@ class KVCacheManagerV2(BaseResourceManager):
                         f"Draft KV cache generation resize failed for request "
                         f"{req.py_request_id}: could not resize to {new_cap} tokens"
                     )
+
+    @staticmethod
+    def _q35_is_text_only(req: LlmRequest) -> bool:
+        # The condition under which _augment_tokens_for_block_reuse returns the plain slice.
+        return (
+            req.multimodal_hashes is None
+            or req.multimodal_positions is None
+            or req.multimodal_lengths is None
+        )
+
+    def _q35_can_create_from_request(self, req: LlmRequest) -> bool:
+        """TRTLLM_Q35_CTX_LEAN_TOKENS=3: the lookup can read the prompt in C++ (needs the libs that have
+        KVCacheManager.create_kv_cache_for_request; otherwise the =1 path runs)."""
+        return (
+            self.enable_block_reuse
+            and self._q35_is_text_only(req)
+            and hasattr(self.impl, "create_kv_cache_for_request")
+        )
+
+    def _q35_lookup_tokens(self, req: LlmRequest) -> Optional[List[int]]:
+        """TRTLLM_Q35_CTX_LEAN_TOKENS: the first context chunk's block-reuse lookup tokens (the prompt without its
+        last token), or None for the generic path (block reuse off, multimodal). Takes the request's intake list
+        (py_q35_prompt_tokens, private to this request) and drops its last token in place; without it, fetches the
+        prefix with get_tokens_range instead of get_tokens(0) plus a slice."""
+        if not self.enable_block_reuse or not self._q35_is_text_only(req):
+            return None
+        num_tokens = req.get_num_tokens(DEFAULT_BEAM_INDEX)
+        tokens = getattr(req, "py_q35_prompt_tokens", None)
+        if tokens is not None:
+            req.py_q35_prompt_tokens = None
+            if (
+                num_tokens > 0
+                and len(tokens) == num_tokens
+                and tokens[-1] == req.get_token(DEFAULT_BEAM_INDEX, num_tokens - 1)
+            ):
+                tokens.pop()
+            else:
+                tokens = None
+        if tokens is None:
+            tokens = req.get_tokens_range(DEFAULT_BEAM_INDEX, 0, num_tokens - 1)
+        if _Q35_CTX_LEAN_TOKENS >= 2:
+            expected = req.get_tokens(DEFAULT_BEAM_INDEX)[: num_tokens - 1]
+            if tokens != expected:
+                raise RuntimeError(
+                    f"TRTLLM_Q35_CTX_LEAN_TOKENS: lookup tokens of request {req.py_request_id} differ from "
+                    f"get_tokens(0)[:-1] ({len(tokens)} vs {len(expected)} tokens)"
+                )
+        return tokens
+
+    def _tokens_for_block_reuse(self, req: LlmRequest, start: int, end: int) -> Sequence[TokenIdExt]:
+        """Beam-0 tokens [start, end) as the radix tree keys them (block commits)."""
+        if _Q35_CTX_LEAN_TOKENS and self._q35_is_text_only(req):
+            return req.get_tokens_range(DEFAULT_BEAM_INDEX, start, end)
+        return self._augment_tokens_for_block_reuse(
+            req.get_tokens(DEFAULT_BEAM_INDEX), req, start=start, end=end
+        )
 
     def _augment_tokens_for_block_reuse(
         self, tokens: Sequence[int], req: LlmRequest, start: int = 0, end: int | None = None
@@ -3192,11 +3318,8 @@ class KVCacheManagerV2(BaseResourceManager):
             return
 
         if request.context_current_position > kv_cache.num_committed_tokens:
-            tokens = self._augment_tokens_for_block_reuse(
-                request.get_tokens(DEFAULT_BEAM_INDEX),
-                request,
-                start=kv_cache.num_committed_tokens,
-                end=request.context_current_position,
+            tokens = self._tokens_for_block_reuse(
+                request, kv_cache.num_committed_tokens, request.context_current_position
             )
             # TODO: On a disaggregated prefill server, pass is_end=True for
             # the last context chunk to improve performance.
@@ -3660,7 +3783,10 @@ class KVCacheManagerV2(BaseResourceManager):
         cache_salt: str | None = None,
         is_dummy: bool = False,
         expected_prompt_length: int | None = None,
+        from_request: LlmRequest | None = None,
     ):
+        """from_request (TRTLLM_Q35_CTX_LEAN_TOKENS=3): look up the request's prompt without its last token,
+        read by the C++ binding from the request itself; input_tokens is then unused."""
         assert request_id not in self.kv_cache_map, (
             f"KV cache for request {request_id} already exists"
         )
@@ -3675,12 +3801,21 @@ class KVCacheManagerV2(BaseResourceManager):
             )
             return None
         salt_int = self._derive_reuse_salt(cache_salt)
-        kv_cache = self.impl.create_kv_cache(
-            ReuseScope(lora_id=lora_task_id, salt=salt_int),
-            input_tokens,
-            id=request_id,
-            expected_prompt_length=expected_prompt_length,
-        )
+        if from_request is not None:
+            kv_cache = self.impl.create_kv_cache_for_request(
+                ReuseScope(lora_id=lora_task_id, salt=salt_int),
+                from_request,
+                from_request.get_num_tokens(DEFAULT_BEAM_INDEX) - 1,
+                id=request_id,
+                expected_prompt_length=expected_prompt_length,
+            )
+        else:
+            kv_cache = self.impl.create_kv_cache(
+                ReuseScope(lora_id=lora_task_id, salt=salt_int),
+                input_tokens,
+                id=request_id,
+                expected_prompt_length=expected_prompt_length,
+            )
         self.kv_cache_map[request_id] = kv_cache
         if is_dummy:
             self.impl.mark_stats_excluded(request_id)

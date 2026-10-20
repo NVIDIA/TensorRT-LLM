@@ -16,6 +16,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import functools
+import os
+
 import torch
 import triton
 import triton.language as tl
@@ -127,6 +130,43 @@ _MULTIROW_ROWS = 4
 _MULTIROW_NUM_WARPS = 4
 _MULTIROW_MAX_N = 256
 
+# Qwen3.5 low-latency switch (default off). TRTLLM_Q35_GDN_NORM_PDL=1: launch the GDN token-major gated RMSNorm as a
+# PDL dependent (port of the layernorm_gated part of upstream 3933f62170): the norm weight is read before
+# griddepcontrol.wait (it is not produced in-step), X and Z only after it, and dependents are released after the
+# output store. Only used when the grid cannot fill the GPU by itself.
+_Q35_GDN_NORM_PDL = os.environ.get("TRTLLM_Q35_GDN_NORM_PDL", "0") == "1"
+# TRTLLM_Q35_PDL_EARLY_TRIGGER=1: release the dependents (out_proj) at kernel entry instead of after the store, so a
+# PDL-launched GEMM can prefetch its weights while the norm runs (it reads Y only after its griddepcontrol.wait).
+_Q35_PDL_EARLY_TRIGGER = os.environ.get("TRTLLM_Q35_PDL_EARLY_TRIGGER", "0") == "1"
+
+
+@functools.lru_cache(maxsize=None)
+def _pdl_device_policy(device_index: int) -> tuple:
+    props = torch.cuda.get_device_properties(device_index)
+    allowed = (props.major * 10 + props.minor >= 90
+               and os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1")
+    return allowed, props.multi_processor_count
+
+
+def _multirow_pdl(grid_size: int, device_index: int) -> bool:
+    if not _Q35_GDN_NORM_PDL:
+        return False
+    allowed, num_sms = _pdl_device_policy(device_index)
+    return allowed and grid_size < num_sms
+
+
+@triton.jit
+def _gdc_wait_with_memory_clobber():
+    # griddepcontrol.wait with a memory clobber so that the compiler cannot hoist dependent loads above the wait.
+    tl.inline_asm_elementwise(
+        "griddepcontrol.wait; // dummy $0",
+        "=r,~{memory}",
+        [],
+        dtype=tl.int32,
+        is_pure=False,
+        pack=1,
+    )
+
 
 @triton.heuristics({"OUTPUT_FP8": lambda args: args["FP8_SCALE"] is not None})
 @triton.heuristics({"SAVE_RSTD": lambda args: args["Rstd"] is not None})
@@ -148,6 +188,8 @@ def _rms_norm_gated_fwd_multirow_kernel(
     HEADS_PER_TOK: tl.constexpr,
     SAVE_RSTD: tl.constexpr,
     OUTPUT_FP8: tl.constexpr,
+    LAUNCH_WITH_PDL: tl.constexpr = False,
+    EARLY_TRIGGER: tl.constexpr = False,
 ):
     """rmsnorm(x) * silu(z), several short rows per program.
 
@@ -162,13 +204,21 @@ def _rms_norm_gated_fwd_multirow_kernel(
     row_mask = rows < M
     cols = tl.arange(0, N)
     mask2d = row_mask[:, None]
+    if EARLY_TRIGGER:
+        tl.extra.cuda.gdc_launch_dependents()
+    if LAUNCH_WITH_PDL:
+        # The weight is a parameter (not produced in-step): safe to fetch before the wait. X (the producer's output)
+        # and Z (an earlier in-step kernel's output) are read only after griddepcontrol.wait.
+        w = tl.load(W + cols).to(tl.float32)
+        _gdc_wait_with_memory_clobber()
     x_off = rows[:, None].to(tl.int64) * stride_x_row + cols[None, :]
     x = tl.load(X + x_off, mask=mask2d, other=0.0).to(tl.float32)
     var = tl.sum(x * x, axis=1) / N
     rstd = 1.0 / tl.sqrt(var + eps)
     if SAVE_RSTD:
         tl.store(Rstd + rows, rstd, mask=row_mask)
-    w = tl.load(W + cols).to(tl.float32)
+    if not LAUNCH_WITH_PDL:
+        w = tl.load(W + cols).to(tl.float32)
     y = x * rstd[:, None] * w[None, :]
     tok = rows // HEADS_PER_TOK
     head = rows % HEADS_PER_TOK
@@ -184,6 +234,9 @@ def _rms_norm_gated_fwd_multirow_kernel(
         y *= tldevice.rcp_rn(tl.load(FP8_SCALE).to(tl.float32))
     y_off = rows[:, None].to(tl.int64) * stride_y_row + cols[None, :]
     tl.store(Y + y_off, y.to(Y.dtype.element_ty), mask=mask2d)
+    if LAUNCH_WITH_PDL and not EARLY_TRIGGER:
+        # Release dependents only after Y (and Rstd) are stored.
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 def _multirow_gated_rmsnorm_eligible(N, ngroups, bias, z, norm_before_gate,
@@ -233,9 +286,13 @@ def rms_norm_gated_token_major(
         return y
     out_dtype = torch.float8_e4m3fn if fp8_scale is not None else x.dtype
     out = torch.empty_like(x, dtype=out_dtype)
-    grid = (triton.cdiv(M, _MULTIROW_ROWS), )
+    grid_size = triton.cdiv(M, _MULTIROW_ROWS)
+    launch_with_pdl = _multirow_pdl(grid_size, x.device.index)
+    pdl_kwargs = dict(LAUNCH_WITH_PDL=True, launch_pdl=True) if launch_with_pdl else {}
+    if _Q35_PDL_EARLY_TRIGGER:
+        pdl_kwargs["EARLY_TRIGGER"] = True
     with torch.cuda.device(x.device.index):
-        _rms_norm_gated_fwd_multirow_kernel[grid](
+        _rms_norm_gated_fwd_multirow_kernel[(grid_size, )](
             x,
             out,
             weight,
@@ -251,6 +308,7 @@ def rms_norm_gated_token_major(
             ROWS=_MULTIROW_ROWS,
             HEADS_PER_TOK=heads,
             num_warps=_MULTIROW_NUM_WARPS,
+            **pdl_kwargs,
         )
     return out
 

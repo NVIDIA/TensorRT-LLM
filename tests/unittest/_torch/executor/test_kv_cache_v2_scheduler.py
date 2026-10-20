@@ -18,6 +18,7 @@ All KVCacheManagerV2, LlmRequest, and PeftCacheManager objects are mocked.
 No GPU required.
 """
 
+import os
 from unittest.mock import Mock, patch
 
 import pytest
@@ -2579,3 +2580,161 @@ class TestMultimodalAwareChunkingV2:
         out = sched.schedule_request([req], set())
         assert ids(out.context_requests) == []
         assert resize_calls == []  # SKIP path: no commit to KV cache
+
+
+# ===========================================================================
+# Shortest-first context order and its starvation guard
+# (TRTLLM_CTX_SCHED_SRPT, TRTLLM_CTX_SCHED_SRPT_AGE_S, TRTLLM_CTX_SCHED_SRPT_AGE_CAP)
+# ===========================================================================
+
+
+class TestShortestFirstAging:
+    BUDGET = 8192
+    SRPT = {"TRTLLM_CTX_SCHED_SRPT": "1"}
+    AGED = {"TRTLLM_CTX_SCHED_SRPT": "1", "TRTLLM_CTX_SCHED_SRPT_AGE_S": "8"}
+    KEYS = ("TRTLLM_CTX_SCHED_SRPT", "TRTLLM_CTX_SCHED_SRPT_AGE_S", "TRTLLM_CTX_SCHED_SRPT_AGE_CAP")
+
+    def _make_sched(self, env, max_batch_size=100, policy=None):
+        """Scheduler with an 8192-token budget, 64-token chunk units and a fake clock at t=100 s."""
+        mgr = make_kv_cache_manager(tokens_per_block=64)
+        mgr.q35_inforward_rows = 0
+        with patch.dict(os.environ, env):
+            for key in self.KEYS:
+                if key not in env:
+                    os.environ.pop(key, None)
+            sched = make_scheduler(
+                mgr,
+                max_batch_size=max_batch_size,
+                max_num_tokens=self.BUDGET,
+                ctx_chunk_config=(policy, 64),
+            )
+        now = [100.0]
+        sched._clock = lambda: now[0]
+        return sched, now
+
+    @staticmethod
+    def _seen_at(req, t):
+        req.py_ctx_sched_since = float(t)
+        return req
+
+    @staticmethod
+    def _shorts(first_id, n=4, length=2100):
+        return [
+            make_ctx_request(i, context_remaining_length=length)
+            for i in range(first_id, first_id + n)
+        ]
+
+    def test_off_by_default(self):
+        sched, _ = self._make_sched(self.SRPT)
+        assert sched._ctx_age_s == 0.0
+
+    def test_needs_shortest_first(self):
+        sched, _ = self._make_sched({"TRTLLM_CTX_SCHED_SRPT_AGE_S": "8"})
+        assert sched._ctx_age_s == 0.0
+
+    def test_needs_chunking(self):
+        mgr = make_kv_cache_manager(tokens_per_block=64)
+        with patch.dict(os.environ, self.AGED):
+            sched = make_scheduler(mgr, max_num_tokens=self.BUDGET)
+        assert sched._ctx_age_s == 0.0
+
+    def test_cap_must_be_positive(self):
+        with pytest.raises(ValueError):
+            self._make_sched({**self.AGED, "TRTLLM_CTX_SCHED_SRPT_AGE_CAP": "0"})
+
+    def test_shortest_first_order(self):
+        sched, _ = self._make_sched(self.SRPT)
+        long = make_ctx_request(0, context_remaining_length=50000)
+        short = make_ctx_request(1, context_remaining_length=3000)
+        out = sched.schedule_request([long, short], set())
+        assert sorted(ids(out.context_requests)) == [0, 1]
+        assert short.context_chunk_size == 3000
+        assert long.context_chunk_size == 5184  # (8192 - 3000) // 64 * 64
+
+    def test_plain_shortest_first_starves_old_request(self):
+        sched, _ = self._make_sched(self.SRPT)
+        long = self._seen_at(make_ctx_request(0, context_remaining_length=50000), 0)
+        out = sched.schedule_request([long] + self._shorts(1), set())
+        # 3 x 2100 + 1856 leave 36 tokens: less than one 64-token unit for the long prefill.
+        assert 0 not in ids(out.context_requests)
+
+    def test_aged_request_takes_capped_share_first(self):
+        sched, _ = self._make_sched(self.AGED)
+        long = self._seen_at(make_ctx_request(0, context_remaining_length=50000), 0)
+        shorts = self._shorts(1)
+        out = sched.schedule_request([long] + shorts, set())
+        assert sorted(ids(out.context_requests)) == [0, 1, 2, 3]
+        # 2048 held for the aged request; the shorts fill 8192 - 2048 = 6144 shortest-first.
+        assert [s.context_chunk_size for s in shorts[:3]] == [2100, 2100, 1920]
+        assert long.context_chunk_size == 2048
+
+    def test_custom_cap(self):
+        sched, _ = self._make_sched({**self.AGED, "TRTLLM_CTX_SCHED_SRPT_AGE_CAP": "1024"})
+        long = self._seen_at(make_ctx_request(0, context_remaining_length=50000), 0)
+        shorts = self._shorts(1)
+        sched.schedule_request([long] + shorts, set())
+        assert long.context_chunk_size == 1024
+        assert [s.context_chunk_size for s in shorts] == [2100, 2100, 2100, 832]
+
+    def test_aged_request_gets_leftover(self):
+        sched, _ = self._make_sched(self.AGED)
+        long = self._seen_at(make_ctx_request(0, context_remaining_length=50000), 0)
+        short = make_ctx_request(1, context_remaining_length=1000)
+        sched.schedule_request([long, short], set())
+        assert short.context_chunk_size == 1000
+        # 2048 + the 5144 the short request left, in 64-token units.
+        assert long.context_chunk_size == 7168
+
+    def test_aged_requests_oldest_first(self):
+        sched, _ = self._make_sched(self.AGED)
+        younger = self._seen_at(make_ctx_request(0, context_remaining_length=30000), 50)
+        older = self._seen_at(make_ctx_request(1, context_remaining_length=60000), 10)
+        short = make_ctx_request(2, context_remaining_length=1000)
+        sched.schedule_request([younger, older, short], set())
+        assert short.context_chunk_size == 1000
+        # Both hold 2048; the 3096 left by the short request goes to the older one first.
+        assert older.context_chunk_size == 5120
+        assert younger.context_chunk_size == 2048
+
+    def test_aged_request_holds_only_what_it_needs(self):
+        sched, _ = self._make_sched(self.AGED)
+        tail = self._seen_at(make_ctx_request(0, context_remaining_length=500), 0)
+        shorts = self._shorts(1)
+        sched.schedule_request([tail] + shorts, set())
+        assert tail.context_chunk_size == 500
+        assert [s.context_chunk_size for s in shorts] == [2100, 2100, 2100, 1344]
+
+    def test_wait_counts_from_first_sight(self):
+        sched, now = self._make_sched(self.AGED)
+        long = make_ctx_request(0, context_remaining_length=50000)
+        sched.schedule_request([long] + self._shorts(1), set())
+        assert long.py_ctx_sched_since == 100.0
+        now[0] = 108.0  # waited exactly the limit: not aged yet
+        out = sched.schedule_request([long] + self._shorts(11), set())
+        assert 0 not in ids(out.context_requests)
+        now[0] = 108.5
+        out = sched.schedule_request([long] + self._shorts(21), set())
+        assert 0 in ids(out.context_requests)
+        assert long.context_chunk_size == 2048
+
+    def test_lone_aged_request_takes_whole_budget(self):
+        sched, _ = self._make_sched(self.AGED)
+        long = self._seen_at(make_ctx_request(0, context_remaining_length=50000), 0)
+        sched.schedule_request([long], set())
+        assert long.context_chunk_size == 8192
+
+    def test_aged_request_keeps_a_request_slot(self):
+        sched, _ = self._make_sched(self.AGED, max_batch_size=2)
+        long = self._seen_at(make_ctx_request(0, context_remaining_length=50000), 0)
+        out = sched.schedule_request([long] + self._shorts(1, n=3, length=500), set())
+        assert sorted(ids(out.context_requests)) == [0, 1]
+        assert long.context_chunk_size == 7680  # 8192 - 500, in 64-token units
+
+    def test_force_chunk_stops_at_cap_before_snapshot_point(self):
+        sched, _ = self._make_sched(self.AGED, policy=ContextChunkingPolicy.FORCE_CHUNK)
+        long = self._seen_at(make_ctx_request(0, context_remaining_length=50000), 0)
+        long.expect_snapshot_points = [49998]
+        shorts = self._shorts(1)
+        sched.schedule_request([long] + shorts, set())
+        assert long.context_chunk_size == 2048
+        assert [s.context_chunk_size for s in shorts[:3]] == [2100, 2100, 1920]

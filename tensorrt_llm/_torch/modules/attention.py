@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import math
+import os
 import weakref
 from typing import List, Optional, Tuple, Union
 
@@ -23,6 +24,8 @@ from ..distributed import (AllReduceParams, HelixAllToAllNative, alltoall_helix,
                            cp_allgather, reducescatter)
 from ..model_config import ModelConfig
 from ..peft.lora.layer import LoraLayer, LoraModuleType
+from ..pyexecutor.breakable_cuda_graph import (eager_on_graph,
+                                               is_in_breakable_cuda_graph)
 from ..utils import (Fp4QuantizedTensor, get_model_extra_attrs,
                      is_torch_compiling)
 from .linear import (Linear, TensorParallelMode, WeightMode,
@@ -72,6 +75,17 @@ def _(q, attention_mask, layer_idx):
     return create_attn_outputs_impl(q, attention_mask, layer_idx)
 
 
+def _q35_direct_call(fn, *args, **kwargs):
+    return fn(*args, **kwargs)
+
+
+# TRTLLM_Q35_CUSTOM_OP_EAGER=1: run the body of this piecewise-excluded custom op with dynamo's eval-frame hook off.
+# The op executes inside the torch.compile'd region, where every Python frame it creates (backend wrappers, Triton
+# launchers, FlashInfer glue) otherwise goes through dynamo's frame callback.
+_q35_op_call = (torch._dynamo.disable(_q35_direct_call, recursive=True)
+                if os.environ.get("TRTLLM_Q35_CUSTOM_OP_EAGER", "0") == "1" else _q35_direct_call)
+
+
 @torch.library.custom_op("trtllm::attn_custom_op_inplace",
                          mutates_args=("output", "output_sf"))
 def attn_custom_op_inplace(
@@ -99,7 +113,8 @@ def attn_custom_op_inplace(
     ) if attention_mask != CustomAttentionMask.CUSTOM else CustomAttentionMask(
         attention_mask)
     # NVFP4 output cannot be supported by torch compile for TRTLLM backend.
-    attn_layer._attn_impl(
+    _q35_op_call(
+        attn_layer._attn_impl,
         q,
         k,
         v,
@@ -115,6 +130,24 @@ def attn_custom_op_inplace(
         relative_attention_bias=relative_attention_bias,
         relative_attention_max_distance=relative_attention_max_distance,
     )
+
+
+# Under a breakable prefill CUDA graph (TRTLLM_PREFILL_BCG) the attention op runs eagerly between the captured
+# segments; outside a capture the wrapper is a plain call.
+maybe_bcg_attn_custom_op_inplace = eager_on_graph(attn_custom_op_inplace)
+
+
+# Qwen3.5 low-latency switch (default off), see Attention.forward / fmha/q35_segmented.py.
+_Q35_ATTN_SEG_FUSE_GATE = os.environ.get("TRTLLM_Q35_ATTN_SEG_FUSE_GATE", "0") == "1"
+# TRTLLM_Q35_ATTN_CP=1: CP-lite generation attention inside each TP KV group (fmha/q35_cp.py); see
+# FlashInferTrtllmGenFmha.run_generation for the batch-size selection.
+_Q35_ATTN_CP = os.environ.get("TRTLLM_Q35_ATTN_CP", "0") == "1"
+# TRTLLM_Q35_CTX_ATTN_PLAN=1|2: see attention_backend/trtllm.py; here it only caches the layer's quantization constants.
+_Q35_CTX_ATTN_PLAN = os.environ.get("TRTLLM_Q35_CTX_ATTN_PLAN", "0") in ("1", "2")
+# TRTLLM_Q35_ATTN_KV_APPEND=1: the fused qk-norm / RoPE / gate preprocessing of a generation-only step also writes the
+# FP8 query and appends the FP8 K / V (QKNormRoPEAttention.preprocess_qkv); the attention metadata is exposed to it
+# for that call only (_q35_attn_metadata) and the hand-over to the backend (attn.q35_kv_appended) is cleared after it.
+_Q35_ATTN_KV_APPEND = os.environ.get("TRTLLM_Q35_ATTN_KV_APPEND", "0") == "1"
 
 
 def _helix_zero_kv_mask(
@@ -525,8 +558,21 @@ class Attention(nn.Module):
         assert self.num_heads % (tp_size * cp_size) == 0
         self.num_heads = self.num_heads // tp_size
         self.num_heads_tp_cp = self.num_heads // cp_size
+        q35_total_kv_heads = self.num_key_value_heads
         self.num_key_value_heads = (self.num_key_value_heads + tp_size -
                                     1) // tp_size
+        # TRTLLM_Q35_ATTN_CP: the TP ranks that replicate this rank's KV head form the CP-lite group.
+        self.q35_cp_group = None
+        self.q35_cp_rank = 0
+        if (_Q35_ATTN_CP and cp_size == 1 and dp_size == 1
+                and tp_size > q35_total_kv_heads
+                and tp_size % q35_total_kv_heads == 0):
+            rep = tp_size // q35_total_kv_heads
+            kvh = mapping.tp_rank // rep
+            self.q35_cp_group = [
+                mapping.tp_group[kvh * rep + i] for i in range(rep)
+            ]
+            self.q35_cp_rank = mapping.tp_rank % rep
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_key_value_heads * self.head_dim
 
@@ -687,6 +733,15 @@ class Attention(nn.Module):
             attention_chunk_size=self.attention_chunk_size,
             sparse_params=sparse_params,
         )
+        # CP-lite group for the attention backend (TRTLLM_Q35_ATTN_CP); None when not applicable.
+        self.attn.q35_cp_group = self.q35_cp_group
+        self.attn.q35_cp_rank = self.q35_cp_rank
+        self.attn.q35_cp_mapping = (self.mapping
+                                    if self.q35_cp_group is not None else None)
+        # MTP / draft layers sit after the target's num_hidden_layers (per-flag opt-out of the Q35 attention paths).
+        num_hidden_layers = getattr(config.pretrained_config, "num_hidden_layers", None)
+        self.attn.q35_is_mtp = bool(self.layer_idx is not None and num_hidden_layers is not None
+                                    and self.layer_idx >= num_hidden_layers)
 
         self.support_fused_qkv = self.attn.support_fused_qkv()
 
@@ -782,6 +837,17 @@ class Attention(nn.Module):
             'pre_quant_scale') and self.o_proj.pre_quant_scale is not None
 
         return self.has_quant_scale and not self.attn_output_gate and not has_awq_pre_quant_scale and not self.is_marlin_enabled
+
+    def _q35_attn_consts(self) -> Tuple[bool, bool]:
+        """(_use_quantize_output(), FP4 KV cache) of this layer, worked out once (TRTLLM_Q35_CTX_ATTN_PLAN): both
+        depend only on the loaded quantization config, and each call rebuilds a QuantMode to answer them."""
+        consts = self.__dict__.get("_q35_consts")
+        if consts is None:
+            consts = (self._use_quantize_output(), self.quant_config
+                      is not None and
+                      self.quant_config.layer_quant_mode.has_fp4_kv_cache())
+            self._q35_consts = consts
+        return consts
 
     def create_output(self, q: torch.Tensor, attn_metadata: AttentionMetadata,
                       mask_type: str):
@@ -880,14 +946,20 @@ class Attention(nn.Module):
         # not populated yet at this call site.
         out_scale = None
         out_scale_sf = None
-        if self._use_quantize_output() and not has_lora:
+        if _Q35_CTX_ATTN_PLAN:
+            quantize_output, fp4_kv_cache = self._q35_attn_consts()
+        else:
+            quantize_output = self._use_quantize_output()
+            fp4_kv_cache = (self.quant_config is not None
+                            and self.quant_config.layer_quant_mode.
+                            has_fp4_kv_cache())
+        if quantize_output and not has_lora:
             out_scale = self.o_proj.inv_input_scale
             out_scale_sf = self.o_proj.input_scale
 
         kv_scale_orig_quant = None
         kv_scale_quant_orig = None
-        if self.quant_config is not None and self.quant_config.layer_quant_mode.has_fp4_kv_cache(
-        ):
+        if fp4_kv_cache:
             kv_scale_orig_quant = self.qkv_proj.inv_kv_scales
             kv_scale_quant_orig = self.qkv_proj.kv_scales
 
@@ -964,19 +1036,22 @@ class Attention(nn.Module):
                 mrope_position_deltas = mrope_config["mrope_position_deltas"]
 
         # Currently only TRTLLM and FLASHINFER are torch compile compatible backends.
-        # Only enable custom inplace op when torch compiling.
-        use_custom_inplace_op = (self.register_to_config
-                                 and (self.attn_backend == "TRTLLM"
-                                      or self.attn_backend == "FLASHINFER")
-                                 and is_torch_compiling()
-                                 and not self.is_marlin_enabled)
+        # Only enable custom inplace op when torch compiling or inside a breakable prefill CUDA graph.
+        use_custom_inplace_op = (
+            self.register_to_config and
+            (self.attn_backend == "TRTLLM" or self.attn_backend == "FLASHINFER")
+            and (is_torch_compiling() or is_in_breakable_cuda_graph())
+            and not self.is_marlin_enabled)
 
         if use_custom_inplace_op:
             outputs = create_attn_outputs(q, attention_mask, self.layer_idx_str)
             assert len(outputs) == 1 or len(outputs) == 2
             output = outputs[0]
             output_sf = outputs[1] if len(outputs) == 2 else None
-            attn_custom_op_inplace(
+            # torch.compile traces the op itself; the BCG wrapper only runs without it.
+            custom_op = (attn_custom_op_inplace if is_torch_compiling() else
+                         maybe_bcg_attn_custom_op_inplace)
+            custom_op(
                 q,
                 k,
                 v,
@@ -1074,8 +1149,24 @@ class Attention(nn.Module):
             position_ids = self._adjust_position_ids_for_spec_dec(
                 position_ids, attn_metadata)
 
+        q35_kv_append = _Q35_ATTN_KV_APPEND and getattr(
+            self, "_fuse_qk_norm_rope_gate", False)
+        if q35_kv_append:
+            self.attn.q35_kv_appended = None
+            self._q35_attn_metadata = attn_metadata
         q, k, v, gate = self.preprocess_qkv(qkv, position_ids)
+        if q35_kv_append:
+            self._q35_attn_metadata = None
         q, k, v = self.convert_qkv(q, k, v)
+
+        # TRTLLM_Q35_ATTN_SEG_FUSE_GATE: offer the output gate to the backend (segmented generation attention fuses
+        # it into its merge kernel and reports back through q35_gate_applied).
+        q35_offer_gate = (_Q35_ATTN_SEG_FUSE_GATE and self.attn_output_gate
+                          and gate is not None
+                          and self.sparse_attn_hooks is None)
+        if q35_offer_gate:
+            self.attn.q35_pending_gate = gate
+            self.attn.q35_gate_applied = False
 
         if attention_sinks is not None:
             assert self.attn_backend == "TRTLLM", (
@@ -1100,7 +1191,14 @@ class Attention(nn.Module):
             **kwargs,
         )
 
-        if self.attn_output_gate:
+        if q35_kv_append:
+            self.attn.q35_kv_appended = None
+        q35_gate_done = False
+        if q35_offer_gate:
+            q35_gate_done = getattr(self.attn, "q35_gate_applied", False)
+            self.attn.q35_pending_gate = None
+            self.attn.q35_gate_applied = False
+        if self.attn_output_gate and not q35_gate_done:
             attn_output = self.apply_output_gate(attn_output, gate)
 
         if self.sparse_attn_hooks is not None:

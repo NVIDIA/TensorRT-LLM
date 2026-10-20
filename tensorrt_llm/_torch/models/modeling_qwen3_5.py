@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 import re
 from types import SimpleNamespace
 from typing import Dict, List, Literal
@@ -652,6 +653,13 @@ _QWEN3_5_VL_PLACEHOLDER_METADATA = MultimodalPlaceholderMetadata(
 )
 
 
+# Qwen3.5 low-latency switch (default off). TRTLLM_Q35_SKIP_MROPE_COS_SIN=1: do not build the packed mrope cos/sin
+# table in prepare_mrope_config every forward. The Qwen3.5 decoder never reads mrope_config (Qwen3NextModel.forward
+# drops it; the attention applies RoPE in its fused qk-norm/rope/gate kernel from position_ids), so the ~8 graph
+# kernels per target forward are dead work. Position-delta bookkeeping is unchanged.
+_Q35_SKIP_MROPE_COS_SIN = os.environ.get("TRTLLM_Q35_SKIP_MROPE_COS_SIN", "0") == "1"
+
+
 class _Qwen3_5VLModel(Qwen3VLModelBase):
     """Shared VLM wrapper composing the Qwen3 vision encoder with a Qwen3.5
     (Qwen3Next-based) text decoder.
@@ -696,6 +704,14 @@ class _Qwen3_5VLModel(Qwen3VLModelBase):
             "mrope_config.mrope_position_ids",
             "mrope_config.mrope_position_deltas",
         ]
+
+    def prepare_mrope_config(self, multimodal_params, num_generation_requests, position_ids, **kwargs):
+        if _Q35_SKIP_MROPE_COS_SIN:
+            # position_ids=None skips only the cos/sin table (see _Q35_SKIP_MROPE_COS_SIN).
+            position_ids = None
+        return super().prepare_mrope_config(
+            multimodal_params, num_generation_requests, position_ids, **kwargs
+        )
 
     def load_weights(
         self,

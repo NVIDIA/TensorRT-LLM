@@ -15,12 +15,14 @@
 
 import enum
 import os
+import time
 from typing import Optional
 
 from tensorrt_llm.llmapi.llm_args import CapacitySchedulerPolicy, ContextChunkingPolicy
 from tensorrt_llm.logger import logger
 
 from ..llm_request import LlmRequest, LlmRequestState, get_draft_token_length
+from .. import q35_admit_timers
 from .scheduler import (
     RequestList,
     RequestScheduler,
@@ -94,6 +96,16 @@ class BudgetTracker:
         self.num_requests += 1
         if peft_pages > 0:
             self.commit_peft(req, peft_pages)
+
+    def hold(self, num_tokens: int, num_requests: int) -> None:
+        """Set tokens and request slots aside for requests scheduled later in the iteration."""
+        self.num_tokens += num_tokens
+        self.num_requests += num_requests
+
+    def release(self, num_tokens: int, num_requests: int) -> None:
+        """Return what ``hold`` set aside."""
+        self.num_tokens -= num_tokens
+        self.num_requests -= num_requests
 
     def commit_peft(self, req: LlmRequest, peft_pages: int) -> None:
         """Record only PEFT consumption without affecting token/request budgets.
@@ -220,6 +232,54 @@ class KVCacheV2Scheduler(RequestScheduler):
             os.environ.get("TLLM_DISAGG_GEN_PRIORITIZE_FIRST_TOKEN", "0") == "1"
         )
 
+        # Opt-in (default off): schedule context requests with the fewest
+        # remaining prompt tokens first instead of in arrival order. Under FCFS
+        # chunking a long prefill takes the whole token budget for several
+        # iterations and every context request behind it waits, although most
+        # multi-turn requests need only a few new tokens after prefix reuse.
+        # With it, TRTLLM_CTX_SCHED_SRPT_LATENCY_TOKENS=N caps an iteration's
+        # token budget at N while a short request (at most
+        # TRTLLM_CTX_SCHED_SRPT_SHORT_TOKENS remaining, default 4096) is among
+        # several pending ones, so it does not ride along with a full-budget
+        # chunk of a long prefill; a long prefill alone keeps the full budget.
+        # See _order_ctx_shortest_first.
+        self._ctx_shortest_first = os.environ.get("TRTLLM_CTX_SCHED_SRPT", "0") == "1"
+        self._ctx_latency_tokens = int(os.environ.get("TRTLLM_CTX_SCHED_SRPT_LATENCY_TOKENS", "0"))
+        self._ctx_short_tokens = int(os.environ.get("TRTLLM_CTX_SCHED_SRPT_SHORT_TOKENS", "4096"))
+        # TRTLLM_MAMBA_INFORWARD_SNAPSHOT: staging rows left in the batch being scheduled (set per batch).
+        self._q35_infwd_rows_left = 0
+        # Opt-in (default off) starvation guard for shortest-first: a context
+        # request that has waited longer than TRTLLM_CTX_SCHED_SRPT_AGE_S
+        # seconds since this scheduler first saw it is aged. Aged requests go in
+        # arrival order and first take at most TRTLLM_CTX_SCHED_SRPT_AGE_CAP
+        # tokens each (default 2048); the shortest-first fill takes the rest of
+        # the budget, and what it leaves goes back to the aged requests. Without
+        # the cap an aged long prefill would take the whole budget again, which
+        # is the head-of-line blocking shortest-first removes. See _split_aged_ctx.
+        self._ctx_age_s = float(os.environ.get("TRTLLM_CTX_SCHED_SRPT_AGE_S", "0"))
+        self._ctx_age_cap = int(os.environ.get("TRTLLM_CTX_SCHED_SRPT_AGE_CAP", "2048"))
+        if self._ctx_age_s > 0:
+            if not (
+                self._ctx_shortest_first and self.chunking_enabled and max_num_tokens is not None
+            ):
+                logger.warning(
+                    "TRTLLM_CTX_SCHED_SRPT_AGE_S is ignored: it needs TRTLLM_CTX_SCHED_SRPT=1, "
+                    "chunked context and a max_num_tokens budget"
+                )
+                self._ctx_age_s = 0.0
+            elif self._ctx_age_cap <= 0:
+                raise ValueError(
+                    f"TRTLLM_CTX_SCHED_SRPT_AGE_CAP must be positive, got {self._ctx_age_cap}"
+                )
+            else:
+                logger.info(
+                    f"KVCacheV2Scheduler: shortest-first context requests age after "
+                    f"{self._ctx_age_s} s and then take up to {self._ctx_age_cap} tokens "
+                    f"per iteration ahead of the shortest-first fill"
+                )
+        self._ctx_aged_count = 0
+        self._clock = time.monotonic
+
     def schedule_request(
         self, active_requests: RequestList, inflight_request_ids: set[int]
     ) -> SchedulerOutput:
@@ -336,7 +396,12 @@ class KVCacheV2Scheduler(RequestScheduler):
                 if peft_pages is None:
                     break
 
-                action, tokens = self._try_schedule_disagg_gen_init(req, budget)
+                if q35_admit_timers.ENABLED:
+                    _t0 = q35_admit_timers.now()
+                    action, tokens = self._try_schedule_disagg_gen_init(req, budget)
+                    q35_admit_timers.add("sched.disagg_gen_init", q35_admit_timers.now() - _t0)
+                else:
+                    action, tokens = self._try_schedule_disagg_gen_init(req, budget)
                 if action is ScheduleAction.STOP:
                     break
                 if action is ScheduleAction.SKIP:
@@ -379,6 +444,8 @@ class KVCacheV2Scheduler(RequestScheduler):
                 peft_pages = budget.peft_pages_needed(req)
                 if peft_pages is None:
                     break
+                if q35_admit_timers.ENABLED:
+                    _t0 = q35_admit_timers.now()
                 action, tokens, scheduled_beam_width, req_it_end = self._try_schedule_generation(
                     req,
                     budget,
@@ -388,6 +455,8 @@ class KVCacheV2Scheduler(RequestScheduler):
                     evicted,
                     scheduled_beam_width,
                 )
+                if q35_admit_timers.ENABLED:
+                    q35_admit_timers.add("sched.generation", q35_admit_timers.now() - _t0)
                 if action is ScheduleAction.STOP:
                     break
                 if action is ScheduleAction.SKIP:
@@ -400,6 +469,29 @@ class KVCacheV2Scheduler(RequestScheduler):
 
         # --- Phase 2: schedule deferred context / encoder requests ---
         # Generation PEFT pages are now fully committed in the budget.
+        # TRTLLM_MAMBA_INFORWARD_SNAPSHOT: only context-only batches take Mamba snapshots inside the forward.
+        self._q35_infwd_rows_left = (
+            0 if scheduled_gen else getattr(self.kv_cache_manager, "q35_inforward_rows", 0)
+        )
+        if self._ctx_shortest_first and len(pending_ctx) > 1:
+            pending_ctx, ordered = self._order_ctx_shortest_first(pending_ctx)
+            if (
+                ordered
+                and self._ctx_latency_tokens > 0
+                and budget.max_num_tokens is not None
+                and pending_ctx[0].context_remaining_length <= self._ctx_short_tokens
+            ):
+                budget.max_num_tokens = min(
+                    budget.max_num_tokens, budget.num_tokens + self._ctx_latency_tokens
+                )
+        aged_ctx: RequestList = []
+        if self._ctx_age_s > 0:
+            pending_ctx, aged_ctx = self._split_aged_ctx(pending_ctx)
+        # Aged requests are scheduled after the others, but their first shares
+        # and request slots are held back while the others fill the budget.
+        aged_shares = self._aged_ctx_shares(aged_ctx, budget)
+        budget.hold(sum(aged_shares), len(aged_ctx))
+        ctx_stopped = False
         for req in pending_ctx:
             if budget.requests_full:
                 break
@@ -409,11 +501,35 @@ class KVCacheV2Scheduler(RequestScheduler):
             if req.state_value == self._encoder_init_state_value:
                 action, tokens = self._try_schedule_encoder(req, budget)
                 if action is ScheduleAction.STOP:
+                    ctx_stopped = True
                     break
                 scheduled_encoder.append(req)
                 budget.commit(req, tokens, peft_pages)
             else:
                 action, tokens, chunking_flag = self._try_schedule_context(req, budget)
+                if action is ScheduleAction.STOP:
+                    ctx_stopped = True
+                    break
+                if action is ScheduleAction.SKIP:
+                    continue
+                has_chunking = has_chunking or chunking_flag
+                scheduled_ctx.append(req)
+                budget.commit(req, tokens, peft_pages)
+        if aged_ctx:
+            held = sum(aged_shares)
+            budget.release(held, len(aged_ctx))
+            for req, share in zip(aged_ctx, aged_shares):
+                held -= share
+                if ctx_stopped or budget.requests_full:
+                    break
+                peft_pages = budget.peft_pages_needed(req)
+                if peft_pages is None:
+                    continue
+                # Its own share plus what the shortest-first fill left, minus
+                # the shares still held for the aged requests after it.
+                action, tokens, chunking_flag = self._try_schedule_context(
+                    req, budget, token_cap=budget.remaining_tokens - held
+                )
                 if action is ScheduleAction.STOP:
                     break
                 if action is ScheduleAction.SKIP:
@@ -453,6 +569,71 @@ class KVCacheV2Scheduler(RequestScheduler):
             disagg_candidates,
             has_chunking,
         )
+
+    def _order_ctx_shortest_first(self, pending_ctx: RequestList) -> tuple[RequestList, bool]:
+        """Order context requests by remaining prompt tokens, fewest first.
+
+        Returns ``(requests, ordered)``. The sort is stable, so requests with
+        equal remaining length keep their arrival order. A first-chunk
+        request's remaining length is known only after its block-reuse lookup,
+        so it is prepared here first, as _try_schedule_context_* would do when
+        its turn comes (prepare_context is idempotent; a prepared request that
+        does not fit the budget keeps its cache, as when the budget runs out
+        after preparation). A list with encoder requests keeps arrival order.
+        """
+        if any(req.state_value != self._context_init_state_value for req in pending_ctx):
+            return pending_ctx, False
+        for req in pending_ctx:
+            if req.is_first_context_chunk:
+                self.kv_cache_manager.prepare_context(req)
+        return sorted(pending_ctx, key=lambda req: req.context_remaining_length), True
+
+    def _split_aged_ctx(self, pending_ctx: RequestList) -> tuple[RequestList, RequestList]:
+        """Starvation guard for shortest-first (TRTLLM_CTX_SCHED_SRPT_AGE_S).
+
+        Stamps each pending request with the time this scheduler first saw it
+        and returns ``(others, aged)``: ``aged`` holds the requests that have
+        waited longer than the age limit, oldest first, and ``others`` keeps the
+        shortest-first order of the rest. Nothing is split off while only one
+        request is pending or the list holds encoder requests (no shortest-first
+        order then).
+        """
+        now = self._clock()
+        aged = []
+        for req in pending_ctx:
+            since = getattr(req, "py_ctx_sched_since", None)
+            if not isinstance(since, float):
+                req.py_ctx_sched_since = now
+            elif now - since > self._ctx_age_s:
+                aged.append(req)
+        if (
+            not aged
+            or len(pending_ctx) < 2
+            or any(req.state_value != self._context_init_state_value for req in pending_ctx)
+        ):
+            return pending_ctx, []
+        for req in aged:
+            if getattr(req, "py_ctx_aged", None) is not True:
+                req.py_ctx_aged = True
+                self._ctx_aged_count += 1
+                logger.info(
+                    f"Context request {req.py_request_id} aged after "
+                    f"{now - req.py_ctx_sched_since:.1f} s with {req.context_remaining_length} "
+                    f"tokens left ({self._ctx_aged_count} aged so far)"
+                )
+        aged.sort(key=lambda req: req.py_ctx_sched_since)
+        aged_ids = {id(req) for req in aged}
+        return [req for req in pending_ctx if id(req) not in aged_ids], aged
+
+    def _aged_ctx_shares(self, aged_ctx: RequestList, budget: BudgetTracker) -> list[int]:
+        """First share of each aged request: up to the age cap, oldest first, within the budget."""
+        shares = []
+        left = budget.remaining_tokens
+        for req in aged_ctx:
+            share = max(0, min(req.context_remaining_length, self._ctx_age_cap, left))
+            shares.append(share)
+            left -= share
+        return shares
 
     # ---- Per-type scheduling methods ----
 
@@ -505,15 +686,17 @@ class KVCacheV2Scheduler(RequestScheduler):
         return ScheduleAction.SCHEDULED, 0
 
     def _try_schedule_context(
-        self, req: LlmRequest, budget: BudgetTracker
+        self, req: LlmRequest, budget: BudgetTracker, token_cap: Optional[int] = None
     ) -> tuple[ScheduleAction, int, bool]:
         """Try to schedule a context request (chunked or non-chunked).
+
+        *token_cap* limits the chunk below the budget left (chunked only).
 
         Returns ``(action, tokens, chunking_flag)``.  *tokens* and
         *chunking_flag* are meaningful only when *action* is ``SCHEDULED``.
         """
         if self.chunking_enabled:
-            return self._try_schedule_context_chunked(req, budget)
+            return self._try_schedule_context_chunked(req, budget, token_cap)
         return self._try_schedule_context_full(req, budget)
 
     def _try_schedule_context_full(
@@ -566,7 +749,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         return ScheduleAction.SCHEDULED, req_tokens, False
 
     def _try_schedule_context_chunked(
-        self, req: LlmRequest, budget: BudgetTracker
+        self, req: LlmRequest, budget: BudgetTracker, token_cap: Optional[int] = None
     ) -> tuple[ScheduleAction, int, bool]:
         """FCFS interleaved chunking for a single context request.
 
@@ -577,8 +760,16 @@ class KVCacheV2Scheduler(RequestScheduler):
         (needing only ~1 token) to still be scheduled.
         """
         remaining_budget = budget.remaining_tokens
+        if token_cap is not None:
+            # The chunk is sized as if only token_cap tokens were left.
+            remaining_budget = (
+                token_cap if remaining_budget is None else min(remaining_budget, token_cap)
+            )
         pre_prepare_context_remaining = req.context_remaining_length
         force_chunk = self.chunking_policy == ContextChunkingPolicy.FORCE_CHUNK
+        # A mark from an earlier pass whose batch did not run this request must not outlive it.
+        req.py_q35_inforward_snapshot = None
+        q35_point = None
 
         if remaining_budget is not None:
             no_budget = remaining_budget <= 0
@@ -600,6 +791,10 @@ class KVCacheV2Scheduler(RequestScheduler):
             # With no remaining state to snapshot, avoid artificial boundaries.
             chunk_size = _get_forced_context_chunk_size(req)
             budget_context_remaining = context_remaining
+            if self._q35_infwd_rows_left > 0:
+                q35_point = self._q35_inforward_point(req, chunk_size, remaining_budget)
+                if q35_point is not None:
+                    chunk_size = context_remaining
         else:
             budget_context_remaining = (
                 context_remaining
@@ -667,7 +862,35 @@ class KVCacheV2Scheduler(RequestScheduler):
 
         chunking_flag = req.context_chunk_size < req.context_remaining_length
 
+        if q35_point is not None and req.context_chunk_size == context_remaining:
+            req.py_q35_inforward_snapshot = q35_point
+            self._q35_infwd_rows_left -= 1
+
         return ScheduleAction.SCHEDULED, chunk_tokens, chunking_flag
+
+    def _q35_inforward_point(
+        self, req: LlmRequest, chunk_size: int, remaining_budget: Optional[int]
+    ) -> Optional[int]:
+        """The snapshot point P the forced chunk ends at, if the chunk can run through the prompt end instead."""
+        manager = self.kv_cache_manager
+        pos = req.context_current_position
+        point = pos + chunk_size
+        end = req.prompt_len
+        points = req.expect_snapshot_points
+        if not points or point != points[-1] or not point < end:
+            return None
+        if pos + req.context_remaining_length != end:
+            return None
+        if end - point > manager.q35_inforward_max_tail or point - pos < manager.q35_inforward_min_main:
+            return None
+        if remaining_budget is not None and end - pos > remaining_budget:
+            return None
+        if self.max_context_length is not None and end - pos > self.max_context_length:
+            return None
+        mm_data = getattr(req, "py_multimodal_data", None)
+        if isinstance(mm_data, dict) and mm_data.get("mm_bidirectional_blocks", False):
+            return None
+        return point
 
     def _align_chunk_to_mm_block(
         self,

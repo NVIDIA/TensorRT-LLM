@@ -10,7 +10,7 @@ import threading
 import time
 import traceback
 from concurrent.futures import Future, ThreadPoolExecutor
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from enum import IntEnum
 from queue import Queue
 from typing import (TYPE_CHECKING, Callable, Dict, Iterable, List, Optional,
@@ -70,6 +70,7 @@ from .handle_additional_outputs import HandleAdditionalOutputs
 from .handle_logits import HandleLogits
 from .hang_detector import HangDetector, propagate_hard_kill
 from .kv_cache_manager_v2 import KVCacheManagerV2
+from . import q35_admit_timers
 from .kv_cache_stats import append_kv_cache_iteration_stats
 from .kv_cache_transceiver import (KvCacheTransceiver,
                                    is_disagg_inflight_cancel_enabled)
@@ -118,6 +119,31 @@ BENCHMARK_REQ_QUEUES_SIZE_ENV_VAR_NAME = "TLLM_BENCHMARK_REQ_QUEUES_SIZE"
 # Format: comma-separated rank IDs, e.g. "0,1,3", or "all" for all ranks.
 # Default: "0" (only rank 0 prints, matching existing behavior).
 PROFILE_LOG_RANKS_ENV_VAR_NAME = "TLLM_PROFILE_LOG_RANKS"
+
+# TRTLLM_DISAGG_GEN_EMIT_FIRST_STEP=1: also stream the first GEN step of a generation-only request (see
+# _handle_responses); otherwise its first streamed content waits for decoding iteration stream_interval.
+DISAGG_GEN_EMIT_FIRST_STEP_ENV_VAR_NAME = "TRTLLM_DISAGG_GEN_EMIT_FIRST_STEP"
+# With "1", the overlap loop of a speculative-decoding executor runs with
+# ``execution_stream``, the stream every forward runs on, as its current stream.
+# The sampler's work and the next step's input preparation then follow each
+# forward in stream order instead of across two cross-stream waits per step (the
+# current stream waits for the forward after it, the forward for the current
+# stream before the next). The order of the work does not change: everything
+# the loop issues on its current stream already runs between two consecutive
+# forwards.
+OVERLAP_ON_EXECUTION_STREAM_ENV_VAR_NAME = (
+    "TRTLLM_OVERLAP_LOOP_ON_EXECUTION_STREAM")
+# Iteration log: refresh kv_cache_util only every N iterations (see _profiler).
+LEAN_ITER_LOG_ENV_VAR_NAME = "TRTLLM_Q35_LEAN_ITER_LOG"
+# Iteration log: print every N-th iteration only (see _profiler).
+ITER_LOG_EVERY_ENV_VAR_NAME = "TRTLLM_Q35_ITER_LOG_EVERY"
+# Disagg idle-progress votes in one raw collective (_q35_merged_disagg_votes).
+MERGED_DISAGG_VOTES_ENV_VAR_NAME = "TRTLLM_Q35_DISAGG_MERGED_VOTES"
+# TRTLLM_Q35_CACHED_STREAM_EVENTS=1: _forward_step orders the execution stream after the current
+# stream and back with two CUDA events created once and re-recorded every step, instead of
+# Stream.wait_stream (which creates, and later destroys, a new event per call). A stream wait
+# captures the event's record at the time of the wait, so re-recording later is harmless.
+CACHED_STREAM_EVENTS_ENV_VAR_NAME = "TRTLLM_Q35_CACHED_STREAM_EVENTS"
 
 
 class PPCommTag(IntEnum):
@@ -601,6 +627,8 @@ class PyExecutor:
         self.disable_overlap_scheduler = disable_overlap_scheduler
         self.enable_kv_pool_rebalance = enable_kv_pool_rebalance
         self.enable_early_first_token_response = enable_early_first_token_response
+        self.disagg_gen_emit_first_step = os.environ.get(
+            DISAGG_GEN_EMIT_FIRST_STEP_ENV_VAR_NAME, "0") == "1"
         self.virtual_memory_pools = virtual_memory_pools
 
         # enqueue and _fetch_new_requests used data
@@ -1240,6 +1268,10 @@ class PyExecutor:
     # Performance metrics methods are in PerfMetricsManager (self.perf_manager)
 
     def _event_loop_wrapper(self):
+        if os.environ.get("TRTLLM_HOST_TIMERS"):
+            # Measurement only (see host_timers.py).
+            from .host_timers import install_host_timers
+            install_host_timers(self)
         try:
             # Skip line profiler during warmup/memory estimation phase to avoid
             # saving incomplete results that would be overwritten anyway
@@ -1708,9 +1740,14 @@ class PyExecutor:
                 torch.profiler.ProfilerActivity.CUDA,
                 torch.profiler.ProfilerActivity.XPU,
             ]
-            torch_profiler = torch.profiler.profile(activities=activities,
-                                                    record_shapes=True,
-                                                    with_modules=True)
+            # TLLM_TORCH_PROFILE_STACK=1: also record Python call stacks
+            # (python_function events) to attribute host time between ops.
+            torch_profiler = torch.profiler.profile(
+                activities=activities,
+                record_shapes=True,
+                with_modules=True,
+                with_stack=os.environ.get("TLLM_TORCH_PROFILE_STACK",
+                                          "0") == "1")
 
         log_ranks_str = os.environ.get(PROFILE_LOG_RANKS_ENV_VAR_NAME, "0")
         if log_ranks_str.strip().lower() == "all":
@@ -1721,6 +1758,19 @@ class PyExecutor:
             log_ranks = {int(r) for r in log_ranks_str.split(",")}
 
         calibrator = get_calibrator()
+
+        # TRTLLM_Q35_LEAN_ITER_LOG=N (N > 1): the iteration log line refreshes
+        # kv_cache_util (a full KvCacheStats build on KV cache manager v2) only
+        # every N-th iteration and reuses the last value in between. Default
+        # off (refreshed every iteration).
+        lean_iter_log_every = int(
+            os.environ.get(LEAN_ITER_LOG_ENV_VAR_NAME, "0") or 0)
+        kv_util_cache = ["N/A", -1]  # [value, iteration it was computed at]
+        # TRTLLM_Q35_ITER_LOG_EVERY=N (N > 1): print the iteration log line of
+        # every N-th iteration only (each line still reports that iteration's
+        # own host / device step). Default 1 (every iteration).
+        iter_log_every = max(
+            1, int(os.environ.get(ITER_LOG_EVERY_ENV_VAR_NAME, "1") or 1))
 
         def profile_step():
             nonlocal it, enabled, start_time, start_event_1, end_event_1, start_event_2, end_event_2, prev_device_step_time
@@ -1774,16 +1824,22 @@ class PyExecutor:
                 self._latest_prev_device_step_time_ms = prev_device_step_time
 
                 if self.print_log and (log_all_ranks
-                                       or self.dist.rank in log_ranks):
+                                       or self.dist.rank in log_ranks) and (
+                                           iter_log_every == 1
+                                           or it % iter_log_every == 0):
                     if prev_device_step_time is None:
                         prev_device_step_time_str = "N/A"  # Handle first iteration
                     else:
                         prev_device_step_time_str = f"{prev_device_step_time}ms"
                     kv_util_str = "N/A"
-                    if self.kv_cache_manager is not None:
+                    if (lean_iter_log_every > 1 and kv_util_cache[1] >= 0
+                            and it - kv_util_cache[1] < lean_iter_log_every):
+                        kv_util_str = kv_util_cache[0]
+                    elif self.kv_cache_manager is not None:
                         kv_stats = self.kv_cache_manager.get_kv_cache_stats()
                         if kv_stats.max_num_blocks > 0:
                             kv_util_str = f"{1.0 - kv_stats.free_num_blocks / kv_stats.max_num_blocks:.3f}"
+                        kv_util_cache[0], kv_util_cache[1] = kv_util_str, it
                     formatted_timestamp = datetime.datetime.now().strftime(
                         "%Y-%m-%d %H:%M:%S")
                     logger.info(
@@ -2271,7 +2327,7 @@ class PyExecutor:
             if item.request is None:
                 continue
             try:
-                token_count = len(item.request.input_token_ids)
+                token_count = item.request.num_input_tokens
             except (AttributeError, TypeError) as e:
                 # Unusual request shape with no usable token payload;
                 # exclude from all queued counters so downstream consumers
@@ -3654,6 +3710,39 @@ class PyExecutor:
                                           op=ReduceOp.MAX)
         return int(local_need_check)
 
+    def _q35_merged_disagg_votes(self, local_need_gen_check: bool,
+                                 local_need_check: bool):
+        """TRTLLM_Q35_DISAGG_MERGED_VOTES=1: both idle-progress votes in one raw
+        MPI Allreduce(MAX) of two int64 instead of two pickled allreduces.
+
+        Only where the world allreduce of the generation vote and the TP
+        allreduce of the context vote span the same ranks (MPIDist, no CP, the
+        TP group is the whole world). The context vote is only used when the
+        generation vote is 0, exactly as with the two separate collectives;
+        reducing it unconditionally is harmless. Returns None when not
+        applicable (the caller keeps the two collectives).
+        """
+        if os.environ.get(MERGED_DISAGG_VOTES_ENV_VAR_NAME, "0") != "1":
+            return None
+        from ..distributed.communicator import MPIDist
+        world = self._dist_size(self.dist, "world_size")
+        if (world <= 1 or not isinstance(self.dist, MPIDist)
+                or self._dist_size(self.dist, "cp_size") > 1
+                or self._dist_size(self.dist, "tp_size") != world):
+            return None
+        import numpy as np
+        from mpi4py import MPI
+
+        from tensorrt_llm._utils import mpi_comm
+        votes = getattr(self, "_q35_vote_bufs", None)
+        if votes is None:
+            votes = self._q35_vote_bufs = (np.zeros(2, dtype=np.int64),
+                                           np.zeros(2, dtype=np.int64))
+        votes[0][0] = int(local_need_gen_check)
+        votes[0][1] = int(local_need_check)
+        mpi_comm().Allreduce(votes[0], votes[1], op=MPI.MAX)
+        return int(votes[1][0]), int(votes[1][1])
+
     def _check_disagg_transfer_progress_when_idle(
             self, num_fitting_reqs: int,
             fitting_disagg_gen_init_requests: List[LlmRequest],
@@ -3671,8 +3760,14 @@ class PyExecutor:
         local_need_gen_check = (local_need_check
                                 and wait_for_disagg_gen_transfer_progress)
 
-        any_need_gen_check = self._sync_disagg_gen_status_entry(
-            local_need_gen_check)
+        merged = self._q35_merged_disagg_votes(local_need_gen_check,
+                                               local_need_check)
+        if merged is not None:
+            any_need_gen_check, merged_need_check = merged
+        else:
+            any_need_gen_check = self._sync_disagg_gen_status_entry(
+                local_need_gen_check)
+            merged_need_check = None
         if any_need_gen_check > 0:
             if local_need_gen_check:
                 logger.debug(
@@ -3681,7 +3776,9 @@ class PyExecutor:
             self._check_disagg_gen_cache_transfer_status(1)
             return
 
-        any_need_check = self._sync_disagg_ctx_status_entry(local_need_check)
+        any_need_check = (merged_need_check if merged_need_check is not None
+                          else self._sync_disagg_ctx_status_entry(
+                              local_need_check))
         if any_need_check > 0:
             if local_need_check and not all_gen_first:
                 logger.warning(
@@ -4595,17 +4692,48 @@ class PyExecutor:
             self.control_action_done.set()
             self.control_request_barrier.clear()
 
+    def _q35_stream_events(self):
+        """The two reusable stream-ordering events of _forward_step, or None (flag off)."""
+        if os.environ.get(CACHED_STREAM_EVENTS_ENV_VAR_NAME, "0") != "1":
+            return None
+        events = getattr(self, "_q35_cached_stream_events", None)
+        if events is None:
+            events = self._q35_cached_stream_events = (torch.cuda.Event(),
+                                                       torch.cuda.Event())
+        return events
+
+    def _q35_forward_on_current_stream(self) -> bool:
+        """True when the overlap loop runs on the execution stream
+        (TRTLLM_OVERLAP_LOOP_ON_EXECUTION_STREAM=1) and the caller's current
+        stream is that stream, i.e. the forward needs no cross-stream ordering."""
+        if os.environ.get(OVERLAP_ON_EXECUTION_STREAM_ENV_VAR_NAME, "0") != "1":
+            return False
+        return torch.cuda.current_stream() == self.execution_stream
+
     def _wait_for_model_engine_input_copy(self):
         wait_for_input_copy = getattr(self.model_engine, "wait_for_input_copy",
                                       None)
         if wait_for_input_copy is not None:
             wait_for_input_copy()
 
+    def _overlap_loop_stream(self):
+        """The current-stream context of the overlap loop.
+
+        ``execution_stream`` for a speculative-decoding executor with
+        ``TRTLLM_OVERLAP_LOOP_ON_EXECUTION_STREAM=1``; otherwise the thread's
+        current stream is left as it is.
+        """
+        if (os.environ.get(OVERLAP_ON_EXECUTION_STREAM_ENV_VAR_NAME, "0") == "1"
+                and self.model_engine.spec_config is not None):
+            return torch.cuda.stream(self.execution_stream)
+        return nullcontext()
+
     def _executor_loop_overlap(self):
         torch.cuda.set_device(self.device_id)
         # ensure the context is created, otherwise, some MPI calls will fail.
         CUASSERT(cudart.cudaSetDevice(self.device_id))
-        with self._profiler() as profile_step, self.hang_detector:
+        with self._profiler() as profile_step, self.hang_detector, \
+                self._overlap_loop_stream():
             iter_start_time = time.time()
             iter_stats = None
             target_inputs = None
@@ -5174,6 +5302,24 @@ class PyExecutor:
             self, waiting_queue: WaitingQueue,
             active_requests: List[LlmRequest]) -> List[LlmRequest]:
         """Fetch new requests and return LlmRequests ready for execution."""
+        # TRTLLM_Q35_SCHED_TIMERS: time the parts of the admission path (q35_admit_timers.py).
+        if q35_admit_timers.ENABLED:
+            t0 = q35_admit_timers.now()
+            q35_admit_timers.begin("fetch")
+            out = []
+            try:
+                out = self._fetch_new_requests_impl(waiting_queue, active_requests)
+                return out
+            finally:
+                q35_admit_timers.end(
+                    "fetch", q35_admit_timers.now() - t0,
+                    f"iter {self.iter_counter}, new {len(out)}, prompt tokens "
+                    f"{sum(getattr(r, 'prompt_len', 0) for r in out)}")
+        return self._fetch_new_requests_impl(waiting_queue, active_requests)
+
+    def _fetch_new_requests_impl(
+            self, waiting_queue: WaitingQueue,
+            active_requests: List[LlmRequest]) -> List[LlmRequest]:
         # 1. Gather rank states and calculate total_num_active_requests
         if self.enable_attention_dp:
             # NOTE: gather_all_rank_states is called here (before step 3)
@@ -5213,13 +5359,21 @@ class PyExecutor:
             all_rank_states = None
 
         # 2. Fetch and enqueue to waiting queue
+        timed = q35_admit_timers.ENABLED
+        if timed:
+            t0 = q35_admit_timers.now()
         self._fetch_and_enqueue_requests(waiting_queue,
                                          total_num_active_requests)
+        if timed:
+            t1 = q35_admit_timers.now()
+            q35_admit_timers.add("fetch_and_enqueue", t1 - t0)
 
         # 3. Pop requests from waiting queue
         new_requests = self._pop_from_waiting_queue(
             waiting_queue, total_num_active_requests,
             all_ranks_num_active_requests)
+        if timed:
+            q35_admit_timers.add("pop_waiting", q35_admit_timers.now() - t1)
 
         # 4. Update performance metrics (before DP scheduling to clear all start_times)
         if self.enable_iter_perf_stats and self.dist.rank == 0:
@@ -5251,12 +5405,17 @@ class PyExecutor:
             new_requests = new_requests_cur_rank
 
         # 7. Merge requests
-        return merge_requests(new_requests,
-                              cp_config=self.dist.cp_config,
-                              cp_rank=self.dist.cp_rank,
-                              cp_size=self.dist.cp_size,
-                              exclude_last_generation_logits=self.
-                              _should_exclude_last_generation_logits())
+        if timed:
+            t0 = q35_admit_timers.now()
+        merged = merge_requests(new_requests,
+                                cp_config=self.dist.cp_config,
+                                cp_rank=self.dist.cp_rank,
+                                cp_size=self.dist.cp_size,
+                                exclude_last_generation_logits=self.
+                                _should_exclude_last_generation_logits())
+        if timed:
+            q35_admit_timers.add("merge_requests", q35_admit_timers.now() - t0, len(merged))
+        return merged
 
     def _handle_special_queue_items(
             self,
@@ -5594,12 +5753,37 @@ class PyExecutor:
 
     @nvtx_range("_schedule")
     def _schedule(self):
-        if hasattr(self.kv_cache_manager, "prepare_expect_snapshot_points"):
-            self.kv_cache_manager.prepare_expect_snapshot_points(
-                self.active_requests)
+        # TRTLLM_Q35_SCHED_TIMERS: time the parts of the admission path (q35_admit_timers.py).
+        if q35_admit_timers.ENABLED:
+            t0 = q35_admit_timers.now()
+            q35_admit_timers.begin("schedule")
+            try:
+                return self._schedule_impl()
+            finally:
+                q35_admit_timers.end(
+                    "schedule", q35_admit_timers.now() - t0,
+                    f"iter {self.iter_counter}, active {len(self.active_requests)}")
+        return self._schedule_impl()
 
-        scheduler_output = self.scheduler.schedule_request(
-            self.active_requests, self.inflight_req_ids)
+    def _schedule_impl(self):
+        if hasattr(self.kv_cache_manager, "prepare_expect_snapshot_points"):
+            if q35_admit_timers.ENABLED:
+                t0 = q35_admit_timers.now()
+                self.kv_cache_manager.prepare_expect_snapshot_points(
+                    self.active_requests)
+                q35_admit_timers.add("snapshot_points", q35_admit_timers.now() - t0)
+            else:
+                self.kv_cache_manager.prepare_expect_snapshot_points(
+                    self.active_requests)
+
+        if q35_admit_timers.ENABLED:
+            t0 = q35_admit_timers.now()
+            scheduler_output = self.scheduler.schedule_request(
+                self.active_requests, self.inflight_req_ids)
+            q35_admit_timers.add("schedule_request", q35_admit_timers.now() - t0)
+        else:
+            scheduler_output = self.scheduler.schedule_request(
+                self.active_requests, self.inflight_req_ids)
 
         scheduled_encoder_requests = scheduler_output.encoder_requests
         should_batch_encoder_requests = (self.is_encoder_decoder
@@ -6302,13 +6486,28 @@ class PyExecutor:
 
         if (not self._enable_dsv4_adp_dummy_fixes
                 or self.kv_cache_transceiver is None):
-            llm_request = self.kv_cache_manager.add_dummy_requests(
-                request_ids=dummy_request_ids,
-                token_nums=token_nums,
-                is_gen=self._adp_dummy_is_gen,
-                prepare_resource=True,
-                max_num_draft_tokens=self.max_total_draft_tokens,
-            )[0]
+            try:
+                dummy_requests = self.kv_cache_manager.add_dummy_requests(
+                    request_ids=dummy_request_ids,
+                    token_nums=token_nums,
+                    is_gen=self._adp_dummy_is_gen,
+                    prepare_resource=True,
+                    max_num_draft_tokens=self.max_total_draft_tokens,
+                )
+            except OutOfPagesError:
+                dummy_requests = None
+            if not dummy_requests:
+                # KV cache manager V2 returns None when its IndexMapper is
+                # saturated or it runs out of pages ("retry next iteration"),
+                # which _has_adp_dummy_kv_capacity() (free tokens only) does
+                # not catch. As in the DeepSeek-V4 path below, this rank
+                # schedules an empty batch and the fleet retries.
+                logger.warning_once(
+                    "Cannot allocate the attention-DP pad dummy; rank "
+                    "schedules an empty batch and the fleet will retry.",
+                    key="attention_dp_dummy_allocation_failed")
+                return
+            llm_request = dummy_requests[0]
             llm_request.is_attention_dp_dummy = True
             spec_resource_manager = self.resource_manager.get_resource_manager(
                 ResourceManagerType.SPEC_RESOURCE_MANAGER)
@@ -6427,6 +6626,16 @@ class PyExecutor:
                     ctx_draft_tokens = [
                         0
                     ] * self.model_engine.max_total_draft_tokens
+                elif (self.model_engine.enable_spec_decode
+                      and len(ctx_draft_tokens)
+                      < self.model_engine.max_total_draft_tokens):
+                    # CTX drafted fewer tokens than this GEN verifies (e.g. a CTX
+                    # with MTP max_draft_len 1 to keep its context iterations
+                    # cheap): pad to the GEN's draft width. Like the dummies
+                    # above, the padding is rejected on verify.
+                    ctx_draft_tokens = list(ctx_draft_tokens) + [0] * (
+                        self.model_engine.max_total_draft_tokens -
+                        len(ctx_draft_tokens))
                 req.py_draft_tokens = [] if ctx_draft_tokens is None else ctx_draft_tokens
                 beam_width = req.py_beam_width
                 if not self._update_sampler_state_for_disagg_gen_request(
@@ -6596,6 +6805,15 @@ class PyExecutor:
 
     @nvtx_range("_send_kv_async")
     def _send_kv_async(self, scheduled_requests: List[LlmRequest]):
+        # TRTLLM_MAMBA_INFORWARD_SNAPSHOT (mamba_cache_manager.py): a context request whose Mamba snapshot was taken
+        # inside the forward gets its end-of-prompt state copied back after this batch's sampler event; the KV
+        # sender reads the cache on its own stream, so that copy has to finish first.
+        if self.kv_cache_transceiver or self.kv_connector_manager:
+            for req in scheduled_requests:
+                restore_event = getattr(req, "py_q35_restore_event", None)
+                if restore_event is not None:
+                    req.py_q35_restore_event = None
+                    restore_event.synchronize()
 
         def kv_connector_request_finished(req: LlmRequest):
             try:
@@ -6834,7 +7052,18 @@ class PyExecutor:
 
             # Run model forward on the execution stream for proper synchronization
             # with KVCacheTransferManager's onboard/offload operations.
-            self.execution_stream.wait_stream(torch.cuda.current_stream())
+            stream_events = self._q35_stream_events()
+            # With the overlap loop on the execution stream the forward already
+            # runs on the current stream: the two stream-ordering record / wait
+            # pairs below order a stream after itself, so they are skipped.
+            same_stream = self._q35_forward_on_current_stream()
+            if same_stream:
+                pass
+            elif stream_events is None:
+                self.execution_stream.wait_stream(torch.cuda.current_stream())
+            else:
+                stream_events[0].record(torch.cuda.current_stream())
+                self.execution_stream.wait_event(stream_events[0])
             self._attach_encoder_output_to_execution_stream(scheduled_requests)
             with torch.cuda.stream(self.execution_stream):
                 outputs = forward(scheduled_requests, self.resource_manager,
@@ -6845,7 +7074,13 @@ class PyExecutor:
 
             # Ensure the default stream waits for execution_stream to complete
             # before downstream operations use the outputs.
-            torch.cuda.current_stream().wait_stream(self.execution_stream)
+            if same_stream:
+                pass
+            elif stream_events is None:
+                torch.cuda.current_stream().wait_stream(self.execution_stream)
+            else:
+                stream_events[1].record(self.execution_stream)
+                torch.cuda.current_stream().wait_event(stream_events[1])
 
             self._kv_connector_wait_for_save()
 
@@ -7424,7 +7659,17 @@ class PyExecutor:
                 request.update_perf_metrics(self.iter_counter)
 
             request_done = False
+            # A generation-only request under the overlap scheduler skipped its
+            # iteration-1 response above (the CTX returned the first token), so
+            # with stream_interval N its first streamed content would wait for
+            # decoding iteration N; TRTLLM_DISAGG_GEN_EMIT_FIRST_STEP=1 streams
+            # its first GEN step as well.
+            first_gen_emit = (self.disagg_gen_emit_first_step
+                              and request.is_generation_only_request()
+                              and not getattr(request, "py_gen_first_emitted",
+                                              False))
             should_emit = (request.py_decoding_iter == 1 or request.is_finished
+                           or first_gen_emit
                            or request.py_decoding_iter % self.stream_interval
                            == 0)
             # The early-emit prototype issues the (non-terminal) iter-1
@@ -7438,6 +7683,8 @@ class PyExecutor:
                     self.perf_manager.compute_batch_gpu_times([request])
                 response = request.create_response(False, self.dist.rank)
                 if response:
+                    if first_gen_emit:
+                        request.py_gen_first_emitted = True
                     request_done = request.is_finished
                     response.result.cached_tokens = request.cached_tokens
                     self._maybe_attach_ctx_usage(request, response)

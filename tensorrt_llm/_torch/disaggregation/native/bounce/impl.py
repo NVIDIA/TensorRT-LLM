@@ -16,6 +16,7 @@
 the contract in core.py. Holds the buffers, the gather and scatter kernels, and the scatter worker,
 and runs the side effects that drive each region's state machine. Never imports transfer.py."""
 
+import os
 import queue
 import threading
 from typing import Callable, Dict, List, Optional
@@ -45,6 +46,12 @@ RidSlice = tuple  # the request id and slice id a region serves
 _MIB = 1024 * 1024
 _SCATTER_POLL_S = 0.5  # how often the scatter worker wakes to re-check the stop flag and reclaim
 _RESERVE_TIMEOUT_S = 0.2  # max wait for a bounce region before falling back to per-fragment
+# The sender waits on a KV transfer worker thread, so it can afford to wait for an earlier write
+# to free its region; the per-fragment fallback is ~18x slower on head-mismatch layouts
+# (attention-DP CTX -> TP GEN).
+_SEND_RESERVE_TIMEOUT_S = float(
+    os.environ.get("TRTLLM_KV_CACHE_BOUNCE_SEND_TIMEOUT_S", "") or _RESERVE_TIMEOUT_S
+)
 _CLOSE_JOIN_S = 2.0  # max wait for the scatter thread to drain on close
 _QUARANTINE_GRACE_S = 60.0  # how long an orphaned region is held out of reuse
 
@@ -204,7 +211,7 @@ class VmmBounceTransport(BounceTransport):
     def build_request(self, write_meta):
         """Gather into a send slot and build the coalesced write, or None on backpressure. The gather
         blocks (and frees the slot on failure) inside _reserve_and_gather."""
-        gathered = self._reserve_and_gather(write_meta, timeout=_RESERVE_TIMEOUT_S)
+        gathered = self._reserve_and_gather(write_meta, timeout=_SEND_RESERVE_TIMEOUT_S)
         if gathered is None:  # backpressure: fall back
             return None
         slot_id, src_addr, total = gathered

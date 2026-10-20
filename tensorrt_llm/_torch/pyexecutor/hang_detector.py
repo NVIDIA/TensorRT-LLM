@@ -17,6 +17,7 @@ import os
 import signal
 import sys
 import threading
+import time
 from contextlib import contextmanager
 from typing import Callable, Optional
 
@@ -25,6 +26,13 @@ from tensorrt_llm.logger import logger
 
 # 137 == 128 + SIGKILL(9): the exit code a shell reports for a SIGKILL'd process.
 _HARD_KILL_EXIT_CODE = 137
+
+# TRTLLM_Q35_HANG_CHECKPOINT_MIN_S=<seconds> (default off): checkpoint() reschedules the hang-detection timer at
+# most once per that many seconds. The executor checkpoints every iteration, and each reschedule cancels a task and
+# submits a new one to the detector's event-loop thread (two wakeups of that thread per decode step, both taking the
+# GIL from the executor thread). A hang is then reported between ``timeout`` and ``timeout`` + the interval after
+# the last progress.
+HANG_CHECKPOINT_MIN_S_ENV = "TRTLLM_Q35_HANG_CHECKPOINT_MIN_S"
 
 
 def _best_effort_flush_streams() -> None:
@@ -101,6 +109,8 @@ class HangDetector:
         self.active = False
         self._detected = False
         self._status_providers: list[Callable[[], str]] = []
+        self._checkpoint_min_s = float(os.environ.get(HANG_CHECKPOINT_MIN_S_ENV, "0") or 0)
+        self._last_checkpoint = 0.0
 
     def start(self):
         """Enable hang detection."""
@@ -154,8 +164,13 @@ class HangDetector:
 
     def checkpoint(self):
         """Reset hang detection timer."""
+        if self._checkpoint_min_s > 0 and self.active and self.task is not None and not self.task.done():
+            now = time.monotonic()
+            if now - self._last_checkpoint < self._checkpoint_min_s:
+                return
         self.cancel_task()
         if self.active:
+            self._last_checkpoint = time.monotonic()
             self.task = asyncio.run_coroutine_threadsafe(self._detect_hang(), self.loop)
 
     def cancel_task(self):

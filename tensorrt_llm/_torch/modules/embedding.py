@@ -1,4 +1,5 @@
 import math
+import os
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -12,6 +13,49 @@ from tensorrt_llm.math_utils import ceil_div
 
 from ..distributed import allgather
 from .linear import Linear, TensorParallelMode
+
+import triton  # noqa: E402
+import triton.language as tl  # noqa: E402
+
+
+@triton.jit
+def _q35_embedding_gather_kernel(ids_ptr, w_ptr, out_ptr, num_embeddings, H: tl.constexpr, BLOCK: tl.constexpr,
+                                 PDL: tl.constexpr):
+    """out[t] = weight[ids[t]] for ids in [0, num_embeddings), zeros otherwise (flashinfer's rejection sampler
+    pads with -1): the non-parallel masked lookup's values in one launch per call."""
+    t = tl.program_id(0)
+    if PDL:
+        tl.inline_asm_elementwise("griddepcontrol.wait; // dummy $0", "=r,~{memory}", [], dtype=tl.int32,
+                                  is_pure=False, pack=1)
+    tok = tl.load(ids_ptr + t).to(tl.int64)
+    ok = (tok >= 0) & (tok < num_embeddings)
+    row = tl.where(ok, tok, 0)
+    for h0 in tl.static_range(0, H, BLOCK):
+        offs = h0 + tl.arange(0, BLOCK)
+        m = offs < H
+        v = tl.load(w_ptr + row * H + offs, mask=m & ok, other=0.0)
+        tl.store(out_ptr + t.to(tl.int64) * H + offs, v, mask=m)
+    if PDL:
+        # PDL rule: release the dependents only after a CTA barrier that follows the last global access (the ids
+        # may live in a block the caching allocator recycles for a dependent's pre-wait write)
+        tl.debug_barrier()
+        tl.extra.cuda.gdc_launch_dependents()
+
+
+def q35_embedding_gather(input: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """One-launch lookup of a full (non-parallel) table, bitwise the masked F.embedding path."""
+    ids = input.reshape(-1)
+    if not ids.is_contiguous():
+        ids = ids.contiguous()
+    num_embeddings, hidden = weight.shape
+    out = torch.empty((ids.numel(), hidden), dtype=weight.dtype, device=weight.device)
+    if ids.numel() > 0:
+        from ..flashinfer_utils import get_env_enable_pdl
+        pdl = get_env_enable_pdl()
+        block = min(triton.next_power_of_2(hidden), 8192)
+        _q35_embedding_gather_kernel[(ids.numel(), )](ids, weight, out, num_embeddings, H=hidden, BLOCK=block,
+                                                       PDL=pdl, num_warps=4, launch_pdl=pdl)
+    return out.view(*input.shape, hidden)
 
 
 class LMHead(Linear):
@@ -228,6 +272,14 @@ def pre_comm_embedding_ops(
     return output
 
 
+# TRTLLM_EMBED_COMPILE_ONCE=1 (default off): outside torch.compile tracing, a tensor-parallel Embedding builds the
+# torch.compile wrapper of its pre-communication ops once per module instead of on every call. Every torch.compile()
+# call constructs an Inductor backend wrapper that deep-copies the Inductor config, also with disable=True, where the
+# result is the plain function; eagerly run embeddings (e.g. the Qwen3.5 MTP draft layer on a CTX worker) paid that in
+# every forward. Traced calls keep the original code, so compiled graphs are unchanged.
+_EMBED_COMPILE_ONCE = os.environ.get("TRTLLM_EMBED_COMPILE_ONCE", "0") == "1"
+
+
 def embedding_skip_forward_impl(input: torch.Tensor, embedding_dim: int,
                                 dtype: torch.dtype) -> torch.Tensor:
     output_shape = input.shape[:] + (embedding_dim, )
@@ -293,8 +345,23 @@ class Embedding(LMHead):
             self.vocab_start_index = 0
             self.vocab_end_index = num_embeddings
 
-    def forward(self, input):
-        if self.tp_size > 1:
+    def forward(self, input, all_reduce_params: Optional[AllReduceParams] = None):
+        """``all_reduce_params`` (COLUMN tensor parallel only): fusion of the vocab-parallel
+        all-reduce with the following RMSNorm (TRTLLM_Q35_AR_NORM_FUSE); the result is then the
+        all-reduce's tuple output. ``q35_gather`` (set by the model on a full, non-parallel table):
+        the masked lookup as one gather launch."""
+        if (self.tp_size == 1 and self.__dict__.get("q35_gather", False) and input.is_cuda
+                and self.weight.dim() == 2 and self.weight.is_contiguous()):
+            return q35_embedding_gather(input, self.weight)
+        if self.tp_size > 1 and _EMBED_COMPILE_ONCE and not torch.compiler.is_compiling():
+            embedding_ops_func = self.__dict__.get("_pre_comm_ops_func")
+            if embedding_ops_func is None:
+                # torch.compile(..., disable=True) returns the function itself
+                embedding_ops_func = (torch.compile(pre_comm_embedding_ops,
+                                                    options={"max-autotune": True})
+                                      if self.enable_torch_compile_for_embedding else pre_comm_embedding_ops)
+                self._pre_comm_ops_func = embedding_ops_func
+        elif self.tp_size > 1:
             # Run the ops before all_reduce/all_gather.
             # We use torch.compile() to fuse the tiny pointwise ops before all_reduce/all_gather for Embedding module.
             embedding_ops_func = torch.compile(
@@ -314,7 +381,8 @@ class Embedding(LMHead):
         if self.tp_size > 1:
             if self.tp_mode == TensorParallelMode.COLUMN:
                 # Reduce across all the model parallel GPUs.
-                output = self.all_reduce(output)
+                output = self.all_reduce(output,
+                                         all_reduce_params=all_reduce_params)
             elif self.tp_mode == TensorParallelMode.ROW:
                 if self.gather_output:
                     # Run allgather.

@@ -74,8 +74,10 @@ from ..speculative.drafting_loops import BaseDraftingLoopWrapper
 from ..speculative.eagle3 import Eagle3ResourceManager, Eagle3SpecMetadata
 from ..speculative.spec_sampler_base import SampleStateTensorsSpec
 from ..utils import (get_model_extra_attrs,
+                     get_per_request_piecewise_cuda_graph_flag,
                      set_per_request_piecewise_cuda_graph_flag,
                      set_torch_compiling, with_model_extra_attrs)
+from .breakable_cuda_graph_runner import BreakableCUDAGraphRunner
 from .config_utils import is_mla
 from .cuda_graph_runner import (ENC_DEC_CUDA_GRAPH_DUMMY_TOKEN_NUM,
                                 CUDAGraphRunner, CUDAGraphRunnerConfig,
@@ -95,6 +97,16 @@ from .sampler import SampleStateTensors
 from .sampler.ops.flashinfer import warmup_sampling_module
 from .scheduler import ScheduledRequests
 from .trace_log_utils import log_mem_snapshot
+
+# TRTLLM_PREFILL_BCG=1: prefill (context) steps replay breakable CUDA graphs (pyexecutor/breakable_cuda_graph,
+# adapted from upstream #16609) instead of torch.compile piecewise CUDA graphs. The model body is captured once per
+# token bucket as CUDA graph segments; the attention and GDN custom ops run eagerly between the segments. Buckets:
+# TRTLLM_PREFILL_BCG_TOKENS (comma list), else torch_compile_config.capture_num_tokens (the config's torch.compile
+# is then not applied). Default off: the piecewise path is unchanged.
+_PREFILL_BCG = os.environ.get("TRTLLM_PREFILL_BCG", "0") == "1"
+_PREFILL_BCG_TOKENS = os.environ.get("TRTLLM_PREFILL_BCG_TOKENS", "")
+_PREFILL_BCG_DEFAULT_TOKENS = [2**i
+                               for i in range(8)] + list(range(256, 3073, 256))
 
 
 def _make_single_token_context_graph_batch(
@@ -646,6 +658,22 @@ class PyTorchModelEngine(ModelEngine):
             torch_compile_piecewise_cuda_graph_num_tokens
             or cuda_graph_batch_sizes or [])
 
+        # TRTLLM_PREFILL_BCG: breakable prefill CUDA graphs replace torch.compile (the capture records the eager
+        # body); the buckets reuse the piecewise bucket list and its filtering.
+        self._prefill_bcg = _PREFILL_BCG
+        if self._prefill_bcg:
+            if getattr(self.llm_args, "lora_config", None) is not None:
+                raise ValueError("TRTLLM_PREFILL_BCG does not support LoRA")
+            if _PREFILL_BCG_TOKENS:
+                piecewise_cuda_graph_num_tokens = [
+                    int(x) for x in _PREFILL_BCG_TOKENS.split(",") if x.strip()
+                ]
+            elif not torch_compile_piecewise_cuda_graph_num_tokens:
+                piecewise_cuda_graph_num_tokens = list(
+                    _PREFILL_BCG_DEFAULT_TOKENS)
+            self._torch_compile_enabled = False
+            self._torch_compile_piecewise_cuda_graph = False
+
         num_extra_decoding_steps = self._get_num_extra_decoding_steps()
         self._piecewise_cuda_graph_num_tokens, unrecordable = (
             _filter_piecewise_capture_num_tokens(
@@ -923,6 +951,23 @@ class PyTorchModelEngine(ModelEngine):
                 enable_encoder_decoder_mixed_cuda_graph),
         )
         self.cuda_graph_runner = CUDAGraphRunner(cuda_graph_runner_config)
+        self.breakable_cuda_graph_runner: Optional[
+            BreakableCUDAGraphRunner] = None
+        self._bcg_stats = {"replay": 0, "eager": 0}
+        if self._prefill_bcg:
+            decoder_model = (self.model if isinstance(
+                self.model, DecoderModelForCausalLM) else getattr(
+                    self.model, "llm", None))
+            if not isinstance(decoder_model, DecoderModelForCausalLM):
+                raise ValueError(
+                    "TRTLLM_PREFILL_BCG requires a decoder model body")
+            self.breakable_cuda_graph_runner = BreakableCUDAGraphRunner(
+                decoder_model.model)
+            logger.info(
+                f"[TRTLLM_PREFILL_BCG] breakable prefill CUDA graphs on "
+                f"{type(decoder_model.model).__name__} for num_tokens="
+                f"{self._piecewise_cuda_graph_num_tokens}; torch.compile is not applied"
+            )
 
         # Initialize CUDA Graph LoRA manager if LoRA is enabled
         self.cuda_graph_lora_manager: Optional[CudaGraphLoraManager] = None
@@ -2043,7 +2088,8 @@ class PyTorchModelEngine(ModelEngine):
     def _run_cuda_graph_warmup(self, resource_manager: ResourceManager):
         """Warm up or capture CUDA graphs for the configured graph shapes."""
         if not (self.cuda_graph_runner.enabled
-                or self._torch_compile_piecewise_cuda_graph):
+                or self._torch_compile_piecewise_cuda_graph
+                or self.breakable_cuda_graph_runner is not None):
             return
 
         self._capture_generation_cuda_graphs(resource_manager)
@@ -2235,10 +2281,17 @@ class PyTorchModelEngine(ModelEngine):
                 request._cached_tokens = cached_tokens
                 request._cached_tokens_set = cached_tokens_set
 
-        def _run_capture_pass(force_non_greedy: bool, label: str) -> None:
+        def _run_capture_pass(force_non_greedy: bool,
+                              label: str,
+                              q35_temperature_only: bool = False) -> None:
             spec_metadata = self.spec_metadata
             if force_non_greedy and spec_metadata is not None:
                 spec_metadata._force_non_greedy_for_capture = True
+                # TRTLLM_Q35_TEMPERATURE_GRAPHS: capture the temperature-only
+                # variant (no top-k / top-p) under its own key bit.
+                spec_metadata._q35_temperature_only_for_capture = (
+                    q35_temperature_only)
+                spec_metadata.q35_temperature_only = q35_temperature_only
                 # maybe_get_cuda_graph reads spec_metadata.is_all_greedy_sample
                 # to build the graph cache key BEFORE populate runs inside
                 # _prepare_inputs. Pre-flip it here so the very first capture
@@ -2284,6 +2337,7 @@ class PyTorchModelEngine(ModelEngine):
             finally:
                 if force_non_greedy and spec_metadata is not None:
                     spec_metadata._force_non_greedy_for_capture = False
+                    spec_metadata._q35_temperature_only_for_capture = False
                     # The base object is not the only holder of the flag: every
                     # graph captured during this pass cached its own SHALLOW COPY
                     # of spec_metadata (create_cuda_graph_metadata -> copy.copy),
@@ -2314,6 +2368,17 @@ class PyTorchModelEngine(ModelEngine):
             and self.spec_config.spec_dec_mode.use_one_engine())
         if needs_non_greedy_capture:
             _run_capture_pass(force_non_greedy=True, label="advanced sampling")
+            # Pass 3 (TRTLLM_Q35_TEMPERATURE_GRAPHS, default off): the
+            # temperature-only variant, so that temperature-only batches replay
+            # the vocabulary-sharded Gumbel-max target sampling (pass 2 records
+            # the stock sampler: its synthetic params enable top-k / top-p).
+            from ..speculative.interface import q35_temperature_graphs_enabled
+            if self.spec_metadata is not None and q35_temperature_graphs_enabled(
+                    self.spec_config, self.mapping):
+                self.spec_metadata.q35_temperature_graphs = True
+                _run_capture_pass(force_non_greedy=True,
+                                  label="q35 temperature-only sampling",
+                                  q35_temperature_only=True)
         # Set the value back to the original value after cuda graph warmups are complete
         self.enable_spec_decode = self.is_spec_decode
         # The advanced-sampling capture pass above leaves is_all_greedy_sample
@@ -2323,6 +2388,7 @@ class PyTorchModelEngine(ModelEngine):
         # iteration; this is a defensive guard.)
         if self.spec_metadata is not None:
             self.spec_metadata.is_all_greedy_sample = True
+            self.spec_metadata.q35_temperature_only = False
 
     def _capture_mixed_encoder_decoder_cuda_graphs(
             self, resource_manager: ResourceManager) -> None:
@@ -2447,8 +2513,62 @@ class PyTorchModelEngine(ModelEngine):
                         self.enable_spec_decode = saved_enable_spec_decode
                         self.runtime_draft_len = saved_runtime_draft_len
 
+    def _capture_breakable_prefill_cuda_graphs(
+            self, resource_manager: ResourceManager):
+        """Capture one breakable CUDA graph of the model body per prefill bucket (TRTLLM_PREFILL_BCG)."""
+        runner = self.breakable_cuda_graph_runner
+        num_tokens_list = sorted(self._piecewise_cuda_graph_num_tokens,
+                                 reverse=True)
+        logger.info(
+            "[TRTLLM_PREFILL_BCG] capturing breakable prefill CUDA graphs...")
+        # The piecewise capture window stays open as in the piecewise path, for per-bucket graphs outside the
+        # captured body that only capture inside it (e.g. TRTLLM_Q35_CTX_MTP_GRAPH).
+        with capture_piecewise_cuda_graph(True), self.no_cuda_graph():
+            for num_tokens in num_tokens_list:
+                warmup_request = self._create_warmup_request(
+                    resource_manager, num_tokens, 0)
+                with self._release_batch_context(warmup_request,
+                                                 resource_manager) as batch:
+                    if batch is None:
+                        continue
+                    runner.capture(
+                        num_tokens,
+                        lambda: self.forward(batch,
+                                             new_tensors_device=None,
+                                             resource_manager=resource_manager))
+                    graph = runner._graphs[num_tokens]
+                    logger.info(
+                        f"[TRTLLM_PREFILL_BCG] captured num_tokens={num_tokens}: "
+                        f"{graph.num_segments} segments, {graph.num_breaks} eager breaks"
+                    )
+                    torch.cuda.synchronize()
+                    gc.collect()
+                    torch.cuda.empty_cache()
+
+        # Logits and other allocations outside the captured body grow with the request count: run the largest
+        # request count once per bucket so the caching allocator holds blocks large enough to reuse.
+        for num_tokens in num_tokens_list:
+            warmup_request = self._create_warmup_request(resource_manager,
+                                                         num_tokens,
+                                                         0,
+                                                         least_requests=False)
+            with self._release_batch_context(warmup_request,
+                                             resource_manager) as batch:
+                if batch is None:
+                    continue
+                with self.no_cuda_graph():
+                    runner.warmup(
+                        lambda: self.forward(batch,
+                                             new_tensors_device=None,
+                                             resource_manager=resource_manager),
+                        steps=1)
+                torch.cuda.synchronize()
+
     def _capture_piecewise_cuda_graphs(self, resource_manager: ResourceManager):
         """Captures piecewise CUDA graphs for context/prefill steps via torch.compile."""
+        if self.breakable_cuda_graph_runner is not None:
+            self._capture_breakable_prefill_cuda_graphs(resource_manager)
+            return
         if not (self._torch_compile_piecewise_cuda_graph
                 and self._torch_compile_enabled):
             return
@@ -3330,6 +3450,8 @@ class PyTorchModelEngine(ModelEngine):
     def _release_cuda_graphs(self):
         if self._torch_compile_backend is not None:
             self._torch_compile_backend.clear_piecewise_cuda_graphs()
+        if getattr(self, "breakable_cuda_graph_runner", None) is not None:
+            self.breakable_cuda_graph_runner.clear()
         if hasattr(self,
                    'cuda_graph_runner') and self.cuda_graph_runner is not None:
             self.cuda_graph_runner.clear()
@@ -3531,16 +3653,29 @@ class PyTorchModelEngine(ModelEngine):
         all_rank_ctx_requests = self._get_all_rank_ctx_requests(
             num_ctx_requests)
 
-        def get_padded_piecewise_tokens(tokens):
+        if self.breakable_cuda_graph_runner is not None:
+            captured_num_tokens = self._piecewise_cuda_graph_num_tokens
+        elif (self._torch_compile_backend is not None
+              and self._torch_compile_piecewise_cuda_graph):
             captured_num_tokens = self._torch_compile_backend.capture_num_tokens
+        else:
+            captured_num_tokens = None
+
+        def get_padded_piecewise_tokens(tokens):
             return captured_num_tokens[bisect.bisect_left(
                 captured_num_tokens, tokens)]
 
-        if (self._torch_compile_backend is not None
-                and self._torch_compile_piecewise_cuda_graph
-                and self._torch_compile_backend.capture_num_tokens):
-            max_captured_num_tokens = self._torch_compile_backend.capture_num_tokens[
-                -1]
+        def bcg_can_replay(tokens: int) -> bool:
+            # TRTLLM_PREFILL_BCG: pad only for a bucket that will replay (or is being captured); an eager forward
+            # gets the real token count.
+            runner = self.breakable_cuda_graph_runner
+            if runner is None or runner.is_capturing or runner.is_warming_up:
+                return True
+            return not self.is_warmup and runner.has_graph(
+                get_padded_piecewise_tokens(tokens))
+
+        if captured_num_tokens:
+            max_captured_num_tokens = captured_num_tokens[-1]
             # Torch piecewise cuda graph is enabled.
             if attn_all_rank_num_tokens is not None:
                 # Any rank has context requests, we enable piecewise cuda graph.
@@ -3551,6 +3686,10 @@ class PyTorchModelEngine(ModelEngine):
                 can_run_piecewise_cuda_graph = (has_ctx_requests and
                                                 max(attn_all_rank_num_tokens)
                                                 <= max_captured_num_tokens)
+                if (can_run_piecewise_cuda_graph
+                        and self.breakable_cuda_graph_runner is not None):
+                    can_run_piecewise_cuda_graph = bcg_can_replay(
+                        max(attn_all_rank_num_tokens))
                 all_ranks_can_run_piecewise_cuda_graph = list(
                     self.dist.tp_allgather(can_run_piecewise_cuda_graph))
                 if all(all_ranks_can_run_piecewise_cuda_graph):
@@ -3567,7 +3706,9 @@ class PyTorchModelEngine(ModelEngine):
                         "Not all ranks can run piecewise cuda graph, disable piecewise cuda graph"
                     )
                     return total_num_tokens, False, attn_all_rank_num_tokens
-            elif num_ctx_requests != 0 and total_num_tokens <= max_captured_num_tokens:
+            elif (num_ctx_requests != 0
+                  and total_num_tokens <= max_captured_num_tokens
+                  and bcg_can_replay(total_num_tokens)):
                 padded_num_tokens = get_padded_piecewise_tokens(
                     total_num_tokens)
                 logger.debug(
@@ -4695,7 +4836,9 @@ class PyTorchModelEngine(ModelEngine):
         req_id_to_old_request: Optional[Dict[int, LlmRequest]] = None,
         resource_manager: Optional[ResourceManager] = None,
         maybe_graph: bool = False,
-        promoted_context_request_ids: frozenset[int] = frozenset()
+        promoted_context_request_ids: frozenset[int] = frozenset(),
+        *,
+        _q35_force_full: bool = False,
     ) -> Tuple[Dict[str, Any], Optional[torch.Tensor]]:
         """
         Prepare inputs for Pytorch Model.
@@ -4717,6 +4860,32 @@ class PyTorchModelEngine(ModelEngine):
                 scheduled_requests,
                 new_tokens=new_tokens_device,
                 runtime_draft_len=self.runtime_draft_len)
+
+        # TRTLLM_Q35_STEADY_PREPARE: steady one-model MTP decode steps are
+        # prepared from the last qualifying full pass (q35_steady_prepare.py).
+        steady = self._q35_steady_prepare() if not _q35_force_full else None
+        if steady is not None:
+            # Only a steady step stages the graph inputs itself (see replay()).
+            self.cuda_graph_runner._q35_static_staged = None
+            steady_result = steady.try_prepare(
+                self, scheduled_requests, kv_cache_manager, attn_metadata,
+                spec_metadata, new_tensors_device, resource_manager,
+                promoted_context_request_ids,
+                lambda: self._prepare_tp_inputs(
+                    scheduled_requests,
+                    kv_cache_manager,
+                    attn_metadata,
+                    spec_metadata,
+                    new_tensors_device,
+                    cache_indirection_buffer,
+                    num_accepted_tokens_device,
+                    req_id_to_old_request,
+                    resource_manager,
+                    maybe_graph,
+                    promoted_context_request_ids,
+                    _q35_force_full=True))
+            if steady_result is not None:
+                return steady_result
 
         if (not promoted_context_request_ids
                 and self._can_use_incremental_update(scheduled_requests,
@@ -5950,8 +6119,48 @@ class PyTorchModelEngine(ModelEngine):
                     _use_mrope,
                 }
 
+        steady = self._q35_steady_prepare()
+        if steady is not None:
+            steady.maybe_record(
+                self,
+                scheduled_requests=scheduled_requests,
+                attn_metadata=attn_metadata,
+                spec_metadata=spec_metadata,
+                resource_manager=resource_manager,
+                kv_cache_manager=kv_cache_manager,
+                request_ids=request_ids,
+                prompt_lengths=prompt_lengths,
+                sequence_lengths=sequence_lengths,
+                draft_lens=draft_lens,
+                previous_batch_indices=previous_batch_indices,
+                num_tokens=num_tokens,
+                num_draft_tokens=num_draft_tokens,
+                extend_requests=extend_requests,
+                extend_dummy_requests=extend_dummy_requests,
+                generation_requests=generation_requests,
+                first_draft_requests=first_draft_requests,
+                padded=attn_metadata.padded_num_tokens is not None,
+                mrope_lists_empty=not (mrope_position_ids
+                                       or mrope_delta_write_seq_slots
+                                       or mrope_delta_read_seq_slots),
+                has_lora=bool(lora_params),
+                promoted_context_request_ids=promoted_context_request_ids)
+
         return inputs, self.gather_ids_cuda[:len(
             gather_ids)] if self.enable_spec_decode else None
+
+    def _q35_steady_prepare(self):
+        """The TRTLLM_Q35_STEADY_PREPARE state of this engine, or None."""
+        steady = getattr(self, "_q35_steady", False)
+        if steady is False:
+            steady = None
+            from .q35_steady_prepare import (SteadyMtpPrepare,
+                                             steady_prepare_enabled)
+            if steady_prepare_enabled() and SteadyMtpPrepare.engine_supported(
+                    self):
+                steady = SteadyMtpPrepare(self)
+            self._q35_steady = steady
+        return steady
 
     def _prepare_tp_inputs_no_cache(
             self,
@@ -6538,6 +6747,9 @@ class PyTorchModelEngine(ModelEngine):
         maybe_graph: bool = False,
         promoted_context_request_ids: frozenset[int] = frozenset()
     ) -> Tuple[Dict[str, Any], Optional[torch.Tensor]]:
+        if self.breakable_cuda_graph_runner is not None:
+            # Only an input preparation that pads to a captured bucket may replay a breakable prefill graph.
+            set_per_request_piecewise_cuda_graph_flag(False)
         if self.mapping is not None and 'cp_type' in self.mapping.cp_config:
             cp_type = self.mapping.cp_config['cp_type']
             if CpType.STAR == cp_type:
@@ -7151,11 +7363,45 @@ class PyTorchModelEngine(ModelEngine):
                     for request in scheduled_requests.context_requests)
                 self.iter_states[
                     'num_generation_tokens'] = scheduled_requests.num_generation_requests
-            self._prepare_inputs_event = torch.cuda.Event()
+            if os.environ.get("TRTLLM_Q35_CACHED_STREAM_EVENTS", "0") == "1":
+                # One event re-recorded every step (py_executor
+                # CACHED_STREAM_EVENTS_ENV_VAR_NAME): wait_for_input_copy syncs
+                # on the previous record before this step records again.
+                if getattr(self, "_q35_inputs_event", None) is None:
+                    self._q35_inputs_event = torch.cuda.Event()
+                self._prepare_inputs_event = self._q35_inputs_event
+            else:
+                self._prepare_inputs_event = torch.cuda.Event()
             self._prepare_inputs_event.record()
 
             with with_shared_pool(self.cuda_graph_runner.get_graph_pool()):
-                if not can_run_graph:
+                bcg_runner = self.breakable_cuda_graph_runner
+                if not can_run_graph and bcg_runner is not None:
+                    # TRTLLM_PREFILL_BCG: capture / replay the model body of a padded context batch.
+                    def forward_step():
+                        with MoeLoadBalancerIterContext(moe_load_balancer):
+                            return self._forward_step(
+                                inputs,
+                                gather_ids=gather_ids,
+                                gather_context_logits=gather_context_logits)
+
+                    if bcg_runner.is_capturing:
+                        return bcg_runner.capture_model_body(forward_step)
+                    num_tokens = (inputs['input_ids'].shape[0] if
+                                  inputs.get('input_ids') is not None else None)
+                    if (not bcg_runner.is_warming_up and not self.is_warmup
+                            and get_per_request_piecewise_cuda_graph_flag()
+                            and not gather_context_logits
+                            and num_tokens is not None
+                            and bcg_runner.has_graph(num_tokens)
+                            and not self._bcg_has_mm_content(inputs)):
+                        outputs = bcg_runner.execute(num_tokens, forward_step)
+                        self._bcg_count("replay", num_tokens)
+                    else:
+                        outputs = forward_step()
+                        if not self.is_warmup:
+                            self._bcg_count("eager", num_tokens)
+                elif not can_run_graph:
                     # Fallback to eager execution if graph was not used
                     with MoeLoadBalancerIterContext(moe_load_balancer):
                         outputs = self._forward_step(
@@ -7211,6 +7457,25 @@ class PyTorchModelEngine(ModelEngine):
             self._execute_logit_post_processors(scheduled_requests, outputs)
 
             return outputs
+
+    @staticmethod
+    def _bcg_has_mm_content(inputs: Dict[str, Any]) -> bool:
+        """Whether the batch carries multimodal content (the body would then read embeddings, not input_ids)."""
+        if inputs.get('inputs_embeds') is not None:
+            return True
+        return any(
+            _has_mm_payload_keys(getattr(p, 'multimodal_data', None))
+            for p in inputs.get('multimodal_params') or ())
+
+    def _bcg_count(self, kind: str, num_tokens: Optional[int]) -> None:
+        """Fired counters of TRTLLM_PREFILL_BCG, logged at 1, 10, 100, ... and every 1000 forwards."""
+        stats = self._bcg_stats
+        stats[kind] += 1
+        total = stats["replay"] + stats["eager"]
+        if total in (1, 10, 100) or total % 1000 == 0:
+            logger.info(
+                f"[TRTLLM_PREFILL_BCG] forwards: {stats['replay']} replayed, {stats['eager']} eager "
+                f"(last: {kind}, num_tokens={num_tokens})")
 
     def _get_spec_worker(self):
         """Access the spec_worker from DecoderModelForCausalLM (one-model spec dec)."""

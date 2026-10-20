@@ -307,6 +307,16 @@ public:
         int numTokens;
         // Total query length passed to match() (== len(tokens)).
         int numLookupTokens;
+        // Internal diagnostic: the prefix the attention pages alone would
+        // support, i.e. before recurrent-state (SSM) snapshot availability
+        // shortens it. Equal to numTokens when the model has no SSM life
+        // cycle. Separates "attention prefix matched N tokens" from
+        // "recurrent-snapshot pruning cut it to M".
+        int numReusableTokensBeforeHybridPruning;
+        // Raw token-path walk depth, before any pruning. Locates where this
+        // request's content diverges from the tree, independent of page
+        // residency. Equal to numLookupTokens when there is no fork.
+        int numReusableTokensBeforePruning;
     };
 
     ReuseMatch match(
@@ -348,7 +358,10 @@ public:
 private:
     std::vector<MatchResult> matchTokenPath(
         ReuseScope const& reuseScope, std::vector<TokenIdExt> const& tokens, bool enablePartialMatch) const;
-    std::vector<MatchResult> pruneMatch(std::vector<MatchResult> matched) const;
+    // Shorten `matched` to the prefix that is actually reusable. Passing
+    // std::nullopt for `ssmLcId` skips the recurrent-snapshot constraint and
+    // yields the attention-only prefix (used for numReusableTokensBeforeHybridPruning).
+    std::vector<MatchResult> pruneMatch(std::vector<MatchResult> matched, std::optional<LifeCycleId> ssmLcId) const;
 
     // Erase any pending empty root blocks from mRoots.
     // Const-qualified: deferred cleanup is not a logical mutation.

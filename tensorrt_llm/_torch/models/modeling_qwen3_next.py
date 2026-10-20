@@ -47,6 +47,7 @@ from ...logger import logger
 from ..attention_backend import AttentionMetadata
 from ..distributed import (AllReduce, AllReduceFusionOp, AllReduceParams,
                            MoEAllReduce, MoEAllReduceParams, allgather)
+from ..distributed.ops import q35_mnnvl_fusable, q35_zero_residual
 from ..model_config import ModelConfig
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
@@ -54,10 +55,17 @@ from ..modules.fused_moe import (BaseMoeRoutingMethod, MoEWeightLoadingMode,
                                  RenormalizeMoeRoutingMethod,
                                  RenormalizeNaiveMoeRoutingMethod,
                                  RoutingMethodType, create_moe)
+from ..modules.fused_moe.q35_fused_front import (
+    Q35_MOE_FRONT_BIG, Q35_MOE_FUSED_FRONT, Q35_MOE_FUSED_FRONT_MAX_TOKENS, Q35_MOE_ROUTER_GEMM,
+    Q35_MOE_GATE_LOWM, Q35_MOE_ROUTER_LOWM, Q35_MOE_STATS, Q35RouterGemm, q35_lowm_router,
+    q35_moe_stats_record, q35_routed_forward)
 from ..modules.gated_mlp import GatedMLP
-from ..modules.linear import Linear, TensorParallelMode
+from ..modules.linear import FP8QDQLinearMethod, Linear, TensorParallelMode
+from ..modules.lowm_linear import (lowm_check, lowm_gemm, lowm_rows_ok,
+                                   lowm_se_enabled, lowm_skipped, swiglu_pairs)
 from ..modules.mamba.gdn_mixer import Qwen3NextGatedDeltaNet
-from ..modules.multi_stream_utils import maybe_execute_in_parallel
+from ..modules.multi_stream_utils import (do_multi_stream,
+                                          maybe_execute_in_parallel)
 from ..modules.rms_norm import RMSNorm
 from ..speculative import SpecMetadata
 from ..utils import AuxStreamType, EventType, create_lm_head_tp_mapping
@@ -118,6 +126,329 @@ def _eager_fusion_enabled(enable_attention_dp: bool) -> bool:
             and not enable_attention_dp)
 
 
+# Qwen3.5 low-latency comm flags (default off).
+# TRTLLM_Q35_AR_FP8_OUT=1: the fused all-reduce in front of a GDN / full-attention layer also emits
+#   that layer's FP8 (E4M3, static per-tensor scale) projection input, bitwise what
+#   static_quantize_e4m3_per_tensor makes of the BF16 norm output, so in_proj_qkvz / qkv_proj skip
+#   their quantize kernel (GDN keeps the BF16 output for in_proj_ba).
+# TRTLLM_Q35_AR_NORM_FUSE=1: fold the standalone RMSNorms that follow plain all-reduces into them
+#   (embedding + first input_layernorm; per MTP pass: embedding + pre_fc_norm_embedding, fc +
+#   input_layernorm, MoE + shared_head.norm).
+# TRTLLM_Q35_REPLICATED_EMBED=1: full embedding table on every rank (+~1.8 GB/GPU), no all-reduce.
+_Q35_AR_FP8_OUT = os.environ.get("TRTLLM_Q35_AR_FP8_OUT", "0") == "1"
+_Q35_AR_NORM_FUSE = os.environ.get("TRTLLM_Q35_AR_NORM_FUSE", "0") == "1"
+_Q35_REPLICATED_EMBED = os.environ.get("TRTLLM_Q35_REPLICATED_EMBED",
+                                       "0") == "1"
+# TRTLLM_Q35_EMBED_GATHER=1 (with TRTLLM_Q35_REPLICATED_EMBED): every target / MTP lookup of the full table
+# is one gather launch instead of the 9-kernel masked lookup (bitwise).
+_Q35_EMBED_GATHER = os.environ.get("TRTLLM_Q35_EMBED_GATHER", "0") == "1"
+
+
+def _q35_mtp_fused_input() -> bool:
+    """TRTLLM_Q35_MTP_FUSED_INPUT=1 (default off): see modules/q35_mtp_glue.py."""
+    return os.environ.get("TRTLLM_Q35_MTP_FUSED_INPUT", "0") == "1"
+
+
+# TRTLLM_Q35_TRITON_AR=se: the MoE-output (POST_MOE) all-reduce runs the Triton one-shot kernel of
+#   distributed/q35_allreduce.py with the shared-expert combine (routed + sigmoid(gate) * shared)
+#   folded into its input, removing the separate combine kernel; =all: additionally every other
+#   fused all-reduce + RMSNorm (PRE_MOE, folds) on that kernel (one-shot also at 28 rows).
+#   Decode shapes only (<= 64 rows, MNNVL); otherwise the library op.
+# TRTLLM_Q35_FUSED_AR=se|all: same, on the CuTe DSL kernel (cute_dsl_kernels/blackwell/
+#   q35_allreduce_norm.py: bitwise the library op, one-shot up to 64 rows); takes precedence.
+_Q35_TRITON_AR = os.environ.get("TRTLLM_Q35_TRITON_AR", "")
+_Q35_FUSED_AR = os.environ.get("TRTLLM_Q35_FUSED_AR", "")
+# TRTLLM_Q35_FIN_FOLD=1 (with TRTLLM_Q35_FUSED_AR): the trtllm-gen NVFP4 MoE runs with
+#   do_finalize=False and the CuTe all-reduce finalizes its permuted FC2 rows in-kernel (the finalize
+#   kernel's arithmetic, bitwise), removing the finalize launch. TRTLLM_Q35_FIN_CHECK=1: in eager
+#   calls, also run the MoE with do_finalize=True and compare (log once per layer).
+_Q35_FIN_FOLD = os.environ.get("TRTLLM_Q35_FIN_FOLD", "0") == "1"
+# TRTLLM_Q35_MTP_MOE_CALIB=<path> (debug, default off): MoE activation maxima for the NVFP4 MTP experts' activation
+# scales (modules/q35_mtp_moe_quant.py).
+_Q35_MTP_MOE_CALIB = bool(os.environ.get("TRTLLM_Q35_MTP_MOE_CALIB", "").strip())
+_Q35_FIN_CHECK = os.environ.get("TRTLLM_Q35_FIN_CHECK", "0") == "1"
+# TRTLLM_Q35_AR2=fe|fp|fpm|sl|slm (with TRTLLM_Q35_FUSED_AR): the one-shot fused all-reduces on the ar2 kernel
+#   (distributed/q35_ar2.py); two-shot calls (TP16 >= 12 rows) stay on the CuTe kernel (slot two-shot: opt-in with
+#   TRTLLM_Q35_AR2_SLOT_TWOSHOT=1). fe / fp: same protocol and outputs as the CuTe
+#   kernel (fp: buffer rotation inside the poll loop); sl: flag-free slot protocol on its own workspace (same
+#   outputs); m: st.async + mbarrier norm exchange. TRTLLM_Q35_AR2_SITES=all|moe|mixer limits it to the MoE-output
+#   (fold) or the other calls.
+_Q35_AR2 = os.environ.get("TRTLLM_Q35_AR2", "")
+_Q35_AR2_SITES = os.environ.get("TRTLLM_Q35_AR2_SITES", "all")
+
+
+# TRTLLM_Q35_FUSED_AR=all also takes the ARs without a fold (PRE_MOE) only while the library's MNNVL path would
+# be one-shot (rows x hidden x TP x 2 B <= 1 MiB): above that the library two-shot + Lamport RMSNorm pair is the
+# faster one (TP8 28 rows 6.34 us vs CuTe one-shot 6.93 / two-shot 7.28). TRTLLM_Q35_FUSED_AR_PLAIN_MAX_ROWS=<n>
+# overrides the bound (A/B).
+_Q35_FUSED_AR_PLAIN_MAX_ROWS = os.environ.get("TRTLLM_Q35_FUSED_AR_PLAIN_MAX_ROWS")
+# TRTLLM_Q35_FUSED_AR_MAX_ROWS=<n> (default 64; CuTe kernel only, i.e. with TRTLLM_Q35_FUSED_AR): largest call the
+# fused all-reduces take. Above 64 rows (TEP8 b16 / b32 verify: 112 / 224 rows) the MoE-output all-reduce keeps the
+# shared-expert combine and the finalize (TRTLLM_Q35_FIN_FOLD) in its launch instead of the library two-shot +
+# Lamport RMSNorm pair behind separate finalize and combine kernels; pair it with TRTLLM_Q35_FUSED_AR_TWOSHOT_ROWS
+# (the CuTe two-shot moves ~1/4 of the one-shot's NVLink ingress at TP8).
+_Q35_FUSED_AR_MAX_ROWS = int(os.environ.get("TRTLLM_Q35_FUSED_AR_MAX_ROWS", "64"))
+
+
+def _q35_triton_ar(allreduce, rows: int, is_post_moe: bool, hidden: int = 4096):
+    """The in-kernel-fused all-reduce for this call (CuTe DSL or Triton), or None (library op)."""
+    mode = _Q35_FUSED_AR or _Q35_TRITON_AR
+    if mode not in ("se", "all") or (not is_post_moe and mode != "all"):
+        return None
+    max_rows = _Q35_FUSED_AR_MAX_ROWS if _Q35_FUSED_AR else 64
+    if (allreduce is None or getattr(allreduce, "mnnvl_allreduce", None) is None
+            or not 0 < rows <= max_rows):
+        return None
+    if not is_post_moe and _Q35_FUSED_AR:
+        if _Q35_FUSED_AR_PLAIN_MAX_ROWS is not None:
+            if rows > int(_Q35_FUSED_AR_PLAIN_MAX_ROWS):
+                return None
+        elif rows * hidden * allreduce.mapping.tp_size * 2 > 64 * 1024 * 8 * 2:
+            return None
+    if _Q35_FUSED_AR:
+        from ..distributed.q35_allreduce import get_q35_cute_allreduce
+        inst = get_q35_cute_allreduce(allreduce.mapping)
+        if _Q35_AR2 and inst is not None and (_Q35_AR2_SITES == "all" or
+                                              (_Q35_AR2_SITES == "moe") == is_post_moe):
+            from ..distributed.q35_ar2 import get_q35_ar2
+            inst = get_q35_ar2(allreduce.mapping, inst, _Q35_AR2) or inst
+        return inst
+    from ..distributed.q35_allreduce import get_q35_fused_allreduce
+    return get_q35_fused_allreduce(allreduce.mapping)
+
+
+def _q35_fin_fold(decoder_layer, rows: int) -> bool:
+    """Run this layer's MoE with do_finalize=False and finalize inside the CuTe all-reduce?"""
+    mlp = decoder_layer.mlp
+    return (_Q35_FIN_FOLD and _Q35_FUSED_AR in ("se", "all")
+            and isinstance(mlp, Qwen3NextSparseMoeBlock)
+            and _q35_triton_ar(decoder_layer.allreduce, rows, True) is not None
+            and mlp.q35_can_defer_finalize())
+
+
+# TRTLLM_Q35_MTP_FC_CUTE_AR=1 (with TRTLLM_Q35_FUSED_AR=all and TRTLLM_Q35_AR_NORM_FUSE): the MTP fc all-reduce +
+#   input_layernorm (zero residual) runs on the CuTe kernel instead of the library MNNVL one-shot, under the same
+#   policy as the other fold-free ARs (only where the library would be one-shot; bitwise there).
+_Q35_MTP_FC_CUTE_AR = os.environ.get("TRTLLM_Q35_MTP_FC_CUTE_AR", "0") == "1"
+
+
+# TRTLLM_Q35_GEMM_AR=1: the attention o_proj / GDN out_proj (FP8 per-tensor on the low-M kernel) and the
+# following all-reduce + residual + post_attention_layernorm run as one CuTe launch
+# (distributed/q35_allreduce.Q35GemmArNorm): the projection defers itself to the decoder layer's fused norm
+# all-reduce. Same projection values; the RMSNorm sums its squares in another order.
+_Q35_GEMM_AR = os.environ.get("TRTLLM_Q35_GEMM_AR", "0") == "1"
+# TRTLLM_Q35_GEMM_AR_MIN_ROWS=N: the fused path only for calls of at least N rows (e.g. 21 = b4 only with MTP 6:
+# b1 / b2 / b4 verify 7 / 14 / 28 rows); every batch size is its own CUDA graph, so this is a per-batch policy.
+_Q35_GEMM_AR_MIN_ROWS = int(os.environ.get("TRTLLM_Q35_GEMM_AR_MIN_ROWS", "1"))
+
+
+class _Q35DeferredProj:
+    """A row-parallel projection's input, handed to the decoder layer instead of its output."""
+
+    def __init__(self, linear, x, args, kwargs):
+        self.linear = linear
+        self.x = x
+        self.args = args
+        self.kwargs = kwargs
+
+    def materialize(self) -> torch.Tensor:
+        return type(self.linear).forward(self.linear, self.x, *self.args, **self.kwargs)
+
+
+def _q35_install_defer(linear) -> None:
+    """Let ``linear`` hand its input back (once, when armed) instead of projecting it."""
+    if linear.__dict__.get("_q35_defer_installed", False):
+        return
+    cls_forward = type(linear).forward
+
+    def forward(input, *args, **kwargs):
+        if linear.__dict__.get("_q35_defer_once", False):
+            linear.__dict__["_q35_defer_once"] = False
+            return _Q35DeferredProj(linear, input, args, kwargs)
+        return cls_forward(linear, input, *args, **kwargs)
+
+    linear.__dict__["forward"] = forward
+    linear.__dict__["_q35_defer_installed"] = True
+
+
+def _q35_gemm_ar_arm(decoder_layer, proj, rows: int, lora_params) -> None:
+    """Arm ``proj`` to defer into the fused GEMM + all-reduce + norm when the call qualifies."""
+    if (not _Q35_GEMM_AR or lora_params is not None or not decoder_layer.fusion_config.PRE_MOE_FUSION
+            or not proj.__dict__.get("_q35_defer_installed", False)):
+        return
+    allreduce = decoder_layer.allreduce
+    if (getattr(allreduce, "mnnvl_allreduce", None) is None or not 0 < rows <= 32
+            or rows < _Q35_GEMM_AR_MIN_ROWS):
+        return
+    from ..modules.lowm_linear import (lowm_fp8_act, lowm_fp8_enabled, lowm_rows_ok,
+                                       lowm_skipped)
+    label = getattr(proj, "_q35_lowm", False)
+    if not label or not lowm_fp8_enabled() or lowm_skipped(label):
+        return
+    weight = getattr(proj, "weight", None)
+    if (weight is None or weight.dtype != torch.float8_e4m3fn
+            or getattr(proj, "input_scale", None) is None
+            or getattr(proj, "force_dynamic_quantization", False)
+            or getattr(proj, "bias", None) is not None):
+        return
+    if not lowm_rows_ok(rows, weight.shape[0], weight.shape[1], lowm_fp8_act()):
+        return
+    from ..distributed.q35_allreduce import get_q35_gemm_ar
+    if get_q35_gemm_ar(allreduce.mapping) is None:
+        return
+    proj.__dict__["_q35_defer_once"] = True
+
+
+def _q35_gemm_ar_run(allreduce, deferred: _Q35DeferredProj, residual, norm):
+    """The fused projection + all-reduce + residual + RMSNorm, or None (caller materializes)."""
+    from ..distributed.q35_allreduce import get_q35_gemm_ar
+    fused = get_q35_gemm_ar(allreduce.mapping)
+    x = deferred.x
+    if fused is None or x.dim() < 2:
+        return None
+    x2 = x.reshape(-1, x.shape[-1])
+    if (x2.dtype not in (torch.bfloat16, torch.float8_e4m3fn) or x2.stride(-1) != 1
+            or x2.stride(0) % 16):
+        return None
+    lin = deferred.linear
+    outs = fused(x2, lin.weight, lin.weight_scale, lin.input_scale, residual,
+                 _fused_norm_weight(norm), norm.variance_epsilon)
+    if outs is not None and not _q35_gemm_ar_logged:
+        _q35_gemm_ar_logged.add(True)
+        logger.info(f"[Q35 comm] TRTLLM_Q35_GEMM_AR: fused projection + all-reduce + norm in use "
+                    f"(first call: {x2.shape[0]} rows, K={x2.shape[1]}, {x2.dtype})")
+    return outs
+
+
+_q35_gemm_ar_logged: set = set()
+
+
+def _q35_finalize_ref(fc2: torch.Tensor, weights: torch.Tensor,
+                      perm: torch.Tensor, hidden: int) -> torch.Tensor:
+    """The trtllm-gen finalize kernel's result (FP32 sum of w * row in k order, BF16 once)."""
+    acc = torch.zeros((perm.shape[0], hidden),
+                      dtype=torch.float32,
+                      device=fc2.device)
+    for k in range(perm.shape[1]):
+        p = perm[:, k]
+        rows = fc2[p.clamp(min=0).long(), :hidden].float()
+        acc = torch.where((p >= 0)[:, None],
+                          acc + weights[:, k:k + 1].float() * rows, acc)
+    return acc.to(torch.bfloat16)
+
+
+def _q35_fp8_input_linear(layer: nn.Module) -> Optional[Linear]:
+    """The FP8 per-tensor (static scale) input projection of a decoder layer, or None."""
+    if isinstance(layer, Qwen3NextLinearDecoderLayer):
+        linear = layer.linear_attn.in_proj_qkvz
+    elif isinstance(layer, Qwen3NextFullAttentionDecoderLayer):
+        linear = layer.self_attn.qkv_proj
+    else:
+        return None
+    if (not isinstance(getattr(linear, "quant_method", None),
+                       FP8QDQLinearMethod)
+            or getattr(linear, "input_scale", None) is None
+            or getattr(linear, "force_dynamic_quantization", False)):
+        return None
+    return linear
+
+
+def _q35_fused_norm_allreduce(allreduce,
+                              hidden_states,
+                              residual,
+                              norm: RMSNorm,
+                              next_layer: Optional[nn.Module],
+                              shared_fold=None,
+                              is_post_moe: bool = False,
+                              se_moe: Optional[nn.Module] = None):
+    """``allreduce`` + residual + ``norm`` (RESIDUAL_RMS_NORM), returning (hidden, residual).
+
+    With TRTLLM_Q35_AR_FP8_OUT and an FP8 input projection in ``next_layer`` the same launch also
+    quantizes the norm output with that projection's static input scale: before a GDN layer the
+    BF16 output is kept (in_proj_ba) and the FP8 copy is handed to the layer as
+    ``_q35_fp8_input``; before a full-attention layer the FP8 tensor replaces it (qkv_proj is the
+    only consumer).
+
+    ``shared_fold`` = (routed, shared, gate logits) of a MoE block that deferred its shared-expert
+    combine (TRTLLM_Q35_TRITON_AR): the Triton kernel folds it into the all-reduce input.
+
+    ``se_moe`` = the MoE block after this (pre-MoE) all-reduce: with TRTLLM_Q35_SE_AUX=fp8 the library
+    launch also emits its shared expert's FP8 input (RESIDUAL_RMS_NORM_OUT_QUANT_FP8 with gate_up_proj's
+    static input scale: 1 / scale times the BF16 norm output, E4M3 satfinite, as its quantize kernel) and
+    hands it to the block as ``_q35_se_fp8_input``.
+    """
+    if isinstance(hidden_states, _Q35DeferredProj):
+        if next_layer is None and shared_fold is None:
+            outs = _q35_gemm_ar_run(allreduce, hidden_states, residual, norm)
+            if outs is not None:
+                return outs
+        hidden_states = hidden_states.materialize()
+    linear = (_q35_fp8_input_linear(next_layer)
+              if _Q35_AR_FP8_OUT and next_layer is not None else None)
+    rows = (shared_fold[1] if shared_fold is not None else residual).shape[0]
+    triton_ar = _q35_triton_ar(allreduce, rows, is_post_moe, residual.shape[-1])
+    if shared_fold is not None and isinstance(shared_fold[0], (tuple, list)):
+        # Un-finalized MoE output: only the CuTe kernel takes it (the caller checked _q35_fin_fold).
+        assert triton_ar is not None and _Q35_FUSED_AR
+    if triton_ar is not None and hasattr(allreduce, "mapping"):
+        gdn_next = isinstance(next_layer, Qwen3NextLinearDecoderLayer)
+        outs = triton_ar(residual,
+                         _fused_norm_weight(norm),
+                         norm.variance_epsilon,
+                         x=hidden_states if shared_fold is None else None,
+                         shared_fold=shared_fold,
+                         scale=linear.input_scale if linear is not None else None,
+                         norm_out=linear is None or gdn_next)
+        if linear is None:
+            return outs
+        if gdn_next:
+            norm_out, quant_out, residual = outs
+            next_layer.__dict__["_q35_fp8_input"] = quant_out
+            return norm_out, residual
+        return outs
+    if shared_fold is not None:
+        routed, shared, gate = shared_fold
+        hidden_states = fused_sigmoid_gate_mul_add(routed,
+                                                   gate,
+                                                   shared,
+                                                   output=torch.empty_like(routed))
+    params = AllReduceParams(fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
+                             residual=residual,
+                             norm_weight=_fused_norm_weight(norm),
+                             eps=norm.variance_epsilon)
+    se_linear = (se_moe.q35_se_fp8_linear(rows) if se_moe is not None and linear is None
+                 and shared_fold is None else None)
+    if se_linear is not None:
+        # TRTLLM_Q35_SE_AUX=fp8: norm output for the router / gate, FP8 copy for the shared expert.
+        params.scale = se_linear.quant_method.get_static_input_scale(se_linear)
+        params.fusion_op = AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_FP8
+        norm_out, quant_out, residual = allreduce(hidden_states,
+                                                  all_reduce_params=params)
+        se_moe.__dict__["_q35_se_fp8_input"] = quant_out
+        return norm_out, residual
+    if linear is None:
+        return allreduce(hidden_states, all_reduce_params=params)
+    params.scale = linear.input_scale
+    if isinstance(next_layer, Qwen3NextLinearDecoderLayer):
+        params.fusion_op = AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_FP8
+        norm_out, quant_out, residual = allreduce(hidden_states,
+                                                  all_reduce_params=params)
+        # A plain attribute (not a registered buffer); the next layer pops it.
+        next_layer.__dict__["_q35_fp8_input"] = quant_out
+        return norm_out, residual
+    params.fusion_op = AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_FP8
+    quant_out, residual = allreduce(hidden_states, all_reduce_params=params)
+    return quant_out, residual
+
+
+def _q35_pop_fp8_input(layer: nn.Module,
+                       hidden_states: torch.Tensor) -> Optional[torch.Tensor]:
+    fp8 = layer.__dict__.pop("_q35_fp8_input", None)
+    if fp8 is not None and fp8.shape != hidden_states.shape:
+        return None
+    return fp8
+
+
 def _experts_excluded_from_quant(model_config: ModelConfig[Qwen3NextConfig],
                                  layer_idx: Optional[int]) -> bool:
     """Is this layer's routed-experts module listed in ``exclude_modules``?
@@ -165,10 +496,43 @@ class Qwen3NextGate(nn.Module):
         # FIXME: out_dtype=float32 does not work
         # self.out_dtype = torch.float32 if moe_backend == "TRTLLM" else dtype
         self.out_dtype = dtype
+        self._q35_router_gemm = None
 
         assert not apply_routing, "Qwen3NextGate routing is called inside MoE"
 
+    def q35_router_ok(self, hidden_states: torch.Tensor) -> bool:
+        return (hidden_states.dim() == 2
+                and hidden_states.shape[0] <= Q35_MOE_FUSED_FRONT_MAX_TOKENS
+                and hidden_states.dtype == torch.bfloat16
+                and hidden_states.stride(1) == 1
+                and self.weight.dtype == torch.bfloat16
+                and self.out_dtype == torch.bfloat16)
+
+    def q35_router(self,
+                   hidden_states: torch.Tensor,
+                   global_scale: Optional[torch.Tensor] = None,
+                   route: Optional[tuple] = None):
+        # Single-launch Triton router GEMM (TRTLLM_Q35_MOE_ROUTER_GEMM=1);
+        # with global_scale it also returns the NVFP4 quantization of x, and with
+        # route (TRTLLM_Q35_MOE_PREROUTE) also the routing and its tables.
+        if route is not None:
+            if self._q35_router_gemm is None:
+                self._q35_router_gemm = Q35RouterGemm()
+            return self._q35_router_gemm(hidden_states, self.weight,
+                                         global_scale, route)
+        if Q35_MOE_ROUTER_LOWM or (global_scale is None and Q35_MOE_GATE_LOWM):
+            # TRTLLM_Q35_MOE_GATE_LOWM: plain (no-quant) router calls, e.g. the BF16 MTP layer's gate, on the
+            # low-M GEMM
+            out = q35_lowm_router(hidden_states, self.weight, global_scale)
+            if out is not None:
+                return out
+        if self._q35_router_gemm is None:
+            self._q35_router_gemm = Q35RouterGemm()
+        return self._q35_router_gemm(hidden_states, self.weight, global_scale)
+
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if Q35_MOE_ROUTER_GEMM and self.q35_router_ok(hidden_states):
+            return self.q35_router(hidden_states)
         logits: torch.Tensor = torch.ops.trtllm.cublas_mm(
             hidden_states, self.weight.t(), bias=None, out_dtype=self.out_dtype)
         return logits
@@ -194,6 +558,46 @@ class Qwen3NextGate(nn.Module):
                 f"Unsupported routing method: {self.routing_method_type}")
 
 
+# TRTLLM_Q35_SE_AUX=gate|prio|fp8, combined with '+' (default off): the shared expert's chain on the aux stream
+#   (FP8 quant of x -> gate_up -> SwiGLU -> down, then the shared_expert_gate GEMV hidden -> 1 and its cuBLAS split-K
+#   reduce) next to the routed MoE. With a short MoE front (TRTLLM_Q35_MOE_FRONT_BIG) the routed FC1 launches early
+#   (PDL) and fills the SMs: chain kernels launched after it wait for the FC1 / FC2 CTA queues to drain, and the
+#   MoE-output all-reduce waits for the chain.
+#   gate: the GEMV + reduce run on a second aux stream, in parallel with the rest of the chain (same kernels, bitwise;
+#     CUDA-graph multi-stream only);
+#   prio: the chain runs on its own aux stream(s) created at the highest stream priority, so its CTAs are dispatched
+#     ahead of queued FC1 / FC2 CTAs (same kernels, bitwise; inside a CUDA graph this needs node priorities);
+#   fp8: the pre-MoE all-reduce + RMSNorm (library launch) also writes the shared expert's FP8 input, so the chain
+#     starts at gate_up without its quantize kernel (the same arithmetic, bitwise).
+#   Use gate. Same-job decode A/B (TEP8 MTP-6, TRTLLM_Q35_MOE_FRONT_BIG=1, step ms): gate b8 -0.13..-0.22, b16 -0.11,
+#   b32 -0.19..-0.21, greedy tokens identical; prio and gate+prio lose most of it (the high-priority chain takes SMs
+#   from FC1 / the route launch); gate+fp8 is 0.02-0.07 slower than gate (gate_up then runs next to the router GEMM).
+# TRTLLM_Q35_SE_AUX_MIN_ROWS=<n> (default 1): only calls of at least n rows (e.g. 112: the TEP8 b16 / b32 verify).
+# TRTLLM_Q35_SE_AUX_CHECK=1 (debug, with fp8): eager calls compare the all-reduce's FP8 copy with the shared expert's
+#   own quantization of x (bitwise; logged once per layer and row count, and on every mismatch).
+_Q35_SE_AUX = frozenset(
+    t for t in os.environ.get("TRTLLM_Q35_SE_AUX", "").replace("+", ",").split(",") if t)
+_Q35_SE_AUX_MIN_ROWS = int(os.environ.get("TRTLLM_Q35_SE_AUX_MIN_ROWS", "1"))
+_Q35_SE_AUX_CHECK = os.environ.get("TRTLLM_Q35_SE_AUX_CHECK", "0") == "1"
+_Q35_SE_STREAMS: Dict[tuple, torch.cuda.Stream] = {}
+_q35_se_logged: set = set()
+
+
+def _q35_se_stream(name: str) -> torch.cuda.Stream:
+    """The shared-expert chain's own aux stream ``name`` (TRTLLM_Q35_SE_AUX), one per device; high priority with
+    ``prio`` (the most negative priority torch hands out; the main stream has 0)."""
+    key = (torch.cuda.current_device(), name)
+    stream = _Q35_SE_STREAMS.get(key)
+    if stream is None:
+        stream = torch.cuda.Stream(priority=-8 if "prio" in _Q35_SE_AUX else 0)
+        _Q35_SE_STREAMS[key] = stream
+        prange = getattr(torch.cuda.Stream, "priority_range", None)
+        logger.info(f"[q35 se aux] TRTLLM_Q35_SE_AUX={'+'.join(sorted(_Q35_SE_AUX))}: stream '{name}' on "
+                    f"device {key[0]} has priority {getattr(stream, 'priority', '?')} (torch range "
+                    f"{prange() if prange is not None else '?'})")
+    return stream
+
+
 class Qwen3NextSparseMoeBlock(nn.Module):
 
     def __init__(
@@ -212,6 +616,7 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         self.top_k = config.num_experts_per_tok
         self.enable_attention_dp = model_config.mapping.enable_attention_dp
         self.mapping = model_config.mapping
+        self._q35_layer_idx = layer_idx
 
         self.allreduce = AllReduce(mapping=model_config.mapping,
                                    strategy=model_config.allreduce_strategy,
@@ -249,21 +654,50 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             expert_quant_config = quant_config_dict.get(
                 f"model.layers.{layer_idx}.mlp.experts")
         moe_model_config = model_config
-        if _experts_excluded_from_quant(model_config, layer_idx):
+        stock_weight_loading_mode = weight_loading_mode
+        # Q35 (opt-in): TRTLLM_Q35_MTP_MOE_QUANT=fp8block|mxfp4 quantizes the
+        # MTP layer's bf16 experts at load time for TRTLLM-gen
+        # (modules/q35_mtp_moe_quant.py). The NVFP4 checkpoint is
+        # MIXED_PRECISION: its MTP experts have no per-layer quant entry (and
+        # may or may not be listed in exclude_modules), i.e. they are bf16.
+        q35_mtp_quant = None
+        n_hidden = getattr(config, "num_hidden_layers", None)
+        if layer_idx is not None and n_hidden is not None and layer_idx >= n_hidden:
+            from ..modules.q35_mtp_moe_quant import (experts_unquantized,
+                                                     mtp_moe_quant_mode,
+                                                     quant_config_for)
+            if (_experts_excluded_from_quant(model_config, layer_idx)
+                    or experts_unquantized(model_config, expert_quant_config)):
+                q35_mtp_quant = mtp_moe_quant_mode()
+        if q35_mtp_quant is not None:
+            expert_quant_config = quant_config_for(
+                q35_mtp_quant, model_config.quant_config.kv_cache_quant_algo)
+            weight_loading_mode = MoEWeightLoadingMode.VANILLA
+            if model_config.moe_backend != "TRTLLM":
+                moe_model_config = copy.copy(model_config)
+                moe_model_config._frozen = False
+                moe_model_config.moe_backend = "TRTLLM"
+                moe_model_config._frozen = True
+        elif _experts_excluded_from_quant(model_config, layer_idx):
             # These experts end up bf16 whatever the per-layer entry says, so
             # build them on CUTLASS, the only backend that serves bf16
             # unconditionally.
             expert_quant_config = QuantConfig(kv_cache_quant_algo=model_config.
                                               quant_config.kv_cache_quant_algo)
-            if model_config.moe_backend != "CUTLASS":
+            # Q35 (opt-in): TRTLLM_Q35_MTP_MOE_BACKEND=TRTLLM runs these bf16
+            # experts on TRTLLM-gen (FlashInfer trtllm_bf16_moe) instead.
+            bf16_backend = ("TRTLLM" if os.environ.get(
+                "TRTLLM_Q35_MTP_MOE_BACKEND", "").upper() == "TRTLLM" else
+                            "CUTLASS")
+            if model_config.moe_backend != bf16_backend:
                 moe_model_config = copy.copy(model_config)
                 moe_model_config._frozen = False
-                moe_model_config.moe_backend = "CUTLASS"
+                moe_model_config.moe_backend = bf16_backend
                 moe_model_config._frozen = True
                 logger.warning(
                     f"Layer {layer_idx} MoE experts are excluded from "
-                    "quantization; using moe_backend=CUTLASS for this layer "
-                    f"(other layers keep {model_config.moe_backend}).")
+                    f"quantization; using moe_backend={bf16_backend} for this "
+                    f"layer (other layers keep {model_config.moe_backend}).")
         self.experts = create_moe(
             num_experts=self.num_experts,
             routing_method=self.gate.routing_method,
@@ -277,6 +711,44 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             weight_loading_mode=weight_loading_mode,
             override_quant_config=expert_quant_config,
         )
+        self._q35_quant_max_m = 0
+        self.q35_experts_bf16 = None
+        if q35_mtp_quant is not None:
+            from ..modules.q35_mtp_moe_quant import (mtp_moe_quant_max_m,
+                                                     wrap_experts_loader)
+            self._q35_quant_max_m = mtp_moe_quant_max_m()
+            if self._q35_quant_max_m > 0:
+                # Inputs above the cap (TRTLLM_Q35_MTP_MOE_QUANT_MAX_M) run on a
+                # BF16 twin built as the stock MTP experts (CUTLASS).
+                twin_config = copy.copy(model_config)
+                twin_config._frozen = False
+                twin_config.moe_backend = "CUTLASS"
+                twin_config._frozen = True
+                self.q35_experts_bf16 = create_moe(
+                    num_experts=self.num_experts,
+                    routing_method=self.gate.routing_method,
+                    hidden_size=self.hidden_dim,
+                    intermediate_size=self.moe_intermediate_size,
+                    aux_stream_dict={
+                        AuxStreamType.MoeChunkingOverlap: aux_stream
+                    },
+                    dtype=config.torch_dtype,
+                    reduce_results=False,
+                    model_config=twin_config,
+                    # Not registered under this layer's index (that slot is the
+                    # quantized experts'; no EPLB / torch.compile custom op).
+                    layer_idx=None,
+                    weight_loading_mode=stock_weight_loading_mode,
+                    override_quant_config=QuantConfig(
+                        kv_cache_quant_algo=model_config.quant_config.
+                        kv_cache_quant_algo),
+                )
+            wrap_experts_loader(self.experts, q35_mtp_quant,
+                                self.q35_experts_bf16)
+            logger.info(f"Layer {layer_idx} (MTP) MoE experts: bf16 checkpoint "
+                        f"weights quantized at load time ({q35_mtp_quant}) for "
+                        "moe_backend=TRTLLM; inputs above "
+                        f"{self._q35_quant_max_m or 'no'} tokens on a BF16 twin")
 
         self.shared_expert = GatedMLP(
             hidden_size=self.hidden_dim,
@@ -299,6 +771,167 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             key: torch.cuda.Event()
             for key in [EventType.Main, EventType.MoeShared]
         }
+        # TRTLLM_Q35_SE_AUX: (chain stream, gate stream or None, x-ready event, gate-done event), else None.
+        self._q35_se_aux = None
+        if _Q35_SE_AUX:
+            self._q35_se_aux = (
+                _q35_se_stream("se") if "prio" in _Q35_SE_AUX else aux_stream,
+                _q35_se_stream("gate") if "gate" in _Q35_SE_AUX else None,
+                torch.cuda.Event(), torch.cuda.Event())
+        # TRTLLM_Q35_LOWM_SE: (SwiGLU-paired gate_up weight, zero-padded gate weight), built on the
+        # first eager decode-sized call; False when the shared expert does not qualify.
+        self._se_lowm = None
+
+    def post_load_weights(self) -> None:
+        # Rebuilt from the final (rescaled) weights on the first eager decode-sized call; CUDA-graph
+        # capture is always preceded by eager warmup forwards.
+        self._se_lowm = None
+
+    def q35_se_fp8_linear(self, rows: int) -> Optional[Linear]:
+        """TRTLLM_Q35_SE_AUX=fp8: the shared expert's gate_up_proj when the pre-MoE all-reduce should also emit
+        its FP8 input for a call of ``rows`` rows, else None (the low-M shared expert takes BF16 x)."""
+        if ("fp8" not in _Q35_SE_AUX or rows < _Q35_SE_AUX_MIN_ROWS
+                or self.enable_attention_dp):
+            return None
+        mlp = self.shared_expert
+        gate_up = getattr(mlp, "gate_up_proj", None)
+        down = getattr(mlp, "down_proj", None)
+        if (gate_up is None or down is None
+                or not isinstance(gate_up.quant_method, FP8QDQLinearMethod)
+                or gate_up.quant_method.get_static_input_scale(gate_up) is None
+                or mlp._can_fuse_gate_up_swiglu()
+                or mlp._can_fuse_gate_up_swiglu_fp4out()):
+            return None
+        if (lowm_se_enabled() and self._se_lowm is not False
+                and not lowm_skipped("se", rows)
+                and lowm_rows_ok(rows, gate_up.weight.shape[0],
+                                 gate_up.weight.shape[1], "quant")
+                and lowm_rows_ok(rows, down.weight.shape[0],
+                                 down.weight.shape[1], "fp8")):
+            return None
+        return gate_up
+
+    def _q35_se_check(self, x: torch.Tensor, x_fp8: torch.Tensor) -> None:
+        """TRTLLM_Q35_SE_AUX_CHECK: the all-reduce's FP8 copy vs gate_up_proj's own static quantization of x."""
+        gate_up = self.shared_expert.gate_up_proj
+        ref, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
+            x, gate_up.quant_method.get_static_input_scale(gate_up))
+        diff = int((ref.view(torch.uint8) != x_fp8.view(torch.uint8)).sum().item())
+        key = (self._q35_layer_idx, x.shape[0])
+        if key not in _q35_se_logged or diff:
+            _q35_se_logged.add(key)
+            logger.info(f"[q35 se aux] fp8 check layer {self._q35_layer_idx} rows {x.shape[0]}: all-reduce FP8 "
+                        f"copy {'== (bitwise)' if diff == 0 else '!='} static_quantize_e4m3_per_tensor(x) "
+                        f"({diff} of {ref.numel()} bytes differ)")
+
+    def _prepare_shared_expert_lowm(self) -> None:
+        """Weights of the shared expert's low-M path (``TRTLLM_Q35_LOWM_SE=1``).
+
+        Decode-sized batches run the FP8 (W8A8) shared expert as two low-M launches instead of seven
+        kernels (input quantize, gate_up GEMM, split-K reduce, SwiGLU + quantize, down GEMM, the
+        shared_expert_gate GEMV and its reduce): (1) gate_up with the SwiGLU in the epilogue (FP8
+        output quantized with down_proj.input_scale) plus shared_expert_gate as a BF16 segment;
+        (2) down_proj on that FP8 output. The gate_up rows are re-paired for the epilogue (a copy;
+        the original stays for larger batches).
+        """
+        self._se_lowm = False
+        mlp = self.shared_expert
+        gate_up = getattr(mlp, "gate_up_proj", None)
+        down = getattr(mlp, "down_proj", None)
+        gate = self.shared_expert_gate
+        if gate_up is None or down is None:
+            return
+        # LoRA: GatedMLP always attaches LoRA layers (applied only with lora_params, which keep the
+        # stock path in _compute_shared_output), so they do not disqualify the low-M path.
+        for proj in (gate_up, down):
+            if (not isinstance(proj.quant_method, FP8QDQLinearMethod)
+                    or proj.bias is not None
+                    or proj.quant_method.get_static_input_scale(proj) is None):
+                return
+        if (mlp.activation is not torch.nn.functional.silu
+                or not mlp._is_plain_swiglu() or mlp.swiglu_limit is not None
+                or gate.weight.dtype != torch.bfloat16
+                or gate.weight.shape[0] != 1 or gate.bias is not None):
+            return
+        inter, k = gate_up.weight.shape[0] // 2, gate_up.weight.shape[1]
+        if inter % 8 or k % 64 or down.weight.shape[1] % 64:
+            return
+        gate_w = torch.zeros((8, k),
+                             dtype=gate.weight.dtype,
+                             device=gate.weight.device)
+        gate_w[:1].copy_(gate.weight)
+        self._se_lowm = (swiglu_pairs(gate_up.weight.data), gate_w)
+
+    def _shared_expert_lowm(self, x: torch.Tensor):
+        """(shared expert output, gate logits [M, 1]) from two low-M launches, or None."""
+        if (not lowm_se_enabled() or x.dim() != 2 or lowm_skipped("se", x.shape[0])
+                or x.dtype != torch.bfloat16):
+            return None
+        gate_up_w = self.shared_expert.gate_up_proj.weight
+        down_w = self.shared_expert.down_proj.weight
+        if not (lowm_rows_ok(x.shape[0], gate_up_w.shape[0], x.shape[1], "quant")
+                and lowm_rows_ok(x.shape[0], down_w.shape[0], down_w.shape[1], "fp8")):
+            return None
+        if self._se_lowm is None:
+            if torch.cuda.is_current_stream_capturing():
+                return None
+            self._prepare_shared_expert_lowm()
+        if not self._se_lowm:
+            return None
+        pairs, gate_w = self._se_lowm
+        mlp = self.shared_expert
+        gate_up, down = mlp.gate_up_proj, mlp.down_proj
+        inter = pairs.shape[0] // 2
+        down_scale = down.quant_method.get_static_input_scale(down)
+        hidden, gate_logits = lowm_gemm(
+            x16=x,
+            w_fp8=pairs,
+            weight_scale=gate_up.weight_scale,
+            input_scale=gate_up.quant_method.get_static_input_scale(gate_up),
+            swiglu_fp8=True,
+            w_bf16=gate_w,
+            split_out=inter,
+            n_valid=inter + 1,
+            out_scale=down_scale,
+            out_dtype=x.dtype,
+        )
+        out = lowm_gemm(x8=hidden,
+                        w_fp8=down.weight,
+                        weight_scale=down.weight_scale,
+                        input_scale=down_scale,
+                        fp8_act="fp8",
+                        out_dtype=x.dtype)
+        lowm_check("fp8:se(gate_up+swiglu+down)", out,
+                   lambda: self.shared_expert(x))
+        lowm_check("bf16:se.gate(fused)", gate_logits,
+                   lambda: self.shared_expert_gate(x))
+        return out, gate_logits
+
+    def q35_can_defer_finalize(self) -> bool:
+        """trtllm-gen NVFP4 experts with in-kernel routing (their do_finalize=False output carries
+        valid top-k weights) and no MoE communication / load balancer."""
+        cached = self.__dict__.get("_q35_can_defer_finalize")
+        if cached is None:
+            from ..modules.fused_moe import moe_scheduler
+            from ..modules.fused_moe.fused_moe_trtllm_gen import \
+                TRTLLMGenFusedMoE
+            experts = self.experts
+            backend = getattr(experts, "backend", experts)
+            routing = getattr(experts, "routing_method", None)
+            cached = (isinstance(backend, TRTLLMGenFusedMoE)
+                      and bool(getattr(backend, "has_nvfp4", False))
+                      # TRTLLM_Q35_MTP_MOE_QUANT_MAX_M: the BF16 twin (CUTLASS)
+                      # always finalizes, so a layer with one never defers.
+                      and getattr(self, "q35_experts_bf16", None) is None
+                      and not self.enable_attention_dp
+                      and not backend._supports_load_balancer()
+                      and getattr(experts, "comm", None) is None
+                      and getattr(experts, "layer_load_balancer", None) is None
+                      and routing is not None
+                      and not routing.requires_separated_routing
+                      and not moe_scheduler.FORCE_SEPARATED_ROUTING)
+            self.__dict__["_q35_can_defer_finalize"] = cached
+        return cached
 
     def forward(
         self,
@@ -307,7 +940,13 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         all_reduce_params: Optional[AllReduceParams] = None,
         do_finalize: Optional[bool] = True,
         lora_params: Optional[dict] = None,
+        q35_defer_shared_combine: bool = False,
+        q35_defer_finalize: bool = False,
     ) -> torch.Tensor:
+        """``q35_defer_shared_combine`` (TRTLLM_Q35_TRITON_AR, caller does the all-reduce): return
+        (routed, shared, gate logits) instead of routed + sigmoid(gate) * shared.
+        ``q35_defer_finalize`` (TRTLLM_Q35_FIN_FOLD, with the former): ``routed`` is the experts'
+        do_finalize=False output (fc2 rows, top-k weights, expanded -> permuted index)."""
         assert hidden_states.shape[-1] == self.hidden_dim
         orig_shape = hidden_states.shape
         hidden_states = hidden_states.view(-1, self.hidden_dim)
@@ -326,22 +965,95 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             raise NotImplementedError(
                 "do_finalize == False is not supported yet")
 
+        # TRTLLM_Q35_MTP_MOE_QUANT_MAX_M: the quantized MTP experts only up to
+        # the cap; larger inputs take the BF16 twin (static per CUDA graph). A
+        # layer with a twin never defers its finalize (_q35_can_defer_finalize).
+        experts = self.experts
+        if (self.q35_experts_bf16 is not None
+                and hidden_states.shape[0] > self._q35_quant_max_m):
+            experts = self.q35_experts_bf16
+        experts_finalize = do_finalize and not (q35_defer_finalize
+                                                and q35_defer_shared_combine
+                                                and lora_params is None)
+
         def _compute_routed_output():
+            if _Q35_MTP_MOE_CALIB:
+                # Debug (TRTLLM_Q35_MTP_MOE_CALIB): activation maxima of every MoE layer's input, and of the
+                # SwiGLU output of layers with BF16 experts (the stock MTP layer; needs their router logits).
+                from ..modules.q35_mtp_moe_quant import mtp_moe_calib_record
+                w31 = getattr(getattr(experts, "backend", experts), "w3_w1_weight", None)
+                calib_logits = (self.gate(hidden_states) if w31 is not None
+                                and w31.dtype == torch.bfloat16 else None)
+                mtp_moe_calib_record(self._q35_layer_idx, experts, hidden_states,
+                                     calib_logits, self.top_k)
+            if Q35_MOE_FUSED_FRONT or Q35_MOE_ROUTER_GEMM or Q35_MOE_FRONT_BIG:
+                out = q35_routed_forward(
+                    self.gate,
+                    experts,
+                    hidden_states,
+                    all_rank_num_tokens=all_rank_num_tokens,
+                    use_dp_padding=use_dp_padding,
+                    do_finalize=experts_finalize,
+                )
+                if out is not None:
+                    return out
             router_logits = self.gate(hidden_states)
-            final_hidden_states = self.experts(
+            if Q35_MOE_STATS:
+                q35_moe_stats_record(self._q35_layer_idx, router_logits,
+                                     self.top_k)
+            final_hidden_states = experts(
                 hidden_states,
                 router_logits,
                 output_dtype=hidden_states.dtype,
                 all_rank_num_tokens=all_rank_num_tokens,
                 use_dp_padding=use_dp_padding,
-                do_finalize=do_finalize,
+                do_finalize=experts_finalize,
             )
+            if not experts_finalize:
+                final_hidden_states = tuple(final_hidden_states)
+                if _Q35_FIN_CHECK and not torch.cuda.is_current_stream_capturing(
+                ):
+                    self._q35_check_finalize(hidden_states, router_logits,
+                                             all_rank_num_tokens,
+                                             use_dp_padding,
+                                             final_hidden_states)
 
             return final_hidden_states
 
+        se_aux = (self._q35_se_aux if self._q35_se_aux is not None
+                  and hidden_states.shape[0] >= _Q35_SE_AUX_MIN_ROWS else None)
+        # TRTLLM_Q35_SE_AUX=fp8: the shared expert's FP8 input from the pre-MoE all-reduce (set by
+        # _q35_fused_norm_allreduce for this call; popped either way).
+        se_x = self.__dict__.pop("_q35_se_fp8_input", None)
+        if se_x is None or se_x.shape != hidden_states.shape or lora_params:
+            se_x = hidden_states
+        elif _Q35_SE_AUX_CHECK and not torch.cuda.is_current_stream_capturing():
+            self._q35_se_check(hidden_states, se_x)
+
         def _compute_shared_output():
+            if not lora_params:
+                lowm = self._shared_expert_lowm(hidden_states)
+                if lowm is not None:
+                    return lowm
+            if (se_aux is not None and se_aux[1] is not None and do_multi_stream()
+                    and not torch.compiler.is_compiling()):
+                # TRTLLM_Q35_SE_AUX=gate: the gate GEMV + split-K reduce on their own stream, beside the shared
+                # expert (this runs on the chain's aux stream, after x is ready).
+                _, gate_stream, x_ready, gate_done = se_aux
+                x_ready.record()
+                with torch.cuda.stream(gate_stream):
+                    x_ready.wait()
+                    shared_expert_gate_logits = self.shared_expert_gate(
+                        hidden_states)
+                    gate_done.record()
+                shared_expert_output = self.shared_expert(
+                    se_x,
+                    lora_params=lora_params,
+                )
+                gate_done.wait()
+                return shared_expert_output, shared_expert_gate_logits
             shared_expert_output = self.shared_expert(
-                hidden_states,
+                se_x,
                 lora_params=lora_params,
             )
             shared_expert_gate_logits = self.shared_expert_gate(hidden_states)
@@ -352,13 +1064,17 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             _compute_shared_output,
             self.event_dict[EventType.Main],
             self.event_dict[EventType.MoeShared],
-            self.aux_stream,
+            se_aux[0] if se_aux is not None else self.aux_stream,
             disable_on_compile=True,
         )
         if not do_finalize:
             return final_hidden_states
 
         shared_expert_output, shared_expert_gate_logits = shared_expert_outputs
+        if q35_defer_shared_combine:
+            return (final_hidden_states, shared_expert_output,
+                    shared_expert_gate_logits)
+        assert experts_finalize
         if not self.enable_attention_dp and self.mapping.tp_size > 1:
             output_tensor, _ = torch.ops.trtllm.allocate_output(
                 final_hidden_states, self.allreduce.output_buffer_kind,
@@ -376,6 +1092,34 @@ class Qwen3NextSparseMoeBlock(nn.Module):
                 final_hidden_states, shared_expert_gate_logits,
                 shared_expert_output)
         return final_hidden_states.view(orig_shape)
+
+
+    def _q35_check_finalize(self, hidden_states, router_logits,
+                            all_rank_num_tokens, use_dp_padding, unfinalized):
+        """TRTLLM_Q35_FIN_CHECK: the do_finalize=False operands, finalized as the trtllm-gen
+        finalize kernel does, must equal the experts' own finalized output (bitwise)."""
+        ref = self.experts(hidden_states,
+                           router_logits,
+                           output_dtype=hidden_states.dtype,
+                           all_rank_num_tokens=all_rank_num_tokens,
+                           use_dp_padding=use_dp_padding,
+                           do_finalize=True)
+        fc2, weights, perm = unfinalized
+        emu = _q35_finalize_ref(fc2, weights, perm, self.hidden_dim)
+        same = torch.equal(emu, ref[:, :self.hidden_dim])
+        key = (id(self), hidden_states.shape[0])
+        logged = Qwen3NextSparseMoeBlock.__dict__.get("_q35_fin_logged")
+        if logged is None:
+            logged = set()
+            Qwen3NextSparseMoeBlock._q35_fin_logged = logged
+        if key not in logged or not same:
+            logged.add(key)
+            diff = (emu.float() - ref[:, :self.hidden_dim].float()).abs().max()
+            logger.info(
+                f"[q35 fin fold] rows={hidden_states.shape[0]} fc2={tuple(fc2.shape)} "
+                f"weights={weights.dtype}{tuple(weights.shape)} local={(perm >= 0).sum().item()}"
+                f"/{perm.numel()}: finalize emulation {'== (bitwise)' if same else '!='} "
+                f"do_finalize=True output (max abs diff {diff.item():.3g})")
 
 
 class _DenseMlpAdapter(nn.Module):
@@ -494,6 +1238,7 @@ class Qwen3NextLinearDecoderLayer(DecoderLayer):
         lora_params: Optional[dict] = None,
         **kwargs,
     ) -> torch.Tensor:
+        h_fp8 = _q35_pop_fp8_input(self, hidden_states)
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
@@ -503,6 +1248,12 @@ class Qwen3NextLinearDecoderLayer(DecoderLayer):
         # Linear Attention
         ### FIXME: 1. forward_batch; 2. allreduce
         if hidden_states.shape[0] != 0:
+            if h_fp8 is not None:
+                kwargs["h_fp8"] = h_fp8
+            if _Q35_GEMM_AR:
+                _q35_install_defer(self.linear_attn.out_proj)
+                _q35_gemm_ar_arm(self, self.linear_attn.out_proj,
+                                 hidden_states.shape[0], lora_params)
             hidden_states = self.linear_attn(
                 hidden_states,
                 attn_metadata,
@@ -511,15 +1262,11 @@ class Qwen3NextLinearDecoderLayer(DecoderLayer):
                     enable_allreduce=not self.disable_attn_allreduce),
                 **kwargs)
         if self.fusion_config.PRE_MOE_FUSION:
-            hidden_states, residual = self.allreduce(
-                hidden_states,
-                all_reduce_params=AllReduceParams(
-                    fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
-                    residual=residual,
-                    norm_weight=_fused_norm_weight(
-                        self.post_attention_layernorm),
-                    eps=self.post_attention_layernorm.variance_epsilon,
-                ))
+            hidden_states, residual = _q35_fused_norm_allreduce(
+                self.allreduce, hidden_states, residual,
+                self.post_attention_layernorm, None,
+                se_moe=self.mlp if lora_params is None and isinstance(
+                    self.mlp, Qwen3NextSparseMoeBlock) else None)
         else:
             # No fusion
             hidden_states, residual = self.post_attention_layernorm(
@@ -529,6 +1276,16 @@ class Qwen3NextLinearDecoderLayer(DecoderLayer):
         # only its final all-reduce so the decoder can fuse it with RMSNorm.
         do_finalize = True
 
+        defer_combine = (self.fusion_config.POST_MOE_FUSION
+                         and isinstance(self.mlp, Qwen3NextSparseMoeBlock)
+                         and _q35_triton_ar(self.allreduce, hidden_states.shape[0],
+                                            True) is not None)
+        defer_kwargs = {}
+        if defer_combine:
+            defer_kwargs["q35_defer_shared_combine"] = True
+            if lora_params is None and _q35_fin_fold(self,
+                                                     hidden_states.shape[0]):
+                defer_kwargs["q35_defer_finalize"] = True
         hidden_states = self.mlp(
             hidden_states,
             attn_metadata,
@@ -537,19 +1294,19 @@ class Qwen3NextLinearDecoderLayer(DecoderLayer):
                                       or self.mapping.tp_size == 1)),
             do_finalize=do_finalize,
             lora_params=lora_params,
+            **defer_kwargs,
         )
 
         if self.fusion_config.POST_MOE_FUSION:
             if do_finalize:
-                hidden_states, residual = self.allreduce(
-                    hidden_states,
-                    all_reduce_params=AllReduceParams(
-                        fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
-                        residual=residual,
-                        norm_weight=_fused_norm_weight(
-                            self.next_layer_layernorm),
-                        eps=self.next_layer_layernorm.variance_epsilon,
-                    ))
+                hidden_states, residual = _q35_fused_norm_allreduce(
+                    self.allreduce,
+                    None if defer_combine else hidden_states,
+                    residual,
+                    self.next_layer_layernorm,
+                    self.__dict__.get("_q35_next_layer"),
+                    shared_fold=hidden_states if defer_combine else None,
+                    is_post_moe=True)
             else:
                 assert len(
                     hidden_states
@@ -591,6 +1348,12 @@ class Qwen3NextAttention(Qwen3Attention):
                          attn_output_gate=True,
                          use_gemma_rms_norm=True)
         self._fuse_qk_norm_rope_gate = True
+        # Decode-sized projections on the low-M kernel (TRTLLM_Q35_LOWM_FP8 for the FP8 target
+        # layers, TRTLLM_Q35_LOWM_BF16 for the BF16 MTP layer; read per call, inert when off).
+        for proj, name in ((self.qkv_proj, "attn.qkv_proj"),
+                           (self.o_proj, "attn.o_proj")):
+            proj._q35_lowm = name
+            proj._q35_lowm_bf16 = name
 
 
 class Qwen3NextFullAttentionDecoderLayer(DecoderLayer):
@@ -673,6 +1436,10 @@ class Qwen3NextFullAttentionDecoderLayer(DecoderLayer):
             self.fusion_config.POST_MOE_FUSION = False
 
         # Self Attention
+        if _Q35_GEMM_AR and hidden_states.shape[0] != 0:
+            _q35_install_defer(self.self_attn.o_proj)
+            _q35_gemm_ar_arm(self, self.self_attn.o_proj,
+                             hidden_states.shape[0], lora_params)
         hidden_states = self.self_attn(
             position_ids=position_ids,
             hidden_states=hidden_states,
@@ -684,15 +1451,11 @@ class Qwen3NextFullAttentionDecoderLayer(DecoderLayer):
         )
 
         if self.fusion_config.PRE_MOE_FUSION:
-            hidden_states, residual = self.allreduce(
-                hidden_states,
-                all_reduce_params=AllReduceParams(
-                    fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
-                    residual=residual,
-                    norm_weight=_fused_norm_weight(
-                        self.post_attention_layernorm),
-                    eps=self.post_attention_layernorm.variance_epsilon,
-                ))
+            hidden_states, residual = _q35_fused_norm_allreduce(
+                self.allreduce, hidden_states, residual,
+                self.post_attention_layernorm, None,
+                se_moe=self.mlp if lora_params is None and isinstance(
+                    self.mlp, Qwen3NextSparseMoeBlock) else None)
         else:
             # No fusion
             hidden_states, residual = self.post_attention_layernorm(
@@ -704,6 +1467,16 @@ class Qwen3NextFullAttentionDecoderLayer(DecoderLayer):
         # still fuses the *finalized* MoE all-reduce with the next layer's RMSNorm
         # via the do_finalize branch below, without hitting the unimplemented path.
         do_finalize = True
+        defer_combine = (self.fusion_config.POST_MOE_FUSION
+                         and isinstance(self.mlp, Qwen3NextSparseMoeBlock)
+                         and _q35_triton_ar(self.allreduce, hidden_states.shape[0],
+                                            True) is not None)
+        defer_kwargs = {}
+        if defer_combine:
+            defer_kwargs["q35_defer_shared_combine"] = True
+            if lora_params is None and _q35_fin_fold(self,
+                                                     hidden_states.shape[0]):
+                defer_kwargs["q35_defer_finalize"] = True
         hidden_states = self.mlp(
             hidden_states,
             attn_metadata,
@@ -712,19 +1485,19 @@ class Qwen3NextFullAttentionDecoderLayer(DecoderLayer):
                                       or self.mapping.tp_size == 1)),
             do_finalize=do_finalize,
             lora_params=lora_params,
+            **defer_kwargs,
         )
 
         if self.fusion_config.POST_MOE_FUSION:
             if do_finalize:
-                hidden_states, residual = self.allreduce(
-                    hidden_states,
-                    all_reduce_params=AllReduceParams(
-                        fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
-                        residual=residual,
-                        norm_weight=_fused_norm_weight(
-                            self.next_layer_layernorm),
-                        eps=self.next_layer_layernorm.variance_epsilon,
-                    ))
+                hidden_states, residual = _q35_fused_norm_allreduce(
+                    self.allreduce,
+                    None if defer_combine else hidden_states,
+                    residual,
+                    self.next_layer_layernorm,
+                    self.__dict__.get("_q35_next_layer"),
+                    shared_fold=hidden_states if defer_combine else None,
+                    is_post_moe=True)
             else:
                 assert len(
                     hidden_states
@@ -865,10 +1638,28 @@ class Qwen3NextMTP(Qwen3NextFullAttentionDecoderLayer):
                 skip_create_weights_in_init,
                 use_cute_dsl_blockscaling_mm=False,
             )
+        self.fc._q35_lowm_bf16 = "mtp.fc"  # TRTLLM_Q35_LOWM_BF16 (strided input rows are fine)
         self.shared_head = Qwen3NextMTPHead(model_config)
         # MTP applies shared_head.norm after the base decoder forward, so its
         # MoE-output all-reduce cannot consume next_layer_layernorm.
         self.fusion_config.POST_MOE_FUSION = False
+        # TRTLLM_Q35_DRAFT_ATTN_WINDOW=W (default 0 = off; experiment): the
+        # draft layer's decode attention reads only the last W keys (sliding
+        # window); prefill and the KV cache are unchanged. Changes the draft
+        # distribution: gate with the long-context AL check.
+        q35_window = int(os.environ.get("TRTLLM_Q35_DRAFT_ATTN_WINDOW", "0")
+                         or 0)
+        if q35_window > 0:
+            self.self_attn.attn.q35_draft_window = q35_window
+            logger.info(f"[Q35] MTP layer {layer_idx}: draft decode attention "
+                        f"window {q35_window} keys")
+        if _Q35_AR_NORM_FUSE and self.fusion_config.PRE_MOE_FUSION:
+            # TRTLLM_Q35_AR_NORM_FUSE: the MoE-output all-reduce does residual + shared_head.norm
+            # itself (RESIDUAL_RMS_NORM), and forward skips the separate FusedAddRMSNorm. A plain
+            # attribute, so the norm is not registered a second time as a submodule.
+            self.fusion_config.POST_MOE_FUSION = not model_config.mapping.has_pp(
+            )
+            self.__dict__["next_layer_layernorm"] = self.shared_head.norm
 
     def forward(
         self,
@@ -882,8 +1673,106 @@ class Qwen3NextMTP(Qwen3NextFullAttentionDecoderLayer):
         **kwargs,
     ) -> torch.Tensor:
         del all_rank_num_tokens
+        tp_size = self.model_config.mapping.tp_size
+        tp_rank = self.model_config.mapping.tp_rank
+        chunked = tp_size > 1 and not self.model_config.mapping.enable_attention_dp
+        # TRTLLM_Q35_DRAFT_BOOKKEEPING: a per-pass ``kv_lens_cuda[:n] += 1`` the
+        # draft loop deferred to this pass (folded into the fused input launch
+        # below, else applied here before anything reads kv_lens).
+        kv_inc = getattr(attn_metadata, "q35_pending_kv_inc", 0)
+        if kv_inc:
+            attn_metadata.q35_pending_kv_inc = 0
+        # TRTLLM_Q35_MTP_FUSED_INPUT (default off): with a replicated embedding
+        # table, the masked embedding gather, both pre-fc Gemma RMSNorms, the
+        # concat and the row-parallel chunk in one launch per pass
+        # (modules/q35_mtp_glue.py).
+        if (_q35_mtp_fused_input() and getattr(embed_tokens, "tp_size", 1) == 1
+                and embed_tokens.weight.dtype == hidden_states.dtype
+                and hidden_states.stride(-1) == 1):
+            from ..modules.q35_mtp_glue import mtp_fused_input
+            hidden_states = mtp_fused_input(
+                input_ids, embed_tokens.weight, hidden_states,
+                self.pre_fc_norm_embedding.weight,
+                self.pre_fc_norm_hidden.weight,
+                self.pre_fc_norm_embedding.variance_epsilon,
+                self.pre_fc_norm_hidden.variance_epsilon,
+                tp_size if chunked else 1, tp_rank if chunked else 0,
+                kv_lens=attn_metadata.kv_lens_cuda if kv_inc else None,
+                kv_rows=kv_inc)
+        else:
+            if kv_inc:
+                attn_metadata.kv_lens_cuda[:kv_inc] += 1
+            hidden_states = self._q35_stock_fc_input(input_ids, hidden_states,
+                                                     embed_tokens, chunked,
+                                                     tp_size, tp_rank)
+
+        residual = None
+        fc_zero = None
+        if (_Q35_AR_NORM_FUSE and self.fc.all_reduce is not None
+                and q35_mnnvl_fusable(self.fc.all_reduce,
+                                      hidden_states.shape[0])):
+            fc_zero = q35_zero_residual(
+                (hidden_states.shape[0], self.fc.out_features),
+                hidden_states.dtype, hidden_states.device)
+        fc_cute = None
+        if fc_zero is not None and _Q35_MTP_FC_CUTE_AR and _Q35_FUSED_AR == "all":
+            fc_cute = _q35_triton_ar(self.fc.all_reduce, hidden_states.shape[0],
+                                     False, self.fc.out_features)
+        if fc_cute is not None:
+            # TRTLLM_Q35_MTP_FC_CUTE_AR: this rank's fc partial, then the CuTe all-reduce +
+            # input_layernorm with the zero residual (residual output = the fc sum).
+            partial = self.fc(
+                hidden_states,
+                all_reduce_params=AllReduceParams(enable_allreduce=False))
+            hidden_states, residual = fc_cute(
+                fc_zero,
+                _fused_norm_weight(self.input_layernorm),
+                self.input_layernorm.variance_epsilon,
+                x=partial)
+        elif fc_zero is not None:
+            # fc all-reduce + input_layernorm in one launch; the residual output is the fc sum.
+            hidden_states, residual = self.fc(
+                hidden_states,
+                all_reduce_params=AllReduceParams(
+                    fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
+                    residual=fc_zero,
+                    norm_weight=_fused_norm_weight(self.input_layernorm),
+                    eps=self.input_layernorm.variance_epsilon))
+        else:
+            hidden_states = self.fc(hidden_states)
+
+        hidden_states, residual = super().forward(
+            position_ids=position_ids,
+            hidden_states=hidden_states,
+            attn_metadata=attn_metadata,
+            residual=residual,
+            spec_metadata=spec_metadata,
+            **kwargs,
+        )
+        if not (_Q35_AR_NORM_FUSE and self.fusion_config.POST_MOE_FUSION):
+            hidden_states, _ = self.shared_head.norm(hidden_states, residual)
+        if spec_metadata is not None:
+            spec_metadata.maybe_capture_hidden_states(0, hidden_states, None)
+
+        return hidden_states
+
+    def _q35_stock_fc_input(self, input_ids, hidden_states, embed_tokens,
+                            chunked, tp_size, tp_rank):
+        """The stock fc input: chunk(concat([norm(embed(ids)), norm(hidden)]))"""
 
         def norm_embeds():
+            if (_Q35_AR_NORM_FUSE and embed_tokens.tp_size > 1
+                    and embed_tokens.tp_mode == TensorParallelMode.COLUMN
+                    and q35_mnnvl_fusable(embed_tokens.all_reduce,
+                                          input_ids.numel())):
+                # Embedding all-reduce + pre_fc_norm_embedding in one launch.
+                return embed_tokens(
+                    input_ids,
+                    all_reduce_params=AllReduceParams(
+                        fusion_op=AllReduceFusionOp.RMS_NORM,
+                        norm_weight=_fused_norm_weight(
+                            self.pre_fc_norm_embedding),
+                        eps=self.pre_fc_norm_embedding.variance_epsilon))
             return self.pre_fc_norm_embedding(embed_tokens(input_ids))
 
         def norm_hidden():
@@ -898,26 +1787,8 @@ class Qwen3NextMTP(Qwen3NextFullAttentionDecoderLayer):
             disable_on_compile=True,
         )
         hidden_states = torch.concat([inputs_embeds, hidden_states], dim=-1)
-
-        tp_size = self.model_config.mapping.tp_size
-        tp_rank = self.model_config.mapping.tp_rank
-        if tp_size > 1 and not self.model_config.mapping.enable_attention_dp:
+        if chunked:
             hidden_states = torch.chunk(hidden_states, tp_size, dim=-1)[tp_rank]
-
-        hidden_states = self.fc(hidden_states)
-
-        hidden_states, residual = super().forward(
-            position_ids=position_ids,
-            hidden_states=hidden_states,
-            attn_metadata=attn_metadata,
-            residual=None,
-            spec_metadata=spec_metadata,
-            **kwargs,
-        )
-        hidden_states, _ = self.shared_head.norm(hidden_states, residual)
-        if spec_metadata is not None:
-            spec_metadata.maybe_capture_hidden_states(0, hidden_states, None)
-
         return hidden_states
 
 
@@ -950,13 +1821,17 @@ class Qwen3NextModel(DecoderModel):
                 "all_reduce",
             ]
 
-        if model_config.mapping.enable_attention_dp:
+        if model_config.mapping.enable_attention_dp or _Q35_REPLICATED_EMBED:
             # When attention_dp is enabled, we cannot do all_reduce since
             # the problem size of different ranks are different.
             # So, we don't do parallelism here.
+            # TRTLLM_Q35_REPLICATED_EMBED: the full table on every rank removes the
+            # vocab-parallel all-reduce of every target and MTP embedding lookup.
             self.embed_tokens = Embedding(pretrained_config.vocab_size,
                                           pretrained_config.hidden_size,
                                           dtype=pretrained_config.torch_dtype)
+            if _Q35_REPLICATED_EMBED and _Q35_EMBED_GATHER:
+                self.embed_tokens.__dict__["q35_gather"] = True
         else:
             self.embed_tokens = Embedding(
                 pretrained_config.vocab_size,
@@ -1003,11 +1878,27 @@ class Qwen3NextModel(DecoderModel):
             attn_metadata.mamba_metadata = Mamba2Metadata(
                 attn_metadata.max_num_requests, chunk_size=128)
 
+        residual = None
         if inputs_embeds is None:
-            inputs_embeds = self.embed_tokens(input_ids)
+            emb = self.embed_tokens
+            zero = None
+            if (_Q35_AR_NORM_FUSE and emb.tp_size > 1
+                    and emb.tp_mode == TensorParallelMode.COLUMN
+                    and q35_mnnvl_fusable(emb.all_reduce, input_ids.numel())):
+                zero = q35_zero_residual((input_ids.numel(), emb.embedding_dim),
+                                         emb.dtype, input_ids.device)
+            if zero is not None:
+                # Embedding all-reduce + layer 0's input_layernorm (+ its FP8 input) in one
+                # launch; layer 0 then skips its norm (residual given).
+                inputs_embeds, residual = _q35_fused_norm_allreduce(
+                    lambda x, all_reduce_params: emb(
+                        input_ids, all_reduce_params=all_reduce_params),
+                    None, zero, self.layers[0].input_layernorm,
+                    self.layers[0])
+            else:
+                inputs_embeds = self.embed_tokens(input_ids)
 
         hidden_states = inputs_embeds
-        residual = None
         for decoder_layer in self.layers[:self.num_hidden_layers]:
             hidden_states, residual = decoder_layer(
                 position_ids=position_ids,
@@ -1096,7 +1987,28 @@ class Qwen3NextForCausalLM(SpecDecOneEngineForCausalLM[Qwen3NextModel,
             else:
                 layer.next_layer_layernorm = self.model.layers[
                     idx + 1].input_layernorm
+                if _Q35_AR_FP8_OUT:
+                    # Plain attribute (not a registered submodule) for _q35_fused_norm_allreduce.
+                    layer.__dict__["_q35_next_layer"] = self.model.layers[idx +
+                                                                          1]
 
     def cache_derived_state(self) -> None:
         super().cache_derived_state()
         _precompute_fused_norm_weights(self)
+        self._build_q35_draft_head()
+
+    def _build_q35_draft_head(self) -> None:
+        """TRTLLM_Q35_DRAFT_FP8_HEAD=1: draft-only MXFP8 copy of this rank's LM-head shard for the
+        one-model MTP draft loop (see ``modules/q35_draft_head.py``); the target head stays BF16."""
+        from ..modules.q35_draft_head import (build_draft_head_if_enabled,
+                                              draft_fp8_head_enabled)
+        if self.draft_model is None or not draft_fp8_head_enabled():
+            return
+        spec_config = self.model_config.spec_config
+        if (spec_config is None
+                or not spec_config.spec_dec_mode.is_mtp_eagle_one_model()):
+            return
+        # Rebuild from the current BF16 weights (idempotent on reloads).
+        self.draft_model.q35_draft_head = None
+        self.draft_model.q35_draft_head = build_draft_head_if_enabled(
+            self.lm_head, self.model_config.mapping)

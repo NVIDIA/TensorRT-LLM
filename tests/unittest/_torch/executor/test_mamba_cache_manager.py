@@ -2657,6 +2657,547 @@ def test_v2_hybrid_saves_conversation_plan_only_after_final_context_chunk():
     assert not kv_cache.enable_swa_scratch_reuse
 
 
+# Branch-point Mamba snapshots (TRTLLM_Q35_BRANCH_SNAPSHOT; upstream #18272
+# and #18724). The switch is read from the environment at import time,
+# so these tests turn on the per-instance flag that _setup_branch_snapshot()
+# derives from it.
+
+
+def _branch_snapshot_manager(
+    enable_branch_snapshot=True,
+    enable_block_reuse=True,
+    tokens_per_block=32,
+    local_num_mamba_layers=1,
+    periodic_snapshot_interval=0,
+    additional_snapshot_offsets_from_end=None,
+    rank=0,
+):
+    """Bare V2 hybrid manager carrying only what branch snapshotting reads."""
+    mgr = object.__new__(MambaHybridCacheManagerV2)
+    mgr.enable_block_reuse = enable_block_reuse
+    mgr.is_draft = False
+    mgr.tokens_per_block = tokens_per_block
+    mgr.local_num_mamba_layers = local_num_mamba_layers
+    mgr.mapping = SimpleNamespace(rank=rank)
+    mgr.kv_cache_config = KvCacheConfig(
+        enable_block_reuse=enable_block_reuse,
+        mamba_state_config=MambaStateConfig(
+            periodic_snapshot_interval=periodic_snapshot_interval,
+            additional_snapshot_offsets_from_end=list(additional_snapshot_offsets_from_end or []),
+        ),
+    )
+    mgr._init_branch_snapshot_state()
+    mgr._enable_branch_snapshot = enable_branch_snapshot and enable_block_reuse
+    mgr._augment_tokens_for_block_reuse = lambda tokens, request, start=0, end=None: tokens[
+        start:end
+    ]
+    return mgr
+
+
+def _fake_reuse_match(divergence, hybrid=None, reused=0):
+    """Stand-in for a _KVCache exposing only the reuse-depth diagnostics."""
+    return SimpleNamespace(
+        _get_num_reusable_tokens_before_pruning=lambda: divergence,
+        _get_num_reusable_tokens_before_hybrid_pruning=lambda: (
+            divergence if hybrid is None else hybrid
+        ),
+        num_committed_tokens=reused,
+    )
+
+
+def _fake_context_request(
+    rid=1,
+    prompt_len=256,
+    context_current_position=0,
+    is_dummy=False,
+    expect_snapshot_points=None,
+):
+    return SimpleNamespace(
+        py_request_id=rid,
+        prompt_len=prompt_len,
+        context_current_position=context_current_position,
+        context_remaining_length=prompt_len - context_current_position,
+        is_dummy=is_dummy,
+        is_dummy_request=is_dummy,
+        is_disagg_generation_init_state=False,
+        lora_task_id=None,
+        cache_salt=None,
+        py_multimodal_data=None,
+        expect_snapshot_points=list(expect_snapshot_points or []),
+    )
+
+
+def test_branch_snapshot_uses_divergence_depth_not_page_pruned_depth():
+    """The point tracks content divergence, not how far pages happen to survive.
+
+    Attention pages have been evicted back to 64, but the fork is at 192. This
+    request re-prefills through 192 either way, so snapshotting there is what
+    lets a later sibling reuse the whole shared prefix.
+    """
+    mgr = _branch_snapshot_manager()
+    request = _fake_context_request(prompt_len=256, context_current_position=64)
+    kv_cache = _fake_reuse_match(divergence=192, hybrid=64, reused=64)
+
+    mgr._record_branch_snapshot_point(request, kv_cache, num_lookup_tokens=255)
+
+    assert mgr._branch_snapshot_points == {1: 192}
+    assert request.expect_snapshot_points == [192, 256]
+    assert mgr._branch_snapshots_recorded_total == 1
+    assert mgr._branch_snapshots_taken_total == 0
+    assert mgr._branch_snapshots_skipped_total == {}
+
+
+def test_branch_snapshot_point_is_aligned_down_to_tokens_per_block():
+    mgr = _branch_snapshot_manager(tokens_per_block=64)
+    request = _fake_context_request(prompt_len=512)
+    kv_cache = _fake_reuse_match(divergence=200)
+
+    mgr._record_branch_snapshot_point(request, kv_cache, num_lookup_tokens=511)
+
+    assert mgr._branch_snapshot_points == {1: 192}
+    assert request.expect_snapshot_points == [192, 512]
+
+
+def test_branch_snapshot_skipped_when_whole_lookup_matched():
+    """No fork: the request duplicates a cached prefix end to end."""
+    mgr = _branch_snapshot_manager()
+    request = _fake_context_request(prompt_len=256, context_current_position=255)
+    kv_cache = _fake_reuse_match(divergence=255, reused=255)
+
+    mgr._record_branch_snapshot_point(request, kv_cache, num_lookup_tokens=255)
+
+    assert mgr._branch_snapshot_points == {}
+    assert mgr._branch_snapshots_taken_total == 0
+    assert mgr._branch_snapshots_skipped_total == {"no_divergence": 1}
+
+
+def test_branch_snapshot_skipped_when_reuse_already_reached_the_fork():
+    """Reuse got there, so a snapshot at that depth already exists."""
+    mgr = _branch_snapshot_manager()
+    request = _fake_context_request(prompt_len=256, context_current_position=96)
+    kv_cache = _fake_reuse_match(divergence=100, hybrid=100, reused=96)
+
+    mgr._record_branch_snapshot_point(request, kv_cache, num_lookup_tokens=255)
+
+    assert mgr._branch_snapshot_points == {}
+    assert mgr._branch_snapshots_skipped_total == {"already_reused": 1}
+
+
+def test_branch_snapshot_skipped_at_or_after_the_prompt_end():
+    """A branch point at or beyond the prompt end cannot improve sibling reuse."""
+    mgr = _branch_snapshot_manager()
+    request = _fake_context_request(prompt_len=128)
+    kv_cache = _fake_reuse_match(divergence=130)
+
+    mgr._record_branch_snapshot_point(request, kv_cache, num_lookup_tokens=255)
+
+    assert mgr._branch_snapshot_points == {}
+    assert mgr._branch_snapshots_skipped_total == {"at_prompt_end": 1}
+
+
+def test_branch_snapshot_skipped_when_divergence_aligns_away_to_zero():
+    mgr = _branch_snapshot_manager(tokens_per_block=32)
+    request = _fake_context_request(prompt_len=256)
+    kv_cache = _fake_reuse_match(divergence=20)
+
+    mgr._record_branch_snapshot_point(request, kv_cache, num_lookup_tokens=255)
+
+    assert mgr._branch_snapshot_points == {}
+    assert mgr._branch_snapshots_skipped_total == {"aligned_to_zero": 1}
+
+
+def test_branch_snapshot_skipped_without_a_fresh_match():
+    """A resumed cache was never matched, so it has no divergence depth."""
+    mgr = _branch_snapshot_manager()
+    request = _fake_context_request()
+    kv_cache = _fake_reuse_match(divergence=192)
+
+    mgr._record_branch_snapshot_point(request, kv_cache, num_lookup_tokens=None)
+
+    assert mgr._branch_snapshot_points == {}
+    assert mgr._branch_snapshots_skipped_total == {"no_fresh_match": 1}
+
+
+def test_branch_snapshot_reapplied_against_reuse_depth_after_failed_resume():
+    """A point recorded before resume() failed is re-applied on the next attempt."""
+    mgr = _branch_snapshot_manager()
+    request = _fake_context_request(prompt_len=256, context_current_position=64)
+    kv_cache = _fake_reuse_match(divergence=192, reused=64)
+
+    mgr._record_branch_snapshot_point(request, kv_cache, num_lookup_tokens=255)
+    assert request.expect_snapshot_points == [192, 256]
+
+    # The next scheduler pass rebuilt the list from a cursor that still
+    # describes the abandoned attempt; the cache's reuse depth is what counts.
+    request.expect_snapshot_points = [256]
+    request.context_current_position = 200
+    mgr._record_branch_snapshot_point(request, kv_cache, num_lookup_tokens=None)
+
+    assert request.expect_snapshot_points == [192, 256]
+    assert mgr._branch_snapshots_skipped_total == {"no_fresh_match": 1}
+
+
+def test_branch_snapshot_is_inert_when_the_switch_is_off():
+    mgr = _branch_snapshot_manager(enable_branch_snapshot=False)
+    request = _fake_context_request(prompt_len=256)
+    kv_cache = _fake_reuse_match(divergence=192, hybrid=64, reused=64)
+
+    mgr._record_branch_snapshot_point(request, kv_cache, num_lookup_tokens=255)
+    mgr.prepare_expect_snapshot_points([request])
+
+    assert mgr._branch_snapshot_points == {}
+    assert mgr._branch_snapshots_taken_total == 0
+    assert mgr._branch_snapshots_skipped_total == {}
+    assert mgr._snapshot_pruned_tokens_total == 0
+    assert mgr._page_pruned_tokens_total == 0
+    assert mgr._fresh_matches_total == 0
+    # No prompt-end point either: the switch is what turns that on.
+    assert request.expect_snapshot_points == []
+
+
+def test_branch_snapshot_points_match_on_attention_only_pp_rank():
+    mamba_mgr = _branch_snapshot_manager(local_num_mamba_layers=1)
+    attention_mgr = _branch_snapshot_manager(local_num_mamba_layers=0)
+    mamba_request = _fake_context_request(prompt_len=256)
+    attention_request = _fake_context_request(prompt_len=256)
+    kv_cache = _fake_reuse_match(divergence=192, hybrid=64, reused=64)
+
+    mamba_mgr._record_branch_snapshot_point(mamba_request, kv_cache, num_lookup_tokens=255)
+    attention_mgr._record_branch_snapshot_point(attention_request, kv_cache, num_lookup_tokens=255)
+
+    assert mamba_request.expect_snapshot_points == [192, 256]
+    assert attention_request.expect_snapshot_points == [192, 256]
+    assert mamba_mgr._branch_snapshot_points == attention_mgr._branch_snapshot_points
+    assert mamba_mgr._page_pruned_tokens_total == 192 - 64
+    assert attention_mgr._snapshot_pruned_tokens_total == 0
+    assert attention_mgr._page_pruned_tokens_total == 0
+
+
+def test_branch_snapshot_skipped_for_dummy_and_generation_only_requests():
+    mgr = _branch_snapshot_manager()
+    dummy = _fake_context_request(prompt_len=256, is_dummy=True)
+    generation_only = _fake_context_request(rid=2, prompt_len=256)
+    generation_only.is_disagg_generation_init_state = True
+    kv_cache = _fake_reuse_match(divergence=192, hybrid=64, reused=64)
+
+    mgr._record_branch_snapshot_point(dummy, kv_cache, num_lookup_tokens=255)
+    mgr._record_branch_snapshot_point(generation_only, kv_cache, num_lookup_tokens=255)
+
+    assert mgr._branch_snapshot_points == {}
+    assert mgr._branch_snapshots_taken_total == 0
+    assert mgr._branch_snapshots_skipped_total == {}
+    assert mgr._snapshot_pruned_tokens_total == 0
+    assert mgr._fresh_matches_total == 0
+
+
+def test_branch_snapshot_point_survives_a_second_scheduler_pass():
+    """prepare_expect_snapshot_points overwrites the list on every pass."""
+    mgr = _branch_snapshot_manager()
+    request = _fake_context_request(prompt_len=256)
+    kv_cache = _fake_reuse_match(divergence=192)
+
+    mgr._record_branch_snapshot_point(request, kv_cache, num_lookup_tokens=255)
+    assert request.expect_snapshot_points == [192, 256]
+
+    mgr.prepare_expect_snapshot_points([request])
+    assert request.expect_snapshot_points == [192, 256]
+
+    mgr.prepare_expect_snapshot_points([request])
+    assert request.expect_snapshot_points == [192, 256]
+
+
+def test_branch_snapshot_drops_the_point_once_prefill_passes_it():
+    """Past the fork, the point is no longer a reachable chunk boundary."""
+    mgr = _branch_snapshot_manager()
+    request = _fake_context_request(prompt_len=256)
+    kv_cache = _fake_reuse_match(divergence=192)
+
+    mgr._record_branch_snapshot_point(request, kv_cache, num_lookup_tokens=255)
+    request.context_current_position = 192
+
+    mgr.prepare_expect_snapshot_points([request])
+
+    assert request.expect_snapshot_points == [256]
+    assert mgr._branch_snapshots_taken_total == 0
+
+
+def test_branch_snapshot_taken_counts_successful_commit_once():
+    mgr = _branch_snapshot_manager()
+    mgr._mark_context_position_as_history = MagicMock()
+    request = _fake_context_request(prompt_len=256, context_current_position=64)
+    request.get_tokens = lambda beam_idx: list(range(256))
+    kv_cache = _fake_reuse_match(divergence=192, hybrid=64, reused=64)
+
+    def commit(tokens):
+        kv_cache.num_committed_tokens += len(tokens)
+
+    kv_cache.commit = MagicMock(side_effect=commit)
+    mgr._record_branch_snapshot_point(request, kv_cache, num_lookup_tokens=255)
+    assert mgr._branch_snapshots_taken_total == 0
+
+    request.context_current_position = 192
+    request.context_remaining_length = 64
+    mgr.try_commit_blocks(request, kv_cache)
+    mgr.try_commit_blocks(request, kv_cache)
+
+    kv_cache.commit.assert_called_once_with(list(range(64, 192)))
+    assert mgr._branch_snapshots_taken_total == 1
+    mgr._mark_context_position_as_history.assert_not_called()
+
+
+def test_branch_snapshot_adds_prompt_end_without_configured_placement():
+    """Keep branch snapshots usable when no baseline placement is configured.
+
+    A branch point below the prompt end must not become the maximum, or the
+    feature would stop committing at the branch point.
+    """
+    mgr = _branch_snapshot_manager()
+    request = _fake_context_request(prompt_len=256)
+    kv_cache = _fake_reuse_match(divergence=192)
+
+    mgr._record_branch_snapshot_point(request, kv_cache, num_lookup_tokens=255)
+
+    assert max(request.expect_snapshot_points) == request.prompt_len
+
+
+def test_branch_snapshot_preserves_configured_nonzero_end_offset():
+    """Do not replace a same-block recurrent checkpoint before prompt end."""
+    mgr = _branch_snapshot_manager(
+        tokens_per_block=64,
+        additional_snapshot_offsets_from_end=[2],
+    )
+    request = _fake_context_request(prompt_len=256)
+    kv_cache = _fake_reuse_match(divergence=192)
+
+    mgr.prepare_expect_snapshot_points([request])
+    assert request.expect_snapshot_points == [254]
+
+    mgr._record_branch_snapshot_point(request, kv_cache, num_lookup_tokens=255)
+    assert request.expect_snapshot_points == [192, 254]
+
+    mgr.prepare_expect_snapshot_points([request])
+    assert request.expect_snapshot_points == [192, 254]
+
+
+def test_branch_snapshot_points_stay_sorted_and_deduplicated():
+    mgr = _branch_snapshot_manager(
+        periodic_snapshot_interval=64,
+        additional_snapshot_offsets_from_end=[0, 64],
+    )
+    # 192 coincides with both a periodic point and prompt_len - 64.
+    request = _fake_context_request(prompt_len=256)
+    kv_cache = _fake_reuse_match(divergence=192)
+
+    mgr._record_branch_snapshot_point(request, kv_cache, num_lookup_tokens=255)
+    mgr.prepare_expect_snapshot_points([request])
+
+    assert request.expect_snapshot_points == [64, 128, 192, 256]
+
+
+def test_branch_snapshot_counters_separate_snapshot_loss_from_page_loss():
+    """The two losses need different fixes, so they are counted apart."""
+    mgr = _branch_snapshot_manager()
+    request = _fake_context_request(rid=5, prompt_len=1024)
+    kv_cache = _fake_reuse_match(divergence=512, hybrid=320, reused=128)
+
+    mgr._record_branch_snapshot_point(request, kv_cache, num_lookup_tokens=1023)
+
+    # Matched in attention but pruned for want of a snapshot.
+    assert mgr._snapshot_pruned_tokens_total == 320 - 128
+    # Shared content whose attention pages were already evicted.
+    assert mgr._page_pruned_tokens_total == 512 - 320
+
+
+def test_branch_snapshot_counters_accumulate_across_requests():
+    mgr = _branch_snapshot_manager()
+    for rid in (1, 2, 3):
+        request = _fake_context_request(rid=rid, prompt_len=1024)
+        mgr._record_branch_snapshot_point(
+            request,
+            _fake_reuse_match(divergence=512, hybrid=320, reused=128),
+            num_lookup_tokens=1023,
+        )
+
+    assert mgr._branch_snapshots_taken_total == 0
+    assert mgr._snapshot_pruned_tokens_total == 3 * (320 - 128)
+    assert mgr._page_pruned_tokens_total == 3 * (512 - 320)
+    assert mgr._branch_snapshot_points == {1: 512, 2: 512, 3: 512}
+    assert mgr._fresh_matches_total == 3
+    assert mgr._fresh_match_lookup_tokens_total == 3 * 1023
+    assert mgr._fresh_match_reused_tokens_total == 3 * 128
+
+
+def test_branch_snapshot_hit_counts_reuse_that_ends_at_a_taken_branch_point():
+    """Sibling 2 snapshots the fork; sibling 3's reuse ending there is a hit."""
+    mgr = _branch_snapshot_manager(tokens_per_block=32)
+    mgr._mark_context_position_as_history = MagicMock()
+    shared = list(range(1000, 1064))
+
+    sibling2_tokens = shared + list(range(2000, 2032))
+    sibling2 = _fake_context_request(rid=2, prompt_len=96)
+    sibling2.get_tokens = lambda beam_idx: sibling2_tokens
+    kv_cache2 = _fake_reuse_match(divergence=64)
+
+    def commit(tokens):
+        kv_cache2.num_committed_tokens += len(tokens)
+
+    kv_cache2.commit = MagicMock(side_effect=commit)
+    mgr._record_branch_snapshot_point(
+        sibling2, kv_cache2, num_lookup_tokens=95, lookup_tokens=sibling2_tokens[:95]
+    )
+    assert sibling2.expect_snapshot_points == [64, 96]
+    sibling2.context_current_position = 64
+    sibling2.context_remaining_length = 32
+    mgr.try_commit_blocks(sibling2, kv_cache2)
+    assert mgr._branch_snapshots_taken_total == 1
+
+    sibling3_tokens = shared + list(range(3000, 3032))
+    sibling3 = _fake_context_request(rid=3, prompt_len=96, context_current_position=64)
+    mgr._record_branch_snapshot_point(
+        sibling3,
+        _fake_reuse_match(divergence=64, reused=64),
+        num_lookup_tokens=95,
+        lookup_tokens=sibling3_tokens[:95],
+    )
+    assert mgr._branch_snapshot_hits_total == 1
+    assert mgr._branch_snapshot_hit_tokens_total == 64
+    assert mgr._branch_snapshots_skipped_total == {"already_reused": 1}
+
+    # Reuse of different content at the same depth is not a branch snapshot hit.
+    unrelated_tokens = list(range(5000, 5095))
+    unrelated = _fake_context_request(rid=4, prompt_len=96, context_current_position=64)
+    mgr._record_branch_snapshot_point(
+        unrelated,
+        _fake_reuse_match(divergence=64, reused=64),
+        num_lookup_tokens=95,
+        lookup_tokens=unrelated_tokens,
+    )
+    assert mgr._branch_snapshot_hits_total == 1
+    assert mgr._fresh_matches_total == 3
+    assert mgr._fresh_match_reused_tokens_total == 128
+
+
+@pytest.mark.parametrize(("rank", "expected_log_count"), [(0, 1), (3, 0)])
+def test_branch_snapshot_counters_logged_by_rank_zero_once_per_interval(
+    monkeypatch: pytest.MonkeyPatch,
+    rank: int,
+    expected_log_count: int,
+) -> None:
+    log_info = MagicMock()
+    monkeypatch.setattr("tensorrt_llm._torch.pyexecutor.mamba_cache_manager.logger.info", log_info)
+    mgr = _branch_snapshot_manager(rank=rank)
+    for rid in (1, 2, 3):
+        mgr._record_branch_snapshot_point(
+            _fake_context_request(rid=rid, prompt_len=1024),
+            _fake_reuse_match(divergence=512, hybrid=320, reused=128),
+            num_lookup_tokens=1023,
+        )
+
+    assert log_info.call_count == expected_log_count
+    if rank == 0:
+        message = log_info.call_args.args[0]
+        assert message.startswith("TRTLLM_Q35_BRANCH_SNAPSHOT: fresh_matches=1 ")
+        assert "branch_snapshot_hits=0" in message
+
+
+def test_branch_snapshot_point_is_released_with_the_request(monkeypatch: pytest.MonkeyPatch):
+    base_free_resources = MagicMock()
+    monkeypatch.setattr(KVCacheManagerV2, "free_resources", base_free_resources)
+    mgr = _branch_snapshot_manager()
+    mgr.kv_cache_map = {}
+    mgr._request_id_to_state_index = {}
+    mgr._request_id_to_is_dummy = {}
+    request = _fake_context_request(rid=11, prompt_len=128)
+    mgr._record_branch_snapshot_point(
+        request, _fake_reuse_match(divergence=64), num_lookup_tokens=127
+    )
+    assert mgr._branch_snapshot_points == {11: 64}
+
+    mgr.free_resources(request)
+
+    assert mgr._branch_snapshot_points == {}
+    base_free_resources.assert_called_once_with(request, False)
+
+
+def test_branch_snapshot_switch_requires_reuse_depth_bindings(monkeypatch: pytest.MonkeyPatch):
+    """Stale bindings must fail at startup instead of silently disabling the switch."""
+    module = "tensorrt_llm._torch.pyexecutor.mamba_cache_manager"
+    monkeypatch.setattr(f"{module}._Q35_BRANCH_SNAPSHOT", True)
+    monkeypatch.setattr(f"{module}._KVCache", type("_StaleKVCache", (), {}))
+    mgr = _branch_snapshot_manager(enable_branch_snapshot=False)
+
+    with pytest.raises(RuntimeError, match="_get_num_reusable_tokens_before_pruning"):
+        mgr._setup_branch_snapshot()
+
+
+def test_branch_snapshot_switch_needs_block_reuse_and_logs_once(monkeypatch: pytest.MonkeyPatch):
+    module = "tensorrt_llm._torch.pyexecutor.mamba_cache_manager"
+    monkeypatch.setattr(f"{module}._Q35_BRANCH_SNAPSHOT", True)
+    monkeypatch.setattr(
+        f"{module}._KVCache",
+        SimpleNamespace(
+            _get_num_reusable_tokens_before_pruning=None,
+            _get_num_reusable_tokens_before_hybrid_pruning=None,
+        ),
+    )
+    log_info = MagicMock()
+    monkeypatch.setattr(f"{module}.logger.info", log_info)
+
+    without_reuse = _branch_snapshot_manager(enable_branch_snapshot=False, enable_block_reuse=False)
+    without_reuse._setup_branch_snapshot()
+    assert not without_reuse._enable_branch_snapshot
+
+    draft = _branch_snapshot_manager(enable_branch_snapshot=False)
+    draft.is_draft = True
+    draft._setup_branch_snapshot()
+    assert not draft._enable_branch_snapshot
+    log_info.assert_not_called()
+
+    mgr = _branch_snapshot_manager(
+        enable_branch_snapshot=False, tokens_per_block=64, additional_snapshot_offsets_from_end=[2]
+    )
+    mgr.block_reuse_policy = BlockReusePolicy.PER_CONVERSATION
+    mgr._setup_branch_snapshot()
+    assert mgr._enable_branch_snapshot
+    log_info.assert_called_once()
+    assert log_info.call_args.args[0].startswith(
+        "TRTLLM_Q35_BRANCH_SNAPSHOT: branch-point Mamba snapshots on (tokens_per_block=64"
+    )
+
+
+def test_branch_snapshot_interior_point_is_a_plain_chunk_boundary_for_inforward_snapshot():
+    """An interior branch point ends a normal chunk; the in-forward snapshot path
+    still takes only the last snapshot point, prompt_len - 2, with its short tail.
+    """
+    from tensorrt_llm._torch.pyexecutor.scheduler.scheduler import _get_forced_context_chunk_size
+    from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import KVCacheV2Scheduler
+
+    mgr = _branch_snapshot_manager(tokens_per_block=64, additional_snapshot_offsets_from_end=[2])
+    request = _fake_context_request(prompt_len=4000)
+    mgr.prepare_expect_snapshot_points([request])
+    assert request.expect_snapshot_points == [3998]
+    mgr._record_branch_snapshot_point(
+        request, _fake_reuse_match(divergence=3000), num_lookup_tokens=3999
+    )
+    assert request.expect_snapshot_points == [2944, 3998]
+
+    scheduler = object.__new__(KVCacheV2Scheduler)
+    scheduler.kv_cache_manager = SimpleNamespace(q35_inforward_max_tail=16, q35_inforward_min_main=3)
+    scheduler.max_context_length = None
+
+    chunk_size = _get_forced_context_chunk_size(request)
+    assert chunk_size == 2944
+    assert scheduler._q35_inforward_point(request, chunk_size, 16384) is None
+
+    request.context_current_position = 2944
+    request.context_remaining_length = 4000 - 2944
+    mgr.prepare_expect_snapshot_points([request])
+    assert request.expect_snapshot_points == [3998]
+    chunk_size = _get_forced_context_chunk_size(request)
+    assert chunk_size == 3998 - 2944
+    assert scheduler._q35_inforward_point(request, chunk_size, 16384) == 3998
+
+
 @skip_no_cuda
 def test_v2_hybrid_mamba_state_views_use_logical_slots():
     mgr = _build_v2_hybrid_with_mamba_layer(max_batch_size=4, num_mamba_layers=2)

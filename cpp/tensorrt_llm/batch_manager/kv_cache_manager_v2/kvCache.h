@@ -321,6 +321,20 @@ public:
         return static_cast<int>(mCommittedTokens.size());
     }
 
+    // Internal diagnostic: prefix supported by the attention pages alone,
+    // before recurrent-state (SSM) snapshot pruning shortened the reuse.
+    int numReusableTokensBeforeHybridPruning() const noexcept
+    {
+        return mNumReusableTokensBeforeHybridPruning;
+    }
+
+    // Raw radix-tree walk depth of the reuse lookup, before any pruning: where
+    // this sequence's content diverges from the cached prefixes.
+    int numReusableTokensBeforePruning() const noexcept
+    {
+        return mNumReusableTokensBeforePruning;
+    }
+
     std::vector<TokenIdExt> const& committedTokens() const noexcept
     {
         return mCommittedTokens;
@@ -624,6 +638,11 @@ private:
     // SWA scratch slot support.
     bool mEnableSwaScratchReuse = false;
     TypedVec<LifeCycleId, std::vector<ScratchSlotLock>> mScratchSlots;
+
+    // Reuse-lookup diagnostics captured from the reuse match (see ReuseMatch).
+    // Kept last so the offsets of the members above do not move.
+    int mNumReusableTokensBeforeHybridPruning = 0;
+    int mNumReusableTokensBeforePruning = 0;
 };
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

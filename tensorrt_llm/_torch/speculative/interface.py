@@ -49,6 +49,41 @@ from ..pyexecutor.sampler.ops.flashinfer import (
     sample_from_logits_op, sampling_batch_spec_dec_one_model_for_rejection)
 from ..pyexecutor.sampler.ops.vanilla import greedy_search_sampling_batch
 
+# TRTLLM_Q35_SAMPLING_PARAMS_CACHE=1: skip the one-model sampling-parameter
+# refills a steady decode batch would repeat (upstream 089a2573ac). Default off.
+SAMPLING_PARAMS_CACHE_ENV = "TRTLLM_Q35_SAMPLING_PARAMS_CACHE"
+# TRTLLM_Q35_SAMPLING_SCAN_CACHE=1: _scan_one_model_sampling (run twice per step:
+# update_is_all_greedy_sample before the graph key, populate after) reuses its last
+# result when the batch is the same requests in the same states and slots, with the
+# same draft length and overrides; a request's sampling config is fixed for its
+# lifetime. Default off.
+SAMPLING_SCAN_CACHE_ENV = "TRTLLM_Q35_SAMPLING_SCAN_CACHE"
+
+# TRTLLM_Q35_TEMPERATURE_GRAPHS=1 (default off; requires
+# TRTLLM_Q35_SHARDED_TARGET_SAMPLING=1): capture a temperature-only variant of
+# the one-engine advanced-sampling CUDA graphs (graph key bit
+# ``q35_temperature_only``), so that steady decode of temperature-only batches
+# (no top-k / top-p, no rejection sampling) replays the vocabulary-sharded
+# Gumbel-max target sampling. The stock advanced-sampling graph is captured with
+# synthetic top-k / top-p values and therefore always records the stock sampler.
+Q35_TEMPERATURE_GRAPHS_ENV = "TRTLLM_Q35_TEMPERATURE_GRAPHS"
+
+
+def q35_temperature_graphs_enabled(spec_config, mapping) -> bool:
+    """Whether to capture the TRTLLM_Q35_TEMPERATURE_GRAPHS variant: the flag
+    and TRTLLM_Q35_SHARDED_TARGET_SAMPLING are set, the model runs one-model
+    MTP-Eagle, and the target head is plain TP (no attention DP), i.e. the
+    sharded target sampling can be taken at all."""
+    if os.environ.get(Q35_TEMPERATURE_GRAPHS_ENV, "0") != "1":
+        return False
+    if os.environ.get("TRTLLM_Q35_SHARDED_TARGET_SAMPLING", "0") != "1":
+        return False
+    if spec_config is None or mapping is None:
+        return False
+    if not spec_config.spec_dec_mode.is_mtp_eagle_one_model():
+        return False
+    return mapping.tp_size > 1 and not mapping.enable_attention_dp
+
 
 def rejection_sampling_one_model(
     draft_probs: torch.Tensor,
@@ -540,6 +575,12 @@ class SpecMetadata:
     # a greedy rank pulled onto the advanced path still samples greedily via
     # its sentinel params.
     group_all_greedy_sample: Optional[bool] = None
+    # TRTLLM_Q35_TEMPERATURE_GRAPHS: whether the temperature-only graph variant
+    # is captured (set by the model engine before that capture pass), and the
+    # graph key bit selecting it for the current batch (non-greedy, no top-k /
+    # top-p, no rejection sampling; see _scan_one_model_sampling).
+    q35_temperature_graphs: bool = False
+    q35_temperature_only: bool = False
     # Whether to use rejection sampling for one-model speculative decoding.
     use_rejection_sampling: bool = False
     # Advanced-sampling specialization (deploy-time; from DecodingBaseConfig.advanced_sampling_mode).
@@ -559,6 +600,23 @@ class SpecMetadata:
     request_temperatures: Optional[torch.Tensor] = None
     request_top_ks: Optional[torch.Tensor] = None
     request_top_ps: Optional[torch.Tensor] = None
+    # Describe what the sampling-parameter buffers currently hold, so a step
+    # that reproduces them can skip the refill. Two entries because the two
+    # buffer groups depend on different things:
+    #   [0] request_* -- the per-request values, in batch order.
+    #   [1] the expanded per-token buffers, which additionally depend on each
+    #       request's token count (a context request contributing one row
+    #       instead of draft_len + 1 shifts every later request's offset).
+    # A context->generation transition therefore invalidates [1] while leaving
+    # [0] valid. See _sampling_params_buffers_need_update.
+    #
+    # Held in a list rather than plain fields because
+    # create_cuda_graph_metadata shallow-copies this object: the graph views
+    # and the eager view write the *same* tensors, so they must agree on what
+    # those tensors hold. Plain fields would give each view its own stale
+    # answer and let one skip a fill another view invalidated.
+    _sampling_params_signature: list = field(
+        default_factory=lambda: [None, None], repr=False)
     # Whether to use sampling parameters when sampling draft tokens.
     use_sampling_params_for_draft_tokens: bool = False
     # Vocab size used for draft_probs buffer allocation.
@@ -693,6 +751,10 @@ class SpecMetadata:
         cuda_graph_metadata = copy.copy(self)
         cuda_graph_metadata.is_cuda_graph = True
         cuda_graph_metadata.max_num_requests = max_batch_size
+        # NB: the shallow copy deliberately keeps sharing
+        # _sampling_params_signature with this object. Both views write the
+        # same sampling-parameter tensors, so the record of what those tensors
+        # hold has to be shared too.
         cuda_graph_metadata.__post_init__()
         return cuda_graph_metadata
 
@@ -784,6 +846,22 @@ class SpecMetadata:
             )
 
         # Phase 1: collect per-request flags and normalized values.
+        scan_key = None
+        if os.environ.get(SAMPLING_SCAN_CACHE_ENV, "0") == "1":
+            scan_key = (tuple(
+                (request.py_request_id,
+                 request.state == LlmRequestState.GENERATION_IN_PROGRESS,
+                 request.py_seq_slot) for request in requests),
+                        self.runtime_draft_len,
+                        getattr(self, '_force_non_greedy_for_capture', False),
+                        self.group_all_greedy_sample, self.dummy_slot_row)
+            cached = getattr(self, "_q35_scan_cache", None)
+            if cached is not None and cached[0] == scan_key:
+                (_, per_request_normalized, per_request_slot_ids,
+                 self.skip_temperature, self.skip_top_k, self.skip_top_p,
+                 self.is_all_greedy_sample) = cached
+                return per_request_normalized, per_request_slot_ids
+
         per_request_normalized: list[tuple[float, int, float, int]] = []
         temperature_enabled = False
         top_k_enabled = False
@@ -852,6 +930,15 @@ class SpecMetadata:
                 (0.7, 50, 0.9, num_tokens)
                 for (_, _, _, num_tokens) in per_request_normalized
             ]
+            if getattr(self, '_q35_temperature_only_for_capture', False):
+                # TRTLLM_Q35_TEMPERATURE_GRAPHS capture pass: the
+                # temperature-only variant (top-k / top-p disabled).
+                self.skip_top_k = True
+                self.skip_top_p = True
+                per_request_normalized = [
+                    (0.7, DISABLE_TOPK_VAL, DISABLE_TOPP_VAL, num_tokens)
+                    for (_, _, _, num_tokens) in per_request_normalized
+                ]
 
         # Apply the group-synchronized override last (semantics: see the
         # ``group_all_greedy_sample`` field comment). Local contract: the
@@ -860,6 +947,19 @@ class SpecMetadata:
         # resurrect the local value.
         if self.group_all_greedy_sample is not None:
             self.is_all_greedy_sample = self.group_all_greedy_sample
+        # TRTLLM_Q35_TEMPERATURE_GRAPHS graph key bit (False unless that
+        # variant was captured, so the stock keys are unchanged otherwise).
+        # (getattr: duck-typed stand-ins of SpecMetadata predate the field.)
+        self.q35_temperature_only = bool(
+            getattr(self, "q35_temperature_graphs", False)
+            and not self.is_all_greedy_sample and self.skip_top_k
+            and self.skip_top_p
+            and not getattr(self, "use_rejection_sampling", False))
+        if scan_key is not None:
+            self._q35_scan_cache = (scan_key, per_request_normalized,
+                                    per_request_slot_ids, self.skip_temperature,
+                                    self.skip_top_k, self.skip_top_p,
+                                    self.is_all_greedy_sample)
         return per_request_normalized, per_request_slot_ids
 
     @property
@@ -922,6 +1022,8 @@ class SpecMetadata:
 
         if self.temperatures is None or self.temperatures.numel(
         ) < required_flat_size:
+            # Fresh tensors hold none of the recorded values.
+            self.invalidate_sampling_params_cache()
             # Allocate once; the captured graph reads from these stable addresses.
             self.temperatures = torch.ones(required_flat_size,
                                            dtype=torch.float32,
@@ -960,53 +1062,129 @@ class SpecMetadata:
             return
 
         # Phase 2: build per-token / per-request lists and copy to GPU.
-        temperatures: list[float] = []
-        top_ks: list[int] = []
-        top_ps: list[float] = []
-        request_temperatures: list[float] = []
-        request_top_ks: list[int] = []
-        request_top_ps: list[float] = []
-        for temp_val, tk_val, tp_val, num_tokens in per_request_normalized:
-            request_temperatures.append(temp_val)
-            request_top_ks.append(tk_val)
-            request_top_ps.append(tp_val)
-            temperatures.extend(temp_val for _ in range(num_tokens))
-            top_ks.extend(tk_val for _ in range(num_tokens))
-            top_ps.extend(tp_val for _ in range(num_tokens))
+        #
+        # Sampling params are fixed for a request's lifetime, so a steady-state
+        # decode batch reproduces the buffers it already holds. Both the host
+        # expansion and the copies sit on the critical path ahead of the
+        # forward, so skip whichever group is already current.
+        need_update_sampler_param, need_update_expanded_sampler_param = (
+            self._sampling_params_buffers_need_update(per_request_normalized))
+        if not (need_update_sampler_param
+                or need_update_expanded_sampler_param):
+            return
 
-        self.temperatures[:len(temperatures)].copy_(torch.tensor(
-            temperatures, dtype=torch.float32, pin_memory=prefer_pinned()),
-                                                    non_blocking=True)
-        self.top_ks[:len(top_ks)].copy_(torch.tensor(
-            top_ks, dtype=torch.int32, pin_memory=prefer_pinned()),
-                                        non_blocking=True)
-        self.top_ps[:len(top_ps)].copy_(torch.tensor(
-            top_ps, dtype=torch.float32, pin_memory=prefer_pinned()),
-                                        non_blocking=True)
-        self.request_temperatures[:len(request_temperatures)].copy_(
-            torch.tensor(request_temperatures,
-                         dtype=torch.float32,
-                         pin_memory=prefer_pinned()),
-            non_blocking=True)
-        self.request_top_ks[:len(request_top_ks)].copy_(
-            torch.tensor(request_top_ks,
-                         dtype=torch.int32,
-                         pin_memory=prefer_pinned()),
-            non_blocking=True,
-        )
-        self.request_top_ps[:len(request_top_ps)].copy_(
-            torch.tensor(request_top_ps,
-                         dtype=torch.float32,
-                         pin_memory=prefer_pinned()),
-            non_blocking=True,
-        )
+        if need_update_sampler_param:
+            request_temperatures: list[float] = []
+            request_top_ks: list[int] = []
+            request_top_ps: list[float] = []
+            for temp_val, tk_val, tp_val, _ in per_request_normalized:
+                request_temperatures.append(temp_val)
+                request_top_ks.append(tk_val)
+                request_top_ps.append(tp_val)
 
-        # Pre-compute top_k_max on the CPU so CUDA-graph capture does not
-        # encounter boolean-tensor indexing (dynamic size) or .item() calls.
-        # DISABLE_TOPK_VAL (INT32_MAX) is the sentinel for "top-k disabled".
-        _disable_topk = torch.iinfo(torch.int32).max
-        self.top_k_max = max(
-            (tk for tk in request_top_ks if 0 < tk < _disable_topk), default=0)
+            self.request_temperatures[:len(request_temperatures)].copy_(
+                torch.tensor(request_temperatures,
+                             dtype=torch.float32,
+                             pin_memory=prefer_pinned()),
+                non_blocking=True)
+            self.request_top_ks[:len(request_top_ks)].copy_(
+                torch.tensor(request_top_ks,
+                             dtype=torch.int32,
+                             pin_memory=prefer_pinned()),
+                non_blocking=True,
+            )
+            self.request_top_ps[:len(request_top_ps)].copy_(
+                torch.tensor(request_top_ps,
+                             dtype=torch.float32,
+                             pin_memory=prefer_pinned()),
+                non_blocking=True,
+            )
+
+            # Pre-compute top_k_max on the CPU so CUDA-graph capture does not
+            # encounter boolean-tensor indexing (dynamic size) or .item()
+            # calls. DISABLE_TOPK_VAL (INT32_MAX) is the "top-k disabled"
+            # sentinel. Derived from the same values as the per-request
+            # buffers, so it is refreshed exactly when they are.
+            _disable_topk = torch.iinfo(torch.int32).max
+            self.top_k_max = max(
+                (tk for tk in request_top_ks if 0 < tk < _disable_topk),
+                default=0)
+
+        if need_update_expanded_sampler_param:
+            temperatures: list[float] = []
+            top_ks: list[int] = []
+            top_ps: list[float] = []
+            for temp_val, tk_val, tp_val, num_tokens in per_request_normalized:
+                temperatures.extend(temp_val for _ in range(num_tokens))
+                top_ks.extend(tk_val for _ in range(num_tokens))
+                top_ps.extend(tp_val for _ in range(num_tokens))
+
+            self.temperatures[:len(temperatures)].copy_(torch.tensor(
+                temperatures, dtype=torch.float32, pin_memory=prefer_pinned()),
+                                                        non_blocking=True)
+            self.top_ks[:len(top_ks)].copy_(torch.tensor(
+                top_ks, dtype=torch.int32, pin_memory=prefer_pinned()),
+                                            non_blocking=True)
+            self.top_ps[:len(top_ps)].copy_(torch.tensor(
+                top_ps, dtype=torch.float32, pin_memory=prefer_pinned()),
+                                            non_blocking=True)
+
+    def _sampling_params_buffers_need_update(
+        self, per_request_normalized: list[tuple[float, int, float, int]]
+    ) -> tuple[bool, bool]:
+        """Report which sampling-parameter buffers this step has to refill.
+
+        Returns ``(need_update_sampler_param,
+        need_update_expanded_sampler_param)`` for the per-request buffers and
+        the expanded per-token buffers respectively, recording the new
+        signatures as a side effect.
+
+        Both signatures are built from ``per_request_normalized``, which every
+        consumer reads by batch position -- so its order already encodes the
+        batch ordering and a reshuffle changes the signature on its own. Slot
+        ids are deliberately absent: they index ``batch_slot_ids`` (copied
+        separately for the rejection path), never these buffers, so including
+        them would only force refills when a slot changes hands between
+        requests that happen to sample identically.
+
+        The expanded buffers additionally depend on each request's token count,
+        which sets their layout, so they can need a refill while the
+        per-request buffers stay valid -- a context request becoming a
+        generation request grows its span from one row to ``draft_len + 1`` and
+        shifts every later request. Whenever the per-request buffers need an
+        update the expanded ones do too.
+
+        ``top_k_max`` derives from the same values as the per-request buffers,
+        so it stays valid for as long as they do.
+        """
+        if os.environ.get(SAMPLING_PARAMS_CACHE_ENV, "0") != "1":
+            # Default: refill both groups every step.
+            self.invalidate_sampling_params_cache()
+            return True, True
+        values = tuple((temp, top_k, top_p)
+                       for temp, top_k, top_p, _ in per_request_normalized)
+        num_tokens = tuple(n for *_, n in per_request_normalized)
+
+        request_signature = values
+        expanded_signature = (values, num_tokens)
+
+        need_update_sampler_param = (self._sampling_params_signature[0]
+                                     != request_signature)
+        need_update_expanded_sampler_param = (self._sampling_params_signature[1]
+                                              != expanded_signature)
+
+        self._sampling_params_signature[0] = request_signature
+        self._sampling_params_signature[1] = expanded_signature
+        return need_update_sampler_param, need_update_expanded_sampler_param
+
+    def invalidate_sampling_params_cache(self) -> None:
+        """Force the next populate call to refill both buffer groups.
+
+        Needed whenever the buffers stop reflecting the recorded signatures,
+        e.g. after reallocating them.
+        """
+        self._sampling_params_signature[0] = None
+        self._sampling_params_signature[1] = None
 
 
 class SpecWorkerBase(nn.Module, ABC):
@@ -1334,6 +1512,32 @@ class SpecWorkerBase(nn.Module, ABC):
 
         return num_accepted_tokens
 
+    def _fused_force_params(self, runtime_draft_len: int, spec_metadata,
+                            device: torch.device):
+        """The decisions of :meth:`_apply_force_accepted_tokens` as the
+        ``force`` argument of ``q35_fused_accept.fused_strict_accept``: None for
+        natural acceptance (no forcing, or eager CUDA-graph warmup)."""
+        if self.force_num_accepted_tokens == 0.0:
+            return None
+        if spec_metadata is not None and (
+                spec_metadata.is_cuda_graph
+                and not torch.cuda.is_current_stream_capturing()):
+            return None
+        int_part = int(self.force_num_accepted_tokens)
+        frac_part = self.force_num_accepted_tokens - int_part
+        max_total = runtime_draft_len + 1
+        base_total = min(int_part + 1, max_total)
+        if frac_part > 0.0 and base_total < max_total:
+            self._ensure_force_accept_rng_state(device)
+            return (base_total, max_total, frac_part,
+                    self._force_accept_rng_pool,
+                    self._force_accept_rng_counter,
+                    _FORCE_ACCEPT_RNG_COUNTER_STRIDE,
+                    _FORCE_ACCEPT_RNG_SLOT_STRIDE, _FORCE_ACCEPT_RNG_POOL_SIZE)
+        return (base_total, max_total, 0.0, None, None,
+                _FORCE_ACCEPT_RNG_COUNTER_STRIDE, _FORCE_ACCEPT_RNG_SLOT_STRIDE,
+                _FORCE_ACCEPT_RNG_POOL_SIZE)
+
     def _sample_and_accept_draft_tokens_base(
         self,
         logits: torch.Tensor,
@@ -1368,6 +1572,18 @@ class SpecWorkerBase(nn.Module, ABC):
 
         if logits.dim() == 1:
             logits = logits.unsqueeze(0)
+
+        from .q35_fused_accept import (MAX_DRAFT_LEN, fused_accept_enabled,
+                                       fused_strict_accept)
+        if fused_accept_enabled() and runtime_draft_len <= MAX_DRAFT_LEN:
+            # TRTLLM_Q35_FUSED_ACCEPT: everything after the target sampling in
+            # one launch (same outputs, same forced-acceptance draws).
+            target_tokens = self._sample_tokens_for_batch(
+                logits, spec_metadata, num_contexts, batch_size)
+            return fused_strict_accept(
+                target_tokens, draft_tokens, num_contexts, batch_size,
+                self._fused_force_params(runtime_draft_len, spec_metadata,
+                                         logits.device))
 
         # Allocate return buffers
         accepted_tokens = torch.empty((batch_size, runtime_draft_len + 1),
@@ -1890,6 +2106,20 @@ class SpecWorkerBase(nn.Module, ABC):
         if (sharded and mapping is not None
                 and getattr(mapping, "tp_size", 1) > 1
                 and not mapping.enable_attention_dp):
+            from ..distributed import ll_exchange
+            if ll_exchange.ll_argmax_exchange_enabled():
+                # TRTLLM_Q35_LL_ARGMAX_EXCHANGE: local row max + one-launch LL exchange of packed
+                # (value, index) keys over peer memory instead of the NCCL all-gather; same tokens
+                # (global argmax, lowest index on ties).
+                exchange = ll_exchange.get_tp_key_exchange(mapping)
+                if exchange is not None and 1 <= logits.shape[
+                        0] <= exchange.MAX_ROWS:
+                    local_max, local_argmax = torch.max(logits, dim=-1)
+                    return exchange.argmax_tokens(
+                        local_max,
+                        local_argmax,
+                        mapping.tp_rank * logits.shape[-1],
+                        channel=0)
             from ..distributed.ops import allgather
             combined = self._get_local_max_and_combined(logits)
             gathered = allgather(combined, mapping, dim=-1)
@@ -2230,6 +2460,22 @@ class SpecWorkerBase(nn.Module, ABC):
             self.seed += 1
             self.seed %= (2**31)
 
+            if getattr(spec_metadata, "q35_sharded_target", False):
+                # TRTLLM_Q35_SHARDED_TARGET_SAMPLING, temperature-only rows:
+                # Gumbel-max over this rank's vocabulary shard + LL key
+                # exchange (exact temperature sampling; greedy rows stay
+                # greedy), keyed by the same per-call device seed.
+                from ..distributed import ll_exchange
+                from ..pyexecutor.sampler.ops.vanilla import \
+                    GREEDY_TEMPERATURE_THRESHOLD
+                exchange = ll_exchange.get_tp_key_exchange(self.mapping)
+                return exchange.argmax_logits(
+                    logits,
+                    vocab_offset=self.mapping.tp_rank * logits.shape[-1],
+                    temperature=temperatures,
+                    seed=self.seed,
+                    greedy_threshold=GREEDY_TEMPERATURE_THRESHOLD,
+                    channel=1)
             eff_top_ks, eff_top_ps = resolve_advanced_sampling_filters(
                 spec_metadata.advanced_sampling_mode, top_ks, top_ps)
             sampled_tokens = sample_from_logits_op(logits,
@@ -2238,6 +2484,16 @@ class SpecWorkerBase(nn.Module, ABC):
                                                    eff_top_ps,
                                                    seed=self.seed,
                                                    offset=self.offset)
+        elif getattr(spec_metadata, "q35_sharded_target", False):
+            # TRTLLM_Q35_SHARDED_TARGET_SAMPLING: logits are this rank's
+            # vocabulary shard; global greedy tokens from one launch (local
+            # first maximum + LL key exchange; same tokens as torch.argmax).
+            from ..distributed import ll_exchange
+            exchange = ll_exchange.get_tp_key_exchange(self.mapping)
+            sampled_tokens = exchange.argmax_logits(
+                logits,
+                vocab_offset=self.mapping.tp_rank * logits.shape[-1],
+                channel=1)
         else:
             sampled_tokens = torch.argmax(logits, dim=-1)
 

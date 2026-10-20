@@ -60,6 +60,16 @@ from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig
 from tensorrt_llm.mapping import Mapping
 
 
+def gen_idle_poll_skip_enabled() -> bool:
+    """Whether an idle generation worker skips the receive-status collectives.
+
+    ``TRTLLM_DISAGG_GEN_IDLE_POLL_SKIP=1``. Only used where every rank owns the
+    same requests (no attention DP, PP 1); see
+    ``KvCacheTransceiverV2.check_gen_transfer_status``.
+    """
+    return os.environ.get("TRTLLM_DISAGG_GEN_IDLE_POLL_SKIP", "0") == "1"
+
+
 def _find_consensus_request_ids(request_ids_all_ranks, sync_size):
     frequency_map = defaultdict(int)
     consensus = []
@@ -120,7 +130,12 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 # Size 0 turns bounce off; the per-transfer size gates are internal (tuned via
                 # env: TRTLLM_KV_CACHE_BOUNCE_MIN_BLOCKS for plain-KV payloads,
                 # TRTLLM_KV_CACHE_BOUNCE_MIN_BYTES for recurrent-state payloads).
-                bounce=bounce_config_from_size(cache_transceiver_config.kv_cache_bounce_size_mb),
+                # TRTLLM_KV_CACHE_BOUNCE_SIZE_MB supplies the size when the config leaves it at 0,
+                # for launchers that cannot pass extra cache_transceiver_config fields.
+                bounce=bounce_config_from_size(
+                    cache_transceiver_config.kv_cache_bounce_size_mb
+                    or int(os.environ.get("TRTLLM_KV_CACHE_BOUNCE_SIZE_MB", "0") or 0)
+                ),
             )
         )
         logger.info(
@@ -148,6 +163,32 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         # per-iter tp_allgather when this transceiver never sends/receives.
         self._ever_had_send_session: bool = False
         self._ever_had_recv_session: bool = False
+
+        # Idle receive-status skip: _gen_idle_agreed is set from the gathered
+        # outcome of a status round in which no rank held a receive session,
+        # and cleared by every receive request; while it is set no rank holds
+        # a session and the status poll skips its collectives on all ranks.
+        self._gen_idle_poll_skip: bool = self._gen_idle_poll_skip_applies(
+            mapping, self._gen_need_sync
+        )
+        self._gen_idle_agreed: bool = False
+
+    @staticmethod
+    def _gen_idle_poll_skip_applies(mapping: Mapping, gen_need_sync: bool) -> bool:
+        """Whether the idle receive-status skip may run on this mapping.
+
+        Requires TRTLLM_DISAGG_GEN_IDLE_POLL_SKIP=1 and a synchronized status
+        poll in which every rank owns every request (no attention DP, one PP
+        stage, no context parallelism), so every rank requests the same
+        receives in the same iteration.
+        """
+        return (
+            gen_idle_poll_skip_enabled()
+            and gen_need_sync
+            and not mapping.enable_attention_dp
+            and mapping.pp_size == 1
+            and getattr(mapping, "cp_size", 1) == 1
+        )
 
     def _broadcast_instance_name(self) -> str:
         if self._dist.rank == 0:
@@ -461,17 +502,30 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         return {rid for rid, c in cnt.items() if c == n_ranks}
 
     def _consensus_outcome(
-        self, to_process, cancelled, failed, completed, allgather: Callable, need_sync: bool
+        self,
+        to_process,
+        cancelled,
+        failed,
+        completed,
+        allgather: Callable,
+        need_sync: bool,
+        local_session_count: Optional[int] = None,
     ):
         # CANCELLED/FAILED on any rank → global; COMPLETED only when ALL ranks agree.
         # Batch the three id lists into one allgather to cut the per-step collective count.
+        # With local_session_count, the payload also carries each rank's
+        # receive-session count and the result ends with whether every rank
+        # reported zero sessions.
+        local_outcome = [list(cancelled), list(failed), list(completed)]
+        if local_session_count is not None:
+            local_outcome.append([local_session_count])
         if not need_sync:
-            all_c, all_f, all_done = [list(cancelled)], [list(failed)], [list(completed)]
+            packed = [local_outcome]
         else:
-            packed = list(allgather([list(cancelled), list(failed), list(completed)]))
-            all_c = [p[0] for p in packed]
-            all_f = [p[1] for p in packed]
-            all_done = [p[2] for p in packed]
+            packed = list(allgather(local_outcome))
+        all_c = [p[0] for p in packed]
+        all_f = [p[1] for p in packed]
+        all_done = [p[2] for p in packed]
         n = len(all_c)
         global_cancelled = self._union(all_c)
         global_failed = self._union(all_f)
@@ -483,12 +537,25 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         new_completed = [
             rid for rid in to_process if rid in global_completed and rid not in terminal
         ]
+        if local_session_count is not None:
+            return new_cancelled, new_failed, new_completed, all(p[3][0] == 0 for p in packed)
         return new_cancelled, new_failed, new_completed
 
     def _gen_consensus_outcome(self, to_process, cancelled, failed, completed):
-        return self._consensus_outcome(
-            to_process, cancelled, failed, completed, self._gen_allgather, self._gen_need_sync
+        idle_skip = getattr(self, "_gen_idle_poll_skip", False)
+        outcome = self._consensus_outcome(
+            to_process,
+            cancelled,
+            failed,
+            completed,
+            self._gen_allgather,
+            self._gen_need_sync,
+            local_session_count=len(self._recv_sessions) if idle_skip else None,
         )
+        if idle_skip:
+            # Every rank derives this from the same gathered payload.
+            self._gen_idle_agreed = outcome[3]
+        return outcome[:3]
 
     def _ctx_consensus_outcome(self, to_process, cancelled, failed, completed, timed_out):
         # TP first, then PP.  timed_out is local-only (back-off signal).
@@ -640,6 +707,9 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
 
     @nvtx_range("KvCacheTransceiverV2.request_and_receive_sync")
     def request_and_receive_sync(self, req: LlmRequest):
+        # Before anything that can return or raise: every rank requests the
+        # same receives, so they all resume status polling together.
+        self._gen_idle_agreed = False
         rid = get_unique_rid(req)
         if rid in self._recv_sessions:
             logger.warning(
@@ -676,6 +746,9 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
 
     @nvtx_range("KvCacheTransceiverV2.request_and_receive_async")
     def request_and_receive_async(self, req: LlmRequest):
+        # Before anything that can return or raise: every rank requests the
+        # same receives, so they all resume status polling together.
+        self._gen_idle_agreed = False
         self._ever_had_recv_session = True
         req.set_kv_cache_transfer_start(tensorrt_llm.bindings.global_steady_clock_now())
         rid = get_unique_rid(req)
@@ -767,6 +840,12 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
 
     def check_gen_transfer_status(self, at_least_request_num: Optional[int]):
         if not self._ever_had_recv_session and not self._gen_need_sync:
+            return [], [], []
+        if getattr(self, "_gen_idle_agreed", False):
+            # The last status round gathered zero receive sessions from every
+            # rank and no rank has requested a receive since (that clears the
+            # flag on every rank in the same iteration), so this round's
+            # consensus would be empty everywhere.
             return [], [], []
         block_all = at_least_request_num is None
         wait_num = at_least_request_num if not block_all else 0

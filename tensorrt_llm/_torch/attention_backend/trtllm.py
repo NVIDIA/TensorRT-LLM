@@ -27,7 +27,7 @@ if TYPE_CHECKING:
     from ..speculative.spec_tree_manager import SpecTreeManager
 
 from tensorrt_llm._torch.attention_backend.fmha import (
-    Fmha, get_enabled_fmha_lib_classes)
+    Fmha, FmhaParams, get_enabled_fmha_lib_classes)
 from tensorrt_llm._utils import get_sm_version, maybe_pin_memory, prefer_pinned
 from tensorrt_llm.bindings.internal import thop
 from tensorrt_llm.functional import AttentionMaskType
@@ -44,6 +44,31 @@ from .interface import (AttentionBackend, AttentionForwardArgs,
 from .sparse.hooks import prepare_sparse_runtime_params
 from .sparse.params import SparseParams
 from .sparse.skip_softmax import SkipSoftmaxParams
+
+
+# TRTLLM_Q35_CTX_ATTN_PLAN=1 (default off): a context-only forward on the FlashInfer trtllm-gen FMHA path works out
+# its attention plan once -- the FMHA library check, the workspace sizing, the batch's max query / KV lengths and the
+# forward-invariant launch arguments -- and every attention layer of the forward (Qwen3.5 CTX: 15 layers + the MTP
+# draft layer) goes straight to the library's run_context with it. Per layer only the tensors and the layer's own
+# window / KV scales / rotary tables change. The plan is tied to the forward by the identity of the per-forward tensors
+# prepare() binds (host / device length views, block offsets, pool pointers; the host length tensors are inference
+# tensors, without version counters) and to the call by the attention geometry and the forward-argument fields that
+# steer the library choice; anything else takes the regular path.
+_Q35_CTX_ATTN_PLAN = os.environ.get("TRTLLM_Q35_CTX_ATTN_PLAN", "0") in ("1", "2")
+# TRTLLM_Q35_CTX_ATTN_PLAN=2: in addition the plan path calls FlashInferTrtllmGenFmha.q35_run_context_lean (the same
+# launches; the layer's constant scalars worked out once and the processed query re-typed with one view).
+_Q35_CTX_ATTN_PLAN_LEAN = os.environ.get("TRTLLM_Q35_CTX_ATTN_PLAN", "0") == "2"
+
+
+class _Q35CtxAttnPlan:
+    """Forward-invariant part of a context-only FlashInfer trtllm-gen attention call (TRTLLM_Q35_CTX_ATTN_PLAN)."""
+
+    __slots__ = ("kv_lens", "prompt_lens", "kv_lens_cuda",
+                 "num_contexts", "num_ctx_tokens", "block_offsets",
+                 "workspace", "kv_cache_manager", "pool_pointers", "sig",
+                 "fmha_cls", "seq_lens", "ctx_lens",
+                 "tokens_per_block", "fp8_context_fmha", "total_num_blocks",
+                 "max_q_len", "max_kv_len", "max_seq_len", "window_vec", "causal")
 
 
 @functools.cache
@@ -1557,6 +1582,9 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Execute the TRTLLM attention backend."""
         forward_args = merge_attention_forward_args(forward_args, kwargs)
+        if _Q35_CTX_ATTN_PLAN and self._q35_ctx_plan_forward(
+                q, k, v, metadata, forward_args):
+            return forward_args.output
         assert isinstance(
             metadata,
             TrtllmAttentionMetadata,
@@ -1863,6 +1891,180 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             return forward_args.output
         else:
             return forward_args.output, forward_args.output_sf
+
+    def _q35_ctx_sig(self, q: torch.Tensor,
+                     fwd: AttentionForwardArgs) -> tuple:
+        """What a TRTLLM_Q35_CTX_ATTN_PLAN plan depends on besides the forward: attention geometry and the
+        forward-argument fields that steer the FMHA library choice or its context launch."""
+        return (q.dtype, q.shape[1], fwd.output.dtype,
+                fwd.attention_input_type, fwd.attention_mask,
+                fwd.attention_window_size, fwd.attention_sinks is None,
+                fwd.mrope_rotary_cos_sin is None,
+                fwd.relative_attention_bias is None, fwd.cross_kv is None,
+                fwd.latent_cache is None, fwd.q_pe is None,
+                fwd.enable_dsv4_epilogue_fusion,
+                fwd.sage_attn_num_elts_per_blk_q,
+                fwd.sage_attn_num_elts_per_blk_k,
+                fwd.sage_attn_num_elts_per_blk_v, fwd.quant_q_buffer is None,
+                fwd.softmax_stats_tensor is None,
+                fwd.sparse_backend_args is None, self.num_heads,
+                self.num_kv_heads, self.head_dim, self.quant_mode,
+                self.position_embedding_type, self.attention_chunk_size,
+                self.q_scaling, self.is_mla_enable)
+
+    def _q35_ctx_plan_build(self, q: torch.Tensor,
+                            metadata: TrtllmAttentionMetadata,
+                            fwd: AttentionForwardArgs,
+                            sig: tuple) -> _Q35CtxAttnPlan:
+        """Work out the context plan of this forward (TRTLLM_Q35_CTX_ATTN_PLAN) the way forward() and
+        PhasedFmha.forward() would; plan.fmha_cls stays None when the call is not one the plan covers."""
+        plan = _Q35CtxAttnPlan()
+        plan.kv_lens = metadata.kv_lens_runtime
+        plan.prompt_lens = metadata.prompt_lens_cpu_runtime
+        plan.kv_lens_cuda = metadata.kv_lens_cuda_runtime
+        plan.num_contexts = metadata.num_contexts
+        plan.num_ctx_tokens = metadata.num_ctx_tokens
+        plan.block_offsets = metadata.kv_cache_block_offsets
+        plan.workspace = metadata.effective_workspace
+        plan.kv_cache_manager = metadata.kv_cache_manager
+        plan.pool_pointers = metadata.host_kv_cache_pool_pointers
+        plan.sig = sig
+        plan.fmha_cls = None
+        if (self.is_mla_enable or self.sparse_params is not None
+                or metadata.kv_cache_manager is None
+                or plan.block_offsets is None or metadata.beam_width != 1
+                or fwd.attention_input_type
+                == AttentionInputType.generation_only
+                or metadata.max_context_q_len_override is not None
+                or metadata.spec_decoding_bl_tree_mask is not None
+                or metadata.spec_bl_tree_first_sparse_mask_offset_kv
+                is not None or metadata.helix_position_offsets is not None
+                or self.print_skip_softmax_stat
+                or fwd.cross_kv is not None or fwd.latent_cache is not None
+                or fwd.out_scale_sf is not None):
+            return plan
+        from .fmha.flashinfer_trtllm_gen import FlashInferTrtllmGenFmha
+        if not self.fmha_libs:
+            self.create_fmha_libs()
+        for fmha in self.fmha_libs:
+            if fmha.is_supported(q, None, None, metadata, fwd):
+                break
+        else:
+            return plan
+        if type(fmha) is not FlashInferTrtllmGenFmha:
+            return plan
+        # PhasedFmha.forward, context part (seq_offset 0, every sequence a context request)
+        n = plan.num_contexts
+        plan.tokens_per_block = (metadata.tokens_per_block if
+                                 metadata.tokens_per_block is not None else 64)
+        plan.fp8_context_fmha = fmha.get_fp8_context_fmha(
+            q, fwd.output, metadata, fwd, False)
+        fmha.prepare_workspace(q, None, None, metadata, fwd, plan.workspace)
+        plan.total_num_blocks = fmha._get_total_num_blocks(metadata)
+        plan.seq_lens = metadata.kv_lens_cuda_runtime[0:]
+        plan.ctx_lens = metadata.prompt_lens_cuda_runtime[0:]
+        plan.max_q_len = int(plan.prompt_lens[0:n].max())
+        plan.max_kv_len = int(plan.kv_lens[0:n].max())
+        plan.max_seq_len = metadata.max_seq_len
+        plan.window_vec = getattr(metadata.kv_cache_manager,
+                                  'max_attention_window_vec', None)
+        plan.causal = fwd.mask_type == int(AttentionMaskType.causal)
+        plan.fmha_cls = FlashInferTrtllmGenFmha
+        return plan
+
+    def _q35_ctx_plan_forward(self, q: torch.Tensor, k: Optional[torch.Tensor],
+                              v: Optional[torch.Tensor],
+                              metadata: TrtllmAttentionMetadata,
+                              fwd: AttentionForwardArgs) -> bool:
+        """TRTLLM_Q35_CTX_ATTN_PLAN: run a context-only call on the forward's plan; False: take the regular path."""
+        if (k is not None or v is not None or fwd.output is None
+                or fwd.output_sf is not None or metadata.num_generations != 0
+                or metadata.num_contexts <= 0 or metadata.is_cross
+                or q.shape[0] != metadata.num_ctx_tokens):
+            return False
+        kv_lens = metadata.kv_lens_runtime
+        prompt_lens = metadata.prompt_lens_cpu_runtime
+        if kv_lens is None or prompt_lens is None:
+            return False
+        plan = metadata.__dict__.get("_q35_ctx_plan")
+        sig = self._q35_ctx_sig(q, fwd)
+        if (plan is None or plan.sig != sig or plan.kv_lens is not kv_lens
+                or plan.prompt_lens is not prompt_lens
+                or plan.kv_lens_cuda is not metadata.kv_lens_cuda_runtime
+                or plan.num_contexts != metadata.num_contexts
+                or plan.num_ctx_tokens != metadata.num_ctx_tokens
+                or plan.block_offsets is not metadata.kv_cache_block_offsets
+                or plan.workspace is not metadata.effective_workspace
+                or plan.kv_cache_manager is not metadata.kv_cache_manager
+                or plan.pool_pointers
+                is not metadata.host_kv_cache_pool_pointers):
+            plan = self._q35_ctx_plan_build(q, metadata, fwd, sig)
+            metadata.__dict__["_q35_ctx_plan"] = plan
+        if plan.fmha_cls is None:
+            return False
+        fmha = self.__dict__.get("_q35_ctx_fmha")
+        if fmha is None:
+            if not self.fmha_libs:
+                self.create_fmha_libs()
+            fmha = next(
+                (f for f in self.fmha_libs if type(f) is plan.fmha_cls), None)
+            if fmha is None:
+                return False
+            self._q35_ctx_fmha = fmha
+        if (fmha._multi_ctas_kv_counter_buffer is None
+                or fmha._multi_processor_count is None):
+            fmha.prepare_workspace(q, None, None, metadata, fwd,
+                                   plan.workspace)
+        # forward(): rope table, layer index, window, KV scale defaults
+        if plan.max_seq_len > self.rope_params.max_positions:
+            self._ensure_rope_table_size(plan.max_seq_len)
+        local_layer_idx = self.local_layer_idx
+        if local_layer_idx is None:
+            local_layer_idx = self.local_layer_idx = self.get_local_layer_idx(
+                metadata)
+        window = fwd.attention_window_size
+        if window is None:
+            window_vec = plan.window_vec
+            if window_vec:
+                window = window_vec[local_layer_idx % len(window_vec)]
+            if window is None:
+                window = plan.max_seq_len
+            fwd.attention_window_size = window
+        if fwd.kv_scale_orig_quant is None:
+            fwd.kv_scale_orig_quant = self.kv_scale_orig_quant
+        if fwd.kv_scale_quant_orig is None:
+            fwd.kv_scale_quant_orig = self.kv_scale_quant_orig
+        # PhasedFmha.forward(): the whole q / output are the context part
+        num_tokens = plan.num_ctx_tokens
+        params = FmhaParams(
+            attn=self,
+            meta=metadata,
+            fwd=fwd,
+            workspace=plan.workspace,
+            attention_input=q,
+            qkv_input=q,
+            context_buf=fwd.output.view(num_tokens, self.num_heads,
+                                        fmha.context_out_head_size),
+            sequence_lengths=plan.seq_lens,
+            context_lengths=plan.ctx_lens,
+            input_seq_length=plan.max_q_len,
+            max_past_kv_length=plan.max_kv_len,
+            max_attention_window_size=window,
+            cyclic_attention_window_size=window,
+            num_tokens=num_tokens,
+            seq_offset=0,
+            tokens_per_block=plan.tokens_per_block,
+            fp8_context_fmha=plan.fp8_context_fmha,
+            kv_factor=fmha.kv_factor,
+            total_num_blocks=plan.total_num_blocks,
+            batch_size=plan.num_contexts,
+            is_cross=False,
+        )
+        if _Q35_CTX_ATTN_PLAN_LEAN:
+            fmha.q35_run_context_lean(params, plan.causal)
+        else:
+            fmha.run_context(params)
+        return True
 
     @classmethod
     def support_fused_rope(cls) -> bool:

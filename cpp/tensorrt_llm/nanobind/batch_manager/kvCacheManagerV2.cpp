@@ -18,6 +18,7 @@
 #include "tensorrt_llm/nanobind/batch_manager/kvCacheManagerV2.h"
 
 #include "kv_cache_manager_v2/blockRadixTree.h"
+#include "tensorrt_llm/batch_manager/llmRequest.h"
 #include "kv_cache_manager_v2/common.h"
 #include "kv_cache_manager_v2/config.h"
 #include "kv_cache_manager_v2/eventManager.h"
@@ -1484,6 +1485,8 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def_prop_ro("num_blocks", [](kv::KvCache const& self) { return self.numBlocks().value(); })
         .def_prop_ro("num_committed_blocks", &kv::KvCache::numCommittedBlocks)
         .def_prop_ro("num_committed_tokens", &kv::KvCache::numCommittedTokens)
+        .def("_get_num_reusable_tokens_before_hybrid_pruning", &kv::KvCache::numReusableTokensBeforeHybridPruning)
+        .def("_get_num_reusable_tokens_before_pruning", &kv::KvCache::numReusableTokensBeforePruning)
         .def_prop_rw("history_length", &kv::KvCache::historyLength,
             [](kv::KvCache& self, int hist) { self.setHistoryLength(hist); })
         .def_prop_rw("capacity", &kv::KvCache::capacity, [](kv::KvCache& self, int cap) { self.setCapacity(cap); })
@@ -1812,6 +1815,35 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             },
             nb::arg("reuse_scope") = nb::none(), nb::arg("input_tokens") = nb::none(), nb::arg("id") = std::nullopt,
             nb::arg("custom_priority_callback") = nb::none(), nb::arg("expected_prompt_length") = std::nullopt)
+        // create_kv_cache with the first num_input_tokens tokens of the request's beam 0 as input_tokens, read
+        // straight from the C++ request: no Python list of the prompt and no per-token Python cast
+        // (TRTLLM_Q35_CTX_LEAN_TOKENS=3 on the PyTorch side). Text tokens only.
+        .def(
+            "create_kv_cache_for_request",
+            [](std::shared_ptr<kv::KvCacheManager> self, nb::object reuseScopeObj,
+                ::tensorrt_llm::batch_manager::GenericLlmRequest<::tensorrt_llm::runtime::ITensor::SharedPtr> const&
+                    request,
+                int numInputTokens,
+                std::optional<kv::RequestIdType> id, std::optional<int> expectedPromptLength)
+            {
+                kv::ReuseScope reuseScope = castReuseScope(std::move(reuseScopeObj));
+                nb::gil_scoped_release release;
+                auto const& src = request.getTokens(0);
+                size_t const count = std::min(static_cast<size_t>(std::max(numInputTokens, 0)), src.size());
+                std::vector<kv::TokenIdExt> tokens;
+                tokens.reserve(count);
+                for (size_t i = 0; i < count; ++i)
+                {
+                    tokens.emplace_back(static_cast<kv::TokenId>(src[i]));
+                }
+                if (!expectedPromptLength.has_value())
+                {
+                    expectedPromptLength = static_cast<int>(count);
+                }
+                return self->createKvCache(std::move(reuseScope), tokens, id, kv::KvCache::PriorityCb{}, expectedPromptLength);
+            },
+            nb::arg("reuse_scope"), nb::arg("request"), nb::arg("num_input_tokens"), nb::arg("id") = std::nullopt,
+            nb::arg("expected_prompt_length") = std::nullopt)
         .def(
             "probe_reuse",
             [](std::shared_ptr<kv::KvCacheManager> self, nb::object reuseScopeObj, nb::object inputTokens)

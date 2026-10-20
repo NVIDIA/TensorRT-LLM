@@ -58,7 +58,8 @@ from tensorrt_llm.metrics.collector import MetricsCollector
 from tensorrt_llm.runtime.kv_cache_hash import \
     get_effective_kv_cache_event_hash_algo
 from tensorrt_llm.sampling_params import GuidedDecodingParams, SamplingParams
-from tensorrt_llm.serve.chat_tokenization import tokenize_harmony_chat_request
+from tensorrt_llm.serve.chat_tokenization import (
+    IncrementalTokenizationCache, tokenize_harmony_chat_request)
 from tensorrt_llm.serve.chat_utils import (load_chat_template,
                                            parse_chat_messages_coroutines,
                                            resolve_top_level_model_type)
@@ -329,6 +330,14 @@ class OpenAIServer(_VideoRoutesMixin):
         self.allow_request_chat_template = allow_request_chat_template
         self._internal_disagg_auth_key = internal_disagg_auth_key
         self.server_role = server_role
+        frontend_name = (f"{server_role.name.lower()} frontend"
+                         if server_role is not None else "server frontend")
+        self._incremental_tokenizer = (
+            IncrementalTokenizationCache.from_environment(frontend_name))
+        if self._incremental_tokenizer.enabled:
+            logger.info(
+                f"Incremental tokenization configured for {frontend_name} with "
+                f"{self._incremental_tokenizer.rollback_tokens}-token rollback")
         # Will be set in __call__
         self.binding_addr = None
         self.host = None
@@ -1303,9 +1312,13 @@ class OpenAIServer(_VideoRoutesMixin):
             return JSONResponse(content=stats)
 
         # Legacy path: no background collector -> read the queue directly.
-        stats = []
-        async for stat in self.generator.get_stats_async(2):
-            stats.append(stat)
+        # With iteration stats disabled nothing is ever produced, and the fetch
+        # below is a synchronous RPC (proxy.aget_stats) that would hold this
+        # frontend's event loop for its whole 2 s timeout on every poll.
+        if not getattr(self.generator.args, "enable_iter_perf_stats", True):
+            return JSONResponse(content=[])
+        # Keep the blocking fetch off the event-loop thread.
+        stats = await asyncio.to_thread(self.generator.get_stats, 2)
         return JSONResponse(content=stats)
 
     async def get_energy_metrics(self) -> JSONResponse:
@@ -1433,9 +1446,11 @@ class OpenAIServer(_VideoRoutesMixin):
                 self._iteration_stats_wakeup_event.clear()
 
                 # Drain all available iteration stats and log each one to Prometheus.
+                # The fetch is a synchronous RPC with the multi-process executor
+                # (it polls for up to the timeout), so it runs off the event loop.
                 try:
-                    async for llm_stat in self.generator.get_stats_async(
-                            timeout=0.5):
+                    for llm_stat in await asyncio.to_thread(
+                            self.generator.get_stats, 0.5):
                         self.metrics_collector.log_iteration_stats(llm_stat)
                         # Tee into the /metrics snapshot buffer so the HTTP
                         # handler can serve without competing for the engine
@@ -1451,6 +1466,30 @@ class OpenAIServer(_VideoRoutesMixin):
         except asyncio.CancelledError:
             logger.info("Iteration stats collector loop cancelled")
             raise
+
+    async def _maybe_incremental_tokenize_chat_prompt(
+            self, prompt: str | list[int],
+            request: ChatCompletionRequest,
+            has_multimodal: bool) -> str | list[int]:
+        """Use the shared cache for eligible conversation-keyed text prompts."""
+        if (not self._incremental_tokenizer.enabled
+                or not isinstance(prompt, str)
+                or request.conversation_params is None or has_multimodal
+                or request.add_special_tokens
+                or request.truncate_prompt_tokens is not None):
+            return prompt
+
+        tokenizer = getattr(self.tokenizer, "tokenizer", self.tokenizer)
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            self._input_proc_executor,
+            functools.partial(
+                self._incremental_tokenizer.encode,
+                prompt,
+                request.conversation_params.conversation_id,
+                tokenizer,
+            ),
+        )
 
     async def openai_chat(self, request: ChatCompletionRequest,
                           raw_request: Request) -> Response:
@@ -1532,6 +1571,8 @@ class OpenAIServer(_VideoRoutesMixin):
                         sampling_params.guided_decoding = strict_guided
             postproc_args = ChatPostprocArgs.from_request(request)
             self._validate_internal_disagg_request(request, raw_request)
+            resolve_request_conversation_id(
+                request, None if raw_request is None else raw_request.headers)
             disaggregated_params = to_llm_disaggregated_params(
                 request.disaggregated_params)
 
@@ -1577,6 +1618,8 @@ class OpenAIServer(_VideoRoutesMixin):
                 )
                 prompt, (mm_data, mm_embeddings) = await asyncio.gather(
                     prompt_task, mm_coroutines)
+                prompt = await self._maybe_incremental_tokenize_chat_prompt(
+                    prompt, request, bool(mm_data or mm_embeddings))
             prompt = prompt_inputs(prompt)
 
             if request.prompt_token_ids is not None:

@@ -1,3 +1,4 @@
+import os
 from copy import copy, deepcopy
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union, cast
@@ -14,6 +15,10 @@ from tensorrt_llm.sampling_params import LogprobMode
 SamplingConfig = tensorrt_llm.bindings.SamplingConfig
 
 MAX_SPEC_DECODE_POSITIONS = 16
+
+# See kv_cache_manager_v2._Q35_CTX_LEAN_TOKENS.
+_Q35_CTX_LEAN_TOKENS = os.environ.get("TRTLLM_Q35_CTX_LEAN_TOKENS",
+                                      "0") not in ("", "0")
 '''
 CONTEXT_INIT: typing.ClassVar[LlmRequestState]  # value = <LlmRequestState.CONTEXT_INIT: 2>
 ENCODER_INIT: typing.ClassVar[LlmRequestState]  # value = <LlmRequestState.ENCODER_INIT: 1>
@@ -1102,6 +1107,12 @@ def get_multimodal_embedding_lengths(
     return multimodal_embedding_lengths
 
 
+_GH18024_BRIDGE_LOGGED = False
+# TRTLLM_TOKEN_INGEST_I32=0 takes the list path even when the bindings have the int32 ndarray bridge (to replay runs
+# made with bindings that lacked it); default on.
+_GH18024_BRIDGE_ON = os.environ.get("TRTLLM_TOKEN_INGEST_I32", "1") != "0"
+
+
 def executor_request_to_llm_request(
         req_id: int,
         executor_request: ExecutorRequest,
@@ -1112,7 +1123,28 @@ def executor_request_to_llm_request(
     executor_sampling_config = executor_request.sampling_config
     sampling_config = SamplingConfig(executor_sampling_config)
 
-    input_tokens = input_token_ids if input_token_ids is not None else executor_request.input_token_ids
+    if input_token_ids is not None:
+        input_tokens = input_token_ids
+    else:
+        # int32 ndarray bridge: `input_token_ids` materializes O(ISL) PyLongs
+        # and the LlmRequest ctor would cast them back one by one; the i32
+        # accessor plus the ctor's ndarray fast path replace both with
+        # memcpys (~1.5 ms saved per ~100k-token request on the executor
+        # thread). getattr keeps compatibility with older bindings.
+        input_tokens = (getattr(executor_request, "input_token_ids_i32",
+                                None) if _GH18024_BRIDGE_ON else None)
+        global _GH18024_BRIDGE_LOGGED
+        if not _GH18024_BRIDGE_LOGGED:
+            _GH18024_BRIDGE_LOGGED = True
+            from tensorrt_llm.logger import logger
+            logger.info(
+                "GH18024: executor request token ingest uses the int32 ndarray bridge"
+                if input_tokens is not None else
+                "GH18024: TRTLLM_TOKEN_INGEST_I32=0, token ingest uses the list path"
+                if not _GH18024_BRIDGE_ON else
+                "GH18024: bindings lack input_token_ids_i32, token ingest uses the list path")
+        if input_tokens is None:
+            input_tokens = executor_request.input_token_ids
 
     llm_request_type = REQUEST_TYPE_MAPPING[executor_request.request_type]
     stop_words_list = convert_wordlist(
@@ -1275,6 +1307,11 @@ def executor_request_to_llm_request(
                                                   None)
     llm_request.py_conversation_params = getattr(executor_request,
                                                  "py_conversation_params", None)
+    if _Q35_CTX_LEAN_TOKENS and type(input_tokens) is list:
+        # TRTLLM_Q35_CTX_LEAN_TOKENS: keep the prompt list built above for the
+        # first context chunk's block-reuse lookup (KVCacheManagerV2), which
+        # would otherwise rebuild it from the C++ request.
+        llm_request.py_q35_prompt_tokens = input_tokens
     if child_req_ids:
         for child_id in child_req_ids:
             llm_request.create_child_request(child_id)

@@ -790,6 +790,15 @@ class TRTLLMGenFusedMoE(MoE):
             If do_finalize=True: final_hidden_states tensor
             If do_finalize=False: tuple of intermediate outputs (for nvfp4 and w4a8_nvfp4_fp8)
         """
+        # TRTLLM_Q35_MOE_PREROUTE: routing tables, ids and weights the Q35 front end
+        # (q35_fused_front.q35_routed_forward) computed from these router_logits; the
+        # op keeps the logits (tactic lookup, other tiles) and skips its routing kernel.
+        prerouted = self.__dict__.pop("_q35_prerouted_pending", None)
+        if prerouted is not None and (token_selected_experts is not None
+                                      or router_logits is None
+                                      or prerouted[2].shape[0] != x.shape[0]):
+            prerouted = None
+
         routing_params = self._extract_routing_params()
         top_k = routing_params.top_k
         routing_bias = routing_params.routing_bias if router_logits is not None else None
@@ -887,45 +896,80 @@ class TRTLLMGenFusedMoE(MoE):
             output1_scale_gate_scalar = self._get_data_or_none("fc31_alpha")
             output2_scale_scalar = self._get_data_or_none("fc2_alpha")
 
-            outputs = self.op_backend.run_fp4_block_scale_moe(
-                router_logits,
-                routing_bias,
-                x,
-                x_sf,
-                self.w3_w1_weight,
-                self.w3_w1_weight_scale,
-                self.w3_w1_bias if self.bias else None,
-                gemm1_alpha,
-                gemm1_beta,
-                self.swiglu_limit,
-                self.w2_weight,
-                self.w2_weight_scale,
-                self.w2_bias if self.bias else None,
-                output1_scale_scalar,
-                output1_scale_gate_scalar,
-                output2_scale_scalar,
-                self.num_slots,
-                top_k,
-                n_group,
-                topk_group,
-                intermediate_size_per_partition_padded,
-                self.slot_start,
-                self.expert_size_per_partition,
-                routed_scaling_factor,
-                self.routing_method.routing_method_type,
-                do_finalize=do_finalize,
-                topk_weights=token_final_scales,
-                topk_ids=token_selected_experts,
-                valid_hidden_size=self.hidden_size,
-                valid_intermediate_size=getattr(
-                    self.quant_method, 'intermediate_size_per_partition_lean',
-                    None),
-                gated_act_type=act_type,
-                output=moe_output,
-                # Pass that to the autotuner so the top bucket profiles per-expert load at runtime scale.
-                tune_max_num_tokens=self.max_num_tokens,
-                use_dp=self.use_dp,
-            )
+            per_expert = [
+                self.w3_w1_weight, self.w3_w1_weight_scale,
+                self.w3_w1_bias if self.bias else None, gemm1_alpha,
+                gemm1_beta, self.swiglu_limit, self.w2_weight,
+                self.w2_weight_scale, self.w2_bias if self.bias else None,
+                output1_scale_scalar, output1_scale_gate_scalar,
+                output2_scale_scalar
+            ]
+            slot_start, num_local = self.slot_start, self.expert_size_per_partition
+            outputs = None
+            if self.__dict__.get("_q35_dea_home") is not None:
+                # TRTLLM_Q35_MOE_DEA (replicated experts): a decode step the Q35 front end
+                # dealt runs as this rank's all-local share; anything else runs contiguous
+                # EP on the home block of the replicated weights, as without the flag.
+                from .q35_fused_front import q35_dea_home, q35_dea_run
+                if prerouted is not None and len(prerouted) > 4 and prerouted[4]:
+                    e4m3 = torch.float8_e4m3fn
+                    outputs = q35_dea_run(
+                        self, [
+                            router_logits, routing_bias, x,
+                            x_sf.view(e4m3) if x_sf is not None else None,
+                            per_expert[0], per_expert[1].view(e4m3),
+                            *per_expert[2:6], per_expert[6],
+                            per_expert[7].view(e4m3), *per_expert[8:], None,
+                            None
+                        ],
+                        prerouted,
+                        top_k=top_k,
+                        n_group=n_group,
+                        topk_group=topk_group,
+                        intermediate_size=intermediate_size_per_partition_padded,
+                        routed_scaling_factor=routed_scaling_factor,
+                        routing_method_type=self.routing_method.routing_method_type,
+                        do_finalize=do_finalize,
+                        act_type=act_type,
+                        output=moe_output)
+                    if outputs is not None and do_finalize:
+                        outputs = outputs[0]
+                prerouted = None
+                per_expert = q35_dea_home(self, per_expert)
+                slot_start, num_local = self._q35_dea_home
+            if outputs is None:
+                outputs = self.op_backend.run_fp4_block_scale_moe(
+                    router_logits,
+                    routing_bias,
+                    x,
+                    x_sf,
+                    *per_expert[:9],
+                    *per_expert[9:],
+                    self.num_slots,
+                    top_k,
+                    n_group,
+                    topk_group,
+                    intermediate_size_per_partition_padded,
+                    slot_start,
+                    num_local,
+                    routed_scaling_factor,
+                    self.routing_method.routing_method_type,
+                    do_finalize=do_finalize,
+                    topk_weights=token_final_scales,
+                    topk_ids=token_selected_experts,
+                    valid_hidden_size=self.hidden_size,
+                    valid_intermediate_size=getattr(
+                        self.quant_method,
+                        'intermediate_size_per_partition_lean', None),
+                    gated_act_type=act_type,
+                    output=moe_output,
+                    # Pass that to the autotuner so the top bucket profiles per-expert load at runtime scale.
+                    tune_max_num_tokens=self.max_num_tokens,
+                    use_dp=self.use_dp,
+                    **({
+                        "prerouted": prerouted
+                    } if prerouted is not None else {}),
+                )
 
             if not do_finalize:
                 assert not self.reduce_results, "reduce_results must be False when do_finalize is False"

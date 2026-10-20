@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2025-2026, NVIDIA CORPORATION. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -158,11 +158,9 @@ void McastDeviceMemory::allocMnMcastMem(size_t bufSize)
     CUmemFabricHandle* exphndl{nullptr};
     CUmemFabricHandle myhndl;
     TLLM_CU_CHECK(cuMemExportToShareableHandle(&myhndl, mUcHandles[mGroupRank], CU_MEM_HANDLE_TYPE_FABRIC, 0));
-    // All gather
-    cudaMallocHost(&exphndl, mGroupSize * sizeof(CUmemFabricHandle));
-    memcpy(exphndl + mGroupRank * sizeof(CUmemFabricHandle), &myhndl, sizeof(CUmemFabricHandle));
-    mGroupComm.allgather(
-        exphndl + mGroupRank * sizeof(CUmemFabricHandle), exphndl, sizeof(CUmemFabricHandle), mpi::MpiType::kCHAR);
+    // All gather: every rank sends its own fabric handle; exphndl receives one CUmemFabricHandle per rank.
+    TLLM_CUDA_CHECK(cudaMallocHost(&exphndl, mGroupSize * sizeof(CUmemFabricHandle)));
+    mGroupComm.allgather(&myhndl, exphndl, sizeof(CUmemFabricHandle), mpi::MpiType::kCHAR);
     cudaDeviceSynchronize();
 
     for (uint32_t p = 0; p < mGroupSize; p++)
@@ -173,7 +171,7 @@ void McastDeviceMemory::allocMnMcastMem(size_t bufSize)
 
     // Initialize multicasting
     CUmemFabricHandle* fabric_handle;
-    cudaMallocHost(&fabric_handle, sizeof(CUmemFabricHandle));
+    TLLM_CUDA_CHECK(cudaMallocHost(&fabric_handle, sizeof(CUmemFabricHandle)));
     if (mGroupRank == 0)
     {
         TLLM_CU_CHECK(cuMulticastCreate(&mMcHandle, &mcProp));

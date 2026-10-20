@@ -1,6 +1,7 @@
 import math
 import os
 import platform
+import sys
 import threading
 from typing import Dict, List, Optional, Tuple, Union
 
@@ -32,7 +33,91 @@ _NCCL_SYMMETRIC_ZERO_COPY: bool = (os.environ.get(
 
 _MNNVL_ONE_SHOT_THRESHOLD_BYTES = 64 * 1024 * 8 * 2
 
+# Qwen3.5 low-latency comm flags (default off), read once at import.
+# TRTLLM_Q35_AR_LOG=1: log which path every AllReduce construction site and call shape takes
+# (MNNVL one-shot / two-shot, C++ AUTO / NCCL) and every all-gather call site.
+_Q35_AR_LOG: bool = os.environ.get("TRTLLM_Q35_AR_LOG", "0") == "1"
+# TRTLLM_Q35_AR_NORM_FUSE=1: MNNVL serves RMS_NORM as RESIDUAL_RMS_NORM with a zero residual, so the
+# callers can fold their standalone RMSNorms into the all-reduce (see q35_zero_residual).
+_Q35_AR_NORM_FUSE: bool = os.environ.get("TRTLLM_Q35_AR_NORM_FUSE", "0") == "1"
+# TRTLLM_Q35_PROBE_NO_AR=1: ATTRIBUTION PROBE ONLY, WRONG OUTPUTS. Every all-reduce is replaced by
+# its local epilogue (residual add + RMSNorm [+ FP8 quant]) without any communication, to bound
+# the exposed all-reduce cost of a decode step against the stock step.
+_Q35_PROBE_NO_AR: bool = os.environ.get("TRTLLM_Q35_PROBE_NO_AR", "0") == "1"
+# TRTLLM_Q35_MNNVL_PRESIZE=1: the MNNVL all-reduce workspace of a TP group is created once, at its first
+# use (model construction), large enough for the model's allreduce_max_num_tokens rows, and is never
+# re-created afterwards; a call that would need more takes the C++ / NCCL fallback instead. Without it the
+# workspace grows lazily, i.e. at the first long prefill (KV-cache profiling), and every McastGPUBuffer
+# construction is a collective fabric allocation. The one construction left per TP group is fenced
+# (_q35_fenced_mcast_buffer): a workaround for a known staging-buffer overrun in the multicast handle exchange;
+# a no-op once the library fix is present.
+_Q35_MNNVL_PRESIZE: bool = os.environ.get("TRTLLM_Q35_MNNVL_PRESIZE", "0") == "1"
+# TRTLLM_Q35_MCAST_STRAY_LOG=1: DIAGNOSTIC for the same workaround. Before every McastGPUBuffer construction on
+# ranks > 0, log which live pinned torch tensors (and which driver allocation) sit next to the handle-exchange
+# staging buffer; constructions where that memory is not mapped are fenced instead.
+_Q35_MCAST_STRAY_LOG: bool = os.environ.get("TRTLLM_Q35_MCAST_STRAY_LOG", "0") == "1"
+# Largest token count for which the zero-residual buffer is used (decode / spec-verify shapes).
+_Q35_ZERO_RESIDUAL_MAX_TOKENS = 1024
+
 _thread_local = threading.local()
+
+_q35_zero_residuals: Dict[Tuple[torch.device, torch.dtype], torch.Tensor] = {}
+
+
+def q35_zero_residual(shape, dtype: torch.dtype,
+                      device: torch.device) -> Optional[torch.Tensor]:
+    """A read-only zero tensor of ``shape`` (at most 1024 rows of ``shape[-1]``), or None.
+
+    Feeding it as the residual of RESIDUAL_RMS_NORM gives RMSNorm(allreduce(x)) and, as the
+    residual output, allreduce(x) itself: the kernel adds the residual to the reduced sum, and adding
+    zero changes no value. One buffer per (device, dtype) is shared by every caller. It is only ever
+    allocated outside CUDA-graph capture (a capture would record its memset without running it); a
+    call that would need it first inside a capture gets None and must take the unfused path.
+    """
+    shape = tuple(shape)
+    hidden = shape[-1]
+    numel = math.prod(shape)
+    if numel > _Q35_ZERO_RESIDUAL_MAX_TOKENS * hidden:
+        return None
+    key = (torch.device(device), dtype)
+    buf = _q35_zero_residuals.get(key)
+    if buf is None or buf.numel() < numel:
+        if torch.cuda.is_current_stream_capturing():
+            return None
+        buf = torch.zeros(max(numel, _Q35_ZERO_RESIDUAL_MAX_TOKENS * hidden),
+                          dtype=dtype,
+                          device=device)
+        _q35_zero_residuals[key] = buf
+    return buf[:numel].view(shape)
+
+
+def q35_mnnvl_fusable(allreduce: Optional["AllReduce"], num_tokens: int) -> bool:
+    """Whether ``allreduce`` serves fused calls of ``num_tokens`` rows on MNNVL (the zero-residual
+    norm folds use it only then, so they never land on the C++ / NCCL fallback)."""
+    return (allreduce is not None and allreduce.mnnvl_allreduce is not None
+            and 0 < num_tokens <= _Q35_ZERO_RESIDUAL_MAX_TOKENS)
+
+
+def _q35_caller_site(skip_files: Tuple[str, ...] = ()) -> str:
+    """file:line of the first frame outside this module (and ``skip_files``)."""
+    frame = sys._getframe(1)
+    while frame is not None and (frame.f_code.co_filename == __file__
+                                 or os.path.basename(
+                                     frame.f_code.co_filename) in skip_files):
+        frame = frame.f_back
+    if frame is None:
+        return "?"
+    return f"{os.path.basename(frame.f_code.co_filename)}:{frame.f_lineno}"
+
+
+_q35_logged: set = set()
+
+
+def _q35_log_once(key, message: str, warn: bool = False) -> None:
+    if key in _q35_logged:
+        return
+    _q35_logged.add(key)
+    (logger.warning if warn else logger.info)(message)
 
 
 def get_allreduce_workspace(mapping: Mapping) -> torch.LongTensor:
@@ -67,20 +152,247 @@ def allocate_low_presicion_allreduce_workspace(mapping: Mapping) -> None:
     return
 
 
+def _q35_mnnvl_presize_bytes(mapping: Mapping, dtype: torch.dtype) -> int:
+    """TRTLLM_Q35_MNNVL_PRESIZE: bytes per Lamport buffer for the largest call of the model being built
+    (allreduce_max_num_tokens rows of allreduce_hidden_size, recorded by AllReduce.__init__), or 0."""
+    from tensorrt_llm._torch.custom_ops.torch_custom_ops import AllReduceRunner
+    tokens = AllReduceRunner._prealloc_max_num_tokens
+    hidden = AllReduceRunner._prealloc_hidden_size
+    if not tokens or not hidden:
+        return 0
+    return MNNVLAllReduce.get_required_workspace_size(tokens, hidden,
+                                                      mapping.tp_size, dtype)
+
+
+_q35_cudart_lib = None
+# (tp_rank, fenced, outcome) of every fenced construction (tests / diagnostics); outcome: "landed" (the fence
+# caught the overrun where expected), "none" (fence untouched: a library with the fix), "elsewhere" (fence bytes
+# changed somewhere else), "" (not fenced)
+_q35_fence_log: List[Tuple[int, bool, str]] = []
+
+
+def _q35_cudart():
+    """ctypes handle on the CUDA runtime that libtensorrt_llm.so allocates its pinned host memory with."""
+    global _q35_cudart_lib
+    if _q35_cudart_lib is None:
+        import ctypes
+        paths = []
+        with open("/proc/self/maps") as maps:
+            for line in maps:
+                path = line.split()[-1]
+                if "libcudart.so" in os.path.basename(path) and path not in paths:
+                    paths.append(path)
+        lib = ctypes.CDLL(paths[0] if paths else "libcudart.so")
+        lib.cudaMallocHost.argtypes = [
+            ctypes.POINTER(ctypes.c_void_p), ctypes.c_size_t
+        ]
+        lib.cudaFreeHost.argtypes = [ctypes.c_void_p]
+        _q35_cudart_lib = lib
+    return _q35_cudart_lib
+
+
+def _q35_fenced_mcast_buffer(workspace_size_bytes: int, mapping: Mapping,
+                             use_fabric_handle: bool, comm) -> McastGPUBuffer:
+    """McastGPUBuffer(...) with a pinned-host fence after its handle-exchange staging buffer
+    (TRTLLM_Q35_MNNVL_PRESIZE).
+
+    Workaround for a known staging-buffer overrun in the multicast handle exchange; a no-op once the
+    library fix is present. The pinned host allocator hands a just-freed block of the same size back
+    first, so a contiguous run of same-size blocks is allocated, its first block freed (the staging buffer
+    lands there) and the rest held as the fence until the construction is done.
+    """
+    import ctypes
+
+    def construct():
+        return McastGPUBuffer(workspace_size_bytes, mapping.tp_size,
+                              mapping.tp_rank, mapping.local_rank,
+                              use_fabric_handle, comm.py2f())
+
+    if not use_fabric_handle or mapping.tp_rank == 0:
+        _q35_fence_log.append((mapping.tp_rank, False, ""))
+        return construct()
+    rt = _q35_cudart()
+    size = mapping.tp_size * 64
+    span = mapping.tp_rank * 4096 + 64
+    held, run = [], []
+    fenced = False
+    try:
+        while len(held) < 1024:
+            p = ctypes.c_void_p()
+            if rt.cudaMallocHost(ctypes.byref(p), size) != 0 or not p.value:
+                break
+            held.append(p.value)
+            if len(run) >= 2 and p.value - run[-1] != run[1] - run[0]:
+                run = []  # a new chunk: start the run over (the old blocks stay held)
+            if len(run) == 1 and not 0 < p.value - run[0] <= 4096:
+                run = []
+            run.append(p.value)
+            if len(run) >= 2 and run[-1] + (run[1] - run[0]) - run[0] >= span:
+                fenced = True
+                break
+        if fenced:
+            for p in run[1:]:
+                ctypes.memset(p, 0x5A, size)
+            held.remove(run[0])
+            rt.cudaFreeHost(run[0])
+        buf = construct()
+        outcome = ""
+        if fenced:
+            blk = run[0] + mapping.tp_rank * 4096
+            pattern = b"\x5a" * size
+            changed = [b for b in run[1:] if ctypes.string_at(b, size) != pattern]
+            if not changed:
+                outcome = "none"  # fixed library: no stray write at all
+            elif all(b <= blk < b + size for b in changed) and ctypes.string_at(blk, 64) != pattern[:64]:
+                outcome = "landed"
+            else:
+                outcome = "elsewhere"
+                _q35_log_once(("mcast_fence_miss", mapping.tp_rank),
+                              "[Q35 comm] McastGPUBuffer wrote into its fence at an unexpected place",
+                              warn=True)
+        else:
+            _q35_log_once(("mcast_fence_none", mapping.tp_rank),
+                          "[Q35 comm] could not build a pinned fence for McastGPUBuffer",
+                          warn=True)
+        _q35_fence_log.append((mapping.tp_rank, fenced, outcome))
+        return buf
+    finally:
+        for p in held:
+            rt.cudaFreeHost(p)
+
+
+def _q35_host_mapping(addr: int):
+    """(start, end) of the readable and writable mapping containing ``addr``, or None (also for reserved
+    PROT_NONE ranges such as the driver's guard regions)."""
+    with open("/proc/self/maps") as maps:
+        for line in maps:
+            fields = line.split()
+            lo, hi = (int(x, 16) for x in fields[0].split("-"))
+            if lo <= addr < hi:
+                return (lo, hi) if fields[1].startswith("rw") else None
+    return None
+
+
+def _q35_stray_target_report(mapping: Mapping, staging: int, chunk, target: int,
+                             mapped: bool) -> str:
+    """Diagnostic: the driver allocation and the live pinned torch tensors covering ``target``."""
+    import ctypes
+    import gc
+    import warnings
+    drv = "?"
+    try:
+        cuda = ctypes.CDLL("libcuda.so.1")
+        start, rsize = ctypes.c_uint64(0), ctypes.c_size_t(0)
+        e1 = cuda.cuPointerGetAttribute(ctypes.byref(start), 11, ctypes.c_uint64(target))
+        e2 = cuda.cuPointerGetAttribute(ctypes.byref(rsize), 12, ctypes.c_uint64(target))
+        drv = (f"driver range +{target - start.value} in [{start.value:#x}, +{rsize.value})"
+               if e1 == 0 and e2 == 0 else f"no driver allocation (err {e1}/{e2})")
+    except OSError as e:
+        drv = f"no libcuda ({e})"
+    owners, chunk_shapes, pinned, in_chunk = [], [], 0, 0
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        for o in gc.get_objects():
+            # diagnostic scan over arbitrary objects: any object that is not a plain pinned CPU tensor is skipped
+            try:
+                if type(o) is not torch.Tensor and not (isinstance(o, torch.Tensor) and type(o).__module__.startswith("torch")):
+                    continue
+                if o.device.type != "cpu" or not o.is_pinned():
+                    continue
+                st = o.untyped_storage()
+                lo, n = st.data_ptr(), st.nbytes()
+            except Exception:  # noqa: BLE001
+                continue
+            pinned += 1
+            if chunk is not None and lo < chunk[1] and lo + n > chunk[0]:
+                in_chunk += 1
+                if in_chunk <= 8:
+                    chunk_shapes.append(f"{tuple(o.shape)}@+{lo - chunk[0]}")
+            if lo < target + 64 and lo + n > target:
+                owners.append(f"{tuple(o.shape)} {o.dtype} storage {n} B at +{target - lo}")
+    return (f"staging {staging:#x} at +{staging - chunk[0] if chunk else -1} of "
+            f"{(chunk[1] - chunk[0]) if chunk else 0} B chunk, target +{mapping.tp_rank * 4096}: "
+            f"{'mapped' if mapped else 'UNMAPPED (would SIGSEGV; fenced instead)'}; {drv}; "
+            f"{pinned} live pinned torch tensors, {in_chunk} in the chunk {chunk_shapes}, covering the target: "
+            f"{owners or 'none'}")
+
+
+def _q35_stray_diag_construct(workspace_size_bytes: int, mapping: Mapping,
+                              use_fabric_handle: bool, comm) -> McastGPUBuffer:
+    """TRTLLM_Q35_MCAST_STRAY_LOG (diagnostic): construct like the stock path and log the fence target's owners.
+    The construction is collective: whatever the diagnostic does, every rank must reach it."""
+    import ctypes
+    import time
+
+    def construct():
+        return McastGPUBuffer(workspace_size_bytes, mapping.tp_size,
+                              mapping.tp_rank, mapping.local_rank,
+                              use_fabric_handle, comm.py2f())
+
+    if not use_fabric_handle or mapping.tp_rank == 0:
+        return construct()
+    try:
+        rt = _q35_cudart()
+        size = mapping.tp_size * 64
+        p = ctypes.c_void_p()
+        rt.cudaMallocHost(ctypes.byref(p), size)
+        staging = p.value
+        rt.cudaFreeHost(staging)  # same-size LIFO reuse: the staging buffer lands here
+        target = staging + mapping.tp_rank * 4096
+        chunk = _q35_host_mapping(staging)
+        tmap = _q35_host_mapping(target)
+        mapped = tmap is not None and tmap[1] >= target + 64
+        old = ctypes.string_at(target, 64) if mapped else None
+        tag = (f"[Q35 comm] stray write (rank {mapping.tp_rank}, {workspace_size_bytes} B workspace, "
+               f"t={time.time():.1f}): " +
+               _q35_stray_target_report(mapping, staging, chunk, target, mapped))
+    except Exception as e:  # noqa: BLE001  (diagnostic only; never skip the collective construction)
+        logger.warning(f"[Q35 comm] stray write diagnostic failed: {e!r}")
+        return construct()
+    if not mapped:
+        logger.warning(tag)
+        return _q35_fenced_mcast_buffer(workspace_size_bytes, mapping,
+                                        use_fabric_handle, comm)
+    buf = construct()
+    new = ctypes.string_at(target, 64)
+    logger.warning(f"{tag}; target bytes {'CHANGED' if new != old else 'unchanged'} "
+                   f"(before: {old[:16].hex()}..., zero={old == bytes(64)})")
+    return buf
+
+
 def get_or_scale_allreduce_mnnvl_workspace(
     mapping: Mapping,
     dtype: torch.dtype,
     buffer_size_bytes: Optional[int] = None
-) -> Tuple[McastGPUBuffer, torch.Tensor, torch.Tensor, int]:
+) -> Optional[Dict]:
     """
     WORKSPACE is a entire memory allocation used for allreduce, while BUFFER refers to single lamport buffer.
     Each WORKSPACE contains NUM_LAMPORT_BUFFERS buffers.
+
+    With TRTLLM_Q35_MNNVL_PRESIZE the first call creates the workspace at its final size and later calls
+    never re-create it: one that needs a larger buffer gets None (the caller falls back).
     """
 
     NUM_LAMPORT_BUFFERS = 3
 
     # Use MNNVLAllReduce class to share across threads
     allreduce_mnnvl_workspaces = MNNVLAllReduce.allreduce_mnnvl_workspaces
+
+    if _Q35_MNNVL_PRESIZE:
+        ws = allreduce_mnnvl_workspaces.get(mapping)
+        if ws is not None:
+            if ws["buffer_size_bytes"] < (buffer_size_bytes or 0):
+                _q35_log_once(
+                    ("mnnvl_sealed", mapping.tp_size, mapping.tp_rank),
+                    f"[Q35 comm] MNNVL workspace is sized once (TRTLLM_Q35_MNNVL_PRESIZE): a call needing "
+                    f"{buffer_size_bytes} bytes per buffer (> {ws['buffer_size_bytes']}) takes the fallback",
+                    warn=True)
+                return None
+            return ws
+        # never below the default initial size (1024 tokens x 8192 hidden)
+        buffer_size_bytes = max(
+            buffer_size_bytes or 0, _q35_mnnvl_presize_bytes(mapping, dtype),
+            1024 * 8192 * torch.tensor([], dtype=dtype).element_size())
 
     # A safe method to get the element size of the dtype
     elem_size = torch.tensor([], dtype=dtype).element_size()
@@ -115,17 +427,30 @@ def get_or_scale_allreduce_mnnvl_workspace(
             logger.debug(
                 f"[MNNVL] Requested {req_buffer_size_bytes} bytes, is larger than the current workspace size. Scaling workspace for pp_rank {mapping.pp_rank}, tp_size {mapping.tp_size} from {allreduce_mnnvl_workspaces[mapping]['buffer_size_bytes']} to {buffer_size_bytes} bytes"
             )
+        if _Q35_AR_LOG:
+            import traceback
+            stack = " <- ".join(f"{os.path.basename(f.filename)}:{f.lineno}:{f.name}"
+                                for f in reversed(traceback.extract_stack()[-9:-1]))
+            logger.info(f"[Q35 comm] MNNVL workspace {'scaled' if mapping in allreduce_mnnvl_workspaces else 'created'}"
+                        f" (rank {mapping.rank}): {buffer_size_bytes} bytes per buffer; called from {stack}")
         # Each workspace contains NUM_LAMPORT_BUFFERS buffers.
         workspace_size_bytes = NUM_LAMPORT_BUFFERS * buffer_size_bytes
         # Pass the pre-split MPI communicator's Fortran handle to avoid redundant splitting in C++
-        mcast_buf_handle = McastGPUBuffer(
-            workspace_size_bytes,
-            mapping.tp_size,
-            mapping.tp_rank,
-            mapping.local_rank,
-            use_fabric_handle,  # whether to use fabric handle or POSIX FD ipc
-            comm.py2f(),  # Fortran handle for the MPI communicator
-        )
+        if _Q35_MNNVL_PRESIZE:
+            mcast_buf_handle = _q35_fenced_mcast_buffer(
+                workspace_size_bytes, mapping, use_fabric_handle, comm)
+        elif _Q35_MCAST_STRAY_LOG:
+            mcast_buf_handle = _q35_stray_diag_construct(
+                workspace_size_bytes, mapping, use_fabric_handle, comm)
+        else:
+            mcast_buf_handle = McastGPUBuffer(
+                workspace_size_bytes,
+                mapping.tp_size,
+                mapping.tp_rank,
+                mapping.local_rank,
+                use_fabric_handle,  # whether to use fabric handle or POSIX FD ipc
+                comm.py2f(),  # Fortran handle for the MPI communicator
+            )
 
         # We use per FP32 element in the buffer for lamport sync
         buffer = mcast_buf_handle.get_uc_buffer(mapping.tp_rank,
@@ -309,6 +634,13 @@ def allgather(
         The gathered tensor or tensor list.
     '''
     group_boxed = mapping.tp_group_pg.boxed() if mpi_disabled() else None
+    if _Q35_AR_LOG and len(mapping.tp_group) > 1:
+        site = _q35_caller_site()
+        shape = tuple(input.shape) if isinstance(input, torch.Tensor) else len(
+            input)
+        _q35_log_once(("allgather", site, shape),
+                      f"[Q35 comm] allgather {site}: tp={mapping.tp_size} "
+                      f"input={shape} dim={dim} -> NCCL all-gather")
     return _allgather(input, mapping.tp_group, mapping.tp_rank, group_boxed,
                       dim, sizes)
 
@@ -611,6 +943,19 @@ class MNNVLAllReduce(nn.Module):
         hidden_dim = input.shape[-1]
         num_tokens = input.numel() // hidden_dim
 
+        residual = all_reduce_params.residual
+        kernel_op = fusion_op
+        if fusion_op == AllReduceFusionOp.RMS_NORM:
+            # TRTLLM_Q35_AR_NORM_FUSE: RMSNorm of the reduced sum is the residual variant with a
+            # zero residual (the kernel adds the residual to the reduced sum; adding zero changes
+            # no value). Without the flag RMS_NORM keeps returning None (caller's fallback path).
+            residual = q35_zero_residual(
+                input.shape, input.dtype, input.device
+            ) if _Q35_AR_NORM_FUSE and input.dtype == self.dtype else None
+            if residual is None:
+                return None
+            kernel_op = AllReduceFusionOp.RESIDUAL_RMS_NORM
+
         workspace_size_bytes = self.get_required_workspace_size(
             num_tokens, hidden_dim, self.mapping.tp_size, self.dtype)
 
@@ -627,27 +972,32 @@ class MNNVLAllReduce(nn.Module):
             self.dtype,
             buffer_size_bytes=workspace_size_bytes,
         )
+        if workspace is None:  # TRTLLM_Q35_MNNVL_PRESIZE: sized once, too small for this call
+            return None
 
         # We don't expect the buffer to be directly used in this level. The tensor is only used for passing the pointer to the kernel
         buffer_base = workspace["uc_buffer"].view(self.dtype).view(3, -1)
         # The buffer flags is tied to the buffer and used to save the state of the buffer
         buffer_flags = workspace["buffer_flags"]
 
-        is_fusion = fusion_op != AllReduceFusionOp.NONE
-        if is_fusion and fusion_op not in MNNVLAllReduce.SUPPORTED_FUSION_OPS:
+        is_fusion = kernel_op != AllReduceFusionOp.NONE
+        if is_fusion and kernel_op not in MNNVLAllReduce.SUPPORTED_FUSION_OPS:
             return None
 
         outputs = torch.ops.trtllm.mnnvl_fusion_allreduce(
             input,
             all_reduce_params.norm_weight,  # gamma
-            all_reduce_params.residual,  # residual
+            residual,  # residual
             all_reduce_params.eps,  # epsilon
             buffer_base,  # comm_buffer
             buffer_flags,  # buffer_flags
             is_fusion,  # rmsnorm_fusion
             all_reduce_params.scale,  # scale
-            int(fusion_op),
+            int(kernel_op),
         )
+        if fusion_op == AllReduceFusionOp.RMS_NORM:
+            # RMS_NORM returns only the normalized tensor (its residual output is the plain sum).
+            return outputs[0]
         return tuple(outputs) if is_fusion else outputs[0]
 
 
@@ -786,6 +1136,74 @@ class AllReduce(nn.Module):
                     )
                     self.mnnvl_allreduce = None
 
+        self._q35_site = None
+        if _Q35_AR_LOG and self.mapping.tp_size > 1:
+            self._q35_site = _q35_caller_site(("linear.py", "embedding.py"))
+            multi_node = self.mapping.is_multi_node()
+            if self.mnnvl_allreduce is not None:
+                route = "MNNVL (fabric Lamport one-/two-shot)"
+            elif self.symm_mem_allreduce is not None:
+                route = "SYMM_MEM for NONE, C++ for fused ops"
+            elif multi_node:
+                route = (f"C++ {self.strategy.name} -> NCCL across nodes "
+                         f"[MNNVL not used: {'no dtype' if dtype is None else 'unsupported'}]")
+            else:
+                route = f"C++ {self.strategy.name} (IPC kernels / NCCL)"
+            _q35_log_once(
+                ("ar_init", self._q35_site, route),
+                f"[Q35 comm] AllReduce {self._q35_site}: tp={self.mapping.tp_size}"
+                f"{' across nodes' if multi_node else ''} strategy={self.strategy.name} "
+                f"dtype={dtype} -> {route}",
+                warn=multi_node and self.mnnvl_allreduce is None)
+
+    def _q35_log_call(self, input: torch.Tensor,
+                      params: Optional[AllReduceParams], path: str) -> None:
+        op = params.fusion_op if params is not None else AllReduceFusionOp.NONE
+        hidden = input.shape[-1]
+        tokens = input.numel() // hidden
+        if path == "MNNVL":
+            nbytes = tokens * hidden * self.mapping.tp_size * input.element_size(
+            )
+            path = ("MNNVL one-shot" if nbytes <= _MNNVL_ONE_SHOT_THRESHOLD_BYTES
+                    else "MNNVL two-shot + Lamport RMSNorm"
+                    if op != AllReduceFusionOp.NONE else "MNNVL two-shot")
+        _q35_log_once(("ar_call", self._q35_site, int(op), tokens, path),
+                      f"[Q35 comm] AllReduce call {self._q35_site}: "
+                      f"op={AllReduceFusionOp(op).name} rows={tokens} hidden={hidden} "
+                      f"dtype={input.dtype} -> {path}",
+                      warn=path.startswith("C++") and self.mapping.is_multi_node())
+
+    def _q35_probe_local(
+        self, input: torch.Tensor, params: Optional[AllReduceParams]
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, ...]]:
+        """TRTLLM_Q35_PROBE_NO_AR: the all-reduce's local epilogue only (no communication)."""
+        op = params.fusion_op if params is not None else AllReduceFusionOp.NONE
+        if op == AllReduceFusionOp.NONE:
+            return input
+        from ..custom_ops import flashinfer_fused_add_rmsnorm, flashinfer_rmsnorm
+        if op == AllReduceFusionOp.RMS_NORM:
+            return flashinfer_rmsnorm(input, params.norm_weight, params.eps)
+        # One in-place fused add + RMSNorm kernel, like the fused all-reduce it replaces (the
+        # all-reduce input and the incoming residual are dead after the call); only the shared
+        # zero residual is copied first.
+        residual = params.residual
+        if any(residual.data_ptr() >= z.data_ptr()
+               and residual.data_ptr() < z.data_ptr() + z.numel() * z.element_size()
+               for z in _q35_zero_residuals.values()):
+            residual = residual.clone()
+        hidden = input
+        flashinfer_fused_add_rmsnorm(hidden, residual, params.norm_weight,
+                                     params.eps)
+        if op == AllReduceFusionOp.RESIDUAL_RMS_NORM:
+            return hidden, residual
+        quant, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
+            hidden, params.scale)
+        if op == AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_FP8:
+            return quant, residual
+        if op == AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_FP8:
+            return hidden, quant, residual
+        raise NotImplementedError(f"probe: fusion op {op}")
+
     def uses_nccl_symmetric_memory_window(self) -> bool:
         """Return True if this allreduce can use an NCCL window output buffer.
 
@@ -847,6 +1265,9 @@ class AllReduce(nn.Module):
 
         input = input.contiguous()  # Underlying op requires contiguous input
 
+        if _Q35_PROBE_NO_AR:
+            return self._q35_probe_local(input, all_reduce_params)
+
         allreduce_strategy = self.strategy
 
         if all_reduce_params is None:
@@ -874,13 +1295,27 @@ class AllReduce(nn.Module):
             mnnvl_output = self.mnnvl_allreduce(
                 input, all_reduce_params=all_reduce_params)
             if mnnvl_output is not None:
+                if self._q35_site is not None:
+                    self._q35_log_call(input, all_reduce_params, "MNNVL")
                 return mnnvl_output
+
+        if self._q35_site is not None:
+            self._q35_log_call(
+                input, all_reduce_params,
+                f"C++ {'tunable_allreduce' if allreduce_strategy == AllReduceStrategy.AUTO else 'allreduce'}"
+                f" strategy={allreduce_strategy.name}"
+                f"{' (NCCL across nodes)' if self.mapping.is_multi_node() else ''}"
+            )
 
         # Fall back to regular AllReduce if specialized methods are not available or not applicable
         # Make sure the strategy is AUTO since allreduceOp does not have the branch for MNNVL/SYMM_MEM
         if allreduce_strategy in (AllReduceStrategy.MNNVL,
                                   AllReduceStrategy.SYMM_MEM):
             allreduce_strategy = AllReduceStrategy.AUTO
+        if (allreduce_strategy == AllReduceStrategy.NCCL_SYMMETRIC
+                and os.environ.get("TRTLLM_Q35_AR_NO_NCCL_SYMM", "0") == "1"):
+            # TRTLLM_Q35_AR_NO_NCCL_SYMM (see custom_ops/torch_custom_ops.py): plain NCCL instead.
+            allreduce_strategy = AllReduceStrategy.NCCL
 
         additional_args = {}
         if self._disable_mpi:
