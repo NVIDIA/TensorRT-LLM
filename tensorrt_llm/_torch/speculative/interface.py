@@ -2801,16 +2801,31 @@ class SpecWorkerBase(nn.Module, ABC):
         top-k / top-p in that mode too). They also need a shared draft/target
         vocabulary, full-vocab fp32 logits and no synthetic acceptance override.
         Host-side checks only, so the decision is CUDA-graph safe. With the flag
-        off nothing else is read, so the reference dispatch is unchanged.
+        off nothing else is read, so the reference dispatch is unchanged. The
+        first decision is logged once per worker, so a run's log shows which
+        path the opt-in took.
         """
         if not fast_rs_enabled():
             return False
         mode = spec_metadata.advanced_sampling_mode
-        return (mode.skips_top_k and mode.skips_top_p and self._d2t is None
-                and self.force_num_accepted_tokens == 0.0
-                and not isinstance(logits, VocabShardedLogits)
-                and fast_rs_supported(logits, spec_metadata.draft_probs,
-                                      stored_vocab))
+        applies = (mode.skips_top_k and mode.skips_top_p and self._d2t is None
+                   and self.force_num_accepted_tokens == 0.0
+                   and not isinstance(logits, VocabShardedLogits)
+                   and fast_rs_supported(logits, spec_metadata.draft_probs,
+                                         stored_vocab))
+        if not getattr(self, "_fast_rs_reported", False):
+            self._fast_rs_reported = True
+            if applies:
+                logger.info(
+                    "TLLM_SPEC_FAST_RS=1: fused rejection sampling active.")
+            else:
+                logger.warning(
+                    "TLLM_SPEC_FAST_RS=1 but the fused rejection sampling does "
+                    "not cover this step (it needs advanced_sampling_mode="
+                    "no_topk_no_topp, a shared draft/target vocabulary and "
+                    f"full-vocab fp32 logits; mode={mode.name}); using the "
+                    "reference path.")
+        return applies
 
     @staticmethod
     def _fast_rs_dummy_row(spec_metadata: SpecMetadata) -> int:

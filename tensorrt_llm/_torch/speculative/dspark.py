@@ -1370,13 +1370,20 @@ class DSparkWorker(DFlashWorker):
             and w2.is_contiguous()
             and self._fast_rs_applies(spec_metadata, flat, vocab)
         )
-        if not applies and not getattr(self, "_warned_sampled_feedback", False):
-            self._warned_sampled_feedback = True
-            logger.warning(
-                "TLLM_DSPARK_MARKOV_SAMPLED_FEEDBACK=1 needs TLLM_SPEC_FAST_RS=1, "
-                "advanced_sampling_mode=no_topk_no_topp and full-vocab draft logits; "
-                "keeping the greedy Markov chain for the rejection proposal."
-            )
+        if not getattr(self, "_sampled_feedback_reported", False):
+            # Once per worker, so a run's log shows which chain the opt-in took.
+            self._sampled_feedback_reported = True
+            if applies:
+                logger.info(
+                    "TLLM_DSPARK_MARKOV_SAMPLED_FEEDBACK=1: the Markov chain advances on "
+                    "the sampled draft tokens."
+                )
+            else:
+                logger.warning(
+                    "TLLM_DSPARK_MARKOV_SAMPLED_FEEDBACK=1 needs TLLM_SPEC_FAST_RS=1, "
+                    "advanced_sampling_mode=no_topk_no_topp and full-vocab draft logits; "
+                    "keeping the greedy Markov chain for the rejection proposal."
+                )
         return applies
 
     def _sampled_chain_draft_tokens(
