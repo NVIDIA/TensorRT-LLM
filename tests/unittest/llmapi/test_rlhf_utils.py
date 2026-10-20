@@ -60,9 +60,7 @@ def test_finish_weight_update_invalidates_cache_and_recaptures() -> None:
 
     engine.reset_prefix_cache.assert_called_once_with()
     synchronize.assert_called_once_with()
-    model_engine.restore_compiled_model_after_refit.assert_called_once_with(
-        resource_manager
-    )
+    model_engine.restore_compiled_model_after_refit.assert_called_once_with(resource_manager)
 
 
 @torch.no_grad()

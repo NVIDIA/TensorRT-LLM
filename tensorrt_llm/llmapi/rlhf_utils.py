@@ -93,9 +93,7 @@ class WorkerExtension:
         """Finalize runtime caches and captures after refit."""
         self.engine.reset_prefix_cache()
         torch.cuda.synchronize()
-        self.engine.model_engine.restore_compiled_model_after_refit(
-            self.engine.resource_manager
-        )
+        self.engine.model_engine.restore_compiled_model_after_refit(self.engine.resource_manager)
 
     def finalize_weight_update(self) -> None:
         """Finalize a refit and refresh post-load state safely for CUDA Graph replay."""

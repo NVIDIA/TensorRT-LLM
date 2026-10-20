@@ -3858,7 +3858,8 @@ class MXFP8LinearMethod(LinearMethodBase):
         if not allow_partial_loading:
             self._store_scale(
                 module,
-                self._load_fused_weight_scales(module, weights, ("q", "k", "v")))
+                self._load_fused_weight_scales(module, weights,
+                                               ("q", "k", "v")))
         else:
             scales = self.load_weight_scales(weights,
                                              module=module,

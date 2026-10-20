@@ -266,8 +266,7 @@ class Qwen3_5MoeHfWeightMapper(Qwen3NextHfWeightMapper):
                 and all(
                     _stacked_in_linear_orientation(name, value)
                     for name, value in module_weights.items()
-                    if name in ("gate_up_proj", "down_proj")
-                    and getattr(value, "ndim", None) == 3
+                    if name in ("gate_up_proj", "down_proj") and getattr(value, "ndim", None) == 3
                 )
             )
 
@@ -285,16 +284,20 @@ class Qwen3_5MoeHfWeightMapper(Qwen3NextHfWeightMapper):
                     for expert_id in range(weight_value.shape[0]):
                         updated_module_weights[f"{expert_id}.w2.weight"] = weight_value[expert_id]
                     continue
-                if unfuse_to_vanilla and weight_name == "gate_up_proj.bias" and (
-                    weight_value.ndim == 2
+                if (
+                    unfuse_to_vanilla
+                    and weight_name == "gate_up_proj.bias"
+                    and (weight_value.ndim == 2)
                 ):
                     for expert_id in range(weight_value.shape[0]):
                         gate_bias, up_bias = weight_value[expert_id].chunk(2, dim=0)
                         updated_module_weights[f"{expert_id}.w1.bias"] = gate_bias
                         updated_module_weights[f"{expert_id}.w3.bias"] = up_bias
                     continue
-                if unfuse_to_vanilla and weight_name == "down_proj.bias" and (
-                    weight_value.ndim == 2
+                if (
+                    unfuse_to_vanilla
+                    and weight_name == "down_proj.bias"
+                    and (weight_value.ndim == 2)
                 ):
                     for expert_id in range(weight_value.shape[0]):
                         updated_module_weights[f"{expert_id}.w2.bias"] = weight_value[expert_id]

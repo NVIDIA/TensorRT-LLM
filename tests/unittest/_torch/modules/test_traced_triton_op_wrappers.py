@@ -30,8 +30,8 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.compilation.remove_copy_pass import remove_copy_for_mutates_args
-from tensorrt_llm._torch.moe.fused_shared_expert import fused_sigmoid_gate_mul_add
 from tensorrt_llm._torch.modules.mamba.layernorm_gated import rms_norm_gated_token_major
+from tensorrt_llm._torch.moe.fused_shared_expert import fused_sigmoid_gate_mul_add
 from tensorrt_llm._torch.utils import set_torch_compiling
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

@@ -2118,8 +2118,9 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         Dropping an alias would therefore not raise -- it would silently skip
         the unwrap and reintroduce the refit corruption.
         """
-        self.assertIs(PyTorchModelEngine.release_piecewise_cuda_graphs_for_refit,
-                      PyTorchModelEngine.unwrap_compiled_model_for_refit)
+        self.assertIs(
+            PyTorchModelEngine.release_piecewise_cuda_graphs_for_refit,
+            PyTorchModelEngine.unwrap_compiled_model_for_refit)
         self.assertIs(
             PyTorchModelEngine.recapture_piecewise_cuda_graphs_after_refit,
             PyTorchModelEngine.restore_compiled_model_after_refit)
