@@ -140,6 +140,39 @@ def test_copy_mode_is_unchanged(extract_from_precompiled, build_tree, tmp_path):
     assert (fmha / "__init__.py").is_file()
 
 
+@pytest.mark.parametrize("source_kind", ["wheel", "copy", "link"])
+def test_precompiled_preserves_source_schemas(
+    extract_from_precompiled, build_tree, tmp_path, monkeypatch, source_kind
+):
+    import zipfile
+
+    paths = (
+        "tensorrt_llm/schemas/trtllm-serve-config.schema.json",
+        "tensorrt_llm/usage/schemas/trtllm_usage_event_schema.json",
+    )
+    for name in paths:
+        path = Path(name)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("current-checkout")
+        old = build_tree / name
+        old.parent.mkdir(parents=True, exist_ok=True)
+        old.write_text("old-precompiled-build")
+    source = build_tree
+    if source_kind == "wheel":
+        source = tmp_path / "precompiled.whl"
+        with zipfile.ZipFile(source, "w") as archive:
+            archive.writestr("fmha_sm100/__init__.py", "")
+            for name in paths:
+                archive.writestr(name, "old-precompiled-build")
+    monkeypatch.setenv("TRTLLM_PRECOMPILED_LINK", "1" if source_kind == "link" else "0")
+    extract_from_precompiled(
+        str(source), PACKAGE_DATA + ["schemas/*.json", "usage/schemas/*.json"], str(tmp_path)
+    )
+    for name in paths:
+        assert Path(name).read_text() == "current-checkout"
+        assert not Path(name).is_symlink()
+
+
 def test_link_mode_rejects_a_wheel(extract_from_precompiled, build_tree, tmp_path):
     """There is no build tree to point at, so fail instead of copying."""
     from setuptools.errors import SetupError

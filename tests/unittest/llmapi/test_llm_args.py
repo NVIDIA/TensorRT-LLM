@@ -548,6 +548,58 @@ def test_dspark_block_size_must_match_max_draft_len(tmp_path):
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize("draft_config, expected_variant", [
+    ({
+        "architectures": ["DFlashDraftModel"]
+    }, 1),
+    ({
+        "architectures": ["DFlash2DraftModel"]
+    }, 2),
+    ({
+        "dflash_config": {
+            "conv_kernel_size": 2
+        }
+    }, 2),
+    ({
+        "dflash_config": {
+            "selector_rank": 4
+        }
+    }, 2),
+    ({
+        "architectures": ["LiLiCorrDraftModel"],
+        "dflash_config": {
+            "selector_rank": 4
+        }
+    }, 1),
+],
+                         ids=[
+                             "dflash", "dflash2_label", "dflash2_conv",
+                             "dflash2_selector", "lilicorr"
+                         ])
+def test_dflash_spec_dec_variant_resolved_from_checkpoint(
+        tmp_path, draft_config, expected_variant):
+    (tmp_path / "config.json").write_text(json.dumps(draft_config))
+    spec_cfg = DFlashDecodingConfig(max_draft_len=3,
+                                    speculative_model=str(tmp_path))
+
+    spec_cfg.resolve_from_checkpoint()
+
+    assert spec_cfg.spec_dec_variant == expected_variant
+
+
+@pytest.mark.cpu_only
+def test_dflash_spec_dec_variant_unknown_until_checkpoint_read():
+    # A HF repo id has no readable config.json until it is downloaded, so the
+    # version must not be reported as DFlash 1 before then.
+    spec_cfg = DFlashDecodingConfig(max_draft_len=3,
+                                    speculative_model="org/dflash-drafter")
+
+    spec_cfg.resolve_from_checkpoint()
+
+    assert spec_cfg.spec_dec_variant is None
+
+
+@pytest.mark.cpu_only
 def test_dspark_target_layer_ids_resolved_from_checkpoint(tmp_path):
     # When the user leaves target_layer_ids unset, the checkpoint's ordered
     # dspark_target_layer_ids must be adopted verbatim.
@@ -1001,6 +1053,7 @@ class TestKvCacheManagerV2AutoResolution:
                                                       cache_transceiver_config):
         llm_args = TorchLlmArgs(
             model="/tmp/dummy_model",
+            kv_cache_config=KvCacheConfig(use_kv_cache_manager_v2="auto"),
             cache_transceiver_config=cache_transceiver_config)
 
         assert _resolve_kv_cache_manager_v2_auto(llm_args,
@@ -1015,6 +1068,7 @@ class TestKvCacheManagerV2AutoResolution:
         """A required V2 is refused on the demotion arm, never demoted."""
         llm_args = TorchLlmArgs(
             model="/tmp/dummy_model",
+            kv_cache_config=KvCacheConfig(use_kv_cache_manager_v2="auto"),
             cache_transceiver_config=CacheTransceiverConfig(
                 backend=backend, transceiver_runtime=runtime),
         )
@@ -2715,9 +2769,27 @@ class TestPiecewiseCudaGraphCaptureDefaults:
         args = TorchLlmArgs(model=llama_model_path,
                             torch_compile_config=TorchCompileConfig(
                                 enable_piecewise_cuda_graph=True,
+                                compile_only_piecewise_graphs=True,
                                 capture_num_tokens=[128, 256]))
         assert args.prefill_cuda_graph_backend == PrefillCudaGraphBackend.PIECEWISE
         assert args.prefill_capture_num_tokens == [256, 128]
+        assert args.torch_compile_config.compile_only_piecewise_graphs
+
+    def test_compile_only_piecewise_graphs_requires_piecewise_backend(self):
+        with pytest.raises(ValueError, match="requires.*piecewise"):
+            TorchLlmArgs(model=llama_model_path,
+                         torch_compile_config=TorchCompileConfig(
+                             compile_only_piecewise_graphs=True))
+
+    def test_compile_only_piecewise_graphs_supports_attention_dp(self):
+        args = TorchLlmArgs(
+            model=llama_model_path,
+            enable_attention_dp=True,
+            prefill_cuda_graph_backend=PrefillCudaGraphBackend.PIECEWISE,
+            torch_compile_config=TorchCompileConfig(
+                compile_only_piecewise_graphs=True))
+        assert args.enable_attention_dp
+        assert args.torch_compile_config.compile_only_piecewise_graphs
 
     def test_explicit_new_buckets_with_legacy_piecewise_enable(self):
         args = TorchLlmArgs(model=llama_model_path,

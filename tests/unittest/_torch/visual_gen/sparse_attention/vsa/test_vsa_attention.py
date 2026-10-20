@@ -28,34 +28,34 @@ import torch
 
 from tensorrt_llm._torch.attention.backends.interface import PredefinedAttentionMask
 from tensorrt_llm._torch.attention.backends.sparse.params import BlockSparseForwardInputs
-from tensorrt_llm._torch.visual_gen.attention_backend.cute_dsl import CuTeDSLAttention
-from tensorrt_llm._torch.visual_gen.attention_backend.interface import AttentionTensorLayout
-from tensorrt_llm._torch.visual_gen.attention_backend.sparse.vsa import backend as vsa_backend
-from tensorrt_llm._torch.visual_gen.attention_backend.sparse.vsa import kernels as vsa_kernels
-from tensorrt_llm._torch.visual_gen.attention_backend.sparse.vsa import predictor as vsa_predictor
-from tensorrt_llm._torch.visual_gen.attention_backend.sparse.vsa.backend import (
+from tensorrt_llm._torch.visual_gen.attention import attention as attention_module
+from tensorrt_llm._torch.visual_gen.attention.attention import Attention, QKVMode
+from tensorrt_llm._torch.visual_gen.attention.backends.cute_dsl import CuTeDSLAttention
+from tensorrt_llm._torch.visual_gen.attention.backends.interface import AttentionTensorLayout
+from tensorrt_llm._torch.visual_gen.attention.backends.sparse.vsa import backend as vsa_backend
+from tensorrt_llm._torch.visual_gen.attention.backends.sparse.vsa import kernels as vsa_kernels
+from tensorrt_llm._torch.visual_gen.attention.backends.sparse.vsa import predictor as vsa_predictor
+from tensorrt_llm._torch.visual_gen.attention.backends.sparse.vsa.backend import (
     VSACuTeDSLAttention,
     VSATrtllmAttention,
 )
-from tensorrt_llm._torch.visual_gen.attention_backend.sparse.vsa.kernels import tile_and_pool_cubes
-from tensorrt_llm._torch.visual_gen.attention_backend.sparse.vsa.metadata import (
+from tensorrt_llm._torch.visual_gen.attention.backends.sparse.vsa.kernels import tile_and_pool_cubes
+from tensorrt_llm._torch.visual_gen.attention.backends.sparse.vsa.metadata import (
     VSA_BLOCK_SIZE,
     VSAMetadataBuilder,
     set_vsa_forward_context,
 )
-from tensorrt_llm._torch.visual_gen.attention_backend.sparse.vsa.predictor import (
+from tensorrt_llm._torch.visual_gen.attention.backends.sparse.vsa.predictor import (
     VSAForwardInputs,
     VSAPredictor,
 )
-from tensorrt_llm._torch.visual_gen.attention_backend.trtllm import TrtllmAttention
-from tensorrt_llm._torch.visual_gen.attention_backend.utils import create_attention
-from tensorrt_llm._torch.visual_gen.attention_backend.vanilla import VanillaAttention
+from tensorrt_llm._torch.visual_gen.attention.backends.trtllm import TrtllmAttention
+from tensorrt_llm._torch.visual_gen.attention.backends.utils import create_attention
+from tensorrt_llm._torch.visual_gen.attention.backends.vanilla import VanillaAttention
 from tensorrt_llm._torch.visual_gen.config import (
     DiffusionModelConfig,
     create_attention_metadata_state,
 )
-from tensorrt_llm._torch.visual_gen.modules import attention as attention_module
-from tensorrt_llm._torch.visual_gen.modules.attention import Attention, QKVMode
 from tensorrt_llm.visual_gen.args import AttentionConfig, VideoSparseAttentionConfig
 
 

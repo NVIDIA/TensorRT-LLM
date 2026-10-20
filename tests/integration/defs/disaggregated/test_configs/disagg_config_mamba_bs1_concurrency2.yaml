@@ -12,7 +12,7 @@ context_servers:
   trust_remote_code: true
   kv_cache_config:
     enable_block_reuse: false
-    use_kv_cache_manager_v2: false
+    use_kv_cache_manager_v2: true
     mamba_ssm_cache_dtype: float16
     free_gpu_memory_fraction: 0.2
   cache_transceiver_config:
@@ -27,7 +27,7 @@ generation_servers:
   trust_remote_code: true
   kv_cache_config:
     enable_block_reuse: false
-    use_kv_cache_manager_v2: false
+    use_kv_cache_manager_v2: true
     mamba_ssm_cache_dtype: float16
     free_gpu_memory_fraction: 0.2
   cache_transceiver_config:

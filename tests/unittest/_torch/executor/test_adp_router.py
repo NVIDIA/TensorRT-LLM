@@ -540,6 +540,29 @@ class TestDefaultADPRouter:
         assert states[1] == rank1
         dist.tp_allgather.assert_called_once_with(expected_local.serialize())
 
+    def test_kv_load_payload_only_changes_wire_shape_when_enabled(self):
+        payload = RankIterStatsPayload(
+            kv_used_blocks=4,
+            kv_total_blocks=10,
+            kv_load_timestamp_ns=123,
+        )
+        state = RankState(
+            rank=0,
+            iter_stats=payload,
+            num_context_requests=2,
+            num_generation_requests=3,
+        )
+
+        disabled = state.serialize()
+        assert len(disabled) == 15
+        assert RankState.deserialize(disabled).num_context_requests == 2
+        enabled = state.serialize(include_kv_cache_load=True)
+        assert len(enabled) == 18
+        restored = RankState.deserialize(enabled)
+        assert restored.iter_stats.kv_used_blocks == 4
+        assert restored.num_context_requests == 2
+        assert restored.num_generation_requests == 3
+
 
 def test_schedule_attention_dp_requests_scheduled_requests(
     attention_dp_config, all_ranks_num_active_requests, all_ranks_num_active_tokens
@@ -1429,6 +1452,20 @@ class TestConversationAwareADPRouter:
         pos2 = self._route(router, self._states(4), second)
         for i in range(4):
             assert pos2[100 + i] == home[convs[i]]
+
+    def test_parent_and_child_turns_share_rank(self):
+        router = self._router(tp_size=4)
+        states = self._states(4)
+        parent = _make_conv_request_item(1, "parent", target_dp_rank=2)
+        assert self._route(router, states, [parent])[1] == 2
+
+        turns = [
+            _make_conv_request_item(2, "child-a", subagent_affinity_id="parent"),
+            _make_conv_request_item(3, "child-b", subagent_affinity_id="parent"),
+            _make_conv_request_item(4, "child-a", subagent_affinity_id="parent"),
+        ]
+        for turn in turns:
+            assert self._route(router, states, [turn])[turn.id] == 2
 
     def test_no_conversation_id_falls_back_and_is_not_recorded(self):
         router = self._router(tp_size=4)

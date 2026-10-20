@@ -24,7 +24,7 @@ import pytest
 import torch
 
 try:
-    from tensorrt_llm._torch.visual_gen.attention_backend.flash_attn4 import (
+    from tensorrt_llm._torch.visual_gen.attention.backends.flash_attn4 import (
         FlashAttn4Attention,
         _flash_attn_fwd,
     )

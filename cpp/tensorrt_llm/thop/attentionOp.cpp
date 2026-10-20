@@ -23,6 +23,7 @@
 #include "tensorrt_llm/kernels/gptKernels.h"
 #include "tensorrt_llm/kernels/mlaKernels.h"
 #include "tensorrt_llm/kernels/sparseAttentionKernels.h"
+#include "tensorrt_llm/kernels/trtllmGenKernels/fmha/prepareCustomMask.h"
 #include "tensorrt_llm/runtime/torchUtils.h"
 #include "tensorrt_llm/runtime/utils/debugUtils.h"
 #include "tensorrt_llm/thop/attentionOp.h"
@@ -352,9 +353,10 @@ public:
 
     virtual ~RunnerBase() = default;
     virtual void prepare(AttentionOp& op) const = 0;
-    virtual int64_t getWorkspaceSize(AttentionOp const& op, int const num_tokens, int const max_attention_window_size,
-        int const num_gen_tokens, int const max_blocks_per_sequence, int const ctx_total_kv_len = 0,
-        int const maxCrossKvLength = 0) const
+    virtual int64_t getWorkspaceSize(AttentionOp const& op, int const num_contexts, int const num_context_tokens,
+        int const max_context_q_len, int const cross_kv_length, int const num_generations,
+        int const max_attention_window_size, int const num_gen_tokens, int const max_blocks_per_sequence,
+        int const ctx_total_kv_len = 0) const
         = 0;
     // typically, we use single qkv input, but for context MLA, we use separate qkv inputs
     virtual void run(AttentionOp& op, bool const is_context, int32_t const seq_offset, int32_t const num_seqs,
@@ -419,14 +421,15 @@ public:
         op.reserveSemaphoreArray(std::max(op.mNumHeads * max_num_sequences, op.getMultiProcessorCount()));
     }
 
-    int64_t getWorkspaceSize(AttentionOp const& op, int const num_tokens, int const max_attention_window_size,
-        int const num_gen_tokens, int const max_blocks_per_sequence, int const ctx_total_kv_len = 0,
-        int const maxCrossKvLength = 0) const override
+    int64_t getWorkspaceSize(AttentionOp const& op, int const num_contexts, int const num_context_tokens,
+        int const max_context_q_len, int const cross_kv_length, int const num_generations,
+        int const max_attention_window_size, int const num_gen_tokens, int const max_blocks_per_sequence,
+        int const ctx_total_kv_len = 0) const override
     {
         size_t const context_workspace_size = op.getWorkspaceSizeForContext(
-            op.mType, max_num_requests, op.mMaxContextLength, maxCrossKvLength, num_tokens, ctx_total_kv_len);
+            op.mType, num_contexts, max_context_q_len, cross_kv_length, num_context_tokens, ctx_total_kv_len);
         size_t const generation_workspace_size = op.getWorkspaceSizeForGeneration(
-            op.mType, max_num_sequences, max_attention_window_size, num_gen_tokens, max_blocks_per_sequence);
+            op.mType, num_generations, max_attention_window_size, num_gen_tokens, max_blocks_per_sequence);
 
         return std::max(context_workspace_size, generation_workspace_size);
     }
@@ -699,12 +702,10 @@ public:
         if (max_context_q_len_override.has_value())
         {
             int32_t const override_value = static_cast<int32_t>(max_context_q_len_override.value());
-            TORCH_CHECK(override_value >= max_context_q_len_computed,
-                "max_context_q_len_override (%d) must be >= computed max context q length (%d).", override_value,
-                max_context_q_len_computed);
-            TORCH_CHECK(override_value >= max_past_kv_length_computed,
-                "max_context_q_len_override (%d) must be >= computed max past kv length (%d).", override_value,
-                max_past_kv_length_computed);
+            TORCH_CHECK(override_value >= max_context_q_len_computed, "max_context_q_len_override (", override_value,
+                ") must be >= computed max context q length (", max_context_q_len_computed, ").");
+            TORCH_CHECK(override_value >= max_past_kv_length_computed, "max_context_q_len_override (", override_value,
+                ") must be >= computed max past kv length (", max_past_kv_length_computed, ").");
         }
 
         int32_t const max_context_q_len = max_context_q_len_override.has_value()
@@ -1032,11 +1033,14 @@ public:
                         "Expecting spec_decoding_bl_tree_mask_offset in trtllm-gen spec-dec mode.");
                     TORCH_CHECK(spec_decoding_bl_tree_mask.has_value(),
                         "Expecting spec_decoding_bl_tree_mask in trtllm-gen spec-dec mode.");
+                    TORCH_CHECK(spec_decoding_bl_tree_mask->is_contiguous() && spec_decoding_bl_tree_mask->numel() > 0,
+                        "spec_decoding_bl_tree_mask must be a non-empty contiguous tensor.");
                     TORCH_CHECK(spec_bl_tree_first_sparse_mask_offset_kv.has_value(),
                         "Expecting spec_bl_tree_first_sparse_mask_offset_kv in trtllm-gen spec-dec mode.");
                     enqueue_params.spec_decoding_bl_tree_mask_offset
                         = spec_decoding_bl_tree_mask_offset->data_ptr<int64_t>();
                     enqueue_params.spec_decoding_bl_tree_mask = spec_decoding_bl_tree_mask->data_ptr<uint32_t>();
+                    enqueue_params.spec_decoding_bl_tree_mask_capacity = spec_decoding_bl_tree_mask->numel();
                     enqueue_params.spec_bl_tree_first_sparse_mask_offset_kv
                         = spec_bl_tree_first_sparse_mask_offset_kv->data_ptr<int32_t>();
                 }
@@ -1483,6 +1487,27 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     auto const ctx_total_kv_len = host_total_kv_lens.index({0}).item<int32_t>();
     auto const gen_total_kv_len = host_total_kv_lens.index({1}).item<int32_t>();
 
+    // The thop workspace is resized for each call, so size the quadratic
+    // unfused-context buffers for this batch rather than the model's configured
+    // maximum context length. Keep the explicit override for CUDA graph capture,
+    // where launch dimensions are padded to a stable length.
+    int32_t max_context_q_len = 0;
+    if (num_contexts > 0)
+    {
+        int32_t const computed_max_context_q_len = host_context_lengths.slice(0, 0, num_contexts).max().item<int32_t>();
+        if (max_context_q_len_override.has_value())
+        {
+            int32_t const override_value = static_cast<int32_t>(max_context_q_len_override.value());
+            TORCH_CHECK(override_value >= computed_max_context_q_len, "max_context_q_len_override (", override_value,
+                ") must be >= computed max context q length (", computed_max_context_q_len, ").");
+            max_context_q_len = override_value;
+        }
+        else
+        {
+            max_context_q_len = computed_max_context_q_len;
+        }
+    }
+
     for (int32_t idx = num_contexts; idx < num_seqs; idx++)
     {
         TLLM_CHECK(request_types[idx] == RequestType::kGENERATION);
@@ -1502,8 +1527,9 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     {
         maxCrossKvLength = host_past_key_value_lengths.slice(0, 0, num_contexts).max().item<int32_t>();
     }
-    int64_t const workspace_size = runner->getWorkspaceSize(*op, num_tokens, max_attention_window_size, num_gen_tokens,
-        max_blocks_per_sequence, ctx_total_kv_len, maxCrossKvLength);
+    int64_t const workspace_size
+        = runner->getWorkspaceSize(*op, num_contexts, num_ctx_tokens, max_context_q_len, maxCrossKvLength,
+            num_generations, max_attention_window_size, num_gen_tokens, max_blocks_per_sequence, ctx_total_kv_len);
     TLLM_LOG_TRACE("Expected workspace size is %ld bytes", workspace_size);
 
     torch::Tensor workspace;
@@ -1625,6 +1651,13 @@ bool attention_supports_nvfp4_output(int64_t const num_heads, int64_t const num_
     }
 
     return op->supportsNvFp4Output();
+}
+
+int64_t spec_dec_tree_custom_mask_capacity(
+    int64_t const max_num_requests, int64_t const max_seq_len_q, int64_t const num_heads_q_per_kv)
+{
+    return tensorrt_llm::kernels::getCustomMaskCapacityUpperBound(static_cast<int32_t>(max_num_requests),
+        static_cast<int32_t>(max_seq_len_q), static_cast<int32_t>(num_heads_q_per_kv));
 }
 
 KvCachePoolPointers buildKvCachePoolPointers(at::Tensor const& hostKvCachePoolPointers, int32_t poolIndex,
@@ -1796,4 +1829,5 @@ TRTLLM_NAMESPACE_END
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def("attention_supports_nvfp4_output", &tensorrt_llm::torch_ext::attention_supports_nvfp4_output);
+    m.def("spec_dec_tree_custom_mask_capacity", &tensorrt_llm::torch_ext::spec_dec_tree_custom_mask_capacity);
 }

@@ -530,40 +530,116 @@ class MiniMaxM3ReasoningParser(DeepSeekR1Parser):
 
           <mm:think>{reasoning}</mm:think>{content}
 
-    * Without reasoning (the template still emits a bare ``</mm:think>``
-      as a sentinel so the model knows where the visible content starts)::
+    * Without reasoning (a bare ``</mm:think>`` sentinel marks where the
+      visible content starts; the template prefills it when thinking is
+      disabled, and in adaptive mode the model generates it)::
 
           </mm:think>{content}
 
-    M3 is therefore not strictly ``reasoning_at_start`` — the leading
-    ``<mm:think>`` may or may not be present — so we partition on the
-    closing tag first and then strip an optional leading opening tag
-    from the reasoning portion. This keeps streaming behavior identical
-    to :class:`DeepSeekR1Parser` for the common (``<mm:think>...``) case
-    while also handling the bare-sentinel form.
+    Which shape the model produces depends on how the prompt was rendered:
+    with thinking enabled the template prefills ``<mm:think>`` into the
+    prompt, so the output opens inside the reasoning block with no opening
+    tag; with thinking disabled it prefills ``</mm:think>``, so the output is
+    all content; in adaptive mode (the template default) it prefills nothing
+    and the model emits ``<mm:think>`` or the bare sentinel first. The parser
+    therefore takes its mode from an explicit ``thinking_mode`` or from the
+    mode the server resolved off the rendered prompt (relayed as
+    ``enable_thinking``), and otherwise starts outside reasoning. Both
+    tags are delimiters and never appear in the result; text before an
+    opening tag is content; an opening tag without a closing tag is
+    reasoning cut off by the token limit. ``parse`` and ``parse_delta``
+    agree on every input for every chunking.
     """
+
+    resolves_thinking_from_prompt = True
+    reasoning_start = "<mm:think>"
+    reasoning_end = "</mm:think>"
 
     def __init__(self,
                  *,
                  chat_template_kwargs: Optional[dict[str, Any]] = None) -> None:
-        super().__init__(reasoning_at_start=False,
+        kwargs = chat_template_kwargs or {}
+        # The template's own knob is `thinking_mode`; only "enabled" prefills
+        # the opening tag. Without it, trust the mode the server resolved
+        # from the rendered prompt, relayed as `enable_thinking` (a caller
+        # cannot pass that key: the template never reads it, so the
+        # unused-kwargs guard rejects it). A bare `thinking` is what the
+        # Responses path injects for `reasoning.effort`; this template does
+        # not act on it, so neither does the parser.
+        thinking_mode = kwargs.get("thinking_mode")
+        if thinking_mode is not None:
+            prefilled_open = thinking_mode == "enabled"
+        else:
+            prefilled_open = kwargs.get("enable_thinking") is True
+        super().__init__(reasoning_at_start=prefilled_open,
                          chat_template_kwargs=chat_template_kwargs)
         self.reasoning_start = "<mm:think>"
         self.reasoning_end = "</mm:think>"
 
     def parse(self, text: str) -> ReasoningParserResult:
+        if self.reasoning_at_start:
+            # The prompt ends with the opening tag, so the output begins
+            # inside the reasoning block.
+            text = self.reasoning_start + text
+        start_idx = text.find(self.reasoning_start)
         end_idx = text.find(self.reasoning_end)
+        if start_idx != -1 and (end_idx == -1 or start_idx < end_idx):
+            prefix = text[:start_idx]
+            body = text[start_idx + len(self.reasoning_start):]
+            if end_idx == -1:
+                # An opening tag with no closing tag is reasoning cut off
+                # (e.g. by max_tokens); streaming reports it as reasoning.
+                return self._create_reasoning_end_result(prefix, body)
+            reasoning_content, _, content = body.partition(self.reasoning_end)
+            return self._create_reasoning_end_result(prefix + content,
+                                                     reasoning_content)
         if end_idx == -1:
-            # No closing tag → no reasoning block in this response.
+            # No tags at all: no reasoning block in this response.
             return ReasoningParserResult(content=text)
-        reasoning_content = text[:end_idx]
-        content = text[end_idx + len(self.reasoning_end):]
-        # Strip an optional leading <mm:think> from the reasoning portion
-        # so the sentinel-only shape (no opening tag) reduces to
-        # reasoning_content="".
-        if reasoning_content.startswith(self.reasoning_start):
-            reasoning_content = reasoning_content[len(self.reasoning_start):]
-        return self._create_reasoning_end_result(content, reasoning_content)
+        # A closing tag with no opening tag is the empty-reasoning sentinel:
+        # a delimiter, dropped; what follows is parsed by the same rules.
+        rest = self.parse(text[end_idx + len(self.reasoning_end):])
+        return self._create_reasoning_end_result(text[:end_idx] + rest.content,
+                                                 rest.reasoning_content)
+
+    def parse_delta(self, delta_text: str) -> ReasoningParserResult:
+        # Outside a reasoning block the inherited parser only looks for the
+        # opening tag, so a bare ``</mm:think>`` sentinel would leak into the
+        # content; it drops text that precedes an opening tag in the same
+        # delta although it reports that text as content when it arrives on
+        # its own; and it only withholds a partial tag when the whole delta
+        # is one. Resolve the three here so streaming matches ``parse`` for
+        # every chunking; inside a reasoning block the inherited behaviour
+        # already does.
+        if self.in_reasoning:
+            return super().parse_delta(delta_text)
+        pending = self._buffer + delta_text
+        self._buffer = ""
+        start_idx = pending.find(self.reasoning_start)
+        end_idx = pending.find(self.reasoning_end)
+        if end_idx != -1 and (start_idx == -1 or end_idx < start_idx):
+            # Sentinel: a delimiter, dropped; the rest is parsed as usual.
+            before = pending[:end_idx]
+            after = pending[end_idx + len(self.reasoning_end):]
+        elif start_idx != -1:
+            # Text before the opening tag is content; the inherited parser
+            # takes over at the tag.
+            rest = super().parse_delta(pending[start_idx:])
+            return ReasoningParserResult(
+                content=pending[:start_idx] + rest.content,
+                reasoning_content=rest.reasoning_content)
+        else:
+            # Withhold a trailing fragment that could still grow into a tag.
+            tag_start = pending.rfind("<")
+            if tag_start != -1 and (
+                    self.reasoning_start.startswith(pending[tag_start:])
+                    or self.reasoning_end.startswith(pending[tag_start:])):
+                self._buffer = pending[tag_start:]
+                pending = pending[:tag_start]
+            return ReasoningParserResult(content=pending)
+        rest = (self.parse_delta(after) if after else ReasoningParserResult())
+        return ReasoningParserResult(content=before + rest.content,
+                                     reasoning_content=rest.reasoning_content)
 
 
 MODEL_TYPE_TO_REASONING_PARSER: dict[str, str] = {

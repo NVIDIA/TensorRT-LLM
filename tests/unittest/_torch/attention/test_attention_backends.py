@@ -11,6 +11,7 @@ each case maps to a real workload. The orthogonal dimensions are bounded:
 
 * default cross on every cacheable config: phase {ctx, gen, mix} x
   precision {bf16, fp8-KV} x KV-manager {v1, v2}, at page_size=32, layout=HND.
+  T5/BART encoder-decoder cross-attention uses V2 only.
 * the non-default dimension values (page_size=64, layout=NHD, dtype=fp16) are
   exercised on a small representative set (GQA / MHA / MQA) to avoid a full
   cross blow-up -- page/manager/layout are mostly head-config-independent. For
@@ -21,10 +22,12 @@ cannot serve a case (dtype/layout/feature) are skipped via the capability matrix
 (``unsupported_reason``), which also gates sm-dependent dtypes.
 """
 
+import backend_case
 import pytest
 import torch
 from backend_case import BACKENDS_UNDER_TEST, BackendCase, generate_inputs, run_backend, run_case
 from model_attn_config import MODEL_CONFIGS, ModelAttnConfig
+from utils.util import getSMVersion
 
 # Precision variants as (dtype, kv_dtype): bf16/fp16 are compute-only; fp8 is an
 # fp8 KV cache with bf16 compute.
@@ -168,6 +171,8 @@ def _expand(cfg: ModelAttnConfig, precisions, kv_layouts, page_sizes):
         for layout in kv_layouts:
             for page in page_sizes:
                 for v2 in (False, True):
+                    if cfg.is_cross and cfg.id != "mllama_gqa_cross" and not v2:
+                        continue
                     tag = f"{_prec_tag(dtype, kvd)}-{layout}-p{page}-{'v2' if v2 else 'v1'}"
                     base = dict(
                         page_size=page,
@@ -227,6 +232,46 @@ MODEL_CASES = _model_cases()
 @pytest.mark.parametrize("name", list(MODEL_CASES), ids=lambda n: n)
 def test_attention_backend(name):
     run_case(MODEL_CASES[name])
+
+
+# ---------------------------------------------------------------------------
+# Backend-specific regressions that require a non-default implementation path
+# or workload shape and therefore do not belong in the cross-backend model
+# matrix above.
+# ---------------------------------------------------------------------------
+@pytest.mark.skipif(
+    getSMVersion() not in (100, 103),
+    reason="Kimi K3 TRTLLM-Gen MLA regression requires SM100 or SM103",
+)
+@pytest.mark.parametrize("page_size", [32, 64], ids=["p32", "p64"])
+@pytest.mark.parametrize("seq_len_q", [1, 3], ids=["q1", "q3"])
+def test_trtllm_mla_kimi_k3_h96(
+    monkeypatch: pytest.MonkeyPatch,
+    page_size: int,
+    seq_len_q: int,
+) -> None:
+    """Verify K3 H96 MLA generation numerics in eager and CUDA Graph execution."""
+    batch_size = 32
+    case = BackendCase(
+        num_heads=96,
+        num_kv_heads=1,
+        head_dim=192,
+        seq_lens=[seq_len_q] * batch_size,
+        num_cached_tokens=[31] * batch_size,
+        num_contexts=0,
+        dtype="bfloat16",
+        page_size=page_size,
+        kv_layout="HND",
+        is_mla=True,
+        v_head_dim=128,
+        q_lora_rank=1536,
+        kv_lora_rank=512,
+        qk_nope_head_dim=128,
+        qk_rope_head_dim=64,
+    )
+    monkeypatch.setattr(backend_case, "BACKENDS_UNDER_TEST", ("TRTLLM",))
+    monkeypatch.setenv("TLLM_FMHA_LIBS", "flashinfer_trtllm_gen,fallback")
+    backend_case.run_case(case)
 
 
 # ---------------------------------------------------------------------------

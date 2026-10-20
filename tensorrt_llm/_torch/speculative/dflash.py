@@ -46,6 +46,27 @@ if TYPE_CHECKING:
     from ...llmapi.llm_args import DFlashDecodingConfig
 
 
+def dflash_context_dtype(draft_model: nn.Module) -> torch.dtype:
+    """Use projection activations for the context cache, not packed weight storage."""
+    projection = getattr(draft_model, "fc", None)
+    if projection is None:
+        return torch.bfloat16
+    return getattr(projection, "dtype", projection.weight.dtype)
+
+
+def last_accepted_hidden(projected_rows: torch.Tensor, num_accepted: torch.Tensor) -> torch.Tensor:
+    """Select the target row that predicted each newly committed anchor.
+
+    Rows are [requests, verification tokens, hidden], after the target projection
+    and hidden normalization: hidden_norm(fc(target_hidden)). Accepted counts
+    include the target's bonus token, so its predicting row is at count minus one.
+    """
+    indices = (num_accepted - 1).clamp_min(0).long()
+    return projected_rows.gather(
+        1, indices[:, None, None].expand(-1, 1, projected_rows.shape[-1])
+    ).squeeze(1)
+
+
 def compute_dflash_ctx_buffer_bytes(
     max_batch_size: int,
     max_ctx_len: int,
@@ -328,7 +349,7 @@ def validate_dflash_ctx_buffer_budget(
     max_ctx = min(_ctx_candidates) if _ctx_candidates else 8192
     num_kv_heads_per_rank = (num_kv_heads + tp_size - 1) // tp_size
     # Config-time approximations of the real allocation's inputs: the lazy
-    # allocation reads draft_model.fc.weight.dtype and _draft_block_width()
+    # allocation reads dflash_context_dtype() and _draft_block_width()
     # (both subclass-overridable), whereas here dtype_bytes is derived from
     # config["torch_dtype"] and the block width is hardcoded to K + 1.
     dtype_bytes = 4 if draft_config.get("torch_dtype") in ("float32", "float") else 2
@@ -430,6 +451,34 @@ def dflash_draft_slot_ids(
     offsets = torch.arange(num_draft_tokens, dtype=torch.long, device=device)
     first_slot = 0 if shift_label else 1
     return (request_bases.unsqueeze(1) + first_slot + offsets.unsqueeze(0)).flatten()
+
+
+def dflash_noise_block_embedding(
+    embed_tokens: nn.Module,
+    bonus: torch.Tensor,
+    mask_token_id: int,
+    block_size: int,
+    trained_mask_embedding: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """The drafter's input block per request, [len(bonus), block_size, hidden]: slot 0 the bonus token's embedding,
+    every other slot the mask token's.
+
+    The mask row is the drafter's own trained one when it has one (``trained_mask_embedding``); otherwise the shared
+    lookup's. Both rows go through ``embed_tokens.forward`` (NOT ``.weight[...]``) so TP-sharded vocabs mask out
+    ranks that don't own the token id and all-reduce, the mask row included, so every rank makes the same call.
+
+    ``trained_mask_embedding`` ([hidden]) is used as given: the drafter casts it to its own dtype and device at load.
+    """
+    num_gens = bonus.shape[0]
+    mask_tok = torch.full((1,), int(mask_token_id), dtype=torch.long, device=bonus.device)
+    combined_embed = embed_tokens(torch.cat([bonus, mask_tok], dim=0))
+    embed_bonus = combined_embed[:num_gens]
+    embed_mask = combined_embed[num_gens]
+    if trained_mask_embedding is not None:
+        embed_mask = trained_mask_embedding
+    noise_embed_2d = embed_mask.expand(num_gens, block_size, -1).clone()
+    noise_embed_2d[:, 0, :] = embed_bonus
+    return noise_embed_2d
 
 
 def dflash_position_ceiling(max_ctx: int, block_size: int, max_draft_len: int) -> int:
@@ -784,6 +833,20 @@ class DFlashWorker(SpecWorkerBase):
                 "DFlash 2 candidate selection requires a shared draft/target vocab "
                 "(d2t vocab mapping is not supported)."
             )
+        lilicorr = getattr(draft_model, "lilicorr", None)
+        if lilicorr is not None:
+            if self._d2t is not None:
+                raise NotImplementedError("LiLiCorr requires a shared draft/target vocabulary")
+            if self.max_draft_len >= lilicorr.block_size:
+                raise ValueError(
+                    f"LiLiCorr checkpoint was trained with block_size={lilicorr.block_size}. "
+                    f"Set max_draft_len to at most {lilicorr.block_size - 1}; "
+                    f"got {self.max_draft_len}."
+                )
+            if not self.spec_config.target_layer_ids:
+                raise ValueError(
+                    "LiLiCorr requires nonempty target_layer_ids to capture target hidden states."
+                )
 
     def _check_ctx_arena_fits(self, capacity, num_slots, L, nkv, hd, dtype, kv_factor=2):
         """Fail with the arithmetic before allocating the drafter context arena.
@@ -1035,7 +1098,7 @@ class DFlashWorker(SpecWorkerBase):
                 "the binding constraint, so requests past it will draft nothing."
             )
 
-        dtype = draft_model.fc.weight.dtype if hasattr(draft_model, "fc") else torch.bfloat16
+        dtype = dflash_context_dtype(draft_model)
 
         # Reserve slot index max_batch as a scratch slot for padding/unknown
         # dummies; real requests only draw slots 0..max_batch-1, so dummy
@@ -1340,6 +1403,19 @@ class DFlashWorker(SpecWorkerBase):
             bs = self._kv_rewind_bs
             attn_metadata.kv_lens_cuda[nc:bs] -= self._kv_rewind_amount
             attn_metadata.kv_lens_cuda[nc:bs].clamp_(min=0)
+
+    def _advance_ctx_len(self, slots: torch.Tensor, num_accepted: torch.Tensor) -> None:
+        """Add this step's accepted tokens to the context lengths of ``slots``, on the device.
+
+        Padding, warmup and attention-DP dummy rows share the dummy slot, which no request owns
+        or frees. Emptying it right after the add keeps it at 0 between steps: those rows attend
+        no context, and their next context K / V starts at column 0, inside the padding
+        request's own pages (past them, its page-table row maps page 0, another request's).
+        The store is to a fixed slot, so a captured step replays it.
+        """
+        self._ctx_len[slots] += num_accepted
+        self._ctx_len.clamp_(max=self._max_ctx)
+        self._ctx_len[self._dummy_slot].zero_()
 
     def _write_ctx_len(self, updates: dict[int, int]) -> None:
         """Apply a slot-to-length mapping to _ctx_len in one async scatter."""
@@ -1698,7 +1774,16 @@ class DFlashWorker(SpecWorkerBase):
 
                 # DFlash 2: replace the independent per-position picks with one
                 # coherent path through the block (absent for plain DFlash).
-                if getattr(draft_model, "has_candidate_selector", False):
+                if getattr(draft_model, "lilicorr", None) is not None:
+                    gen_logits = self._apply_lilicorr(
+                        draft_model,
+                        gen_logits,
+                        gen_hidden_states.reshape(num_gens, K, -1),
+                        inputs["lilicorr_anchor"],
+                        spec_metadata,
+                    )
+                    vocab_size = gen_logits.shape[-1]
+                elif getattr(draft_model, "has_candidate_selector", False):
                     gen_logits = self._apply_dflash2_selector(
                         draft_model,
                         gen_logits,
@@ -1855,6 +1940,38 @@ class DFlashWorker(SpecWorkerBase):
             anchor_tokens.long(),
         )
 
+    def _apply_lilicorr(
+        self,
+        draft_model,
+        gen_logits: torch.Tensor,
+        draft_hidden: torch.Tensor,
+        anchor_hidden: torch.Tensor,
+        spec_metadata,
+    ) -> torch.Tensor:
+        if anchor_hidden is None:
+            raise RuntimeError(
+                "LiLiCorr requires the projected target row that predicted the anchor"
+            )
+        full_vocab = draft_model.config.vocab_size
+        candidate_ids, unary_logits, block_logits = self._dflash2_global_top_k(
+            gen_logits, spec_metadata, draft_model.lilicorr.candidate_topk, full_vocab
+        )
+        # Candidate features use probabilities normalized over the entire vocabulary,
+        # including the mass outside top-k and on other tensor-parallel ranks.
+        log_normalizer = torch.logsumexp(gen_logits.float(), dim=-1, keepdim=True)
+        if gen_logits.shape[-1] != full_vocab:
+            from ..distributed.ops import allgather
+
+            log_normalizer = torch.logsumexp(
+                allgather(log_normalizer, self.mapping, dim=-1), dim=-1, keepdim=True
+            )
+        proposal = draft_model.select_lilicorr_path(
+            candidate_ids, unary_logits.float() - log_normalizer, draft_hidden, anchor_hidden
+        )
+        block_logits.fill_(float("-inf"))
+        block_logits.scatter_(-1, candidate_ids, proposal.to(block_logits.dtype))
+        return block_logits
+
     def _dflash2_global_top_k(
         self,
         gen_logits: torch.Tensor,
@@ -1951,6 +2068,7 @@ class DFlashWorker(SpecWorkerBase):
         hidden_dim = (
             spec_metadata.hidden_size if spec_metadata.hidden_size > 0 else hidden_states.shape[-1]
         )
+        lilicorr_anchor = None
 
         if num_gens > 0:
             gen_num_accepted = num_accepted_tokens[num_contexts : num_contexts + num_gens]
@@ -1995,14 +2113,15 @@ class DFlashWorker(SpecWorkerBase):
             query_position_ids = ctx_len_now.unsqueeze(1) + j_block.unsqueeze(0)
             ctx_position_ids = ctx_len_gen.unsqueeze(1) + offsets_kp1.unsqueeze(0)
 
-            # Go through embed_tokens.forward (NOT .weight[...]) so TP-sharded
-            # vocabs mask out ranks that don't own the token id and all-reduce.
-            mask_tok = torch.full((1,), int(mask_token_id), dtype=torch.long, device="cuda")
-            combined_embed = embed_tokens(torch.cat([bonus, mask_tok], dim=0))
-            embed_bonus = combined_embed[:num_gens]
-            embed_mask = combined_embed[num_gens]
-            noise_embed_2d = embed_mask.expand(num_gens, query_tokens_per_req, -1).clone()
-            noise_embed_2d[:, 0, :] = embed_bonus
+            # The drafter's own trained mask row, if it kept one for the mask id in use.
+            trained_mask_embedding = (
+                getattr(draft_model, "mask_token_embedding", None)
+                if mask_token_id == getattr(draft_model, "mask_token_id", None)
+                else None
+            )
+            noise_embed_2d = dflash_noise_block_embedding(
+                embed_tokens, bonus, mask_token_id, query_tokens_per_req, trained_mask_embedding
+            )
 
             # Accumulate new accepted features into context buffers
             if has_target_features:
@@ -2012,6 +2131,11 @@ class DFlashWorker(SpecWorkerBase):
                 gen_hs = captured_hs[gen_start : gen_start + num_gens * total_tokens_per_req]
                 gen_hs_to_project = gen_hs.reshape(-1, gen_hs.shape[-1])
                 projected_to_store = draft_model.project_target_hidden(gen_hs_to_project)
+                if getattr(draft_model, "lilicorr", None) is not None:
+                    # The last accepted output is predicted by the corresponding input
+                    # row; the newly committed token itself has no target row yet.
+                    projected_rows = projected_to_store.reshape(num_gens, K_plus_1, -1)
+                    lilicorr_anchor = last_accepted_hidden(projected_rows, gen_num_accepted)
                 gen_num_accepted_long = gen_num_accepted.long()
                 col_idx = self._ctx_len[slots].unsqueeze(1) + offsets_kp1.unsqueeze(0)
                 write_mask = offsets_kp1.unsqueeze(0) < gen_num_accepted_long.unsqueeze(1)
@@ -2061,8 +2185,7 @@ class DFlashWorker(SpecWorkerBase):
                     if v_new is not None:
                         self._ctx_v_buf[slot_long, :, col_long] = v_new
 
-                self._ctx_len[slots] += gen_num_accepted_long
-                self._ctx_len.clamp_(max=self._max_ctx)
+                self._advance_ctx_len(slots, gen_num_accepted_long)
 
             num_ctx_per_req_t = self._ctx_len[slots]
             if self._ctx_block_tables is not None:
@@ -2092,6 +2215,7 @@ class DFlashWorker(SpecWorkerBase):
             bonus = torch.empty(0, dtype=torch.long, device="cuda")
 
         return {
+            "lilicorr_anchor": lilicorr_anchor,
             "noise_embedding": noise_embedding,
             "query_positions": query_positions,
             "num_ctx_per_req": num_ctx_per_req_t,

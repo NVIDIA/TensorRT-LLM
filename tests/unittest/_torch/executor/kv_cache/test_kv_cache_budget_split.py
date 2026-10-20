@@ -21,7 +21,11 @@ from unittest.mock import Mock
 import numpy as np
 import pytest
 
-from tensorrt_llm._torch.pyexecutor._util import CacheCost, KvCacheCreator
+from tensorrt_llm._torch.pyexecutor._util import (
+    _STANDALONE_DRAFT_TOKENS_PER_BLOCK,
+    CacheCost,
+    KvCacheCreator,
+)
 from tensorrt_llm._torch.pyexecutor.config_utils import uses_vswa_kv_cache_layout
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.speculative.interface import SpeculativeDecodingMode
@@ -74,6 +78,7 @@ def _make_creator(
     c._disable_overlap_scheduler = False
 
     c._kv_cache_manager_cls = Mock()
+    c._is_kv_cache_manager_v2 = False
     c._kv_cache_manager_cls.get_cache_size_per_token = Mock(
         return_value=(target_kv_per_token, target_kv_intercept)
     )
@@ -116,10 +121,12 @@ class TestSplitGpuBudgetForDraft:
         c._kv_cache_config.enable_block_reuse = False
         c._kv_cache_config.max_attention_window = [128, long_window]
         c._kv_cache_manager_cls = KVCacheManagerV2
+        c._is_kv_cache_manager_v2 = True
         c._max_seq_len = max_seq_len
         c._max_batch_size = max_batch_size
         c._max_num_tokens = 8192
         c._mapping = Mock(enable_attention_dp=False, tp_size=2)
+        c._mapping.has_cp_helix.return_value = False
         c._mapping.pp_layers.return_value = list(range(24))
         c._mapping.is_last_pp_rank.return_value = True
         c._speculative_config = SimpleNamespace(
@@ -226,7 +233,9 @@ class TestSplitGpuBudgetForDraft:
         creator._max_beam_width = 1
         creator._kv_connector_manager = None
         creator._cache_transceiver_config = None
+        creator._llm_args = SimpleNamespace(kv_cache_compression_config=None, sleep_config=None)
         creator._mapping = Mock(enable_attention_dp=False, tp_size=1)
+        creator._mapping.has_cp_helix.return_value = False
         creator._mapping.pp_layers.return_value = [0]
         creator._mapping.is_last_pp_rank.return_value = True
         creator._speculative_config = SimpleNamespace(
@@ -1071,6 +1080,7 @@ class TestExternalDrafterKvDtype:
     def _creator(self, mocker, draft_quant_config):
         class DraftModelConfig:
             quant_config = draft_quant_config
+            sparse_attention_config = None
             pretrained_config = SimpleNamespace(
                 num_hidden_layers=TestExternalDrafterKvDtype.DRAFT_LAYERS,
                 hidden_size=32,
@@ -1110,6 +1120,9 @@ class TestExternalDrafterKvDtype:
         # Read by _build_managers on the draft path (_util.py); the cost
         # assertions below are per-token, so the value only has to exist.
         c._max_num_tokens = 8192
+        c._max_beam_width = 1
+        c._cache_transceiver_config = None
+        c._llm_args = SimpleNamespace(kv_cache_compression_config=None, sleep_config=None)
         c._mapping = Mock(enable_attention_dp=True, tp_size=1)
         c._mapping.has_cp_helix.return_value = False
         c._mapping.pp_layers.return_value = list(range(self.DRAFT_LAYERS))
@@ -1188,6 +1201,81 @@ class TestExternalDrafterKvDtype:
         assert c._speculative_config.spec_dec_mode == SpeculativeDecodingMode.MTP_EAGLE_ONE_MODEL
 
         assert c._get_draft_kv_model_config() is draft_model_config
+
+
+class TestStandaloneDrafterPageSize:
+    """A standalone drafter's separate pool has its own page size.
+
+    The target's tokens_per_block is whatever its attention backend or the
+    deployment config chose (FP4 MLA forces 128), and the drafter's block-decode
+    kernels need not accept it: trtllm-gen MLA decode takes 32 or 64 only. The
+    pool is built with the drafter's page size, and the budget split must charge
+    the same one, since per-request quotas round up to whole pages.
+    """
+
+    TARGET_TOKENS_PER_BLOCK = 128
+
+    def _creator(self, mocker):
+        from tensorrt_llm.models.modeling_utils import QuantConfig
+
+        c, draft_model_config, _ = TestExternalDrafterKvDtype()._creator(mocker, QuantConfig())
+        c._tokens_per_block = self.TARGET_TOKENS_PER_BLOCK
+        # Read by the draft manager-class resolution on both the cost and the
+        # allocation path; the resolution itself is not under test here.
+        c._cache_transceiver_config = None
+        c._max_beam_width = 1
+        c._validate_or_fallback_kv_cache_manager_v2 = Mock(side_effect=lambda cls, *_: cls)
+        return c, draft_model_config
+
+    def test_standalone_drafter_page_size_is_independent_of_the_target(self, mocker):
+        c, _ = self._creator(mocker)
+        assert c._get_draft_tokens_per_block() == _STANDALONE_DRAFT_TOKENS_PER_BLOCK
+        assert c._get_draft_tokens_per_block() != c._tokens_per_block
+
+    def test_draft_layers_of_the_target_keep_the_target_page_size(self, mocker):
+        """MTP/Eagle3 draft layers run on the target's attention metadata."""
+        c, _ = self._creator(mocker)
+        c._speculative_config = MTPDecodingConfig(num_nextn_predict_layers=1, max_draft_len=4)
+        assert c._get_draft_tokens_per_block() == self.TARGET_TOKENS_PER_BLOCK
+
+    def test_cost_charges_the_draft_page_size(self, mocker):
+        c, _ = self._creator(mocker)
+        size_spy = mocker.spy(KVCacheManagerV2, "get_cache_size_per_token")
+        bytes_spy = mocker.spy(KVCacheManagerV2, "get_cache_bytes_per_request")
+        quota_spy = mocker.spy(KVCacheManagerV2, "get_cache_quota_per_request")
+
+        c._get_draft_cache_cost(
+            c._kv_cache_config,
+            use_separate_draft_kv_cache=True,
+            include_request_cost=True,
+        )
+
+        for spy in (size_spy, bytes_spy, quota_spy):
+            assert spy.call_count == 1, spy
+            assert spy.call_args.kwargs["tokens_per_block"] == (
+                _STANDALONE_DRAFT_TOKENS_PER_BLOCK
+            ), spy
+
+    def test_allocation_uses_the_page_size_the_cost_charged(self, mocker):
+        c, draft_model_config = self._creator(mocker)
+        draft_model_config.sparse_attention_config = None
+        c._model_engine._max_cuda_graph_batch_size = 1
+        c._skip_est = False
+        c._enable_kv_cache_stats = Mock(return_value=False)
+        c._execution_stream = None
+        c._kv_connector_manager = None
+        c._disable_overlap_scheduler = False
+        c._joint_kv_cache_reuse = False
+        create = mocker.patch("tensorrt_llm._torch.pyexecutor._util._create_kv_cache_manager")
+        size_spy = mocker.spy(KVCacheManagerV2, "get_cache_size_per_token")
+
+        c._create_one_model_draft_kv_cache_manager(c._max_seq_len)
+        c._get_kv_size_per_token()
+
+        assert create.call_count == 1
+        allocated = create.call_args.kwargs["tokens_per_block"]
+        assert allocated == _STANDALONE_DRAFT_TOKENS_PER_BLOCK
+        assert size_spy.call_args.kwargs["tokens_per_block"] == allocated
 
 
 class TestMambaEffectiveTpSize:
@@ -1609,6 +1697,67 @@ class TestPerRequestWeightedSplit:
         # below its 400-byte intercept.
         with pytest.raises(ValueError, match="insufficient"):
             c._split_kv_cache_budget_for_draft("max_gpu_total_bytes")
+
+    def test_draft_gpu_budget_cap_moves_the_excess_to_the_target(self, monkeypatch):
+        """TLLM_DRAFT_KV_GPU_BUDGET_GIB caps the draft's GPU share (above its
+        intercept) and hands the rest of the budget to the target."""
+        monkeypatch.setenv("TLLM_DRAFT_KV_GPU_BUDGET_GIB", "1.5")
+        c = self._creator(
+            10 * GB,
+            target=CacheCost(slope=80, intercept=GB, bytes_per_request=GB),
+            draft=CacheCost(slope=20, intercept=GB // 2, bytes_per_request=GB),
+        )
+
+        target_config, draft_config = c._split_kv_cache_budget_for_draft("max_gpu_total_bytes")
+
+        assert draft_config.max_gpu_total_bytes == GB // 2 + 3 * GB // 2
+        assert target_config.max_gpu_total_bytes == 10 * GB - 2 * GB
+
+    def test_draft_gpu_budget_cap_keeps_the_allocator_floor(self, monkeypatch):
+        """The cap never goes below the draft's one-request allocator quota."""
+        monkeypatch.setenv("TLLM_DRAFT_KV_GPU_BUDGET_GIB", "0.5")
+        c = self._creator(
+            10 * GB,
+            target=CacheCost(slope=80, bytes_per_request=GB),
+            draft=CacheCost(slope=20, bytes_per_request=GB, quota_per_request=2 * GB),
+        )
+
+        target_config, draft_config = c._split_kv_cache_budget_for_draft("max_gpu_total_bytes")
+
+        assert draft_config.max_gpu_total_bytes == 2 * GB
+        assert target_config.max_gpu_total_bytes == 8 * GB
+
+    @pytest.mark.parametrize(
+        "value, match",
+        [
+            ("abc", "must be a number"),
+            ("0", "must be positive"),
+            ("-1", "must be positive"),
+            ("nan", "must be positive"),
+        ],
+    )
+    def test_draft_gpu_budget_cap_rejects_invalid_values(self, monkeypatch, value, match):
+        """A malformed or non-positive cap fails with the variable's name instead
+        of leaving the draft a zero or negative slope budget."""
+        monkeypatch.setenv("TLLM_DRAFT_KV_GPU_BUDGET_GIB", value)
+        c = self._creator(
+            10 * GB,
+            target=CacheCost(slope=80, bytes_per_request=GB),
+            draft=CacheCost(slope=20, bytes_per_request=GB),
+        )
+
+        with pytest.raises(ValueError, match=f"TLLM_DRAFT_KV_GPU_BUDGET_GIB {match}"):
+            c._split_kv_cache_budget_for_draft("max_gpu_total_bytes")
+
+    def test_draft_gpu_budget_cap_ignores_offload_budgets(self, monkeypatch):
+        """The cap applies to the GPU budget only."""
+        monkeypatch.setenv("TLLM_DRAFT_KV_GPU_BUDGET_GIB", "0")
+        c = _make_creator(max_gpu_total_bytes=1_000, host_cache_size=1_000)
+
+        target_config, draft_config = c._split_kv_cache_budget_for_draft("host_cache_size")
+
+        assert draft_config.host_cache_size == 200
+        assert target_config.host_cache_size == 800
 
     def test_fully_covered_target_weight_hands_slope_budget_to_draft(self):
         """A target whose entire retention is intercept-funded reports a zero
