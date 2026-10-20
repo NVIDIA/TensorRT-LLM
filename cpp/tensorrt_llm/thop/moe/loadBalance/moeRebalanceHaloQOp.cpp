@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-#include "tensorrt_llm/kernels/moe/loadBalance/dynamicEplb/moeRebalanceHaloQ.h"
+#include "tensorrt_llm/thop/moe/loadBalance/moeRebalanceHaloQOp.h"
 
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -51,13 +51,14 @@ int checkedInt(std::int64_t value, char const* name)
 
 } // namespace
 
-void moeRebalanceHaloQ(torch::Tensor const& routes, torch::Tensor& outSlots, torch::Tensor& outIds,
-    torch::Tensor& outLevels, torch::Tensor& outOwners, torch::Tensor const& peerBases, torch::Tensor& status,
-    torch::Tensor& partial, torch::Tensor& routeAux, torch::Tensor& gridSync, torch::Tensor& planWorkspace,
-    torch::Tensor& routePrefix, std::int64_t planChannelPtr, std::int64_t epValue, std::int64_t expertsValue,
-    std::int64_t helpersValue, std::int64_t localRankValue, std::int64_t routeCapacityValue, std::int64_t ctasValue,
-    std::int64_t threadsValue, bool enablePdl, std::int64_t spinCycles, std::int64_t planAbiVersionValue,
-    std::int64_t planChannelWordsValue, std::int64_t routeFeaturesValue, std::int64_t validRouteCountValue)
+kernels::MoeRebalanceHaloQParams makeMoeRebalanceHaloQParams(torch::Tensor const& routes, torch::Tensor& outSlots,
+    torch::Tensor& outIds, torch::Tensor& outLevels, torch::Tensor& outOwners, torch::Tensor const& peerBases,
+    torch::Tensor& status, torch::Tensor& partial, torch::Tensor& routeAux, torch::Tensor& gridSync,
+    torch::Tensor& planWorkspace, torch::Tensor& routePrefix, std::int64_t planChannelPtr, std::int64_t epValue,
+    std::int64_t expertsValue, std::int64_t helpersValue, std::int64_t localRankValue, std::int64_t routeCapacityValue,
+    std::int64_t ctasValue, std::int64_t threadsValue, bool enablePdl, std::int64_t spinCycles,
+    std::int64_t planAbiVersionValue, std::int64_t planChannelWordsValue, std::int64_t routeFeaturesValue,
+    std::int64_t validRouteCountValue)
 {
     int const ep = checkedInt(epValue, "ep");
     int const experts = checkedInt(expertsValue, "experts");
@@ -103,9 +104,7 @@ void moeRebalanceHaloQ(torch::Tensor const& routes, torch::Tensor& outSlots, tor
     checkCudaTensor(planWorkspace, device, torch::kInt32, 2 + 6 * 384, "plan_workspace");
     checkCudaTensor(routePrefix, device, torch::kInt32, static_cast<std::int64_t>(384) * (ep + 1), "route_prefix");
 
-    c10::cuda::CUDAGuard const deviceGuard(device);
-    auto const stream = at::cuda::getCurrentCUDAStream(routes.get_device());
-    kernels::MoeRebalanceHaloQParams const params{
+    return kernels::MoeRebalanceHaloQParams{
         routes.data_ptr<int>(),
         outSlots.data_ptr<int>(),
         outIds.data_ptr<int>(),
@@ -133,7 +132,22 @@ void moeRebalanceHaloQ(torch::Tensor const& routes, torch::Tensor& outSlots, tor
         routeFeatures,
         validRouteCount,
     };
-    kernels::invokeMoeRebalanceHaloQ(params, stream);
+}
+
+void moeRebalanceHaloQ(torch::Tensor const& routes, torch::Tensor& outSlots, torch::Tensor& outIds,
+    torch::Tensor& outLevels, torch::Tensor& outOwners, torch::Tensor const& peerBases, torch::Tensor& status,
+    torch::Tensor& partial, torch::Tensor& routeAux, torch::Tensor& gridSync, torch::Tensor& planWorkspace,
+    torch::Tensor& routePrefix, std::int64_t planChannelPtr, std::int64_t ep, std::int64_t experts,
+    std::int64_t helpers, std::int64_t localRank, std::int64_t routeCapacity, std::int64_t ctas, std::int64_t threads,
+    bool enablePdl, std::int64_t spinCycles, std::int64_t planAbiVersion, std::int64_t planChannelWords,
+    std::int64_t routeFeatures, std::int64_t validRouteCount)
+{
+    auto const params = makeMoeRebalanceHaloQParams(routes, outSlots, outIds, outLevels, outOwners, peerBases, status,
+        partial, routeAux, gridSync, planWorkspace, routePrefix, planChannelPtr, ep, experts, helpers, localRank,
+        routeCapacity, ctas, threads, enablePdl, spinCycles, planAbiVersion, planChannelWords, routeFeatures,
+        validRouteCount);
+    c10::cuda::CUDAGuard const deviceGuard(routes.device());
+    kernels::invokeMoeRebalanceHaloQ(params, at::cuda::getCurrentCUDAStream(routes.get_device()));
 }
 
 } // namespace torch_ext

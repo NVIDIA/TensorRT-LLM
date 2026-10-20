@@ -16,6 +16,7 @@
  */
 
 #include "tensorrt_llm/kernels/moe/loadBalance/dynamicEplb/moeRebalanceTma.h"
+#include "tensorrt_llm/thop/moe/loadBalance/moeRebalanceHaloQOp.h"
 #include "tensorrt_llm/thop/thUtils.h"
 
 #include <ATen/cuda/CUDAContext.h>
@@ -228,14 +229,28 @@ public:
         mBound = true;
     }
 
-    int64_t submitGpuDirect(int64_t flagMc)
+    // Launches the bound HALO-Q scheduler and this copy as one kernel; see megamoe_tma_copy_submit_fused.
+    void submitFused(int64_t flagMc, kernels::MoeRebalanceHaloQParams const& scheduler, torch::Tensor const& routeEpoch,
+        int64_t routeTarget)
     {
         std::lock_guard<std::mutex> lock(mMutex);
         requireBound();
+        TORCH_CHECK(
+            routeEpoch.is_cuda() && routeEpoch.get_device() == mDevice, "route_epoch must be on CUDA device ", mDevice);
+        TORCH_CHECK(
+            routeEpoch.scalar_type() == at::ScalarType::Long && routeEpoch.is_contiguous() && routeEpoch.numel() == 1,
+            "route_epoch must be a contiguous one-element torch.int64 tensor");
+        uint64_t const flag = checkedUnsigned(flagMc, "flag_mc");
+        TORCH_CHECK(flag != 0, "flag_mc must be nonzero");
+        kernels::checkMoeRebalanceHaloQParams(scheduler);
         c10::cuda::CUDAGuard const deviceGuard(c10::Device(c10::DeviceType::CUDA, mDevice));
         auto const stream = at::cuda::getCurrentCUDAStream(mDevice).stream();
-        submitLocked(flagMc, reinterpret_cast<void*>(stream));
-        return 0;
+        checkTmaResult(megamoe_tma_copy_submit_fused(mState, scheduler,
+                           reinterpret_cast<uint64_t*>(routeEpoch.data_ptr<int64_t>()),
+                           static_cast<uint64_t>(routeTarget), flag, mGeneration, reinterpret_cast<void*>(stream)),
+            "moe rebalance fused HALO-Q + TMA submit");
+        ++mGeneration;
+        TORCH_CHECK(mGeneration != 0, "moe rebalance TMA generation overflow");
     }
 
     int64_t currentGeneration() const
@@ -320,16 +335,6 @@ private:
         return static_cast<int64_t>(value);
     }
 
-    void submitLocked(int64_t flagMc, void* stream)
-    {
-        uint64_t const flag = checkedUnsigned(flagMc, "flag_mc");
-        TORCH_CHECK(flag != 0, "flag_mc must be nonzero");
-        checkTmaResult(megamoe_tma_copy_submit_gpu_direct(mState, flag, mGeneration, stream),
-            "moe rebalance TMA GPU-direct submit");
-        ++mGeneration;
-        TORCH_CHECK(mGeneration != 0, "moe rebalance TMA generation overflow");
-    }
-
     mutable std::mutex mMutex;
     MegamoeTmaCopyState* mState{nullptr};
     int mDevice{-1};
@@ -373,10 +378,20 @@ void moeRebalanceTmaBindGpuDirect(MoeRebalanceTmaStatePtr const& state, torch::T
         std::move(gridSync), capacity);
 }
 
-int64_t moeRebalanceTmaSubmitGpuDirect(MoeRebalanceTmaStatePtr const& state, int64_t flagMc)
+void moeRebalanceTmaSubmitFused(MoeRebalanceTmaStatePtr const& state, int64_t flagMc, torch::Tensor& routeEpoch,
+    int64_t routeTarget, torch::Tensor const& routes, torch::Tensor& outSlots, torch::Tensor& outIds,
+    torch::Tensor& outLevels, torch::Tensor& outOwners, torch::Tensor const& peerBases, torch::Tensor& status,
+    torch::Tensor& partial, torch::Tensor& routeAux, torch::Tensor& gridSync, torch::Tensor& planWorkspace,
+    torch::Tensor& routePrefix, int64_t planChannelPtr, int64_t ep, int64_t experts, int64_t helpers, int64_t localRank,
+    int64_t routeCapacity, int64_t ctas, int64_t threads, bool enablePdl, int64_t spinCycles, int64_t planAbiVersion,
+    int64_t planChannelWords, int64_t routeFeatures, int64_t validRouteCount)
 {
     TORCH_CHECK(state, "moe rebalance TMA state is null");
-    return state->submitGpuDirect(flagMc);
+    auto const scheduler = makeMoeRebalanceHaloQParams(routes, outSlots, outIds, outLevels, outOwners, peerBases,
+        status, partial, routeAux, gridSync, planWorkspace, routePrefix, planChannelPtr, ep, experts, helpers,
+        localRank, routeCapacity, ctas, threads, enablePdl, spinCycles, planAbiVersion, planChannelWords, routeFeatures,
+        validRouteCount);
+    state->submitFused(flagMc, scheduler, routeEpoch, routeTarget);
 }
 
 int64_t moeRebalanceTmaCurrentGeneration(MoeRebalanceTmaStatePtr const& state)
@@ -425,8 +440,14 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "__torch__.torch.classes.trtllm.MoeRebalanceTmaState state, Tensor ids, Tensor levels, Tensor owners, "
         "Tensor workspace, Tensor status, Tensor grid_sync, int capacity) -> ()");
     m.def(
-        "moe_rebalance_tma_submit_gpu_direct("
-        "__torch__.torch.classes.trtllm.MoeRebalanceTmaState state, int flag_mc) -> int");
+        "moe_rebalance_tma_submit_fused("
+        "__torch__.torch.classes.trtllm.MoeRebalanceTmaState state, int flag_mc, Tensor(a!) route_epoch, "
+        "int route_target, Tensor routes, Tensor(b!) out_slots, Tensor(c!) out_ids, Tensor(d!) out_levels, "
+        "Tensor(e!) out_owners, Tensor peer_bases, Tensor(f!) status, Tensor(g!) partial, Tensor(h!) route_aux, "
+        "Tensor(i!) grid_sync, Tensor(j!) plan_workspace, Tensor(k!) route_prefix, int plan_channel_ptr, int ep, "
+        "int experts, int helpers, int local_rank, int route_capacity, int ctas, int threads, bool enable_pdl, "
+        "int spin_cycles, int plan_abi_version, int plan_channel_words, int route_features, "
+        "int valid_route_count) -> ()");
     m.def(
         "moe_rebalance_tma_current_gen("
         "__torch__.torch.classes.trtllm.MoeRebalanceTmaState state) -> int");
@@ -446,7 +467,7 @@ TORCH_LIBRARY_IMPL(trtllm, CompositeExplicitAutograd, m)
     m.impl("moe_rebalance_tma_create", &tensorrt_llm::torch_ext::moeRebalanceTmaCreate);
     m.impl("moe_rebalance_tma_configure_gpu_plan", &tensorrt_llm::torch_ext::moeRebalanceTmaConfigureGpuPlan);
     m.impl("moe_rebalance_tma_bind_gpu_direct", &tensorrt_llm::torch_ext::moeRebalanceTmaBindGpuDirect);
-    m.impl("moe_rebalance_tma_submit_gpu_direct", &tensorrt_llm::torch_ext::moeRebalanceTmaSubmitGpuDirect);
+    m.impl("moe_rebalance_tma_submit_fused", &tensorrt_llm::torch_ext::moeRebalanceTmaSubmitFused);
     m.impl("moe_rebalance_tma_current_gen", &tensorrt_llm::torch_ext::moeRebalanceTmaCurrentGeneration);
     m.impl("moe_rebalance_tma_result", &tensorrt_llm::torch_ext::moeRebalanceTmaResult);
     m.impl("moe_rebalance_tma_config", &tensorrt_llm::torch_ext::moeRebalanceTmaConfig);
