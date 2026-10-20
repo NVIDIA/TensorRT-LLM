@@ -48,7 +48,6 @@ if TYPE_CHECKING:
     from tensorrt_llm.quantization.mode import QuantMode
 
 
-<<<<<<< HEAD
 @dataclass(kw_only=True, slots=True, frozen=True)
 class StaticAttentionConfig:
     """The attention-layer configuration used to build native kernel runners."""
@@ -288,13 +287,6 @@ _FORWARD_ARG_NAMES = frozenset(field.name for field in fields(AttentionForwardAr
 _SPARSE_ARG_NAMES = frozenset(field.name for field in fields(SparseRuntimeParams))
 
 
-def _legacy_forward_args(
-    arguments: Mapping[str, object], **overrides: object
-) -> AttentionForwardArgs:
-    """Translate flat compatibility arguments into the shared nested carriers."""
-    sparse = {
-        name: arguments[name] for name in _SPARSE_ARG_NAMES if arguments.get(name) is not None
-=======
 # ``AttentionForwardArgs`` fields that this backend does not consume.
 # Sync test (test_attention_op_sync.py) requires every other field to map to a
 # kwarg name, a @property on the dataclass, or a field that some @property
@@ -310,7 +302,16 @@ _THOP_EXCLUDED_FIELDS: frozenset = frozenset(
         "sparse_attn_phase",  # host-resolved sparse phase, consumed before FMHA dispatch
         "qk_fp8_per_tensor",  # per-tensor FP8 recipe flag, consumed by FMHA selection and the PrimTS FMHA
         "v_fp8_per_tensor",  # per-tensor FP8 recipe flag, consumed by FMHA selection and the PrimTS FMHA
->>>>>>> origin/main
+    }
+)
+
+
+def _legacy_forward_args(
+    arguments: Mapping[str, object], **overrides: object
+) -> AttentionForwardArgs:
+    """Translate flat compatibility arguments into the shared nested carriers."""
+    sparse = {
+        name: arguments[name] for name in _SPARSE_ARG_NAMES if arguments.get(name) is not None
     }
     sparse.setdefault("sparse_attn_indices_block_size", 1)
     sparse["threshold_scale_factor_prefill"] = (

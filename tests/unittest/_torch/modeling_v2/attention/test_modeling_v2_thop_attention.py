@@ -6959,11 +6959,7 @@ def _cell_mla_context(cell) -> None:
         atol=FP8_MLA_ATOL,
         msg=lambda m: f"op.reference disagrees with _fp8_no_append_reference\n{m}",
     )
-<<<<<<< HEAD
-    torch.testing.assert_close(out, ref, rtol=FP8_MLA_RTOL, atol=FP8_MLA_ATOL)
-=======
     _compare_fp8_mla(out, ref)
->>>>>>> origin/main
 
 
 def _seed(cell) -> None:

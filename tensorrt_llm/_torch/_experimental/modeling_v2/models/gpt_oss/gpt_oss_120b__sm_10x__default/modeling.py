@@ -72,13 +72,10 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.flashinfer_fused
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.flashinfer_rmsnorm import (
     flashinfer_rmsnorm,
 )
-<<<<<<< HEAD:tensorrt_llm/_torch/_experimental/modeling_v2/models/gpt_oss/gpt_oss_120b__sm_103__tp1/modeling.py
-from tensorrt_llm._torch.attention.backends.fmha.phased import get_spec_decoding_position_offsets
-=======
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.quantization.mxfp8_quantize import (
     mxfp8_quantize,
 )
->>>>>>> origin/main:tensorrt_llm/_torch/_experimental/modeling_v2/models/gpt_oss/gpt_oss_120b__sm_10x__default/modeling.py
+from tensorrt_llm._torch.attention.backends.fmha.phased import get_spec_decoding_position_offsets
 from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.model_config import ModelConfig
