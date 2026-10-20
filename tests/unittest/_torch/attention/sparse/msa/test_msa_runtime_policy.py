@@ -9,15 +9,22 @@ path runs as before; the existing test_msa_backend.py tests cover that.
 
 from unittest.mock import create_autospec
 
+import numpy as np
 import pytest
 import torch
 
-from tensorrt_llm._torch.attention.backends.sparse.minimax_m3 import MiniMaxM3KVCacheManagerV2
+from tensorrt_llm._torch.attention.backends.sparse.minimax_m3 import (
+    MiniMaxM3KVCacheManagerV2,
+    msa_backend,
+)
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.common import (
     MiniMaxM3SparseMetadataParams,
 )
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.msa_utils import (
     MSA_REQUIRED_TOPK,
+)
+from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.trtllm_gen_dense_decode import (
+    write_subpage_block_table,
 )
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.msa_backend import (
     MiniMaxM3MsaSparseAttentionMetadata,
@@ -30,6 +37,7 @@ from tensorrt_llm._torch.pyexecutor.runtime_hooks import MsaRuntimePolicy
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.llmapi.llm_args import MiniMaxM3SparseAttentionConfig
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.runtime.kv_cache_manager_v2 import BAD_PAGE_INDEX
 
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
@@ -48,8 +56,8 @@ def manager(monkeypatch) -> MiniMaxM3KVCacheManagerV2:
         self.is_disagg = False
         self.dtype = DataType.BF16
         self.layer_offsets = {3: 0}
-        # _prepare_page_table_tensor's result for the two-pool host table the copy tests build.
-        self.num_attention_op_pools = 2
+        # Set by the base's page-table setup, which this fake base skips.
+        self.num_pools = self.num_attention_op_pools = 1
 
     def no_index_k_buffer(self, layer_idx, **kwargs):
         del self, layer_idx, kwargs
@@ -58,10 +66,10 @@ def manager(monkeypatch) -> MiniMaxM3KVCacheManagerV2:
     monkeypatch.setattr(KVCacheManagerV2, "__init__", fake_base_init)
     monkeypatch.setattr(KVCacheManagerV2, "get_index_k_buffer", no_index_k_buffer)
     monkeypatch.setattr(MiniMaxM3KVCacheManagerV2, "_compute_num_total_slots", lambda self: 0)
-    # The constructor resolves every layer's K/V view, which needs a real pool. Stub it there
-    # only: the pool-view tests below call get_buffers against their own geometry.
-    with monkeypatch.context() as construction:
-        construction.setattr(MiniMaxM3KVCacheManagerV2, "get_buffers", lambda self, *args: None)
+    # The constructor resolves each layer's K/V views; the bare base has no pools to resolve them
+    # from. Stub that only while constructing, so the pool-view tests below build real views.
+    with monkeypatch.context() as construct:
+        construct.setattr(MiniMaxM3KVCacheManagerV2, "get_buffers", lambda self, *args: None)
         return MiniMaxM3KVCacheManagerV2(
             num_layers=4, sparse_attention_config=MiniMaxM3SparseAttentionConfig()
         )
@@ -373,3 +381,203 @@ def test_unused_slots_are_filled_after_a_full_buffer_step():
         buf[:3] = 0
         _fill_unused_slots(buf, 3)
     assert buf.tolist() == [0, 0, 0, -1, -1, -1, -1, -1]
+
+
+class _PageIndexView:
+    """A request's KV cache as get_block_ids_per_seq reads it: an int32 page-index view per pool."""
+
+    def __init__(self, view: np.ndarray):
+        self._view = view
+
+    def get_base_page_indices(self, pool_id: int) -> np.ndarray:
+        assert pool_id == 0
+        return self._view
+
+
+def _page_index_views(seed: int):
+    rng = np.random.default_rng(seed)
+    batch = int(rng.integers(0, 5))
+    same_width = rng.random() < 0.5
+    width = int(rng.integers(1, 9000))
+    views = {}
+    for rid in range(batch):
+        w = width if same_width else int(rng.integers(0, 9000))
+        view = rng.integers(0, 2**31 - 1, w, dtype=np.int64).astype(np.int32)
+        view[int(rng.integers(0, w + 1)) :] = BAD_PAGE_INDEX
+        view[rng.random(w) < float(rng.choice([0.0, 0.01, 0.5]))] = BAD_PAGE_INDEX
+        view.setflags(write=False)
+        views[100 + rid] = _PageIndexView(view)
+    return views
+
+
+def _bare_manager() -> MiniMaxM3KVCacheManagerV2:
+    """A manager with only the state get_block_ids_per_seq reads (no pools, no V2 base)."""
+    return object.__new__(MiniMaxM3KVCacheManagerV2)
+
+
+def test_block_ids_from_views_is_off_by_default():
+    assert not _bare_manager().block_ids_from_views
+
+
+@pytest.mark.parametrize("seed", range(24))
+def test_block_ids_from_views_matches_the_list_build(seed):
+    manager = _bare_manager()
+    manager.kv_cache_map = _page_index_views(seed)
+    request_ids = list(manager.kv_cache_map)
+
+    manager.configure_decode_shortcuts(skip_unchanged_block_offsets=False, reuse_pool_views=False)
+    built_from_lists = manager.get_block_ids_per_seq(request_ids)
+    manager.configure_decode_shortcuts(
+        skip_unchanged_block_offsets=False, reuse_pool_views=False, block_ids_from_views=True
+    )
+    copied_from_views = manager.get_block_ids_per_seq(request_ids)
+
+    assert copied_from_views.dtype == built_from_lists.dtype == torch.int32
+    assert copied_from_views.is_pinned() == built_from_lists.is_pinned()
+    assert torch.equal(copied_from_views, built_from_lists)
+
+
+# ---------------------------------------------------------------------------
+# Sub-page block table expanded inside the forward
+# ---------------------------------------------------------------------------
+
+
+def _subpage_metadata(
+    rows: int, max_blocks: int, factor: int
+) -> MiniMaxM3MsaSparseAttentionMetadata:
+    metadata = object.__new__(MiniMaxM3MsaSparseAttentionMetadata)
+    metadata._msa_subpage_rows = rows  # as prepare() stages them
+    metadata.msa_block_table = torch.randint(
+        0, 1 << 20, (rows + 2, max_blocks), dtype=torch.int32, device="cuda"
+    )
+    metadata.msa_subpage_block_table = torch.full(
+        (rows + 2, 2, max_blocks), -7, dtype=torch.int32, device="cuda"
+    )
+    metadata._msa_subpages_per_slot = factor
+    metadata._msa_subpage_expanded = False
+    return metadata
+
+
+def _expected_subpages(metadata, rows: int) -> torch.Tensor:
+    out = torch.empty_like(metadata.msa_subpage_block_table[:rows])
+    write_subpage_block_table(metadata.msa_block_table[:rows], metadata._msa_subpages_per_slot, out)
+    return out
+
+
+@requires_cuda
+def test_the_first_reader_of_a_forward_expands_the_subpage_table(monkeypatch):
+    monkeypatch.setattr(msa_backend, "SUBPAGE_IN_GRAPH", True)
+    metadata = _subpage_metadata(rows=3, max_blocks=40, factor=2)
+    calls = []
+    real = msa_backend.write_subpage_block_table
+    monkeypatch.setattr(
+        msa_backend, "write_subpage_block_table", lambda *a: (calls.append(1), real(*a))
+    )
+
+    table, factor = metadata.msa_subpage_rows(0, 3)
+    again, _ = metadata.msa_subpage_rows(1, 3)
+
+    assert factor == 2 and len(calls) == 1
+    assert torch.equal(table, _expected_subpages(metadata, 3))
+    assert torch.equal(again, table[1:3])
+    # Rows past the step's requests are left alone.
+    assert metadata.msa_subpage_block_table[3:].eq(-7).all()
+
+
+@requires_cuda
+def test_each_forward_expands_the_current_block_table(monkeypatch):
+    monkeypatch.setattr(msa_backend, "SUBPAGE_IN_GRAPH", True)
+    metadata = _subpage_metadata(rows=2, max_blocks=16, factor=4)
+    metadata.msa_subpage_rows(0, 2)
+    metadata.msa_block_table[:2, :5] += 11
+    # The next forward (on_update_kv_lens opens it).
+    metadata._msa_subpage_expanded = False
+
+    table, _ = metadata.msa_subpage_rows(0, 2)
+
+    assert torch.equal(table, _expected_subpages(metadata, 2))
+
+
+@requires_cuda
+def test_a_captured_forward_expands_the_table_at_every_replay(monkeypatch):
+    monkeypatch.setattr(msa_backend, "SUBPAGE_IN_GRAPH", True)
+    metadata = _subpage_metadata(rows=4, max_blocks=32, factor=2)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.stream(stream), torch.cuda.graph(graph, stream=stream):
+        metadata._msa_subpage_expanded = False
+        metadata.msa_subpage_rows(0, 4)
+        metadata.msa_subpage_rows(2, 4)
+    torch.cuda.current_stream().wait_stream(stream)
+
+    for step in range(3):
+        # The pack lands this step's block table; then the replay.
+        metadata.msa_block_table[:4].copy_(
+            torch.randint(0, 1 << 20, (4, 32), dtype=torch.int32, device="cuda")
+        )
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(metadata.msa_subpage_block_table[:4], _expected_subpages(metadata, 4)), (
+            step
+        )
+
+
+def test_nothing_is_expanded_without_a_prepared_step():
+    metadata = object.__new__(MiniMaxM3MsaSparseAttentionMetadata)
+    metadata.msa_subpage_block_table = torch.arange(12, dtype=torch.int32).reshape(2, 2, 3)
+    metadata._msa_subpages_per_slot = 2
+
+    table, factor = metadata.msa_subpage_rows(0, 2)
+
+    assert factor == 2 and torch.equal(table, torch.arange(12, dtype=torch.int32).reshape(2, 2, 3))
+
+
+# ---------------------------------------------------------------------------
+# msa_out_cache_loc tail filled inside the forward
+# ---------------------------------------------------------------------------
+
+
+def _tail_metadata(cap: int, start) -> MiniMaxM3MsaSparseAttentionMetadata:
+    metadata = object.__new__(MiniMaxM3MsaSparseAttentionMetadata)
+    metadata.msa_out_cache_loc = torch.arange(100, 100 + cap, dtype=torch.int32, device="cuda")
+    metadata._msa_tail_start = start
+    return metadata
+
+
+@requires_cuda
+def test_the_forward_fills_only_past_the_live_slots():
+    metadata = _tail_metadata(10, 4)
+    metadata._fill_tail_in_forward()
+    assert metadata.msa_out_cache_loc.tolist() == [100, 101, 102, 103] + [-1] * 6
+
+    untouched = _tail_metadata(6, None)
+    untouched._fill_tail_in_forward()
+    assert untouched.msa_out_cache_loc.tolist() == list(range(100, 106))
+
+    full = _tail_metadata(6, 6)
+    full._fill_tail_in_forward()
+    assert full.msa_out_cache_loc.tolist() == list(range(100, 106))
+
+
+@requires_cuda
+def test_a_captured_forward_refills_its_tail_at_every_replay():
+    """Another graph key sharing the pool block writes live slots past this key's tail between replays; each replay of
+    this key's forward must invalidate them again before its own readers run."""
+    metadata = _tail_metadata(12, 5)
+    buf = metadata.msa_out_cache_loc
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.stream(stream), torch.cuda.graph(graph, stream=stream):
+        metadata._fill_tail_in_forward()
+    torch.cuda.current_stream().wait_stream(stream)
+
+    for step in range(3):
+        buf[:5] = (
+            torch.arange(5, dtype=torch.int32, device="cuda") + 10 * step
+        )  # this step's live slots
+        buf[5:9] = 777  # another key's in-graph writes into the shared block
+        graph.replay()
+        torch.cuda.synchronize()
+        assert buf.tolist() == [10 * step + i for i in range(5)] + [-1] * 7, step

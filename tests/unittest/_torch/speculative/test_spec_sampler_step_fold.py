@@ -252,3 +252,119 @@ def test_a_fold_that_declines_leaves_the_sampler_store_path(draft_width):
     assert fold.rows_stored_calls == [(0, SEQ_SLOTS)]
     assert len(fold.scatter_calls) == 1
     _assert_store_equals(sampler, _reference_store(before, outputs))
+
+
+def _host_outputs(state) -> dict[str, torch.Tensor]:
+    state.sampler_event.synchronize()
+    return dict(
+        new_tokens=state.host.new_tokens.clone(),
+        new_tokens_lens=state.host.new_tokens_lens.clone(),
+        next_draft_tokens=state.host.next_draft_tokens.clone(),
+    )
+
+
+def test_store_copies_stay_on_the_main_stream_by_default():
+    sampler = _sampler()
+    scheduled, outputs = _step(MAX_DRAFT_LEN)
+
+    state = sampler.sample_async(scheduled, outputs, [])
+
+    assert not sampler.d2h_side_stream_copies
+    assert state.sampler_event.side_stream_event is None
+
+
+@pytest.mark.parametrize("draft_width", [MAX_DRAFT_LEN, MAX_DRAFT_LEN - 1])
+def test_side_stream_store_copies_match_the_main_stream_copies(draft_width):
+    scheduled, outputs = _step(draft_width)
+    on_main = _host_outputs(_sampler().sample_async(scheduled, outputs, []))
+    sampler = _sampler()
+    sampler.d2h_side_stream_copies = True
+
+    state = sampler.sample_async(scheduled, outputs, [])
+
+    assert state.sampler_event.side_stream_event is not None
+    on_side = _host_outputs(state)
+    for name, tensor in on_main.items():
+        assert torch.equal(on_side[name], tensor), name
+
+
+def test_a_fold_that_stored_the_rows_keeps_the_copies_on_the_main_stream():
+    sampler = _sampler()
+    sampler.bind_spec_step_fold(_fold(rows_stored=True))
+    sampler.d2h_side_stream_copies = True
+    scheduled, outputs = _step(MAX_DRAFT_LEN)
+
+    state = sampler.sample_async(scheduled, outputs, [])
+
+    assert state.sampler_event.side_stream_event is None
+
+
+def test_a_fold_that_awaits_the_store_copies_moves_them_to_the_side_stream():
+    """A fold with store_copies_done: the copies go on the side stream although its forward stored the rows, and
+    the event is recorded after them."""
+    scheduled, outputs = _step(MAX_DRAFT_LEN)
+    fold = _fold(rows_stored=True)
+    fold.store_copies_done = torch.cuda.Event(external=True)
+    fold.store_copies_done.record()
+    sampler = _sampler()
+    sampler.bind_spec_step_fold(fold)
+    sampler.d2h_side_stream_copies = True
+    expected = _store_snapshot(sampler)
+
+    state = sampler.sample_async(scheduled, outputs, [])
+
+    assert state.sampler_event.side_stream_event is not None
+    state.sampler_event.synchronize()
+    fold.store_copies_done.synchronize()
+    host = _host_outputs(state)
+    for name in ("new_tokens", "new_tokens_lens", "next_draft_tokens"):
+        assert torch.equal(host[name], expected[name].cpu()), name
+
+
+def test_a_fold_that_awaits_the_store_copies_keeps_them_on_the_main_stream_when_side_copies_are_off():
+    scheduled, outputs = _step(MAX_DRAFT_LEN)
+    fold = _fold(rows_stored=True)
+    fold.store_copies_done = torch.cuda.Event(external=True)
+    sampler = _sampler()
+    sampler.bind_spec_step_fold(fold)
+
+    state = sampler.sample_async(scheduled, outputs, [])
+
+    assert state.sampler_event.side_stream_event is None
+
+
+def test_static_slot_ids_are_off_by_default():
+    assert not _sampler().static_slot_ids
+
+
+@pytest.mark.parametrize("draft_width", [MAX_DRAFT_LEN, MAX_DRAFT_LEN - 1])
+def test_static_slot_ids_store_the_same_rows(draft_width):
+    scheduled, outputs = _step(draft_width)
+    plain = _sampler()
+    expected = _reference_store(_store_snapshot(plain), outputs)
+    sampler = _sampler()
+    sampler.static_slot_ids = True
+
+    sampler.sample_async(scheduled, outputs, [])
+    sampler.sample_async(scheduled, outputs, [])  # second step reuses the uploaded ids
+
+    _assert_store_equals(sampler, expected)
+
+
+def test_static_slot_ids_follow_a_changed_batch():
+    sampler = _sampler()
+    sampler.static_slot_ids = True
+
+    first_view = sampler._device_slot_ids([4, 1])
+    first = first_view.clone()
+    # Unchanged ids reuse the sampler's buffer without a new upload. The returned tensor is a view of that buffer,
+    # which the next call rewrites, so snapshot it before changing the batch.
+    reused_view = sampler._device_slot_ids([4, 1])
+    assert reused_view.data_ptr() == first_view.data_ptr()
+    reused = reused_view.clone()
+    changed = sampler._device_slot_ids([2, 5, 0]).clone()
+
+    torch.cuda.synchronize()
+    assert first.tolist() == [4, 1]
+    assert reused.tolist() == [4, 1]
+    assert changed.tolist() == [2, 5, 0]

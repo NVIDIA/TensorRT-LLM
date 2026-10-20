@@ -41,7 +41,7 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from ...pyexecutor import step_inputs
 from ...pyexecutor.config_utils import is_mla
-from ...pyexecutor.h2d_cache import copy_h2d_if_changed
+from ...pyexecutor.h2d_cache import copy_h2d_pool_shared
 from ...utils import (compute_swizzled_sf_shape, get_global_attrs,
                       get_model_extra_attrs, helix_local_len_tensor)
 from .fmha.manager import FmhaManager
@@ -56,6 +56,11 @@ from .sparse.hooks import prepare_sparse_runtime_params
 from .sparse.params import BlockSparseForwardInputs, SparseParams
 from .sparse.skip_softmax import SkipSoftmaxParams
 from .utils import log_attention_failure_context
+
+# With an H2D skip cache active (RuntimeHooks.skip_unchanged_h2d), the prompt-length upload of prepare() joins the
+# open step-input pack instead of going out as its own copy on the main stream between the step graphs; False
+# issues it directly.
+PACK_PROMPT_LENS = True
 
 _SKIP_CORRECTION_SUPPORTED_SMS = frozenset((100, 103))
 
@@ -1008,8 +1013,9 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             device='cpu',
         )
         self.prompt_lens_cpu[:self.num_seqs].copy_(prompt_lens)
-        copy_h2d_if_changed(self.prompt_lens_cuda[:self.num_seqs],
-                            self.prompt_lens_cpu[:self.num_seqs])
+        copy_h2d_pool_shared(self.prompt_lens_cuda[:self.num_seqs],
+                             self.prompt_lens_cpu[:self.num_seqs],
+                             pack=PACK_PROMPT_LENS)
 
         # number of tokens in the kv cache for each sequence in the batch
         cached_token_lens = torch.tensor(
@@ -1170,7 +1176,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             f"({self.kv_cache_manager.max_seq_len}).")
 
         num_seqs = self.num_seqs
-        copy_h2d_if_changed(self.prompt_lens_cuda[:num_seqs], prompt_lens)
+        copy_h2d_pool_shared(self.prompt_lens_cuda[:num_seqs], prompt_lens)
         self.kv_lens_cuda[:num_seqs].copy_(kv_lens, non_blocking=True)
         self.host_total_kv_lens[0] = context_kv_tokens
         self.host_total_kv_lens[1] = generation_kv_tokens

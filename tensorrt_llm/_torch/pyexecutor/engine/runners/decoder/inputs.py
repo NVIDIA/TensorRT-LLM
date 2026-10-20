@@ -1730,9 +1730,11 @@ class DecoderInputPreparer:
             num_accepted_draft_tokens = torch.tensor(
                 num_accepted_draft_tokens, dtype=torch.int, pin_memory=prefer_pinned()
             )
+            # Read only by the forward (through the spec metadata), so the copy may wait for the pack's flush.
             copy_h2d_if_changed(
                 self._buffers.num_accepted_draft_tokens_cuda[: len(num_accepted_draft_tokens)],
                 num_accepted_draft_tokens,
+                pack=self.runtime_hooks.spec_small_h2d,
             )
         step_fold = self.runtime_hooks.spec_step_fold if self._config.is_spec_decode else None
         fold_rows = None
@@ -2313,6 +2315,20 @@ class DecoderInputPreparer:
             )
         return gathered[:, 0].tolist()
 
+    def _kv_lens_corrected_in_preprocess(
+        self, inputs: dict[str, Any], enable_spec_decode: bool
+    ) -> bool:
+        """Whether preprocess_inputs applies the overlap scheduler's KV-length offsets to kv_lens_cuda and then calls
+        on_update_kv_lens (the branch below)."""
+        attn_meta = inputs.get("attn_metadata")
+        return (
+            enable_spec_decode
+            and not self._config.disable_overlap_scheduler
+            and attn_meta is not None
+            and attn_meta.kv_cache_manager is not None
+            and hasattr(attn_meta, "kv_lens_cuda")
+        )
+
     def preprocess_inputs(
         self, inputs: dict[str, Any], *, enable_spec_decode: bool, runtime_draft_len: int
     ) -> dict[str, Any]:
@@ -2320,8 +2336,14 @@ class DecoderInputPreparer:
         Make some changes to the device inputs and avoid blocking the async data transfer
         """
         attn_meta = inputs.get("attn_metadata")
-        # Invalidate per-forward-pass caches so they are recomputed (and captured) on every _forward_step.
-        if attn_meta is not None:
+        # Invalidate per-forward-pass caches so they are recomputed (and captured) on every _forward_step. With
+        # RuntimeHooks.kv_lens_update_once, a step that corrects the KV lengths below (and then calls it again) calls
+        # it only there: the second call rewrites everything the first one writes, and nothing reads the metadata
+        # in between.
+        if attn_meta is not None and not (
+            self.runtime_hooks.kv_lens_update_once
+            and self._kv_lens_corrected_in_preprocess(inputs, enable_spec_decode)
+        ):
             attn_meta.on_update_kv_lens()
 
         if enable_spec_decode and not self._config.disable_overlap_scheduler:
@@ -2338,7 +2360,25 @@ class DecoderInputPreparer:
                 num_ctx_tokens = inputs["attn_metadata"].num_ctx_tokens
                 num_chunked_ctx_requests = inputs["attn_metadata"].num_chunked_ctx_requests
                 previous_batch_tokens = inputs["input_ids"].shape[0] - num_ctx_tokens
-                if inputs["position_ids"].ndim == 3:  # mrope: [3, 1, N]
+                # RuntimeHooks.spec_offsets_op: both corrections of a generation-row step in one launch.
+                fused_offsets = (
+                    self.runtime_hooks.spec_offsets_op is not None
+                    and inputs["position_ids"].ndim != 3
+                    and hasattr(inputs["attn_metadata"], "kv_lens_cuda")
+                    and not (
+                        num_ctx_requests >= num_chunked_ctx_requests
+                        and num_chunked_ctx_requests > 0
+                    )
+                    and self.runtime_hooks.spec_offsets_op(
+                        inputs["position_ids"][0, num_ctx_tokens:],
+                        self._buffers.previous_pos_id_offsets_cuda[:previous_batch_tokens],
+                        inputs["attn_metadata"].kv_lens_cuda[num_ctx_requests:num_seqs],
+                        self._buffers.previous_kv_lens_offsets_cuda[:num_gen_requests],
+                    )
+                )
+                if fused_offsets:
+                    pass
+                elif inputs["position_ids"].ndim == 3:  # mrope: [3, 1, N]
                     inputs["position_ids"][:, :, num_ctx_tokens:] += (
                         self._buffers.previous_pos_id_offsets_cuda[:previous_batch_tokens]
                     )
@@ -2348,7 +2388,9 @@ class DecoderInputPreparer:
                     )
 
                 if hasattr(inputs["attn_metadata"], "kv_lens_cuda"):
-                    if (
+                    if fused_offsets:
+                        pass
+                    elif (
                         num_ctx_requests >= num_chunked_ctx_requests
                         and num_chunked_ctx_requests > 0
                     ):

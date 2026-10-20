@@ -205,6 +205,8 @@ class CUDAGraphRunner:
         self._pre_replay_position_ids: Optional[torch.Tensor] = None
 
         self.graphs: Dict[KeyType, torch.cuda.CUDAGraph] = {}
+        # Graphs captured with a step-input pack's prologue, and that pack (step_inputs.capture_prologue).
+        self._step_input_prologue_keys: Dict[KeyType, Any] = {}
         self.graph_outputs: Dict[KeyType,
                                  Callable[[], Optional[torch.Tensor]]] = {}
         self.graph_metadata: Dict[KeyType, Dict[str, Any]] = {}
@@ -792,6 +794,11 @@ class CUDAGraphRunner:
             # setup/capture; release its reference before entering.
             output = None
             with torch.cuda.graph(graph, pool=self.memory_pool):
+                # A pre-replay hook reads the static inputs before the replay, so their copies must land before it.
+                prologue_pack = (None if self._pre_replay_hooks else
+                                 step_inputs.capture_prologue())
+                if prologue_pack is not None:
+                    self._step_input_prologue_keys[key] = prologue_pack
                 output = forward_fn(capture_inputs)
             # Snapshot before postprocessing so the check compares against
             # the addresses the graph actually baked in.
@@ -910,8 +917,14 @@ class CUDAGraphRunner:
             static_encoder_hidden_states[actual_num_encoder_tokens:].zero_()
 
         # Issue the step's packed input copies (no-op without an open pack) before
-        # anything below reads the static inputs on the device.
-        step_inputs.flush()
+        # anything below reads the static inputs on the device; a graph captured
+        # with the pack's prologue issues them itself at the start of the replay.
+        prologue_pack = self._step_input_prologue_keys.get(key)
+        step_inputs.flush(in_graph=prologue_pack is not None)
+        if prologue_pack is not None and not step_inputs.is_active(
+                prologue_pack):
+            # Replayed outside the pack's context: nothing filled its window.
+            prologue_pack.quiesce_graph_window()
         if self._pre_replay_hooks:
             hook_tensors = static_tensors
             if position_id_offsets is not None:
@@ -1363,6 +1376,7 @@ class CUDAGraphRunner:
         self.graph_outputs.clear()
         self.graph_metadata.clear()
         self._pre_replay_position_ids = None
+        self._step_input_prologue_keys.clear()
         self.padding_dummy_requests = {}
         del self.memory_pool
         self.memory_pool = None

@@ -27,6 +27,7 @@ from typing import Optional
 
 import torch
 
+from ..._utils import prefer_pinned
 from ...sampling_params import SamplingParams
 from ..pyexecutor.llm_request import LlmRequest, LlmRequestState, get_draft_token_length
 from ..pyexecutor.resource_manager import BaseResourceManager
@@ -73,6 +74,11 @@ UNSUPPORTED_TOP_P_DECAY_MSG = (
     "Drop top_p_decay / top_p_min from the request, or disable "
     "speculative decoding."
 )
+UNSUPPORTED_LOGITS_POST_PROCESSOR_MSG = (
+    "logits_processor (a logits post-processor callback) is not supported with one-model "
+    "speculative decoding. Drop logits_processor from the request, or disable speculative "
+    "decoding."
+)
 UNSUPPORTED_MIN_P_MSG = (
     "min_p requires 'advanced_sampling_mode: full' in the speculative decoding "
     "config when using one-model speculative decoding. Restore that default, "
@@ -113,6 +119,10 @@ def one_model_sampling_rejection_reason(
         return UNSUPPORTED_NO_REPEAT_NGRAM_MSG
     if sampling_params.embedding_bias is not None:
         return UNSUPPORTED_EMBEDDING_BIAS_MSG
+    # A per-request callback becomes py_logits_post_processors; the one-model path never
+    # calls it (a fused verify may not even materialize the full logits).
+    if sampling_params.logits_processor:
+        return UNSUPPORTED_LOGITS_POST_PROCESSOR_MSG
     # The same predicate top_p_decay_active() delegates to, so "active" cannot
     # mean one thing here and another in the sampler.
     if SamplingParams.params_imply_top_p_decay_active(sampling_params.top_p_decay):
@@ -168,6 +178,13 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
 
     # The model's speculative step-input staging, when it opted into one (bind_spec_step_fold).
     spec_step_fold: Optional[SpecStepFold] = None
+    # Copy the per-slot store to the host on the D2H side stream (RuntimeHooks.sampler_d2h_side_stream).
+    d2h_side_stream_copies: bool = False
+    # Keep the stored rows' slot ids in a device buffer re-uploaded only when they change
+    # (RuntimeHooks.spec_small_h2d).
+    static_slot_ids: bool = False
+    _slot_ids_host: Optional[list[int]] = None
+    _slot_ids_cuda: Optional[torch.Tensor] = None
 
     SampleState = SampleStateSpec
 
@@ -232,8 +249,8 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         """Reject logits-side sampling features the one-model path cannot apply.
 
         TorchSampler implements min_length, bad_words, no_repeat_ngram_size,
-        embedding_bias and top_p_decay by editing the target logits before
-        sampling. The one-model path has no logits-editing hook, so each is
+        embedding_bias, top_p_decay and logits post-processor callbacks by editing
+        the target logits before sampling. The one-model path has no logits-editing hook, so each is
         rejected here instead of being silently dropped.
 
         Each check gates on a non-neutral value rather than on presence, since a
@@ -252,6 +269,11 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
             raise ValueError(UNSUPPORTED_NO_REPEAT_NGRAM_MSG)
         if getattr(request, "py_embedding_bias", None) is not None:
             raise ValueError(UNSUPPORTED_EMBEDDING_BIAS_MSG)
+        # The one-model sampler never calls a request's logits post-processors, and a fused
+        # verify (e.g. the MiniMax-M3 shard verify) does not even gather the full logits, so
+        # the callback would be skipped silently.
+        if getattr(request, "py_logits_post_processors", None):
+            raise ValueError(UNSUPPORTED_LOGITS_POST_PROCESSOR_MSG)
         # Reuse the handler's own predicate so "active" cannot drift between paths.
         if top_p_decay_active(_request_get_sampling_params(request)):
             raise ValueError(UNSUPPORTED_TOP_P_DECAY_MSG)
@@ -316,6 +338,68 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
             next_draft_tokens=int_tensor((seq_slots, args.max_total_draft_tokens)),
             new_tokens_lens=int_tensor((seq_slots,)),
         )
+
+    def _device_slot_ids(self, seq_slots: list[int]) -> torch.Tensor:
+        """The slot ids on the device, uploaded only when they differ from the last upload.
+
+        The buffer is this sampler's own: only this method writes it, so the last uploaded
+        list describes its contents, and the stream orders each upload after the scatter that
+        read the previous ids.
+        """
+        n = len(seq_slots)
+        if self._slot_ids_cuda is None or self._slot_ids_cuda.numel() < n:
+            self._slot_ids_cuda = torch.empty(max(n, 8), dtype=torch.long, device="cuda")
+            self._slot_ids_host = None
+        if self._slot_ids_host != list(seq_slots):
+            self._slot_ids_cuda[:n].copy_(
+                torch.tensor(seq_slots, dtype=torch.long, pin_memory=prefer_pinned()),
+                non_blocking=True,
+            )
+            self._slot_ids_host = list(seq_slots)
+        return self._slot_ids_cuda[:n]
+
+    def _copy_outputs_to_host(
+        self,
+        o_verify_lens: Optional[torch.Tensor],
+        store_copies_on_side_stream: bool,
+        store_copies_done: Optional[torch.cuda.Event] = None,
+    ) -> tuple[SampleStateTensorsSpec, Optional[torch.cuda.Event]]:
+        """Host copies of the step's stored outputs, and the side-stream event to await them by (or None).
+
+        With ``d2h_side_stream_copies`` the per-slot store is copied on the D2H side stream, so the copies
+        overlap the next step's input staging instead of preceding it on the main stream. That is sound
+        only while nothing rewrites the store before the sampler event is synchronized host-side, which
+        holds when this sampler stored the rows itself: the store is next written by the following
+        ``sample_async``, after the loop has synchronized this step. ``verify_lens`` is a forward output
+        buffer the next replay rewrites, so it is always copied on the main stream.
+
+        ``store_copies_done`` (a step fold's ``store_copies_done``) is recorded on the side stream after the copies:
+        a forward that stores into the store waits on it first, which keeps the side-stream copies sound when the
+        next replay rather than the next ``sample_async`` writes the store.
+        """
+        verify_lens = self._copy_to_host(o_verify_lens) if o_verify_lens is not None else None
+        if not (
+            self.d2h_side_stream_copies
+            and store_copies_on_side_stream
+            and not self._async_worker_active()
+        ):
+            host = SampleStateTensorsSpec(
+                new_tokens=self._copy_to_host(self.store.new_tokens),
+                new_tokens_lens=self._copy_to_host(self.store.new_tokens_lens),
+                next_draft_tokens=self._copy_to_host(self.store.next_draft_tokens),
+                verify_lens=verify_lens,
+            )
+            return host, None
+        with self._make_side_stream_copier() as copier:
+            host = SampleStateTensorsSpec(
+                new_tokens=copier.stage_copy_to_host(self.store.new_tokens),
+                new_tokens_lens=copier.stage_copy_to_host(self.store.new_tokens_lens),
+                next_draft_tokens=copier.stage_copy_to_host(self.store.next_draft_tokens),
+                verify_lens=verify_lens,
+            )
+        if store_copies_done is not None and copier.event is not None:
+            store_copies_done.record(self._d2h_side_stream)
+        return host, copier.event
 
     def bind_spec_step_fold(self, spec_step_fold: SpecStepFold) -> None:
         """Let the model's forward store into this sampler's per-slot store (see SpecStepFold)."""
@@ -414,8 +498,11 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         o_next_draft_tokens: torch.Tensor,
     ) -> None:
         """Store one step's worker outputs into the per-slot store."""
-        slots = torch.as_tensor(seq_slots, dtype=torch.long)
-        slots = slots.to(device="cuda", non_blocking=True)
+        if self.static_slot_ids:
+            slots = self._device_slot_ids(seq_slots)
+        else:
+            slots = torch.as_tensor(seq_slots, dtype=torch.long)
+            slots = slots.to(device="cuda", non_blocking=True)
         step_fold = self.spec_step_fold
         if step_fold is not None and step_fold.scatter(
             slots, o_new_tokens, o_next_new_tokens, o_new_tokens_lens, o_next_draft_tokens
@@ -546,7 +633,10 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
             o_verify_lens = o_verify_lens[num_skip : num_skip + num_sampling_requests]
 
         step_fold = self.spec_step_fold
-        if step_fold is None or not step_fold.sampler_rows_stored(outputs, num_skip, seq_slots):
+        stored_here = step_fold is None or not step_fold.sampler_rows_stored(
+            outputs, num_skip, seq_slots
+        )
+        if stored_here:
             self._store_outputs(
                 seq_slots, o_new_tokens, o_next_new_tokens, o_new_tokens_lens, o_next_draft_tokens
             )
@@ -558,13 +648,15 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
             next_draft_tokens=self.store.next_draft_tokens,
         )
 
-        host_tensors = SampleStateTensorsSpec(
-            new_tokens=self._copy_to_host(self.store.new_tokens),
-            new_tokens_lens=self._copy_to_host(self.store.new_tokens_lens),
-            next_draft_tokens=self._copy_to_host(self.store.next_draft_tokens),
-            verify_lens=(self._copy_to_host(o_verify_lens) if o_verify_lens is not None else None),
+        # A fold whose forward waits for the store copies (store_copies_done) lets them go on the side stream
+        # on the steps its forward stored the rows too.
+        store_copies_done = getattr(step_fold, "store_copies_done", None) if step_fold else None
+        host_tensors, side_stream_event = self._copy_outputs_to_host(
+            o_verify_lens,
+            store_copies_on_side_stream=stored_here or store_copies_done is not None,
+            store_copies_done=store_copies_done,
         )
-        sampler_event = self._record_sampler_event()
+        sampler_event = self._record_sampler_event(side_stream_event)
 
         # Add dummy draft tokens to context requests for KV cache preparation
         for request in finished_context_requests:

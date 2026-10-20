@@ -19,6 +19,7 @@ targets are text-only: they load no vision tower and refuse image input.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Any, Optional, Tuple
 
@@ -30,10 +31,17 @@ from ..._router_index import NoTarget, RuntimeFacts
 # ``route`` also reads the engine's sparse-attention runtime and KV cache dtype (``RuntimeFacts``).
 ROUTES_ON_RUNTIME = True
 
-# The one GPU architecture these targets are written for: the decode kernels
-# (the tcgen05 GEMVs, the fused MoE engines, the attention megakernels and the
-# multicast all-reduce) are built and measured on GB300 only.
+# The GPU architectures these targets are written for: the tp4 / tp8 decode
+# kernels (the tcgen05 GEMVs, the fused MoE engines, the attention megakernels
+# and the multicast all-reduce) are built and measured on GB300 (sm103); the
+# tp2 and tp4 Rubin (sm107) targets are ports, switched on one certified path
+# at a time.
 _SM = (10, 3)
+_SM_RUBIN = (10, 7)
+
+# The routing knobs of the former separate Rubin tp2 wide-decode target. Its 9..192-row decode cells are now part of the
+# one Rubin tp2 target, so there is nothing left to select: a deployment that still sets either knob is stale.
+_REMOVED_TP2_KNOBS = ("TRTLLM_M3_TP2_WIDE", "TRTLLM_M3_TP2_WIDE_MIN_BATCH")
 
 # The checkpoint's config shape, read from ``text_config``; see the note in the
 # gpt_oss routing module for what shape-sniffing does and does not pin.
@@ -88,9 +96,9 @@ def _parallel(m) -> Optional[str]:
     Attention is head-split and the routed experts are tensor-parallel with
     every expert on every rank: the expert split decides which expert weights
     each rank loads and into which shapes (per-rank expert width 768 at tp4,
-    384 at tp8), so it selects a target rather than a runtime branch.
+    384 at tp8, 1536 at tp2), so it selects a target rather than a runtime branch.
     """
-    for tp in (4, 8):
+    for tp in (2, 4, 8):
         if (
             m.world_size == tp
             and m.tp_size == tp
@@ -271,6 +279,57 @@ def route(
 
         return ModelingV2MiniMaxM3Nvfp4Sm103Tp8
 
+    # The same checkpoint on 2 Rubin GPUs (sm107), tensor-parallel attention and
+    # experts, one-model Eagle3 or no speculative decoding, at any batch size (decode rows 1..192).
+    if (
+        compute_capability == _SM_RUBIN
+        and shape == _SHAPE
+        and quant_algo == QuantAlgo.MIXED_PRECISION
+        and parallel == "tp2"
+        and speculation
+        and drafter is None
+        and runtime_miss is None
+    ):
+        stale = [knob for knob in _REMOVED_TP2_KNOBS if knob in os.environ]
+        if stale:
+            raise ValueError(
+                f"{', '.join(stale)}: removed; the MiniMax-M3 sm107 tp2 target serves every batch size (its "
+                "wide-decode cells are part of it), so unset these variables"
+            )
+        from .minimax_m3_nvfp4__sm_107__tp2.modeling import ModelingV2MiniMaxM3Nvfp4Sm107Tp2
+
+        return ModelingV2MiniMaxM3Nvfp4Sm107Tp2
+
+    # The same checkpoint on 4 Rubin GPUs (sm107), tensor-parallel attention and
+    # experts, one-model Eagle3 or no speculative decoding.
+    if (
+        compute_capability == _SM_RUBIN
+        and shape == _SHAPE
+        and quant_algo == QuantAlgo.MIXED_PRECISION
+        and parallel == "tp4"
+        and speculation
+        and drafter is None
+        and runtime_miss is None
+    ):
+        from .minimax_m3_nvfp4__sm_107__tp4.modeling import ModelingV2MiniMaxM3Nvfp4Sm107Tp4
+
+        return ModelingV2MiniMaxM3Nvfp4Sm107Tp4
+
+    # The same checkpoint on 8 Rubin GPUs over two trays (sm107), tensor-parallel
+    # attention and experts, one-model Eagle3 or no speculative decoding.
+    if (
+        compute_capability == _SM_RUBIN
+        and shape == _SHAPE
+        and quant_algo == QuantAlgo.MIXED_PRECISION
+        and parallel == "tp8"
+        and speculation
+        and drafter is None
+        and runtime_miss is None
+    ):
+        from .minimax_m3_nvfp4__sm_107__tp8.modeling import ModelingV2MiniMaxM3Nvfp4Sm107Tp8
+
+        return ModelingV2MiniMaxM3Nvfp4Sm107Tp8
+
     raise NoTarget(
         f"compute capability {compute_capability}, text_config shape {shape}, "
         f"quantization {quant_algo.name if quant_algo is not None else 'none'}, parallel "
@@ -280,8 +339,8 @@ def route(
         f"{spec_config.spec_dec_mode.name if spec_config is not None else 'off'}"
         f"{f' (Eagle3 drafter: {drafter})' if drafter else ''}"
         f"{f', runtime: {runtime_miss}' if runtime_miss else ''}; the "
-        "minimax_m3 targets are the MiniMax-M3 NVFP4 checkpoint on sm103 (GB300), 4 or 8 ranks of "
-        "tensor-parallel attention and experts, with one-model Eagle3 (a one-layer drafter with per-layer fc_norms) "
-        "or no speculative decoding, on the MSA sparse attention runtime with an FP8 indexer and an FP8 or NVFP4 KV "
-        "cache"
+        "minimax_m3 targets are the MiniMax-M3 NVFP4 checkpoint on sm103 (GB300) with 4 or 8 ranks, or on sm107 "
+        "(Rubin) with 2, 4 or 8 ranks, of tensor-parallel attention and experts, with one-model Eagle3 (a one-layer "
+        "drafter with per-layer fc_norms) or no speculative decoding, on the MSA sparse attention runtime with an FP8 "
+        "indexer and an FP8 or NVFP4 KV cache"
     )

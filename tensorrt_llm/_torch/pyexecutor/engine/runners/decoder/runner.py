@@ -63,6 +63,7 @@ from tensorrt_llm.llmapi.llm_args import (
     PrefillCudaGraphBackend,
     SeqLenAwareSparseAttentionConfig,
 )
+from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
 from ...lora import LoraParamBuilder, make_cuda_graph_lora_manager
@@ -200,12 +201,41 @@ class DecoderRunner(ScheduledModelRunner):
 
         self._config = config
         self.runtime_hooks = runtime_hooks_of(model)
-        self._h2d_cache = H2DSkipCache() if self.runtime_hooks.skip_unchanged_h2d else None
+        self._h2d_cache = (
+            H2DSkipCache(changed_span=self.runtime_hooks.h2d_changed_span)
+            if self.runtime_hooks.skip_unchanged_h2d
+            else None
+        )
         self._step_pack = (
-            StepInputPack(torch.device("cuda", torch.cuda.current_device()))
+            StepInputPack(
+                torch.device("cuda", torch.cuda.current_device()),
+                parallel_scatter=self.runtime_hooks.pack_parallel_scatter,
+                in_graph=self.runtime_hooks.pack_in_graph,
+                early_copy=self.runtime_hooks.pack_early_copy,
+                step_epoch=self.runtime_hooks.pack_step_epoch,
+                prologue_op=self.runtime_hooks.pack_prologue_op,
+            )
             if self.runtime_hooks.pack_step_inputs
             else None
         )
+        if self._step_pack is not None and self._step_pack.parallel_scatter:
+            logger.info("[M3 host] step-input pack: parallel scatter for non-overlapping copies")
+        if self._step_pack is not None and self._step_pack.in_graph:
+            logger.info("[M3 host] step-input pack issued by the decode graph's prologue")
+        if self._step_pack is not None and self._step_pack.early_copy:
+            logger.info(
+                "[M3 host] step-input pack: window uploaded ahead of the replay on a side copy stream"
+            )
+        if self._step_pack is not None and self._step_pack.epoch is not None:
+            logger.info(
+                "[M3 host] step epoch: one device counter bumped by the decode graph's prologue"
+            )
+        if self._step_pack is not None and self._step_pack.prologue_op is not None:
+            logger.info(
+                "[M3 host] step-input pack: the decode graph's prologue is one launch (scatter, header, epoch)"
+            )
+        if self._h2d_cache is not None and self._h2d_cache.changed_span:
+            logger.info("[M3 host] changed metadata uploads stage only each row's changed span")
 
         self.forward_pass_callable = None
         # Optional in-graph sampling hook, registered by PyExecutor. Called at
@@ -491,7 +521,11 @@ class DecoderRunner(ScheduledModelRunner):
 
         Set by a sparse attention config that asks for the split, or by a model whose MSA
         policy stages identity selections for short sequences: a sequence within the
-        top-k blocks attends every valid block.
+        top-k blocks attends every valid block. The short family runs the identity selection,
+        so every token it attends must fit in the top-k blocks. The graph key estimates a
+        sequence's length from host token counts, which under the overlap scheduler miss up to
+        the in-flight step's accepted tokens; the identity threshold leaves one generation
+        step's tokens of headroom for that.
         """
         sparse_config = self.sparse_attention_config
         if (
@@ -505,7 +539,8 @@ class DecoderRunner(ScheduledModelRunner):
                     "MsaRuntimePolicy.short_sequence_identity requires a MiniMax-M3 sparse "
                     f"attention config, got {type(sparse_config).__name__}"
                 )
-            return sparse_config.sparse_topk_blocks * sparse_config.sparse_block_size
+            topk_span = sparse_config.sparse_topk_blocks * sparse_config.sparse_block_size
+            return topk_span - self.get_runtime_tokens_per_gen_step(self._config.max_draft_len)
         return None
 
     def _initialize_breakable_cuda_graph_runner(

@@ -34,8 +34,17 @@ def test_model_without_hooks_gets_the_all_off_default():
     assert not hooks.skip_unchanged_h2d
     assert not hooks.loop_on_execution_stream
     assert not hooks.merge_tuned_tactics_across_ranks
+    assert hooks.first_content_emit_iters == 1
+    assert not hooks.mxfp8_pinned_tactics
+    assert not hooks.late_compile_detect
     assert not hooks.skip_greedy_rng_upload
+    assert not hooks.pack_spec_rng_uploads
     assert hooks.spec_step_fold is None
+    assert not hooks.sampler_d2h_side_stream
+    assert not hooks.spec_small_h2d
+    assert not hooks.iteration_timing_one_event
+    assert not hooks.pack_parallel_scatter
+    assert not hooks.pack_in_graph
     assert hooks.msa == MsaRuntimePolicy()
     assert not hooks.msa.short_sequence_identity
     assert hooks.msa.kv_update is None

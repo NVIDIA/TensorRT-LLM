@@ -7,11 +7,14 @@ import threading
 import pytest
 import torch
 
+from tensorrt_llm._torch.memory_buffer_utils import Buffers
 from tensorrt_llm._torch.pyexecutor import h2d_cache
 from tensorrt_llm._torch.pyexecutor.h2d_cache import (
     H2DSkipCache,
     copy_h2d_if_changed,
+    copy_h2d_pool_shared,
     fill_tail_if_changed,
+    fill_tail_pool_shared,
 )
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -314,3 +317,102 @@ def test_a_tail_record_keeps_its_storage_so_a_new_buffer_cannot_inherit_it(cache
     assert fresh.data_ptr() != address
     fill_tail_if_changed(fresh, 3, -1)
     assert fresh[3:].eq(-1).all()
+
+
+# ---------------------------------------------------------------------------
+# CUDA graph metadata pool: one block shared by every graph key
+# ---------------------------------------------------------------------------
+
+NUM_SLOTS = 8
+
+
+def _graph_key_views(name):
+    """Two graph keys' metadata views from one pool, as create_cuda_graph_metadata hands them out."""
+    pool = Buffers()
+    large = pool.get_buffer([NUM_SLOTS], torch.int32, name, reserve_buffer=True)
+    small = pool.get_buffer([NUM_SLOTS], torch.int32, name, reserve_buffer=True)
+    assert small.data_ptr() == large.data_ptr()
+    return large, small
+
+
+def _capture_live_row_write(buf, rows, values):
+    """A graph whose replay writes buf[:rows] on the device, as on_update_kv_lens writes the live slots."""
+    slots = torch.tensor(values, dtype=torch.int32, device="cuda")
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.stream(stream), torch.cuda.graph(graph, stream=stream):
+        buf[:rows].copy_(slots)
+    torch.cuda.current_stream().wait_stream(stream)
+    return graph
+
+
+def _key_b_step(buf, live):
+    """Key B's prepare: its live slots, then -1 over the padded rows its captured producers also run."""
+    copy_h2d_pool_shared(buf[: len(live)], _host(live))
+    fill_tail_pool_shared(buf, len(live), -1)
+
+
+@pytest.mark.parametrize("skip_pool_shared", [False, True], ids=["fixed", "kill_switch"])
+def test_two_graph_keys_over_one_block_keep_the_padded_rows_unused(
+    cache, monkeypatch, skip_pool_shared
+):
+    monkeypatch.setattr(h2d_cache, "SKIP_POOL_SHARED_UPLOADS", skip_pool_shared)
+    key_a, key_b = _graph_key_views("msa_out_cache_loc")
+    replay_a = _capture_live_row_write(key_a, 6, [10, 11, 12, 13, 14, 15])
+
+    _key_b_step(key_b, [20, 21, 22])
+    torch.cuda.synchronize()
+    assert key_b.tolist() == [20, 21, 22, -1, -1, -1, -1, -1]
+    # Key A's step: its replay writes six live slots into the shared block.
+    replay_a.replay()
+    # Key B's next step, with the same live slots.
+    _key_b_step(key_b, [20, 21, 22])
+    torch.cuda.synchronize()
+    if skip_pool_shared:
+        # The old behaviour: both writes were skipped, so key B's live and padded rows hold key A's live slots.
+        assert key_b.tolist() == [10, 11, 12, 13, 14, 15, -1, -1]
+    else:
+        assert key_b.tolist() == [20, 21, 22, -1, -1, -1, -1, -1]
+
+
+@pytest.mark.parametrize("skip_pool_shared", [False, True], ids=["fixed", "kill_switch"])
+def test_two_graph_keys_over_one_block_keep_their_uploads(cache, monkeypatch, skip_pool_shared):
+    monkeypatch.setattr(h2d_cache, "SKIP_POOL_SHARED_UPLOADS", skip_pool_shared)
+    key_a, key_b = _graph_key_views("msa_block_table")
+    replay_a = _capture_live_row_write(key_a, 4, [7, 7, 7, 7])
+    table = [1, 2, 3, 4]
+
+    assert copy_h2d_pool_shared(key_b[:4], _host(table)) is True
+    replay_a.replay()
+    copied = copy_h2d_pool_shared(key_b[:4], _host(table))
+    torch.cuda.synchronize()
+    if skip_pool_shared:
+        assert copied is False
+        assert key_b[:4].tolist() == [7, 7, 7, 7]
+    else:
+        assert copied is True
+        assert key_b[:4].tolist() == table
+
+
+def test_pool_shared_writes_drop_the_shadow_and_tail_record(cache):
+    buf = _device_zeros(6)
+    values = _host([1, 2])
+    assert copy_h2d_if_changed(buf[:2], values) is True
+    fill_tail_if_changed(buf, 2, -1)
+    copy_h2d_pool_shared(buf[:2], _host([5, 6]))
+    buf[3] = 9
+    # Neither record vouches for the buffer after a write outside the skip cache.
+    assert copy_h2d_if_changed(buf[:2], values) is True
+    fill_tail_if_changed(buf, 2, -1)
+    torch.cuda.synchronize()
+    assert buf.tolist() == [1, 2, -1, -1, -1, -1]
+
+
+def test_pool_shared_writes_without_an_active_cache_are_plain_writes():
+    assert not h2d_cache.enabled()
+    buf = _device_zeros(4)
+    assert copy_h2d_pool_shared(buf[:2], _host([3, 4]), pack=True) is True
+    fill_tail_pool_shared(buf, 2, -1)
+    torch.cuda.synchronize()
+    assert buf.tolist() == [3, 4, -1, -1]

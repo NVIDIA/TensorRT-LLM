@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """DecoderRunner and DecoderMetadata wiring of the step-loop hooks a model declares."""
 
+from types import SimpleNamespace
+
 import pytest
 
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.cache_manager import (
@@ -30,12 +32,16 @@ _SHORT_IDENTITY = RuntimeHooks(msa=MsaRuntimePolicy(short_sequence_identity=True
 
 
 def _runner(
-    sparse_attention_config: BaseSparseAttentionConfig | None, hooks: RuntimeHooks
+    sparse_attention_config: BaseSparseAttentionConfig | None,
+    hooks: RuntimeHooks,
+    max_draft_len: int = 0,
 ) -> DecoderRunner:
-    # Only the two attributes the threshold reads.
+    # Only the attributes the threshold reads.
     runner = object.__new__(DecoderRunner)
     runner.sparse_attention_config = sparse_attention_config
     runner.runtime_hooks = hooks
+    runner._config = SimpleNamespace(max_draft_len=max_draft_len)
+    runner.get_runtime_tokens_per_gen_step = lambda draft_len: draft_len + 1
     return runner
 
 
@@ -64,10 +70,14 @@ def test_a_sparse_config_that_asks_for_the_split_sets_the_threshold():
     assert _runner(config, _SHORT_IDENTITY)._short_long_seq_len_threshold() == 512
 
 
-def test_short_identity_threshold_is_the_topk_span():
+@pytest.mark.parametrize("max_draft_len", [0, 3])
+def test_short_identity_threshold_keeps_one_step_of_headroom_in_the_topk_span(max_draft_len):
+    """The short graph family runs the identity selection: one generation step's tokens below the top-k span, the most
+    the graph key's host length estimate can lag the attended length under the overlap scheduler."""
     config = MiniMaxM3SparseAttentionConfig(sparse_topk_blocks=16, sparse_block_size=128)
 
-    assert _runner(config, _SHORT_IDENTITY)._short_long_seq_len_threshold() == 16 * 128
+    threshold = _runner(config, _SHORT_IDENTITY, max_draft_len)._short_long_seq_len_threshold()
+    assert threshold == 16 * 128 - (max_draft_len + 1)
 
 
 @pytest.mark.parametrize(

@@ -14,10 +14,11 @@ Each engine that armed ``RuntimeHooks.skip_unchanged_h2d`` owns one cache and ma
 cache travels in the context rather than as an argument.
 
 Route a copy through it only for a destination that no other code writes (no device kernel, no other copy path, no other
-engine): the shadow describes the device contents only under that invariant. Pooled metadata buffers satisfy it because
-an engine that arms the skip gives its CUDA graph metadata a buffer pool of its own
-(``RuntimeHooks.skips_unchanged_metadata_uploads``); eager metadata allocates its own buffers. A write through a
-different view of the same buffer replaces the shadow, so overlapping views never skip on stale state.
+engine, no graph replay): the shadow describes the device contents only under that invariant. CUDA graph metadata
+buffers do not satisfy it: every graph key's metadata takes them from one pool, which hands the same block to each key
+that asks for the same name, and a captured graph's device writes into a block run again at each of its replays. Those
+destinations use ``copy_h2d_pool_shared`` / ``fill_tail_pool_shared``, which never skip. A write through a different
+view of the same buffer replaces the shadow, so overlapping views never skip on stale state.
 """
 
 from __future__ import annotations
@@ -32,9 +33,19 @@ from . import step_inputs
 
 
 class H2DSkipCache:
-    """One engine's host shadows of its skip-routed destinations (see the module docstring)."""
+    """One engine's host shadows of its skip-routed destinations (see the module docstring).
 
-    def __init__(self) -> None:
+    ``changed_span``: a packed copy into a 2-D view with contiguous rows whose shadow covers the same rows (same
+    first element and row stride) uploads, per row, only the span from its first to its last changed column, plus any
+    columns the shadow does not cover. A page table that gained one page then stages a few bytes instead of every
+    padded row, so the pack still fits the decode graph's prologue window.
+    """
+
+    # A changed-span upload is used only while it moves at most this fraction of the view's bytes.
+    CHANGED_SPAN_MAX_FRACTION = 0.5
+
+    def __init__(self, changed_span: bool = False) -> None:
+        self.changed_span = changed_span
         # Device storage address -> (the storage, kept alive so the address is not reused; the view key; the host
         # values). Keyed by storage rather than by view base: tensors made under inference mode do not record their
         # base.
@@ -65,12 +76,57 @@ class H2DSkipCache:
             and torch.equal(entry[2], src)
         ):
             return False
-        if pack:
-            step_inputs.copy_(dst, src)
-        else:
-            dst.copy_(src, non_blocking=True)
+        if not (
+            pack
+            and self.changed_span
+            and entry is not None
+            and self._copy_changed_span(dst, src, entry[1:])
+        ):
+            if pack:
+                step_inputs.copy_(dst, src)
+            else:
+                dst.copy_(src, non_blocking=True)
         self._shadow[addr] = (storage, key, src.clone())
         return True
+
+    def _copy_changed_span(self, dst: torch.Tensor, src: torch.Tensor, shadow: tuple) -> bool:
+        """Stage only the changed span of each row of ``dst`` (see the class docstring); False if not applicable."""
+        (offset, shape, stride, dtype), old = shadow
+        if (
+            dst.dim() != 2
+            or dst.stride(1) != 1
+            or offset != dst.storage_offset()
+            or len(shape) != 2
+            or shape[0] != dst.shape[0]
+            or stride != tuple(dst.stride())
+            or dtype != dst.dtype
+            or old.dtype != src.dtype
+            or tuple(src.shape) != tuple(dst.shape)
+            or not step_inputs.is_open()
+        ):
+            return False
+        cols = dst.shape[1]
+        known = min(shape[1], cols)
+        changed = src[:, :known] != old[:, :known]
+        if cols > known:
+            # Columns the shadow does not cover hold unknown device values.
+            changed = torch.cat([changed, changed.new_ones(dst.shape[0], cols - known)], dim=1)
+        rows = changed.any(dim=1).nonzero().flatten().tolist()
+        spans = []
+        for row in rows:
+            columns = changed[row].nonzero().flatten()
+            spans.append((row, int(columns[0]), int(columns[-1]) + 1))
+        if sum(hi - lo for _, lo, hi in spans) > self.CHANGED_SPAN_MAX_FRACTION * dst.numel():
+            return False
+        for row, lo, hi in spans:
+            step_inputs.copy_(dst[row, lo:hi], src[row, lo:hi])
+        return True
+
+    def forget(self, dst: torch.Tensor) -> None:
+        """Drop the shadow and tail record of ``dst``'s storage (it is about to be written outside the cache)."""
+        addr = dst.untyped_storage().data_ptr()
+        self._shadow.pop(addr, None)
+        self._tails.pop(addr, None)
 
     def fill_tail(self, buf: torch.Tensor, start: int, value: int) -> None:
         storage = buf.untyped_storage()
@@ -92,6 +148,10 @@ class H2DSkipCache:
 
 
 _active: ContextVar[Optional[H2DSkipCache]] = ContextVar("trtllm_h2d_skip_cache", default=None)
+
+# Kill switch for A/B only: True routes the pool-shared metadata destinations (``copy_h2d_pool_shared``,
+# ``fill_tail_pool_shared``) through the skip cache again, as before. False keeps them always written.
+SKIP_POOL_SHARED_UPLOADS = False
 
 
 @contextlib.contextmanager
@@ -135,3 +195,40 @@ def fill_tail_if_changed(buf: torch.Tensor, start: int, value: int) -> None:
             buf[start:].fill_(value)
         return
     cache.fill_tail(buf, start, value)
+
+
+def copy_h2d_pool_shared(dst: torch.Tensor, src: torch.Tensor, pack: bool = False) -> bool:
+    """``copy_h2d_if_changed`` for a destination in a CUDA graph metadata buffer pool: always issued.
+
+    Every graph key's metadata takes its buffers from one pool, which hands the same block to each key that asks
+    for the same buffer name, and the captured graphs write some of those blocks on the device at every replay. The
+    host shadow therefore does not describe the device contents, so such a copy is never skipped. ``pack``: as for
+    ``copy_h2d_if_changed``, the copy may join the open ``step_inputs`` pack when a cache is active.
+    """
+    cache = _active.get()
+    if cache is None:
+        dst.copy_(src, non_blocking=True)
+        return True
+    if SKIP_POOL_SHARED_UPLOADS:
+        return cache.copy(dst, src, pack)
+    cache.forget(dst)
+    if pack:
+        step_inputs.copy_(dst, src)
+    else:
+        dst.copy_(src, non_blocking=True)
+    return True
+
+
+def fill_tail_pool_shared(buf: torch.Tensor, start: int, value: int) -> None:
+    """``buf[start:].fill_(value)`` for a buffer in a CUDA graph metadata buffer pool: always issued.
+
+    See ``copy_h2d_pool_shared``: another graph key's replay can write ``buf`` past ``start``.
+    """
+    cache = _active.get()
+    if cache is not None and SKIP_POOL_SHARED_UPLOADS:
+        cache.fill_tail(buf, start, value)
+        return
+    if cache is not None:
+        cache.forget(buf)
+    if start < buf.shape[0]:
+        buf[start:].fill_(value)

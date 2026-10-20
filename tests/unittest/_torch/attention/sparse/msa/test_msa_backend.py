@@ -48,14 +48,18 @@ from tensorrt_llm.llmapi.llm_args import MiniMaxM3SparseAttentionConfig
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "tail_in_forward", [True, False], ids=["tail_in_forward", "tail_in_prepare"]
+)
 @pytest.mark.parametrize("empty_state", ["empty_batch", "no_requests", "no_lengths"])
 def test_msa_metadata_clears_padded_cache_slot_tail(
-    monkeypatch: pytest.MonkeyPatch, empty_state: str
+    monkeypatch: pytest.MonkeyPatch, empty_state: str, tail_in_forward: bool
 ) -> None:
     """A smaller replay must not reuse the previous step's live cache slots."""
     from tensorrt_llm._torch.attention.backends.sparse.minimax_m3 import msa_backend
 
     monkeypatch.setattr(msa_backend, "maybe_pin_memory", lambda tensor: tensor)
+    monkeypatch.setattr(msa_backend, "TAIL_FILL_IN_FORWARD", tail_in_forward)
     metadata_cls = MiniMaxM3MsaSparseAttention.Metadata
     metadata = metadata_cls.__new__(metadata_cls)
     metadata._msa_buffers_ready = True
@@ -81,6 +85,8 @@ def test_msa_metadata_clears_padded_cache_slot_tail(
         # live count off it.
         metadata._num_tokens = count
         metadata._build_msa_fields()
+        # TAIL_FILL_IN_FORWARD: the forward (on_update_kv_lens) fills the tail before anything reads it.
+        metadata._fill_tail_in_forward()
         assert metadata.msa_out_cache_loc.tolist() == list(range(12, 12 + count)) + [-1] * (
             4 - count
         )
@@ -259,7 +265,7 @@ def test_nvfp4_sparse_decode_rejects_unsupported_device(
     block_scale = torch.empty((1, 1, 128, 8), dtype=torch.uint8)
     global_scale = torch.ones(1)
 
-    with pytest.raises(NotImplementedError, match="NVFP4 sparse decode requires SM100/SM103"):
+    with pytest.raises(NotImplementedError, match="NVFP4 sparse decode requires SM100/SM103/SM107"):
         minimax_m3_sparse_attn_decode(
             q,
             kv,
@@ -274,6 +280,34 @@ def test_nvfp4_sparse_decode_rejects_unsupported_device(
             v_block_scale=block_scale,
             k_global_scale=global_scale,
             v_global_scale=global_scale,
+        )
+    get_capability.assert_called_once_with(q.device)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("capability", [(10, 0), (10, 3), (10, 7)])
+def test_nvfp4_sparse_decode_admits_the_sm100_family(
+    monkeypatch: pytest.MonkeyPatch, capability: tuple[int, int]
+) -> None:
+    """SM100-family devices, Rubin included, pass the device check and reach
+    input validation, which here rejects the missing scales."""
+    get_capability = Mock(spec_set=torch.cuda.get_device_capability, return_value=capability)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", get_capability)
+    q = torch.empty((1, 8, 128), dtype=torch.bfloat16)
+    kv = torch.empty((1, 1, 128, 64), dtype=torch.uint8)
+
+    with pytest.raises(ValueError, match="needs all four"):
+        minimax_m3_sparse_attn_decode(
+            q,
+            kv,
+            kv,
+            torch.zeros((1, 1, 1), dtype=torch.int32),
+            torch.zeros((1, 1), dtype=torch.int32),
+            torch.ones(1, dtype=torch.int32),
+            sm_scale=128**-0.5,
+            output=torch.empty_like(q),
+            decode_query_len=1,
+            k_block_scale=torch.empty((1, 1, 128, 8), dtype=torch.uint8),
         )
     get_capability.assert_called_once_with(q.device)
 
@@ -488,6 +522,45 @@ def test_msa_buffers_stage_local_cache_views(monkeypatch: pytest.MonkeyPatch, nv
     index.fill_(3)
     torch.testing.assert_close(main_cache, torch.full_like(main_cache, 2))
     torch.testing.assert_close(index_cache, torch.full_like(index_cache, 3))
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("kv_dtype", "expect_lengths"),
+    [
+        (DataType.FP8, False),
+        (DataType.NVFP4, True),
+    ],
+)
+def test_msa_buffers_reserve_cumulative_lengths_for_csr_prefill(
+    monkeypatch: pytest.MonkeyPatch,
+    kv_dtype: DataType,
+    expect_lengths: bool,
+) -> None:
+    """The NVFP4 CSR kernel reads graph-stable cumulative lengths, so only an
+    NVFP4 cache reserves them."""
+    from tensorrt_llm._torch.attention.backends.sparse.minimax_m3 import msa_backend
+
+    metadata = _buffer_metadata(dtype=kv_dtype, sparse_layer_ids=[], layer_offsets={})
+    reserved = {}
+
+    def get_empty(buffers, shape, **kwargs):
+        reserved[kwargs["cache_name"]] = tuple(shape)
+        return torch.empty(shape, dtype=kwargs["dtype"])
+
+    monkeypatch.setattr(metadata, "get_empty", get_empty)
+    monkeypatch.setattr(msa_backend, "uniform_subpages_per_slot", lambda manager: 0)
+    metadata._create_msa_buffers()
+
+    names = ("msa_qo_lens_cuda", "msa_cu_q_lens", "msa_cu_kv_lens")
+    if expect_lengths:
+        assert reserved["msa_qo_lens_cuda"] == (MAX_NUM_SEQUENCES,)
+        assert reserved["msa_cu_q_lens"] == (MAX_NUM_SEQUENCES + 1,)
+        assert reserved["msa_cu_kv_lens"] == (MAX_NUM_SEQUENCES + 1,)
+        assert all(getattr(metadata, name) is not None for name in names)
+    else:
+        assert not set(names) & set(reserved)
+        assert all(getattr(metadata, name) is None for name in names)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")

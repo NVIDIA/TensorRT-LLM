@@ -23,8 +23,9 @@ from tensorrt_llm._torch.custom_ops.torch_custom_ops import _map_to_mxfp8_large_
 
 
 @pytest.mark.skipif(
-    getSMVersion() not in (100, 103),
-    reason="MXFP8 GEMM is supported on SM100 and SM103 only. Current SM is %d." % getSMVersion(),
+    getSMVersion() not in (100, 103, 107),
+    reason="MXFP8 GEMM is supported on SM100, SM103 and SM107 only. Current SM is %d."
+    % getSMVersion(),
 )
 @pytest.mark.parametrize(
     "m,n,k",
@@ -62,8 +63,8 @@ def test_mxfp8_mxfp8_gemm_large_m(m: int, n: int, k: int):
 
 
 @pytest.mark.skipif(
-    getSMVersion() not in (100, 103),
-    reason="MXFP8 tactic runner requires SM100 or SM103. Current SM is %d." % getSMVersion(),
+    getSMVersion() not in (100, 103, 107),
+    reason="MXFP8 tactic runner requires SM100, SM103 or SM107. Current SM is %d." % getSMVersion(),
 )
 def test_mxfp8_mxfp8_runner_tactics():
     """Every exposed tactic and the generic fallback produce aligned output."""
@@ -94,8 +95,8 @@ def test_mxfp8_mxfp8_runner_tactics():
 
 
 @pytest.mark.skipif(
-    getSMVersion() not in (100, 103),
-    reason="MXFP8 tactic cache requires SM100 or SM103. Current SM is %d." % getSMVersion(),
+    getSMVersion() not in (100, 103, 107),
+    reason="MXFP8 tactic cache requires SM100, SM103 or SM107. Current SM is %d." % getSMVersion(),
 )
 def test_mxfp8_mxfp8_native_tactic_cache():
     """The direct op uses cached tactics and preserves the generic fallback."""
@@ -156,8 +157,8 @@ def test_mxfp8_mxfp8_native_tactic_cache():
 
 
 @pytest.mark.skipif(
-    getSMVersion() not in (100, 103),
-    reason="MXFP8 tactic cache requires SM100 or SM103. Current SM is %d." % getSMVersion(),
+    getSMVersion() not in (100, 103, 107),
+    reason="MXFP8 tactic cache requires SM100, SM103 or SM107. Current SM is %d." % getSMVersion(),
 )
 @pytest.mark.parametrize(
     "lower_bound,upper_bound,bucket",

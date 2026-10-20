@@ -15,7 +15,7 @@ own deployment; none is a general default.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional, Protocol
+from typing import TYPE_CHECKING, Callable, Optional, Protocol
 
 if TYPE_CHECKING:
     import torch
@@ -144,6 +144,9 @@ class MsaRuntimePolicy:
     skip_unchanged_block_offsets: bool = False
     # Build each KV pool view once per pool geometry instead of on every attention call.
     reuse_pool_views: bool = False
+    # Fill the per-request block-id table by slice-copying each request's page-index view instead of
+    # building a Python list of the whole padded row (max_seq_len / tokens_per_block entries) first.
+    block_ids_from_views: bool = False
 
 
 @dataclass(frozen=True)
@@ -153,19 +156,76 @@ class RuntimeHooks:
     # Pack a decode step's small host-to-device input copies into one upload and
     # one scatter launch, issued just before the CUDA graph replay.
     pack_step_inputs: bool = False
+    # Issue the step-input pack's host copies with one parallel scatter (a program per copy) instead of the
+    # serial one-CTA scatter, when their destinations do not overlap (pack_step_inputs).
+    pack_parallel_scatter: bool = False
+    # Issue the step-input pack inside the replayed graph (a prologue copies a pinned window and scatters it), so no
+    # operation is left between the decode graphs (needs pack_parallel_scatter).
+    pack_in_graph: bool = False
+    # With pack_in_graph: a side copy stream uploads the pinned window into the prologue's own device buffer while the
+    # previous graph still runs, so the prologue only waits on that copy and scatters device to device (no host copy
+    # at the head of the replay).
+    pack_early_copy: bool = False
+    # With pack_in_graph: the pack keeps a step epoch, one int64 device counter the graph's prologue increments once per
+    # replay and never resets, so in-graph per-step flags can be tagged with it instead of cleared between steps.
+    pack_step_epoch: bool = False
+    # With pack_early_copy: the model's one-launch prologue, called inside the capture as
+    # ``op(window, epoch_or_None, max_desc)``. It writes the window's host copies, then its device copies, zeroes the
+    # window's header and increments the epoch, which the default prologue does with two scatter launches and a fill.
+    pack_prologue_op: Optional[Callable[[torch.Tensor, Optional[torch.Tensor], int], None]] = None
     # Skip host-to-device metadata copies whose values the destination already holds.
     skip_unchanged_h2d: bool = False
+    # With skip_unchanged_h2d: a changed packed 2-D upload stages only each row's changed column span (a page table that
+    # gained a page re-sends a few bytes, not every padded row), so the pack keeps fitting the in-graph window.
+    h2d_changed_span: bool = False
+    # A speculative step under the overlap scheduler re-derives its KV-length metadata (on_update_kv_lens) once,
+    # after the forward's KV-length correction, instead of also before it: the first pass's device writes are all
+    # rewritten by the second.
+    kv_lens_update_once: bool = False
+    # The overlap scheduler's speculative step correction (position_ids += position offsets, kv_lens += KV-length
+    # offsets) as the model's one launch, called as ``op(positions, position_offsets, kv_lens, kv_lens_offsets)`` on the
+    # generation rows; it returns False to decline (the two in-tree adds run).
+    spec_offsets_op: Optional[
+        Callable[[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor], bool]
+    ] = None
     # Run the overlap executor loop with the execution stream current, so the
     # loop's own stream work and the forward are ordered on one stream.
     loop_on_execution_stream: bool = False
     # After autotuning, keep the fastest profiled tactic per shape on every
     # tensor-parallel rank, so the ranks capture the same kernels.
     merge_tuned_tactics_across_ranks: bool = False
+    # Streaming: also emit a response on decoding iterations 2..N, so the first
+    # counted text reaches the client one step after the first token instead of
+    # one stream interval later (a reasoning parser holds a leading reasoning
+    # tag back, so the iteration-1 chunk can carry no content). Emission only;
+    # tokens are unchanged. 1 keeps the stock schedule.
+    first_content_emit_iters: int = 1
+    # On SM107, run FlashInfer's CuTe DSL MXFP8 GEMM above 32 rows at the pinned tuned tactics of
+    # custom_ops/mxfp8_cute_pinned_tactics (bitwise the default tactic's output, faster). The GEMM runner does not
+    # know the model, so the executor arms the table process-wide when the model opts in.
+    mxfp8_pinned_tactics: bool = False
+    # After warmup, log every CuTe DSL / Triton compile as a late compile (tensorrt_llm/_torch/late_compile.py).
+    late_compile_detect: bool = False
     # Skip the per-step Philox seed and offset uploads on all-greedy
     # one-model speculative batches (the argmax path never reads them).
     skip_greedy_rng_upload: bool = False
+    # Stage the one-model speculative sampler's per-step Philox seed and offset
+    # uploads into the step-input pack (pack_step_inputs), so they ride its one
+    # upload instead of each being a copy the next graph waits for.
+    pack_spec_rng_uploads: bool = False
+    # The one-model speculative step's small per-step uploads: the accepted-draft
+    # counts join the step-input pack, and the spec sampler keeps its slot ids in
+    # a device buffer it re-uploads only when they change.
+    spec_small_h2d: bool = False
     # Speculative step-input staging folded into the forward (see SpecStepFold).
     spec_step_fold: Optional[SpecStepFold] = None
+    # Copy the one-model speculative sampler's per-slot store to the host on the sampler's D2H side
+    # stream, so those copies overlap the next step's input staging instead of preceding it.
+    sampler_d2h_side_stream: bool = False
+    # Time the iteration log's device step with one timing event per iteration boundary, recorded on a side
+    # stream that waits for the current stream, instead of an end and a start event back to back on the
+    # current stream (the same instant, with no GPU work between them). The reported step times are unchanged.
+    iteration_timing_one_event: bool = False
     # MiniMax-M3 MSA metadata preparation.
     msa: MsaRuntimePolicy = MsaRuntimePolicy()
 
