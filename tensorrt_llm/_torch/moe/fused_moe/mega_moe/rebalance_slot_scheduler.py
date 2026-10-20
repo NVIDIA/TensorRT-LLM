@@ -405,6 +405,9 @@ class RebalanceSlotSchedulerGroup:
         self._check_owner()
         if self._plan_part is not None or self._generation != self._finished_generation:
             raise RuntimeError("Previous rebalance plan has no paired finish")
+        if self._routes_in_flight is not None:
+            # Only a failed submission leaves routes that MAIN never waited for.
+            raise RuntimeError("Routes of an earlier HALO-Q launch were never ordered on MAIN")
         if (
             not isinstance(logical_expert_ids, torch.Tensor)
             or logical_expert_ids.ndim != 2
@@ -420,7 +423,6 @@ class RebalanceSlotSchedulerGroup:
 
         # Both waits capture their event's current record before a later plan
         # can re-record it. No host synchronization or temporary event is needed.
-        self._routes_in_flight = logical_expert_ids
         self._record_event(self._input_ready_handle, self._execution_stream_handle)
         self._wait_event(self._stream_handle, self._input_ready_handle)
         outputs = self.scheduler.outputs
@@ -429,6 +431,7 @@ class RebalanceSlotSchedulerGroup:
             self.lease.prove(self._pending_release[0])
             self._pending_release = None
         route_target = self._route_target + self.auxiliary_sms
+        self._routes_in_flight = logical_expert_ids
         ticket = self.broadcaster.submit_fused(
             outputs,
             logical_expert_ids,
