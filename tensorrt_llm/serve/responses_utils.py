@@ -1243,8 +1243,7 @@ async def _create_input_tokens(
         tokenize=not has_media,
     )
     rendered, (mm_data,
-               mm_embeddings) = await asyncio.gather(render_task,
-                                                     mm_coroutines)
+               mm_embeddings) = await asyncio.gather(render_task, mm_coroutines)
     if not has_media:
         return rendered.token_ids
 
