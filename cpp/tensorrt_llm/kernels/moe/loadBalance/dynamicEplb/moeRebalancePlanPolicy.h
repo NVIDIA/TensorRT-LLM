@@ -202,7 +202,7 @@ __device__ void publish_plan_channel(int* channel, int const* ids, int const* le
 
 /* Small ABI6 plans fit in one warp. Load each record once and compare its
  * register values through shuffles. Two mode bits per helper fit in a register
- * for S<=16. Larger/malformed plans use the unchanged scalar publisher.
+ * for S<=16. Larger or malformed plans use the scalar publisher.
  * Only lane 0 writes mapped words; its SYS release orders every field. */
 template <bool PublishHost = true>
 __device__ void publish_plan_channel_warp(int* channel, int const* ids, int const* levels, int const* owners,

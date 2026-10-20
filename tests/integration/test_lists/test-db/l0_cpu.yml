@@ -48,7 +48,6 @@ l0_cpu:
   - unittest/_torch/kernels/kimi_k3/test_k3_mla_decode_view.py
   - unittest/_torch/kernels/kimi_k3/test_k3_mla_launch.py
   - unittest/_torch/kernels/kimi_k3/test_k3_kda_pool_layout.py
-  - unittest/_torch/moe/test_megamoe_shared_fc12_autotune.py
   - unittest/_torch/compilation/test_auto_multi_stream.py
   - unittest/_torch/compilation/test_phase_selective_forward.py
   - unittest/_torch/compilation/test_remove_copy_pass.py::test_remove_copy_preserves_minimax_producer_outputs
