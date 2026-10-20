@@ -699,6 +699,67 @@ async def test_generate_submits_image_and_reports_expanded_prompt_usage(image_ll
 
 
 @pytest.mark.asyncio
+async def test_duplicate_request_id_is_reserved_while_media_loads(image_llm, monkeypatch):
+    capability_llm, _ = image_llm
+    llm = _ImageLlm(
+        capability_llm.input_processor,
+        capability_llm._hf_model_config,
+    )
+    load_started = asyncio.Event()
+    release_load = asyncio.Event()
+    load_count = 0
+
+    class _ImageIo:
+        @classmethod
+        def create(cls, defaults, runtime):
+            return cls()
+
+        async def async_load_bytes(self, data):
+            nonlocal load_count
+            load_count += 1
+            load_started.set()
+            await release_load.wait()
+            return np.zeros((1, 1, 3), dtype=np.uint8)
+
+    monkeypatch.setattr(request_mapping, "ImageMediaIO", _ImageIo)
+    servicer = OpenEngineInferenceServicer(llm, model="image-model")
+    request = generation_pb2.GenerateRequest(
+        request_id="duplicate-image-request",
+        model="image-model",
+        prompt="<image_1>",
+        media=[
+            generation_pb2.MediaItem(
+                modality=generation_pb2.MODALITY_IMAGE,
+                raw_bytes=b"image",
+            )
+        ],
+    )
+
+    async def collect(context):
+        return [response async for response in servicer.Generate(request, context)]
+
+    first_context = FakeServicerContext()
+    first = asyncio.create_task(collect(first_context))
+    await load_started.wait()
+    duplicate_context = FakeServicerContext()
+    try:
+        with pytest.raises(AbortError):
+            await asyncio.wait_for(collect(duplicate_context), timeout=1)
+        assert duplicate_context.abort_code == grpc.StatusCode.ALREADY_EXISTS
+        assert load_count == 1
+        assert servicer.active_request_count() == 1
+        assert servicer.abort_request_by_id(request.request_id)
+    finally:
+        release_load.set()
+        first_outcome = await asyncio.gather(first, return_exceptions=True)
+
+    assert isinstance(first_outcome[0], AbortError)
+    assert first_context.abort_code == grpc.StatusCode.CANCELLED
+    assert llm.generate_kwargs is None
+    assert servicer.active_request_count() == 0
+
+
+@pytest.mark.asyncio
 async def test_generate_maps_media_errors_to_grpc_statuses(image_llm):
     capability_llm, _ = image_llm
     llm = _ImageLlm(
@@ -740,6 +801,7 @@ async def test_generate_maps_media_errors_to_grpc_statuses(image_llm):
         async for _ in servicer.Generate(file_request, malformed_context):
             pass
     assert malformed_context.abort_code == grpc.StatusCode.INVALID_ARGUMENT
+    assert servicer.active_request_count() == 0
 
 
 @pytest.mark.asyncio

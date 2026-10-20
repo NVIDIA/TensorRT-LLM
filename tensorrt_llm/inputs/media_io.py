@@ -91,14 +91,24 @@ _SUPPORTED_VIDEO_FORMATS = ("pt", "np", "pil")
 # Created lazily on first use inside the async event loop, then reused so that
 # TCP connections are kept alive and not re-established per request.
 _global_aiohttp_session: aiohttp.ClientSession | None = None
+_global_aiohttp_session_loop: asyncio.AbstractEventLoop | None = None
 
 
 async def _get_aiohttp_session() -> aiohttp.ClientSession:
-    """Return the shared aiohttp.ClientSession, creating it on first call."""
-    global _global_aiohttp_session
-    if _global_aiohttp_session is None or _global_aiohttp_session.closed:
+    """Return the aiohttp session owned by the current event loop."""
+    global _global_aiohttp_session, _global_aiohttp_session_loop
+    current_loop = asyncio.get_running_loop()
+    if (
+        _global_aiohttp_session is None
+        or _global_aiohttp_session.closed
+        or _global_aiohttp_session_loop is not current_loop
+    ):
+        previous_session = _global_aiohttp_session
         connector = aiohttp.TCPConnector(resolver=_ValidatingResolver())
         _global_aiohttp_session = aiohttp.ClientSession(connector=connector)
+        _global_aiohttp_session_loop = current_loop
+        if previous_session is not None and not previous_session.closed:
+            await previous_session.close()
     return _global_aiohttp_session
 
 
