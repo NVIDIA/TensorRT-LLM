@@ -67,7 +67,6 @@ worker_config:
       use_low_precision_moe_combine: true
       load_balancer: tests/scripts/perf/disaggregated/deepseek-v4-pro-eplb/moe_load_balancer_gen_ep8_slots384.yaml
     cache_transceiver_config:
-      max_tokens_in_buffer: 8192
       kv_transfer_timeout_ms: 600000
       backend: NIXL
       transceiver_runtime: PYTHON
@@ -98,7 +97,6 @@ worker_config:
       backend: TRTLLM
       load_balancer: tests/scripts/perf/disaggregated/deepseek-v4-pro-eplb/moe_load_balancer_ctx_ep4_384.yaml
     cache_transceiver_config:
-      max_tokens_in_buffer: 8192
       kv_transfer_timeout_ms: 600000
       backend: NIXL
       transceiver_runtime: PYTHON
