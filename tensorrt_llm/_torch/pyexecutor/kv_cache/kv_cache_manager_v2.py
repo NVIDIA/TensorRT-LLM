@@ -12,7 +12,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import hashlib
 import math
 import os
 import sys
@@ -91,7 +90,6 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     SsmLayerConfig,
     SwaScratchReuseConfig,
     TokenIdExt,
-    _cpp_introspection,
     _KVCache,
     exact_div,
     gen_multimodal_cache_key_tokens,
@@ -1045,14 +1043,14 @@ def _update_kv_cache_draft_token_location(
     scheduled_batch: ScheduledRequests,
     attn_metadata: "AttentionMetadata",
     kv_cache_dtype_byte_size: float,
-):
+    include_finished_requests: bool = False,
+) -> None:
     run_kv_cache_relocation = False
     for request in scheduled_batch.generation_requests:
-        if request.state != LlmRequestState.GENERATION_COMPLETE:
-            if (
-                request.py_num_accepted_draft_tokens > 0
-                and len(request.py_num_accepted_draft_tokens_indices) > 0
-            ):
+        if (
+            request.state != LlmRequestState.GENERATION_COMPLETE or include_finished_requests
+        ) and request.py_num_accepted_draft_tokens > 0:
+            if len(request.py_num_accepted_draft_tokens_indices) > 0:
                 run_kv_cache_relocation = True
     if not run_kv_cache_relocation:
         return
@@ -1920,6 +1918,7 @@ class KVCacheManagerV2(BaseResourceManager):
         # Requests whose pages a connector is still reading from, so the
         # release half of `preempt_request` has to wait.
         self._pending_preemption: Dict[int, LlmRequest] = {}
+        self._use_per_layer_page_tables = False
         self._prepare_page_table_tensor(index_mapper_capacity)
         self._sparse_layer_group_ids = tuple(
             sorted(
@@ -4724,16 +4723,8 @@ class KVCacheManagerV2(BaseResourceManager):
                     )
 
     def _reuse_token_source(self, req: LlmRequest) -> Sequence[int]:
-        """Beam-0 tokens for block reuse, in the form the active backend consumes.
-
-        The C++ backend ingests a zero-copy int32 view (get_tokens_view) — no per-token
-        PyLong allocation. The pure-Python backend cannot consume a numpy array, so it gets
-        a plain list (get_tokens), preserving pre-optimization behavior. ``_cpp_introspection``
-        is None exactly when the Python backend is active.
-        """
-        if _cpp_introspection is not None:
-            return req.get_tokens_view(DEFAULT_BEAM_INDEX)
-        return req.get_tokens(DEFAULT_BEAM_INDEX)
+        """Return a zero-copy beam-0 token view for block reuse."""
+        return req.get_tokens_view(DEFAULT_BEAM_INDEX)
 
     def _augment_tokens_for_block_reuse(
         self, tokens: Sequence[int], req: LlmRequest, start: int = 0, end: int | None = None
@@ -5505,8 +5496,8 @@ class KVCacheManagerV2(BaseResourceManager):
             req.paged_kv_block_ids = []
             if prepare_resource:
                 expected_prompt_length = token_num - 1 if is_gen else token_num
-                # Dummy/warmup request. Its reuse scope must be separate from
-                # real requests because a real prefix may already be cached.
+                # Dummy caches skip the prefix lookup and never commit, so they
+                # neither claim nor publish real prefixes (see _create_kv_cache).
                 kv_cache = self._create_kv_cache(
                     req.py_request_id,
                     req.lora_task_id,
@@ -5524,7 +5515,6 @@ class KVCacheManagerV2(BaseResourceManager):
                 if not success:
                     release_resources(req)
                     return None
-                kv_cache.stop_committing()
                 dummy_capacity = token_num + self.num_extra_kv_tokens
                 if is_gen and not materialize_history:
                     kv_cache.enable_swa_scratch_reuse = False
@@ -5543,7 +5533,6 @@ class KVCacheManagerV2(BaseResourceManager):
                         is_dummy=req.is_dummy,
                         expected_prompt_length=expected_prompt_length,
                     )
-                    # Dummy path: use the same isolated reuse scope.
                     if draft_kv_cache is None:
                         release_resources(req)
                         return None
@@ -5551,7 +5540,6 @@ class KVCacheManagerV2(BaseResourceManager):
                     if not success:
                         release_resources(req, free_draft_resources=True)
                         return None
-                    draft_kv_cache.stop_committing()
                     success = draft_kv_cache.resize(dummy_capacity)
                     if not success:
                         release_resources(req, free_draft_resources=True)
@@ -5627,8 +5615,59 @@ class KVCacheManagerV2(BaseResourceManager):
             # TODO: On a disaggregated prefill server, pass is_end=True for
             # the last context chunk to improve performance.
             kv_cache.commit(tokens)
-        if request.context_remaining_length == 0:
+        keep_committing = self._can_commit_generation_blocks(request)
+        if request.context_remaining_length == 0 and not keep_committing:
             kv_cache.stop_committing()
+
+    def _can_commit_generation_blocks(self, request: LlmRequest) -> bool:
+        """Whether decode KV remains a valid reusable logical prefix."""
+        return (
+            self.enable_block_reuse
+            and self.block_reuse_policy == BlockReusePolicy.ALL_REUSABLE
+            and not self.kv_compression_manages_history
+            # The overlap loop can hand page IDs to an async connector save
+            # before this update. Committing can rebase those pages, so keep
+            # connector-managed caches prompt-only until save ordering supports it.
+            and self.kv_connector_manager is None
+            # The KV cache lender assumes only prompt blocks are committed.
+            and self._sharing is None
+            and not self.is_draft
+            # Committed blocks keep only beam 0, but beams diverge in decode.
+            and self.max_beam_width == 1
+            and not request.is_dummy_request
+            and not request.is_context_only_request
+        )
+
+    def try_commit_generation_blocks(self, request: LlmRequest) -> None:
+        """Commit the stable KV prefix produced by generation forwards."""
+        should_commit = (
+            self._can_commit_generation_blocks(request)
+            and request.state != LlmRequestState.CONTEXT_INIT
+        )
+        if not should_commit:
+            return
+
+        kv_cache = self.kv_cache_map.get(request.py_request_id)
+        if kv_cache is None:
+            return
+
+        # The newest sampled token has no KV until the next forward pass.
+        stable_token_count = request.max_beam_num_tokens - 1
+        is_end = request.state == LlmRequestState.GENERATION_COMPLETE
+        start = kv_cache.num_committed_tokens
+        if stable_token_count > start:
+            tokens = self._reuse_token_source(request)
+            if start >= request.prompt_len:
+                # Multimodal items live in the prompt, so generated text needs no digests.
+                tokens = tokens[start:stable_token_count]
+            else:
+                # A generation-only request may still have an uncommitted prompt suffix.
+                tokens = self._augment_tokens_for_block_reuse(
+                    tokens, request, start=start, end=stable_token_count
+                )
+            kv_cache.commit(tokens, is_end=is_end)
+        elif is_end:
+            kv_cache.commit([], is_end=True)
 
     def release_index_slot(self, request_id: int) -> None:
         """Release IndexMapper slot early while keeping KV cache blocks allocated.
@@ -6405,7 +6444,11 @@ class KVCacheManagerV2(BaseResourceManager):
             return
         if not self.is_draft:
             _update_kv_cache_draft_token_location(
-                self, scheduled_batch, attn_metadata, kv_cache_dtype_byte_size
+                self,
+                scheduled_batch,
+                attn_metadata,
+                kv_cache_dtype_byte_size,
+                include_finished_requests=True,
             )
         # Context request KV cache updates are handled by
         # update_context_resources, called separately from the executor loop.
@@ -6470,6 +6513,7 @@ class KVCacheManagerV2(BaseResourceManager):
             if new_capacity is not None and self._sharing is not None:
                 self._after_shrink(req.py_request_id, kv_cache)
             self._allocated_draft_lens.pop(req.py_request_id, None)
+            self.try_commit_generation_blocks(req)
 
     def copy_batch_block_offsets(
         self,
@@ -6525,18 +6569,9 @@ class KVCacheManagerV2(BaseResourceManager):
         )
 
     @staticmethod
-    def _derive_reuse_salt(cache_salt: str | None) -> int | None:
-        """Derive ``ReuseScope.salt`` (int|None) from the ``cache_salt`` string.
-
-        Deterministic so the same string yields the same reuse namespace across
-        processes (matches C++ blockKey hashing on cacheSalt). Shared by cache
-        creation, prefetch, and the cache-aware router probe so they all hit the
-        same radix-tree namespace.
-        """
-        if cache_salt is None:
-            return None
-        digest = hashlib.sha256(cache_salt.encode("utf-8")).digest()
-        return int.from_bytes(digest[:8], "little")
+    def _derive_reuse_salt(cache_salt: str | None) -> str | None:
+        """Return the string namespace shared by creation, prefetch and probes."""
+        return cache_salt
 
     def _create_kv_cache(
         self,
@@ -6562,10 +6597,13 @@ class KVCacheManagerV2(BaseResourceManager):
                 self.index_mapper.size(),
             )
             return None
-        # Synthetic requests use repeated token 1, which can match a real
-        # request's prefix before stop_committing() is called. Salt 0 gives
-        # them a separate reuse scope from ordinary unsalted requests.
-        salt_int = 0 if is_dummy else self._derive_reuse_salt(cache_salt)
+        # Synthetic requests must neither claim real prefixes nor publish reusable blocks.
+        # Skipping the initial lookup avoids reserving any user-visible salt value.
+        if is_dummy:
+            if expected_prompt_length is None and input_tokens is not None:
+                expected_prompt_length = len(input_tokens)
+            input_tokens = None
+        reuse_salt = self._derive_reuse_salt(cache_salt)
         enable_request_stats = enable_request_stats and not is_dummy and not self.is_draft
         priority_kwargs = {}
         if (
@@ -6580,7 +6618,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 expected_prompt_length, self.tokens_per_block, self._swa_endpoint_rewind
             )
         kv_cache = self.impl.create_kv_cache(
-            ReuseScope(lora_id=lora_task_id, salt=salt_int),
+            ReuseScope(lora_id=lora_task_id, salt=reuse_salt),
             input_tokens,
             id=request_id,
             enable_request_stats=enable_request_stats,
@@ -6591,6 +6629,7 @@ class KVCacheManagerV2(BaseResourceManager):
         if enable_request_stats and not self.enable_stats:
             self._request_stats_enabled_ids.add(request_id)
         if is_dummy:
+            kv_cache.stop_committing()
             self.impl.mark_stats_excluded(request_id)
             kv_cache.discard_pending_stats()
         index = self.index_mapper.add_new_sequence(request_id)
@@ -6615,9 +6654,9 @@ class KVCacheManagerV2(BaseResourceManager):
             return 0
         if len(input_tokens) == 0:
             return 0
-        salt_int = self._derive_reuse_salt(cache_salt)
+        reuse_salt = self._derive_reuse_salt(cache_salt)
         return self.impl.probe_reuse(
-            ReuseScope(lora_id=lora_task_id, salt=salt_int),
+            ReuseScope(lora_id=lora_task_id, salt=reuse_salt),
             input_tokens,
         )
 
@@ -6680,9 +6719,10 @@ class KVCacheManagerV2(BaseResourceManager):
             tokens = self._context_reuse_tokens(req)
             # Use the same salt derivation as _create_kv_cache so the transient
             # cache hits the same radix-tree blocks.
-            salt_int = self._derive_reuse_salt(req.cache_salt)
+            reuse_salt = self._derive_reuse_salt(req.cache_salt)
             kv_cache = self.impl.create_kv_cache(
-                ReuseScope(lora_id=req.lora_task_id, salt=salt_int), tokens
+                ReuseScope(lora_id=req.lora_task_id, salt=reuse_salt),
+                tokens,
             )
             try:
                 # Prefetch to the first tier below GPU (host if present,

@@ -207,10 +207,14 @@ def route(
     mapping: Any,
     compute_capability: Tuple[int, int],
     spec_config: Optional[Any],
+    kv_cache_quant_algo: Optional[Any],
     *,
     runtime: RuntimeFacts,
 ) -> type:
     """Return the target class for this deployment, or raise ``NoTarget`` saying why none fits.
+
+    ``kv_cache_quant_algo`` is the resolver's main KV-cache algorithm, passed to every routing module; this router
+    reads the same value, with the sparse attention config, from ``runtime`` (``ROUTES_ON_RUNTIME``).
 
     Each target is imported where it is returned, so declining costs no import
     of modeling code.

@@ -270,7 +270,6 @@ unittest/llmapi/test_llm_pytorch.py::test_gqa_nemo_lora[None] SKIP (https://nvbu
 unittest/llmapi/test_llm_pytorch.py::test_gqa_nemo_lora[cuda_graph_config0] SKIP (https://nvbugs/6162504)
 unittest/llmapi/test_llm_pytorch.py::test_llm_disagg_streaming_gen_cancelled[PYTHON] SKIP (https://nvbugs/6903683)
 unittest/llmapi/test_memory_profiling.py::test_profile_kvcache SKIP (https://nvbugs/5580781)
-unittest/llmapi/test_trtllm_serve_config_schemas.py::test_checked_in_schemas_are_current SKIP (https://nvbugs/6942724)
 unittest/others/test_web_dependency_security.py::test_web_framework_security_floors SKIP (https://nvbugs/6930053)
 verl/test_verl_cases.py::test_async_generate SKIP (https://nvbugs/6683838)
 verl/test_verl_cases.py::test_async_memory_management SKIP (https://nvbugs/6683838)
