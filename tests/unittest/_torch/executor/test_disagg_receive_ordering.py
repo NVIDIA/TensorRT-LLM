@@ -51,6 +51,7 @@ def _manager() -> Mock:
     """Run the real admission and resource hooks with mocked cache allocation."""
     manager = Mock(spec=KVCacheManagerV2)
     manager._sharing = None  # no lender: free_resources closes and removes the cache itself
+    manager.impl = Mock()
     manager._stream = Mock()
     manager._disagg_receive_ready = {}
     manager._pending_preemption = {}
