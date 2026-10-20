@@ -649,12 +649,12 @@ __device__ __forceinline__ int plan_halo_m_register8_impl(
             continue;
         }
 
-        /* owner and owner_next are now warp-uniform, so every lane can read
+        /* owner and owner_next are warp-uniform here, so every lane can read
          * candidates[] and histogram[] directly.  Both are written by
          * prepare_halo_m_sparse8 before its bar.sync and never inside this
-         * loop, so a uniform load returns exactly what the owner would have
-         * broadcast.  The increment stays owner-only and stays ahead of the
-         * mass test, as before. */
+         * loop, so every lane loads the same values and no broadcast from the
+         * owner is needed.  Only the owner advances lane_next, and it does so
+         * before the mass test. */
         int const expert = candidates[owner * plan_helpers + owner_next];
         if (lane == owner)
             ++lane_next;
@@ -692,11 +692,10 @@ __device__ __forceinline__ int plan_halo_m_register8_impl(
         if constexpr (FixedEp == 8 && FixedHelpers == 4)
         {
             int slack = lane != owner ? imax(0, target - lane_load) : 0;
-            /* Two independent full-mask sums instead of one lane-varying-mask
-             * reduce followed by two broadcasts.  Integer addition is exact, so
-             * masking the addend gives the same half sums; the two reduces do
-             * not depend on each other, so the chain is depth 1 instead of 3,
-             * and the redux.sync no longer runs with a per-lane membermask. */
+            /* Two independent full-mask sums give the two half sums.  Integer
+             * addition is exact, so zeroing the other half's addends yields
+             * each half sum exactly; the two reduces do not depend on each
+             * other, and neither redux.sync uses a per-lane membermask. */
             int room0 = __reduce_add_sync(mask, lane < 4 ? slack : 0);
             int room4 = __reduce_add_sync(mask, lane >= 4 ? slack : 0);
             unsigned receive_mask = __ballot_sync(mask, lane_recv < plan_helpers);
@@ -868,7 +867,7 @@ __device__ __forceinline__ int plan_halo_m_register8(
 }
 
 /* Exact HALO-M state machine executed by warp 0.  Each lane owns one rank;
- * warp reductions replace all serial rank/group/destination scans. */
+ * rank/group/destination scans are warp reductions rather than serial loops. */
 __device__ int plan_halo_m_warp(int const* histogram, int* load, int* quota, int const* candidates, int* recv_used,
     int* send_used, int* next_index, int* frozen, int* plan, int ep, int experts, int helpers)
 {
@@ -1233,7 +1232,7 @@ __device__ __forceinline__ void halo_q_direction8(
  *
  * `b`, `hosts` and `expert` are the lane's own broadcast identity and do not
  * change between phases or rounds, so the caller hoists them.  Reading them
- * here put a four-deep dependent load chain (order[lane] -> b -> host_mask[b]
+ * here would put a four-deep dependent load chain (order[lane] -> b -> host_mask[b]
  * and the GLOBAL p_expert[b] -> expert -> counts[...]) at the head of all
  * fourteen phases. */
 __device__ __forceinline__ void halo_q_pair8(
@@ -1281,13 +1280,9 @@ __device__ __forceinline__ void scheduler_tail_barrier()
 
 /* Build order[] and host_mask[] with one lane per broadcast.
  *
- * This replaces serial insertion-sort and mask-construction loops while
- * preserving the same stable order.
- *
- * order[]:  lane b's position is the number of broadcasts that sort before it.
- *           The `j < lane` tiebreak makes this the same stable order the
- *           insertion sort produced (its shift test is a strict `>`), so the
- *           result is bit-identical, not merely equivalent.
+ * order[]:  lane b's position is the number of broadcasts that sort before it,
+ *           ordered by expert.  The `j < lane` tiebreak orders equal experts by
+ *           broadcast index, so the order is stable.
  * host_mask: the destination group is a contiguous rank range, so the mask is
  *           closed form; no loop over group members is needed.
  *           rank_group_mask handles the full EP32 word without a shift by32.
@@ -1354,8 +1349,9 @@ __device__ void run_halo_q(int const* counts, int* quota, int* plan, int broadca
             if (broadcasts >= 2)
             {
                 int const ring_size = plan_ep - 1;
-                /* Use two unconditional repair rounds. Phases with no required repair
-                 * are no-ops, so this preserves the conditional algorithm's result. */
+                /* Run two repair rounds unconditionally. A phase with no required
+                 * repair is a no-op, so the plan equals running only the required
+                 * repairs. */
                 int const repair_rounds = 2;
                 for (int round = 0; round < repair_rounds; ++round)
                 {
@@ -1394,7 +1390,6 @@ __device__ void run_halo_q(int const* counts, int* quota, int* plan, int broadca
                 }
             }
         }
-        /* The unconditional repair rounds above replace the conditional scan. */
         return;
     }
     if (warp == 0)
@@ -1515,12 +1510,12 @@ __device__ void build_route_prefix(int const* counts, int const* quota, int* pre
         int source_count = counts[local_rank * experts + expert];
         int source_diagonal = imin(source_count, quota[b * ep + local_rank]);
         int residual_supply = source_count - source_diagonal;
-        /* The loop used to run to destination == ep.  route_destination only
-         * ever loads prefix[destination + step] under `candidate < ep`, so the
-         * ep entry is never read, and the accumulation at ep-1 fed nothing but
-         * that dead entry.  Both are gone; entry 0 is still written because it
-         * costs one store and leaving it stale would depend on nobody ever
-         * reading it, which is a weaker guarantee than writing the right value. */
+        /* route_destination loads prefix[destination + step] only under
+         * `candidate < ep`, so entry ep is never read: the loop stops before
+         * destination == ep and skips the accumulation after the last
+         * destination, which would only feed that entry.  Entry 0 is written
+         * although route_destination never reads it: it costs one store and
+         * leaves no stale entry below ep. */
         int destination_before = 0;
         for (int destination = 0; destination < ep; ++destination)
         {
@@ -1591,8 +1586,8 @@ __device__ bool wait_for_plan_epoch(int* marker, Epoch epoch, unsigned long long
     return *ready != 0;
 }
 
-/* Prefix entries are monotonic.  Binary lifting returns the same number of
- * thresholds <= ordinal as the old linear scan, including repeated entries. */
+/* Prefix entries are monotonic, so binary lifting returns the number of
+ * thresholds <= ordinal, counting repeated entries. */
 __device__ __forceinline__ int route_destination(int const* prefix, int ordinal, int ep)
 {
     int destination = 0;

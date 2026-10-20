@@ -1228,7 +1228,7 @@ def _expand_megamoe_ready_tactics(
     choices = _token_back_ready_granularity_choices(load_balance=load_balance)
     if sm_version == 107 and choices != ("expert",):
         # At every token bucket include a legal local-TMA/atomic-counter
-        # base; the historical candidates otherwise exclude token_tile.
+        # base; the curated SM107 candidates otherwise exclude token_tile.
         for cluster, fallback, policy, mode, flag, epi in (
             ([2, 1, 1], None, ("grouped", 512), "reuse_dispatch_warps", 4, (1, 1)),
             ([2, 1, 1], None, ("grouped", 512), "reuse_dispatch_warps", 4, (2, 4)),
@@ -3004,7 +3004,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
         # ``hot_expert_weight_ready_flags`` is the local uint64[EP] terminal
         # view published by the weight transport, ``..._generation`` the
         # expected generation g in [1, 2**63). All three default to the
-        # unchanged S == 0 baseline.
+        # S == 0 kernel without helper slots.
         helper_expert_count: int = 0,
         hot_expert_weight_ready_flags: Optional[torch.Tensor] = None,
         hot_expert_weight_ready_generation: int = 0,
@@ -3207,7 +3207,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
         # ``hot_expert_weight_ready_flags`` is the local uint64[EP] terminal
         # view published by the weight transport, ``..._generation`` the
         # expected generation g in [1, 2**63). All three default to the
-        # unchanged S == 0 baseline.
+        # S == 0 kernel without helper slots.
         helper_expert_count: int = 0,
         hot_expert_weight_ready_flags: Optional[torch.Tensor] = None,
         hot_expert_weight_ready_generation: int = 0,

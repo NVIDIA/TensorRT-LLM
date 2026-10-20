@@ -2173,8 +2173,8 @@ def test_megamoe_compute_slots_do_not_widen_resident_expert_axis():
     assert moe.compute_slot_count == 11
     assert moe.expert_size_per_partition == 8
 
-    # Catch the old representation (expert_size_per_partition == H + S)
-    # instead of silently adding S a second time.
+    # A resident axis that already counts the helper slots
+    # (expert_size_per_partition == H + S) must raise instead of adding S again.
     moe.expert_size_per_partition = 11
     with pytest.raises(RuntimeError, match="resident expert geometry changed"):
         _ = moe.compute_slot_count
