@@ -401,7 +401,10 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
                                                     mm_item_order)
         if metadata is not None:
             for modality in ("image", "video"):
-                if isinstance(multimodal_data.get(modality), dict):
+                modality_data = multimodal_data.get(modality)
+                grid_key = "image_grid_thw" if modality == "image" else "video_grid_thw"
+                if isinstance(modality_data,
+                              dict) and modality_data.get(grid_key) is not None:
                     metadata.input_partitions[
                         modality] = _qwen_vision_input_partitions(
                             multimodal_data, modality, metadata)
@@ -2188,11 +2191,8 @@ def _qwen_vision_item_partitions(
     metadata = param.item_metadata
     if metadata is not None and modality in metadata.input_partitions:
         return metadata.input_partitions[modality]
-    grid_key = "image_grid_thw" if modality == "image" else "video_grid_thw"
-    grids = param.multimodal_data[modality][grid_key]
-    return _qwen_vision_input_partitions(
-        param.multimodal_data, modality,
-        metadata if grids.device.type != "cpu" else None)
+    return _qwen_vision_input_partitions(param.multimodal_data, modality,
+                                         metadata)
 
 
 def _qwen_vision_input_partitions(

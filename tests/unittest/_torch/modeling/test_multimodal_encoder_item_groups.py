@@ -82,6 +82,47 @@ def test_qwen_common_metadata_preserves_positive_output_requirement():
         processor.get_mm_item_metadata([12, 10, 13], data)
 
 
+@pytest.mark.parametrize("modality", ["image", "video"])
+def test_qwen_precomputed_embeddings_skip_payloads_without_grids(modality: str) -> None:
+    from tensorrt_llm._torch.models.modeling_qwen2vl import Qwen2VLInputProcessorBase
+
+    processor = object.__new__(Qwen2VLInputProcessorBase)
+    metadata = MultimodalItemMetadata([(modality, 0)], output_embedding_lengths=[3])
+    data = {
+        modality: {},
+        "multimodal_embedding": torch.zeros(3, HIDDEN),
+        MULTIMODAL_ENCODER_ITEM_METADATA_KEY: metadata,
+    }
+
+    result = processor.get_mm_item_metadata([], data)
+
+    assert result.item_refs == metadata.item_refs
+    assert result.output_embedding_lengths == (3,)
+    assert result.input_partitions == {}
+
+
+def test_qwen_partition_uses_metadata_costs_without_reading_grid_values(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tensorrt_llm._torch.models.modeling_qwen2vl import _qwen_vision_item_partitions
+
+    metadata = MultimodalItemMetadata([("image", 1), ("image", 0)], [32, 16], [8, 4])
+    params = MultimodalParams(
+        multimodal_data={
+            "image": {"image_grid_thw": torch.tensor([[1, 4, 4], [2, 4, 4]])},
+            MULTIMODAL_ENCODER_ITEM_METADATA_KEY: metadata,
+        }
+    )
+
+    def unexpected_grid_read(tensor: torch.Tensor) -> list:
+        raise AssertionError("Known encoder costs must not be recomputed from grid values")
+
+    monkeypatch.setattr(torch.Tensor, "tolist", unexpected_grid_read)
+    partitions = _qwen_vision_item_partitions(params, "image")
+
+    assert partitions["pixel_values"].item_lengths == (16, 32)
+
+
 @pytest.mark.parametrize("model", ["qwen2", "qwen2_5", "qwen3", "mistral"])
 @pytest.mark.parametrize("custom", [False, True])
 def test_processors_use_the_common_metadata_hook(model, custom):
@@ -144,7 +185,11 @@ def test_gemma_processor_describes_image_and_audio_without_encoder_costs():
 
     processor = object.__new__(Gemma4InputProcessor)
     data = {
-        "image": {"pixel_values": torch.zeros(1, 4, 6), "image_position_ids": torch.zeros(1, 4, 2)},
+        "image": {
+            "pixel_values": torch.zeros(1, 4, 6),
+            "image_position_ids": torch.zeros(1, 4, 2),
+            "image_seq_lens": [4],
+        },
         "audio": {"audio_features": torch.zeros(1, 5, 8), "audio_features_mask": torch.ones(1, 5)},
         MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
             [("audio", 0), ("image", 0)], output_embedding_lengths=[2, 4]
@@ -157,6 +202,32 @@ def test_gemma_processor_describes_image_and_audio_without_encoder_costs():
     assert metadata.encoder_token_lengths is None
     assert metadata.input_partitions["audio"]["audio_features_mask"].item_axis == 0
     assert metadata.input_partitions["image"]["image_position_ids"].item_axis == 0
+
+
+@pytest.mark.parametrize(
+    "modality,field,value",
+    [
+        ("image", "image_position_ids", torch.zeros(2, 4, 2)),
+        ("image", "image_seq_lens", [4, 4]),
+        ("audio", "audio_features_mask", torch.ones(2, 5)),
+    ],
+)
+def test_gemma_processor_rejects_misaligned_sibling_items(
+    modality: str, field: str, value: torch.Tensor | list[int]
+) -> None:
+    from tensorrt_llm._torch.models.modeling_gemma4mm import Gemma4InputProcessor
+
+    processor = object.__new__(Gemma4InputProcessor)
+    primary = "pixel_values" if modality == "image" else "audio_features"
+    data = {
+        modality: {primary: torch.zeros(1, 4, 6), field: value},
+        MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+            [(modality, 0)], output_embedding_lengths=[4]
+        ),
+    }
+
+    with pytest.raises(ValueError, match=rf"{modality}\.{field} must have 1 items"):
+        processor.get_mm_item_metadata([], data)
 
 
 def test_nemotron_audio_keeps_clip_groups_and_video_audio_relationship():
@@ -200,6 +271,31 @@ def test_nemotron_audio_keeps_clip_groups_and_video_audio_relationship():
     assert video_metadata.item_refs == (("video", 0),)
     assert "audio" not in video_metadata.input_partitions
     assert video_data["video"]["audio"] is audio
+
+
+@pytest.mark.parametrize("full_prompt_ids", [False, True])
+def test_nemotron_audio_skips_incomplete_or_prompt_coupled_partitions(
+    full_prompt_ids: bool,
+) -> None:
+    from tensorrt_llm._torch.models.modeling_nemotron_h_multimodal import (
+        NemotronHMultimodalInputProcessor,
+    )
+
+    processor = object.__new__(NemotronHMultimodalInputProcessor)
+    audio = {"input_audio_features": torch.zeros(1, 5, 2)}
+    if full_prompt_ids:
+        audio.update(audio_num_clips=torch.tensor([1]), evs_ids=torch.tensor([1, 2, 3]))
+    data = {
+        "audio": audio,
+        MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+            [("audio", 0)], output_embedding_lengths=[2]
+        ),
+    }
+
+    metadata = processor.get_mm_item_metadata([], data)
+
+    assert metadata.item_refs == (("audio", 0),)
+    assert "audio" not in metadata.input_partitions
 
 
 def _grid_for_rows(rows: int) -> list[int]:
@@ -251,6 +347,22 @@ class _GroupedEncoderModel(MultimodalModelMixin):
 
     def encode_multimodal_inputs(self, multimodal_params) -> torch.Tensor:
         return encode_multimodal_by_groups(self.mm_encoder_groups, list(multimodal_params))
+
+
+@pytest.mark.parametrize("empty_record", [False, True])
+def test_grouped_encoder_rejects_raw_payload_without_item_layout(empty_record: bool) -> None:
+    model = _GroupedEncoderModel()
+    data = {"image": {"pixel_values": torch.ones(2, HIDDEN)}}
+    if empty_record:
+        data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = MultimodalItemMetadata(
+            [], output_embedding_lengths=[]
+        )
+    params = MultimodalParams(multimodal_data=data)
+
+    with pytest.raises(MultimodalEncoderContractError, match="metadata.*grouped encoding"):
+        model.encode_multimodal_inputs([params])
+
+    assert model.encoder_calls == []
 
 
 def test_common_metadata_shares_executor_and_encoder_layout():

@@ -210,6 +210,17 @@ def test_mm_item_metadata_rejects_mismatched_embedding_lengths():
         input_processor({"prompt": "unused"}, sampling_params=None)
 
 
+def test_removed_encoder_metadata_hook_fails_before_processing() -> None:
+    class OldMetadataProcessor(_ItemMetadataFakeProcessor):
+        def get_mm_encoder_item_metadata(
+            self, prompt_token_ids: list[int], multimodal_data: dict
+        ) -> None:
+            raise AssertionError("The removed hook must not be called")
+
+    with pytest.raises(TypeError, match=r"implement get_mm_item_metadata\(\)"):
+        create_input_processor_with_hash(OldMetadataProcessor([2]))
+
+
 def test_mm_item_metadata_none_falls_back_to_non_item_path():
     # Generic item order does not imply that physical encoder costs or
     # item scheduling are supported.

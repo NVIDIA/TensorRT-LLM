@@ -13,11 +13,9 @@ from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.bindings import executor as tllm_executor
 from tensorrt_llm.executor.result import SimpleTokenLogprobs, TokenLogprobs
-from tensorrt_llm.inputs.multimodal import \
-    MultimodalEncoderProgress as MultimodalEncoderProgress
-from tensorrt_llm.inputs.multimodal import \
-    MultimodalEncoderRequestState as MultimodalEncoderRequestState
-from tensorrt_llm.inputs.multimodal import (MultimodalParams,
+from tensorrt_llm.inputs.multimodal import (MultimodalEncoderProgress,
+                                            MultimodalEncoderRequestState,
+                                            MultimodalParams,
                                             get_multimodal_item_metadata)
 from tensorrt_llm.sampling_params import LogprobMode
 
@@ -1139,6 +1137,11 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
 
     @property
     def py_multimodal_data(self) -> dict[str, Any] | None:
+        """Request-owned processed payload, e.g. ``{"image": {"pixel_values": tensor}}``.
+
+        The same dict stores the common item record under
+        ``MULTIMODAL_ENCODER_ITEM_METADATA_KEY`` and model-specific auxiliary data.
+        """
         params = self.py_multimodal_params
         return params.multimodal_data if params is not None else None
 
@@ -1153,6 +1156,11 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
 
     @property
     def py_mm_encoder_state(self) -> MultimodalEncoderRequestState | None:
+        """Item-encoding progress and cache references owned by the request Params.
+
+        Set at encoder admission and cleared by request cleanup. Inline encoding
+        and requests with precomputed embeddings leave it unset.
+        """
         params = self.py_multimodal_params
         return params.encoder_state if params is not None else None
 
@@ -1167,6 +1175,11 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
 
     @property
     def py_mm_encoder_event(self) -> torch.cuda.Event | None:
+        """Completion event for encoder work queued on the prefetch CUDA stream.
+
+        Consumers wait before reading the staged payload or embeddings; the
+        executor clears the event after that work is consumed or cleaned up.
+        """
         params = self.py_multimodal_params
         return params.encoder_event if params is not None else None
 

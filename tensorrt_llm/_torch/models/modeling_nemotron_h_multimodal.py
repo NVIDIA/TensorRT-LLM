@@ -1169,10 +1169,15 @@ class NemotronHMultimodalInputProcessor(
     ) -> Optional[MultimodalItemMetadata]:
         metadata = super().get_mm_item_metadata(prompt_token_ids, multimodal_data, mm_item_order)
         audio = multimodal_data.get("audio")
+        # EVS merge also carries full prompt IDs for image/audio requests.
+        # Selecting individual items would require rebuilding that prompt stream.
         if metadata is not None and isinstance(audio, dict) and audio.get("evs_ids") is None:
             # One audio item can contain several clips. Video's embedded audio
             # stays in its video bucket and retains the model's AV interleave.
-            clips = tuple(audio["audio_num_clips"].tolist())
+            clip_counts = audio.get("audio_num_clips")
+            if clip_counts is None:
+                return metadata
+            clips = tuple(clip_counts.cpu().tolist())
             item_count = sum(m == "audio" for m, _ in metadata.item_refs)
             if len(clips) == item_count:
                 packed = MultimodalItemPartition(item_lengths=clips)

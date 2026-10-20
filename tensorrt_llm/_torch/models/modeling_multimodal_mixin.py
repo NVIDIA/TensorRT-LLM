@@ -135,6 +135,18 @@ def _lengths_by_modality(
     Layouts describe whole requests, so only modalities in this encoder
     group contribute lengths (for example, image/video in a vision group
     while the same request's audio is handled by another group).
+
+    Encoders batch in payload order, which can differ from prompt order.
+    Modality-local indices restart for each request. For example::
+
+        item_layouts = [
+            ([("image", 1), ("video", 0), ("image", 0)], [20, 30, 10]),
+            ([("audio", 0), ("image", 0)], [40, 50]),
+        ]
+        modalities = ("image", "video")
+        # Result: {"image": [10, 20, 50], "video": [30]}
+
+    These lengths split encoder outputs before restoring prompt order.
     """
     by_modality: Dict[str, List[int]] = {m: [] for m in modalities}
     for item_refs, lengths in item_layouts:
@@ -252,6 +264,10 @@ def encode_multimodal_by_groups(
         group_layouts = []
         for mp, layout in zip(multimodal_params, item_layouts, strict=True):
             if any(mp.multimodal_data.get(m) is not None for m in group.modalities):
+                if not layout[0]:
+                    raise MultimodalEncoderContractError(
+                        "MM item metadata with output lengths is required for grouped encoding"
+                    )
                 group_params.append(mp)
                 group_layouts.append(layout)
         if not group_params:
@@ -844,11 +860,13 @@ class MultimodalModelMixin:
     def build_multimodal_encoder_input(
         self,
         param: MultimodalParams,
-        item_indices: Sequence[int],
+        local_item_indices: Sequence[int],
         modality: Optional[str] = None,
     ) -> MultimodalParams:
         """Build a forward view containing selected modality-local items.
 
+        ``local_item_indices`` indexes this modality's payload, not positions
+        in the request's prompt-ordered item metadata.
         Declared field layouts drive common tensor/list selection. Models with
         custom preprocessing can still override this hook. The caller slices
         the parallel item metadata after this returns, preserving original
@@ -869,9 +887,11 @@ class MultimodalModelMixin:
             )
         item_partitions = self.get_multimodal_item_partitions(param, modality)
         if item_partitions is None:
-            sliced = self._select_legacy_multimodal_fields(modality_data, modality, item_indices)
+            sliced = self._select_legacy_multimodal_fields(
+                modality_data, modality, local_item_indices
+            )
         else:
-            sliced = select_multimodal_fields(modality_data, item_partitions, item_indices)
+            sliced = select_multimodal_fields(modality_data, item_partitions, local_item_indices)
 
         # Metadata slicing must not rewrite the original request's hashes.
         residual_input = (
@@ -1219,7 +1239,13 @@ class MultimodalModelMixin:
             return None
 
         item_metadata = param.item_metadata
-        if item_metadata is None or item_metadata.output_embedding_lengths is None:
+        if item_metadata is None:
+            logger.debug(f"{_MM_ENCODER_CACHE_LOG_NAME}: skipping params without item metadata.")
+            return None
+        if item_metadata.output_embedding_lengths is None:
+            logger.debug(
+                f"{_MM_ENCODER_CACHE_LOG_NAME}: skipping params without item output lengths."
+            )
             return None
         item_modalities = {modality for modality, _ in item_metadata.item_refs}
         if any(
@@ -1347,7 +1373,7 @@ class MultimodalModelMixin:
     def _apply_metadata_slice(
         residual: MultimodalParams,
         source: MultimodalParams,
-        item_indices: Sequence[int],
+        prompt_item_indices: Sequence[int],
         *,
         item_metadata: Optional[MultimodalItemMetadata] = None,
     ) -> None:
@@ -1355,16 +1381,20 @@ class MultimodalModelMixin:
 
         Models slice raw modality tensors in `build_multimodal_encoder_input`; the mixin owns
         the parallel per-item metadata slice so every model gets it identically.
+        ``prompt_item_indices`` indexes the source metadata's ``item_refs``
+        across all modalities, rather than a modality's payload.
         """
         metadata = item_metadata if item_metadata is not None else source.item_metadata
         if metadata is None:
             raise MultimodalEncoderContractError("Item selection requires multimodal item metadata")
         residual.multimodal_data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = metadata.select(
-            item_indices
+            prompt_item_indices
         )
         if residual.multimodal_input is not None and source.multimodal_input is not None:
             source_hashes = source.multimodal_input.multimodal_hashes
-            residual.multimodal_input.multimodal_hashes = [source_hashes[i] for i in item_indices]
+            residual.multimodal_input.multimodal_hashes = [
+                source_hashes[i] for i in prompt_item_indices
+            ]
 
     def _encode_with_partial_cache(
         self,
