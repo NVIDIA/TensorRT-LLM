@@ -697,15 +697,36 @@ def row_linear_residual_norm_fusion_forward(
 
     MPI.COMM_WORLD.barrier()
 
-    if compile:
-        # The model loader publishes these before the model is built; the MNNVL
-        # workspace is sized from them so it never grows inside a trace.
-        from tensorrt_llm._torch.custom_ops.torch_custom_ops import \
-            AllReduceRunner
-        AllReduceRunner._prealloc_max_num_tokens = max(x.shape[0]
-                                                       for x in x_list)
-        AllReduceRunner._prealloc_hidden_size = hidden_size
+    # The model loader publishes these before the model is built; the MNNVL
+    # workspace is sized from them so it never grows inside a trace. They are
+    # class attributes shared by every test in this MPI worker, so the prior
+    # values are restored below.
+    from tensorrt_llm._torch.custom_ops.torch_custom_ops import AllReduceRunner
+    saved_prealloc = (AllReduceRunner._prealloc_max_num_tokens,
+                      AllReduceRunner._prealloc_hidden_size)
+    try:
+        if compile:
+            AllReduceRunner._prealloc_max_num_tokens = max(x.shape[0]
+                                                           for x in x_list)
+            AllReduceRunner._prealloc_hidden_size = hidden_size
+        _run_row_linear_residual_norm_fusion_body(
+            x_list, residual_list, reference_output_list, hidden_size,
+            tensor_parallel_size, tensor_parallel_rank, dtype, strategy, fusion,
+            compile, norm_weight, eps)
+    finally:
+        (AllReduceRunner._prealloc_max_num_tokens,
+         AllReduceRunner._prealloc_hidden_size) = saved_prealloc
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
 
+
+def _run_row_linear_residual_norm_fusion_body(x_list, residual_list,
+                                              reference_output_list,
+                                              hidden_size, tensor_parallel_size,
+                                              tensor_parallel_rank, dtype,
+                                              strategy, fusion, compile,
+                                              norm_weight, eps):
+    """Construct the all-reduce, optionally compile it, and check every sequence length."""
     # Create a single AllReduce instance to be reused for all sequence lengths
     allreduce = AllReduce(
         mapping=Mapping(
@@ -746,29 +767,25 @@ def row_linear_residual_norm_fusion_forward(
         torch._dynamo.reset()
         func = torch.compile(func, fullgraph=True, backend="aot_eager")
 
-    try:
-        # Process each sequence length using the same AllReduce instance
-        for i, (x, residual, reference_output) in enumerate(
-                zip(x_list, residual_list, reference_output_list)):
-            output = func(x.clone(), residual.clone(), norm_weight, eps, fusion)
+    # Process each sequence length using the same AllReduce instance
+    for x, residual, reference_output in zip(x_list, residual_list,
+                                             reference_output_list):
+        output = func(x.clone(), residual.clone(), norm_weight, eps, fusion)
 
+        torch.testing.assert_close(
+            output[0],
+            reference_output[0],
+            rtol=0.05,
+            atol=0.15,
+        )
+
+        if fusion:
             torch.testing.assert_close(
-                output[0],
-                reference_output[0],
+                output[1],
+                reference_output[1],
                 rtol=0.05,
                 atol=0.15,
             )
-
-            if fusion:
-                torch.testing.assert_close(
-                    output[1],
-                    reference_output[1],
-                    rtol=0.05,
-                    atol=0.15,
-                )
-    finally:
-        torch.cuda.synchronize()
-        torch.cuda.empty_cache()
 
 
 def _run_row_linear_residual_norm_fusion(seq_len,

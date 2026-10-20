@@ -367,11 +367,21 @@ def test_workspace_growth_refuses_to_trace(monkeypatch: pytest.MonkeyPatch) -> N
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "max_num_tokens,hidden_size",
+    [
+        # Larger than the default initial buffer, below the limit: sized exactly.
+        (4096, 8192),
+        # Two-shot at exactly 2**32 bytes, past the uint32 limit: capped.
+        (65536, 16384),
+    ],
+)
 def test_mnnvl_allreduce_sizes_workspace_from_prealloc_config(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, max_num_tokens: int, hidden_size: int
 ) -> None:
     """With the model-level prealloc attributes published, construction sizes the workspace for
-    the largest all-reduce instead of the default, so no later shape can trigger growth."""
+    the largest all-reduce instead of the default, so no later shape can trigger growth, and never
+    beyond the largest workspace ``forward`` accepts."""
     from tensorrt_llm._torch.custom_ops.torch_custom_ops import AllReduceRunner
 
     mapping = Mapping(world_size=1, tp_size=1, rank=0)
@@ -380,11 +390,15 @@ def test_mnnvl_allreduce_sizes_workspace_from_prealloc_config(
     monkeypatch.setattr(
         ops_module.MnnvlMemory, "supports_mnnvl", staticmethod(lambda: True), raising=False
     )
-    monkeypatch.setattr(AllReduceRunner, "_prealloc_max_num_tokens", 4096)
-    monkeypatch.setattr(AllReduceRunner, "_prealloc_hidden_size", 8192)
+    monkeypatch.setattr(AllReduceRunner, "_prealloc_max_num_tokens", max_num_tokens)
+    monkeypatch.setattr(AllReduceRunner, "_prealloc_hidden_size", hidden_size)
 
     MNNVLAllReduce(mapping, torch.bfloat16)
 
-    expected = MNNVLAllReduce.get_required_workspace_size(4096, 8192, 1, torch.bfloat16)
-    assert expected > 1024 * 8192 * 2  # larger than the default initial buffer
+    required = MNNVLAllReduce.get_required_workspace_size(
+        max_num_tokens, hidden_size, 1, torch.bfloat16
+    )
+    assert required > 1024 * 8192 * 2  # larger than the default initial buffer
+    expected = min(required, ops_module._MNNVL_MAX_WORKSPACE_BYTES)
     assert MNNVLAllReduce.allreduce_mnnvl_workspaces[mapping]["buffer_size_bytes"] == expected
+    assert expected % (8 * 1024 * 1024) == 0 or expected == required

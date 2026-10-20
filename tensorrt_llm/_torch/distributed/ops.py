@@ -47,6 +47,10 @@ _NCCL_SYMMETRIC_ZERO_COPY: bool = (os.environ.get(
     "TLLM_NCCL_SYMMETRIC_ZERO_COPY", "1") == "1")
 
 _MNNVL_ONE_SHOT_THRESHOLD_BYTES = 64 * 1024 * 8 * 2
+# Largest MNNVL workspace per Lamport buffer: sizes are carried in uint32
+# fields, and the workspace grows in 8 MiB steps, so the limit is the largest
+# 8 MiB multiple below 2**32 - 1.
+_MNNVL_MAX_WORKSPACE_BYTES = 2**32 - 8 * 1024 * 1024
 
 _thread_local = threading.local()
 
@@ -861,8 +865,12 @@ class MNNVLAllReduce(nn.Module):
         hidden_size = AllReduceRunner._prealloc_hidden_size
         buffer_size_bytes = None
         if max_num_tokens and hidden_size:
-            buffer_size_bytes = MNNVLAllReduce.get_required_workspace_size(
-                max_num_tokens, hidden_size, mapping.tp_size, dtype)
+            # Capped at the largest workspace forward accepts: shapes beyond it
+            # are rejected there, so a bigger buffer could never be used.
+            buffer_size_bytes = min(
+                MNNVLAllReduce.get_required_workspace_size(
+                    max_num_tokens, hidden_size, mapping.tp_size, dtype),
+                _MNNVL_MAX_WORKSPACE_BYTES)
         get_or_scale_allreduce_mnnvl_workspace(self.mapping, self.dtype,
                                                buffer_size_bytes)
 
@@ -1003,13 +1011,13 @@ class MNNVLAllReduce(nn.Module):
         workspace_size_bytes = self.get_required_workspace_size(
             num_tokens, hidden_dim, self.mapping.tp_size, self.dtype)
 
-        # We use uint32_t to store workspace size related info. Safeguard against overflow.
-        if workspace_size_bytes >= 2**32 - 1:
-            # Raise an error so we can fallback to other allreduce strategies
+        # Workspace sizes are carried in uint32 fields and the workspace grows
+        # in 8 MiB steps; reject shapes whose aligned workspace would overflow.
+        if workspace_size_bytes > _MNNVL_MAX_WORKSPACE_BYTES:
             raise ValueError(
-                f"[MNNVL AllReduce] Required workspace {workspace_size_bytes} bytes exceeds uint32 limits "
-                f"for shard ({num_tokens}, {hidden_dim}), TP {self.mapping.tp_size}."
-            )
+                f"[MNNVL AllReduce] Required workspace {workspace_size_bytes} bytes exceeds the "
+                f"{_MNNVL_MAX_WORKSPACE_BYTES}-byte limit for shard ({num_tokens}, {hidden_dim}), "
+                f"TP {self.mapping.tp_size}.")
 
         workspace = get_or_scale_allreduce_mnnvl_workspace(
             self.mapping,
