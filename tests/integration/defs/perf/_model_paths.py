@@ -71,6 +71,8 @@ MODEL_PATH_DICT = {
     "qwen3.8_max_fp4_mtp": "Inferact-Qwen3.8-2.4T-A95B-NVFP4",
     "qwen3.8_flash_next_fp8_mtp": "Qwen3.8-Flash-Next-FP8",
     "qwen3.8_flash_next_fp4_mtp": "Inferact-Qwen3.8-Flash-Next-NVFP4",
+    # The NVFP4 checkpoint the CI accuracy gates load.
+    "qwen3.8_flash_next_fp4": "Qwen3.8-Flash-Next-NVFP4",
     # DeepSeek V4
     "deepseek_v4_pro_fp4": "DeepSeek-V4-Pro",
     "deepseek_v4_pro_base_fp8": "DeepSeek-V4-Pro-Base",
