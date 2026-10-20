@@ -110,7 +110,17 @@ def __getattr__(name):
     entry = _LAZY_ATTRS.get(name)
     if entry is not None:
         module_name, attr = entry
-        module = importlib.import_module(module_name)
+        try:
+            module = importlib.import_module(module_name)
+        except AttributeError as e:
+            # An AttributeError escaping the module is a bug inside it, not a
+            # missing name here. Raised as is, hasattr() and getattr() with a
+            # default would hide it, and ``from ... import`` would run the
+            # module twice (losing the cause unless the name is a submodule).
+            raise ImportError(
+                f"cannot import {name!r} from {__name__!r}: importing "
+                f"{module_name} raised {e!r}",
+                name=__name__) from e
         value = module if attr is None else getattr(module, attr)
         globals()[name] = value  # cache: subsequent access skips __getattr__
         return value
@@ -126,6 +136,12 @@ def __getattr__(name):
             raise
         raise AttributeError(
             f"module {__name__!r} has no attribute {name!r}") from None
+    except AttributeError as e:
+        # Same as above: a bug inside the submodule, not a missing name.
+        raise ImportError(
+            f"cannot import {name!r} from {__name__!r}: importing "
+            f"{__name__}.{name} raised {e!r}",
+            name=__name__) from e
 
 
 def __dir__():
