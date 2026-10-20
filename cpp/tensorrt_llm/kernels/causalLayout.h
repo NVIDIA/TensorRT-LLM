@@ -27,22 +27,31 @@ TRTLLM_NAMESPACE_BEGIN
 namespace kernels::causalLayout
 {
 
-//! The per-causal-block tensors of one block size for a causal K/V cache, computed on the device
-//! from the cache's page table. The cache holds logical tokens ``[0, past)``: ``fixedTokens`` fixed
-//! ones, then history; a forward stages ``numBlocks * blockSize`` tokens at ``past``. Block ``i``
-//! starts at ``past + i * blockSize`` and attends to the fixed tokens, the ``windowTokens`` before it,
-//! the earlier blocks and itself. Its row lists every page it attends to in full, then its private
-//! pages: copies of the tokens it attends to on its partial pages (at most three: where the fixed
-//! tokens end, where the window starts, where the block starts), then its own tokens. The copies of
-//! committed tokens (committed_private) are made at commit; the copies of earlier blocks' tokens of
-//! the same forward (current_private) are written by every forward.
+//! Compute per-block attention layouts on the GPU from the cache's page table,
+//! for one causal-block size.
 //!
-//! A view page is a layer-0 page index as the table stores it; a slot id is
-//! ``viewPage * tokensPerPage + slot``; a pool row is ``viewPage * rowsPerPage + slot``.
+//! Cached tokens occupy logical positions [0, past): first fixedTokens pinned
+//! tokens, then history. The forward writes numBlocks * blockSize new tokens
+//! starting at past.
+//!
+//! Block i starts at past + i * blockSize. It sees the pinned tokens, up to
+//! windowTokens preceding tokens (including earlier blocks), and its own tokens.
+//! Its page-table row contains:
+//!   1. Resident pages that are fully visible.
+//!   2. Private pages containing visible fragments of partial pages, followed
+//!      by the block's own tokens.
+//!
+//! There are at most three partial pages: where the pinned prefix ends,
+//! where the window starts, and where the block starts.
+//!
+//! Indices use these units:
+//!   viewPage: a layer-0 page index stored in the page table.
+//!   slot id:  viewPage * tokensPerPage + slot.
+//!   pool row: viewPage * rowsPerPage + slot.
 struct CausalLayoutParams
 {
-    int32_t const* table;   //!< [numPages] view page of each logical page
-    int32_t const* privatePages; //!< [numBlocks, numPrivatePages] private view pages of each block
+    int32_t const* table;        //!< [numPages] maps logical pages to viewPage indices.
+    int32_t const* privatePages; //!< [numBlocks, numPrivatePages] private viewPage indices per block.
     int64_t numPages;
     int64_t numPrivatePages;
     int64_t numBlocks;
@@ -52,22 +61,24 @@ struct CausalLayoutParams
     int64_t past;
     int64_t fixedTokens;
     int64_t windowTokens;
-    //! Pages dropped by the rotation this commit (0 if none). The page the fixed tokens' tail
-    //! shares with the history then has a new view page; its old one, now at logical page
-    //! ``numPages - dropPages``, still holds the fixed tail and is the source for it.
+    //! Number of pages rotated out of history by this commit; 0 if none. If the pinned prefix
+    //! ends mid-page, that page also holds history. Rotation replaces it at the prefix/history
+    //! boundary. The original page, now at `numPages - dropPages`, still holds the pinned tail
+    //! and acts as the source of its tokens.
     int64_t dropPages;
     int64_t kvFactor; //!< block-offset encoding: ``viewPage * kvFactor`` is the K plane
     int64_t kvOffset; //!< and ``+ kvOffset`` the V plane
     int64_t rowsPerPage;
 
-    int32_t* rows;         //!< [numBlocks, rowLen] view pages, 0-padded
+    int32_t* rows;         //!< [numBlocks, rowLen] page-table rows; unused entries are 0.
     int64_t rowLen;
     int32_t* blockOffsets; //!< [numBlocks, 2, rowLen]
-    int32_t* seqLenKv;     //!< [numBlocks] keys in the row: full pages, segment slots, the block
+    int32_t* seqLenKv;     //!< [numBlocks] key token count: `full-page + partial-page + block's own`
     int64_t* ownSlots;     //!< [numBlocks * blockSize] slot ids of each block's own tokens
-    //! current_private: this forward's tokens of earlier blocks on a block's partial pages, which every
-    //! forward writes into the block's private pages. ``2 * (tokensPerPage - 1)`` entries per block,
-    //! (staged token index, slot id), padded with the block's own first token.
+    //! current_private: copy indices for earlier blocks' tokens from this forward that belong in a
+    //! block's private partial-page copies. Written every forward. Each block has
+    //! ``2 * (tokensPerPage - 1)`` entries: currentPrivateSrc holds staged-token indices;
+    //! currentPrivateDst holds slot ids. Unused entries repeat the block's first own token.
     int64_t* currentPrivateSrc;
     int64_t* currentPrivateDst;
     //! committed_private: committed tokens on a block's partial pages, copied into the block's private
