@@ -2330,19 +2330,21 @@ class KvCacheCreator:
             draft_layout: tuple[int, int, object, bool]) -> bool:
         """Whether the transceiver can move draft layers with the target's.
 
-        Heads are resharded in bytes: a view's bytes per head are its own
-        per-layer bytes over the rank's KV-head count, so dtype and head_dim
-        may differ. The KV-head count and K-only flag come from the rank's
-        single AttentionInfo and must match. NVFP4 adds block-scale views, so
-        an NVFP4 side is only paired with an identical layout.
+        Every view of a rank's page table carries its own KV-head count and byte
+        geometry, so the draft's head count (and hence its sharding or
+        replication across TP), head_dim and dtype may differ from the target's.
+        The K-only flag decides the buffer count per layer and must match. NVFP4
+        adds block-scale views whose heads are not resharded, so an NVFP4 side
+        is only paired with an identical dtype and head count.
         """
         target_heads, _, target_dtype, target_k_only = target_layout
         draft_heads, _, draft_dtype, draft_k_only = draft_layout
-        if (target_heads, target_k_only) != (draft_heads, draft_k_only):
+        if target_k_only != draft_k_only:
             return False
         nvfp4 = tensorrt_llm.bindings.DataType.NVFP4
-        return target_dtype == draft_dtype or nvfp4 not in (target_dtype,
-                                                            draft_dtype)
+        if nvfp4 in (target_dtype, draft_dtype):
+            return target_dtype == draft_dtype and target_heads == draft_heads
+        return True
 
     def _dflash_kv_layout(
             self, model_config: ModelConfig,

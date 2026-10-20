@@ -2514,11 +2514,6 @@ def _shared_draft_kv_blocker(server_configs) -> Optional[str]:
     if with_spec != {"ctx", "gen"}:
         return ("speculative_config in both context_servers and "
                 "generation_servers")
-    if len({(cfg.other_args.get("tensor_parallel_size", 1),
-             bool(cfg.other_args.get("enable_attention_dp", False)))
-            for cfg in server_configs}) != 1:
-        return ("the same tensor_parallel_size and enable_attention_dp in "
-                "context_servers and generation_servers")
     for cfg in server_configs:
         spec = cfg.other_args["speculative_config"]
         backend = spec.get("attention_backend")

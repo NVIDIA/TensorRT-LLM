@@ -177,10 +177,13 @@ cache (`kv_cache_config.dtype: fp8`) is paired with a BF16 draft cache.
 
 In disaggregated serving, the context server's draft pages are transferred to
 the generation server with the target pages, so the drafter starts generation
-with the prompt context instead of an empty one. This requires the draft layers
-to have the target's rank-local KV-head count; the draft dtype and head
-dimension may differ, except that an NVFP4 target KV cache requires an
-identical draft layout. Both servers must use the same layout.
+with the prompt context instead of an empty one. The target and draft layers
+are resharded by their own KV-head counts, so the draft's KV-head count, head
+dimension and dtype may differ from the target's, and the context and
+generation servers may use different tensor-parallel sizes or attention DP
+settings. An NVFP4 target KV cache requires a draft with an identical dtype
+and KV-head count. The target's and draft's K-only (MLA) or K/V cache kind must
+match, and both servers must run the same target and drafter.
 
 The drafter keeps a separate draft KV cache manager instead when any of the
 following applies: context parallelism larger than 1, a per-layer KV-head count
