@@ -91,6 +91,7 @@ def test_recompute_pause_defers_reset_until_pp_consensus() -> None:
 
     executor._on_disagg_pp_termination(request)
 
+    executor.sampler.release_request.assert_called_once_with(request)
     assert events == ["free", "reset"]
     assert request.py_request_id not in executor._pending_recompute_pause_ids
     assert request.py_request_id not in executor.inflight_req_ids
