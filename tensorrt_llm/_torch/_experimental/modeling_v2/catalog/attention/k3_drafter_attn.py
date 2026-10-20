@@ -5,7 +5,7 @@ block's own K / V."""
 
 import torch
 
-import tensorrt_llm._torch.cute_dsl_kernels.k3_drafter.op  # noqa: F401 — registers torch.ops.trtllm.k3_drafter_attn
+import tensorrt_llm._torch.kernels.k3_drafter.op  # noqa: F401 — registers torch.ops.trtllm.k3_drafter_attn
 
 
 def k3_drafter_attn(

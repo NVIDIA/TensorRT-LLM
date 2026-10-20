@@ -5,10 +5,10 @@
 
 import torch
 
-from tensorrt_llm._torch.cute_dsl_kernels.k3_kda_attn import (  # noqa: F401 — registers the ops
+from tensorrt_llm._torch.kernels.k3_kda_attn import (  # noqa: F401 — registers the ops
     op as _k3_kda_attn_op,
 )
-from tensorrt_llm._torch.cute_dsl_kernels.k3_kda_verify import (  # noqa: F401 — k3_kda_attn's helpers
+from tensorrt_llm._torch.kernels.k3_kda_verify import (  # noqa: F401 — k3_kda_attn's helpers
     op as _k3_kda_verify_op,
 )
 

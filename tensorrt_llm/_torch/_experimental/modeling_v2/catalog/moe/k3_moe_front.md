@@ -93,7 +93,7 @@ compiles once (*Metadata consumed*).
 
 ## State
 
-**Object.** `K3MoeHeadWorkspace` (`cute_dsl_kernels/k3_fused_moe/op.py`, re-exported by `catalog/moe/k3_moe_front.py`
+**Object.** `K3MoeHeadWorkspace` (`kernels/k3_fused_moe/op.py`, re-exported by `catalog/moe/k3_moe_front.py`
 and `catalog/moe/k3_moe.py`), one per TP group, owned by the caller.
 
 **Contents and size.** One multicast allocation of `workspace_words(W)` int32 words per rank, 157,696 words (616 KiB)
@@ -210,7 +210,7 @@ Besides `workspace` (an explicit argument):
   384 shared columns (6 tiles) the half-tile path runs at `W` 16 only: 280 head rows per rank make 5 half-tiles, 11
   GEMV clusters of the 13 left. At `W` 8 (560 rows, 9 half-tiles) and `W` 4 (1120 rows, 18) they do not fit, and the
   head runs as 5 and 9 tiles of 128 rows. The CPU test
-  `tests/unittest/_torch/cute_dsl_kernels/kimi_k3/test_k3_moe_front_geometry.py` checks this choice and that
+  `tests/unittest/_torch/kernels/kimi_k3/test_k3_moe_front_geometry.py` checks this choice and that
   `front_weight`'s rows are the rows each plan reads. So this entry's 4-rank matrix runs 128-row tiles only; at 16
   ranks (a recorded run on four GB200 trays of one rack) the matrix runs the half-tile path and passes, every check
   on every rank, as does the kernel test `test_k3_moe_front.py` run as 16 processes.
@@ -247,7 +247,7 @@ Besides `workspace` (an explicit argument):
   rank's head slice from one seed, so each holds the whole reference. The routed experts behind the front are random
   checkpoint-format MXFP4 (224 per rank, rank `r` at global ids `[224 (r % 4), 224 (r % 4) + 224)`), the reference
   for `y` the stock TRTLLM-Gen runner. The kernel test
-  (`tests/unittest/_torch/cute_dsl_kernels/kimi_k3/test_k3_moe_front.py`) covers Gaussian payloads and races the
+  (`tests/unittest/_torch/kernels/kimi_k3/test_k3_moe_front.py`) covers Gaussian payloads and races the
   publishing front's epoch read against `k3_moe`'s epoch advance (`check_publish_order`); neither is repeated here.
 - `mutates_args` names every buffer the op writes (`ag_uc`, `ag_mc`, `ag_flags`, `ag_ready`). Gaps (the op is
   unchanged by this entry): the compile cache is a module-level dict (result-neutral, documented above); the slots'

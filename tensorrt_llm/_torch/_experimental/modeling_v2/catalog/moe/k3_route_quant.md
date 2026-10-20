@@ -100,7 +100,7 @@ Stateless: no state object, nothing kept from one call to the next. Process stat
 - Certified path: one GB200 GPU (sm_100), test
   `tests/unittest/_torch/modeling_v2/moe/test_modeling_v2_k3_route_quant.py`. Reference: the stock
   `trtllm::kimi_k3_noaux_tc_mxfp8_quant`, bit for bit. The kernel test
-  (`tests/unittest/_torch/cute_dsl_kernels/kimi_k3/test_k3_route_quant.py`) also compares with the unfused chain
+  (`tests/unittest/_torch/kernels/kimi_k3/test_k3_route_quant.py`) also compares with the unfused chain
   (`trtllm::noaux_tc_op`, then `trtllm::mxfp8_quantize`) and reports a stable PyTorch sort of sigmoid + bias.
 - Users: `moe/k3_moe` consumes the four outputs directly; `moe/k3_moe_front` runs this op's device code on the
   gathered head (and so returns the same bits for the same logits and latent).

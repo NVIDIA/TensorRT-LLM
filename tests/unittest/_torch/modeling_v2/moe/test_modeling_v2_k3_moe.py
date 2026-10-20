@@ -16,7 +16,7 @@ largest magnitude per element, 4 ulp relative RMS. Everything about state is com
 The checks run in file order and share the state objects: a K3MoeState with layers A, B, C (A and C over this rank's
 experts, B over other experts), a second K3MoeState, a K3MoeWideState with layers A and B. Each check makes its own
 first (compiling) call eagerly where it needs one, so it also runs alone (-k). The kernel tests under
-tests/unittest/_torch/cute_dsl_kernels/kimi_k3/ remain the exhaustive numerics; this file copies what it needs.
+tests/unittest/_torch/kernels/kimi_k3/ remain the exhaustive numerics; this file copies what it needs.
 
 The head_flags build needs the TP group's head workspace and the MoE front: its cells run in moe/k3_moe_front's
 4-rank matrix, tests/unittest/_torch/modeling_v2/comm/_k3_moe_front_op_matrix.py.
@@ -304,7 +304,7 @@ def _snapshot(state, layers):
 def _cold_k3_moe_cache():
     """trtllm::k3_moe's compile cache emptied for the duration (and restored after): the next call of every build is
     a first call."""
-    from tensorrt_llm._torch.cute_dsl_kernels.k3_fused_moe import op
+    from tensorrt_llm._torch.kernels.k3_fused_moe import op
 
     saved = dict(op._compiled)
     op._compiled.clear()

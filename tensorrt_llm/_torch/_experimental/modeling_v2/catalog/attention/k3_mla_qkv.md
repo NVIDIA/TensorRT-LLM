@@ -94,7 +94,7 @@ Certified at `R` up to 8 and `T` 1 and 8 (no speculation; a DSpark verify step),
 pool: `KVCacheManager.get_buffers(layer)` of a `SELFKONLY` manager (one latent head of 576, `kv_factor` 1, 64 tokens
 per block), owned and sized by the manager. The addressing (`pool`, `row_stride`, `page_table`, `page_offset`,
 `seq_len`) is the attention metadata's view of one generation step: `k3_mla_decode_view(attn, metadata, M)`
-(`cute_dsl_kernels/k3_mla/decode_view.py`), computed per layer after `metadata.prepare()`.
+(`kernels/k3_mla/decode_view.py`), computed per layer after `metadata.prepare()`.
 
 **What a call writes.** One 576-column row per token, at that token's position in its request (positions below 0
 skipped); nothing else (certified, above). The manager keeps every layer in one pool, interleaved by block: a layer's
@@ -148,7 +148,7 @@ the target takes its generic path.
 
 ## Notes
 
-- The op-level test is `tests/unittest/_torch/cute_dsl_kernels/kimi_k3/test_k3_mla_q.py`: `fused_q` at `M` 1 to 64
+- The op-level test is `tests/unittest/_torch/kernels/kimi_k3/test_k3_mla_q.py`: `fused_q` at `M` 1 to 64
   against the reference and the unfused chain (the model's RMSNorm, the q_b GEMM, the k_b bmm), the cache rows of R
   x T steps in a sentinel-filled pool, an interleaved pool of rows of 640, the short-length case, refusals, and (with
   `K3_BASE_TRTLLM`) batch-1 identity against the unmodified single-request kernel.

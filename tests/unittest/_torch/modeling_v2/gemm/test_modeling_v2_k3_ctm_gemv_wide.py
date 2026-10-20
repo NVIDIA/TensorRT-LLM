@@ -111,8 +111,8 @@ def test_projection_cells() -> None:
 
 def test_rows_match_long_at_the_same_split() -> None:
     """A token's row is k3_ctm_gemv_long's for it (calls of up to 8 tokens) where the splits agree."""
-    from tensorrt_llm._torch.cute_dsl_kernels.k3_ctm_gemv import op as ctm_op
-    from tensorrt_llm._torch.cute_dsl_kernels.k3_ctm_gemv.k3_ctm_gemv_kernel import wide_tile
+    from tensorrt_llm._torch.kernels.k3_ctm_gemv import op as ctm_op
+    from tensorrt_llm._torch.kernels.k3_ctm_gemv.k3_ctm_gemv_kernel import wide_tile
 
     sms = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
     compared = 0

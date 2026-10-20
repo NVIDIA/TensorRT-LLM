@@ -9,7 +9,7 @@ from typing import Optional, Tuple
 import torch
 
 # Importing the op module registers trtllm::k3_sandwich_*; the state type is the one the ops' buffers come from.
-from tensorrt_llm._torch.cute_dsl_kernels.k3_sandwich.op import K3SandwichWorkspace
+from tensorrt_llm._torch.kernels.k3_sandwich.op import K3SandwichWorkspace
 
 __all__ = ["K3SandwichWorkspace", "k3_sandwich_tail"]
 

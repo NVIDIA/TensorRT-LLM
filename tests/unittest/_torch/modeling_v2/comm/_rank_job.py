@@ -59,6 +59,7 @@ def adopt_srun_env() -> int:
     os.environ.setdefault("TLLM_DISABLE_MPI", "1")
     return int(os.environ["SLURM_LOCALID"])
 
+
 def _devices(world_size: int) -> str:
     visible = os.environ.get("CUDA_VISIBLE_DEVICES")
     if visible:

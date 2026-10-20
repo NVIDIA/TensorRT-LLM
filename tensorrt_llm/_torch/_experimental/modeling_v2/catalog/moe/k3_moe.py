@@ -10,11 +10,11 @@ from typing import Optional
 
 import torch
 
-from tensorrt_llm._torch.cute_dsl_kernels.k3_fused_moe.latent_op import K3LatentExchange
+from tensorrt_llm._torch.kernels.k3_fused_moe.latent_op import K3LatentExchange
 
 # The state types (they launch nothing per call); importing the op module registers trtllm::k3_moe. is_supported reads
 # metadata only.
-from tensorrt_llm._torch.cute_dsl_kernels.k3_fused_moe.op import (
+from tensorrt_llm._torch.kernels.k3_fused_moe.op import (
     K3MoeHeadWorkspace,
     K3MoeLayer,
     K3MoeState,

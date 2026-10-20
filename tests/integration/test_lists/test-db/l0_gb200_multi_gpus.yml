@@ -75,15 +75,15 @@ l0_gb200_multi_gpus:
   - unittest/_torch/multi_gpu/test_mnnvl_allreduce.py::test_mnnvl_checkpoint_rejects_wrong_group_membership
   - unittest/_torch/multi_gpu/test_mnnvl_allreduce.py::test_mnnvl_workspace_growth_keeps_captured_graphs
   - unittest/_torch/modeling_v2/comm/test_modeling_v2_mnnvl_allreduce_attn_res_op_matrix.py
-  - unittest/_torch/cute_dsl_kernels/kimi_k3/test_k3_mnnvl_comm.py
+  - unittest/_torch/kernels/kimi_k3/test_k3_mnnvl_comm.py
   # Kimi K3 collective kernels (sm_100) and the catalog entries over caller-owned state, 4 ranks
-  - unittest/_torch/cute_dsl_kernels/kimi_k3/test_k3_sandwich.py
-  - unittest/_torch/cute_dsl_kernels/kimi_k3/test_k3_moe_front.py
-  - unittest/_torch/cute_dsl_kernels/kimi_k3/test_k3_latent_reduce.py
-  - unittest/_torch/cute_dsl_kernels/kimi_k3/test_k3_moe_push.py
+  - unittest/_torch/kernels/kimi_k3/test_k3_sandwich.py
+  - unittest/_torch/kernels/kimi_k3/test_k3_moe_front.py
+  - unittest/_torch/kernels/kimi_k3/test_k3_latent_reduce.py
+  - unittest/_torch/kernels/kimi_k3/test_k3_moe_push.py
   # Kimi K3 DSpark decode kernels' cross-rank exchanges (sm_100): the sharded acceptance and the Markov chain, 4 ranks
-  - unittest/_torch/cute_dsl_kernels/kimi_k3/test_k3_spec_accept_sharded.py
-  - unittest/_torch/cute_dsl_kernels/kimi_k3/test_k3_markov.py
+  - unittest/_torch/kernels/kimi_k3/test_k3_spec_accept_sharded.py
+  - unittest/_torch/kernels/kimi_k3/test_k3_markov.py
   - unittest/_torch/modeling_v2/comm/test_modeling_v2_k3_sandwich_oproj_op_matrix.py
   - unittest/_torch/modeling_v2/comm/test_modeling_v2_k3_sandwich_tail_op_matrix.py
   - unittest/_torch/modeling_v2/comm/test_modeling_v2_k3_sandwich_plain_op_matrix.py

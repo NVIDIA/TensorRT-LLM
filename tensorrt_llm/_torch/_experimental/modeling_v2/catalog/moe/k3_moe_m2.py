@@ -8,7 +8,7 @@ from typing import Optional
 
 import torch
 
-from tensorrt_llm._torch.cute_dsl_kernels.k3_fused_moe.op import K3MoeM2Layer, K3MoeM2State
+from tensorrt_llm._torch.kernels.k3_fused_moe.op import K3MoeM2Layer, K3MoeM2State
 
 __all__ = ["K3MoeM2Layer", "K3MoeM2State", "k3_moe_m2", "k3_moe_m2_push"]
 

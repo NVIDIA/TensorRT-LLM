@@ -31,7 +31,7 @@ class K3MlaAttnWorkspace:
         """Allocate and arm a workspace for ``groups`` head groups on ``device``: the counters zeroed, the partial
         slots left as allocated (a call reads only the words it wrote). Eager: it allocates, so it refuses to run
         under CUDA-graph capture; it returns once the arming is complete, so the workspace is ready on any stream."""
-        from tensorrt_llm._torch.cute_dsl_kernels.k3_mla import op
+        from tensorrt_llm._torch.kernels.k3_mla import op
 
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError("K3MlaAttnWorkspace.create allocates: call it before capture")

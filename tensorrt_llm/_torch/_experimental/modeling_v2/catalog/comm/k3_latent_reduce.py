@@ -7,7 +7,7 @@ order."""
 import torch
 
 # Importing the op module registers trtllm::k3_latent_reduce; the state type is the one its buffers come from.
-from tensorrt_llm._torch.cute_dsl_kernels.k3_fused_moe.latent_op import K3LatentExchange
+from tensorrt_llm._torch.kernels.k3_fused_moe.latent_op import K3LatentExchange
 
 __all__ = ["K3LatentExchange", "k3_latent_reduce"]
 

@@ -60,10 +60,10 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.k3_head_gemv imp
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.k3_embed_norm import k3_embed_norm
 
 # The kernels' support predicates: metadata reads only.
-from tensorrt_llm._torch.cute_dsl_kernels.k3_ctm_gemv import op as _ctm_op
-from tensorrt_llm._torch.cute_dsl_kernels.k3_decode_gemv import op as _decode_op
-from tensorrt_llm._torch.cute_dsl_kernels.k3_embed import op as _embed_op
-from tensorrt_llm._torch.cute_dsl_kernels.k3_head_gemv import op as _head_op
+from tensorrt_llm._torch.kernels.k3_ctm_gemv import op as _ctm_op
+from tensorrt_llm._torch.kernels.k3_decode_gemv import op as _decode_op
+from tensorrt_llm._torch.kernels.k3_embed import op as _embed_op
+from tensorrt_llm._torch.kernels.k3_head_gemv import op as _head_op
 from tensorrt_llm._torch.flashinfer_utils import IS_FLASHINFER_AVAILABLE
 from tensorrt_llm._utils import mpi_disabled
 
@@ -133,7 +133,7 @@ def _width(spec: Site) -> int:
 
 
 def _wide_tile(rows: int) -> int:
-    from tensorrt_llm._torch.cute_dsl_kernels.k3_ctm_gemv import k3_ctm_gemv_kernel
+    from tensorrt_llm._torch.kernels.k3_ctm_gemv import k3_ctm_gemv_kernel
 
     return k3_ctm_gemv_kernel.wide_tile(rows)
 

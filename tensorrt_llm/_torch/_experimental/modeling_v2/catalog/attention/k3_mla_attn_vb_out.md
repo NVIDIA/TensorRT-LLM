@@ -180,7 +180,7 @@ pool's token stride, `softmax_scale` from the attention module's `qk_nope_head_d
 
 ## Notes
 
-- The op-level test is `tests/unittest/_torch/cute_dsl_kernels/kimi_k3/test_k3_mla_attn.py`: every split of up to 8
+- The op-level test is `tests/unittest/_torch/kernels/kimi_k3/test_k3_mla_attn.py`: every split of up to 8
   tokens and the R x 8 verify steps against the float64 reference and the stock CuTe DSL MLA decode
   (`trtllm::cute_dsl_mla_decode_fp16_blackwell`), the TP4 head count, interleaved pools of rows of 640, the
   workspace poison and counter-wrap checks above, refusals, and (with `K3_BASE_TRTLLM`) batch-1 identity against

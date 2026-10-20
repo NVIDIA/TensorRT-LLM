@@ -5,7 +5,7 @@ the kernel, then k3_drafter_attn."""
 
 import torch
 
-import tensorrt_llm._torch.cute_dsl_kernels.k3_drafter.op  # noqa: F401 — registers torch.ops.trtllm.k3_drafter_attn_qknorm
+import tensorrt_llm._torch.kernels.k3_drafter.op  # noqa: F401 — registers torch.ops.trtllm.k3_drafter_attn_qknorm
 
 
 def k3_drafter_attn_qknorm(

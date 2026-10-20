@@ -5,7 +5,7 @@ by the weight's shape)."""
 
 import torch
 
-import tensorrt_llm._torch.cute_dsl_kernels.k3_decode_gemv.op  # noqa: F401 — registers the op
+import tensorrt_llm._torch.kernels.k3_decode_gemv.op  # noqa: F401 — registers the op
 
 
 def k3_decode_gemv(

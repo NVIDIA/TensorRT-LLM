@@ -74,7 +74,7 @@ drafter whose all-reduce is the IPC one — another compiled kernel, not certifi
 ## State
 
 **Object.** `K3SandwichWorkspace`, the object `comm/k3_sandwich_oproj` and `comm/k3_sandwich_tail` take, defined in
-`tensorrt_llm/_torch/cute_dsl_kernels/k3_sandwich/op.py` and re-exported by this entry's wrapper too; one per TP
+`tensorrt_llm/_torch/kernels/k3_sandwich/op.py` and re-exported by this entry's wrapper too; one per TP
 group, owned by the caller.
 
 **Contents and size.** As in `k3_sandwich_oproj.md`: two alternating halves of `[8 tokens][W ranks][7168]` bf16 per
@@ -172,7 +172,7 @@ forms are two kernels, each compiled (seconds) on its first call, which must be 
   magnitude (the one-shot rounds the squares to bf16 and sums them in its own tree). SiLU-and-mul's rounding on
   general inputs is the kernel test's to certify (bit for bit against `k3_ctm_gemv_swiglu`), not this matrix's.
 - World sizes: as for `k3_sandwich_oproj`; at 16 ranks this entry's matrix passes in a recorded run. The op's kernel
-  test (`tests/unittest/_torch/cute_dsl_kernels/kimi_k3/test_k3_sandwich.py`) passed every case at 16 ranks on four
+  test (`tests/unittest/_torch/kernels/kimi_k3/test_k3_sandwich.py`) passed every case at 16 ranks on four
   trays in a recorded run: the kernel's record, not this entry's receipt.
 - State: `mutates_args` names `ws_uc`, `ws_mc` and `ws_flags`, every buffer the op writes. The compile cache is the
   documented process-wide cache above.

@@ -481,7 +481,7 @@ def _chain_heads(seq) -> set:
 def armed_and_sized(ws) -> None:
     """``create`` returned this rank's view of a buffer sized for the group (two halves of [8 tokens][W ranks][7168]
     bf16 as int32 words), every word empty, every counter zero."""
-    from tensorrt_llm._torch.cute_dsl_kernels.k3_sandwich import k3_sandwich_kernel as kernel
+    from tensorrt_llm._torch.kernels.k3_sandwich import k3_sandwich_kernel as kernel
 
     assert ws.world_size == R.world and ws.rank == R.rank
     assert ws.uc.dtype == ws.mc.dtype == ws.flags.dtype == torch.int32

@@ -108,7 +108,7 @@ memory those outputs may occupy (a stream synchronization before the call, or `T
 ## State
 
 **Object.** `K3SandwichWorkspace`, the object `comm/k3_sandwich_oproj` takes, defined in
-`tensorrt_llm/_torch/cute_dsl_kernels/k3_sandwich/op.py` and re-exported by this entry's wrapper too; one per TP
+`tensorrt_llm/_torch/kernels/k3_sandwich/op.py` and re-exported by this entry's wrapper too; one per TP
 group, owned by the caller.
 
 **Contents and size.** As in `k3_sandwich_oproj.md`: two alternating halves of `[8 tokens][W ranks][7168]` bf16 per
@@ -213,7 +213,7 @@ outside CUDA-graph capture first". `updated_out` is not part of the key. The cac
   across the ranks. The negative control's wrong pairing puts more than half the elements outside the 8e-3 bound,
   the largest error over 10 times it.
 - World sizes: as for `k3_sandwich_oproj`; at 16 ranks this entry's matrix passes in a recorded run. The op's kernel
-  test (`tests/unittest/_torch/cute_dsl_kernels/kimi_k3/test_k3_sandwich.py`) passed every case at 16 ranks on four
+  test (`tests/unittest/_torch/kernels/kimi_k3/test_k3_sandwich.py`) passed every case at 16 ranks on four
   trays in a recorded run: the kernel's record, not this entry's receipt.
 - State: `mutates_args` names every buffer the op can write: `ws_uc`, `ws_mc`, `ws_flags`, `x_slab`, `lat_uc`,
   `lat_flags`, `tap` and `updated_out`. The compile cache is the documented process-wide cache above.

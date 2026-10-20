@@ -126,7 +126,7 @@ layout at intermediate 768: `[224, 1536, 1792]`, `[224, 1536, 112]`, `[224, 3584
 
 ## State
 
-**Objects.** Per rank and per device, owned by the caller (`cute_dsl_kernels/k3_fused_moe/op.py`, re-exported by
+**Objects.** Per rank and per device, owned by the caller (`kernels/k3_fused_moe/op.py`, re-exported by
 `catalog/moe/k3_moe.py`): a build's scratch, `K3MoeState` (`m_max` 8) or `K3MoeWideState` (`m_max` 64), and one
 `K3MoeLayer` per MoE layer from `state.layer(...)`. A head_flags `K3MoeState`'s calls also read and write the TP
 group's `K3MoeHeadWorkspace` (collective; its *State* is in `moe/k3_moe_front`).
@@ -281,11 +281,11 @@ Besides the state objects (explicit arguments):
   `moe/k3_route_quant`. The head_flags build and the front as producer: 4 ranks of one GB200 tray in
   `tests/unittest/_torch/modeling_v2/comm/_k3_moe_front_op_matrix.py` (entry point
   `moe/test_modeling_v2_k3_moe_front_op_matrix.py`), which also passes at 16 ranks in a recorded run.
-- The push form: 4 ranks of one GB200 tray in `tests/unittest/_torch/cute_dsl_kernels/kimi_k3/test_k3_moe_push.py`
+- The push form: 4 ranks of one GB200 tray in `tests/unittest/_torch/kernels/kimi_k3/test_k3_moe_push.py`
   (`k3_moe_push`: `K3MoeLayer.push` into a 4-slot exchange, this entry's `k3_moe_push` into a 16-slot one). At 16
   ranks (four GB200 trays of one rack, one exchange slot per rank) it passes in a recorded run.
 - References: an fp64 reference over the dequantized experts (from the checkpoint-format tensors) and the stock path.
-  The kernel tests (`tests/unittest/_torch/cute_dsl_kernels/kimi_k3/test_k3_fused_moe.py`, `test_k3_moe_wide.py`)
+  The kernel tests (`tests/unittest/_torch/kernels/kimi_k3/test_k3_fused_moe.py`, `test_k3_moe_wide.py`)
   remain the exhaustive numerics; this entry's test copies their references.
 - Gaps (the op is unchanged by this entry): a layer does not record `local_expert_offset`; nothing ties a state to a
   stream or checks the inputs' device; the head_flags pairing with the front is the caller's (the entry checks only

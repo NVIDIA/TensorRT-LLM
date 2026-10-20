@@ -94,7 +94,7 @@ of the cells are listed under *State* and *Preconditions*.
 
 ## State
 
-**Object.** `K3HeadGemvWorkspace` (`tensorrt_llm/_torch/cute_dsl_kernels/k3_head_gemv/op.py`, re-exported by this
+**Object.** `K3HeadGemvWorkspace` (`tensorrt_llm/_torch/kernels/k3_head_gemv/op.py`, re-exported by this
 entry's wrapper module), owned by the caller: a frozen dataclass of the weight shape (`n_out`, `k_in`), `schedule`,
 `chunk_tiles` (0 for stream-K) and three tensors.
 

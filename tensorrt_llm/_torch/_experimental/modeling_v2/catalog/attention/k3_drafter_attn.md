@@ -6,7 +6,7 @@ receipts:
 # k3_drafter_attn
 
 **Wraps** `torch.ops.trtllm.k3_drafter_attn` (one call), a CuTe DSL kernel
-(`tensorrt_llm/_torch/cute_dsl_kernels/k3_drafter/`).
+(`tensorrt_llm/_torch/kernels/k3_drafter/`).
 
 ## Semantics
 
@@ -77,6 +77,6 @@ them rewritten in place (certified: 4 replays with new lengths, rotated page-tab
 
 - Certified on GB200 (sm_100) against an fp64 torch reference that gathers the pages, within 1e-2 of the largest
   output magnitude (the kernel rounds the probabilities and the output to bf16). Reruns are bit-identical.
-- The op's own test (`tests/unittest/_torch/cute_dsl_kernels/kimi_k3/test_k3_drafter_attn.py`) also compares every
+- The op's own test (`tests/unittest/_torch/kernels/kimi_k3/test_k3_drafter_attn.py`) also compares every
   split against the DFlash TRTLLM path it replaces (`append_paged_kv_cache` + the trtllm-gen context kernel,
   non-causal) and checks request isolation.

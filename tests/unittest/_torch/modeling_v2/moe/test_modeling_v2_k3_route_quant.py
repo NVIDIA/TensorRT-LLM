@@ -105,7 +105,7 @@ def _edge_case(case: str):
 @contextlib.contextmanager
 def _cold_compile_cache():
     """The op's compile cache emptied for the duration (and restored after), so that the next call is a first call."""
-    from tensorrt_llm._torch.cute_dsl_kernels.k3_route_quant import op
+    from tensorrt_llm._torch.kernels.k3_route_quant import op
 
     saved = dict(op._compiled)
     op._compiled.clear()

@@ -30,7 +30,7 @@ import torch
 from ..._device_copy import DeviceCopyBuffer
 from ..._utils import prefer_pinned
 from ...sampling_params import SamplingParams
-from ..cute_dsl_kernels.spec_step_copies import op as spec_step_copies
+from ..kernels.spec_step_copies import op as spec_step_copies
 from ..pyexecutor.llm_request import LlmRequest, LlmRequestState, get_draft_token_length
 from ..pyexecutor.resource_manager import BaseResourceManager
 from ..pyexecutor.sampler import (

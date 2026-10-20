@@ -75,7 +75,7 @@ call, or `TRTLLM_ENABLE_PDL=0`).
 ## State
 
 **Object.** `K3SandwichWorkspace`, defined beside the buffer layout it allocates
-(`tensorrt_llm/_torch/cute_dsl_kernels/k3_sandwich/op.py`) and re-exported by this entry's wrapper; one per TP
+(`tensorrt_llm/_torch/kernels/k3_sandwich/op.py`) and re-exported by this entry's wrapper; one per TP
 group, owned by the caller.
 
 **Contents and size.** The all-reduce buffer: two alternating halves of `[8 tokens][W ranks][7168]` bf16 per rank,
@@ -190,7 +190,7 @@ it changes scheduling, not results.
   kernel sums ranks in chunks of 8, so a run at `W` <= 8 exercises one chunk; Kimi K3 runs `W` = 16 over four trays.
   At 16 ranks (four GB200 trays of one rack, fabric handles) this entry's matrix passes, every check on every rank, in
   a recorded run; CI runs it at 4. The op's kernel test
-  (`tests/unittest/_torch/cute_dsl_kernels/kimi_k3/test_k3_sandwich.py`; this op bit for bit against `o_proj` and the
+  (`tests/unittest/_torch/kernels/kimi_k3/test_k3_sandwich.py`; this op bit for bit against `o_proj` and the
   MNNVL one-shot) passed every case at 16 ranks on four trays in a recorded run: the kernel's record, not this entry's
   receipt.
 - State: `mutates_args` names `ws_uc`, `ws_mc` and `ws_flags` — every call pushes through `ws_mc` into every rank's

@@ -229,7 +229,7 @@ def raised_under_capture(fn) -> str:
 
 
 def check_exchange_is_armed_and_sized() -> None:
-    from tensorrt_llm._torch.cute_dsl_kernels.k3_fused_moe import k3_latent_reduce as kernel
+    from tensorrt_llm._torch.kernels.k3_fused_moe import k3_latent_reduce as kernel
 
     words = 2 * MAX_TOKENS * R.world * ROW_WORDS
     assert kernel.buffer_words(R.world) == words
@@ -292,7 +292,7 @@ def check_capture_refusals() -> None:
     # Imported by the op's first call; imported here so that nothing is imported inside the capture.
     import cutlass.cute.runtime  # noqa: F401
 
-    from tensorrt_llm._torch.cute_dsl_kernels.k3_fused_moe import k3_latent_reduce  # noqa: F401
+    from tensorrt_llm._torch.kernels.k3_fused_moe import k3_latent_reduce  # noqa: F401
 
     def create() -> None:
         create_exchange(R.mapping, fabric_handle=R.fabric)

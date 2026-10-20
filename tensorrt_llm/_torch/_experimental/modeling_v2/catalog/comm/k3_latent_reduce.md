@@ -53,13 +53,13 @@ def k3_latent_reduce(num_tokens: int, exchange: K3LatentExchange) -> torch.Tenso
 The summands are not arguments: they are rows `0..M-1` of every rank's slot in this call's half of the exchange,
 written by the producers. The op runs on the current stream of `exchange.uc`'s device. Inert (not exposed by the
 wrapper): the op's `ctas_per_token` = 0, i.e. 4 CTAs per token row up to 8 ranks and 14 at 16. The op also takes 4,
-14 or 28, which its own test (`tests/unittest/_torch/cute_dsl_kernels/kimi_k3/test_k3_latent_reduce.py`) runs; only
+14 or 28, which its own test (`tests/unittest/_torch/kernels/kimi_k3/test_k3_latent_reduce.py`) runs; only
 the default is certified here.
 
 ## State
 
 **Object.** `K3LatentExchange`, defined beside the buffer layout it allocates
-(`cute_dsl_kernels/k3_fused_moe/latent_op.py`) and re-exported by this entry's wrapper; one per TP group, owned by
+(`kernels/k3_fused_moe/latent_op.py`) and re-exported by this entry's wrapper; one per TP group, owned by
 the caller. A state type, not an entry: it launches nothing per call.
 
 **Contents and size.**

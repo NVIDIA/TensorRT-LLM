@@ -7,7 +7,7 @@ from typing import Optional
 
 import torch
 
-from tensorrt_llm._torch.cute_dsl_kernels.k3_mla import (  # noqa: F401 — registers the ops
+from tensorrt_llm._torch.kernels.k3_mla import (  # noqa: F401 — registers the ops
     op as _k3_mla_op,
 )
 

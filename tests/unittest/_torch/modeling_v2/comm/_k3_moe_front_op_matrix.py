@@ -365,7 +365,7 @@ def check_workspace_is_armed_and_sized() -> None:
     Flags and ready words zero; the front supports this W at the certified widths (checked at setup); the two
     K3MoeStates are the plain and the head_flags build.
     """
-    from tensorrt_llm._torch.cute_dsl_kernels.k3_fused_moe import k3_route_quant_ag as layout
+    from tensorrt_llm._torch.kernels.k3_fused_moe import k3_route_quant_ag as layout
 
     assert layout.workspace_words(R.world) == WORKSPACE_WORDS == 157_696
     for ws in (WS_A, WS_B):

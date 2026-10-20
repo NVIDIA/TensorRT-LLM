@@ -96,7 +96,7 @@ def layer_weights(index: int):
 def routed(m: int, seed: int):
     """m tokens' MXFP8 latents and routing, as trtllm::k3_route_quant produces them (the engines' caller)."""
     import tensorrt_llm  # noqa: F401
-    from tensorrt_llm._torch.cute_dsl_kernels.k3_route_quant import op as _rq  # noqa: F401
+    from tensorrt_llm._torch.kernels.k3_route_quant import op as _rq  # noqa: F401
 
     gen = torch.Generator(device="cuda").manual_seed(seed)
     logits = (torch.randn(m, NUM_EXPERTS, generator=gen, device="cuda") * 3.0).float()
@@ -167,7 +167,7 @@ class Engine:
         self.name, self.m = name, m
 
     def create(self, push=()):
-        from tensorrt_llm._torch.cute_dsl_kernels.k3_fused_moe import op
+        from tensorrt_llm._torch.kernels.k3_fused_moe import op
 
         device = torch.device("cuda", torch.cuda.current_device())
         if self.name == "k3_moe_m1":

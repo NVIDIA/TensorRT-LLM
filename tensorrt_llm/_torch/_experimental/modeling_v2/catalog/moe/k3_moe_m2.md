@@ -6,7 +6,7 @@ receipts:
 # k3_moe_m2
 
 **Wraps** `torch.ops.trtllm.k3_moe_m2` through `K3MoeM2Layer.__call__` and `K3MoeM2Layer.push`
-(`tensorrt_llm/_torch/cute_dsl_kernels/k3_fused_moe/op.py`; one CuTe DSL kernel, `k3_moe_m2_kernel.py`, launched
+(`tensorrt_llm/_torch/kernels/k3_fused_moe/op.py`; one CuTe DSL kernel, `k3_moe_m2_kernel.py`, launched
 with programmatic dependent launch).
 
 A stateful entry: its correctness depends on a caller-owned state object, `K3MoeM2State`, which the `layer` argument
@@ -157,7 +157,7 @@ cached per configuration in the process (code only, no state).
 - Certified path: one GB200 GPU (sm_100), TP16 shapes (896 experts, `i_tp` 192 in buffers of 256). Tests:
   `tests/unittest/_torch/modeling_v2/moe/test_modeling_v2_k3_moe_m2.py` (the reference is fp32 over the dequantized
   checkpoint slices: 8 ulp of the row's max per element, 4 ulp relative RMS);
-  `tests/unittest/_torch/cute_dsl_kernels/kimi_k3/test_k3_moe_m2.py` (also against `trtllm::k3_moe`, two
+  `tests/unittest/_torch/kernels/kimi_k3/test_k3_moe_m2.py` (also against `trtllm::k3_moe`, two
   tokens routed to the same and to disjoint experts); the push form at 4 ranks in `test_k3_moe_push.py` (bit-exact
   against `MNNVLAllReduce`, a 16-slot exchange filled 4 slots per rank, the exchange's count across the int32 wrap).
 - Kimi K3 runs the push form over 16 ranks; a 4-rank run fills a 16-slot exchange only by repeating each rank's

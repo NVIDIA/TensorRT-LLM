@@ -65,7 +65,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm.mnnvl_workspace 
 )
 
 # The kernel's support predicate: metadata reads only.
-from tensorrt_llm._torch.cute_dsl_kernels.k3_sandwich import op as _sandwich_op
+from tensorrt_llm._torch.kernels.k3_sandwich import op as _sandwich_op
 from tensorrt_llm._torch.distributed import AllReduceParams
 
 # The most tokens of a step whose post-attention all-reduce runs one-shot with the residual update in its epilogue.

@@ -109,7 +109,7 @@ class KimiK3DFlashWorker(DFlashWorker):
             or logits.shape[0] != num_gens * (K + 1)
         ):
             return False
-        from tensorrt_llm._torch.cute_dsl_kernels.k3_spec_accept import op as accept_op
+        from tensorrt_llm._torch.kernels.k3_spec_accept import op as accept_op
 
         embed = draft_model.draft_model_full.model.embed_tokens
         return accept_op.supports(
@@ -211,7 +211,7 @@ class KimiK3DFlashWorker(DFlashWorker):
         """
         if not self.k3_decode:
             return None
-        from tensorrt_llm._torch.cute_dsl_kernels.k3_spec_accept import op as accept_op
+        from tensorrt_llm._torch.kernels.k3_spec_accept import op as accept_op
         from tensorrt_llm._torch.distributed.ops import MNNVLAllReduce
 
         mapping = self.mapping
@@ -262,7 +262,7 @@ class KimiK3DFlashWorker(DFlashWorker):
     def _k3_logits_shard_reason(self, lm_head):
         """Why the target logits cannot stay vocabulary-sharded under this configuration and head (None if they can,
         given an MNNVL workspace for the mapping, which ``_k3_logits_shard`` checks)."""
-        from tensorrt_llm._torch.cute_dsl_kernels.k3_spec_accept import op as accept_op
+        from tensorrt_llm._torch.kernels.k3_spec_accept import op as accept_op
         from tensorrt_llm._torch.modules.linear import TensorParallelMode
 
         mapping = self.mapping
@@ -338,7 +338,7 @@ class KimiK3DFlashWorker(DFlashWorker):
         ok = cache.get(n)
         if ok is not None:
             return ok
-        from tensorrt_llm._torch.cute_dsl_kernels.k3_ctx_kv import op as ctx_op
+        from tensorrt_llm._torch.kernels.k3_ctx_kv import op as ctx_op
         from tensorrt_llm._torch.models import modeling_dflash
 
         reason = None
@@ -424,7 +424,7 @@ class KimiK3DFlashWorker(DFlashWorker):
         the KDA replay record, kv_lens + 1 and the drafter's inputs in one launch. ``shard``: the exchange
         workspace and first column when ``logits`` are this rank's vocabulary shard (``_k3_logits_shard``).
         Returns (accepted tokens, num accepted, {rewind, bonus, qpos, cpos, noise})."""
-        from tensorrt_llm._torch.cute_dsl_kernels.k3_spec_accept import op as accept_op
+        from tensorrt_llm._torch.kernels.k3_spec_accept import op as accept_op
 
         num_gens = attn_metadata.num_seqs
         K = spec_metadata.runtime_draft_len
@@ -1144,7 +1144,7 @@ class KimiK3DSparkWorker(KimiK3DFlashWorker, DSparkWorker):
         """
         if not self.k3_decode:
             return False
-        from tensorrt_llm._torch.cute_dsl_kernels.k3_markov import op as k3_markov_op
+        from tensorrt_llm._torch.kernels.k3_markov import op as k3_markov_op
         from tensorrt_llm._torch.distributed.ops import MNNVLAllReduce
         from tensorrt_llm._torch.modules.linear import TensorParallelMode
 
@@ -1239,7 +1239,7 @@ class KimiK3DSparkWorker(KimiK3DFlashWorker, DSparkWorker):
         ``sample_draft_tokens`` and its next_new_tokens (built from this step's acceptance) for
         ``_prepare_next_new_tokens``.
         """
-        from tensorrt_llm._torch.cute_dsl_kernels.k3_markov import op as k3_markov_op
+        from tensorrt_llm._torch.kernels.k3_markov import op as k3_markov_op
 
         acceptance = getattr(self, "_k3_acceptance", None)
         if acceptance is None:
