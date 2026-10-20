@@ -14,6 +14,9 @@ the model used to say, and an import would now have the test agreeing with
 itself. A shape that changes here is a real change to what this target
 allocates, and should be made knowingly rather than discovered.
 
+The block was the one-GPU target's, so the table is held to it at one rank:
+the default target at tp1, where every share is the whole tensor.
+
 No GPU and no built extensions: the parameters are meta tensors, so only
 shape and dtype are compared, which is all the declaration ever stated.
 """
@@ -26,9 +29,10 @@ import torch
 
 __extra_import_path__ = [".."]  # noqa: F841 -- repo's file-scoped import hook
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.gpt_oss.gpt_oss_120b__sm_103__tp1 import (
+from tensorrt_llm._torch._experimental.modeling_v2.models.gpt_oss.gpt_oss_120b__sm_10x__default import (  # noqa: E501
     weights as W,
 )
+from tensorrt_llm.mapping import Mapping
 
 # gpt-oss-120b's own numbers, so the comparison is against the shapes this
 # target actually ships rather than a toy configuration.
@@ -39,6 +43,8 @@ _DIMS = dict(
     kv_width=8 * 64,
     heads_q=64,
     num_experts=128,
+    # At one rank the expert window is all of them.
+    local_experts=128,
     vocab=201088,
     fc1_rows=2 * 2944,
     # 2880 padded up to FC1_K_ALIGN (512), not to 128 like the other three.
@@ -89,7 +95,8 @@ def _reference(d):
 
 
 def _fake_core():
-    """The configuration surface `dims` reads, carrying this target's numbers.
+    """The configuration surface `dims` reads, carrying this target's numbers,
+    on a one-rank mapping.
 
     `dims` reads `model_config` only, never the half-built core around it,
     which is what lets this run without constructing a model.
@@ -107,7 +114,9 @@ def _fake_core():
         vocab_size=_DIMS["vocab"],
     )
     return SimpleNamespace(
-        model_config=SimpleNamespace(pretrained_config=cfg, torch_dtype=_DIMS["dtype"])
+        model_config=SimpleNamespace(
+            pretrained_config=cfg, mapping=Mapping(), torch_dtype=_DIMS["dtype"]
+        )
     )
 
 

@@ -136,7 +136,6 @@ def _disagg_yaml(num_ctx, num_gen, ctx_tp, gen_tp, request_lengths=(64,), mtp_dr
             "cache_transceiver_config": {
                 "backend": "NIXL",
                 "transceiver_runtime": "PYTHON",
-                "max_tokens_in_buffer": 512,
             },
         }
         if mtp_draft_len:

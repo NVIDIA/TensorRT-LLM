@@ -3681,19 +3681,40 @@ class MXFP8LinearMethod(LinearMethodBase):
         self._store_scale(module, scales[0])
         self.load_kv_cache_scales(module, weights)
 
+    def _load_fused_weight_scales(self, module: Linear, weights: List[Dict],
+                                  shard_names: tuple[str, ...]) -> torch.Tensor:
+        """Load the scales of fused shards with the rows of their weights.
+
+        Scale rows share the out_features dim with weight rows, so each
+        shard's scale is sliced by ``Linear.load_shard`` exactly like its
+        weight, including uneven or replicated ``override_tp_sharding``
+        ranges.
+        """
+        scale_name = self._get_scale_name(weights)
+        scales = []
+        for shard_weights, shard_name in zip(weights, shard_names):
+            scale = module.load_shard(shard_weights,
+                                      scale_name,
+                                      device=torch.device("cuda"),
+                                      name=shard_name)
+            if scale is None:
+                raise ValueError(
+                    f"MXFP8 fused load is missing {scale_name} for shard "
+                    f"'{shard_name}'")
+            assert scale.dtype == torch.uint8, (
+                f"MXFP8 weight_scale must be uint8 (UE8M0), got {scale.dtype}")
+            scales.append(scale.contiguous())
+        # Concatenate along dim 0 (out_features), the axis of the weights.
+        return torch.cat(scales, dim=0)
+
     def load_weights_fused_qkv_linear(self, module: Linear,
                                       weights: List[Dict]) -> None:
         q_weight, k_weight, v_weight = load_weights_fused_qkv_helper(
             module, weights)
         copy_weight(module.weight, torch.cat((q_weight, k_weight, v_weight)))
-
-        scales = self.load_weight_scales(weights,
-                                         tp_size=module.tp_size,
-                                         tp_rank=module.tp_rank,
-                                         tp_mode=module.tp_mode)
-        # Scales share the out_features dim with weights; concatenate along
-        # dim 0 (out_features), same axis the weights are concatenated on.
-        self._store_scale(module, torch.cat(scales, dim=0))
+        self._store_scale(
+            module,
+            self._load_fused_weight_scales(module, weights, ("q", "k", "v")))
 
         self.load_kv_cache_scales(module, weights)
 
@@ -3714,12 +3735,9 @@ class MXFP8LinearMethod(LinearMethodBase):
         gate_weight, up_weight = load_weights_fused_gate_up_helper(
             module, weights)
         copy_weight(module.weight, torch.cat((gate_weight, up_weight)))
-
-        scales = self.load_weight_scales(weights,
-                                         tp_size=module.tp_size,
-                                         tp_rank=module.tp_rank,
-                                         tp_mode=module.tp_mode)
-        self._store_scale(module, torch.cat(scales, dim=0))
+        self._store_scale(
+            module,
+            self._load_fused_weight_scales(module, weights, ("gate", "up")))
 
 
 def get_quant_method(quant_config: Optional[QuantConfig] = None):

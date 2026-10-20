@@ -3691,7 +3691,7 @@ class TestOneModelMTPDraftTokenScheduling:
     draft-token budget while context requests are left untouched.
 
     The Python-side fill is placeholder-only: with the overlap scheduler
-    disabled, ``_prepare_tp_inputs`` sources a generation request's draft
+    disabled, ``DecoderInputPreparer._pack_extend_requests`` sources a generation request's draft
     tokens from ``py_draft_tokens``, which the one-model spec sampler wrote at
     the end of the previous iteration. Overwriting a populated list here would
     feed zeros to the target model and collapse the acceptance rate.
@@ -3954,6 +3954,55 @@ def test_non_last_pp_rank_drains_every_relay_send():
 
     waited = sorted(call.args[1] for call in executor.wait_on_pp_send_handles.call_args_list)
     assert waited == [0, 1, 2, 3]
+
+
+@pytest.mark.parametrize("loop", ["overlap", "pp"])
+def test_v2_generation_update_runs_before_cancel_and_responses(loop):
+    executor = object.__new__(PyExecutor)
+    batch = ScheduledRequests()
+    metadata = object()
+    executor._is_kv_manager_v2 = True
+    executor.model_engine = types.SimpleNamespace(
+        attn_metadata=metadata, kv_cache_dtype_byte_size=2.0
+    )
+    executor.kv_cache_manager = Mock()
+    executor.resource_manager = Mock()
+    executor.enable_kv_cache_events = False
+    executor.enable_iter_perf_stats = False
+    events = []
+    executor._handle_canceled_requests = Mock(side_effect=lambda: events.append("cancel"))
+    executor.kv_cache_manager.update_resources.side_effect = lambda *args: events.append(
+        "target_update"
+    )
+    executor._handle_responses = Mock(side_effect=lambda **kwargs: events.append("responses"))
+    executor.resource_manager.update_resources.side_effect = lambda *args, **kwargs: events.append(
+        "other_updates"
+    )
+
+    if loop == "overlap":
+        executor.previous_batch = types.SimpleNamespace(scheduled_requests=batch)
+        executor.enable_early_first_token_response = False
+        executor._process_previous_batch()
+    else:
+        executor._update_requests = Mock()
+        executor.speculation_gate = None
+        executor._update_v2_context_resources = Mock()
+        executor.kv_cache_transceiver = None
+        executor._flush_pending_transfer_responses = Mock()
+        executor._disagg_coordinator = Mock()
+        executor._remove_inflight_ids = Mock()
+        executor._commit_kv_cache_stats = Mock()
+        executor._flush_iter_stats_synced = Mock()
+        executor._disagg_pp_termination_handler = None
+        executor._handle_executed_batch(
+            types.SimpleNamespace(scheduled_requests=batch, sample_state=None)
+        )
+
+    assert events == ["target_update", "cancel", "responses", "other_updates"]
+    executor.kv_cache_manager.update_resources.assert_called_once_with(batch, metadata, 2.0)
+    executor.resource_manager.update_resources.assert_called_once_with(
+        batch, metadata, 2.0, skip_kv_cache_manager=True
+    )
 
 
 # -- first-token logprobs and logits transferred from prefill -----------------
