@@ -1209,7 +1209,7 @@ def test_mhc_fused_hc_force_deterministic(
     fuse_norm: bool,
     lagged: bool,
 ) -> None:
-    """Deterministic dispatch must survive cached atomic tactics and graph replay."""
+    """Deterministic dispatch must bypass autotuning and remain stable across graph replay."""
     from tensorrt_llm._torch.modules.mhc import mhc_cuda
 
     monkeypatch.setenv("FORCE_DETERMINISTIC", "1")
@@ -1217,15 +1217,11 @@ def test_mhc_fused_hc_force_deterministic(
     inputs[0].mul_(hidden_size)
     inputs[1].mul_(hidden_size)
     inputs[4].mul_(500)
-    # A pre-existing autotune cache may contain a split-K tactic. The public
-    # deterministic path must not execute it, including at a cache hit.
-    if _mhc_fused_hc_mma_available():
-        cached_tactic = ("fused_half_mma", 0, 4, 256, 1)
-    else:
-        cached_tactic = ("fused_all_fma", 2, 2, 0, 1)
-    monkeypatch.setattr(
-        mhc_cuda.AutoTuner.get(), "choose_one", lambda *args, **kwargs: (runner, cached_tactic)
-    )
+
+    def unexpected_choose_one(*args: object, **kwargs: object) -> None:
+        raise AssertionError("Deterministic mHC dispatch must bypass autotuning")
+
+    monkeypatch.setattr(mhc_cuda.AutoTuner.get(), "choose_one", unexpected_choose_one)
     norm_weight = (
         torch.randn(hidden_size, dtype=torch.bfloat16, device="cuda") * 0.1 + 1
         if fuse_norm
