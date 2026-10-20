@@ -239,6 +239,28 @@ class TestModuleLevelFiltering:
         # Cleanup
         singleton._module_levels = {}
 
+    def test_filtered_message_skips_caller_lookup(self, monkeypatch):
+        import tensorrt_llm.logger as logger_module
+
+        singleton = Logger()
+        old_severity = singleton._min_severity
+        singleton._min_severity = "warning"
+
+        def fail():
+            raise AssertionError("caller module looked up for a filtered message")
+
+        monkeypatch.setattr(logger_module, "_get_caller_module", fail)
+        try:
+            singleton.info("filtered")
+            assert singleton.is_debug_enabled() is False
+            # A per-module override still needs the caller's module.
+            singleton._module_levels = {"runtime": 10}
+            with pytest.raises(AssertionError, match="caller module"):
+                singleton.info("module filtered")
+        finally:
+            singleton._module_levels = {}
+            singleton._min_severity = old_severity
+
 
 class TestIsDebugEnabled:
     """Tests for is_debug_enabled, the guard for expensive debug arguments.
