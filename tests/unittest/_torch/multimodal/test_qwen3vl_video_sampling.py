@@ -23,7 +23,10 @@ from tokenizers.models import WordLevel
 from tokenizers.pre_tokenizers import Whitespace
 from transformers import PreTrainedTokenizerFast
 from transformers.models.qwen2_vl.image_processing_qwen2_vl import Qwen2VLImageProcessor
-from transformers.models.qwen3_vl.processing_qwen3_vl import Qwen3VLProcessor
+from transformers.models.qwen3_vl.processing_qwen3_vl import (
+    Qwen3VLProcessor,
+    Qwen3VLProcessorKwargs,
+)
 from transformers.models.qwen3_vl.video_processing_qwen3_vl import Qwen3VLVideoProcessor
 from transformers.video_utils import VideoMetadata
 
@@ -56,6 +59,7 @@ def adapter() -> SimpleNamespace:
         "np": np,
         "torch": torch,
         "VideoMetadata": VideoMetadata,
+        "Qwen3VLProcessorKwargs": Qwen3VLProcessorKwargs,
     }
     exec(
         compile(ast.Module(body=[decide, preprocess], type_ignores=[]), str(source), "exec"),
@@ -263,6 +267,7 @@ def test_explicit_fps_uses_duration_without_source_frame_count(adapter, processo
         video.metadata["frames_indices"][i] for i in selected
     ]
     assert result["video_metadata"][0].fps == 24.0
+    assert result["video_metadata"][0].total_num_frames == 240
 
 
 @pytest.mark.parametrize("kwargs", [{"num_frames": 40}, {"fps": 4}])
@@ -284,3 +289,113 @@ def test_preprocessing_does_not_mutate_request_or_frames(adapter, processor, kwa
     )
     assert request == original_kwargs
     assert torch.equal(torch.stack(video.frames), original_frames)
+
+
+@pytest.mark.parametrize("target", [{"fps": 4}, {"num_frames": 8, "fps": None}])
+def test_nested_sampling_preserves_pixels_and_source_timestamps(adapter, processor, target):
+    video = _video(list(range(48)), total=48)
+    request = {
+        "return_metadata": True,
+        "videos_kwargs": {"do_normalize": False, **target},
+    }
+    original = copy.deepcopy(request)
+    result = adapter.preprocess(
+        SimpleNamespace(processor=processor), "<|video_pad|>", {"video": [video]}, request
+    )
+    expected = np.linspace(0, 47, 8).round().astype(int).tolist()
+    metadata = result["video_metadata"][0]
+    assert result["video_grid_thw"][0, 0].item() == 4
+    assert list(metadata.frames_indices) == expected
+    assert processor._calculate_timestamps(metadata.frames_indices, metadata.fps) == pytest.approx(
+        [(expected[i] + expected[i + 1]) / 48 for i in range(0, 8, 2)]
+    )
+    patches = result["pixel_values_videos"].reshape(4, -1, 3, 2, 16, 16)
+    assert patches[:, 0, 0, :, 0, 0].flatten().tolist() == pytest.approx(np.asarray(expected) / 255)
+    assert request == original
+
+
+@pytest.mark.parametrize(
+    "kwargs,count",
+    [
+        ({}, 40),
+        ({"fps": 2}, 20),
+        ({"num_frames": 8}, 8),
+        ({"do_sample_frames": True}, 20),
+        ({"do_sample_frames": False, "num_frames": 8}, 40),
+    ],
+)
+def test_nested_sampling_controls_presampled_video(adapter, processor, kwargs, count):
+    indices = np.linspace(0, 239, 40).astype(int).tolist()
+    video = _video(indices)
+    result = _run(adapter, processor, [video], videos_kwargs=kwargs)
+    selected = np.linspace(0, 39, count).round().astype(int)
+    assert result["video_grid_thw"][0, 0].item() == count // 2
+    assert list(result["video_metadata"][0].frames_indices) == [indices[i] for i in selected]
+
+
+@pytest.mark.parametrize(
+    "config",
+    [{"num_frames": 8, "fps": None}, {"fps": 4}, {"do_sample_frames": False}],
+)
+def test_video_processor_sampling_defaults_match_hf(adapter, processor, config):
+    processor.video_processor = Qwen3VLVideoProcessor(
+        size={"shortest_edge": 2048, "longest_edge": 4096}, **config
+    )
+    video = _video(list(range(48)), total=48)
+    reference = processor(
+        text=["<|video_pad|>"],
+        videos=[video.frames],
+        video_metadata=[copy.deepcopy(video.metadata)],
+        do_rescale=False,
+        do_normalize=False,
+        return_tensors="pt",
+        return_metadata=True,
+    )
+    result = _run(adapter, processor, [video])
+    for key in ("video_grid_thw", "pixel_values_videos", "input_ids"):
+        assert torch.equal(result[key], reference[key])
+
+
+def test_request_can_enable_sampling_disabled_in_processor(adapter, processor):
+    processor.video_processor.do_sample_frames = False
+    video = _video(list(range(48)), total=48)
+    result = _run(adapter, processor, [video], do_sample_frames=True, num_frames=8)
+    assert result["video_grid_thw"][0, 0].item() == 4
+
+
+@pytest.mark.parametrize("presampled", [False, True])
+@pytest.mark.parametrize("kwargs", [{}, {"num_frames": 8}])
+def test_sampling_preserves_source_total_duration_and_effective_fps(
+    adapter, processor, presampled, kwargs
+):
+    indices = np.linspace(0, 239, 40).astype(int).tolist() if presampled else list(range(48))
+    video = _video(indices, total=240 if presampled else 48)
+    result = _run(adapter, processor, [video], **kwargs)
+    metadata = result["video_metadata"][0]
+    assert metadata.total_num_frames == video.metadata["total_num_frames"]
+    assert metadata.duration == video.metadata["duration"]
+    assert metadata.sampled_fps == pytest.approx(
+        len(metadata.frames_indices) / video.metadata["duration"]
+    )
+    assert max(metadata.frames_indices) < metadata.total_num_frames
+
+
+@pytest.mark.parametrize("with_image", [False, True])
+def test_non_video_processing_matches_hf(adapter, processor, with_image):
+    processor.video_processor = None
+    images = [torch.ones(3, 32, 32)] if with_image else None
+    text = "<|image_pad|>" if with_image else "text"
+    result = adapter.preprocess(
+        SimpleNamespace(processor=processor), text, {"image": images}, {"do_normalize": False}
+    )
+    reference = processor(
+        text=[text],
+        images=images,
+        padding=True,
+        return_tensors="pt",
+        do_rescale=not with_image,
+        do_normalize=False,
+    )
+    assert result.keys() == reference.keys()
+    for key in result:
+        assert torch.equal(result[key], reference[key])
