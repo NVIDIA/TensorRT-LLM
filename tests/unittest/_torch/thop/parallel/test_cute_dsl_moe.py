@@ -1615,7 +1615,7 @@ def test_rubin_act_fusion_kernel_rejects_finite_swiglu_limit_for_non_swiglu(
 ):
     # Host-only: the constructor validates its arguments before any DSL work,
     # so this pins the guard without a GPU.
-    from tensorrt_llm._torch.cute_dsl_kernels.rubin.moe.rubin_contiguous_gather_grouped_blockscaled_gemm_act_fusion import (  # noqa: E501
+    from tensorrt_llm._torch.moe.kernels.rubin.rubin_contiguous_gather_grouped_blockscaled_gemm_act_fusion import (  # noqa: E501
         Sm107BlockScaledContiguousGatherGroupedGemmActFusionKernel as Kernel,
     )
 

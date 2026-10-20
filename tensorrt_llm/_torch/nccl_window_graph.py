@@ -11,6 +11,7 @@ which preserves correctness but loses symmetric-window performance.
 """
 
 import contextlib
+import gc
 import operator
 import threading
 from typing import Any, Iterator
@@ -23,6 +24,28 @@ _next_pool_owner = _OWNER_BASE
 _pool_owners: dict[tuple[int, int], int] = {}
 _pool_owners_lock = threading.Lock()
 _capture_owner = threading.local()
+_capture_gc_lock = threading.Lock()
+_capture_gc_depth = 0
+_capture_gc_was_enabled = False
+
+
+@contextlib.contextmanager
+def _defer_capture_gc() -> Iterator[None]:
+    """Defer automatic cyclic GC until all overlapping graph captures finish."""
+    global _capture_gc_depth, _capture_gc_was_enabled
+
+    with _capture_gc_lock:
+        if _capture_gc_depth == 0:
+            _capture_gc_was_enabled = gc.isenabled()
+            gc.disable()
+        _capture_gc_depth += 1
+    try:
+        yield
+    finally:
+        with _capture_gc_lock:
+            _capture_gc_depth -= 1
+            if _capture_gc_depth == 0 and _capture_gc_was_enabled:
+                gc.enable()
 
 
 def _pool_key(pool: Any) -> tuple[int, int]:
@@ -80,7 +103,9 @@ def nccl_window_graph_capture(
     with nccl_window_graph_owner(pool):
         device = torch.cuda.current_device()
         release_epoch = torch.ops.trtllm.get_nccl_window_buffer_release_epoch()
-        with torch.cuda.graph(graph, pool=pool, **capture_kwargs):
+        # CUDA tensor finalizers can invalidate capture. Restore automatic GC only
+        # after torch.cuda.graph has completed its exit or exception cleanup.
+        with _defer_capture_gc(), torch.cuda.graph(graph, pool=pool, **capture_kwargs):
             # capture_begin has synchronized PyTorch warmup work. Promote explicitly
             # released windows before the captured body can request them.
             torch.ops.trtllm.promote_nccl_window_buffer_releases(device, release_epoch)

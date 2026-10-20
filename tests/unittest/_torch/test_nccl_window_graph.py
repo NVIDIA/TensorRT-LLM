@@ -2,7 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import contextlib
+import gc
 import inspect
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from operator import getitem
 
@@ -13,6 +15,90 @@ from torch._subclasses import FakeTensorMode
 from tensorrt_llm._torch import nccl_window_graph, nccl_window_tensor_scope
 
 pytestmark = pytest.mark.cpu_only
+
+
+@pytest.mark.parametrize("gc_enabled", [True, False])
+@pytest.mark.parametrize("failure", ["none", "enter", "body", "exit"])
+def test_capture_defers_gc_and_restores_state(
+    monkeypatch: pytest.MonkeyPatch, gc_enabled: bool, failure: str
+) -> None:
+    original_gc_enabled = gc.isenabled()
+
+    @contextlib.contextmanager
+    def capture(graph: torch.cuda.CUDAGraph, *, pool: tuple[int, int]) -> Iterator[None]:
+        assert not gc.isenabled()
+        if failure == "enter":
+            raise RuntimeError("capture failed")
+        try:
+            yield
+        finally:
+            assert not gc.isenabled()
+            if failure == "exit":
+                raise RuntimeError("capture failed")
+
+    monkeypatch.setattr(nccl_window_graph.torch.cuda, "graph", capture)
+    monkeypatch.setattr(torch.ops.trtllm, "set_nccl_window_graph_owner", lambda _owner: None)
+    try:
+        if gc_enabled:
+            gc.enable()
+        else:
+            gc.disable()
+        expected = (
+            pytest.raises(RuntimeError, match="capture failed")
+            if failure != "none"
+            else contextlib.nullcontext()
+        )
+        with expected:
+            with nccl_window_graph.nccl_window_graph_capture(object(), (91234, 5678)):
+                assert not gc.isenabled()
+                if failure == "body":
+                    raise RuntimeError("capture failed")
+        assert gc.isenabled() == gc_enabled
+    finally:
+        if original_gc_enabled:
+            gc.enable()
+        else:
+            gc.disable()
+
+
+def test_capture_gc_defers_cyclic_finalizers_until_last_capture() -> None:
+    original_gc_enabled = gc.isenabled()
+    finalized: list[bool] = []
+
+    class CyclicResource:
+        def __init__(self) -> None:
+            self.cycle = self
+
+        def __del__(self) -> None:
+            finalized.append(True)
+
+    first = nccl_window_graph._defer_capture_gc()
+    second = nccl_window_graph._defer_capture_gc()
+    try:
+        gc.enable()
+        with contextlib.ExitStack() as cleanup:
+            first.__enter__()
+            cleanup.callback(first.__exit__, None, None, None)
+            second.__enter__()
+            cleanup.callback(second.__exit__, None, None, None)
+            CyclicResource()
+            # Enough tracked allocations to trigger automatic collection when enabled.
+            pressure = [[] for _ in range(gc.get_threshold()[0] + 100)]
+            assert pressure
+            assert not finalized
+            first.__exit__(None, None, None)
+            assert not gc.isenabled()
+            assert not finalized
+            second.__exit__(None, None, None)
+            cleanup.pop_all()
+        assert gc.isenabled()
+        gc.collect()
+        assert finalized == [True]
+    finally:
+        if original_gc_enabled:
+            gc.enable()
+        else:
+            gc.disable()
 
 
 @pytest.fixture(autouse=True)
