@@ -18,6 +18,7 @@ try:
     from ..custom_ops import flashinfer_apply_rope_with_cos_sin_cache_inplace as _flashinfer_rope
 except ImportError:
     _flashinfer_rope = None
+from ..modules.logits_processor import scale_and_soft_cap_logits
 from ..pyexecutor.config_utils import _is_sliding_attention_layer, get_layer_attention_window
 from ..speculative.dflash_attention import (
     dflash_trtllm_gen_unavailability_reason,
@@ -791,19 +792,14 @@ class DFlashForCausalLM(nn.Module):
     def apply_draft_logit_transform(self, logits: torch.Tensor) -> torch.Tensor:
         """Scale and soft-cap draft logits the way the drafter was trained.
 
-        The multiplier, then ``softcap * tanh(logits / softcap)``, in FP32 and in
-        place. Neither changes a position's argmax, but the DFlash 2 selector adds
-        these logits to its pairwise scores and draft sampling reads them as a
-        distribution, so both depend on the scale.
+        The same epilogue as the target's (:func:`scale_and_soft_cap_logits`), in
+        FP32 and in place. Neither step changes a position's argmax, but the
+        DFlash 2 selector adds these logits to its pairwise scores and draft
+        sampling reads them as a distribution, so both depend on the scale.
         """
         if self.logit_multiplier == 1.0 and self.logit_softcap is None:
             return logits
-        logits = logits.float()
-        if self.logit_multiplier != 1.0:
-            logits.mul_(self.logit_multiplier)
-        if self.logit_softcap is not None:
-            logits.div_(self.logit_softcap).tanh_().mul_(self.logit_softcap)
-        return logits
+        return scale_and_soft_cap_logits(logits, self.logit_multiplier, self.logit_softcap)
 
     def select_candidate_path(
         self,

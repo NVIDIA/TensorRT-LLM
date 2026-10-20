@@ -1697,9 +1697,10 @@ class DFlashWorker(SpecWorkerBase):
                 )
                 # The drafter shares the target's lm_head but not its logits
                 # processor; apply the logit transform its config declares.
-                apply_logit_transform = getattr(draft_model, "apply_draft_logit_transform", None)
-                if apply_logit_transform is not None:
-                    gen_logits = apply_logit_transform(gen_logits)
+                # This comes before _refine_block_logits on purpose: a DSpark
+                # Markov bias is added to the transformed logits, as SGLang adds
+                # it to DSpark's scaled base logits.
+                gen_logits = draft_model.apply_draft_logit_transform(gen_logits)
 
                 vocab_size = gen_logits.shape[-1]
                 gen_logits = gen_logits.reshape(num_gens, K, vocab_size)

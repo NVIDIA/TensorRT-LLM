@@ -765,11 +765,11 @@ CTX_LEN = 24
 NUM_CAPTURE = 2
 
 
-def _tiny_config(dflash2: bool):
+def _tiny_config(dflash2: bool, dflash_overrides=None):
     from transformers import Qwen3Config
 
     config = dict(TINY)
-    dflash_config = dict(RELEASED_DFLASH_CONFIG)
+    dflash_config = dict(RELEASED_DFLASH_CONFIG, **(dflash_overrides or {}))
     if not dflash2:
         for key in ("conv_group_size", "conv_kernel_size", "selector_rank", "selector_top_k"):
             del dflash_config[key]
@@ -824,10 +824,12 @@ def _tiny_weights(dflash2: bool, seed=7):
     return weights
 
 
-def _build_drafter(dflash2: bool, weights):
+def _build_drafter(dflash2: bool, weights, dflash_overrides=None):
     from tensorrt_llm._torch.model_config import ModelConfig
 
-    model_config = ModelConfig(pretrained_config=_tiny_config(dflash2), attn_backend="TRTLLM")
+    model_config = ModelConfig(
+        pretrained_config=_tiny_config(dflash2, dflash_overrides), attn_backend="TRTLLM"
+    )
     drafter = DFlashForCausalLM(model_config).to("cuda")
     drafter.load_weights(dict(weights))
     return drafter
@@ -1003,6 +1005,21 @@ def test_dflash2_drafter_parses_config_and_loads_checkpoint_weights():
         weights["candidate_selector.successor_codebook"],
     )
     assert drafter.candidate_selector.top_k == TOP_K
+
+
+@needs_gpu
+def test_drafter_reads_its_logit_transform_from_dflash_config():
+    weights = _tiny_weights(True)
+    plain = _build_drafter(True, weights)
+    assert (plain.logit_multiplier, plain.logit_softcap) == (1.0, None)
+
+    declared = _build_drafter(True, weights, dflash_overrides=MUSESPARK_LOGIT_TRANSFORM)
+    assert (declared.logit_multiplier, declared.logit_softcap) == (0.17677669529663687, 20.0)
+    logits = torch.tensor([[-400.0, -30.0, 0.0, 30.0, 400.0]], device="cuda")
+    torch.testing.assert_close(
+        declared.apply_draft_logit_transform(logits.clone()),
+        20.0 * torch.tanh(logits * 0.17677669529663687 / 20.0),
+    )
 
 
 @needs_gpu
