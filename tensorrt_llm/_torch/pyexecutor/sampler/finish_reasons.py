@@ -22,6 +22,7 @@ through request admission, release, and the per-step write.
 """
 
 from dataclasses import dataclass
+from typing import NamedTuple
 
 import torch
 
@@ -37,6 +38,11 @@ from .ops.triton import (
 from .sampler_common import int_tensor
 
 __all__ = ["FinishReasonsHandler"]
+
+
+class _StopWordAllocation(NamedTuple):
+    request: LlmRequest
+    tensor: torch.Tensor
 
 
 class FinishReasonsHandler:
@@ -83,7 +89,7 @@ class FinishReasonsHandler:
             max_tokens=max_tokens,
             max_seq_len=max_seq_len,
         )
-        self._stop_word_allocations: dict[int, tuple[LlmRequest, torch.Tensor]] = {}
+        self._stop_word_allocations: dict[int, _StopWordAllocation] = {}
         self._stop_word_history_slots: set[int] = set()
         self._stop_word_allocation_generation = 0
         self._stop_word_stream_generations: dict[torch.cuda.Stream, int] = {}
@@ -182,7 +188,7 @@ class FinishReasonsHandler:
         if slot is None:
             return
         allocation = self._stop_word_allocations.get(slot)
-        if allocation is None or allocation[0] is not request:
+        if allocation is None or allocation.request is not request:
             return
         del self._stop_word_allocations[slot]
         self._stop_word_history_slots.discard(slot)
@@ -265,7 +271,9 @@ class FinishReasonsHandler:
                         tokens[-count:], dtype=torch.int32
                     )
         allocation = host.to("cuda", non_blocking=True)
-        self._stop_word_allocations[seq_slot] = (request, allocation)
+        self._stop_word_allocations[seq_slot] = _StopWordAllocation(
+            request=request, tensor=allocation
+        )
         self._stop_word_allocation_generation += 1
         if window_length:
             self._stop_word_history_slots.add(seq_slot)
@@ -313,8 +321,8 @@ class FinishReasonsHandler:
         generation = self._stop_word_allocation_generation
         if self._stop_word_stream_generations.get(stream) == generation:
             return
-        for _, allocation in self._stop_word_allocations.values():
-            allocation.record_stream(stream)
+        for allocation in self._stop_word_allocations.values():
+            allocation.tensor.record_stream(stream)
         # The allocator records completion events when storage is released;
         # repeated uses on an already registered stream need no registration.
         self._stop_word_stream_generations[stream] = generation
