@@ -1335,17 +1335,23 @@ CHECKS = (
 )
 
 
-def _run_one_rank() -> int:
+def _run_one_rank(device: Optional[int] = None) -> int:
     """Body of one spawned rank: run every test; a failing rank exits nonzero
     and the launcher kills its siblings."""
     global RANK, WORLD, GROUP, PG_BOXED, SUBGROUPS, reducescatter, validating, entry
     os.environ.setdefault("TLLM_DISABLE_MPI", "1")
     rank = int(os.environ["RANK"])
     world = int(os.environ["WORLD_SIZE"])
-    torch.cuda.set_device(rank)
+    # Spawned on one node, the rank owns device `rank`. Across nodes (--srun)
+    # the caller passes the node-local index. Never read LOCAL_RANK here: a
+    # spawned rank inherits the launching shell's value, the same on every
+    # rank, and NCCL then refuses the group with "invalid usage".
+    if device is None:
+        device = rank
+    torch.cuda.set_device(device)
     # device_id keeps NCCL communicator teardown off the implicit-device path
     # that measurably wedges a watchdog at exit.
-    dist.init_process_group("nccl", init_method="env://", device_id=torch.device("cuda", rank))
+    dist.init_process_group("nccl", init_method="env://", device_id=torch.device("cuda", device))
 
     from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm import reducescatter as entry
 
@@ -1481,5 +1487,9 @@ def _spawn_ranks() -> None:
 if __name__ == "__main__":
     if _WORKER_FLAG in sys.argv:
         sys.exit(_run_one_rank())
+    if "--srun" in sys.argv:
+        import _rank_job
+
+        sys.exit(_run_one_rank(device=_rank_job.adopt_srun_env()))
     _spawn_ranks()
     print("OK")

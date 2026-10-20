@@ -48,6 +48,7 @@ if TYPE_CHECKING:
     from tensorrt_llm.quantization.mode import QuantMode
 
 
+<<<<<<< HEAD
 @dataclass(kw_only=True, slots=True, frozen=True)
 class StaticAttentionConfig:
     """The attention-layer configuration used to build native kernel runners."""
@@ -293,6 +294,23 @@ def _legacy_forward_args(
     """Translate flat compatibility arguments into the shared nested carriers."""
     sparse = {
         name: arguments[name] for name in _SPARSE_ARG_NAMES if arguments.get(name) is not None
+=======
+# ``AttentionForwardArgs`` fields that this backend does not consume.
+# Sync test (test_attention_op_sync.py) requires every other field to map to a
+# kwarg name, a @property on the dataclass, or a field that some @property
+# transitively reads; entries here are exempt.
+_THOP_EXCLUDED_FIELDS: frozenset = frozenset(
+    {
+        "sparse_backend_args",  # consumed by sparse prediction before the attention op
+        "block_sparse_inputs",  # consumed by the selected block-sparse FMHA
+        "attention_mask_data",  # custom-mask code path
+        "out_scale_sf",  # promoted into ``out_scale`` in ``TrtllmAttention.forward`` for NVFP4 path
+        "skip_mla_rope_generation",  # handled in ``TrtllmAttention.forward`` for the test-only MLA path
+        "timestep",  # consumed by sparse prediction before FMHA dispatch
+        "sparse_attn_phase",  # host-resolved sparse phase, consumed before FMHA dispatch
+        "qk_fp8_per_tensor",  # per-tensor FP8 recipe flag, consumed by FMHA selection and the PrimTS FMHA
+        "v_fp8_per_tensor",  # per-tensor FP8 recipe flag, consumed by FMHA selection and the PrimTS FMHA
+>>>>>>> origin/main
     }
     sparse.setdefault("sparse_attn_indices_block_size", 1)
     sparse["threshold_scale_factor_prefill"] = (
@@ -577,7 +595,7 @@ class FallbackFmha(PhasedFmha):
         *,
         phase: Optional[FmhaPhase] = None,
     ) -> bool:
-        del k, v, phase
+        del k, v
         # A context phase served by the thop op with use_paged_context_fmha
         # enabled would silently corrupt the cached prefix wherever the fused
         # context kernel is absent. Raise rather than return False: no
@@ -588,6 +606,23 @@ class FallbackFmha(PhasedFmha):
         # (``context_batch_size``), so the admitted result cannot be reused
         # for a context batch.
         if metadata.num_contexts > 0:
+            # Extra page sizes are supported by TRTLLM-Gen, not the thop
+            # paged-context kernel. Refuse before the kernel can read KV.
+            extra_page_sizes = getattr(
+                metadata.kv_cache_manager, "trtllm_gen_extra_tokens_per_block", ()
+            )
+            if (
+                extra_page_sizes
+                and phase != FmhaPhase.GENERATION
+                and metadata.use_paged_context_fmha
+                and metadata.tokens_per_block in extra_page_sizes
+            ):
+                raise RuntimeError(
+                    f"FallbackFmha cannot serve paged prefill with "
+                    f"{metadata.tokens_per_block}-token KV pages. "
+                    "Use a supported TRTLLM-Gen configuration or disable "
+                    "chunked prefill, KV reuse and speculative decoding."
+                )
             self._validate_paged_context_fmha(metadata)
         # A verify group may straddle a page boundary onto two CP ranks, so
         # its KV ownership is per-token. The fused thop path cannot express

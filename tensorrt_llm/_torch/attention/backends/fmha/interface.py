@@ -94,6 +94,7 @@ class Fmha(ABC):
 
     supports_skip_correction: ClassVar[bool] = False
     supports_block_sparse_inputs: ClassVar[bool] = False
+    supports_per_tensor_fp8: ClassVar[bool] = False
     supports_workspace_reclamation: bool = False
     supports_fp4_mla: ClassVar[bool] = False
 
@@ -170,6 +171,12 @@ class Fmha(ABC):
             and not self.supports_block_sparse_inputs
         ):
             logger.debug(f"{type(self).__name__} does not support block-sparse inputs.")
+            return False
+        if (
+            getattr(forward_args, "qk_fp8_per_tensor", False)
+            or getattr(forward_args, "v_fp8_per_tensor", False)
+        ) and not self.supports_per_tensor_fp8:
+            logger.debug(f"{type(self).__name__} does not support per-tensor FP8 recipes.")
             return False
         return self._is_supported(q, k, v, metadata, forward_args, phase=phase)
 

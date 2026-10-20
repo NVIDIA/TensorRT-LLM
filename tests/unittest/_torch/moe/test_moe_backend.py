@@ -20,6 +20,7 @@ import itertools
 import logging
 import os
 import sys
+from collections.abc import Callable
 from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
@@ -73,6 +74,10 @@ from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl import (
     CuteDslFusedMoENvfp4Runner,
 )
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl_b12x import CuteDslB12xFusedMoE
+from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl_fc12 import (
+    CuteDslFc12FusedMoE,
+    CuteDslFc12FusedMoENvfp4Runner,
+)
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_cutlass import CutlassFusedMoE
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_deepgemm import DeepGemmFusedMoE
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_marlin import MarlinFusedMoE
@@ -2441,6 +2446,170 @@ def test_megamoe_cutedsl_minimax_m3_swiglu_bias_numerics() -> None:
         check_accuracy(output, ref_output, rtol=0.1, atol=0.1, percent=0.94)
 
 
+@pytest.fixture(scope="module")
+def _run_megamoe_prologue_helper() -> Callable[[int, bool], torch.Tensor]:
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7):
+        pytest.skip("The scheduler helper regression requires an SM107 CUDA GPU")
+
+    from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
+
+    if not IS_CUTLASS_DSL_AVAILABLE:
+        pytest.skip("cutlass-dsl is not available")
+
+    import cuda.bindings.driver as cuda
+    import cutlass.cute as cute
+    import cutlass.utils as utils
+    from cutlass.cute.runtime import from_dlpack
+    from cutlass.cutlass_dsl import Boolean, Int32
+    from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
+
+    from tensorrt_llm._torch.moe.kernels.cutedsl_megamoe.api import ImplDesc, ProblemDesc
+    from tensorrt_llm._torch.moe.kernels.cutedsl_megamoe.helpers.device_workspace import (
+        DeviceWorkspace,
+    )
+    from tensorrt_llm._torch.moe.kernels.cutedsl_megamoe.helpers.smem_workspace import SmemWorkspace
+    from tensorrt_llm._torch.moe.kernels.cutedsl_megamoe.kernel_src.schedulers.fc12_mapping import (
+        BlockPhase,
+        map_phase_interleaved_fc12_work_id,
+        resolve_phase_interleaved_fc1_claim_target,
+    )
+    from tensorrt_llm._torch.moe.kernels.cutedsl_megamoe.kernel_src.schedulers.fc12_scheduler import (
+        PhaseInterleavedFc12Scheduler,
+    )
+
+    class PrologueProbe:
+        def __init__(self) -> None:
+            self.scheduler = PhaseInterleavedFc12Scheduler(
+                ProblemDesc(dict(expert_count=1, intermediate_gateup_size=128, hidden_size=128)),
+                ImplDesc(
+                    dict(
+                        num_scheduler_consumer_threads=32,
+                        mma_tiler_mnk=(128, 128, 64),
+                        cluster_shape_mn=(1, 1),
+                        use_2cta_instrs=False,
+                        hint=1,
+                        token_padding_block=128,
+                        sf_padding_block=128,
+                        work_id_mode="atomic_counter",
+                        is_swap_ab=False,
+                        launch_cluster_count=3,
+                    )
+                ),
+            )
+            assert self.scheduler.minimum_global_fc1_claims == 3
+            self.smem = SmemWorkspace()
+            self.device = DeviceWorkspace()
+            self.scheduler.register_smem_regions(self.smem)
+            self.scheduler.register_device_workspace(self.device)
+            self.smem.finalize()
+            self.device.finalize()
+            alignment = self.smem.base_alignment
+            self.smem_launch_bytes = (
+                (self.smem.total_bytes + alignment - 1) // alignment * alignment
+            )
+            assert self.smem_launch_bytes >= self.smem.storage_class().size_in_bytes()
+
+        @cute.jit
+        def __call__(
+            self,
+            counts: cute.Tensor,
+            workspace: cute.Tensor,
+            exhausted: cute.Tensor,
+            output: cute.Tensor,
+            stream: cuda.CUstream,
+        ) -> None:
+            self.kernel(counts, workspace, exhausted, output).launch(
+                grid=(1, 1, 1), block=(32, 1, 1), smem=self.smem_launch_bytes, stream=stream
+            )
+
+        @cute.kernel
+        def kernel(
+            self,
+            counts: cute.Tensor,
+            workspace: cute.Tensor,
+            exhausted: cute.Tensor,
+            output: cute.Tensor,
+        ) -> None:
+            storage = utils.SmemAllocator().allocate(self.smem.storage_class())
+            self.device.assign_device_members(workspace.iterator)
+            self.scheduler.assign_device_members(
+                expert_token_sizes=counts,
+                expert_token_prefix_sum=None,
+                actual_expert_shape=None,
+                block_idx=cute.arch.block_idx(),
+                smem_workspace=self.smem,
+                smem_base=storage.buffer.data_ptr(),
+                device_workspace=self.device,
+            )
+            pipeline_init_arrive(cluster_shape_mn=(1, 1), is_relaxed=True)
+            pipeline_init_wait(cluster_shape_mn=(1, 1))
+            worker = self.scheduler._work_id_worker
+            state = self.scheduler._task_mapping_state
+            _, fc1_valid, state = map_phase_interleaved_fc12_work_id(
+                Int32(0), Int32(BlockPhase.Linear1), (Int32(0), Int32(0), Int32(0)), state
+            )
+            _, fc2_valid, state = map_phase_interleaved_fc12_work_id(
+                Int32(0), Int32(BlockPhase.Linear2), (Int32(0), Int32(0), Int32(0)), state
+            )
+            target, short_stream = resolve_phase_interleaved_fc1_claim_target(
+                Int32(self.scheduler.minimum_global_fc1_claims), state
+            )
+            input_exhausted = Boolean(exhausted[0])
+            pointer = worker.get_atomic_counter_pointer(Int32(0))
+            result = self.scheduler._wait_for_fc1_prologue_claims(input_exhausted, worker, state)
+            tid, _, _ = cute.arch.thread_idx()
+            output[tid, 0] = Int32(result)
+            output[tid, 1] = cute.arch.load(pointer, Int32, sem="acquire", scope="gpu")
+            output[tid, 2] = target
+            output[tid, 3] = Int32(short_stream)
+            output[tid, 4] = Int32(fc1_valid)
+            output[tid, 5] = Int32(fc2_valid)
+
+    probe = PrologueProbe()
+    counts = torch.tensor([1], device="cuda", dtype=torch.int32)
+    workspace = torch.zeros(probe.device.total_bytes("local"), device="cuda", dtype=torch.uint8)
+    exhausted = torch.zeros(1, device="cuda", dtype=torch.int32)
+    output = torch.full((32, 6), -1, device="cuda", dtype=torch.int32)
+    tensors = tuple(
+        from_dlpack(t, assumed_align=16) for t in (counts, workspace, exhausted, output)
+    )
+    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    compiled = cute.compile(probe, *tensors, stream)
+    counter_index = probe.device.offset(probe.scheduler._work_id_worker.work_id_counter_region) // 4
+
+    def run(counter: int, input_exhausted: bool) -> torch.Tensor:
+        workspace.zero_()
+        workspace.view(torch.int32)[counter_index] = counter
+        workspace.view(torch.int32)[counter_index + 1] = 1
+        exhausted.fill_(int(input_exhausted))
+        output.fill_(-1)
+        compiled(*tensors, stream)
+        torch.cuda.synchronize()
+        return output.cpu()
+
+    return run
+
+
+@pytest.mark.parametrize(
+    "counter,input_exhausted",
+    [(1, False), (3, False), (2, True)],
+    ids=["slow-peek", "fast-peek", "already-exhausted"],
+)
+def test_fc1_prologue_wait_preserves_exhaustion(
+    _run_megamoe_prologue_helper: Callable[[int, bool], torch.Tensor],
+    counter: int,
+    input_exhausted: bool,
+) -> None:
+    # One observer warp represents a three-cluster snapshot with one real FC1
+    # tile. Counter 1 precedes peer arrivals; counter 3 includes two invalid peer
+    # claims. Already-exhausted controls include an invalid local claim.
+    actual = _run_megamoe_prologue_helper(counter, input_exhausted)
+    expected = torch.tensor(
+        [int(input_exhausted), counter, 1, 1, 1, 1], dtype=torch.int32
+    ).expand_as(actual)
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
 def run_backend_moe(
     backend: MoE,
     backend_type: MoeBackendType,
@@ -3897,8 +4066,8 @@ def test_nvfp4_fc1_row_alignment_gate(
 
 @pytest.mark.parametrize(
     "backend_cls",
-    [CutlassFusedMoE, CuteDslFusedMoE],
-    ids=["cutlass", "cutedsl"],
+    [CutlassFusedMoE, CuteDslFusedMoE, CuteDslFc12FusedMoE],
+    ids=["cutlass", "cutedsl", "cutedsl_fc12"],
 )
 def test_situ_survives_resolution_not_just_construction(backend_cls):
     """A SiTU layer must be admitted by the *resolver*, not only build.
@@ -3917,6 +4086,61 @@ def test_situ_survives_resolution_not_just_construction(backend_cls):
     )
     rejection = _reject_unsupported_activation(backend_cls, problem)
     assert rejection is None, f"{backend_cls.__name__} refuses SiTU at resolution: {rejection}"
+
+
+@pytest.mark.parametrize("sm", [100, 103, 107])
+def test_cutedsl_nvfp4_situ_admitted_on_blackwell_and_rubin(sm):
+    """CuteDSL NVFP4 SiTU is eligible on SM100/SM103 and on Rubin (SM107)."""
+    deps = (MoEDep.CUTEDSL_RUBIN,) if sm == 107 else ()
+    deployment = MoEDeployment(
+        ep_size=1,
+        tp_size=1,
+        parallel_size=1,
+        use_dp=False,
+        num_slots=256,
+        env=MoEEnvironment(sm=sm, available_deps=deps),
+    )
+    verdict = CuteDslFusedMoE.can_implement(_nvfp4_problem(2048, "SiTu"), deployment)
+    assert verdict.reject_reason is not MoERejectReason.ACTIVATION_UNSUPPORTED, verdict.detail
+
+
+def test_cutedsl_fc12_refuses_relu2_at_resolution():
+    """Relu2 is not gated; the fused FC12 epilogue would compile it as SwiGLU."""
+    rejection = _reject_unsupported_activation(CuteDslFc12FusedMoE, _nvfp4_problem(2048, "Relu2"))
+    assert rejection is not None
+    assert rejection.reason is MoERejectReason.ACTIVATION_UNSUPPORTED
+
+
+def test_cutedsl_fc12_outer_runner_unique_id_includes_epilogue():
+    """The outer AutoTuner key must not share a tile tactic across epilogues."""
+
+    def _forward(*args, **kwargs):
+        raise AssertionError("not launched")
+
+    def _runner(identity):
+        return CuteDslFc12FusedMoENvfp4Runner(
+            forward_impl=_forward,
+            num_experts=8,
+            top_k=2,
+            num_local_experts=8,
+            local_expert_offset=0,
+            enable_finalize_fusion=True,
+            enable_alltoall=False,
+            workload_identity=identity,
+        )
+
+    swiglu = _runner((int(ActivationType.Swiglu), -1.0, -1.0))
+    situ = _runner((int(ActivationType.SiTu), 4.0, 25.0))
+    assert swiglu.unique_id() != situ.unique_id()
+
+    # A non-None workload_identity is a cache key only. It must not open the
+    # locality-domain inner-tactic priming branch, which calls forward_impl with
+    # overlap_moe_output_memset -- a kwarg the fused single-op impl does not
+    # take. _forward raises if reached; no GPU needed, the failure is at kwarg
+    # binding.
+    assert situ.prime_inner_tactics is False
+    inputs = [torch.empty(0) for _ in range(5)]
+    assert situ(inputs, tactic=-1, do_preparation=True) is inputs[4]
 
 
 def test_unresolvable_layer_error_carries_rejection_details():

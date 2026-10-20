@@ -94,7 +94,7 @@ class ThopAttention(OpWrapper):
     without allocating.
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = frozenset({Arch.SM_100, Arch.SM_103})
 
     # gpt-oss alternates its two window classes inside one engine, so both of
     # its cells are live every step; deepseek runs context and generation
@@ -127,6 +127,22 @@ class ThopAttention(OpWrapper):
                 quant_mode=0,
             ),
         ),
+        # The per-rank head counts the gpt-oss default target runs under
+        # attention TP: the same code path as the two cells above, at the
+        # head counts a rank holds after the split.
+        Cell(
+            why="gpt-oss default at attention TP8: 8q/1kv per rank, 128-token window",
+            spec=dict(
+                input_type=STANDARD,
+                num_heads=8,
+                num_kv_heads=1,
+                head_size=64,
+                v_head_dim=64,
+                sinks=True,
+                window=128,
+                quant_mode=0,
+            ),
+        ),
         Cell(
             why="deepseek MLA context: explicit k/v, qk 576 -> v 128, fp8 pool",
             spec=dict(
@@ -151,6 +167,65 @@ class ThopAttention(OpWrapper):
                 sinks=False,
                 window=None,
                 quant_mode=QM_FP8_KV_CACHE,
+            ),
+        ),
+        # The per-rank head counts the deepseek default target runs under
+        # attention TP: the same two MLA code paths as the cells above, at the
+        # 128 heads split 2, 4 or 8 ways.
+        Cell(
+            why="deepseek default at attention TP8: MLA context, 16 heads per rank",
+            spec=dict(
+                input_type=MLA_CONTEXT,
+                num_heads=16,
+                num_kv_heads=16,
+                head_size=576,
+                v_head_dim=128,
+                sinks=False,
+                window=None,
+                quant_mode=QM_FP8_KV_CACHE,
+            ),
+        ),
+        Cell(
+            why="deepseek default at attention TP2: MLA generation, 64 heads per rank",
+            spec=dict(
+                input_type=MLA_GENERATION,
+                num_heads=64,
+                num_kv_heads=1,
+                head_size=576,
+                v_head_dim=512,
+                sinks=False,
+                window=None,
+                quant_mode=QM_FP8_KV_CACHE,
+            ),
+        ),
+        Cell(
+            why="deepseek default at attention TP8: MLA generation, 16 heads per rank",
+            spec=dict(
+                input_type=MLA_GENERATION,
+                num_heads=16,
+                num_kv_heads=1,
+                head_size=576,
+                v_head_dim=512,
+                sinks=False,
+                window=None,
+                quant_mode=QM_FP8_KV_CACHE,
+            ),
+        ),
+        # MTP3 under attention TP: the verify step's taller query block (draft
+        # length 3 + 1 rows per sequence) at a split head count. The P > 1 mask
+        # itself is pinned at 128 heads by the MTP cases in the test.
+        Cell(
+            why="deepseek default MTP3 at attention TP8: MLA generation, 16 heads, P=4",
+            spec=dict(
+                input_type=MLA_GENERATION,
+                num_heads=16,
+                num_kv_heads=1,
+                head_size=576,
+                v_head_dim=512,
+                sinks=False,
+                window=None,
+                quant_mode=QM_FP8_KV_CACHE,
+                predicted_tokens_per_seq=4,
             ),
         ),
         Cell(
