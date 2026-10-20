@@ -1,0 +1,8 @@
+API walkthrough
+===============
+Source https://github.com/NVIDIA/TensorRT-LLM/blob/0372799d1543ef5920c1318b829cf127800dbcb9/examples/visual_gen/api_walkthrough.py.
+
+.. literalinclude:: ../../../examples/visual_gen/api_walkthrough.py
+    :lines: 3-71
+    :language: python
+    :linenos:

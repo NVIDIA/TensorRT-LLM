@@ -1,0 +1,1241 @@
+
+<!DOCTYPE html>
+
+
+<html lang="en" data-content_root="../../" >
+
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+    <title>KV Cache Compression in TensorRT LLM &#8212; TensorRT LLM</title>
+  
+  
+  
+  <script data-cfasync="false">
+    document.documentElement.dataset.mode = localStorage.getItem("mode") || "";
+    document.documentElement.dataset.theme = localStorage.getItem("theme") || "";
+  </script>
+  <!--
+    this give us a css class that will be invisible only if js is disabled
+  -->
+  <noscript>
+    <style>
+      .pst-js-only { display: none !important; }
+
+    </style>
+  </noscript>
+  
+  <!-- Loaded before other Sphinx assets -->
+  <link href="../../_static/styles/theme.css?digest=18bd87630a240e9c25be" rel="stylesheet" />
+<link href="../../_static/styles/pydata-sphinx-theme.css?digest=18bd87630a240e9c25be" rel="stylesheet" />
+
+    <link rel="stylesheet" type="text/css" href="../../_static/pygments.css?v=8f2a1f02" />
+    <link rel="stylesheet" type="text/css" href="../../_static/styles/nvidia-sphinx-theme.css?v=933278ad" />
+    <link rel="stylesheet" type="text/css" href="../../_static/copybutton.css?v=76b2166b" />
+    <link rel="stylesheet" type="text/css" href="../../_static/autodoc_pydantic.css" />
+    <link rel="stylesheet" type="text/css" href="../../_static/togglebutton.css?v=9c3e77be" />
+    <link rel="stylesheet" type="text/css" href="../../_static/config_selector.css?v=4351f35f" />
+    <link rel="stylesheet" type="text/css" href="../../_static/custom.css?v=19d20f17" />
+  
+  <!-- So that users can add custom icons -->
+  <script defer src="../../_static/scripts/fontawesome.js?digest=18bd87630a240e9c25be"></script>
+  <!-- Pre-loaded scripts that we'll load fully later -->
+  <link rel="preload" as="script" href="../../_static/scripts/bootstrap.js?digest=18bd87630a240e9c25be" />
+<link rel="preload" as="script" href="../../_static/scripts/pydata-sphinx-theme.js?digest=18bd87630a240e9c25be" />
+
+
+
+    <script src="../../_static/documentation_options.js?v=5929fcd5"></script>
+    <script src="../../_static/doctools.js?v=9a2dae69"></script>
+    <script src="../../_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="../../_static/clipboard.min.js?v=a7894cd8"></script>
+    <script src="../../_static/copybutton.js?v=65e89d2a"></script>
+    <script src="../../_static/config_selector.js?v=db50c9f4"></script>
+    <script>let toggleHintShow = 'Click to show';</script>
+    <script>let toggleHintHide = 'Click to hide';</script>
+    <script>let toggleOpenOnPrint = 'true';</script>
+    <script src="../../_static/togglebutton.js?v=b8b12719"></script>
+    <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
+    <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
+    <script>DOCUMENTATION_OPTIONS.pagename = 'blogs/tech_blog/blog30_KV_Cache_Compression_in_TensorRT-LLM';</script>
+    <script>
+        DOCUMENTATION_OPTIONS.theme_version = '0.23.0';
+        DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc1';
+        DOCUMENTATION_OPTIONS.show_version_warning_banner =
+            false;
+        </script>
+    <script>DOCUMENTATION_OPTIONS.search_as_you_type = false;</script>
+
+    <link rel="icon" href="../../_static/favicon.png"/>
+
+    <link rel="index" title="Index" href="../../genindex.html" />
+    <link rel="search" title="Search" href="../../search.html" />
+    <link rel="next" title="GVR V2: Self-Sampling and Multi-Thresholding for Faster Exact Top-K" href="blog29_GVR_V2_Self_Sampling_Exact_TopK_for_Sparse_Attention.html" />
+    <link rel="prev" title="Telemetry" href="../../developer-guide/telemetry.html" />
+
+
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="color-scheme" content="light dark"/>
+  <meta name="docsearch:language" content="en"/>
+  <meta name="docsearch:version" content="1.4.0rc1" />
+  
+    
+    <script src="../../_static/searchtools.js"></script>
+    <script src="../../_static/language_data.js"></script>
+    <script src="../../searchindex.js"></script>
+  
+
+
+  </head>
+
+  <body data-default-mode="">
+
+
+  
+  
+  <div id="pst-skip-link" class="skip-link d-print-none"><a href="#main-content">Skip to main content</a></div>
+
+  
+  <div id="pst-scroll-pixel-helper"></div>
+  
+  <button type="button" class="btn rounded-pill" id="pst-back-to-top">
+    <i class="fa-solid fa-arrow-up"></i>Back to top</button>
+  
+  
+  
+  
+  <dialog id="pst-search-dialog">
+    
+<form class="bd-search d-flex align-items-center"
+      action="../../search.html"
+      method="get">
+  <i class="fa-solid fa-magnifying-glass"></i>
+  <input type="search"
+         class="form-control"
+         name="q"
+         placeholder="Search the docs ..."
+         aria-label="Search the docs ..."
+         autocomplete="off"
+         autocorrect="off"
+         autocapitalize="off"
+         spellcheck="false"/>
+  <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd>K</kbd></span>
+</form>
+  </dialog>
+
+  <div class="pst-async-banner-revealer d-none">
+  <aside id="bd-header-version-warning" class="d-none d-print-none" aria-label="Version warning"></aside>
+</div>
+
+  
+    <header id="pst-header" class="bd-header navbar navbar-expand-lg bd-navbar d-print-none">
+<div class="bd-header__inner bd-page-width">
+  <button type="button" class="pst-navbar-icon sidebar-toggle primary-toggle" aria-label="Site navigation">
+    <span class="fa-solid fa-bars"></span>
+  </button>
+  
+  
+  <div class="col-lg-3 navbar-header-items__start">
+    
+      <div class="navbar-item">
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../../index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="../../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT LLM - Home"/>
+    <img src="../../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT LLM - Home"/>
+  
+  
+    <p class="title logo__title">TensorRT LLM</p>
+  
+</a></div>
+    
+  </div>
+  
+  <div class="col-lg-9 navbar-header-items">
+    
+    <div class="me-auto navbar-header-items__center">
+      
+        <div class="navbar-item">
+
+
+<div class="version-switcher__container dropdown pst-js-only">
+  <button id="pst-version-switcher-button-2"
+    type="button"
+    class="version-switcher__button btn btn-sm dropdown-toggle"
+    data-bs-toggle="dropdown"
+    aria-haspopup="listbox"
+    aria-controls="pst-version-switcher-list-2"
+    aria-label="Version switcher list"
+  >
+    Choose version  <!-- this text may get changed later by javascript -->
+    <span class="caret"></span>
+  </button>
+  <div id="pst-version-switcher-list-2"
+    class="version-switcher__menu dropdown-menu list-group-flush py-0"
+    role="listbox" aria-labelledby="pst-version-switcher-button-2">
+    <!-- dropdown will be populated by javascript on page load -->
+  </div>
+</div></div>
+      
+    </div>
+    
+    
+    <div class="navbar-header-items__end">
+      
+        <div class="navbar-item navbar-persistent--container">
+          
+
+<button type="button" class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+        </div>
+      
+      
+        <div class="navbar-item">
+
+<div class="theme-switch-container dropdown pst-js-only" data-bs-toggle="tooltip" data-bs-placement="bottom" title="Color mode">
+  <button type="button" class="btn btn-sm nav-link pst-navbar-icon theme-switch-button dropdown-toggle" aria-label="Color mode" data-bs-toggle="dropdown">
+    <i class="theme-switch fa-solid fa-sun fa-lg fa-fw" data-mode="light" title="Light"></i>
+    <i class="theme-switch fa-solid fa-moon fa-lg fa-fw" data-mode="dark" title="Dark"></i>
+    <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg fa-fw" data-mode="auto" title="System Settings"></i>
+  </button>
+  <ul class="dropdown-menu dropdown-menu-end">
+    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="auto"><i class="fa-solid fa-circle-half-stroke fa-lg fa-fw me-1"></i>System Settings</button></li>
+    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="light"><i class="fa-solid fa-sun fa-lg fa-fw me-1"></i>Light</button></li>
+    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="dark"><i class="fa-solid fa-moon fa-lg fa-fw me-1"></i>Dark</button></li>
+  </ul>
+</div></div>
+      
+    </div>
+    
+  </div>
+  
+  
+    <div class="navbar-persistent--mobile">
+
+<button type="button" class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+    </div>
+  
+
+  
+    <button type="button" class="pst-navbar-icon sidebar-toggle secondary-toggle" aria-label="On this page">
+      <span class="fa-solid fa-outdent"></span>
+    </button>
+  
+</div>
+
+    </header>
+  
+
+  <div class="bd-container">
+    <div class="bd-container__inner bd-page-width">
+      
+      
+      
+      <dialog id="pst-primary-sidebar-modal"></dialog>
+      <div id="pst-primary-sidebar" class="bd-sidebar-primary bd-sidebar">
+        
+
+
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../../index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="../../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT LLM - Home"/>
+    <img src="../../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT LLM - Home"/>
+  
+  
+    <p class="title logo__title">TensorRT LLM</p>
+  
+</a>
+
+
+  
+  <div class="sidebar-header-items sidebar-primary__section">
+    
+    
+      <div class="sidebar-header-items__center">
+        
+          
+          
+            <div class="navbar-item">
+
+
+<div class="version-switcher__container dropdown pst-js-only">
+  <button id="pst-version-switcher-button-3"
+    type="button"
+    class="version-switcher__button btn btn-sm dropdown-toggle"
+    data-bs-toggle="dropdown"
+    aria-haspopup="listbox"
+    aria-controls="pst-version-switcher-list-3"
+    aria-label="Version switcher list"
+  >
+    Choose version  <!-- this text may get changed later by javascript -->
+    <span class="caret"></span>
+  </button>
+  <div id="pst-version-switcher-list-3"
+    class="version-switcher__menu dropdown-menu list-group-flush py-0"
+    role="listbox" aria-labelledby="pst-version-switcher-button-3">
+    <!-- dropdown will be populated by javascript on page load -->
+  </div>
+</div></div>
+          
+        
+      </div>
+    
+    
+    
+      <div class="sidebar-header-items__end">
+        
+          <div class="navbar-item">
+
+<div class="theme-switch-container dropdown pst-js-only" data-bs-toggle="tooltip" data-bs-placement="bottom" title="Color mode">
+  <button type="button" class="btn btn-sm nav-link pst-navbar-icon theme-switch-button dropdown-toggle" aria-label="Color mode" data-bs-toggle="dropdown">
+    <i class="theme-switch fa-solid fa-sun fa-lg fa-fw" data-mode="light" title="Light"></i>
+    <i class="theme-switch fa-solid fa-moon fa-lg fa-fw" data-mode="dark" title="Dark"></i>
+    <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg fa-fw" data-mode="auto" title="System Settings"></i>
+  </button>
+  <ul class="dropdown-menu dropdown-menu-end">
+    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="auto"><i class="fa-solid fa-circle-half-stroke fa-lg fa-fw me-1"></i>System Settings</button></li>
+    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="light"><i class="fa-solid fa-sun fa-lg fa-fw me-1"></i>Light</button></li>
+    <li><button type="button" class="dropdown-item d-flex align-items-center theme-change-button" data-mode="dark"><i class="fa-solid fa-moon fa-lg fa-fw me-1"></i>Dark</button></li>
+  </ul>
+</div></div>
+        
+      </div>
+    
+  </div>
+  
+    <div class="sidebar-primary-items__start sidebar-primary__section">
+        <div class="sidebar-primary-item">
+
+
+
+<nav class="bd-docs-nav bd-links"
+     aria-label="Table of Contents">
+  <p class="bd-links__title" role="heading" aria-level="1">Table of Contents</p>
+  <div class="bd-toc-item navbar-nav"><p aria-level="2" class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../quick-start-guide.html">Quick Start Guide</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../installation/index.html">Installation</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../installation/installation-guide.html">Installation Guide</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../installation/build-from-source.html">Build from Source</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../installation/containers.html">Container Images</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../../supported-hardware.html">Supported Hardware</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Deployment Guide</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../examples/llm_api_examples.html">LLM Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_inference.html">Generate text</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_inference_async.html">Generate text asynchronously</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_inference_async_streaming.html">Generate text in streaming</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_inference_distributed.html">Distributed LLM Generation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_guided_decoding.html">Generate text with guided decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_logits_processor.html">Control generated text using logits processor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_sparse_attention.html">Sparse Attention</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_speculative_decoding.html">Speculative Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_kv_cache_compression.html">KV Cache Compression</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_kv_cache_connector.html">KV Cache Connector</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_kv_cache_connector_vswa.html">KV Cache Connector under VSWA</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_kv_cache_offloading.html">KV Cache Offloading</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_runtime.html">Runtime Configuration Examples</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_sampling.html">Sampling Techniques Showcase</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_lmcache_connector.html">LMCache KV Cache Connector</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_mgmn_llm_distributed.html">Run LLM-API with pytorch backend on Slurm</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_mgmn_trtllm_bench.html">Run trtllm-bench with pytorch backend on Slurm</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_mgmn_trtllm_serve.html">Run trtllm-serve with pytorch backend on Slurm</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../examples/visual_gen_examples.html">VisualGen Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/api_walkthrough.html">API walkthrough</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../examples/trtllm_serve_examples.html">Online Serving Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/aiperf_client.html">Aiperf Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/aiperf_client_for_multimodal.html">Aiperf Client For Multimodal</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/curl_chat_client.html">Curl Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/curl_chat_client_for_multimodal.html">Curl Chat Client For Multimodal</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/curl_completion_client.html">Curl Completion Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/curl_responses_client.html">Curl Responses Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/deepseek_r1_reasoning_parser.html">Deepseek R1 Reasoning Parser</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_chat_client.html">OpenAI Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_chat_client_for_multimodal.html">OpenAI Chat Client for Multimodal</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_completion_client.html">OpenAI Completion Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_completion_client_for_lora.html">Openai Completion Client For Lora</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_completion_client_json_schema.html">OpenAI Completion Client with JSON Schema</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_responses_client.html">OpenAI Responses Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/prometheus_metrics.html">Prometheus Metrics</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../../examples/dynamo_k8s_example.html">Dynamo K8s Example</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../deployment-guide/index.html">Model Recipes</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-nemotron-3-on-trtllm.html">Deployment Guide for Nemotron v3 (Ultra &amp; Super) on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-gpt-oss-on-trtllm.html">Deployment Guide for GPT-OSS on TensorRT-LLM - Blackwell Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-qwen3-on-trtllm.html">Deployment Guide for Qwen3 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-qwen3.8-qwen3.5-on-trtllm.html">Deployment Guide for Qwen3.8 MoE and Qwen3.5 MoE on TensorRT LLM - Blackwell Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-qwen3.8-flash-next-on-trtllm.html">Deployment Guide for Qwen3.8-Flash-Next on TensorRT LLM - Blackwell Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-kimi-k3-on-trtllm.html">Deployment Guide for Kimi K3 on TensorRT LLM - Blackwell</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-glm-5-on-trtllm.html">Deployment Guide for GLM-5 on TensorRT LLM - Blackwell Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-glm-5.3-flash-on-trtllm.html">Deployment Guide for GLM-5.3-Flash on TensorRT LLM - Blackwell Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-minimax-m3-on-trtllm.html">Deployment Guide for MiniMax-M3 on TensorRT LLM</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../../deployment-guide/configuring-cpu-affinity.html">CPU Affinity configuration in TensorRT LLM</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Models</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../models/supported-models.html">Supported Models</a></li>
+
+
+
+<li class="toctree-l1"><a class="reference internal" href="../../models/visual-generation.html">Visual Generation (Beta)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../models/adding-new-model.html">Adding a New Model</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">CLI Reference</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../commands/trtllm-bench.html">trtllm-bench</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../commands/trtllm-eval.html">trtllm-eval</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../commands/trtllm-serve/index.html">trtllm-serve</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../commands/trtllm-serve/trtllm-serve.html">trtllm-serve</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../commands/trtllm-serve/run-benchmark-with-trtllm-serve.html">Run benchmarking with <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code></a></li>
+</ul>
+</details></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">API Reference</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../llm-api/index.html">LLM API Introduction</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../llm-api/reference.html">API Reference</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/LLM.html">LLM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/AsyncLLM.html">AsyncLLM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/ExecutorMemoryType.html">ExecutorMemoryType</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/RuntimeMemoryStatus.html">RuntimeMemoryStatus</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SleepConfig.html">SleepConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/MultimodalEncoder.html">MultimodalEncoder</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/CompletionOutput.html">CompletionOutput</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/RequestOutput.html">RequestOutput</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/GuidedDecodingParams.html">GuidedDecodingParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SamplingParams.html">SamplingParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DisaggregatedParams.html">DisaggregatedParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/ConversationParams.html">ConversationParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DisaggScheduleStyle.html">DisaggScheduleStyle</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/BlockReuseConfig.html">BlockReuseConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/KvCacheConfig.html">KvCacheConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/KVEventsConfig.html">KVEventsConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/MambaStateConfig.html">MambaStateConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/KvCacheRetentionConfig.html">KvCacheRetentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/CudaGraphConfig.html">CudaGraphConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DecodeCudaGraphConfig.html">DecodeCudaGraphConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/EncodeCudaGraphConfig.html">EncodeCudaGraphConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/EncodeExtraInputSpec.html">EncodeExtraInputSpec</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/MoeConfig.html">MoeConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/EagleDecodingConfig.html">EagleDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/Eagle3DecodingConfig.html">Eagle3DecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/MTPDecodingConfig.html">MTPDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SchedulerConfig.html">SchedulerConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/CapacitySchedulerPolicy.html">CapacitySchedulerPolicy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/QuantConfig.html">QuantConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/QuantAlgo.html">QuantAlgo</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/CalibConfig.html">CalibConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/RequestError.html">RequestError</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/MpiCommSession.html">MpiCommSession</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/ExtendedRuntimePerfKnobConfig.html">ExtendedRuntimePerfKnobConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/BatchingType.html">BatchingType</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/ContextChunkingPolicy.html">ContextChunkingPolicy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DynamicBatchConfig.html">DynamicBatchConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/CacheTransceiverConfig.html">CacheTransceiverConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/NGramDecodingConfig.html">NGramDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/PARDDecodingConfig.html">PARDDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DFlashDecodingConfig.html">DFlashDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DSparkDecodingConfig.html">DSparkDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SADecodingConfig.html">SADecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SAEnhancerConfig.html">SAEnhancerConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/UserProvidedDecodingConfig.html">UserProvidedDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/TorchCompileConfig.html">TorchCompileConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DraftTargetDecodingConfig.html">DraftTargetDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/LlmArgs.html">LlmArgs</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/TorchLlmArgs.html">TorchLlmArgs</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/AutoDecodingConfig.html">AutoDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/AttentionDpConfig.html">AttentionDpConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/LoRARequest.html">LoRARequest</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SaveHiddenStatesDecodingConfig.html">SaveHiddenStatesDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/RocketSparseAttentionConfig.html">RocketSparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/QSASparseAttentionConfig.html">QSASparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/ReorderRequestPolicyConfig.html">ReorderRequestPolicyConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DeepSeekSparseAttentionConfig.html">DeepSeekSparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DeepSeekV4SparseAttentionConfig.html">DeepSeekV4SparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/MiniMaxM3SparseAttentionConfig.html">MiniMaxM3SparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SchedulingParams.html">SchedulingParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SkipSoftmaxAttentionConfig.html">SkipSoftmaxAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/ColdPageQuantizationCompressionConfig.html">ColdPageQuantizationCompressionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/TriAttentionKvCacheCompressionConfig.html">TriAttentionKvCacheCompressionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/PrometheusMetricsConfig.html">PrometheusMetricsConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/PrefillCudaGraphBackend.html">PrefillCudaGraphBackend</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/ThinkingBudgetLogitsProcessor.html">ThinkingBudgetLogitsProcessor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/add_thinking_budget_logits_processor.html">add_thinking_budget_logits_processor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/MultimodalConfig.html">MultimodalConfig</a></li>
+</ul>
+</details></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Features</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../features/feature-combination-matrix.html">Feature Combination Matrix</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/disagg-serving.html">Disaggregated Serving</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/subagent-routing.html">Sub-agent Routing</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/embeddings.html">Embeddings (Encoder-Only Models)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/kvcache.html">KV Cache System</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/kv-cache-compression.html">KV Cache Compression</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/long-sequence.html">Long Sequences</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/lora.html">LoRA (Low-Rank Adaptation)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/multi-modality.html">Multimodal Support in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/overlap-scheduler.html">Overlap Scheduler</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/paged-attention-ifb-scheduler.html">Paged Attention, IFB, and Request Scheduling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/parallel-strategy.html">Parallelism in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/quantization.html">Quantization</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/sampling.html">Sampling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/additional-outputs.html">Additional Outputs</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/post-processor-hook.html">Post-Processing Hook</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/guided-decoding.html">Guided Decoding</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/speculative-decoding.html">Speculative Decoding</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/checkpoint-loading.html">Checkpoint Loading</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/model-express.html">ModelExpress (MX) Checkpoint Loading</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/sleep-wakeup.html">Runtime Memory Checkpointing (Prototype)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/ray-orchestrator.html">Ray Orchestrator (Prototype)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/torch_compile_and_piecewise_cuda_graph.html">Torch Compile &amp; Prefill CUDA Graph</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/helix.html">Helix Parallelism</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/kv-cache-connector.html">KV Cache Connector</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/sparse-attention.html">Sparse Attention</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../features/visual-generation.html">Visual Generation (Beta)</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../features/visualgen-cuda-graph.html">CUDA Graphs</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../features/visualgen-quantized-attention.html">Quantized Attention</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../features/visualgen-sparse-attention.html">Sparse Attention</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/prefix-tokenization-cache.html">Prefix-Tokenization Cache</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Developer Guide</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/overview.html">Architecture Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/perf-analysis.html">Performance Analysis</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/perf-benchmarking.html">TensorRT LLM Benchmarking</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../developer-guide/moe-perf-guide.html">MoE Performance Guide</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../developer-guide/moe-perf-dashboard.html">MoE Perf Dashboard</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/ci-overview.html">Continuous Integration Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/dev-containers.html">Using Dev Containers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/api-change.html">LLM API Change Guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/kv-transfer.html">Introduction to KV Cache Transmission</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/kv-cache-cold-page-codec.html">KVCacheManagerV2 Cold-Page Codec Design</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/kv-cache-compression-development.html">KV Cache Compression Development Guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/sparse-attention-development-guide.html">Sparse Attention Development Guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/telemetry.html">Telemetry</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
+<ul class="current nav bd-sidenav">
+<li class="toctree-l1 current active"><a aria-current="page" class="current reference internal" href="#">KV Cache Compression in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog29_GVR_V2_Self_Sampling_Exact_TopK_for_Sparse_Attention.html">GVR V2: Self-Sampling and Multi-Thresholding for Faster Exact Top-K</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog28_Accelerating_Video_Generation_with_GEMM_Quantization_Attention_Quantization_and_Skip_Softmax_Attention_in_TensorRT-LLM.html">Accelerating Video Generation with GEMM Quantization, Attention Quantization and Skip Softmax Attention in TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog27_Evaluating_Agentic_Serving_with_Trace_Replay_and_Job_Level_Metrics.html">Evaluating Agentic Serving with Trace Replay and Job-Level Metrics</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog26_DeepSeek_V4_on_NVIDIA_Blackwell_Model_Specific_and_Agentic_Workload_Optimizations_in_TensorRT-LLM.html">DeepSeek-V4 on NVIDIA Blackwell: Model-Specific and Agentic-Workload Optimizations in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog25_Scaling_Video_Generation_Across_NVL72_Rack_with_TensorRT-LLM.html">Scaling Video Generation Across NVL72 rack with TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog24_MoE_as_Dense_GEMM.html">MoE as Dense GEMM: Optimizing Low-Latency MoE Inference on NVIDIA Blackwell</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog23_Joint_Optimization_of_Agent_Applications_and_TensorRT-LLM.html">Joint Optimization of Agent Applications and TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog22_Helix_Parallelism_Scaling_Multi_Million_Token_Decoding_with_KV_Cache_Sharding.html">Helix Parallelism in TensorRT-LLM: Scaling Multi-Million-Token Decoding with KV Cache Sharding</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog21_Temporal_Correlation_Meets_Sparse_Attention.html">Temporal Correlation Meets Sparse Attention: Guess-Verify-Refine Top-K for Blackwell</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog20_Tuning_CUDA_Graph_Batch_Sizes_for_Higher_Output_Throughput.html">Tuning CUDA Graph Batch Sizes for Higher Output Throughput</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog19_DWDP_Distributed_Weight_Data_Parallelism_for_High_Performance_LLM_Inference_on_NVL72.html">DWDP: Distributed Weight Data Parallelism for High-Performance LLM Inference on NVL72</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog18_Optimizing_MoE_Communication_with_One_Sided_AlltoAll_Over_NVLink.html">Optimizing MoE Communication with One-Sided AlltoAll Over NVLink</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog17_Sparse_Attention_in_TensorRT-LLM.html">Sparse Attention in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog16_Accelerating_Long_Context_Inference_with_Skip_Softmax_Attention.html">Accelerating Long-Context Inference with Skip Softmax Attention</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog15_Optimizing_DeepSeek_V32_on_NVIDIA_Blackwell_GPUs.html">Optimizing DeepSeek-V3.2 on NVIDIA Blackwell GPUs</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog14_Scaling_Expert_Parallelism_in_TensorRT-LLM_part3.html">Scaling Expert Parallelism in TensorRT LLM (Part 3: Pushing the Performance Boundary)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog13_Inference_Time_Compute_Implementation_in_TensorRT-LLM.html">Inference Time Compute Implementation in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog12_Combining_Guided_Decoding_and_Speculative_Decoding.html">Combining Guided Decoding and Speculative Decoding: Making CPU and GPU Cooperate Seamlessly</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog11_GPT_OSS_Eagle3.html">Running GPT-OSS-120B with Eagle3 Speculative Decoding on GB200/B200 (TensorRT LLM)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog10_ADP_Balance_Strategy.html">ADP Balance Strategy</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog09_Deploying_GPT_OSS_on_TRTLLM.html">Running a High Performance GPT-OSS-120B Inference Server with TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog08_Scaling_Expert_Parallelism_in_TensorRT-LLM_part2.html">Scaling Expert Parallelism in TensorRT LLM (Part 2: Performance Status and Optimization)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog07_NGram_performance_Analysis_And_Auto_Enablement.html">N-Gram Speculative Decoding in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog06_Llama4_maverick_eagle_guide.html">How to launch Llama4 Maverick + Eagle3 TensorRT LLM server</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog05_Disaggregated_Serving_in_TensorRT-LLM.html">Disaggregated Serving in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog04_Scaling_Expert_Parallelism_in_TensorRT-LLM.html">Scaling Expert Parallelism in TensorRT LLM (Part 1: Design and Implementation of Large-scale EP)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog03_Optimizing_DeepSeek_R1_Throughput_on_NVIDIA_Blackwell_GPUs.html">Optimizing DeepSeek R1 Throughput on NVIDIA Blackwell GPUs: A Deep Dive for Developers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog02_DeepSeek_R1_MTP_Implementation_and_Optimization.html">DeepSeek R1 MTP Implementation and Optimization</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog01_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs.html">Pushing Latency Boundaries: Optimizing DeepSeek-R1 Performance on NVIDIA B200 GPUs</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../Best_perf_practice_on_DeepSeek-R1_in_TensorRT-LLM.html">How to get best performance on DeepSeek-R1 in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../H200launch.html">H200 achieves nearly 12,000 tokens/sec on Llama2-13B with TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../XQA-kernel.html">New XQA-kernel provides 2.4x more Llama-70B throughput within the same latency budget</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../H100vsA100.html">H100 has 4.6x A100 Performance in TensorRT LLM, achieving 10,000 tok/s at 100ms to first token</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../Falcon180B-H200.html">Falcon-180B on a single H200 GPU with INT4 AWQ, and 6.7x faster Llama-70B over A100</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../quantization-in-TRT-LLM.html">Speed up inference with SOTA quantization techniques in TRT-LLM</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Quick Links</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/releases">Releases</a></li>
+<li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM">Github Code</a></li>
+<li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/issues?q=is%3Aissue%20state%3Aopen%20label%3Aroadmap">Roadmap</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Migration</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../legacy/tensorrt-backend-removal.html">Migration Guide: TensorRT Backend Removed</a></li>
+</ul>
+</div>
+</nav></div>
+    </div>
+  
+  
+  <div class="sidebar-primary-items__end sidebar-primary__section">
+  </div>
+
+
+
+      </div>
+      
+      <main id="main-content" class="bd-main" role="main">
+        
+        
+          <div class="bd-content">
+            <div class="bd-article-container">
+              
+              <div class="bd-header-article d-print-none">
+<div class="header-article-items header-article__inner">
+  
+    <div class="header-article-items__start">
+      
+        <div class="header-article-item">
+
+<nav aria-label="Breadcrumb" class="d-print-none">
+  <ul class="bd-breadcrumbs">
+    
+    <li class="breadcrumb-item breadcrumb-home">
+      <a href="../../index.html" class="nav-link" aria-label="Home">
+        <i class="fa-solid fa-home"></i>
+      </a>
+    </li>
+    <li class="breadcrumb-item active" aria-current="page"><span class="ellipsis">KV Cache Compression in TensorRT LLM</span></li>
+  </ul>
+</nav>
+</div>
+      
+    </div>
+  
+  
+</div>
+</div>
+              
+              
+              
+                
+<div id="searchbox"></div>
+                <article class="bd-article">
+                  
+  <section class="tex2jax_ignore mathjax_ignore" id="kv-cache-compression-in-tensorrt-llm">
+<h1>KV Cache Compression in TensorRT LLM<a class="headerlink" href="#kv-cache-compression-in-tensorrt-llm" title="Link to this heading">#</a></h1>
+<p><strong>Table of Contents</strong></p>
+<ul class="simple">
+<li><p><a class="reference internal" href="#introduction-and-motivation">Introduction and Motivation</a></p></li>
+<li><p><a class="reference internal" href="#overview-of-kv-cache-compression-in-tensorrt-llm">Overview of KV Cache Compression in TensorRT LLM</a></p></li>
+<li><p><a class="reference internal" href="#kv-cache-compression-framework-design">KV Cache Compression Framework Design</a></p>
+<ul>
+<li><p><a class="reference internal" href="#design-philosophy">Design Philosophy</a></p></li>
+<li><p><a class="reference internal" href="#architecture-overview">Architecture Overview</a></p></li>
+<li><p><a class="reference internal" href="#configuration-and-setup-of-kv-cache-compression">Configuration and Setup of KV Cache Compression</a></p></li>
+<li><p><a class="reference internal" href="#kv-cache-compression-in-the-executor-iteration-loop">KV Cache Compression in the Executor Iteration Loop</a></p></li>
+<li><p><a class="reference internal" href="#kv-cache-compression-in-cross-request-kv-management">KV Cache Compression in Cross-Request KV Management</a></p></li>
+</ul>
+</li>
+<li><p><a class="reference internal" href="#algorithm-implementations">Algorithm Implementations</a></p>
+<ul>
+<li><p><a class="reference internal" href="#nvfp4-cold-page-compression">NVFP4 Cold-Page Compression</a></p></li>
+<li><p><a class="reference internal" href="#triattention">TriAttention</a></p></li>
+</ul>
+</li>
+<li><p><a class="reference internal" href="#evaluation">Evaluation</a></p>
+<ul>
+<li><p><a class="reference internal" href="#id4">NVFP4 Cold-Page Compression</a></p></li>
+<li><p><a class="reference internal" href="#id5">TriAttention</a></p></li>
+</ul>
+</li>
+<li><p><a class="reference internal" href="#summary-and-future-work">Summary and Future Work</a></p>
+<ul>
+<li><p><a class="reference internal" href="#current-state">Current State</a></p></li>
+<li><p><a class="reference internal" href="#future-work">Future Work</a></p></li>
+</ul>
+</li>
+</ul>
+<section id="introduction-and-motivation">
+<h2>Introduction and Motivation<a class="headerlink" href="#introduction-and-motivation" title="Link to this heading">#</a></h2>
+<p>Agentic workloads change what a serving system has to do. Instead of answering once, an agent works through a job in many steps, and it calls the model again with every tool result. Each call carries the whole conversation so far, so the prompt grows turn by turn while the answer stays short. Figure 1 shows how far production traffic has already moved in this direction: prompts dominate and keep getting longer, the KV cache behind them runs to tens of gigabytes per conversation, almost every prompt is a prefix the system has seen before, and that prefix comes back within minutes. For this workload <strong>KV cache compression is critical</strong>. Every byte of KV cache saved pays back many times: a smaller cache keeps more turns resident, reuses more prefixes instead of recomputing them, and frees memory for more requests.</p>
+<div align="center">
+<figure>
+  <img src="../media/tech_blog30_workload_facts.svg" width="1000">
+</figure>
+</div>
+<p align="center"><sub><em>Figure 1: LLM serving today. On a one-year production trace, requests are prompt-heavy, outputs are getting shorter, a single long context carries tens of gigabytes of KV, and almost all reuse arrives within minutes. In agentic coding traces, almost the entire prompt is reusable prefix. Sources: <a href="https://arxiv.org/abs/2608.13573">Nixon et al., A Year in LLM Serving (2026)</a> for the first six tiles, and our <a href="https://nvidia.github.io/TensorRT-LLM/blogs/tech_blog/blog27_Evaluating_Agentic_Serving_with_Trace_Replay_and_Job_Level_Metrics.html">trace-replay blog</a> for the last one.</em></sub></p>
+<p>Compression itself is not new. TensorRT LLM already stores the active cache in low precision and lets <a class="reference internal" href="blog17_Sparse_Attention_in_TensorRT-LLM.html"><span class="std std-doc">sparse attention</span></a> skip part of it. Both act inside the forward pass. Yet a KV cache spends most of its life <strong>outside the attention kernel</strong>: waiting between prefill chunks and decode steps, parked while a tool runs, kept after the request for the next turn, and moved to host or disk memory when the GPU is full. Each of these moments is a chance to compress, and until now no part of the serving stack was in charge of them. This blog introduces a <strong>KV cache compression framework</strong> that turns these moments into well-defined attachment points and lets any compression method plug into the ones it needs. The cache manager keeps ownership of every page and the attention kernels never see a compressed page, so one framework serves every model and compression can be co-designed with storage, transfer and compute at the system level. Two methods ship on it today:</p>
+<ul class="simple">
+<li><p><strong><a class="reference internal" href="#nvfp4-cold-page-compression">NVFP4 cold-page compression</a></strong>: keeps attention KV pages in NVFP4 only while they are <strong>cold</strong>, that is, while they sit in host or disk memory. The conversion runs inside the copy, and the page returns to its original precision when it comes back to the GPU. On an agentic replay with a growing disk tier it completes up to <strong>1.64x the requests</strong> with up to <strong>1.9x lower time to first token</strong> on the same hardware.</p></li>
+<li><p><strong><a class="reference internal" href="#triattention">TriAttention</a></strong>: a training-free method that periodically scores the tokens generated so far and <strong>evicts the least useful ones</strong> between decoding steps once a sequence exceeds its budget. On Qwen3-8B it delivers up to <strong>1.6x the decode throughput</strong> at the same batch size and <strong>2.7x the dense peak</strong> once the dense cache runs out of memory, with accuracy within noise of dense from an 8k-token budget on.</p></li>
+</ul>
+<p>The next section gives an overview of what ships, followed by the framework design, how each method is built on it, and the evaluation.</p>
+</section>
+<section id="overview-of-kv-cache-compression-in-tensorrt-llm">
+<h2>Overview of KV Cache Compression in TensorRT LLM<a class="headerlink" href="#overview-of-kv-cache-compression-in-tensorrt-llm" title="Link to this heading">#</a></h2>
+<p>The general idea is simple: <strong>shrink the KV cache at every safe point of the serving workflow, not only inside the forward pass</strong>. Figure 2 shows how this fits with the two paths TensorRT LLM already has. Active KV cache quantization sets the data type of the GPU cache and is read and written by every forward step. Sparse attention changes which KV entries attention keeps or reads. The <strong>KV cache compression framework</strong> covers the rest: it runs at stable boundaries outside the forward pass, between steps or when a page moves between cache tiers, and it works on KV pages across the whole inference system, from the GPU cache at runtime to host and disk storage.</p>
+<div align="center">
+<figure>
+  <img src="../media/tech_blog30_trtllm_stack.svg" width="1000">
+</figure>
+</div>
+<p align="center"><sub><em>Figure 2: The TensorRT LLM stack. KV cache compression sits in the compression layer next to quantization and sparse attention. It changes what is stored in the KV cache and touches neither the kernels below nor the serving layers above.</em></sub></p>
+<p>To demonstrate the framework’s generality, we have built two methods on it that act at different points in the life of a KV cache:</p>
+<ul class="simple">
+<li><p><strong>NVFP4 cold-page compression</strong>: stores attention KV pages as NVFP4 while they sit in host or disk memory. A page is encoded on the way out and decoded on the way back, so the GPU cache and the attention kernels keep the model’s normal KV data type.</p></li>
+<li><p><strong>TriAttention</strong>: runs between decode steps. It scores the generated tokens with an importance measure calibrated offline per attention head and keeps only a fixed budget of them. The prompt is never touched.</p></li>
+</ul>
+<p>The two tables below summarize the current coverage.</p>
+<div align="center">
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head text-left"><p>Method</p></th>
+<th class="head text-left"><p>When It Runs</p></th>
+<th class="head text-left"><p>What It Changes</p></th>
+<th class="head text-left"><p>Supported Attention Types<a class="footnote-reference brackets" href="#attn-types" id="id1" role="doc-noteref"><span class="fn-bracket">[</span>1<span class="fn-bracket">]</span></a></p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td class="text-left"><p><strong>NVFP4 cold-page compression</strong></p></td>
+<td class="text-left"><p>When a page moves between the GPU and host or disk memory</p></td>
+<td class="text-left"><p>How attention KV is stored while off the GPU</p></td>
+<td class="text-left"><p>MHA / MQA / GQA / MLA / hybrid</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p><strong>TriAttention</strong></p></td>
+<td class="text-left"><p>Periodically between decode steps</p></td>
+<td class="text-left"><p>Which KV tokens are kept</p></td>
+<td class="text-left"><p>MHA / MQA / GQA</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p align="center"><sub><em>Table 1. The two methods built on the framework: when each one runs, what it changes, and the attention types it supports.</em></sub></p>
+</div>
+<div align="center">
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head text-left"><p>Memory Tier</p></th>
+<th class="head text-left"><p>NVFP4 Cold-Page Compression</p></th>
+<th class="head text-left"><p>TriAttention</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td class="text-left"><p><strong>GPU (active KV)</strong></p></td>
+<td class="text-left"><p>Unchanged (FP16 / BF16 / FP8)</p></td>
+<td class="text-left"><p>Generated tokens evicted periodically</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p><strong>Host memory</strong></p></td>
+<td class="text-left"><p>NVFP4</p></td>
+<td class="text-left"><p>Not affected</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p><strong>Disk</strong></p></td>
+<td class="text-left"><p>NVFP4</p></td>
+<td class="text-left"><p>Not affected</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p align="center"><sub><em>Table 2. What each method does to the KV cache in each memory tier.</em></sub></p>
+</div>
+<p><strong>Note</strong>: Currently, this design targets and is optimized for NVIDIA Blackwell GPUs and newer architectures.</p>
+<p>The rest of the blog covers the framework design shared by all methods, with cold-page compression as the worked example. The framework landed in <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/pull/15106">#15106</a> and its runtime integration in <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/pull/15697">#15697</a>. The interface between the cache manager and a page encoder is in the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/developer-guide/kv-cache-cold-page-codec.md">cold-page codec design guide</a>, and the APIs for adding a method are in the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/developer-guide/kv-cache-compression-development.md">KV Cache Compression Development Guide</a>.</p>
+</section>
+<section id="kv-cache-compression-framework-design">
+<h2>KV Cache Compression Framework Design<a class="headerlink" href="#kv-cache-compression-framework-design" title="Link to this heading">#</a></h2>
+<p>Our goals for the framework are two. A user turns a compression method on with <strong>one configuration block</strong> and nothing else. A developer adds a new method with <strong>plain Python and kernels</strong>, without touching the runtime. The framework takes care of the rest.</p>
+<section id="design-philosophy">
+<h3>Design Philosophy<a class="headerlink" href="#design-philosophy" title="Link to this heading">#</a></h3>
+<p>Beyond the forward pass, a serving system offers <strong>extra opportunities to compress the KV cache</strong>: moments where the KV already exists, nothing is reading it, and a dedicated algorithm can run at exactly that time. Using them well means three things:</p>
+<ul class="simple">
+<li><p><strong>Untouched attention</strong>: attention reads the KV cache as before.</p></li>
+<li><p><strong>Seamless insertion</strong>: no exposed overhead; the compression kernels hide inside existing steps and nothing else in the runtime changes.</p></li>
+<li><p><strong>General to models</strong>: works on KV pages, not on model-specific operators.</p></li>
+</ul>
+<p>To insert precisely, we define five stages in the life of a KV cache (Figure 3):</p>
+<ol class="arabic simple">
+<li><p><strong>Prefill-chunk stage</strong>: after each prefill chunk.</p></li>
+<li><p><strong>After-prefill stage</strong>: right after prefill, before the first decode step.</p></li>
+<li><p><strong>Decode stage</strong>: between decode steps (TriAttention).</p></li>
+<li><p><strong>Tool-call stage</strong>: around a tool call, while the request waits.</p></li>
+<li><p><strong>After-request stage</strong>: after the request, KV kept for reuse on GPU, host or disk (cold-page compression).</p></li>
+</ol>
+<div align="center">
+<figure>
+  <img src="../media/tech_blog30_kv_lifetime_stages.svg" width="900">
+</figure>
+</div>
+<p align="center"><sub><em>Figure 3: Five stages in the life of a KV cache where compression can run. TriAttention acts at the decode stage (stage 3) and cold-page compression at the after-request stage (stage 5). The dashed stages are in scope and have no method yet.</em></sub></p>
+<p>These stages fall into two groups, and each group has its own integration path. Stages 1 to 3 happen while a request is running, so <strong>iteration-driven</strong> methods hook into the executor loop at each stage boundary and transform the retained KV before the next step reads it; TriAttention is one. Stages 4 and 5 happen while no request is running: the cache manager holds the KV, keeps it across requests, and moves it between GPU, host and disk memory. For them we define <strong>cross-request KV management</strong> methods, which run inside the cache manager. A method may use either path or both, and in both the cache manager keeps ownership of every page.</p>
+</section>
+<section id="architecture-overview">
+<h3>Architecture Overview<a class="headerlink" href="#architecture-overview" title="Link to this heading">#</a></h3>
+<p>To keep compression simple and straightforward, the whole design breaks down into three parts, shown in Figure 4, without modifying any existing runtime component:</p>
+<ul class="simple">
+<li><p><strong>Compression config</strong>: one block that selects the method and carries its options; a factory builds the method from it before the model runs.</p></li>
+<li><p><strong>Compression manager</strong>: the class a method inherits. It already sits at every hook in the executor loop and in the cache manager’s page migration; a method overrides the functions for the stages it needs and the compression flow is in place.</p></li>
+<li><p><strong>Method-specific kernels</strong>: a method could bring its own kernels, new algorithms as well as fusions with existing parts of the runtime.</p></li>
+</ul>
+<p>The executor and the KV cache manager are existing components. The framework does not replace them; it meets them at the hooks and leaves scheduling and memory ownership where they are.</p>
+<div align="center">
+<figure>
+  <img src="../media/tech_blog30_framework.svg" width="1000">
+</figure>
+</div>
+<p align="center"><sub><em>Figure 4: The KV cache compression framework and its execution order. The config builds the manager (1). The manager inserts a hook into the executor and one into the KV cache manager (2). The concrete method inherits the manager and runs inside those hooks (3), launching its own kernels (4). Highlighted boxes are the framework parts; white boxes are existing system components, with the stages each one hosts today and in the future.</em></sub></p>
+<p>In the current implementation, <strong>storage-bound</strong> compression is the first cross-request mechanism: it acts when a page moves to host or disk memory and defines how the page is stored there. Today TriAttention implements the decode stage (stage 3) and NVFP4 cold-page compression the offload part of the after-request stage (stage 5). The other stages are reachable the same way and will be filled as new methods need them. The rest of this section covers the configuration and the two paths.</p>
+</section>
+<section id="configuration-and-setup-of-kv-cache-compression">
+<h3>Configuration and Setup of KV Cache Compression<a class="headerlink" href="#configuration-and-setup-of-kv-cache-compression" title="Link to this heading">#</a></h3>
+<p>Turning compression on takes one configuration block, and everything else follows from it: which modules to engage and whether the rest of the setup allows it. The block, <code class="docutils literal notranslate"><span class="pre">kv_cache_compression_config</span></code>, holds:</p>
+<ul class="simple">
+<li><p><strong><code class="docutils literal notranslate"><span class="pre">algorithm</span></code></strong>: which method to run. One method can be active per LLM instance.</p></li>
+<li><p><strong>Method options</strong>: the method’s own parameters, e.g. for TriAttention the token <code class="docutils literal notranslate"><span class="pre">budget</span></code>, the eviction period, the <code class="docutils literal notranslate"><span class="pre">eviction_mode</span></code> and the calibration file.</p></li>
+</ul>
+<p>It works the same in the Python API, in <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code> YAML and in <code class="docutils literal notranslate"><span class="pre">trtllm-bench</span></code>; the full option table is in the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/features/kv-cache-compression.md">KV Cache Compression feature documentation</a>.</p>
+<p>Because compression can happen at many places and stages of TensorRT LLM, initialization has to be deliberate: with the config in hand, the compression manager decides which parts of the runtime to modify and invoke for compression. Before anything is built, a factory reads the block and wires things up: which modules the method engages (the cache manager’s page migration for cold-page compression, the executor loop for TriAttention), whether block reuse and the configured speculative decoding mode stay valid, and whether the platform matches, since some methods target a specific one (e.g. TriAttention currently requires Blackwell or a newer architecture).</p>
+<p>An unsupported combination is rejected with a clear message; otherwise the compression manager is built and bound to <code class="docutils literal notranslate"><span class="pre">KVCacheManagerV2</span></code>. For the interfaces, see the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/developer-guide/kv-cache-compression-development.md">KV cache compression development guide</a>.</p>
+</section>
+<section id="kv-cache-compression-in-the-executor-iteration-loop">
+<h3>KV Cache Compression in the Executor Iteration Loop<a class="headerlink" href="#kv-cache-compression-in-the-executor-iteration-loop" title="Link to this heading">#</a></h3>
+<p>The most important property of the framework is seamless insertion: compression reaches the whole lifecycle of a request inside TensorRT LLM without the runtime learning anything new. This section shows how.</p>
+<p>In the TensorRT LLM executor every iteration follows the same cycle. The scheduler picks a batch of requests; each resource manager prepares its resources for that batch (<code class="docutils literal notranslate"><span class="pre">prepare_resources</span></code>); the model runs one forward pass; each manager updates its state (<code class="docutils literal notranslate"><span class="pre">update_resources</span></code>); and a finished request releases its resources (<code class="docutils literal notranslate"><span class="pre">free_resources</span></code>). These three callbacks are exactly the moments when nothing is reading the cache, so the five stages of Figure 3 become hooks here.</p>
+<p><code class="docutils literal notranslate"><span class="pre">KVCacheCompressionManager</span></code> inherits <code class="docutils literal notranslate"><span class="pre">BaseResourceManager</span></code> and is registered as the last resource manager, so every hook sees the cache already updated. In <code class="docutils literal notranslate"><span class="pre">prepare_resources</span></code> it fires <code class="docutils literal notranslate"><span class="pre">on_request_init</span></code> for a request’s first prefill chunk (stage 1) and <code class="docutils literal notranslate"><span class="pre">on_generation_step_begin</span></code> (stage 3); in <code class="docutils literal notranslate"><span class="pre">update_resources</span></code> it fires <code class="docutils literal notranslate"><span class="pre">on_context_step_end</span></code> for the requests whose last prefill chunk just ran (stage 2) and <code class="docutils literal notranslate"><span class="pre">on_generation_step_end</span></code> (stage 3); in <code class="docutils literal notranslate"><span class="pre">free_resources</span></code> it fires <code class="docutils literal notranslate"><span class="pre">on_request_finish</span></code> (stages 4 and 5). Every hook does nothing by default, and a method overrides the hooks of the stages it wants (Figure 5). The manager owns no pages, so it never touches admission or memory accounting.</p>
+<div align="center">
+<figure>
+  <img src="../media/tech_blog30_hooks_flow.svg" width="1000">
+</figure>
+</div>
+<p align="center"><sub><em>Figure 5: How the hooks reach the executor iteration loop. Every BaseResourceManager receives three callbacks per iteration: before the forward pass, after it, and when a request ends. KVCacheCompressionManager inherits BaseResourceManager and turns the three callbacks into the five hooks. A method overrides the hooks it needs.</em></sub></p>
+<p>Inside a hook a method runs its own kernels on the cache. A shared, algorithm-neutral compaction kernel packs the kept tokens and returns the freed pages, so a method only decides what to keep. Two rules: the keep policy stays separate from the compaction, and GPU work finishes before any page is shrunk or freed. TriAttention overrides <code class="docutils literal notranslate"><span class="pre">on_generation_step_end</span></code>, scores and selects tokens with its own kernels, and calls the shared compaction.</p>
+</section>
+<section id="kv-cache-compression-in-cross-request-kv-management">
+<h3>KV Cache Compression in Cross-Request KV Management<a class="headerlink" href="#kv-cache-compression-in-cross-request-kv-management" title="Link to this heading">#</a></h3>
+<p>Once a request pauses or ends, its KV belongs to the cache manager, so that is where compression plugs in: at the points where pages move. During a tool call (stage 4 in Figure 3) and after the request (stage 5), <code class="docutils literal notranslate"><span class="pre">KVCacheManagerV2</span></code> decides which pages stay on the GPU, move to host or disk memory, are reused by a later request or transferred to another worker; it does no compression itself. Every page that is reused skips its prefill outright, the largest saving a serving system can get, and compression lets the tiers hold more of these pages. Today the framework covers the first and busiest of these movements, offload and onboard, with the <strong>storage-bound</strong> mechanism.</p>
+<p><strong>Compression is more than the algorithm.</strong> A page that crosses a storage boundary is already being read, moved and written by the cache manager’s own copy kernels, so a compression method should not add a pass of its own on top. The storage-bound path is built around that: quantization is fused into the offload copy and dequantization into the onboard copy, so compression rides the transfer’s bandwidth instead of competing with it.</p>
+<p><strong>How it plugs into <code class="docutils literal notranslate"><span class="pre">KVCacheManagerV2</span></code>.</strong> <code class="docutils literal notranslate"><span class="pre">KVCacheManagerV2</span></code> keeps a hot representation on the GPU, one page spread over several kernel-facing pools, and a cold representation off the GPU, one fixed-size block per page, with a codec translating between the two. The default codec concatenates the pools into the block; NVFP4 cold-page compression is a codec that produces a smaller one, quantizing on the way out and dequantizing on the way back inside the same copy. <code class="docutils literal notranslate"><span class="pre">KVCacheManagerV2</span></code> calls the codec with batches of pages on its own stream and never looks inside the block, so it keeps ownership of pools, mappings and migration while the codec decides how a page is stored while cold. The codec and its kernels are described in the NVFP4 cold-page compression section below and in the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/developer-guide/kv-cache-cold-page-codec.md">cold-page codec design guide</a>.</p>
+<p>The same fusion could later apply to the other movements on this path: the KV transfer between workers in disaggregated serving and the pause at a tool call.</p>
+</section>
+</section>
+<section id="algorithm-implementations">
+<h2>Algorithm Implementations<a class="headerlink" href="#algorithm-implementations" title="Link to this heading">#</a></h2>
+<p>In this section, we walk through the two KV cache compression methods currently implemented in TensorRT LLM, focusing on how each method works and how it integrates with the framework. For a quick-start guide and runnable configurations, please refer to the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/kv_cache_compression">KV cache compression examples</a>.</p>
+<section id="nvfp4-cold-page-compression">
+<h3>NVFP4 Cold-Page Compression<a class="headerlink" href="#nvfp4-cold-page-compression" title="Link to this heading">#</a></h3>
+<section id="introduction">
+<h4>Introduction<a class="headerlink" href="#introduction" title="Link to this heading">#</a></h4>
+<p>NVFP4 cold-page compression stores KV cache pages in NVIDIA’s 4-bit NVFP4 format while they sit in host or disk memory, and keeps the model’s normal data type on the GPU. The design starts from one observation: the moment a page leaves the GPU is the <strong>best place to compress</strong> it. The page is being copied anyway, nothing reads it while it is cold, and only the pages pushed out by memory pressure are touched, so the compression is effectively free and lands exactly where capacity is short. It also happens only under pressure and never on the whole cache, which makes it <strong>far friendlier to accuracy</strong> than compressing every page on every step. NVFP4 itself is the format TensorRT LLM already uses for weights and for the active KV cache, 4.5 bits per value including scales, so a cold page shrinks to about a quarter of FP16 and half of FP8, and the attention kernels never see the compressed form. To try it, see the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/kv_cache_compression/nvfp4_cold_page.md">NVFP4 cold-page example</a>. Figure 6 compares the three layouts of one KV page. The method was added in <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/pull/18091">#18091</a>.</p>
+<div align="center">
+<figure>
+  <img src="../media/tech_blog30_page_layouts.svg" width="1000">
+</figure>
+</div>
+<p align="center"><sub><em>Figure 6: One KV page of one layer, holding K and V for 32 tokens, in three layouts. The hot page on the GPU stores 16 bits per value in one pool. The NVFP4 active KV cache and the NVFP4 cold page hold the same bytes, 4-bit data plus one 8-bit block scale per 16 values. The active cache keeps them in two pools that attention reads together; the cold page packs them into one fixed-size block with one base address.</em></sub></p>
+</section>
+<section id="how-it-works-in-tensorrt-llm">
+<h4>How It Works in TensorRT LLM<a class="headerlink" href="#how-it-works-in-tensorrt-llm" title="Link to this heading">#</a></h4>
+<p>Within TensorRT LLM, cold-page compression is a compression manager on the cross-request path, enabled with <code class="docutils literal notranslate"><span class="pre">algorithm:</span> <span class="pre">quantization_for_cold_page</span></code> and <code class="docutils literal notranslate"><span class="pre">quant:</span> <span class="pre">nvfp4</span></code>. Below we highlight the fused encode and decode kernels, the single-block cold-page layout, and the handling of position-encoded values; Figure 7 follows one page out of the GPU and back.</p>
+<p><strong>Encode and decode, fused with the copy.</strong> When <code class="docutils literal notranslate"><span class="pre">KVCacheManagerV2</span></code> offloads a batch of pages, one fused kernel quantizes them and writes the cold pages straight into the host slots; on the way back its counterpart dequantizes them into the GPU pool before attention reads them. The kernels build on the NVFP4 conversion path TensorRT LLM already uses, so no calibration is needed, and they are shaped like the cache manager’s own copy kernel, streaming the page through shared memory and storing directly into host memory, so quantization rides the transfer instead of adding a pass. Only attention K and V are quantized; everything else in a page, such as the recurrent state of hybrid layers, is copied unchanged in the same launch. Target and draft caches are both covered, so speculative decoding works with the codec enabled.</p>
+<p><strong>One block per page.</strong> A hot page is spread over several GPU pools because that is the layout attention reads. A cold page is read by nobody, so its layout is chosen purely for storage and transfer: one fixed-size block holding the NVFP4 data, the scales and the lossless buffers (Figure 6). Host and disk address it as base plus slot times size, one copy moves a whole page instead of one per buffer, disk issues one I/O operation per page instead of one per pool, and a move between host and disk copies the bytes unchanged. This is exactly the contract <code class="docutils literal notranslate"><span class="pre">KVCacheManagerV2</span></code> asks of a codec, which is what lets it slot in without changing the cache manager.</p>
+<p><strong>The RoPE part of K.</strong> The position-encoded (RoPE) part of each K vector is the most sensitive to quantization, so it is where compression ratio and accuracy pull against each other. By default we quantize it like the rest for the best ratio; DeepSeek-V4 follows its native scheme and stores it as two FP4 components (2FP4), the second holding the first one’s rounding error, which keeps accuracy at that ratio (<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/pull/18783">#18783</a>). For users who want to explore the other side of the trade, <code class="docutils literal notranslate"><span class="pre">skip_rope_quantization:</span> <span class="pre">true</span></code> keeps the RoPE part at its original precision at a lower ratio (<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/pull/19391">#19391</a>). Validate the choice on your workload; see the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/kv_cache_compression/nvfp4_cold_page.md#deepseek-v4">NVFP4 cold-page example</a>.</p>
+<div align="center">
+<figure>
+  <img src="../media/tech_blog30_nvfp4_cold_page_pipeline.svg" width="1000">
+</figure>
+</div>
+<p align="center"><sub><em>Figure 7: One page leaving and returning to the GPU inside the KV cache manager. A page goes cold when its request pauses or ends, or under memory pressure. A fused kernel quantizes the 16-bit hot page and copies it to the host and disk tiers as one 4.5-bit cold block in a single pass, and a fused decode kernel dequantizes and copies it back when an active request reuses it.</em></sub></p>
+<p>The implementation lives in <code class="docutils literal notranslate"><span class="pre">tensorrt_llm/_torch/kv_cache_compression/quantization_for_cold_page/</span></code> (manager and layout policy), <code class="docutils literal notranslate"><span class="pre">cpp/tensorrt_llm/batch_manager/kv_cache_compression/</span></code> (native codec) and <code class="docutils literal notranslate"><span class="pre">cpp/tensorrt_llm/kernels/nvfp4ColdPageKernels.cu</span></code> (fused encode and decode kernels).</p>
+</section>
+</section>
+<section id="triattention">
+<h3>TriAttention<a class="headerlink" href="#triattention" title="Link to this heading">#</a></h3>
+<section id="id2">
+<h4>Introduction<a class="headerlink" href="#id2" title="Link to this heading">#</a></h4>
+<p>In a long generation most of the KV cache is generated tokens, and most of them will not matter to the queries still to come. <a class="reference external" href="https://arxiv.org/abs/2604.04921">TriAttention</a> (ICML 2026) predicts which ones matter from per-head query statistics collected once offline, and every few tokens evicts the rest and compacts the cache, so decoding reads a shorter cache and more sequences fit on the GPU. Figure 8 shows one round. For details, see the paper.</p>
+<div align="center">
+<figure>
+  <img src="../media/tech_blog30_triattention_concept.svg" width="1000">
+</figure>
+</div>
+<p align="center"><sub><em>Figure 8: TriAttention keeps the prompt intact and evicts generated tokens. Every β new tokens, the generated tokens are scored with the calibrated query statistics of each head. The `budget` highest-scoring tokens stay, the rest are evicted, and the cache is compacted, so decoding continues over a shorter cache.</em></sub></p>
+</section>
+<section id="id3">
+<h4>How It Works in TensorRT LLM<a class="headerlink" href="#id3" title="Link to this heading">#</a></h4>
+<p><strong>Migrating the mechanism to high-performance kernels.</strong> A round scores the generated tokens, selects the keep set, and compacts the cache (Figure 9). TriAttention was added in <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/pull/16957">#16957</a>, with the batched compaction kernels of <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/pull/16836">#16836</a>. Each step is implemented with the best-suited kernel path, CuTe DSL for scoring and selection, native CUDA for compaction, working on the paged cache in place. A round runs every <code class="docutils literal notranslate"><span class="pre">beta</span></code> generated tokens once a sequence exceeds its <code class="docutils literal notranslate"><span class="pre">budget</span></code>; the prompt is never evicted, so block reuse stays valid.</p>
+<p><strong>Keeping the extra work off the critical path.</strong> These steps are work that attention does not have. The kernels keep the GPU time to a small fraction of a decode step, and the round is driven from the executor’s own callbacks, so no CPU-side overhead is exposed either.</p>
+<p><strong>Injection into decoding.</strong> A round has to run after a decode step has written its tokens and before the next step reads the cache. That is the <code class="docutils literal notranslate"><span class="pre">on_generation_step_end</span></code> hook, the only one TriAttention overrides. It is enabled with <code class="docutils literal notranslate"><span class="pre">algorithm:</span> <span class="pre">triattention</span></code> plus <code class="docutils literal notranslate"><span class="pre">budget</span></code>, <code class="docutils literal notranslate"><span class="pre">beta</span></code>, <code class="docutils literal notranslate"><span class="pre">eviction_mode</span></code> and <code class="docutils literal notranslate"><span class="pre">calibration_path</span></code>. When the hook fires, only the requests that are due run the round in Figure 9, and a speculative step that confirms several tokens triggers at most one.</p>
+<div align="center">
+<figure>
+  <img src="../media/tech_blog30_triattention_pipeline.svg" width="1000">
+</figure>
+</div>
+<p align="center"><sub><em>Figure 9: One TriAttention eviction round in TensorRT LLM, one box per kernel. The generation-end hook picks the due requests; a Triton kernel gathers the mean-phase rows; the fused CuTe DSL kernel scores every generated token from the K pages; the selection rows are produced in the same kernel for `union` mode and by a Triton reduction for the per-head modes; a CuTe DSL radix top-k and a Triton tie-settling pass choose the kept tokens; a native CUDA kernel compacts K and V; and the cache manager takes the new length and the freed pages.</em></sub></p>
+<p>For calibration, configuration and current requirements, see the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/kv_cache_compression/triattention.md">TriAttention example</a>.</p>
+</section>
+</section>
+</section>
+<section id="evaluation">
+<h2>Evaluation<a class="headerlink" href="#evaluation" title="Link to this heading">#</a></h2>
+<p>This section consolidates performance and accuracy results for the KV cache compression methods supported in TensorRT LLM. Every comparison is against TensorRT LLM’s own uncompressed configuration on the same hardware, software build, and serving configuration; only the compression setting differs.</p>
+<section id="id4">
+<h3>NVFP4 Cold-Page Compression<a class="headerlink" href="#id4" title="Link to this heading">#</a></h3>
+<p>Unless otherwise specified, the experiments below use GB300 GPUs, the paged KV cache manager, and block reuse enabled. Before any result was accepted we confirmed that pages were actually compressed during the measured window, using the offload and onboard byte counters on the <code class="docutils literal notranslate"><span class="pre">/metrics</span></code> endpoint and an Nsight Systems trace.</p>
+<section id="performance">
+<h4>Performance<a class="headerlink" href="#performance" title="Link to this heading">#</a></h4>
+<p>The NVFP4 format alone brings a large reduction: a cold page costs 0.5625 bytes per value against 2 for FP16 or BF16 and 1 for FP8. Figure 10 compares the measured size of one attention KV page off the GPU with its uncompressed baseline for four models; the recurrent-state buffers of hybrid models are stored as they are and do not shrink.</p>
+<div align="center">
+<figure>
+  <img src="../media/tech_blog30_page_sizes.svg" width="1000">
+</figure>
+</div>
+<p align="center"><sub><em>Figure 10: Measured size, in MiB, of one attention KV page off the GPU, uncompressed and as an NVFP4 cold page. A page holds 64 tokens for Qwen3.5-397B-A17B and GLM-5.2 and 32 tokens for Qwen3-8B. FP8 pages shrink by 43.75%, BF16 pages by 71.9%; the GLM-5.2 MLA page shrinks a little less because its index buffer stays lossless.</em></sub></p>
+<p>A smaller cold page means <strong>more capacity in the host and disk tiers, and therefore a higher prefix-cache hit rate</strong> when the working set does not fit. To show what that buys in practice, we take a large model on a complex agentic workload, GLM-5.2 serving AgentX traces across many GPU counts and concurrencies, and compare the serving Pareto frontier with and without NVFP4 cold pages; we then look at where the gain comes from.</p>
+<p>Put together, compression and the cold-page mechanism <strong>move the serving frontier for agentic workloads</strong>. Figure 11 takes the ten highest-throughput points of the GLM-5.2 frontier with NVFP4 cold pages and shows, for each, the run of that serving point with an uncompressed FP8 host cache. The gain is largest where the FP8 tier misses most, <strong>up to 84% more throughput per GPU and 4x the P90 interactivity</strong>, and fades to nothing where it already reads most prefixes; averaged over the ten points it is <strong>+21% throughput and +92% interactivity</strong>.</p>
+<div align="center">
+<figure>
+  <img src="../media/tech_blog30_pareto_frontier.svg" width="1000">
+</figure>
+</div>
+<p align="center"><sub><em>Figure 11: GLM-5.2 Pareto frontier · GB300 · 128 GiB of host cache per prefill rank · the ten highest-throughput NVFP4 points and the FP8 host-cache run of each. Top: each green numbered point is a serving point with NVFP4 cold pages, the hollow point is its run with an uncompressed FP8 host cache, and the arrow shows the change. Bottom: the gain of each numbered configuration in tok/s/GPU (green) and in P90 interactivity (blue). Two repeats per setting; AgentX replay.</em></sub></p>
+<p>The gain is not tied to one setup. Figure 12 details the four configurations with the largest gains, across two models (GLM-5.2 and Qwen3.5-397B-A17B), from 8 to 40 GPUs, and from concurrency 128 to 1536: in every one <strong>both the hit rate and the TTFT improve</strong>. The improvement comes from two sources, not one: the smaller cold page lets the tiers <strong>hold more prefixes, so the hit rate rises</strong>, and it also means <strong>fewer bytes to move, so offloading and onboarding themselves get faster</strong>.</p>
+<div align="center">
+<figure>
+  <img src="../media/tech_blog30_pareto_pairs.svg" width="1000">
+</figure>
+</div>
+<p align="center"><sub><em>Figure 12: The four serving configurations with the largest NVFP4 gains · AgentX replay. Each panel is one serving point run with an uncompressed FP8 host cache and with an NVFP4 host cache, two or three repeats per setting; bars are throughput per GPU and P90 interactivity, with the cache-read hit rate and P90 TTFT below.</em></sub></p>
+</section>
+<section id="where-the-gain-comes-from">
+<h4>Where the Gain Comes From<a class="headerlink" href="#where-the-gain-comes-from" title="Link to this heading">#</a></h4>
+<p>The frontier gains above come mostly from a higher hit rate, but the benefit does not stop when the hit rate saturates. There are <strong>two cases</strong>.</p>
+<p><strong>The hit rate rises.</strong> When the host tier cannot hold the working set, a smaller cold page means more prefixes are still there when the next turn arrives. In the configurations of Figure 12 the hit rate rises by <strong>5 to 34 points</strong>. The effect is clearest in a GPU-limited deployment (Figure 13), where the uncompressed tier reads barely half of the prefixes: at every disk-tier size NVFP4 hits more, completes more and answers sooner, peaking at <strong>64% more requests completed and 48% lower TTFT</strong>.</p>
+<div align="center">
+<figure>
+  <img src="../media/tech_blog30_disk_sweep.svg" width="1000">
+</figure>
+</div>
+<p align="center"><sub><em>Figure 13: Qwen3.5-397B-A17B · ten GB300s · concurrency 192 · growing disk tier. NVFP4 completes more requests, hits more, and answers sooner at every disk size.</em></sub></p>
+<p><strong>The hit rate is saturated, and the hits move from disk to host.</strong> Even when the hit rate cannot rise further, cold pages still pay: a hit served from disk costs far more than one served from host memory, and a hit rate alone does not tell them apart. TensorRT LLM now counts every hit by the tier that served it (<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/pull/18583">#18583</a>). Figure 14 shows two cases on one GB300 node with the GPU cache capped: the hit rate barely changes, but the share of hits served from disk falls from <strong>31% to 19%</strong> for GLM-5.2 and from <strong>14% to 0%</strong> for Qwen3.5-397B-A17B, <strong>tail TTFT roughly halves</strong>, and <strong>40% to 50% more requests complete</strong> in the same window. The same host memory holds more pages, so <strong>less disk is used and the prefixes come back faster</strong>.</p>
+<div align="center">
+<figure>
+  <img src="../media/tech_blog30_tier_hits.svg" width="1000">
+</figure>
+</div>
+<p align="center"><sub><em>Figure 14: GLM-5.2 · 4 GB300 · concurrency 48 (left) and Qwen3.5-397B-A17B · 4 GB300 · concurrency 128 (right) · where reuse hits are served from. Each bar splits the full-block hits of a 30-minute AgentX replay by tier. The hit rate is similar in both settings of each pair; with NVFP4 cold pages fewer hits are served from disk, the tail TTFT falls, and more requests complete in the window. GPU cache capped at 50% (GLM-5.2) and 35% (Qwen3.5) of free GPU memory.</em></sub></p>
+</section>
+<section id="accuracy">
+<h4>Accuracy<a class="headerlink" href="#accuracy" title="Link to this heading">#</a></h4>
+<p>A page is quantized only when it leaves the GPU, so the accuracy question is whether repeated <strong>quantize-dequantize (QDQ) round trips</strong> accumulate error as a page is offloaded and brought back again and again. <strong>They do not.</strong> Figure 15 measures every representable FP8, FP16 and BF16 value through up to four round trips: the distance to the original value is the one-time quantization error and stays the same after every trip, and the distance to the previous trip is zero from the second trip on. End to end, Qwen3-8B on AIME24 and AIME25 reproduces every output of the first round trip on the second.</p>
+<div align="center">
+<figure>
+  <img src="../media/tech_blog30_nvfp4_roundtrip.svg" width="1000">
+</figure>
+</div>
+<p align="center"><sub><em>Figure 15: NVFP4 round trips do not accumulate error. Left: distance to the original value after 1 to 4 round trips, for every FP8, FP16 and BF16 value; it is the quantization error and does not change with the number of round trips. Middle: distance to the previous round trip; from the second round trip on it is zero. Right: Qwen3-8B accuracy on AIME24 and AIME25 after 0, 1 and 2 round trips; the second round trip reproduces every output of the first.</em></sub></p>
+<p>End to end, on a <strong>large model, hard reasoning tasks, and with very different shares of pages offloaded</strong>, accuracy is <strong>indistinguishable from the uncompressed baseline</strong>. Figure 16 shows Qwen3.5-397B-A17B with and without NVFP4 cold pages: AIME25 stays at 90.0% when 28% of the reused pages are compressed and 90.2% when 61% are, and MATH-500 stays within 0.4 points whether 9% or 23% of the pages are compressed.</p>
+<div align="center">
+<figure>
+  <img src="../media/tech_blog30_large_model_acc.svg" width="620">
+</figure>
+</div>
+<p align="center"><sub><em>Figure 16: Qwen3.5-397B-A17B accuracy with and without NVFP4 cold pages on AIME25 (16 seeds, error bar is the standard error) and MATH-500 (greedy). Labels give the share of reused pages that had been compressed before scoring.</em></sub></p>
+</section>
+</section>
+<section id="id5">
+<h3>TriAttention<a class="headerlink" href="#id5" title="Link to this heading">#</a></h3>
+<section id="id6">
+<h4>Performance<a class="headerlink" href="#id6" title="Link to this heading">#</a></h4>
+<p>TriAttention helps in two ways: decoding reads a shorter cache at the same batch size, and more sequences fit on the GPU. Figure 17 shows both on Qwen3-8B on one B200 with 1,024 input and 16,384 output tokens per request. At batch size 32 the compacted cache decodes <strong>27% to 60% faster</strong> than dense, depending on the budget. Where the dense cache runs out of memory at batch size 64, TriAttention keeps scaling to batch size 128 and reaches <strong>2.7x the dense peak throughput</strong> on the same GPU.</p>
+<div align="center">
+<figure>
+  <img src="../media/tech_blog30_triattention_perf.svg" width="1000">
+</figure>
+</div>
+<p align="center"><sub><em>Figure 17: TriAttention on Qwen3-8B, one B200, 1,024 input and 16,384 output tokens. Output throughput per GPU against batch size for the dense KV cache and for TriAttention with budgets of 4,096 and 2,048 tokens. The dense cache runs out of memory at batch size 64; TriAttention continues to batch size 128.</em></sub></p>
+</section>
+<section id="id7">
+<h4>Accuracy<a class="headerlink" href="#id7" title="Link to this heading">#</a></h4>
+<p>Eviction is lossy by design, and the budget sets the trade. Figure 18 shows AIME25 accuracy against the decode KV budget for Qwen3-8B and GPT-OSS-120B. From <strong>8,192 tokens on, accuracy is within noise of dense</strong> on both models while the decode KV still shrinks 2 to 4x; at 4,096 tokens, the budget behind the throughput results above, the drop is about 5 points for a 7.9x smaller decode KV. The budget is therefore a dial: a known amount of accuracy for a known amount of capacity.</p>
+<div align="center">
+<figure>
+  <img src="../media/tech_blog30_triattention_acc.svg" width="1000">
+</figure>
+</div>
+<p align="center"><sub><em>Figure 18: AIME25 accuracy against the decode KV budget for TriAttention on Qwen3-8B (left) and GPT-OSS-120B (right); the dashed line is the dense cache, the label under each bar is the decode-KV compression at that budget.</em></sub></p>
+<p>For configuration, the calibration workflow, and validated modes, please refer to the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/kv_cache_compression/triattention.md">TriAttention example</a>.</p>
+</section>
+</section>
+</section>
+<section id="summary-and-future-work">
+<h2>Summary and Future Work<a class="headerlink" href="#summary-and-future-work" title="Link to this heading">#</a></h2>
+<section id="current-state">
+<h3>Current State<a class="headerlink" href="#current-state" title="Link to this heading">#</a></h3>
+<p>The KV cache compression framework, NVFP4 cold-page compression, and TriAttention are in TensorRT LLM today and ready to use. Both methods are turned on with one configuration block and work with the mainstream model families; the tested list is in the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/features/kv-cache-compression.md#tested-models">KV Cache Compression feature documentation</a>, and runnable configurations are in the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/kv_cache_compression">examples</a>. The framework is ready to extend: a new method inherits the manager base, plugs into the stages it needs, and brings its own kernels, without changes to the attention kernels, the cache manager, or the serving loop.</p>
+</section>
+<section id="future-work">
+<h3>Future Work<a class="headerlink" href="#future-work" title="Link to this heading">#</a></h3>
+<p>The framework is built to grow. We will keep adding compression techniques for the new era of long-context, reasoning and agentic workloads, as the workload and the hardware evolve.</p>
+<p>The goals do not change: better use of GPU memory and bandwidth, higher throughput and lower latency, and accuracy that holds on real tasks. New methods will land through the same framework, with the same one-block configuration and no changes to the attention kernels, the cache manager or the serving loop.</p>
+</section>
+</section>
+<section id="references">
+<h2>References<a class="headerlink" href="#references" title="Link to this heading">#</a></h2>
+<ul class="simple">
+<li><p>W. Nixon, J. Durbin, F. Standhartinger, H. S. Gunawi, and J. Yang. A Year in LLM Serving: Workload Evolution, Caching and Load-Balancing. <a class="reference external" href="https://arxiv.org/abs/2608.13573">arXiv:2608.13573</a>, 2026.</p></li>
+<li><p>W. Mao et al. TriAttention. ICML 2026. <a class="reference external" href="https://arxiv.org/abs/2604.04921">arXiv:2604.04921</a>.</p></li>
+<li><p>RocketKV: Accelerating Long-Context LLM Inference via Two-Stage KV Cache Compression. ICML 2025. <a class="reference external" href="https://arxiv.org/abs/2502.14051">arXiv:2502.14051</a>.</p></li>
+<li><p>TensorRT LLM, <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/features/kv-cache-compression.md">KV Cache Compression feature documentation</a> and <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/kv_cache_compression">examples</a>.</p></li>
+</ul>
+</section>
+</section>
+<hr class="footnotes docutils" />
+<aside class="footnote-list brackets">
+<aside class="footnote brackets" id="attn-types" role="doc-footnote">
+<span class="label"><span class="fn-bracket">[</span><a role="doc-backlink" href="#id1">1</a><span class="fn-bracket">]</span></span>
+<p>MHA: multi-head attention. MQA: multi-query attention. GQA: grouped-query attention. MLA: multi-head latent attention. For hybrid models, only the KV of the attention layers is compressed.</p>
+</aside>
+</aside>
+
+
+                </article>
+              
+              
+              
+              
+              
+                <footer class="prev-next-footer d-print-none">
+                  
+<div class="prev-next-area">
+    <a class="left-prev"
+       href="../../developer-guide/telemetry.html"
+       title="previous page">
+      <i class="fa-solid fa-angle-left"></i>
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">previous</p>
+        <p class="prev-next-title">Telemetry</p>
+      </div>
+    </a>
+    <a class="right-next"
+       href="blog29_GVR_V2_Self_Sampling_Exact_TopK_for_Sparse_Attention.html"
+       title="next page">
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">next</p>
+        <p class="prev-next-title">GVR V2: Self-Sampling and Multi-Thresholding for Faster Exact Top-K</p>
+      </div>
+      <i class="fa-solid fa-angle-right"></i>
+    </a>
+</div>
+                </footer>
+              
+            </div>
+            
+            
+
+
+              
+                <dialog id="pst-secondary-sidebar-modal"></dialog>
+                <div id="pst-secondary-sidebar" class="bd-sidebar-secondary bd-toc"><div class="sidebar-secondary-items sidebar-secondary__inner">
+
+
+  <div class="sidebar-secondary-item">
+<div
+    id="pst-page-navigation-heading-2"
+    class="page-toc tocsection onthispage">
+    <i class="fa-solid fa-list"></i> On this page
+  </div>
+  <nav id="pst-page-toc-nav" class="page-toc" aria-labelledby="pst-page-navigation-heading-2">
+    <ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#introduction-and-motivation">Introduction and Motivation</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#overview-of-kv-cache-compression-in-tensorrt-llm">Overview of KV Cache Compression in TensorRT LLM</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#kv-cache-compression-framework-design">KV Cache Compression Framework Design</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#design-philosophy">Design Philosophy</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#architecture-overview">Architecture Overview</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#configuration-and-setup-of-kv-cache-compression">Configuration and Setup of KV Cache Compression</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#kv-cache-compression-in-the-executor-iteration-loop">KV Cache Compression in the Executor Iteration Loop</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#kv-cache-compression-in-cross-request-kv-management">KV Cache Compression in Cross-Request KV Management</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#algorithm-implementations">Algorithm Implementations</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#nvfp4-cold-page-compression">NVFP4 Cold-Page Compression</a><ul class="nav section-nav flex-column">
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#introduction">Introduction</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#how-it-works-in-tensorrt-llm">How It Works in TensorRT LLM</a></li>
+</ul>
+</li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#triattention">TriAttention</a><ul class="nav section-nav flex-column">
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#id2">Introduction</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#id3">How It Works in TensorRT LLM</a></li>
+</ul>
+</li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#evaluation">Evaluation</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id4">NVFP4 Cold-Page Compression</a><ul class="nav section-nav flex-column">
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#performance">Performance</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#where-the-gain-comes-from">Where the Gain Comes From</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#accuracy">Accuracy</a></li>
+</ul>
+</li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id5">TriAttention</a><ul class="nav section-nav flex-column">
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#id6">Performance</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#id7">Accuracy</a></li>
+</ul>
+</li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#summary-and-future-work">Summary and Future Work</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#current-state">Current State</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#future-work">Future Work</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#references">References</a></li>
+</ul>
+  </nav></div>
+
+</div></div>
+              
+            
+
+          </div>
+          <footer class="bd-footer-content">
+            
+          </footer>
+        
+      </main>
+    </div>
+  </div>
+  
+
+  <!-- Scripts loaded after <body> so the DOM is not blocked -->
+  <script defer src="../../_static/scripts/bootstrap.js?digest=18bd87630a240e9c25be"></script>
+<script defer src="../../_static/scripts/pydata-sphinx-theme.js?digest=18bd87630a240e9c25be"></script>
+
+
+  <footer class="bd-footer">
+<div class="bd-footer__inner bd-page-width">
+  
+    <div class="footer-items__start">
+      
+        <div class="footer-item">
+<a class="footer-brand logo" href="https://www.nvidia.com">
+  <img src="../../_static/nvidia-logo-horiz-rgb-1c-blk-for-screen.svg" class="logo__image only-light" alt="NVIDIA"/>
+  <img src="../../_static/nvidia-logo-horiz-rgb-1c-wht-for-screen.svg" class="logo__image only-dark" alt="NVIDIA"/>
+</a></div>
+      
+        <div class="footer-item">
+
+<div class="footer-links">
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/privacy-policy/">Privacy Policy</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/privacy-center/">Your Privacy Choices</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/terms-of-service/">Terms of Service</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/accessibility/">Accessibility</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/company-policies/">Corporate Policies</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/product-security/">Product Security</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/contact/">Contact</a>
+  
+  
+  
+</div>
+</div>
+      
+        <div class="footer-item">
+
+
+
+
+  <p class="copyright">
+    
+      Copyright © 2025, NVidia.
+      <br/>
+    
+  </p>
+</div>
+      
+        <div class="footer-item">
+<div class="extra_footer">
+  
+  <p>Last updated on October 19, 2026.</p>
+  
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/0372799">0372799</a>.</p>
+  
+</div></div>
+      
+    </div>
+  
+  
+  
+</div>
+
+  </footer>
+  </body>
+</html>

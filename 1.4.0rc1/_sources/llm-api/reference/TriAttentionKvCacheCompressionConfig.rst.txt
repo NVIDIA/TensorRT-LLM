@@ -1,0 +1,11 @@
+TriAttentionKvCacheCompressionConfig
+====================================
+
+.. autoclass:: tensorrt_llm.llmapi.TriAttentionKvCacheCompressionConfig
+    :members:
+    :undoc-members:
+    :show-inheritance:
+    :special-members: __init__
+    :member-order: groupwise
+    :inherited-members:
+    :exclude-members: model_json_schema,parse_raw,model_fields,Config,model_post_init,from_orm,parse_obj,schema,copy,validate,model_config,json,model_fields_set,model_validate_json,model_copy,model_extra,update_forward_refs,parse_file,model_parametrized_name,construct,schema_json,dict,model_dump_json,model_rebuild,model_construct,model_dump,model_computed_fields,model_validate,model_validate_strings
