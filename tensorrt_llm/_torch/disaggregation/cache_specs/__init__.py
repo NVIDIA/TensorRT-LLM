@@ -12,16 +12,16 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Cache kinds for the native P/D transfer: what each cache is, and how its bytes map.
+"""Cache specs for the native P/D transfer: what each cache is, and how its bytes map.
 
 A rank's cache is a :class:`PageTable` of unit spaces and regions, each region carrying its own
-layout declaration (:class:`BufferDecl`). One class per cache variant (``kinds/variants.py``)
-claims the manager classes it understands and describes them (:class:`CacheKindSpec`); one algorithm
+layout declaration (:class:`BufferDecl`). One class per cache variant (``specs/variants.py``)
+claims the manager classes it understands and describes them (:class:`CacheSpec`); one algorithm
 (``correspondence``) maps any two sides' regions onto each other. The rest of the transfer only
-asks the spec of a unit space. See ``CACHE_KINDS_DEVELOPER_GUIDE.md`` for adding a kind.
+asks the spec of a unit space. See ``CACHE_SPECS_DEVELOPER_GUIDE.md`` for adding a spec.
 """
 
-from . import kinds  # noqa: F401  (registers the built-in kinds)
+from . import specs  # noqa: F401  (registers the built-in specs)
 from .build import build_page_table, requires_physical_ownership, role_layout
 from .correspondence import (
     RegionRef,
@@ -45,10 +45,10 @@ from .queries import (
     resume_after_receive,
     sends_first_tokens,
     transfer_length,
-    whole_request_kinds,
+    whole_request_specs,
 )
 from .registry import claim, register, registered_specs, spec_for, spec_named, specs_in
-from .spec import CacheKindSpec, ChunkContext, LocalUnitsContext, PairContext, RegistrationRegion
+from .spec import CacheSpec, ChunkContext, LocalUnitsContext, PairContext, RegistrationRegion
 from .topology import (
     ATTENTION_TP,
     STATE_TP,
@@ -63,7 +63,7 @@ from .topology import (
 __all__ = [
     "ATTENTION_TP",
     "BufferDecl",
-    "CacheKindSpec",
+    "CacheSpec",
     "ChunkContext",
     "LocalUnitsContext",
     "PageTable",
@@ -106,5 +106,5 @@ __all__ = [
     "state_grid",
     "transfer_length",
     "validate_peer_compatible",
-    "whole_request_kinds",
+    "whole_request_specs",
 ]

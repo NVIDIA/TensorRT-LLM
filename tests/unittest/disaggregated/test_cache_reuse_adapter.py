@@ -21,8 +21,8 @@ import numpy as np
 import pytest
 
 from tensorrt_llm._torch.disaggregation.base import CacheKind
-from tensorrt_llm._torch.disaggregation.cache_kinds import UnitSpace
-from tensorrt_llm._torch.disaggregation.cache_kinds.kinds._paged import pair_ordinals
+from tensorrt_llm._torch.disaggregation.cache_specs import UnitSpace
+from tensorrt_llm._torch.disaggregation.cache_specs.specs._paged import pair_ordinals
 from tensorrt_llm._torch.disaggregation.resource.cache_reuse import (
     CacheReuseAdapter,
     _CacheReuseAdapterV2,
@@ -37,17 +37,17 @@ def _arr(values):
     return np.array(values, dtype=np.int64)
 
 
-def _space(window=None, tokens_per_block=8, kind="attention"):
-    """A paged attention unit space (no regions: _create_chunk only reads its kind and params)."""
+def _space(window=None, tokens_per_block=8, spec="attention"):
+    """A paged attention unit space (no regions: _create_chunk only reads its spec and params)."""
     return UnitSpace(
-        kind=kind,
+        spec=spec,
         unit=CacheKind.PAGED,
         params={"tokens_per_block": tokens_per_block, "window": window},
     )
 
 
 # ---------------------------------------------------------------------------
-# pair_ordinals (attention kind): the whole alignment protocol is one intersection.
+# pair_ordinals (attention spec): the whole alignment protocol is one intersection.
 # ---------------------------------------------------------------------------
 
 
@@ -125,20 +125,20 @@ def _build_transceiver_for_kv_slice(
     sliding_window_size=None,
     cached_tokens: int = 0,
     is_generation_only: bool = False,
-    kind: str = "attention",
+    spec: str = "attention",
 ):
     """Stub a KvCacheTransceiverV2 so _create_chunk runs without dist setup.
 
     Wires only the attributes the method touches:
       - reuse adapter: tokens_per_block, per-space cached count, ordinals
-      - page table:    unit spaces (``kind`` selects the cache kind's request-wide rules)
+      - page table:    unit spaces (``spec`` selects the cache spec's request-wide rules)
 
     `block_ids` is beam-0's stale-stripped chain (valid window followed by any
     speculative / ctx first-token over-hang). The adapter's positional table is
     modeled by prepending the manager-reported SWA holes, as V2 reports them via
     valid_only=False.
     """
-    space = _space(sliding_window_size, tokens_per_block, kind)
+    space = _space(sliding_window_size, tokens_per_block, spec)
     total_blocks = (prompt_len + num_extra_kv_tokens + tokens_per_block - 1) // tokens_per_block
     if block_ids is None:
         block_ids = np.arange(total_blocks, dtype=np.int64)
@@ -466,7 +466,7 @@ class TestKvSliceProperty:
                 block_ids=block_ids,
                 sliding_window_size=128,
                 is_generation_only=mode == "destination",
-                kind="csa2",
+                spec="csa2",
             )
             req.py_csa2_remote_tail_mode = mode
             req.py_csa2_remote_tail_start = remote_tail_start
@@ -497,7 +497,7 @@ class TestKvSliceProperty:
             block_ids=[100],
             sliding_window_size=window,
             is_generation_only=mode == "destination",
-            kind="csa2",
+            spec="csa2",
         )
         req.py_csa2_remote_tail_mode = mode
         req.py_csa2_remote_tail_start = 0

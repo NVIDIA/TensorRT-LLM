@@ -14,17 +14,17 @@
 # limitations under the License.
 """A rank's cache memory as the transfer sees it.
 
-The page table has four parts, none of them specific to a cache kind:
+The page table has four parts, none of them specific to a cache spec:
 
 * :class:`Pool` -- where memory is: a base address and how a slot is addressed.
 * :class:`UnitSpace` -- memory that one per-request list of unit ids indexes (a life cycle's blocks,
-  a request's state slot). ``kind`` names the plugin that owns its selection rules; ``params`` is
+  a request's state slot). ``spec`` names the plugin that owns its selection rules; ``params`` is
   free-form data only that plugin reads.
 * :class:`Region` -- one piece of memory inside a unit's slot: what it is (global layer id + role,
   the key both sides match on) and where it is (pool + offset).
 * :class:`BufferDecl` -- how a region's bytes are laid out and split across ranks.
 
-The mapping algorithm reads only regions and their declarations, so a new cache kind adds rows to
+The mapping algorithm reads only regions and their declarations, so a new cache spec adds rows to
 this table without changing its shape. It is exchanged between peers as is (``to_dict``).
 """
 
@@ -174,8 +174,8 @@ RegionKey = Tuple[int, str]
 class Region:
     """One piece of memory inside a unit's slot.
 
-    ``layer`` is a global layer id: unique per (layer, role) within a kind and equal on every PP
-    split, so the two sides match regions by ``(kind, layer, role)``. ``local_layer`` is the
+    ``layer`` is a global layer id: unique per (layer, role) within a spec and equal on every PP
+    split, so the two sides match regions by ``(spec, layer, role)``. ``local_layer`` is the
     manager's own id of the layer, kept for the plugin that described the region.
     """
 
@@ -211,12 +211,12 @@ class UnitSpace:
     """Memory one per-request list of unit ids indexes.
 
     ``unit`` says how the ids are read: PAGED ids are blocks by ordinal (entry ``i`` covers tokens
-    ``[i * tokens_per_block, ...)``), STATE ids are one slot per request. ``kind`` names the plugin
+    ``[i * tokens_per_block, ...)``), STATE ids are one slot per request. ``spec`` names the plugin
     whose rules select a request's units; ``params`` holds what those rules need (window size,
     tokens per block, ...) and must be msgpack-able.
     """
 
-    kind: str
+    spec: str
     unit: CacheKind
     regions: List[Region] = field(default_factory=list)
     params: Dict[str, Any] = field(default_factory=dict)
@@ -238,7 +238,7 @@ class UnitSpace:
                 [int(r.pool), int(r.layer), str(r.role), int(r.offset), index, r.local_layer]
             )
         return {
-            "kind": self.kind,
+            "spec": self.spec,
             "unit": int(self.unit),
             "params": dict(self.params),
             # Most layers share a layout, so declarations are sent once per distinct layout.
@@ -252,7 +252,7 @@ class UnitSpace:
             tuple(BufferDecl.from_dict(b) for b in buffers) for buffers in data.get("layouts", [])
         ]
         return UnitSpace(
-            kind=str(data["kind"]),
+            spec=str(data["spec"]),
             unit=CacheKind(int(data["unit"])),
             params=dict(data.get("params") or {}),
             regions=[

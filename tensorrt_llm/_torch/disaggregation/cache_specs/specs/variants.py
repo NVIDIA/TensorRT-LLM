@@ -12,10 +12,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""The cache kinds, one class per cache variant.
+"""The cache specs, one class per cache variant.
 
 Each class claims its manager classes (``managers``) and overrides only what its cache does
-differently from :class:`~._base.StandardSpec`. Managers no kind claims by class are described as
+differently from :class:`~._base.StandardSpec`. Managers no spec claims by class are described as
 ``attention``; so are subclasses of a claimed manager that add nothing the transfer needs to know
 (DSA's indexer-K is an index-key cache, replicated by default; GLM-5 Next is a ``mamba`` manager).
 """
@@ -67,7 +67,7 @@ class Fp4MlaSpec(AttentionSpec):
 
     K and its block scales are stored token-major; the high-precision tail is identical on every
     rank, so it is replicated. The physical ownership bridge for NVFP4 key-only caches applies to
-    every V2 kind (``_ownership``).
+    every V2 spec (``_ownership``).
     """
 
     name = "fp4_mla"

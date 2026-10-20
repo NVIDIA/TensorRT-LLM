@@ -20,7 +20,7 @@ import pytest
 import tensorrt_llm._torch.disaggregation.native.peer as peer_module
 from tensorrt_llm._torch.disaggregation.base import CacheKind
 from tensorrt_llm._torch.disaggregation.base.region import MemRegionGroup, SpecRegion
-from tensorrt_llm._torch.disaggregation.cache_kinds import (
+from tensorrt_llm._torch.disaggregation.cache_specs import (
     ATTENTION_TP,
     STATE_TP,
     BufferDecl,
@@ -33,7 +33,7 @@ from tensorrt_llm._torch.disaggregation.cache_kinds import (
     spec_named,
     validate_peer_compatible,
 )
-from tensorrt_llm._torch.disaggregation.cache_kinds.kinds.variants import AttentionSpec, MambaSpec
+from tensorrt_llm._torch.disaggregation.cache_specs.specs.variants import AttentionSpec, MambaSpec
 from tensorrt_llm._torch.disaggregation.native.auxiliary import (
     AuxBufferMeta,
     build_aux_transfer_layout,
@@ -76,7 +76,7 @@ def make_page_table(
     The attention space holds a K and a V region per layer, sized so the layers fill the
     pool slot. ``mamba_tp`` is the TP degree the synthetic recurrent-state space is sharded
     for: per-rank sizes are the ``mamba_tp`` shard of a fixed global state, so page tables
-    built for different TP degrees stay peer-compatible under the mamba kind's global
+    built for different TP degrees stay peer-compatible under the mamba spec's global
     (TP-aggregated) size check. Pass the rank's effective mamba TP (``make_rankinfo``
     defaults to ``tp_size=2``).
     """
@@ -100,7 +100,7 @@ def make_page_table(
                 )
             )
     attn = UnitSpace(
-        kind="mamba",
+        spec="mamba",
         unit=CacheKind.PAGED,
         regions=attn_regions,
         params={"tokens_per_block": tokens_per_block, "window": None},
@@ -136,7 +136,7 @@ def make_page_table(
                 local_layer=lid,
             )
         )
-    state = UnitSpace(kind="mamba", unit=CacheKind.STATE, regions=state_regions)
+    state = UnitSpace(spec="mamba", unit=CacheKind.STATE, regions=state_regions)
 
     return PageTable(
         pools=[
@@ -458,7 +458,7 @@ def _single_space_table(layer_offsets, bytes_per_layer, heads, tokens_per_block,
         pools=[Pool(base_address=0, slot_bytes=slot, num_slots=4)],
         spaces=[
             UnitSpace(
-                kind="attention",
+                spec="attention",
                 unit=CacheKind.PAGED,
                 regions=regions,
                 params={"tokens_per_block": tokens_per_block, "window": None},
@@ -1277,7 +1277,7 @@ def test_hnd_head_mismatch_inconsistent_slot_geometry_raises():
 
 
 # ---------------------------------------------------------------------------
-# Kind dispatch: a unit space's kind name selects its spec; each region's buffer
+# Spec dispatch: a unit space's spec name selects its spec; each region's buffer
 # declarations (replicated included) decide how its bytes map and who sends them.
 # ---------------------------------------------------------------------------
 
@@ -1302,7 +1302,7 @@ def _add_replicated_side_regions(page_table, *, bytes_per_layer=8):
     return pool
 
 
-def test_kind_dispatch_keys_on_kind_name_only():
+def test_spec_dispatch_keys_on_spec_name_only():
     page_table = make_page_table()
     assert [space.unit for space in page_table.spaces] == [CacheKind.PAGED, CacheKind.STATE]
     assert all(isinstance(spec_for(space), MambaSpec) for space in page_table.spaces)
@@ -1310,7 +1310,7 @@ def test_kind_dispatch_keys_on_kind_name_only():
     assert isinstance(spec_for(attention_only.spaces[0]), AttentionSpec)
     assert isinstance(spec_named("attention"), AttentionSpec)
     assert isinstance(spec_named("mamba"), MambaSpec)
-    with pytest.raises(ValueError, match="unknown cache kind 'linear_state'"):
+    with pytest.raises(ValueError, match="unknown cache spec 'linear_state'"):
         spec_named("linear_state")
 
 
@@ -1366,7 +1366,7 @@ def test_mamba_replicated_side_region_copies_whole_layers_under_tp_mismatch():
 
 
 def test_replicated_validation_covers_state_spaces():
-    """A replicated role held on one side only is rejected for the kind owning the state."""
+    """A replicated role held on one side only is rejected for the spec owning the state."""
     self_pt = make_page_table()
     _add_replicated_side_regions(self_pt)
     peer_pt = make_page_table()

@@ -26,7 +26,7 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.disaggregation.base import CacheKind
-from tensorrt_llm._torch.disaggregation.cache_kinds import BufferDecl
+from tensorrt_llm._torch.disaggregation.cache_specs import BufferDecl
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import build_page_table_from_manager
 from tensorrt_llm._torch.pyexecutor.kv_cache.sharing._layout import ShardDesc, derive_layout
 from tensorrt_llm.bindings import DataType

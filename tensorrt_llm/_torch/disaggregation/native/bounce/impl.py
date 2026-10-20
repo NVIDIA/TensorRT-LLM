@@ -44,7 +44,7 @@ from .core import BounceTransport, Disposition, Settlement, TransferContext
 from .gather_scatter import Plan, gather_contiguous, scatter_contiguous
 
 if TYPE_CHECKING:
-    from tensorrt_llm._torch.disaggregation.cache_kinds.page_table import PageTable
+    from tensorrt_llm._torch.disaggregation.cache_specs.page_table import PageTable
 
 RidSlice = tuple  # the request id and slice id a region serves
 _MIB = 1024 * 1024
@@ -247,7 +247,7 @@ class VmmBounceTransport(BounceTransport):
         False to fall back to the per-fragment path. A fan-in splits the region evenly, so the total
         must divide across the writers. ``extra_bytes`` is the non-paged payload the sender appends
         to the same coalesced write (recurrent state, sized by the receiver via
-        ``cache_kinds.receiver_extra_bytes``); the region must cover it or the write would overrun into the
+        ``cache_specs.receiver_extra_bytes``); the region must cover it or the write would overrun into the
         neighboring slot."""
         total = 0
         has_state_group = False
@@ -625,12 +625,12 @@ def decode_result_tail(message):
 def block_bytes_per_group(page_table: PageTable) -> list[int | None]:
     """Return transferred bytes per cache block for each layer group (page-table unit space).
 
-    Each space's cache kind answers: a paged space counts every distinct physical pool its regions
+    Each space's cache spec answers: a paged space counts every distinct physical pool its regions
     live in once; a space sized per request instead (recurrent state, see
     ``receiver_extra_bytes``) keeps a ``None`` placeholder so the result stays aligned with
     receive-request layer-group indices.
     """
-    from tensorrt_llm._torch.disaggregation.cache_kinds import bounce_unit_bytes_per_space
+    from tensorrt_llm._torch.disaggregation.cache_specs import bounce_unit_bytes_per_space
 
     assert page_table is not None
     return bounce_unit_bytes_per_space(page_table)

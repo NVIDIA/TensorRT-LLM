@@ -16,7 +16,7 @@
 
 Behind ``TRTLLM_ENABLE_FP4_MLA_KV_OWNERSHIP_BRIDGE=1`` the transfer runs with physical KV ownership
 (a writer retires only proven writes). The bridge is defined by the cache layout -- NVFP4,
-``SELFKONLY`` -- not by a manager class, so every kind built on ``StandardSpec`` asks it.
+``SELFKONLY`` -- not by a manager class, so every spec built on ``StandardSpec`` asks it.
 """
 
 import os

@@ -12,20 +12,20 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""What one cache kind tells the P/D transfer about itself.
+"""What one cache spec tells the P/D transfer about itself.
 
-A kind is a plugin. It claims the cache-manager classes it understands and answers three sorts of
+A spec is a plugin. It claims the cache-manager classes it understands and answers three sorts of
 questions:
 
-* **Description**: what memory a manager holds (:meth:`CacheKindSpec.describe`), as unit spaces of
+* **Description**: what memory a manager holds (:meth:`CacheSpec.describe`), as unit spaces of
   regions with their layout declarations. How two sides' bytes correspond follows from those
-  declarations alone (``correspondence``); a kind never writes a mapper.
-* **Selection**: which units of a request move (:meth:`CacheKindSpec.local_units`,
-  :meth:`CacheKindSpec.chunk_units`, :meth:`CacheKindSpec.pair_units`) and the request-wide rules
-  of the kind (how much history moves, what is excluded, where a received request resumes).
+  declarations alone (``correspondence``); a spec never writes a mapper.
+* **Selection**: which units of a request move (:meth:`CacheSpec.local_units`,
+  :meth:`CacheSpec.chunk_units`, :meth:`CacheSpec.pair_units`) and the request-wide rules
+  of the spec (how much history moves, what is excluded, where a received request resumes).
 * **Checks and memory**: peer compatibility beyond the declarations, and what to register.
 
-Everything outside ``cache_kinds`` asks the spec of a unit space instead of testing its kind.
+Everything outside ``cache_specs`` asks the spec of a unit space instead of testing its spec.
 """
 
 from __future__ import annotations
@@ -46,7 +46,7 @@ if TYPE_CHECKING:
 
 @dataclass(frozen=True)
 class LocalUnitsContext:
-    """What :meth:`CacheKindSpec.local_units` may consult to list a request's units on this rank."""
+    """What :meth:`CacheSpec.local_units` may consult to list a request's units on this rank."""
 
     request: Any
     space_index: int
@@ -54,14 +54,14 @@ class LocalUnitsContext:
     cache_manager: Any
     reuse_adapter: Any
     transfer_len: int
-    """Prompt tokens the request moves (see :meth:`CacheKindSpec.transfer_length`)."""
+    """Prompt tokens the request moves (see :meth:`CacheSpec.transfer_length`)."""
     cached_tokens: int
     """Block-aligned prefix the receiver already holds for this space (0 on the sender)."""
 
 
 @dataclass(frozen=True)
 class ChunkContext:
-    """One prompt chunk as :meth:`CacheKindSpec.chunk_units` sees it, in block ordinals."""
+    """One prompt chunk as :meth:`CacheSpec.chunk_units` sees it, in block ordinals."""
 
     start_block: int
     end_block: int
@@ -71,7 +71,7 @@ class ChunkContext:
 
 @dataclass(frozen=True)
 class PairContext:
-    """What :meth:`CacheKindSpec.pair_units` may consult when pairing one request's units."""
+    """What :meth:`CacheSpec.pair_units` may consult when pairing one request's units."""
 
     self_ri: "RankInfo"
     peer_ri: "RankInfo"
@@ -97,27 +97,27 @@ MatchedPair = Tuple[UnitSpace, Region, UnitSpace, Region]
 """``(local space, local region, peer space, peer region)`` of one matched region."""
 
 
-class CacheKindSpec(ABC):
-    """The one place a cache kind describes itself to the P/D transfer.
+class CacheSpec(ABC):
+    """The one place a cache spec describes itself to the P/D transfer.
 
-    Subclass it in ``cache_kinds/kinds/variants.py`` and decorate the class with
-    :func:`~tensorrt_llm._torch.disaggregation.cache_kinds.registry.register`. Most kinds subclass
-    ``kinds._base.StandardSpec``, which implements paged and state units for managers built on
+    Subclass it in ``cache_specs/specs/variants.py`` and decorate the class with
+    :func:`~tensorrt_llm._torch.disaggregation.cache_specs.registry.register`. Most specs subclass
+    ``specs._base.StandardSpec``, which implements paged and state units for managers built on
     ``KVCacheManagerV2``, and override what their cache does differently.
     """
 
     name: ClassVar[str]
-    """Recorded as ``UnitSpace.kind`` on every space the kind describes; peers match on it."""
+    """Recorded as ``UnitSpace.spec`` on every space the spec describes; peers match on it."""
 
     managers: ClassVar[Tuple[str, ...]] = ()
-    """Dotted paths of the cache-manager classes this kind describes. A manager is claimed by the
-    kind naming the class nearest to it in its MRO."""
+    """Dotted paths of the cache-manager classes this spec describes. A manager is claimed by the
+    spec naming the class nearest to it in its MRO."""
 
-    # ---- description (asked of the kind that claims the manager) ----
+    # ---- description (asked of the spec that claims the manager) ----
 
     @abstractmethod
     def describe(self, manager) -> PageTable:
-        """Every region of the manager's memory, as unit spaces of this or other kinds."""
+        """Every region of the manager's memory, as unit spaces of this or other specs."""
 
     def role_buffers(
         self,
@@ -137,11 +137,11 @@ class CacheKindSpec(ABC):
     def requires_physical_ownership(self, manager, mapping, transceiver_config) -> bool:
         """Whether the transfer must run with physical KV ownership (retire only proven writes).
 
-        A kind that needs it validates the deployment here and raises when it cannot be honoured.
+        A spec that needs it validates the deployment here and raises when it cannot be honoured.
         """
         return False
 
-    # ---- request-wide rules (asked of every kind in the page table) ----
+    # ---- request-wide rules (asked of every spec in the page table) ----
 
     def transfer_length(self, request) -> int:
         """Prompt tokens whose history the request moves (and the receiver must have declared)."""
@@ -194,7 +194,7 @@ class CacheKindSpec(ABC):
     def validate_peer(
         self, self_ri: "RankInfo", peer_ri: "RankInfo", pairs: Sequence[MatchedPair]
     ) -> None:
-        """Checks on this kind's matched regions beyond what their declarations make generic;
+        """Checks on this spec's matched regions beyond what their declarations make generic;
         raises ``ValueError`` naming the mismatch."""
 
     def on_peer_registered(self, self_ri: "RankInfo", peer_ri: "RankInfo", pairs) -> None:

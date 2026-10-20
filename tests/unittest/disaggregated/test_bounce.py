@@ -41,9 +41,9 @@ try:
 except ImportError:  # pragma: no cover - CPU-only env without CUDA bindings
     _HAVE_TRANSPORT = False
 
-# base and cache_kinds are pure numpy, always importable on CPU.
+# base and cache_specs are pure numpy, always importable on CPU.
 from tensorrt_llm._torch.disaggregation.base import CacheKind
-from tensorrt_llm._torch.disaggregation.cache_kinds import (
+from tensorrt_llm._torch.disaggregation.cache_specs import (
     ATTENTION_TP,
     STATE_TP,
     BufferDecl,
@@ -253,7 +253,7 @@ def test_fanin_bounce_safe_gate() -> None:
             pools=[Pool(base_address=0x1000, slot_bytes=64, num_slots=4)],
             spaces=[
                 UnitSpace(
-                    kind="attention",
+                    spec="attention",
                     unit=CacheKind.PAGED,
                     regions=[region],
                     params={"tokens_per_block": 16, "window": None},
@@ -426,7 +426,7 @@ class TestFanInReserve:
             ],
             spaces=[
                 UnitSpace(
-                    kind="attention",
+                    spec="attention",
                     unit=CacheKind.PAGED,
                     # Two regions share pool 1: its slot counts once.
                     regions=[
@@ -742,14 +742,14 @@ _K3_KDA_PAYLOAD_BYTES = (
 
 
 def _k3_page_table() -> PageTable:
-    """A K3-shaped page table as the mamba kind describes it.
+    """A K3-shaped page table as the mamba spec describes it.
 
     One unit space per life cycle, attention first and the recurrent-state space LAST, as the
     space index follows the life-cycle id.
     """
     mla_layer_bytes = _K3_MLA_BLOCK_BYTES // 24
     attn = UnitSpace(
-        kind="mamba",
+        spec="mamba",
         unit=CacheKind.PAGED,
         regions=[
             Region(
@@ -794,7 +794,7 @@ def _k3_page_table() -> PageTable:
             )
         )
     regions.sort(key=lambda r: (r.pool, r.offset))
-    mamba = UnitSpace(kind="mamba", unit=CacheKind.STATE, regions=regions)
+    mamba = UnitSpace(spec="mamba", unit=CacheKind.STATE, regions=regions)
     return PageTable(
         pools=[Pool(0x100000, _K3_MLA_BLOCK_BYTES, 128), conv_pool, ssm_pool],
         spaces=[attn, mamba],
@@ -821,7 +821,7 @@ def _receiver_units(page_table, dst_slot):
 
 def _state_paired(sender_ri, peer_ri, global_heads=8):
     """Whether two ranks exchange any recurrent-state bytes (8 heads over each rank's grid)."""
-    from tensorrt_llm._torch.disaggregation.cache_kinds import state_grid
+    from tensorrt_llm._torch.disaggregation.cache_specs import state_grid
 
     def table(ri):
         heads = global_heads // state_grid(ri).size
@@ -834,7 +834,7 @@ def _state_paired(sender_ri, peer_ri, global_heads=8):
         )
         return PageTable(
             pools=[Pool(0x100, heads * 4, 4)],
-            spaces=[UnitSpace(kind="mamba", unit=CacheKind.STATE, regions=[region])],
+            spaces=[UnitSpace(spec="mamba", unit=CacheKind.STATE, regions=[region])],
         )
 
     return bool(plan_transfers(sender_ri, peer_ri, table(sender_ri), table(peer_ri)))
@@ -916,7 +916,7 @@ class TestHybridK3Bounce:
 # --------------------------------------------------------------------------- #
 class TestMambaHelixCP:
     def test_state_grid_helix_is_cp_minor(self):
-        from tensorrt_llm._torch.disaggregation.cache_kinds import ShardGrid, state_grid
+        from tensorrt_llm._torch.disaggregation.cache_specs import ShardGrid, state_grid
 
         # cp == 1 keeps the plain TP grid; cp > 1 flattens tp*cp CP-minor.
         assert state_grid(_k3_rank_info()) == ShardGrid(1, 0)

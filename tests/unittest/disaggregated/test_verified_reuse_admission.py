@@ -38,7 +38,7 @@ import tensorrt_llm._torch.disaggregation.native.transfer as transfer_mod
 from tensorrt_llm import DisaggregatedParams
 from tensorrt_llm._torch.disaggregation.base import CacheKind, Chunk, TokenRange
 from tensorrt_llm._torch.disaggregation.base.transfer import SessionStatus
-from tensorrt_llm._torch.disaggregation.cache_kinds import (
+from tensorrt_llm._torch.disaggregation.cache_specs import (
     ATTENTION_TP,
     BufferDecl,
     PageTable,
@@ -418,7 +418,7 @@ def _make_block_chunk(num_blocks: int, excluded_regions=frozenset()) -> Chunk:
 
 def _attention_space(regions) -> UnitSpace:
     return UnitSpace(
-        kind="attention",
+        spec="attention",
         unit=CacheKind.PAGED,
         regions=sorted(regions, key=lambda r: (r.pool, r.offset)),
         params={"tokens_per_block": _TOKENS_PER_BLOCK, "window": None},

@@ -22,7 +22,7 @@ from tensorrt_llm._torch.disaggregation.base.region import (
     SpecRegion,
     SpecRegionPair,
 )
-from tensorrt_llm._torch.disaggregation.cache_kinds import (
+from tensorrt_llm._torch.disaggregation.cache_specs import (
     ATTENTION_TP,
     BufferDecl,
     PageTable,
@@ -118,7 +118,7 @@ def _kv_table(layer_offsets, bytes_per_layer, kv_heads):
         pools=[Pool(0, slot_bytes=slot, num_slots=4)],
         spaces=[
             UnitSpace(
-                kind="attention",
+                spec="attention",
                 unit=CacheKind.PAGED,
                 regions=regions,
                 params={"tokens_per_block": 4, "window": None},

@@ -66,7 +66,7 @@ import tensorrt_llm.bindings
 import tensorrt_llm.tensorrt_llm_transfer_agent_binding  # noqa: F401
 from tensorrt_llm import DisaggregatedParams, Mapping, SamplingParams
 from tensorrt_llm._torch.disaggregation.base import CacheKind
-from tensorrt_llm._torch.disaggregation.cache_kinds import (
+from tensorrt_llm._torch.disaggregation.cache_specs import (
     PageTable,
     UnitSpace,
     receiver_extra_bytes,
@@ -218,7 +218,7 @@ def test_kda_layer_group_descriptors(enable_attention_dp):
     try:
         pt = build_page_table_from_manager(mgr)
         space = _get_state_space(pt)
-        assert space.kind == "mamba"
+        assert space.spec == "mamba"
 
         first_kda_layer = next(iter(_mamba_layer_ids(mgr)))
         conv = mgr.get_conv_states(first_kda_layer)

@@ -56,7 +56,7 @@ else:
 from tensorrt_llm import DisaggregatedParams, Mapping, SamplingParams
 from tensorrt_llm._torch.disaggregation.base import CacheKind, Chunk, TokenRange
 from tensorrt_llm._torch.disaggregation.base.transfer import SessionStatus, WaitResult
-from tensorrt_llm._torch.disaggregation.cache_kinds import PageTable, UnitSpace
+from tensorrt_llm._torch.disaggregation.cache_specs import PageTable, UnitSpace
 from tensorrt_llm._torch.disaggregation.native.transfer import TransferWorker, TransferWorkerConfig
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
@@ -246,9 +246,9 @@ def test_session_status_enum():
 
 
 def _paged_space(tokens_per_block: int, window: Optional[int] = None) -> UnitSpace:
-    """A paged attention space as ``cache_kinds`` describes a KVCacheManagerV2 life cycle."""
+    """A paged attention space as ``cache_specs`` describes a KVCacheManagerV2 life cycle."""
     return UnitSpace(
-        kind="attention",
+        spec="attention",
         unit=CacheKind.PAGED,
         params={"tokens_per_block": tokens_per_block, "window": window},
     )

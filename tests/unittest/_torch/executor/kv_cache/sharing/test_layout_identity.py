@@ -29,10 +29,10 @@ import torch
 from utils.util import skip_pre_blackwell, skip_pre_hopper
 
 from tensorrt_llm._torch.disaggregation.base import CacheKind
-from tensorrt_llm._torch.disaggregation.cache_kinds import ATTENTION_TP, STATE_TP, BufferDecl
-from tensorrt_llm._torch.disaggregation.cache_kinds.kinds import _paged, _state
-from tensorrt_llm._torch.disaggregation.cache_kinds.kinds._base import StandardSpec
-from tensorrt_llm._torch.disaggregation.cache_kinds.registry import register, unregister
+from tensorrt_llm._torch.disaggregation.cache_specs import ATTENTION_TP, STATE_TP, BufferDecl
+from tensorrt_llm._torch.disaggregation.cache_specs.registry import register, unregister
+from tensorrt_llm._torch.disaggregation.cache_specs.specs import _paged, _state
+from tensorrt_llm._torch.disaggregation.cache_specs.specs._base import StandardSpec
 from tensorrt_llm._torch.pyexecutor.kv_cache.sharing._identity import Identity
 from tensorrt_llm._torch.pyexecutor.kv_cache.sharing._layout import (
     LAYOUT_ID_VERSION,
@@ -405,7 +405,7 @@ class RoleGeometry(NamedTuple):
 
 
 class _DeclaredKind(StandardSpec):
-    """The cache kind of :class:`Manager`: lays its buffers out from the manager's ``mappers``
+    """The cache spec of :class:`Manager`: lays its buffers out from the manager's ``mappers``
     ("INDEXED" / "NHD" / "REPLICATED" / "SECTIONED" per role, "all" the fallback) and ``layouts``,
     the way a real kind lays out its manager's buffers."""
 

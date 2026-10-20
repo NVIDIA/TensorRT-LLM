@@ -14,7 +14,7 @@
 # limitations under the License.
 """The layout of a manager's blocks as the lender needs it, and ``layout_id``, the digest of how a
 block's bytes are laid out. Read from the manager's public layout surface; how each buffer's bytes
-split across ranks is the native transfer's declaration (``disaggregation.cache_kinds``)."""
+split across ranks is the native transfer's declaration (``disaggregation.cache_specs``)."""
 
 from __future__ import annotations
 
@@ -70,7 +70,7 @@ class LayerGroupDesc:
 class BufferDesc:
     """One buffer of one layer (global id) in a page: ``size`` bytes at ``offset`` in the slot of
     ``pool`` = (pool group, pool index), how its bytes split across ranks (``decls``, the
-    ``cache_kinds.BufferDecl``s that tile it; empty for a buffer peers do not transfer), whether
+    ``cache_specs.BufferDecl``s that tile it; empty for a buffer peers do not transfer), whether
     peers transfer it, and its sub-pages per block. ``ValueError`` for a non-positive size or
     expansion, or declarations that do not tile the buffer."""
 

@@ -14,7 +14,7 @@
 # limitations under the License.
 """The one mapping algorithm: from two sides' regions to the byte runs that move.
 
-1. Regions match by ``(kind, global layer id, role)`` (:func:`match_regions`).
+1. Regions match by ``(spec, global layer id, role)`` (:func:`match_regions`).
 2. For every buffer of a matched pair, the two ranks' spans along the split axis intersect
    (:func:`~.topology.shard_span`); an empty intersection means the two ranks are not paired.
 3. The intersection becomes byte runs -- one per row of the axes outside the split axis.
@@ -63,36 +63,36 @@ Run = Tuple[int, int, int]
 
 
 def _region_index(page_table: PageTable) -> Dict[Tuple[str, int, str], RegionRef]:
-    """``{(kind, layer, role): (space, region)}``; a kind holds each (layer, role) once."""
+    """``{(spec, layer, role): (space, region)}``; a spec holds each (layer, role) once."""
     index: Dict[Tuple[str, int, str], RegionRef] = {}
     for si, space in enumerate(page_table.spaces):
         for ri, region in enumerate(space.regions):
-            key = (space.kind, region.layer, region.role)
+            key = (space.spec, region.layer, region.role)
             if key in index:
                 raise ValueError(
-                    f"{space.kind} region (layer={region.layer}, role={region.role!r}) appears in "
-                    f"spaces {index[key][0]} and {si}; a kind holds each (layer, role) once"
+                    f"{space.spec} region (layer={region.layer}, role={region.role!r}) appears in "
+                    f"spaces {index[key][0]} and {si}; a spec holds each (layer, role) once"
                 )
             index[key] = (si, ri)
     return index
 
 
 def check_page_table(page_table: PageTable) -> None:
-    """Structural checks of a freshly built table: known kinds, unique regions, valid pools."""
+    """Structural checks of a freshly built table: known specs, unique regions, valid pools."""
     specs_in(page_table)
     _region_index(page_table)
     for space in page_table.spaces:
         for region in space.regions:
             if not 0 <= region.pool < len(page_table.pools):
                 raise ValueError(
-                    f"{space.kind} region {region.key} names missing pool {region.pool}"
+                    f"{space.spec} region {region.key} names missing pool {region.pool}"
                 )
 
 
 def match_regions(
     self_page_table: Optional[PageTable], peer_page_table: Optional[PageTable]
 ) -> Dict[RegionRef, RegionRef]:
-    """Each local region paired with the peer region of the same kind, layer and role.
+    """Each local region paired with the peer region of the same spec, layer and role.
 
     Regions only one side holds are a legal skip (PP slices, one-sided MTP layers); a role that
     must not be one-sided is rejected by :func:`validate_peer_compatible` instead.
@@ -105,13 +105,13 @@ def match_regions(
     mapping: Dict[RegionRef, RegionRef] = {}
     for si, space in enumerate(self_page_table.spaces):
         for ri, region in enumerate(space.regions):
-            ref = peer_index.get((space.kind, region.layer, region.role))
+            ref = peer_index.get((space.spec, region.layer, region.role))
             if ref is None:
                 continue
             peer_space = peer_page_table.spaces[ref[0]]
             if peer_space.unit != space.unit:
                 raise ValueError(
-                    f"{space.kind} region {region.key} is a {space.unit.name} unit locally but "
+                    f"{space.spec} region {region.key} is a {space.unit.name} unit locally but "
                     f"{peer_space.unit.name} on the peer"
                 )
             mapping[(si, ri)] = ref
@@ -328,7 +328,7 @@ def plan_transfers(
             continue
         space, peer_space = self_page_table.spaces[si], peer_page_table.spaces[psi]
         src, dst = space.regions[ri], peer_space.regions[pri]
-        context = f"{space.kind} region (layer={src.layer}, role={src.role!r})"
+        context = f"{space.spec} region (layer={src.layer}, role={src.role!r})"
         runs = region_runs(src, dst, self_ri, peer_ri, context)
         if not runs:
             continue
@@ -368,17 +368,19 @@ def owns_transfer(group: TransferGroup, self_ri: "RankInfo", peer_ri: "RankInfo"
 
 
 def check_peer_compatible(self_ri: "RankInfo", peer_ri: "RankInfo") -> bool:
-    """Topology-level gate of the kinds both sides run; False when any rejects the peer."""
+    """Topology-level gate of the specs both sides run; False when any rejects the peer."""
     specs = specs_in(self_ri.page_table)
     specs += [s for s in specs_in(peer_ri.page_table) if s not in specs]
     return all(spec.check_rank_compatible(self_ri, peer_ri) for spec in specs)
 
 
-def _hosted_and_replicated(page_table: PageTable, kind: str) -> Tuple[Set[int], Set[RegionKey]]:
+def _hosted_and_replicated(
+    page_table: PageTable, spec_name: str
+) -> Tuple[Set[int], Set[RegionKey]]:
     hosted: Set[int] = set()
     replicated: Set[RegionKey] = set()
     for space in page_table.spaces:
-        if space.kind != kind:
+        if space.spec != spec_name:
             continue
         for region in space.regions:
             hosted.add(region.layer)
@@ -395,23 +397,23 @@ def validate_peer_compatible(
 ) -> None:
     """Layout-level gate on both page tables; raises ``ValueError`` naming the mismatch.
 
-    Generic over every kind: both sides run the same kinds, matched regions declare the same
+    Generic over every spec: both sides run the same specs, matched regions declare the same
     layouts, and a replicated role is held by both sides on every layer both host (matching would
-    otherwise drop a one-sided role and leave the receiver with zeroed state). Each kind then checks
-    its own matched regions (:meth:`CacheKindSpec.validate_peer`).
+    otherwise drop a one-sided role and leave the receiver with zeroed state). Each spec then checks
+    its own matched regions (:meth:`CacheSpec.validate_peer`).
     """
     if self_page_table is None or peer_page_table is None:
         return
     self_specs, peer_specs = specs_in(self_page_table), specs_in(peer_page_table)
     if self_specs and peer_specs and set(self_specs) != set(peer_specs):
         raise ValueError(
-            "cache kinds differ: local="
+            "cache specs differ: local="
             f"{sorted(s.name for s in self_specs)}, peer={sorted(s.name for s in peer_specs)}"
         )
     mapping = match_regions(self_page_table, peer_page_table)
     pairs = matched_pairs(self_page_table, peer_page_table, mapping)
     for space, region, _, peer_region in pairs:
-        context = f"{space.kind} region (layer={region.layer}, role={region.role!r})"
+        context = f"{space.spec} region (layer={region.layer}, role={region.role!r})"
         if len(region.buffers) != len(peer_region.buffers):
             raise ValueError(
                 f"{context}: buffer count differs (local={len(region.buffers)}, "
@@ -430,12 +432,14 @@ def validate_peer_compatible(
                 f"{spec.name}: replicated roles differ on overlapping layers "
                 f"(layer, role): {differing}"
             )
-        spec.validate_peer(self_ri, peer_ri, [p for p in pairs if p[0].kind == spec.name])
+        spec.validate_peer(self_ri, peer_ri, [p for p in pairs if p[0].spec == spec.name])
 
 
-def log_incompatible(kind: str, reason: str, **details) -> None:
+def log_incompatible(spec_name: str, reason: str, **details) -> None:
     text = ", ".join(f"{k}={v!r}" for k, v in details.items())
-    logger.warning("%s", f"{kind}: incompatible peer: {reason}" + (f"; {text}" if text else ""))
+    logger.warning(
+        "%s", f"{spec_name}: incompatible peer: {reason}" + (f"; {text}" if text else "")
+    )
 
 
 def notify_peer_registered(
@@ -445,5 +449,5 @@ def notify_peer_registered(
         spec.on_peer_registered(
             self_ri,
             peer_ri,
-            [g for g in groups if self_page_table.spaces[g.self_space].kind == spec.name],
+            [g for g in groups if self_page_table.spaces[g.self_space].spec == spec.name],
         )

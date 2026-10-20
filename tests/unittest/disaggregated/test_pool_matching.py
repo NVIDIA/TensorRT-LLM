@@ -24,14 +24,14 @@ Locks the behavior of disagg region matching across the representative scenarios
   * PP partial layer overlap (regions match by global layer id)
   * peer splitting the same layers over two spaces, or over two pools of one space
 
-Regions match by ``(kind, layer, role)``; matched regions must declare the same layout.
+Regions match by ``(spec, layer, role)``; matched regions must declare the same layout.
 """
 
 import numpy as np
 import pytest
 
 from tensorrt_llm._torch.disaggregation.base import CacheKind
-from tensorrt_llm._torch.disaggregation.cache_kinds import (
+from tensorrt_llm._torch.disaggregation.cache_specs import (
     ATTENTION_TP,
     BufferDecl,
     PageTable,
@@ -41,7 +41,7 @@ from tensorrt_llm._torch.disaggregation.cache_kinds import (
     match_regions,
     validate_peer_compatible,
 )
-from tensorrt_llm._torch.disaggregation.cache_kinds.correspondence import check_page_table
+from tensorrt_llm._torch.disaggregation.cache_specs.correspondence import check_page_table
 from tensorrt_llm._torch.disaggregation.native.peer import PeerRegistrar
 from tensorrt_llm._torch.disaggregation.native.rank_info import AttentionInfo, RankInfo
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
@@ -93,7 +93,7 @@ def _indexer(pool, layers, role="indexer_k"):
 
 def _space(regions):
     return UnitSpace(
-        kind="attention",
+        spec="attention",
         unit=CacheKind.PAGED,
         regions=regions,
         params={"tokens_per_block": 16, "window": None},
@@ -338,9 +338,9 @@ def test_buffer_count_mismatch_raises():
 
 
 def test_duplicate_region_across_spaces_raises():
-    """A kind holds each (layer, role) once.
+    """A spec holds each (layer, role) once.
 
-    The same global layer id in two spaces of one kind would silently corrupt matching.
+    The same global layer id in two spaces of one spec would silently corrupt matching.
     """
     dup_pt = _page_table([_space(_kv(0, [10])), _space(_kv(0, [10]))])
     ok_pt = _page_table([_space(_kv(0, [10]))])

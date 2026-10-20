@@ -14,7 +14,7 @@
 # limitations under the License.
 """Rank topology: which ranks talk to each other and how a shard domain splits a buffer.
 
-A cache kind never reads ``tp_size`` / ``cp_rank`` itself. It names the *shard domain* its buffers
+A cache spec never reads ``tp_size`` / ``cp_rank`` itself. It names the *shard domain* its buffers
 are split over (``ATTENTION_TP`` or ``STATE_TP``), and this module turns a ``RankInfo`` into the
 domain's :class:`ShardGrid`. Everything else -- which bytes a rank holds, which rank sends them --
 follows from the grid in ``correspondence``.

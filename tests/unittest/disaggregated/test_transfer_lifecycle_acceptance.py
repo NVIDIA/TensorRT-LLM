@@ -27,7 +27,7 @@ import pytest
 
 from tensorrt_llm._torch.disaggregation.base import Cancelled, Chunk, TokenRange
 from tensorrt_llm._torch.disaggregation.base.transfer import SessionStatus
-from tensorrt_llm._torch.disaggregation.cache_kinds.kinds import _ownership
+from tensorrt_llm._torch.disaggregation.cache_specs.specs import _ownership
 from tensorrt_llm._torch.disaggregation.native.bounce.impl import NoBounceTransport
 from tensorrt_llm._torch.disaggregation.native.handle import TaskHandle
 from tensorrt_llm._torch.disaggregation.native.transfer import AgentResult, KVRecvTask, RxSession

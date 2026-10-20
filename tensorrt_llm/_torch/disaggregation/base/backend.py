@@ -87,7 +87,7 @@ class Chunk:
     recurrent-state group carries one slot rather than a span, and a windowed group's table is
     mostly holes.
 
-    Layer group ``g`` is unit space ``g`` of the rank's page table (``cache_kinds.PageTable``).
+    Layer group ``g`` is unit space ``g`` of the rank's page table (``cache_specs.PageTable``).
     """
 
     block_ids_per_layer_groups: List[np.ndarray]
@@ -107,7 +107,7 @@ class Chunk:
     span, so comparing against the full length lies."""
 
     excluded_regions: FrozenSet[Tuple[int, int]] = frozenset()
-    """``(space, region)`` of local regions this request does not move (``cache_kinds``)."""
+    """``(space, region)`` of local regions this request does not move (``cache_specs``)."""
 
     def __post_init__(self):
         if len(self.kind_per_layer_group) != len(self.block_ids_per_layer_groups):

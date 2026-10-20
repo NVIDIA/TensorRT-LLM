@@ -13,7 +13,7 @@ from tensorrt_llm._torch.attention.backends.sparse.csa2.cache_manager import (
     CSA2CacheRole,
 )
 from tensorrt_llm._torch.attention.backends.sparse.csa2.params import CSA2Layout
-from tensorrt_llm._torch.disaggregation.cache_kinds import match_regions
+from tensorrt_llm._torch.disaggregation.cache_specs import match_regions
 from tensorrt_llm._torch.disaggregation.native.peer import PeerRegistrar
 from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
 from tensorrt_llm._torch.disaggregation.native.transfer import RecvReqInfo, Sender

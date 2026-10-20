@@ -185,32 +185,32 @@ def _uses_exact_tpb_regions(ri) -> bool:
     )
 
 
-def _tpb_incompatible(kind: str, self_ri, peer_ri) -> bool:
+def _tpb_incompatible(spec_name: str, self_ri, peer_ri) -> bool:
     local, peer = self_ri.attention.tokens_per_block, peer_ri.attention.tokens_per_block
     if local == peer:
         return False
     if _uses_exact_tpb_regions(self_ri) or _uses_exact_tpb_regions(peer_ri):
         log_incompatible(
-            kind, "tokens_per_block mismatch for NHD/replicated pools", local=local, peer=peer
+            spec_name, "tokens_per_block mismatch for NHD/replicated pools", local=local, peer=peer
         )
         return True
     if max(local, peer) % min(local, peer) != 0:
-        log_incompatible(kind, "tokens_per_block not divisible", local=local, peer=peer)
+        log_incompatible(spec_name, "tokens_per_block not divisible", local=local, peer=peer)
         return True
     logger.warning(
-        f"{kind}: tokens_per_block mismatch (local={local}, peer={peer}); "
+        f"{spec_name}: tokens_per_block mismatch (local={local}, peer={peer}); "
         "KV transfer proceeds — ensure block boundaries align during transfer."
     )
     return False
 
 
-def check_rank_compatible(kind: str, self_ri, peer_ri) -> bool:
+def check_rank_compatible(spec_name: str, self_ri, peer_ri) -> bool:
     """Attention topology both sides must share for paged blocks to correspond."""
     a, b = self_ri.attention, peer_ri.attention
 
     def fail(cond: bool, reason: str, **details) -> bool:
         if cond:
-            log_incompatible(kind, reason, **details)
+            log_incompatible(spec_name, reason, **details)
         return cond
 
     heads_match = a.is_mla or a.kv_heads_per_rank == b.kv_heads_per_rank
@@ -245,7 +245,7 @@ def check_rank_compatible(kind: str, self_ri, peer_ri) -> bool:
             dims_per_head=a.dims_per_head,
             element_bytes=a.element_bytes,
         )
-        or _tpb_incompatible(kind, self_ri, peer_ri)
+        or _tpb_incompatible(spec_name, self_ri, peer_ri)
         or fail(
             a.dims_per_head != b.dims_per_head,
             "dims_per_head mismatch",

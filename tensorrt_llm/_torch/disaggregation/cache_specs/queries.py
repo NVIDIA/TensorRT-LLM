@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Whole-table questions, answered space by space by each space's kind.
+"""Whole-table questions, answered space by space by each space's spec.
 
 Memory to register, bounce sizing, bytes a chunk moves, and the request-wide rules (how much history
 moves, which regions are left out, whether first tokens travel, where a received request resumes).
@@ -106,13 +106,13 @@ def chunk_transfer_bytes(
     return total
 
 
-def whole_request_kinds(page_table: Optional[PageTable]) -> List[str]:
-    """Kinds with a space whose units can only move once the whole prompt is done."""
+def whole_request_specs(page_table: Optional[PageTable]) -> List[str]:
+    """Specs with a space whose units can only move once the whole prompt is done."""
     if page_table is None:
         return []
     return sorted(
         {
-            space.kind
+            space.spec
             for space in page_table.spaces
             if not spec_for(space).sends_incrementally(space)
         }
@@ -120,7 +120,7 @@ def whole_request_kinds(page_table: Optional[PageTable]) -> List[str]:
 
 
 def transfer_length(page_table: Optional[PageTable], request) -> int:
-    """Prompt tokens whose history the request moves: the least every kind allows."""
+    """Prompt tokens whose history the request moves: the least every spec allows."""
     specs = specs_in(page_table)
     if not specs:
         return request.prompt_len
@@ -128,7 +128,7 @@ def transfer_length(page_table: Optional[PageTable], request) -> int:
 
 
 def resume_after_receive(page_table: Optional[PageTable], request) -> int:
-    """Where a request whose whole prompt arrived continues: the earliest point every kind allows."""
+    """Where a request whose whole prompt arrived continues: the earliest point every spec allows."""
     specs = specs_in(page_table)
     if not specs:
         return request.prompt_len

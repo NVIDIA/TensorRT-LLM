@@ -12,11 +12,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""cache_kinds: the region page table, kinds claiming managers, the correspondence.
+"""cache_specs: the region page table, specs claiming managers, the correspondence.
 
 The resharding matrix checks every receiving rank byte by byte against an independent model of TP /
 GQA / helix sharding (``check_resharding``), for the built-in layouts and for a test-only
-kind that is added without touching anything outside its own file.
+spec that is added without touching anything outside its own file.
 """
 
 import enum
@@ -28,24 +28,24 @@ from typing import Callable, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 import pytest
 
-from tensorrt_llm._torch.disaggregation import cache_kinds as ck
+from tensorrt_llm._torch.disaggregation import cache_specs as cs
 from tensorrt_llm._torch.disaggregation.base import CacheKind
-from tensorrt_llm._torch.disaggregation.cache_kinds.kinds._base import StandardSpec
-from tensorrt_llm._torch.disaggregation.cache_kinds.page_table import (
+from tensorrt_llm._torch.disaggregation.cache_specs.page_table import (
     BufferDecl,
     PageTable,
     Pool,
     Region,
     UnitSpace,
 )
-from tensorrt_llm._torch.disaggregation.cache_kinds.registry import register, unregister
-from tensorrt_llm._torch.disaggregation.cache_kinds.spec import ChunkContext, PairContext
+from tensorrt_llm._torch.disaggregation.cache_specs.registry import register, unregister
+from tensorrt_llm._torch.disaggregation.cache_specs.spec import ChunkContext, PairContext
+from tensorrt_llm._torch.disaggregation.cache_specs.specs._base import StandardSpec
 from tensorrt_llm._torch.disaggregation.native.rank_info import AttentionInfo, RankInfo
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
 
 pytestmark = pytest.mark.cpu_only
 
-A, S = ck.ATTENTION_TP, ck.STATE_TP
+A, S = cs.ATTENTION_TP, cs.STATE_TP
 
 
 # ---------------------------------------------------------------------------
@@ -73,7 +73,7 @@ def check_page_table_round_trip(page_table: PageTable) -> None:
     restored = PageTable.from_dict(page_table.to_dict())
     if restored != page_table:
         raise AssertionError("page table does not survive to_dict/from_dict")
-    ck.specs_in(restored)
+    cs.specs_in(restored)
 
 
 def _byte_ids(region: Region, ri, global_units: GlobalUnits) -> Dict[Address, ByteId]:
@@ -81,7 +81,7 @@ def _byte_ids(region: Region, ri, global_units: GlobalUnits) -> Dict[Address, By
     ids: Dict[Address, ByteId] = {}
     offset = region.offset
     for index, decl in enumerate(region.buffers):
-        grid = ck.shard_grid(decl.domain, ri)
+        grid = cs.shard_grid(decl.domain, ri)
         if decl.split_axis is None:
             for b in range(decl.nbytes):
                 ids[(region.pool, offset + b)] = (region.layer, region.role, index, 0, 0, b)
@@ -129,15 +129,15 @@ def check_resharding(
         dst_pt = dst_ri.page_table
         writes: Counter = Counter()
         expected: Dict[Tuple[int, Address], ByteId] = {}
-        overlap = ck.rank_overlap(dst_ri, senders[0], sender_dp_rank)
+        overlap = cs.rank_overlap(dst_ri, senders[0], sender_dp_rank)
         for flat in overlap.ranks:
             src_ri = by_rank[flat]
             src_pt = src_ri.page_table
             src_layers = {
-                (space.kind, region.key) for space in src_pt.spaces for region in space.regions
+                (space.spec, region.key) for space in src_pt.spaces for region in space.regions
             }
-            for group in ck.plan_transfers(src_ri, dst_ri, src_pt, dst_pt):
-                if not ck.owns_transfer(group, src_ri, dst_ri):
+            for group in cs.plan_transfers(src_ri, dst_ri, src_pt, dst_pt):
+                if not cs.owns_transfer(group, src_ri, dst_ri):
                     continue
                 src_ids = _space_byte_ids(src_pt, group.self_space, src_ri, global_units)
                 dst_ids = _space_byte_ids(dst_pt, group.peer_space, dst_ri, global_units)
@@ -154,7 +154,7 @@ def check_resharding(
                         writes[(group.peer_space, (group.peer_pool, d + b))] += 1
             for space_index, space in enumerate(dst_pt.spaces):
                 for region in space.regions:
-                    if (space.kind, region.key) not in src_layers:
+                    if (space.spec, region.key) not in src_layers:
                         continue
                     for address, byte_id in _byte_ids(region, dst_ri, global_units).items():
                         expected[(space_index, address)] = byte_id
@@ -325,10 +325,10 @@ def make_rank(model: Model, par: Par, *, name="ctx", pp_rank=0, tp_rank=0, cp_ra
     if attn:
         spaces.append(_attention_space(model, attn, kv, pools, base))
     if state:
-        spaces.append(_state_space(model, state, ck.state_grid(ri).size, pools, base + 0x4000000))
-    # A hybrid manager is described by the mamba kind, attention life cycles included.
+        spaces.append(_state_space(model, state, cs.state_grid(ri).size, pools, base + 0x4000000))
+    # A hybrid manager is described by the mamba spec, attention life cycles included.
     for space in spaces:
-        space.kind = "mamba" if "M" in model.pattern else "attention"
+        space.spec = "mamba" if "M" in model.pattern else "attention"
     ri.page_table = PageTable(pools=pools, spaces=spaces)
     return ri
 
@@ -338,7 +338,7 @@ def instance(model: Model, par: Par, name: str) -> List[RankInfo]:
 
 
 # ---------------------------------------------------------------------------
-# The page table: kind-free shape, round trip
+# The page table: spec-free shape, round trip
 # ---------------------------------------------------------------------------
 
 
@@ -364,12 +364,12 @@ def test_region_and_buffer_declarations():
 
 
 # ---------------------------------------------------------------------------
-# Registry: kinds claim managers by class, spaces name their kind
+# Registry: specs claim managers by class, spaces name their spec
 # ---------------------------------------------------------------------------
 
 
-def test_builtin_variants_are_registered_kinds():
-    names = {spec.name for spec in ck.registered_specs()}
+def test_builtin_variants_are_registered_specs():
+    names = {spec.name for spec in cs.registered_specs()}
     assert {
         "attention",
         "minimax_m3",
@@ -380,7 +380,7 @@ def test_builtin_variants_are_registered_kinds():
         "qsa",
     } <= names
     space = UnitSpace("csa2", CacheKind.PAGED)
-    assert ck.spec_for(space) is ck.spec_named("csa2")
+    assert cs.spec_for(space) is cs.spec_named("csa2")
 
 
 class _BaseManager:
@@ -396,7 +396,7 @@ class _GrandChildManager(_ChildManager):
 
 
 @pytest.fixture
-def claiming_kinds():
+def claiming_specs():
     @register
     class BaseKind(StandardSpec):
         name = "test_base"
@@ -412,15 +412,15 @@ def claiming_kinds():
     unregister(ChildKind)
 
 
-def test_claim_picks_the_kind_nearest_in_the_mro(claiming_kinds):
-    assert ck.claim(_BaseManager()).name == "test_base"
-    assert ck.claim(_ChildManager()).name == "test_child"
-    assert ck.claim(_GrandChildManager()).name == "test_child"
-    # A manager no kind names by class is described as plain paged attention.
-    assert ck.claim(SimpleNamespace()).name == "attention"
+def test_claim_picks_the_spec_nearest_in_the_mro(claiming_specs):
+    assert cs.claim(_BaseManager()).name == "test_base"
+    assert cs.claim(_ChildManager()).name == "test_child"
+    assert cs.claim(_GrandChildManager()).name == "test_child"
+    # A manager no spec names by class is described as plain paged attention.
+    assert cs.claim(SimpleNamespace()).name == "attention"
 
 
-def test_two_kinds_cannot_claim_one_manager_class(claiming_kinds):
+def test_two_specs_cannot_claim_one_manager_class(claiming_specs):
     class Duplicate(StandardSpec):
         name = "test_duplicate"
         managers = (f"{__name__}._ChildManager",)
@@ -429,16 +429,16 @@ def test_two_kinds_cannot_claim_one_manager_class(claiming_kinds):
         register(Duplicate)
 
 
-def test_unknown_kind_fails_loudly():
+def test_unknown_spec_fails_loudly():
     table = make_rank(Model(), Par()).page_table
     alien = PageTable.from_dict(table.to_dict())
-    alien.spaces[0].kind = "alien"
+    alien.spaces[0].spec = "alien"
     for call in (
-        lambda: ck.match_regions(table, alien),
-        lambda: ck.specs_in(alien),
-        lambda: ck.validate_peer_compatible(None, None, table, alien),
+        lambda: cs.match_regions(table, alien),
+        lambda: cs.specs_in(alien),
+        lambda: cs.validate_peer_compatible(None, None, table, alien),
     ):
-        with pytest.raises(ValueError, match="unknown cache kind 'alien'"):
+        with pytest.raises(ValueError, match="unknown cache spec 'alien'"):
             call()
 
 
@@ -516,8 +516,8 @@ def test_v2_life_cycles_become_spaces_of_regions():
             )
         ],
     )
-    table = ck.build_page_table(manager)
-    assert [s.kind for s in table.spaces] == ["attention", "attention"]
+    table = cs.build_page_table(manager)
+    assert [s.spec for s in table.spaces] == ["attention", "attention"]
     assert [s.unit for s in table.spaces] == [CacheKind.PAGED, CacheKind.PAGED]
     assert table.spaces[0].params == {"tokens_per_block": 4, "window": None}
     assert table.spaces[1].params == {"tokens_per_block": 4, "window": 64}
@@ -537,16 +537,16 @@ def test_v2_life_cycles_become_spaces_of_regions():
 
 def test_v1_managers_are_rejected():
     with pytest.raises(ValueError, match="not a KVCacheManagerV2"):
-        ck.build_page_table(SimpleNamespace(tokens_per_block=4))
+        cs.build_page_table(SimpleNamespace(tokens_per_block=4))
 
 
-def _role_buffers(kind, manager, unit, role, nbytes=64):
-    return ck.spec_named(kind).role_buffers(
+def _role_buffers(spec, manager, unit, role, nbytes=64):
+    return cs.spec_named(spec).role_buffers(
         manager, unit, role, nbytes, heads=2, tokens_per_block=4, context="test"
     )
 
 
-def test_kinds_own_their_role_layouts():
+def test_specs_own_their_role_layouts():
     from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import Role
 
     paged, key = CacheKind.PAGED, str(Role.KEY)
@@ -590,22 +590,22 @@ def test_mamba_describes_attention_and_state_life_cycles():
     manager.ssm_state_shape = (4, 2, 4)
     manager.ssm_state_dtype = SimpleNamespace(itemsize=4)
     manager._request_id_to_state_index = {7: 3}
-    table = ck.spec_named("mamba").describe(manager)
+    table = cs.spec_named("mamba").describe(manager)
     attention, state = table.spaces
-    assert (attention.kind, attention.unit) == ("mamba", CacheKind.PAGED)
-    assert (state.kind, state.unit, state.params) == ("mamba", CacheKind.STATE, {})
+    assert (attention.spec, attention.unit) == ("mamba", CacheKind.PAGED)
+    assert (state.spec, state.unit, state.params) == ("mamba", CacheKind.STATE, {})
     conv_region = state.regions[0]
     assert (conv_region.pool, conv_region.role) == (1, conv)
     assert [b.nbytes for b in conv_region.buffers] == [16, 8, 8]
     assert state.regions[2].buffers == (BufferDecl(128, S, (("head", 4),), "head"),)
-    spec = ck.spec_for(state)
+    spec = cs.spec_for(state)
     assert not spec.sends_incrementally(state) and spec.sends_incrementally(attention)
-    ctx = ck.LocalUnitsContext(SimpleNamespace(py_request_id=7), 1, state, manager, None, 12, 0)
+    ctx = cs.LocalUnitsContext(SimpleNamespace(py_request_id=7), 1, state, manager, None, 12, 0)
     assert spec.local_units(ctx).tolist() == [3]
 
     manager.conv_section_dims = (4, 2, 1)
     with pytest.raises(ValueError, match="do not sum to the role's 32 bytes"):
-        ck.spec_named("mamba").describe(manager)
+        cs.spec_named("mamba").describe(manager)
 
 
 class _AttnType(enum.Enum):
@@ -652,9 +652,9 @@ def _virtual_manager():
     return manager
 
 
-@pytest.mark.parametrize("kind", ["deepseek_v4", "csa2"])
-def test_virtual_layers_get_pp_independent_global_ids(kind):
-    table = ck.spec_named(kind).describe(_virtual_manager())
+@pytest.mark.parametrize("spec", ["deepseek_v4", "csa2"])
+def test_virtual_layers_get_pp_independent_global_ids(spec):
+    table = cs.spec_named(spec).describe(_virtual_manager())
     swa, compressed = table.spaces
     # model_layer * num_attention_types + attention_type
     assert [r.layer for r in swa.regions] == [8, 10]
@@ -665,7 +665,7 @@ def test_virtual_layers_get_pp_independent_global_ids(kind):
 
 def test_csa2_remote_tail_rules():
     manager = _virtual_manager()
-    table = ck.spec_named("csa2").describe(manager)
+    table = cs.spec_named("csa2").describe(manager)
     tail = SimpleNamespace(
         prompt_len=40,
         py_csa2_remote_tail_start=24,
@@ -673,11 +673,11 @@ def test_csa2_remote_tail_rules():
         py_csa2_remote_tail_mode="source",
     )
     plain = SimpleNamespace(prompt_len=40)
-    assert ck.transfer_length(table, tail) == 24 and ck.transfer_length(table, plain) == 40
-    assert not ck.sends_first_tokens(table, tail) and ck.sends_first_tokens(table, plain)
+    assert cs.transfer_length(table, tail) == 24 and cs.transfer_length(table, plain) == 40
+    assert not cs.sends_first_tokens(table, tail) and cs.sends_first_tokens(table, plain)
     # Decoder SWA state of model layer 5 (>= split) is rebuilt by the generation side.
-    assert ck.excluded_regions(manager, table, tail) == {(0, 1)}
-    assert ck.excluded_regions(manager, table, plain) == frozenset()
+    assert cs.excluded_regions(manager, table, tail) == {(0, 1)}
+    assert cs.excluded_regions(manager, table, plain) == frozenset()
 
 
 # ---------------------------------------------------------------------------
@@ -687,20 +687,20 @@ def test_csa2_remote_tail_rules():
 
 def test_shard_span_duplicates_units_on_the_finer_grid():
     # 2 global heads over TP=4: ranks 0, 1 hold head 0 and ranks 2, 3 head 1.
-    grid = [ck.ShardGrid(4, r) for r in range(4)]
-    spans = [ck.topology.shard_span(1, g, virtual_units=2) for g in grid]
+    grid = [cs.ShardGrid(4, r) for r in range(4)]
+    spans = [cs.topology.shard_span(1, g, virtual_units=2) for g in grid]
     assert spans == [(0, 1), (0, 1), (1, 2), (1, 2)]
     # Two ranks hold the head one TP=1 peer needs: exactly one of them is elected.
-    factor = ck.topology.replication_factor(1, grid[0], 2, ck.ShardGrid(1, 0))
+    factor = cs.topology.replication_factor(1, grid[0], 2, cs.ShardGrid(1, 0))
     assert factor == 2
-    assert [ck.topology.elects_sender(g, 0, factor) for g in grid] == [True, False, True, False]
+    assert [cs.topology.elects_sender(g, 0, factor) for g in grid] == [True, False, True, False]
 
 
 def test_state_grid_follows_attention_dp_and_helix():
     model, par = Model(pattern="MMMM"), Par(tp=2, cp=2)
-    assert ck.state_grid(make_rank(model, par, tp_rank=1, cp_rank=1)) == ck.ShardGrid(4, 3)
-    assert ck.state_grid(make_rank(model, Par(tp=4, adp=True), tp_rank=3)) == ck.ShardGrid(1, 0)
-    assert ck.attention_grid(make_rank(model, Par(tp=4, adp=True), tp_rank=3)) == ck.ShardGrid(1, 0)
+    assert cs.state_grid(make_rank(model, par, tp_rank=1, cp_rank=1)) == cs.ShardGrid(4, 3)
+    assert cs.state_grid(make_rank(model, Par(tp=4, adp=True), tp_rank=3)) == cs.ShardGrid(1, 0)
+    assert cs.attention_grid(make_rank(model, Par(tp=4, adp=True), tp_rank=3)) == cs.ShardGrid(1, 0)
 
 
 # ---------------------------------------------------------------------------
@@ -757,12 +757,12 @@ def test_helix_replicated_state_reaches_every_receiver():
         senders = [
             src
             for src in ctx
-            for group in ck.plan_transfers(src, dst, src.page_table, dst.page_table)
+            for group in cs.plan_transfers(src, dst, src.page_table, dst.page_table)
             if any(
                 src.page_table.spaces[group.self_space].regions[r].role == "ple"
                 for r in group.regions
             )
-            and ck.owns_transfer(group, src, dst)
+            and cs.owns_transfer(group, src, dst)
         ]
         assert len(senders) == 1, dst.instance_rank
 
@@ -772,10 +772,10 @@ def test_helix_replicated_state_reaches_every_receiver():
 # ---------------------------------------------------------------------------
 
 
-def test_regions_match_by_kind_layer_and_role():
+def test_regions_match_by_spec_layer_and_role():
     ctx = make_rank(Model(pattern="AMAM", index_key=8), Par(pp=2), pp_rank=1)
     gen = make_rank(Model(pattern="AMAM", index_key=8), Par(), name="gen")
-    mapping = ck.match_regions(ctx.page_table, gen.page_table)
+    mapping = cs.match_regions(ctx.page_table, gen.page_table)
     for (si, ri), (psi, pri) in mapping.items():
         mine = ctx.page_table.spaces[si].regions[ri]
         theirs = gen.page_table.spaces[psi].regions[pri]
@@ -786,18 +786,18 @@ def test_regions_match_by_kind_layer_and_role():
     dup = PageTable.from_dict(gen.page_table.to_dict())
     dup.spaces[0].regions.append(dup.spaces[0].regions[0])
     with pytest.raises(ValueError, match="holds each \\(layer, role\\) once"):
-        ck.match_regions(ctx.page_table, dup)
+        cs.match_regions(ctx.page_table, dup)
 
 
 def test_transfer_groups_merge_contiguous_regions_and_skip_excluded_ones():
     ctx = make_rank(Model(), Par(), name="ctx")
     gen = make_rank(Model(), Par(), name="gen")
-    (group,) = ck.plan_transfers(ctx, gen, ctx.page_table, gen.page_table)
+    (group,) = cs.plan_transfers(ctx, gen, ctx.page_table, gen.page_table)
     # Equal layouts: every layer's K and V are contiguous on both sides, one run moves the slot.
     slot = ctx.page_table.pools[0].slot_bytes
     assert group.plan.runs == [(0, 0, slot)] and group.owner_factor == 1
     excluded = frozenset({(0, 0), (0, 1)})  # layer 0's K and V
-    (group,) = ck.plan_transfers(ctx, gen, ctx.page_table, gen.page_table, excluded)
+    (group,) = cs.plan_transfers(ctx, gen, ctx.page_table, gen.page_table, excluded)
     assert group.plan.runs == [(slot // 4, slot // 4, slot * 3 // 4)]
     assert group.regions == tuple(range(2, 8))
 
@@ -806,22 +806,22 @@ def test_peer_layout_mismatches_are_rejected():
     ctx = make_rank(Model(pattern="MMMM"), Par(tp=2))
     gen = make_rank(Model(pattern="MMMM", ssm_heads=4), Par(tp=1), name="gen")
     with pytest.raises(ValueError, match="TP-aggregated"):
-        ck.validate_peer_compatible(ctx, gen, ctx.page_table, gen.page_table)
+        cs.validate_peer_compatible(ctx, gen, ctx.page_table, gen.page_table)
 
     nhd = make_rank(Model(nhd=True), Par(), name="gen")
     hnd = make_rank(Model(), Par())
     with pytest.raises(ValueError, match="layout differs"):
-        ck.validate_peer_compatible(hnd, nhd, hnd.page_table, nhd.page_table)
+        cs.validate_peer_compatible(hnd, nhd, hnd.page_table, nhd.page_table)
 
     with_index = make_rank(Model(index_key=8), Par(), name="gen")
     with pytest.raises(ValueError, match="replicated roles differ"):
-        ck.validate_peer_compatible(hnd, with_index, hnd.page_table, with_index.page_table)
+        cs.validate_peer_compatible(hnd, with_index, hnd.page_table, with_index.page_table)
 
-    other_kind = make_rank(Model(), Par(), name="gen")
-    for space in other_kind.page_table.spaces:
-        space.kind = "minimax_m3"
-    with pytest.raises(ValueError, match="cache kinds differ"):
-        ck.validate_peer_compatible(hnd, other_kind, hnd.page_table, other_kind.page_table)
+    other_spec = make_rank(Model(), Par(), name="gen")
+    for space in other_spec.page_table.spaces:
+        space.spec = "minimax_m3"
+    with pytest.raises(ValueError, match="cache specs differ"):
+        cs.validate_peer_compatible(hnd, other_spec, hnd.page_table, other_spec.page_table)
 
 
 # ---------------------------------------------------------------------------
@@ -838,7 +838,7 @@ def _pair_ctx(self_ri, peer_ri, space, dst_start_token=None):
 def test_paged_units_pair_by_ordinal_and_state_by_slot():
     ri = make_rank(Model(pattern="AMAM"), Par())
     paged, state = ri.page_table.spaces
-    spec = ck.spec_for(paged)
+    spec = cs.spec_for(paged)
     src, dst = spec.pair_units(
         np.array([10, 11, -1, 13]), np.array([-1, 21, 22, 23]), _pair_ctx(ri, ri, paged)
     )
@@ -857,14 +857,14 @@ def test_helix_receiver_takes_its_strided_blocks():
     ctx = make_rank(Model(), Par(tp=1))
     gen = make_rank(Model(), Par(tp=1, cp=2), name="gen", cp_rank=1)
     space = ctx.page_table.spaces[0]
-    src, dst = ck.spec_for(space).pair_units(
+    src, dst = cs.spec_for(space).pair_units(
         np.array([10, 11, 12, 13]), np.array([21, 23]), _pair_ctx(ctx, gen, space)
     )
     assert src.tolist() == [11, 13] and dst.tolist() == [21, 23]
 
 
 def test_chunk_units_defer_windows_and_whole_request_spaces():
-    spec = ck.spec_named("attention")
+    spec = cs.spec_named("attention")
     units = np.arange(6)
     full = UnitSpace("attention", CacheKind.PAGED, params={"tokens_per_block": 4, "window": None})
     swa = UnitSpace("attention", CacheKind.PAGED, params={"tokens_per_block": 4, "window": 8})
@@ -879,7 +879,7 @@ def test_chunk_units_defer_windows_and_whole_request_spaces():
     assert chunk(state, np.array([5]), False) == [-1]
     assert chunk(state, np.array([5]), True) == [5]
     table = make_rank(Model(pattern="AMAM"), Par()).page_table
-    assert ck.whole_request_kinds(table) == ["mamba"]
+    assert cs.whole_request_specs(table) == ["mamba"]
 
 
 def test_chunk_bytes_count_regions_not_slots():
@@ -887,19 +887,19 @@ def test_chunk_bytes_count_regions_not_slots():
     attn_bytes = sum(r.nbytes for r in table.spaces[0].regions)
     state_bytes = sum(r.nbytes for r in table.spaces[1].regions)
     units = [np.array([3, -1, 4]), np.array([9])]
-    assert ck.chunk_transfer_bytes(table, units) == 2 * attn_bytes + state_bytes
+    assert cs.chunk_transfer_bytes(table, units) == 2 * attn_bytes + state_bytes
     ple_regions = {(1, i) for i, r in enumerate(table.spaces[1].regions) if r.role == "ple"}
-    assert ck.chunk_transfer_bytes(table, units, ple_regions) == (
+    assert cs.chunk_transfer_bytes(table, units, ple_regions) == (
         2 * attn_bytes + state_bytes - 2 * 12
     )
-    assert ck.receiver_extra_bytes(table, table, units) == state_bytes
-    assert ck.bounce_unit_bytes_per_space(table) == [table.pools[0].slot_bytes, None]
-    assert ck.resume_after_receive(table, SimpleNamespace(prompt_len=37)) == 37
+    assert cs.receiver_extra_bytes(table, table, units) == state_bytes
+    assert cs.bounce_unit_bytes_per_space(table) == [table.pools[0].slot_bytes, None]
+    assert cs.resume_after_receive(table, SimpleNamespace(prompt_len=37)) == 37
 
 
 def test_memory_registration_dedups_shared_state_allocation():
     table = make_rank(Model(pattern="MMMM", ple=12, interleaved_state=True), Par()).page_table
-    descs = ck.memory_registration_descs(table, device_id=2)
+    descs = cs.memory_registration_descs(table, device_id=2)
     assert len(descs) == 1
     pool = table.pools[0]
     assert descs[0][:3] == (pool.base_address, pool.num_slots * pool.slot_stride_bytes, 2)
@@ -946,7 +946,7 @@ def test_sender_write_meta_covers_paged_blocks_and_state_slot():
 
     expected = []
     for group in registrar.transfer_groups(gen):
-        if not ck.owns_transfer(group, ctx, gen):
+        if not cs.owns_transfer(group, ctx, gen):
             continue
         src_pool = ctx.page_table.pools[group.self_pool]
         dst_pool = gen.page_table.pools[group.peer_pool]
@@ -973,7 +973,7 @@ def test_sender_write_meta_covers_paged_blocks_and_state_slot():
 
 
 # ---------------------------------------------------------------------------
-# A new kind is one file: a linear-attention state added in this test alone
+# A new spec is one file: a linear-attention state added in this test alone
 # ---------------------------------------------------------------------------
 
 
@@ -981,7 +981,7 @@ class LinearStateSpec(StandardSpec):
     """Gated linear attention: q/k/v conv channels plus a [head, d_k, d_v] state, one slot each.
 
     It names its own axes; nothing outside this declaration (page table, correspondence, other
-    kinds, managers) knows about it. Selection reuses the state-unit rules.
+    specs, managers) knows about it. Selection reuses the state-unit rules.
     """
 
     name = "linear_state"
@@ -1034,25 +1034,25 @@ def _linear_rank(model: LinearModel, par: Par, name: str, tp_rank: int) -> RankI
 
 
 @pytest.fixture
-def linear_state_kind():
+def linear_state_spec():
     register(LinearStateSpec)
     yield
     unregister(LinearStateSpec)
 
 
 @pytest.mark.parametrize("ctx_tp,gen_tp", [(1, 1), (1, 4), (4, 1), (2, 4), (4, 2)])
-def test_new_kind_reshards_with_no_change_outside_its_file(linear_state_kind, ctx_tp, gen_tp):
+def test_new_spec_reshards_with_no_change_outside_its_file(linear_state_spec, ctx_tp, gen_tp):
     model = LinearModel()
     ctx = [_linear_rank(model, Par(tp=ctx_tp), "ctx", r) for r in range(ctx_tp)]
     gen = [_linear_rank(model, Par(tp=gen_tp), "gen", r) for r in range(gen_tp)]
     check_page_table_round_trip(ctx[0].page_table)
     for dst in gen:
-        ck.validate_peer_compatible(dst, ctx[0], dst.page_table, ctx[0].page_table)
+        cs.validate_peer_compatible(dst, ctx[0], dst.page_table, ctx[0].page_table)
     assert check_resharding(ctx, gen, model.global_units) > 0
-    assert ck.memory_registration_descs(ctx[0].page_table, 0)
+    assert cs.memory_registration_descs(ctx[0].page_table, 0)
 
 
-def test_new_kind_is_unknown_until_registered():
+def test_new_spec_is_unknown_until_registered():
     table = _linear_rank(LinearModel(), Par(tp=1), "ctx", 0).page_table
-    with pytest.raises(ValueError, match="unknown cache kind 'linear_state'"):
-        ck.match_regions(table, table)
+    with pytest.raises(ValueError, match="unknown cache spec 'linear_state'"):
+        cs.match_regions(table, table)

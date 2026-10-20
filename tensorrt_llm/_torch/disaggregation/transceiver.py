@@ -32,7 +32,7 @@ from tensorrt_llm._torch.disaggregation.base.transfer import (
     WaitResult,
     get_unique_rid,
 )
-from tensorrt_llm._torch.disaggregation.cache_kinds import (
+from tensorrt_llm._torch.disaggregation.cache_specs import (
     ChunkContext,
     LocalUnitsContext,
     chunk_transfer_bytes,
@@ -42,7 +42,7 @@ from tensorrt_llm._torch.disaggregation.cache_kinds import (
     sends_first_tokens,
     spec_for,
     transfer_length,
-    whole_request_kinds,
+    whole_request_specs,
 )
 from tensorrt_llm._torch.disaggregation.kv_cache_transceiver import (
     CtxTransferStatus,
@@ -227,7 +227,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             else None
         )
         self._check_compatible()
-        # The cache kind describing the manager decides (and validates) whether the transfer
+        # The cache spec describing the manager decides (and validates) whether the transfer
         # runs with physical KV ownership.
         enforce_physical_ownership = requires_physical_ownership(
             kv_cache_manager, mapping, cache_transceiver_config
@@ -482,10 +482,10 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         come straight from the cache manager (``get_block_ordinals``), so ctx and gen never have
         to agree on *when* a block left the window -- the sender simply pairs the ordinals both
         sides still hold. The only request-derived bound is the transfer length (prompt_len unless
-        a cache kind moves less, see ``cache_kinds.transfer_length``), which drops the speculative
+        a cache spec moves less, see ``cache_specs.transfer_length``), which drops the speculative
         tail and the ctx first-token block (num_extra_kv_tokens slots are not transferred; both
         sides use the same length, so the ranges stay consistent). On the receiver the
-        already-cached prefix is masked so the sender skips it. Each space's cache kind lists its
+        already-cached prefix is masked so the sender skips it. Each space's cache spec lists its
         own units (a recurrent-state space carries one slot, or nothing when this rank has none).
         """
         adapter = self._reuse_adapter
@@ -526,7 +526,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         Populates kv_cache_size (and the perf-metric timestamps that gate on it) and is the exact
         expected-write total the verified-reuse admission checks attested sender bytes against,
         so it counts what the regions move, never physical slot bytes; see
-        ``cache_kinds.chunk_transfer_bytes``.
+        ``cache_specs.chunk_transfer_bytes``.
 
         Counterpart accounting: the bounce reserve sizing (bounce/impl.py block_bytes_per_group)
         computes per-block bytes for the same spaces from their physical pools, while this sums the
@@ -1510,10 +1510,10 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 f"the Python bounce buffer (kv_cache_bounce_size_mb="
                 f"{cfg.kv_cache_bounce_size_mb} without agent_bounce_buffer_enable)"
             )
-        once_per_request = whole_request_kinds(self._page_table)
+        once_per_request = whole_request_specs(self._page_table)
         if once_per_request:
             blockers.append(
-                "cache kinds sent once per request (" + ", ".join(once_per_request) + ")"
+                "cache specs sent once per request (" + ", ".join(once_per_request) + ")"
             )
         # Refused for the configuration, not for the piece: the per-chunk guard downstream only sees
         # a piece short of the whole prompt, so a prompt that fits one chunk would slip past it.
@@ -1539,7 +1539,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         return True
 
     def resume_position_after_receive(self, req: LlmRequest) -> int:
-        """The earliest position every cache kind of this rank can resume from."""
+        """The earliest position every cache spec of this rank can resume from."""
         return resume_after_receive(self._page_table, req)
 
     def commit_blocks_for_reuse(self, req) -> None:

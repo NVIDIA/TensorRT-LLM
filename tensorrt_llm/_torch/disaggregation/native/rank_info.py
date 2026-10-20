@@ -18,7 +18,7 @@ from typing import List, Optional
 
 import msgpack
 
-from tensorrt_llm._torch.disaggregation.cache_kinds.page_table import PageTable
+from tensorrt_llm._torch.disaggregation.cache_specs.page_table import PageTable
 from tensorrt_llm._torch.disaggregation.native.auxiliary import AuxBufferMeta
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import build_page_table_from_manager
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager

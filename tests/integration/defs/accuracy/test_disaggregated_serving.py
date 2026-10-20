@@ -2103,7 +2103,7 @@ class TestQwen3_8_Flash_Next(LlmapiAccuracyTestHarness):
         The two sides shard recurrent state differently on purpose. The context
         side splits Gated DeltaNet state across both ranks, while attention DP
         leaves it unsharded on the generation side (its recurrent-state grid,
-        cache_kinds.state_grid, has size 1), so the transfer exercises the
+        cache_specs.state_grid, has size 1), so the transfer exercises the
         sharded-to-replicated path.
         PLE state stays replicated on both sides throughout.
 

@@ -475,7 +475,7 @@ class DisaggTransferCoordinator:
         if not request.is_disagg_generation_transmission_complete:
             return False
         request.state = LlmRequestState.GENERATION_IN_PROGRESS
-        # commit_blocks_for_reuse requires the position to be where every received cache kind is
+        # commit_blocks_for_reuse requires the position to be where every received cache spec is
         # valid (the prompt end for attention and recurrent state alike).
         request.context_current_position = self._transceiver.resume_position_after_receive(request)
         self._transceiver.commit_blocks_for_reuse(request)

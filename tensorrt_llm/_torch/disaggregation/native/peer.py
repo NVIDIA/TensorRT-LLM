@@ -16,7 +16,7 @@
 from typing import Dict, FrozenSet, List, Optional, Tuple
 
 from tensorrt_llm import logger
-from tensorrt_llm._torch.disaggregation.cache_kinds import (
+from tensorrt_llm._torch.disaggregation.cache_specs import (
     PeerOverlap,
     RegionRef,
     TransferGroup,
@@ -38,8 +38,8 @@ class PeerRegistrar:
     """Per-peer bookkeeping for the native transfer.
 
     Holds what each registered peer advertised (rank info, page table, aux layout) and caches the
-    answers ``cache_kinds`` computes for it: the transfer groups (matched regions with their byte
-    plans and sender election) and which peer ranks overlap this one. No cache-kind logic lives
+    answers ``cache_specs`` computes for it: the transfer groups (matched regions with their byte
+    plans and sender election) and which peer ranks overlap this one. No cache-spec logic lives
     here.
     """
 
@@ -139,7 +139,7 @@ class PeerRegistrar:
     def transfer_groups(
         self, peer_ri: RankInfo, excluded: FrozenSet[RegionRef] = frozenset()
     ) -> List[TransferGroup]:
-        """Every transfer group to one peer rank (see ``cache_kinds.plan_transfers``), cached."""
+        """Every transfer group to one peer rank (see ``cache_specs.plan_transfers``), cached."""
         key = (self._unique_key(peer_ri.instance_name, peer_ri.instance_rank), frozenset(excluded))
         groups = self._groups_cache.get(key)
         if groups is None:

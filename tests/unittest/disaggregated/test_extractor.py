@@ -21,7 +21,7 @@ import torch
 
 from tensorrt_llm._torch.disaggregation.base import CacheKind
 from tensorrt_llm._torch.disaggregation.base.region import MemRegionGroup, SpecRegion
-from tensorrt_llm._torch.disaggregation.cache_kinds import (
+from tensorrt_llm._torch.disaggregation.cache_specs import (
     ATTENTION_TP,
     STATE_TP,
     BufferDecl,
@@ -126,7 +126,7 @@ def test_build_page_table():
 
         buffer_bytes = num_kv_heads * tokens_per_block * head_dim * 2
         for space in page_table.spaces:
-            assert space.kind == "attention"
+            assert space.spec == "attention"
             assert space.unit == CacheKind.PAGED
             assert space.params["tokens_per_block"] == tokens_per_block
             roles = {}
@@ -184,7 +184,7 @@ def test_page_table_meta_serialization():
         pools=[kv_pool],
         spaces=[
             UnitSpace(
-                kind="attention",
+                spec="attention",
                 unit=CacheKind.PAGED,
                 regions=regions,
                 params={"tokens_per_block": 16, "window": 512},
@@ -193,7 +193,7 @@ def test_page_table_meta_serialization():
     )
     restored = PageTable.from_dict(page_table.to_dict())
     space = restored.spaces[0]
-    assert space.kind == "attention"
+    assert space.spec == "attention"
     assert space.unit == CacheKind.PAGED
     assert space.params["window"] == 512
     assert space.params["tokens_per_block"] == 16
@@ -206,7 +206,7 @@ def _make_fake_v2_manager(attrs, *, num_pools=1, slot_bytes_list=(640,), main_kv
     """Build a minimal duck-typed KVCacheManagerV2 for ``build_page_table``.
 
     ``main_kv_layout`` gives it MiniMax M3's ``_main_kv_layout_name`` (describe it with the
-    ``minimax_m3`` kind to read it).
+    ``minimax_m3`` spec to read it).
 
     ``attrs`` keeps the storage-layer shape ``{(layer_id, role):
     (life_cycle_id, pool_index, offset, size)}``; the fake synthesizes the
@@ -282,7 +282,7 @@ def test_v2_builder_stamps_homogeneous_pool_kinds():
         (0x1000, 128, 4),
     ]
     (space,) = page_table.spaces
-    assert space.kind == "minimax_m3"
+    assert space.spec == "minimax_m3"
     assert space.params == {"tokens_per_block": 16, "window": None}
     nhd = _nhd(128, 1, 16)
     replicated = (BufferDecl(128, ATTENTION_TP),)
@@ -337,10 +337,10 @@ def test_v2_builder_defaults_to_head_major_kv():
         (1, Role.KEY): SimpleNamespace(life_cycle_id=0, pool_index=0, offset=256, size=128),
         (1, Role.VALUE): SimpleNamespace(life_cycle_id=0, pool_index=0, offset=384, size=128),
     }
-    # A manager no kind claims by class is plain attention: head-major K/V written by the TRTLLM
+    # A manager no spec claims by class is plain attention: head-major K/V written by the TRTLLM
     # attention kernels.
     page_table = build_page_table_from_manager(_make_fake_v2_manager(attrs))
-    assert page_table.spaces[0].kind == "attention"
+    assert page_table.spaces[0].spec == "attention"
     assert [r.buffers for r in page_table.spaces[0].regions] == [_hnd(128, 1)] * 4
 
 
@@ -359,14 +359,14 @@ def test_state_space_serialization():
                 0, layer, str(MambaRole.SSM_STATE), base + sum(conv_sections), ssm, local_layer=lid
             )
         )
-    space = UnitSpace(kind="mamba", unit=CacheKind.STATE, regions=regions)
+    space = UnitSpace(spec="mamba", unit=CacheKind.STATE, regions=regions)
 
     d = space.to_dict()
     assert d["unit"] == int(CacheKind.STATE)
     assert d["layouts"] == [[b.to_dict() for b in conv], [b.to_dict() for b in ssm]]
 
     restored = UnitSpace.from_dict(d)
-    assert restored.kind == "mamba"
+    assert restored.spec == "mamba"
     assert restored.unit == CacheKind.STATE
     assert restored.params == {}
     assert restored.regions == regions
@@ -478,9 +478,9 @@ def test_v2_builder_describes_recurrent_life_cycle_from_descriptors():
     ]
     assert len(page_table.spaces) == 2
     recurrent, attention = page_table.spaces
-    # Space index == life-cycle id; both spaces belong to the mamba kind.
-    assert (recurrent.kind, recurrent.unit) == ("mamba", CacheKind.STATE)
-    assert (attention.kind, attention.unit) == ("mamba", CacheKind.PAGED)
+    # Space index == life-cycle id; both spaces belong to the mamba spec.
+    assert (recurrent.spec, recurrent.unit) == ("mamba", CacheKind.STATE)
+    assert (attention.spec, attention.unit) == ("mamba", CacheKind.PAGED)
     assert recurrent.params == {}
     # The recurrent space keeps V2 layer numbering.
     assert [(r.local_layer, r.layer) for r in recurrent.regions] == [
@@ -552,7 +552,7 @@ def test_v2_mamba_registration_uses_coalesced_physical_pool():
     ]
     page_table = PageTable(
         pools=[physical_pool],
-        spaces=[UnitSpace(kind="mamba", unit=CacheKind.STATE, regions=regions)],
+        spaces=[UnitSpace(spec="mamba", unit=CacheKind.STATE, regions=regions)],
     )
 
     # V2 interleaved: one shared pool registered once
@@ -574,7 +574,7 @@ def test_region_offsets_past_four_gib_survive_rank_info_roundtrip() -> None:
     ]
     page_table = PageTable(
         pools=[Pool(base_address=(1 << 40) + 1000, slot_bytes=slot_bytes, num_slots=2)],
-        spaces=[UnitSpace(kind="mamba", unit=CacheKind.STATE, regions=regions)],
+        spaces=[UnitSpace(spec="mamba", unit=CacheKind.STATE, regions=regions)],
     )
     ri = RankInfo(
         instance_name="ctx",
@@ -616,12 +616,12 @@ def test_mixed_page_table_serialization():
         pools=[Pool(1000, 512, 10), Pool(2000, 1024, 10), Pool(3000, 2048, 10)],
         spaces=[
             UnitSpace(
-                kind="mamba",
+                spec="mamba",
                 unit=CacheKind.PAGED,
                 regions=attn_regions,
                 params={"tokens_per_block": 16, "window": None},
             ),
-            UnitSpace(kind="mamba", unit=CacheKind.STATE, regions=state_regions),
+            UnitSpace(spec="mamba", unit=CacheKind.STATE, regions=state_regions),
         ],
     )
 

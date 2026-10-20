@@ -876,7 +876,7 @@ class PythonMambaCacheManager(BaseResourceManager):
 
         On a disaggregated generation server the ctx->gen transfer populates
         only the base ``conv`` / ``temporal`` pools (see
-        ``MambaSpec`` in ``disaggregation/cache_kinds/kinds/variants.py``); the per-slot ``kda_conv_*``
+        ``MambaSpec`` in ``disaggregation/cache_specs/specs/variants.py``); the per-slot ``kda_conv_*``
         replay caches consumed by ``trtllm::kda_mtp_decode`` are normally
         seeded by a *local* prefill/decode via
         ``_sync_kda_replay_conv_window`` and would otherwise hold zeros (or a

@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Describe a cache manager as a page table: the kind claiming the manager does it."""
+"""Describe a cache manager as a page table: the spec claiming the manager does it."""
 
 from __future__ import annotations
 
@@ -26,7 +26,7 @@ from .registry import claim
 
 
 def build_page_table(manager) -> PageTable:
-    """The page table of a cache manager, described by the kind that claims it."""
+    """The page table of a cache manager, described by the spec that claims it."""
     page_table = claim(manager).describe(manager)
     check_page_table(page_table)
     return page_table
@@ -35,7 +35,7 @@ def build_page_table(manager) -> PageTable:
 def role_layout(
     manager, unit: CacheKind, role: str, nbytes: int, *, heads: int, tokens_per_block: int
 ) -> Tuple[BufferDecl, ...]:
-    """How the kind describing ``manager`` lays out one ``(layer, role)`` buffer, for readers of the
+    """How the spec describing ``manager`` lays out one ``(layer, role)`` buffer, for readers of the
     cache layout other than the transfer (named reuse)."""
     spec = claim(manager)
     return spec.role_buffers(
@@ -50,5 +50,5 @@ def role_layout(
 
 
 def requires_physical_ownership(manager, mapping, transceiver_config) -> bool:
-    """Whether the kind describing ``manager`` needs the transfer to enforce physical ownership."""
+    """Whether the spec describing ``manager`` needs the transfer to enforce physical ownership."""
     return claim(manager).requires_physical_ownership(manager, mapping, transceiver_config)

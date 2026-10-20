@@ -27,7 +27,7 @@ import pytest
 from tensorrt_llm import DisaggregatedParams
 from tensorrt_llm._torch.disaggregation.base import CacheExtent, CacheKind, Chunk, TokenRange
 from tensorrt_llm._torch.disaggregation.base.transfer import SessionStatus, WaitResult
-from tensorrt_llm._torch.disaggregation.cache_kinds import PageTable, UnitSpace
+from tensorrt_llm._torch.disaggregation.cache_specs import PageTable, UnitSpace
 from tensorrt_llm._torch.disaggregation.native.transfer import (
     AgentResult,
     KVSendTask,
@@ -137,12 +137,12 @@ def _projection_token_range(start_block: int, end_block: int) -> TokenRange:
 def _attention_page_table(tokens_per_block: int, *windows) -> PageTable:
     """A page table of paged attention spaces, one per window (``None``: full attention).
 
-    Selection reads only a space's kind, unit and params, so the spaces carry no regions.
+    Selection reads only a space's spec, unit and params, so the spaces carry no regions.
     """
     return PageTable(
         spaces=[
             UnitSpace(
-                kind="attention",
+                spec="attention",
                 unit=CacheKind.PAGED,
                 params={"tokens_per_block": tokens_per_block, "window": window},
             )
@@ -551,7 +551,7 @@ def test_pipelined_transfer_allows_agent_bounce_buffer():
 
 
 def test_pipelined_transfer_rejects_mamba_cache_manager():
-    """Pipelined transfer refuses cache kinds that move once per request (recurrent state)."""
+    """Pipelined transfer refuses cache specs that move once per request (recurrent state)."""
     from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
 
     transceiver = object.__new__(KvCacheTransceiverV2)
@@ -560,11 +560,11 @@ def test_pipelined_transfer_rejects_mamba_cache_manager():
     transceiver._page_table = PageTable(
         spaces=[
             UnitSpace(
-                kind="mamba",
+                spec="mamba",
                 unit=CacheKind.PAGED,
                 params={"tokens_per_block": 32, "window": None},
             ),
-            UnitSpace(kind="mamba", unit=CacheKind.STATE),
+            UnitSpace(spec="mamba", unit=CacheKind.STATE),
         ]
     )
     cache_transceiver_config = CacheTransceiverConfig(
@@ -574,7 +574,7 @@ def test_pipelined_transfer_rejects_mamba_cache_manager():
 
     with pytest.raises(
         ValueError,
-        match=r"not supported with cache kinds sent once per request \(mamba\)",
+        match=r"not supported with cache specs sent once per request \(mamba\)",
     ):
         KvCacheTransceiverV2._resolve_pipelined_transfer(transceiver, cache_transceiver_config)
 

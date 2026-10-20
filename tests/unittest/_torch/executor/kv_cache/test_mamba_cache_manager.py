@@ -11,7 +11,7 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.disaggregation.base import CacheKind
-from tensorrt_llm._torch.disaggregation.cache_kinds import PageTable, UnitSpace
+from tensorrt_llm._torch.disaggregation.cache_specs import PageTable, UnitSpace
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import build_page_table_from_manager
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
@@ -1147,7 +1147,7 @@ def test_v2_disagg_slice_reads_state_index_without_refreshing_batch_mask():
         side_effect=AssertionError("state-index lookup must not refresh the dummy mask")
     )
     # Provide a mamba state space so _create_chunk places the slot ID
-    mamba_space = UnitSpace(kind="mamba", unit=CacheKind.STATE)
+    mamba_space = UnitSpace(spec="mamba", unit=CacheKind.STATE)
     transceiver = object.__new__(KvCacheTransceiverV2)
     transceiver._kv_cache_manager = manager
     transceiver._reuse_adapter = SimpleNamespace(tokens_per_block=32)
@@ -3598,7 +3598,7 @@ def test_v2_hybrid_disagg_page_table_preserves_lifecycle_indices():
 
         # One unit space per life cycle, indexed by life-cycle id.
         assert len(page_table.spaces) == len(mgr.impl.layer_grouping)
-        assert [space.kind for space in page_table.spaces[:2]] == ["mamba", "mamba"]
+        assert [space.spec for space in page_table.spaces[:2]] == ["mamba", "mamba"]
         assert page_table.spaces[0].unit == CacheKind.STATE
         assert page_table.spaces[1].unit == CacheKind.PAGED
 

@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""What a ``KVCacheManagerV2`` holds, read once for every kind built on it.
+"""What a ``KVCacheManagerV2`` holds, read once for every spec built on it.
 
 ``life_cycles`` walks the manager's pool groups: each slot-desc variant is one life cycle, whose
 coalesced buffers place every ``(layer, role)`` buffer at an offset inside a slot of one physical

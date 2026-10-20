@@ -29,7 +29,7 @@ import tensorrt_llm._torch.disaggregation.native.transfer as transfer_mod
 from tensorrt_llm import DisaggregatedParams
 from tensorrt_llm._torch.disaggregation.base import CacheExtent, CacheKind, Chunk, TokenRange
 from tensorrt_llm._torch.disaggregation.base.transfer import SessionStatus, WaitResult
-from tensorrt_llm._torch.disaggregation.cache_kinds.kinds import _ownership
+from tensorrt_llm._torch.disaggregation.cache_specs.specs import _ownership
 from tensorrt_llm._torch.disaggregation.native.bounce.core import TransferContext
 from tensorrt_llm._torch.disaggregation.native.transfer import (
     AgentResult,

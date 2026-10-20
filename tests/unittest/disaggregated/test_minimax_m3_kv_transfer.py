@@ -35,7 +35,7 @@ import torch
 
 from tensorrt_llm import Mapping
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3 import MiniMaxM3KVCacheManagerV2
-from tensorrt_llm._torch.disaggregation.cache_kinds import spec_named
+from tensorrt_llm._torch.disaggregation.cache_specs import spec_named
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import (
     KVRegionExtractorV1,
     build_page_table_from_manager,
@@ -97,7 +97,7 @@ def test_minimax_cache_indices_support_block_count_limit() -> None:
         ("triton", DataType.NVFP4, "NHD"),
     ],
 )
-def test_minimax_kv_storage_layout_drives_its_cache_kind(
+def test_minimax_kv_storage_layout_drives_its_cache_spec(
     monkeypatch: pytest.MonkeyPatch,
     implementation: str,
     cache_dtype: DataType,
@@ -122,10 +122,10 @@ def test_minimax_kv_storage_layout_drives_its_cache_kind(
         ),
     )
 
-    kind = spec_named("minimax_m3")
+    spec = spec_named("minimax_m3")
     assert manager._main_kv_layout_name() == expected_layout
-    assert kind.kv_layout(manager) == expected_layout
-    assert str(Role.INDEX_KEY) in kind.replicated_roles(manager)
+    assert spec.kv_layout(manager) == expected_layout
+    assert str(Role.INDEX_KEY) in spec.replicated_roles(manager)
     if implementation == "triton":
         fp8_manager = MiniMaxM3KVCacheManagerV2(
             num_layers=0,
@@ -136,7 +136,7 @@ def test_minimax_kv_storage_layout_drives_its_cache_kind(
                 implementation="triton", indexer_kv_dtype="bf16"
             ),
         )
-        assert kind.kv_layout(fp8_manager) == "NHD"
+        assert spec.kv_layout(fp8_manager) == "NHD"
         assert fp8_manager._dense_native_layer_ids == ()
 
 
@@ -267,7 +267,7 @@ def test_minimax_m3_pool_view_scheme_coalesced_vs_separate() -> None:
     )
     try:
         space = build_page_table_from_manager(manager).spaces[0]
-        assert space.kind == "minimax_m3"
+        assert space.spec == "minimax_m3"
         keys, values, index_keys = check_declarations(space)
         # Coalesced: every region addresses the same physical pool.
         assert len({region.pool for region in space.regions}) == 1

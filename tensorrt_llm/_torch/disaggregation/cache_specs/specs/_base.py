@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""The base of every built-in kind: a ``KVCacheManagerV2`` described life cycle by life cycle.
+"""The base of every built-in spec: a ``KVCacheManagerV2`` described life cycle by life cycle.
 
 Each life cycle becomes one unit space (its index is the life-cycle id), paged or state as
 :meth:`StandardSpec.life_cycle_unit` decides, and each ``(layer, role)`` buffer in it one region
@@ -33,7 +33,7 @@ from tensorrt_llm._torch.disaggregation.base import CacheKind
 
 from ..page_table import BufferDecl, PageTable, Region, UnitSpace
 from ..spec import (
-    CacheKindSpec,
+    CacheSpec,
     ChunkContext,
     LocalUnitsContext,
     MatchedPair,
@@ -44,7 +44,7 @@ from . import _ownership, _paged, _state, _v2
 from ._v2 import LifeCycle
 
 
-class StandardSpec(CacheKindSpec):
+class StandardSpec(CacheSpec):
     # ---- description ----
 
     def describe(self, manager) -> PageTable:
@@ -100,7 +100,7 @@ class StandardSpec(CacheKindSpec):
             params = _paged.params(tokens_per_block, self.window_size(manager, cycle))
         else:
             params = {}
-        return UnitSpace(kind=self.name, unit=unit, regions=regions, params=params)
+        return UnitSpace(spec=self.name, unit=unit, regions=regions, params=params)
 
     def role_buffers(
         self,

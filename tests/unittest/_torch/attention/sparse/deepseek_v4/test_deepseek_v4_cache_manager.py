@@ -1928,7 +1928,7 @@ class TestDeepseekV4CacheManager:
             page_table = build_page_table_from_manager(cache_manager)
             saw_region = False
             for space in page_table.spaces:
-                assert space.kind == "deepseek_v4"
+                assert space.spec == "deepseek_v4"
                 for region in space.regions:
                     saw_region = True
                     # All DSv4 roles are laid out head-major (INDEXED): one

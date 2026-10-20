@@ -12,6 +12,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Cache kinds, one class per variant (``variants``), and the rules they share."""
+"""Cache specs, one class per variant (``variants``), and the rules they share."""
 
 from . import variants  # noqa: F401

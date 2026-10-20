@@ -5,7 +5,7 @@
 
 import torch
 
-from tensorrt_llm._torch.disaggregation.cache_kinds import memory_registration_descs
+from tensorrt_llm._torch.disaggregation.cache_specs import memory_registration_descs
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import build_page_table_from_manager
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest

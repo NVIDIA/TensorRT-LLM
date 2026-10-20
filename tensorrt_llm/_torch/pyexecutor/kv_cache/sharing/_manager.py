@@ -193,10 +193,10 @@ def declared_global_layer_ids(manager: KVCacheManagerV2) -> dict[int, int] | Non
 def buffer_layout(
     manager: KVCacheManagerV2, role: str, size: int, *, state: bool, heads: int
 ) -> tuple:
-    """The ``BufferDecl``s of one buffer, as the cache kind describing the manager lays it out for
-    the native transfer (``disaggregation.cache_kinds``)."""
+    """The ``BufferDecl``s of one buffer, as the cache spec describing the manager lays it out for
+    the native transfer (``disaggregation.cache_specs``)."""
     from tensorrt_llm._torch.disaggregation.base import CacheKind
-    from tensorrt_llm._torch.disaggregation.cache_kinds import role_layout
+    from tensorrt_llm._torch.disaggregation.cache_specs import role_layout
 
     return role_layout(
         manager,

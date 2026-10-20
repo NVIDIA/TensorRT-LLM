@@ -16,7 +16,7 @@
 import pytest
 
 from tensorrt_llm._torch.disaggregation.base import CacheKind
-from tensorrt_llm._torch.disaggregation.cache_kinds import (
+from tensorrt_llm._torch.disaggregation.cache_specs import (
     ATTENTION_TP,
     STATE_TP,
     BufferDecl,
@@ -43,7 +43,7 @@ def _kv_regions(layer, offset, local_layer=0, pool=0, nbytes=128):
 
 def _attention_space(regions, window=None, tokens_per_block=64):
     return UnitSpace(
-        kind="attention",
+        spec="attention",
         unit=CacheKind.PAGED,
         regions=regions,
         params={"tokens_per_block": tokens_per_block, "window": window},
@@ -120,7 +120,7 @@ def test_unit_space_roundtrip():
         window=512,
     )
     restored = UnitSpace.from_dict(space.to_dict())
-    assert restored.kind == "attention"
+    assert restored.spec == "attention"
     assert restored.unit == CacheKind.PAGED
     assert restored.params == {"tokens_per_block": 64, "window": 512}
     assert restored.layers == [5, 6]

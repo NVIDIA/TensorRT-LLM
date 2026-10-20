@@ -97,11 +97,11 @@ def registration_regions(page_table: PageTable, space_index: int) -> List[Regist
     ]
 
 
-def _keys(page_table: PageTable, kind: str) -> Set[RegionKey]:
+def _keys(page_table: PageTable, spec_name: str) -> Set[RegionKey]:
     return {
         region.key
         for space in page_table.spaces
-        if space.kind == kind and space.unit == CacheKind.STATE
+        if space.spec == spec_name and space.unit == CacheKind.STATE
         for region in space.regions
     }
 
@@ -117,11 +117,11 @@ def receiver_extra_bytes(
     if dst_units.size == 0:
         return 0
     space = receiver_page_table.spaces[space_index]
-    sender_keys = _keys(sender_page_table, space.kind)
+    sender_keys = _keys(sender_page_table, space.spec)
     return sum(region.nbytes for region in space.regions if region.key in sender_keys)
 
 
-def validate_peer(kind: str, self_ri, peer_ri, pairs: Sequence[MatchedPair]) -> None:
+def validate_peer(spec_name: str, self_ri, peer_ri, pairs: Sequence[MatchedPair]) -> None:
     """Reject a peer whose recurrent layout cannot be resharded into ours.
 
     Analogue of the C++ ``rnnCacheFormatter inquireSupport`` gate. The core invariant is the
@@ -138,7 +138,7 @@ def validate_peer(kind: str, self_ri, peer_ri, pairs: Sequence[MatchedPair]) -> 
             if a.split_axis is None:
                 if a.nbytes != b.nbytes:
                     raise ValueError(
-                        f"{kind}: replicated state size differs for {role} buffer {i} "
+                        f"{spec_name}: replicated state size differs for {role} buffer {i} "
                         f"(local={a.nbytes}, peer={b.nbytes})"
                     )
                 continue
@@ -146,7 +146,7 @@ def validate_peer(kind: str, self_ri, peer_ri, pairs: Sequence[MatchedPair]) -> 
             peer_grid = shard_grid(b.domain, peer_ri).size
             if a.nbytes * grid != b.nbytes * peer_grid:
                 raise ValueError(
-                    f"{kind}: global (TP-aggregated) size of {role} buffer {i} differs: local "
+                    f"{spec_name}: global (TP-aggregated) size of {role} buffer {i} differs: local "
                     f"{a.nbytes} bytes/rank x state grid {grid} vs peer {b.nbytes} bytes/rank x "
                     f"state grid {peer_grid}. Per-rank state sizes are inconsistent with a sharded "
                     "layout across the two sides; either the state shape/dtype differs, or the "
@@ -157,6 +157,6 @@ def validate_peer(kind: str, self_ri, peer_ri, pairs: Sequence[MatchedPair]) -> 
             if a.split_axis == "head" and a.unit_bytes(role) != b.unit_bytes(role):
                 # TP-invariant head_dim * d_state * element_size: a different state shape or dtype.
                 raise ValueError(
-                    f"{kind}: bytes per head of {role} differ (local={a.unit_bytes(role)}, "
+                    f"{spec_name}: bytes per head of {role} differ (local={a.unit_bytes(role)}, "
                     f"peer={b.unit_bytes(role)}); check head_dim / d_state / mamba_ssm_cache_dtype"
                 )

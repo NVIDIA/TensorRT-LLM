@@ -21,7 +21,7 @@ from tensorrt_llm._torch.disaggregation.base.region import (
     RegionExtractorBase,
     SpecRegion,
 )
-from tensorrt_llm._torch.disaggregation.cache_kinds.page_table import PageTable
+from tensorrt_llm._torch.disaggregation.cache_specs.page_table import PageTable
 from tensorrt_llm._utils import nvtx_range
 
 
@@ -57,7 +57,7 @@ class KVRegionExtractorV1(RegionExtractorBase):
 
 
 def build_page_table_from_manager(manager) -> PageTable:
-    """The page table of a cache manager; see ``cache_kinds.build_page_table``."""
-    from tensorrt_llm._torch.disaggregation.cache_kinds.build import build_page_table
+    """The page table of a cache manager; see ``cache_specs.build_page_table``."""
+    from tensorrt_llm._torch.disaggregation.cache_specs.build import build_page_table
 
     return build_page_table(manager)

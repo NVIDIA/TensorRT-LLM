@@ -56,7 +56,7 @@ from tensorrt_llm._torch.disaggregation.base.transfer import (
     TxSessionBase,
     WaitResult,
 )
-from tensorrt_llm._torch.disaggregation.cache_kinds import (
+from tensorrt_llm._torch.disaggregation.cache_specs import (
     PageTable,
     PairContext,
     has_replicated_regions,
@@ -1724,7 +1724,7 @@ class Sender(SenderBase):
         # Aggregate fragments from every transfer group using numpy concatenation.
         # Send ownership is per group: ranks holding identical bytes elect one
         # sender, ranks holding a unique shard always send. Each space's cache
-        # kind pairs the two sides' units (blocks by ordinal, a recurrent state
+        # spec pairs the two sides' units (blocks by ordinal, a recurrent state
         # slot once); every unit is addressed by its slot base.
         page_table = extractor.page_table
         paired_units: dict[tuple[int, int], tuple[np.ndarray, np.ndarray]] = {}
