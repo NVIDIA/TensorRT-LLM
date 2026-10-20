@@ -251,22 +251,22 @@ class RebalanceSlotSchedulerGroup:
         if self._closed:
             raise RuntimeError("Rebalance scheduler group is closed")
         thread_id = threading.get_ident()
-        if torch.cuda.current_device() != self.device:
+        # Runs several times per layer: read the raw device and stream instead
+        # of building a torch.cuda.Stream, and return early for the bound owner.
+        if torch._C._cuda_getDevice() != self.device:
             raise RuntimeError("Rebalance submission requires its bound CUDA device")
-        stream = torch.cuda.current_stream(self.device)
-        handle = int(stream.cuda_stream)
-        if self._owner_thread_id is None:
-            if (
-                self._execution_stream_handle is not None
-                and handle != self._execution_stream_handle
-            ):
-                raise RuntimeError("Rebalance MAIN stream cannot change during owner handoff")
-            if handle == self._stream_handle or stream.priority <= self.copy_stream.priority:
-                raise RuntimeError("MAIN must be distinct from the higher-priority COPY stream")
-            self._owner_thread_id = thread_id
-            self._execution_stream_handle = handle
-        elif thread_id != self._owner_thread_id or handle != self._execution_stream_handle:
+        handle = torch._C._cuda_getCurrentRawStream(self.device)
+        if thread_id == self._owner_thread_id and handle == self._execution_stream_handle:
+            return
+        if self._owner_thread_id is not None:
             raise RuntimeError("Rebalance must be submitted by one MAIN thread and stream")
+        if self._execution_stream_handle is not None and handle != self._execution_stream_handle:
+            raise RuntimeError("Rebalance MAIN stream cannot change during owner handoff")
+        stream = torch.cuda.current_stream(self.device)
+        if handle == self._stream_handle or stream.priority <= self.copy_stream.priority:
+            raise RuntimeError("MAIN must be distinct from the higher-priority COPY stream")
+        self._owner_thread_id = thread_id
+        self._execution_stream_handle = handle
 
     def release_warmup_owner_after_sync(self, execution_stream_handle: int) -> None:
         """Release the startup CPU owner after the caller drains this device.

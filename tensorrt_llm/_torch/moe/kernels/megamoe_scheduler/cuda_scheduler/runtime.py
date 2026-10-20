@@ -199,6 +199,33 @@ class CudaSchedulerOutputs:
         )
 
 
+def enter_cuda_stream(stream: torch.cuda.Stream) -> tuple:
+    """Make ``stream`` and its device current; ``exit_cuda_stream`` restores both.
+
+    Same effect as entering ``torch.cuda.device(stream.device)`` and then
+    ``torch.cuda.stream(stream)``, without their Python overhead on the
+    per-layer submission path. Returns the state to pass to ``exit_cuda_stream``.
+    """
+    index = stream.device_index
+    prev_device = torch._C._cuda_exchangeDevice(index)
+    prev_stream = torch._C._cuda_getCurrentStream(index)
+    torch._C._cuda_setStream(
+        stream_id=stream.stream_id,
+        device_index=index,
+        device_type=stream.device_type,
+    )
+    return prev_device, prev_stream
+
+
+def exit_cuda_stream(state: tuple) -> None:
+    """Restore the stream and device saved by ``enter_cuda_stream``."""
+    prev_device, (stream_id, device_index, device_type) = state
+    torch._C._cuda_setStream(
+        stream_id=stream_id, device_index=device_index, device_type=device_type
+    )
+    torch._C._cuda_maybeExchangeDevice(prev_device)
+
+
 def _stream_handle(stream: object) -> int:
     if isinstance(stream, bool):
         raise TypeError("stream must be a CUDA stream handle")
@@ -455,7 +482,8 @@ class CudaPhysicalSlotScheduler:
         stream = self._plan_channel_torch_stream
         if stream is None or _stream_handle(stream) != stream_handle:
             stream = torch.cuda.ExternalStream(stream_handle, device=self.device)
-        with torch.cuda.device(self.device), torch.cuda.stream(stream):
+        state = enter_cuda_stream(stream)
+        try:
             torch.ops.trtllm.moe_rebalance_halo_q(
                 routes,
                 self.outputs.physical_slot_ids,
@@ -484,6 +512,8 @@ class CudaPhysicalSlotScheduler:
                 self._plan_channel_route_features,
                 valid_route_count,
             )
+        finally:
+            exit_cuda_stream(state)
 
     def submit(
         self, routes: torch.Tensor, stream_handle: int, *,
