@@ -661,7 +661,12 @@ class MiniMaxM3Gate(nn.Module):
         w = weights[0]
         if "weight" in w:
             self.weight.copy_(w["weight"][:].to(self.weight.dtype))
-            self.split_weight = split_router_weight_bf16(self.weight)
+            split = split_router_weight_bf16(self.weight)
+            if self.split_weight is None:
+                self.split_weight = split
+            else:
+                # In place, so a CUDA graph that captured the buffer reads the new weight.
+                self.split_weight.copy_(split)
         if "e_score_correction_bias" in w:
             self.e_score_correction_bias.copy_(
                 w["e_score_correction_bias"][:].to(self.e_score_correction_bias.dtype)

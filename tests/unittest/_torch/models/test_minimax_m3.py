@@ -2590,6 +2590,19 @@ def test_minimax_m3_gate_bf16_split_matches_fp32_router(rows: int) -> None:
     graph.replay()
     torch.testing.assert_close(graph_logits, gate(new_y), rtol=0, atol=0)
 
+    # Reloading the router weight refreshes the split buffer in place, so the
+    # captured graph computes with the new weight.
+    before_refit = graph_logits.clone()
+    new_weight = torch.randn(num_experts, hidden_size, device="cuda") * 0.02
+    gate.load_weights([{"weight": new_weight, "e_score_correction_bias": bias}])
+    graph.replay()
+    assert not torch.equal(graph_logits, before_refit)
+    torch.testing.assert_close(graph_logits, gate(new_y), rtol=0, atol=0)
+    reference = new_y.double() @ new_weight.double().t()
+    assert (
+        float((graph_logits.double() - reference).abs().max()) / float(reference.abs().max()) < 1e-5
+    )
+
 
 @pytest.mark.skipif(not _has_cuda(), reason="MiniMax-M3 router gate needs CUDA")
 @pytest.mark.skipif(
