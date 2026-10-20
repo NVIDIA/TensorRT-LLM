@@ -1059,11 +1059,13 @@ def check_v2_events(llm: LLM,
                     del cached_blocks[block_hash]
                     num_removed_blocks += 1
 
-        # V2 publishes the prompt, including its partial tail, but no decode tokens.
+        # V2 publishes the prompt and stable generated tokens. The final sampled
+        # token has no KV until the next forward pass.
+        cached_tokens = prompt + output.outputs[0].token_ids[:-1]
         assert [[token["token_id"] for token in block["tokens"]]
                 for block in stored_blocks] == [
-                    prompt[start:start + tokens_per_block]
-                    for start in range(0, prompt_length, tokens_per_block)
+                    cached_tokens[start:start + tokens_per_block]
+                    for start in range(0, len(cached_tokens), tokens_per_block)
                 ]
         if request_index == 0:
             assert num_offloaded_blocks == 0
