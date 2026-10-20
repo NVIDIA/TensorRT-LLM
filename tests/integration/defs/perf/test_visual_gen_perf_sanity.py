@@ -29,7 +29,10 @@ import pytest
 import yaml
 from test_common.error_utils import report_error
 from test_common.http_utils import wait_for_endpoint_ready
-from test_common.visual_gen_perf_history import transform_visual_gen_history
+from test_common.visual_gen_perf_history import (
+    get_generation_metric_path,
+    transform_visual_gen_history,
+)
 
 from defs.trt_test_alternative import print_info
 from tensorrt_llm._utils import get_free_port
@@ -569,7 +572,7 @@ class VisualGenPerfSanityTestConfig:
         result_path: str,
     ) -> None:
         """Validate the saved benchmark JSON before it is used as the source of truth."""
-        is_video = str(result_data.get("backend")) == "openai-videos"
+        generation_path = get_generation_metric_path(str(result_data.get("backend")))
         required_keys = [
             "backend",
             "model",
@@ -579,8 +582,8 @@ class VisualGenPerfSanityTestConfig:
             "e2e_latency",
             "timings",
         ]
-        if is_video:
-            required_keys.append("gen_latency")
+        if generation_path not in required_keys:
+            required_keys.append(generation_path)
         missing_keys = [key for key in required_keys if key not in result_data]
         if missing_keys:
             raise ValueError(f"Missing keys in benchmark result {result_path}: {missing_keys}")
@@ -612,10 +615,7 @@ class VisualGenPerfSanityTestConfig:
                 f"completed={completed_requests}, total={total_requests}"
             )
 
-        # The image route has no separate generation series: its whole request is one.
-        series = {"e2e_latency": result_data["e2e_latency"]}
-        if is_video:
-            series["gen_latency"] = result_data["gen_latency"]
+        series = {name: result_data[name] for name in ("e2e_latency", generation_path)}
         for name, stats in series.items():
             for percentile in ("p90", "p99"):
                 if percentile not in stats.get("percentiles", {}):

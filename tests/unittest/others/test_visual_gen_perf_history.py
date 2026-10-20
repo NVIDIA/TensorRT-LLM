@@ -27,6 +27,11 @@ def _benchmark_result(backend: str) -> dict:
 
     return {
         "backend": backend,
+        "model": "test-model",
+        "config": {"num_gpus": 1},
+        "total_requests": 1,
+        "completed": 1,
+        "timings": {},
         "request_throughput": 2,
         "e2e_latency": latency(0.94),
         "gen_latency": latency(0.8),
@@ -345,6 +350,27 @@ def producer(monkeypatch: pytest.MonkeyPatch) -> types.ModuleType:
     return module
 
 
+@pytest.fixture
+def harness(
+    modules: _Modules, producer: types.ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> types.ModuleType:
+    """Import the actual harness with only environment/GPU dependencies replaced."""
+    config = types.ModuleType("defs.conftest")
+    config.get_llm_root = lambda: str(_PERF_DIR.parents[3])
+    config.llm_models_root = lambda: "/unused-test-models"
+    gpu = types.ModuleType("tensorrt_llm._utils")
+    gpu.get_free_port = lambda: 0
+    monkeypatch.setitem(sys.modules, "defs.conftest", config)
+    monkeypatch.setitem(sys.modules, "tensorrt_llm._utils", gpu)
+    monkeypatch.setitem(sys.modules, "defs.perf.visual_gen_perf_utils", producer)
+    spec = importlib.util.spec_from_file_location(
+        "defs.perf.test_visual_gen_perf_sanity", _PERF_DIR / "test_visual_gen_perf_sanity.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 @pytest.mark.parametrize(
     ("backend", "source", "generation"),
     [
@@ -379,6 +405,7 @@ def test_producer_source_agrees_with_extracted_metrics_without_changing_match_ke
 )
 def test_one_path_change_updates_extraction_metadata_and_history_selection(
     producer: types.ModuleType,
+    harness: types.ModuleType,
     monkeypatch: pytest.MonkeyPatch,
     backend: str,
     new_path: str,
@@ -387,6 +414,16 @@ def test_one_path_change_updates_extraction_metadata_and_history_selection(
     old = _client_row(0.9, "2026-10-14T00:00:00Z", s_backend=backend)
     assert transform_visual_gen_history(old) == old
     monkeypatch.setitem(visual_gen_perf_history._GENERATION_METRIC_PATHS, backend, new_path)
+    result = _benchmark_result(backend)
+    validate = harness.VisualGenPerfSanityTestConfig._validate_benchmark_result
+    validation_kwargs = dict(
+        model_path="test-model",
+        expected_num_gpus=1,
+        result_data=result,
+        client_config={"backend": backend},
+        result_path="test-only.json",
+    )
+    validate(None, **validation_kwargs)
     row = producer.build_visual_gen_db_entry(
         gpu_type="b200",
         model_name="test-model",
@@ -400,6 +437,13 @@ def test_one_path_change_updates_extraction_metadata_and_history_selection(
     assert row["s_generation_timing_source"] == f"client_{new_path}"
     assert transform_visual_gen_history(row) == row
     assert transform_visual_gen_history(old) is None
+    for invalid in (float("nan"), 0, -1):
+        result[new_path]["median"] = invalid
+        with pytest.raises(ValueError, match=f"Invalid median {new_path}"):
+            validate(None, **validation_kwargs)
+    del result[new_path]
+    with pytest.raises(ValueError, match="Missing keys"):
+        validate(None, **validation_kwargs)
 
 
 def test_producer_rejects_mismatched_result_backend(producer: types.ModuleType) -> None:
