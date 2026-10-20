@@ -7952,8 +7952,8 @@ class PyExecutor:
         # A KDA context-only cache manager keeps no replay or draft-verification
         # buffers, so it cannot run a generation row; pad with a one-token
         # context dummy instead.
-        context_dummy = bool(
-            getattr(self.kv_cache_manager, "kda_context_only", False))
+        context_dummy = getattr(self.kv_cache_manager, "kda_context_only",
+                                False) is True
         token_nums = [1] if context_dummy else None
         if not self._has_adp_dummy_kv_capacity(
                 token_nums, draft_reserve=0 if context_dummy else None):

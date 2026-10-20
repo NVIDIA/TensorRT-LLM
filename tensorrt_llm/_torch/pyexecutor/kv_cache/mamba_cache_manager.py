@@ -3202,9 +3202,9 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
 
         # A disaggregated context server never verifies drafts, so it keeps
         # neither KDA replay caches nor intermediate verification buffers.
-        self.kda_context_only = (kda_replay_num_spec is not None
-                                 and _is_disagg_context_server(
-                                     kwargs.get("is_disagg", False)))
+        self.kda_context_only = bool(
+            kda_replay_num_spec is not None
+            and _is_disagg_context_server(kwargs.get("is_disagg", False)))
         if self.kda_context_only:
             kda_replay_num_spec = None
         self._kda_replay_layers: List[Dict[str, torch.Tensor]] = []
