@@ -49,6 +49,7 @@ def _executor() -> PyExecutor:
     executor.canceled_req_ids = []
     executor.waiting_queue = Mock()
     executor.dist = SimpleNamespace(rank=0)
+    executor.enable_attention_dp = False
     executor._disagg_pp_termination_handler = None
     executor._do_terminate_request = Mock()
     executor._enqueue_responses = Mock()
@@ -317,6 +318,20 @@ def test_control_drain_waits_for_detached_connector_load() -> None:
     pending = SimpleNamespace(control_requires_drain=True)
     executor.control_requests = [pending]
     executor.kv_connector_manager.has_pending_loads.return_value = True
+
+    executor._handle_control_request()
+
+    assert executor.control_requests == [pending]
+
+
+def test_control_drain_waits_for_peer_ranks_under_attention_dp() -> None:
+    executor = _executor()
+    executor.enable_attention_dp = True
+    executor.dist = SimpleNamespace(rank=0, world_size=2, tp_allgather=lambda drained: [drained, 0])
+    executor.waiting_queue = []
+    pending = SimpleNamespace(control_requires_drain=True)
+    executor.control_requests = [pending]
+    executor.kv_connector_manager.has_pending_loads.return_value = False
 
     executor._handle_control_request()
 

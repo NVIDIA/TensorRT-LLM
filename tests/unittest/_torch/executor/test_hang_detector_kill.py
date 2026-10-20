@@ -211,6 +211,7 @@ def test_control_request_wait_pauses_detector():
     executor.control_action_done = threading.Event()
     executor.dist = SimpleNamespace(pp_size=1, world_size=1)
     executor.disable_overlap_scheduler = True
+    executor.enable_attention_dp = False
     executor.hang_detector = HangDetector(timeout=1, on_detected=lambda: fired.append(1))
 
     def complete_control_action():

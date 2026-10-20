@@ -5244,11 +5244,19 @@ class PyExecutor:
 
         pending = self.control_requests[0]
 
-        if pending.control_requires_drain and (
-                len(self.active_requests) != 0 or len(self.waiting_queue) != 0
-                or self._has_pending_connector_transfers()):
-            # drain=True: keep the sentinel parked until the engine drains.
-            return
+        if pending.control_requires_drain:
+            drained = (len(self.active_requests) == 0
+                       and len(self.waiting_queue) == 0
+                       and not self._has_pending_connector_transfers())
+            if self.enable_attention_dp and self.dist.world_size != 1:
+                # Attention-DP ranks drain independently (per-rank queues), and
+                # the retire below issues attention-DP gathers that every rank
+                # must join in the same iteration, so fire only once all ranks
+                # are drained.
+                drained = all(self.dist.tp_allgather(int(drained)))
+            if not drained:
+                # drain=True: keep the sentinel parked until the engine drains.
+                return
 
         logger.debug(f"[control_action] firing control request "
                      f"drain={pending.control_requires_drain} "
