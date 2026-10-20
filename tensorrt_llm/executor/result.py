@@ -449,7 +449,8 @@ class GenerationResultBase:
                         f"logprobs length: {len(output.logprobs)} != "
                         f"output.length: {output.length}")
 
-        if (generation_logits :=
+        if not isinstance(response_tensors, tllm.Result) and (
+                generation_logits :=
                 response_tensors.generation_logits) is not None:
             output.generation_logits = generation_logits[
                 src_idx, :output.length]
@@ -721,7 +722,9 @@ class GenerationResultBase:
                     self._disaggregated_params.first_gen_logits = \
                         first_gen_logits
 
-            if (context_logits := response_result.context_logits) is not None:
+            if not isinstance(response_result, tllm.Result) and (
+                    context_logits :=
+                    response_result.context_logits) is not None:
                 self._context_logits = context_logits
 
             if (mm_embedding_handles :=
