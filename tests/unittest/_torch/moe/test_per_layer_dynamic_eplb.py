@@ -462,16 +462,23 @@ def test_helper_slot_mode_rejects_unknown_mode():
 
 
 def test_scheduler_spin_bound_follows_the_warmup_guard_until_shutdown(monkeypatch):
+    from tensorrt_llm._torch.autotuner import AutoTuner
     from tensorrt_llm._torch.moe.fused_moe import moe_comm_timeout_guard
 
     guard = moe_comm_timeout_guard.MoECommTimeoutGuard(environ={}, is_capturing=lambda: False)
     monkeypatch.setattr(moe_comm_timeout_guard, "_DEFAULT_GUARD", guard)
+    # The real AutoTuner reads the CUDA device name; this test runs without a GPU.
+    tuner = SimpleNamespace(is_tuning_mode=False)
+    monkeypatch.setattr(AutoTuner, "get", lambda: tuner)
     manager = _manager()
 
     bound = manager.get_scheduler_spin_bound()
 
     assert manager.get_scheduler_spin_bound() is bound
     assert bound.cycles() == 8_000_000_000
+    tuner.is_tuning_mode = True
+    assert bound.cycles() == 1800 * 2_000_000_000
+    tuner.is_tuning_mode = False
     guard.set_warmup(True)
     assert bound.cycles() == 1800 * 2_000_000_000
     guard.set_warmup(False)
