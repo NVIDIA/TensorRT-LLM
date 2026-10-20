@@ -149,6 +149,18 @@ def test_mixed_precision_preserves_native_and_shared_kv_storage(make_manager):
         assert mixed.get_buffers(layer).shape[1:] == native.get_buffers(layer).shape[1:]
 
 
+def test_mixed_precision_keeps_kv_quota(make_manager):
+    # Attention stages the native-dtype copy from its own buffer pool, so the
+    # manager hands the whole KV budget to the pools.
+    budget = 64 << 20
+    native = make_manager(config=KvCacheConfig(enable_block_reuse=True, max_gpu_total_bytes=budget))
+    mixed = make_manager(
+        config=mixed_config(max_tokens=None, max_gpu_total_bytes=budget, pool_ratio=[0.5, 0.5])
+    )
+    assert native.kv_cache_manager_py_config.cache_tiers[0].quota == budget
+    assert mixed.kv_cache_manager_py_config.cache_tiers[0].quota == budget
+
+
 def test_pool_ratio_must_cover_retained_group(make_manager):
     with pytest.raises(ValueError, match="needs 2"):
         make_manager(config=mixed_config(pool_ratio=[1.0]))
@@ -156,12 +168,19 @@ def test_pool_ratio_must_cover_retained_group(make_manager):
 
 @pytest.mark.parametrize("ratio", ([0.6, 0.4], [0.75, 0.25]))
 def test_explicit_pool_ratio_orders_retained_group_last(make_manager, ratio):
-    manager = make_manager(config=mixed_config(pool_ratio=ratio))
+    # A byte budget, so the ratio is not distorted by the max_tokens cap.
+    manager = make_manager(
+        config=mixed_config(pool_ratio=ratio, max_tokens=None, max_gpu_total_bytes=128 << 20)
+    )
     assert manager.kv_cache_manager_py_config.initial_pool_ratio == pytest.approx(ratio)
     assert [list(group) for group in manager.impl.layer_grouping] == [[0], [1]]
     low_pages, high_pages = pool_pages(manager)
     low_bytes = low_pages * manager.get_layer_bytes_per_token(0, Role.ALL) * 128
     high_bytes = high_pages * manager.kv_factor * 128 * 2 * 64 * 2
+    print(
+        f"explicit ratio {ratio}: low {low_pages} pages / {low_bytes >> 20} MiB, "
+        f"high {high_pages} pages / {high_bytes >> 20} MiB"
+    )
     assert low_bytes / (low_bytes + high_bytes) == pytest.approx(ratio[0], abs=0.05)
 
 

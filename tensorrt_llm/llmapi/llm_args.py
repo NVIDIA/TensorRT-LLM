@@ -4783,10 +4783,9 @@ class KvPoolRebalanceConfig(StrictBaseModel):
 # first/last retained tokens and the attention inputs use the second dtype;
 # the full history is stored in the first. Requires KV cache manager V2.
 _MIXED_PRECISION_KV_DTYPE = re.compile(
-    r"^mixed_(?P<low>nvfp4)_(?P<high>auto|fp8|float16|bfloat16)$")
+    r"^mixed_(?P<low>nvfp4)_(?P<high>fp8|float16|bfloat16)$")
 _MIXED_PRECISION_KV_DTYPES = tuple(f"mixed_nvfp4_{high}"
-                                   for high in ("auto", "fp8", "float16",
-                                                "bfloat16"))
+                                   for high in ("fp8", "float16", "bfloat16"))
 
 
 @PybindMirror.mirror_pybind_fields(_KvCacheConfig)
@@ -4900,7 +4899,7 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         "'fp8_ds_mla' selects the packed FP8 cache used by sparse MLA on SM90/SM120/SM121. "
         "'mixed_nvfp4_<dtype>' (prototype) stores the full KV history in NVFP4 and "
         "keeps the first_n/last_n tokens of every sequence in <dtype> "
-        "('auto', 'fp8', 'float16' or 'bfloat16'); requires KV cache manager V2. "
+        "('fp8', 'float16' or 'bfloat16'); requires KV cache manager V2. "
         "Resolved at "
         "LLM-construction time, including when set via trtllm-serve "
         "--extra_llm_api_options.",
@@ -5121,7 +5120,7 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
 
         raise ValueError(
             'kv_cache_config.dtype must be one of "auto", "fp8", "fp8_ds_mla", '
-            '"nvfp4", "mixed_nvfp4_<auto|fp8|float16|bfloat16>", or valid '
+            '"nvfp4", "mixed_nvfp4_<fp8|float16|bfloat16>", or valid '
             'torch.dtype string')
 
     @property

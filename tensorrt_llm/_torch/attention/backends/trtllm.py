@@ -1147,21 +1147,21 @@ class TrtllmAttentionMetadata(AttentionMetadata):
 
     def _on_mixed_precision_kv_prepared(self, view) -> None:
         """Lay out the staging pages as TRTLLM block offsets for this batch."""
+        batch = len(view.page_counts)
         ordinals = torch.arange(view.max_blocks_per_seq, dtype=torch.int32)
-        pages = torch.tensor(view.page_starts[:-1],
+        pages = torch.tensor(view.page_starts[:batch],
                              dtype=torch.int32)[:, None] + ordinals
         offsets = torch.stack((view.kv_factor * pages,
                                view.kv_factor * pages + view.kv_factor - 1),
                               dim=1)
         valid = ordinals < torch.tensor(view.page_counts,
                                         dtype=torch.int32)[:, None]
-        block_offsets = self.kv_cache_manager.mixed_precision_buffers.get_buffer(
-            (1, self.kv_cache_manager.max_batch_size, 2,
-             view.max_blocks_per_seq),
+        block_offsets = view.buffers.get_buffer(
+            (1, view.rows, 2, view.max_blocks_per_seq),
             torch.int32,
             "mixed_block_offsets",
             self.is_cuda_graph,
-        )[:, :len(view.page_counts)]
+        )[:, :batch]
         block_offsets.copy_(maybe_pin_memory(
             offsets.masked_fill(~valid[:, None], -1).unsqueeze(0)),
                             non_blocking=True)

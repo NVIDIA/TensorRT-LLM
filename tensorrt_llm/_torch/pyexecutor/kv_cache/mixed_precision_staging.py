@@ -2,11 +2,14 @@
 # SPDX-License-Identifier: Apache-2.0
 """Native-dtype staging of mixed-precision KV layers for one attention batch."""
 
+import math
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
 
 from tensorrt_llm._utils import prefer_pinned
+
+from ...memory_buffer_utils import Buffers
 
 
 class MixedPrecisionKVStaging:
@@ -25,20 +28,28 @@ class MixedPrecisionKVStaging:
     def __init__(
         self,
         manager,
+        buffers: Buffers,
         *,
+        rows: int,
         layout: str,
         pool_layout: str,
         tokens_per_block: int,
-        num_seqs: int,
     ) -> None:
-        """Allocate the staging copy and the pool views for ``num_seqs`` requests.
+        """Allocate the staging copy and the pool views for ``rows`` requests.
 
-        ``layout`` and ``tokens_per_block`` describe the paged cache the
-        attention kernels read; the kernels may need smaller pages than the
-        manager stores (TRTLLM paged-context FMHA uses 32-token pages).
-        ``pool_layout`` is the layout the backend writes the manager's pools in.
+        ``buffers`` is the attention metadata's buffer pool; the staging copy is
+        taken from it once, sized for this rank: ``rows`` requests (the
+        metadata's sequence capacity) times the manager's ``max_seq_len`` times
+        the largest local mixed-precision layer page, whose head count is
+        already sharded by the manager. ``layout`` and ``tokens_per_block``
+        describe the paged cache the attention kernels read; the kernels may
+        need smaller pages than the manager stores (TRTLLM paged-context FMHA
+        uses 32-token pages). ``pool_layout`` is the layout the backend writes
+        the manager's pools in.
         """
         self.manager = manager
+        self.buffers = buffers
+        self.rows = rows
         self.layout = layout
         self.block_size = manager.tokens_per_block
         self.tokens_per_block = tokens_per_block
@@ -46,25 +57,31 @@ class MixedPrecisionKVStaging:
         self.max_blocks_per_seq = -(-self.max_seq_len // tokens_per_block)
         self.kv_factor = manager.kv_factor
         # Fixed per-request spans keep addresses unchanged as sequences grow.
-        self.page_starts = [row * self.max_blocks_per_seq for row in range(num_seqs + 1)]
-        storage = manager.mixed_precision_buffers.get_buffer(
-            [manager._staging_bytes], torch.uint8, "mixed_kv_staging", True
-        )
-        # layer_idx -> (staging, low pool, high pool), all presented in ``layout``.
-        self.pools: Dict[int, Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
+        self.page_starts = [row * self.max_blocks_per_seq for row in range(rows + 1)]
+        # layer_idx -> (staging shape, low pool, high pool), all presented in ``layout``.
+        pools: Dict[int, Tuple[List[int], torch.Tensor, torch.Tensor]] = {}
+        self.max_page_bytes = 0
         for layer_idx, local in manager.layer_offsets.items():
             if local not in manager.high_layers:
                 continue
-            pools = tuple(
+            low, high = (
                 manager.get_buffers(layer_idx, pool_layout, mixed_precision_pool=pool)
                 for pool in ("low", "high")
             )
             if layout != pool_layout:
-                pools = tuple(pool.transpose(2, 3) for pool in pools)
-            shape = [self.page_starts[-1], *pools[-1].shape[1:]]
+                low, high = low.transpose(2, 3), high.transpose(2, 3)
+            shape = [self.page_starts[-1], *high.shape[1:]]
             shape[3 if layout == "HND" else 2] = tokens_per_block
-            staging = manager.mixed_precision_buffers._view_as(storage, shape, pools[-1].dtype)
-            self.pools[layer_idx] = (staging, *pools)
+            pools[layer_idx] = (shape, low, high)
+            self.max_page_bytes = max(
+                self.max_page_bytes, math.prod(shape[1:]) * high.element_size()
+            )
+        self.staging_bytes = self.page_starts[-1] * self.max_page_bytes
+        storage = buffers.get_buffer([self.staging_bytes], torch.uint8, "mixed_kv_staging", True)
+        self.pools: Dict[int, Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {
+            layer_idx: (Buffers._view_as(storage, shape, high.dtype), low, high)
+            for layer_idx, (shape, low, high) in pools.items()
+        }
         # Cache manager interface read by the attention backends.
         self.layer_offsets = {layer: layer for layer in self.pools}
         self.max_attention_window_vec = (None,) * (max(self.pools) + 1)
@@ -87,10 +104,10 @@ class MixedPrecisionKVStaging:
     ) -> None:
         """Load this batch's page tables and lengths into device buffers."""
         manager = self.manager
+        buffers = self.buffers
         lengths = [cached + new for cached, new in zip(cached_lengths, seq_lens)]
         self.page_counts = [-(-length // self.tokens_per_block) for length in lengths]
         batch = len(lengths)
-        buffers = manager.mixed_precision_buffers
         max_pages = -(-self.max_seq_len // self.block_size)
         self.page_tables = {}
         for layer_idx in self.pools:
@@ -103,14 +120,14 @@ class MixedPrecisionKVStaging:
                     count = min(len(pages), max_pages)
                     tables[role, row, :count] = torch.tensor(pages[:count], dtype=torch.int32)
             self.page_tables[layer_idx] = buffers.get_buffer(
-                (2, manager.max_batch_size, max_pages),
+                (2, self.rows, max_pages),
                 torch.int32,
                 f"mixed_page_tables_{layer_idx}",
                 capture_graph,
             )[:, :batch]
             self.page_tables[layer_idx].copy_(tables, non_blocking=True)
         self.lengths = buffers.get_buffer(
-            (2, manager.max_batch_size), torch.int32, "mixed_lengths", capture_graph
+            (2, self.rows), torch.int32, "mixed_lengths", capture_graph
         )[:, :batch]
         self.lengths.copy_(
             torch.tensor(

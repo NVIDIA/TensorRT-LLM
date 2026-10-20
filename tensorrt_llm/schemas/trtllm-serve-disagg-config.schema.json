@@ -2254,7 +2254,7 @@
         },
         "kv_cache_dtype": {
           "default": "auto",
-          "description": "The data type for the KV cache. 'auto' (default) leaves the checkpoint's own KV-cache quantization metadata untouched (quant_config.kv_cache_quant_algo is inherited as-is); 'fp8', 'fp8_ds_mla', or 'nvfp4' override it explicitly. 'fp8_ds_mla' selects the packed FP8 cache used by sparse MLA on SM90/SM120/SM121. 'mixed_nvfp4_<dtype>' (prototype) stores the full KV history in NVFP4 and keeps the first_n/last_n tokens of every sequence in <dtype> ('auto', 'fp8', 'float16' or 'bfloat16'); requires KV cache manager V2. Resolved at LLM-construction time, including when set via trtllm-serve --extra_llm_api_options.",
+          "description": "The data type for the KV cache. 'auto' (default) leaves the checkpoint's own KV-cache quantization metadata untouched (quant_config.kv_cache_quant_algo is inherited as-is); 'fp8', 'fp8_ds_mla', or 'nvfp4' override it explicitly. 'fp8_ds_mla' selects the packed FP8 cache used by sparse MLA on SM90/SM120/SM121. 'mixed_nvfp4_<dtype>' (prototype) stores the full KV history in NVFP4 and keeps the first_n/last_n tokens of every sequence in <dtype> ('fp8', 'float16' or 'bfloat16'); requires KV cache manager V2. Resolved at LLM-construction time, including when set via trtllm-serve --extra_llm_api_options.",
           "telemetry": {
             "allowed_values": [
               "auto",
@@ -2264,7 +2264,6 @@
               "fp8",
               "fp8_ds_mla",
               "nvfp4",
-              "mixed_nvfp4_auto",
               "mixed_nvfp4_fp8",
               "mixed_nvfp4_float16",
               "mixed_nvfp4_bfloat16"
@@ -4329,7 +4328,7 @@
         },
         "dtype": {
           "default": "auto",
-          "description": "The data type for the KV cache. 'auto' (default) leaves the checkpoint's own KV-cache quantization metadata untouched (quant_config.kv_cache_quant_algo is inherited as-is); 'fp8', 'fp8_ds_mla', or 'nvfp4' override it explicitly. 'fp8_ds_mla' selects the packed FP8 cache used by sparse MLA on SM90/SM120/SM121. 'mixed_nvfp4_<dtype>' (prototype) stores the full KV history in NVFP4 and keeps the first_n/last_n tokens of every sequence in <dtype> ('auto', 'fp8', 'float16' or 'bfloat16'); requires KV cache manager V2. Resolved at LLM-construction time, including when set via trtllm-serve --extra_llm_api_options.",
+          "description": "The data type for the KV cache. 'auto' (default) leaves the checkpoint's own KV-cache quantization metadata untouched (quant_config.kv_cache_quant_algo is inherited as-is); 'fp8', 'fp8_ds_mla', or 'nvfp4' override it explicitly. 'fp8_ds_mla' selects the packed FP8 cache used by sparse MLA on SM90/SM120/SM121. 'mixed_nvfp4_<dtype>' (prototype) stores the full KV history in NVFP4 and keeps the first_n/last_n tokens of every sequence in <dtype> ('fp8', 'float16' or 'bfloat16'); requires KV cache manager V2. Resolved at LLM-construction time, including when set via trtllm-serve --extra_llm_api_options.",
           "telemetry": {
             "allowed_values": [
               "auto",
@@ -4339,7 +4338,6 @@
               "fp8",
               "fp8_ds_mla",
               "nvfp4",
-              "mixed_nvfp4_auto",
               "mixed_nvfp4_fp8",
               "mixed_nvfp4_float16",
               "mixed_nvfp4_bfloat16"
@@ -8498,7 +8496,7 @@
     },
     "kv_cache_dtype": {
       "default": "auto",
-      "description": "The data type for the KV cache. 'auto' (default) leaves the checkpoint's own KV-cache quantization metadata untouched (quant_config.kv_cache_quant_algo is inherited as-is); 'fp8', 'fp8_ds_mla', or 'nvfp4' override it explicitly. 'fp8_ds_mla' selects the packed FP8 cache used by sparse MLA on SM90/SM120/SM121. 'mixed_nvfp4_<dtype>' (prototype) stores the full KV history in NVFP4 and keeps the first_n/last_n tokens of every sequence in <dtype> ('auto', 'fp8', 'float16' or 'bfloat16'); requires KV cache manager V2. Resolved at LLM-construction time, including when set via trtllm-serve --extra_llm_api_options.",
+      "description": "The data type for the KV cache. 'auto' (default) leaves the checkpoint's own KV-cache quantization metadata untouched (quant_config.kv_cache_quant_algo is inherited as-is); 'fp8', 'fp8_ds_mla', or 'nvfp4' override it explicitly. 'fp8_ds_mla' selects the packed FP8 cache used by sparse MLA on SM90/SM120/SM121. 'mixed_nvfp4_<dtype>' (prototype) stores the full KV history in NVFP4 and keeps the first_n/last_n tokens of every sequence in <dtype> ('fp8', 'float16' or 'bfloat16'); requires KV cache manager V2. Resolved at LLM-construction time, including when set via trtllm-serve --extra_llm_api_options.",
       "telemetry": {
         "allowed_values": [
           "auto",
@@ -8508,7 +8506,6 @@
           "fp8",
           "fp8_ds_mla",
           "nvfp4",
-          "mixed_nvfp4_auto",
           "mixed_nvfp4_fp8",
           "mixed_nvfp4_float16",
           "mixed_nvfp4_bfloat16"

@@ -612,11 +612,12 @@ def test_mixed_precision_public_options():
     assert config.attention_dtype == "fp8"
     assert config.first_n == config.last_n == 256
     assert config.pool_ratio is None
-    for high in ("auto", "float16", "bfloat16"):
+    for high in ("float16", "bfloat16"):
         assert KvCacheConfig(dtype=f"mixed_nvfp4_{high}").attention_dtype == high
     for invalid in (
         {"dtype": "mixed_int4_fp8"},
         {"dtype": "mixed_nvfp4_nvfp4"},
+        {"dtype": "mixed_nvfp4_auto"},
         {"dtype": "mixed_nvfp4_fp8", "first_n": -1},
         {"dtype": "mixed_nvfp4_fp8", "last_n": -1},
         {"dtype": "mixed_nvfp4_fp8", "first_n": 0, "last_n": 0},
@@ -678,3 +679,88 @@ def test_mixed_precision_llm_args_validation(overrides, error, match):
     kwargs.update(overrides)
     with pytest.raises(error, match=match):
         TorchLlmArgs(**kwargs)
+
+
+@pytest.mark.parametrize(
+    "tp_size,attention_dp,heads_per_rank",
+    [(1, False, 4), (2, False, 2), (2, True, 4)],
+    ids=("tp1", "tp2", "tp2_attention_dp"),
+)
+def test_staging_allocation_follows_rank_geometry(tp_size, attention_dp, heads_per_rank):
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] not in (10, 12):
+        pytest.skip("Mixed-precision NVFP4 KV requires Blackwell")
+    from unittest.mock import Mock
+
+    from tensorrt_llm._torch.distributed.communicator import Distributed
+    from tensorrt_llm._torch.memory_buffer_utils import get_memory_buffers
+    from tensorrt_llm._torch.pyexecutor.kv_cache import kv_cache_manager_v2 as kv_cache_v2_module
+
+    rows, block, width = 3, 128, 64
+    mapping = Mapping(world_size=tp_size, rank=0, tp_size=tp_size, enable_attention_dp=attention_dp)
+    distributed = Mock(local_world_size=1)
+    distributed.allreduce.side_effect = lambda value, op: value
+    with (
+        patch.object(kv_cache_v2_module, "mpi_rank", return_value=0),
+        patch.object(Distributed, "get", return_value=distributed),
+    ):
+        manager = KVCacheManagerV2(
+            KvCacheConfig(
+                max_tokens=65536,
+                host_cache_size=0,
+                enable_block_reuse=True,
+                dtype="mixed_nvfp4_bfloat16",
+                first_n=block,
+                last_n=block,
+                pool_ratio=[0.75, 0.25],
+            ),
+            CacheType.SELF,
+            num_layers=2,
+            num_kv_heads=4,
+            head_dim=width,
+            tokens_per_block=block,
+            max_seq_len=1024,
+            max_batch_size=rows,
+            mapping=mapping,
+            dtype=DataType.BF16,
+        )
+    try:
+        # The manager shards KV heads across TP ranks; attention DP keeps them whole.
+        assert manager.num_kv_heads_per_layer == [heads_per_rank, heads_per_rank]
+        manager.add_dummy_requests([0], [block], is_gen=False)
+
+        def make_metadata():
+            metadata = TrtllmAttention.Metadata(
+                seq_lens=torch.tensor([block], dtype=torch.int32),
+                num_contexts=1,
+                kv_cache_params=KVCacheParams(use_cache=True, num_cached_tokens_per_seq=[0]),
+                max_num_requests=rows,
+                max_num_tokens=block,
+                max_num_sequences=rows,
+                kv_cache_manager=manager,
+                request_ids=[0],
+                prompt_lens=[block],
+                kv_layout="NHD",
+                mapping=mapping,
+                runtime_features=AttentionRuntimeFeatures(chunked_prefill=True, cache_reuse=True),
+            )
+            metadata.prepare()
+            return metadata
+
+        view = make_metadata().mixed_precision_kv_views[0]
+        # TRTLLM stages 32-token HND pages; every row spans the full max_seq_len.
+        page_bytes = manager.kv_factor * heads_per_rank * 32 * width * 2
+        assert view.max_page_bytes == page_bytes
+        assert view.staging_bytes == rows * (1024 // 32) * page_bytes
+        staging = view.get_buffers(0)
+        assert staging.shape[0] == rows * (1024 // 32)
+        # Allocated once from the shared metadata buffer pool as a reserved block,
+        # and reused by later metadata objects (the final engine after profiling).
+        blocks = get_memory_buffers().buffers["mixed_kv_staging"]
+        assert any(b.is_reserved and b.buffer.data_ptr() == staging.data_ptr() for b in blocks)
+        again = make_metadata().mixed_precision_kv_views[0]
+        assert again.get_buffers(0).data_ptr() == staging.data_ptr()
+        assert len(get_memory_buffers().buffers["mixed_kv_staging"]) == len(blocks)
+        # The KV quota is not reduced for staging.
+        assert manager.kv_cache_manager_py_config.cache_tiers[0].quota > 0
+    finally:
+        manager.shutdown()

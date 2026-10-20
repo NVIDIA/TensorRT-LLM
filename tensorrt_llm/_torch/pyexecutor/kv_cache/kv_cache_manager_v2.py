@@ -105,7 +105,6 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import KVCacheManagerConfig as KVC
 from tensorrt_llm.runtime.kv_cache_manager_v2 import OutOfMemoryError as KVCacheOutOfMemoryError
 from tensorrt_llm.sampling_params import SamplingParams
 
-from ...memory_buffer_utils import Buffers
 from ..config_utils import get_layer_attention_window, uses_vswa_kv_cache_layout
 from ..connectors.kv_cache_connector import KvCacheConnectorManager
 from ..kv_cache_events import StreamingKVCacheEventManager, validate_streaming_support
@@ -3179,8 +3178,6 @@ class KVCacheManagerV2(BaseResourceManager):
         self.first_n = kv_cache_config.first_n
         self.last_n = kv_cache_config.last_n
         self._shared_kv_layers: set[int] = set()
-        self._staging_bytes = 0
-        self.mixed_precision_buffers = Buffers()
         mixed = kv_cache_config.mixed_precision_dtypes
         if mixed is None:
             return
@@ -3219,7 +3216,7 @@ class KVCacheManagerV2(BaseResourceManager):
         )
 
     def _add_mixed_precision_layers(self, config: KVCacheManagerConfigPy) -> KVCacheManagerConfigPy:
-        """Append the retained-token layers and reserve the attention staging space."""
+        """Append the retained-token layer group for every mixed-precision layer."""
         if self.low_precision_dtype is None:
             return config
         if self.kv_cache_type not in (CacheTypeCpp.SELF, CacheTypeCpp.SELFKONLY):
@@ -3237,7 +3234,6 @@ class KVCacheManagerV2(BaseResourceManager):
             (model, _MixedPrecisionLayerKind.PRIMARY): LayerId(local)
             for local, model in enumerate(self.pp_layers)
         }
-        largest_page = 0
         for layer in config.layers:
             # Preserve native SWA and recurrent-state pools.
             if not isinstance(layer, AttentionLayerConfig) or not self._is_mixed_precision_layer(
@@ -3270,7 +3266,6 @@ class KVCacheManagerV2(BaseResourceManager):
                     reuse_policy=AttentionReusePolicy.REQUIRED,
                 )
             )
-            largest_page = max(largest_page, self.kv_factor * page_bytes)
 
         if not self.high_layers:
             return config
@@ -3284,21 +3279,7 @@ class KVCacheManagerV2(BaseResourceManager):
                     "model followed by one for the retained first_n/last_n tokens. Leave "
                     "pool_ratio unset to size the groups automatically."
                 )
-        # Layers share one native KV view.
-        pages = self.max_batch_size * math.ceil(self.max_seq_len / self.tokens_per_block)
-        self._staging_bytes = pages * largest_page
-        reserve = self._staging_bytes
-        # Page tables are per layer; lengths are shared by the batch.
-        reserve += len(self.high_layers) * 2 * pages * 4
-        reserve += 2 * self.max_batch_size * 4
-        # TRTLLM uses at most 32 tokens per staging page and two offsets even for MLA.
-        view_pages = math.ceil(self.max_seq_len / min(self.tokens_per_block, 32))
-        reserve += self.max_batch_size * 2 * view_pages * 4
-        quota = config.cache_tiers[0].quota - reserve
-        if quota <= 0:
-            raise ValueError("KV budget cannot cover mixed-precision Attention staging")
-        tiers = [GpuCacheTierConfig(quota=quota), *config.cache_tiers[1:]]
-        return replace(config, layers=layers, cache_tiers=tiers)
+        return replace(config, layers=layers)
 
     @staticmethod
     def _count_layer_groups(config: KVCacheManagerConfigPy, layers: Sequence[object]) -> int:
@@ -6236,7 +6217,6 @@ class KVCacheManagerV2(BaseResourceManager):
         if self.conversation_manager is not None:
             self.conversation_manager.clear()
         self.impl.shutdown()
-        self.mixed_precision_buffers.buffers.clear()
         if self._sharing is not None:
             # After the runtime's shutdown, which raises while any cache is open, in the map or not;
             # a poisoned runtime returns at once, and a close then does nothing.

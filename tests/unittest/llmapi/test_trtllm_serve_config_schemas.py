@@ -90,7 +90,7 @@ def schemas(tmp_path_factory: pytest.TempPathFactory) -> dict[str, dict]:
         ),
         (
             generator.SERVE_SCHEMA,
-            {"kv_cache_config": {"dtype": "mixed_nvfp4_auto", "first_n": 255, "last_n": 0}},
+            {"kv_cache_config": {"dtype": "mixed_nvfp4_bfloat16", "first_n": 255, "last_n": 0}},
             True,
         ),
         (generator.SERVE_SCHEMA, {"kv_cache_config": {"first_n": -1}}, False),

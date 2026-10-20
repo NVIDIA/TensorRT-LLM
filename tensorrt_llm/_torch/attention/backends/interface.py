@@ -28,7 +28,7 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
-from ...memory_buffer_utils import Buffers
+from ...memory_buffer_utils import Buffers, get_memory_buffers
 from ...metadata import KVCacheParams
 from ...pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from ...pyexecutor.kv_cache.mamba_cache_manager import BaseMambaCacheManager
@@ -377,11 +377,25 @@ class AttentionMetadata:
 
         view = next(iter(self.mixed_precision_kv_views.values()), None)
         if view is None or not self.is_cuda_graph:
+            # The eager metadata and every CUDA graph copy share the process
+            # buffer pool, so the staging copy is allocated once per rank and
+            # the KV budget profiling run already accounts for it.
+            buffers = (self.cuda_graph_buffers if self.cuda_graph_buffers
+                       is not None else get_memory_buffers())
             view = MixedPrecisionKVStaging(self.kv_cache_manager,
+                                           buffers,
+                                           rows=self.max_num_sequences
+                                           or self.max_num_requests,
                                            layout=layout,
                                            pool_layout=self.kv_layout,
-                                           tokens_per_block=tokens_per_block,
-                                           num_seqs=self.num_seqs)
+                                           tokens_per_block=tokens_per_block)
+            logger.info_once(
+                "Mixed-precision KV staging on this rank: "
+                f"{view.staging_bytes / (1 << 20):.1f} MiB = {view.rows} "
+                f"requests x {view.max_blocks_per_seq} pages x "
+                f"{view.max_page_bytes} B ({layout}, {tokens_per_block} "
+                "tokens per page)",
+                key="mixed_precision_kv_staging")
             self.mixed_precision_kv_views = dict.fromkeys(view.pools, view)
         view.update(self.request_ids,
                     self.kv_cache_params.num_cached_tokens_per_seq,
