@@ -1008,6 +1008,7 @@ class TestWarmupCleanup(unittest.TestCase):
     def test_no_kv_cache_warmup_delegates_runner_lifecycle(self):
         """Verify no-KV-cache warmup delegates warmup and graph capture to the runner."""
         model_engine = object.__new__(PyTorchModelEngine)
+        model_engine.llm_args = SimpleNamespace(enable_autotuner=False)
         model_engine.model = SimpleNamespace(model_config=SimpleNamespace(is_encoder_decoder=False))
         model_engine.moe_load_balancer = None
         model_engine._metrics = {}
@@ -1028,6 +1029,7 @@ class TestWarmupCleanup(unittest.TestCase):
     def test_no_kv_cache_warmup_rejects_allocated_kv_cache(self):
         """Verify a no-KV-cache runner rejects an allocated KV cache before warmup."""
         model_engine = object.__new__(PyTorchModelEngine)
+        model_engine.llm_args = SimpleNamespace(enable_autotuner=False)
         model_engine._metrics = {}
         model_engine.model = SimpleNamespace(model_config=SimpleNamespace(is_encoder_decoder=False))
         model_engine.moe_load_balancer = None
@@ -1061,6 +1063,7 @@ class TestWarmupCleanup(unittest.TestCase):
         )
         model_engine = object.__new__(PyTorchModelEngine)
         model_engine._metrics = warmup._metrics = {}
+        model_engine.llm_args = SimpleNamespace(enable_autotuner=False)
         model_engine.moe_load_balancer = None
         model_engine.is_warmup = False
         model_engine.kv_cache_manager_key = ResourceManagerType.KV_CACHE_MANAGER
