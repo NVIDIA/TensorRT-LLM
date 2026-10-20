@@ -35,8 +35,8 @@ from cutlass.cute.runtime import from_dlpack
 from cutlass.cutlass_dsl import T, dsl_user_op
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
-from tensorrt_llm._torch.cute_dsl_kernels.blackwell.utils import make_ptr
 from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
+from tensorrt_llm._torch.kernels.blackwell.utils import make_ptr
 
 #: Trigger dependents at kernel start (`griddepcontrol.launch_dependents`); a no-op
 #: unless the next kernel is launched with programmatic dependent launch.

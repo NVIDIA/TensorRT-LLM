@@ -27,7 +27,7 @@ from cutlass.cute.runtime import from_dlpack
 from cutlass.cutlass_dsl import T, dsl_user_op
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
-from tensorrt_llm._torch.cute_dsl_kernels.blackwell.utils import make_ptr
+from tensorrt_llm._torch.kernels.blackwell.utils import make_ptr
 
 
 @triton.jit
