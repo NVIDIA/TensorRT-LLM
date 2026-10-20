@@ -229,9 +229,9 @@ def test_hierarchical_fused_submit_launches_bound_scheduler_and_copy():
         launches.append((ctx, flags_mc, route_epoch, route_target, scheduler_args))
 
     torch = SimpleNamespace(
-        cuda=SimpleNamespace(device=lambda _: nullcontext(), stream=lambda _: nullcontext()),
         ops=SimpleNamespace(trtllm=SimpleNamespace(moe_rebalance_tma_submit_fused=submit_fused)),
     )
+    stream_switches = []
     ticket_cls = _extract_class(
         source,
         "HierarchicalCopyTicket",
@@ -242,7 +242,12 @@ def test_hierarchical_fused_submit_launches_bound_scheduler_and_copy():
         source,
         "HierarchicalSamiWeightBroadcast",
         {"submit_fused", "_require_live_bank_reusable"},
-        {"torch": torch, "HierarchicalCopyTicket": ticket_cls},
+        {
+            "torch": torch,
+            "HierarchicalCopyTicket": ticket_cls,
+            "enter_cuda_stream": lambda stream: stream_switches.append(("enter", stream)) or stream,
+            "exit_cuda_stream": lambda state: stream_switches.append(("exit", state)),
+        },
     )
     outputs = object()
     requests = []
@@ -272,6 +277,9 @@ def test_hierarchical_fused_submit_launches_bound_scheduler_and_copy():
 
     assert requests == [("routes", 19)]
     assert launches == [("ctx", 4096, "epoch", 8, ("scheduler", "routes"))]
+    # The launch runs on the copy stream and restores the caller's stream afterwards.
+    owner = broadcast._stream_owner
+    assert stream_switches == [("enter", owner), ("exit", owner)]
     assert (ticket.generation, ticket.command_count) == (1, 1)
     assert (broadcast._active_generation, broadcast._generation) == (1, 2)
     # The bank stays leased until the consumer of generation 1 is proven done.
