@@ -419,7 +419,7 @@ window.runMermaid = runMermaid;</script>
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.23.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc0';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc1';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -434,7 +434,7 @@ window.runMermaid = runMermaid;</script>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="color-scheme" content="light dark"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.4.0rc0" />
+  <meta name="docsearch:version" content="1.4.0rc1" />
   
     
     <script src="../../../_static/searchtools.js"></script>
@@ -795,6 +795,9 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l1 has-children"><a class="reference internal" href="../../../llm-api/reference.html">API Reference</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/LLM.html">LLM</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/AsyncLLM.html">AsyncLLM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/ExecutorMemoryType.html">ExecutorMemoryType</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/RuntimeMemoryStatus.html">RuntimeMemoryStatus</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/SleepConfig.html">SleepConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/MultimodalEncoder.html">MultimodalEncoder</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/CompletionOutput.html">CompletionOutput</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/RequestOutput.html">RequestOutput</a></li>
@@ -884,6 +887,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/speculative-decoding.html">Speculative Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/checkpoint-loading.html">Checkpoint Loading</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/model-express.html">ModelExpress (MX) Checkpoint Loading</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../features/sleep-wakeup.html">Runtime Memory Checkpointing (Prototype)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/ray-orchestrator.html">Ray Orchestrator (Prototype)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/torch_compile_and_piecewise_cuda_graph.html">Torch Compile &amp; Prefill CUDA Graph</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/helix.html">Helix Parallelism</a></li>
@@ -902,6 +906,10 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l1"><a class="reference internal" href="../../../developer-guide/overview.html">Architecture Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../developer-guide/perf-analysis.html">Performance Analysis</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../developer-guide/perf-benchmarking.html">TensorRT LLM Benchmarking</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../../developer-guide/moe-perf-guide.html">MoE Performance Guide</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../../developer-guide/moe-perf-dashboard.html">MoE Perf Dashboard</a></li>
+</ul>
+</details></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../developer-guide/ci-overview.html">Continuous Integration Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../developer-guide/dev-containers.html">Using Dev Containers</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../developer-guide/api-change.html">LLM API Change Guide</a></li>
@@ -913,6 +921,7 @@ window.runMermaid = runMermaid;</script>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog30_KV_Cache_Compression_in_TensorRT-LLM.html">KV Cache Compression in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog29_GVR_V2_Self_Sampling_Exact_TopK_for_Sparse_Attention.html">GVR V2: Self-Sampling and Multi-Thresholding for Faster Exact Top-K</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog28_Accelerating_Video_Generation_with_GEMM_Quantization_Attention_Quantization_and_Skip_Softmax_Attention_in_TensorRT-LLM.html">Accelerating Video Generation with GEMM Quantization, Attention Quantization and Skip Softmax Attention in TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog27_Evaluating_Agentic_Serving_with_Trace_Replay_and_Job_Level_Metrics.html">Evaluating Agentic Serving with Trace Replay and Job-Level Metrics</a></li>
@@ -1013,19 +1022,24 @@ window.runMermaid = runMermaid;</script>
                 <article class="bd-article">
                   
   <h1>Source code for tensorrt_llm._torch.async_llm</h1><div class="highlight"><pre>
-<span></span><span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">Any</span><span class="p">,</span> <span class="n">List</span><span class="p">,</span> <span class="n">Optional</span>
+<span></span><span class="ch">#!/usr/bin/env python</span>
+<span class="c1"># SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION &amp; AFFILIATES. All rights reserved.</span>
+<span class="c1"># SPDX-License-Identifier: Apache-2.0</span>
+
+<span class="kn">from</span><span class="w"> </span><span class="nn">collections.abc</span><span class="w"> </span><span class="kn">import</span> <span class="n">Sequence</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">Any</span><span class="p">,</span> <span class="n">List</span><span class="p">,</span> <span class="n">Optional</span>
 
 <span class="kn">from</span><span class="w"> </span><span class="nn">..llmapi.llm</span><span class="w"> </span><span class="kn">import</span> <span class="n">LLM</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">..llmapi.llm_args</span><span class="w"> </span><span class="kn">import</span> <span class="n">RayPlacementConfig</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">..llmapi.llm_args</span><span class="w"> </span><span class="kn">import</span> <span class="n">ExecutorMemoryType</span><span class="p">,</span> <span class="n">RayPlacementConfig</span><span class="p">,</span> <span class="n">RuntimeMemoryStatus</span>
 
 
 <div class="viewcode-block" id="AsyncLLM">
 <a class="viewcode-back" href="../../../llm-api/reference/AsyncLLM.html#tensorrt_llm.llmapi.AsyncLLM">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">AsyncLLM</span><span class="p">(</span><span class="n">LLM</span><span class="p">):</span>
-<span class="w">    </span><span class="sd">"""AsyncLLM is a subclass of LLM that supports asynchronous setup, release and</span>
-<span class="sd">    resume operations that are necessary for RL or agentic scenarios.</span>
+<span class="w">    </span><span class="sd">"""LLM runtime with asynchronous setup, generation, and memory control.</span>
 
-<span class="sd">    Currently, RL APIs are only supported with Ray orchestrator.</span>
+<span class="sd">    AsyncLLM uses the Ray orchestrator. Weight-update methods remain available</span>
+<span class="sd">    for compatibility with existing reinforcement-learning integrations.</span>
 <span class="sd">    """</span>
 
 <div class="viewcode-block" id="AsyncLLM.__init__">
@@ -1065,26 +1079,66 @@ window.runMermaid = runMermaid;</script>
         <span class="k">return</span> <span class="bp">self</span></div>
 
 
+<div class="viewcode-block" id="AsyncLLM.get_memory_status">
+<a class="viewcode-back" href="../../../llm-api/reference/AsyncLLM.html#tensorrt_llm.llmapi.AsyncLLM.get_memory_status">[docs]</a>
+    <span class="k">async</span> <span class="k">def</span><span class="w"> </span><span class="nf">get_memory_status</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">RuntimeMemoryStatus</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Return the authoritative runtime-memory checkpoint status."""</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_check_runtime_memory_enabled</span><span class="p">()</span>
+        <span class="n">replies</span> <span class="o">=</span> <span class="k">await</span> <span class="bp">self</span><span class="o">.</span><span class="n">collective_rpc</span><span class="p">(</span><span class="s2">"get_memory_status"</span><span class="p">)</span>
+        <span class="n">statuses</span> <span class="o">=</span> <span class="p">[</span><span class="n">RuntimeMemoryStatus</span><span class="o">.</span><span class="n">model_validate</span><span class="p">(</span><span class="n">reply</span><span class="p">)</span> <span class="k">for</span> <span class="n">reply</span> <span class="ow">in</span> <span class="n">replies</span><span class="p">]</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="n">statuses</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">RuntimeError</span><span class="p">(</span><span class="s2">"No worker returned runtime-memory status."</span><span class="p">)</span>
+        <span class="n">expected</span> <span class="o">=</span> <span class="n">statuses</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span>
+        <span class="k">if</span> <span class="nb">any</span><span class="p">(</span><span class="n">status</span> <span class="o">!=</span> <span class="n">expected</span> <span class="k">for</span> <span class="n">status</span> <span class="ow">in</span> <span class="n">statuses</span><span class="p">[</span><span class="mi">1</span><span class="p">:]):</span>
+            <span class="k">raise</span> <span class="ne">RuntimeError</span><span class="p">(</span>
+                <span class="s2">"Runtime-memory state diverged across workers: "</span>
+                <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="p">[</span><span class="n">status</span><span class="o">.</span><span class="n">model_dump</span><span class="p">(</span><span class="n">mode</span><span class="o">=</span><span class="s1">'json'</span><span class="p">)</span><span class="w"> </span><span class="k">for</span><span class="w"> </span><span class="n">status</span><span class="w"> </span><span class="ow">in</span><span class="w"> </span><span class="n">statuses</span><span class="p">]</span><span class="si">}</span><span class="s2">"</span>
+            <span class="p">)</span>
+        <span class="k">return</span> <span class="n">expected</span></div>
+
+
 <div class="viewcode-block" id="AsyncLLM.release">
 <a class="viewcode-back" href="../../../llm-api/reference/AsyncLLM.html#tensorrt_llm.llmapi.AsyncLLM.release">[docs]</a>
-    <span class="k">async</span> <span class="k">def</span><span class="w"> </span><span class="nf">release</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">tags</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]):</span>
+    <span class="k">async</span> <span class="k">def</span><span class="w"> </span><span class="nf">release</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span>
+        <span class="n">tags</span><span class="p">:</span> <span class="n">Sequence</span><span class="p">[</span><span class="n">ExecutorMemoryType</span> <span class="o">|</span> <span class="nb">str</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">"""Release the GPU memory used by the LLM asynchronously.</span>
 
 <span class="sd">        Args:</span>
-<span class="sd">            tags: List of memory tag strings to release (e.g., ["model", "kv_cache"]).</span>
+<span class="sd">            tags: Memory types to release. When omitted, release every</span>
+<span class="sd">                sleep-managed runtime memory type.</span>
 <span class="sd">        """</span>
-        <span class="k">await</span> <span class="bp">self</span><span class="o">.</span><span class="n">collective_rpc</span><span class="p">(</span><span class="s2">"sleep"</span><span class="p">,</span> <span class="n">args</span><span class="o">=</span><span class="p">(</span><span class="n">tags</span><span class="p">,))</span></div>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_check_runtime_memory_enabled</span><span class="p">()</span>
+        <span class="n">default_tags</span> <span class="o">=</span> <span class="p">[</span>
+            <span class="n">memory_type</span>
+            <span class="k">for</span> <span class="n">memory_type</span> <span class="ow">in</span> <span class="n">ExecutorMemoryType</span>
+            <span class="k">if</span> <span class="n">memory_type</span>
+            <span class="ow">not</span> <span class="ow">in</span> <span class="p">(</span><span class="n">ExecutorMemoryType</span><span class="o">.</span><span class="n">INIT_KV_CACHE</span><span class="p">,</span> <span class="n">ExecutorMemoryType</span><span class="o">.</span><span class="n">INIT_EXTRA_RESOURCES</span><span class="p">)</span>
+        <span class="p">]</span>
+        <span class="n">normalized</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_normalize_runtime_memory_tags</span><span class="p">(</span><span class="n">tags</span><span class="p">,</span> <span class="n">default_tags</span><span class="o">=</span><span class="n">default_tags</span><span class="p">)</span>
+        <span class="k">await</span> <span class="bp">self</span><span class="o">.</span><span class="n">collective_rpc</span><span class="p">(</span><span class="s2">"sleep"</span><span class="p">,</span> <span class="n">args</span><span class="o">=</span><span class="p">([</span><span class="n">tag</span><span class="o">.</span><span class="n">value</span> <span class="k">for</span> <span class="n">tag</span> <span class="ow">in</span> <span class="n">normalized</span><span class="p">],))</span></div>
 
 
 <div class="viewcode-block" id="AsyncLLM.resume">
 <a class="viewcode-back" href="../../../llm-api/reference/AsyncLLM.html#tensorrt_llm.llmapi.AsyncLLM.resume">[docs]</a>
-    <span class="k">async</span> <span class="k">def</span><span class="w"> </span><span class="nf">resume</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">tags</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]):</span>
+    <span class="k">async</span> <span class="k">def</span><span class="w"> </span><span class="nf">resume</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span>
+        <span class="n">tags</span><span class="p">:</span> <span class="n">Sequence</span><span class="p">[</span><span class="n">ExecutorMemoryType</span> <span class="o">|</span> <span class="nb">str</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">"""Resume the GPU memory used by the LLM asynchronously.</span>
 
 <span class="sd">        Args:</span>
-<span class="sd">            tags: List of memory tag strings to resume (e.g., ["model", "kv_cache"]).</span>
+<span class="sd">            tags: Memory types to restore. When omitted, restore every</span>
+<span class="sd">                currently parked memory type.</span>
 <span class="sd">        """</span>
-        <span class="k">await</span> <span class="bp">self</span><span class="o">.</span><span class="n">collective_rpc</span><span class="p">(</span><span class="s2">"wakeup"</span><span class="p">,</span> <span class="n">args</span><span class="o">=</span><span class="p">(</span><span class="n">tags</span><span class="p">,))</span></div>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_check_runtime_memory_enabled</span><span class="p">()</span>
+        <span class="n">status</span> <span class="o">=</span> <span class="k">await</span> <span class="bp">self</span><span class="o">.</span><span class="n">get_memory_status</span><span class="p">()</span>
+        <span class="k">if</span> <span class="n">status</span><span class="o">.</span><span class="n">state</span> <span class="ow">not</span> <span class="ow">in</span> <span class="p">(</span><span class="s2">"running"</span><span class="p">,</span> <span class="s2">"parked"</span><span class="p">):</span>
+            <span class="k">raise</span> <span class="ne">RuntimeError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"Cannot resume runtime memory while state is '</span><span class="si">{</span><span class="n">status</span><span class="o">.</span><span class="n">state</span><span class="si">}</span><span class="s2">'."</span><span class="p">)</span>
+        <span class="n">normalized</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_normalize_runtime_memory_tags</span><span class="p">(</span><span class="n">tags</span><span class="p">,</span> <span class="n">default_tags</span><span class="o">=</span><span class="n">status</span><span class="o">.</span><span class="n">parked_tags</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">normalized</span><span class="p">:</span>
+            <span class="k">await</span> <span class="bp">self</span><span class="o">.</span><span class="n">collective_rpc</span><span class="p">(</span><span class="s2">"wakeup"</span><span class="p">,</span> <span class="n">args</span><span class="o">=</span><span class="p">([</span><span class="n">tag</span><span class="o">.</span><span class="n">value</span> <span class="k">for</span> <span class="n">tag</span> <span class="ow">in</span> <span class="n">normalized</span><span class="p">],))</span></div>
 
 
 <div class="viewcode-block" id="AsyncLLM.update_weights">
@@ -1277,9 +1331,9 @@ window.runMermaid = runMermaid;</script>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on October 09, 2026.</p>
+  <p>Last updated on October 19, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/cc63e66">cc63e66</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/0372799">0372799</a>.</p>
   
 </div></div>
       

@@ -62,7 +62,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.23.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc0';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc1';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -73,13 +73,13 @@
     <link rel="index" title="Index" href="../genindex.html" />
     <link rel="search" title="Search" href="../search.html" />
     <link rel="next" title="Torch Compile &amp; Prefill CUDA Graph" href="torch_compile_and_piecewise_cuda_graph.html" />
-    <link rel="prev" title="ModelExpress (MX) Checkpoint Loading" href="model-express.html" />
+    <link rel="prev" title="Runtime Memory Checkpointing (Prototype)" href="sleep-wakeup.html" />
 
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="color-scheme" content="light dark"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.4.0rc0" />
+  <meta name="docsearch:version" content="1.4.0rc1" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -444,6 +444,9 @@
 <li class="toctree-l1 has-children"><a class="reference internal" href="../llm-api/reference.html">API Reference</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/LLM.html">LLM</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/AsyncLLM.html">AsyncLLM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/ExecutorMemoryType.html">ExecutorMemoryType</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/RuntimeMemoryStatus.html">RuntimeMemoryStatus</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SleepConfig.html">SleepConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/MultimodalEncoder.html">MultimodalEncoder</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CompletionOutput.html">CompletionOutput</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/RequestOutput.html">RequestOutput</a></li>
@@ -533,6 +536,7 @@
 <li class="toctree-l1"><a class="reference internal" href="speculative-decoding.html">Speculative Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="checkpoint-loading.html">Checkpoint Loading</a></li>
 <li class="toctree-l1"><a class="reference internal" href="model-express.html">ModelExpress (MX) Checkpoint Loading</a></li>
+<li class="toctree-l1"><a class="reference internal" href="sleep-wakeup.html">Runtime Memory Checkpointing (Prototype)</a></li>
 <li class="toctree-l1 current active"><a aria-current="page" class="current reference internal" href="#">Ray Orchestrator (Prototype)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="torch_compile_and_piecewise_cuda_graph.html">Torch Compile &amp; Prefill CUDA Graph</a></li>
 <li class="toctree-l1"><a class="reference internal" href="helix.html">Helix Parallelism</a></li>
@@ -551,6 +555,10 @@
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/overview.html">Architecture Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/perf-analysis.html">Performance Analysis</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/perf-benchmarking.html">TensorRT LLM Benchmarking</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../developer-guide/moe-perf-guide.html">MoE Performance Guide</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../developer-guide/moe-perf-dashboard.html">MoE Perf Dashboard</a></li>
+</ul>
+</details></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/ci-overview.html">Continuous Integration Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/dev-containers.html">Using Dev Containers</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/api-change.html">LLM API Change Guide</a></li>
@@ -562,6 +570,7 @@
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog30_KV_Cache_Compression_in_TensorRT-LLM.html">KV Cache Compression in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog29_GVR_V2_Self_Sampling_Exact_TopK_for_Sparse_Attention.html">GVR V2: Self-Sampling and Multi-Thresholding for Faster Exact Top-K</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog28_Accelerating_Video_Generation_with_GEMM_Quantization_Attention_Quantization_and_Skip_Softmax_Attention_in_TensorRT-LLM.html">Accelerating Video Generation with GEMM Quantization, Attention Quantization and Skip Softmax Attention in TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog27_Evaluating_Agentic_Serving_with_Trace_Replay_and_Job_Level_Metrics.html">Evaluating Agentic Serving with Trace Replay and Job-Level Metrics</a></li>
@@ -685,9 +694,9 @@ pip<span class="w"> </span>install<span class="w"> </span>-r<span class="w"> </s
 <h2>Features<a class="headerlink" href="#features" title="Link to this heading">#</a></h2>
 <p>Currently available:</p>
 <ul class="simple">
-<li><p>Generate text asynchronously (refer to <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/cc63e66/examples/ray_orchestrator/llm_inference_async_ray.py">llm_inference_async_ray.py</a>)</p></li>
-<li><p>Multi-node inference (refer to <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/cc63e66/examples/ray_orchestrator/multi_nodes/README.md">multi-node README</a>)</p></li>
-<li><p>Disaggregated serving (refer to <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/cc63e66/examples/ray_orchestrator/disaggregated/README.md">disagg README</a>)</p></li>
+<li><p>Generate text asynchronously (refer to <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/0372799/examples/ray_orchestrator/llm_inference_async_ray.py">llm_inference_async_ray.py</a>)</p></li>
+<li><p>Multi-node inference (refer to <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/0372799/examples/ray_orchestrator/multi_nodes/README.md">multi-node README</a>)</p></li>
+<li><p>Disaggregated serving (refer to <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/0372799/examples/ray_orchestrator/disaggregated/README.md">disagg README</a>)</p></li>
 </ul>
 <p><em>Initial testing has been focused on LLaMA and DeepSeek variants. Please open an Issue if you encounter problems with other models so we can prioritize support.</em></p>
 </section>
@@ -700,7 +709,7 @@ pip<span class="w"> </span>install<span class="w"> </span>-r<span class="w"> </s
 </section>
 <section id="architecture">
 <h2>Architecture<a class="headerlink" href="#architecture" title="Link to this heading">#</a></h2>
-<p>This feature introduces new classes such as <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/cc63e66/tensorrt_llm/executor/ray/executor.py">RayExecutor</a> and <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/cc63e66/tensorrt_llm/executor/ray/gpu_worker.py">RayGPUWorker</a> for Ray actor lifecycle management and distributed inference. In Ray mode, collective ops run on <a class="reference external" href="https://docs.pytorch.org/tutorials/beginner/dist_overview.html">torch.distributed</a> without MPI. We welcome contributions to improve and extend this support.</p>
+<p>This feature introduces new classes such as <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/0372799/tensorrt_llm/executor/ray/executor.py">RayExecutor</a> and <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/0372799/tensorrt_llm/executor/ray/gpu_worker.py">RayGPUWorker</a> for Ray actor lifecycle management and distributed inference. In Ray mode, collective ops run on <a class="reference external" href="https://docs.pytorch.org/tutorials/beginner/dist_overview.html">torch.distributed</a> without MPI. We welcome contributions to improve and extend this support.</p>
 <p><img alt="Ray orchestrator architecture" src="docs/source/media/ray_orchestrator_architecture.jpg" /></p>
 </section>
 </section>
@@ -716,12 +725,12 @@ pip<span class="w"> </span>install<span class="w"> </span>-r<span class="w"> </s
                   
 <div class="prev-next-area">
     <a class="left-prev"
-       href="model-express.html"
+       href="sleep-wakeup.html"
        title="previous page">
       <i class="fa-solid fa-angle-left"></i>
       <div class="prev-next-info">
         <p class="prev-next-subtitle">previous</p>
-        <p class="prev-next-title">ModelExpress (MX) Checkpoint Loading</p>
+        <p class="prev-next-title">Runtime Memory Checkpointing (Prototype)</p>
       </div>
     </a>
     <a class="right-next"
@@ -850,9 +859,9 @@ pip<span class="w"> </span>install<span class="w"> </span>-r<span class="w"> </s
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on October 09, 2026.</p>
+  <p>Last updated on October 19, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/cc63e66">cc63e66</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/0372799">0372799</a>.</p>
   
 </div></div>
       

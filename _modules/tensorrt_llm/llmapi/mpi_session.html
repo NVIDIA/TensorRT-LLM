@@ -419,7 +419,7 @@ window.runMermaid = runMermaid;</script>
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.23.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc0';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc1';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -434,7 +434,7 @@ window.runMermaid = runMermaid;</script>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="color-scheme" content="light dark"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.4.0rc0" />
+  <meta name="docsearch:version" content="1.4.0rc1" />
   
     
     <script src="../../../_static/searchtools.js"></script>
@@ -795,6 +795,9 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l1 has-children"><a class="reference internal" href="../../../llm-api/reference.html">API Reference</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/LLM.html">LLM</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/AsyncLLM.html">AsyncLLM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/ExecutorMemoryType.html">ExecutorMemoryType</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/RuntimeMemoryStatus.html">RuntimeMemoryStatus</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/SleepConfig.html">SleepConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/MultimodalEncoder.html">MultimodalEncoder</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/CompletionOutput.html">CompletionOutput</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/RequestOutput.html">RequestOutput</a></li>
@@ -884,6 +887,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/speculative-decoding.html">Speculative Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/checkpoint-loading.html">Checkpoint Loading</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/model-express.html">ModelExpress (MX) Checkpoint Loading</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../features/sleep-wakeup.html">Runtime Memory Checkpointing (Prototype)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/ray-orchestrator.html">Ray Orchestrator (Prototype)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/torch_compile_and_piecewise_cuda_graph.html">Torch Compile &amp; Prefill CUDA Graph</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/helix.html">Helix Parallelism</a></li>
@@ -902,6 +906,10 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l1"><a class="reference internal" href="../../../developer-guide/overview.html">Architecture Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../developer-guide/perf-analysis.html">Performance Analysis</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../developer-guide/perf-benchmarking.html">TensorRT LLM Benchmarking</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../../developer-guide/moe-perf-guide.html">MoE Performance Guide</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../../developer-guide/moe-perf-dashboard.html">MoE Perf Dashboard</a></li>
+</ul>
+</details></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../developer-guide/ci-overview.html">Continuous Integration Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../developer-guide/dev-containers.html">Using Dev Containers</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../developer-guide/api-change.html">LLM API Change Guide</a></li>
@@ -913,6 +921,7 @@ window.runMermaid = runMermaid;</script>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog30_KV_Cache_Compression_in_TensorRT-LLM.html">KV Cache Compression in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog29_GVR_V2_Self_Sampling_Exact_TopK_for_Sparse_Attention.html">GVR V2: Self-Sampling and Multi-Thresholding for Faster Exact Top-K</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog28_Accelerating_Video_Generation_with_GEMM_Quantization_Attention_Quantization_and_Skip_Softmax_Attention_in_TensorRT-LLM.html">Accelerating Video Generation with GEMM Quantization, Attention Quantization and Skip Softmax Attention in TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog27_Evaluating_Agentic_Serving_with_Trace_Replay_and_Job_Level_Metrics.html">Evaluating Agentic Serving with Trace Replay and Job-Level Metrics</a></li>
@@ -1032,6 +1041,7 @@ window.runMermaid = runMermaid;</script>
 
 <span class="kn">import</span><span class="w"> </span><span class="nn">zmq</span>
 
+<span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm._bootstrap</span><span class="w"> </span><span class="kn">import</span> <span class="n">_UNIFIED_CACHE_ENV_VARS</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.bindings.BuildInfo</span><span class="w"> </span><span class="kn">import</span> <span class="n">ENABLE_MULTI_DEVICE</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.logger</span><span class="w"> </span><span class="kn">import</span> <span class="n">logger</span>
 
@@ -1045,6 +1055,38 @@ window.runMermaid = runMermaid;</script>
     <span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm._utils</span><span class="w"> </span><span class="kn">import</span> <span class="n">global_mpi_size</span><span class="p">,</span> <span class="n">mpi_world_size</span>
 
 <span class="n">T</span> <span class="o">=</span> <span class="n">TypeVar</span><span class="p">(</span><span class="s2">"T"</span><span class="p">)</span>
+
+<span class="c1"># Environment that MpiPoolSession forwards from the parent to its workers.</span>
+<span class="n">_FORWARDED_ENV_PREFIXES</span> <span class="o">=</span> <span class="p">(</span><span class="s2">"TRTLLM"</span><span class="p">,</span> <span class="s2">"TLLM"</span><span class="p">)</span>
+<span class="n">_FORWARDED_ENV_NAMES</span> <span class="o">=</span> <span class="p">(</span><span class="o">*</span><span class="n">_UNIFIED_CACHE_ENV_VARS</span><span class="p">,</span> <span class="s2">"FLASHINFER_CUBIN_DIR"</span><span class="p">,</span>
+                        <span class="s2">"MASTER_ADDR"</span><span class="p">,</span> <span class="s2">"MASTER_PORT"</span><span class="p">)</span>
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">_is_forwarded_env</span><span class="p">(</span><span class="n">name</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+    <span class="k">return</span> <span class="p">(</span><span class="n">name</span><span class="o">.</span><span class="n">startswith</span><span class="p">(</span><span class="n">_FORWARDED_ENV_PREFIXES</span><span class="p">)</span>
+            <span class="ow">or</span> <span class="n">name</span> <span class="ow">in</span> <span class="n">_FORWARDED_ENV_NAMES</span><span class="p">)</span>
+
+
+<span class="c1"># A spawned worker starts from the environment of the MPI runtime that launches</span>
+<span class="c1"># it, which can be older than the parent's current one: a singleton's DVM is</span>
+<span class="c1"># forked once, at the process's first spawn, and keeps that environment for</span>
+<span class="c1"># every later spawn. ``MPIPoolExecutor(env=...)`` can only add variables, so</span>
+<span class="c1"># drop every inherited forwarded variable before the server applies the</span>
+<span class="c1"># parent's overlay; the overlay then fully defines them, including variables</span>
+<span class="c1"># the parent no longer has.</span>
+<span class="n">_WORKER_ENV_BOOTSTRAP</span> <span class="o">=</span> <span class="sa">f</span><span class="s2">"""</span>
+<span class="s2">import os</span>
+
+<span class="s2">for _name in list(os.environ):</span>
+<span class="s2">    if (_name.startswith(</span><span class="si">{</span><span class="n">_FORWARDED_ENV_PREFIXES</span><span class="si">!r}</span><span class="s2">)</span>
+<span class="s2">            or _name in </span><span class="si">{</span><span class="n">_FORWARDED_ENV_NAMES</span><span class="si">!r}</span><span class="s2">):</span>
+<span class="s2">        del os.environ[_name]</span>
+<span class="s2">"""</span>
+<span class="n">_WORKER_SERVER_MAIN</span> <span class="o">=</span> <span class="s2">"""</span>
+<span class="s2">from mpi4py.futures.server import main</span>
+
+<span class="s2">main()</span>
+<span class="s2">"""</span>
 
 <span class="n">_FLASHINFER_WORKSPACE_ROOT</span> <span class="o">=</span> <span class="s2">"~/.cache/tensorrt_llm/flashinfer"</span>
 <span class="n">_FLASHINFER_WORKSPACE_ENV</span> <span class="o">=</span> <span class="s2">"FLASHINFER_WORKSPACE_BASE"</span>
@@ -1563,28 +1605,39 @@ window.runMermaid = runMermaid;</script>
 
         <span class="n">env</span> <span class="o">=</span> <span class="p">{</span>
             <span class="n">key</span><span class="p">:</span> <span class="n">value</span>
-            <span class="k">for</span> <span class="n">key</span><span class="p">,</span> <span class="n">value</span> <span class="ow">in</span> <span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="o">.</span><span class="n">items</span><span class="p">()</span>
-            <span class="k">if</span> <span class="n">key</span><span class="o">.</span><span class="n">startswith</span><span class="p">(</span><span class="s2">"TRTLLM"</span><span class="p">)</span> <span class="ow">or</span> <span class="n">key</span><span class="o">.</span><span class="n">startswith</span><span class="p">(</span><span class="s2">"TLLM"</span><span class="p">)</span> <span class="ow">or</span> <span class="n">key</span> <span class="ow">in</span> <span class="p">(</span>
-                <span class="s2">"FLASHINFER_WORKSPACE_BASE"</span><span class="p">,</span> <span class="s2">"FLASHINFER_CUBIN_DIR"</span><span class="p">,</span>
-                <span class="s2">"MASTER_ADDR"</span><span class="p">,</span> <span class="s2">"MASTER_PORT"</span><span class="p">)</span>
+            <span class="k">for</span> <span class="n">key</span><span class="p">,</span> <span class="n">value</span> <span class="ow">in</span> <span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="o">.</span><span class="n">items</span><span class="p">()</span> <span class="k">if</span> <span class="n">_is_forwarded_env</span><span class="p">(</span><span class="n">key</span><span class="p">)</span>
         <span class="p">}</span>
         <span class="n">workspace_managed</span> <span class="o">=</span> <span class="n">env</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">_FLASHINFER_WORKSPACE_MANAGED_ENV</span><span class="p">)</span> <span class="o">==</span> <span class="s2">"1"</span>
         <span class="n">env</span><span class="o">.</span><span class="n">update</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_env_overrides</span><span class="p">)</span>
         <span class="n">explicit_workspace_override</span> <span class="o">=</span> <span class="p">(</span><span class="n">_FLASHINFER_WORKSPACE_ENV</span>
                                        <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_env_overrides</span><span class="p">)</span>
+        <span class="n">workspace_root</span> <span class="o">=</span> <span class="n">_FLASHINFER_WORKSPACE_ROOT</span>
+        <span class="k">if</span> <span class="n">cache_root</span> <span class="o">:=</span> <span class="n">env</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"TRTLLM_CACHE_DIR"</span><span class="p">):</span>
+            <span class="n">workspace_root</span> <span class="o">=</span> <span class="n">os</span><span class="o">.</span><span class="n">path</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="n">os</span><span class="o">.</span><span class="n">path</span><span class="o">.</span><span class="n">expanduser</span><span class="p">(</span><span class="n">cache_root</span><span class="p">),</span>
+                                          <span class="s2">"flashinfer"</span><span class="p">)</span>
+            <span class="n">workspace_managed</span> <span class="o">|=</span> <span class="n">env</span><span class="o">.</span><span class="n">get</span><span class="p">(</span>
+                <span class="n">_FLASHINFER_WORKSPACE_ENV</span><span class="p">)</span> <span class="o">==</span> <span class="n">workspace_root</span>
         <span class="n">isolate_workspace</span> <span class="o">=</span> <span class="p">(</span>
             <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">n_workers</span> <span class="o">&gt;</span> <span class="mi">1</span> <span class="ow">or</span> <span class="n">workspace_managed</span><span class="p">)</span>
             <span class="ow">and</span> <span class="n">env</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"TRTLLM_FLASHINFER_WORKSPACE_PER_PROCESS"</span><span class="p">,</span> <span class="s2">"1"</span><span class="p">)</span> <span class="o">!=</span> <span class="s2">"0"</span>
             <span class="ow">and</span> <span class="p">(</span><span class="n">_FLASHINFER_WORKSPACE_ENV</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">env</span> <span class="ow">or</span>
                  <span class="p">(</span><span class="n">workspace_managed</span> <span class="ow">and</span> <span class="ow">not</span> <span class="n">explicit_workspace_override</span><span class="p">)))</span>
+        <span class="n">python_args</span> <span class="o">=</span> <span class="p">[</span><span class="s2">"-c"</span><span class="p">,</span> <span class="n">_WORKER_ENV_BOOTSTRAP</span> <span class="o">+</span> <span class="n">_WORKER_SERVER_MAIN</span><span class="p">]</span>
         <span class="k">if</span> <span class="n">isolate_workspace</span><span class="p">:</span>
             <span class="n">env</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="n">_FLASHINFER_WORKSPACE_ENV</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
+            <span class="k">if</span> <span class="n">cache_root</span><span class="p">:</span>
+                <span class="n">logger</span><span class="o">.</span><span class="n">warning_once</span><span class="p">(</span>
+                    <span class="s2">"TRTLLM_CACHE_DIR keeps FlashInfer isolation enabled; "</span>
+                    <span class="s2">"set TRTLLM_FLASHINFER_WORKSPACE_PER_PROCESS=0 for better "</span>
+                    <span class="s2">"cache reuse at the risk of concurrent writes."</span><span class="p">,</span>
+                    <span class="n">key</span><span class="o">=</span><span class="s2">"flashinfer_unified_cache_isolation"</span><span class="p">)</span>
+            <span class="n">python_args</span> <span class="o">=</span> <span class="p">[</span>
+                <span class="s2">"-c"</span><span class="p">,</span> <span class="n">_WORKER_ENV_BOOTSTRAP</span> <span class="o">+</span> <span class="n">_FLASHINFER_WORKER_BOOTSTRAP</span><span class="p">,</span>
+                <span class="n">workspace_root</span>
+            <span class="p">]</span>
         <span class="k">elif</span> <span class="n">explicit_workspace_override</span><span class="p">:</span>
             <span class="c1"># The override is user-owned, including in any further nested pool.</span>
             <span class="n">env</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="n">_FLASHINFER_WORKSPACE_MANAGED_ENV</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
-        <span class="n">python_args</span> <span class="o">=</span> <span class="p">([</span>
-            <span class="s2">"-c"</span><span class="p">,</span> <span class="n">_FLASHINFER_WORKER_BOOTSTRAP</span><span class="p">,</span> <span class="n">_FLASHINFER_WORKSPACE_ROOT</span>
-        <span class="p">]</span> <span class="k">if</span> <span class="n">isolate_workspace</span> <span class="k">else</span> <span class="kc">None</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">mpi_pool</span> <span class="o">=</span> <span class="n">MPIPoolExecutor</span><span class="p">(</span><span class="n">max_workers</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">n_workers</span><span class="p">,</span>
                                         <span class="n">path</span><span class="o">=</span><span class="n">sys</span><span class="o">.</span><span class="n">path</span><span class="p">,</span>
                                         <span class="n">env</span><span class="o">=</span><span class="n">env</span><span class="p">,</span>
@@ -1736,6 +1789,8 @@ window.runMermaid = runMermaid;</script>
     <span class="n">args</span><span class="p">:</span> <span class="n">Tuple</span><span class="p">[</span><span class="n">Any</span><span class="p">,</span> <span class="o">...</span><span class="p">]</span>
     <span class="n">kwargs</span><span class="p">:</span> <span class="n">Dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">]</span>
     <span class="n">sync</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>  <span class="c1"># if True, the result will be sent back to the client</span>
+    <span class="c1"># Submitting client's sys.path, applied on every rank by task_wrapper.</span>
+    <span class="n">sys_path</span><span class="p">:</span> <span class="n">Tuple</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="o">...</span><span class="p">]</span> <span class="o">=</span> <span class="p">()</span>
 
 
 <span class="k">class</span><span class="w"> </span><span class="nc">RemoteWorkerDeath</span><span class="p">(</span><span class="n">NamedTuple</span><span class="p">):</span>
@@ -1817,7 +1872,8 @@ window.runMermaid = runMermaid;</script>
         <span class="n">logger_debug</span><span class="p">(</span>
             <span class="sa">f</span><span class="s2">"RemoteMpiCommSessionClient [rank</span><span class="si">{</span><span class="n">global_mpi_rank</span><span class="p">()</span><span class="si">}</span><span class="s2">] sending task </span><span class="si">{</span><span class="n">task</span><span class="si">}</span><span class="s2"> to </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">addr</span><span class="si">}</span><span class="se">\n</span><span class="s2">"</span><span class="p">,</span>
             <span class="s2">"yellow"</span><span class="p">)</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">queue</span><span class="o">.</span><span class="n">put</span><span class="p">(</span><span class="n">RemoteTask</span><span class="p">(</span><span class="n">task</span><span class="p">,</span> <span class="n">args</span><span class="p">,</span> <span class="n">kwargs</span><span class="p">,</span> <span class="n">sync</span><span class="o">=</span><span class="n">sync</span><span class="p">))</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">queue</span><span class="o">.</span><span class="n">put</span><span class="p">(</span>
+            <span class="n">RemoteTask</span><span class="p">(</span><span class="n">task</span><span class="p">,</span> <span class="n">args</span><span class="p">,</span> <span class="n">kwargs</span><span class="p">,</span> <span class="n">sync</span><span class="o">=</span><span class="n">sync</span><span class="p">,</span> <span class="n">sys_path</span><span class="o">=</span><span class="nb">tuple</span><span class="p">(</span><span class="n">sys</span><span class="o">.</span><span class="n">path</span><span class="p">)))</span>
         <span class="k">return</span> <span class="p">[]</span>
 
     <span class="n">SYNC_IDLE_INTERVAL</span> <span class="o">=</span> <span class="mi">8</span>
@@ -1919,7 +1975,17 @@ window.runMermaid = runMermaid;</script>
                     <span class="n">n_workers</span><span class="o">=</span><span class="n">n_workers</span><span class="p">)</span>
 
     <span class="nd">@staticmethod</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">task_wrapper</span><span class="p">(</span><span class="n">task</span><span class="p">:</span> <span class="n">Callable</span><span class="p">[</span><span class="o">...</span><span class="p">,</span> <span class="n">T</span><span class="p">],</span> <span class="o">*</span><span class="n">args</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">T</span><span class="p">:</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">task_wrapper</span><span class="p">(</span><span class="n">client_sys_path</span><span class="p">:</span> <span class="n">Tuple</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="o">...</span><span class="p">],</span> <span class="n">task</span><span class="p">:</span> <span class="n">Callable</span><span class="p">[</span><span class="o">...</span><span class="p">,</span> <span class="n">T</span><span class="p">],</span>
+                     <span class="o">/</span><span class="p">,</span> <span class="o">*</span><span class="n">args</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">T</span><span class="p">:</span>
+        <span class="c1"># Adopt the client's sys.path before the task runs, so objects it later</span>
+        <span class="c1"># unpickles -- per-request payloads such as a caller-defined logits</span>
+        <span class="c1"># processor -- can resolve their classes on this rank. Appending keeps</span>
+        <span class="c1"># this process's own environment ahead of the client's; relative entries</span>
+        <span class="c1"># are dropped because they would resolve against this process's working</span>
+        <span class="c1"># directory rather than the client's.</span>
+        <span class="k">for</span> <span class="n">path</span> <span class="ow">in</span> <span class="n">client_sys_path</span><span class="p">:</span>
+            <span class="k">if</span> <span class="n">os</span><span class="o">.</span><span class="n">path</span><span class="o">.</span><span class="n">isabs</span><span class="p">(</span><span class="n">path</span><span class="p">)</span> <span class="ow">and</span> <span class="n">path</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">sys</span><span class="o">.</span><span class="n">path</span><span class="p">:</span>
+                <span class="n">sys</span><span class="o">.</span><span class="n">path</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">path</span><span class="p">)</span>
         <span class="n">logger_debug</span><span class="p">(</span>
             <span class="sa">f</span><span class="s2">"MpiCommSession rank</span><span class="si">{</span><span class="n">mpi_rank</span><span class="p">()</span><span class="si">}</span><span class="s2"> with world_size </span><span class="si">{</span><span class="n">mpi_world_size</span><span class="p">()</span><span class="si">}</span><span class="se">\n</span><span class="s2">"</span><span class="p">,</span>
             <span class="s2">"green"</span><span class="p">)</span>
@@ -1995,8 +2061,8 @@ window.runMermaid = runMermaid;</script>
                     <span class="sa">f</span><span class="s2">"RemoteMpiCommSessionServer [rank</span><span class="si">{</span><span class="n">global_mpi_rank</span><span class="p">()</span><span class="si">}</span><span class="s2">] received task [</span><span class="si">{</span><span class="n">message</span><span class="o">.</span><span class="n">task</span><span class="si">}</span><span class="s2">] from </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">addr</span><span class="si">}</span><span class="se">\n</span><span class="s2">"</span><span class="p">,</span>
                     <span class="s2">"green"</span><span class="p">)</span>
                 <span class="n">futures</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">session</span><span class="o">.</span><span class="n">submit</span><span class="p">(</span>
-                    <span class="n">RemoteMpiCommSessionServer</span><span class="o">.</span><span class="n">task_wrapper</span><span class="p">,</span> <span class="n">message</span><span class="o">.</span><span class="n">task</span><span class="p">,</span>
-                    <span class="o">*</span><span class="n">message</span><span class="o">.</span><span class="n">args</span><span class="p">,</span> <span class="o">**</span><span class="n">message</span><span class="o">.</span><span class="n">kwargs</span><span class="p">)</span>
+                    <span class="n">RemoteMpiCommSessionServer</span><span class="o">.</span><span class="n">task_wrapper</span><span class="p">,</span> <span class="n">message</span><span class="o">.</span><span class="n">sys_path</span><span class="p">,</span>
+                    <span class="n">message</span><span class="o">.</span><span class="n">task</span><span class="p">,</span> <span class="o">*</span><span class="n">message</span><span class="o">.</span><span class="n">args</span><span class="p">,</span> <span class="o">**</span><span class="n">message</span><span class="o">.</span><span class="n">kwargs</span><span class="p">)</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">num_results</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">session</span><span class="o">.</span><span class="n">n_workers</span>
                 <span class="k">assert</span> <span class="nb">len</span><span class="p">(</span><span class="n">futures</span><span class="p">)</span> <span class="o">==</span> <span class="bp">self</span><span class="o">.</span><span class="n">num_results</span> <span class="o">==</span> <span class="n">mpi_world_size</span><span class="p">()</span>
                 <span class="c1"># Store futures to wait for them before the next task</span>
@@ -2296,9 +2362,9 @@ window.runMermaid = runMermaid;</script>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on October 09, 2026.</p>
+  <p>Last updated on October 19, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/cc63e66">cc63e66</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/0372799">0372799</a>.</p>
   
 </div></div>
       

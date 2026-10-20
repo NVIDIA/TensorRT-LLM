@@ -62,7 +62,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.23.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc0';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc1';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -79,7 +79,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="color-scheme" content="light dark"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.4.0rc0" />
+  <meta name="docsearch:version" content="1.4.0rc1" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -444,6 +444,9 @@
 <li class="toctree-l1 has-children"><a class="reference internal" href="../llm-api/reference.html">API Reference</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/LLM.html">LLM</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/AsyncLLM.html">AsyncLLM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/ExecutorMemoryType.html">ExecutorMemoryType</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/RuntimeMemoryStatus.html">RuntimeMemoryStatus</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SleepConfig.html">SleepConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/MultimodalEncoder.html">MultimodalEncoder</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CompletionOutput.html">CompletionOutput</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/RequestOutput.html">RequestOutput</a></li>
@@ -533,6 +536,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../features/speculative-decoding.html">Speculative Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/checkpoint-loading.html">Checkpoint Loading</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/model-express.html">ModelExpress (MX) Checkpoint Loading</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/sleep-wakeup.html">Runtime Memory Checkpointing (Prototype)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/ray-orchestrator.html">Ray Orchestrator (Prototype)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/torch_compile_and_piecewise_cuda_graph.html">Torch Compile &amp; Prefill CUDA Graph</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/helix.html">Helix Parallelism</a></li>
@@ -551,6 +555,10 @@
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/overview.html">Architecture Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/perf-analysis.html">Performance Analysis</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/perf-benchmarking.html">TensorRT LLM Benchmarking</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../developer-guide/moe-perf-guide.html">MoE Performance Guide</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../developer-guide/moe-perf-dashboard.html">MoE Perf Dashboard</a></li>
+</ul>
+</details></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/ci-overview.html">Continuous Integration Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/dev-containers.html">Using Dev Containers</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/api-change.html">LLM API Change Guide</a></li>
@@ -562,6 +570,7 @@
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog30_KV_Cache_Compression_in_TensorRT-LLM.html">KV Cache Compression in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog29_GVR_V2_Self_Sampling_Exact_TopK_for_Sparse_Attention.html">GVR V2: Self-Sampling and Multi-Thresholding for Faster Exact Top-K</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog28_Accelerating_Video_Generation_with_GEMM_Quantization_Attention_Quantization_and_Skip_Softmax_Attention_in_TensorRT-LLM.html">Accelerating Video Generation with GEMM Quantization, Attention Quantization and Skip Softmax Attention in TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog27_Evaluating_Agentic_Serving_with_Trace_Replay_and_Job_Level_Metrics.html">Evaluating Agentic Serving with Trace Replay and Job-Level Metrics</a></li>
@@ -701,6 +710,14 @@
 <td><p>DeepSeek-V4</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">deepseek-ai/DeepSeek-V4-Pro</span></code></p></td>
 </tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">DeepseekV41ForCausalLM</span></code></p></td>
+<td><p>DeepSeek-V4.1 (text decoder)</p></td>
+<td><p>—</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">DeepseekV41ForConditionalGeneration</span></code></p></td>
+<td><p>DeepSeek-V4.1</p></td>
+<td><p>—</p></td>
+</tr>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">Exaone4ForCausalLM</span></code></p></td>
 <td><p>EXAONE 4.0</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">LGAI-EXAONE/EXAONE-4.0-32B</span></code></p></td>
@@ -761,103 +778,107 @@
 <td><p>Laguna-XS</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">poolside/laguna-XS.2</span></code></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">LlamaForCausalLM</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">LiLiCorrDraftModel</span></code></p></td>
+<td><p><a class="reference internal" href="../features/speculative-decoding.html#dflash"><span class="std std-ref">LiLiCorr draft model</span></a></p></td>
+<td><p>Compatible checkpoint via <code class="docutils literal notranslate"><span class="pre">DFlashDecodingConfig.speculative_model</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">LlamaForCausalLM</span></code></p></td>
 <td><p>Llama 3.1, Llama 3, Llama 2, LLaMA</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">meta-llama/Meta-Llama-3.1-70B</span></code></p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">Llama4ForConditionalGeneration</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">Llama4ForConditionalGeneration</span></code></p></td>
 <td><p>Llama 4</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">meta-llama/Llama-4-Scout-17B-16E-Instruct</span></code></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MBartForConditionalGeneration</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MBartForConditionalGeneration</span></code></p></td>
 <td><p>mBART</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">facebook/mbart-large-50-many-to-one-mmt</span></code></p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MiniCPMV4_6ForConditionalGeneration</span></code> <a class="footnote-reference brackets" href="#id27" id="id5" role="doc-noteref"><span class="fn-bracket">[</span>14<span class="fn-bracket">]</span></a></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MiniCPMV4_6ForConditionalGeneration</span></code> <a class="footnote-reference brackets" href="#id27" id="id5" role="doc-noteref"><span class="fn-bracket">[</span>14<span class="fn-bracket">]</span></a></p></td>
 <td><p>MiniCPM-V 4.6</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">openbmb/MiniCPM-V-4.6</span></code></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MiniMaxM3SparseForConditionalGeneration</span></code> <a class="footnote-reference brackets" href="#id25" id="id6" role="doc-noteref"><span class="fn-bracket">[</span>12<span class="fn-bracket">]</span></a></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MiniMaxM3SparseForConditionalGeneration</span></code> <a class="footnote-reference brackets" href="#id25" id="id6" role="doc-noteref"><span class="fn-bracket">[</span>12<span class="fn-bracket">]</span></a></p></td>
 <td><p>MiniMax-M3</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">MiniMaxAI/MiniMax-M3</span></code></p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MistralForCausalLM</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MistralForCausalLM</span></code></p></td>
 <td><p>Mistral</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">mistralai/Mistral-7B-v0.1</span></code></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MixtralForCausalLM</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MixtralForCausalLM</span></code></p></td>
 <td><p>Mixtral</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">mistralai/Mixtral-8x7B-v0.1</span></code></p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MllamaForConditionalGeneration</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MllamaForConditionalGeneration</span></code></p></td>
 <td><p>Llama 3.2</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">meta-llama/Llama-3.2-11B-Vision</span></code></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">NemotronForCausalLM</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">NemotronForCausalLM</span></code></p></td>
 <td><p>Nemotron-3, Nemotron-4, Minitron</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">nvidia/Minitron-8B-Base</span></code></p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">NemotronHForCausalLM</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">NemotronHForCausalLM</span></code></p></td>
 <td><p>Nemotron-3-Nano, Nemotron-3-Super, Nemotron-3-Ultra</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">nvidia/nvidia-nemotron-v3</span></code></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">NemotronNASForCausalLM</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">NemotronNASForCausalLM</span></code></p></td>
 <td><p>NemotronNAS</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">nvidia/Llama-3_3-Nemotron-Super-49B-v1</span></code></p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">Phi3ForCausalLM</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">Phi3ForCausalLM</span></code></p></td>
 <td><p>Phi-4</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">microsoft/Phi-4</span></code></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">Qwen2ForCausalLM</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">Qwen2ForCausalLM</span></code></p></td>
 <td><p>QwQ, Qwen2</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Qwen/Qwen2-7B-Instruct</span></code></p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">Qwen2ForProcessRewardModel</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">Qwen2ForProcessRewardModel</span></code></p></td>
 <td><p>Qwen2-based</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Qwen/Qwen2.5-Math-PRM-7B</span></code></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">Qwen2ForRewardModel</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">Qwen2ForRewardModel</span></code></p></td>
 <td><p>Qwen2-based</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Qwen/Qwen2.5-Math-RM-72B</span></code></p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">Qwen3ForCausalLM</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">Qwen3ForCausalLM</span></code></p></td>
 <td><p>Qwen3</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Qwen/Qwen3-8B</span></code></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">Qwen3ForTextEmbedding</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">Qwen3ForTextEmbedding</span></code></p></td>
 <td><p>Qwen3-Embedding</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Qwen/Qwen3-Embedding-8B</span></code></p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">Qwen3MoeForCausalLM</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">Qwen3MoeForCausalLM</span></code></p></td>
 <td><p>Qwen3MoE</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Qwen/Qwen3-30B-A3B</span></code></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">Qwen3NextForCausalLM</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">Qwen3NextForCausalLM</span></code></p></td>
 <td><p>Qwen3Next</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Qwen/Qwen3-Next-80B-A3B-Thinking</span></code></p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">Qwen3_5MoeForCausalLM</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">Qwen3_5MoeForCausalLM</span></code></p></td>
 <td><p>Qwen3.8-MoE, Qwen3.5-MoE</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Qwen/Qwen3.8-2.4T-A95B</span></code>, <code class="docutils literal notranslate"><span class="pre">Qwen/Qwen3.5-397B-A17B</span></code></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">Qwen4ExpForCausalLM</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">Qwen4ExpForCausalLM</span></code></p></td>
 <td><p>Qwen3.8-Flash-Next (text)</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Qwen/Qwen3.8-Flash-Next</span></code></p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">Qwen4ExpForConditionalGeneration</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">Qwen4ExpForConditionalGeneration</span></code></p></td>
 <td><p>Qwen3.8-Flash-Next</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Qwen/Qwen3.8-Flash-Next</span></code></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">Step3p7ForConditionalGeneration</span></code> <a class="footnote-reference brackets" href="#id21" id="id7" role="doc-noteref"><span class="fn-bracket">[</span>8<span class="fn-bracket">]</span></a></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">Step3p7ForConditionalGeneration</span></code> <a class="footnote-reference brackets" href="#id21" id="id7" role="doc-noteref"><span class="fn-bracket">[</span>8<span class="fn-bracket">]</span></a></p></td>
 <td><p>Step-3.7-Flash</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">stepfun-ai/Step-3.7-Flash</span></code></p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">T5ForConditionalGeneration</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">T5ForConditionalGeneration</span></code></p></td>
 <td><p>T5, Flan-T5, ByT5</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">google/flan-t5-small</span></code></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">WhisperForConditionalGeneration</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">WhisperForConditionalGeneration</span></code></p></td>
 <td><p>Whisper</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">openai/whisper-large-v3</span></code></p></td>
 </tr>
@@ -1484,16 +1505,27 @@ limits the number of prefetched requests that can be ahead of admission. This op
 exclusive with <code class="docutils literal notranslate"><span class="pre">multimodal_config.encoder_cuda_graph</span></code> and can increase peak GPU memory use. It
 can be combined with the multimodal embeddings cache so side-stream cache hits skip encoder work
 and misses populate the cache.</p></li>
-<li><p><strong>Multimodal embeddings cache</strong> is a per-model, cross-request LRU cache of encoder embeddings.
-Set <code class="docutils literal notranslate"><span class="pre">multimodal_config.encoder_cache_max_bytes</span></code> to its capacity (for example, <code class="docutils literal notranslate"><span class="pre">&quot;512MiB&quot;</span></code>), or
-<code class="docutils literal notranslate"><span class="pre">0</span></code> to disable it. Entries are cached per multimodal item, but a request reuses cached embeddings
-only when all of its items hit the cache. At present, only single-modality requests are cacheable;
-mixed-modality requests bypass the cache. For models with item-level encoder scheduling, the
-cache also composes with the item path: cached items skip encoder execution after selection but
-still count against the per-iteration item and token budgets, partially cached requests re-compute
-only the missing items, and items encoded through the item path populate the cache for later
-requests. When combined with side-stream prefetch, peak memory is the cache capacity plus any
-in-flight prefetched encoder inputs and outputs.</p></li>
+<li><p><strong>Multimodal embeddings cache</strong> is a per-model, cross-request LRU cache of encoder embeddings,
+stored per multimodal item. Set <code class="docutils literal notranslate"><span class="pre">multimodal_config.encoder_cache_max_bytes</span></code> to its capacity (for
+example, <code class="docutils literal notranslate"><span class="pre">&quot;512MiB&quot;</span></code>), or <code class="docutils literal notranslate"><span class="pre">0</span></code> to disable cross-request reuse. The capacity applies per rank; ranks
+do not share a cache.</p>
+<ul>
+<li><p>On the inline encoder path, a request whose items all hit the cache skips the encoder, and a
+partially cached request encodes only its missing items. Inline caching supports only
+single-modality requests. When combined with side-stream prefetch, peak memory is the cache
+capacity plus any in-flight prefetched encoder inputs and outputs.</p></li>
+<li><p>Models with item-level encoder scheduling use the item path unless
+<code class="docutils literal notranslate"><span class="pre">multimodal_config.encoder_scheduling_policy</span></code> is <code class="docutils literal notranslate"><span class="pre">DISABLED</span></code>. Cached items are reused before
+encoder work is selected, so they use none of the per-iteration encoder item or token budget.
+Only missing items are encoded, mixed-modality requests are cached per item, and newly encoded
+items populate the cache for later requests. The item path also keeps encoder outputs in this
+cache until the request’s prefill completes, so the cache is never smaller than the output of
+one encoder iteration, even when <code class="docutils literal notranslate"><span class="pre">encoder_cache_max_bytes</span></code> is <code class="docutils literal notranslate"><span class="pre">0</span></code>. Item scheduling does not
+support side-stream prefetch or pipeline parallelism yet. With <code class="docutils literal notranslate"><span class="pre">pipeline_parallel_size</span> <span class="pre">&gt;</span> <span class="pre">1</span></code>,
+the <code class="docutils literal notranslate"><span class="pre">DEFAULT</span></code> policy, explicit or unset, logs a warning and falls back to the inline path, and
+the <code class="docutils literal notranslate"><span class="pre">EAGER</span></code> policy raises an error.</p></li>
+</ul>
+</li>
 </ul>
 </section>
 </section>
@@ -1668,8 +1700,8 @@ For full documentation, see the <a class="reference internal" href="visual-gener
 <td><p>Yes</p></td>
 <td><p>No</p></td>
 <td><p>No</p></td>
-<td><p>No</p></td>
-<td><p>No</p></td>
+<td><p>Yes</p></td>
+<td><p>Yes</p></td>
 <td><p>No</p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
@@ -1768,7 +1800,7 @@ For full documentation, see the <a class="reference internal" href="visual-gener
 <aside class="footnote brackets" id="id24" role="doc-footnote">
 <span class="label"><span class="fn-bracket">[</span>11<span class="fn-bracket">]</span></span>
 <span class="backrefs">(<a role="doc-backlink" href="#id1">1</a>,<a role="doc-backlink" href="#id11">2</a>)</span>
-<p>DeepSeek-V4 is only supported on Blackwell GPUs (<code class="docutils literal notranslate"><span class="pre">SM100+</span></code>). See the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/cc63e66/examples/models/core/deepseek_v4/README.md">DeepSeek-V4 example README</a> for setup and parallelism.</p>
+<p>DeepSeek-V4 is only supported on Blackwell GPUs (<code class="docutils literal notranslate"><span class="pre">SM100+</span></code>). See the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/0372799/examples/models/core/deepseek_v4/README.md">DeepSeek-V4 example README</a> for setup and parallelism.</p>
 </aside>
 <aside class="footnote brackets" id="id25" role="doc-footnote">
 <span class="label"><span class="fn-bracket">[</span>12<span class="fn-bracket">]</span></span>
@@ -1968,9 +2000,9 @@ For full documentation, see the <a class="reference internal" href="visual-gener
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on October 09, 2026.</p>
+  <p>Last updated on October 19, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/cc63e66">cc63e66</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/0372799">0372799</a>.</p>
   
 </div></div>
       

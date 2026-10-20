@@ -62,7 +62,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.23.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc0';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc1';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -79,7 +79,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="color-scheme" content="light dark"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.4.0rc0" />
+  <meta name="docsearch:version" content="1.4.0rc1" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -444,6 +444,9 @@
 <li class="toctree-l1 has-children"><a class="reference internal" href="../llm-api/reference.html">API Reference</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/LLM.html">LLM</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/AsyncLLM.html">AsyncLLM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/ExecutorMemoryType.html">ExecutorMemoryType</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/RuntimeMemoryStatus.html">RuntimeMemoryStatus</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SleepConfig.html">SleepConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/MultimodalEncoder.html">MultimodalEncoder</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CompletionOutput.html">CompletionOutput</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/RequestOutput.html">RequestOutput</a></li>
@@ -533,6 +536,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../features/speculative-decoding.html">Speculative Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/checkpoint-loading.html">Checkpoint Loading</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/model-express.html">ModelExpress (MX) Checkpoint Loading</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/sleep-wakeup.html">Runtime Memory Checkpointing (Prototype)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/ray-orchestrator.html">Ray Orchestrator (Prototype)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/torch_compile_and_piecewise_cuda_graph.html">Torch Compile &amp; Prefill CUDA Graph</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/helix.html">Helix Parallelism</a></li>
@@ -551,6 +555,10 @@
 <li class="toctree-l1"><a class="reference internal" href="overview.html">Architecture Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="perf-analysis.html">Performance Analysis</a></li>
 <li class="toctree-l1"><a class="reference internal" href="perf-benchmarking.html">TensorRT LLM Benchmarking</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="moe-perf-guide.html">MoE Performance Guide</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="moe-perf-dashboard.html">MoE Perf Dashboard</a></li>
+</ul>
+</details></li>
 <li class="toctree-l1"><a class="reference internal" href="ci-overview.html">Continuous Integration Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="dev-containers.html">Using Dev Containers</a></li>
 <li class="toctree-l1"><a class="reference internal" href="api-change.html">LLM API Change Guide</a></li>
@@ -562,6 +570,7 @@
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog30_KV_Cache_Compression_in_TensorRT-LLM.html">KV Cache Compression in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog29_GVR_V2_Self_Sampling_Exact_TopK_for_Sparse_Attention.html">GVR V2: Self-Sampling and Multi-Thresholding for Faster Exact Top-K</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog28_Accelerating_Video_Generation_with_GEMM_Quantization_Attention_Quantization_and_Skip_Softmax_Attention_in_TensorRT-LLM.html">Accelerating Video Generation with GEMM Quantization, Attention Quantization and Skip Softmax Attention in TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog27_Evaluating_Agentic_Serving_with_Trace_Replay_and_Job_Level_Metrics.html">Evaluating Agentic Serving with Trace Replay and Job-Level Metrics</a></li>
@@ -1035,6 +1044,44 @@ batched encode/decode operations through those APIs.</p></li>
 <p>The framework connects storage-bound compression to KVCM V2 through the
 existing interfaces. A new compression format implements its provider APIs and
 algorithm launcher.</p>
+<section id="which-numbers-of-a-k-or-v-vector-become-nvfp4">
+<h4>Which numbers of a K or V vector become NVFP4<a class="headerlink" href="#which-numbers-of-a-k-or-v-vector-become-nvfp4" title="Link to this heading">#</a></h4>
+<p>The hot KV cache stores, for every token and KV head, one K vector and one V
+vector of <code class="docutils literal notranslate"><span class="pre">head_dim</span></code> numbers; the kernel calls each vector a row and places rows
+<code class="docutils literal notranslate"><span class="pre">raw_row_stride_elements</span></code> numbers apart. For each row the kernel turns one
+contiguous piece into NVFP4 (4-bit values plus one scale per 16 numbers) and
+copies everything before and after that piece unchanged. A compressed buffer
+records the piece as <code class="docutils literal notranslate"><span class="pre">quantized_range_start</span></code> and <code class="docutils literal notranslate"><span class="pre">quantized_range_elements</span></code>.</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">skip_rope_quantization:</span> <span class="pre">false</span></code> (default): the piece is the whole vector. DeepSeek-V4
+compressed rows use single NVFP4 for NoPE and, by default, 2FP4 for the trailing 64 RoPE
+values. Set <code class="docutils literal notranslate"><span class="pre">nvfp4_residual_dim:</span> <span class="pre">0</span></code> for single NVFP4 throughout; the default
+<code class="docutils literal notranslate"><span class="pre">64</span></code> selects 2FP4 for the 64 RoPE values. Other widths are rejected.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">skip_rope_quantization:</span> <span class="pre">true</span></code>: the piece is the NoPE part of the K vector, so the
+RoPE numbers are copied unchanged into the cold page, right after that buffer’s
+scales. The codec finds the RoPE part in the model config: the last
+<code class="docutils literal notranslate"><span class="pre">qk_rope_head_dim</span></code> numbers of the single 576-number vector an MLA layer stores
+per token (its only buffer is the key), the first
+<code class="docutils literal notranslate"><span class="pre">head_dim</span> <span class="pre">*</span> <span class="pre">partial_rotary_factor</span></code> numbers of a GQA head that rotates only its
+leading numbers (Qwen3.5), or the last 64 of the 512 numbers of a DeepSeek-V4
+compressed entry. V vectors carry
+no position and always become NVFP4 in full.</p></li>
+</ul>
+<p>The codec refuses what the kernel cannot express: a K vector that is entirely
+RoPE (nothing left to quantize), RoPE in the middle of the vector (two pieces),
+or a piece whose start or length is not a multiple of 16 numbers (the scale
+group). The switch only takes effect for the model types in
+<code class="docutils literal notranslate"><span class="pre">_SKIP_ROPE_QUANTIZATION_MODEL_TYPES</span></code>, whose RoPE layout the codec knows; other
+models log a warning and quantize whole vectors. To add a model, first verify
+its physical cache layout: a key-only buffer is assumed to be an MLA latent
+with trailing RoPE; separate key and value buffers are assumed to be
+partial-rotary GQA with leading RoPE. Adding a <code class="docutils literal notranslate"><span class="pre">model_type</span></code> alone is not enough
+for interleaved rotated dimensions or an MLA cache that also exposes a value
+buffer; implement an explicit placement rule and test it before adding that
+model to the supported-model list. RoPE widths come from rotary-width fields or partial
+rotary factors, never from theta or <code class="docutils literal notranslate"><span class="pre">rotary_emb_base</span></code>.</p>
+<p>Draft-model cold pages ignore both RoPE options and use single NVFP4.</p>
+</section>
 </section>
 <section id="add-method-specific-kernels">
 <h3>4. Add method-specific kernels<a class="headerlink" href="#add-method-specific-kernels" title="Link to this heading">#</a></h3>
@@ -1267,7 +1314,10 @@ declared lossless;</p></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#define-the-configuration-and-telemetry">1. Define the configuration and telemetry</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#register-python-admission-and-construction">2. Register Python admission and construction</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#a-implement-an-iteration-driven-method">3A. Implement an iteration-driven method</a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#b-implement-a-storage-bound-method">3B. Implement a storage-bound method</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#b-implement-a-storage-bound-method">3B. Implement a storage-bound method</a><ul class="nav section-nav flex-column">
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#which-numbers-of-a-k-or-v-vector-become-nvfp4">Which numbers of a K or V vector become NVFP4</a></li>
+</ul>
+</li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#add-method-specific-kernels">4. Add method-specific kernels</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#preserve-reuse-and-serving-compatibility-where-possible">5. Preserve reuse and serving compatibility where possible</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#document-the-method">6. Document the method</a></li>
@@ -1376,9 +1426,9 @@ declared lossless;</p></li>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on October 09, 2026.</p>
+  <p>Last updated on October 19, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/cc63e66">cc63e66</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/0372799">0372799</a>.</p>
   
 </div></div>
       

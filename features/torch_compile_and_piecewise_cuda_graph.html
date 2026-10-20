@@ -62,7 +62,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.23.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc0';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc1';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -79,7 +79,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="color-scheme" content="light dark"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.4.0rc0" />
+  <meta name="docsearch:version" content="1.4.0rc1" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -444,6 +444,9 @@
 <li class="toctree-l1 has-children"><a class="reference internal" href="../llm-api/reference.html">API Reference</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/LLM.html">LLM</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/AsyncLLM.html">AsyncLLM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/ExecutorMemoryType.html">ExecutorMemoryType</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/RuntimeMemoryStatus.html">RuntimeMemoryStatus</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SleepConfig.html">SleepConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/MultimodalEncoder.html">MultimodalEncoder</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CompletionOutput.html">CompletionOutput</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/RequestOutput.html">RequestOutput</a></li>
@@ -533,6 +536,7 @@
 <li class="toctree-l1"><a class="reference internal" href="speculative-decoding.html">Speculative Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="checkpoint-loading.html">Checkpoint Loading</a></li>
 <li class="toctree-l1"><a class="reference internal" href="model-express.html">ModelExpress (MX) Checkpoint Loading</a></li>
+<li class="toctree-l1"><a class="reference internal" href="sleep-wakeup.html">Runtime Memory Checkpointing (Prototype)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="ray-orchestrator.html">Ray Orchestrator (Prototype)</a></li>
 <li class="toctree-l1 current active"><a aria-current="page" class="current reference internal" href="#">Torch Compile &amp; Prefill CUDA Graph</a></li>
 <li class="toctree-l1"><a class="reference internal" href="helix.html">Helix Parallelism</a></li>
@@ -551,6 +555,10 @@
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/overview.html">Architecture Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/perf-analysis.html">Performance Analysis</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/perf-benchmarking.html">TensorRT LLM Benchmarking</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../developer-guide/moe-perf-guide.html">MoE Performance Guide</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../developer-guide/moe-perf-dashboard.html">MoE Perf Dashboard</a></li>
+</ul>
+</details></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/ci-overview.html">Continuous Integration Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/dev-containers.html">Using Dev Containers</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/api-change.html">LLM API Change Guide</a></li>
@@ -562,6 +570,7 @@
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog30_KV_Cache_Compression_in_TensorRT-LLM.html">KV Cache Compression in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog29_GVR_V2_Self_Sampling_Exact_TopK_for_Sparse_Attention.html">GVR V2: Self-Sampling and Multi-Thresholding for Faster Exact Top-K</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog28_Accelerating_Video_Generation_with_GEMM_Quantization_Attention_Quantization_and_Skip_Softmax_Attention_in_TensorRT-LLM.html">Accelerating Video Generation with GEMM Quantization, Attention Quantization and Skip Softmax Attention in TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog27_Evaluating_Agentic_Serving_with_Trace_Replay_and_Job_Level_Metrics.html">Evaluating Agentic Serving with Trace Replay and Job-Level Metrics</a></li>
@@ -674,6 +683,7 @@
 <li><p><a class="reference internal" href="#piecewise-cuda-graph-generation-only-cuda-graph">Piecewise CUDA Graph &amp; Generation Only CUDA Graph</a></p></li>
 <li><p><a class="reference internal" href="#piecewise-cuda-graph-padding">Piecewise CUDA Graph Padding</a></p></li>
 <li><p><a class="reference internal" href="#performance-tuning">Performance Tuning</a></p></li>
+<li><p><a class="reference internal" href="#torch-compile-optimizations">Torch Compile Optimizations</a></p></li>
 </ul>
 </li>
 <li><p><a class="reference internal" href="#known-issue">Known Issue</a></p></li>
@@ -783,6 +793,19 @@ validated before use.</p>
 <li><p>Manage trade-offs: more capture points reduce padding but increase memory use and can lower max concurrency; fewer points save memory but increase padding and compute cost.</p></li>
 </ul>
 <p>Even with Piecewise CUDA Graph enabled, you may still observe bubbles in the context (prefill) phase, primarily due to the attention operator’s substantial host-side overhead.</p>
+</section>
+<section id="torch-compile-optimizations">
+<h3>Torch Compile Optimizations<a class="headerlink" href="#torch-compile-optimizations" title="Link to this heading">#</a></h3>
+<p>Enabling <code class="docutils literal notranslate"><span class="pre">prefill_cuda_graph_backend:</span> <span class="pre">piecewise</span></code> also enables <code class="docutils literal notranslate"><span class="pre">torch.compile</span></code>. By default, decoder forwards are routed through the compiled callable, including autotuning and auxiliary warmups as well as context, mixed, and generation-only batches. For some models, running these forwards through the compiled callable can improve performance through optimizations such as kernel fusion. In other cases, most of the benefit comes from applying piecewise CUDA graphs to context and mixed batches only.</p>
+<p>The <code class="docutils literal notranslate"><span class="pre">compile_only_piecewise_graphs</span></code> option restricts compilation to forwards that are eligible for piecewise CUDA graphs, including the corresponding specialization warmup and capture forwards:</p>
+<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">prefill_cuda_graph_backend</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">piecewise</span>
+<span class="nt">torch_compile_config</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">compile_only_piecewise_graphs</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span>
+</pre></div>
+</div>
+<p>With this option enabled, ineligible context and mixed forwards use the eager decoder. Ordinary CUDA graphs are also captured from the eager decoder and subsequently replayed as CUDA graphs. Auxiliary kernel and memory-pool warmups bypass <code class="docutils literal notranslate"><span class="pre">torch.compile</span></code>. Avoiding unnecessary tracing and compilation can significantly reduce startup time.</p>
+<p>The <code class="docutils literal notranslate"><span class="pre">compile_only_piecewise_graphs</span></code> option was validated with a Qwen3 8B FP8 model, where no performance impact was measured in the tested TP1 and TP2 configurations. However, performance and numerical behavior can be model- and configuration-dependent, so these should be evaluated on a case-by-case basis before deployment.
+This option requires <code class="docutils literal notranslate"><span class="pre">prefill_cuda_graph_backend:</span> <span class="pre">piecewise</span></code> and currently supports only models derived from <code class="docutils literal notranslate"><span class="pre">DecoderModelForCausalLM</span></code>. With attention DP, the compiled path follows the group-wide prefill graph eligibility decision.</p>
 </section>
 </section>
 <section id="known-issue">
@@ -1122,6 +1145,7 @@ the Multimodal Model Family.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#piecewise-cuda-graph-generation-only-cuda-graph">Piecewise CUDA Graph &amp; Generation Only CUDA Graph</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#piecewise-cuda-graph-padding">Piecewise CUDA Graph Padding</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#performance-tuning">Performance Tuning</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#torch-compile-optimizations">Torch Compile Optimizations</a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#known-issue">Known Issue</a></li>
@@ -1238,9 +1262,9 @@ the Multimodal Model Family.</p>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on October 09, 2026.</p>
+  <p>Last updated on October 19, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/cc63e66">cc63e66</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/0372799">0372799</a>.</p>
   
 </div></div>
       

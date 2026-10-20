@@ -62,7 +62,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.23.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc0';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc1';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -79,7 +79,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="color-scheme" content="light dark"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.4.0rc0" />
+  <meta name="docsearch:version" content="1.4.0rc1" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -444,6 +444,9 @@
 <li class="toctree-l1 has-children"><a class="reference internal" href="../llm-api/reference.html">API Reference</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/LLM.html">LLM</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/AsyncLLM.html">AsyncLLM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/ExecutorMemoryType.html">ExecutorMemoryType</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/RuntimeMemoryStatus.html">RuntimeMemoryStatus</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SleepConfig.html">SleepConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/MultimodalEncoder.html">MultimodalEncoder</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CompletionOutput.html">CompletionOutput</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/RequestOutput.html">RequestOutput</a></li>
@@ -533,6 +536,7 @@
 <li class="toctree-l1"><a class="reference internal" href="speculative-decoding.html">Speculative Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="checkpoint-loading.html">Checkpoint Loading</a></li>
 <li class="toctree-l1"><a class="reference internal" href="model-express.html">ModelExpress (MX) Checkpoint Loading</a></li>
+<li class="toctree-l1"><a class="reference internal" href="sleep-wakeup.html">Runtime Memory Checkpointing (Prototype)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="ray-orchestrator.html">Ray Orchestrator (Prototype)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="torch_compile_and_piecewise_cuda_graph.html">Torch Compile &amp; Prefill CUDA Graph</a></li>
 <li class="toctree-l1"><a class="reference internal" href="helix.html">Helix Parallelism</a></li>
@@ -551,6 +555,10 @@
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/overview.html">Architecture Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/perf-analysis.html">Performance Analysis</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/perf-benchmarking.html">TensorRT LLM Benchmarking</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../developer-guide/moe-perf-guide.html">MoE Performance Guide</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../developer-guide/moe-perf-dashboard.html">MoE Perf Dashboard</a></li>
+</ul>
+</details></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/ci-overview.html">Continuous Integration Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/dev-containers.html">Using Dev Containers</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/api-change.html">LLM API Change Guide</a></li>
@@ -562,6 +570,7 @@
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog30_KV_Cache_Compression_in_TensorRT-LLM.html">KV Cache Compression in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog29_GVR_V2_Self_Sampling_Exact_TopK_for_Sparse_Attention.html">GVR V2: Self-Sampling and Multi-Thresholding for Faster Exact Top-K</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog28_Accelerating_Video_Generation_with_GEMM_Quantization_Attention_Quantization_and_Skip_Softmax_Attention_in_TensorRT-LLM.html">Accelerating Video Generation with GEMM Quantization, Attention Quantization and Skip Softmax Attention in TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog27_Evaluating_Agentic_Serving_with_Trace_Replay_and_Job_Level_Metrics.html">Evaluating Agentic Serving with Trace Replay and Job-Level Metrics</a></li>
@@ -688,7 +697,7 @@
 <li><p><strong><code class="docutils literal notranslate"><span class="pre">build_connector_meta(self,</span> <span class="pre">scheduler_output:</span> <span class="pre">SchedulerOutput)</span> <span class="pre">-&gt;</span> <span class="pre">object</span></code></strong></p>
 <ul class="simple">
 <li><p><strong>Description</strong>: The core orchestration method. Called during the scheduling phase. It examines the current requests and decides which blocks need to be loaded from or saved to the external store.</p></li>
-<li><p><strong>Arguments</strong>: <code class="docutils literal notranslate"><span class="pre">scheduler_output</span></code> contains information about new requests, blocks allocated, current request states, and the cumulative <code class="docutils literal notranslate"><span class="pre">RequestData.block_hashes</span></code> chain. <code class="docutils literal notranslate"><span class="pre">block_hashes</span></code> is read directly from each KV cache block’s stored hash, which the KV cache manager commits as soon as a block becomes full – the value matches the hash that KV cache events will subsequently emit for the same block. The chain only covers beam 0; the executor rejects <code class="docutils literal notranslate"><span class="pre">kv_connector_config</span></code> at startup when <code class="docutils literal notranslate"><span class="pre">max_beam_width</span> <span class="pre">&gt;</span> <span class="pre">1</span></code>, so connectors may assume beam-width-1 inputs.</p></li>
+<li><p><strong>Arguments</strong>: <code class="docutils literal notranslate"><span class="pre">scheduler_output</span></code> contains information about new requests, blocks allocated, current request states, and the cumulative <code class="docutils literal notranslate"><span class="pre">RequestData.block_hashes</span></code> chain. <code class="docutils literal notranslate"><span class="pre">block_hashes</span></code> is read directly from each KV cache block’s stored hash, which the KV cache manager commits as soon as a block becomes full, so the value matches the hash that KV cache events will subsequently emit for the same block. The chain only covers beam 0; the executor rejects <code class="docutils literal notranslate"><span class="pre">kv_connector_config</span></code> at startup when <code class="docutils literal notranslate"><span class="pre">max_beam_width</span> <span class="pre">&gt;</span> <span class="pre">1</span></code>, so connectors may assume beam-width-1 inputs.</p></li>
 <li><p><strong>Returns</strong>: An arbitrary metadata object (picklable) that describes the tasks for the workers. This object is broadcasted to all workers.</p></li>
 </ul>
 </li>
@@ -731,6 +740,12 @@
 </div>
 <p>Both example connectors walk <code class="docutils literal notranslate"><span class="pre">new_requests</span></code> only, so neither one demonstrates this.</p>
 </li>
+</ul>
+</li>
+<li><p><strong><code class="docutils literal notranslate"><span class="pre">request_reset(self,</span> <span class="pre">request:</span> <span class="pre">LlmRequest)</span></code></strong></p>
+<ul class="simple">
+<li><p><strong>Description</strong>: Optional, with a no-op default. The request’s allocation has been released and it will run again from the start, unlike <code class="docutils literal notranslate"><span class="pre">request_finished</span></code>, which ends it. Any per-request state held in page indices now describes pages another request may own, so it must be dropped or rebuilt here.</p></li>
+<li><p><strong>When it fires</strong>: on <code class="docutils literal notranslate"><span class="pre">KVCacheManagerV2</span></code>, from <code class="docutils literal notranslate"><span class="pre">free_resources</span></code>, which is the path a rollback or a failed admission takes. Direct preemption calls <code class="docutils literal notranslate"><span class="pre">request_finished</span></code> instead, so a connector keying state by request id sees exactly one of the two.</p></li>
 </ul>
 </li>
 <li><p><strong><code class="docutils literal notranslate"><span class="pre">update_state_after_alloc_by_layer_group(self,</span> <span class="pre">request:</span> <span class="pre">LlmRequest,</span> <span class="pre">block_ids_by_layer_group:</span> <span class="pre">list[list[int]])</span></code></strong></p></li>
@@ -1161,6 +1176,16 @@ request in the same iteration. With chunked prefill, allocation growth can limit
 <li><p><strong>Compatibility</strong>: Legacy request-ID load and save completions continue through <code class="docutils literal notranslate"><span class="pre">get_finished</span></code>.</p></li>
 </ul>
 </li>
+<li><p><strong><code class="docutils literal notranslate"><span class="pre">shutdown(self)</span></code></strong></p>
+<ul>
+<li><p><strong>Description</strong>: Optional, with a no-op default. Releases whatever the worker holds — store handles, registered buffers, background threads. Called once, after the executor’s worker thread has joined, so no transfer can start afterwards; implementations must be idempotent. Without it a worker’s resources live as long as the process, so engines built back to back in one session accumulate them.</p></li>
+</ul>
+</li>
+<li><p><strong><code class="docutils literal notranslate"><span class="pre">capacity_only(self)</span> <span class="pre">-&gt;</span> <span class="pre">bool</span></code></strong> (property)</p>
+<ul>
+<li><p><strong>Description</strong>: Optional, <code class="docutils literal notranslate"><span class="pre">False</span></code> by default. Declares a worker that contributes resources to an external store but transfers no KV of its own — for example a rank that lends host memory to a shared pool other engines read and write. Must be the same on every rank; the runtime gathers it at startup and rejects a deployment whose ranks disagree. Such a worker is never asked for a lookup, a save, a prefix reservation, or a completion, and the runtime keeps its own connector bookkeeping — page-index gathers, scheduler output, the per-layer hooks — off the forward path entirely.</p></li>
+</ul>
+</li>
 </ul>
 </section>
 </section>
@@ -1213,6 +1238,146 @@ request in the same iteration. With chunked prefill, allocation growth can limit
 <li><p>Generating text for the same prompt (Second run).</p></li>
 <li><p>Asserting that the outputs match, proving the state was correctly restored from the disk cache.</p></li>
 </ol>
+</section>
+</section>
+<section id="mooncake-store">
+<h2>Mooncake store<a class="headerlink" href="#mooncake-store" title="Link to this heading">#</a></h2>
+<p><code class="docutils literal notranslate"><span class="pre">connector:</span> <span class="pre">mooncake-store</span></code> is a connector shipped with TensorRT-LLM. It backs the KV cache with a
+<a class="reference external" href="https://github.com/kvcache-ai/Mooncake">Mooncake</a> store: a pool of host memory, lent by the
+participating ranks and addressed by content, that every server joining it can read and write. A
+prefix computed by one engine is therefore replayable by another, which block reuse alone cannot do
+because it never leaves the instance that computed it.</p>
+<p>The Python bindings it needs come from <code class="docutils literal notranslate"><span class="pre">mooncake-transfer-engine-cuda13</span></code>, pinned in
+<code class="docutils literal notranslate"><span class="pre">requirements.txt</span></code> and installed with TensorRT-LLM.</p>
+<section id="starting-the-pool">
+<h3>Starting the pool<a class="headerlink" href="#starting-the-pool" title="Link to this heading">#</a></h3>
+<p>The pool’s own settings — its master’s address, the transport, the key namespace — are properties of
+the pool rather than of any engine in it, so a master publishes them once as a manifest and each
+server names that file:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># Once per deployment, before any server starts.</span>
+trtllm-serve<span class="w"> </span>mooncake_master<span class="w"> </span>--pool_file<span class="w"> </span>/shared/pool.json<span class="w"> </span>--run_dir<span class="w"> </span>/shared/run
+
+<span class="c1"># Afterwards, on any node: capacity the pool actually had, and where blocks landed.</span>
+trtllm-serve<span class="w"> </span>mooncake_pool_report<span class="w"> </span>--run_dir<span class="w"> </span>/shared/run
+</pre></div>
+</div>
+<p>Each server then renders its own Mooncake client config from the manifest and exports
+<code class="docutils literal notranslate"><span class="pre">MOONCAKE_CONFIG_PATH</span></code> for the ranks it spawns. A deployment that provisions the pool itself sets
+that variable instead, and an inherited value wins over the <code class="docutils literal notranslate"><span class="pre">mooncake_store</span></code> block.</p>
+</section>
+<section id="configuring-a-server">
+<h3>Configuring a server<a class="headerlink" href="#configuring-a-server" title="Link to this heading">#</a></h3>
+<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">kv_cache_config</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">use_kv_cache_manager_v2</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span>
+<span class="w">  </span><span class="nt">enable_block_reuse</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span>
+
+<span class="nt">kv_connector_config</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">connector</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">mooncake-store</span>
+<span class="w">  </span><span class="nt">mooncake_store</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">pool</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">file:///shared/pool.json</span><span class="w">   </span><span class="c1"># the manifest, or a master's host:port</span>
+<span class="w">    </span><span class="nt">role</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">both</span>
+<span class="w">    </span><span class="nt">segment_size</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">32GiB</span><span class="w">              </span><span class="c1"># host memory each rank lends</span>
+<span class="w">    </span><span class="nt">model_key</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">qwen2-1.5b-instruct</span><span class="w">   </span><span class="c1"># what the pool keys this checkpoint by</span>
+</pre></div>
+</div>
+<p><code class="docutils literal notranslate"><span class="pre">examples/llm-api/configs/trtllm_mooncake_store_connector_extra.yaml</span></code> is this file ready to pass to
+<code class="docutils literal notranslate"><span class="pre">trtllm-serve</span> <span class="pre">--extra_llm_api_options</span></code>. <code class="docutils literal notranslate"><span class="pre">KvCacheConnectorConfig.mooncake_store</span></code> documents every
+field; two are worth calling out. <code class="docutils literal notranslate"><span class="pre">model_key</span></code> has no default, because two engines that disagree
+about it read each other’s pages as their own and a model path is a poor identity — <code class="docutils literal notranslate"><span class="pre">org-a/model</span></code>
+and <code class="docutils literal notranslate"><span class="pre">org-b/model</span></code> share a directory name while meaning different weights. <code class="docutils literal notranslate"><span class="pre">segment_size</span></code> is per
+rank against a per-node memory limit, so a node’s demand is <code class="docutils literal notranslate"><span class="pre">ranks_on_node</span> <span class="pre">×</span> <span class="pre">segment_size</span></code> and is
+checked against available memory at startup.</p>
+</section>
+<section id="roles">
+<h3>Roles<a class="headerlink" href="#roles" title="Link to this heading">#</a></h3>
+<p>Capacity and traffic are separate: every role lends the memory its config asks for, and the role
+says only what the engine then does with the pool.</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p><code class="docutils literal notranslate"><span class="pre">role</span></code></p></th>
+<th class="head"><p>Reads the pool</p></th>
+<th class="head"><p>Writes the pool</p></th>
+<th class="head"><p>Typical use</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">both</span></code></p></td>
+<td><p>yes</p></td>
+<td><p>yes</p></td>
+<td><p>An aggregated server, or a context server in a disaggregated deployment</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">producer</span></code></p></td>
+<td><p>no</p></td>
+<td><p>yes</p></td>
+<td><p>A server that fills the pool for others</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">consumer</span></code></p></td>
+<td><p>yes</p></td>
+<td><p>no</p></td>
+<td><p>A server that only replays what others stored</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">capacity</span></code></p></td>
+<td><p>no</p></td>
+<td><p>no</p></td>
+<td><p>A generation server: it lends memory and moves no KV</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p><code class="docutils literal notranslate"><span class="pre">capacity</span></code> is the right role for a disaggregated generation server. Generated tokens are rarely a
+reused prefix, and prompt KV reaches decode over the cache transceiver rather than through the
+pool, so decode-side traffic would cost bandwidth for no hits. Because such a rank registers no
+page addresses with the pool, it is also exempt from everything that exists to protect them: it
+keeps its own host and disk cache tiers, including the host tier
+<a class="reference internal" href="#kv-cache-tiers-are-gpu-only-under-a-connector"><code class="docutils literal notranslate"><span class="pre">MAX_UTILIZATION</span></code> suspends pages into</a>, and pays
+no per-request or per-layer connector cost.</p>
+</section>
+<section id="settings-this-connector-overrides">
+<h3>Settings this connector overrides<a class="headerlink" href="#settings-this-connector-overrides" title="Link to this heading">#</a></h3>
+<p>For a role that transfers KV, the pool <em>is</em> the deployment’s offload tier, so the server’s own
+tiers would claim a second share of the same node’s DRAM and their page migrations would invalidate
+the addresses registered with the pool. Two settings are therefore overridden, with a log line
+naming each, rather than rejected:</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Setting</p></th>
+<th class="head"><p>Effective value</p></th>
+<th class="head"><p>Why</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">kv_cache_config.host_cache_size</span></code>, <code class="docutils literal notranslate"><span class="pre">kv_cache_config.disk_cache_size</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">0</span></code></p></td>
+<td><p>Put the memory into <code class="docutils literal notranslate"><span class="pre">mooncake_store.segment_size</span></code>, where every server on the node can reuse what any of them stored.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">kv_cache_config.enable_partial_reuse</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">False</span></code></p></td>
+<td><p>The connector addresses whole blocks, so a partial match leaves the matched length off a block boundary and the lookup is declined — trading part of one block for every stored block of the remaining prefix.</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>Both are settled in the <code class="docutils literal notranslate"><span class="pre">LLM</span></code> constructor, before the ranks are spawned and before the usage report
+reads the arguments, so <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code>, <code class="docutils literal notranslate"><span class="pre">trtllm-bench</span></code> and a direct <code class="docutils literal notranslate"><span class="pre">LLM(...)</span></code> all see the same
+settings. A <code class="docutils literal notranslate"><span class="pre">capacity</span></code> server keeps both as configured.</p>
+</section>
+<section id="restrictions">
+<h3>Restrictions<a class="headerlink" href="#restrictions" title="Link to this heading">#</a></h3>
+<p>Checked at startup, before any request is admitted, because each one’s failure mode is KV replayed
+without all of the state it was computed with — a wrong answer rather than a slow one.</p>
+<p>Beyond beam search, attention data parallelism, speculative decoding and Mamba/hybrid models, which
+are rejected for <a class="reference internal" href="#a-page-slot-must-not-be-reassigned-underneath-the-connector">every connector</a>,
+this one also rejects KV cache manager V1, context parallelism, pipeline parallelism,
+sliding-window attention, and <code class="docutils literal notranslate"><span class="pre">sparse_attention_config</span></code> with an index-V cache unless
+<code class="docutils literal notranslate"><span class="pre">sparse_disable_index_value=True</span></code>; it bypasses individual requests that carry a LoRA adapter or
+multimodal content without hashes, leaving the rest of the deployment served.</p>
+</section>
+<section id="how-pages-reach-the-pool">
+<h3>How pages reach the pool<a class="headerlink" href="#how-pages-reach-the-pool" title="Link to this heading">#</a></h3>
+<p>Every page passes through a pinned host buffer. <code class="docutils literal notranslate"><span class="pre">stage_through_host</span></code> defaults to <code class="docutils literal notranslate"><span class="pre">true</span></code> and is the
+only supported value today, so <code class="docutils literal notranslate"><span class="pre">false</span></code> is ignored with a warning; registering the KV pools with
+Mooncake instead is planned for a later release. Staging costs a copy each way and needs no
+GPUDirect RDMA. A <code class="docutils literal notranslate"><span class="pre">capacity</span></code> server stages nothing, holding no KV in the pool.</p>
 </section>
 </section>
 </section>
@@ -1293,6 +1458,15 @@ request in the same iteration. With chunked prefill, allocation growth can limit
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#implementation-details">Implementation Details</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#limitations-patterns">Limitations &amp; Patterns</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#usage">Usage</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mooncake-store">Mooncake store</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#starting-the-pool">Starting the pool</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#configuring-a-server">Configuring a server</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#roles">Roles</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#settings-this-connector-overrides">Settings this connector overrides</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#restrictions">Restrictions</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#how-pages-reach-the-pool">How pages reach the pool</a></li>
 </ul>
 </li>
 </ul>
@@ -1386,9 +1560,9 @@ request in the same iteration. With chunked prefill, allocation growth can limit
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on October 09, 2026.</p>
+  <p>Last updated on October 19, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/cc63e66">cc63e66</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/0372799">0372799</a>.</p>
   
 </div></div>
       

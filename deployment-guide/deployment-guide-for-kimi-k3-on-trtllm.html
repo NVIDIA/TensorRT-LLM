@@ -62,7 +62,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.23.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc0';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc1';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -79,7 +79,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="color-scheme" content="light dark"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.4.0rc0" />
+  <meta name="docsearch:version" content="1.4.0rc1" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -444,6 +444,9 @@
 <li class="toctree-l1 has-children"><a class="reference internal" href="../llm-api/reference.html">API Reference</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/LLM.html">LLM</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/AsyncLLM.html">AsyncLLM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/ExecutorMemoryType.html">ExecutorMemoryType</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/RuntimeMemoryStatus.html">RuntimeMemoryStatus</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SleepConfig.html">SleepConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/MultimodalEncoder.html">MultimodalEncoder</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CompletionOutput.html">CompletionOutput</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/RequestOutput.html">RequestOutput</a></li>
@@ -533,6 +536,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../features/speculative-decoding.html">Speculative Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/checkpoint-loading.html">Checkpoint Loading</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/model-express.html">ModelExpress (MX) Checkpoint Loading</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/sleep-wakeup.html">Runtime Memory Checkpointing (Prototype)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/ray-orchestrator.html">Ray Orchestrator (Prototype)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/torch_compile_and_piecewise_cuda_graph.html">Torch Compile &amp; Prefill CUDA Graph</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/helix.html">Helix Parallelism</a></li>
@@ -551,6 +555,10 @@
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/overview.html">Architecture Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/perf-analysis.html">Performance Analysis</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/perf-benchmarking.html">TensorRT LLM Benchmarking</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../developer-guide/moe-perf-guide.html">MoE Performance Guide</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../developer-guide/moe-perf-dashboard.html">MoE Perf Dashboard</a></li>
+</ul>
+</details></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/ci-overview.html">Continuous Integration Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/dev-containers.html">Using Dev Containers</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/api-change.html">LLM API Change Guide</a></li>
@@ -562,6 +570,7 @@
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog30_KV_Cache_Compression_in_TensorRT-LLM.html">KV Cache Compression in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog29_GVR_V2_Self_Sampling_Exact_TopK_for_Sparse_Attention.html">GVR V2: Self-Sampling and Multi-Thresholding for Faster Exact Top-K</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog28_Accelerating_Video_Generation_with_GEMM_Quantization_Attention_Quantization_and_Skip_Softmax_Attention_in_TensorRT-LLM.html">Accelerating Video Generation with GEMM Quantization, Attention Quantization and Skip Softmax Attention in TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog27_Evaluating_Agentic_Serving_with_Trace_Replay_and_Job_Level_Metrics.html">Evaluating Agentic Serving with Trace Replay and Job-Level Metrics</a></li>
@@ -724,7 +733,7 @@
 <li><p><strong>High-throughput and low-latency deployments are provided.</strong> DEP16 (<code class="docutils literal notranslate"><span class="pre">enable_attention_dp:</span> <span class="pre">true</span></code>, <code class="docutils literal notranslate"><span class="pre">moe_expert_parallel_size:</span> <span class="pre">16</span></code>) is the high-throughput deployment. TEP16 (<code class="docutils literal notranslate"><span class="pre">enable_attention_dp:</span> <span class="pre">false</span></code>, <code class="docutils literal notranslate"><span class="pre">moe_expert_parallel_size:</span> <span class="pre">16</span></code>) is the low-latency deployment. An 8-GPU deployment, TEP8 (<code class="docutils literal notranslate"><span class="pre">enable_attention_dp:</span> <span class="pre">false</span></code>, <code class="docutils literal notranslate"><span class="pre">moe_expert_parallel_size:</span> <span class="pre">8</span></code>), is also provided. Select the deployment and concurrency appropriate for your workload.</p></li>
 <li><p><strong>CUDA graphs and the overlap scheduler are enabled.</strong> The performance-sweep recipes set <code class="docutils literal notranslate"><span class="pre">disable_overlap_scheduler:</span> <span class="pre">false</span></code> and enable CUDA graphs. DEP16 additionally sets <code class="docutils literal notranslate"><span class="pre">cuda_graph_config.enable_padding:</span> <span class="pre">true</span></code>.</p></li>
 <li><p><strong>Chunked prefill is supported and enabled</strong> (<code class="docutils literal notranslate"><span class="pre">enable_chunked_prefill:</span> <span class="pre">true</span></code>), so prompts longer than <code class="docutils literal notranslate"><span class="pre">max_num_tokens</span></code> are scheduled across multiple steps.</p></li>
-<li><p><strong><code class="docutils literal notranslate"><span class="pre">kv_cache_config.tokens_per_block</span></code> must be <code class="docutils literal notranslate"><span class="pre">64</span></code></strong> — required by the MLA (576, 512) generation kernels.</p></li>
+<li><p><strong><code class="docutils literal notranslate"><span class="pre">kv_cache_config.tokens_per_block</span></code> is <code class="docutils literal notranslate"><span class="pre">64</span></code></strong> — retained as the validated configuration. Earlier releases needed this page size to avoid a legacy MLA fallback that did not support Kimi K3’s 96 query heads.</p></li>
 <li><p><strong>Disaggregated serving and suffix-automaton speculative decoding are available.</strong> Disaggregated serving is validated end-to-end on GB300 with matched DEP16 context/generation servers; see <code class="docutils literal notranslate"><span class="pre">examples/kimi_k3/disagg/README.md</span></code>. Suffix-automaton speculation works for both aggregated and disaggregated serving. See the “Current limitations” section of <code class="docutils literal notranslate"><span class="pre">examples/kimi_k3/README.md</span></code> for constraints (e.g. only matched DEP16=DEP16 disagg geometry is validated at scale).</p></li>
 </ul>
 </section>
@@ -894,7 +903,7 @@ INFO:     Uvicorn running on http://localhost:8000 (Press CTRL+C to quit)
 <ul>
 <li><p><code class="docutils literal notranslate"><span class="pre">enable_block_reuse</span></code>: Off by default; set to <code class="docutils literal notranslate"><span class="pre">true</span></code> to enable prefix-cache reuse across requests.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">mamba_state_config.periodic_snapshot_interval</span></code>: With block reuse on, the KDA recurrent state is snapshotted every this many tokens so prefix hits can restore it (default <code class="docutils literal notranslate"><span class="pre">0</span></code> = snapshots off; hybrid models only expose reusable prefixes at snapshot boundaries, so set e.g. <code class="docutils literal notranslate"><span class="pre">256</span></code> for block reuse to engage; see <code class="docutils literal notranslate"><span class="pre">examples/kimi_k3/eval_extra_llm_options_reuse.yaml</span></code>).</p></li>
-<li><p><code class="docutils literal notranslate"><span class="pre">tokens_per_block</span></code>: Must be <code class="docutils literal notranslate"><span class="pre">64</span></code>, required by the MLA (576, 512) generation kernels.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">tokens_per_block</span></code>: <code class="docutils literal notranslate"><span class="pre">64</span></code> is the validated configuration; earlier releases needed it to avoid a legacy MLA fallback that did not support Kimi K3’s 96 query heads.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">free_gpu_memory_fraction</span></code>: Fraction of free GPU memory reserved for the paged KV cache after model load. The configuration above uses <code class="docutils literal notranslate"><span class="pre">0.25</span></code> to leave runtime headroom. Lower it if you hit out-of-memory errors.</p></li>
 </ul>
 </li>
@@ -1166,7 +1175,7 @@ mkdir<span class="w"> </span>-p<span class="w"> </span><span class="s2">"</span>
 <li><p><strong>Job reaches its Slurm time limit before the model loads:</strong> Weight loading for a checkpoint of this size is dominated by filesystem throughput; request a longer allocation (<code class="docutils literal notranslate"><span class="pre">--time=...</span></code>), particularly with cold caches or a busy filesystem.</p></li>
 <li><p><strong>Model fails to load:</strong> Make sure <code class="docutils literal notranslate"><span class="pre">trust_remote_code:</span> <span class="pre">true</span></code> is set and that the checkpoint path is a complete Hugging Face-format Kimi K3 checkpoint with its tokenizer files.</p></li>
 <li><p><strong><code class="docutils literal notranslate"><span class="pre">fla</span></code> / <code class="docutils literal notranslate"><span class="pre">einops</span></code> import errors:</strong> Install the extra dependencies into the in-place environment: <code class="docutils literal notranslate"><span class="pre">.venv-3.12/bin/python</span> <span class="pre">-m</span> <span class="pre">pip</span> <span class="pre">install</span> <span class="pre">fla-core</span> <span class="pre">einops</span></code>.</p></li>
-<li><p><strong>Accuracy looks off:</strong> Confirm <code class="docutils literal notranslate"><span class="pre">tokens_per_block:</span> <span class="pre">64</span></code> (a hard constraint for Kimi K3), and that the remaining settings match the tested configuration above.</p></li>
+<li><p><strong>Accuracy looks off:</strong> Confirm <code class="docutils literal notranslate"><span class="pre">tokens_per_block:</span> <span class="pre">64</span></code> (the validated Kimi K3 page size; other values historically routed MLA decode to a TRTLLM-Gen path that did not support K3’s 96 query heads), and that the remaining settings match the tested configuration above.</p></li>
 <li><p><strong>GPU utilization:</strong> For performance issues, check GPU utilization with <code class="docutils literal notranslate"><span class="pre">nvidia-smi</span></code> on the compute nodes while the server is running.</p></li>
 </ul>
 </section>
@@ -1359,9 +1368,9 @@ mkdir<span class="w"> </span>-p<span class="w"> </span><span class="s2">"</span>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on October 09, 2026.</p>
+  <p>Last updated on October 19, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/cc63e66">cc63e66</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/0372799">0372799</a>.</p>
   
 </div></div>
       

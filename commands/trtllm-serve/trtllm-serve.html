@@ -62,7 +62,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.23.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc0';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc1';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -79,7 +79,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="color-scheme" content="light dark"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.4.0rc0" />
+  <meta name="docsearch:version" content="1.4.0rc1" />
   
     
     <script src="../../_static/searchtools.js"></script>
@@ -444,6 +444,9 @@
 <li class="toctree-l1 has-children"><a class="reference internal" href="../../llm-api/reference.html">API Reference</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/LLM.html">LLM</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/AsyncLLM.html">AsyncLLM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/ExecutorMemoryType.html">ExecutorMemoryType</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/RuntimeMemoryStatus.html">RuntimeMemoryStatus</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SleepConfig.html">SleepConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/MultimodalEncoder.html">MultimodalEncoder</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/CompletionOutput.html">CompletionOutput</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/RequestOutput.html">RequestOutput</a></li>
@@ -533,6 +536,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../../features/speculative-decoding.html">Speculative Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/checkpoint-loading.html">Checkpoint Loading</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/model-express.html">ModelExpress (MX) Checkpoint Loading</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/sleep-wakeup.html">Runtime Memory Checkpointing (Prototype)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/ray-orchestrator.html">Ray Orchestrator (Prototype)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/torch_compile_and_piecewise_cuda_graph.html">Torch Compile &amp; Prefill CUDA Graph</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/helix.html">Helix Parallelism</a></li>
@@ -551,6 +555,10 @@
 <li class="toctree-l1"><a class="reference internal" href="../../developer-guide/overview.html">Architecture Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../developer-guide/perf-analysis.html">Performance Analysis</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../developer-guide/perf-benchmarking.html">TensorRT LLM Benchmarking</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../developer-guide/moe-perf-guide.html">MoE Performance Guide</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../developer-guide/moe-perf-dashboard.html">MoE Perf Dashboard</a></li>
+</ul>
+</details></li>
 <li class="toctree-l1"><a class="reference internal" href="../../developer-guide/ci-overview.html">Continuous Integration Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../developer-guide/dev-containers.html">Using Dev Containers</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../developer-guide/api-change.html">LLM API Change Guide</a></li>
@@ -562,6 +570,7 @@
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog30_KV_Cache_Compression_in_TensorRT-LLM.html">KV Cache Compression in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog29_GVR_V2_Self_Sampling_Exact_TopK_for_Sparse_Attention.html">GVR V2: Self-Sampling and Multi-Thresholding for Faster Exact Top-K</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog28_Accelerating_Video_Generation_with_GEMM_Quantization_Attention_Quantization_and_Skip_Softmax_Attention_in_TensorRT-LLM.html">Accelerating Video Generation with GEMM Quantization, Attention Quantization and Skip Softmax Attention in TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog27_Evaluating_Agentic_Serving_with_Trace_Replay_and_Job_Level_Metrics.html">Evaluating Agentic Serving with Trace Replay and Job-Level Metrics</a></li>
@@ -1093,7 +1102,7 @@ Since the statistics are stored in an internal queue and removed once retrieved,
 <span id="id1"></span><h2>Runtime Profiling Endpoints<a class="headerlink" href="#runtime-profiling-endpoints" title="Link to this heading">#</a></h2>
 <div class="admonition note">
 <p class="admonition-title">Note</p>
-<p>The <code class="docutils literal notranslate"><span class="pre">/start_profile</span></code> and <code class="docutils literal notranslate"><span class="pre">/stop_profile</span></code> endpoints are <strong>prototype</strong> and only apply to the default PyTorch backend (<code class="docutils literal notranslate"><span class="pre">PyExecutor</span></code>). They are no-ops on the TensorRT backend. APIs, parameters, and behaviour may change in future releases.</p>
+<p>The <code class="docutils literal notranslate"><span class="pre">/start_profile</span></code> and <code class="docutils literal notranslate"><span class="pre">/stop_profile</span></code> endpoints are <strong>prototype</strong> and only apply to the default PyTorch backend (<code class="docutils literal notranslate"><span class="pre">PyExecutor</span></code>). APIs, parameters, and behaviour may change in future releases.</p>
 </div>
 <p>The server exposes two HTTP endpoints that control iteration-scoped profiling of the backend engine at runtime, without restarting <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code> and without setting <code class="docutils literal notranslate"><span class="pre">TLLM_PROFILE_START_STOP</span></code> / <code class="docutils literal notranslate"><span class="pre">TLLM_TORCH_PROFILE_TRACE</span></code>. Under TP/PP &gt; 1, both endpoints broadcast the window to every rank, so each rank writes its own chrome trace (distinguished by a <code class="docutils literal notranslate"><span class="pre">rank-&lt;N&gt;</span></code> suffix in the filename) and all ranks profile the same iterations in lockstep.</p>
 <section id="post-start-profile">
@@ -1223,6 +1232,56 @@ a path.</p>
 history, process listings, or logs. Eligible configuration fields may also be
 included in usage telemetry; use <code class="docutils literal notranslate"><span class="pre">--no-telemetry</span></code> to opt out. See
 <a class="reference internal" href="../../developer-guide/telemetry.html"><span class="doc">Telemetry</span></a>.</p>
+</section>
+<section id="editor-validation-of-yaml-files">
+<h2>Editor Validation of YAML Files<a class="headerlink" href="#editor-validation-of-yaml-files" title="Link to this heading">#</a></h2>
+<p>In VS Code, install <a class="reference external" href="https://marketplace.visualstudio.com/items?itemName=redhat.vscode-yaml">YAML by Red Hat</a>
+and add this comment to a serving config to enable validation, completion, and hover documentation:</p>
+<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="c1"># yaml-language-server: $schema=https://nvidia.github.io/TensorRT-LLM/latest/_static/schemas/trtllm-serve-config.schema.json</span>
+<span class="nt">max_batch_size</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">8</span>
+</pre></div>
+</div>
+<p>Other YAML language-server clients can use the same schema. The editor downloads
+the schema; it does not need a local TensorRT-LLM installation or a running server.
+Replace <code class="docutils literal notranslate"><span class="pre">latest</span></code> with the docs version matching your installation, once that
+release publishes schemas. Existing releases are not retroactively updated.</p>
+<p>Use <code class="docutils literal notranslate"><span class="pre">trtllm-serve-disagg-config.schema.json</span></code> for <code class="docutils literal notranslate"><span class="pre">disaggregated</span> <span class="pre">--config</span></code> and
+<code class="docutils literal notranslate"><span class="pre">trtllm-serve-visual-gen-config.schema.json</span></code> for <code class="docutils literal notranslate"><span class="pre">--visual_gen_args</span></code>, in the same
+schema directory. These describe YAML files, not CLI flags or <code class="docutils literal notranslate"><span class="pre">--set</span></code> assignments.</p>
+<p>View or download the JSON schemas for this documentation version:</p>
+<ul class="simple">
+<li><p><a class="reference external" href="../../_static/schemas/trtllm-serve-config.schema.json">Serving schema</a></p></li>
+<li><p><a class="reference external" href="../../_static/schemas/trtllm-serve-disagg-config.schema.json">Disaggregated serving schema</a></p></li>
+<li><p><a class="reference external" href="../../_static/schemas/trtllm-serve-visual-gen-config.schema.json">VisualGen schema</a></p></li>
+</ul>
+<p>To save a schema, right-click its link and select <strong>Save link as</strong>.</p>
+<p>Schemas check field names, nested structure, types, and declarative constraints.
+Runtime checks still determine model/GPU compatibility, file existence, and
+cross-field validity. Custom Python validators, free-form mappings, and the
+deprecated <code class="docutils literal notranslate"><span class="pre">decoding_config</span></code> have limited static validation; live Python
+objects are not configurable in YAML.</p>
+<p>For offline use, set <code class="docutils literal notranslate"><span class="pre">$schema</span></code> to a local JSON file (an absolute path or a path
+relative to your YAML file):</p>
+<ul class="simple">
+<li><p>Source checkouts include the schemas in <code class="docutils literal notranslate"><span class="pre">tensorrt_llm/schemas/</span></code>; no build is needed to use them.</p></li>
+<li><p>Release containers expose them at <code class="docutils literal notranslate"><span class="pre">/app/tensorrt_llm/schemas/</span></code>. The editor must be
+attached to the container, or otherwise able to access those files.</p></li>
+<li><p>Wheels include the same schemas. To locate them without importing TensorRT-LLM:</p></li>
+</ul>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python3<span class="w"> </span>-c<span class="w"> </span><span class="s1">'from importlib.metadata import distribution; print(distribution("tensorrt_llm").locate_file("tensorrt_llm/schemas"))'</span>
+</pre></div>
+</div>
+<p>When changing configuration definitions or bumping the package version in
+<code class="docutils literal notranslate"><span class="pre">tensorrt_llm/version.py</span></code>, regenerate and commit the snapshots using a
+TensorRT-LLM build and dependencies matching the checkout. Each schema’s <code class="docutils literal notranslate"><span class="pre">$id</span></code>
+and <code class="docutils literal notranslate"><span class="pre">title</span></code> include the package version.</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python3<span class="w"> </span>scripts/generate_trtllm_serve_schemas.py
+python3<span class="w"> </span>scripts/generate_trtllm_serve_schemas.py<span class="w"> </span>--check
+</pre></div>
+</div>
+<p>The CPU schema tests reject stale snapshots. Wheel and HTML docs builds publish
+the checked-in files without importing configuration classes. <code class="docutils literal notranslate"><span class="pre">--output-dir</span></code>
+can be used to generate a separate local preview.</p>
 </section>
 <section id="syntax">
 <span id="id2"></span><h2>Syntax<a class="headerlink" href="#syntax" title="Link to this heading">#</a></h2>
@@ -1541,90 +1600,12 @@ Single-GPU only: the command does not expose tensor/pipeline parallelism.</p>
 </dd></dl>
 
 </section>
-<section id="trtllm-serve-mooncake-donor">
-<h4>mooncake_donor<a class="headerlink" href="#trtllm-serve-mooncake-donor" title="Link to this heading">#</a></h4>
-<p>Lend this node’s host memory to a Mooncake pool, for as long as it runs.</p>
-<p>Running this on the generation nodes puts their memory into the pool while
-leaving those engines connector-free.</p>
-<p class="rubric">Usage</p>
-<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>trtllm-serve<span class="w"> </span>mooncake_donor<span class="w"> </span><span class="o">[</span>OPTIONS<span class="o">]</span>
-</pre></div>
-</div>
-<p class="rubric">Options</p>
-<dl class="std option">
-<dt class="sig sig-object std" id="cmdoption-trtllm-serve-mooncake_donor-master_server_address">
-<span class="sig-name descname"><span class="pre">--master_server_address</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;master_server_address&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-serve-mooncake_donor-master_server_address" title="Link to this definition">#</a></dt>
-<dd><p>Master to join, as host:port or file://&lt;path&gt; naming a file that holds one. Defaults to the master_server_address in –config.</p>
-</dd></dl>
-
-<dl class="std option">
-<dt class="sig sig-object std" id="cmdoption-trtllm-serve-mooncake_donor-segment_size">
-<span class="sig-name descname"><span class="pre">--segment_size</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;segment_size&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-serve-mooncake_donor-segment_size" title="Link to this definition">#</a></dt>
-<dd><p>Host memory to contribute from this node. Deliberately separate from a config’s global_segment_size, which is sized for an engine worker rather than a node lending what it can spare.</p>
-<dl class="field-list simple">
-<dt class="field-odd">Default<span class="colon">:</span></dt>
-<dd class="field-odd"><p><code class="docutils literal notranslate"><span class="pre">'32GiB'</span></code></p>
-</dd>
-</dl>
-</dd></dl>
-
-<dl class="std option">
-<dt class="sig sig-object std" id="cmdoption-trtllm-serve-mooncake_donor-config">
-<span class="sig-name descname"><span class="pre">--config</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;config&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-serve-mooncake_donor-config" title="Link to this definition">#</a></dt>
-<dd><p>Mooncake JSON config describing the pool, for the settings not given here. Defaults to $MOONCAKE_CONFIG_PATH.</p>
-</dd></dl>
-
-<dl class="std option">
-<dt class="sig sig-object std" id="cmdoption-trtllm-serve-mooncake_donor-protocol">
-<span class="sig-name descname"><span class="pre">--protocol</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;protocol&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-serve-mooncake_donor-protocol" title="Link to this definition">#</a></dt>
-<dd><p>Transport, ‘rdma’ or ‘tcp’. Defaults to –config’s, else rdma.</p>
-</dd></dl>
-
-<dl class="std option">
-<dt class="sig sig-object std" id="cmdoption-trtllm-serve-mooncake_donor-device_name">
-<span class="sig-name descname"><span class="pre">--device_name</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;device_name&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-serve-mooncake_donor-device_name" title="Link to this definition">#</a></dt>
-<dd><p>RDMA device, from ibv_devinfo. Defaults to –config’s.</p>
-</dd></dl>
-
-<dl class="std option">
-<dt class="sig sig-object std" id="cmdoption-trtllm-serve-mooncake_donor-metadata_server">
-<span class="sig-name descname"><span class="pre">--metadata_server</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;metadata_server&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-serve-mooncake_donor-metadata_server" title="Link to this definition">#</a></dt>
-<dd><p>Mooncake metadata service. Defaults to –config’s, else P2PHANDSHAKE.</p>
-</dd></dl>
-
-<dl class="std option">
-<dt class="sig sig-object std" id="cmdoption-trtllm-serve-mooncake_donor-local_buffer_size">
-<span class="sig-name descname"><span class="pre">--local_buffer_size</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;local_buffer_size&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-serve-mooncake_donor-local_buffer_size" title="Link to this definition">#</a></dt>
-<dd><p>Mooncake transfer buffer for this process. Deliberately separate from a config’s local_buffer_size, which is sized for an engine worker: a donor never transfers, and only needs one because setup rejects a zero-sized buffer. Defaults to 64MiB.</p>
-</dd></dl>
-
-<dl class="std option">
-<dt class="sig sig-object std" id="cmdoption-trtllm-serve-mooncake_donor-ready_file">
-<span class="sig-name descname"><span class="pre">--ready_file</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;ready_file&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-serve-mooncake_donor-ready_file" title="Link to this definition">#</a></dt>
-<dd><p>File to create once the segment is mounted, for launchers that must not let prefill start writing before the pool has this capacity.</p>
-</dd></dl>
-
-<dl class="std option">
-<dt class="sig sig-object std" id="cmdoption-trtllm-serve-mooncake_donor-heartbeat_seconds">
-<span class="sig-name descname"><span class="pre">--heartbeat_seconds</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;heartbeat_seconds&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-serve-mooncake_donor-heartbeat_seconds" title="Link to this definition">#</a></dt>
-<dd><p>Interval between liveness lines. 0 disables them.</p>
-<dl class="field-list simple">
-<dt class="field-odd">Default<span class="colon">:</span></dt>
-<dd class="field-odd"><p><code class="docutils literal notranslate"><span class="pre">300</span></code></p>
-</dd>
-</dl>
-</dd></dl>
-
-<dl class="std option">
-<dt class="sig sig-object std" id="cmdoption-trtllm-serve-mooncake_donor-telemetry">
-<span id="cmdoption-trtllm-serve-mooncake_donor-no-telemetry"></span><span class="sig-name descname"><span class="pre">--telemetry</span></span><span class="sig-prename descclassname"></span><span class="sig-prename descclassname"><span class="pre">,</span> </span><span class="sig-name descname"><span class="pre">--no-telemetry</span></span><span class="sig-prename descclassname"></span><a class="headerlink" href="#cmdoption-trtllm-serve-mooncake_donor-telemetry" title="Link to this definition">#</a></dt>
-<dd><p>Enable or disable anonymous usage telemetry collection.</p>
-</dd></dl>
-
-</section>
 <section id="trtllm-serve-mooncake-master">
 <h4>mooncake_master<a class="headerlink" href="#trtllm-serve-mooncake-master" title="Link to this heading">#</a></h4>
-<p>Run a mooncake_master for as long as this command runs.</p>
+<p>Own a Mooncake pool for as long as this command runs.</p>
+<p>Start this before the servers that join the pool. They wait for the
+manifest, so the order within a job is not delicate, but nothing can hold
+capacity or serve a lookup until this is up.</p>
 <p class="rubric">Usage</p>
 <div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>trtllm-serve<span class="w"> </span>mooncake_master<span class="w"> </span><span class="o">[</span>OPTIONS<span class="o">]</span>
 </pre></div>
@@ -1664,21 +1645,70 @@ leaving those engines connector-free.</p>
 </dd></dl>
 
 <dl class="std option">
-<dt class="sig sig-object std" id="cmdoption-trtllm-serve-mooncake_master-address_file">
-<span class="sig-name descname"><span class="pre">--address_file</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;address_file&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-serve-mooncake_master-address_file" title="Link to this definition">#</a></dt>
-<dd><p>File to publish ‘host:port’ to once the master answers. Workers name it as master_server_address: file://&lt;path&gt;, which is how they reach a master whose host the scheduler chose. Removed on exit so a stale address is never dialed.</p>
+<dt class="sig sig-object std" id="cmdoption-trtllm-serve-mooncake_master-pool_file">
+<span class="sig-name descname"><span class="pre">--pool_file</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;pool_file&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-serve-mooncake_master-pool_file" title="Link to this definition">#</a></dt>
+<dd><p>File to publish the pool manifest to once the master answers. Servers name it as mooncake_store.pool: <a class="reference external" href="file:/">file:/</a>/&lt;path&gt;, which is how they reach a master whose host the scheduler chose. Removed on exit so a stale address is never dialed. One is written to –run_dir regardless.</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-serve-mooncake_master-protocol">
+<span class="sig-name descname"><span class="pre">--protocol</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;protocol&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-serve-mooncake_master-protocol" title="Link to this definition">#</a></dt>
+<dd><p>Transport every participant will use: ‘rdma’ or ‘tcp’. Recorded in the manifest so the servers need not restate it. TCP is for bring-up only; it invalidates performance conclusions.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Default<span class="colon">:</span></dt>
+<dd class="field-odd"><p><code class="docutils literal notranslate"><span class="pre">'rdma'</span></code></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-serve-mooncake_master-metadata_server">
+<span class="sig-name descname"><span class="pre">--metadata_server</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;metadata_server&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-serve-mooncake_master-metadata_server" title="Link to this definition">#</a></dt>
+<dd><p>Mooncake metadata service, recorded in the manifest. P2PHANDSHAKE keeps a separate metadata process out of the deployment.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Default<span class="colon">:</span></dt>
+<dd class="field-odd"><p><code class="docutils literal notranslate"><span class="pre">'P2PHANDSHAKE'</span></code></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-serve-mooncake_master-namespace">
+<span class="sig-name descname"><span class="pre">--namespace</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;namespace&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-serve-mooncake_master-namespace" title="Link to this definition">#</a></dt>
+<dd><p>Default key namespace for this pool, recorded in the manifest. A server may override it.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Default<span class="colon">:</span></dt>
+<dd class="field-odd"><p><code class="docutils literal notranslate"><span class="pre">'trtllm'</span></code></p>
+</dd>
+</dl>
 </dd></dl>
 
 <dl class="std option">
 <dt class="sig sig-object std" id="cmdoption-trtllm-serve-mooncake_master-run_dir">
 <span class="sig-name descname"><span class="pre">--run_dir</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;run_dir&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-serve-mooncake_master-run_dir" title="Link to this definition">#</a></dt>
-<dd><p>Where to keep the master’s log. Defaults to $TRTLLM_MOONCAKE_RUN_DIR, else a temporary directory.</p>
+<dd><p>Where to keep the master’s log and a copy of the manifest. Defaults to a temporary directory.</p>
 </dd></dl>
 
 <dl class="std option">
-<dt class="sig sig-object std" id="cmdoption-trtllm-serve-mooncake_master-config">
-<span class="sig-name descname"><span class="pre">--config</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;config&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-serve-mooncake_master-config" title="Link to this definition">#</a></dt>
-<dd><p>Mooncake JSON config describing the pool. When given, a copy naming this master is written to –run_dir as the client config every worker reads, so no external script has to render one. Workers find it by setting $TRTLLM_MOONCAKE_RUN_DIR to that directory, or $MOONCAKE_CONFIG_PATH to the file.</p>
+<dt class="sig sig-object std" id="cmdoption-trtllm-serve-mooncake_master-binary">
+<span class="sig-name descname"><span class="pre">--binary</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;binary&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-serve-mooncake_master-binary" title="Link to this definition">#</a></dt>
+<dd><p>The master executable to run, looked up on PATH. It ships with the Mooncake runtime that docker/common/install_mooncake.sh installs.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Default<span class="colon">:</span></dt>
+<dd class="field-odd"><p><code class="docutils literal notranslate"><span class="pre">'mooncake_master'</span></code></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-serve-mooncake_master-timeout">
+<span class="sig-name descname"><span class="pre">--timeout</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;timeout&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-serve-mooncake_master-timeout" title="Link to this definition">#</a></dt>
+<dd><p>Seconds to wait for the master to accept connections before giving up on it.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Default<span class="colon">:</span></dt>
+<dd class="field-odd"><p><code class="docutils literal notranslate"><span class="pre">60.0</span></code></p>
+</dd>
+</dl>
 </dd></dl>
 
 <dl class="std option">
@@ -1695,6 +1725,35 @@ leaving those engines connector-free.</p>
 <dl class="std option">
 <dt class="sig sig-object std" id="cmdoption-trtllm-serve-mooncake_master-telemetry">
 <span id="cmdoption-trtllm-serve-mooncake_master-no-telemetry"></span><span class="sig-name descname"><span class="pre">--telemetry</span></span><span class="sig-prename descclassname"></span><span class="sig-prename descclassname"><span class="pre">,</span> </span><span class="sig-name descname"><span class="pre">--no-telemetry</span></span><span class="sig-prename descclassname"></span><a class="headerlink" href="#cmdoption-trtllm-serve-mooncake_master-telemetry" title="Link to this definition">#</a></dt>
+<dd><p>Enable or disable anonymous usage telemetry collection.</p>
+</dd></dl>
+
+</section>
+<section id="trtllm-serve-mooncake-pool-report">
+<h4>mooncake_pool_report<a class="headerlink" href="#trtllm-serve-mooncake-pool-report" title="Link to this heading">#</a></h4>
+<p>Report the capacity a run’s pool actually had, and where blocks landed.</p>
+<p>Safe to run after the job, since the records outlive the processes that
+wrote them.</p>
+<p class="rubric">Usage</p>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>trtllm-serve<span class="w"> </span>mooncake_pool_report<span class="w"> </span><span class="o">[</span>OPTIONS<span class="o">]</span>
+</pre></div>
+</div>
+<p class="rubric">Options</p>
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-serve-mooncake_pool_report-run_dir">
+<span class="sig-name descname"><span class="pre">--run_dir</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;run_dir&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-serve-mooncake_pool_report-run_dir" title="Link to this definition">#</a></dt>
+<dd><p><strong>Required</strong> Directory holding the pool manifest and the segments/ records each participating rank wrote.</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-serve-mooncake_pool_report-master_log">
+<span class="sig-name descname"><span class="pre">--master_log</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;master_log&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-serve-mooncake_pool_report-master_log" title="Link to this definition">#</a></dt>
+<dd><p>The master’s log, for the block-placement table. Defaults to mooncake_master.log in –run_dir.</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-serve-mooncake_pool_report-telemetry">
+<span id="cmdoption-trtllm-serve-mooncake_pool_report-no-telemetry"></span><span class="sig-name descname"><span class="pre">--telemetry</span></span><span class="sig-prename descclassname"></span><span class="sig-prename descclassname"><span class="pre">,</span> </span><span class="sig-name descname"><span class="pre">--no-telemetry</span></span><span class="sig-prename descclassname"></span><a class="headerlink" href="#cmdoption-trtllm-serve-mooncake_pool_report-telemetry" title="Link to this definition">#</a></dt>
 <dd><p>Enable or disable anonymous usage telemetry collection.</p>
 </dd></dl>
 
@@ -1863,7 +1922,7 @@ leaving those engines connector-free.</p>
 <dl class="std option">
 <dt class="sig sig-object std" id="cmdoption-trtllm-serve-serve-num_serve_frontends">
 <span class="sig-name descname"><span class="pre">--num_serve_frontends</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;num_serve_frontends&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-serve-serve-num_serve_frontends" title="Link to this definition">#</a></dt>
-<dd><p><code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Number of HTTP frontend processes serving one executor; values &gt; 1 share the serving port via SO_REUSEPORT (classic IPC executor path only).</p>
+<dd><p><code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Number of HTTP or OpenEngine frontend processes serving one executor; values &gt; 1 share the serving port via SO_REUSEPORT (classic IPC executor path only).</p>
 </dd></dl>
 
 <dl class="std option">
@@ -1908,7 +1967,7 @@ leaving those engines connector-free.</p>
 <dd><p><code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Specify the parser for reasoning models. Use ‘auto’ to automatically select based on the model.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Options<span class="colon">:</span></dt>
-<dd class="field-odd"><p>auto | minimax_m2_append_think | minimax_m2 | qwen3_5 | qwen3 | deepseek-r1 | deepseek_v4 | poolside_v1 | laguna | minimax_m3 | k-exaone | nano-v3 | nemotron-v3 | gemma4 | kimi_k25 | kimi_k2 | kimi_k3</p>
+<dd class="field-odd"><p>auto | minimax_m2_append_think | minimax_m2 | qwen3_5 | qwen3 | deepseek-r1 | glm_moe_dsa | glm47 | glm45 | glm | deepseek_v4 | deepseek_v41 | poolside_v1 | laguna | minimax_m3 | k-exaone | nano-v3 | nemotron-v3 | gemma4 | kimi_k25 | kimi_k2 | kimi_k3</p>
 </dd>
 </dl>
 </dd></dl>
@@ -1919,7 +1978,7 @@ leaving those engines connector-free.</p>
 <dd><p><code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Specify the parser for tool models. Use ‘auto’ to automatically select based on the model.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Options<span class="colon">:</span></dt>
-<dd class="field-odd"><p>auto | qwen3 | qwen3_coder | kimi_k2 | kimi_k3 | deepseek_v3 | deepseek_v31 | deepseek_v32 | deepseek_v4 | gemma4 | glm4 | glm47 | minimax_m2 | minimax_m3 | poolside_v1</p>
+<dd class="field-odd"><p>auto | qwen3 | qwen3_coder | kimi_k2 | kimi_k3 | deepseek_v3 | deepseek_v31 | deepseek_v32 | deepseek_v4 | deepseek_v41 | gemma4 | glm4 | glm47 | minimax_m2 | minimax_m3 | poolside_v1</p>
 </dd>
 </dl>
 </dd></dl>
@@ -1964,6 +2023,12 @@ leaving those engines connector-free.</p>
 <dt class="sig sig-object std" id="cmdoption-trtllm-serve-serve-enable_attention_dp">
 <span class="sig-name descname"><span class="pre">--enable_attention_dp</span></span><span class="sig-prename descclassname"></span><a class="headerlink" href="#cmdoption-trtllm-serve-serve-enable_attention_dp" title="Link to this definition">#</a></dt>
 <dd><p><code class="tag beta docutils literal notranslate"><span class="pre">beta</span></code> Enable attention data parallel.</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-serve-serve-enable_locality_domains">
+<span class="sig-name descname"><span class="pre">--enable_locality_domains</span></span><span class="sig-prename descclassname"></span><a class="headerlink" href="#cmdoption-trtllm-serve-serve-enable_locality_domains" title="Link to this definition">#</a></dt>
+<dd><p><code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Enable locality domain execution for supported PyTorch backend ops.</p>
 </dd></dl>
 
 <dl class="std option">
@@ -2014,6 +2079,12 @@ leaving those engines connector-free.</p>
 </dd></dl>
 
 <dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-serve-serve-openengine-enable-load-metrics">
+<span class="sig-name descname"><span class="pre">--openengine-enable-load-metrics</span></span><span class="sig-prename descclassname"></span><a class="headerlink" href="#cmdoption-trtllm-serve-serve-openengine-enable-load-metrics" title="Link to this definition">#</a></dt>
+<dd><p><code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Expose per-rank KV occupancy for OpenEngine routing, independently of KV events.</p>
+</dd></dl>
+
+<dl class="std option">
 <dt class="sig sig-object std" id="cmdoption-trtllm-serve-serve-served_model_name">
 <span class="sig-name descname"><span class="pre">--served_model_name</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;served_model_name&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-serve-serve-served_model_name" title="Link to this definition">#</a></dt>
 <dd><p><code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> The model name used in the API. If not specified, the model path is used as the model name. This is useful when the model path is long or when you want to expose a custom name to clients.</p>
@@ -2047,6 +2118,12 @@ leaving those engines connector-free.</p>
 <dt class="sig sig-object std" id="cmdoption-trtllm-serve-serve-report_addr">
 <span class="sig-name descname"><span class="pre">--report_addr</span></span><span class="sig-prename descclassname"> <span class="pre">&lt;report_addr&gt;</span></span><a class="headerlink" href="#cmdoption-trtllm-serve-serve-report_addr" title="Link to this definition">#</a></dt>
 <dd><p><code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Write the host:port this server actually bound to this file, atomically, once the socket is bound. Lets –port 0 be used and have the launcher read the kernel-assigned port back instead of reserving one up front.</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-serve-serve-enable_sleep_mode">
+<span class="sig-name descname"><span class="pre">--enable_sleep_mode</span></span><span class="sig-prename descclassname"></span><a class="headerlink" href="#cmdoption-trtllm-serve-serve-enable_sleep_mode" title="Link to this definition">#</a></dt>
+<dd><p><code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Enable runtime-memory checkpointing and authenticated HTTP control endpoints.</p>
 </dd></dl>
 
 <p class="rubric">Arguments</p>
@@ -2133,14 +2210,15 @@ Please refer to <cite>Performance Benchmarking with `trtllm-serve</cite> &lt;<a 
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#configuring-with-yaml-files-and-set">Configuring with YAML Files and <code class="docutils literal notranslate"><span class="pre">--set</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#editor-validation-of-yaml-files">Editor Validation of YAML Files</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#syntax">Syntax</a><ul class="nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#trtllm-serve">trtllm-serve</a><ul class="nav section-nav flex-column">
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#trtllm-serve-disaggregated">disaggregated</a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#trtllm-serve-disaggregated-mpi-worker">disaggregated_mpi_worker</a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#trtllm-serve-embeddings">embeddings</a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#trtllm-serve-mm-embedding-serve">mm_embedding_serve</a></li>
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#trtllm-serve-mooncake-donor">mooncake_donor</a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#trtllm-serve-mooncake-master">mooncake_master</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#trtllm-serve-mooncake-pool-report">mooncake_pool_report</a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#trtllm-serve-serve">serve</a></li>
 </ul>
 </li>
@@ -2237,9 +2315,9 @@ Please refer to <cite>Performance Benchmarking with `trtllm-serve</cite> &lt;<a 
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on October 09, 2026.</p>
+  <p>Last updated on October 19, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/cc63e66">cc63e66</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/0372799">0372799</a>.</p>
   
 </div></div>
       

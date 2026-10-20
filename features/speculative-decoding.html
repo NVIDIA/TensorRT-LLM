@@ -62,7 +62,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.23.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc0';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc1';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -79,7 +79,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="color-scheme" content="light dark"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.4.0rc0" />
+  <meta name="docsearch:version" content="1.4.0rc1" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -444,6 +444,9 @@
 <li class="toctree-l1 has-children"><a class="reference internal" href="../llm-api/reference.html">API Reference</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/LLM.html">LLM</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/AsyncLLM.html">AsyncLLM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/ExecutorMemoryType.html">ExecutorMemoryType</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/RuntimeMemoryStatus.html">RuntimeMemoryStatus</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SleepConfig.html">SleepConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/MultimodalEncoder.html">MultimodalEncoder</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CompletionOutput.html">CompletionOutput</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/RequestOutput.html">RequestOutput</a></li>
@@ -533,6 +536,7 @@
 <li class="toctree-l1 current active"><a aria-current="page" class="current reference internal" href="#">Speculative Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="checkpoint-loading.html">Checkpoint Loading</a></li>
 <li class="toctree-l1"><a class="reference internal" href="model-express.html">ModelExpress (MX) Checkpoint Loading</a></li>
+<li class="toctree-l1"><a class="reference internal" href="sleep-wakeup.html">Runtime Memory Checkpointing (Prototype)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="ray-orchestrator.html">Ray Orchestrator (Prototype)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="torch_compile_and_piecewise_cuda_graph.html">Torch Compile &amp; Prefill CUDA Graph</a></li>
 <li class="toctree-l1"><a class="reference internal" href="helix.html">Helix Parallelism</a></li>
@@ -551,6 +555,10 @@
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/overview.html">Architecture Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/perf-analysis.html">Performance Analysis</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/perf-benchmarking.html">TensorRT LLM Benchmarking</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../developer-guide/moe-perf-guide.html">MoE Performance Guide</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../developer-guide/moe-perf-dashboard.html">MoE Perf Dashboard</a></li>
+</ul>
+</details></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/ci-overview.html">Continuous Integration Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/dev-containers.html">Using Dev Containers</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/api-change.html">LLM API Change Guide</a></li>
@@ -562,6 +570,7 @@
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog30_KV_Cache_Compression_in_TensorRT-LLM.html">KV Cache Compression in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog29_GVR_V2_Self_Sampling_Exact_TopK_for_Sparse_Attention.html">GVR V2: Self-Sampling and Multi-Thresholding for Faster Exact Top-K</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog28_Accelerating_Video_Generation_with_GEMM_Quantization_Attention_Quantization_and_Skip_Softmax_Attention_in_TensorRT-LLM.html">Accelerating Video Generation with GEMM Quantization, Attention Quantization and Skip Softmax Attention in TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog27_Evaluating_Agentic_Serving_with_Trace_Replay_and_Job_Level_Metrics.html">Evaluating Agentic Serving with Trace Replay and Job-Level Metrics</a></li>
@@ -814,6 +823,30 @@ By default, each request uses a single sequence (linear chain) of draft tokens w
 </pre></div>
 </div>
 <p><a class="reference external" href="https://inco.ai/blog/dflash2/">DFlash 2</a> is also supported. The same <code class="docutils literal notranslate"><span class="pre">DFlashDecodingConfig</span></code> can be used for DFlash 2; no extra arguments are required.</p>
+<p><a class="reference external" href="https://arxiv.org/abs/2608.20530">LiLiCorr</a> checkpoints use the same
+<code class="docutils literal notranslate"><span class="pre">DFlashDecodingConfig</span></code>. The draft checkpoint selects LiLiCorr through
+<code class="docutils literal notranslate"><span class="pre">architectures:</span> <span class="pre">[&quot;LiLiCorrDraftModel&quot;]</span></code>, <code class="docutils literal notranslate"><span class="pre">dflash_config.projector_type:</span> <span class="pre">&quot;lilicorr&quot;</span></code>,
+or <code class="docutils literal notranslate"><span class="pre">dflash_config.lilicorr_enabled:</span> <span class="pre">true</span></code>.
+Its candidate scorer correlates the per-position top-k proposals before target
+verification. Load the matching target separately through <code class="docutils literal notranslate"><span class="pre">LLM(model=...)</span></code> and
+set <code class="docutils literal notranslate"><span class="pre">speculative_model</span></code> to the drafter. Both models must share the token vocabulary
+and embedding width; the captured target layers must match the drafter’s training.
+The drafter currently uses the generic GQA DFlash backbone; MLA and Laguna-specific
+draft layers require separate adapters.</p>
+<p>Set <code class="docutils literal notranslate"><span class="pre">max_draft_len</span></code> to at most <code class="docutils literal notranslate"><span class="pre">block_size</span> <span class="pre">-</span> <span class="pre">1</span></code>; for an eight-position checkpoint,
+use up to seven draft tokens. Projection quantization follows the checkpoint’s
+global or per-module metadata, including excluded modules. The loader accepts
+dense, FP8, NVFP4 and W4A16 NVFP4 projections. Backbone QKV projections must remain
+unquantized; checkpoints with quantized backbone QKV are rejected during loading.
+It preserves a checkpoint-owned output head when <code class="docutils literal notranslate"><span class="pre">has_own_lm_head</span></code> is set. Grouped
+convolutions are loaded when declared by the checkpoint. Draft attention is
+non-causal, including symmetric windows on sliding-attention layers; causal
+LiLiCorr checkpoints are rejected. The draft attention backend retains the
+hardware restrictions listed above.</p>
+<p>LiLiCorr builds proposal rows along a greedy candidate path. With stochastic draft
+sampling, a sampled token can differ from the predecessor used to score the next
+row. Rejection sampling uses the actual proposal distributions, preserving the
+target distribution, but acceptance can decrease.</p>
 </section>
 <section id="user-provided-drafting">
 <h3>User-provided drafting<a class="headerlink" href="#user-provided-drafting" title="Link to this heading">#</a></h3>
@@ -1086,9 +1119,9 @@ Existing workflows using <code class="docutils literal notranslate"><span class=
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on October 09, 2026.</p>
+  <p>Last updated on October 19, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/cc63e66">cc63e66</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/0372799">0372799</a>.</p>
   
 </div></div>
       

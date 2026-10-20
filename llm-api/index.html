@@ -62,7 +62,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.23.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc0';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc1';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -79,7 +79,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="color-scheme" content="light dark"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.4.0rc0" />
+  <meta name="docsearch:version" content="1.4.0rc1" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -444,6 +444,9 @@
 <li class="toctree-l1 has-children"><a class="reference internal" href="reference.html">API Reference</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l2"><a class="reference internal" href="reference/LLM.html">LLM</a></li>
 <li class="toctree-l2"><a class="reference internal" href="reference/AsyncLLM.html">AsyncLLM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="reference/ExecutorMemoryType.html">ExecutorMemoryType</a></li>
+<li class="toctree-l2"><a class="reference internal" href="reference/RuntimeMemoryStatus.html">RuntimeMemoryStatus</a></li>
+<li class="toctree-l2"><a class="reference internal" href="reference/SleepConfig.html">SleepConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="reference/MultimodalEncoder.html">MultimodalEncoder</a></li>
 <li class="toctree-l2"><a class="reference internal" href="reference/CompletionOutput.html">CompletionOutput</a></li>
 <li class="toctree-l2"><a class="reference internal" href="reference/RequestOutput.html">RequestOutput</a></li>
@@ -533,6 +536,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../features/speculative-decoding.html">Speculative Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/checkpoint-loading.html">Checkpoint Loading</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/model-express.html">ModelExpress (MX) Checkpoint Loading</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/sleep-wakeup.html">Runtime Memory Checkpointing (Prototype)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/ray-orchestrator.html">Ray Orchestrator (Prototype)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/torch_compile_and_piecewise_cuda_graph.html">Torch Compile &amp; Prefill CUDA Graph</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/helix.html">Helix Parallelism</a></li>
@@ -551,6 +555,10 @@
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/overview.html">Architecture Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/perf-analysis.html">Performance Analysis</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/perf-benchmarking.html">TensorRT LLM Benchmarking</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../developer-guide/moe-perf-guide.html">MoE Performance Guide</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../developer-guide/moe-perf-dashboard.html">MoE Perf Dashboard</a></li>
+</ul>
+</details></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/ci-overview.html">Continuous Integration Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/dev-containers.html">Using Dev Containers</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer-guide/api-change.html">LLM API Change Guide</a></li>
@@ -562,6 +570,7 @@
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog30_KV_Cache_Compression_in_TensorRT-LLM.html">KV Cache Compression in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog29_GVR_V2_Self_Sampling_Exact_TopK_for_Sparse_Attention.html">GVR V2: Self-Sampling and Multi-Thresholding for Faster Exact Top-K</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog28_Accelerating_Video_Generation_with_GEMM_Quantization_Attention_Quantization_and_Skip_Softmax_Attention_in_TensorRT-LLM.html">Accelerating Video Generation with GEMM Quantization, Attention Quantization and Skip Softmax Attention in TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog27_Evaluating_Agentic_Serving_with_Trace_Replay_and_Job_Level_Metrics.html">Evaluating Agentic Serving with Trace Replay and Job-Level Metrics</a></li>
@@ -701,7 +710,7 @@
 <span class="linenos">33</span>    <span class="n">main</span><span class="p">()</span>
 </pre></div>
 </div>
-<p>For more advanced usage including distributed inference, multimodal, and speculative decoding, please refer to this <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/cc63e66/examples/llm-api/README.md">README</a>.</p>
+<p>For more advanced usage including distributed inference, multimodal, and speculative decoding, please refer to this <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/0372799/examples/llm-api/README.md">README</a>.</p>
 </section>
 <section id="model-input">
 <h2>Model Input<a class="headerlink" href="#model-input" title="Link to this heading">#</a></h2>
@@ -990,6 +999,71 @@ The <code class="docutils literal notranslate"><span class="pre">py_executor.mod
 <p>Because the LLM API relies on the <code class="docutils literal notranslate"><span class="pre">mpi4py</span></code> library, put the LLM class in a function and protect the main entrypoint to the program under the <code class="docutils literal notranslate"><span class="pre">__main__</span></code> namespace to avoid a <a class="reference external" href="https://mpi4py.readthedocs.io/en/stable/mpi4py.futures.html#mpipoolexecutor">recursive spawn</a> process in <code class="docutils literal notranslate"><span class="pre">mpi4py</span></code>.</p>
 <p>This limitation is applicable for multi-GPU inference only.</p>
 </section>
+<section id="unified-compiled-artifact-cache">
+<h3>Unified compiled-artifact cache<a class="headerlink" href="#unified-compiled-artifact-cache" title="Link to this heading">#</a></h3>
+<p>Set <code class="docutils literal notranslate"><span class="pre">TRTLLM_CACHE_DIR</span></code> before importing TensorRT-LLM to place its compiled
+artifact caches under a single root. TensorRT-LLM supplies the following
+defaults. Except for the isolation behavior described below, an individually
+configured environment variable takes precedence.</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Environment variable</p></th>
+<th class="head"><p>Default under <code class="docutils literal notranslate"><span class="pre">TRTLLM_CACHE_DIR</span></code></p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">TLLM_AUTOTUNER_CACHE_PATH</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">autotuner/cache.json</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">TORCHINDUCTOR_CACHE_DIR</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">inductor</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">TRITON_CACHE_DIR</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">triton</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">TORCH_EXTENSIONS_DIR</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">torch_extensions</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">FLASHINFER_WORKSPACE_BASE</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">flashinfer</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">CUTE_DSL_CACHE_DIR</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">cute_dsl</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">DG_JIT_CACHE_DIR</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">deep_gemm</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">TRTLLM_DG_CACHE_DIR</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">trtllm_deep_gemm</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">CUDA_CACHE_PATH</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">cuda</span></code></p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>The directories are created by their respective consumers when needed.
+TensorRT-LLM does not add cache locking, cleanup, or per-rank isolation for
+these unified defaults (with the exceptions described below). The
+configured values are forwarded to dynamically spawned MPI workers.</p>
+<p>Configuring <code class="docutils literal notranslate"><span class="pre">TRTLLM_DG_CACHE_DIR</span></code>, either directly or through
+<code class="docutils literal notranslate"><span class="pre">TRTLLM_CACHE_DIR</span></code>, also defaults <code class="docutils literal notranslate"><span class="pre">TRTLLM_DG_JIT_DUMP_CUBIN</span></code> to <code class="docutils literal notranslate"><span class="pre">1</span></code> so its
+NVRTC-generated cubins are persisted. An explicitly configured dump setting
+still takes precedence. See the
+<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/0372799/examples/models/core/deepseek_v3/README.md">DeepGEMM environment variables</a>
+for details.</p>
+<p>Note that, when <code class="docutils literal notranslate"><span class="pre">TRTLLM_CACHE_DIR</span></code> is set, the FlashInfer workspace isolation
+mechanism described below still applies. This will prevent race conditions
+during cache read/writes, at the cost of limiting cache sharing. To disable
+workspace isolation, either set <code class="docutils literal notranslate"><span class="pre">TRTLLM_FLASHINFER_WORKSPACE_PER_PROCESS=0</span></code>,
+or set <code class="docutils literal notranslate"><span class="pre">FLASHINFER_WORKSPACE_BASE</span></code> to a different path from the one assigned
+under <code class="docutils literal notranslate"><span class="pre">TRTLLM_CACHE_DIR</span></code>.</p>
+<p>Ray workers treat <code class="docutils literal notranslate"><span class="pre">DG_JIT_CACHE_DIR</span></code> equal to
+<code class="docutils literal notranslate"><span class="pre">&lt;TRTLLM_CACHE_DIR&gt;/deep_gemm</span></code> as unified-cache-managed and isolate it by rank
+and GPU, even when that value was set explicitly. Other explicit values are
+preserved. Set <code class="docutils literal notranslate"><span class="pre">TRTLLM_DEEP_GEMM_CACHE_PER_PROCESS=0</span></code> to preserve and share the
+unified path.</p>
+</section>
 <section id="flashinfer-jit-workspaces-for-mpi-workers">
 <h3>FlashInfer JIT workspaces for MPI workers<a class="headerlink" href="#flashinfer-jit-workspaces-for-mpi-workers" title="Link to this heading">#</a></h3>
 <p><code class="docutils literal notranslate"><span class="pre">trtllm-llmapi-launch</span></code> ranks and dynamically spawned <code class="docutils literal notranslate"><span class="pre">MpiPoolSession</span></code> workers
@@ -1008,7 +1082,7 @@ artifacts.</p>
 process-unique temporary workspace that is removed, artifacts included, when
 the process exits.</p>
 <p>An explicitly configured <code class="docutils literal notranslate"><span class="pre">FLASHINFER_WORKSPACE_BASE</span></code> takes precedence in both
-launch modes. An explicitly configured <code class="docutils literal notranslate"><span class="pre">FLASHINFER_CUBIN_DIR</span></code> is propagated
+launch modes, while setting <code class="docutils literal notranslate"><span class="pre">TRTLLM_CACHE_DIR</span></code> does not. An explicitly configured <code class="docutils literal notranslate"><span class="pre">FLASHINFER_CUBIN_DIR</span></code> is propagated
 unchanged to every rank and is the way to share downloaded artifacts between
 ranks; populate it before the multi-rank launch, either by installing the
 <code class="docutils literal notranslate"><span class="pre">flashinfer-cubin</span></code> package matching <code class="docutils literal notranslate"><span class="pre">flashinfer-python</span></code> or with a single-rank
@@ -1099,6 +1173,7 @@ instead of being downloaded concurrently into the shared directory.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#runtimeerror-only-rank-0-can-start-multi-node-session-got-1">RuntimeError: only rank 0 can start multi-node session, got 1</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#hang-issue-on-slurm-node">Hang issue on Slurm Node</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mpi-abort-was-invoked-on-rank-1-in-communicator-mpi-comm-world-with-errorcode-1">MPI_ABORT was invoked on rank 1 in communicator MPI_COMM_WORLD with errorcode 1.</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#unified-compiled-artifact-cache">Unified compiled-artifact cache</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#flashinfer-jit-workspaces-for-mpi-workers">FlashInfer JIT workspaces for MPI workers</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#cannot-quit-after-generation">Cannot quit after generation</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#single-node-hanging-when-using-docker-run-net-host">Single node hanging when using <code class="docutils literal notranslate"><span class="pre">docker</span> <span class="pre">run</span> <span class="pre">--net=host</span></code></a></li>
@@ -1195,9 +1270,9 @@ instead of being downloaded concurrently into the shared directory.</p>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on October 09, 2026.</p>
+  <p>Last updated on October 19, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/cc63e66">cc63e66</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/0372799">0372799</a>.</p>
   
 </div></div>
       

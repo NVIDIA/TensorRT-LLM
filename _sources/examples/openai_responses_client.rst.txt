@@ -2,7 +2,7 @@ OpenAI Responses Client
 =======================
 Refer to the `trtllm-serve documentation <https://nvidia.github.io/TensorRT-LLM/commands/trtllm-serve.html>`_ for starting a server.
 
-Source https://github.com/NVIDIA/TensorRT-LLM/blob/cc63e66daf52644f1441e117bb7ba67d20566016/examples/serve/openai_responses_client.py.
+Source https://github.com/NVIDIA/TensorRT-LLM/blob/0372799d1543ef5920c1318b829cf127800dbcb9/examples/serve/openai_responses_client.py.
 
 .. literalinclude:: ../../../examples/serve/openai_responses_client.py
     :lines: 2-15

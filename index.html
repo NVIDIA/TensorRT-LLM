@@ -64,7 +64,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.23.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc0';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.4.0rc1';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -80,7 +80,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="color-scheme" content="light dark"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.4.0rc0" />
+  <meta name="docsearch:version" content="1.4.0rc1" />
   
     
     <script src="_static/searchtools.js"></script>
@@ -445,6 +445,9 @@
 <li class="toctree-l1 has-children"><a class="reference internal" href="llm-api/reference.html">API Reference</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l2"><a class="reference internal" href="llm-api/reference/LLM.html">LLM</a></li>
 <li class="toctree-l2"><a class="reference internal" href="llm-api/reference/AsyncLLM.html">AsyncLLM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="llm-api/reference/ExecutorMemoryType.html">ExecutorMemoryType</a></li>
+<li class="toctree-l2"><a class="reference internal" href="llm-api/reference/RuntimeMemoryStatus.html">RuntimeMemoryStatus</a></li>
+<li class="toctree-l2"><a class="reference internal" href="llm-api/reference/SleepConfig.html">SleepConfig</a></li>
 <li class="toctree-l2"><a class="reference internal" href="llm-api/reference/MultimodalEncoder.html">MultimodalEncoder</a></li>
 <li class="toctree-l2"><a class="reference internal" href="llm-api/reference/CompletionOutput.html">CompletionOutput</a></li>
 <li class="toctree-l2"><a class="reference internal" href="llm-api/reference/RequestOutput.html">RequestOutput</a></li>
@@ -534,6 +537,7 @@
 <li class="toctree-l1"><a class="reference internal" href="features/speculative-decoding.html">Speculative Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="features/checkpoint-loading.html">Checkpoint Loading</a></li>
 <li class="toctree-l1"><a class="reference internal" href="features/model-express.html">ModelExpress (MX) Checkpoint Loading</a></li>
+<li class="toctree-l1"><a class="reference internal" href="features/sleep-wakeup.html">Runtime Memory Checkpointing (Prototype)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="features/ray-orchestrator.html">Ray Orchestrator (Prototype)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="features/torch_compile_and_piecewise_cuda_graph.html">Torch Compile &amp; Prefill CUDA Graph</a></li>
 <li class="toctree-l1"><a class="reference internal" href="features/helix.html">Helix Parallelism</a></li>
@@ -552,6 +556,10 @@
 <li class="toctree-l1"><a class="reference internal" href="developer-guide/overview.html">Architecture Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="developer-guide/perf-analysis.html">Performance Analysis</a></li>
 <li class="toctree-l1"><a class="reference internal" href="developer-guide/perf-benchmarking.html">TensorRT LLM Benchmarking</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="developer-guide/moe-perf-guide.html">MoE Performance Guide</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="developer-guide/moe-perf-dashboard.html">MoE Perf Dashboard</a></li>
+</ul>
+</details></li>
 <li class="toctree-l1"><a class="reference internal" href="developer-guide/ci-overview.html">Continuous Integration Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="developer-guide/dev-containers.html">Using Dev Containers</a></li>
 <li class="toctree-l1"><a class="reference internal" href="developer-guide/api-change.html">LLM API Change Guide</a></li>
@@ -563,6 +571,7 @@
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="blogs/tech_blog/blog30_KV_Cache_Compression_in_TensorRT-LLM.html">KV Cache Compression in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="blogs/tech_blog/blog29_GVR_V2_Self_Sampling_Exact_TopK_for_Sparse_Attention.html">GVR V2: Self-Sampling and Multi-Thresholding for Faster Exact Top-K</a></li>
 <li class="toctree-l1"><a class="reference internal" href="blogs/tech_blog/blog28_Accelerating_Video_Generation_with_GEMM_Quantization_Attention_Quantization_and_Skip_Softmax_Attention_in_TensorRT-LLM.html">Accelerating Video Generation with GEMM Quantization, Attention Quantization and Skip Softmax Attention in TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="blogs/tech_blog/blog27_Evaluating_Agentic_Serving_with_Trace_Replay_and_Job_Level_Metrics.html">Evaluating Agentic Serving with Trace Replay and Job-Level Metrics</a></li>
@@ -724,6 +733,7 @@
 <li class="toctree-l2"><a class="reference internal" href="models/visual-generation.html#quick-start">Quick Start</a></li>
 <li class="toctree-l2"><a class="reference internal" href="models/visual-generation.html#minimax-h3-notes">MiniMax-H3 Notes</a></li>
 <li class="toctree-l2"><a class="reference internal" href="models/visual-generation.html#optimizations">Optimizations</a></li>
+<li class="toctree-l2"><a class="reference internal" href="models/visual-generation.html#experimental-features">Experimental Features</a></li>
 <li class="toctree-l2"><a class="reference internal" href="models/visual-generation.html#developer-guide">Developer Guide</a></li>
 </ul>
 </li>
@@ -925,6 +935,16 @@
 <li class="toctree-l2"><a class="reference internal" href="features/model-express.html#notes-and-limitations">Notes and Limitations</a></li>
 </ul>
 </li>
+<li class="toctree-l1"><a class="reference internal" href="features/sleep-wakeup.html">Runtime Memory Checkpointing (Prototype)</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="features/sleep-wakeup.html#python-api">Python API</a></li>
+<li class="toctree-l2"><a class="reference internal" href="features/sleep-wakeup.html#memory-tags">Memory tags</a></li>
+<li class="toctree-l2"><a class="reference internal" href="features/sleep-wakeup.html#restore-modes">Restore modes</a></li>
+<li class="toctree-l2"><a class="reference internal" href="features/sleep-wakeup.html#gpu-memory-service-weights">GPU Memory Service weights</a></li>
+<li class="toctree-l2"><a class="reference internal" href="features/sleep-wakeup.html#failure-and-lifecycle-behavior">Failure and lifecycle behavior</a></li>
+<li class="toctree-l2"><a class="reference internal" href="features/sleep-wakeup.html#control-plane-http-endpoints">Control-plane HTTP endpoints</a></li>
+<li class="toctree-l2"><a class="reference internal" href="features/sleep-wakeup.html#implementation-overview">Implementation overview</a></li>
+</ul>
+</li>
 <li class="toctree-l1"><a class="reference internal" href="features/ray-orchestrator.html">Ray Orchestrator (Prototype)</a><ul>
 <li class="toctree-l2"><a class="reference internal" href="features/ray-orchestrator.html#motivation">Motivation</a></li>
 <li class="toctree-l2"><a class="reference internal" href="features/ray-orchestrator.html#basic-usage">Basic Usage</a></li>
@@ -953,6 +973,7 @@
 <li class="toctree-l2"><a class="reference internal" href="features/kv-cache-connector.html#use-cases">Use Cases</a></li>
 <li class="toctree-l2"><a class="reference internal" href="features/kv-cache-connector.html#architecture">Architecture</a></li>
 <li class="toctree-l2"><a class="reference internal" href="features/kv-cache-connector.html#example-implementation">Example Implementation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="features/kv-cache-connector.html#mooncake-store">Mooncake store</a></li>
 </ul>
 </li>
 <li class="toctree-l1"><a class="reference internal" href="features/sparse-attention.html">Sparse Attention</a><ul>
@@ -1001,6 +1022,14 @@
 <li class="toctree-l2"><a class="reference internal" href="developer-guide/perf-benchmarking.html#throughput-benchmarking">Throughput Benchmarking</a></li>
 <li class="toctree-l2"><a class="reference internal" href="developer-guide/perf-benchmarking.html#online-serving-benchmarking">Online Serving Benchmarking</a></li>
 <li class="toctree-l2"><a class="reference internal" href="developer-guide/perf-benchmarking.html#startup-metrics">Startup Metrics</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="developer-guide/moe-perf-guide.html">MoE Performance Guide</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="developer-guide/moe-perf-guide.html#moe-architecture">MoE Architecture</a></li>
+<li class="toctree-l2"><a class="reference internal" href="developer-guide/moe-perf-guide.html#recommended-configuration">Recommended Configuration</a></li>
+<li class="toctree-l2"><a class="reference internal" href="developer-guide/moe-perf-guide.html#tuning-a-specific-workload">Tuning a Specific Workload</a></li>
+<li class="toctree-l2"><a class="reference internal" href="developer-guide/moe-perf-guide.html#advanced-techniques">Advanced Techniques</a></li>
+<li class="toctree-l2"><a class="reference internal" href="developer-guide/moe-perf-guide.html#appendix">Appendix</a></li>
 </ul>
 </li>
 <li class="toctree-l1"><a class="reference internal" href="developer-guide/ci-overview.html">Continuous Integration Overview</a><ul>
@@ -1081,6 +1110,16 @@
 <div class="toctree-wrapper compound">
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul>
+<li class="toctree-l1"><a class="reference internal" href="blogs/tech_blog/blog30_KV_Cache_Compression_in_TensorRT-LLM.html">KV Cache Compression in TensorRT LLM</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="blogs/tech_blog/blog30_KV_Cache_Compression_in_TensorRT-LLM.html#introduction-and-motivation">Introduction and Motivation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="blogs/tech_blog/blog30_KV_Cache_Compression_in_TensorRT-LLM.html#overview-of-kv-cache-compression-in-tensorrt-llm">Overview of KV Cache Compression in TensorRT LLM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="blogs/tech_blog/blog30_KV_Cache_Compression_in_TensorRT-LLM.html#kv-cache-compression-framework-design">KV Cache Compression Framework Design</a></li>
+<li class="toctree-l2"><a class="reference internal" href="blogs/tech_blog/blog30_KV_Cache_Compression_in_TensorRT-LLM.html#algorithm-implementations">Algorithm Implementations</a></li>
+<li class="toctree-l2"><a class="reference internal" href="blogs/tech_blog/blog30_KV_Cache_Compression_in_TensorRT-LLM.html#evaluation">Evaluation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="blogs/tech_blog/blog30_KV_Cache_Compression_in_TensorRT-LLM.html#summary-and-future-work">Summary and Future Work</a></li>
+<li class="toctree-l2"><a class="reference internal" href="blogs/tech_blog/blog30_KV_Cache_Compression_in_TensorRT-LLM.html#references">References</a></li>
+</ul>
+</li>
 <li class="toctree-l1"><a class="reference internal" href="blogs/tech_blog/blog29_GVR_V2_Self_Sampling_Exact_TopK_for_Sparse_Attention.html">GVR V2: Self-Sampling and Multi-Thresholding for Faster Exact Top-K</a><ul>
 <li class="toctree-l2"><a class="reference internal" href="blogs/tech_blog/blog29_GVR_V2_Self_Sampling_Exact_TopK_for_Sparse_Attention.html#motivation-and-design-foundations">Motivation and Design Foundations</a></li>
 <li class="toctree-l2"><a class="reference internal" href="blogs/tech_blog/blog29_GVR_V2_Self_Sampling_Exact_TopK_for_Sparse_Attention.html#self-sampling-and-multi-thresholding">Self-Sampling and Multi-Thresholding</a></li>
@@ -1588,9 +1627,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on October 09, 2026.</p>
+  <p>Last updated on October 19, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/cc63e66">cc63e66</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/0372799">0372799</a>.</p>
   
 </div></div>
       
