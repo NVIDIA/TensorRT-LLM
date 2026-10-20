@@ -34,10 +34,10 @@ def assert_parity(actual: torch.Tensor, expected: torch.Tensor) -> None:
 def test_indexed_prefill_matches_reference(
     heads: int, lengths: list[int], distribution: str
 ) -> None:
-    from tensorrt_llm._torch.custom_ops.cute_dsl_kimi_k3_custom_ops import kda_prefill
     from tensorrt_llm._torch.attention.kernels.blackwell.kimi_k3_kda.kda_chunked_bt16 import (
         kda_chunked_mma_reference,
     )
+    from tensorrt_llm._torch.custom_ops.cute_dsl_kimi_k3_custom_ops import kda_prefill
 
     torch.manual_seed(1901)
     total, n = sum(lengths), len(lengths)

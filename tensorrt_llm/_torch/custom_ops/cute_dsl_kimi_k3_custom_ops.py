@@ -169,7 +169,9 @@ def kda_prefill(
         aligned_beta = aligned_beta.clone(memory_format=torch.contiguous_format)
     output = torch.empty_like(q)
     if use_small_bh:
-        from ..attention.kernels.blackwell.kimi_k3_kda.kda_chunked_bt16_small_bh import chunk_kda_fwd
+        from ..attention.kernels.blackwell.kimi_k3_kda.kda_chunked_bt16_small_bh import (
+            chunk_kda_fwd,
+        )
 
         with torch.cuda.device(device):
             chunk_kda_fwd(
