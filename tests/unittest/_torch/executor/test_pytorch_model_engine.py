@@ -39,6 +39,8 @@ from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner import \
     PrefillCompiledModel
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.warmup import \
     DecoderWarmup
+from tensorrt_llm._torch.pyexecutor.engine.runners.encoder_decoder import \
+    EncoderDecoderRunner
 from tensorrt_llm._torch.pyexecutor.engine.runners.interface import \
     PreparedInputs
 from tensorrt_llm._torch.pyexecutor.engine.runners.pooling import PoolingRunner
@@ -80,17 +82,80 @@ from tensorrt_llm.mapping import CpType, Mapping
 _TWO_MODEL_SPEC_MODE = SimpleNamespace(use_one_engine=lambda: False)
 
 
-def _input_preparer() -> DecoderInputPreparer:
-    return DecoderInputPreparer(buffers=None,
-                                config=SimpleNamespace(is_spec_decode=False),
-                                mapping=Mapping(),
-                                dist=None,
-                                model=None,
-                                get_runtime_tokens_per_gen_step=None,
-                                iter_states={},
-                                lora=None,
-                                use_beam_search=False,
-                                steady_gen_cache_supported=True)
+def _input_preparer(*, without_config: bool = False) -> DecoderInputPreparer:
+    return DecoderInputPreparer(
+        buffers=None,
+        config=(None if without_config else SimpleNamespace(
+            is_spec_decode=False, spec_config=None)),
+        mapping=Mapping(),
+        dist=None,
+        model=None,
+        get_runtime_tokens_per_gen_step=None,
+        iter_states={},
+        lora=None,
+        use_beam_search=False,
+        steady_gen_cache_supported=True)
+
+
+@pytest.mark.parametrize("runner_type,graphs_path", [
+    (DecoderRunner,
+     "tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner.DecoderCudaGraphs"
+     ),
+    (EncoderDecoderRunner,
+     "tensorrt_llm._torch.pyexecutor.engine.runners.encoder_decoder.EncoderDecoderCudaGraphs"
+     )
+])
+def test_cuda_graph_factory_preserves_input_preparer(runner_type, graphs_path):
+    runner = Mock()
+    runner._inputs = object()
+    runner._cuda_graphs_kwargs.side_effect = lambda: DecoderRunner._cuda_graphs_kwargs(
+        runner)
+
+    with patch(graphs_path) as graphs_type:
+        graphs = runner_type._make_cuda_graphs(runner)
+
+    graphs_type.assert_called_once()
+    assert graphs_type.call_args.kwargs["inputs"] is runner._inputs
+    assert graphs_type.call_args.kwargs[
+        "warmup_inputs"] is runner._buffers.input_ids_cuda
+    assert graphs is graphs_type.return_value
+
+
+@pytest.mark.parametrize("enabled,fused", [(None, False), (False, True),
+                                           (True, False), (True, True)])
+def test_input_preparer_configured_confidence_flags(enabled, fused):
+    spec_config = (None if enabled is None else SimpleNamespace(
+        enable_confidence_scheduling=enabled,
+        enable_fused_confidence_scheduler=fused))
+    config = SimpleNamespace(is_spec_decode=False, spec_config=spec_config)
+    inputs = DecoderInputPreparer(buffers=None,
+                                  config=config,
+                                  mapping=Mapping(),
+                                  dist=None,
+                                  model=None,
+                                  get_runtime_tokens_per_gen_step=None,
+                                  iter_states={},
+                                  lora=None,
+                                  use_beam_search=False,
+                                  steady_gen_cache_supported=True)
+
+    assert inputs._config is config
+    assert inputs._dspark_confidence_enabled is bool(enabled)
+    assert inputs._dspark_trims_submitted_tokens is bool(enabled)
+    assert inputs._dspark_device_windows is bool(enabled and fused)
+    assert inputs.previous_verify_lens == ([] if enabled else None)
+    assert inputs.has_previous_device_draft is False
+
+
+def test_input_preparer_without_config_keeps_confidence_disabled():
+    inputs = _input_preparer(without_config=True)
+
+    assert inputs._config is None
+    assert inputs._dspark_confidence_enabled is False
+    assert inputs._dspark_trims_submitted_tokens is False
+    assert inputs._dspark_device_windows is False
+    assert inputs.previous_verify_lens is None
+    assert inputs.has_previous_device_draft is False
 
 
 class TestCachedKvTokenLogging(unittest.TestCase):

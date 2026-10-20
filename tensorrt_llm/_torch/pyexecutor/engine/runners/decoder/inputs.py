@@ -356,7 +356,7 @@ class DecoderInputPreparer:
         self._prepare_inputs_event: torch.cuda.Event | None = None
         self._gather_ids_buffer = (
             DeviceCopyBuffer(buffers.gather_ids_cuda, pin_memory=prefer_pinned())
-            if config.is_spec_decode
+            if config is not None and config.is_spec_decode
             else None
         )
         # Reuse device indices while the scheduled batch stays unchanged.
@@ -364,7 +364,7 @@ class DecoderInputPreparer:
         self._staged_previous_pos_indices: list[int] | None = None
         self._step_input_gather: spec_step_copies.StepInputGather | None = (
             spec_step_copies.StepInputGather()
-            if config.is_spec_decode and spec_step_copies.is_supported()
+            if config is not None and config.is_spec_decode and spec_step_copies.is_supported()
             else None
         )
         # Steady-state generation-only prepare cache (non-speculative overlap
@@ -380,7 +380,7 @@ class DecoderInputPreparer:
             os.getenv("TLLM_LOG_CACHED_KV_TOKENS_PER_REQ", "0") == "1"
         )
 
-        spec_config = self._config.spec_config
+        spec_config = self._config.spec_config if self._config is not None else None
         self._dspark_confidence_enabled = bool(
             spec_config is not None and getattr(spec_config, "enable_confidence_scheduling", False)
         )
@@ -1972,23 +1972,27 @@ class DecoderInputPreparer:
                     if host.previous_batch_token_start is not None
                     else previous_begin * runtime_tokens_per_gen_step
                 )
-                if is_ragged_gen or step_gather is None or not step_gather.gather(
-                    new_tokens_device,
-                    next_draft_tokens_device,
-                    new_tokens_lens_device,
-                    self._buffers.previous_batch_indices_cuda,
-                    self._buffers.previous_pos_indices_cuda,
-                    previous_batch_len,
-                    runtime_tokens_per_gen_step,
-                    runtime_draft_token_buffer_width,
-                    self._buffers.input_ids_cuda,
-                    num_tokens,
-                    self._buffers.draft_tokens_cuda,
-                    num_draft_tokens,
-                    self._buffers.previous_pos_id_offsets_cuda,
-                    pos_offsets_start,
-                    self._buffers.previous_kv_lens_offsets_cuda,
-                    previous_begin,
+                if (
+                    is_ragged_gen
+                    or step_gather is None
+                    or not step_gather.gather(
+                        new_tokens_device,
+                        next_draft_tokens_device,
+                        new_tokens_lens_device,
+                        self._buffers.previous_batch_indices_cuda,
+                        self._buffers.previous_pos_indices_cuda,
+                        previous_batch_len,
+                        runtime_tokens_per_gen_step,
+                        runtime_draft_token_buffer_width,
+                        self._buffers.input_ids_cuda,
+                        num_tokens,
+                        self._buffers.draft_tokens_cuda,
+                        num_draft_tokens,
+                        self._buffers.previous_pos_id_offsets_cuda,
+                        pos_offsets_start,
+                        self._buffers.previous_kv_lens_offsets_cuda,
+                        previous_begin,
+                    )
                 ):
                     # previous input ids
                     if is_ragged_gen:

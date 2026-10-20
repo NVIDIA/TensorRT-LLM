@@ -239,7 +239,7 @@ class DecoderRunner(ScheduledModelRunner):
 
     def _make_cuda_graphs(self) -> DecoderCudaGraphs:
         """Build the CUDA graph component; call after the input preparer."""
-        return DecoderCudaGraphs(**self._cuda_graphs_kwargs())
+        return DecoderCudaGraphs(**self._cuda_graphs_kwargs(), inputs=self._inputs)
 
     def _dummy_requests_kwargs(self) -> dict[str, Any]:
         return dict(
@@ -286,7 +286,6 @@ class DecoderRunner(ScheduledModelRunner):
             torch_compile_bypass=self._bypass_torch_compile,
             context_promotion_supported=self._context_graph_promotion_supported,
             warmup_inputs=self._buffers.input_ids_cuda,
-            inputs=self._inputs,
         )
 
     @property

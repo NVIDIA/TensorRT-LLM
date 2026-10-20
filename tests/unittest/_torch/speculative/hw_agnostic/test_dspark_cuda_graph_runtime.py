@@ -42,7 +42,7 @@ class _Batch:
 
 def _runner_stub(runner_type=DSparkCUDAGraphRunner):
     runner = runner_type.__new__(runner_type)
-    runner.clear = lambda: None
+    runner.clear = lambda **_kwargs: None
     return runner
 
 
@@ -220,11 +220,11 @@ def test_decoder_selects_confidence_graph_subclass_only_when_enabled(
     decoder = SimpleNamespace(
         _dspark_confidence_enabled=confidence_enabled,
         _cuda_graph_runner_config=lambda: config,
-        model=SimpleNamespace(register_cuda_graph_pre_replay_hooks=registered.append),
+        _model=SimpleNamespace(register_cuda_graph_pre_replay_hooks=registered.append),
     )
 
     runner = DecoderRunner._initialize_cuda_graph_runner(decoder)
-    runner.clear = lambda: None
+    runner.clear = lambda **_kwargs: None
 
     expected_type = DSparkCUDAGraphRunner if confidence_enabled else CUDAGraphRunner
     assert type(runner) is expected_type
