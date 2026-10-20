@@ -2161,7 +2161,7 @@ class PyExecutor:
         # FC12 runners are rank-local and may be released only after every
         # model-owned collective resource has been closed.
         try:
-            from ..cute_dsl_kernels.megamoe_shared_fc12 import \
+            from ..moe.kernels.megamoe_shared_fc12 import \
                 release_shared_fc12_cache
 
             device = self.execution_stream.device
