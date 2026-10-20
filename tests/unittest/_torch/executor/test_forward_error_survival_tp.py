@@ -24,6 +24,7 @@ Not wired into any L0 test list; this is a diagnostic for multi-GPU runs.
 """
 
 import os
+import time
 
 import pytest
 from utils.llm_data import llm_models_root
@@ -39,10 +40,11 @@ PROMPTS = [
     "The future of AI is",
 ]
 
-# Per-future wait. Generous for TinyLlama TP=2; a hit means a terminal
-# response was lost (the pre-fix desync signature), not that the engine is
-# slow.
-FUTURE_TIMEOUT_S = 240
+# Shared deadline for collecting every future. Generous for TinyLlama TP=2;
+# hitting it means terminal responses were lost (the pre-fix desync
+# signature), not that the engine is slow. Shared, so a hung engine costs one
+# deadline rather than one per future.
+COLLECT_DEADLINE_S = 240
 
 
 @pytest.mark.skipif(mpi_disabled(), reason="needs the MPI worker path to inject via env_overrides")
@@ -81,9 +83,10 @@ def test_forward_error_survival_tp_rank_local(overlap):
                     futures.append(llm.generate_async(prompt, sampling_params))
 
             hung, errored, completed = [], 0, 0
+            deadline = time.monotonic() + COLLECT_DEADLINE_S
             for idx, future in enumerate(futures):
                 try:
-                    future.result(timeout=FUTURE_TIMEOUT_S)
+                    future.result(timeout=max(1.0, deadline - time.monotonic()))
                     completed += 1
                 except RequestError:
                     # Expected for requests in flight when rank 1's injected
@@ -95,7 +98,7 @@ def test_forward_error_survival_tp_rank_local(overlap):
 
             assert not hung, (
                 f"futures {hung} never received a terminal response within "
-                f"{FUTURE_TIMEOUT_S}s (completed={completed}, "
+                f"{COLLECT_DEADLINE_S}s (completed={completed}, "
                 f"errored={errored}): a rank-local TP forward failure lost "
                 "responses (ranks desynchronized)"
             )
