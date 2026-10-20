@@ -289,6 +289,7 @@ def test_production_forward_updates_live_cache(state_dtype: torch.dtype) -> None
     batch.indices = slots[1:]
     batch.metadata.state_indices = batch.indices
     state = batch.state.to(state_dtype)
+    initial_state = state.clone()
     ref_state, ref_conv = state.clone(), batch.conv.clone()
     from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import PythonMambaCacheManager
 
@@ -329,9 +330,7 @@ def test_production_forward_updates_live_cache(state_dtype: torch.dtype) -> None
     torch.testing.assert_close(cache.conv, ref_conv, rtol=0, atol=0)
     torch.testing.assert_close(batch.hidden, original, rtol=0, atol=0)
     untouched = [0, batch.n + 1]
-    torch.testing.assert_close(
-        state[untouched], batch.state[untouched].to(state_dtype), rtol=0, atol=0
-    )
+    torch.testing.assert_close(state[untouched], initial_state[untouched], rtol=0, atol=0)
     for i, label in enumerate(("q", "k", "v")):
         replay = getattr(cache, f"kda_conv_{label}")
         selected = cache.conv[batch.indices.long(), i * heads * 128 : (i + 1) * heads * 128]
