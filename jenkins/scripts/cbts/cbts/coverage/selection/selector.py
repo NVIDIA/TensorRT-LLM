@@ -129,7 +129,10 @@ class CoverageSelector:
         return out
 
     def _impacted_tests(
-        self, residual_files: list[str], diffs: dict[str, str]
+        self,
+        residual_files: list[str],
+        diffs: dict[str, str],
+        selection_diffs: dict[str, str] | None = None,
     ) -> tuple[set[str], list[str], list[str], list[str], str | None]:
         """Return impacted tests, diagnostics, and an optional decline reason."""
         impacted: set[str] = set()
@@ -150,7 +153,10 @@ class CoverageSelector:
                     no_diff,
                     f"no usable diff: {path}",
                 )
-            lines = iter_diff_post_line_numbers(diff)
+            selection_diff = (
+                selection_diffs.get(path, diff) if selection_diffs is not None else diff
+            )
+            lines = iter_diff_post_line_numbers(selection_diff)
             qualnames, ok = qualnames_for_lines(source, lines)
             if not ok:
                 return (
@@ -161,13 +167,13 @@ class CoverageSelector:
                     f"unparsable source: {path}",
                 )
             if not lines:
-                continue  # comment / blank only: nothing executable changed, so nothing runs
+                continue  # selection diff has no remaining executable edits
             import_executed = import_executed_qualnames(source)
             closures = closure_attributed_qualnames(source, lines)
             dependencies = analyze_python_changes(
                 source,
                 lines,
-                iter_diff_deleted_post_lines(diff),
+                iter_diff_deleted_post_lines(selection_diff),
                 pre_source=reconstruct_diff_pre_image(source, diff),
             )
             import_resolved = False
@@ -537,8 +543,14 @@ class CoverageSelector:
         except (OSError, UnicodeDecodeError):
             return None
 
-    def decide(self, residual_files: list[str], diffs: dict[str, str]) -> CoverageResult:
-        """Decide over residual files; ok=False for non-core, not-in-DB, or import-executed changes."""
+    def decide(
+        self,
+        residual_files: list[str],
+        diffs: dict[str, str],
+        *,
+        selection_diffs: dict[str, str] | None = None,
+    ) -> CoverageResult:
+        """Resolve impact from raw source images and optional executable selection diffs."""
         for path in residual_files:
             # Gate on the repo path: canon() matches `tensorrt_llm/` anywhere.
             if not (path.endswith(".py") and path.startswith("tensorrt_llm/")):
@@ -550,7 +562,7 @@ class CoverageSelector:
                 )
 
         impacted_tests, no_data_funcs, caller_bounded_funcs, no_diff_files, decline = (
-            self._impacted_tests(residual_files, diffs)
+            self._impacted_tests(residual_files, diffs, selection_diffs)
         )
         if decline is not None:
             return CoverageResult(ok=False, reason=decline, no_diff_files=no_diff_files)
