@@ -8931,13 +8931,23 @@ class PyExecutor:
             # TLLM_TEST_INJECT_FORWARD_FAIL_STEPS is set in the worker's
             # environment.
             inject_steps = os.environ.get("TLLM_TEST_INJECT_FORWARD_FAIL_STEPS")
+            inject_ranks = os.environ.get("TLLM_TEST_INJECT_FORWARD_FAIL_RANKS")
+            inject_fail_post_forward = False
             if inject_steps and not self.is_warmup:
                 step = getattr(self, "_inject_forward_fail_step_counter", 0) + 1
                 self._inject_forward_fail_step_counter = step
                 if str(step) in inject_steps.split(","):
-                    raise RuntimeError(
-                        f"injected forward failure at forward step {step} "
-                        "(TLLM_TEST_INJECT_FORWARD_FAIL_STEPS)")
+                    if inject_ranks is None:
+                        raise RuntimeError(
+                            f"injected forward failure at forward step {step} "
+                            "(TLLM_TEST_INJECT_FORWARD_FAIL_STEPS)")
+                    # Rank-local variant: listed ranks raise AFTER the model
+                    # forward returns, so TP peers are already out of the
+                    # forward's collectives when the failure is handled
+                    # (a pre-forward raise would leave peers blocked inside
+                    # the model's allreduce, which no survival path can fix).
+                    inject_fail_post_forward = str(
+                        self.dist.rank) in inject_ranks.split(",")
 
             cache_indirection_buffer = self.sampler.get_cache_indirection()
 
@@ -8963,6 +8973,11 @@ class PyExecutor:
             torch.cuda.current_stream().wait_stream(self.execution_stream)
 
             self._kv_connector_wait_for_save()
+            if inject_fail_post_forward:
+                raise RuntimeError(
+                    "injected rank-local forward failure at forward step "
+                    f"{self._inject_forward_fail_step_counter} on rank "
+                    f"{self.dist.rank} (TLLM_TEST_INJECT_FORWARD_FAIL_RANKS)")
             if route_capture is not None:
                 route_capture.finish_forward()  # R3: disarm between forwards
 
