@@ -156,6 +156,7 @@ COPY setup.py requirements.txt requirements-dev.txt requirements-grpc-smg.txt co
 ENV CCACHE_DIR=/root/.cache/ccache
 # Build the TRT-LLM wheel
 ARG GIT_COMMIT
+ARG TRT_LLM_VER
 ARG GITHUB_MIRROR=""
 ARG BUILD_WHEEL_ARGS="--clean"
 ARG BUILD_WHEEL_SCRIPT="scripts/build_wheel.py"
@@ -167,9 +168,13 @@ RUN --mount=type=cache,target=/root/.cache/pip --mount=type=cache,target=${CCACH
     # Authenticates `git submodule update` and the CMake FetchContent clones
     # (3rdparty/fetch_content.json) that this build pulls from github.com.
     . docker/common/github_auth.sh && \
+    set -- ${BUILD_WHEEL_ARGS} && \
+    if [ "${BUILD_WHEEL_SCRIPT}" = "scripts/build_wheel.py" ] && [ -n "${TRT_LLM_VER}" ]; then \
+      set -- "$@" --version-override "${TRT_LLM_VER}"; \
+    fi && \
     TRTLLM_BUILD_SOURCE_COMMIT=${GIT_COMMIT} \
     GITHUB_MIRROR=${GITHUB_MIRROR} \
-    python3 ${BUILD_WHEEL_SCRIPT} ${BUILD_WHEEL_ARGS}
+    python3 ${BUILD_WHEEL_SCRIPT} "$@"
 
 FROM ${DEVEL_IMAGE} AS release
 
@@ -214,6 +219,13 @@ ARG TRT_LLM_VER
 ARG TARGETARCH
 ENV TRT_LLM_GIT_COMMIT=${GIT_COMMIT} \
     TRT_LLM_VERSION=${TRT_LLM_VER}
+
+# Check installed metadata without importing CUDA-linked modules.
+RUN --mount=type=bind,source=docker/common/validate_wheel_metadata.py,target=/tmp/validate_wheel_metadata.py \
+    --mount=type=bind,source=tensorrt_llm/version.py,target=/tmp/trtllm_source_version.py \
+    python3 /tmp/validate_wheel_metadata.py \
+        --expected-version "${TRT_LLM_VER}" --expected-commit "${GIT_COMMIT}" \
+        --source-version-file /tmp/trtllm_source_version.py
 
 # Generate OSS attribution file for release image
 RUN --mount=type=bind,source=scripts/generate_container_oss_attribution.sh,target=/mnt/gen_attribution.sh \
