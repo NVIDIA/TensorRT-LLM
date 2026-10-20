@@ -153,6 +153,7 @@ l0_a10:
   - unittest/executor/test_proxy_postproc_terminate.py
   - unittest/executor/test_proxy_fast_death.py
   - unittest/executor/test_proxy_profile_sync.py
+  - unittest/executor/test_proxy_request_sender.py
   # trtllm-serve CPU-only
   - unittest/llmapi/apps/test_encode_batcher.py
   - unittest/llmapi/test_embedding_arch_routing.py

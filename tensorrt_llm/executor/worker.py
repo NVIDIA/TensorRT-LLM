@@ -564,7 +564,12 @@ def worker_main(
                     worker.engine.set_resource_governor_queue(
                         resource_governor_queue)
 
-                while (req := request_queue.get()) is not None:
+                def _incoming_requests():
+                    # The proxy sends a burst of requests as one list.
+                    while (msg := request_queue.get()) is not None:
+                        yield from (msg if isinstance(msg, list) else (msg, ))
+
+                for req in _incoming_requests():
                     if isinstance(req, CancellingRequest):
                         worker.abort_request(req.id)
                     elif isinstance(req, StartProfileRequest):
