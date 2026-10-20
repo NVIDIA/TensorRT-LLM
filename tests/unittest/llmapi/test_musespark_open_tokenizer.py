@@ -17,9 +17,9 @@
 Nothing model-specific is needed: transformers loads the chat template from
 ``chat_template.jinja``, ``tokenizer_config.json`` names the pad token, and
 the second EOS id in ``generation_config.json`` becomes a stop id the way it
-does for every model. These tests pin those facts on the released checkpoint's
-own files, so they skip unless it is under ``LLM_MODELS_ROOT``. Both released
-checkpoints ship the same tokenizer files.
+does for every model. These tests pin those facts on the released checkpoints'
+own files, loaded without remote code. Each runs once per released checkpoint
+under ``LLM_MODELS_ROOT`` and skips the ones that are absent.
 """
 
 import json
@@ -54,18 +54,17 @@ RAW_PROMPTS = [
 ]
 
 
-@pytest.fixture(scope="module")
-def checkpoint_dir():
-    for name in CHECKPOINTS:
-        path = os.path.join(llm_models_root(), name)
-        if os.path.isfile(os.path.join(path, "tokenizer.json")):
-            return path
-    pytest.skip("no Muse Spark Open checkpoint under LLM_MODELS_ROOT")
+@pytest.fixture(scope="module", params=CHECKPOINTS)
+def checkpoint_dir(request):
+    path = os.path.join(llm_models_root(), request.param)
+    if not os.path.isfile(os.path.join(path, "tokenizer.json")):
+        pytest.skip(f"{request.param} is not under LLM_MODELS_ROOT")
+    return path
 
 
 @pytest.fixture(scope="module")
 def tokenizer(checkpoint_dir):
-    tokenizer = load_hf_tokenizer(checkpoint_dir)
+    tokenizer = load_hf_tokenizer(checkpoint_dir, trust_remote_code=False)
     assert tokenizer is not None
     return tokenizer
 
@@ -127,6 +126,6 @@ def test_both_eos_ids_stop_generation_and_end_of_message_does_not(checkpoint_dir
     assert params.stop_token_ids == [END_OF_TURN]
 
 
-def test_end_of_message_reaches_the_parsers_as_text(tokenizer):
+def test_end_of_message_decodes_as_text_only_with_special_tokens_kept(tokenizer):
     assert tokenizer.decode([END_OF_MESSAGE], skip_special_tokens=False) == "<|eom|>"
     assert tokenizer.decode([END_OF_MESSAGE], skip_special_tokens=True) == ""

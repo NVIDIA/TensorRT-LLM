@@ -649,9 +649,10 @@ class MuseSparkOpenConfig(PretrainedConfig):
         if not text:
             raise ValueError("Muse Spark Open format: config has no text_config")
         # The class constructor defaults torch_dtype to bfloat16; the
-        # checkpoint states the same at the top level. A different dtype must
-        # not be silently overridden by that default.
-        _require(config_dict, "dtype", "bfloat16", "the export dtype the runtime assumes")
+        # checkpoint states the same at the top level. A different dtype, under
+        # either key name, must not be silently overridden by that default.
+        for dtype_key in ("dtype", "torch_dtype"):
+            _require(config_dict, dtype_key, "bfloat16", "the export dtype the runtime assumes")
 
         num_hidden_layers = int(text["num_hidden_layers"])
         hidden_size = int(text["hidden_size"])
@@ -668,7 +669,9 @@ class MuseSparkOpenConfig(PretrainedConfig):
                 "FFN layer has no home in the flat config"
             )
 
-        rope_theta = float((text.get("rope_parameters") or {}).get("rope_theta", 500000.0))
+        rope_parameters = text.get("rope_parameters") or {}
+        _require(rope_parameters, "rope_type", "default", "the decoder RoPE has no scaling")
+        rope_theta = float(rope_parameters.get("rope_theta", 500000.0))
         every_n_layers_nope, global_attn_cfg = _derive_nope_schedule(
             text["layer_types"],
             text["layer_rope_theta"],
@@ -778,19 +781,3 @@ class MuseSparkOpenConfig(PretrainedConfig):
         _require(config_dict, "video_token_id", flat.video_token_id, "the <|video|> marker id")
         _require(config_dict, "audio_token_id", flat.audio_token_id, "the <|audio|> marker id")
         return flat
-
-    def unquantized_layers(self, exclude_modules: Optional[List[str]]) -> List[int]:
-        """Decoder layers whose experts are stored unquantized.
-
-        Derived from the checkpoint's ``hf_quant_config.json``
-        ``exclude_modules`` rather than hardcoded, so a re-export with a
-        different excluded set is picked up. Accepts both the raw
-        bare-substring form the producer wrote and the anchored glob form
-        TRT-LLM matches with.
-        """
-        layers = []
-        for idx in range(self.num_hidden_layers):
-            token = f"layers.{idx}."
-            if any(token in pattern for pattern in (exclude_modules or [])):
-                layers.append(idx)
-        return layers

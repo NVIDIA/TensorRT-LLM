@@ -79,7 +79,6 @@ def open_format_config_dict():
             "num_experts_per_tok": 8,
             "num_shared_experts": 0,
             "routed_scaling_factor": 1.0,
-            "router_score_division_eps": 1e-15,
             "final_logit_softcapping": 20.0,
             "output_multiplier": 0.17677669529663687,
             "qk_scale_factor": 5.4730064863875,
@@ -196,6 +195,10 @@ def test_from_open_format_reproduces_flat_config():
         (lambda c: c["text_config"].__setitem__("output_multiplier", 0.3), "output_multiplier"),
         (lambda c: c["text_config"]["layer_rope_theta"].__setitem__(3, 123.0), "rope"),
         (
+            lambda c: c["text_config"]["rope_parameters"].__setitem__("rope_type", "yarn"),
+            "rope_type",
+        ),
+        (
             lambda c: c["text_config"]["layer_types"].__setitem__(0, "full_attention"),
             "layer_types|residue",
         ),
@@ -210,6 +213,8 @@ def test_from_open_format_reproduces_flat_config():
         ),
         (lambda c: c.__setitem__("image_token_id", 12345), "image_token_id"),
         (lambda c: c.__setitem__("dtype", "float16"), "dtype"),
+        # A config written before transformers renamed the key.
+        (lambda c: (c.pop("dtype"), c.__setitem__("torch_dtype", "float16")), "torch_dtype"),
     ],
 )
 def test_from_open_format_rejects_semantic_changes(mutate, match):
