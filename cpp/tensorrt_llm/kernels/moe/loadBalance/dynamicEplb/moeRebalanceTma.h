@@ -183,11 +183,14 @@ extern "C"
      * Submit is stream-ordered and does not read or wait for plan data on the CPU.
      * All bound tensors must remain alive and only be reused on the same stream
      * after the copy kernel has read them. The Python endpoint enforces this lease.
-     * Binding also loads the fused scheduler + copy kernel.
+     * Binding also loads the fused scheduler + copy kernel. helper_residency=1
+     * keeps a per-layer table of the expert each helper slot holds and skips a
+     * broadcast whose whole team already holds its expert; it requires helper
+     * rows that only this copy writes.
      */
     int megamoe_tma_copy_configure_gpu_plan(MegamoeTmaCopyState* state, MegamoeTmaGpuPlanConfig const* config);
     int megamoe_tma_copy_bind_gpu_direct(MegamoeTmaCopyState* state, uint64_t ids, uint64_t levels, uint64_t owners,
-        uint64_t workspace, uint64_t status, uint64_t grid_sync, int capacity);
+        uint64_t workspace, uint64_t status, uint64_t grid_sync, int capacity, int helper_residency);
     /* Explicit diagnostic only: synchronizes last work and copies one small result. */
     int megamoe_tma_copy_gpu_plan_result(MegamoeTmaCopyState* state, MegamoeTmaGpuPlanResult* result);
     /* Nulls *state once ownership is consumed. If device activation fails before

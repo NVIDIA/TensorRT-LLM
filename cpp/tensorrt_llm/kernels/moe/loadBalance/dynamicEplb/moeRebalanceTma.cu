@@ -193,7 +193,40 @@ __device__ __forceinline__ void multicast_generation(uint64_t flag_mc, uint64_t 
     asm volatile("fence.proxy.alias;" ::: "memory");
 }
 
-__device__ __forceinline__ void finish_cta_and_notify(unsigned* completed_ctas, uint64_t flag_mc, uint64_t generation)
+/* Helper residency of one layer: the expert that each rank's helper slot holds,
+ * int32 [world][helper_count], -1 when unknown. Every rank keeps an identical
+ * table because it changes only from the replicated HALO-Q placement. */
+struct HelperResidency
+{
+    int* table;
+    int const* placement; // HALO-Q workspace: epoch, count, six capacity-strided fields.
+    int capacity;
+    int helpers;
+    int world;
+};
+
+// After a copy, every member of each broadcast's team holds its expert in the
+// broadcast's helper slot.
+__device__ __forceinline__ void update_helper_residency(HelperResidency const& residency)
+{
+    int const count = __ldcg(residency.placement + 1);
+    int const used = count < 0 ? 0 : (count > residency.capacity ? residency.capacity : count);
+    int const* fields = residency.placement + 2;
+    for (int broadcast = 0; broadcast < used; ++broadcast)
+    {
+        int const expert = __ldcg(fields + broadcast);
+        int const begin = __ldcg(fields + 2 * residency.capacity + broadcast);
+        int const size = __ldcg(fields + 3 * residency.capacity + broadcast);
+        int const helper = __ldcg(fields + 5 * residency.capacity + broadcast);
+        if (helper < 0 || helper >= residency.helpers || begin < 0 || size <= 0 || begin + size > residency.world)
+            continue;
+        for (int rank = begin; rank < begin + size; ++rank)
+            residency.table[rank * residency.helpers + helper] = expert;
+    }
+}
+
+__device__ __forceinline__ void finish_cta_and_notify(
+    unsigned* completed_ctas, uint64_t flag_mc, uint64_t generation, HelperResidency const* residency = nullptr)
 {
     unsigned previous;
     // A release/acquire RMW chain combines the completed payload of all CTAs.
@@ -205,6 +238,10 @@ __device__ __forceinline__ void finish_cta_and_notify(unsigned* completed_ctas, 
         // the last CTA can rearm the counter without a host memset each time.
         asm volatile("st.relaxed.gpu.global.u32 [%0], 0;" ::"l"(completed_ctas) : "memory");
         multicast_generation(flag_mc, generation);
+        // Every CTA read the table before joining the chain; the next copy of
+        // this layer is a later kernel on the same stream.
+        if (residency != nullptr)
+            update_helper_residency(*residency);
     }
 }
 
@@ -483,7 +520,7 @@ __device__ __forceinline__ void publish_bank_ticket(unsigned* address, unsigned 
 
 __device__ __forceinline__ void tma_copy_body(MegamoeTmaCopySegment const* segments, MegamoeTmaCopyRange const* ranges,
     uint64_t range_count, uint64_t total_slices, int warps, int total_slots, unsigned* completed_ctas, uint64_t flag_mc,
-    uint64_t generation)
+    uint64_t generation, HelperResidency const* residency)
 {
     if (!total_slices)
     {
@@ -592,7 +629,7 @@ __device__ __forceinline__ void tma_copy_body(MegamoeTmaCopySegment const* segme
     }
     __syncthreads();
     if (threadIdx.x == 0 && flag_mc)
-        finish_cta_and_notify(completed_ctas, flag_mc, generation);
+        finish_cta_and_notify(completed_ctas, flag_mc, generation, residency);
 }
 
 // Per-CTA scratch is allocated once. No plan tensor is copied between kernels.
@@ -606,6 +643,8 @@ struct GpuDirectStorage
     MegamoeTmaCopySegment* segments;
     MegamoeTmaCopyRange* ranges;
     MegamoeTmaGpuPlanResult* results;
+    // Helper residency table, or null when helper slots are shared across layers.
+    int* resident;
 };
 
 __device__ __forceinline__ void tma_copy_gpu_direct_body(GpuDirectStorage const& direct, int warps, int total_slots,
@@ -647,8 +686,8 @@ __device__ __forceinline__ void tma_copy_gpu_direct_body(GpuDirectStorage const&
     __syncthreads();
     if (threadIdx.x == 0)
     {
-        megamoe_tma_build_gpu_plan(
-            &c, plan, plan + c.plan_words, segments, direct.max_segments, ranges, direct.max_segments, result);
+        megamoe_tma_build_gpu_plan(&c, plan, plan + c.plan_words, segments, direct.max_segments, ranges,
+            direct.max_segments, result, direct.resident);
         // Malformed plans must never publish READY. The CUDA error surfaces at
         // the caller's normal completion check, without a host wait in submit.
         if (result->error)
@@ -658,16 +697,18 @@ __device__ __forceinline__ void tma_copy_gpu_direct_body(GpuDirectStorage const&
         }
     }
     __syncthreads();
+    HelperResidency const residency{direct.resident, direct.workspace, cap, c.helper_count, c.world};
+    HelperResidency const* const update = direct.resident != nullptr ? &residency : nullptr;
     if (!result->total_slices)
     {
         // Work size is device-derived, so the launch always has config.sms CTAs.
         // Empty ranks must still join the last-CTA chain before one READY store.
         if (threadIdx.x == 0)
-            finish_cta_and_notify(completed_ctas, flag_mc, generation);
+            finish_cta_and_notify(completed_ctas, flag_mc, generation, update);
         return;
     }
     tma_copy_body(segments, ranges, result->range_count, result->total_slices, warps, total_slots, completed_ctas,
-        flag_mc, generation);
+        flag_mc, generation, update);
 }
 
 // Scheduler arguments of the fused launch, as halo_q_scheduler_body takes them.
@@ -871,6 +912,8 @@ extern "C" int megamoe_tma_copy_destroy(MegamoeTmaCopyState** state_ptr)
         record(cudaFree(state->direct.ranges));
     if (state->direct.results)
         record(cudaFree(state->direct.results));
+    if (state->direct.resident)
+        record(cudaFree(state->direct.resident));
     if (state->completed_ctas)
         record(cudaFree(state->completed_ctas));
     if (previous_device != state->config.device)
@@ -1138,10 +1181,11 @@ extern "C" int megamoe_tma_copy_configure_gpu_plan(MegamoeTmaCopyState* state, M
 }
 
 extern "C" int megamoe_tma_copy_bind_gpu_direct(MegamoeTmaCopyState* state, uint64_t ids, uint64_t levels,
-    uint64_t owners, uint64_t workspace, uint64_t status, uint64_t grid_sync, int capacity)
+    uint64_t owners, uint64_t workspace, uint64_t status, uint64_t grid_sync, int capacity, int helper_residency)
 {
     if (!state || !ids || !levels || !owners || !workspace || !status || !grid_sync
-        || (ids | levels | owners | workspace | status | grid_sync) % alignof(int) || capacity < 1 || capacity > 384)
+        || (ids | levels | owners | workspace | status | grid_sync) % alignof(int) || capacity < 1 || capacity > 384
+        || (helper_residency != 0 && helper_residency != 1))
         return cudaErrorInvalidValue;
     std::lock_guard<std::mutex> lock(state->submit_mutex);
     if (!state->direct_configured || state->direct_bound || state->work_queued)
@@ -1169,6 +1213,18 @@ extern "C" int megamoe_tma_copy_bind_gpu_direct(MegamoeTmaCopyState* state, uint
     d.status = reinterpret_cast<int const*>(status);
     d.grid_sync = reinterpret_cast<int const*>(grid_sync);
     d.capacity = capacity;
+    if (helper_residency)
+    {
+        size_t const bytes
+            = sizeof(int) * static_cast<size_t>(d.config.world) * static_cast<size_t>(d.config.helper_count);
+        error = cudaMalloc(reinterpret_cast<void**>(&d.resident), bytes);
+        if (error == cudaSuccess)
+            error = cudaMemset(d.resident, 0xFF, bytes); // -1: no expert is known to be resident.
+        if (error == cudaSuccess)
+            error = cudaStreamSynchronize(nullptr);      // Cold initialization only.
+        if (error != cudaSuccess)
+            return error;
+    }
     error = prepare_fused_launch(*state);
     if (error != cudaSuccess)
         return error;
@@ -1208,7 +1264,7 @@ int megamoe_tma_copy_submit_fused(MegamoeTmaCopyState* state,
         return error;
     if (capture != cudaStreamCaptureStatusNone)
         return cudaErrorStreamCaptureUnsupported;
-    // One stream orders the scheduler workspace and the plan scratch.
+    // One stream orders the scheduler workspace, the plan scratch and the residency table.
     if (state->work_queued && stream != state->last_stream)
         return cudaErrorInvalidValue;
     FusedSchedulerArgs scheduler_args{scheduler.routes, scheduler.outSlots, scheduler.outIds, scheduler.outLevels,

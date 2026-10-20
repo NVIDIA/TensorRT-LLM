@@ -33,9 +33,13 @@
 #endif
 namespace megamoe_gpu_plan_detail
 {
+/* A helper slot whose whole team already holds its expert needs no copy. */
+static constexpr int kSlotModeResident = 3;
+
 struct Builder : MegamoeTmaGpuPlanConfig
 {
     int32_t const* plan;
+    int32_t const* resident; /* [world][helper_count] expert held per helper slot, or null. */
     int32_t* slot_scratch;
     MegamoeTmaCopySegment* tma_segments;
     MegamoeTmaCopyRange* tma_ranges;
@@ -144,6 +148,16 @@ static MEGAMOE_GP_HD inline int append_tma_range(Builder* c, size_t* ranges, uin
     return 0;
 }
 
+static MEGAMOE_GP_HD inline bool team_holds_expert(Builder const* c, int slot, int expert, int level)
+{
+    int group = c->group_sizes[level];
+    int begin = c->rank / group * group;
+    for (int rank = begin; rank < begin + group; ++rank)
+        if (c->resident[rank * c->helper_count + slot] != expert)
+            return false;
+    return true;
+}
+
 static MEGAMOE_GP_HD inline size_t build_tma_descriptors(Builder* c, int outgoing_count, int* plan_error)
 {
     *plan_error = 3;
@@ -161,6 +175,11 @@ static MEGAMOE_GP_HD inline size_t build_tma_descriptors(Builder* c, int outgoin
     {
         if (experts[slot] < 0 || modes[slot] == 2)
             continue;
+        if (c->resident && team_holds_expert(c, slot, experts[slot], levels[slot]))
+        {
+            modes[slot] = kSlotModeResident;
+            continue;
+        }
         if (c->tma_route == 1)
         {
             int group = c->group_sizes[levels[slot]];
@@ -424,10 +443,13 @@ static MEGAMOE_GP_HD inline size_t build_descriptors(Builder* c, int* plan_error
 /* Host/device parity permits differential tests against the CPU submitter.
  * Counts remain zero on failure: callers must not publish successful READY.
  * Caller supplies valid memory for the full immutable tables and scratch.
+ * A non-null resident table removes the slots whose team already holds the
+ * planned expert from every routing domain.
  */
 static MEGAMOE_GP_HD inline int megamoe_tma_build_gpu_plan(MegamoeTmaGpuPlanConfig const* config,
     int32_t const* device_plan, int32_t* slot_scratch, MegamoeTmaCopySegment* segments, uint64_t max_segments,
-    MegamoeTmaCopyRange* ranges, uint64_t max_ranges, MegamoeTmaGpuPlanResult* result)
+    MegamoeTmaCopyRange* ranges, uint64_t max_ranges, MegamoeTmaGpuPlanResult* result,
+    int32_t const* resident = nullptr)
 {
     if (!result)
         return 1;
@@ -463,6 +485,7 @@ static MEGAMOE_GP_HD inline int megamoe_tma_build_gpu_plan(MegamoeTmaGpuPlanConf
     megamoe_gpu_plan_detail::Builder c{};
     static_cast<MegamoeTmaGpuPlanConfig&>(c) = g;
     c.plan = device_plan;
+    c.resident = resident;
     c.slot_scratch = slot_scratch;
     c.tma_segments = segments;
     c.tma_ranges = ranges;
