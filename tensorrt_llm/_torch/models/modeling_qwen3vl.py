@@ -510,7 +510,7 @@ class Qwen3VLInputProcessorBase(Qwen2VLInputProcessorBase):
                 multimodal_positions=list(mm_input.multimodal_positions),
                 multimodal_embedding_lengths=list(embedding_lengths),
                 **copy.deepcopy(mm_input.run_metadata()),
-                special_token_offsets=list(mm_data.get("special_token_offsets", [])),
+                special_token_offsets=copy.deepcopy(mm_data.get("special_token_offsets")),
                 item_types=[
                     0 if modality == "image" else 1 for modality, _ in item_metadata.item_refs
                 ],
@@ -544,7 +544,7 @@ class Qwen3VLInputProcessorBase(Qwen2VLInputProcessorBase):
             multimodal_item_run_cu_offsets=run_offsets,
             multimodal_run_positions=run_positions,
             multimodal_run_lengths=run_lengths,
-            special_token_offsets=special_offsets,
+            special_token_offsets=special_offsets or None,
             item_types=[0 if token == self.config.image_token_id else 1 for token in first_tokens],
         )
 

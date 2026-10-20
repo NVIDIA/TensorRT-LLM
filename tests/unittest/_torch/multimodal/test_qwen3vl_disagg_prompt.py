@@ -15,13 +15,13 @@ from tensorrt_llm._torch.models.modeling_qwen3vl import (
     _expand_prompt_token_ids_for_mm_handoff,
 )
 from tensorrt_llm.disaggregated_params import DisaggregatedParams
-from tensorrt_llm.inputs.multimodal import (
-    MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
-    MultimodalInput,
-    MultimodalParams,
+from tensorrt_llm.inputs.multimodal import MULTIMODAL_ENCODER_ITEM_METADATA_KEY, MultimodalParams
+from tensorrt_llm.inputs.registry import (
+    BaseMultimodalInputProcessor,
+    MultimodalEncoderItemMetadata,
+    create_input_processor_with_hash,
 )
-from tensorrt_llm.inputs.registry import BaseMultimodalInputProcessor, MultimodalEncoderItemMetadata
-from tensorrt_llm.llmapi.llm import BaseLLM
+from tensorrt_llm.llmapi.llm import BaseLLM, PreprocessedInputs
 from tensorrt_llm.sampling_params import SamplingParams
 
 pytestmark = pytest.mark.cpu_only
@@ -158,9 +158,9 @@ def test_qwen3vl_video_token_count_sums_single_video_grid_rows():
     )
 
 
-@pytest.fixture
-def video_handoff():
-    """Build a video prompt with two frame groups separated by timestamp text."""
+@pytest.fixture(params=[False, True], ids=["no-special-ids", "special-ids"])
+def video_handoff(request):
+    """Build the hashing path's layout with and without optional special-token IDs."""
     processor = object.__new__(Qwen3VLInputProcessorBase)
     processor._config = SimpleNamespace(
         image_token_id=_IMAGE_TOKEN_ID,
@@ -169,9 +169,11 @@ def video_handoff():
         text_config=SimpleNamespace(hidden_size=16, vocab_size=200000),
         vision_config=SimpleNamespace(deepstack_visual_indexes=[]),
     )
-    processor._processor = SimpleNamespace(
-        mm_special_token_ids=torch.tensor([_VISION_START_TOKEN_ID])
-    )
+    processor._processor = SimpleNamespace()
+    if request.param:
+        processor._processor.mm_special_token_ids = torch.tensor([_VISION_START_TOKEN_ID])
+    processor.multimodal_hashing_supported = True
+    processor.get_num_tokens_per_video = Mock(return_value=6 if request.param else 4)
     processor._tokenizer = _FakeTokenizer(
         [11, _VISION_START_TOKEN_ID, _VIDEO_TOKEN_ID, _VISION_END_TOKEN_ID, 12]
     )
@@ -192,32 +194,30 @@ def video_handoff():
         _VISION_END_TOKEN_ID,
         12,
     ]
-    params = MultimodalParams(
-        multimodal_input=MultimodalInput(
-            multimodal_hashes=[[1] * 8],
-            multimodal_positions=[3],
-            multimodal_lengths=[6],
-            multimodal_item_run_cu_offsets=[0, 2],
-            multimodal_run_positions=[3, 9],
-            multimodal_run_lengths=[3, 3],
-        ),
-        multimodal_data={
+    processed = {
+        "multimodal_data": {
             "multimodal_embedding_lengths": [4],
-            "special_token_offsets": [0, 3],
             MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalEncoderItemMetadata(
                 item_refs=[("video", 0)],
                 encoder_token_lengths=[16],
                 output_embedding_lengths=[4],
             ),
-        },
-    )
-    return processor, token_ids, params
+        }
+    }
+    with patch.object(Qwen3VLInputProcessorBase, "__call__", return_value=(token_ids, processed)):
+        _, hashed = create_input_processor_with_hash(processor)(
+            {"prompt": "video prompt", "multi_modal_data": {"video": [[torch.zeros(2, 2, 3)]]}},
+            SamplingParams(max_tokens=1),
+        )
+    return processor, token_ids, MultimodalParams(**hashed)
 
 
 @pytest.mark.parametrize("hashing_enabled", [True, False])
 def test_encoder_handoff_preserves_video_timestamps(video_handoff, hashing_enabled):
     """Keep timestamps and sparse visual runs with or without hashing metadata."""
     processor, token_ids, params = video_handoff
+    expected = params.multimodal_input
+    expected_offsets = params.multimodal_data.get("special_token_offsets")
     if not hashing_enabled:
         params.multimodal_input = None
     layout = processor.get_disagg_prefill_inputs(token_ids, params)
@@ -228,14 +228,18 @@ def test_encoder_handoff_preserves_video_timestamps(video_handoff, hashing_enabl
         encoder_inputs=layout,
     )
     assert result.prompt_token_ids == token_ids
-    assert result.multimodal_positions == [3]
-    assert result.multimodal_lengths == [6]
+    assert result.multimodal_positions == expected.multimodal_positions
+    assert result.multimodal_lengths == expected.multimodal_lengths
     assert result.multimodal_embedding_lengths == [4]
-    assert result.multimodal_item_run_cu_offsets == [0, 2]
-    assert result.multimodal_run_positions == [3, 9]
-    assert result.multimodal_run_lengths == [3, 3]
-    assert result.special_token_offsets == [0, 3]
+    assert result.multimodal_item_run_cu_offsets == expected.multimodal_item_run_cu_offsets
+    assert result.multimodal_run_positions == expected.multimodal_run_positions
+    assert result.multimodal_run_lengths == expected.multimodal_run_lengths
+    assert result.special_token_offsets == expected_offsets
     assert result.item_types == [1]
+    if processor.get_mm_special_token_ids() is None:
+        assert result.multimodal_lengths == [4]
+        assert result.multimodal_run_positions == [4, 10]
+        assert result.special_token_offsets is None
 
 
 @pytest.mark.parametrize("round_trip", ["json", "pickle"])
@@ -276,7 +280,16 @@ def test_prefill_consumes_encoder_layout_and_rejects_stale_positions(video_hando
     )
     assert result_ids == token_ids
     assert result_mm.multimodal_input.multimodal_hashes == [[1] * 8]
-    assert result_mm.multimodal_input.multimodal_run_positions == [3, 9]
+    assert (
+        result_mm.multimodal_input.multimodal_run_positions
+        == params.multimodal_input.multimodal_run_positions
+    )
+    assert result_mm.multimodal_data.get("special_token_offsets") == params.multimodal_data.get(
+        "special_token_offsets"
+    )
+    assert ("special_token_offsets" in result_mm.multimodal_data) == (
+        "special_token_offsets" in params.multimodal_data
+    )
     assert result_mm.multimodal_data["multimodal_embed_mask_cumsum"].tolist() == [
         0,
         0,
@@ -322,6 +335,7 @@ def test_encoder_layout_does_not_bypass_handle_validation(video_handoff, shape, 
 def test_encoder_layout_owns_its_metadata(video_handoff):
     """Keep exported and consumed layouts independent of caller-owned metadata."""
     processor, token_ids, params = video_handoff
+    expected_positions = list(params.multimodal_input.multimodal_run_positions)
     layout = processor.get_disagg_prefill_inputs(token_ids, params)
     restored = processor.build_disagg_prefill_multimodal_inputs(
         {},
@@ -331,11 +345,11 @@ def test_encoder_layout_owns_its_metadata(video_handoff):
     restored.prompt_token_ids.append(99)
     restored.multimodal_run_positions[0] = 0
     assert layout.prompt_token_ids == token_ids
-    assert layout.multimodal_run_positions == [3, 9]
+    assert layout.multimodal_run_positions == expected_positions
     layout.prompt_token_ids.append(100)
     layout.multimodal_run_positions[0] = 1
     assert token_ids[-1] == 12
-    assert params.multimodal_input.multimodal_run_positions == [3, 9]
+    assert params.multimodal_input.multimodal_run_positions == expected_positions
 
 
 @pytest.mark.parametrize("modality", ["image", "video"])
@@ -359,19 +373,23 @@ def test_multiple_items_without_hashing_keep_prompt_order(video_handoff, modalit
     )
     layout = processor.get_disagg_prefill_inputs(item_ids + item_ids, params)
     assert layout.prompt_token_ids == item_ids + item_ids
+    has_special_ids = processor.get_mm_special_token_ids() is not None
     if modality == "image":
-        assert layout.multimodal_positions == [1, 7]
-        assert layout.multimodal_lengths == [3, 3]
+        positions = [1, 7] if has_special_ids else [2, 8]
+        assert layout.multimodal_positions == positions
+        assert layout.multimodal_lengths == ([3, 3] if has_special_ids else [2, 2])
         assert layout.multimodal_item_run_cu_offsets == [0, 1, 2]
-        assert layout.multimodal_run_positions == [1, 7]
-        assert layout.special_token_offsets == [0, 3]
+        assert layout.multimodal_run_positions == positions
+        assert layout.special_token_offsets == ([0, 3] if has_special_ids else None)
         assert layout.item_types == [0, 0]
     else:
-        assert layout.multimodal_positions == [3, 17]
-        assert layout.multimodal_lengths == [6, 6]
+        assert layout.multimodal_positions == ([3, 17] if has_special_ids else [4, 18])
+        assert layout.multimodal_lengths == ([6, 6] if has_special_ids else [4, 4])
         assert layout.multimodal_item_run_cu_offsets == [0, 2, 4]
-        assert layout.multimodal_run_positions == [3, 9, 17, 23]
-        assert layout.special_token_offsets == [0, 3, 6, 9]
+        assert layout.multimodal_run_positions == (
+            [3, 9, 17, 23] if has_special_ids else [4, 10, 18, 24]
+        )
+        assert layout.special_token_offsets == ([0, 3, 6, 9] if has_special_ids else None)
         assert layout.item_types == [1, 1]
 
 
@@ -455,3 +473,48 @@ def test_encoder_submits_layout_without_mutating_caller_params(video_handoff, ex
         assert submitted.disagg_request_id == 7
         assert submitted is not original
         assert original.multimodal_input_layout is None
+
+
+@pytest.mark.parametrize("preprocessed", [False, True])
+@pytest.mark.parametrize("request_type", ["context_only", "context_and_generation"])
+def test_prefill_drops_consumed_layout_before_executor(video_handoff, preprocessed, request_type):
+    """Submit only engine-needed metadata while preserving the caller's handoff."""
+    processor, token_ids, params = video_handoff
+    llm = object.__new__(BaseLLM)
+    llm.shutdown = Mock()
+    llm._encode_only = False
+    llm.args = SimpleNamespace(mm_encoder_only=False, return_perf_metrics=False)
+    llm.input_processor = processor
+    llm._executor = Mock()
+    llm._executor.is_shutdown.return_value = False
+    llm._is_encoder_decoder_model = Mock(return_value=False)
+    llm._prepare_sampling_params = Mock(return_value=SamplingParams(max_tokens=1))
+    llm._configure_bart_decoder_prefix = Mock()
+    llm._check_arguments = Mock()
+    llm._post_processor_hook = None
+    original = DisaggregatedParams(
+        request_type=request_type,
+        disagg_request_id=7,
+        multimodal_embedding_handles=[{"tensor_size": [4, 16]}],
+        multimodal_hashes=[[1] * 8],
+        multimodal_input_layout=processor.get_disagg_prefill_inputs(token_ids, params),
+        mrope_position_ids_handle={"tensor_size": [3, 1, len(token_ids)]},
+        mrope_position_deltas_handle={"tensor_size": [1, 1]},
+    )
+    expected = asdict(original)
+    inputs = {"prompt": "video prompt"}
+    if preprocessed:
+        ids, _, mm_params, encoder_ids = llm._preprocess(
+            inputs, SamplingParams(max_tokens=1), original
+        )
+        inputs = PreprocessedInputs(ids, mm_params, encoder_ids)
+    with patch("tensorrt_llm.llmapi.llm.RequestOutput._from_generation_result"):
+        llm.generate_async(inputs, disaggregated_params=original)
+    submitted = llm._executor.generate_async.call_args
+    assert submitted.args[0] == token_ids
+    assert submitted.kwargs["multimodal_params"].multimodal_data["multimodal_embedding"] == (
+        original.multimodal_embedding_handles
+    )
+    assert asdict(original) == expected
+    expected["multimodal_input_layout"] = None
+    assert asdict(submitted.kwargs["disaggregated_params"]) == expected

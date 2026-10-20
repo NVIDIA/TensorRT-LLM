@@ -872,6 +872,11 @@ class BaseLLM:
                  disaggregated_params,
              )
 
+        if (not self.args.mm_encoder_only and disaggregated_params is not None
+                and disaggregated_params.multimodal_input_layout is not None):
+            disaggregated_params = replace(disaggregated_params,
+                                           multimodal_input_layout=None)
+
         if (self.args.mm_encoder_only
                 and multimodal_params is not None and isinstance(
                     self.input_processor, BaseMultimodalInputProcessor)):
