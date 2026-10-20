@@ -5041,8 +5041,9 @@ def test_rewind_context_after_cache_drop_handles_empty_rank_local_prompt(
 
 
 class TestLongContextDemotion:
-    """TLLM_V2_CTX_DEMOTE_UNCACHED_TOKENS: a mid-prefill request with more than
-    the threshold left goes to the tail of the iteration's context order."""
+    """TLLM_V2_CTX_DEMOTE_UNCACHED_TOKENS: a request whose router estimate of
+    uncached prefill exceeds the threshold goes to the tail of the iteration's
+    context order, from its first chunk on."""
 
     ENV = {"TLLM_V2_CTX_DEMOTE_UNCACHED_TOKENS": "1024"}
 
@@ -5054,40 +5055,58 @@ class TestLongContextDemotion:
                 ctx_chunk_config=(None, 64),
             )
 
-    def _req(self, request_id, remaining, kv_start=64):
-        """kv_start > 0: prepare_context already ran, remaining is post-reuse."""
+    def _req(self, request_id, remaining, estimate=None, kv_start=0):
+        """`estimate`: the router's py_uncached_prefill_tokens (None = not
+        published). kv_start > 0: prepare_context already ran, so `remaining`
+        is the exact post-reuse remainder."""
         req = make_ctx_request(request_id, context_remaining_length=remaining)
         req.context_current_position = kv_start
+        req.py_uncached_prefill_tokens = estimate
         return req
 
     def test_disabled_without_env(self):
-        long_req, short = self._req(0, 10_000), self._req(1, 256)
+        long_req, short = self._req(0, 10_000, estimate=10_000), self._req(1, 256, estimate=256)
         out = self._make().schedule_request([long_req, short], set())
         assert ids(out.context_requests) == [0]
         assert long_req.context_chunk_size == 1024
 
-    def test_long_request_moved_to_tail_and_keeps_the_leftover_budget(self):
-        long_req, short = self._req(0, 10_000), self._req(1, 256)
+    def test_estimated_long_request_waits_behind_short_ones_from_its_first_chunk(self):
+        long_req, short = self._req(0, 10_000, estimate=10_000), self._req(1, 256, estimate=256)
         out = self._make(self.ENV).schedule_request([long_req, short], set())
         assert ids(out.context_requests) == [1, 0]
         assert short.context_chunk_size == 256
-        assert long_req.context_chunk_size == 768
-        # Alone in the queue it still gets everything: reordered, not capped.
-        alone = self._req(0, 10_000)
-        self._make(self.ENV).schedule_request([alone], set())
-        assert alone.context_chunk_size == 1024
+        assert long_req.context_chunk_size == 768  # leftover, not a full first chunk
+        # Only long requests left: the head of the long queue takes everything.
+        first, second = self._req(0, 10_000, estimate=10_000), self._req(1, 10_000, estimate=10_000)
+        out = self._make(self.ENV).schedule_request([first, second], set())
+        assert ids(out.context_requests) == [0]
+        assert first.context_chunk_size == 1024
 
-    def test_first_chunk_is_never_demoted(self):
-        """Before prepare_context the length is pre-reuse: plain FCFS."""
-        fresh_long, short = self._req(0, 10_000, kv_start=0), self._req(1, 256)
+    def test_request_without_estimate_is_never_demoted(self):
+        """No router estimate: plain FCFS, whether fresh or already mid-prefill."""
+        fresh_long, short = self._req(0, 10_000), self._req(1, 256, estimate=256)
         out = self._make(self.ENV).schedule_request([fresh_long, short], set())
         assert ids(out.context_requests) == [0]
+        mid_long = self._req(0, 10_000, kv_start=64)
+        out = self._make(self.ENV).schedule_request([mid_long, short], set())
+        assert ids(out.context_requests) == [0]
+
+    def test_exact_remainder_releases_the_tail(self):
+        """Mid-prefill the exact remainder is known: a demoted request with no
+        more than the threshold left is not demoted any further."""
+        tail = self._req(0, 512, estimate=10_000, kv_start=9_600)
+        short = self._req(1, 256, estimate=256)
+        out = self._make(self.ENV).schedule_request([tail, short], set())
+        assert ids(out.context_requests) == [0, 1]
+        still_long = self._req(0, 5_000, estimate=10_000, kv_start=5_000)
+        out = self._make(self.ENV).schedule_request([still_long, short], set())
+        assert ids(out.context_requests) == [1, 0]
 
     def test_aging_bound_lets_a_demoted_request_through(self):
         sched = self._make(dict(self.ENV, TLLM_V2_CTX_DEMOTE_MAX_ITERS="2"))
-        long_req = self._req(0, 10_000)
+        long_req = self._req(0, 10_000, estimate=10_000)
         # At the threshold (`> T` is false): never demoted, leaves 64 tokens.
-        hog = self._req(1, 960)
+        hog = self._req(1, 960, estimate=960)
         for _ in range(2):
             out = sched.schedule_request([long_req, hog], set())
             assert ids(out.context_requests) == [1, 0]

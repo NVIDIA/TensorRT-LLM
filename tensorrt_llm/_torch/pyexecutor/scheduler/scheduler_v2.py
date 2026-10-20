@@ -267,12 +267,14 @@ class KVCacheV2Scheduler(RequestScheduler):
         # Long-prefill demotion (opt-in). Context scheduling is FCFS, so a
         # multi-hundred-k-token prefill takes the whole token budget for as many
         # iterations as it needs while the short cached turns behind it wait. A
-        # context request already mid-prefill with more than this many tokens
-        # left goes to the tail of the iteration's context order (FCFS within
-        # each class) and takes whatever budget the others leave: reordered,
-        # never capped, so its chunks do not shrink. Before prepare_context has
-        # run the length is pre-reuse and says nothing about the work left, so
-        # a request's first chunk is always scheduled FCFS.
+        # request whose uncached prefill the attention-DP router estimates above
+        # this many tokens (py_uncached_prefill_tokens) goes to the tail of the
+        # iteration's context order from its first chunk on, FCFS within each
+        # class, and takes whatever budget the others leave: reordered, never
+        # capped. Without an estimate a request is never demoted; mid-prefill
+        # the exact remainder releases it once less than the threshold is left.
+        # Gating at the door (not from the second chunk on) keeps long requests
+        # from parking mid-prefill with their KV blocks held.
         demote_uncached = int(os.environ.get("TLLM_V2_CTX_DEMOTE_UNCACHED_TOKENS", "0"))
         self._ctx_demote_uncached_tokens = max(0, demote_uncached) if self.chunking_enabled else 0
         # A request demoted this many consecutive iterations is let through in
@@ -289,14 +291,18 @@ class KVCacheV2Scheduler(RequestScheduler):
             )
 
     def _is_long_context(self, req: LlmRequest) -> bool:
-        """Whether a context request past prepare_context has more than the
-        threshold left to compute. No radix probe here: it would walk the whole
-        prompt for every request on every iteration."""
+        """Whether the router's uncached-prefill estimate exceeds the threshold
+        and, once mid-prefill, more than the threshold is actually left. A
+        request without an estimate is never long. No radix probe here: it
+        would walk the whole prompt for every request on every iteration."""
         if req.state_value == self._encoder_init_state_value:
             return False
-        return (
+        estimate = req.py_uncached_prefill_tokens
+        if estimate is None or estimate <= self._ctx_demote_uncached_tokens:
+            return False
+        return not (
             req.context_current_position > 0
-            and req.context_remaining_length > self._ctx_demote_uncached_tokens
+            and req.context_remaining_length <= self._ctx_demote_uncached_tokens
         )
 
     def _defer_long_context(
