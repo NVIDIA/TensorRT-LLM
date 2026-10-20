@@ -163,7 +163,6 @@ SLURM_INFRA_RETRY_MAX = 1
 // stdout/stderr in the SLURM job log. Keep the concrete terms and their retry
 // policy owned by FailureClassifier.
 SLURM_JOB_LOG_EVIDENCE_QUERY_IDS = [
-    "slurm-ucx-worker-address",
     "cuda-device-unavailable",
     "cuda-buffer-mapping",
     "nvidia-driver-unavailable",
