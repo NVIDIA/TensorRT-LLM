@@ -312,21 +312,18 @@ class FmhaManager:
             if fmha_cls.is_available(attn):
                 self.fmha_libs.append(fmha_cls(attn))
         self._layer_idx = getattr(attn, "layer_idx", None)
-        # Libraries already announced in the log for this layer; one line per
-        # library per layer is enough to tell which kernel serves a model.
-        self._announced: set[type[Fmha]] = set()
 
     def _announce(self, fmha: Fmha, cache_key: _FmhaCacheKey) -> None:
-        if type(fmha) in self._announced:
-            return
-        self._announced.add(type(fmha))
-        logger.info(
+        # One line per library per layer is enough to tell which kernel
+        # serves a model; the logger dedups on the key.
+        logger.info_once(
             f"FMHA layer {self._layer_idx}: {type(fmha).__name__} serves "
             f"{cache_key.attention_mask_type.name} requests "
             f"(context_batch<={cache_key.context_batch_size}, "
             f"generation_batch<={cache_key.generation_batch_size}, "
             f"generation_seq_len_q<={cache_key.generation_seq_len_q}, "
-            f"output_dtype={cache_key.output_dtype})."
+            f"output_dtype={cache_key.output_dtype}).",
+            key=f"fmha_serves:{self._layer_idx}:{type(fmha).__name__}",
         )
 
     def _make_cache_key(
