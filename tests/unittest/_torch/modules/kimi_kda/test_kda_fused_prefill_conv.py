@@ -477,6 +477,44 @@ def test_grid_y_never_exceeds_the_longest_sequence() -> None:
         assert 1 <= _grid_runs(tokens, batch, bound, channels, 32) <= min(longest, 65535)
 
 
+@torch.inference_mode()
+def test_fused_conv_addresses_pool_rows_past_int32() -> None:
+    """Pool rows whose element offset slot * stride exceeds int32.
+
+    KV cache manager V2 coalesces every layer's state of a slot, so a large pool
+    passes 2**31 elements as a whole; slot 16 here starts exactly there. The
+    launch must give the bits of the same launch on a compact pool and leave
+    every element outside the batch's rows (NaN) alone.
+    """
+    lengths = [40, 24]
+    batch, src, weight, qkv = _conv_inputs(heads=1, lengths=lengths, seed=971)
+    seed = clone_pool(batch.conv)
+    expected_qkv = tuple(torch.empty_like(t) for t in qkv)
+    _launch(batch, src, weight, expected_qkv, lengths)
+    expected_rows = batch.conv[batch.indices.long()].clone()
+    row_stride = 2**27
+    backing = torch.full(
+        (16 * row_stride + 3 * 128 * 3,), float("nan"), device="cuda", dtype=torch.bfloat16
+    )
+    pool = backing.as_strided((17, 3 * 128, 3), (row_stride, 3, 1))
+    slots = torch.tensor([16, 3], device="cuda", dtype=torch.int32)
+    pool[slots.long()] = seed[batch.indices.long()]
+    fused_prefill_conv(
+        src,
+        weight,
+        pool,
+        batch.metadata.query_start_loc,
+        slots,
+        batch.metadata.has_initial_states,
+        max(lengths),
+        *qkv,
+    )
+    assert all(torch.equal(_bits(a), _bits(b)) for a, b in zip(qkv, expected_qkv))
+    assert torch.equal(_bits(pool[slots.long()]), _bits(expected_rows))
+    pool[slots.long()] = float("nan")
+    assert bool(torch.isnan(backing).all()), "the convolution wrote outside the batch's rows"
+
+
 @pytest.mark.parametrize("lengths", [[40, 24], [3000, 100, 5], [1024], [1] * 33 + [700]])
 @torch.inference_mode()
 def test_fused_conv_grid_y_only_sets_parallelism(lengths: list[int]) -> None:

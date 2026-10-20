@@ -1335,10 +1335,17 @@ def fused_prefill_conv(src, weight, conv_state, starts, slots, has_init, max_seq
         or any(not t.is_contiguous() for t in (starts, slots, has_init))
     ):
         raise ValueError("Prepare contiguous int32 starts/slots and bool initial-state flags")
+
     # The scalar fallback uses CuTe layout arithmetic with int32 extents.
     # Reject overflowing layouts before launch rather than wrap an address.
-    if any(
-        sum((n - 1) * stride for n, stride in zip(t.shape, t.stride())) >= 2**31 for t in tensors
+    # The kernel forms a state slot's base in Int64 (slot * stride), so for the
+    # pool only one slot's extent must fit int32. KV cache manager V2 keeps the
+    # states of all layers of a slot together, so a large pool passes int32 as a whole.
+    def span(shape, strides):
+        return sum((n - 1) * stride for n, stride in zip(shape, strides))
+
+    if any(span(t.shape, t.stride()) >= 2**31 for t in tensors if t is not conv_state) or (
+        span(conv_state.shape[1:], conv_state.stride()[1:]) >= 2**31
     ):
         raise ValueError("KDA convolution tensor offsets must fit int32")
     writable = (conv_state, q, k, v)
