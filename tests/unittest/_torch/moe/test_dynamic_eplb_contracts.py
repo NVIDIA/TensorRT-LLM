@@ -344,7 +344,7 @@ def test_vendored_live_plane_abi_matches_independent_goldens(
     expected_stride_bytes,
     expected_planes,
 ):
-    path = _TORCH_ROOT / "cute_dsl_kernels/megamoe_scheduler/sami/geometry.py"
+    path = _TORCH_ROOT / "moe/kernels/megamoe_scheduler/sami/geometry.py"
     module_name = f"_live_plane_geometry_{hidden}_{intermediate}"
     spec = importlib.util.spec_from_file_location(module_name, path)
     assert spec is not None and spec.loader is not None
