@@ -165,6 +165,8 @@ class RebalanceSlotSchedulerGroup:
         self._finished_generation = 0
         self._scheduled_generation = 0
         self._route_wait_generation = 0
+        # Routes of the latest launch, held until MAIN waits for its route epoch.
+        self._routes_in_flight: Optional[torch.Tensor] = None
         self._owner_thread_id: Optional[int] = None
         self._execution_stream_handle: Optional[int] = None
         self._closed = False
@@ -293,6 +295,7 @@ class RebalanceSlotSchedulerGroup:
         self._execution_stream_handle = None
         self._plan_part = None
         self._pending_release = None
+        self._routes_in_flight = None
         self.lease = None
         self.broadcaster = None
         self.scheduler = None
@@ -390,9 +393,14 @@ class RebalanceSlotSchedulerGroup:
     def plan_schedule(self, logical_expert_ids: torch.Tensor) -> Tuple[Any, int]:
         """Submit contiguous CUDA int32 routes [tokens, topk] without staging.
 
-        The route producer must run on MAIN and must not overwrite this tensor
-        until HALO-Q finishes. record_stream protects allocator reuse while COPY
-        consumes the input. Empty ranks still submit and join the EP exchange.
+        The route producer must allocate and write this tensor on MAIN and must
+        not overwrite it until HALO-Q finishes. The group holds the tensor until
+        wait_for_routes() orders MAIN after the route epoch. Every HALO-Q CTA
+        reads its routes before it raises that epoch, so the caching allocator
+        can only reuse the block for MAIN work queued after that wait. This needs
+        no COPY-stream allocator event, which every later allocation would poll
+        while COPY runs behind MAIN. Empty ranks still submit and join the EP
+        exchange.
         """
         self._check_owner()
         if self._plan_part is not None or self._generation != self._finished_generation:
@@ -412,7 +420,7 @@ class RebalanceSlotSchedulerGroup:
 
         # Both waits capture their event's current record before a later plan
         # can re-record it. No host synchronization or temporary event is needed.
-        logical_expert_ids.record_stream(self.copy_stream)
+        self._routes_in_flight = logical_expert_ids
         self._record_event(self._input_ready_handle, self._execution_stream_handle)
         self._wait_event(self._stream_handle, self._input_ready_handle)
         outputs = self.scheduler.outputs
@@ -452,13 +460,22 @@ class RebalanceSlotSchedulerGroup:
         return physical, self._generation
 
     def wait_for_routes(self) -> None:
-        """Order the first MAIN route read after HALO-Q, without a host wait."""
+        """Order the first MAIN route read after HALO-Q, without a host wait.
+
+        The first call of a generation checks the owner and queues the stream
+        wait. Later calls of that generation return at once: their consumers
+        are already ordered after it on MAIN.
+        """
+        generation = self._generation
+        if generation > 0 and generation == self._route_wait_generation and not self._closed:
+            return
         self._check_owner()
-        if self._generation <= 0:
+        if generation <= 0:
             raise RuntimeError("No scheduler generation is available")
-        if self._route_wait_generation != self._generation:
-            self._wait_route_epoch(self._execution_stream_handle)
-            self._route_wait_generation = self._generation
+        self._wait_route_epoch(self._execution_stream_handle)
+        self._route_wait_generation = generation
+        # MAIN work queued from here on runs after every HALO-Q read of the routes.
+        self._routes_in_flight = None
 
     def plan(
         self, logical_expert_ids: torch.Tensor, *, defer_wait: bool = False

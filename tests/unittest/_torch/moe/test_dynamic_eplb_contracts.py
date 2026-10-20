@@ -1273,10 +1273,15 @@ def test_fused_submit_orders_generations_and_defers_the_route_wait(auxiliary_sms
         assert physical.shape == (rows, 6)
         assert actual_generation == generation
         assert route_wait not in trace
+        # The group, not an allocator stream event, keeps the routes alive
+        # until MAIN waits for every HALO-Q read of them.
+        assert group._routes_in_flight is routes
         group.wait_for_routes()
+        assert group._routes_in_flight is None
         group.wait_for_routes()
         group.finish()
         assert trace.count(route_wait) == 1
+        assert not any(entry[0] == "lifetime" for entry in trace)
         assert trace.index(("wait", 19, 1)) < trace.index(("FUSED", rows, target, generation))
         assert trace.index(("FUSED", rows, target, generation)) < trace.index(route_wait)
         assert trace[-2:] == [("record", 3, 44), ("consumer_release", generation, 3)]
@@ -1311,6 +1316,11 @@ def test_fused_submit_orders_generations_and_defers_the_route_wait(auxiliary_sms
         group.plan_schedule(_Routes(8, trace))
     assert not any(entry[0] == "FUSED" for entry in trace)
     assert group._plan_part is None
+
+    # A closed group rejects every route wait, including one of a waited generation.
+    group._closed = True
+    with pytest.raises(RuntimeError, match="closed"):
+        group.wait_for_routes()
 
 
 def _module_constants(path: Path, names: set[str]) -> dict:
