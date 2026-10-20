@@ -28,14 +28,18 @@ l0_gb300_multi_gpus:
   - accuracy/modeling_v2/test_deepseek_v3.py::TestModelingV2DeepseekR10528Nvfp4Sm10xDefault::test_gsm8k[dep4_moetp4]
   - accuracy/modeling_v2/test_deepseek_v3.py::TestModelingV2DeepseekR10528Nvfp4Sm10xDefault::test_gsm8k_chunked_prefill[tp4_ep4]
   - accuracy/modeling_v2/test_deepseek_v3.py::TestModelingV2DeepseekR10528Nvfp4Sm10xDefault::test_gsm8k_chunked_prefill[dep4]
-  # Covers tests/unittest/_torch/attention/. Two sub-trees moved in here from elsewhere
-  # under tests/unittest/_torch/ and have no entry of their own on any list, so this entry
-  # is what picks them up:
-  #   kernels/    fused attention kernels (ex thop/ and custom_ops/)
-  #   multi_gpu/  helix tests -- each case spawns a 2-rank MPIPoolExecutor pinned to GPU 0/1
-  #               by absolute index, and they gate on >= 2 GPUs plus Blackwell. They also
-  #               rebind mpi4py's serializer at import time, which applies process-wide on
-  #               every stage that collects them, including where the tests themselves skip.
+  # Covers tests/unittest/_torch/attention/ on GB300, kernels/ and multi_gpu/ included.
+  # - Width: this entry text matches the GB300 row in agg_unit_mem_df.csv, so test_unittests
+  #   runs it with 4 xdist workers and retries failures serially with --lf. Adding --ignore
+  #   options would change the text and drop it to one worker with no retry.
+  #   TIMEOUT (120) bounds the whole entry.
+  # - kernels/parallel_hw_agnostic/ runs here too: l0_b200 and l0_b300 ignore it, but an
+  #   --ignore here would cost the csv match above. This post_merge stage is the only
+  #   Blackwell stage that runs it.
+  # - multi_gpu/ cases need >= 2 GPUs. Its helix exchange cases each spawn a 2-rank
+  #   MPIPoolExecutor pinned to GPU 0/1 by absolute index, and its helix files rebind
+  #   mpi4py's serializer at import time, which applies process-wide on every stage that
+  #   collects them.
   - unittest/_torch/attention TIMEOUT (120)
   - unittest/_torch/moe/kernels/parallel
   - unittest/_torch/kernels/parallel

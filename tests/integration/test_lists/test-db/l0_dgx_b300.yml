@@ -19,7 +19,9 @@ l0_dgx_b300:
       backend: pytorch
   tests:
   # Single-GPU coverage of tests/unittest/_torch/attention/ on B300 comes from l0_b300
-  # (pre_merge, same GPU), so this 4-GPU stage runs only multi_gpu/, whose cases need
+  # (pre_merge, same GPU), except kernels/parallel_hw_agnostic/, which does not depend on
+  # the GPU architecture and runs on H100 (pre_merge; its cpu_only cases also on CPU) and
+  # on GB300 (post_merge). So this 4-GPU stage runs only multi_gpu/, whose cases need
   # >= 2 GPUs; test_helix_zero_kv.py runs in this list's pre_merge block instead.
   # No agg_unit_mem_df.csv row matches this entry text, so test_unittests runs it with one
   # xdist worker and no --lf retry. TIMEOUT (60) bounds the whole entry.
