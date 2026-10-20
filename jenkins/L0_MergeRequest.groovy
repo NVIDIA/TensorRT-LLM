@@ -2895,6 +2895,9 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
             script {
                 def testStageName = "[Build-Docker-Images] Remote Run"
                 stage(testStageName) {
+                    if (runMode == "nightly_release") {
+                        error "Build-Docker-Images does not support nightly_release; use Build-Release-Docker-Images"
+                    }
                     try {
                         def branch = globalVars[BUILD_BRANCH]
 
@@ -2907,9 +2910,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                         def additionalParameters = [
                             'branch': branch,
                             'action': "push",
-                            'triggerType': runMode == "nightly_release" ?
-                                "nightly-release" :
-                                (env.JOB_NAME ==~ /.*PostMerge.*/ ? "post-merge" : "pre-merge"),
+                            'triggerType': env.JOB_NAME ==~ /.*PostMerge.*/ ? "post-merge" : "pre-merge",
                             'runSanityCheck': env.JOB_NAME ==~ /.*PostMerge.*/,
                             'defaultTag': defaultTag,
                             'program_version_name': env.NSPECT_RELEASE_VERSION,
@@ -2934,15 +2935,6 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                             // built from source rather than downloaded.
                             'boltOptimizeWheel': true,
                         ]
-                        if (runMode == "nightly_release") {
-                            additionalParameters += [
-                                'buildInternalRelease': false,
-                                'buildCiImage': false,
-                                'buildNgcRelease': true,
-                                'useWheelFromBuildStage': false,
-                                'wait_success_seconds': "",
-                            ]
-                        }
                         if (params.release_type_id) {
                             additionalParameters['release_type_id'] = params.release_type_id
                         }
@@ -3002,6 +2994,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                         if (runMode == "nightly_release") {
                             additionalParameters += [
                                 'buildNgcRelease': true,
+                                'useWheelFromBuildStage': true,
                                 'wait_success_seconds': "",
                             ]
                             additionalParameters['program_version_name'] = env.NSPECT_RELEASE_VERSION
