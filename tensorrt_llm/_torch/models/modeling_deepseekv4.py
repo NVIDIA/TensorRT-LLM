@@ -47,7 +47,7 @@ from transformers import PretrainedConfig
 import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 from tensorrt_llm._ipc_utils import can_access_peer
 from tensorrt_llm._torch.models.checkpoints.base_weight_loader import ConsumableWeightsDict
-from tensorrt_llm._utils import get_sm_version, is_sm_120f
+from tensorrt_llm._utils import get_sm_version, is_sm_100f, is_sm_120f
 from tensorrt_llm.functional import PositionEmbeddingType, RotaryScalingType
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
@@ -1736,7 +1736,7 @@ class DeepseekV4MoE(nn.Module):
         use_fused_fc12 = (
             self._per_layer_dynamic_eplb_enabled
             and self._shared_fc12_backend_supported(rebalance_backend)
-            and get_sm_version() == 107
+            and is_sm_100f()
             and self._shared_fc12_quantization_supported(gate_up_quant_config, down_quant_config)
             and not model_config.use_cuda_graph
         )
