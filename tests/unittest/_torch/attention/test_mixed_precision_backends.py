@@ -618,15 +618,12 @@ def test_mixed_precision_public_options():
     from pydantic import ValidationError
 
     assert KvCacheConfig().mixed_precision_dtypes is None
-    assert KvCacheConfig(dtype="fp8").attention_dtype == "fp8"
     config = KvCacheConfig(dtype="mixed_nvfp4_fp8")
     assert config.mixed_precision_dtypes == ("nvfp4", "fp8")
-    assert config.attention_dtype == "fp8"
     assert config.first_n == config.last_n == 256
     assert config.pool_ratio is None
     for high in ("float16", "bfloat16"):
-        # Model-dtype retention leaves the checkpoint's KV quantization untouched.
-        assert KvCacheConfig(dtype=f"mixed_nvfp4_{high}").attention_dtype == "auto"
+        assert KvCacheConfig(dtype=f"mixed_nvfp4_{high}").mixed_precision_dtypes == ("nvfp4", high)
     for invalid in (
         {"dtype": "mixed_int4_fp8"},
         {"dtype": "mixed_nvfp4_nvfp4"},

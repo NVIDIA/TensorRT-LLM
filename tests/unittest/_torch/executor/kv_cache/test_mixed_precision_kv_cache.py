@@ -162,7 +162,8 @@ def test_mixed_precision_keeps_kv_quota(make_manager):
 
 
 def test_pool_ratio_must_cover_retained_group(make_manager):
-    with pytest.raises(ValueError, match="needs 2"):
+    # The runtime counts the appended retained-token group as a layer group.
+    with pytest.raises(ValueError, match="layer groups"):
         make_manager(config=mixed_config(pool_ratio=[1.0]))
 
 

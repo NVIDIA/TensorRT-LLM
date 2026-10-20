@@ -65,9 +65,16 @@ _KV_CACHE_MAP = {
     "fp8": QuantAlgo.FP8.value,
     "fp8_ds_mla": QuantAlgo.FP8.value,
     "nvfp4": QuantAlgo.NVFP4.value,
-    "auto": "auto"
+    "auto": "auto",
+    # Mixed-precision KV: the retained tokens and attention use the second
+    # dtype; float16/bfloat16 mean the model dtype, i.e. no KV quantization.
+    "mixed_nvfp4_fp8": QuantAlgo.FP8.value,
+    "mixed_nvfp4_float16": None,
+    "mixed_nvfp4_bfloat16": None,
 }
-_VALID_KV_CACHE_DTYPES = ("fp8", "fp8_ds_mla", "nvfp4", "auto")
+_VALID_KV_CACHE_DTYPES = ("fp8", "fp8_ds_mla", "nvfp4", "auto",
+                          "mixed_nvfp4_fp8", "mixed_nvfp4_float16",
+                          "mixed_nvfp4_bfloat16")
 
 # Dense models do not consume the MoE backend or MoE mapping dimensions. Their
 # runtime topology remains bounded by the general and attention dimensions.
@@ -1976,7 +1983,7 @@ class ModelLoader:
         config.extra_attrs[
             'nvfp4_gemm_allowed_backends'] = config.nvfp4_gemm_allowed_backends
         config.extra_attrs[
-            'kv_cache_dtype'] = self.llm_args.kv_cache_config.attention_dtype
+            'kv_cache_dtype'] = self.llm_args.kv_cache_config.dtype
         config.extra_attrs["bounded_replay_on_generation"] = (
             self.llm_args.bounded_replay_on_generation)
         # Store allreduce pre-allocation config for AllReduce module access.
@@ -2002,8 +2009,8 @@ class ModelLoader:
         validate_encoder_decoder_tp_scope(config)
         validate_encoder_decoder_kv_cache_config(config,
                                                  self.llm_args.kv_cache_config)
-        validate_and_set_kv_cache_quant(
-            config, self.llm_args.kv_cache_config.attention_dtype)
+        validate_and_set_kv_cache_quant(config,
+                                        self.llm_args.kv_cache_config.dtype)
         validate_fp4_mla_config(config, self.llm_args)
         validate_and_set_mamba_ssm_cache_dtype(
             config, self.llm_args.kv_cache_config.mamba_ssm_cache_dtype,

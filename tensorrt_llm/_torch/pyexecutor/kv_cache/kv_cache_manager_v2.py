@@ -3286,36 +3286,9 @@ class KVCacheManagerV2(BaseResourceManager):
         if not self.high_layers:
             return config
         self._layer_attn_to_layer_id = layer_attn_to_layer_id
-        if config.initial_pool_ratio is not None:
-            num_groups = self._count_layer_groups(config, layers)
-            if len(config.initial_pool_ratio) != num_groups:
-                raise ValueError(
-                    f"kv_cache_config.pool_ratio has {len(config.initial_pool_ratio)} entries, "
-                    f"but mixed-precision KV needs {num_groups}: one per layer group of the "
-                    "model followed by one for the retained first_n/last_n tokens. Leave "
-                    "pool_ratio unset to size the groups automatically."
-                )
+        # A configured pool_ratio must now cover the appended retained-token
+        # group as well; the runtime rejects a mismatched length.
         return replace(config, layers=layers)
-
-    @staticmethod
-    def _count_layer_groups(config: KVCacheManagerConfigPy, layers: Sequence[object]) -> int:
-        """Count the layer groups the runtime forms from these layer configs."""
-        groups: list = []
-        for layer in layers:
-            if isinstance(layer, AttentionLayerConfig):
-                life_cycle = AttnLifeCycle.make(
-                    layer.sliding_window_size,
-                    layer.num_sink_tokens,
-                    config.tokens_per_block,
-                    bool(layer.buffers and layer.buffers[0].is_sparse),
-                    layer.reuse_policy,
-                )
-            else:
-                life_cycle = None
-            # AttnLifeCycle compares by value but is not hashable.
-            if (type(layer), life_cycle) not in groups:
-                groups.append((type(layer), life_cycle))
-        return len(groups)
 
     def _get_mixed_precision_buffers(
         self, layer_offset: int, kv_layout: str, mixed_precision_pool: str

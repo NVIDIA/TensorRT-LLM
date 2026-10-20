@@ -139,9 +139,9 @@ kv_cache_config:
 
 The first part of the dtype names the history storage (NVFP4 values with one
 FP8 scale per 16 elements); the second part is the dtype attention computes
-in and the retained tokens are stored in. `fp8` selects FP8 KV quantization;
-`float16` and `bfloat16` keep the model dtype and are rejected when the
-checkpoint resolves its KV cache to a different dtype. Retention follows the
+in and the retained tokens are stored in. Like `dtype: fp8`, it overrides the
+checkpoint's KV quantization: `fp8` selects FP8 KV, `float16` and `bfloat16`
+select the unquantized model dtype. Retention follows the
 cache page granularity, and at least one of `first_n` and `last_n` must be
 positive.
 

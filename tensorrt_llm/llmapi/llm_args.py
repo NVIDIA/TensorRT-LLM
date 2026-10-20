@@ -5129,20 +5129,6 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         match = _MIXED_PRECISION_KV_DTYPE.match(self.dtype)
         return None if match is None else (match["low"], match["high"])
 
-    @property
-    def attention_dtype(self) -> str:
-        """The dtype setting the KV quantization plumbing should see.
-
-        For a mixed-precision cache attention reads and writes the retained
-        dtype: 'fp8' selects FP8 KV quantization, and 'float16'/'bfloat16'
-        are the model dtype, so they map to 'auto' like a plain cache. The
-        manager rejects a checkpoint whose KV dtype resolves differently.
-        """
-        mixed = self.mixed_precision_dtypes
-        if mixed is None:
-            return self.dtype
-        return mixed[1] if mixed[1] == "fp8" else "auto"
-
     @model_validator(mode='after')
     def reject_fp8_ds_mla_pool_rebalance(self) -> 'KvCacheConfig':
         """Reject resizing while packed sparse-MLA pool views are fixed."""
@@ -7751,13 +7737,17 @@ class TorchLlmArgs(BaseLlmArgs):
             return self
 
         assert self.quant_config is not None
-        kv_cache_dtype = self.kv_cache_config.attention_dtype
-        if kv_cache_dtype == "auto":
+        if self.kv_cache_config.dtype == "auto":
             return self
-        elif kv_cache_dtype in ('fp8', 'fp8_ds_mla'):
+        elif self.kv_cache_config.dtype in ('fp8', 'fp8_ds_mla',
+                                            'mixed_nvfp4_fp8'):
             self.quant_config.kv_cache_quant_algo = QuantAlgo.FP8
-        elif kv_cache_dtype == 'nvfp4':
+        elif self.kv_cache_config.dtype == 'nvfp4':
             self.quant_config.kv_cache_quant_algo = QuantAlgo.NVFP4
+        elif self.kv_cache_config.dtype in ('mixed_nvfp4_float16',
+                                            'mixed_nvfp4_bfloat16'):
+            # Retained tokens stay in the model dtype: no KV quantization.
+            self.quant_config.kv_cache_quant_algo = None
         else:
             logger.warning(
                 f"Cannot sync quant_config.kv_cache_quant_algo with kv_cache_config.dtype of {self.kv_cache_config.dtype}, "
