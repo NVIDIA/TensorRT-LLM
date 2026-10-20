@@ -274,6 +274,14 @@ def get_or_scale_allreduce_mnnvl_workspace(
         if workspace["buffer_size_bytes"] >= (buffer_size_bytes or 0):
             return _mark_if_capturing(workspace)
 
+    # Creation and growth allocate collectively under locks, which a Dynamo
+    # trace cannot carry; MNNVLAllReduce sizes the workspace for the model's
+    # largest all-reduce up front for that reason.
+    if torch.compiler.is_compiling():
+        raise RuntimeError(
+            "MNNVL all-reduce workspace creation or growth while tracing under torch.compile: size the "
+            "workspace before compiling")
+
     workspace_lock = MNNVLAllReduce._get_allreduce_mnnvl_workspace_lock(mapping)
     with workspace_lock:
         return _mark_if_capturing(
@@ -843,8 +851,20 @@ class MNNVLAllReduce(nn.Module):
                 f"MNNVL all reduce only supports dtype {MNNVLAllReduce.get_supported_dtypes()} and without cp."
             )
 
-        # Initialize the workspace
-        get_or_scale_allreduce_mnnvl_workspace(self.mapping, self.dtype)
+        # Size the workspace for the largest all-reduce the model can issue when
+        # the model-level prealloc attributes are known (set on AllReduceRunner
+        # by AllReduce.__init__), so it never has to grow inside a CUDA graph
+        # capture or a torch.compile trace. Warmup reaches that size anyway.
+        from tensorrt_llm._torch.custom_ops.torch_custom_ops import \
+            AllReduceRunner
+        max_num_tokens = AllReduceRunner._prealloc_max_num_tokens
+        hidden_size = AllReduceRunner._prealloc_hidden_size
+        buffer_size_bytes = None
+        if max_num_tokens and hidden_size:
+            buffer_size_bytes = MNNVLAllReduce.get_required_workspace_size(
+                max_num_tokens, hidden_size, mapping.tp_size, dtype)
+        get_or_scale_allreduce_mnnvl_workspace(self.mapping, self.dtype,
+                                               buffer_size_bytes)
 
     @staticmethod
     def get_supported_dtypes():

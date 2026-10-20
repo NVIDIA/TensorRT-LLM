@@ -697,6 +697,15 @@ def row_linear_residual_norm_fusion_forward(
 
     MPI.COMM_WORLD.barrier()
 
+    if compile:
+        # The model loader publishes these before the model is built; the MNNVL
+        # workspace is sized from them so it never grows inside a trace.
+        from tensorrt_llm._torch.custom_ops.torch_custom_ops import \
+            AllReduceRunner
+        AllReduceRunner._prealloc_max_num_tokens = max(x.shape[0]
+                                                       for x in x_list)
+        AllReduceRunner._prealloc_hidden_size = hidden_size
+
     # Create a single AllReduce instance to be reused for all sequence lengths
     allreduce = AllReduce(
         mapping=Mapping(
@@ -725,6 +734,11 @@ def row_linear_residual_norm_fusion_forward(
         else:
             output = allreduce(input)
             return (output, )
+
+    if strategy == AllReduceStrategy.MNNVL:
+        # Initialization failures are swallowed and fall back to AUTO; this
+        # test is about the MNNVL path.
+        assert allreduce.mnnvl_allreduce is not None
 
     if compile:
         # aot_eager runs Dynamo and AOT functionalization, the parts of the
@@ -824,8 +838,11 @@ def _run_row_linear_residual_norm_fusion(seq_len,
 def test_mnnvl_row_linear_residual_norm_fusion_compiled(fusion,
                                                         mpi_pool_executor):
     """The MNNVL all-reduce inside a torch.compile(fullgraph=True) region: the
-    workspace lookup must trace and the kernel's custom op must functionalize."""
-    _run_row_linear_residual_norm_fusion(SEQ_LEN_CASES[0],
+    workspace lookup must trace, the kernel's custom op must functionalize and
+    the workspace must not need to grow while tracing."""
+    # (12, 2048): the second shape needs a larger workspace than the default,
+    # which the construction-time sizing must already have provided.
+    _run_row_linear_residual_norm_fusion(SEQ_LEN_CASES[-1],
                                          8192,
                                          torch.bfloat16,
                                          AllReduceStrategy.MNNVL,

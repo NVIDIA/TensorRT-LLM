@@ -336,3 +336,55 @@ def test_workspace_lookup_traces_under_fullgraph(monkeypatch: pytest.MonkeyPatch
     workspace["handle"] = SimpleNamespace(is_mapped=lambda: False)
     with pytest.raises(RuntimeError, match="not attached"):
         get_or_scale_allreduce_mnnvl_workspace(mapping, torch.float32, buffer_size_bytes=16)
+
+
+@pytest.mark.cpu_only
+def test_workspace_growth_refuses_to_trace(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Growth allocates collectively under a lock, which a Dynamo trace cannot carry, so a
+    compiled lookup that needs a larger workspace fails with a message naming the cause."""
+    mapping = Mapping(world_size=1, tp_size=1, rank=0)
+    real_device = torch.device
+    _patch_workspace_dependencies(monkeypatch)
+    monkeypatch.setattr(ops_module, "McastGPUBuffer", lambda *args, **kwargs: _FakeMcastBuffer())
+    workspace = get_or_scale_allreduce_mnnvl_workspace(mapping, torch.float32)
+    too_large = workspace["buffer_size_bytes"] + 1
+    # Dynamo needs the real torch.device while tracing; the fixture's stand-in only served creation.
+    monkeypatch.setattr(ops_module.torch, "device", real_device)
+
+    def lookup(x: torch.Tensor) -> torch.Tensor:
+        cached = get_or_scale_allreduce_mnnvl_workspace(
+            mapping, torch.float32, buffer_size_bytes=too_large
+        )
+        return x + cached["buffer_flags"][0].float()
+
+    torch._dynamo.reset()
+    try:
+        with pytest.raises(Exception, match="while tracing under torch.compile"):
+            torch.compile(lookup, fullgraph=True, backend="eager")(torch.ones(2))
+    finally:
+        torch._dynamo.reset()
+    assert MNNVLAllReduce.allreduce_mnnvl_workspaces[mapping] is workspace
+
+
+@pytest.mark.cpu_only
+def test_mnnvl_allreduce_sizes_workspace_from_prealloc_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With the model-level prealloc attributes published, construction sizes the workspace for
+    the largest all-reduce instead of the default, so no later shape can trigger growth."""
+    from tensorrt_llm._torch.custom_ops.torch_custom_ops import AllReduceRunner
+
+    mapping = Mapping(world_size=1, tp_size=1, rank=0)
+    _patch_workspace_dependencies(monkeypatch)
+    monkeypatch.setattr(ops_module, "McastGPUBuffer", lambda *args, **kwargs: _FakeMcastBuffer())
+    monkeypatch.setattr(
+        ops_module.MnnvlMemory, "supports_mnnvl", staticmethod(lambda: True), raising=False
+    )
+    monkeypatch.setattr(AllReduceRunner, "_prealloc_max_num_tokens", 4096)
+    monkeypatch.setattr(AllReduceRunner, "_prealloc_hidden_size", 8192)
+
+    MNNVLAllReduce(mapping, torch.bfloat16)
+
+    expected = MNNVLAllReduce.get_required_workspace_size(4096, 8192, 1, torch.bfloat16)
+    assert expected > 1024 * 8192 * 2  # larger than the default initial buffer
+    assert MNNVLAllReduce.allreduce_mnnvl_workspaces[mapping]["buffer_size_bytes"] == expected
