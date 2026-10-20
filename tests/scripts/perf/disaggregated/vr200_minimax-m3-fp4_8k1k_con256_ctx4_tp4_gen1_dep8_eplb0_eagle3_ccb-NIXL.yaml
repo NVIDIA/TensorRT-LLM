@@ -119,7 +119,7 @@ worker_config:
     kv_cache_config:
       enable_block_reuse: false
       free_gpu_memory_fraction: 0.9
-      dtype: nvfp4
+      dtype: fp8
       tokens_per_block: 128
       use_kv_cache_manager_v2: true
       event_buffer_max_size: 0
@@ -172,7 +172,7 @@ worker_config:
     kv_cache_config:
       enable_block_reuse: false
       free_gpu_memory_fraction: 0.9
-      dtype: nvfp4
+      dtype: fp8
       tokens_per_block: 128
       use_kv_cache_manager_v2: true
       event_buffer_max_size: 0
