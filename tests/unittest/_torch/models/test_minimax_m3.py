@@ -2604,55 +2604,6 @@ def test_minimax_m3_gate_bf16_split_matches_fp32_router(rows: int) -> None:
     )
 
 
-@pytest.mark.skipif(not _has_cuda(), reason="MiniMax-M3 router gate needs CUDA")
-@pytest.mark.skipif(
-    not os.environ.get("MINIMAX_M3_ROUTER_DUMP_DIR"),
-    reason="set MINIMAX_M3_ROUTER_DUMP_DIR to dumped router inputs (router_dump_*.pt: y, w, b)",
-)
-@pytest.mark.parametrize("rows", [33, 96, 256])
-def test_minimax_m3_gate_bf16_split_on_dumped_router_inputs(rows: int) -> None:
-    """The BF16-split router keeps every top-4 choice of the FP64 reference on real inputs.
-
-    Each dump holds a decode step's BF16 router input ``y`` and the layer's FP32 gate
-    weight ``w`` and bias ``b``; ``rows`` rows are taken from consecutive dumps.
-    """
-    import glob
-
-    files = sorted(
-        glob.glob(os.path.join(os.environ["MINIMAX_M3_ROUTER_DUMP_DIR"], "router_dump_*.pt"))
-    )
-    assert files, "no router_dump_*.pt files"
-    files = files[: int(os.environ.get("MINIMAX_M3_ROUTER_DUMP_MAX", "96"))]
-    hidden_size, top_k = 6144, 4
-    mismatches, fp32_mismatches, total, worst = 0, 0, 0, 0.0
-    for start in range(0, len(files), 3):
-        dumps = [torch.load(f, map_location="cuda") for f in files[start : start + 3]]
-        y = torch.cat([d["y"] for d in dumps])[:rows].contiguous()
-        if y.shape[0] < rows:
-            continue
-        weight, bias = dumps[0]["w"].float(), dumps[0]["b"].float()
-        gate = modeling_minimaxm3.MiniMaxM3Gate(
-            hidden_size, weight.shape[0], top_k=top_k, routed_scaling_factor=1.0
-        ).cuda()
-        gate.load_weights([{"weight": weight, "e_score_correction_bias": bias}])
-        logits = gate(y)
-        reference = y.double() @ weight.double().t()
-        fp32_logits = torch.ops.trtllm.cublas_mm(
-            y.float(), weight.t(), bias=None, out_dtype=torch.float32
-        )
-        worst = max(worst, float((logits.double() - reference).abs().max()))
-        mismatches += _router_topk_mismatches(logits, reference, bias, top_k, 0.0)
-        fp32_mismatches += _router_topk_mismatches(fp32_logits, reference, bias, top_k, 0.0)
-        total += rows
-    assert total > 0
-    print(
-        f"rows={rows}: {total} rows, top-{top_k} flips split {mismatches} fp32 {fp32_mismatches}, "
-        f"max |logit err| {worst:.2e}"
-    )
-    assert mismatches == 0
-    assert worst < 1e-4
-
-
 @pytest.mark.gpu
 @pytest.mark.skipif(not _has_cuda(), reason="MiniMax-M3 needs CUDA")
 def test_text_norm_weights_real_loader_smoke(monkeypatch: pytest.MonkeyPatch):

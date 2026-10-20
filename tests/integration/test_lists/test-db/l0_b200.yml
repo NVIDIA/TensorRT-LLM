@@ -43,6 +43,8 @@ l0_b200:
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_unfused_index_projection_tp_construction
   - unittest/_torch/models/test_minimax_m3.py::test_horizontal_producer_explicit_caches_match_manager
   - unittest/_torch/models/test_minimax_m3.py::test_nvfp4_reload_preserves_attention_scale_storage[cuda]
+  - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_gate_stays_fp32_when_tf32_is_allowed
+  - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_gate_bf16_split_matches_fp32_router
   - unittest/others/test_kv_cache_transceiver.py::test_cpp_nixl_sync_transfer_stress
   - unittest/others/test_lora_manager.py
   - accuracy/test_llm_api_pytorch.py::TestLagunaXS::test_nvfp4
