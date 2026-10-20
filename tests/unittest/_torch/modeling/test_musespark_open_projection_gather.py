@@ -12,9 +12,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""TP8 fabric gather bit preservation across graph replay and tag wrap.
+"""TP4/TP8 fabric gather bit preservation across graph replay and tag wrap.
 
-Run with eight MPI ranks on two NVLink-connected four-GPU GB300 nodes.
+Run with eight MPI ranks on two NVLink-connected four-GPU GB300 nodes (TP8), or
+with four MPI ranks on one four-GPU GB300 node (TP4).
 """
 
 import time
@@ -33,20 +34,21 @@ from tensorrt_llm.mapping import Mapping
 def test_projection_gather_replay_and_wrap(columns: int, initial_epoch: int) -> None:
     """An independent CPU oracle checks raw BF16 bits, including NaN payloads."""
     comm = MPI.COMM_WORLD
-    if comm.Get_size() != 8 or not torch.cuda.is_available():
-        pytest.skip("Requires eight MPI ranks and CUDA")
+    world = comm.Get_size()
+    if world not in (4, 8) or not torch.cuda.is_available():
+        pytest.skip("Requires four or eight MPI ranks and CUDA")
     rank = comm.Get_rank()
     torch.cuda.set_device(rank % 4)
     if torch.cuda.get_device_capability() != (10, 3):
         pytest.skip("Requires GB300")
-    mapping = Mapping(world_size=8, tp_size=8, rank=rank, gpus_per_node=4)
+    mapping = Mapping(world_size=world, tp_size=world, rank=rank, gpus_per_node=4)
     workspace = ProjectionGatherWorkspace(mapping)
     workspace.counters.fill_(initial_epoch)
 
     # A large shape followed by small shapes must not leave stale tagged words
     # that become visible when a later launch grows or the tag wraps.
     for tokens in (1, 8, 128, 3, 1, 128):
-        local = torch.zeros(tokens, columns // 8, dtype=torch.bfloat16, device="cuda")
+        local = torch.zeros(tokens, columns // world, dtype=torch.bfloat16, device="cuda")
         workspace.gather(local)
         torch.cuda.synchronize()
         comm.Barrier()

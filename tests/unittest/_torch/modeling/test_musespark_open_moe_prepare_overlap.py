@@ -27,13 +27,27 @@ from tensorrt_llm._torch.models.modeling_musespark_open import (
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-@pytest.mark.parametrize("tokens", [1, 2, 8, 16, 80, 128, 129])
-def test_prepare_overlap_matches_serial_and_graph_replay(tokens):
+@pytest.mark.parametrize(
+    "tokens,large",
+    [(1, False), (2, False), (8, False), (16, False), (80, False), (128, False), (129, False)]
+    + [(129, True), (256, True), (512, True), (513, True)],
+)
+def test_prepare_overlap_matches_serial_and_graph_replay(tokens, large, monkeypatch):
     torch.manual_seed(923)
     with torch.inference_mode():
         mod = MuseSparkOpenMoE.__new__(MuseSparkOpenMoE)
         torch.nn.Module.__init__(mod)
         mod._prepare_stream = torch.cuda.Stream()
+        if large:
+            mod._prepare_overlap_max_tokens = 512
+        overlapped = []
+        original_stream = torch.cuda.stream
+
+        def recording_stream(stream):
+            overlapped.append(stream is mod._prepare_stream)
+            return original_stream(stream)
+
+        monkeypatch.setattr(torch.cuda, "stream", recording_stream)
         mod._pool_gather_workspace = None
         mod.nvtx = lambda name: contextlib.nullcontext()
         router_weight = torch.randn(256, 256, device="cuda")
@@ -49,6 +63,7 @@ def test_prepare_overlap_matches_serial_and_graph_replay(tokens):
         expected = (mod.router_logits(x), mod.prepare_expert_input(mod.pooler(x)))
         got = mod.prepare_moe_inputs(x)
         torch.cuda.synchronize()
+        assert overlapped == ([True] if tokens <= (512 if large else 128) else [])
         for a, b in zip(got, expected):
             torch.testing.assert_close(a, b, rtol=0, atol=0)
         graph = torch.cuda.CUDAGraph()
@@ -61,3 +76,19 @@ def test_prepare_overlap_matches_serial_and_graph_replay(tokens):
             torch.cuda.synchronize()
             for a, b in zip(got, expected):
                 torch.testing.assert_close(a, b, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("value,expected", [(None, 128), ("0", 128), ("1", 512), ("on", 512)])
+def test_large_prepare_overlap_switch(monkeypatch, value, expected):
+    from tensorrt_llm._torch.models import modeling_musespark_open as builtin
+
+    if value is None:
+        monkeypatch.delenv("MUSESPARK_OPEN_LARGE_PREPARE_OVERLAP", raising=False)
+    else:
+        monkeypatch.setenv("MUSESPARK_OPEN_LARGE_PREPARE_OVERLAP", value)
+    limit = (
+        builtin._LARGE_PREPARE_OVERLAP_MAX_TOKENS
+        if builtin._large_prepare_overlap_enabled()
+        else builtin._PREPARE_OVERLAP_MAX_TOKENS
+    )
+    assert limit == expected

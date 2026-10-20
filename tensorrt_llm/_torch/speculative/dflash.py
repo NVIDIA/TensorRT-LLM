@@ -42,6 +42,43 @@ from .interface import SpecMetadata, SpecWorkerBase
 # They share the pool layout, page table and paged append op
 _PAGED_ATTENTION_BACKENDS = ("TRTLLM", "FA4")
 
+# Opt-in: bound the dense (VANILLA) context arena by the drafter's sliding
+# window instead of max_seq_len. Every draft layer must carry a finite
+# window; the arena then keeps only the most recent window tokens per slot.
+_WINDOWED_CTX_ARENA_ENV = "TRTLLM_DFLASH_WINDOWED_CTX_ARENA"
+
+
+def windowed_ctx_arena_enabled() -> bool:
+    return os.environ.get(_WINDOWED_CTX_ARENA_ENV, "0") == "1"
+
+
+def drafter_config_window(draft_config: Optional[dict]) -> Optional[int]:
+    """Context window every draft layer applies, read from a drafter config.
+
+    ``dflash_config.use_swa`` / ``swa_window_size`` win; otherwise a top-level
+    ``sliding_window`` counts only when ``use_sliding_window`` is not False
+    and every entry of ``layer_types`` is a sliding layer. ``None`` when any
+    layer could attend beyond a window.
+    """
+    if not draft_config:
+        return None
+    dflash_config = draft_config.get("dflash_config") or {}
+    if dflash_config.get("use_swa") and dflash_config.get("swa_window_size"):
+        return int(dflash_config["swa_window_size"])
+    if draft_config.get("use_sliding_window") is False:
+        return None
+    window = draft_config.get("sliding_window")
+    layer_types = draft_config.get("layer_types") or []
+    if (
+        isinstance(window, int)
+        and window > 0
+        and layer_types
+        and all("sliding" in str(t) for t in layer_types)
+    ):
+        return window
+    return None
+
+
 if TYPE_CHECKING:
     from ...llmapi.llm_args import DFlashDecodingConfig
 
@@ -326,6 +363,12 @@ def validate_dflash_ctx_buffer_budget(
         c for c in (max_seq_len, draft_config.get("max_position_embeddings")) if c is not None
     ]
     max_ctx = min(_ctx_candidates) if _ctx_candidates else 8192
+    if windowed_ctx_arena_enabled() and attention_backend == "VANILLA":
+        # The windowed arena keeps the window plus one step of accepted
+        # tokens; see _lazy_init_ctx_buffers.
+        window = drafter_config_window(draft_config)
+        if window is not None:
+            max_ctx = min(max_ctx, window + K + 1)
     num_kv_heads_per_rank = (num_kv_heads + tp_size - 1) // tp_size
     # Config-time approximations of the real allocation's inputs: the lazy
     # allocation reads draft_model.fc.weight.dtype and _draft_block_width()
@@ -538,7 +581,9 @@ class DFlashSpecMetadata(SpecMetadata):
         batch_indices = torch.arange(
             num_seqs, dtype=torch.int, device="cpu", pin_memory=prefer_pinned()
         )
-        self.batch_indices_cuda[:num_seqs].copy_(batch_indices, non_blocking=True)
+        stager = self.step_input_stager
+        if stager is None or not stager.copy(self.batch_indices_cuda[:num_seqs], batch_indices):
+            self.batch_indices_cuda[:num_seqs].copy_(batch_indices, non_blocking=True)
 
         # Update slot mapping for DFlash context buffers
         worker = getattr(self, "_dflash_worker", None)
@@ -579,7 +624,8 @@ class DFlashSpecMetadata(SpecMetadata):
                 device="cpu",
                 pin_memory=prefer_pinned(),
             )
-            worker._batch_to_slot[:num_seqs].copy_(mapping, non_blocking=True)
+            if stager is None or not stager.copy(worker._batch_to_slot[:num_seqs], mapping):
+                worker._batch_to_slot[:num_seqs].copy_(mapping, non_blocking=True)
 
     def is_layer_capture(self, layer_id: int) -> bool:
         return layer_id in self._capture_layer_set
@@ -669,10 +715,24 @@ class DFlashWorker(SpecWorkerBase):
         # Host shadows of _ctx_len and of each request's prompt progress.
         self._ctx_len_host = None
         self._req_ctx_pos = {}
+        # Windowed arena: _ctx_len counts logical context tokens (and numbers
+        # RoPE positions); _ctx_base is the logical index held in physical
+        # column 0, so a slot's columns are [0, _ctx_len - _ctx_base).
+        # _ctx_keep is the number of most recent tokens kept, 0 when the
+        # arena is not windowed. _ctx_base is None unless the arena may be
+        # windowed (then it stays 0 while _ctx_keep is 0).
+        self._ctx_base = None
+        self._ctx_base_host = None
+        self._ctx_keep = 0
+        # Whether the dense context arena may keep only a window per slot
+        # (TRTLLM_DFLASH_WINDOWED_CTX_ARENA=1), decided once.
+        self.windowed_ctx_arena = windowed_ctx_arena_enabled()
         # Snapshot for rolling back in-place _ctx_len updates when a forward
         # fails (or after warmup). See _ensure_spec_dec_state_restored.
         self._saved_ctx_len = None
         self._saved_ctx_len_host = None
+        self._saved_ctx_base = None
+        self._saved_ctx_base_host = None
         self._saved_req_ctx_pos = None
         self._ctx_len_restore_pending = False
         # Deferred kv_lens_cuda rewind state (see _prepare_kv_for_draft_forward,
@@ -1051,6 +1111,10 @@ class DFlashWorker(SpecWorkerBase):
 
         self._ctx_len = torch.zeros(num_slots, dtype=torch.long, device="cuda")
         self._ctx_len_host = [0] * num_slots
+        if self.windowed_ctx_arena:
+            self._ctx_base = torch.zeros(num_slots, dtype=torch.long, device="cuda")
+            self._ctx_base_host = [0] * num_slots
+        self._ctx_keep = 0
         self._batch_to_slot = torch.zeros(max_batch, dtype=torch.long, device="cuda")
 
         self._free_slots = deque(range(max_batch))
@@ -1174,6 +1238,18 @@ class DFlashWorker(SpecWorkerBase):
                 (num_slots,), page_size, dtype=torch.int32, device="cuda"
             )
         else:  # dense private arena (VANILLA, unpaged)
+            self._ctx_keep = self._windowed_ctx_keep(draft_model, L)
+            if self._ctx_keep:
+                # Columns needed at once: the kept window, this step's
+                # accepted tokens (written before compaction), and the
+                # noise block the draft forward appends after them.
+                capacity = min(
+                    capacity, self._ctx_keep + self.max_draft_len + 1 + self._compute_block_size
+                )
+                logger.info(
+                    f"DFlash: windowed ctx arena keeps the last {self._ctx_keep} context "
+                    f"tokens per slot (capacity={capacity}, logical max_ctx={self._max_ctx})"
+                )
             self._check_ctx_arena_fits(capacity, num_slots, L, nkv, hd, dtype, kv_factor)
             kv_shape = (num_slots, L, capacity, nkv, hd)
             self._ctx_k_buf = torch.zeros(kv_shape, dtype=dtype, device="cuda")
@@ -1204,6 +1280,50 @@ class DFlashWorker(SpecWorkerBase):
             f"dflash_attention_backend={self._dflash_attention_backend}, "
             f"reuse_addressable={self._ctx_reuse_addressable}"
         )
+
+    def _windowed_ctx_keep(self, draft_model, num_layers: int) -> int:
+        """Context tokens the dense arena must keep per slot, 0 to keep all.
+
+        Bounded only when opted in and every draft layer attends through a
+        finite left window: a query at block row i sits at column
+        ``phys + i`` and reaches back ``window_left`` columns, so the last
+        ``window_left + 1`` context tokens cover every row's key set.
+        """
+        if not self.windowed_ctx_arena:
+            return 0
+        resolve = getattr(draft_model, "_resolve_block_attention", None)
+        if resolve is None:
+            logger.warning("DFlash: windowed ctx arena requested but the drafter has no windows.")
+            return 0
+        lefts = [resolve(layer_idx)[1][0] for layer_idx in range(num_layers)]
+        if not lefts or min(lefts) < 0:
+            logger.warning(
+                f"DFlash: windowed ctx arena requested but draft layer windows are {lefts}; "
+                "keeping the full context."
+            )
+            return 0
+        keep = max(lefts) + 1
+        return keep if keep < self._max_ctx else 0
+
+    def _compact_ctx_window(self, slots: torch.Tensor) -> None:
+        """Shift each slot's columns left so at most ``_ctx_keep`` remain.
+
+        Fixed-shape gather over the slot rows, so it is CUDA-graph safe; a
+        slot already within the window shifts by 0. Duplicate (dummy) slots
+        compute identical rows, so their concurrent writes agree.
+        """
+        phys = self._ctx_len[slots] - self._ctx_base[slots]
+        shift = (phys - self._ctx_keep).clamp_(min=0)
+        capacity = self._ctx_k_buf.size(2)
+        cols = torch.arange(capacity, dtype=torch.long, device=slots.device)
+        src = (cols.unsqueeze(0) + shift.unsqueeze(1)).clamp_(max=capacity - 1)
+        for buf in (self._ctx_k_buf, self._ctx_v_buf):
+            if buf is None:
+                continue
+            rows = buf[slots]  # [G, L, C, nkv, hd]
+            index = src.view(src.size(0), 1, capacity, 1, 1).expand_as(rows)
+            buf[slots] = rows.gather(2, index)
+        self._ctx_base[slots] += shift
 
     def _ctx_paged_index_args(self):
         """(kv_indices, kv_indptr) for the append op, and what ``rows`` means.
@@ -1348,27 +1468,60 @@ class DFlashWorker(SpecWorkerBase):
             attn_metadata.kv_lens_cuda[nc:bs] -= self._kv_rewind_amount
             attn_metadata.kv_lens_cuda[nc:bs].clamp_(min=0)
 
-    def _write_ctx_len(self, updates: dict[int, int]) -> None:
-        """Apply a slot-to-length mapping to _ctx_len in one async scatter."""
+    def _write_ctx_len(
+        self, updates: dict[int, int], base_updates: Optional[dict[int, int]] = None
+    ) -> None:
+        """Apply a slot-to-length mapping to _ctx_len in one async scatter.
+
+        A slot's _ctx_base comes from ``base_updates``; without an entry it
+        is 0 for a slot reset to length 0 and otherwise unchanged.
+        """
         if not updates:
             return
+        if self._ctx_base is None:
+            for slot, value in updates.items():  # Update host side mirror
+                self._ctx_len_host[slot] = value
+
+            slots, values = zip(*updates.items())
+            pinned = prefer_pinned()
+            slots_pinned = torch.tensor(slots, dtype=torch.long, pin_memory=pinned)
+            vals_pinned = torch.tensor(values, dtype=torch.long, pin_memory=pinned)
+            self._ctx_len.index_copy_(
+                0,
+                slots_pinned.to("cuda", non_blocking=True),
+                vals_pinned.to("cuda", non_blocking=True),
+            )
+            return
+        # Windowed arena: each slot's base moves with its length.
+        base_updates = base_updates or {}
+        bases = {}
         for slot, value in updates.items():  # Update host side mirror
             self._ctx_len_host[slot] = value
+            if slot in base_updates:
+                bases[slot] = base_updates[slot]
+            elif value == 0:
+                bases[slot] = 0
+            else:
+                bases[slot] = self._ctx_base_host[slot]
+            self._ctx_base_host[slot] = bases[slot]
 
         slots, values = zip(*updates.items())
         pinned = prefer_pinned()
         slots_pinned = torch.tensor(slots, dtype=torch.long, pin_memory=pinned)
         vals_pinned = torch.tensor(values, dtype=torch.long, pin_memory=pinned)
-        self._ctx_len.index_copy_(
-            0,
-            slots_pinned.to("cuda", non_blocking=True),
-            vals_pinned.to("cuda", non_blocking=True),
+        bases_pinned = torch.tensor(
+            [bases[slot] for slot in slots], dtype=torch.long, pin_memory=pinned
         )
+        slots_cuda = slots_pinned.to("cuda", non_blocking=True)
+        self._ctx_len.index_copy_(0, slots_cuda, vals_pinned.to("cuda", non_blocking=True))
+        self._ctx_base.index_copy_(0, slots_cuda, bases_pinned.to("cuda", non_blocking=True))
 
     def _restore_ctx_len_host(self) -> None:
         """Roll the host shadows back to their pre-forward snapshot."""
         if self._saved_ctx_len_host is not None:
             self._ctx_len_host = list(self._saved_ctx_len_host)
+        if self._saved_ctx_base_host is not None:
+            self._ctx_base_host = list(self._saved_ctx_base_host)
         if self._saved_req_ctx_pos is not None:
             self._req_ctx_pos = dict(self._saved_req_ctx_pos)
 
@@ -1411,6 +1564,7 @@ class DFlashWorker(SpecWorkerBase):
         # the same values, but reading it costs a D2H sync per request.
         host_pos = spec_metadata.host_position_ids
         ctx_len_updates = {}
+        ctx_base_updates = {}
         offset = 0
         num_contexts = attn_metadata.num_contexts
         # A context write addresses pages through row i of the block table, so
@@ -1439,7 +1593,8 @@ class DFlashWorker(SpecWorkerBase):
             # where the previous one ended. Everything else -- a fresh request, a
             # request id reused after completion, a prefill restarted after
             # preemption -- has to start from a clean slot.
-            reset = self._req_ctx_pos.get(req_id) != first_pos
+            prev_pos = self._req_ctx_pos.get(req_id)
+            reset = prev_pos != first_pos
             if self._assign_slot(req_id, reset=reset, updates=ctx_len_updates) is None:
                 logger.warning("DFlash: no free slots, skipping context store")
                 self._req_ctx_pos.pop(req_id, None)
@@ -1506,13 +1661,54 @@ class DFlashWorker(SpecWorkerBase):
                         torch.full((actual,), row, dtype=torch.long, device="cuda"),
                         local_pos,
                     )
+                elif self._ctx_keep:  # VANILLA, windowed arena
+                    # A slot reset this iteration holds nothing yet: its first
+                    # physical column is logical position `cur` (non-zero when
+                    # block reuse skipped a prefix), so any stale base from the
+                    # slot's previous occupant must not be used.
+                    reset_now = ctx_len_updates.get(slot) == 0
+                    base_cur = (
+                        cur if reset_now else ctx_base_updates.get(slot, self._ctx_base_host[slot])
+                    )
+                    phys_cur = cur - base_cur
+                    if phys_cur < 0:
+                        logger.warning(
+                            f"DFlash windowed arena: slot {slot} (req {req_id}) has base "
+                            f"{base_cur} > ctx_len {cur} (first_pos={first_pos}, "
+                            f"prev_pos={prev_pos}, reset={reset}, "
+                            f"pending_len={ctx_len_updates.get(slot)}, "
+                            f"host_len={self._ctx_len_host[slot]}, "
+                            f"host_base={self._ctx_base_host[slot]}); restarting the "
+                            f"slot window at {cur}."
+                        )
+                        base_cur = cur
+                        phys_cur = 0
+                    n_keep = min(actual, self._ctx_keep)
+                    drop = max(0, phys_cur + n_keep - self._ctx_keep)
+                    if drop > 0:
+                        # Older columns no window can reach any more.
+                        kept = phys_cur - drop
+                        self._ctx_k_buf[slot, :, :kept] = self._ctx_k_buf[
+                            slot, :, drop:phys_cur
+                        ].clone()
+                        if self._ctx_v_buf is not None:
+                            self._ctx_v_buf[slot, :, :kept] = self._ctx_v_buf[
+                                slot, :, drop:phys_cur
+                            ].clone()
+                        phys_cur = kept
+                    tail_k = chunk_k[actual - n_keep :].permute(1, 0, 2, 3)
+                    self._ctx_k_buf[slot, :, phys_cur : phys_cur + n_keep] = tail_k
+                    if chunk_v is not None:
+                        tail_v = chunk_v[actual - n_keep :].permute(1, 0, 2, 3)
+                        self._ctx_v_buf[slot, :, phys_cur : phys_cur + n_keep] = tail_v
+                    ctx_base_updates[slot] = end - (phys_cur + n_keep)
                 else:  # VANILLA DFlash backend (FlashAttention)
                     self._ctx_k_buf[slot, :, cur:end] = chunk_k.permute(1, 0, 2, 3)
                     if chunk_v is not None:
                         self._ctx_v_buf[slot, :, cur:end] = chunk_v.permute(1, 0, 2, 3)
             offset += slen
 
-        self._write_ctx_len(ctx_len_updates)
+        self._write_ctx_len(ctx_len_updates, ctx_base_updates)
 
     def _ensure_spec_dec_state_restored(self, attn_metadata, spec_metadata):
         # Restore first (in warmup mode kv_lens_cuda was saved and comes back
@@ -1533,6 +1729,8 @@ class DFlashWorker(SpecWorkerBase):
             # A failed forward must not keep this iteration's in-place
             # _ctx_len updates: roll back to the pre-forward snapshot.
             self._ctx_len.copy_(self._saved_ctx_len)
+            if self._saved_ctx_base is not None:
+                self._ctx_base.copy_(self._saved_ctx_base)
             self._restore_ctx_len_host()
             self._ctx_len_restore_pending = False
 
@@ -1588,6 +1786,9 @@ class DFlashWorker(SpecWorkerBase):
             # mutate _ctx_len until replay.
             self._saved_ctx_len = self._ctx_len.clone()
             self._saved_ctx_len_host = list(self._ctx_len_host)
+            if self._ctx_base is not None:
+                self._saved_ctx_base = self._ctx_base.clone()
+                self._saved_ctx_base_host = list(self._ctx_base_host)
             self._saved_req_ctx_pos = dict(self._req_ctx_pos)
             self._ctx_len_restore_pending = True
 
@@ -1777,6 +1978,8 @@ class DFlashWorker(SpecWorkerBase):
         # Restore context lengths after warmup; real runs keep the updates.
         if is_warmup:
             self._ctx_len.copy_(self._saved_ctx_len)
+            if self._ctx_base is not None:
+                self._ctx_base.copy_(self._saved_ctx_base)
             self._restore_ctx_len_host()
         self._ctx_len_restore_pending = False
 
@@ -2020,7 +2223,13 @@ class DFlashWorker(SpecWorkerBase):
                 gen_hs_to_project = gen_hs.reshape(-1, gen_hs.shape[-1])
                 projected_to_store = draft_model.project_target_hidden(gen_hs_to_project)
                 gen_num_accepted_long = gen_num_accepted.long()
-                col_idx = self._ctx_len[slots].unsqueeze(1) + offsets_kp1.unsqueeze(0)
+                if self._ctx_base is None:
+                    col_idx = self._ctx_len[slots].unsqueeze(1) + offsets_kp1.unsqueeze(0)
+                else:
+                    # Windowed arena: physical columns.
+                    col_idx = (self._ctx_len[slots] - self._ctx_base[slots]).unsqueeze(
+                        1
+                    ) + offsets_kp1.unsqueeze(0)
                 write_mask = offsets_kp1.unsqueeze(0) < gen_num_accepted_long.unsqueeze(1)
                 if self._ctx_block_tables is not None:
                     # Bound by what the manager handed THIS request: the masked
@@ -2028,6 +2237,8 @@ class DFlashWorker(SpecWorkerBase):
                     # safety) and a placeholder page resolves to another's.
                     gen_capacity = self._ctx_block_counts[gen_rows_out] * self._ctx_page_size
                     col_idx = torch.minimum(col_idx, (gen_capacity - 1).unsqueeze(1)).clamp_(min=0)
+                elif self._ctx_keep:
+                    col_idx = col_idx.clamp(max=self._ctx_k_buf.size(2) - 1)
                 else:
                     col_idx = col_idx.clamp(max=self._max_ctx - 1)
 
@@ -2070,8 +2281,15 @@ class DFlashWorker(SpecWorkerBase):
 
                 self._ctx_len[slots] += gen_num_accepted_long
                 self._ctx_len.clamp_(max=self._max_ctx)
+                if self._ctx_keep and not self._ctx_paged:
+                    self._compact_ctx_window(slots)
 
-            num_ctx_per_req_t = self._ctx_len[slots]
+            if self._ctx_base is None:
+                num_ctx_per_req_t = self._ctx_len[slots]
+            else:
+                # Windowed arena: the physical length the draft forward appends
+                # after and attends over.
+                num_ctx_per_req_t = self._ctx_len[slots] - self._ctx_base[slots]
             if self._ctx_block_tables is not None:
                 # The write above clamps columns to the request's allocation, so
                 # a context that outruns it has its tail written over the last

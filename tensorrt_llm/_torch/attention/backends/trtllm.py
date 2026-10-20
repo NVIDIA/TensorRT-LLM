@@ -28,6 +28,7 @@ if TYPE_CHECKING:
     from tensorrt_llm.mapping import Mapping
 
     from ...model_config import ModelConfig
+    from ...pyexecutor.runtime_hooks import StepInputStager
     from ...speculative.interface import SpecMetadata
     from ...speculative.spec_tree_manager import SpecTreeManager
     from .sparse.dsa.metadata import TokenMajorGenView
@@ -123,6 +124,8 @@ def generate_spec_decoding_packed_mask(max_num_requests: int,
 
 @dataclass(kw_only=True)
 class TrtllmAttentionMetadata(AttentionMetadata):
+    # A step-input stager while it records this metadata's writes, else None.
+    step_input_stager: ClassVar[Optional["StepInputStager"]] = None
     workspace: Optional[torch.Tensor] = None
     cuda_graph_workspace: Optional[torch.Tensor] = None
     workspace_reclaimable: bool = field(default=True, init=False)
@@ -997,8 +1000,12 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             device='cpu',
         )
         self.prompt_lens_cpu[:self.num_seqs].copy_(prompt_lens)
-        self.prompt_lens_cuda[:self.num_seqs].copy_(
-            self.prompt_lens_cpu[:self.num_seqs], non_blocking=True)
+        stager = self.step_input_stager
+        if stager is None or not stager.copy(
+                self.prompt_lens_cuda[:self.num_seqs],
+                self.prompt_lens_cpu[:self.num_seqs]):
+            self.prompt_lens_cuda[:self.num_seqs].copy_(
+                self.prompt_lens_cpu[:self.num_seqs], non_blocking=True)
 
         # number of tokens in the kv cache for each sequence in the batch
         cached_token_lens = torch.tensor(
@@ -1051,9 +1058,12 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         # the sequence length including the cached tokens and the input tokens.
         self.kv_lens[:self.num_seqs].copy_(
             kv_lens + self.kv_cache_params.num_extra_kv_tokens)
-        self.kv_lens_cuda[:self.num_seqs].copy_(maybe_pin_memory(
-            kv_lens[:self.num_seqs]),
-                                                non_blocking=True)
+        if stager is None or not stager.copy(
+                self.kv_lens_cuda[:self.num_seqs],
+                maybe_pin_memory(kv_lens[:self.num_seqs])):
+            self.kv_lens_cuda[:self.num_seqs].copy_(maybe_pin_memory(
+                kv_lens[:self.num_seqs]),
+                                                    non_blocking=True)
         # total kv lens for context requests and generation requests, without extra tokens
         self.host_total_kv_lens[0] = kv_lens[:self.num_contexts].sum().item()
         self.host_total_kv_lens[1] = kv_lens[self.num_contexts:self.
@@ -1091,13 +1101,17 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             if not spec_active and self.kv_cache_manager.tokens_per_block:
                 max_blocks = ceil_div(max_kv_len,
                                       self.kv_cache_manager.tokens_per_block)
-            self.kv_cache_manager.copy_batch_block_offsets(
-                self.kv_cache_block_offsets,
-                self.request_ids,
-                self.beam_width,
-                self.num_contexts,
-                self.num_seqs,
-                max_blocks=max_blocks)
+            if stager is None or not stager.block_offsets(
+                    self.kv_cache_manager, self.kv_cache_block_offsets,
+                    self.request_ids, self.beam_width, self.num_contexts,
+                    self.num_seqs):
+                self.kv_cache_manager.copy_batch_block_offsets(
+                    self.kv_cache_block_offsets,
+                    self.request_ids,
+                    self.beam_width,
+                    self.num_contexts,
+                    self.num_seqs,
+                    max_blocks=max_blocks)
 
             # Also prepare draft KV cache block offsets if draft_kv_cache_manager exists
             if self.draft_kv_cache_manager is not None:

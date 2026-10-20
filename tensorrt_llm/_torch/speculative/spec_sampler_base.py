@@ -30,6 +30,7 @@ import torch
 from ...sampling_params import SamplingParams
 from ..pyexecutor.llm_request import LlmRequest, LlmRequestState, get_draft_token_length
 from ..pyexecutor.resource_manager import BaseResourceManager
+from ..pyexecutor.runtime_hooks import SamplerStoreWriter
 from ..pyexecutor.sampler import (
     DEFAULT_BEAM_IDX,
     AsyncWorkerMixin,
@@ -166,6 +167,10 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
     """
 
     SampleState = SampleStateSpec
+
+    # The model's one-launch store writer, bound once by instantiate_sampler; None keeps
+    # the native stores and host copies.
+    store_writer: Optional[SamplerStoreWriter] = None
 
     def is_generation_model(self) -> bool:
         return True
@@ -442,8 +447,10 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
             for r in sampling_requests
         ]
 
-        slots = torch.as_tensor([r.py_seq_slot for r in sampling_requests], dtype=torch.long)
-        slots = slots.to(device="cuda", non_blocking=True)
+        store_writer = self.store_writer
+        if store_writer is None:
+            slots = torch.as_tensor([r.py_seq_slot for r in sampling_requests], dtype=torch.long)
+            slots = slots.to(device="cuda", non_blocking=True)
 
         o_new_tokens = outputs["new_tokens"][num_skip : num_skip + num_sampling_requests]
         o_new_tokens_lens = outputs["new_tokens_lens"][num_skip : num_skip + num_sampling_requests]
@@ -514,11 +521,32 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         elif o_next_new_tokens.shape[1] > next_new_tokens_width:
             o_next_new_tokens = o_next_new_tokens[:, :next_new_tokens_width]
 
-        # Use index_copy_ for efficient copying (slots are unique)
-        self.store.new_tokens.squeeze(-1).T.index_copy_(0, slots, o_new_tokens)
-        self.store.next_new_tokens.squeeze(-1).T.index_copy_(0, slots, o_next_new_tokens)
-        self.store.new_tokens_lens.index_copy_(0, slots, o_new_tokens_lens)
-        self.store.next_draft_tokens.index_copy_(0, slots, o_next_draft_tokens)
+        # The writer stores the outputs and copies the store to the host in one
+        # launch, or returns None, having written nothing, to keep the native path.
+        host_snapshots = (
+            None
+            if store_writer is None
+            else store_writer.store_and_copy_out(
+                self,
+                [r.py_seq_slot for r in sampling_requests],
+                o_new_tokens,
+                o_next_new_tokens,
+                o_new_tokens_lens,
+                o_next_draft_tokens,
+                o_verify_lens,
+            )
+        )
+        if host_snapshots is None:
+            if store_writer is not None:
+                slots = torch.as_tensor(
+                    [r.py_seq_slot for r in sampling_requests], dtype=torch.long
+                )
+                slots = slots.to(device="cuda", non_blocking=True)
+            # Use index_copy_ for efficient copying (slots are unique)
+            self.store.new_tokens.squeeze(-1).T.index_copy_(0, slots, o_new_tokens)
+            self.store.next_new_tokens.squeeze(-1).T.index_copy_(0, slots, o_next_new_tokens)
+            self.store.new_tokens_lens.index_copy_(0, slots, o_new_tokens_lens)
+            self.store.next_draft_tokens.index_copy_(0, slots, o_next_draft_tokens)
 
         # Create sample state with async D2H copy
         device_tensors = SampleStateTensorsSpec(
@@ -527,12 +555,24 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
             next_draft_tokens=self.store.next_draft_tokens,
         )
 
-        host_tensors = SampleStateTensorsSpec(
-            new_tokens=self._copy_to_host(self.store.new_tokens),
-            new_tokens_lens=self._copy_to_host(self.store.new_tokens_lens),
-            next_draft_tokens=self._copy_to_host(self.store.next_draft_tokens),
-            verify_lens=(self._copy_to_host(o_verify_lens) if o_verify_lens is not None else None),
-        )
+        if host_snapshots is None:
+            host_tensors = SampleStateTensorsSpec(
+                new_tokens=self._copy_to_host(self.store.new_tokens),
+                new_tokens_lens=self._copy_to_host(self.store.new_tokens_lens),
+                next_draft_tokens=self._copy_to_host(self.store.next_draft_tokens),
+                verify_lens=(
+                    self._copy_to_host(o_verify_lens) if o_verify_lens is not None else None
+                ),
+            )
+        else:
+            host_tensors = SampleStateTensorsSpec(
+                new_tokens=host_snapshots[0],
+                new_tokens_lens=host_snapshots[1],
+                next_draft_tokens=host_snapshots[2],
+                verify_lens=(
+                    self._copy_to_host(o_verify_lens) if o_verify_lens is not None else None
+                ),
+            )
         sampler_event = self._record_sampler_event()
 
         # Add dummy draft tokens to context requests for KV cache preparation
