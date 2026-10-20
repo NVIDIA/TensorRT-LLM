@@ -10,6 +10,7 @@ import math
 import os
 import socket
 import tempfile
+import threading
 from abc import ABC, abstractmethod
 from concurrent.futures import Executor
 from io import BytesIO
@@ -130,29 +131,32 @@ _SUPPORTED_IMAGE_FORMATS = ("pt", "np", "pil")
 # `_load_video_by_cv2` for the per-format contract.
 _SUPPORTED_VIDEO_FORMATS = ("pt", "np", "pil")
 
-# Module-level aiohttp session shared across all media fetch calls.
-# Created lazily on first use inside the async event loop, then reused so that
-# TCP connections are kept alive and not re-established per request.
-_global_aiohttp_session: aiohttp.ClientSession | None = None
-_global_aiohttp_session_loop: asyncio.AbstractEventLoop | None = None
+# One aiohttp session per event loop. Media loading can run on multiple live
+# loops in one process, and aiohttp sessions must only be used and closed from
+# their owning loop.
+_aiohttp_sessions: dict[asyncio.AbstractEventLoop, aiohttp.ClientSession] = {}
+_aiohttp_sessions_lock = threading.Lock()
 
 
 async def _get_aiohttp_session() -> aiohttp.ClientSession:
     """Return the aiohttp session owned by the current event loop."""
-    global _global_aiohttp_session, _global_aiohttp_session_loop
     current_loop = asyncio.get_running_loop()
-    if (
-        _global_aiohttp_session is None
-        or _global_aiohttp_session.closed
-        or _global_aiohttp_session_loop is not current_loop
-    ):
-        previous_session = _global_aiohttp_session
-        connector = aiohttp.TCPConnector(resolver=_ValidatingResolver())
-        _global_aiohttp_session = aiohttp.ClientSession(connector=connector)
-        _global_aiohttp_session_loop = current_loop
-        if previous_session is not None and not previous_session.closed:
-            await previous_session.close()
-    return _global_aiohttp_session
+    with _aiohttp_sessions_lock:
+        session = _aiohttp_sessions.get(current_loop)
+        if session is None or session.closed:
+            connector = aiohttp.TCPConnector(resolver=_ValidatingResolver())
+            session = aiohttp.ClientSession(connector=connector)
+            _aiohttp_sessions[current_loop] = session
+    return session
+
+
+async def _close_aiohttp_session() -> None:
+    """Close and forget the media session owned by the current event loop."""
+    current_loop = asyncio.get_running_loop()
+    with _aiohttp_sessions_lock:
+        session = _aiohttp_sessions.pop(current_loop, None)
+    if session is not None and not session.closed:
+        await session.close()
 
 
 # Maximum allowed response size for remote fetches (200 MB).

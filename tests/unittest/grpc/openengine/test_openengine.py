@@ -29,6 +29,7 @@ from tensorrt_llm.grpc.openengine.bindings import (  # noqa: E402
     server_pb2,
 )
 from tensorrt_llm.grpc.openengine.server import OpenEngineServer  # noqa: E402
+from tensorrt_llm.inputs.media_io import _get_aiohttp_session  # noqa: E402
 
 # grpc.aio starts a `_poll_wrapper` daemon thread on server start and tears it
 # down only once its internal state is released, which happens after the event
@@ -78,6 +79,7 @@ def test_openengine_server_serves_the_control_contract() -> None:
         assert server.port != 0
 
         await server.start()
+        media_session = await _get_aiohttp_session()
         with pytest.raises(RuntimeError, match="Failed to bind"):
             OpenEngineServer(host="127.0.0.1", port=server.port, llm=llm, model="test-model")
         channel = grpc.aio.insecure_channel(f"127.0.0.1:{server.port}")
@@ -99,6 +101,7 @@ def test_openengine_server_serves_the_control_contract() -> None:
         finally:
             await channel.close()
             await server.stop(grace=0)
+        assert media_session.closed
 
     asyncio.run(exercise_server())
 

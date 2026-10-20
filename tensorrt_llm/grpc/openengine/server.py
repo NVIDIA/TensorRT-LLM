@@ -20,6 +20,7 @@ import grpc
 import uvloop
 
 from tensorrt_llm import LLM as PyTorchLLM
+from tensorrt_llm.inputs.media_io import _close_aiohttp_session
 from tensorrt_llm.logger import logger
 from tensorrt_llm.serve._frontend_processes import (
     FrontendStartupCancelled,
@@ -170,7 +171,10 @@ class OpenEngineServer:
         Args:
             grace: Maximum time in seconds to allow active RPCs to finish.
         """
-        await self._server.stop(grace=grace)
+        try:
+            await self._server.stop(grace=grace)
+        finally:
+            await _close_aiohttp_session()
         logger.info("OpenEngine server stopped")
 
     async def wait_for_termination(self) -> None:
