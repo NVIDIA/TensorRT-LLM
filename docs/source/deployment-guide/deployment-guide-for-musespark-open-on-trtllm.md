@@ -54,7 +54,7 @@ docker run --rm -it \
 ```
 
 > [!WARNING]
-> `1.4.0a0.dev202610171236` is a preview tag published from the head of `feat/musespark-open` (commit `79e45c5d`) on 2026-10-17. Preview artifacts are retained for roughly two months, so expect this tag (and the matching wheels) to be removed around mid-December 2026. If the tag is gone, use a newer release published from this branch (see the [release tags page](https://catalog.ngc.nvidia.com/orgs/nvidia/teams/tensorrt-llm/containers/release/tags)) or build the container from this branch's sources (see the [Docker guide](source:docker/README.md)).
+> `1.4.0a0.dev202610171236` is a preview tag published from the head of `feat/musespark-open` (commit `79e45c5d`) on 2026-10-17. Preview artifacts are retained for roughly two months, so expect this tag (and the matching wheels) to be removed around mid-December 2026. If the tag is gone, use a newer release published from this branch (see the [release tags page](https://catalog.ngc.nvidia.com/orgs/nvidia/teams/tensorrt-llm/containers/release/tags)) or build the container from this branch's sources (see the [Docker guide](https://github.com/NVIDIA/TensorRT-LLM/blob/feat/musespark-open/docker/README.md)).
 
 For installations without Docker, the matching Python wheel is available from the preview index:
 
