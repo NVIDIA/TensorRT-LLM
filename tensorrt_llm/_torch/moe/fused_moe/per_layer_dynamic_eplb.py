@@ -390,6 +390,11 @@ class PerLayerDynamicMoeLoadBalancer(BaseMoeLoadBalancer):
         self.auxiliary_sms = int(getattr(config, "auxiliary_sms", 8))
         if self.auxiliary_sms <= 0:
             raise ValueError("auxiliary_sms must be positive")
+        helper_slot_mode = getattr(config, "helper_slot_mode", "per_layer_resident")
+        if helper_slot_mode not in ("per_layer_resident", "shared_banks"):
+            raise ValueError(f"unknown helper_slot_mode {helper_slot_mode!r}")
+        # Resident helper experts need helper rows that only their layer writes.
+        self.helper_residency = helper_slot_mode == "per_layer_resident"
 
         # State read by the shared lifecycle and by the engine.
         self._previous_balancer = None
@@ -489,7 +494,7 @@ class PerLayerDynamicMoeLoadBalancer(BaseMoeLoadBalancer):
         """Create a per-layer provider scoped to this model manager."""
         from .mega_moe.rebalance_live_arena import SharedSlotArenaProvider
 
-        provider = SharedSlotArenaProvider(self)
+        provider = SharedSlotArenaProvider(self, per_layer_helper_sets=self.helper_residency)
         self._arena_providers.append(provider)
         return provider
 
