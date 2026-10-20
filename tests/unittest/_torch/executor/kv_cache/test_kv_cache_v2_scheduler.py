@@ -93,6 +93,7 @@ def test_resume_restores_page_buffers_and_sparse_metadata_row(sparse: bool) -> N
 @pytest.mark.parametrize("is_draft", [False, True])
 def test_sparse_metadata_publishes_after_preparation(is_draft: bool) -> None:
     manager = object.__new__(KVCacheManagerV2)
+    manager.impl = Mock()
     order = Mock()
     manager._disagg_receive_ready = {}
     manager.is_draft = is_draft
