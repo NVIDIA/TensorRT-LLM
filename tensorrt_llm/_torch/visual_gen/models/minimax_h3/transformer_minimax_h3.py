@@ -42,6 +42,8 @@ from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeig
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 
+from .vsa import get_h3_vsa_context, h3_vsa_attention
+
 MINIMAX_H3_MODALITY_NUM = 3
 
 
@@ -88,6 +90,19 @@ def apply_minimax_h3_rotary_emb(
     hidden_states_rotated = torch.cat((-x2, x1), dim=-1)
     hidden_states_rotary = hidden_states_rotary * cos + hidden_states_rotated * sin
     return torch.cat((hidden_states_rotary, hidden_states_pass), dim=-1).contiguous()
+
+
+def _dense_attention_model_config(model_config: DiffusionModelConfig) -> DiffusionModelConfig:
+    """Return a shallow config copy with VSA disabled for non-video attention."""
+
+    sparse_config = getattr(model_config.attention, "sparse_attention_config", None)
+    if sparse_config is None or getattr(sparse_config, "algorithm", None) != "vsa":
+        return model_config
+
+    dense_config = model_config.model_copy(deep=False)
+    dense_config.attention = model_config.attention.model_copy(deep=True)
+    dense_config.attention.sparse_attention_config = None
+    return dense_config
 
 
 class MiniMaxH3RotaryPosEmbed(nn.Module):
@@ -140,10 +155,25 @@ class MiniMaxH3Attention(Attention):
             # The shared fused kernel currently implements a different layout.
             fuse_qk_norm_rope=False,
             interleave=False,
-            config=model_config,
+            config=_dense_attention_model_config(model_config),
             layer_idx=layer_idx,
             module_name=module_name,
         )
+        sparse = model_config.attention.sparse_attention_config
+        self.to_gate_compress = None
+        if sparse is not None and sparse.algorithm == "vsa":
+            if model_config.attention.backend != "TRTLLM":
+                raise ValueError("MiniMax-H3 VSA currently requires the TRTLLM backend.")
+            if model_config.mapping.world_size != 1:
+                raise ValueError("MiniMax-H3 VSA currently supports a single GPU.")
+            self.to_gate_compress = Linear(
+                hidden_size,
+                num_attention_heads * attention_head_dim,
+                bias=False,
+                dtype=model_config.torch_dtype,
+                mapping=model_config.mapping,
+                skip_create_weights_in_init=model_config.skip_create_weights_in_init,
+            )
 
     def forward(
         self,
@@ -163,6 +193,14 @@ class MiniMaxH3Attention(Attention):
         if rotary_emb is not None:
             query = apply_minimax_h3_rotary_emb(query, *rotary_emb)
             key = apply_minimax_h3_rotary_emb(key, *rotary_emb)
+
+        if self.to_gate_compress is not None:
+            metadata = get_h3_vsa_context()
+            gate = self.to_gate_compress(hidden_states).view_as(query)
+            output = h3_vsa_attention(
+                query, key, value.view_as(query), gate, metadata, self._attn_impl
+            )
+            return self.to_out[0](output.flatten(2))
 
         query = query.flatten(2)
         key = key.flatten(2)
@@ -278,7 +316,7 @@ class MiniMaxH3TokenRefinerBlock(nn.Module):
             num_attention_heads=num_attention_heads,
             attention_head_dim=attention_head_dim,
             qk_norm_eps=qk_norm_eps,
-            model_config=model_config,
+            model_config=_dense_attention_model_config(model_config),
             layer_idx=layer_idx,
             module_name=f"token_refiner.refiner_blocks.{layer_idx}.attn",
         )
