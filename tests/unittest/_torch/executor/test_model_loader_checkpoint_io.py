@@ -32,6 +32,7 @@ from tensorrt_llm._torch.pyexecutor.model_loader import (
     _timed_checkpoint_weight_session,
     construct_checkpoint_loader,
 )
+from tensorrt_llm._torch.pyexecutor.weight_load_strategies import model_hooks
 from tensorrt_llm.checkpoint_format import CheckpointFormat
 from tensorrt_llm.llmapi.llm_args import CheckpointIOPolicy, LoadFormat
 from tensorrt_llm.mapping import Mapping
@@ -461,14 +462,18 @@ def test_checkpoint_session_times_preparation_and_finalization_separately(
     assert metrics == {"preparation": 1.0, "finalization": 1.0}
 
 
-def test_model_loader_session_spans_mapper_and_materialization() -> None:
+def test_model_loader_session_spans_mapper_and_materialization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     events = []
     model = MagicMock()
     checkpoint_loader = _SessionCheckpointLoader(events)
     loader = ModelLoader.__new__(ModelLoader)
     loader._metrics = {}
-    loader._call_load_weights = MagicMock(
-        side_effect=lambda *_args, **_kwargs: events.append("materialize")
+    monkeypatch.setattr(
+        model_hooks,
+        "call_load_weights",
+        MagicMock(side_effect=lambda *_args, **_kwargs: events.append("materialize")),
     )
     weights_preloaded = loader._materialize_checkpoint_weights(
         checkpoint_loader,
@@ -533,8 +538,10 @@ def test_shadow_plan_is_advisory_and_preserves_materialization_order(
     model = MagicMock()
     loader = ModelLoader.__new__(ModelLoader)
     loader._metrics = {}
-    loader._call_load_weights = MagicMock(
-        side_effect=lambda *_args, **_kwargs: events.append("materialize")
+    monkeypatch.setattr(
+        model_hooks,
+        "call_load_weights",
+        MagicMock(side_effect=lambda *_args, **_kwargs: events.append("materialize")),
     )
 
     loader._materialize_checkpoint_weights(
@@ -553,7 +560,7 @@ def test_shadow_plan_is_advisory_and_preserves_materialization_order(
         "materialize",
         "session_exit",
     ]
-    loader._call_load_weights.assert_called_once()
+    model_hooks.call_load_weights.assert_called_once()
 
 
 @pytest.mark.parametrize("failure_site", ["catalog", "plan"])
@@ -617,8 +624,10 @@ def test_draft_session_spans_mapper_and_materialization(
     loader._metrics = {}
     loader.spec_config = SimpleNamespace(speculative_model="/draft")
     loader.mapping = object()
-    loader._call_load_weights = MagicMock(
-        side_effect=lambda *_args, **_kwargs: events.append("materialize")
+    monkeypatch.setattr(
+        model_hooks,
+        "call_load_weights",
+        MagicMock(side_effect=lambda *_args, **_kwargs: events.append("materialize")),
     )
     draft_mapper = MagicMock()
     draft_mapper.init_model_and_config.side_effect = lambda *_args: events.append("mapper_init")
@@ -669,13 +678,15 @@ def test_mtp_draft_session_reuses_target_mapper_during_materialization(
     loader.weight_mapper = SimpleNamespace(
         build_weight_load_plan=MagicMock(side_effect=lambda _catalog: events.append("plan") or plan)
     )
-    loader._call_load_weights = MagicMock(
-        side_effect=lambda *_args, **_kwargs: events.append("materialize")
+    monkeypatch.setattr(
+        model_hooks,
+        "call_load_weights",
+        MagicMock(side_effect=lambda *_args, **_kwargs: events.append("materialize")),
     )
 
     loader._materialize_draft_checkpoint_weights(checkpoint_loader, model)
 
-    assert loader._call_load_weights.call_args.args[2] is loader.weight_mapper
+    assert model_hooks.call_load_weights.call_args.args[2] is loader.weight_mapper
     assert events == [
         "session_enter",
         "catalog",
