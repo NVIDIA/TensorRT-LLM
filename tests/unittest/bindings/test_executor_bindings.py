@@ -345,9 +345,11 @@ def test_result_pickle():
     result.is_sequence_final = True
     result.decoding_iter = 1
     result.avg_decoded_tokens_per_iter = 1.5
+    # Empty DataTransceiverState: no comm state, no cache state, and not arbitrary.
+    opaque_state = bytes([0, 0, 0])
     result.context_phase_params = trtllm.ContextPhaseParams(
-        [1, 2], 123, bytes([0,
-                            1]), [10, 20, 30], 1, "disagg_info_endpoint_24680")
+        [1, 2], 123, opaque_state, [10, 20, 30], 1,
+        "disagg_info_endpoint_24680")
     result.request_perf_metrics = trtllm.RequestPerfMetrics()
     result.request_perf_metrics.last_iter = 33
     result_str = pickle.dumps(result)
