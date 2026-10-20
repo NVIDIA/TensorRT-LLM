@@ -1542,6 +1542,18 @@ class SpecMetadata:
         # same table to map logits rows back to their slot, so they enable it too.
         if (self.use_rejection_sampling
                 or self.enable_penalty) and self.batch_slot_ids is not None:
+            if fast_rs_enabled() and self.draft_probs is not None:
+                # The fused kernels index draft_probs by these ids without a
+                # device-side bound check (the reference's advanced indexing
+                # has one), so check the host list before it is copied.
+                num_rows = self.draft_probs.shape[0]
+                bad = [s for s in per_request_slot_ids if not 0 <= s < num_rows]
+                if bad:
+                    raise RuntimeError(
+                        f"rejection sampling: slot ids {bad[:8]} outside "
+                        f"draft_probs rows [0, {num_rows}) (num_seq_slots="
+                        f"{self.num_seq_slots}, max_num_requests="
+                        f"{self.max_num_requests})")
             self.batch_slot_ids[:len(per_request_slot_ids)].copy_(
                 torch.tensor(per_request_slot_ids,
                              dtype=torch.long,
@@ -2791,40 +2803,48 @@ class SpecWorkerBase(nn.Module, ABC):
             return False
         return True
 
-    def _fast_rs_applies(self, spec_metadata: SpecMetadata, logits,
-                         stored_vocab: int) -> bool:
+    def _fast_rs_applies(self,
+                         spec_metadata: SpecMetadata,
+                         logits,
+                         stored_vocab: int,
+                         site: str = "verify") -> bool:
         """Whether the fused rejection-sampling kernels cover this step.
 
         ``TLLM_SPEC_FAST_RS=1`` opts in. The kernels implement temperature-only
         sampling, so the deploy-time ``advanced_sampling_mode`` must disable both
         filters (``no_topk_no_topp``; the reference path ignores per-request
         top-k / top-p in that mode too). They also need a shared draft/target
-        vocabulary, full-vocab fp32 logits and no synthetic acceptance override.
-        Host-side checks only, so the decision is CUDA-graph safe. With the flag
-        off nothing else is read, so the reference dispatch is unchanged. The
-        first decision is logged once per worker, so a run's log shows which
-        path the opt-in took.
+        vocabulary, full-vocab fp32 logits, no synthetic acceptance override
+        and no guided decoding (not validated with the fused path). Host-side
+        checks only, so the decision is CUDA-graph safe. With the flag off
+        nothing else is read, so the reference dispatch is unchanged. The first
+        decision of each call site (``site``) is logged once per worker, so a
+        run's log shows which path the opt-in took.
         """
         if not fast_rs_enabled():
             return False
         mode = spec_metadata.advanced_sampling_mode
         applies = (mode.skips_top_k and mode.skips_top_p and self._d2t is None
+                   and self.guided_decoder is None
                    and self.force_num_accepted_tokens == 0.0
                    and not isinstance(logits, VocabShardedLogits)
                    and fast_rs_supported(logits, spec_metadata.draft_probs,
                                          stored_vocab))
-        if not getattr(self, "_fast_rs_reported", False):
-            self._fast_rs_reported = True
+        reported = getattr(self, "_fast_rs_reported_sites", None)
+        if reported is None:
+            reported = self._fast_rs_reported_sites = set()
+        if site not in reported:
+            reported.add(site)
             if applies:
-                logger.info(
-                    "TLLM_SPEC_FAST_RS=1: fused rejection sampling active.")
+                logger.info("TLLM_SPEC_FAST_RS=1: fused rejection sampling "
+                            f"active ({site}).")
             else:
                 logger.warning(
                     "TLLM_SPEC_FAST_RS=1 but the fused rejection sampling does "
-                    "not cover this step (it needs advanced_sampling_mode="
-                    "no_topk_no_topp, a shared draft/target vocabulary and "
-                    f"full-vocab fp32 logits; mode={mode.name}); using the "
-                    "reference path.")
+                    f"not cover this step ({site}; it needs advanced_sampling_"
+                    "mode=no_topk_no_topp, a shared draft/target vocabulary, "
+                    "full-vocab fp32 logits and no guided decoding; mode="
+                    f"{mode.name}); using the reference path.")
         return applies
 
     @staticmethod
@@ -3256,7 +3276,8 @@ class SpecWorkerBase(nn.Module, ABC):
         if (getattr(spec_metadata, "use_rejection_sampling", False)
                 and spec_metadata.draft_probs is not None
                 and spec_metadata.batch_slot_ids is not None
-                and self._fast_rs_applies(spec_metadata, flat_view, vocab)):
+                and self._fast_rs_applies(
+                    spec_metadata, flat_view, vocab, site="draft")):
             # Fused: the proposals go straight to draft_probs[slot, 0:K]; draft
             # position i of request b draws from subsequence b * K + i at
             # offset + 1 (see the Philox layout in fast_rejection_sampling).

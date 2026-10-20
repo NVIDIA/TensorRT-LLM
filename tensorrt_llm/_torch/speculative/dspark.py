@@ -1368,7 +1368,7 @@ class DSparkWorker(DFlashWorker):
             and w1.shape == w2.shape
             and w1.is_contiguous()
             and w2.is_contiguous()
-            and self._fast_rs_applies(spec_metadata, flat, vocab)
+            and self._fast_rs_applies(spec_metadata, flat, vocab, site="markov feedback")
         )
         if not getattr(self, "_sampled_feedback_reported", False):
             # Once per worker, so a run's log shows which chain the opt-in took.

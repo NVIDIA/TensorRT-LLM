@@ -12,19 +12,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""The fused rejection-sampling kernels (TLLM_SPEC_FAST_RS) against the flashinfer reference path.
+"""Tests of the temperature-only fused rejection-sampling kernels in `fast_rejection_sampling`
+(``TLLM_SPEC_FAST_RS=1``).
 
-Exactness, with the reference's Philox seed / offset:
-  * draft block sampler vs ``sampling_batch_spec_dec_one_model_for_rejection``;
-  * verify vs ``rejection_sampling_one_model`` (``chain_speculative_sampling``);
-  * the SpecWorkerBase entry points with the flag on and off;
-  * the sampled-token Markov chain vs a float64 model.
-Both sides draw the same uniforms, so the decisions agree except where float32 rounding of a
-probability or of a running sum decides: every disagreement must sit within ``_CDF_TOL`` of an
-inverse-CDF boundary (or ``_ACCEPT_TOL`` of the accept threshold), checked with float64 sums of
-the reference's own probabilities and the cuRAND draw recomputed here.
-
-Losslessness: chi-square of the emitted and the draft tokens against their distributions.
+The kernels are checked for exactness against flashinfer and float64 models on the same Philox draws,
+for losslessness with chi-square tests, and through the `SpecWorkerBase` entry points and CUDA graphs.
+The top-p kernels are tested in ``test_fast_topp_*.py``.
 """
 
 import math
@@ -58,6 +51,7 @@ _CDF_TOL = 2e-5
 _ACCEPT_TOL = 1e-5
 
 _M32 = 0xFFFFFFFF
+_M64 = (1 << 64) - 1
 
 
 # The float64 models recompute the kernels' cuRAND Philox draws (layout in the comment above
@@ -84,7 +78,7 @@ def _philox4x32_10(ctr, key):
 
 def curand_uniform(seed, offset, subsequence, draw):
     """Draw ``draw`` of ``curand_init(seed, subsequence, offset)`` + ``curand_uniform``."""
-    seed &= (1 << 64) - 1
+    seed &= _M64
     g = (offset & 3) + draw
     ctr = (offset >> 2) + (g >> 2)
     out = _philox4x32_10(
@@ -93,6 +87,16 @@ def curand_uniform(seed, offset, subsequence, draw):
     )
     x = np.float32(out[g & 3])
     return float(np.float32(x * np.float32(2.0**-32) + np.float32(2.0**-33)))
+
+
+def _draft_key(seed):
+    """The draft stream's Philox key for a request seed (the kernel's int64 XOR)."""
+    return (seed & _M64) ^ frs.DRAFT_KEY_XOR
+
+
+def _as_int64(x):
+    x &= _M64
+    return x - (1 << 64) if x >> 63 else x
 
 
 def _cdf_gap(weights, u, a, b):
@@ -110,6 +114,59 @@ def _cdf_gap(weights, u, a, b):
     return max(dist(a), dist(b))
 
 
+def _inv_cdf(weights, u):
+    """flashinfer's ``sampling_from_probs`` rule on float64 sums: the first token whose running
+    mass exceeds ``u`` (it has nonzero weight), else the last nonzero token."""
+    w = np.asarray(weights, dtype=np.float64)
+    idx = int(np.searchsorted(np.cumsum(w), u, side="right"))
+    return idx if idx < len(w) else int(np.flatnonzero(w > 0)[-1])
+
+
+def _token_gap(weights, u, got):
+    """0 when ``got`` is the model's token for ``u``; else the CDF distance (relative to the row
+    mass) that rounding must explain."""
+    want = _inv_cdf(weights, u)
+    if int(got) == want:
+        return 0.0
+    return _cdf_gap(weights, u, int(got), want) / max(float(np.sum(weights)), 1e-300)
+
+
+def _verify_model(p, q, drafts, seed, offset, b, k):
+    """Request ``b``'s accept position and drawn token weights from float64 target ``p``
+    [k + 1, V] and stored proposals ``q`` [k, V]: (pos, weights, u scaled by their mass)."""
+    pos = k
+    for i in range(k):
+        d = int(drafts[i])
+        if not curand_uniform(seed, offset, b, i) * q[i, d] < p[i, d]:
+            pos = i
+            break
+    w = np.maximum(p[pos] - q[pos], 0.0) if pos < k else p[pos]
+    return pos, w, curand_uniform(seed, offset, b, k) * float(w.sum())
+
+
+def _verify_row_gap(acc_row, num, p, q, drafts, seed, offset, b, k):
+    """Compare request ``b``'s verify row with the float64 model.
+
+    Returns: the decision that differs (``"accept"`` or ``"token"``) and the size of the rounding that
+    must explain it (0 when the drawn tokens agree)."""
+    pos_m, w, u = _verify_model(p, q, drafts, seed, offset, b, k)
+    pos = int(num) - 1
+    if pos != pos_m:
+        i = min(pos, pos_m)
+        d = int(drafts[i])
+        u_i = curand_uniform(seed, offset, b, i)
+        return "accept", abs(u_i * q[i, d] - p[i, d]) / max(p[i, d], 1e-300)
+    row = [int(x) for x in acc_row]
+    assert row[:pos] == [int(x) for x in drafts[:pos]]
+    assert all(x == -1 for x in row[pos + 1 : k + 1])
+    return "token", _token_gap(w, u, row[pos])
+
+
+def _softmax64(logits, temps):
+    """float64 softmax(logits / T) with one temperature per row."""
+    return torch.softmax(logits.double() / temps.double().unsqueeze(1), dim=-1).cpu().numpy()
+
+
 def peaked_logits(rows, vocab, gen, spread=2.0, ncand=48, top=14.0):
     base = torch.randn(rows, vocab, generator=gen, device=DEV) * spread
     idx = torch.randint(0, vocab, (rows, ncand), generator=gen, device=DEV)
@@ -118,32 +175,43 @@ def peaked_logits(rows, vocab, gen, spread=2.0, ncand=48, top=14.0):
     return base.float().contiguous()
 
 
-def _correlated_case(num_gens, gen, accept_bias):
-    """Target logits [G*(K+1), V] and draft logits [G, K, V] that agree often."""
-    tgt = peaked_logits(num_gens * (K + 1), V, gen)
-    noise = torch.randn(num_gens, K, V, generator=gen, device=DEV) * accept_bias
-    drf = (tgt.view(num_gens, K + 1, V)[:, :K] + noise).contiguous()
+def _correlated_case(num_gens, gen, accept_bias, k=K, vocab=V):
+    """Target logits [G*(k+1), V] and draft logits [G, k, V] that agree often."""
+    tgt = peaked_logits(num_gens * (k + 1), vocab, gen)
+    noise = torch.randn(num_gens, k, vocab, generator=gen, device=DEV) * accept_bias
+    drf = (tgt.view(num_gens, k + 1, vocab)[:, :k] + noise).contiguous()
     return tgt, drf
 
 
-def _verify_disagreement(row_args, acc_f, num_f, acc_r, num_r):
-    """Size of the rounding that explains one verify row differing between the two paths: the
-    relative distance of the accept test to its threshold, or the residual inverse-CDF gap."""
-    tprobs, stored, drafts, seed, offset, row = row_args
-    pos_f, pos_r = int(num_f) - 1, int(num_r) - 1
-    if pos_f != pos_r:
-        i = min(pos_f, pos_r)
-        d = int(drafts[i])
-        p = float(tprobs[i, d])
-        q = float(stored[i, d])
-        u = curand_uniform(seed, offset, row, i)
-        return abs(u * q - p) / max(p, 1e-30), "accept"
-    p = tprobs[pos_f].double().cpu().numpy()
-    q = stored[pos_f].double().cpu().numpy() if pos_f < K else np.zeros_like(p)
-    res = np.maximum(p - q, 0.0)
-    total = float(res.sum())
-    u = curand_uniform(seed, offset, row, K + int(pos_f < K)) * total
-    return _cdf_gap(res, u, int(acc_f[pos_f]), int(acc_r[pos_f])) / max(total, 1e-30), "residual"
+class _Gaps:
+    """Worst rounding size per kind and the number of rows that needed one."""
+
+    def __init__(self):
+        self.worst = {"accept": 0.0, "token": 0.0}
+        self.count = 0
+
+    def add(self, kind, size):
+        self.worst[kind] = max(self.worst[kind], size)
+        self.count += size > 0.0
+
+    def check(self, total):
+        assert self.worst["accept"] <= _ACCEPT_TOL and self.worst["token"] <= _CDF_TOL
+        assert self.count <= max(2, int(0.02 * total))
+
+
+def _check_drafts(tokens, stored, seeds, offsets, k, gaps):
+    """Draft tokens [G, k] vs the model on the stored proposals [G, k, V] (float64)."""
+    for b in range(tokens.shape[0]):
+        for i in range(k):
+            u = curand_uniform(_draft_key(seeds[b]), offsets[b] + 1, b * k + i, 0)
+            gaps.add("token", _token_gap(stored[b, i], u, tokens[b, i]))
+
+
+def _check_verify(acc, num, p, q, drafts, seeds, offsets, k, gaps):
+    for b in range(acc.shape[0]):
+        gaps.add(
+            *_verify_row_gap(acc[b], num[b], p[b], q[b], drafts[b], seeds[b], offsets[b], b, k)
+        )
 
 
 @pytest.mark.parametrize("num_gens", [1, 16])
@@ -161,12 +229,13 @@ def test_draft_block_matches_flashinfer(num_gens, temperature):
         seed = 1234 + trial
         seeds = torch.full((num_gens,), seed, dtype=torch.int64, device=DEV)
         offs = torch.full((num_gens,), 6 * trial + trial % 4, dtype=torch.int64, device=DEV)
+        draft_seeds = torch.full_like(seeds, _as_int64(_draft_key(seed)))
         ref_tok, ref_probs = sampling_batch_spec_dec_one_model_for_rejection(
             logits,
             temps.repeat_interleave(K),
             None,
             None,
-            seed=seeds.repeat_interleave(K),
+            seed=draft_seeds.repeat_interleave(K),
             offset=(offs + 1).repeat_interleave(K),
         )
         slots = torch.randperm(17, device=DEV)[:num_gens].to(torch.int64)
@@ -177,7 +246,7 @@ def test_draft_block_matches_flashinfer(num_gens, temperature):
         rel = ((stored - ref_probs).abs() / ref_probs.clamp_min(1e-30))[big]
         worst_rel = max(worst_rel, float(rel.max()))
         for r in (tok.long() != ref_tok.long()).nonzero().flatten().tolist():
-            u = curand_uniform(seed, int(offs[0]) + 1, r, 0)
+            u = curand_uniform(_draft_key(seed), int(offs[0]) + 1, r, 0)
             gap = _cdf_gap(ref_probs[r].double().cpu().numpy(), u, int(tok[r]), int(ref_tok[r]))
             worst_gap = max(worst_gap, gap)
             mism += 1
@@ -198,8 +267,8 @@ def test_verify_matches_flashinfer(num_gens, accept_bias):
     every row's accept position and drawn token (draw ``K``) match the float64 model. Differences must
     be explained by rounding."""
     gen = torch.Generator(device=DEV).manual_seed(101 + num_gens)
-    mism = total = 0
-    worst = {"accept": 0.0, "residual": 0.0}
+    model, decisions = _Gaps(), _Gaps()
+    total = 0
     hist = np.zeros(K + 1, dtype=np.int64)
     temps_req = torch.ones(num_gens, dtype=torch.float32, device=DEV)
     temps_tok = torch.ones(num_gens * (K + 1), dtype=torch.float32, device=DEV)
@@ -212,28 +281,190 @@ def test_verify_matches_flashinfer(num_gens, accept_bias):
         buf = torch.zeros((18, K, V), dtype=torch.float32, device=DEV)
         drafts = frs.fast_rs_draft_block(drf.view(-1, V), temps_req, slots, -1, buf, seeds, offs, 1)
         drafts = drafts.view(num_gens, K).contiguous()
-        # What _sample_and_accept_draft_tokens_rejection does in NO_TOPK_NO_TOPP mode.
+        acc, num = frs.fast_rs_verify(tgt, temps_tok, drafts, slots, -1, buf, seeds, offs)
+        # Accept decisions: chain_speculative_sampling draws the same uniforms 0..K-1 (what
+        # _sample_and_accept_draft_tokens_rejection runs in NO_TOPK_NO_TOPP mode).
         tprobs = compute_probs_from_logits(tgt, temps_tok, None, None).view(num_gens, K + 1, V)
-        ref_acc, ref_num = rejection_sampling_one_model(
+        _, ref_num = rejection_sampling_one_model(
             buf[slots], drafts, tprobs, deterministic=True, seed=seeds, offset=offs
         )
-        acc, num = frs.fast_rs_verify(tgt, temps_tok, drafts, slots, -1, buf, seeds, offs)
-        bad = (acc.long() != ref_acc.long()).any(dim=1) | (num.long() != ref_num.long())
-        for b in bad.nonzero().flatten().tolist():
-            row_args = (tprobs[b], buf[slots[b]], drafts[b].tolist(), seed, offset, b)
-            size, kind = _verify_disagreement(row_args, acc[b], num[b], ref_acc[b], ref_num[b])
-            worst[kind] = max(worst[kind], size)
-            mism += 1
+        p = _softmax64(tgt, temps_tok).reshape(num_gens, K + 1, V)
+        q = buf[slots].double().cpu().numpy()
+        dr = drafts.cpu().numpy()
+        for b in (num.long() != ref_num.long()).nonzero().flatten().tolist():
+            i = min(int(num[b]), int(ref_num[b])) - 1
+            d = int(dr[b, i])
+            u = curand_uniform(seed, offset, b, i)
+            decisions.add("accept", abs(u * q[b, i, d] - p[b, i, d]) / max(p[b, i, d], 1e-300))
+        # Every row (accept position and drawn token) vs the float64 model.
+        _check_verify(
+            acc.cpu().numpy(),
+            num.cpu().numpy(),
+            p,
+            q,
+            dr,
+            [seed] * num_gens,
+            [offset] * num_gens,
+            K,
+            model,
+        )
         total += num_gens
         for n in num.tolist():
             hist[n - 1] += 1
     print(
-        f"verify G={num_gens} bias={accept_bias}: {mism}/{total} rows differ (worst accept "
-        f"{worst['accept']:.2e} rel, residual {worst['residual']:.2e}); accepted-length "
-        f"histogram {hist.tolist()}"
+        f"verify G={num_gens} bias={accept_bias}: accept decisions vs flashinfer differ in "
+        f"{decisions.count}/{total} rows (worst {decisions.worst['accept']:.2e} rel); vs the "
+        f"float64 model {model.count}/{total} rows (worst accept {model.worst['accept']:.2e}, "
+        f"token {model.worst['token']:.2e}); accepted-length histogram {hist.tolist()}"
     )
-    assert worst["accept"] <= _ACCEPT_TOL and worst["residual"] <= _CDF_TOL
-    assert mism <= max(2, int(0.02 * total))
+    decisions.check(total)
+    model.check(total)
+
+
+def test_per_request_seeds_and_offsets():
+    """Each request keys its own stream: 64-bit (negative) seeds, offsets past 2**32, per-row
+    temperatures."""
+    gen = torch.Generator(device=DEV).manual_seed(3)
+    seeds_py = [1, 2**40 + 7, -5, 0x7FFFFFFFFFFFFFF0, 99, -(2**62), 12345, 31337]
+    offs_py = [0, 6, 2**33 + 3, 18, 7, 2**32 - 1, 120, 61]
+    g = len(seeds_py)
+    seeds = torch.tensor(seeds_py, dtype=torch.int64, device=DEV)
+    offs = torch.tensor(offs_py, dtype=torch.int64, device=DEV)
+    drafts_gaps, verify_gaps = _Gaps(), _Gaps()
+    for _ in range(4):
+        tgt, drf = _correlated_case(g, gen, 0.8)
+        temps_req = 0.6 + 0.8 * torch.rand(g, generator=gen, device=DEV)
+        temps_tok = 0.6 + 0.8 * torch.rand(g * (K + 1), generator=gen, device=DEV)
+        slots = torch.randperm(g + 2, device=DEV)[:g].to(torch.int64)
+        buf = torch.zeros((g + 2, K, V), dtype=torch.float32, device=DEV)
+        drafts = frs.fast_rs_draft_block(drf.view(-1, V), temps_req, slots, -1, buf, seeds, offs, 1)
+        drafts = drafts.view(g, K).contiguous()
+        q = buf[slots].double().cpu().numpy()
+        want_q = _softmax64(drf.view(-1, V), temps_req.repeat_interleave(K)).reshape(g, K, V)
+        assert np.abs(q - want_q).max() < 1e-5
+        _check_drafts(drafts.cpu().numpy(), q, seeds_py, offs_py, K, drafts_gaps)
+        acc, num = frs.fast_rs_verify(tgt, temps_tok, drafts, slots, -1, buf, seeds, offs)
+        p = _softmax64(tgt, temps_tok).reshape(g, K + 1, V)
+        _check_verify(
+            acc.cpu().numpy(),
+            num.cpu().numpy(),
+            p,
+            q,
+            drafts.cpu().numpy(),
+            seeds_py,
+            offs_py,
+            K,
+            verify_gaps,
+        )
+    print(f"per-request streams: draft worst {drafts_gaps.worst}, verify worst {verify_gaps.worst}")
+    drafts_gaps.check(4 * g * K)
+    verify_gaps.check(4 * g)
+
+
+def test_masked_logits():
+    """-inf logits (guided-decoding style masks) get probability 0, also in chunks with no finite
+    logit at all, and the outputs stay inside the allowed set."""
+    gen = torch.Generator(device=DEV).manual_seed(4)
+    g = 4
+    chunk = frs._CHUNK
+    pool = torch.cat(
+        [torch.arange(c * chunk, (c + 1) * chunk) for c in range(V // chunk) if c not in (1, 7, 39)]
+    )
+    allowed = pool[torch.randperm(pool.numel(), generator=torch.Generator().manual_seed(0))[:100]]
+    allowed = allowed.to(DEV)
+    keep = torch.zeros(V, dtype=torch.bool, device=DEV)
+    keep[allowed] = True
+    tgt, drf = _correlated_case(g, gen, 0.8)
+    tgt = tgt.masked_fill(~keep, float("-inf"))
+    drf = drf.clone()
+    drf[: g // 2] = drf[: g // 2].masked_fill(~keep, float("-inf"))  # half the drafts masked too
+    seeds = torch.full((g,), 21, dtype=torch.int64, device=DEV)
+    offs = torch.full((g,), 30, dtype=torch.int64, device=DEV)
+    slots = torch.arange(g, dtype=torch.int64, device=DEV)
+    buf = torch.zeros((g + 1, K, V), dtype=torch.float32, device=DEV)
+    temps_req = torch.ones(g, device=DEV)
+    temps_tok = torch.ones(g * (K + 1), device=DEV)
+    drafts = frs.fast_rs_draft_block(drf.view(-1, V), temps_req, slots, -1, buf, seeds, offs, 1)
+    drafts = drafts.view(g, K).contiguous()
+    assert not torch.isnan(buf).any()
+    assert bool(keep[drafts[: g // 2].long()].all())
+    assert float(buf[: g // 2][:, :, ~keep].abs().max()) == 0.0
+    acc, num = frs.fast_rs_verify(tgt, temps_tok, drafts, slots, -1, buf, seeds, offs)
+    for b in range(g):
+        emitted = acc[b, : int(num[b])].long()
+        assert bool(keep[emitted].all()), (b, emitted.tolist())
+    gaps = _Gaps()
+    p = _softmax64(tgt, temps_tok).reshape(g, K + 1, V)
+    q = buf[slots].double().cpu().numpy()
+    _check_verify(
+        acc.cpu().numpy(),
+        num.cpu().numpy(),
+        p,
+        q,
+        drafts.cpu().numpy(),
+        [21] * g,
+        [30] * g,
+        K,
+        gaps,
+    )
+    gaps.check(g)
+
+
+def test_short_draft_and_ragged_vocab():
+    """Runtime draft length 3 in a 5-step buffer, a vocabulary that is not a chunk multiple,
+    per-row temperatures."""
+    gen = torch.Generator(device=DEV).manual_seed(6)
+    vocab, k, g = 10000, 3, 6
+    drafts_gaps, verify_gaps = _Gaps(), _Gaps()
+    for trial in range(6):
+        tgt, drf = _correlated_case(g, gen, 0.6, k=k, vocab=vocab)
+        temps_req = 0.5 + torch.rand(g, generator=gen, device=DEV)
+        temps_tok = 0.5 + torch.rand(g * (k + 1), generator=gen, device=DEV)
+        seeds_py, offs_py = [77 + trial] * g, [(k + 1) * trial] * g
+        seeds = torch.tensor(seeds_py, dtype=torch.int64, device=DEV)
+        offs = torch.tensor(offs_py, dtype=torch.int64, device=DEV)
+        slots = torch.arange(g, dtype=torch.int64, device=DEV)
+        buf = torch.zeros((g + 1, K, vocab), dtype=torch.float32, device=DEV)
+        drafts = frs.fast_rs_draft_block(
+            drf.view(-1, vocab), temps_req, slots, -1, buf, seeds, offs, 1
+        )
+        drafts = drafts.view(g, k).contiguous()
+        q = buf[slots, :k].double().cpu().numpy()
+        _check_drafts(drafts.cpu().numpy(), q, seeds_py, offs_py, k, drafts_gaps)
+        acc, num = frs.fast_rs_verify(tgt, temps_tok, drafts, slots, -1, buf, seeds, offs)
+        p = _softmax64(tgt, temps_tok).reshape(g, k + 1, vocab)
+        _check_verify(
+            acc.cpu().numpy(),
+            num.cpu().numpy(),
+            p,
+            q,
+            drafts.cpu().numpy(),
+            seeds_py,
+            offs_py,
+            k,
+            verify_gaps,
+        )
+    drafts_gaps.check(6 * g * k)
+    verify_gaps.check(6 * g)
+
+
+def test_philox_layout_never_reuses_a_draw():
+    """Over consecutive steps (offset window max_draft_len + 1, as
+    _populate_request_rng_state advances it), no (key, subsequence, word) is drawn twice, even
+    with every request on one seed."""
+    window = K + 1
+    seed = 7
+    for k in range(1, K + 1):
+        for g in (1, 4, 16):
+            seen = set()
+            for step in range(3):
+                for b in range(g):
+                    offset = (b % 3 + step) * window
+                    draws = [(seed, b, offset + i) for i in range(k + 1)]
+                    draws += [(_draft_key(seed), b * k + i, offset + 1) for i in range(k)]
+                    for d in draws:
+                        assert d not in seen, (k, g, step, b, d)
+                        seen.add(d)
 
 
 class _Worker(itf.SpecWorkerBase):
@@ -281,51 +512,78 @@ def _worker_metadata(mbs, slots, seed, offset):
     return md
 
 
-def test_worker_paths_fast_vs_reference(monkeypatch):
-    """SpecWorkerBase entry points with the flag on and off (NO_TOPK_NO_TOPP): a mixed batch
-    (2 context rows) and a padding request routed to the dummy slot."""
+def test_worker_paths_fast(monkeypatch):
+    """`SpecWorkerBase` entry points in ``NO_TOPK_NO_TOPP`` mode with the flag off and on, on a mixed
+    batch (2 context rows) and a padding request routed to the dummy slot: the fused path stores the
+    reference's proposals, and its tokens and accept decisions match the float64 model."""
     mbs, nctx, ngen, seed, offset = 16, 2, 9, 99, 13
     bsz = nctx + ngen
     slots = range(3, 3 + bsz)
+    real = slice(3 + nctx, 2 + bsz)  # generation slots without the padding request
     gen = torch.Generator(device=DEV).manual_seed(7)
     tgt_gen, drf = _correlated_case(ngen, gen, 0.5)
     logits = torch.cat([peaked_logits(nctx, V, gen), tgt_gen], dim=0).contiguous()
-    drafts, probs = {}, {}
+    probs = {}
     for flag in ("0", "1"):
         monkeypatch.setenv(frs.FAST_RS_ENV_VAR, flag)
         md = _worker_metadata(mbs, slots, seed, offset)
         out = _Worker().sample_draft_tokens(drf, md, bsz, num_contexts=nctx)
-        drafts[flag] = out.view(ngen, K).clone()
         probs[flag] = md.draft_probs.clone()
-    real = slice(3 + nctx, 2 + bsz)  # generation slots without the padding request
+    drafts = out.view(ngen, K).contiguous()
+    # The fused path stores the reference's proposals and draws its tokens from them.
     assert float((probs["0"][real] - probs["1"][real]).abs().max()) < 1e-6
-    mism = 0
-    for b in range(ngen - 1):
-        for i in range(K):
-            t0, t1 = int(drafts["0"][b, i]), int(drafts["1"][b, i])
-            if t0 != t1:
-                u = curand_uniform(seed, offset + 1, b * K + i, 0)
-                weights = probs["0"][3 + nctx + b, i].double().cpu().numpy()
-                assert _cdf_gap(weights, u, t0, t1) <= _CDF_TOL
-                mism += 1
-    # Verify both paths against the same drafts and stored proposals (the reference's).
+    q = probs["1"][real].double().cpu().numpy()
+    gaps = _Gaps()
+    _check_drafts(drafts[: ngen - 1].cpu().numpy(), q, [seed] * ngen, [offset] * ngen, K, gaps)
     out = {}
     for flag in ("0", "1"):
         monkeypatch.setenv(frs.FAST_RS_ENV_VAR, flag)
         md = _worker_metadata(mbs, slots, seed, offset)
-        md.draft_probs.copy_(probs["0"])
-        md.draft_tokens = drafts["0"].reshape(-1)
-        acc, num = _Worker()._accept_draft_tokens(logits, drafts["0"], nctx, bsz, md)
+        md.draft_probs.copy_(probs["1"])
+        md.draft_tokens = drafts.reshape(-1)
+        acc, num = _Worker()._accept_draft_tokens(logits, drafts, nctx, bsz, md)
         out[flag] = (acc.clone(), num.clone())
     (a0, n0), (a1, n1) = out["0"], out["1"]
-    print(f"worker: {mism} draft disagreements (all at CDF boundaries); counts {n1.tolist()}")
-    assert torch.equal(a0[:nctx, 0], a1[:nctx, 0])
-    assert torch.equal(a0[nctx:-1], a1[nctx:-1]) and torch.equal(n0[:-1], n1[:-1])
+    assert torch.equal(a0[:nctx, 0], a1[:nctx, 0])  # context rows: the same target sampler
+    p = _softmax64(logits[nctx:], torch.ones(ngen * (K + 1), device=DEV)).reshape(ngen, K + 1, V)
+    real_gens = slice(nctx, bsz - 1)
+    _check_verify(
+        a1[real_gens].cpu().numpy(),
+        n1[real_gens].cpu().numpy(),
+        p,
+        q,
+        drafts[: ngen - 1].cpu().numpy(),
+        [seed] * ngen,
+        [offset] * ngen,
+        K,
+        gaps,
+    )
+    # The accept decisions draw the reference's uniforms (draws 0..K-1).
+    same = int((n0[real_gens] == n1[real_gens]).sum())
+    print(
+        f"worker: worst {gaps.worst}; accept counts equal to the reference in {same}/{ngen - 1}"
+        f" rows; counts {n1.tolist()}"
+    )
+    gaps.check(ngen - 1)
+    assert same >= ngen - 2
+
+
+def test_guided_decoding_keeps_reference(monkeypatch):
+    """With the flag on, a worker with a guided decoder keeps the reference path."""
+    monkeypatch.setenv(frs.FAST_RS_ENV_VAR, "1")
+    md = _worker_metadata(4, range(4), 1, 0)
+    worker = _Worker()
+    logits = torch.zeros((4 * (K + 1), V), device=DEV)
+    assert worker._fast_rs_applies(md, logits, V)
+    worker.guided_decoder = types.SimpleNamespace()
+    assert not worker._fast_rs_applies(md, logits, V)
 
 
 def test_markov_feedback_matches_float64_model():
-    """The chain advances on the sampled token: base_i + w2 @ w1[prev], prev_0 = anchor; position
-    i of request b draws Philox subsequence b * K + i, draw 0, at offset + 1."""
+    """The Markov draft chain advances on the sampled token: position ``i`` samples from the logits
+    ``base_i + w2 @ w1[prev]`` with ``prev_0 = anchor``, using draw 0 of
+    ``(seed ^ DRAFT_KEY_XOR, subsequence b * K + i, offset + 1)`` for request ``b``. Every token must
+    match the float64 model up to `_CDF_TOL`."""
     gen = torch.Generator(device=DEV).manual_seed(5)
     num_gens, rank = 4, 256
     checked = mism = 0
@@ -345,8 +603,8 @@ def test_markov_feedback_matches_float64_model():
             torch.arange(num_gens, dtype=torch.int64, device=DEV),
             -1,
             torch.zeros((8, K, V), dtype=torch.float32, device=DEV),
-            torch.tensor([seed], dtype=torch.int64, device=DEV),
-            torch.tensor([offset], dtype=torch.int64, device=DEV),
+            torch.full((num_gens,), seed, dtype=torch.int64, device=DEV),
+            torch.full((num_gens,), offset, dtype=torch.int64, device=DEV),
             1,
         )
         # Same batched bias GEMM as the kernel path (F.linear of the [G, rank] embeddings).
@@ -359,8 +617,8 @@ def test_markov_feedback_matches_float64_model():
             for b in range(num_gens):
                 if not live[b]:
                     continue
-                u = curand_uniform(seed, offset + 1, b * K + i, 0)
-                ref_tok = int(np.searchsorted(np.cumsum(q[b]), u, side="right"))
+                u = curand_uniform(_draft_key(seed), offset + 1, b * K + i, 0)
+                ref_tok = _inv_cdf(q[b], u)
                 checked += 1
                 if ref_tok != int(tok[b, i]):
                     # The chains condition on different tokens from here on.
@@ -403,7 +661,8 @@ def _chi2_pvalue(tokens, probs, min_expected=20.0):
 
 def test_chi2_emitted_tokens_follow_target():
     """P(first emitted = x) = p_0(x) and P(second = y | first accepted) = p_1(y) for a proposal
-    that differs from the target (rejection sampling is lossless for any proposal)."""
+    that differs from the target (rejection sampling is lossless for any proposal); the trials
+    are consecutive offset windows of the same requests, as in decoding."""
     gen = torch.Generator(device=DEV).manual_seed(2024)
     g = 16
     tgt_one = _small_support_logits(K + 1, gen)
@@ -415,9 +674,9 @@ def test_chi2_emitted_tokens_follow_target():
     slots = torch.arange(g, dtype=torch.int64, device=DEV)
     buf = torch.zeros((g + 1, K, V), dtype=torch.float32, device=DEV)
     first, second = [], []
-    for t in range(1500):
+    for t in range(3000):
         seeds = torch.full((g,), 7, dtype=torch.int64, device=DEV)
-        offs = torch.full((g,), 6 * t, dtype=torch.int64, device=DEV)
+        offs = torch.full((g,), (K + 1) * t, dtype=torch.int64, device=DEV)
         drafts = frs.fast_rs_draft_block(drf, temps_req, slots, -1, buf, seeds, offs, 1)
         acc, num = frs.fast_rs_verify(
             tgt, temps_tok, drafts.view(g, K), slots, -1, buf, seeds, offs
@@ -443,9 +702,9 @@ def test_chi2_draft_tokens_follow_stored_proposal():
     slots = torch.arange(g, dtype=torch.int64, device=DEV)
     buf = torch.zeros((g + 1, K, V), dtype=torch.float32, device=DEV)
     toks = []
-    for t in range(1500):
+    for t in range(3000):
         seeds = torch.full((g,), 3, dtype=torch.int64, device=DEV)
-        offs = torch.full((g,), 6 * t, dtype=torch.int64, device=DEV)
+        offs = torch.full((g,), (K + 1) * t, dtype=torch.int64, device=DEV)
         out = frs.fast_rs_draft_block(drf, temps_req, slots, -1, buf, seeds, offs, 1)
         toks.append(out.view(g, K).cpu().numpy())
     toks = np.concatenate(toks)
@@ -454,6 +713,75 @@ def test_chi2_draft_tokens_follow_stored_proposal():
         stat, dof, pv = _chi2_pvalue(toks[:, i], q[i] / q[i].sum())
         print(f"draft position {i}: chi2={stat:.1f} dof={dof} p={pv:.3f}")
         assert pv > 1e-3
+
+
+def _independence_pvalue(pairs):
+    """Chi-square test of independence (1 dof) of a list of (bool, bool) pairs."""
+    t = np.zeros((2, 2), dtype=np.float64)
+    for x, y in pairs:
+        t[int(x), int(y)] += 1
+    n = t.sum()
+    expected = np.outer(t.sum(1), t.sum(0)) / n
+    stat = float(((t - expected) ** 2 / expected).sum())
+    return stat, math.erfc(math.sqrt(stat / 2))
+
+
+def test_consecutive_steps_are_independent():
+    """Lossless across steps, not just within one: the token drawn after a rejection at position
+    0 must not predict whether the next step (offset advanced by K + 1) accepts its position 0.
+    flashinfer's chain draws that residual with draw K + 1, the next window's draw 0, so on the
+    reference the two are dependent (printed, not asserted)."""
+    gen = torch.Generator(device=DEV).manual_seed(31)
+    g = 16
+    tgt_one = _small_support_logits(K + 1, gen)
+    drf_one = (tgt_one[:K] + torch.randn(K, V, generator=gen, device=DEV) * 1.5).contiguous()
+    tgt, drf = tgt_one.repeat(g, 1).contiguous(), drf_one.repeat(g, 1).contiguous()
+    temps_tok, temps_req = torch.ones(g * (K + 1), device=DEV), torch.ones(g, device=DEV)
+    tprobs = compute_probs_from_logits(tgt, temps_tok, None, None).view(g, K + 1, V)
+    slots = torch.arange(g, dtype=torch.int64, device=DEV)
+    buf = torch.zeros((g + 1, K, V), dtype=torch.float32, device=DEV)
+    seeds = torch.full((g,), 11, dtype=torch.int64, device=DEV)
+    steps = {"fused": [], "reference": []}
+    for t in range(2500):
+        offs = torch.full((g,), (K + 1) * t, dtype=torch.int64, device=DEV)
+        drafts = frs.fast_rs_draft_block(drf, temps_req, slots, -1, buf, seeds, offs, 1)
+        drafts = drafts.view(g, K).contiguous()
+        acc, num = frs.fast_rs_verify(tgt, temps_tok, drafts, slots, -1, buf, seeds, offs)
+        steps["fused"].append((acc[:, 0].cpu().numpy(), num.cpu().numpy()))
+        acc, num = rejection_sampling_one_model(
+            buf[slots], drafts, tprobs, deterministic=True, seed=seeds, offset=offs
+        )
+        steps["reference"].append((acc[:, 0].cpu().numpy(), num.cpu().numpy()))
+    p0 = torch.softmax(tgt_one[0].double(), -1).cpu().numpy()
+    resid = np.maximum(p0 - buf[0, 0].double().cpu().numpy(), 0.0)
+    median = int(np.searchsorted(np.cumsum(resid) / resid.sum(), 0.5))
+    pvalue = {}
+    for name, rows in steps.items():
+        pairs = [
+            (tok[b] <= median, nxt[b] >= 2)
+            for (tok, num), (_, nxt) in zip(rows[:-1], rows[1:])
+            for b in range(g)
+            if num[b] == 1
+        ]
+        stat, pvalue[name] = _independence_pvalue(pairs)
+        print(
+            f"{name}: {len(pairs)} (residual token, next accept) pairs, chi2={stat:.1f} "
+            f"p={pvalue[name]:.2e}"
+        )
+    assert pvalue["fused"] > 1e-3
+
+
+def _capture(fn):
+    """Warm ``fn`` up on a side stream, then capture it; returns (graph, outputs)."""
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        fn()
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        outs = fn()
+    return graph, outs
 
 
 def test_cuda_graph_replay_matches_eager():
@@ -478,15 +806,7 @@ def test_cuda_graph_replay_matches_eager():
     snapshot = buf.clone()
     eager = [x.clone() for x in step()]
     buf.copy_(snapshot)
-    stream = torch.cuda.Stream()
-    stream.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(stream):
-        step()
-    torch.cuda.current_stream().wait_stream(stream)
-    buf.copy_(snapshot)
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        outs = step()
+    graph, outs = _capture(step)
     buf.copy_(snapshot)
     graph.replay()
     torch.cuda.synchronize()
@@ -501,6 +821,38 @@ def test_cuda_graph_replay_matches_eager():
     replay = [x.clone() for x in outs]
     buf.copy_(snapshot)
     for a, b in zip(step(), replay):
+        assert torch.equal(a, b)
+
+
+def test_workspace_growth_keeps_captured_graph(monkeypatch):
+    """A graph captured at a small batch keeps its scratch after an eager step at a larger batch
+    grows the buffers: the outgrown buffers are retired, never freed, so memory handed out
+    afterwards is not written by a replay."""
+    monkeypatch.setattr(frs, "_WORKSPACE", frs.FastRejectionWorkspace())
+    gen = torch.Generator(device=DEV).manual_seed(12)
+
+    def case(g):
+        tgt, drf = _correlated_case(g, gen, 0.5)
+        slots = torch.arange(g, dtype=torch.int64, device=DEV)
+        buf = torch.zeros((g + 1, K, V), dtype=torch.float32, device=DEV)
+        seeds = torch.full((g,), 8, dtype=torch.int64, device=DEV)
+        offs = torch.full((g,), 24, dtype=torch.int64, device=DEV)
+        temps_req, temps_tok = torch.ones(g, device=DEV), torch.ones(g * (K + 1), device=DEV)
+        drafts = frs.fast_rs_draft_block(drf.view(-1, V), temps_req, slots, -1, buf, seeds, offs, 1)
+        return (tgt, temps_tok, drafts.view(g, K).contiguous(), slots, -1, buf, seeds, offs)
+
+    small = case(4)
+    # Sizes the verify scratch for G=4 on this stream (the capture below reuses it).
+    want = [x.clone() for x in frs.fast_rs_verify(*small)]
+    graph, outs = _capture(lambda: frs.fast_rs_verify(*small))
+    frs.fast_rs_verify(*case(16))  # outgrows every verify scratch buffer
+    # Had the G=4 buffers been freed, these (same stream, same size classes: pos, rsum / rlast,
+    # pmax / psum) would be handed their blocks and the replay would write into them.
+    junk = [torch.full((n,), float("nan"), device=DEV) for _ in range(3000) for n in (8, 160, 960)]
+    graph.replay()
+    torch.cuda.synchronize()
+    assert bool(torch.cat(junk).isnan().all())
+    for a, b in zip(outs, want):
         assert torch.equal(a, b)
 
 
