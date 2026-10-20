@@ -59,8 +59,8 @@ l0_cpu:
   # compute capability, no device. The default targets' shard tests: small CPU
   # tensors and the CPU block_scale_interleave. The qwen4_exp entries are the target's
   # tests that run on the source text, stubbed weights and meta tensors: its multimodal
-  # splice and admission check on a stub tower, the KV pool contract, and its KV storage
-  # derivation and attention-call arguments.
+  # splice and admission check on a stub tower, the KV pool contract, its KV storage
+  # derivation and attention-call arguments, and its routed-expert scalars.
   # The rest of unittest/_torch/modeling_v2 needs a GPU.
   - unittest/_torch/modeling_v2/test_modeling_v2_claims.py
   - unittest/_torch/modeling_v2/test_modeling_v2_routing.py
@@ -68,6 +68,7 @@ l0_cpu:
   - unittest/_torch/modeling_v2/test_modeling_v2_gpt_oss_default_shards.py
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_dense_backend_library_order
   - unittest/_torch/modeling_v2/test_modeling_v2_qwen4_exp_multimodal_embeds.py
+  - unittest/_torch/modeling_v2/test_modeling_v2_qwen4_exp_moe_scalars.py
   - unittest/_torch/modeling_v2/test_modeling_v2_qwen4_exp_validate_request.py
   - unittest/_torch/modeling_v2/test_modeling_v2_qwen4_exp_pool_contract.py
   - unittest/_torch/modeling_v2/test_modeling_v2_qwen4_exp_kv_quant.py

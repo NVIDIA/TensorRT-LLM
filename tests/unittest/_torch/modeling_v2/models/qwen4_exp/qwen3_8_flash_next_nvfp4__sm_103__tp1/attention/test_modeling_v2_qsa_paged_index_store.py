@@ -409,7 +409,7 @@ def test_rejects_a_one_dimensional_table() -> None:
 def test_huge_int64_position_is_skipped_not_truncated() -> None:
     """`2^32 + 5` truncated to int32 would be position 5 of column 0; the
     kernel keeps int64 and finds it past the table."""
-    args = _small(seed=70)
+    args = _small(seed=70, position_dtype=torch.int64)
     args["logical_positions"][0] = 2**32 + 5
     before = (args["index_cache"].clone(), args["position_cache"].clone())
     op(**args)

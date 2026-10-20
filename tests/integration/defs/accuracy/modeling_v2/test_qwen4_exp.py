@@ -855,16 +855,15 @@ class TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1(LlmapiAccuracyTestHarness):
                     .token_ids
                     for n in lengths
                 ]
-                # The first requests are decoding when the long prompt arrives.
-                futures = []
-                for index, prompt in enumerate(problems):
-                    futures.append(llm.generate_async(prompt, answering))
-                    time.sleep(0.3)
-                    if index == 1:
-                        long_future = llm.generate_async(
-                            {"prompt_token_ids": document[:5000]}, greedy
-                        )
-                        time.sleep(0.3)
+                # The word problems are decoding when the long prompt arrives: their short
+                # prefills are done well inside the pause, and a step-by-step answer is
+                # still being written after it.
+                futures = [llm.generate_async(prompt, answering) for prompt in problems]
+                time.sleep(0.2)
+                assert not all(future.finished for future in futures), (
+                    "every word problem finished before the long prompt arrived"
+                )
+                long_future = llm.generate_async({"prompt_token_ids": document[:5000]}, greedy)
                 answers = [future.result().outputs[0].text for future in futures]
                 long_tokens = long_future.result().outputs[0].token_ids
             return single, again, answers, long_tokens

@@ -19,6 +19,8 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flas
     modeling as M,
 )
 
+pytestmark = pytest.mark.cpu_only
+
 EXPERTS = 8
 
 
