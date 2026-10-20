@@ -445,14 +445,17 @@ class Qwen3VLInputProcessorBase(Qwen2VLInputProcessorBase):
             video_kwargs.pop("num_frames", None)
             video_kwargs.pop("fps", None)
 
-        # Qwen3VLProcessor reads this flag from the outer kwargs while using
-        # its default return_metadata=True internally to build timestamps.
-        video_kwargs.pop("return_metadata", None)
+        # HF needs metadata internally for timestamps. Its outer flag only
+        # controls whether metadata is kept in the returned batch.
+        if mm_processor_kwargs.get("return_metadata", False):
+            video_kwargs.pop("return_metadata", None)
+            proc_kwargs["return_metadata"] = True
+        else:
+            video_kwargs["return_metadata"] = True
         return self.processor(
             text=[text],
             images=images,
             videos=videos,
-            return_metadata=mm_processor_kwargs.get("return_metadata", False),
             **proc_kwargs,
         )
 
