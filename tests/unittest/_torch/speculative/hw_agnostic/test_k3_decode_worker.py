@@ -35,10 +35,10 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_mxf
     KimiK3DFlashWorker,
     KimiK3DSparkWorker,
 )
+from tensorrt_llm._torch.distributed.ops import MNNVLAllReduce
 from tensorrt_llm._torch.kernels.k3_ctx_kv import op as ctx_op
 from tensorrt_llm._torch.kernels.k3_markov import op as markov_op
 from tensorrt_llm._torch.kernels.k3_spec_accept import op as accept_op
-from tensorrt_llm._torch.distributed.ops import MNNVLAllReduce
 from tensorrt_llm._torch.models import modeling_dflash
 from tensorrt_llm._torch.modules.linear import TensorParallelMode
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManagerV2

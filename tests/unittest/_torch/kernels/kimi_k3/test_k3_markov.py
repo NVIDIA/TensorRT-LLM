@@ -209,9 +209,9 @@ class Group:
         gpus = torch.cuda.device_count()
         torch.cuda.set_device(self.rank % gpus)
         import tensorrt_llm  # noqa: F401  (registers the trtllm ops)
-        from tensorrt_llm._torch.kernels.k3_markov import op
         from tensorrt_llm._torch.distributed import AllReduceFusionOp, AllReduceParams, allgather
         from tensorrt_llm._torch.distributed.ops import MNNVLAllReduce
+        from tensorrt_llm._torch.kernels.k3_markov import op
         from tensorrt_llm.mapping import Mapping
 
         self.op, self.kernel, self.allgather = op, op._kernel_module(), allgather

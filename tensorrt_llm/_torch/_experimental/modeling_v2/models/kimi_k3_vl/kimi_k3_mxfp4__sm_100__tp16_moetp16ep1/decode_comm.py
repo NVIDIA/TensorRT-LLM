@@ -63,10 +63,10 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm.mnnvl_fusion_all
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm.mnnvl_workspace import (
     MnnvlWorkspace,
 )
+from tensorrt_llm._torch.distributed import AllReduceParams
 
 # The kernel's support predicate: metadata reads only.
 from tensorrt_llm._torch.kernels.k3_sandwich import op as _sandwich_op
-from tensorrt_llm._torch.distributed import AllReduceParams
 
 # The most tokens of a step whose post-attention all-reduce runs one-shot with the residual update in its epilogue.
 AR_ATTN_RES_MAX_TOKENS = 16

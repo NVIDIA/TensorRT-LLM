@@ -94,8 +94,8 @@ def _context():
     gpus = torch.cuda.device_count()
     torch.cuda.set_device(rank % gpus)
     import tensorrt_llm  # noqa: F401
-    from tensorrt_llm._torch.kernels.k3_fused_moe import latent_op
     from tensorrt_llm._torch.distributed.ops import MNNVLAllReduce
+    from tensorrt_llm._torch.kernels.k3_fused_moe import latent_op
     from tensorrt_llm.mapping import Mapping
 
     mapping = Mapping(world_size=world, rank=rank, gpus_per_node=gpus, tp_size=world)

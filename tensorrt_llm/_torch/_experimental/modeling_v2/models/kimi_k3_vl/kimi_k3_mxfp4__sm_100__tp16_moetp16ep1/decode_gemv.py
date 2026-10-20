@@ -58,13 +58,13 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.k3_head_gemv imp
     k3_head_gemv,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.k3_embed_norm import k3_embed_norm
+from tensorrt_llm._torch.flashinfer_utils import IS_FLASHINFER_AVAILABLE
 
 # The kernels' support predicates: metadata reads only.
 from tensorrt_llm._torch.kernels.k3_ctm_gemv import op as _ctm_op
 from tensorrt_llm._torch.kernels.k3_decode_gemv import op as _decode_op
 from tensorrt_llm._torch.kernels.k3_embed import op as _embed_op
 from tensorrt_llm._torch.kernels.k3_head_gemv import op as _head_op
-from tensorrt_llm._torch.flashinfer_utils import IS_FLASHINFER_AVAILABLE
 from tensorrt_llm._utils import mpi_disabled
 
 # The row limit of the decode GEMV and head kernels (one token tile), and of k3_ctm_gemv_wide (a decode step of 8

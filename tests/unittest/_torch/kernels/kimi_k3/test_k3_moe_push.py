@@ -186,11 +186,11 @@ class _Exchange:
     call count starting at ``count``."""
 
     def __init__(self, ctx, slots: int, count: int):
-        from tensorrt_llm._torch.kernels.k3_fused_moe import k3_latent_reduce as kernel
         from tensorrt_llm._torch.distributed.ops import (
             _get_mnnvl_workspace_comm,
             _make_mnnvl_mcast_buffer,
         )
+        from tensorrt_llm._torch.kernels.k3_fused_moe import k3_latent_reduce as kernel
 
         words = kernel.buffer_words(slots)
         fabric = os.environ.get("TRTLLM_FORCE_MNNVL_AR", "0") == "1" or ctx.mapping.is_multi_node()
@@ -242,11 +242,11 @@ def _context():
     gpus = torch.cuda.device_count()
     torch.cuda.set_device(rank % gpus)
     import tensorrt_llm  # noqa: F401
+    from tensorrt_llm._torch.distributed.ops import MNNVLAllReduce
     from tensorrt_llm._torch.kernels.k3_fused_moe import (
         latent_op,  # noqa: F401  (registers the reduce)
     )
     from tensorrt_llm._torch.kernels.k3_route_quant import op as _rq  # noqa: F401
-    from tensorrt_llm._torch.distributed.ops import MNNVLAllReduce
     from tensorrt_llm.mapping import Mapping
 
     mapping = Mapping(world_size=world, rank=rank, gpus_per_node=gpus, tp_size=world)

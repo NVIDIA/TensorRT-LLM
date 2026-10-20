@@ -8,9 +8,7 @@ from typing import Tuple
 import torch
 
 # Importing the op module registers trtllm::k3_route_quant; CuTe DSL is imported on its first call.
-from tensorrt_llm._torch.kernels.k3_route_quant import (
-    op as _k3_route_quant_op,  # noqa: F401
-)
+from tensorrt_llm._torch.kernels.k3_route_quant import op as _k3_route_quant_op  # noqa: F401
 
 __all__ = ["k3_route_quant"]
 

@@ -112,10 +112,10 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.ssm.k3_kda_decode_att
     k3_kda_decode_attn,
 )
 from tensorrt_llm._torch.attention.backends import AttentionMetadata
-from tensorrt_llm._torch.kernels.k3_mla.decode_view import k3_mla_decode_view
 
 # <<< route B
 from tensorrt_llm._torch.distributed import AllReduce
+from tensorrt_llm._torch.kernels.k3_mla.decode_view import k3_mla_decode_view
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_dflash import DFlashForCausalLM
 from tensorrt_llm._torch.models.modeling_dspark import (

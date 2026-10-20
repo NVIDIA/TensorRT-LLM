@@ -211,8 +211,8 @@ class KimiK3DFlashWorker(DFlashWorker):
         """
         if not self.k3_decode:
             return None
-        from tensorrt_llm._torch.kernels.k3_spec_accept import op as accept_op
         from tensorrt_llm._torch.distributed.ops import MNNVLAllReduce
+        from tensorrt_llm._torch.kernels.k3_spec_accept import op as accept_op
 
         mapping = self.mapping
         if getattr(self, "_k3_shard_head", None) is not lm_head:
@@ -1144,8 +1144,8 @@ class KimiK3DSparkWorker(KimiK3DFlashWorker, DSparkWorker):
         """
         if not self.k3_decode:
             return False
-        from tensorrt_llm._torch.kernels.k3_markov import op as k3_markov_op
         from tensorrt_llm._torch.distributed.ops import MNNVLAllReduce
+        from tensorrt_llm._torch.kernels.k3_markov import op as k3_markov_op
         from tensorrt_llm._torch.modules.linear import TensorParallelMode
 
         mapping = self.mapping
