@@ -78,6 +78,7 @@ l0_cpu:
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp2/spec/test_modeling_v2_m3_wide_draft_logits.py
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp2/test_modeling_v2_m3_draft_attention_bcg_route.py
   - unittest/_torch/attention/test_fallback_fmha_extra_page_sizes.py
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp2/test_modeling_v2_m3_ctx_stack_route.py
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_dense_backend_library_order
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_fp8_indexer_rejects_different_qk_norm_epsilons
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_moe_reduces_only_local_terms
@@ -104,6 +105,13 @@ l0_cpu:
   - unittest/_torch/models/test_minimax_m3.py::test_piecewise_attention_boundary_preserves_indexer_cache_contract
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_five_way_projection_shard_geometry
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_five_way_loader_returns_exact_generic_skip
+  - unittest/_torch/models/test_minimax_m3.py::test_bcg_bucket_takes_eager_qkv
+  - unittest/_torch/models/test_minimax_m3.py::test_bcg_bucket_keeps_captured_qkv_off_rubin
+  - unittest/_torch/models/test_minimax_m3.py::test_swiglu_mxfp8_engages_on_sm107_only
+  - unittest/_torch/models/test_minimax_m3.py::test_shared_fold_into_trtllm_gen_finalize_is_sm107_only
+  - unittest/_torch/models/test_minimax_m3.py::test_fused_qkv_rows_agree_between_eager_and_breakable
+  - unittest/_torch/models/test_minimax_m3.py::test_ctx_boundary_norm_declines_off_rubin_and_off_geometry
+  - unittest/_torch/models/test_minimax_m3.py::test_cutedsl_shared_fold_only_without_token_dispatch
   - unittest/_torch/models/checkpoints
   - unittest/_torch/modules
   - unittest/_torch/moe
@@ -112,6 +120,7 @@ l0_cpu:
   - unittest/_torch/speculative/hw_agnostic
   # l0_h100 selects with -m "not cpu_only", so this entry is what runs it.
   - unittest/_torch/speculative/test_spec_slot_pool_sizing.py
+  - unittest/_torch/misc/test_fp4_moe_tactic_table.py
   - unittest/_torch/test_hf_quant_config.py
   - unittest/_torch/test_mmap_utils.py
   - unittest/_torch/test_model_config.py

@@ -15,6 +15,7 @@
 
 import enum
 import os
+import time
 from collections import Counter
 from typing import Callable, Optional
 
@@ -260,6 +261,55 @@ class KVCacheV2Scheduler(RequestScheduler):
         self._prioritize_first_token_gen = (
             os.environ.get("TLLM_DISAGG_GEN_PRIORITIZE_FIRST_TOKEN", "0") == "1"
         )
+
+        # Append reserve for chunked context (opt-in: TLLM_CTX_APPEND_RESERVE=R tokens; unset or 0 disables).
+        # The first context request of each iteration is chunked against
+        # max_num_tokens - R, so R tokens stay free for short context requests
+        # (agentic appends) in the same iteration instead of waiting for the
+        # whole long prefill. The cold chunk boundaries depend only on the
+        # request and the config, so scheduling stays deterministic. Applies
+        # only when max_num_tokens > 2 * R.
+        self._ctx_append_reserve = int(os.environ.get("TLLM_CTX_APPEND_RESERVE", "0") or 0)
+        if (
+            self._ctx_append_reserve > 0
+            and max_num_tokens is not None
+            and max_num_tokens > 2 * self._ctx_append_reserve
+        ):
+            logger.info(
+                f"KVCacheV2Scheduler: context append reserve {self._ctx_append_reserve} tokens "
+                f"(first context chunk <= {max_num_tokens - self._ctx_append_reserve})"
+            )
+        else:
+            self._ctx_append_reserve = 0
+        self._ctx_append_reserve_logged = 0
+        # Adaptive reserve (on with the reserve; TLLM_CTX_APPEND_RESERVE_ADAPTIVE=0 falls back to the fixed
+        # reserve): hold the reserve back only in iterations where another context request is
+        # waiting behind the first one, so an idle cold prompt keeps full
+        # max_num_tokens chunks. Its chunk sizes then depend on load, which is
+        # value-neutral only if the forward is invariant to chunk size.
+        self._ctx_append_reserve_adaptive = self._ctx_append_reserve > 0 and (
+            os.environ.get("TLLM_CTX_APPEND_RESERVE_ADAPTIVE", "1") == "1"
+        )
+        self._ctx_append_reserve_active = True
+        if self._ctx_append_reserve_adaptive:
+            logger.info("KVCacheV2Scheduler: context append reserve is adaptive")
+        # Shortest-first reserve (on with the reserve; TLLM_CTX_APPEND_RESERVE_SJF=0 keeps arrival order): the first
+        # context request keeps its arrival-order place and its max_num_tokens - R chunk, and the requests behind it
+        # compete for the leftover budget shortest-uncached-first, so a short append is not starved behind a second
+        # long prefill. Like the adaptive reserve, this makes chunk boundaries load-dependent.
+        self._ctx_append_reserve_sjf = self._ctx_append_reserve > 0 and (
+            os.environ.get("TLLM_CTX_APPEND_RESERVE_SJF", "1") == "1"
+        )
+        self._ctx_append_reserve_sjf_logged = 0
+        # The sort key is each request's uncached token count, probed against the reuse tree; it is memoized per
+        # request and re-probed every TLLM_CTX_APPEND_RESERVE_SJF_REPROBE scheduler passes (it only orders requests).
+        self._ctx_append_reserve_sjf_reprobe = max(
+            1, int(os.environ.get("TLLM_CTX_APPEND_RESERVE_SJF_REPROBE", "8") or 1)
+        )
+        self._ctx_append_reserve_sjf_pass = 0
+        self._uncached_context_memo: dict[int, tuple[int, int]] = {}
+        if self._ctx_append_reserve_sjf:
+            logger.info("KVCacheV2Scheduler: context append reserve is shortest-first")
 
         # Registered by PyExecutor; see set_async_transfer_manager.
         self._async_transfer_manager = None
@@ -566,6 +616,18 @@ class KVCacheV2Scheduler(RequestScheduler):
         # is itself the progress in that case.
         deferred_behind_contributor = False
 
+        if self._ctx_append_reserve_adaptive:
+            self._ctx_append_reserve_active = (
+                sum(1 for req in pending_ctx if req.state_value == self._context_init_state_value)
+                > 1
+            )
+        if (
+            self._ctx_append_reserve_sjf
+            and self._ctx_append_reserve_active
+            and len(pending_ctx) > 2
+        ):
+            self._order_reserve_shortest_first(pending_ctx)
+
         for req in pending_ctx:
             if budget.requests_full:
                 break
@@ -612,6 +674,8 @@ class KVCacheV2Scheduler(RequestScheduler):
                         "block is already contributed by a request that runs this iteration"
                     )
                     deferred_behind_contributor = True
+                    # Its reuse grows once the contributor commits the shared block: re-probe it next pass.
+                    self._uncached_context_memo.pop(req.py_request_id, None)
                     continue
             peft_pages = budget.peft_pages_needed(req)
             if peft_pages is None:
@@ -959,7 +1023,84 @@ class KVCacheV2Scheduler(RequestScheduler):
             )
         )
 
+    def _order_reserve_shortest_first(self, pending_ctx: RequestList) -> None:
+        """Reorder ``pending_ctx`` in place for the append reserve.
+
+        The first request keeps its place. Started context requests (continuations holding pages) follow in arrival
+        order, so a new short request never pushes a started prefill toward page preemption. Not-yet-started requests
+        come last, shortest uncached first.
+        """
+        start = time.perf_counter()
+        self._ctx_append_reserve_sjf_pass += 1
+        rest = pending_ctx[1:]
+        unstarted = [req for req in rest if self._is_unstarted_context(req)]
+        started = [req for req in rest if not self._is_unstarted_context(req)]
+        if len(unstarted) > 1:
+            unstarted.sort(key=self._uncached_context_tokens)
+        pending_ctx[1:] = started + unstarted
+        live = {req.py_request_id for req in unstarted}
+        for request_id in [rid for rid in self._uncached_context_memo if rid not in live]:
+            del self._uncached_context_memo[request_id]
+        if self._ctx_append_reserve_sjf_logged < 3:
+            self._ctx_append_reserve_sjf_logged += 1
+            logger.info(
+                f"[ctx-reserve-sjf] taken: {len(started)} started + {len(unstarted)} new context requests behind "
+                f"the first, new ones shortest first ({(time.perf_counter() - start) * 1e6:.0f} us)"
+            )
+
+    def _is_unstarted_context(self, req: LlmRequest) -> bool:
+        return req.state_value == self._context_init_state_value and req.is_first_context_chunk
+
+    def _uncached_context_tokens(self, req: LlmRequest) -> int:
+        """Context tokens a not-yet-started ``req`` still has to compute: its length minus the reuse depth that
+        ``_prepare_context_pair`` would claim (the joint draft/target minimum when a draft pool is paired), probed
+        without claiming pages. Memoized per request for ``_ctx_append_reserve_sjf_reprobe`` passes."""
+        memo = self._uncached_context_memo.get(req.py_request_id)
+        if (
+            memo is not None
+            and self._ctx_append_reserve_sjf_pass - memo[1] < self._ctx_append_reserve_sjf_reprobe
+        ):
+            return memo[0]
+        if self._joint_draft_manager is not None:
+            reuse = self._reuse_claim_limit(req)
+        else:
+            probe = getattr(self.kv_cache_manager, "probe_context_reuse", None)
+            reuse = probe(req) if probe is not None else None
+        uncached = max(0, req.context_remaining_length - (reuse or 0))
+        self._uncached_context_memo[req.py_request_id] = (
+            uncached,
+            self._ctx_append_reserve_sjf_pass,
+        )
+        return uncached
+
     def _try_schedule_context_chunked(
+        self,
+        req: LlmRequest,
+        budget: BudgetTracker,
+        preempt_for_pages: Callable[[LlmRequest], bool],
+    ) -> tuple[ScheduleAction, int, bool]:
+        """Chunk a context request, holding back the append reserve for the first one.
+
+        See ``_ctx_append_reserve`` in ``__init__``.
+        """
+        reserve = self._ctx_append_reserve if self._ctx_append_reserve_active else 0
+        if not reserve or budget.num_tokens != 0 or budget.max_num_tokens is None:
+            return self._try_schedule_context_chunked_impl(req, budget, preempt_for_pages)
+        full = budget.max_num_tokens
+        budget.max_num_tokens = full - reserve
+        try:
+            result = self._try_schedule_context_chunked_impl(req, budget, preempt_for_pages)
+        finally:
+            budget.max_num_tokens = full
+        if self._ctx_append_reserve_logged < 3 and result[0] is ScheduleAction.SCHEDULED:
+            self._ctx_append_reserve_logged += 1
+            logger.info(
+                f"[ctx-reserve] taken: first ctx chunk {result[1]} tokens "
+                f"(budget {full} - reserve {reserve})"
+            )
+        return result
+
+    def _try_schedule_context_chunked_impl(
         self,
         req: LlmRequest,
         budget: BudgetTracker,

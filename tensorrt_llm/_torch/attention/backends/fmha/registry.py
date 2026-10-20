@@ -34,12 +34,16 @@ def init_fmha_libs() -> dict[str, "FmhaCls"]:
     scope, so backends can import trtllm attention classes at module scope
     without an import cycle.
     """
+    from .drafter_last_row import DrafterLastRowContextFmha
     from .flashinfer_sparse_mla import FlashInferSparseMlaFmha
     from .msa_decode import MsaDecodeFmha
     from .msa_prefill import MsaPrefillFmha
     from .prims_ts_block_sparse import PrimsTSBlockSparseFmha
 
     return {
+        # Available only on the attention backend a model marks with
+        # mark_drafter_last_row_attention, ahead of the libraries it shortens.
+        "drafter_last_row": DrafterLastRowContextFmha,
         "fp4_mla": Fp4MlaFmha,
         "triton_custom_mask": TritonCustomMaskFmha,
         "cute_dsl_mla": CuteDslMlaFmha,

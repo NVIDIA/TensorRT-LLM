@@ -589,9 +589,27 @@ _MXFP8_QUANTIZE_AUTOTUNED_OP = "trtllm::mxfp8_quantize_autotuned::quantize"
 _FLASHINFER_MXFP8_GEMM_AUTOTUNED_OP = (
     "trtllm::flashinfer_mxfp8_gemm_autotuned::gemm")
 
+_MXFP8_SMALL_M_BUCKETS: Optional[tuple[int, ...]] = None
+
+
+def _get_mxfp8_small_m_buckets() -> tuple[int, ...]:
+    """Return the native runner's small-M tuning buckets (empty except on SM107)."""
+    global _MXFP8_SMALL_M_BUCKETS
+    if _MXFP8_SMALL_M_BUCKETS is None:
+        try:
+            runner = torch.classes.trtllm.MXFP8GemmRunner(torch.bfloat16)
+        except RuntimeError:
+            # No CUDA device or no native MXFP8 runner: keep exact-M profiles.
+            return ()
+        _MXFP8_SMALL_M_BUCKETS = tuple(runner.get_small_m_tuning_buckets())
+    return _MXFP8_SMALL_M_BUCKETS
+
 
 def _map_to_mxfp8_large_m_bucket(num_tokens: int) -> int:
-    """Map known large-M bands to stable native autotuning profiles."""
+    """Map known large-M bands, and small-M bands where the GPU has them, to native autotuning profiles."""
+    small_buckets = _get_mxfp8_small_m_buckets()
+    if small_buckets and num_tokens <= small_buckets[-1]:
+        return next(bucket for bucket in small_buckets if num_tokens <= bucket)
     for (lower_bound,
          upper_bound), bucket in zip(MXFP8GemmRunner._LARGE_M_BANDS,
                                      MXFP8GemmRunner._LARGE_M_BUCKETS):
@@ -603,8 +621,8 @@ def _map_to_mxfp8_large_m_bucket(num_tokens: int) -> int:
 def _get_mxfp8_large_m_tuning_buckets(max_num_tokens: int) -> tuple[int, ...]:
     """Return large-M profiles reachable by the configured token limit."""
     mapped_max = _map_to_mxfp8_large_m_bucket(max_num_tokens)
-    return tuple(bucket for bucket in MXFP8GemmRunner._LARGE_M_BUCKETS
-                 if bucket <= mapped_max)
+    return tuple(bucket for bucket in _get_mxfp8_small_m_buckets() +
+                 MXFP8GemmRunner._LARGE_M_BUCKETS if bucket <= mapped_max)
 
 
 def _mxfp8_scale_infer_shape(input_shapes: List[List[int]]) -> int:

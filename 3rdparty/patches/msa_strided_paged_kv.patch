@@ -1,8 +1,108 @@
 diff --git a/python/fmha_sm100/api.py b/python/fmha_sm100/api.py
-index b02f747..17d7cfb 100644
+index b02f747..47dea78 100644
 --- a/python/fmha_sm100/api.py
 +++ b/python/fmha_sm100/api.py
-@@ -532,9 +532,8 @@ def _fmha_sm100_plan(
+@@ -17,6 +17,8 @@ __all__ = [
+ ]
+ 
+ import numpy as np
++import os as _ss_os0
++_SS_VERIFY_ZERO = _ss_os0.environ.get("TLLM_FMHA_PLAN_SS_VERIFY", "0") == "1"
+ import torch
+ 
+ from .jit import _dlpack_dtype_code, _PACK_FACTORS, get_fmha_variant, get_reduction_module, get_plan_fn, get_sparse_topk_module
+@@ -91,6 +93,8 @@ def _get_workspace_buf(tag, device):
+     return _workspace_cache[device_id][tag]
+ 
+ def _alloc_perplan_buf(tag, size, device, dtype):
++    if _SS_VERIFY_ZERO:
++        return torch.zeros(size, dtype=dtype, device=device)  # verify mode only: unwritten tails compare equal
+     # global _workspace_cache
+     # device_id = torch.device(device).index
+     # buf = _workspace_cache[-1][device_id][tag]
+@@ -482,6 +486,72 @@ def _make_plan_info(
+     })
+ 
+ 
++# ---- MiniMax-M3 (SM107 only): DEFERRED split decision (exact). The adaptive plan's split decision (plan_cost[0] = split,
++# [1] = predicted speedup) is read back with plan_cost.tolist() in prepare(); its single-CTA plan kernel waits for an SM
++# under the previous step's kernels, so that read stalls the prepare thread (~1 ms per ctx-bearing step) and costs the
++# overlap scheduler its run-ahead. Deferred: the same plan kernel, its 2 floats copied to a pinned per-plan buffer with
++# an event, and the split-dependent plan fields filled at their first read -- the attention launch that consumes the plan,
++# an eager point, by which time the event has normally completed. The fields are then the ones the immediate read gives.
++# Never resolved under stream capture (asserted). Kill: TLLM_FMHA_PLAN_DEFER_READ=0. TLLM_FMHA_PLAN_DECISION_LOG=<path>
++# appends one line per adaptive plan (split, speedup, max_kv_splits, total_qo) on either path, for the trace gate.
++_PLAN_DEFER_READ = _ss_os0.environ.get("TLLM_FMHA_PLAN_DEFER_READ", "1") != "0"
++_PLAN_DECISION_LOG = _ss_os0.environ.get("TLLM_FMHA_PLAN_DECISION_LOG")
++_SPLIT_KEYS = frozenset((
++    "kv_tile_begin_indices", "kv_tile_end_indices", "kv_split_indices", "num_kv_splits", "workspace_o",
++    "workspace_lse", "predicted_speedup", "num_kv_splits_per_row",
++))
++
++
++def _log_plan_decision(split, speedup, max_kv_splits, total_qo_len, path):
++    if _PLAN_DECISION_LOG:
++        with open(_PLAN_DECISION_LOG, "a") as f:
++            f.write(f"pid={_ss_os0.getpid()} {path} split={int(bool(split))} speedup={speedup!r} "
++                    f"max_kv_splits={max_kv_splits} total_qo={total_qo_len}\n")
++
++
++class _DeferredSplitPlanInfo(PlanInfo):
++    """A PlanInfo whose split-dependent fields are filled from the plan's cost read at their first access."""
++
++    def _resolve(self):
++        lazy = self.__dict__.pop("_lazy", None)
++        if lazy is None:
++            return
++        if torch.cuda.is_current_stream_capturing():
++            raise RuntimeError("fmha_sm100: a deferred plan decision was first read under CUDA graph capture")
++        lazy["event"].synchronize()
++        split_flag, speedup = lazy["host"].tolist()
++        do_split = split_flag > 0
++        _log_plan_decision(do_split, speedup, lazy["max_kv_splits"], lazy["total_qo_len"], "deferred")
++        put = dict.__setitem__
++        if do_split:
++            put(self, "workspace_o", _alloc_workspace_buf(
++                _BuffTag.workspace_o, lazy["total_qo_len"] * lazy["max_kv_splits"] * lazy["num_qo_heads"] * 128,
++                lazy["device"], dtype=torch.bfloat16))
++            put(self, "num_kv_splits", lazy["max_kv_splits"])
++        else:
++            for key in ("kv_tile_begin_indices", "kv_tile_end_indices", "kv_split_indices",
++                        "num_kv_splits_per_row", "workspace_o", "workspace_lse"):
++                put(self, key, None)
++            put(self, "num_kv_splits", 1)
++        put(self, "predicted_speedup", speedup)
++
++    def __getitem__(self, key):
++        if key in _SPLIT_KEYS and "_lazy" in self.__dict__:
++            self._resolve()
++        return dict.__getitem__(self, key)
++
++    def get(self, key, default=None):
++        if key in _SPLIT_KEYS and "_lazy" in self.__dict__:
++            self._resolve()
++        return dict.get(self, key, default)
++
++    def items(self):
++        # fmha_sm100_plan's mixed-batch path clones a sub-plan through items(): resolve first (that path keeps the
++        # immediate read). values() stays unresolved: the side-stream wrapper only record_stream()s the tensors.
++        self._resolve()
++        return dict.items(self)
++
++
+ def _call_plan(qo_segment_offsets, qo_segment_lens, kv_segment_lens,
+                packed_work_range, packed_work_info,
+                qo_tile_size, kv_tile_size, num_qo_heads, num_ctas, causal,
+@@ -507,7 +577,7 @@ def _call_plan(qo_segment_offsets, qo_segment_lens, kv_segment_lens,
+         pack_factor,
+     )
+ 
+-def _fmha_sm100_plan(
++def _fmha_sm100_plan_impl(
+     qo_segment_lens: torch.Tensor,
+     kv_segment_lens: torch.Tensor,
+     num_qo_heads: int,
+@@ -532,9 +602,8 @@ def _fmha_sm100_plan(
  
      if kv_block_num > 0 and (sparse_kernel_mode == 'prefill' or (sparse_kernel_mode == 'auto' and max_qo_len_orig > _prefill_qlen_threshold(True))):
          # print("Nv-Prefill")
@@ -14,7 +114,217 @@ index b02f747..17d7cfb 100644
          return sparse_fmha_plan(qo_segment_lens=qo_segment_lens, kv_segment_lens=kv_segment_lens,
                  num_qo_heads=num_qo_heads, causal=causal, qo_offset=qo_offset,
                  num_kv_splits=num_kv_splits, page_size=page_size, output_maxscore=output_maxscore,
-@@ -941,6 +940,62 @@ def _fmha_sm100(
+@@ -652,7 +721,10 @@ def _fmha_sm100_plan(
+             kv_tile_end_indices = _alloc_perplan_buf(_BuffTag.kv_tile_end_indices, max_work_items, device, torch.int32)
+             kv_split_indices = _alloc_perplan_buf(_BuffTag.kv_split_indices, max_work_items, device, torch.int32)
+             num_kv_splits_per_row = _alloc_perplan_buf(_BuffTag.num_kv_splits_per_row, total_qo_len, device, torch.int32)
+-            plan_cost = _alloc_workspace_buf(_BuffTag.plan_cost, 2, device, dtype=torch.float32)
++            defer = _PLAN_DEFER_READ and _ss_is_sm107(device) and not torch.cuda.is_current_stream_capturing()
++            # A deferred read owns its plan_cost (the shared one may be rewritten by a later plan on another stream).
++            plan_cost = (torch.empty(2, dtype=torch.float32, device=device) if defer
++                         else _alloc_workspace_buf(_BuffTag.plan_cost, 2, device, dtype=torch.float32))
+ 
+             lse_total_size = max_kv_splits * total_qo_len * num_qo_heads
+             workspace_lse = _alloc_perplan_buf(_BuffTag.workspace_lse, lse_total_size, device, torch.float32)
+@@ -669,7 +741,32 @@ def _fmha_sm100_plan(
+                 chunk_size, plan_cost, num_kv_splits_per_row, workspace_lse, lse_total_size,
+                 pack_factor, cuda_stream)
+ 
++            if defer:
++                host_cost = torch.empty(2, dtype=torch.float32, pin_memory=True)
++                host_cost.copy_(plan_cost, non_blocking=True)
++                cost_ready = torch.cuda.Event()
++                cost_ready.record()
++                info = _make_plan_info(
++                    packed_work_range=packed_work_range, packed_work_info=packed_work_info,
++                    kv_tile_begin_indices=kv_tile_begin_indices, kv_tile_end_indices=kv_tile_end_indices,
++                    kv_split_indices=kv_split_indices, num_kv_splits=max_kv_splits, workspace_o=None,
++                    workspace_lse=workspace_lse, max_qo_len=max_qo_len, predicted_speedup=None,
++                    num_kv_splits_per_row=num_kv_splits_per_row, qo_segment_offsets=qo_segment_offsets,
++                    kv_segment_offsets=kv_segment_offsets, kv_page_indptr=kv_page_indptr, max_k_tiles=max_k_tiles,
++                    qo_segment_lens=qo_segment_lens_gpu, kv_segment_lens=kv_segment_lens, qo_offset=qo_offset,
++                    pack_factor=pack_factor, orig_num_qo_heads=orig_num_qo_heads,
++                    qo_len_uniform=qo_len_uniform, cute_workspace_buffer=cute_workspace_buffer)
++                deferred = _DeferredSplitPlanInfo(info)
++                # plan_cost is kept alive until the read resolves (the copy reads it on this stream).
++                deferred.__dict__["_lazy"] = dict(event=cost_ready, host=host_cost, plan_cost=plan_cost,
++                                                  max_kv_splits=max_kv_splits, total_qo_len=total_qo_len,
++                                                  num_qo_heads=num_qo_heads, device=device)
++                return deferred
++
++            _tl0 = _ss_time.perf_counter()
+             _cost = plan_cost.tolist()
++            _log_plan_decision(_cost[0] > 0, _cost[1], max_kv_splits, total_qo_len, "immediate")
++            _SS_STATS["tl"].append((_ss_time.perf_counter() - _tl0) * 1e3)
+             do_split = _cost[0] > 0
+             predicted_speedup = _cost[1]
+ 
+@@ -747,6 +844,164 @@ def _fmha_sm100_plan(
+ 
+ 
+ 
++
++# ---- TTFT/CTX: side-stream plan (exact). The adaptive plan reads plan_cost back to the host (.tolist()); on the current
++# stream that read waits for every kernel queued before it (the previous prefill chunk), so the host can no longer run
++# ahead. All plan inputs come from host lists and every plan buffer is fresh, so the whole plan can run on a dedicated
++# HIGH-priority stream: the read then waits only for the plan stream's own copies + the tiny plan kernel. The consumer
++# stream (caller's stream, else current) then waits device-side on the plan stream, and every returned tensor is
++# record_stream()'d for it. Same kernel, same inputs -> same plan. Kill: TLLM_FMHA_PLAN_SIDE_STREAM=0.
++import inspect as _ss_inspect
++import os as _ss_os
++import sys as _ss_sys
++import time as _ss_time
++
++_SS_ON = _ss_os.environ.get("TLLM_FMHA_PLAN_SIDE_STREAM", "1") != "0"
++_SS_STREAMS = {}
++_SS_SIG = _ss_inspect.signature(_fmha_sm100_plan_impl)
++_SS_STATS = {"n": 0, "waits": [], "logged": False, "vn": 0, "vbad": 0, "tl": []}
++_SS_VERIFY = _ss_os.environ.get("TLLM_FMHA_PLAN_SS_VERIFY", "0") == "1"  # gate arm only (implies a main-stream sync)
++
++
++_SS_CC = {}
++
++
++def _ss_index(device):
++    if device is None:
++        return torch.cuda.current_device()
++    if isinstance(device, int):
++        return device
++    d = torch.device(device)
++    return d.index if d.index is not None else torch.cuda.current_device()
++
++
++def _ss_is_sm107(device):
++    idx = _ss_index(device)
++    cc = _SS_CC.get(idx)
++    if cc is None:
++        cc = _SS_CC[idx] = torch.cuda.get_device_capability(idx)
++    return cc == (10, 7)
++
++
++def _ss_stream(device):
++    idx = _ss_index(device)
++    st = _SS_STREAMS.get(idx)
++    if st is None:
++        lo, hi = torch.cuda.Stream.priority_range()
++        st = _SS_STREAMS[idx] = torch.cuda.Stream(device=idx, priority=min(lo, hi))
++    return st
++
++
++def _ss_tensors(obj):
++    if isinstance(obj, torch.Tensor):
++        yield obj
++    elif isinstance(obj, dict):
++        for v in obj.values():
++            yield from _ss_tensors(v)
++    elif isinstance(obj, (list, tuple)):
++        for v in obj:
++            yield from _ss_tensors(v)
++
++
++def _ss_same(a, b):
++    if isinstance(a, torch.Tensor) or isinstance(b, torch.Tensor):
++        return (isinstance(a, torch.Tensor) and isinstance(b, torch.Tensor) and a.shape == b.shape
++                and a.dtype == b.dtype and torch.equal(a, b))
++    if isinstance(a, dict) and isinstance(b, dict):
++        return a.keys() == b.keys() and all(_ss_same(a[k], b[k]) for k in a)
++    if isinstance(a, (list, tuple)) and isinstance(b, (list, tuple)):
++        return len(a) == len(b) and all(_ss_same(x, y) for x, y in zip(a, b))
++    return a == b
++
++
++def _ss_verify(side_out, ref_out):
++    st = _SS_STATS
++    st["vn"] += 1
++    ok = True
++    if isinstance(side_out, dict) and isinstance(ref_out, dict):
++        for k in side_out:
++            if k in ("cute_workspace_buffer", "workspace_o"):
++                continue  # scratch buffers the plan never writes
++            if not _ss_same(side_out.get(k), ref_out.get(k)):
++                ok = False
++                _ss_sys.stderr.write(f"[fmha_sm100] SS VERIFY MISMATCH key={k}\n")
++    else:
++        ok = _ss_same(side_out, ref_out)
++    if not ok:
++        st["vbad"] += 1
++    if st["vn"] % 200 == 0 or not ok:
++        _ss_sys.stderr.write(f"[fmha_sm100] SS VERIFY calls {st['vn']} mismatches {st['vbad']}\n")
++
++
++def _ss_eligible(b):
++    a = b.arguments
++    if not _ss_is_sm107(a.get("device")):
++        return False  # validated on SM107 only: SM100 / SM103 keep the stock current-stream plan
++    for name in ("qo_segment_lens", "kv_segment_lens", "qo_offset"):
++        v = a.get(name)
++        if isinstance(v, torch.Tensor) and v.is_cuda:
++            return False  # produced on a CUDA stream: reading it on the plan stream would race
++    if torch.cuda.is_current_stream_capturing():
++        return False
++    kv_block_num = a.get("kv_block_num", -1)
++    mode = a.get("sparse_kernel_mode", "auto")
++    lens = a.get("qo_segment_lens")
++    mq = int(lens.max()) if isinstance(lens, torch.Tensor) and lens.numel() else 0
++    if kv_block_num > 0 and (mode == "prefill" or (mode == "auto" and mq > _prefill_qlen_threshold(True))):
++        return False  # sparse_fmha_plan branch: not audited for the side stream
++    return True
++
++
++def _ss_tl_report(tag):
++    st = _SS_STATS
++    st["n"] += 1
++    if st["n"] % 50 == 0 and st["tl"]:
++        t = sorted(st["tl"]); st["tl"] = []
++        _ss_sys.stderr.write(f"[fmha_sm100] {tag}: last {len(t)} plan_cost.tolist() host waits ms p50 "
++                             f"{t[len(t)//2]:.3f} p99 {t[min(len(t)-1, int(0.99*len(t)))]:.3f} max {t[-1]:.3f}\n")
++
++
++def _fmha_sm100_plan(*args, **kwargs):
++    if not _SS_ON:
++        out = _fmha_sm100_plan_impl(*args, **kwargs)
++        _ss_tl_report("stock-stream plan (kill switch)")
++        return out
++    b = _SS_SIG.bind(*args, **kwargs)
++    b.apply_defaults()
++    if not _ss_eligible(b):
++        _SS_STATS["tl"].clear()  # never reported on this path (e.g. off SM107): keep the sample list bounded
++        return _fmha_sm100_plan_impl(*args, **kwargs)
++    dev = b.arguments.get("device")
++    caller = b.arguments.get("stream")
++    consumer = torch.cuda.ExternalStream(caller) if isinstance(caller, int) and caller else torch.cuda.current_stream()
++    side = _ss_stream(dev)
++    b.arguments["stream"] = side.cuda_stream
++    t0 = _ss_time.perf_counter()
++    with torch.cuda.stream(side):
++        out = _fmha_sm100_plan_impl(*b.args, **b.kwargs)
++    dt = (_ss_time.perf_counter() - t0) * 1e3
++    consumer.wait_stream(side)
++    for t in _ss_tensors(out):
++        if t.is_cuda:
++            t.record_stream(consumer)
++    if _SS_VERIFY:
++        _ss_verify(out, _fmha_sm100_plan_impl(*args, **kwargs))
++    st = _SS_STATS
++    st["n"] += 1
++    st["waits"].append(dt)
++    if not st["logged"]:
++        st["logged"] = True
++        _ss_sys.stderr.write("[fmha_sm100] plan decision on side stream taken (high priority)\n")
++    if st["n"] % 50 == 0:
++        w = sorted(st["waits"]); st["waits"] = []
++        t = sorted(st["tl"]); st["tl"] = []
++        if t:
++            _ss_sys.stderr.write(f"[fmha_sm100] side-stream plan: last {len(t)} plan_cost.tolist() host waits ms p50 "
++                                 f"{t[len(t)//2]:.3f} p99 {t[min(len(t)-1, int(0.99*len(t)))]:.3f} max {t[-1]:.3f}\n")
++        _ss_sys.stderr.write(f"[fmha_sm100] side-stream plan: last {len(w)} calls, plan wall ms (upper bound of the plan_cost read wait) p50 {w[len(w)//2]:.3f} "
++                             f"p99 {w[min(len(w)-1, int(0.99*len(w)))]:.3f} max {w[-1]:.3f}\n")
++    return out
++
+ def _fmha_sm100(
+     q: torch.Tensor,
+     k: torch.Tensor,
+@@ -941,6 +1196,62 @@ def _fmha_sm100(
      return out, max_score
  
  
@@ -77,7 +387,7 @@ index b02f747..17d7cfb 100644
  def fmha_sm100_plan(
      qo_segment_lens: torch.Tensor,
      kv_segment_lens: torch.Tensor,
-@@ -973,9 +1028,11 @@ def fmha_sm100_plan(
+@@ -973,9 +1284,11 @@ def fmha_sm100_plan(
          ``kv_segment_lens - qo_segment_lens`` for bottom-right causal masking.
          A tensor must have shape ``[batch_size]``.
      split_prefill_decode : bool, optional
@@ -92,7 +402,7 @@ index b02f747..17d7cfb 100644
      **kwargs
          Planner options forwarded to ``_fmha_sm100_plan``.  Common options are
          ``num_kv_heads``, ``num_kv_splits``, ``page_size``,
-@@ -985,8 +1042,13 @@ def fmha_sm100_plan(
+@@ -985,8 +1298,13 @@ def fmha_sm100_plan(
      Returns
      -------
      tuple
@@ -108,7 +418,7 @@ index b02f747..17d7cfb 100644
      """
  
      # assert qo_segment_lens.device.type == 'cpu' \
-@@ -997,31 +1059,23 @@ def fmha_sm100_plan(
+@@ -997,31 +1315,23 @@ def fmha_sm100_plan(
          qo_offset = kv_segment_lens - qo_segment_lens
      elif isinstance(qo_offset, int):
          qo_offset = torch.full_like(qo_segment_lens, qo_offset)
@@ -153,7 +463,7 @@ index b02f747..17d7cfb 100644
                                      qo_offset=qo_offset, **kwargs)
          return (False, 0, batch_size, plan, None)
  
-@@ -1081,16 +1135,23 @@ def fmha_sm100(
+@@ -1081,16 +1391,23 @@ def fmha_sm100(
      -------
      tuple[torch.Tensor | None, torch.Tensor | None]
          ``(out, max_score)``.  Either item may be ``None`` if the corresponding
@@ -182,7 +492,7 @@ index b02f747..17d7cfb 100644
          is_paged = kv_indices is not None
          nnz_qo = q.shape[0]
          num_qo_heads = q.shape[1]
-@@ -1101,10 +1162,12 @@ def fmha_sm100(
+@@ -1101,10 +1418,12 @@ def fmha_sm100(
          if is_paged:
              k_decode, v_decode = k, v
              k_prefill, v_prefill = k, v
@@ -199,7 +509,7 @@ index b02f747..17d7cfb 100644
              decode_kv_indices = kv_indices[:kv_page_split]
              prefill_kv_indices = kv_indices[kv_page_split:]
          else:
-@@ -1129,27 +1192,35 @@ def fmha_sm100(
+@@ -1129,27 +1448,35 @@ def fmha_sm100(
              decode_qo_offset = None
              prefill_qo_offset = None
  
@@ -240,8 +550,823 @@ index b02f747..17d7cfb 100644
              out.copy_(combined_out)
  
          # ---- Merge max_score ----
+diff --git a/python/fmha_sm100/csrc/fmha_sm100_inst.jinja b/python/fmha_sm100/csrc/fmha_sm100_inst.jinja
+index 6949035..ec10e51 100644
+--- a/python/fmha_sm100/csrc/fmha_sm100_inst.jinja
++++ b/python/fmha_sm100/csrc/fmha_sm100_inst.jinja
+@@ -1,4 +1,5 @@
+ // SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
++// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
+ // SPDX-License-Identifier: MIT
+ 
+ // Auto-generated FMHA variant: {{ variant_name }}
+@@ -28,12 +29,14 @@ cudaError_t {{ func_name }}(const FMHACutlassSM100Params& p) {
+ 
+   using ActiveMaskType = {% if pack_factor is defined and pack_factor > 1 %}PackedCausalMask<{{ pack_factor }}>{% else %}CausalMask{% endif %};
+ 
+-  return run_fmha_fwd<cutlass_type_in, cutlass_type_out, int32_t,
++  auto run = [&](auto unit_selector_column) {
++    return run_fmha_fwd<cutlass_type_in, cutlass_type_out, int32_t,
+                       TileShapeQK, TileShapePV, ActiveMaskType, FmhaThreadShape,
+                       /*IsSplitKV=*/{{ is_split_kv }},
+                       /*SingleSoftmaxWarpGroup=*/{{ single_wg }},
+                       {{ page_size }},
+-                      cutlass::fmha::collective::SparseAttnMode::{{ sparse_mode }}>(
++                      cutlass::fmha::collective::SparseAttnMode::{{ sparse_mode }},
++                      decltype(unit_selector_column)::value>(
+       p.workspace_buffer_ptr,
+       static_cast<cutlass_type_in*>(p.q_ptr),
+       static_cast<cutlass_type_in*>(p.k_ptr),
+@@ -58,6 +61,7 @@ cudaError_t {{ func_name }}(const FMHACutlassSM100Params& p) {
+       p.kv_indices_ptr, p.kv_page_indptr_ptr, p.total_page_num,
+       p.max_score_ptr, p.max_k_tiles,
+       p.kv_block_indexes_ptr, p.kv_block_num,
++      p.kv_block_stride_n, p.kv_block_stride_h, p.kv_block_stride_b,
+       p.pack_factor, p.q_stride_n_original, p.q_stride_h_original, p.h_r_original,
+       flashinfer::PackGQAUnpackParams{p.max_score_direct_ptr, p.total_qo_len_orig,
+                                       p.o_direct_ptr, p.num_qo_heads_orig,
+@@ -67,4 +71,13 @@ cudaError_t {{ func_name }}(const FMHACutlassSM100Params& p) {
+ #endif
+                                       },
+       p.num_ctas);
++  };
++{% if dtype_in == "nv_bfloat16" and page_size > 0 and sparse_mode == "Sparse" %}
++  // The selector layout is host metadata; capture the matching existing kernel
++  // specialization without copying the selector or reading device values.
++  if (p.kv_block_stride_b == 1) {
++    return run(cute::true_type{});
++  }
++{% endif %}
++  return run(cute::false_type{});
+ }
+diff --git a/python/fmha_sm100/csrc/fmha_sm100_params.h b/python/fmha_sm100/csrc/fmha_sm100_params.h
+index 878a90c..8972c64 100644
+--- a/python/fmha_sm100/csrc/fmha_sm100_params.h
++++ b/python/fmha_sm100/csrc/fmha_sm100_params.h
+@@ -1,4 +1,5 @@
+ // SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
++// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
+ // SPDX-License-Identifier: MIT
+ 
+ #pragma once
+@@ -54,6 +55,9 @@ struct FMHACutlassSM100Params {
+   int max_k_tiles;
+   int* kv_block_indexes_ptr;
+   int kv_block_num;
++  int64_t kv_block_stride_n = 0;
++  int64_t kv_block_stride_h = 0;
++  int64_t kv_block_stride_b = 1;
+   int pack_factor = 1;
+   int h_r_original = 0;
+   int q_stride_n_original = 0;
+diff --git a/python/fmha_sm100/csrc/fmha_sm100_variant_run.cu.jinja b/python/fmha_sm100/csrc/fmha_sm100_variant_run.cu.jinja
+index 7e21585..ac0ac05 100644
+--- a/python/fmha_sm100/csrc/fmha_sm100_variant_run.cu.jinja
++++ b/python/fmha_sm100/csrc/fmha_sm100_variant_run.cu.jinja
+@@ -1,9 +1,11 @@
+ // SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
++// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
+ // SPDX-License-Identifier: MIT
+ 
+ // Auto-generated per-variant FMHA run binding: {{ variant_name }}
+ #include "fmha_sm100_params.h"
+ #include "tvm_ffi_utils.h"
++#include <climits>
+ #include <cmath>
+ #include <cstdlib>
+ 
+@@ -121,9 +123,25 @@ void FMHAVariantRun_{{ variant_name }}(ffi::TensorView workspace_buffer, ffi::Te
+   params.max_score_ptr = max_score_ptr;
+   params.max_k_tiles = static_cast<int>(max_k_tiles);
+   params.kv_block_indexes_ptr = kv_block_indexes_ptr;
+-  params.kv_block_num = maybe_kv_block_indexes.has_value()
+-                            ? static_cast<int>(maybe_kv_block_indexes.value().size(2))
+-                            : 0;
++  params.kv_block_num = 0;
++  if (maybe_kv_block_indexes.has_value()) {
++    auto const selector = maybe_kv_block_indexes.value();
++    CHECK_CUDA(selector);
++    CHECK_DEVICE(selector, q);
++    CHECK_INPUT_TYPE(selector, dl_int32);
++    CHECK_DIM(3, selector);
++    TVM_FFI_ICHECK_EQ(selector.size(0), q.size(0));
++    TVM_FFI_ICHECK_EQ(selector.size(1), num_kv_heads);
++    TVM_FFI_ICHECK_GT(selector.size(2), 0);
++    TVM_FFI_ICHECK_LE(selector.size(2), INT_MAX);
++    for (int dim = 0; dim < 3; ++dim) {
++      TVM_FFI_ICHECK_GE(selector.stride(dim), 0);
++    }
++    params.kv_block_num = static_cast<int>(selector.size(2));
++    params.kv_block_stride_n = selector.stride(0);
++    params.kv_block_stride_h = selector.stride(1);
++    params.kv_block_stride_b = selector.stride(2);
++  }
+ 
+   params.pack_factor = static_cast<int>(pack_factor);
+   params.num_ctas = static_cast<int>(packed_work_range.size(0));
+@@ -187,10 +205,18 @@ void FMHAVariantRun_{{ variant_name }}(ffi::TensorView workspace_buffer, ffi::Te
+       ? static_cast<int>(maybe_max_score.value().size(0)
+                          * maybe_max_score.value().size(1)
+                          * maybe_max_score.value().size(2)) : 0;
+-  params.gmem_bounds.kv_block_indexes_numel = maybe_kv_block_indexes.has_value()
+-      ? static_cast<int>(maybe_kv_block_indexes.value().size(0)
+-                         * maybe_kv_block_indexes.value().size(1)
+-                         * maybe_kv_block_indexes.value().size(2)) : 0;
++  // A sliced head-major view can span more storage than its logical numel.
++  // TensorView::data_ptr() already includes the view's storage offset.
++  params.gmem_bounds.kv_block_indexes_span = 0;
++  if (maybe_kv_block_indexes.has_value()) {
++    auto const selector = maybe_kv_block_indexes.value();
++    if (selector.size(0) > 0 && selector.size(1) > 0) {
++      params.gmem_bounds.kv_block_indexes_span =
++          (selector.size(0) - 1) * params.kv_block_stride_n
++          + (selector.size(1) - 1) * params.kv_block_stride_h
++          + (selector.size(2) - 1) * params.kv_block_stride_b + 1;
++    }
++  }
+   params.gmem_bounds.split_kv_size = maybe_kv_tile_begin_indices.has_value()
+       ? static_cast<int>(maybe_kv_tile_begin_indices.value().size(0)) : 0;
+   params.gmem_bounds.qo_offsets_size = maybe_qo_offsets.has_value()
+diff --git a/python/fmha_sm100/csrc/gmem_bounds_check.h b/python/fmha_sm100/csrc/gmem_bounds_check.h
+index 9d0e672..a2759e9 100644
+--- a/python/fmha_sm100/csrc/gmem_bounds_check.h
++++ b/python/fmha_sm100/csrc/gmem_bounds_check.h
+@@ -1,4 +1,5 @@
+ // SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
++// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
+ // SPDX-License-Identifier: MIT
+ 
+ #pragma once
+@@ -9,6 +10,7 @@
+ #ifdef FMHA_GMEM_BOUNDS_CHECK
+ 
+ #include <cstdio>
++#include <cstdint>
+ 
+ struct GmemBounds {
+   int packed_work_range_size;
+@@ -19,17 +21,17 @@ struct GmemBounds {
+   int kv_page_indptr_size;
+   int kv_indices_size;
+   int max_score_numel;
+-  int kv_block_indexes_numel;
++  int64_t kv_block_indexes_span;
+   int split_kv_size;
+   int qo_offsets_size;
+ };
+ 
+ template <typename T>
+ __device__ __forceinline__ T gmem_load_checked(
+-    const T* base, int idx, int size, const char* name) {
++    const T* base, int64_t idx, int64_t size, const char* name) {
+   if (__builtin_expect(idx < 0 || idx >= size, 0)) {
+-    printf("GMEM-OOB-LOAD [%s] idx=%d size=%d blk=(%d,%d,%d) thr=%d\n",
+-           name, idx, size, blockIdx.x, blockIdx.y, blockIdx.z, threadIdx.x);
++    printf("GMEM-OOB-LOAD [%s] idx=%lld size=%lld blk=(%d,%d,%d) thr=%d\n",
++           name, static_cast<long long>(idx), static_cast<long long>(size), blockIdx.x, blockIdx.y, blockIdx.z, threadIdx.x);
+     return T(0);
+   }
+   return base[idx];
+@@ -82,6 +84,7 @@ __device__ __forceinline__ bool gmem_range_ok(
+ // Macros for paged KV reads
+ #define KV_INDPTR_LOAD(ptr, idx, sz)  gmem_load_checked((ptr), (idx), (sz), "kv_page_indptr")
+ #define KV_INDICES_LOAD(ptr, idx, sz) gmem_load_checked((ptr), (idx), (sz), "kv_indices")
++#define KV_BLOCK_INDEX_LOAD(ptr, idx, sz) gmem_load_checked((ptr), (idx), (sz), "kv_block_indexes")
+ 
+ #else  // FMHA_GMEM_BOUNDS_CHECK not defined
+ 
+@@ -93,5 +96,6 @@ __device__ __forceinline__ bool gmem_range_ok(
+ #define SEG_LEN_LOAD(vl, idx, sz)  (vl).segment_lens[(idx)]
+ #define KV_INDPTR_LOAD(ptr, idx, sz)  __ldg(&(ptr)[(idx)])
+ #define KV_INDICES_LOAD(ptr, idx, sz) __ldg(&(ptr)[(idx)])
++#define KV_BLOCK_INDEX_LOAD(ptr, idx, sz) __ldg(&(ptr)[(idx)])
+ 
+ #endif  // FMHA_GMEM_BOUNDS_CHECK
+diff --git a/python/fmha_sm100/csrc/include/fmha_cutlass_sm100.cuh b/python/fmha_sm100/csrc/include/fmha_cutlass_sm100.cuh
+index b11abe6..96757b6 100644
+--- a/python/fmha_sm100/csrc/include/fmha_cutlass_sm100.cuh
++++ b/python/fmha_sm100/csrc/include/fmha_cutlass_sm100.cuh
+@@ -1,3 +1,4 @@
++// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
+ /*
+  * Copyright (c) 2023 by FlashInfer team.
+  *
+@@ -57,7 +58,8 @@ template <typename DTypeIn, typename DTypeOut, typename IdType, class TileShapeQ
+           bool SingleSoftmaxWarpGroup = false,
+           int KVPageSize = -1,
+           cutlass::fmha::collective::SparseAttnMode kSparseAttnMode =
+-              cutlass::fmha::collective::SparseAttnMode::Off>
++              cutlass::fmha::collective::SparseAttnMode::Off,
++          bool UnitSelectorColumn = false>
+ struct FwdRunner {
+   using Element = DTypeIn;
+   using ElementAccumulatorQK = float;
+@@ -89,7 +91,8 @@ struct FwdRunner {
+ 
+   using Mainloop = cutlass::fmha::collective::Sm100FmhaFwdMainloopTmaWarpspecialized<
+       Element, ElementAccumulatorQK, ElementAccumulatorPV, TileShapeQK, TileShapePV, StrideQ,
+-      StrideK, StrideV, ActiveMask, ThreadShape, IsSplitKV, KVPageSize, kSparseAttnMode>;
++      StrideK, StrideV, ActiveMask, ThreadShape, IsSplitKV, KVPageSize, kSparseAttnMode,
++      UnitSelectorColumn>;
+   using Epilogue = cutlass::fmha::collective::Sm100FmhaFwdEpilogueTmaWarpspecialized<
+       ElementOut, ElementAccumulatorPV, typename Mainloop::TileShapePV, NumQStages, IsSplitKV, bNeedOutput, kPackFactor>;
+   using Operation =
+@@ -126,6 +129,9 @@ struct FwdRunner {
+                          int max_k_tiles = 0,
+                          int* kv_block_indexes = nullptr,
+                          int kv_block_num = 0,
++                         int64_t kv_block_stride_n = 0,
++                         int64_t kv_block_stride_h = 0,
++                         int64_t kv_block_stride_b = 1,
+                          int pack_factor = 1,
+                          int q_stride_n_original = 0,
+                          int q_stride_h_original = 0,
+@@ -223,11 +229,28 @@ struct FwdRunner {
+       if constexpr (IsSplitKV) {
+         arguments = {
+           {problem_shape,
+-           {{q, layout_Q, k, layout_K, v, layout_V, kv_indices, kv_page_indptr, kv_block_indexes, kv_block_num,
++           {{.ptr_Q = q,
++             .layout_Q = layout_Q,
++             .ptr_K = k,
++             .layout_K = layout_K,
++             .ptr_V = v,
++             .layout_V = layout_V,
++             .kv_indices = kv_indices,
++             .kv_page_indptr = kv_page_indptr,
++             .kv_block_indexes = kv_block_indexes,
++             .kv_block_num = kv_block_num,
++             .kv_block_stride_n = kv_block_stride_n,
++             .kv_block_stride_h = kv_block_stride_h,
++             .kv_block_stride_b = kv_block_stride_b,
+ #ifdef FMHA_GMEM_BOUNDS_CHECK
+-             pack_gqa.gmem_bounds.kv_page_indptr_size, pack_gqa.gmem_bounds.kv_indices_size, pack_gqa.gmem_bounds.kv_block_indexes_numel,
++             .kv_page_indptr_size = pack_gqa.gmem_bounds.kv_page_indptr_size,
++             .kv_indices_size = pack_gqa.gmem_bounds.kv_indices_size,
++             .kv_block_indexes_span = pack_gqa.gmem_bounds.kv_block_indexes_span,
+ #endif
+-             pack_factor, q_stride_n_original, q_stride_h_original, h_r_original},
++             .pack_factor = pack_factor,
++             .q_stride_n_original = q_stride_n_original,
++             .q_stride_h_original = q_stride_h_original,
++             .h_r_original = h_r_original},
+             sm_scale, q_scale, k_scale, v_scale, o_scale},
+            epi_args,
+            sched_args,
+@@ -244,11 +267,28 @@ struct FwdRunner {
+       } else {
+         arguments = {
+           problem_shape,
+-          {{q, layout_Q, k, layout_K, v, layout_V, kv_indices, kv_page_indptr, kv_block_indexes, kv_block_num,
++          {{.ptr_Q = q,
++             .layout_Q = layout_Q,
++             .ptr_K = k,
++             .layout_K = layout_K,
++             .ptr_V = v,
++             .layout_V = layout_V,
++             .kv_indices = kv_indices,
++             .kv_page_indptr = kv_page_indptr,
++             .kv_block_indexes = kv_block_indexes,
++             .kv_block_num = kv_block_num,
++             .kv_block_stride_n = kv_block_stride_n,
++             .kv_block_stride_h = kv_block_stride_h,
++             .kv_block_stride_b = kv_block_stride_b,
+ #ifdef FMHA_GMEM_BOUNDS_CHECK
+-            pack_gqa.gmem_bounds.kv_page_indptr_size, pack_gqa.gmem_bounds.kv_indices_size, pack_gqa.gmem_bounds.kv_block_indexes_numel,
++             .kv_page_indptr_size = pack_gqa.gmem_bounds.kv_page_indptr_size,
++             .kv_indices_size = pack_gqa.gmem_bounds.kv_indices_size,
++             .kv_block_indexes_span = pack_gqa.gmem_bounds.kv_block_indexes_span,
+ #endif
+-            pack_factor, q_stride_n_original, q_stride_h_original, h_r_original},
++             .pack_factor = pack_factor,
++             .q_stride_n_original = q_stride_n_original,
++             .q_stride_h_original = q_stride_h_original,
++             .h_r_original = h_r_original},
+            sm_scale, q_scale, k_scale, v_scale, o_scale},
+           epi_args,
+           sched_args,
+@@ -343,8 +383,28 @@ struct FwdRunner {
+       if constexpr (IsSplitKV) {
+         arguments = {
+           {problem_shape,
+-           {{q, layout_Q, k, layout_K, v, layout_V, nullptr, nullptr, nullptr, 0,
+-             pack_factor, q_stride_n_original, q_stride_h_original, h_r_original},
++           {{.ptr_Q = q,
++             .layout_Q = layout_Q,
++             .ptr_K = k,
++             .layout_K = layout_K,
++             .ptr_V = v,
++             .layout_V = layout_V,
++             .kv_indices = nullptr,
++             .kv_page_indptr = nullptr,
++             .kv_block_indexes = nullptr,
++             .kv_block_num = 0,
++             .kv_block_stride_n = 0,
++             .kv_block_stride_h = 0,
++             .kv_block_stride_b = 1,
++#ifdef FMHA_GMEM_BOUNDS_CHECK
++             .kv_page_indptr_size = 0,
++             .kv_indices_size = 0,
++             .kv_block_indexes_span = 0,
++#endif
++             .pack_factor = pack_factor,
++             .q_stride_n_original = q_stride_n_original,
++             .q_stride_h_original = q_stride_h_original,
++             .h_r_original = h_r_original},
+             sm_scale, q_scale, k_scale, v_scale, o_scale},
+            epi_args,
+            sched_args,
+@@ -361,8 +421,28 @@ struct FwdRunner {
+       } else {
+         arguments = {
+           problem_shape,
+-          {{q, layout_Q, k, layout_K, v, layout_V, nullptr, nullptr, nullptr, 0,
+-            pack_factor, q_stride_n_original, q_stride_h_original, h_r_original},
++          {{.ptr_Q = q,
++             .layout_Q = layout_Q,
++             .ptr_K = k,
++             .layout_K = layout_K,
++             .ptr_V = v,
++             .layout_V = layout_V,
++             .kv_indices = nullptr,
++             .kv_page_indptr = nullptr,
++             .kv_block_indexes = nullptr,
++             .kv_block_num = 0,
++             .kv_block_stride_n = 0,
++             .kv_block_stride_h = 0,
++             .kv_block_stride_b = 1,
++#ifdef FMHA_GMEM_BOUNDS_CHECK
++             .kv_page_indptr_size = 0,
++             .kv_indices_size = 0,
++             .kv_block_indexes_span = 0,
++#endif
++             .pack_factor = pack_factor,
++             .q_stride_n_original = q_stride_n_original,
++             .q_stride_h_original = q_stride_h_original,
++             .h_r_original = h_r_original},
+            sm_scale, q_scale, k_scale, v_scale, o_scale},
+           epi_args,
+           sched_args,
+@@ -412,7 +492,8 @@ template <typename DTypeIn, typename DTypeOut, typename IdType, class TileShapeQ
+           bool SingleSoftmaxWarpGroup = false,
+           int KVPageSize = -1,
+           cutlass::fmha::collective::SparseAttnMode kSparseAttnMode =
+-              cutlass::fmha::collective::SparseAttnMode::Off>
++              cutlass::fmha::collective::SparseAttnMode::Off,
++          bool UnitSelectorColumn = false>
+ cudaError_t run_fmha_fwd(void* workspace_buffer, DTypeIn* q, DTypeIn* k, DTypeIn* v,
+                          IdType* qo_segment_lens, IdType* kv_segment_lens,
+                          IdType* qo_segment_offsets, IdType* kv_segment_offsets,
+@@ -436,6 +517,9 @@ cudaError_t run_fmha_fwd(void* workspace_buffer, DTypeIn* q, DTypeIn* k, DTypeIn
+                          int max_k_tiles = 0,
+                          int* kv_block_indexes = nullptr,
+                          int kv_block_num = 0,
++                         int64_t kv_block_stride_n = 0,
++                         int64_t kv_block_stride_h = 0,
++                         int64_t kv_block_stride_b = 1,
+                          int pack_factor = 1,
+                          int q_stride_n_original = 0,
+                          int q_stride_h_original = 0,
+@@ -443,7 +527,8 @@ cudaError_t run_fmha_fwd(void* workspace_buffer, DTypeIn* q, DTypeIn* k, DTypeIn
+                          PackGQAUnpackParams pack_gqa = {},
+                          int num_ctas = 0) {
+   return FwdRunner<DTypeIn, DTypeOut, IdType, TileShapeQK, TileShapePV, ActiveMask,
+-                   ThreadShape, IsSplitKV, SingleSoftmaxWarpGroup, KVPageSize, kSparseAttnMode>::run(
++                   ThreadShape, IsSplitKV, SingleSoftmaxWarpGroup, KVPageSize, kSparseAttnMode,
++                   UnitSelectorColumn>::run(
+       workspace_buffer, q, k, v, qo_segment_lens, kv_segment_lens,
+       qo_segment_offsets, kv_segment_offsets, packed_work_range,
+       packed_work_info, o, mask_mode_code, sm_scale,
+@@ -455,6 +540,7 @@ cudaError_t run_fmha_fwd(void* workspace_buffer, DTypeIn* q, DTypeIn* k, DTypeIn
+       kv_indices, kv_page_indptr, total_page_num,
+       maybe_max_score, max_k_tiles,
+       kv_block_indexes, kv_block_num,
++      kv_block_stride_n, kv_block_stride_h, kv_block_stride_b,
+       pack_factor, q_stride_n_original, q_stride_h_original, h_r_original,
+       pack_gqa, num_ctas);
+ }
+diff --git a/python/fmha_sm100/csrc/include/sm100_fmha_fwd_kernel_tma_warpspecialized.hpp b/python/fmha_sm100/csrc/include/sm100_fmha_fwd_kernel_tma_warpspecialized.hpp
+index 0e41ce0..09f3c80 100644
+--- a/python/fmha_sm100/csrc/include/sm100_fmha_fwd_kernel_tma_warpspecialized.hpp
++++ b/python/fmha_sm100/csrc/include/sm100_fmha_fwd_kernel_tma_warpspecialized.hpp
+@@ -214,9 +214,9 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
+   }
+ 
+   CUTLASS_DEVICE void operator()(const Params& params, char* smem) {
+-// #if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+-//     asm volatile("griddepcontrol.wait;");
+-// #endif
++#if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
++    asm volatile("griddepcontrol.wait;" ::: "memory");  // t0fix (Indexer): PDL-launched; wait before any input read
++#endif
+ 
+     GPU_TRACE_INIT;
+ 
+diff --git a/python/fmha_sm100/csrc/include/sm100_fmha_fwd_mainloop_tma_warpspecialized.hpp b/python/fmha_sm100/csrc/include/sm100_fmha_fwd_mainloop_tma_warpspecialized.hpp
+index 5a5d0f3..5c923c1 100644
+--- a/python/fmha_sm100/csrc/include/sm100_fmha_fwd_mainloop_tma_warpspecialized.hpp
++++ b/python/fmha_sm100/csrc/include/sm100_fmha_fwd_mainloop_tma_warpspecialized.hpp
+@@ -1,5 +1,5 @@
+ /***************************************************************************************************
+- * Copyright (c) 2024 - 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++ * Copyright (c) 2024 - 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+  * SPDX-License-Identifier: BSD-3-Clause
+  *
+  * Redistribution and use in source and binary forms, with or without
+@@ -158,7 +158,8 @@ template <class Element_, class ElementQK_, class ElementPV_, class TileShapeQK_
+           class ThreadShape = Shape<_2, _1, _1>,
+           bool IsSplitKV_ = false,
+           int KVPageSize_ = -1,
+-          SparseAttnMode kSparseAttnMode = SparseAttnMode::Off>
++          SparseAttnMode kSparseAttnMode = SparseAttnMode::Off,
++          bool UnitSelectorColumn = false>
+ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
+   static constexpr bool IsSplitKV = IsSplitKV_;
+   static constexpr int KVPageSize = KVPageSize_;
+@@ -173,6 +174,16 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
+   // for safety (no sync elision in v1 — those are TODO for v2).
+   static constexpr bool kFuseMaxScoreIntoSoftmax =
+       (kSparseAttnMode == SparseAttnMode::OnlyScore);
++  // OnlyScore K-split: correction has no per-tile work (softmax writes the max scores itself), so the per-tile
++  // softmax -> correction -> MMA handshake (pipeline_c commit/acquire, correction's s0_c/s1_c wait/release and
++  // pipeline_corr arrive/wait) only serializes the two softmax warpgroups. It is skipped; pipeline_s (S0/S1 TMEM
++  // reuse between MMA and softmax) and the final pipeline_c handshake into the split-KV merge/epilogue are kept.
++  // Defining FMHA_ONLYSCORE_PER_TILE_CORRECTION (jit.py: TLLM_FMHA_PROXY_CORRECTION_CHAIN=1) keeps the handshake.
++#ifdef FMHA_ONLYSCORE_PER_TILE_CORRECTION
++  static constexpr bool kSkipPerTileCorrection = false;
++#else
++  static constexpr bool kSkipPerTileCorrection = kFuseMaxScoreIntoSoftmax && (get<1>(ThreadShape{}) > 1);
++#endif
+ 
+   struct SplitKVParams {
+     float scale_output_splitkv = 1.0f;
+@@ -345,7 +356,18 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
+   // from mma to softmax0/1 warp, protects S in tmem
+   // (not sure yet about the reverse direction)
+   // there is one pipe per softmax warp, and the mma warp alternates between them
+-  using PipelineS = cutlass::PipelineUmmaAsync<1>;
++  // OnlyScore K-split keeps no O accumulator in TMEM, so each Q stage double-buffers S: buffer 1 of S0 / S1 sits in
++  // the O0 / O1 columns (+256), and the MMA fills tile i+1 while the softmax warps still read tile i. Nothing in
++  // OnlyScore reads or writes O (the O-touching correction paths static_assert kNeedOutput).
++  // Defining FMHA_ONLYSCORE_SINGLE_S (jit.py: TLLM_FMHA_PROXY_S_DOUBLE_BUFFER=0) keeps one S buffer per Q stage.
++#ifdef FMHA_ONLYSCORE_SINGLE_S
++  static constexpr bool kSDoubleBuf = false;
++#else
++  static constexpr bool kSDoubleBuf = kSkipPerTileCorrection;
++#endif
++  static_assert(!kSDoubleBuf || !kNeedOutput, "S double-buffering reuses the O TMEM columns");
++  static constexpr uint32_t kSBuf1Offset = uint32_t(TmemAllocation::O0) - uint32_t(TmemAllocation::S0);
++  using PipelineS = cutlass::PipelineUmmaAsync<kSDoubleBuf ? 2 : 1>;
+ 
+   // from softmax0/1/ to correction wg
+   using PipelineC = cutlass::PipelineAsync<1>;
+@@ -376,7 +398,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
+   using Load = Sm100FmhaLoadTmaWarpspecialized<Element, CollectiveMmaQK, CollectiveMmaPV,
+                                                SmemLayoutQ, SmemLayoutK, SmemLayoutV, TensorStorage,
+                                                PipelineQ, PipelineKV, Mask, TileShape, KVPageSize,
+-                                               kSparseAttnMode>;
++                                               kSparseAttnMode, UnitSelectorColumn>;
+   using LayoutQ = typename Load::LayoutQ;
+   using LayoutK = typename Load::LayoutK;
+   using LayoutV = typename Load::LayoutV;
+@@ -494,6 +516,12 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
+     tStS0.data() = tStS.data().get() + uint32_t(TmemAllocation::S0);
+     Tensor tStS1 = tStS;
+     tStS1.data() = tStS.data().get() + uint32_t(TmemAllocation::S1);
++    Tensor tStS0b = tStS0;
++    tStS0b.data() = tStS0.data().get() + kSBuf1Offset;
++    Tensor tStS1b = tStS1;
++    tStS1b.data() = tStS1.data().get() + kSBuf1Offset;
++    auto s0_buf = [&](auto const& state) { return (kSDoubleBuf && state.index() == 1) ? tStS0b : tStS0; };
++    auto s1_buf = [&](auto const& state) { return (kSDoubleBuf && state.index() == 1) ? tStS1b : tStS1; };
+ 
+     Tensor tOtO0 = tOtO;
+     tOtO0.data() = tOtO.data().get() + uint32_t(TmemAllocation::O0);
+@@ -571,7 +599,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
+     pipeline_s0.producer_acquire(pipeline_s0_producer_state);
+     {
+       // GPU_TRACE_SCOPE(GEMM_QK0);
+-      gemm_zero_acc(mma_qk, tSrQ0, tSrK(_, _, _, k_index), tStS0);
++      { auto tS_cur = s0_buf(pipeline_s0_producer_state); gemm_zero_acc(mma_qk, tSrQ0, tSrK(_, _, _, k_index), tS_cur); }
+     }
+     pipeline_s0.producer_commit(pipeline_s0_producer_state);
+     ++pipeline_s0_producer_state;
+@@ -596,7 +624,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
+     // QK_s1: Q-split: Q1 * K0 -> S1; K-split: Q0 * K1 -> S1
+     pipeline_s1.producer_acquire(pipeline_s1_producer_state);
+     {//GPU_TRACE_SCOPE(GEMM_QK1);
+-    gemm_zero_acc(mma_qk, tSrQ1, tSrK(_, _, _, k_index), tStS1);
++    { auto tS_cur = s1_buf(pipeline_s1_producer_state); gemm_zero_acc(mma_qk, tSrQ1, tSrK(_, _, _, k_index), tS_cur); }
+     }
+     pipeline_s1.producer_commit(pipeline_s1_producer_state);
+     ++pipeline_s1_producer_state;
+@@ -623,7 +651,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
+       }
+ 
+       // PV0: P0 * V_even -> O0
+-      pipeline_corr.wait();
++      if constexpr (!kSkipPerTileCorrection) { pipeline_corr.wait(); }
+       pipeline_s0.producer_acquire(pipeline_s0_producer_state);
+       if constexpr(kNeedOutput) {
+         // GPU_TRACE_SCOPE(GEMM_PV0);
+@@ -648,7 +676,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
+       // QK_s0: Q0 * K_even -> S0
+       {
+         // GPU_TRACE_SCOPE(GEMM_QK0);
+-        gemm_zero_acc(mma_qk, tSrQ0, tSrK(_, _, _, k_index), tStS0);
++        { auto tS_cur = s0_buf(pipeline_s0_producer_state); gemm_zero_acc(mma_qk, tSrQ0, tSrK(_, _, _, k_index), tS_cur); }
+         pipeline_s0.producer_commit(pipeline_s0_producer_state);
+         ++pipeline_s0_producer_state;
+       }
+@@ -666,7 +694,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
+         }
+       }
+ 
+-      pipeline_corr.wait();
++      if constexpr (!kSkipPerTileCorrection) { pipeline_corr.wait(); }
+       pipeline_s1.producer_acquire(pipeline_s1_producer_state);
+       if constexpr(kNeedOutput) {
+         // GPU_TRACE_SCOPE(GEMM_PV1);
+@@ -693,7 +721,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
+       // Must happen BEFORE releasing K!
+       {
+         // GPU_TRACE_SCOPE(GEMM_QK1);
+-        gemm_zero_acc(mma_qk, tSrQ1, tSrK(_, _, _, k_index), tStS1);
++        { auto tS_cur = s1_buf(pipeline_s1_producer_state); gemm_zero_acc(mma_qk, tSrQ1, tSrK(_, _, _, k_index), tS_cur); }
+         pipeline_s1.producer_commit(pipeline_s1_producer_state);
+         ++pipeline_s1_producer_state;
+       }
+@@ -725,7 +753,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
+     }
+ 
+     // final PV0: P0 * V_last_even -> O0
+-    pipeline_corr.wait();
++    if constexpr (!kSkipPerTileCorrection) { pipeline_corr.wait(); }
+     pipeline_s0.producer_acquire(pipeline_s0_producer_state);
+     if constexpr(kNeedOutput) {
+       GPU_TRACE_SCOPE(GEMM_PV0);
+@@ -746,7 +774,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
+     }
+ 
+     // final PV1: P1 * V_last -> O1
+-    pipeline_corr.wait();
++    if constexpr (!kSkipPerTileCorrection) { pipeline_corr.wait(); }
+     pipeline_s1.producer_acquire(pipeline_s1_producer_state);
+     if constexpr(kNeedOutput) {
+       GPU_TRACE_SCOPE(GEMM_PV1);
+@@ -899,7 +927,13 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
+ 
+       {GPU_TRACE_SCOPE(SOFTMAX_Mask);
+       if constexpr (!skip_computation) {
+-        copy(tiled_tmem_load, l_tTMEM_LOADtS, tTMEM_LOADrS);
++        auto l_ld = l_tTMEM_LOADtS;
++        if constexpr (kSDoubleBuf) {
++          if (pipeline_s_consumer_state.index() == 1) {
++            l_ld.data() = l_ld.data().get() + kSBuf1Offset;
++          }
++        }
++        copy(tiled_tmem_load, l_ld, tTMEM_LOADrS);
+         if constexpr (need_apply_mask) {
+           Mask{}.apply_mask(tTMEM_LOADrS, tTMEM_LOADcS, problem_shape);
+         }
+@@ -977,8 +1011,10 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
+         copy(tiled_tmem_storev, tTMEM_STOREVrS, l_tTMEM_STOREVtS);
+       }
+ 
+-      pipeline_c.producer_commit(pipeline_c_producer_state);
+-      ++pipeline_c_producer_state;
++      if constexpr (!kSkipPerTileCorrection) {
++        pipeline_c.producer_commit(pipeline_c_producer_state);
++        ++pipeline_c_producer_state;
++      }
+ 
+       Tensor tTMEM_STORErS_x4 = make_tensor<uint32_t>(shape(tTMEM_STOREcS));
+ 
+@@ -1043,7 +1079,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
+ 
+       CUTE_STATIC_ASSERT_V(size<2>(tTMEM_STORErS_x4) <= _2{});
+       CUTE_STATIC_ASSERT_V(size<1>(tTMEM_STORErS_x4) == _1{});
+-      if constexpr (skip_computation) {
++      if constexpr (skip_computation && !kSDoubleBuf) {
+         CUTLASS_PRAGMA_UNROLL
+         for (int k = 0; k < size<2>(tTMEM_STORErS_x4); ++k) {
+           copy(tiled_tmem_store, tTMEM_STORErS_x4(_, _, k), l_tTMEM_STOREtS_x4(_, _, k));
+@@ -1058,7 +1094,9 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
+       pipeline_s.consumer_release(pipeline_s_consumer_state);
+       ++pipeline_s_consumer_state;
+ 
+-      pipeline_c.producer_acquire(pipeline_c_producer_state);
++      if constexpr (!kSkipPerTileCorrection) {
++        pipeline_c.producer_acquire(pipeline_c_producer_state);
++      }
+ 
+       {GPU_TRACE_SCOPE(SOFTMAX_Sum);
+       if constexpr (!skip_computation && kNeedOutput) {
+@@ -1104,7 +1142,9 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
+           tTMEM_STOREVrS(kIdxFinalRowMax) = 0;
+           tTMEM_STOREVrS(kIdxFinalRowSum) = 0;
+         }
+-        copy(tiled_tmem_storev, tTMEM_STOREVrS, l_tTMEM_STOREVtS);
++        if constexpr (!kSDoubleBuf) {
++          copy(tiled_tmem_storev, tTMEM_STOREVrS, l_tTMEM_STOREVtS);
++        }
+       }}
+     }  // end step()
+   };
+@@ -1131,14 +1171,13 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
+     int skip_count, real_masked_count, unmasked_count;
+     int effective_end;
+ 
+-    int kbi_off_s = 0;
++    int64_t kbi_off_s = 0;
+     if constexpr (kNeedSparse) {
+       int h_r_s = get<3, 0, 0>(problem_shape);
+-      int num_kv_heads_s = get<3, 0, 1>(problem_shape);
+       int kv_head_idx_s = get<2, 0>(blk_coord) / h_r_s;
+       int batch_idx_s = get<2, 1>(blk_coord);
+-      kbi_off_s = batch_idx_s * num_kv_heads_s * params.load.kv_block_num
+-                + kv_head_idx_s * params.load.kv_block_num;
++      kbi_off_s = batch_idx_s * params.load.kv_block_stride_n
++                + kv_head_idx_s * params.load.kv_block_stride_h;
+     }
+ 
+     if constexpr (kNeedSparse) {
+@@ -1154,7 +1193,12 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
+ 
+       // Count padding blocks (backward scan for -1)
+       int valid_blks = params.load.kv_block_num;
+-      while (valid_blks > 0 && __ldg(&params.load.kv_block_indexes[kbi_off_s + valid_blks - 1]) < 0)
++      while (valid_blks > 0 && (UnitSelectorColumn
++          ? KV_BLOCK_INDEX_LOAD(params.load.kv_block_indexes,
++                kbi_off_s + valid_blks - 1, params.load.kv_block_indexes_span)
++          : KV_BLOCK_INDEX_LOAD(params.load.kv_block_indexes,
++                kbi_off_s + (valid_blks - 1) * params.load.kv_block_stride_b,
++                params.load.kv_block_indexes_span)) < 0)
+         valid_blks--;
+ 
+       int valid_tiles = (valid_blks * KVPageSize + full_tile_kv - 1) / full_tile_kv;
+@@ -1223,7 +1267,12 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
+           cS = domain_offset(make_coord(q_s, INT_MAX / 2), cS_base);
+           return false;
+         }
+-        int pos = __ldg(&params.load.kv_block_indexes[kbi_off_s + page_idx]);
++        int pos = UnitSelectorColumn
++            ? KV_BLOCK_INDEX_LOAD(params.load.kv_block_indexes,
++                  kbi_off_s + page_idx, params.load.kv_block_indexes_span)
++            : KV_BLOCK_INDEX_LOAD(params.load.kv_block_indexes,
++                  kbi_off_s + page_idx * params.load.kv_block_stride_b,
++                  params.load.kv_block_indexes_span);
+         if (pos < 0) {
+           cS = domain_offset(make_coord(q_s, INT_MAX / 2), cS_base);
+           return false;
+@@ -1441,6 +1490,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
+ 
+   template <class Stage, class TensorO>
+   CUTLASS_DEVICE auto correction_epilogue(float scale, Stage stage, TensorO const& sO_01) {
++    static_assert(kNeedOutput, "O TMEM columns are S buffer 1 in OnlyScore");
+     using ElementOut = typename TensorO::value_type;
+ 
+     int thread_idx = threadIdx.x % (4 * cutlass::NumThreadsPerWarp);
+@@ -1530,6 +1580,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
+   }
+ 
+   CUTLASS_DEVICE auto correction_rescale(float scale, uint32_t tmem_O) {
++    static_assert(kNeedOutput, "O TMEM columns are S buffer 1 in OnlyScore");
+     int thread_idx = threadIdx.x % (4 * cutlass::NumThreadsPerWarp);
+ 
+     // As opposed to the softmax, we do not have enough registers here
+@@ -1615,6 +1666,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
+   CUTLASS_DEVICE auto correction_merge_ksplit(
+       Params const& params, TensorV const& tTMEM_LOADVrS0, TensorV const& tTMEM_LOADVrS1,
+       float* smem_scratch = nullptr) {
++    static_assert(kNeedOutput, "O TMEM columns are S buffer 1 in OnlyScore");
+     ElementPV row_max_0 = tTMEM_LOADVrS0(kIdxFinalRowMax);
+     ElementPV row_sum_0 = tTMEM_LOADVrS0(kIdxFinalRowSum);
+     ElementPV row_max_1 = tTMEM_LOADVrS1(kIdxFinalRowMax);
+@@ -1887,6 +1939,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
+       max_score(kIdxNewRowMax) = max_score(kIdxNewRowMax) == -INFINITY ? 0 : max_score(kIdxNewRowMax);
+     };
+ 
++    if constexpr (!kSkipPerTileCorrection) {
+     pipeline_s0_c.consumer_wait(pipeline_s0_c_consumer_state);
+     if constexpr (kNeedMaxScore) {
+       // P2 (v3): in OnlyScore fuse mode, the V-channel STOREV on the softmax
+@@ -1992,6 +2045,8 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
+     pipeline_s1_c.consumer_release(pipeline_s1_c_consumer_state);
+     ++pipeline_s1_c_consumer_state;
+ 
++    }
++
+     // do the final correction to O1
+     // better to somehow special-case it in the loop above
+     // doesn't matter for non-persistent code, but if it were
+diff --git a/python/fmha_sm100/csrc/include/sm100_fmha_load_tma_warpspecialized.hpp b/python/fmha_sm100/csrc/include/sm100_fmha_load_tma_warpspecialized.hpp
+index 0fdcbfa..d3d7c11 100644
+--- a/python/fmha_sm100/csrc/include/sm100_fmha_load_tma_warpspecialized.hpp
++++ b/python/fmha_sm100/csrc/include/sm100_fmha_load_tma_warpspecialized.hpp
+@@ -1,5 +1,5 @@
+ /***************************************************************************************************
+- * Copyright (c) 2024 - 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++ * Copyright (c) 2024 - 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+  * SPDX-License-Identifier: BSD-3-Clause
+  *
+  * Redistribution and use in source and binary forms, with or without
+@@ -64,7 +64,8 @@ struct MaskPackFactor<PackedCausalMask<P>> { static constexpr int value = P; };
+ template <class Element, class CollectiveMmaQK, class CollectiveMmaPV, class SmemLayoutQ,
+           class SmemLayoutK, class SmemLayoutV, class TensorStorage, class PipelineQ,
+           class PipelineKV, class Mask, class TileShape, int KVPageSize = -1,
+-          SparseAttnMode kSparseAttnMode = SparseAttnMode::Off>
++          SparseAttnMode kSparseAttnMode = SparseAttnMode::Off,
++          bool UnitSelectorColumn = false>
+ struct Sm100FmhaLoadTmaWarpspecialized {
+   // P0: OnlyScore mode never reads V — skip every V slot in the KV pipeline.
+   // mma() gates the matching wait_V/release_V under `kNeedOutput` so producer
+@@ -112,10 +113,13 @@ struct Sm100FmhaLoadTmaWarpspecialized {
+     int* kv_page_indptr = nullptr;
+     int* kv_block_indexes = nullptr;
+     int kv_block_num = 0;
++    int64_t kv_block_stride_n = 0;
++    int64_t kv_block_stride_h = 0;
++    int64_t kv_block_stride_b = 1;
+ #ifdef FMHA_GMEM_BOUNDS_CHECK
+     int kv_page_indptr_size = 0;
+     int kv_indices_size = 0;
+-    int kv_block_indexes_numel = 0;
++    int64_t kv_block_indexes_span = 0;
+ #endif
+     int pack_factor = 1;
+     int q_stride_n_original = 0;
+@@ -148,10 +152,13 @@ struct Sm100FmhaLoadTmaWarpspecialized {
+     int* kv_page_indptr = nullptr;
+     int* kv_block_indexes = nullptr;
+     int kv_block_num = 0;
++    int64_t kv_block_stride_n = 0;
++    int64_t kv_block_stride_h = 0;
++    int64_t kv_block_stride_b = 1;
+ #ifdef FMHA_GMEM_BOUNDS_CHECK
+     int kv_page_indptr_size = 0;
+     int kv_indices_size = 0;
+-    int kv_block_indexes_numel = 0;
++    int64_t kv_block_indexes_span = 0;
+ #endif
+     const Element* ptr_Q_orig = nullptr;
+     int q_stride_n_orig = 0;
+@@ -218,8 +225,9 @@ struct Sm100FmhaLoadTmaWarpspecialized {
+ 
+     Params p{tma_load_Q, layout_Q, tma_load_K, layout_K, tma_load_V, layout_V,
+                   args.kv_indices, args.kv_page_indptr, args.kv_block_indexes, args.kv_block_num,
++                  args.kv_block_stride_n, args.kv_block_stride_h, args.kv_block_stride_b,
+ #ifdef FMHA_GMEM_BOUNDS_CHECK
+-                  args.kv_page_indptr_size, args.kv_indices_size, args.kv_block_indexes_numel,
++                  args.kv_page_indptr_size, args.kv_indices_size, args.kv_block_indexes_span,
+ #endif
+                   args.ptr_Q, args.q_stride_n_original, args.q_stride_h_original, args.h_r_original,
+                   tma_desc_q_pack};
+@@ -525,11 +533,10 @@ struct Sm100FmhaLoadTmaWarpspecialized {
+       constexpr int effective_tile_kv = get<1>(TileShapeQK{});
+       constexpr int tiles_per_page = KVPageSize / effective_tile_kv;
+ 
+-      int kv_block_offset = 0;
++      int64_t kv_block_offset = 0;
+       if constexpr (kSparseAttnMode == SparseAttnMode::Sparse) {
+-        int num_kv_heads_val = get<3, 0, 1>(params_problem_shape);
+-        kv_block_offset = batch_idx * num_kv_heads_val * params.kv_block_num
+-                        + kv_head_idx * params.kv_block_num;
++        kv_block_offset = batch_idx * params.kv_block_stride_n
++                        + kv_head_idx * params.kv_block_stride_h;
+       }
+ 
+       // Keep full 4D tensor (page_size, D, H_kv, P) — select head at copy time
+@@ -549,7 +556,12 @@ struct Sm100FmhaLoadTmaWarpspecialized {
+         int page_for_lookup;
+         if constexpr (kSparseAttnMode == SparseAttnMode::Sparse) {
+           int sparse_idx = (logical_page < params.kv_block_num)
+-              ? __ldg(&params.kv_block_indexes[kv_block_offset + logical_page])
++              ? (UnitSelectorColumn
++                    ? KV_BLOCK_INDEX_LOAD(params.kv_block_indexes,
++                          kv_block_offset + logical_page, params.kv_block_indexes_span)
++                    : KV_BLOCK_INDEX_LOAD(params.kv_block_indexes,
++                          kv_block_offset + logical_page * params.kv_block_stride_b,
++                          params.kv_block_indexes_span))
+               : -1;
+           page_for_lookup = (sparse_idx >= 0) ? sparse_idx : 0;
+         } else {
+@@ -573,7 +585,12 @@ struct Sm100FmhaLoadTmaWarpspecialized {
+         int page_for_lookup;
+         if constexpr (kSparseAttnMode == SparseAttnMode::Sparse) {
+           int sparse_idx = (logical_page < params.kv_block_num)
+-              ? __ldg(&params.kv_block_indexes[kv_block_offset + logical_page])
++              ? (UnitSelectorColumn
++                    ? KV_BLOCK_INDEX_LOAD(params.kv_block_indexes,
++                          kv_block_offset + logical_page, params.kv_block_indexes_span)
++                    : KV_BLOCK_INDEX_LOAD(params.kv_block_indexes,
++                          kv_block_offset + logical_page * params.kv_block_stride_b,
++                          params.kv_block_indexes_span))
+               : -1;
+           page_for_lookup = (sparse_idx >= 0) ? sparse_idx : 0;
+         } else {
 diff --git a/python/fmha_sm100/cute/interface.py b/python/fmha_sm100/cute/interface.py
-index d72b17a..0cf430c 100644
+index d72b17a..55be196 100644
 --- a/python/fmha_sm100/cute/interface.py
 +++ b/python/fmha_sm100/cute/interface.py
 @@ -136,6 +136,35 @@ def _prepare_paged_kv_for_tma(k, v, blk_kv: int):
@@ -377,7 +1502,9 @@ index d72b17a..0cf430c 100644
 +    # so what has to be checked is the shape and the *in-region* byte order.
 +    for name, scale in (("k_scale", k_scale), ("v_scale", v_scale)):
 +        if scale.stride(-1) != 1:
-+            raise ValueError(
+             raise ValueError(
+-                f"{name} is too small for 128x4 layout: got {tuple(scale.shape)}, "
+-                f"need at least {(padded_scale_rows, padded_scale_cols)}"
 +                f"{name} must be contiguous in its last dimension, got "
 +                f"stride(-1)={scale.stride(-1)}"
 +            )
@@ -453,9 +1580,7 @@ index d72b17a..0cf430c 100644
 +    # properties the TMA descriptor actually needs.
 +    for name, data in (("k", k), ("v", v)):
 +        if int(data.stride(-1)) != 1:
-             raise ValueError(
--                f"{name} is too small for 128x4 layout: got {tuple(scale.shape)}, "
--                f"need at least {(padded_scale_rows, padded_scale_cols)}"
++            raise ValueError(
 +                f"KVFP4 {name} must be contiguous in its last dimension, got "
 +                f"stride(-1)={int(data.stride(-1))}"
 +            )
@@ -532,7 +1657,25 @@ index d72b17a..0cf430c 100644
      k_global_scale: Optional[torch.Tensor],
      v_global_scale: Optional[torch.Tensor],
      k2q_row_ptr: torch.Tensor,
-@@ -805,16 +949,25 @@ def sparse_atten_nvfp4_kv_func(
+@@ -791,9 +935,17 @@ def sparse_atten_nvfp4_kv_func(
+     page_table: Optional[torch.Tensor] = None,
+     seqused_k: Optional[torch.Tensor] = None,
+     schedule: Optional[SparseAttentionSchedule] = None,
++    out: Optional[torch.Tensor] = None,
++    o_fp8: Optional[torch.Tensor] = None,
++    sf_out: Optional[torch.Tensor] = None,
++    write_bf16: bool = True,
+ ):
+     """Run SM100 CSR sparse attention with packed NVFP4 K/V.
+ 
++    ``o_fp8`` / ``sf_out`` (with ``out``): the combine also writes the final O as MXFP8 for an MXFP8 o_proj
++    (E4M3 [total_q, head_q * dim] + swizzled 128x4 K32 UE8M0 scales), bitwise mxfp8_quantize(O, True);
++    ``write_bf16=False`` skips the bf16 store. See combine().
++
+     Parameters
+     ----------
+     q : torch.Tensor
+@@ -805,16 +957,25 @@ def sparse_atten_nvfp4_kv_func(
          because each byte packs two FP4 values.
      v : torch.Tensor
          Packed NVFP4 V data with the same shape as ``k``.
@@ -565,7 +1708,7 @@ index d72b17a..0cf430c 100644
      k2q_row_ptr : torch.Tensor
          CSR row pointers with shape ``[Hkv, total_rows + 1]`` and dtype int32.
      k2q_q_indices : torch.Tensor
-@@ -847,7 +1000,14 @@ def sparse_atten_nvfp4_kv_func(
+@@ -847,7 +1008,14 @@ def sparse_atten_nvfp4_kv_func(
          Paged-KV physical page table with shape
          ``[batch_size, max_num_pages_per_seq]`` and dtype int32.
      seqused_k : torch.Tensor, optional
@@ -581,7 +1724,7 @@ index d72b17a..0cf430c 100644
      schedule : SparseAttentionSchedule, optional
          Prebuilt sparse forward schedule.
  
-@@ -878,8 +1038,8 @@ def sparse_atten_nvfp4_kv_func(
+@@ -878,8 +1046,8 @@ def sparse_atten_nvfp4_kv_func(
          q,
          k,
          v,
@@ -592,7 +1735,33 @@ index d72b17a..0cf430c 100644
          k_global_scale,
          v_global_scale,
          k2q_row_ptr,
-@@ -939,12 +1099,19 @@ def sparse_atten_nvfp4_kv_func(
+@@ -917,7 +1085,24 @@ def sparse_atten_nvfp4_kv_func(
+         if kernel_return_temperature_lse
+         else None
+     )
+-    O_out = torch.empty(total_q, head_q, dim, dtype=torch.bfloat16, device=q.device)
++    if out is None:
++        O_out = torch.empty(total_q, head_q, dim, dtype=torch.bfloat16, device=q.device)
++    else:
++        # `combine` writes its output with a plain contiguous layout, so a
++        # caller that already owns a matching buffer can have it written
++        # directly instead of copying the result afterwards.
++        if tuple(out.shape) != (total_q, head_q, dim):
++            raise ValueError(
++                f"out must have shape {(total_q, head_q, dim)}, "
++                f"got {tuple(out.shape)}"
++            )
++        if out.dtype != torch.bfloat16:
++            raise TypeError(f"out must be torch.bfloat16, got {out.dtype}")
++        if out.device != q.device:
++            raise ValueError("out must be on the same device as q")
++        if not out.is_contiguous():
++            raise ValueError("out must be contiguous")
++        O_out = out
+     LSE_out = torch.empty(total_q, head_q, dtype=torch.float32, device=q.device)
+     LSE_temperature_out = (
+         torch.empty_like(LSE_out) if kernel_return_temperature_lse else None
+@@ -939,12 +1124,19 @@ def sparse_atten_nvfp4_kv_func(
          k2q_qsplit_indices = schedule.qsplit_indices
          split_counts = schedule.split_counts
  
@@ -616,16 +1785,20 @@ index d72b17a..0cf430c 100644
          None if k_global_scale is None else k_global_scale.contiguous(),
          None if v_global_scale is None else v_global_scale.contiguous(),
          k2q_row_ptr.contiguous(),
-@@ -978,7 +1145,7 @@ def sparse_atten_nvfp4_kv_func(
+@@ -978,8 +1170,11 @@ def sparse_atten_nvfp4_kv_func(
          lse_temperature_out=LSE_temperature_out,
          cu_seqlens=cu_seqlens_q,
          split_counts=split_counts,
 -        output_scale=v_global_scale,
 +        output_scale=None if q.dtype == torch.float8_e4m3fn else v_global_scale,
          use_pdl=True,
++        o_fp8=o_fp8,
++        sf_out=sf_out,
++        write_bf16=write_bf16,
      )
      if temperature_lse_fast_path:
-@@ -1296,13 +1463,34 @@ class SparseDecodePagedAttentionWrapper:
+         LSE_temperature_out = LSE_out
+@@ -1296,13 +1491,34 @@ class SparseDecodePagedAttentionWrapper:
          self.work_count = schedule.work_count
          self.padded_work_count = schedule.padded_work_count
          if schedule.split_kv:
@@ -661,7 +1834,7 @@ index d72b17a..0cf430c 100644
                  dtype=torch.float32,
                  device=page_table.device,
              )
-@@ -1449,6 +1637,7 @@ def _sparse_atten_csr_varlen_forward(
+@@ -1449,6 +1665,7 @@ def _sparse_atten_csr_varlen_forward(
      max_seqlen_k: int,
      qk_dtype: torch.dtype,
      pv_dtype: torch.dtype,
@@ -669,7 +1842,7 @@ index d72b17a..0cf430c 100644
  ):
      total_q, head_q, dim = q.shape
      if head_q % head_kv != 0:
-@@ -1478,7 +1667,24 @@ def _sparse_atten_csr_varlen_forward(
+@@ -1478,7 +1695,24 @@ def _sparse_atten_csr_varlen_forward(
          if kernel_return_temperature_lse
          else None
      )
@@ -695,7 +1868,7 @@ index d72b17a..0cf430c 100644
      LSE_out = torch.empty(total_q, head_q, dtype=torch.float32, device=q.device)
      LSE_temperature_out = (
          torch.empty_like(LSE_out) if kernel_return_temperature_lse else None
-@@ -1807,12 +2013,47 @@ def _call_sparse_forward_sm100_csr_varlen(
+@@ -1807,12 +2041,47 @@ def _call_sparse_forward_sm100_csr_varlen(
      return schedule
  
  
@@ -745,7 +1918,7 @@ index d72b17a..0cf430c 100644
      k_global_scale,
      v_global_scale,
      k2q_row_ptr,
-@@ -1859,9 +2100,9 @@ def _call_sparse_forward_sm100_csr_varlen_nvfp4_kv(
+@@ -1859,9 +2128,9 @@ def _call_sparse_forward_sm100_csr_varlen_nvfp4_kv(
      qhead_per_kv = head_q // head_kv
      fp8_pair_dequant = os.environ.get("MINIMAX_KVFP4_FP8_PAIR_DEQUANT", "1") != "0"
      k_global_scale_kernel = k_global_scale
@@ -758,7 +1931,7 @@ index d72b17a..0cf430c 100644
      has_k_global_scale = k_global_scale_kernel is not None
      has_v_global_scale = v_global_scale_kernel is not None
      paged_kv = page_table is not None
-@@ -1873,6 +2114,18 @@ def _call_sparse_forward_sm100_csr_varlen_nvfp4_kv(
+@@ -1873,6 +2142,18 @@ def _call_sparse_forward_sm100_csr_varlen_nvfp4_kv(
          _prepare_paged_kv_for_tma(k, v, n_block_size)
      k_kernel = k
      v_kernel = v
@@ -777,7 +1950,7 @@ index d72b17a..0cf430c 100644
      O_partial_flat = O_partial.reshape(-1, head_dim).contiguous()
      Q_flat = q.reshape(-1, head_dim).contiguous()
      Q_gather4_desc = (
-@@ -1948,8 +2201,8 @@ def _call_sparse_forward_sm100_csr_varlen_nvfp4_kv(
+@@ -1948,8 +2229,8 @@ def _call_sparse_forward_sm100_csr_varlen_nvfp4_kv(
                  kernel,
                  to_cute_tensor_kvouter(k_kernel),
                  to_cute_tensor_kvouter(v_kernel),
@@ -788,7 +1961,7 @@ index d72b17a..0cf430c 100644
                  None if k_global_scale_kernel is None else to_cute_tensor_kvouter(k_global_scale_kernel),
                  None if v_global_scale_kernel is None else to_cute_tensor_kvouter(v_global_scale_kernel),
                  to_cute_tensor_kvouter(k2q_q_indices),
-@@ -1974,6 +2227,13 @@ def _call_sparse_forward_sm100_csr_varlen_nvfp4_kv(
+@@ -1974,6 +2255,13 @@ def _call_sparse_forward_sm100_csr_varlen_nvfp4_kv(
                  Int32(head_kv),
                  Int32(max_seqlen_q),
                  Int32(work_capacity),
@@ -802,7 +1975,7 @@ index d72b17a..0cf430c 100644
                  cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
                  options="--enable-tvm-ffi",
              )
-@@ -1983,8 +2243,8 @@ def _call_sparse_forward_sm100_csr_varlen_nvfp4_kv(
+@@ -1983,8 +2271,8 @@ def _call_sparse_forward_sm100_csr_varlen_nvfp4_kv(
          _compile_cache[key](
              k_kernel,
              v_kernel,
@@ -813,7 +1986,7 @@ index d72b17a..0cf430c 100644
              k_global_scale_kernel,
              v_global_scale_kernel,
              k2q_q_indices,
-@@ -2007,5 +2267,11 @@ def _call_sparse_forward_sm100_csr_varlen_nvfp4_kv(
+@@ -2007,5 +2295,11 @@ def _call_sparse_forward_sm100_csr_varlen_nvfp4_kv(
              head_kv,
              max_seqlen_q,
              work_capacity,
@@ -1612,7 +2785,7 @@ index 4719a48..65e51be 100644
  
  
 diff --git a/python/fmha_sm100/cute/src/common/aot_cache.py b/python/fmha_sm100/cute/src/common/aot_cache.py
-index 99fd0b4..05b3254 100644
+index 99fd0b4..8037d13 100644
 --- a/python/fmha_sm100/cute/src/common/aot_cache.py
 +++ b/python/fmha_sm100/cute/src/common/aot_cache.py
 @@ -6,6 +6,12 @@
@@ -1628,7 +2801,7 @@ index 99fd0b4..05b3254 100644
  Environment variables:
      MM_SPARSE_ATTN_AOT_CACHE: Override cache directory
          (default: ~/.cache/minfer/mm_sparse_attn)
-@@ -25,10 +31,64 @@ _AOT_CACHE_DIR = os.environ.get(
+@@ -25,10 +31,87 @@ _AOT_CACHE_DIR = os.environ.get(
  _AOT_DISABLE = os.environ.get("MM_SPARSE_ATTN_AOT_DISABLE", "0") == "1"
  
  _loaded_modules: dict[str, object] = {}
@@ -1671,6 +2844,26 @@ index 99fd0b4..05b3254 100644
 +        return "smunknown"
 +
 +
++_r2_store_cache: bool | None = None
++
++
++def r2_store_enabled() -> bool:
++    """Whether the NVFP4-KV sparse prefill uses the R2 store warpgroup.
++
++    SM107 only (resolved once from the device capability); TRTLLM_MSA_DISABLE_R2STORE=1 restores the stock
++    in-softmax epilogue there too.
++    """
++    global _r2_store_cache
++    if _r2_store_cache is None:
++        import torch
++
++        _r2_store_cache = (
++            torch.cuda.get_device_capability() == (10, 7)
++            and os.environ.get("TRTLLM_MSA_DISABLE_R2STORE", "0") != "1"
++        )
++    return _r2_store_cache
++
++
 +def _build_fingerprint() -> str:
 +    global _build_fingerprint_cache
 +    if _build_fingerprint_cache is None:
@@ -1680,8 +2873,11 @@ index 99fd0b4..05b3254 100644
 +            cutlass_version = getattr(cutlass, "__version__", "unknown")
 +        except Exception:
 +            cutlass_version = "unknown"
++        # Construction-time codegen knobs must be part of the key: the source hash
++        # alone would hand one mode's cached .o to the other.
++        r2store = "r2store" + ("0" if r2_store_enabled() else "1")
 +        _build_fingerprint_cache = "-".join(
-+            (_target_arch(), str(cutlass_version), _source_fingerprint())
++            (_target_arch(), str(cutlass_version), _source_fingerprint(), r2store)
 +        )
 +    return _build_fingerprint_cache
  
@@ -1886,6 +3082,112 @@ index e3473fb..dc4cfb0 100644
  
  
  def assume_strides_aligned(t):
+diff --git a/python/fmha_sm100/cute/src/common/mxfp8_epi.py b/python/fmha_sm100/cute/src/common/mxfp8_epi.py
+new file mode 100644
+index 0000000..b771f5d
+--- /dev/null
++++ b/python/fmha_sm100/cute/src/common/mxfp8_epi.py
+@@ -0,0 +1,100 @@
++# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++# SPDX-License-Identifier: MIT
++"""PTX helpers for the combine's MXFP8 epilogue: the exact instructions of the CUDA quantizer
++(quantization.cuh cvt_warp_fp16_to_mxfp8), so the epilogue's E4M3 values and UE8M0 scales are bitwise those of
++mxfp8_quantize / quantize_mxfp8_rows on the same bf16 values."""
++
++import cutlass
++from cutlass import Float32, Int32
++from cutlass.cutlass_dsl import T, dsl_user_op
++from cutlass._mlir.dialects import llvm
++
++
++def _asm(ret, args, text, cons):
++    return llvm.inline_asm(
++        ret, args, text, cons, has_side_effects=False, is_align_stack=False, asm_dialect=llvm.AsmDialect.AD_ATT
++    )
++
++
++@dsl_user_op
++def rcp_approx_ftz(a: Float32, *, loc=None, ip=None) -> Float32:
++    """reciprocal_approximate_ftz."""
++    return Float32(_asm(T.f32(), [Float32(a).ir_value(loc=loc, ip=ip)], "rcp.approx.ftz.f32 $0, $1;", "=f,f"))
++
++
++@dsl_user_op
++def ue8m0_round_up(a: Float32, *, loc=None, ip=None) -> Int32:
++    """__nv_cvt_float_to_e8m0(a, __NV_SATFINITE, cudaRoundPosInf): the low byte of the packed pair."""
++    return Int32(
++        _asm(
++            T.i32(),
++            [Float32(a).ir_value(loc=loc, ip=ip)],
++            "{\n.reg .b16 h;\ncvt.rp.satfinite.ue8m0x2.f32 h, $1, $1;\ncvt.u32.u16 $0, h;\n}\n",
++            "=r,f",
++        )
++    ) & Int32(0xFF)
++
++
++@dsl_user_op
++def as_f32(a: Int32, *, loc=None, ip=None) -> Float32:
++    """Reinterpret 32 bits as fp32."""
++    return Float32(_asm(T.f32(), [Int32(a).ir_value(loc=loc, ip=ip)], "mov.b32 $0, $1;", "=f,r"))
++
++
++@dsl_user_op
++def bf16x2_lo_f32(w: Int32, *, loc=None, ip=None) -> Float32:
++    """The low bf16 of a packed pair as fp32 (exact)."""
++    return Float32(_asm(T.f32(), [Int32(w).ir_value(loc=loc, ip=ip)], "shl.b32 $0, $1, 16;", "=f,r"))
++
++
++@dsl_user_op
++def bf16x2_hi_f32(w: Int32, *, loc=None, ip=None) -> Float32:
++    """The high bf16 of a packed pair as fp32 (exact)."""
++    return Float32(_asm(T.f32(), [Int32(w).ir_value(loc=loc, ip=ip)], "and.b32 $0, $1, 0xFFFF0000;", "=f,r"))
++
++
++@dsl_user_op
++def fabs_f32(a: Float32, *, loc=None, ip=None) -> Float32:
++    return Float32(_asm(T.f32(), [Float32(a).ir_value(loc=loc, ip=ip)], "abs.f32 $0, $1;", "=f,f"))
++
++
++@dsl_user_op
++def fmax_f32(a: Float32, b: Float32, *, loc=None, ip=None) -> Float32:
++    return Float32(
++        _asm(
++            T.f32(),
++            [Float32(a).ir_value(loc=loc, ip=ip), Float32(b).ir_value(loc=loc, ip=ip)],
++            "max.f32 $0, $1, $2;",
++            "=f,f,f",
++        )
++    )
++
++
++@dsl_user_op
++def ue8m0_to_f32(sf_bits: Int32, *, loc=None, ip=None) -> Float32:
++    """static_cast<float>(__nv_fp8_e8m0): 0 -> 2^-127 (0x00400000), 0xFF -> NaN (0x7FFFFFFF), else bits << 23."""
++    return Float32(
++        _asm(
++            T.f32(),
++            [Int32(sf_bits).ir_value(loc=loc, ip=ip)],
++            "{\n.reg .b32 s;\n.reg .pred z, n;\n"
++            "shl.b32 s, $1, 23;\n"
++            "setp.eq.u32 z, $1, 0;\n"
++            "setp.eq.u32 n, $1, 255;\n"
++            "selp.b32 s, 0x00400000, s, z;\n"
++            "selp.b32 s, 0x7FFFFFFF, s, n;\n"
++            "mov.b32 $0, s;\n}\n",
++            "=f,r",
++        )
++    )
++
++
++def sf_offset_128x4(m_idx, k_idx, num_k_tiles):
++    """get_sf_out_offset_128x4 (batch 0): [m tiles, k tiles, 32, 4, 4]."""
++    return (
++        (m_idx // 128) * (num_k_tiles * 512)
++        + (k_idx // 4) * 512
++        + (m_idx % 32) * 16
++        + ((m_idx % 128) // 32) * 4
++        + (k_idx % 4)
++    )
 diff --git a/python/fmha_sm100/cute/src/common/tma_utils.py b/python/fmha_sm100/cute/src/common/tma_utils.py
 index 5bdc19a..9df4699 100644
 --- a/python/fmha_sm100/cute/src/common/tma_utils.py
@@ -2177,6 +3479,601 @@ index 10b2b1f..3b9f909 100644
  
  
  @dsl_user_op
+diff --git a/python/fmha_sm100/cute/src/sm100/build_k2q_csr/build_k2q_csr.cu b/python/fmha_sm100/cute/src/sm100/build_k2q_csr/build_k2q_csr.cu
+index 8ee5457..428b5a3 100644
+--- a/python/fmha_sm100/cute/src/sm100/build_k2q_csr/build_k2q_csr.cu
++++ b/python/fmha_sm100/cute/src/sm100/build_k2q_csr/build_k2q_csr.cu
+@@ -27,6 +27,10 @@
+ #include <cuda_runtime.h>
+ 
+ #include <algorithm>
++#include <cstdio>
++#include <cstdlib>
++#include <mutex>
++#include <unordered_map>
+ 
+ #define CHECK_CUDA(x) TORCH_CHECK((x).is_cuda(), #x " must be CUDA")
+ #define CHECK_CONTIGUOUS(x) TORCH_CHECK((x).is_contiguous(), #x " must be contiguous")
+@@ -196,6 +200,79 @@ __global__ void k2q_hist_kernel(
+ // ---------------------------------------------------------------------------
+ // PR: row prefix. One block per head.
+ // ---------------------------------------------------------------------------
++template <int kThreads>
++__global__ void k2q_row_prefix_agg_kernel(
++    int const* __restrict__ row_counts,
++    int* __restrict__ row_ptr,
++    int const* __restrict__ row_coords,
++    int* __restrict__ scheduler_metadata,
++    int* __restrict__ work_count,
++    int total_rows,
++    int target_q_per_cta,
++    int work_capacity)
++{
++    // Same row_ptr as k2q_row_prefix_kernel. Work items are claimed with one atomic per warp per 32-row group
++    // (the order of scheduler_metadata entries was already atomic-order, i.e. unspecified).
++    int h = blockIdx.x;
++    int tid = threadIdx.x;
++    int lane = tid & 31;
++    __shared__ int scan_buf[kThreads];
++    int const* head_counts = row_counts + (size_t)h * total_rows;
++    int* head_rowptr = row_ptr + (size_t)h * (total_rows + 1);
++    int chunk = (total_rows + kThreads - 1) / kThreads;
++    int lo = tid * chunk;
++    int hi = min(lo + chunk, total_rows);
++    int local_sum = 0;
++    for (int i = lo; i < hi; ++i) local_sum += head_counts[i];
++    scan_buf[tid] = local_sum;
++    __syncthreads();
++    for (int off = 1; off < kThreads; off <<= 1) {
++        int add = (tid >= off) ? scan_buf[tid - off] : 0;
++        __syncthreads();
++        scan_buf[tid] += add;
++        __syncthreads();
++    }
++    int running = scan_buf[tid] - local_sum;
++    for (int i = lo; i < hi; ++i) {
++        running += head_counts[i];
++        head_rowptr[i + 1] = running;
++    }
++    if (scheduler_metadata == nullptr || work_count == nullptr) return;
++    // Work items: rows strided by thread so each warp instruction covers 32 consecutive rows.
++    for (int i0 = 0; i0 < total_rows; i0 += kThreads) {
++        int i = i0 + tid;
++        int row_count = i < total_rows ? head_counts[i] : 0;
++        int num_chunks = row_count > 0 ? (row_count + target_q_per_cta - 1) / target_q_per_cta : 0;
++        int x = num_chunks;
++        #pragma unroll
++        for (int off = 1; off < 32; off <<= 1) {
++            int nbr = __shfl_up_sync(0xFFFFFFFFu, x, off);
++            if (lane >= off) x += nbr;
++        }
++        int warp_total = __shfl_sync(0xFFFFFFFFu, x, 31);
++        int base = 0;
++        if (lane == 31 && warp_total > 0) base = atomicAdd(work_count, warp_total);
++        base = __shfl_sync(0xFFFFFFFFu, base, 31) + x - num_chunks;
++        if (num_chunks > 0) {
++            int batch_idx = row_coords[(size_t)i * 2];
++            int kv_block_idx = row_coords[(size_t)i * 2 + 1];
++            for (int c = 0; c < num_chunks; ++c) {
++                int work_idx = base + c;
++                if (work_idx < work_capacity) {
++                    int q_begin = c * target_q_per_cta;
++                    int* meta = scheduler_metadata + (size_t)work_idx * 6;
++                    meta[0] = h;
++                    meta[1] = i;
++                    meta[2] = q_begin;
++                    meta[3] = min(target_q_per_cta, row_count - q_begin);
++                    meta[4] = batch_idx;
++                    meta[5] = kv_block_idx;
++                }
++            }
++        }
++    }
++}
++
+ template <int kThreads>
+ __global__ void k2q_row_prefix_kernel(
+     int const* __restrict__ row_counts,
+@@ -256,6 +333,194 @@ __global__ void k2q_row_prefix_kernel(
+     }
+ }
+ 
++// ---------------------------------------------------------------------------
++// MiniMax-M3 (MSA) edge-rank build (kill: FMHA_K2Q_EDGE_RANK=0): hist in the scatter's lane layout (lanes =
++// (q pair, slot)); each edge's per-warp rank comes from __match_any_sync + popc (lane order = q order), not from
++// the order of same-address atomics, which CUDA leaves unspecified (the stock scatter relies on it). Each edge keeps
++// its per-warp rank in registers (q_per_warp <= 2 * kIters); after the CTA sync the per-warp counts become an exclusive
++// cross-warp prefix in SMEM (warp order = q order), so rank + prefix = the edge's q-ordered rank inside the CTA
++// tile. Stored per edge (int16); the scatter is then a flat per-edge kernel with no SMEM and no atomics.
++// ---------------------------------------------------------------------------
++template <int kTopK, int kWarps, int kIters>
++__global__ void k2q_hist_rank_kernel(
++    int const* __restrict__ q2k, int const* __restrict__ cu_q, int const* __restrict__ row_map,
++    int* __restrict__ row_counts, int* __restrict__ tile_counts, short* __restrict__ edge_rank,
++    int H, int B, int S_Q, int total_rows, int max_kv_blocks, int q_per_cta, int q_per_warp)
++{
++    constexpr int kQPerIter = kWarpSize / kTopK;
++    constexpr int kThreads = kWarps * kWarpSize;
++    extern __shared__ int smem_hist_int[];
++    int tid = threadIdx.x;
++    int warp_id = tid >> 5;
++    int lane = tid & 31;
++    int c = blockIdx.x;
++    int q_start_cta = c * q_per_cta;
++    int q_end_cta = min(q_start_cta + q_per_cta, S_Q);
++    int q_start_warp = min(q_start_cta + warp_id * q_per_warp, q_end_cta);
++    int q_end_warp = min(q_start_warp + q_per_warp, q_end_cta);
++    int q_in_iter = lane / kTopK;
++    int slot_in_q = lane % kTopK;
++    int packed_per_warp = (total_rows + 1) >> 1;
++    int* my_hist = smem_hist_int + warp_id * packed_per_warp;
++
++    for (int h = 0; h < H; ++h) {
++        for (int i = lane; i < packed_per_warp; i += kWarpSize) my_hist[i] = 0;
++        __syncwarp();
++        int const* head_q2k = q2k + (size_t)h * S_Q * kTopK;
++        int row[kIters];
++        int rank[kIters];
++        int bi = 0;
++        #pragma unroll
++        for (int it = 0; it < kIters; ++it) {
++            int qi = q_start_warp + it * kQPerIter + q_in_iter;
++            row[it] = -1;
++            rank[it] = 0;
++            if (qi < q_end_warp) {
++                advance_batch_only(cu_q, B, qi, bi);
++                int kvb = head_q2k[(size_t)qi * kTopK + slot_in_q];
++                if (kvb >= 0 && kvb < max_kv_blocks) {
++                    int r = row_map[(size_t)bi * max_kv_blocks + kvb];
++                    if (r >= 0 && r < total_rows) row[it] = r;
++                }
++            }
++        }
++        // Deterministic per-warp rank (no reliance on the order of same-address atomics): the lanes holding the
++        // same row in this step are matched; rank = warp base for that row + earlier matching lanes (lane order =
++        // q order). The group leader adds the group size with one atomic whose return is the base; __syncwarp
++        // orders the warp's successive steps.
++        unsigned int const lt_mask = lane == 0 ? 0u : ((1u << lane) - 1u);
++        #pragma unroll
++        for (int it = 0; it < kIters; ++it) {
++            int r = row[it];
++            unsigned int peers = __match_any_sync(0xFFFFFFFFu, r >= 0 ? r : -1 - lane);
++            int leader = __ffs(peers) - 1;
++            int base = 0;
++            if (r >= 0 && lane == leader) {
++                int shift = (r & 1) << 4;
++                base = (atomicAdd(&my_hist[r >> 1], __popc(peers) << shift) >> shift) & 0xFFFF;
++            }
++            base = __shfl_sync(0xFFFFFFFFu, base, leader);
++            rank[it] = base + __popc(peers & lt_mask);
++            __syncwarp();
++        }
++        __syncthreads();
++        // Exclusive cross-warp prefix in place (packed int16 words add without carry: per-CTA row count
++        // <= q_per_cta < 32768), CTA totals -> tile_counts [G, H, rows] + row_counts.
++        int* cta_tile = tile_counts + ((size_t)c * H + h) * total_rows;
++        int* head_row_counts = row_counts + (size_t)h * total_rows;
++        for (int j = tid; j < packed_per_warp; j += kThreads) {
++            int running = 0;
++            #pragma unroll
++            for (int w = 0; w < kWarps; ++w) {
++                int v = smem_hist_int[w * packed_per_warp + j];
++                smem_hist_int[w * packed_per_warp + j] = running;
++                running += v;
++            }
++            int r0 = 2 * j, s0 = running & 0xFFFF, s1 = (running >> 16) & 0xFFFF;
++            cta_tile[r0] = s0;
++            if (s0 > 0) atomicAdd(&head_row_counts[r0], s0);
++            if (r0 + 1 < total_rows) {
++                cta_tile[r0 + 1] = s1;
++                if (s1 > 0) atomicAdd(&head_row_counts[r0 + 1], s1);
++            }
++        }
++        __syncthreads();
++        short* head_rank = edge_rank + (size_t)h * S_Q * kTopK;
++        #pragma unroll
++        for (int it = 0; it < kIters; ++it) {
++            int qi = q_start_warp + it * kQPerIter + q_in_iter;
++            if (row[it] >= 0)
++                head_rank[(size_t)qi * kTopK + slot_in_q] = (short)(rank[it] + read_int16_packed(my_hist, row[it]));
++        }
++        if (h + 1 < H) __syncthreads();
++    }
++}
++
++template <int kTopK>
++__global__ void k2q_scatter_rank_kernel(
++    int const* __restrict__ q2k, int const* __restrict__ cu_q, int const* __restrict__ row_map,
++    int const* __restrict__ abs_base, short const* __restrict__ edge_rank,
++    int* __restrict__ q_idx, int* __restrict__ qsplit_idx, int* __restrict__ split_counts,
++    int H, int B, int S_Q, int total_rows, int max_kv_blocks, int q_per_cta)
++{
++    long long e = (long long)blockIdx.x * blockDim.x + threadIdx.x;   // e = (h * S_Q + q) * kTopK + slot
++    long long n = (long long)H * S_Q * kTopK;
++    int lane = threadIdx.x & 31;
++    bool in = e < n;
++    int slot = (int)(e % kTopK);
++    long long hq = e / kTopK;
++    int q = in ? (int)(hq % S_Q) : 0;
++    int h = in ? (int)(hq / S_Q) : 0;
++    int row = -1, qloc = 0;
++    if (in) {
++        int lo = 0, hi = B - 1;
++        while (lo < hi) { int mid = (lo + hi + 1) >> 1; if (cu_q[mid] <= q) lo = mid; else hi = mid - 1; }
++        qloc = q - cu_q[lo];
++        int kvb = q2k[e];
++        if (kvb >= 0 && kvb < max_kv_blocks) {
++            int r = row_map[(size_t)lo * max_kv_blocks + kvb];
++            if (r >= 0 && r < total_rows) row = r;
++        }
++    }
++    bool valid = row >= 0;
++    unsigned int vmask = __ballot_sync(0xFFFFFFFFu, valid);
++    unsigned int gmask = (kTopK >= 32) ? 0xFFFFFFFFu : (((1u << kTopK) - 1u) << ((lane / kTopK) * kTopK));
++    unsigned int lower = lane == 0 ? 0u : ((1u << lane) - 1u);
++    int split_slot = __popc(vmask & gmask & lower);
++    if (!in) return;
++    if (split_counts != nullptr && slot == 0) split_counts[(size_t)q * H + h] = __popc(vmask & gmask);
++    if (!valid) return;
++    int c = q / q_per_cta;
++    int pos = abs_base[((size_t)c * H + h) * total_rows + row] + (int)edge_rank[e];
++    size_t o = (size_t)h * S_Q * kTopK + pos;
++    q_idx[o] = qloc;
++    if (qsplit_idx != nullptr) qsplit_idx[o] = qloc | ((split_slot & 0xFF) << 24);
++}
++
++// MiniMax-M3 (MSA): the work-item emission of k2q_row_prefix_agg_kernel on a multi-CTA grid (rows x heads)
++// instead of H CTAs. Same per-warp claims; only the (already atomic) order of the items changes.
++__global__ void k2q_sched_emit_kernel(
++    int const* __restrict__ row_counts,
++    int const* __restrict__ row_coords,
++    int* __restrict__ scheduler_metadata,
++    int* __restrict__ work_count,
++    int total_rows,
++    int target_q_per_cta,
++    int work_capacity)
++{
++    int h = blockIdx.y;
++    int i = blockIdx.x * blockDim.x + threadIdx.x;
++    int lane = threadIdx.x & 31;
++    int row_count = i < total_rows ? row_counts[(size_t)h * total_rows + i] : 0;
++    int num_chunks = row_count > 0 ? (row_count + target_q_per_cta - 1) / target_q_per_cta : 0;
++    int x = num_chunks;
++    #pragma unroll
++    for (int off = 1; off < 32; off <<= 1) {
++        int nbr = __shfl_up_sync(0xFFFFFFFFu, x, off);
++        if (lane >= off) x += nbr;
++    }
++    int warp_total = __shfl_sync(0xFFFFFFFFu, x, 31);
++    int base = 0;
++    if (lane == 31 && warp_total > 0) base = atomicAdd(work_count, warp_total);
++    base = __shfl_sync(0xFFFFFFFFu, base, 31) + x - num_chunks;
++    if (num_chunks == 0) return;
++    int batch_idx = row_coords[(size_t)i * 2];
++    int kv_block_idx = row_coords[(size_t)i * 2 + 1];
++    for (int c = 0; c < num_chunks; ++c) {
++        int work_idx = base + c;
++        if (work_idx < work_capacity) {
++            int q_begin = c * target_q_per_cta;
++            int* meta = scheduler_metadata + (size_t)work_idx * 6;
++            meta[0] = h;
++            meta[1] = i;
++            meta[2] = q_begin;
++            meta[3] = min(target_q_per_cta, row_count - q_begin);
++            meta[4] = batch_idx;
++            meta[5] = kv_block_idx;
++        }
++    }
++}
++
+ // ---------------------------------------------------------------------------
+ // PT_smem: SMEM-staged tile prefix scan.
+ // Each block handles kRowsPerBlock rows for one head h. Cooperative load
+@@ -521,6 +786,49 @@ __global__ void k2q_scatter_kernel(
+ // Host orchestration
+ // ===========================================================================
+ 
++// MiniMax-M3 (MSA) F2 host-cost cut (SM107 only, eager only): the pipeline's five scratch buffers (row_counts,
++// row_map, row_coords, tile_counts, edge_rank) are slices of one per-device int32 arena that grows on demand instead of
++// five allocations per call (row_counts zeroed by a memset instead of torch::zeros), the SM count is read once per
++// device, and cudaFuncSetAttribute is called only when a kernel's requested dynamic SMEM differs from the value last set
++// (stock sets it on every call; the attribute state is the same). Every user of the arena runs on the caller's current
++// stream, so reuse is stream-ordered; a capturing stream takes the stock allocations. Same kernels, same launches.
++// Kill: FMHA_K2Q_WS_ARENA=0.
++static bool k2q_arena_enabled() {
++    static bool const on = [] {
++        char const* env = std::getenv("FMHA_K2Q_WS_ARENA");
++        bool const v = env == nullptr || std::atoi(env) != 0;
++        std::fprintf(stderr, "[fmha_sm100] k2q CSR build: scratch arena %s (FMHA_K2Q_WS_ARENA)\n", v ? "on" : "off (stock)");
++        return v;
++    }();
++    return on;
++}
++
++// Leaked on purpose: a static tensor array would free CUDA memory during static destruction, after the context is gone.
++static torch::Tensor* const k2q_arena_slots = new torch::Tensor[64];
++static cudaStream_t k2q_arena_stream[64] = {};
++static bool k2q_arena_bound[64] = {};  // the default stream is a null handle, so binding needs its own flag
++
++static torch::Tensor k2q_arena_take(int dev, torch::TensorOptions const& opts, int64_t words) {
++    torch::Tensor& a = k2q_arena_slots[dev & 63];
++    if (!a.defined() || a.numel() < words) {
++        int64_t const grow = a.defined() ? std::max<int64_t>(words, a.numel() + a.numel() / 2) : words;
++        a = torch::empty({grow}, opts);
++    }
++    return a;
++}
++
++// Every set is recorded (cached or not), so a cached skip always matches the attribute's current value.
++static void k2q_set_max_dyn_smem(bool cached, int dev, void const* fn, int bytes) {
++    static std::mutex mu;
++    static std::unordered_map<void const*, int> last[64];
++    std::lock_guard<std::mutex> lock(mu);
++    auto& m = last[dev & 63];
++    auto it = m.find(fn);
++    if (cached && it != m.end() && it->second == bytes) return;
++    AT_CUDA_CHECK(cudaFuncSetAttribute(fn, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes));
++    m[fn] = bytes;
++}
++
+ template <int kTopK, int kBlockK>
+ static void launch_pipeline(
+     torch::Tensor q2k,
+@@ -554,15 +862,13 @@ static void launch_pipeline(
+         (size_t)H * S_Q * kTopK * sizeof(int), stream));
+ 
+     auto opts = torch::TensorOptions().dtype(torch::kInt32).device(device);
+-    auto row_counts = torch::zeros({H, total_rows}, opts);
+-    auto row_map = torch::empty({B, max_kv_blocks}, opts);
++    torch::Tensor row_counts, row_map, row_coords;  // allocated below, once the tile grid is known
+     bool emit_schedule = scheduler_metadata.defined();
+-    auto row_coords = emit_schedule ? torch::empty({total_rows, 2}, opts) : torch::Tensor();
+     int* scheduler_metadata_ptr = emit_schedule ? scheduler_metadata.data_ptr<int>() : nullptr;
+     int* work_count_ptr = emit_schedule ? work_count.data_ptr<int>() : nullptr;
+     int* qsplit_idx_ptr = emit_schedule ? qsplit_idx.data_ptr<int>() : nullptr;
+     int* split_counts_ptr = emit_schedule ? split_counts.data_ptr<int>() : nullptr;
+-    int* row_coords_ptr = emit_schedule ? row_coords.data_ptr<int>() : nullptr;
++    int* row_coords_ptr = nullptr;
+     if (emit_schedule) {
+         AT_CUDA_CHECK(cudaMemsetAsync(work_count_ptr, 0, sizeof(int), stream));
+         AT_CUDA_CHECK(cudaMemsetAsync(
+@@ -571,9 +877,39 @@ static void launch_pipeline(
+     }
+ 
+     int dev = q2k.get_device();
++    // The MiniMax-M3 k2q changes below (min q per CTA, edge-rank, multi-CTA emission, row-prefix claims, the scratch
++    // arena) are validated on SM107 only; SM100 / SM103 keep the stock pipeline and allocations. SM107 loads the sm_100
++    // build, so this is a runtime check, resolved once per device (host code only; the device code is unchanged).
++    static signed char sm107_by_dev[64] = {};  // 0 unknown, 1 SM107, 2 other
++    signed char& sm107_state = sm107_by_dev[dev & 63];
++    if (sm107_state == 0) {
++        int cc_major = 0, cc_minor = 0;
++        AT_CUDA_CHECK(cudaDeviceGetAttribute(&cc_major, cudaDevAttrComputeCapabilityMajor, dev));
++        AT_CUDA_CHECK(cudaDeviceGetAttribute(&cc_minor, cudaDevAttrComputeCapabilityMinor, dev));
++        sm107_state = (cc_major == 10 && cc_minor == 7) ? 1 : 2;
++    }
++    bool const is_sm107 = sm107_state == 1;
++    bool use_arena = false;
++    if (is_sm107 && k2q_arena_enabled()) {
++        cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
++        AT_CUDA_CHECK(cudaStreamIsCapturing(stream, &capture));
++        // The arena is bound to the first stream that uses it; any other stream takes the stock allocations, so
++        // reuse stays stream-ordered.
++        if (capture == cudaStreamCaptureStatusNone && !k2q_arena_bound[dev & 63]) {
++            k2q_arena_stream[dev & 63] = stream;
++            k2q_arena_bound[dev & 63] = true;
++        }
++        use_arena = capture == cudaStreamCaptureStatusNone && k2q_arena_stream[dev & 63] == stream;
++    }
+     int num_sms = 0;
+-    AT_CUDA_CHECK(cudaDeviceGetAttribute(
+-        &num_sms, cudaDevAttrMultiProcessorCount, dev));
++    static int num_sms_by_dev[64] = {};
++    if (use_arena && num_sms_by_dev[dev & 63] > 0) {
++        num_sms = num_sms_by_dev[dev & 63];
++    } else {
++        AT_CUDA_CHECK(cudaDeviceGetAttribute(
++            &num_sms, cudaDevAttrMultiProcessorCount, dev));
++        num_sms_by_dev[dev & 63] = num_sms;
++    }
+ 
+     // -- Pick kWarps per CTA based on SMEM budget for cursor/hist ---------
+     // SMEM per CTA = kWarps * total_rows * sizeof(int) (for both H and S).
+@@ -596,26 +932,86 @@ static void launch_pipeline(
+     int max_ctas_per_sm = std::max(
+         1, (228 * 1024) / std::max(1, per_cta_smem_bytes));
+     if (max_ctas_per_sm > 8) max_ctas_per_sm = 8;
+-    constexpr int kMinQPerCta = 256;
++    // MiniMax-M3 (MSA): 128 query tokens per CTA (stock 256) doubles the hist / scatter grid at long context, where
++    // the per-warp row histograms make each CTA latency-bound; the CSR (row_ptr, q_idx, qsplit, split_counts) is
++    // bitwise the stock one, since rows stay q-ascending whatever the tile split. Kill: FMHA_K2Q_MIN_Q_PER_CTA=256.
++    static int const kMinQPerCta = [] {
++        char const* env = std::getenv("FMHA_K2Q_MIN_Q_PER_CTA");
++        int const v = (env != nullptr && std::atoi(env) > 0) ? std::atoi(env) : 128;
++        std::fprintf(stderr, "[fmha_sm100] k2q CSR build: %d query tokens per CTA (FMHA_K2Q_MIN_Q_PER_CTA)\n", v);
++        return v;
++    }();
+     // Cap target_g at num_sms * 3 — empirically this balances
+     // per-CTA work-size against parallelism. Higher caps regress
+     // mid-size cases due to row_counts atomicAdd contention and
+     // smaller q_per_cta. SMEM-bound configurations naturally cap
+     // lower if max_ctas_per_sm < 3.
+     int target_g = num_sms * std::min(max_ctas_per_sm, 3);
+-    int max_g_for_q = (S_Q + kMinQPerCta - 1) / kMinQPerCta;
++    int const min_q_per_cta = is_sm107 ? kMinQPerCta : 256;  // SM107 only; stock 256 elsewhere
++    int max_g_for_q = (S_Q + min_q_per_cta - 1) / min_q_per_cta;
+     int G = std::min({target_g, max_g_for_q, S_Q});
+     if (G < 1) G = 1;
+     int q_per_cta = (S_Q + G - 1) / G;
+     G = (S_Q + q_per_cta - 1) / q_per_cta;
+     int q_per_warp = (q_per_cta + kWarps_pick - 1) / kWarps_pick;
+-    int G_total = G * kWarps_pick;
+-
+-    auto tile_counts = torch::empty({G_total, H, total_rows}, opts);
++    // MiniMax-M3 (MSA) edge-rank build: per-CTA tiles, deterministic per-edge ranks, flat scatter (see
++    // k2q_hist_rank_kernel). Same CSR as the per-warp pipeline. Kill: FMHA_K2Q_EDGE_RANK=0.
++    static bool const kEdgeRankOn = [] {
++        char const* env = std::getenv("FMHA_K2Q_EDGE_RANK");
++        bool const on = env == nullptr || std::atoi(env) != 0;
++        std::fprintf(stderr, "[fmha_sm100] k2q CSR build: edge-rank %s (FMHA_K2Q_EDGE_RANK)\n", on ? "on" : "off (stock)");
++        return on;
++    }();
++    // Work items emitted on a (rows x heads) grid instead of H CTAs; order was already atomic-order.
++    // Kill: FMHA_K2Q_SCHED_PAR=0.
++    static bool const kSchedPar = [] {
++        char const* env = std::getenv("FMHA_K2Q_SCHED_PAR");
++        bool const on = env == nullptr || std::atoi(env) != 0;
++        std::fprintf(stderr, "[fmha_sm100] k2q CSR build: multi-CTA work emission %s (FMHA_K2Q_SCHED_PAR)\n",
++                     on ? "on" : "off (stock)");
++        return on;
++    }();
++    bool const kEdgeRank = is_sm107 && kEdgeRankOn && kTopK == 16 && kWarps_pick == 4 && q_per_warp <= 32;  // SM107 only
++    int G_total = kEdgeRank ? G : G * kWarps_pick;
++
++    torch::Tensor tile_counts, edge_rank_ws;
++    if (use_arena) {
++        auto pad = [](int64_t w) { return (w + 31) / 32 * 32; };  // 128-byte aligned slices
++        int64_t const n_rc = (int64_t)H * total_rows;
++        int64_t const n_rm = (int64_t)B * max_kv_blocks;
++        int64_t const n_co = emit_schedule ? (int64_t)total_rows * 2 : 0;
++        int64_t const n_tc = (int64_t)G_total * H * total_rows;
++        int64_t const n_er = kEdgeRank ? ((int64_t)H * S_Q * kTopK + 1) / 2 : 0;  // int16 entries in int32 words
++        int64_t const o_rm = pad(n_rc), o_co = o_rm + pad(n_rm), o_tc = o_co + pad(n_co), o_er = o_tc + pad(n_tc);
++        torch::Tensor arena = k2q_arena_take(dev, opts, o_er + pad(n_er));
++        row_counts = arena.narrow(0, 0, n_rc).view({H, total_rows});
++        AT_CUDA_CHECK(cudaMemsetAsync(row_counts.data_ptr<int>(), 0, (size_t)n_rc * sizeof(int), stream));
++        row_map = arena.narrow(0, o_rm, n_rm).view({B, max_kv_blocks});
++        if (emit_schedule) row_coords = arena.narrow(0, o_co, n_co).view({total_rows, 2});
++        tile_counts = arena.narrow(0, o_tc, n_tc).view({G_total, H, total_rows});
++        if (kEdgeRank) edge_rank_ws = arena.narrow(0, o_er, n_er);
++    } else {
++        row_counts = torch::zeros({H, total_rows}, opts);
++        row_map = torch::empty({B, max_kv_blocks}, opts);
++        if (emit_schedule) row_coords = torch::empty({total_rows, 2}, opts);
++        tile_counts = torch::empty({G_total, H, total_rows}, opts);
++    }
++    row_coords_ptr = emit_schedule ? row_coords.data_ptr<int>() : nullptr;
+ 
+     // -- Compile-time switch on kWarps for the templated kernels ---------
+     auto rmap_fn = k2q_build_row_map_kernel<kBlockK>;
+-    auto rprefix_fn = k2q_row_prefix_kernel<1024>;
++    // MiniMax-M3 (MSA): work items are claimed with one atomic per warp (a warp prefix sum of the per-row chunk
++    // counts) instead of one per row. Only the order of scheduler_metadata entries changes, which was already
++    // atomic-order in stock; the attention consumer is order-invariant (O/LSE bitwise under permuted orders).
++    // Kill: FMHA_K2Q_ROW_PREFIX_AGG=0.
++    static bool const kRowPrefixAgg = [] {
++        char const* env = std::getenv("FMHA_K2Q_ROW_PREFIX_AGG");
++        bool const on = env == nullptr || std::atoi(env) != 0;
++        std::fprintf(stderr, "[fmha_sm100] k2q CSR build: row-prefix work claims %s (FMHA_K2Q_ROW_PREFIX_AGG)\n",
++                     on ? "warp-aggregated" : "per row (stock)");
++        return on;
++    }();
++    auto rprefix_fn = (is_sm107 && kRowPrefixAgg) ? k2q_row_prefix_agg_kernel<1024> : k2q_row_prefix_kernel<1024>;  // SM107 only
+     constexpr int kPtRowsPerBlock = 8;
+     constexpr int kPtThreads = 256;
+     auto tprefix_smem_fn = k2q_tile_prefix_smem_kernel<kPtThreads, kPtRowsPerBlock>;
+@@ -630,24 +1026,54 @@ static void launch_pipeline(
+         size_t smem_bytes = (size_t)W * per_warp_smem;
+         auto hist_fn = k2q_hist_kernel<kTopK, kBlockK, W>;
+         auto scat_fn = k2q_scatter_kernel<kTopK, kBlockK, W>;
+-        AT_CUDA_CHECK(cudaFuncSetAttribute(
+-            hist_fn, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_bytes));
+-        AT_CUDA_CHECK(cudaFuncSetAttribute(
+-            scat_fn, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_bytes));
+-
+-        hist_fn<<<G, W * kWarpSize, smem_bytes, stream>>>(
+-            q2k.data_ptr<int>(), cu_q.data_ptr<int>(), row_map.data_ptr<int>(),
+-            row_counts.data_ptr<int>(), tile_counts.data_ptr<int>(),
+-            H, B, S_Q, total_rows, max_kv_blocks, q_per_cta, q_per_warp);
++        k2q_set_max_dyn_smem(use_arena, dev, (void const*)hist_fn, (int)smem_bytes);
++        k2q_set_max_dyn_smem(use_arena, dev, (void const*)scat_fn, (int)smem_bytes);
++
++        torch::Tensor edge_rank;
++        if constexpr (W == 4 && kTopK == 16) {
++            if (kEdgeRank) {
++                edge_rank = use_arena ? edge_rank_ws : torch::empty({(long long)H * S_Q * kTopK}, opts.dtype(torch::kInt16));
++                // More warps per CTA (the tiles are per CTA, so the CSR does not depend on it): the rank pass is
++                // latency-bound at 4 warps. 16 / 8 / 4 warps by SMEM (warps x packed rows) and q per CTA.
++                int rw = 16;
++                while (rw > 4 && ((size_t)rw * per_warp_smem > 200 * 1024 || (q_per_cta + rw - 1) / rw < 2)) rw >>= 1;
++                int qpw = (q_per_cta + rw - 1) / rw;
++                auto go = [&](auto kern, int warps) {
++                    size_t sb = (size_t)warps * per_warp_smem;
++                    k2q_set_max_dyn_smem(use_arena, dev, (void const*)kern, (int)sb);
++                    kern<<<G, warps * kWarpSize, sb, stream>>>(
++                        q2k.data_ptr<int>(), cu_q.data_ptr<int>(), row_map.data_ptr<int>(),
++                        row_counts.data_ptr<int>(), tile_counts.data_ptr<int>(),
++                        reinterpret_cast<short*>(edge_rank.data_ptr()),
++                        H, B, S_Q, total_rows, max_kv_blocks, q_per_cta, (q_per_cta + warps - 1) / warps);
++                };
++                if (rw == 16 && qpw <= 8) go(k2q_hist_rank_kernel<kTopK, 16, 4>, 16);
++                else if (rw >= 8 && (q_per_cta + 7) / 8 <= 16) go(k2q_hist_rank_kernel<kTopK, 8, 8>, 8);
++                else go(k2q_hist_rank_kernel<kTopK, 4, 16>, 4);
++            }
++        }
++        if (!kEdgeRank) {
++            hist_fn<<<G, W * kWarpSize, smem_bytes, stream>>>(
++                q2k.data_ptr<int>(), cu_q.data_ptr<int>(), row_map.data_ptr<int>(),
++                row_counts.data_ptr<int>(), tile_counts.data_ptr<int>(),
++                H, B, S_Q, total_rows, max_kv_blocks, q_per_cta, q_per_warp);
++        }
+ 
++        bool const par = is_sm107 && kSchedPar && emit_schedule;  // SM107 only
+         rprefix_fn<<<H, 1024, 0, stream>>>(
+             row_counts.data_ptr<int>(), row_ptr.data_ptr<int>(),
+             emit_schedule ? row_coords.data_ptr<int>() : nullptr,
+-            scheduler_metadata_ptr,
+-            work_count_ptr,
++            par ? nullptr : scheduler_metadata_ptr,
++            par ? nullptr : work_count_ptr,
+             total_rows,
+             target_q_per_cta,
+             work_capacity);
++        if (par) {
++            dim3 eg((total_rows + 255) / 256, H);
++            k2q_sched_emit_kernel<<<eg, 256, 0, stream>>>(
++                row_counts.data_ptr<int>(), row_coords.data_ptr<int>(), scheduler_metadata_ptr, work_count_ptr,
++                total_rows, target_q_per_cta, work_capacity);
++        }
+ 
+         // Grid is H * blocks_per_h so each block stays within a single
+         // head; flat (H*total_rows) grid would skip rows when total_rows
+@@ -656,19 +1082,26 @@ static void launch_pipeline(
+         int pt_grid = H * blocks_per_h;
+         if (pt_grid < 1) pt_grid = 1;
+         size_t pt_smem = (size_t)kPtRowsPerBlock * G_total * sizeof(int);
+-        AT_CUDA_CHECK(cudaFuncSetAttribute(
+-            tprefix_smem_fn, cudaFuncAttributeMaxDynamicSharedMemorySize,
+-            (int)pt_smem));
++        k2q_set_max_dyn_smem(use_arena, dev, (void const*)tprefix_smem_fn, (int)pt_smem);
+         tprefix_smem_fn<<<pt_grid, kPtThreads, pt_smem, stream>>>(
+             tile_counts.data_ptr<int>(), row_ptr.data_ptr<int>(),
+             H, total_rows, G_total);
+ 
+-        scat_fn<<<G, W * kWarpSize, smem_bytes, stream>>>(
+-            q2k.data_ptr<int>(), cu_q.data_ptr<int>(), row_map.data_ptr<int>(),
+-            tile_counts.data_ptr<int>(), q_idx.data_ptr<int>(),
+-            qsplit_idx_ptr, split_counts_ptr,
+-            H, B, S_Q, total_rows, max_kv_blocks, q_per_cta, q_per_warp,
+-            max_seqlen_q);
++        if (kEdgeRank) {
++            long long ne = (long long)H * S_Q * kTopK;
++            k2q_scatter_rank_kernel<kTopK><<<(unsigned)((ne + 255) / 256), 256, 0, stream>>>(
++                q2k.data_ptr<int>(), cu_q.data_ptr<int>(), row_map.data_ptr<int>(),
++                tile_counts.data_ptr<int>(), reinterpret_cast<short const*>(edge_rank.data_ptr()),
++                q_idx.data_ptr<int>(), qsplit_idx_ptr, split_counts_ptr,
++                H, B, S_Q, total_rows, max_kv_blocks, q_per_cta);
++        } else {
++            scat_fn<<<G, W * kWarpSize, smem_bytes, stream>>>(
++                q2k.data_ptr<int>(), cu_q.data_ptr<int>(), row_map.data_ptr<int>(),
++                tile_counts.data_ptr<int>(), q_idx.data_ptr<int>(),
++                qsplit_idx_ptr, split_counts_ptr,
++                H, B, S_Q, total_rows, max_kv_blocks, q_per_cta, q_per_warp,
++                max_seqlen_q);
++        }
+     };
+ 
+     if (kWarps_pick == 4) {
 diff --git a/python/fmha_sm100/cute/src/sm100/fwd/atten_fwd.py b/python/fmha_sm100/cute/src/sm100/fwd/atten_fwd.py
 index f5950f3..caad594 100644
 --- a/python/fmha_sm100/cute/src/sm100/fwd/atten_fwd.py
@@ -2193,7 +4090,7 @@ index f5950f3..caad594 100644
          tOrP: cute.Tensor,
          sK: cute.Tensor,
 diff --git a/python/fmha_sm100/cute/src/sm100/fwd/atten_fwd_nvfp4_kv.py b/python/fmha_sm100/cute/src/sm100/fwd/atten_fwd_nvfp4_kv.py
-index ba930a6..f2d7fb3 100644
+index ba930a6..25c4537 100644
 --- a/python/fmha_sm100/cute/src/sm100/fwd/atten_fwd_nvfp4_kv.py
 +++ b/python/fmha_sm100/cute/src/sm100/fwd/atten_fwd_nvfp4_kv.py
 @@ -9,7 +9,8 @@ forward contract:
@@ -2206,7 +4103,36 @@ index ba930a6..f2d7fb3 100644
  - FP32 per-tensor K/V global scales
  """
  
-@@ -297,8 +298,8 @@ class SparseAttentionForwardNvfp4KvSm100:
+@@ -28,6 +29,7 @@ from cutlass.cutlass_dsl import BaseDSL
+ 
+ from quack import copy_utils
+ 
++from src.common.aot_cache import r2_store_enabled
+ from src.common.cute_dsl_utils import assume_tensor_aligned
+ from src.common import utils
+ from src.common import pipeline
+@@ -139,10 +141,18 @@ class SparseAttentionForwardNvfp4KvSm100:
+         self.store_warp_base = self.softmax1_warp_base + self.warps_per_group
+         self.mma_warp_id = self.store_warp_base + self.warps_per_group
+         self.load_warp_base = self.mma_warp_id + 1
+-        self.q_load_warp_base = self.store_warp_base
++        # R2 store WG (SM107 only, see aot_cache.r2_store_enabled): warps 8-11 drain partial O/LSE for every q-group
++        # while the softmax WGs move on; the Q load then runs on warp 15 (formerly empty).
++        # TRTLLM_MSA_DISABLE_R2STORE=1, or any other device, keeps the stock in-softmax epilogue.
++        self.r2_store = r2_store_enabled()
++        self.q_load_warp_base = (
++            self.load_warp_base + 2 if self.r2_store else self.store_warp_base)
+         self.kv_load_warp_base = self.load_warp_base
+         self.num_kv_load_warps = 2
+-        self.num_q_load_warps = self.warps_per_group
++        self.num_q_load_warps = 1 if self.r2_store else self.warps_per_group
++        # Softmax stats ring: with the store WG, 2 slots per softmax stage
++        # (meta = qi_group & 3); stock uses one slot per stage.
++        self.sm_meta_stages = 4 if self.r2_store else self.o_stage
+         self.total_warps = 16
+         self.threads_per_cta = cute.arch.WARP_SIZE * self.total_warps  # 512
+ 
+@@ -297,8 +307,8 @@ class SparseAttentionForwardNvfp4KvSm100:
          self,
          mK: cute.Tensor,            # packed NVFP4: flat [total_k, head_kv, dim/2] or paged [page, head_kv, token, dim/2]
          mV: cute.Tensor,            # packed NVFP4: flat [total_k, head_kv, dim/2] or paged [page, head_kv, token, dim/2]
@@ -2217,7 +4143,7 @@ index ba930a6..f2d7fb3 100644
          mKGlobalScale: Optional[cute.Tensor], # optional FP32 tensor/global dequant scale
          mVGlobalScale: Optional[cute.Tensor], # optional FP32 tensor/global dequant scale
          mK2qIndices: cute.Tensor,   # csr payload: [head_kv, nnz]
-@@ -321,6 +322,17 @@ class SparseAttentionForwardNvfp4KvSm100:
+@@ -321,6 +331,17 @@ class SparseAttentionForwardNvfp4KvSm100:
          num_heads_kv: Int32,
          seq_len_q: Int32,
          work_capacity: Int32,
@@ -2235,7 +4161,7 @@ index ba930a6..f2d7fb3 100644
          stream=None,
      ):
          self.q_dtype = mQ_flat.element_type
-@@ -358,9 +370,11 @@ class SparseAttentionForwardNvfp4KvSm100:
+@@ -358,9 +379,11 @@ class SparseAttentionForwardNvfp4KvSm100:
              not in [Float32, cutlass.BFloat16, cutlass.Float16, cutlass.Float8E4M3FN]
          ):
              raise TypeError(f"Unsupported O_partial dtype: {self.o_dtype}")
@@ -2250,7 +4176,29 @@ index ba930a6..f2d7fb3 100644
  
          if const_expr(not self.paged_kv):
              # Flat varlen K/V:
-@@ -588,6 +602,8 @@ class SparseAttentionForwardNvfp4KvSm100:
+@@ -516,18 +539,18 @@ class SparseAttentionForwardNvfp4KvSm100:
+             mbar_p: cute.struct.MemRange[Int64, self.s_stage * 2]
+             mbar_p_lastsplit: cute.struct.MemRange[Int64, self.s_stage * 2]
+             mbar_o: cute.struct.MemRange[Int64, self.o_stage * 2]
+-            mbar_sm_stats: cute.struct.MemRange[Int64, self.o_stage * 2]
++            mbar_sm_stats: cute.struct.MemRange[Int64, self.sm_meta_stages * 2]
+             tmem_dealloc_mbar_ptr: Int64
+             tmem_holding_buf: Int32
+             # Per-row softmax stats cache (for epilogue LSE + rescale):
+             #   [0 : m_block_size)            row_sum
+             #   [m_block_size : 2*m_block_size) row_max
+             sScale: cute.struct.MemRange[
+-                Float32, self.o_stage * self.m_block_size * 2]
++                Float32, self.sm_meta_stages * self.m_block_size * 2]
+             # Per-row temperature LSE row_sum cache. The row_max is shared with
+             # sScale because lse_temperature_scale is positive.
+             sScaleTemperature: cute.struct.MemRange[
+-                Float32, self.o_stage * self.m_block_size]
++                Float32, self.sm_meta_stages * self.m_block_size]
+             # Per-token split_id from prepare-time per-edge metadata.
+             sSplitIdx: cute.struct.MemRange[
+                 Int32, self.o_stage * self.q_tokens_per_group]
+@@ -588,6 +611,8 @@ class SparseAttentionForwardNvfp4KvSm100:
              tiled_mma_qk, tiled_mma_pv,
              k_fp4_tma_bytes, v_fp4_tma_bytes, q_tma_bytes, q_subtile_bytes,
              num_kv_blocks, num_heads_kv, seq_len_q, work_capacity,
@@ -2259,7 +4207,7 @@ index ba930a6..f2d7fb3 100644
          ).launch(
              grid=(num_ctas,),
              block=[self.threads_per_cta, 1, 1],
-@@ -653,6 +669,11 @@ class SparseAttentionForwardNvfp4KvSm100:
+@@ -653,6 +678,11 @@ class SparseAttentionForwardNvfp4KvSm100:
          num_heads_kv: Int32,
          seq_len_q: Int32,
          work_capacity: Int32,
@@ -2271,7 +4219,109 @@ index ba930a6..f2d7fb3 100644
      ):
          # ------------------------------------------------------------------
          #  Thread / warp identity, CTA coordinate
-@@ -1085,6 +1106,8 @@ class SparseAttentionForwardNvfp4KvSm100:
+@@ -709,9 +739,9 @@ class SparseAttentionForwardNvfp4KvSm100:
+         sQ = storage.sQ.get_tensor(sQ_layout.outer, swizzle=sQ_layout.inner)
+         sQ_load = storage.sQ.get_tensor(sQ_load_layout.outer, swizzle=sQ_load_layout.inner)
+         sScale = storage.sScale.get_tensor(
+-            cute.make_layout(self.o_stage * self.m_block_size * 2))
++            cute.make_layout(self.sm_meta_stages * self.m_block_size * 2))
+         sScaleTemperature = storage.sScaleTemperature.get_tensor(
+-            cute.make_layout(self.o_stage * self.m_block_size))
++            cute.make_layout(self.sm_meta_stages * self.m_block_size))
+         sSplitIdx = storage.sSplitIdx.get_tensor(
+             cute.make_layout((self.o_stage * self.q_tokens_per_group,)))
+         sQIdx = storage.sQIdx.get_tensor(
+@@ -731,7 +761,8 @@ class SparseAttentionForwardNvfp4KvSm100:
+         # ------------------------------------------------------------------
+         #  TMEM allocator — allocator warp 0 serves the whole CTA.
+         # ------------------------------------------------------------------
+-        tmem_alloc_warps: cutlass.Constexpr[int] = self.warps_per_group * 2 + 1
++        tmem_alloc_warps: cutlass.Constexpr[int] = (
++            self.warps_per_group * (3 if self.r2_store else 2) + 1)
+         tmem_alloc_threads = cute.arch.WARP_SIZE * tmem_alloc_warps
+         tmem_alloc_barrier = pipeline.NamedBarrier(
+             barrier_id=int(NamedBarrierFwdSm100.TmemPtr),
+@@ -799,7 +830,7 @@ class SparseAttentionForwardNvfp4KvSm100:
+         )
+         pipeline_sm_stats = pipeline.PipelineAsync.create(
+             barrier_storage=storage.mbar_sm_stats.data_ptr(),
+-            num_stages=self.o_stage,
++            num_stages=self.sm_meta_stages,
+             producer_group=softmax_threads,
+             consumer_group=epilogue_threads,
+             defer_sync=True,
+@@ -941,7 +972,8 @@ class SparseAttentionForwardNvfp4KvSm100:
+             num_threads=cute.arch.WARP_SIZE * self.warps_per_group,
+         )
+         if (
+-            warp_idx == Int32(self.total_warps - 1)
++            warp_idx == Int32(
++                self.total_warps if self.r2_store else self.total_warps - 1)
+             and warp_idx >= Int32(self.kv_load_warp_base + self.num_kv_load_warps)
+         ):
+             cute.arch.setmaxregister_decrease(self.num_regs_empty)
+@@ -952,7 +984,9 @@ class SparseAttentionForwardNvfp4KvSm100:
+         )
+         is_q_load_thread = tidx >= q_load_thread_base and tidx < q_load_thread_end
+         if is_q_load_thread and cta_valid_work:
+-            if self.store_reg_decrease:
++            if self.r2_store:
++                cute.arch.setmaxregister_decrease(self.num_regs_empty)
++            elif self.store_reg_decrease:
+                 cute.arch.setmaxregister_decrease(self.num_regs_store)
+             else:
+                 cute.arch.setmaxregister_increase(self.num_regs_store)
+@@ -1056,6 +1090,49 @@ class SparseAttentionForwardNvfp4KvSm100:
+             tmem.free(tmem_ptr, num_columns=tmem_cols)
+             cute.arch.griddepcontrol_launch_dependents()
+ 
++        if const_expr(self.r2_store):
++            if (
++                warp_idx >= Int32(self.store_warp_base)
++                and warp_idx < Int32(self.store_warp_base + self.warps_per_group)
++                and cta_valid_work
++            ):
++                if self.store_reg_decrease:
++                    cute.arch.setmaxregister_decrease(self.num_regs_store)
++                else:
++                    cute.arch.setmaxregister_increase(self.num_regs_store)
++                count_raw_store = sRowMeta[3]
++                has_work_store = count_raw_store > Int32(0)
++                num_q_groups_store = (
++                    count_raw_store + Int32(self.q_tokens_per_group - 1)
++                ) // Int32(self.q_tokens_per_group)
++                tmem.wait_for_alloc()
++                tmem_ptr = tmem.retrieve_ptr(self.qk_acc_dtype)
++                self._wg_store(
++                    tiled_mma_pv,
++                    sScale,
++                    sScaleTemperature,
++                    sSplitIdx,
++                    sQIdx,
++                    sQIdxMeta,
++                    pipeline_o,
++                    pipeline_sm_stats,
++                    sm_stats_barrier,
++                    epilogue_barrier,
++                    mO_partial, mLSE_partial, mLSE_temperature_partial,
++                    softmax_scale_log2,
++                    lse_temperature_scale_log2,
++                    mVGlobalScale,
++                    num_q_groups_store, count_raw_store, has_work_store,
++                    sRowMeta[0],
++                    head_kv_idx,
++                    seq_len_q,
++                    head_q,
++                    num_heads_kv,
++                    sRowMeta[5],
++                    mQ_2d,
++                )
++                tmem_alloc_barrier.arrive()
++
+         if (
+             warp_idx >= Int32(self.softmax0_warp_base)
+             and warp_idx < Int32(self.softmax1_warp_base)
+@@ -1085,6 +1162,8 @@ class SparseAttentionForwardNvfp4KvSm100:
                  head_kv_idx, kv_block_idx_softmax,
                  sRowMeta[6],
                  num_heads_kv,
@@ -2280,16 +4330,17 @@ index ba930a6..f2d7fb3 100644
              )
              tmem.wait_for_alloc()
              tmem_ptr = tmem.retrieve_ptr(self.qk_acc_dtype)
-@@ -1152,6 +1175,8 @@ class SparseAttentionForwardNvfp4KvSm100:
+@@ -1152,6 +1231,9 @@ class SparseAttentionForwardNvfp4KvSm100:
                  head_kv_idx, kv_block_idx_softmax,
                  sRowMeta[6],
                  num_heads_kv,
 +                v_sf_page_stride,
 +                v_sf_head_stride,
++                kv_valid_cols_softmax,
              )
              tmem.wait_for_alloc()
              tmem_ptr = tmem.retrieve_ptr(self.qk_acc_dtype)
-@@ -1193,66 +1218,147 @@ class SparseAttentionForwardNvfp4KvSm100:
+@@ -1193,66 +1275,147 @@ class SparseAttentionForwardNvfp4KvSm100:
      # Warp-specialized helpers
      # ------------------------------------------------------------------
  
@@ -2476,7 +4527,7 @@ index ba930a6..f2d7fb3 100644
  
      @cute.jit
      def _dequant_fp4x16_to_bf16(
-@@ -1282,12 +1388,14 @@ class SparseAttentionForwardNvfp4KvSm100:
+@@ -1282,12 +1445,14 @@ class SparseAttentionForwardNvfp4KvSm100:
          src_words: cute.Tensor,
          scale_e4m3: Int32,
          dst: cute.Tensor,
@@ -2491,7 +4542,7 @@ index ba930a6..f2d7fb3 100644
              )
              dst_i32[word_idx * 2] = fp8_lo
              dst_i32[word_idx * 2 + 1] = fp8_hi
-@@ -1299,12 +1407,14 @@ class SparseAttentionForwardNvfp4KvSm100:
+@@ -1299,12 +1464,14 @@ class SparseAttentionForwardNvfp4KvSm100:
          scale_e4m3_lo: Int32,
          scale_e4m3_hi: Int32,
          dst: cute.Tensor,
@@ -2506,7 +4557,7 @@ index ba930a6..f2d7fb3 100644
              )
              dst_i32[word_idx * 2] = fp8_lo
              dst_i32[word_idx * 2 + 1] = fp8_hi
-@@ -1312,29 +1422,11 @@ class SparseAttentionForwardNvfp4KvSm100:
+@@ -1312,29 +1479,11 @@ class SparseAttentionForwardNvfp4KvSm100:
              fp8_lo, fp8_hi = utils.cvt_fp4x8_e2m1_scaled_e4m3x8(
                  src_words[word_idx + 2],
                  scale_e4m3_hi,
@@ -2537,7 +4588,7 @@ index ba930a6..f2d7fb3 100644
      @cute.jit
      def _load_k_fp4_to_smem(
          self,
-@@ -1350,11 +1442,37 @@ class SparseAttentionForwardNvfp4KvSm100:
+@@ -1350,11 +1499,37 @@ class SparseAttentionForwardNvfp4KvSm100:
          kv_block_idx: Int32,
          k_batch_offset: Int32,
          num_heads_kv: Int32,
@@ -2576,7 +4627,7 @@ index ba930a6..f2d7fb3 100644
          if const_expr(self.k_dtype == cutlass.Float8E4M3FN and self.fp8_pair_dequant):
              elems_per_pair: cutlass.Constexpr[int] = 32
              bytes_per_pair: cutlass.Constexpr[int] = 16
-@@ -1379,22 +1497,17 @@ class SparseAttentionForwardNvfp4KvSm100:
+@@ -1379,22 +1554,17 @@ class SparseAttentionForwardNvfp4KvSm100:
                  pair_col = task_idx - row * Int32(scale_pairs)
                  scale_col = pair_col * Int32(2)
                  byte_col = pair_col * Int32(bytes_per_pair)
@@ -2605,7 +4656,7 @@ index ba930a6..f2d7fb3 100644
                  smem_offset = row * Int32(self.head_dim // 2) + byte_col
                  s_ptr = cute.make_ptr(
                      cutlass.Int32,
-@@ -1404,10 +1517,16 @@ class SparseAttentionForwardNvfp4KvSm100:
+@@ -1404,10 +1574,16 @@ class SparseAttentionForwardNvfp4KvSm100:
                  )
                  s_vec = cute.make_tensor(s_ptr, cute.make_layout(bytes_per_pair // 4))
                  cute.copy(g2r_pair_atom, s_vec, r_words_pair)
@@ -2625,7 +4676,7 @@ index ba930a6..f2d7fb3 100644
                      scale_col + Int32(1),
                  )
                  self._dequant_fp4x32_to_fp8(
-@@ -1415,98 +1534,101 @@ class SparseAttentionForwardNvfp4KvSm100:
+@@ -1415,98 +1591,101 @@ class SparseAttentionForwardNvfp4KvSm100:
                      scale_e4m3_lo,
                      scale_e4m3_hi,
                      r_vals_pair,
@@ -2809,17 +4860,21 @@ index ba930a6..f2d7fb3 100644
          cute.arch.fence_view_async_shared()
  
      @cute.jit
-@@ -1524,11 +1646,30 @@ class SparseAttentionForwardNvfp4KvSm100:
+@@ -1524,11 +1703,34 @@ class SparseAttentionForwardNvfp4KvSm100:
          kv_block_idx: Int32,
          k_batch_offset: Int32,
          num_heads_kv: Int32,
 +        v_sf_page_stride: Int32,
 +        v_sf_head_stride: Int32,
++        kv_valid_cols: Int32,
      ):
          elems_per_block: cutlass.Constexpr[int] = 16
          bytes_per_block: cutlass.Constexpr[int] = 8
          scale_cols: cutlass.Constexpr[int] = self.head_dim // elems_per_block
 -        token_in_block_base = kv_block_idx * Int32(self.n_block_size)
++        # Rows at or past kv_valid_cols take a zero block scale: their P is 0, but a never-written pool slot can hold a
++        # NaN / Inf scale byte, and 0 * NaN = NaN would reach O. E2M1 data is always finite, so such a row dequantizes
++        # to exact zeros; valid rows are unchanged (bitwise).
 +        # Loop-invariant scale addressing; see `_load_k_fp4_to_smem`.  Only the
 +        # offset formula differs -- V is 4x4 token-quad swizzled.
 +        if const_expr(self.paged_kv):
@@ -2841,7 +4896,7 @@ index ba930a6..f2d7fb3 100644
          if const_expr(self.v_dtype == cutlass.Float8E4M3FN and self.fp8_pair_dequant):
              elems_per_pair: cutlass.Constexpr[int] = 32
              bytes_per_pair: cutlass.Constexpr[int] = 16
-@@ -1553,22 +1694,18 @@ class SparseAttentionForwardNvfp4KvSm100:
+@@ -1553,22 +1755,18 @@ class SparseAttentionForwardNvfp4KvSm100:
                  pair_col = task_idx - row * Int32(scale_pairs)
                  scale_col = pair_col * Int32(2)
                  byte_col = pair_col * Int32(bytes_per_pair)
@@ -2871,7 +4926,7 @@ index ba930a6..f2d7fb3 100644
                  smem_offset = row * Int32(self.head_dim // 2) + byte_col
                  s_ptr = cute.make_ptr(
                      cutlass.Int32,
-@@ -1578,10 +1715,16 @@ class SparseAttentionForwardNvfp4KvSm100:
+@@ -1578,17 +1776,26 @@ class SparseAttentionForwardNvfp4KvSm100:
                  )
                  s_vec = cute.make_tensor(s_ptr, cute.make_layout(bytes_per_pair // 4))
                  cute.copy(g2r_pair_atom, s_vec, r_words_pair)
@@ -2890,8 +4945,10 @@ index ba930a6..f2d7fb3 100644
 +                    sf_token,
                      scale_col + Int32(1),
                  )
++                scale_e4m3_lo = scale_e4m3_lo if row < kv_valid_cols else Int32(0)
++                scale_e4m3_hi = scale_e4m3_hi if row < kv_valid_cols else Int32(0)
                  self._dequant_fp4x32_to_fp8(
-@@ -1589,6 +1732,7 @@ class SparseAttentionForwardNvfp4KvSm100:
+                     r_words_pair,
                      scale_e4m3_lo,
                      scale_e4m3_hi,
                      r_vals_pair,
@@ -2899,7 +4956,7 @@ index ba930a6..f2d7fb3 100644
                  )
                  sV_cols = sV[(None, row % Int32(32)), 0, row // Int32(32), 0]
                  sV_vec = cute.local_tile(sV_cols, (elems_per_pair,), (pair_col,))
-@@ -1596,81 +1740,86 @@ class SparseAttentionForwardNvfp4KvSm100:
+@@ -1596,81 +1803,88 @@ class SparseAttentionForwardNvfp4KvSm100:
                  s_tiles = cute.logical_divide(sV_vec, cute.make_layout(16))
                  for v in cutlass.range_constexpr(elems_per_pair // 16):
                      cute.copy(r2s_pair_atom, r_tiles[None, v], s_tiles[None, v])
@@ -3026,6 +5083,7 @@ index ba930a6..f2d7fb3 100644
 +                        sf_token,
 +                        scale_col,
 +                    )
++                    scale_e4m3 = scale_e4m3 if row < kv_valid_cols else Int32(0)
 +                    self._dequant_fp4x16_to_fp8(r_words, scale_e4m3, r_vals, v_global)
 +                    sV_cols = sV[(None, row % Int32(32)), 0, row // Int32(32), 0]
 +                else:
@@ -3036,6 +5094,7 @@ index ba930a6..f2d7fb3 100644
 +                        sf_token,
 +                        scale_col,
 +                    )
++                    combined_bf16x2 = combined_bf16x2 if row < kv_valid_cols else Int32(0)
 +                    if const_expr(self.has_v_global_scale):
 +                        global_bf16x2 = utils.cvt_f16x2_f32(
 +                            mVGlobalScale[0],
@@ -3057,7 +5116,7 @@ index ba930a6..f2d7fb3 100644
          cute.arch.fence_view_async_shared()
  
      @cute.jit
-@@ -1794,6 +1943,8 @@ class SparseAttentionForwardNvfp4KvSm100:
+@@ -1794,6 +2008,8 @@ class SparseAttentionForwardNvfp4KvSm100:
          kv_block_idx: Int32,
          k_batch_offset: Int32,
          num_heads_kv: Int32,
@@ -3066,7 +5125,7 @@ index ba930a6..f2d7fb3 100644
      ):
          warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
          warp_idx_in_wg = warp_idx - Int32(dequant_warp_base)
-@@ -1814,6 +1965,8 @@ class SparseAttentionForwardNvfp4KvSm100:
+@@ -1814,6 +2030,8 @@ class SparseAttentionForwardNvfp4KvSm100:
                  kv_block_idx,
                  k_batch_offset,
                  num_heads_kv,
@@ -3075,25 +5134,27 @@ index ba930a6..f2d7fb3 100644
              )
              dequant_barrier.arrive_and_wait()
              if warp_idx_in_wg == Int32(0):
-@@ -1838,6 +1991,8 @@ class SparseAttentionForwardNvfp4KvSm100:
+@@ -1838,6 +2056,9 @@ class SparseAttentionForwardNvfp4KvSm100:
          kv_block_idx: Int32,
          k_batch_offset: Int32,
          num_heads_kv: Int32,
 +        v_sf_page_stride: Int32,
 +        v_sf_head_stride: Int32,
++        kv_valid_cols: Int32,
      ):
          warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
          warp_idx_in_wg = warp_idx - Int32(dequant_warp_base)
-@@ -1858,6 +2013,8 @@ class SparseAttentionForwardNvfp4KvSm100:
+@@ -1858,6 +2079,9 @@ class SparseAttentionForwardNvfp4KvSm100:
                  kv_block_idx,
                  k_batch_offset,
                  num_heads_kv,
 +                v_sf_page_stride,
 +                v_sf_head_stride,
++                kv_valid_cols,
              )
              dequant_barrier.arrive_and_wait()
              if warp_idx_in_wg == Int32(0):
-@@ -2191,8 +2348,8 @@ class SparseAttentionForwardNvfp4KvSm100:
+@@ -2191,8 +2415,8 @@ class SparseAttentionForwardNvfp4KvSm100:
          self,
          tiled_mma_qk: cute.TiledMma,
          tiled_mma_pv: cute.TiledMma,
@@ -3104,7 +5165,15 @@ index ba930a6..f2d7fb3 100644
          tStS: cute.Tensor,
          tOrP: cute.Tensor,
          sK: cute.Tensor,
-@@ -2479,17 +2636,6 @@ class SparseAttentionForwardNvfp4KvSm100:
+@@ -2441,6 +2665,7 @@ class SparseAttentionForwardNvfp4KvSm100:
+         s_consumer_phase: Int32,
+         p_producer_phase: Int32,
+         sm_stats_producer_phase: Int32,
++        sm_meta_idx: Int32,
+         softmax: SoftmaxSm100,
+         sScale: cute.Tensor,
+         sScaleTemperature: cute.Tensor,
+@@ -2479,17 +2704,6 @@ class SparseAttentionForwardNvfp4KvSm100:
              self.qk_acc_dtype)
          cute.copy(thr_tmem_load, tStS_t2r, tSrS_t2r)
  
@@ -3122,7 +5191,206 @@ index ba930a6..f2d7fb3 100644
          seqlen_info = SeqlenInfoQK(
              Int32(0),
              Int32(0),
-@@ -3071,11 +3217,6 @@ class SparseAttentionForwardNvfp4KvSm100:
+@@ -2593,11 +2807,11 @@ class SparseAttentionForwardNvfp4KvSm100:
+         else:
+             pipeline_p_lastsplit.producer_commit_w_index(slot_rt)
+         pipeline_sm_stats.producer_acquire_w_index_phase(
+-            slot_rt, sm_stats_producer_phase)
++            sm_meta_idx, sm_stats_producer_phase)
+         softmax.update_row_sum(tSrS_t2r.load(), Float32(0.0), True)
+         del tSrS_t2r
+         sScale_slot = cute.make_tensor(
+-            sScale.iterator + slot_rt * Int32(self.m_block_size * 2),
++            sScale.iterator + sm_meta_idx * Int32(self.m_block_size * 2),
+             cute.make_layout(self.m_block_size * 2),
+         )
+         sScale_slot[group_tidx] = softmax.row_sum[0]
+@@ -2605,11 +2819,13 @@ class SparseAttentionForwardNvfp4KvSm100:
+             softmax.row_max[0])
+         if const_expr(return_temperature_lse):
+             sScale_temperature_slot = cute.make_tensor(
+-                sScaleTemperature.iterator + slot_rt * Int32(self.m_block_size),
++                sScaleTemperature.iterator + sm_meta_idx * Int32(self.m_block_size),
+                 cute.make_layout(self.m_block_size),
+             )
+             sScale_temperature_slot[group_tidx] = lse_temperature_row_sum
+         cute.arch.fence_view_async_shared()
++        if const_expr(self.r2_store):
++            pipeline_sm_stats.producer_commit_w_index(sm_meta_idx)
+ 
+         if const_expr(signal_stats_barrier):
+             sm_stats_barrier.arrive_w_index(index=stats_barrier_idx)
+@@ -2734,6 +2950,12 @@ class SparseAttentionForwardNvfp4KvSm100:
+                 qi_group = qi_iter * Int32(2) + Int32(stage)
+                 phase = qi_iter & Int32(1)
+                 producer_phase = phase ^ Int32(1)
++                sm_meta_idx = Int32(stage)
++                sm_meta_producer_phase = producer_phase
++                if const_expr(self.r2_store):
++                    sm_meta_idx = Int32(stage) + Int32(2) * (qi_iter & Int32(1))
++                    sm_meta_producer_phase = (
++                        (qi_iter // Int32(2)) & Int32(1)) ^ Int32(1)
+                 qidx_meta_slot = (
+                     (qi_group & Int32(self.qidx_meta_stages - 1))
+                     * Int32(self.q_tokens_per_group)
+@@ -2754,7 +2976,8 @@ class SparseAttentionForwardNvfp4KvSm100:
+                         stage,
+                         phase,
+                         producer_phase,
+-                        producer_phase,
++                        sm_meta_producer_phase,
++                        sm_meta_idx,
+                         softmax,
+                         sScale,
+                         sScaleTemperature,
+@@ -2789,7 +3012,8 @@ class SparseAttentionForwardNvfp4KvSm100:
+                         stage,
+                         phase,
+                         producer_phase,
+-                        producer_phase,
++                        sm_meta_producer_phase,
++                        sm_meta_idx,
+                         softmax,
+                         sScale,
+                         sScaleTemperature,
+@@ -2819,7 +3043,98 @@ class SparseAttentionForwardNvfp4KvSm100:
+                         False,
+                         False,
+                     )
+-                epilogue_barrier.arrive_and_wait_w_index(index=Int32(stage))
++                if const_expr(not self.r2_store):
++                    epilogue_barrier.arrive_and_wait_w_index(index=Int32(stage))
++                    self._epilogue_step(
++                        qi_group,
++                        group_tidx,
++                        warp_idx_in_wg,
++                        tOtO_base,
++                        tOcO_i,
++                        o_tmem_copy_atom,
++                        sScale,
++                        sScaleTemperature,
++                        sSplitIdx,
++                        sQIdx,
++                        sQIdxMeta,
++                        pipeline_o,
++                        pipeline_sm_stats,
++                        sm_stats_barrier,
++                        epilogue_barrier,
++                        mO_partial,
++                        mLSE_partial,
++                        mLSE_temperature_partial,
++                        softmax_scale_log2,
++                        lse_temperature_scale_log2,
++                        mVGlobalScale,
++                        count_raw,
++                        batch_idx,
++                        head_kv_idx,
++                        seq_len_q,
++                        head_q,
++                        num_heads_kv,
++                        q_batch_offset,
++                        total_q,
++                        False,
++                        stage,
++                    )
++
++    @cute.jit
++    def _wg_store(
++        self,
++        tiled_mma_pv: cute.TiledMma,
++        sScale: cute.Tensor,
++        sScaleTemperature: cute.Tensor,
++        sSplitIdx: cute.Tensor,
++        sQIdx: cute.Tensor,
++        sQIdxMeta: cute.Tensor,
++        pipeline_o,
++        pipeline_sm_stats,
++        sm_stats_barrier,
++        epilogue_barrier,
++        mO_partial: cute.Tensor,
++        mLSE_partial: cute.Tensor,
++        mLSE_temperature_partial: Optional[cute.Tensor],
++        softmax_scale_log2: Float32,
++        lse_temperature_scale_log2: Float32,
++        mVGlobalScale: Optional[cute.Tensor],
++        num_q_groups: Int32,
++        count_raw: Int32,
++        has_work: Int32,
++        batch_idx: Int32,
++        head_kv_idx: Int32,
++        seq_len_q: Int32,
++        head_q: Int32,
++        num_heads_kv: Int32,
++        q_batch_offset: Int32,
++        mQ_2d: cute.Tensor,
++    ):
++        """R2 store WG: partial O/LSE epilogue for every q-group, in order.
++
++        O(qi_group) is released through pipeline_o (gates PV(qi_group + 2)); the softmax
++        stats come through the 4-slot pipeline_sm_stats ring.
++        """
++        tidx = cute.arch.thread_idx()[0]
++        warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
++        warp_idx_in_wg = warp_idx % Int32(self.warps_per_group)
++        group_tidx = (
++            warp_idx_in_wg * Int32(cute.arch.WARP_SIZE)
++            + tidx % Int32(cute.arch.WARP_SIZE)
++        )
++        total_q = mQ_2d.shape[0] // head_q
++        thr0_pv = tiled_mma_pv.get_slice(0)
++        pv_acc_shape = thr0_pv.partition_shape_C(self.mma_tiler_pv[:2])
++        tOtO_base = thr0_pv.make_fragment_C(pv_acc_shape)
++        corr_tile_size = 64
++        tOcO = thr0_pv.partition_C(
++            cute.make_identity_tensor(self.mma_tiler_pv[:2]))
++        tOcO_i = cute.logical_divide(
++            tOcO, cute.make_layout((self.m_block_size, corr_tile_size)))
++        o_tmem_copy_atom = cute.make_copy_atom(
++            tcgen05.copy.Ld16x256bOp(tcgen05.copy.Repetition(8)),
++            self.pv_acc_dtype)
++        if has_work:
++            for qi_group in cutlass.range(num_q_groups, unroll=1):
+                 self._epilogue_step(
+                     qi_group,
+                     group_tidx,
+@@ -2851,7 +3166,7 @@ class SparseAttentionForwardNvfp4KvSm100:
+                     q_batch_offset,
+                     total_q,
+                     False,
+-                    stage,
++                    0,
+                 )
+ 
+     @cute.jit
+@@ -2961,14 +3276,16 @@ class SparseAttentionForwardNvfp4KvSm100:
+     ):
+         slot = qi_group & Int32(1)
+         phase = (qi_group // Int32(2)) & Int32(1)
++        sm_meta = qi_group & Int32(self.sm_meta_stages - 1)
++        sm_phase = (qi_group // Int32(self.sm_meta_stages)) & Int32(1)
+         stage_base = slot * Int32(self.tmem_o_stage_stride)
+         corr_tile_size = 64
+         sScale_slot = cute.make_tensor(
+-            sScale.iterator + slot * Int32(self.m_block_size * 2),
++            sScale.iterator + sm_meta * Int32(self.m_block_size * 2),
+             cute.make_layout(self.m_block_size * 2),
+         )
+         sScale_temperature_slot = cute.make_tensor(
+-            sScaleTemperature.iterator + slot * Int32(self.m_block_size),
++            sScaleTemperature.iterator + sm_meta * Int32(self.m_block_size),
+             cute.make_layout(self.m_block_size),
+         )
+         sSplitIdx_slot = cute.make_tensor(
+@@ -2984,6 +3301,8 @@ class SparseAttentionForwardNvfp4KvSm100:
+                               self.q_tokens_per_group)
+ 
+         pipeline_o.consumer_wait_w_index_phase(slot, phase)
++        if const_expr(self.r2_store):
++            pipeline_sm_stats.consumer_wait_w_index_phase(sm_meta, sm_phase)
+         if const_expr(use_stats_barrier):
+             sm_stats_barrier.arrive_and_wait_w_index(
+                 index=slot * Int32(self.warps_per_group) + warp_idx_in_wg)
+@@ -3071,11 +3390,6 @@ class SparseAttentionForwardNvfp4KvSm100:
                                      row_sum_val
                                      if not is_zero_or_nan
                                      else Float32(1.0))
@@ -3134,7 +5402,7 @@ index ba930a6..f2d7fb3 100644
                                  row_base_ptr = (
                                      flat_row * Int64(self.head_dim))
                                  o0 = tOrO_mn[r, c_base]
-@@ -3133,11 +3274,6 @@ class SparseAttentionForwardNvfp4KvSm100:
+@@ -3133,11 +3447,6 @@ class SparseAttentionForwardNvfp4KvSm100:
                                      row_sum_val
                                      if not is_zero_or_nan
                                      else Float32(1.0))
@@ -3146,7 +5414,7 @@ index ba930a6..f2d7fb3 100644
                                  row_base_ptr = (
                                      flat_row * Int64(self.head_dim))
                                  o0 = tOrO_mn[r, c_base]
-@@ -3211,11 +3347,6 @@ class SparseAttentionForwardNvfp4KvSm100:
+@@ -3211,11 +3520,6 @@ class SparseAttentionForwardNvfp4KvSm100:
                                      if not is_zero_or_nan
                                      else Float32(1.0)
                                  )
@@ -3158,6 +5426,268 @@ index ba930a6..f2d7fb3 100644
                                  row_base_ptr = flat_row * Int64(self.head_dim)
                                  o0 = tOrO_mn[r, c_base]
                                  o1 = tOrO_mn[r, c_base + Int32(1)]
+@@ -3301,5 +3605,5 @@ class SparseAttentionForwardNvfp4KvSm100:
+                     lse_temperature_cur)
+         epilogue_barrier.arrive_and_wait_w_index(index=Int32(softmax_stage))
+ 
+-        pipeline_sm_stats.consumer_release_w_index(slot)
++        pipeline_sm_stats.consumer_release_w_index(sm_meta)
+         pipeline_o.consumer_release_w_index(slot)
+diff --git a/python/fmha_sm100/cute/src/sm100/fwd/combine.py b/python/fmha_sm100/cute/src/sm100/fwd/combine.py
+index b9e6bbb..fa18fab 100644
+--- a/python/fmha_sm100/cute/src/sm100/fwd/combine.py
++++ b/python/fmha_sm100/cute/src/sm100/fwd/combine.py
+@@ -27,6 +27,7 @@ from src.common.seqlen_info import SeqlenInfo
+ from cutlass.cute import FastDivmodDivisor
+ 
+ from src.common.pack_gqa import PackGQAComb
++from src.common import mxfp8_epi
+ from src.common.tma_utils import (
+     stg128_fake_col_to_real_col,
+     stg128_fp8_fake_col_to_real_col,
+@@ -47,6 +48,7 @@ class SparseAttentionForwardCombine:
+         stages: int = 4,
+         use_pdl: bool = False,
+         min_blocks_per_mp: int = 0,
++        write_bf16: bool = True,
+     ):
+         """
+         Forward combine kernel for split attention computation.
+@@ -72,6 +74,10 @@ class SparseAttentionForwardCombine:
+         self.stages = stages
+         self.use_pdl = use_pdl
+         self.min_blocks_per_mp = min_blocks_per_mp
++        # MXFP8 epilogue (Host, CTX (b)): the final O also written as MXFP8 (E4M3 + K32 UE8M0 scales, swizzled
++        # 128x4) for the o_proj GEMM, bitwise mxfp8_quantize(O_bf16.view(total_q, nheads * head_dim), True).
++        # write_bf16=False skips the bf16 O store (only when nothing else reads it).
++        self.write_bf16 = write_bf16
+         self.use_stg128_half_layout = dtype_partial in (cutlass.BFloat16, cutlass.Float16)
+         self.use_stg128_fp8_layout = dtype_partial is cutlass.Float8E4M3FN
+ 
+@@ -256,6 +262,8 @@ class SparseAttentionForwardCombine:
+         mSplitCounts: Optional[cute.Tensor] = None,
+         mOutputScale: Optional[cute.Tensor] = None,
+         qhead_per_kvhead: Int32 = Int32(1),
++        mOq: Optional[cute.Tensor] = None,
++        mSFq: Optional[cute.Tensor] = None,
+         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
+         stream: cuda.CUstream = None,
+     ):
+@@ -432,6 +440,8 @@ class SparseAttentionForwardCombine:
+             mSplitCounts,
+             mOutputScale,
+             qhead_per_kvhead,
++            mOq,
++            mSFq,
+             SharedStorage,
+             self.smem_layout_lse,
+             self.smem_layout_o,
+@@ -480,6 +490,8 @@ class SparseAttentionForwardCombine:
+         mSplitCounts: Optional[cute.Tensor],
+         mOutputScale: Optional[cute.Tensor],
+         qhead_per_kvhead: Int32,
++        mOq: Optional[cute.Tensor],
++        mSFq: Optional[cute.Tensor],
+         SharedStorage: cutlass.Constexpr,
+         smem_layout_lse: cute.Layout | cute.ComposedLayout,
+         smem_layout_o: cute.Layout | cute.ComposedLayout,
+@@ -1110,19 +1122,94 @@ class SparseAttentionForwardCombine:
+                         if const_expr(self.is_even_k) or tOpO_store[k]:
+                             cute.autovec_copy(tOsO_store[None, m, k], rO[None, m, k])
+ 
+-                # Write bf16 to GMEM using gmem_tiled_copy_O (same as original FA Step 7)
+-                for m in cutlass.range(num_store_rows, unroll_full=True):
+-                    row_local = tOcO_store[0, m, 0][0]
+-                    idx = m_block * self.tile_m + row_local
+-                    if idx < max_idx:
+-                        m_idx, head_idx = self.decode_flat_row_idx(idx, head_divmod)
+-                        mO_cur_copy = cute.tiled_divide(
+-                            mO_cur[m_idx, None, head_idx], (elems_per_store,)
+-                        )
+-                        for k in cutlass.range(cute.size(tOcO_store, mode=[2]), unroll_full=True):
+-                            k_idx = tOcO_store[0, 0, k][1] // elems_per_store
+-                            if const_expr(self.is_even_k) or tOpO_store[k]:
+-                                cute.copy(gmem_thr_copy_O, rO[None, m, k], mO_cur_copy[None, k_idx])
++                if const_expr(self.write_bf16):
++                    # Write bf16 to GMEM using gmem_tiled_copy_O (same as original FA Step 7)
++                    for m in cutlass.range(num_store_rows, unroll_full=True):
++                        row_local = tOcO_store[0, m, 0][0]
++                        idx = m_block * self.tile_m + row_local
++                        if idx < max_idx:
++                            m_idx, head_idx = self.decode_flat_row_idx(idx, head_divmod)
++                            mO_cur_copy = cute.tiled_divide(
++                                mO_cur[m_idx, None, head_idx], (elems_per_store,)
++                            )
++                            for k in cutlass.range(cute.size(tOcO_store, mode=[2]), unroll_full=True):
++                                k_idx = tOcO_store[0, 0, k][1] // elems_per_store
++                                if const_expr(self.is_even_k) or tOpO_store[k]:
++                                    cute.copy(gmem_thr_copy_O, rO[None, m, k], mO_cur_copy[None, k_idx])
++
++                if const_expr(mOq is not None):
++                    self.quant_rows_mxfp8(
++                        rO, tOcO_store, mOq, mSFq, m_block, max_idx, offset, head_divmod, num_store_rows
++                    )
++
++    @cute.jit
++    def quant_rows_mxfp8(
++        self,
++        rO: cute.Tensor,
++        tOcO_store: cute.Tensor,
++        mOq: cute.Tensor,
++        mSFq: cute.Tensor,
++        m_block: Int32,
++        max_idx: Int32,
++        offset: Int32,
++        head_divmod: FastDivmodDivisor,
++        num_store_rows: cutlass.Constexpr[int],
++    ):
++        """The tile's final O rows as MXFP8 for the o_proj GEMM, from the bf16 registers 7b read out of sO_perm (one
++        SMEM pass). 7b's copy gives each thread 8 consecutive real columns of a row and 16 consecutive lanes per row
++        (k_block 128), the stock quantize_mxfp8_rows mapping: 4 lanes per K32 block, so amax / scale / E4M3 are
++        bitwise mxfp8_quantize of the bf16 output. mOq: uint8 [total_q, nheads * head_dim]; mSFq: uint8 swizzled
++        128x4 scales (padding rows zeroed by the caller)."""
++        assert cute.size(tOcO_store, mode=[0]) == 8 and cute.size(tOcO_store, mode=[2]) == 1
++        num_head = Int32(mOq.shape[1] // self.head_dim)
++        col0 = tOcO_store[0, 0, 0][1]
++        lane_block = col0 // 8
++        for m in cutlass.range_constexpr(num_store_rows):
++            row_local = tOcO_store[0, m, 0][0]
++            idx = m_block * self.tile_m + row_local
++            vals = cute.make_rmem_tensor((8,), Float32)
++            for i in cutlass.range_constexpr(8):
++                vals[i] = rO[i, m, 0].to(Float32)
++            vmax = mxfp8_epi.fabs_f32(vals[0])
++            for i in cutlass.range_constexpr(1, 8):
++                vmax = mxfp8_epi.fmax_f32(vmax, mxfp8_epi.fabs_f32(vals[i]))
++            # amax over the 4 lanes of a K32 block (consecutive lanes of one warp, one row).
++            vmax = mxfp8_epi.fmax_f32(vmax, cute.arch.shuffle_sync_bfly(vmax, offset=1))
++            vmax = mxfp8_epi.fmax_f32(vmax, cute.arch.shuffle_sync_bfly(vmax, offset=2))
++            sf_bits = mxfp8_epi.ue8m0_round_up(vmax * mxfp8_epi.rcp_approx_ftz(Float32(448.0)))
++            out_scale = Float32(0.0)
++            if vmax != Float32(0.0):
++                out_scale = mxfp8_epi.rcp_approx_ftz(mxfp8_epi.ue8m0_to_f32(sf_bits))
++            if idx < max_idx:
++                m_idx, head_idx = self.decode_flat_row_idx(idx, head_divmod)
++                tok = offset + m_idx
++                q0 = utils.cvt_fp8x4_e4m3_f32(
++                    vals[0] * out_scale, vals[1] * out_scale, vals[2] * out_scale, vals[3] * out_scale
++                )
++                q1 = utils.cvt_fp8x4_e4m3_f32(
++                    vals[4] * out_scale, vals[5] * out_scale, vals[6] * out_scale, vals[7] * out_scale
++                )
++                qp = cute.make_ptr(
++                    dtype=cutlass.Int32,
++                    value=mOq.iterator.toint()
++                    + Int64(tok) * Int64(mOq.shape[1])
++                    + Int64(head_idx * self.head_dim + col0),
++                    mem_space=mOq.iterator.memspace,
++                    assumed_align=8,
++                )
++                qt = cute.make_tensor(qp, cute.make_layout((2,), stride=(1,)))
++                qt[0] = q0
++                qt[1] = q1
++                if lane_block % 4 == 0:
++                    k_idx = head_idx * (self.head_dim // 32) + lane_block // 4
++                    sf_off = mxfp8_epi.sf_offset_128x4(tok, k_idx, num_head * (self.head_dim // 128))
++                    sp = cute.make_ptr(
++                        dtype=cutlass.Uint8,
++                        value=mSFq.iterator.toint() + Int64(sf_off),
++                        mem_space=mSFq.iterator.memspace,
++                        assumed_align=1,
++                    )
++                    cute.make_tensor(sp, cute.make_layout((1,), stride=(1,)))[0] = cutlass.Uint8(sf_bits)
+ 
+     @cute.jit
+     def load_O_partial(
+@@ -1210,6 +1297,9 @@ def combine(
+     split_counts=None,
+     output_scale=None,
+     use_pdl=False,
++    o_fp8=None,
++    sf_out=None,
++    write_bf16=True,
+ ):
+     """K2: merge sparse forward split partials into the final output.
+ 
+@@ -1245,7 +1335,28 @@ def combine(
+             provided, the final O accumulator is multiplied once before store.
+         use_pdl: When True, wait on PDL dependencies from the producer K1
+             kernel. When False, launch without PDL waits.
++        o_fp8, sf_out: Optional MXFP8 copy of the final O for the o_proj GEMM (Host, CTX (b)):
++            o_fp8 uint8/float8_e4m3fn [total_q, head_q * dim] and sf_out uint8 1-D swizzled 128x4 K32 UE8M0
++            scales of [total_q, head_q * dim]; bitwise mxfp8_quantize(o_out.view(total_q, -1), True). The
++            caller zeroes sf_out's padding rows (total_q .. pad128). Varlen + use_pdl only.
++        write_bf16: False skips the bf16 o_out store (only valid with o_fp8 and no other reader of o_out).
+     """
++    emit_mxfp8 = o_fp8 is not None
++    if (o_fp8 is None) != (sf_out is None):
++        raise ValueError("o_fp8 and sf_out must be given together")
++    if not write_bf16 and not emit_mxfp8:
++        raise ValueError("write_bf16=False requires the MXFP8 output")
++    if emit_mxfp8:
++        if cu_seqlens is None or not use_pdl or o_out.ndim != 3:
++            raise ValueError("the MXFP8 combine epilogue supports the varlen use_pdl path only")
++        if o_out.dtype != torch.bfloat16 or o_partial_fake.shape[-1] != 128:
++            raise ValueError("the MXFP8 combine epilogue needs a bf16 output and head_dim 128")
++        o_fp8 = o_fp8.view(torch.uint8)
++        if o_fp8.shape != (o_out.shape[0], o_out.shape[1] * o_out.shape[2]) or not o_fp8.is_contiguous():
++            raise ValueError(f"o_fp8 must be contiguous [total_q, head_q * dim], got {tuple(o_fp8.shape)}")
++        rows_padded = (o_out.shape[0] + 127) // 128 * 128
++        if sf_out.dtype != torch.uint8 or sf_out.numel() < rows_padded * o_fp8.shape[1] // 32:
++            raise ValueError("sf_out must be uint8 with the padded 128x4 swizzled size")
+     D = o_partial_fake.shape[-1]
+     num_splits = o_partial_fake.shape[0]
+     return_temperature_lse = (
+@@ -1352,6 +1463,8 @@ def combine(
+         has_output_scale,
+         use_pdl,
+         min_blocks_per_mp,
++        emit_mxfp8,
++        write_bf16,
+     )
+     if key not in _combine_compile_cache:
+         from src.common.aot_cache import try_load_aot, save_aot
+@@ -1371,6 +1484,7 @@ def combine(
+                 topk=num_splits,
+                 use_pdl=use_pdl,
+                 min_blocks_per_mp=min_blocks_per_mp,
++                write_bf16=write_bf16,
+                 # stages=2 halves per-block SMEM (168 KB -> 103 KB) -> 2 blocks/SM,
+                 # theoretical occupancy 12.5% -> 25%. NCU DRAM throughput 76.35%
+                 # -> 88.64%. Runtime latency within noise (kernel already at HBM
+@@ -1452,6 +1566,16 @@ def combine(
+                 if has_output_scale
+                 else None
+             )
++            mOq = (
++                make_fake_tensor(cutlass.Uint8, (cute.sym_int64(), cute.sym_int64()), divisibility=16, leading_dim=1)
++                if emit_mxfp8
++                else None
++            )
++            mSFq = (
++                make_fake_tensor(cutlass.Uint8, (cute.sym_int64(),), divisibility=4, leading_dim=0)
++                if emit_mxfp8
++                else None
++            )
+             stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+ 
+             _combine_compile_cache[key] = cute.compile(
+@@ -1474,6 +1598,8 @@ def combine(
+                 mSplitCounts,
+                 mOutputScale,
+                 Int32(qheadperkv),
++                mOq,
++                mSFq,
+                 stream,
+                 options="--enable-tvm-ffi",
+             )
+@@ -1495,4 +1621,6 @@ def combine(
+             split_counts,
+             output_scale,
+             qheadperkv,
++            o_fp8,
++            sf_out,
+         )
 diff --git a/python/fmha_sm100/cute/src/sm100/fwd_decode/atten_fwd.py b/python/fmha_sm100/cute/src/sm100/fwd_decode/atten_fwd.py
 index 8ccc2cb..daf0e74 100644
 --- a/python/fmha_sm100/cute/src/sm100/fwd_decode/atten_fwd.py
@@ -4085,6 +6615,7 @@ index 21c777e..fa48c96 100644
              v_q.global_scale,
              k2q_row_ptr,
 diff --git a/python/fmha_sm100/jit.py b/python/fmha_sm100/jit.py
+index fa63a02..2d2aa2b 100644
 --- a/python/fmha_sm100/jit.py
 +++ b/python/fmha_sm100/jit.py
 @@ -1,4 +1,5 @@
@@ -4107,7 +6638,7 @@ diff --git a/python/fmha_sm100/jit.py b/python/fmha_sm100/jit.py
  import logging
  import os
  import shutil
-@@ -22,11 +24,18 @@
+@@ -22,11 +24,54 @@ import jinja2
  
  logger = logging.getLogger(__name__)
  
@@ -4120,6 +6651,42 @@ diff --git a/python/fmha_sm100/jit.py b/python/fmha_sm100/jit.py
 +_CUTLASS_UTIL_INCLUDE = _CUTLASS_DIR / "tools" / "util" / "include"
 +
 +
++def _device_is_sm107() -> bool:
++    """Whether the current CUDA device is SM107 (compute capability 10.7)."""
++    import torch
++
++    return torch.cuda.is_available() and torch.cuda.get_device_capability() == (10, 7)
++
++
++_proxy_modes_cache = None
++
++
++def _proxy_modes():
++    """(keep correction chain, single S buffer) for the OnlyScore K-split kernels (the MSA indexer proxy).
++
++    By default they skip the per-tile softmax -> correction -> MMA handshake (kSkipPerTileCorrection in
++    sm100_fmha_fwd_mainloop_tma_warpspecialized.hpp) and double-buffer S in the O TMEM columns (kSDoubleBuf, which
++    requires the skip); TLLM_FMHA_PROXY_CORRECTION_CHAIN=1 / TLLM_FMHA_PROXY_S_DOUBLE_BUFFER=0 keep the stock
++    behaviour, each in its own cache directory. Both are SM107-only: every other device compiles the stock mainloop
++    (the kill knobs' defines and cache directory). Resolved on first use, not at import, so importing this module
++    never initializes CUDA (a parent that later forks workers must not hold a CUDA context).
++    """
++    global _proxy_modes_cache
++    if _proxy_modes_cache is None:
++        sm107 = _device_is_sm107()
++        chain = os.environ.get("TLLM_FMHA_PROXY_CORRECTION_CHAIN", "0") == "1" or not sm107
++        single_s = os.environ.get("TLLM_FMHA_PROXY_S_DOUBLE_BUFFER", "1") == "0" or not sm107
++        logger.warning(
++            "fmha_sm100: OnlyScore K-split per-tile correction handshake %s (TLLM_FMHA_PROXY_CORRECTION_CHAIN=%s), "
++            "S double buffer %s (TLLM_FMHA_PROXY_S_DOUBLE_BUFFER=%s)%s",
++            "kept" if chain else "skipped", "1" if chain else "0",
++            "off" if (single_s or chain) else "on", "0" if single_s else "1",
++            "" if sm107 else "; stock mainloop, the device is not SM107",
++        )
++        _proxy_modes_cache = (chain, single_s)
++    return _proxy_modes_cache
++
++
  def _compute_cache_base():
      explicit = os.environ.get("MINFER_FMHA_CACHE_DIR")
 -    if explicit:
@@ -4129,11 +6696,16 @@ diff --git a/python/fmha_sm100/jit.py b/python/fmha_sm100/jit.py
      # Different build configs get separate cache dirs to avoid conflicts
      suffix = ""
      if os.environ.get("GPU_TRACE") is not None:
-@@ -35,9 +44,27 @@
+@@ -35,12 +80,58 @@ def _compute_cache_base():
          suffix += "_sm_timing"
      if os.environ.get("FMHA_GMEM_CHECK") is not None:
          suffix += "_gmem_check"
 -    if suffix:
++    proxy_chain, proxy_single_s = _proxy_modes()
++    if proxy_chain:
++        suffix += "_proxy_correction_chain"
++    if proxy_single_s:
++        suffix += "_proxy_single_s"
 +    if suffix and not explicit:
          base = base.parent / (base.name + suffix)
 -    return base
@@ -4158,8 +6730,35 @@ diff --git a/python/fmha_sm100/jit.py b/python/fmha_sm100/jit.py
 +    return cache_base
  
  
- CACHE_BASE = _compute_cache_base()
-@@ -55,13 +82,6 @@
+-CACHE_BASE = _compute_cache_base()
++class _LazyCacheBase:
++    """The cache root, computed on first use: its suffix depends on the device (see _proxy_modes)."""
++
++    _path = None
++
++    def _resolve(self) -> Path:
++        if self._path is None:
++            self._path = _compute_cache_base()
++        return self._path
++
++    def __truediv__(self, other):
++        return self._resolve() / other
++
++    def __fspath__(self):
++        return str(self._resolve())
++
++    def __str__(self):
++        return str(self._resolve())
++
++    def __getattr__(self, name):
++        return getattr(self._resolve(), name)
++
++
++CACHE_BASE = _LazyCacheBase()
+ 
+ 
+ def _acquire_file_lock(lock_path):
+@@ -55,13 +146,6 @@ def _release_file_lock(fd):
      os.close(fd)
  
  
@@ -4173,7 +6772,17 @@ diff --git a/python/fmha_sm100/jit.py b/python/fmha_sm100/jit.py
  
  _PACK_FACTORS = [1,2,4,6,8,16]
  # _PACK_FACTORS = [1, 6]
-@@ -199,6 +219,9 @@
+@@ -187,7 +271,8 @@ def _get_cuda_home():
+     raise RuntimeError("Cannot find CUDA toolkit. Set CUDA_HOME.")
+ 
+ 
+-_ALL_VARIANTS_SO = CACHE_BASE / "_all_variants" / "all_variants.so"
++def _all_variants_so() -> Path:
++    return CACHE_BASE / "_all_variants" / "all_variants.so"
+ 
+ def _get_nvcc_flags(cache_dir, fmha=True):
+     tvm_include = _get_tvm_ffi_include()
+@@ -199,6 +284,9 @@ def _get_nvcc_flags(cache_dir, fmha=True):
          "--expt-relaxed-constexpr", "--expt-extended-lambda",
          "-gencode=arch=compute_100a,code=sm_100a",
          "-gencode=arch=compute_103a,code=sm_103a",
@@ -4183,6 +6792,31 @@ diff --git a/python/fmha_sm100/jit.py b/python/fmha_sm100/jit.py
          "-static-global-template-stub=false",
          "-DFLASHINFER_ENABLE_BF16",
          "-DFLASHINFER_ENABLE_FP8_E4M3",
+@@ -225,6 +313,11 @@ def _get_nvcc_flags(cache_dir, fmha=True):
+         nvcc_flags.append("-DSM_TIMING_ENABLED")
+     if os.environ.get("FMHA_GMEM_CHECK") is not None:
+         nvcc_flags.append("-DFMHA_GMEM_BOUNDS_CHECK")
++    proxy_chain, proxy_single_s = _proxy_modes()
++    if proxy_chain:
++        nvcc_flags.append("-DFMHA_ONLYSCORE_PER_TILE_CORRECTION")
++    if proxy_single_s:
++        nvcc_flags.append("-DFMHA_ONLYSCORE_SINGLE_S")
+     return " ".join(nvcc_flags)
+ 
+ class _VariantWrapper:
+@@ -257,9 +350,10 @@ class FMHAVariantManager:
+     def _ensure_all_module(self):
+         if not self._all_module_checked:
+             self._all_module_checked = True
+-            if _ALL_VARIANTS_SO.exists():
++            all_variants_so = _all_variants_so()
++            if all_variants_so.exists():
+                 import tvm_ffi
+-                self._all_module = tvm_ffi.load_module(str(_ALL_VARIANTS_SO))
++                self._all_module = tvm_ffi.load_module(str(all_variants_so))
+ 
+     def get_variant(self, dtype_code, qo_tile_size, single_wg,
+                     sparse_mode, page_size, split_kv, pack_factor):
 diff --git a/python/fmha_sm100/sparse.py b/python/fmha_sm100/sparse.py
 index 7006fcd..9a09324 100644
 --- a/python/fmha_sm100/sparse.py
@@ -4420,576 +7054,3 @@ index 306b416..a564d47 100644
          out.copy_(result)
          return out, None
      return result, None
-diff --git a/python/fmha_sm100/csrc/fmha_sm100_params.h b/python/fmha_sm100/csrc/fmha_sm100_params.h
---- a/python/fmha_sm100/csrc/fmha_sm100_params.h
-+++ b/python/fmha_sm100/csrc/fmha_sm100_params.h
-@@ -1,4 +1,5 @@
- // SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
-+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
- // SPDX-License-Identifier: MIT
- 
- #pragma once
-@@ -54,6 +55,9 @@
-   int max_k_tiles;
-   int* kv_block_indexes_ptr;
-   int kv_block_num;
-+  int64_t kv_block_stride_n = 0;
-+  int64_t kv_block_stride_h = 0;
-+  int64_t kv_block_stride_b = 1;
-   int pack_factor = 1;
-   int h_r_original = 0;
-   int q_stride_n_original = 0;
-diff --git a/python/fmha_sm100/csrc/fmha_sm100_variant_run.cu.jinja b/python/fmha_sm100/csrc/fmha_sm100_variant_run.cu.jinja
---- a/python/fmha_sm100/csrc/fmha_sm100_variant_run.cu.jinja
-+++ b/python/fmha_sm100/csrc/fmha_sm100_variant_run.cu.jinja
-@@ -1,9 +1,11 @@
- // SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
-+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
- // SPDX-License-Identifier: MIT
- 
- // Auto-generated per-variant FMHA run binding: {{ variant_name }}
- #include "fmha_sm100_params.h"
- #include "tvm_ffi_utils.h"
-+#include <climits>
- #include <cmath>
- #include <cstdlib>
- 
-@@ -121,9 +123,25 @@
-   params.max_score_ptr = max_score_ptr;
-   params.max_k_tiles = static_cast<int>(max_k_tiles);
-   params.kv_block_indexes_ptr = kv_block_indexes_ptr;
--  params.kv_block_num = maybe_kv_block_indexes.has_value()
--                            ? static_cast<int>(maybe_kv_block_indexes.value().size(2))
--                            : 0;
-+  params.kv_block_num = 0;
-+  if (maybe_kv_block_indexes.has_value()) {
-+    auto const selector = maybe_kv_block_indexes.value();
-+    CHECK_CUDA(selector);
-+    CHECK_DEVICE(selector, q);
-+    CHECK_INPUT_TYPE(selector, dl_int32);
-+    CHECK_DIM(3, selector);
-+    TVM_FFI_ICHECK_EQ(selector.size(0), q.size(0));
-+    TVM_FFI_ICHECK_EQ(selector.size(1), num_kv_heads);
-+    TVM_FFI_ICHECK_GT(selector.size(2), 0);
-+    TVM_FFI_ICHECK_LE(selector.size(2), INT_MAX);
-+    for (int dim = 0; dim < 3; ++dim) {
-+      TVM_FFI_ICHECK_GE(selector.stride(dim), 0);
-+    }
-+    params.kv_block_num = static_cast<int>(selector.size(2));
-+    params.kv_block_stride_n = selector.stride(0);
-+    params.kv_block_stride_h = selector.stride(1);
-+    params.kv_block_stride_b = selector.stride(2);
-+  }
- 
-   params.pack_factor = static_cast<int>(pack_factor);
-   params.num_ctas = static_cast<int>(packed_work_range.size(0));
-@@ -187,10 +205,18 @@
-       ? static_cast<int>(maybe_max_score.value().size(0)
-                          * maybe_max_score.value().size(1)
-                          * maybe_max_score.value().size(2)) : 0;
--  params.gmem_bounds.kv_block_indexes_numel = maybe_kv_block_indexes.has_value()
--      ? static_cast<int>(maybe_kv_block_indexes.value().size(0)
--                         * maybe_kv_block_indexes.value().size(1)
--                         * maybe_kv_block_indexes.value().size(2)) : 0;
-+  // A sliced head-major view can span more storage than its logical numel.
-+  // TensorView::data_ptr() already includes the view's storage offset.
-+  params.gmem_bounds.kv_block_indexes_span = 0;
-+  if (maybe_kv_block_indexes.has_value()) {
-+    auto const selector = maybe_kv_block_indexes.value();
-+    if (selector.size(0) > 0 && selector.size(1) > 0) {
-+      params.gmem_bounds.kv_block_indexes_span =
-+          (selector.size(0) - 1) * params.kv_block_stride_n
-+          + (selector.size(1) - 1) * params.kv_block_stride_h
-+          + (selector.size(2) - 1) * params.kv_block_stride_b + 1;
-+    }
-+  }
-   params.gmem_bounds.split_kv_size = maybe_kv_tile_begin_indices.has_value()
-       ? static_cast<int>(maybe_kv_tile_begin_indices.value().size(0)) : 0;
-   params.gmem_bounds.qo_offsets_size = maybe_qo_offsets.has_value()
-diff --git a/python/fmha_sm100/csrc/fmha_sm100_inst.jinja b/python/fmha_sm100/csrc/fmha_sm100_inst.jinja
---- a/python/fmha_sm100/csrc/fmha_sm100_inst.jinja
-+++ b/python/fmha_sm100/csrc/fmha_sm100_inst.jinja
-@@ -1,4 +1,5 @@
- // SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
-+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
- // SPDX-License-Identifier: MIT
- 
- // Auto-generated FMHA variant: {{ variant_name }}
-@@ -28,12 +29,14 @@
- 
-   using ActiveMaskType = {% if pack_factor is defined and pack_factor > 1 %}PackedCausalMask<{{ pack_factor }}>{% else %}CausalMask{% endif %};
- 
--  return run_fmha_fwd<cutlass_type_in, cutlass_type_out, int32_t,
-+  auto run = [&](auto unit_selector_column) {
-+    return run_fmha_fwd<cutlass_type_in, cutlass_type_out, int32_t,
-                       TileShapeQK, TileShapePV, ActiveMaskType, FmhaThreadShape,
-                       /*IsSplitKV=*/{{ is_split_kv }},
-                       /*SingleSoftmaxWarpGroup=*/{{ single_wg }},
-                       {{ page_size }},
--                      cutlass::fmha::collective::SparseAttnMode::{{ sparse_mode }}>(
-+                      cutlass::fmha::collective::SparseAttnMode::{{ sparse_mode }},
-+                      decltype(unit_selector_column)::value>(
-       p.workspace_buffer_ptr,
-       static_cast<cutlass_type_in*>(p.q_ptr),
-       static_cast<cutlass_type_in*>(p.k_ptr),
-@@ -58,6 +61,7 @@
-       p.kv_indices_ptr, p.kv_page_indptr_ptr, p.total_page_num,
-       p.max_score_ptr, p.max_k_tiles,
-       p.kv_block_indexes_ptr, p.kv_block_num,
-+      p.kv_block_stride_n, p.kv_block_stride_h, p.kv_block_stride_b,
-       p.pack_factor, p.q_stride_n_original, p.q_stride_h_original, p.h_r_original,
-       flashinfer::PackGQAUnpackParams{p.max_score_direct_ptr, p.total_qo_len_orig,
-                                       p.o_direct_ptr, p.num_qo_heads_orig,
-@@ -67,4 +71,13 @@
- #endif
-                                       },
-       p.num_ctas);
-+  };
-+{% if dtype_in == "nv_bfloat16" and page_size > 0 and sparse_mode == "Sparse" %}
-+  // The selector layout is host metadata; capture the matching existing kernel
-+  // specialization without copying the selector or reading device values.
-+  if (p.kv_block_stride_b == 1) {
-+    return run(cute::true_type{});
-+  }
-+{% endif %}
-+  return run(cute::false_type{});
- }
-diff --git a/python/fmha_sm100/csrc/include/fmha_cutlass_sm100.cuh b/python/fmha_sm100/csrc/include/fmha_cutlass_sm100.cuh
---- a/python/fmha_sm100/csrc/include/fmha_cutlass_sm100.cuh
-+++ b/python/fmha_sm100/csrc/include/fmha_cutlass_sm100.cuh
-@@ -1,3 +1,4 @@
-+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
- /*
-  * Copyright (c) 2023 by FlashInfer team.
-  *
-@@ -57,7 +58,8 @@
-           bool SingleSoftmaxWarpGroup = false,
-           int KVPageSize = -1,
-           cutlass::fmha::collective::SparseAttnMode kSparseAttnMode =
--              cutlass::fmha::collective::SparseAttnMode::Off>
-+              cutlass::fmha::collective::SparseAttnMode::Off,
-+          bool UnitSelectorColumn = false>
- struct FwdRunner {
-   using Element = DTypeIn;
-   using ElementAccumulatorQK = float;
-@@ -89,7 +91,8 @@
- 
-   using Mainloop = cutlass::fmha::collective::Sm100FmhaFwdMainloopTmaWarpspecialized<
-       Element, ElementAccumulatorQK, ElementAccumulatorPV, TileShapeQK, TileShapePV, StrideQ,
--      StrideK, StrideV, ActiveMask, ThreadShape, IsSplitKV, KVPageSize, kSparseAttnMode>;
-+      StrideK, StrideV, ActiveMask, ThreadShape, IsSplitKV, KVPageSize, kSparseAttnMode,
-+      UnitSelectorColumn>;
-   using Epilogue = cutlass::fmha::collective::Sm100FmhaFwdEpilogueTmaWarpspecialized<
-       ElementOut, ElementAccumulatorPV, typename Mainloop::TileShapePV, NumQStages, IsSplitKV, bNeedOutput, kPackFactor>;
-   using Operation =
-@@ -126,6 +129,9 @@
-                          int max_k_tiles = 0,
-                          int* kv_block_indexes = nullptr,
-                          int kv_block_num = 0,
-+                         int64_t kv_block_stride_n = 0,
-+                         int64_t kv_block_stride_h = 0,
-+                         int64_t kv_block_stride_b = 1,
-                          int pack_factor = 1,
-                          int q_stride_n_original = 0,
-                          int q_stride_h_original = 0,
-@@ -223,11 +229,28 @@
-       if constexpr (IsSplitKV) {
-         arguments = {
-           {problem_shape,
--           {{q, layout_Q, k, layout_K, v, layout_V, kv_indices, kv_page_indptr, kv_block_indexes, kv_block_num,
--#ifdef FMHA_GMEM_BOUNDS_CHECK
--             pack_gqa.gmem_bounds.kv_page_indptr_size, pack_gqa.gmem_bounds.kv_indices_size, pack_gqa.gmem_bounds.kv_block_indexes_numel,
--#endif
--             pack_factor, q_stride_n_original, q_stride_h_original, h_r_original},
-+           {{.ptr_Q = q,
-+             .layout_Q = layout_Q,
-+             .ptr_K = k,
-+             .layout_K = layout_K,
-+             .ptr_V = v,
-+             .layout_V = layout_V,
-+             .kv_indices = kv_indices,
-+             .kv_page_indptr = kv_page_indptr,
-+             .kv_block_indexes = kv_block_indexes,
-+             .kv_block_num = kv_block_num,
-+             .kv_block_stride_n = kv_block_stride_n,
-+             .kv_block_stride_h = kv_block_stride_h,
-+             .kv_block_stride_b = kv_block_stride_b,
-+#ifdef FMHA_GMEM_BOUNDS_CHECK
-+             .kv_page_indptr_size = pack_gqa.gmem_bounds.kv_page_indptr_size,
-+             .kv_indices_size = pack_gqa.gmem_bounds.kv_indices_size,
-+             .kv_block_indexes_span = pack_gqa.gmem_bounds.kv_block_indexes_span,
-+#endif
-+             .pack_factor = pack_factor,
-+             .q_stride_n_original = q_stride_n_original,
-+             .q_stride_h_original = q_stride_h_original,
-+             .h_r_original = h_r_original},
-             sm_scale, q_scale, k_scale, v_scale, o_scale},
-            epi_args,
-            sched_args,
-@@ -244,11 +267,28 @@
-       } else {
-         arguments = {
-           problem_shape,
--          {{q, layout_Q, k, layout_K, v, layout_V, kv_indices, kv_page_indptr, kv_block_indexes, kv_block_num,
--#ifdef FMHA_GMEM_BOUNDS_CHECK
--            pack_gqa.gmem_bounds.kv_page_indptr_size, pack_gqa.gmem_bounds.kv_indices_size, pack_gqa.gmem_bounds.kv_block_indexes_numel,
--#endif
--            pack_factor, q_stride_n_original, q_stride_h_original, h_r_original},
-+          {{.ptr_Q = q,
-+             .layout_Q = layout_Q,
-+             .ptr_K = k,
-+             .layout_K = layout_K,
-+             .ptr_V = v,
-+             .layout_V = layout_V,
-+             .kv_indices = kv_indices,
-+             .kv_page_indptr = kv_page_indptr,
-+             .kv_block_indexes = kv_block_indexes,
-+             .kv_block_num = kv_block_num,
-+             .kv_block_stride_n = kv_block_stride_n,
-+             .kv_block_stride_h = kv_block_stride_h,
-+             .kv_block_stride_b = kv_block_stride_b,
-+#ifdef FMHA_GMEM_BOUNDS_CHECK
-+             .kv_page_indptr_size = pack_gqa.gmem_bounds.kv_page_indptr_size,
-+             .kv_indices_size = pack_gqa.gmem_bounds.kv_indices_size,
-+             .kv_block_indexes_span = pack_gqa.gmem_bounds.kv_block_indexes_span,
-+#endif
-+             .pack_factor = pack_factor,
-+             .q_stride_n_original = q_stride_n_original,
-+             .q_stride_h_original = q_stride_h_original,
-+             .h_r_original = h_r_original},
-            sm_scale, q_scale, k_scale, v_scale, o_scale},
-           epi_args,
-           sched_args,
-@@ -343,8 +383,28 @@
-       if constexpr (IsSplitKV) {
-         arguments = {
-           {problem_shape,
--           {{q, layout_Q, k, layout_K, v, layout_V, nullptr, nullptr, nullptr, 0,
--             pack_factor, q_stride_n_original, q_stride_h_original, h_r_original},
-+           {{.ptr_Q = q,
-+             .layout_Q = layout_Q,
-+             .ptr_K = k,
-+             .layout_K = layout_K,
-+             .ptr_V = v,
-+             .layout_V = layout_V,
-+             .kv_indices = nullptr,
-+             .kv_page_indptr = nullptr,
-+             .kv_block_indexes = nullptr,
-+             .kv_block_num = 0,
-+             .kv_block_stride_n = 0,
-+             .kv_block_stride_h = 0,
-+             .kv_block_stride_b = 1,
-+#ifdef FMHA_GMEM_BOUNDS_CHECK
-+             .kv_page_indptr_size = 0,
-+             .kv_indices_size = 0,
-+             .kv_block_indexes_span = 0,
-+#endif
-+             .pack_factor = pack_factor,
-+             .q_stride_n_original = q_stride_n_original,
-+             .q_stride_h_original = q_stride_h_original,
-+             .h_r_original = h_r_original},
-             sm_scale, q_scale, k_scale, v_scale, o_scale},
-            epi_args,
-            sched_args,
-@@ -361,8 +421,28 @@
-       } else {
-         arguments = {
-           problem_shape,
--          {{q, layout_Q, k, layout_K, v, layout_V, nullptr, nullptr, nullptr, 0,
--            pack_factor, q_stride_n_original, q_stride_h_original, h_r_original},
-+          {{.ptr_Q = q,
-+             .layout_Q = layout_Q,
-+             .ptr_K = k,
-+             .layout_K = layout_K,
-+             .ptr_V = v,
-+             .layout_V = layout_V,
-+             .kv_indices = nullptr,
-+             .kv_page_indptr = nullptr,
-+             .kv_block_indexes = nullptr,
-+             .kv_block_num = 0,
-+             .kv_block_stride_n = 0,
-+             .kv_block_stride_h = 0,
-+             .kv_block_stride_b = 1,
-+#ifdef FMHA_GMEM_BOUNDS_CHECK
-+             .kv_page_indptr_size = 0,
-+             .kv_indices_size = 0,
-+             .kv_block_indexes_span = 0,
-+#endif
-+             .pack_factor = pack_factor,
-+             .q_stride_n_original = q_stride_n_original,
-+             .q_stride_h_original = q_stride_h_original,
-+             .h_r_original = h_r_original},
-            sm_scale, q_scale, k_scale, v_scale, o_scale},
-           epi_args,
-           sched_args,
-@@ -412,7 +492,8 @@
-           bool SingleSoftmaxWarpGroup = false,
-           int KVPageSize = -1,
-           cutlass::fmha::collective::SparseAttnMode kSparseAttnMode =
--              cutlass::fmha::collective::SparseAttnMode::Off>
-+              cutlass::fmha::collective::SparseAttnMode::Off,
-+          bool UnitSelectorColumn = false>
- cudaError_t run_fmha_fwd(void* workspace_buffer, DTypeIn* q, DTypeIn* k, DTypeIn* v,
-                          IdType* qo_segment_lens, IdType* kv_segment_lens,
-                          IdType* qo_segment_offsets, IdType* kv_segment_offsets,
-@@ -436,6 +517,9 @@
-                          int max_k_tiles = 0,
-                          int* kv_block_indexes = nullptr,
-                          int kv_block_num = 0,
-+                         int64_t kv_block_stride_n = 0,
-+                         int64_t kv_block_stride_h = 0,
-+                         int64_t kv_block_stride_b = 1,
-                          int pack_factor = 1,
-                          int q_stride_n_original = 0,
-                          int q_stride_h_original = 0,
-@@ -443,7 +527,8 @@
-                          PackGQAUnpackParams pack_gqa = {},
-                          int num_ctas = 0) {
-   return FwdRunner<DTypeIn, DTypeOut, IdType, TileShapeQK, TileShapePV, ActiveMask,
--                   ThreadShape, IsSplitKV, SingleSoftmaxWarpGroup, KVPageSize, kSparseAttnMode>::run(
-+                   ThreadShape, IsSplitKV, SingleSoftmaxWarpGroup, KVPageSize, kSparseAttnMode,
-+                   UnitSelectorColumn>::run(
-       workspace_buffer, q, k, v, qo_segment_lens, kv_segment_lens,
-       qo_segment_offsets, kv_segment_offsets, packed_work_range,
-       packed_work_info, o, mask_mode_code, sm_scale,
-@@ -455,6 +540,7 @@
-       kv_indices, kv_page_indptr, total_page_num,
-       maybe_max_score, max_k_tiles,
-       kv_block_indexes, kv_block_num,
-+      kv_block_stride_n, kv_block_stride_h, kv_block_stride_b,
-       pack_factor, q_stride_n_original, q_stride_h_original, h_r_original,
-       pack_gqa, num_ctas);
- }
-diff --git a/python/fmha_sm100/csrc/include/sm100_fmha_load_tma_warpspecialized.hpp b/python/fmha_sm100/csrc/include/sm100_fmha_load_tma_warpspecialized.hpp
---- a/python/fmha_sm100/csrc/include/sm100_fmha_load_tma_warpspecialized.hpp
-+++ b/python/fmha_sm100/csrc/include/sm100_fmha_load_tma_warpspecialized.hpp
-@@ -1,5 +1,5 @@
- /***************************************************************************************************
-- * Copyright (c) 2024 - 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-+ * Copyright (c) 2024 - 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-  * SPDX-License-Identifier: BSD-3-Clause
-  *
-  * Redistribution and use in source and binary forms, with or without
-@@ -64,7 +64,8 @@
- template <class Element, class CollectiveMmaQK, class CollectiveMmaPV, class SmemLayoutQ,
-           class SmemLayoutK, class SmemLayoutV, class TensorStorage, class PipelineQ,
-           class PipelineKV, class Mask, class TileShape, int KVPageSize = -1,
--          SparseAttnMode kSparseAttnMode = SparseAttnMode::Off>
-+          SparseAttnMode kSparseAttnMode = SparseAttnMode::Off,
-+          bool UnitSelectorColumn = false>
- struct Sm100FmhaLoadTmaWarpspecialized {
-   // P0: OnlyScore mode never reads V — skip every V slot in the KV pipeline.
-   // mma() gates the matching wait_V/release_V under `kNeedOutput` so producer
-@@ -112,10 +113,13 @@
-     int* kv_page_indptr = nullptr;
-     int* kv_block_indexes = nullptr;
-     int kv_block_num = 0;
-+    int64_t kv_block_stride_n = 0;
-+    int64_t kv_block_stride_h = 0;
-+    int64_t kv_block_stride_b = 1;
- #ifdef FMHA_GMEM_BOUNDS_CHECK
-     int kv_page_indptr_size = 0;
-     int kv_indices_size = 0;
--    int kv_block_indexes_numel = 0;
-+    int64_t kv_block_indexes_span = 0;
- #endif
-     int pack_factor = 1;
-     int q_stride_n_original = 0;
-@@ -148,10 +152,13 @@
-     int* kv_page_indptr = nullptr;
-     int* kv_block_indexes = nullptr;
-     int kv_block_num = 0;
-+    int64_t kv_block_stride_n = 0;
-+    int64_t kv_block_stride_h = 0;
-+    int64_t kv_block_stride_b = 1;
- #ifdef FMHA_GMEM_BOUNDS_CHECK
-     int kv_page_indptr_size = 0;
-     int kv_indices_size = 0;
--    int kv_block_indexes_numel = 0;
-+    int64_t kv_block_indexes_span = 0;
- #endif
-     const Element* ptr_Q_orig = nullptr;
-     int q_stride_n_orig = 0;
-@@ -218,8 +225,9 @@
- 
-     Params p{tma_load_Q, layout_Q, tma_load_K, layout_K, tma_load_V, layout_V,
-                   args.kv_indices, args.kv_page_indptr, args.kv_block_indexes, args.kv_block_num,
-+                  args.kv_block_stride_n, args.kv_block_stride_h, args.kv_block_stride_b,
- #ifdef FMHA_GMEM_BOUNDS_CHECK
--                  args.kv_page_indptr_size, args.kv_indices_size, args.kv_block_indexes_numel,
-+                  args.kv_page_indptr_size, args.kv_indices_size, args.kv_block_indexes_span,
- #endif
-                   args.ptr_Q, args.q_stride_n_original, args.q_stride_h_original, args.h_r_original,
-                   tma_desc_q_pack};
-@@ -525,11 +533,10 @@
-       constexpr int effective_tile_kv = get<1>(TileShapeQK{});
-       constexpr int tiles_per_page = KVPageSize / effective_tile_kv;
- 
--      int kv_block_offset = 0;
-+      int64_t kv_block_offset = 0;
-       if constexpr (kSparseAttnMode == SparseAttnMode::Sparse) {
--        int num_kv_heads_val = get<3, 0, 1>(params_problem_shape);
--        kv_block_offset = batch_idx * num_kv_heads_val * params.kv_block_num
--                        + kv_head_idx * params.kv_block_num;
-+        kv_block_offset = batch_idx * params.kv_block_stride_n
-+                        + kv_head_idx * params.kv_block_stride_h;
-       }
- 
-       // Keep full 4D tensor (page_size, D, H_kv, P) — select head at copy time
-@@ -549,7 +556,12 @@
-         int page_for_lookup;
-         if constexpr (kSparseAttnMode == SparseAttnMode::Sparse) {
-           int sparse_idx = (logical_page < params.kv_block_num)
--              ? __ldg(&params.kv_block_indexes[kv_block_offset + logical_page])
-+              ? (UnitSelectorColumn
-+                    ? KV_BLOCK_INDEX_LOAD(params.kv_block_indexes,
-+                          kv_block_offset + logical_page, params.kv_block_indexes_span)
-+                    : KV_BLOCK_INDEX_LOAD(params.kv_block_indexes,
-+                          kv_block_offset + logical_page * params.kv_block_stride_b,
-+                          params.kv_block_indexes_span))
-               : -1;
-           page_for_lookup = (sparse_idx >= 0) ? sparse_idx : 0;
-         } else {
-@@ -573,7 +585,12 @@
-         int page_for_lookup;
-         if constexpr (kSparseAttnMode == SparseAttnMode::Sparse) {
-           int sparse_idx = (logical_page < params.kv_block_num)
--              ? __ldg(&params.kv_block_indexes[kv_block_offset + logical_page])
-+              ? (UnitSelectorColumn
-+                    ? KV_BLOCK_INDEX_LOAD(params.kv_block_indexes,
-+                          kv_block_offset + logical_page, params.kv_block_indexes_span)
-+                    : KV_BLOCK_INDEX_LOAD(params.kv_block_indexes,
-+                          kv_block_offset + logical_page * params.kv_block_stride_b,
-+                          params.kv_block_indexes_span))
-               : -1;
-           page_for_lookup = (sparse_idx >= 0) ? sparse_idx : 0;
-         } else {
-diff --git a/python/fmha_sm100/csrc/include/sm100_fmha_fwd_mainloop_tma_warpspecialized.hpp b/python/fmha_sm100/csrc/include/sm100_fmha_fwd_mainloop_tma_warpspecialized.hpp
---- a/python/fmha_sm100/csrc/include/sm100_fmha_fwd_mainloop_tma_warpspecialized.hpp
-+++ b/python/fmha_sm100/csrc/include/sm100_fmha_fwd_mainloop_tma_warpspecialized.hpp
-@@ -1,5 +1,5 @@
- /***************************************************************************************************
-- * Copyright (c) 2024 - 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-+ * Copyright (c) 2024 - 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-  * SPDX-License-Identifier: BSD-3-Clause
-  *
-  * Redistribution and use in source and binary forms, with or without
-@@ -158,7 +158,8 @@
-           class ThreadShape = Shape<_2, _1, _1>,
-           bool IsSplitKV_ = false,
-           int KVPageSize_ = -1,
--          SparseAttnMode kSparseAttnMode = SparseAttnMode::Off>
-+          SparseAttnMode kSparseAttnMode = SparseAttnMode::Off,
-+          bool UnitSelectorColumn = false>
- struct Sm100FmhaFwdMainloopTmaWarpspecialized {
-   static constexpr bool IsSplitKV = IsSplitKV_;
-   static constexpr int KVPageSize = KVPageSize_;
-@@ -376,7 +377,7 @@
-   using Load = Sm100FmhaLoadTmaWarpspecialized<Element, CollectiveMmaQK, CollectiveMmaPV,
-                                                SmemLayoutQ, SmemLayoutK, SmemLayoutV, TensorStorage,
-                                                PipelineQ, PipelineKV, Mask, TileShape, KVPageSize,
--                                               kSparseAttnMode>;
-+                                               kSparseAttnMode, UnitSelectorColumn>;
-   using LayoutQ = typename Load::LayoutQ;
-   using LayoutK = typename Load::LayoutK;
-   using LayoutV = typename Load::LayoutV;
-@@ -1131,14 +1132,13 @@
-     int skip_count, real_masked_count, unmasked_count;
-     int effective_end;
- 
--    int kbi_off_s = 0;
-+    int64_t kbi_off_s = 0;
-     if constexpr (kNeedSparse) {
-       int h_r_s = get<3, 0, 0>(problem_shape);
--      int num_kv_heads_s = get<3, 0, 1>(problem_shape);
-       int kv_head_idx_s = get<2, 0>(blk_coord) / h_r_s;
-       int batch_idx_s = get<2, 1>(blk_coord);
--      kbi_off_s = batch_idx_s * num_kv_heads_s * params.load.kv_block_num
--                + kv_head_idx_s * params.load.kv_block_num;
-+      kbi_off_s = batch_idx_s * params.load.kv_block_stride_n
-+                + kv_head_idx_s * params.load.kv_block_stride_h;
-     }
- 
-     if constexpr (kNeedSparse) {
-@@ -1154,7 +1154,12 @@
- 
-       // Count padding blocks (backward scan for -1)
-       int valid_blks = params.load.kv_block_num;
--      while (valid_blks > 0 && __ldg(&params.load.kv_block_indexes[kbi_off_s + valid_blks - 1]) < 0)
-+      while (valid_blks > 0 && (UnitSelectorColumn
-+          ? KV_BLOCK_INDEX_LOAD(params.load.kv_block_indexes,
-+                kbi_off_s + valid_blks - 1, params.load.kv_block_indexes_span)
-+          : KV_BLOCK_INDEX_LOAD(params.load.kv_block_indexes,
-+                kbi_off_s + (valid_blks - 1) * params.load.kv_block_stride_b,
-+                params.load.kv_block_indexes_span)) < 0)
-         valid_blks--;
- 
-       int valid_tiles = (valid_blks * KVPageSize + full_tile_kv - 1) / full_tile_kv;
-@@ -1223,7 +1228,12 @@
-           cS = domain_offset(make_coord(q_s, INT_MAX / 2), cS_base);
-           return false;
-         }
--        int pos = __ldg(&params.load.kv_block_indexes[kbi_off_s + page_idx]);
-+        int pos = UnitSelectorColumn
-+            ? KV_BLOCK_INDEX_LOAD(params.load.kv_block_indexes,
-+                  kbi_off_s + page_idx, params.load.kv_block_indexes_span)
-+            : KV_BLOCK_INDEX_LOAD(params.load.kv_block_indexes,
-+                  kbi_off_s + page_idx * params.load.kv_block_stride_b,
-+                  params.load.kv_block_indexes_span);
-         if (pos < 0) {
-           cS = domain_offset(make_coord(q_s, INT_MAX / 2), cS_base);
-           return false;
-diff --git a/python/fmha_sm100/csrc/gmem_bounds_check.h b/python/fmha_sm100/csrc/gmem_bounds_check.h
---- a/python/fmha_sm100/csrc/gmem_bounds_check.h
-+++ b/python/fmha_sm100/csrc/gmem_bounds_check.h
-@@ -1,4 +1,5 @@
- // SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
-+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
- // SPDX-License-Identifier: MIT
- 
- #pragma once
-@@ -9,6 +10,7 @@
- #ifdef FMHA_GMEM_BOUNDS_CHECK
- 
- #include <cstdio>
-+#include <cstdint>
- 
- struct GmemBounds {
-   int packed_work_range_size;
-@@ -19,17 +21,17 @@
-   int kv_page_indptr_size;
-   int kv_indices_size;
-   int max_score_numel;
--  int kv_block_indexes_numel;
-+  int64_t kv_block_indexes_span;
-   int split_kv_size;
-   int qo_offsets_size;
- };
- 
- template <typename T>
- __device__ __forceinline__ T gmem_load_checked(
--    const T* base, int idx, int size, const char* name) {
-+    const T* base, int64_t idx, int64_t size, const char* name) {
-   if (__builtin_expect(idx < 0 || idx >= size, 0)) {
--    printf("GMEM-OOB-LOAD [%s] idx=%d size=%d blk=(%d,%d,%d) thr=%d\n",
--           name, idx, size, blockIdx.x, blockIdx.y, blockIdx.z, threadIdx.x);
-+    printf("GMEM-OOB-LOAD [%s] idx=%lld size=%lld blk=(%d,%d,%d) thr=%d\n",
-+           name, static_cast<long long>(idx), static_cast<long long>(size), blockIdx.x, blockIdx.y, blockIdx.z, threadIdx.x);
-     return T(0);
-   }
-   return base[idx];
-@@ -82,6 +84,7 @@
- // Macros for paged KV reads
- #define KV_INDPTR_LOAD(ptr, idx, sz)  gmem_load_checked((ptr), (idx), (sz), "kv_page_indptr")
- #define KV_INDICES_LOAD(ptr, idx, sz) gmem_load_checked((ptr), (idx), (sz), "kv_indices")
-+#define KV_BLOCK_INDEX_LOAD(ptr, idx, sz) gmem_load_checked((ptr), (idx), (sz), "kv_block_indexes")
- 
- #else  // FMHA_GMEM_BOUNDS_CHECK not defined
- 
-@@ -93,5 +96,6 @@
- #define SEG_LEN_LOAD(vl, idx, sz)  (vl).segment_lens[(idx)]
- #define KV_INDPTR_LOAD(ptr, idx, sz)  __ldg(&(ptr)[(idx)])
- #define KV_INDICES_LOAD(ptr, idx, sz) __ldg(&(ptr)[(idx)])
-+#define KV_BLOCK_INDEX_LOAD(ptr, idx, sz) __ldg(&(ptr)[(idx)])
- 
- #endif  // FMHA_GMEM_BOUNDS_CHECK

@@ -516,6 +516,28 @@ def _register_fake():
                 packed.new_empty((num_tokens, num_heads_index, head_dim),
                                  dtype=torch.float8_e4m3fn))
 
+    # Here, not in modeling_v2's minimax_m3/fake_ops.py: the built-in modeling_minimaxm3 also calls this op and does not import fake_ops.
+    @torch.library.register_fake(
+        "trtllm::minimax_m3_ctx_residual_rmsnorm_mxfp8")
+    def _(inter, residual, weight, eps, write_norm, fp4_global_scale=None):
+        """(norm_out, mxfp8, swizzled UE8M0 scales, fp4, fp4 linear scales); the fp4 pair and an unwritten norm_out
+        are empty."""
+        del residual, weight, eps
+        hidden = inter.shape[-1]
+        rows = inter.numel() // hidden
+        norm_out = torch.empty_like(inter) if write_norm else inter.new_empty(
+            (0, ))
+        mxfp8 = inter.new_empty(inter.shape, dtype=torch.float8_e4m3fn)
+        sf_size = (rows + 127) // 128 * 128 * ((hidden // 32 + 3) // 4 * 4)
+        sf = inter.new_empty((sf_size, ), dtype=torch.uint8)
+        if fp4_global_scale is None:
+            return norm_out, mxfp8, sf, inter.new_empty((0, )), inter.new_empty(
+                (0, ))
+        fp4 = inter.new_empty((*inter.shape[:-1], hidden // 2),
+                              dtype=torch.uint8)
+        fp4_sf = inter.new_empty((rows * (hidden // 16), ), dtype=torch.uint8)
+        return norm_out, mxfp8, sf, fp4, fp4_sf
+
     @torch.library.register_fake("trtllm::userbuffers_allreduce_finalize")
     def _(input, force_applying_finalize):
         return torch.empty_like(input)

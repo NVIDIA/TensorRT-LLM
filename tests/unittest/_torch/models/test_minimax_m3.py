@@ -23,7 +23,7 @@ from __future__ import annotations
 import json
 import os
 from types import SimpleNamespace
-from unittest.mock import Mock, create_autospec
+from unittest.mock import Mock, call, create_autospec
 
 import pytest
 import torch
@@ -86,13 +86,14 @@ from tensorrt_llm._torch.models.modeling_minimaxm3 import (
 )
 from tensorrt_llm._torch.models.modeling_speculative import SpecDecOneEngineForCausalLM
 from tensorrt_llm._torch.models.modeling_utils import _load_weights_impl_v2
-from tensorrt_llm._torch.modules.linear import _load_kv_cache_scales
+from tensorrt_llm._torch.modules.linear import MXFP8LinearMethod, _load_kv_cache_scales
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm._torch.moe.fused_moe.interface import MoESchedulerKind
 from tensorrt_llm._torch.moe.fused_moe.routing import (
     MiniMaxM2MoeRoutingMethod,
     MiniMaxM3MoeRoutingMethod,
 )
+from tensorrt_llm._torch.moe.fused_moe.trtllm_gen.trtllm_nvfp4 import TrtllmTrtllmGenNvfp4Impl
 from tensorrt_llm._torch.utils import AuxStreamType, EventType
 from tensorrt_llm.llmapi import MiniMaxM3SparseAttentionConfig, RocketSparseAttentionConfig
 from tensorrt_llm.mapping import Mapping
@@ -219,7 +220,7 @@ def test_nvfp4_reload_preserves_attention_scale_storage(
 
 
 class _M3CompositionGate(nn.Module):
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor, generation_only: bool = False) -> torch.Tensor:
         return hidden_states
 
 
@@ -283,6 +284,7 @@ def test_minimax_m3_moe_reduces_only_local_terms(
     moe.allreduce = _M3CompositionAllReduce()
     moe.event_dict = {EventType.Main: None, EventType.MoeShared: None}
     moe.aux_stream = None
+    moe._prequantized_fp4 = None
 
     hidden_states = torch.ones((2, 4))
     output = moe(hidden_states, SimpleNamespace(all_rank_num_tokens=None))
@@ -528,7 +530,7 @@ def test_eagle_capture_precedes_next_layer_norm() -> None:
 
     layer = SimpleNamespace(
         layer_idx=25,
-        _apply_pre_feed_forward_norm=lambda hidden, residual: (hidden + 1, residual + 2),
+        _apply_pre_feed_forward_norm=lambda hidden, residual, moe=None: (hidden + 1, residual + 2),
         block_sparse_moe=lambda hidden, unused_metadata, **unused_kwargs: hidden + 3,
         _feed_forward_all_reduce_params=lambda: None,
         _apply_next_layer_layernorm=lambda hidden, residual: (hidden + 10, residual + 20),
@@ -738,7 +740,7 @@ def test_piecewise_captures_horizontal_producer_before_attention(
         layer_idx=3,
         layer_idx_str="3",
         qkv_proj=Mock(return_value=packed),
-        _fused_fp8_qkv_indexer_norm_rope_kv_insert=Mock(return_value=(q, idx_q)),
+        _fused_fp8_qkv_indexer_norm_rope_kv_insert=Mock(side_effect=[None, (q, idx_q)]),
         _forward_attention_core=Mock(return_value=output),
         o_proj=lambda output, all_reduce_params: output,
     )
@@ -753,9 +755,12 @@ def test_piecewise_captures_horizontal_producer_before_attention(
     result = MiniMaxM3Attention._sparse_forward(layer, positions, hidden, metadata)
     assert result is output
     layer.qkv_proj.assert_called_once_with(hidden)
-    layer._fused_fp8_qkv_indexer_norm_rope_kv_insert.assert_called_once_with(
-        packed, positions, metadata, cache_tensors=(kv_cache, index_cache, scale_cache, slots)
-    )
+    cache_tensors = (kv_cache, index_cache, scale_cache, slots)
+    # The fused QKV GEMM + producer is tried first on hidden_states; it declines here, so the packed projection runs.
+    assert layer._fused_fp8_qkv_indexer_norm_rope_kv_insert.call_args_list == [
+        call(None, positions, metadata, cache_tensors=cache_tensors, hidden_states=hidden),
+        call(packed, positions, metadata, cache_tensors=cache_tensors),
+    ]
     layer._forward_attention_core.assert_called_once_with(q, None, None, idx_q, None, metadata)
 
 
@@ -782,7 +787,8 @@ def test_piecewise_captured_producer_rejects_unavailable_fusion(
             "3",
         )
     assert str(exc.value) == "MiniMax-M3 piecewise graph requires the fused sparse QKV producer."
-    layer._fused_fp8_qkv_indexer_norm_rope_kv_insert.assert_called_once()
+    # Tried on hidden_states (fused QKV GEMM + producer) and on the packed projection; both decline.
+    assert layer._fused_fp8_qkv_indexer_norm_rope_kv_insert.call_count == 2
 
 
 @pytest.mark.cpu_only
@@ -801,8 +807,11 @@ def test_piecewise_captured_producer_declares_cache_mutations(
         metadata: object,
         *,
         cache_tensors: tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor],
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        hidden_states: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
         """Emulate native cache writes using only the explicit tensor arguments."""
+        if packed is None:
+            return None  # no fused QKV GEMM + producer here: the op falls back to the packed projection
         kv_cache, index_cache, scale_cache, slots = cache_tensors
         # Deliberately use only the explicit caches, not the runtime metadata.
         valid = slots >= 0
@@ -942,6 +951,7 @@ def test_piecewise_unfused_indexer_keeps_cache_write_eager(monkeypatch: pytest.M
         aux_stream=None,
         _forward_attention_core=Mock(return_value=torch.empty((4, 128), dtype=torch.bfloat16)),
         o_proj=lambda output, all_reduce_params: output,
+        _core_then_o_proj=lambda core, all_reduce_params, site, padded=False: core(),
     )
     monkeypatch.setattr(modeling_minimaxm3, "is_torch_compiling", lambda: True)
     monkeypatch.setattr(
@@ -2858,3 +2868,166 @@ def test_minimax_m3_dense_backend_library_order(monkeypatch, libraries, availabl
             )
     kernel.forward.assert_called_once()
     torch.testing.assert_close(output, q)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "bcg_p5a, qkv_fused, rows, expected",
+    [
+        (True, True, 1024, False),
+        (True, True, 1025, True),
+        (True, True, 1536, True),
+        (True, True, 2048, True),
+        (False, True, 2048, False),
+        (True, False, 2048, False),
+    ],
+)
+def test_bcg_bucket_takes_eager_qkv(
+    monkeypatch, bcg_p5a: bool, qkv_fused: bool, rows: int, expected: bool
+) -> None:
+    # Breakable buckets above the fused-QKV row floor run the eager path's QKV in an eager break (bitwise the eager
+    # step); TRTLLM_CTX_BCG_P5A=0 or TRTLLM_CTX_QKV_FUSED=0 keeps the captured stock projection.
+    monkeypatch.setattr(modeling_minimaxm3, "_CTX_BCG_P5A", bcg_p5a)
+    monkeypatch.setattr(modeling_minimaxm3, "_CTX_QKV_FUSED", qkv_fused)
+    monkeypatch.setattr(modeling_minimaxm3, "get_sm_version", lambda: 107)
+    assert modeling_minimaxm3._bcg_bucket_takes_eager_qkv(rows) is expected
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("sm", [90, 100, 103, 110])
+def test_bcg_bucket_keeps_captured_qkv_off_rubin(monkeypatch, sm: int) -> None:
+    # Off SM107 the fused QKV GEMM never engages, so breakable buckets keep the captured stock projection.
+    monkeypatch.setattr(modeling_minimaxm3, "_CTX_BCG_P5A", True)
+    monkeypatch.setattr(modeling_minimaxm3, "_CTX_QKV_FUSED", True)
+    monkeypatch.setattr(modeling_minimaxm3, "get_sm_version", lambda: sm)
+    assert not modeling_minimaxm3._bcg_bucket_takes_eager_qkv(2048)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("rows", [1, 1023, 1024, 1025, 2048, 16384])
+def test_fused_qkv_rows_agree_between_eager_and_breakable(monkeypatch, rows: int) -> None:
+    # A breakable bucket runs the eager QKV exactly when an eager step of the same rows takes the fused QKV GEMM +
+    # producer, so a captured step is bitwise the eager one at every row count, including the 1024-row boundary.
+    monkeypatch.setattr(modeling_minimaxm3, "_CTX_BCG_P5A", True)
+    monkeypatch.setattr(modeling_minimaxm3, "_CTX_QKV_FUSED", True)
+    monkeypatch.setattr(modeling_minimaxm3, "get_sm_version", lambda: 107)
+    fused = modeling_minimaxm3._ctx_qkv_fused_takes_rows(rows)
+    assert modeling_minimaxm3._bcg_bucket_takes_eager_qkv(rows) is fused
+    assert fused is (rows > 1024)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("sm, expected", [(107, True), (103, False), (100, False), (90, False)])
+def test_swiglu_mxfp8_engages_on_sm107_only(monkeypatch, sm: int, expected: bool) -> None:
+    # The fused SwiGLU + MXFP8 quantize is SM107-only; other architectures keep the stock activation and quantize.
+    monkeypatch.setattr(modeling_minimaxm3, "_CTX_SWIGLU_MXFP8", True)
+    monkeypatch.setattr(modeling_minimaxm3, "get_sm_version", lambda: sm)
+    monkeypatch.setattr(modeling_minimaxm3, "ctx_eager_only", lambda: True)
+    method = MXFP8LinearMethod.__new__(MXFP8LinearMethod)
+    method.use_cutlass = True
+    mlp = SimpleNamespace(
+        activation=torch.nn.functional.silu, down_proj=SimpleNamespace(quant_method=method)
+    )
+    x = torch.zeros((modeling_minimaxm3._CTX_NORM_MXFP8_MIN_ROWS, 3072), dtype=torch.bfloat16)
+    assert modeling_minimaxm3._SwigluOaiMLP._swiglu_mxfp8_eligible(mlp, x, False) is expected
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("sm, expected", [(107, True), (100, False), (103, False), (90, False)])
+def test_shared_fold_into_trtllm_gen_finalize_is_sm107_only(
+    monkeypatch, sm: int, expected: bool
+) -> None:
+    # An otherwise eligible TRTLLM-gen NVFP4 MoE: the fold engages on SM107 (positive control) and, elsewhere, the
+    # shared expert keeps its separate add after the finalize.
+    monkeypatch.setattr(modeling_minimaxm3, "_FOLD_SHARED_INTO_FINALIZE", True)
+    monkeypatch.setattr(modeling_minimaxm3, "get_sm_version", lambda: sm)
+    monkeypatch.setattr(modeling_minimaxm3, "ctx_eager_only", lambda: True)
+    hidden = 64
+    backend = TrtllmTrtllmGenNvfp4Impl.__new__(TrtllmTrtllmGenNvfp4Impl)
+    backend.supports_unfinalized_output = lambda: True
+    backend._routes_outside_the_kernel = lambda: False
+    backend.w3_w1_weight = torch.empty((4, 2 * hidden, hidden // 2), dtype=torch.uint8)
+    experts = SimpleNamespace(backend=backend, moe_max_num_tokens=16)
+    block = SimpleNamespace(
+        shared_experts=object(), experts=experts, routed_output_is_global=False, hidden_dim=hidden
+    )
+    x = torch.zeros((8, hidden), dtype=torch.bfloat16)
+    assert modeling_minimaxm3.MiniMaxM3MoE.fold_shared_ok(block, x, None) is expected
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("sm, hidden", [(103, 3072), (100, 3072), (107, 384), (107, 16384)])
+def test_ctx_boundary_norm_declines_off_rubin_and_off_geometry(
+    monkeypatch, sm: int, hidden: int
+) -> None:
+    # The fused boundary norm + MXFP8 kernel is SM107-only and needs whole 256-element groups in at most 1024
+    # threads; anything else keeps the stock AllReduce + RMSNorm (None) before touching the layer.
+    monkeypatch.setattr(modeling_minimaxm3, "_CTX_NORM_MXFP8", True)
+    monkeypatch.setattr(modeling_minimaxm3, "get_sm_version", lambda: sm)
+    monkeypatch.setattr(modeling_minimaxm3, "ctx_eager_only", lambda: True)
+    layer = SimpleNamespace(allreduce=Mock(side_effect=AssertionError("fused boundary norm ran")))
+    hidden_states = torch.zeros(
+        (modeling_minimaxm3._CTX_NORM_MXFP8_MIN_ROWS, hidden), dtype=torch.bfloat16
+    )
+    norm = SimpleNamespace(weight=torch.ones(hidden, dtype=torch.bfloat16), variance_epsilon=1e-6)
+    assert (
+        modeling_minimaxm3.MiniMaxM3DecoderLayer._reduce_norm_mxfp8(
+            layer, hidden_states, hidden_states, norm
+        )
+        is None
+    )
+
+
+@pytest.mark.skipif(not _has_cuda(), reason="the embedding gather is a Triton kernel")
+def test_embedding_gather_matches_f_embedding_for_any_id_layout() -> None:
+    # The fused gather equals F.embedding with out-of-vocabulary rows zeroed, for contiguous, 2-D and strided ids.
+    torch.manual_seed(0)
+    vocab, hidden = 64, 1536
+    weight = torch.randn(vocab, hidden, dtype=torch.bfloat16, device="cuda")
+    base = torch.tensor([1, 5, -1, 7, vocab, 3, 63, 0], dtype=torch.int32, device="cuda")
+
+    def reference(ids: torch.Tensor) -> torch.Tensor:
+        valid = (ids >= 0) & (ids < vocab)
+        out = torch.nn.functional.embedding(torch.where(valid, ids, 0).long(), weight)
+        return out.masked_fill(~valid.unsqueeze(-1), 0)
+
+    for ids in (base, base.view(2, 4), base[::2], base.view(2, 4)[:, 1::2]):
+        out = modeling_minimaxm3.minimax_m3_embedding_gather(ids, weight)
+        assert out.shape == (*ids.shape, hidden)
+        assert torch.equal(out, reference(ids))
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "use_dp, comm, folds",
+    [(False, None, True), (True, None, False), (False, object(), False)],
+    ids=["local_tokens", "attention_dp", "moe_communication"],
+)
+def test_cutedsl_shared_fold_only_without_token_dispatch(monkeypatch, use_dp, comm, folds) -> None:
+    # With attention DP or MoE communication the finalize rows can be other ranks' tokens, so the shared output of
+    # this rank's tokens must not be folded into them.
+    monkeypatch.setattr(modeling_minimaxm3, "_FOLD_SHARED_INTO_FINALIZE", True)
+    monkeypatch.setattr(modeling_minimaxm3, "_fold_shared_backend", lambda experts: True)
+    monkeypatch.setattr(modeling_minimaxm3, "ctx_eager_only", lambda: True)
+    moe = SimpleNamespace(
+        experts=SimpleNamespace(comm=comm),
+        aux_stream=object(),
+        routed_output_is_global=False,
+        use_dp=use_dp,
+    )
+    assert modeling_minimaxm3.MiniMaxM3MoE.cutedsl_fold_ok(moe) is folds
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("tuning", [False, True])
+def test_ctx_qkv_fused_skips_autotune_pass(monkeypatch, tuning: bool) -> None:
+    # The fused QKV producer stays out of the AutoTuner warmup pass, so the stock MXFP8 QKV GEMM profiles its shape
+    # for the steps the producer does not take.
+    from tensorrt_llm._torch.autotuner import AutoTuner
+    from tensorrt_llm._torch.models import modeling_minimaxm3 as m3
+
+    monkeypatch.setattr(AutoTuner.get(), "is_tuning_mode", tuning)
+    monkeypatch.setattr(m3, "_CTX_QKV_FUSED_YIELD_LOGGED", False)
+    assert m3._autotuner_tuning() is tuning
+    # The yield is logged once per process, and only when it happens.
+    assert m3._CTX_QKV_FUSED_YIELD_LOGGED is tuning

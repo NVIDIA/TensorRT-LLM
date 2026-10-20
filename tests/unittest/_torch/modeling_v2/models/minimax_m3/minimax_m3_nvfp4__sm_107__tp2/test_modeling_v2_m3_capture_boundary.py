@@ -20,6 +20,12 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_
 LAYERS = 4
 
 
+class _Rows(tuple):
+    """A tagged stand-in activation that has the row count the layer reads."""
+
+    shape = (2,)
+
+
 class _Spec:
     def __init__(self, layers):
         self.layers = set(layers)
@@ -47,7 +53,7 @@ def layer(request, monkeypatch):
     monkeypatch.setattr(
         modeling,
         "_native_allreduce_norm",
-        lambda core, x, r, norm: (("normed", x, norm), ("updated", x, r)),
+        lambda core, x, r, norm: (_Rows(("normed", x, norm)), ("updated", x, r)),
     )
 
     def boundary(self, x, x2, residual, norm_w):
@@ -57,9 +63,10 @@ def layer(request, monkeypatch):
     if request.param == "prefill":
         cls = modeling.PrefillTarget
         monkeypatch.setattr(cls, "_moe", lambda self, i, h, **k: (("moe", i), ("routed", i)))
-        monkeypatch.setattr(
-            cls, "_swiglu_mlp", lambda self, h, prefix, low_m, dense=False: ("mlp", prefix)
-        )
+        monkeypatch.setattr(cls, "_swiglu_mlp", lambda self, h, prefix, low_m, **k: ("mlp", prefix))
+        # The stand-in activations are not prefill-sized tensors: no boundary here takes the built-in CTX stack.
+        monkeypatch.setattr(modeling, "_ctx_norm_rows", lambda x: False)
+        monkeypatch.setattr(modeling, "_ctx_stack_step", lambda step, rows: False)
     else:
         cls = modeling.DecodeTarget
         monkeypatch.setattr(
@@ -134,6 +141,8 @@ def test_a_prefill_moe_layer_takes_the_mc_finalize_boundary_when_it_folds(monkey
         _decode=SimpleNamespace(_generic_mc_finalize=mc_finalize),
     )
     monkeypatch.setattr(modeling, "_can_mc", lambda x, folded=False: False)
+    # Stand-in activations: not a CTX-stack step.
+    monkeypatch.setattr(modeling, "_ctx_norm_rows", lambda x: False)
     monkeypatch.setattr(
         modeling, "_native_allreduce_norm", lambda core, x, r, norm: (("normed", x), ("upd", x, r))
     )

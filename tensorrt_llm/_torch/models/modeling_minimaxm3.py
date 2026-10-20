@@ -26,10 +26,13 @@ from typing import Any, Dict, List, Literal, Optional, Tuple
 from typing import Mapping as TMapping
 
 import torch
+import triton
+import triton.language as tl
 from torch import nn
 from torch.nn.attention import SDPBackend, sdpa_kernel
 from transformers import PretrainedConfig
 
+from tensorrt_llm._utils import get_sm_version, mpi_rank
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.functional import AllReduceStrategy, PositionEmbeddingType
 from tensorrt_llm.logger import logger
@@ -58,6 +61,8 @@ from ..attention.backends.sparse.minimax_m3.common import index_head_range
 from ..attention.backends.sparse.params import SparseBackendForwardArgs
 from ..attention.backends.trtllm import TrtllmAttention
 from ..distributed import AllReduce, AllReduceFusionOp, AllReduceParams, MiniMaxAllReduceRMS
+from ..flashinfer_utils import get_env_enable_pdl
+from ..modules import linear as linear_module
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.gated_mlp import GatedMLP
@@ -67,28 +72,100 @@ from ..modules.linear import (
     WeightMode,
     WeightsLoadingConfig,
     copy_weight,
+    ctx_eager_only,
     load_weight_shard,
+    prequantized_mxfp8_pending,
+    set_prequantized_mxfp8,
 )
-from ..modules.multi_stream_utils import maybe_execute_in_parallel
+from ..modules.multi_stream_utils import do_multi_stream, maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
+from ..modules.swiglu import swiglu_mxfp8
 from ..moe.fused_moe import MiniMaxM3MoeRoutingMethod, SwigluBiasActivation, create_moe
 from ..moe.fused_moe.interface import MoESchedulerKind
 from ..pyexecutor.breakable_cuda_graph import eager_on_graph, is_in_breakable_cuda_graph
 from ..speculative import SpecMetadata
-from ..utils import AuxStreamType, EventType, get_model_extra_attrs, is_torch_compiling
+from ..utils import (
+    AuxStreamType,
+    EventType,
+    Fp4QuantizedTensor,
+    get_model_extra_attrs,
+    is_torch_compiling,
+)
 from .checkpoints.base_weight_mapper import BaseWeightMapper
 from .checkpoints.hf.minimaxm3_weight_mapper import MINIMAX_M3_PARAMS_MAP, MiniMaxM3HfWeightMapper
-from .modeling_speculative import SpecDecOneEngineForCausalLM
+from .modeling_speculative import Eagle3DecoderLayer, Eagle3ForCausalLM, SpecDecOneEngineForCausalLM
 from .modeling_utils import DecoderModel, ModelConfig, filter_weights, register_auto_model
 
 # Legacy dense fallback: cuDNN cannot consume this SDPA layout.
 _DENSE_SDPA_BACKENDS = [SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH]
 
 
+_FOLD_LOGGED = False
+_FOLD_CALLS_LOGGED = False
+_FOLD_CALLS_SEEN: set = set()
+
+
+def _fold_shared_backend(experts: nn.Module) -> bool:
+    """Whether ``experts`` runs the SM107 CuteDSL deterministic FC2, the only finalize that takes the shared-output
+    residual (the GEN decode targets override MiniMaxM3MoE.forward and use the TRTLLM backend: never this path)."""
+    from ..moe.fused_moe import fused_moe_cute_dsl as _cute_moe
+
+    backend = getattr(experts, "backend", experts)
+    return _cute_moe._RUBIN_DETERMINISTIC_FC2 and isinstance(backend, _cute_moe.CuteDslFusedMoE)
+
+
 def _moe_routed_output_is_global(experts: nn.Module) -> bool:
     """Return whether the selected MoE backend performs fused communication."""
     backend = getattr(experts, "backend", experts)
     return getattr(backend, "scheduler_kind", None) == MoESchedulerKind.FUSED_COMM
+
+
+# CTX prefill: fuse the boundary RMSNorm with the next MXFP8 linear's activation quantization (bitwise the same as
+# the stock two-kernel path). TRTLLM_CTX_NORM_MXFP8=0 is the kill switch.
+_CTX_NORM_MXFP8 = os.environ.get("TRTLLM_CTX_NORM_MXFP8", "1") == "1"
+_CTX_NORM_MXFP8_MIN_ROWS = 8192
+_CTX_NORM_MXFP8_LOGGED = False
+# The same kernel at the pre-MoE norm also emits the routed experts' NVFP4 fc31 input (bitwise fp4_quantize(norm,
+# fc31_input_scale, 16, ue8m0=False, swizzled=False), the backend's own quantize_input). TRTLLM_CTX_NORM_FP4=0 is the
+# kill switch.
+_CTX_NORM_FP4 = os.environ.get("TRTLLM_CTX_NORM_FP4", "1") == "1"
+_CTX_NORM_FP4_LOGGED = False
+# CTX prefill: the shared + routed add folded into the routed experts' finalize. The TRTLLM-gen NVFP4 runner returns
+# its unfinalized output (do_finalize=False) and one pass sums each token's top-k rows in the kernel's own order and
+# weights, then adds the shared output with the ATen add_'s rounding: bitwise the same as finalize + add_, one fewer
+# full read-modify-write of the hidden states. TLLM_M3_MOE_FOLD_SHARED=0 is the kill switch.
+_FOLD_SHARED_INTO_FINALIZE = os.environ.get("TLLM_M3_MOE_FOLD_SHARED", "1") == "1"
+# (diagnostic) With the fold on two streams, the main stream waits for the shared expert before the routed compute.
+_FOLD_WAIT_UPFRONT = os.environ.get("TLLM_M3_MOE_FOLD_WAIT_UPFRONT", "0") == "1"
+_FOLD_SHARED_LOGGED = False
+
+
+def fold_shared_into_finalize(unfinalized, shared_output: torch.Tensor, top_k: int) -> torch.Tensor:
+    """Finalize a TRTLLM-gen ``do_finalize=False`` triple ``(gemm2_output, expert_weights,
+    expanded_idx_to_permuted_idx)`` with the shared expert's output added: equal bit for bit to the runner's own
+    finalize followed by ``shared_output.add_(routed)``. Returns a new [num_tokens, hidden] tensor."""
+    from ..moe.fused_moe.unpermute_residual import unpermute_residual
+
+    gemm2_output, expert_weights, expanded_idx_to_permuted_idx = unfinalized
+    num_tokens, hidden = shared_output.shape
+    out = torch.empty((num_tokens, hidden), dtype=shared_output.dtype, device=shared_output.device)
+    return unpermute_residual(
+        gemm2_output,
+        out,
+        expanded_idx_to_permuted_idx.view(num_tokens, top_k),
+        expert_weights.view(num_tokens, top_k),
+        shared_output.contiguous(),
+    )
+
+
+def _ctx_norm_op_has_fp4() -> bool:
+    """Whether the installed fused norm op takes fp4_global_scale (resolved once)."""
+    has = getattr(_ctx_norm_op_has_fp4, "_cached", None)
+    if has is None:
+        op = getattr(torch.ops.trtllm, "minimax_m3_ctx_residual_rmsnorm_mxfp8", None)
+        has = op is not None and "fp4_global_scale" in str(op.default._schema)
+        _ctx_norm_op_has_fp4._cached = has
+    return has
 
 
 class MiniMaxM3QKVIndexerLinear(Linear):
@@ -496,6 +573,70 @@ def _minimax_m3_swiglu_oai(gate_up: torch.Tensor, *, alpha: float, limit: float)
     return gate * torch.sigmoid(alpha * gate) * (up + 1.0)
 
 
+# CTX prefill: the SwiGLU-OAI activation of the dense / shared-expert MLPs also quantizes its output for the MXFP8
+# down_proj in the same pass (bitwise mxfp8_quantize of the stock BF16 activation); the BF16 activation is not written.
+# TRTLLM_CTX_SWIGLU_MXFP8=0 is the kill switch.
+_CTX_SWIGLU_MXFP8 = os.environ.get("TRTLLM_CTX_SWIGLU_MXFP8", "1") == "1"
+_CTX_SWIGLU_MXFP8_LOGGED = False
+
+
+class _SwigluOaiMLP(GatedMLP):
+    """GatedMLP whose prefill-sized activation hands the MXFP8 down_proj a pre-quantized input."""
+
+    def _swiglu_mxfp8_eligible(self, x: torch.Tensor, has_lora: bool) -> bool:
+        from ..modules.linear import MXFP8LinearMethod
+
+        method = getattr(self.down_proj, "quant_method", None)
+        return (
+            _CTX_SWIGLU_MXFP8
+            and get_sm_version() == 107
+            and not has_lora
+            and self.activation == torch.nn.functional.silu
+            and x.dim() == 2
+            and x.shape[0] >= _CTX_NORM_MXFP8_MIN_ROWS
+            and x.dtype == torch.bfloat16
+            and x.shape[-1] % 256 == 0
+            and ctx_eager_only()
+            and isinstance(method, MXFP8LinearMethod)
+            and getattr(method, "use_cutlass", False)
+        )
+
+    def _apply_activation(self, x, *, has_lora: bool = False):
+        if not self._swiglu_mxfp8_eligible(x, has_lora):
+            return super()._apply_activation(x, has_lora=has_lora)
+        act_e4m3, act_sf = swiglu_mxfp8(
+            x,
+            swiglu_limit=self.swiglu_limit,
+            swiglu_alpha=self.swiglu_alpha,
+            swiglu_beta=self.swiglu_beta,
+        )
+        # Stands in for the BF16 activation: down_proj takes the MXFP8 pair keyed on it and never reads it.
+        placeholder = torch.empty(act_e4m3.shape, dtype=x.dtype, device=x.device)
+        set_prequantized_mxfp8(placeholder, act_e4m3, act_sf, tag="ctx_swiglu")
+        self._swiglu_mxfp8_source = placeholder
+        self._swiglu_mxfp8_takes = linear_module._PREQUANTIZED_MXFP8_TAKES[0]
+        global _CTX_SWIGLU_MXFP8_LOGGED
+        if not _CTX_SWIGLU_MXFP8_LOGGED:
+            _CTX_SWIGLU_MXFP8_LOGGED = True
+            logger.info(f"MiniMax-M3 CTX SwiGLU+MXFP8 fused path taken (rows {x.shape[0]})")
+        return placeholder
+
+    def forward(self, *args, **kwargs):
+        self._swiglu_mxfp8_source = None
+        output = super().forward(*args, **kwargs)
+        source, self._swiglu_mxfp8_source = self._swiglu_mxfp8_source, None
+        # The placeholder is never written: down_proj must have TAKEN the pair (a dropped entry would quantize it).
+        # The take count is snapshotted when the pair is set, after gate_up's own take of the norm slot.
+        if source is not None and (
+            prequantized_mxfp8_pending(source)
+            or linear_module._PREQUANTIZED_MXFP8_TAKES[0] == self._swiglu_mxfp8_takes
+        ):
+            raise RuntimeError(
+                "MiniMax-M3 SwiGLU+MXFP8: down_proj did not consume the pre-quantized activation"
+            )
+        return output
+
+
 def _build_swiglu_oai_dense_mlp(
     model_config: "ModelConfig[PretrainedConfig]",
     intermediate_size: int,
@@ -536,7 +677,7 @@ def _build_swiglu_oai_dense_mlp(
     # the fused silu_and_mul kernel runs it in one launch with an optional fp8
     # epilogue. Mirrors the routed-expert SwigluBias path; the math lives in
     # _minimax_m3_swiglu_oai.
-    return GatedMLP(
+    return _SwigluOaiMLP(
         hidden_size=config.hidden_size,
         intermediate_size=intermediate_size,
         bias=False,
@@ -551,6 +692,321 @@ def _build_swiglu_oai_dense_mlp(
         is_shared_expert=is_shared_expert,
         layer_idx=layer_idx,
     )
+
+
+# SM107: from this many tokens the router input is cast to float32 by one vectorized Triton pass instead of the
+# aten dtype-converting copy (its unrolled path runs at ~2 TB/s). The cast is exact, so the result is bitwise the same.
+_SM107_ROUTER_FP32_CAST = True
+_SM107_ROUTER_FP32_CAST_MIN_TOKENS = 2048
+_SM107_ROUTER_FP32_CAST_LOGGED = []
+
+
+@triton.jit
+def _bf16_to_fp32_kernel(x_ptr, y_ptr, numel, BLOCK: tl.constexpr):
+    offs = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < numel
+    tl.store(y_ptr + offs, tl.load(x_ptr + offs, mask=mask).to(tl.float32), mask=mask)
+
+
+@torch.library.custom_op("trtllm::minimax_m3_router_input_fp32", mutates_args=())
+def minimax_m3_router_input_fp32(hidden_states: torch.Tensor) -> torch.Tensor:
+    """``hidden_states.to(torch.float32)``; large contiguous BF16 inputs take the Triton cast."""
+    if (
+        hidden_states.dtype != torch.bfloat16
+        or hidden_states.shape[0] < _SM107_ROUTER_FP32_CAST_MIN_TOKENS
+        or not hidden_states.is_contiguous()
+    ):
+        return hidden_states.to(torch.float32)
+    out = torch.empty(hidden_states.shape, dtype=torch.float32, device=hidden_states.device)
+    if not _SM107_ROUTER_FP32_CAST_LOGGED:
+        _SM107_ROUTER_FP32_CAST_LOGGED.append(True)
+        logger.info(
+            f"[M3 dispatch] rank {mpi_rank()}: router_fp32_cast taken at {hidden_states.shape[0]} rows"
+        )
+    numel = hidden_states.numel()
+    block = 8192
+    _bf16_to_fp32_kernel[(triton.cdiv(numel, block),)](
+        hidden_states, out, numel, BLOCK=block, num_warps=8
+    )
+    return out
+
+
+@minimax_m3_router_input_fp32.register_fake
+def _minimax_m3_router_input_fp32_fake(hidden_states: torch.Tensor) -> torch.Tensor:
+    return hidden_states.new_empty(hidden_states.shape, dtype=torch.float32)
+
+
+# CTX prefill (SM107, NVFP4 sparse layers): one CuTe DSL kernel runs the QKV-index MXFP8 GEMM and the horizontal
+# producer (per-head RMSNorm, RoPE, FP8 Q / index-Q, NVFP4 K/V + scales, FP8 index-K paged inserts) in its epilogue,
+# bitwise the stock producer applied to its own BF16 GEMM output. TRTLLM_CTX_QKV_FUSED=0 is the kill switch.
+_CTX_QKV_FUSED = os.environ.get("TRTLLM_CTX_QKV_FUSED", "1") == "1"
+_CTX_QKV_FUSED_MIN_ROWS = 1024
+# A layer whose QKV the fused producer above took runs its attention core and o_proj through _core_then_o_proj, so the
+# NVFP4 combine can also hand the o_proj its MXFP8 input (msa_combine_mxfp8, slot tag "p5a"); same o_proj input values.
+# Kill switch: TRTLLM_CTX_P5A_COMBINE_MXFP8=0 calls the o_proj on the BF16 core output.
+_CTX_P5A_COMBINE_MXFP8 = os.environ.get("TRTLLM_CTX_P5A_COMBINE_MXFP8", "1") == "1"
+
+
+def _ctx_qkv_fused_takes_rows(rows: int) -> bool:
+    """Whether a step of rows QKV rows is large enough for the fused QKV GEMM + producer (eager and breakable alike)."""
+    return rows > _CTX_QKV_FUSED_MIN_ROWS
+
+
+# Breakable prefill CUDA graphs capture the stock qkv_proj, so a captured bucket M > _CTX_QKV_FUSED_MIN_ROWS
+# would run the stock QKV GEMM where an eager step of the same real rows takes the fused producer above
+# (rule-1b different). For those buckets the QKV projection and producer run instead in an eager break on the
+# live rows, i.e. exactly the eager path, so the captured step is bitwise the eager one. Buckets
+# <= _CTX_QKV_FUSED_MIN_ROWS keep the captured stock projection (an eager or piecewise-compiled step of
+# <= 1024 rows does not take the fused producer either). TRTLLM_CTX_BCG_P5A=0 is the kill switch.
+_CTX_BCG_P5A = os.environ.get("TRTLLM_CTX_BCG_P5A", "1") == "1"
+
+
+_BCG_EAGER_QKV_LOGGED: set = set()
+_CTX_QKV_FUSED_YIELD_LOGGED = False
+
+
+def _autotuner_tuning() -> bool:
+    """Whether the AutoTuner warmup pass is running. The fused QKV producer stays out of it, so the stock MXFP8 QKV
+    GEMM profiles its shape there: the steps the producer does not take (captured buckets, < 1024 rows) otherwise run
+    that GEMM on the CUTLASS runner's untuned default tactic."""
+    from ..autotuner import AutoTuner
+
+    global _CTX_QKV_FUSED_YIELD_LOGGED
+    tuning = AutoTuner.get().is_tuning_mode
+    if tuning and not _CTX_QKV_FUSED_YIELD_LOGGED:
+        _CTX_QKV_FUSED_YIELD_LOGGED = True
+        logger.info("[CTX R3] fused QKV yields to AutoTuner tuning pass; plain QKV GEMM tuned")
+    return tuning
+
+
+def _log_bcg_eager_qkv_once(captured_rows: int) -> None:
+    if captured_rows not in _BCG_EAGER_QKV_LOGGED:
+        _BCG_EAGER_QKV_LOGGED.add(captured_rows)
+        logger.info(
+            f"[M3 CTX] breakable bucket {captured_rows}: eager QKV + fused producer on live rows"
+        )
+
+
+def _bcg_bucket_takes_eager_qkv(captured_rows: int) -> bool:
+    """Whether a breakable-graph bucket of captured_rows runs the QKV in the eager break (decided at capture)."""
+    return (
+        _CTX_BCG_P5A
+        and _CTX_QKV_FUSED
+        and get_sm_version() == 107
+        and _ctx_qkv_fused_takes_rows(captured_rows)
+    )
+
+
+_CTX_QKV_FUSED_RUNNERS: Dict[Tuple[int, int, int], Any] = {}
+_CTX_QKV_FUSED_LOGGED = False
+
+
+def _ctx_qkv_fused_runner(num_heads_q: int, num_heads_kv: int, num_heads_index: int):
+    """The compiled fused QKV runner for one per-rank head geometry (compiled on first use, outside capture)."""
+    key = (num_heads_q, num_heads_kv, num_heads_index)
+    runner = _CTX_QKV_FUSED_RUNNERS.get(key)
+    if runner is None:
+        from ..kernels.rubin.m3_qkv_fusion.kernel import M3QkvFusedRunner
+
+        runner = M3QkvFusedRunner(
+            num_heads_q=num_heads_q, num_heads_kv=num_heads_kv, num_heads_index=num_heads_index
+        )
+        _CTX_QKV_FUSED_RUNNERS[key] = runner
+    return runner
+
+
+# CTX prefill router: a fixed-tile TF32 tensor-core GEMM (router_gemm_tf32) reads the BF16 hidden states directly
+# against the TF32-rounded weight. Its tile and K order depend on the row count only through its split-K cap (8192
+# rows), so a token's logits are the same in every chunk size on either side of the cap (cuBLAS picks an M-dependent
+# algorithm at every M), and it replaces the fp32 cast + linear. Same
+# TF32 class as the cuBLAS path it replaces (the container enables TF32). TRTLLM_CTX_ROUTER_TF32_FIXED=0 is the kill
+# switch.
+_CTX_ROUTER_TF32_FIXED = os.environ.get("TRTLLM_CTX_ROUTER_TF32_FIXED", "1") == "1"
+_CTX_ROUTER_TF32_LOGGED = False
+# Pure generation steps (no context rows) keep the stock router below: the fixed-tile kernel runs a 128-row tile with a
+# serial K loop, so a decode batch pays its full ~70 us per layer, which the stock cuBLAS path does in ~13 us. Context
+# steps keep the fixed tile at every size, so a prefill token's logits stay independent of its chunk.
+# Kill switch: TRTLLM_M3_ROUTER_TF32_IN_GEN=1 keeps the fixed tile in generation steps too.
+_ROUTER_TF32_IN_GEN = os.environ.get("TRTLLM_M3_ROUTER_TF32_IN_GEN", "0") == "1"
+# SM107 generation steps of 9..16 rows (TP2 GEN batch 4 with 3 drafts) run the stock router as a cuBLAS TF32
+# split-K GEMM + splitKreduce (~9.8 us/call standalone); the TF32 tensor-core router (minimax_m3_router_tc, 16-CTA
+# clusters only, one reduction order) takes 2.9-3.5 us/call (GEMM-AR 796203) and is closer to the fp32 product
+# (max |dlogit| 1.7e-6 vs 6.7e-5 for cuBLAS TF32). Rule 1b: top-4 sets may change near ties (1 / 10,240 random rows).
+# Devices that cannot co-schedule 16-CTA clusters keep the stock router. Rule-1b gates passed (GSM McNemar greedy
+# p 0.839 / sampled p 0.424; natural AL at 9..16 rows dAL +0.002). Kill switch: TRTLLM_M3_ROUTER_TC_GEN=0.
+_ROUTER_TC_GEN = os.environ.get("TRTLLM_M3_ROUTER_TC_GEN", "1") == "1"
+_ROUTER_TC_GEN_MIN_ROWS = 9
+# The router_tc launch also emits the routed experts' NVFP4 input (packed e2m1 + linear block scales, bit-identical to
+# fp4_quantize(x, fc31_input_scale, 16, False, False)), which MiniMaxM3MoE hands to the experts in place of their own
+# quantize_input. Default OFF with the router above; enable with TRTLLM_M3_ROUTER_TC_FP4_MOE=1 (needs
+# TRTLLM_M3_ROUTER_TC_GEN=1). Off: the experts quantize again; the router is unchanged.
+_ROUTER_TC_FP4_MOE = os.environ.get("TRTLLM_M3_ROUTER_TC_FP4_MOE", "0") == "1"
+_ROUTER_TC_FP4_MOE_LOGGED = False
+_ROUTER_TC_GEN_MAX_ROWS = 16
+_ROUTER_TC_GEN_OK: Dict[
+    int, bool
+] = {}  # hidden size -> 16-CTA clusters available (device-static; decided once)
+
+
+def _router_tc_gen_ok(hidden_size: int) -> bool:
+    ok = _ROUTER_TC_GEN_OK.get(hidden_size)
+    if ok is None:
+        ok = _ROUTER_TC_GEN_OK[hidden_size] = bool(
+            torch.ops.trtllm.minimax_m3_router_tc_cluster16(hidden_size)
+        )
+        if ok:
+            logger.info(
+                f"[M3 Gate] rank {mpi_rank()}: TF32 tensor-core router engaged for "
+                f"{_ROUTER_TC_GEN_MIN_ROWS}..{_ROUTER_TC_GEN_MAX_ROWS}-row generation steps (16-CTA clusters)"
+            )
+        else:
+            logger.info(
+                f"[M3 Gate] rank {mpi_rank()}: TF32 tensor-core router not used: this device cannot co-schedule "
+                "16-CTA clusters (stock router)"
+            )
+    return ok
+
+
+# SM107: the one-model Eagle3 drafter reads its first pass at context steps only at each context request's last row,
+# so its context attention runs that row alone (DrafterLastRowContextFmha); every row still gets RoPE and its K/V
+# appended to the drafter KV cache. Kill: TRTLLM_CTX_DRAFTER_LAST_ROW=0 in the deployment env (read once at import)
+# runs the stock context attention over all rows.
+_SM107_DRAFTER_CTX_LAST_ROW = os.environ.get("TRTLLM_CTX_DRAFTER_LAST_ROW", "1") == "1"
+
+# SM107: at a context step the same drafter layer runs its o_proj (with its all-reduce) and its MLP only on the rows the
+# Eagle3 loop reads (each context request's last row, every generation row); the other rows' outputs are zeros. Every
+# row still gets its QKV, RoPE and K/V append. Kill: TRTLLM_CTX_DRAFTER_DEAD_ROWS=0 in the deployment env (read once at
+# import) runs both over all rows.
+_SM107_DRAFTER_CTX_DEAD_ROWS = os.environ.get("TRTLLM_CTX_DRAFTER_DEAD_ROWS", "1") == "1"
+_SM107_DRAFTER_CTX_DEAD_ROWS_LOGGED = []
+
+
+def _drafter_live_rows(attn_metadata, rows: int) -> Optional[torch.Tensor]:
+    """The rows of a drafter pass the Eagle3 loop reads, or None on a step without context requests."""
+    num_contexts = int(attn_metadata.num_contexts)
+    if num_contexts == 0:
+        return None
+    num_ctx_tokens = int(attn_metadata.num_ctx_tokens)
+    if rows - num_ctx_tokens + num_contexts >= rows:
+        return None
+    last_rows = (
+        torch.cumsum(attn_metadata.seq_lens_cuda[:num_contexts], dim=0, dtype=torch.long) - 1
+    )
+    gen_rows = torch.arange(num_ctx_tokens, rows, dtype=torch.long, device=last_rows.device)
+    return torch.cat([last_rows, gen_rows])
+
+
+def _rows_only(module: torch.nn.Module, live: List[Optional[torch.Tensor]]) -> None:
+    """Run ``module`` (rows in, rows out) only on the rows in ``live[0]`` while set; other output rows are zeros."""
+    module_forward = module.forward
+
+    def forward(x, *args, **kwargs):
+        rows = live[0]
+        if rows is None:
+            return module_forward(x, *args, **kwargs)
+        y = module_forward(x.index_select(0, rows), *args, **kwargs)
+        out = y.new_zeros((x.shape[0], y.shape[1]))
+        return out.index_copy_(0, rows, y)
+
+    module.forward = forward
+
+
+def mark_drafter_dead_rows(draft_model: torch.nn.Module) -> int:
+    """Skip the dead context rows of a one-layer Eagle3 drafter's o_proj and MLP (``_SM107_DRAFTER_CTX_DEAD_ROWS``).
+
+    A drafter with more layers is left alone: there every row's output feeds the next layer. Returns the number of
+    layers marked (0 or 1)."""
+    layers = [m for m in draft_model.modules() if isinstance(m, Eagle3DecoderLayer)]
+    if len(layers) != 1:
+        logger.info(f"drafter_ctx_dead_rows not enabled: the drafter has {len(layers)} layers")
+        return 0
+    layer = layers[0]
+    live: List[Optional[torch.Tensor]] = [None]
+    _rows_only(layer.self_attn.o_proj, live)
+    _rows_only(layer.mlp, live)
+    layer_forward = layer.forward
+
+    def forward(position_ids, embeds, hidden_states, attn_metadata, spec_metadata):
+        live[0] = _drafter_live_rows(attn_metadata, hidden_states.shape[0])
+        if live[0] is not None and not _SM107_DRAFTER_CTX_DEAD_ROWS_LOGGED:
+            _SM107_DRAFTER_CTX_DEAD_ROWS_LOGGED.append(True)
+            logger.info(
+                f"[M3 dispatch] rank {mpi_rank()}: drafter_ctx_dead_rows taken at "
+                f"{live[0].shape[0]} of {hidden_states.shape[0]} rows"
+            )
+        try:
+            return layer_forward(position_ids, embeds, hidden_states, attn_metadata, spec_metadata)
+        finally:
+            live[0] = None
+
+    layer.forward = forward
+    logger.info("drafter_ctx_dead_rows enabled on the drafter's o_proj and MLP")
+    return 1
+
+
+# SM107: the token embedding (full vocabulary on every rank) is one Triton gather that writes a token's row, or zeros
+# for an id outside the vocabulary, instead of the aten gather followed by the broadcast masked_fill of the whole
+# output (~270 us per 16K-token chunk). The same bits. Kill: TRTLLM_CTX_EMBEDDING_GATHER=0 in the deployment env (read
+# once at import) runs the stock Embedding forward.
+_SM107_EMBEDDING_GATHER = os.environ.get("TRTLLM_CTX_EMBEDDING_GATHER", "1") == "1"
+_SM107_EMBEDDING_GATHER_LOGGED = []
+
+
+@triton.jit
+def _embedding_gather_kernel(ids_ptr, weight_ptr, out_ptr, vocab, hidden, BLOCK: tl.constexpr):
+    row = tl.program_id(0).to(tl.int64)
+    cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    mask = cols < hidden
+    token = tl.load(ids_ptr + row).to(tl.int64)
+    valid = (token >= 0) & (token < vocab)
+    values = tl.load(weight_ptr + token * hidden + cols, mask=mask & valid, other=0.0)
+    tl.store(out_ptr + row * hidden + cols, values, mask=mask)
+
+
+@torch.library.custom_op("trtllm::minimax_m3_embedding_gather", mutates_args=())
+def minimax_m3_embedding_gather(input_ids: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """``F.embedding(ids, weight)`` with the rows of ids outside ``[0, weight.shape[0])`` zeroed."""
+    hidden = weight.shape[1]
+    # The kernel reads the ids as one dense row; a strided view (e.g. ids[::2]) is copied first.
+    ids = input_ids.reshape(-1).contiguous()
+    out = torch.empty((ids.shape[0], hidden), dtype=weight.dtype, device=weight.device)
+    if ids.shape[0] > 0:
+        if not _SM107_EMBEDDING_GATHER_LOGGED:
+            _SM107_EMBEDDING_GATHER_LOGGED.append(True)
+            logger.info(
+                f"[M3 dispatch] rank {mpi_rank()}: embedding_gather taken at {ids.shape[0]} rows"
+            )
+        block = 1024
+        _embedding_gather_kernel[(ids.shape[0], triton.cdiv(hidden, block))](
+            ids, weight, out, weight.shape[0], hidden, BLOCK=block, num_warps=4
+        )
+    return out.view(*input_ids.shape, hidden)
+
+
+@minimax_m3_embedding_gather.register_fake
+def _minimax_m3_embedding_gather_fake(
+    input_ids: torch.Tensor, weight: torch.Tensor
+) -> torch.Tensor:
+    return weight.new_empty((*input_ids.shape, weight.shape[1]))
+
+
+class MiniMaxM3Embedding(Embedding):
+    """The token embedding; on SM107 without vocabulary parallelism, one fused gather (minimax_m3_embedding_gather)."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._sm107_gather = _SM107_EMBEDDING_GATHER and get_sm_version() == 107
+
+    def forward(self, input):
+        if (
+            self._sm107_gather
+            and self.tp_size == 1
+            and input.is_cuda
+            and self.weight.dim() == 2
+            and self.weight.is_contiguous()
+        ):
+            return minimax_m3_embedding_gather(input, self.weight)
+        return super().forward(input)
 
 
 class MiniMaxM3Gate(nn.Module):
@@ -584,10 +1040,79 @@ class MiniMaxM3Gate(nn.Module):
             torch.empty((num_experts,), dtype=torch.float32),
             requires_grad=False,
         )
+        self._sm107_fp32_cast = _SM107_ROUTER_FP32_CAST and get_sm_version() == 107
+        self._weight_tf32: Optional[torch.Tensor] = None
+        # SM107 generation steps of 9..16 rows: the TF32 tensor-core router (16-CTA clusters, see _router_tc_gen_ok).
+        self._router_tc_gen = (
+            _ROUTER_TC_GEN
+            and get_sm_version() == 107
+            and num_experts == 128
+            and hidden_size % 1024 == 0
+        )
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def cache_tf32_weight(self) -> None:
+        """Build the TF32-rounded weight copy for the fixed-tile router (after every weight load)."""
+        self._weight_tf32 = None
+        if _CTX_ROUTER_TF32_FIXED and self._sm107_fp32_cast:
+            from ..moe.fused_moe.router_gemm_tf32 import prepare_router_weight_tf32
+
+            self._weight_tf32 = prepare_router_weight_tf32(self.weight.float())
+        if self._router_tc_gen:
+            # Decide the TF32 tensor-core router at load time (cluster query + its log), never inside a CUDA-graph
+            # capture of a 9..16-row bucket; a device without 16-CTA clusters keeps the stock router.
+            self._router_tc_gen = _router_tc_gen_ok(self.hidden_size)
+
+    def router_tc_applies(self, hidden_states: torch.Tensor, generation_only: bool) -> bool:
+        """Whether forward() takes the TF32 tensor-core router (9..16-row generation steps on SM107)."""
+        return (
+            generation_only
+            and not is_torch_compiling()
+            and self._router_tc_gen
+            and _ROUTER_TC_GEN_MIN_ROWS <= hidden_states.shape[0] <= _ROUTER_TC_GEN_MAX_ROWS
+            and hidden_states.dtype == torch.bfloat16
+            and hidden_states.dim() == 2
+            and hidden_states.stride(1) == 1
+            and (hidden_states.stride(0) * 2) % 16 == 0
+            and _router_tc_gen_ok(self.hidden_size)
+        )
+
+    def router_tc_with_fp4(
+        self, hidden_states: torch.Tensor, fp4_scale: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """forward()'s router_tc logits plus the NVFP4 activation of the same launch: (logits, packed e2m1 [M, K / 2],
+        linear block scales [M * K / 16]); only where router_tc_applies()."""
+        logits, q, sf = torch.ops.trtllm.minimax_m3_router_tc(
+            hidden_states, self.weight, fp4_scale, get_env_enable_pdl()
+        )
+        return logits, q, sf
+
+    def forward(self, hidden_states: torch.Tensor, generation_only: bool = False) -> torch.Tensor:
+        if (
+            self._weight_tf32 is not None
+            and not (generation_only and not _ROUTER_TF32_IN_GEN)
+            and hidden_states.dtype == torch.bfloat16
+            and hidden_states.dim() == 2
+            and hidden_states.is_contiguous()
+        ):
+            global _CTX_ROUTER_TF32_LOGGED
+            if not _CTX_ROUTER_TF32_LOGGED and not is_torch_compiling():
+                _CTX_ROUTER_TF32_LOGGED = True
+                logger.info("[M3 Gate] fixed-tile TF32 router engaged")
+            return torch.ops.trtllm.router_gemm_tf32(hidden_states, self._weight_tf32)
+        if self.router_tc_applies(hidden_states, generation_only):
+            return torch.ops.trtllm.minimax_m3_router_tc(
+                hidden_states, self.weight, None, get_env_enable_pdl()
+            )[0]
+        if self._weight_tf32 is not None and generation_only and not is_torch_compiling():
+            logger.info_once(
+                "[M3 Gate] stock router (generation_only)", key="m3_router_stock_generation_only"
+            )
         # Router runs in fp32 to match SGLang.
-        return torch.nn.functional.linear(hidden_states.to(torch.float32), self.weight)
+        if self._sm107_fp32_cast:
+            hidden_states = minimax_m3_router_input_fp32(hidden_states)
+        else:
+            hidden_states = hidden_states.to(torch.float32)
+        return torch.nn.functional.linear(hidden_states, self.weight)
 
     def load_weights(self, weights: List[Dict]):
         """Load the router weight and the e_score_correction_bias.
@@ -768,6 +1293,103 @@ class MiniMaxM3MoE(nn.Module):
         # ``maybe_execute_in_parallel`` runs fn0/fn1 sequentially.
         self.aux_stream = aux_stream_dict[AuxStreamType.MoeShared]
         self.event_dict = {key: torch.cuda.Event() for key in [EventType.Main, EventType.MoeShared]}
+        # One-shot (norm output, Fp4QuantizedTensor) from the fused pre-MoE norm; see fp4_input_scale.
+        self._prequantized_fp4 = None
+
+    def fp4_input_scale(self, num_rows: int) -> Optional[torch.Tensor]:
+        """The routed experts' NVFP4 fc31 input scale when a pre-quantized input can stand in for quantize_input.
+
+        Only for a single-chunk, non-DP, non-fused-comm forward of the TRT-LLM-op NVFP4 TRTLLM-gen leaf (no AWQ
+        pre-scale, no hidden padding) or CuteDSL backend: there quantize_input is exactly fp4_quantize(x,
+        fc31_input_scale, 16, False, False) and passes an unswizzled Fp4QuantizedTensor through unchanged.
+        """
+        from ..moe.fused_moe import CuteDslFusedMoE
+        from ..moe.fused_moe.trtllm_gen.trtllm_nvfp4 import TrtllmTrtllmGenNvfp4Impl
+
+        experts = self.experts
+        backend = getattr(experts, "backend", None)
+        if (
+            backend is None
+            or self.routed_output_is_global
+            or getattr(experts, "use_dp", False)
+            or getattr(experts, "enable_dwdp", False)
+            or num_rows > getattr(experts, "moe_max_num_tokens", 0)
+            or getattr(backend, "lora_params", None) is not None
+        ):
+            return None
+        if type(backend) is TrtllmTrtllmGenNvfp4Impl:
+            w = getattr(backend, "w3_w1_weight", None)
+            if (
+                getattr(experts, "use_flashinfer", False)
+                or getattr(backend, "fc31_act_scale", None) is not None
+                or w is None
+                or w.shape[-1] * 2 != self.hidden_dim
+            ):
+                return None
+        elif not (isinstance(backend, CuteDslFusedMoE) and getattr(backend, "has_nvfp4", False)):
+            return None
+        if getattr(backend, "scaling_vector_size", None) != 16:
+            return None
+        scale = getattr(backend, "fc31_input_scale", None)
+        if (
+            not isinstance(scale, torch.Tensor)
+            or scale.dtype != torch.float32
+            or scale.numel() != 1
+        ):
+            return None
+        return scale
+
+    def cutedsl_fold_ok(self) -> bool:
+        """Whether this forward offers the shared output to the CuteDSL deterministic finalize (see
+        _FOLD_SHARED_INTO_FINALIZE): eager, an aux stream, and no token dispatch (no attention DP, no MoE
+        communication), so the finalize rows are this rank's own tokens."""
+        return (
+            _FOLD_SHARED_INTO_FINALIZE
+            and _fold_shared_backend(self.experts)
+            and self.aux_stream is not None
+            and not self.routed_output_is_global
+            and not self.use_dp
+            and getattr(self.experts, "comm", None) is None
+            and not is_torch_compiling()
+            and ctx_eager_only()
+        )
+
+    def fold_shared_ok(self, hidden_states: torch.Tensor, lora_params: Optional[dict]) -> bool:
+        """Whether this forward can fold the shared add into the routed finalize (see _FOLD_SHARED_INTO_FINALIZE):
+        eager, a shared expert, the TRT-LLM-op NVFP4 TRTLLM-gen leaf with no hidden padding, a single chunk, no
+        communication strategy (so ``do_finalize=False`` hands back the runner's own triple), routing inside the kernel
+        (with precomputed top-k the runner finalizes with the caller's weights and leaves the triple's
+        ``expert_weights`` unwritten), no DP / DWDP / LoRA."""
+        from ..moe.fused_moe.trtllm_gen.trtllm_nvfp4 import TrtllmTrtllmGenNvfp4Impl
+
+        if (
+            not _FOLD_SHARED_INTO_FINALIZE
+            or get_sm_version() != 107
+            or self.shared_experts is None
+            or lora_params
+            or not ctx_eager_only()
+        ):
+            return False
+        experts = self.experts
+        backend = getattr(experts, "backend", None)
+        w = getattr(backend, "w3_w1_weight", None)
+        return (
+            type(backend) is TrtllmTrtllmGenNvfp4Impl
+            and backend.supports_unfinalized_output()
+            and not backend._routes_outside_the_kernel()
+            and getattr(experts, "comm", None) is None
+            and getattr(experts, "unfinalized_combine_fn", None) is None
+            and not getattr(experts, "use_flashinfer", False)
+            and not getattr(experts, "apply_router_weight_on_input", False)
+            and not self.routed_output_is_global
+            and not getattr(experts, "use_dp", False)
+            and not getattr(experts, "enable_dwdp", False)
+            and hidden_states.dim() == 2
+            and hidden_states.dtype == torch.bfloat16
+            and hidden_states.shape[0] <= getattr(experts, "moe_max_num_tokens", 0)
+            and w is not None
+            and w.shape[-1] * 2 == self.hidden_dim
+        )
 
     def forward(
         self,
@@ -776,16 +1398,57 @@ class MiniMaxM3MoE(nn.Module):
         final_all_reduce_params: Optional[AllReduceParams] = None,
         lora_params: Optional[dict] = None,
     ) -> torch.Tensor:
+        global _FOLD_SHARED_LOGGED
         all_rank_num_tokens = attn_metadata.all_rank_num_tokens
+        prequantized = None
+        if ctx_eager_only():
+            prequantized, self._prequantized_fp4 = self._prequantized_fp4, None
+        experts_input, output_dtype = hidden_states, None
+        if prequantized is not None and prequantized[0] is hidden_states and not lora_params:
+            experts_input, output_dtype = prequantized[1], hidden_states.dtype
+            logger.info_once(
+                "MiniMax-M3 CTX NVFP4 MoE input consumed from the fused norm",
+                key="m3_ctx_norm_fp4_consumed",
+            )
+
+        fold = self.fold_shared_ok(hidden_states, lora_params)
 
         def _compute_routed_output():
-            router_logits = self.gate(hidden_states)
+            global _ROUTER_TC_FP4_MOE_LOGGED
+            generation_only = getattr(attn_metadata, "num_contexts", 1) == 0
+            routed_input, routed_dtype = experts_input, output_dtype
+            fp4_scale = None
+            if (
+                _ROUTER_TC_FP4_MOE
+                and experts_input is hidden_states
+                and not lora_params
+                and self.gate.router_tc_applies(hidden_states, generation_only)
+            ):
+                fp4_scale = self.fp4_input_scale(hidden_states.shape[0])
+            if fp4_scale is None:
+                router_logits = self.gate(hidden_states, generation_only=generation_only)
+            else:
+                # One router_tc launch gives the logits and the experts' NVFP4 input (what quantize_input computes).
+                router_logits, q, sf = self.gate.router_tc_with_fp4(hidden_states, fp4_scale)
+                routed_input = Fp4QuantizedTensor(
+                    q, sf, is_sf_swizzled=False, unquantized_hidden_states=hidden_states
+                )
+                routed_dtype = hidden_states.dtype
+                if not _ROUTER_TC_FP4_MOE_LOGGED:
+                    _ROUTER_TC_FP4_MOE_LOGGED = True
+                    logger.info(
+                        f"[M3 MoE] rank {mpi_rank()}: NVFP4 MoE input from the TF32 tensor-core router "
+                        f"({_ROUTER_TC_GEN_MIN_ROWS}..{_ROUTER_TC_GEN_MAX_ROWS}-row generation steps)"
+                    )
+            kwargs = {"do_finalize": False} if fold else {}
             return self.experts(
-                hidden_states,
+                routed_input,
                 router_logits,
                 all_rank_num_tokens=all_rank_num_tokens,
                 use_dp_padding=False,
+                output_dtype=routed_dtype,
                 lora_params=lora_params,
+                **kwargs,
             )
 
         def _compute_shared_output():
@@ -794,6 +1457,63 @@ class MiniMaxM3MoE(nn.Module):
         if self.shared_experts is None:
             routed_output = _compute_routed_output()
             result = routed_output
+        elif self.cutedsl_fold_ok():
+            # (bitwise) The shared expert runs on the aux stream and its output is offered to the routed MoE's
+            # deterministic finalize, which adds it while un-permuting (one pass instead of a separate bf16 add) and
+            # waits on it only right before the finalize. A backend that does not take it leaves ``consumed`` False
+            # and the add runs here as before. Kill: TLLM_M3_MOE_FOLD_SHARED=0.
+            from ..moe.fused_moe import fused_moe_cute_dsl as _cute_moe
+
+            if do_multi_stream():
+                main_ev = self.event_dict[EventType.Main]
+                # A fresh event per offer: no re-record aliasing between the record and the finalize wait.
+                shared_ev = torch.cuda.Event()
+                main_ev.record()
+                with torch.cuda.stream(self.aux_stream):
+                    main_ev.wait()
+                    shared_output = _compute_shared_output()
+                    shared_ev.record()
+                # As in maybe_execute_in_parallel: graph capture owns the lifetime (and cudaMallocAsync rejects it).
+                if not torch.cuda.is_current_stream_capturing():
+                    shared_output.record_stream(torch.cuda.current_stream())
+            else:
+                # Eager (no multi-stream, as maybe_execute_in_parallel): the shared expert runs on this stream before
+                # the routed compute, never concurrently with it; only the add is folded.
+                shared_output = _compute_shared_output()
+                shared_ev = None
+            holder = _cute_moe.offer_finalize_residual(shared_output, shared_ev)
+            if shared_ev is not None and _FOLD_WAIT_UPFRONT:
+                # (diagnostic) main waits for the shared expert BEFORE the routed compute: no overlap, same arithmetic
+                torch.cuda.current_stream().wait_event(shared_ev)
+            try:
+                routed_output = _compute_routed_output()
+            finally:
+                _cute_moe.clear_finalize_residual()
+            global _FOLD_CALLS_LOGGED
+            if not _FOLD_CALLS_LOGGED or holder.calls != 1:
+                # (diagnostic) det-finalize calls between this layer's offer and clear (expected 1); logged once, and
+                # again (once) the first time it is not 1 -- a value != 1 means the pairing guard skipped extra calls
+                key = "ok" if holder.calls == 1 else "multi"
+                if key not in _FOLD_CALLS_SEEN:
+                    _FOLD_CALLS_SEEN.add(key)
+                    _FOLD_CALLS_LOGGED = True
+                    logger.info(
+                        f"[M3 MoE fold] det-finalize calls this layer/forward = {holder.calls} "
+                        f"(tokens {shared_output.shape[0]}, consumed {holder.consumed})"
+                    )
+            if holder.consumed:
+                global _FOLD_LOGGED
+                if not _FOLD_LOGGED:
+                    _FOLD_LOGGED = True
+                    logger.info(
+                        "[M3 MoE] shared expert folded into the CuteDSL deterministic finalize "
+                        "(TLLM_M3_MOE_FOLD_SHARED)"
+                    )
+                result = routed_output
+            else:
+                if shared_ev is not None:
+                    torch.cuda.current_stream().wait_event(shared_ev)
+                result = shared_output.add_(routed_output)
         else:
             routed_output, shared_output = maybe_execute_in_parallel(
                 _compute_routed_output,
@@ -810,9 +1530,20 @@ class MiniMaxM3MoE(nn.Module):
                     shared_output, all_reduce_params=final_all_reduce_params
                 )
                 return shared_output.add_(routed_output)
-            # In-place add into ``shared_output`` to avoid allocating a temporary
-            # (matches DeepSeekV3 / GLM convention).
-            result = shared_output.add_(routed_output)
+            if fold:
+                # The runner's unfinalized triple: finalize + the shared add in one pass (bitwise finalize + add_).
+                result = fold_shared_into_finalize(
+                    routed_output, shared_output, self.experts.routing_method.top_k
+                )
+                if not _FOLD_SHARED_LOGGED:
+                    _FOLD_SHARED_LOGGED = True
+                    logger.info(
+                        "[M3 MoE] shared expert folded into the TRTLLM-gen finalize (TLLM_M3_MOE_FOLD_SHARED)"
+                    )
+            else:
+                # In-place add into ``shared_output`` to avoid allocating a temporary
+                # (matches DeepSeekV3 / GLM convention).
+                result = shared_output.add_(routed_output)
 
         if self.allreduce is not None and not self.routed_output_is_global:
             result = self.allreduce(result, all_reduce_params=final_all_reduce_params)
@@ -925,12 +1656,18 @@ def minimax_m3_fused_sparse_qkv_producer(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Capture projection, norm, RoPE and FP8/NVFP4 cache insertion together."""
     attn_metadata, attn_layer = _extract_minimax_m3_attention_extra_attrs(layer_idx)
+    cache_tensors = (kv_cache, index_k_cache, kv_scale_cache, out_cache_loc)
+    result = attn_layer._fused_fp8_qkv_indexer_norm_rope_kv_insert(
+        None, position_ids, attn_metadata, cache_tensors=cache_tensors, hidden_states=hidden_states
+    )
+    if result is not None:
+        return result
     packed = attn_layer.qkv_proj(hidden_states)
     result = attn_layer._fused_fp8_qkv_indexer_norm_rope_kv_insert(
         packed,
         position_ids,
         attn_metadata,
-        cache_tensors=(kv_cache, index_k_cache, kv_scale_cache, out_cache_loc),
+        cache_tensors=cache_tensors,
     )
     if result is None:
         raise RuntimeError("MiniMax-M3 piecewise graph requires the fused sparse QKV producer.")
@@ -1034,6 +1771,44 @@ def minimax_m3_attn_custom_op_inplace(
 
 
 maybe_bcg_minimax_m3_attn_custom_op_inplace = eager_on_graph(minimax_m3_attn_custom_op_inplace)
+
+
+def _minimax_m3_eager_qkv_attn_inplace(
+    hidden_states: torch.Tensor,
+    position_ids: Optional[torch.Tensor],
+    layer_idx: str,
+    output: torch.Tensor,
+) -> None:
+    """Eager-path QKV projection + producer + attention on the live rows of a breakable-graph step.
+
+    Runs exactly what an eager step of the same live rows runs (the fused QKV GEMM + producer when it applies, else
+    qkv_proj + the horizontal producer), so the captured step is bitwise the eager one. Pad rows of output are left as
+    the buffer supplied them (nothing reads them; see _dispatch_attention_over_live_tokens).
+    """
+    attn_metadata, attn_layer = _extract_minimax_m3_attention_extra_attrs(layer_idx)
+    num_tokens = int(attn_metadata.num_tokens)
+    live_hidden = hidden_states[:num_tokens]
+    live_positions = position_ids[..., :num_tokens] if position_ids is not None else None
+    horizontal = attn_layer._fused_fp8_qkv_indexer_norm_rope_kv_insert(
+        None, live_positions, attn_metadata, hidden_states=live_hidden
+    )
+    if horizontal is None:
+        horizontal = attn_layer._fused_fp8_qkv_indexer_norm_rope_kv_insert(
+            attn_layer.qkv_proj(live_hidden), live_positions, attn_metadata
+        )
+    if horizontal is None:
+        raise RuntimeError(
+            "MiniMax-M3 fused horizontal producer is required inside the breakable eager QKV boundary for layer "
+            f"{layer_idx}, but its runtime geometry or cache layout was unsupported."
+        )
+    q, idx_q = horizontal
+    _dispatch_attention_over_live_tokens(
+        attn_layer, q, None, None, idx_q, None, attn_metadata, output
+    )
+    _log_bcg_eager_qkv_once(int(hidden_states.shape[0]))
+
+
+maybe_bcg_minimax_m3_eager_qkv_attn_inplace = eager_on_graph(_minimax_m3_eager_qkv_attn_inplace)
 
 
 class MiniMaxM3Attention(Attention):
@@ -1483,8 +2258,12 @@ class MiniMaxM3Attention(Attention):
         cache_tensors: Optional[
             Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], torch.Tensor]
         ] = None,
+        hidden_states: Optional[torch.Tensor] = None,
     ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
         """Run the vLLM-style horizontal producer for every sparse batch.
+
+        With ``hidden_states`` (``packed`` None) only the fused SM107 QKV GEMM + producer kernel is tried; None
+        means the caller projects with ``qkv_proj`` and calls again with ``packed``.
 
         The CUDA kernel is token-major and batch-type agnostic: per-token
         positions and cache slots cover pure prefill, mixed aggregate batches,
@@ -1501,8 +2280,10 @@ class MiniMaxM3Attention(Attention):
             return None
         rope = self.pos_embd_params.rope if self.pos_embd_params is not None else None
         rotary_dim = int(rope.dim) if rope is not None else 0
+        source = packed if packed is not None else hidden_states
         if (
-            packed.dtype != torch.bfloat16
+            source is None
+            or source.dtype != torch.bfloat16
             or position_ids is None
             or self.head_dim != 128
             or self.sparse_index_dim != 128
@@ -1544,7 +2325,7 @@ class MiniMaxM3Attention(Attention):
             out_cache_loc = getattr(attn_metadata, "msa_out_cache_loc", None)
         else:
             buffers, index_k_cache, scale_buffers, out_cache_loc = cache_tensors
-        num_tokens = int(packed.shape[0])
+        num_tokens = int(source.shape[0])
         layer_uses_nvfp4 = scale_buffers is not None
         kv_quant_scale = getattr(self.qkv_proj, "inv_kv_scales", None) if layer_uses_nvfp4 else None
         if layer_uses_nvfp4:
@@ -1626,6 +2407,19 @@ class MiniMaxM3Attention(Attention):
             rotary_cos_sin,
             position_ids.reshape(-1).contiguous().to(torch.int32),
         )
+        if packed is None:
+            if not layer_uses_nvfp4:
+                return None
+            return self._ctx_fused_qkv_gemm_producer(
+                hidden_states,
+                buffers,
+                scale_buffers,
+                index_k_cache,
+                kv_quant_scale,
+                common_args,
+                norm_weights,
+                norm_eps,
+            )
         if layer_uses_nvfp4:
             q, index_q = torch.ops.trtllm.minimax_m3_nvfp4_qkv_indexer_norm_rope_kv_insert(
                 packed.contiguous(),
@@ -1643,6 +2437,86 @@ class MiniMaxM3Attention(Attention):
                 index_k_cache,
                 *common_args,
             )
+        return q.flatten(1), index_q.flatten(1)
+
+    def _ctx_fused_qkv_gemm_producer(
+        self,
+        hidden_states: torch.Tensor,
+        buffers: torch.Tensor,
+        scale_buffers: torch.Tensor,
+        index_k_cache: torch.Tensor,
+        kv_quant_scale: torch.Tensor,
+        common_args: tuple,
+        norm_weights: Tuple[torch.Tensor, ...],
+        norm_eps: float,
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+        """The QKV-index MXFP8 GEMM with the NVFP4 producer in its epilogue (see _CTX_QKV_FUSED), or None."""
+        from ..modules.linear import MXFP8LinearMethod, take_prequantized_mxfp8
+
+        proj = self.qkv_proj
+        method = getattr(proj, "quant_method", None)
+        num_tokens = int(hidden_states.shape[0])
+        n_total = (
+            self.num_heads + 2 * self.num_key_value_heads + self.sparse_num_index_heads + 1
+        ) * 128
+        if (
+            not _CTX_QKV_FUSED
+            or not ctx_eager_only()
+            or get_sm_version() != 107
+            or hidden_states.dim() != 2
+            or not hidden_states.is_contiguous()
+            or not _ctx_qkv_fused_takes_rows(num_tokens)
+            or not isinstance(method, MXFP8LinearMethod)
+            or not getattr(method, "use_cutlass", False)
+            or getattr(proj, "bias", None) is not None
+            or tuple(proj.weight.shape) != (n_total, hidden_states.shape[1])
+            or _autotuner_tuning()
+        ):
+            return None
+        runner = _ctx_qkv_fused_runner(
+            self.num_heads, self.num_key_value_heads, self.sparse_num_index_heads
+        )
+        q = hidden_states.new_empty(
+            (num_tokens, self.num_heads, self.head_dim), dtype=torch.float8_e4m3fn
+        )
+        index_q = hidden_states.new_empty(
+            (num_tokens, self.sparse_num_index_heads, self.head_dim), dtype=torch.float8_e4m3fn
+        )
+        out_cache_loc, *_, rotary_cos_sin, position_ids = common_args
+        prequantized = take_prequantized_mxfp8(hidden_states)
+        act, act_sf = (
+            prequantized
+            if prequantized is not None
+            else torch.ops.trtllm.mxfp8_quantize(hidden_states, True)
+        )
+        try:
+            args = runner.make_args(
+                act.view(num_tokens, -1),
+                act_sf,
+                proj.weight,
+                proj.weight_scale,
+                proj._mxfp8_alpha,
+                q,
+                index_q,
+                buffers.view(torch.uint8),
+                scale_buffers,
+                index_k_cache,
+                out_cache_loc,
+                kv_quant_scale,
+                rotary_cos_sin,
+                position_ids,
+                torch.cat(norm_weights),
+                norm_eps,
+            )
+        except AssertionError:
+            # A cache geometry outside the kernel's alignment contract: the caller runs the stock projection +
+            # producer (the MXFP8 activation it already took is re-quantized there, bitwise the same).
+            return None
+        runner.run_args(args)
+        global _CTX_QKV_FUSED_LOGGED
+        if not _CTX_QKV_FUSED_LOGGED:
+            _CTX_QKV_FUSED_LOGGED = True
+            logger.info(f"MiniMax-M3 CTX fused QKV GEMM + producer taken (rows {num_tokens})")
         return q.flatten(1), index_q.flatten(1)
 
     def _expect_fused_qk_norm_rope(self, position_ids: Optional[torch.Tensor]) -> bool:
@@ -2176,6 +3050,22 @@ class MiniMaxM3Attention(Attention):
                 )
                 o = self._forward_attention_core(q, None, None, idx_q, None, attn_metadata)
                 return self.o_proj(o, all_reduce_params=all_reduce_params)
+            if (
+                self.register_to_config
+                and not is_torch_compiling()
+                and is_in_breakable_cuda_graph()
+                and _bcg_bucket_takes_eager_qkv(int(hidden_states.shape[0]))
+            ):
+                # Captured bucket > 1024 rows: the eager path's QKV (fused producer) on the live rows,
+                # in an eager break.
+                output = hidden_states.new_empty(
+                    (hidden_states.shape[0], self.num_heads * self.head_dim),
+                    dtype=self.attn_activation_dtype,
+                )
+                maybe_bcg_minimax_m3_eager_qkv_attn_inplace(
+                    hidden_states, position_ids, self.layer_idx_str, output
+                )
+                return self.o_proj(output, all_reduce_params=all_reduce_params)
             if self.register_to_config and (is_torch_compiling() or is_in_breakable_cuda_graph()):
                 # Keep the projection in the captured segment while hiding
                 # its shape-specializing MXFP8 internals behind a symbolic
@@ -2203,14 +3093,34 @@ class MiniMaxM3Attention(Attention):
                     output,
                 )
                 return self.o_proj(output, all_reduce_params=all_reduce_params)
+            horizontal = self._fused_fp8_qkv_indexer_norm_rope_kv_insert(
+                None, position_ids, attn_metadata, hidden_states=hidden_states
+            )
+            if horizontal is not None:
+                q, idx_q = horizontal
+                if _CTX_P5A_COMBINE_MXFP8:
+                    return self._core_then_o_proj(
+                        lambda: self._forward_attention_core(
+                            q, None, None, idx_q, None, attn_metadata
+                        ),
+                        all_reduce_params,
+                        site="p5a",
+                        padded=getattr(attn_metadata, "padded_num_tokens", None) is not None,
+                    )
+                o = self._forward_attention_core(q, None, None, idx_q, None, attn_metadata)
+                return self.o_proj(o, all_reduce_params=all_reduce_params)
             packed = self.qkv_proj(hidden_states)
             horizontal = self._fused_fp8_qkv_indexer_norm_rope_kv_insert(
                 packed, position_ids, attn_metadata
             )
             if horizontal is not None:
                 q, idx_q = horizontal
-                o = self._forward_attention_core(q, None, None, idx_q, None, attn_metadata)
-                return self.o_proj(o, all_reduce_params=all_reduce_params)
+                return self._core_then_o_proj(
+                    lambda: self._forward_attention_core(q, None, None, idx_q, None, attn_metadata),
+                    all_reduce_params,
+                    site="horizontal",
+                    padded=getattr(attn_metadata, "padded_num_tokens", None) is not None,
+                )
             main_size = self.q_size + 2 * self.kv_size
             packed_qkv, packed_idx_qk = packed.split(
                 [main_size, self.index_q_size + self.index_k_size], dim=-1
@@ -2298,12 +3208,35 @@ class MiniMaxM3Attention(Attention):
             disable_on_compile=True,
         )
 
-        o = self._forward_attention_core(q, k, v, idx_q, idx_k, attn_metadata)
         # all_reduce_params lets the decoder defer the o_proj output AllReduce so
         # it can be fused with post_attention_layernorm (RESIDUAL_RMS_NORM).
         # Passing None preserves the standalone o_proj reduction used by the
         # single-GPU, attention-DP, and fusion-disabled paths.
-        return self.o_proj(o, all_reduce_params=all_reduce_params)
+        return self._core_then_o_proj(
+            lambda: self._forward_attention_core(q, k, v, idx_q, idx_k, attn_metadata),
+            all_reduce_params,
+            site="general",
+            padded=getattr(attn_metadata, "padded_num_tokens", None) is not None,
+        )
+
+    def _core_then_o_proj(self, core, all_reduce_params, site, padded=False):
+        """The sparse attention core, then its o_proj. In eager prefill the core's NVFP4 combine may also write the
+        o_proj input as MXFP8 into the prequant slot (msa_combine_mxfp8, TRTLLM_CTX_COMBINE_MXFP8); the o_proj takes
+        it. Never armed while compiling (the slot is not taken there), nor on a padded step (an eager breakable-graph
+        warmup or fallback step): the combine covers only the live rows while the o_proj input carries the pad rows,
+        so the slot would not be taken and, with the bf16 store skipped, the o_proj input would be unwritten."""
+        if not ctx_eager_only() or padded:
+            return self.o_proj(core(), all_reduce_params=all_reduce_params)
+        from ..attention.backends.fmha import msa_combine_mxfp8
+
+        skip_bf16_ok = msa_combine_mxfp8.SKIP_BF16 and msa_combine_mxfp8.o_proj_takes_slot(
+            self.o_proj
+        )
+        with msa_combine_mxfp8.armed(site, skip_bf16_ok):
+            o = core()
+        out = self.o_proj(o, all_reduce_params=all_reduce_params)
+        msa_combine_mxfp8.after_o_proj(o)
+        return out
 
     def _triton_sparse_attention_core(
         self,
@@ -2575,6 +3508,7 @@ class MiniMaxM3DecoderLayer(DecoderLayer):
         self,
         hidden_states: torch.Tensor,
         residual: torch.Tensor,
+        moe: Optional[MiniMaxM3MoE] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """AllReduce(+residual+RMSNorm) between attention and the feed-forward.
 
@@ -2583,6 +3517,11 @@ class MiniMaxM3DecoderLayer(DecoderLayer):
         add+RMSNorm and the attention already reduced its own output.
         """
         if self.pre_feed_forward_fusion:
+            fused = self._reduce_norm_mxfp8(
+                hidden_states, residual, self.post_attention_layernorm, moe=moe
+            )
+            if fused is not None:
+                return fused
             return self.allreduce(
                 hidden_states,
                 all_reduce_params=AllReduceParams(
@@ -2594,6 +3533,73 @@ class MiniMaxM3DecoderLayer(DecoderLayer):
                 ),
             )
         return self.post_attention_layernorm(hidden_states, residual)
+
+    def _reduce_norm_mxfp8(
+        self,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+        norm: RMSNorm,
+        moe: Optional[MiniMaxM3MoE] = None,
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+        """Prefill-sized boundary AllReduce + residual RMSNorm that also emits the MXFP8 copy of the norm output.
+
+        The plain AllReduce is followed by one kernel that does the RESIDUAL_RMS_NORM epilogue's residual add +
+        RMSNorm (the same arithmetic as the stock SM107 rows kernel) and the next MXFP8 linear's activation
+        quantization; the MXFP8 pair waits in a one-entry slot for that linear. Only for rows at or above
+        _CTX_NORM_MXFP8_MIN_ROWS, where the stock AUTO strategy reduces with NCCL and normalizes with that same
+        rows kernel; returns None (stock path) otherwise. With moe (the pre-MoE norm), the same kernel also writes
+        the routed experts' NVFP4 input, handed to moe as a one-shot Fp4QuantizedTensor.
+        """
+        if (
+            not _CTX_NORM_MXFP8
+            or get_sm_version() != 107
+            or hidden_states.dim() != 2
+            or hidden_states.shape[0] < _CTX_NORM_MXFP8_MIN_ROWS
+            # The kernel's geometry: whole 256-element MXFP8 groups per thread block of at most 1024 threads.
+            or hidden_states.shape[1] % 256 != 0
+            or hidden_states.shape[1] // 8 > 1024
+            or hidden_states.dtype != torch.bfloat16
+            or not ctx_eager_only()
+            or not hasattr(torch.ops.trtllm, "minimax_m3_ctx_residual_rmsnorm_mxfp8")
+        ):
+            return None
+        reduced = self.allreduce(
+            hidden_states,
+            all_reduce_params=AllReduceParams(fusion_op=AllReduceFusionOp.NONE),
+        )
+        fp4_scale = None
+        if moe is not None and _CTX_NORM_FP4 and _ctx_norm_op_has_fp4():
+            fp4_scale = moe.fp4_input_scale(hidden_states.shape[0])
+        if fp4_scale is None:
+            outs = torch.ops.trtllm.minimax_m3_ctx_residual_rmsnorm_mxfp8(
+                reduced, residual, norm.weight, norm.variance_epsilon, True
+            )
+        else:
+            outs = torch.ops.trtllm.minimax_m3_ctx_residual_rmsnorm_mxfp8(
+                reduced, residual, norm.weight, norm.variance_epsilon, True, fp4_scale
+            )
+        normed, act_e4m3, act_sf = outs[:3]
+        set_prequantized_mxfp8(normed, act_e4m3, act_sf, tag="ctx_norm")
+        if fp4_scale is not None:
+            moe._prequantized_fp4 = (
+                normed,
+                Fp4QuantizedTensor(
+                    outs[3], outs[4], is_sf_swizzled=False, unquantized_hidden_states=normed
+                ),
+            )
+            global _CTX_NORM_FP4_LOGGED
+            if not _CTX_NORM_FP4_LOGGED:
+                _CTX_NORM_FP4_LOGGED = True
+                logger.info(
+                    f"MiniMax-M3 CTX norm+NVFP4 MoE input fused path taken (rows {hidden_states.shape[0]})"
+                )
+        global _CTX_NORM_MXFP8_LOGGED
+        if not _CTX_NORM_MXFP8_LOGGED:
+            _CTX_NORM_MXFP8_LOGGED = True
+            logger.info(
+                f"MiniMax-M3 CTX norm+MXFP8 fused path taken (rows {hidden_states.shape[0]})"
+            )
+        return normed, reduced
 
     def _apply_next_layer_layernorm(
         self,
@@ -2613,6 +3619,11 @@ class MiniMaxM3DecoderLayer(DecoderLayer):
         if self.next_layer_layernorm is None:
             return hidden_states, residual
         if self.post_feed_forward_fusion:
+            fused = None
+            if getattr(self, "next_layer_norm_feeds_mxfp8", False):
+                fused = self._reduce_norm_mxfp8(hidden_states, residual, self.next_layer_layernorm)
+            if fused is not None:
+                return fused
             return self.allreduce(
                 hidden_states,
                 all_reduce_params=AllReduceParams(
@@ -2644,7 +3655,9 @@ class MiniMaxM3DecoderLayer(DecoderLayer):
         spec_metadata: Optional[SpecMetadata] = None,
         lora_params: Optional[dict] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        hidden_states, residual = self._apply_pre_feed_forward_norm(hidden_states, residual)
+        hidden_states, residual = self._apply_pre_feed_forward_norm(
+            hidden_states, residual, moe=self.block_sparse_moe
+        )
 
         hidden_states = self.block_sparse_moe(
             hidden_states,
@@ -2702,7 +3715,7 @@ class MiniMaxM3Model(DecoderModel):
             AuxStreamType.MoeChunkingOverlap: torch.cuda.Stream(),
         }
 
-        self.embed_tokens = Embedding(
+        self.embed_tokens = MiniMaxM3Embedding(
             config.vocab_size,
             config.hidden_size,
             dtype=config.torch_dtype,
@@ -2901,6 +3914,22 @@ class MiniMaxM3ForCausalLM(SpecDecOneEngineForCausalLM[MiniMaxM3Model, Pretraine
             # representation while the target remains NVFP4.
             model_config.extra_attrs["draft_kv_cache_quant_algo_override"] = QuantAlgo.FP8
         super().__init__(MiniMaxM3Model(model_config), model_config)
+        if (
+            _SM107_DRAFTER_CTX_LAST_ROW
+            and get_sm_version() == 107
+            and self.draft_model is not None
+            and isinstance(self.draft_model, Eagle3ForCausalLM)
+        ):
+            from ..attention.backends.fmha.drafter_last_row import mark_drafter_last_row_attention
+
+            mark_drafter_last_row_attention(self.draft_model)
+        if (
+            _SM107_DRAFTER_CTX_DEAD_ROWS
+            and get_sm_version() == 107
+            and self.draft_model is not None
+            and isinstance(self.draft_model, Eagle3ForCausalLM)
+        ):
+            mark_drafter_dead_rows(self.draft_model)
 
     def load_weights(
         self,
@@ -2941,6 +3970,13 @@ class MiniMaxM3ForCausalLM(SpecDecOneEngineForCausalLM[MiniMaxM3Model, Pretraine
                     attention.attn, attention.qkv_proj.kv_scales, refresh=True
                 )
 
+    def cache_derived_state(self) -> None:
+        """Rebuild the routers' TF32 weight copies from the loaded fp32 weights."""
+        super().cache_derived_state()
+        for module in self.modules():
+            if isinstance(module, MiniMaxM3Gate):
+                module.cache_tf32_weight()
+
     def setup_aliases(self) -> None:
         """Chain each decoder layer's next_layer_layernorm for POST fusion.
 
@@ -2957,6 +3993,8 @@ class MiniMaxM3ForCausalLM(SpecDecOneEngineForCausalLM[MiniMaxM3Model, Pretraine
                 layer.next_layer_layernorm = self.model.norm
             else:
                 layer.next_layer_layernorm = layers[idx + 1].input_layernorm
+            # Only a next decoder layer's QKV consumes an MXFP8 copy of the boundary norm (not lm_head).
+            layer.next_layer_norm_feeds_mxfp8 = idx != num_layers - 1
 
 
 def _strip_language_model_prefix(

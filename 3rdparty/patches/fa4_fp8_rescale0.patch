@@ -1,0 +1,11 @@
+--- a/flash_attn/cute/flash_fwd_sm100.py
++++ b/flash_attn/cute/flash_fwd_sm100.py
+@@ -2021,7 +2021,7 @@
+ 
+             rescale_threshold = (
+                 8.0 if const_expr(self.q_dtype.width == 16) else
+-                4.0 if const_expr(self.q_dtype.width == 8) else
++                0.0 if const_expr(self.q_dtype.width == 8) else
+                 0.0
+             )
+             softmax = SoftmaxSm100.create(
