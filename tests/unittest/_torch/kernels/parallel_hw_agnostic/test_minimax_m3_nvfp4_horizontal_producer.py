@@ -360,6 +360,35 @@ def test_minimax_m3_nvfp4_horizontal_producer_rejects_invalid_inputs(
         )
 
 
+def test_minimax_m3_nvfp4_horizontal_producer_more_index_heads_than_kv_heads() -> None:
+    """Each of 4 index-Q heads with 1 KV head (the TP-split indexer) matches a 1-head run."""
+    from tensorrt_llm._utils import get_sm_version
+
+    if get_sm_version() not in (100, 103):
+        pytest.skip("NVFP4 quantization requires Blackwell")
+    num_tokens, width = 16, (8 + 2) * 128
+    packed = torch.randn(num_tokens, width + 5 * 128, device="cuda").bfloat16()
+    weights = [torch.randn(128, dtype=torch.bfloat16, device="cuda") for _ in range(4)]
+    positions = torch.arange(num_tokens, dtype=torch.int32, device="cuda")
+    slots = torch.arange(num_tokens, dtype=torch.int32, device="cuda")
+    inv_scales = torch.ones(3, dtype=torch.float32, device="cuda")
+
+    def run(packed, num_index_heads):
+        caches = _nvfp4_caches(1, 1)
+        q, index_q = torch.ops.trtllm.minimax_m3_nvfp4_qkv_indexer_norm_rope_kv_insert(
+            packed, *caches, slots, inv_scales, 8, 1, num_index_heads, 128, 64, 1e-5,
+            *weights, _rope_cache(num_tokens), positions,
+        )  # fmt: skip
+        return [t.view(torch.uint8) for t in (index_q, q, *caches)]
+
+    expected = run(packed, 4)
+    for head in range(4):
+        index_q = packed[:, width + head * 128 : width + (head + 1) * 128]
+        got = run(torch.cat([packed[:, :width], index_q, packed[:, -128:]], dim=1), 1)
+        assert torch.equal(got[0][:, 0], expected[0][:, head])
+        assert all(map(torch.equal, got[1:], expected[1:]))
+
+
 def test_minimax_m3_nvfp4_horizontal_producer_cuda_graph_replay() -> None:
     from tensorrt_llm._utils import get_sm_version
 

@@ -1133,8 +1133,8 @@ class MiniMaxM3SparseAttentionConfig(BaseSparseAttentionConfig):
         "Split the decode indexer across the TP ranks: each rank scores every "
         "index head on 1/TP of the index-K rows and the ranks exchange the "
         "partial block maxima over NVLink. Replicates index-Q on every rank. "
-        "Requires fuse_qkv_index_projection and TP 2 or 4 on one node without "
-        "attention DP.",
+        "Requires fuse_qkv_index_projection, TP 2 or 4 on one node without "
+        "attention DP, and at most 7 draft tokens.",
         status="prototype",
     )
     num_attention_heads: Optional[int] = Field(

@@ -46,8 +46,10 @@ def _run_rank(world: int) -> bool:
     split = IndexTpSplit(mapping, range(5), 4, max_blocks, 5 * dql)
     # Every slot set, the wrap from the last layer to the first and set reuse, back to back.
     scores = [torch.full_like(expected[split.heads], float("nan")) for _ in range(15)]
-    for i, got in enumerate(scores):
+    scores = [
         split.score(i % 5, idx_q, cache, block_table, seq_lens, got, dql)
+        for i, got in enumerate(scores)
+    ]
     torch.cuda.synchronize()
     return all(
         torch.equal(got.view(torch.int32), expected[split.heads].view(torch.int32))

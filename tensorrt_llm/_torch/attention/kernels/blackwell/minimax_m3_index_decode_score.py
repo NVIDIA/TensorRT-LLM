@@ -25,11 +25,9 @@ Differences from upstream:
   blackwell.utils rather than cute.arch.
 * Compilation and caching live in the trtllm::cute_dsl_minimax_m3_index_decode_score
   runner, matching the other CuTe DSL ops in this tree.
-* TP split (shard_world W > 1, index_tp_split): each rank scores every head on
-  rows rank, rank + W, ... of every block and pushes the partial block maxima
-  to the rank that owns the head; max is exact, so the ranks' partials combine
-  to the unsplit score bit for bit.
+* TP split (shard_world > 1, index_tp_split): see IndexDecodeScoreKernel.
 * Proxy fences before the TMA stage releases.
+* One MMA warp stores the final scores rather than all four.
 """
 
 import cutlass
@@ -80,13 +78,17 @@ def _fp8_to_f16_mma_fragments(src: cute.Tensor):
 
 
 @dsl_user_op
-def _store_sys(addr: Int64, value: Float32, *, loc=None, ip=None) -> None:
-    """System-scope store, so a peer GPU polling the address sees it."""
+def _store_sys(addr: Int64, values, *, loc=None, ip=None) -> None:
+    """System-scope store of 1, 2 or 4 consecutive fp32, so a peer GPU polling the address sees it."""
+    n = len(values)
+    regs = ", ".join(f"${i + 1}" for i in range(n))
     llvm.inline_asm(
         None,
-        [addr.ir_value(loc=loc, ip=ip), value.ir_value(loc=loc, ip=ip)],
-        "st.relaxed.sys.global.f32 [$0], $1;",
-        "l,f",
+        [addr.ir_value(loc=loc, ip=ip)] + [v.ir_value(loc=loc, ip=ip) for v in values],
+        f"st.relaxed.sys.global.v{n}.f32 [$0], {{{regs}}};"
+        if n > 1
+        else "st.relaxed.sys.global.f32 [$0], $1;",
+        "l" + ",f" * n,
         has_side_effects=True,
         loc=loc,
         ip=ip,
@@ -105,7 +107,9 @@ class IndexDecodeScoreKernel:
     and a group is W consecutive blocks, so a pipeline stage is still 128 rows.
     The partial max of (head h, token t, block b) goes to
     recv_bases[h // (num_heads // W)] at the offset of
-    (shard_rank, h % (num_heads // W), t, b) in the score layout.
+    (shard_rank, h % (num_heads // W), t, b) in the score layout. A group's W
+    partials go out as one vector store, so that layout has blocks innermost,
+    its other strides are multiples of W and the bases are 4 * W-byte aligned.
     """
 
     BLOCK_K = 128
@@ -486,25 +490,32 @@ class IndexDecodeScoreKernel:
                     head_id = lane_id // MAX_DQL
                     q_local_pos = lane_id - head_id * MAX_DQL
                     valid_q = head_id < NUM_HEADS and q_local_pos < decode_query_len
-                    if lane_id < BLOCK_Q and valid_q:
+                    # The four MMA warps hold the same final scores; one stores them.
+                    if warp_id == 0 and lane_id < BLOCK_Q and valid_q:
                         t = batch_id * decode_query_len + q_local_pos
+                        partials = []
                         for p in cutlass.range_constexpr(W):
-                            block_id = group_id * W + p
-                            if block_id < num_blocks:
-                                final_score = epi_buffer[lane_id, p * WARPS_PER_PAGE]
-                                for i in cutlass.range_constexpr(1, WARPS_PER_PAGE):
-                                    final_score = cute.arch.fmax(
-                                        final_score, epi_buffer[lane_id, p * WARPS_PER_PAGE + i]
-                                    )
-                                if cutlass.const_expr(W == 1):
-                                    score[head_id, t, block_id] = final_score
-                                else:
-                                    crd = (shard_rank, head_id % H_LOCAL, t, block_id)
-                                    _store_sys(
-                                        recv_bases[head_id // H_LOCAL]
-                                        + Int64(cute.crd2idx(crd, score.layout)) * 4,
-                                        final_score,
-                                    )
+                            final_score = epi_buffer[lane_id, p * WARPS_PER_PAGE]
+                            for i in cutlass.range_constexpr(1, WARPS_PER_PAGE):
+                                final_score = cute.arch.fmax(
+                                    final_score, epi_buffer[lane_id, p * WARPS_PER_PAGE + i]
+                                )
+                            partials.append(final_score)
+                        if cutlass.const_expr(W == 1):
+                            score[head_id, t, group_id] = partials[0]
+                        else:
+                            crd = (shard_rank, head_id % H_LOCAL, t, group_id * W)
+                            addr = (
+                                recv_bases[head_id // H_LOCAL]
+                                + Int64(cute.crd2idx(crd, score.layout)) * 4
+                            )
+                            if group_id * W + W <= num_blocks:
+                                _store_sys(addr, partials)
+                            else:
+                                # Blocks past the last one are never stored.
+                                for p in cutlass.range_constexpr(W - 1):
+                                    if group_id * W + p < num_blocks:
+                                        _store_sys(addr + p * 4, partials[p : p + 1])
 
                     tma_stage = (tma_stage + 1) % self.num_stages
                     if tma_stage == 0:
