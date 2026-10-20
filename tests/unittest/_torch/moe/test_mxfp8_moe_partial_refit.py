@@ -286,3 +286,22 @@ def test_mxfp8_two_sequential_refits_match_single_shot():
     _refit(module, [_split(weights_a, {"w1", "w3"}), _split(weights_a, {"w2"})])
     _refit(module, [_split(weights_b, {"w1", "w3"}), _split(weights_b, {"w2"})])
     _assert_matches(module, expected_b, "second refit")
+
+
+@requires_mxfp8_moe
+@pytest.mark.parametrize("leaf", ["w1", "w3"])
+def test_mxfp8_single_projection_refit_after_finalize_matches_fresh_load(leaf):
+    """Refitting only w1 (or w3) of already-finalized slots must leave the
+    other projection's swizzled scales untouched and match a fresh full load."""
+    torch.manual_seed(20260821)
+    weights_a = _mxfp8_expert_weights(torch.Generator(device="cuda").manual_seed(1))
+    weights_b = _mxfp8_expert_weights(torch.Generator(device="cuda").manual_seed(2))
+    merged = dict(weights_a)
+    merged.update(_split(weights_b, {leaf}))
+
+    expected = _fresh_load(_make_module(), merged)
+
+    module = _make_module()
+    _refit(module, [weights_a])
+    _refit(module, [_split(weights_b, {leaf})])
+    _assert_matches(module, expected, f"{leaf}-only refit after finalize")

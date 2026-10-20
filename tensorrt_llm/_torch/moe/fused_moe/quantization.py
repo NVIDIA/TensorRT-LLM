@@ -6625,6 +6625,8 @@ class MXFP8CutlassFusedMoEMethod(FusedMoEMethodBase):
         # down_proj-only bucket following a gate_up bucket) and scramble them.
         # Tracking slots rather than a single flag keeps expert-sharded
         # buckets correct, and clearing them makes repeated finalize a no-op.
+        # The w3_w1 entries are (slot, "w3" | "w1") so that a partial refit of
+        # one projection swizzles only the half that was rewritten.
         module._mxfp8_w3_w1_sf_pending_slots = set()
         module._mxfp8_w2_sf_pending_slots = set()
 
@@ -6718,42 +6720,65 @@ class MXFP8CutlassFusedMoEMethod(FusedMoEMethodBase):
             # once. Arm a slot only when its bytes actually arrived, so a
             # bucket that carries no scale for this tensor cannot re-swizzle a
             # slot that a previous finalize already converted.
-            if w1_sf is not None or w3_sf is not None:
-                module._mxfp8_w3_w1_sf_pending_slots.add(local_slot_id)
+            if w1_sf is not None:
+                module._mxfp8_w3_w1_sf_pending_slots.add((local_slot_id, "w1"))
+            if w3_sf is not None:
+                module._mxfp8_w3_w1_sf_pending_slots.add((local_slot_id, "w3"))
             if w2_sf is not None:
                 module._mxfp8_w2_sf_pending_slots.add(local_slot_id)
 
-    def _swizzle_slot_scale(self, scale_data: torch.Tensor,
-                            local_slot_id: int) -> None:
-        """Swizzle one slot's block scale into the CUTLASS Mxf8f6f4 layout.
+    def _swizzle_scale(self, scale: torch.Tensor) -> None:
+        """Swizzle a block-scale tensor into the CUTLASS Mxf8f6f4 layout.
 
         The op operates on the uint8 view; the result is re-viewed back to
         int32 (same bytes, new dtype interpretation matching what the MoE TMA
         descriptor reads).
         """
-        slot = scale_data[local_slot_id]
-        orig_int32_shape = slot.shape
+        orig_int32_shape = scale.shape
         swizzled = torch.ops.trtllm.block_scale_interleave(
-            slot.view(torch.uint8))
-        slot.copy_(
+            scale.view(torch.uint8))
+        scale.copy_(
             swizzled.view(self.BLOCK_SCALES_DTYPE).reshape(orig_int32_shape))
+
+    def _swizzle_w3_w1_slot(self, scale_data: torch.Tensor, local_slot_id: int,
+                            halves: set) -> None:
+        slot = scale_data[local_slot_id]
+        if len(halves) == 2:
+            self._swizzle_scale(slot)
+            return
+        # The swizzle works on 128-row tiles, so a single projection can be
+        # swizzled on its own only when it is a whole number of tiles; the
+        # result is then identical to swizzling the full slot.
+        half_rows = slot.shape[0] // 2
+        if half_rows % 128 != 0:
+            raise RuntimeError(
+                "MXFP8 MoE partial refit of a single w1/w3 projection needs "
+                f"intermediate size per partition to be a multiple of 128, got "
+                f"{half_rows}")
+        w3, w1 = slot.chunk(2, dim=0)
+        self._swizzle_scale(w1 if "w1" in halves else w3)
 
     def process_weights_after_loading(self, module: torch.nn.Module):
         # Apply the deferred swizzle once per load/refit sequence. Draining the
         # pending sets keeps the RLHF finalize walk -- which invokes both
         # process_weights_after_loading and post_load_weights -- from
         # double-swizzling.
-        for pending_attr, scale_attr in (("_mxfp8_w3_w1_sf_pending_slots",
-                                          "w3_w1_weight_scale"),
-                                         ("_mxfp8_w2_sf_pending_slots",
-                                          "w2_weight_scale")):
-            pending = getattr(module, pending_attr, None)
-            if not pending:
-                continue
-            scale_data = getattr(module, scale_attr).data
-            for local_slot_id in sorted(pending):
-                self._swizzle_slot_scale(scale_data, local_slot_id)
-            pending.clear()
+        pending_w3_w1 = getattr(module, "_mxfp8_w3_w1_sf_pending_slots", None)
+        if pending_w3_w1:
+            scale_data = module.w3_w1_weight_scale.data
+            halves_by_slot: Dict[int, set] = {}
+            for local_slot_id, half in pending_w3_w1:
+                halves_by_slot.setdefault(local_slot_id, set()).add(half)
+            for local_slot_id in sorted(halves_by_slot):
+                self._swizzle_w3_w1_slot(scale_data, local_slot_id,
+                                         halves_by_slot[local_slot_id])
+            pending_w3_w1.clear()
+        pending_w2 = getattr(module, "_mxfp8_w2_sf_pending_slots", None)
+        if pending_w2:
+            scale_data = module.w2_weight_scale.data
+            for local_slot_id in sorted(pending_w2):
+                self._swizzle_scale(scale_data[local_slot_id])
+            pending_w2.clear()
 
 
 # Serializes the duplicate-check + slot-claim step of
