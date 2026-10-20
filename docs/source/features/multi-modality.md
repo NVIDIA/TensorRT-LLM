@@ -1,3 +1,8 @@
+<!--
+SPDX-License-Identifier: Apache-2.0
+Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+-->
+
 # Multimodal Support in TensorRT LLM
 
 TensorRT LLM supports a variety of multimodal models, enabling efficient inference with inputs beyond just text.
@@ -25,6 +30,11 @@ Further optimizations are under development and will be updated as they become a
 ## Model Support Matrix
 
 Please refer to the latest multimodal [support matrix](../models/supported-models.md#multimodal-feature-support-matrix-pytorch-backend).
+
+## Adding a Model
+
+See the [multimodal onboarding guide](../developer-guide/multimodal.md#onboarding-a-model)
+for processor metadata, payload selection, model hooks, and encoder/prefill handoff.
 
 ## Optional dependencies
 

@@ -10,9 +10,21 @@ metadata:
   author: NVIDIA Corporation
 ---
 
+<!--
+SPDX-License-Identifier: Apache-2.0
+Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+-->
+
 # TensorRT-LLM Multimodal Model Onboarding (PyTorch backend)
 
 > **Scope.** PyTorch backend only (`tensorrt_llm/_torch/`) — the default for `LLM(..., backend="pytorch")`, `trtllm-serve`, and `trtllm-bench`.
+
+Read the [multimodal developer guide](../../../docs/source/developer-guide/multimodal.md)
+for request ownership and process boundaries. Its
+[model onboarding section](../../../docs/source/developer-guide/multimodal.md#onboarding-a-model)
+defines minimum metadata, scheduling requirements, unusual payload selection,
+coupled media items, and model-specific extensions. Use that contract alongside
+the implementation steps below.
 
 **Output:**
 - `tensorrt_llm/_torch/models/modeling_{name}.py` — wrapper class (multimodal encoder + LLM) decorated with `@register_auto_model`, `@register_vision_encoder`, `@register_input_processor` (and `@support_multimodal_disaggregated` if EPD is supported), plus a `BaseMultimodalInputProcessor` (+ `BaseMultimodalDummyInputsBuilder`) subclass.
@@ -40,7 +52,9 @@ metadata:
        (mRoPE) mrope_position_ids + deltas computed on CPU
        _postprocess: HF mm token ids → tllm_multimodal_token_id (OOV sentinel)
     The framework wrapper around your processor computes blake3 content hashes
-    for KV-cache reuse.
+    for KV-cache reuse and merges get_mm_item_metadata into one
+    MultimodalItemMetadata record inside multimodal_data. The frontend's
+    mm_item_order is consumed here; execution reads item_metadata.item_refs.
     MultimodalParams.to_handle("multimodal_data") at the end → each tensor in
     multimodal_data is replaced by a small dict pointing at its CUDA-IPC / shm
     handle, so the broadcast in [3] carries pointers, not megabytes of pixels.
@@ -48,24 +62,26 @@ metadata:
 [3] Worker fan-out  (TP / PP / CP)
     Each worker rebuilds local tensor views via to_tensor("multimodal_data").
     multimodal_input (hashes / positions / lengths) is forwarded to the C++
-    executor to drive KV-cache hash matching.
+    executor to drive KV-cache hash matching, then cleared from the request's
+    Params. Persistent encoder caching reconstructs it lazily when needed.
+    Live encoder_state cache references and CUDA events stay in the executor.
 
 [4] Per-iteration staging  (model engine)
     Context:    build MultimodalRuntimeData (positions / lengths / chunk bounds).
                 For item-scheduled models, reserve space in the model's one
                 TensorLRUCache. Reuse ready outputs and encode each missing item only
                 once, within the encoder item / token / output-byte limits. Then
-                join the request's cached item outputs in prompt order, keeping only
-                the current chunk's rows, into a multimodal_embedding flagged
-                multimodal_embedding_is_chunk.
-                Legacy models stage the request payload here as before. H2D obeys
+                assemble the current chunk's rows in a forward Params view with
+                multimodal_embedding_is_chunk. The request keeps cache references,
+                not a combined embedding buffer.
+                Full-request models stage the request payload here. H2D obeys
                 multimodal_data_device_paths and uses pinned, non-blocking copies.
     Generation (mRoPE only): strip everything except mrope_position_deltas.
     Post-prefill / termination: release request-held cache references, then strip
                 raw MM fields so they don't ride along in decode.
 
 [5] Model.forward(attn_metadata, input_ids, position_ids, multimodal_params=…)
-    MultimodalModelMixin.prepare_multimodal_inputs: the legacy path looks up
+    MultimodalModelMixin.prepare_multimodal_inputs: full-request encoding looks up
        the persistent cache and encodes partial-hit misses;
        get_multimodal_embeddings then encodes the remaining full misses and
        joins every request's rows into one batch tensor. If any request is
@@ -99,7 +115,7 @@ metadata:
 When `@support_multimodal_disaggregated` is set and the deployment uses `TLLM_MULTIMODAL_DISAGGREGATED=1`:
 
 - **Encoder worker:** runs as a standalone `MultimodalEncoder` (`mm_encoder_only=True`). It executes only the multimodal encoder and ships `mm_embeddings` (+ mRoPE position ids/deltas) to prefill+decode workers as shared-tensor handles.
-- **Prefill+decode worker:** the model's `__init__` skips constructing `self.mm_encoder` when `_is_mm_disagg()` is true; the input processor's `attach_multimodal_embeddings()` override binds the encoder handles into the request. For context-only requests, the engine re-clones mrope tensors so IPC handles outlive the encoder worker's freed memory — replicate that pattern for any new GPU-resident mm tensors.
+- **Prefill+decode worker:** the model's `__init__` skips constructing `self.mm_encoder` when `_is_mm_disagg()` is true. For supplied embeddings, override `_attach_multimodal_embeddings_impl`, not the `attach_multimodal_embeddings` wrapper. Handle-based E/P input uses `build_disagg_prefill_multimodal_inputs(inputs, mm_handles, *, mm_hashes=None)` and returns `(prompt_token_ids, MultimodalParams)`; build the Params with `MultimodalParams.from_embeddings`. `DisaggregatedParams` remains the transport envelope, separate from this local return value. For context-only requests, the engine re-clones mrope tensors so IPC handles outlive the encoder worker's freed memory — replicate that pattern for any new GPU-resident mm tensors.
 
 This item-scheduled cache path currently applies only when the encoder and LLM
 run in the same process. `mm_encoder_only` / EPD keeps its existing
@@ -218,7 +234,7 @@ A 1024×1024 fp32 patch tensor is ~12 MB; a video clip can be hundreds of MB. Na
 ### Contract 4 — Batch the multimodal encoder across requests
 
 Implement `MultimodalModelMixin.encode_multimodal_inputs` as one batched forward over its
-`MultimodalParams` list. The legacy path batches uncached requests through
+`MultimodalParams` list. Full-request encoding batches uncached requests through
 `get_multimodal_embeddings`. The item-scheduled path instead passes sliced inputs for selected
 producer items and calls the same hook once per compatible modality run. For example,
 `image -> video -> image` can require three calls, even if the model supports both modalities
@@ -229,10 +245,14 @@ boundaries, and run the encoder blocks once. Never loop over requests and call t
 per request.
 
 **Pattern (Qwen3-VL).** `encode_multimodal_by_groups` concatenates items for compatible
-modalities, runs one encoder call, and restores request/prompt order from `mm_item_order`.
+modalities, runs one encoder call, and restores request/prompt order from
+`param.item_metadata.item_refs` and `output_embedding_lengths`.
 `forward_multimodal_encoder_items` then splits the result into one tensor per atomic item using
-the processor-declared output lengths. Override `build_multimodal_encoder_input` only when the
-default packed-grid, stacked-image, or stacked-audio slicers cannot represent the model's input.
+the processor-declared output lengths. Declare `item_metadata.input_partitions`
+with `MultimodalItemPartition` for batched, packed, or shared fields. Override
+`build_multimodal_encoder_input(param, local_item_indices, modality)` when those
+partitions cannot express the payload. The mixin separately selects metadata
+using prompt-global indices. New models should not rely on legacy layout inference.
 
 **Audit.** Under load, compatible requests should share one wide encoder block per hook call,
 not one block per request. Item scheduling may produce multiple blocks per iteration when
@@ -271,8 +291,8 @@ class {Name}VisionModel(nn.Module):
 class {Name}Model(MultimodalModelMixin, PreTrainedModel):
     config_class = {Name}Config
     supports_encoder_cache = True
-    # Enable only after implementing the Phase 3 atomic-item contracts.
-    supports_mm_encoder_item_scheduling = True
+    # Enable after implementing and validating the Phase 3 atomic-item contracts.
+    supports_mm_encoder_item_scheduling = False
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig], *args, **kwargs):
         config = model_config.pretrained_config
@@ -337,7 +357,7 @@ class {Name}Model(MultimodalModelMixin, PreTrainedModel):
 - Implement `encode_multimodal_inputs`, `language_model`, `text_embedding_layer`,
   `embedding_dim`, and `embedding_dtype`. The encoder must return one tensor whose first
   dimension equals the processor-declared aggregate output length. The item path validates and
-  splits it per item; the legacy path retains its existing full-request behavior.
+  splits it per item; full-request encoding uses the same common metadata record.
   `embedding_dim` and `embedding_dtype` describe one cached encoder-output row, not the text
   embedding: include any extra features folded into each row (Qwen3-VL deepstack returns
   `hidden * (deepstack_num_level + 1)`). Item scheduling sizes cache entries from them and
@@ -374,12 +394,21 @@ The workspace dimension comes from `encoder_max_num_tokens`, falling back to the
 
 > Mixed image+video+audio models profile the supported modality with the largest legal per-item workload under the configured limits. Runtime mixed-modality requests still share the same aggregate token limit.
 
-**Atomic-item scheduling.** Override `get_mm_encoder_item_metadata` to return
-prompt-ordered `item_refs`, the encoder-token cost of each item, and each
-item's output length. Also implement `get_max_mm_encoder_output_embeddings` so
-the engine can size the cache for one legal encoder iteration. The declared
-output lengths must match both the MM placeholder spans and the tensor splits
-from `forward_multimodal_encoder_items`.
+**Common item metadata.** Implement
+`get_mm_item_metadata(prompt_token_ids, multimodal_data, mm_item_order=None)`
+and return `MultimodalItemMetadata`. The framework supplies prompt order and
+known output rows; the processor adds encoder costs and input partitions.
+Full-request models can leave unknown costs as `None`; grouped assembly still
+requires exact output row counts. Do not implement the removed
+`get_mm_encoder_item_metadata` hook: the registry rejects it at wrapper creation.
+
+**Atomic-item scheduling (optional).** Enable
+`supports_mm_encoder_item_scheduling` only when items can be encoded independently.
+Supply exact positive `encoder_token_lengths`, `output_embedding_lengths`, and
+item selection, and implement `get_max_mm_encoder_output_embeddings` to size
+the cache for one legal iteration. Missing scheduling metadata fails admission;
+it does not trigger a per-request fallback. Keep lengths and partitions on the
+host: `.cpu().tolist()` can synchronize and does not belong in a forward path.
 
 Implement `call_with_text_prompt(inputs, sampling_params)` — the per-model text-prompt path. **Don't override `__call__`**: the base class's concrete `__call__` dispatches here for text prompts, and also detokenizes `prompt_token_ids → prompt` and falls through to here for non-fast-path VLMs. `call_with_text_prompt` does:
 
@@ -392,7 +421,7 @@ Implement `call_with_text_prompt(inputs, sampling_params)` — the per-model tex
 
 **Optional tokenized+MM fast path (skip unless needed):** set `supports_token_id_mm_expansion = True` (`ClassVar`) and implement `get_text_with_mm_placeholders(mm_counts)` + `expand_prompt_token_ids_for_mm(prompt_token_ids, num_mm_tokens, ...)`. The base-class `call_with_token_ids` then builds dummy placeholder text, runs `call_with_text_prompt` on it, expands the real token IDs, and merges any returned `mm_data_updates` (e.g. video `evs_ids`) into `multimodal_data`. Leave the flag `False` and the base class just detokenizes token-ID inputs and re-runs `call_with_text_prompt`. Only LlavaNext + Nemotron H multimodal opt in today.
 
-**EPD override (if `@support_multimodal_disaggregated`):** override `_attach_multimodal_embeddings_impl(inputs, multimodal_embedding, sampling_params)` — **not** the `attach_multimodal_embeddings` wrapper — to consume encoder outputs in the prefill+decode worker. The base wrapper detokenizes tokenized inputs for non-fast-path VLMs before delegating to your impl.
+**EPD overrides (if `@support_multimodal_disaggregated`):** override `_attach_multimodal_embeddings_impl(inputs, multimodal_embedding, sampling_params)` — **not** the `attach_multimodal_embeddings` wrapper — for supplied embeddings. The base wrapper detokenizes tokenized inputs for non-fast-path VLMs before delegating to your impl. If the model supports handle-based E/P handoff, implement `build_disagg_prefill_multimodal_inputs(inputs, mm_handles, *, mm_hashes=None) -> tuple[list[int], MultimodalParams]`; preserve prompt order, hashes, output rows, and model-specific auxiliary data in the returned Params. See Qwen3-VL's implementation and the developer guide's [handoff contract](../../../docs/source/developer-guide/multimodal.md#encoderprefill-handoff).
 
 **Decorator stack** — bottom-up application; `register_vision_encoder` requires `register_auto_model` to have run first:
 
@@ -508,10 +537,12 @@ Follow `CONTRIBUTING.md`. Title `[JIRA/NVBUG/None][type] description`, `git comm
 
 **Input processor**
 - [ ] Subclasses both `BaseMultimodalInputProcessor` and `BaseMultimodalDummyInputsBuilder`.
-- [ ] Encoder profiling implements `get_mm_max_tokens_per_item` + `get_dummy_mm_data`; item scheduling additionally implements `get_mm_encoder_item_metadata` + `get_max_mm_encoder_output_embeddings`. The model exposes batched `encode_multimodal_inputs`; encoder metadata capacity comes from `setup_attn_metadata`, not hardcoded `max_num_*` values.
+- [ ] Encoder profiling implements `get_mm_max_tokens_per_item` + `get_dummy_mm_data`. The processor returns `MultimodalItemMetadata` from `get_mm_item_metadata`; item scheduling additionally supplies exact costs/output rows, item selection, and `get_max_mm_encoder_output_embeddings`. The model exposes batched `encode_multimodal_inputs`; encoder metadata capacity comes from `setup_attn_metadata`, not hardcoded `max_num_*` values.
+- [ ] Batched/packed/shared fields have explicit `input_partitions`, or the model overrides selection for its layout. Payload indices are modality-local; metadata indices are prompt-global. Execution reads `item_metadata.item_refs`, not frontend `mm_item_order`.
 - [ ] `call_with_text_prompt` (not `__call__` — that's the base-class dispatcher) runs HF AutoProcessor + tokenizer, builds `multimodal_data` by modality, computes `mrope_config` on CPU, `_postprocess`-rewrites mm token ids to the OOV sentinel.
 - [ ] `mm_processor_kwargs` flow-through preserved. (Tokenized fast path is optional: set `supports_token_id_mm_expansion = True` + implement `get_text_with_mm_placeholders` / `expand_prompt_token_ids_for_mm`; otherwise the base class detokenizes token-ID inputs automatically.)
 - [ ] `_attach_multimodal_embeddings_impl` implemented (not the `attach_multimodal_embeddings` wrapper) if `@support_multimodal_disaggregated`.
+- [ ] Handle-based E/P hooks accept keyword-only `mm_hashes` and return `(prompt_token_ids, MultimodalParams)`. Cache references stay on request Params; execution views do not own them.
 
 **Performance contracts**
 - [ ] Grep clean for Contract 1 bans (`.item()` / `.cpu()` / `.tolist()` / `torch.nonzero` / single-arg `torch.where` / value-dependent `if`, etc.) in modeling `forward` paths — elementwise `torch.where(cond, x, y)` with GPU-only `cond` is fine.
