@@ -1229,6 +1229,7 @@ def test_fused_submit_orders_generations_and_defers_the_route_wait(auxiliary_sms
         setattr(group, name, 0)
     group._plan_part = None
     group._pending_release = None
+    group._routes_in_flight = None
     group._closed = False
     group._owner_thread_id = None
     group._execution_stream_handle = None
@@ -1335,6 +1336,21 @@ def test_fused_submit_orders_generations_and_defers_the_route_wait(auxiliary_sms
         group.plan_schedule(_Routes(8, trace))
     assert not any(entry[0] == "FUSED" for entry in trace)
     assert group._plan_part is None
+    # Nothing was launched, so the routes were never handed to HALO-Q.
+    assert group._routes_in_flight is None
+
+    # A submission that fails after the launch keeps its routes alive, and the
+    # group refuses further plans rather than let the allocator reuse them.
+    group._driver.cuStreamWaitEvent = lambda *args: (0,)
+    group._pending_release = None
+    group._spin_bound = SimpleNamespace(cycles=lambda: _SERVING_SPIN_CYCLES)
+    group.broadcaster.submit_fused = lambda *args, **kwargs: SimpleNamespace(generation=99)
+    stuck = _Routes(8, trace)
+    with pytest.raises(RuntimeError, match="generation mismatch"):
+        group.plan_schedule(stuck)
+    assert group._routes_in_flight is stuck
+    with pytest.raises(RuntimeError, match="never ordered on MAIN"):
+        group.plan_schedule(_Routes(8, trace))
 
     # A closed group rejects every route wait, including one of a waited generation.
     group._closed = True
