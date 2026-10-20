@@ -3472,8 +3472,9 @@ def _create_kv_cache_manager(
         # layers are sparse MLA) plus paged indexer state; both families use
         # sequential verify when replay is unavailable.
         is_glm5_next = config_utils.is_glm5_next(config)
-        text_config = config_utils.unwrap_glm5_next_text_config(
-            config) if is_glm5_next else config
+        text_config = (config_utils.unwrap_glm5_next_text_config(config)
+                       if is_glm5_next else
+                       config_utils.unwrap_kimi_text_config(config))
         if max_beam_width > 1:
             raise ValueError(
                 "glm5_next + beam search is not supported yet."

@@ -175,6 +175,7 @@ def test_skip_drafting_routes_through_the_guided_helper():
     worker = _Worker(MagicMock(name="guided_decoder"))
     batch_size = 3
     attn_metadata = MagicMock(num_seqs=batch_size, num_contexts=1)
+    attn_metadata.kv_cache_manager.use_kda_replay_update = False
     logits = torch.zeros((batch_size, 8))
     with (
         patch.object(_Worker, "_execute_guided_decoder_if_present") as helper,
@@ -195,4 +196,5 @@ def test_skip_drafting_routes_through_the_guided_helper():
         )
 
     helper.assert_called_once_with(logits)
+    attn_metadata.kv_cache_manager.update_mamba_states.assert_not_called()
     assert out["new_tokens"].tolist() == [[0], [1], [2]]
