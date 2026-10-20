@@ -491,7 +491,9 @@ class ExternalCommMoEScheduler(MoEScheduler):
                 token_selected_experts, token_final_scales, x, x_sf = fused_result
                 used_fused_route_quant = True
 
-            token_selected_experts = token_selected_experts.to(torch.int32)
+            token_selected_experts = moe._maybe_get_perfect_router_expert_ids(
+                token_selected_experts.to(torch.int32)
+            )
             if row_offset is not None:
                 route_capture = get_active_route_capture()
                 if route_capture is not None:  # R3: in-graph device-buffer capture
@@ -1498,7 +1500,9 @@ class FusedCommMoEScheduler(MoEScheduler):
                 token_selected_experts, token_final_scales = moe.routing_method.apply_with_aux(
                     router_logits_chunk_real, input_ids_chunk_real, routing_aux[:num_tokens]
                 )
-            token_selected_experts = token_selected_experts.to(torch.int32)
+            token_selected_experts = moe._maybe_get_perfect_router_expert_ids(
+                token_selected_experts.to(torch.int32)
+            )
             route_capture = get_active_route_capture()
             if route_capture is not None:  # R3: in-graph device-buffer capture
                 route_capture.capture(moe.layer_idx, token_selected_experts, row_offset)

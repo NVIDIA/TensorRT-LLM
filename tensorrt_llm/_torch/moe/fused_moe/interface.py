@@ -53,6 +53,7 @@ from ...utils import (ActivationType, AuxStreamType, Fp4QuantizedTensor,
                       get_model_extra_attrs, is_gated_activation,
                       is_torch_compiling)
 from .routing import (BaseMoeRoutingMethod, RoutingMethodType,
+                      get_cached_perfect_router_expert_ids,
                       get_cached_perfect_router_logits,
                       precompute_common_perfect_router_logits)
 
@@ -466,8 +467,12 @@ class MoE(MoEExecutionContractMixin, MoEWeightOwnerMixin,
         return self.dtype if self.dtype is not None else torch.float32
 
     def _init_perfect_router(self):
-        self._enable_perfect_router = os.environ.get("ENABLE_PERFECT_ROUTER",
-                                                     "0") == "1"
+        # ENABLE_PERFECT_ROUTER=1 replaces the router logits before routing;
+        # ENABLE_PERFECT_ROUTER=expert_ids replaces the routed expert ids after
+        # routing. Both are for performance analysis only.
+        perfect_router = os.environ.get("ENABLE_PERFECT_ROUTER", "0")
+        self._enable_perfect_router = perfect_router == "1"
+        self._enable_perfect_router_expert_ids = perfect_router == "expert_ids"
         if not self._enable_perfect_router:
             return
 
@@ -495,6 +500,27 @@ class MoE(MoEExecutionContractMixin, MoEWeightOwnerMixin,
             device=router_logits.device,
             dtype=router_logits.dtype,
             routing_method=self.routing_method)
+
+    def _maybe_get_perfect_router_expert_ids(
+            self, token_selected_experts: torch.Tensor) -> torch.Tensor:
+        """Return balanced expert ids under ENABLE_PERFECT_ROUTER=expert_ids.
+
+        The router still runs, so its cost is kept; only its expert ids are
+        replaced, by a view of a cached table (see
+        ``get_cached_perfect_router_expert_ids``). The routing scales are left
+        as computed. Model outputs are wrong by design.
+        """
+        if not self._enable_perfect_router_expert_ids:
+            return token_selected_experts
+
+        num_tokens, experts_per_token = token_selected_experts.shape
+        return get_cached_perfect_router_expert_ids(
+            num_tokens=num_tokens,
+            num_experts=self.num_experts,
+            experts_per_token=experts_per_token,
+            moe_ep_size=self.ep_size,
+            ep_rank=self.ep_rank,
+            device=token_selected_experts.device)
 
     def _init_load_balancer(
         self,
