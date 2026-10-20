@@ -601,6 +601,26 @@ ReusedBlocksByLevelByLifeCycle KvCacheManager::getAndResetIterationReusedBlocksB
     return byLifeCycle;
 }
 
+void KvCacheManager::commitConnectorReusedBlocks(ConnectorReusedBlocksByLifeCycle const& byLifeCycle)
+{
+    for (auto const& [lifeCycle, numBlocks] : byLifeCycle)
+    {
+        TLLM_CHECK_DEBUG(numBlocks >= 0);
+        if (numBlocks != 0)
+        {
+            mIterConnectorReusedBlocks[lifeCycle] += numBlocks;
+        }
+    }
+}
+
+ConnectorReusedBlocksByLifeCycle KvCacheManager::getAndResetIterationConnectorReusedBlocks()
+{
+    auto const apiLock = lockExclusive();
+    ConnectorReusedBlocksByLifeCycle byLifeCycle;
+    byLifeCycle.swap(mIterConnectorReusedBlocks);
+    return byLifeCycle;
+}
+
 void KvCacheManager::recordRequestSuspended()
 {
     auto const apiLock = lockExclusive();
@@ -655,6 +675,24 @@ CountsByLevel KvCacheManager::getAndResetIterationCachedTokensByLevel()
     CountsByLevel counts;
     std::swap(counts, mIterCachedTokensByLevel);
     return counts;
+}
+
+void KvCacheManager::commitConnectorCachedTokens(int64_t numTokens)
+{
+    TLLM_CHECK_DEBUG(numTokens >= 0);
+    if (!mConfig.enableStats)
+    {
+        return;
+    }
+    mIterConnectorCachedTokens += numTokens;
+}
+
+int64_t KvCacheManager::getAndResetIterationConnectorCachedTokens()
+{
+    auto const apiLock = lockExclusive();
+    auto const numTokens = mIterConnectorCachedTokens;
+    mIterConnectorCachedTokens = 0;
+    return numTokens;
 }
 
 std::pair<int64_t, int64_t> KvCacheManager::getAndResetIterationSuspendResumeStats()
