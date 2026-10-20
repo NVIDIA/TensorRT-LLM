@@ -1261,6 +1261,7 @@ def _adapter_to_fp8(adapter):
 @requires_native_fp8
 @pytest.mark.parametrize("schema", ["per_request", "slot_indexed"])
 def test_moe_fp8_adapter_weights_change_output(schema):
+    """Compare native FP8 LoRA with BF16 execution of the same rounded weights."""
     device = torch.device("cuda")
     dtype = torch.bfloat16
     num_tokens, hidden_size, inter_size = 16, 128, 256
@@ -1309,6 +1310,35 @@ def test_moe_fp8_adapter_weights_change_output(schema):
     assert torch.isfinite(out_lora).all()
     diff = (out_lora.float() - out_baseline.float()).abs().mean().item()
     assert diff > 1e-3, f"Native FP8 MoE LoRA ({schema}) had no observable effect: {diff}"
+
+    # Upcasting preserves the E4M3 weight values; only execution precision differs.
+    fc1_ref, gated_ref, fc2_ref = [
+        {name: tensor.to(dtype).contiguous() for name, tensor in adapter.items()}
+        for adapter in (fc1_adapter, gated_adapter, fc2_adapter)
+    ]
+    ref_kwargs = builder(
+        num_tokens,
+        fc1_ref["A"],
+        fc1_ref["B"],
+        fc2_ref["A"],
+        fc2_ref["B"],
+        rank=rank,
+        gated_a=gated_ref["A"],
+        gated_b=gated_ref["B"],
+    )
+    ref_kwargs["lora_dtype"] = dtype
+    out_ref = _call_fused_moe(
+        x, w3_w1, w2, topk_ids, topk_scores, output_dtype=dtype, lora_kwargs=ref_kwargs
+    )[0]
+
+    reference_delta = out_ref.float() - out_baseline.float()
+    actual_delta = out_lora.float() - out_baseline.float()
+    relative_error = torch.linalg.vector_norm(
+        actual_delta - reference_delta
+    ) / torch.linalg.vector_norm(reference_delta)
+    assert relative_error < 0.10, (
+        f"Native FP8 MoE LoRA ({schema}) differs from BF16 reference: {relative_error}"
+    )
 
 
 # -- Per-tensor FP8 (qdq) base weights + routed-expert LoRA -----------------
