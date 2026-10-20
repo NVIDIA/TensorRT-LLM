@@ -423,6 +423,51 @@ def test_fp8_pool_scores_track_bf16_selection(single_request):
     assert overlaps and sum(overlaps) / len(overlaps) > 0.97 and min(overlaps) > 0.9
 
 
+@pytest.mark.skipif(
+    get_sm_version() not in (100, 103), reason="DeepGEMM MQA logits require SM100/103"
+)
+def test_fp8_pool_scores_of_a_table_range_match_the_packed_call():
+    """Scoring one request against its own table equals its rows of a multi-table call."""
+    gen = torch.Generator(device="cuda").manual_seed(11)
+    heads, tpb, slots = 32, 32, 400
+    lens = [3000, 2500, 1200]
+    pages = [(length + tpb - 1) // tpb for length in lens]
+    pool = torch.randn(slots, 2, tpb, 3 * HD, generator=gen, device="cuda").to(torch.bfloat16)[:, 1]
+    perm = torch.randperm(slots, generator=gen, device="cuda")
+    tables = torch.zeros(len(lens), max(pages), dtype=torch.int64, device="cuda")
+    start = 0
+    for i, count in enumerate(pages):
+        tables[i, :count] = perm[start : start + count]
+        start += count
+    request_ids = torch.cat(
+        [torch.full((length,), i, dtype=torch.int32) for i, length in enumerate(lens)]
+    ).cuda()
+    kv_lens = torch.cat([torch.arange(1, length + 1, dtype=torch.int32) for length in lens]).cuda()
+    q = torch.randn(kv_lens.shape[0], heads, HD, generator=gen, device="cuda").to(torch.bfloat16)
+    w = torch.randn(kv_lens.shape[0], heads, generator=gen, device="cuda").to(torch.bfloat16)
+    kwargs = dict(head_dim=HD, kpool=KPOOL, q_scale=HD**-0.5, w_scale=heads**-0.5)
+    packed = kpool_score_fp8(
+        q, w, pool, tables, kv_lens, tpb, request_ids=request_ids, max_kv_len=max(lens), **kwargs
+    )
+    first = lens[0]
+    rows = slice(first, first + lens[1])
+    alone = kpool_score_fp8(
+        q[rows],
+        w[rows],
+        pool,
+        tables[1:2],
+        kv_lens[rows],
+        tpb,
+        request_ids=request_ids[rows] - 1,
+        max_kv_len=lens[1],
+        **kwargs,
+    )
+    assert packed is not None and alone is not None
+    for row in range(0, lens[1], 97):
+        visible = (row + 1) // KPOOL
+        torch.testing.assert_close(alone[row, :visible], packed[first + row, :visible])
+
+
 def test_pool_expansion_graph_replay_tracks_request_tables_and_tails():
     # Requests occupy disjoint slots, with gaps between slots from coalesced buffers.
     tables = torch.tensor([[3, 1], [5, 2]], dtype=torch.int64, device="cuda")
