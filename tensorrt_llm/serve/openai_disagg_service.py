@@ -16,6 +16,7 @@ import asyncio
 import os
 from typing import Callable, Optional
 
+from tensorrt_llm._utils import get_steady_clock_now_in_seconds
 from tensorrt_llm.llmapi.disagg_utils import ConditionalDisaggConfig, DisaggServerConfig, ServerRole
 from tensorrt_llm.logger import logger
 from tensorrt_llm.serve.anthropic_protocol import (
@@ -147,6 +148,7 @@ class OpenAIDisaggregatedService(OpenAIService):
     ) -> UCompletionResponseOrGenerator:
         # ctx_response contains a http response with ContextPhaseParams attached after prefill compute is done
 
+        arrival_time = self._get_arrival_time(hooks)
         if hooks:
             hooks.on_req_begin(request)
         # empty server means client decides which server to use
@@ -204,6 +206,7 @@ class OpenAIDisaggregatedService(OpenAIService):
                     gen_req, exclude_server=ctx_server, req_id=disagg_request_id
                 )
                 gen_reservation_id = disagg_request_id
+            self._stamp_orig_elapsed(gen_req, arrival_time)
             gen_response = await self._gen_client.send_request(
                 gen_req, server=gen_server, hooks=hooks, req_id=gen_reservation_id
             )
@@ -218,6 +221,22 @@ class OpenAIDisaggregatedService(OpenAIService):
                 # make up for this by returning a done generator
                 return done_generator()
             return ctx_response
+
+    @staticmethod
+    def _get_arrival_time(hooks: Optional[ResponseHooks]) -> float:
+        """The HTTP middleware's steady-clock arrival stamp, else now."""
+        arrival_time = getattr(hooks, "request_arrival_time", None)
+        if isinstance(arrival_time, (int, float)) and arrival_time > 0:
+            return float(arrival_time)
+        return get_steady_clock_now_in_seconds()
+
+    @staticmethod
+    def _stamp_orig_elapsed(gen_req: UCompletionRequest, arrival_time: float) -> None:
+        """A duration rather than a timestamp, so no cross-host clock sync is needed."""
+        params = gen_req.disaggregated_params
+        if params is None:
+            return
+        params.orig_elapsed_s = max(0.0, get_steady_clock_now_in_seconds() - arrival_time)
 
     def _need_gen(self, response: UCompletionResponse) -> bool:
         if response:
@@ -449,6 +468,7 @@ class OpenAIDisaggregatedService(OpenAIService):
             ctx_server_info=ctx_server_info,
         )
         self._strip_gen_subagent_affinity(gen_req)
+        # No orig_elapsed_s before the context phase: GEN admission keeps it FCFS.
 
         if request.stream and need_ctx:
             # For streaming gen_first requests, the gen client returns a lazy
