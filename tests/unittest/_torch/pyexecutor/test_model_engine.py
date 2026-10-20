@@ -1057,6 +1057,7 @@ class TestWarmupCleanup(unittest.TestCase):
     def test_no_kv_cache_warmup_rejects_allocated_kv_cache(self) -> None:
         """Verify a no-KV-cache runner rejects an allocated KV cache before warmup."""
         model_engine = object.__new__(ModelEngine)
+        model_engine.llm_args = SimpleNamespace(enable_autotuner=False)
         model_engine._metrics = {}
         model_engine.model = SimpleNamespace(model_config=SimpleNamespace(is_encoder_decoder=False))
         model_engine.moe_load_balancer = None
