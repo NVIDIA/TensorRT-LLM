@@ -882,10 +882,7 @@ def _construct_megamoe_kernel(
     from cutlass.cute.nvgpu import OperandMajorMode
 
     from tensorrt_llm._torch.moe.kernels.cutedsl_megamoe.api import ImplDesc, ProblemDesc
-    from tensorrt_llm._torch.moe.kernels.cutedsl_megamoe.quant_def import (
-        CombineFormat,
-        QuantKind,
-    )
+    from tensorrt_llm._torch.moe.kernels.cutedsl_megamoe.quant_def import CombineFormat, QuantKind
     from tensorrt_llm._torch.moe.kernels.megamoe_kernels import (
         BlackwellInferenceMegaMoE,
         RubinInferenceGenphaseMegaMoE,
@@ -1554,6 +1551,19 @@ if IS_MEGAMOE_OP_AVAILABLE:
 
         return to_cute, to_cute_ptr, SymBufferHost, cute
 
+    def _to_cute_cached(cache: dict, t: torch.Tensor, assumed_align: int = 16):
+        """Return the cute view of ``t`` from ``cache``, converting it on a miss.
+
+        The key holds everything the view encodes, so a hit equals a fresh
+        conversion even if the address was reused. Only for tensors whose
+        layout is fixed (module weights): one entry per tensor.
+        """
+        key = (t.data_ptr(), tuple(t.shape), t.stride(), t.dtype, t.device.index, assumed_align)
+        cute_tensor = cache.get(key)
+        if cute_tensor is None:
+            cute_tensor = cache[key] = _cute_launch_helpers()[0](t, assumed_align)
+        return cute_tensor
+
     def _evict_latched_tuning_workspaces() -> None:
         """Pop every tuning-latched local workspace and prune its fence keys.
 
@@ -1932,6 +1942,16 @@ if IS_MEGAMOE_OP_AVAILABLE:
         )
         _MEGAMOE_PROFILING_SCRATCH_CACHE[cache_key] = provider
         return provider
+
+    # Cute views of the calling module's weights, set by the backend around
+    # the op call like the profiling scratch. A cute view keeps its tensor
+    # alive, so the module owns the dict and the views never outlive it.
+    _ACTIVE_MEGAMOE_CUTE_WEIGHT_CACHE: Optional[dict] = None
+
+    def set_active_megamoe_cute_weight_cache(cache: Optional[dict]) -> None:
+        """Set (``None`` clears) the calling module's cute weight-view cache."""
+        global _ACTIVE_MEGAMOE_CUTE_WEIGHT_CACHE
+        _ACTIVE_MEGAMOE_CUTE_WEIGHT_CACHE = cache
 
     def set_active_megamoe_profiling_scratch(regions) -> None:
         """Set (``None`` clears) the :class:`MegaMoeSymmRegions` used for
@@ -2786,6 +2806,12 @@ if IS_MEGAMOE_OP_AVAILABLE:
             # 32-bit memref shape field overflows once shared_workspace passes
             # 2 GiB (the kernel addresses by raw base + Int64 byte offset).
             _to_cute, _to_cute_ptr, SymBufferHost, cute = _cute_launch_helpers()
+            # Weights reuse the calling module's cute views; tuning launches convert afresh.
+            weight_cache = _ACTIVE_MEGAMOE_CUTE_WEIGHT_CACHE
+            if weight_cache is None or AutoTuner.get().is_tuning_mode:
+                _to_cute_w = _to_cute
+            else:
+                _to_cute_w = functools.partial(_to_cute_cached, weight_cache)
 
             # combine_output (max_T, 1, hidden) reshapes freely to 2D. Weights
             # present K stride-1 via a transpose VIEW (DLPack carries the
@@ -2794,13 +2820,13 @@ if IS_MEGAMOE_OP_AVAILABLE:
             runtime_kwargs = dict(
                 activation=_to_cute(activation),
                 activation_sf=_to_cute(activation_sf),
-                fc1_weight=_to_cute(fc1_weight.transpose(1, 2)),
-                fc1_weight_sf=_to_cute(fc1_weight_sf),
-                fc2_weight=_to_cute(fc2_weight.transpose(1, 2)),
-                fc2_weight_sf=_to_cute(fc2_weight_sf),
-                fc1_alpha=_to_cute(fc1_alpha, assumed_align=4),
-                fc2_alpha=_to_cute(fc2_alpha, assumed_align=4),
-                fc1_norm_const=_to_cute(fc1_norm_const, assumed_align=4),
+                fc1_weight=_to_cute_w(fc1_weight.transpose(1, 2)),
+                fc1_weight_sf=_to_cute_w(fc1_weight_sf),
+                fc2_weight=_to_cute_w(fc2_weight.transpose(1, 2)),
+                fc2_weight_sf=_to_cute_w(fc2_weight_sf),
+                fc1_alpha=_to_cute_w(fc1_alpha, assumed_align=4),
+                fc2_alpha=_to_cute_w(fc2_alpha, assumed_align=4),
+                fc1_norm_const=_to_cute_w(fc1_norm_const, assumed_align=4),
                 output_activation=_to_cute(output_activation),
                 local_workspace=_to_cute_ptr(local_workspace),
                 shared_workspace=_to_cute_ptr(shared_workspace),
@@ -2816,7 +2842,6 @@ if IS_MEGAMOE_OP_AVAILABLE:
                     max_ranks=int(self.world_size),
                 ),
             )
-            cache_key = self._tactic_cache_key(tactic_t)
             # READY ABI tail: attached only when S > 0, i.e. rebalance is on.
             # Contract: with S > 0 both values must be supplied. Fail loudly
             # here rather than hand the kernel an unarmed gate.
@@ -2942,12 +2967,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
 
     # ----- torch op ---------------------------------------------------------
 
-    @torch.library.custom_op(
-        "trtllm::cute_dsl_megamoe_nvfp4_blackwell",
-        mutates_args=("combine_output", "shared_workspace"),
-        device_types="cuda",
-    )
-    def cute_dsl_megamoe_nvfp4_blackwell(
+    def run_cute_dsl_megamoe_nvfp4_blackwell(
         activation: torch.Tensor,
         activation_sf: torch.Tensor,
         topk_idx: torch.Tensor,
@@ -3140,6 +3160,14 @@ if IS_MEGAMOE_OP_AVAILABLE:
             peer_offsets=peer_offsets,
             shared_workspace=shared_workspace,
         )
+
+    # Eager callers may call ``run_cute_dsl_megamoe_nvfp4_blackwell`` directly
+    # and skip the custom-op dispatch; traced code must use the registered op.
+    cute_dsl_megamoe_nvfp4_blackwell = torch.library.custom_op(
+        "trtllm::cute_dsl_megamoe_nvfp4_blackwell",
+        mutates_args=("combine_output", "shared_workspace"),
+        device_types="cuda",
+    )(run_cute_dsl_megamoe_nvfp4_blackwell)
 
     @torch.library.register_fake("trtllm::cute_dsl_megamoe_nvfp4_blackwell")
     def _(

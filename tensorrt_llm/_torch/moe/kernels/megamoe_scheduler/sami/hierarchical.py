@@ -14,6 +14,7 @@ from cuda.bindings import driver as cuda
 
 from .arena import BoundLiveWeightArena, LiveWeightArena, _TensorIdentity
 from ._util import check_cuda
+from ..cuda_scheduler.runtime import enter_cuda_stream, exit_cuda_stream
 from ..geometry import hierarchy_group_sizes
 from .geometry import BundleLayout
 
@@ -634,9 +635,8 @@ class HierarchicalSamiWeightBroadcast:
                 raise RuntimeError("outputs are not from the bound CUDA scheduler")
             self._require_live_bank_reusable()
             try:
-                with torch.cuda.device(self.device), torch.cuda.stream(
-                    self._stream_owner
-                ):
+                state = enter_cuda_stream(self._stream_owner)
+                try:
                     if start_event is not None:
                         start_event.record()
                     commands = int(
@@ -648,6 +648,8 @@ class HierarchicalSamiWeightBroadcast:
                         payload_end_event.record()
                     if end_event is not None:
                         end_event.record()
+                finally:
+                    exit_cuda_stream(state)
                 self._active_generation = self._generation
                 release = getattr(self._scheduler, "release_plan_channel")
                 release()
