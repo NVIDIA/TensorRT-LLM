@@ -332,8 +332,9 @@ Entries: `Arch.SM_100` is declared on every shared entry the target calls, each 
 whole on sm_100: `thop_attention`, `cublas_mm`, `flashinfer_rmsnorm`,
 `flashinfer_fused_add_rmsnorm`, `rms_norm_gated_grouped`, `noaux_tc_op`,
 `causal_conv1d_fwd`, `causal_conv1d_update`, `mamba_chunk_scan_combined`,
-`selective_state_update`, `flashinfer_selective_state_update` (new, sm_100 only) and the
-promoted ones, `fused_moe`, `allreduce` and `mnnvl_fusion_allreduce`. The
+`selective_state_update`, `flashinfer_selective_state_update` and
+`flashinfer_direct_bf16_gemm` (new, sm_100 only) and the promoted ones, `fused_moe`,
+`allreduce` and `mnnvl_fusion_allreduce`. The
 cells added for tep8 -- the rank's in_proj, qkv, o_proj and shared-expert GEMM shapes;
 8 q / 1 kv head over a bf16 pool, including rows 4 and 55 of a real
 `MambaHybridCacheManagerV2`'s 60-row mapping; conv, scan and decode-step shapes at 32
@@ -450,6 +451,24 @@ noise there), time to first token unchanged; gsm8k 94.617 on tep8 and 94.920 on 
 both changes the tp8ep2 target serves 145.8 / 2616.9 / 5831.8 / 8309.4 output tok/s where
 tep8 without FlashInfer's step served 138.9 / 2402.1 / 5356.7 / 7671.0 (mean of two runs):
 +5.0 / +8.9 / +8.9 / +8.3%.
+
+#### Decode projections at one and two rows
+
+A decode step of one or two rows is latency-bound: every dense projection reads its whole
+weight to produce a row or two. Both BF16 targets run the four K = 8192 projections of such a
+step -- the mamba in_proj, qkv, the shared expert's up projection and fc1_latent -- through
+`flashinfer_direct_bf16_gemm`, FlashInfer's register-prefetch kernel, instead of `cublas_mm`:
+at one row it is 1.3-2.3x faster on those shapes in CUDA-graph replay, at two still ahead, and
+from four rows on not, hence the two-row threshold. The router keeps `cublas_mm`: each shape
+has one fixed tactic, so ranks running a replicated projection get the same bits, but the
+router's fp32 logits are out of the kernel's reach. On two GB200 nodes, alternating off / on /
+off / on on one allocation, tp8ep2 serves 154.4 output tok/s at one concurrent request where it
+served 146.0 (+5.8%, time per output token 6.78 -> 6.39 ms) and is unchanged at eight (884 vs
+890, within the noise of the two off runs); gsm8k 94.845 on tp8ep2 and 94.617 on tep8. An
+nsys trace of the one-request step puts in_proj, fc1_latent and qkv / shared up at 13.3, 8.6
+and 6.6 us per call in the model against 11.2, 6.5 and 4.5 us in isolation: the kernel waits
+for its predecessor before it loads weights and releases its dependents only after its stores,
+which an earlier PDL trigger would overlap.
 
 ### What replaced the version pin
 
