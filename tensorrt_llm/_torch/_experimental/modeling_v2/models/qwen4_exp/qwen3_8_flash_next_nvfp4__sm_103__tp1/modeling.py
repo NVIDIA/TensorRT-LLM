@@ -4677,9 +4677,12 @@ class DecodeTarget:
         advanced, so a request that grows past the threshold finds its prefix
         already compressed; above it the dense core is replaced outright and the
         main K/V append becomes this layer's own call, because the op that would
-        have done it is not the one running. Above the threshold over a bf16 pool
-        everything up to the index scores is one launch,
-        `qwen4_exp_attn_decode_prologue`."""
+        have done it is not the one running. Above the threshold over a bf16 pool,
+        on a step with one row per request, everything up to the index scores is one
+        launch, `qwen4_exp_attn_decode_prologue`. A verify step stays on the composed
+        prologue: at a group's last token that launch reads the group's earlier keys
+        from the index plane, and in a verify group the rows before it are written by
+        the same launch."""
         core = self.core
         (
             req_idx,
@@ -4716,13 +4719,11 @@ class DecodeTarget:
         index_section = (_QSA_MROPE_SECTION or (0, 0, 0)) if _QSA_INDEX_USE_MROPE else (0, 0, 0)
         index_cache = core._bound.index_cache[i]
         kv = core._bound.kv[i]
-        fused_prologue = sparse and kv.k_scale is None and kv.k.dtype == proj.dtype
+        fused_prologue = sparse and not stage and kv.k_scale is None and kv.k.dtype == proj.dtype
         if fused_prologue:
             # The norm + rope of both planes, the K/V append the dense op would have
             # owned, and the index branch's raw-key and coordinate store and group
             # compression in one launch on this stream.
-            if stage:
-                core.spec_rollback.stage_index(index_cache, core._bound.position_cache)
             qwen4_exp_attn_decode_prologue(
                 proj,
                 q_index,
@@ -4782,9 +4783,10 @@ class DecodeTarget:
                 only_visible_blocks=True,
                 context_rows=False,
                 # Its predecessor is the prologue launch and its consumer the top-k,
-                # which waits before reading the scores. The prologue writes no
-                # compressed key but the one the entry re-reads after its wait, so at
-                # decode-sized batches the pages and keys are read before it.
+                # which waits before reading the scores. With one row per request the
+                # prologue writes no compressed key but the one the entry re-reads
+                # after its wait, so at decode-sized batches the pages and keys are
+                # read before it.
                 use_pdl=fused_prologue,
                 prefetch=fused_prologue and num_tokens <= _SPARSE_DECODE_MAX_ROWS,
             )
