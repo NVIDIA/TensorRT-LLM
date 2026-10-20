@@ -1,20 +1,20 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test for the flashinfer_chunk_gated_delta_rule catalog entry (FlashInfer GDN prefill)."""
+"""GPU test for the flashinfer_chunk_gated_delta_rule entry (FlashInfer GDN prefill)."""
 
 import zlib
 
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.ssm.flashinfer_chunk_gated_delta_rule import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.ssm.flashinfer_chunk_gated_delta_rule import (  # noqa: E501
     QWEN38_GEOMETRY,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.ssm.flashinfer_chunk_gated_delta_rule import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.ssm.flashinfer_chunk_gated_delta_rule import (  # noqa: E501
     flashinfer_chunk_gated_delta_rule as op,
 )
 
-__extra_import_path__ = [".."]
+__extra_import_path__ = ["../../../.."]
 from _validating import certifying, validating  # noqa: E402,F401 — path above; fixture by name
 
 assert torch.cuda.is_available(), "flashinfer_chunk_gated_delta_rule requires a CUDA device"
