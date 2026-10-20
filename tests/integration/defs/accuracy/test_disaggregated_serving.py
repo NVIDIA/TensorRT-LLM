@@ -1694,9 +1694,9 @@ class TestQwen3_8BDFlash(LlmapiAccuracyTestHarness):
                 ctx_server_config,
                 gen_server_config,
                 self.MODEL_PATH,
-                extra_env={"TRTLLM_DISAGG_SHARED_DRAFT_KV": "1"},
                 assert_worker_log_contains=
-                "target and draft KV layers share one KV cache manager") as llm:
+                "target and draft KV layers share one KV cache manager",
+                extra_env={"TRTLLM_DISAGG_SHARED_DRAFT_KV": "1"}) as llm:
             llm.args.speculative_config = DFlashDecodingConfig(
                 max_draft_len=self.MAX_DRAFT_LEN,
                 speculative_model=self.DRAFT_PATH,

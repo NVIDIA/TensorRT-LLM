@@ -632,9 +632,16 @@ class DFlashSpecMetadata(SpecMetadata):
             worker._write_ctx_len(assigned)
 
             # Route unknown request IDs (cuda graph padding or warmup dummies)
-            # to dummy slot to avoid corrupting real request's context
+            # to dummy slot to avoid corrupting real request's context. A
+            # generation row with the idle id is a dummy even when a context
+            # warmup stored a prompt under that id: its length is not this row's.
             mapping = torch.tensor(
-                [worker._req_to_slot.get(rid, worker._dummy_slot) for rid in self.request_ids],
+                [
+                    worker._dummy_slot
+                    if i >= num_contexts and rid == ATTENTION_DP_DUMMY_REQUEST_ID
+                    else worker._req_to_slot.get(rid, worker._dummy_slot)
+                    for i, rid in enumerate(self.request_ids)
+                ],
                 dtype=torch.long,
                 device="cpu",
                 pin_memory=prefer_pinned(),
@@ -994,26 +1001,28 @@ class DFlashWorker(SpecWorkerBase):
         if isinstance(mgr, KVCacheManagerV2):
             converter = mgr.impl.get_page_index_converter(layer_offset, Role.KEY)
             layer_group_id = mgr.layer_to_pool_mapping_dict[layer_offset]
+            unsupported = None
             if mgr.enable_swa_scratch_reuse:
-                raise NotImplementedError(
-                    "DFlash managed context does not support SWA scratch pages"
-                )
+                unsupported = "DFlash managed context does not support SWA scratch pages"
             for layer_id in self._ctx_layer_ids:
                 local_id = mgr.layer_offsets[layer_id]
                 if (
                     mgr.layer_to_pool_mapping_dict[local_id] != layer_group_id
                     or mgr.get_layer_page_index_scale(layer_id) != converter.scale
                 ):
-                    if self._ctx_unified_cache:
-                        raise NotImplementedError(
-                            "DFlash's shared context block table requires draft layers "
-                            "with the same lifecycle and page-index scale"
-                        )
-                    logger.warning(
-                        "DFlash: draft KV layers have different lifecycles or page-index "
-                        "scales; using the private ctx arena."
+                    unsupported = (
+                        "DFlash's shared context block table requires draft layers "
+                        "with the same lifecycle and page-index scale"
                     )
-                    return False
+                    break
+            if unsupported is not None:
+                # A unified manager was selected for this layout, so the drafter
+                # cannot move to private storage without breaking allocation,
+                # reuse and transfer. A separate manager keeps the private arena.
+                if self._ctx_unified_cache:
+                    raise NotImplementedError(unsupported)
+                logger.warning(f"{unsupported}; using the private ctx arena.")
+                return False
             if per_layer_tables:
                 # Attention tables address the physical pool origin, whereas
                 # get_buffers() starts at this layer's own K buffer.
@@ -1066,6 +1075,23 @@ class DFlashWorker(SpecWorkerBase):
             f"view_pages={pool[0].size(0)}"
         )
         return True
+
+    @staticmethod
+    def _check_block_within_allocation(
+        num_ctx: torch.Tensor, allocated_ctx_limit: torch.Tensor, block_size: int
+    ) -> None:
+        """Raise when a request's drafter block would leave its allocated pages.
+
+        The shared manager sizes the request, so a shortfall there would have the
+        block's scratch write land on the last context position, or on another
+        request's page. Asynchronous, so it adds no host sync and is safe to
+        capture in a CUDA graph; on the device it traps instead of raising.
+        """
+        torch._assert_async(
+            (num_ctx <= allocated_ctx_limit).all(),
+            f"DFlash: the drafter's block of {block_size} positions falls outside the "
+            "pages the shared KV cache manager allocated for the request",
+        )
 
     def _refresh_ctx_block_tables(self, attn_metadata, num_seqs: int) -> bool:
         """Decode this iteration's draft block table into the persistent buffer.
@@ -1961,7 +1987,12 @@ class DFlashWorker(SpecWorkerBase):
         this alongside :meth:`_draft_slot_ids` — the two must agree, since
         the width bounds the slots the gather is allowed to name.
         """
-        return self.max_draft_len + 1
+        return self.block_width_for(self.spec_config)
+
+    @staticmethod
+    def block_width_for(spec_config) -> int:
+        """Block slots a worker of this family computes for ``spec_config``."""
+        return spec_config.max_draft_len + 1
 
     def _draft_slot_ids(
         self, draft_model, num_gens: int, block_size: int, num_draft_tokens: int
@@ -2283,6 +2314,10 @@ class DFlashWorker(SpecWorkerBase):
                 allocated = dflash_allocated_ctx_limit(
                     self._ctx_block_counts, self._ctx_page_size, block_size
                 )
+                if self._ctx_unified_cache:
+                    self._check_block_within_allocation(
+                        num_ctx_per_req_t, allocated[gen_rows_out], block_size
+                    )
                 num_ctx_per_req_t = torch.minimum(num_ctx_per_req_t, allocated[gen_rows_out])
             noise_embedding = noise_embed_2d
             query_positions = query_position_ids.long()

@@ -27,6 +27,7 @@ from tensorrt_llm._torch.pyexecutor._util import (
     _create_kv_cache_manager,
     _derive_v2_layer_type_attention_windows,
     _get_num_pool_groups_for_estimation,
+    _get_num_storage_pool_groups,
     get_mla_context_workspace_kv_len_cap,
 )
 from tensorrt_llm._torch.pyexecutor.config_utils import get_layer_attention_window
@@ -1735,3 +1736,55 @@ def test_create_kv_cache_manager_cross_pool_keeps_single_window_default() -> Non
 
     assert manager_config is kv_cache_config
     assert manager_config.max_attention_window is None
+
+
+def _fp8_target_bf16_draft_specs(*, draft_window):
+    target = KVCacheLayerSpec(
+        global_layer_id=0,
+        owner=KVCacheLayerOwner.TARGET,
+        dtype=DataType.FP8,
+        num_kv_heads=8,
+        head_dim=128,
+        buffer_roles=(Role.KEY, Role.VALUE),
+    )
+    return [
+        *(replace(target, global_layer_id=i) for i in range(3)),
+        replace(
+            target,
+            global_layer_id=3,
+            owner=KVCacheLayerOwner.DRAFT,
+            dtype=DataType.BF16,
+            sliding_window_size=draft_window,
+        ),
+    ]
+
+
+def test_unified_fp8_target_bf16_draft_scales_by_combined_pool_groups():
+    """The V2 pool-group count comes from the combined target and draft layout.
+
+    The FP8 target and the windowed BF16 draft differ in life cycle and slot
+    size, so they land in two pool groups; counting the target's model config
+    alone gives one.
+    """
+    tpb = 32
+    spec_config = SimpleNamespace(
+        tokens_per_gen_step=1,
+        spec_dec_mode=SimpleNamespace(is_dflash=lambda: True, use_one_engine=lambda: False),
+    )
+    baseline = _make_creator(tpb, [_make_mock_request(128)], False, 1)
+    baseline._speculative_config = spec_config
+    baseline._build_unified_dflash_layer_specs = lambda kv_cache_config: ()
+    unified = _make_creator(tpb, [_make_mock_request(128)], False, 1)
+    unified._speculative_config = spec_config
+    specs = _fp8_target_bf16_draft_specs(draft_window=128)
+    unified._build_unified_dflash_layer_specs = lambda kv_cache_config: tuple(specs)
+
+    assert _get_num_storage_pool_groups(specs, tpb) == 2
+    assert unified._get_token_num_for_estimation() == 2 * baseline._get_token_num_for_estimation()
+
+
+def test_unified_fp8_target_bf16_draft_in_one_life_cycle_is_one_pool_group():
+    """Pages of different sizes in one life cycle share a pool group."""
+    specs = _fp8_target_bf16_draft_specs(draft_window=None)
+
+    assert _get_num_storage_pool_groups(specs, 32) == 1
