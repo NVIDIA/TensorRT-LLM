@@ -28,7 +28,7 @@ if __name__ == '__main__':
     main()
 ```
 
-The blocks from the prompts are stored for reuse with the default priority of 35 on a scale from 1 to 100, where 100 is highest priority and 1 is lowest priority. Assume you know that the first four tokens of each prompt represent a system prompt that should be stored with high priority (100). You can achieve this by providing a KV cache retention config object when you submit the prompts for generation:
+The blocks from the prompts are stored for reuse with the default priority of 35 on a scale from 0 to 100, where 100 is highest priority and 0 is lowest priority. Assume you know that the first four tokens of each prompt represent a system prompt that should be stored with high priority (100). You can achieve this by providing a KV cache retention config object when you submit the prompts for generation:
 
 ```python
 from tensorrt_llm import LLM, SamplingParams
@@ -66,3 +66,9 @@ if __name__ == '__main__':
 ```
 
 This example uses a single ```kv_cache_retention_config``` object for all the prompts. You can also provide a list that must have the same length as the list of prompts.
+
+## KV Cache Manager V2
+
+KV cache manager V2 accepts the same `KvCacheRetentionConfig`, so the examples above work unchanged. For `transfer_mode`, V2 supports only the default `DRAM` and rejects requests that set `GDS` or `POSIX_DEBUG_FALLBACK`. V2's host and disk offload tiers are configured manager-wide when the manager is created and are independent of these per-request transfer modes.
+
+The priority threshold that decides which evicted blocks are offloaded is also manager-wide; see [Enable Offloading to Host Memory](../features/kvcache.md#enable-offloading-to-host-memory).

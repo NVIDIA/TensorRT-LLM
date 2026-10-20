@@ -454,6 +454,9 @@ struct KVCacheManagerConfig
     // Beam search disables this while retaining full-block reuse.
     bool enablePartialCommit = true;
 
+    // Unreferenced GPU pages below this priority are dropped instead of offloaded.
+    Priority coldTierOffloadMinPriority = kDefaultColdTierOffloadMinPriority;
+
     bool enableSwaScratchReuse() const noexcept
     {
         return swaScratchReuse.has_value();
