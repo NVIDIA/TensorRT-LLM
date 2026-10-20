@@ -20,7 +20,6 @@ import argparse
 
 from tensorrt_llm import VisualGen, VisualGenArgs
 
-
 FASTH3_MODEL_ID = "FastVideo/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree"
 
 
