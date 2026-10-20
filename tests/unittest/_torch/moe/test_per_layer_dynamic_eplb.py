@@ -461,6 +461,27 @@ def test_helper_slot_mode_rejects_unknown_mode():
         PerLayerDynamicMoeLoadBalancer(ep_rank=0, ep_size=4, config=config)
 
 
+def test_scheduler_spin_bound_follows_the_warmup_guard_until_shutdown(monkeypatch):
+    from tensorrt_llm._torch.moe.fused_moe import moe_comm_timeout_guard
+
+    guard = moe_comm_timeout_guard.MoECommTimeoutGuard(environ={}, is_capturing=lambda: False)
+    monkeypatch.setattr(moe_comm_timeout_guard, "_DEFAULT_GUARD", guard)
+    manager = _manager()
+
+    bound = manager.get_scheduler_spin_bound()
+
+    assert manager.get_scheduler_spin_bound() is bound
+    assert bound.cycles() == 8_000_000_000
+    guard.set_warmup(True)
+    assert bound.cycles() == 1800 * 2_000_000_000
+    guard.set_warmup(False)
+    assert bound.cycles() == 8_000_000_000
+    assert manager.shutdown()
+    guard.set_warmup(True)
+    # A released bound no longer follows the guard.
+    assert bound.cycles() == 8_000_000_000
+
+
 def test_per_layer_dynamic_manager_shares_the_base_lifecycle_only():
     manager = _manager()
     assert isinstance(manager, BaseMoeLoadBalancer)

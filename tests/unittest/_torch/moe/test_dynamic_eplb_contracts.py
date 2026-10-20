@@ -10,10 +10,11 @@ import functools
 import importlib.util
 import math
 import os
+import re
 import sys
 from contextlib import nullcontext
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from typing import Any, List, Optional, Tuple
 
 import pytest
@@ -23,6 +24,11 @@ pytestmark = pytest.mark.cpu_only
 _ROOT = Path(__file__).resolve().parents[4]
 _TORCH_ROOT = _ROOT / "tensorrt_llm/_torch"
 _QUEUE = "CUDA_SCALE_LAUNCH_QUEUES"
+_SCHEDULER_RUNTIME = _TORCH_ROOT / "moe/kernels/megamoe_scheduler/cuda_scheduler/runtime.py"
+# The scheduler's native bound and the bound of the default 1800 s MoE
+# communication warmup timeout at the nominal 2 GHz clock.
+_SERVING_SPIN_CYCLES = 8_000_000_000
+_WARMUP_SPIN_CYCLES = 1800 * 2_000_000_000
 
 
 def _extract_class(
@@ -252,8 +258,8 @@ def test_hierarchical_fused_submit_launches_bound_scheduler_and_copy():
     outputs = object()
     requests = []
 
-    def fused_submit_args(routes, stream_handle):
-        requests.append((routes, stream_handle))
+    def fused_submit_args(routes, stream_handle, *, spin_cycles):
+        requests.append((routes, stream_handle, spin_cycles))
         return ("scheduler", routes)
 
     broadcast = broadcast_cls.__new__(broadcast_cls)
@@ -273,9 +279,9 @@ def test_hierarchical_fused_submit_launches_bound_scheduler_and_copy():
     broadcast.flags_mc = 4096
     broadcast.terminal_flags = "terminals"
 
-    ticket = broadcast.submit_fused(outputs, "routes", "epoch", 8)
+    ticket = broadcast.submit_fused(outputs, "routes", "epoch", 8, spin_cycles=12345)
 
-    assert requests == [("routes", 19)]
+    assert requests == [("routes", 19, 12345)]
     assert launches == [("ctx", 4096, "epoch", 8, ("scheduler", "routes"))]
     # The launch runs on the copy stream and restores the caller's stream afterwards.
     owner = broadcast._stream_owner
@@ -284,9 +290,9 @@ def test_hierarchical_fused_submit_launches_bound_scheduler_and_copy():
     assert (broadcast._active_generation, broadcast._generation) == (1, 2)
     # The bank stays leased until the consumer of generation 1 is proven done.
     with pytest.raises(RuntimeError, match="still leased"):
-        broadcast.submit_fused(outputs, "routes", "epoch", 16)
+        broadcast.submit_fused(outputs, "routes", "epoch", 16, spin_cycles=12345)
     with pytest.raises(RuntimeError, match="bound CUDA scheduler"):
-        broadcast.submit_fused(object(), "routes", "epoch", 16)
+        broadcast.submit_fused(object(), "routes", "epoch", 16, spin_cycles=12345)
 
 
 @pytest.mark.parametrize(
@@ -1219,6 +1225,9 @@ def test_fused_submit_orders_generations_and_defers_the_route_wait(auxiliary_sms
     route_epoch = object()
     group._route_epoch = route_epoch
     group._route_epoch_ptr = 77
+    # Generation 1 launches during warmup, generation 2 while serving.
+    bounds = iter((_WARMUP_SPIN_CYCLES, _SERVING_SPIN_CYCLES))
+    group._spin_bound = SimpleNamespace(cycles=lambda: next(bounds))
 
     def driver_call(*entry):
         trace.append(entry)
@@ -1235,10 +1244,13 @@ def test_fused_submit_orders_generations_and_defers_the_route_wait(auxiliary_sms
     )
     outputs = SimpleNamespace(physical_slot_ids=_Routes(8192, trace))
 
-    def submit_fused(result, routes, epoch, target):
+    launch_bounds = []
+
+    def submit_fused(result, routes, epoch, target, *, spin_cycles):
         assert result is outputs and epoch is route_epoch
         generation = group._scheduled_generation
         trace.append(("FUSED", routes.shape[0], target, generation))
+        launch_bounds.append(spin_cycles)
         return SimpleNamespace(generation=generation)
 
     group.scheduler = SimpleNamespace(device="cuda:0", outputs=outputs)
@@ -1273,6 +1285,7 @@ def test_fused_submit_orders_generations_and_defers_the_route_wait(auxiliary_sms
             assert trace.index(("lease", generation - 1)) < trace.index(
                 ("FUSED", rows, target, generation)
             )
+    assert launch_bounds == [_WARMUP_SPIN_CYCLES, _SERVING_SPIN_CYCLES]
 
     # The bound-owner fast path still rejects another thread, stream or device.
     state.thread = 8
@@ -1298,6 +1311,204 @@ def test_fused_submit_orders_generations_and_defers_the_route_wait(auxiliary_sms
         group.plan_schedule(_Routes(8, trace))
     assert not any(entry[0] == "FUSED" for entry in trace)
     assert group._plan_part is None
+
+
+def _module_constants(path: Path, names: set[str]) -> dict:
+    tree = ast.parse(path.read_text())
+    constants = {
+        node.targets[0].id: ast.literal_eval(node.value)
+        for node in tree.body
+        if isinstance(node, ast.Assign)
+        and len(node.targets) == 1
+        and isinstance(node.targets[0], ast.Name)
+        and node.targets[0].id in names
+    }
+    assert set(constants) == names
+    return constants
+
+
+def _scheduler_spin_namespace() -> dict:
+    namespace = _module_constants(_SCHEDULER_RUNTIME, {"SPIN_CYCLES", "ASSUMED_CLOCK_HZ"})
+    _extract_function(_SCHEDULER_RUNTIME, "spin_cycles_for_timeout", namespace)
+    _extract_function(_SCHEDULER_RUNTIME, "_check_spin_cycles", namespace)
+    return namespace
+
+
+def _moe_comm_timeout_guard_module(monkeypatch) -> ModuleType:
+    """Execute the timeout guard module without its torch and logger imports."""
+    path = _TORCH_ROOT / "moe/fused_moe/moe_comm_timeout_guard.py"
+    tree = ast.parse(path.read_text())
+    tree.body = [
+        node
+        for node in tree.body
+        if not (
+            (isinstance(node, ast.Import) and node.names[0].name == "torch")
+            or (isinstance(node, ast.ImportFrom) and node.module == "tensorrt_llm.logger")
+        )
+    ]
+    module = ModuleType("moe_comm_timeout_guard_under_test")
+    module.logger = SimpleNamespace(info=lambda *args, **kwargs: None)
+    module.torch = None
+    # Dataclasses resolve their module through sys.modules.
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    exec(compile(tree, str(path), "exec"), module.__dict__)
+    return module
+
+
+def test_scheduler_spin_cycles_convert_timeouts_at_the_nominal_clock():
+    namespace = _scheduler_spin_namespace()
+    to_cycles = namespace["spin_cycles_for_timeout"]
+
+    assert namespace["SPIN_CYCLES"] == _SERVING_SPIN_CYCLES
+    assert to_cycles(None) == _SERVING_SPIN_CYCLES
+    assert to_cycles(1800) == _WARMUP_SPIN_CYCLES
+    for seconds in (0, -1, 2.5, True):
+        with pytest.raises(ValueError, match="positive exact int"):
+            to_cycles(seconds)
+    for cycles in (0, -1, 1.0, True):
+        with pytest.raises(ValueError, match="positive exact int"):
+            namespace["_check_spin_cycles"](cycles)
+
+
+@pytest.mark.parametrize(
+    ("environ", "warmup_cycles", "serving_cycles"),
+    [
+        pytest.param({}, _WARMUP_SPIN_CYCLES, _SERVING_SPIN_CYCLES, id="defaults"),
+        pytest.param(
+            {
+                "TRTLLM_MOE_COMM_WARMUP_TIMEOUT_SEC": "600",
+                "TRTLLM_MOE_COMM_TIMEOUT_SEC": "30",
+            },
+            600 * 2_000_000_000,
+            30 * 2_000_000_000,
+            id="configured",
+        ),
+    ],
+)
+def test_scheduler_spin_bound_follows_warmup_transitions_and_autotuning(
+    monkeypatch, environ, warmup_cycles, serving_cycles
+):
+    guard_module = _moe_comm_timeout_guard_module(monkeypatch)
+    guard = guard_module.MoECommTimeoutGuard(environ=environ, is_capturing=lambda: False)
+    runtime = SimpleNamespace(**_scheduler_spin_namespace())
+    monkeypatch.setitem(
+        sys.modules,
+        "tensorrt_llm._torch.moe.kernels.megamoe_scheduler.cuda_scheduler.runtime",
+        runtime,
+    )
+    bound_cls = _extract_class(
+        _TORCH_ROOT / "moe/fused_moe/mega_moe/rebalance_slot_scheduler.py",
+        "SchedulerSpinBound",
+        None,
+        {"Callable": Any, "Optional": Optional},
+    )
+    tuning = [False]
+    bound = bound_cls(warmup_seconds=guard.budgets().warmup_seconds, is_tuning=lambda: tuning[0])
+    guard.register(bound)
+
+    # The engine starts in serving; its warmup transitions switch the bound.
+    assert bound.cycles() == serving_cycles
+    guard.set_warmup(True)
+    assert bound.cycles() == warmup_cycles
+    guard.set_warmup(False)
+    assert bound.cycles() == serving_cycles
+    # AutoTuner profiling outside warmup gets the warmup bound too.
+    tuning[0] = True
+    assert bound.cycles() == warmup_cycles
+    # The startup warmup launch always uses the warmup bound.
+    assert bound.warmup_cycles == warmup_cycles
+
+
+def test_scheduler_launches_pass_their_spin_bound_to_the_kernel():
+    # Locate spin_cycles in the registered operator schema rather than hard-coding it.
+    op_source = (
+        _ROOT / "cpp/tensorrt_llm/thop/moe/loadBalance/moeRebalanceHaloQOp.cpp"
+    ).read_text()
+    schema = "".join(re.findall(r'"([^"]*)"', op_source.split("m.def(", 1)[1].split(");", 1)[0]))
+    parameters = re.fullmatch(r"moe_rebalance_halo_q\((.*)\) -> \(\)", schema).group(1)
+    names = [parameter.split()[-1] for parameter in parameters.split(",")]
+    spin_index = names.index("spin_cycles")
+
+    launched = []
+    torch = SimpleNamespace(
+        Tensor=_Routes,
+        int32="int32",
+        ops=SimpleNamespace(
+            trtllm=SimpleNamespace(moe_rebalance_halo_q=lambda *args: launched.append(args))
+        ),
+    )
+    namespace = _scheduler_spin_namespace()
+    namespace.update(
+        {
+            "torch": torch,
+            "enter_cuda_stream": lambda stream: stream,
+            "exit_cuda_stream": lambda state: None,
+            "_stream_handle": lambda stream: int(getattr(stream, "cuda_stream", stream)),
+        }
+    )
+    scheduler_cls = _extract_class(
+        _SCHEDULER_RUNTIME,
+        "CudaPhysicalSlotScheduler",
+        {"launch", "_launch_op", "_halo_q_args", "fused_submit_args", "_check_routes"},
+        namespace,
+    )
+    scheduler = scheduler_cls.__new__(scheduler_cls)
+    scheduler.cfg = SimpleNamespace(
+        ep_size=8,
+        logical_expert_count=384,
+        extra_slots_per_rank=4,
+        local_rank=0,
+        route_count=8192 * 6,
+        ctas=8,
+        threads=512,
+        enable_pdl=True,
+        topk=6,
+        max_tokens_per_rank=8192,
+    )
+    scheduler.outputs = SimpleNamespace(
+        physical_slot_ids="slots",
+        hot_expert_ids="ids",
+        hot_expert_group_level="levels",
+        hot_expert_source_ranks="owners",
+    )
+    for name in (
+        "peer_base",
+        "status",
+        "partial",
+        "route_aux",
+        "grid_sync",
+        "plan_workspace",
+        "route_prefix",
+    ):
+        setattr(scheduler, name, name)
+    scheduler.logical_expert_ids = "staged routes"
+    scheduler.device = "cuda:0"
+    scheduler._connected = True
+    scheduler._plan_channel_lock = nullcontext()
+    scheduler._plan_channel_bound = False
+    scheduler._plan_channel_pending = False
+    scheduler._plan_channel_ptr = 0
+    scheduler._plan_channel_abi_version = 0
+    scheduler._plan_channel_words = 0
+    scheduler._plan_channel_route_features = 0
+    scheduler._plan_channel_torch_stream = SimpleNamespace(cuda_stream=19)
+    scheduler._launch_stream_handle = None
+
+    # The standalone kernel keeps the native bound unless the caller passes one.
+    scheduler.launch(19)
+    scheduler.launch(19, spin_cycles=_WARMUP_SPIN_CYCLES)
+    assert [args[spin_index] for args in launched] == [_SERVING_SPIN_CYCLES, _WARMUP_SPIN_CYCLES]
+
+    # The fused launch takes the same scheduler arguments with the caller's bound.
+    scheduler._gpu_direct_bound = True
+    scheduler._plan_channel_stream_handle = 19
+    routes = _Routes(16, [])
+    routes.is_cuda = True
+    args = scheduler.fused_submit_args(routes, 19, spin_cycles=_WARMUP_SPIN_CYCLES)
+    assert args[spin_index] == _WARMUP_SPIN_CYCLES
+    assert args[spin_index - 1] is False  # No programmatic dependency in the fused kernel.
+    with pytest.raises(ValueError, match="positive exact int"):
+        scheduler.fused_submit_args(routes, 19, spin_cycles=0)
 
 
 def test_raw_stream_switch_restores_the_previous_stream_and_device():

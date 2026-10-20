@@ -629,13 +629,20 @@ class HierarchicalSamiWeightBroadcast:
             )
 
     def submit_fused(
-        self, outputs: object, routes: torch.Tensor, route_epoch: torch.Tensor, route_target: int
+        self,
+        outputs: object,
+        routes: torch.Tensor,
+        route_epoch: torch.Tensor,
+        route_target: int,
+        *,
+        spin_cycles: int,
     ) -> HierarchicalCopyTicket:
         """Enqueue the bound scheduler and this GPU-direct copy as one kernel.
 
         Each scheduler CTA adds one to ``route_epoch`` once its routes are
         written, which makes it reach ``route_target``; the copy and its READY
-        publication follow in the same CTAs.
+        publication follow in the same CTAs. ``spin_cycles`` bounds the
+        launch's cross-rank waits and its wait for the route epoch.
         """
 
         with self._lock:
@@ -647,7 +654,9 @@ class HierarchicalSamiWeightBroadcast:
                 raise RuntimeError("outputs are not from the bound CUDA scheduler")
             self._require_live_bank_reusable()
             try:
-                scheduler_args = self._scheduler.fused_submit_args(routes, self._stream)
+                scheduler_args = self._scheduler.fused_submit_args(
+                    routes, self._stream, spin_cycles=spin_cycles
+                )
                 state = enter_cuda_stream(self._stream_owner)
                 try:
                     torch.ops.trtllm.moe_rebalance_tma_submit_fused(

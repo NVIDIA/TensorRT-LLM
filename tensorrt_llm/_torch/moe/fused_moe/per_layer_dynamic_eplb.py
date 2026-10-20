@@ -407,6 +407,7 @@ class PerLayerDynamicMoeLoadBalancer(BaseMoeLoadBalancer):
         self._copy_stream: Optional[torch.cuda.Stream] = None
         self._copy_stream_device: Optional[int] = None
         self._ep_comm: Optional[Any] = None
+        self._scheduler_spin_bound: Optional[Any] = None
 
         # Providers use this manager as their scope owner. Resource references
         # stay reachable here, never through Mapping or a process-global registry.
@@ -489,6 +490,28 @@ class PerLayerDynamicMoeLoadBalancer(BaseMoeLoadBalancer):
             raise RuntimeError("one per-layer dynamic EPLB manager cannot span EP ProcessGroups")
         self._ep_comm.validate_geometry(expected_rank=self.ep_rank, expected_world=self.ep_size)
         return self._ep_comm
+
+    def get_scheduler_spin_bound(self) -> Any:
+        """Return the HALO-Q spin bound shared by this model's layers.
+
+        It is registered with the MoE communication timeout guard, which
+        lengthens it while the engine warms up.
+        """
+        if self._scheduler_spin_bound is None:
+            from ...autotuner import AutoTuner
+            from .mega_moe.rebalance_slot_scheduler import SchedulerSpinBound
+            from .moe_comm_timeout_guard import (
+                get_moe_comm_timeout_budgets,
+                register_moe_comm_timeout_proxy,
+            )
+
+            spin_bound = SchedulerSpinBound(
+                warmup_seconds=get_moe_comm_timeout_budgets().warmup_seconds,
+                is_tuning=lambda: AutoTuner.get().is_tuning_mode,
+            )
+            register_moe_comm_timeout_proxy(spin_bound)
+            self._scheduler_spin_bound = spin_bound
+        return self._scheduler_spin_bound
 
     def create_arena_provider(self) -> Any:
         """Create a per-layer provider scoped to this model manager."""
@@ -596,6 +619,11 @@ class PerLayerDynamicMoeLoadBalancer(BaseMoeLoadBalancer):
             layer._clear_runtime()
         self._arena_providers.clear()
         self._ep_comm = None
+        if self._scheduler_spin_bound is not None:
+            from .moe_comm_timeout_guard import unregister_moe_comm_timeout_proxy
+
+            unregister_moe_comm_timeout_proxy(self._scheduler_spin_bound)
+            self._scheduler_spin_bound = None
         self._rebalance_shared_slot_pools.clear()
         self._rebalance_shared_slot_pool_order.clear()
         self._copy_stream = None

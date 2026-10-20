@@ -21,13 +21,57 @@ collective or auxiliary copy submitter is needed in the serving path.
 from __future__ import annotations
 
 import threading
-from typing import Any, Optional, Tuple
+from typing import Any, Callable, Optional, Tuple
 
 import torch
 
 from tensorrt_llm.logger import logger
 
-__all__ = ["RebalanceSlotSchedulerGroup", "build_rebalance_slot_scheduler_group"]
+__all__ = [
+    "RebalanceSlotSchedulerGroup",
+    "SchedulerSpinBound",
+    "build_rebalance_slot_scheduler_group",
+]
+
+
+class SchedulerSpinBound:
+    """Bound of the HALO-Q scheduler's cross-rank waits, chosen per launch.
+
+    HALO-Q exchanges route counts with every EP rank inside the kernel and
+    traps once a peer is later than this bound. During warmup, one-time JIT
+    compilation and autotuning can delay a healthy rank by minutes. As a MoE
+    communication timeout proxy, the bound follows every warmup transition:
+    warmup gets the warmup timeout, and serving the serving timeout or the
+    scheduler's native ``SPIN_CYCLES``. Launches while ``is_tuning`` returns
+    True, such as AutoTuner profiling outside warmup, also get the warmup
+    timeout. One bound serves every layer of a model.
+
+    Args:
+        warmup_seconds: The MoE communication warmup timeout.
+        is_tuning: Returns whether kernels are being profiled.
+    """
+
+    name = "per-layer dynamic EPLB HALO-Q"
+
+    def __init__(self, *, warmup_seconds: int, is_tuning: Callable[[], bool]) -> None:
+        from tensorrt_llm._torch.moe.kernels.megamoe_scheduler.cuda_scheduler.runtime import (
+            spin_cycles_for_timeout,
+        )
+
+        self._spin_cycles_for_timeout = spin_cycles_for_timeout
+        self._is_tuning = is_tuning
+        self.warmup_cycles = spin_cycles_for_timeout(warmup_seconds)
+        self._timeout_cycles = spin_cycles_for_timeout(None)
+
+    def set_timeout_seconds(self, seconds: Optional[int]) -> None:
+        """Apply a timeout to the launches issued after this call; ``None`` restores the default."""
+        self._timeout_cycles = self._spin_cycles_for_timeout(seconds)
+
+    def cycles(self) -> int:
+        """Return the bound of the next launch."""
+        if self._is_tuning():
+            return self.warmup_cycles
+        return self._timeout_cycles
 
 
 class _LiveBankLeaseProvider:
@@ -80,6 +124,7 @@ class RebalanceSlotSchedulerGroup:
         copy_stream: torch.cuda.Stream,
         auxiliary_sms: int,
         helper_residency: bool,
+        spin_bound: SchedulerSpinBound,
         layer_idx: Optional[int],
     ) -> None:
         from cuda.bindings import driver
@@ -109,6 +154,7 @@ class RebalanceSlotSchedulerGroup:
         self.topk = int(topk)
         self.max_tokens_per_rank = int(max_tokens_per_rank)
         self.auxiliary_sms = int(auxiliary_sms)
+        self._spin_bound = spin_bound
         if copy_stream.device.index != self.device:
             raise ValueError("copy stream device does not match scheduler device")
         self.arena = arena
@@ -204,7 +250,9 @@ class RebalanceSlotSchedulerGroup:
         # Warm all ranks before binding the plan channel: a bound launch would
         # leave a pending publication that must be consumed by the broadcaster.
         # The scheduler input is already initialized and peer allocations synchronized.
-        self.scheduler.launch(self.scheduler_stream)
+        # Loading the kernel can still skew the ranks, so this launch always
+        # waits for its peers as long as warmup does.
+        self.scheduler.launch(self.scheduler_stream, spin_cycles=spin_bound.warmup_cycles)
         torch.cuda.synchronize(self.device)
         ep_comm.barrier()
 
@@ -374,7 +422,11 @@ class RebalanceSlotSchedulerGroup:
             self._pending_release = None
         route_target = self._route_target + self.auxiliary_sms
         ticket = self.broadcaster.submit_fused(
-            outputs, logical_expert_ids, self._route_epoch, route_target
+            outputs,
+            logical_expert_ids,
+            self._route_epoch,
+            route_target,
+            spin_cycles=self._spin_bound.cycles(),
         )
         if int(ticket.generation) != self._scheduled_generation:
             raise RuntimeError("TMA and HALO-Q generation mismatch")
@@ -452,8 +504,8 @@ def build_rebalance_slot_scheduler_group(
     """Build one layer's scheduler/copy group from its manager's resources.
 
     The manager supplies the model-owned EP communicator, copy stream,
-    auxiliary SM budget and helper-slot mode; the communicator is resolved
-    before the stream.
+    auxiliary SM budget, helper-slot mode and scheduler spin bound; the
+    communicator is resolved before the stream.
     """
     device = int(mapping.local_rank)
     return RebalanceSlotSchedulerGroup(
@@ -468,6 +520,7 @@ def build_rebalance_slot_scheduler_group(
         copy_stream=manager.get_copy_stream(device),
         auxiliary_sms=int(manager.auxiliary_sms),
         helper_residency=bool(manager.helper_residency),
+        spin_bound=manager.get_scheduler_spin_bound(),
         layer_idx=layer_idx,
     )
 
