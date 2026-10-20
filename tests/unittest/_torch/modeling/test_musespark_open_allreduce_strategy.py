@@ -8,8 +8,9 @@ the NCCL symmetric-memory all-reduce, which reuses a shared buffer across
 launches without synchronising: ranks overwrite each other's payload, the layer
 output comes back non-finite, and argmax over the all-NaN row collapses every
 request to token 0. On the MoE combine its autotuner hangs engine warmup. Both
-all-reduces therefore take NCCL in place of AUTO, and any other configured
-strategy is used as given.
+all-reduces therefore take NCCL in place of AUTO. An explicit NCCL_SYMMETRIC,
+the corrupting path itself, is rejected; any other configured strategy is used
+as given.
 """
 
 import ast
@@ -60,11 +61,22 @@ def test_auto_becomes_nccl():
 
 @pytest.mark.parametrize(
     "strategy",
-    [strategy for strategy in AllReduceStrategy if strategy is not AllReduceStrategy.AUTO],
+    [
+        strategy
+        for strategy in AllReduceStrategy
+        if strategy not in (AllReduceStrategy.AUTO, AllReduceStrategy.NCCL_SYMMETRIC)
+    ],
     ids=lambda strategy: strategy.name,
 )
 def test_an_explicit_strategy_is_used_as_configured(strategy):
     assert _allreduce_strategy(ModelConfig(allreduce_strategy=strategy)) is strategy
+
+
+@pytest.mark.parametrize("strategy", [AllReduceStrategy.NCCL_SYMMETRIC, "NCCL_SYMMETRIC"])
+def test_an_explicit_nccl_symmetric_is_rejected(strategy):
+    """An explicit setting must not bring back the corruption AUTO is remapped to avoid."""
+    with pytest.raises(ValueError, match="NCCL_SYMMETRIC"):
+        _allreduce_strategy(ModelConfig(allreduce_strategy=strategy))
 
 
 def test_a_strategy_named_in_the_llm_args_is_used_as_configured():

@@ -1243,9 +1243,17 @@ def _allreduce_strategy(model_config: ModelConfig) -> AllReduceStrategy:
       that capture as one collective, and all of them hang in
       ``torch.cuda.synchronize()`` during engine warmup.
 
-    A strategy other than AUTO is used as configured.
+    An explicit NCCL_SYMMETRIC selects the symmetric-memory path that corrupts
+    the attention output projection's reduce, so it is rejected. Any other
+    strategy is used as configured.
     """
     strategy = model_config.allreduce_strategy
+    if strategy == AllReduceStrategy.NCCL_SYMMETRIC:
+        raise ValueError(
+            "MuseSparkOpen does not support allreduce_strategy=NCCL_SYMMETRIC: the NCCL "
+            "symmetric-memory all-reduce corrupts the attention output projection's small "
+            "decode-step reduces at TP4. Use NCCL or leave the default (AUTO)."
+        )
     return AllReduceStrategy.NCCL if strategy == AllReduceStrategy.AUTO else strategy
 
 
