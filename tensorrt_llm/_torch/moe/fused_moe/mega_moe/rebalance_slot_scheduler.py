@@ -79,6 +79,7 @@ class RebalanceSlotSchedulerGroup:
         max_tokens_per_rank: int,
         copy_stream: torch.cuda.Stream,
         auxiliary_sms: int,
+        helper_residency: bool,
         layer_idx: Optional[int],
     ) -> None:
         from cuda.bindings import driver
@@ -220,6 +221,7 @@ class RebalanceSlotSchedulerGroup:
             tma_sm_count=self.auxiliary_sms,
             tma_warps=7,
             tma_route="plan",
+            helper_residency=bool(helper_residency),
         )
         self.broadcaster.bind_scheduler(self.scheduler, self.scheduler_stream)
 
@@ -449,8 +451,9 @@ def build_rebalance_slot_scheduler_group(
 ) -> RebalanceSlotSchedulerGroup:
     """Build one layer's scheduler/copy group from its manager's resources.
 
-    The manager supplies the model-owned EP communicator, copy stream and
-    auxiliary SM budget; the communicator is resolved before the stream.
+    The manager supplies the model-owned EP communicator, copy stream,
+    auxiliary SM budget and helper-slot mode; the communicator is resolved
+    before the stream.
     """
     device = int(mapping.local_rank)
     return RebalanceSlotSchedulerGroup(
@@ -464,6 +467,7 @@ def build_rebalance_slot_scheduler_group(
         device=device,
         copy_stream=manager.get_copy_stream(device),
         auxiliary_sms=int(manager.auxiliary_sms),
+        helper_residency=bool(manager.helper_residency),
         layer_idx=layer_idx,
     )
 

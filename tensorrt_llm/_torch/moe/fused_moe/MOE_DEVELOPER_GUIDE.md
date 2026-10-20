@@ -785,6 +785,10 @@ expert bias, and the NVFP4 TMA-WS runner already applies `SwigluBiasAdaptor`.
   memory wait on that epoch orders it after the routes. A single CPU submitter
   owns both streams; the path does not require a CUDA green context or a
   steady-state host wait.
+- `helper_slot_mode=per_layer_resident` gives each layer its own helper-slot
+  set, and the copy keeps a per-layer table of the expert each helper slot
+  holds so that it skips experts a whole team already holds. Any other writer
+  of those helper rows would invalidate the table.
 - HALO-Q and TMA follow the native-operator path under
   `cpp/tensorrt_llm/kernels/moe/loadBalance/dynamicEplb` and
   `cpp/tensorrt_llm/thop/moe/loadBalance`. The scheduler accepts the original

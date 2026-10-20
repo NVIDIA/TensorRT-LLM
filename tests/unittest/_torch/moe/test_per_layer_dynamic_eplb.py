@@ -439,6 +439,28 @@ def test_layer_allocates_arena_from_model_owned_resources(monkeypatch):
     )
 
 
+@pytest.mark.parametrize(
+    ("helper_slot_mode", "per_layer_sets"),
+    [(None, True), ("per_layer_resident", True), ("shared_banks", False)],
+)
+def test_helper_slot_mode_selects_helper_residency(helper_slot_mode, per_layer_sets):
+    config = _Config()
+    if helper_slot_mode is not None:
+        config.helper_slot_mode = helper_slot_mode
+    manager = PerLayerDynamicMoeLoadBalancer(ep_rank=0, ep_size=4, config=config)
+
+    assert manager.helper_residency is per_layer_sets
+    provider = manager.create_arena_provider()
+    assert provider._per_layer_helper_sets is per_layer_sets
+
+
+def test_helper_slot_mode_rejects_unknown_mode():
+    config = _Config()
+    config.helper_slot_mode = "private"
+    with pytest.raises(ValueError, match="helper_slot_mode"):
+        PerLayerDynamicMoeLoadBalancer(ep_rank=0, ep_size=4, config=config)
+
+
 def test_per_layer_dynamic_manager_shares_the_base_lifecycle_only():
     manager = _manager()
     assert isinstance(manager, BaseMoeLoadBalancer)
