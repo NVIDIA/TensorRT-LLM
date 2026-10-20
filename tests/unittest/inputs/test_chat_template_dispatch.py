@@ -511,38 +511,49 @@ class TestServingChatTemplateGather:
         assert captured["model_type"] == "resolved-model-type"
         assert captured["mm_placeholder_counts"] == [{}]
 
-    @pytest.mark.asyncio
-    async def test_responses_create_input_tokens_unpacks_mm_tuple(self, monkeypatch):
-        """_create_input_tokens must return mm_data, not the whole gather tuple."""
-        from unittest.mock import Mock
-
+    @staticmethod
+    def _stub_responses_rendering(monkeypatch, conversation, mm_result, item_order=None):
+        """Stub what _create_input_tokens calls; capture the render kwargs."""
         import tensorrt_llm.serve.responses_utils as ru
 
         async def fake_create_input_messages(request, prev_msgs):
             return [{"role": "user", "content": "hi"}]
 
         async def fake_mm_coroutine():
-            return ({"image": ["data"]}, {"image": ["embed"]})
+            # Yields (mm_data, mm_embeddings), as the real coroutine does.
+            return mm_result
 
         monkeypatch.setattr(ru, "_create_input_messages", fake_create_input_messages)
         monkeypatch.setattr(
             ru,
             "parse_chat_messages_coroutines",
-            lambda messages, model_config: ([], fake_mm_coroutine(), [{}], None),
+            lambda messages, model_config, multimodal_server_config=None: (
+                conversation,
+                fake_mm_coroutine(),
+                [{}],
+                item_order,
+            ),
         )
         monkeypatch.setattr(ru, "resolve_top_level_model_type", lambda cfg: "resolved-model-type")
         monkeypatch.setattr(ru, "_get_chat_completion_function_tools", lambda tools: [])
 
+        captured = {}
+
         async def fake_async_apply(**kwargs):
-            return [1, 2, 3]
+            captured.update(kwargs)
+            return [1, 2, 3] if kwargs["enable_tokenize"] else "rendered prompt"
 
         monkeypatch.setattr(ru, "async_apply_chat_template", fake_async_apply)
+        return ru, captured
+
+    @staticmethod
+    async def _create_responses_input(ru):
+        from unittest.mock import Mock
 
         request = Mock()
         request.tools = None
         request.store = False
-
-        token_ids, mm_data = await ru._create_input_tokens(
+        return await ru._create_input_tokens(
             request=request,
             prev_response=None,
             prev_msgs=None,
@@ -553,6 +564,39 @@ class TestServingChatTemplateGather:
             processor=None,
         )
 
-        assert token_ids == [1, 2, 3]
-        # mm_data is the data dict, not the (mm_data, mm_embeddings) tuple.
-        assert mm_data == {"image": ["data"]}
+    @pytest.mark.asyncio
+    async def test_responses_create_input_tokens_text_only(self, monkeypatch):
+        """Text-only input is rendered straight to token ids."""
+        ru, captured = self._stub_responses_rendering(
+            monkeypatch,
+            conversation=[{"role": "user", "content": "hi", "media": []}],
+            mm_result=(None, None),
+        )
+
+        assert await self._create_responses_input(ru) == [1, 2, 3]
+        assert captured["enable_tokenize"] is True
+
+    @pytest.mark.asyncio
+    async def test_responses_create_input_tokens_attaches_mm_data(self, monkeypatch):
+        """Media is submitted as a text prompt that carries its multimodal data.
+
+        The data dict is attached, not the (mm_data, mm_embeddings) gather
+        tuple, and the prompt is left untokenized so that the model's input
+        processor can expand each media placeholder.
+        """
+        item_order = [{"modality": "image", "index": 0, "placeholder": "<image>"}]
+        ru, captured = self._stub_responses_rendering(
+            monkeypatch,
+            conversation=[{"role": "user", "content": "<image>hi", "media": ["image"]}],
+            mm_result=({"image": ["data"]}, None),
+            item_order=item_order,
+        )
+
+        inputs = await self._create_responses_input(ru)
+
+        assert captured["enable_tokenize"] is False
+        assert inputs == {
+            "prompt": "rendered prompt",
+            "multi_modal_data": {"image": ["data"]},
+            "mm_item_order": item_order,
+        }

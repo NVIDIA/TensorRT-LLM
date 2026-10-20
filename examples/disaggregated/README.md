@@ -1,3 +1,6 @@
+<!-- SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved. -->
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+
 # Disaggregated Serving
 
 The execution method of disaggregated serving relies on the `trtllm-serve` command. Specifically, compared to the standard usage of `trtllm-serve`, serving requires running this command multiple times to separately start the router and workers (including context and generation) serving components. This document focuses on this approach and provides a detailed guide on how to use it.
@@ -26,6 +29,13 @@ cache_transceiver_config:
 cache_transceiver_config:
   backend: NIXL
 ```
+
+These examples omit `max_tokens_in_buffer` and leave the runtime at `auto`.
+On the standard PyTorch model-loading path, `backend: DEFAULT` with runtime
+`auto` normally selects NIXL/Python when no legacy backend selector or
+incompatible configuration intervenes. Keep `DEFAULT`/`auto` when the test
+or recipe should follow the supported defaults rather than exercise a
+particular implementation.
 
 Keep `cache_transceiver_config` identical in the two files. For the remaining fields, see
 [Disaggregated Serving](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/features/disagg-serving.md).
@@ -110,7 +120,6 @@ To use NIXL for KV cache exchange, configure the `cache_transceiver_config` with
 disable_overlap_scheduler: True
 cache_transceiver_config:
   backend: NIXL
-  max_tokens_in_buffer: 2048
 ```
 
 **Generation server configuration:**
@@ -118,7 +127,6 @@ cache_transceiver_config:
 # gen_config_nixl.yml
 cache_transceiver_config:
   backend: NIXL
-  max_tokens_in_buffer: 2048
 ```
 
 #### Example 1: Using NIXL with UCX backend (default)
@@ -431,11 +439,9 @@ data:
     disable_overlap_scheduler: true
     cache_transceiver_config:
       backend: NIXL
-      max_tokens_in_buffer: 2048
   generation.yaml: |
     cache_transceiver_config:
       backend: NIXL
-      max_tokens_in_buffer: 2048
 ```
 
 Launch services:
