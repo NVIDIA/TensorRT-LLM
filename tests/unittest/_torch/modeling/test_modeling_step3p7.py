@@ -452,7 +452,7 @@ class TestStep3p7Helpers(unittest.TestCase):
     def test_dummy_weights_initialize_nonpersistent_clamp_buffers(self):
         """Dummy loading initializes the Python clamp path's private buffers."""
         from tensorrt_llm._torch.models.modeling_step3p7 import Step3p7MoE
-        from tensorrt_llm._torch.pyexecutor.model_loader import initialize_dummy_weights
+        from tensorrt_llm._torch.pyexecutor.weight_sources import initialize_dummy_weights
 
         moe = Step3p7MoE.__new__(Step3p7MoE)
         torch.nn.Module.__init__(moe)
