@@ -929,7 +929,9 @@ def test_stop_request_reaches_server_still_waiting_for_workers(
         if not worker_future.done():
             worker_future.set_result(None)
         server_thread.join(10)
-        server.queue.close()
+        # Close the socket only once the thread using it has exited.
+        if not server_thread.is_alive():
+            server.queue.close()
 
 
 @pytest.mark.cpu_only
@@ -944,11 +946,13 @@ def test_stop_request_reads_past_other_messages_to_the_ack(
     stopped = threading.Event()
 
     def answer_stop_request():
-        assert server.queue.get() is None
-        server.queue.put(
-            RemoteWorkerDeath.from_exception(RuntimeError("rank 1 failed")))
-        server.queue.put(RemoteMpiCommSessionServer.SHUTDOWN_ACK)
-        stopped.set()
+        # Bounded, so a missing request ends the thread instead of leaving it
+        # blocked on the socket.
+        if server.queue.poll(10) and server.queue.get() is None:
+            server.queue.put(
+                RemoteWorkerDeath.from_exception(RuntimeError("rank 1 failed")))
+            server.queue.put(RemoteMpiCommSessionServer.SHUTDOWN_ACK)
+            stopped.set()
 
     server_thread = threading.Thread(target=answer_stop_request, daemon=True)
     server_thread.start()
@@ -958,8 +962,10 @@ def test_stop_request_reads_past_other_messages_to_the_ack(
         assert stop_server_main(ack_timeout=5.0, max_attempts=1)
         assert stopped.wait(10)
     finally:
-        server_thread.join(10)
-        server.queue.close()
+        server_thread.join(15)
+        # Close the socket only once the thread using it has exited.
+        if not server_thread.is_alive():
+            server.queue.close()
 
 
 @pytest.mark.cpu_only
