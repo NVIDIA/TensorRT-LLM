@@ -328,10 +328,9 @@ def test_native_fallback_releases_previous_mx_session(monkeypatch, fallback):
     previous_session.cleanup.assert_called_once_with()
     assert loader._mx_loader is None
 
-    loader.post_load_publish(
+    loader.publish_as_source(
         MagicMock(),
         checkpoint_dir="checkpoint",
-        weights_preloaded=False,
     )
     previous_session.publish_model.assert_not_called()
 
@@ -364,10 +363,9 @@ def test_auxiliary_native_load_preserves_previous_mx_session(monkeypatch):
     assert loader.is_weights_preloaded()
     assert loader.is_post_transform_weights_preloaded()
 
-    loader.post_load_publish(
+    loader.publish_as_source(
         kwargs["model"],
         checkpoint_dir="checkpoint",
-        weights_preloaded=True,
         source_identity=kwargs["source_identity"],
     )
     session.publish_model.assert_called_once_with(kwargs["model"])
@@ -536,10 +534,9 @@ def test_failed_mx_load_cleans_session_and_prevents_publish(monkeypatch):
     session.cleanup.assert_called_once_with()
     assert loader._mx_loader is None
 
-    loader.post_load_publish(
+    loader.publish_as_source(
         MagicMock(),
         checkpoint_dir="checkpoint",
-        weights_preloaded=False,
     )
     session.publish_model.assert_not_called()
 
@@ -582,10 +579,9 @@ def test_p2p_receiver_republishes_after_trt_post_load(monkeypatch):
     loader.load_weights("checkpoint", **kwargs)
     instances[0].publish_model.assert_not_called()
 
-    loader.post_load_publish(
+    loader.publish_as_source(
         model,
         checkpoint_dir="checkpoint",
-        weights_preloaded=True,
         source_identity=kwargs["source_identity"],
     )
 
@@ -604,10 +600,9 @@ def test_native_source_publishes_after_trt_post_load(monkeypatch):
     loader.load_weights("checkpoint", **kwargs)
     instances[0].publish_model.assert_not_called()
 
-    loader.post_load_publish(
+    loader.publish_as_source(
         model,
         checkpoint_dir="checkpoint",
-        weights_preloaded=False,
         source_identity=kwargs["source_identity"],
     )
 
@@ -750,10 +745,9 @@ def test_native_donor_writes_transfer_manifest_before_publish(
         expected.exists()
     )
 
-    loader.post_load_publish(
+    loader.publish_as_source(
         kwargs["model"],
         checkpoint_dir="checkpoint",
-        weights_preloaded=False,
         source_identity=kwargs["source_identity"],
     )
 
@@ -776,7 +770,7 @@ def test_donor_publish_rank_falls_back_to_load_time_identity(
     kwargs = _manifest_load_kwargs(source_identity=replace(_source_identity(), rank=1))
     loader.load_weights("checkpoint", **kwargs)
 
-    loader.post_load_publish(kwargs["model"], checkpoint_dir="checkpoint", weights_preloaded=False)
+    loader.publish_as_source(kwargs["model"], checkpoint_dir="checkpoint")
 
     manifest = load_weight_manifest(tmp_path / "manifest.transfer.donor.rank1.json")
     assert manifest.context["rank"] == 1
@@ -791,10 +785,9 @@ def test_receiver_republish_writes_no_second_transfer_manifest(
     kwargs = _manifest_load_kwargs()
     loader.load_weights("checkpoint", **kwargs)
 
-    loader.post_load_publish(
+    loader.publish_as_source(
         kwargs["model"],
         checkpoint_dir="checkpoint",
-        weights_preloaded=True,
         source_identity=kwargs["source_identity"],
     )
 
@@ -815,10 +808,9 @@ def test_donor_manifest_problem_is_not_swallowed(
     loader.load_weights("checkpoint", **kwargs)
 
     with pytest.raises(ValueError, match="role"):
-        loader.post_load_publish(
+        loader.publish_as_source(
             kwargs["model"],
             checkpoint_dir="checkpoint",
-            weights_preloaded=False,
             source_identity=kwargs["source_identity"],
         )
 
@@ -835,10 +827,9 @@ def test_publish_without_manifest_env_writes_nothing(
     kwargs = _manifest_load_kwargs()
     loader.load_weights("checkpoint", **kwargs)
 
-    loader.post_load_publish(
+    loader.publish_as_source(
         kwargs["model"],
         checkpoint_dir="checkpoint",
-        weights_preloaded=False,
         source_identity=kwargs["source_identity"],
     )
 

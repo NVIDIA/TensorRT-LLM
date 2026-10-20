@@ -500,7 +500,7 @@ def test_gms_rw_mx_post_transform_preload_uses_staged_path(monkeypatch):
 
 
 def test_gms_rw_no_load_and_no_preload_raises(monkeypatch):
-    """RW + empty ``weights`` + ``is_weights_preloaded()=False`` is a bug.
+    """RW + empty ``weights`` from a loader that cannot preload is a bug.
 
     Without weights and without a loader-driven preload, the model is
     not populated. Committing it to GMS would expose an uninitialized
@@ -514,7 +514,6 @@ def test_gms_rw_no_load_and_no_preload_raises(monkeypatch):
     checkpoint_loader = MagicMock(name="checkpoint_loader")
     checkpoint_loader.checkpoint_format = "HF"
     checkpoint_loader.load_weights.return_value = {}
-    checkpoint_loader.is_weights_preloaded.return_value = False
 
     with pytest.raises(RuntimeError, match="Refusing to commit an unpopulated model"):
         loader.load("/ckpt", checkpoint_loader)
