@@ -1896,6 +1896,11 @@ class DFlashWorker(SpecWorkerBase):
                 gen_logits = draft_model.logits_processor(
                     gen_hidden_states, draft_model.lm_head, attn_metadata, True
                 )
+                # The drafter shares the target's lm_head but not its logits
+                # processor; apply the logit transform its config declares.
+                apply_logit_transform = getattr(draft_model, "apply_draft_logit_transform", None)
+                if apply_logit_transform is not None:
+                    gen_logits = apply_logit_transform(gen_logits)
 
                 vocab_size = gen_logits.shape[-1]
                 gen_logits = gen_logits.reshape(num_gens, K, vocab_size)

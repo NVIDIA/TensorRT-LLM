@@ -25,6 +25,7 @@ from tensorrt_llm._torch.models.modeling_dflash import (
     dflash2_grouped_conv,
     dflash2_score_edges,
     dflash2_walk_candidate_paths,
+    resolve_draft_logit_transform,
 )
 from tensorrt_llm._torch.speculative.dflash import DFlashWorker
 
@@ -660,6 +661,67 @@ def test_trtllm_window_check_reads_the_use_swa_override():
     assert wrapper._resolve_block_attention(0) == (False, (3, 3))
     with pytest.raises(ValueError, match="draft layer 0"):
         wrapper.validate_block_attention_windows()
+
+
+# ---------------------------------------------------------------------------
+# Drafter logit transform: dflash_config output_multiplier, then
+# final_logit_softcapping, as the target applies to its own logits
+# ---------------------------------------------------------------------------
+
+# The Muse Spark Open target's transform, which its DFlash 2 drafters repeat.
+MUSESPARK_LOGIT_TRANSFORM = {
+    "output_multiplier": 0.17677669529663687,
+    "final_logit_softcapping": 20.0,
+}
+
+
+def _transform_wrapper(dflash_config):
+    wrapper = DFlashForCausalLM.__new__(DFlashForCausalLM)
+    torch.nn.Module.__init__(wrapper)
+    wrapper.logit_multiplier, wrapper.logit_softcap = resolve_draft_logit_transform(dflash_config)
+    return wrapper
+
+
+def test_logit_transform_is_off_unless_the_config_declares_it():
+    assert resolve_draft_logit_transform({}) == (1.0, None)
+    assert resolve_draft_logit_transform({"final_logit_softcapping": 0}) == (1.0, None)
+    logits = torch.randn(3, VOCAB)
+    assert _transform_wrapper({}).apply_draft_logit_transform(logits) is logits
+
+
+def test_logit_transform_scales_then_soft_caps_in_fp32():
+    logits = torch.tensor([[-400.0, -30.0, 0.0, 30.0, 400.0]], dtype=torch.bfloat16)
+    transformed = _transform_wrapper(MUSESPARK_LOGIT_TRANSFORM).apply_draft_logit_transform(logits)
+    expected = 20.0 * torch.tanh(logits.float() * 0.17677669529663687 / 20.0)
+    assert transformed.dtype == torch.float32
+    torch.testing.assert_close(transformed, expected)
+    assert transformed.abs().max() < 20.0
+
+
+def test_logit_transform_decides_the_selector_walk():
+    """The transform keeps every position's argmax, but the selector adds the
+    drafter logits to its pairwise scores, so their scale picks the path."""
+    # One request, one position, two candidates. The unary logits prefer
+    # candidate 0 by 2.0; the pairwise term favors candidate 1 by 1.0.
+    candidate_ids = torch.tensor([[[0, 1]]])
+    anchor = torch.tensor([2])
+    predecessor = torch.zeros(VOCAB, 1)
+    predecessor[2] = 1.0
+    successor = torch.zeros(VOCAB, 1)
+    successor[1] = 1.0
+    gate = torch.ones(1, 1, 1)
+    raw_unary = torch.tensor([[[10.0, 8.0]]])
+
+    def walk(unary):
+        scores = dflash2_score_edges(predecessor, successor, candidate_ids, unary, gate, anchor)
+        return int(dflash2_walk_candidate_paths(candidate_ids, scores)[0, 0].argmax())
+
+    transformed = _transform_wrapper(MUSESPARK_LOGIT_TRANSFORM).apply_draft_logit_transform(
+        raw_unary.clone()
+    )
+    assert int(transformed[0, 0].argmax()) == int(raw_unary[0, 0].argmax()) == 0
+    assert walk(raw_unary) == 0
+    assert walk(transformed) == 1
 
 
 # ---------------------------------------------------------------------------
