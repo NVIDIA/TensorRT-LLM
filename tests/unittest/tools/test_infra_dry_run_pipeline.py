@@ -151,6 +151,23 @@ class InfraDryRunPipelineTest(unittest.TestCase):
             "classifyFailure(pipeline, submitEx, InfraFailure.SLURM, retryContext)", sbatch
         )
 
+    def test_slurm_job_log_evidence_scan_is_bounded_without_script_approval(self) -> None:
+        scanner = _function_body(L0_TEST, "collectSlurmJobLogEvidence", "uploadResults")
+
+        self.assertIn(
+            'script: "timeout 300s " + Utils.sshUserCmd',
+            scanner,
+        )
+        self.assertIn("timeout: false,", scanner)
+        self.assertNotIn("isActualInterruption()", scanner)
+
+    def test_slurm_job_log_evidence_ignores_pytest_nodeids(self) -> None:
+        scanner = _function_body(L0_TEST, "collectSlurmJobLogEvidence", "uploadResults")
+
+        self.assertIn("""awk 'index($0, \".py::\") == 0'""", scanner)
+        self.assertIn("seen[key]++ == 0", scanner)
+        self.assertNotIn("!seen[key]++", scanner)
+
     def test_cbts_parser_preserves_coverage_preflight_fields(self) -> None:
         parser = _function_body(
             L0_PARENT, "_cbtsParseSelectionResult", "getOssComplianceFileChanged"
