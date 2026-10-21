@@ -11,6 +11,12 @@ DIM = 128
 WINDOW = 16
 SCALE = DIM**-0.5
 LOWER_BOUND = -5.0
+HEAD_STATE_CASES = [
+    pytest.param(3, torch.bfloat16, id="kda-bf16"),
+    pytest.param(3, torch.float32, id="kda-fp32"),
+    pytest.param(16, torch.float32, id="glm-tp4-fp32"),
+    pytest.param(64, torch.float32, id="glm-adp-fp32"),
+]
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or not is_sm_100f() or not IS_CUTLASS_DSL_AVAILABLE,
@@ -112,18 +118,18 @@ def _replay_reference(
     return output
 
 
-@pytest.mark.parametrize("state_dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize(("heads", "state_dtype"), HEAD_STATE_CASES)
 @pytest.mark.parametrize(
     ("width", "strong_decay"),
-    [(1, False), (3, False), (7, True)],
+    [(1, False), (4, False), (8, True)],
     ids=["single-token", "weak-decay", "strong-decay"],
 )
 @torch.no_grad()
-def test_kda_mtp_replay_matches_reference(state_dtype, width, strong_decay):
+def test_kda_mtp_replay_matches_reference(heads, state_dtype, width, strong_decay):
     from tensorrt_llm._torch.custom_ops.cute_dsl_kimi_k3_kda_mtp_replay import kda_mtp_replay
 
     torch.manual_seed(7)
-    batch, slots, heads = 3, 6, 3
+    batch, slots = 3, 6
     token_capacity = 8
     channels = 3 * heads * DIM
     physical_width = 4 * heads * DIM
@@ -301,13 +307,13 @@ def _make_state_views(indirect, layers, slots, heads, channels, state_dtype):
 
 
 @pytest.mark.parametrize("indirect", [False, True], ids=["affine", "indirect"])
-@pytest.mark.parametrize("state_dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize(("heads", "state_dtype"), HEAD_STATE_CASES)
 @torch.no_grad()
-def test_kda_mtp_commit_matches_reference(indirect, state_dtype):
+def test_kda_mtp_commit_matches_reference(indirect, heads, state_dtype):
     from tensorrt_llm._torch.custom_ops.cute_dsl_kimi_k3_kda_mtp_commit import kda_mtp_commit
 
     torch.manual_seed(11)
-    layers, slots, candidate_capacity, width, heads = 2, 5, 5, 3, 3
+    layers, slots, candidate_capacity, width = 2, 5, 5, 3
     channels = 3 * heads * DIM
     capacity = WINDOW + width
     states, conv, state_desc, conv_desc = _make_state_views(

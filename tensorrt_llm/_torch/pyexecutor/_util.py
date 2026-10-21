@@ -3507,13 +3507,11 @@ def _create_kv_cache_manager(
         # else tp_size`, then num_heads / n_groups / conv_dim divide by
         # it), so the params pass through unscaled.
         # KDA replay keeps one delayed recurrent checkpoint and a
-        # single accepted K/U/G history. It is specialized for Kimi K3 on
-        # SM100-family GPUs and uses the V2 manager for its all-layer
-        # post-sampling commit.
+        # single accepted K/U/G history. The SM100-family kernels use the
+        # V2 manager for their all-layer post-sampling commit.
         kda_extra_kwargs = {}
         use_kda_replay = (
-            not is_glm5_next and spec_config is not None
-            and 2 <= spec_config.tokens_per_gen_step
+            spec_config is not None and 2 <= spec_config.tokens_per_gen_step
             and not getattr(spec_config, "use_dynamic_tree", False)
             and issubclass(kv_cache_manager_cls, MambaHybridCacheManagerV2)
             and is_sm_100f(get_sm_version()) and IS_CUTLASS_DSL_AVAILABLE
