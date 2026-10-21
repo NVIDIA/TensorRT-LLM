@@ -215,8 +215,13 @@ def route(
     mapping: Any,
     compute_capability: Tuple[int, int],
     spec_config: Optional[Any],
+    kv_cache_quant_algo: Optional[Any],
 ) -> type:
     """Return the target class for this deployment, or raise ``NoTarget`` saying why none fits.
+
+    ``kv_cache_quant_algo`` is the KV-cache algorithm the engine will run with. It
+    selects the fast paths of a dep deployment, which the dep target checks together
+    with the MoE backend when it is built, so ``route`` only reports it.
 
     The target is imported where it is returned, so declining costs no import
     of modeling code.
@@ -278,7 +283,8 @@ def route(
         f"pp={mapping.pp_size} cp={mapping.cp_size} moe_tp={mapping.moe_tp_size} "
         f"moe_ep={mapping.moe_ep_size} attention_dp={mapping.enable_attention_dp} "
         f"lm_head_tp_in_adp={mapping.enable_lm_head_tp_in_adp}, "
-        f"speculative decoding {_speculation(spec_config)}; the glm_moe_dsa targets are "
+        f"speculative decoding {_speculation(spec_config)}, KV cache "
+        f"{kv_cache_quant_algo or 'bf16'}; the glm_moe_dsa targets are "
         "the GLM-5.2 modelopt NVFP4 checkpoint (bf16 MTP layer) on sm103, with one-model "
         "MTP-Eagle as a linear chain, without the suffix-automaton enhancer or relaxed "
         "acceptance, at tp8 (8 ranks of tensor-parallel attention and experts) or tep (4 or 8 "

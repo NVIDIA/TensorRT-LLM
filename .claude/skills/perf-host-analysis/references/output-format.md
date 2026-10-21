@@ -79,12 +79,12 @@ Optimization should focus on context-phase host preparation.
 
 ### Next Steps
 
-**If YES** → Use `host-perf-optimization` skill to profile and optimize.
+**If YES** → Use `perf-host-optimization` skill to profile and optimize.
 Start with line_profiler on `_prepare_tp_inputs`.
 
 **If NO** → Host overhead is not the bottleneck.
 Use `perf-nsight-compute-analysis` for kernel-level SOL% analysis.
-Use `trace-interpretation` for full bottleneck classification.
+Use `perf-analysis` for full bottleneck classification.
 ```
 
 ## Integration JSON

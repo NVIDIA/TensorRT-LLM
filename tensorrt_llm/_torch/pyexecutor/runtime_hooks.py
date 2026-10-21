@@ -16,7 +16,7 @@ site needs; the objects that implement them are owned by the model.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Callable, Optional, Protocol, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Dict, Optional, Protocol, Sequence
 
 if TYPE_CHECKING:
     import torch
@@ -33,26 +33,32 @@ class StepInputStager(Protocol):
     operations; ``discard`` drops them after a failed preparation.
 
     While its window is open the stager sets itself as ``step_input_stager`` on
-    the runner, the attention metadata, the speculative metadata and the KV
-    cache managers, and resets that attribute to None at ``end`` and
-    ``discard``. Every call site reads the attribute and runs its original
-    statement when it is None.
+    the decoder's input preparer, the attention metadata, the speculative
+    metadata and the KV cache managers, and resets that attribute to None at
+    ``end`` and ``discard``. Every call site reads the attribute and runs its
+    original statement when it is None.
     """
 
     def begin_if_eligible(
         self,
-        runner: Any,
+        preparer: Any,
         requests: Any,
         attn_metadata: Any,
         spec_metadata: Any,
         new_tensors_device: Any,
         *,
         graph_replay: bool,
+        static_inputs: Optional[Dict[str, "torch.Tensor"]],
         is_dummy: bool,
         enable_spec_decode: bool,
         promoted: bool,
     ) -> Optional["StepInputStager"]:
-        """Open the window for this step, or return None to keep the native preparation."""
+        """Open the window for this step, or return None to keep the native preparation.
+
+        ``preparer`` is the ``DecoderInputPreparer`` whose writes the window
+        records. ``static_inputs`` are the static input tensors of the CUDA
+        graph the step replays (None when it replays none).
+        """
 
     def copy(
         self, dst: "torch.Tensor", src: "torch.Tensor", clamp_min: Optional[int] = None
@@ -75,14 +81,12 @@ class StepInputStager(Protocol):
     ) -> None:
         """Stage the KV cache manager's batch copy of block offsets to the device."""
 
-    def position_ids(
-        self, runner: Any, dst: "torch.Tensor", host_position_ids: "torch.Tensor"
-    ) -> None:
+    def position_ids(self, dst: "torch.Tensor", host_position_ids: "torch.Tensor") -> None:
         """Stage the position-id upload and the CUDA graph's static copy of it."""
 
     def overlap_inputs(
         self,
-        runner: Any,
+        buffers: Any,
         previous_batch_indices: Sequence[int],
         previous_pos_indices: Sequence[int],
         num_tokens: int,
@@ -93,7 +97,7 @@ class StepInputStager(Protocol):
         next_draft_tokens: "torch.Tensor",
         new_tokens_lens: "torch.Tensor",
     ) -> None:
-        """Stage the overlap scheduler's gathers of the previous step's outputs."""
+        """Stage the overlap scheduler's gathers of the previous step's outputs into ``buffers``."""
 
     def scheduler_metadata(self, metadata: Any) -> bool:
         """Stage the sparse-attention indexer's scheduler metadata.
@@ -163,8 +167,9 @@ class DecodePrologue(Protocol):
     """
 
     def __call__(
-        self, runner: Any, inputs: Any, *, enable_spec_decode: bool, runtime_draft_len: int
-    ) -> bool: ...
+        self, preparer: Any, inputs: Any, *, enable_spec_decode: bool, runtime_draft_len: int
+    ) -> bool:
+        """``preparer`` is the ``DecoderInputPreparer`` running the step's preprocessing."""
 
 
 class ExecutorEvents(Protocol):

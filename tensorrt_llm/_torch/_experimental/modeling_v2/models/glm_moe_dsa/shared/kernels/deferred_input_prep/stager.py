@@ -49,11 +49,11 @@ attached to the objects that own the instrumented call sites (their
 native path runs whenever that attribute is ``None``.
 
 Deferred-write window. ``DecoderRunner._forward_decoder`` opens it with
-``begin_if_eligible`` right before ``_prepare_inputs`` and closes it with
-``end`` right before the decode-graph replay. In between, the instrumented
-call sites (on the runner, the attention and spec metadata and the KV cache
-managers, each marked "Staged write") only record their writes, and the
-commit at ``end`` performs them. Contract for code that runs inside the
+``begin_if_eligible`` right before ``DecoderInputPreparer.prepare_inputs`` and
+closes it with ``end`` right before the decode-graph replay. In between, the
+instrumented call sites (on the input preparer, the attention and spec
+metadata and the KV cache managers, each marked "Staged write") only record
+their writes, and the commit at ``end`` performs them. Contract for code that runs inside the
 window:
 
 * No other device operation may read or write a buffer the stager was
@@ -62,10 +62,10 @@ window:
 * Route new writes to such a buffer through the staging API (``copy``,
   ``values``, ``gather``, ``zero``, ``clamp_min``, ``block_offsets``), or call
   ``flush`` first, which issues every write staged so far in staging order.
-* Exception: the runner's ``input_ids_cuda`` and ``position_ids_cuda``.
+* Exception: the input buffers' ``input_ids_cuda`` and ``position_ids_cuda``.
   ``overlap_inputs`` and ``position_ids`` also stage the decode graph's static
-  copies of them (``shared_static_tensors``), and the replay then skips its
-  own copy from the runner buffers, so a later staged write to either buffer
+  copies of them (``static_inputs``), and the replay then skips its
+  own copy from the input buffers, so a later staged write to either buffer
   does not reach the graph. To change them inside the window, call ``flush``
   and then write them natively; ``flush`` returns both to the replay's copy.
 * Deferred native operations (``defer``) run after the commit at ``end``,
@@ -158,6 +158,8 @@ class PrepStager:
         self.num_native_copies = 0
         self.num_flushes = 0
         self._attached: list = []
+        # The replayed decode graph's static inputs while a window is open.
+        self._static: Optional[dict] = None
         self._static_input_ids = 0
         self._static_positions = 0
         # Why every preparation of this stager stays native (None: may engage).
@@ -223,7 +225,7 @@ class PrepStager:
         staged values precede that operation in stream order. Later stagings
         go into a new packet; deferred native operations still run at the
         commit. The graph replay copies ``input_ids`` and ``position_ids``
-        from the runner buffers again (``static_inputs_tokens`` is 0 unless
+        from the input buffers again (``static_inputs_tokens`` is 0 unless
         later stagings write both static inputs again), so a native write to
         ``input_ids_cuda`` or ``position_ids_cuda`` after ``flush`` reaches
         the graph.
@@ -339,13 +341,14 @@ class PrepStager:
 
     def begin_if_eligible(
         self,
-        runner,
+        preparer,
         requests,
         attn_metadata,
         spec_metadata,
         new_tensors_device,
         *,
         graph_replay: bool,
+        static_inputs: Optional[dict],
         is_dummy: bool,
         enable_spec_decode: bool,
         promoted: bool,
@@ -368,7 +371,7 @@ class PrepStager:
             self._decline_reason
             if self._decline_reason is not None
             else self._ineligible_reason(
-                runner,
+                preparer,
                 requests,
                 attn_metadata,
                 spec_metadata,
@@ -388,7 +391,8 @@ class PrepStager:
         if reason is not None:
             return None
         self.begin()
-        self._attached = [runner, attn_metadata, spec_metadata, attn_metadata.kv_cache_manager]
+        self._static = self._usable_static_inputs(static_inputs)
+        self._attached = [preparer, attn_metadata, spec_metadata, attn_metadata.kv_cache_manager]
         draft_manager = getattr(attn_metadata, "draft_kv_cache_manager", None)
         if draft_manager is not None:
             self._attached.append(draft_manager)
@@ -398,7 +402,7 @@ class PrepStager:
 
     @staticmethod
     def _ineligible_reason(
-        runner,
+        preparer,
         requests,
         attn_metadata,
         spec_metadata,
@@ -408,7 +412,7 @@ class PrepStager:
         enable_spec_decode,
         promoted,
     ) -> Optional[str]:
-        cfg = runner._config
+        cfg = preparer._config
         if not graph_replay or is_dummy or promoted:
             return "not a steady decode-graph replay"
         if not enable_spec_decode or spec_metadata is None or cfg.spec_config is None:
@@ -418,12 +422,12 @@ class PrepStager:
             return "not linear one-model speculation"
         if cfg.disable_overlap_scheduler or cfg.enable_attention_dp or cfg.use_mrope:
             return "overlap off, attention DP or MRoPE"
-        if runner.use_beam_search or runner.mapping.has_cp_helix():
+        if preparer.use_beam_search or preparer.mapping.has_cp_helix():
             return "beam search or helix"
-        if getattr(runner.mapping, "pp_size", 1) > 1:
+        if getattr(preparer.mapping, "pp_size", 1) > 1:
             # deferred_input_prep is not validated with the pipeline-parallel executor loop.
             return "pipeline parallelism"
-        if runner.guided_decoder is not None or runner._lora.cuda_graph_manager is not None:
+        if preparer.guided_decoder is not None or preparer._lora.cuda_graph_manager is not None:
             return "guided decoding or LoRA graphs"
         if getattr(new_tensors_device, "next_draft_tokens", None) is None:
             return "no previous speculative device tensors"
@@ -472,6 +476,7 @@ class PrepStager:
             if getattr(obj, self._ATTACH_ATTR, None) is self:
                 setattr(obj, self._ATTACH_ATTR, None)
         self._attached = []
+        self._static = None
 
     # ---- staging API used by the call sites -----------------------------
 
@@ -517,7 +522,7 @@ class PrepStager:
     @_stager_internal
     def overlap_inputs(
         self,
-        runner,
+        buffers,
         previous_batch_indices: Sequence[int],
         previous_pos_indices: Sequence[int],
         num_tokens: int,
@@ -528,7 +533,7 @@ class PrepStager:
         next_draft_tokens: torch.Tensor,
         new_tokens_lens: torch.Tensor,
     ) -> None:
-        """Stage the overlap-scheduler block of ``DecoderRunner._prepare_tp_inputs``.
+        """Stage the overlap-scheduler block of ``DecoderInputPreparer._copy_token_ids_to_device``.
 
         Native: zero ``previous_pos_id_offsets_cuda`` and
         ``previous_kv_lens_offsets_cuda``; upload the previous slots and
@@ -541,8 +546,8 @@ class PrepStager:
         T = tokens_per_gen_step
         D = T - 1
         prev = len(previous_batch_indices)
-        pos_off = runner.previous_pos_id_offsets_cuda
-        kv_off = runner.previous_kv_lens_offsets_cuda
+        pos_off = buffers.previous_pos_id_offsets_cuda
+        kv_off = buffers.previous_kv_lens_offsets_cuda
         if prev == 0:
             self.zero(pos_off)
             self.zero(kv_off)
@@ -550,10 +555,10 @@ class PrepStager:
         nt_s0, nt_s1 = new_tokens.stride(0), new_tokens.stride(1)
         nd_s0, nd_s1 = next_draft_tokens.stride(0), next_draft_tokens.stride(1)
         nl_s0 = new_tokens_lens.stride(0)
-        self.values(runner.previous_batch_indices_cuda[:prev], previous_batch_indices)
+        self.values(buffers.previous_batch_indices_cuda[:prev], previous_batch_indices)
         tok_idx = [t * nt_s0 + slot * nt_s1 for slot in previous_batch_indices for t in range(T)]
-        self.gather(runner.input_ids_cuda[num_tokens : num_tokens + prev * T], new_tokens, tok_idx)
-        static = self._static_tensors(runner)
+        self.gather(buffers.input_ids_cuda[num_tokens : num_tokens + prev * T], new_tokens, tok_idx)
+        static = self._static
         if static is not None and num_tokens == 0:
             # Also fill the graph's static input buffer; CUDAGraphRunner.replay
             # then skips its device-to-device copy of input_ids.
@@ -564,11 +569,11 @@ class PrepStager:
                 slot * nd_s0 + d * nd_s1 for slot in previous_batch_indices for d in range(D)
             ]
             self.gather(
-                runner.draft_tokens_cuda[num_draft_tokens : num_draft_tokens + prev * D],
+                buffers.draft_tokens_cuda[num_draft_tokens : num_draft_tokens + prev * D],
                 next_draft_tokens,
                 draft_idx,
             )
-        self.values(runner.previous_pos_indices_cuda[: prev * T], previous_pos_indices)
+        self.values(buffers.previous_pos_indices_cuda[: prev * T], previous_pos_indices)
         lo, hi = (num_extend_requests - prev) * T, num_extend_requests * T
         self._zero_except(pos_off, lo, hi)
         self.gather(pos_off[lo:hi], new_tokens_lens, [i * nl_s0 for i in previous_pos_indices])
@@ -579,19 +584,18 @@ class PrepStager:
         )
 
     @staticmethod
-    def _static_tensors(runner):
-        cgr = getattr(runner, "cuda_graph_runner", None)
-        static = getattr(cgr, "shared_static_tensors", None)
+    def _usable_static_inputs(static: Optional[dict]) -> Optional[dict]:
+        """The graph's static inputs when they hold token ids and 2-D positions, else None."""
         if not static or "input_ids" not in static or static["position_ids"].dim() != 2:
             return None
         return static
 
-    def position_ids(self, runner, dst: torch.Tensor, host_position_ids: torch.Tensor) -> None:
+    def position_ids(self, dst: torch.Tensor, host_position_ids: torch.Tensor) -> None:
         """Stage ``dst.copy_(host_position_ids)`` and the graph's static copy of it."""
         with self._internal():
             n = dst.numel()
             self.copy(dst, host_position_ids)
-            static = self._static_tensors(runner)
+            static = self._static
             if static is not None:
                 self.copy(static["position_ids"][0, :n], host_position_ids)
                 self._static_positions = n

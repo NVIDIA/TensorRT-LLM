@@ -124,6 +124,7 @@ def test_engine_classes_declare_the_stager_off():
     )
     from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
     from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDAGraphRunner
+    from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.inputs import DecoderInputPreparer
     from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner import DecoderRunner
     from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
     from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
@@ -140,7 +141,8 @@ def test_engine_classes_declare_the_stager_off():
         assert cls.step_input_stager is None, cls
         # A class attribute, not a dataclass field: the constructors do not take it.
         assert "step_input_stager" not in {f.name for f in dataclasses.fields(cls)}, cls
-    assert DecoderRunner.step_input_stager is None
+    assert DecoderInputPreparer.step_input_stager is None
+    assert DecoderInputPreparer.decode_prologue is None
     assert DecoderRunner.runtime_hooks is DEFAULT_RUNTIME_HOOKS
     assert KVCacheManagerV2.step_input_stager is None
     assert CUDAGraphRunner.staged_static_input_tokens == 0
@@ -154,10 +156,12 @@ def test_engine_classes_declare_the_stager_off():
 # the engine files with call sites.
 _HOOK_CONSUMERS = {
     StepInputStager: (
-        ("stager", "stager_source"),
+        ("stager", "stager_source", "step_input_stager"),
         ("step_input_stager",),
         (
             "pyexecutor/engine/runners/decoder/runner.py",
+            "pyexecutor/engine/runners/decoder/inputs.py",
+            "pyexecutor/engine/runners/common.py",
             "pyexecutor/kv_cache/kv_cache_manager_v2.py",
             "attention/backends/trtllm.py",
             "attention/backends/sparse/dsa/metadata.py",
@@ -387,6 +391,7 @@ def test_instantiate_sampler_leaves_other_spec_decoders_alone(monkeypatch):
 
 _SEAM_CONSUMERS = (
     "pyexecutor/engine/runners/decoder/runner.py",
+    "pyexecutor/engine/runners/decoder/inputs.py",
     "pyexecutor/cuda_graph_runner.py",
     "pyexecutor/kv_cache/kv_cache_manager_v2.py",
     "pyexecutor/py_executor.py",
@@ -408,6 +413,7 @@ _SEAM_ATTRS = {
     "_execution_stream_loop_armed": False,
     "staged_static_input_tokens": 0,
     "runtime_hooks": DEFAULT_RUNTIME_HOOKS,
+    "decode_prologue": None,
 }
 # Locals the call sites hold a hook (or a decision on one) in.
 _SEAM_LOCALS = ("stager", "stager_source", "store_writer", "prologue", "staged", "staged_store")
@@ -613,7 +619,7 @@ def step(self, x):
 
 
 def test_the_decode_prologue_call_site_uses_its_protocol():
-    """The runner calls the prologue with the protocol's positional and keyword parameters."""
+    """The input preparer calls the prologue with the protocol's positional and keyword parameters."""
     from tensorrt_llm._torch.pyexecutor.runtime_hooks import DecodePrologue
 
     signature = inspect.signature(DecodePrologue.__call__)
@@ -626,7 +632,7 @@ def test_the_decode_prologue_call_site_uses_its_protocol():
         p.name for p in signature.parameters.values() if p.kind is inspect.Parameter.KEYWORD_ONLY
     }
     root = Path(tensorrt_llm.__file__).resolve().parent / "_torch"
-    tree = ast.parse((root / "pyexecutor/engine/runners/decoder/runner.py").read_text())
+    tree = ast.parse((root / "pyexecutor/engine/runners/decoder/inputs.py").read_text())
     calls = [
         node
         for node in ast.walk(tree)
@@ -650,25 +656,25 @@ class _AttnMetadata:
         self.kv_lens_updates += 1
 
 
-def _prologue_runner(prologue):
-    """A ``DecoderRunner`` with only what ``_preprocess_inputs`` reads without spec decoding."""
-    from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner import DecoderRunner
+def _prologue_preparer(prologue):
+    """A ``DecoderInputPreparer`` with only what ``preprocess_inputs`` reads without spec decoding."""
+    from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.inputs import DecoderInputPreparer
 
-    runner = DecoderRunner.__new__(DecoderRunner)
+    preparer = DecoderInputPreparer.__new__(DecoderInputPreparer)
     if prologue is not None:
-        runner.runtime_hooks = RuntimeHooks(decode_prologue=prologue)
-    runner.guided_decoder = None
-    runner._config = types.SimpleNamespace(disable_overlap_scheduler=True)
-    runner.mapping = types.SimpleNamespace(has_cp_helix=lambda: False)
-    return runner
+        preparer.decode_prologue = prologue
+    preparer.guided_decoder = None
+    preparer._config = types.SimpleNamespace(disable_overlap_scheduler=True)
+    preparer.mapping = types.SimpleNamespace(has_cp_helix=lambda: False)
+    return preparer
 
 
 def test_preprocess_inputs_runs_the_native_prologue_without_a_hook():
-    runner = _prologue_runner(None)
+    preparer = _prologue_preparer(None)
     inputs = {"attn_metadata": _AttnMetadata()}
 
-    assert runner.runtime_hooks is DEFAULT_RUNTIME_HOOKS
-    assert runner._preprocess_inputs(inputs, enable_spec_decode=False, runtime_draft_len=0) is (
+    assert preparer.decode_prologue is None
+    assert preparer.preprocess_inputs(inputs, enable_spec_decode=False, runtime_draft_len=0) is (
         inputs
     )
     assert inputs["attn_metadata"].kv_lens_updates == 1
@@ -678,17 +684,17 @@ def test_preprocess_inputs_runs_the_native_prologue_without_a_hook():
 def test_preprocess_inputs_keeps_the_native_prologue_when_the_hook_declines(engaged):
     calls = []
 
-    def prologue(runner, inputs, *, enable_spec_decode, runtime_draft_len):
-        calls.append((runner, inputs, enable_spec_decode, runtime_draft_len))
+    def prologue(preparer, inputs, *, enable_spec_decode, runtime_draft_len):
+        calls.append((preparer, inputs, enable_spec_decode, runtime_draft_len))
         return engaged
 
-    runner = _prologue_runner(prologue)
+    preparer = _prologue_preparer(prologue)
     inputs = {"attn_metadata": _AttnMetadata()}
 
-    assert runner._preprocess_inputs(inputs, enable_spec_decode=False, runtime_draft_len=3) is (
+    assert preparer.preprocess_inputs(inputs, enable_spec_decode=False, runtime_draft_len=3) is (
         inputs
     )
-    assert calls == [(runner, inputs, False, 3)]
+    assert calls == [(preparer, inputs, False, 3)]
     assert inputs["attn_metadata"].kv_lens_updates == (0 if engaged else 1)
 
 

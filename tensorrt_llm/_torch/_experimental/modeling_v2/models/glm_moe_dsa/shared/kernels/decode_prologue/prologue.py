@@ -14,7 +14,7 @@
 # limitations under the License.
 """Single-launch target decode-metadata prologue and target embedding (decode_prologue).
 
-A decode step's captured forward begins with ``DecoderRunner._preprocess_inputs``:
+A decode step's captured forward begins with ``DecoderInputPreparer.preprocess_inputs``:
 ``on_update_kv_lens()``, the overlap scheduler's accepted-count correction of
 the position ids and the KV lengths, and ``on_update_kv_lens()`` again. On the
 fused DSA decode-metadata path each call writes the 2-D KV-length view, three
@@ -305,7 +305,7 @@ def _metadata_ineligibility(md, B: int) -> Optional[str]:
     return None
 
 
-def _correction_ineligibility(runner, inputs, md, B: int) -> Optional[str]:
+def _correction_ineligibility(preparer, inputs, md, B: int) -> Optional[str]:
     """Why the accepted-count correction cannot be fused, or None."""
     pos = inputs.get("position_ids")
     ids = inputs.get("input_ids")
@@ -319,8 +319,9 @@ def _correction_ineligibility(runner, inputs, md, B: int) -> Optional[str]:
     # Program 0 rewrites the positions while the embedding programs read the ids.
     if pos.untyped_storage().data_ptr() == ids.untyped_storage().data_ptr():
         return "position ids share storage with the input ids"
-    pos_off = getattr(runner, "previous_pos_id_offsets_cuda", None)
-    kv_off = getattr(runner, "previous_kv_lens_offsets_cuda", None)
+    buffers = getattr(preparer, "_buffers", None)
+    pos_off = getattr(buffers, "previous_pos_id_offsets_cuda", None)
+    kv_off = getattr(buffers, "previous_kv_lens_offsets_cuda", None)
     if pos_off is None or kv_off is None:
         return "no overlap-scheduler offsets"
     if pos_off.dtype != torch.int32 or kv_off.dtype != torch.int32:
@@ -334,13 +335,13 @@ def _correction_ineligibility(runner, inputs, md, B: int) -> Optional[str]:
     return None
 
 
-def _embedding_target(runner, inputs):
+def _embedding_target(preparer, inputs):
     """The target ``Embedding`` decode_prologue may run, or (None, reason)."""
     from tensorrt_llm._torch.models.modeling_deepseekv3 import DeepseekV3Model
 
     if inputs.get("inputs_embeds") is not None:
         return None, "inputs_embeds given"
-    target = getattr(getattr(runner, "model", None), "model", None)
+    target = getattr(getattr(preparer, "model", None), "model", None)
     if not isinstance(target, DeepseekV3Model):
         return None, "target model is not DeepseekV3Model"
     embed = getattr(target, "embed_tokens", None)
@@ -378,40 +379,40 @@ def _replay_host_on_update_kv_lens(md) -> None:
     md._compute_kv_lens_row_reorder()
 
 
-def prologue_ineligibility(runner, inputs, enable_spec_decode: bool) -> Optional[str]:
+def prologue_ineligibility(preparer, inputs, enable_spec_decode: bool) -> Optional[str]:
     """Return why ``target_prologue`` must leave the native code in place, or None."""
     md = inputs.get("attn_metadata")
     if md is None:
         return "no attention metadata"
-    mapping = getattr(runner, "mapping", None)
+    mapping = getattr(preparer, "mapping", None)
     if mapping is not None and mapping.has_cp_helix():
         return "helix context parallelism"
     B = md.num_seqs
     reason = _metadata_ineligibility(md, B)
     if reason is not None:
         return reason
-    config = getattr(runner, "_config", None)
+    config = getattr(preparer, "_config", None)
     if config is None:
-        return "no runner config"
+        return "no preparer config"
     if enable_spec_decode and not config.disable_overlap_scheduler:
-        return _correction_ineligibility(runner, inputs, md, B)
+        return _correction_ineligibility(preparer, inputs, md, B)
     return None
 
 
-def target_prologue(runner, inputs, *, enable_spec_decode: bool, runtime_draft_len: int) -> bool:
+def target_prologue(preparer, inputs, *, enable_spec_decode: bool, runtime_draft_len: int) -> bool:
     """Run the decode-metadata prologue (and the target embedding) in one launch.
 
     Replaces the device work and reproduces the host statements of
-    ``DecoderRunner._preprocess_inputs`` up to (not including) the guided
+    ``DecoderInputPreparer.preprocess_inputs`` up to (not including) the guided
     decoder event, which the caller keeps.
 
     Args:
-        runner: the ``DecoderRunner`` (reads ``_config``, ``mapping``,
-            ``model`` and the overlap-scheduler offset buffers).
+        preparer: the ``DecoderInputPreparer`` (reads ``_config``, ``mapping``,
+            ``model`` and the overlap-scheduler offset buffers in ``_buffers``).
         inputs: the step's input dict (``attn_metadata``, ``input_ids``,
             ``position_ids``).
-        enable_spec_decode: as passed to ``_preprocess_inputs``.
-        runtime_draft_len: as passed to ``_preprocess_inputs`` (unused by the
+        enable_spec_decode: as passed to ``preprocess_inputs``.
+        runtime_draft_len: as passed to ``preprocess_inputs`` (unused by the
             fused path; the DSA branch of the native code does not read it).
 
     Returns:
@@ -421,7 +422,7 @@ def target_prologue(runner, inputs, *, enable_spec_decode: bool, runtime_draft_l
     from ... import dispatch
 
     del runtime_draft_len
-    reason = prologue_ineligibility(runner, inputs, enable_spec_decode)
+    reason = prologue_ineligibility(preparer, inputs, enable_spec_decode)
     # One log line per distinct outcome: context and warmup steps decline
     # before the first decode step engages.
     key = "target_prologue" if reason is None else f"target_prologue[{reason}]"
@@ -431,8 +432,8 @@ def target_prologue(runner, inputs, *, enable_spec_decode: bool, runtime_draft_l
 
     md = inputs["attn_metadata"]
     B = md.num_seqs
-    correct = enable_spec_decode and not runner._config.disable_overlap_scheduler
-    embed, embed_reason = _embedding_target(runner, inputs)
+    correct = enable_spec_decode and not preparer._config.disable_overlap_scheduler
+    embed, embed_reason = _embedding_target(preparer, inputs)
     key = "target_embedding" if embed is not None else f"target_embedding[{embed_reason}]"
     dispatch.log_capability("decode_prologue", key, embed is not None, embed_reason or "")
 
@@ -454,8 +455,8 @@ def target_prologue(runner, inputs, *, enable_spec_decode: bool, runtime_draft_l
     if correct:
         pos = inputs["position_ids"]
         num_pos = inputs["input_ids"].shape[0] - md.num_ctx_tokens
-        pos_off = runner.previous_pos_id_offsets_cuda
-        kv_off = runner.previous_kv_lens_offsets_cuda
+        pos_off = preparer._buffers.previous_pos_id_offsets_cuda
+        kv_off = preparer._buffers.previous_kv_lens_offsets_cuda
     else:
         pos = pos_off = kv_off = dummy
         num_pos = 1
@@ -582,9 +583,11 @@ class DecodePrologueHook:
     embedded (``take_embedding``).
     """
 
-    def __call__(self, runner, inputs, *, enable_spec_decode: bool, runtime_draft_len: int) -> bool:
+    def __call__(
+        self, preparer, inputs, *, enable_spec_decode: bool, runtime_draft_len: int
+    ) -> bool:
         return target_prologue(
-            runner,
+            preparer,
             inputs,
             enable_spec_decode=enable_spec_decode,
             runtime_draft_len=runtime_draft_len,

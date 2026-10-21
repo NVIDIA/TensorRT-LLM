@@ -1,3 +1,6 @@
+.. SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+.. SPDX-License-Identifier: Apache-2.0
+
 trtllm-serve
 ============
 
@@ -34,6 +37,46 @@ The following abbreviated command syntax shows the commonly used arguments to st
    trtllm-serve <model> [--tp_size <tp> --pp_size <pp> --ep_size <ep> --host <host> --port <port>]
 
 For the full syntax and argument descriptions, refer to :ref:`syntax`.
+
+.. _tool-parser-selection:
+
+Tool-call Parser Selection
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Select ``--tool_parser`` to match the tool-call syntax specified by the checkpoint's
+chat template. Models from different families can share a parser when they emit
+the same format.
+
+The ``qwen3_coder`` parser handles the following function/parameter format, shared
+by Qwen3-Coder, Nemotron 3 Nano, Nemotron 3 Super, Nemotron 3 Ultra, and
+Nemotron 3.5 Super VL:
+
+.. code-block:: text
+
+   <tool_call>
+   <function=get_weather>
+   <parameter=city>
+   Taipei
+   </parameter>
+   </function>
+   </tool_call>
+
+The official chat templates specify this syntax and use it to serialize previous
+assistant tool calls:
+
+* `Qwen3-Coder <https://huggingface.co/Qwen/Qwen3-Coder-30B-A3B-Instruct/blob/main/chat_template.jinja>`__
+* `Nemotron 3 Nano <https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16/blob/main/chat_template.jinja>`__
+* `Nemotron 3 Super <https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4/blob/main/chat_template.jinja>`__
+* `Nemotron 3 Ultra <https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4/blob/main/chat_template.jinja>`__
+* `Nemotron 3.5 Super VL <https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16/blob/main/chat_template.jinja>`__
+
+Among these Nemotron models, ``--tool_parser auto`` selects ``qwen3_coder`` only
+for Nemotron 3.5 Super VL (``nemotron_h_omni``). For Nemotron 3 Nano, Super, and
+Ultra (``nemotron_h``), specify ``--tool_parser qwen3_coder`` explicitly.
+
+The module ``tensorrt_llm/serve/tool_parser/qwen3_coder_parser.py`` implements this
+shared format. ``--reasoning_parser`` separately controls reasoning extraction;
+``nemotron-v3`` and ``nano-v3`` are aliases for the same Nemotron reasoning parser.
 
 Inference Endpoints
 -------------------
@@ -94,7 +137,7 @@ Multimodal Serving
 For multimodal models, you need to create a configuration file and start the server with additional options due to the following limitations:
 
 * TRT-LLM multimodal is currently not compatible with ``kv_cache_reuse``
-* Multimodal models require ``chat_template``, so only the Chat API is supported
+* Multimodal models require ``chat_template``, so only the Chat API and the Responses API are supported
 
 To set up multimodal models:
 
@@ -128,6 +171,20 @@ Another example uses ``curl``:
 .. literalinclude:: ../../../../examples/serve/curl_chat_client_for_multimodal.sh
     :language: bash
     :linenos:
+
+Multimodal Responses API
+~~~~~~~~~~~~~~~~~~~~~~~~
+
+The Responses API takes an image as an ``input_image`` content part whose ``image_url`` is the image URL or a base64 data URL:
+
+.. code-block:: json
+
+   {"role": "user", "content": [
+       {"type": "input_text", "text": "What's in this image?"},
+       {"type": "input_image", "image_url": "data:image/jpeg;base64,{image_base64}"}
+   ]}
+
+Images referenced by ``file_id`` and ``input_file`` content are not supported; a request that carries them is rejected with a 400 error.
 
 Multimodal Modality Coverage
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -325,7 +382,7 @@ Runtime Profiling Endpoints
 
 .. note::
 
-   The ``/start_profile`` and ``/stop_profile`` endpoints are **prototype** and only apply to the default PyTorch backend (``PyExecutor``). They are no-ops on the TensorRT backend. APIs, parameters, and behaviour may change in future releases.
+   The ``/start_profile`` and ``/stop_profile`` endpoints are **prototype** and only apply to the default PyTorch backend (``PyExecutor``). APIs, parameters, and behaviour may change in future releases.
 
 The server exposes two HTTP endpoints that control iteration-scoped profiling of the backend engine at runtime, without restarting ``trtllm-serve`` and without setting ``TLLM_PROFILE_START_STOP`` / ``TLLM_TORCH_PROFILE_TRACE``. Under TP/PP > 1, both endpoints broadcast the window to every rank, so each rank writes its own chrome trace (distinguished by a ``rank-<N>`` suffix in the filename) and all ranks profile the same iterations in lockstep.
 

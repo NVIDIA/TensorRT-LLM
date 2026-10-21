@@ -101,8 +101,6 @@ class Eagle3ResourceManager(BaseResourceManager):
                                                   device='cuda')
         # start indices of each slot
         self.start_indices = {i: 0 for i in range(slot_size)}
-        # whether the next draft forward is the first
-        self.is_first_draft = True
         self.spec_tree_manager = None
 
         if isinstance(config, EagleDecodingConfig) and config.use_dynamic_tree:
@@ -130,8 +128,6 @@ class Eagle3ResourceManager(BaseResourceManager):
                 self.slot_ids.append(slot_id)
                 if self.use_relaxed_acceptance_for_thinking:
                     self.relaxed_delta_pool[slot_id].fill_(0)
-        # reset the flag before model forward
-        self.is_first_draft = True
 
     def update_resources(self, scheduled_batch: ScheduledRequests):
         pass

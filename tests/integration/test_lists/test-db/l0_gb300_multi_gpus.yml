@@ -17,9 +17,17 @@ l0_gb300_multi_gpus:
   tests:
   # One ordered sequence in one job: the cases share module-global rank state.
   - unittest/_torch/modeling_v2/comm
-  - accuracy/modeling_v2/test_deepseek_v3.py::TestModelingV2DeepseekR10528Nvfp4Sm103Dep4::test_gsm8k_identity_vs_mtp3
-  - accuracy/modeling_v2/test_deepseek_v3.py::TestModelingV2DeepseekR10528Nvfp4Sm103Dep4::test_mtp3_acceptance[modeling_v2]
-  - accuracy/modeling_v2/test_deepseek_v3.py::TestModelingV2DeepseekR10528Nvfp4Sm103Dep4::test_mtp3_acceptance[stock]
+  - accuracy/modeling_v2/test_deepseek_v3.py::TestModelingV2DeepseekR10528Nvfp4Sm10xDefault::test_gsm8k_identity_vs_mtp3[dep4]
+  - accuracy/modeling_v2/test_deepseek_v3.py::TestModelingV2DeepseekR10528Nvfp4Sm10xDefault::test_mtp3_acceptance[modeling_v2-dep4]
+  - accuracy/modeling_v2/test_deepseek_v3.py::TestModelingV2DeepseekR10528Nvfp4Sm10xDefault::test_mtp3_acceptance[stock-dep4]
+  - accuracy/modeling_v2/test_gpt_oss.py::TestModelingV2GptOss120bSm10xDefault::test_gsm8k[tp2]
+  - accuracy/modeling_v2/test_gpt_oss.py::TestModelingV2GptOss120bSm10xDefault::test_gsm8k[tp4_ep4]
+  - accuracy/modeling_v2/test_gpt_oss.py::TestModelingV2GptOss120bSm10xDefault::test_gsm8k[dep4_moetp2_ep2]
+  - accuracy/modeling_v2/test_deepseek_v3.py::TestModelingV2DeepseekR10528Nvfp4Sm10xDefault::test_gsm8k[tp4]
+  - accuracy/modeling_v2/test_deepseek_v3.py::TestModelingV2DeepseekR10528Nvfp4Sm10xDefault::test_gsm8k[tp4_ep4]
+  - accuracy/modeling_v2/test_deepseek_v3.py::TestModelingV2DeepseekR10528Nvfp4Sm10xDefault::test_gsm8k[dep4_moetp4]
+  - accuracy/modeling_v2/test_deepseek_v3.py::TestModelingV2DeepseekR10528Nvfp4Sm10xDefault::test_gsm8k_chunked_prefill[tp4_ep4]
+  - accuracy/modeling_v2/test_deepseek_v3.py::TestModelingV2DeepseekR10528Nvfp4Sm10xDefault::test_gsm8k_chunked_prefill[dep4]
   # GLM-5.2 NVFP4 modeling_v2 tep target, GSM8K under modeling_v2="require". Measured 17 min on 4 GB300.
   - accuracy/modeling_v2/test_glm_moe_dsa.py::TestModelingV2Glm52Nvfp4Sm103::test_gsm8k_tep4 TIMEOUT (60)
   # Covers tests/unittest/_torch/attention/. Two sub-trees moved in here from elsewhere
@@ -32,8 +40,10 @@ l0_gb300_multi_gpus:
   #               every stage that collects them, including where the tests themselves skip.
   - unittest/_torch/attention TIMEOUT (120)
   - unittest/_torch/thop/parallel
+  - unittest/_torch/kernels/parallel
   - unittest/_torch/visual_gen/kernels/parallel
   - unittest/_torch/thop/serial
+  - unittest/_torch/kernels/serial
   - unittest/_torch/executor
   - unittest/_torch/disaggregation
   # GLM-5.3-Flash: ADP/MTP/FP8-KV and non-speculative prefix reuse.

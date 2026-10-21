@@ -273,6 +273,14 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     _mla_ctx_cu_seqlens_valid: bool = field(default=False,
                                             init=False,
                                             repr=False)
+    # CuTe DSL MLA decode plans its per-request split-KV counts once per step
+    # (cute_dsl_mla.py); the plan buffer and the key that marks it current.
+    _cute_dsl_mla_split_plan: Optional[torch.Tensor] = field(init=False,
+                                                             default=None,
+                                                             repr=False)
+    _cute_dsl_mla_split_plan_key: Optional[tuple] = field(init=False,
+                                                          default=None,
+                                                          repr=False)
 
     # `DSAtrtllmAttentionMetadata` overrides this; the dense path keeps 0.
     num_sparse_topk: int = 0
@@ -695,6 +703,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         # buffers below must be rebuilt before the next MLA layer reads them.
         self._mla_scheduler_buffers_valid = False
         self._mla_ctx_cu_seqlens_valid = False
+        self._cute_dsl_mla_split_plan_key = None
 
     def restore_from_spec_dec(self) -> None:
         super().restore_from_spec_dec()
@@ -1471,22 +1480,6 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 self.host_ctx_kv_indptr[:self.num_contexts + 1],
                 non_blocking=True)
 
-    def compute_max_num_custom_mask_tiles_kv_upper_bound(
-            self, max_seq_len_kv, min_first_sparse_mask_offset_kv,
-            tile_size_kv_per_cta) -> int:
-        """
-        Compute the conservative upper bound of numCustomMaskTilesKv.
-
-        Args:
-            max_seq_len_kv (int): The maximum seqLenKv in the batch
-            min_first_sparse_mask_offset_kv (int): The minimum firstSparseMaskOffsetKv in the batch
-            tile_size_kv_per_cta (int): tileSizeKvPerCta value
-        """
-        first_sparse_tile_offset = min_first_sparse_mask_offset_kv // tile_size_kv_per_cta
-        num_tiles_kv_total = math.ceil(max_seq_len_kv / tile_size_kv_per_cta)
-        max_num_custom_mask_tiles_kv = num_tiles_kv_total - first_sparse_tile_offset
-        return max_num_custom_mask_tiles_kv
-
     def spec_decoding_param_prepare_for_blackwell(self) -> None:
         """
         Prepare the blackwell parameters for the speculative decoding (Medusa and Eagle) generation-phase attention kernels.
@@ -1507,27 +1500,10 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             )
 
         if self.spec_decoding_bl_tree_mask is None:
-            # Custom mask covers the tree region (seqLenQ x seqLenQ).
-            # The mask buffer needs extra room for tile boundary crossing:
-            # when firstSparse is not aligned to stepKv (=tileSizeKv*numInstsKv),
-            # the mask can span one extra KV tile. Adding (stepKv - 1) to
-            # max_kv_len guarantees the upper-bound tile count is correct.
             seqLenQ = self.spec_decoding_packed_mask.shape[
                 1] if self.spec_decoding_packed_mask is not None else 1
-            tile_size_kv = 128
-            tile_size_q = 128
-            num_instances_q = 1
-            num_instances_kv = 2
-            tile_size_kv_per_cta = tile_size_kv * num_instances_kv
-            max_kv_len = seqLenQ + tile_size_kv_per_cta - 1
-            tile_size_q_per_cta = tile_size_q * num_instances_q
-            max_num_custom_mask_tiles_kv = self.compute_max_num_custom_mask_tiles_kv_upper_bound(
-                max_kv_len, 0, tile_size_kv_per_cta)
-            max_num_tiles_q = math.ceil(
-                (seqLenQ * self.num_heads_per_kv) / tile_size_q_per_cta)
-            mask_size = int(self.max_num_requests * max_num_tiles_q *
-                            max_num_custom_mask_tiles_kv * num_instances_q *
-                            num_instances_kv * tile_size_q * tile_size_kv / 32)
+            mask_size = torch.ops.trtllm.spec_dec_tree_custom_mask_capacity(
+                self.max_num_requests, seqLenQ, self.max_num_heads_per_kv)
             self.spec_decoding_bl_tree_mask = torch.zeros(
                 mask_size,
                 dtype=torch.uint32,

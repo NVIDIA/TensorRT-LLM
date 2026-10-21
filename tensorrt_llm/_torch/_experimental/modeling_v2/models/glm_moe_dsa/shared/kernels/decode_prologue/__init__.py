@@ -21,7 +21,7 @@ schedule reproduction (``draft_loop/draft_step.py``) and draft_loop's embedding 
 Entry point: :class:`prologue.DecodePrologueHook`, which ``runtime.make_runtime_hooks``
 declares to the engine as the step loop's ``decode_prologue`` and hands to the decode
 target. Calling it runs :func:`prologue.target_prologue` at the start of
-``DecoderRunner._preprocess_inputs`` (True when it replaced the native prologue, False
+``DecoderInputPreparer.preprocess_inputs`` (True when it replaced the native prologue, False
 to keep the native code); its ``take_embedding`` (:func:`prologue.take_embedding`)
 returns the rows the launch embedded to the decode target's forward, or None.
 """
