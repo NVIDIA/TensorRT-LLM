@@ -30,6 +30,7 @@ from tensorrt_llm._torch.models import modeling_mistral as modeling_mistral_mod
 from tensorrt_llm._torch.models import modeling_qwen as modeling_qwen_mod
 from tensorrt_llm._torch.models import modeling_qwen3 as modeling_qwen3_mod
 from tensorrt_llm._torch.models.checkpoints.mx.checkpoint_loader import MXCheckpointLoader
+from tensorrt_llm._torch.models.modeling_multimodal_mixin import MultimodalModelMixin
 from tensorrt_llm._torch.models.modeling_utils import get_registered_model_class
 from tensorrt_llm._torch.modules.linear import Linear, WeightMode
 from tensorrt_llm._torch.pyexecutor import model_loader as model_loader_mod
@@ -955,6 +956,149 @@ def test_mx_post_transform_receiver_uses_staged_path_when_qualified(
     assert model.linear._weights_transformed is True
     assert model.draft_model.linear._weights_transformed is True
     assert events == ["setup_aliases", "setup_aliases", "cache_derived_state"]
+
+
+class _TinyParameterModule(nn.Module):
+    """One-parameter module standing in for a language model or an encoder."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.zeros(2))
+
+
+class _TinyMultimodalModel(MultimodalModelMixin, _TinyModel):
+    """`_TinyModel` with a language model and an optional local encoder."""
+
+    def __init__(self, events: list[str], *, with_encoder: bool) -> None:
+        super().__init__(events)
+        self.llm = _TinyParameterModule()
+        self.mm_encoder = _TinyParameterModule() if with_encoder else None
+
+    @property
+    def language_model(self) -> nn.Module:
+        """Return the inner language model."""
+        return self.llm
+
+
+class _UnknownLanguageModelMultimodalModel(_TinyMultimodalModel):
+    """Registered multimodal root that keeps the mixin's raising `language_model`."""
+
+    language_model = MultimodalModelMixin.language_model
+
+
+class _UnregisteredMultimodalModel(_TinyMultimodalModel):
+    """Multimodal root without a profile; its language model must not be queried."""
+
+    @property
+    def language_model(self) -> nn.Module:
+        """Fail if scope derivation inspects an unregistered root."""
+        raise AssertionError("language_model queried for an unregistered root")
+
+
+def _tiny_multimodal_profile(
+    root_model_class: type[nn.Module],
+) -> PostTransformProfile:
+    return PostTransformProfile(
+        profile_id=f"{root_model_class.__name__}-complete-v1",
+        root_model_class=root_model_class,
+        architecture="TinyForCausalLM",
+        model_type="tiny",
+        speculative_mode=None,
+        protocol_version=ModelLoader._MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION,
+        transform_abi_id=LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1,
+        transfer_scope=PostTransformTransferScope.COMPLETE_MODEL,
+        runtime_constraints=PostTransformRuntimeConstraints(),
+    )
+
+
+@pytest.mark.cpu_only
+def test_post_transform_transfer_scope_is_derived_from_the_root(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A registered multimodal root is the complete model only with a local encoder.
+
+    Text-only and unregistered roots keep the target-model scope without
+    querying `language_model`, and a registered root whose language model is
+    unknown keeps it too instead of raising, so qualification never breaks a
+    plain load.
+    """
+    monkeypatch.setattr(
+        ModelLoader,
+        "_POST_TRANSFORM_PROFILE_REGISTRY",
+        PostTransformProfileRegistry(
+            profiles=(
+                _tiny_multimodal_profile(_TinyMultimodalModel),
+                _tiny_multimodal_profile(_UnknownLanguageModelMultimodalModel),
+            )
+        ),
+    )
+    derive_scope = ModelLoader._post_transform_transfer_scope
+
+    assert derive_scope(_TinyModel([])) is PostTransformTransferScope.TARGET_MODEL
+    assert (
+        derive_scope(_TinyMultimodalModel([], with_encoder=True))
+        is PostTransformTransferScope.COMPLETE_MODEL
+    )
+    assert (
+        derive_scope(_TinyMultimodalModel([], with_encoder=False))
+        is PostTransformTransferScope.LANGUAGE_MODEL
+    )
+    assert (
+        derive_scope(_UnknownLanguageModelMultimodalModel([], with_encoder=True))
+        is PostTransformTransferScope.TARGET_MODEL
+    )
+    assert (
+        derive_scope(_UnregisteredMultimodalModel([], with_encoder=True))
+        is PostTransformTransferScope.TARGET_MODEL
+    )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "with_encoder",
+    [True, False],
+    ids=["complete-model", "language-model"],
+)
+def test_mx_load_offers_post_transform_weights_only_for_the_registered_scope(
+    monkeypatch: pytest.MonkeyPatch,
+    with_encoder: bool,
+) -> None:
+    """An MX load accepts post-transform weights only when the derived scope matches.
+
+    The profile registers the complete model, so a multimodal root without a
+    local encoder falls back to native loading before any transfer.
+    """
+    events: list[str] = []
+    loader = _make_loader(monkeypatch, events=events)
+    monkeypatch.setattr(
+        ModelLoader,
+        "_POST_TRANSFORM_PROFILE_REGISTRY",
+        PostTransformProfileRegistry(profiles=(_tiny_multimodal_profile(_TinyMultimodalModel),)),
+    )
+    monkeypatch.setattr(
+        model_loader_mod.AutoModelForCausalLM,
+        "from_config",
+        MagicMock(return_value=_TinyMultimodalModel(events, with_encoder=with_encoder)),
+    )
+    checkpoint_loader = _PostTransformMxLoader(post_transform=True)
+
+    model, _ = loader.load("/ckpt", checkpoint_loader)
+
+    _args, kwargs = checkpoint_loader.load_weights.call_args
+    assert kwargs["allow_post_transform_weights"] is with_encoder
+    if with_encoder:
+        assert loader._source_identity.transform_abi_id == LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1
+        loader._call_load_weights.assert_not_called()
+        checkpoint_loader.post_load_publish.assert_called_once_with(
+            model,
+            checkpoint_dir="/ckpt",
+            weights_preloaded=True,
+            source_identity=loader._source_identity,
+        )
+    else:
+        assert loader._source_identity.transform_abi_id is None
+        assert loader._call_load_weights.call_count == 1
+        checkpoint_loader.post_load_publish.assert_not_called()
 
 
 def test_default_profile_qualifies_real_tiny_llama_lifecycle(

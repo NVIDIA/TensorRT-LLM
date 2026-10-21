@@ -49,6 +49,7 @@ from ..models import AutoModelForCausalLM
 from ..models.checkpoints.base_checkpoint_loader import BaseCheckpointLoader
 from ..models.checkpoints.checkpoint_catalog import CheckpointCatalog
 from ..models.checkpoints.weight_load_plan import WeightLoadPlan
+from ..models.modeling_multimodal_mixin import MultimodalModelMixin
 from ..models.modeling_utils import (DecoderModelForCausalLM, MetaInitMode,
                                      get_registered_model_class, timing_metric)
 from ..modules.low_m_gemm import LOW_M_GEMM_ACTIVE, prepare_low_m_gemm
@@ -1608,6 +1609,42 @@ class ModelLoader:
                 torch.cuda.synchronize()
 
     @classmethod
+    def _post_transform_transfer_scope(
+            cls, model: torch.nn.Module) -> PostTransformTransferScope:
+        """Return the model component that an MX transfer of `model` carries.
+
+        MX transfers every parameter of the constructed root. A text-only root
+        is the target model. A registered multimodal root is the complete model
+        when it owns parameters outside its language model (a local multimodal
+        encoder), and only the language model otherwise, as with
+        `disable_mm_encoder` or multimodal encoder/prefill disaggregation.
+        Roots without a registered profile keep the target-model scope without
+        querying `language_model`; qualification rejects them by root class.
+        """
+        if not isinstance(model, MultimodalModelMixin):
+            return PostTransformTransferScope.TARGET_MODEL
+        root_model_class = type(model)
+        if not any(
+                profile.root_model_class.matches(root_model_class)
+                for profile in cls._post_transform_profile_registry().profiles):
+            return PostTransformTransferScope.TARGET_MODEL
+        try:
+            language_model = getattr(model, "language_model", None)
+        except NotImplementedError:
+            language_model = None
+        if not isinstance(language_model, torch.nn.Module):
+            return PostTransformTransferScope.TARGET_MODEL
+        language_model_parameters = {
+            id(parameter)
+            for parameter in language_model.parameters()
+        }
+        if any(
+                id(parameter) not in language_model_parameters
+                for parameter in model.parameters()):
+            return PostTransformTransferScope.COMPLETE_MODEL
+        return PostTransformTransferScope.LANGUAGE_MODEL
+
+    @classmethod
     def _qualify_post_transform_profile(
             cls,
             model: DecoderModelForCausalLM,
@@ -1632,7 +1669,7 @@ class ModelLoader:
             model_type=config_identity.model_type,
             speculative_mode=speculative_mode,
             protocol_version=cls._MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION,
-            transfer_scope=PostTransformTransferScope.TARGET_MODEL,
+            transfer_scope=cls._post_transform_transfer_scope(model),
             enabled_features=frozenset(enabled_features),
             runtime_config=PostTransformRuntimeConfig.from_model_config(
                 model.model_config, model=model),
