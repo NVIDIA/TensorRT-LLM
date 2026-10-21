@@ -19,11 +19,6 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from test_common.visual_gen_perf_history import (
-    get_generation_metric_path,
-    get_generation_timing_source,
-)
-
 from tensorrt_llm.commands.utils import get_visual_gen_num_gpus as resolve_visual_gen_num_gpus
 
 MAXIMIZE_METRICS = [
@@ -71,15 +66,13 @@ MATCH_KEYS = [
 
 
 def result_metric_paths(backend: str) -> dict[str, str]:
-    """Where each gated metric lives in the result JSON, per route.
+    """Map client timings to the existing database metrics.
 
-    Both series are client-side wall clock, so what they measure is what a
-    caller of the server waits for. The latency series is the whole request.
-    The generation series ends once generation is done: the video route
-    reports that separately as ``gen_latency``, and the image route, being a
-    single leg, cannot tell it apart from the whole request.
+    Video exposes a separate ``gen_latency`` observation; synchronous image
+    routes use ``e2e_latency`` for the same ``d_*_generation`` metrics. These
+    are client wall-clock intervals, not the diagnostic server inference time.
     """
-    generation = get_generation_metric_path(backend)
+    generation = "gen_latency" if backend == "openai-videos" else "e2e_latency"
     return {
         "d_request_throughput": "request_throughput",
         "d_mean_latency": "e2e_latency.mean",
@@ -173,12 +166,8 @@ def build_visual_gen_db_entry(
     """Build one OpenSearch document from VisualGen config and result JSON."""
     expected_num_gpus = get_visual_gen_num_gpus_from_server_config(server_config)
     client_name = str(client_config.get("name", "default"))
-    backend = str(result_data.get("backend", ""))
-    if backend != str(client_config.get("backend")):
-        raise ValueError("VisualGen benchmark result backend does not match the client config")
     entry = {
         "s_runtime": "visual_gen",
-        "s_generation_timing_source": get_generation_timing_source(backend),
         "s_gpu_type": gpu_type,
         "s_model_name": str(model_name).lower(),
         "s_server_name": server_name,

@@ -32,30 +32,15 @@ shared perf regression pipeline. It is responsible for:
 | `MINIMIZE_METRICS` | `d_mean_latency`, `d_median_latency`, `d_p90_latency`, `d_p99_latency`, `d_mean_generation`, `d_median_generation`, `d_p90_generation`, `d_p99_generation` |
 | `REGRESSION_METRICS` | `d_median_generation` |
 
-Latency/generation metrics use seconds and client timing; server timings are diagnostic only.
-`s_generation_timing_source` identifies the measurement without changing metric
-names or match keys. Synchronous image routes have no separately observable client
-generation window:
+Latency and generation metrics use client wall-clock seconds, not server inference
+time. `result_metric_paths` in `visual_gen_perf_utils.py` selects `gen_latency` for
+video and `e2e_latency` for synchronous image/image-edit routes, which currently
+have no separate client generation observation. Both populate the existing
+`d_*_generation` fields; server timings under `timings` are diagnostic only.
 
-| Backend | Generation metric path | Timing source |
-|---------|------------------------|---------------|
-| `openai-videos` | `gen_latency` | `client_gen_latency` |
-| `openai-images`, `openai-image-edits` | `e2e_latency` | `client_e2e_latency` |
-
-`tests/test_common/visual_gen_perf_history.py::get_generation_metric_path` shares
-one mapping across validation, extraction, metadata, and history selection.
-Update it to switch paths; reassess compatibility if semantics change within a path.
-
-CI excludes missing/incompatible sources before latest-main and baseline lookup,
-retaining compatible fixed baselines and threshold overrides without mutating history.
-Without a fixed baseline it uses the shared rolling baseline; defaults remain 10% pre-merge and
-5% post-merge (see `README_perf_regression_system.md`).
-
-Reusing existing client results requires separate, source-verified metadata backfill,
-not a date cutoff. Atomically tag each record and validate or clear its unverified
-`d_baseline_*` fields, preserving measurements. Retain applicable custom thresholds;
-resets require approval. Without backfill or compatible history, the first run has
-no baseline; verify the next run uses the uploaded client history.
+Historical server-generation baselines are not interchangeable with client timing.
+Reconciling those baselines is separate work; this adapter does not filter or
+rewrite history, change thresholds, or remove the Flux waiver.
 
 ## Match Keys
 

@@ -20,7 +20,6 @@ perf_regression_utils.py.
 """
 import os
 import time
-from collections.abc import Callable
 from datetime import datetime
 
 from defs.trt_test_alternative import print_info, print_warning
@@ -41,11 +40,7 @@ def add_id(data):
     OpenSearchDB.add_id_of_json(data)
 
 
-def get_history_data(new_data_dict,
-                     match_keys,
-                     common_values_dict,
-                     history_transform: Callable[[dict], dict | None]
-                     | None = None):
+def get_history_data(new_data_dict, match_keys, common_values_dict):
     """
     Query history post-merge data for each cmd_idx.
 
@@ -54,10 +49,6 @@ def get_history_data(new_data_dict,
       - latest_baseline_threshold_dict: baseline/threshold fields from the most
         recent entry that has them, per cmd_idx (or None)
       - history_data_dict: all history post-merge entries per cmd_idx
-
-    history_transform: Optional caller policy applied before matching and latest
-      record selection. Returning None excludes a record; returning a copy can
-      remove inherited fields without changing the stored document.
     """
     # Supported timestamp formats
     time_formats = [
@@ -194,10 +185,6 @@ def get_history_data(new_data_dict,
     # Process history data if we have any
     if history_data_list:
         for history_data in history_data_list:
-            if history_transform is not None:
-                history_data = history_transform(history_data)
-                if history_data is None:
-                    continue
             for cmd_idx in cmd_idxs:
                 if benchmark_data_matches(history_data, new_data_dict[cmd_idx],
                                           match_keys):

@@ -23,8 +23,6 @@ The lowest layer. It knows only how to talk to OpenSearch and nothing about regr
 | `get_history_data(new_data_dict, match_keys, common_values_dict)` | Queries OpenSearch for the last 90 days of valid post-merge data, matches each history record to the correct `cmd_idx` based on `match_keys`. Returns a 3-tuple: `latest_history_data_dict` (most recent entry per cmd_idx), `latest_baseline_threshold_dict` (baseline/threshold fields from the most recent entry that has them, per cmd_idx), and `history_data_dict` (all entries per cmd_idx) |
 | `post_new_perf_data(new_data_dict)` | Posts all entries to OpenSearch |
 
-`get_history_data` also accepts an optional `history_transform` policy, applied before matching and latest-record/baseline selection; returning `None` excludes a record.
-
 ### Layer 2: `perf_regression_utils.py` — Generic Regression Pipeline
 
 The reusable middle layer. Contains all business logic but is completely agnostic to what test produced the data. It takes metric lists as parameters rather than using hardcoded constants.

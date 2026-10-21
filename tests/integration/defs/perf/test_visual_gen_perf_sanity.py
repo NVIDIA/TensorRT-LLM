@@ -29,10 +29,6 @@ import pytest
 import yaml
 from test_common.error_utils import report_error
 from test_common.http_utils import wait_for_endpoint_ready
-from test_common.visual_gen_perf_history import (
-    get_generation_metric_path,
-    transform_visual_gen_history,
-)
 
 from defs.trt_test_alternative import print_info
 from tensorrt_llm._utils import get_free_port
@@ -46,6 +42,7 @@ from .visual_gen_perf_utils import (
     build_visual_gen_db_entry,
     get_visual_gen_match_keys,
     get_visual_gen_num_gpus_from_server_config,
+    result_metric_paths,
 )
 
 DEFAULT_TIMEOUT = 5400
@@ -572,7 +569,9 @@ class VisualGenPerfSanityTestConfig:
         result_path: str,
     ) -> None:
         """Validate the saved benchmark JSON before it is used as the source of truth."""
-        generation_path = get_generation_metric_path(str(result_data.get("backend")))
+        generation_path = result_metric_paths(str(result_data.get("backend")))[
+            "d_median_generation"
+        ].partition(".")[0]
         required_keys = [
             "backend",
             "model",
@@ -820,7 +819,6 @@ class VisualGenPerfSanityTestConfig:
             regression_metrics=REGRESSION_METRICS,
             extra_fields=extra_fields,
             upload_to_db=self.upload_to_db,
-            history_transform=transform_visual_gen_history,
         )
 
 

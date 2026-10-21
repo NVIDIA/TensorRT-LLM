@@ -22,7 +22,6 @@ import json
 import os
 import re
 import socket
-from collections.abc import Callable
 from datetime import datetime
 from typing import Dict, List, Optional
 
@@ -527,7 +526,6 @@ def process_and_upload_test_results(
     extra_fields: Optional[dict] = None,
     upload_to_db: bool = True,
     fail_on_regression: Optional[bool] = None,
-    history_transform: Callable[[dict], dict | None] | None = None,
 ):
     """Generic regression pipeline: enrich data, query history, detect regression, upload.
 
@@ -542,8 +540,6 @@ def process_and_upload_test_results(
         upload_to_db: Whether to post results to the database.
         fail_on_regression: Whether to raise on pre-merge regression.
             None = auto (fail for pre-merge only).
-        history_transform: Optional runtime-specific policy selecting compatible
-            history before latest-record and baseline/threshold lookup.
     """
     if not new_data_dict:
         print_info("No data to upload to database.")
@@ -583,11 +579,8 @@ def process_and_upload_test_results(
     common_values_dict = get_common_values(lookup_data_dict, match_keys)
 
     # Step 5: Query history data
-    history_kwargs = (
-        {"history_transform": history_transform} if history_transform is not None else {}
-    )
     latest_history_data_dict, latest_baseline_threshold_dict, history_data_dict = get_history_data(
-        lookup_data_dict, match_keys, common_values_dict, **history_kwargs
+        lookup_data_dict, match_keys, common_values_dict
     )
 
     # Step 6: Compute regression info. Cases whose regression is already present
