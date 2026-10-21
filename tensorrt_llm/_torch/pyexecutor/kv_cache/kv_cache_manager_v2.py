@@ -1249,6 +1249,10 @@ class KVCacheManagerV2(BaseResourceManager):
     # True on hybrid Mamba/GDN managers; __init__ then coerces a positive
     # recompute tail to a full re-prefill.
     _has_recurrent_state: bool = False
+    # Mixed-precision state as seen by instances built without __init__;
+    # _init_mixed_precision assigns fresh per-instance values.
+    low_precision_dtype: Optional[DataType] = None
+    high_layers: dict[int, int] = {}
     # Read by KvCacheCreator: a subclass that overrides the context
     # commit/history protocol opts out of generic reuse-match backoff.
     _supports_reuse_match_backoff = True
@@ -3127,16 +3131,17 @@ class KVCacheManagerV2(BaseResourceManager):
         # Local layer id -> layer id of its retained-token (high-precision) twin.
         self.high_layers: dict[int, int] = {}
         self.low_precision_dtype: Optional[DataType] = None
-        self.first_n = kv_cache_config.first_n
-        self.last_n = kv_cache_config.last_n
+        self.first_n = self.last_n = 0
         # The engine's sequence capacity. KV estimation lowers self.max_seq_len
         # to fit the temporary cache; the attention staging copy is sized from
         # this value so the profiling run allocates it at its final size.
         self.mixed_precision_max_seq_len = max_seq_len
         self._shared_kv_layers: set[int] = set()
-        mixed = kv_cache_config.mixed_precision_dtypes
+        # Tests pass plain config stand-ins that predate the mixed-precision fields.
+        mixed = getattr(kv_cache_config, "mixed_precision_dtypes", None)
         if mixed is None:
             return
+        self.first_n, self.last_n = kv_cache_config.first_n, kv_cache_config.last_n
         if torch.cuda.get_device_capability()[0] not in (10, 12):
             raise NotImplementedError("Mixed-precision NVFP4 KV requires Blackwell")
         self.low_precision_dtype = _MIXED_PRECISION_LOW_DTYPES[mixed[0]]
