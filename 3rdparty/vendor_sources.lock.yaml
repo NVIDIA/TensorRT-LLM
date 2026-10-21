@@ -2,7 +2,7 @@ schema_version: 1
 vendors:
   flashinfer-prims-ts:
     url: https://github.com/yuxianq/flashinfer.git
-    branch: bug-6791733-prims-ts-cuda-graph--source-q-tma-release13
+    branch: trtllm-prims-ts-dev-20261012
     commit: ae3851ab5f958ba22f154059df5b38321f6369d2
     source: flashinfer/attention/prims_ts
     destination: tensorrt_llm/_torch/attention/backends/prims_ts
