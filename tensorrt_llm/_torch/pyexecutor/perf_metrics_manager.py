@@ -8,6 +8,7 @@ and per-request metric bookkeeping.  Extracted from PyExecutor to improve
 readability and separation of concerns.
 """
 
+from collections.abc import Iterator
 from contextlib import contextmanager
 from types import SimpleNamespace
 from typing import Optional
@@ -33,6 +34,8 @@ class PerfMetricsManager:
         self._perf_events = None
         self._perf_event_idx = 0
         self._forward_event_pool = []
+        self._encoder_events: list[tuple[torch.cuda.Event, torch.cuda.Event]] = []
+        self._encoder_gpu_times_ms: list[float] = []
 
     # ------------------------------------------------------------------
     # GPU event helpers
@@ -73,6 +76,44 @@ class PerfMetricsManager:
     def release_forward_timing_events(self, start_event, end_event) -> None:
         if start_event is not None and end_event is not None:
             self._forward_event_pool.append((start_event, end_event))
+
+    @contextmanager
+    def record_encoder_forward(self) -> Iterator[None]:
+        """Time one encoder call on the current stream, including graph replay."""
+        self._collect_encoder_gpu_times()
+        start_event, end_event = self.borrow_forward_timing_events()
+        start_event.record()
+        try:
+            yield
+        finally:
+            end_event.record()
+            self._encoder_events.append((start_event, end_event))
+
+    def take_encoder_gpu_times_ms(self) -> list[float]:
+        """Drain completed encoder calls without waiting for a side stream.
+
+        Pending events stay owned here until they complete; they must not be
+        reused by a later encoder or LLM forward before their timing is read.
+        """
+        self._collect_encoder_gpu_times()
+        completed, self._encoder_gpu_times_ms = self._encoder_gpu_times_ms, []
+        return completed
+
+    def _collect_encoder_gpu_times(self) -> None:
+        # Reclaim completed events even when iteration stats are downsampled.
+        pending = []
+        for start_event, end_event in self._encoder_events:
+            try:
+                if not end_event.query():
+                    pending.append((start_event, end_event))
+                    continue
+                elapsed_ms = start_event.elapsed_time(end_event)
+            except RuntimeError as error:
+                logger.warning("Failed to compute encoder GPU elapsed time: %s", error)
+            else:
+                self._encoder_gpu_times_ms.append(float(elapsed_ms))
+                self.release_forward_timing_events(start_event, end_event)
+        self._encoder_events = pending
 
     @contextmanager
     def record_perf_events(
