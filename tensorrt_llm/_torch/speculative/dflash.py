@@ -520,11 +520,13 @@ def dflash_allocated_ctx_limit(
     ``_refresh_ctx_block_tables`` clamped to 0 -- another request's block. A
     silent cross-request write, not a fault.
 
-    Per-request only on the ``python`` V2 backend, which propagates
-    ``BAD_PAGE_INDEX``. The default ``cpp`` one maps it to 0
-    (kvCacheManagerV2Utils.cu), every row counts full, and this degenerates to
-    the block-table-width bound upstream already applied. Do not read a
-    per-request guarantee into it there.
+    ``block_counts`` is the extent of each request's allocation (last valid
+    table entry + 1), not the number of valid entries: a sliding window's
+    evicted pages precede its live tail. Per-request only on the ``python`` V2
+    backend, which propagates ``BAD_PAGE_INDEX``. The default ``cpp`` one maps
+    it to 0 (kvCacheManagerV2Utils.cu), every row spans its full width, and this
+    degenerates to the block-table-width bound upstream already applied. Do not
+    read a per-request guarantee into it there.
     """
     return (block_counts * page_size - block_size).clamp(min=0)
 
@@ -791,9 +793,11 @@ class DFlashWorker(SpecWorkerBase):
         self._ctx_page_table = None
         self._ctx_block_tables = None  # [max_batch+1, max_blocks_per_seq] int32
         self._ctx_block_indptr = None
-        # Pages the manager handed this request, per batch row. Saturates at
-        # the table width on the default backend -- dflash_allocated_ctx_limit.
+        # Pages the manager's allocation spans for this request (last valid
+        # entry + 1), per batch row. Saturates at the table width on the
+        # default backend -- dflash_allocated_ctx_limit.
         self._ctx_block_counts = None
+        self._ctx_block_cols = None  # 1..max_blocks_per_seq, for the extent
         self._ctx_pool_idx = 0
         self._ctx_layer_ids = None
         self._ctx_unified_cache = False
@@ -1081,6 +1085,7 @@ class DFlashWorker(SpecWorkerBase):
             0, (num_slots + 1) * max_blocks, max_blocks, dtype=torch.int32, device="cuda"
         )
         self._ctx_block_counts = torch.zeros(num_slots, dtype=torch.long, device="cuda")
+        self._ctx_block_cols = torch.arange(1, max_blocks + 1, dtype=torch.long, device="cuda")
         logger.info(
             f"DFlash: ctx block tables {tuple(self._ctx_block_tables.shape)}, "
             f"pool_idx={self._ctx_pool_idx}, divisor={self._ctx_block_divisor}, "
@@ -1132,9 +1137,14 @@ class DFlashWorker(SpecWorkerBase):
         # below would then edit attn_metadata's own tensor.
         encoded = src[self._ctx_pool_idx, :num_seqs, 0].to(torch.int64).clone()
         encoded.sub_(self._ctx_block_offset)
-        # Before the clamp erases the placeholders. Informative only on the
+        # Before the clamp erases the placeholders: the allocation's extent,
+        # i.e. last valid entry + 1. Not the number of valid entries -- a
+        # sliding-window layer's evicted pages are placeholders BEFORE its live
+        # tail (per-layer tables of a unified cache), so a count stops at the
+        # window and caps every longer context there. Informative only on the
         # python V2 backend; the cpp one already mapped BAD_PAGE_INDEX to 0.
-        self._ctx_block_counts[:num_seqs].copy_((encoded >= 0).sum(dim=1))
+        valid_cols = (encoded >= 0) * self._ctx_block_cols[: encoded.size(1)]
+        self._ctx_block_counts[:num_seqs].copy_(valid_cols.amax(dim=1))
         decoded = encoded.clamp_(min=0).div_(self._ctx_block_divisor, rounding_mode="floor")
         self._ctx_block_tables[:num_seqs].copy_(decoded.to(torch.int32))
         return True
@@ -1174,6 +1184,7 @@ class DFlashWorker(SpecWorkerBase):
         self._ctx_kv_manager = draft_kv_cache_manager
         self._ctx_block_tables = None
         self._ctx_block_counts = None
+        self._ctx_block_cols = None
         max_batch = spec_metadata.max_num_requests
 
         # ctx_len is 1:1 with the target's positions, so max_seq_len bounds it.
