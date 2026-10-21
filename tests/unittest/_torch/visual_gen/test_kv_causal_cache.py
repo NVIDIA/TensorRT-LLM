@@ -226,7 +226,7 @@ def test_table_and_ranges_follow_commits():
         assert lengths.tolist() == [4 * 96] * 4  # the window and the frame
         host = cache.host_page_table()
         device = cache.page_table.cpu().tolist()
-        assert device == [p * cache.page_view_scale if p >= 0 else 0 for p in host]
+        assert device == [p if p >= 0 else 0 for p in host]
     finally:
         cache.shutdown()
 
