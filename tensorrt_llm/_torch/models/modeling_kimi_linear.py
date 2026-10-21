@@ -90,7 +90,7 @@ import math
 import os
 import threading
 import weakref
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -143,7 +143,7 @@ from ..moe.fused_moe import ConfigurableMoE, SiTuActivation, TRTLLMGenFusedMoE, 
 from ..moe.fused_moe.interface import MoESchedulerKind
 from ..moe.fused_moe.routing import DeepSeekV3MoeRoutingMethod
 from ..nccl_window_tensor_scope import nccl_window_tensor_scoped_module
-from ..utils import AuxStreamType
+from ..utils import AuxStreamType, Fp4QuantizedTensor
 from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import DecoderModel, register_auto_model, run_concurrently
 
@@ -178,6 +178,33 @@ _KIMI_K3_MLA_DERIVED_PARAM_SUFFIXES = (
 # BF16 shared/latent MLP weights are optionally quantized once after loading.
 # Checkpoint-native attention FP8 is independent of this lossy conversion.
 _KIMI_K3_FP8_WEIGHT_READ_MOE_MLP_ENV = "KIMI_K3_FP8_WEIGHT_READ_MOE_MLP"
+
+# Expected routed rows per rank (tokens x top-k x local experts / experts) from which the routed
+# experts of a decode forward wait for the shared expert's GEMMs (``_shared_gemms_lead``).
+_SHARED_GEMMS_LEAD_MIN_ROUTED_ROWS = 80
+# SMs the shared expert's GEMMs keep to while they run beside routed experts whose backend leaves
+# that many SMs free of its persistent grid (``MoEImplBase.reserve_sms_for_concurrent_kernels``;
+# the fused FC12 kernel on Rubin does). 16 of the R200's SMs is the measured split.
+_SHARED_EXPERT_SMS_BESIDE_ROUTED_GRID = 16
+
+
+@contextmanager
+def _cublas_sm_limit(num_sms: int):
+    """Run the cuBLAS GEMMs issued inside on ``num_sms`` SMs (no limit for 0).
+
+    Uses torch's SM carveout, which cuBLAS reads when a GEMM is issued, so CUDA graph capture
+    records the confined launch.
+    """
+    if num_sms <= 0:
+        yield
+        return
+    total = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+    previous = torch._C._get_sm_carveout_experimental()
+    torch._C._set_sm_carveout_experimental(total - num_sms)
+    try:
+        yield
+    finally:
+        torch._C._set_sm_carveout_experimental(previous)
 
 
 class KimiK3MoEGate(nn.Module):
@@ -1522,6 +1549,9 @@ def _is_helix_a2a(model_config: ModelConfig) -> bool:
 class KimiK3MoERuntime(nn.Module):
     """Kimi K3 latent MoE block backed by ConfigurableMoE."""
 
+    # SMs the shared expert's GEMMs keep to beside the routed experts (0: all; set in __init__).
+    _shared_sms: int = 0
+
     def __init__(
         self,
         model_config: ModelConfig,
@@ -1684,6 +1714,7 @@ class KimiK3MoERuntime(nn.Module):
             layer_idx=layer_idx,
             is_shared_expert=True,
         )
+        self._shared_all_reduce = use_shared_tp
         # Side stream (+ fork/join events) for overlapping shared-expert
         # compute with the routed chain. Only engaged when multi-stream is
         # active (CUDA graphs on); otherwise both run in order on the default
@@ -1702,6 +1733,21 @@ class KimiK3MoERuntime(nn.Module):
         has_latent_stream = self.latent_down_stream is not None
         self.moe_latent_fork_event = torch.cuda.Event() if has_latent_stream else None
         self.moe_latent_ready_event = torch.cuda.Event() if has_latent_stream else None
+        # Shared GEMMs and the latent chain done (``_shared_gemms_lead``).
+        self.moe_shared_gemm_event = torch.cuda.Event() if has_latent_stream else None
+        # A persistent routed grid that leaves SMs free (CUTEDSL_FC12) runs beside the shared
+        # expert, whose GEMMs keep to those SMs, instead of waiting for them. MoE modules and
+        # backends outside the ``MoEImplBase`` contract do not offer it.
+        reserve_sms = getattr(
+            getattr(self.routed_experts, "backend", None),
+            "reserve_sms_for_concurrent_kernels",
+            None,
+        )
+        self._shared_sms = (
+            reserve_sms(_SHARED_EXPERT_SMS_BESIDE_ROUTED_GRID)
+            if reserve_sms is not None and not self._defer_shared_allreduce
+            else 0
+        )
         self.routed_expert_down_proj = nn.Linear(
             cfg.hidden_size, self.moe_hidden_size, bias=False, dtype=dtype
         )
@@ -1984,6 +2030,55 @@ class KimiK3MoERuntime(nn.Module):
         routed_model_config._frozen = True
         return routed_model_config
 
+    def _shared_gemms_lead(self, num_tokens: int) -> bool:
+        """Whether this forward's routed experts run after the shared expert's GEMMs.
+
+        Routed by ``kimi_k3_routing`` (decode batches, no dispatch), the routing chain is short
+        enough that the persistent routed grid, which holds every SM, launches while the shared
+        expert's GEMMs or all-reduce are pending; those then wait for the whole grid. From
+        ``_SHARED_GEMMS_LEAD_MIN_ROUTED_ROWS`` expected routed rows per rank the routed experts
+        wait for the shared GEMMs instead, on an NVFP4 input the latent chain quantized, and
+        the shared all-reduce follows its GEMMs on the shared stream. Same kernels on the same
+        inputs. Needs the latent and shared-expert streams; a GEMM fused with its all-reduce
+        cannot be split. Not where the shared expert runs beside the routed grid on SMs that grid
+        leaves free (``_shared_sms``).
+        """
+        if self.shared_expert_stream is None or self._defer_shared_allreduce or self._shared_sms:
+            return False
+        down = self.shared_experts.down_proj
+        if isinstance(down, TrtllmLinear) and down.use_fused_gemm_allreduce:
+            return False
+        rows = num_tokens * self.top_k * self.experts_per_rank // self.num_experts
+        moe = self.routed_experts
+        if (
+            rows < _SHARED_GEMMS_LEAD_MIN_ROUTED_ROWS
+            or moe.comm is not None
+            or not moe.backend.has_nvfp4
+        ):
+            return False
+        from ..moe.kernels.blackwell import kimi_k3_routing
+
+        return num_tokens <= kimi_k3_routing.MAX_M
+
+    def _quantize_routed_input(self, latent: torch.Tensor) -> Fp4QuantizedTensor:
+        """The routed experts' NVFP4 input, quantized like their ``quantize_input``."""
+        x_fp4, x_sf = self.routed_experts.backend.quantize_input(latent, post_quant_comm=False)
+        return Fp4QuantizedTensor(x_fp4, x_sf, is_sf_swizzled=False)
+
+    def _issue_shared_gemms(self, identity: torch.Tensor) -> torch.Tensor:
+        """The shared expert's GEMMs, without their all-reduce, on the shared stream after the
+        router GEMM; ``moe_shared_gemm_event`` marks them and the latent chain done. Returns
+        the (partial) shared output."""
+        self.moe_main_event.record()
+        with torch.cuda.stream(self.shared_expert_stream):
+            self.moe_main_event.wait()
+            partial = self.shared_experts(
+                identity, final_all_reduce_params=AllReduceParams(enable_allreduce=False)
+            )
+            self.moe_latent_ready_event.wait()
+            self.moe_shared_gemm_event.record()
+        return partial
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -2008,16 +2103,19 @@ class KimiK3MoERuntime(nn.Module):
         identity = hidden_states
         projected_input = None
         early_routed_in = None
+        shared_partial = None
         if self._can_fuse_router_down(hidden_states):
             router_logits, projected_input = torch.ops.trtllm.dsv3_router_latent_gemm_op(
                 hidden_states, self.gate.weight, self.routed_expert_down_proj.weight
             )
         else:
+            shared_first = False
             if (
                 self.latent_down_stream is not None
                 and do_multi_stream()
                 and not torch.compiler.is_compiling()
             ):
+                shared_first = self._shared_gemms_lead(hidden_states.shape[0])
                 # Forked ahead of the router GEMM: the latent chain needs only
                 # hidden_states.
                 self.moe_latent_fork_event.record()
@@ -2026,11 +2124,17 @@ class KimiK3MoERuntime(nn.Module):
                     early_routed_in = self._routed_projection(
                         hidden_states, self.routed_expert_down_proj
                     )
+                    if shared_first:
+                        # Quantized here, the routed input waits for neither the
+                        # routing nor the shared expert.
+                        early_routed_in = self._quantize_routed_input(early_routed_in)
                     self.moe_latent_ready_event.record()
                 # No record_stream (under graph capture it holds every layer's
                 # blocks until capture ends): both tensors are read on main only
                 # after the join, and later work on this stream forks from main.
             router_logits = self.gate.compute_logits(hidden_states)
+            if shared_first:
+                shared_partial = self._issue_shared_gemms(identity)
         moe_all_reduce = self.routed_experts.all_reduce if self._reduce_routed_output else None
         overlap_shared_allreduce = (
             self._defer_shared_allreduce
@@ -2056,9 +2160,17 @@ class KimiK3MoERuntime(nn.Module):
             elif early_routed_in is not None:
                 routed_in = early_routed_in
                 # ConfigurableMoE joins the event before its first read of x.
-                moe_kwargs = {"input_ready_event": self.moe_latent_ready_event}
+                moe_kwargs = {
+                    "input_ready_event": (
+                        self.moe_latent_ready_event
+                        if shared_partial is None
+                        else self.moe_shared_gemm_event
+                    )
+                }
             else:
                 routed_in = self._routed_projection(hidden_states, self.routed_expert_down_proj)
+            if isinstance(routed_in, Fp4QuantizedTensor):
+                moe_kwargs["output_dtype"] = hidden_states.dtype
             y = self.routed_experts(
                 routed_in,
                 router_logits,
@@ -2074,14 +2186,16 @@ class KimiK3MoERuntime(nn.Module):
             return self._routed_projection(y, self.routed_expert_up_proj)
 
         def _shared_output():
-            shared_out = self.shared_experts(
-                identity,
-                final_all_reduce_params=(
-                    AllReduceParams(enable_allreduce=False)
-                    if self._defer_shared_allreduce
-                    else None
-                ),
-            )
+            # Beside the routed grid (multi-stream) the shared GEMMs keep to the SMs it leaves.
+            with _cublas_sm_limit(self._shared_sms if do_multi_stream() else 0):
+                shared_out = self.shared_experts(
+                    identity,
+                    final_all_reduce_params=(
+                        AllReduceParams(enable_allreduce=False)
+                        if self._defer_shared_allreduce
+                        else None
+                    ),
+                )
             if overlap_shared_allreduce:
                 # Wait for all routed chunks, but overlap the norm/up tail.
                 self.moe_routed_event.wait()
@@ -2096,14 +2210,23 @@ class KimiK3MoERuntime(nn.Module):
         # MegaMoE). The final join includes the shared all-reduce, so it
         # precedes the routed all-reduce: concurrent collectives on different
         # streams can corrupt SYMM_MEM all-reduce state.
-        routed_out, shared_out = maybe_execute_in_parallel(
-            _routed_output,
-            _shared_output,
-            self.moe_main_event,
-            self.moe_shared_event,
-            self.shared_expert_stream,
-            disable_on_compile=True,
-        )
+        if shared_partial is not None:
+            routed_out = _routed_output()
+            with torch.cuda.stream(self.shared_expert_stream):
+                shared_out = shared_partial
+                if self._shared_all_reduce:
+                    shared_out = self.shared_experts.down_proj.all_reduce(shared_partial)
+                self.moe_shared_event.record()
+            self.moe_shared_event.wait()
+        else:
+            routed_out, shared_out = maybe_execute_in_parallel(
+                _routed_output,
+                _shared_output,
+                self.moe_main_event,
+                self.moe_shared_event,
+                self.shared_expert_stream,
+                disable_on_compile=True,
+            )
         if self._defer_shared_allreduce and not overlap_shared_allreduce:
             shared_out = self.shared_experts.down_proj.all_reduce(shared_out)
         if self._reduce_routed_output:

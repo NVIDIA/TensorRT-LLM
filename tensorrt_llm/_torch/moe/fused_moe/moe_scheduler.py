@@ -507,8 +507,9 @@ class ExternalCommMoEScheduler(MoEScheduler):
                 and not moe.apply_router_weight_on_input
                 and routing_aux is None
             )
-            if supports_post_quant and routes_unchanged:
-                # A fused route+quant reads x.
+            if supports_post_quant and routes_unchanged and isinstance(x, torch.Tensor):
+                # A fused route+quant quantizes x, so it needs an unquantized x
+                # and reads it.
                 input_ready_event = _wait_input_ready(input_ready_event)
                 fused_result = moe.backend.try_fused_route_quant(x, router_logits)
             else:
