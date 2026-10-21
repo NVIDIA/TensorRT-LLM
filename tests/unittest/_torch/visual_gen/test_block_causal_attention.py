@@ -32,6 +32,7 @@ from utils.block_causal_reference import exact_reference as _exact_reference
 from utils.block_causal_reference import reference_attention
 
 from tensorrt_llm._torch.attention.backends.interface import PredefinedAttentionMask
+from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention as BaseTrtllmAttention
 from tensorrt_llm._torch.visual_gen.attention.attention import Attention
 from tensorrt_llm._torch.visual_gen.attention.backends.cudnn import CuDNNAttention
 from tensorrt_llm._torch.visual_gen.attention.backends.trtllm import TrtllmAttention
@@ -844,6 +845,41 @@ def test_cache_path_refusals(cache, backend):
         attn.sparse_params = object()  # any sparse attention configuration
         with pytest.raises(NotImplementedError, match="sparse"):
             attn.forward(q[None], k[None], v[None], batch_size=1, **common)
+
+
+@pytest.mark.parametrize("pad", [0, 6], ids=["unpadded", "padded"])
+def test_trtllm_reads_fused_qkv_slices_without_a_copy(cache, monkeypatch, pad):
+    """q/k/v sliced from one qkv_proj output reach the kernel as that buffer, padded or
+    not, and give the same output as separate tensors, which are concatenated."""
+    if lacks_kernel("trtllm", cache):
+        pytest.skip("no paged context kernel for this page size in this build")
+    open_with_prompt(cache, 9)
+    attn = make_backend("trtllm")
+    rows = CHUNK + pad
+    q_dim, kv_dim = NUM_HEADS * HEAD_DIM, NUM_KV_HEADS * HEAD_DIM
+    fused = torch.randn(1, rows, q_dim + 2 * kv_dim, device=DEVICE, dtype=DTYPE)
+    q, k, v = (x.view(1, rows, -1, HEAD_DIM) for x in fused.split([q_dim, kv_dim, kv_dim], dim=-1))
+    kernel_inputs = []
+    parent_forward = BaseTrtllmAttention.forward
+
+    def recording_forward(self, *args, **kwargs):
+        kernel_inputs.append(kwargs["q"])
+        return parent_forward(self, *args, **kwargs)
+
+    monkeypatch.setattr(BaseTrtllmAttention, "forward", recording_forward)
+
+    def forward(q, k, v):
+        return attn.forward(q, k, v, batch_size=1, seq_len=CHUNK, kv_cache=cache).reshape(
+            rows, NUM_HEADS, HEAD_DIM
+        )
+
+    out_fused = forward(q, k, v)
+    assert kernel_inputs[-1].data_ptr() == fused.data_ptr(), "expected the qkv_proj buffer"
+    # The same tokens again, as separate tensors: staged in place of the first ones.
+    out_separate = forward(q.clone(), k.clone(), v.clone())
+    assert kernel_inputs[-1].untyped_storage().data_ptr() != fused.untyped_storage().data_ptr()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out_fused, out_separate, rtol=0, atol=0)
 
 
 def test_trtllm_metadata_lives_on_the_cache():

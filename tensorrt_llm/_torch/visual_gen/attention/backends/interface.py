@@ -25,6 +25,45 @@ from typing import Optional
 import torch
 
 
+@torch.compiler.disable
+def is_fused_qkv(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> bool:
+    """Whether Q, K, and V are gap-free slices from one fused-QKV buffer.
+
+    At TRTLLM/VisualGen, Attention.get_qkv() at QKVMode.FUSE_QKV produces this type of buffer,
+    where one qkv_proj output is split along the last dim.
+    """
+    if q.dim() != 4 or k.shape != v.shape or q.shape[3] != k.shape[3]:
+        return False
+    if q.dtype != k.dtype or q.dtype != v.dtype:
+        return False
+    storage_ptr = q.untyped_storage().data_ptr()
+    if any(x.untyped_storage().data_ptr() != storage_ptr for x in (k, v)):
+        return False
+
+    b, s, h_q, d = q.shape
+    h_kv = k.shape[2]
+    q_dim, kv_dim = h_q * d, h_kv * d
+    total = q_dim + 2 * kv_dim
+
+    # Heads packed within each slice, and one shared row pitch across all three.
+    for x, h in ((q, h_q), (k, h_kv), (v, h_kv)):
+        if x.shape[:3] != (b, s, h):
+            return False
+        if x.stride() != (s * total, total, d, 1):
+            return False
+
+    base = q.storage_offset()
+    return k.storage_offset() == base + q_dim and v.storage_offset() == base + q_dim + kv_dim
+
+
+@torch.compiler.disable
+def as_fused_qkv(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    """Zero-copy [B, S, q_dim + 2 * kv_dim] view of the parent QKV buffer."""
+    b, s, h_q, d = q.shape
+    total = (h_q + 2 * k.shape[2]) * d
+    return torch.as_strided(q, (b, s, total), (s * total, total, 1), q.storage_offset())
+
+
 class AttentionTensorLayout(str, Enum):
     """
     Tensor layout for attention backend input/output.

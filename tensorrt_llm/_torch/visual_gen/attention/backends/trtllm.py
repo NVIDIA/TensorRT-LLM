@@ -42,7 +42,7 @@ from ....attention.backends.trtllm import TrtllmAttentionMetadata as BaseTrtllmA
 from ....metadata import KVCacheParams
 from ...cache import BlockCausalKVCacheManager
 from ...cuda_graph_runner import resolved_extra_key
-from .interface import AttentionBackend, AttentionTensorLayout
+from .interface import AttentionBackend, AttentionTensorLayout, as_fused_qkv, is_fused_qkv
 
 
 @functools.lru_cache(maxsize=None)
@@ -593,6 +593,9 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
             v = packed[:, :, self.num_heads + kv_heads :]
         elif k is None or v is None:
             raise ValueError("K/V cache attention needs separate q, k, v, or one packed qkv.")
+        elif q.dim() == 4 and is_fused_qkv(q, k, v):
+            # q/k/v are slices of one qkv_proj output: hand the kernel that buffer.
+            packed = as_fused_qkv(q, k, v).view(q.shape[0], q.shape[1], -1, self.head_dim)
         if not self.support_kv_cache_page_size(kv_cache.tokens_per_page, q.dtype):
             raise NotImplementedError(
                 f"This build has no fused paged context attention kernel for "
