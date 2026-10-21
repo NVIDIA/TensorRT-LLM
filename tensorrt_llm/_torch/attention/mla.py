@@ -17,7 +17,6 @@ import functools
 import math
 import os
 import weakref
-from contextlib import nullcontext
 from typing import Dict, Optional, cast
 
 import torch
@@ -968,13 +967,7 @@ class MLA(nn.Module):
             )
             return
 
-        # Backend-only callers may pass no metadata at all.
-        staging = (
-            attn_metadata.mixed_precision_kv_staging(self.layer_idx)
-            if getattr(attn_metadata, "mixed_precision_kv_views", None)
-            else nullcontext()
-        )
-        with staging:
+        with attn_metadata.mixed_precision_kv_staging(self.layer_idx):
             self._forward_impl(
                 position_ids,
                 hidden_states,
