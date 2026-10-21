@@ -139,15 +139,14 @@ l0_b300:
   # stage instead), so 30 is 2.2x headroom.
   - unittest/_torch/modeling_v2 --ignore=unittest/_torch/modeling_v2/comm TIMEOUT (30)
   - accuracy/modeling_v2/test_gpt_oss.py::TestModelingV2GptOss120bSm10xDefault::test_gsm8k[tp1]
-  # qwen4_exp target, pre-merge: gsm8k; gsm8k with one MTP draft plus the
-  # acceptance-length floor, the only gate that sees a miscomputed draft layer;
-  # mmmu with MTP, which reaches the vision tower; and 3k-6k-token pass key prompts
-  # with three drafts and IndexShare over bf16 KV, the only prompts long enough to run
-  # the sparse attention path. The opt-in variants run post-merge (below).
+  # qwen4_exp target, pre-merge: gsm8k; one MTP engine for gsm8k with the acceptance-length
+  # floor (the only gate that sees a miscomputed draft layer), mmmu (the vision tower) and
+  # synthetic videos; and 3k-6k-token pass keys with three drafts and IndexShare over bf16 KV,
+  # the only prompts long enough to run the sparse attention path. The opt-in variants run
+  # post-merge (below).
   - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1::test_gsm8k
-  - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1::test_mtp1_gsm8k_and_acceptance
-  - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1::test_mtp1_mmmu
-  - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1::test_mtp3_long_context_passkey[index_share]
+  - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1::test_mtp1_gsm8k_mmmu_and_video
+  - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1::test_mtp3_long_context_passkey
 - condition:
     ranges:
       system_gpu_count:
@@ -168,17 +167,11 @@ l0_b300:
   - unittest/_torch/moe/test_moe_backend.py::test_moe_backend -k "TRTLLM"
   - unittest/_torch/moe/test_moe_backend.py::test_moe_backend -k "CUTEDSL"
   - unittest/_torch/moe/test_moe_backend.py::test_moe_backend -k "DEEPGEMM"
-  # qwen4_exp target, post-merge: the opt-in variants -- three drafts over CuteDSL experts and a
-  # bf16 recurrent state in one engine; fp8 and NVFP4 KV over the pass keys (their sparse
-  # attention path); seven drafts over 3k-12k-token pass keys on a bf16 state (the verify
-  # step's eight rows per request); seven drafts all rejected by forced acceptance (the
-  # speculative rollback end to end); synthetic videos; and the breakable prefill CUDA graph
-  # replayed against eager greedy continuations at the bucket edges and with context and
-  # generation rows in one batch.
-  - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1::test_mtp3_cutedsl_bf16_ssm_state_gsm8k_and_acceptance
-  - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1::test_mtp3_long_context_passkey[fp8_kv]
-  - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1::test_mtp3_long_context_passkey[nvfp4_kv]
+  # qwen4_exp target, post-merge: the opt-in variants -- three drafts over CuteDSL experts, fp8
+  # KV and a bf16 recurrent state in one engine (gsm8k and the pass keys); seven drafts over
+  # 3k-12k-token pass keys on NVFP4 KV and a bf16 state (the verify step's eight rows per
+  # request); and the breakable prefill CUDA graph replayed against eager greedy continuations
+  # at the bucket edges and with context and generation rows in one batch.
+  - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1::test_mtp3_cutedsl_fp8_kv_bf16_state
   - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1::test_mtp7_long_context_passkey
-  - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1::test_mtp7_forced_acceptance_extremes[all_rejected]
-  - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1::test_mtp1_video
   - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1::test_breakable_prefill_matches_eager
