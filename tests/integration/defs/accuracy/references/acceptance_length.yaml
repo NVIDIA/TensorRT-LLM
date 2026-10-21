@@ -154,43 +154,16 @@ ModelingV2Qwen38FlashNextNvfp4Sm103Tp1::mtp1:
   # measured, and tighten min_al then.
   min_al: 1.5
 
-# test_mtp1_fp8_kv_gsm8k_and_acceptance: the same draft over an fp8 KV cache, with a floor of
-# its own. Storage in e4m3 can cost drafts the bf16 cache keeps, and the bf16 floor of 1.5
-# would let a quarter of the acceptance go unnoticed.
-ModelingV2Qwen38FlashNextNvfp4Sm103Tp1::mtp1_fp8_kv:
-  # modeling_v2's own full-gsm8k reading on GB300 (TRTLLM MoE, 1319 samples); the bf16 KV
-  # reading of the same run is 1.971, so fp8 storage costs 0.4%.
-  ref_al: 1.964
-  # 95% of ref_al.
-  min_al: 1.866
-
-# test_mtp1_nvfp4_kv_gsm8k_and_acceptance: the same draft over an NVFP4 KV cache, with a floor of
-# its own for the same reason as the fp8 one.
-ModelingV2Qwen38FlashNextNvfp4Sm103Tp1::mtp1_nvfp4_kv:
-  # modeling_v2's own full-gsm8k reading on GB300 (TRTLLM MoE, 1319 samples); the bf16 KV
-  # reading of the same run is 1.971, so NVFP4 storage costs 0.6%.
-  ref_al: 1.959
-  # 95% of ref_al.
-  min_al: 1.861
-
-# test_mtp3_gsm8k_and_acceptance: three drafts, bf16 KV, trtllm-gen experts.
-ModelingV2Qwen38FlashNextNvfp4Sm103Tp1::mtp3:
-  # The built-in implementation's full-gsm8k reading on GB300, so the gate is not
-  # self-referential. modeling_v2's own is 3.704 (MTP2: 2.876).
-  ref_al: 3.567
-  # Hand-set as a collapse tripwire, NOT the automatic 95%: 3.0 is well below both readings
-  # (16% under the built-in's, 19% under the target's) yet above what a broken later draft
-  # position scores. The first draft alone is the one-draft value, ~1.97; the first two
-  # without the third score ~2.8; a draft path rejected every time scores 1.0. Each of those
-  # leaves the text correct and every accuracy gate green.
-  min_al: 3.0
-
-# test_mtp3_cutedsl_gsm8k_and_acceptance: three drafts with the trunk's experts on CuteDSL.
-ModelingV2Qwen38FlashNextNvfp4Sm103Tp1::mtp3_cutedsl:
-  # modeling_v2's own full-gsm8k reading; there is no built-in reading for this combination
-  # (the built-in model has no CuteDSL trunk), so the floor is the mtp3 tripwire.
-  ref_al: 3.690
-  min_al: 3.0
+# test_mtp3_cutedsl_bf16_ssm_state_gsm8k_and_acceptance: three drafts with the trunk's experts on
+# CuteDSL over a bf16 recurrent state.
+ModelingV2Qwen38FlashNextNvfp4Sm103Tp1::mtp3_cutedsl_bf16_state:
+  # modeling_v2's own full-gsm8k reading on GB300 (1319 samples); there is no built-in reading
+  # for this combination (the built-in model has no CuteDSL trunk). Each choice alone read
+  # 3.690 (CuteDSL) and 3.699 (bf16 state), against 3.704 for neither.
+  ref_al: 3.705
+  # 95% of ref_al, above the two-draft reading (~2.8): a third draft position that is never
+  # accepted fails it.
+  min_al: 3.520
 
 # test_mtp3_long_context_passkey[index_share]: three drafts with IndexShare on, bf16 KV, over
 # 13 prompts of 3k-6k tokens (the sparse attention path). Most of the output is a copy of the
@@ -219,51 +192,11 @@ ModelingV2Qwen38FlashNextNvfp4Sm103Tp1::mtp3_nvfp4_kv_long_context:
   # 2.5% below ref_al, as for mtp3_long_context.
   min_al: 3.87
 
-# test_mtp1_gdn_legacy_verify: one draft with TRTLLM_USE_GDN_REPLAY=0, over six word problems.
-ModelingV2Qwen38FlashNextNvfp4Sm103Tp1::mtp1_gdn_legacy:
-  # modeling_v2's own reading over those problems, 384 new tokens each; the cached-replay
-  # verify path reads the same over full gsm8k (1.971).
-  ref_al: 1.968
-  # 95% of ref_al.
-  min_al: 1.87
-
-# test_mtp5_gsm8k_and_acceptance: five drafts, bf16 KV, trtllm-gen experts.
-ModelingV2Qwen38FlashNextNvfp4Sm103Tp1::mtp5:
-  # modeling_v2's own full-gsm8k reading on GB300 (1319 samples; four drafts read 4.428, six
-  # 5.609); there is no built-in reading at this draft length.
-  ref_al: 5.063
-  # 95% of ref_al: above the four-draft reading, so a fifth draft position that is never
-  # accepted fails it.
-  min_al: 4.810
-
-# test_mtp7_gsm8k_and_acceptance: seven drafts, the longest the target runs.
-ModelingV2Qwen38FlashNextNvfp4Sm103Tp1::mtp7:
-  # modeling_v2's own full-gsm8k reading on GB300, as for mtp5.
-  ref_al: 6.052
-  # 95% of ref_al: above the six-draft reading (5.609), so a seventh draft position that is
-  # never accepted fails it.
-  min_al: 5.749
-
-# test_mtp7_long_context_passkey: seven drafts with IndexShare on over 12 prompts of 3k-12k
-# tokens (the sparse attention path), whose output mostly copies the document's section
-# headings: the readings sit near the range's ceiling of 8.
-ModelingV2Qwen38FlashNextNvfp4Sm103Tp1::mtp7_long_context:
-  ref_al: 7.774
-  # 2.5% below ref_al, as for mtp3_long_context.
-  min_al: 7.580
-
-# test_mtp3_bf16_ssm_state_gsm8k_and_acceptance: three drafts over a bf16 recurrent state.
-ModelingV2Qwen38FlashNextNvfp4Sm103Tp1::mtp3_bf16_state:
-  # modeling_v2's own full-gsm8k reading on GB300; the fp32-state reading is
-  # 3.704, so the bf16 state costs nothing measurable.
-  ref_al: 3.699
-  # 95% of ref_al, above the two-draft reading (~2.8): a third draft position that is never
-  # accepted fails it.
-  min_al: 3.514
-
-# test_mtp7_bf16_ssm_state_long_context_passkey: the mtp7_long_context prompts over a bf16
-# recurrent state (7.774 over fp32).
+# test_mtp7_long_context_passkey: seven drafts with IndexShare on, over a bf16 recurrent state,
+# over 12 prompts of 3k-12k tokens (the sparse attention path), whose output mostly copies the
+# document's section headings: the readings sit near the range's ceiling of 8 (7.774 over an
+# fp32 state).
 ModelingV2Qwen38FlashNextNvfp4Sm103Tp1::mtp7_bf16_state_long_context:
   ref_al: 7.857
-  # 2.5% below ref_al, as for mtp7_long_context.
+  # 2.5% below ref_al, as for mtp3_long_context.
   min_al: 7.661

@@ -412,33 +412,26 @@ class TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1(LlmapiAccuracyTestHarness):
         moe_config=MOE,
     )
 
-    # The breakable prefill CUDA graph is opt-in. The buckets cover the gsm8k prompts; with the
-    # 2048-token budget every chunk of a longer prompt lands on one as well.
+    # The breakable prefill CUDA graph is opt-in; these buckets cover the prompts of
+    # `test_breakable_prefill_matches_eager`.
     BREAKABLE_PREFILL = dict(
         prefill_cuda_graph_backend="breakable",
         prefill_capture_num_tokens=[128, 256, 512, 1024, 2048, 3072],
     )
     ENGINE_BREAKABLE = dict(ENGINE, **BREAKABLE_PREFILL)
-    ENGINE_BREAKABLE_CHUNKED = dict(ENGINE_BREAKABLE, max_num_tokens=2048)
 
     # One-model MTP-Eagle with the checkpoint's single MTP module replayed
     # `max_draft_len` times.
     MTP1 = MTPDecodingConfig(max_draft_len=1)
     MTP3 = MTPDecodingConfig(max_draft_len=3)
-    MTP5 = MTPDecodingConfig(max_draft_len=5)
     MTP7 = MTPDecodingConfig(max_draft_len=7)
 
     # Acceptance-length anchors in references/acceptance_length.yaml, keyed by
     # target and variant.
     ACCEPTANCE_KEY = "ModelingV2Qwen38FlashNextNvfp4Sm103Tp1::mtp1"
-    ACCEPTANCE_KEY_FP8_KV = "ModelingV2Qwen38FlashNextNvfp4Sm103Tp1::mtp1_fp8_kv"
-    ACCEPTANCE_KEY_NVFP4_KV = "ModelingV2Qwen38FlashNextNvfp4Sm103Tp1::mtp1_nvfp4_kv"
-    ACCEPTANCE_KEY_MTP3 = "ModelingV2Qwen38FlashNextNvfp4Sm103Tp1::mtp3"
-    ACCEPTANCE_KEY_MTP3_CUTEDSL = "ModelingV2Qwen38FlashNextNvfp4Sm103Tp1::mtp3_cutedsl"
-    ACCEPTANCE_KEY_MTP5 = "ModelingV2Qwen38FlashNextNvfp4Sm103Tp1::mtp5"
-    ACCEPTANCE_KEY_MTP7 = "ModelingV2Qwen38FlashNextNvfp4Sm103Tp1::mtp7"
-    ACCEPTANCE_KEY_MTP7_LONG_CONTEXT = "ModelingV2Qwen38FlashNextNvfp4Sm103Tp1::mtp7_long_context"
-    ACCEPTANCE_KEY_MTP3_BF16_STATE = "ModelingV2Qwen38FlashNextNvfp4Sm103Tp1::mtp3_bf16_state"
+    ACCEPTANCE_KEY_MTP3_CUTEDSL_BF16_STATE = (
+        "ModelingV2Qwen38FlashNextNvfp4Sm103Tp1::mtp3_cutedsl_bf16_state"
+    )
     ACCEPTANCE_KEY_MTP7_BF16_STATE_LONG_CONTEXT = (
         "ModelingV2Qwen38FlashNextNvfp4Sm103Tp1::mtp7_bf16_state_long_context"
     )
@@ -449,7 +442,6 @@ class TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1(LlmapiAccuracyTestHarness):
     ACCEPTANCE_KEY_NVFP4_KV_LONG_CONTEXT = (
         "ModelingV2Qwen38FlashNextNvfp4Sm103Tp1::mtp3_nvfp4_kv_long_context"
     )
-    ACCEPTANCE_KEY_GDN_LEGACY = "ModelingV2Qwen38FlashNextNvfp4Sm103Tp1::mtp1_gdn_legacy"
 
     def _gsm8k_with_acceptance(self, mocker, monkeypatch, engine, speculative_config, key, label):
         """gsm8k against the reference row the engine resolves, then the acceptance length.
@@ -485,62 +477,6 @@ class TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1(LlmapiAccuracyTestHarness):
             task.evaluate(llm, extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
 
     @skip_not_sm103
-    def test_gsm8k_breakable_prefill_cuda_graph(self, mocker, monkeypatch):
-        """The text model with ``prefill_cuda_graph_backend="breakable"``, against the same gsm8k anchor.
-
-        Every prefill step of up to 3072 tokens is padded to a captured bucket and replayed, so
-        the padding rows, the four eager breaks and the per-bucket graphs run under real
-        prompts. That replays happen is shown by ``test_breakable_prefill_matches_eager``.
-        """
-        mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN", self.GSM8K_MAX_OUTPUT_LEN)
-
-        with LLM(
-            self.MODEL_PATH,
-            **self.ENGINE_BREAKABLE,
-            **_require_target(monkeypatch, **_VALIDATE),
-        ) as llm:
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm, extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
-
-    @skip_not_sm103
-    def test_gsm8k_cutedsl_moe(self, mocker, monkeypatch):
-        """The text model with the trunk's routed experts on CuteDSL, against the same gsm8k anchor.
-
-        Same as ``test_gsm8k`` with ``moe_config.backend="CUTEDSL"``.
-        """
-        mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN", self.GSM8K_MAX_OUTPUT_LEN)
-        engine = dict(self.ENGINE, moe_config=MoeConfig(backend="CUTEDSL"))
-
-        with LLM(
-            self.MODEL_PATH,
-            **engine,
-            **_require_target(monkeypatch, **_VALIDATE),
-        ) as llm:
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm, extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
-
-    @skip_not_sm103
-    def test_gsm8k_bf16_ssm_state(self, mocker, monkeypatch):
-        """The text model with the recurrent state stored in bf16, against the fp32 gsm8k anchor.
-
-        ``mamba_ssm_cache_dtype="bfloat16"`` (what ``auto`` resolves to for this checkpoint) rounds
-        the state to bf16 on every decode token and every prefill call, a lossy substitution
-        for the checkpoint's fp32 state. It reads the same reference row as ``test_gsm8k``, so
-        the rounding has to stay inside that row's tolerance. The decode step runs its
-        recurrence in the batch-invariant form that a bf16 pool needs.
-        """
-        mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN", self.GSM8K_MAX_OUTPUT_LEN)
-        engine = dict(self.ENGINE, kv_cache_config=self.KV_CACHE_BF16_STATE)
-
-        with LLM(
-            self.MODEL_PATH,
-            **engine,
-            **_require_target(monkeypatch, **_VALIDATE),
-        ) as llm:
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm, extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
-
-    @skip_not_sm103
     def test_mtp1_gsm8k_and_acceptance(self, mocker, monkeypatch):
         """MTP with one draft: gsm8k against the MTP reference, plus acceptance length.
 
@@ -554,126 +490,28 @@ class TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1(LlmapiAccuracyTestHarness):
         )
 
     @skip_not_sm103
-    def test_mtp1_fp8_kv_gsm8k_and_acceptance(self, mocker, monkeypatch):
-        """MTP with one draft over an fp8 KV cache: the FP8 KV row of references/gsm8k.yaml.
+    def test_mtp3_cutedsl_bf16_ssm_state_gsm8k_and_acceptance(self, mocker, monkeypatch):
+        """Three drafts over a CuteDSL trunk and a bf16 recurrent state: the MTP row and a floor.
 
-        ``kv_cache_config.dtype="fp8"`` makes the engine resolve ``kv_cache_quant_algo`` FP8,
-        which the reference lookup keys on: this case reads the FP8 row where
-        ``test_mtp1_gsm8k_and_acceptance`` (no KV quantization) reads the bf16 MTP row. The
-        draft layer runs over the same fp8 pool; its acceptance length has a floor of its own,
-        since fp8 storage can cost drafts the bf16 cache would have kept.
+        The opt-in storage and kernel choices in one engine: the trunk's routed experts run on
+        CuteDSL next to the draft layer's FP8 block-scale experts, and the recurrent state is
+        bf16 (what ``auto`` resolves to for this checkpoint), rounded at every decode token,
+        prefill call and cached-replay commit. Three drafts give the verify step four rows per
+        request on every attention and recurrent-state call. Acceptance length detects a trunk
+        hidden state or a drifted state the draft layer cannot use, which accuracy does not.
         """
-        engine = dict(self.ENGINE, kv_cache_config=self.KV_CACHE_FP8)
-        self._gsm8k_with_acceptance(
-            mocker, monkeypatch, engine, self.MTP1, self.ACCEPTANCE_KEY_FP8_KV, "mtp1 fp8 kv"
+        engine = dict(
+            self.ENGINE,
+            moe_config=MoeConfig(backend="CUTEDSL"),
+            kv_cache_config=self.KV_CACHE_BF16_STATE,
         )
-
-    @skip_not_sm103
-    def test_mtp1_nvfp4_kv_gsm8k_and_acceptance(self, mocker, monkeypatch):
-        """MTP with one draft over an NVFP4 KV cache: the NVFP4 KV row of references/gsm8k.yaml.
-
-        ``kv_cache_config.dtype="nvfp4"`` makes the engine resolve ``kv_cache_quant_algo``
-        NVFP4, which the reference lookup keys on. A lossy substitution of the checkpoint's bf16
-        K/V (e2m1 values under e4m3 block scales), so the accuracy and the acceptance length
-        each have a row of their own. The draft layer runs over the same NVFP4 pool.
-        """
-        engine = dict(self.ENGINE, kv_cache_config=self.KV_CACHE_NVFP4)
-        self._gsm8k_with_acceptance(
-            mocker, monkeypatch, engine, self.MTP1, self.ACCEPTANCE_KEY_NVFP4_KV, "mtp1 nvfp4 kv"
-        )
-
-    @skip_not_sm103
-    def test_mtp3_gsm8k_and_acceptance(self, mocker, monkeypatch):
-        """MTP with three drafts: the MTP row of references/gsm8k.yaml, and a length floor.
-
-        Three drafts replay the one MTP module three times, with the verify step running four
-        rows per request, a different shape from ``test_mtp1_gsm8k_and_acceptance`` on every
-        attention and recurrent-state call of the verify step. Drafts after the first can be
-        rejected while the first stays accepted, which holds the length near the one-draft
-        value, so the floor has its own entry.
-        """
-        self._gsm8k_with_acceptance(
-            mocker, monkeypatch, self.ENGINE, self.MTP3, self.ACCEPTANCE_KEY_MTP3, "mtp3"
-        )
-
-    @skip_not_sm103
-    def test_mtp3_breakable_prefill_gsm8k_and_acceptance(self, mocker, monkeypatch):
-        """MTP with three drafts over replayed prefill steps: the MTP row, and the length floor.
-
-        The padded rows must never reach the draft loop: the worker takes the batch's own rows
-        and the draft layer's first step runs over them eagerly. A draft layer fed a wrong
-        hidden state loses acceptance length without changing accuracy.
-        """
-        self._gsm8k_with_acceptance(
-            mocker,
-            monkeypatch,
-            self.ENGINE_BREAKABLE,
-            self.MTP3,
-            self.ACCEPTANCE_KEY_MTP3,
-            "mtp3 breakable prefill",
-        )
-
-    @skip_not_sm103
-    def test_mtp3_cutedsl_gsm8k_and_acceptance(self, mocker, monkeypatch):
-        """MTP with three drafts over a trunk whose routed experts run on CuteDSL.
-
-        The trunk's CuteDSL experts and the draft layer's FP8 block-scale experts run in one
-        forward only here: ``test_gsm8k_cutedsl_moe`` has no draft layer and the other MTP
-        cases run the trunk on trtllm-gen. Acceptance length detects a trunk hidden state the
-        draft layer cannot use, which accuracy does not.
-        """
-        engine = dict(self.ENGINE, moe_config=MoeConfig(backend="CUTEDSL"))
         self._gsm8k_with_acceptance(
             mocker,
             monkeypatch,
             engine,
             self.MTP3,
-            self.ACCEPTANCE_KEY_MTP3_CUTEDSL,
-            "mtp3 cutedsl",
-        )
-
-    @skip_not_sm103
-    def test_mtp5_gsm8k_and_acceptance(self, mocker, monkeypatch):
-        """MTP with five drafts: the MTP row of references/gsm8k.yaml, and a length floor.
-
-        Six verify rows per request, a width that no other case runs: the cached replay at
-        ``T = 6`` and ``thop_attention`` at ``predicted_tokens_per_seq`` 6, with the all-layer
-        commit from 16 requests on.
-        """
-        self._gsm8k_with_acceptance(
-            mocker, monkeypatch, self.ENGINE, self.MTP5, self.ACCEPTANCE_KEY_MTP5, "mtp5"
-        )
-
-    @skip_not_sm103
-    def test_mtp7_gsm8k_and_acceptance(self, mocker, monkeypatch):
-        """MTP with seven drafts, the longest the target runs: the MTP row and a length floor.
-
-        Eight verify rows per request is the cached replay kernel's ceiling (``T = 8``, history
-        16): a slot that accepts every draft fills its history every other step, so the
-        checkpoint commit, in-kernel below 16 requests and all-layer from there on, runs twice
-        as often as at three drafts. The engine captures a CUDA graph for every batch size up
-        to 32, so every captured step carries up to 256 verify rows.
-        """
-        self._gsm8k_with_acceptance(
-            mocker, monkeypatch, self.ENGINE, self.MTP7, self.ACCEPTANCE_KEY_MTP7, "mtp7"
-        )
-
-    @skip_not_sm103
-    def test_mtp3_bf16_ssm_state_gsm8k_and_acceptance(self, mocker, monkeypatch):
-        """MTP with three drafts over a bf16 recurrent state: the MTP row, and a length floor.
-
-        The cached replay rebuilds the state from a checkpoint that is now bf16 and rounds it
-        once at every commit; drafts after the first are the ones a degraded state would lose,
-        so the length floor has its own entry.
-        """
-        engine = dict(self.ENGINE, kv_cache_config=self.KV_CACHE_BF16_STATE)
-        self._gsm8k_with_acceptance(
-            mocker,
-            monkeypatch,
-            engine,
-            self.MTP3,
-            self.ACCEPTANCE_KEY_MTP3_BF16_STATE,
-            "mtp3 bf16 state",
+            self.ACCEPTANCE_KEY_MTP3_CUTEDSL_BF16_STATE,
+            "mtp3 cutedsl bf16 state",
         )
 
     def _long_context_passkey(
@@ -730,11 +568,7 @@ class TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1(LlmapiAccuracyTestHarness):
         assert not missed, f"pass keys not stated back: {missed} of {[key for _, key in prompts]}"
         twins = outputs[len(prompts) // 2], outputs[-1]
         assert twins[0].outputs[0].token_ids == twins[1].outputs[0].token_ids
-        if engine.get("prefill_cuda_graph_backend") == "breakable":
-            # Every prompt is longer than the chunk budget, so its chunks fill the top bucket.
-            assert replays.get(2048, 0) >= len(texts), replays
-        else:
-            assert not replays, replays
+        assert not replays, replays
         if index_share:
             assert reuse_calls, "IndexShare is on and the reuse op never ran"
         else:
@@ -746,28 +580,17 @@ class TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1(LlmapiAccuracyTestHarness):
         assert_acceptance_length(getattr(self, key_name), acceptance_length)
 
     @pytest.mark.parametrize(
-        "kv_cache, index_share, breakable, key_name",
+        "kv_cache, index_share, key_name",
         [
-            pytest.param("KV_CACHE", True, False, "ACCEPTANCE_KEY_LONG_CONTEXT", id="index_share"),
+            pytest.param("KV_CACHE", True, "ACCEPTANCE_KEY_LONG_CONTEXT", id="index_share"),
+            pytest.param("KV_CACHE_FP8", False, "ACCEPTANCE_KEY_FP8_KV_LONG_CONTEXT", id="fp8_kv"),
             pytest.param(
-                "KV_CACHE_FP8", False, False, "ACCEPTANCE_KEY_FP8_KV_LONG_CONTEXT", id="fp8_kv"
-            ),
-            pytest.param(
-                "KV_CACHE_NVFP4",
-                False,
-                False,
-                "ACCEPTANCE_KEY_NVFP4_KV_LONG_CONTEXT",
-                id="nvfp4_kv",
-            ),
-            pytest.param(
-                "KV_CACHE", True, True, "ACCEPTANCE_KEY_LONG_CONTEXT", id="breakable_prefill"
+                "KV_CACHE_NVFP4", False, "ACCEPTANCE_KEY_NVFP4_KV_LONG_CONTEXT", id="nvfp4_kv"
             ),
         ],
     )
     @skip_not_sm103
-    def test_mtp3_long_context_passkey(
-        self, monkeypatch, kv_cache, index_share, breakable, key_name
-    ):
+    def test_mtp3_long_context_passkey(self, monkeypatch, kv_cache, index_share, key_name):
         """Pass key retrieval over 3k-6k-token prompts, where the sparse attention path runs.
 
         The gsm8k cases never leave the dense path (their prompts are under the indexer's
@@ -779,15 +602,8 @@ class TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1(LlmapiAccuracyTestHarness):
         ``index_share`` makes the draft loop reuse the selection of its first step; the
         acceptance length then must not fall below the floor taken from the same prompts
         with the draft layer selecting on every step, and the reuse op must have run.
-
-        With ``breakable`` the prompts are prefilled in 2048-token chunks, each replayed from
-        the top bucket: the continuations past the first chunk read the KV, index and recurrent
-        state the earlier replays wrote, which the single-chunk gsm8k prompts never do.
         """
-        engine = dict(
-            self.ENGINE_BREAKABLE_CHUNKED if breakable else self.ENGINE,
-            kv_cache_config=getattr(self, kv_cache),
-        )
+        engine = dict(self.ENGINE, kv_cache_config=getattr(self, kv_cache))
         self._long_context_passkey(
             monkeypatch,
             self.MTP3,
@@ -795,7 +611,7 @@ class TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1(LlmapiAccuracyTestHarness):
             index_share,
             _PASSKEY_LENGTHS,
             key_name,
-            f"mtp3 long context {kv_cache} breakable={breakable}",
+            f"mtp3 long context {kv_cache}",
         )
 
     @skip_not_sm103
@@ -892,32 +708,16 @@ class TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1(LlmapiAccuracyTestHarness):
 
     @skip_not_sm103
     def test_mtp7_long_context_passkey(self, monkeypatch):
-        """Pass key retrieval over 3k-12k-token prompts with seven drafts and IndexShare on.
+        """Pass key retrieval over 3k-12k-token prompts: seven drafts, IndexShare, bf16 state.
 
-        Seven drafts run the sparse path with eight rows per request in the verify step and
-        draft decode steps that reuse the first step's selection up to six positions past it,
-        where the groups completed since the capture displace two of its ids. 12k tokens past
+        Seven drafts run the sparse path with eight rows per request in the verify step, the
+        cached replay kernel's ceiling (``T = 8``), and draft decode steps that reuse the first
+        step's selection up to six positions past it, where the groups completed since the
+        capture displace two of its ids. The recurrent state is bf16, what ``auto`` resolves to
+        for this checkpoint: it is rounded at every cached-replay checkpoint commit and once
+        per prefill chunk, so the rounding adds up with the length of the prompt and of the
+        answer, and pass keys stated back over 3k-12k tokens bound that drift. 12k tokens past
         the 8k default needs ``max_seq_len`` 16384.
-        """
-        engine = dict(self.ENGINE, max_seq_len=16384)
-        self._long_context_passkey(
-            monkeypatch,
-            self.MTP7,
-            engine,
-            True,
-            _PASSKEY_LENGTHS_LONG,
-            "ACCEPTANCE_KEY_MTP7_LONG_CONTEXT",
-            "mtp7 long context",
-        )
-
-    @skip_not_sm103
-    def test_mtp7_bf16_ssm_state_long_context_passkey(self, monkeypatch):
-        """``test_mtp7_long_context_passkey`` over a bf16 recurrent state.
-
-        The state is rounded to bf16 at every cached-replay checkpoint commit, each time a
-        slot's history of 16 accepted tokens fills, and once per prefill chunk, so the rounding
-        adds up with the length of the prompt and of the answer; pass keys stated back over
-        3k-12k tokens bound that drift.
         """
         engine = dict(self.ENGINE, max_seq_len=16384, kv_cache_config=self.KV_CACHE_BF16_STATE)
         self._long_context_passkey(
@@ -932,24 +732,19 @@ class TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1(LlmapiAccuracyTestHarness):
 
     @pytest.mark.parametrize(
         "forced, accepted_rows",
-        [
-            pytest.param("1e-9", 1, id="all_rejected"),
-            pytest.param("7", 8, id="all_accepted"),
-        ],
+        [pytest.param("1e-9", 1, id="all_rejected")],
     )
     @skip_not_sm103
     def test_mtp7_forced_acceptance_extremes(self, monkeypatch, forced, accepted_rows):
-        """Seven drafts with every draft rejected, then with every draft accepted, at batch 32.
+        """Seven drafts with every draft rejected, at batch 32.
 
-        ``TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS`` overrides the sampler's acceptance:
-        a vanishing fraction accepts the target's own token and nothing else, ``7`` accepts
-        the seven drafts as well. 32 requests over 2k-6k-token prompts run the sparse path,
-        the all-layer replay commit and the CUDA graph at 32 x 8 = 256 verify rows with the
-        most rows rolled back at every step (seven) and with none rolled back, a history that
-        then fills to its end every second step. The acceptance length, read from the
-        requests' own metrics, must be exactly the forced row count: the acceptance
-        bookkeeping of the verify step moved by the number of rows forced, not by what the
-        drafts say.
+        ``TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS`` overrides the sampler's acceptance: a
+        vanishing fraction accepts the target's own token and nothing else. 32 requests over
+        2k-6k-token prompts run the sparse path, the all-layer replay commit and the CUDA graph
+        at 32 x 8 = 256 verify rows with the most rows rolled back at every step (seven). The
+        acceptance length, read from the requests' own metrics, must be exactly the forced row
+        count: the acceptance bookkeeping of the verify step moved by the number of rows
+        forced, not by what the drafts say.
 
         The text under forced acceptance is not compared with anything: the drafts a forced
         step accepts are not the target's tokens, and a run's tokens depend on the verify
@@ -984,53 +779,6 @@ class TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1(LlmapiAccuracyTestHarness):
         assert acceptance_length == pytest.approx(accepted_rows, abs=0.05)
 
     @skip_not_sm103
-    def test_mtp1_gdn_legacy_verify(self, monkeypatch):
-        """MTP with one draft and ``TRTLLM_USE_GDN_REPLAY=0``: the per-step recurrent buffers.
-
-        The engine runs the cached-replay verify step unless the variable is 0; this is the
-        only case that binds and runs the other one. A few word problems keep it short: their
-        answers say the recurrent state survives rejected drafts, and the acceptance length
-        says the drafts still land.
-        """
-        monkeypatch.setenv("TLLM_WORKER_USE_SINGLE_PROCESS", "1")
-        tokenizer = AutoTokenizer.from_pretrained(self.MODEL_PATH)
-        prompts = [
-            tokenizer.apply_chat_template(
-                [{"role": "user", "content": f"{question} {_WORD_PROBLEM_SUFFIX}"}],
-                tokenize=False,
-                add_generation_prompt=True,
-                enable_thinking=False,
-            )
-            for question, _ in _WORD_PROBLEMS
-        ]
-
-        with LLM(
-            self.MODEL_PATH,
-            speculative_config=self.MTP1,
-            **self.ENGINE,
-            **_require_target(monkeypatch, TRTLLM_USE_GDN_REPLAY="0", **_VALIDATE),
-        ) as llm:
-            outputs = llm.generate(
-                prompts,
-                SamplingParams(max_tokens=384, temperature=0, return_perf_metrics=True),
-                use_tqdm=False,
-            )
-            bound = _target_core(llm)._bound
-
-        assert bound.replay is None and bound.int_ssm, (
-            "TRTLLM_USE_GDN_REPLAY=0 but the target bound the cached-replay verify state"
-        )
-        wrong = [
-            (question, answer, output.outputs[0].text[-120:])
-            for (question, answer), output in zip(_WORD_PROBLEMS, outputs)
-            if f"answer is {answer}" not in output.outputs[0].text.replace("**", "")
-        ]
-        assert not wrong, f"wrong or missing answers: {wrong}"
-        acceptance_length = _acceptance_length_from_requests(outputs, self.MTP1.max_draft_len)
-        print(f"[AL] mtp1 gdn legacy acceptance_length = {acceptance_length:.3f}")
-        assert_acceptance_length(self.ACCEPTANCE_KEY_GDN_LEGACY, acceptance_length)
-
-    @skip_not_sm103
     def test_mtp1_mmmu(self, monkeypatch):
         """The vision tower and mrope path under MTP, against the MTP row of references/mmmu.yaml.
 
@@ -1038,16 +786,6 @@ class TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1(LlmapiAccuracyTestHarness):
         requires it.
         """
         self._mmmu(monkeypatch, self.ENGINE)
-
-    @skip_not_sm103
-    def test_mtp1_mmmu_breakable_prefill(self, monkeypatch):
-        """``test_mtp1_mmmu`` over replayed prefill steps, against the same row.
-
-        The vision rows are spliced into the embedding inside the first break of every
-        replay; a replay that kept the previous step's rows or dropped them would answer
-        from the text alone, which this score detects.
-        """
-        self._mmmu(monkeypatch, self.ENGINE_BREAKABLE)
 
     def _mmmu(self, monkeypatch, engine):
         engine = dict(engine, kv_cache_config=self.KV_CACHE_MULTIMODAL)

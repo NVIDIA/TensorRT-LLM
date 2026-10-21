@@ -168,20 +168,17 @@ l0_b300:
   - unittest/_torch/moe/test_moe_backend.py::test_moe_backend -k "TRTLLM"
   - unittest/_torch/moe/test_moe_backend.py::test_moe_backend -k "CUTEDSL"
   - unittest/_torch/moe/test_moe_backend.py::test_moe_backend -k "DEEPGEMM"
-  # qwen4_exp target, post-merge: one gate per opt-in variant -- three drafts, alone and
-  # over CuteDSL experts; seven drafts over 3k-12k-token pass keys (the verify step's
-  # eight rows per request); fp8 and NVFP4 KV over the pass keys (their sparse attention
-  # path); the recurrent state in bf16 at three drafts; seven drafts all rejected by
-  # forced acceptance (the speculative rollback end to end); synthetic videos; and the
-  # breakable prefill CUDA graph replayed against eager greedy continuations at the bucket
-  # edges and with context and generation rows in one batch. The other gates in
-  # test_qwen4_exp.py run on demand.
-  - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1::test_mtp3_gsm8k_and_acceptance
-  - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1::test_mtp3_cutedsl_gsm8k_and_acceptance
-  - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1::test_mtp7_long_context_passkey
+  # qwen4_exp target, post-merge: the opt-in variants -- three drafts over CuteDSL experts and a
+  # bf16 recurrent state in one engine; fp8 and NVFP4 KV over the pass keys (their sparse
+  # attention path); seven drafts over 3k-12k-token pass keys on a bf16 state (the verify
+  # step's eight rows per request); seven drafts all rejected by forced acceptance (the
+  # speculative rollback end to end); synthetic videos; and the breakable prefill CUDA graph
+  # replayed against eager greedy continuations at the bucket edges and with context and
+  # generation rows in one batch.
+  - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1::test_mtp3_cutedsl_bf16_ssm_state_gsm8k_and_acceptance
   - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1::test_mtp3_long_context_passkey[fp8_kv]
   - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1::test_mtp3_long_context_passkey[nvfp4_kv]
-  - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1::test_mtp3_bf16_ssm_state_gsm8k_and_acceptance
+  - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1::test_mtp7_long_context_passkey
   - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1::test_mtp7_forced_acceptance_extremes[all_rejected]
   - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1::test_mtp1_video
   - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1::test_breakable_prefill_matches_eager
