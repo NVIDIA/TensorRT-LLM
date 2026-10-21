@@ -106,18 +106,18 @@ l0_b200:
   - test_e2e.py::test_ptp_quickstart_advanced_mtp[DeepSeek-V3-Lite-BF16-DeepSeek-V3-Lite/bf16]
   - test_e2e.py::test_ptp_quickstart_advanced_mtp_eagle[DeepSeek-V3-Lite-BF16-DeepSeek-V3-Lite/bf16]
   - test_e2e.py::test_openai_chat_guided_decoding[openai/gpt-oss-120b]
-  # Covers tests/unittest/_torch/attention/ on B200. kernels/ has no entry of its own on
-  # any list, so this entry is what runs it; multi_gpu/ has its own entries only in
-  # l0_dgx_b300.
-  # - Width: no agg_unit_mem_df.csv row matches this entry text, so test_unittests runs
-  #   it with one xdist worker and no --lf retry. TIMEOUT (90) bounds the whole entry.
+  # Covers the GPU cases of tests/unittest/_torch/attention/ on B200, except the paths
+  # ignored below; its cpu_only cases run on CPU (l0_cpu). kernels/ has no entry of its own
+  # on any list, so apart from kernels/parallel_hw_agnostic/ this entry is what runs it
+  # here. multi_gpu/ cases need >= 2 GPUs, so they skip here and run on multi-GPU stages:
+  # l0_gb300_multi_gpus (post_merge) and l0_dgx_b300, which runs test_helix_zero_kv.py in
+  # its pre_merge block and the rest in post_merge. Collecting them still runs their helix
+  # files' import-time rebinding of mpi4py's serializer, which applies to the whole pytest
+  # process.
   # - kernels/parallel_hw_agnostic/ is ignored: its cases do not depend on the GPU
-  #   architecture, so they run on H100 (l0_h100), with the cpu_only ones on CPU (l0_cpu).
-  #   GB300 (l0_gb300_multi_gpus) also runs them, to keep its csv match; that post_merge
-  #   stage is the only Blackwell stage that does.
-  # - multi_gpu/ cases need >= 2 GPUs and skip on this 1-GPU stage. Its helix files rebind
-  #   mpi4py's serializer at import time, which applies process-wide on every stage that
-  #   collects them, including where the tests themselves skip.
+  #   architecture, so its GPU cases run on H100 (l0_h100) and its cpu_only ones on CPU
+  #   (l0_cpu). GB300 (l0_gb300_multi_gpus, post_merge) also runs the GPU cases; it is
+  #   the only Blackwell stage that does.
   # - The other files ignored here have their own entries below.
   - unittest/_torch/attention --ignore=unittest/_torch/attention/sparse/test_cute_dsl_gvr_topk_decode.py --ignore=unittest/_torch/attention/sparse/msa/test_minimax_m3_sparse_attn_decode.py --ignore=unittest/_torch/attention/sparse/msa/test_msa_proxy_split.py --ignore=unittest/_torch/attention/sparse/deepseek_v4/test_prims_ts_sparse_mla_fmha.py --ignore=unittest/_torch/attention/kernels/parallel_hw_agnostic TIMEOUT (90)
   - unittest/_torch/executor/kv_cache/test_mixed_precision_kv_cache.py
