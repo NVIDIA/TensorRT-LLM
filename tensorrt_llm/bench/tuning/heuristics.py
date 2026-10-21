@@ -122,9 +122,10 @@ def calc_engine_setting(
     bytes_per_elem = BYTES_PER_ELEM.get(QuantAlgo.NO_QUANT)
     if isinstance(model_config, (NemotronHybridConfig, Qwen3HybridConfig)):
         mamba_ssm_cache_dtype = model_config.mamba_ssm_cache_dtype
-        if mamba_ssm_cache_dtype != "auto":
-            if str_dtype_to_torch(mamba_ssm_cache_dtype) == torch.float32:
-                bytes_per_elem = 4.0
+        if mamba_ssm_cache_dtype in (None, "auto"):
+            mamba_ssm_cache_dtype = model_config.dtype
+        if str_dtype_to_torch(mamba_ssm_cache_dtype) == torch.float32:
+            bytes_per_elem = 4.0
 
     gb_per_extra_cache = model_config.extra_model_cache_in_gb(bytes_per_elem, target_seq_len)
     kv_cache_max_requests = cache_memory / (gb_per_token * target_seq_len + gb_per_extra_cache)
