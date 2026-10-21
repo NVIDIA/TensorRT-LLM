@@ -122,6 +122,15 @@ def _make_mock_kv_iter_stats(
 
 
 class TestStatsSerializer:
+    @pytest.mark.parametrize("times", [[], [0.0, 2.5]])
+    def test_serializer_encoder_gpu_samples(self, times):
+        iter_stats = _make_mock_iteration_stats()
+        stats = (iter_stats, None, None, 0, None, None, "overlap", None, {"gpuTimesMS": times})
+        result = json.loads(BaseWorker._stats_serializer(stats))
+        assert result["multimodalEncoderStats"]["gpuTimesMS"] == times
+        legacy = json.loads(BaseWorker._stats_serializer(stats[:8]))
+        assert "multimodalEncoderStats" not in legacy
+
     def test_serializer_without_kv_iter_stats(self):
         """Legacy 2-tuple and 3-tuple with None should produce same output."""
         iter_stats = _make_mock_iteration_stats()

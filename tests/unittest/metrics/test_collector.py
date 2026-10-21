@@ -122,6 +122,29 @@ class TestIterationStatsTopLevel:
         collector.log_iteration_stats(SAMPLE_ITERATION_STATS)
         assert _get_gauge_value(collector, "iteration_latency_seconds") == pytest.approx(0.0155)
 
+    def test_encoder_samples_preserve_calls_and_convert_units(self, collector):
+        collector.log_iteration_stats({"multimodalEncoderStats": {"gpuTimesMS": [2.0, 4.0]}})
+        collector.log_iteration_stats({})
+        labels = collector.labels
+        assert (
+            REGISTRY.get_sample_value("trtllm_multimodal_encoder_gpu_time_seconds_count", labels)
+            == 2
+        )
+        assert REGISTRY.get_sample_value(
+            "trtllm_multimodal_encoder_gpu_time_seconds_sum", labels
+        ) == pytest.approx(0.006)
+
+    def test_input_processing_separates_stages_and_worker_queue(self, collector):
+        collector.log_input_processing("media_load", 0.25)
+        collector.log_input_processing("processor", 0.04, queue_seconds=0.1)
+        for stage, elapsed in (("media_load", 0.25), ("processor", 0.04)):
+            assert REGISTRY.get_sample_value(
+                "trtllm_input_processing_seconds_sum", {**collector.labels, "stage": stage}
+            ) == pytest.approx(elapsed)
+        assert REGISTRY.get_sample_value(
+            "trtllm_input_processing_queue_seconds_sum", collector.labels
+        ) == pytest.approx(0.1)
+
     def test_memory_usage(self, collector):
         collector.log_iteration_stats(SAMPLE_ITERATION_STATS)
 
