@@ -1853,9 +1853,25 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         batch_next_tokens_cuda_int = torch.empty(
             (logits_cuda.size(0), self.max_beam_width), device=cuda_device, dtype=token_dtype
         )
+        # Raw and processed logprobs share this buffer. Beam-search logprobs
+        # come from beam history and do not occupy rows here.
+        reqs_indices_needing_raw_logprobs: list[int] = []
+        num_logprobs_rows = 0
+        if return_log_probs:
+            need_raw_logprobs = self._slot_params.need_raw_logprobs
+            need_processed_logprobs = self._slot_params.need_processed_logprobs
+            for req_idx, (request, slot, num_generated_tokens) in enumerate(
+                zip(requests, seq_slots_list, req_num_generated_tokens.tolist())
+            ):
+                if self._use_beam_search and request.py_beam_width != 1:
+                    continue
+                if need_raw_logprobs[slot]:
+                    reqs_indices_needing_raw_logprobs.append(req_idx)
+                if need_raw_logprobs[slot] or need_processed_logprobs[slot]:
+                    num_logprobs_rows += num_generated_tokens
         batch_processed_logprobs_cuda = (
-            torch.empty(  # NB: overprovisioning buffer for simplicity and later reuse in _process_logprobs
-                (logits_cuda.size(0), logits_cuda.size(1)), device=cuda_device, dtype=torch.float32
+            torch.empty(
+                (num_logprobs_rows, logits_cuda.size(1)), device=cuda_device, dtype=torch.float32
             )
             if return_log_probs
             else None
@@ -2045,20 +2061,11 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
 
         # Prepare logit indices for raw logprobs; beam-search requests get theirs
         # from the beam history instead.
-        reqs_indices_needing_raw_logprobs: list[int] = []
         batch_raw_logprob_indices_cuda = None
-        if return_log_probs:
-            need_raw_logprobs = self._slot_params.need_raw_logprobs
-            reqs_indices_needing_raw_logprobs = [
-                req_idx
-                for req_idx, (request, slot) in enumerate(zip(requests, seq_slots_list))
-                if need_raw_logprobs[slot]
-                and (not self._use_beam_search or request.py_beam_width == 1)
-            ]
-            if reqs_indices_needing_raw_logprobs:
-                batch_raw_logprob_indices_cuda = logits_cuda_indexer[
-                    torch.tensor(reqs_indices_needing_raw_logprobs, dtype=torch.int64)
-                ].to(device=cuda_device, non_blocking=True)
+        if reqs_indices_needing_raw_logprobs:
+            batch_raw_logprob_indices_cuda = logits_cuda_indexer[
+                torch.tensor(reqs_indices_needing_raw_logprobs, dtype=torch.int64)
+            ].to(device=cuda_device, non_blocking=True)
 
         # NB: 'd2t' contains offsets for transforming draft vocab token IDs into
         #     the target vocab. This is used by Eagle3ForCausalLM, whose input domain
