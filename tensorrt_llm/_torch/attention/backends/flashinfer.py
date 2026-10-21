@@ -2410,9 +2410,11 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
         """
         # NHD layout: [num_pages, kv_factor=1, page_size, num_kv_heads=1, head_dim]
         kv_buf = metadata.kv_cache_manager.get_buffers(self.layer_idx)
-        # Swap in this layer's page indices when layers live in different
-        # page spaces (mixed-precision staging); a no-op otherwise.
-        metadata.swap_paged_kv_indices_for_layer(self.layer_idx)
+        # Mixed precision gives MLA layers a second page space (the staging
+        # copy), so select this layer's page indices. Other MLA models keep
+        # their existing single-page-space behavior.
+        if metadata.mixed_precision_staging is not None:
+            metadata.swap_paged_kv_indices_for_layer(self.layer_idx)
         # [num_pages, page_size, kv_lora_rank + qk_rope_head_dim]
         combined = kv_buf.squeeze(1).squeeze(2)
         if self.has_fp8_kv_cache:
