@@ -435,6 +435,10 @@ def _attn_res_kernel(prefix_sum: torch.Tensor, num_candidates: int) -> _AttnResK
     return _AttnResKernel.UNFUSED
 
 
+# Largest token count per trtllm::attn_res_fwd call (cpp/tensorrt_llm/thop/attnResOp.cpp).
+_ATTN_RES_OP_MAX_TOKENS = 16384
+
+
 def _apply_attn_res_fused(
     prefix_sum: torch.Tensor, block_residual: torch.Tensor, proj: nn.Linear, norm: KimiK3RMSNorm
 ) -> Optional[torch.Tensor]:
@@ -454,22 +458,34 @@ def _apply_attn_res_fused(
         return None
     M, H = prefix_sum.shape
     K = int(block_residual.shape[0])
-    if K + 1 > 12 or M > 16384 or not (4096 <= H <= 8192 and H % 1024 == 0):
+    if K + 1 > 12 or not (4096 <= H <= 8192 and H % 1024 == 0):
         return None
     try:
         attn_res_op = torch.ops.trtllm.attn_res_fwd
     except (AttributeError, RuntimeError):
         return None
-    layer_kernel = prefix_sum.reshape(M, 1, H).contiguous()
-    block_kernel = block_residual.reshape(K, M, 1, H).contiguous()
-    output, _rsigma, _probs, _logits = attn_res_op(
-        layer_kernel,
-        block_kernel,
-        proj.weight.reshape(-1).to(torch.bfloat16).contiguous(),
-        norm.weight.to(torch.bfloat16).contiguous(),
-        float(norm.eps),
-    )
-    return output.reshape(M, H)
+    proj_weight = proj.weight.reshape(-1).to(torch.bfloat16).contiguous()
+    norm_weight = norm.weight.to(torch.bfloat16).contiguous()
+
+    def run(prefix: torch.Tensor, block: torch.Tensor) -> torch.Tensor:
+        T = prefix.shape[0]
+        output, _rsigma, _probs, _logits = attn_res_op(
+            prefix.reshape(T, 1, H).contiguous(),
+            block.reshape(K, T, 1, H).contiguous(),
+            proj_weight,
+            norm_weight,
+            float(norm.eps),
+        )
+        return output.reshape(T, H)
+
+    if M <= _ATTN_RES_OP_MAX_TOKENS:
+        return run(prefix_sum, block_residual)
+    # The op is per-token, so prefill chunks above its token limit run in slices.
+    output = torch.empty_like(prefix_sum)
+    for start in range(0, M, _ATTN_RES_OP_MAX_TOKENS):
+        end = min(M, start + _ATTN_RES_OP_MAX_TOKENS)
+        output[start:end] = run(prefix_sum[start:end], block_residual[:, start:end])
+    return output
 
 
 def _rms_norm_eps(norm: nn.Module) -> float:
