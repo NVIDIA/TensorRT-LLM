@@ -74,6 +74,40 @@ You can then send OpenAI-compatible requests, such as via curl or API clients, t
 
 `trtllm-serve` renders the chat template itself and marks the resulting `TextPrompt` with `chat_template_applied`, as do the multimodal prompt builders in `tensorrt_llm.inputs.utils`. An input processor that would otherwise apply the chat template to a raw `prompt` should use such a prompt verbatim; see `TextPrompt` in `tensorrt_llm/inputs/data.py`.
 
+### Input processing and encoder metrics
+
+Enable the existing metrics options in the serving YAML:
+
+```yaml
+return_perf_metrics: true
+enable_iter_perf_stats: true
+```
+
+`/prometheus/metrics` exposes these histograms; `/metrics` serves iteration statistics as JSON.
+
+| Metric | Measurement |
+| --- | --- |
+| `trtllm_input_processing_seconds{stage="media_load"}` | Time awaiting media resolution, including fetch, decode and worker waits, per chat request with media. |
+| `trtllm_input_processing_seconds{stage="chat_template"}` | Time awaiting chat template rendering, when rendering is needed. |
+| `trtllm_input_processing_seconds{stage="processor"}` | Input processor wall time inside its worker, including tokenization, model preprocessing and hashing. |
+| `trtllm_input_processing_queue_seconds` | Wait for an input processor worker, separate from processor execution. |
+| `trtllm_multimodal_encoder_gpu_time_seconds` | Rank-0 CUDA-event elapsed time per encoder call through `MultimodalModelMixin`, including item scheduling, inline encoding and side-stream prefetch. |
+
+Processor metrics cover the chat and text completion paths that offload preprocessing to the input processor pool. Encoder metrics exclude warmup, cache-only lookups and H2D transfers performed before the encoder call. Calls using precomputed embeddings or legacy paths outside `MultimodalModelMixin` do not produce encoder observations. The count is encoder calls, not requests or media items. The timings describe rank 0; they are not a sum or maximum across GPUs. Completed encoder observations may appear in a later iteration's JSON field, `multimodalEncoderStats.gpuTimesMS`, because collection does not wait for the GPU.
+
+Media loading and chat rendering can overlap. Encoder work can overlap LLM execution. Do not add these histogram averages to reconstruct TTFT or divide a shared encoder call across requests. Use client TTFT and throughput alongside the stage distributions to identify bottlenecks.
+
+[AIPerf server metrics](https://docs.nvidia.com/aiperf/server-metrics/server-metrics-collection) can scrape these metrics without a TRT-LLM-specific adapter. Add the explicit endpoint to your profile command:
+
+```bash
+aiperf profile --model MODEL --url http://localhost:8000 \
+  --endpoint-type chat --endpoint /v1/chat/completions \
+  --server-metrics http://localhost:8000/prometheus/metrics \
+  --server-metrics-formats json csv jsonl
+```
+
+The histogram sum and count provide total measured time and mean; percentile values are bucket estimates. Grafana can query the same Prometheus series.
+
 ### Run with [`trtllm-bench`](../../source/commands/trtllm-bench.rst)
 
 Evaluate offline inference performance with multimodal inputs using the `trtllm-bench` tool. For detailed instructions, see the [benchmarking guide](../developer-guide/perf-benchmarking.md).
