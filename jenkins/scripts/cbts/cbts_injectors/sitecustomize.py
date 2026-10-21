@@ -329,7 +329,7 @@ if os.getenv("CBTS_COVERAGE_CONFIG"):
             _product_tops = {
                 os.path.basename(p.rstrip("/"))
                 for p in _src
-                if p and os.path.abspath(p) != _tracker.repository_root
+                if p and os.path.realpath(p) != _tracker.repository_root
             }
             _watched_imports.update(dict.fromkeys(_product_tops, _activate_tracker))
             sys.meta_path.insert(0, ImportCompletionWatcher(_watched_imports))

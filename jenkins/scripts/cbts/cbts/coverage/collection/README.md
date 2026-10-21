@@ -41,6 +41,11 @@ and SLURM use the checkout visible to their test process. Include patterns match
 paths with `fnmatch` semantics (`*` also matches `/`). Extending collection does not extend the
 coverage selector's core-Python eligibility rules.
 
+Source roots and filenames resolve symlinks before membership checks. Installed
+`site-packages/tensorrt_llm/` and `dist-packages/tensorrt_llm/` paths retain the same library
+identity even when the virtual environment is inside the checkout. The report skips unrelated
+top-level directories when the configured include patterns name literal top-level paths.
+
 ## When it runs
 
 `jenkins/L0_MergeRequest.groovy` decides pipeline-level eligibility and propagates it through

@@ -26,6 +26,7 @@ SCHEMA_VERSION = "4"
 STORAGE_SCHEMA = "compact-v1"
 
 _CANON_RE = re.compile(r"(?:^|/)(tensorrt_llm/.*)$")
+_INSTALLED_RE = re.compile(r"(?:^|/)(?:site-packages|dist-packages)/(tensorrt_llm/.*)$")
 _REQUIRED_COLUMNS = {
     "stage": {"id", "name"},
     "case_stage": {"id", "test", "stage_id"},
@@ -61,13 +62,16 @@ def canonicalize_path(path: str, repository_root: Optional[str] = None) -> str:
     """Collapse a checkout or installed-package path to its repository-relative form."""
     if not os.path.isabs(path):
         return path
+    absolute = os.path.realpath(path)
+    match = _INSTALLED_RE.search(absolute)
+    if match:
+        return match.group(1)
     if repository_root:
-        root = os.path.abspath(repository_root).rstrip("/") + "/"
-        absolute = os.path.abspath(path)
+        root = os.path.realpath(repository_root).rstrip("/") + "/"
         if absolute.startswith(root):
             return absolute[len(root) :]
-    match = _CANON_RE.search(path)
-    return match.group(1) if match else path
+    match = _CANON_RE.search(absolute)
+    return match.group(1) if match else absolute
 
 
 def _bare_test_id(test: str, stage: str) -> str:

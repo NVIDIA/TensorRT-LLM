@@ -57,8 +57,8 @@ class PyStartTracker:
         repository_root: Optional[str] = None,
         include: Iterable[str] = (),
     ) -> None:
-        self.source_roots = tuple(os.path.abspath(p).rstrip("/") + "/" for p in source_roots if p)
-        self.repository_root = os.path.abspath(repository_root) if repository_root else None
+        self.source_roots = tuple(os.path.realpath(p).rstrip("/") + "/" for p in source_roots if p)
+        self.repository_root = os.path.realpath(repository_root) if repository_root else None
         self.include = tuple(include)
         self.data_dir = data_dir
         self.stage = stage
@@ -93,7 +93,7 @@ class PyStartTracker:
     def _in_source(self, filename: str) -> bool:
         if not filename or filename[0] == "<" or not filename.endswith(".py"):
             return False
-        absolute = os.path.abspath(filename)
+        absolute = os.path.realpath(filename)
         if not absolute.startswith(self.source_roots):
             return False
         relative = canonicalize_path(absolute, self.repository_root)
@@ -108,7 +108,7 @@ class PyStartTracker:
             fn = self._source_files.get(filename)
             if fn is None:
                 fn = self._source_files[filename] = (
-                    os.path.abspath(filename) if self._in_source(filename) else ""
+                    os.path.realpath(filename) if self._in_source(filename) else ""
                 )
             if fn:
                 qual = code.co_qualname

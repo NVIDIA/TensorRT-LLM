@@ -61,10 +61,18 @@ def enumerate_defs(source_root: str) -> tuple[set[str], set[tuple[str, str]]]:
     """Return (coverable_files, funcs) for the coverage-rate denominator, matching what the tracker records."""
     funcs: set[tuple[str, str]] = set()
     patterns = read_source_config().get("run", "include", fallback="").split()
-    repository_root = os.path.abspath(source_root)
+    source_root = os.path.realpath(source_root)
+    repository_root = source_root
     if os.path.basename(repository_root) == "tensorrt_llm":
         repository_root = os.path.dirname(repository_root)
-    for dirpath, _dirs, names in os.walk(source_root):
+    top_levels = {pattern.split("/", 1)[0] for pattern in patterns}
+    # A wildcard before the first slash can match files in any subtree.
+    prune_top_level = bool(patterns) and not any(
+        char in top for top in top_levels for char in "*?["
+    )
+    for dirpath, dirs, names in os.walk(source_root):
+        if dirpath == repository_root and prune_top_level:
+            dirs[:] = [name for name in dirs if name in top_levels]
         for nm in names:
             if not nm.endswith(".py"):
                 continue
