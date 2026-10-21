@@ -4,4 +4,5 @@
 
 * ``replicated_experts``: ring-buddy expert replication, balanced.
 * ``three_window_placement``: a third ring window for the replicated experts.
+* ``hot_replicas``: copies of each NVFP4 layer's hot experts, placed per step (tep4).
 """

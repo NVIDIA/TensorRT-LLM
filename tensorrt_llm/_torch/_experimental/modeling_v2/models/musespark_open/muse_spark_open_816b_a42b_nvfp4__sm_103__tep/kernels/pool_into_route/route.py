@@ -370,7 +370,7 @@ def install(model, plan, mapping=None) -> DirectPool:
     else:
         for layer in layers:
             moe = layer.feed_forward
-            if type(moe) is not MuseSparkOpenTepPrologueMoE or moe._router_stream is None:
+            if not isinstance(moe, MuseSparkOpenTepPrologueMoE) or moe._router_stream is None:
                 reason = (
                     f"[musespark_open] pool_into_route publishes from the forked router shard; layer "
                     f"{layer.layer_idx} has {type(moe).__name__} without the router fork's side stream"

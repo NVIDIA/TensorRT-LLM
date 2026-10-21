@@ -357,7 +357,7 @@ def install_router_fork(model: MuseSparkOpenModel) -> int:
     wrong = [
         layer.layer_idx
         for layer in layers
-        if type(layer.feed_forward) is not MuseSparkOpenTepPrologueMoE
+        if not isinstance(layer.feed_forward, MuseSparkOpenTepPrologueMoE)
     ]
     if wrong:
         reason = f"[musespark_open] router_fork forks the router shard; layers {wrong} do not run the prologue"
