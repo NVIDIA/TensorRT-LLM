@@ -6649,3 +6649,56 @@ def test_v2_kda_replay_seeds_disaggregated_generation_slots():
 
 
 _KDA_REPLAY_FIELDS = (*_KDA_REPLAY_BUFFERS, "prev_num_accepted_tokens")
+
+
+def _kda_replay_seed_state(stacked: bool):
+    """Two KDA layers whose state and replay buffers are per-layer views of
+    one allocation each, like the KVCM pool views."""
+    generator = torch.Generator().manual_seed(0)
+    state = KDAReplayState(2)
+    state.prev_num_accepted_tokens = torch.full((4,), 5, dtype=torch.int32, device="cuda")
+    conv = torch.randn(2, 4, 6, 4, generator=generator).to("cuda", torch.bfloat16)
+    state._conv_states = tuple(conv[layer] for layer in range(2))
+    state._conv_section_dims = (2, 2, 2)
+    state._committed_window = 4
+    replay = {
+        name: torch.randn(2, 4, 6, 2, generator=generator)
+        .to("cuda", torch.bfloat16)
+        .transpose(-1, -2)
+        for name in ("kda_conv_q", "kda_conv_k", "kda_conv_v")
+    }
+    for name, dtype in (
+        ("kda_k_cache", torch.bfloat16),
+        ("kda_g_cache", torch.float32),
+        ("kda_v_cache", torch.bfloat16),
+    ):
+        replay[name] = torch.randn(2, 4, 2, 2, generator=generator).to("cuda", dtype)
+    replay["kda_beta_cache"] = torch.randn(2, 4, 2, 4, generator=generator).to(
+        "cuda", torch.bfloat16
+    )[..., :2]
+    state.pool_layers = [
+        {name: buffer[layer] for name, buffer in replay.items()} for layer in range(2)
+    ]
+    if stacked:
+        state._stack_seed_views()
+        assert state._stacked_seed_replay is not None
+    return state, replay
+
+
+@skip_no_cuda
+def test_v2_kda_replay_seed_of_all_layers_at_once_is_bit_identical():
+    per_layer, per_layer_replay = _kda_replay_seed_state(stacked=False)
+    stacked, stacked_replay = _kda_replay_seed_state(stacked=True)
+    slots = torch.tensor([1, 3], device="cuda")
+
+    per_layer.seed_transferred_slots(slots)
+    stacked.seed_transferred_slots(slots)
+
+    for name, buffer in per_layer_replay.items():
+        assert torch.equal(stacked_replay[name], buffer), name
+    assert torch.equal(stacked.prev_num_accepted_tokens, per_layer.prev_num_accepted_tokens)
+    # The seeded slots hold the committed windows, the others are untouched.
+    assert torch.equal(
+        stacked_replay["kda_conv_k"][1, 3, :, :4], stacked._conv_states[1][3, 2:4, :]
+    )
+    assert stacked.prev_num_accepted_tokens.tolist() == [5, 0, 5, 0]
