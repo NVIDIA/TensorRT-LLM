@@ -943,6 +943,16 @@ class DSparkWorker(DFlashWorker):
                 f"{type(draft_model).__name__} declares one."
             )
 
+    @staticmethod
+    def block_width_for(spec_config) -> int:
+        """Block slots a DSpark worker computes for ``spec_config``.
+
+        The ``shift_label`` convention, which the DSpark drafter defaults to,
+        reads slots 0..K-1; a checkpoint that turns it off needs K+1 and is
+        caught by the block-within-allocation check.
+        """
+        return spec_config.max_draft_len
+
     def _draft_block_width(self, draft_model) -> int:
         """Block width under the dspark ``shift_label`` convention.
 
@@ -952,8 +962,8 @@ class DSparkWorker(DFlashWorker):
         drafters are meant to run.
         """
         if getattr(draft_model, "_dspark_shift_label", False):
-            return self.max_draft_len
-        return super()._draft_block_width(draft_model)
+            return self.block_width_for(self.spec_config)
+        return DFlashWorker.block_width_for(self.spec_config)
 
     def _draft_slot_ids(
         self, draft_model, num_gens: int, block_size: int, num_draft_tokens: int
