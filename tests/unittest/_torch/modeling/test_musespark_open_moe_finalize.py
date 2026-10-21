@@ -548,3 +548,146 @@ def test_fused_finalize_replays_from_a_cuda_graph():
     expected = _reference_combine(gemm2, index, routing, weight, EPS, **kwargs)
     assert torch.isfinite(static_out).all()
     torch.testing.assert_close(static_out, expected, rtol=2e-5, atol=2e-5)
+
+
+def _ep_case(num_tokens, *, ep_size=4, num_experts=256, top_k=CKPT_TOP_K, seed=0):
+    """An EP-rank finalize input: each token picks ``top_k`` distinct experts and
+    only those owned by rank 0 of ``ep_size`` are local; every other slot is -1
+    and its would-be row is NaN, as the MoE kernel leaves it."""
+    gen = torch.Generator(device="cuda").manual_seed(seed)
+    picks = torch.rand(num_tokens, num_experts, generator=gen, device="cuda").topk(top_k).indices
+    local = picks < num_experts // ep_size
+    index = torch.full((num_tokens, top_k), -1, dtype=torch.int32, device="cuda")
+    num_local = int(local.sum())
+    index[local] = torch.randperm(num_local, generator=gen, device="cuda").int()
+    gemm2 = torch.randn(num_local + 3, CKPT_HIDDEN, generator=gen, device="cuda")
+    gemm2[num_local:].fill_(float("nan"))
+    routing = torch.rand(num_tokens, top_k, generator=gen, device="cuda")
+    routing /= routing.sum(-1, keepdim=True)
+    weight = torch.randn(CKPT_HIDDEN, generator=gen, device="cuda") * 0.1
+    return gemm2.to(torch.bfloat16), index.reshape(-1), routing, weight.to(torch.bfloat16)
+
+
+@cuda_only
+@pytest.mark.parametrize("num_tokens", [129, 1546, 8192])
+@torch.inference_mode()
+def test_sparse_finalize_matches_the_reference_on_ep_rank_inputs(num_tokens):
+    """Rounding-different from the tile kernel by summation order only."""
+    gemm2, index, routing, weight = _ep_case(num_tokens)
+    kwargs = dict(num_tokens=num_tokens, top_k=CKPT_TOP_K, hidden_size=CKPT_HIDDEN)
+
+    sparse = post_expert_norm_combine(
+        gemm2, index, routing, weight, EPS, sparse_slots=True, **kwargs
+    )
+    tile = post_expert_norm_combine(gemm2, index, routing, weight, EPS, **kwargs)
+    reference = torch.cat(
+        [
+            _reference_combine(
+                gemm2,
+                index.view(num_tokens, CKPT_TOP_K)[start : start + 256].reshape(-1),
+                routing[start : start + 256],
+                weight,
+                EPS,
+                num_tokens=min(256, num_tokens - start),
+                top_k=CKPT_TOP_K,
+                hidden_size=CKPT_HIDDEN,
+            )
+            for start in range(0, num_tokens, 256)
+        ]
+    )
+
+    assert torch.isfinite(sparse).all()
+    torch.testing.assert_close(sparse, reference, rtol=2e-5, atol=2e-5)
+    torch.testing.assert_close(sparse, tile, rtol=2e-5, atol=2e-5)
+    # The result is cast to BF16 before the all-reduce.
+    mismatch = (sparse.to(torch.bfloat16) != tile.to(torch.bfloat16)).float().mean().item()
+    print(f"T={num_tokens} bf16 elements differing from the tile kernel: {mismatch:.2e}")
+    assert mismatch < 1e-3
+
+
+@cuda_only
+@torch.inference_mode()
+def test_sparse_finalize_rank_without_local_slots_is_exact_zero():
+    num_tokens = 300
+    gemm2, index, routing, weight = _ep_case(num_tokens)
+    index.fill_(-1)
+    gemm2.fill_(float("nan"))
+    out = post_expert_norm_combine(
+        gemm2,
+        index,
+        routing,
+        weight,
+        EPS,
+        num_tokens=num_tokens,
+        top_k=CKPT_TOP_K,
+        hidden_size=CKPT_HIDDEN,
+        sparse_slots=True,
+    )
+    assert torch.equal(out, torch.zeros_like(out))
+
+
+@cuda_only
+@torch.inference_mode()
+def test_sparse_finalize_selects_out_a_permuted_index_past_the_end_of_gemm2():
+    num_tokens = 200
+    gemm2, index, routing, weight = _ep_case(num_tokens)
+    kwargs = dict(num_tokens=num_tokens, top_k=CKPT_TOP_K, hidden_size=CKPT_HIDDEN)
+    expected = post_expert_norm_combine(
+        gemm2, index, routing, weight, EPS, sparse_slots=True, **kwargs
+    )
+    beyond = index.clone()
+    # Every slot that was invalid now points past the end of gemm2.
+    beyond[beyond < 0] = gemm2.shape[0] + 7
+    out = post_expert_norm_combine(gemm2, beyond, routing, weight, EPS, sparse_slots=True, **kwargs)
+    assert torch.equal(out, expected)
+
+
+@cuda_only
+@torch.inference_mode()
+def test_moe_finalize_uses_the_sparse_kernel_from_160_tokens(monkeypatch):
+    import tensorrt_llm._torch.models.modeling_musespark_open as mso
+
+    calls = []
+    original = mso._sparse_post_expert_norm_combine
+
+    def spy(*args, **kwargs):
+        calls.append(kwargs["num_tokens"])
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(mso, "_sparse_post_expert_norm_combine", spy)
+    for num_tokens in (8, 128, 129, 159, 160, 161):
+        gemm2, index, routing, weight = _ep_case(num_tokens)
+        module = SimpleNamespace(
+            mapping=SimpleNamespace(moe_tp_size=1),
+            _large_finalize_4warps=False,
+            _large_finalize_sparse=True,
+            expert_hidden_size=CKPT_HIDDEN,
+            top_k=CKPT_TOP_K,
+            post_expert_norm_weight=weight,
+            post_expert_norm_eps=EPS,
+        )
+        MuseSparkOpenMoE.finalize(module, gemm2, index, routing, num_tokens)
+    assert calls == [160, 161]
+
+
+@cuda_only
+@torch.inference_mode()
+def test_sparse_finalize_replays_from_a_cuda_graph():
+    num_tokens = 640
+    gemm2, index, routing, weight = _ep_case(num_tokens)
+    kwargs = dict(num_tokens=num_tokens, top_k=CKPT_TOP_K, hidden_size=CKPT_HIDDEN)
+    post_expert_norm_combine(gemm2, index, routing, weight, EPS, sparse_slots=True, **kwargs)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        static_out = post_expert_norm_combine(
+            gemm2, index, routing, weight, EPS, sparse_slots=True, **kwargs
+        )
+    # The last three rows are the NaN tail no valid slot addresses.
+    gemm2[:-3].normal_()
+    routing.uniform_()
+    graph.replay()
+    torch.cuda.synchronize()
+    expected = post_expert_norm_combine(gemm2, index, routing, weight, EPS, **kwargs)
+    assert torch.isfinite(static_out).all()
+    torch.testing.assert_close(static_out, expected, rtol=2e-5, atol=2e-5)
