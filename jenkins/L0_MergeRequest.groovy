@@ -1084,20 +1084,27 @@ def getGithubMRChangedFileWithFallback(pipeline, globalVars, function, filePath=
     }
 }
 
-// Changed files or diffs of this build, from the first source it has:
-//   github_pr_api_url  GitHub PR files API, internal Git mirror as the fallback;
-//   base_commit        internal Git mirror, base_commit..gitlabCommit (merge queue);
+// Changed files or diffs of this build, from the first source (in `globalVars`):
+//   github_pr_api_url  GitHub PR files API, internal Git mirror with `git diff` as the fallback;
+//   base_commit        internal Git mirror, git diff base_commit..gitlabCommit;
 //   otherwise          GitLab MR diffs API.
-// function: getChangedFileList (list of paths), getOneFileChanges (diff of filePath) or
-// getFileChanges (map of path to diff; the Git mirror only diffs the paths in filePaths).
+// function:
+//  - getChangedFileList -> list of paths
+//  - getOneFileChanges -> diff of `filePath`
+//  - getFileChanges -> map of path to diff, for the paths in `filePaths`
 def getMRChangedFile(pipeline, globalVars, function, filePath="", filePaths=[]) {
+    def result
     if (globalVars[GITHUB_PR_API_URL] != null) {
-        return getGithubMRChangedFileWithFallback(pipeline, globalVars, function, filePath, filePaths)
+        result = getGithubMRChangedFileWithFallback(pipeline, globalVars, function, filePath, filePaths)
+    } else if (globalVars[BASE_COMMIT]) {
+        result = getGitMirrorMRChangedFile(pipeline, globalVars, function, filePath, filePaths)
+    } else {
+        result = getGitlabMRChangedFile(pipeline, function, filePath)
     }
-    if (globalVars[BASE_COMMIT]) {
-        return getGitMirrorMRChangedFile(pipeline, globalVars, function, filePath, filePaths)
+    if (function == "getFileChanges") {
+        result = result.findAll { changedFilePath, diff -> changedFilePath in filePaths }
     }
-    return getGitlabMRChangedFile(pipeline, function, filePath)
+    return result
 }
 
 // Gate multi-GPU stages behind 'ci: full pre-merge approved' label.
