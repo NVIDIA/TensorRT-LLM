@@ -891,6 +891,61 @@ def test_gen_first_no_retry_adp_count_seal_waits_for_one_writer_group() -> None:
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("session_present", "error_message"),
+    [
+        (False, "RxSession .* not found"),
+        (True, "missing bounce region"),
+    ],
+)
+def test_dispatch_releases_bounce_reservation_on_setup_failure(
+    session_present: bool, error_message: str
+) -> None:
+    rid = 87
+    receiver = _make_owned_receiver()
+    bounce = Mock()
+    bounce.reserve.return_value = True
+    bounce.writer_span.return_value = None
+    receiver._bounce = bounce
+    receiver_req = SimpleNamespace(unique_rid=rid, slice_id=0)
+    receiver._build_recv_req_info = Mock(return_value=receiver_req)
+    receiver._registrar = SimpleNamespace(
+        get_peer_overlap=Mock(return_value=SimpleNamespace(ranks=[0])),
+        self_extractor=SimpleNamespace(page_table=None),
+        self_rank_info=SimpleNamespace(cp_size=1),
+    )
+    receiver._get_sender_info = Mock(
+        return_value=SimpleNamespace(
+            sender_endpoints={0: "tcp://sender-0"},
+            page_table=None,
+            cp_size=1,
+            dp_size=1,
+        )
+    )
+    receiver._request_sender_data = Mock()
+    if session_present:
+        _make_rx_session(receiver, rid)
+    task = KVRecvTask(
+        rid,
+        _sole_piece(),
+        0,
+        DisaggregatedParams(disagg_request_id=rid, ctx_dp_rank=0),
+        None,
+    )
+
+    with pytest.raises(RuntimeError, match=error_message):
+        receiver.dispatch_task(task)
+
+    bounce.reserve.assert_called_once_with(receiver_req, 1, extra_bytes=0)
+    bounce.release_idle_reservation.assert_called_once_with((rid, 0))
+    receiver._request_sender_data.assert_not_called()
+    if session_present:
+        bounce.writer_span.assert_called_once_with((rid, 0), 0)
+    else:
+        bounce.writer_span.assert_not_called()
+
+
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("writer_settles_before_failure", [False, True])
 def test_partial_bounced_publication_waits_for_queued_writer_success(
     monkeypatch: pytest.MonkeyPatch,
