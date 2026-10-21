@@ -252,6 +252,24 @@ def compact_stop_words(
     Metadata points to int32 allocations containing rule offsets, rule tokens,
     and two rolling-history windows. The caller retains these allocations and
     records their use on the current stream because they are indirect inputs.
+
+    Args:
+        metadata: Contiguous CUDA int64 tensor of shape [max_num_sequences, 5].
+            Columns are allocation address, rule count, history offset in int32
+            elements, history window length, and allocated beam width.
+        slots: Contiguous CUDA int32 or int64 tensor of shape [requests], mapping
+            batch requests to metadata rows.
+        tokens: CUDA int32 or int64 tensor of shape [steps, requests, beams].
+            All three strides are passed to the kernels; contiguity is not required.
+        accepted: Contiguous CUDA int32 or int64 tensor of shape [requests], or
+            a Python int shared by all requests. Counts accepted draft tokens plus
+            one, used to advance the rolling history. Unused for single-token rules.
+        single_token_only: Whether all rules contain exactly one token, allowing
+            history updates to be skipped.
+
+    Returns:
+        CUDA bool tensor of shape [steps, requests, beams], true where a sequence
+        ends with a stop word.
     """
     steps, requests, beams = tokens.shape
     result = torch.empty(tokens.shape, device=tokens.device, dtype=torch.bool)
@@ -302,7 +320,19 @@ def compact_stop_words(
 def reorder_compact_stop_word_history(
     metadata: torch.Tensor, slots: torch.Tensor, predecessors: torch.Tensor
 ) -> None:
-    """Reorder packed histories through scratch storage, including duplicate parents."""
+    """Reorder packed histories through scratch storage, including duplicate parents.
+
+    Args:
+        metadata: Contiguous CUDA int64 tensor of shape [max_num_sequences, 5],
+            with the column layout described in :func:`compact_stop_words`.
+            The caller retains the pointed-to allocations and records their use
+            on the current stream.
+        slots: Contiguous CUDA int32 or int64 tensor of shape [requests], mapping
+            batch requests to metadata rows.
+        predecessors: CUDA int32 or int64 tensor of shape [requests, beams],
+            containing each beam's parent index. The last dimension must have
+            unit stride because only stride(0) is passed to the kernel.
+    """
     requests, beams = predecessors.shape
     if requests == 0:
         return
