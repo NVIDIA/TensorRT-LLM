@@ -25,8 +25,8 @@ from dataclasses import dataclass
 from enum import Enum, EnumMeta
 from pathlib import Path
 from typing import (TYPE_CHECKING, Annotated, Any, Callable, ClassVar, Dict,
-                    List, Literal, Optional, Set, Tuple, Type, TypeAlias,
-                    TypeVar, Union, get_args, get_origin)
+                    List, Literal, NamedTuple, Optional, Set, Tuple, Type,
+                    TypeAlias, TypeVar, Union, get_args, get_origin)
 
 import torch
 import yaml
@@ -4833,6 +4833,14 @@ _MIXED_PRECISION_KV_DTYPES = tuple(f"mixed_nvfp4_{high}"
                                    for high in ("fp8", "float16", "bfloat16"))
 
 
+class MixedPrecisionKV(NamedTuple):
+    """Layout of a mixed-precision KV cache, parsed from KvCacheConfig."""
+    low: str
+    high: str
+    first_n: int
+    last_n: int
+
+
 @PybindMirror.mirror_pybind_fields(_KvCacheConfig)
 class KvCacheConfig(StrictBaseModel, PybindMirror):
     """Configuration for the KV cache."""
@@ -5169,10 +5177,13 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
             'torch.dtype string')
 
     @property
-    def mixed_precision_dtypes(self) -> Optional[Tuple[str, str]]:
-        """(history dtype, retained dtype) of a mixed-precision KV cache, else None."""
+    def mixed_precision_kv(self) -> Optional[MixedPrecisionKV]:
+        """Layout of a mixed-precision KV cache, else None."""
         match = _MIXED_PRECISION_KV_DTYPE.match(self.dtype)
-        return None if match is None else (match["low"], match["high"])
+        if match is None:
+            return None
+        return MixedPrecisionKV(match["low"], match["high"], self.first_n,
+                                self.last_n)
 
     @model_validator(mode='after')
     def reject_fp8_ds_mla_pool_rebalance(self) -> 'KvCacheConfig':
@@ -5297,7 +5308,7 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
     @model_validator(mode='after')
     def validate_mixed_precision_retention(self) -> 'KvCacheConfig':
         """A mixed-precision cache must retain at least one token per sequence."""
-        if (self.mixed_precision_dtypes is not None
+        if (self.mixed_precision_kv is not None
                 and self.first_n == self.last_n == 0):
             raise ValueError(
                 "Mixed-precision KV requires first_n or last_n to be greater than zero."
@@ -7039,7 +7050,7 @@ class TorchLlmArgs(BaseLlmArgs):
     @model_validator(mode="after")
     def validate_mixed_precision_kv(self) -> 'TorchLlmArgs':
         """Reject runtime features the mixed-precision KV cache does not support."""
-        if self.kv_cache_config.mixed_precision_dtypes is None:
+        if self.kv_cache_config.mixed_precision_kv is None:
             return self
         if self.kv_cache_config.use_kv_cache_manager_v2 is not True:
             raise ValueError(

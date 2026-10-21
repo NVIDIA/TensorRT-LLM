@@ -214,10 +214,6 @@ class KvCacheConfigV2:
     # tensorrt_llm/llmapi/llm_args.py; KVCacheManagerV2._build_base_config()
     # reads it unconditionally.
     kv_pool_rebalance_config: KvPoolRebalanceConfig = field(default_factory=KvPoolRebalanceConfig)
-    # Mirrors KvCacheConfig.first_n / last_n; read only when dtype selects
-    # mixed precision, declared so the stub-coverage test stays exact.
-    first_n: int = 256
-    last_n: int = 256
 
 
 # ---------------------------------------------------------------------------

@@ -3138,18 +3138,18 @@ class KVCacheManagerV2(BaseResourceManager):
         self.mixed_precision_max_seq_len = max_seq_len
         self._shared_kv_layers: set[int] = set()
         # Tests pass plain config stand-ins that predate the mixed-precision fields.
-        mixed = getattr(kv_cache_config, "mixed_precision_dtypes", None)
+        mixed = getattr(kv_cache_config, "mixed_precision_kv", None)
         if mixed is None:
             return
-        self.first_n, self.last_n = kv_cache_config.first_n, kv_cache_config.last_n
+        self.first_n, self.last_n = mixed.first_n, mixed.last_n
         if torch.cuda.get_device_capability()[0] not in (10, 12):
             raise NotImplementedError("Mixed-precision NVFP4 KV requires Blackwell")
-        self.low_precision_dtype = _MIXED_PRECISION_LOW_DTYPES[mixed[0]]
-        retained_dtype = str_dtype_to_binding(mixed[1])
+        self.low_precision_dtype = _MIXED_PRECISION_LOW_DTYPES[mixed.low]
+        retained_dtype = str_dtype_to_binding(mixed.high)
         if dtype != retained_dtype:
             raise ValueError(
                 f"kv_cache_config.dtype={kv_cache_config.dtype!r} keeps the retained tokens in "
-                f"{mixed[1]}, but the model's KV cache dtype resolved to {dtype}."
+                f"{mixed.high}, but the model's KV cache dtype resolved to {dtype}."
             )
         if getattr(pretrained_config, "num_kv_shared_layers", 0):
             config = pretrained_config

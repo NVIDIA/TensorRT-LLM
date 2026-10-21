@@ -619,13 +619,13 @@ def test_conversion_kernel_imports_pinned_flashinfer_symbols():
 def test_mixed_precision_public_options():
     from pydantic import ValidationError
 
-    assert KvCacheConfig().mixed_precision_dtypes is None
+    assert KvCacheConfig().mixed_precision_kv is None
     config = KvCacheConfig(dtype="mixed_nvfp4_fp8")
-    assert config.mixed_precision_dtypes == ("nvfp4", "fp8")
+    assert config.mixed_precision_kv == ("nvfp4", "fp8", 256, 256)
     assert config.first_n == config.last_n == 256
     assert config.pool_ratio is None
     for high in ("float16", "bfloat16"):
-        assert KvCacheConfig(dtype=f"mixed_nvfp4_{high}").mixed_precision_dtypes == ("nvfp4", high)
+        assert KvCacheConfig(dtype=f"mixed_nvfp4_{high}").mixed_precision_kv.high == high
     for invalid in (
         {"dtype": "mixed_int4_fp8"},
         {"dtype": "mixed_nvfp4_nvfp4"},
