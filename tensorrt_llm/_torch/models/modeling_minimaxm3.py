@@ -1145,6 +1145,8 @@ class MiniMaxM3Attention(Attention):
             and sparse_runtime_cfg is not None
             and getattr(sparse_runtime_cfg, "fuse_qkv_index_projection", False)
         )
+        # index_k_tp_shard: TP rank r stores index-K rows r, r + TP, ...
+        self.index_shard_rank, self.index_shard_world = 0, 1
         if self.is_sparse_attention_layer:
             sparse_cfg = getattr(config, "sparse_attention_config", None) or {}
             total_num_index_heads = int(sparse_cfg.get("sparse_num_index_heads", 4))
@@ -1176,10 +1178,9 @@ class MiniMaxM3Attention(Attention):
                     use_cute_dsl_blockscaling_mm=old_qkv_proj.use_cute_dsl_blockscaling_mm,
                     replicate_index_q=sparse_runtime_cfg.index_tp_split,
                 )
-                # index_k_tp_shard: TP rank r stores index-K rows r, r + TP, ...
-                shard = sparse_runtime_cfg.index_k_tp_shard
-                self.index_shard_rank = self.qkv_proj.tp_rank if shard else 0
-                self.index_shard_world = self.qkv_proj.tp_size if shard else 1
+                if sparse_runtime_cfg.index_k_tp_shard:
+                    self.index_shard_rank = self.qkv_proj.tp_rank
+                    self.index_shard_world = self.qkv_proj.tp_size
                 self.sparse_num_index_heads = self.qkv_proj.local_num_index_heads
             else:
                 # Use the same KV-group ownership as the five-way projection.
