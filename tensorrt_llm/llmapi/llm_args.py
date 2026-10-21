@@ -7071,7 +7071,11 @@ class TorchLlmArgs(BaseLlmArgs):
                     logger.info(
                         "DFlash attention_backend AUTO resolved to VANILLA "
                         "(disaggregated worker or modeling_v2).")
-                if disagg:
+                # A draft KV shared with the target (TRTLLM_DISAGG_SHARED_DRAFT_KV=1) is transferred.
+                if disagg and not (
+                        self.speculative_config.attention_backend == "TRTLLM"
+                        and os.environ.get("TRTLLM_DISAGG_SHARED_DRAFT_KV")
+                        == "1"):
                     # The transceiver moves the target KV cache, but the
                     # drafter's context is built from target hidden states
                     # during prefill and is not transferred with it, so a

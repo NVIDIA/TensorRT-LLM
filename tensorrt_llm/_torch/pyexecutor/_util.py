@@ -2071,11 +2071,27 @@ class KvCacheCreator:
                     and os.environ.get("TRTLLM_DISAGG_SHARED_DRAFT_KV") != "1")
 
     def _check_shared_draft_kv_request(self) -> None:
-        """Fail at startup when TRTLLM_DISAGG_SHARED_DRAFT_KV=1 cannot be honored."""
-        if (not self._is_disagg
-                or os.environ.get("TRTLLM_DISAGG_SHARED_DRAFT_KV") != "1"
-                or self._speculative_config is None
+        """Fail at startup when disaggregated draft KV sharing is missing or cannot be honored."""
+        if (not self._is_disagg or self._speculative_config is None
                 or self._unified_drafter_attention_backend() is None):
+            return
+        if os.environ.get("TRTLLM_DISAGG_SHARED_DRAFT_KV") != "1":
+            # The drafter writes from column 0; a separate pool drops blocks at real positions.
+            if (self._unified_drafter_attention_backend() == "TRTLLM"
+                    and self._should_create_separate_draft_kv_cache()
+                    and self._get_draft_max_attention_window(
+                        self._unification_max_seq_len,
+                        self._kv_cache_config) is not None):
+                raise ValueError(
+                    f"{self._unified_drafter_name()} with attention_backend "
+                    "TRTLLM on a disaggregated worker must share its "
+                    "sliding-window draft KV with the target: set "
+                    "TRTLLM_DISAGG_SHARED_DRAFT_KV=1 on every worker, or use "
+                    "attention_backend VANILLA. A separate draft KV cache "
+                    "retires the blocks behind the window at a request's real "
+                    "position while a transferred request's drafter fills it "
+                    "from position 0, so acceptance length collapses once a "
+                    "request passes the window.")
             return
         blocker = self._dflash_unify_blocker()
         if blocker is not None:

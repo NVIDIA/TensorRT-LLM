@@ -23,6 +23,7 @@ import yaml
 
 from tensorrt_llm._torch.pyexecutor._util import KvCacheCreator
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+from tensorrt_llm.llmapi import DFlashDecodingConfig
 from tensorrt_llm.quantization import QuantAlgo
 from tensorrt_llm.quantization.mode import QuantMode
 
@@ -311,3 +312,21 @@ def test_launcher_accepts_eligible_shared_cache_config(
             {"speculative_config": spec, "enable_attention_dp": context_attention_dp},
             {"speculative_config": spec, "enable_attention_dp": generation_attention_dp},
         )
+
+
+@pytest.mark.parametrize(
+    ("shared", "windows", "refused"),
+    [("0", [2048], True), ("0", None, False), ("1", [2048], False)],
+)
+def test_disagg_separate_windowed_draft_pool_is_refused(monkeypatch, shared, windows, refused):
+    """Unshared, a transferred request's drafter would read blocks the pool retired behind the window."""
+    monkeypatch.setenv(_SHARED_DRAFT_KV_ENV, shared)
+    layout = _model_config(kv_heads=8, head_dim=128)
+    creator = _creator(is_disagg=True, target=layout, draft=layout, draft_windows=windows)
+    creator._speculative_config = DFlashDecodingConfig(max_draft_len=7, attention_backend="TRTLLM")
+    creator._sparse_attention_config = None
+    if refused:
+        with pytest.raises(ValueError, match="TRTLLM_DISAGG_SHARED_DRAFT_KV=1 on every worker"):
+            creator._check_shared_draft_kv_request()
+    else:
+        creator._check_shared_draft_kv_request()
