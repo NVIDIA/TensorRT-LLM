@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import enum
+import math
 import os
 from collections import Counter
 from typing import Callable, Optional
@@ -37,6 +38,24 @@ from .scheduler import (
     _is_forced_context_chunk_boundary,
     drop_decoder_context_requests_waiting_for_encoder_output,
 )
+
+
+def _attention_weighted_tokens(num_tokens: int, prefix: int, ctx0: float) -> int:
+    """Budget charge of a context chunk whose tokens also attend to ``prefix`` cached tokens.
+
+    Each token costs 1 plus its mean attention span (the prefix and half the chunk) over
+    ``ctx0``, the span at which a token's attention costs as much as the rest of its step.
+    """
+    return math.ceil(num_tokens * (1.0 + (prefix + num_tokens / 2.0) / ctx0))
+
+
+def _attention_weighted_capacity(budget: int, prefix: int, ctx0: float) -> int:
+    """Largest chunk after ``prefix`` cached tokens whose weighted charge fits ``budget``."""
+    a = 1.0 + prefix / ctx0
+    num_tokens = max(0, int(ctx0 * (math.sqrt(a * a + 2.0 * budget / ctx0) - a)))
+    while num_tokens > 0 and _attention_weighted_tokens(num_tokens, prefix, ctx0) > budget:
+        num_tokens -= 1
+    return num_tokens
 
 
 class ScheduleAction(enum.Enum):
@@ -202,6 +221,13 @@ class KVCacheV2Scheduler(RequestScheduler):
         # makes a loaded context tier host-bound. TRTLLM_SCHED_CTX_EARLY_EXIT=0 turns it off.
         self._ctx_early_exit = os.environ.get("TRTLLM_SCHED_CTX_EARLY_EXIT", "1") != "0"
         self._ctx_budget_spent = False
+        # Attention-DP ranks run each step in lockstep, so a step lasts as long as its busiest
+        # rank. A context chunk's attention grows with the prefix it attends to, so equal token
+        # budgets leave the ranks prefilling long contexts behind the others, which wait for them
+        # in the next MoE all-to-all. TRTLLM_SCHED_CTX_ATTN_COST_CTX0=<tokens> charges each context
+        # token 1 + (prefix + chunk / 2) / <tokens> against max_num_tokens, so ranks with long
+        # contexts take shorter chunks. 0 (default) charges plain tokens.
+        self._ctx_attn_cost_ctx0 = float(os.environ.get("TRTLLM_SCHED_CTX_ATTN_COST_CTX0", "0"))
         # Every input to the prefix-aware skip is fixed for this scheduler's
         # lifetime: the knob is a constructor argument, and both manager
         # attributes are assigned once in ``KVCacheManagerV2.__init__``. Resolve
@@ -1018,6 +1044,12 @@ class KVCacheV2Scheduler(RequestScheduler):
             remaining_budget -= replay_tokens
             if remaining_budget <= 0:
                 return ScheduleAction.SKIP, 0, False
+        attn_ctx0 = self._ctx_attn_cost_ctx0
+        attn_prefix = req.context_current_position
+        if remaining_budget is not None and attn_ctx0 > 0:
+            remaining_budget = _attention_weighted_capacity(
+                remaining_budget, attn_prefix, attn_ctx0
+            )
         if force_chunk:
             # Snapshot boundaries can be shorter than chunk_unit_size.
             assert isinstance(req.expect_snapshot_points, list)
@@ -1074,6 +1106,11 @@ class KVCacheV2Scheduler(RequestScheduler):
 
         # Draft tokens only matter for last chunk (budget + resize)
         chunk_tokens = budget_chunk_size + replay_tokens
+        if remaining_budget is not None and attn_ctx0 > 0:
+            chunk_tokens = (
+                _attention_weighted_tokens(budget_chunk_size, attn_prefix, attn_ctx0)
+                + replay_tokens
+            )
         resize_tokens = req.context_chunk_size
         if req.is_last_context_chunk:
             draft_len = get_draft_token_length(req)

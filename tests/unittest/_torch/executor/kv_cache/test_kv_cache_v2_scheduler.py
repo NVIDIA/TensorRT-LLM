@@ -5062,3 +5062,55 @@ class TestContextAdmissionEarlyExit:
         # The continuation is mid-prefill: it is never skipped for a spent first-chunk budget,
         # and its 64 tokens fit in the 100 left.
         assert ids(out.context_requests) == [0, 2]
+
+
+class TestContextAttentionCostBudget:
+    """TRTLLM_SCHED_CTX_ATTN_COST_CTX0 charges context tokens by their attention span.
+
+    Attention-DP context ranks step in lockstep, so a rank prefilling after a long prefix sets
+    the step for all of them. Charging 1 + (prefix + chunk / 2) / ctx0 per token against
+    max_num_tokens gives that rank a shorter chunk instead.
+    """
+
+    @staticmethod
+    def _chunks(monkeypatch, ctx0, prefixes):
+        if ctx0:
+            monkeypatch.setenv("TRTLLM_SCHED_CTX_ATTN_COST_CTX0", str(ctx0))
+        else:
+            monkeypatch.delenv("TRTLLM_SCHED_CTX_ATTN_COST_CTX0", raising=False)
+        mgr = make_kv_cache_manager()
+        sched = make_scheduler(
+            mgr, max_num_tokens=2048, ctx_chunk_config=(ContextChunkingPolicy.FORCE_CHUNK, 128)
+        )
+        reqs = []
+        for i, prefix in enumerate(prefixes):
+            req = make_ctx_request(i, 4000, prompt_len=prefix + 4000)
+            req.context_current_position = prefix
+            reqs.append(req)
+        out = sched.schedule_request(reqs, set())
+        return {req.py_request_id: req.context_chunk_size for req in out.context_requests}
+
+    def test_off_by_default(self, monkeypatch):
+        assert self._chunks(monkeypatch, None, [100_000, 0]) == {0: 2048}
+
+    def test_long_prefix_takes_a_shorter_chunk(self, monkeypatch):
+        # 1533 tokens fit 2048 at a 100k prefix (about 1 + 100.77k / 300k per token), rounded
+        # down to the 128-token chunk unit.
+        assert self._chunks(monkeypatch, 300_000, [100_000]) == {0: 1408}
+
+    def test_budget_is_charged_the_weighted_tokens(self, monkeypatch):
+        # The first chunk costs ceil(1408 * (1 + 100704 / 300000)) = 1881 of the 2048; the
+        # 167 left take one 128-token unit of the second request.
+        assert self._chunks(monkeypatch, 300_000, [100_000, 0]) == {0: 1408, 1: 128}
+
+    @pytest.mark.parametrize("prefix", [0, 10_000, 100_000])
+    def test_capacity_is_the_largest_chunk_that_fits(self, prefix):
+        from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import (
+            _attention_weighted_capacity,
+            _attention_weighted_tokens,
+        )
+
+        for budget in (1, 128, 2048):
+            n = _attention_weighted_capacity(budget, prefix, 300_000.0)
+            assert _attention_weighted_tokens(n, prefix, 300_000.0) <= budget
+            assert _attention_weighted_tokens(n + 1, prefix, 300_000.0) > budget
