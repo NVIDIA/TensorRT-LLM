@@ -270,9 +270,8 @@ class ModelConfig(Generic[TConfig]):
     use_low_precision_moe_combine: bool = False
 
     # NVFP4 GEMM backend configuration - list of backends to consider for auto-selection
-    # Default excludes 'cutedsl' for faster build time. Add 'cutedsl' for extreme perf.
     nvfp4_gemm_allowed_backends: List[str] = field(
-        default_factory=lambda: ['cutlass', 'cublaslt', 'cuda_core'])
+        default_factory=lambda: ['cutlass', 'cublaslt', 'cutedsl', 'cuda_core'])
 
     allreduce_strategy: AllReduceStrategy = AllReduceStrategy.AUTO
 
@@ -1107,7 +1106,8 @@ class ModelConfig(Generic[TConfig]):
                 skip_indexer_for_short_seqs = True
                 # Defaults match DeepSeekV4SparseAttentionConfig field defaults.
                 use_cute_dsl_topk = False
-                use_cute_dsl_paged_mqa_logits = False
+                use_cute_dsl_paged_mqa_logits = DeepSeekV4SparseAttentionConfig.model_fields[
+                    'use_cute_dsl_paged_mqa_logits'].default
                 q_split_threshold = 8192
                 indexer_rope_interleave = False
                 enable_heuristic_topk = False
@@ -1187,7 +1187,8 @@ class ModelConfig(Generic[TConfig]):
                         indexer_max_chunk_size = None
                         skip_indexer_for_short_seqs = True
                         use_cute_dsl_topk = False
-                        use_cute_dsl_paged_mqa_logits = False
+                        use_cute_dsl_paged_mqa_logits = DeepSeekSparseAttentionConfig.model_fields[
+                            'use_cute_dsl_paged_mqa_logits'].default
                         q_split_threshold = 8192
                         enable_heuristic_topk = False
                         use_self_sampling_topk = True

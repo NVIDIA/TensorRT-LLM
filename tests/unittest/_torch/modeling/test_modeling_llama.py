@@ -19,6 +19,7 @@ from tensorrt_llm._torch.attention.backends.utils import get_attention_backend
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_llama import LlamaForCausalLM
+from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import KeyType
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     KVCacheManagerV2, _update_kv_cache_draft_token_location)
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
@@ -352,7 +353,7 @@ class TestLlama(unittest.TestCase):
                     "position_ids": position_ids,
                     "attn_metadata": attn_metadata,
                 }
-                key = (1, 0, False)
+                key = KeyType(batch_size=1, draft_len=0)
                 graph_runner.capture(key,
                                      lambda inputs: llama.forward(**inputs),
                                      inputs)

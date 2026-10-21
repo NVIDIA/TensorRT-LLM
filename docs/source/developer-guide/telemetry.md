@@ -134,6 +134,7 @@ unset or when the safety sanitizer rejects the runtime value.
 | `kv_cache_config.block_reuse_config.max_num_turns` | `int` | `value` |  |
 | `kv_cache_config.block_reuse_config.policy` | `literal` | `categorical` | `all_reusable`, `per_request`, `per_conversation` |
 | `kv_cache_config.block_reuse_config.swa_endpoint_rewind_tokens` | `int` | `value` |  |
+| `kv_cache_config.cold_tier_offload_min_priority` | `int\|none` | `value` |  |
 | `kv_cache_config.copy_on_partial_reuse` | `bool` | `value` |  |
 | `kv_cache_config.cross_kv_cache_fraction` | `float\|none` | `value` |  |
 | `kv_cache_config.disk_cache_size` | `int\|none` | `value` |  |
@@ -164,7 +165,6 @@ unset or when the safety sanitizer rejects the runtime value.
 | `kv_cache_config.max_tokens` | `int\|none` | `value` |  |
 | `kv_cache_config.max_util_for_resume` | `float` | `value` |  |
 | `kv_cache_config.pool_ratio` | `list[float]\|none` | `value` |  |
-| `kv_cache_config.secondary_offload_min_priority` | `int\|none` | `value` |  |
 | `kv_cache_config.sink_token_length` | `int\|none` | `value` |  |
 | `kv_cache_config.tokens_per_block` | `int` | `value` |  |
 | `kv_cache_config.use_kv_cache_manager_v2` | `bool\|literal` | `categorical` | `auto` |

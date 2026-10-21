@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2025-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -273,6 +273,131 @@ __global__ void scale_1x128_kernel(
 #endif
 }
 
+// Vectorized 1x128 quantization. A group is quantized by kLanes consecutive
+// lanes, each owning kVec contiguous inputs that fit one 16-byte load, so a
+// warp covers kGroupsPerWarp groups at once. The kernels need rows of whole
+// lane chunks (dim_x and any row stride divisible by kVec), a 16-byte aligned
+// input and an 8-byte aligned output; launch_scale_1x128 and
+// launch_scale_1x128_reshape fall back to the element-wise kernels otherwise.
+template <typename InputType>
+struct Quantize1x128Layout
+{
+    static_assert(sizeof(InputType) == 2, "1x128 quantization reads half or bf16 inputs");
+    static constexpr int kVec = 16 / sizeof(InputType);
+    static constexpr int kLanes = 128 / kVec;
+    static constexpr int kGroupsPerWarp = 32 / kLanes;
+};
+
+// Quantize the kVec inputs one lane owns in a 1x128 group, with the same
+// arithmetic as scale_1x128_kernel. Lanes past the row end or of an inactive
+// group pass in_row = false. Every lane of the warp must call this, since the
+// group amax is reduced with shuffles. The lane given a non-null ``scale``
+// writes the group's dequantization scale.
+template <typename InputType, typename OutputType, typename ScaleType, bool USE_UE8M0>
+__device__ __forceinline__ void quantize_1x128_lane(
+    InputType const* input, OutputType* output, ScaleType* scale, bool in_row)
+{
+    using Layout = Quantize1x128Layout<InputType>;
+    constexpr int kVec = Layout::kVec;
+    static_assert(sizeof(OutputType) == 1 && kVec * sizeof(OutputType) == sizeof(uint2),
+        "1x128 quantization writes 8-bit outputs");
+
+    union
+    {
+        uint4 pack;
+        InputType v[kVec];
+    } in;
+
+    in.pack = in_row ? *reinterpret_cast<uint4 const*>(input) : make_uint4(0, 0, 0, 0);
+
+    InputType lane_amax = InputType(0);
+#pragma unroll
+    for (int i = 0; i < kVec; i++)
+    {
+        lane_amax = __hmax(lane_amax, __habs(in.v[i]));
+    }
+    float group_amax = float(lane_amax);
+#pragma unroll
+    for (int mask = Layout::kLanes / 2; mask > 0; mask /= 2)
+    {
+        group_amax = std::max(group_amax, __shfl_xor_sync(0xFFFFFFFF, group_amax, mask));
+    }
+
+    InputType amax = tensorrt_llm::common::cuda_max(InputType(group_amax), InputType(1e-10f));
+    ScaleType quant_scale = 448.f / ScaleType(amax);
+    ScaleType dequant_scale;
+
+    if constexpr (USE_UE8M0)
+    {
+        // Round dequant scale to UE8M0 (power of 2)
+        ScaleType dequant_scale_raw = 1.f / quant_scale;
+        __nv_fp8_e8m0 ue8m0_scale;
+        ue8m0_scale.__x = __nv_cvt_float_to_e8m0(float(dequant_scale_raw), __NV_SATFINITE, cudaRoundPosInf);
+        // Cast back to float automatically decodes E8M0 format
+        dequant_scale = ScaleType(static_cast<float>(ue8m0_scale));
+        // Recompute quant scale from rounded dequant scale for consistency
+        quant_scale = dequant_scale != ScaleType(0.f) ? 1.f / dequant_scale : 1.f;
+    }
+    else
+    {
+        dequant_scale = 1.f / quant_scale;
+    }
+
+    if (scale != nullptr)
+    {
+        *scale = dequant_scale;
+    }
+    if (!in_row)
+    {
+        return;
+    }
+
+    union
+    {
+        uint2 pack;
+        OutputType v[kVec];
+    } out;
+
+#pragma unroll
+    for (int i = 0; i < kVec; i++)
+    {
+        out.v[i] = OutputType(ScaleType(in.v[i]) * quant_scale);
+    }
+    *reinterpret_cast<uint2*>(output) = out.pack;
+}
+
+template <typename InputType, typename OutputType, typename ScaleType = float, bool USE_UE8M0 = false>
+__global__ void scale_1x128_vec_kernel(
+    OutputType* output, ScaleType* scales, InputType const* const input, int dim_x, int dim_y)
+{
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 890))
+    using Layout = Quantize1x128Layout<InputType>;
+    size_t const scales_along_dim_x = div_up(dim_x, 128);
+    size_t const num_groups = scales_along_dim_x * dim_y;
+    size_t const stride_scale_dim_y = div_up(dim_y, 4) * 4;
+    int const lane_id = threadIdx.x % 32;
+    int const sub_lane = lane_id % Layout::kLanes;
+    size_t const warp_idx = ((size_t) blockIdx.x * blockDim.x + threadIdx.x) / 32;
+    size_t const num_warps = (size_t) gridDim.x * blockDim.x / 32;
+
+    // Whole warps step together so every lane takes part in the group shuffles.
+    for (size_t first_group = warp_idx * Layout::kGroupsPerWarp; first_group < num_groups;
+         first_group += num_warps * Layout::kGroupsPerWarp)
+    {
+        size_t const group = first_group + lane_id / Layout::kLanes;
+        bool const active = group < num_groups;
+        size_t const scales_idx_y = active ? group / scales_along_dim_x : 0;
+        size_t const scales_idx_x = active ? group % scales_along_dim_x : 0;
+        size_t const col = scales_idx_x * 128 + sub_lane * Layout::kVec;
+        size_t const offset = scales_idx_y * dim_x + col;
+        ScaleType* scale
+            = active && sub_lane == 0 ? scales + scales_idx_x * stride_scale_dim_y + scales_idx_y : nullptr;
+        quantize_1x128_lane<InputType, OutputType, ScaleType, USE_UE8M0>(
+            input + offset, output + offset, scale, active && col < (size_t) dim_x);
+    }
+#endif
+}
+
 template <bool UseBinarySearch, typename InputType, typename OutputType>
 __global__ void scale_1x128_kernel(OutputType* output, float* scales, InputType const* input,
     int64_t const* problem_m_offsets, int num_problems, int dim_x, int64_t scale_leading_dim, uint32_t scale_dim_x_mul,
@@ -485,6 +610,41 @@ __global__ void scale_1x128_reshape_kernel(
 #endif
 }
 
+// Vectorized scale_1x128_reshape_kernel (see Quantize1x128Layout).
+template <typename InputType, typename OutputType, typename ScaleType = float>
+__global__ void scale_1x128_reshape_vec_kernel(
+    OutputType* output, ScaleType* scales, InputType const* const input, int dim_x, int dim_h, int dim_y, int stride_x)
+{
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 890))
+    using Layout = Quantize1x128Layout<InputType>;
+    size_t const scales_along_dim_x = div_up(dim_x, 128);
+    size_t const num_groups = scales_along_dim_x * dim_h * dim_y;
+    size_t const stride_scale_dim_y = div_up(dim_y, 4) * 4;
+    int const lane_id = threadIdx.x % 32;
+    int const sub_lane = lane_id % Layout::kLanes;
+    size_t const warp_idx = ((size_t) blockIdx.x * blockDim.x + threadIdx.x) / 32;
+    size_t const num_warps = (size_t) gridDim.x * blockDim.x / 32;
+
+    // Whole warps step together so every lane takes part in the group shuffles.
+    for (size_t first_group = warp_idx * Layout::kGroupsPerWarp; first_group < num_groups;
+         first_group += num_warps * Layout::kGroupsPerWarp)
+    {
+        size_t const group = first_group + lane_id / Layout::kLanes;
+        bool const active = group < num_groups;
+        size_t const scales_idx_y = active ? group / (scales_along_dim_x * dim_h) : 0;
+        size_t const scales_idx_h = active ? group % (scales_along_dim_x * dim_h) / scales_along_dim_x : 0;
+        size_t const scales_idx_x = active ? group % scales_along_dim_x : 0;
+        size_t const col = scales_idx_x * 128 + sub_lane * Layout::kVec;
+        ScaleType* scale = active && sub_lane == 0
+            ? scales + (scales_idx_h * scales_along_dim_x + scales_idx_x) * stride_scale_dim_y + scales_idx_y
+            : nullptr;
+        quantize_1x128_lane<InputType, OutputType, ScaleType, false>(
+            input + (scales_idx_y * dim_h + scales_idx_h) * stride_x + col,
+            output + (scales_idx_h * dim_y + scales_idx_y) * dim_x + col, scale, active && col < (size_t) dim_x);
+    }
+#endif
+}
+
 template <typename InputType, typename OutputType, typename ScaleType = float>
 __global__ void scale_128x128_kernel(
     OutputType* output, ScaleType* scales, InputType const* const input, int dim_x, int dim_y)
@@ -596,34 +756,73 @@ __global__ void convert_kernel(OutputType* output, InputType const* const input,
 
 static int kNumDeviceSMs = -1;
 
-void fp8_1x128_cs(__nv_fp8_e4m3* mat_quant, float* scales, __nv_bfloat16 const* mat, int shape_x, int shape_y,
-    cudaStream_t stream, bool use_ue8m0 = false)
+// Whether the vectorized 1x128 kernels apply: whole 16-byte lane chunks in
+// every row, a 16-byte aligned input and an 8-byte aligned output.
+template <typename InputType, typename OutputType>
+bool can_vectorize_1x128(OutputType const* output, InputType const* input, int dim_x, int stride_x)
+{
+    constexpr int kVec = Quantize1x128Layout<InputType>::kVec;
+    return dim_x % kVec == 0 && stride_x % kVec == 0 && reinterpret_cast<uintptr_t>(input) % sizeof(uint4) == 0
+        && reinterpret_cast<uintptr_t>(output) % sizeof(uint2) == 0;
+}
+
+template <bool USE_UE8M0 = false, typename InputType, typename OutputType, typename ScaleType>
+void launch_scale_1x128(
+    OutputType* output, ScaleType* scales, InputType const* input, int dim_x, int dim_y, cudaStream_t stream)
 {
     if (kNumDeviceSMs < 0)
     {
         kNumDeviceSMs = tensorrt_llm::common::getMultiProcessorCount();
     }
-    if (use_ue8m0)
+    if (can_vectorize_1x128(output, input, dim_x, dim_x))
     {
-        scale_1x128_kernel<__nv_bfloat16, __nv_fp8_e4m3, float, true>
-            <<<kNumDeviceSMs * 8, 256, 0, stream>>>(mat_quant, scales, mat, shape_x, shape_y);
+        scale_1x128_vec_kernel<InputType, OutputType, ScaleType, USE_UE8M0>
+            <<<kNumDeviceSMs * 8, 256, 0, stream>>>(output, scales, input, dim_x, dim_y);
     }
     else
     {
-        scale_1x128_kernel<__nv_bfloat16, __nv_fp8_e4m3, float, false>
-            <<<kNumDeviceSMs * 8, 256, 0, stream>>>(mat_quant, scales, mat, shape_x, shape_y);
+        scale_1x128_kernel<InputType, OutputType, ScaleType, USE_UE8M0>
+            <<<kNumDeviceSMs * 8, 256, 0, stream>>>(output, scales, input, dim_x, dim_y);
+    }
+}
+
+template <typename InputType, typename OutputType, typename ScaleType>
+void launch_scale_1x128_reshape(OutputType* output, ScaleType* scales, InputType const* input, int dim_x, int dim_h,
+    int dim_y, int stride_x, cudaStream_t stream)
+{
+    if (kNumDeviceSMs < 0)
+    {
+        kNumDeviceSMs = tensorrt_llm::common::getMultiProcessorCount();
+    }
+    if (can_vectorize_1x128(output, input, dim_x, stride_x))
+    {
+        scale_1x128_reshape_vec_kernel<<<kNumDeviceSMs * 8, 256, 0, stream>>>(
+            output, scales, input, dim_x, dim_h, dim_y, stride_x);
+    }
+    else
+    {
+        scale_1x128_reshape_kernel<<<kNumDeviceSMs * 8, 256, 0, stream>>>(
+            output, scales, input, dim_x, dim_h, dim_y, stride_x);
+    }
+}
+
+void fp8_1x128_cs(__nv_fp8_e4m3* mat_quant, float* scales, __nv_bfloat16 const* mat, int shape_x, int shape_y,
+    cudaStream_t stream, bool use_ue8m0 = false)
+{
+    if (use_ue8m0)
+    {
+        launch_scale_1x128<true>(mat_quant, scales, mat, shape_x, shape_y, stream);
+    }
+    else
+    {
+        launch_scale_1x128<false>(mat_quant, scales, mat, shape_x, shape_y, stream);
     }
 }
 
 void fp8_1x128_cs_reshape(__nv_fp8_e4m3* mat_quant, float* scales, __nv_bfloat16 const* mat, int shape_x, int shape_h,
     int shape_y, int stride_x, cudaStream_t stream)
 {
-    if (kNumDeviceSMs < 0)
-    {
-        kNumDeviceSMs = tensorrt_llm::common::getMultiProcessorCount();
-    }
-    scale_1x128_reshape_kernel<<<kNumDeviceSMs * 8, 256, 0, stream>>>(
-        mat_quant, scales, mat, shape_x, shape_h, shape_y, stride_x);
+    launch_scale_1x128_reshape(mat_quant, scales, mat, shape_x, shape_h, shape_y, stride_x, stream);
 }
 
 void fp8_128x128_cs(
@@ -842,7 +1041,7 @@ void fp8_gemm_run(__nv_bfloat16 const* mat_a, __nv_fp8_e4m3* fp8_mat_a, int ld_a
 
     if (internal_quantize_a)
     {
-        scale_1x128_kernel<<<kNumDeviceSMs * 8, 256, 0, stream>>>(fp8_mat_a, scales_a, mat_a, shape_k, shape_m);
+        launch_scale_1x128(fp8_mat_a, scales_a, mat_a, shape_k, shape_m, stream);
     }
     if (internal_quantize_b)
     {
@@ -1160,8 +1359,7 @@ void fp8_stride_batch_gemm_run(__nv_bfloat16 const* mat_a, __nv_fp8_e4m3* fp8_ma
     }
     if (internal_quantize_a)
     {
-        scale_1x128_kernel<<<kNumDeviceSMs * 8, 256, 0, stream>>>(
-            fp8_mat_a, scales_a, mat_a, shape_k, shape_m * num_problems);
+        launch_scale_1x128(fp8_mat_a, scales_a, mat_a, shape_k, shape_m * num_problems, stream);
     }
     if (internal_quantize_b)
     {

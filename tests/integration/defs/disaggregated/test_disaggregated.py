@@ -14,9 +14,9 @@
 # limitations under the License.
 
 import asyncio
+import csv
 import json
 import os
-import platform
 import re
 import secrets
 import shutil
@@ -32,8 +32,8 @@ import numpy as np
 import pytest
 import yaml
 from defs.common import get_free_port_in_ci as get_free_port
-from defs.common import (parse_gsm8k_output, resolve_llm_model_path,
-                         wait_for_server)
+from defs.common import (get_ucx_tls, parse_gsm8k_output,
+                         resolve_llm_model_path, wait_for_server)
 from defs.conftest import (get_sm_version, llm_models_root, skip_arm,
                            skip_no_hopper, skip_pre_blackwell, skip_pre_hopper)
 from defs.deepseek_v41_gsm8k import GSM8K_TEST_TIMEOUT
@@ -68,20 +68,16 @@ class TestConfig:
         return self.test_desc
 
 
-def get_ucx_tls():
-    """Get UCX_TLS value based on GPU architecture.
+def get_ucx_net_devices():
+    """Get UCX_NET_DEVICES for these single-node disaggregated tests.
 
-    Pre-Hopper GPUs need cuda_ipc excluded from UCX transports.
+    Every worker runs on this host, so loopback is the only TCP device UCX
+    needs. With every netdev enabled, UCX protocol selection re-queries each
+    TCP interface (ethtool ioctls, slow on bonded NICs) for every new endpoint,
+    which pushed cold NIXL peer setup past kv_transfer_timeout_ms on B200
+    nodes (https://nvbugs/6836097).
     """
-    sm = get_sm_version()
-    """
-    ON some gb300 cluster,  we need to set `cuda_copy,cuda_ipc,sm,self,tcp` for UCX_TLS
-    """
-    if sm == 103 and "aarch" in platform.machine().lower():
-        return "cuda_copy,cuda_ipc,sm,self,tcp"
-    if sm < 90:
-        return "^cuda_ipc,ib,gdr_copy"
-    return "^ib,gdr_copy"
+    return "lo"
 
 
 def apply_pre_hopper_nccl_workaround(env: dict) -> None:
@@ -97,15 +93,6 @@ def apply_pre_hopper_nccl_workaround(env: dict) -> None:
     """
     if get_sm_version() < 90:
         env.setdefault("NCCL_P2P_LEVEL", "PXB")
-
-
-def cleanup_output_files():
-    """Clean up output files from previous runs."""
-    for file in ['output.json', 'output_streaming.json']:
-        try:
-            os.remove(file)
-        except FileNotFoundError:
-            pass
 
 
 # Fatal patterns whose presence in worker/server logs after a stress run
@@ -350,8 +337,6 @@ def get_test_config(test_desc, example_dir, test_root):
         f"{test_configs_root}/disagg_config_ngram.yaml",
         "sa":
         f"{test_configs_root}/disagg_config_sa.yaml",
-        "sa_python":
-        f"{test_configs_root}/disagg_config_sa_python.yaml",
         "ctxpp2_genpp2":
         f"{test_configs_root}/disagg_config_ctxpp2_genpp2.yaml",
         "ctxtp2_genpp2":
@@ -518,11 +503,19 @@ def run_client_tests(example_dir,
                      server_url,
                      workers_proc,
                      server_proc,
+                     client_output_dir,
                      use_ray=False,
                      client_test_set=None):
-    """Run client tests against the disaggregated server."""
+    """Run client tests against the disaggregated server.
+
+    Client outputs go to client_output_dir, not to the cwd: concurrent QA jobs
+    run from one shared checkout and can overwrite each other's files there.
+    """
     if client_test_set is None:
         client_test_set = get_client_test_set(test_desc)
+
+    def output_path(file_name):
+        return os.path.join(client_output_dir, file_name)
 
     client_dir = f"{example_dir}/clients"
     for _ in range(num_iters):
@@ -552,25 +545,30 @@ def run_client_tests(example_dir,
 
         # Run completion test (non-streaming)
         if client_test_set.completion:
-            check_call(client_cmd, env=env, poll_procs=poll_procs)
+            completion_output = output_path('output.json')
+            completion_client_cmd = client_cmd + ['-o', completion_output]
+            check_call(completion_client_cmd, env=env, poll_procs=poll_procs)
 
         # Streaming client run
         if client_test_set.completion_streaming:
+            streaming_output = output_path('output_streaming.json')
             streaming_client_cmd = client_cmd + [
-                '--streaming', '-o', 'output_streaming.json'
+                '--streaming', '-o', streaming_output
             ]
             check_call(streaming_client_cmd, env=env, poll_procs=poll_procs)
 
         # Run chat completion test
         if client_test_set.chat:
-            chat_output = 'output_tool_calls.json' if test_desc == "tool_calls" else 'output_chat.json'
+            chat_file_name = 'output_tool_calls.json' if test_desc == "tool_calls" else 'output_chat.json'
+            chat_output = output_path(chat_file_name)
             chat_client_cmd = client_cmd + ['-e', 'chat', '-o', chat_output]
             check_call(chat_client_cmd, env=env, poll_procs=poll_procs)
 
         # Run streaming chat completion test
         if client_test_set.chat_streaming:
+            streaming_chat_output = output_path('output_streaming_chat.json')
             streaming_chat_client_cmd = client_cmd + [
-                '-e', 'chat', '--streaming', '-o', 'output_streaming_chat.json'
+                '-e', 'chat', '--streaming', '-o', streaming_chat_output
             ]
             check_call(streaming_chat_client_cmd,
                        env=env,
@@ -602,7 +600,7 @@ def run_client_tests(example_dir,
             continue
 
         for output_file in output_files:
-            with open(output_file, 'r') as f:
+            with open(output_path(output_file), 'r') as f:
                 content = f.read()
                 if "deepseek_v3_lite" in test_desc or output_file == "output_chat.json":
                     # Different models (and endpoints) phrase the continuation
@@ -1074,6 +1072,7 @@ def run_disaggregated_test(example_dir,
 
     run_env = env.copy() if env else os.environ.copy()
     run_env["UCX_TLS"] = get_ucx_tls()
+    run_env["UCX_NET_DEVICES"] = get_ucx_net_devices()
     apply_pre_hopper_nccl_workaround(run_env)
     ctx_run_env = run_env.copy()
     if ctx_env:
@@ -1127,6 +1126,7 @@ def run_disaggregated_test(example_dir,
             server_url,
             all_worker_procs,
             disagg_server.process,
+            client_output_dir=work_dir,
             use_ray=True)
         if post_client_test is not None:
             post_client_test(server_url)
@@ -1319,6 +1319,7 @@ def test_disaggregated_benchmark_gen_only_insufficient_kv(
     env['TRTLLM_DISAGG_BENCHMARK_GEN_ONLY'] = '1'
     env['TLLM_BENCHMARK_REQ_QUEUES_SIZE'] = '64'
     env["UCX_TLS"] = get_ucx_tls()
+    env["UCX_NET_DEVICES"] = get_ucx_net_devices()
 
     config_file = get_test_config("gen_only_insufficient_kv",
                                   disaggregated_example_root,
@@ -1495,6 +1496,7 @@ def test_disaggregated_overlap_transceiver_runtime_python(
 
     env = llm_venv._new_env.copy()
     env["UCX_TLS"] = get_ucx_tls()
+    env["UCX_NET_DEVICES"] = get_ucx_net_devices()
     run_disaggregated_test(disaggregated_example_root,
                            "overlap_transceiver_runtime_python",
                            env=env,
@@ -1518,6 +1520,7 @@ def test_disaggregated_overlap_transceiver_runtime_python_fabric_memory(
 
     env = llm_venv._new_env.copy()
     env["UCX_TLS"] = get_ucx_tls()
+    env["UCX_NET_DEVICES"] = get_ucx_net_devices()
     env["TRTLLM_KVCACHE_POOL_USE_FABRIC_MEMORY"] = "1"
     run_disaggregated_test(disaggregated_example_root,
                            "overlap_transceiver_runtime_python",
@@ -1538,6 +1541,7 @@ def test_disaggregated_overlap_transceiver_runtime_python_bounce(
 
     env = llm_venv._new_env.copy()
     env["UCX_TLS"] = get_ucx_tls()
+    env["UCX_NET_DEVICES"] = get_ucx_net_devices()
     env["TRTLLM_USE_PY_NIXL_KVCACHE"] = "0"
     run_disaggregated_test(
         disaggregated_example_root,
@@ -1561,15 +1565,15 @@ def test_disaggregated_perf_metrics(disaggregated_test_root, llm_venv,
 
     def extra_endpoints_test(_server_url: str):
         item = get_timing_metrics(perf_metrics_output_dir)
-        # Use helper function to validate all timing metrics comprehensively
-        validate_timing_metrics(item, "perf_metrics test")
+        gen_timing = item["gen_perf_metrics"]["perf_metrics"]["timing_metrics"]
+        # JSONL omits kv_cache_size for zero-byte transfers (e.g. block reuse).
+        assert {"kv_cache_transfer_start",
+                "kv_cache_transfer_end"} <= gen_timing.keys()
+        validate_timing_metrics(item, "Python transceiver perf_metrics test")
 
-    # This test validates the C++ transceiver's timing-metric semantics: the
-    # config pins transceiver_runtime=CPP, and DEFAULT is forced to UCX.
     env = llm_venv._new_env | {
-        "TRTLLM_USE_NIXL_KVCACHE": "0",
-        "TRTLLM_USE_UCX_KVCACHE": "1",
         "UCX_TLS": get_ucx_tls(),
+        "UCX_NET_DEVICES": get_ucx_net_devices(),
     }
     run_disaggregated_test(disaggregated_example_root,
                            "perf_metrics",
@@ -1599,20 +1603,18 @@ def test_disaggregated_chat_completion_tool_calls(disaggregated_test_root,
 
 
 def test_disaggregated_kv_cache_time_output(disaggregated_test_root, llm_venv,
-                                            disaggregated_example_root):
+                                            disaggregated_example_root,
+                                            tmp_path):
     qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
     assert os.path.exists(
         qwen_model_root
     ), f"{qwen_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
     setup_model_symlink(llm_venv, qwen_model_root, "Qwen3/Qwen3-0.6B")
 
-    output_path = os.path.join(llm_venv.get_working_directory(), "cache_time")
+    output_path = str(tmp_path / "cache_time")
     env = llm_venv._new_env.copy()
-    # This test validates the C++ transceiver's CSV format: the config pins
-    # transceiver_runtime=CPP, and DEFAULT is forced to UCX.
-    env["TRTLLM_USE_NIXL_KVCACHE"] = "0"
-    env["TRTLLM_USE_UCX_KVCACHE"] = "1"
     env["UCX_TLS"] = get_ucx_tls()
+    env["UCX_NET_DEVICES"] = get_ucx_net_devices()
     env["TRTLLM_KVCACHE_TIME_OUTPUT_PATH"] = output_path
     run_disaggregated_test(disaggregated_example_root,
                            "perf_metrics",
@@ -1620,39 +1622,63 @@ def test_disaggregated_kv_cache_time_output(disaggregated_test_root, llm_venv,
                            model_path=qwen_model_root,
                            cwd=llm_venv.get_working_directory())
     assert os.path.isdir(output_path)
-    # The C++ transceiver names timing files "<instanceId>_<rank>_<tag>.csv"
-    # (instanceId is a runtime UUID that disambiguates instances sharing an
-    # output directory), so match by the "_<tag>.csv" suffix instead of a fixed
-    # "rank_0" prefix.
-    send_files = sorted(f for f in os.listdir(output_path)
-                        if f.endswith("_send.csv"))
-    recv_files = sorted(f for f in os.listdir(output_path)
-                        if f.endswith("_recv.csv"))
-    assert send_files, f"no *_send.csv in {output_path}: {os.listdir(output_path)}"
-    assert recv_files, f"no *_recv.csv in {output_path}: {os.listdir(output_path)}"
-    send_file = os.path.join(output_path, send_files[0])
-    recv_file = os.path.join(output_path, recv_files[0])
-    with open(send_file, "r") as f:
-        lines = f.readlines()
-        assert len(lines) > 1
-        assert lines[0].startswith(
-            "RequestID,RequestInfo,Preparation,Preprocess,Transmissions,Postprocess"
-        )
-        assert ",Delay,Duration,Bandwidth(Gbps)" in lines[0]
-        # get a send sample and match the recv
-        sample = lines[1].split(',')
-        assert len(sample) >= 9
-    with open(recv_file, "r") as f:
-        lines = f.readlines()
-        assert len(lines) > 1
-        matched = False
-        for line in lines:
-            sample_recv = line.split(',')
-            if sample_recv[0] == sample[0]:
-                matched = True
-                assert float(sample_recv[1]) <= float(sample[1])
-                break
-        assert matched
+    # Python writes task rows per instance/rank and a separate generation
+    # summary. Match requests across both workers instead of relying on UUIDs.
+    task_rows = []
+    summary_rows = []
+    for filename in sorted(os.listdir(output_path)):
+        if not filename.endswith(".csv"):
+            continue
+        with open(os.path.join(output_path, filename), newline="") as f:
+            reader = csv.DictReader(f)
+            if filename.endswith("_gen_transfer_summary.csv"):
+                assert reader.fieldnames == [
+                    "timestamp", "RequestID", "gen_side_transfer_time(ms)",
+                    "kv_cache_size"
+                ]
+                summary_rows.extend(reader)
+            else:
+                assert reader.fieldnames == [
+                    "timestamp", "task_type", "unique_rid", "peer_rank",
+                    "transfer_size_bytes", "avg_segment_size_bytes",
+                    "transfer_entry_count", "prepare_args_latency_ms",
+                    "queue_latency_ms", "transfer_latency_ms",
+                    "task_latency_ms", "throughput_mbs"
+                ]
+                task_rows.extend(reader)
+
+    send_rows = [row for row in task_rows if row["task_type"] == "KVSendTask"]
+    recv_rows = [row for row in task_rows if row["task_type"] == "KVRecvTask"]
+    assert send_rows, f"No Python send task metrics in {output_path}"
+    assert recv_rows, f"No Python receive task metrics in {output_path}"
+    assert summary_rows, f"No generation transfer summaries in {output_path}"
+    recv_ids = {row["unique_rid"] for row in recv_rows}
+    # Repeated prompts may reuse all blocks. Require an actual transfer among
+    # the matched requests, while permitting zero-byte rows for cache hits.
+    sent_ids = {
+        row["unique_rid"]
+        for row in send_rows if int(row["transfer_size_bytes"]) > 0
+    }
+    summary_ids = {
+        row["RequestID"]
+        for row in summary_rows if int(row["kv_cache_size"]) > 0
+    }
+    assert sent_ids & recv_ids & summary_ids
+    for row in send_rows:
+        assert int(row["transfer_size_bytes"]) >= 0
+        assert int(row["transfer_entry_count"]) >= 0
+        assert float(row["avg_segment_size_bytes"]) >= 0
+        for field in ("prepare_args_latency_ms", "queue_latency_ms",
+                      "transfer_latency_ms", "task_latency_ms",
+                      "throughput_mbs"):
+            assert float(row[field]) >= 0, row
+        assert float(row["task_latency_ms"]) >= float(
+            row["transfer_latency_ms"])
+    for row in recv_rows:
+        assert float(row["task_latency_ms"]) >= 0, row
+    for row in summary_rows:
+        assert float(row["gen_side_transfer_time(ms)"]) >= 0, row
+        assert int(row["kv_cache_size"]) >= 0, row
 
 
 def test_disaggregated_load_balance(disaggregated_test_root, llm_venv,
@@ -1723,25 +1749,6 @@ def test_disaggregated_sa(disaggregated_test_root, llm_venv,
     setup_model_symlink(llm_venv, qwen_model_root, "Qwen3/Qwen3-0.6B")
     run_disaggregated_test(disaggregated_example_root,
                            "sa",
-                           env=llm_venv._new_env,
-                           model_path=qwen_model_root,
-                           cwd=llm_venv.get_working_directory())
-
-
-def test_disaggregated_sa_python(disaggregated_test_root, llm_venv,
-                                 disaggregated_example_root):
-    """Spec-split SA (ctx no-spec, gen SA) on the V2 PYTHON transceiver path.
-
-    NIXL + transceiver_runtime PYTHON. The existing test_disaggregated_sa
-    covers this split only on the C++ DEFAULT backend.
-    """
-    qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
-    assert os.path.exists(
-        qwen_model_root
-    ), f"{qwen_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
-    setup_model_symlink(llm_venv, qwen_model_root, "Qwen3/Qwen3-0.6B")
-    run_disaggregated_test(disaggregated_example_root,
-                           "sa_python",
                            env=llm_venv._new_env,
                            model_path=qwen_model_root,
                            cwd=llm_venv.get_working_directory())
@@ -1945,6 +1952,7 @@ def test_disaggregated_deepseek_v3_lite_fp8_nixl(disaggregated_test_root,
     env = llm_venv._new_env.copy()
     env["TRTLLM_USE_NIXL_KVCACHE"] = "1"
     env["UCX_TLS"] = get_ucx_tls()
+    env["UCX_NET_DEVICES"] = get_ucx_net_devices()
     env["UCX_MM_ERROR_HANDLING"] = "y"
 
     # @skip_pre_hopper (SM >= 90), not @skip_no_hopper (SM == 90): placement is
@@ -2249,6 +2257,7 @@ def run_disaggregated_benchmark(example_dir,
     """Run disaggregated test with given configuration."""
     run_env = env.copy() if env else os.environ.copy()
     run_env["UCX_TLS"] = get_ucx_tls()
+    run_env["UCX_NET_DEVICES"] = get_ucx_net_devices()
     run_env["UCX_MM_ERROR_HANDLING"] = "y"
 
     config, ctx_workers, gen_workers, disagg_server, server_port, work_dir = \
@@ -2328,7 +2337,6 @@ def get_config_for_benchmark(model_root, backend):
             "disable_overlap_scheduler": True,
             "cache_transceiver_config": {
                 "backend": backend,
-                "max_tokens_in_buffer": 512,
             },
             "urls": [f"localhost:{get_free_port()}"]
         },
@@ -2341,7 +2349,6 @@ def get_config_for_benchmark(model_root, backend):
             "max_seq_len": 384,
             "cache_transceiver_config": {
                 "backend": backend,
-                "max_tokens_in_buffer": 512,
             },
             "urls": [f"localhost:{get_free_port()}"]
         }
@@ -2515,9 +2522,9 @@ def run_disaggregated_aiperf(config_file,
         env: Environment variables dict
         cwd: Working directory
     """
-    cleanup_output_files()
     run_env = env.copy()
     run_env["UCX_TLS"] = get_ucx_tls()
+    run_env["UCX_NET_DEVICES"] = get_ucx_net_devices()
     run_env["UCX_MM_ERROR_HANDLING"] = "y"
 
     config, ctx_workers, gen_workers, disagg_server, server_port, work_dir = \
@@ -2851,9 +2858,9 @@ def test_disaggregated_deepseek_v3_lite_bf16_empty_batch(
 def test_llama4_long_context_kv_cache_overflow(disaggregated_test_root,
                                                disaggregated_example_root,
                                                llm_venv, model_path):
-    """
-    RCCA: https://nvbugspro.nvidia.com/bug/5555681
-    Test to reproduce KV cache buffer overflow bug with long context.
+    """Verify long-context KV cache transfer with the Python transceiver.
+
+    Retains long-context coverage from https://nvbugspro.nvidia.com/bug/5555681.
     """
     models_root = llm_models_root()
     llama4_model_root = os.path.join(models_root, model_path)
@@ -2865,20 +2872,13 @@ def test_llama4_long_context_kv_cache_overflow(disaggregated_test_root,
                                   disaggregated_example_root,
                                   os.path.dirname(__file__))
 
-    run_disaggregated_aiperf(
-        config_file=config_file,
-        model_path=llama4_model_root,
-        server_start_timeout=1200,
-        input_tokens=128000,
-        output_tokens=100,
-        # This repro intentionally degrades the KV
-        # transfer path (tiny max_tokens_in_buffer vs
-        # 128k inputs), so sporadic request errors are
-        # by-design; keep the test scoped to its
-        # original crash/fatal-log checks.
-        max_error_rate=None,
-        env=llm_venv._new_env,
-        cwd=llm_venv.get_working_directory())
+    run_disaggregated_aiperf(config_file=config_file,
+                             model_path=llama4_model_root,
+                             server_start_timeout=1200,
+                             input_tokens=128000,
+                             output_tokens=100,
+                             env=llm_venv._new_env,
+                             cwd=llm_venv.get_working_directory())
 
 
 @skip_pre_blackwell
@@ -3086,7 +3086,6 @@ def _run_deepseek_v41_gsm8k(llm_venv, model_path, tmp_path, *,
             "cache_transceiver_config": {
                 "backend": "NIXL",
                 "transceiver_runtime": "PYTHON",
-                "max_tokens_in_buffer": 8192
             },
         }
         # Both workers share one node. The KV cache manager V2 auto host tier
@@ -3108,6 +3107,7 @@ def _run_deepseek_v41_gsm8k(llm_venv, model_path, tmp_path, *,
                                                                "transfers")
     env = baseline_env(llm_venv._new_env) | {
         "UCX_TLS": get_ucx_tls(),
+        "UCX_NET_DEVICES": get_ucx_net_devices(),
         "TRTLLM_NIXL_KVCACHE_BACKEND": "UCX",
         "TRTLLM_NIXL_NUM_THREADS": "1",
         "TRTLLM_KVCACHE_TIME_OUTPUT_PATH": transfer_dir,
@@ -3953,9 +3953,9 @@ def run_disaggregated_mixed_stress(example_dir: str,
     if profiles is None:
         profiles = _DEFAULT_MIXED_STRESS_PROFILES
 
-    cleanup_output_files()
     run_env = env.copy() if env else os.environ.copy()
     run_env["UCX_TLS"] = get_ucx_tls()
+    run_env["UCX_NET_DEVICES"] = get_ucx_net_devices()
     run_env["UCX_MM_ERROR_HANDLING"] = "y"
 
     setup_start = time.monotonic()
@@ -4109,9 +4109,9 @@ def run_disaggregated_cancel_test(example_dir,
                                   model_path=None,
                                   cwd=None):
     """Run disaggregated test with request cancellation stress test."""
-    cleanup_output_files()
     run_env = env.copy()
     run_env["UCX_TLS"] = get_ucx_tls()
+    run_env["UCX_NET_DEVICES"] = get_ucx_net_devices()
 
     config_file = get_test_config(test_desc, example_dir,
                                   os.path.dirname(__file__))
@@ -4262,6 +4262,7 @@ def test_disaggregated_logprobs_serving(disaggregated_test_root,
 
     env = llm_venv._new_env.copy()
     env["UCX_TLS"] = get_ucx_tls()
+    env["UCX_NET_DEVICES"] = get_ucx_net_devices()
     ctx_workers, gen_workers, disagg_server, work_dir = [], [], None, None
     config, ctx_workers, gen_workers, disagg_server, server_port, work_dir = \
         setup_disagg_cluster(config_file, env=env,
@@ -4405,6 +4406,7 @@ def test_disaggregated_mamba_conc_greater_than_mbs(disaggregated_example_root,
 
     env = llm_venv._new_env.copy()
     env["UCX_TLS"] = get_ucx_tls()
+    env["UCX_NET_DEVICES"] = get_ucx_net_devices()
     e2el, ttft = run_disaggregated_benchmark(
         disaggregated_example_root,
         config_file,
