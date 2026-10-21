@@ -708,14 +708,151 @@ def test_unmerged_or_wrong_base_rejected(world: World, field: str, value: object
         m._make_plan(world.args(), world)
 
 
+def _advance_canonical(world: World) -> str:
+    _write(world.source, "prims_ts/kernel.py", "VALUE = 4\n")
+    tip = _commit(world.source, "new canonical update")
+    _git(world.canonical, "fetch", "-q", str(world.source), tip)
+    _git(world.canonical, "update-ref", "refs/heads/trtllm-prims-ts-dev", tip)
+    return tip
+
+
+@pytest.mark.parametrize("tip_kind", ["previous", "intermediate", "reviewed"])
+def test_promotion_accepts_live_tip_contained_in_reviewed_pin(world: World, tip_kind: str) -> None:
+    tip = {"previous": world.previous, "intermediate": world.first, "reviewed": world.reviewed}[
+        tip_kind
+    ]
+    _git(world.canonical, "update-ref", "refs/heads/trtllm-prims-ts-dev", tip)
+    args = world.args(publish=True)
+    plan = m._make_plan(args, world)
+    m._publish(args, world, plan)
+    assert _git(world.canonical, "rev-parse", "trtllm-prims-ts-dev") == world.reviewed
+    assert world.prs[99]["base"]["ref"] == "main"
+
+
+def test_plan_rejects_tip_newer_than_pinned_source(world: World) -> None:
+    tip = _advance_canonical(world)
+    with pytest.raises(m.Diagnostic, match="latest canonical branch tip") as failure:
+        m._make_plan(world.args(), world)
+    assert tip in failure.value.problem
+    assert world.reviewed in failure.value.problem
+    assert "consumer lock" in failure.value.action
+    assert not any(method != "GET" for method, _, _ in world.calls)
+
+
+def test_canonical_rewind_is_operator_error(world: World) -> None:
+    _git(world.canonical, "update-ref", "refs/heads/trtllm-prims-ts-dev", world.upstream)
+    with pytest.raises(RuntimeError, match="Canonical branch no longer contains"):
+        m._make_plan(world.args(), world)
+    assert not any(method != "GET" for method, _, _ in world.calls)
+
+
+def test_tip_advance_during_preparation_blocks_all_remote_writes(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    args = world.args(publish=True)
+    plan = m._make_plan(args, world)
+    prepare = m._prepare_commit
+
+    def advance(*arguments):
+        result = prepare(*arguments)
+        _advance_canonical(world)
+        return result
+
+    monkeypatch.setattr(m, "_prepare_commit", advance)
+    with pytest.raises(m.Diagnostic, match="latest canonical branch tip"):
+        m._publish(args, world, plan)
+    assert not any(method != "GET" for method, _, _ in world.calls)
+    assert not any(call[0] == "push" for call in world.git_calls)
+
+
+def test_manual_promotion_rejects_upstream_source(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    plan = m._plan_identity(world.args(), world)
+    plan.reviewed = dataclasses.replace(
+        plan.reviewed, url=f"https://github.com/{_UPSTREAM}.git", branch="main"
+    )
+    monkeypatch.setattr(m, "_plan_identity", lambda *args: plan)
+    with pytest.raises(m.Diagnostic, match="not upstream itself"):
+        m._make_plan(world.args(), world)
+    assert not any(method != "GET" for method, _, _ in world.calls)
+
+
+@pytest.mark.parametrize("consumer_base", ["main", "release/1.3"])
+@pytest.mark.parametrize(
+    "case", ["stale", "diverged", "advance-during-attribution", "contained", "upstream"]
+)
+def test_open_pr_checks_live_dev_tip_before_valid_feedback(
+    world: World, monkeypatch: pytest.MonkeyPatch, consumer_base: str, case: str
+) -> None:
+    world.base_branch = consumer_base
+    args = world.args(publish=True)
+    args.workdir = world.root
+    args.since = None
+    args.refresh_branch = []
+    args.migrate_canonical_branch_from = None
+    previous = m._lock_at(world, _CONSUMER, world.base)
+    reviewed = m._lock_at(world, _CONSUMER, world.merged)
+    if case == "upstream":
+        reviewed = dataclasses.replace(
+            reviewed, url=f"https://github.com/{_UPSTREAM}.git", branch="main"
+        )
+    endpoint = f"repos/{_CONSUMER}/pulls/17"
+    pr = world.get(endpoint)
+    pr.update(
+        merged=False,
+        state="open",
+        base={"ref": consumer_base},
+        head={"sha": world.merged},
+        user={"login": "maintainer"},
+    )
+    world.overrides[endpoint] = pr
+    world.main = world.base
+    if case == "diverged":
+        _git(world.source, "checkout", "-q", "--detach", world.previous)
+    if case in ("stale", "diverged"):
+        tip = _advance_canonical(world)
+    elif case == "contained":
+        _git(world.canonical, "update-ref", "refs/heads/trtllm-prims-ts-dev", world.first)
+    matches = []
+
+    def resolve(*arguments):
+        matches.append(True)
+        if case == "advance-during-attribution":
+            _advance_canonical(world)
+        return {}, {}
+
+    monkeypatch.setattr(b.metadata, "resolve", resolve)
+    with contextlib.closing(b.Store(":memory:")) as store:
+        monitor = b.Monitor(args, world, store)
+        monkeypatch.setattr(monitor, "_inputs", lambda source_pr: (previous, reviewed))
+        monitor.inspect(17)
+        message = world.source_comments[0]["body"]
+        if case == "contained":
+            assert store.get("observation:17")["state"] == "metadata_valid"
+            assert "metadata and source attribution are valid" in message
+        else:
+            assert store.get("observation:17")["state"] == "blocked"
+            assert "metadata and source attribution are valid" not in message
+            if case == "upstream":
+                assert "not upstream itself" in message
+            else:
+                assert "latest canonical branch tip" in message
+                assert "rebase" in message and "scripts/vendor/manage.py" in message
+            if case in ("stale", "diverged"):
+                assert tip in message
+    assert bool(matches) == (case in ("contained", "advance-during-attribution"))
+    assert not any(call[0] == "push" for call in world.git_calls)
+
+
 @pytest.mark.parametrize("target", ["main", "canonical"])
 def test_concurrent_updates_block_before_publication(world: World, target: str) -> None:
     plan = m._make_plan(world.args(), world)
     if target == "main":
         world.main = world.base
     else:
-        _git(world.canonical, "update-ref", "refs/heads/trtllm-prims-ts-dev", world.first)
-    with pytest.raises(ValueError, match="superseded|moved unexpectedly"):
+        _advance_canonical(world)
+    with pytest.raises(ValueError, match="superseded|latest canonical branch tip"):
         m._publish(world.args(publish=True), world, plan)
     assert not any(method != "GET" for method, _, _ in world.calls)
     assert not any(args[0] == "push" for args in world.git_calls)
@@ -1478,7 +1615,7 @@ def test_recovery_rejects_changed_artifacts_without_writes(world: World, tamper:
     elif tamper == "dco":
         commit["commit"]["message"] = m._record_text(original.record)
     elif tamper == "canonical":
-        _git(world.canonical, "update-ref", "refs/heads/trtllm-prims-ts-dev", world.first)
+        _advance_canonical(world)
     else:
         pr["state"] = "closed"
     world.overrides[endpoint] = commit

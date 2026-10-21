@@ -229,8 +229,42 @@ def _check_fork(gh: GitHub, repo: str, upstream: str) -> None:
 
 
 def _check_source_repo(gh: GitHub, repo: str) -> None:
-    if repo.lower() != gh.upstream_repo.lower():
+    try:
         _check_fork(gh, repo, gh.upstream_repo)
+    except Diagnostic as error:
+        raise Diagnostic(
+            error.problem,
+            "Create a temporary branch in an upstream fork from the latest canonical dev "
+            "branch and apply the intended source changes there. Push it, then use "
+            "`scripts/vendor/manage.py` to update the lock URL, branch, SHA, and vendored "
+            "snapshot. A broader upstream refresh requires the separate, explicitly "
+            "configured maintainer refresh workflow.",
+        ) from error
+
+
+def _check_canonical_tip(gh: GitHub, previous: vendor.Vendor, reviewed: vendor.Vendor) -> str:
+    """Require the immutable source pin to contain the live canonical branch tip."""
+    repo = _repo_name(previous.url)
+    tip = _sha(gh.get(f"repos/{repo}/git/ref/heads/{previous.branch}")["object"]["sha"])
+    if tip in (previous.commit, reviewed.commit):
+        return tip
+    if gh.compare(repo, previous.commit, tip)["merge_base_commit"]["sha"] != previous.commit:
+        raise RuntimeError(
+            "Canonical branch no longer contains the consumer lock's revision; "
+            "a maintainer must inspect the branch history before promotion."
+        )
+    if gh.compare(repo, tip, reviewed.commit)["merge_base_commit"]["sha"] != tip:
+        raise Diagnostic(
+            f"The pinned temporary source commit {field(reviewed.commit)} does not contain "
+            f"the latest canonical branch tip {field(tip)}.",
+            f"Fetch {field(previous.url)} / {field(previous.branch)} and rebase the temporary "
+            f"source branch {field(reviewed.branch)} onto `{tip}`. Push it, then use "
+            "`scripts/vendor/manage.py` to update the consumer lock and vendored snapshot "
+            "to the rebased SHA. The consumer lock's old pin alone is not a sufficient "
+            "base; updating only the PR metadata or temporary branch without its lock pin "
+            "will not fix this.",
+        )
+    return tip
 
 
 def _record_from_message(message: str) -> dict:
@@ -326,11 +360,7 @@ def _check_current(gh: GitHub, plan: Promotion) -> None:
         raise ValueError(
             "Consumer branch's vendor lock has been superseded; do not promote this PR."
         )
-    ref = gh.get(f"repos/{plan.canonical_repo}/git/ref/heads/{plan.previous.branch}")
-    if ref["object"]["sha"] not in (plan.previous.commit, plan.reviewed.commit):
-        raise ValueError(
-            "Canonical branch moved unexpectedly; coordinate with the other maintainer."
-        )
+    _check_canonical_tip(gh, plan.previous, plan.reviewed)
 
 
 def _plan_identity(args: argparse.Namespace, gh: GitHub) -> Promotion:
@@ -431,6 +461,7 @@ def _make_plan(
         raise ValueError(
             "Promote requires a nonempty, linear source commit range; rebase merges first."
         )
+    _check_canonical_tip(gh, previous, reviewed)
     prs = {}
     for reference in args.upstream_pr:
         upstream_number = _pr_number(reference, gh.upstream_repo)
