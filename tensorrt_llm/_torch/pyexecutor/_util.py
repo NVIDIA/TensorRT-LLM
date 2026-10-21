@@ -40,7 +40,6 @@ from tensorrt_llm._torch.peft.lora.manager import (load_torch_lora,
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import CpType, Mapping
 from tensorrt_llm.quantization import QuantAlgo
-from tensorrt_llm.runtime.kv_cache_manager_v2 import AttentionReusePolicy
 
 from ..attention.backends import get_sparse_attn_kv_cache_manager
 from ..disaggregation.kv_cache_transceiver import (
@@ -695,28 +694,28 @@ def _get_num_storage_pool_groups(layer_specs: Sequence[KVCacheLayerSpec],
     """Count the pool groups KVCacheManagerV2 creates for explicit layer specs.
 
     Mirrors the grouping key of ``createStorageConfig``: a life cycle is a
-    distinct (window, sink blocks, reuse policy), its slot sizes are the sizes
-    of its coalesced buffers in descending order, and life cycles with the same
-    (reuse policy, slot sizes) share one pool group.
+    distinct (window, sink blocks), its slot sizes are the sizes of its
+    coalesced buffers in descending order, and life cycles with the same slot
+    sizes share one pool group. [agentx port] The agentx bindings have no
+    per-layer reuse policy (main #19727), so it is not part of either key.
     """
     scale_roles = (Role.KEY_BLOCK_SCALE, Role.VALUE_BLOCK_SCALE)
     nvfp4 = tensorrt_llm.bindings.DataType.NVFP4
     life_cycles: dict[tuple, dict[tuple[int, int], int]] = {}
     for layer in layer_specs:
         life_cycle = (layer.sliding_window_size,
-                      ceil_div(layer.num_sink_tokens or 0,
-                               tokens_per_block), layer.reuse_policy)
+                      ceil_div(layer.num_sink_tokens or 0, tokens_per_block))
         coalesced = life_cycles.setdefault(life_cycle, {})
         for role in layer.buffer_roles:
             group = 1 + int(role in scale_roles) if layer.dtype == nvfp4 else 0
             key = (group, layer.bytes_per_token(role) * tokens_per_block)
             coalesced[key] = coalesced.get(key, 0) + 1
-    return len({(life_cycle[2],
-                 tuple(
-                     sorted((size * count
-                             for (_, size), count in coalesced.items()),
-                            reverse=True)))
-                for life_cycle, coalesced in life_cycles.items()})
+    return len({
+        tuple(
+            sorted((size * count for (_, size), count in coalesced.items()),
+                   reverse=True))
+        for coalesced in life_cycles.values()
+    })
 
 
 def _get_num_pool_groups_for_estimation(
@@ -2272,7 +2271,6 @@ class KvCacheCreator:
                 buffer_roles=self._layer_spec_roles(target_dtype,
                                                     k_only=target_k_only),
                 sliding_window_size=window,
-                reuse_policy=AttentionReusePolicy.REQUIRED,
             ) for layer_id, window in zip(target_local_ids, target_windows)
         ]
         specs.extend(
@@ -2285,7 +2283,6 @@ class KvCacheCreator:
                 buffer_roles=self._layer_spec_roles(draft_dtype,
                                                     k_only=draft_k_only),
                 sliding_window_size=window,
-                reuse_policy=AttentionReusePolicy.REQUIRED,
             ) for layer_id, window in zip(draft_local_ids, draft_windows))
         return tuple(specs)
 

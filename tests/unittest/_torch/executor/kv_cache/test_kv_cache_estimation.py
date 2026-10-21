@@ -48,7 +48,6 @@ from tensorrt_llm.llmapi.llm_args import (
     TorchLlmArgs,
 )
 from tensorrt_llm.mapping import Mapping
-from tensorrt_llm.runtime.kv_cache_manager_v2 import AttentionReusePolicy
 
 pytestmark = pytest.mark.cpu_only
 
@@ -961,7 +960,13 @@ def test_creator_uses_v2_affine_cache_cost():
     assert cost == CacheCost(slope=20, intercept=21)
 
 
+@pytest.mark.skip(
+    reason="[agentx port] needs main's per-layer AttentionReusePolicy (#19727), "
+    "which the agentx KV bindings lack"
+)
 def test_v2_layer_spec_costing_preserves_sink_and_reuse_policy() -> None:
+    from tensorrt_llm.runtime.kv_cache_manager_v2 import AttentionReusePolicy
+
     windowed = KVCacheLayerSpec(
         global_layer_id=0,
         owner=KVCacheLayerOwner.TARGET,
