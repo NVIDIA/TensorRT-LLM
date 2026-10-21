@@ -173,13 +173,15 @@ def _persistent(
 
 
 def _above_ceiling_tokens() -> int:
-    """One more token than the fused epilogue will take.
+    """One more token than the fused epilogues (per-token and decode kernel) will take.
 
-    Read from the module rather than hardcoded: the ceiling is configurable via
+    Read from the modules rather than hardcoded: the per-token ceiling is configurable via
     KIMI_K3_FUSED_ATTN_RES_MAX_TOKENS, and a literal here would silently stop
     testing the fallback branch the moment someone raised it.
     """
-    return modeling_kimi_linear._FUSED_ATTN_RES_MAX_TOKENS + 1
+    from tensorrt_llm._torch.kernels.blackwell import kimi_k3_attn_res
+
+    return max(modeling_kimi_linear._FUSED_ATTN_RES_MAX_TOKENS, kimi_k3_attn_res.MAX_TOKENS) + 1
 
 
 def _similarity(

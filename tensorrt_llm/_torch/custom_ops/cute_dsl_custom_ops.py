@@ -700,6 +700,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
     import cutlass.cute as cute
 
     from ..kernels.blackwell import fp8_block_scale_low_m_gemm as fp8_low_m
+    from ..kernels.blackwell import kimi_k3_attn_res
     from ..kernels.blackwell.blockwise_gemm.blockwise_gemm import \
         Sm100BlockwiseGemmKernel
     from ..kernels.blackwell.dense_blockscaled_gemm_act_fusion import \
@@ -5645,6 +5646,75 @@ if IS_CUTLASS_DSL_AVAILABLE:
           sigmoid: bool = False) -> torch.Tensor:
         return input.new_empty((input.shape[0], weight.shape[0]),
                                dtype=torch.bfloat16)
+
+    # Kimi-K3 decode attention-residual mix + RMSNorm with a PDL prologue
+    # (``kimi_k3_attn_res.py``). ``layer``/``prefix``/``residual`` and the
+    # addends are BF16 ``[M, 7168]``, ``block`` BF16 ``[N - 1, M, 7168]``, the
+    # weights BF16 ``[7168]``; inputs as ``kimi_k3_attn_res.can_run`` accepts.
+
+    @torch.library.custom_op("trtllm::kimi_k3_attn_res_rmsnorm",
+                             mutates_args=(),
+                             device_types="cuda")
+    def kimi_k3_attn_res_rmsnorm(layer: torch.Tensor, block: torch.Tensor,
+                                 res_weight: torch.Tensor,
+                                 rms_weight: torch.Tensor,
+                                 out_weight: torch.Tensor, rms_eps: float,
+                                 out_eps: float) -> torch.Tensor:
+        """Attention-residual mix of ``block`` and ``layer``, then RMSNorm."""
+        output = torch.empty_like(layer)
+        kimi_k3_attn_res.run_attn_res(layer, (), block, res_weight, rms_weight,
+                                      out_weight, rms_eps, out_eps, output,
+                                      None)
+        return output
+
+    @torch.library.register_fake("trtllm::kimi_k3_attn_res_rmsnorm")
+    def _(layer, block, res_weight, rms_weight, out_weight, rms_eps, out_eps):
+        return torch.empty_like(layer)
+
+    @torch.library.custom_op("trtllm::kimi_k3_attn_res_add_rmsnorm",
+                             mutates_args=(),
+                             device_types="cuda")
+    def kimi_k3_attn_res_add_rmsnorm(
+            prefix: torch.Tensor, addend: torch.Tensor, block: torch.Tensor,
+            res_weight: torch.Tensor, rms_weight: torch.Tensor,
+            out_weight: torch.Tensor, rms_eps: float,
+            out_eps: float) -> Tuple[torch.Tensor, torch.Tensor]:
+        """``(bf16(prefix + addend), output)``: the residual add, then the mix
+        and RMSNorm on the updated prefix sum."""
+        output = torch.empty_like(prefix)
+        updated = torch.empty_like(prefix)
+        kimi_k3_attn_res.run_attn_res(prefix, (addend, ), block, res_weight,
+                                      rms_weight, out_weight, rms_eps, out_eps,
+                                      output, updated)
+        return updated, output
+
+    @torch.library.register_fake("trtllm::kimi_k3_attn_res_add_rmsnorm")
+    def _(prefix, addend, block, res_weight, rms_weight, out_weight, rms_eps,
+          out_eps):
+        return torch.empty_like(prefix), torch.empty_like(prefix)
+
+    @torch.library.custom_op("trtllm::kimi_k3_attn_res_moe_add_rmsnorm",
+                             mutates_args=(),
+                             device_types="cuda")
+    def kimi_k3_attn_res_moe_add_rmsnorm(
+            residual: torch.Tensor, routed: torch.Tensor, shared: torch.Tensor,
+            block: torch.Tensor, res_weight: torch.Tensor,
+            rms_weight: torch.Tensor, out_weight: torch.Tensor, rms_eps: float,
+            out_eps: float) -> Tuple[torch.Tensor, torch.Tensor]:
+        """``(prefix, output)`` with ``prefix = bf16(residual + bf16(routed +
+        shared))``, a MoE layer's residual update, then the mix and RMSNorm on
+        ``prefix``."""
+        output = torch.empty_like(residual)
+        prefix = torch.empty_like(residual)
+        kimi_k3_attn_res.run_attn_res(residual, (routed, shared), block,
+                                      res_weight, rms_weight, out_weight,
+                                      rms_eps, out_eps, output, prefix)
+        return prefix, output
+
+    @torch.library.register_fake("trtllm::kimi_k3_attn_res_moe_add_rmsnorm")
+    def _(residual, routed, shared, block, res_weight, rms_weight, out_weight,
+          rms_eps, out_eps):
+        return torch.empty_like(residual), torch.empty_like(residual)
 
     # =============================================================================
     # Dense GEMM with SwiGLU Fusion (FC1 Kernel for MoE as Dense GEMM)

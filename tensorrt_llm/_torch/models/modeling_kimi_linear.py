@@ -516,6 +516,72 @@ def _rms_norm_eps(norm: nn.Module) -> float:
     return float(norm.variance_epsilon)
 
 
+class _DeferredMoEResidual(NamedTuple):
+    """A MoE layer's residual update ``residual + bf16(routed + shared)``, left to the next
+    attention-residual mix, which folds it into its kernel (or materializes it)."""
+
+    residual: torch.Tensor
+    routed: torch.Tensor
+    shared: torch.Tensor
+
+    def materialize(self) -> torch.Tensor:
+        return self.residual + (self.routed + self.shared)
+
+
+def _defers_moe_residual(num_tokens: int) -> bool:
+    """Whether a MoE layer leaves its residual update to the next layer's mix: where the decode
+    attention-residual kernel serves that mix."""
+    from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
+
+    if not (_FUSED_ATTN_RES_ENABLED and IS_CUTLASS_DSL_AVAILABLE):
+        return False
+    from ..kernels.blackwell import kimi_k3_attn_res
+
+    return num_tokens <= kimi_k3_attn_res.MAX_TOKENS
+
+
+def _attn_res_decode_kernel(
+    layer: torch.Tensor,
+    addends: Tuple[torch.Tensor, ...],
+    block_residual: torch.Tensor,
+    proj: nn.Linear,
+    norm: KimiK3RMSNorm,
+    output_norm: nn.Module,
+) -> Optional[Tuple[Optional[torch.Tensor], torch.Tensor]]:
+    """``(updated prefix sum or None, normed mix)`` from the decode attention-residual kernel
+    (``kimi_k3_attn_res``: PDL prologue, cluster per token) where it serves the inputs.
+
+    ``addends``: ``()``; ``(addend,)`` for ``layer + addend``; ``(routed, shared)`` for the MoE
+    residual update ``layer + bf16(routed + shared)``.
+    """
+    from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
+
+    if not IS_CUTLASS_DSL_AVAILABLE:
+        return None
+    from ..kernels.blackwell import kimi_k3_attn_res
+
+    weights = (proj.weight.reshape(-1), norm.weight, output_norm.weight)
+    if not kimi_k3_attn_res.can_run(layer, addends, block_residual, *weights):
+        return None
+    M, H = layer.shape
+    _note_attn_res_fusion(
+        f"attn_res+norm/decode/add{len(addends)}", True, M, H, int(block_residual.shape[0]) + 1
+    )
+    eps, out_eps = float(norm.eps), _rms_norm_eps(output_norm)
+    if not addends:
+        output = torch.ops.trtllm.kimi_k3_attn_res_rmsnorm(
+            layer, block_residual, *weights, eps, out_eps
+        )
+        return None, output
+    if len(addends) == 1:
+        return torch.ops.trtllm.kimi_k3_attn_res_add_rmsnorm(
+            layer, addends[0], block_residual, *weights, eps, out_eps
+        )
+    return torch.ops.trtllm.kimi_k3_attn_res_moe_add_rmsnorm(
+        layer, *addends, block_residual, *weights, eps, out_eps
+    )
+
+
 def _note_attn_res_fusion(site: str, fused: bool, M: int, H: int, N: int) -> None:
     """Report whether the fused path was actually reached, once per shape.
 
@@ -548,6 +614,9 @@ def _apply_attn_res_rmsnorm_fused(
     M, H = prefix_sum.shape
     K = int(block_residual.shape[0])
     N = K + 1
+    decode = _attn_res_decode_kernel(prefix_sum, (), block_residual, proj, norm, output_norm)
+    if decode is not None:
+        return decode[1]
     # The fused path is taken for M <= _FUSED_ATTN_RES_MAX_TOKENS, H == 7168 and
     # N <= 12, which is the measured window; larger token counts have not been
     # measured and fall back to the unfused add + attn_res_fwd + RMSNorm path.
@@ -619,6 +688,9 @@ def _apply_attn_res_add_rmsnorm_fused(
     M, H = prefix_sum.shape
     K = int(block_residual.shape[0])
     N = K + 1
+    decode = _attn_res_decode_kernel(prefix_sum, (addend,), block_residual, proj, norm, output_norm)
+    if decode is not None:
+        return decode
     # Same measured window as _apply_attn_res_rmsnorm_fused above.
     if _use_persistent_attn_res(M, H, N):
         try:
@@ -1778,6 +1850,13 @@ class KimiK3MoERuntime(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor, all_rank_num_tokens=None) -> torch.Tensor:
         """``hidden_states``: ``[num_tokens, hidden_size]`` bf16."""
+        routed_out, shared_out = self.forward_parts(hidden_states, all_rank_num_tokens)
+        return routed_out + shared_out
+
+    def forward_parts(
+        self, hidden_states: torch.Tensor, all_rank_num_tokens=None
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """The routed and the shared experts' outputs, whose BF16 sum :meth:`forward` returns."""
         identity = hidden_states
         projected_input = None
         early_routed_in = None
@@ -1893,7 +1972,7 @@ class KimiK3MoERuntime(nn.Module):
                 ),
             )
             routed_out = self._routed_projection(routed_latent, self.routed_expert_up_proj)
-        return routed_out + shared_out
+        return routed_out, shared_out
 
 
 def resolve_attention_quant_config(
@@ -2275,18 +2354,21 @@ class KimiLinearDecoderLayer(nn.Module):
 
     def forward(
         self,
-        hidden_states: torch.Tensor,
+        hidden_states: torch.Tensor | _DeferredMoEResidual,
         block_residual: torch.Tensor,
         num_snapshots: int,
         attn_metadata: AttentionMetadata,
         capture: Optional[Tuple[Any, int]] = None,
         helix_a2a: Optional[KimiK3HelixA2A] = None,
-    ) -> Tuple[torch.Tensor, int]:
+    ) -> Tuple[torch.Tensor | _DeferredMoEResidual, int]:
         """Port of HF ``KimiDecoderLayer._forward_attn_residual`` (per token).
 
         ``block_residual`` is a preallocated snapshot bank in kernel-native
         ``[K_max, M, H]`` layout. Returns the running prefix sum and the
-        number of valid bank rows.
+        number of valid bank rows. After a MoE layer the prefix sum is a
+        ``_DeferredMoEResidual`` where the next layer's decode mix folds the
+        residual update in (``_defers_moe_residual``); every consumer accepts
+        both forms.
 
         ``capture`` is ``(spec_metadata, layer_id)`` and taps the DSpark aux
         stream for the layer BEFORE this one: the aggregated stream for layer j
@@ -2307,9 +2389,24 @@ class KimiLinearDecoderLayer(nn.Module):
 
         def _full_rows(t: torch.Tensor) -> torch.Tensor:
             return t if sliced is None else sliced.all_gather(t, num_tokens)
-
-        prefix_sum = hidden_states
         valid_block_residual = block_residual[:num_snapshots]
+        normed = None
+        if isinstance(hidden_states, _DeferredMoEResidual):
+            # The previous MoE layer's residual update, folded into this layer's mix.
+            if capture is None and num_snapshots > 0:
+                folded = _attn_res_decode_kernel(
+                    hidden_states.residual,
+                    (hidden_states.routed, hidden_states.shared),
+                    valid_block_residual,
+                    self.self_attention_res_proj,
+                    self.self_attention_res_norm,
+                    self.input_layernorm,
+                )
+                if folded is not None:
+                    hidden_states, normed = folded
+            if normed is None:
+                hidden_states = hidden_states.materialize()
+        prefix_sum = hidden_states
 
         if capture is not None:
             # The mixture tap needs the PRE-norm value, which the fused
@@ -2328,6 +2425,8 @@ class KimiLinearDecoderLayer(nn.Module):
             tapped = hidden_states if _AUX_ATTN_RES_STREAM_ENABLED else prefix_sum
             capture[0].maybe_capture_hidden_states(capture[1], _full_rows(tapped), None)
             hidden_states = self.input_layernorm(hidden_states)
+        elif normed is not None:
+            hidden_states = normed
         elif num_snapshots > 0:
             hidden_states = _apply_attn_res_and_rmsnorm(
                 prefix_sum,
@@ -2374,16 +2473,18 @@ class KimiLinearDecoderLayer(nn.Module):
                 self.post_attention_layernorm,
             )
         if self.is_moe:
-            hidden_states = self.block_sparse_moe(
+            routed, shared = self.block_sparse_moe.forward_parts(
                 hidden_states,
                 sliced.all_rank_num_tokens(num_tokens)
                 if sliced is not None
                 else getattr(attn_metadata, "all_rank_num_tokens", None),
             )
-        else:
-            hidden_states = self.mlp(hidden_states)
+            residual_update = _DeferredMoEResidual(prefix_sum, routed, shared)
+            if _defers_moe_residual(prefix_sum.shape[0]):
+                return residual_update, num_snapshots
+            return residual_update.materialize(), num_snapshots
 
-        prefix_sum = prefix_sum + hidden_states
+        prefix_sum = prefix_sum + self.mlp(hidden_states)
         return prefix_sum, num_snapshots
 
     def skip_forward(
@@ -2538,6 +2639,8 @@ class KimiLinearModel(DecoderModel):
                 capture=capture,
                 helix_a2a=self.helix_a2a,
             )
+        if isinstance(hidden_states, _DeferredMoEResidual):
+            hidden_states = hidden_states.materialize()
         sliced = self.helix_a2a is not None
 
         # The last layer has no successor, so this one recompute is
