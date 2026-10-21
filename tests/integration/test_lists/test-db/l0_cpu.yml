@@ -161,6 +161,9 @@ l0_cpu:
   - unittest/llmapi/apps/test_tool_parsers.py
   - unittest/llmapi/apps/test_web_search_shared.py
   - unittest/llmapi/test_bench_async.py
+  - unittest/llmapi/test_disagg_telemetry_launcher.py::test_disaggregated_command_sets_shared_deployment_id
+  - unittest/llmapi/test_disagg_telemetry_launcher.py::test_launch_disagg_fleet_propagates_resolved_schedule_style
+  - unittest/llmapi/test_disagg_telemetry_launcher.py::test_fleet_worker_uses_process_wide_telemetry_setting
   - unittest/llmapi/test_additional_model_outputs.py -m "gpu1"
   - unittest/llmapi/test_executor.py
   - unittest/llmapi/test_gc_utils.py

@@ -36,6 +36,7 @@ pytestmark = pytest.mark.cpu_only
 def _isolate_prometheus_multiproc_dir(monkeypatch: pytest.MonkeyPatch) -> None:
     """Prevent launcher tests from reusing a deleted Prometheus temp dir."""
     monkeypatch.delenv("PROMETHEUS_MULTIPROC_DIR", raising=False)
+    monkeypatch.setattr(serve._usage_lib, "_DISAGG_DEPLOYMENT_ID", "")
 
 
 def _mock_llmapi_modules(
@@ -56,10 +57,7 @@ def _mock_llmapi_modules(
 
 def test_disaggregated_command_sets_shared_deployment_id(monkeypatch) -> None:
     """The top-level disagg launcher assigns one deployment id for child workers."""
-    monkeypatch.delenv(
-        serve.DisaggLauncherEnvs.TLLM_DISAGG_DEPLOYMENT_ID,
-        raising=False,
-    )
+    monkeypatch.setenv("TRTLLM_DISAGG_DEPLOYMENT_ID", "/home/alice/deployment")
 
     disagg_config = SimpleNamespace(
         hostname="127.0.0.1",
@@ -70,7 +68,7 @@ def test_disaggregated_command_sets_shared_deployment_id(monkeypatch) -> None:
     )
     fake_socket = mock.MagicMock()
     fake_socket.__enter__.return_value = fake_socket
-    deployment_id = SimpleNamespace(hex="deploy123")
+    deployment_id = serve.uuid.uuid4()
 
     with (
         mock.patch.object(serve.uuid, "uuid4", return_value=deployment_id),
@@ -93,7 +91,7 @@ def test_disaggregated_command_sets_shared_deployment_id(monkeypatch) -> None:
             report_addr=None,
         )
 
-    assert os.environ[serve.DisaggLauncherEnvs.TLLM_DISAGG_DEPLOYMENT_ID] == "deploy123"
+    assert serve._usage_lib._get_disagg_deployment_id() == deployment_id.hex
     assert os.environ[serve.DisaggLauncherEnvs.TLLM_DISAGG_ROLE] == "server_coordinator"
     fake_socket.bind.assert_called_once_with(("127.0.0.1", 0))
 
@@ -172,6 +170,7 @@ def test_launch_disagg_fleet_propagates_resolved_schedule_style(
     """Fleet children receive the resolved CLI-or-config schedule style."""
     real_popen = subprocess.Popen
     observed_envs = []
+    observed_commands = []
     fleet_processes = []
     registered_cleanups = []
     signal_handlers = {}
@@ -180,6 +179,7 @@ def test_launch_disagg_fleet_propagates_resolved_schedule_style(
         pid = 12345
 
         def __init__(self, _command, **kwargs):
+            observed_commands.append(_command)
             observed_envs.append(kwargs["env"])
             fleet_processes.append(self)
             self.returncode = None
@@ -210,6 +210,9 @@ def test_launch_disagg_fleet_propagates_resolved_schedule_style(
     )
     monkeypatch.setenv("TRTLLM_NO_USAGE_STATS", "1")
     monkeypatch.setenv(serve.DisaggLauncherEnvs.TLLM_DISAGG_ROLE, "coordinator")
+    monkeypatch.setenv("TRTLLM_DISAGG_DEPLOYMENT_ID", "/home/alice/deployment")
+    deployment_id = serve.uuid.uuid4()
+    serve._usage_lib._set_disagg_deployment_id(deployment_id)
 
     serve._launch_disagg_fleet(
         disagg_config,
@@ -223,6 +226,8 @@ def test_launch_disagg_fleet_propagates_resolved_schedule_style(
 
     assert observed_envs[0][serve.DisaggWorkerEnvs.TLLM_DISAGG_SCHEDULE_STYLE] == schedule_style
     assert observed_envs[0]["TRTLLM_NO_USAGE_STATS"] == "1"
+    assert f"_run_fleet_worker('{deployment_id.hex}')" in observed_commands[0][2]
+    assert "/home/alice/deployment" not in observed_commands[0][2]
     assert serve.DisaggLauncherEnvs.TLLM_DISAGG_ROLE not in observed_envs[0]
     assert signal_handlers[signal.SIGTERM] is serve._command_telemetry.raise_signal_exit
     with pytest.raises(serve._command_telemetry.SignalExit):
@@ -307,7 +312,7 @@ def test_launch_disaggregated_leader_signal_cleans_up_and_reports(
         installed_handlers[signal_number](signal_number, None)
 
     monkeypatch.setenv(
-        serve.DisaggLauncherEnvs.TLLM_DISAGG_DEPLOYMENT_ID,
+        "TRTLLM_DISAGG_DEPLOYMENT_ID",
         "deploy123",
     )
     monkeypatch.setenv("TRTLLM_NO_USAGE_STATS", "1")
@@ -351,7 +356,7 @@ def test_launch_disaggregated_leader_signal_cleans_up_and_reports(
             default_usage_context="disaggregated",
         )
 
-    assert observed["env"][serve.DisaggLauncherEnvs.TLLM_DISAGG_DEPLOYMENT_ID] == "deploy123"
+    assert serve._usage_lib._get_disagg_deployment_id() == ""
     assert observed["env"][serve.DisaggLauncherEnvs.TLLM_DISAGG_INSTANCE_IDX] == "2"
     assert observed["env"]["TRTLLM_NO_USAGE_STATS"] == "1"
     assert (
@@ -394,8 +399,10 @@ def test_launch_disaggregated_leader_signal_cleans_up_and_reports(
     assert outcome.signal_number == signal_number
 
 
-def test_fleet_worker_uses_process_wide_telemetry_setting() -> None:
+@pytest.mark.parametrize("deployment_id", ["", "7cd46f928e324879b82a7cabd3c0ecde"])
+def test_fleet_worker_uses_process_wide_telemetry_setting(monkeypatch, deployment_id) -> None:
     """The direct fleet boundary does not construct an enabled override."""
+    monkeypatch.setenv("TRTLLM_DISAGG_DEPLOYMENT_ID", "/home/alice/deployment")
     with (
         mock.patch.object(serve, "apply_usage_session_config") as apply_config,
         mock.patch.object(serve, "_run_fleet_worker_impl"),
@@ -410,8 +417,9 @@ def test_fleet_worker_uses_process_wide_telemetry_setting() -> None:
             "report_exit",
         ) as report_exit,
     ):
-        serve._run_fleet_worker()
+        serve._run_fleet_worker(deployment_id)
 
+    assert serve._usage_lib._get_disagg_deployment_id() == deployment_id
     assert apply_config.call_args.args == ()
     assert report_exit.call_args.kwargs["telemetry_config"] is None
     assert report_exit.call_args.kwargs["default_usage_context"] == "disaggregated"

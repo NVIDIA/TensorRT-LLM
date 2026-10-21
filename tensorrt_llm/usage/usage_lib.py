@@ -72,7 +72,7 @@ logger = logging.getLogger("tensorrt_llm")
 # ---------------------------------------------------------------------------
 
 _DISAGG_ROLE_ENV = "TRTLLM_DISAGG_ROLE"
-_DISAGG_DEPLOYMENT_ID_ENV = "TRTLLM_DISAGG_DEPLOYMENT_ID"
+_DISAGG_DEPLOYMENT_ID = ""
 _DEFAULT_ENDPOINT = "https://events.gfe.nvidia.com/v1.1/events/json"
 _HTTP_TIMEOUT = 2.0
 _MAX_HEARTBEATS = 1000
@@ -81,6 +81,17 @@ _ALLOWED_USAGE_CONTEXTS = frozenset(context.value for context in UsageContext)
 _ARCHITECTURE_HASH_DOMAIN = b"trtllm-architecture-class-v1\0"
 _ARCHITECTURE_HASH_PREFIX = "sha256:"
 _T = TypeVar("_T")
+
+
+def _set_disagg_deployment_id(deployment_id: uuid.UUID) -> None:
+    """Install the launcher's generated ID, shared through internal worker startup."""
+    global _DISAGG_DEPLOYMENT_ID
+    _DISAGG_DEPLOYMENT_ID = deployment_id.hex
+
+
+def _get_disagg_deployment_id() -> str:
+    """Return the launcher-owned deployment ID, or empty outside its workers."""
+    return _DISAGG_DEPLOYMENT_ID
 
 
 @dataclass(frozen=True)
@@ -829,8 +840,7 @@ class _TelemetrySession:
     def _refresh_metadata_unlocked(self) -> None:
         if not self.disagg_role:
             self.disagg_role = os.environ.get(_DISAGG_ROLE_ENV, "")
-        if not self.deployment_id:
-            self.deployment_id = os.environ.get(_DISAGG_DEPLOYMENT_ID_ENV, "")
+        self.deployment_id = _get_disagg_deployment_id()
 
         normalized_role = self.disagg_role.lower()
         if self.component == "server" and (
@@ -1072,9 +1082,7 @@ def _empty_event_snapshot(usage_context: str = "") -> dict[str, Any]:
     return {
         "ingressPoint": _clamp_str(usage_context, schema._SHORT_STR),
         "disaggRole": _clamp_str(os.environ.get(_DISAGG_ROLE_ENV, ""), schema._SHORT_STR),
-        "deploymentId": _clamp_str(
-            os.environ.get(_DISAGG_DEPLOYMENT_ID_ENV, ""), schema._SHORT_STR
-        ),
+        "deploymentId": _get_disagg_deployment_id(),
         "llmInitializationAttempts": 0,
         "llmInstancesCreated": 0,
         "activeLlmInstances": 0,
