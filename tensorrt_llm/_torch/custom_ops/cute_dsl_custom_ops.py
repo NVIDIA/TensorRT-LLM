@@ -5610,24 +5610,39 @@ if IS_CUTLASS_DSL_AVAILABLE:
     @torch.library.custom_op("trtllm::fp8_block_scale_low_m_gemm",
                              mutates_args=(),
                              device_types="cuda")
-    def fp8_block_scale_low_m_gemm(input: torch.Tensor, weight: torch.Tensor,
-                                   weight_scale: torch.Tensor) -> torch.Tensor:
+    def fp8_block_scale_low_m_gemm(input: torch.Tensor,
+                                   weight: torch.Tensor,
+                                   weight_scale: torch.Tensor,
+                                   gate: Optional[torch.Tensor] = None,
+                                   sigmoid: bool = False) -> torch.Tensor:
         """FP8 block-scale GEMM for few rows (``fp8_block_scale_low_m_gemm.py``).
 
         Takes the operands of ``fp8_swap_ab_gemm(..., disable_ue8m0_cast=True)``:
         BF16 ``input [M, K]`` with ``1 <= M <= 256``, the UE8M0-resmoothed FP8
         ``weight [N, K]`` and its DeepGEMM-packed UE8M0 ``weight_scale``.
-        Returns BF16 ``[M, N]``.
+        Returns BF16 ``[M, N]``: ``bf16(input * gate) @ weight^T`` with a
+        ``gate``, ``sigmoid`` of the result with ``sigmoid`` (both for M in the
+        low-M kernel's range only).
         """
         fp8_low_m.check_inputs(input, weight, weight_scale)
+        if gate is not None:
+            fp8_low_m.check_gate(input, gate)
         output = torch.empty((input.shape[0], weight.shape[0]),
                              dtype=torch.bfloat16,
                              device=input.device)
-        return fp8_low_m.run_low_m_gemm(input, weight, weight_scale, output)
+        return fp8_low_m.run_low_m_gemm(input,
+                                        weight,
+                                        weight_scale,
+                                        output,
+                                        gate=gate,
+                                        sigmoid=sigmoid)
 
     @torch.library.register_fake("trtllm::fp8_block_scale_low_m_gemm")
-    def _(input: torch.Tensor, weight: torch.Tensor,
-          weight_scale: torch.Tensor) -> torch.Tensor:
+    def _(input: torch.Tensor,
+          weight: torch.Tensor,
+          weight_scale: torch.Tensor,
+          gate: Optional[torch.Tensor] = None,
+          sigmoid: bool = False) -> torch.Tensor:
         return input.new_empty((input.shape[0], weight.shape[0]),
                                dtype=torch.bfloat16)
 
