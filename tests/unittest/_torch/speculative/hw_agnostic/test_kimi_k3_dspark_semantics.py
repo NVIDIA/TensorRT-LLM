@@ -1224,15 +1224,22 @@ def test_mla_dspark_block_decode_matches_unabsorbed_reference(monkeypatch, paged
     # variant has to enter the kernel branch, and a fixture that quietly falls
     # back to eager is exactly how this test used to pass without testing
     # anything (no page table, then MLA dims and a page size both kernels
-    # reject).
-    calls = {"fixup": 0}
+    # reject). TLLM_DFLASH_FUSED_PROLOGUE=1 builds the same fixup with the
+    # fused builder instead; either one counts.
+    calls = {"fixup": 0, "fused": 0}
     _original = md._build_mla_block_fixup
+    _original_fused = md.MLADSparkForCausalLM._build_mla_block_fixup_fused
 
     def _counted(*a, **kw):
         calls["fixup"] += 1
         return _original(*a, **kw)
 
+    def _counted_fused(*a, **kw):
+        calls["fused"] += 1
+        return _original_fused(*a, **kw)
+
     monkeypatch.setattr(md, "_build_mla_block_fixup", _counted)
+    monkeypatch.setattr(md.MLADSparkForCausalLM, "_build_mla_block_fixup_fused", _counted_fused)
     if backend == "CUTEDSL":
         reason = md.cute_dsl_mla_decode_unavailability_reason()
         if reason is not None:
@@ -1270,7 +1277,11 @@ def test_mla_dspark_block_decode_matches_unabsorbed_reference(monkeypatch, paged
         ]
     )
 
-    assert calls == {"fixup": 1 if paged else 0}, f"paged={paged} took the wrong branch: {calls}"
+    assert calls["fixup"] + calls["fused"] == (1 if paged else 0), (
+        f"paged={paged} took the wrong branch: {calls}"
+    )
+    if md._fused_prologue_on():
+        assert calls["fixup"] == 0, f"fused prologue on, unfused builder ran: {calls}"
     assert out.shape[0] == len(requests)
 
     diff = (out - expected).abs().max().item()
