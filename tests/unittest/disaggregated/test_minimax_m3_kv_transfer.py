@@ -70,6 +70,8 @@ class _ShortFakeKVCache:
 
 def test_minimax_cache_indices_support_block_count_limit() -> None:
     manager = object.__new__(MiniMaxM3KVCacheManagerV2)
+    manager.layer_specs = None
+    manager.kv_factor = 2
     manager.kv_cache_map = {7: _FakeKVCache(), 8: _ShortFakeKVCache()}
 
     assert manager._get_batch_cache_indices_by_pool_id([7]) == [[4, 5, 6, -1]]
@@ -79,6 +81,12 @@ def test_minimax_cache_indices_support_block_count_limit() -> None:
         [4, 5, 6, -1],
         [7, 8, -1, -1],
     ]
+    assert manager._get_batch_cache_indices_by_pool_id([7], index_scale=3, kv_factor=2) == [
+        [4, 5, 6, -1]
+    ]
+    assert manager.get_batch_cache_indices([7, 8]) == [[4, 5, 6, -1], [7, 8, -1, -1]]
+    assert manager.get_batch_cache_indices([7], num_blocks_per_seq=[2]) == [[4, 5]]
+    assert manager.get_batch_cache_indices([7], raw_indices=True) == [[4, 5, 6, -1]]
     assert manager.get_block_ids_per_seq([7]).tolist() == [[4, 5, 6, 0]]
     assert manager.get_block_ids_per_seq([7, 8]).tolist() == [
         [4, 5, 6, 0],
