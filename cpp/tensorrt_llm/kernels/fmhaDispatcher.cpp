@@ -167,6 +167,8 @@ bool FmhaDispatcher::isSupported()
         // Sparse context attention uses a generation-style kernel with per-token sparse indices.
         if (mFixedParams.useTllmGenSparseAttention)
         {
+            // Sparse selection needs a positive TopK, aligned to four, even for this synthetic probe.
+            tllmRunnerParams.mSparseTopK = 4;
             tllmRunnerParams.mSparseAttention
                 = (mFixedParams.useSparseMLA && mFixedParams.headSizeV == mFixedParams.headSize)
                 ? SparseType::DynamicTokenSparse
