@@ -141,12 +141,15 @@ def test_rmsnorm_fp32_in_matches_reference_chain(device):
 # ---------------------------------------------------------------------------
 
 
-def _case(tokens, hidden, monkeypatch, fused: bool, norm_fp32: bool):
-    monkeypatch.setenv("MUSESPARK_OPEN_FUSED_RESIDUAL", "1" if fused else "0")
+def _case(tokens, hidden, monkeypatch, norm_fp32: bool, contiguous_branch: bool = True):
     monkeypatch.setenv("MUSESPARK_OPEN_PREQKV_NORM_FP32_RESIDUAL", "1" if norm_fp32 else "0")
     torch.manual_seed(719)
     residual = _nonrepresentable_residual(tokens, hidden, "cuda")
     branch = torch.randn(tokens, hidden, device="cuda", dtype=torch.bfloat16)
+    if not contiguous_branch:
+        # Same values in a layout the kernels do not take, which sends the
+        # join to the torch composition.
+        branch = branch.t().contiguous().t()
     gate = MuseSparkOpenGatedResidual(hidden, torch.bfloat16).cuda()
     norm = RMSNorm(hidden_size=hidden, eps=1e-5, dtype=torch.bfloat16, use_gemma=True).cuda()
     with torch.no_grad():
@@ -159,10 +162,13 @@ def _case(tokens, hidden, monkeypatch, fused: bool, norm_fp32: bool):
 @cuda_only
 @pytest.mark.parametrize("norm_fp32", [False, True])
 def test_unfused_arm_selects_ordering(monkeypatch, norm_fp32):
-    """MUSESPARK_OPEN_FUSED_RESIDUAL=0: the composition must take exactly the
+    """A branch the kernels do not take: the composition must take exactly the
     selected ordering, bitwise."""
     with torch.inference_mode():
-        residual, branch, gate, norm = _case(16, 512, monkeypatch, fused=False, norm_fp32=norm_fp32)
+        residual, branch, gate, norm = _case(
+            16, 512, monkeypatch, norm_fp32=norm_fp32, contiguous_branch=False
+        )
+        assert not branch.is_contiguous()
         updated, next_input = gate._add_after_rmsnorm_and_norm(residual, branch, 1e-5, norm)
         expected_updated = gate.add_after_rmsnorm(residual, branch, 1e-5)
         assert torch.equal(updated, expected_updated)
@@ -180,11 +186,9 @@ def test_fused_arm_residual_invariant_and_norm_switched(monkeypatch, tokens, hid
     fused next-norm output moves with the switch and matches the matching
     torch reference orderings elementwise at BF16 grain."""
     with torch.inference_mode():
-        residual, branch, gate_off, norm = _case(
-            tokens, hidden, monkeypatch, fused=True, norm_fp32=False
-        )
+        residual, branch, gate_off, norm = _case(tokens, hidden, monkeypatch, norm_fp32=False)
         updated_off, next_off = gate_off._add_after_rmsnorm_and_norm(residual, branch, 1e-5, norm)
-        _, _, gate_on, _ = _case(tokens, hidden, monkeypatch, fused=True, norm_fp32=True)
+        _, _, gate_on, _ = _case(tokens, hidden, monkeypatch, norm_fp32=True)
         with torch.no_grad():
             gate_on.gate.copy_(gate_off.gate)
         gate_on.cache_derived_state()

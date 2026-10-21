@@ -745,62 +745,6 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         page = guard(layer_idx)
         return 0 if page is None else int(page)
 
-    def zero_planned_split_kv_scratch(self, wrapper, num_qo_heads: int,
-                                      head_dim_vo: int) -> None:
-        """Zero the split-KV partials the wrapper's current plan will use.
-
-        With split-KV the attention kernel writes a partial output (``tmp_v``)
-        and a log-sum-exp (``tmp_s``) per scheduled tile, and a merge pass
-        combines them. A tile the merge covers that this pass's attention
-        kernel did not write returns whatever the buffer already held, and
-        after the first few passes that is a previous pass's partials, whose
-        log-sum-exps include ``-inf`` for chunks with no keys in the sliding
-        window. Merging those produces a non-finite row, and argmax over an
-        all-NaN row returns token id 0.
-
-        Zeroing at allocation only covers the first pass, which leaves the
-        graph path reading stale partials. Giving each wrapper its own buffer
-        does not help either -- measured, not assumed -- because the stale
-        partials a wrapper reads are its own. What clears it is repainting
-        before every pass, and this is the narrow version of that: only the
-        bytes this plan can address, a few MB out of 320.
-
-        Call this immediately before ``wrapper.run()``, not after the plan: a
-        CUDA graph is captured around the run and replayed without re-planning,
-        so a zero placed at plan time would run once and every replay would
-        attend over whatever the previous replay left. Placed here it is
-        captured into the graph and re-runs on each replay. The extent is safe
-        to compute on the host: everything it depends on is fixed for the life
-        of a captured graph.
-        """
-        plan_info = getattr(wrapper, "_plan_info", None)
-        if plan_info is None or self.workspace_buffer is None:
-            return
-        plan_info = list(plan_info)
-        # The FA2 batch-prefill plan returns 15 entries; the batch-decode plan
-        # returns 10 in a different order, so the length picks out the layout.
-        if len(plan_info) != _FI_PREFILL_PLAN_INFO_LEN:
-            return
-        if not plan_info[_FI_PLAN_SPLIT_KV]:
-            # No split, no partials and no merge. (With CUDA graphs enabled
-            # FlashInfer forces split_kv on, so this is the eager path only.)
-            return
-        num_tiles = (plan_info[_FI_PLAN_PADDED_BATCH_SIZE] *
-                     plan_info[_FI_PLAN_CTA_TILE_Q] * num_qo_heads)
-        v_offset = plan_info[_FI_PLAN_V_OFFSET]
-        s_offset = plan_info[_FI_PLAN_S_OFFSET]
-        v_bytes = num_tiles * head_dim_vo * _FI_SIZEOF_FLOAT
-        s_bytes = num_tiles * _FI_SIZEOF_FLOAT
-        # workspace_buffer is uint8, so these are byte ranges.
-        # tmp_v is a partial output, so zero contributes nothing once its
-        # log-sum-exp weight is zero. tmp_s is that weight and needs the
-        # neutral sentinel instead: see _FI_NEUTRAL_LSE for why neither 0 nor
-        # -inf will do. Both offsets are 16-byte aligned by FlashInfer's
-        # allocator, so the float view is safe.
-        self.workspace_buffer[v_offset:v_offset + v_bytes].zero_()
-        self.workspace_buffer[s_offset:s_offset + s_bytes].view(
-            torch.float32).fill_(_FI_NEUTRAL_LSE)
-
     def swap_paged_kv_indices_for_layer(self, layer_idx: int) -> None:
         """Copy pool-specific page indices into the shared buffer.
 

@@ -1,8 +1,8 @@
 {
   "_meta": {
     "generated_by": "scripts/legacy_utils.py lint-update-violations",
-    "total_violations": 1860,
-    "total_files": 204
+    "total_violations": 1856,
+    "total_files": 202
   },
   ".github/scripts/label_community_user.py": {
     "D212": 1
@@ -150,9 +150,6 @@
   "tensorrt_llm/__init__.py": {
     "E402": 4
   },
-  "tensorrt_llm/_torch/attention/backends/flashinfer.py": {
-    "F811": 1
-  },
   "tensorrt_llm/_torch/compilation/piecewise_optimizer.py": {
     "E711": 2
   },
@@ -223,9 +220,6 @@
   },
   "tensorrt_llm/_torch/moe/fused_moe/quantization.py": {
     "E731": 1
-  },
-  "tensorrt_llm/_torch/pyexecutor/guided_decoder.py": {
-    "F811": 3
   },
   "tensorrt_llm/_torch/pyexecutor/model_loader.py": {
     "F811": 1

@@ -164,6 +164,7 @@ These options are set within the YAML file passed to `trtllm-serve` via the `--c
 #### `attn_backend` / `allreduce_strategy` / `moe_config.backend`
 
 * **Description:** The validated configuration uses the `TRTLLM` attention backend, `NCCL` all-reduce, and the `TRTLLM` MoE backend.
+* **`allreduce_strategy`:** For this model, `AUTO` (the default) is replaced by `NCCL`, `NCCL_SYMMETRIC` is rejected, and any other value is used as given.
 
 #### `trust_remote_code`
 

@@ -24,24 +24,22 @@ state 4096 wide (``compression_factor=2``) and expert FFN intermediate 4096.
 Layers ``l`` with ``(num_layers - l - 1) % 4 == 0`` are NoPE + full causal; the
 rest are interleaved-RoPE with a 2048-key sliding window.
 
-Environment switches (each keeps its unfused/recomputing arm reachable so any
-lever can be A/B'd on one image; see the ``_*_enabled`` helpers for rationale):
+The fused residual join, the fused pre-expert RMSNorm + NVFP4 quantization,
+the fused expert finalize + TP4 all-reduce, the routing memo and the cached
+gate coefficients have no switches: each runs wherever it applies and falls
+back to the reference composition elsewhere.
 
-- ``MUSESPARK_OPEN_FUSED_RESIDUAL`` (default on): fused residual join.
-- ``MUSESPARK_OPEN_ROUTING_MEMO`` (default on): reuse of the first routing pass.
-- ``MUSESPARK_OPEN_FROZEN_GATE_CACHE`` (default on): cached gate coefficients.
-- ``MUSESPARK_OPEN_FUSED_FINALIZE_AR`` (default on): fused expert finalize +
-  TP4 all-reduce.
+Opt-in environment switches:
+
 - ``MUSESPARK_OPEN_FUSED_FINALIZE_AR_MNNVL`` (default off): extend finalize fusion
   to TP8/EP8 across two NVLink-connected four-GPU GB300 nodes.
 - ``MUSESPARK_OPEN_SHARDED_PROJECTIONS`` (default off, experimental): column-shard
   TP8 pool/unpool projections for batches of at most eight tokens.
-- ``MUSESPARK_OPEN_FUSED_PRE_EXPERT_QUANT`` (default on): fused pre-expert
-  RMSNorm + NVFP4 quantization.
 - ``MUSESPARK_OPEN_LL_QKV_WEIGHT_LAYOUT`` (default off): BF16 TP4/TP8 QKV
   weight layout for single-row decode with separate native normalization.
 - ``MUSESPARK_OPEN_FUSED_PREATTN`` (default OFF, opt-in): fused pre-attention.
-- ``MUSESPARK_OPEN_ALLREDUCE`` (default NCCL): all-reduce strategy name.
+- ``MUSESPARK_OPEN_PREQKV_NORM_FP32_RESIDUAL`` (default off): pre-QKV prenorm
+  over the FP32 residual.
 - ``MUSESPARK_OPEN_PREFILL_SEQUENCE_PARALLEL`` (default off): shard replicated
   prefill work across single-node BF16 TP4/EP4 ranks.
 - ``MUSESPARK_OPEN_BF16X3_ROUTER`` (default off): BF16x3 projection for large routers.
@@ -55,9 +53,6 @@ lever can be A/B'd on one image; see the ``_*_enabled`` helpers for rationale):
   chunks with reduce-scatter in eager sequence-parallel prefills of >=8192 tokens.
 - ``MUSESPARK_OPEN_PAD_SP_PROJECTION`` (default off): pad narrower projection inputs
   instead of outputs in eager sequence-parallel prefills; overlap takes precedence.
-
-Default-on switches read as disabled for the values ``0``/``false``/``no``/
-``off``.
 """
 
 import contextlib
@@ -522,37 +517,12 @@ def _gated_residual_after_rmsnorm_kernel(
 _RESIDUAL_NUM_WARPS = 16
 
 
-def _fused_residual_enabled() -> bool:
-    """Whether each decoder layer's residual join runs as one Triton kernel.
-
-    On unless MUSESPARK_OPEN_FUSED_RESIDUAL names a falsy value, the convention
-    every accepted lever in this file uses. ``_fused_preattention_enabled`` is
-    the deliberate exception: it opts in, because its canary is red.
-
-    The unfused chain stays reachable for the same reason it does there: it is
-    this fusion's control leg. The two arms round identically at every step
-    except the RMSNorm reduction order -- the kernel reproduces the gain product
-    and the norm result's rounds to the activation dtype deliberately -- so a
-    difference between them is attributable to that reduction and nothing else.
-
-    Having the switch at all is what lets the A/B run on ONE image. Without it
-    the only way to time the layer without this fusion is a second build, and
-    two images differ by more than the lever under test.
-    """
-    return os.environ.get("MUSESPARK_OPEN_FUSED_RESIDUAL", "1").strip().lower() not in (
-        "0",
-        "false",
-        "no",
-        "off",
-    )
-
-
 def _preqkv_norm_fp32_residual_enabled() -> bool:
     """Whether the pre-QKV prenorm reads the FP32 residual (cast after norm).
 
     Off unless MUSESPARK_OPEN_PREQKV_NORM_FP32_RESIDUAL names a truthy value. This
-    is an opt-in, unlike the accepted fusion levers, because it selects between
-    two well-defined numerics orderings rather than fusing an unchanged one:
+    is an opt-in because it selects between two well-defined numerics orderings
+    rather than fusing an unchanged one:
     set, the pre-QKV RMSNorm in later layers computes its variance on the FP32
     residual stream and rounds to the activation dtype once, on its output
     (the reference training recipe's ordering); unset, the residual is rounded
@@ -563,9 +533,8 @@ def _preqkv_norm_fp32_residual_enabled() -> bool:
     The default stays on the historical side until the served numerics are
     confirmed to switch; flipping it is a bf16-grain change to every later
     layer's attention input. Both arms exist in one build so the A/B is a
-    one-image environment flip, the same reason every other lever here keeps
-    its control leg. Resolved at module construction, before warmup and any
-    graph capture.
+    one-image environment flip. Resolved at module construction, before warmup
+    and any graph capture.
     """
     return os.environ.get("MUSESPARK_OPEN_PREQKV_NORM_FP32_RESIDUAL", "0").strip().lower() in (
         "1",
@@ -589,66 +558,6 @@ def _rmsnorm_fp32_in(x: torch.Tensor, norm: "RMSNorm") -> torch.Tensor:
     variance = x.pow(2).mean(-1, keepdim=True)
     normed = x * torch.rsqrt(variance + norm.variance_epsilon)
     return (normed * (norm.weight.to(torch.float32) + 1.0)).to(norm.weight.dtype)
-
-
-def _routing_memo_enabled() -> bool:
-    """Whether the second routing pass reuses the first one's result.
-
-    On unless MUSESPARK_OPEN_ROUTING_MEMO names a falsy value, the convention this
-    file already uses for ``MUSESPARK_OPEN_FUSED_RESIDUAL``.
-
-    The recomputing path stays reachable because it is this change's control
-    leg, and this one needs a control more than the fusions do, not less: the
-    memo is declared BIT-EXACT -- it returns the tensors the second pass would
-    have recomputed from the same logits -- and the only way to demonstrate
-    bit-exactness is to run both arms and compare tokens. That comparison is
-    valid only within a single process, because this build is not
-    greedy-deterministic across server boots, so two images cannot answer it and
-    a switch on one image is the only thing that can.
-    """
-    return os.environ.get("MUSESPARK_OPEN_ROUTING_MEMO", "1").strip().lower() not in (
-        "0",
-        "false",
-        "no",
-        "off",
-    )
-
-
-def _fused_finalize_ar_enabled() -> bool:
-    """Whether the expert finalize may fuse with the TP4 all-reduce.
-
-    On unless MUSESPARK_OPEN_FUSED_FINALIZE_AR names a falsy value, the convention
-    every accepted lever in this file uses. The unfused finalize + AllReduce
-    chain stays reachable as this fusion's control leg: the fused kernel is the
-    most novel machinery in the file (IPC, Lamport signaling, epochs), and a
-    one-image A/B is the only practical way to attribute a regression to it.
-    Resolved at model construction, before warmup and any graph capture.
-    """
-    return os.environ.get("MUSESPARK_OPEN_FUSED_FINALIZE_AR", "1").strip().lower() not in (
-        "0",
-        "false",
-        "no",
-        "off",
-    )
-
-
-def _fused_pre_expert_quant_enabled() -> bool:
-    """Whether the pre-expert RMSNorm may fuse with NVFP4 quantization.
-
-    On unless MUSESPARK_OPEN_FUSED_PRE_EXPERT_QUANT names a falsy value, the
-    convention every accepted lever in this file uses. The unfused
-    pre_expert_norm path stays reachable as this fusion's control leg: the
-    fused kernel quantizes the FP32 norm result without the intermediate BF16
-    cast, a deliberate (slightly more precise) numerics change that a one-image
-    A/B must be able to isolate. Resolved at module construction, before warmup
-    and any graph capture.
-    """
-    return os.environ.get("MUSESPARK_OPEN_FUSED_PRE_EXPERT_QUANT", "1").strip().lower() not in (
-        "0",
-        "false",
-        "no",
-        "off",
-    )
 
 
 @triton.jit
@@ -876,10 +785,6 @@ class MuseSparkOpenRoutingMethod(MiniMaxM2MoeRoutingMethod):
         # One-slot memo for the duplicated routing pass; see ``apply``.
         # (logits tensor, its version or None, topk_idx, top_k_weights) or None.
         self._routing_memo = None
-        # Read ONCE here rather than per call. A forward that consults the
-        # environment is a forward whose behaviour can change between CUDA-graph
-        # capture and replay, and the captured graph is what actually runs.
-        self._memo_enabled = _routing_memo_enabled()
         # Experimental high-concurrency path: selection keeps the fused kernel's
         # lowest-ID tie policy and sorted accumulation order at larger batches.
         self._full_routing_all_batches = (
@@ -930,7 +835,7 @@ class MuseSparkOpenRoutingMethod(MiniMaxM2MoeRoutingMethod):
         is exactly today's behaviour.
         """
         version = _version_or_none(router_logits)
-        memo = self._routing_memo if self._memo_enabled else None
+        memo = self._routing_memo
         if memo is not None and memo[0] is router_logits and memo[1] == version:
             return memo[2], memo[3]
         bias = self.e_score_correction_bias
@@ -977,28 +882,6 @@ class MuseSparkOpenRoutingMethod(MiniMaxM2MoeRoutingMethod):
         return selected, weights
 
 
-def _frozen_gate_cache_enabled() -> bool:
-    """Whether the frozen-parameter derived constants are cached at weight load.
-
-    On unless MUSESPARK_OPEN_FROZEN_GATE_CACHE names a falsy value, the same
-    convention as this file's other switches.
-
-    Falsy restores the pre-cache behaviour exactly: every call recomputes
-    ``1 + w`` for the weight-first norm and the sigmoid/sigmoid/multiply/clamp/
-    sqrt chain for the gated residual's coefficients. That path is not dead
-    code kept for sentiment -- it is the control leg for a change declared
-    BIT-EXACT, and bit-exactness can only be shown by running both arms in ONE
-    process and comparing tokens, because this build is not greedy-deterministic
-    across server boots. Two images cannot answer it; a switch on one image can.
-    """
-    return os.environ.get("MUSESPARK_OPEN_FROZEN_GATE_CACHE", "1").strip().lower() not in (
-        "0",
-        "false",
-        "no",
-        "off",
-    )
-
-
 class MuseSparkOpenRMSNormWeightFirst(nn.Module):
     """``rmsnorm((1 + w) * x, eps)`` with no output gain.
 
@@ -1017,9 +900,6 @@ class MuseSparkOpenRMSNormWeightFirst(nn.Module):
         # cache_derived_state() after the weights land. Non-persistent: it
         # is derived from ``weight`` and must not enter a checkpoint.
         self.register_buffer("_weight_plus_one", None, persistent=False)
-        # Read once, not per call: a forward that consults the environment can
-        # behave differently under CUDA-graph capture than under replay.
-        self._cache_enabled = _frozen_gate_cache_enabled()
 
     def cache_derived_state(self) -> None:
         """Framework post-load stage; see MuseSparkOpenGatedResidual for why."""
@@ -1033,7 +913,7 @@ class MuseSparkOpenRMSNormWeightFirst(nn.Module):
 
     def gain(self) -> torch.Tensor:
         """``1 + w``, cached where it has been refreshed."""
-        if self._weight_plus_one is None or not self._cache_enabled:
+        if self._weight_plus_one is None:
             return self.weight + 1
         return self._weight_plus_one
 
@@ -1079,21 +959,9 @@ class MuseSparkOpenGatedResidual(nn.Module):
         # once the weights are in. Non-persistent: derived, never checkpointed.
         self.register_buffer("_alpha", None, persistent=False)
         self.register_buffer("_beta", None, persistent=False)
-        # Same switch, same reason, as MuseSparkOpenRMSNormWeightFirst: falsy
-        # restores the per-call recompute this cache replaced, so the bit-exact
-        # claim has a control leg inside one process.
-        self._cache_enabled = _frozen_gate_cache_enabled()
-        # Read once here, not per call, which is how MuseSparkOpenAttention takes
-        # its own switch (``self._fuse_qk_norm_rope_gate``). Per call it would
-        # be an environment lookup twice per layer per step, and -- worse -- a
-        # value that could change under a captured CUDA graph, where the arm
-        # recorded at capture is the one that replays no matter what the
-        # variable says afterwards. Fixing it at construction makes the engine's
-        # choice a property of the engine.
-        self._fused_enabled = _fused_residual_enabled()
-        # Same construction-time read, for the same graph-capture reason: the
-        # ordering of the fused next prenorm must not change between capture
-        # and replay.
+        # Read once here, not per call: a value read per call could change
+        # under a captured CUDA graph, where the arm recorded at capture is the
+        # one that replays no matter what the variable says afterwards.
         self._preqkv_norm_fp32 = _preqkv_norm_fp32_residual_enabled()
 
     def _compute_coefficients(self) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -1163,7 +1031,7 @@ class MuseSparkOpenGatedResidual(nn.Module):
         return out
 
     def coefficients(self) -> Tuple[torch.Tensor, torch.Tensor]:
-        if self._alpha is None or not self._cache_enabled:
+        if self._alpha is None:
             return self._compute_coefficients()
         return self._alpha, self._beta
 
@@ -1188,8 +1056,7 @@ class MuseSparkOpenGatedResidual(nn.Module):
         set, all three arms norm the FP32 residual and round once on the output.
         """
         if not (
-            self._fused_enabled
-            and residual.is_cuda
+            residual.is_cuda
             and residual.dtype == torch.float32
             and branch.dtype == torch.bfloat16
             and residual.ndim == 2
@@ -1266,10 +1133,8 @@ class MuseSparkOpenGatedResidual(nn.Module):
         ``1 + w`` for the weight-first FFN one, ``None`` for the weightless
         attention one.
 
-        Everywhere but CUDA -- and anywhere MUSESPARK_OPEN_FUSED_RESIDUAL is set
-        falsy, which is how the A/B gets both arms out of one image -- this is
-        the composition it replaces, spelled out, so the two can be compared
-        directly. ROUNDING-DIFFERENT and declared so
+        Everywhere but CUDA this is the composition it replaces, spelled out,
+        so the two can be compared directly. ROUNDING-DIFFERENT and declared so
         before it was measured: only the variance reduction order changes, at
         ~9e-08 relative, because the kernel reproduces both of the chain's
         intermediate rounds to the activation dtype.
@@ -1298,23 +1163,15 @@ class MuseSparkOpenGatedResidual(nn.Module):
         if num_tokens > 0:
             # Not for num_tokens == 0: that is the routine pad, and reporting it
             # would bury the conditions that actually mean something.
-            #
-            # The switch is reported alongside the involuntary conditions rather
-            # than short-circuited quietly above them, because a run that was
-            # left with MUSESPARK_OPEN_FUSED_RESIDUAL=0 set is exactly the false
-            # negative _note_unfused_fallback exists to catch: correct output,
-            # no gain, and the lever priced at zero for the wrong reason.
             _note_unfused_fallback(
                 "gated-residual join",
-                fused_residual_enabled=self._fused_enabled,
                 residual_on_cuda=on_cuda,
                 residual_contiguous=residual_contiguous,
                 branch_contiguous=branch_contiguous,
                 gain_dtype_matches_branch=gain_dtype_ok,
             )
         if not (
-            self._fused_enabled
-            and on_cuda
+            on_cuda
             and num_tokens > 0
             and residual_contiguous
             and branch_contiguous
@@ -1370,31 +1227,41 @@ class MuseSparkOpenLogitsProcessor(LogitsProcessor):
         return self.soft_cap * torch.tanh(logits / self.soft_cap)
 
 
-def _attention_allreduce_strategy() -> AllReduceStrategy:
-    """Strategy for the attention output projection's all-reduce.
+def _allreduce_strategy(model_config: ModelConfig) -> AllReduceStrategy:
+    """The configured all-reduce strategy, with NCCL in place of AUTO.
 
-    NCCL unless MUSESPARK_OPEN_ALLREDUCE names another member of the enum. An
-    unknown name keeps the pin rather than failing engine construction: the
-    variable exists for attribution legs, and a typo in one must not decide
-    correctness.
+    AUTO, the default, fails this model at TP4 on one node in two ways:
+
+    - The attention output projection reduces a tiny message per decode step,
+      and AUTO sends tiny messages down the NCCL symmetric-memory path, which
+      reuses a shared buffer across launches without synchronising: ranks
+      overwrite each other's payload and the layer output comes back
+      non-finite. Argmax over an all-NaN row is index 0, so every request in
+      flight collapses to token 0 at the same engine iteration.
+    - The MoE all-reduce goes through ``tunable_allreduce``, whose autotuner
+      profiles each tactic inside a CUDA-graph capture. The ranks do not enter
+      that capture as one collective, and all of them hang in
+      ``torch.cuda.synchronize()`` during engine warmup.
+
+    An explicit NCCL_SYMMETRIC selects the symmetric-memory path that corrupts
+    the attention output projection's reduce, so it is rejected. Any other
+    strategy is used as configured.
     """
-    name = os.environ.get("MUSESPARK_OPEN_ALLREDUCE", "NCCL").strip().upper() or "NCCL"
-    try:
-        return AllReduceStrategy[name]
-    except KeyError:
-        logger.warning(
-            f"MUSESPARK_OPEN_ALLREDUCE={name!r} is not an all-reduce strategy; "
-            f"keeping NCCL on the attention output projection"
+    strategy = model_config.allreduce_strategy
+    if strategy == AllReduceStrategy.NCCL_SYMMETRIC:
+        raise ValueError(
+            "MuseSparkOpen does not support allreduce_strategy=NCCL_SYMMETRIC: the NCCL "
+            "symmetric-memory all-reduce corrupts the attention output projection's small "
+            "decode-step reduces at TP4. Use NCCL or leave the default (AUTO)."
         )
-        return AllReduceStrategy.NCCL
+    return AllReduceStrategy.NCCL if strategy == AllReduceStrategy.AUTO else strategy
 
 
 def _fused_preattention_enabled() -> bool:
     """Whether attention preprocessing runs as one Triton kernel.
 
-    OFF unless MUSESPARK_OPEN_FUSED_PREATTN names a truthy value. This is the one
-    switch in this file that opts in rather than out, and the asymmetry is the
-    point. Two independent multi-turn canaries on this fusion's own image fail
+    OFF unless MUSESPARK_OPEN_FUSED_PREATTN names a truthy value. Two
+    independent multi-turn canaries on this fusion's own image fail
     the structural check that a streamed answer and an unstreamed one agree:
     at the same serial turn the streamed text is a 105-character prefix of the
     106-character unstreamed one, with a 0.3225 logprob margin at the first
@@ -1409,9 +1276,8 @@ def _fused_preattention_enabled() -> bool:
     reduction order and the output gate's sigmoid, so a difference between them
     is attributable to exactly those two.
 
-    An unrecognized value reads as off. The on-by-default switches spell this
-    the other way round because there a typo costs throughput; here it would
-    hand back the defect.
+    An unrecognized value reads as off: reading a typo as on would hand back
+    the defect.
     """
     return os.environ.get("MUSESPARK_OPEN_FUSED_PREATTN", "0").strip().lower() in (
         "1",
@@ -1499,32 +1365,12 @@ class MuseSparkOpenAttention(QKNormRoPEAttention):
             dtype=config.torch_dtype,
             has_weights=False,
         )
-        # An explicit strategy for the row-parallel output projection's
-        # all-reduce, for the same reason the MoE one above is pinned but a
-        # different failure. `o_proj` takes its strategy from the model config,
-        # which defaults to AUTO. At TP4 on one node a decode step reduces a
-        # tiny message, and AUTO sends tiny messages down the NCCL
-        # symmetric-memory path, which reuses a shared buffer across launches
-        # without synchronising: ranks overwrite each other's payload and the
-        # layer output comes back non-finite. Downstream that is the token-0
-        # collapse -- argmax over an all-NaN row is index 0 -- which is why it
-        # arrives on all four ranks at once, at the same engine iteration for
-        # every request in flight, and only when the batch (and so the message)
-        # is small.
-        #
-        # Measured on the concurrency gate, one variable, same node, same
-        # session: AUTO failed with non-finite decode steps on nearly every
-        # prompt, NCCL passed. Candidate identified by an independent
-        # investigation; the symmetric-memory corruption itself is
-        # filed as a follow-up rather than fixed here.
-        #
-        # MUSESPARK_OPEN_ALLREDUCE names a different strategy for one run --
-        # `AUTO` restores the racy default, which is what a control leg needs
-        # in order to reproduce the fault at all.
+        # `o_proj` builds its all-reduce with the configured strategy as is;
+        # rebuild it so AUTO becomes NCCL (see _allreduce_strategy).
         if self.o_proj.all_reduce is not None:
             self.o_proj.all_reduce = AllReduce(
                 mapping=self.o_proj.mapping,
-                strategy=_attention_allreduce_strategy(),
+                strategy=_allreduce_strategy(model_config),
                 dtype=self.o_proj.dtype,
             )
 
@@ -1779,8 +1625,6 @@ class MuseSparkOpenMoE(nn.Module):
         self._prepare_stream = aux_stream
         self.post_expert_norm_eps = config.rms_post_norm_eps
         self.register_buffer("_pre_expert_quant_gain", None, persistent=False)
-        # Resolved once, before warmup and any graph capture.
-        self._pre_expert_quant_fused = _fused_pre_expert_quant_enabled()
         # Weight-first post-expert norm, applied per selected expert output.
         self.post_expert_norm_weight = nn.Parameter(
             torch.zeros(self.expert_hidden_size, dtype=config.torch_dtype), requires_grad=False
@@ -1860,14 +1704,11 @@ class MuseSparkOpenMoE(nn.Module):
         # strategy for another, never between None and a strategy.
         if getattr(self.experts, "comm", None) is not None:
             self.experts.unfinalized_combine_fn = self.finalize
-        # An explicit strategy, not the AUTO default. AUTO routes through
-        # `torch.ops.trtllm.tunable_allreduce`, whose autotuner profiles each
-        # tactic inside a `torch.cuda.graph` capture; at TP4 every rank hung in
-        # `torch.cuda.synchronize()` inside that capture during engine warmup,
-        # because the ranks do not enter it as one collective. Pinning the
-        # strategy skips the tunable path. Worth revisiting after bring-up:
-        # this is a throughput question, not a correctness one.
-        self.all_reduce = AllReduce(mapping=self.mapping, strategy=AllReduceStrategy.NCCL)
+        # NCCL in place of AUTO keeps warmup off the tunable all-reduce
+        # (see _allreduce_strategy).
+        self.all_reduce = AllReduce(
+            mapping=self.mapping, strategy=_allreduce_strategy(model_config)
+        )
 
         self.nvtx = LayerNvtx(
             "moe",
@@ -2007,8 +1848,7 @@ class MuseSparkOpenMoE(nn.Module):
         """
         backend = getattr(self.experts, "backend", self.experts)
         if (
-            not getattr(self, "_pre_expert_quant_fused", True)
-            or not pooled.is_cuda
+            not pooled.is_cuda
             or pooled.dtype != torch.bfloat16
             or torch.compiler.is_compiling()
             or getattr(self.experts, "comm", None) is not None
@@ -2459,9 +2299,6 @@ def _build_finalize_ar_workspace(
     a property of the deployment, so it must degrade
     to the unfused finalize + AllReduce path instead of failing model init.
     """
-    if not _fused_finalize_ar_enabled():
-        return None
-
     from .musespark_open_finalize_ar import HAS_CUTEDSL, FinalizeIpcWorkspace
 
     if not HAS_CUTEDSL:

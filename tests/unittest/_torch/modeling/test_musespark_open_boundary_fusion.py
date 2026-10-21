@@ -39,8 +39,7 @@ def _case(tokens, hidden):
 @pytest.mark.parametrize("with_gain", [False, True])
 @pytest.mark.parametrize("tokens", [1, 2, 16, 128, 8192])
 @pytest.mark.parametrize("hidden", [256, 8192])
-def test_boundary_fusion_preserves_residual_and_prenorm(tokens, hidden, with_gain, monkeypatch):
-    monkeypatch.setenv("MUSESPARK_OPEN_FUSED_RESIDUAL", "1")
+def test_boundary_fusion_preserves_residual_and_prenorm(tokens, hidden, with_gain):
     with torch.inference_mode():
         residual, branch, gate, norm = _case(tokens, hidden)
         gain = (
@@ -63,8 +62,7 @@ def test_boundary_fusion_preserves_residual_and_prenorm(tokens, hidden, with_gai
         assert relative_l2 < 1e-3
 
 
-def test_boundary_fusion_graph_replay(monkeypatch):
-    monkeypatch.setenv("MUSESPARK_OPEN_FUSED_RESIDUAL", "1")
+def test_boundary_fusion_graph_replay():
     with torch.inference_mode():
         residual, branch, gate, norm = _case(2, 8192)
         gate._add_after_rmsnorm_and_norm(residual, branch, 1e-5, norm)

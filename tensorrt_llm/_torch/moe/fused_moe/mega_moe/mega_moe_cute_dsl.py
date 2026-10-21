@@ -605,15 +605,17 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         # byte-identical to a build without this knob.
         self.deferred_finalize = os.environ.get("MEGAMOE_DEFERRED_FINALIZE", "0") == "1"
 
-        # topk-score application point; an internal backend constant, not a
-        # MoeConfig field. The default folds the topk score into the SwiGLU
-        # output before the fc1-out NVFP4 quant (the pre-quantization route
-        # the default path was qualified with). Deferred finalize MUST take
-        # the post-FC2 route instead: a model finalize that is not
-        # scale-covariant (RMSNorm is scale-invariant) would erase a routing
-        # weight folded upstream, so the weight has to be applied after the
-        # model's per-expert transform.
-        self.apply_topk_in_fc1 = not self.deferred_finalize
+        # DeepSeek V4 and V4.1 apply routing weights before FC2 input
+        # quantization; other models apply them after FC2. Deferred finalize
+        # takes the post-FC2 route for every model: a model finalize that is
+        # not scale-covariant (RMSNorm is scale-invariant) would erase a
+        # routing weight folded upstream, so the weight has to be applied
+        # after the model's per-expert transform.
+        architectures = getattr(model_config.pretrained_config, "architectures", None) or ()
+        self.apply_topk_in_fc1 = not self.deferred_finalize and any(
+            architecture in ("DeepseekV4ForCausalLM", "DeepseekV41ForCausalLM")
+            for architecture in architectures
+        )
         self._topk_idx_dtype = torch.int32 if get_sm_version() == 107 else torch.int64
 
         # Cross-rank combine wire format is selected with

@@ -143,7 +143,6 @@ def test_cluster_boundary_side_stream_and_gate_cache(
 ) -> None:
     if torch.cuda.device_count() <= device_index:
         pytest.skip("Second GPU unavailable")
-    monkeypatch.setenv("MUSESPARK_OPEN_FROZEN_GATE_CACHE", str(int(cache_enabled)))
     with torch.cuda.device(device_index):
         stream = torch.cuda.Stream()
         with torch.cuda.stream(stream):
@@ -152,7 +151,9 @@ def test_cluster_boundary_side_stream_and_gate_cache(
             gain = torch.ones(8192, device="cuda", dtype=torch.bfloat16)
             gate = MuseSparkOpenGatedResidual(8192, torch.bfloat16).cuda()
             gate.gate.normal_(0, 0.5)
-            gate.cache_derived_state()
+            if cache_enabled:
+                # Uncached, the coefficients are recomputed from the live gate.
+                gate.cache_derived_state()
             norm = RMSNorm(hidden_size=8192, eps=1e-5, dtype=torch.bfloat16, use_gemma=True).cuda()
             norm.weight.normal_(0, 0.02)
             gate._add_after_rmsnorm_and_norm(residual, branch, 1e-5, norm, gain)

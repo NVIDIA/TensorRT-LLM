@@ -19,10 +19,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from tensorrt_llm._torch.models.modeling_musespark_open import (
-    MuseSparkOpenMoE,
-    _fused_pre_expert_quant_enabled,
-)
+from tensorrt_llm._torch.models import modeling_musespark_open
+from tensorrt_llm._torch.models.modeling_musespark_open import MuseSparkOpenMoE
 from tensorrt_llm._torch.modules.fused_ops.rmsnorm_fp4_quant import rmsnorm_fp4_quant_available
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm._torch.moe.fused_moe.moe_op_backend import TRTLLMOpBackend
@@ -34,8 +32,6 @@ def _module(device, comm=None):
     module = MuseSparkOpenMoE.__new__(MuseSparkOpenMoE)
     torch.nn.Module.__init__(module)
     module.register_buffer("_pre_expert_quant_gain", None, persistent=False)
-    # Mirrors __init__: the opt-out switch is resolved once at construction.
-    module._pre_expert_quant_fused = _fused_pre_expert_quant_enabled()
     module.pre_expert_norm = RMSNorm(
         hidden_size=4096, eps=1e-5, dtype=torch.bfloat16, device=device, use_gemma=True
     )
@@ -79,17 +75,17 @@ def test_pre_expert_quant_unsupported_consumers(reason):
     not torch.cuda.is_available() or not rmsnorm_fp4_quant_available(),
     reason="CUDA and FlashInfer fused norm/quantization required",
 )
-def test_pre_expert_quant_env_opt_out(monkeypatch):
-    """MUSESPARK_OPEN_FUSED_PRE_EXPERT_QUANT=0 keeps the unfused norm on a
-    configuration where the fused path would otherwise engage."""
+def test_pre_expert_quant_without_fused_kernel_keeps_the_norm(monkeypatch):
+    """Without the fused norm/quantization kernel, a configuration where the
+    fused path would otherwise engage keeps the unfused norm."""
     with torch.inference_mode():
         module = _module("cuda")
         x = torch.randn(2, 4096, device="cuda", dtype=torch.bfloat16)
         assert isinstance(module.prepare_expert_input(x), Fp4QuantizedTensor)
-        monkeypatch.setenv("MUSESPARK_OPEN_FUSED_PRE_EXPERT_QUANT", "0")
-        opted_out = _module("cuda")
-        torch.testing.assert_close(opted_out.prepare_expert_input(x), opted_out.pre_expert_norm(x))
-        assert opted_out._pre_expert_quant_gain is None
+        monkeypatch.setattr(modeling_musespark_open, "rmsnorm_fp4_quant_available", lambda: False)
+        unfused = _module("cuda")
+        torch.testing.assert_close(unfused.prepare_expert_input(x), unfused.pre_expert_norm(x))
+        assert unfused._pre_expert_quant_gain is None
 
 
 @pytest.mark.skipif(

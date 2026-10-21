@@ -1161,99 +1161,86 @@ def test_fused_residual_join_at_the_checkpoint_width(tokens):
         torch.testing.assert_close(fused, reference, rtol=2e-5, atol=2e-5)
 
 
-@pytest.mark.parametrize("value", ["0", "false", "off", "No"])
-def test_fused_residual_switch_off_takes_the_composition(monkeypatch, value):
-    """MUSESPARK_OPEN_FUSED_RESIDUAL=<falsy> must route both sides to the chain.
-
-    This is the lever's control leg, and it exists so the A/B runs on ONE image:
-    without it the only way to time a layer without this fusion is a second
-    build, and two images differ by more than the lever under test.
+def test_residual_join_off_cuda_takes_the_composition():
+    """Off CUDA the join is the composition it replaces, to the last bit.
 
     Bit-exact equality with the composition IS the proof the kernel did not run,
     for the same reason the mismatched-gain test relies on it: the kernel
     reduces the variance in a different order and so cannot land on the torch
-    result to the last bit. Asserting only "close" would pass just as well with
-    the switch ignored entirely.
+    result to the last bit.
     """
     hidden, eps, tokens = 256, 1e-6, 8
-    monkeypatch.setenv("MUSESPARK_OPEN_FUSED_RESIDUAL", value)
-    residual, branch, _ = _residual_join_case(tokens, hidden, torch.bfloat16)
-    gen = torch.Generator(device=DEVICE).manual_seed(3)
-    off = MuseSparkOpenGatedResidual(hidden, torch.bfloat16).to(DEVICE)
+    gen = torch.Generator().manual_seed(3)
+    residual = torch.randn(tokens, hidden, generator=gen, dtype=torch.float32)
+    branch = torch.randn(tokens, hidden, generator=gen, dtype=torch.float32).to(torch.bfloat16)
+    gate = MuseSparkOpenGatedResidual(hidden, torch.bfloat16)
     with torch.no_grad():
-        off.gate.normal_(0, 0.5, generator=gen)
-    off.cache_derived_state()
-    assert off._fused_enabled is False
+        gate.gate.normal_(0, 0.5, generator=gen)
+    gate.cache_derived_state()
 
-    norm = MuseSparkOpenRMSNormWeightFirst(hidden, eps, torch.bfloat16).to(DEVICE)
+    norm = MuseSparkOpenRMSNormWeightFirst(hidden, eps, torch.bfloat16)
     with torch.no_grad():
-        norm.weight.normal_(0, 0.3)
+        norm.weight.normal_(0, 0.3, generator=gen)
     norm.cache_derived_state()
 
+    def weightless_norm(x):
+        x = x.to(torch.float32)
+        return (x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps)).to(torch.bfloat16)
+
     # Both sides of the layer: weight-first (FFN) and weightless (attention).
-    from tensorrt_llm._torch.modules.rms_norm import RMSNorm
-
-    weightless_norm = RMSNorm(
-        hidden_size=hidden, eps=eps, dtype=torch.bfloat16, has_weights=False
-    ).to(DEVICE)
     for gain, reference_norm in ((norm.gain(), norm), (None, weightless_norm)):
-        got = off.add_after_rmsnorm(residual, branch, eps, gain)
-        torch.testing.assert_close(got, off(residual, reference_norm(branch)), atol=0, rtol=0)
+        got = gate.add_after_rmsnorm(residual, branch, eps, gain)
+        torch.testing.assert_close(got, gate(residual, reference_norm(branch)), atol=0, rtol=0)
 
 
-# The next three run on BOTH cpu and DEVICE. The property they assert -- that a
-# switch read once in __init__ selects the arm it names, and that the two arms of
-# a change declared BIT-EXACT agree to the last bit -- has no device-dependent
-# part in principle, and an earlier revision ran them on cpu alone for that
-# reason. It is still the wrong choice here: these are the pass evidence for two
-# bit-exact claims on a path that only ever executes on a GPU, and a claim about
-# GPU arithmetic proved on cpu is proved somewhere else. Reduction order is
-# exactly what differs between the two backends, so the cpu leg cannot see a
-# regression that appears only in a cuda kernel. Keeping the cpu leg as well
-# costs milliseconds and keeps the switch itself checkable on a machine with no
-# GPU.
+# The next three run on BOTH cpu and DEVICE. The property they assert -- that
+# the two arms of a change declared BIT-EXACT agree to the last bit -- has no
+# device-dependent part in principle, and an earlier revision ran them on cpu
+# alone for that reason. It is still the wrong choice here: these are the pass
+# evidence for two bit-exact claims on a path that only ever executes on a GPU,
+# and a claim about GPU arithmetic proved on cpu is proved somewhere else.
+# Reduction order is exactly what differs between the two backends, so the cpu
+# leg cannot see a regression that appears only in a cuda kernel. Keeping the
+# cpu leg as well costs milliseconds and keeps both arms checkable on a machine
+# with no GPU.
 
 
 @pytest.mark.parametrize("device", ["cpu", DEVICE])
-@pytest.mark.parametrize("value", ["0", "false", "off", "No"])
-def test_frozen_gate_cache_switch_off_recomputes_and_matches_the_cache(monkeypatch, value, device):
-    """MUSESPARK_OPEN_FROZEN_GATE_CACHE=<falsy> must recompute, identically.
+def test_frozen_gate_cache_matches_the_recompute(device):
+    """The cached constants equal the per-call recompute, to the last bit.
 
-    Sub-item 1a hoists constants derived from frozen parameters out of the
-    forward. It is declared BIT-EXACT, and bit-exactness can only be shown by
-    running both arms and comparing -- which needs both arms reachable from ONE
-    process, because this build is not greedy-deterministic across server boots
-    and two images therefore cannot answer the question.
+    The cache hoists constants derived from frozen parameters out of the
+    forward, and it is declared BIT-EXACT. Until cache_derived_state() runs --
+    and after a dtype move drops the cache -- every call recomputes, so both
+    arms are reachable from one process.
 
-    Equality is asserted at atol=0, rtol=0 on purpose. "Close" would pass with
-    the switch ignored entirely, which is the failure this test exists to catch.
+    Equality is asserted at atol=0, rtol=0 on purpose. "Close" would pass with a
+    cache that rounds differently, which is the failure this test exists to catch.
     """
-    monkeypatch.setenv("MUSESPARK_OPEN_FROZEN_GATE_CACHE", value)
     hidden = 128
 
     norm = MuseSparkOpenRMSNormWeightFirst(hidden, 1e-6, torch.float32).to(device)
     with torch.no_grad():
         norm.weight.normal_(0, 0.3)
+    assert norm._weight_plus_one is None
+    recomputed_gain = norm.gain()
     norm.cache_derived_state()
-    assert norm._cache_enabled is False
-    assert norm._weight_plus_one is not None, "the cache is filled; the switch must bypass it"
-    torch.testing.assert_close(norm.gain(), norm.weight + 1, atol=0, rtol=0)
+    torch.testing.assert_close(norm.gain(), recomputed_gain, atol=0, rtol=0)
 
     gated = MuseSparkOpenGatedResidual(hidden, torch.float32).to(device)
     with torch.no_grad():
         gated.gate.normal_(0, 0.5)
+    assert gated._alpha is None
+    recomputed_alpha, recomputed_beta = gated.coefficients()
     gated.cache_derived_state()
-    assert gated._cache_enabled is False
-    assert gated._alpha is not None
     alpha, beta = gated.coefficients()
-    recomputed_alpha, recomputed_beta = gated._compute_coefficients()
     torch.testing.assert_close(alpha, recomputed_alpha, atol=0, rtol=0)
     torch.testing.assert_close(beta, recomputed_beta, atol=0, rtol=0)
 
 
 @pytest.mark.parametrize("device", ["cpu", DEVICE])
-def test_frozen_gate_cache_default_on_uses_the_cached_tensors(device):
-    """Unset means cached, and cached means the buffer itself, not a copy.
+def test_frozen_gate_cache_returns_the_cached_tensors(device):
+    """Cached means the buffer itself, not a copy.
 
     Identity rather than equality: the point of the hoist is that the forward
     stops launching the sigmoid/sigmoid/multiply/clamp/sqrt chain, and a value
@@ -1264,7 +1251,6 @@ def test_frozen_gate_cache_default_on_uses_the_cached_tensors(device):
     with torch.no_grad():
         norm.weight.normal_(0, 0.3)
     norm.cache_derived_state()
-    assert norm._cache_enabled is True
     assert norm.gain() is norm._weight_plus_one
 
     gated = MuseSparkOpenGatedResidual(hidden, torch.float32).to(device)
@@ -1276,24 +1262,17 @@ def test_frozen_gate_cache_default_on_uses_the_cached_tensors(device):
 
 
 @pytest.mark.parametrize("device", ["cpu", DEVICE])
-@pytest.mark.parametrize("value,expected_passes", [(None, 1), ("1", 1), ("0", 2), ("off", 2)])
-def test_routing_memo_switch_controls_the_duplicate_pass(
-    monkeypatch, value, expected_passes, device
-):
-    """MUSESPARK_OPEN_ROUTING_MEMO=<falsy> must route the second call to a recompute.
+@pytest.mark.parametrize("clear_memo,expected_passes", [(False, 1), (True, 2)])
+def test_routing_memo_skips_the_duplicate_pass(clear_memo, expected_passes, device):
+    """The second call on the same logits reuses the first result.
 
-    Sub-item 1b removes the duplicated routing pass by memoizing the first
-    result on the identity of the logits tensor. Also declared BIT-EXACT, and
-    the assertion that makes that claim testable is here: with the memo OFF the
+    The memo removes the duplicated routing pass by memoizing the first result
+    on the identity of the logits tensor. It is declared BIT-EXACT, and the
+    assertion that makes that claim testable is here: with the memo cleared the
     second pass really recomputes, and it lands on the same tensors to the last
-    bit. Counting the recomputes is what separates "the switch works" from "the
-    switch is ignored and both calls happened to agree".
+    bit. Counting the recomputes is what separates "the memo works" from "both
+    calls recomputed and happened to agree".
     """
-    if value is None:
-        monkeypatch.delenv("MUSESPARK_OPEN_ROUTING_MEMO", raising=False)
-    else:
-        monkeypatch.setenv("MUSESPARK_OPEN_ROUTING_MEMO", value)
-
     calls = []
 
     class CountingRouting(MuseSparkOpenRoutingMethod):
@@ -1315,6 +1294,8 @@ def test_routing_memo_switch_controls_the_duplicate_pass(
     logits = torch.randn(4, 8, generator=torch.Generator().manual_seed(11)).to(device)
 
     first_selected, first_weights = router.apply(logits)
+    if clear_memo:
+        router.clear_routing_memo()
     second_selected, second_weights = router.apply(logits)
 
     assert len(calls) == expected_passes
@@ -1322,10 +1303,10 @@ def test_routing_memo_switch_controls_the_duplicate_pass(
     torch.testing.assert_close(second_weights, first_weights, atol=0, rtol=0)
 
 
-def test_fused_residual_switch_default_on_agrees_with_the_switch_off():
-    """Unset means fused, and the two arms differ only by the reduction order.
+def test_fused_residual_join_differs_from_the_composition_only_by_reduction_order():
+    """The kernel and the composition differ only by the reduction order.
 
-    The bound is the lever's declared contract, not a shrug: the kernel
+    The bound is the fusion's declared contract, not a shrug: the kernel
     reproduces both of the chain's rounds to the activation dtype -- the gain
     product before the variance and the norm result before the gated add -- so
     the variance reduction order is the only arithmetic left that can differ.
@@ -1334,57 +1315,24 @@ def test_fused_residual_switch_default_on_agrees_with_the_switch_off():
     would be MORE accurate than the chain and would blow through it.
     """
     hidden, eps, tokens = 8192, 1e-6, 4
-    residual, branch, _ = _residual_join_case(tokens, hidden, torch.bfloat16)
+    residual, branch, gate = _residual_join_case(tokens, hidden, torch.bfloat16, seed=3)
     norm = MuseSparkOpenRMSNormWeightFirst(hidden, eps, torch.bfloat16).to(DEVICE)
     with torch.no_grad():
         norm.weight.normal_(0, 0.3)
     norm.cache_derived_state()
 
-    def build(env_value):
-        gen = torch.Generator(device=DEVICE).manual_seed(3)
-        with pytest.MonkeyPatch.context() as patch:
-            if env_value is None:
-                patch.delenv("MUSESPARK_OPEN_FUSED_RESIDUAL", raising=False)
-            else:
-                patch.setenv("MUSESPARK_OPEN_FUSED_RESIDUAL", env_value)
-            gate = MuseSparkOpenGatedResidual(hidden, torch.bfloat16).to(DEVICE)
-        with torch.no_grad():
-            gate.gate.normal_(0, 0.5, generator=gen)
-        gate.cache_derived_state()
-        return gate
+    def weightless_norm(x):
+        x = x.to(torch.float32)
+        return (x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps)).to(torch.bfloat16)
 
-    on, off = build(None), build("0")
-    assert (on._fused_enabled, off._fused_enabled) == (True, False)
-
-    for gain in (norm.gain(), None):
-        fused = on.add_after_rmsnorm(residual, branch, eps, gain)
-        unfused = off.add_after_rmsnorm(residual, branch, eps, gain)
+    for gain, reference_norm in ((norm.gain(), norm), (None, weightless_norm)):
+        fused = gate.add_after_rmsnorm(residual, branch, eps, gain)
+        unfused = gate(residual, reference_norm(branch))
         max_abs = (fused - unfused).abs().max().item()
         scale = unfused.abs().max().item()
-        print(f"switch gain={gain is not None} max_abs={max_abs:.3e} rel={max_abs / scale:.3e}")
+        print(f"gain={gain is not None} max_abs={max_abs:.3e} rel={max_abs / scale:.3e}")
         assert torch.isfinite(fused).all()
         assert max_abs < 1e-6 * scale
-
-
-def test_fused_residual_switch_is_read_once_at_construction():
-    """The engine's choice is fixed when the module is built, not per call.
-
-    Per call it would be an environment lookup twice per layer per step, and --
-    the reason that matters rather than just being slow -- a value that could
-    change under a captured CUDA graph, where the arm recorded at capture is the
-    one that replays whatever the variable says afterwards. A test that only
-    checked the OFF path would not notice the difference.
-    """
-    hidden = 128
-    with pytest.MonkeyPatch.context() as patch:
-        patch.setenv("MUSESPARK_OPEN_FUSED_RESIDUAL", "0")
-        gate = MuseSparkOpenGatedResidual(hidden, torch.bfloat16).to(DEVICE)
-    assert gate._fused_enabled is False
-
-    with pytest.MonkeyPatch.context() as patch:
-        patch.setenv("MUSESPARK_OPEN_FUSED_RESIDUAL", "1")
-        assert gate._fused_enabled is False
-        assert MuseSparkOpenGatedResidual(hidden, torch.bfloat16)._fused_enabled is True
 
 
 def test_causal_lm_is_a_one_engine_speculative_model():
