@@ -15,8 +15,10 @@
 #       --mode dep16|tep16|tep8 --model PATH --image PATH \
 #       [--repo PATH] [--concurrencies "16 32 64"] [--isl N] [--osl N] [--tag NAME]
 #
-# Submit ALL jobs of a comparison batch at the same time so one job's weight
-# load does not overlap another job's measurement window.
+# Submitting comparison jobs together does not guarantee phase alignment.
+# Slurm may start each allocation at a different time. Use cluster-specific
+# coordination when the comparison requires non-overlapping load and
+# measurement phases.
 #
 # The #SBATCH partition and account below are placeholders — edit them or
 # override on the sbatch command line (sbatch --partition=... --account=...).
