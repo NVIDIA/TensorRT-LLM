@@ -1182,3 +1182,44 @@ def test_confidence_state_is_absent_when_scheduling_is_disabled():
     assert worker.staged_confidence_buffer() is None
     assert worker.confidence_stamp_buffer() is None
     assert worker.verify_planner is None
+
+
+def test_prepare_does_not_synchronize_the_stream():
+    """prepare() runs on the host while the previous iteration's graph is still
+    executing under the overlap scheduler, so it must not synchronize the stream.
+
+    Covers the per-iteration scratch-row reset, a finished request's slot release
+    and a new generation request's slot assignment.
+    """
+    from tensorrt_llm._utils import prefer_pinned
+
+    if not prefer_pinned():
+        pytest.skip("pageable host copies synchronize by design without pinned memory")
+    worker = _make_worker()
+    meta = _make_metadata(max_num_requests=4)
+    worker._lazy_init(_fake_draft_model(), meta)
+    meta._dspark_worker = worker
+
+    stale = worker._assign_slot(100, reset=True)
+    worker._assign_slot(101, reset=True)
+    scratch = worker._scratch_slot
+    for slot in (stale, scratch):
+        worker._ctx_len[slot] = 17
+        worker._valid_len[slot] = 8
+        worker._position_initialized[slot] = True
+    torch.cuda.synchronize()
+
+    meta.request_ids = [101, 102]
+    meta.num_generations = 2
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        meta.prepare()
+    finally:
+        torch.cuda.set_sync_debug_mode("default")
+
+    assert 100 not in worker._req_to_slot
+    fresh = worker._req_to_slot[102]
+    for slot in (stale, scratch, fresh):
+        assert int(worker._ctx_len[slot]) == 0
+        assert int(worker._valid_len[slot]) == 0
+        assert not bool(worker._position_initialized[slot])
