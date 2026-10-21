@@ -95,11 +95,13 @@ def test_linear_output_slice(backend, bias, start, end):
 @pytest.mark.parametrize("start,end", [(0, 576), (576, 1152), (513, 1107)])
 @torch.inference_mode()
 def test_kimi_fp8_output_slice(start, end):
-    from tensorrt_llm._torch.models.modeling_kimi_linear import _Fp8BlockScaleWeightReadLinear
+    from tensorrt_llm._torch.modules.fp8_block_scale_weight_read_linear import (
+        Fp8BlockScaleWeightReadLinear,
+    )
 
     backend = "fp8_cute" if get_sm_version() == 107 else "fp8_deepgemm"
     linear, _ = _make_linear(backend, False)
-    projection = _Fp8BlockScaleWeightReadLinear(
+    projection = Fp8BlockScaleWeightReadLinear(
         linear.weight.detach(), linear.weight_scale.detach(), linear.out_features
     )
     inputs = torch.randn(2, 17, linear.in_features, dtype=torch.bfloat16, device="cuda")
@@ -235,16 +237,16 @@ def test_fp8_block_scale_low_m_dispatch_uses_full_weight_only(monkeypatch):
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("rubin", [False, True])
 def test_kimi_fp8_low_m_dispatch_uses_full_weight_only(monkeypatch, rubin):
-    from tensorrt_llm._torch.models import modeling_kimi_linear as kimi_module
+    from tensorrt_llm._torch.modules import fp8_block_scale_weight_read_linear as weight_read
 
-    monkeypatch.setattr(kimi_module, "_rubin_mxfp8_is_available", lambda: rubin)
+    monkeypatch.setattr(weight_read, "_rubin_mxfp8_is_available", lambda: rubin)
     weight = torch.empty((256, 128), dtype=torch.float8_e4m3fn)
     scale = (
         torch.empty((256 * 4,), dtype=torch.uint8)
         if rubin
         else torch.empty((256, 1), dtype=torch.int32)
     )
-    projection = kimi_module._Fp8BlockScaleWeightReadLinear(weight, scale, 256)
+    projection = weight_read.Fp8BlockScaleWeightReadLinear(weight, scale, 256)
     projection._low_m = Fp8BlockScaleLowMGemmRange(max_m=32)
     projection._low_m_weight_scale = torch.empty((256, 1), dtype=torch.int32)
     calls = []

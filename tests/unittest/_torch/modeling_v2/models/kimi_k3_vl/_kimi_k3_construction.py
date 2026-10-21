@@ -10,7 +10,7 @@ import types
 import pytest
 import torch
 
-from tensorrt_llm._torch.models import modeling_kimi_linear as shared
+from tensorrt_llm._torch.models.modeling_kimi_k3_loader import _K3ExpertCkptSpec
 from tensorrt_llm._torch.speculative.dspark import DSparkWorker
 from tensorrt_llm.functional import AllReduceStrategy
 from tensorrt_llm.quantization.mode import QuantAlgo
@@ -49,7 +49,7 @@ def sm_100(monkeypatch):
 def check_expert_ckpt_spec_meets_the_shared_loader_contract(modeling):
     """The routed experts' checkpoint spec of a target's ``modeling`` module against the shared loader."""
     spec = modeling._k3_expert_ckpt_spec(QuantAlgo.W4A8_MXFP4_MXFP8)
-    assert set(shared._K3ExpertCkptSpec._fields) <= set(spec._fields)
+    assert set(_K3ExpertCkptSpec._fields) <= set(spec._fields)
     assert tuple(spec.optional_suffixes) == ()
 
     loaded = {}
