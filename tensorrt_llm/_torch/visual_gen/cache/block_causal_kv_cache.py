@@ -18,10 +18,34 @@ One rollout is one logical sequence laid out as
 
     [ fixed region | rolling history | staged tokens ]
 
-held in a single pool of ``KVCacheManagerV2``. The manager provides the pool
-and the pages; this class owns the page table and the sliding window. Nothing
-here uses the manager's own sliding-window eviction, page reuse, or request
-scheduling, and no ``LlmRequest`` is ever created.
+held in a single pool of ``KVCacheManagerV2``. The manager allocates the pages;
+the page table, the sliding window and the fixed region are this class's own.
+
+Taken from V2:
+
+- the pool and its pages: one sequence (``_create_kv_cache(is_dummy=True)``)
+  resized to cover the whole pool;
+- the per-layer views of the pool (``get_buffers``, the page index scale,
+  ``kv_offset``);
+- the attributes the TRTLLM attention op reads through its ``kv_cache_manager``
+  (pool pointers and pool mapping, ``layer_offsets``, ``tokens_per_block``,
+  ``max_seq_len``), with ``copy_batch_block_offsets`` overridden to hand it each
+  causal block's page list.
+
+Switched off: page reuse (``enable_block_reuse=False``, ``stop_committing()``),
+request scheduling (no ``LlmRequest`` is created), the host tier
+(``host_cache_size=0``) and V2's own sliding window (its window is the whole pool).
+
+Why the window is not V2's:
+
+- V2's window is per query token over absolute page ordinals, and the kernel
+  masks it; here all queries of a causal block share one window start and attend
+  fully within the causal block.
+- The PyTorch path has no attention sinks (V2 builds its layers with
+  ``num_sink_tokens=None``; ``sink_token_length`` is ignored), hence the fixed
+  region.
+- V2's page lists grow with absolute position up to ``max_seq_len``; the rotated
+  page table stays at ``num_pages`` pages.
 
 The fixed region is the first ``pin_tokens`` tokens of the sequence, declared
 by ``open``: every frame sees them for the whole rollout and they are never
