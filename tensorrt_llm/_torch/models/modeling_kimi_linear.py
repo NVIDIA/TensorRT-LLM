@@ -831,6 +831,12 @@ def _rubin_mxfp8_is_available() -> bool:
     return get_sm_version() == 107 and IS_CUTLASS_DSL_RUBIN_AVAILABLE
 
 
+def _low_m_gemm_gated_applies(x: torch.Tensor, gate: torch.Tensor, out_features: int) -> bool:
+    from ..kernels.blackwell import fp8_block_scale_low_m_gemm
+
+    return fp8_block_scale_low_m_gemm.gate_fits(x, gate, out_features)
+
+
 def _low_m_gemm_scale_from_mxfp8(weight_scale: torch.Tensor, n: int, k: int) -> torch.Tensor:
     """The DeepGEMM-packed scale the low-M GEMM reads, from the SM107 CuTe MXFP8 scale."""
     from ..kernels.blackwell import fp8_block_scale_low_m_gemm
@@ -1029,6 +1035,34 @@ class _Fp8BlockScaleWeightReadLinear(nn.Module):
                 fine_grained_m=True,
             )
         return out.reshape(out_shape)
+
+    def forward_gated(self, x: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
+        """``forward(x * gate)``, bit for bit, for an output-gated projection.
+
+        Where :meth:`forward` would run the low-M kernel, one gated launch multiplies inside
+        the GEMM (``gate`` may then be a row-strided BF16 view, see ``check_gate``).
+        """
+        x_flat = x.reshape(-1, x.shape[-1])
+        gate_flat = gate.reshape(x_flat.shape)
+        if self._low_m.serves(x_flat, kernel=True) and _low_m_gemm_gated_applies(
+            x_flat, gate_flat, self.out_features
+        ):
+            out = torch.ops.trtllm.fp8_block_scale_low_m_gemm(
+                x_flat, self.weight, self._low_m_weight_scale, gate=gate_flat
+            )
+            return out.reshape(*x.shape[:-1], self.out_features)
+        return self.forward(x * gate)
+
+    def forward_sigmoid(self, x: torch.Tensor) -> torch.Tensor:
+        """``forward(x).sigmoid()``, bit for bit; one launch where :meth:`forward` would run
+        the low-M kernel."""
+        x_flat = x.reshape(-1, x.shape[-1])
+        if self._low_m.serves(x_flat, kernel=True):
+            out = torch.ops.trtllm.fp8_block_scale_low_m_gemm(
+                x_flat, self.weight, self._low_m_weight_scale, sigmoid=True
+            )
+            return out.reshape(*x.shape[:-1], self.out_features)
+        return self.forward(x).sigmoid()
 
     def forward_prequantized(
         self,
