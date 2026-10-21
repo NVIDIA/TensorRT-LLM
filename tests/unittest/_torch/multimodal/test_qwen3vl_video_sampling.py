@@ -453,3 +453,23 @@ def test_nested_image_and_video_preserve_float_pixel_values(adapter, processor):
     assert result["pixel_values"].mean().item() == pytest.approx(1.0)
     patches = result["pixel_values_videos"].reshape(2, -1, 3, 2, 16, 16)
     assert patches[:, 0, 0, :, 0, 0].flatten().tolist() == pytest.approx([0, 2, 5, 7])
+
+
+@pytest.mark.parametrize("n_decoded", [32, 40])
+@pytest.mark.parametrize("nested", [False, True])
+@pytest.mark.parametrize("do_sample_frames", [None, True, False])
+def test_conflicting_sampling_targets_do_not_depend_on_decoded_count(
+    adapter, processor, n_decoded, nested, do_sample_frames
+):
+    video = _video(np.linspace(0, 239, n_decoded).astype(int).tolist())
+    kwargs = {"num_frames": 40, "fps": 2}
+    if do_sample_frames is not None:
+        kwargs["do_sample_frames"] = do_sample_frames
+    request = {"videos_kwargs": kwargs} if nested else kwargs
+    if do_sample_frames is False:
+        result = _run(adapter, processor, [video], **request)
+        assert result["video_grid_thw"][0, 0].item() == n_decoded // 2
+        assert list(result["video_metadata"][0].frames_indices) == video.metadata["frames_indices"]
+    else:
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            _run(adapter, processor, [video], **request)
