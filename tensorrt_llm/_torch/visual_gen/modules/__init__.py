@@ -37,9 +37,10 @@ def __getattr__(name):
         try:
             from ..attention import attention
         except AttributeError as e:
-            # An AttributeError escaping ``attention`` is a bug inside it, not a
-            # missing name here. Raised as is, hasattr() and ``from ... import``
-            # would swallow it, and from-import would run it again, hiding the cause.
+            # An AttributeError escaping the module is a bug inside it, not a
+            # missing name here. Raised as is, hasattr() and getattr() with a
+            # default would hide it, and ``from ... import`` would run the
+            # module twice (losing the cause unless the name is a submodule).
             raise ImportError(
                 f"cannot import {name!r} from {__name__!r}: importing "
                 f"tensorrt_llm._torch.visual_gen.attention.attention raised {e!r}",
