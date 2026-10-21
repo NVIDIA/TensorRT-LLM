@@ -55,6 +55,8 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.tools.layer_wise_benchmarks import get_calibrator
 from tensorrt_llm.tools.profiler.host_profile_tools.host_profiler import get_global_profiler
 
+from .runtime_hooks import runtime_hooks_of
+
 # Environment-variable names used by both the env-var-driven legacy
 # path and the runtime HTTP-endpoint path. They are duplicated as
 # module-level constants here so callers that only need the manager
@@ -608,6 +610,18 @@ class PyExecutorProfileManager:
         start_event_2 = None
         end_event_2 = torch.cuda.Event(enable_timing=True)
         prev_device_step_time = None
+        # With RuntimeHooks.iteration_timing_one_event, boundary_events[k % 3] marks the boundary before
+        # iteration k, recorded on timing_stream, and replaces the start/end ping-pong above.
+        one_timing_event = runtime_hooks_of(
+            getattr(executor.model_engine, "model", None)
+        ).iteration_timing_one_event
+        boundary_events = (
+            [torch.cuda.Event(enable_timing=True) for _ in range(3)] if one_timing_event else None
+        )
+        boundary_count = 0
+        timing_stream = torch.cuda.Stream() if one_timing_event else None
+        if one_timing_event:
+            logger.info("[M3 host] iteration timing: one side-stream event per iteration boundary")
         # Cumulative fetch counter as of the previous iter log line; the
         # per-iteration ``num_fetched`` on the log line is the delta.
         prev_fetch_requests_cur_rank = 0
@@ -663,6 +677,7 @@ class PyExecutorProfileManager:
             nonlocal it, enabled, start_time
             nonlocal start_event_1, end_event_1, start_event_2, end_event_2
             nonlocal prev_device_step_time, prev_fetch_requests_cur_rank
+            nonlocal boundary_count
             nonlocal torch_profiler, active_torch_trace_path
             nonlocal active_enable_torch_trace
             calibrator.post_step(it)
@@ -718,9 +733,21 @@ class PyExecutorProfileManager:
             # ``self`` lets the /metrics serializer pick up the
             # values without going through the log line.
             should_capture_timing = executor.print_log or executor.enable_iter_perf_stats
+            if should_capture_timing and one_timing_event:
+                # Iteration k - 2 spans the two previous boundaries: the step the ping-pong reports here.
+                timing_stream.wait_stream(torch.cuda.current_stream())
+                boundary_events[boundary_count % 3].record(timing_stream)
+                if boundary_count >= 2:
+                    boundary_events[(boundary_count - 1) % 3].synchronize()
+                    prev_device_step_time = boundary_events[(boundary_count - 2) % 3].elapsed_time(
+                        boundary_events[(boundary_count - 1) % 3]
+                    )
+                boundary_count += 1
             if should_capture_timing and start_time is not None:
                 end_time = time.time()
-                if it % 2 == 0:
+                if one_timing_event:
+                    pass
+                elif it % 2 == 0:
                     end_event_1.record()
                     if start_event_2 is not None:
                         end_event_2.synchronize()
@@ -847,7 +874,7 @@ class PyExecutorProfileManager:
 
             calibrator.pre_step(it)
             start_time = time.time()
-            if should_capture_timing:
+            if should_capture_timing and not one_timing_event:
                 if it % 2 == 0:
                     if start_event_1 is None:
                         start_event_1 = torch.cuda.Event(enable_timing=True)
