@@ -119,7 +119,7 @@ l0_b200:
   # - The other files ignored here have their own entries below.
   - unittest/_torch/attention --ignore=unittest/_torch/attention/sparse/test_cute_dsl_gvr_topk_decode.py --ignore=unittest/_torch/attention/sparse/msa/test_minimax_m3_sparse_attn_decode.py --ignore=unittest/_torch/attention/sparse/msa/test_msa_proxy_split.py --ignore=unittest/_torch/attention/kernels/parallel_hw_agnostic TIMEOUT (90)
   - unittest/_torch/executor/kv_cache/test_mixed_precision_kv_cache.py
-  # Keep cold-JIT MSA coverage out of the 60-minute attention aggregate.
+  # Keep cold-JIT MSA coverage out of the 90-minute attention aggregate.
   # Cold-JIT runs take about 25 minutes; allow a 45-minute budget.
   - unittest/_torch/attention/sparse/msa/test_minimax_m3_sparse_attn_decode.py TIMEOUT (45)
   - unittest/_torch/attention/sparse/msa/test_msa_proxy_split.py
