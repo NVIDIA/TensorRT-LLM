@@ -12,7 +12,10 @@ import pytest
 import torch
 from torch import nn
 
-from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
+from tensorrt_llm._torch.cute_dsl_utils import (
+    IS_CUTLASS_DSL_AVAILABLE,
+    IS_CUTLASS_DSL_RUBIN_AVAILABLE,
+)
 from tensorrt_llm._torch.models import modeling_kimi_linear as mkl
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 
@@ -22,8 +25,11 @@ EPS = 1e-6
 pytestmark = pytest.mark.skipif(
     not IS_CUTLASS_DSL_AVAILABLE
     or not torch.cuda.is_available()
-    or torch.cuda.get_device_capability() not in ((10, 0), (10, 3), (10, 7)),
-    reason="needs an SM100/SM103/SM107 GPU",
+    or not (
+        torch.cuda.get_device_capability() in ((10, 0), (10, 3))
+        or (torch.cuda.get_device_capability() == (10, 7) and IS_CUTLASS_DSL_RUBIN_AVAILABLE)
+    ),
+    reason="needs an SM100/SM103 GPU, or SM107 with a Rubin-capable CuTe DSL",
 )
 
 
