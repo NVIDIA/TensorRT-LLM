@@ -1263,6 +1263,11 @@ _MX_E2E_ROWS = {
         "qwen3-moe",
         "TRTLLM_MX_QWEN3_MOE_MODEL",
     ),
+    "qwen3-for-causal-lm-bf16-tied-target-v1": (
+        "qwen3-tied-bf16",
+        "qwen3-tied",
+        "TRTLLM_MX_QWEN3_TIED_MODEL",
+    ),
 }
 
 
