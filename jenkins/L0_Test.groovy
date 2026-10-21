@@ -471,11 +471,12 @@ def uploadResults(def pipeline, SlurmCluster cluster, String clusterName, String
     }
 }
 
-def runIsolatedTests(pipeline, preprocessedLists, testCmdLine, llmSrc, stageName, postTag="") {
+def runIsolatedTests(pipeline, preprocessedLists, testCmdLine, llmSrc, stageName, postTag="", Map retryContext=null) {
     // Run the isolated tests one by one to avoid any potential conflicts
     def isolateTestList = preprocessedLists.isolate
     def isolateTestLines = readFile(file: isolateTestList).readLines()
     def rerunFailed = false
+    def rerunInfraFailure = null
     def hasUnrerunFailure = false
 
     for (int i = 0; i < isolateTestLines.size(); i++) {
@@ -504,14 +505,15 @@ def runIsolatedTests(pipeline, preprocessedLists, testCmdLine, llmSrc, stageName
         } catch (InterruptedException e) {
             throw e
         } catch (Exception e) {
-            def isRerunFailed = rerunFailedTests(
-                stageName, llmSrc, isolateTestCmdLine, "results_isolated_${i}.xml", "isolated_${i}", postTag)
-            if (isRerunFailed) {
+            def rerunResult = rerunFailedTests(
+                pipeline, stageName, llmSrc, isolateTestCmdLine, "results_isolated_${i}.xml", "isolated_${i}", postTag, retryContext)
+            if (rerunResult.failed) {
                 catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
                     error "Isolated test ${i} (${isolateTestName}) failed after rerun attempt"
                 }
                 // Mark that at least one isolated test failed, but continue processing other tests
                 rerunFailed = true
+                rerunInfraFailure = rerunResult.infraFailure ?: rerunInfraFailure
             } else {
                 // Strip trailing " TIMEOUT (N)" / "TIMEOUT(N)" / " ISOLATION" turtle
                 // directives the same way generate_duration.py's _TURTLE_DIRECTIVE_RE does.
@@ -558,7 +560,11 @@ def runIsolatedTests(pipeline, preprocessedLists, testCmdLine, llmSrc, stageName
         }
     }
 
-    return [rerunFailed: rerunFailed, hasUnrerunFailure: hasUnrerunFailure]
+    return [
+        rerunFailed: rerunFailed,
+        rerunInfraFailure: rerunInfraFailure,
+        hasUnrerunFailure: hasUnrerunFailure,
+    ]
 }
 
 def getInfraDryRunPytestTargets(testListPath) {
@@ -1538,7 +1544,7 @@ def executeLLMTestOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, p
         // TODO: refactor the finallyRunner to reuse within slurm or nonslurm job.
         cacheErrorAndUploadResult(pipeline, stageName, {
             try {
-                runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, skipInstallWheel, cpver, postTag, useClusterDurations)
+                runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, skipInstallWheel, cpver, postTag, useClusterDurations, retryContext)
             } catch (InterruptedException e) {
                 throw e
             } catch (Exception e) {
@@ -4542,8 +4548,10 @@ def fileHasContent(path) {
     return fileExists(path) && readFile(path).trim()
 }
 
-// Return true means the test rerun also fails. Return false otherwise.
-def rerunFailedTests(stageName, llmSrc, testCmdLine, resultFileName="results.xml", testType="regular", postTag="") {
+// Return whether the rerun failed and any typed infra failure classified from
+// the rerun's originating shell step. The typed failure lets the outer retry
+// layer preserve bounded evidence after result/report generation finishes.
+def rerunFailedTests(pipeline, stageName, llmSrc, testCmdLine, resultFileName="results.xml", testType="regular", postTag="", Map retryContext=null) {
     if (!fileExists("${WORKSPACE}/${stageName}/${resultFileName}")) {
         // No results were ever flushed (e.g. the process was killed before any
         // test finished reporting). test_rerun.py treats a missing xml as "no
@@ -4589,6 +4597,7 @@ def rerunFailedTests(stageName, llmSrc, testCmdLine, resultFileName="results.xml
 
     // Rerun tests
     def isRerunFailed = false
+    def rerunInfraFailure = null
     for (times in [1, 2]) {
         def currentRerunTestList = "${rerunDir}/rerun_${times}.txt"
         if (!fileExists(currentRerunTestList)) {
@@ -4654,13 +4663,18 @@ def rerunFailedTests(stageName, llmSrc, testCmdLine, resultFileName="results.xml
                 echo "The ${testType} tests crashed when rerun attempt."
                 throw e
             }
+            String scope = retryContext?.scope ?: InfraFailure.K8S
+            def classified = classifyFailure(pipeline, e, scope, retryContext)
+            if (classified instanceof InfraFailure) {
+                rerunInfraFailure = classified
+            }
             echo "The ${testType} tests still failed after rerun attempt."
             isRerunFailed = true
         }
     }
 
     echo "isRerunFailed for ${testType}: ${isRerunFailed}"
-    return isRerunFailed
+    return [failed: isRerunFailed, infraFailure: rerunInfraFailure]
 }
 
 def generateRerunReport(stageName, llmSrc) {
@@ -5068,7 +5082,7 @@ def priorAttemptTags(String postTag) {
     return priors
 }
 
-def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, skipInstallWheel=false, cpver="cp312", String postTag="", boolean useClusterDurations=false)
+def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, skipInstallWheel=false, cpver="cp312", String postTag="", boolean useClusterDurations=false, Map retryContext=null)
 {
     // Step 1: create LLM_ROOT dir and clean up the workspace
     def llmRootConfig = "${LLM_ROOT}${config}"
@@ -5229,6 +5243,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         def noRegularTests = false
         def noIsolateTests = false
         def rerunFailed = false
+        def rerunInfraFailure = null
         def hasUnrerunFailure = false
         def infraDryRun = isInfraDryRun()
         if (infraDryRun) {
@@ -5419,18 +5434,19 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                     } catch (InterruptedException e) {
                         throw e
                     } catch (Exception e) {
-                        def isRerunFailed = rerunFailedTests(
-                            stageName, llmSrc, pytestCommand, "results.xml", "regular", postTag)
+                        def rerunResult = rerunFailedTests(
+                            pipeline, stageName, llmSrc, pytestCommand, "results.xml", "regular", postTag, retryContext)
                         // Unconditional: a test can crash again during the rerun itself
                         // (isRerunFailed=true), and unfinished_test.txt is the only
                         // record of that crash. junit()'s "results*.xml" glob picks up
                         // results-timeout.xml directly, so this is what surfaces it.
                         def hadUnfinishedTests = generateTimeoutTestResultXml(pipeline, stageName)
-                        if (isRerunFailed) {
+                        if (rerunResult.failed) {
                             catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
                                 error "Regular tests failed after rerun attempt"
                             }
                             rerunFailed = true
+                            rerunInfraFailure = rerunResult.infraFailure ?: rerunInfraFailure
                         } else if (hadUnfinishedTests) {
                             // Rerun passed but the first run had a timeout: mark this
                             // stage FAILURE so "[${stageName}] Run Pytest" turns red,
@@ -5456,8 +5472,9 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                         stage ("[${stageName}] Run Pytest (Isolated)") {
                             echo "There are ${preprocessedLists.isolateCount} isolated tests to run"
                             def isolatedResult = runIsolatedTests(
-                                pipeline, preprocessedLists, pytestCommand, llmSrc, stageName, postTag)
+                                pipeline, preprocessedLists, pytestCommand, llmSrc, stageName, postTag, retryContext)
                             rerunFailed = isolatedResult.rerunFailed || rerunFailed
+                            rerunInfraFailure = isolatedResult.rerunInfraFailure ?: rerunInfraFailure
                             hasUnrerunFailure = isolatedResult.hasUnrerunFailure || hasUnrerunFailure
                         }
                     } else {
@@ -5536,6 +5553,9 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         // Unguarded error() on purpose -- catchError here would swallow the
         // throw that cacheErrorAndUploadResult relies on to fail the build.
         if (rerunFailed) {
+            if (rerunInfraFailure != null) {
+                throw rerunInfraFailure
+            }
             error "Some tests still failed after rerun attempts, please check the test report."
         }
 
@@ -5577,7 +5597,7 @@ def runLLMTestlistOnPlatform(pipeline, platform, testList, config=VANILLA_CONFIG
             "PMIX_HOSTNAME=mpi-node0",
         ]
         withEnv(testEnv) {
-            runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, skipInstallWheel, cpver, postTag, useClusterDurations)
+            runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, skipInstallWheel, cpver, postTag, useClusterDurations, retryContext)
         }
     }, {
         if (testFilter[(DEBUG_MODE)]) {
