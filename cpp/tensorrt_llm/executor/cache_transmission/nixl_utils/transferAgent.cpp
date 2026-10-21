@@ -1234,7 +1234,11 @@ bool NixlTransferAgent::checkRemoteDescs(std::string const& name, MemoryDescs co
 {
     std::shared_lock<std::shared_mutex> lock(mLock);
     TLLM_CHECK_WITH_INFO(!mShutdown.load(), "NixlTransferAgent::checkRemoteDescs called after shutdown");
-    auto status = mRawAgent->checkRemoteMD(name, NixlHelper::convertXferDist(memoryDescs));
+    static VramRegionMap const kEmptyMap;
+    auto const remoteIt = mRemoteVramRegionInfo.find(name);
+    auto const& remoteRegionMap = (remoteIt != mRemoteVramRegionInfo.end()) ? remoteIt->second : kEmptyMap;
+    auto const splitDescs = VmmDescSplitter::splitDescsWithRegionMap(memoryDescs, remoteRegionMap);
+    auto status = mRawAgent->checkRemoteMD(name, NixlHelper::convertXferDist(splitDescs));
     TLLM_CHECK_WITH_INFO(status == NIXL_SUCCESS || status == NIXL_ERR_NOT_FOUND, "checkRemoteMD failed with status: %s",
         nixlEnumStrings::statusStr(status).c_str());
     return status == NIXL_SUCCESS;
