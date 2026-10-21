@@ -68,9 +68,17 @@ its embeddings, so these checkpoints do not match the profile. Phi-3-small
 (`Phi3VForCausalLM`), Phi-3.5-MoE (`PhiMoEForCausalLM`), and
 Phi-4-multimodal (`Phi4MMForCausalLM`, including its quantized variants) use
 other roots. Phi4MM builds a Phi3 language model internally, but qualification
-matches the outer root, so these checkpoints fall back as well. Phi3 also
-records the runtime `max_seq_len` in its model configuration, so a donor and a
-receiver must use the same `max_seq_len` to match in `SourceIdentity`.
+matches the outer root, so these checkpoints fall back as well.
+
+Phi3 has one known limitation. `Phi3Attention.__init__` in
+`tensorrt_llm/_torch/models/modeling_phi3.py` writes the runtime `max_seq_len`
+into the shared pretrained configuration for LongRoPE, and `SourceIdentity`
+hashes that configuration. A donor and a receiver with different `max_seq_len`
+values therefore get different model fingerprints: the receiver logs a
+`SourceIdentity mismatch` warning and falls back to non-shared weight loading,
+even though no transferred weight of a default-RoPE checkpoint depends on the
+value. Until the model code stops recording it, run both sides with the same
+`max_seq_len`.
 
 TensorRT LLM applies two independent compatibility gates:
 

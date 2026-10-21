@@ -857,9 +857,19 @@ def _l0_model_express_case_ids() -> dict[int, list[str]]:
 
 
 def _documented_names(text: str, start: str, end: str) -> set[str]:
-    """Return the leading name of each item enumerated between `start` and `end`."""
-    stop = text.index(end)
-    enumeration = text[text.rindex(start, 0, stop) + len(start) : stop]
+    """Return the leading name of each item enumerated between `start` and `end`.
+
+    A missing anchor fails with its text, so whoever rewords
+    `docs/source/features/model-express.md` knows which anchor to update here.
+    """
+    doc = "docs/source/features/model-express.md"
+    stop = text.find(end)
+    if stop < 0:
+        pytest.fail(f"{doc} no longer contains the anchor {end!r}; update this test's anchors")
+    begin = text.rfind(start, 0, stop)
+    if begin < 0:
+        pytest.fail(f"{doc} has no anchor {start!r} before {end!r}; update this test's anchors")
+    enumeration = text[begin + len(start) : stop]
     return {re.match(r"\w+", item).group() for item in re.split(r",? and |, ", enumeration)}
 
 
@@ -1767,11 +1777,17 @@ def test_phi3_dense_profile_rejects_longrope_and_tied_embedding_variants(
     assert decision.unsupported_runtime_dimensions == frozenset({expected_dimension})
 
 
-def test_phi3_source_identity_binds_runtime_max_seq_len() -> None:
-    """Phi3 donors and receivers with different `max_seq_len` values do not share.
+def test_phi3_runtime_max_seq_len_reaches_model_fingerprint() -> None:
+    """Known limitation: Phi3's runtime `max_seq_len` reaches the model fingerprint.
 
-    `Phi3Attention` records the runtime `max_seq_len` in the pretrained config,
-    which `SourceIdentity` hashes, so a donor and a receiver must agree on it.
+    `Phi3Attention.__init__` in `tensorrt_llm/_torch/models/modeling_phi3.py`
+    writes the runtime `max_seq_len` into the shared pretrained config for
+    LongRoPE, and `SourceIdentity` hashes that config. Donors and receivers with
+    different `max_seq_len` values therefore differ in `model_fingerprint`, even
+    though no default-RoPE weight depends on the value. This test pins current
+    behavior, not a contract: once the model code stops recording the value,
+    update it together with the limitation note in
+    `docs/source/features/model-express.md`.
     """
     identities = []
     for max_seq_len in (16, 32):
@@ -1788,8 +1804,7 @@ def test_phi3_source_identity_binds_runtime_max_seq_len() -> None:
 
     decision = check_weight_sharing_compatibility(*identities, IdentityCheckPolicy.WARN_FALLBACK)
 
-    assert not decision.should_share
-    assert "model_fingerprint" in decision.match_result.mismatched_fields
+    assert decision.match_result.mismatched_fields == ["model_fingerprint"]
 
 
 @pytest.mark.cpu_only
