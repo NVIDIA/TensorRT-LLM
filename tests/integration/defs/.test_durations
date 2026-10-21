@@ -892,7 +892,7 @@
    "perf/test_perf_sanity.py::test_e2e[aggr_upload-gen_only_no_context-gb300_deepseek-v4-pro-fp4_8k1k_con4301_ctx12_dep4_gen1_dep8_eplb384_mtp1_ccb-NIXL]": 1135.0671764705883,
    "perf/test_perf_sanity.py::test_e2e[aggr_upload-gen_only_no_context-gb300_deepseek-v4-pro-fp4_8k1k_con666_ctx6_dep4_gen1_dep16_eplb384_mtp3_ccb-NIXL]": 702.5193333333334,
    "perf/test_perf_sanity.py::test_e2e[aggr_upload-gen_only_no_context-gb300_deepseek-v4-pro-fp4_8k1k_con8_ctx1_dep4_gen4_tep8_eplb0_mtp3_ccb-NIXL]": 532.9006470588236,
-   "perf/test_perf_sanity.py::test_e2e[aggr_upload-gen_only_no_context-gb300_deepseek-v41-flash-fp4-dspark_agentx_con1579_ctx2_dep2_gen1_dep16_eplb0_dspark5_ccb-NIXL]": 4787.0,
+   "perf/test_perf_sanity.py::test_e2e[aggr_upload-gen_only_no_context-gb300_deepseek-v41-flash-fp4-dspark_agentx_con1579_ctx2_dep2_gen1_dep16_eplb0_dspark5_ccb-NIXL]": 2909.0,
    "perf/test_perf_sanity.py::test_e2e[aggr_upload-gen_only_no_context-gb300_glm-5-fp4_8k1k_con1024_ctx1_dep2_gen1_dep8_eplb256_mtp1_ccb-NIXL]": 743.9306315789474,
    "perf/test_perf_sanity.py::test_e2e[aggr_upload-gen_only_no_context-gb300_glm-5-fp4_8k1k_con1_ctx1_dep2_gen1_tep8_eplb0_mtp3_ccb-NIXL]": 1568.1411666666668,
    "perf/test_perf_sanity.py::test_e2e[aggr_upload-gen_only_no_context-gb300_glm-5-fp4_8k1k_con512_ctx1_dep2_gen1_dep32_eplb0_mtp3_ccb-NIXL]": 395.5433333333333,
