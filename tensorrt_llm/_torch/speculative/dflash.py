@@ -1178,8 +1178,7 @@ class DFlashWorker(SpecWorkerBase):
             ):
                 # Gated on the drafter that actually runs the trtllm-gen ops:
                 # one paging its own block decode the same way is not shaped
-                # like them. No non-causal sliding window there either.
-                draft_model.validate_block_attention_windows()
+                # like them.
                 has_context_attention = any(
                     not draft_model._get_attention_mask_args(layer_idx)[0] for layer_idx in range(L)
                 )
