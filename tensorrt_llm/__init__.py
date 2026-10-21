@@ -41,8 +41,11 @@ from typing import TYPE_CHECKING
 # ImportError: libc10.so: cannot open shared object file: No such file or directory
 import torch  # noqa
 
+from ._transformers_serialization import _install_chat_template_guards
 from .logger import logger
 from .version import __version__
+
+_install_chat_template_guards()
 
 if TYPE_CHECKING:
     import tensorrt_llm._torch.models as torch_models
