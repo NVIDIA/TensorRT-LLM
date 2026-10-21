@@ -43,6 +43,11 @@ Mid-M path (``low_m_max_for(N, K) < M <= MAX_M``):
   ``st.async`` into the owner's DSMEM mailbox, and writes BF16 rows through a token-major
   shared staging buffer with 16-byte stores.
 
+Prequantized low-M kernel (:func:`run_low_m_gemm_prequantized`): the low-M kernel on an MXFP8
+activation a producer quantized with the same arithmetic (E4M3 codes and UE8M0 1x32 scales in
+the R128c4 layout, see :func:`mxfp8_quantize_reference`); same tiling, split-K and reduction
+order, so the output is bitwise the low-M kernel's on the BF16 activation.
+
 Low-M kernel variants for output-gated and gate projections, bitwise equal to the separate
 PyTorch ops followed / preceded by the plain kernel at the same tactic:
 
@@ -2228,6 +2233,708 @@ class Fp8BlockScaleMidMGemmKernel:
 
 
 # ---------------------------------------------------------------------------
+# Prequantized low-M path: the low-M kernel on an MXFP8 activation made upstream. ``xq`` E4M3
+# ``[M, K]`` and its UE8M0 1x32 scales in the R128c4 layout arrive by TMA / plain loads after
+# ``griddepcontrol.wait`` (one warp folds the weight block exponents into the activation
+# exponents) instead of BF16 tiles quantized in the kernel. With the low-M kernel's tiling (same
+# ``mma_n`` and split-K), K-tile order, scale folding and split-K reduction order, the output is
+# bitwise the low-M kernel's on the BF16 activation that ``(xq, xs)`` quantizes. Warp roles:
+# 0 weights (releases the dependent grid at once), 1 MMA, 2 E4M3 tiles, 3 scales, 4-7 epilogue
+# (32-column TMEM blocks, ``st.async`` split-K partials into the owner's dead weight ring).
+# ---------------------------------------------------------------------------
+
+_PQ_SF_WARP = 3
+_PQ_EPI_WARP0 = 4
+_PQ_THREADS = 256
+
+
+@dataclasses.dataclass(frozen=True)
+class PrequantizedLowMTactic:
+    """``mma_n`` padded tokens, cluster ``split_k``, weight ring ``a_stages`` and activation
+    ring ``b_stages`` (``b_stages`` = the K tiles of a CTA keeps every activation load in
+    flight)."""
+
+    mma_n: int
+    split_k: int
+    a_stages: int
+    b_stages: int
+
+
+def _prequantized_mailbox_bytes(t: PrequantizedLowMTactic) -> int:
+    if t.split_k == 1:
+        return 0
+    return (t.split_k - 1) * _ceil_div(t.mma_n // 4, t.split_k) * MMA_M * 16
+
+
+def prequantized_smem_bytes(n: int, k: int, t: PrequantizedLowMTactic) -> int:
+    """Conservative host-side mirror of the kernel's shared-memory footprint."""
+    kt_max = _ceil_div(k // CTA_K, t.split_k)
+    a_st = min(t.a_stages, kt_max)
+    b_st = min(t.b_stages, kt_max)
+    total = 8 * (2 * (a_st + b_st) + 5) + 4
+    total = _align_up(total, 1024) + max(a_st * MMA_M * CTA_K, _prequantized_mailbox_bytes(t))
+    total = _align_up(total, 1024) + max(b_st * t.mma_n * CTA_K, t.mma_n * MMA_M * 2)
+    total = _align_up(total, 128) + 512  # SFA (one stage, constant 1.0)
+    total = _align_up(total, 128) + b_st * 512
+    return total + 1024
+
+
+def validate_prequantized_tactic(n: int, k: int, t: PrequantizedLowMTactic) -> None:
+    if t.mma_n not in SUPPORTED_MMA_N:
+        raise ValueError(f"mma_n must be one of {SUPPORTED_MMA_N}, got {t.mma_n}")
+    if n % N_ALIGN or k % CTA_K:
+        raise ValueError(f"N={n} must be a multiple of {N_ALIGN} and K={k} of {CTA_K}")
+    if not 1 <= t.split_k <= min(16, k // CTA_K):
+        raise ValueError(f"split_k={t.split_k} invalid for K={k}")
+    if t.a_stages < 1 or t.b_stages < 1:
+        raise ValueError("a_stages and b_stages must be >= 1")
+    need = prequantized_smem_bytes(n, k, t)
+    if need > _SMEM_CAPACITY:
+        raise ValueError(f"tactic {t} needs {need} B of SMEM > {_SMEM_CAPACITY} B")
+
+
+@dsl_user_op
+def _ldg_b32(addr, *, loc=None, ip=None):
+    return Int32(
+        _asm(
+            T.i32(),
+            [Int64(addr).ir_value(loc=loc, ip=ip)],
+            "ld.global.b32 $0, [$1];",
+            "=r,l",
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def _fold_scales_x4(act4, w_exp, *, loc=None, ip=None):
+    """Four bytes ``clamp(e_act_i + w_exp - 127, 0, 254)`` of a packed word of four UE8M0
+    activation exponents (``_sts_scale`` of the low-M kernel, four at a time)."""
+    return Int32(
+        _asm(
+            T.i32(),
+            [_iv(act4, loc=loc, ip=ip), _iv(w_exp, loc=loc, ip=ip)],
+            "{\n"
+            ".reg .s32 a, v, r;\n"
+            "mov.b32 r, 0;\n"
+            + "".join(
+                f"bfe.u32 a, $1, {8 * i}, 8;\n"
+                "add.s32 v, a, $2;\n"
+                "sub.s32 v, v, 127;\n"
+                "max.s32 v, v, 0;\n"
+                "min.s32 v, v, 254;\n"
+                f"bfi.b32 r, v, r, {8 * i}, 8;\n"
+                for i in range(4)
+            )
+            + "mov.b32 $0, r;\n}",
+            "=r,r,r",
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def _sts_b32(addr, v, *, loc=None, ip=None):
+    _asm(
+        None,
+        [_iv(addr, loc=loc, ip=ip), _iv(v, loc=loc, ip=ip)],
+        "st.shared.b32 [$0], $1;",
+        "r,r",
+        loc=loc,
+        ip=ip,
+    )
+
+
+class Fp8BlockScaleLowMPrequantizedGemmKernel:
+    """The low-M kernel on an MXFP8 activation quantized upstream (``M <= 64``)."""
+
+    def __init__(self, n: int, k: int, tactic: PrequantizedLowMTactic, use_pdl: bool):
+        validate_prequantized_tactic(n, k, tactic)
+        self.n = n
+        self.k = k
+        self.mma_n = tactic.mma_n
+        self.split_k = tactic.split_k
+        self.kt_total = k // CTA_K
+        self.kt_max = _ceil_div(self.kt_total, self.split_k)
+        self.a_stages = min(tactic.a_stages, self.kt_max)
+        self.b_stages = min(tactic.b_stages, self.kt_max)
+        self.n_tiles = _ceil_div(n, MMA_M)
+        self.use_pdl = use_pdl
+        self.mma_tiler = (MMA_M, self.mma_n, CTA_K)
+        self.a_stage_bytes = MMA_M * CTA_K
+        self.b_stage_bytes = self.mma_n * CTA_K
+        self.chunks = self.mma_n // 4
+        self.chunks_cap = _ceil_div(self.chunks, self.split_k)
+        self.a_region_bytes = max(
+            self.a_stages * self.a_stage_bytes, _prequantized_mailbox_bytes(tactic)
+        )
+        self.out_stage_bytes = self.mma_n * MMA_M * 2
+        self.blk = min(32, self.mma_n)
+
+    @cute.jit
+    def __call__(
+        self,
+        w_ptr: cute.Pointer,
+        xq_ptr: cute.Pointer,
+        xs_ptr: cute.Pointer,
+        ws_ptr: cute.Pointer,
+        out_ptr: cute.Pointer,
+        m: Int32,
+        stream: cuda.CUstream,
+    ):
+        n, k = self.n, self.k
+        mW = cute.make_tensor(w_ptr, cute.make_layout((n, k, 1), stride=(k, 1, n * k)))
+        mXq = cute.make_tensor(xq_ptr, cute.make_layout((m, k, 1), stride=(k, 1, m * k)))
+        mWS = cute.make_tensor(
+            ws_ptr,
+            cute.make_layout(
+                (_ceil_div(n, MMA_M), (4, _ceil_div(k // CTA_K, 4))),
+                stride=(MMA_M * 4, (1, 4 * n)),
+            ),
+        )
+        mOut = cute.make_tensor(out_ptr, cute.make_layout((m, n), stride=(n, 1)))
+
+        tiled_mma = sm100_utils.make_blockscaled_trivial_tiled_mma(
+            cutlass.Float8E4M3FN,
+            cutlass.Float8E4M3FN,
+            OperandMajorMode.K,
+            OperandMajorMode.K,
+            cutlass.Float8E8M0FNU,
+            SF_VEC,
+            tcgen05.CtaGroup.ONE,
+            (MMA_M, self.mma_n),
+        )
+        a_layout = sm100_utils.make_smem_layout_a(
+            tiled_mma, self.mma_tiler, cutlass.Float8E4M3FN, self.a_stages
+        )
+        b_layout = sm100_utils.make_smem_layout_b(
+            tiled_mma, self.mma_tiler, cutlass.Float8E4M3FN, self.b_stages
+        )
+        sfa_layout = blockscaled_utils.make_smem_layout_sfa(tiled_mma, self.mma_tiler, SF_VEC, 1)
+        sfb_layout = blockscaled_utils.make_smem_layout_sfb(
+            tiled_mma, self.mma_tiler, SF_VEC, self.b_stages
+        )
+        cluster_layout_vmnk = cute.tiled_divide(
+            cute.make_layout((1, 1, 1)), (tiled_mma.thr_id.shape,)
+        )
+        tma_atom_a, tma_tensor_a = cute.nvgpu.make_tiled_tma_atom_A(
+            cpasync.CopyBulkTensorTileG2SOp(tcgen05.CtaGroup.ONE),
+            mW,
+            cute.slice_(a_layout, (None, None, None, 0)),
+            self.mma_tiler,
+            tiled_mma,
+            cluster_layout_vmnk.shape,
+        )
+        tma_atom_b, tma_tensor_b = cute.nvgpu.make_tiled_tma_atom_B(
+            cpasync.CopyBulkTensorTileG2SOp(tcgen05.CtaGroup.ONE),
+            mXq,
+            cute.slice_(b_layout, (None, None, None, 0)),
+            self.mma_tiler,
+            tiled_mma,
+            cluster_layout_vmnk.shape,
+        )
+
+        @cute.struct
+        class SharedStorage:
+            a_full: cute.struct.MemRange[cutlass.Int64, self.a_stages]
+            a_empty: cute.struct.MemRange[cutlass.Int64, self.a_stages]
+            b_full: cute.struct.MemRange[cutlass.Int64, self.b_stages]
+            b_empty: cute.struct.MemRange[cutlass.Int64, self.b_stages]
+            acc_full: cutlass.Int64
+            tmem_ready: cutlass.Int64
+            tmem_free: cutlass.Int64
+            mbox_full: cutlass.Int64
+            peers_done: cutlass.Int64
+            tmem_holding_buf: cutlass.Int32
+            # Weight ring; the split-K mailbox once every CTA of the cluster is done with it.
+            sA: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Float8E4M3FN, self.a_region_bytes], 1024
+            ]
+            # Activation ring; stages the BF16 output tile token-major after the mainloop.
+            sB: cute.struct.Align[
+                cute.struct.MemRange[
+                    cutlass.Float8E4M3FN, max(cute.cosize(b_layout.outer), self.out_stage_bytes)
+                ],
+                1024,
+            ]
+            sSFA: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Float8E8M0FNU, cute.cosize(sfa_layout)], 128
+            ]
+            sSFB: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Float8E8M0FNU, cute.cosize(sfb_layout)], 128
+            ]
+
+        self.shared_storage = SharedStorage
+
+        self.kernel(
+            tiled_mma,
+            tma_atom_a,
+            tma_tensor_a,
+            tma_atom_b,
+            tma_tensor_b,
+            xs_ptr,
+            mWS,
+            mOut,
+            m,
+            a_layout,
+            b_layout,
+            sfa_layout,
+            sfb_layout,
+        ).launch(
+            grid=(self.n_tiles * self.split_k, 1, 1),
+            block=(_PQ_THREADS, 1, 1),
+            cluster=(self.split_k, 1, 1),
+            smem=self.shared_storage.size_in_bytes(),
+            min_blocks_per_mp=1,
+            stream=stream,
+            use_pdl=self.use_pdl,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        tiled_mma: cute.TiledMma,
+        tma_atom_a: cute.CopyAtom,
+        mA: cute.Tensor,
+        tma_atom_b: cute.CopyAtom,
+        mB: cute.Tensor,
+        xs_ptr: cute.Pointer,
+        mWS: cute.Tensor,
+        mOut: cute.Tensor,
+        m: Int32,
+        a_layout: cute.ComposedLayout,
+        b_layout: cute.ComposedLayout,
+        sfa_layout: cute.Layout,
+        sfb_layout: cute.Layout,
+    ):
+        S = self.split_k
+        warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+        tidx, _, _ = cute.arch.thread_idx()
+        bidx, _, _ = cute.arch.block_idx()
+
+        rank = Int32(0)
+        if cutlass.const_expr(S > 1):
+            rank = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
+        n_tile = bidx // S
+
+        kt_base = self.kt_total // S
+        kt_rem = self.kt_total % S
+        kt_count = Int32(kt_base)
+        kt_start = rank * kt_base
+        if cutlass.const_expr(kt_rem > 0):
+            if rank < kt_rem:
+                kt_count = kt_count + 1
+                kt_start = kt_start + rank
+            else:
+                kt_start = kt_start + kt_rem
+
+        storage = utils.SmemAllocator().allocate(self.shared_storage)
+        a_full = storage.a_full.data_ptr()
+        a_empty = storage.a_empty.data_ptr()
+        b_full = storage.b_full.data_ptr()
+        b_empty = storage.b_empty.data_ptr()
+
+        if warp_idx == _TMA_WARP:
+            cpasync.prefetch_descriptor(tma_atom_a)
+            cpasync.prefetch_descriptor(tma_atom_b)
+            with cute.arch.elect_one():
+                for i in cutlass.range_constexpr(self.a_stages):
+                    cute.arch.mbarrier_init(a_full + i, 1)
+                    cute.arch.mbarrier_init(a_empty + i, 1)
+                for i in cutlass.range_constexpr(self.b_stages):
+                    # the E4M3 tile (TMA, expect_tx) and its folded scales (warp 3)
+                    cute.arch.mbarrier_init(b_full + i, 2)
+                    cute.arch.mbarrier_init(b_empty + i, 1)
+                cute.arch.mbarrier_init(storage.acc_full, 1)
+                cute.arch.mbarrier_init(storage.tmem_ready, 1)
+                cute.arch.mbarrier_init(storage.tmem_free, 4)
+                cute.arch.mbarrier_init(storage.mbox_full, 1)
+                cute.arch.mbarrier_init(storage.peers_done, max(S - 1, 1))
+        cute.arch.mbarrier_init_fence()
+        cute.arch.barrier()
+        if cutlass.const_expr(S > 1):
+            cute.arch.cluster_arrive_relaxed()
+
+        if warp_idx == _TMA_WARP:
+            # Weight producer: never waits on the previous grid (weights are static), so the
+            # dependent grid may launch at once.
+            if cutlass.const_expr(self.use_pdl):
+                griddepcontrol_launch_dependents()
+            sA = storage.sA.get_tensor(a_layout.outer, swizzle=a_layout.inner)
+            gA = cute.local_tile(
+                mA, cute.slice_(self.mma_tiler, (None, 0, None)), (None, None, None)
+            )
+            tCgA = tiled_mma.get_slice(0).partition_A(gA)
+            tAsA, tAgA = cpasync.tma_partition(
+                tma_atom_a,
+                0,
+                cute.make_layout(1),
+                cute.group_modes(sA, 0, 3),
+                cute.group_modes(tCgA, 0, 3),
+            )
+            for kt in cutlass.range(kt_count, unroll=1):
+                stage = kt % self.a_stages
+                if kt >= self.a_stages:
+                    cute.arch.mbarrier_wait(a_empty + stage, ((kt // self.a_stages) & 1) ^ 1)
+                with cute.arch.elect_one():
+                    cute.arch.mbarrier_arrive_and_expect_tx(a_full + stage, self.a_stage_bytes)
+                cute.copy(
+                    tma_atom_a,
+                    tAgA[(None, n_tile, kt_start + kt, 0)],
+                    tAsA[(None, stage)],
+                    tma_bar_ptr=a_full + stage,
+                    cache_policy=Int64(_EVICT_FIRST),
+                )
+        elif warp_idx == _X_WARP:
+            # Activation producer: the E4M3 tiles of every K tile (128B swizzle = UMMA B layout).
+            if cutlass.const_expr(self.use_pdl):
+                griddepcontrol_wait()
+            sB = storage.sB.get_tensor(b_layout.outer, swizzle=b_layout.inner)
+            gB = cute.local_tile(
+                mB, cute.slice_(self.mma_tiler, (0, None, None)), (None, None, None)
+            )
+            tCgB = tiled_mma.get_slice(0).partition_B(gB)
+            tBsB, tBgB = cpasync.tma_partition(
+                tma_atom_b,
+                0,
+                cute.make_layout(1),
+                cute.group_modes(sB, 0, 3),
+                cute.group_modes(tCgB, 0, 3),
+            )
+            for kt in cutlass.range(kt_count, unroll=1):
+                stage = kt % self.b_stages
+                if kt >= self.b_stages:
+                    cute.arch.mbarrier_wait(b_empty + stage, ((kt // self.b_stages) & 1) ^ 1)
+                with cute.arch.elect_one():
+                    cute.arch.mbarrier_arrive_and_expect_tx(b_full + stage, self.b_stage_bytes)
+                cute.copy(
+                    tma_atom_b,
+                    tBgB[(None, 0, kt_start + kt, 0)],
+                    tBsB[(None, stage)],
+                    tma_bar_ptr=b_full + stage,
+                )
+        elif warp_idx == _PQ_SF_WARP:
+            self.scale_warp(storage, xs_ptr, mWS, m, n_tile, kt_start, kt_count)
+        elif warp_idx == _MMA_WARP:
+            self.mma_warp(tiled_mma, storage, kt_count, a_layout, b_layout, sfa_layout, sfb_layout)
+        elif warp_idx >= _PQ_EPI_WARP0:
+            self.epilogue(tiled_mma, storage, mOut, m, tidx - 32 * _PQ_EPI_WARP0, n_tile, rank)
+
+    @cute.jit
+    def scale_warp(
+        self,
+        storage,
+        xs_ptr: cute.Pointer,
+        mWS: cute.Tensor,
+        m: Int32,
+        n_tile: Int32,
+        kt_start: Int32,
+        kt_count: Int32,
+    ):
+        """SFB of every K tile: lane r (and r + 32) writes token row r's four folded exponents
+        ``clamp(e_act + e_w - 127, 0, 254)`` at ``(r % 32) * 16 + (r // 32) * 4``; rows past M
+        (zero codes) get ``e_act = 127``. The activation exponents of one row and K tile are one
+        word of the R128c4 scale (rows below 128: atom ``kt``, byte ``(r % 32) * 16 +
+        (r // 32) * 4``)."""
+        lane = cute.arch.lane_idx()
+        b_full = storage.b_full.data_ptr()
+        b_empty = storage.b_empty.data_ptr()
+        sf_base = storage.sSFB.data_ptr().toint()
+        # Weight block exponents of this CTA's K tiles (static: before the wait).
+        w_exps = []
+        for j in cutlass.range_constexpr(_ceil_div(self.kt_max, 32)):
+            e = Int32(127)
+            if lane + 32 * j < kt_count:
+                e = Int32(mWS[n_tile, kt_start + lane + 32 * j])
+            w_exps.append(e)
+        if cutlass.const_expr(self.use_pdl):
+            griddepcontrol_wait()
+        rows_per_lane = _ceil_div(self.mma_n, 32)
+        # Issue every activation exponent load first (one word = the 4 groups of a K tile).
+        acts = []
+        for i in cutlass.range_constexpr(rows_per_lane):
+            r = lane + 32 * i
+            row_words = []
+            for kt in cutlass.range_constexpr(self.kt_max):
+                v = Int32(0x7F7F7F7F)
+                if (r < m) & (kt < kt_count) & (r < self.mma_n):
+                    v = _ldg_b32(
+                        xs_ptr.toint() + Int64((kt_start + kt) * 512 + (r & 31) * 16 + (r >> 5) * 4)
+                    )
+                row_words.append(v)
+            acts.append(row_words)
+        if cutlass.const_expr(self.b_stages >= self.kt_max):
+            # Every K tile has its own stage: write all scales, fence once, release all tiles.
+            for kt in cutlass.range_constexpr(self.kt_max):
+                if kt < kt_count:
+                    e_w = cute.arch.shuffle_sync(w_exps[kt // 32], kt % 32)
+                    for i in cutlass.range_constexpr(rows_per_lane):
+                        r = lane + 32 * i
+                        if r < self.mma_n:
+                            _sts_b32(
+                                sf_base + kt * 512 + (r & 31) * 16 + (r >> 5) * 4,
+                                _fold_scales_x4(acts[i][kt], e_w),
+                            )
+            cute.arch.fence_proxy("async.shared", space="cta")
+            cute.arch.sync_warp()
+            for j in cutlass.range_constexpr(_ceil_div(self.kt_max, 32)):
+                if lane + 32 * j < kt_count:
+                    cute.arch.mbarrier_arrive(b_full + lane + 32 * j)
+        else:
+            for kt in cutlass.range_constexpr(self.kt_max):
+                if kt < kt_count:
+                    stage = kt % self.b_stages
+                    if cutlass.const_expr(kt >= self.b_stages):
+                        cute.arch.mbarrier_wait(b_empty + stage, ((kt // self.b_stages) & 1) ^ 1)
+                    e_w = cute.arch.shuffle_sync(w_exps[kt // 32], kt % 32)
+                    for i in cutlass.range_constexpr(rows_per_lane):
+                        r = lane + 32 * i
+                        if r < self.mma_n:
+                            _sts_b32(
+                                sf_base + stage * 512 + (r & 31) * 16 + (r >> 5) * 4,
+                                _fold_scales_x4(acts[i][kt], e_w),
+                            )
+                    cute.arch.fence_proxy("async.shared", space="cta")
+                    cute.arch.sync_warp()
+                    with cute.arch.elect_one():
+                        cute.arch.mbarrier_arrive(b_full + stage)
+
+    @cute.jit
+    def mma_warp(
+        self,
+        tiled_mma: cute.TiledMma,
+        storage,
+        kt_count: Int32,
+        a_layout: cute.ComposedLayout,
+        b_layout: cute.ComposedLayout,
+        sfa_layout: cute.Layout,
+        sfb_layout: cute.Layout,
+    ):
+        a_full = storage.a_full.data_ptr()
+        a_empty = storage.a_empty.data_ptr()
+        b_full = storage.b_full.data_ptr()
+        b_empty = storage.b_empty.data_ptr()
+        cute.arch.alloc_tmem(_TMEM_COLS, storage.tmem_holding_buf)
+        cute.arch.relinquish_tmem_alloc_permit()
+        with cute.arch.elect_one():
+            cute.arch.mbarrier_arrive(storage.tmem_ready)
+        acc_tmem_ptr = cute.arch.retrieve_tmem_ptr(
+            cutlass.Float32, alignment=16, ptr_to_buffer_holding_addr=storage.tmem_holding_buf
+        )
+        acc_shape = tiled_mma.partition_shape_C(self.mma_tiler[:2])
+        tCtAcc = cute.make_tensor(acc_tmem_ptr, tiled_mma.make_fragment_C(acc_shape).layout)
+        tCtSFA = cute.make_tensor(
+            cute.recast_ptr(acc_tmem_ptr + self.mma_n, dtype=cutlass.Float8E8M0FNU),
+            blockscaled_utils.make_tmem_layout_sfa(
+                tiled_mma, self.mma_tiler, SF_VEC, cute.slice_(sfa_layout, (None, None, None, 0))
+            ),
+        )
+        s2t_sfa, tCsSFA_s2t, tCtSFA_s2t = _s2t_partition_sf(
+            storage.sSFA.get_tensor(sfa_layout), tCtSFA
+        )
+        tCtSFB = cute.make_tensor(
+            cute.recast_ptr(acc_tmem_ptr + self.mma_n + _SF_TMEM_COLS, dtype=cutlass.Float8E8M0FNU),
+            blockscaled_utils.make_tmem_layout_sfb(
+                tiled_mma, self.mma_tiler, SF_VEC, cute.slice_(sfb_layout, (None, None, None, 0))
+            ),
+        )
+        s2t_sfb, tCsSFB_s2t, tCtSFB_s2t = _s2t_partition_sf(
+            storage.sSFB.get_tensor(sfb_layout), tCtSFB
+        )
+        # The weight scale is folded into SFB, so SFA is a constant 1.0 (UE8M0 127).
+        lane = cute.arch.lane_idx()
+        one4 = Int32(0x7F7F7F7F)
+        _sts_v4_b32(storage.sSFA.data_ptr().toint() + lane * 16, one4, one4, one4, one4)
+        cute.arch.fence_proxy("async.shared", space="cta")
+        cute.arch.sync_warp()
+        cute.copy(s2t_sfa, tCsSFA_s2t[(None, None, None, None, 0)], tCtSFA_s2t)
+
+        sA = storage.sA.get_tensor(a_layout.outer, swizzle=a_layout.inner)
+        sB = storage.sB.get_tensor(b_layout.outer, swizzle=b_layout.inner)
+        tCrA = tiled_mma.make_fragment_A(sA)
+        tCrB = tiled_mma.make_fragment_B(sB)
+        num_kphases = cute.size(tCrA, mode=[2])
+
+        tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
+        # Fully unrolled over the largest K-tile count; the MMA descriptor fields are set outside
+        # the per-tile predicate (a rank with one K tile fewer skips the last tile's work).
+        for kt in cutlass.range_constexpr(self.kt_max):
+            a_stage = kt % self.a_stages
+            b_stage = kt % self.b_stages
+            live = kt < kt_count
+            if live:
+                cute.arch.mbarrier_wait(a_full + a_stage, (kt // self.a_stages) & 1)
+                cute.arch.mbarrier_wait(b_full + b_stage, (kt // self.b_stages) & 1)
+                cute.copy(s2t_sfb, tCsSFB_s2t[(None, None, None, None, b_stage)], tCtSFB_s2t)
+            for kp in cutlass.range_constexpr(num_kphases):
+                tiled_mma.set(tcgen05.Field.SFA, tCtSFA[(None, None, kp)].iterator)
+                tiled_mma.set(tcgen05.Field.SFB, tCtSFB[(None, None, kp)].iterator)
+                if live:
+                    cute.gemm(
+                        tiled_mma,
+                        tCtAcc,
+                        tCrA[(None, None, kp, a_stage)],
+                        tCrB[(None, None, kp, b_stage)],
+                        tCtAcc,
+                    )
+                tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
+            if live:
+                with cute.arch.elect_one():
+                    if cutlass.const_expr(kt + self.a_stages < self.kt_max):
+                        tcgen05.commit(a_empty + a_stage)
+                    if cutlass.const_expr(kt + self.b_stages < self.kt_max):
+                        tcgen05.commit(b_empty + b_stage)
+        with cute.arch.elect_one():
+            tcgen05.commit(storage.acc_full)
+
+        cute.arch.mbarrier_wait(storage.tmem_free, 0)
+        cute.arch.dealloc_tmem(acc_tmem_ptr, _TMEM_COLS)
+
+    @cute.jit
+    def epilogue(
+        self,
+        tiled_mma: cute.TiledMma,
+        storage,
+        mOut: cute.Tensor,
+        m: Int32,
+        q: Int32,
+        n_tile: Int32,
+        rank: Int32,
+    ):
+        """TMEM -> registers -> token-major SMEM tile -> 16-byte stores; with ``split_k > 1``
+        rank ``r`` reduces every 4-token chunk ``c`` with ``c % split_k == r`` (own partial,
+        then the peers' in rank order: the low-M kernel's order)."""
+        S = self.split_k
+        if cutlass.const_expr(self.use_pdl):
+            griddepcontrol_wait()
+        cute.arch.mbarrier_wait(storage.tmem_ready, 0)
+        acc_tmem_ptr = cute.arch.retrieve_tmem_ptr(
+            cutlass.Float32, alignment=16, ptr_to_buffer_holding_addr=storage.tmem_holding_buf
+        )
+        acc_shape = tiled_mma.partition_shape_C(self.mma_tiler[:2])
+        tCtAcc = cute.make_tensor(acc_tmem_ptr, tiled_mma.make_fragment_C(acc_shape).layout)
+        tAcc = tCtAcc[((None, None), 0, 0)]
+        cAcc = cute.make_identity_tensor((MMA_M, self.mma_n))
+        blk = self.blk
+        tiled_t2r = tcgen05.make_tmem_copy(
+            cute.make_copy_atom(tcgen05.Ld32x32bOp(tcgen05.Repetition(blk)), cutlass.Float32),
+            cute.local_tile(tAcc, (MMA_M, blk), (0, 0)),
+        )
+        thr_t2r = tiled_t2r.get_slice(q)
+        out_base = storage.sB.data_ptr().toint()
+        out_gmem = mOut.iterator.toint() + Int64(n_tile * MMA_M * 2)
+        row_stride = Int64(self.n * 2)
+        store_cols = Int32(16)
+        if cutlass.const_expr(self.n % MMA_M != 0):
+            if n_tile * MMA_M + (q & 15) * 8 >= self.n:
+                store_cols = Int32(0)
+
+        cute.arch.mbarrier_wait(storage.acc_full, 0)
+        if cutlass.const_expr(S > 1):
+            # Every CTA's weight ring is dead once its MMAs completed: it becomes the mailbox.
+            cute.arch.cluster_wait()
+            if q == 0:
+                for p in cutlass.range_constexpr(1, S):
+                    _mbarrier_arrive_remote(storage.peers_done.toint(), (rank + p) % S)
+            cute.arch.mbarrier_wait(storage.peers_done, 0)
+
+        mbox_base = storage.sA.data_ptr().toint()
+        mbar_addr = storage.mbox_full.toint()
+        slot_bytes = self.chunks_cap * MMA_M * 16
+        rOwn = cute.make_rmem_tensor((self.chunks_cap * 4,), cutlass.Float32)
+        nblk = self.mma_n // blk
+        tTR_cAcc0 = thr_t2r.partition_D(cute.local_tile(cAcc, (MMA_M, blk), (0, 0)))
+        rBuf = [cute.make_rmem_tensor(tTR_cAcc0.shape, cutlass.Float32) for _ in range(2)]
+        cute.copy(
+            tiled_t2r, thr_t2r.partition_S(cute.local_tile(tAcc, (MMA_M, blk), (0, 0))), rBuf[0]
+        )
+        for j in cutlass.range_constexpr(nblk):
+            cute.arch.fence_view_async_tmem_load()
+            rAcc = rBuf[j % 2]
+            if cutlass.const_expr(j + 1 < nblk):
+                cute.copy(
+                    tiled_t2r,
+                    thr_t2r.partition_S(cute.local_tile(tAcc, (MMA_M, blk), (0, j + 1))),
+                    rBuf[(j + 1) % 2],
+                )
+            for c4 in cutlass.range_constexpr(blk // 4):
+                c = j * (blk // 4) + c4
+                if cutlass.const_expr(S == 1):
+                    if 4 * c < m:
+                        for v in cutlass.range_constexpr(4):
+                            _sts_u16(
+                                out_base + (4 * c + v) * (MMA_M * 2) + q * 2,
+                                _f32_to_bf16_bits(rAcc[4 * c4 + v]),
+                            )
+                else:
+                    if rank == c % S:
+                        for v in cutlass.range_constexpr(4):
+                            rOwn[(c // S) * 4 + v] = rAcc[4 * c4 + v]
+                    else:
+                        if 4 * c < m:
+                            slot = rank
+                            if rank > c % S:
+                                slot = rank - 1
+                            _st_async_v4_f32(
+                                mbox_base + slot * slot_bytes + ((c // S) * MMA_M + q) * 16,
+                                rAcc[4 * c4],
+                                rAcc[4 * c4 + 1],
+                                rAcc[4 * c4 + 2],
+                                rAcc[4 * c4 + 3],
+                                mbar_addr,
+                                c % S,
+                            )
+        cute.arch.sync_warp()
+        with cute.arch.elect_one():
+            cute.arch.mbarrier_arrive(storage.tmem_free)
+
+        if cutlass.const_expr(S == 1):
+            cute.arch.barrier(barrier_id=_EPI_BARRIER_ID, number_of_threads=MMA_M)
+            for p in cutlass.range(q, m * store_cols, MMA_M, unroll=1):
+                t = p >> 4
+                col = (p & 15) * 16
+                w0, w1, w2, w3 = _lds_v4_b32(out_base + t * (MMA_M * 2) + col)
+                _stg_v4_b32(out_gmem + Int64(t) * row_stride + col, w0, w1, w2, w3)
+        else:
+            active = (m + 3) >> 2
+            my_chunks = Int32(0)
+            if active > rank:
+                my_chunks = (active - rank + S - 1) // S
+            if my_chunks > 0:
+                if q == 0:
+                    cute.arch.mbarrier_arrive_and_expect_tx(
+                        storage.mbox_full, my_chunks * ((S - 1) * MMA_M * 16)
+                    )
+                cute.arch.mbarrier_wait(storage.mbox_full, 0)
+                for i in cutlass.range_constexpr(self.chunks_cap):
+                    if i < my_chunks:
+                        acc = [rOwn[i * 4 + v] for v in range(4)]
+                        for p in cutlass.range_constexpr(S - 1):
+                            v0, v1, v2, v3 = _lds_v4_f32(
+                                mbox_base + p * slot_bytes + (i * MMA_M + q) * 16
+                            )
+                            acc[0] = acc[0] + v0
+                            acc[1] = acc[1] + v1
+                            acc[2] = acc[2] + v2
+                            acc[3] = acc[3] + v3
+                        for v in cutlass.range_constexpr(4):
+                            _sts_u16(
+                                out_base + (4 * (rank + i * S) + v) * (MMA_M * 2) + q * 2,
+                                _f32_to_bf16_bits(acc[v]),
+                            )
+                cute.arch.barrier(barrier_id=_EPI_BARRIER_ID, number_of_threads=MMA_M)
+                for p in cutlass.range(q, my_chunks * 4 * store_cols, MMA_M, unroll=1):
+                    r = p >> 4
+                    t = 4 * (rank + (r >> 2) * S) + (r & 3)
+                    if t < m:
+                        col = (p & 15) * 16
+                        w0, w1, w2, w3 = _lds_v4_b32(out_base + t * (MMA_M * 2) + col)
+                        _stg_v4_b32(out_gmem + Int64(t) * row_stride + col, w0, w1, w2, w3)
+
+
+# ---------------------------------------------------------------------------
 # Host side
 # ---------------------------------------------------------------------------
 
@@ -2278,8 +2985,9 @@ class _ShapeTables:
     #: for buckets without an entry.
     mid_m_tuned: dict
     mid_m_default: dict
-    #: (N, K) -> largest M for which :func:`can_run` selects this GEMM; ``default_max_m`` for
-    #: other shapes.
+    #: (N, K) -> largest M for which :func:`max_m_for` selects this GEMM (its cross-over with
+    #: the architecture's default FP8 block-scale GEMM); ``default_max_m`` for other shapes
+    #: whose grid fits in one wave, none for the rest.
     max_m: dict
     default_max_m: int
     #: (N, K) -> largest M of the low-M kernel (mid-M kernel above); ``LOW_M_MAX`` otherwise.
@@ -2291,160 +2999,84 @@ class _ShapeTables:
 # ``fp8_swap_ab_gemm`` (with its quantization), both standalone and behind a latency-bound
 # kernel with PDL; every measured shape wins up to M = 128.
 _SM100_TABLES = _ShapeTables(
-    low_m_tuned={
-        # KDA fused q/k/v/g (helix16 shard)
-        (3072, 7168, 8): (5, 12, 4, 4, 4),
-        (3072, 7168, 16): (4, 8, 4, 4, 2),
-        (3072, 7168, 32): (5, 8, 4, 8, 4),
-        (3072, 7168, 64): (5, 4, 4, 8, 4),
-        # MoE latent down
-        (3584, 7168, 8): (4, 14, 4, 4, 4),
-        (3584, 7168, 16): (4, 8, 4, 4, 2),
-        (3584, 7168, 32): (4, 8, 4, 8, 2),
-        (3584, 7168, 64): (4, 4, 4, 8, 4),
-        # MoE latent up
-        (7168, 3584, 8): (2, 14, 4, 4, 4),
-        (7168, 3584, 16): (2, 8, 4, 4, 2),
-        (7168, 3584, 32): (2, 8, 4, 8, 2),
-        (7168, 3584, 64): (2, 4, 4, 8, 4),
-        # KDA / MLA o_proj (helix16 shard)
-        (7168, 768, 8): (1, 6, 4, 4, 4),
-        (7168, 768, 16): (1, 6, 4, 8, 4),
-        (7168, 768, 32): (1, 6, 4, 8, 4),
-        (7168, 768, 64): (1, 4, 4, 8, 2),
-        # MLA fused q_a / kv_a (2112 rows)
-        (2176, 7168, 8): (6, 10, 4, 4, 4),
-        (2176, 7168, 16): (6, 8, 4, 8, 4),
-        (2176, 7168, 32): (6, 8, 4, 8, 4),
-        (2176, 7168, 64): (6, 4, 4, 8, 4),
-        # MLA q_b
-        (18432, 1536, 8): (1, 12, 4, 4, 4),
-        (18432, 1536, 16): (1, 12, 4, 4, 2),
-        (18432, 1536, 32): (1, 8, 4, 8, 2),
-        (18432, 1536, 64): (1, 4, 4, 8, 2),
-    },
-    mid_m_tuned={
-        (3072, 7168, 224): (4, 4),
-        (3072, 7168, 256): (4, 3),
-        (3584, 7168, 224): (3, 4),
-        (3584, 7168, 256): (3, 3),
-        (7168, 3584, 224): (2, 3),
-        (7168, 3584, 256): (2, 3),
-        (2176, 7168, 128): (6, 4),
-        (2176, 7168, 192): (6, 4),
-        (2176, 7168, 224): (4, 4),
-        (2176, 7168, 256): (6, 3),
-        (12288, 7168, 192): (1, 3),
-        (12288, 7168, 224): (1, 3),
-        (12288, 7168, 256): (1, 3),
-        (7168, 6144, 256): (2, 3),
-    },
-    mid_m_default={
-        (3072, 7168): (4, 4),
-        (3584, 7168): (4, 4),
-        (7168, 3584): (2, 4),
-        (7168, 768): (1, 4),
-        (2176, 7168): (5, 4),
-        (18432, 1536): (1, 4),
-        (12288, 7168): (1, 4),
-        (7168, 6144): (2, 4),
-    },
+    low_m_tuned={},
+    mid_m_tuned={},
+    mid_m_default={},
     max_m={
+        (768, 7168): 224,
+        (1536, 7168): 224,
+        (2176, 7168): 192,
         (3072, 7168): 224,
-        (3584, 7168): 224,
-        (7168, 3584): 144,
+        (3584, 7168): 192,
+        (6144, 7168): 192,
         (7168, 768): 192,
-        (2176, 7168): 224,
+        (7168, 1536): 160,
+        (7168, 6144): 160,
+        (7168, 12288): 160,
+        (12288, 7168): 160,
         (18432, 1536): 224,
-        (12288, 7168): 128,
-        (7168, 6144): 128,
     },
     default_max_m=128,
-    # Large weights on fewer than all SMs, where the in-kernel quantization of a 64-token tile
-    # is exposed: the mid-M kernel is faster above 32 tokens.
-    low_m_cutover={
-        (12288, 7168): 32,
-        (7168, 6144): 32,
-    },
+    low_m_cutover={},
 )
 
-# SM107, tuned on Rubin (212 SMs) for the Kimi-K3 decode projections with cold weights (rotated
-# over 1.5 GiB): each tactic scores the mean CUDA-graph per-call time of back-to-back launches
-# with and without PDL. Low-M kernel, per mma_n bucket timed at M = mma_n: a split_k sweep with
-# the heuristic ring sizes, then quant warps / groups and x / b ring depths around the three
-# best splits; mid-M kernel, per mma_n bucket: split_k x b_stages. With 212 SMs the best split
-# is larger than on GB300 for the small-N weights. The M limits are the largest M up to which
-# this GEMM ran at least 5% faster than ``fp8_quantize_1x128_cutedsl_ue8m0`` + the autotuned
-# ``cute_dsl_mxfp8_gemm_rubin`` at every measured M (and, for the helix weights, not slower on
-# the mean of the times with and without PDL); other shapes stop at 32 tokens.
+# SM107: measured tactics, low-/mid-M cut-overs and cross-overs with
+# ``fp8_quantize_1x128_cutedsl_ue8m0`` + ``cute_dsl_mxfp8_gemm_rubin``; other shapes are not
+# selected.
 _SM107_TABLES = _ShapeTables(
     low_m_tuned={
-        # KDA fused q/k/v/g (dep16)
         (49152, 7168, 8): (1, 8, 4, 4, 4),
         (49152, 7168, 16): (1, 8, 4, 8, 4),
         (49152, 7168, 32): (1, 8, 4, 8, 4),
         (49152, 7168, 64): (1, 4, 4, 8, 4),
-        # KDA / MLA o_proj (dep16)
         (7168, 12288, 8): (3, 8, 4, 4, 4),
         (7168, 12288, 16): (3, 8, 4, 8, 4),
         (7168, 12288, 32): (3, 8, 4, 8, 4),
         (7168, 12288, 64): (3, 4, 4, 8, 4),
-        # MLA output gate / shared-expert gate_up (dep16)
         (12288, 7168, 8): (2, 8, 4, 4, 4),
         (12288, 7168, 16): (2, 8, 4, 8, 4),
         (12288, 7168, 32): (2, 8, 4, 8, 4),
         (12288, 7168, 64): (2, 4, 4, 8, 4),
-        # shared-expert down (dep16)
         (7168, 6144, 8): (6, 8, 4, 4, 4),
         (7168, 6144, 16): (3, 8, 4, 8, 4),
         (7168, 6144, 32): (3, 8, 4, 8, 4),
         (7168, 6144, 64): (3, 4, 4, 8, 4),
-        # MLA q_b
         (18432, 1536, 8): (2, 4, 4, 4, 4),
         (18432, 1536, 16): (2, 4, 4, 8, 4),
         (18432, 1536, 32): (1, 8, 4, 8, 4),
         (18432, 1536, 64): (1, 4, 4, 8, 4),
-        # MoE latent down
         (3584, 7168, 8): (8, 7, 4, 4, 4),
         (3584, 7168, 16): (8, 4, 4, 8, 4),
         (3584, 7168, 32): (5, 8, 4, 8, 4),
         (3584, 7168, 64): (6, 4, 4, 8, 2),
-        # MoE latent up
         (7168, 3584, 8): (7, 4, 4, 4, 4),
         (7168, 3584, 16): (6, 4, 4, 8, 4),
         (7168, 3584, 32): (6, 5, 4, 8, 4),
         (7168, 3584, 64): (3, 4, 4, 8, 4),
-        # KDA fused q/k/v/g (helix16 shard)
         (3072, 7168, 8): (7, 8, 4, 4, 4),
         (3072, 7168, 16): (7, 4, 4, 8, 4),
         (3072, 7168, 32): (6, 8, 4, 8, 4),
         (3072, 7168, 64): (6, 4, 4, 8, 2),
-        # MLA fused q_a / kv_a (2112 rows)
         (2176, 7168, 8): (10, 4, 4, 4, 4),
         (2176, 7168, 16): (7, 8, 4, 8, 4),
         (2176, 7168, 32): (8, 4, 4, 8, 4),
         (2176, 7168, 64): (8, 7, 4, 8, 4),
-        # MLA output gate (helix16 shard)
         (768, 7168, 8): (14, 4, 4, 4, 4),
         (768, 7168, 16): (14, 4, 4, 8, 4),
         (768, 7168, 32): (10, 6, 4, 8, 4),
         (768, 7168, 64): (16, 4, 4, 8, 4),
-        # KDA / MLA o_proj (helix16 shard)
         (7168, 768, 8): (3, 2, 2, 4, 4),
         (7168, 768, 16): (3, 2, 2, 8, 4),
         (7168, 768, 32): (1, 6, 4, 8, 4),
         (7168, 768, 64): (2, 3, 3, 8, 4),
-        # KDA fused q/k/v/g (helix8 shard)
         (6144, 7168, 8): (3, 4, 4, 4, 4),
         (6144, 7168, 16): (3, 8, 4, 8, 4),
         (6144, 7168, 32): (3, 8, 4, 8, 4),
         (6144, 7168, 64): (3, 4, 4, 8, 4),
-        # KDA / MLA o_proj (helix8 shard)
         (7168, 1536, 8): (4, 3, 3, 4, 4),
         (7168, 1536, 16): (4, 3, 3, 8, 4),
         (7168, 1536, 32): (2, 6, 4, 8, 4),
         (7168, 1536, 64): (2, 4, 4, 8, 4),
-        # MLA output gate (helix8 shard)
         (1536, 7168, 8): (12, 5, 4, 4, 4),
         (1536, 7168, 16): (7, 8, 4, 8, 4),
         (1536, 7168, 32): (8, 7, 4, 8, 4),
@@ -2843,6 +3475,95 @@ def _run_mid(x, w, w_scale, out, tactic: MidMTactic, use_pdl: bool) -> None:
     )
 
 
+#: Weight-ring depth :func:`default_prequantized_tactic` keeps before it shortens the activation
+#: ring.
+_PQ_MIN_A_STAGES = 6
+
+
+@functools.cache
+def default_prequantized_tactic(m: int, n: int, k: int) -> PrequantizedLowMTactic:
+    """The low-M kernel's ``mma_n`` and split-K for ``(M, N, K)`` (same bits) and the deepest
+    weight ring that fits next to the activation ring. The activation ring holds every K tile
+    of the CTA unless that leaves fewer than ``_PQ_MIN_A_STAGES`` weight stages; then it is the
+    deepest ring that does."""
+    base = default_tactic(m, n, k)
+    kt_max = _ceil_div(k // CTA_K, base.split_k)
+    best = None
+    for b_stages in range(kt_max, 0, -1):
+        t = PrequantizedLowMTactic(
+            mma_n=base.mma_n, split_k=base.split_k, a_stages=1, b_stages=b_stages
+        )
+        fits = [
+            a
+            for a in range(1, kt_max + 1)
+            if prequantized_smem_bytes(n, k, dataclasses.replace(t, a_stages=a)) <= _SMEM_CAPACITY
+        ]
+        if fits:
+            t = dataclasses.replace(t, a_stages=max(fits))
+            best = best or t
+            if t.a_stages >= min(_PQ_MIN_A_STAGES, kt_max):
+                return t
+    if best is None:
+        raise ValueError(f"no prequantized tactic fits for M={m}, N={n}, K={k}")
+    return best
+
+
+@functools.cache
+def _compiled_prequantized_kernel(n: int, k: int, tactic: PrequantizedLowMTactic, use_pdl: bool):
+    kernel = Fp8BlockScaleLowMPrequantizedGemmKernel(n, k, tactic, use_pdl)
+    return cute.compile(
+        kernel,
+        _dummy_ptr(cutlass.Float8E4M3FN),
+        _dummy_ptr(cutlass.Float8E4M3FN),
+        _dummy_ptr(cutlass.Uint8),
+        _dummy_ptr(cutlass.Uint8),
+        _dummy_ptr(cutlass.BFloat16),
+        Int32(1),
+        _current_stream(torch.device("cuda")),
+    )
+
+
+def run_low_m_gemm_prequantized(
+    xq: torch.Tensor,
+    xs: torch.Tensor,
+    w: torch.Tensor,
+    w_scale: torch.Tensor,
+    out: torch.Tensor,
+    *,
+    tactic: PrequantizedLowMTactic | None = None,
+    use_pdl: bool = True,
+) -> torch.Tensor:
+    """Launch ``out = dequant(xq, xs) @ dequant(w, w_scale)^T`` on the current stream: bitwise
+    :func:`run_low_m_gemm` on the BF16 activation that ``(xq, xs)`` quantizes.
+
+    Args:
+        xq: ``[M, K]`` contiguous E4M3 activation, ``1 <= M <= low_m_max_for(N, K)``.
+        xs: its UE8M0 1x32 scales in the R128c4 layout (uint8, at least ``128 * K / 32``
+            bytes).
+        w, w_scale, out: as for :func:`run_low_m_gemm`.
+        tactic: kernel specialization; :func:`default_prequantized_tactic` if None.
+        use_pdl: launch with programmatic dependent launch.
+    """
+    m, k = xq.shape
+    n = w.shape[0]
+    if not 1 <= m <= low_m_max_for(n, k):
+        raise ValueError(f"the prequantized GEMM serves M <= {low_m_max_for(n, k)}, got {m}")
+    if tactic is None:
+        tactic = default_prequantized_tactic(m, n, k)
+    if m > tactic.mma_n:
+        raise ValueError(f"M={m} exceeds tactic.mma_n={tactic.mma_n}")
+    _compiled_prequantized_kernel(n, k, tactic, use_pdl)(
+        _gmem_ptr(cutlass.Float8E4M3FN, w),
+        _gmem_ptr(cutlass.Float8E4M3FN, xq),
+        _gmem_ptr(cutlass.Uint8, xs),
+        _gmem_ptr(cutlass.Uint8, w_scale),
+        _gmem_ptr(cutlass.BFloat16, out),
+        Int32(m),
+        _current_stream(xq.device),
+    )
+    return out
+
+
 def run_low_m_gemm(
     x: torch.Tensor,
     w: torch.Tensor,
@@ -2936,15 +3657,12 @@ def pack_block_scale_from_mxfp8_layout(sf: torch.Tensor, n: int, k: int) -> torc
     return packed
 
 
-def check_inputs(x: torch.Tensor, w: torch.Tensor, w_scale: torch.Tensor) -> None:
-    """Raise ``ValueError`` unless :func:`run_low_m_gemm` accepts these operands."""
-    if x.dtype != torch.bfloat16 or x.dim() != 2 or not x.is_contiguous():
-        raise ValueError("x must be a contiguous 2D bfloat16 tensor")
+def _check_weight(w: torch.Tensor, w_scale: torch.Tensor, k: int) -> None:
     if w.dtype != torch.float8_e4m3fn or w.dim() != 2 or not w.is_contiguous():
         raise ValueError("w must be a contiguous 2D float8_e4m3fn tensor")
-    n, k = w.shape
-    if x.shape[1] != k:
-        raise ValueError(f"x has K={x.shape[1]}, weight has K={k}")
+    n = w.shape[0]
+    if w.shape[1] != k:
+        raise ValueError(f"the activation has K={k}, the weight K={w.shape[1]}")
     if n % N_ALIGN or k % CTA_K:
         raise ValueError(f"N={n} must be a multiple of {N_ALIGN} and K={k} of {CTA_K}")
     words = _ceil_div(k // CTA_K, 4)
@@ -2957,8 +3675,31 @@ def check_inputs(x: torch.Tensor, w: torch.Tensor, w_scale: torch.Tensor) -> Non
         raise ValueError(
             f"w_scale must be DeepGEMM-packed UE8M0 int32 [{n}, {words}] with strides (1, {n})"
         )
-    if x.data_ptr() % 16 or w.data_ptr() % 16:
-        raise ValueError("x and w must be 16-byte aligned")
+    if w.data_ptr() % 16:
+        raise ValueError("w must be 16-byte aligned")
+
+
+def check_inputs(x: torch.Tensor, w: torch.Tensor, w_scale: torch.Tensor) -> None:
+    """Raise ``ValueError`` unless :func:`run_low_m_gemm` accepts these operands."""
+    if x.dtype != torch.bfloat16 or x.dim() != 2 or not x.is_contiguous():
+        raise ValueError("x must be a contiguous 2D bfloat16 tensor")
+    if x.data_ptr() % 16:
+        raise ValueError("x must be 16-byte aligned")
+    _check_weight(w, w_scale, x.shape[1])
+
+
+def check_prequantized_inputs(
+    xq: torch.Tensor, xs: torch.Tensor, w: torch.Tensor, w_scale: torch.Tensor
+) -> None:
+    """Raise ``ValueError`` unless :func:`run_low_m_gemm_prequantized` accepts these operands."""
+    if xq.dtype != torch.float8_e4m3fn or xq.dim() != 2 or not xq.is_contiguous():
+        raise ValueError("xq must be a contiguous 2D float8_e4m3fn tensor")
+    m, k = xq.shape
+    if xs.dtype != torch.uint8 or not xs.is_contiguous() or xs.numel() < MMA_M * (k // SF_VEC):
+        raise ValueError(f"xs must be the contiguous uint8 R128c4 scale of {m} rows")
+    if xq.data_ptr() % 16 or xs.data_ptr() % 4:
+        raise ValueError("xq must be 16-byte and xs 4-byte aligned")
+    _check_weight(w, w_scale, k)
 
 
 def check_gate(x: torch.Tensor, gate: torch.Tensor) -> None:
@@ -2993,12 +3734,15 @@ __all__ = [
     "N_ALIGN",
     "LowMTactic",
     "MidMTactic",
+    "PrequantizedLowMTactic",
     "amax_bf16x8",
     "amax_pair",
     "bf16x2_inv_scale",
     "check_gate",
     "check_inputs",
+    "check_prequantized_inputs",
     "default_mid_tactic",
+    "default_prequantized_tactic",
     "default_tactic",
     "gate_fits",
     "gated_tactic",
@@ -3009,5 +3753,6 @@ __all__ = [
     "pack_block_scale_from_mxfp8_layout",
     "quant_bf16x8_to_e4m3",
     "run_low_m_gemm",
+    "run_low_m_gemm_prequantized",
     "ue8m0_of_amax",
 ]

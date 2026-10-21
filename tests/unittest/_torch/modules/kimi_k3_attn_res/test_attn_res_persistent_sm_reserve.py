@@ -43,12 +43,31 @@ def test_sm_reserve_keeps_results(num_tokens: int, num_snapshots: int, with_add:
             assert torch.equal(out[0], ref[0]), reserve
 
 
-def test_model_passes_the_cute_dsl_sm_reserve():
-    from tensorrt_llm._torch.cute_dsl_utils import set_sm_reserve
+def test_model_passes_the_sm_reserve(monkeypatch):
+    """The model's persistent mixes leave the SMs reserved for a step-resident kernel
+    (``cute_dsl_utils.set_sm_reserve``, which ``DwdpManager`` calls) out of the grid."""
+    from torch import nn
 
+    from tensorrt_llm._torch.cute_dsl_utils import set_sm_reserve
+    from tensorrt_llm._torch.modules.rms_norm import RMSNorm
+
+    op = torch.ops.trtllm.attn_res_add_rmsnorm_persistent_fwd
+    reserves = []
+
+    def spy(*args):
+        reserves.append(args[-1])
+        return op(*args)
+
+    monkeypatch.setattr(torch.ops.trtllm, "attn_res_add_rmsnorm_persistent_fwd", spy)
+    proj = nn.Linear(HIDDEN, 1, bias=False, dtype=torch.bfloat16, device="cuda")
+    norm = mkl.KimiK3RMSNorm(HIDDEN, eps=EPS, dtype=torch.bfloat16).cuda()
+    out_norm = RMSNorm(hidden_size=HIDDEN, eps=EPS, dtype=torch.bfloat16).cuda()
+    prefix = _rows(300, HIDDEN, seed=1)
+    block = _rows(4, 300, HIDDEN, seed=2)
     set_sm_reserve(16)
     try:
-        assert mkl._persistent_sm_reserve() == 16
+        mkl._attn_res_persistent_kernel(prefix, None, block, proj, norm, out_norm)
     finally:
         set_sm_reserve(0)
-    assert mkl._persistent_sm_reserve() == 0
+    mkl._attn_res_persistent_kernel(prefix, None, block, proj, norm, out_norm)
+    assert reserves == [16, 0]

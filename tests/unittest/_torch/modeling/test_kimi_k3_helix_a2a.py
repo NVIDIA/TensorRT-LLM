@@ -90,7 +90,9 @@ def _make_layer(layer_idx, attn_weight, moe_weight, rank, token_sliced):
     layer.mlp_res_proj = nn.Linear(HIDDEN, 1, bias=False)
     # Head-TP attention: rank 0 holds the whole row-parallel partial sum.
     owns_output = not token_sliced or rank == 0
-    layer.linear_attn = lambda x, _md: x @ attn_weight if owns_output else torch.zeros_like(x)
+    layer.linear_attn = lambda x, _md, prequantized_input=None: (
+        x @ attn_weight if owns_output else torch.zeros_like(x)
+    )
     layer.seen_all_rank_num_tokens = []
 
     class _MoE:
