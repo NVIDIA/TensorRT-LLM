@@ -71,7 +71,6 @@ worker_config:
     moe_config:
       backend: TRTLLM
     cache_transceiver_config:
-      max_tokens_in_buffer: 32768
       backend: NIXL
       transceiver_runtime: PYTHON
     disable_overlap_scheduler: false
@@ -95,7 +94,6 @@ worker_config:
       backend: CUTEDSL
       use_low_precision_moe_combine: true
     cache_transceiver_config:
-      max_tokens_in_buffer: 32768
       backend: NIXL
       transceiver_runtime: PYTHON
     disable_overlap_scheduler: false

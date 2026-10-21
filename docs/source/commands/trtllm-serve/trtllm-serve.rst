@@ -137,7 +137,7 @@ Multimodal Serving
 For multimodal models, you need to create a configuration file and start the server with additional options due to the following limitations:
 
 * TRT-LLM multimodal is currently not compatible with ``kv_cache_reuse``
-* Multimodal models require ``chat_template``, so only the Chat API is supported
+* Multimodal models require ``chat_template``, so only the Chat API and the Responses API are supported
 
 To set up multimodal models:
 
@@ -171,6 +171,20 @@ Another example uses ``curl``:
 .. literalinclude:: ../../../../examples/serve/curl_chat_client_for_multimodal.sh
     :language: bash
     :linenos:
+
+Multimodal Responses API
+~~~~~~~~~~~~~~~~~~~~~~~~
+
+The Responses API takes an image as an ``input_image`` content part whose ``image_url`` is the image URL or a base64 data URL:
+
+.. code-block:: json
+
+   {"role": "user", "content": [
+       {"type": "input_text", "text": "What's in this image?"},
+       {"type": "input_image", "image_url": "data:image/jpeg;base64,{image_base64}"}
+   ]}
+
+Images referenced by ``file_id`` and ``input_file`` content are not supported; a request that carries them is rejected with a 400 error.
 
 Multimodal Modality Coverage
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
