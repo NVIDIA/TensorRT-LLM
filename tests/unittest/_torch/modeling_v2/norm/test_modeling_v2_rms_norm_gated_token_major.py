@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """GPU test for the rms_norm_gated_token_major catalog entry."""
 
-from typing import Optional
+import zlib
 
 import pytest
 import torch
@@ -10,6 +10,9 @@ import torch
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.rms_norm_gated_token_major import (
     rms_norm_gated_token_major,
 )
+
+__extra_import_path__ = [".."]
+from _validating import validating
 
 assert torch.cuda.is_available(), "rms_norm_gated_token_major requires a CUDA device"
 pytestmark = pytest.mark.skipif(
@@ -21,29 +24,6 @@ HEAD_DIM = 128
 EPS = 1e-5
 
 
-def _ref(
-    x: torch.Tensor,
-    z: torch.Tensor,
-    weight: torch.Tensor,
-    eps: float,
-    fp8_scale: Optional[torch.Tensor],
-    gate_activation: str,
-) -> torch.Tensor:
-    """fp32 reference: norm before gate, the gate read token-major, one final rounding."""
-    rows, n = x.shape
-    zf = z.float().reshape(rows, n)
-    xf = x.float()
-    y = xf / torch.sqrt(xf.pow(2).mean(-1, keepdim=True) + eps) * weight.float()
-    gate = torch.sigmoid(zf)
-    if gate_activation == "silu":
-        gate = gate * zf
-    y = y * gate
-    if fp8_scale is None:
-        return y.to(x.dtype)
-    # The output is first rounded to x.dtype, then scaled by the rounded reciprocal of the scale.
-    return (y.to(x.dtype).float() * (1.0 / fp8_scale.float())).to(torch.float8_e4m3fn)
-
-
 def _gate_view(tokens: int, heads: int, n: int, dtype, extra: int = 0) -> torch.Tensor:
     """[tokens, heads, n] whose (heads, n) block is dense per token; `extra` columns widen the token stride."""
     wide = torch.randn(tokens, heads * n + extra, dtype=dtype, device="cuda")
@@ -51,10 +31,11 @@ def _gate_view(tokens: int, heads: int, n: int, dtype, extra: int = 0) -> torch.
 
 
 def _check(x, z, weight, eps, fp8_scale=None, gate_activation="silu") -> torch.Tensor:
-    out = rms_norm_gated_token_major(x, z, weight, eps, fp8_scale, gate_activation)
+    with validating(rms_norm_gated_token_major):
+        out = rms_norm_gated_token_major(x, z, weight, eps, fp8_scale, gate_activation)
     expected_dtype = torch.float8_e4m3fn if fp8_scale is not None else x.dtype
     assert out.shape == x.shape and out.dtype == expected_dtype and out.is_contiguous()
-    ref = _ref(x, z, weight, eps, fp8_scale, gate_activation)
+    ref = rms_norm_gated_token_major.reference(x, z, weight, eps, fp8_scale, gate_activation)
     if fp8_scale is None:
         # fp32 math and one rounding on both sides; the kernel's reduction order and sigmoid can move
         # an output by one ulp of x.dtype.
@@ -65,55 +46,25 @@ def _check(x, z, weight, eps, fp8_scale=None, gate_activation="silu") -> torch.T
     return out
 
 
-def test_kimi_k3_kda_output_gate() -> None:
-    # Kimi K3's KDA output gate: o rows [tokens * heads, 128], the full-rank gate projection as a
-    # column slice of a wider per-token buffer, sigmoid gate, bf16.
-    torch.manual_seed(0)
-    weight = torch.randn(HEAD_DIM, dtype=torch.bfloat16, device="cuda")
-    for heads in (6, 12, 24, 96):
-        for tokens in (1, 7, 64, 1024, 8192):
-            x = torch.randn(tokens * heads, HEAD_DIM, dtype=torch.bfloat16, device="cuda")
-            z = _gate_view(tokens, heads, HEAD_DIM, torch.bfloat16, extra=3 * heads * HEAD_DIM)
-            _check(x, z, weight, EPS, gate_activation="sigmoid")
-
-
-def test_silu_gate_and_row_lengths() -> None:
-    # The GDN form of the gate, and the multi-row kernel's other row lengths (powers of two up to
-    # 256); a plain [rows, 1, N] gate (heads = 1).
-    torch.manual_seed(1)
-    for n in (32, 64, 128, 256):
-        weight = torch.randn(n, dtype=torch.bfloat16, device="cuda")
-        x = torch.randn(48 * 4, n, dtype=torch.bfloat16, device="cuda")
-        _check(x, _gate_view(48, 4, n, torch.bfloat16), weight, 1e-6, gate_activation="silu")
-        _check(x, _gate_view(192, 1, n, torch.bfloat16), weight, 1e-6, gate_activation="sigmoid")
-
-
-def test_fallback_paths() -> None:
-    # Shapes outside the token-level multi-row path, same result: a row length that is not a power of
-    # two or is above 256 runs the generic kernel; a gate whose heads are strided runs the multi-row
-    # kernel one head per row, on the gate viewed as [tokens * heads, N].
-    torch.manual_seed(2)
-    for n, heads in ((96, 4), (512, 2)):
-        weight = torch.randn(n, dtype=torch.bfloat16, device="cuda")
-        x = torch.randn(32 * heads, n, dtype=torch.bfloat16, device="cuda")
-        _check(x, _gate_view(32, heads, n, torch.bfloat16), weight, EPS, gate_activation="sigmoid")
-    weight = torch.randn(HEAD_DIM, dtype=torch.bfloat16, device="cuda")
-    x = torch.randn(16 * 6, HEAD_DIM, dtype=torch.bfloat16, device="cuda")
-    strided_heads = torch.randn(16, 6, 2 * HEAD_DIM, dtype=torch.bfloat16, device="cuda")[
-        :, :, :HEAD_DIM
-    ]
-    _check(x, strided_heads, weight, EPS, gate_activation="sigmoid")
-
-
-def test_fp8_output() -> None:
-    # With fp8_scale the output is quantized to e4m3 in the same kernel: rounded to x.dtype first, then
-    # multiplied by the rounded reciprocal of the scale.
-    torch.manual_seed(3)
-    weight = torch.randn(HEAD_DIM, dtype=torch.bfloat16, device="cuda")
-    for scale in (0.5, 1.0, 3.0):
-        fp8_scale = torch.tensor(scale, dtype=torch.float32, device="cuda")
-        x = torch.randn(64 * 6, HEAD_DIM, dtype=torch.bfloat16, device="cuda")
-        _check(x, _gate_view(64, 6, HEAD_DIM, torch.bfloat16), weight, EPS, fp8_scale, "sigmoid")
+@pytest.mark.parametrize(
+    "cell",
+    rms_norm_gated_token_major.CELLS,
+    ids=[c.why[:40] for c in rms_norm_gated_token_major.CELLS],
+)
+def test_certified_cells(cell) -> None:
+    spec = cell.spec
+    torch.manual_seed(zlib.crc32(cell.why.encode()) % 2**31)
+    tokens, heads, n, dtype = spec["tokens"], spec["heads"], spec["width"], spec["dtype"]
+    weight = torch.randn(n, dtype=dtype, device="cuda")
+    x = torch.randn(tokens * heads, n, dtype=dtype, device="cuda")
+    if spec.get("head_strided"):
+        z = torch.randn(tokens, heads, 2 * n, dtype=dtype, device="cuda")[:, :, :n]
+    else:
+        z = _gate_view(tokens, heads, n, dtype, extra=spec.get("extra", 0))
+    fp8_scale = None
+    if "fp8_scale" in spec:
+        fp8_scale = torch.tensor(spec["fp8_scale"], dtype=torch.float32, device="cuda")
+    _check(x, z, weight, spec["eps"], fp8_scale, spec["gate_activation"])
 
 
 def test_cuda_graph_replay() -> None:
@@ -152,3 +103,13 @@ def test_rejects_out_of_contract() -> None:
         except error:
             continue
         raise AssertionError(f"{name}: the op accepted an out-of-contract call")
+
+
+def test_guard_refuses_per_column_fp8_scale() -> None:
+    weight = torch.randn(HEAD_DIM, dtype=torch.bfloat16, device="cuda")
+    x = torch.randn(8 * 6, HEAD_DIM, dtype=torch.bfloat16, device="cuda")
+    z = _gate_view(8, 6, HEAD_DIM, torch.bfloat16)
+    fp8_scale = torch.linspace(0.5, 3.0, HEAD_DIM, dtype=torch.float32, device="cuda")
+    with pytest.raises(AssertionError, match="exactly one element"):
+        with validating(rms_norm_gated_token_major):
+            rms_norm_gated_token_major(x, z, weight, EPS, fp8_scale, "sigmoid")

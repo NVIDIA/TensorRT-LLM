@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """GPU test for the causal_conv1d_fwd catalog entry."""
 
-from typing import List, Optional
+import zlib
 
 import pytest
 import torch
@@ -11,6 +11,9 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.ssm.causal_conv1d_fwd
     causal_conv1d_fwd,
 )
 from tensorrt_llm._torch.modules.mamba import PAD_SLOT_ID
+
+__extra_import_path__ = [".."]
+from _validating import validating
 
 assert torch.cuda.is_available(), "causal_conv1d_fwd requires a CUDA device"
 pytestmark = pytest.mark.skipif(
@@ -27,63 +30,45 @@ SLOT_PAD = 40  # extra elements per slot: the cache manager's slot stride is wid
 class _Pool:
     """A conv-state pool laid out as a cache manager's: [slots, dim, width - 1] views of padded slots."""
 
-    def __init__(self, dim: int, dtype=torch.bfloat16) -> None:
+    def __init__(self, dim: int, dtype=torch.bfloat16, generator=None) -> None:
         self.dim = dim
         stride = dim * (WIDTH - 1) + SLOT_PAD
-        self.storage = torch.randn(NUM_SLOTS, stride, dtype=dtype, device="cuda")
+        self.storage = torch.randn(
+            NUM_SLOTS, stride, dtype=dtype, device="cuda", generator=generator
+        )
         self.states = self.storage[:, : dim * (WIDTH - 1)].view(NUM_SLOTS, dim, WIDTH - 1)
         assert self.states.stride(0) == stride
 
 
-def _reference(
-    x: torch.Tensor,
-    weight: torch.Tensor,
-    bias: Optional[torch.Tensor],
-    states: torch.Tensor,
-    seq_lens: List[int],
-    slots: List[int],
-    has_init: List[bool],
-    silu: bool,
-):
-    """fp32 per-sequence reference: (output [dim, T] in x.dtype, {slot: new state [dim, width - 1]})."""
-    out = x.clone()
-    new_states = {}
-    start = 0
-    for length, slot, init in zip(seq_lens, slots, has_init):
-        seq = x[:, start : start + length].float()
-        if slot == PAD_SLOT_ID:
-            start += length
-            continue
-        hist = states[slot].float() if init else torch.zeros(x.shape[0], WIDTH - 1, device="cuda")
-        full = torch.cat([hist, seq], dim=1)
-        y = sum(weight[:, k : k + 1].float() * full[:, k : k + length] for k in range(WIDTH))
-        if bias is not None:
-            y = y + bias.float().unsqueeze(1)
-        if silu:
-            y = y * torch.sigmoid(y)
-        out[:, start : start + length] = y.to(x.dtype)
-        new_states[slot] = full[:, -(WIDTH - 1) :].to(states.dtype)
-        start += length
-    return out, new_states
-
-
-def _run(dim, seq_lens, slots, has_init, silu=True, use_bias=False, seed=0):
+def _run(dim, seq_lens, slots, has_init, silu=True, use_bias=False, seed=0, channel_last=False):
     gen = torch.Generator(device="cuda").manual_seed(seed)
     total = sum(seq_lens)
     x = torch.randn(dim, total, generator=gen, device="cuda").to(torch.bfloat16)
     weight = (torch.randn(dim, WIDTH, generator=gen, device="cuda") * 0.5).to(torch.bfloat16)
     bias = torch.randn(dim, generator=gen, device="cuda").to(torch.bfloat16) if use_bias else None
-    pool = _Pool(dim)
+    pool = _Pool(dim, generator=gen)
     starts = [0]
     for length in seq_lens:
         starts.append(starts[-1] + length)
     qsl = torch.tensor(starts, dtype=torch.int32, device="cuda")
     idx = torch.tensor(slots, dtype=torch.int32, device="cuda")
     init = torch.tensor(has_init, dtype=torch.bool, device="cuda")
-    ref_out, ref_states = _reference(x, weight, bias, pool.states, seq_lens, slots, has_init, silu)
+    ref_out = x.clone()
+    ref_pool = pool.states.clone()
+    causal_conv1d_fwd.reference(ref_out, weight, bias, ref_pool, qsl, idx, init, silu, PAD_SLOT_ID)
+    ref_states = {slot: ref_pool[slot] for slot in slots if slot != PAD_SLOT_ID}
     storage_before = pool.storage.clone()
-    causal_conv1d_fwd(x, weight, bias, pool.states, qsl, idx, init, silu, PAD_SLOT_ID)
-    return x, ref_out, pool, storage_before, ref_states
+    if channel_last:
+        x = x.t().contiguous().t()
+        out = torch.empty_like(x)
+        before = x.clone()
+    else:
+        out = None
+    with validating(causal_conv1d_fwd):
+        causal_conv1d_fwd(x, weight, bias, pool.states, qsl, idx, init, silu, PAD_SLOT_ID, out)
+    if channel_last:
+        assert torch.equal(x, before)
+    return x if out is None else out, ref_out, pool, storage_before, ref_states
 
 
 def _check(x, ref_out, pool, storage_before, ref_states) -> None:
@@ -101,15 +86,14 @@ def _check(x, ref_out, pool, storage_before, ref_states) -> None:
     assert torch.equal(pad, storage_before[:, pool.dim * (WIDTH - 1) :])
 
 
-def test_kimi_k3_varlen_prefill() -> None:
+@pytest.mark.parametrize(
+    "cell", causal_conv1d_fwd.CELLS, ids=[c.why[:40] for c in causal_conv1d_fwd.CELLS]
+)
+def test_kimi_k3_varlen_prefill(cell) -> None:
     # Kimi K3's KDA prefill conv: packed q | k | v channels, width 4, SiLU, no bias, a varlen batch
     # mixing fresh sequences and continuations (chunked prefill or a reused prefix), sequences
     # shorter than the state, scattered slots of a padded pool.
-    for dim in K3_DIMS:
-        seq_lens = [1, 2, 3, 17, 300, 64]
-        slots = [5, 0, 11, 3, 15, 8]
-        has_init = [True, False, True, False, True, True]
-        _check(*_run(dim, seq_lens, slots, has_init, seed=dim))
+    _check(*_run(**cell.spec, seed=zlib.crc32(cell.why.encode()) % 2**31))
 
 
 def test_chunked_prefill_continuation() -> None:
@@ -256,3 +240,41 @@ def test_rejects_out_of_contract() -> None:
         except RuntimeError:
             continue
         raise AssertionError(f"{name}: the op accepted an out-of-contract call")
+
+
+@pytest.mark.parametrize(
+    "bad,match",
+    [
+        ("width", "dispatches no kernel"),
+        ("weight_dtype", "read as x.dtype"),
+        ("token_stride", "token stride 1"),
+        ("state_stride", "state width stride"),
+        ("state_history", "shorter than width"),
+        ("slot", "inside conv_states"),
+        ("missing_state", "requires conv_states"),
+    ],
+)
+def test_guard_refuses_silent_wrong_inputs(bad, match) -> None:
+    dim = 768
+    x = torch.randn(dim, 10, dtype=torch.bfloat16, device="cuda")
+    weight = torch.randn(dim, WIDTH, dtype=torch.bfloat16, device="cuda")
+    states = _Pool(dim).states
+    qsl = torch.tensor([0, 10], dtype=torch.int32, device="cuda")
+    idx = torch.tensor([0], dtype=torch.int32, device="cuda")
+    init = torch.tensor([True], dtype=torch.bool, device="cuda")
+    if bad == "width":
+        weight = torch.zeros(dim, 5, dtype=x.dtype, device="cuda")
+    elif bad == "weight_dtype":
+        weight = weight.float()
+    elif bad == "token_stride":
+        x = torch.randn(dim, 20, dtype=x.dtype, device="cuda")[:, ::2]
+    elif bad == "state_stride":
+        states = torch.zeros(NUM_SLOTS, dim, 6, dtype=x.dtype, device="cuda")[:, :, ::2]
+    elif bad == "state_history":
+        states = states[:, :, :1]
+    elif bad == "slot":
+        idx.fill_(NUM_SLOTS)
+    elif bad == "missing_state":
+        states = None
+    with pytest.raises(AssertionError, match=match), validating(causal_conv1d_fwd):
+        causal_conv1d_fwd(x, weight, None, states, qsl, idx, init, True, PAD_SLOT_ID)

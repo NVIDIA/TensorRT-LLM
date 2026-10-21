@@ -5,8 +5,7 @@
 A state type, not an entry: it launches nothing per call. Its constructor is eager; the target builds one per
 device in ``post_load_weights`` (before any CUDA-graph capture) and passes it to every ``ssm/k3_kda_attn`` and
 ``ssm/k3_kda_decode_attn`` call on that device, of every KDA layer. ``ssm/k3_kda_attn``'s sibling
-``k3_kda_qkvg`` (the projection stream alone) takes a set of its own, made with ``ctas=CTAS``. The contract is the
-``## State`` section of ``k3_kda_attn.md``.
+``k3_kda_qkvg`` (the projection stream alone) takes a set of its own, made with ``ctas=CTAS``.
 """
 
 from __future__ import annotations
@@ -26,8 +25,7 @@ class K3KdaBuffers:
     """The projection's Lamport set: three buffers of every published word, each word the sentinel (all ones) until a
     launch writes it, and each CTA's buffer index. A launch writes buffer ``e = epoch[cta]``, re-arms buffer
     ``(e + 1) % 3`` (the next launch's) to the sentinel and leaves ``epoch[cta] = (e + 1) % 3``, so launches on one
-    set run one at a time, in stream order, and every launch moves every index once (see the contract's
-    ``## State``)."""
+    set run one at a time, in stream order, and every launch moves every index once."""
 
     p1: torch.Tensor
     """int16 [3 * 8 * 1664]: per buffer, 8 token rows of the q, k and f_a columns (bf16 bits)."""

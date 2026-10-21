@@ -1,13 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test for the k3_ctm_gemv_long catalog entry.
+"""GPU test for the k3_ctm_gemv_long catalog entry."""
 
-The Kimi K3 TP16 per-rank shapes with their call sites' sig_col0, split, ring and push, at every M in 1..8: error of
-the plain (sig_col0=-1) output against an fp64 product of the same bf16 inputs, the sigmoid columns torch.sigmoid of
-that output bit for bit, identical bits on a repeated call, and each M's rows bit-identical to the same rows of the
-8-row call. The schedule-only flags (ring, push, trigger_early) move no bits, a CUDA-graph replay returns the eager
-bits, and calls outside the op's preconditions raise ValueError.
-"""
+import zlib
 
 import pytest
 import torch
@@ -16,6 +11,9 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.k3_ctm_gemv_long
     k3_ctm_gemv_long,
 )
 
+__extra_import_path__ = [".."]
+from _validating import validating
+
 assert torch.cuda.is_available(), "k3_ctm_gemv_long requires a CUDA device"
 # The receipts are sm_100 ones; CI's other architectures skip this file.
 pytestmark = pytest.mark.skipif(
@@ -23,18 +21,15 @@ pytestmark = pytest.mark.skipif(
 )
 
 M_ALL = range(1, 9)
-TOL = 8e-3  # max |y - ref| / max |ref| against an fp64 product of the same bf16 inputs
+TOL = 8e-3
 
 # (N, K, sig_col0, split, ring, push), as each call site passes them. mla_qkv_a_gate is the fused
 # [W_a; W_g] projection, its gate columns returned as bf16(sigmoid).
 CELLS = {
-    "mla_qkv_a_gate": (2880, 7168, 2112, 6, 6, True),
-    "dense_gate_up": (4224, 7168, -1, 4, 5, False),
-    "dense_down": (7168, 2112, -1, 2, 6, False),  # K 2112 ends in a half k-tile
-    "drafter_qkv": (512, 7168, -1, 8, 6, True),
-    "drafter_gate_up": (1792, 7168, -1, 8, 6, True),
-    "drafter_gate_up_synthetic": (1536, 7168, -1, 8, 6, True),
-    "kda_qkvg": (3208, 7168, -1, 5, 6, True),  # 25 whole 128-row blocks and an 8-row last one
+    cell.spec["name"]: tuple(
+        cell.spec[key] for key in ("n", "k", "sig_col0", "split", "ring", "push")
+    )
+    for cell in k3_ctm_gemv_long.CELLS
 }
 
 # One flag changed from a call site's values; each must return the call site's bits.
@@ -66,29 +61,41 @@ def _rel(y: torch.Tensor, ref: torch.Tensor) -> float:
     return (y.double() - ref).abs().max().item() / ref.abs().max().item()
 
 
-def test_call_site_cells() -> None:
-    for name, (n, k, sig, split, ring, push) in CELLS.items():
-        w = _weight(n, k)
-        x8 = _rows(k)
-        ref8 = x8.double() @ w.double().t()
+@pytest.mark.parametrize(
+    "cell", k3_ctm_gemv_long.CELLS, ids=[c.why[:40] for c in k3_ctm_gemv_long.CELLS]
+)
+def test_call_site_cells(cell) -> None:
+    spec = cell.spec
+    n, k, sig, split, ring, push = (
+        spec[key] for key in ("n", "k", "sig_col0", "split", "ring", "push")
+    )
+    seed = zlib.crc32(cell.why.encode()) % 2**31
+    w = _randn(n, k, seed, 0.02)
+    x8 = _randn(8, k, seed + 1, 1.0)
+    ref8 = k3_ctm_gemv_long.reference(x8, w, sig, split, ring, True, push)
+    plain_ref8 = (
+        k3_ctm_gemv_long.reference(x8, w, -1, split, ring, True, push) if sig >= 0 else ref8
+    )
+    with validating(k3_ctm_gemv_long):
         y8 = k3_ctm_gemv_long(x8, w, sig, split, ring, True, push)
-        for m in M_ALL:
-            cell = f"{name} M={m}"
+        for m in spec["ms"]:
+            label = f"{cell.why} M={m}"
             x = x8[:m].contiguous()
             y = k3_ctm_gemv_long(x, w, sig, split, ring, True, push)
-            assert y.shape == (m, n) and y.dtype == torch.bfloat16, cell
+            assert y.shape == (m, n) and y.dtype == torch.bfloat16, label
+            assert _rel(y, ref8[:m]) <= TOL, label
             again = k3_ctm_gemv_long(x, w, sig, split, ring, True, push)
-            assert torch.equal(_bits(y), _bits(again)), f"{cell}: a repeated call changed bits"
-            assert torch.equal(_bits(y), _bits(y8[:m])), f"{cell}: rows differ from the 8-row call"
+            assert torch.equal(_bits(y), _bits(again)), f"{label}: a repeated call changed bits"
+            assert torch.equal(_bits(y), _bits(y8[:m])), f"{label}: rows differ from the 8-row call"
             plain = k3_ctm_gemv_long(x, w, -1, split, ring, True, push) if sig >= 0 else y
-            rel = _rel(plain, ref8[:m])
-            assert rel <= TOL, f"{cell}: max |y - ref| / max |ref| = {rel:.2e} > {TOL}"
+            rel = _rel(plain, plain_ref8[:m])
+            assert rel <= TOL, f"{label}: max |y - ref| / max |ref| = {rel:.2e} > {TOL}"
             if sig >= 0:
                 assert torch.equal(_bits(y[:, :sig]), _bits(plain[:, :sig])), (
-                    f"{cell}: columns before sig_col0 differ from the sig_col0=-1 call"
+                    f"{label}: columns before sig_col0 differ from the sig_col0=-1 call"
                 )
                 assert torch.equal(_bits(y[:, sig:]), _bits(plain[:, sig:].sigmoid())), (
-                    f"{cell}: columns from sig_col0 on are not torch.sigmoid of the sig_col0=-1 call"
+                    f"{label}: columns from sig_col0 on are not torch.sigmoid of the sig_col0=-1 call"
                 )
 
 
@@ -152,3 +159,27 @@ def test_unsupported_calls_raise_value_error() -> None:
         except ValueError:
             continue
         raise AssertionError(f"{name}: expected ValueError, the op accepted the call")
+
+
+@pytest.mark.parametrize("operand", ("x", "weight"))
+def test_guard_refuses_misaligned_inputs(operand) -> None:
+    x = _rows(2112)[:1]
+    weight = _weight(7168, 2112)
+    source = x if operand == "x" else weight
+    flat = torch.empty(source.numel() + 1, dtype=source.dtype, device=source.device)
+    misaligned = flat[1:].view(source.shape)
+    if operand == "x":
+        x = misaligned
+    else:
+        weight = misaligned
+    with pytest.raises(AssertionError, match="16-byte-aligned"):
+        with validating(k3_ctm_gemv_long):
+            k3_ctm_gemv_long(x, weight, split=2, ring=6)
+
+
+def test_guard_refuses_weight_on_another_device() -> None:
+    x = _rows(2112)[:1]
+    weight = torch.empty(128, 2112, dtype=torch.bfloat16)
+    with pytest.raises(AssertionError, match="weight must be on"):
+        with validating(k3_ctm_gemv_long):
+            k3_ctm_gemv_long(x, weight, split=2, ring=6)

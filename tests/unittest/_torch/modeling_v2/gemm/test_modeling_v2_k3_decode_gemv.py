@@ -1,18 +1,17 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test for the k3_decode_gemv catalog entry.
-
-Both kernels at Kimi K3's TP16 per-rank shapes, at every M in 1..8, against an fp64 torch product (error at most 8e-3
-of max |ref|), with run-to-run bits, each M's rows equal to the same rows of the 8-row call, trigger_early False equal
-to True, a CUDA graph replayed with its input rewritten, and the refused calls.
-"""
+"""GPU test for the k3_decode_gemv catalog entry."""
 
 import functools
+import zlib
 
 import pytest
 import torch
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.k3_decode_gemv import k3_decode_gemv
+
+__extra_import_path__ = [".."]
+from _validating import validating
 
 assert torch.cuda.is_available(), "k3_decode_gemv requires a CUDA device"
 # The receipts are sm_100 ones; CI's other architectures skip this file.
@@ -20,12 +19,11 @@ pytestmark = pytest.mark.skipif(
     torch.cuda.get_device_capability() != (10, 0), reason="certified on sm_100 only"
 )
 
-TOL = 8e-3  # max |y - ref| / max |ref|, ref an fp64 product
-M_ALL = range(1, 9)
+TOL = 8e-3
 # (N, K) per rank at TP16. The KDA o_proj: short K, one CTA per 128-row weight tile with the whole K resident.
-SHORT_K = (7168, 768)
+SHORT_K = tuple(k3_decode_gemv.CELLS[0].spec[key] for key in ("n", "k"))
 # The KDA input projection: split K over clusters of 4 CTAs; N is not a multiple of 128 (the last tile has 8 rows).
-SPLIT_K = (3208, 7168)
+SPLIT_K = tuple(k3_decode_gemv.CELLS[1].spec[key] for key in ("n", "k"))
 
 
 def _bits(t: torch.Tensor) -> torch.Tensor:
@@ -41,9 +39,9 @@ def _rel(y: torch.Tensor, ref: torch.Tensor) -> float:
 
 
 @functools.lru_cache(maxsize=None)
-def _inputs(n: int, k: int) -> tuple[torch.Tensor, torch.Tensor]:
+def _inputs(n: int, k: int, seed: int | None = None) -> tuple[torch.Tensor, torch.Tensor]:
     """The weight [N, K] and 8 activation rows [8, K]."""
-    gen = torch.Generator(device="cuda").manual_seed(n * 100003 + k)
+    gen = torch.Generator(device="cuda").manual_seed(n * 100003 + k if seed is None else seed)
     weight = (torch.randn(n, k, generator=gen, device="cuda") * 0.03).bfloat16()
     x8 = torch.randn(8, k, generator=gen, device="cuda").bfloat16()
     # The kernels read the weight before their PDL grid-dependency wait: it is written well before any call.
@@ -51,37 +49,31 @@ def _inputs(n: int, k: int) -> tuple[torch.Tensor, torch.Tensor]:
     return weight, x8
 
 
-def _check_cells(shape: tuple[int, int]) -> None:
-    n, k = shape
-    weight, x8 = _inputs(n, k)
+@pytest.mark.parametrize(
+    "cell", k3_decode_gemv.CELLS, ids=[c.why[:40] for c in k3_decode_gemv.CELLS]
+)
+def test_certified_cells(cell) -> None:
+    n, k = (cell.spec[key] for key in ("n", "k"))
+    weight, x8 = _inputs(n, k, zlib.crc32(cell.why.encode()) % 2**31)
     first = {}
-    for trigger_early in (True, False):
-        y8 = k3_decode_gemv(x8, weight, trigger_early)
-        for m in M_ALL:
-            x = x8[:m]
-            y = k3_decode_gemv(x, weight, trigger_early)
-            again = k3_decode_gemv(x, weight, trigger_early)
-            ref = x.double() @ weight.double().t()
-            assert y.shape == (m, n) and y.dtype == torch.bfloat16 and y.device == x.device
-            assert y.is_contiguous()
-            err = _rel(y, ref)
-            assert err <= TOL, f"{shape} M={m} trigger_early={trigger_early}: rel {err:.3e}"
-            assert _same(y, again), f"{shape} M={m}: a rerun differs"
-            assert _same(y, y8[:m]), f"{shape} M={m}: rows differ from the 8-row call"
-            if trigger_early:
-                first[m] = y
-            else:
-                assert _same(y, first[m]), f"{shape} M={m}: trigger_early changes the result"
-
-
-def test_short_k_cells() -> None:
-    """[7168, 768] (one CTA per 128-row tile, the whole K resident) at every M, trigger_early True and False."""
-    _check_cells(SHORT_K)
-
-
-def test_split_k_cells() -> None:
-    """[3208, 7168] (clusters of 4 CTAs over K) at every M, trigger_early True and False."""
-    _check_cells(SPLIT_K)
+    with validating(k3_decode_gemv):
+        for trigger_early in cell.spec["trigger_early"]:
+            ref8 = k3_decode_gemv.reference(x8, weight, trigger_early)
+            y8 = k3_decode_gemv(x8, weight, trigger_early)
+            for m in cell.spec["ms"]:
+                x = x8[:m]
+                y = k3_decode_gemv(x, weight, trigger_early)
+                again = k3_decode_gemv(x, weight, trigger_early)
+                assert y.shape == (m, n) and y.dtype == torch.bfloat16 and y.device == x.device
+                assert y.is_contiguous()
+                err = _rel(y, ref8[:m])
+                assert err <= TOL, f"{cell.why} M={m} trigger_early={trigger_early}: rel {err:.3e}"
+                assert _same(y, again), f"{cell.why} M={m}: a rerun differs"
+                assert _same(y, y8[:m]), f"{cell.why} M={m}: rows differ from the 8-row call"
+                if trigger_early:
+                    first[m] = y
+                else:
+                    assert _same(y, first[m]), f"{cell.why} M={m}: trigger_early changes the result"
 
 
 def test_graph_replay() -> None:
@@ -121,3 +113,27 @@ def test_refused_calls() -> None:
         w = torch.zeros(n, k, dtype=torch.bfloat16, device="cuda")
         with pytest.raises(ValueError, match="unsupported call"):
             k3_decode_gemv(x, w)
+
+
+@pytest.mark.parametrize("operand", ("x", "weight"))
+def test_guard_refuses_misaligned_inputs(operand) -> None:
+    weight, x8 = _inputs(*SHORT_K)
+    x = x8[:1]
+    source = x if operand == "x" else weight
+    flat = torch.empty(source.numel() + 1, dtype=source.dtype, device=source.device)
+    misaligned = flat[1:].view(source.shape)
+    if operand == "x":
+        x = misaligned
+    else:
+        weight = misaligned
+    with pytest.raises(AssertionError, match="16-byte-aligned"):
+        with validating(k3_decode_gemv):
+            k3_decode_gemv(x, weight)
+
+
+def test_guard_refuses_weight_on_another_device() -> None:
+    _, x8 = _inputs(*SHORT_K)
+    weight = torch.empty(128, SHORT_K[1], dtype=torch.bfloat16)
+    with pytest.raises(AssertionError, match="weight must be on"):
+        with validating(k3_decode_gemv):
+            k3_decode_gemv(x8[:1], weight)

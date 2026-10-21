@@ -3,15 +3,20 @@
 """GPU test for the k3_situ_mul catalog entry.
 
 The Kimi K3 dense MLP's SiTU-and-mul at TP16 (gate_up [M, 4224] -> [M, 2112]) with the checkpoint's and the default
-(beta, linear_beta), at every M in 1..8: error against SituAndMul's formula evaluated in fp64, identical bits on a
+(beta, linear_beta), at every M in 1..8: error against SituAndMul's formula evaluated in fp32, identical bits on a
 repeated call, and each M's rows bit-identical to the same rows of the 8-row call. A CUDA-graph replay returns the
 eager bits, calls outside the op's preconditions raise ValueError, and the wrapper refuses linear_beta=0.0.
 """
+
+import zlib
 
 import pytest
 import torch
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.activation.k3_situ_mul import k3_situ_mul
+
+__extra_import_path__ = [".."]
+from _validating import validating
 
 assert torch.cuda.is_available(), "k3_situ_mul requires a CUDA device"
 # The receipts are sm_100 ones; CI's other architectures skip this file.
@@ -19,8 +24,7 @@ pytestmark = pytest.mark.skipif(
     torch.cuda.get_device_capability() != (10, 0), reason="certified on sm_100 only"
 )
 
-M_ALL = range(1, 9)
-TOL = 8e-3  # max |y - ref| / max |ref| against the formula evaluated in fp64
+TOL = 8e-3
 K = 2112  # the dense MLP's intermediate size per rank at TP16
 SITU = {"k3": (4.0, 25.0), "defaults": (1.0, None)}  # (beta, linear_beta)
 
@@ -34,16 +38,6 @@ def _gate_up() -> torch.Tensor:
     return _randn(8, 2 * K, 14, 2.0)
 
 
-def _situ_ref(gu: torch.Tensor, beta: float, linear_beta: float | None) -> torch.Tensor:
-    """SituAndMul's eager fp32 formula, evaluated in fp64."""
-    k = gu.shape[1] // 2
-    g, u = gu[:, :k].double(), gu[:, k:].double()
-    a = beta * torch.tanh(g / beta) * torch.sigmoid(g)
-    if linear_beta is not None:
-        u = linear_beta * torch.tanh(u / linear_beta)
-    return a * u
-
-
 def _bits(t: torch.Tensor) -> torch.Tensor:
     return t.contiguous().view(torch.int16)
 
@@ -53,21 +47,22 @@ def _rel(y: torch.Tensor, ref: torch.Tensor) -> float:
     return (y.double() - ref).abs().max().item() / ref.abs().max().item()
 
 
-def test_call_site_cells() -> None:
-    gu8 = _gate_up()
-    for name, (beta, linear_beta) in SITU.items():
-        ref8 = _situ_ref(gu8, beta, linear_beta)
+@pytest.mark.parametrize("cell", k3_situ_mul.CELLS, ids=[c.why[:40] for c in k3_situ_mul.CELLS])
+def test_call_site_cells(cell) -> None:
+    spec = cell.spec
+    gu8 = _randn(8, spec["width"], zlib.crc32(cell.why.encode()) % 2**31, 2.0)
+    m, beta, linear_beta = spec["rows"], spec["beta"], spec["linear_beta"]
+    gu = gu8[:m].contiguous()
+    with validating(k3_situ_mul):
         y8 = k3_situ_mul(gu8, beta, linear_beta)
-        for m in M_ALL:
-            cell = f"{name} M={m}"
-            gu = gu8[:m].contiguous()
-            y = k3_situ_mul(gu, beta, linear_beta)
-            assert y.shape == (m, K) and y.dtype == torch.bfloat16, cell
-            rel = _rel(y, ref8[:m])
-            assert rel <= TOL, f"{cell}: max |y - ref| / max |ref| = {rel:.2e} > {TOL}"
-            again = k3_situ_mul(gu, beta, linear_beta)
-            assert torch.equal(_bits(y), _bits(again)), f"{cell}: a repeated call changed bits"
-            assert torch.equal(_bits(y), _bits(y8[:m])), f"{cell}: rows differ from the 8-row call"
+        y = k3_situ_mul(gu, beta, linear_beta)
+        again = k3_situ_mul(gu, beta, linear_beta)
+    ref = k3_situ_mul.reference(gu, beta, linear_beta)
+    assert y.shape == (m, K) and y.dtype == torch.bfloat16, cell.why
+    rel = _rel(y, ref)
+    assert rel <= TOL, f"{cell.why}: max |y - ref| / max |ref| = {rel:.2e} > {TOL}"
+    assert torch.equal(_bits(y), _bits(again)), f"{cell.why}: a repeated call changed bits"
+    assert torch.equal(_bits(y), _bits(y8[:m])), f"{cell.why}: rows differ from the 8-row call"
 
 
 def test_cuda_graph_replay_matches_eager() -> None:
@@ -115,7 +110,8 @@ def test_zero_linear_beta_is_refused_before_dispatch() -> None:
     gu = _gate_up()[:1]
     for linear_beta in (0.0, -0.0):
         try:
-            k3_situ_mul(gu, 4.0, linear_beta)
+            with validating(k3_situ_mul):
+                k3_situ_mul(gu, 4.0, linear_beta)
         except AssertionError:
             continue
         raise AssertionError(f"linear_beta={linear_beta} should have been refused before dispatch")

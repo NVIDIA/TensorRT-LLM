@@ -1,16 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test for the k3_head_gemv catalog entry.
-
-Kimi K3's TP16 per-rank LM-head vocabulary shard [10240, 7168] on the stream-K schedule, at every M in 1..8, against an
-fp64 torch product (error at most 8e-3 of max |ref|), with run-to-run bits and each M's rows equal to the same rows of
-the 8-row call. The caller-owned workspace is driven through real call sequences: M dipping and growing back on one
-workspace, two workspaces interleaved, two weights on one workspace, and a CUDA graph replayed between eager calls on
-the same workspace, every call against the same call on a fresh workspace and every flag / count word back at zero
-after. Negative controls: a workspace of another shape is refused, and so is creating one under capture.
-"""
+"""GPU test for the k3_head_gemv catalog entry."""
 
 import functools
+import zlib
 
 import pytest
 import torch
@@ -20,14 +13,16 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.k3_head_gemv imp
     k3_head_gemv,
 )
 
+__extra_import_path__ = [".."]
+from _validating import validating
+
 assert torch.cuda.is_available(), "k3_head_gemv requires a CUDA device"
 # The receipts are sm_100 ones; CI's other architectures skip this file.
 pytestmark = pytest.mark.skipif(
     torch.cuda.get_device_capability() != (10, 0), reason="certified on sm_100 only"
 )
 
-TOL = 8e-3  # max |y - ref| / max |ref|, ref an fp64 product
-M_ALL = range(1, 9)
+TOL = 8e-3
 VOCAB_SHARD, HIDDEN = 10240, 7168  # Kimi K3's 163840-row LM head over 16 ranks
 TILES = VOCAB_SHARD // 128
 
@@ -45,12 +40,14 @@ def _rel(y: torch.Tensor, ref: torch.Tensor) -> float:
 
 
 @functools.lru_cache(maxsize=None)
-def _inputs() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+def _inputs(
+    seed: int = 20261001, n: int = VOCAB_SHARD, k: int = HIDDEN
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Two shard weights (e.g. the target's LM head and DSpark's draft head) and 8 activation rows."""
-    gen = torch.Generator(device="cuda").manual_seed(20261001)
-    weight = (torch.randn(VOCAB_SHARD, HIDDEN, generator=gen, device="cuda") * 0.02).bfloat16()
-    weight2 = (torch.randn(VOCAB_SHARD, HIDDEN, generator=gen, device="cuda") * 0.02).bfloat16()
-    x8 = torch.randn(8, HIDDEN, generator=gen, device="cuda").bfloat16()
+    gen = torch.Generator(device="cuda").manual_seed(seed)
+    weight = (torch.randn(n, k, generator=gen, device="cuda") * 0.02).bfloat16()
+    weight2 = (torch.randn(n, k, generator=gen, device="cuda") * 0.02).bfloat16()
+    x8 = torch.randn(8, k, generator=gen, device="cuda").bfloat16()
     # The kernel reads the weight before its PDL grid-dependency wait: it is written well before any call.
     torch.cuda.synchronize()
     return weight, weight2, x8
@@ -65,35 +62,42 @@ def _at_rest(ws: K3HeadGemvWorkspace) -> bool:
     return not bool(ws.flags.any()) and not bool(ws.claim.any())
 
 
-def test_certified_cells() -> None:
+@pytest.mark.parametrize("cell", k3_head_gemv.CELLS, ids=[c.why[:40] for c in k3_head_gemv.CELLS])
+def test_certified_cells(cell) -> None:
     """Every M on one workspace: shape, dtype, error, rerun and 8-row-call bits, the words at zero after each call;
     keep_tiles 40 and 80 bit-identical to 0."""
-    weight, _, x8 = _inputs()
-    ws = _workspace()
+    n, k = (cell.spec[key] for key in ("n", "k"))
+    weight, weight2, x8 = _inputs(zlib.crc32(cell.why.encode()) % 2**31, n, k)
+    weight = (weight, weight2)[cell.spec["weight_index"]]
+    assert weight.shape == (n, k)
+    ws = K3HeadGemvWorkspace.create(n, k, weight.device)
     assert ws.schedule == "streamk" and ws.chunk_tiles == 0
     assert ws.partials.dtype == torch.float32 and ws.flags.dtype == torch.int32
     assert ws.claim.dtype == torch.int32 and ws.claim.numel() == 1
     # One flag word and one [128 x 8] fp32 partial slot per (tile, piece).
     assert ws.flags.numel() % TILES == 0 and ws.partials.numel() == ws.flags.numel() * 128 * 8
     assert _at_rest(ws)
-    y8 = k3_head_gemv(x8, weight, ws)
-    for m in M_ALL:
-        x = x8[:m]
-        y = k3_head_gemv(x, weight, ws)
-        again = k3_head_gemv(x, weight, ws)
-        ref = x.double() @ weight.double().t()
-        assert y.shape == (m, VOCAB_SHARD) and y.dtype == torch.bfloat16 and y.device == x.device
-        assert y.is_contiguous()
-        err = _rel(y, ref)
-        assert err <= TOL, f"M={m}: rel {err:.3e}"
-        assert _same(y, again), f"M={m}: a rerun differs"
-        assert _same(y, y8[:m]), f"M={m}: rows differ from the 8-row call"
-        assert _at_rest(ws), f"M={m}: words left raised"
-    for m in (1, 8):
-        for keep in (TILES // 2, TILES):
-            y = k3_head_gemv(x8[:m], weight, ws, keep_tiles=keep)
-            assert _same(y, y8[:m]), f"M={m} keep_tiles={keep}: result differs"
-    assert _at_rest(ws)
+    ref8 = k3_head_gemv.reference(x8, weight, ws)
+    with validating(k3_head_gemv):
+        y8 = k3_head_gemv(x8, weight, ws)
+        for m in cell.spec["ms"]:
+            x = x8[:m]
+            y = k3_head_gemv(x, weight, ws)
+            again = k3_head_gemv(x, weight, ws)
+            assert y.shape == (m, n) and y.dtype == torch.bfloat16 and y.device == x.device
+            assert y.is_contiguous()
+            err = _rel(y, ref8[:m])
+            assert err <= TOL, f"M={m}: rel {err:.3e}"
+            assert _same(y, again), f"M={m}: a rerun differs"
+            assert _same(y, y8[:m]), f"M={m}: rows differ from the 8-row call"
+            assert _at_rest(ws), f"M={m}: words left raised"
+        for m in (1, 8):
+            for keep in cell.spec["keep_tiles"]:
+                y = k3_head_gemv(x8[:m], weight, ws, keep_tiles=keep)
+                ref = k3_head_gemv.reference(x8[:m], weight, ws, keep_tiles=keep)
+                assert _rel(y, ref) <= TOL, f"M={m} keep_tiles={keep}"
+                assert _same(y, y8[:m]), f"M={m} keep_tiles={keep}: result differs"
+        assert _at_rest(ws)
 
 
 def test_m_dipping_and_growing_on_one_workspace() -> None:
@@ -181,3 +185,27 @@ def test_refusals() -> None:
     with pytest.raises(ValueError, match="unsupported call"):
         k3_head_gemv(x8[:1], odd, ws)
     assert _at_rest(ws)
+
+
+@pytest.mark.parametrize("operand", ("x", "weight"))
+def test_guard_refuses_misaligned_inputs(operand) -> None:
+    weight, _, x8 = _inputs()
+    x = x8[:1]
+    source = x if operand == "x" else weight
+    flat = torch.empty(source.numel() + 1, dtype=source.dtype, device=source.device)
+    misaligned = flat[1:].view(source.shape)
+    if operand == "x":
+        x = misaligned
+    else:
+        weight = misaligned
+    with pytest.raises(AssertionError, match="16-byte-aligned"):
+        with validating(k3_head_gemv):
+            k3_head_gemv(x, weight, _workspace())
+
+
+def test_guard_refuses_weight_on_another_device() -> None:
+    _, _, x8 = _inputs()
+    weight = torch.empty(VOCAB_SHARD, HIDDEN, dtype=torch.bfloat16)
+    with pytest.raises(AssertionError, match="weight must be on"):
+        with validating(k3_head_gemv):
+            k3_head_gemv(x8[:1], weight, _workspace())

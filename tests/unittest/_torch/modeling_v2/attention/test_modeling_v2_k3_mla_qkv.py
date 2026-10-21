@@ -20,6 +20,7 @@ Covered, at Kimi K3's per-rank shapes (6 heads at TP16, 24 at TP4; q_lora 1536, 
    step's positions and leaves its own slot unwritten, which the pool comparison sees.
 """
 
+import zlib
 from typing import Dict
 
 import pytest
@@ -27,8 +28,10 @@ import torch
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.k3_mla_qkv import (
     k3_mla_q,
-    k3_mla_qkv,
     k3_mla_qkv_out,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.k3_mla_qkv import (
+    k3_mla_qkv as op,
 )
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.attention.backends.utils import create_attention
@@ -39,6 +42,9 @@ from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.internal.batch_manager import CacheType
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
+
+__extra_import_path__ = [".."]
+from _validating import validating
 
 
 def _is_sm100() -> bool:
@@ -79,23 +85,6 @@ def _ag(seed: int, m: int, heads: int) -> torch.Tensor:
     """The fused projection's rows: [q_a 1536 | kv_a latent 512 | rope 64 | gate heads * 128]."""
     gen = torch.Generator(device="cuda").manual_seed(seed)
     return (torch.randn(m, QL + DQK + heads * V, generator=gen, device="cuda") * 0.7).bfloat16()
-
-
-def _reference_q(ag, w_qa, w_qb, w_kb):
-    """The norm in fp32, the GEMMs in float64, bf16 rounding where the model rounds (norm output, q_b output, q_abs)."""
-    m, heads = ag.shape[0], w_kb.shape[0]
-    x = ag[:, :QL].float()
-    qn = (x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + EPS) * w_qa.float()).bfloat16()
-    q = (qn.double() @ w_qb.double().t()).bfloat16().view(m, heads, QK)
-    q_abs = torch.einsum("thd,hcd->thc", q[..., :NOPE].double(), w_kb.double()).bfloat16()
-    return torch.cat([q_abs, q[..., NOPE:]], dim=-1).reshape(m, heads * DQK)
-
-
-def _reference_kv(ag, w_kv):
-    """The cache rows in fp32 ((x * rrms) * w, one bf16 rounding); the rope columns copied."""
-    x = ag[:, QL : QL + LAT].float()
-    r = torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + KV_EPS)
-    return torch.cat([((x * r) * w_kv.float()).bfloat16(), ag[:, QL + LAT : QL + DQK]], dim=-1)
 
 
 def _max_rel(a, b) -> float:
@@ -195,20 +184,21 @@ class _MlaCache:
 
 def _call(view: dict, ag, weights) -> torch.Tensor:
     w_qa, w_qb, w_kb, w_kv = weights
-    return k3_mla_qkv(
-        ag,
-        w_qa,
-        EPS,
-        w_qb,
-        w_kb,
-        w_kv,
-        KV_EPS,
-        view["pool"],
-        view["row_stride"],
-        view["page_table"],
-        view["page_offset"],
-        view["seq_len"],
-    )
+    with validating(op):
+        return op(
+            ag,
+            w_qa,
+            EPS,
+            w_qb,
+            w_kb,
+            w_kv,
+            KV_EPS,
+            view["pool"],
+            view["row_stride"],
+            view["page_table"],
+            view["page_offset"],
+            view["seq_len"],
+        )
 
 
 def _dense(ag, weights):
@@ -219,13 +209,38 @@ def _dense(ag, weights):
     return y, rows
 
 
-def _check_cell(y, rows, ag, weights) -> None:
+def _check_cell(cache, layer, view, y, rows, ag, weights) -> None:
     """fused_q and the stored rows against the references; the q-only form's fused_q bit-identical."""
     w_qa, w_qb, w_kb, w_kv = weights
     m = ag.shape[0]
     y_q = k3_mla_q(ag, w_qa, EPS, w_qb, w_kb)
-    ref_q = _reference_q(ag, w_qa, w_qb, w_kb).view(m, -1, DQK)
-    ref_kv = _reference_kv(ag, w_kv)
+    ref_pool = torch.empty_like(view["pool"])
+    ref_pool.view(torch.int16).fill_(SENTINEL)
+    ref_q = op.reference(
+        ag,
+        w_qa,
+        EPS,
+        w_qb,
+        w_kb,
+        w_kv,
+        KV_EPS,
+        ref_pool,
+        view["row_stride"],
+        view["page_table"],
+        view["page_offset"],
+        view["seq_len"],
+    ).view(m, -1, DQK)
+    layer_pool = cache.mgr.get_buffers(layer)
+    ref_layer = ref_pool.as_strided(
+        layer_pool.shape, layer_pool.stride(), layer_pool.storage_offset()
+    )
+    ref_kv = torch.stack(
+        [
+            ref_layer[cache.blocks[layer][i][pos // PAGE], 0, pos % PAGE, 0]
+            for i, cached in enumerate(cache.cached)
+            for pos in range(cached, cached + cache.tokens)
+        ]
+    )
     torch.cuda.synchronize()
     for part in (slice(0, LAT), slice(LAT, DQK)):
         assert _max_rel(y.view(m, -1, DQK)[..., part], ref_q[..., part]) <= 2e-2
@@ -234,19 +249,19 @@ def _check_cell(y, rows, ag, weights) -> None:
     assert torch.equal(_bits(y), _bits(y_q))
 
 
-# (R, T, heads): T 1 (decode without speculation) and 8 (a DSpark verify step), up to 8 requests, the TP4 head count.
-CASES = [(3, 1, H), (8, 1, H), (2, 8, H), (8, 8, H), (2, 8, 4 * H)]
-CASE_IDS = [f"{r}x{t}-h{h}" for r, t, h in CASES]
 EAGER_STEPS, GRAPH_STEPS = 2, 2
 
 
-@pytest.mark.parametrize("num_requests,tokens,heads", CASES, ids=CASE_IDS)
-def test_layers_by_steps_eager_then_graph(num_requests, tokens, heads):
+@pytest.mark.parametrize("cell", op.CELLS, ids=[c.why[:40] for c in op.CELLS])
+def test_layers_by_steps_eager_then_graph(cell):
     """LAYERS layers x EAGER_STEPS decode steps called eagerly, then one step captured as a CUDA graph and replayed
     for GRAPH_STEPS steps with rewritten inputs and the metadata prepared for each step: after every step each
     layer's whole pool equals its expected image (the step's rows at the manager's blocks, nothing else written),
     and every call's outputs pass the cell checks."""
-    seed = 31 * num_requests + tokens + heads
+    num_requests = cell.spec["num_requests"]
+    tokens = cell.spec["tokens"]
+    heads = cell.spec["heads"]
+    seed = zlib.crc32(cell.why.encode()) % 2**31
     weights = [_weights(seed + layer, heads) for layer in range(LAYERS)]
     cache = _MlaCache(num_requests, tokens, EAGER_STEPS + GRAPH_STEPS, heads, seed)
     m = num_requests * tokens
@@ -256,9 +271,10 @@ def test_layers_by_steps_eager_then_graph(num_requests, tokens, heads):
             cache.prepare(md)
             for layer in range(LAYERS):
                 ag = _ag(1000 * step + 10 * layer + seed, m, heads)
-                y = _call(cache.view(md, layer), ag, weights[layer])
+                view = cache.view(md, layer)
+                y = _call(view, ag, weights[layer])
                 y_dense, rows = _dense(ag, weights[layer])
-                _check_cell(y, rows, ag, weights[layer])
+                _check_cell(cache, layer, view, y, rows, ag, weights[layer])
                 assert torch.equal(_bits(y), _bits(y_dense))
                 cache.record(layer, rows)
             for layer in range(LAYERS):
@@ -286,6 +302,9 @@ def test_layers_by_steps_eager_then_graph(num_requests, tokens, heads):
             graph.replay()
             for layer in range(LAYERS):
                 y_dense, rows = _dense(inputs[layer], weights[layer])
+                _check_cell(
+                    cache, layer, views[layer], static_y[layer], rows, inputs[layer], weights[layer]
+                )
                 torch.cuda.synchronize()
                 assert torch.equal(_bits(static_y[layer]), _bits(y_dense)), (step, layer)
                 cache.record(layer, rows)

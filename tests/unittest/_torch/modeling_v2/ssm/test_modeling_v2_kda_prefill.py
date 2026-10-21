@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """GPU test for the kda_prefill catalog entry."""
 
+import zlib
 from typing import List
 
 import _kda_reference as kr
@@ -10,6 +11,9 @@ import torch
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.ssm.kda_prefill import kda_prefill
 from tensorrt_llm._torch.modules.fla.index import prepare_chunk_indices
+
+__extra_import_path__ = [".."]
+from _validating import validating
 
 assert torch.cuda.is_available(), "kda_prefill requires a CUDA device"
 pytestmark = pytest.mark.skipif(
@@ -45,20 +49,22 @@ class _Inputs:
         self.pool = storage[:, :slot].view(NUM_SLOTS, heads, HEAD_DIM, HEAD_DIM)
         self.cu_seqlens = kr.cu_seqlens_of(seq_lens, cu_dtype) if batch_rows == 1 else None
 
-    def call(self, slots: List[int], fresh: List[bool]):
+    def call(self, slots: List[int], fresh: List[bool], reference=False, pool=None):
         """Zero the fresh sequences' rows (the layer's job) and run the op as Kimi K3's layer does; return o."""
+        state_pool = self.pool if pool is None else pool
         for s, is_fresh in zip(slots, fresh):
             if is_fresh:
-                self.pool[s].zero_()
+                state_pool[s].zero_()
         state_indices = torch.tensor(slots, dtype=torch.int32, device="cuda")
         varlen = self.cu_seqlens is not None
-        return kda_prefill(
+        call = kda_prefill.reference if reference else kda_prefill
+        return call(
             self.q,
             self.k,
             self.v,
             self.g,
             self.beta,
-            self.pool,
+            state_pool,
             state_indices,
             SCALE,
             cu_seqlens=self.cu_seqlens,
@@ -81,49 +87,39 @@ def _assert_state_close(got: torch.Tensor, ref: torch.Tensor) -> None:
     kr.assert_scaled_close(got, ref, atol=1e-2)
 
 
-def _check_sequences(inp: _Inputs, o: torch.Tensor, slots, initial_states) -> None:
-    assert o.shape == inp.v.shape and o.dtype == inp.v.dtype
-    start = 0
-    for length, slot, state0 in zip(inp.seq_lens, slots, initial_states):
-        sl = slice(start, start + length)
-        ref_o, ref_s = kr.recurrent_reference(
-            inp.q[0, sl],
-            inp.k[0, sl],
-            inp.v[0, sl],
-            inp.g[0, sl],
-            inp.beta[0, sl],
-            state0,
-            inp.A_log,
-            inp.dt_bias,
-        )
-        # Chunked evaluation with bf16 operands against an fp64 recurrence: within 2e-2 of each
-        # sequence's largest output, 1e-2 of its state's largest entry.
-        kr.assert_scaled_close(o[0, sl], ref_o, atol=2e-2)
-        _assert_state_close(inp.pool[slot], ref_s)
-        start += length
-
-
-def test_kimi_k3_varlen_prefill() -> None:
+@pytest.mark.parametrize("cell", kda_prefill.CELLS, ids=[c.why[:40] for c in kda_prefill.CELLS])
+def test_kimi_k3_varlen_prefill(cell) -> None:
     # Kimi K3's prefill call at its TP16 rank slice (6 heads) and TP4 (24): a varlen batch of fresh
     # sequences and continuations (chunked prefill / a reused prefix, which start from the slot's
     # state), sequence lengths not chunk multiples, scattered slots of a padded pool. The layer's
     # cu_seqlens are int64; the op takes int32 as well.
-    for heads, seed, cu_dtype in ((6, 0, torch.int64), (24, 1, torch.int64), (6, 8, torch.int32)):
-        inp = _Inputs(heads, [100, 64, 300, 37], seed, cu_dtype=cu_dtype)
-        slots, fresh = [7, 2, 10, 4], [True, False, True, False]
-        before = inp.storage.clone()
-        initial = [
-            torch.zeros_like(inp.pool[s]) if f else inp.pool[s].clone()
-            for s, f in zip(slots, fresh)
-        ]
+    spec = cell.spec
+    inp = _Inputs(
+        spec["heads"],
+        spec["seq_lens"],
+        zlib.crc32(cell.why.encode()) % 2**31,
+        batch_rows=spec["batch_rows"],
+        cu_dtype=spec["cu_dtype"],
+    )
+    slots, fresh = spec["slots"], spec["fresh"]
+    before = inp.storage.clone()
+    ref_pool = inp.pool.clone()
+    ref_o = inp.call(slots, fresh, reference=True, pool=ref_pool)
+    with validating(kda_prefill):
         o = inp.call(slots, fresh)
-        _check_sequences(inp, o, slots, initial)
-        untouched = [s for s in range(NUM_SLOTS) if s not in slots]
-        assert torch.equal(inp.storage[untouched], before[untouched])
-        slot_floats = heads * HEAD_DIM * HEAD_DIM
-        assert torch.equal(inp.storage[:, slot_floats:], before[:, slot_floats:]), (
-            "slot padding written"
-        )
+    assert o.shape == inp.v.shape and o.dtype == inp.v.dtype
+    start = 0
+    for seq, (length, slot) in enumerate(zip(inp.seq_lens, slots)):
+        where = (0, slice(start, start + length)) if spec["batch_rows"] == 1 else (seq,)
+        kr.assert_scaled_close(o[where], ref_o[where], atol=2e-2)
+        _assert_state_close(inp.pool[slot], ref_pool[slot])
+        start += length
+    untouched = [s for s in range(NUM_SLOTS) if s not in slots]
+    assert torch.equal(inp.storage[untouched], before[untouched])
+    slot_floats = spec["heads"] * HEAD_DIM * HEAD_DIM
+    assert torch.equal(inp.storage[:, slot_floats:], before[:, slot_floats:]), (
+        "slot padding written"
+    )
 
 
 def test_continuation_equals_one_call() -> None:
@@ -170,22 +166,14 @@ def test_equal_length_batch() -> None:
     heads = 6
     inp = _Inputs(heads, [256], seed=3, batch_rows=2)
     slots = [1, 9]
-    initial = [torch.zeros_like(inp.pool[s]) for s in slots]
-    o = inp.call(slots, [True, True])
+    ref_pool = inp.pool.clone()
+    ref_o = inp.call(slots, [True, True], reference=True, pool=ref_pool)
+    with validating(kda_prefill):
+        o = inp.call(slots, [True, True])
     assert o.shape == inp.v.shape
-    for row, (slot, state0) in enumerate(zip(slots, initial)):
-        ref_o, ref_s = kr.recurrent_reference(
-            inp.q[row],
-            inp.k[row],
-            inp.v[row],
-            inp.g[row],
-            inp.beta[row],
-            state0,
-            inp.A_log,
-            inp.dt_bias,
-        )
-        kr.assert_scaled_close(o[row], ref_o, atol=2e-2)
-        _assert_state_close(inp.pool[slot], ref_s)
+    for row, slot in enumerate(slots):
+        kr.assert_scaled_close(o[row], ref_o[row], atol=2e-2)
+        _assert_state_close(inp.pool[slot], ref_pool[slot])
 
 
 def test_output_is_a_new_tensor() -> None:
@@ -240,3 +228,20 @@ def test_rejects_out_of_contract() -> None:
         except ValueError:
             continue
         raise AssertionError(f"{name}: the op accepted an out-of-contract call")
+
+
+@pytest.mark.parametrize("bad", ("head_dim", "device", "padding"))
+def test_guard_refuses_silent_wrong_inputs(bad) -> None:
+    inp = _Inputs(6, [256], seed=9)
+    if bad == "head_dim":
+        inp.q = inp.q[..., :64].contiguous()
+        match = "K == V == 128"
+    elif bad == "device":
+        inp.g = inp.g.cpu()
+        match = "share q's device"
+    else:
+        inp.cu_seqlens = kr.cu_seqlens_of([255])
+        inp.seq_lens = [255]
+        match = "padding of q/k/v/beta must be zero"
+    with pytest.raises(AssertionError, match=match), validating(kda_prefill):
+        inp.call([0], [True])

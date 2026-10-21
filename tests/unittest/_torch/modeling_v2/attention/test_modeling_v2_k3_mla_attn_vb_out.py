@@ -15,7 +15,7 @@ Covered, at Kimi K3's per-rank shapes (6 heads at TP16, 24 at TP4; latent 512, r
 launch modes (up to CLUSTER_WAVE = 7 clusters of 16 CTAs; more take the no-cluster mode, which uses the workspace's
 arrival counters):
 
-1. Cells: the gated output against a float64 reference (attention output rounded to bf16, v_b in float64, the gate
+1. Cells: the gated output against an fp32 reference (attention output rounded to bf16, v_b in fp32, the gate
    applied as bf16(y * s)); the plain v_b output, k3_mla_attn_out and k3_mla_attn on the same step.
 2. Call sequences: layers x decode steps on one shared workspace eagerly, then the same steps captured once as a
    CUDA graph and replayed with rewritten inputs and advanced lengths; two workspaces interleaved across layers.
@@ -25,15 +25,19 @@ arrival counters):
    with ValueError before any launch, and neither the output nor the workspace changes.
 """
 
+import zlib
 from typing import List
 
 import pytest
 import torch
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.k3_mla_attn_vb_out import (
+    _attention_reference,
     k3_mla_attn,
     k3_mla_attn_out,
-    k3_mla_attn_vb_out,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.k3_mla_attn_vb_out import (
+    k3_mla_attn_vb_out as op,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.k3_mla_attn_workspace import (
     K3MlaAttnWorkspace,
@@ -47,6 +51,9 @@ from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.internal.batch_manager import CacheType
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
+
+__extra_import_path__ = [".."]
+from _validating import validating
 
 
 def _is_sm100() -> bool:
@@ -176,22 +183,29 @@ class _MlaCache:
     def advance(self) -> None:
         self.cached = [c + self.tokens for c in self.cached]
 
+    def reference_view(self, layer: int) -> dict:
+        pool, blocks = self.mgr.get_buffers(layer), self._blocks(layer)
+        lengths = [cached + self.tokens for cached in self.cached]
+        width = (max(lengths) + PAGE - 1) // PAGE
+        table = torch.zeros(len(lengths), width, dtype=torch.int32, device="cuda")
+        rows, offset = [], 0
+        for i, length in enumerate(lengths):
+            count = (length + PAGE - 1) // PAGE
+            rows.append(pool[blocks[i][:count], 0, :, 0])
+            table[i, :count] = torch.arange(offset, offset + count, device="cuda")
+            offset += count
+        return dict(
+            pool=torch.cat(rows).reshape(-1),
+            row_stride=DQK,
+            page_table=table,
+            page_offset=0,
+            seq_len=torch.tensor(lengths, dtype=torch.int32, device="cuda"),
+        )
+
     def reference(self, layer: int, q: torch.Tensor) -> torch.Tensor:
-        """float64 attention of each request's T tokens over its rows [0, L) read through the manager's block ids;
+        """fp32 attention of each request's T tokens over its rows [0, L) read through the manager's block ids;
         token t sees rows <= L - T + t. [M, heads, 512]."""
-        pool, blocks, outs = self.mgr.get_buffers(layer), self._blocks(layer), []
-        t = self.tokens
-        for i, cached in enumerate(self.cached):
-            length = cached + t
-            pages = [blocks[i][p] for p in range((length + PAGE - 1) // PAGE)]
-            kv = pool[pages, 0, :, 0].reshape(-1, DQK)[:length].double()
-            qi = q[i * t : (i + 1) * t].view(t, self.heads, DQK).double()
-            s = torch.einsum("thd,ld->thl", qi, kv) * SCALE
-            limit = length - t + torch.arange(t, device="cuda")
-            hidden = torch.arange(length, device="cuda")[None, :] > limit[:, None]
-            s = s.masked_fill(hidden[:, None, :], float("-inf"))
-            outs.append(torch.einsum("thl,ld->thd", torch.softmax(s, dim=-1), kv[:, :LAT]))
-        return torch.cat(outs)
+        return _attention_reference(q, **self.reference_view(layer), softmax_scale=SCALE)
 
     def shutdown(self) -> None:
         self.mgr.shutdown()
@@ -209,30 +223,38 @@ def _inputs(seed: int, m: int, heads: int):
 def _vb(view: dict, q, w_vb, gate, workspace: K3MlaAttnWorkspace) -> torch.Tensor:
     m, heads = q.shape[0], q.shape[1] // DQK
     out = torch.empty(m, heads * V, dtype=torch.bfloat16, device="cuda")
-    k3_mla_attn_vb_out(
-        q,
-        view["pool"],
-        view["row_stride"],
-        view["page_table"],
-        view["page_offset"],
-        view["seq_len"],
-        view["softmax_scale"],
-        w_vb,
-        out,
-        workspace,
-        gate,
-        GATE_COL0,
-    )
+    with validating(op):
+        op(
+            q,
+            view["pool"],
+            view["row_stride"],
+            view["page_table"],
+            view["page_offset"],
+            view["seq_len"],
+            view["softmax_scale"],
+            w_vb,
+            out,
+            workspace,
+            gate,
+            GATE_COL0,
+        )
     return out
 
 
-def _vb_reference(cache: _MlaCache, layer: int, q, w_vb, gate) -> torch.Tensor:
+def _vb_reference(cache: _MlaCache, layer: int, q, w_vb, gate, workspace) -> torch.Tensor:
     m, heads = q.shape[0], q.shape[1] // DQK
-    o = cache.reference(layer, q).bfloat16().double()
-    y = torch.einsum("thc,hvc->thv", o, w_vb.double()).reshape(m, heads * V)
-    if gate is None:
-        return y
-    return y.bfloat16().double() * gate[:, GATE_COL0:].double()
+    out = torch.empty(m, heads * V, dtype=torch.bfloat16, device=q.device)
+    op.reference(
+        q,
+        **cache.reference_view(layer),
+        softmax_scale=SCALE,
+        w_vb=w_vb,
+        out=out,
+        workspace=workspace,
+        gate=gate,
+        gate_col0=GATE_COL0,
+    )
+    return out
 
 
 def _max_rel(a, b, tokens: int) -> float:
@@ -267,19 +289,18 @@ def _check_counters(workspace: K3MlaAttnWorkspace, num_requests: int, launches: 
     assert bool((ctrs[num_requests:] == 0).all())
 
 
-# (R, T, heads): T 1 (decode without speculation) and 8 (a DSpark verify step); the cluster and no-cluster modes;
-# the TP4 head count (4 head groups: several clusters per request).
-CASES = [(3, 8, H), (8, 1, H), (2, 8, 4 * H)]
-CASE_IDS = [f"{r}x{t}-h{h}" for r, t, h in CASES]
 EAGER_STEPS, GRAPH_STEPS = 2, 2
 
 
-@pytest.mark.parametrize("num_requests,tokens,heads", CASES, ids=CASE_IDS)
-def test_cells(num_requests, tokens, heads):
-    """One step of layer 0: the gated output within 1e-2 (per request) of the float64 reference and rerun-identical;
+@pytest.mark.parametrize("cell", op.CELLS, ids=[c.why[:40] for c in op.CELLS])
+def test_cells(cell):
+    """One step of layer 0: the gated output within 1e-2 (per request) of the fp32 reference and rerun-identical;
     the plain v_b output within 1e-2 of its reference, and the gated one bit-identical to bf16(plain * s);
     k3_mla_attn_out within 1e-2 of the attention reference and k3_mla_attn bit-identical to it."""
-    seed = 17 * num_requests + tokens + heads
+    num_requests = cell.spec["num_requests"]
+    tokens = cell.spec["tokens"]
+    heads = cell.spec["heads"]
+    seed = zlib.crc32(cell.why.encode()) % 2**31
     cache = _MlaCache(num_requests, tokens, 1, heads, seed)
     m = num_requests * tokens
     try:
@@ -307,8 +328,8 @@ def test_cells(num_requests, tokens, heads):
             workspace,
         )
         torch.cuda.synchronize()
-        assert _max_rel(y, _vb_reference(cache, 0, q, w_vb, gate), tokens) <= 1e-2
-        assert _max_rel(plain, _vb_reference(cache, 0, q, w_vb, None), tokens) <= 1e-2
+        assert _max_rel(y, _vb_reference(cache, 0, q, w_vb, gate, workspace), tokens) <= 1e-2
+        assert _max_rel(plain, _vb_reference(cache, 0, q, w_vb, None, workspace), tokens) <= 1e-2
         assert torch.equal(_bits(y), _bits(again))
         assert torch.equal(_bits(y), _bits(plain * gate[:, GATE_COL0:]))
         ref_o = cache.reference(0, q).reshape(m, heads * LAT)
@@ -318,13 +339,16 @@ def test_cells(num_requests, tokens, heads):
         cache.shutdown()
 
 
-@pytest.mark.parametrize("num_requests,tokens,heads", CASES, ids=CASE_IDS)
-def test_layers_by_steps_eager_then_graph(num_requests, tokens, heads):
+@pytest.mark.parametrize("cell", op.CELLS, ids=[c.why[:40] for c in op.CELLS])
+def test_layers_by_steps_eager_then_graph(cell):
     """LAYERS layers x EAGER_STEPS decode steps on one shared workspace, eagerly; then one step's LAYERS calls
     captured as a CUDA graph on the same workspace and replayed for GRAPH_STEPS steps with rewritten q and the
     metadata prepared for each step. Every output within 1e-2 of the reference and bit-identical to the same call
     on a new workspace; in the no-cluster mode the shared workspace's counters end at 16 x its launches."""
-    seed = 23 * num_requests + tokens + heads
+    num_requests = cell.spec["num_requests"]
+    tokens = cell.spec["tokens"]
+    heads = cell.spec["heads"]
+    seed = zlib.crc32(cell.why.encode()) % 2**31
     groups = heads // H
     cache = _MlaCache(num_requests, tokens, EAGER_STEPS + GRAPH_STEPS, heads, seed)
     m = num_requests * tokens
@@ -341,7 +365,7 @@ def test_layers_by_steps_eager_then_graph(num_requests, tokens, heads):
                 y = _vb(view, q, *weights[layer], shared)
                 launches += 1
                 fresh = _vb(view, q, *weights[layer], K3MlaAttnWorkspace.create("cuda", groups))
-                ref = _vb_reference(cache, layer, q, *weights[layer])
+                ref = _vb_reference(cache, layer, q, *weights[layer], shared)
                 torch.cuda.synchronize()
                 assert torch.equal(_bits(y), _bits(fresh)), (step, layer)
                 assert _max_rel(y, ref, tokens) <= 1e-2, (step, layer)
@@ -362,7 +386,7 @@ def test_layers_by_steps_eager_then_graph(num_requests, tokens, heads):
         with torch.cuda.graph(graph):
             for layer in range(LAYERS):
                 w_vb, gate = weights[layer]
-                k3_mla_attn_vb_out(
+                op(
                     static_q[layer], views[layer]["pool"], DQK, views[layer]["page_table"],
                     views[layer]["page_offset"], views[layer]["seq_len"], SCALE, w_vb, static_y[layer],
                     shared, gate, GATE_COL0,
@@ -378,7 +402,7 @@ def test_layers_by_steps_eager_then_graph(num_requests, tokens, heads):
             for layer in range(LAYERS):
                 fresh = _vb(views[layer], qs[layer], *weights[layer],
                             K3MlaAttnWorkspace.create("cuda", groups))  # fmt: skip
-                ref = _vb_reference(cache, layer, qs[layer], *weights[layer])
+                ref = _vb_reference(cache, layer, qs[layer], *weights[layer], shared)
                 torch.cuda.synchronize()
                 assert torch.equal(_bits(static_y[layer]), _bits(fresh)), (step, layer)
                 assert _max_rel(static_y[layer], ref, tokens) <= 1e-2, (step, layer)
@@ -439,7 +463,7 @@ def test_workspace_of_another_shape_is_refused():
             K3MlaAttnWorkspace(buffer=right.buffer[:-8], groups=1),
         ):
             with pytest.raises(ValueError, match="workspace"):
-                k3_mla_attn_vb_out(
+                op(
                     q, view["pool"], DQK, view["page_table"], view["page_offset"], view["seq_len"], SCALE,
                     w_vb, out, bad, gate, GATE_COL0,
                 )  # fmt: skip
@@ -458,3 +482,18 @@ def test_create_refuses_capture():
     with pytest.raises(RuntimeError, match="capture"):
         with torch.cuda.graph(graph):
             K3MlaAttnWorkspace.create(torch.device("cuda"), 1)
+
+
+def test_guard_refuses_incomplete_step():
+    cache = _MlaCache(2, 8, 1, H, 15)
+    try:
+        md = cache.metadata()
+        cache.prepare(md)
+        view = cache.view(md, 0)
+        q, w_vb, gate = _inputs(16, 16, H)
+        workspace = K3MlaAttnWorkspace.create(torch.device("cuda"), 1)
+        view["seq_len"] = torch.full_like(view["seq_len"], 7)
+        with pytest.raises(AssertionError, match="seq_len must include every token"):
+            _vb(view, q, w_vb, gate, workspace)
+    finally:
+        cache.shutdown()

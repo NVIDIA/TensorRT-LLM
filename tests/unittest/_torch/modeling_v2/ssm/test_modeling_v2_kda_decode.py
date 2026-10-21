@@ -5,16 +5,21 @@
 Kimi K3's plain decode shape (6 heads, K = V = 128, conv width 4, the lower-bound gate, the output norm, beta sigmoid
 in the kernel) on the pools of a real ``MambaHybridCacheManagerV2`` (``_kda_cells.build_manager``): its per-layer
 conv views (``[q | k | v]`` sections of one bf16 ``[slots, 2304, 3]`` pool) and fp32 state views, strided by the
-manager's per-slot coalescing, at the slots the manager assigned. The reference is a float64 torch decode
-(``_kda_cells.F64Decode``). B runs 1..8: on sm_100 B <= 5 selects the four-CTA cluster kernel and 6 <= B <= 24 the
+manager's per-slot coalescing, at the slots the manager assigned. The reference is an fp32 torch decode.
+B runs 1..8: on sm_100 B <= 5 selects the four-CTA cluster kernel and 6 <= B <= 24 the
 legacy compact-heads kernel (the one #19830 fixes).
 """
+
+import zlib
 
 import _kda_cells as kc
 import pytest
 import torch
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.ssm.kda_decode import kda_decode
+
+__extra_import_path__ = [".."]
+from _validating import validating
 
 pytestmark = pytest.mark.skipif(not kc.sm100(), reason="certified on SM100 only")
 
@@ -53,14 +58,15 @@ def _inputs(num: int, gen: torch.Generator) -> dict:
     }
 
 
-def _call(wt, pools, inp, slots, out=None, use_lower_bound=True) -> torch.Tensor:
+def _call(wt, pools, inp, slots, out=None, use_lower_bound=True, reference=False) -> torch.Tensor:
     """The entry on one layer's pools, as the model calls it: packed conv sections updated in place, indexed state."""
     num = slots.numel()
     raw, conv = inp["raw"], pools["conv"]
     zeros = torch.zeros(kc.HK, dtype=torch.bfloat16, device="cuda")
     if out is None:
         out = torch.empty(num, 1, kc.H, kc.V, dtype=torch.bfloat16, device="cuda")
-    kda_decode(
+    call = kda_decode.reference if reference else kda_decode
+    call(
         _heads(raw[:, : kc.HK]), _heads(raw[:, kc.HK : 2 * kc.HK]), _heads(raw[:, 2 * kc.HK :]),
         wt["w_t"][0], wt["w_t"][1], wt["w_t"][2], zeros, zeros, zeros,
         conv[:, : kc.HK], conv[:, kc.HK : 2 * kc.HK], conv[:, 2 * kc.HK :],
@@ -74,28 +80,31 @@ def _layers(mgr) -> list:
     return [kc.layer_pools(mgr, layer) for layer in range(LAYERS)]
 
 
-@pytest.mark.parametrize("num", range(1, 9))
-def test_decode_on_manager_pools(mgr, slots, num) -> None:
-    """Every layer's step against float64: outputs and the state rows at fp32 tolerance, the conv windows bit for
+@pytest.mark.parametrize("cell", kda_decode.CELLS, ids=[c.why[:40] for c in kda_decode.CELLS])
+def test_decode_on_manager_pools(mgr, slots, cell) -> None:
+    """Every layer's step against fp32: outputs and the state rows at fp32 tolerance, the conv windows bit for
     bit (raw bf16 inputs), the other slots of the layer and every slot of the other layers untouched."""
+    num = cell.spec["num"]
+    seed = zlib.crc32(cell.why.encode()) % 2**31
     used = slots[:num]
     pools = _layers(mgr)
     with torch.inference_mode():
         for layer, p in enumerate(pools):
-            kc.fill_pools(p, 10 * num + layer)
-        gen = torch.Generator(device="cuda").manual_seed(num)
+            kc.fill_pools(p, seed + layer)
+        gen = torch.Generator(device="cuda").manual_seed(seed)
         for layer, p in enumerate(pools):
-            wt = kc.make_weights(100 + layer)
-            ref = kc.F64Decode(wt, p)
+            wt = kc.make_weights(seed + 100 + layer)
+            ref = kc.clone_pools(p)
             before = [kc.snapshot(q) for q in pools]
             inp = _inputs(num, gen)
-            out = _call(wt, p, inp, used)
-            want = ref.step(inp["raw"], inp["g"], inp["beta"], inp["gate"], used)
+            with validating(kda_decode):
+                out = _call(wt, p, inp, used)
+            want = _call(wt, ref, inp, used, reference=True)
             torch.cuda.synchronize()
             rows = used.long()
             assert kc.rel(out, want) <= kc.TOL_OUT, (layer, kc.rel(out, want))
-            assert kc.rel(p["ssm"][rows], ref.state[rows]) <= kc.TOL_STATE, layer
-            assert torch.equal(p["conv"][rows], ref.conv[rows].bfloat16()), layer
+            assert kc.rel(p["ssm"][rows], ref["ssm"][rows]) <= kc.TOL_STATE, layer
+            assert torch.equal(p["conv"][rows], ref["conv"][rows]), layer
             others = kc.other_slots(p["ssm"].shape[0], used.tolist())
             assert kc.same_rows(p, before[layer], others, ("conv", "ssm")), layer
             for o, q in enumerate(pools):

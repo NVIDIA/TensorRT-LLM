@@ -5,7 +5,7 @@ counters of every ``attention/k3_mla_attn_vb_out`` call (and its ``k3_mla_attn``
 
 A state type, not an entry: it launches nothing per call. Its constructor is eager; the target builds one per device
 and head-group count in ``post_load_weights`` (before any CUDA-graph capture) and passes it to every MLA attention
-call of that shape. The contract is the ``## State`` section of ``k3_mla_attn_vb_out.md``.
+call of that shape.
 """
 
 from __future__ import annotations
