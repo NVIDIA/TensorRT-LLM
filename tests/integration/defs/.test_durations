@@ -896,6 +896,7 @@
    "perf/test_perf_sanity.py::test_e2e[aggr_upload-dynamo_qwen3_32b_fp8_hopper-qwen3_32b_fp8_tp2_6k1k]": 693.3143181818182,
    "perf/test_perf_sanity.py::test_e2e[aggr_upload-gb300_deepseek_v41_flash_nvfp4_grace_blackwell-v41_flash_nvfp4_dep4_dspark5_8k1k]": 1310.0,
    "perf/test_perf_sanity.py::test_e2e[aggr_upload-gb300_deepseek_v41_flash_nvfp4_grace_blackwell-v41_flash_nvfp4_tep4_dspark5_8k1k]": 1020.0,
+   "perf/test_perf_sanity.py::test_e2e[aggr_upload-gb300_glm53_flash_fp8_grace_blackwell-glm53_flash_fp8_tp4_mtp3_8k1k]": 717.0,
    "perf/test_perf_sanity.py::test_e2e[aggr_upload-gb300_nemotron_ultra_v3_fp4_grace_blackwell-nemotron_ultra_v3_fp4_dep4_mtp0_50k2k]": 1907.2140526315789,
    "perf/test_perf_sanity.py::test_e2e[aggr_upload-gb300_nemotron_ultra_v3_fp4_grace_blackwell-nemotron_ultra_v3_fp4_dep4_mtp3_50k2k]": 773.3173333333334,
    "perf/test_perf_sanity.py::test_e2e[aggr_upload-gb300_nemotron_ultra_v3_fp4_grace_blackwell-nemotron_ultra_v3_fp4_tep4_mtp6_50k2k]": 1362.6711666666667,
