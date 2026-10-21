@@ -201,7 +201,7 @@ whether or not the record is sound.
 
 `L0_MergeRequest.groovy` decides pipeline-level eligibility and `isCbtsStage()` decides each stage:
 
-- pre-merge and post-merge pipelines with `ENABLE_CBTS_COVERAGE` enabled (excluding infrastructure dry runs)
+- official post-merge pipeline only (`ENABLE_CBTS_COVERAGE && JOB_NAME ==~ /.*PostMerge.*/`)
 - not a perf stage or a TensorRT / CPP stage
 - single-GPU stages only (name carries no `-<N>_GPUs` / `-<N>_Nodes`)
 - not listed in `CBTS_EXCLUDE_STAGES`

@@ -181,7 +181,7 @@ def CBTS_COVERAGE = "cbts_coverage"
 def DISABLE_CBTS = "disable_cbts"
 @Field
 def INFRA_DRY_RUN = "infra_dry_run"
-// Kill switch for CBTS per-test coverage; single-GPU stages only in Phase 1.
+// Kill switch for CBTS per-test coverage; official post-merge pipeline only, single-GPU stages only in Phase 1.
 @Field
 def ENABLE_CBTS_COVERAGE = true
 // Version-controlled Tier 2 application policy. Coverage decisions are evaluated
@@ -536,7 +536,7 @@ def setupPipelineEnvironment(pipeline, testFilter, globalVars)
         testFilter[(AUTO_TRIGGER_TAG_LIST)] = getAutoTriggerTagList(pipeline, testFilter, globalVars)
         testFilter[(CBTS_RESULT)] = getCbtsResult(pipeline, testFilter, globalVars)
         // Decide CBTS coverage eligibility here so L0_Test only consumes the propagated flag.
-        testFilter[(CBTS_COVERAGE)] = ENABLE_CBTS_COVERAGE
+        testFilter[(CBTS_COVERAGE)] = ENABLE_CBTS_COVERAGE && (env.JOB_NAME ==~ /.*PostMerge.*/)
     }
     pipeline.echo("CBTS coverage eligible: ${testFilter[(CBTS_COVERAGE)]}")
     testFilter[(OSS_COMPLIANCE_FILE_CHANGED)] = getOssComplianceFileChanged(pipeline, globalVars)
