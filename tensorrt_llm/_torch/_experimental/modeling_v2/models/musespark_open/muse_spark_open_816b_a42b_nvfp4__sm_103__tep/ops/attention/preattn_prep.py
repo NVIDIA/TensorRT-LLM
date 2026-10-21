@@ -234,6 +234,159 @@ def _preattn_prep_kernel(
     tl.store(out + 7, y7.to(tl.bfloat16))
 
 
+#: Above this many rows the entry launches ``_preattn_prep_rows_kernel``: one program per
+#: ``ROW_BLOCK`` rows of one head instead of one per row and head. Decode steps stay at or
+#: below it; a context step's thousands of rows need the larger programs to keep HBM busy.
+ROW_KERNEL_MIN_ROWS = 512
+#: Rows per program of ``_preattn_prep_rows_kernel``.
+ROW_BLOCK = 16
+
+
+# ``rows`` only bounds the last program's mask: one compiled variant serves every row count,
+# so no step size compiles anything after the first.
+@triton.jit(do_not_specialize=["rows"])
+def _preattn_prep_rows_kernel(
+    qkv_ptr,
+    qkv_out_ptr,
+    gate_out_ptr,
+    cos_sin_ptr,
+    positions_ptr,
+    rows,
+    qkv_stride,
+    qkv_out_stride,
+    gate_out_stride,
+    eps,
+    q_scale,
+    NUM_Q_HEADS: tl.constexpr,
+    NUM_KV_HEADS: tl.constexpr,
+    QKV_PERMUTED: tl.constexpr,
+    APPLY_ROPE: tl.constexpr,
+    LAUNCH_WITH_PDL: tl.constexpr,
+    BLOCK: tl.constexpr,
+    TRIGGER_AT_ENTRY: tl.constexpr = False,
+):
+    """``_preattn_prep_kernel`` over ``BLOCK`` rows of one head per program.
+
+    Every row runs the same per-head arithmetic as there -- the same loads per
+    lane, the same in-order sum within a lane and the same three size-2 sums over
+    lane bits 0, 1, 2, the same BF16 roundings and FTZ RoPE -- with a leading row
+    axis on each tensor, so a row's values are the same bits as from that kernel.
+    """
+    D: tl.constexpr = 64
+    HALF: tl.constexpr = 32
+    if LAUNCH_WITH_PDL:
+        if TRIGGER_AT_ENTRY:
+            tl.extra.cuda.gdc_launch_dependents()
+        tl.extra.cuda.gdc_wait()
+    row = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    valid = row < rows
+    row = row.to(tl.int64)
+    head = tl.program_id(1)
+    is_q = head < NUM_Q_HEADS
+    kv_head = head - NUM_Q_HEADS
+    in_row = qkv_ptr + row * qkv_stride
+    out_row = qkv_out_ptr + row * qkv_out_stride
+
+    d = tl.arange(0, D)[None, :]
+    valid2 = valid[:, None]
+    if is_q:
+        if QKV_PERMUTED:
+            gate_in = (NUM_Q_HEADS + 2 * NUM_KV_HEADS) * D + head * D
+        else:
+            gate_in = head * 2 * D + D
+        gate = tl.load(in_row[:, None] + gate_in + d, mask=valid2)
+        tl.store(gate_out_ptr + row[:, None] * gate_out_stride + head * D + d, gate, mask=valid2)
+    else:
+        if QKV_PERMUTED:
+            v_in = NUM_Q_HEADS * D + NUM_KV_HEADS * D + kv_head * D
+        else:
+            v_in = 2 * NUM_Q_HEADS * D + NUM_KV_HEADS * D + kv_head * D
+        value = tl.load(in_row[:, None] + v_in + d, mask=valid2)
+        tl.store(
+            out_row[:, None] + (NUM_Q_HEADS + NUM_KV_HEADS) * D + kv_head * D + d,
+            value,
+            mask=valid2,
+        )
+
+    if QKV_PERMUTED:
+        in_off = tl.where(is_q, head * D, NUM_Q_HEADS * D + kv_head * D)
+    else:
+        in_off = tl.where(is_q, head * 2 * D, 2 * NUM_Q_HEADS * D + kv_head * D)
+    out_off = tl.where(is_q, head * D, NUM_Q_HEADS * D + kv_head * D)
+    scale = tl.where(is_q, q_scale, 1.0)
+
+    lane = (
+        4 * tl.arange(0, 2)[None, :, None, None]
+        + 2 * tl.arange(0, 2)[None, None, :, None]
+        + tl.arange(0, 2)[None, None, None, :]
+    )
+    valid4 = valid[:, None, None, None]
+    src = in_row[:, None, None, None] + in_off + lane * 8
+    x0 = tl.load(src + 0, mask=valid4, other=0.0).to(tl.float32)
+    x1 = tl.load(src + 1, mask=valid4, other=0.0).to(tl.float32)
+    x2 = tl.load(src + 2, mask=valid4, other=0.0).to(tl.float32)
+    x3 = tl.load(src + 3, mask=valid4, other=0.0).to(tl.float32)
+    x4 = tl.load(src + 4, mask=valid4, other=0.0).to(tl.float32)
+    x5 = tl.load(src + 5, mask=valid4, other=0.0).to(tl.float32)
+    x6 = tl.load(src + 6, mask=valid4, other=0.0).to(tl.float32)
+    x7 = tl.load(src + 7, mask=valid4, other=0.0).to(tl.float32)
+    s = libdevice.add_rn(x0 * x0, x1 * x1)
+    s = libdevice.add_rn(s, x2 * x2)
+    s = libdevice.add_rn(s, x3 * x3)
+    s = libdevice.add_rn(s, x4 * x4)
+    s = libdevice.add_rn(s, x5 * x5)
+    s = libdevice.add_rn(s, x6 * x6)
+    s = libdevice.add_rn(s, x7 * x7)
+    total = tl.sum(tl.sum(tl.sum(s, axis=3), axis=2), axis=1)
+    inverse_rms = _rsqrt_approx_ftz(total / 64.0 + eps)[:, None, None, None]
+    y0 = _normalize(x0, inverse_rms, scale)
+    y1 = _normalize(x1, inverse_rms, scale)
+    y2 = _normalize(x2, inverse_rms, scale)
+    y3 = _normalize(x3, inverse_rms, scale)
+    y4 = _normalize(x4, inverse_rms, scale)
+    y5 = _normalize(x5, inverse_rms, scale)
+    y6 = _normalize(x6, inverse_rms, scale)
+    y7 = _normalize(x7, inverse_rms, scale)
+
+    if APPLY_ROPE:
+        position = tl.load(positions_ptr + row, mask=valid, other=0).to(tl.int64)
+        table = cos_sin_ptr + position[:, None, None, None] * D + lane * 4
+        y0, y1 = _rotate(
+            y0,
+            y1,
+            tl.load(table + 0, mask=valid4, other=0.0),
+            tl.load(table + HALF + 0, mask=valid4, other=0.0),
+        )
+        y2, y3 = _rotate(
+            y2,
+            y3,
+            tl.load(table + 1, mask=valid4, other=0.0),
+            tl.load(table + HALF + 1, mask=valid4, other=0.0),
+        )
+        y4, y5 = _rotate(
+            y4,
+            y5,
+            tl.load(table + 2, mask=valid4, other=0.0),
+            tl.load(table + HALF + 2, mask=valid4, other=0.0),
+        )
+        y6, y7 = _rotate(
+            y6,
+            y7,
+            tl.load(table + 3, mask=valid4, other=0.0),
+            tl.load(table + HALF + 3, mask=valid4, other=0.0),
+        )
+
+    out = out_row[:, None, None, None] + out_off + lane * 8
+    tl.store(out + 0, y0.to(tl.bfloat16), mask=valid4)
+    tl.store(out + 1, y1.to(tl.bfloat16), mask=valid4)
+    tl.store(out + 2, y2.to(tl.bfloat16), mask=valid4)
+    tl.store(out + 3, y3.to(tl.bfloat16), mask=valid4)
+    tl.store(out + 4, y4.to(tl.bfloat16), mask=valid4)
+    tl.store(out + 5, y5.to(tl.bfloat16), mask=valid4)
+    tl.store(out + 6, y6.to(tl.bfloat16), mask=valid4)
+    tl.store(out + 7, y7.to(tl.bfloat16), mask=valid4)
+
+
 def is_rope_table(cos_sin: torch.Tensor) -> bool:
     """Whether ``cos_sin`` is a table the entry reads: contiguous fp32 ``[positions, 2, 32]``."""
     return (
@@ -301,7 +454,9 @@ class PreattnPrep(OpWrapper):
 
     # spec: rows, rope (sliding-window RoPE layer vs full-attention NoPE),
     # permuted (low-latency weight layout), positions ("uniform" over the
-    # table, "tail" = the last 2048 positions), zero_heads (exact-zero heads).
+    # table, "tail" = the last 2048 positions, "sequences" = K=7 verify blocks,
+    # "chunk" = consecutive positions after a 98,304-token prefix), zero_heads
+    # (exact-zero heads).
     CELLS: tuple[Cell, ...] = (
         tuple(
             Cell(why=f"{rows} rows, RoPE layer: {why}", spec=dict(rows=rows, rope=True))
@@ -361,14 +516,32 @@ class PreattnPrep(OpWrapper):
                 spec=dict(rows=512, rope=True, permuted=True, positions="sequences"),
             ),
         )
+        + tuple(
+            Cell(
+                why=f"{rows} rows, {'RoPE' if rope else 'NoPE'} layer: {why}",
+                spec=dict(rows=rows, rope=rope, positions="chunk"),
+            )
+            for rows, rope, why in (
+                (513, True, "the smallest row-kernel step, a one-row last program"),
+                (513, False, "the smallest row-kernel step, a one-row last program"),
+                (1032, True, "a context chunk with a half-masked last program"),
+                (3000, True, "a context chunk with a half-masked last program"),
+                (8192, True, "an 8k context chunk after a 98,304-token prefix"),
+                (8192, False, "an 8k context chunk after a 98,304-token prefix"),
+            )
+        )
     )
 
     note = """
     Metadata consumed: none beyond the per-row positions; every row and head
     independent, so a step of several sequences is rows with their own
-    positions. Call site: once per decoder layer per decode step, from the
-    target's attention when the step has no context rows and at most 512
-    rows (46 RoPE + 16 NoPE layers). Grid (rows, H + G), one warp per program.
+    positions. Call sites: once per decoder layer (46 RoPE + 16 NoPE layers)
+    per step, from the target's attention -- on a decode step of at most 512
+    rows (``preattn_prep``), and on every row of a step with context rows, up
+    to 32768 (``context_prep``). Up to 512 rows the grid is (rows, H + G), one
+    warp per program; above 512 rows it is (ceil(rows / 16), H + G), four warps
+    per program of 16 rows of one head (``_preattn_prep_rows_kernel``), with the
+    same per-row arithmetic.
 
     Bit-identical, gated by its own test against the built-in attention's
     `preprocess_qkv` + `convert_qkv` (the split/chunk copies, the flashinfer
@@ -389,9 +562,10 @@ class PreattnPrep(OpWrapper):
     unit stride in the last dim, width 2 * (H + G) * 64, a contiguous fp32
     `[max_positions, 2, 32]` table and one position per row when RoPE is on.
 
-    Not certified as a cell: rows above 512 (the kernel has no row limit; the
-    target does not call it there; the 32768-row sample above covers the
-    kernel), head width other than 64, fp16/fp32 activations.
+    Not certified as a cell: rows above 8192 (the largest context step a
+    ``max_num_tokens`` of 8192 admits; the op has no row limit and the
+    32768-row bit-identity sample above covers the row kernel there), head
+    width other than 64, fp16/fp32 activations.
     """
 
     def __call__(
@@ -434,6 +608,30 @@ class PreattnPrep(OpWrapper):
         elif position_ids is not None:
             raise ValueError("preattn_prep: position_ids without a cos/sin table")
         if rows == 0:
+            return qkv_out, gate_out
+        if rows > ROW_KERNEL_MIN_ROWS:
+            _preattn_prep_rows_kernel[(triton.cdiv(rows, ROW_BLOCK), num_q_heads + num_kv_heads)](
+                qkv,
+                qkv_out,
+                gate_out,
+                cos_sin,
+                positions,
+                rows,
+                qkv.stride(0),
+                qkv_out.stride(0),
+                gate_out.stride(0),
+                eps,
+                q_scale,
+                NUM_Q_HEADS=num_q_heads,
+                NUM_KV_HEADS=num_kv_heads,
+                QKV_PERMUTED=qkv_permuted,
+                APPLY_ROPE=cos_sin is not None,
+                LAUNCH_WITH_PDL=enable_pdl,
+                BLOCK=ROW_BLOCK,
+                num_warps=4,
+                launch_pdl=enable_pdl,
+                **({"TRIGGER_AT_ENTRY": True} if enable_pdl and trigger_at_entry else {}),
+            )
             return qkv_out, gate_out
         _preattn_prep_kernel[(rows, num_q_heads + num_kv_heads)](
             qkv,

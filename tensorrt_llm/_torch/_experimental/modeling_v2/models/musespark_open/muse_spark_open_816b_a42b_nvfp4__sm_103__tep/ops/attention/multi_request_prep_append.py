@@ -1,0 +1,695 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+"""A multi-request decode step's pre-attention prep and generation preprocess, in one launch.
+
+On a decode step of ``B >= 2`` sequences of ``Q`` query rows each (the target's
+K = 7 verify blocks: ``Q = 8``), each target layer's built-in attention runs
+three launches between the QKV projection and the trtllm-gen generation FMHA:
+the pre-attention prep (``preattn_prep``), then the attention op's generation
+preprocess ``thop.trtllm_gen_generation_preprocess``, whose two kernels on
+this path are
+
+* the decoder-info kernel ``computeSeqAndPaddingOffsets`` (launched because
+  ``B > 1`` and ``Q > 1``), which writes the cumulative query and key lengths
+  and a per-token (sequence, index) table into the attention workspace, and
+* ``applyBiasRopeUpdateKVCacheV2`` without rotation (the prep applied RoPE),
+  which writes every row's K and V into the paged FP8 cache, Q in E4M3 into the
+  workspace's query buffer and the FMHA's two scale words into the workspace.
+
+This entry is ``preattn_prep`` (on RoPE and NoPE layers alike) with the writes
+the FMHA reads folded in, so the FMHA can be launched straight after it:
+
+* row ``r`` of sequence ``b = r // Q`` (``t = r % Q``) sits at cache position
+  ``p = seq_lens[b] - Q + t`` -- the append kernel's ``past + t`` with
+  ``past = cache_seq_len - max_input_seq_len`` when the call carries no
+  per-sequence generation lengths -- and its K and V go to
+  ``pool[block_tables[b][kv][p >> log2 P], kv_head, p & (P - 1), :]`` as
+  ``e4m3_rn_satfinite(bf16(x * bf16(s)))`` of the BF16 value the prep writes
+  (``KVBlockArray`` addressing; the conversion is ``paged_decode_attention``'s,
+  byte-identical to the built-in append's);
+* Q in E4M3, the same conversion, ``[rows, H, 64]`` into the query buffer;
+* the scale words ``bmm1 = [s_q * s_k * bmm1_host, that * log2(e)]`` and
+  ``bmm2 = o_scale * s_v`` (``s`` the cache's dequant scale), in the built-in
+  kernel's operation order;
+* with ``Q > 1``, the cumulative query lengths ``[0, Q, 2 Q, ..., B Q]`` -- the
+  decoder-info kernel's ``cu_seqlens`` for fixed query lengths, which the real
+  preprocess returns as a view of the workspace (with ``Q = 1`` it launches no
+  decoder-info kernel and returns none).
+
+Not written: the decoder-info kernel's cumulative key lengths and its
+per-token table. Without multi-token generation (on Blackwell the trtllm-gen
+path enables spec-dec masks only for dynamic trees, so a linear draft chain
+passes no generation lengths) the append kernel addresses rows itself and the
+FMHA takes ``q_len_per_req`` instead of ``cu_seqlens``: nothing reads either.
+
+Fusion boundary: the QKV projection producing ``qkv`` is outside; the
+trtllm-gen generation FMHA reading the query buffer, the cache and the scales,
+and the output gate's norm and sigmoid, are outside. The fused QKV operand and
+the gate are still written, bit for bit ``preattn_prep``'s, so a call that ends
+up running the built-in preprocess after all reads the same operand.
+
+``prefetch`` (optional): a tensor whose bytes the kernel asks the L2 to fetch --
+the layer's attention output projection weight, read after the FMHA. Every
+program issues one ``cp.async.bulk.prefetch.L2`` of an equal slice right after
+its wait, so the requests leave every SM's TMA unit within the prep, before the
+FMHA's own TMA loads of K/V start. It reads nothing back and writes nothing: the
+values computed are the same with and without it.
+"""
+
+from __future__ import annotations
+
+from typing import Optional, Tuple
+
+import torch
+import triton
+import triton.language as tl
+
+from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+
+from ..gemm.dense_gemm import _bulk_prefetch_l2
+from .paged_decode_attention import _to_cache_fp8
+from .preattn_prep import (
+    HEAD_DIM,
+    _inverse_rms,
+    _load8,
+    _normalize,
+    _rotate,
+    is_rope_table,
+    preattn_prep,
+)
+
+#: ``log2(e)`` as the built-in kernel's ``kLog2e`` float constant.
+LOG2E = 1.4426950408889634
+#: Query rows per sequence the entry takes: one accepted token and up to 7 drafts.
+MAX_ROWS_PER_SEQ = 8
+#: Sequences one call takes: 128 verify blocks of 8 rows (``preattn_prep``'s 1024-row cap), the
+#: largest decode step of a generation worker of ``max_batch_size`` 128. The grid is one program
+#: per (row, head), so a call's rows do not depend on how many sequences it carries.
+MAX_SEQS = 128
+#: Rows one call takes.
+MAX_ROWS = MAX_SEQS * MAX_ROWS_PER_SEQ
+
+
+@triton.jit
+def _fp8_store8(ptr, y0, y1, y2, y3, y4, y5, y6, y7, scale_bf16):
+    """Eight BF16 values one norm thread owns, as E4M3 at ``ptr + 0..7``."""
+    tl.store(ptr + 0, _to_cache_fp8(y0, scale_bf16))
+    tl.store(ptr + 1, _to_cache_fp8(y1, scale_bf16))
+    tl.store(ptr + 2, _to_cache_fp8(y2, scale_bf16))
+    tl.store(ptr + 3, _to_cache_fp8(y3, scale_bf16))
+    tl.store(ptr + 4, _to_cache_fp8(y4, scale_bf16))
+    tl.store(ptr + 5, _to_cache_fp8(y5, scale_bf16))
+    tl.store(ptr + 6, _to_cache_fp8(y6, scale_bf16))
+    tl.store(ptr + 7, _to_cache_fp8(y7, scale_bf16))
+
+
+@triton.jit
+def _multi_request_prep_append_kernel(
+    qkv_ptr,
+    qkv_out_ptr,
+    gate_out_ptr,
+    cos_sin_ptr,
+    positions_ptr,
+    q8_ptr,
+    pool_ptr,
+    bt_ptr,
+    bt_stride_seq,
+    bt_stride_kv,
+    seq_len_ptr,
+    orig_quant_ptr,
+    quant_orig_ptr,
+    bmm1_ptr,
+    bmm2_ptr,
+    cu_seqlens_ptr,
+    bmm1_host,
+    o_scale,
+    qkv_stride,
+    qkv_out_stride,
+    gate_out_stride,
+    eps,
+    q_scale,
+    num_seqs,
+    pf_base,
+    pf_bytes,
+    pf_chunk,
+    NUM_Q_HEADS: tl.constexpr,
+    NUM_KV_HEADS: tl.constexpr,
+    QKV_PERMUTED: tl.constexpr,
+    APPLY_ROPE: tl.constexpr,
+    ROWS_PER_SEQ: tl.constexpr,
+    P: tl.constexpr,
+    LOG2_P: tl.constexpr,
+    SEQS_BLOCK: tl.constexpr,
+    LAUNCH_WITH_PDL: tl.constexpr,
+    PREFETCH: tl.constexpr = False,
+):
+    D: tl.constexpr = 64
+    HALF: tl.constexpr = 32
+    PAGE: tl.constexpr = NUM_KV_HEADS * P * D
+    if LAUNCH_WITH_PDL:
+        # Before any global read: the projection is the previous kernel's output.
+        # No early trigger: a dependent (the FMHA) launches when this grid ends.
+        tl.extra.cuda.gdc_wait()
+    if PREFETCH:
+        # One bulk L2 prefetch of this program's slice of ``pf_bytes`` (lane 0 issues it). The
+        # asm yields 0, so the store never happens; it keeps the request live.
+        lane = tl.arange(0, 32)
+        program = tl.program_id(0).to(tl.int64) * tl.num_programs(1) + tl.program_id(1)
+        start = program * pf_chunk
+        size = tl.minimum(pf_bytes - start, pf_chunk)
+        size = tl.where((lane == 0) & (size > 0), size, 0).to(tl.int32)
+        issued = _bulk_prefetch_l2(tl.full([32], 0, tl.int64) + pf_base + start, size)
+        tl.store(cu_seqlens_ptr + lane, issued, mask=issued != 0)
+    row = tl.program_id(0)
+    head = tl.program_id(1)
+    is_q = head < NUM_Q_HEADS
+    kv_head = head - NUM_Q_HEADS
+    row64 = row.to(tl.int64)
+    in_row = qkv_ptr + row64 * qkv_stride
+    out_row = qkv_out_ptr + row64 * qkv_out_stride
+    scale_bf16 = tl.load(orig_quant_ptr).to(tl.bfloat16)
+
+    # The row's cache position: the sequence's last ROWS_PER_SEQ positions
+    # (seq_lens counts the step's rows), addressed as KVBlockArray does.
+    seq = row // ROWS_PER_SEQ
+    position = tl.load(seq_len_ptr + seq) - ROWS_PER_SEQ + row % ROWS_PER_SEQ
+    table = bt_ptr + seq.to(tl.int64) * bt_stride_seq + (position >> LOG2_P)
+    slot = (kv_head * P + (position & (P - 1))) * D
+
+    # The pass-through half first, so its load is in flight during the norm:
+    # a query program copies its gate head, a key program its value head (and
+    # stores it into the cache's V page).
+    d = tl.arange(0, D)
+    if is_q:
+        if QKV_PERMUTED:
+            gate_in = (NUM_Q_HEADS + 2 * NUM_KV_HEADS) * D + head * D
+        else:
+            gate_in = head * 2 * D + D
+        gate = tl.load(in_row + gate_in + d)
+        tl.store(gate_out_ptr + row64 * gate_out_stride + head * D + d, gate)
+    else:
+        if QKV_PERMUTED:
+            v_in = NUM_Q_HEADS * D + NUM_KV_HEADS * D + kv_head * D
+        else:
+            v_in = 2 * NUM_Q_HEADS * D + NUM_KV_HEADS * D + kv_head * D
+        value = tl.load(in_row + v_in + d)
+        tl.store(out_row + (NUM_Q_HEADS + NUM_KV_HEADS) * D + kv_head * D + d, value)
+        page_v = tl.load(table + bt_stride_kv).to(tl.int64)
+        tl.store(pool_ptr + page_v * PAGE + slot + d, _to_cache_fp8(value, scale_bf16))
+
+    if QKV_PERMUTED:
+        in_off = tl.where(is_q, head * D, NUM_Q_HEADS * D + kv_head * D)
+    else:
+        in_off = tl.where(is_q, head * 2 * D, 2 * NUM_Q_HEADS * D + kv_head * D)
+    out_off = tl.where(is_q, head * D, NUM_Q_HEADS * D + kv_head * D)
+    scale = tl.where(is_q, q_scale, 1.0)
+
+    lane = (
+        4 * tl.arange(0, 2)[:, None, None]
+        + 2 * tl.arange(0, 2)[None, :, None]
+        + tl.arange(0, 2)[None, None, :]
+    )
+    x0, x1, x2, x3, x4, x5, x6, x7 = _load8(in_row + in_off + lane * 8)
+    inverse_rms = _inverse_rms(x0, x1, x2, x3, x4, x5, x6, x7, eps)
+    y0 = _normalize(x0, inverse_rms, scale)
+    y1 = _normalize(x1, inverse_rms, scale)
+    y2 = _normalize(x2, inverse_rms, scale)
+    y3 = _normalize(x3, inverse_rms, scale)
+    y4 = _normalize(x4, inverse_rms, scale)
+    y5 = _normalize(x5, inverse_rms, scale)
+    y6 = _normalize(x6, inverse_rms, scale)
+    y7 = _normalize(x7, inverse_rms, scale)
+
+    if APPLY_ROPE:
+        # Pair p = 4 * lane + i rotates elements 2p, 2p + 1 by table row
+        # [cos(32) | sin(32)] of this token's RoPE position.
+        rope_position = tl.load(positions_ptr + row).to(tl.int64)
+        rope = cos_sin_ptr + rope_position * D + lane * 4
+        y0, y1 = _rotate(y0, y1, tl.load(rope + 0), tl.load(rope + HALF + 0))
+        y2, y3 = _rotate(y2, y3, tl.load(rope + 1), tl.load(rope + HALF + 1))
+        y4, y5 = _rotate(y4, y5, tl.load(rope + 2), tl.load(rope + HALF + 2))
+        y6, y7 = _rotate(y6, y7, tl.load(rope + 3), tl.load(rope + HALF + 3))
+
+    # The BF16 operand values: what the prep stores and what the append converts.
+    b0 = y0.to(tl.bfloat16)
+    b1 = y1.to(tl.bfloat16)
+    b2 = y2.to(tl.bfloat16)
+    b3 = y3.to(tl.bfloat16)
+    b4 = y4.to(tl.bfloat16)
+    b5 = y5.to(tl.bfloat16)
+    b6 = y6.to(tl.bfloat16)
+    b7 = y7.to(tl.bfloat16)
+    out = out_row + out_off + lane * 8
+    tl.store(out + 0, b0)
+    tl.store(out + 1, b1)
+    tl.store(out + 2, b2)
+    tl.store(out + 3, b3)
+    tl.store(out + 4, b4)
+    tl.store(out + 5, b5)
+    tl.store(out + 6, b6)
+    tl.store(out + 7, b7)
+
+    # Their E4M3 copies: Q into the FMHA's query buffer, K into the cache's K page.
+    if is_q:
+        q8 = q8_ptr + (row64 * NUM_Q_HEADS + head) * D + lane * 8
+        _fp8_store8(q8, b0, b1, b2, b3, b4, b5, b6, b7, scale_bf16)
+    else:
+        page_k = tl.load(table).to(tl.int64)
+        k8 = pool_ptr + page_k * PAGE + slot + lane * 8
+        _fp8_store8(k8, b0, b1, b2, b3, b4, b5, b6, b7, scale_bf16)
+
+    if (row == 0) & (head == 0):
+        # The FMHA's scale words, in the built-in kernel's operation order:
+        # (s_q * s_k) * bmm1_host, then that * log2(e); o_scale * s_v.
+        s = tl.load(quant_orig_ptr)
+        bmm1 = s * s * bmm1_host
+        tl.store(bmm1_ptr, bmm1)
+        tl.store(bmm1_ptr + 1, bmm1 * 1.4426950408889634)
+        tl.store(bmm2_ptr, o_scale * s)
+        if ROWS_PER_SEQ > 1:
+            # The decoder-info kernel's cumulative query lengths for fixed query lengths
+            # (it runs only for more than one query row per sequence).
+            i = tl.arange(0, SEQS_BLOCK)
+            tl.store(cu_seqlens_ptr + i, i * ROWS_PER_SEQ, mask=i <= num_seqs)
+
+
+def _cache_positions(seq_lens: torch.Tensor, num_seqs: int, rows_per_seq: int) -> torch.Tensor:
+    """Every row's cache position ``seq_lens[b] - Q + t``, as int64 ``[B * Q]``."""
+    lengths = seq_lens[:num_seqs].long()
+    token = torch.arange(rows_per_seq, device=seq_lens.device)
+    return (lengths[:, None] - rows_per_seq + token[None, :]).reshape(-1)
+
+
+class MultiRequestPrepAppend(OpWrapper):
+    """``preattn_prep`` for ``B`` sequences, plus their FP8 K/V append, E4M3 Q, FMHA scales and
+    cumulative query lengths.
+
+    With ``H = num_q_heads``, ``G = num_kv_heads``, head width 64, ``B`` =
+    ``num_seqs`` sequences of ``Q`` rows each (row ``r`` of sequence ``b = r //
+    Q`` at cache position ``p = seq_lens[b] - Q + r % Q``), ``s =
+    kv_scale_orig_quant[0]`` and ``u = kv_scale_quant_orig[0]``::
+
+        qkv_out, gate_out = preattn_prep(qkv, cos_sin, position_ids, ...)   # bit for bit
+        e4m3(x)  = e4m3_rn_satfinite(bf16(x * bf16(s)))
+        q_fp8[r, h, :]                                              = e4m3(q'[r, h])
+        kv_pool[block_tables[b][0][p >> log2 P], g, p & (P - 1), :] = e4m3(k'[r, g])
+        kv_pool[block_tables[b][1][p >> log2 P], g, p & (P - 1), :] = e4m3(v[r, g])
+        bmm1_scale[0:2] = [u * u * bmm1_host_scale, that * log2(e)]
+        bmm2_scale[0]   = o_scale * u
+        cu_seqlens[0:B + 1] = [0, Q, ..., B Q]                      # only when Q > 1
+
+    ``q'``, ``k'`` are ``qkv_out``'s query and key heads (normalized, scaled and,
+    with ``cos_sin``, rotated). ``qkv_out`` and ``gate_out`` are fresh and
+    contiguous; ``q_fp8`` (at least ``B Q H 64`` bytes, any dtype), ``kv_pool``,
+    ``bmm1_scale`` (fp32, at least 2), ``bmm2_scale`` (fp32, at least 1) and
+    ``cu_seqlens`` (int32, at least ``B + 1``) are written in place.
+    ``block_tables`` is the TRT-LLM table ``[>= B, 2, pages]`` (K page ids, then
+    V page ids) into ``kv_pool [pages, G, P, 64]``.
+
+    ``enable_pdl`` launches with programmatic dependent launch: the grid may
+    start while the projection's kernel finishes and waits before its first
+    global read; it triggers its dependents only by completing.
+    """
+
+    ARCHS = frozenset({Arch.SM_103})
+
+    # spec: seqs, rows_per_seq, ctx (an int for every sequence, or one per
+    # sequence), rope (sliding-window RoPE layer vs full-attention NoPE), page,
+    # permuted (low-latency weight layout), scale (the cache's quant scale),
+    # gain (projection magnitude: saturating E4M3), zero_heads (exact-zero heads),
+    # heads ((query, KV) heads of a rank; default a tep4 rank's (32, 4)).
+    CELLS: tuple[Cell, ...] = tuple(
+        Cell(
+            why=f"{seqs} sequences of a K=7 verify block, {'RoPE' if rope else 'NoPE'}: {why}",
+            spec=dict(seqs=seqs, rows_per_seq=8, ctx=ctx, rope=rope, page=32),
+        )
+        for seqs, ctx, why in (
+            (2, (100000, 4100), "two requests, one straddling a page boundary"),
+            (4, (100000, 40000, 4096, 8), "the bs-4 graph: a page end and a first step"),
+            (8, 60000, "the bs-8 graph at a 60k-token context"),
+            (16, 120000, "the bs-16 graph at a 120k-token context"),
+            (24, 90000, "the bs-24 graph"),
+            (32, 30000, "the bs-32 graph"),
+            (64, (1 << 20) - 5, "64 sequences (512 rows) near the 2^20-position limit"),
+            (96, 70000, "the bs-96 graph of a generation worker"),
+            (128, (1 << 20) - 5, "the largest step (1024 rows) near the 2^20-position limit"),
+        )
+        for rope in (True, False)
+    ) + (
+        Cell(
+            why="2 sequences of a K=3 verify block (4 rows each)",
+            spec=dict(seqs=2, rows_per_seq=4, ctx=(70001, 333), rope=True, page=32),
+        ),
+        Cell(
+            why="3 sequences of plain decode (1 row each)",
+            spec=dict(seqs=3, rows_per_seq=1, ctx=(5, 32, 33), rope=True, page=32),
+        ),
+        Cell(
+            why="8 sequences, 64-token pages",
+            spec=dict(seqs=8, rows_per_seq=8, ctx=100000, rope=True, page=64),
+        ),
+        Cell(
+            why="8 sequences, low-latency weight layout",
+            spec=dict(seqs=8, rows_per_seq=8, ctx=100000, rope=True, page=32, permuted=True),
+        ),
+        Cell(
+            why="8 sequences, a quant scale other than 1 (bf16-rounded before the multiply)",
+            spec=dict(seqs=8, rows_per_seq=8, ctx=100000, rope=False, page=32, scale=0.7071),
+        ),
+        Cell(
+            why="8 sequences, magnitudes past the E4M3 range (satfinite)",
+            spec=dict(seqs=8, rows_per_seq=8, ctx=100000, rope=True, page=32, gain=200.0),
+        ),
+        Cell(
+            why="8 sequences with exact-zero heads (rsqrt(eps) times zero, signed E4M3 zeros)",
+            spec=dict(seqs=8, rows_per_seq=8, ctx=100000, rope=True, page=32, zero_heads=True),
+        ),
+        Cell(
+            why="8 sequences at a tep8 rank's 16 query / 2 KV heads",
+            spec=dict(seqs=8, rows_per_seq=8, ctx=100000, rope=True, page=32, heads=(16, 2)),
+        ),
+    )
+
+    note = """
+    Metadata consumed: seq_lens[0:B] (device, read by the kernel), the
+    sequences' K and V page ids, the layer's pool view, the two FP8 KV
+    scales, the FMHA's host bmm1 scale and the output scale (1.0 for a BF16
+    output); with RoPE the per-row positions and the cos/sin table. Call site:
+    every target layer (46 RoPE + 16 NoPE) on decode steps of 2..128 sequences
+    of the same number of rows (fast path multi_request_prep_append), whose
+    trtllm-gen generation preprocess launch (decoder-info + append kernels)
+    the target then skips. Grid (rows, H + G), one warp per program.
+
+    Bit-identical, gated by its own tests: qkv_out and gate_out against
+    preattn_prep; the cache bytes, the E4M3 query bytes, both scale words and
+    the cumulative query lengths against thop.trtllm_gen_generation_preprocess
+    run on the same projection, pool and tables (every pool byte, including
+    the untouched ones), including saturating, NaN, zero and special heads;
+    and the FMHA output on both paths, eager and from a captured graph.
+
+    Loud preconditions (ValueError before any launch): BF16 projection with
+    unit last stride and width 2 * (H + G) * 64, B * Q rows with 2 <= B <= 128
+    and 1 <= Q <= 8, FP8 E4M3 pool [pages, G, P, 64] with P a power of two,
+    int32 [>= B, 2, pages] block table with unit last stride, int32 seq_lens
+    of at least B, int32 cu_seqlens of at least B + 1, fp32 scales, a query
+    buffer of at least B Q H 64 bytes, and with RoPE a contiguous fp32
+    [positions, 2, 32] table and one position per row.
+
+    Not certified: sequences of different row counts (the target routes only
+    uniform steps), a sequence shorter than its rows, head width other than
+    64, NVFP4 or BF16 caches, multi-token generation (per-sequence generation
+    lengths and the per-token table).
+    """
+
+    def __call__(
+        self,
+        qkv: torch.Tensor,
+        cos_sin: Optional[torch.Tensor],
+        position_ids: Optional[torch.Tensor],
+        num_q_heads: int,
+        num_kv_heads: int,
+        eps: float,
+        q_scale: float,
+        qkv_permuted: bool,
+        num_seqs: int,
+        kv_pool: torch.Tensor,
+        block_tables: torch.Tensor,
+        seq_lens: torch.Tensor,
+        kv_scale_orig_quant: torch.Tensor,
+        kv_scale_quant_orig: torch.Tensor,
+        q_fp8: torch.Tensor,
+        bmm1_scale: torch.Tensor,
+        bmm2_scale: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        bmm1_host_scale: float,
+        o_scale: float = 1.0,
+        enable_pdl: bool = False,
+        prefetch: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        rows, width = qkv.shape
+        page = kv_pool.shape[2] if kv_pool.dim() == 4 else 0
+        rows_per_seq = rows // num_seqs if num_seqs > 0 else 0
+        if (
+            qkv.dtype != torch.bfloat16
+            or qkv.stride(-1) != 1
+            or width != 2 * (num_q_heads + num_kv_heads) * HEAD_DIM
+            or not 2 <= num_seqs <= MAX_SEQS
+            or rows != num_seqs * rows_per_seq
+            or not 1 <= rows_per_seq <= MAX_ROWS_PER_SEQ
+            or kv_pool.dtype != torch.float8_e4m3fn
+            or kv_pool.dim() != 4
+            or tuple(kv_pool.shape[1:]) != (num_kv_heads, page, HEAD_DIM)
+            or not kv_pool.is_contiguous()
+            or page <= 0
+            or page & (page - 1) != 0
+            or block_tables.dtype != torch.int32
+            or block_tables.dim() != 3
+            or block_tables.shape[0] < num_seqs
+            or block_tables.shape[1] != 2
+            or block_tables.stride(-1) != 1
+            or seq_lens.dtype != torch.int32
+            or seq_lens.numel() < num_seqs
+            or kv_scale_orig_quant.dtype != torch.float32
+            or kv_scale_quant_orig.dtype != torch.float32
+            or bmm1_scale.dtype != torch.float32
+            or bmm1_scale.numel() < 2
+            or bmm2_scale.dtype != torch.float32
+            or bmm2_scale.numel() < 1
+            or cu_seqlens.dtype != torch.int32
+            or cu_seqlens.numel() < num_seqs + 1
+            or not q_fp8.is_contiguous()
+            or q_fp8.numel() * q_fp8.element_size() < rows * num_q_heads * HEAD_DIM
+        ):
+            raise ValueError(
+                "multi_request_prep_append takes a BF16 [B Q, 2 (H + G) 64] projection of "
+                f"2..{MAX_SEQS} sequences of 1..{MAX_ROWS_PER_SEQ} rows, an FP8 E4M3 pool "
+                "[pages, G, P, 64] (P a power of two), an int32 [>= B, 2, pages] block table, "
+                "int32 seq_lens and cu_seqlens, fp32 scales and a contiguous query buffer of "
+                f"B Q H 64 bytes; got qkv {qkv.dtype} {tuple(qkv.shape)} strides {qkv.stride()}, "
+                f"B={num_seqs}, H={num_q_heads} G={num_kv_heads}, pool {kv_pool.dtype} "
+                f"{tuple(kv_pool.shape)}, table {block_tables.dtype} {tuple(block_tables.shape)}, "
+                f"seq_lens {seq_lens.dtype}[{seq_lens.numel()}], cu_seqlens {cu_seqlens.dtype}"
+                f"[{cu_seqlens.numel()}], scales {kv_scale_orig_quant.dtype}/"
+                f"{kv_scale_quant_orig.dtype}, bmm {bmm1_scale.dtype}[{bmm1_scale.numel()}]/"
+                f"{bmm2_scale.dtype}[{bmm2_scale.numel()}], query buffer "
+                f"{q_fp8.numel() * q_fp8.element_size()} bytes"
+            )
+        positions = None
+        if cos_sin is not None:
+            positions = position_ids.reshape(-1)
+            if positions.numel() != rows or not is_rope_table(cos_sin):
+                raise ValueError(
+                    "multi_request_prep_append RoPE needs one position per row and a contiguous "
+                    f"fp32 [max_positions, 2, {HEAD_DIM // 2}] table, got {positions.numel()} "
+                    f"positions for {rows} rows and a {cos_sin.dtype} {tuple(cos_sin.shape)} table"
+                )
+        elif position_ids is not None:
+            raise ValueError("multi_request_prep_append: position_ids without a cos/sin table")
+        pf_base, pf_bytes, pf_chunk = 0, 0, 16
+        if prefetch is not None:
+            pf_bytes = prefetch.numel() * prefetch.element_size()
+            if not (
+                prefetch.is_cuda
+                and prefetch.is_contiguous()
+                and prefetch.data_ptr() % 16 == 0
+                and pf_bytes % 16 == 0
+            ):
+                raise ValueError(
+                    "multi_request_prep_append prefetches a contiguous, 16-byte aligned CUDA tensor "
+                    f"of a multiple of 16 bytes, got {tuple(prefetch.shape)} {prefetch.dtype} at "
+                    f"{prefetch.data_ptr():#x}"
+                )
+            programs = rows * (num_q_heads + num_kv_heads)
+            pf_base = prefetch.data_ptr()
+            pf_chunk = ((pf_bytes + programs - 1) // programs + 15) // 16 * 16
+        qkv_out = torch.empty(
+            (rows, (num_q_heads + 2 * num_kv_heads) * HEAD_DIM), dtype=qkv.dtype, device=qkv.device
+        )
+        gate_out = torch.empty((rows, num_q_heads * HEAD_DIM), dtype=qkv.dtype, device=qkv.device)
+        _multi_request_prep_append_kernel[(rows, num_q_heads + num_kv_heads)](
+            qkv,
+            qkv_out,
+            gate_out,
+            cos_sin,
+            positions,
+            q_fp8.view(torch.uint8).view(torch.float8_e4m3fn),
+            kv_pool,
+            block_tables,
+            block_tables.stride(0),
+            block_tables.stride(1),
+            seq_lens,
+            kv_scale_orig_quant,
+            kv_scale_quant_orig,
+            bmm1_scale,
+            bmm2_scale,
+            cu_seqlens,
+            bmm1_host_scale,
+            o_scale,
+            qkv.stride(0),
+            qkv_out.stride(0),
+            gate_out.stride(0),
+            eps,
+            q_scale,
+            num_seqs,
+            pf_base,
+            pf_bytes,
+            pf_chunk,
+            NUM_Q_HEADS=num_q_heads,
+            NUM_KV_HEADS=num_kv_heads,
+            QKV_PERMUTED=qkv_permuted,
+            APPLY_ROPE=cos_sin is not None,
+            ROWS_PER_SEQ=rows_per_seq,
+            P=page,
+            LOG2_P=page.bit_length() - 1,
+            SEQS_BLOCK=triton.next_power_of_2(num_seqs + 1),
+            LAUNCH_WITH_PDL=enable_pdl,
+            PREFETCH=prefetch is not None,
+            num_warps=1,
+            launch_pdl=enable_pdl,
+        )
+        return qkv_out, gate_out
+
+    def reference(
+        self,
+        qkv: torch.Tensor,
+        cos_sin: Optional[torch.Tensor],
+        position_ids: Optional[torch.Tensor],
+        num_q_heads: int,
+        num_kv_heads: int,
+        eps: float,
+        q_scale: float,
+        qkv_permuted: bool,
+        num_seqs: int,
+        kv_pool: torch.Tensor,
+        block_tables: torch.Tensor,
+        seq_lens: torch.Tensor,
+        kv_scale_orig_quant: torch.Tensor,
+        kv_scale_quant_orig: torch.Tensor,
+        q_fp8: torch.Tensor,
+        bmm1_scale: torch.Tensor,
+        bmm2_scale: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        bmm1_host_scale: float,
+        o_scale: float = 1.0,
+        enable_pdl: bool = False,
+        prefetch: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """``preattn_prep.reference`` (float64 between its rounding points), then the same
+        in-place writes from its BF16 values.
+
+        The E4M3 conversions round the BF16 product with the BF16 scale, then to
+        E4M3 with saturation; the scale words are fp32 products in the kernel's
+        order. ``enable_pdl`` changes how the op is launched and ``prefetch`` only asks
+        the L2 for bytes; both are ignored here.
+        """
+        rows = qkv.shape[0]
+        page = kv_pool.shape[2]
+        rows_per_seq = rows // num_seqs
+        qkv_out, gate_out = preattn_prep.reference(
+            qkv,
+            cos_sin,
+            position_ids,
+            num_q_heads,
+            num_kv_heads,
+            eps,
+            q_scale,
+            qkv_permuted,
+        )
+        q_width, kv_width = num_q_heads * HEAD_DIM, num_kv_heads * HEAD_DIM
+        q = qkv_out[:, :q_width].reshape(rows, num_q_heads, HEAD_DIM)
+        k = qkv_out[:, q_width : q_width + kv_width].reshape(rows, num_kv_heads, HEAD_DIM)
+        v = qkv_out[:, q_width + kv_width :].reshape(rows, num_kv_heads, HEAD_DIM)
+        s_bf16 = kv_scale_orig_quant.float()[0].to(torch.bfloat16).float()
+
+        def e4m3(x: torch.Tensor) -> torch.Tensor:
+            # E4M3 round-to-nearest with saturation: a finite overflow lands on
+            # +-448 rather than torch's NaN; NaN stays NaN.
+            y = (x.float() * s_bf16).to(torch.bfloat16).float()
+            return y.clamp(-448.0, 448.0).to(torch.float8_e4m3fn).view(torch.uint8)
+
+        q8 = q_fp8.view(torch.uint8).reshape(-1)
+        q8[: rows * num_q_heads * HEAD_DIM] = e4m3(q).reshape(-1)
+        pool_bytes = kv_pool.view(torch.uint8)
+        positions = _cache_positions(seq_lens, num_seqs, rows_per_seq)
+        seqs = torch.arange(num_seqs, device=qkv.device).repeat_interleave(rows_per_seq)
+        index = torch.div(positions, page, rounding_mode="floor")
+        k_pages = block_tables[seqs, 0, index].long()
+        v_pages = block_tables[seqs, 1, index].long()
+        slots = positions - index * page
+        for g in range(num_kv_heads):
+            pool_bytes[k_pages, g, slots] = e4m3(k[:, g])
+            pool_bytes[v_pages, g, slots] = e4m3(v[:, g])
+        u = kv_scale_quant_orig.float()[0]
+        bmm1 = u * u * torch.tensor(bmm1_host_scale, dtype=torch.float32, device=u.device)
+        bmm1_scale[0] = bmm1
+        bmm1_scale[1] = bmm1 * torch.tensor(LOG2E, dtype=torch.float32, device=u.device)
+        bmm2_scale[0] = torch.tensor(o_scale, dtype=torch.float32, device=u.device) * u
+        if rows_per_seq > 1:
+            cu_seqlens[: num_seqs + 1] = torch.arange(
+                0, (num_seqs + 1) * rows_per_seq, rows_per_seq, dtype=torch.int32, device=u.device
+            )
+        return qkv_out, gate_out
+
+    def is_valid(
+        self,
+        qkv: torch.Tensor,
+        cos_sin: Optional[torch.Tensor],
+        position_ids: Optional[torch.Tensor],
+        num_q_heads: int,
+        num_kv_heads: int,
+        eps: float,
+        q_scale: float,
+        qkv_permuted: bool,
+        num_seqs: int,
+        kv_pool: torch.Tensor,
+        block_tables: torch.Tensor,
+        seq_lens: torch.Tensor,
+        kv_scale_orig_quant: torch.Tensor,
+        kv_scale_quant_orig: torch.Tensor,
+        q_fp8: torch.Tensor,
+        bmm1_scale: torch.Tensor,
+        bmm2_scale: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        bmm1_host_scale: float,
+        o_scale: float = 1.0,
+        enable_pdl: bool = False,
+        prefetch: Optional[torch.Tensor] = None,
+    ) -> None:
+        """Inputs the kernel takes and answers wrongly, with no error.
+
+        A sequence shorter than its rows puts keys at negative positions; a block
+        table shorter than a sequence reads page ids past its row; a page id outside
+        the pool writes outside it; a RoPE position outside the table is read from
+        outside it.
+        """
+        rows = qkv.shape[0]
+        rows_per_seq = rows // num_seqs
+        page = kv_pool.shape[2]
+        lengths = seq_lens[:num_seqs].long()
+        if int(lengths.min()) < rows_per_seq:
+            raise ValueError(
+                f"a sequence of {int(lengths.min())} keys is shorter than its {rows_per_seq} rows"
+            )
+        last = (lengths - 1) // page
+        if block_tables.shape[2] <= int(last.max()):
+            raise ValueError(
+                f"a [.., 2, {block_tables.shape[2]}] block table cannot address "
+                f"{int(lengths.max())} keys of {page}-token pages"
+            )
+        positions = _cache_positions(seq_lens, num_seqs, rows_per_seq)
+        seqs = torch.arange(num_seqs, device=qkv.device).repeat_interleave(rows_per_seq)
+        used = block_tables[seqs, :, positions // page]
+        if int(used.min()) < 0 or int(used.max()) >= kv_pool.shape[0]:
+            raise ValueError(
+                f"page ids [{int(used.min())}, {int(used.max())}] outside the "
+                f"{kv_pool.shape[0]}-page pool"
+            )
+        if cos_sin is not None and position_ids is not None and position_ids.numel():
+            low, high = int(position_ids.min()), int(position_ids.max())
+            if low < 0 or high >= cos_sin.shape[0]:
+                raise ValueError(
+                    f"positions [{low}, {high}] outside the RoPE table of {cos_sin.shape[0]}"
+                )
+
+
+multi_request_prep_append = MultiRequestPrepAppend()

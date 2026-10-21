@@ -83,6 +83,43 @@ def _attention_norm_gate_pdl_kernel(
     tl.store(out + row * HEAD_DIM + offsets, result)
 
 
+@triton.jit
+def _attention_norm_gate_pdl_heads_kernel(
+    out,
+    attention,
+    gate,
+    attention_stride,
+    gate_token_stride,
+    gate_head_stride,
+    eps,
+    HEADS: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    TRIGGER: tl.constexpr,
+    HEADS_PER_PROGRAM: tl.constexpr,
+):
+    """``_attention_norm_gate_pdl_kernel`` over ``HEADS_PER_PROGRAM`` consecutive (row, head)
+    pairs per program: each pair runs the same statements on the same layout."""
+    if TRIGGER == 2:
+        tl.extra.cuda.gdc_launch_dependents()
+    tl.extra.cuda.gdc_wait()
+    if TRIGGER == 1:
+        tl.extra.cuda.gdc_launch_dependents()
+    offsets = tl.arange(0, HEAD_DIM)
+    for i in tl.static_range(HEADS_PER_PROGRAM):
+        row = tl.program_id(0) * HEADS_PER_PROGRAM + i
+        token = row // HEADS
+        head = row % HEADS
+        x = tl.load(attention + token * attention_stride + head * HEAD_DIM + offsets).to(tl.float32)
+        variance = tl.sum(x * x, axis=0) / HEAD_DIM
+        normed = (x * tl.rsqrt(variance + eps)).to(tl.bfloat16)
+        g = tl.load(gate + token * gate_token_stride + head * gate_head_stride + offsets).to(
+            tl.float32
+        )
+        sigmoid = tl.sigmoid(g).to(tl.bfloat16)
+        result = normed.to(tl.float32) * sigmoid.to(tl.float32)
+        tl.store(out + row * HEAD_DIM + offsets, result)
+
+
 def gate_head_stride(gate: torch.Tensor) -> int:
     """The stride between heads of ``gate`` as the built-in launch computes it."""
     return gate.stride(1) if gate.ndim == 3 else HEAD_DIM
@@ -144,10 +181,34 @@ class AttentionNormGate(OpWrapper):
         eps: float,
         trigger: str = "after_wait",
         out: Optional[torch.Tensor] = None,
+        heads_per_program: int = 1,
     ) -> torch.Tensor:
         if out is None:
             out = torch.empty_like(attention, memory_format=torch.contiguous_format)
         heads = attention.shape[1] // HEAD_DIM
+        if heads_per_program > 1:
+            if heads % heads_per_program:
+                raise ValueError(
+                    f"heads_per_program must divide the {heads} heads, got {heads_per_program}"
+                )
+            _attention_norm_gate_pdl_heads_kernel[
+                (attention.shape[0] * heads // heads_per_program,)
+            ](
+                out,
+                attention,
+                gate,
+                attention.stride(0),
+                gate.stride(0),
+                gate_head_stride(gate),
+                eps,
+                HEADS=heads,
+                HEAD_DIM=HEAD_DIM,
+                TRIGGER=TRIGGERS[trigger],
+                HEADS_PER_PROGRAM=heads_per_program,
+                num_warps=4,
+                launch_pdl=True,
+            )
+            return out
         _attention_norm_gate_pdl_kernel[(attention.shape[0] * heads,)](
             out,
             attention,
@@ -171,11 +232,12 @@ class AttentionNormGate(OpWrapper):
         eps: float,
         trigger: str = "after_wait",
         out: Optional[torch.Tensor] = None,
+        heads_per_program: int = 1,
     ) -> torch.Tensor:
         """float64 between the op's BF16 rounding points, which it keeps.
 
-        ``trigger`` and ``out`` change where the result goes and when a
-        dependent may start, not the result.
+        ``trigger``, ``out`` and ``heads_per_program`` change where the result goes, when a
+        dependent may start and how the grid is cut, not the result.
         """
         rows, width = attention.shape
         heads = width // HEAD_DIM
@@ -192,6 +254,7 @@ class AttentionNormGate(OpWrapper):
         eps: float,
         trigger: str = "after_wait",
         out: Optional[torch.Tensor] = None,
+        heads_per_program: int = 1,
     ) -> None:
         """Shapes, dtypes and strides the kernel reads as if they were the built-in's, with no error.
 
