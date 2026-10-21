@@ -7901,7 +7901,8 @@ class PyExecutor:
         """Pad an idle attention-DP rank with a role-matched dummy request."""
         if getattr(self, "_enable_remote_tail_adp", False):
             return
-        if not self.enable_attention_dp:
+        # A single-rank attention-DP group has no peer to keep in step.
+        if not self.enable_attention_dp or self.dist.tp_size <= 1:
             return
 
         expected_num_active_requests = self.expected_num_active_requests
@@ -8069,6 +8070,10 @@ class PyExecutor:
                 scheduled_batch.attention_dp_phase
                 in (RemoteTailPhase.CONTEXT, RemoteTailPhase.DECODE) and 0
                 in self.model_engine.cuda_graph_runner.padding_dummy_requests)
+            return
+        # With a single attention-DP rank `_can_queue` vetoes only this rank's
+        # own empty batch, so there is no peer to unblock.
+        if self.dist.tp_size <= 1:
             return
         if not self.active_requests or self.expected_num_active_requests <= 0:
             return

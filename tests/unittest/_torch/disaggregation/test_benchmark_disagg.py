@@ -739,7 +739,7 @@ class MockPadDummyExecutor:
         expected_num_active_requests: int = 1,
         num_fetch_requests: int = 0,
         benchmark_req_queues_size: int = 8,
-        tp_size: int = 1,
+        tp_size: int = 2,
     ):
         self.is_benchmark_disagg = is_benchmark_disagg
         self._benchmark_fill_phase_active = (
