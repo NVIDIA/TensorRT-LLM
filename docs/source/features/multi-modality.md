@@ -87,11 +87,19 @@ enable_iter_perf_stats: true
 
 | Metric | Measurement |
 | --- | --- |
-| `trtllm_input_processing_seconds{stage="media_load"}` | Time awaiting media resolution, including fetch, decode and worker waits, per chat request with media. |
+| `trtllm_input_processing_seconds{stage="total"}` | Wall time from entry into a chat, completion, encoder, Harmony or Responses handler until its inputs are prepared, before waiting for generation. Includes message parsing, rendering, media resolution, preprocessing and their waits. |
+| `trtllm_input_processing_seconds{stage="media_load"}` | Time awaiting the common media resolver, including concurrent downloads, decodes and worker waits. |
 | `trtllm_input_processing_seconds{stage="chat_template"}` | Time awaiting chat template rendering, when rendering is needed. |
 | `trtllm_input_processing_seconds{stage="processor"}` | Input processor wall time inside its worker, including tokenization, model preprocessing and hashing. |
 | `trtllm_input_processing_queue_seconds` | Wait for an input processor worker, separate from processor execution. |
+| `trtllm_media_processing_seconds{stage="download", modality="image"}` | Per-item HTTP(S) download wall time. Also supports `audio` and `video`. Local and inline data inputs do not create download observations. |
+| `trtllm_media_processing_seconds{stage="decode", modality="image"}` | Per-item decode execution in the common media worker, separate from queue time. Local file decoding includes file IO; inline decoding includes base64 conversion. |
+| `trtllm_media_processing_seconds{stage="decode_queue", modality="image"}` | Per-item wait for a media decode worker. |
 | `trtllm_multimodal_encoder_gpu_time_seconds` | Rank-0 CUDA-event elapsed time per encoder call through `MultimodalModelMixin`, including item scheduling, inline encoding and side-stream prefetch. |
+
+Input timings are captured in a request context independently of Prometheus. Completed requests also carry them in `perf_metrics.input_processing_metrics` in the existing JSONL output (`perf_metrics_output_dir`). Values are seconds: request-level stages use keys such as `total`, `media_load`, `chat_template`, `processor` and `processor_queue`. Per-item times are summed by stage and modality within each request, for example `media_download_image` and `media_decode_image`; these sums can exceed elapsed request time when items overlap. Batched completion inputs share the HTTP request's frontend timings.
+
+For selected requests, send `X-TRTLLM-return-metrics: 1` to receive the same values in `Server-Timing`, for example `server_input_total;dur=150.000000` (milliseconds). Streaming responses use the existing `trtllm.perf_metrics` SSE event. These fields survive context/generation worker handoff and remain separate from executor timing and batch-level encoder GPU measurements. Stage histograms include failed attempts; request JSONL records follow the existing completed-request reporting path.
 
 Processor metrics cover the chat and text completion paths that offload preprocessing to the input processor pool. Encoder metrics exclude warmup, cache-only lookups and H2D transfers performed before the encoder call. Calls using precomputed embeddings or legacy paths outside `MultimodalModelMixin` do not produce encoder observations. The count is encoder calls, not requests or media items. The timings describe rank 0; they are not a sum or maximum across GPUs. Completed encoder observations may appear in a later iteration's JSON field, `multimodalEncoderStats.gpuTimesMS`, because collection does not wait for the GPU.
 
