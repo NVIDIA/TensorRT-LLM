@@ -24,4 +24,4 @@ l0_gb300_multi_nodes_perf_sanity_ctx2_node1_gpu2_gen1_node4_gpu16:
   # would need far more gen KV than 16x GB300 holds at this trace's ISL. The
   # ctx_only and gen_only_no_context lanes are in
   # l0_gb300_multi_gpus_perf_sanity and l0_gb300_multi_nodes_perf_sanity_gen1_node4_gpu16.
-  - perf/test_perf_sanity.py::test_e2e[disagg_upload-e2e-gb300_deepseek-v41-flash-fp4-dspark_agentx_con1579_ctx2_dep2_gen1_dep16_eplb0_dspark5_ccb-NIXL] TIMEOUT (120)
+  - perf/test_perf_sanity.py::test_e2e[disagg_upload-e2e-gb300_deepseek-v41-flash-fp4-dspark_agentx_con1579_ctx2_dep2_gen1_dep16_eplb0_dspark5_ccb-NIXL] TIMEOUT (90)
