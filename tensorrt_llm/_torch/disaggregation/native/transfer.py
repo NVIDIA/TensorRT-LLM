@@ -17,12 +17,13 @@ from __future__ import annotations
 
 import os
 import queue
+import secrets
 import struct
 import threading
 import time
 import weakref
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Callable, Dict, Iterable, Iterator, List, Optional, Union
 
@@ -117,6 +118,8 @@ class RecvReqInfo:
     aux_slot: Optional[int] = None
     slice_id: Optional[int] = None
     bounce_dst_base: Optional[int] = None
+    # REQUEST_DATA carries this separately for the sender to echo in KV_AGENT_RESULT.
+    kv_result_report_token: bytes = field(default=b"", repr=False, compare=False)
 
     def to_bytes(self) -> bytes:
         return msgpack.packb(
@@ -174,6 +177,7 @@ class WriteMeta:
     is_last_slice: bool = False
     meta_type: WriteMetaType = WriteMetaType.KV
     bounce_dst_base: Optional[int] = None
+    kv_result_report_token: bytes = field(default=b"", repr=False)
 
 
 class MessageType:
@@ -431,10 +435,10 @@ class AgentResult(Enum):
     IN_DOUBT = "IN_DOUBT"
 
 
-# KV_AGENT_RESULT prefix in one struct frame (was ascii frames serialized/parsed under the
-# GIL per slice per writer): instance_rank, unique_rid, slice_id, is_last, status,
-# transfer_size. The optional bounce tail follows at message[2:].
-_KV_RESULT_PREFIX = struct.Struct("<qqq?Bq")
+# KV_AGENT_RESULT prefix: instance_rank, unique_rid, slice_id, is_last, status,
+# transfer_size, kv_result_report_token. The optional bounce tail follows at message[2:].
+_KV_RESULT_REPORT_TOKEN_BYTES = 16
+_KV_RESULT_PREFIX = struct.Struct("<qqq?Bq16s")
 _AGENT_RESULT_CODE = {
     AgentResult.SUCCESS: 0,
     AgentResult.FAILED: 1,
@@ -448,11 +452,18 @@ _AGENT_RESULT_BY_CODE = {
 
 
 def _make_kv_result_msg(
-    instance_rank, unique_rid, slice_id, is_last_slice, agent_result, transfer_size=0, tail=None
+    instance_rank,
+    unique_rid,
+    slice_id,
+    is_last_slice,
+    agent_result,
+    *,
+    kv_result_report_token: bytes,
+    transfer_size=0,
+    tail=None,
 ):
-    """Build a KV_AGENT_RESULT message. ALL result sends (success AND failed/cancelled) must go
-    through this single binary frame so the receiver's _KV_RESULT_PREFIX.unpack never hits a stale
-    ascii payload (which would fail to decode and leave the RX task stuck forever)."""
+    """Build a KV_AGENT_RESULT with the same binary prefix for every result status."""
+    kv_result_report_token = _check_kv_result_report_token(kv_result_report_token)
     msg = [
         MessageType.KV_AGENT_RESULT,
         _KV_RESULT_PREFIX.pack(
@@ -462,11 +473,21 @@ def _make_kv_result_msg(
             bool(is_last_slice),
             _AGENT_RESULT_CODE[agent_result],
             int(transfer_size),
+            kv_result_report_token,
         ),
     ]
     if tail:
         msg += tail
     return msg
+
+
+def _check_kv_result_report_token(kv_result_report_token: bytes) -> bytes:
+    if (
+        not isinstance(kv_result_report_token, bytes)
+        or len(kv_result_report_token) != _KV_RESULT_REPORT_TOKEN_BYTES
+    ):
+        raise ValueError("KV result report token must be 16 bytes")
+    return kv_result_report_token
 
 
 def _make_aux_result_msg(instance_rank: int, unique_rid: int, result: AgentResult) -> list[bytes]:
@@ -1099,6 +1120,7 @@ class Sender(SenderBase):
                     write_meta.receiver_slice_id,
                     True,  # is_last_slice — ensures receiver resolves its task future
                     AgentResult.FAILED,
+                    kv_result_report_token=write_meta.kv_result_report_token,
                 )
             )
             return
@@ -1131,6 +1153,7 @@ class Sender(SenderBase):
                         write_meta.receiver_slice_id,
                         True,  # is_last_slice — ensures receiver resolves its task future
                         AgentResult.FAILED,
+                        kv_result_report_token=write_meta.kv_result_report_token,
                     )
                 )
                 return
@@ -1187,6 +1210,7 @@ class Sender(SenderBase):
             write_meta.receiver_slice_id,
             write_meta.is_last_slice,
             agent_result,
+            kv_result_report_token=write_meta.kv_result_report_token,
             transfer_size=transfer_size,
             tail=tail,
         )
@@ -1473,6 +1497,7 @@ class Sender(SenderBase):
             receiver_slice_id=req_info.slice_id if req_info.slice_id is not None else 0,
             is_last_slice=task._chunk.is_last,
             bounce_dst_base=req_info.bounce_dst_base,
+            kv_result_report_token=req_info.kv_result_report_token,
         )
 
     def _build_aux_write_meta(self, task: AuxSendTask, req_info: RecvReqInfo) -> WriteMeta:
@@ -1642,7 +1667,10 @@ class Sender(SenderBase):
     def _respond_with_kv(self, _send_id: bytes, message: list[bytes]):
         # _sessions_lock prevents a race between session lookup and req_info save.
         # session.lock atomically saves peer info and snapshots tasks against send().
+        if len(message) != 3:
+            raise ValueError("REQUEST_DATA must include a result report token")
         info: RecvReqInfo = RecvReqInfo.from_bytes(message[1])
+        info.kv_result_report_token = _check_kv_result_report_token(message[2])
         with self._sessions_lock:
             session = self._get_session(info.unique_rid)
             if session is None:
@@ -1687,6 +1715,7 @@ class Sender(SenderBase):
                     slice_id,
                     True,  # is_last_slice
                     AgentResult.FAILED,
+                    kv_result_report_token=info.kv_result_report_token,
                 )
             ]
             if include_aux:
@@ -1746,6 +1775,7 @@ class Sender(SenderBase):
                     receiver_slice_id,
                     True,
                     AgentResult.FAILED,
+                    kv_result_report_token=info.kv_result_report_token,
                 )
             else:
                 with self._sessions_lock:
@@ -2311,6 +2341,7 @@ class KVRecvTask(_LogicalTask):
         # One terminal result per writer rank, keyed by the rank the result frame carries.
         self._writer_reports: dict[int, bool] = {}
         self._receive_bounds: Optional[ReceiveBounds] = None
+        self._kv_result_report_tokens: dict[int, bytes] = {}
 
         self._unique_rid = unique_rid
         self._chunk = chunk
@@ -2768,6 +2799,10 @@ class Receiver(ReceiverBase):
             task._receive_bounds = ReceiveBounds.from_chunk(
                 task._chunk, self._registrar.self_extractor.page_table, writer_spans
             )
+            task._kv_result_report_tokens = {
+                rank: secrets.token_bytes(_KV_RESULT_REPORT_TOKEN_BYTES)
+                for rank in peer_overlap.ranks
+            }
         except Exception:
             if bounced:
                 self._bounce.release_idle_reservation(key)
@@ -2788,7 +2823,11 @@ class Receiver(ReceiverBase):
                         )
                     receiver_req.bounce_dst_base = span[0]
                     receiver_req_bytes = receiver_req.to_bytes()
-                self._request_sender_data(peer_infos.sender_endpoints[rank], receiver_req_bytes)
+                self._request_sender_data(
+                    peer_infos.sender_endpoints[rank],
+                    receiver_req_bytes,
+                    task._kv_result_report_tokens[rank],
+                )
             return
 
         peer_ranks = list(peer_overlap.ranks)
@@ -2813,7 +2852,11 @@ class Receiver(ReceiverBase):
                     task._perf_timer.record_task_start(rank)
                 published_writers.add(rank)
                 try:
-                    self._request_sender_data(peer_infos.sender_endpoints[rank], payload)
+                    self._request_sender_data(
+                        peer_infos.sender_endpoints[rank],
+                        payload,
+                        task._kv_result_report_tokens[rank],
+                    )
                 except Exception:
                     published_writers.discard(rank)
                     raise
@@ -2977,9 +3020,15 @@ class Receiver(ReceiverBase):
                 f"_process_kv_agent_result: unexpected msg_type={message[0]!r}, expected KV_AGENT_RESULT"
             )
             return
-        peer_rank, unique_rid, receiver_slice_id, is_last_slice, status_code, transfer_size = (
-            _KV_RESULT_PREFIX.unpack(message[1])
-        )
+        (
+            peer_rank,
+            unique_rid,
+            receiver_slice_id,
+            is_last_slice,
+            status_code,
+            transfer_size,
+            kv_result_report_token,
+        ) = _KV_RESULT_PREFIX.unpack(message[1])
         from .bounce import decode_result_tail
 
         dst_ptrs, sizes, src_base = decode_result_tail(message)
@@ -2994,6 +3043,7 @@ class Receiver(ReceiverBase):
             receiver_slice_id,
             is_last_slice,
             _AGENT_RESULT_BY_CODE[status_code],
+            kv_result_report_token,
             dst_ptrs=dst_ptrs,
             sizes=sizes,
             src_base=src_base,
@@ -3012,11 +3062,19 @@ class Receiver(ReceiverBase):
             return
         session.process_aux_agent_result(peer_rank, AgentResult(status))
 
-    def _request_sender_data(self, endpoint: str, receiver_info_bytes: bytes):
+    def _request_sender_data(
+        self, endpoint: str, receiver_info_bytes: bytes, kv_result_report_token: bytes
+    ):
         # receiver_info serialized once and reused for every peer rank (block-table msgpack isn't free at fan-out).
         logger.debug("Sending data request to endpoint '%s'", endpoint)
         messenger = self._get_or_connect_dealer(endpoint)
-        messenger.send([MessageType.REQUEST_DATA, receiver_info_bytes])
+        messenger.send(
+            [
+                MessageType.REQUEST_DATA,
+                receiver_info_bytes,
+                _check_kv_result_report_token(kv_result_report_token),
+            ]
+        )
 
     def __del__(self):
         try:
@@ -3280,6 +3338,7 @@ class RxSession(RxSessionBase):
         receiver_slice_id: int,
         is_last_slice: bool,
         status: AgentResult,
+        kv_result_report_token: bytes,
         dst_ptrs=None,
         sizes=None,
         src_base=None,
@@ -3294,6 +3353,13 @@ class RxSession(RxSessionBase):
                     f"address a task this receiver posted."
                 )
             task = self._kv_tasks[receiver_slice_id]
+            expected_report_token = task._kv_result_report_tokens.get(peer_rank)
+            if (
+                expected_report_token is None
+                or not isinstance(kv_result_report_token, bytes)
+                or not secrets.compare_digest(expected_report_token, kv_result_report_token)
+            ):
+                raise ValueError("KV result report token does not match the published writer")
             if status not in (
                 AgentResult.SUCCESS,
                 AgentResult.FAILED,
