@@ -37,7 +37,8 @@ Consumers:
 * :meth:`VocabParallelHead.markov_tokens` -- the DSpark vanilla-Markov greedy
   block chain on shard logits: step ``i`` adds ``markov_w2 @ markov_w1[prev_i]``
   to block position ``i`` and its global argmax becomes ``prev_{i+1}`` and draft
-  token ``i``.
+  token ``i``. :func:`markov_chain_logits` runs the same chain on full-vocab
+  or shard logits and also returns the biased logits.
 
 The pairs travel through one all-reduce (sum) of a zero-padded float32 buffer in
 which each rank writes only its own columns; ``x + 0`` is exact and indices
@@ -54,6 +55,7 @@ import triton
 import triton.language as tl
 
 from tensorrt_llm.logger import logger
+from tensorrt_llm.mapping import Mapping
 
 from ..distributed import AllReduce, AllReduceStrategy, allgather
 from ..modules.embedding import LMHead
@@ -318,16 +320,20 @@ def _markov_add_local_argmax_kernel(
     chunk,
     bias_ptr,
     stride_bias,
+    biased_ptr,
+    stride_biased,
     out_ptr,
     stride_out,
     slot0,
     zero_lo,
     zero_hi,
+    STORE_BIASED: tl.constexpr,
     ZERO_WIDTH: tl.constexpr,
     BLOCK_V: tl.constexpr,
 ):
     # base (logits of block position `step`) + bias, both upcast to float32
-    # like the gathered reference, then the argmax of one split.
+    # like the gathered reference, optionally stored, then the argmax of one
+    # split.
     req = tl.program_id(0)
     split = tl.program_id(1)
     lo = split * chunk
@@ -335,6 +341,7 @@ def _markov_add_local_argmax_kernel(
     offs = tl.arange(0, BLOCK_V)
     base_row = base_ptr + req.to(tl.int64) * stride_base
     bias_row = bias_ptr + req.to(tl.int64) * stride_bias
+    biased_row = biased_ptr + req.to(tl.int64) * stride_biased
     best_val = tl.full([BLOCK_V], float("-inf"), tl.float32)
     best_idx = tl.full([BLOCK_V], _INT32_MAX, tl.int32)
     for start in range(lo, hi, BLOCK_V):
@@ -342,6 +349,8 @@ def _markov_add_local_argmax_kernel(
         mask = cols < hi
         base = tl.load(base_row + cols, mask=mask, other=0.0).to(tl.float32)
         bias = tl.load(bias_row + cols, mask=mask, other=0.0).to(tl.float32)
+        if STORE_BIASED:
+            tl.store(biased_row + cols, base + bias, mask=mask)
         vals = tl.where(mask, base + bias, float("-inf"))
         idx = tl.where(mask, cols, _INT32_MAX)
         best_val, best_idx = argmax_combine(best_val, best_idx, vals, idx)
@@ -458,6 +467,7 @@ def _markov_chain_tokens(
     markov_w2_rows: torch.Tensor,
     col_base: int,
     exchange: _PairExchange,
+    biased_out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Greedy vanilla-Markov block chain over (a shard of) the block logits.
 
@@ -469,6 +479,8 @@ def _markov_chain_tokens(
             of ``block_logits``.
         col_base: global vocab id of column 0.
         exchange: the TP pair exchange.
+        biased_out: optional ``[B, K, n_cols]`` float32 destination of the
+            biased logits (unit vocab stride).
     Returns:
         ``[B, K]`` int32 draft tokens.
     """
@@ -505,6 +517,7 @@ def _markov_chain_tokens(
         # The same F.linear as the reference chain, on this shard's w2 rows.
         bias = F.linear(emb, markov_w2_rows)
         step_logits = block_logits[:, step]
+        step_biased = step_logits if biased_out is None else biased_out[:, step]
         _markov_add_local_argmax_kernel[(num_reqs, layout.splits)](
             step_logits,
             step_logits.stride(0),
@@ -513,17 +526,79 @@ def _markov_chain_tokens(
             layout.chunk,
             bias,
             bias.stride(0),
+            step_biased,
+            step_biased.stride(0),
             layout.buffer,
             layout.buffer.stride(0),
             layout.slot0,
             layout.zero_lo,
             layout.zero_hi,
+            STORE_BIASED=biased_out is not None,
             ZERO_WIDTH=layout.zero_width,
             BLOCK_V=_LOCAL_BLOCK_V,
             num_warps=8,
         )
         pairs, n_slots = exchange.exchange(layout)
     return tokens
+
+
+def tp_pair_exchange(mapping: Mapping, strategy: AllReduceStrategy) -> _PairExchange:
+    """The pair exchange over ``mapping``'s TP group, one float32 all-reduce
+    with ``strategy``."""
+    return _PairExchange(
+        AllReduce(mapping, strategy=strategy, dtype=torch.float32),
+        mapping.tp_size,
+        mapping.tp_rank,
+    )
+
+
+def markov_chain_logits(
+    base_logits: torch.Tensor,
+    first_prev_tokens: torch.Tensor,
+    markov_w1: torch.Tensor,
+    markov_w2: torch.Tensor,
+    tp_exchange: Optional[_PairExchange] = None,
+) -> torch.Tensor:
+    """The DSpark vanilla-Markov greedy block chain, returning the biased logits.
+
+    Each block position takes three launches: resolve the previous token and
+    gather its ``markov_w1`` row, the bias GEMV, add + argmax.
+
+    Args:
+        base_logits: ``[B, K, n]`` float32 block logits, unit vocab stride:
+            the full vocab, or with ``tp_exchange`` this rank's contiguous
+            vocab shard.
+        first_prev_tokens: ``[B]`` anchor token ids.
+        markov_w1, markov_w2: ``[vocab, rank]`` Markov head weights of one
+            dtype, ``markov_w1`` contiguous.
+        tp_exchange: the TP group's pair exchange (:func:`tp_pair_exchange`)
+            when ``base_logits`` is a vocab shard.
+    Returns:
+        ``[B, K, n]`` float32 biased logits: (this rank's shard of) the eager
+        chain (``modeling_speculative.dspark_markov_chain`` over the raw
+        Markov tensors) advanced by a plain argmax of the full vocab. The bias
+        is the same ``F.linear`` GEMV over this shard's ``markov_w2`` rows;
+        the result is bit-identical on the tested shapes, which cuBLAS does
+        not guarantee for every shard width.
+    """
+    assert base_logits.dtype == torch.float32
+    n_cols = base_logits.shape[-1]
+    if tp_exchange is None:
+        col_base, exchange = 0, _PairExchange(None, 1, 0)
+    else:
+        assert n_cols * tp_exchange.tp_size == markov_w2.shape[0]
+        col_base, exchange = tp_exchange.tp_rank * n_cols, tp_exchange
+    biased = torch.empty_like(base_logits)
+    _markov_chain_tokens(
+        base_logits,
+        first_prev_tokens,
+        markov_w1,
+        markov_w2[col_base : col_base + n_cols],
+        col_base,
+        exchange,
+        biased_out=biased,
+    )
+    return biased
 
 
 class VocabParallelHead:
@@ -632,8 +707,9 @@ class VocabParallelHead:
             markov_w1, markov_w2: ``[vocab, rank]`` Markov head weights,
                 contiguous and of one dtype.
         Returns:
-            ``[B, K]`` int32 draft tokens, bit-identical to the per-position
-            argmax of ``dspark_markov_chain_logits`` on the gathered logits.
+            ``[B, K]`` int32 draft tokens: the per-position argmax of the
+            eager chain on the gathered logits (bit-identical as described in
+            :func:`markov_chain_logits`).
         """
         w2_rows = markov_w2[self.col_base : self.col_base + self.shard_width]
         return _markov_chain_tokens(

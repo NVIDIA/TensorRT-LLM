@@ -17,19 +17,21 @@
 The multi-rank exchange is covered by
 ``tests/unittest/_torch/multi_gpu/test_vocab_parallel_selection.py``; here one
 shard holds the whole vocab, which isolates the kernels: argmax order, the
-Gumbel-max sampler's distribution and the Markov chain.
+Gumbel-max sampler's distribution and the Markov chain, including the
+full-vocab chain that also returns the biased logits.
 """
 
 import pytest
 import torch
+from _torch.helpers import dspark_markov_chain_logits_reference
 
-from tensorrt_llm._torch.models.modeling_speculative import dspark_markov_chain_logits
 from tensorrt_llm._torch.speculative.vocab_parallel import (
     _local_argmax_kernel,
     _local_sample_kernel,
     _markov_chain_tokens,
     _PairExchange,
     _select_tokens,
+    markov_chain_logits,
 )
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
@@ -310,6 +312,42 @@ def test_loader_post_load_walk_binds_the_draft_side(monkeypatch, walk):
     assert worker._vocab_parallel.draft_tokens == worker._argmax_block_tokens
 
 
+def test_markov_tp_exchange_only_for_a_drafter_with_shard_logits(monkeypatch):
+    """The DSpark Markov chain's TP exchange is built only for a Markov drafter
+    whose own column-parallel head does not gather its output."""
+    from types import SimpleNamespace
+
+    from torch import nn
+
+    from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
+    from tensorrt_llm._torch.speculative import dspark
+    from tensorrt_llm._torch.speculative.dspark import DSparkWorker
+
+    monkeypatch.setattr(dspark, "tp_pair_exchange", lambda mapping, strategy: "exchange")
+
+    def head(gather_output):
+        linear = Linear.__new__(Linear)
+        nn.Module.__init__(linear)
+        linear.tp_mode = TensorParallelMode.COLUMN
+        linear.gather_output = gather_output
+        return linear
+
+    def exchange_for(lm_head, has_markov_head=True, tp_size=2, attention_dp=False):
+        worker = _bare_worker(DSparkWorker, monkeypatch)
+        worker.mapping = SimpleNamespace(tp_size=tp_size, enable_attention_dp=attention_dp)
+        worker._markov_tp_exchange = None
+        worker.bind_draft_lm_head(SimpleNamespace(lm_head=lm_head, has_markov_head=has_markov_head))
+        return worker._markov_tp_exchange
+
+    assert exchange_for(head(gather_output=False)) == "exchange"
+    # The usual drafter shares the target's gathered head: full-vocab logits.
+    assert exchange_for(head(gather_output=True)) is None
+    assert exchange_for(head(gather_output=False), has_markov_head=False) is None
+    assert exchange_for(head(gather_output=False), tp_size=1) is None
+    assert exchange_for(head(gather_output=False), attention_dp=True) is None
+    assert exchange_for(nn.Linear(4, 4)) is None
+
+
 def test_target_logits_are_the_shard_once_the_head_is_bound(monkeypatch):
     """The worker's target-logits hook hands its forward this rank's vocab
     shard once the target head is bound, and the gathered logits before."""
@@ -355,7 +393,9 @@ def test_markov_chain_matches_the_reference_chain(w_dtype):
     w2 = (torch.randn(vocab, rank, device="cuda", generator=gen) * 0.5).to(w_dtype)
     # Out-of-vocab anchors contribute no bias.
     anchors = torch.tensor([0, 17, vocab - 1, -1, vocab, 4096], device="cuda")
-    expected = dspark_markov_chain_logits(base, anchors, w1, w2).argmax(-1).to(torch.int32)
+    expected = (
+        dspark_markov_chain_logits_reference(base, anchors, w1, w2).argmax(-1).to(torch.int32)
+    )
     tokens = _markov_chain_tokens(base, anchors, w1, w2, 0, _SINGLE)
     assert torch.equal(tokens, expected)
     # The bias must actually steer the chain for the check to mean something.
@@ -375,5 +415,38 @@ def test_markov_chain_cuda_graph_replay():
     base.copy_(torch.randn_like(base))
     anchors.copy_(torch.tensor([7, 8, 9], device="cuda"))
     graph.replay()
-    expected = dspark_markov_chain_logits(base, anchors, w1, w2).argmax(-1).to(torch.int32)
+    expected = (
+        dspark_markov_chain_logits_reference(base, anchors, w1, w2).argmax(-1).to(torch.int32)
+    )
     assert torch.equal(tokens, expected)
+
+
+@pytest.mark.parametrize("num_reqs,block", [(1, 1), (4, 7), (128, 6)])
+@pytest.mark.parametrize("w_dtype", [torch.bfloat16, torch.float32])
+def test_markov_chain_logits_bit_identical(num_reqs, block, w_dtype):
+    vocab, rank = 6001, 64
+    gen = torch.Generator(device="cuda").manual_seed(num_reqs)
+    base = torch.randn(num_reqs, block, vocab, device="cuda", generator=gen) * 3
+    w1 = torch.randn(vocab, rank, device="cuda", generator=gen).to(w_dtype)
+    w2 = (torch.randn(vocab, rank, device="cuda", generator=gen) * 0.2).to(w_dtype)
+    anchors = torch.randint(0, vocab, (num_reqs,), device="cuda", generator=gen)
+    if num_reqs > 1:
+        anchors[0] = -1
+    expected = dspark_markov_chain_logits_reference(base, anchors, w1, w2)
+    biased = markov_chain_logits(base, anchors, w1, w2)
+    assert torch.equal(biased.view(torch.int32), expected.view(torch.int32))
+
+
+def test_markov_chain_logits_ties_and_nan():
+    """The chain follows torch.argmax order through ties and NaN."""
+    num_reqs, block, vocab, rank = 3, 4, 4100, 8
+    base = torch.zeros(num_reqs, block, vocab, device="cuda")
+    base[1, 0, 3000] = float("nan")
+    base[2, :, 2049] = 5.0
+    base[2, :, 4099] = 5.0
+    w1 = torch.randn(vocab, rank, device="cuda").to(torch.bfloat16)
+    w2 = torch.zeros(vocab, rank, device="cuda").to(torch.bfloat16)
+    anchors = torch.tensor([5, 6, 7], device="cuda")
+    expected = dspark_markov_chain_logits_reference(base, anchors, w1, w2)
+    biased = markov_chain_logits(base, anchors, w1, w2)
+    assert torch.equal(biased.view(torch.int32), expected.view(torch.int32))
