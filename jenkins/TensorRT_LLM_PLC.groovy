@@ -315,6 +315,8 @@ def sonarScan()
                 "triton_kernels/**",
 
                 // Tests and benchmarks
+                ".github/**",
+                "jenkins/**",
                 "tests/**",
                 "cpp/tests/**",
                 "cpp/micro_benchmarks/**",
