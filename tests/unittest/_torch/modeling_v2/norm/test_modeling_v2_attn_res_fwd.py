@@ -12,10 +12,15 @@ split-K cluster kernel for N in {8, 12}; the fixed-N = 12 online variant at (T, 
 persistent online kernel everywhere else.
 """
 
+import zlib
+
 import pytest
 import torch
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.attn_res_fwd import attn_res_fwd
+
+__extra_import_path__ = [".."]
+from _validating import validating
 
 assert torch.cuda.is_available(), "attn_res_fwd requires a CUDA device"
 # The receipts are sm_100 ones; CI's other architectures skip this file.
@@ -25,10 +30,6 @@ pytestmark = pytest.mark.skipif(
 
 HIDDEN_SIZE = 7168
 RMS_EPS = 1e-6
-# Kimi K3's 93 layers append a snapshot every 12 layers: at most 8 snapshots, so N runs 2 ... 9.
-K3_NUM_CANDIDATES = tuple(range(2, 10))
-DECODE_NUM_TOKENS = tuple(range(1, 9))
-PREFILL_NUM_TOKENS = (300, 2048)
 # The thresholds of main's op test.
 MIN_COSINE = 0.999
 MAX_RELATIVE_L2 = 3e-2
@@ -36,9 +37,9 @@ INPUT_NAMES = ("layer_residual", "block_residual", "res_weight", "rms_weight")
 OUTPUT_NAMES = ("output", "rsigma", "probs", "logits")
 
 
-def _make_inputs(num_tokens: int, num_candidates: int) -> tuple[torch.Tensor, ...]:
+def _make_inputs(num_tokens: int, num_candidates: int, seed: int = 0) -> tuple[torch.Tensor, ...]:
     """Inputs at the scales of main's op tests, seeded by the cell."""
-    torch.manual_seed(97 * num_tokens + num_candidates)
+    torch.manual_seed(seed)
     layer_residual = (
         torch.randn(num_tokens, 1, HIDDEN_SIZE, dtype=torch.bfloat16, device="cuda") * 0.05
     )
@@ -51,23 +52,6 @@ def _make_inputs(num_tokens: int, num_candidates: int) -> tuple[torch.Tensor, ..
     res_weight = torch.randn(HIDDEN_SIZE, dtype=torch.bfloat16, device="cuda") * 0.02
     rms_weight = 1 + torch.randn(HIDDEN_SIZE, dtype=torch.bfloat16, device="cuda") * 0.02
     return layer_residual, block_residual, res_weight, rms_weight
-
-
-def _reference(
-    layer_residual: torch.Tensor,
-    block_residual: torch.Tensor,
-    res_weight: torch.Tensor,
-    rms_weight: torch.Tensor,
-    rms_eps: float,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """fp32 evaluation of the contract's Semantics; snapshots first, the layer residual last."""
-    values = torch.cat((block_residual, layer_residual.unsqueeze(0)), dim=0).float()
-    rsigma = torch.rsqrt(values.square().mean(dim=-1) + rms_eps)
-    score_weight = rms_weight.float() * res_weight.float()
-    logits = (values * rsigma.unsqueeze(-1) * score_weight).sum(dim=-1)
-    probs = torch.softmax(logits, dim=0)
-    output = (probs.unsqueeze(-1) * values).sum(dim=0).to(torch.bfloat16)
-    return output, rsigma, probs, logits
 
 
 def _bits(tensor: torch.Tensor) -> torch.Tensor:
@@ -84,12 +68,16 @@ def _similarity(actual: torch.Tensor, expected: torch.Tensor) -> tuple[float, fl
     return cosine, relative_l2
 
 
-def _check(num_tokens: int, num_candidates: int, rms_eps: float = RMS_EPS) -> None:
-    inputs = _make_inputs(num_tokens, num_candidates)
+def _check(cell) -> None:
+    spec = cell.spec
+    num_tokens, num_candidates, rms_eps = spec["tokens"], spec["candidates"], spec["eps"]
+    assert spec["hidden"] == HIDDEN_SIZE
+    inputs = _make_inputs(num_tokens, num_candidates, zlib.crc32(cell.why.encode()) % 2**31)
     before = [tensor.clone() for tensor in inputs]
-    outputs = attn_res_fwd(*inputs, rms_eps)
-    repeat = attn_res_fwd(*inputs, rms_eps)
-    expected = _reference(*inputs, rms_eps)
+    with validating(attn_res_fwd):
+        outputs = attn_res_fwd(*inputs, rms_eps)
+        repeat = attn_res_fwd(*inputs, rms_eps)
+    expected = attn_res_fwd.reference(*inputs, rms_eps)
 
     cell = f"T={num_tokens} N={num_candidates} rms_eps={rms_eps}"
     stats_shape = (num_candidates, num_tokens, 1)
@@ -114,39 +102,20 @@ def _check(num_tokens: int, num_candidates: int, rms_eps: float = RMS_EPS) -> No
         assert torch.equal(_bits(old), _bits(new)), f"{cell}: {name} was mutated"
 
 
-def test_k3_decode_cells() -> None:
-    """Kimi K3's N = 2 ... 9 at T = 1 ... 8: every T == 1 kernel, then the online kernel."""
-    for num_tokens in DECODE_NUM_TOKENS:
-        for num_candidates in K3_NUM_CANDIDATES:
-            _check(num_tokens, num_candidates)
+@pytest.mark.parametrize("cell", attn_res_fwd.CELLS, ids=[c.why[:40] for c in attn_res_fwd.CELLS])
+def test_certified_cells(cell) -> None:
+    _check(cell)
 
 
-def test_k3_prefill_cells() -> None:
-    """Kimi K3's N = 2 ... 9 at prefill token counts: the online kernel's CTAs loop over tokens."""
-    for num_tokens in PREFILL_NUM_TOKENS:
-        for num_candidates in K3_NUM_CANDIDATES:
-            _check(num_tokens, num_candidates)
-
-
-def test_other_dispatch_branches() -> None:
-    """The kernels and N extremes outside Kimi K3's range, down to the fixed-N = 12 variant."""
-    for num_tokens, num_candidates in (
-        (1, 1),  # single-CTA kernel, no snapshot
-        (1, 10),  # online kernel at T == 1
-        (1, 11),  # online kernel at T == 1
-        (1, 12),  # split-K kernel
-        (8, 1),  # online kernel, a single candidate
-        (8, 12),  # online kernel, three full chunks of four candidates
-        (1024, 12),  # online kernel, fixed-N = 12 variant
-    ):
-        _check(num_tokens, num_candidates)
-
-
-def test_rms_eps_enters_under_the_root() -> None:
-    """rms_eps is added to the mean square inside the rsqrt; 1e-2 dominates the inputs' 2.5e-3."""
-    for num_tokens, num_candidates in ((1, 2), (1, 8), (1, 9), (300, 9)):
-        for rms_eps in (1e-5, 1e-2):
-            _check(num_tokens, num_candidates, rms_eps)
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires two CUDA devices")
+@pytest.mark.parametrize("index", (1, 2, 3))
+def test_guard_refuses_mixed_devices(index) -> None:
+    inputs = list(_make_inputs(1, 2))
+    other_device = (inputs[0].device.index + 1) % torch.cuda.device_count()
+    inputs[index] = inputs[index].to(f"cuda:{other_device}")
+    with pytest.raises(AssertionError, match="device"):
+        with validating(attn_res_fwd):
+            attn_res_fwd(*inputs, RMS_EPS)
 
 
 def test_cuda_graph_replay_matches_eager() -> None:

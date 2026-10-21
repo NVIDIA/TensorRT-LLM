@@ -20,6 +20,8 @@ kernels: the head CTAs read the slot's pools before their grid-dependency wait, 
 another launch on the same pools.
 """
 
+import zlib
+
 import _kda_cells as kc
 import pytest
 import torch
@@ -34,10 +36,12 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.ssm.k3_kda_buffers im
 )
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.ssm.k3_kda_verify import k3_kda_verify
 
+__extra_import_path__ = [".."]
+from _validating import validating
+
 pytestmark = pytest.mark.skipif(not kc.sm100(), reason="needs SM100 (tcgen05, TMA, clusters)")
 
 LAYERS = 2
-SLOT_ROUNDS = 9  # pending 0, then the schedule's 1, 6, 3, 0, 5, 2, 7, 4
 POOL_NAMES = ("cs_q", "cs_k", "cs_v", "ssm", "state_tok")
 
 
@@ -101,45 +105,75 @@ def _accept(pools_list, slot: int, accepted: int) -> None:
         pools["pending"][slot] = accepted
 
 
-def test_attn_on_manager_pools(mgr, slots) -> None:
-    """Two requests, one after the other, each on its slot for SLOT_ROUNDS rounds of every layer (pending through
+@pytest.mark.parametrize("cell", k3_kda_attn.CELLS, ids=[c.why[:40] for c in k3_kda_attn.CELLS])
+def test_attn_on_manager_pools(mgr, slots, cell) -> None:
+    """Two requests, one after the other, each on its slot for nine rounds of every layer (pending through
     0..7), all launches on one set: outputs and pools bit for bit the unfused path's on a copy; the other slots
     untouched; layer 0's outputs also within fp32 tolerance of float64 over the committed history."""
+    seed = zlib.crc32(cell.why.encode()) % 2**31
+    requests, rounds = cell.spec["requests"], cell.spec["rounds"]
     pools = _layers(mgr)
-    with torch.inference_mode():
+    with torch.inference_mode(), validating(k3_kda_attn):
         for layer, p in enumerate(pools):
-            kc.fill_pools(p, 1000 + layer)
+            kc.fill_pools(p, seed + layer)
         copies = [kc.clone_pools(p) for p in pools]
+        reference_pools = [kc.clone_pools(p) for p in pools]
         # The record is one tensor for every layer in the manager; keep the copies' one shared too.
-        for c in copies[1:]:
-            c["pending"] = copies[0]["pending"]
-        wts = [kc.make_weights(500 + layer) for layer in range(LAYERS)]
+        for group in (copies, reference_pools):
+            for c in group[1:]:
+                c["pending"] = group[0]["pending"]
+        wts = [kc.make_weights(seed + 100 + layer) for layer in range(LAYERS)]
         bufs = K3KdaBuffers.create("cuda")
         ref = _Unfused()
-        gen = torch.Generator(device="cuda").manual_seed(50)
-        for req in range(2):
+        gen = torch.Generator(device="cuda").manual_seed(seed)
+        for req in range(requests):
             s = int(slots[req])
             slot = slots[req : req + 1]
             f64 = kc.F64Verify(wts[0], pools[0], slot, kc.NUM_SPEC)
-            for rnd in range(SLOT_ROUNDS):
+            for rnd in range(rounds):
                 for layer, (p, c) in enumerate(zip(pools, copies)):
                     before = kc.snapshot(p)
                     x = _x(gen)
                     got = _fused(wts[layer], p, x, slot, bufs)
                     want = ref(wts[layer], c, x, slot)
+                    rp, wt = reference_pools[layer], wts[layer]
+                    out_reference = k3_kda_attn.reference(
+                        x,
+                        wt["w"],
+                        wt["w_fb"],
+                        wt["w_q"],
+                        wt["w_k"],
+                        wt["w_v"],
+                        wt["a_log"],
+                        wt["dt_bias"],
+                        wt["onorm_w"],
+                        rp["cs_q"],
+                        rp["cs_k"],
+                        rp["cs_v"],
+                        rp["ssm"],
+                        rp["state_tok"],
+                        slot,
+                        rp["pending"],
+                        bufs,
+                        kc.NUM_SPEC,
+                        kc.LOWER_BOUND,
+                        kc.SCALE,
+                        kc.EPS,
+                    )
                     if layer == 0:
                         out_f64 = f64(ref.last_rows)
                     torch.cuda.synchronize()
                     assert torch.equal(got, want), (req, rnd, layer)
+                    assert kc.rel(got, out_reference) <= kc.TOL_OUT, (req, rnd, layer)
                     assert kc.same_rows(p, c, [s], POOL_NAMES), (req, rnd, layer)
                     others = kc.other_slots(p["ssm"].shape[0], [s])
                     assert kc.same_rows(p, before, others, POOL_NAMES), (req, rnd, layer)
                     if layer == 0:
                         assert kc.rel(got, out_f64) <= kc.TOL_OUT, (req, rnd, kc.rel(got, out_f64))
                 accepted = kc.pending_schedule(1, kc.NUM_SPEC, rnd)[0]
-                _accept([pools[0], copies[0]], s, accepted)
+                _accept([pools[0], copies[0], reference_pools[0]], s, accepted)
                 f64.commit([accepted])
-        assert bool((bufs.epoch == (2 * SLOT_ROUNDS * LAYERS) % 3).all()), (
+        assert bool((bufs.epoch == (requests * rounds * LAYERS) % 3).all()), (
             bufs.epoch.unique().tolist()
         )
 
@@ -290,3 +324,24 @@ def test_qkvg_set_is_refused(mgr, slots) -> None:
             _fused(wt, p, x, slot, K3KdaBuffers.create("cuda", ctas=CTAS))
         torch.cuda.synchronize()
     assert all(torch.equal(p[n], before[n]) for n in POOL_NAMES)
+
+
+@pytest.mark.parametrize("misuse", ("pending", "conv_layout"))
+def test_guard_rejects_silent_misuse(mgr, slots, misuse) -> None:
+    p = kc.layer_pools(mgr, 0)
+    slot = slots[:1]
+    with torch.inference_mode():
+        kc.fill_pools(p, 1500)
+        before = kc.snapshot(p)
+        wt = kc.make_weights(560)
+        x = _x(torch.Generator(device="cuda").manual_seed(56))
+        if misuse == "pending":
+            bad = dict(p, pending=p["pending"].clone())
+            bad["pending"][slot.long()] = kc.NUM_SPEC + 1
+            match = "pending must be in"
+        else:
+            bad = dict(p, cs_k=p["cs_k"].contiguous())
+            match = "channel-contiguous"
+        with pytest.raises(AssertionError, match=match), validating(k3_kda_attn):
+            _fused(wt, bad, x, slot, K3KdaBuffers.create("cuda"))
+        assert all(torch.equal(p[n], before[n]) for n in POOL_NAMES)

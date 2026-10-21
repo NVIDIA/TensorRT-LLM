@@ -17,6 +17,8 @@ kernels: the head CTAs read the slots' pools before their grid-dependency wait, 
 another launch on the same pools.
 """
 
+import zlib
+
 import _kda_cells as kc
 import pytest
 import torch
@@ -35,6 +37,9 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.ssm.k3_kda_decode_att
     k3_kda_decode_attn,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.ssm.kda_decode import kda_decode
+
+__extra_import_path__ = [".."]
+from _validating import validating
 
 pytestmark = pytest.mark.skipif(not kc.sm100(), reason="needs SM100 (tcgen05, TMA, clusters)")
 
@@ -107,23 +112,28 @@ def _x(num: int, gen: torch.Generator) -> torch.Tensor:
     return torch.randn(num, kc.K_IN, generator=gen, device="cuda").bfloat16()
 
 
-@pytest.mark.parametrize("num", range(1, 9))
-def test_decode_attn_on_manager_pools(mgr, slots, num) -> None:
+@pytest.mark.parametrize(
+    "cell", k3_kda_decode_attn.CELLS, ids=[c.why[:40] for c in k3_kda_decode_attn.CELLS]
+)
+def test_decode_attn_on_manager_pools(mgr, slots, cell) -> None:
     """Every layer's step, all layers on one buffer set: outputs against the native path and float64, the state rows
     against both (fp32 tolerance), the conv windows against the native path bit for bit; the other slots of the
     layer and every slot of the other layers untouched."""
+    seed = zlib.crc32(cell.why.encode()) % 2**31
+    num = cell.spec["requests"]
     used = slots[:num]
     rows_idx = used.long()
     pools = _layers(mgr)
-    with torch.inference_mode():
+    with torch.inference_mode(), validating(k3_kda_decode_attn):
         for layer, p in enumerate(pools):
-            kc.fill_pools(p, 30 * num + layer)
+            kc.fill_pools(p, seed + layer)
         bufs = K3KdaBuffers.create("cuda")
         rows_of = _Rows()
-        gen = torch.Generator(device="cuda").manual_seed(40 + num)
+        gen = torch.Generator(device="cuda").manual_seed(seed)
         for layer, p in enumerate(pools):
-            wt = kc.make_weights(100 + layer)
+            wt = kc.make_weights(seed + 100 + layer)
             native = kc.clone_pools(p)
+            reference_pools = kc.clone_pools(p)
             ref = kc.F64Decode(wt, p)
             before = [kc.snapshot(q) for q in pools]
             x = _x(num, gen)
@@ -131,9 +141,29 @@ def test_decode_attn_on_manager_pools(mgr, slots, num) -> None:
             rows = rows_of(wt["w"], x)
             out_n = _native(wt, native, rows, used)
             out_r = ref.step_rows(rows, used)
+            rp = reference_pools
+            out_reference = k3_kda_decode_attn.reference(
+                x,
+                wt["w"],
+                wt["w_fb"],
+                wt["w_q"],
+                wt["w_k"],
+                wt["w_v"],
+                wt["a_log"],
+                wt["dt_bias"],
+                wt["onorm_w"],
+                rp["conv"],
+                rp["ssm"],
+                used,
+                bufs,
+                kc.LOWER_BOUND,
+                kc.SCALE,
+                kc.EPS,
+            )
             torch.cuda.synchronize()
             assert kc.rel(out, out_n) <= kc.TOL_OUT, (layer, kc.rel(out, out_n))
             assert kc.rel(out, out_r) <= kc.TOL_OUT, (layer, kc.rel(out, out_r))
+            assert kc.rel(out, out_reference) <= kc.TOL_OUT, (layer, kc.rel(out, out_reference))
             assert kc.rel(p["ssm"][rows_idx], ref.state[rows_idx]) <= kc.TOL_STATE, layer
             assert kc.rel(p["ssm"][rows_idx], native["ssm"][rows_idx]) <= kc.TOL_STATE, layer
             assert torch.equal(p["conv"][rows_idx], native["conv"][rows_idx]), layer
@@ -356,3 +386,23 @@ def test_buffer_set_misuse_raises(mgr, slots) -> None:
             with torch.cuda.stream(stream), torch.cuda.graph(graph, stream=stream):
                 K3KdaBuffers.create("cuda")
         torch.cuda.current_stream().wait_stream(stream)
+
+
+@pytest.mark.parametrize("misuse", ("duplicate_slot", "conv_taps"))
+def test_guard_rejects_silent_misuse(mgr, slots, misuse) -> None:
+    used = slots[:2]
+    p = kc.layer_pools(mgr, 0)
+    with torch.inference_mode():
+        kc.fill_pools(p, 980)
+        before = kc.snapshot(p)
+        wt = kc.make_weights(170)
+        x = _x(2, torch.Generator(device="cuda").manual_seed(47))
+        if misuse == "duplicate_slot":
+            used = used[:1].repeat(2)
+            match = "each slot once"
+        else:
+            wt["w_q"] = wt["w_q"].t().contiguous().t()
+            match = "conv taps"
+        with pytest.raises(AssertionError, match=match), validating(k3_kda_decode_attn):
+            _launch(wt, p, x, used, K3KdaBuffers.create("cuda"))
+        assert all(torch.equal(p[n], before[n]) for n in ("conv", "ssm"))

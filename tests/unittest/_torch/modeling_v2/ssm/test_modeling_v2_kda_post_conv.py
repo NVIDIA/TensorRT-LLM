@@ -2,10 +2,15 @@
 # SPDX-License-Identifier: Apache-2.0
 """GPU test for the kda_post_conv catalog entry."""
 
+import zlib
+
 import pytest
 import torch
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.ssm.kda_post_conv import kda_post_conv
+
+__extra_import_path__ = [".."]
+from _validating import validating
 
 assert torch.cuda.is_available(), "kda_post_conv requires a CUDA device"
 pytestmark = pytest.mark.skipif(
@@ -13,27 +18,12 @@ pytestmark = pytest.mark.skipif(
 )
 
 HEAD_DIM = 128  # Kimi K3's KDA head_dim
-EPS = 1e-6
-
-
-def _ref(packed: torch.Tensor, heads: int, eps: float = EPS):
-    """fp32 reference: q / sqrt(sum(q^2) + eps) per head (k alike), v as is; token-major [1, T, H, D]."""
-    tokens = packed.shape[1]
-    q, k, v = packed.float().view(3, heads, HEAD_DIM, tokens).permute(0, 3, 1, 2)
-
-    def norm(t):
-        return t / torch.sqrt(t.pow(2).sum(-1, keepdim=True) + eps)
-
-    return (
-        norm(q).to(packed.dtype).unsqueeze(0),
-        norm(k).to(packed.dtype).unsqueeze(0),
-        v.to(packed.dtype).unsqueeze(0),
-    )
 
 
 def _check(packed: torch.Tensor, heads: int) -> None:
-    q, k, v = kda_post_conv(packed, heads, HEAD_DIM)
-    rq, rk, rv = _ref(packed, heads)
+    with validating(kda_post_conv):
+        q, k, v = kda_post_conv(packed, heads, HEAD_DIM)
+    rq, rk, rv = kda_post_conv.reference(packed, heads, HEAD_DIM)
     shape = (1, packed.shape[1], heads, HEAD_DIM)
     for t in (q, k, v):
         assert t.shape == shape and t.dtype == packed.dtype and t.is_contiguous()
@@ -45,22 +35,26 @@ def _check(packed: torch.Tensor, heads: int) -> None:
     assert torch.equal(v, rv), "v must be copied, not computed"
 
 
-def test_kimi_k3_prefill_shapes() -> None:
+@pytest.mark.parametrize("cell", kda_post_conv.CELLS, ids=[c.why[:40] for c in kda_post_conv.CELLS])
+def test_kimi_k3_prefill_shapes(cell) -> None:
     # Kimi K3's KDA prefill: 6 heads (TP16) and 24 (TP4), head_dim 128, bf16, decode- through
     # prefill-sized token counts (16-token blocks and a ragged tail).
-    torch.manual_seed(0)
-    for heads in (6, 24):
-        rows = 3 * heads * HEAD_DIM
-        for tokens in (1, 15, 16, 300, 4096):
-            packed = torch.randn(rows, tokens, dtype=torch.bfloat16, device="cuda") * 3
-            _check(packed, heads)
-
-
-def test_other_dtypes_and_heads() -> None:
-    torch.manual_seed(1)
-    for dtype in (torch.float16, torch.float32):
-        packed = torch.randn(3 * 4 * HEAD_DIM, 77, dtype=dtype, device="cuda")
-        _check(packed, 4)
+    spec = cell.spec
+    gen = torch.Generator(device="cuda").manual_seed(zlib.crc32(cell.why.encode()) % 2**31)
+    packed = (
+        torch.randn(
+            3 * spec["heads"] * HEAD_DIM,
+            spec["tokens"],
+            dtype=spec["dtype"],
+            generator=gen,
+            device="cuda",
+        )
+        * 3
+    )
+    if spec["kind"] == "tiny":
+        packed.zero_()
+        packed[:, 1] = 1e-4
+    _check(packed, spec["heads"])
 
 
 def test_zero_and_tiny_rows() -> None:

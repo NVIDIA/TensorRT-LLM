@@ -1,13 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test for the k3_ctm_gemv_wide catalog entry.
+"""GPU test for the k3_ctm_gemv_wide catalog entry."""
 
-The Kimi K3 TP16 per-rank shapes of the projections of a wide decode step, at every M in 1..64: error of the plain
-(sig_col0=-1) output against an fp64 product of the same bf16 inputs, the sigmoid columns torch.sigmoid of that
-output bit for bit, identical bits on a repeated call, and each M's rows bit-identical to the same rows of the
-64-row call. Where the device's split equals a k3_ctm_gemv_long call site's, every token's row carries that op's
-bits; a CUDA-graph replay returns the eager bits; calls outside the op's preconditions raise ValueError.
-"""
+import zlib
 
 import pytest
 import torch
@@ -19,14 +14,16 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.k3_ctm_gemv_wide
     k3_ctm_gemv_wide,
 )
 
+__extra_import_path__ = [".."]
+from _validating import validating
+
 assert torch.cuda.is_available(), "k3_ctm_gemv_wide requires a CUDA device"
 # The receipts are sm_100 ones; CI's other architectures skip this file.
 pytestmark = pytest.mark.skipif(
     torch.cuda.get_device_capability() != (10, 0), reason="certified on sm_100 only"
 )
 
-M_ALL = range(1, 65)
-TOL = 8e-3  # bf16 output: max |y - ref| / max |ref| against an fp64 product of the same bf16 inputs
+TOL = 8e-3
 TOL_FP32 = 1e-4  # fp32 output
 
 # (N, K, sig_col0, out_fp32): the per-rank TP16 shapes of the projections of a wide decode step. kda_qkvg is 25
@@ -34,17 +31,8 @@ TOL_FP32 = 1e-4  # fp32 output
 # moe_head is [latent down slice; router rows] in fp32 (router logits); moe_tail is 5 k-tiles; dense_down's K 2112
 # ends in a half k-tile.
 CELLS = {
-    "kda_qkvg": (3208, 7168, -1, False),
-    "mla_qkv_a_gate": (2880, 7168, 2112, False),
-    "o_proj": (7168, 768, -1, False),
-    "moe_head": (280, 7168, -1, True),
-    "moe_tail": (7168, 640, -1, False),
-    "shared_gate_up": (768, 7168, -1, False),
-    "dense_gate_up": (4224, 7168, -1, False),
-    "dense_down": (7168, 2112, -1, False),
-    "drafter_qkv": (512, 7168, -1, False),
-    "drafter_gate_up": (1792, 7168, -1, False),
-    "drafter_o_proj": (7168, 384, -1, False),
+    cell.spec["name"]: tuple(cell.spec[key] for key in ("n", "k", "sig_col0", "out_fp32"))
+    for cell in k3_ctm_gemv_wide.CELLS
 }
 # The k3_ctm_gemv_long call (split, ring, push) of the shapes that run it at up to 8 tokens.
 LONG_SITES = {
@@ -79,33 +67,41 @@ def _rel(y: torch.Tensor, ref: torch.Tensor) -> float:
     return (y.double() - ref).abs().max().item() / ref.abs().max().item()
 
 
-def test_projection_cells() -> None:
-    for name, (n, k, sig, fp32) in CELLS.items():
-        w = _weight(n, k)
-        x64 = _rows(k)
-        ref64 = x64.double() @ w.double().t()
+@pytest.mark.parametrize(
+    "cell", k3_ctm_gemv_wide.CELLS, ids=[c.why[:40] for c in k3_ctm_gemv_wide.CELLS]
+)
+def test_projection_cells(cell) -> None:
+    spec = cell.spec
+    n, k, sig, fp32 = (spec[key] for key in ("n", "k", "sig_col0", "out_fp32"))
+    seed = zlib.crc32(cell.why.encode()) % 2**31
+    w = _randn(n, k, seed, 0.02)
+    x64 = _randn(64, k, seed + 1, 1.0)
+    ref64 = k3_ctm_gemv_wide.reference(x64, w, sig, fp32)
+    plain_ref64 = k3_ctm_gemv_wide.reference(x64, w, -1, fp32) if sig >= 0 else ref64
+    dtype = torch.float32 if fp32 else torch.bfloat16
+    tol = TOL_FP32 if fp32 else TOL
+    with validating(k3_ctm_gemv_wide):
         y64 = k3_ctm_gemv_wide(x64, w, sig, fp32)
-        dtype = torch.float32 if fp32 else torch.bfloat16
-        tol = TOL_FP32 if fp32 else TOL
-        for m in M_ALL:
-            cell = f"{name} M={m}"
+        for m in spec["ms"]:
+            label = f"{cell.why} M={m}"
             x = x64[:m].contiguous()
             y = k3_ctm_gemv_wide(x, w, sig, fp32)
-            assert y.shape == (m, n) and y.dtype == dtype, cell
+            assert y.shape == (m, n) and y.dtype == dtype, label
+            assert _rel(y, ref64[:m]) <= tol, label
             again = k3_ctm_gemv_wide(x, w, sig, fp32)
-            assert torch.equal(_bits(y), _bits(again)), f"{cell}: a repeated call changed bits"
+            assert torch.equal(_bits(y), _bits(again)), f"{label}: a repeated call changed bits"
             assert torch.equal(_bits(y), _bits(y64[:m])), (
-                f"{cell}: rows differ from the 64-row call"
+                f"{label}: rows differ from the 64-row call"
             )
             plain = k3_ctm_gemv_wide(x, w, -1, fp32) if sig >= 0 else y
-            rel = _rel(plain, ref64[:m])
-            assert rel <= tol, f"{cell}: max |y - ref| / max |ref| = {rel:.2e} > {tol}"
+            rel = _rel(plain, plain_ref64[:m])
+            assert rel <= tol, f"{label}: max |y - ref| / max |ref| = {rel:.2e} > {tol}"
             if sig >= 0:
                 assert torch.equal(_bits(y[:, :sig]), _bits(plain[:, :sig])), (
-                    f"{cell}: columns before sig_col0 differ from the sig_col0=-1 call"
+                    f"{label}: columns before sig_col0 differ from the sig_col0=-1 call"
                 )
                 assert torch.equal(_bits(y[:, sig:]), _bits(plain[:, sig:].sigmoid())), (
-                    f"{cell}: columns from sig_col0 on are not torch.sigmoid of the sig_col0=-1 call"
+                    f"{label}: columns from sig_col0 on are not torch.sigmoid of the sig_col0=-1 call"
                 )
 
 
@@ -182,3 +178,11 @@ def test_unsupported_calls_raise_value_error() -> None:
         except ValueError:
             continue
         raise AssertionError(f"{name}: expected ValueError, the op accepted the call")
+
+
+def test_guard_refuses_weight_on_another_device() -> None:
+    x = _rows(7168)[:1]
+    weight = torch.empty(128, 7168, dtype=torch.bfloat16)
+    with pytest.raises(AssertionError, match="weight must be on"):
+        with validating(k3_ctm_gemv_wide):
+            k3_ctm_gemv_wide(x, weight)

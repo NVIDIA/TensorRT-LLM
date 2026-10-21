@@ -1,20 +1,18 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test for the k3_ctm_gemv_swiglu catalog entry.
+"""GPU test for the k3_ctm_gemv_swiglu catalog entry."""
 
-The Kimi K3 TP16 per-rank drafter down projection with its call site's split and push, at every M in 1..8: error
-against an fp64 product of torch's bf16 silu_and_mul activation, identical bits on a repeated call, and each M's rows
-bit-identical to the same rows of the 8-row call. The schedule-only flags (push, trigger_early) move no bits, a
-CUDA-graph replay returns the eager bits, and calls outside the op's preconditions raise ValueError.
-"""
+import zlib
 
 import pytest
 import torch
-import torch.nn.functional as F
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.k3_ctm_gemv_swiglu import (
     k3_ctm_gemv_swiglu,
 )
+
+__extra_import_path__ = [".."]
+from _validating import validating
 
 assert torch.cuda.is_available(), "k3_ctm_gemv_swiglu requires a CUDA device"
 # The receipts are sm_100 ones; CI's other architectures skip this file.
@@ -23,12 +21,12 @@ pytestmark = pytest.mark.skipif(
 )
 
 M_ALL = range(1, 9)
-TOL = 8e-3  # max |y - ref| / max |ref| against an fp64 product of the bf16 activation
+TOL = 8e-3
 
 # (N, K, split, push): the drafter down projection (tuned and synthetic drafter); K 896 is 7 k-tiles.
 CELLS = {
-    "drafter_down": (7168, 896, 2, True),
-    "drafter_down_synthetic": (7168, 768, 2, True),
+    cell.spec["name"]: tuple(cell.spec[key] for key in ("n", "k", "split", "push"))
+    for cell in k3_ctm_gemv_swiglu.CELLS
 }
 
 
@@ -45,12 +43,6 @@ def _gate_up(k: int) -> torch.Tensor:
     return _randn(8, 2 * k, 8, 2.0)
 
 
-def _silu_and_mul(gu: torch.Tensor) -> torch.Tensor:
-    """silu_and_mul's fp32 arithmetic and one bf16 rounding (gate columns first)."""
-    k = gu.shape[1] // 2
-    return (F.silu(gu[:, :k].float()) * gu[:, k:].float()).bfloat16()
-
-
 def _bits(t: torch.Tensor) -> torch.Tensor:
     return t.contiguous().view(torch.int16)
 
@@ -60,22 +52,28 @@ def _rel(y: torch.Tensor, ref: torch.Tensor) -> float:
     return (y.double() - ref).abs().max().item() / ref.abs().max().item()
 
 
-def test_call_site_cells() -> None:
-    for name, (n, k, split, push) in CELLS.items():
-        w = _weight(n, k)
-        gu8 = _gate_up(k)
-        ref8 = _silu_and_mul(gu8).double() @ w.double().t()
+@pytest.mark.parametrize(
+    "cell", k3_ctm_gemv_swiglu.CELLS, ids=[c.why[:40] for c in k3_ctm_gemv_swiglu.CELLS]
+)
+def test_call_site_cells(cell) -> None:
+    spec = cell.spec
+    n, k, split, push = (spec[key] for key in ("n", "k", "split", "push"))
+    seed = zlib.crc32(cell.why.encode()) % 2**31
+    w = _randn(n, k, seed, 0.02)
+    gu8 = _randn(8, 2 * k, seed + 1, 2.0)
+    ref8 = k3_ctm_gemv_swiglu.reference(gu8, w, True, split, push)
+    with validating(k3_ctm_gemv_swiglu):
         y8 = k3_ctm_gemv_swiglu(gu8, w, True, split, push)
-        for m in M_ALL:
-            cell = f"{name} M={m}"
+        for m in spec["ms"]:
+            label = f"{cell.why} M={m}"
             gu = gu8[:m].contiguous()
             y = k3_ctm_gemv_swiglu(gu, w, True, split, push)
-            assert y.shape == (m, n) and y.dtype == torch.bfloat16, cell
+            assert y.shape == (m, n) and y.dtype == torch.bfloat16, label
             rel = _rel(y, ref8[:m])
-            assert rel <= TOL, f"{cell}: max |y - ref| / max |ref| = {rel:.2e} > {TOL}"
+            assert rel <= TOL, f"{label}: max |y - ref| / max |ref| = {rel:.2e} > {TOL}"
             again = k3_ctm_gemv_swiglu(gu, w, True, split, push)
-            assert torch.equal(_bits(y), _bits(again)), f"{cell}: a repeated call changed bits"
-            assert torch.equal(_bits(y), _bits(y8[:m])), f"{cell}: rows differ from the 8-row call"
+            assert torch.equal(_bits(y), _bits(again)), f"{label}: a repeated call changed bits"
+            assert torch.equal(_bits(y), _bits(y8[:m])), f"{label}: rows differ from the 8-row call"
 
 
 def test_schedule_flags_move_no_bits() -> None:
@@ -133,3 +131,27 @@ def test_unsupported_calls_raise_value_error() -> None:
         except ValueError:
             continue
         raise AssertionError(f"{name}: expected ValueError, the op accepted the call")
+
+
+@pytest.mark.parametrize("operand", ("gu", "weight"))
+def test_guard_refuses_misaligned_inputs(operand) -> None:
+    gu = _gate_up(896)[:1]
+    weight = _weight(7168, 896)
+    source = gu if operand == "gu" else weight
+    flat = torch.empty(source.numel() + 1, dtype=source.dtype, device=source.device)
+    misaligned = flat[1:].view(source.shape)
+    if operand == "gu":
+        gu = misaligned
+    else:
+        weight = misaligned
+    with pytest.raises(AssertionError, match="16-byte-aligned"):
+        with validating(k3_ctm_gemv_swiglu):
+            k3_ctm_gemv_swiglu(gu, weight)
+
+
+def test_guard_refuses_weight_on_another_device() -> None:
+    gu = _gate_up(896)[:1]
+    weight = torch.empty(128, 896, dtype=torch.bfloat16)
+    with pytest.raises(AssertionError, match="weight must be on"):
+        with validating(k3_ctm_gemv_swiglu):
+            k3_ctm_gemv_swiglu(gu, weight)

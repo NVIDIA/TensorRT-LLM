@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """GPU test for the chunk_kda catalog entry: Kimi K3's KDA prefill below four 64-token chunks."""
 
+import zlib
 from typing import Dict, List
 
 import _kda_reference as kr
@@ -12,6 +13,9 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.ssm.chunk_kda import 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.ssm.kda_prefill import kda_prefill
 from tensorrt_llm._torch.modules.fla.index import prepare_chunk_indices
 
+__extra_import_path__ = [".."]
+from _validating import validating
+
 assert torch.cuda.is_available(), "chunk_kda requires a CUDA device"
 pytestmark = pytest.mark.skipif(
     torch.cuda.get_device_capability() != (10, 0), reason="certified on sm_100 only"
@@ -21,7 +25,7 @@ HEAD_DIM = kr.HEAD_DIM
 _TIME_MAJOR = ("q", "k", "v", "g", "beta")
 
 
-def _call(inp: Dict, cu_seqlens: torch.Tensor, initial_state, **overrides):
+def _call(inp: Dict, cu_seqlens: torch.Tensor, initial_state, reference=False, **overrides):
     """Kimi K3's layer's call (``prefill_chunk_kda``'s FLA path): o and the final V-first states."""
     args = dict(
         scale=kr.SCALE,
@@ -39,7 +43,10 @@ def _call(inp: Dict, cu_seqlens: torch.Tensor, initial_state, **overrides):
     )
     args.update(overrides)
     with torch.inference_mode():
-        return chunk_kda(inp["q"], inp["k"], inp["v"], inp["g"], inp["beta"], **args)
+        if reference:
+            return chunk_kda.reference(inp["q"], inp["k"], inp["v"], inp["g"], inp["beta"], **args)
+        with validating(chunk_kda):
+            return chunk_kda(inp["q"], inp["k"], inp["v"], inp["g"], inp["beta"], **args)
 
 
 def _states(heads: int, fresh: List[bool], gen: torch.Generator) -> torch.Tensor:
@@ -57,44 +64,28 @@ def _slice(inp: Dict, sl: slice) -> Dict:
     return {name: t[:, sl].contiguous() if name in _TIME_MAJOR else t for name, t in inp.items()}
 
 
-def test_kimi_k3_short_varlen_prefill() -> None:
+@pytest.mark.parametrize("cell", chunk_kda.CELLS, ids=[c.why[:40] for c in chunk_kda.CELLS])
+def test_kimi_k3_short_varlen_prefill(cell) -> None:
     # Kimi K3's layer routes a prefill batch below four chunks here, at its TP16 rank slice (6 heads)
     # and TP4 (24): fresh sequences and continuations, lengths not chunk multiples, one token.
-    cases = (
-        (6, 0, [100, 37], [True, False]),
-        (24, 1, [150], [False]),
-        (6, 2, [1], [True]),
-        (6, 3, [17, 5, 64], [False, True, False]),
-    )
-    for heads, seed, seq_lens, fresh in cases:
-        gen = torch.Generator(device="cuda").manual_seed(seed)
-        inp = kr.kimi_k3_inputs(heads, sum(seq_lens), gen)
-        cu_seqlens = kr.cu_seqlens_of(seq_lens)
-        assert prepare_chunk_indices(cu_seqlens, kr.CHUNK).shape[0] < 4
-        h0 = _states(heads, fresh, gen)
-        h0_before = h0.clone()
-        o, ht = _call(inp, cu_seqlens, h0)
-        assert o.shape == inp["v"].shape and o.dtype == inp["q"].dtype
-        assert ht.shape == h0.shape and ht.dtype == torch.float32
-        assert torch.equal(h0, h0_before), "initial_state was written"
-        start = 0
-        for i, length in enumerate(seq_lens):
-            sl = slice(start, start + length)
-            ref_o, ref_s = kr.recurrent_reference(
-                inp["q"][0, sl],
-                inp["k"][0, sl],
-                inp["v"][0, sl],
-                inp["g"][0, sl],
-                inp["beta"][0, sl],
-                h0[i],
-                inp["A_log"],
-                inp["dt_bias"],
-            )
-            # Chunked evaluation with bf16 operands against an fp64 recurrence: within 2e-2 of each
-            # sequence's largest output, 1e-2 of its state's largest entry.
-            kr.assert_scaled_close(o[0, sl], ref_o, atol=2e-2)
-            kr.assert_scaled_close(ht[i], ref_s, atol=1e-2)
-            start += length
+    heads, seq_lens, fresh = cell.spec["heads"], cell.spec["seq_lens"], cell.spec["fresh"]
+    gen = torch.Generator(device="cuda").manual_seed(zlib.crc32(cell.why.encode()) % 2**31)
+    inp = kr.kimi_k3_inputs(heads, sum(seq_lens), gen)
+    cu_seqlens = kr.cu_seqlens_of(seq_lens)
+    assert prepare_chunk_indices(cu_seqlens, kr.CHUNK).shape[0] < 4
+    h0 = _states(heads, fresh, gen)
+    h0_before = h0.clone()
+    o, ht = _call(inp, cu_seqlens, h0)
+    ref_o, ref_s = _call(inp, cu_seqlens, h0, reference=True)
+    assert o.shape == inp["v"].shape and o.dtype == inp["q"].dtype
+    assert ht.shape == h0.shape and ht.dtype == torch.float32
+    assert torch.equal(h0, h0_before), "initial_state was written"
+    start = 0
+    for i, length in enumerate(seq_lens):
+        sl = slice(start, start + length)
+        kr.assert_scaled_close(o[0, sl], ref_o[0, sl], atol=2e-2)
+        kr.assert_scaled_close(ht[i], ref_s[i], atol=1e-2)
+        start += length
 
 
 def test_continuation_equals_one_call() -> None:

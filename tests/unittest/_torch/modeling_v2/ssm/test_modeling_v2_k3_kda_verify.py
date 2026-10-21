@@ -17,19 +17,22 @@ Every launch here follows a plain copy kernel (its input), as each KDA launch in
 kernels: the head CTAs read the slots' pools before their grid-dependency wait.
 """
 
+import zlib
+
 import _kda_cells as kc
 import pytest
 import torch
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.ssm.k3_kda_verify import k3_kda_verify
 
+__extra_import_path__ = [".."]
+from _validating import validating
+
 pytestmark = pytest.mark.skipif(not kc.sm100(), reason="needs SM100 (tcgen05, TMA, clusters)")
 
-LAYERS = 2
+LAYERS = max(c.spec["layers"] for c in k3_kda_verify.CELLS)
 ROUNDS = 6
 POOL_NAMES = ("cs_q", "cs_k", "cs_v", "ssm", "state_tok")
-# (requests, 1 + num_spec): the model's 7 drafts, and a 3-draft manager.
-CELLS = [(1, 8), (4, 8), (8, 8), (4, 4)]
 
 
 @pytest.fixture(scope="module")
@@ -37,7 +40,7 @@ def managers():
     kc.load_ops()
     built = {}
     try:
-        for num_spec in sorted({steps - 1 for _, steps in CELLS}):
+        for num_spec in sorted({c.spec["num_spec"] for c in k3_kda_verify.CELLS}):
             mgr = kc.build_manager(LAYERS, num_spec=num_spec)
             built[num_spec] = (mgr, kc.request_slots(mgr, 8, first_id=600 + 10 * num_spec))
         yield built
@@ -69,35 +72,72 @@ def _accept(pools_list, slots, accepted) -> None:
         pools["pending"][slots.long()] = torch.tensor(accepted, dtype=torch.int32, device="cuda")
 
 
-@pytest.mark.parametrize("num,steps", CELLS, ids=[f"{r}x{t}" for r, t in CELLS])
-def test_verify_on_manager_pools(managers, num, steps) -> None:
+@pytest.mark.parametrize("cell", k3_kda_verify.CELLS, ids=[c.why[:40] for c in k3_kda_verify.CELLS])
+def test_verify_on_manager_pools(managers, cell) -> None:
     """ROUNDS rounds of every layer with a pending count per request that changes every round: outputs and the
     committed states against float64 (fp32 tolerance); the other slots of each layer untouched."""
-    num_spec = steps - 1
+    seed = zlib.crc32(cell.why.encode()) % 2**31
+    num, num_spec = cell.spec["requests"], cell.spec["num_spec"]
+    steps, layers = num_spec + 1, cell.spec["layers"]
     mgr, all_slots = managers[num_spec]
     slots = all_slots[:num]
-    pools = _layers(mgr)
-    with torch.inference_mode():
+    pools = _layers(mgr)[:layers]
+    with torch.inference_mode(), validating(k3_kda_verify):
         for layer, p in enumerate(pools):
-            kc.fill_pools(p, 2000 + 10 * num + layer)
-        wts = [kc.make_weights(600 + layer) for layer in range(LAYERS)]
+            kc.fill_pools(p, seed + layer)
+        wts = [kc.make_weights(seed + 100 + layer) for layer in range(layers)]
         refs = [kc.F64Verify(wts[layer], p, slots, num_spec) for layer, p in enumerate(pools)]
-        gen = torch.Generator(device="cuda").manual_seed(60 + num)
-        for rnd in range(ROUNDS):
+        reference_pools = [kc.clone_pools(p) for p in pools]
+        for p in reference_pools[1:]:
+            p["pending"] = reference_pools[0]["pending"]
+        gen = torch.Generator(device="cuda").manual_seed(seed)
+        for rnd in range(cell.spec["rounds"]):
             for layer, p in enumerate(pools):
                 before = kc.snapshot(p)
                 proj = _proj(num, steps, gen)
                 out = _verify(wts[layer], p, proj, slots, num_spec)
                 want = refs[layer](proj)
+                rp, wt = reference_pools[layer], wts[layer]
+                out_reference = k3_kda_verify.reference(
+                    proj,
+                    wt["w_fb"],
+                    wt["w_q"],
+                    wt["w_k"],
+                    wt["w_v"],
+                    wt["a_log"],
+                    wt["dt_bias"],
+                    wt["onorm_w"],
+                    rp["cs_q"],
+                    rp["cs_k"],
+                    rp["cs_v"],
+                    rp["ssm"],
+                    rp["state_tok"],
+                    slots,
+                    rp["pending"],
+                    num_spec,
+                    kc.LOWER_BOUND,
+                    kc.SCALE,
+                    kc.EPS,
+                )
                 torch.cuda.synchronize()
                 assert kc.rel(out, want) <= kc.TOL_OUT, (rnd, layer, kc.rel(out, want))
+                assert kc.rel(out, out_reference) <= kc.TOL_OUT, (rnd, layer)
+                assert kc.rel(p["ssm"][slots.long()], rp["ssm"][slots.long()]) <= kc.TOL_STATE, (
+                    rnd,
+                    layer,
+                )
+                assert (
+                    kc.rel(p["state_tok"][slots.long()], rp["state_tok"][slots.long()])
+                    <= kc.TOL_STATE
+                ), (rnd, layer)
+                assert kc.same_rows(p, rp, slots.tolist(), ("cs_q", "cs_k", "cs_v")), (rnd, layer)
                 for n, s in enumerate(slots.tolist()):
                     committed = refs[layer].last[n][0][0]  # the state after the golden token
                     assert kc.rel(p["ssm"][s], committed) <= kc.TOL_STATE, (rnd, layer, n)
                 others = kc.other_slots(p["ssm"].shape[0], slots.tolist())
                 assert kc.same_rows(p, before, others, POOL_NAMES), (rnd, layer)
             accepted = kc.pending_schedule(num, num_spec, rnd)
-            _accept([pools[0]], slots, accepted)
+            _accept([pools[0], reference_pools[0]], slots, accepted)
             for ref in refs:
                 ref.commit(accepted)
 
@@ -200,3 +240,29 @@ def test_rejects_out_of_contract(managers) -> None:
             _verify(wt, dict(p, pending=p["pending"].long()), proj, slots, kc.NUM_SPEC)
         torch.cuda.synchronize()
     assert all(torch.equal(p[n], before[n]) for n in POOL_NAMES)
+
+
+@pytest.mark.parametrize("misuse", ("duplicate_slot", "pending", "conv_layout"))
+def test_guard_rejects_silent_misuse(managers, misuse) -> None:
+    mgr, all_slots = managers[kc.NUM_SPEC]
+    slots = all_slots[:2]
+    p = kc.layer_pools(mgr, 0)
+    with torch.inference_mode():
+        kc.fill_pools(p, 2400)
+        before = kc.snapshot(p)
+        wt = kc.make_weights(640)
+        proj = _proj(2, kc.NT, torch.Generator(device="cuda").manual_seed(64))
+        bad = p
+        if misuse == "duplicate_slot":
+            slots = slots[:1].repeat(2)
+            match = "each slot once"
+        elif misuse == "pending":
+            bad = dict(p, pending=p["pending"].clone())
+            bad["pending"][slots.long()] = kc.NUM_SPEC + 1
+            match = "pending must be in"
+        else:
+            bad = dict(p, cs_k=p["cs_k"].contiguous())
+            match = "channel-contiguous"
+        with pytest.raises(AssertionError, match=match), validating(k3_kda_verify):
+            _verify(wt, bad, proj, slots, kc.NUM_SPEC)
+        assert all(torch.equal(p[n], before[n]) for n in POOL_NAMES)
