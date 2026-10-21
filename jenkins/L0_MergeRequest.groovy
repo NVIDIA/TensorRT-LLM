@@ -217,7 +217,7 @@ def BOLT_CONSUME = "bolt_consume"
 // resolveBoltConsume() still applies the post-merge and branch restrictions.
 @Field
 def ENABLE_BOLT_PREMERGE_CONSUME = true
-// Version-controlled rollout switch for post-merge BOLT, same idiom as above.
+// Version-controlled rollout switch for post-merge and nightly release BOLT.
 //
 // Post-merge cannot use the pre-merge shape, where the BOLTed build REPLACES the
 // canonical tarball: that tarball is BoltProfileGen's input and must stay
@@ -338,19 +338,15 @@ def globalVars = [
     (RELEASE_TARGET): runMode == "nightly_release" ?
         normalizeReleaseTargets(gitlabParamsFromBot.get(RELEASE_TARGET, null)) : [],
     (BOLT_PROFILE_REF): "",
-    (BOLT_PUBLISH_VARIANT): (env.JOB_NAME ==~ /.*PostMerge.*/) && ENABLE_BOLT_POSTMERGE_VARIANT,
+    (BOLT_PUBLISH_VARIANT): isBoltReleasePipeline() && ENABLE_BOLT_POSTMERGE_VARIANT,
     (BOLT_PROFILE_BRANCH): "",
     (BOLT_CONSUME_TRIPLES): BOLT_PRODUCER_TRIPLE,
 ]
 globalVars[BUILD_BRANCH] = resolveBuildBranch(globalVars)
 // Compare against "true" rather than relying on Groovy truthiness: the bot phrase
 // is free-form JSON, and a quoted "false" would otherwise read as opt-in.
-// globalVars[BOLT_PUBLISH_VARIANT], not the raw ENABLE_BOLT_POSTMERGE_VARIANT:
-// the raw flag carries no job scope, so ORing it into `requested` would make
-// every PRE-merge job targeting main pass resolveBoltConsume and start
-// consuming in the replace-canonical shape. That silently takes over what
-// ENABLE_BOLT_PREMERGE_CONSUME governs, and pre-merge behaviour is supposed to
-// be untouched by this work. The globalVars value is already PostMerge-scoped.
+// Scope variant publication to post-merge and nightly releases so pre-merge
+// consumption remains governed by its own rollout switch and explicit opt-in.
 globalVars[BOLT_CONSUME_BUILD] = resolveBoltConsume(
     ENABLE_BOLT_PREMERGE_CONSUME || globalVars[BOLT_PUBLISH_VARIANT] ||
         gitlabParamsFromBot.get(BOLT_CONSUME, false).toString() == "true",
@@ -2182,26 +2178,12 @@ def resolveBuildBranch(globalVars)
     return env.gitlabBranch ? env.gitlabBranch : "main"
 }
 
-// Decide whether the build helper jobs should re-BOLT their packed tarball with
-// the target branch's promoted profile bundle (Build.groovy's `boltConsume`).
-// Two restrictions narrow this well below the raw opt-in:
-//
-//  1. Pre-merge only. Post-merge builds the SBSA tarball that the
-//     BOLT-Profile-Gen stage below profiles later in the same run, so BOLTing it
-//     would feed already-BOLTed binaries back into profile generation and yield
-//     circular, meaningless profiles. Post-merge consumers are served instead by
-//     the container overlay (boltOverlayEnabled on the image build) and by
-//     BoltProfileGen applying its own freshly generated bundle in-run.
-//  2. `main` only. scripts/bolt/internal/apply_latest.sh resolves exactly one
-//     branch with no fallback and exits non-zero when that branch has nothing
-//     promoted, so pointing consume at a branch that has never promoted a bundle
-//     hard-fails the build on its first run. `main` is the only branch the
-//     post-merge producer keeps fresh, so stay there until apply_latest.sh grows
-//     a documented fallback.
-//
-// Skips are announced rather than silent: a run that asked for BOLTed binaries
-// and did not get them should say so in the log.
-// (Everything above documents resolveBoltConsume, defined further down.)
+// Release consumers need an unoptimized canonical tarball and a separate
+// optimized variant. Pin their profiles once so tests and images agree.
+def isBoltReleasePipeline()
+{
+    return (env.JOB_NAME ==~ /.*PostMerge.*/) || runMode == "nightly_release"
+}
 
 // Pick the single BOLT profile bundle this pipeline will use, and pin it.
 //
@@ -2212,7 +2194,7 @@ def resolveBuildBranch(globalVars)
 // invisible: each consumer succeeds, and the run is green having tested
 // something other than what it shipped.
 //
-// Pinning is post-merge only. Pre-merge keeps reading `latest` (requirement: its
+// Pinning applies to post-merge and nightly releases. Pre-merge reads `latest` (its
 // drift is acceptable and its behaviour must not change), and returning "" leaves
 // every consumer on exactly today's path.
 //
@@ -2222,7 +2204,7 @@ def resolveBuildBranch(globalVars)
 // build.
 def resolveBoltProfileRef(String branch, String triple = "aarch64-linux-gnu")
 {
-    if (!(env.JOB_NAME ==~ /.*PostMerge.*/)) {
+    if (!isBoltReleasePipeline()) {
         return ""
     }
     def ref = ""
@@ -2254,13 +2236,10 @@ def resolveBoltConsume(boolean requested, String targetBranch, boolean postMerge
     if (!requested) {
         return false
     }
-    // Post-merge is allowed only in the publish-both shape. The exclusion exists
-    // to protect BoltProfileGen's input, and publishing the optimized build under
-    // a second name protects it just as well as not building one -- canonical is
-    // still the un-BOLTed tarball the producer profiles. Without that shape the
-    // build would replace canonical, which is what the exclusion forbids.
-    if ((env.JOB_NAME ==~ /.*PostMerge.*/) && !postMergeVariant) {
-        echo "BOLT consume requested but disabled: the post-merge build is the un-BOLTed input BoltProfileGen profiles."
+    // Post-merge and nightly release consumers require the canonical tarball
+    // to remain unoptimized for profile generation and image-side BOLT.
+    if (isBoltReleasePipeline() && !postMergeVariant) {
+        echo "BOLT consume requested but disabled: post-merge and nightly releases require an un-BOLTed canonical tarball."
         return false
     }
     if (targetBranch != "main") {
