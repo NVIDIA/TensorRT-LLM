@@ -61,6 +61,7 @@ l0_cpu:
   - unittest/_torch/test_connector.py::test_a_partial_grouped_scheduler_is_rejected_at_bring_up
   - unittest/_torch/test_connector.py::test_a_grouped_scheduler_and_a_single_group_cache_are_accepted
   - unittest/test_startup.py
+  - unittest/scripts/test_perf_client_wheel_cache.py
   - unittest/test_unified_cache.py
   - unittest/_torch/disaggregation
   - unittest/_torch/peft

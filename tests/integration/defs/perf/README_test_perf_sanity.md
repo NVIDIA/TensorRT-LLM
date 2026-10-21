@@ -147,6 +147,12 @@ config-parse time rather than silently falling through to the default client.
 | `agentx` | `perf/agentx_client.py` | AgentX agentic multi-turn trace replay (a fork of `aiperf`). |
 
 **AgentX specifics**:
+- Images built with Python 3.11 through 3.13 cache the client's pinned `aiperf` fork
+  as a wheel under `/opt/trtllm-benchmark-client`. The client verifies the source pin and
+  checksum before installing it, so benchmark workers do not need GitHub access.
+  This cache does not install or change the image's Python dependencies. Rebuild
+  the CI image when updating the fork pin. Older images retain the source install;
+  an explicit source override still takes precedence over the bundled wheel.
 - Duration-bounded, not count-bounded: the run replays a conversation trace for
   `AGENTX_DURATION` seconds, so `dataset_file` names an `aiperf` dataset loader (fetched
   from HF), *not* a path — `get_dataset_dir` must not be applied to it.

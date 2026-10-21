@@ -119,6 +119,18 @@ RUN --mount=type=bind,source=docker/common,target=/opt/docker/common \
     # WAR against https://github.com/advisories/GHSA-8rrh-rw8j-w5fx
     rm -rf /usr/local/lib/python3.12/dist-packages/setuptools/_vendor/wheel-*.dist-info
 
+# Cache the benchmark client's fork without changing the installed Python dependency stack.
+RUN --mount=type=cache,target=/root/.cache/pip \
+    --mount=type=secret,id=github_clone_token \
+    --mount=type=bind,source=docker/common/github_auth.sh,target=/tmp/github_auth.sh \
+    --mount=type=bind,source=docker/common/cache_benchmark_client_wheel.py,target=/tmp/cache_benchmark_client_wheel.py \
+    --mount=type=bind,source=tests/integration/defs/perf/agentx_client.py,target=/tmp/benchmark_client.py \
+    if [ -n "$GITHUB_MIRROR" ]; then \
+      export PIP_INDEX_URL="https://artifactory.pdx.nvidia.com/artifactory/api/pypi/pypi-remote/simple"; \
+    fi && \
+    . /tmp/github_auth.sh && \
+    python3 /tmp/cache_benchmark_client_wheel.py --client-file /tmp/benchmark_client.py --output-dir /opt/trtllm-benchmark-client
+
 ARG GIT_COMMIT
 ARG TRT_LLM_VER
 ARG TARGETARCH

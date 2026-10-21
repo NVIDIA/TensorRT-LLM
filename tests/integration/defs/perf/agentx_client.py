@@ -53,6 +53,7 @@ as the reference script, so a lane is configured purely through the YAML's
 """
 
 import argparse
+import hashlib
 import json
 import os
 import subprocess
@@ -61,6 +62,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from pathlib import Path
 
 # Pinned agentx-harness build. It installs *as* ``aiperf`` (shadowing any
 # PyPI aiperf), so the version is pinned by commit rather than by release.
@@ -68,6 +70,7 @@ DEFAULT_AIPERF_REF = (
     "git+https://github.com/SemiAnalysisAI/agentx-harness.git"
     "@754356e9a39acc6cc6afb242d123bb57c3fb6f75"
 )
+AIPERF_WHEEL_MANIFEST = Path("/opt/trtllm-benchmark-client/manifest.json")
 
 # aiperf's CLI/serialization/UI dependencies. The TRT-LLM container already
 # carries its ML stack (numpy/pandas/torch/huggingface-hub/aiohttp); installing
@@ -270,6 +273,29 @@ def _pip(*args: str) -> None:
     subprocess.check_call([sys.executable, "-m", "pip", "install", *args])
 
 
+def aiperf_install_ref() -> str:
+    """Use the image's pinned wheel unless the caller selected another source."""
+    if "AGENTX_AIPERF_REF" in os.environ:
+        return os.environ["AGENTX_AIPERF_REF"]
+    if not AIPERF_WHEEL_MANIFEST.exists():
+        return DEFAULT_AIPERF_REF
+    record = json.loads(AIPERF_WHEEL_MANIFEST.read_text())
+    if record["source_ref"] != DEFAULT_AIPERF_REF:
+        _log("cached aiperf source does not match the client pin; using the source install")
+        return DEFAULT_AIPERF_REF
+    filename = record["wheel"]
+    if (
+        not isinstance(filename, str)
+        or Path(filename).name != filename
+        or not filename.endswith(".whl")
+    ):
+        raise RuntimeError("invalid aiperf cache wheel filename")
+    wheel = AIPERF_WHEEL_MANIFEST.parent / filename
+    if hashlib.sha256(wheel.read_bytes()).hexdigest() != record["sha256"]:
+        raise RuntimeError(f"cached aiperf wheel checksum mismatch: {wheel}")
+    return wheel.as_uri()
+
+
 def ensure_aiperf(url: str, model: str) -> None:
     """Install the pinned agentx build unless a usable one is already present."""
     if os.environ.get("AGENTX_FORCE_REINSTALL", "0") == "1":
@@ -278,7 +304,7 @@ def ensure_aiperf(url: str, model: str) -> None:
         _log("aiperf + deps already usable; skipping install")
         return
 
-    ref = os.environ.get("AGENTX_AIPERF_REF", DEFAULT_AIPERF_REF)
+    ref = aiperf_install_ref()
     with _Heartbeat(url, model):
         _log(f"installing aiperf (agentx) from {ref}")
         _pip("--force-reinstall", "--no-deps", f"aiperf @ {ref}")
