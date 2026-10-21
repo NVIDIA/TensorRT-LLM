@@ -4019,9 +4019,7 @@ def _prepared_gen_request(rid: int, py_result: PyResult, **disagg_params) -> typ
         py_result=py_result,
         py_disaggregated_params=types.SimpleNamespace(**transferred),
     )
-    request.create_response = lambda _use_fast_logits, _rank: LlmResponse(
-        request_id=rid, result=LlmResult(b"", py_result)
-    )
+    request.create_response = lambda: LlmResponse(request_id=rid, result=LlmResult(b"", py_result))
     return request
 
 

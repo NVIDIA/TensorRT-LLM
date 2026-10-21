@@ -1189,18 +1189,12 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
                 return self.context_current_position + self.context_chunk_size == end
         return super().is_last_context_chunk
 
-    def create_response(self,
-                        use_fast_logits=False,
-                        mpi_world_rank=0) -> LlmResponse | None:
+    def create_response(self) -> LlmResponse | None:
         """Create an LlmResponse from the current request state.
 
         This method generates a response containing the request's execution results,
         including generated tokens, logits, and completion status. It wraps the
         parent class's serialized result in a PyTorch-specific LlmResponse object.
-
-        Args:
-            use_fast_logits: Reserved; does not affect response construction.
-            mpi_world_rank: Reserved; does not affect response construction.
 
         Returns:
             LlmResponse | None: An LlmResponse object containing the request results
