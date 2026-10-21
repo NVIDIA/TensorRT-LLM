@@ -94,6 +94,8 @@ If you want to use the latest main branch, you can build from source: [https://n
 
 Use these configurations as starting points for 4x B200 with FP8 weights and a BF16 KV cache. Tune the batch size and token budget for your workload.
 
+For single-request latency, setting `TRTLLM_LOW_M_GEMM_BACKEND=auto` before launching the server routes BF16 projections with at most 32 rows to autotuned low-M GEMM kernels. With MTP on 4x B200 it lowered inter-token latency by about 2% at concurrency 1 and left concurrency 8 unchanged, but tuning those kernels adds about two minutes to server startup.
+
 #### B200 FP8 Config
 
 ```bash
