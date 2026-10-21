@@ -504,7 +504,6 @@ class TestConsumePreviousBatch:
             exe.result_wait_queues = {}
             exe._pending_transfer_responses = []
             exe._pending_response_terminations = []
-            exe._is_preemption_pending.return_value = False
             exe.enable_early_first_token_response = False
             exe.enable_iter_perf_stats = False
             exe.enable_kv_cache_events = enable_events
