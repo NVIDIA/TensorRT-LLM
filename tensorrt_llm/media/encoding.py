@@ -181,7 +181,7 @@ class _FfmpegCliEncoder(_VideoEncoder):
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                 )
-                raw_frames = video_np.tobytes()
+                raw_frames = memoryview(video_np.reshape(-1))
                 _, stderr = process.communicate(input=raw_frames)
                 if process.returncode != 0:
                     raise RuntimeError(f"ffmpeg encoding failed: {stderr.decode()}")

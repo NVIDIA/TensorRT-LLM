@@ -168,6 +168,17 @@ def test_hash_chain_separates_cache_salts():
     assert salted[0] != other[0]
 
 
+def test_reuse_scope_distinguishes_absent_empty_and_zero_salts():
+    """Salt equality is exact: no salt, an empty salt and "0" are three scopes."""
+    seeds = {
+        ReuseScope().seed(),
+        ReuseScope(cache_salt="").seed(),
+        ReuseScope(cache_salt="0").seed(),
+        ReuseScope(cache_salt="\x00").seed(),
+    }
+    assert len(seeds) == 4
+
+
 def test_reuse_scope_fields_cannot_be_confused_for_one_another():
     """A scope's seed reads its fields apart, however their bytes line up.
 

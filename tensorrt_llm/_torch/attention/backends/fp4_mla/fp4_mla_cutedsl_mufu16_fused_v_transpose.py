@@ -5901,14 +5901,14 @@ def _runtime_t336_producer_tile(
             ):
                 pass
             cute.arch.mbarrier_arrive(
-                p4_smem_slot0_mbar_ptr + p4_smem_slot0_producer.index(),
+                p4_smem_slot0_mbar_ptr + p4_smem_slot0_producer.current_handle().index,
                 cutlass.Int32(0),
             )
             p4_smem_slot0_producer.advance()
             cute.arch.mbarrier_arrive(
                 tmem_score_slot0_mbar_ptr
                 + SMEM_P4_TMEM_SCORE_PIPELINE_STAGES
-                + tmem_score_slot0_consumer.index(),
+                + tmem_score_slot0_consumer.current_handle().index,
                 cutlass.Int32(0),
             )
             tmem_score_slot0_consumer.advance()
@@ -6174,14 +6174,14 @@ def _runtime_t336_producer_tile_v23(
             ):
                 pass
             cute.arch.mbarrier_arrive(
-                p4_smem_slot0_mbar_ptr + p4_smem_slot0_producer.index(),
+                p4_smem_slot0_mbar_ptr + p4_smem_slot0_producer.current_handle().index,
                 cutlass.Int32(0),
             )
             p4_smem_slot0_producer.advance()
             cute.arch.mbarrier_arrive(
                 tmem_score_slot0_mbar_ptr
                 + SMEM_P4_TMEM_SCORE_PIPELINE_STAGES
-                + tmem_score_slot0_consumer.index(),
+                + tmem_score_slot0_consumer.current_handle().index,
                 cutlass.Int32(0),
             )
             tmem_score_slot0_consumer.advance()
@@ -7293,14 +7293,14 @@ def _run_mla_decode_body(
             ):
                 pass
             cute.arch.mbarrier_arrive(
-                p4_smem_slot0_mbar_ptr + p4_smem_slot0_producer.index(),
+                p4_smem_slot0_mbar_ptr + p4_smem_slot0_producer.current_handle().index,
                 cutlass.Int32(0),
             )
             p4_smem_slot0_producer.advance()
             cute.arch.mbarrier_arrive(
                 tmem_score_slot0_mbar_ptr
                 + SMEM_P4_TMEM_SCORE_PIPELINE_STAGES
-                + tmem_score_slot0_consumer.index(),
+                + tmem_score_slot0_consumer.current_handle().index,
                 cutlass.Int32(0),
             )
             tmem_score_slot0_consumer.advance()

@@ -83,7 +83,8 @@ class RequestData:
     # hash is committed in the same scheduler step.
     block_hashes: List[int] = field(default_factory=list)
     # The retention priorities for each new block (same length as new_block_ids).
-    # Used for priority-based offload filtering. None means use default priority.
+    # Used for priority-based offload filtering. None omits priority metadata
+    # when the request has no explicit retention config.
     priorities: Optional[List[int]] = None
     # Per-request cache salt that the KV cache manager uses to isolate reuse
     # between requests carrying different salts. Connectors that key cached
@@ -590,8 +591,7 @@ class KvCacheConnectorSchedulerOutputRequest:
 
         new_block_ids_by_layer_group: List[List[int]] = []
         if is_v2:
-            # Block hashes and retention priorities have no V2 accessor yet, so
-            # they are reported empty rather than guessed at.
+            # Block hashes have no V2 accessor yet.
             block_hashes = []
             indices_by_group = kv_cache_manager.get_page_indices_by_layer_group(req)
             while len(self.block_ids_by_layer_group) < len(indices_by_group):
@@ -635,13 +635,21 @@ class KvCacheConnectorSchedulerOutputRequest:
                 req
             )  # Specdec with draft tokens is not supported yet.
 
-        # V2 does not honour KvCacheRetentionConfig, so it cannot provide
-        # per-block retention priorities for connector offload filtering.
+        # Report the native pages' current priorities, including shared-page claims.
         priorities = None
-        if not is_v2 and req.kv_cache_retention_config is not None:
-            priorities = [
-                kv_cache_manager.get_priority_by_block_id(block_id) for block_id in new_block_ids
-            ]
+        if req.kv_cache_retention_config is not None:
+            if not new_block_ids:
+                priorities = []
+            elif is_v2:
+                kv_cache = kv_cache_manager.kv_cache_map[req.py_request_id]
+                priorities = kv_cache.get_page_priorities(0)[
+                    len(self.block_ids) - len(new_block_ids) : len(self.block_ids)
+                ]
+            else:
+                priorities = [
+                    kv_cache_manager.get_priority_by_block_id(block_id)
+                    for block_id in new_block_ids
+                ]
 
         return RequestData(
             req.request_id,

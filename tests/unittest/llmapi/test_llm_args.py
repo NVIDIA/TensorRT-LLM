@@ -1210,7 +1210,10 @@ class TestKvCacheManagerV2AutoResolution:
 
 
 @pytest.mark.cpu_only
-def test_KvCacheConfig_declaration():
+@pytest.mark.parametrize(
+    "offload_field",
+    ["cold_tier_offload_min_priority", "secondary_offload_min_priority"])
+def test_KvCacheConfig_declaration(offload_field):
     assert KvCacheConfig().mamba_state_cache_interval is None
     assert KvCacheConfig().mamba_state_config.periodic_snapshot_interval == 0
     assert KvCacheConfig().kv_cache_event_hash_algo == "auto"
@@ -1234,7 +1237,7 @@ def test_KvCacheConfig_declaration():
                            disk_cache_size=2048,
                            disk_cache_path="/tmp",
                            cross_kv_cache_fraction=0.5,
-                           secondary_offload_min_priority=1,
+                           **{offload_field: 1},
                            event_buffer_max_size=0,
                            kv_cache_event_hash_algo="v2_sha256_64",
                            enable_swa_scratch_reuse=True,
@@ -1263,6 +1266,12 @@ def test_KvCacheConfig_declaration():
     assert KvCacheConfig().enable_swa_scratch_reuse is False
     assert pybind_config.cross_kv_cache_fraction == 0.5
     assert pybind_config.secondary_offload_min_priority == 1
+    assert config.cold_tier_offload_min_priority == 1
+    dumped = config.model_dump(exclude_unset=True)
+    assert dumped["cold_tier_offload_min_priority"] == 1
+    assert "secondary_offload_min_priority" not in dumped
+    assert KvCacheConfig.model_validate_json(
+        config.model_dump_json()).cold_tier_offload_min_priority == 1
     assert pybind_config.event_buffer_max_size == 0
     assert config.kv_cache_event_hash_algo == "v2_sha256_64"
     assert config.pool_ratio == [0.25, 0.75]
@@ -1297,6 +1306,36 @@ def test_KvCacheConfig_declaration():
         BlockReuseConfig(policy="invalid")
     with pytest.raises(ValidationError):
         BlockReuseConfig(max_num_turns=0)
+
+
+@pytest.mark.cpu_only
+def test_KvCacheConfig_offload_priority_compatibility():
+    assert KvCacheConfig().cold_tier_offload_min_priority is None
+    for field in ("cold_tier_offload_min_priority",
+                  "secondary_offload_min_priority"):
+        for threshold in (-1, 101):
+            config = KvCacheConfig(**{field: threshold})
+            assert config.cold_tier_offload_min_priority == threshold
+            assert config._to_pybind(
+            ).secondary_offload_min_priority == threshold
+    with pytest.raises(ValidationError, match="must match"):
+        KvCacheConfig(cold_tier_offload_min_priority=50,
+                      secondary_offload_min_priority=40)
+    with patch.object(llm_args_mod.logger, "warning") as warning:
+        config = KvCacheConfig(cold_tier_offload_min_priority="50",
+                               secondary_offload_min_priority=50)
+    assert config.cold_tier_offload_min_priority == 50
+    warning.assert_called_once()
+    assert "deprecated" in warning.call_args.args[0]
+    with pytest.warns(DeprecationWarning, match="cold_tier"):
+        assert config.secondary_offload_min_priority == 50
+    config = KvCacheConfig(secondary_offload_min_priority=0)
+    config.secondary_offload_min_priority = 50
+    assert TorchLlmArgs(model=llama_model_path, kv_cache_config=config
+                        ).kv_cache_config.cold_tier_offload_min_priority == 50
+    config.cold_tier_offload_min_priority = 80
+    assert KvCacheConfig.model_validate(
+        config).cold_tier_offload_min_priority == 80
 
 
 @pytest.mark.cpu_only
