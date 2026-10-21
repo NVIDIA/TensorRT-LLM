@@ -34,8 +34,8 @@ from cuda.bindings import driver
 import tensorrt_llm
 from tensorrt_llm._torch.distributed import Distributed
 from tensorrt_llm._torch.nccl_window_graph import (
-    abandon_nccl_window_graph_owner, nccl_window_graph_capture,
-    release_nccl_window_graph_owner)
+    abandon_nccl_window_graph_owner, nccl_window_allocation_suppressed,
+    nccl_window_graph_capture, release_nccl_window_graph_owner)
 from tensorrt_llm._torch.nccl_window_tensor_scope import \
     nccl_window_tensor_scope
 from tensorrt_llm._utils import confidential_compute_enabled, nvtx_range
@@ -1332,7 +1332,14 @@ class AutoTuner:
         tuning_config: TuningConfig,
         **kwargs,
     ) -> float:
-        with nccl_window_tensor_scope(input_tensors) as scope:
+        # PARALLEL ranks profile different tactics, so window requests here would diverge the
+        # per-rank pools and let a later request register a window collectively on some ranks only.
+        window_guard = (nccl_window_allocation_suppressed()
+                        if tuning_config.distributed_tuning_strategy
+                        == DistributedTuningStrategy.PARALLEL
+                        and self._is_distributed() else
+                        contextlib.nullcontext())
+        with window_guard, nccl_window_tensor_scope(input_tensors) as scope:
             scope.escape(input_tensors)
             if tuning_config.inputs_pre_hook is not None:
                 input_tensors = tuning_config.inputs_pre_hook(input_tensors)
