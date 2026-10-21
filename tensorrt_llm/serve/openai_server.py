@@ -17,15 +17,15 @@ import time
 import traceback
 import uuid
 from collections import deque
-from collections.abc import Awaitable
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
+from contextvars import copy_context
 from datetime import datetime
 from http import HTTPStatus
 from pathlib import Path
 from typing import (TYPE_CHECKING, Annotated, Any, AsyncGenerator,
-                    AsyncIterator, Callable, Dict, List, Literal, Optional,
-                    Tuple, TypeVar, Union)
+                    AsyncIterator, Callable, Dict, List, Optional, Tuple,
+                    TypeVar, Union)
 
 import msgspec
 import torch
@@ -69,6 +69,9 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.media.encoding import image_to_bytes
 from tensorrt_llm.media.tensor_payload import is_tensor_format
 from tensorrt_llm.metrics.collector import MetricsCollector
+from tensorrt_llm.metrics.perf_utils import (_record_input_processing,
+                                             _start_input_processing,
+                                             _time_input_processing)
 from tensorrt_llm.runtime.kv_cache_hash import \
     get_effective_kv_cache_event_hash_algo
 from tensorrt_llm.sampling_params import GuidedDecodingParams, SamplingParams
@@ -969,10 +972,14 @@ class OpenAIServer(_VideoRoutesMixin):
             self.register_routes()
 
         if self._collect_perf_metrics:
-            self.app.add_middleware(PerfMetricsMiddleware,
-                                    expose_headers=self._expose_perf_metrics,
-                                    writer=self._perf_metrics_writer,
-                                    adjusted_clock=self._adjusted_steady_clock)
+            self.app.add_middleware(
+                PerfMetricsMiddleware,
+                expose_headers=self._expose_perf_metrics,
+                writer=self._perf_metrics_writer,
+                adjusted_clock=self._adjusted_steady_clock,
+                input_processing_observer=(
+                    self.metrics_collector.log_input_processing
+                    if self.metrics_collector else None))
         self.app.add_middleware(ServerArrivalTimeMiddleware,
                                 adjusted_clock=self._adjusted_steady_clock)
 
@@ -2218,43 +2225,24 @@ class OpenAIServer(_VideoRoutesMixin):
         if self._iteration_stats_buffer is not None:
             self._iteration_stats_buffer.append(llm_stat)
 
-    async def _time_input_stage(
-        self,
-        stage: Literal["media_load", "chat_template"],
-        task: Awaitable[_InputProcessingResult],
-    ) -> _InputProcessingResult:
-        """Measure async stage wall time, including IO and worker waits."""
-        collector = self.metrics_collector
-        if collector is None:
-            return await task
-        started = time.perf_counter()
-        try:
-            return await task
-        finally:
-            collector.log_input_processing(stage, time.perf_counter() - started)
-
     async def _run_input_processor(
         self,
         process: Callable[[], _InputProcessingResult],
     ) -> _InputProcessingResult:
         """Run preprocessing with separate thread queue and execution times."""
         loop = asyncio.get_running_loop()
-        collector = self.metrics_collector
-        if collector is None:
+        queued = _start_input_processing()
+        if queued is None:
             return await loop.run_in_executor(self._input_proc_executor,
                                               process)
-        queued = time.perf_counter()
 
         def run() -> _InputProcessingResult:
-            started = time.perf_counter()
-            try:
+            _record_input_processing("processor_queue", queued)
+            with _time_input_processing("processor"):
                 return process()
-            finally:
-                collector.log_input_processing("processor",
-                                               time.perf_counter() - started,
-                                               started - queued)
 
-        return await loop.run_in_executor(self._input_proc_executor, run)
+        return await loop.run_in_executor(self._input_proc_executor,
+                                          copy_context().run, run)
 
     async def openai_chat(self, request: ChatCompletionRequest,
                           raw_request: Request) -> Response:
@@ -2298,6 +2286,7 @@ class OpenAIServer(_VideoRoutesMixin):
                 logger.error(traceback.format_exc())
                 raise
 
+        input_started = _start_input_processing()
         try:
             # Extension preprocessing, the required-tool check and tool dumping
             # are the first stage of the shared prompt-preparation pipeline.
@@ -2548,10 +2537,6 @@ class OpenAIServer(_VideoRoutesMixin):
                     resolve_media=resolve_media,
                 )
 
-            if resolve_media and mm_item_order:
-                mm_coroutines = self._time_input_stage("media_load",
-                                                       mm_coroutines)
-
             # Decode base64 int32 prompt_token_ids relayed by the orchestrator.
             if request.prompt_token_ids is None and request.prompt_token_ids_b64:
                 import numpy as np
@@ -2580,8 +2565,7 @@ class OpenAIServer(_VideoRoutesMixin):
                     forced_prefix=forced_tool_begin_prefix,
                 )
                 rendered, (mm_data, mm_embeddings) = await asyncio.gather(
-                    self._time_input_stage("chat_template", render_task),
-                    mm_coroutines)
+                    render_task, mm_coroutines)
                 if rendered.text is None:
                     prompt = rendered.token_ids
                 else:
@@ -2689,6 +2673,9 @@ class OpenAIServer(_VideoRoutesMixin):
                         or get_request_conversation_id(request), preprocess)
                 generate_inputs = await self._run_input_processor(preprocess)
 
+            _record_input_processing("total", input_started)
+            input_started = None
+
             promise = self.generator.generate_async(
                 inputs=generate_inputs,
                 sampling_params=sampling_params,
@@ -2748,6 +2735,8 @@ class OpenAIServer(_VideoRoutesMixin):
         except Exception as e:
             logger.error(traceback.format_exc())
             return self.create_error_response(str(e))
+        finally:
+            _record_input_processing("total", input_started)
 
     async def anthropic_messages(self, request: AnthropicMessagesRequest,
                                  raw_request: Request) -> Response:
@@ -3095,6 +3084,7 @@ class OpenAIServer(_VideoRoutesMixin):
                 ),
             )
 
+        input_started = _start_input_processing()
         try:
             ensure_request_chat_template_allowed(
                 request, self.allow_request_chat_template)
@@ -3125,10 +3115,6 @@ class OpenAIServer(_VideoRoutesMixin):
                     request_media_io_kwargs=request.media_io_kwargs,
                 )
 
-            if mm_item_order:
-                mm_coroutines = self._time_input_stage("media_load",
-                                                       mm_coroutines)
-
             if request.prompt_token_ids is not None:
                 prompt = request.prompt_token_ids
             else:
@@ -3145,8 +3131,7 @@ class OpenAIServer(_VideoRoutesMixin):
                     injected_chat_template_kwargs,
                 )
                 rendered, (mm_data, mm_embeddings) = await asyncio.gather(
-                    self._time_input_stage("chat_template", render_task),
-                    mm_coroutines)
+                    render_task, mm_coroutines)
                 prompt = (rendered.text
                           if rendered.text is not None else rendered.token_ids)
             prompt = prompt_inputs(prompt)
@@ -3158,6 +3143,9 @@ class OpenAIServer(_VideoRoutesMixin):
             if mm_data is not None:
                 self._attach_multimodal_data(prompt, request, mm_data,
                                              mm_item_order)
+
+            _record_input_processing("total", input_started)
+            input_started = None
 
             promise = self.generator.generate_async(inputs=prompt, )
             asyncio.create_task(self.await_disconnected(raw_request, promise))
@@ -3173,6 +3161,8 @@ class OpenAIServer(_VideoRoutesMixin):
         except Exception as e:
             logger.error(traceback.format_exc())
             return self.create_error_response(str(e))
+        finally:
+            _record_input_processing("total", input_started)
 
     async def openai_completion(self, request: CompletionRequest,
                                 raw_request: Request) -> Response:
@@ -3282,6 +3272,7 @@ class OpenAIServer(_VideoRoutesMixin):
                 yield output
             yield "data: [DONE]\n\n"
 
+        input_started = _start_input_processing()
         try:
             if isinstance(request.prompt, list) and not request.prompt:
                 return self.create_error_response("'prompt' must not be empty.")
@@ -3373,6 +3364,9 @@ class OpenAIServer(_VideoRoutesMixin):
                 postproc_params_collection.append(
                     None if self.postproc_worker_enabled else postproc_params)
 
+            _record_input_processing("total", input_started)
+            input_started = None
+
             if request.stream:
                 generators = [
                     completion_generator(promise, params) for promise, params in
@@ -3399,6 +3393,8 @@ class OpenAIServer(_VideoRoutesMixin):
         except Exception as e:
             logger.error(traceback.format_exc())
             return self.create_error_response(str(e))
+        finally:
+            _record_input_processing("total", input_started)
 
     async def chat_harmony(self, request: ChatCompletionRequest,
                            raw_request: Request) -> Response:
@@ -3435,6 +3431,7 @@ class OpenAIServer(_VideoRoutesMixin):
                 logger.error(traceback.format_exc())
                 raise
 
+        input_started = _start_input_processing()
         try:
             ensure_request_chat_template_allowed(
                 request, self.allow_request_chat_template)
@@ -3520,6 +3517,9 @@ class OpenAIServer(_VideoRoutesMixin):
                 request, raw_request)
 
             # Generate
+            _record_input_processing("total", input_started)
+            input_started = None
+
             promise = self.generator.generate_async(
                 inputs=harmony_tokens,
                 sampling_params=sampling_params,
@@ -3558,6 +3558,8 @@ class OpenAIServer(_VideoRoutesMixin):
             logger.debug("Error details: %s", traceback.format_exc())
             return self.create_error_response(message=str(e),
                                               err_type="internal_error")
+        finally:
+            _record_input_processing("total", input_started)
 
     def _responses_prompt_tokens_excluded_from_usage(
             self, request: ResponsesRequest) -> int:
@@ -3640,6 +3642,7 @@ class OpenAIServer(_VideoRoutesMixin):
                     yield pp_res
             await self._extract_metrics(res, raw_request)
 
+        input_started = _start_input_processing()
         try:
             if request.background:
                 logger.warning(
@@ -3771,6 +3774,9 @@ class OpenAIServer(_VideoRoutesMixin):
                 request.disaggregated_params)
             conversation_params = to_llm_conversation_params(
                 request.conversation_params)
+            _record_input_processing("total", input_started)
+            input_started = None
+
             promise = self.generator.generate_async(
                 inputs=input_tokens,
                 sampling_params=sampling_params,
@@ -3823,6 +3829,9 @@ class OpenAIServer(_VideoRoutesMixin):
         except Exception as e:
             logger.error(traceback.format_exc())
             return self.create_error_response(str(e))
+
+        finally:
+            _record_input_processing("total", input_started)
 
         return JSONResponse(content={"detail": "None"})
 
