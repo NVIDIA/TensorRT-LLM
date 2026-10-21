@@ -37,7 +37,7 @@ To implement a custom KV connector, you need to implement both the scheduler and
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Set, Tuple, TypeVar
+from typing import TYPE_CHECKING, Callable, Dict, Iterable, List, Optional, Set, Tuple, TypeVar
 
 import torch
 
@@ -60,6 +60,9 @@ if TYPE_CHECKING:
 
 
 _SchedulerResult = TypeVar("_SchedulerResult")
+
+#: See `KvCacheConnectorWorker.get_allocation_fence`.
+AllocationFence = Callable[[Iterable[int]], None]
 
 
 # Used to store data for a single inflight request.
@@ -181,6 +184,7 @@ class KvCacheConnectorWorker(ABC):
     def __init__(self, llm_args: TorchLlmArgs):
         self._llm_args = llm_args
         self._metadata = None
+        self._allocation_fence: Optional[AllocationFence] = None
         super().__init__()
 
     def __init_subclass__(cls, **kwargs):
@@ -214,6 +218,20 @@ class KvCacheConnectorWorker(ABC):
 
     def _clear_connector_meta(self):
         self._metadata = None
+
+    def bind_allocation_fence(self, fence: Optional[AllocationFence]):
+        self._allocation_fence = fence
+
+    def get_allocation_fence(self) -> Optional[AllocationFence]:
+        """A callable that blocks until the named requests' pages are free of earlier GPU work.
+
+        A writer no CUDA stream orders, such as the NIC, must call it with the
+        requests it is about to write into first.
+
+        Returns:
+            The fence, or None when the KV cache manager offers none.
+        """
+        return self._allocation_fence
 
     def register_forward_pass_callable(self) -> Callable:
         """
@@ -779,6 +797,7 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         self.finished_async_loading_requests = dict()
 
         self._scheduler_output = None
+        self._allocation_fence: Optional[AllocationFence] = None
         self.scheduler_output_manager = KvCacheConnectorSchedulerOutputManager(
             enable_attention_dp=enable_attention_dp
         )
@@ -1318,6 +1337,9 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         self._scheduler_output = self.scheduler_output_manager.build_scheduler_output(
             scheduled_batch, async_requests, kv_cache_manager
         )
+        # Every page of this batch is allocated by now; see
+        # `KvCacheConnectorWorker.get_allocation_fence`.
+        self._allocation_fence = getattr(kv_cache_manager, "wait_allocation_fences", None)
         self._scheduler_output.prefix_loads = [
             load
             for reservation_id, load in self._prefix_loads.items()
@@ -1378,6 +1400,8 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         self._bound_scheduler_output = self._scheduler_output
         self._scheduler_output = None
 
+        self.worker.bind_allocation_fence(self._allocation_fence)
+        self._allocation_fence = None
         self.worker.bind_connector_meta(metadata)
 
     def request_finished(

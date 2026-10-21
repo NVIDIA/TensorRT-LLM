@@ -747,7 +747,12 @@ class TestTritonPrefillWithPrefix:
         torch.testing.assert_close(output, ref, atol=1e-2, rtol=1e-2)
 
 
-def test_paged_cache_tile_cast() -> None:
+@pytest.mark.parametrize("kv_scale_value", [None, 0.25, 2.0])
+@pytest.mark.parametrize("fp8_output", [False, True])
+@pytest.mark.parametrize("head_dim", [256, 512])
+def test_paged_cache_tile_cast(
+    kv_scale_value: float | None, fp8_output: bool, head_dim: int
+) -> None:
     """FP8 prefix attention must not allocate a BF16 copy of the KV pool."""
     if not torch.cuda.is_available():
         pytest.skip("This test requires CUDA")
@@ -757,7 +762,7 @@ def test_paged_cache_tile_cast() -> None:
     torch.manual_seed(42)
     device = "cuda"
     page_size, num_pages, num_heads, num_kv_heads = 16, 128, 4, 2
-    compute_dtype, head_dim = torch.bfloat16, 512
+    compute_dtype = torch.bfloat16
     extend_lens = [7, 19, 5]
     prefix_lens = [47, 17, 0]
     # Noncontiguous physical pages, a shared page, and a partial last page.
@@ -774,7 +779,13 @@ def test_paged_cache_tile_cast() -> None:
     q = torch.randn(sum(extend_lens), num_heads, head_dim, device=device, dtype=compute_dtype)
     k = torch.randn(sum(extend_lens), num_kv_heads, head_dim, device=device, dtype=compute_dtype)
     v = torch.randn_like(k)
-    output = torch.empty_like(q)
+    output = torch.empty_like(q, dtype=torch.float8_e4m3fn if fp8_output else compute_dtype)
+    kv_scale = (
+        torch.tensor([kv_scale_value], dtype=torch.float32, device=device)
+        if kv_scale_value is not None
+        else None
+    )
+    out_scale = torch.tensor([8.0], dtype=torch.float32, device=device) if fp8_output else None
     masks = [
         torch.ones(ext, pre + ext, dtype=torch.bool, device=device)
         for ext, pre in zip(extend_lens, prefix_lens)
@@ -794,6 +805,8 @@ def test_paged_cache_tile_cast() -> None:
         page_size=page_size,
         custom_mask=_flatten_masks(masks),
         sm_scale=head_dim**-0.5,
+        kv_scale_quant_orig=kv_scale,
+        out_scale=out_scale,
     )
     triton_prefill_with_custom_mask(**kwargs)  # Compile before measuring.
     torch.cuda.synchronize()
@@ -808,7 +821,10 @@ def test_paged_cache_tile_cast() -> None:
     # Reference uses the quantized cache values, not the pre-quantization input.
     prefix_k, prefix_v = [], []
     for ids, length in zip([page_ids[:3], page_ids[3:], []], prefix_lens):
-        pages = cache[ids].to(compute_dtype)
+        pages = cache[ids].float()
+        if kv_scale_value is not None:
+            pages *= kv_scale_value
+        pages = pages.to(compute_dtype)
         prefix_k.append(
             pages[:, 0].permute(0, 2, 1, 3).reshape(-1, num_kv_heads, head_dim)[:length]
         )
@@ -826,7 +842,37 @@ def test_paged_cache_tile_cast() -> None:
         mask=masks,
         sm_scale=head_dim**-0.5,
     )
-    torch.testing.assert_close(output, ref, atol=1e-2, rtol=1e-2)
+    if fp8_output:
+        # Compare in compute units so the absolute tolerance is independent of out_scale.
+        torch.testing.assert_close(output.float() / out_scale, ref.float(), atol=1e-2, rtol=8e-2)
+    else:
+        torch.testing.assert_close(output, ref, atol=1e-2, rtol=1e-2)
+
+
+def test_fp8_output_saturates() -> None:
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() < (8, 9):
+        pytest.skip("FP8 output requires SM89 or newer")
+    q = torch.ones((3, 2, 64), dtype=torch.bfloat16, device="cuda")
+    k = torch.ones((3, 1, 64), dtype=torch.bfloat16, device="cuda")
+    v = torch.full_like(k, 300.0)
+    v[:, :, 32:] = -300.0
+    output = torch.empty_like(q, dtype=torch.float8_e4m3fn)
+    triton_prefill_with_custom_mask(
+        q=q,
+        k=k,
+        v=v,
+        output=output,
+        qo_indptr=torch.tensor([0, 3], dtype=torch.int32, device="cuda"),
+        kv_cache=None,
+        prefix_lens=torch.zeros(1, dtype=torch.int32, device="cuda"),
+        page_table_indptr=torch.zeros(2, dtype=torch.int32, device="cuda"),
+        page_table_indices=torch.empty(0, dtype=torch.int32, device="cuda"),
+        page_size=16,
+        custom_mask=torch.ones(9, dtype=torch.bool, device="cuda"),
+        sm_scale=0.125,
+        out_scale=torch.tensor([2.0], dtype=torch.float32, device="cuda"),
+    )
+    torch.testing.assert_close(output.float(), v.expand_as(q).float().sign() * 448)
 
 
 if __name__ == "__main__":

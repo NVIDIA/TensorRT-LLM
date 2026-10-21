@@ -43,6 +43,8 @@ l0_b200:
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_unfused_index_projection_tp_construction
   - unittest/_torch/models/test_minimax_m3.py::test_horizontal_producer_explicit_caches_match_manager
   - unittest/_torch/models/test_minimax_m3.py::test_nvfp4_reload_preserves_attention_scale_storage[cuda]
+  - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_gate_stays_fp32_when_tf32_is_allowed
+  - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_gate_bf16_split_matches_fp32_router
   - unittest/others/test_kv_cache_transceiver.py::test_cpp_nixl_sync_transfer_stress
   - unittest/others/test_lora_manager.py
   - accuracy/test_llm_api_pytorch.py::TestLagunaXS::test_nvfp4
@@ -280,6 +282,7 @@ l0_b200:
   - unittest/_torch/modeling/test_modeling_gemma4.py
   - unittest/_torch/modeling/test_modeling_gemma4_unified.py
   - unittest/_torch/modeling/test_gemma4_multimodal.py
+  - unittest/_torch/modeling/test_gemma4_assistant.py
   - unittest/_torch/modeling/test_gemma4_e2e_dummy.py::test_e2e_text_26b_dummy
   - unittest/_torch/modeling/test_gemma4_e2e_dummy.py::test_e2e_text_e2b_dummy
   - unittest/_torch/modeling/test_gemma4_e2e_dummy.py::test_e2e_text_e2b_dummy_small_max_seq_len[256]
@@ -527,6 +530,8 @@ l0_b200:
   - examples/visual_gen/test_visual_gen_glm.py::test_glm_image_lpips_against_golden
   - examples/visual_gen/test_visual_gen_flux.py::test_flux_accuracy_against_golden[flux1-fp8-blockwise]
   - examples/visual_gen/test_visual_gen_flux.py::test_flux_accuracy_against_golden[flux1-nvfp4]
+  - examples/visual_gen/test_visual_gen_flux.py::test_flux_accuracy_against_golden[flux1-nvfp4-static]
+  - examples/visual_gen/test_visual_gen_flux.py::test_flux_accuracy_against_golden[flux1-nvfp4-static-mha-quantize]
   - examples/visual_gen/test_visual_gen_flux.py::test_flux_accuracy_against_golden[flux1-cuda-graph]
   - examples/visual_gen/test_visual_gen_flux.py::test_flux_accuracy_against_golden[flux2-fp8-blockwise]
   - examples/visual_gen/test_visual_gen_flux.py::test_flux_accuracy_against_golden[flux2-nvfp4]

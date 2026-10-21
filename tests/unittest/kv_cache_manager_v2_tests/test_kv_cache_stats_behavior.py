@@ -319,6 +319,7 @@ def test_v2_resume_restores_offsets_only_after_execution_stream_ready(
     manager = object.__new__(KVCacheManagerV2)
     execution_stream = object()
     manager._stream = SimpleNamespace(cuda_stream=execution_stream)
+    manager._on_allocation_stream = set()
     calls: list[str] = []
 
     def resume(actual_stream: object) -> bool:
