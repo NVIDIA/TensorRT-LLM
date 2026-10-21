@@ -42,11 +42,14 @@ from .dflash_accept import (
     FORCE_FIXED,
     FORCE_FRACTIONAL,
     FORCE_NONE,
-    MAX_REQUESTS,
+    LOOP_REQUESTS,
     SLOT_STRIDE,
     dflash_accept,
 )
 
+#: The requests one launch takes: its single program loops over them, as
+#: ``dflash_accept``'s per-request loop does up to ``LOOP_REQUESTS``.
+MAX_REQUESTS = LOOP_REQUESTS
 #: Elements of ``_seq_lens_cuda`` copied per loop iteration.
 SEQ_BLOCK = 128
 

@@ -34,6 +34,12 @@ attention geometry is one the op takes (it calls the op directly; selected for
 a drafter outside that path, the install raises); a step outside that path
 runs the built-in forward (with the windowed attention).
 
+``wide_drafter_window_attention`` (tep4 on sm_103 only) binds a ``WideWindowAttention``
+to the drafter (``kernels/wide_drafter_window_attention``); a block decode of the
+rows it takes calls it (``ops/spec/dflash_window_attention_wide``, the same
+attention and append on a multi-request split geometry) instead of
+``dflash_window_attention``.
+
 The fast paths compose. ``windowed_block_decode``, like the built-in forward,
 reaches the block convolutions through the modules' ``prepare`` / ``finish``,
 which call ``_convolve``; with ``drafter_block_conv`` installed that is the fused convolution
@@ -313,6 +319,10 @@ def windowed_block_decode(
     prenormed = None
     # PDL chain merge trigger (drafter_pdl_chain/chain.py): the merge releases o_proj's GEMM at its entry.
     merge_entry = bool(self.__dict__.get("_pdl_merge")) and B * block_size == _ENTRY_ROWS
+    # wide_drafter_window_attention: a block decode of several requests on the wide op.
+    wide = self.__dict__.get("_wide_window_attention")
+    if wide is not None and not wide.takes(B * block_size):
+        wide = None
     for layer_idx, layer in enumerate(layers):
         attn_mod = layer.self_attn
 
@@ -345,19 +355,32 @@ def windowed_block_decode(
         v_new = qkv_query[:, q_size + kv_size :].reshape(-1, num_kv_heads_per_rank, head_dim)
 
         _, window_size = self._resolve_block_attention(layer_idx)
-        out = dflash_window_attention(
-            q_bshd,
-            ctx_k_cache[:, layer_idx],
-            ctx_v_cache[:, layer_idx],
-            seq_lens_after,
-            cache_batch_idx_i32,
-            window_size,
-            None,
-            enable_pdl,
-            k_new,
-            v_new,
-            merge_entry,
-        )
+        if wide is not None:
+            out = wide(
+                q_bshd,
+                ctx_k_cache[:, layer_idx],
+                ctx_v_cache[:, layer_idx],
+                seq_lens_after,
+                cache_batch_idx_i32,
+                window_size,
+                enable_pdl,
+                k_new,
+                v_new,
+            )
+        else:
+            out = dflash_window_attention(
+                q_bshd,
+                ctx_k_cache[:, layer_idx],
+                ctx_v_cache[:, layer_idx],
+                seq_lens_after,
+                cache_batch_idx_i32,
+                window_size,
+                None,
+                enable_pdl,
+                k_new,
+                v_new,
+                merge_entry,
+            )
         attn_output = out.reshape(B * block_size, q_size)
 
         res_flat = residual.reshape(-1, residual.shape[-1])

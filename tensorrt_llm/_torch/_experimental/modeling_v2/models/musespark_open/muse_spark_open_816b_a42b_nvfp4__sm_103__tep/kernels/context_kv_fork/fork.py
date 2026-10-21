@@ -46,6 +46,16 @@ the fold kernel (its last read of the context lengths), the noise block, the
 join -- and every other step reaches this class's prepare unchanged.
 No stream priority is set: the side stream is a default-priority stream of
 its own (``dedicated_stream``), never one of PyTorch's pooled streams.
+
+Over the windowed drafter context arena (``TRTLLM_DFLASH_WINDOWED_CTX_ARENA=1``,
+composed with ``drafter_window_compact``) a slot's physical column 0 holds its
+logical token ``_ctx_base[slot]``, and the built-in stores row ``r`` at column
+``min(_ctx_len - _ctx_base + r, capacity - 1)``, then compacts the slot's
+window (``_compact_ctx_window``) and hands the drafter ``_ctx_len - _ctx_base``.
+The side chain and the commit address those columns (``arena_columns``), and
+the prepare runs the compaction and that read on the main stream after the
+join: the compaction moves the columns the side chain wrote, so it must follow
+them, and nothing else in the step writes ``_ctx_base`` before it.
 """
 
 from __future__ import annotations
@@ -111,6 +121,36 @@ def dedicated_stream() -> torch.cuda.ExternalStream:
     CUASSERT(_cudart.cudaSetDevice(device))
     (handle,) = CUASSERT(_cudart.cudaStreamCreateWithFlags(_cudart.cudaStreamNonBlocking))
     return torch.cuda.ExternalStream(int(handle), device=torch.device("cuda", device))
+
+
+def arena_columns(worker) -> tuple[Optional[torch.Tensor], int]:
+    """``(ctx_base, last column)`` of the built-in store of this worker's arena.
+
+    The built-in stores row ``r`` of a slot at column ``ctx_len + r`` (dense
+    arena: ``ctx_base`` None) or ``ctx_len - ctx_base + r`` (windowed arena),
+    clamped to the window's last column when it keeps a window and to ``max_ctx
+    - 1`` otherwise.
+    """
+    if worker._ctx_base is None:
+        return None, worker._max_ctx - 1
+    if worker._ctx_keep:
+        return worker._ctx_base, worker._ctx_k_buf.size(2) - 1
+    return worker._ctx_base, worker._max_ctx - 1
+
+
+def drafter_lengths(worker, slots: torch.Tensor, new_lengths: torch.Tensor) -> torch.Tensor:
+    """The built-in prepare's end once this step's rows are stored: ``num_ctx_per_req``.
+
+    ``new_lengths`` are ``_ctx_len[slots]`` after the update, which is what the
+    drafter reads over the dense arena. Over the windowed arena the built-in
+    compacts the slots' windows first (``_compact_ctx_window``) and reads the
+    physical lengths ``_ctx_len[slots] - _ctx_base[slots]``.
+    """
+    if worker._ctx_base is None:
+        return new_lengths
+    if worker._ctx_keep and not worker._ctx_paged:
+        worker._compact_ctx_window(slots)
+    return worker._ctx_len[slots] - worker._ctx_base[slots]
 
 
 # --------------------------------------------------------------------------
@@ -229,18 +269,33 @@ class ContextKvFork:
                 "capture state than the one committing it"
             )
         num_ctx = torch.empty(launched.num_gens, dtype=torch.int64, device=worker._ctx_len.device)
+        base, last = arena_columns(worker)
         self.stream.wait_stream(main)
         with torch.cuda.stream(self.stream):
-            context_kv_commit(
-                worker._ctx_k_buf,
-                worker._ctx_v_buf,
-                worker._ctx_len,
-                slots,
-                num_accepted,
-                num_ctx,
-                launched.k + 1,
-                worker._max_ctx,
-            )
+            if base is None:
+                context_kv_commit(
+                    worker._ctx_k_buf,
+                    worker._ctx_v_buf,
+                    worker._ctx_len,
+                    slots,
+                    num_accepted,
+                    num_ctx,
+                    launched.k + 1,
+                    worker._max_ctx,
+                )
+            else:
+                context_kv_commit(
+                    worker._ctx_k_buf,
+                    worker._ctx_v_buf,
+                    worker._ctx_len,
+                    slots,
+                    num_accepted,
+                    num_ctx,
+                    launched.k + 1,
+                    worker._max_ctx,
+                    base,
+                    last,
+                )
         return num_ctx
 
     def settle(self) -> None:
@@ -261,7 +316,7 @@ class ContextKvFork:
         """``(generation requests, K)`` when the side chain reproduces this step's store, else None.
 
         Host-side reads only (per-capture constants under a CUDA graph): the
-        dense arena is allocated, the step has no context rows and at most
+        dense arena (full-length or windowed) is allocated, the step has no context rows and at most
         ``MAX_REQUESTS`` requests of ``K + 1`` target rows each, the target
         features were captured and the drafter has ``fc`` + ``hidden_norm``
         (the built-in's ``has_target_features``).
@@ -306,7 +361,12 @@ class ContextKvFork:
         ctx_len = worker._ctx_len[slots]
         offsets = torch.arange(k + 1, dtype=torch.long, device="cuda")
         positions = ctx_len.unsqueeze(1) + offsets.unsqueeze(0)
-        col = positions.clamp(max=worker._max_ctx - 1)
+        base, last = arena_columns(worker)
+        if base is None:
+            col = positions.clamp(max=last)
+        else:
+            # Windowed arena: physical columns.
+            col = ((ctx_len - base[slots]).unsqueeze(1) + offsets.unsqueeze(0)).clamp(max=last)
         # The built-in's get_hidden_states(num_tokens)[0 : rows]: the same view.
         gen_hs = spec_metadata.captured_hidden_states[
             :rows, : spec_metadata.hidden_size * spec_metadata.num_capture_layers
@@ -347,12 +407,16 @@ class ContextKvForkDFlashWorker(DFlashWorker):
     def _lazy_init_ctx_buffers(
         self, draft_model, spec_metadata, attn_metadata, draft_kv_cache_manager=None
     ):
-        before = (self._ctx_k_buf, self._ctx_v_buf, self._ctx_len, self._batch_to_slot)
+        before = (
+            self._ctx_k_buf, self._ctx_v_buf, self._ctx_len, self._ctx_base, self._batch_to_slot
+        )  # fmt: skip
         super()._lazy_init_ctx_buffers(
             draft_model, spec_metadata, attn_metadata, draft_kv_cache_manager
         )
         fork: Optional[ContextKvFork] = self.__dict__.get("_kv_fork")
-        after = (self._ctx_k_buf, self._ctx_v_buf, self._ctx_len, self._batch_to_slot)
+        after = (
+            self._ctx_k_buf, self._ctx_v_buf, self._ctx_len, self._ctx_base, self._batch_to_slot
+        )  # fmt: skip
         if fork is not None and fork.launched and any(a is not b for a, b in zip(before, after)):
             raise RuntimeError(
                 "[musespark_open] context_kv_fork: the DFlash context arena was rebuilt while a forked "
@@ -410,11 +474,12 @@ class ContextKvForkDFlashWorker(DFlashWorker):
 
         Written out from the built-in ``DFlashWorker.prepare_1st_drafter_inputs``
         for its one path here -- no context rows, captured target features, the
-        dense arena -- with the store moved to the side chain: the bonus token
-        and the query positions as the built-in computes them, then the commit
-        (zeroing, lengths and the new lengths the drafter reads) launched on the
-        side stream, the bonus-token embedding on the main stream meanwhile,
-        and the join.
+        dense arena (full-length or windowed) -- with the store moved to the side
+        chain: the bonus token and the query positions as the built-in computes
+        them, then the commit (zeroing, lengths and the new lengths the drafter
+        reads) launched on the side stream, the bonus-token embedding on the main
+        stream meanwhile, and the join; over a windowed arena then the built-in's
+        window compaction and its read of the physical lengths (``drafter_lengths``).
         """
         num_gens = launched.num_gens
         if (
@@ -471,6 +536,7 @@ class ContextKvForkDFlashWorker(DFlashWorker):
         noise_embed_2d[:, 0, :] = embed_bonus
 
         fork.join(launched)
+        num_ctx_per_req_t = drafter_lengths(self, slots, num_ctx_per_req_t)
 
         # The dense arena (plan()) has no block table: the built-in's
         # allocation clamp of the advertised length does not apply.

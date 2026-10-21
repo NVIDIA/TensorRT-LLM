@@ -23,10 +23,20 @@ def adopt_drafter(shell, plan: "_dispatch.Plan") -> None:
         from .kernels.drafter_block_decode import block_decode as _draft
 
         _draft.install(shell.llm.draft_model, block_conv, block_decode)
+    if plan.enabled("wide_drafter_window_attention"):
+        # On the block decode drafter_block_decode just bound.
+        from .kernels.wide_drafter_window_attention import attention as _wide_window
+
+        _wide_window.install(shell.llm.draft_model)
     if plan.enabled("draft_head"):
         from .kernels.draft_head import head as _draft_head
 
         _draft_head.install(shell.llm)
+    if plan.enabled("wide_draft_topk"):
+        # On the key all-reduce draft_head just attached.
+        from .kernels.wide_draft_topk import exchange as _wide_topk
+
+        _wide_topk.install(shell.llm)
     fc_shard = plan.enabled("drafter_fc_shard")
     fused_accept = plan.enabled("fused_accept")
     fixed_gemms = plan.enabled("drafter_fixed_gemms")
@@ -71,3 +81,11 @@ def adopt_drafter(shell, plan: "_dispatch.Plan") -> None:
         from .kernels.split_sampler import target_head as _target_head
 
         _target_head.install(shell.llm, shell._mapping, plan.enabled("lm_head_inbox"))
+        if plan.enabled("wide_split_sampler"):
+            _target_head.widen(shell.llm)
+    # Last: the arena compaction derives its worker class from whatever class every
+    # other draft and head fast path left the worker with.
+    if plan.enabled("drafter_window_compact"):
+        from .kernels.drafter_window_compact import compact as _window_compact
+
+        _window_compact.install(getattr(shell.llm, "spec_worker", None))

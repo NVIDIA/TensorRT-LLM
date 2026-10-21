@@ -23,10 +23,14 @@ derived from ``TargetHeadDFlashWorker`` and its current class. Both share one
 ``TargetHead``, which holds the step's pending BF16 row between the two:
 
 * the processor produces the row on decode steps (no context rows) of at most
-  ``head_sampler.MAX_ROWS`` (128) rows when no guided decoder is attached --
-  facts every rank shares, so every rank takes the same path for the same
-  call; only steps of exactly 8 rows use the ``lm_head_inbox`` gather, the
-  others the built-in all-gather;
+  ``TargetHead.max_rows`` rows -- ``head_sampler.MAX_ROWS`` (128), or
+  ``head_sampler.WIDE_MAX_ROWS`` (1024) once ``wide_split_sampler`` widened the
+  head (``widen``; the scratch above 128 rows is allocated at the first such
+  step outside a CUDA graph capture, and a capture that comes first keeps the
+  built-in path) -- when no guided decoder is attached -- facts every rank
+  shares, so every rank takes the same path for the same call; only steps of
+  exactly 8 rows use the ``lm_head_inbox`` gather, the others the built-in
+  all-gather;
 * the worker's ``_sample_tokens_for_batch`` samples it on non-greedy batches
   with the fused sampling mode; every other consumer first **materializes**
   the built-in FP32 capped logits from it with the built-in torch chain --
@@ -210,13 +214,16 @@ class TargetHead:
         else:
             self.workspace = None
             self.library = _hs.load_library_agreed(mapping)
-        # Kernel A's states for ``split_sample`` at any row count it takes (the inbox
-        # path uses the workspace's own, sized to its slot).
-        self.states = _hs.new_states(_hs.MAX_ROWS, self.device)
+        # Kernel A's states for ``split_sample`` at up to MAX_ROWS rows (the inbox path
+        # uses the workspace's own, sized to its slot), and above MAX_ROWS once widened.
+        self.max_rows = _hs.MAX_ROWS
+        self.states = _hs.new_states(self.max_rows, self.device)
+        self.wide_states: Optional[torch.Tensor] = None
         self.load_seconds = time.perf_counter() - start
         self.pending: Optional[torch.Tensor] = None
         self.pending_inbox = False
         self._bypass_logged = False
+        self._wide_capture_logged = False
         self.hook_handle = None
 
     def takes(
@@ -229,9 +236,11 @@ class TargetHead:
             and attn_metadata.num_contexts == 0
             and hidden_states.dim() == 2
             and hidden_states.dtype == torch.bfloat16
-            and 1 <= hidden_states.shape[0] <= _hs.MAX_ROWS
+            and 1 <= hidden_states.shape[0] <= self.max_rows
         )
         if not step:
+            return False
+        if hidden_states.shape[0] > _hs.MAX_ROWS and not self._has_wide_states():
             return False
         if getattr(self.worker, "guided_decoder", None) is not None:
             if not self._bypass_logged:
@@ -241,6 +250,35 @@ class TargetHead:
                     "fast paths are bypassed (built-in LM head, gather, soft cap and sampler)"
                 )
             return False
+        return True
+
+    def _has_wide_states(self) -> bool:
+        """Whether the scratch above ``MAX_ROWS`` rows exists, allocating it outside a capture.
+
+        Allocated once, at the first call above ``MAX_ROWS`` rows, so a deployment
+        that never reaches one allocates nothing; the CUDA-graph runner's eager
+        warmup of a batch size precedes its capture. Inside a capture it is not
+        allocated (it would live in that graph's pool): the call keeps the
+        built-in path, and the first such call logs a warning, since that graph
+        then runs the built-in processor chain and sampler on every replay.
+        Every rank makes the same calls, so every rank agrees.
+        """
+        if self.wide_states is not None:
+            return True
+        if torch.cuda.is_current_stream_capturing():
+            if not self._wide_capture_logged:
+                self._wide_capture_logged = True
+                logger.warning(
+                    "[musespark_open] wide_split_sampler: a CUDA graph of more than "
+                    f"{_hs.MAX_ROWS} rows was captured before any eager step of that size; "
+                    "it keeps the built-in head and sampler"
+                )
+            return False
+        self.wide_states = _hs.new_states(_hs.WIDE_MAX_ROWS, self.device)
+        logger.info(
+            f"[musespark_open] wide_split_sampler: {self.wide_states.numel() * 4 / 2**20:.1f} MiB "
+            f"of state scratch for decode steps of {_hs.MAX_ROWS + 1}..{_hs.WIDE_MAX_ROWS} rows"
+        )
         return True
 
     def produce(self, hidden_states: torch.Tensor, lm_head: Linear) -> torch.Tensor:
@@ -342,7 +380,7 @@ class TargetHead:
             offset,
             self.multiplier,
             self.soft_cap,
-            self.states,
+            self.states if logits.shape[0] <= _hs.MAX_ROWS else self.wide_states,
             self.pdl,
         )
 
@@ -573,6 +611,36 @@ def installed(llm) -> bool:
     return isinstance(
         getattr(llm, "logits_processor", None), SplitSamplerLogitsProcessor
     ) and isinstance(getattr(llm, "spec_worker", None), TargetHeadDFlashWorker)
+
+
+def widen(llm) -> bool:
+    """``wide_split_sampler``: let the installed head take decode steps of up to ``WIDE_MAX_ROWS`` rows.
+
+    The split sampler reproduces the shipped sampler's 512-thread block above 128
+    rows bit for bit (``head_sampler``), so steps of 129..1024 rows (17 to 128
+    requests at K = 7) keep their BF16 row and the split sampler instead of the
+    built-in processor chain and sampler. Idempotent; returns whether this call
+    changed the head. Call after ``install``.
+
+    Raises:
+        ValueError: when the head fast path is not installed on this model.
+    """
+    if not installed(llm):
+        raise ValueError(
+            "[musespark_open] wide_split_sampler cannot run here: the split_sampler head is not installed"
+        )
+    head = llm.logits_processor._split_head
+    if head.max_rows == _hs.WIDE_MAX_ROWS:
+        return False
+    if head.pending is not None:
+        raise RuntimeError("[musespark_open] wide_split_sampler: a head row is pending")
+    head.max_rows = _hs.WIDE_MAX_ROWS
+    logger.info(
+        f"[musespark_open] wide_split_sampler: the split sampler takes decode steps of up to "
+        f"{head.max_rows} rows (the shipped 512-thread block above {_hs.MAX_ROWS}); its state "
+        "scratch is allocated at the first such step"
+    )
+    return True
 
 
 def install(llm, mapping, gather: bool) -> None:

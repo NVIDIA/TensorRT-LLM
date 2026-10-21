@@ -10,7 +10,10 @@ sum, an add, the accepted-token copy -- and its forced-acceptance override
 (``_apply_force_accepted_tokens``) adds a counter bump, an ``arange``, two
 multiplies, an add, a mask, a pool gather, a compare, a cast, an add, a clamp
 and two copies: about twenty launches of one to five microseconds for a
-handful of integers. This entry does all of it in one single-program kernel.
+handful of integers. This entry does all of it in one single-program kernel: for up to
+``LOOP_REQUESTS`` requests a loop over the requests, above that (the decode
+steps of a generation worker of ``max_batch_size`` up to ``MAX_REQUESTS``) the
+same arithmetic on one ``[requests, K + 1]`` tile.
 
 Everything it computes is integer arithmetic plus one fp32 comparison of a
 pool value against the fractional rate, so its outputs are bitwise the
@@ -35,9 +38,12 @@ FORCE_NONE, FORCE_FIXED, FORCE_FRACTIONAL = 0, 1, 2
 #: read off the pool, which must be a power of two.
 COUNTER_STRIDE, SLOT_STRIDE = 6007, 1009
 
-#: Above this many requests the single-program loop stops being cheaper than
-#: the built-in vectorized chain; callers send larger batches to the built-in.
-MAX_REQUESTS = 64
+#: Requests the single-program loop serves; above this the loop stops being
+#: cheaper than the built-in vectorized chain, and the tile kernel takes over.
+LOOP_REQUESTS = 64
+#: Requests one call takes (the tile kernel's request block); callers send larger
+#: batches to the built-in.
+MAX_REQUESTS = 128
 
 
 @triton.jit
@@ -92,6 +98,71 @@ def _dflash_accept_kernel(
             draw = tl.load(pool_ptr + index)
             accepted = tl.minimum(base_total + (draw < frac).to(tl.int32), max_total)
         tl.store(num_accepted_ptr + b, accepted.to(tl.int32))
+
+
+@triton.jit
+def _dflash_accept_tile_kernel(
+    target_ptr,
+    draft_ptr,
+    draft_row_stride,
+    accepted_ptr,
+    num_accepted_ptr,
+    pool_ptr,
+    counter_ptr,
+    num_contexts,
+    num_gens,
+    base_total,
+    max_total,
+    frac,
+    K: tl.constexpr,
+    BLOCK: tl.constexpr,
+    GENS: tl.constexpr,
+    FORCE: tl.constexpr,
+    COUNTER_STRIDE: tl.constexpr,
+    SLOT_STRIDE: tl.constexpr,
+    POOL_MASK: tl.constexpr,
+):
+    """``_dflash_accept_kernel`` with the generation requests as one tile's rows."""
+    cols = tl.arange(0, BLOCK)
+    gens = tl.arange(0, GENS)
+    row_width = K + 1
+    for b in range(num_contexts):
+        token = tl.load(target_ptr + b)
+        tl.store(accepted_ptr + b * row_width, token.to(tl.int32))
+        tl.store(num_accepted_ptr + b, 1)
+    in_gen = gens < num_gens
+    in_row = cols < row_width
+    tokens = tl.load(
+        target_ptr + num_contexts + gens[:, None] * row_width + cols[None, :],
+        mask=in_gen[:, None] & in_row[None, :],
+        other=0,
+    )
+    tl.store(
+        accepted_ptr + (num_contexts + gens[:, None]) * row_width + cols[None, :],
+        tokens.to(tl.int32),
+        mask=in_gen[:, None] & in_row[None, :],
+    )
+    if FORCE == 0:
+        drafts = tl.load(
+            draft_ptr + gens[:, None] * draft_row_stride + cols[None, :],
+            mask=in_gen[:, None] & (cols < K)[None, :],
+            other=0,
+        )
+        mismatch = (cols < K)[None, :] & (drafts.to(tl.int64) != tokens.to(tl.int64))
+        # Leading matches = index of the first mismatch, or K.
+        accepted = tl.min(tl.where(mismatch, cols[None, :], K), axis=1) + 1
+    elif FORCE == 1:
+        accepted = tl.zeros([GENS], dtype=tl.int32) + base_total
+    else:
+        # One bump per call, before any request reads it. The program has several warps:
+        # every warp reads the counter before any warp writes it back.
+        counter = tl.load(counter_ptr).to(tl.int64) + 1
+        tl.debug_barrier()
+        tl.store(counter_ptr, counter)
+        index = (counter * COUNTER_STRIDE + gens.to(tl.int64) * SLOT_STRIDE) & POOL_MASK
+        draw = tl.load(pool_ptr + index, mask=in_gen, other=1.0)
+        accepted = tl.minimum(base_total + (draw < frac).to(tl.int32), max_total)
+    tl.store(num_accepted_ptr + num_contexts + gens, accepted.to(tl.int32), mask=in_gen)
 
 
 class DflashAccept(OpWrapper):
@@ -149,12 +220,34 @@ class DflashAccept(OpWrapper):
             why="int64 target tokens (the greedy argmax path)",
             spec=dict(contexts=0, gens=2, k=7, force=FORCE_NONE, rate=0.0, int64=True),
         ),
+        Cell(
+            why="64 requests: the loop kernel's largest batch, forced 3.05",
+            spec=dict(contexts=0, gens=64, k=7, force=FORCE_FRACTIONAL, rate=3.05),
+        ),
+        Cell(
+            why="65 requests: the tile kernel's smallest batch, strict acceptance",
+            spec=dict(contexts=0, gens=65, k=7, force=FORCE_NONE, rate=0.0),
+        ),
+        Cell(
+            why="96 requests on the tile kernel, forced 3.05 (fractional)",
+            spec=dict(contexts=0, gens=96, k=7, force=FORCE_FRACTIONAL, rate=3.05),
+        ),
+        Cell(
+            why="128 requests on the tile kernel, integer override",
+            spec=dict(contexts=0, gens=128, k=7, force=FORCE_FIXED, rate=2.0),
+        ),
+        Cell(
+            why="128 requests on the tile kernel, int64 tokens, strict",
+            spec=dict(contexts=0, gens=128, k=7, force=FORCE_NONE, rate=0.0, int64=True),
+        ),
     )
 
     note = """
-    Metadata consumed: none. One Triton program (grid 1, 1 warp), JIT-compiled
-    per (K, force mode); loops over the requests, so it is for small batches
-    (``MAX_REQUESTS``). Writes ``counter`` in place under ``FORCE_FRACTIONAL``.
+    Metadata consumed: none. One Triton program (grid 1), JIT-compiled per (K,
+    force mode): up to ``LOOP_REQUESTS`` requests a loop over them (1 warp),
+    above that one ``[MAX_REQUESTS, K + 1]`` tile (4 warps; the same integer
+    arithmetic per request). Writes ``counter`` in place under
+    ``FORCE_FRACTIONAL``.
 
     Call site: the DFlash worker's ``_sample_and_accept_draft_tokens_base``
     when the ``fused_accept`` fast path is selected (``spec_worker.py``), after the
@@ -191,6 +284,30 @@ class DflashAccept(OpWrapper):
         if batch == 0:
             return accepted, num_accepted
         fractional = force_mode == FORCE_FRACTIONAL
+        if batch > LOOP_REQUESTS:
+            _dflash_accept_tile_kernel[(1,)](
+                target_tokens,
+                draft_tokens,
+                draft_tokens.stride(0),
+                accepted,
+                num_accepted,
+                pool if fractional else num_accepted,
+                counter if fractional else num_accepted,
+                num_contexts,
+                num_gens,
+                base_total,
+                max_total,
+                frac,
+                K=k,
+                BLOCK=triton.next_power_of_2(k + 1),
+                GENS=MAX_REQUESTS,
+                FORCE=force_mode,
+                COUNTER_STRIDE=COUNTER_STRIDE,
+                SLOT_STRIDE=SLOT_STRIDE,
+                POOL_MASK=(pool.numel() - 1) if fractional else 0,
+                num_warps=4,
+            )
+            return accepted, num_accepted
         _dflash_accept_kernel[(1,)](
             target_tokens,
             draft_tokens,

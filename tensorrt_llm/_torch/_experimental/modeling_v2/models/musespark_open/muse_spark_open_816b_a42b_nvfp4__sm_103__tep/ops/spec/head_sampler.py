@@ -22,6 +22,12 @@ operations, so the states, the row reductions and the tokens are the built-in
 ones bit for bit. A row with a filter runs the shipped kernel body inside
 kernel B, reading the BF16 row through the cap.
 
+Above ``MAX_ROWS`` (128) rows the shipped sampler runs a 512-thread block per row
+instead (``fusedSamplingTokensNarrowKernel``); a call of more rows runs 512
+virtual threads per row the same way (4 CTAs of kernel A per row, a 512-thread
+kernel B), up to ``WIDE_MAX_ROWS`` rows (fast path ``wide_split_sampler`` lets the
+head take them). ``virtual_threads(rows)`` is the shipped block of a call.
+
 ``GatherSplitSample`` (fast path ``lm_head_inbox``) also replaces the gather: each rank's
 LM-head GEMM writes its ``[rows, shard]`` output straight into its slot of a
 multicast inbox (``HeadGatherWorkspace``) whose words hold a sentinel between
@@ -34,16 +40,22 @@ Both ops are CUDA C++ built from ``_head_sampler/`` (copies of the shipped
 ``cpp/tensorrt_llm/kernels/fusedSampling`` headers plus ``head_sampler.cu``)
 with ``torch.utils.cpp_extension`` and without ``--use_fast_math`` -- the
 shipped library's arithmetic -- as one extension per device architecture
-(``library_name``: ``LIBRARY_NAME`` and the arch target) under torch's
-extension build root; ``load_library`` builds it there on first use (torch
-rebuilds it when the source or the flags change, and serializes concurrent
-builds) and loads it. The per-arch name keeps an sm_103a and an sm_107a build
-apart when both share one build root.
+and source version (``library_name``: ``LIBRARY_NAME``, the arch target and
+``source_digest``) under torch's extension build root; ``load_library``
+builds it there on first use (torch serializes concurrent builds) and loads
+it. The per-arch name keeps an sm_103a and an sm_107a build apart when both
+share one build root. The digest of the sources and flags keeps builds of
+different sources apart: torch rebuilds an extension of an unchanged name only
+when ninja finds a source newer than its object, so two source versions
+mounted at the same path under one build root (a cache seeded from another
+run, or two code versions served one after another from one cache) would
+otherwise load whichever build is newest.
 """
 
 from __future__ import annotations
 
 import functools
+import hashlib
 import threading
 from pathlib import Path
 from typing import Optional, Tuple
@@ -74,13 +86,16 @@ LIBRARY_NAME = "musespark_open_head_sampler"
 
 #: Threads of the shipped single-CTA block at up to 128 rows; one virtual thread each.
 VIRTUAL_THREADS = 1024
+#: Threads of the shipped single-CTA block above 128 rows (its 512-thread narrow block).
+NARROW_VIRTUAL_THREADS = 512
 #: 32-bit words of one virtual thread's online-softmax state (max, sum, argmax).
 STATE_WORDS = 3
-#: Rows ``SplitSample`` takes: the shipped sampler's single-CTA block is the
-#: 1024-thread one up to its ``kWideBlockMaxRows`` (128) rows, 16 requests of a
-#: K=7 verify block. Above it the shipped sampler runs a 512-thread block,
-#: which kernel A's virtual threads do not reproduce.
+#: Rows of the shipped sampler's 1024-thread single-CTA block (its
+#: ``kWideBlockMaxRows``), 16 requests of a K=7 verify block; the head's default row cap.
 MAX_ROWS = 128
+#: Most rows ``SplitSample`` takes (128 requests of a K=7 verify block); above
+#: ``MAX_ROWS`` it reproduces the shipped 512-thread block.
+WIDE_MAX_ROWS = 1024
 #: Rows of one rank's slot of the head-gather inbox (``HeadGatherWorkspace``):
 #: one request's last accepted token and 7 drafts.
 INBOX_ROWS = 8
@@ -110,9 +125,20 @@ def arch_target() -> str:
     )
 
 
+@functools.lru_cache(maxsize=None)
+def source_digest() -> str:
+    """12 hex digits of SHA-256 over the library's sources (``SOURCES``) and ``NVCC_FLAGS``."""
+    digest = hashlib.sha256()
+    for name in SOURCES:
+        digest.update(name.encode() + b"\0")
+        digest.update((SOURCE_DIR / name).read_bytes())
+    digest.update("\0".join(NVCC_FLAGS).encode())
+    return digest.hexdigest()[:12]
+
+
 def library_name(target: str) -> str:
-    """The torch extension name of the library built for ``target`` (``arch_target``)."""
-    return f"{LIBRARY_NAME}_sm{target}"
+    """The torch extension name of the library built for ``target`` (``arch_target``) from these sources."""
+    return f"{LIBRARY_NAME}_sm{target}_{source_digest()}"
 
 
 def build(verbose: bool = False) -> str:
@@ -187,12 +213,25 @@ def reference_capped(logits: torch.Tensor, multiplier: float, soft_cap: float) -
     return soft_cap * torch.tanh(x / soft_cap)
 
 
+def virtual_threads(rows: int) -> int:
+    """The shipped sampler's threads per row for a call of ``rows`` rows."""
+    return VIRTUAL_THREADS if rows <= MAX_ROWS else NARROW_VIRTUAL_THREADS
+
+
+def state_words(rows: int) -> int:
+    """32-bit words of kernel A's per-virtual-thread states for a call of ``rows`` rows."""
+    return rows * virtual_threads(rows) * STATE_WORDS
+
+
 def new_states(rows: int, device: torch.device) -> torch.Tensor:
-    """Scratch for kernel A's per-virtual-thread states."""
-    return torch.empty(rows * VIRTUAL_THREADS * STATE_WORDS, dtype=torch.int32, device=device)
+    """Scratch for kernel A's per-virtual-thread states, for every call of at most ``rows`` rows."""
+    words = max(state_words(r) for r in {min(rows, MAX_ROWS), rows})
+    return torch.empty(words, dtype=torch.int32, device=device)
 
 
 def _neutral_or_filtered_rows_ok(vocab: int) -> bool:
+    # The walk stages WALK_VECTORS vectors per 1024-thread virtual thread, twice that per
+    # 512-thread one: the same vocabulary bound.
     return vocab % 4 == 0 and vocab // 4 <= WALK_VECTORS * VIRTUAL_THREADS
 
 
@@ -274,17 +313,38 @@ class SplitSample(OpWrapper):
             why="128 rows with filtered rows on the shipped body, mixed with neutral rows",
             spec=dict(rows=128, kind="n40", temperature=1.0, rng="row", filters="mixed"),
         ),
+        Cell(
+            why="129 rows: the shipped sampler's first 512-thread call",
+            spec=dict(rows=129, kind="n40", temperature=1.0, rng="row"),
+        ),
+        Cell(
+            why="256 rows (32 requests), spiky rows, shared RNG entry",
+            spec=dict(rows=256, kind="spiky", temperature=0.7, rng="shared"),
+        ),
+        Cell(
+            why="256 rows with filtered rows on the shipped 512-thread body",
+            spec=dict(rows=256, kind="n40", temperature=1.0, rng="row", filters="mixed"),
+        ),
+        Cell(
+            why="512 rows (64 requests), flat rows: the crossing thread anywhere",
+            spec=dict(rows=512, kind="flat", temperature=1.0, rng="row"),
+        ),
+        Cell(
+            why="1024 rows (128 requests, a 1P1D generation step), saturated soft cap",
+            spec=dict(rows=1024, kind="sat", temperature=1.0, rng="row"),
+        ),
     )
 
     note = """
-    Metadata consumed: none. Two launches (kernel A grid (rows, 8) x 128
-    threads; kernel B grid rows x 1024 threads), both with programmatic
-    dependent launch when ``pdl``; each waits on its predecessor before its
-    first global read.
+    Metadata consumed: none. Two launches (kernel A grid (rows, V / 128) x 128
+    threads; kernel B grid rows x V threads, V = ``virtual_threads(rows)``: 1024
+    up to 128 rows, 512 above), both with programmatic dependent launch when
+    ``pdl``; each waits on its predecessor before its first global read.
 
     Call site: the target DFlash worker's ``_sample_tokens_for_batch`` under
     the ``split_sampler`` fast path (``target_head.py``), on non-greedy batches with the fused
-    sampling mode, on decode steps of at most 128 rows (16 requests at K=7).
+    sampling mode, on decode steps of at most 128 rows (16 requests at K=7), or
+    of at most ``WIDE_MAX_ROWS`` rows under ``wide_split_sampler``.
 
     Numerics: bitwise the built-in soft cap + ``fused_sample_from_logits``,
     by construction (same per-thread fold order and operations, the shipped
@@ -300,9 +360,9 @@ class SplitSample(OpWrapper):
     rule. The single-walker path runs when exactly one thread claims.
 
     Hard limits
-      rows <= 128 (the shipped sampler's 1024-thread block; ``states`` holds
-      ``new_states(rows)``), vocab % 4 == 0, vocab / 4 <= 64 * 1024 (the walk
-      stages one virtual thread's vectors in shared memory).
+      rows <= WIDE_MAX_ROWS (``states`` holds ``state_words(rows)`` words, as
+      ``new_states(rows)`` gives), vocab % 4 == 0, vocab / 4 <= 64 * 1024 (the
+      walk stages one virtual thread's vectors in shared memory).
 
     Not certified: torch.compile.
     """
@@ -369,11 +429,11 @@ class SplitSample(OpWrapper):
         if logits.dtype != torch.bfloat16 or logits.dim() != 2:
             raise ValueError("logits must be BF16 [rows, vocab]")
         rows, vocab = logits.shape
-        if not 1 <= rows <= MAX_ROWS:
-            raise ValueError(f"1..{MAX_ROWS} rows")
+        if not 1 <= rows <= WIDE_MAX_ROWS:
+            raise ValueError(f"1..{WIDE_MAX_ROWS} rows")
         if not _neutral_or_filtered_rows_ok(vocab):
             raise ValueError("vocab must be a multiple of 4 and at most 4 * 64 * 1024")
-        if states.numel() < rows * VIRTUAL_THREADS * STATE_WORDS:
+        if states.numel() < state_words(rows):
             raise ValueError("states is smaller than new_states(rows)")
 
 

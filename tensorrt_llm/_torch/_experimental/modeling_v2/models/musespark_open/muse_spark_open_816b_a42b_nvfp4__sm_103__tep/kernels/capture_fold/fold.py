@@ -29,7 +29,8 @@ on only to sparse-attention hooks, which this model does not use); an
 attention class that does read it cannot be combined with this feature
 (``test_modeling_v2_musespark_open_capture_fold.py`` checks the classes).
 
-On a decode call of at most 8 rows on a layer ``install`` counted as folded
+On a decode call of at most 8 rows -- 32 while ``wide_projection_gathers`` is armed, whose
+fused boundary stores the capture the same way -- on a layer ``install`` counted as folded
 (``folded_layers``, which ``boundary_early_release`` converts like any other), a capture the
 boundary could not store is still made by the built-in cast and copy, after a
 boundary that may already have released the next QKV GEMM without the
@@ -58,7 +59,11 @@ from tensorrt_llm.logger import logger
 
 from ...ops.comm import unpool_gather_boundary as _unpool
 from ...ops.comm.projection_inbox import MAX_ROWS
-from ..projection_gathers.gathers import MuseSparkOpenTepDecoderLayer, MuseSparkOpenTepGatedResidual
+from ..projection_gathers.gathers import (
+    MuseSparkOpenTepDecoderLayer,
+    MuseSparkOpenTepGatedResidual,
+    fused_rows,
+)
 
 #: The layer keyword ``DecodeTarget`` passes on decode steps.
 LAYER_KWARG = "capture_fold"
@@ -84,20 +89,22 @@ def capture_layers(spec_config) -> Tuple[int, ...]:
     return tuple(sorted(int(layer) for layer in layers))
 
 
-def destination(spec_metadata, layer_idx: int, hidden_states: torch.Tensor):
+def destination(
+    spec_metadata, layer_idx: int, hidden_states: torch.Tensor, max_rows: int = MAX_ROWS
+):
     """The view the built-in capture of ``layer_idx`` would write this call, or ``None``.
 
     ``None`` whenever the built-in capture would not cast the FP32 residual into
     a BF16 buffer of this layout (no DFlash metadata, no buffer, a layer the
     step does not capture, another dtype or width, more rows than the fused
-    boundary takes). Host-side reads only: under a CUDA graph each is a
+    boundary takes: ``max_rows``). Host-side reads only: under a CUDA graph each is a
     per-capture constant.
     """
-    return _destination(spec_metadata, layer_idx, hidden_states)[0]
+    return _destination(spec_metadata, layer_idx, hidden_states, max_rows)[0]
 
 
 def _destination(
-    spec_metadata, layer_idx: int, hidden_states: torch.Tensor
+    spec_metadata, layer_idx: int, hidden_states: torch.Tensor, max_rows: int = MAX_ROWS
 ) -> Tuple[Optional[torch.Tensor], Optional[str]]:
     """``destination``'s view, or why there is none when the built-in capture still writes.
 
@@ -120,7 +127,7 @@ def _destination(
     if buffer is None or index is None:
         return None, None
     rows = hidden_states.shape[0] if hidden_states.dim() == 2 else 0
-    if hidden_states.dim() == 2 and not 1 <= rows <= MAX_ROWS:
+    if hidden_states.dim() == 2 and not 1 <= rows <= max_rows:
         return None, None
     hidden = _unpool.HIDDEN
     if not (
@@ -172,7 +179,7 @@ class MuseSparkOpenTepCaptureDecoderLayer(MuseSparkOpenTepDecoderLayer):
     ):
         spec_metadata = kwargs.get("spec_metadata")
         view, reason = (
-            _destination(spec_metadata, self.layer_idx, hidden_states)
+            _destination(spec_metadata, self.layer_idx, hidden_states, fused_rows(self.add_ffn))
             if capture_fold
             else (None, None)
         )

@@ -17,7 +17,9 @@ With this feature the draft step runs, per rank:
 3. an exchange of those keys only (a few KB instead of the logits): the
    MNNVL one-shot all-reduce in fp32, each rank's keys as exact 16-bit
    integer halves in its own slot and +0.0 elsewhere, or an NCCL all-gather
-   of the int32 keys where that all-reduce is unavailable;
+   of the int32 keys where that all-reduce is unavailable (an exchange that
+   carries a key selection of its own, ``wide_draft_topk``'s, takes the rows
+   it admits instead of this one);
 4. ``draft_topk_merge``: ``torch.topk``'s full-vocab result rebuilt exactly
    (selection, tie order) plus the selector's einsum operands;
 5. the built-in ``hidden_projection`` and the built-in einsum, unchanged;
@@ -122,16 +124,25 @@ def selector_draft_tokens(
     """Greedy DFlash 2 draft tokens ``[B, K]`` int32 from this rank's ``[B, K, shard]`` logits.
 
     ``allreduce`` (from ``key_allreduce``) exchanges the keys as fp32 halves;
-    without it they are all-gathered as int32. ``walk`` stands in for
+    without it they are all-gathered as int32. An ``allreduce`` with a
+    ``takes(rows)`` method (``wide_draft_topk``'s ``RankTopKExchange``) selects
+    and packs the keys itself (``keys``) and names the merge's launch
+    (``merge_launch``) on the steps it takes. ``walk`` stands in for
     ``draft_path_walk`` (same arguments; its result is returned as is):
     the ``path_walk_tail`` fast path passes a walk that also writes the step's tail.
     """
     requests, positions, shard = local_logits.shape
     local = local_logits.reshape(requests * positions, shard)
+    merge_launch = {}
     if allreduce is not None:
-        packed = draft_shard_topk(
-            local, selector.top_k, CHUNK, NUM_WARPS, mapping.tp_rank, mapping.tp_size
-        )
+        takes = getattr(allreduce, "takes", None)
+        if takes is not None and takes(local.shape[0]):
+            packed = allreduce.keys(local, selector.top_k, mapping.tp_rank, mapping.tp_size)
+            merge_launch = allreduce.merge_launch(local.shape[0])
+        else:
+            packed = draft_shard_topk(
+                local, selector.top_k, CHUNK, NUM_WARPS, mapping.tp_rank, mapping.tp_size
+            )
         gathered = allreduce(packed)
     else:
         gathered = allgather(
@@ -152,6 +163,7 @@ def selector_draft_tokens(
         selector.successor_codebook,
         selector.top_k,
         mapping.tp_size,
+        **merge_launch,
     )
     # dflash2_score_edges' einsum on tensors of its shapes and strides: the same kernel.
     edges = torch.einsum("blpr,blcr->blpc", predecessors, successors)

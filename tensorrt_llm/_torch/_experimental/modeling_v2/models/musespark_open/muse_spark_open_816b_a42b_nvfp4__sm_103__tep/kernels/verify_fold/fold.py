@@ -60,6 +60,11 @@ stream's last read of ``_ctx_len`` -- builds the noise block meanwhile and
 joins the side stream before returning; a step this class does not fold
 reaches the fork's own prepare through ``super()``.
 
+Over the windowed drafter context arena (``TRTLLM_DFLASH_WINDOWED_CTX_ARENA=1``)
+the store and the drafter's lengths follow the built-in's windowed lines: rows
+at the physical columns ``_ctx_len - _ctx_base + r``, the window compaction
+after the length update, and ``_ctx_len - _ctx_base`` for the drafter.
+
 Once the fold has run in a step it has applied ``kv_lens_cuda += 1`` and owes
 the rewind, so the methods that consume it (``FOLD_CONSUMERS``) never hand the
 step back to their built-in versions, which would apply both again: each one
@@ -83,8 +88,8 @@ from tensorrt_llm.logger import logger
 
 from ... import spec_worker as _drafter_worker
 from ...ops.embedding.replicated_gather import replicated_embedding_gather
-from ...ops.spec.dflash_accept import FORCE_FRACTIONAL, MAX_REQUESTS
-from ...ops.spec.dflash_verify_fold import VerifyFold, dflash_verify_fold
+from ...ops.spec.dflash_accept import FORCE_FRACTIONAL
+from ...ops.spec.dflash_verify_fold import MAX_REQUESTS, VerifyFold, dflash_verify_fold
 from ...ops.spec.draft_path_walk_tail import draft_path_walk_tail
 from ..draft_head import head as _draft_head
 from ..replicated_embedding import embedding as _replicated_embedding
@@ -487,7 +492,12 @@ class SpecLoopFoldDFlashWorker(DFlashWorker):
                 fold.num_accepted_long,
             )
 
-        num_ctx_per_req_t = self._ctx_len[slots]
+        if self._ctx_base is None:
+            num_ctx_per_req_t = self._ctx_len[slots]
+        else:
+            # Windowed arena: the physical length the draft forward appends
+            # after and attends over.
+            num_ctx_per_req_t = self._ctx_len[slots] - self._ctx_base[slots]
         if self._ctx_block_tables is not None:
             allocated = dflash_allocated_ctx_limit(
                 self._ctx_block_counts, self._ctx_page_size, block_size
@@ -541,9 +551,11 @@ class SpecLoopFoldDFlashWorker(DFlashWorker):
         clamped -- is launched first, the noise block runs on the main stream
         meanwhile, and the main stream joins the side stream before returning.
         The commit returns the new lengths, which are ``_ctx_len[slots]`` after
-        the built-in store; the side chain's plan admits only the dense arena,
-        where the built-in neither clamps them to an allocation nor indexes by
-        batch row.
+        the built-in store; the side chain's plan admits only the dense arena
+        (full-length or windowed), where the built-in neither clamps them to an
+        allocation nor indexes by batch row. Over a windowed arena the built-in's
+        window compaction and its read of the physical lengths follow the join
+        (``context_kv_fork.drafter_lengths``).
         """
         num_gens = fold.accepted.shape[0]
         if (
@@ -559,9 +571,12 @@ class SpecLoopFoldDFlashWorker(DFlashWorker):
                 + ("; the arena is paged" if self._ctx_block_tables is not None else "")
                 + ("; the step has no target features" if not has_target_features else "")
             )
+        from ..context_kv_fork.fork import drafter_lengths
+
         num_ctx_per_req_t = fork.commit(launched, slots, gen_num_accepted)
         noise_embed_2d = self._fold_noise_block(embed_tokens, fold, num_gens, block_size)
         fork.join(launched)
+        num_ctx_per_req_t = drafter_lengths(self, slots, num_ctx_per_req_t)
         attn_metadata._seq_lens_cuda[0:num_gens] = total_tokens_per_req
         attn_metadata._seq_lens[0:num_gens] = total_tokens_per_req
         return {
@@ -595,7 +610,8 @@ class SpecLoopFoldDFlashWorker(DFlashWorker):
 
         Projects this step's captured target rows, writes their context K/V
         into the drafter's arena (rows past the accepted count zeroed) and
-        advances ``_ctx_len``. ``gen_num_accepted_long`` is the fold's copy of
+        advances ``_ctx_len``; over a windowed arena it then compacts the slots'
+        windows. ``gen_num_accepted_long`` is the fold's copy of
         ``gen_num_accepted.long()``.
         """
         gen_start = attn_metadata.num_ctx_tokens
@@ -604,7 +620,13 @@ class SpecLoopFoldDFlashWorker(DFlashWorker):
         gen_hs = captured_hs[gen_start : gen_start + num_gens * total_tokens_per_req]
         gen_hs_to_project = gen_hs.reshape(-1, gen_hs.shape[-1])
         projected_to_store = draft_model.project_target_hidden(gen_hs_to_project)
-        col_idx = self._ctx_len[slots].unsqueeze(1) + offsets_kp1.unsqueeze(0)
+        if self._ctx_base is None:
+            col_idx = self._ctx_len[slots].unsqueeze(1) + offsets_kp1.unsqueeze(0)
+        else:
+            # Windowed arena: physical columns.
+            col_idx = (self._ctx_len[slots] - self._ctx_base[slots]).unsqueeze(
+                1
+            ) + offsets_kp1.unsqueeze(0)
         write_mask = offsets_kp1.unsqueeze(0) < gen_num_accepted_long.unsqueeze(1)
         if self._ctx_block_tables is not None:
             # Bound by what the manager handed THIS request: the masked
@@ -612,6 +634,8 @@ class SpecLoopFoldDFlashWorker(DFlashWorker):
             # safety) and a placeholder page resolves to another's.
             gen_capacity = self._ctx_block_counts[gen_rows_out] * self._ctx_page_size
             col_idx = torch.minimum(col_idx, (gen_capacity - 1).unsqueeze(1)).clamp_(min=0)
+        elif self._ctx_keep:
+            col_idx = col_idx.clamp(max=self._ctx_k_buf.size(2) - 1)
         else:
             col_idx = col_idx.clamp(max=self._max_ctx - 1)
 
@@ -650,6 +674,8 @@ class SpecLoopFoldDFlashWorker(DFlashWorker):
 
         self._ctx_len[slots] += gen_num_accepted_long
         self._ctx_len.clamp_(max=self._max_ctx)
+        if self._ctx_keep and not self._ctx_paged:
+            self._compact_ctx_window(slots)
 
     # ------------------------------------------------------------------
     # path_walk_tail: the step's tail in the path walk

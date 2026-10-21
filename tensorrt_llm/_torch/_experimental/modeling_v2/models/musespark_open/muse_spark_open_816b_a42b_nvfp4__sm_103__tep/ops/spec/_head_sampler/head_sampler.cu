@@ -37,6 +37,13 @@
 // A row that enables a filter runs the shipped kernel body inside kernel B on the BF16
 // logits, reading them through CapBf16 (the soft cap applied on every read).
 //
+// Above kWideBlockMaxRows (128) rows the shipped sampler runs its 512-thread block
+// (fusedSamplingTokensNarrowKernel: thread t folds the elements 4 (t + 512 j) + {0..3}).
+// Both kernels are templated on that virtual block (VB): a call of more than 128 rows
+// runs 512 virtual threads per row (4 CTAs of kernel A per row, a 512-thread kernel B),
+// statement for statement the shipped narrow block's first round; a call of at most 128
+// rows runs the 1024-thread instances, unchanged.
+//
 // With the gather, each rank's LM-head GEMM writes its [rows, shard] BF16 output into
 // its slot of a multicast buffer whose every word holds a sentinel (0xFFFF in both
 // BF16 halves, a NaN no GEMM epilogue produces) between calls. Kernel A polls this
@@ -124,10 +131,23 @@ __device__ inline void forEachLogit(CapBf16 const* row, int vocabSize, Fn fn)
 //! The shipped single-CTA block for at most kWideBlockMaxRows rows; kernel A spreads
 //! its threads, kernel B is one of it per row.
 constexpr int kSplitBlock = kWideBlock;
+//! The shipped single-CTA block above kWideBlockMaxRows rows.
+constexpr int kSplitNarrowBlock = kNarrowBlock;
+//! Most rows one call takes (the states scratch and the grids are sized by the caller).
+constexpr int kSplitMaxRows = 1024;
 //! Loads kernel A issues before folding them, per virtual thread.
 constexpr int kSplitPrefetch = 16;
-//! Vectors of one virtual thread kernel B's walk stages in shared memory.
+//! Vectors of one virtual thread kernel B's walk stages in shared memory (1024-thread block).
 constexpr int kSplitWalkVectors = 64;
+//! The same for the 512-thread block: twice the vectors per thread, the same vocabulary bound.
+constexpr int kSplitNarrowWalkVectors = 128;
+
+//! The virtual block of a call of `numRows` rows: the shipped sampler's block for that call.
+__host__ __device__ constexpr int splitVirtualBlock(int numRows)
+{
+    return numRows <= kWideBlockMaxRows ? kSplitBlock : kSplitNarrowBlock;
+}
+
 //! Two BF16 halves of 0xFFFF: the value of every unpublished word of the inbox.
 constexpr uint32_t kSplitSentinel = 0xFFFFFFFFu;
 //! Status bit: a poll waited past the timeout (the kernel then traps).
@@ -143,7 +163,7 @@ struct SplitFoldParams
     uint2* inbox{nullptr};
     //! With the gather: the gathered BF16 [numRows, vocabSize] row, written here.
     uint2* gathered{nullptr};
-    //! Per-virtual-thread online-softmax states, [numRows][kSplitBlock].
+    //! Per-virtual-thread online-softmax states, [numRows][splitVirtualBlock(numRows)].
     OnlineSoftmax* states{nullptr};
     int* status{nullptr};
     SplitCap cap{};
@@ -222,15 +242,15 @@ __device__ __noinline__ uint2 awaitPublished(uint2* address, int* status, unsign
     }
 }
 
-//! Kernel A: (optionally) gather, then (optionally) fold. Grid (numRows, kSplitBlock /
-//! THREADS); block THREADS; virtual thread vt = blockIdx.y * THREADS + threadIdx.x of
-//! the shipped 1024-thread block.
+//! Kernel A: (optionally) gather, then (optionally) fold. Grid (numRows, VB / THREADS);
+//! block THREADS; virtual thread vt = blockIdx.y * THREADS + threadIdx.x of the shipped
+//! VB-thread block (VB = splitVirtualBlock(numRows)).
 //!
 //! PDL: waits on its predecessor before its first read of anything, so every input,
 //! the inbox included, is read after the predecessor grid (the LM-head GEMM) completed.
 //! Peer slots are published by the peers' GEMMs and are read through the Lamport
 //! protocol, not through that edge.
-template <bool GATHER, bool FOLD, int THREADS>
+template <bool GATHER, bool FOLD, int THREADS, int VB>
 __global__ void __launch_bounds__(THREADS) splitFoldKernel(SplitFoldParams p)
 {
     gridDependencyWait();
@@ -245,13 +265,13 @@ __global__ void __launch_bounds__(THREADS) splitFoldKernel(SplitFoldParams p)
     OnlineSoftmax st{-FLT_MAX, 0.0f, 0};
     uint2 const* plainRow = GATHER ? nullptr : p.plain + static_cast<size_t>(row) * vecCount;
     uint2* gatheredRow = GATHER ? p.gathered + static_cast<size_t>(row) * vecCount : nullptr;
-    for (int v0 = vt; v0 < vecCount; v0 += kSplitPrefetch * kSplitBlock)
+    for (int v0 = vt; v0 < vecCount; v0 += kSplitPrefetch * VB)
     {
         uint2 buf[kSplitPrefetch];
 #pragma unroll
         for (int u = 0; u < kSplitPrefetch; ++u)
         {
-            int const v = v0 + u * kSplitBlock;
+            int const v = v0 + u * VB;
             if (v < vecCount)
             {
                 if constexpr (GATHER)
@@ -267,7 +287,7 @@ __global__ void __launch_bounds__(THREADS) splitFoldKernel(SplitFoldParams p)
 #pragma unroll
         for (int u = 0; u < kSplitPrefetch; ++u)
         {
-            int const v = v0 + u * kSplitBlock;
+            int const v = v0 + u * VB;
             if (v < vecCount)
             {
                 if constexpr (GATHER)
@@ -295,16 +315,17 @@ __global__ void __launch_bounds__(THREADS) splitFoldKernel(SplitFoldParams p)
     }
     if constexpr (FOLD)
     {
-        p.states[static_cast<size_t>(row) * kSplitBlock + vt] = st;
+        p.states[static_cast<size_t>(row) * VB + vt] = st;
     }
     gridDependencyTrigger();
 }
 
-//! Kernel B: one 1024-thread CTA per row. `params.logits` is the BF16 row (gathered or
-//! not); the soft cap is applied on every read.
+//! Kernel B: one VB-thread CTA per row (VB = splitVirtualBlock(numRows), the shipped
+//! block of the call). `params.logits` is the BF16 row (gathered or not); the soft cap is
+//! applied on every read.
 //!
 //! A row without top-k / top-p / min-p takes the shipped tokens-only rejection path's
-//! first round from the states kernel A wrote: cub BlockReduce of the 1024 states, each
+//! first round from the states kernel A wrote: cub BlockReduce of the VB states, each
 //! thread's mass rebased onto the row max, cub BlockScan, tid 0's Philox draw, and the
 //! walk of the thread whose span holds the target -- its elements' weights computed in
 //! parallel, then summed by one thread in the original order (when two spans overlap
@@ -312,11 +333,12 @@ __global__ void __launch_bounds__(THREADS) splitFoldKernel(SplitFoldParams p)
 //! runs the shipped body itself.
 //!
 //! PDL: waits on kernel A before reading anything.
-__global__ void __launch_bounds__(kSplitBlock, 1)
+template <int VB, int WALK>
+__global__ void __launch_bounds__(VB, VB == kSplitNarrowBlock ? 2 : 1)
     splitDrawKernel(FusedSamplingParams params, OnlineSoftmax const* states, SplitCap cap)
 {
-    __shared__ FusedSamplingShared<kSplitBlock> shared;
-    __shared__ __align__(16) float wbuf[4 * kSplitWalkVectors];
+    __shared__ FusedSamplingShared<VB> shared;
+    __shared__ __align__(16) float wbuf[4 * WALK];
     __shared__ int sWalker;
     __shared__ float sBase;
     __shared__ unsigned long long sLastCrossing;
@@ -332,12 +354,12 @@ __global__ void __launch_bounds__(kSplitBlock, 1)
     RowParams const rp = loadRowParams(params, row);
     if (rp.needTopK || rp.needTopP || rp.needMinP)
     {
-        fusedSamplingBody<CapBf16, kSplitBlock, true, false>(params, shared);
+        fusedSamplingBody<CapBf16, VB, true, false>(params, shared);
         return;
     }
-    using BlockReduceOnline = cub::BlockReduce<OnlineSoftmax, kSplitBlock>;
-    using BlockScanF = cub::BlockScan<float, kSplitBlock>;
-    OnlineSoftmax const cachedThreadStats = states[static_cast<size_t>(row) * kSplitBlock + tid];
+    using BlockReduceOnline = cub::BlockReduce<OnlineSoftmax, VB>;
+    using BlockScanF = cub::BlockScan<float, VB>;
+    OnlineSoftmax const cachedThreadStats = states[static_cast<size_t>(row) * VB + tid];
     OnlineSoftmax const rowStats
         = BlockReduceOnline(shared.temp.reduceOnline).Reduce(cachedThreadStats, OnlineSoftmaxOp());
     if (tid == 0)
@@ -390,10 +412,10 @@ __global__ void __launch_bounds__(kSplitBlock, 1)
         // One walker (it alone wrote sWalker and sBase): its elements' weights in
         // parallel, summed by one thread in the shipped walk's order.
         int const walker = sWalker;
-        int const walkVectors = (vecCount - walker + kSplitBlock - 1) / kSplitBlock;
+        int const walkVectors = (vecCount - walker + VB - 1) / VB;
         if (tid < walkVectors)
         {
-            uint2 const packed = reinterpret_cast<uint2 const*>(rowLogits)[walker + tid * kSplitBlock];
+            uint2 const packed = reinterpret_cast<uint2 const*>(rowLogits)[walker + tid * VB];
             __nv_bfloat16 const* elems = reinterpret_cast<__nv_bfloat16 const*>(&packed);
 #pragma unroll
             for (int j = 0; j < 4; ++j)
@@ -423,7 +445,7 @@ __global__ void __launch_bounds__(kSplitBlock, 1)
                         running += w;
                         if (running > target)
                         {
-                            cand = (walker + q * kSplitBlock) * 4 + j;
+                            cand = (walker + q * VB) * 4 + j;
                             candWeight = w;
                         }
                     }
@@ -450,7 +472,7 @@ __global__ void __launch_bounds__(kSplitBlock, 1)
         {
             float running = base;
             int position = 0;
-            for (int v = tid; v < vecCount && crossIdx < 0; v += kSplitBlock)
+            for (int v = tid; v < vecCount && crossIdx < 0; v += VB)
             {
                 uint2 const packed = reinterpret_cast<uint2 const*>(rowLogits)[v];
                 __nv_bfloat16 const* elems = reinterpret_cast<__nv_bfloat16 const*>(&packed);
@@ -494,8 +516,9 @@ __global__ void __launch_bounds__(kSplitBlock, 1)
 }
 
 //! Test reference: the shipped pass 1 of a neutral tokens-only row, verbatim, on FP32
-//! soft-capped logits; stores each of the 1024 threads' online-softmax state.
-__global__ void __launch_bounds__(kSplitBlock, 1) splitRefFoldKernel(FusedSamplingParams params, OnlineSoftmax* states)
+//! soft-capped logits; stores each of the VB threads' online-softmax state.
+template <int VB>
+__global__ void __launch_bounds__(VB, 1) splitRefFoldKernel(FusedSamplingParams params, OnlineSoftmax* states)
 {
     int const row = blockIdx.x;
     int const tid = threadIdx.x;
@@ -507,7 +530,7 @@ __global__ void __launch_bounds__(kSplitBlock, 1) splitRefFoldKernel(FusedSampli
             cachedThreadStats
                 = combineOnlineSoftmax(cachedThreadStats, OnlineSoftmax{__fmul_rn(logit, rp.tempInv), 1.0f, i});
         });
-    states[static_cast<size_t>(row) * kSplitBlock + tid] = cachedThreadStats;
+    states[static_cast<size_t>(row) * VB + tid] = cachedThreadStats;
 }
 
 //! Test reference: capOf over a BF16 tensor.
@@ -597,7 +620,7 @@ tk::FusedSamplingParams rowParams(at::Tensor const& logits, at::Tensor const& te
     TORCH_CHECK(logits.dim() == 2, "logits must be [numRows, vocabSize]");
     TORCH_CHECK(logits.is_cuda() && logits.is_contiguous(), "logits must be a contiguous CUDA tensor");
     auto const numRows = logits.size(0);
-    TORCH_CHECK(numRows >= 1 && numRows <= fs::kWideBlockMaxRows, "1..", fs::kWideBlockMaxRows, " rows");
+    TORCH_CHECK(numRows >= 1 && numRows <= fs::kSplitMaxRows, "1..", fs::kSplitMaxRows, " rows");
     TORCH_CHECK(logits.size(1) % 4 == 0, "the vocabulary must be a whole number of 4-element vectors");
     TORCH_CHECK(reinterpret_cast<uintptr_t>(logits.data_ptr()) % 8 == 0, "logits must be 8-byte aligned");
     checkRowVector(temperatures, "temperatures", at::kFloat, numRows);
@@ -638,20 +661,35 @@ void checkStates(at::Tensor const& states, int64_t rows)
 {
     TORCH_CHECK(states.is_cuda() && states.is_contiguous() && states.scalar_type() == at::kInt,
         "states must be a contiguous int32 CUDA tensor");
-    TORCH_CHECK(states.numel() >= rows * fs::kSplitBlock * 3, "states holds 3 words per virtual thread");
+    TORCH_CHECK(rows >= 1 && rows <= fs::kSplitMaxRows, "1..", fs::kSplitMaxRows, " rows");
+    TORCH_CHECK(states.numel() >= rows * fs::splitVirtualBlock(static_cast<int>(rows)) * 3,
+        "states holds 3 words per virtual thread");
+}
+
+template <bool GATHER, bool FOLD, int VB>
+void launchFoldBlock(fs::SplitFoldParams const& p, int64_t threads, bool pdl)
+{
+    if (threads == 128)
+    {
+        launch(fs::splitFoldKernel<GATHER, FOLD, 128, VB>, dim3(p.fs.numRows, VB / 128), dim3(128), pdl, p);
+    }
+    else
+    {
+        TORCH_CHECK(threads == 64, "kernel A runs 64 or 128 threads per CTA");
+        launch(fs::splitFoldKernel<GATHER, FOLD, 64, VB>, dim3(p.fs.numRows, VB / 64), dim3(64), pdl, p);
+    }
 }
 
 template <bool GATHER, bool FOLD>
 void launchFold(fs::SplitFoldParams const& p, int64_t threads, bool pdl)
 {
-    if (threads == 128)
+    if (fs::splitVirtualBlock(p.fs.numRows) == fs::kSplitBlock)
     {
-        launch(fs::splitFoldKernel<GATHER, FOLD, 128>, dim3(p.fs.numRows, fs::kSplitBlock / 128), dim3(128), pdl, p);
+        launchFoldBlock<GATHER, FOLD, fs::kSplitBlock>(p, threads, pdl);
     }
     else
     {
-        TORCH_CHECK(threads == 64, "kernel A runs 64 or 128 threads per CTA");
-        launch(fs::splitFoldKernel<GATHER, FOLD, 64>, dim3(p.fs.numRows, fs::kSplitBlock / 64), dim3(64), pdl, p);
+        launchFoldBlock<GATHER, FOLD, fs::kSplitNarrowBlock>(p, threads, pdl);
     }
 }
 
@@ -729,12 +767,23 @@ at::Tensor draw(at::Tensor const& logits, at::Tensor const& temperatures, at::Te
     TORCH_CHECK(logits.scalar_type() == at::kBFloat16, "logits must be BF16");
     at::cuda::CUDAGuard guard(logits.device());
     auto params = rowParams(logits, temperatures, topKs, topPs, minPs, seed, offset);
-    TORCH_CHECK(params.vocabSize / 4 <= fs::kSplitWalkVectors * fs::kSplitBlock, "vocabulary too wide for the walk");
+    TORCH_CHECK(params.vocabSize / 4 <= fs::kSplitWalkVectors * fs::kSplitBlock
+            && params.vocabSize / 4 <= fs::kSplitNarrowWalkVectors * fs::kSplitNarrowBlock,
+        "vocabulary too wide for the walk");
     checkStates(states, logits.size(0));
     auto tokens = at::empty({logits.size(0)}, logits.options().dtype(at::kInt));
     params.outputTokens = tokens.data_ptr<int32_t>();
-    launch(fs::splitDrawKernel, dim3(params.numRows), dim3(fs::kSplitBlock), pdl, params,
-        reinterpret_cast<fs::OnlineSoftmax const*>(states.data_ptr()), softCap(multiplier, invCap, cap));
+    auto const* threadStates = reinterpret_cast<fs::OnlineSoftmax const*>(states.data_ptr());
+    if (fs::splitVirtualBlock(params.numRows) == fs::kSplitBlock)
+    {
+        launch(fs::splitDrawKernel<fs::kSplitBlock, fs::kSplitWalkVectors>, dim3(params.numRows), dim3(fs::kSplitBlock),
+            pdl, params, threadStates, softCap(multiplier, invCap, cap));
+    }
+    else
+    {
+        launch(fs::splitDrawKernel<fs::kSplitNarrowBlock, fs::kSplitNarrowWalkVectors>, dim3(params.numRows),
+            dim3(fs::kSplitNarrowBlock), pdl, params, threadStates, softCap(multiplier, invCap, cap));
+    }
     return tokens;
 }
 
@@ -749,8 +798,17 @@ void refFold(at::Tensor const& capped, at::Tensor const& temperatures, at::Tenso
     params.temperatures = temperatures.data_ptr<float>();
     params.numRows = static_cast<int32_t>(capped.size(0));
     params.vocabSize = static_cast<int32_t>(capped.size(1));
-    launch(fs::splitRefFoldKernel, dim3(params.numRows), dim3(fs::kSplitBlock), false, params,
-        reinterpret_cast<fs::OnlineSoftmax*>(states.data_ptr()));
+    auto* threadStates = reinterpret_cast<fs::OnlineSoftmax*>(states.data_ptr());
+    if (fs::splitVirtualBlock(params.numRows) == fs::kSplitBlock)
+    {
+        launch(fs::splitRefFoldKernel<fs::kSplitBlock>, dim3(params.numRows), dim3(fs::kSplitBlock), false, params,
+            threadStates);
+    }
+    else
+    {
+        launch(fs::splitRefFoldKernel<fs::kSplitNarrowBlock>, dim3(params.numRows), dim3(fs::kSplitNarrowBlock), false,
+            params, threadStates);
+    }
 }
 
 at::Tensor capRows(at::Tensor const& x, double multiplier, double invCap, double cap)
