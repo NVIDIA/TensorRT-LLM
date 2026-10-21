@@ -100,6 +100,11 @@ l0_cpu:
   - unittest/_torch/models/test_minimax_m3.py::test_piecewise_attention_boundary_preserves_indexer_cache_contract
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_five_way_projection_shard_geometry
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_five_way_loader_returns_exact_generic_skip
+  - unittest/_torch/models/test_minimax_m3_vl.py::test_call_with_text_prompt_float_video_frames_are_not_rescaled_twice
+  - unittest/_torch/models/test_minimax_m3_vl.py::test_call_with_text_prompt_float_images_are_not_rescaled_twice
+  - unittest/_torch/models/test_minimax_m3_vl.py::test_call_with_text_prompt_rejects_mixed_float_and_uint8_video_frames
+  - unittest/_torch/models/test_minimax_m3_vl.py::test_call_with_text_prompt_forwards_video_metadata
+  - unittest/_torch/models/test_minimax_m3_vl.py::test_call_with_text_prompt_video_without_timing_has_no_timestamps
   - unittest/_torch/models/checkpoints
   - unittest/_torch/modules
   - unittest/_torch/moe

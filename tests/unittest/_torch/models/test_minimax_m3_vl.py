@@ -48,6 +48,7 @@ from tensorrt_llm._torch.models.modeling_minimaxm3_vl import (
     split_multimodal_weights,
 )
 from tensorrt_llm._torch.models.modeling_utils import MetaInitMode
+from tensorrt_llm.inputs.multimodal_data import VideoData
 
 # ---------------------------------------------------------------------------
 # Shared helpers (mirror the conventions used by test_minimax_m3.py).
@@ -2195,3 +2196,182 @@ def test_fast_path_hooks_are_registered_on_processor_class():
     assert hasattr(cls, "expand_prompt_token_ids_for_mm")
     assert hasattr(cls, "get_num_tokens_per_image")
     assert hasattr(cls, "get_num_tokens_per_video")
+
+
+# ---------------------------------------------------------------------------
+# call_with_text_prompt: what reaches the HF processor. Pixel values must not
+# depend on whether the media loader delivered uint8 data or float tensors
+# already scaled to [0, 1], and each video's frame timing must be forwarded.
+# ---------------------------------------------------------------------------
+
+
+class _RecordingHFProcessor:
+    """Stand-in for the HF ``MiniMaxVLProcessor``.
+
+    Records the per-modality kwargs it receives and, like the real image /
+    video processors (``do_rescale=True``, ``rescale_factor=1/255``),
+    rescales pixels unless it is passed ``do_rescale=False``.
+    """
+
+    def __init__(self):
+        self.calls: List[Dict] = []
+
+    @staticmethod
+    def _pixels(items, kwargs) -> torch.Tensor:
+        pixels = torch.stack(
+            [x if isinstance(x, torch.Tensor) else torch.as_tensor(np.array(x)) for x in items]
+        ).float()
+        return pixels / 255.0 if kwargs.get("do_rescale", True) else pixels
+
+    def __call__(
+        self,
+        text,
+        images=None,
+        videos=None,
+        return_tensors=None,
+        images_kwargs=None,
+        videos_kwargs=None,
+    ):
+        images_kwargs = dict(images_kwargs or {})
+        videos_kwargs = dict(videos_kwargs or {})
+        self.calls.append({"images_kwargs": images_kwargs, "videos_kwargs": videos_kwargs})
+        out = {"input_ids": torch.tensor([[1, 2, 3]])}
+        if images is not None:
+            out["pixel_values"] = self._pixels(images, images_kwargs)
+            out["image_grid_thw"] = torch.tensor([[1, 2, 2]] * len(images))
+        if videos is not None:
+            out["pixel_values_videos"] = torch.cat([self._pixels(v, videos_kwargs) for v in videos])
+            out["video_grid_thw"] = torch.tensor([[len(v), 2, 2] for v in videos])
+        return out
+
+
+def _make_minimax_m3_vl_prompt_processor():
+    proc = _make_minimax_m3_vl_fast_path_processor()
+    proc._processor = _RecordingHFProcessor()
+    proc._tokenizer = SimpleNamespace(apply_chat_template=lambda messages, **kwargs: "prompt")
+    proc._dtype = torch.float32
+    return proc
+
+
+def _uint8_frames(num_frames: int, seed: int = 0) -> List[torch.Tensor]:
+    gen = torch.Generator().manual_seed(seed)
+    return [
+        torch.randint(0, 256, (3, 4, 4), dtype=torch.uint8, generator=gen)
+        for _ in range(num_frames)
+    ]
+
+
+def _run_prompt(proc, **mm_data):
+    _, extra = proc.call_with_text_prompt({"prompt": "Describe.", "multi_modal_data": mm_data})
+    (call,) = proc._processor.calls
+    return extra["multimodal_data"], call
+
+
+@pytest.mark.cpu_only
+def test_call_with_text_prompt_float_video_frames_are_not_rescaled_twice():
+    """Float frames in [0, 1] (the ``"pt"`` loader format) must reach the
+    model at the same scale as the uint8 frames they were decoded from."""
+    uint8_frames = _uint8_frames(4)
+    float_frames = [f.float() / 255.0 for f in uint8_frames]
+    metadata = {"total_num_frames": 4, "fps": 2.0, "duration": 2.0, "frames_indices": [0, 1, 2, 3]}
+
+    mm_u8, call_u8 = _run_prompt(
+        _make_minimax_m3_vl_prompt_processor(),
+        video=[VideoData(frames=uint8_frames, metadata=dict(metadata))],
+    )
+    mm_f32, call_f32 = _run_prompt(
+        _make_minimax_m3_vl_prompt_processor(),
+        video=[VideoData(frames=float_frames, metadata=dict(metadata))],
+    )
+
+    # uint8 frames keep the processor's default rescale; float ones skip it.
+    assert "do_rescale" not in call_u8["videos_kwargs"]
+    assert call_f32["videos_kwargs"]["do_rescale"] is False
+    pixels_u8 = mm_u8["video"]["pixel_values_videos"]
+    pixels_f32 = mm_f32["video"]["pixel_values_videos"]
+    torch.testing.assert_close(pixels_f32, pixels_u8)
+    assert float(pixels_f32.max()) > 0.5
+
+
+@pytest.mark.cpu_only
+def test_call_with_text_prompt_float_images_are_not_rescaled_twice():
+    uint8_images = _uint8_frames(2, seed=1)
+    float_images = [x.float() / 255.0 for x in uint8_images]
+
+    mm_u8, call_u8 = _run_prompt(_make_minimax_m3_vl_prompt_processor(), image=uint8_images)
+    mm_f32, call_f32 = _run_prompt(_make_minimax_m3_vl_prompt_processor(), image=float_images)
+    _, call_pil = _run_prompt(
+        _make_minimax_m3_vl_prompt_processor(), image=[Image.new("RGB", (4, 4))]
+    )
+
+    assert "do_rescale" not in call_u8["images_kwargs"]
+    assert "do_rescale" not in call_pil["images_kwargs"]
+    assert call_f32["images_kwargs"]["do_rescale"] is False
+    torch.testing.assert_close(mm_f32["image"]["pixel_values"], mm_u8["image"]["pixel_values"])
+
+
+@pytest.mark.cpu_only
+def test_call_with_text_prompt_rejects_mixed_float_and_uint8_video_frames():
+    frames = _uint8_frames(2)
+    frames[1] = frames[1].float() / 255.0
+    proc = _make_minimax_m3_vl_prompt_processor()
+    with pytest.raises(ValueError, match="mix float tensors"):
+        proc.call_with_text_prompt(
+            {"prompt": "Describe.", "multi_modal_data": {"video": [VideoData(frames, {})]}}
+        )
+
+
+@pytest.mark.cpu_only
+def test_call_with_text_prompt_forwards_video_metadata():
+    """Each video's fps / sampled frame indices reach the HF video processor,
+    which uses them to emit per-temporal-group timestamps."""
+    from transformers.video_utils import VideoMetadata
+
+    video = VideoData(
+        frames=_uint8_frames(4),
+        metadata={
+            "total_num_frames": 30,
+            "fps": 10.0,
+            "duration": 3.0,
+            "frames_indices": [0, 9, 19, 29],
+        },
+    )
+    _, call = _run_prompt(_make_minimax_m3_vl_prompt_processor(), video=[video])
+
+    (metadata,) = call["videos_kwargs"]["video_metadata"]
+    assert metadata == {
+        "total_num_frames": 4,
+        "fps": 10.0,
+        "duration": 3.0,
+        "frames_indices": [0, 9, 19, 29],
+    }
+    # The dict must be accepted by transformers' VideoMetadata as-is.
+    assert VideoMetadata(**metadata).timestamps == pytest.approx([0.0, 0.9, 1.9, 2.9])
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "video",
+    [
+        pytest.param(lambda frames: frames, id="frame-list"),
+        pytest.param(lambda frames: VideoData(frames, {}), id="no-metadata"),
+        pytest.param(
+            lambda frames: VideoData(frames, {"fps": 0.0, "frames_indices": [0, 5]}),
+            id="zero-fps",
+        ),
+        pytest.param(lambda frames: VideoData(frames, {"fps": 30.0}), id="no-frame-indices"),
+        pytest.param(
+            lambda frames: VideoData(frames, {"fps": 30.0, "frames_indices": []}),
+            id="empty-frame-indices",
+        ),
+    ],
+)
+def test_call_with_text_prompt_video_without_timing_has_no_timestamps(video):
+    """Without a positive fps and frame indices the processor gets fps=None,
+    so it emits no timestamps (and never divides by a zero fps)."""
+    _, call = _run_prompt(_make_minimax_m3_vl_prompt_processor(), video=[video(_uint8_frames(2))])
+
+    (metadata,) = call["videos_kwargs"]["video_metadata"]
+    assert metadata["fps"] is None
+    assert metadata["frames_indices"] == [0, 1]
+    assert metadata["total_num_frames"] == 2
