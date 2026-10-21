@@ -61,7 +61,9 @@ class TestGemma4Assistant(unittest.TestCase):
             "hidden_size_per_layer_input": 0,
             "vocab_size_per_layer_input": 0,
             "use_double_wide_mlp": False,
-            "final_logit_softcapping": 30.0,
+            # The assistant does not apply logit softcapping; leave it unset so the
+            # config does not suggest coverage this test does not provide.
+            "final_logit_softcapping": None,
             "rope_parameters": {
                 "sliding_attention": {
                     "rope_type": "default",
@@ -102,19 +104,17 @@ class TestGemma4Assistant(unittest.TestCase):
         model_class = get_registered_model_class("Gemma4AssistantForCausalLM")
         self.assertIs(model_class, Gemma4AssistantForCausalLM)
         assistant = model_class(assistant_config).cuda().eval()
-        for parameter in target.parameters():
+        # Distinct non-unit 1-D weights so the reference can tell each norm apart.
+        for parameter in [*target.parameters(), *assistant.parameters()]:
             if parameter.ndim == 2:
                 torch.nn.init.normal_(parameter, std=0.02)
             else:
-                parameter.fill_(1)
-        for parameter in assistant.parameters():
-            if parameter.ndim == 2:
-                torch.nn.init.normal_(parameter, std=0.02)
-            else:
-                parameter.fill_(1)
+                parameter.uniform_(0.5, 1.5)
         assistant.load_weights_from_target_model(target)
         layer = assistant.model.layers[0]
         self.assertTrue(layer.is_kv_shared_layer)
+        # layer_scalar is a buffer initialized to 1; make it observable.
+        layer.layer_scalar.fill_(0.7)
 
         manager = KVCacheManagerV2(
             KvCacheConfig(max_tokens=128, enable_block_reuse=False),
@@ -184,7 +184,12 @@ class TestGemma4Assistant(unittest.TestCase):
         normalized = norm(assistant_inputs, layer.input_layernorm.weight, eps)
         query = linear(normalized, layer.self_attn.qkv_proj.weight).reshape(1, num_heads, head_dim)
         query = norm(query, layer.self_attn.q_norm.weight, eps)
-        angles = 2 * 10000.0 ** (
+        # Proportional RoPE with partial_rotary_factor=1.0 rotates every dimension,
+        # which reduces to the default RoPE frequencies.
+        rope = text_config["rope_parameters"]["full_attention"]
+        self.assertEqual(rope["partial_rotary_factor"], 1.0)
+        position = position_ids.flatten()[-1].float()
+        angles = position * rope["rope_theta"] ** (
             -torch.arange(0, head_dim, 2, device="cuda", dtype=torch.float32) / head_dim
         )
         cos = torch.cat([angles.cos(), angles.cos()])
