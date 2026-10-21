@@ -725,11 +725,6 @@ void initRequestBindings(nb::module_& m)
         .def("__getstate__", requestGetstate)
         .def("__setstate__", requestSetstate);
 
-    nb::class_<tle::SpeculativeDecodingFastLogitsInfo>(m, "SpeculativeDecodingFastLogitsInfo")
-        .def(nb::init<>())
-        .def_rw("draft_request_id", &tle::SpeculativeDecodingFastLogitsInfo::draftRequestId)
-        .def_rw("draft_participant_id", &tle::SpeculativeDecodingFastLogitsInfo::draftParticipantId);
-
     auto requestPerfMetrics = nb::class_<tle::RequestPerfMetrics>(m, "RequestPerfMetrics");
 
     auto timingMetricsGetstate = [](tle::RequestPerfMetrics::TimingMetrics const& self)
@@ -840,11 +835,6 @@ void initRequestBindings(nb::module_& m)
         .def_rw("iter", &tle::RequestPerfMetrics::iter)
         .def("__getstate__", requestPerfMetricsGetstate)
         .def("__setstate__", requestPerfMetricsSetstate);
-
-    nb::class_<tle::AdditionalOutput>(m, "AdditionalOutput")
-        .def(nb::init<std::string, tle::Tensor>(), nb::arg("name"), nb::arg("output"))
-        .def_rw("name", &tle::AdditionalOutput::name)
-        .def_rw("output", &tle::AdditionalOutput::output);
 
     auto resultSetstate = [](tle::Result& self, nb::tuple const& state)
     {

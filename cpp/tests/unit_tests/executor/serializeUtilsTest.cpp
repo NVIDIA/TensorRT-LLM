@@ -732,14 +732,6 @@ TEST(SerializeUtilsTest, ContextPhaseParams)
     }
 }
 
-TEST(SerializeUtilsTest, SpeculativeDecodingFastLogitsInfo)
-{
-    auto logitsInfo = texec::SpeculativeDecodingFastLogitsInfo{10, 20};
-    auto logitsInfo2 = serializeDeserialize(logitsInfo);
-    EXPECT_EQ(logitsInfo.draftRequestId, logitsInfo2.draftRequestId);
-    EXPECT_EQ(logitsInfo.draftParticipantId, logitsInfo2.draftParticipantId);
-}
-
 TEST(SerializeUtilsTest, GuidedDecodingConfig)
 {
     std::vector<std::string> encodedVocab{"eos", "a", "b", "c", "d"};

@@ -308,15 +308,6 @@ def test_request():
     assert isinstance(request.lora_config, trtllm.LoraConfig)
 
 
-@pytest.mark.cpu_only
-def test_spec_dec_fast_logits_info():
-    fast_logits_info = trtllm.SpeculativeDecodingFastLogitsInfo()
-    fast_logits_info.draft_request_id = 3
-    fast_logits_info.draft_participant_id = 5
-    assert fast_logits_info.draft_request_id == 3
-    assert fast_logits_info.draft_participant_id == 5
-
-
 def test_result():
     result = trtllm.Result()
     result.is_final = True

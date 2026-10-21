@@ -929,29 +929,6 @@ size_t Serialization::serializedSize(Tensor const& tensor)
     return totalSize;
 }
 
-// SpeculativeDecodingFastLogitsInfo
-SpeculativeDecodingFastLogitsInfo Serialization::deserializeSpecDecFastLogitsInfo(std::istream& is)
-{
-    auto draftRequestId = su::deserialize<uint64_t>(is);
-    auto draftParticipantId = su::deserialize<int32_t>(is);
-
-    return SpeculativeDecodingFastLogitsInfo{draftRequestId, draftParticipantId};
-}
-
-void Serialization::serialize(SpeculativeDecodingFastLogitsInfo const& info, std::ostream& os)
-{
-    su::serialize(info.draftRequestId, os);
-    su::serialize(info.draftParticipantId, os);
-}
-
-size_t Serialization::serializedSize(SpeculativeDecodingFastLogitsInfo const& info)
-{
-    size_t totalSize = 0;
-    totalSize += su::serializedSize(info.draftRequestId);
-    totalSize += su::serializedSize(info.draftParticipantId);
-    return totalSize;
-}
-
 // Result
 Result Serialization::deserializeResult(std::istream& is)
 {
@@ -1065,28 +1042,6 @@ std::vector<char> Serialization::serialize(std::vector<Response> const& response
         su::serialize(response, os);
     }
     return buffer;
-}
-
-AdditionalOutput Serialization::deserializeAdditionalOutput(std::istream& is)
-{
-    return {
-        Serialization::deserializeString(is),
-        Serialization::deserializeTensor(is),
-    };
-}
-
-void Serialization::serialize(AdditionalOutput const& additionalOutput, std::ostream& os)
-{
-    su::serialize(additionalOutput.name, os);
-    su::serialize(additionalOutput.output, os);
-}
-
-size_t serializedSize(AdditionalOutput const& additionalOutput)
-{
-    size_t totalSize = 0;
-    totalSize += su::serializedSize(additionalOutput.name);
-    totalSize += su::serializedSize(additionalOutput.output);
-    return totalSize;
 }
 
 // KvCacheConfig

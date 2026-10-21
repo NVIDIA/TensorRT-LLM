@@ -723,34 +723,6 @@ private:
     std::unique_ptr<Impl> mImpl;
 };
 
-/// @brief Struct that holds the logits information when using direct transfer
-struct SpeculativeDecodingFastLogitsInfo
-{
-    /// @brief Draft request id
-    uint64_t draftRequestId;
-
-    /// @brief MPI world rank of the draft model leader
-    int32_t draftParticipantId;
-};
-
-struct AdditionalOutput
-{
-    AdditionalOutput(std::string name, Tensor output)
-        : name(std::move(name))
-        , output(std::move(output))
-    {
-    }
-
-    AdditionalOutput(AdditionalOutput const& other) = default;
-    AdditionalOutput(AdditionalOutput&& other) noexcept = default;
-    AdditionalOutput& operator=(AdditionalOutput const& other) = default;
-    AdditionalOutput& operator=(AdditionalOutput&& other) noexcept = default;
-    ~AdditionalOutput() = default;
-
-    std::string name;
-    Tensor output;
-};
-
 /// @brief Struct that holds the generation result
 struct Result
 {
