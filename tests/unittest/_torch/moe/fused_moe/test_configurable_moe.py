@@ -138,6 +138,42 @@ def test_layerwise_quant_config_is_applied_before_weight_creation() -> None:
     backend.create_weights.assert_called_once_with()
 
 
+def test_override_builds_the_backend_on_a_shallow_copy() -> None:
+    """The backend sees the override; the caller's config, and the per-weight
+    ``quant_config_dict`` every layer shares, are left as they were."""
+    global_config = QuantConfig()
+    override = QuantConfig(quant_algo=QuantAlgo.FP8)
+    model_config = ModelConfig(
+        quant_config=global_config,
+        quant_config_dict={"model.layers.0.mlp.experts": override},
+    )
+    skip_create_weights = model_config.skip_create_weights_in_init
+    wrapper = _wrapper()
+
+    with (
+        patch(
+            "tensorrt_llm._torch.moe.fused_moe.create_moe.resolve_moe_cls",
+            return_value=Mock(),
+        ),
+        patch(
+            "tensorrt_llm._torch.moe.fused_moe.create_moe.create_moe_backend",
+            return_value=_backend_mock(),
+        ) as create_moe_backend,
+    ):
+        wrapper._create_and_sync_backend(
+            model_config=model_config,
+            routing_method=Mock(),
+            override_quant_config=override,
+        )
+
+    backend_config = create_moe_backend.call_args.kwargs["model_config"]
+    assert backend_config is not model_config
+    assert backend_config.quant_config is override
+    assert backend_config.quant_config_dict is model_config.quant_config_dict
+    assert model_config.quant_config is global_config
+    assert model_config.skip_create_weights_in_init == skip_create_weights
+
+
 def test_exclusions_only_recreate_matching_moe_weights() -> None:
     quant_config = QuantConfig(
         quant_algo=QuantAlgo.FP8,

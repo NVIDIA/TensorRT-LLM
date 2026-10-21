@@ -17,14 +17,15 @@
 import hashlib
 from dataclasses import dataclass
 from enum import Enum
-from typing import TYPE_CHECKING, Dict, FrozenSet, List, Optional, Protocol, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import torch
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.utils import ActivationType
-    from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
+    from tensorrt_llm.models.modeling_utils import QuantAlgo
 
+    from .impl_base import MoEImplBase
     from .moe_load_balancer import SingleLayerMoeLoadBalancer
     from .routing import BaseMoeRoutingMethod, RoutingMethodType
 
@@ -339,8 +340,9 @@ class MoERejectReason(str, Enum):
     NOT_AN_IMPL = "not_an_impl"
 
 
-# Rejections no deployment change can lift: the candidate implements another
-# format, or has no kernel for this SM. They say it was never in the running.
+# Rejections that usually mean the candidate implements another format or has
+# no kernel for this SM. A best-effort signal: the CUTLASS build gate also
+# answers QUANT_UNSUPPORTED, and not every candidate checks format and SM first.
 _NOT_A_CONTENDER = frozenset({MoERejectReason.QUANT_UNSUPPORTED, MoERejectReason.SM_UNSUPPORTED})
 
 
@@ -399,14 +401,7 @@ def check_quant_matches_identity(cls: type, p: "MoEProblem") -> Optional[MoEElig
     return None
 
 
-class _BuiltLayer(Protocol):
-    """What :func:`require_layer_quant_format` reads off an implementation."""
-
-    quant_config: Optional["QuantConfig"]
-    layer_idx: Optional[int]
-
-
-def require_layer_quant_format(impl: _BuiltLayer, expected: str) -> None:
+def require_layer_quant_format(impl: "MoEImplBase", expected: str) -> None:
     """Raise unless ``impl``'s final ``quant_config`` is the format ``expected``.
 
     A leaf is one format, picked from the layer's quantization when
@@ -503,9 +498,9 @@ class MoEResolutionReport:
     eligible: Tuple[str, ...] = ()
     requested: Optional[str] = None  # backend literal, as written
     env_fingerprint: str = ""
-    # Legacy names of the implementations the request named (its backend
-    # family, or the pin's matches); the fallback candidates are not in it.
-    requested_impls: FrozenSet[str] = frozenset()
+    # ``MoERejection.legacy_backend`` names of what the request named: its
+    # backend family, or the pin's matches. Fallback candidates are excluded.
+    requested_impls: frozenset[str] = frozenset()
 
     @property
     def alternatives(self) -> Tuple[str, ...]:
@@ -523,18 +518,23 @@ class MoEResolutionReport:
         return self.selected_by == "heuristic"
 
     @property
+    def requested_rejections(self) -> tuple[MoERejection, ...]:
+        """The rejections of the implementations the request named, in priority
+        order; the fallback candidates' are not among them."""
+        return tuple(r for r in self.rejected if r.legacy_backend in self.requested_impls)
+
+    @property
     def degraded_from(self) -> Optional[MoERejection]:
-        """The rejection that caused the substitution, if there was one."""
+        """The most telling of :attr:`requested_rejections`, if anything degraded.
+
+        Reason codes only approximate which implementation was a contender, so
+        the degradation warning lists every requested rejection as well.
+        """
         if not self.degraded or not self.rejected:
             return None
-        # Only the requested implementations' rejections explain the fallback;
-        # the fallback candidates are asked after them. Within a multi-leaf
-        # family most members are not contenders for this layer on this host,
-        # so the reported one is the highest-priority requested implementation
-        # that declined for any other reason: the one the request would have
-        # run had that reason not applied. Without one, an SM mismatch still
-        # says more than a format mismatch.
-        requested = [r for r in self.rejected if r.legacy_backend in self.requested_impls]
+        # The first one declined for a reason other than format/SM, else one
+        # declined on SM, else the first.
+        requested = self.requested_rejections
         for rejection in requested:
             if rejection.reason not in _NOT_A_CONTENDER:
                 return rejection
@@ -600,21 +600,26 @@ class MoEResolutionReport:
         )
         return f"{head}; turned down: {turned_down}"
 
-    def describe_rejections(self) -> str:
+    def describe_rejections(self, *, requested_only: bool = False) -> str:
         """Every rejection with its detail, not just the reason code.
 
         For the no-winner case, where the reasons are the outcome rather than
         context for a choice and the operator needs them to know which
-        constraint to relax. :meth:`describe` stays the summary.
+        constraint to relax; with ``requested_only``, for a degradation, where
+        only the requested implementations explain it. :meth:`describe` stays
+        the summary.
         """
-        if not self.rejected:
+        rejections = (
+            self.requested_rejections if requested_only and self.requested_impls else self.rejected
+        )
+        if not rejections:
             # Nothing was turned down because nothing was asked: the candidate
             # list is the bug, and that is a different diagnosis from silence.
             return "(no candidate was considered)"
         return "; ".join(
             f"{rejection.legacy_backend}: {rejection.reason.value}"
             + (f" ({rejection.detail})" if rejection.detail else "")
-            for rejection in self.rejected
+            for rejection in rejections
         )
 
 

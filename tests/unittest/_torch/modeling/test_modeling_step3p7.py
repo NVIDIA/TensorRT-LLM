@@ -377,6 +377,8 @@ class TestStep3p7Helpers(unittest.TestCase):
             pretrained_config=text_config,
             mapping=types.SimpleNamespace(enable_attention_dp=True, tp_size=1),
             lora_config=object(),
+            quant_config=None,
+            quant_config_dict=None,
         )
 
         for moe_lora_enabled in (False, True):

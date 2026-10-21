@@ -179,8 +179,7 @@ def find_backend_classes(
     absent. A caller asking whether a case is *supported* has to ask the same
     way, or it skips cases the layer under test goes on to serve.
 
-    CUTLASS is the same shape for ``fp8_block_scales``: one leaf per SM family,
-    and only asking both tells a skip from a case the device serves.
+    For CUTLASS ``fp8_block_scales`` these are the SM90 and SM120 leaves.
 
     :func:`find_backend_class` stays for callers that want to name one class.
     """

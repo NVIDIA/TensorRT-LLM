@@ -28,8 +28,7 @@ class TrtllmCutlassMxfp8Impl(CutlassFusedMoEBase):
 
     W8A8 e4m3 x e4m3 with UE8M0 1x32 block scales on both sides. Shares the
     MXFP4 family's activation quantization; only the weight element widens from
-    fp4 to fp8. Outside the reference VanillaMoE, no other MoE implementation
-    serves this format.
+    fp4 to fp8.
     """
 
     descriptor = cutlass_descriptor(

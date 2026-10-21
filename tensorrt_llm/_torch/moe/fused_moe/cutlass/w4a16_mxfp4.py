@@ -30,8 +30,7 @@ from .identity import cutlass_descriptor
 class TrtllmCutlassW4a16Mxfp4Impl(CutlassFusedMoEBase):
     """``trtllm.cutlass.grouped_gemm.w4a16_mxfp4``.
 
-    SM90 only: the TRTLLM-Gen leaves cover this format on Blackwell, and the
-    weight method raises outside SM90.
+    SM90 only; the weight method raises elsewhere.
     """
 
     descriptor = cutlass_descriptor(

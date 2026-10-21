@@ -576,7 +576,9 @@ quantization to `create_moe` as `override_quant_config`.
 `modeling_utils.moe_experts_quant_config(model_config, experts_prefix)` computes
 it the way the `__post_init__` passes would (the `quant_config_dict` entry, by
 the match `apply_layerwise_quant_config` uses, then the `exclude_modules`
-match); `Qwen3MoE` and `NemotronHMOE` use it.
+match); every MoE model without a lookup of its own passes it at its
+`create_moe` call. GptOss does not: its `__post_init__` rewrites
+`exclude_modules` after the layers are built.
 
 The model's `__post_init__` passes (`apply_layerwise_quant_config`,
 `apply_quant_config_exclude_modules`) can still rewrite a layer's
@@ -742,14 +744,17 @@ Public routing helpers remain available in either build.
 The build mode is collected once into `MoEEnvironment.oss_cutlass_moe` and
 included in its fingerprint. Libraries without the build-mode query preserve
 the OSS default. One family gate, `cutlass/eligibility.check_oss_cutlass_build`,
-runs in every CUTLASS leaf after its support gates and rejects SiTu and Relu2,
+runs after the support gates in every CUTLASS leaf that issues
+`torch.ops.trtllm.fused_moe` (`issues_fused_moe_op`; not the SM120 Triton leaf)
+and rejects SiTu and Relu2,
 the formats whose leaf sets `requires_oss_cutlass_build` (`MXFP8`,
 `W4A8_MXFP4_MXFP8`, `W4A16_MXFP4`, `W4A8_AWQ`), dynamic FC2 scaling on the leaf
 that sets `uses_dynamic_fc2_scale` (`NVFP4`), post-SiLU clamping, and
 routed-expert LoRA. The B12x NVFP4 leaf runs the same gate for the prefill
 chunks it routes through CUTLASS. W4A8 AWQ uses per-expert activation-scale
 buffers and is unavailable in the legacy build. `CutlassFusedMoEBase` exposes
-`supports_alltoall` before communication selection. Unsupported auto-selection
+`supports_alltoall` before communication selection; it is False only for a
+leaf that issues the op on a legacy build. Unsupported auto-selection
 falls back to AllGather/ReduceScatter, and
 explicit all-to-all requests fail before allocation. Construction validation
 retains an all-to-all backstop. Input layout and token-count options supplied

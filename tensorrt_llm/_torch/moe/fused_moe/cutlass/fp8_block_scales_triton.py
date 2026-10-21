@@ -23,10 +23,12 @@ from ..impl_contract import (
     MoEDeployment,
     MoEEligibility,
     MoEProblem,
+    MoERejectReason,
     MoERunContext,
     require_comm_plan,
 )
 from ..impl_identity import register_moe_impl
+from ..interface import _reject
 from ..quantization import DeepSeekFP8BlockScalesFusedMoEMethod
 from .base import CutlassFusedMoEBase
 from .eligibility import BF16_ONLY, SmSupport, check_cutlass_leaf
@@ -39,14 +41,15 @@ class TrtllmTritonFp8BlockScalesImpl(CutlassFusedMoEBase):
 
     FP8 block scales on SM120, where CUTLASS TMA fails for large token counts
     (``cuTensorMapEncodeTiled`` limitations). The whole MoE runs in
-    ``run_triton_fp8_block_scale_moe`` and never enters C++; the leaf takes
-    only construction and the layer-format check from ``CutlassFusedMoEBase``.
+    ``run_triton_fp8_block_scale_moe``, which never enters C++.
     """
 
     descriptor = cutlass_descriptor(
         "fp8_block_scales",
         "Internal Triton FP8 block-scale grouped GEMM, SM120.",
         technique=TECHNIQUE_TRITON,
+        # run_triton_fp8_block_scale_moe takes no bias operands.
+        supports_expert_bias=False,
     )
     sm_support = SmSupport(allowed=frozenset({120}))
     #: The Triton kernel is instantiated for BF16 activations only.
@@ -55,10 +58,30 @@ class TrtllmTritonFp8BlockScalesImpl(CutlassFusedMoEBase):
     activation_support = MoEActivationSupport(
         kinds=frozenset({ActivationType.Swiglu, ActivationType.Geglu})
     )
+    issues_fused_moe_op = False
 
     @classmethod
     def can_implement(cls, p: MoEProblem, d: MoEDeployment) -> MoEEligibility:
-        return check_cutlass_leaf(cls, p, d)
+        return check_cutlass_leaf(cls, p, d, cls._check_activation(p))
+
+    @classmethod
+    def _check_activation(cls, p: MoEProblem) -> MoEEligibility | None:
+        """Reject an activation kind or clamp order the kernel does not run.
+
+        Resolution also checks ``activation_support``; this answers a direct
+        call, which the OSS build gate no longer covers for this leaf.
+        """
+        if p.activation_type not in cls.activation_support.kinds:
+            return _reject(
+                MoERejectReason.ACTIVATION_UNSUPPORTED,
+                f"{cls.__name__} does not execute {p.activation}",
+            )
+        if p.clamp_after_silu:
+            return _reject(
+                MoERejectReason.ACTIVATION_UNSUPPORTED,
+                f"{cls.__name__} does not implement post-SiLU clamping",
+            )
+        return None
 
     def _get_quant_method(self) -> object:
         return DeepSeekFP8BlockScalesFusedMoEMethod()
@@ -78,16 +101,10 @@ class TrtllmTritonFp8BlockScalesImpl(CutlassFusedMoEBase):
         if token_final_scales is None:
             token_final_scales = torch.ones_like(ctx.token_selected_experts, dtype=torch.float32)
 
-        # The kernel indexes local experts, but the ids are global slots with or
-        # without alltoall: dispatch keeps the global numbering and marks
-        # padding with an id no rank owns (-1, or num_slots for DeepEP low
-        # latency). Shift them into this rank's range and zero the scale of any
-        # pair this rank does not own.
-        local_n = self.expert_size_per_partition
-        ids = ctx.token_selected_experts - self.slot_start
-        is_local = (ids >= 0) & (ids < local_n)
-        local_ids = ids.clamp(0, local_n - 1)
-        local_scales = token_final_scales * is_local.to(token_final_scales.dtype)
+        # The kernel indexes local experts; zero the scale of every pair this
+        # rank does not own.
+        local_ids, offsets = self._local_slot_ids(ctx.token_selected_experts)
+        local_scales = token_final_scales * (local_ids == offsets).to(token_final_scales.dtype)
 
         return run_triton_fp8_block_scale_moe(
             ctx.x,

@@ -39,8 +39,7 @@ class TrtllmCutlassW4a16Nvfp4Impl(CutlassFusedMoEBase):
 
     Weights stay NVFP4 in memory and are dequantized to the activation dtype
     every forward, so what runs is the unquantized kernel and the SM range is
-    that path's. AUTO routes here only outside SM90-99 (MARLIN) and SM120/121
-    (CuteDSL B12x); see ``ModelConfig.resolve_moe_backend``.
+    that path's.
     """
 
     descriptor = cutlass_descriptor(
@@ -68,12 +67,9 @@ class TrtllmCutlassW4a16Nvfp4Impl(CutlassFusedMoEBase):
         require_comm_plan(self, ctx)
         if ctx.output_dtype is None:
             ctx = replace(ctx, output_dtype=ctx.x.dtype)
-        # Dispatch preserves global slot IDs. Dequantization indexes local
-        # weights; clamp padding and non-local IDs to keep its scatter in bounds.
-        # The MoE kernel receives the global IDs and filters non-local work.
-        local_ids = (ctx.token_selected_experts - self.slot_start).clamp(
-            0, self.expert_size_per_partition - 1
-        )
+        # Dequantization indexes local weights; the MoE kernel receives the
+        # global ids and filters non-local work itself.
+        local_ids, _ = self._local_slot_ids(ctx.token_selected_experts)
         w3_w1_hp, w2_hp = self.quant_method.dequant_active_experts_to_hp(
             self, local_ids, ctx.output_dtype
         )

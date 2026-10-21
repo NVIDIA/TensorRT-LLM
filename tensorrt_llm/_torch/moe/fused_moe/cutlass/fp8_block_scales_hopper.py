@@ -32,10 +32,13 @@ class DeepgemmCudaHopperFp8BlockScalesImpl(CutlassFusedMoEBase):
     """``deepgemm.cuda.hopper_grouped_gemm.fp8_block_scales``.
 
     FP8 block scales on SM90. ``use_deepseek_fp8_block_scale=True`` makes
-    ``CutlassMoeFCRunner`` hand FC1/FC2 to the vendored DeepGEMM
-    (``cpp/tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/``), hence
-    the identity; permute, activation and finalize stay in the CUTLASS runner,
-    hence the family. The runner quantizes activations itself.
+    ``CutlassMoeFCRunner`` run FC1/FC2 through
+    ``cpp/tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/``, which is
+    built on TRT-LLM's DeepGEMM port (``cpp/include/tensorrt_llm/deep_gemm``),
+    hence the identity; permute, activation and finalize stay in the CUTLASS
+    runner, hence the family. The runner quantizes activations itself. Only
+    ``kernel_name`` separates this identity from the SM100/103/107 leaf in
+    ``..fused_moe_deepgemm``.
     """
 
     descriptor = cutlass_descriptor(

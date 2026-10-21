@@ -81,10 +81,7 @@ class CutlassMoELoraMixin:
         self.lora = self._maybe_make_lora_marker(model_config)
 
     def _has_moe_lora_targets(self, model_config: ModelConfig) -> bool:
-        """Return True iff this MoE layer is in the routed-expert LoRA
-        target-module set. The LoRA application itself is fused into
-        `torch.ops.trtllm.fused_moe`; no submodule is registered.
-        """
+        """Whether this layer is in the routed-expert LoRA target-module set."""
         return has_moe_lora_targets(getattr(model_config, "lora_config", None))
 
     def _maybe_make_lora_marker(self, model_config: ModelConfig) -> MoeLoraLayer | None:

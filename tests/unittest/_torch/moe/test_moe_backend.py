@@ -77,6 +77,7 @@ from tensorrt_llm._torch.moe.fused_moe.cutlass import (
     TrtllmCutlassW4a16Nvfp4Impl,
     TrtllmTritonFp8BlockScalesImpl,
 )
+from tensorrt_llm._torch.moe.fused_moe.cutlass.base import FusedMoeOpFlags
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl import (
     CuteDslFusedMoE,
     CuteDslFusedMoENvfp4Runner,
@@ -4589,7 +4590,7 @@ def _cutlass_leaf_on_cpu(leaf_cls):
     leaf.hidden_size = 8
     leaf.unpadded_hidden_size = 8
     leaf.force_dynamic_quantization = False
-    # Present on every leaf so the LoRA mixin's extraction is what decides.
+    # Stubbed on every leaf, so only whether run_moe calls it decides.
     leaf._extract_moe_lora_tensors = lambda lora_params: dict(_LORA_SENTINEL)
     return leaf
 
@@ -4624,13 +4625,7 @@ def _record_fused_moe(monkeypatch) -> list:
     return calls
 
 
-_FLAG_KWARGS = (
-    "use_deepseek_fp8_block_scale",
-    "use_w4_group_scaling",
-    "use_int8_woq_per_channel",
-    "use_mxfp8_act_scaling",
-    "use_mxfp8_weight_scaling",
-)
+_FLAG_KWARGS = tuple(FusedMoeOpFlags().op_kwargs())
 
 
 @pytest.mark.cpu_only
@@ -4700,19 +4695,25 @@ def test_cutlass_nvfp4_dynamic_fc2_scale_reaches_the_op(monkeypatch):
     assert calls[0]["quant_scales"][-1] is leaf.fc2_weight_scale_2
 
 
+_B12X_PREFILL_THRESHOLD = CuteDslB12xNvfp4FusedMoE._PREFILL_VIA_CUTLASS_THRESHOLD
+
+
 @pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "leaf_cls, num_tokens, reaches_cutlass",
     [
-        pytest.param(CuteDslB12xNvfp4FusedMoE, 64, True, id="nvfp4-prefill"),
-        pytest.param(CuteDslB12xNvfp4FusedMoE, 63, False, id="nvfp4-decode"),
-        pytest.param(CuteDslB12xW4a16Nvfp4FusedMoE, 64, False, id="w4a16-prefill"),
+        pytest.param(CuteDslB12xNvfp4FusedMoE, _B12X_PREFILL_THRESHOLD, True, id="nvfp4-prefill"),
+        pytest.param(
+            CuteDslB12xNvfp4FusedMoE, _B12X_PREFILL_THRESHOLD - 1, False, id="nvfp4-decode"
+        ),
+        pytest.param(
+            CuteDslB12xW4a16Nvfp4FusedMoE, _B12X_PREFILL_THRESHOLD, False, id="w4a16-prefill"
+        ),
     ],
 )
 def test_b12x_reaches_the_cutlass_op_only_for_an_nvfp4_prefill_chunk(
     leaf_cls, num_tokens, reaches_cutlass, monkeypatch
 ):
-    assert CuteDslB12xNvfp4FusedMoE._PREFILL_VIA_CUTLASS_THRESHOLD == 64
     calls = _record_fused_moe(monkeypatch)
     leaf = _cutlass_leaf_on_cpu(leaf_cls)
     leaf._run_b12x_decode = MagicMock(return_value=torch.zeros(num_tokens, 8))

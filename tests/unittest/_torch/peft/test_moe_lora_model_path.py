@@ -463,6 +463,8 @@ def test_step3p7_moe_lora_uses_clamp_capable_expert_path() -> None:
         pretrained_config=text_config,
         mapping=SimpleNamespace(enable_attention_dp=True, tp_size=1),
         lora_config=object(),
+        quant_config=None,
+        quant_config_dict=None,
     )
 
     with (

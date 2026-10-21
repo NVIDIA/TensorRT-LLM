@@ -60,7 +60,6 @@ from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl_b12x import (
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl_fc12 import (
     TrtllmCutedslFusedFc12Nvfp4Impl,
 )
-from tensorrt_llm._torch.moe.fused_moe.fused_moe_cutlass import CutlassFusedMoE
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_deepgemm import (
     DeepgemmCudaFp8BlockScalesImpl,
     DeepGemmFusedMoE,
@@ -80,6 +79,8 @@ from tensorrt_llm._torch.moe.fused_moe.impl_contract import (
     MoEResolutionReport,
     canonical_quant,
     canonical_routing,
+    identity_quant_of,
+    normalize_quant,
 )
 from tensorrt_llm._torch.moe.fused_moe.impl_environment import (
     MoEDep,
@@ -124,8 +125,7 @@ from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 # CPU stage collects only files that carry it.
 pytestmark = pytest.mark.cpu_only
 
-# The four abstract ``MoEImplBase`` methods; a single-format class defines all
-# four itself.
+# The four abstract ``MoEImplBase`` methods.
 _ABSTRACT_METHODS = ("can_implement", "_get_quant_method", "quantize_input", "run_moe")
 
 # =====================================================================
@@ -205,8 +205,7 @@ def test_identity_matching_nothing_registered_raises():
     """Built as a query rather than parsed, to get past the token vocabulary.
 
     ``w8a8_sq_per_channel`` because SmoothQuant has no MoE implementation,
-    which is what makes the query match nothing while staying well-formed
-    (``fp8`` and ``nvfp4`` are both registered, by CUTLASS leaves among others).
+    which is what makes the query match nothing while staying well-formed.
     """
     with override_moe_environment(_deepgemm_environment()):
         with pytest.raises(ValueError, match="matches no registered implementation"):
@@ -1146,6 +1145,7 @@ def _cutlass_model_config(quant_algo=QuantAlgo.NVFP4):
 _HP = frozenset({torch.float16, torch.bfloat16})
 _HP_FP32 = _HP | {torch.float32}
 _FROM_AMPERE = frozenset(range(80, 125))
+_PROBED_DTYPES = (torch.float16, torch.bfloat16, torch.float32, torch.float8_e4m3fn)
 
 # Every CUTLASS leaf's declarations, written out by hand rather than read off
 # the leaves, so one that drifts fails here: the SMs it admits (probed over
@@ -1284,8 +1284,22 @@ def test_cutlass_declarations_cover_every_leaf():
     "leaf, sms, dtypes, gptoss, oss_build, flags, fuses_lora", _CUTLASS_DECLARATIONS
 )
 def test_cutlass_leaf_declarations(leaf, sms, dtypes, gptoss, oss_build, flags, fuses_lora):
-    assert {sm for sm in range(75, 125) if leaf.sm_support.accepts(sm)} == set(sms)
-    assert leaf.supported_dtypes == frozenset(dtypes)
+    # SM and dtype support are probed through can_implement, so a gate that
+    # stops enforcing a declaration fails here, not only a declaration change.
+    identity = identity_quant_of(leaf)
+    quant = next(
+        canonical_quant(algo)
+        for algo in (None, *QuantAlgo)
+        if normalize_quant(canonical_quant(algo)) == identity
+    )
+
+    def admits(sm: int, dtype: torch.dtype) -> bool:
+        problem = MoEProblem(quant=quant, dtype_act=dtype)
+        deployment = _single_rank_deployment(MoEEnvironment(sm=sm))
+        return leaf.can_implement(problem, deployment).eligible
+
+    assert {sm for sm in range(75, 125) if admits(sm, torch.bfloat16)} == set(sms)
+    assert {dtype for dtype in _PROBED_DTYPES if admits(min(sms), dtype)} == set(dtypes)
     assert (leaf.supports_gptoss_style, leaf.rejects_gptoss_expert_bias) == gptoss
     assert (leaf.requires_oss_cutlass_build, leaf.uses_dynamic_fc2_scale) == oss_build
     assert leaf.FUSED_MOE_OP_FLAGS == flags
@@ -1294,15 +1308,11 @@ def test_cutlass_leaf_declarations(leaf, sms, dtypes, gptoss, oss_build, flags, 
     assert leaf.capabilities.supports_moe_lora is fuses_lora
     assert issubclass(leaf, CutlassMoELoraMixin) is fuses_lora
 
-    # Taken off the leaf's own descriptor, which the registry returns it for.
+    # Taken off the leaf's own descriptor.
     assert "descriptor" in vars(leaf)
-    assert MOE_IMPL_REGISTRY.lookup(leaf.descriptor.identity) is leaf
     assert leaf.scheduler_kind is leaf.descriptor.scheduler_kind
     assert leaf.capabilities is leaf.descriptor.capabilities
     assert leaf.input_requirement is leaf.descriptor.input_requirement
-    # Concrete, and under the family name create_moe_backend dispatches on.
-    assert not leaf.__abstractmethods__
-    assert issubclass(leaf, CutlassFusedMoE)
 
 
 @pytest.mark.parametrize(
@@ -1374,6 +1384,15 @@ def test_degradation_names_the_first_requested_rejection_not_about_format_or_sm(
 
     only_format = dataclasses.replace(report, rejected=report.rejected[:1])
     assert only_format.degraded_from.legacy_backend == "OtherFormat"
+
+    # A fallback leaf's SM rejection outranks a format one, but is never the cause.
+    with_fallback = dataclasses.replace(report, rejected=(report.rejected[0], report.rejected[3]))
+    assert with_fallback.degraded_from.legacy_backend == "OtherFormat"
+
+    # The warning lists every requested rejection, never a fallback's.
+    described = report.describe_rejections(requested_only=True)
+    assert all(name in described for name in ("OtherFormat", "OtherSm", "ServesFormat"))
+    assert "FallbackLeaf" not in described
 
 
 def test_cutedsl_degradation_is_not_blamed_on_the_sm120_leaf():
@@ -1562,6 +1581,75 @@ def test_fp8_block_scales_leaves_admit_only_what_their_kernel_runs(
         assert report.winner is None
         assert report.rejected[-1].reason is MoERejectReason.ACTIVATION_UNSUPPORTED
         assert rejection in report.rejected[-1].detail
+
+
+@pytest.mark.parametrize("bias", [False, True], ids=["no_bias", "bias"])
+def test_triton_fp8_block_scales_leaf_declines_an_expert_bias(bias):
+    """The Triton kernel has no bias operand, so a biased layer is declined
+    rather than run without its bias."""
+    problem = MoEProblem(
+        quant=canonical_quant(QuantAlgo.FP8_BLOCK_SCALES),
+        dtype_act=torch.bfloat16,
+        bias=bias,
+    )
+    verdict = TrtllmTritonFp8BlockScalesImpl.can_implement(
+        problem, _single_rank_deployment(MoEEnvironment(sm=120))
+    )
+
+    assert verdict.eligible is not bias
+    assert TrtllmTritonFp8BlockScalesImpl.capabilities.supports_expert_bias is False
+    if bias:
+        assert verdict.reject_reason is MoERejectReason.ACTIVATION_UNSUPPORTED
+
+
+@pytest.mark.parametrize("is_oss", [True, False], ids=["oss", "internal"])
+@pytest.mark.parametrize(
+    "activation, clamp_after_silu, detail",
+    [
+        pytest.param("Swiglu", True, "post-SiLU clamping", id="post_silu_clamp"),
+        pytest.param("Relu2", False, "does not execute Relu2", id="relu2"),
+    ],
+)
+def test_triton_fp8_block_scales_leaf_declines_what_its_kernel_lacks(
+    is_oss, activation, clamp_after_silu, detail
+):
+    """Declined by the leaf itself, not only by resolution, and never blamed on
+    the build: the Triton kernel never enters the CUTLASS op."""
+    problem = MoEProblem(
+        quant=canonical_quant(QuantAlgo.FP8_BLOCK_SCALES),
+        dtype_act=torch.bfloat16,
+        activation=activation,
+        clamp_after_silu=clamp_after_silu,
+    )
+    verdict = TrtllmTritonFp8BlockScalesImpl.can_implement(
+        problem, _single_rank_deployment(MoEEnvironment(sm=120, oss_cutlass_moe=is_oss))
+    )
+
+    assert verdict.reject_reason is MoERejectReason.ACTIVATION_UNSUPPORTED
+    assert detail in verdict.detail
+    assert "USING_OSS_CUTLASS_MOE_GEMM" not in verdict.detail
+
+
+def test_only_leaves_issuing_the_op_are_bound_by_the_oss_build():
+    """The legacy kernel archive limits ``torch.ops.trtllm.fused_moe``; the
+    Triton leaf never calls it, so a legacy build keeps its all-to-all."""
+    with override_moe_environment(MoEEnvironment(sm=120, oss_cutlass_moe=False)):
+        triton_leaf = TrtllmTritonFp8BlockScalesImpl.__new__(TrtllmTritonFp8BlockScalesImpl)
+        nvfp4_leaf = TrtllmCutlassNvfp4Impl.__new__(TrtllmCutlassNvfp4Impl)
+        assert triton_leaf.supports_alltoall
+        assert not nvfp4_leaf.supports_alltoall
+
+
+def test_cutlass_build_gate_does_not_answer_for_an_unsupported_sm():
+    """An internal build has no MXFP8 kernel, but no build has one for SM90:
+    the leaf names the SM, so nobody rebuilds for a GPU that cannot run it."""
+    problem = MoEProblem(quant=canonical_quant(QuantAlgo.MXFP8), dtype_act=torch.bfloat16)
+    verdict = TrtllmCutlassMxfp8Impl.can_implement(
+        problem, _single_rank_deployment(MoEEnvironment(sm=90, oss_cutlass_moe=False))
+    )
+
+    assert verdict.reject_reason is MoERejectReason.SM_UNSUPPORTED
+    assert "USING_OSS_CUTLASS_MOE_GEMM" not in verdict.detail
 
 
 # =====================================================================
@@ -2077,18 +2165,3 @@ def test_b12x_lora_rejection_is_build_independent(is_oss):
     assert not verdict.eligible
     assert verdict.reject_reason is MoERejectReason.LORA_UNSUPPORTED
     assert verdict.detail == "CuteDslB12xNvfp4FusedMoE does not fuse routed-expert LoRA"
-
-
-@pytest.mark.parametrize(
-    "leaf",
-    [CuteDslB12xNvfp4FusedMoE, CuteDslB12xW4a16Nvfp4FusedMoE],
-    ids=["nvfp4", "w4a16_nvfp4"],
-)
-@pytest.mark.parametrize("num_tokens", [63, 64, 65])
-def test_b12x_cutlass_prefill_routing(leaf, num_tokens):
-    """A leaf hands a chunk to CUTLASS only if it also runs the CUTLASS build gate."""
-    backend = leaf.__new__(leaf)
-    torch.nn.Module.__init__(backend)
-    route = getattr(backend, "_route_to_cutlass", None)
-    routed = route is not None and route(torch.empty(num_tokens, 1))
-    assert routed is (leaf._prefill_uses_cutlass and num_tokens >= 64)

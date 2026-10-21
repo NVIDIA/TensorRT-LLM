@@ -40,6 +40,7 @@ from ..moe.fused_moe import (BaseMoeRoutingMethod, ConfigurableMoE,
 from ..speculative import SpecMetadata
 from ..utils import AuxStreamType, Fp4QuantizedTensor
 from .modeling_llama import Llama4Attention, Llama4DecoderLayer, Llama4MoE
+from .modeling_utils import moe_experts_quant_config
 
 # Perf heuristics thresholds.
 # Use routing gemv kernels when num_tokens <= 8.
@@ -470,13 +471,16 @@ class Llama4MinLatencyFusedMoE(ConfigurableMoE):
         weight_loading_mode: MoEWeightLoadingMode = MoEWeightLoadingMode.
         VANILLA,
         apply_router_weight_on_input: bool = False,
+        override_quant_config: Optional[QuantConfig] = None,
     ):
 
-        quant_algo = (model_config.quant_config.quant_algo
-                      if model_config.quant_config is not None else None)
+        experts_quant_config = override_quant_config or model_config.quant_config
+        quant_algo = (experts_quant_config.quant_algo
+                      if experts_quant_config is not None else None)
 
         super().__init__(
             moe_cls=cutlass_leaf(quant_algo),
+            override_quant_config=override_quant_config,
             routing_method=routing_method,
             num_experts=num_experts,
             hidden_size=hidden_size,
@@ -494,8 +498,8 @@ class Llama4MinLatencyFusedMoE(ConfigurableMoE):
         if num_experts == 128 \
             and hidden_size == 5120 \
             and intermediate_size == 8192 \
-            and model_config.quant_config is not None \
-            and model_config.quant_config.quant_mode.has_fp8_qdq() \
+            and experts_quant_config is not None \
+            and experts_quant_config.quant_mode.has_fp8_qdq() \
             and model_config.mapping.moe_tp_size == 8 \
             and model_config.mapping.moe_ep_size == 1 \
             and routing_method.top_k == 1 \
@@ -545,17 +549,18 @@ class Llama4MinLatencyFusedMoE(ConfigurableMoE):
 class Llama4MinLatencyMoE(Llama4MoE):
 
     def __init__(
-            self,
-            *,
-            num_experts: int,
-            top_k: int,
-            hidden_size: int,
-            intermediate_size: int,
-            shared_expert_intermediate_size: int,
-            aux_stream: torch.cuda.Stream,
-            dtype: Optional[torch.dtype] = None,
-            tune_max_num_tokens: int = 8192,
-            model_config: ModelConfig = ModelConfig(),
+        self,
+        *,
+        num_experts: int,
+        top_k: int,
+        hidden_size: int,
+        intermediate_size: int,
+        shared_expert_intermediate_size: int,
+        aux_stream: torch.cuda.Stream,
+        dtype: Optional[torch.dtype] = None,
+        tune_max_num_tokens: int = 8192,
+        model_config: ModelConfig = ModelConfig(),
+        layer_idx: Optional[int] = None,
     ):
 
         # First, initialize the base class.
@@ -593,6 +598,9 @@ class Llama4MinLatencyMoE(Llama4MoE):
             model_config=model_config,
             apply_router_weight_on_input=True,
             aux_stream_dict={AuxStreamType.MoeChunkingOverlap: aux_stream},
+            override_quant_config=None
+            if layer_idx is None else moe_experts_quant_config(
+                model_config, f"model.layers.{layer_idx}.feed_forward.experts"),
         )
 
         self.router = Llama4MinLatencyLinear(
@@ -735,7 +743,8 @@ class Llama4MinLatencyDecoderLayer(Llama4DecoderLayer):
                 shared_expert_intermediate_size=config.intermediate_size,
                 model_config=model_config,
                 aux_stream=aux_stream,
-                dtype=config.torch_dtype)
+                dtype=config.torch_dtype,
+                layer_idx=layer_idx)
 
             self.fusion_config.PRE_MOE_FUSION = model_config.mapping.has_tp()
             self.fusion_config.POST_MOE_FUSION = model_config.mapping.has_tp()

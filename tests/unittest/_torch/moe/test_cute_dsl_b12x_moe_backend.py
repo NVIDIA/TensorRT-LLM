@@ -23,6 +23,7 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl_b12x import (
+    CuteDslB12xFusedMoE,
     CuteDslB12xNvfp4FusedMoE,
     CuteDslB12xW4a16Nvfp4FusedMoE,
     _patch_flashinfer_w4a16_ultra_wide_fc2_tile_validation,
@@ -134,6 +135,22 @@ def test_can_implement_rejects_foreign_quant(leaf, rejected_algo):
     assert verdict.reject_reason is MoERejectReason.QUANT_UNSUPPORTED
 
 
+def test_family_name_is_not_an_implementation():
+    """``CuteDslB12xFusedMoE`` names both leaves; asking it gives a verdict that
+    points at them instead of failing on the format it does not carry."""
+    verdict = CuteDslB12xFusedMoE.can_implement(_problem(), _deployment(120))
+    assert verdict.reject_reason is MoERejectReason.NOT_AN_IMPL
+    assert CuteDslB12xNvfp4FusedMoE.__name__ in verdict.detail
+
+
+@pytest.mark.parametrize("alias", [QuantAlgo.NVFP4_AWQ, QuantAlgo.NVFP4_ARC])
+def test_nvfp4_leaf_admits_the_calibration_aliases(alias):
+    """The format gate compares identities, so an uncanonicalized alias is
+    admitted, as the CUTLASS NVFP4 leaf admits it."""
+    problem = MoEProblem(quant=alias.value, dtype_act=torch.bfloat16, intermediate_size=2048)
+    assert NVFP4_LEAF.can_implement(problem, _deployment(120)).eligible
+
+
 def test_can_implement_rejects_swiglu_gptoss_style():
     verdict = NVFP4_LEAF.can_implement(_problem(swiglu_gptoss_style=True), _deployment(120))
     assert not verdict.eligible
@@ -176,15 +193,18 @@ def test_can_implement_rejects_attention_dp_without_expert_parallelism():
     assert "attention-DP" in verdict.detail
 
 
+@pytest.mark.parametrize("leaf,quant_algo", B12X_LEAVES, ids=LEAF_IDS)
 @pytest.mark.parametrize(
     "intermediate_size,eligible",
     [pytest.param(256, True, id="aligned"), pytest.param(192, False, id="unaligned")],
 )
-def test_can_implement_rejects_unaligned_nvfp4_fc1_shard(intermediate_size, eligible):
-    """Prefill runs the CUTLASS NVFP4 GEMM, which splits a padded FC1 shard at
-    the wrong row, so the shapes the CUTLASS leaf refuses are refused here too."""
-    verdict = NVFP4_LEAF.can_implement(
-        _problem(intermediate_size=intermediate_size), _deployment(120, tp_size=2)
+def test_can_implement_rejects_unaligned_nvfp4_fc1_shard(
+    leaf, quant_algo, intermediate_size, eligible
+):
+    """Both leaves consume the FC1 buffer the CUTLASS NVFP4 loader pads, which
+    splits gate/up at the wrong row for an unaligned shard."""
+    verdict = leaf.can_implement(
+        _problem(quant_algo, intermediate_size=intermediate_size), _deployment(120, tp_size=2)
     )
     assert verdict.eligible is eligible
     if not eligible:

@@ -353,8 +353,8 @@ class ConfigurableMoE(MoE):
 
         backend_model_config = model_config
         if override_quant_config is not None:
-            # Only quant_config differs, and quant_config_dict can hold one
-            # entry per quantized weight, so the copy stays shallow.
+            # Only quant_config differs; a shallow copy avoids cloning the
+            # per-weight quant_config_dict for every layer.
             backend_model_config = copy.copy(model_config)
             backend_model_config.quant_config = override_quant_config
 
@@ -399,10 +399,9 @@ class ConfigurableMoE(MoE):
         # Sync done -- now the backend has enough info to allocate weight
         # tensors with the right shard / slot count.
         # Layerwise quantization is applied after the model is constructed, so
-        # allocation waits for the final wrapper quant_config; a backend whose
-        # format is fixed refuses one that differs (require_layer_quant_format).
-        # Module exclusions reset _weights_created on matching modules during
-        # __post_init__, so unrelated exclusions keep eager allocation.
+        # allocation waits for the final wrapper quant_config. Module exclusions
+        # reset _weights_created on matching modules during __post_init__, so
+        # unrelated exclusions keep eager allocation.
         has_post_init_quant_config = model_config.quant_config_dict is not None
         if not backend_model_config.skip_create_weights_in_init and not has_post_init_quant_config:
             self.create_weights()

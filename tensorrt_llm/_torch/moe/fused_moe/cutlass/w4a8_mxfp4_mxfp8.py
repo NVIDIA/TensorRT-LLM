@@ -26,9 +26,7 @@ from .identity import cutlass_descriptor
 class TrtllmCutlassW4a8Mxfp4Mxfp8Impl(CutlassFusedMoEBase):
     """``trtllm.cutlass.grouped_gemm.w4a8_mxfp4_mxfp8``.
 
-    Activations are block-scale quantized per forward. On SM120/121 the
-    TRTLLM-Gen leaves decline on their SM gate, so outside the reference
-    VanillaMoE this is the only implementation of the format there.
+    Activations are MXFP8-quantized per forward.
     """
 
     descriptor = cutlass_descriptor(

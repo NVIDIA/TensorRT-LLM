@@ -15,9 +15,8 @@
 """The checks each Cutlass-family ``can_implement`` composes.
 
 A leaf's support is what it declares -- ``sm_support``, ``supported_dtypes``,
-the gpt-oss and OSS-build flags and ``capabilities`` -- plus the shape gates
-its own ``can_implement`` adds, so reading one leaf tells the whole story for
-its format.
+the gpt-oss and OSS-build flags and ``capabilities`` -- plus the gates its own
+``can_implement`` adds.
 """
 
 from dataclasses import dataclass
@@ -107,6 +106,20 @@ def check_gptoss_activation(cls: type, p: MoEProblem) -> MoEEligibility | None:
     return None
 
 
+def check_expert_bias(cls: type, p: MoEProblem) -> MoEEligibility | None:
+    """Reject an expert FC bias on a leaf whose kernel applies none.
+
+    Declining here lets resolution say so; ``create_moe`` would otherwise
+    refuse the bias only after this leaf was picked.
+    """
+    if p.bias and not cls.capabilities.supports_expert_bias:
+        return _reject(
+            MoERejectReason.ACTIVATION_UNSUPPORTED,
+            f"{cls.__name__} takes no expert bias",
+        )
+    return None
+
+
 def check_moe_lora(cls: type, d: MoEDeployment) -> MoEEligibility | None:
     """Reject routed-expert MoE LoRA on a leaf whose format the op cannot fuse.
 
@@ -130,12 +143,13 @@ def check_oss_cutlass_build(cls: type, p: MoEProblem, d: MoEDeployment) -> MoEEl
     """Reject what only the open-source CUTLASS MoE kernels implement.
 
     A build with ``USING_OSS_CUTLASS_MOE_GEMM=OFF`` runs the op on the bundled
-    internal kernel archive, whose legacy interface has no SiTu or Relu2, no
+    internal kernel archive, which has no SiTu or Relu2, no
     post-SiLU clamp and no routed-expert LoRA. A leaf whose format, or whose
     dynamic FC2 scale, needs the open-source kernels declares it through
-    ``requires_oss_cutlass_build`` / ``uses_dynamic_fc2_scale``.
+    ``requires_oss_cutlass_build`` / ``uses_dynamic_fc2_scale``; a leaf that
+    never issues the op (``issues_fused_moe_op``) is not bound by it.
     """
-    if d.env.oss_cutlass_moe:
+    if d.env.oss_cutlass_moe or not cls.issues_fused_moe_op:
         return None
     if p.activation_type in (ActivationType.SiTu, ActivationType.Relu2):
         return _reject(
@@ -168,25 +182,22 @@ def check_oss_cutlass_build(cls: type, p: MoEProblem, d: MoEDeployment) -> MoEEl
 def check_cutlass_leaf(
     cls: type, p: MoEProblem, d: MoEDeployment, *leaf_gates: MoEEligibility | None
 ) -> MoEEligibility:
-    """Run the family gates in order, then the leaf's own, and admit.
+    """Return the first rejection of the family gates and ``leaf_gates``, else admit.
 
-    Order matters for the message an operator reads: identity first, so a
-    format this leaf does not implement is never described in terms of an SM or
-    dtype it also would not satisfy. The identity gate compares against the
-    descriptor exactly as the registry lookup that routes a problem here does.
-    ``leaf_gates`` are already-evaluated verdicts, computed before the identity
-    gate has had its say: each must be pure and must abstain (``None``) on a
-    format it does not police. The build gate follows the family support gates,
-    so a build limit is never blamed for a problem the leaf turns down anyway.
+    Identity runs first, so a foreign format is never reported as an SM or
+    dtype miss; the build gate runs last, so a build limit is never blamed for a
+    problem the leaf turns down anyway. ``leaf_gates`` are pre-evaluated, so
+    each must be pure and abstain (``None``) on formats it does not police.
     """
     for verdict in (
         check_quant_matches_identity(cls, p),
         check_sm(cls, d),
         check_dtype(cls, p),
         check_gptoss_activation(cls, p),
+        check_expert_bias(cls, p),
         check_moe_lora(cls, d),
-        check_oss_cutlass_build(cls, p, d),
         *leaf_gates,
+        check_oss_cutlass_build(cls, p, d),
     ):
         if verdict is not None:
             return verdict

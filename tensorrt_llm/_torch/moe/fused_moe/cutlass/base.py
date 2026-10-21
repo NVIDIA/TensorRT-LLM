@@ -16,14 +16,12 @@
 call every leaf but the SM120 Triton one issues.
 
 A leaf declares its kernel-selection flags once, as a frozen
-:class:`FusedMoeOpFlags`, so the whole kernel configuration for a format reads
-in one place and nothing here branches on ``quant_config``. The two
-``quantize_input`` implementations at the bottom are the ones more than one
-format binds.
+:class:`FusedMoeOpFlags`. The two ``quantize_input`` implementations at the
+bottom are the ones more than one format binds.
 """
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 
 import torch
 
@@ -81,13 +79,7 @@ class FusedMoeOpFlags:
 
     def op_kwargs(self) -> dict[str, bool]:
         """The flags as ``torch.ops.trtllm.fused_moe`` keyword arguments."""
-        return {
-            "use_deepseek_fp8_block_scale": self.use_deepseek_fp8_block_scale,
-            "use_w4_group_scaling": self.use_w4_group_scaling,
-            "use_int8_woq_per_channel": self.use_int8_woq_per_channel,
-            "use_mxfp8_act_scaling": self.use_mxfp8_act_scaling,
-            "use_mxfp8_weight_scaling": self.use_mxfp8_weight_scaling,
-        }
+        return {f.name: getattr(self, f.name) for f in fields(self) if f.name != "weight_dtype"}
 
 
 class CutlassFusedMoEBase(MoEImplBase):
@@ -95,23 +87,21 @@ class CutlassFusedMoEBase(MoEImplBase):
 
     Owns construction, the layer-format check in ``create_weights``, and the
     default ``quantize_input`` (pass-through) and ``run_moe`` (one
-    ``torch.ops.trtllm.fused_moe`` call with the leaf's ``FUSED_MOE_OP_FLAGS``);
-    the weight lifecycle itself comes from ``MoEWeightOwnerMixin``. Unregistered, because a descriptor is exactly
-    one identity and this class stands for twelve.
+    ``torch.ops.trtllm.fused_moe`` call); the weight lifecycle comes from
+    ``MoEWeightOwnerMixin``. Unregistered, because a descriptor is exactly one
+    identity and this class stands for twelve.
 
     A leaf declares:
 
     * ``descriptor`` -- its one identity. ``scheduler_kind``, ``capabilities``
       and ``input_requirement`` are taken off it when the class is created.
     * ``sm_support`` / ``supported_dtypes`` -- what its kernel is built for.
+    * ``FUSED_MOE_OP_FLAGS`` -- the kernel-selection flags it hands the op.
     * ``supports_gptoss_style`` / ``rejects_gptoss_expert_bias`` -- whether its
       weight method can load a gpt-oss / MiniMax SwiGLU shape.
     * ``requires_oss_cutlass_build`` / ``uses_dynamic_fc2_scale`` -- whether its
       format, or its dynamic FC2 scale, needs the open-source CUTLASS kernels.
     * ``can_implement`` and ``_get_quant_method``.
-
-    A leaf's format is fixed: :meth:`create_weights` refuses a layer whose
-    final ``quant_config`` is not the one the leaf was resolved for.
     """
 
     # No default: a wrong SM set or dtype set silently admits a layer whose
@@ -124,11 +114,17 @@ class CutlassFusedMoEBase(MoEImplBase):
     # Read by ``eligibility.check_oss_cutlass_build``.
     requires_oss_cutlass_build: bool = False
     uses_dynamic_fc2_scale: bool = False
+    #: Whether ``run_moe`` issues ``torch.ops.trtllm.fused_moe``; only such a
+    #: leaf is bound by the open-source CUTLASS build (its gate and all-to-all).
+    issues_fused_moe_op: bool = True
 
     FUSED_MOE_OP_FLAGS: FusedMoeOpFlags = FusedMoeOpFlags()
     #: Round ``hidden_size`` and ``intermediate_size_per_partition`` up to a
     #: multiple of this at construction, before the weights are allocated.
     pad_hidden_and_intermediate_to: int | None = None
+    #: Whether the layer is a routed-expert LoRA target; only
+    #: ``CutlassMoELoraMixin._init_moe_lora`` sets it.
+    _moe_lora_enabled: bool = False
 
     # The CUTLASS epilogue has an adaptor per kind (``moe_kernels.cuh``) and
     # takes all three constants as ``float*`` indexed by expert.
@@ -259,12 +255,7 @@ class CutlassFusedMoEBase(MoEImplBase):
             self.create_weights()
 
     def _init_moe_lora(self, model_config: ModelConfig) -> None:
-        """Set up routed-expert LoRA state; ``CutlassMoELoraMixin`` overrides it.
-
-        A no-op here. Readers of the LoRA state outside this package reach it
-        through ``ConfigurableMoE._moe_lora_enabled``, which reads False for a
-        leaf that never sets it.
-        """
+        """No-op; ``CutlassMoELoraMixin`` overrides it."""
 
     def create_weights(self) -> None:
         """Allocate expert weights once the layer's final format is confirmed."""
@@ -294,7 +285,8 @@ class CutlassFusedMoEBase(MoEImplBase):
 
     @property
     def supports_alltoall(self) -> bool:
-        return collect_moe_environment().oss_cutlass_moe
+        # The internal kernel archive's fused_moe op rejects all-to-all.
+        return not self.issues_fused_moe_op or collect_moe_environment().oss_cutlass_moe
 
     def validate_configurable_moe(self, moe: torch.nn.Module) -> None:
         if moe.enable_alltoall and not self.supports_alltoall:
@@ -407,6 +399,25 @@ class CutlassFusedMoEBase(MoEImplBase):
         # returns an empty list to avoid an aliasing-constraint violation;
         # otherwise the single output tensor comes back in a list.
         return moe_output if moe_output is not None else result[0]
+
+    def _local_slot_ids(self, slot_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Map global slot ids onto this rank's expert slots.
+
+        Dispatch keeps the global numbering with or without alltoall and marks
+        padding with an id no rank owns (-1, or ``num_slots`` under DeepEP low
+        latency).
+
+        Args:
+            slot_ids: ``token_selected_experts``, int32 ``[num_tokens, top_k]``.
+
+        Returns:
+            ``(local_ids, offsets)``. ``offsets`` is ``slot_ids - slot_start``;
+            ``local_ids`` clamps it into ``[0, expert_size_per_partition)`` so
+            indexing local weights stays in bounds. This rank owns exactly the
+            ids where the two are equal.
+        """
+        offsets = slot_ids - self.slot_start
+        return offsets.clamp(0, self.expert_size_per_partition - 1), offsets
 
     def _tuner_shapes(
         self,

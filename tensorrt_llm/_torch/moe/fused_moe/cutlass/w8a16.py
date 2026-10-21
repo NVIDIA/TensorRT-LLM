@@ -26,8 +26,7 @@ from .identity import cutlass_descriptor
 class TrtllmCutlassW8a16Impl(CutlassFusedMoEBase):
     """``trtllm.cutlass.grouped_gemm.w8a16``.
 
-    INT8 weight-only with per-channel scales; outside the reference VanillaMoE,
-    no other MoE implementation serves this format.
+    INT8 weight-only with per-channel scales.
     """
 
     descriptor = cutlass_descriptor(

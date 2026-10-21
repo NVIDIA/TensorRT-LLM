@@ -66,7 +66,12 @@ from ..peft.lora.validation import has_moe_lora_targets
 from ..speculative import SpecMetadata
 from ..utils import AuxStreamType, create_lm_head_tp_mapping
 from .modeling_speculative import SpecDecOneEngineForCausalLM, _slice_spec_position_ids
-from .modeling_utils import DecoderModel, DecoderModelForCausalLM, register_auto_model
+from .modeling_utils import (
+    DecoderModel,
+    DecoderModelForCausalLM,
+    moe_experts_quant_config,
+    register_auto_model,
+)
 
 # ---------------------------------------------------------------------------
 # FP8 / NVFP4 dequant helpers (used by the layer-43/44 SwiGLU-clamp path)
@@ -792,14 +797,13 @@ class Step3p7MoE(nn.Module):
             dtype=text_config.torch_dtype,
             reduce_results=False,
             model_config=model_config,
+            override_quant_config=moe_experts_quant_config(
+                model_config, f"model.layers.{layer_idx}.moe.experts"
+            ),
             layer_idx=layer_idx,
             weight_loading_mode=MoEWeightLoadingMode.VANILLA,
-            # When the Python path owns these experts the backend kernel never
-            # runs them, so it is not asked for a clamp it would not apply;
-            # kernels without clamp support (SM120 FP8 block scales) can then
-            # still hold the weights the Python path dequantizes. The Python
-            # path is kept fail-closed below if those weights cannot be
-            # materialized.
+            # When the Python path owns these experts it applies the clamp; the
+            # backend never runs them, so it is not asked for one.
             activation=SwigluActivation(
                 clamp=None if self._use_python_experts else self._routed_swiglu_limit,
                 clamp_after_silu=(

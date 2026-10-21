@@ -28,9 +28,8 @@ from .identity import cutlass_descriptor
 class TrtllmCutlassW4a8AwqImpl(CutlassFusedMoEBase):
     """``trtllm.cutlass.grouped_gemm.w4a8_awq``.
 
-    The DeepSeek-R1 W4A8 mixed-precision recipe; outside the reference
-    VanillaMoE, no other MoE implementation serves this format. The kernel
-    quantizes activations itself.
+    INT4 group-scaled weights with FP8 activations, which the kernel quantizes
+    itself.
     """
 
     descriptor = cutlass_descriptor(

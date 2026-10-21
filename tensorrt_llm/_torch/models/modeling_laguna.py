@@ -52,7 +52,12 @@ from ..speculative import SpecMetadata
 from ..utils import AuxStreamType
 from .checkpoints.hf.weight_mapper import HfWeightMapper
 from .modeling_speculative import SpecDecOneEngineForCausalLM
-from .modeling_utils import DecoderModel, register_auto_model, register_mapper
+from .modeling_utils import (
+    DecoderModel,
+    moe_experts_quant_config,
+    register_auto_model,
+    register_mapper,
+)
 
 # ---------------------------------------------------------------------------
 #  Gate (MoE router)
@@ -168,6 +173,9 @@ class LagunaMoE(nn.Module):
             dtype=config.torch_dtype,
             reduce_results=False,
             model_config=model_config,
+            override_quant_config=moe_experts_quant_config(
+                model_config, f"model.layers.{layer_idx}.mlp.experts"
+            ),
             layer_idx=layer_idx,
             weight_loading_mode=MoEWeightLoadingMode.VANILLA,
         )

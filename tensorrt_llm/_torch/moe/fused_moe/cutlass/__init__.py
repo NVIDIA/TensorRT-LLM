@@ -12,20 +12,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Everything Cutlass: the twelve registered leaves and the layers under them.
+"""The CUTLASS-family leaves, their base and the leaf lookups.
 
-Layers: :mod:`.identity` (the identity strings, the shared contracts, the
-descriptor factory) and :mod:`.eligibility` (the gates each ``can_implement``
-composes) import nothing from the package; :mod:`.base` holds
-:class:`.CutlassFusedMoEBase`, the ``torch.ops.trtllm.fused_moe`` call and the
-``quantize_input`` implementations several formats bind; :mod:`.lora` holds
-the routed-expert LoRA mixin; then one module per leaf, named for its
-quantization format. Importing this package is what registers the leaves.
-
-Ten leaves run the CUTLASS grouped GEMM. The two ``fp8_block_scales`` leaves do
-not and say so in their identity: DeepGEMM on SM90
-(:mod:`.fp8_block_scales_hopper`) and an internal Triton kernel on SM120
-(:mod:`.fp8_block_scales_triton`).
+One module per leaf, named for its quantization format. Importing this package
+registers the leaves.
 """
 
 from tensorrt_llm.models.modeling_utils import QuantAlgo

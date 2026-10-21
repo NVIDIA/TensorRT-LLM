@@ -12,21 +12,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Cutlass's values of the identity types ``..impl_identity`` defines.
+"""CUTLASS-family identity segments, shared contracts and the descriptor factory.
 
-Three ``(provider, technique, kernel_name)`` triples, because not every leaf in
-this family runs a CUTLASS kernel:
-
-* ``trtllm.cutlass.grouped_gemm`` -- the CUTLASS grouped GEMM behind
-  ``torch.ops.trtllm.fused_moe``.
-* ``deepgemm.cuda.hopper_grouped_gemm`` -- FP8 block scales on SM90: the same
-  op, but ``CutlassMoeFCRunner`` hands FC1/FC2 to TRT-LLM's in-tree port of
-  DeepGEMM (``cpp/include/tensorrt_llm/deep_gemm``). Only ``kernel_name``
-  separates its identity from the SM100/103/107 leaf in
-  ``..fused_moe_deepgemm``, which calls the ``tensorrt_llm.deep_gemm`` Python
-  package.
-* ``trtllm.triton.grouped_gemm`` -- FP8 block scales on SM120, an internal
-  Triton grouped GEMM that never enters C++.
+Ten leaves are ``trtllm.cutlass.grouped_gemm.<quant>``. Each ``fp8_block_scales``
+leaf names the kernel it runs instead: ``deepgemm.cuda.hopper_grouped_gemm``
+(:mod:`.fp8_block_scales_hopper`) and ``trtllm.triton.grouped_gemm``
+(:mod:`.fp8_block_scales_triton`).
 """
 
 import dataclasses
@@ -64,12 +55,13 @@ def cutlass_descriptor(
     technique: str = TECHNIQUE_CUTLASS,
     kernel_name: str = KERNEL_GROUPED_GEMM,
     supports_moe_lora: bool = False,
+    supports_expert_bias: bool = True,
 ) -> MoEImplDescriptor:
     """Build one leaf's descriptor.
 
     Args:
         quant: The one quantization format the leaf implements.
-        doc: One line naming the kernel and the SMs it runs on.
+        doc: One line naming the kernel.
         provider: Identity segment. The defaults name the CUTLASS grouped
             GEMM; only the two FP8 block-scale leaves, which run another
             kernel, override the segments.
@@ -79,11 +71,17 @@ def cutlass_descriptor(
             routed-expert LoRA for this format. The scheduler reads the flag
             before it reaches for the LoRA helpers, so only a leaf that mixes
             in ``CutlassMoELoraMixin`` may set it.
+        supports_expert_bias: Whether the leaf's kernel applies an expert FC
+            bias.
     """
     return MoEImplDescriptor(
         identity=MoEImplId(provider, technique, kernel_name, quant),
         scheduler_kind=MoESchedulerKind.EXTERNAL_COMM,
-        capabilities=dataclasses.replace(CUTLASS_CAPABILITIES, supports_moe_lora=supports_moe_lora),
+        capabilities=dataclasses.replace(
+            CUTLASS_CAPABILITIES,
+            supports_moe_lora=supports_moe_lora,
+            supports_expert_bias=supports_expert_bias,
+        ),
         input_requirement=CUTLASS_INPUT_REQUIREMENT,
         doc=doc,
     )

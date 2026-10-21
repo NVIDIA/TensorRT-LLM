@@ -114,8 +114,7 @@ def find_backend_class(backend_type: MoeBackendType, quant_algo=None):
 
     Names one class. A caller deciding whether a configuration is *runnable*
     wants :func:`find_backend_classes` instead, because for ``TRTLLM`` that
-    question spans a provider pair and for CUTLASS ``fp8_block_scales`` an SM
-    pair.
+    question spans a provider pair.
     """
     if backend_type == MoeBackendType.TRTLLM:
         from tensorrt_llm._torch.moe.fused_moe.fused_moe_trtllm_gen import find_trtllm_gen_leaf
@@ -136,8 +135,7 @@ def find_backend_classes(backend_type: MoeBackendType, quant_algo=None) -> tuple
     rejects -- a missing wheel, an unmet shape -- not only when it is absent.
     Asking a single pre-picked class prunes candidates a run would have served.
 
-    CUTLASS is the same shape for ``fp8_block_scales``: one leaf per SM family,
-    and only asking both tells a skip from a case the device serves.
+    For CUTLASS ``fp8_block_scales`` these are the SM90 and SM120 leaves.
     """
     if backend_type == MoeBackendType.TRTLLM:
         from tensorrt_llm._torch.moe.fused_moe.trtllm_gen import (

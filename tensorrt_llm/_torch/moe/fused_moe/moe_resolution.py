@@ -195,7 +195,7 @@ def backend_family_of(impl_cls: MoEImplClass) -> Optional[str]:
 
 # Default degradation target: the Cutlass leaves, whose coverage is the
 # widest between them.
-FALLBACK_IMPLS: Tuple[MoEImplClass, ...] = CUTLASS_LEAVES
+FALLBACK_IMPLS: tuple[MoEImplClass, ...] = CUTLASS_LEAVES
 
 
 def _legacy_backend_name(impl_cls: MoEImplClass) -> str:
@@ -670,10 +670,9 @@ def resolve_moe_impl(
             f"{report.describe_rejections()}"
         )
     elif report.degraded:
-        cause = report.degraded_from
         logger.warning(
             f"MoE backend {requested} cannot serve this layer{location} "
-            f"({cause.reason.value}: {cause.detail}); running "
+            f"({report.describe_rejections(requested_only=True)}); running "
             f"{winner_cls.__name__} instead. Full trail: {report.describe()}"
         )
     else:

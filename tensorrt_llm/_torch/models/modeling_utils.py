@@ -482,12 +482,10 @@ def moe_experts_quant_config(model_config: ModelConfig,
                              experts_prefix: str) -> QuantConfig | None:
     """The final quantization of the MoE experts at ``experts_prefix``.
 
-    A MoE implementation is one format, fixed when ``create_moe`` resolves it,
-    so a model passes this as ``override_quant_config``. It answers what the
-    ``__post_init__`` passes would leave on the layer: the layer's
-    ``quant_config_dict`` entry, found by the same match
-    ``apply_layerwise_quant_config`` uses, then the ``exclude_modules`` match,
-    which wins.
+    What a model passes to ``create_moe`` as ``override_quant_config``: what
+    the ``__post_init__`` passes would leave on the layer, i.e. its
+    ``quant_config_dict`` entry (by the match ``apply_layerwise_quant_config``
+    uses), then the ``exclude_modules`` match, which wins.
 
     Args:
         model_config: The model's configuration.
