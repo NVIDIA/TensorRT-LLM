@@ -827,8 +827,9 @@ def update_spec_config_from_model_config(spec_config,
             spec_config.spec_dec_mode.is_mtp_eagle_one_model())
     if is_glm5_next(model_config):
         # The glm_kpool slot tables live in the recurrent metadata and are not
-        # switched by draft_kv_cache_context, so the MTP layers share the
-        # target KV cache manager.
+        # switched by draft_kv_cache_context. Keep the MTP layers in the
+        # target KV cache manager so that one table is valid for both target
+        # and draft layers.
         spec_config._allow_separate_draft_kv_cache = False
 
     # The target implementation owns the contract for its MTP drafter. Some one-model MTP
