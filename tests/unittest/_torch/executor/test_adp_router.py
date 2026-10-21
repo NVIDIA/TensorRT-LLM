@@ -1538,6 +1538,68 @@ class TestConversationAwareADPRouter:
         # ...but the mapping is unchanged so it can return home later.
         assert router._conv_to_rank["A"] == home
 
+    @staticmethod
+    def _strict_router(tp_size=2, max_wait_iters=2000):
+        return ConversationAwareADPRouter(
+            dist=_mock_dist(tp_size=tp_size),
+            strict_affinity=True,
+            strict_affinity_max_wait_iters=max_wait_iters,
+        )
+
+    def test_strict_affinity_off_pins_nothing(self):
+        router = self._router(tp_size=2)
+        self._route(router, self._states(2), [_make_conv_request_item(1, "A")])
+        assert router.strict_affinity_target_rank(_make_conv_request_item(2, "A")) is None
+
+    def test_strict_affinity_pins_later_turns_to_their_rank(self):
+        router = self._strict_router()
+        first = _make_conv_request_item(1, "A")
+        assert router.strict_affinity_target_rank(first) is None  # not bound yet
+        self._route(router, self._states(2), [first])
+        home = router._conv_to_rank["A"]
+        assert router.strict_affinity_target_rank(_make_conv_request_item(2, "A")) == home
+        assert router.strict_affinity_target_rank(_make_conv_request_item(3, None)) is None
+
+    def test_strict_affinity_releases_a_request_after_max_wait_iters(self):
+        router = self._strict_router(max_wait_iters=3)
+        self._route(router, self._states(2), [_make_conv_request_item(1, "A")])
+        home = router._conv_to_rank["A"]
+        later = _make_conv_request_item(2, "A")
+        held = [router.strict_affinity_target_rank(later) for _ in range(4)]
+        assert held == [home, home, home, None]
+
+    def test_strict_affinity_routing_resets_the_wait(self):
+        router = self._strict_router(max_wait_iters=1)
+        self._route(router, self._states(2), [_make_conv_request_item(1, "A")])
+        home = router._conv_to_rank["A"]
+        later = _make_conv_request_item(2, "A")
+        assert router.strict_affinity_target_rank(later) == home
+        self._route(router, self._states(2), [later])
+        assert router.strict_affinity_target_rank(later) == home
+
+    @pytest.mark.parametrize("strict", [False, True])
+    def test_strict_affinity_routes_pinned_turns_first(self, strict: bool) -> None:
+        """Strict mode places a pinned turn before the new conversations of its batch: a
+        new conversation queued ahead of it would otherwise take the last free slot of
+        its rank (admitted for the pinned turn) and push the turn off its prefix."""
+        router = ConversationAwareADPRouter(dist=_mock_dist(tp_size=2), strict_affinity=strict)
+        # X -> rank 0, A -> rank 1 (round robin).
+        self._route(
+            router,
+            self._states(2),
+            [_make_conv_request_item(1, "X"), _make_conv_request_item(2, "A")],
+        )
+        home = router._conv_to_rank["A"]
+        assert home == 1
+        states = self._states(2, active=[5, 4])  # cap 5: rank 1 has one free slot
+        pos = self._route(
+            router,
+            states,
+            [_make_conv_request_item(10, "B"), _make_conv_request_item(11, "A")],
+            cap=5,
+        )
+        assert (pos[11] == home) is strict
+
     def test_create_rank_state(self):
         router = ConversationAwareADPRouter(dist=_mock_dist(tp_rank=2))
         req1 = Mock(py_orig_prompt_len=100)
@@ -1576,6 +1638,22 @@ class TestConversationAwareADPRouter:
         assert router._max_sessions == 8
         # A mocked (non-string) placement value must fall back to round_robin.
         assert router._new_conv_placement == "round_robin"
+        assert not router._strict_affinity
+
+    def test_factory_reads_strict_affinity_from_env(self, monkeypatch):
+        monkeypatch.setenv("TRTLLM_ADP_STRICT_CONVERSATION_AFFINITY", "1")
+        monkeypatch.setenv("TRTLLM_ADP_STRICT_AFFINITY_MAX_WAIT_ITERS", "7")
+        cfg = MagicMock()
+        cfg.kv_cache_routing_conversation_affinity = True
+        cfg.kv_cache_routing_max_sessions = 8
+        router = ADPRouter.create(
+            dist=_mock_dist(),
+            has_seq_slot_headroom=True,
+            kv_cache_manager=None,
+            attention_dp_config=cfg,
+        )
+        assert router._strict_affinity
+        assert router._strict_affinity_max_wait_iters == 7
 
     @staticmethod
     def _lq_router(tp_size=4):

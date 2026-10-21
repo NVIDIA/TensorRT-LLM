@@ -4,7 +4,7 @@
 """Utility functions for request processing."""
 
 import os
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 
 if TYPE_CHECKING:
     from .scheduler import WaitingQueue
@@ -132,12 +132,54 @@ def can_process_attention_dp_request(
     return False
 
 
+def can_process_pinned_request(
+    req_item,
+    pinned_rank_fn: Callable[[Any], Optional[int]],
+    all_ranks_num_active_requests: List[int],
+    max_num_active_requests: int,
+) -> bool:
+    """Check if a request pinned to a rank by strict conversation affinity can be processed.
+
+    A request ``pinned_rank_fn`` pins waits in the queue until its rank is under
+    ``max_num_active_requests`` instead of overflowing to a rank that does not hold its
+    conversation. Requests with a strict explicit ``attention_dp_rank`` were already placed
+    by :func:`can_process_attention_dp_request`.
+
+    Args:
+        req_item: The request queue item to check.
+        pinned_rank_fn: Returns the rank the request must wait for, or None.
+        all_ranks_num_active_requests: Number of active requests for each rank.
+        max_num_active_requests: Maximum number of active requests per rank.
+
+    Returns:
+        True if the request can be processed, False otherwise.
+    """
+    scheduling_params = getattr(req_item.request, "py_scheduling_params", None)
+    if (
+        scheduling_params is not None
+        and scheduling_params.attention_dp_rank is not None
+        and not scheduling_params.attention_dp_relax
+    ):
+        return True
+
+    pinned_rank = pinned_rank_fn(req_item)
+    if pinned_rank is None:
+        return True
+
+    if all_ranks_num_active_requests[pinned_rank] < max_num_active_requests:
+        all_ranks_num_active_requests[pinned_rank] += 1
+        return True
+
+    return False
+
+
 def get_from_waiting_queue(
     waiting_queue: "WaitingQueue",
     max_req_count: int,
     enable_attention_dp: bool,
     max_num_active_requests: int,
     all_ranks_num_active_requests: Optional[List[int]] = None,
+    pinned_rank_fn: Optional[Callable[[Any], Optional[int]]] = None,
 ) -> List:
     """Get requests from the waiting queue.
 
@@ -147,6 +189,9 @@ def get_from_waiting_queue(
         enable_attention_dp: Whether to enable attention DP scheduling.
         max_num_active_requests: Maximum number of active requests per rank.
         all_ranks_num_active_requests: Number of active requests for each rank.
+        pinned_rank_fn: Attention DP only. Returns the rank a request is pinned to by
+            strict conversation affinity (None when it is free to go anywhere); a pinned
+            request whose rank is full stays queued.
 
     Returns:
         List of requests that can be processed.
@@ -177,6 +222,13 @@ def get_from_waiting_queue(
             if enable_attention_dp
             else True
         )
+        if can_process and enable_attention_dp and pinned_rank_fn is not None:
+            can_process = can_process_pinned_request(
+                req_item,
+                pinned_rank_fn,
+                scheduling_all_ranks_num_active_requests,
+                max_num_active_requests,
+            )
 
         if can_process:
             items.append(req_item)

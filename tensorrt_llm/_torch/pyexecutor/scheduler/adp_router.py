@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import heapq
 import math
+import os
 import random
 from abc import ABC, abstractmethod
 from collections import OrderedDict, namedtuple
@@ -142,6 +143,11 @@ class ADPRouter(ABC):
                 max_sessions=attention_dp_config.kv_cache_routing_max_sessions,
                 fair_share_multiplier=attention_dp_config.kv_cache_routing_fair_share_multiplier,
                 new_conv_placement=attention_dp_config.kv_cache_routing_new_conv_placement,
+                strict_affinity=os.environ.get("TRTLLM_ADP_STRICT_CONVERSATION_AFFINITY", "0")
+                == "1",
+                strict_affinity_max_wait_iters=int(
+                    os.environ.get("TRTLLM_ADP_STRICT_AFFINITY_MAX_WAIT_ITERS", "2000")
+                ),
             )
 
         if (
@@ -214,6 +220,13 @@ class ADPRouter(ABC):
             local_state.num_context_requests, local_state.num_generation_requests = forward_work
         responses = self.dist.tp_allgather(local_state.serialize(include_kv_cache_load))
         return [RankState.deserialize(data=resp) for resp in responses]
+
+    def strict_affinity_target_rank(self, req_item: "RequestQueueItem") -> Optional[int]:
+        """The rank a waiting request must wait for, or None to admit it anywhere.
+
+        Only ConversationAwareADPRouter under strict affinity pins requests.
+        """
+        return None
 
     @staticmethod
     def _assign_explicit_dp_ranks(
@@ -758,6 +771,13 @@ class ConversationAwareADPRouter(ADPRouter):
     the same ``conversation_id`` returns to that rank, keeping the conversation's
     KV-cache prefix on one rank. Requests without a ``conversation_id`` fall
     back to the same ``new_conv_placement`` policy.
+
+    By default a later turn whose rank is at ``max_num_active_requests``
+    overflows to another rank, which holds none of its prefix and recomputes it
+    whole -- under saturation that extra work feeds the saturation it escaped.
+    With ``strict_affinity`` the turn waits in the queue for its own rank while
+    requests behind it are admitted; after ``strict_affinity_max_wait_iters``
+    iterations it is released to the overflow path so nothing waits forever.
     """
 
     # Default LRU cap on the conversation->rank map (entries are ~tens of
@@ -771,6 +791,8 @@ class ConversationAwareADPRouter(ADPRouter):
         max_sessions: int = DEFAULT_MAX_SESSIONS,
         fair_share_multiplier: float = 2.0,
         new_conv_placement: str = "round_robin",
+        strict_affinity: bool = False,
+        strict_affinity_max_wait_iters: int = 2000,
     ):
         super().__init__(dist, has_seq_slot_headroom=has_seq_slot_headroom)
         self._conv_to_rank: "OrderedDict[str, int]" = OrderedDict()
@@ -782,6 +804,11 @@ class ConversationAwareADPRouter(ADPRouter):
             else "round_robin"
         )
         self._round_robin_cursor = 0
+        self._strict_affinity = strict_affinity
+        self._strict_affinity_max_wait_iters = max(0, int(strict_affinity_max_wait_iters))
+        # request id -> waiting-queue passes it has been held for its rank (LRU-bounded
+        # like the conversation map; every rank keeps the same counts).
+        self._strict_waits: "OrderedDict[int, int]" = OrderedDict()
 
     def create_rank_state(
         self,
@@ -819,6 +846,27 @@ class ConversationAwareADPRouter(ADPRouter):
         self._conv_to_rank.move_to_end(conv_id)
         while len(self._conv_to_rank) > self._max_sessions:
             self._conv_to_rank.popitem(last=False)
+
+    def strict_affinity_target_rank(self, req_item: "RequestQueueItem") -> Optional[int]:
+        """Under strict affinity, the rank a later turn waits for instead of overflowing.
+
+        Called once per waiting-queue pass that reaches the request; each call counts
+        as one held iteration until the request is routed.
+        """
+        if not self._strict_affinity:
+            return None
+        conv_id = self._conversation_id(req_item)
+        rank = self._conv_to_rank.get(conv_id) if conv_id is not None else None
+        if rank is None:
+            return None
+        held = self._strict_waits.get(req_item.id, 0) + 1
+        self._strict_waits[req_item.id] = held
+        self._strict_waits.move_to_end(req_item.id)
+        while len(self._strict_waits) > self._max_sessions:
+            self._strict_waits.popitem(last=False)
+        if held > self._strict_affinity_max_wait_iters:
+            return None
+        return rank
 
     def _assign_new_conversation_explicit_dp_ranks(
         self,
@@ -884,6 +932,13 @@ class ConversationAwareADPRouter(ADPRouter):
             all_ranks_num_active_requests,
             max_num_active_requests,
         )
+        if self._strict_affinity:
+            # Pinned turns first: the waiting queue admitted them against their
+            # rank's capacity, which a new conversation placed ahead of them in
+            # this batch could otherwise take.
+            remaining_unscheduled.sort(
+                key=lambda item: self._conversation_id(item) not in self._conv_to_rank
+            )
 
         # Only allgathered state and broadcast requests enter the estimate;
         # local KV statistics would make ranks disagree on placement.
@@ -970,6 +1025,7 @@ class ConversationAwareADPRouter(ADPRouter):
 
             all_ranks_new_requests[rank].append(req_item)
             all_ranks_num_active_requests[rank] += 1
+            self._strict_waits.pop(req_item.id, None)
             if self._new_conv_placement == "least_tokens":
                 token_load[rank] += _num_input_tokens(req_item.request)
 

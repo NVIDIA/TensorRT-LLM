@@ -20,6 +20,7 @@ from tensorrt_llm._torch.pyexecutor.request_utils import (
     RequestBroadcaster,
     attach_py_objects_to_requests,
     can_process_attention_dp_request,
+    can_process_pinned_request,
     derive_attention_dp_per_rank_request_cap,
     executor_request_to_llm_request,
     get_from_waiting_queue,
@@ -632,6 +633,88 @@ def test_can_process_attention_dp_request(attention_dp_config):
     assert not can_process_attention_dp_request(
         req_no_capacity, all_ranks_full, max_num_active_requests
     )
+
+
+def test_get_from_waiting_queue_holds_pinned_request_for_its_full_rank(
+    attention_dp_config, all_ranks_num_active_requests
+):
+    """Strict conversation affinity: a request pinned to a full rank stays at the front
+    of the queue while the requests behind it are admitted."""
+    max_num_active_requests = attention_dp_config["max_num_active_requests"]
+    pinned_rank = {1: 0, 2: 1}  # request 3 is free to go anywhere
+    items = [RequestQueueItem(i, create_mock_request_with_py_schedule_params()) for i in (1, 2, 3)]
+    waiting_queue = FCFSWaitingQueue()
+    waiting_queue.extend(items)
+    all_ranks_num_active_requests[0] = max_num_active_requests
+
+    result = get_from_waiting_queue(
+        waiting_queue,
+        3,
+        True,
+        max_num_active_requests,
+        all_ranks_num_active_requests,
+        pinned_rank_fn=lambda item: pinned_rank.get(item.id),
+    )
+
+    assert result == items[1:]
+    assert len(waiting_queue) == 1
+    assert waiting_queue.peek_request() is items[0]
+
+
+def test_get_from_waiting_queue_pinned_requests_take_their_rank_capacity(attention_dp_config):
+    """Pinned requests are admitted one per free slot of their rank; the rest wait."""
+    max_num_active_requests = attention_dp_config["max_num_active_requests"]
+    items = [RequestQueueItem(i, create_mock_request_with_py_schedule_params()) for i in range(4)]
+    waiting_queue = FCFSWaitingQueue()
+    waiting_queue.extend(items)
+    all_ranks = [max_num_active_requests - 2, 0, 0, 0]  # rank 0 has two free slots
+
+    result = get_from_waiting_queue(
+        waiting_queue,
+        4,
+        True,
+        max_num_active_requests,
+        all_ranks,
+        pinned_rank_fn=lambda item: 0,
+    )
+
+    assert result == items[:2]
+    assert [waiting_queue.pop_request() for _ in range(2)] == items[2:]
+    assert all_ranks == [
+        max_num_active_requests - 2,
+        0,
+        0,
+        0,
+    ]  # the caller's counts are not mutated
+
+
+def test_can_process_pinned_request(attention_dp_config):
+    max_num_active_requests = attention_dp_config["max_num_active_requests"]
+
+    unpinned = RequestQueueItem(1, create_mock_request_with_py_schedule_params())
+    assert can_process_pinned_request(
+        unpinned, lambda item: None, [8, 8, 8, 8], max_num_active_requests
+    )
+
+    pinned = RequestQueueItem(2, create_mock_request_with_py_schedule_params())
+    all_ranks = [0, 8, 0, 0]
+    assert not can_process_pinned_request(
+        pinned, lambda item: 1, all_ranks, max_num_active_requests
+    )
+    assert can_process_pinned_request(pinned, lambda item: 2, all_ranks, max_num_active_requests)
+    assert all_ranks == [0, 8, 1, 0]
+
+    # A strict explicit attention_dp_rank was placed (and counted) by
+    # can_process_attention_dp_request; the pin is not consulted again.
+    explicit = RequestQueueItem(
+        3,
+        create_mock_request_with_py_schedule_params(attention_dp_rank=1, attention_dp_relax=False),
+    )
+    asked = []
+    assert can_process_pinned_request(
+        explicit, lambda item: asked.append(item) or 1, all_ranks, max_num_active_requests
+    )
+    assert not asked and all_ranks == [0, 8, 1, 0]
 
 
 # --------------------------------------------------------------------------

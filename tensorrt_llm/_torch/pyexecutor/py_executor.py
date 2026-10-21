@@ -6648,7 +6648,9 @@ class PyExecutor:
             max_new_requests,
             enable_attention_dp=self.enable_attention_dp,
             max_num_active_requests=self.max_num_active_requests,
-            all_ranks_num_active_requests=all_ranks_num_active_requests)
+            all_ranks_num_active_requests=all_ranks_num_active_requests,
+            pinned_rank_fn=(self.adp_router.strict_affinity_target_rank
+                            if self.enable_attention_dp else None))
         if (not new_requests or
                 not getattr(self, "_mm_encoder_item_scheduling_enabled", False)
                 or self.enable_attention_dp):
