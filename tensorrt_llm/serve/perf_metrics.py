@@ -52,6 +52,8 @@ import json
 import math
 import os
 import socket
+import threading
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -60,6 +62,7 @@ from typing import Any, Dict, List, Literal, Optional
 from tensorrt_llm._utils import AdjustedSteadyClock
 from tensorrt_llm.llmapi.disagg_utils import ServerRole
 from tensorrt_llm.logger import logger
+from tensorrt_llm.metrics.perf_utils import _input_processing_observer
 from tensorrt_llm.serve._perf_metrics_schema import (
     DisaggPerfMetricsRecord,
     PerfMetrics,
@@ -277,6 +280,10 @@ def build_request_metrics_record(
         "timing_metrics": timing_metrics,
         "kv_cache_metrics": {name: getattr(metrics.kv_cache_metrics, name) for name in _KV_FIELDS},
     }
+    if raw_request is not None:
+        input_metrics = getattr(raw_request.state, "input_processing_metrics", None)
+        if input_metrics:
+            phase_record["input_processing_metrics"] = dict(input_metrics)
     speculative = metrics.speculative_decoding
     if speculative.total_draft_tokens > 0:
         phase_record["speculative_decoding"] = {
@@ -357,6 +364,11 @@ def build_metrics_headers(records: List[Dict[str, Any]]) -> Dict[str, str]:
                 duration = _elapsed_ms(timing, start, end)
                 if duration is not None:
                     values[SERVER_TIMING_HEADER].append(f"{phase}_{name};dur={duration:.6f}")
+
+            for name, seconds in phase_record.get("input_processing_metrics", {}).items():
+                values[SERVER_TIMING_HEADER].append(
+                    f"{phase}_input_{name};dur={seconds * 1000:.6f}"
+                )
 
             breakdown = phase_record.get("time_breakdown_metrics") or {}
             for header, key, label in (
@@ -444,6 +456,13 @@ def build_metrics_record_from_headers(
                 timing_metrics.setdefault(field, arrival_time + durations[name])
 
     phase_record = {"metrics_headers": metrics_headers}
+    input_metrics = {
+        name[len("input_") :]: seconds
+        for name, seconds in durations.items()
+        if name.startswith("input_")
+    }
+    if input_metrics:
+        phase_record["input_processing_metrics"] = input_metrics
     if timing_metrics:
         phase_record["timing_metrics"] = timing_metrics
     return {
@@ -560,6 +579,8 @@ def _jsonl_perf_metrics(phase_record: Dict[str, Any]) -> PerfMetrics:
         perf_metrics["kv_cache_metrics"] = phase_record["kv_cache_metrics"]
     if "speculative_decoding" in phase_record:
         perf_metrics["speculative_decoding"] = phase_record["speculative_decoding"]
+    if "input_processing_metrics" in phase_record:
+        perf_metrics["input_processing_metrics"] = phase_record["input_processing_metrics"]
 
     timing_metrics = dict(perf_metrics.get("timing_metrics", {}))
     if not timing_metrics.get("kv_cache_size"):
@@ -765,11 +786,13 @@ class PerfMetricsMiddleware:
         expose_headers: bool,
         writer: Optional[PerfMetricsJsonlWriter] = None,
         adjusted_clock: Optional[AdjustedSteadyClock] = None,
+        input_processing_observer: Callable[[str, float, str | None], None] | None = None,
     ):
         self._app = app
         self._expose_headers = expose_headers
         self._writer = writer
         self._adjusted_clock = adjusted_clock
+        self._input_processing_observer = input_processing_observer
 
     async def __call__(self, scope: Dict[str, Any], receive: Any, send: Any) -> None:
         if scope["type"] != "http":
@@ -825,4 +848,20 @@ class PerfMetricsMiddleware:
                         return
             await send(message)
 
-        await self._app(scope, receive, send_metrics)
+        input_metrics: dict[str, float] = {}
+        scope["state"]["input_processing_metrics"] = input_metrics
+        input_lock = threading.Lock()
+
+        def observe_input(stage: str, seconds: float, modality: str | None) -> None:
+            name = f"media_{stage}_{modality}" if modality is not None else stage
+            # Concurrent media decode workers share this bounded request record.
+            with input_lock:
+                input_metrics[name] = input_metrics.get(name, 0.0) + seconds
+            if self._input_processing_observer is not None:
+                self._input_processing_observer(stage, seconds, modality)
+
+        token = _input_processing_observer.set(observe_input)
+        try:
+            await self._app(scope, receive, send_metrics)
+        finally:
+            _input_processing_observer.reset(token)

@@ -15,7 +15,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Iterator
 from concurrent.futures import Executor
 from contextlib import contextmanager
-from contextvars import ContextVar
+from contextvars import ContextVar, copy_context
 from io import BytesIO
 from pathlib import Path
 from stat import S_ISREG
@@ -48,6 +48,11 @@ from PIL import Image
 
 from tensorrt_llm.inputs.multimodal_data import AudioData, MediaModality, VideoData
 from tensorrt_llm.logger import logger
+from tensorrt_llm.metrics.perf_utils import (
+    _record_input_processing,
+    _start_input_processing,
+    _time_input_processing,
+)
 
 
 class MediaFetchError(RuntimeError):
@@ -348,11 +353,14 @@ async def _read_aiohttp_content(response: aiohttp.ClientResponse) -> bytes:
         content.write(chunk)
 
 
-async def _safe_aiohttp_get(url: str, timeout_sec: int = 30) -> bytes:
+async def _safe_aiohttp_get(
+    url: str, timeout_sec: int = 30, *, session: Optional[aiohttp.ClientSession] = None
+) -> bytes:
     """Aiohttp GET wrapper that validates every redirect hop before following."""
     await asyncio.to_thread(_validate_url, url)
     timeout = aiohttp.ClientTimeout(total=timeout_sec)
-    session = await _get_aiohttp_session()
+    if session is None:
+        session = await _get_aiohttp_session()
     current_url = url
     for _ in range(_MAX_REDIRECTS + 1):
         try:
@@ -1153,6 +1161,7 @@ class BaseMediaIO(ABC, Generic[_MediaT]):
     _request_executor: ClassVar[ContextVar[Optional[Executor]]] = ContextVar(
         "media_io_executor", default=None
     )
+    _modality: ClassVar[str] = "other"
 
     # Required MIME type prefix for `data:` URIs handled by this modality
     # (e.g. `"image/"`). A data URI whose declared media type falls outside
@@ -1233,7 +1242,9 @@ class BaseMediaIO(ABC, Generic[_MediaT]):
         """
         parsed = urlparse(url)
         if parsed.scheme in ("http", "https"):
-            data = await _safe_aiohttp_get(url)
+            with _time_input_processing("download", self._modality):
+                session = await _get_aiohttp_session()
+                data = await _safe_aiohttp_get(url, session=session)
             return await self._run_in_executor(self.load_bytes, data)
         elif parsed.scheme == "data":
             data_spec, b64_data = parsed.path.split(",", 1)
@@ -1258,20 +1269,32 @@ class BaseMediaIO(ABC, Generic[_MediaT]):
         """Decode in-memory media without blocking the event loop."""
         return await self._run_in_executor(self.load_bytes, data)
 
-    @staticmethod
-    async def _run_in_executor(fn, *args, **kwargs):
+    async def _run_in_executor(
+        self, fn: Callable[..., _MediaT], *args: Any, **kwargs: Any
+    ) -> _MediaT:
         """Run a blocking decode callable on the configured executor."""
         if kwargs:
             fn = functools.partial(fn, **kwargs)
         loop = asyncio.get_event_loop()
         executor = BaseMediaIO._request_executor.get() or BaseMediaIO._executor
-        return await loop.run_in_executor(executor, fn, *args)
+        queued = _start_input_processing()
+        if queued is None:
+            return await loop.run_in_executor(executor, fn, *args)
+
+        def decode() -> _MediaT:
+            _record_input_processing("decode_queue", queued, self._modality)
+            with _time_input_processing("decode", self._modality):
+                return fn(*args)
+
+        # run_in_executor does not propagate request ContextVars to workers.
+        return await loop.run_in_executor(executor, copy_context().run, decode)
 
 
 class ImageMediaIO(BaseMediaIO[Union[Image.Image, torch.Tensor, np.ndarray]]):
     """I/O for the image modality."""
 
     _data_uri_mime_prefix: ClassVar[Optional[str]] = "image/"
+    _modality = "image"
 
     def __init__(self, format: str = "pt", device: str = "cpu") -> None:
         if format not in _SUPPORTED_IMAGE_FORMATS:
@@ -1324,6 +1347,7 @@ class AudioMediaIO(BaseMediaIO[Tuple[np.ndarray, int]]):
     """I/O for the audio modality."""
 
     _data_uri_mime_prefix: ClassVar[Optional[str]] = "audio/"
+    _modality = "audio"
 
     def __init__(
         self, decoded_memory_reserver: Optional[_DecodedMemoryReserver] = None, **kwargs
@@ -1384,6 +1408,7 @@ class VideoMediaIO(BaseMediaIO[VideoData]):
     """Video I/O with a 200 MiB encoded-input limit and coupled sampling kwargs."""
 
     _data_uri_mime_prefix: ClassVar[Optional[str]] = "video/"
+    _modality = "video"
 
     def __init__(
         self,

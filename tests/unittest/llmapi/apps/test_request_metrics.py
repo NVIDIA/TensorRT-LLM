@@ -12,10 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
 import json
 
 import pytest
 
+from tensorrt_llm.metrics.perf_utils import _input_processing_observer
 from tensorrt_llm.serve.perf_metrics import (
     CTX_CHUNK_METRICS_HEADER,
     RETURN_METRICS_HEADER,
@@ -33,6 +35,77 @@ from tensorrt_llm.serve.perf_metrics import (
 from tensorrt_llm.serve.scripts.time_breakdown import RequestDataParser
 
 pytestmark = pytest.mark.cpu_only
+
+
+def test_input_metrics_survive_headers_disagg_and_jsonl():
+    record = _record()
+    inputs = {
+        "total": 0.15,
+        "media_load": 0.1,
+        "processor": 0.04,
+        "media_download_image": 0.08,
+        "media_decode_image": 0.02,
+    }
+    record["phases"]["server"]["input_processing_metrics"] = inputs
+    headers = build_metrics_headers([record])
+    assert "server_input_total;dur=150.000000" in headers[SERVER_TIMING_HEADER]
+    ctx = build_metrics_record_from_headers(headers, "ctx", request_id="42")
+    assert ctx["phases"]["ctx"]["input_processing_metrics"] == pytest.approx(inputs)
+    assert _jsonl_record(record)["perf_metrics"]["input_processing_metrics"] == inputs
+    combined = combine_disagg_metrics("1", {"timing_metrics": {}}, ctx, None)
+    assert combined["phases"]["ctx"]["input_processing_metrics"] == pytest.approx(inputs)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True])
+async def test_input_metrics_are_request_local_and_exported(stream):
+    async def app(scope, receive, send):
+        await asyncio.sleep(0)
+        observer = _input_processing_observer.get()
+        await asyncio.to_thread(observer, "decode", scope["seconds"], "image")
+        record = _record()
+        record["phases"]["server"]["input_processing_metrics"] = dict(
+            scope["state"]["input_processing_metrics"]
+        )
+        scope["state"]["perf_metrics_records"].append(record)
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 200,
+                "headers": [
+                    (b"content-type", b"text/event-stream" if stream else b"application/json")
+                ],
+            }
+        )
+        await send({"type": "http.response.body", "body": b"data: [DONE]\n\n" if stream else b"{}"})
+
+    middleware = PerfMetricsMiddleware(app, expose_headers=True)
+
+    async def request(seconds):
+        messages = []
+
+        async def capture(message):
+            messages.append(message)
+
+        scope = {
+            "type": "http",
+            "headers": [(RETURN_METRICS_HEADER.encode(), b"1")],
+            "seconds": seconds,
+        }
+        await middleware(scope, None, capture)
+        assert scope["state"]["input_processing_metrics"] == {"media_decode_image": seconds}
+        if stream:
+            data = messages[-1]["body"].split(b"data: ")[-1].strip()
+            headers = json.loads(data)
+        else:
+            headers = {key.decode(): value.decode() for key, value in messages[0]["headers"]}
+        assert (
+            f"server_input_media_decode_image;dur={seconds * 1000:.6f}"
+            in headers[SERVER_TIMING_HEADER]
+        )
+
+    await asyncio.gather(request(0.1), request(0.2))
+    assert _input_processing_observer.get() is None
 
 
 def _record(status="complete"):
