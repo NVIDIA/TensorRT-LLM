@@ -935,7 +935,8 @@ class CuDNNAttention(AttentionBackend):
             kv_cache: A ``BlockCausalKVCacheManager``. When given, ``k``/``v`` are the new
                 tokens only: they are written at ``staging_offset`` and attention runs
                 over everything cached before them plus themselves.
-            seq_len: Number of real tokens when ``kv_cache`` is given; all ``S_q`` rows
+            seq_len: Global number of real tokens when ``kv_cache`` is given (all
+                ranks, before padding, not this rank's shard); all ``S_q`` rows
                 are real if it is ``None`` or ``kv_cache`` is absent. Rows past it are
                 padding added so the sequence splits evenly across ranks; they are
                 neither written to the cache nor attended, and their output rows are zero.

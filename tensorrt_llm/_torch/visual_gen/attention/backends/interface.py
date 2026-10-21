@@ -64,9 +64,10 @@ class AttentionBackend(ABC):
           key sequence lengths. ``seq_len`` is the number of query tokens this call
           computes, as in the engine's attention metadata, not a cached total. The
           Attention module derives it from ``q.shape[1]``; with a ``kv_cache`` the
-          caller passes it and it may be smaller than ``q.shape[1]``: rows past it
-          are padding added so the sequence splits evenly across ranks, and they
-          are neither written to the cache nor attended, and come back zero.
+          caller passes the global count (all ranks, before padding, not this rank's
+          shard), and it may be smaller than ``q.shape[1]``: rows past it are
+          padding added so the sequence splits evenly across ranks, and they are
+          neither written to the cache nor attended, and come back zero.
         * ``attention_mask``, ``key_padding_mask``: the mask, if the backend takes one.
         * ``kv_cache``: a ``BlockCausalKVCacheManager``; only backends whose
           ``support_kv_cache()`` is true accept it. ``k``/``v`` are then this call's

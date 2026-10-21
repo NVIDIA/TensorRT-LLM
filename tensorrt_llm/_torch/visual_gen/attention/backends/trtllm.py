@@ -466,7 +466,8 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
             batch_size: Batch size
             seq_len: Query length used for metadata and reshaping. Without ``kv_cache``,
                 the Attention module supplies ``S``, including padding. With ``kv_cache``,
-                the caller supplies the real query length, which may be smaller than
+                the caller supplies the global real query length (all ranks, before
+                padding, not this rank's shard), which may be smaller than
                 ``S``; trailing padding is neither cached nor attended and outputs zero.
             attention_mask: Attention mask type
             seq_len_kv: Sequence length for K/V (for cross-attention, defaults to seq_len)

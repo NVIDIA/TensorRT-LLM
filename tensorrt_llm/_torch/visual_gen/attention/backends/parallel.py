@@ -349,9 +349,9 @@ class UlyssesAttention(AttentionBackend):
     Backend-specific kwargs are forwarded to the inner backend. Sequence
     lengths are updated after all-to-all, and VSA gates are redistributed with
     the same sequence/head mapping as Q before they are forwarded. With a
-    ``kv_cache`` the caller's ``seq_len`` is the number of real tokens, the same
-    on every rank, and is passed through untouched; rows past it are padding
-    from the exchange.
+    ``kv_cache`` the caller's ``seq_len`` is the global number of real tokens (all
+    ranks, before padding, not this rank's shard), the same on every rank, and is
+    passed through untouched; rows past it are padding from the exchange.
 
     Architecture:
         Input:  [B, S/P, H, D] (sequence sharded across P processes)
