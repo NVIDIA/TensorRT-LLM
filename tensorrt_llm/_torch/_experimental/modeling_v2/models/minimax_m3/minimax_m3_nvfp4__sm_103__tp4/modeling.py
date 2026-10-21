@@ -40,7 +40,7 @@ range: log once, run the generic path) or **missed** (inside a covered range but
 
 **Hand-offs between kernels.** A producer that already holds an activation in registers writes its MXFP8 form for the
 next MXFP8 projection: the decode boundary all-reduce for the next layer's QKV, the sparse-decode merge and the fused
-decode attention for the o_proj. It publishes it in ``kernels/m3_prequant.SLOT`` keyed by the BF16 tensor; the next
+decode attention for the o_proj. It publishes it in ``ops/m3_prequant.SLOT`` keyed by the BF16 tensor; the next
 MXFP8 projection on a decode graph takes it (``_linear``), and every take clears the slot. The decode boundaries'
 push targets (the o_proj / shared-expert GEMVs and the MoE engine writing straight into the boundary all-reduce's
 exchange) are passed explicitly from the layer to the producer and back.
@@ -145,23 +145,16 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization.mode import QuantAlgo
 
 from . import weights as _weights
-from .kernels import m3_attn_mega as _attn_mega_kernel
-from .kernels import m3_attn_mega_c1 as _attn_c1_kernel
-from .kernels import m3_draft_step as m3_draft_step_kernel
-from .kernels import m3_fused_attn as _fused_attn_kernel
-from .kernels import m3_index_score as _index_score_kernel
-from .kernels import m3_mc_allreduce, m3_prequant, m3_spec_tail
-from .kernels import m3_sampled_accept as m3_sampled_accept_kernel
-from .kernels import m3_shard_accept as m3_shard_accept_kernel
-from .kernels import m3_target_head as m3_target_head_kernel
-from .kernels import msa_kv_update as _msa_kv_update_kernel
-from .kernels.long_select import long_select_blocks
-from .kernels.m3_router_gemv import m3_router_gemv as _router_gemv
-from .kernels.m3_router_gemv import m3_router_gemv_fp4 as _router_gemv_fp4
-from .kernels.m3_router_gemv import m3_router_tc as _router_tc
-from .kernels.mx_gemv import op as mx_gemv
-from .kernels.mxfp8_low_m_gemm import mxfp8_low_m_gemm as _low_m_gemm
-from .kernels.triton_sparse_decode import MERGE_MXFP8, MERGE_MXFP8_MIN_TOKENS
+from .ops import m3_attn_mega as _attn_mega_kernel
+from .ops import m3_attn_mega_c1 as _attn_c1_kernel
+from .ops import m3_draft_step as m3_draft_step_kernel
+from .ops import m3_fused_attn as _fused_attn_kernel
+from .ops import m3_index_score as _index_score_kernel
+from .ops import m3_mc_allreduce, m3_prequant, m3_spec_tail
+from .ops import m3_sampled_accept as m3_sampled_accept_kernel
+from .ops import m3_shard_accept as m3_shard_accept_kernel
+from .ops import m3_target_head as m3_target_head_kernel
+from .ops import msa_kv_update as _msa_kv_update_kernel
 from .ops.activation.m3_silu_and_mul import m3_silu_and_mul
 from .ops.attention.m3_attn_c1 import m3_attn_c1
 from .ops.attention.m3_attn_mega import m3_attn_mega
@@ -201,17 +194,24 @@ from .ops.gemm.m3_mxfp8_linear import m3_mxfp8_linear
 from .ops.gemm.m3_target_head import MAX_ROWS as TARGET_HEAD_KERNEL_MAX_ROWS
 from .ops.gemm.m3_target_head import m3_target_head
 from .ops.gemm.mxfp8_low_m_gemm import mxfp8_low_m_gemm
+from .ops.long_select import long_select_blocks
+from .ops.m3_router_gemv import m3_router_gemv as _router_gemv
+from .ops.m3_router_gemv import m3_router_gemv_fp4 as _router_gemv_fp4
+from .ops.m3_router_gemv import m3_router_tc as _router_tc
 from .ops.moe.m3_moe16_engine import M3Moe16State, m3_moe16_engine
 from .ops.moe.m3_moe_engine import M3MoeState, ar_push_desc, m3_moe_engine
 from .ops.moe.m3_router_gemv import m3_router_gemv
 from .ops.moe.m3_router_gemv_fp4 import m3_router_gemv_fp4
 from .ops.moe.m3_router_tc import m3_router_tc
+from .ops.mx_gemv import op as mx_gemv
+from .ops.mxfp8_low_m_gemm import mxfp8_low_m_gemm as _low_m_gemm
 from .ops.norm.m3_embedding_firstnorm import DecodeEmbedding, m3_embedding_firstnorm
 from .ops.spec.m3_draft_input import m3_draft_input
 from .ops.spec.m3_draft_step import MAX_TOKENS as DRAFT_STEP_KERNEL_MAX_TOKENS
 from .ops.spec.m3_draft_step import m3_draft_step
 from .ops.spec.m3_force_vec import m3_force_vec
 from .ops.spec.m3_shard_accept import m3_shard_accept
+from .ops.triton_sparse_decode import MERGE_MXFP8, MERGE_MXFP8_MIN_TOKENS
 
 _SM = (10, 3)
 # --------------------------------------------------------------------------------------------------------------------
@@ -238,7 +238,7 @@ class DecodePlan:
 
 
 # tiny: every step up to 8 tokens (c1..c8 without speculation, the c1 verify, every draft pass); small: the c2
-# verify; verify: the c4 / c8 verifies. Each is one multicast all-reduce bucket (kernels/m3_mc_allreduce.BUCKETS).
+# verify; verify: the c4 / c8 verifies. Each is one multicast all-reduce bucket (ops/m3_mc_allreduce.BUCKETS).
 DECODE_PLANS = (
     DecodePlan("tiny", 8, attn_mc_ar=True, moe_mc_ar=True, qkv_prequant=True),
     DecodePlan("small", 16, attn_mc_ar=True, moe_mc_ar=True, qkv_prequant=True),
@@ -286,22 +286,22 @@ FUSED_ATTN_MAX_TOKENS = 16  # capacity: fixed: measured wave crossover
 # One request verifying a draft of 6 query rows runs attention + o_proj as one launch (96 CTAs: 6 clusters of 16).
 ATTN_C1_QUERY_LEN = 6  # capacity: fixed: the verify kernel's query rows
 # A greedy Eagle3 verify step of up to this many requests verifies with the fused shard argmax + acceptance kernel
-# over the target lm_head's BF16 shard logits (kernels/m3_shard_accept), at the configured draft length.
+# over the target lm_head's BF16 shard logits (ops/m3_shard_accept), at the configured draft length.
 SHARD_ACCEPT_DRAFT_LEN = 3  # capacity: fixed: the built Eagle3 draft length
 SHARD_ACCEPT_MAX_REQUESTS = DECODE_MAX_TOKENS // (
     SHARD_ACCEPT_DRAFT_LEN + 1
 )  # capacity: fixed: decode rows / (draft length + 1)
 # A fused-verify step of up to this many verify rows (one or two requests at draft length 3) computes the target
-# logits shard from the 12-bit coded copy of the BF16 head (kernels/m3_target_head; the same BF16 x BF16 -> fp32
+# logits shard from the 12-bit coded copy of the BF16 head (ops/m3_target_head; the same BF16 x BF16 -> fp32
 # arithmetic, 75% of the bytes) instead of the in-tree head GEMM; wider verifies keep the in-tree GEMM.
 TARGET_HEAD_MAX_ROWS = TARGET_HEAD_KERNEL_MAX_ROWS
 # On a fused-verify step of up to this many verify rows the drafter's first fc is forked onto the aux stream right
 # after the last captured target layer, overlapping the remaining target layers and the head (spec_worker).
 FC_EARLY_MAX_ROWS = 8  # capacity: fixed: measured fork crossover
 # A decode-only Eagle3 step of up to this many requests drafts with the fused draft loop (spec_worker): per pass the
-# draft input in one launch (kernels/m3_spec_tail.draft_input), the drafter layer's in-tree attention, MLP and
+# draft input in one launch (ops/m3_spec_tail.draft_input), the drafter layer's in-tree attention, MLP and
 # all-reduces, and one kernel for the draft head (its 12-bit coded copy, or the BF16 fragments when the coding does
-# not decode bit for bit), the cross-rank argmax and the pass's bookkeeping (kernels/m3_draft_step), at the
+# not decode bit for bit), the cross-rank argmax and the pass's bookkeeping (ops/m3_draft_step), at the
 # configured draft length. The head kernel takes one row per request, at most 8.
 # The fused draft loop streams the 12-bit coded copy of the draft head (when it decodes bit for bit); False keeps the
 # BF16 fragments.
@@ -309,7 +309,7 @@ DRAFT_HEAD_CODED = True
 DRAFT_STEP_DRAFT_LEN = SHARD_ACCEPT_DRAFT_LEN  # capacity: fixed: the built draft length
 DRAFT_STEP_MAX_REQUESTS = DRAFT_STEP_KERNEL_MAX_TOKENS
 # The identity-selection sparse decode moves from the per-row producer to the multi-query producer at this many rows
-# (kernels/triton_sparse_decode.MQ_MIN_TOKENS).
+# (ops/triton_sparse_decode.MQ_MIN_TOKENS).
 SPARSE_DECODE_MQ_MIN_TOKENS = 17  # capacity: fixed: the multi-query crossover
 # The long-row top-16 selector takes engines of 129..LONG_SELECT_MAX_BLOCKS KV blocks of 128 tokens; it holds 2, 4 or
 # 9 keys per thread by the row's valid-block count. At most 128 blocks the built-in selector runs.
@@ -350,7 +350,7 @@ MX_GEMV_BF16_MAX_TOKENS: Dict[Tuple[int, int], int] = {
     DENSE_DOWN: 16,
 }
 # The fused low-M MXFP8 GEMM (projections marked for it), per projection: its built configurations' row limit
-# (kernels/mxfp8_low_m_gemm). The bf16 GEMV serves every one of these rows first; the GEMM takes them only if it
+# (ops/mxfp8_low_m_gemm). The bf16 GEMV serves every one of these rows first; the GEMM takes them only if it
 # declines.
 LOW_M_GEMM_MAX_TOKENS: Dict[Tuple[int, int], int] = {
     QKV_SPARSE: 8,
@@ -815,8 +815,8 @@ def _text_model_config(model_config: ModelConfig) -> ModelConfig:
 
 
 def _validate_runtime(model_config: ModelConfig) -> None:
-    """The runtime this target is written for (it is not in the checkpoint): routing declines every other one
-    (``routing._runtime_mismatch``), so this is the backstop for a construction that did not go through routing.
+    """The runtime this target is written for. It is set by engine arguments rather than the checkpoint, so routing
+    sees only its KV cache algorithm; this check at construction refuses every other runtime.
 
     The MiniMax-M3 MSA backend (it owns the step metadata and the index-K cache), the fused five-way QKV/index
     projection or the separate QKV and index projections, an FP8 indexer and an FP8 or NVFP4 main KV cache.

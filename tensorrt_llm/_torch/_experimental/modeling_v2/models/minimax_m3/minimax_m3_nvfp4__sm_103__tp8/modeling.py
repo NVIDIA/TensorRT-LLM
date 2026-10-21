@@ -42,7 +42,7 @@ range: log once, run the generic path) or **missed** (inside a covered range but
 
 **Hand-offs between kernels.** A producer that already holds an activation in registers writes its MXFP8 form for the
 next MXFP8 projection: the decode boundary all-reduce for the next layer's QKV, the sparse-decode merge for the
-o_proj. It publishes it in ``kernels/m3_prequant.SLOT`` keyed by the BF16 tensor; the next
+o_proj. It publishes it in ``ops/m3_prequant.SLOT`` keyed by the BF16 tensor; the next
 MXFP8 projection on a decode graph takes it (``_linear``), and every take clears the slot. The decode boundaries'
 push targets (the o_proj / shared-expert GEMVs and the MoE engine writing straight into the boundary all-reduce's
 exchange) are passed explicitly from the layer to the producer and back.
@@ -147,18 +147,13 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization.mode import QuantAlgo
 
 from . import weights as _weights
-from .kernels import m3_draft_step as m3_draft_step_kernel
-from .kernels import m3_fused_score_select as _fused_score_select_kernel
-from .kernels import m3_index_score as _index_score_kernel
-from .kernels import m3_mc_allreduce, m3_prequant, m3_spec_tail
-from .kernels import m3_sampled_accept as m3_sampled_accept_kernel
-from .kernels import m3_shard_accept as m3_shard_accept_kernel
-from .kernels import msa_kv_update as _msa_kv_update_kernel
-from .kernels.long_select import long_select_blocks
-from .kernels.m3_router_gemv import m3_router_gemv as _router_gemv
-from .kernels.m3_router_gemv import m3_router_gemv_fp4 as _router_gemv_fp4
-from .kernels.m3_router_gemv import m3_router_tc as _router_tc
-from .kernels.mx_gemv import op as mx_gemv
+from .ops import m3_draft_step as m3_draft_step_kernel
+from .ops import m3_fused_score_select as _fused_score_select_kernel
+from .ops import m3_index_score as _index_score_kernel
+from .ops import m3_mc_allreduce, m3_prequant, m3_spec_tail
+from .ops import m3_sampled_accept as m3_sampled_accept_kernel
+from .ops import m3_shard_accept as m3_shard_accept_kernel
+from .ops import msa_kv_update as _msa_kv_update_kernel
 from .ops.activation.m3_silu_and_mul import m3_silu_and_mul
 from .ops.attention.m3_dense_decode import m3_dense_decode
 from .ops.attention.m3_draft_attention import m3_draft_attention
@@ -190,10 +185,15 @@ from .ops.gemm.m3_mx_gemv import DENSE_DOWN, DENSE_GATE_UP, O_PROJ, QKV, QKV_SPA
 from .ops.gemm.m3_mx_gemv_bf16 import m3_mx_gemv_bf16
 from .ops.gemm.m3_mxfp8_gemm import m3_mxfp8_gemm
 from .ops.gemm.m3_mxfp8_linear import m3_mxfp8_linear
+from .ops.long_select import long_select_blocks
+from .ops.m3_router_gemv import m3_router_gemv as _router_gemv
+from .ops.m3_router_gemv import m3_router_gemv_fp4 as _router_gemv_fp4
+from .ops.m3_router_gemv import m3_router_tc as _router_tc
 from .ops.moe.m3_moe_engine import M3MoeState, ar_push_desc, m3_moe_engine
 from .ops.moe.m3_router_gemv import m3_router_gemv
 from .ops.moe.m3_router_gemv_fp4 import m3_router_gemv_fp4
 from .ops.moe.m3_router_tc import m3_router_tc
+from .ops.mx_gemv import op as mx_gemv
 from .ops.norm.m3_embedding_firstnorm import DecodeEmbedding, m3_embedding_firstnorm
 from .ops.spec.m3_draft_input import m3_draft_input
 from .ops.spec.m3_draft_step import MAX_TOKENS as DRAFT_STEP_KERNEL_MAX_TOKENS
@@ -226,7 +226,7 @@ class DecodePlan:
 
 
 # tiny: every step up to 8 tokens (c1..c8 without speculation, the c1 verify, every draft pass); small: the c2
-# verify; verify: the c4 / c8 verifies. Each is one multicast all-reduce bucket (kernels/m3_mc_allreduce.BUCKETS).
+# verify; verify: the c4 / c8 verifies. Each is one multicast all-reduce bucket (ops/m3_mc_allreduce.BUCKETS).
 DECODE_PLANS = (
     DecodePlan("tiny", 8, attn_mc_ar=True, moe_mc_ar=True, qkv_prequant=True),
     DecodePlan("small", 16, attn_mc_ar=True, moe_mc_ar=True, qkv_prequant=True),
@@ -265,7 +265,7 @@ MC_FINALIZE_MIN_TOKENS = MOE_ENGINE_MAX_TOKENS + 1  # capacity: fixed: the rows 
 ROUTER_GEMV_MAX_TOKENS = 1  # capacity: fixed: measured router crossover
 ROUTER_TC_MAX_TOKENS = 48  # capacity: fixed: the tensor-core router's built rows
 # A greedy Eagle3 verify step of up to this many requests verifies with the fused shard argmax + acceptance kernel
-# over the target lm_head's BF16 shard logits (kernels/m3_shard_accept), at the configured draft length. The lm_head
+# over the target lm_head's BF16 shard logits (ops/m3_shard_accept), at the configured draft length. The lm_head
 # is the in-tree BF16 GEMM: at the TP8 shard (25008 rows) a coded copy of the head saves no time.
 SHARD_ACCEPT_DRAFT_LEN = 3  # capacity: fixed: the built Eagle3 draft length
 SHARD_ACCEPT_MAX_REQUESTS = DECODE_MAX_TOKENS // (
@@ -276,14 +276,14 @@ SHARD_ACCEPT_MAX_REQUESTS = DECODE_MAX_TOKENS // (
 # its GEMM lands beside the target tail it was meant to hide under.
 FC_EARLY_MAX_ROWS = 0  # capacity: fixed: measured fork crossover (never at TP8)
 # A decode-only Eagle3 step of up to this many requests drafts with the fused draft loop (M3Eagle3Worker): per pass
-# the draft input in one launch (kernels/m3_spec_tail.draft_input), the drafter layer's attention, MLP and
+# the draft input in one launch (ops/m3_spec_tail.draft_input), the drafter layer's attention, MLP and
 # all-reduces, and one kernel for the BF16 draft head, the cross-rank argmax and the pass's bookkeeping
-# (kernels/m3_draft_step), at the configured draft length. The head kernel takes one row per request, at most 8, and
+# (ops/m3_draft_step), at the configured draft length. The head kernel takes one row per request, at most 8, and
 # streams the head's BF16 weight fragments.
 DRAFT_STEP_DRAFT_LEN = SHARD_ACCEPT_DRAFT_LEN  # capacity: fixed: the built draft length
 DRAFT_STEP_MAX_REQUESTS = DRAFT_STEP_KERNEL_MAX_TOKENS
 # The identity-selection sparse decode moves from the per-row producer to the multi-query producer at this many rows
-# (kernels/triton_sparse_decode.MQ_MIN_TOKENS).
+# (ops/triton_sparse_decode.MQ_MIN_TOKENS).
 SPARSE_DECODE_MQ_MIN_TOKENS = 17  # capacity: fixed: the multi-query crossover
 # Decode spans of at most this many requests score and select their top-16 blocks in one launch
 # (ops/attention/m3_fused_score_select), which loads the older index-K pages before its grid wait; larger spans run
@@ -759,8 +759,8 @@ def _text_model_config(model_config: ModelConfig) -> ModelConfig:
 
 
 def _validate_runtime(model_config: ModelConfig) -> None:
-    """The runtime this target is written for (it is not in the checkpoint): routing declines every other one
-    (``routing._runtime_mismatch``), so this is the backstop for a construction that did not go through routing.
+    """The runtime this target is written for. It is set by engine arguments rather than the checkpoint, so routing
+    sees only its KV cache algorithm; this check at construction refuses every other runtime.
 
     The MiniMax-M3 MSA backend (it owns the step metadata and the index-K cache), the fused five-way QKV/index
     projection or the separate QKV and index projections, an FP8 indexer and an FP8 or NVFP4 main KV cache.

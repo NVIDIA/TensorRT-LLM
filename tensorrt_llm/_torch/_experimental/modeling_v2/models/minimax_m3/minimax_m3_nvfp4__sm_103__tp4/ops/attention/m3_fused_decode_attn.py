@@ -366,7 +366,7 @@ class M3FusedDecodeAttn(OpWrapper):
     the split-K LSE merge, writing the bf16 output and its MXFP8 copy for the o_proj GEMM.
 
     ``(tokens_per_cluster, blocks_per_cta)`` is the launch geometry; the target passes
-    ``kernels.m3_fused_attn.default_geometry(qlen, num_requests)``. Returns None: the cells read ``output``,
+    ``ops.m3_fused_attn.default_geometry(qlen, num_requests)``. Returns None: the cells read ``output``,
     ``mxfp8_data`` / ``mxfp8_scale`` and the three caches.
     """
 

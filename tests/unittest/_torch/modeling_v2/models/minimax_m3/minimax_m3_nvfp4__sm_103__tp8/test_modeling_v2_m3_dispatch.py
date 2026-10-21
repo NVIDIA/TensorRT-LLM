@@ -18,16 +18,13 @@ import torch
 from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_103__tp8 import (  # noqa: E501
     modeling as dispatch,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_103__tp8.kernels import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_103__tp8.ops import (  # noqa: E501
     m3_attn_lc8,
     m3_draft_step,
     m3_fused_score_select,
     m3_mc_allreduce,
     m3_shard_accept,
     triton_sparse_decode,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_103__tp8.kernels.mx_gemv import (  # noqa: E501
-    op as mx_gemv,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_103__tp8.ops.attention import (  # noqa: E501
     m3_fused_score_select as fused_score_select_entry,
@@ -44,6 +41,9 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_
     O_PROJ,
     QKV,
     QKV_SPARSE,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_103__tp8.ops.mx_gemv import (  # noqa: E501
+    op as mx_gemv,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_103__tp8.ops.spec import (  # noqa: E501
     m3_draft_step as draft_step_entry,
@@ -135,12 +135,12 @@ def test_the_removed_tp4_paths_are_gone() -> None:
     ):
         assert not hasattr(dispatch, constant), constant
     for module in (
-        "kernels.m3_target_head",
-        "kernels.mxfp8_low_m_gemm",
-        "kernels.m3_attn_mega",
-        "kernels.m3_attn_mega_c1",
-        "kernels.m3_fused_attn",
-        "kernels.m3_attn_lc",
+        "ops.m3_target_head",
+        "ops.mxfp8_low_m_gemm",
+        "ops.m3_attn_mega",
+        "ops.m3_attn_mega_c1",
+        "ops.m3_fused_attn",
+        "ops.m3_attn_lc",
         "ops.gemm.m3_target_head",
         "ops.gemm.mxfp8_low_m_gemm",
         "ops.moe.m3_moe16_engine",

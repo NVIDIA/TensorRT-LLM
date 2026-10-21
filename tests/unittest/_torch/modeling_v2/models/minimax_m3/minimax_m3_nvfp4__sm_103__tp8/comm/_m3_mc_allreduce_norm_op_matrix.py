@@ -559,7 +559,7 @@ def _run_one_rank() -> int:
     RANK, WORLD = rank, world
     assert WORLD in WORLD_SIZES, f"the matrix runs at {WORLD_SIZES} ranks on one node, got {WORLD}"
 
-    import tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_103__tp8.kernels.m3_mc_allreduce as _ar  # noqa: E501
+    import tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_103__tp8.ops.m3_mc_allreduce as _ar  # noqa: E501
     from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_103__tp8.ops.comm import (  # noqa: E501
         m3_mc_allreduce_norm as _plain,
     )
