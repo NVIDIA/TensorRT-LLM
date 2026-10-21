@@ -1092,29 +1092,51 @@ def _documented_names(text: str, start: str, end: str) -> set[str]:
 
 @pytest.mark.cpu_only
 def test_mx_e2e_rows_and_ci_list_match_qualified_profile_registry() -> None:
-    """Every qualified profile has TP1 and TP2 donor/receiver rows that CI schedules.
+    """Every qualified profile has donor/receiver rows that CI schedules.
 
-    The `_MX_CASES` rows must follow the shared naming scheme, and
-    `l0_model_express.yml` must list each row exactly once, in a block whose GPU
-    count matches the row's two TP groups.
+    A dense profile has TP1 and TP2 rows. A MoE profile has one row per admitted
+    MoE partition: TP1, TP2 with MoE TP 2, and TP2 with MoE EP 2 (case ID suffix
+    `-ep2`). MoE rows disable the finalize fusion, which is not deterministic,
+    because the test compares tokens across processes. The `_MX_CASES` rows must
+    follow the shared naming scheme, and `l0_model_express.yml` must list each
+    row exactly once, in a block whose GPU count matches the row's two TP groups.
     """
     cases = _mx_e2e_cases()
     ci_case_ids = _l0_model_express_case_ids()
     expected_case_ids = set()
     for profile in ModelLoader._post_transform_profile_registry().profiles:
         family = profile.profile_id.split("-for-causal-lm-")[0]
+        constraints = profile.runtime_constraints
+        is_moe_profile = constraints.moe_backends is not None
         for tp_size in (1, 2):
-            case_id = f"{family}-bf16-tp{tp_size}"
-            expected_case_ids.add(case_id)
-            assert cases[case_id] == {
-                "model_env": f"TRTLLM_MX_{family.upper()}_MODEL",
-                "default_model_subdir": cases[f"{family}-bf16-tp1"]["default_model_subdir"],
-                "repository_cache_prefix": f"models--trtllm-mx-e2e--{family}-tp{tp_size}",
-                "tp_size": tp_size,
-                # The donor and the receiver each hold one TP group.
-                "min_devices": 2 * tp_size,
-            }
-            assert case_id in ci_case_ids[2 * tp_size]
+            moe_ep_sizes = (
+                sorted(
+                    moe_ep_size
+                    for moe_ep_size in constraints.moe_ep_sizes
+                    if tp_size % moe_ep_size == 0
+                    and tp_size // moe_ep_size in constraints.moe_tp_sizes
+                )
+                if is_moe_profile
+                else [1]
+            )
+            for moe_ep_size in moe_ep_sizes:
+                row_suffix = f"tp{tp_size}" + (f"-ep{moe_ep_size}" if moe_ep_size > 1 else "")
+                case_id = f"{family}-bf16-{row_suffix}"
+                expected_case_ids.add(case_id)
+                expected_row: dict[str, object] = {
+                    "model_env": f"TRTLLM_MX_{family.upper().replace('-', '_')}_MODEL",
+                    "default_model_subdir": cases[f"{family}-bf16-tp1"]["default_model_subdir"],
+                    "repository_cache_prefix": f"models--trtllm-mx-e2e--{family}-{row_suffix}",
+                    "tp_size": tp_size,
+                    # The donor and the receiver each hold one TP group.
+                    "min_devices": 2 * tp_size,
+                }
+                if moe_ep_size > 1:
+                    expected_row["moe_ep_size"] = moe_ep_size
+                if is_moe_profile:
+                    expected_row["moe_disable_finalize_fusion"] = True
+                assert cases[case_id] == expected_row
+                assert case_id in ci_case_ids[2 * tp_size]
 
     assert set(cases) == expected_case_ids
     assert set(ci_case_ids) == {2, 4}
