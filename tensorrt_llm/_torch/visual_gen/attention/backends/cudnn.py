@@ -641,7 +641,9 @@ class CuDNNAttention(AttentionBackend):
             q, k, v = q[:, :num_tokens], k[:, :num_tokens], v[:, :num_tokens]
         causal_block_size, num_causal_blocks = kv_cache.causal_blocks(num_tokens, causal_block_size)
         device = q.device
-        buf = kv_cache.kv_buffer(self.layer_idx)
+        # Cut to the last layer's view, which still covers every page-list entry, so
+        # all layers share one num_pages and therefore one cuDNN graph.
+        buf = kv_cache.kv_buffer(self.layer_idx)[: kv_cache.kv_buffer(-1).shape[0]]
         if q.dtype != buf.dtype:
             raise TypeError(f"q is {q.dtype} but the cache holds {buf.dtype}")
         # Write ``k``/``v`` to the KV cache at ``staging_offset``.

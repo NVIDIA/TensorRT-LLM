@@ -263,7 +263,8 @@ def test_every_layer_and_library_over_a_multi_layer_cache(
     """A 3-layer cache with different K/V in every layer, attended on every layer
     through a rotating table, with 1, 4 and 8 causal blocks in BF16 and FP16. Each
     layer must read its own pages. For TRTLLM the cases also cross the FMHA library
-    boundary on SM100/SM103, and the library that served each one is checked."""
+    boundary on SM100/SM103, and the library that served each one is checked. For
+    cuDNN every layer shares one graph."""
     torch.manual_seed(11)
     num_layers, prompt_len = 3, 17
     geometry = dict(
@@ -279,6 +280,8 @@ def test_every_layer_and_library_over_a_multi_layer_cache(
             cache.write_range(layer, 0, pk, pv)
         cache.commit(prompt_len)
         attns = [make_backend(backend, layer, dtype) for layer in range(num_layers)]
+        if backend == "cudnn":
+            CuDNNAttention.clear_graph_cache()
         served = set()
         if backend == "trtllm":
             if get_sm_version() in (100, 103):
@@ -323,6 +326,8 @@ def test_every_layer_and_library_over_a_multi_layer_cache(
         assert saw_stale, "test geometry should hold stale tokens at some step"
         if backend == "trtllm":
             assert served == {expected_fmha_library(dtype, num_causal_blocks)}
+        else:
+            assert len(CuDNNAttention._graph_cache) == 1, "every layer should share one graph"
     finally:
         cache.shutdown()
 
