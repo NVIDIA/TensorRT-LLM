@@ -1296,9 +1296,13 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         child = super().create_child_request(child_id)
         py_request = LlmRequest(llm_request=child)
 
-        # Copy all py_* attributes from parent to child
+        # Encoder features are shared read-only. Before an in-place mutation,
+        # clone and reassign the tensor on the request being modified.
+        # Deep-copy other py_* attributes to preserve child independence.
         for attr_name, attr_value in self.__dict__.items():
-            if attr_name.startswith('py_'):
+            if attr_name == 'py_encoder_input_features':
+                py_request.py_encoder_input_features = attr_value
+            elif attr_name.startswith('py_'):
                 attr_value = getattr(self, attr_name)
                 setattr(py_request, attr_name, deepcopy(attr_value))
             elif attr_name in [

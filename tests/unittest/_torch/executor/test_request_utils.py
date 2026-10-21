@@ -189,25 +189,35 @@ def test_executor_request_to_llm_request_owns_encoder_features_in_python() -> No
     executor_request = trtllm.Request(
         input_token_ids=[1, 2, 3],
         max_tokens=10,
-        sampling_config=trtllm.SamplingConfig(num_return_sequences=2),
+        sampling_config=trtllm.SamplingConfig(num_return_sequences=3),
     )
     executor_request.py_multimodal_data = {
         "audio": {"encoder_input_features": features, "encoder_output_len": 6}
     }
     llm_request = executor_request_to_llm_request(
-        42, executor_request, child_req_ids=[43], exclude_last_generation_logits=False
+        42, executor_request, child_req_ids=[43, 44], exclude_last_generation_logits=False
     )
-    child = llm_request.child_requests[0]
+    child, sibling = llm_request.child_requests
     assert llm_request.py_encoder_input_features is features
-    torch.testing.assert_close(child.py_encoder_input_features, features)
-    assert child.py_encoder_input_features.data_ptr() != features.data_ptr()
-    for request in (llm_request, child):
+    for request in (llm_request, child, sibling):
+        assert request.py_encoder_input_features is features
+        assert request.py_encoder_input_features.data_ptr() == features.data_ptr()
         assert request.encoder_output_len == 6
         assert request.state.name == "ENCODER_INIT"
         request.validate(10, 30, 0)
         request.pause(20)
         assert request.state.name == "ENCODER_INIT"
         assert request.encoder_output_len == 6
+
+        assert request.py_encoder_input_features is features
+
+    child.py_encoder_input_features = child.py_encoder_input_features.clone()
+    child.py_encoder_input_features.add_(1)
+    assert child.py_encoder_input_features.data_ptr() != features.data_ptr()
+    torch.testing.assert_close(child.py_encoder_input_features, features + 1)
+    assert llm_request.py_encoder_input_features is features
+    assert sibling.py_encoder_input_features is features
+    torch.testing.assert_close(features, torch.arange(96, dtype=torch.float32).reshape(12, 8))
 
 
 @pytest.mark.parametrize("enabled", [False, True])
