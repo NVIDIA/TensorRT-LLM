@@ -13,6 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
+
 import pytest
 
 from tensorrt_llm._torch.model_config import ModelConfig
@@ -176,3 +178,117 @@ def test_modelopt_preserves_w4a8_nvfp4_fp8_group_size(group_size: int | None) ->
     )
     assert quant_config.quant_algo == QuantAlgo.W4A8_NVFP4_FP8
     assert quant_config.group_size == group_size
+
+
+# Module names chosen so that their order differs from any string-hash order
+# with high probability; a merge through a set would reorder them.
+_HF_EXCLUDE_MODULES = [
+    "model.layers.3.mlp.gate",
+    "model.layers.0.self_attn.q_proj",
+    "lm_head",
+    "model.layers.11.mlp.shared_expert_gate",
+    "model.layers.2.linear_attn.in_proj_ba",
+]
+
+
+def _compressed_tensors_fp8_block_config(**overrides):
+    config = {
+        "quant_method": "compressed-tensors",
+        "config_groups": {
+            "group_0": {
+                "weights": {"num_bits": 8, "type": "float", "strategy": "block"},
+                "input_activations": {"strategy": "group", "group_size": 128},
+            },
+        },
+    }
+    config.update(overrides)
+    return config
+
+
+def _compressed_tensors_mxfp4_config(**overrides):
+    config = {
+        "quant_method": "compressed-tensors",
+        "format": "mxfp4-pack-quantized",
+        "config_groups": {
+            "group_0": {
+                "weights": {
+                    "num_bits": 4,
+                    "type": "float",
+                    "strategy": "group",
+                    "group_size": 32,
+                },
+                "input_activations": None,
+            },
+        },
+    }
+    config.update(overrides)
+    return config
+
+
+@pytest.mark.parametrize(
+    "hf_quant_config, appended_modules",
+    [
+        pytest.param(
+            {
+                "quant_method": "fp8",
+                "fmt": "e4m3",
+                "weight_block_size": [128, 128],
+                "activation_scheme": "dynamic",
+                "modules_to_not_convert": _HF_EXCLUDE_MODULES + ["lm_head"],
+            },
+            ["*kv_b_proj*", "*k_b_proj*", "*eh_proj"],
+            id="fp8-block-scales",
+        ),
+        pytest.param(
+            {
+                "quant_method": "mxfp4",
+                "modules_to_not_convert": _HF_EXCLUDE_MODULES + ["lm_head"],
+            },
+            [
+                "block.*.attn.out",
+                "block.*.mlp.gate",
+                "block.*.attn.qkv",
+                "embedding",
+                "unembedding",
+            ],
+            id="mxfp4",
+        ),
+        pytest.param(
+            _compressed_tensors_fp8_block_config(
+                modules_to_not_convert=_HF_EXCLUDE_MODULES,
+                ignore=["lm_head", "model.embed_tokens"],
+            ),
+            ["model.embed_tokens"],
+            id="compressed-tensors-fp8-block",
+        ),
+        pytest.param(
+            _compressed_tensors_mxfp4_config(
+                modules_to_not_convert=_HF_EXCLUDE_MODULES,
+                ignore=["lm_head", "model.embed_tokens"],
+            ),
+            ["model.embed_tokens"],
+            id="compressed-tensors-mxfp4",
+        ),
+    ],
+)
+def test_load_hf_quant_config_keeps_exclude_modules_in_checkpoint_order(
+    hf_quant_config: dict, appended_modules: list[str]
+) -> None:
+    """The merged list feeds identity fingerprints, so its order must not vary."""
+    quant_config, _ = ModelConfig.load_hf_quant_config(hf_quant_config, moe_backend="CUTLASS")
+
+    assert quant_config.exclude_modules == _HF_EXCLUDE_MODULES + appended_modules
+
+
+def test_dtypes_json_quant_config_keeps_exclude_modules_in_checkpoint_order(tmp_path) -> None:
+    dtypes = {f"{name}.weight": "BF16" for name in _HF_EXCLUDE_MODULES}
+    dtypes["model.layers.0.mlp.experts.weight.blocks"] = "MXFP4"
+    dtypes["model.layers.0.mlp.experts.weight.scales"] = "UE8"
+    dtypes_json_file = tmp_path / "dtypes.json"
+    dtypes_json_file.write_text(json.dumps(dtypes), encoding="utf-8")
+
+    quant_config, _ = ModelConfig.load_quant_config_from_dtypes_json(
+        str(dtypes_json_file), moe_backend="CUTLASS"
+    )
+
+    assert quant_config.exclude_modules == _HF_EXCLUDE_MODULES
