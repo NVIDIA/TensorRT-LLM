@@ -820,6 +820,13 @@ def _rubin_mxfp8_is_available() -> bool:
     return get_sm_version() == 107 and IS_CUTLASS_DSL_RUBIN_AVAILABLE
 
 
+def _low_m_gemm_scale_from_mxfp8(weight_scale: torch.Tensor, n: int, k: int) -> torch.Tensor:
+    """The DeepGEMM-packed scale the low-M GEMM reads, from the SM107 CuTe MXFP8 scale."""
+    from ..kernels.blackwell import fp8_block_scale_low_m_gemm
+
+    return fp8_block_scale_low_m_gemm.pack_block_scale_from_mxfp8_layout(weight_scale, n, k)
+
+
 class _Fp8BlockScaleWeightReadLinear(nn.Module):
     """Bias-free FP8 block-scale GEMM for checkpoint attention and converted MLPs.
 
@@ -829,9 +836,10 @@ class _Fp8BlockScaleWeightReadLinear(nn.Module):
     GEMM. On Rubin (SM107) the scales are packed into the CuTe DSL K32 R128c4
     layout and the activation is quantized by the specialized CuTe quantizer
     before the native MXFP8 GEMM, which runs with K3's fine-grained low-M tuning
-    buckets. On SM100/SM103 the low-M GEMM is a candidate of forward like in the
-    generic FP8 block-scale linear (``Fp8BlockScaleLowMGemmRange``), on the same
-    DeepGEMM-packed ``weight_scale``.
+    buckets. On both, the low-M GEMM is a candidate of forward like in the
+    generic FP8 block-scale linear (``Fp8BlockScaleLowMGemmRange``); it reads a
+    DeepGEMM-packed scale, which is ``weight_scale`` on SM100/SM103 and a copy
+    repacked from the MXFP8 scale on SM107.
     """
 
     def __init__(
@@ -847,8 +855,9 @@ class _Fp8BlockScaleWeightReadLinear(nn.Module):
         # touched by any later autocast/dtype move.
         self.register_buffer("weight", weight_fp8, persistent=False)
         self.register_buffer("weight_scale", weight_scale, persistent=False)
-        # Rows the low-M GEMM serves; set at post-load.
+        # Rows the low-M GEMM serves and the DeepGEMM-packed scale it reads; set at post-load.
         self._low_m = Fp8BlockScaleLowMGemmRange()
+        self._low_m_weight_scale: Optional[torch.Tensor] = None
 
     @property
     def has_fp8_qdq(self) -> bool:
@@ -941,14 +950,20 @@ class _Fp8BlockScaleWeightReadLinear(nn.Module):
         self._prepare_low_m_gemm()
 
     def _prepare_low_m_gemm(self) -> None:
-        """Select the low-M GEMM for this weight on SM100/SM103, where ``weight_scale`` holds
-        the DeepGEMM-packed UE8M0 scale it reads."""
-        if _rubin_mxfp8_is_available():
-            self._low_m = Fp8BlockScaleLowMGemmRange()
+        """Select the low-M GEMM for this weight where it has a DeepGEMM-packed scale.
+
+        On SM107 that scale is a copy (N * K / 128 bytes) derived from the MXFP8
+        ``weight_scale``; row views of a fused KDA projection have none (the fused module
+        serves decode).
+        """
+        n, k = self.out_features, self.in_features
+        self._low_m = Fp8BlockScaleLowMGemmRange.for_weight(n, k)
+        if not _rubin_mxfp8_is_available():
+            self._low_m_weight_scale = self.weight_scale
+        elif self._low_m.max_m and self._fused_projection is None:
+            self._low_m_weight_scale = _low_m_gemm_scale_from_mxfp8(self.weight_scale, n, k)
         else:
-            self._low_m = Fp8BlockScaleLowMGemmRange.for_weight(
-                self.out_features, self.in_features
-            )
+            self._low_m, self._low_m_weight_scale = Fp8BlockScaleLowMGemmRange(), None
 
     def forward(
         self,
@@ -963,6 +978,10 @@ class _Fp8BlockScaleWeightReadLinear(nn.Module):
         if not _rubin_mxfp8_is_available():
             out = fp8_block_scale_ue8m0_gemm(
                 x_flat, self.weight, self.weight_scale, self._low_m, output_dtype=x.dtype
+            )
+        elif self._low_m.serves(x_flat):
+            out = torch.ops.trtllm.fp8_block_scale_low_m_gemm(
+                x_flat, self.weight, self._low_m_weight_scale
             )
         else:
             act_fp8, act_scale = torch.ops.trtllm.fp8_quantize_1x128_cutedsl_ue8m0(x_flat)
