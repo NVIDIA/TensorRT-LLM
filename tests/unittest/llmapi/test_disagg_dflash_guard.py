@@ -72,7 +72,13 @@ class TestTorchLlmArgsValidation:
 
     @pytest.mark.parametrize(
         "attention_backend,shared_draft_kv,warns",
-        [("VANILLA", None, True), ("TRTLLM", None, True), ("TRTLLM", "1", False)],
+        [
+            ("VANILLA", None, True),
+            ("TRTLLM", None, True),
+            ("TRTLLM", "1", False),
+            ("AUTO", None, True),
+            ("AUTO", "1", False),
+        ],
     )
     def test_disagg_dflash_warns_unless_the_draft_kv_is_shared(
         self, monkeypatch, attention_backend, shared_draft_kv, warns

@@ -14,6 +14,7 @@
 # limitations under the License.
 """Selection of the unified target+DFlash KV cache layout."""
 
+import json
 from types import SimpleNamespace
 
 import click
@@ -330,3 +331,27 @@ def test_disagg_separate_windowed_draft_pool_is_refused(monkeypatch, shared, win
             creator._check_shared_draft_kv_request()
     else:
         creator._check_shared_draft_kv_request()
+
+
+@pytest.mark.parametrize("is_disagg", [False, True])
+def test_rank_pins_auto_to_unify_like_trtllm(tmp_path, monkeypatch, is_disagg):
+    """An AUTO the frontend could not probe is pinned on the rank, so it unifies like TRTLLM."""
+    from tensorrt_llm._torch.pyexecutor.py_executor_creator import (
+        _pin_dflash_auto_attention_backend,
+    )
+    from tensorrt_llm._torch.speculative import dflash
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(dflash, "dflash_trtllm_gen_unavailability_reason", lambda: None)
+    windowed = {"layer_types": ["sliding_attention"] * 2, "sliding_window": 16}
+    (tmp_path / "config.json").write_text(json.dumps(windowed))
+    layout = _model_config(kv_heads=8, head_dim=128)
+    creator = _creator(is_disagg=is_disagg, target=layout, draft=layout, draft_windows=[16])
+    creator._speculative_config = DFlashDecodingConfig(
+        max_draft_len=7, speculative_model=str(tmp_path)
+    )
+    _pin_dflash_auto_attention_backend(creator._speculative_config)
+    assert creator._speculative_config.attention_backend == "TRTLLM"
+    assert creator._unified_drafter_attention_backend() == "TRTLLM"
+    creator._check_shared_draft_kv_request()  # TRTLLM_DISAGG_SHARED_DRAFT_KV=1 (autouse)
+    assert creator._should_unify_dflash_kv_cache()
