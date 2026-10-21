@@ -109,6 +109,7 @@ class _BlockSparsePlanKey:
             return str(error)
         return None
 
+    @torch.compiler.disable
     def plan(self) -> "BlockSparseTSWrapper | BlockSparsePagedTSWrapper":
         paged = self.page_size is not None
         wrapper_type = _BlockSparsePagedTSWrapper if paged else _BlockSparseTSWrapper
