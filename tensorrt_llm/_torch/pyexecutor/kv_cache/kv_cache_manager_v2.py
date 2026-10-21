@@ -132,6 +132,7 @@ from ..resource_manager import (
     request_context,
 )
 from ..scheduler import ScheduledRequests
+from . import host_tier_memory
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
@@ -1686,6 +1687,12 @@ class KVCacheManagerV2(BaseResourceManager):
                 is_draft=self.is_draft,
             )
 
+        mappings_before_host_tier = (
+            host_tier_memory.anonymous_mappings()
+            if has_host_cache_tier and host_tier_memory.collapse_enabled()
+            else None
+        )
+
         candidate: Optional[KVCacheManagerPy] = None
         event_sink = (
             self.event_manager.event_sink
@@ -1770,6 +1777,10 @@ class KVCacheManagerV2(BaseResourceManager):
         assert candidate is not None
         self.kv_cache_manager_py_config = config
         self.impl = candidate
+        if mappings_before_host_tier is not None and any(
+            isinstance(tier, HostCacheTierConfig) for tier in config.cache_tiers
+        ):
+            host_tier_memory.collapse_new_mappings(mappings_before_host_tier)
         self.can_evict = len(config.cache_tiers) > 1
         if self.event_manager is not None:
             self.event_manager.set_layer_group_window_sizes(
