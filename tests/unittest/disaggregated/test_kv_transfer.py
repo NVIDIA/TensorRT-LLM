@@ -65,6 +65,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheM
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestType
 from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor, get_size_in_bytes
 from tensorrt_llm.bindings import DataType
+from tensorrt_llm.disaggregated_params import DisaggScheduleStyle
 from tensorrt_llm.llmapi.llm_args import BlockReuseConfig, KvPoolRebalanceConfig
 from tensorrt_llm.logger import logger
 
@@ -1811,6 +1812,102 @@ def test_session_has_transferring_tasks_false():
     finally:
         ctx_transfer_worker.shutdown()
         gen_transfer_worker.shutdown()
+
+
+def _wait_until(predicate, timeout_s: float = 20.0) -> bool:
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.01)
+    return predicate()
+
+
+@pytest.mark.timeout(120)
+@pytest.mark.parametrize(
+    "schedule_style",
+    [DisaggScheduleStyle.CONTEXT_FIRST, DisaggScheduleStyle.GENERATION_FIRST],
+    ids=["ctx_first", "gen_first"],
+)
+def test_receive_without_context_session_fails_after_sweep(schedule_style):
+    """A receive that no context TxSession will ever serve must end, not hang.
+
+    A context-first generation request whose context KV cache is gone (its
+    TxSession failed and was closed, or the request names a disagg_request_id the
+    context rank never had) leaves its REQUEST_DATA unclaimed on the sender. Once
+    that entry outlives the sweep TTL the sender reports FAILED, so the RxSession
+    fails instead of holding its KV cache and transfer budget forever.
+    Generation-first entries may legitimately stay unclaimed (ADP broadcast) and
+    are only evicted.
+    """
+    setup = create_transfer_worker_setup(
+        ctx_tp=1, ctx_pp=1, ctx_enable_dp=False, gen_tp=1, gen_pp=1, gen_enable_dp=False
+    )
+    ctx_transfer_worker = setup["ctx_transfer_workers"][0]
+    gen_transfer_worker = setup["gen_transfer_workers"][0]
+    sender = ctx_transfer_worker._sender
+    sampling_config = tensorrt_llm.bindings.SamplingConfig(
+        SamplingParams(temperature=0)._get_sampling_config()
+    )
+
+    unique_rid = uuid.uuid4().int & 0x7FFFFFFFFFFFFFFF
+    gen_request = LlmRequest(
+        request_id=600,
+        max_new_tokens=1,
+        input_tokens=list(range(16)),
+        sampling_config=sampling_config,
+        is_streaming=False,
+        llm_request_type=LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY,
+    )
+    gen_request.py_disaggregated_params = DisaggregatedParams(
+        ctx_request_id=599,
+        ctx_dp_rank=0,
+        ctx_info_endpoint=setup["ctx_info_endpoint"],
+        disagg_request_id=unique_rid,
+        schedule_style=schedule_style,
+    )
+    page_table = gen_transfer_worker._rank_info.page_table
+    block_ids_per_groups = [np.array([], dtype=np.int64) for _ in page_table.layer_groups]
+    empty_chunk = Chunk(
+        block_ids_per_layer_groups=block_ids_per_groups,
+        kind_per_layer_group=[CacheKind.PAGED] * len(block_ids_per_groups),
+        token_range=TokenRange(start=0, end=gen_request.prompt_len),
+        is_last=True,
+    )
+
+    try:
+        rx_session = gen_transfer_worker.create_rx_session(gen_request)
+        rx_session.receive(empty_chunk)
+        assert _wait_until(lambda: sender._get_req_info(unique_rid) is not None)
+        assert rx_session.wait_complete(blocking=False) is None
+
+        # Inside the TTL the sender keeps waiting for a TxSession.
+        ctx_transfer_worker.sweep_stale_req_infos()
+        time.sleep(0.2)
+        assert sender._get_req_info(unique_rid) is not None
+        assert rx_session.wait_complete(blocking=False) is None
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(type(sender), "_STALE_REQ_INFO_TTL_S", 0.0)
+            ctx_transfer_worker.sweep_stale_req_infos()
+        assert sender._get_req_info(unique_rid) is None
+        if schedule_style == DisaggScheduleStyle.CONTEXT_FIRST:
+            assert _wait_until(
+                lambda: rx_session.wait_complete(blocking=False) == WaitResult.FAILED
+            )
+            assert rx_session.has_failed()
+        else:
+            time.sleep(0.2)
+            assert rx_session.wait_complete(blocking=False) is None
+        rx_session.close()
+
+        # The same workers keep serving ordinary transfers.
+        add_and_verify_request(setup, 0, 1, setup["request_len"], send_first=True)
+    finally:
+        for worker in setup["ctx_transfer_workers"]:
+            worker.shutdown()
+        for worker in setup["gen_transfer_workers"]:
+            worker.shutdown()
 
 
 @pytest.mark.timeout(120)
