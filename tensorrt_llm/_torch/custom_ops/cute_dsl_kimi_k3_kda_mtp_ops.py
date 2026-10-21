@@ -55,7 +55,9 @@ Kernel selection (``_select_verify_kernel``): calls on the runtime verify
 contract (packed token rows, fused gated RMSNorm with a bf16 output, 3xTF32
 recurrence, vector-aligned operands) run ``kda_decode_mtp_v2_kernel``
 (``kda_mtp_decode_v2.py``: the same arithmetic in the same order, bitwise
-identical results, shorter critical path); every other variant runs
+identical results, shorter critical path), or with more ``(head, request)``
+tiles than SMs ``kda_decode_mtp_2cta_kernel`` (``kda_mtp_decode_2cta.py``: the
+same arithmetic sized for two CTAs per SM); every other variant runs
 ``kda_decode_mtp_kernel``.
 """
 
@@ -85,12 +87,17 @@ if IS_CUTLASS_DSL_AVAILABLE:
         TILE_K,
         kda_decode_mtp_kernel,
     )
+    from ..attention.kernels.blackwell.kimi_k3_kda.kda_mtp_decode_2cta import (
+        kda_decode_mtp_2cta_kernel,
+    )
     from ..attention.kernels.blackwell.kimi_k3_kda.kda_mtp_decode_v2 import kda_decode_mtp_v2_kernel
 else:
     raise ImportError("Kimi K3 KDA MTP decode requires NVIDIA CUTLASS DSL")
 
 # One V pass: the kernel runs 16 warps x 8 rows over the full 128-row state.
 _TILE_V = 128
+# CTAs per SM kda_decode_mtp_2cta_kernel is compiled for (64 registers per thread).
+_TWO_CTA_BLOCKS_PER_SM = 2
 
 
 if IS_CUTLASS_DSL_AVAILABLE:
@@ -228,14 +235,16 @@ if IS_CUTLASS_DSL_AVAILABLE:
         )
         return _StateTmaAtoms(tma_atom_l, mS_tma, box_layout, tma_atom_t, mT_tma, box_layout_t)
 
-    def _launch_verify(launched, HV: int, N, split_v: int, stream) -> None:
+    def _launch_verify(launched, HV: int, N, split_v: int, stream, **launch_kwargs) -> None:
         if split_v == 2:
             # cluster pair: the two CTAs of a (head, request) must be co-scheduled (in-place state)
             launched.launch(
                 grid=(HV, N, 2), block=[NUM_THREADS, 1, 1], cluster=(1, 1, 2), stream=stream
             )
         else:
-            launched.launch(grid=(HV, N, 1), block=[NUM_THREADS, 1, 1], stream=stream)
+            launched.launch(
+                grid=(HV, N, 1), block=[NUM_THREADS, 1, 1], stream=stream, **launch_kwargs
+            )
 
     @cute.jit
     def _run_kda_decode_mtp(
@@ -478,6 +487,101 @@ if IS_CUTLASS_DSL_AVAILABLE:
             SPLIT_V,
         )
         _launch_verify(launched, HV, N, SPLIT_V, stream)
+
+    @cute.jit
+    def _run_kda_decode_mtp_2cta(
+        h0: cute.Tensor,
+        x_q: cute.Tensor,
+        x_k: cute.Tensor,
+        x_v: cute.Tensor,
+        w_q: cute.Tensor,
+        w_k: cute.Tensor,
+        w_v: cute.Tensor,
+        cs_q: cute.Tensor,
+        cs_k: cute.Tensor,
+        cs_v: cute.Tensor,
+        A_log: cute.Tensor,
+        g: cute.Tensor,
+        dt_bias: cute.Tensor,
+        beta: cute.Tensor,
+        onorm_g: cute.Tensor,
+        onorm_weight: cute.Tensor,
+        o: cute.Tensor,
+        k_cache: cute.Tensor,
+        g_cache: cute.Tensor,
+        v_cache: cute.Tensor,
+        beta_cache: cute.Tensor,
+        ssm_state_indices: cute.Tensor,
+        num_accepted_tokens: cute.Tensor,
+        N: cutlass.Int32,
+        scale: cutlass.Constexpr[float],
+        HV: cutlass.Constexpr[int],
+        K: cutlass.Constexpr[int],
+        V: cutlass.Constexpr[int],
+        NUM_SPEC: cutlass.Constexpr[int],
+        KERNEL_WIDTH: cutlass.Constexpr[int],
+        lower_bound: cutlass.Constexpr[float],
+        onorm_eps: cutlass.Constexpr[float],
+        USE_FLAT_LAYOUT: cutlass.Constexpr[bool],
+        stream: cuda.CUstream,
+    ):
+        """Host side of ``kda_decode_mtp_2cta_kernel`` (fp32 or bf16 state), launched for two
+        CTAs per SM (64 registers per thread)."""
+        mma = _verify_mma_atoms(cutlass.Float32, V, K, 3 * T_PAD)
+        state_tma = _state_tma_atoms(h0, h0, V, K, 1)
+        launched = kda_decode_mtp_2cta_kernel(
+            h0,
+            x_q,
+            x_k,
+            x_v,
+            w_q,
+            w_k,
+            w_v,
+            cs_q,
+            cs_k,
+            cs_v,
+            A_log,
+            g,
+            dt_bias,
+            beta,
+            onorm_g,
+            onorm_weight,
+            o,
+            k_cache,
+            g_cache,
+            v_cache,
+            beta_cache,
+            ssm_state_indices,
+            num_accepted_tokens,
+            mma.tiled_mma1,
+            mma.tiled_mma3,
+            mma.tiled_mma1k,
+            mma.smem_layout_b1,
+            mma.smem_layout_a2,
+            mma.smem_layout_a3,
+            mma.smem_layout_b3,
+            mma.smem_layout_b1k,
+            mma.tiled_mma4,
+            mma.tiled_mma2h,
+            mma.smem_layout_b2h,
+            mma.tiled_mma2q,
+            mma.smem_layout_b2q,
+            state_tma.tma_atom_l,
+            state_tma.mS_tma,
+            state_tma.box_layout,
+            state_tma.tma_atom_t,
+            state_tma.mT_tma,
+            scale,
+            HV,
+            K,
+            V,
+            NUM_SPEC,
+            KERNEL_WIDTH,
+            lower_bound,
+            onorm_eps,
+            USE_FLAT_LAYOUT,
+        )
+        _launch_verify(launched, HV, N, 1, stream, min_blocks_per_mp=_TWO_CTA_BLOCKS_PER_SM)
 
 
 def _require_stride_layout(
@@ -727,6 +831,27 @@ def _v2_operands_ok(*, w_q, w_k, w_v, rows, conv_caches) -> bool:
     )
 
 
+def _two_cta_operands_ok(*, state, rows, conv_caches, g_cache) -> bool:
+    """Operand dtypes of ``kda_decode_mtp_2cta_kernel``: fp32 or bf16 state, bf16 new-token
+    projections and conv caches (staged as bf16), fp32 replay gates."""
+    return (
+        state.dtype in (torch.float32, torch.bfloat16)
+        and all(t.dtype == torch.bfloat16 for t in (*rows, *conv_caches))
+        and g_cache.dtype == torch.float32
+    )
+
+
+_num_sms_cache = {}
+
+
+def _num_sms(device: torch.device) -> int:
+    dev = torch.device(device)
+    index = dev.index if dev.index is not None else torch.cuda.current_device()
+    if index not in _num_sms_cache:
+        _num_sms_cache[index] = torch.cuda.get_device_properties(index).multi_processor_count
+    return _num_sms_cache[index]
+
+
 def _select_verify_kernel(
     *,
     packed_token_layout: bool,
@@ -735,16 +860,22 @@ def _select_verify_kernel(
     bf16_math: bool,
     replay_only: bool,
     num_spec: int,
+    num_tiles: int,
+    num_sms: int,
     v2_operands_ok: Callable[[], bool],
-) -> Literal["v1", "v2"]:
+    two_cta_operands_ok: Callable[[], bool],
+) -> Literal["v1", "v2", "two_cta"]:
     """The verify kernel a call runs (see the module docstring).
 
-    ``v2`` (``kda_decode_mtp_v2_kernel``) serves the runtime verify contract: packed token rows,
-    the fused gated RMSNorm with a bf16 output, the 3xTF32 recurrence and vector-aligned operands
-    (``v2_operands_ok``, evaluated last). ``v1`` (``kda_decode_mtp_kernel``) serves everything
-    else; both compute bitwise the same results where both apply.
+    The runtime verify contract is packed token rows, the fused gated RMSNorm with a bf16
+    output, the 3xTF32 recurrence and vector-aligned operands (``v2_operands_ok``). On it,
+    ``two_cta`` (``kda_decode_mtp_2cta_kernel``, two CTAs per SM) serves grids of more
+    ``(head, request)`` tiles than SMs with the operand dtypes it stages
+    (``two_cta_operands_ok``), and ``v2`` (``kda_decode_mtp_v2_kernel``) serves the rest. ``v1``
+    (``kda_decode_mtp_kernel``) serves every other variant. All compute bitwise the same results
+    where they apply. The operand checks are evaluated last.
     """
-    if (
+    if not (
         packed_token_layout
         and fuse_output_norm
         and not quantize_output
@@ -753,8 +884,10 @@ def _select_verify_kernel(
         and num_spec <= MAX_NUM_SPEC
         and v2_operands_ok()
     ):
-        return "v2"
-    return "v1"
+        return "v1"
+    if num_tiles > num_sms and two_cta_operands_ok():
+        return "two_cta"
+    return "v2"
 
 
 # (device_index, enabled) -> persistent int32 [1] control tensor. Keys are
@@ -1050,6 +1183,8 @@ def kda_mtp_decode_impl(
         bf16_math=bf16_math,
         replay_only=replay_only,
         num_spec=num_spec,
+        num_tiles=HV * N,
+        num_sms=_num_sms(x_q.device),
         v2_operands_ok=lambda: _v2_operands_ok(
             w_q=w_q,
             w_k=w_k,
@@ -1057,9 +1192,16 @@ def kda_mtp_decode_impl(
             rows=(x_q_arg, x_k_arg, x_v_arg, g, onorm_g, k_cache, g_cache, v_cache),
             conv_caches=(cs_q, cs_k, cs_v),
         ),
+        two_cta_operands_ok=lambda: _two_cta_operands_ok(
+            state=h0_arg,
+            rows=(x_q, x_k, x_v),
+            conv_caches=(cs_q, cs_k, cs_v),
+            g_cache=g_cache,
+        ),
     )
-    if kernel == "v2":
-        v2_args = (
+    if kernel != "v1":
+        # Shared operands of kda_decode_mtp_v2_kernel and kda_decode_mtp_2cta_kernel.
+        args = [
             (h0_arg, 16),
             (x_q_arg, 16),
             (x_k_arg, 16),
@@ -1083,42 +1225,40 @@ def kda_mtp_decode_impl(
             (beta_cache, beta_cache_assumed_align),
             (ssm_state_indices, 4),
             (num_accepted_tokens, 4),
+        ]
+        if kernel == "two_cta":
+            runner = _run_kda_decode_mtp_2cta
+            variant = {}
+        else:
+            runner = _run_kda_decode_mtp_v2
+            variant = {"SPLIT_V": split_v}
+        constexprs = dict(
+            scale=scale,
+            HV=HV,
+            K=K,
+            V=V_dim,
+            NUM_SPEC=num_spec,
+            KERNEL_WIDTH=W,
+            lower_bound=float(lower_bound),
+            onorm_eps=float(onorm_eps),
+            USE_FLAT_LAYOUT=use_flat_layout,
+            **variant,
         )
-        v2_key = (
-            "v2",
-            tuple(_layout_key(t, dynamic_layout=True, assumed_align=a) for t, a in v2_args),
-            scale,
-            HV,
-            K,
-            V_dim,
-            num_spec,
-            W,
-            float(lower_bound),
-            float(onorm_eps),
-            use_flat_layout,
-            split_v,
+        key = (
+            kernel,
+            tuple(_layout_key(t, dynamic_layout=True, assumed_align=a) for t, a in args),
+            tuple(sorted(constexprs.items())),
         )
-        if v2_key not in _compiled_cache:
-            logger.info(
-                f"kda_mtp_decode: compiling v2 variant H={HV} num_spec={num_spec} split_v={split_v}"
-            )
-            _compiled_cache[v2_key] = cute.compile(
-                _run_kda_decode_mtp_v2,
-                *[_dlpack_arg(t, assumed_align=a) for t, a in v2_args],
+        if key not in _compiled_cache:
+            logger.info(f"kda_mtp_decode: compiling {kernel} variant {constexprs}")
+            _compiled_cache[key] = cute.compile(
+                runner,
+                *[_dlpack_arg(t, assumed_align=a) for t, a in args],
                 N,
-                scale=scale,
-                HV=HV,
-                K=K,
-                V=V_dim,
-                NUM_SPEC=num_spec,
-                KERNEL_WIDTH=W,
-                lower_bound=float(lower_bound),
-                onorm_eps=float(onorm_eps),
-                USE_FLAT_LAYOUT=use_flat_layout,
-                SPLIT_V=split_v,
+                **constexprs,
                 stream=stream,
             )
-        _compiled_cache[v2_key](*[_dlpack_arg(t, assumed_align=a) for t, a in v2_args], N, stream)
+        _compiled_cache[key](*[_dlpack_arg(t, assumed_align=a) for t, a in args], N, stream)
         return out
 
     key = (
