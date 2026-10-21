@@ -20,7 +20,6 @@ from tensorrt_llm._torch.models.modeling_multimodal_mixin import (
 from tensorrt_llm._torch.pyexecutor.executor_request_queue import RequestQueueItem
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import (
-    MultimodalEncoderProgress,
     MultimodalEncoderRequestError,
     MultimodalEncoderRequestState,
     get_mm_items_for_chunk,
@@ -44,6 +43,7 @@ from tensorrt_llm._torch.pyexecutor.scheduler.waiting_queue import FCFSWaitingQu
 from tensorrt_llm._torch.tensor_lru_cache import TensorLRUCache
 from tensorrt_llm.inputs.multimodal import (
     MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
+    MultimodalEncoderProgress,
     MultimodalItemMetadata,
     MultimodalParams,
     strip_mm_encoder_inputs,
@@ -728,7 +728,7 @@ def test_admission_checks_only_outputs_resident_at_once(context_chunk_unit_size,
 
     if admitted:
         initialize_multimodal_encoder_request(request, **budget)
-        assert request.py_mm_encoder_state.embedding_lengths == [1, 1]
+        assert request.py_mm_encoder_state.embedding_lengths == (1, 1)
     else:
         with pytest.raises(ValueError, match="raise encoder_max_num_tokens") as error:
             initialize_multimodal_encoder_request(request, **budget)
