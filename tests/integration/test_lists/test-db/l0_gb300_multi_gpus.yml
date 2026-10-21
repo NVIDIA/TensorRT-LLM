@@ -55,6 +55,9 @@ l0_gb300_multi_gpus:
   - unittest/_torch/modules/test_group_rmn_norm.py
   - unittest/_torch/modules/mamba
   - unittest/_torch/modules/tests_lora_modules
+  # DWDP expert prefetch on real streams and copies, incl. the gather from
+  # peer GPUs.
+  - unittest/_torch/modules/dwdp/test_dwdp_prefetch_gpu.py
   # ------------- MoE components tests ---------------
   - unittest/_torch/moe/test_moe_load_balancer.py
   - unittest/_torch/moe/test_moe_routing.py

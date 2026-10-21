@@ -357,13 +357,11 @@ class TestDwdpManagerLifecycle(unittest.TestCase):
     # Runtime forwards require setup()
     # ------------------------------------------------------------------
 
-    def test_prefetch_first_layers_forwards(self, mock_comm_world, _rank, mock_setup):
+    def _set_up_manager(self, mock_comm_world, mock_setup):
         mock_comm_world.Create_group.return_value = MagicMock()
         mock_comm_world.group.Incl.return_value = MagicMock()
         mock_comm_world.Get_size.return_value = 1024
         fake_wm = MagicMock()
-        fake_wm.first_moe_layer.return_value = 3
-        fake_wm.next_moe_layer.return_value = 5
         mock_setup.return_value = fake_wm
         mgr = DwdpManager(
             config=_make_config(),
@@ -375,105 +373,33 @@ class TestDwdpManagerLifecycle(unittest.TestCase):
             return_value=0,
         ):
             mgr.setup(MagicMock())
-        mgr.prefetch_first_layers()
-        # First MoE layer 3 + ping-pong depth -> also prefetch next (5)
-        self.assertEqual(
-            fake_wm.prefetch_layer.call_args_list,
-            [
-                unittest.mock.call(3),
-                unittest.mock.call(5),
-            ],
-        )
+        return mgr, fake_wm
 
-    def test_record_compute_and_prefetch_next_schedules_next_next(
-        self, mock_comm_world, _rank, mock_setup
-    ):
-        mock_comm_world.Create_group.return_value = MagicMock()
-        mock_comm_world.group.Incl.return_value = MagicMock()
-        mock_comm_world.Get_size.return_value = 1024
-        fake_wm = MagicMock()
-        fake_wm.next_moe_layer.side_effect = lambda layer_idx: {7: 9, 9: 11}.get(layer_idx)
-        mock_setup.return_value = fake_wm
+    def test_start_forward_forwards(self, mock_comm_world, _rank, mock_setup):
+        mgr, fake_wm = self._set_up_manager(mock_comm_world, mock_setup)
+        mgr.start_forward()
+        fake_wm.start_forward.assert_called_once_with()
+
+    def test_finish_layer_forwards(self, mock_comm_world, _rank, mock_setup):
+        mgr, fake_wm = self._set_up_manager(mock_comm_world, mock_setup)
+        mgr.finish_layer(7)
+        fake_wm.finish_layer.assert_called_once_with(7)
+
+    def test_invalidate_prefetch_forwards(self, mock_comm_world, _rank, mock_setup):
+        mgr, fake_wm = self._set_up_manager(mock_comm_world, mock_setup)
+        mgr.invalidate_prefetch()
+        fake_wm.invalidate_prefetch.assert_called_once_with()
+
+    def test_invalidate_prefetch_before_setup_is_noop(self, mock_comm_world, _rank, _setup):
+        _configure_mock_comm_world(mock_comm_world)
         mgr = DwdpManager(
             config=_make_config(),
             dist=MagicMock(spec=MPIDist),
             mapping=_make_mapping(),
         )
-        with patch(
-            "tensorrt_llm._torch.pyexecutor.dwdp.torch.cuda.current_device",
-            return_value=0,
-        ):
-            mgr.setup(MagicMock())
-
-        mgr.record_compute_and_prefetch_next(7)
-        fake_wm.record_compute.assert_called_once_with(7)
-        self.assertEqual(
-            fake_wm.next_moe_layer.call_args_list,
-            [unittest.mock.call(7), unittest.mock.call(9)],
-        )
-        fake_wm.prefetch_layer.assert_called_once_with(11)
-
-    def test_record_compute_and_prefetch_next_last_layer_is_noop(
-        self, mock_comm_world, _rank, mock_setup
-    ):
-        mock_comm_world.Create_group.return_value = MagicMock()
-        mock_comm_world.group.Incl.return_value = MagicMock()
-        mock_comm_world.Get_size.return_value = 1024
-        fake_wm = MagicMock()
-        fake_wm.next_moe_layer.return_value = None
-        mock_setup.return_value = fake_wm
-        mgr = DwdpManager(
-            config=_make_config(),
-            dist=MagicMock(spec=MPIDist),
-            mapping=_make_mapping(),
-        )
-        with patch(
-            "tensorrt_llm._torch.pyexecutor.dwdp.torch.cuda.current_device",
-            return_value=0,
-        ):
-            mgr.setup(MagicMock())
-
-        mgr.record_compute_and_prefetch_next(60)
-        fake_wm.record_compute.assert_called_once_with(60)
-        fake_wm.prefetch_layer.assert_not_called()
-
-    def test_prefetch_pipeline_schedules_each_layer_once(self, mock_comm_world, _rank, mock_setup):
-        mock_comm_world.Create_group.return_value = MagicMock()
-        mock_comm_world.group.Incl.return_value = MagicMock()
-        mock_comm_world.Get_size.return_value = 1024
-        fake_wm = MagicMock()
-        fake_wm.first_moe_layer.return_value = 3
-        fake_wm.next_moe_layer.side_effect = lambda layer_idx: {
-            3: 5,
-            5: 7,
-            7: 9,
-            9: None,
-        }.get(layer_idx)
-        mock_setup.return_value = fake_wm
-        mgr = DwdpManager(
-            config=_make_config(),
-            dist=MagicMock(spec=MPIDist),
-            mapping=_make_mapping(),
-        )
-        with patch(
-            "tensorrt_llm._torch.pyexecutor.dwdp.torch.cuda.current_device",
-            return_value=0,
-        ):
-            mgr.setup(MagicMock())
-
-        mgr.prefetch_first_layers()
-        for layer_idx in (3, 5, 7, 9):
-            mgr.record_compute_and_prefetch_next(layer_idx)
-
-        self.assertEqual(
-            fake_wm.prefetch_layer.call_args_list,
-            [
-                unittest.mock.call(3),
-                unittest.mock.call(5),
-                unittest.mock.call(7),
-                unittest.mock.call(9),
-            ],
-        )
+        mgr.invalidate_prefetch()
+        with self.assertRaises(RuntimeError):
+            mgr.start_forward()
 
     def test_wait_and_bind_forwards(self, mock_comm_world, _rank, mock_setup):
         mock_comm_world.Create_group.return_value = MagicMock()
