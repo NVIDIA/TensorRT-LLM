@@ -18,7 +18,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2.kernels import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2.ops import (  # noqa: E501
     m3_draft_step as draft_step_kernels,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2.ops.gemm.m3_target_head import (  # noqa: E501
@@ -687,7 +687,7 @@ def test_guard_refuses_too_few_ctas() -> None:
             op(*args)
 
 
-# ------------------------------------------------- one pass as two launches (uGPU, kernels/m3_draft_step.UGPU)
+# ------------------------------------------------- one pass as two launches (uGPU, ops/m3_draft_step.UGPU)
 
 
 @pytest.mark.parametrize(
@@ -699,7 +699,7 @@ def test_two_launches_per_domain_are_the_one_launch_pass(cell) -> None:
     """A pass split into two launches (tiles [0, split) and [split, n), one per locality domain stream, the exchange
     and bookkeeping by the last of both launches' CTAs) writes exactly what the one-launch pass writes: tokens,
     winning keys, draft columns, next positions, KV and sequence lengths, and re-arms the counters and keys."""
-    from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2.kernels.m3_locality import (  # noqa: E501
+    from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2.ops.m3_locality import (  # noqa: E501
         LocalityMap,
     )
 
@@ -736,7 +736,7 @@ def test_two_launches_per_domain_are_the_one_launch_pass(cell) -> None:
     assert two[6].tolist() == [0, 1] and not bool(two[5].any()), "counters / keys not re-armed"
 
 
-# ----------------------------------------------- equal-chunk split (kernels/m3_draft_step.EQ_CHUNKS: bnd / bnd_cnt set)
+# ----------------------------------------------- equal-chunk split (ops/m3_draft_step.EQ_CHUNKS: bnd / bnd_cnt set)
 
 
 def _eq_buffers(n_tiles: int):
@@ -757,7 +757,7 @@ def test_equal_chunk_split_is_the_whole_tile_pass(cell, launches) -> None:
     bnd: the same tokens, winning global ids, draft columns, positions and lengths as whole tiles per CTA (the logits
     differ at most by the order of fp32 additions: their BF16 keys by at most one ulp), and bnd / bnd_cnt are left
     zero for the next call, over one launch and over the two per-domain launches."""
-    from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2.kernels.m3_locality import (  # noqa: E501
+    from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2.ops.m3_locality import (  # noqa: E501
         LocalityMap,
     )
 

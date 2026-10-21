@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""SA-1R (kernels/m3_sampled_accept.ONE_ROUND_K) on trtllm::minimax_m3_sm107tp8_sampled_accept, world 1, the TP8 shard.
+"""SA-1R (ops/m3_sampled_accept.ONE_ROUND_K) on trtllm::minimax_m3_sm107tp8_sampled_accept, world 1, the TP8 shard.
 
 The one-round variants (one_round_k 9: exact top-9 list; 82: pooled top-8 + bound) must return the two-round
 kernel's (one_round_k 0) sampled tokens, accepted tokens, accepted counts, gather ids and extra-attempt count BIT FOR

@@ -298,8 +298,8 @@ def _run_one_rank() -> int:
     RANK, WORLD = rank, world
     assert WORLD == 2, f"the push is certified at 2 ranks, got {WORLD}"
 
-    import tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2.kernels.m3_mc_allreduce as _ar  # noqa: E501
-    import tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2.kernels.m3_prequant as _pq  # noqa: E501
+    import tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2.ops.m3_mc_allreduce as _ar  # noqa: E501
+    import tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2.ops.m3_prequant as _pq  # noqa: E501
     from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2.ops.comm.m3_mc_allreduce_norm import (  # noqa: E501
         sf_written as _sf_written,
     )

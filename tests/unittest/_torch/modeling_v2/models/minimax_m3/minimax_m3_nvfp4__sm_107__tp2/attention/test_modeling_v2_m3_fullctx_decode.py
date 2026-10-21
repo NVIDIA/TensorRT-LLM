@@ -112,7 +112,7 @@ def test_the_cells_cover_the_target_rows() -> None:
 def test_the_bf16_merge_is_the_primts_reducer_to_one_ulp(cell) -> None:
     """The BF16 split-KV merge op against PrimTS's own FP16 reducer and the cast: the same partials, merged once
     in fp32 and rounded once, so within one BF16 spacing of the FP16-then-BF16 result."""
-    from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2.kernels import (  # noqa: E501
+    from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2.ops import (  # noqa: E501
         m3_fullctx_decode as kernel,
     )
 
@@ -152,7 +152,7 @@ def test_rows_with_no_key_in_a_trailing_split(qlen, nreq) -> None:
     """A row whose keys end before its Q CTA's causal union does has trailing splits holding none of its keys
     (log2-LSE -inf); both reducers must leave them out. [1300, 1281] at 4 query rows is the batch a GSM8K decode
     step first hit (NaN rows from exp2(-inf - -inf))."""
-    from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2.kernels import (  # noqa: E501
+    from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2.ops import (  # noqa: E501
         m3_fullctx_decode as kernel,
     )
     from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
@@ -186,7 +186,7 @@ def test_rows_with_no_key_in_a_trailing_split(qlen, nreq) -> None:
 def test_kv_lengths_past_the_policy_length(qlen, nreq) -> None:
     """The plans are compiled for MAX_KV_LEN of K/V with PrimTS's policy sized at 1 << 20 (POLICY_KV_LEN): caches just
     past the policy length (the AgentX bound is 1 << 20 plus the speculative rows) and well past it stay exact."""
-    from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2.kernels import (  # noqa: E501
+    from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2.ops import (  # noqa: E501
         m3_fullctx_decode as kernel,
     )
     from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl

@@ -4,14 +4,14 @@
 
 The drafter layer is a plain ``TrtllmAttention`` over its own FP8 paged cache (the full context, every draft pass).
 On SM 10.7 its generation phase runs ``thop.attention``'s in-tree trtllm-gen runner, whose split is capped at 8 CTAs
-per (request, KV head): 45-46 us per pass at 165k tokens on 212 SMs, for 85 MB.
+per (request, KV head): at TP4 (1 KV head per rank) 45.4 us per pass at 165k tokens on 212 SMs.
 
 This library keeps the in-tree preprocessing -- ``thop.trtllm_gen_generation_preprocess``: RoPE, the FP8 K/V append
 into the paged cache and the FP8 query, as ``FlashInferTrtllmGenFmha`` runs it -- and attends with the full-context
-PrimTS split-KV decode of ``kernels/m3_fullctx_decode`` at the same pinned recipes as the dense layers.
+PrimTS split-KV decode of ``ops/m3_fullctx_decode`` at the same pinned recipes as the dense layers.
 
 With ``fused_rope_mode`` set, the preprocess and the query cast run as one launch instead
-(``minimax_m3_sm107tp8_drafter_rope_fp8_kv``, the same bytes into the query and the cache), the layer's sub-page
+(``minimax_m3_sm107tp4_drafter_rope_fp8_kv``, the same bytes into the query and the cache), the layer's sub-page
 pool and block table taken from the KV cache pool pointers and mapping the preprocess reads.
 
 It serves generation-only steps of the covered (query rows per request, requests) shapes; the target installs it
@@ -44,8 +44,8 @@ from tensorrt_llm.quantization.mode import QuantMode
 
 from . import m3_fullctx_decode as fullctx
 
-# With PDL, the fused RoPE + FP8 K/V launch takes the maximum shared-memory carveout so the drafter decode's large-smem
-# CTAs co-reside with it (timing only).
+# With PDL, the fused RoPE launch takes the maximum shared-memory carveout so the drafter decode's large-smem CTAs
+# co-reside with it (timing only).
 ROPE_CARVEOUT = True
 
 
@@ -102,7 +102,7 @@ class M3DrafterFullCtxFmha(FlashInferTrtllmGenFmha):
             or attn.head_dim != fullctx.HEAD_DIM
             or not QuantMode(attn.quant_mode).has_fp8_kv_cache()
         ):
-            self._on_uncovered("not the TP8 FP8 drafter geometry")
+            self._on_uncovered("not the TP4 FP8 drafter geometry")
             return False
         # The arithmetic matches the stock decode only at unit KV scales (bmm1 and bmm2 carry none here); the layer's
         # own scales are checked to be 1.0 at install, so any other per-step scale falls through to the stock path.
@@ -204,7 +204,8 @@ class M3DrafterFullCtxFmha(FlashInferTrtllmGenFmha):
             dtype=torch.float8_e4m3fn,
             device=attention_input.device,
         )
-        torch.ops.trtllm.minimax_m3_sm107tp8_drafter_rope_fp8_kv(
+
+        torch.ops.trtllm.minimax_m3_sm107tp4_drafter_rope_fp8_kv(
             attention_input,
             attn.rotary_cos_sin,
             params.sequence_lengths,

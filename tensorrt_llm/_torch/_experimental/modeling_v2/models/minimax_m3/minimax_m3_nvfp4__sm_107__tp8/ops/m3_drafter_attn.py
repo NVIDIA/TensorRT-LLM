@@ -8,10 +8,10 @@ per (request, KV head): 45-46 us per pass at 165k tokens on 212 SMs, for 85 MB.
 
 This library keeps the in-tree preprocessing -- ``thop.trtllm_gen_generation_preprocess``: RoPE, the FP8 K/V append
 into the paged cache and the FP8 query, as ``FlashInferTrtllmGenFmha`` runs it -- and attends with the full-context
-PrimTS split-KV decode of ``kernels/m3_fullctx_decode`` at the same pinned recipes as the dense layers.
+PrimTS split-KV decode of ``ops/m3_fullctx_decode`` at the same pinned recipes as the dense layers.
 
 With ``fused_rope_mode`` set, the preprocess and the query cast run as one launch instead
-(``minimax_m3_sm107tp2_drafter_rope_fp8_kv``, the same bytes into the query and the cache), the layer's sub-page
+(``minimax_m3_sm107tp8_drafter_rope_fp8_kv``, the same bytes into the query and the cache), the layer's sub-page
 pool and block table taken from the KV cache pool pointers and mapping the preprocess reads.
 
 It serves generation-only steps of the covered (query rows per request, requests) shapes; the target installs it
@@ -44,11 +44,8 @@ from tensorrt_llm.quantization.mode import QuantMode
 
 from . import m3_fullctx_decode as fullctx
 
-# The fused RoPE + FP8 K/V launch also takes a one-request multi-token pass (the drafter's first pass at one
-# request), where the in-tree preprocess needs the token-map guard: bitwise the guarded preprocess + cast.
-ROPE_ONE_REQUEST_MULTI = True
-# With PDL, that launch takes the maximum shared-memory carveout so the drafter decode's large-smem CTAs co-reside with
-# it (timing only).
+# With PDL, the fused RoPE + FP8 K/V launch takes the maximum shared-memory carveout so the drafter decode's large-smem
+# CTAs co-reside with it (timing only).
 ROPE_CARVEOUT = True
 
 
@@ -83,7 +80,6 @@ class M3DrafterFullCtxFmha(FlashInferTrtllmGenFmha):
         self._fused_rope_mode = fused_rope_mode
         self._pdl = pdl
         self._on_rope_taken = on_rope_taken
-        self._one_request_multi = ROPE_ONE_REQUEST_MULTI
         self._on_taken = on_taken
         self._on_uncovered = on_uncovered
         self._on_missed = on_missed
@@ -106,7 +102,7 @@ class M3DrafterFullCtxFmha(FlashInferTrtllmGenFmha):
             or attn.head_dim != fullctx.HEAD_DIM
             or not QuantMode(attn.quant_mode).has_fp8_kv_cache()
         ):
-            self._on_uncovered("not the TP2 FP8 drafter geometry")
+            self._on_uncovered("not the TP8 FP8 drafter geometry")
             return False
         # The arithmetic matches the stock decode only at unit KV scales (bmm1 and bmm2 carry none here); the layer's
         # own scales are checked to be 1.0 at install, so any other per-step scale falls through to the stock path.
@@ -149,13 +145,8 @@ class M3DrafterFullCtxFmha(FlashInferTrtllmGenFmha):
             and rotary_dim % 16 == 0
             and int(params.num_tokens) == int(params.batch_size) * int(params.input_seq_length)
             # A one-request multi-token pass: the in-tree preprocess does not build its token map (buildDecoderInfo
-            # runs for several requests only) and reads the workspace's; with ROPE_ONE_REQUEST_MULTI
-            # the fused launch (which places rows by request = token / q_len, no map) takes it too, else it keeps
-            # the in-tree path (and its token-map guard).
-            and (
-                self._one_request_multi
-                or not (self._multi_token(params) and int(params.batch_size) == 1)
-            )
+            # runs for several requests only) and reads the workspace's, so it keeps that path.
+            and not (self._multi_token(params) and int(params.batch_size) == 1)
         )
 
     @staticmethod
@@ -213,7 +204,7 @@ class M3DrafterFullCtxFmha(FlashInferTrtllmGenFmha):
             dtype=torch.float8_e4m3fn,
             device=attention_input.device,
         )
-        torch.ops.trtllm.minimax_m3_sm107tp2_drafter_rope_fp8_kv(
+        torch.ops.trtllm.minimax_m3_sm107tp8_drafter_rope_fp8_kv(
             attention_input,
             attn.rotary_cos_sin,
             params.sequence_lengths,

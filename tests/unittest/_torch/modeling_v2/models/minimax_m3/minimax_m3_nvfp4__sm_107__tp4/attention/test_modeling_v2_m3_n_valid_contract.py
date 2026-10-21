@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """The per-token valid-block count is written only before the step's first layer.
 
-The long-row select (``kernels/m3_select_long_dsl.py``, ``N_VALID_PREWAIT``) reads its row's entry of
+The long-row select (``ops/m3_select_long_dsl.py``, ``N_VALID_PREWAIT``) reads its row's entry of
 ``MsaMetadata.msa_n_valid_blocks`` BEFORE its PDL grid-dependency wait. That is exact only while every write to the
 buffer happens before the step's first layer:
 
@@ -131,7 +131,7 @@ def test_only_the_pre_forward_paths_write_the_valid_block_count() -> None:
         for func, line in _write_sites(ast.parse(src)):
             assert (rel, func) in _ALLOWED, (
                 f"{rel}:{line} ({func}) writes msa_n_valid_blocks; the long-row select reads it before its PDL grid "
-                "wait (kernels/m3_select_long_dsl.py, N_VALID_PREWAIT), so a writer inside the "
+                "wait (ops/m3_select_long_dsl.py, N_VALID_PREWAIT), so a writer inside the "
                 "step must be ordered before the select's grid or the read moved after the wait"
             )
             found.add((rel, func))

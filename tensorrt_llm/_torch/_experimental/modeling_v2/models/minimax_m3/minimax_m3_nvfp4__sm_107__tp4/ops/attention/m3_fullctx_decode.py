@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""The dense layers' full-context decode attention at TP4 on Rubin (``kernels/m3_fullctx_decode``): PrimTS split-KV
+"""The dense layers' full-context decode attention at TP4 on Rubin (``ops/m3_fullctx_decode``): PrimTS split-KV
 decode at the recipe ``modeling.FULLCTX_DECODE_RECIPES`` pins per (query rows per request, requests)."""
 
 from __future__ import annotations
@@ -12,7 +12,7 @@ from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.paged_cach
     fp8_e4m3_saturate,
 )
 
-from ...kernels import m3_fullctx_decode as kernel
+from .. import m3_fullctx_decode as kernel
 from .m3_dense_decode import dense_attention_reference, gather_paged_kv
 
 __all__ = ["m3_fullctx_decode"]

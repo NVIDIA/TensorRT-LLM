@@ -99,7 +99,7 @@ class M3DraftLowM(OpWrapper):
         if kind == "d" and ar is not None:
             # The boundary push (modeling's DRAFT_AR_PUSH_DIRECT): this target's copy of the direct kernel, whose
             # output is FlashInfer's, also stores the rows into the boundary all-reduce's exchange.
-            from ...kernels.m3_lowm_direct import DirectTactic, run_direct_dense_push
+            from ..m3_lowm_direct import DirectTactic, run_direct_dense_push
 
             run_direct_dense_push(x, weight.t(), out, use_pdl, DirectTactic(*tactic), ar)
         elif kind == "d":
@@ -110,13 +110,9 @@ class M3DraftLowM(OpWrapper):
 
             run_direct_dense(x, weight.t(), out, use_pdl, DirectTactic(*tactic))
         elif own_splitk:
-            # This target's copy of the split-K kernel (kernels/m3_lowm_splitk): bit for bit FlashInfer's; with ``ar``
+            # This target's copy of the split-K kernel (ops/m3_lowm_splitk): bit for bit FlashInfer's; with ``ar``
             # it also pushes the rows into a drafter boundary all-reduce (modeling's DRAFT_AR_PUSH).
-            from ...kernels.m3_lowm_splitk import (
-                SplitKTactic,
-                run_splitk_dense,
-                run_splitk_dense_push,
-            )
+            from ..m3_lowm_splitk import SplitKTactic, run_splitk_dense, run_splitk_dense_push
 
             if ar is not None:
                 run_splitk_dense_push(x, weight.t(), out, use_pdl, SplitKTactic(*tactic), ar)

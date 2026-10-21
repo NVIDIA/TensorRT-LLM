@@ -10,7 +10,7 @@ import torch
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 
-from ...kernels.embedding_firstnorm.op import DecodeEmbedding, m3_embed_norm
+from ..embedding_firstnorm.op import DecodeEmbedding, m3_embed_norm
 
 __all__ = ["DecodeEmbedding", "m3_embedding_firstnorm"]
 

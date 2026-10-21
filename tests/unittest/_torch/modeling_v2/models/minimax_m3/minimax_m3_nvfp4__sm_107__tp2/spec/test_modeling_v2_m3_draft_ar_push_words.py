@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """GPU test of the drafter boundary push (modeling.DRAFT_AR_PUSH / DRAFT_AR_PUSH_DIRECT) on one rank: the push variants
-of the split-K copy (kernels/m3_lowm_splitk) and the direct copy (kernels/m3_lowm_direct) write FlashInfer's output
+of the split-K copy (ops/m3_lowm_splitk) and the direct copy (ops/m3_lowm_direct) write FlashInfer's output
 bit for bit, and store exactly the boundary all-reduce's canonical exchange words of that output: word (t, column pair)
 = bf16 lo | bf16 hi << 16 with -0.0 halves as +0.0, at parity * maxt * world * H / 2 + (t * world + rank) * H / 2 +
 column / 2, the parity being the (t, column / (H / 8)) flag's low bit; every other word stays untouched. Eager and in a
@@ -15,7 +15,7 @@ from flashinfer.gemm.kernels.dense_bf16_gemm_direct import run_direct_dense as f
 from flashinfer.gemm.kernels.dense_bf16_gemm_sm100_splitk import SplitKTactic as FiSplitK
 from flashinfer.gemm.kernels.dense_bf16_gemm_sm100_splitk import run_splitk_dense as fi_splitk
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2.kernels import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2.ops import (  # noqa: E501
     m3_lowm_direct,
     m3_lowm_splitk,
 )
@@ -28,7 +28,7 @@ assert torch.cuda.is_available(), "the push variants require a CUDA device"
 
 H, MAXT, EMPTY = 6144, 8, -2147483648
 # The boundary linears (output width H): o_proj and down, each certified row count on split-K or an even direct width,
-# up to the 8-token bucket the push arms on (kernels/m3_draft_lowm.arm_push); the batch-4/8 rows past it run unpushed.
+# up to the 8-token bucket the push arms on (ops/m3_draft_lowm.arm_push); the batch-4/8 rows past it run unpushed.
 CELLS = [
     (nk[1], m, *tactic_for(nk[0], nk[1], m))
     for nk, rows in sorted(ROWS.items())

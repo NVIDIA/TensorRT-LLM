@@ -135,7 +135,7 @@ class M3McAllreduceNorm(OpWrapper):
             spec=dict(m=48, maxt=48, opts=15, x2=True, quant=True, prepushed=0),
         ),
         # Every other row count of the decode boundaries (modeling.MC_ALLREDUCE): the bucket and epilogue options the
-        # target picks for it (kernels/m3_mc_allreduce), the second addend and the MXFP8 copy alternating.
+        # target picks for it (ops/m3_mc_allreduce), the second addend and the MXFP8 copy alternating.
         *(
             Cell(
                 why=f"{m} tokens: a boundary row count between the ones above",

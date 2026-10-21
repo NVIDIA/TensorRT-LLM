@@ -715,6 +715,39 @@ def test_minimax_m3_route_declines_another_rope_base_or_sparse_layout(monkeypatc
         )
 
 
+@pytest.mark.parametrize("mapping_kwargs", [_M3_TP2, _M3_TP4, _M3_TP8], ids=["tp2", "tp4", "tp8"])
+@pytest.mark.parametrize(
+    "layout",
+    [
+        _OTHER_LAYOUT,
+        dict(
+            _M3_LAYOUT,
+            sparse_attention_config=dict(
+                _M3_LAYOUT["sparse_attention_config"], use_sparse_attention=False
+            ),
+        ),
+    ],
+    ids=["other_revision", "sparse_disabled"],
+)
+def test_minimax_m3_rubin_route_declines_another_layout(monkeypatch, mapping_kwargs, layout):
+    """The sm107 targets build the same RoPE table and sparse layout as the sm103 ones, so they decline the same
+    checkpoints."""
+    from types import SimpleNamespace
+
+    from tensorrt_llm._torch._experimental.modeling_v2._router_index import NoTarget
+    from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3 import routing
+
+    monkeypatch.setattr(routing, "_quant_algo", lambda cfg: QuantAlgo.MIXED_PRECISION)
+    with pytest.raises(NoTarget, match="sparse attention layers other than 3-59|rope_theta"):
+        routing.route(
+            SimpleNamespace(text_config=_m3_text_config(**layout)),
+            Mapping(**mapping_kwargs),
+            routing._SM_RUBIN,
+            None,
+            QuantAlgo.NVFP4,
+        )
+
+
 def test_minimax_m3_layout_reads_rope_theta_from_rope_parameters():
     """A config that keeps the RoPE base under ``rope_parameters`` (newer transformers) reads the same."""
     from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3 import routing

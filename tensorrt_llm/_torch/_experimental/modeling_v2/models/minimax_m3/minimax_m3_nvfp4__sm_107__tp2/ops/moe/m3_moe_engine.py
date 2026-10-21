@@ -17,7 +17,7 @@ from tensorrt_llm.quantization.utils.fp4_utils import (
     get_shuffle_matrix_a_row_indices,
 )
 
-from ...kernels.m3_moe.op import (
+from ..m3_moe.op import (
     HIDDEN,
     INTER,
     SHARED_INTER,

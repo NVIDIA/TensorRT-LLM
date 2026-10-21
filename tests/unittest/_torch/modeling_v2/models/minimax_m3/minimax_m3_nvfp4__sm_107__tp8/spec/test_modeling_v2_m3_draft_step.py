@@ -18,7 +18,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp8.kernels import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp8.ops import (  # noqa: E501
     m3_draft_step as draft_step_kernels,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp8.ops.gemm.m3_target_head import (  # noqa: E501
@@ -216,7 +216,7 @@ def _args(
 
 
 def _fixed(args) -> bool:
-    """fixed_order for these op arguments as dispatch picks it (kernels/m3_draft_step._fixed_order): the warp-order
+    """fixed_order for these op arguments as dispatch picks it (ops/m3_draft_step._fixed_order): the warp-order
     sum where the launch grid lets a tile take more than 2 warp pieces (D-FIX; the TP8 shard on 212 SMs does)."""
     x, wf, num_ctas, exc_off = args[0], args[3], args[20], args[23]
     tiles = wf.shape[0] if exc_off is None else exc_off.numel() - 1
@@ -698,7 +698,7 @@ def test_guard_refuses_too_few_ctas() -> None:
             op(*args, fixed_order=_fixed(args))
 
 
-# ------------------------------------------------- one pass as two launches (uGPU, kernels/m3_draft_step.UGPU)
+# ------------------------------------------------- one pass as two launches (uGPU, ops/m3_draft_step.UGPU)
 
 
 @pytest.mark.parametrize(
@@ -710,7 +710,7 @@ def test_two_launches_per_domain_are_the_one_launch_pass(cell) -> None:
     """A pass split into two launches (tiles [0, split) and [split, n), one per locality domain stream, the exchange
     and bookkeeping by the last of both launches' CTAs) writes exactly what the one-launch pass writes: tokens,
     winning keys, draft columns, next positions, KV and sequence lengths, and re-arms the counters and keys."""
-    from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp8.kernels.m3_locality import (  # noqa: E501
+    from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp8.ops.m3_locality import (  # noqa: E501
         LocalityMap,
     )
 

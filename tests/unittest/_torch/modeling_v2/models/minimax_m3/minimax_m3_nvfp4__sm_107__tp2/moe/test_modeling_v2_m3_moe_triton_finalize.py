@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""kernels/m3_moe_finalize: the routed experts' finalize (+ the shared expert) from the TRTLLM-Gen runner's unfinalized
+"""ops/m3_moe_finalize: the routed experts' finalize (+ the shared expert) from the TRTLLM-Gen runner's unfinalized
 parts, bitwise to the runner's finalizeKernelVecLoad order (acc = 0; acc += w_k * fc2[idx_k] for k in order, skipping
 -1; one BF16 rounding) and to ``shared.add_(routed)``, at the rows the wide target routes there (49..16K), with dropped
 (-1) slots, padded FC2 rows, eager and CUDA-graph replay. (The runner itself was compared at 512 / 2K / 4K / 16K rows on
@@ -9,7 +9,7 @@ SM107, maximum difference 0.)"""
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2.kernels.m3_moe_finalize import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2.ops.m3_moe_finalize import (  # noqa: E501
     m3_moe_finalize,
 )
 

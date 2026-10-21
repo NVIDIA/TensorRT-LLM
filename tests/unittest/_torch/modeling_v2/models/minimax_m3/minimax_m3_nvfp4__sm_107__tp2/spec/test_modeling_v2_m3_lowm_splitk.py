@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test for the target's copy of FlashInfer's split-K low-M GEMM (kernels/m3_lowm_splitk,
+"""GPU test for the target's copy of FlashInfer's split-K low-M GEMM (ops/m3_lowm_splitk,
 modeling.DRAFT_LOWM_OWN_SPLITK): bit for bit FlashInfer's kernel at every certified split-K cell of the drafter's
 linears, eager and in a CUDA graph, with and without PDL."""
 
@@ -9,13 +9,13 @@ import torch
 from flashinfer.gemm.kernels.dense_bf16_gemm_sm100_splitk import SplitKTactic as FiTactic
 from flashinfer.gemm.kernels.dense_bf16_gemm_sm100_splitk import run_splitk_dense as fi_run
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2.kernels.m3_lowm_splitk import (  # noqa: E501
-    SplitKTactic,
-    run_splitk_dense,
-)
 from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2.ops.gemm.m3_draft_lowm import (  # noqa: E501
     ROWS,
     tactic_for,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2.ops.m3_lowm_splitk import (  # noqa: E501
+    SplitKTactic,
+    run_splitk_dense,
 )
 
 assert torch.cuda.is_available(), "m3_lowm_splitk requires a CUDA device"

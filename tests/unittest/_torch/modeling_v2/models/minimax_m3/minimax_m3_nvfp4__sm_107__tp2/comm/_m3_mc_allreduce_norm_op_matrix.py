@@ -329,7 +329,7 @@ def _capture_reference(
     updated: torch.Tensor, weight: torch.Tensor, eps: float, out: torch.Tensor
 ) -> None:
     """The capture the boundary replaces: m3_spec_tail.capture_norm of the updated residual (no second addend)."""
-    from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2.kernels import (  # noqa: E501
+    from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2.ops import (  # noqa: E501
         m3_spec_tail,
     )
 
@@ -644,7 +644,7 @@ def _run_one_rank() -> int:
     RANK, WORLD = rank, world
     assert WORLD == 2, f"the entries are certified at 2 ranks, got {WORLD}"
 
-    import tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2.kernels.m3_mc_allreduce as _ar  # noqa: E501
+    import tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2.ops.m3_mc_allreduce as _ar  # noqa: E501
     from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2.ops.comm import (  # noqa: E501
         m3_mc_allreduce_norm as _plain,
     )

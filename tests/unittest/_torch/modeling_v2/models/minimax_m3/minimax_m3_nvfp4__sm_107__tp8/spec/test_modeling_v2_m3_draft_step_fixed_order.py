@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""D-FIX: the draft step's tile pieces and their summation order (kernels/m3_draft_step.FIXED_ORDER).
+"""D-FIX: the draft step's tile pieces and their summation order (ops/m3_draft_step.FIXED_ORDER).
 
 A CTA's (tile, chunk) range is cut into 16 equal warp segments; the shared-memory atomics add a tile's pieces in
 arrival order, which is deterministic only while no tile takes more than 2 pieces. ``fixed_order`` sums them in warp
@@ -14,7 +14,7 @@ import types
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp8.kernels import (
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp8.ops import (
     m3_draft_step as kds,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp8.ops.spec.m3_draft_step import (  # noqa: E501
@@ -43,7 +43,7 @@ gpu = pytest.mark.skipif(
 
 @pytest.mark.parametrize("grid", [SMS, kds.GRID])
 def test_real_grid_pieces(grid) -> None:
-    """One CTA per SM and the DS-GRID launch (kernels/m3_draft_step.GRID)."""
+    """One CTA per SM and the DS-GRID launch (ops/m3_draft_step.GRID)."""
     pieces = max_tile_pieces(DRAFT_SHARD // 16, grid, CHUNKS)
     assert (pieces > 2) == ORDER_DEPENDENT, (grid, pieces)
 

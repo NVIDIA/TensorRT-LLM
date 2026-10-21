@@ -3,10 +3,10 @@
 """Blackwell low-M BF16/FP16 GEMM with an in-kernel cluster split-K reduction.
 
 This target's copy of FlashInfer's ``flashinfer/gemm/kernels/dense_bf16_gemm_sm100_splitk.py`` (the Eagle3
-drafter's low-M linears, ``kernels/m3_draft_lowm``): the same kernel and the same split order at every tactic,
-bit for bit FlashInfer's output (spec/test_modeling_v2_m3_lowm_splitk.py). The one change: the owner rank's final
-cast and store is one method, ``_store_tile``, the seam for the drafter-boundary push epilogue and, on the A side, the
-SwiGLU prologue that follow.
+drafter's low-M linears, modeling's ``DRAFT_LOWM_OWN_SPLITK``): the same kernel and the same split order at every
+tactic, bit for bit FlashInfer's output (spec/test_modeling_v2_m3_lowm_splitk.py). The one change: the owner rank's
+final cast and store is one method, ``_store_tile``, the seam for the drafter-boundary push epilogue and, on the A side,
+the SwiGLU prologue that follow.
 
 Each cluster rank accumulates an exact K slice in FP32. Peers publish partials
 to rank 0 through DSMEM; rank 0 reduces, casts, and stores once. The public
@@ -251,6 +251,8 @@ __all__ = [
     "autotune_tactics",
     "default_tactic",
     "run_splitk_dense",
+    "run_splitk_dense_swiglu",
+    "compile_swiglu_push",
 ]
 
 
@@ -312,12 +314,83 @@ def _store_shared_remote_v4(
     )
 
 
+@dsl_user_op
+def _silu_mul_f32(g, u, *, loc=None, ip=None):
+    """silu(g) * (u + 0) in FP32 for one gate / up pair: the instruction sequence of the Triton silu_and_mul kernel at
+    its defaults (no limit, alpha 1, beta 0), so the bf16 rounding after it is bit for bit the Triton activation."""
+    return cutlass.Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [
+                cutlass.Float32(g).ir_value(loc=loc, ip=ip),
+                cutlass.Float32(u).ir_value(loc=loc, ip=ip),
+            ],
+            "{\n\t.reg .f32 t, e, s, p, q, one, zero;\n\t"
+            "mul.rn.f32 t, $1, 0fBFB8AA3B;\n\tex2.approx.f32 e, t;\n\t"
+            "mov.f32 one, 0f3F800000;\n\tadd.rn.f32 e, e, one;\n\tdiv.full.f32 s, one, e;\n\t"
+            "mul.rn.f32 p, $1, s;\n\tmov.f32 zero, 0f00000000;\n\tadd.rn.f32 q, $2, zero;\n\t"
+            "mul.rn.f32 $0, q, p;\n\t}",
+            "=f,f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
+def _ld_bf16_f32(addr, *, loc=None, ip=None):
+    """The bf16 at global byte address ``addr``, widened to FP32 (exact)."""
+    return cutlass.Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [cutlass.Int64(addr).ir_value(loc=loc, ip=ip)],
+            "{\n\t.reg .b16 h;\n\tld.global.b16 h, [$1];\n\tcvt.f32.bf16 $0, h;\n\t}",
+            "=f,l",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
+def _st_f32_bf16(addr, value, *, loc=None, ip=None) -> None:
+    """``value`` rounded to bf16 (round to nearest even) at global byte address ``addr``."""
+    llvm.inline_asm(
+        None,
+        [
+            cutlass.Int64(addr).ir_value(loc=loc, ip=ip),
+            cutlass.Float32(value).ir_value(loc=loc, ip=ip),
+        ],
+        "{\n\t.reg .b16 h;\n\tcvt.rn.bf16.f32 h, $1;\n\tst.global.b16 [$0], h;\n\t}",
+        "l,f",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@dsl_user_op
+def _fence_proxy_async_global(*, loc=None, ip=None) -> None:
+    """Order this thread's generic global stores before later async-proxy (TMA) reads of them."""
+    llvm.inline_asm(
+        None,
+        [],
+        "fence.proxy.async.global;",
+        "",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
 #: Rank that gathers partials and stores the output.
 OWNER_RANK = 0  # capacity: fixed: a split index, not a size
 
 
-# The drafter-boundary push (``ar_push``, modeling.DRAFT_AR_PUSH): the exchange words of
-# kernels/m3_mc_allreduce, as m3_mx_gemv's ``ar`` push stores them.
+# The drafter-boundary push (``ar_push``, modeling's DRAFT_AR_PUSH): the exchange words of
+# ops/m3_mc_allreduce, as m3_mx_gemv's ``ar`` push stores them.
 @dsl_user_op
 def _ld_volatile_s32(addr, *, loc=None, ip=None):
     return Int32(
@@ -377,10 +450,14 @@ class SplitKDenseGemmKernel:
         tactic: SplitKTactic,
         use_pdl: bool,
         has_bias: bool,
+        b_swiglu: bool = False,
         ar_push: bool = False,
     ) -> None:
         self.ar_push = ar_push
         self.acc_dtype = cutlass.Float32
+        # The B operand (public A, the activation) is silu(gate) * up of a [M, 2K] gate | up tensor: the B DMA warp
+        # writes its CTA's K-slice of it to the B tensor (a scratch) before its unchanged TMA loop reads it back.
+        self.b_swiglu = b_swiglu
         self.cta_m = tactic.mma_m
         self.cta_n = tactic.mma_n
         self.cta_k = _CTA_K
@@ -413,6 +490,10 @@ class SplitKDenseGemmKernel:
         b: cute.Tensor,
         c: cute.Tensor,
         bias: cute.Tensor,
+        g: cute.Tensor,
+        u: cute.Tensor,
+        gu_ld: cutlass.Int32,
+        b_ld: cutlass.Int32,
         stream: _cuda.CUstream,
         ar_ws: cutlass.Int64 = cutlass.Int64(0),
         ar_flags: cutlass.Int64 = cutlass.Int64(0),
@@ -424,7 +505,21 @@ class SplitKDenseGemmKernel:
     ):
         # Grid-y packs output-N tile and cluster rank.
         self.kernel(
-            a, b, c, bias, ar_ws, ar_flags, ar_rank, ar_world, ar_maxt, ar_tokens, ar_n
+            a,
+            b,
+            c,
+            bias,
+            g,
+            u,
+            gu_ld,
+            b_ld,
+            ar_ws,
+            ar_flags,
+            ar_rank,
+            ar_world,
+            ar_maxt,
+            ar_tokens,
+            ar_n,
         ).launch(
             grid=(
                 cute.ceil_div(c.layout.shape[0], self.cta_m),
@@ -445,6 +540,10 @@ class SplitKDenseGemmKernel:
         mB: cute.Tensor,  # (Gemm_N, Gemm_K, Gemm_L), K-major
         mC: cute.Tensor,  # (Gemm_M, Gemm_N, Gemm_L), M-major
         mBias: cute.Tensor,  # Broadcast bias; dead when has_bias=False
+        mG: cute.Tensor,  # b_swiglu: the gate half (Gemm_N, Gemm_K, Gemm_L); dead otherwise
+        mU: cute.Tensor,  # b_swiglu: the up half, same layout; dead otherwise
+        gu_ld: cutlass.Int32,  # b_swiglu: elements between gate (and up) rows
+        b_ld: cutlass.Int32,  # b_swiglu: elements between B rows
         ar_ws: cutlass.Int64,  # ar_push: the boundary all-reduce's multicast exchange words (int32)
         ar_flags: cutlass.Int64,  # ar_push: its per-(token, cluster CTA) call flags (parity = flag & 1)
         ar_rank: Int32,
@@ -592,6 +691,13 @@ class SplitKDenseGemmKernel:
                 k_tile_start,
                 k_tile_count,
                 True,
+                cutlass.Int64(0),
+                cutlass.Int64(0),
+                cutlass.Int64(0),
+                Int32(0),
+                Int32(0),
+                Int32(0),
+                Int32(0),
             )
         elif warp_idx == 1:
             self.dma_warp(
@@ -604,6 +710,13 @@ class SplitKDenseGemmKernel:
                 k_tile_start,
                 k_tile_count,
                 False,
+                mG.iterator.toint(),
+                mU.iterator.toint(),
+                mB.iterator.toint(),
+                gu_ld,
+                b_ld,
+                n_idx * Int32(self.cta_n),
+                Int32(cute.size(mB, mode=[0])) - n_idx * Int32(self.cta_n),
             )
         elif warp_idx == 2:
             self.mma_warp(
@@ -646,6 +759,42 @@ class SplitKDenseGemmKernel:
             )
 
     @cute.experimental.jit
+    def _swiglu_to_b(
+        self,
+        gate_base: cutlass.Int64,
+        up_base: cutlass.Int64,
+        out_base: cutlass.Int64,
+        gu_ld: cutlass.Int32,
+        b_ld: cutlass.Int32,
+        row0: cutlass.Int32,
+        rows_valid: cutlass.Int32,
+        k_tile_start: cutlass.Int32,
+        k_tile_count: cutlass.Int32,
+    ):
+        """This CTA's K-slice of the activation, silu(gate) * up rounded to bf16, into the B tensor's valid rows (TMA
+        fills the rest with zeros), through raw global addresses (the B tensor is in the TMA chain); then the stores
+        are made visible to the TMA reads that follow."""
+        lane = cute.arch.lane_idx()
+        per_tile = cutlass.const_expr(self.cta_n * self.cta_k)
+        for k_tile in cutlass.range(k_tile_count, unroll=1):
+            k0 = (k_tile_start + k_tile) * Int32(self.cta_k)
+            for j in cutlass.range_constexpr(per_tile // 32):
+                idx = Int32(j * 32) + lane
+                row = idx // Int32(self.cta_k)
+                col = k0 + idx % Int32(self.cta_k)
+                if row < rows_valid:
+                    src = (
+                        cutlass.Int64(row0 + row) * cutlass.Int64(gu_ld) + cutlass.Int64(col)
+                    ) * cutlass.Int64(2)
+                    dst = (
+                        cutlass.Int64(row0 + row) * cutlass.Int64(b_ld) + cutlass.Int64(col)
+                    ) * cutlass.Int64(2)
+                    act = _silu_mul_f32(_ld_bf16_f32(gate_base + src), _ld_bf16_f32(up_base + src))
+                    _st_f32_bf16(out_base + dst, act)
+        _fence_proxy_async_global()
+        cute.arch.sync_warp()
+
+    @cute.experimental.jit
     def dma_warp(
         self,
         bar_full,
@@ -657,10 +806,29 @@ class SplitKDenseGemmKernel:
         k_tile_start: cutlass.Int32,
         k_tile_count: cutlass.Int32,
         is_a: cutlass.Constexpr,
+        gate_base: cutlass.Int64,
+        up_base: cutlass.Int64,
+        out_base: cutlass.Int64,
+        gu_ld: cutlass.Int32,
+        b_ld: cutlass.Int32,
+        row0: cutlass.Int32,
+        rows_valid: cutlass.Int32,
     ):
         stages = self.num_ab_stage
         if cutlass.const_expr(not is_a and self.use_pdl):
             cute.arch.griddepcontrol_wait()
+        if cutlass.const_expr(not is_a and self.b_swiglu):
+            self._swiglu_to_b(
+                gate_base,
+                up_base,
+                out_base,
+                gu_ld,
+                b_ld,
+                row0,
+                rows_valid,
+                k_tile_start,
+                k_tile_count,
+            )
 
         empty_phase = cutlass.Int32(1)
         for k_tile in cutlass.range(k_tile_count, unroll=1):
@@ -935,7 +1103,7 @@ class SplitKDenseGemmKernel:
         ar_n: cutlass.Int32,
     ):
         """ar_push: the owner's tile rows into the boundary all-reduce's exchange, as its own push of the output
-        would store them (kernels/m3_mc_allreduce: word (t, column pair) at the call parity of the (t, column / (N / 8))
+        would store them (ops/m3_mc_allreduce: word (t, column pair) at the call parity of the (t, column / (N / 8))
         cluster CTA, -0.0 halves as +0.0), then the release of the dependents (the prepushed all-reduce)."""
         cute_ext.partition_and_copy(thr_t2r, rD, sD)
         cute.arch.barrier(barrier_id=1, number_of_threads=self.epilog_threads)
@@ -982,11 +1150,44 @@ def _bmm_no_bias(
     stream: _cuda.CUstream,
 ):
     c = cute.make_tensor(c.iterator, cute.select(c.layout, mode=[1, 2, 0]))
+    b_sel = cute.make_tensor(b.iterator, cute.select(b.layout, mode=[2, 1, 0]))
+    gemm_op(
+        cute.make_tensor(a.iterator, cute.select(a.layout, mode=[1, 2, 0])),
+        b_sel,
+        c,
+        cute.make_tensor(c.iterator, cute.select(c.layout, mode=[0, 1, 2])),
+        b_sel,
+        b_sel,
+        Int32(0),
+        Int32(0),
+        stream,
+    )
+
+
+@cute.experimental.jit
+def _bmm_swiglu(
+    gemm_op: cutlass.Constexpr,
+    a: cute.Tensor,
+    b: cute.Tensor,
+    c: cute.Tensor,
+    g: cute.Tensor,
+    u: cute.Tensor,
+    gu_ld: cutlass.Int32,
+    b_ld: cutlass.Int32,
+    stream: _cuda.CUstream,
+):
+    """_bmm_no_bias with the B operand built in the kernel from g / u (laid out as b, rows gu_ld apart; B rows b_ld
+    apart)."""
+    c = cute.make_tensor(c.iterator, cute.select(c.layout, mode=[1, 2, 0]))
     gemm_op(
         cute.make_tensor(a.iterator, cute.select(a.layout, mode=[1, 2, 0])),
         cute.make_tensor(b.iterator, cute.select(b.layout, mode=[2, 1, 0])),
         c,
         cute.make_tensor(c.iterator, cute.select(c.layout, mode=[0, 1, 2])),
+        cute.make_tensor(g.iterator, cute.select(g.layout, mode=[2, 1, 0])),
+        cute.make_tensor(u.iterator, cute.select(u.layout, mode=[2, 1, 0])),
+        gu_ld,
+        b_ld,
         stream,
     )
 
@@ -1012,6 +1213,51 @@ def _bmm_push(
         cute.make_tensor(b.iterator, cute.select(b.layout, mode=[2, 1, 0])),
         c,
         cute.make_tensor(c.iterator, cute.select(c.layout, mode=[0, 1, 2])),
+        cute.make_tensor(b.iterator, cute.select(b.layout, mode=[2, 1, 0])),
+        cute.make_tensor(b.iterator, cute.select(b.layout, mode=[2, 1, 0])),
+        Int32(0),
+        Int32(0),
+        stream,
+        ar_ws,
+        ar_flags,
+        ar_rank,
+        ar_world,
+        ar_maxt,
+        ar_tokens,
+        ar_n,
+    )
+
+
+@cute.experimental.jit
+def _bmm_swiglu_push(
+    gemm_op: cutlass.Constexpr,
+    a: cute.Tensor,
+    b: cute.Tensor,
+    c: cute.Tensor,
+    g: cute.Tensor,
+    u: cute.Tensor,
+    gu_ld: cutlass.Int32,
+    b_ld: cutlass.Int32,
+    stream: _cuda.CUstream,
+    ar_ws: cutlass.Int64,
+    ar_flags: cutlass.Int64,
+    ar_rank: Int32,
+    ar_world: Int32,
+    ar_maxt: Int32,
+    ar_tokens: Int32,
+    ar_n: Int32,
+):
+    """_bmm_swiglu that also pushes the output rows (_bmm_push's exchange)."""
+    c = cute.make_tensor(c.iterator, cute.select(c.layout, mode=[1, 2, 0]))
+    gemm_op(
+        cute.make_tensor(a.iterator, cute.select(a.layout, mode=[1, 2, 0])),
+        cute.make_tensor(b.iterator, cute.select(b.layout, mode=[2, 1, 0])),
+        c,
+        cute.make_tensor(c.iterator, cute.select(c.layout, mode=[0, 1, 2])),
+        cute.make_tensor(g.iterator, cute.select(g.layout, mode=[2, 1, 0])),
+        cute.make_tensor(u.iterator, cute.select(u.layout, mode=[2, 1, 0])),
+        gu_ld,
+        b_ld,
         stream,
         ar_ws,
         ar_flags,
@@ -1032,11 +1278,16 @@ def _bmm_bias(
     bias: cute.Tensor,
     stream: _cuda.CUstream,
 ):
+    b_sel = cute.make_tensor(b.iterator, cute.select(b.layout, mode=[2, 1, 0]))
     gemm_op(
         cute.make_tensor(a.iterator, cute.select(a.layout, mode=[1, 2, 0])),
-        cute.make_tensor(b.iterator, cute.select(b.layout, mode=[2, 1, 0])),
+        b_sel,
         cute.make_tensor(c.iterator, cute.select(c.layout, mode=[1, 2, 0])),
         cute.make_tensor(bias.iterator, cute.select(bias.layout, mode=[1, 2, 0])),
+        b_sel,
+        b_sel,
+        Int32(0),
+        Int32(0),
         stream,
     )
 
@@ -1123,6 +1374,7 @@ def _get_compiled_splitk_kernel(
     use_pdl: bool,
     has_bias: bool,
     leading_dims: tuple[int, int, int],
+    b_swiglu: bool = False,
 ):
     if dtype not in _SUPPORTED_TORCH_DTYPES:
         raise ValueError(f"split-K dense GEMM supports {_SUPPORTED_TORCH_DTYPES}; got {dtype}")
@@ -1131,10 +1383,17 @@ def _get_compiled_splitk_kernel(
         tactic=tactic,
         use_pdl=use_pdl,
         has_bias=has_bias,
+        b_swiglu=b_swiglu,
     )
     compile_tensors = _make_compile_repr_tensors(dtype, has_bias, *leading_dims)
     stream = _cuda.CUstream(_torch.cuda.current_stream().cuda_stream)
-    if has_bias:
+    if b_swiglu:
+        # The gate / up halves are laid out as the B operand (public A) is.
+        gu = _make_compile_repr_tensors(dtype, False, *leading_dims)[0]
+        compiled = cute_ext.compile(
+            _bmm_swiglu, kernel, *compile_tensors[:3], gu, gu, Int32(2), Int32(1), stream
+        )
+    elif has_bias:
         compiled = cute_ext.compile(_bmm_bias, kernel, *compile_tensors, stream)
     else:
         compiled = cute_ext.compile(_bmm_no_bias, kernel, *compile_tensors[:3], stream)
@@ -1195,6 +1454,90 @@ def run_splitk_dense(
         compiled(*cute_tensors[:4], stream)
     else:
         compiled(*cute_tensors[:3], stream)
+    return out
+
+
+@functools.cache
+def _get_compiled_swiglu_push(
+    dtype, tactic: SplitKTactic, use_pdl: bool, leading_dims: tuple[int, int, int]
+):
+    """The SwiGLU B load and the ar push in one kernel (the drafter down projection at a pushed boundary)."""
+    kernel = SplitKDenseGemmKernel(
+        tactic=tactic, use_pdl=use_pdl, has_bias=False, b_swiglu=True, ar_push=True
+    )
+    compile_tensors = _make_compile_repr_tensors(dtype, False, *leading_dims)
+    gu = _make_compile_repr_tensors(dtype, False, *leading_dims)[0]
+    stream = _cuda.CUstream(_torch.cuda.current_stream().cuda_stream)
+    z64, z32 = cutlass.Int64(0), Int32(0)
+    return cute_ext.compile(
+        _bmm_swiglu_push, kernel, *compile_tensors[:3], gu, gu, Int32(2), Int32(1), stream,
+        z64, z64, z32, Int32(1), Int32(8), z32, Int32(6144),
+    )  # fmt: skip
+
+
+def compile_swiglu_push(scratch, b, out, pdl: bool, tactic) -> None:
+    """Compile (only) the SwiGLU + push variant of ``run_splitk_dense_swiglu`` for these operands' layouts."""
+    cute_tensors = _to_cute_swap(scratch, b, out, None)
+    _get_compiled_swiglu_push(scratch.dtype, SplitKTactic(*tactic), pdl, cute_tensors[4])
+
+
+def run_splitk_dense_swiglu(
+    gate_up, b, out, pdl: bool, tactic: SplitKTactic, scratch, ar: tuple = None
+):
+    """``out = silu_and_mul(gate_up) @ b`` in one launch: ``gate_up`` [M, 2K] (gate then up, contiguous rows) is
+    activated by the B DMA warp (the Triton silu_and_mul arithmetic at its defaults, bit for bit) into ``scratch``
+    [>= M, K], which the unchanged GEMM then reads; the output is bit for bit ``run_splitk_dense(silu_and_mul(gate_up),
+    b, None, out, pdl, tactic)``. ``scratch`` must not be read or written by anything else while the kernel runs. With
+    ``ar`` (``run_splitk_dense_push``'s tuple) the rows are also pushed into the drafter boundary all-reduce's
+    exchange, from the same kernel."""
+    if gate_up.ndim != 2 or gate_up.shape[1] % 2 or not gate_up.is_contiguous():
+        raise ValueError("gate_up must be a contiguous [M, 2K] matrix")
+    m, k = gate_up.shape[0], gate_up.shape[1] // 2
+    a = scratch[:m]
+    if a.shape != (m, k) or not a.is_contiguous():
+        raise ValueError(f"scratch must be a contiguous [>= {m}, {k}] matrix")
+    gate, up = gate_up[:, :k], gate_up[:, k:]
+    validate_tactic(tactic, *_validate_runtime_tensors(a, b, None, out))
+    if any(t.data_ptr() % 32 for t in (gate, up)) or gate.dtype != a.dtype:
+        raise ValueError("gate / up halves must be 32-byte aligned and of the GEMM dtype")
+    cute_tensors = _to_cute_swap(a, b, out, None)
+    g_swap = gate.unsqueeze(0).transpose(-2, -1)
+    u_swap = up.unsqueeze(0).transpose(-2, -1)
+    lead = cute_tensors[4][1]
+    if _detect_leading_dim(g_swap) != lead or _detect_leading_dim(u_swap) != lead:
+        raise ValueError("gate / up must share the activation's K-major layout")
+    stream = _cuda.CUstream(_torch.cuda.current_stream(a.device).cuda_stream)
+    operands = (
+        *cute_tensors[:3],
+        _from_dlpack_dynamic(g_swap, lead),
+        _from_dlpack_dynamic(u_swap, lead),
+        Int32(gate_up.stride(0)),
+        Int32(a.stride(0)),
+        stream,
+    )
+    if ar is None:
+        compiled = _get_compiled_splitk_kernel(
+            dtype=a.dtype,
+            tactic=tactic,
+            use_pdl=pdl,
+            has_bias=False,
+            leading_dims=cute_tensors[4],
+            b_swiglu=True,
+        )
+        compiled(*operands)
+        return out
+    compiled = _get_compiled_swiglu_push(a.dtype, tactic, pdl, cute_tensors[4])
+    ws, flags, rank, world, maxt = ar
+    compiled(
+        *operands,
+        cutlass.Int64(ws),
+        cutlass.Int64(flags),
+        Int32(rank),
+        Int32(world),
+        Int32(maxt),
+        Int32(out.shape[0]),
+        Int32(out.shape[1]),
+    )
     return out
 
 

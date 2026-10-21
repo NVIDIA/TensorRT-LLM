@@ -444,8 +444,8 @@ def _run_one_rank() -> int:
     RANK, WORLD = rank, world
     assert WORLD == 4, f"the drafter runs at tp4, got {WORLD} ranks"
     try:
-        import tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp4.kernels.m3_mc_allreduce as _ar  # noqa: E501
         import tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp4.modeling as _modeling  # noqa: E501
+        import tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp4.ops.m3_mc_allreduce as _ar  # noqa: E501
 
         modeling, ar_module = _modeling, _ar
         assert modeling.m3_mc_allreduce is ar_module, (

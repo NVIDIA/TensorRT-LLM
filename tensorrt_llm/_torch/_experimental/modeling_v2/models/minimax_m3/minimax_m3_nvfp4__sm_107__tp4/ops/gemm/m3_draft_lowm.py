@@ -53,7 +53,7 @@ class M3DraftLowM(OpWrapper):
     ``kind`` / ``tactic`` pick FlashInfer's kernel: "d" runs ``run_direct_dense`` (SIMT, one dot product per output in
     K order), "s" runs ``run_splitk_dense`` (tcgen05 MMA, K split over ``split_k`` CTAs and summed in FP32). Both
     round once to BF16. The kernel is compiled on its first call per (M, N, K, tactic, PDL); the target compiles every
-    covered call before warmup (kernels/m3_draft_lowm.prebuild).
+    covered call before warmup (ops/m3_draft_lowm.prebuild).
     """
 
     ARCHS = frozenset({Arch.SM_107})
@@ -95,13 +95,9 @@ class M3DraftLowM(OpWrapper):
 
             run_direct_dense(x, weight.t(), out, use_pdl, DirectTactic(*tactic))
         elif own_splitk:
-            # This target's copy of the split-K kernel (kernels/m3_lowm_splitk): bit for bit FlashInfer's; with ``ar``
+            # This target's copy of the split-K kernel (ops/m3_lowm_splitk): bit for bit FlashInfer's; with ``ar``
             # it also pushes the rows into a drafter boundary all-reduce (modeling.DRAFT_AR_PUSH).
-            from ...kernels.m3_lowm_splitk import (
-                SplitKTactic,
-                run_splitk_dense,
-                run_splitk_dense_push,
-            )
+            from ..m3_lowm_splitk import SplitKTactic, run_splitk_dense, run_splitk_dense_push
 
             if ar is not None:
                 run_splitk_dense_push(x, weight.t(), out, use_pdl, SplitKTactic(*tactic), ar)

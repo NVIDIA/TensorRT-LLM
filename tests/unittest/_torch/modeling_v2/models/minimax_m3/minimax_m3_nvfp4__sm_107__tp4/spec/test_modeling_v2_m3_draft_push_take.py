@@ -1,13 +1,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""The drafter boundary push bookkeeping (kernels/m3_draft_lowm arm_push / take_pushed, dispatch.DRAFT_AR_PUSH): the
+"""The drafter boundary push bookkeeping (ops/m3_draft_lowm arm_push / take_pushed, dispatch.DRAFT_AR_PUSH): the
 boundary all-reduce runs prepushed only when the armed call pushed, and only on that call's own output; any other
 input raises instead of reducing rows the exchange does not hold. Host state only (no GPU)."""
 
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp4.kernels import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp4.ops import (  # noqa: E501
     m3_draft_lowm,
 )
 

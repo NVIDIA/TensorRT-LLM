@@ -143,7 +143,7 @@ def test_prebuild_covers_the_split8_config_while_frozen(nk) -> None:
     from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp4 import (
         modeling as dispatch,
     )
-    from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp4.kernels.mx_gemv import (  # noqa: E501
+    from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp4.ops.mx_gemv import (  # noqa: E501
         op as mx_gemv,
     )
 

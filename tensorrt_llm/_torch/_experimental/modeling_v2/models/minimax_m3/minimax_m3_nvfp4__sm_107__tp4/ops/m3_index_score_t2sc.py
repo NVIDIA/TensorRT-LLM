@@ -4,7 +4,7 @@
 # Vendored from vLLM (Apache-2.0):
 # https://github.com/vllm-project/vllm/blob/6f91edf96d3f3272945809c04702380053bff4de/vllm/models/minimax_m3/nvidia/ops/index_decode_score.py
 """MiniMax-M3 index decode block scorer (CuTe DSL, Blackwell) with its pre-wait schedule: T2SC, this target's copy of
-the sm_107 TP2 / TP8 targets' scorer (``modeling.INDEX_SCORE_T2SC``). The sm_103-derived ``kernels/m3_index_score``
+the sm_107 TP2 / TP8 targets' scorer (``modeling.INDEX_SCORE_T2SC``). The sm_103-derived ``ops/m3_index_score``
 stays the kill path.
 
 The kernel of ``tensorrt_llm/_torch/attention/kernels/blackwell/minimax_m3_index_decode_score.py`` (the same scores, bit

@@ -17,7 +17,7 @@ import tensorrt_llm  # noqa: F401  (registers torch.ops.trtllm)
 from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp8 import (
     modeling,  # noqa: E501
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp8.kernels import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp8.ops import (  # noqa: E501
     m3_attn_lc8,
     m3_prequant,
     m3_report,
@@ -594,7 +594,7 @@ def test_lc_fails_closed_on_ids_past_the_row(requests) -> None:
     """A selected id past the token's row (a stale table, e.g. a padded row keeping a 500K request's n_valid) is
     skipped, as the Triton producer skips it: the rows equal those with that slot at -1, bit for bit, and stay finite
     even though the block-table tail it would reach points at a page whose block scales are NaN (0xFF)."""
-    from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp8.kernels import (  # noqa: E501
+    from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp8.ops import (  # noqa: E501
         m3_prequant,
     )
 

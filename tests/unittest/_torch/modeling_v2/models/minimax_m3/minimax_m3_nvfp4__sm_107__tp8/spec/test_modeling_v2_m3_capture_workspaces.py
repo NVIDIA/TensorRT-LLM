@@ -4,13 +4,13 @@
 
 The draft-step and sampled-accept workspaces are created collectively (both ranks, a multicast buffer) on the first
 eager call. Creating one inside a capture would allocate and synchronize mid-capture, so a capture that finds it missing
-reports a miss (``kernels/m3_report.capture_missed``) and gets None (the caller then takes its stock path) instead.
+reports a miss (``ops/m3_report.capture_missed``) and gets None (the caller then takes its stock path) instead.
 """
 
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp8.kernels import (
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp8.ops import (
     m3_draft_step,
     m3_report,
     m3_sampled_accept,

@@ -240,7 +240,7 @@ def test_run_to_run_deterministic(prewait, mxfp8) -> None:
     ids=["1x165k", "2req", "short-1row", "4req-incl-64"],
 )
 def test_merge_once_is_bitwise_the_image_op(seq_lens, decode_query_len) -> None:
-    """kernels/m3_attn_lc8.MERGE_ONCE: the target's op (merge weights formed once per CTA) writes exactly the
+    """ops/m3_attn_lc8.MERGE_ONCE: the target's op (merge weights formed once per CTA) writes exactly the
     image op's rows and hand-off, at both softmax recurrences and both staging variants, including requests with fewer
     than 16 selected blocks (empty chunks, -inf LSE). With SPARSE_DECODE_LC8_PREFETCH_OPROJ it also pulls two ranges
     the size of the TP8 o_proj weight and scales (one not a multiple of 16 bytes) into L2: the same bits again. With
@@ -318,7 +318,7 @@ def test_merge_once_is_bitwise_the_image_op(seq_lens, decode_query_len) -> None:
 def test_one_div_merge_is_deterministic_and_in_band(
     seq_lens, decode_query_len, prewait, linear
 ) -> None:
-    """kernels/m3_attn_lc8.ONE_DIV_MERGE (numerics rule 1b, gate a): the one-division merge writes the same rows on
+    """ops/m3_attn_lc8.ONE_DIV_MERGE (numerics rule 1b, gate a): the one-division merge writes the same rows on
     every run (5 eager runs, PDL on and off) and under CUDA-graph replay (3 replays == eager), MXFP8 hand-off included;
     the rows are within the float64 reference's band, and within summation-order distance of the per-chunk merge."""
     case = build_step(

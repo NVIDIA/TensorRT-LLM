@@ -8,7 +8,7 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2.kernels import (
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2.ops import (
     m3_select_long_dsl as select_kernels,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2.ops.attention.m3_select_long import (  # noqa: E501
@@ -140,7 +140,7 @@ def test_trigger_phase_selects_the_same(cell: int) -> None:
 @pytest.mark.parametrize("early_trigger", [False, True])
 @pytest.mark.parametrize("cell", range(len(op.CELLS)))
 def test_valid_count_read_before_the_wait_selects_the_same(cell: int, early_trigger: bool) -> None:
-    """kernels/m3_select_long_dsl.SELECT_N_VALID_PREWAIT: the kernel that reads its row's valid-block count before the
+    """ops/m3_select_long_dsl.SELECT_N_VALID_PREWAIT: the kernel that reads its row's valid-block count before the
     grid wait selects exactly the blocks of the one that reads it after, on every certified cell (padding, clamped and
     tied rows)."""
     phase = 0 if early_trigger else 1
