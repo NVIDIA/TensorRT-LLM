@@ -45,7 +45,9 @@ Differences from other targets:
   chosen by ``moe_config.backend``; any other request is refused. The MTP draft
   layer's FP8 block-scale experts run on trtllm-gen under either. Under ``TRTLLM`` the
   prefill-sized launches (``_CUTE_DSL_MOE_MIN_ROWS``) run the CuteDSL pipeline over a
-  second copy of the experts in its layout. A graph-captured decode step routes its block
+  second copy of the experts in its layout, about 1.3 GiB a layer, kept only when a step
+  can reach that size and ``TRTLLM_MODELING_V2_MOE_PREFILL_COPY`` does not turn it off
+  (``_moe_prefill_copy``). A graph-captured decode step routes its block
   projections through ``ops/gemm/low_m_bf16_mm`` (FlashInfer low-M kernels at
   M <= 32 on the shapes it lists, cuBLAS otherwise); see ``DecodeTarget.forward``.
 
@@ -501,6 +503,24 @@ _PLE_HOST_OFFLOAD_OFF = frozenset({"0", "false", "no", "off"})
 def _ple_host_offload_enabled() -> bool:
     """Whether the n-gram table is allocated in host memory."""
     return os.environ.get(_PLE_HOST_OFFLOAD_ENV, "1").strip().lower() not in _PLE_HOST_OFFLOAD_OFF
+
+
+# Whether trtllm-gen keeps the second, CuteDSL-layout copy of the routed experts for the
+# launches of at least `_CUTE_DSL_MOE_MIN_ROWS` rows (module docstring). No engine arg owns
+# it, hence an env var read at construction; "off" (the spellings above) drops the copy and
+# every launch runs on trtllm-gen.
+_MOE_PREFILL_COPY_ENV = "TRTLLM_MODELING_V2_MOE_PREFILL_COPY"
+
+
+def _moe_prefill_copy(trunk_moe_backend: str, max_num_tokens: int) -> bool:
+    """Whether the trunk keeps the second expert copy: only under trtllm-gen, only when a
+    step's rows (at most `max_num_tokens`) can reach the CuteDSL dispatch threshold, and not
+    when the env var turns it off."""
+    return (
+        trunk_moe_backend == "TRTLLM"
+        and max_num_tokens >= _CUTE_DSL_MOE_MIN_ROWS
+        and os.environ.get(_MOE_PREFILL_COPY_ENV, "1").strip().lower() not in _PLE_HOST_OFFLOAD_OFF
+    )
 
 
 # QSA's fixed constants (backend `constants.py`): one index KV head, three position
@@ -1256,6 +1276,9 @@ class Qwen4ExpTp1ModelingV2(DecoderModel):
             f"this target; the supported requests are {sorted(_TRUNK_MOE_BACKENDS)}"
         )
         self.trunk_moe_backend = _TRUNK_MOE_BACKENDS[requested]
+        self.moe_prefill_copy = _moe_prefill_copy(
+            self.trunk_moe_backend, model_config.max_num_tokens
+        )
 
         # ---- PLE -----------------------------------------------------------
         ple_ids = list(getattr(cfg, "ple_layer_ids", None) or [])
@@ -1556,11 +1579,11 @@ class Qwen4ExpTp1ModelingV2(DecoderModel):
         moe_scalars = [
             _moe_layer_scalars(w, i, self.trunk_moe_backend) for i in range(self.num_layers)
         ]
-        # Under trtllm-gen, the CuteDSL scalars of the second expert copy that
+        # With the second expert copy (`moe_prefill_copy`), its CuteDSL scalars, which
         # prefill-sized launches run on (`_CUTE_DSL_MOE_MIN_ROWS`).
         moe_scalars_cd = (
             [_moe_layer_scalars(w, i, "CUTEDSL") for i in range(self.num_layers)]
-            if self.trunk_moe_backend == "TRTLLM"
+            if self.moe_prefill_copy
             else None
         )
         self._moe_scalars = moe_scalars
@@ -2081,7 +2104,8 @@ class _LayerWeights(NamedTuple):
     alpha2: torch.Tensor | None
     global_sf: torch.Tensor | None
     # Under trtllm-gen, the second expert copy in the CuteDSL layout and its scalars,
-    # which prefill-sized launches run on (`_CUTE_DSL_MOE_MIN_ROWS`); None on CuteDSL.
+    # which prefill-sized launches run on (`_CUTE_DSL_MOE_MIN_ROWS`); None on CuteDSL and
+    # without the copy (`moe_prefill_copy`).
     fc1_w_cd: torch.Tensor | None
     fc1_s_cd: torch.Tensor | None
     fc2_w_cd: torch.Tensor | None
@@ -2756,8 +2780,8 @@ class PrefillTarget:
         runner the router logits (its Renormalize routing is bitwise the
         `renorm_moe_routing_op` + pre-routed composition), and a launch of at
         least `_CUTE_DSL_MOE_MIN_ROWS` rows runs the CuteDSL MoE over the second
-        expert copy instead; on CuteDSL every launch is `_cute_dsl_routed`, which
-        writes `routed_out`."""
+        expert copy instead when the core keeps it (`moe_prefill_copy`); on CuteDSL
+        every launch is `_cute_dsl_routed`, which writes `routed_out`."""
         core = self.core
         main = torch.cuda.current_stream()
         side = core._side_stream
@@ -2777,7 +2801,7 @@ class PrefillTarget:
         logits = cublas_mm(x, L.router)
         if core.trunk_moe_backend == "CUTEDSL":
             routed = _cute_dsl_routed(core, L, logits, xq, xsf, routed_out)
-        elif x.shape[0] >= _CUTE_DSL_MOE_MIN_ROWS:
+        elif core.moe_prefill_copy and x.shape[0] >= _CUTE_DSL_MOE_MIN_ROWS:
             routed = fp4_moe_renorm_cute_dsl(
                 logits,
                 xq,

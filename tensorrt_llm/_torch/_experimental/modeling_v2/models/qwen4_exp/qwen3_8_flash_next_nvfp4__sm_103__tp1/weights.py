@@ -22,7 +22,8 @@ Transforms:
   interleaves FC1 row by row and 32-row block shuffles weight and scale bytes (FC2:
   shuffle only); CuteDSL interleaves FC1 in 64-row up/gate groups and leaves FC2 in
   checkpoint row order. Under trtllm-gen a second copy in the CuteDSL layout (`fc*_cd`)
-  serves the prefill-sized launches (`modeling._CUTE_DSL_MOE_MIN_ROWS`);
+  serves the prefill-sized launches (`modeling._CUTE_DSL_MOE_MIN_ROWS`) when the core keeps
+  it (`core.moe_prefill_copy`);
 * n-gram table: 128 row chunks concatenated into one `[rows, 160]` buffer (the hash
   emits global row indices).
 
@@ -425,9 +426,10 @@ def _in_proj_rows(d, part: int) -> tuple[slice]:
 
 
 def _cute_dsl_copy_layers(d):
-    """Every layer when the trunk's routed experts run on trtllm-gen (the second, CuteDSL
-    copy that prefill-sized launches read); none under CuteDSL, whose one copy is it."""
-    return range(d.num_layers) if d.trunk_moe_backend == "TRTLLM" else ()
+    """Every layer when the core keeps the second, CuteDSL-layout copy that prefill-sized
+    launches read under trtllm-gen (`core.moe_prefill_copy`); none otherwise, CuteDSL among
+    them, whose one copy is it."""
+    return range(d.num_layers) if d.moe_prefill_copy else ()
 
 
 def _vision_blocks(d):
@@ -1158,6 +1160,7 @@ class Qwen4ExpTp1Weights:
             v_merge_dim=v_hidden * vcfg.spatial_merge_size * vcfg.spatial_merge_size,
             mtp_enabled=getattr(core.model_config, "spec_config", None) is not None,
             trunk_moe_backend=core.trunk_moe_backend,
+            moe_prefill_copy=core.moe_prefill_copy,
             dtype=core.model_config.torch_dtype,
         )
 

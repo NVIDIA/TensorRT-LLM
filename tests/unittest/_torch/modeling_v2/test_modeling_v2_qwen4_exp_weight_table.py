@@ -21,6 +21,9 @@ import torch
 __extra_import_path__ = [".."]  # noqa: F841 -- repo's file-scoped import hook
 
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1 import (  # noqa: E501
+    modeling as M,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1 import (  # noqa: E501
     weights as W,
 )
 
@@ -65,8 +68,9 @@ _VISION = dict(
 )
 
 
-def _core(mtp: bool, backend: str = "TRTLLM"):
-    """The configuration surface the table reads."""
+def _core(mtp: bool, backend: str = "TRTLLM", prefill_copy: bool | None = None):
+    """The configuration surface the table reads; the second expert copy defaults to kept
+    under trtllm-gen."""
     return SimpleNamespace(
         model_config=SimpleNamespace(
             pretrained_config=SimpleNamespace(**_TEXT),
@@ -76,6 +80,7 @@ def _core(mtp: bool, backend: str = "TRTLLM"):
         vision_config=SimpleNamespace(**_VISION),
         mtp_enabled=mtp,
         trunk_moe_backend=backend,
+        moe_prefill_copy=backend == "TRTLLM" if prefill_copy is None else prefill_copy,
     )
 
 
@@ -361,12 +366,37 @@ def test_cutedsl_fc2_keeps_the_checkpoint_row_order_and_trtllm_gen_shuffles_it()
             assert int(shuffled[32 + 8 * v + u, 0]) == 32 + 4 * u + v
 
 
-@pytest.mark.parametrize("backend", ["TRTLLM", "CUTEDSL"])
-def test_cute_dsl_expert_copy_rows_only_under_trtllm_gen(backend):
-    """Under trtllm-gen every layer also carries its experts in the CuteDSL layout
-    (`fc*_cd`), which prefill-sized launches run on; under CuteDSL the one copy is that
-    layout and no `_cd` row is declared."""
-    manifest = W.MODEL_WEIGHTS.manifest(_core(False, backend))
+@pytest.mark.parametrize(
+    "backend, prefill_copy", [("TRTLLM", True), ("TRTLLM", False), ("CUTEDSL", False)]
+)
+def test_cute_dsl_expert_copy_rows_only_when_kept(backend, prefill_copy):
+    """With the second expert copy (trtllm-gen, a step able to reach the CuteDSL dispatch
+    threshold) every layer also carries its experts in the CuteDSL layout (`fc*_cd`);
+    without it, and under CuteDSL whose one copy is that layout, no `_cd` row is declared."""
+    manifest = W.MODEL_WEIGHTS.manifest(_core(False, backend, prefill_copy))
     rows = [k for k in manifest if k.endswith(("_fc1_w_cd", "_fc1_s_cd", "_fc2_w_cd", "_fc2_s_cd"))]
     layers = _TEXT["num_hidden_layers"]
-    assert len(rows) == (4 * layers if backend == "TRTLLM" else 0), len(rows)
+    assert len(rows) == (4 * layers if prefill_copy else 0), len(rows)
+
+
+@pytest.mark.parametrize(
+    "backend, max_num_tokens, env, kept",
+    [
+        ("TRTLLM", 16384, None, True),
+        ("TRTLLM", 4096, None, True),
+        ("TRTLLM", 4095, None, False),
+        ("TRTLLM", 16384, "0", False),
+        ("TRTLLM", 16384, "1", True),
+        ("CUTEDSL", 16384, None, False),
+    ],
+)
+def test_second_expert_copy_kept_only_where_its_launches_can_happen(
+    monkeypatch, backend, max_num_tokens, env, kept
+):
+    """The copy costs about 1.3 GiB a layer: it is kept only under trtllm-gen, only when a
+    step's rows can reach the CuteDSL dispatch threshold, and not when the env var is off."""
+    if env is None:
+        monkeypatch.delenv(M._MOE_PREFILL_COPY_ENV, raising=False)
+    else:
+        monkeypatch.setenv(M._MOE_PREFILL_COPY_ENV, env)
+    assert M._moe_prefill_copy(backend, max_num_tokens) is kept
