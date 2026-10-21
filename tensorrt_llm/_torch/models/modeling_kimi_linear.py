@@ -1440,8 +1440,9 @@ class KimiK3MoERuntime(nn.Module):
             # MEGAMOE_CUTEDSL is excluded deliberately rather than by
             # oversight: its process_weights_after_loading packs into the mega
             # buffers and shrinks the raw source params back to placeholders
-            # (see maybe_finalize_layer), which has never been checked against
-            # DWDP's copy-then-free of those same originals.
+            # (see _load_expert_into_slot() in modeling_kimi_k3_loader.py),
+            # which has never been checked against DWDP's copy-then-free of
+            # those same originals.
             if model_config.moe_backend not in ("CUTEDSL", "CUTEDSL_FC12"):
                 raise NotImplementedError(
                     "Kimi K3 with DWDP requires moe_config.backend CUTEDSL or "

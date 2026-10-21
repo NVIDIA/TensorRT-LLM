@@ -12,6 +12,10 @@ parameters:
   (`checkpoint_name_plan()`), checks that no key is missing, then loads the
   non-expert ("trunk") parameters, the FP8 attention projections and the
   routed-expert slices of this rank, and ends with `_finalize_weight_load()`.
+- `KimiK3WeightLoaderMixin.plan_model_streamer_load()` is used instead with
+  ``checkpoint_io_policy="model_streamer"``. It tells the streaming code
+  which tensors this rank needs and how to load them, with the same helpers
+  as `load_weights()`.
 - The module functions convert checkpoint layouts during the load, for
   example FP8 block-scale pairs (`_checkpoint_fp8_pair()`), head-major
   tensor-parallel shards (`_shard_head_major_param()`) and the fused gate/up
@@ -31,13 +35,16 @@ parameters:
 
 from __future__ import annotations
 
+import functools
 import gc
 import json
 import math
 import os
+import re
 import threading
 import weakref
 from contextlib import ExitStack
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Callable, Dict, List, NamedTuple, Optional, Set, Tuple
 
 import torch
@@ -51,6 +58,7 @@ from ..modules.fp8_block_scale_weight_read_linear import Fp8BlockScaleWeightRead
 from ..modules.kimi_kda import KimiKDALinearAttention
 from ..modules.linear import Linear as TrtllmLinear
 from ..modules.linear import TensorParallelMode, load_weight_shard
+from .checkpoints.model_streamer.model_loading import ModelStreamerPlan
 from .modeling_utils import run_concurrently
 
 if TYPE_CHECKING:
@@ -93,6 +101,17 @@ def _has_weights(module: nn.Module) -> bool:
 
 
 _GATE_UP_FUSED_SUFFIX = ".gate_up_proj.weight"
+# Matches routed-expert tensor names and captures the layer index, e.g.
+# "language_model.model.layers.3.block_sparse_moe.experts.17.w1.weight" -> "3".
+# Shared experts ("...block_sparse_moe.shared_experts...") do not match.
+# `plan_model_streamer_load()` uses it to put a few MoE layers in each batch.
+_ROUTED_EXPERT_KEY = re.compile(r"\.layers\.(\d+)\.block_sparse_moe\.experts\.\d+\.")
+# Number of MoE layers whose routed experts are streamed in one Model Streamer
+# batch. Some MoE backends keep a layer's experts in a staging buffer until the
+# layer's last expert arrives, and the tensors of a batch arrive in any order,
+# so every layer of a batch can be staged at once. A larger value means fewer
+# batches but more staged memory, so a higher OOM risk.
+_EXPERT_LAYERS_PER_BATCH = 4
 
 
 def _gate_up_ckpt_keys(fused_key: str) -> Tuple[str, str]:
@@ -436,12 +455,158 @@ def _k3_expert_ckpt_spec(quant_algo: Optional[QuantAlgo]) -> _K3ExpertCkptSpec:
     return spec
 
 
+# ---------------------------------------------------------------------------
+# Loading routed experts into the slots of their MoE backend. The regular load
+# (`_load_expert_slices()`) and the Model Streamer load (`plan_model_streamer_load()`)
+# both load every routed expert with these functions, so they follow the same
+# per-layer steps.
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _ExpertLoadState:
+    """MoE backends whose layer staging is prepared or finalized during one load.
+
+    Holds ``id()`` of each backend. `_load_expert_slices()` loads experts from
+    several threads, so ``lock`` guards both sets.
+    """
+
+    prepared_backend_ids: set[int] = field(default_factory=set)
+    finalized_backend_ids: set[int] = field(default_factory=set)
+    lock: threading.Lock = field(default_factory=threading.Lock)
+
+
+def _load_expert_into_slot(
+    state: _ExpertLoadState,
+    moe: KimiK3MoERuntime,
+    base: str,
+    slot: int,
+    expert_idx: int,
+    get_tensor: Callable[[str], torch.Tensor],
+    get_optional_tensor: Callable[[str], Optional[torch.Tensor]],
+) -> None:
+    """Load one routed expert into its slot of the layer's MoE backend.
+
+    A layout whose per-expert loader only stages its input
+    (``needs_layer_finalize``) needs two more steps per layer: the first expert
+    of a layer prepares the layer's staging buffers, and the expert that fills
+    the last slot finalizes the layer. Nothing else on the load path calls
+    ``process_weights_after_loading()`` for these layers.
+
+    Args:
+        state: the prepared and finalized layers of this load
+        moe: MoE runtime of the layer
+        base: checkpoint name prefix of the layer's experts, e.g.
+            ``"model.layers.3.block_sparse_moe.experts"``
+        slot: local slot of the expert in the backend
+        expert_idx: global index of the expert in the checkpoint
+        get_tensor: returns the checkpoint tensor of a name
+        get_optional_tensor: returns the checkpoint tensor of a name, or None if
+            the checkpoint does not store it
+    """
+    spec = moe.expert_ckpt_spec
+    backend = moe.routed_experts.backend
+    backend_id = id(backend)
+    # Prepare a layer's streaming state on its FIRST expert, not up front.
+    #
+    # Preparing every layer before the load starts is what OOM-ed the
+    # MegaMoE CuteDSL backend: it keeps its raw NVFP4 source params as
+    # 0-element placeholders and rematerializes them at full shape here,
+    # so preparing all 92 layers held 92 layers of raw weights at once
+    # instead of the handful actually being filled. Cutlass did not care
+    # because its parameters are allocated either way.
+    #
+    # Bounded lazily instead. The paired shrink already happens per layer
+    # in process_weights_after_loading, so the live set is whatever is
+    # genuinely in flight -- measured at 1 layer per shard file for this
+    # checkpoint (its rank-local experts are 1:1 with files), so ~4 with
+    # 4 loader threads. Correctness does not depend on that layout
+    # though; a checkpoint that split a layer across files would only
+    # raise the peak, not break this.
+    #
+    # The membership add happens AFTER preparing, so the lock-free fast
+    # path can only ever be stale in the safe direction.
+    if spec.needs_layer_finalize and backend_id not in state.prepared_backend_ids:
+        with state.lock:
+            if backend_id not in state.prepared_backend_ids:
+                backend.quant_method.prepare_streaming_expert_load(backend)
+                state.prepared_backend_ids.add(backend_id)
+
+    spec.loader(backend, base, expert_idx, slot, get_tensor, get_optional_tensor)
+
+    if not spec.needs_layer_finalize:
+        return
+    # Which thread completes a layer is a race, so the completion test and the
+    # "already finalized" bookkeeping are one critical section.
+    with state.lock:
+        if len(getattr(backend, spec.loaded_slots_attr, ())) != backend.expert_size_per_partition:
+            return
+        if backend_id in state.finalized_backend_ids:
+            return
+        state.finalized_backend_ids.add(backend_id)
+    # Computes the alphas, interleaves the w2 scales, and (MegaMoE)
+    # packs into the mega buffers and shrinks the raw source params
+    # back to placeholders. Paired with the preparation above, that
+    # pairing is what bounds the per-layer footprint. The per-expert
+    # drain inside load_streaming_nvfp4_expert separately bounds the
+    # Cutlass w3_w1 staging, which is per expert rather than per layer.
+    backend.process_weights_after_loading()
+
+
+def _check_expert_slots(
+    state: _ExpertLoadState, expert_jobs: List[Tuple[int, KimiK3MoERuntime, str]]
+) -> None:
+    """Check that the load filled every expert slot and finalized every staged layer.
+
+    Called once after all routed experts loaded. Then clears the
+    ``_weights_transformed`` flag of each MoE backend.
+
+    Args:
+        state: the prepared and finalized layers of this load
+        expert_jobs: ``(layer index, MoE runtime, checkpoint name prefix)`` of
+            every MoE layer, from `checkpoint_name_plan()`
+
+    Raises:
+        RuntimeError: a slot is empty, or a staged layer was never finalized.
+    """
+    for _, moe, _ in expert_jobs:
+        spec = moe.expert_ckpt_spec
+        backend = moe.routed_experts.backend
+        loaded_slots = getattr(backend, spec.loaded_slots_attr, set())
+        expected_slots = set(range(backend.expert_size_per_partition))
+        if loaded_slots != expected_slots:
+            missing_slots = sorted(expected_slots - loaded_slots)
+            raise RuntimeError(
+                "Kimi K3 streaming expert loading did not fill all backend "
+                f"slots; missing {missing_slots[:10]}."
+            )
+        if (
+            spec.needs_layer_finalize
+            and expected_slots
+            and id(backend) not in state.finalized_backend_ids
+        ):
+            # Unreachable via _load_expert_into_slot() (the last slot
+            # finalizes), so reaching it means the two bookkeeping paths
+            # disagree. Guarded on expected_slots because a layer that owns no
+            # local slots is never prepared and so is legitimately never
+            # finalized.
+            raise RuntimeError(
+                "Kimi K3 streaming expert loading filled every slot but never finalized the layer."
+            )
+        backend._weights_transformed = False
+
+
 class KimiK3WeightLoaderMixin:
     """Weight-loading methods of `KimiLinearForCausalLM`.
 
-    The methods read the model's attributes, such as ``self.model`` and
-    ``self.model_config``, so they work only as a base class of
-    `KimiLinearForCausalLM`. The annotations below declare the model
+    This is a mixin-like base class that does not have ``__init__()``.
+    It provides only weight loading related functions so the main Kimi K3
+    class `KimiLinearForCausalLM` in ``modeling_kimi_linear.py`` is focused
+    on inference implementation.
+
+    The weight loading methods would read the model's attributes defined
+    in `KimiLinearForCausalLM`, such as ``self.model`` and
+    ``self.model_config``. The annotations below declare the model
     attributes that the methods read. This mixin must come before
     `SpecDecOneEngineForCausalLM` in the bases of `KimiLinearForCausalLM`,
     so that its `load_weights()` replaces the one of
@@ -489,9 +654,16 @@ class KimiK3WeightLoaderMixin:
                     projections.append((f"{scope}.{attr}", module, attention))
         return projections
 
-    def _load_attention_fp8(self, weights: Dict[str, torch.Tensor], prefix: str) -> int:
+    def _load_attention_fp8(
+        self,
+        weights: Dict[str, torch.Tensor],
+        prefix: str,
+        projection_names: Set[str] | None = None,
+    ) -> int:
         """Load checkpoint FP8 codes/scales without a BF16 projection intermediate."""
         projections = self._attention_fp8_linears()
+        if projection_names is not None:
+            projections = [item for item in projections if item[0] in projection_names]
         for name, linear, attention in projections:
             # Both attention implementations use self_attn keys in the checkpoint.
             key = (
@@ -776,6 +948,198 @@ class KimiK3WeightLoaderMixin:
             # work before the caller can release the weights container.
             torch.cuda.synchronize(device)
 
+    def plan_model_streamer_load(self, checkpoint_keys: Set[str]) -> ModelStreamerPlan:
+        """Tell the streaming code which checkpoint tensors this rank needs and how to load them.
+
+        Called by `load_weights_with_model_streamer` for
+        ``checkpoint_io_policy="model_streamer"``. Each group loads with the
+        same helper as `load_weights()`, so a streamed load gives the same
+        weights: one group per trunk parameter (`_load_trunk_params()`), per FP8
+        attention projection (`_load_attention_fp8()`), and per routed expert
+        that this rank owns (the MoE backend's expert loader).
+
+        Routed experts stream a few MoE layers per batch. Some MoE backends stage
+        a layer's experts until the last one arrives, so this bounds the staged
+        memory, like the file workers of `load_weights()` do.
+
+        Args:
+            checkpoint_keys: names of all tensors in the checkpoint, e.g.
+                ``{"language_model.lm_head.weight",
+                "language_model.model.layers.3.block_sparse_moe.experts.17.w1.weight", ...}``.
+
+        Returns:
+            The plan for `load_weights_with_model_streamer()`. A group of an FP8 parameter
+            looks like ``({"...q_b_proj.weight", "...q_b_proj.weight_scale_inv"},
+            load_function)``.
+
+        Raises:
+            - If the checkpoint lacks a tensor that this rank needs (KeyError).
+        """
+        # A multimodal checkpoint puts "language_model." before every text-model tensor name.
+        prefix = (
+            "language_model."
+            if any(key.startswith("language_model.") for key in checkpoint_keys)
+            else ""
+        )
+        params = self._trunk_parameters()
+        name_map, expected_keys, expert_jobs = self.checkpoint_name_plan(prefix)
+        # Fail here, before the streaming code calls other ranks. A block scale
+        # may be stored as "..._scale" or "..._scale_inv".
+        missing = {
+            key
+            for key in expected_keys - checkpoint_keys
+            if not (key.endswith("_scale") and key + "_inv" in checkpoint_keys)
+        }
+        if missing:
+            raise KeyError(
+                f"Kimi K3 Model Streamer missing checkpoint keys: {sorted(missing)[:10]}"
+            )
+
+        def tensor_and_scale_names(key: str) -> set[str]:
+            """Return ``key`` and the name of its FP8 block scale, if the checkpoint has one.
+
+            Example: ``"x.weight"`` -> ``{"x.weight", "x.weight_scale_inv"}``.
+            """
+            names = {key}
+            scale_key = _fp8_block_scale_key(key)
+            if scale_key in checkpoint_keys:
+                names.add(scale_key)
+            elif scale_key + "_inv" in checkpoint_keys:
+                names.add(scale_key + "_inv")
+            return names
+
+        # groups: list of (tensor names, load function) pairs
+        groups = []
+
+        # Groups of trunk parameters.
+        # ids of fused Q-A/KV-A weights of MLA layers; each also reads the
+        # checkpoint's separate q_a_proj tensor.
+        fused_a_param_ids: set[int] = {
+            id(layer.self_attn.mixer.kv_a_proj_with_mqa.weight)
+            for layer in self.model.layers
+            if not getattr(layer, "is_kda", True)
+            and _has_weights(layer)
+            and getattr(layer.self_attn.mixer, "fuse_qkv_a_proj", False)
+        }
+        for name, key in name_map.items():
+            if name.endswith(_GATE_UP_FUSED_SUFFIX):
+                inputs = _gate_up_ckpt_keys(key)
+            else:
+                inputs = (key,)
+            tensor_names = set().union(*(tensor_and_scale_names(input_key) for input_key in inputs))
+            if id(params[name]) in fused_a_param_ids:
+                tensor_names.update(
+                    tensor_and_scale_names(
+                        key.replace("kv_a_proj_with_mqa.weight", "q_a_proj.weight")
+                    )
+                )
+            load = functools.partial(
+                self._load_trunk_params,
+                params={name: params[name]},
+                name_map={name: key},
+                log_summary=False,
+            )
+            groups.append((tensor_names, load))
+
+        # Groups of FP8 attention projections.
+        fp8_linears = self._attention_fp8_linears()
+        for name, _, attention in fp8_linears:
+            key = (
+                prefix
+                + name.replace(".linear_attn.", ".self_attn.").replace(
+                    ".self_attn.mixer.", ".self_attn."
+                )
+                + ".weight"
+            )
+            tensor_names = tensor_and_scale_names(key)
+            if name.endswith("kv_a_proj_with_mqa") and attention.fuse_qkv_a_proj:
+                tensor_names.update(
+                    tensor_and_scale_names(
+                        key.replace("kv_a_proj_with_mqa.weight", "q_a_proj.weight")
+                    )
+                )
+            load = functools.partial(
+                self._load_attention_fp8, prefix=prefix, projection_names={name}
+            )
+            groups.append((tensor_names, load))
+
+        # Groups of routed experts that this rank owns.
+        expert_load_state = _ExpertLoadState()
+
+        def load_expert(
+            moe: KimiK3MoERuntime,
+            base: str,
+            slot: int,
+            expert_idx: int,
+            tensors: Dict[str, torch.Tensor],
+        ) -> None:
+            """Load one routed expert into its backend slot.
+
+            Called by the Model Streamer load when all tensors of the expert have
+            arrived. Like `_load_expert_slices()`, it loads through
+            `_load_expert_into_slot()`.
+            """
+            _load_expert_into_slot(
+                expert_load_state, moe, base, slot, expert_idx, tensors.__getitem__, tensors.get
+            )
+
+        for _, moe, base in expert_jobs:
+            for slot, expert_idx in enumerate(moe.local_expert_ids):
+                tensor_names = {
+                    f"{base}.{expert_idx}.{weight}.{kind}"
+                    for weight in ("w1", "w2", "w3")
+                    for kind in moe.expert_ckpt_spec.kinds
+                }
+                # An optional tensor, such as an AWQ pre-quant scale, is streamed
+                # only when the checkpoint stores it.
+                tensor_names.update(
+                    name
+                    for name in (
+                        f"{base}.{expert_idx}.{suffix}"
+                        for suffix in moe.expert_ckpt_spec.optional_suffixes
+                    )
+                    if name in checkpoint_keys
+                )
+                load = functools.partial(load_expert, moe, base, slot, expert_idx)
+                groups.append((tensor_names, load))
+
+        def finish() -> None:
+            """Check every expert slot and finalize the load, as `load_weights()` does.
+
+            Called by the Model Streamer load after every group has loaded.
+            """
+            _check_expert_slots(expert_load_state, expert_jobs)
+            self._finalize_weight_load(len(name_map) + len(fp8_linears), len(expert_jobs))
+
+        # Like the standard loader's file workers, bound how many expert layers
+        # are prepared but not yet finalized at once: stream a few MoE layers
+        # per batch. ``is_moe`` comes from the config, so every rank builds
+        # the same table, even a rank whose layers hold no weights.
+        moe_layers: list[int] = [
+            index
+            for index, layer in enumerate(self.model.layers)
+            if getattr(layer, "is_moe", False)
+        ]
+        # MoE layer index -> batch index, e.g. with 4 layers per batch, MoE
+        # layers 1 to 9 -> batches 1, 1, 1, 1, 2, 2, 2, 2, 3.
+        moe_layer_to_batch_idx: dict[int, int] = {
+            layer: 1 + position // _EXPERT_LAYERS_PER_BATCH
+            for position, layer in enumerate(moe_layers)
+        }
+
+        def batch_index(name: str) -> int:
+            """Return the batch index of a tensor name.
+
+            Called by the Model Streamer load for every tensor name that this
+            node streams, which can include names that only other ranks need.
+            """
+            # Batch 0 holds every non-expert tensor; each later batch holds
+            # the routed experts of a few MoE layers.
+            match = _ROUTED_EXPERT_KEY.search(name)
+            return 0 if match is None else moe_layer_to_batch_idx[int(match.group(1))]
+
+        return ModelStreamerPlan(groups, batch_index=batch_index, finish=finish)
+
     def _validate_checkpoint_keys(
         self, weights: Dict[str, torch.Tensor], expected_keys: Set[str], prefix: str
     ) -> None:
@@ -817,10 +1181,14 @@ class KimiK3WeightLoaderMixin:
         weights: Dict[str, torch.Tensor],
         params: Dict[str, torch.nn.Parameter],
         name_map: Dict[str, str],
+        log_summary: bool = True,
     ) -> int:
         """Load every non-expert trunk parameter concurrently (with the
         per-parameter TP-shard / pad / fuse conversions) and return the
-        number of parameters loaded."""
+        number of parameters loaded.
+
+        Each trunk-parameter group of `plan_model_streamer_load()` calls it for
+        one parameter with ``log_summary=False``, so the summary is not logged per parameter."""
         # The checkpoint stores every MLA KV-B head as interleaved [K | V]
         # rows. Runtime keeps one DeepSeek-style [all K | all V] parameter
         # instead, so context can project directly into the FMHA layout and
@@ -1005,11 +1373,15 @@ class KimiK3WeightLoaderMixin:
             param.data.copy_(src.to(param.dtype))
 
         param_jobs = [(name, params[name]) for name in name_map]
-        run_concurrently(load_param, param_jobs, num_workers=8)
+        if len(param_jobs) == 1:
+            load_param(*param_jobs[0])
+        else:
+            run_concurrently(load_param, param_jobs, num_workers=8)
 
-        logger.info(
-            f"Kimi K3: loaded {len(mla_mixers)} MLA KV-B projections in grouped runtime layout"
-        )
+        if log_summary:
+            logger.info(
+                f"Kimi K3: loaded {len(mla_mixers)} MLA KV-B projections in grouped runtime layout"
+            )
         return len(param_jobs)
 
     def _load_expert_slices(
@@ -1021,68 +1393,7 @@ class KimiK3WeightLoaderMixin:
         the backend expert slots, then verify every slot was filled."""
         device = next(self.parameters()).device
 
-        # Layouts whose per-expert loader only stages its input must have the
-        # staging containers created before any thread runs, and must be
-        # finalized once the layer's last slot lands: nothing else on this path
-        # calls process_weights_after_loading. Which thread completes a layer is
-        # a race, so the completion test and the "already finalized" bookkeeping
-        # are one critical section.
-        finalize_lock = threading.Lock()
-        finalized_backends = set()
-        prepared_backends = set()
-
-        def ensure_prepared(moe: KimiK3MoERuntime):
-            """Prepare a layer's streaming state on its FIRST expert, not up front.
-
-            Preparing every layer before the load starts is what OOM-ed the
-            MegaMoE CuteDSL backend: it keeps its raw NVFP4 source params as
-            0-element placeholders and rematerializes them at full shape here,
-            so preparing all 92 layers held 92 layers of raw weights at once
-            instead of the handful actually being filled. Cutlass did not care
-            because its parameters are allocated either way.
-
-            Bounded lazily instead. The paired shrink already happens per layer
-            in process_weights_after_loading, so the live set is whatever is
-            genuinely in flight -- measured at 1 layer per shard file for this
-            checkpoint (its rank-local experts are 1:1 with files), so ~4 with
-            4 loader threads. Correctness does not depend on that layout
-            though; a checkpoint that split a layer across files would only
-            raise the peak, not break this.
-
-            The membership add happens AFTER preparing, so the lock-free fast
-            path can only ever be stale in the safe direction.
-            """
-            spec = moe.expert_ckpt_spec
-            if not spec.needs_layer_finalize:
-                return
-            backend = moe.routed_experts.backend
-            if id(backend) in prepared_backends:
-                return
-            with finalize_lock:
-                if id(backend) in prepared_backends:
-                    return
-                backend.quant_method.prepare_streaming_expert_load(backend)
-                prepared_backends.add(id(backend))
-
-        def maybe_finalize_layer(moe: KimiK3MoERuntime):
-            spec = moe.expert_ckpt_spec
-            if not spec.needs_layer_finalize:
-                return
-            backend = moe.routed_experts.backend
-            with finalize_lock:
-                loaded = len(getattr(backend, spec.loaded_slots_attr, ()))
-                if loaded != backend.expert_size_per_partition:
-                    return
-                if id(backend) in finalized_backends:
-                    return
-                finalized_backends.add(id(backend))
-            # Computes the alphas, interleaves the w2 scales, and (MegaMoE)
-            # packs into the mega buffers and shrinks the raw source params
-            # back to placeholders. Paired with ensure_prepared above, that
-            # pairing is what bounds the per-layer footprint. The per-expert
-            # drain inside load_streaming_nvfp4_expert separately bounds the
-            # Cutlass w3_w1 staging, which is per expert rather than per layer.
-            backend.process_weights_after_loading()
+        expert_load_state = _ExpertLoadState()
 
         def load_expert(
             moe: KimiK3MoERuntime,
@@ -1094,15 +1405,18 @@ class KimiK3WeightLoaderMixin:
         ):
             if device.type == "cuda":
                 torch.cuda.set_device(device)
-            backend = moe.routed_experts.backend
             # Every route into an expert goes through here (file-grouped,
             # split-file and the shared-dict fallback alike), so this is the
             # one place preparation has to be hooked.
-            ensure_prepared(moe)
-            moe.expert_ckpt_spec.loader(
-                backend, base, expert_idx, local_slot_id, get_tensor, get_optional_tensor
+            _load_expert_into_slot(
+                expert_load_state,
+                moe,
+                base,
+                local_slot_id,
+                expert_idx,
+                get_tensor,
+                get_optional_tensor,
             )
-            maybe_finalize_layer(moe)
 
         def load_experts_from_weights(layer_idx: int, moe: KimiK3MoERuntime, base: str):
             del layer_idx
@@ -1251,31 +1565,7 @@ class KimiK3WeightLoaderMixin:
                 )
             run_concurrently(load_experts_from_weights, expert_jobs, num_workers=4)
 
-        for _, moe, _ in expert_jobs:
-            spec = moe.expert_ckpt_spec
-            backend = moe.routed_experts.backend
-            loaded_slots = getattr(backend, spec.loaded_slots_attr, set())
-            expected_slots = set(range(backend.expert_size_per_partition))
-            if loaded_slots != expected_slots:
-                missing_slots = sorted(expected_slots - loaded_slots)
-                raise RuntimeError(
-                    "Kimi K3 streaming expert loading did not fill all backend "
-                    f"slots; missing {missing_slots[:10]}."
-                )
-            if (
-                spec.needs_layer_finalize
-                and expected_slots
-                and id(backend) not in finalized_backends
-            ):
-                # Unreachable via load_expert (the last slot finalizes), so
-                # reaching it means the two bookkeeping paths disagree. Guarded
-                # on expected_slots because a layer that owns no local slots is
-                # never prepared and so is legitimately never finalized.
-                raise RuntimeError(
-                    "Kimi K3 streaming expert loading filled every slot but "
-                    "never finalized the layer."
-                )
-            backend._weights_transformed = False
+        _check_expert_slots(expert_load_state, expert_jobs)
 
     def _finalize_weight_load(self, num_params: int, num_moe_layers: int) -> None:
         """Finalize checkpoint-loaded attention and optional BF16 MLP conversion."""
