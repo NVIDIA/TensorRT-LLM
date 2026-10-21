@@ -15,13 +15,16 @@
 
 from __future__ import annotations
 
+import hmac
 import math
 import os
 import queue
+import secrets
 import struct
 import threading
 import time
 import weakref
+from collections import OrderedDict
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from enum import Enum
@@ -101,6 +104,19 @@ _FALLBACK_TX_WAIT_SLICE_S = 1.0
 # an overall deadline. KvCacheTransceiverV2 requires a configured transfer
 # timeout before it creates either sender or receiver sessions.
 _FALLBACK_TX_OVERALL_TIMEOUT_S = 60.0
+_RANK_INFO_AUTH_CONTEXT = b"trtllm-rank-info-request-v1\0"
+_RANK_INFO_NONCE_BYTES = 32
+_RANK_INFO_AUTH_TAG_BYTES = 32
+_RANK_INFO_CHALLENGE_CACHE_SIZE = 4096
+_PROCESS_RANK_INFO_AUTH_KEY = secrets.token_bytes(32)
+
+
+def _rank_info_auth_tag(auth_key: bytes, endpoint: str, nonce: bytes) -> bytes:
+    return hmac.digest(
+        auth_key,
+        _RANK_INFO_AUTH_CONTEXT + endpoint.encode("utf-8") + b"\0" + nonce,
+        "sha256",
+    )
 
 
 class _TransferNotSubmittedError(RuntimeError):
@@ -186,6 +202,8 @@ class MessageType:
     KV_AGENT_RESULT = b"KV_AGENT_RESULT"
     REQUEST_DATA = b"REQUEST_DATA"
     REQUEST_INSTANCE_INFO = b"REQUEST_INSTANCE_INFO"
+    AUTHENTICATION_CHALLENGE = b"AUTHENTICATION_CHALLENGE"
+    AUTHENTICATION_ERROR = b"AUTHENTICATION_ERROR"
     REGISTER_RANK_INFO = b"REGISTER_RANK_INFO"
     AUX_AGENT_RESULT = b"AUX_AGENT_RESULT"
     CANCEL_SESSION = b"CANCEL_SESSION"
@@ -2978,6 +2996,7 @@ class Receiver(ReceiverBase):
         bounce=None,
         enforce_physical_ownership: bool = False,
         retirement_watchdog: Optional[RetirementWatchdog] = None,
+        rank_info_auth_key: Optional[bytes] = None,
     ):
         self._registrar = peer_registrar
         self._agent = agent
@@ -2986,6 +3005,7 @@ class Receiver(ReceiverBase):
         # complete Phase 1 ownership path is available and qualified.
         self._enforce_physical_ownership = enforce_physical_ownership
         self._retirement_watchdog = retirement_watchdog
+        self._rank_info_auth_key = rank_info_auth_key or _PROCESS_RANK_INFO_AUTH_KEY
         self._dealers = {}
         self._sender_ep_instance_map = {}
         # info_endpoint -> diagnostic message for peers that failed the
@@ -3375,7 +3395,24 @@ class Receiver(ReceiverBase):
             messenger = ZMQMessenger(mode="DEALER", endpoint=info_endpoint)
             try:
                 messenger.send([MessageType.REQUEST_INSTANCE_INFO])
+                challenge = messenger.receive()
+                if (
+                    len(challenge) != 2
+                    or challenge[0] != MessageType.AUTHENTICATION_CHALLENGE
+                    or len(challenge[1]) != _RANK_INFO_NONCE_BYTES
+                ):
+                    raise PermissionError("Invalid RankInfo authentication challenge")
+                nonce = challenge[1]
+                messenger.send(
+                    [
+                        MessageType.REQUEST_INSTANCE_INFO,
+                        nonce,
+                        _rank_info_auth_tag(self._rank_info_auth_key, info_endpoint, nonce),
+                    ]
+                )
                 message = messenger.receive()
+                if message == [MessageType.AUTHENTICATION_ERROR]:
+                    raise PermissionError("RankInfo request authentication failed")
                 sender_info = RankInfo.from_bytes(message[0])
             finally:
                 messenger.stop()
@@ -4397,8 +4434,16 @@ class RxSession(RxSessionBase):
 
 
 class RankInfoServer:
-    def __init__(self, rank_info: RankInfo, addr: Optional[str] = None, port: Optional[int] = None):
+    def __init__(
+        self,
+        rank_info: RankInfo,
+        addr: Optional[str] = None,
+        port: Optional[int] = None,
+        rank_info_auth_key: Optional[bytes] = None,
+    ):
         self._rank_info = rank_info
+        self._rank_info_auth_key = rank_info_auth_key or _PROCESS_RANK_INFO_AUTH_KEY
+        self._rank_info_auth_challenges: OrderedDict[bytes, bytes] = OrderedDict()
         self._shutdown = False  # must be set before _start_listener() so __del__ is safe
         if addr is None and port is None:
             endpoint = f"tcp://{get_local_ip()}:*"
@@ -4436,7 +4481,34 @@ class RankInfoServer:
 
         self._messenger.start_listener(handle_message)
 
-    def _handle_rank_info_request(self, send_id: bytes, _message: list[bytes]):
+    def _handle_rank_info_request(self, send_id: bytes, message: list[bytes]):
+        if len(message) == 1:
+            challenge = secrets.token_bytes(_RANK_INFO_NONCE_BYTES)
+            self._rank_info_auth_challenges[send_id] = challenge
+            self._rank_info_auth_challenges.move_to_end(send_id)
+            if len(self._rank_info_auth_challenges) > _RANK_INFO_CHALLENGE_CACHE_SIZE:
+                self._rank_info_auth_challenges.popitem(last=False)
+            self._messenger.send([send_id, MessageType.AUTHENTICATION_CHALLENGE, challenge])
+            return
+
+        if len(message) != 3:
+            self._messenger.send([send_id, MessageType.AUTHENTICATION_ERROR])
+            return
+
+        nonce, provided_tag = message[1:]
+        expected_nonce = self._rank_info_auth_challenges.pop(send_id, None)
+        authenticated = (
+            len(nonce) == _RANK_INFO_NONCE_BYTES
+            and len(provided_tag) == _RANK_INFO_AUTH_TAG_BYTES
+            and hmac.compare_digest(nonce, expected_nonce or b"")
+            and hmac.compare_digest(
+                provided_tag,
+                _rank_info_auth_tag(self._rank_info_auth_key, self.endpoint, nonce),
+            )
+        )
+        if not authenticated:
+            self._messenger.send([send_id, MessageType.AUTHENTICATION_ERROR])
+            return
         self._messenger.send([send_id, self._rank_info.to_bytes()])
 
     def __del__(self):
@@ -4513,11 +4585,13 @@ class TransferWorkerConfig:
     # trailing _BYTES, lowercased); dict > env > default. Ignored when
     # agent_buffer_size_mb == 0.
     agent_bounce_params: Optional[Dict[str, str]] = None
+    rank_info_auth_key: Optional[bytes] = None
 
 
 class TransferWorker:
     def __init__(self, config: TransferWorkerConfig):
         self._config = config
+        self._rank_info_auth_key = config.rank_info_auth_key or _PROCESS_RANK_INFO_AUTH_KEY
         self._retirement_watchdog = None
         if config.quiescence_fatal_callback is not None:
             if not config.enforce_physical_ownership:
@@ -4599,7 +4673,11 @@ class TransferWorker:
         self._sender.sweep_stale_req_infos()
 
     def _setup_peer_infrastructure(self, kvm: KVCacheManager):
-        self._rank_info_server = RankInfoServer(self._rank_info) if kvm.mapping.rank == 0 else None
+        self._rank_info_server = (
+            RankInfoServer(self._rank_info, rank_info_auth_key=self._rank_info_auth_key)
+            if kvm.mapping.rank == 0
+            else None
+        )
         self._kv_extractor = KVRegionExtractorV1(kvm)
         self._peer_registrar = PeerRegistrar(self._rank_info, self._kv_extractor)
 
@@ -4656,6 +4734,7 @@ class TransferWorker:
                 bounce=self._bounce,
                 enforce_physical_ownership=self._config.enforce_physical_ownership,
                 retirement_watchdog=self._retirement_watchdog,
+                rank_info_auth_key=self._rank_info_auth_key,
             )
             self._rank_info.transfer_engine_info = bytes(self._agent.get_local_agent_desc())
             self._rank_info.self_endpoint = self._receiver.endpoint

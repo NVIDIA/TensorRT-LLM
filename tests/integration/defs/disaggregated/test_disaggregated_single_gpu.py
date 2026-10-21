@@ -183,6 +183,7 @@ async def run_worker(kv_cache_config,
     try:
         llm = LLM(tensor_parallel_size=1,
                   model=model_name,
+                  internal_request_auth_key="test-rank-info-auth-key",
                   enable_chunked_prefill=False,
                   **pytorch_config,
                   _mpi_session=mpi_session,

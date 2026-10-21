@@ -1180,12 +1180,17 @@ def test_connector_disagg_prefill(enforce_single_worker, model_with_connector,
     model_fn, scheduler, worker = model_with_connector
 
     transceiver_config = _disagg_transceiver_config(use_kv_cache_manager_v2)
+    rank_info_auth = ({
+        "internal_request_auth_key": "test-rank-info-auth-key"
+    } if use_kv_cache_manager_v2 else {})
 
     prefill_worker = model_fn(disable_overlap_scheduler=True,
-                              cache_transceiver_config=transceiver_config)
+                              cache_transceiver_config=transceiver_config,
+                              **rank_info_auth)
 
     decode_worker = model_fn(cache_transceiver_config=transceiver_config,
-                             kv_connector_config=None)
+                             kv_connector_config=None,
+                             **rank_info_auth)
 
     sampling_params = SamplingParams(ignore_eos=True, max_tokens=16)
 

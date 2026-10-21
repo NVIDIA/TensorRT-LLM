@@ -32,6 +32,7 @@ if TYPE_CHECKING:
 _NEW_TOKENS = 16
 _TOKENS_PER_BLOCK = 32
 _WORKER_TIMEOUT = 300
+_RANK_INFO_AUTH_KEY = "test-rank-info-auth-key"
 
 
 def _run_worker(
@@ -71,6 +72,7 @@ def _run_worker(
             max_num_tokens=256,
             enable_chunked_prefill=False,
             disable_overlap_scheduler=True,
+            internal_request_auth_key=(_RANK_INFO_AUTH_KEY if disaggregated else None),
             cuda_graph_config=None,
             kv_cache_config=KvCacheConfig(
                 use_kv_cache_manager_v2=True,

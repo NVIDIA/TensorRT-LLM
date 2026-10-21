@@ -34,6 +34,8 @@ from tensorrt_llm.bindings import DataType, LlmRequestState
 from tensorrt_llm.disaggregated_params import DisaggScheduleStyle
 from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig, KvCacheConfig
 
+RANK_INFO_AUTH_KEY = b"test-rank-info-auth-key"
+
 
 def broadcast_string(s: str | None, src: int, group: dist.ProcessGroup | None = None) -> str:
     """Broadcast a string from src rank to all other ranks in the group."""
@@ -382,6 +384,7 @@ def worker_fn(
         cache_transceiver_config = CacheTransceiverConfig(
             backend="NIXL", transceiver_runtime="PYTHON", max_tokens_in_buffer=512
         )
+        cache_transceiver_config._rank_info_auth_key = RANK_INFO_AUTH_KEY
 
         # Create KvCacheTransceiverV2
         print(f"[Rank {rank}] CTX: Creating transceiver...", flush=True)
@@ -445,6 +448,7 @@ def worker_fn(
         cache_transceiver_config = CacheTransceiverConfig(
             backend="NIXL", transceiver_runtime="PYTHON", max_tokens_in_buffer=512
         )
+        cache_transceiver_config._rank_info_auth_key = RANK_INFO_AUTH_KEY
 
         # Create KvCacheTransceiverV2
         print(f"[Rank {rank}] GEN: Creating transceiver...", flush=True)

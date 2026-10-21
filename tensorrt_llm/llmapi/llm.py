@@ -56,6 +56,7 @@ from ..inputs import (PromptInputs, TokensPrompt, create_input_processor,
 from ..logger import logger
 from ..sampling_params import LogitsProcessor, SamplingParams
 from ..scheduling_params import SchedulingParams
+from .disagg_utils import validate_internal_request_auth_key
 from .llm_args import (ENCODER_RUNNER_MANAGED_INPUTS,
                        TORCH_LLMARGS_EXPLICIT_DOCSTRING,
                        TORCH_LLMARGS_REMOVED_ARGS, ExecutorMemoryType,
@@ -374,6 +375,7 @@ class BaseLLM:
         self._executor_cls = kwargs.pop("executor_cls", GenerationExecutor)
         enable_routing_load = kwargs.pop("_enable_routing_load", False)
         openengine_discovery = kwargs.pop("_openengine_discovery", None)
+        rank_info_auth_key = kwargs.pop("_rank_info_auth_key", None)
         self._orchestrator_type = kwargs.get("orchestrator_type", None)
         self._llm_id = None
         self._disaggregated_params: dict | None = None
@@ -427,6 +429,7 @@ class BaseLLM:
                                      **kwargs)
             self.args._enable_routing_load = enable_routing_load
             self.args._openengine_discovery = openengine_discovery
+            self.args._rank_info_auth_key = rank_info_auth_key
 
             self._capture_usage_startup(llm_args=self.args)
 
@@ -1851,6 +1854,11 @@ class _TorchLLM(BaseLLM):
                  tokenizer_revision: Optional[str] = None,
                  **kwargs: Any) -> None:
 
+        internal_request_auth_key = validate_internal_request_auth_key(
+            kwargs.pop("internal_request_auth_key", None))
+        rank_info_auth_key = kwargs.pop("_rank_info_auth_key", None)
+        if rank_info_auth_key is None and internal_request_auth_key is not None:
+            rank_info_auth_key = internal_request_auth_key.encode("utf-8")
         self._usage_lifecycle_active = False
         self._usage_lifecycle_lock = threading.Lock()
         telemetry_config = kwargs.get("telemetry_config")
@@ -1876,6 +1884,8 @@ class _TorchLLM(BaseLLM):
                                backend=backend,
                                tensor_parallel_size=tensor_parallel_size,
                                dtype=dtype))
+        if rank_info_auth_key is not None:
+            kwargs["_rank_info_auth_key"] = rank_info_auth_key
 
         try:
             # Validate that only arguments supported by the PyTorch backend are passed.
@@ -2177,12 +2187,13 @@ class _TorchLLM(BaseLLM):
         """Validate that only arguments supported by the PyTorch backend are passed.
         """
         # Values of removed args are vetted by TorchLlmArgs._drop_removed_args.
-        accepted_keys = (set(TorchLlmArgs.model_fields.keys())
-                         | TORCH_LLMARGS_REMOVED_ARGS
-                         | {
-                             '_mpi_session', '_enable_routing_load',
-                             '_openengine_discovery', 'backend'
-                         })
+        accepted_keys = (
+            set(TorchLlmArgs.model_fields.keys())
+            | TORCH_LLMARGS_REMOVED_ARGS
+            | {
+                '_mpi_session', '_enable_routing_load', '_openengine_discovery',
+                '_rank_info_auth_key', 'backend'
+            })
 
         # Check if any arguments not supported by the PyTorch backend are passed.
         unsupported_args = [key for key in kwargs if key not in accepted_keys]

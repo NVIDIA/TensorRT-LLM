@@ -5348,6 +5348,8 @@ _CACHE_TRANSCEIVER_BACKEND_ENV_VARS = (
 class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
     """Configuration for the cache transceiver."""
 
+    _rank_info_auth_key: Optional[bytes] = PrivateAttr(default=None)
+
     backend: Optional[Literal[
         "DEFAULT", "UCX", "NIXL", "MOONCAKE", "MPI"]] = Field(
             default=None,
@@ -5595,6 +5597,7 @@ class BaseLlmArgs(StrictBaseModel):
     _enable_routing_load: bool = PrivateAttr(default=False)
     _openengine_discovery: dict[str, str | int] | None = PrivateAttr(
         default=None)
+    _rank_info_auth_key: Optional[bytes] = PrivateAttr(default=None)
 
     # Explicit arguments
     model: Union[str, Path] = Field(
