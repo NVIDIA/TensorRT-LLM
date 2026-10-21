@@ -109,10 +109,10 @@ def __getattr__(name: str):
         try:
             module = importlib.import_module(f".{module_name}", __name__)
         except AttributeError as e:
-            # An AttributeError escaping the submodule is a bug inside it, not
-            # a missing name here. Raised as is, hasattr() and
-            # ``from ... import`` would swallow it, and from-import would run
-            # the submodule again, hiding the cause.
+            # An AttributeError escaping the module is a bug inside it, not a
+            # missing name here. Raised as is, hasattr() and getattr() with a
+            # default would hide it, and ``from ... import`` would run the
+            # module twice (losing the cause unless the name is a submodule).
             raise ImportError(
                 f"cannot import {name!r} from {__name__!r}: importing "
                 f"{__name__}.{module_name} raised {e!r}",
