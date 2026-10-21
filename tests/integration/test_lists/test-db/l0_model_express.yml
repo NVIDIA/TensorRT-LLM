@@ -18,8 +18,8 @@ l0_model_express:
       backend: pytorch
       orchestrator: mpi
   tests:
-  # One lightweight E2E canary per pull request; the other TP=1 family rows run
-  # in the post_merge block below, and TP=2 rows run in the on-demand stage.
+  # One lightweight E2E canary per pull request; the other TP=1 rows run in the
+  # post_merge block below, and TP=2 rows run in the on-demand stage.
   - model_express/test_model_express.py::test_mx_donor_receiver[llama-bf16-tp1]
   - unittest/_torch/weight_sharing/test_mx_source_identity_gate.py
 - condition:
@@ -40,6 +40,7 @@ l0_model_express:
   - model_express/test_model_express.py::test_mx_donor_receiver[llama-bf16-tp2]
   - model_express/test_model_express.py::test_mx_donor_receiver[qwen2-bf16-tp2]
   - model_express/test_model_express.py::test_mx_donor_receiver[qwen3-bf16-tp2]
+  - model_express/test_model_express.py::test_mx_donor_receiver[qwen3-tied-bf16-tp2]
   - model_express/test_model_express.py::test_mx_donor_receiver[mistral-bf16-tp2]
   - model_express/test_model_express.py::test_mx_donor_receiver[phi3-bf16-tp2]
 - condition:
@@ -59,6 +60,7 @@ l0_model_express:
   tests:
   - model_express/test_model_express.py::test_mx_donor_receiver[qwen2-bf16-tp1]
   - model_express/test_model_express.py::test_mx_donor_receiver[qwen3-bf16-tp1]
+  - model_express/test_model_express.py::test_mx_donor_receiver[qwen3-tied-bf16-tp1]
   - model_express/test_model_express.py::test_mx_donor_receiver[mistral-bf16-tp1]
   - model_express/test_model_express.py::test_mx_donor_receiver[phi3-bf16-tp1]
   - model_express/test_model_express_accuracy.py::test_mx_accuracy_cases_have_references

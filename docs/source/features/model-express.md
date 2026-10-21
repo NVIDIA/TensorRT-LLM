@@ -225,7 +225,10 @@ prerequisites from skips into failures and must be set by a CI qualification
 stage. That stage must also allocate the GPUs declared by the selected test
 row. `TRTLLM_MX_E2E_TIMEOUT_S` controls the 1200-second timeout used for the
 baseline worker, receiver worker, and donor-readiness wait; increase it for
-slow model storage or startup.
+slow model storage or startup. The tied Qwen3 profile rows
+`qwen3-tied-bf16-tp1` / `qwen3-tied-bf16-tp2` load the tied Qwen3-4B
+checkpoint, with an optional model path override in
+`TRTLLM_MX_QWEN3_TIED_MODEL`.
 
 The dedicated H100 CI stages own isolated Redis and ModelExpress 0.5.1
 sidecars. Coverage is tiered so that pull requests pay for one lightweight
@@ -234,7 +237,7 @@ end-to-end canary while every qualified family still runs on each main commit:
 | Stage | When it runs | Rows |
 | --- | --- | --- |
 | `DGX_H100-2_GPUs-PyTorch-ModelExpress-1` | Pre-merge and post-merge | `llama-bf16-tp1` and `test_mx_source_identity_gate.py` |
-| `DGX_H100-2_GPUs-PyTorch-ModelExpress-Post-Merge-1` | Post-merge only | The other TP=1 family rows and the accuracy canaries below |
+| `DGX_H100-2_GPUs-PyTorch-ModelExpress-Post-Merge-1` | Post-merge only | The other TP=1 rows and the accuracy canaries below |
 | `DGX_H100-4_GPUs-PyTorch-ModelExpress-OnDemand-1` | On demand only | Every TP=2 row |
 
 The two-GPU stages are classified as multi-GPU, so running either of them on a
@@ -286,8 +289,8 @@ A canary needs a bare BF16 reference for its task that was measured on the
 PyTorch backend. The Qwen3 GSM8K entry is the one gated by
 `tests/integration/defs/accuracy/test_disaggregated_serving.py::TestQwen3_8B`,
 so re-run that test to re-measure it if the value drifts. No in-envelope Llama,
-Qwen2, or Mistral checkpoint has such a reference today, so those families are
-covered by their smoke rows until one is added.
+Qwen2, Mistral, or tied Qwen3 checkpoint has such a reference today, so those
+profiles are covered by their smoke rows until one is added.
 
 The rows are registered as `stage: post_merge` entries in
 `tests/integration/test_lists/test-db/l0_model_express.yml`, so they run in

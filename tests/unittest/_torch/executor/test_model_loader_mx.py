@@ -887,6 +887,13 @@ def _documented_names(text: str, start: str, end: str) -> set[str]:
     return {re.match(r"\w+", item).group() for item in re.split(r",? and |, ", enumeration)}
 
 
+def _mx_e2e_row_stem(profile: PostTransformProfile) -> str:
+    """Name a profile's donor/receiver rows: its family, plus `-tied` for a tied-embedding profile."""
+    family = profile.profile_id.split("-for-causal-lm-")[0]
+    tied = profile.runtime_constraints.tied_word_embeddings == frozenset({True})
+    return f"{family}-tied" if tied else family
+
+
 @pytest.mark.cpu_only
 def test_mx_e2e_rows_and_ci_list_match_qualified_profile_registry() -> None:
     """Every qualified profile has TP1 and TP2 donor/receiver rows that CI schedules.
@@ -899,14 +906,14 @@ def test_mx_e2e_rows_and_ci_list_match_qualified_profile_registry() -> None:
     ci_case_ids = _l0_model_express_case_ids()
     expected_case_ids = set()
     for profile in ModelLoader._post_transform_profile_registry().profiles:
-        family = profile.profile_id.split("-for-causal-lm-")[0]
+        stem = _mx_e2e_row_stem(profile)
         for tp_size in (1, 2):
-            case_id = f"{family}-bf16-tp{tp_size}"
+            case_id = f"{stem}-bf16-tp{tp_size}"
             expected_case_ids.add(case_id)
             assert cases[case_id] == {
-                "model_env": f"TRTLLM_MX_{family.upper()}_MODEL",
-                "default_model_subdir": cases[f"{family}-bf16-tp1"]["default_model_subdir"],
-                "repository_cache_prefix": f"models--trtllm-mx-e2e--{family}-tp{tp_size}",
+                "model_env": f"TRTLLM_MX_{stem.upper().replace('-', '_')}_MODEL",
+                "default_model_subdir": cases[f"{stem}-bf16-tp1"]["default_model_subdir"],
+                "repository_cache_prefix": f"models--trtllm-mx-e2e--{stem}-tp{tp_size}",
                 "tp_size": tp_size,
                 # The donor and the receiver each hold one TP group.
                 "min_devices": 2 * tp_size,
@@ -953,8 +960,10 @@ def test_documentation_prose_matches_qualified_profile_registry() -> None:
         )
     ]
     cases = _mx_e2e_cases()
-    assert set(re.findall(r"\b[a-z][a-z0-9]*-bf16-tp\d+\b", qualification_test)) == set(cases)
-    assert set(re.findall(r"\bTRTLLM_MX_[A-Z0-9]+_MODEL\b", qualification_test)) == {
+    assert set(
+        re.findall(r"\b[a-z][a-z0-9_]*(?:-[a-z][a-z0-9_]*)*-bf16-tp\d+\b", qualification_test)
+    ) == set(cases)
+    assert set(re.findall(r"\bTRTLLM_MX_[A-Z0-9_]+_MODEL\b", qualification_test)) == {
         row["model_env"] for row in cases.values()
     }
 
