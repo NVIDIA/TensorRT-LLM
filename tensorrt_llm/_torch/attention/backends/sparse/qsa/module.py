@@ -420,20 +420,37 @@ def select_qsa_paged_tokens(
             token_topk=params.token_topk,
         )
 
-    logits = triton_qsa_paged_index_scores(
-        q=q,
-        index_cache=index_cache,
-        block_table=metadata.qsa_block_table,
-        query_positions=query_positions,
-        request_indices=request_indices,
-        tokens_per_block=metadata.kv_cache_manager.tokens_per_block,
-        compress_ratio=params.compress_ratio,
-        # CUDA radix Top-K scans only [row_starts, row_ends), so score tiles
-        # outside the causal boundary need not be materialized. Preserve fully
-        # initialized logits for the Torch fallback below.
-        only_visible_blocks=top_k is not None and q.is_cuda,
-        context_rows=context_rows,
-    )
+    # CUDA radix Top-K scans only [row_starts, row_ends), so score tiles
+    # outside the causal boundary need not be materialized. Preserve fully
+    # initialized logits for the Torch fallback below.
+    only_visible_blocks = top_k is not None and q.is_cuda
+    from .prims_ts_core import use_prims_ts_indexer
+
+    if use_prims_ts_indexer(params, q):
+        from .prims_ts_indexer import prims_ts_qsa_index_scores
+
+        logits = prims_ts_qsa_index_scores(
+            q,
+            index_cache,
+            metadata.qsa_block_table,
+            query_positions,
+            request_indices,
+            tokens_per_block=metadata.kv_cache_manager.tokens_per_block,
+            compress_ratio=params.compress_ratio,
+            only_visible_blocks=only_visible_blocks,
+        )
+    else:
+        logits = triton_qsa_paged_index_scores(
+            q=q,
+            index_cache=index_cache,
+            block_table=metadata.qsa_block_table,
+            query_positions=query_positions,
+            request_indices=request_indices,
+            tokens_per_block=metadata.kv_cache_manager.tokens_per_block,
+            compress_ratio=params.compress_ratio,
+            only_visible_blocks=only_visible_blocks,
+            context_rows=context_rows,
+        )
     if top_k is not None and logits.is_cuda:
         if top_k_output is None or top_k_row_starts is None:
             raise ValueError("QSA CUDA Top-K requires caller-owned output and row starts")
