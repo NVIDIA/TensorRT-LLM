@@ -953,6 +953,15 @@ class KvCacheCreator:
             model_engine)
         self._is_kv_cache_manager_v2 = issubclass(self._kv_cache_manager_cls,
                                                   KVCacheManagerV2)
+        if (mapping.has_cp_helix() and not is_disagg
+                and not self._is_kv_cache_manager_v2):
+            raise ValueError(
+                "Aggregated helix context parallelism requires "
+                f"KVCacheManagerV2, got {self._kv_cache_manager_cls.__name__}: "
+                "only V2 sizes prefill KV in global ledger blocks shared by "
+                "every CP rank. Set "
+                "kv_cache_config.use_kv_cache_manager_v2=True and disable "
+                "features that fall back to V1.")
         self._disable_overlap_scheduler = llm_args.disable_overlap_scheduler
         self._draft_config = draft_config
         self._skip_est = skip_est
