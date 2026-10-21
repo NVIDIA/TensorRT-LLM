@@ -121,7 +121,9 @@ Gemma4, and EXAONE 4.5 integrations. The Hugging Face Qwen2-VL and encoder-free
 Gemma4 Unified integrations support encoder DP but do not shard their front ends.
 Encoder DP currently excludes encoder-only execution, encoder CUDA graphs, and
 side-stream prefetch. Encoder TP with LLM attention DP requires item scheduling
-and also excludes encoder CUDA graphs and side-stream prefetch.
+and also excludes encoder CUDA graphs and side-stream prefetch. Models without
+item scheduling, including Gemma4, reject shared encoder TP with attention DP
+at startup.
 
 ### FFN Module
 

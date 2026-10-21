@@ -318,6 +318,14 @@ class MultimodalItemScheduler:
         enabled = mm_item_scheduling_enabled(llm_args, model)
         validate_mm_encoder_scheduling_compatibility(llm_args, enabled)
         if not enabled:
+            if (
+                not llm_args.disable_mm_encoder
+                and isinstance(model, MultimodalModelMixin)
+                and model.encoder_collective_required
+            ):
+                raise ValueError(
+                    "Encoder TP with attention DP requires MM encoder item scheduling."
+                )
             return None
         assert isinstance(model, MultimodalModelMixin)  # narrowed by the predicate
         return cls.create(
@@ -488,8 +496,14 @@ class MultimodalItemScheduler:
                     requests, scheduled_items
                 )
         except (MultimodalEncoderContractError, EncoderDpError) as error:
+            # Nested DP guards must preserve local request scope and system errors.
+            cause: BaseException = error
+            while isinstance(cause, EncoderDpError) and cause.__cause__ is not None:
+                cause = cause.__cause__
+            if not isinstance(cause, (MultimodalEncoderContractError, EncoderDpError)):
+                raise cause
             raise MultimodalEncoderRequestError(
-                str(error), request_ids=producer_request_ids
+                str(cause), request_ids=producer_request_ids
             ) from error
 
         def requests_using_cache_keys(cache_keys: set[Hashable]) -> set[int]:
