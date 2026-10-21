@@ -871,8 +871,9 @@ class TestDisaggIdRegenOnRetry:
             internal_disagg_auth_key="secret",
             disagg_id_generator=AsyncMock(return_value=1000) if regenerate_id else None,
         )
+        # A failure that leaves the request undelivered, so both roles retry.
         session.post.side_effect = [
-            aiohttp.ClientError("transient"),
+            aiohttp.ServerDisconnectedError(),
             self._mock_http_ok(self._ok_response()),
         ]
         request = CompletionRequest(
@@ -890,7 +891,10 @@ class TestDisaggIdRegenOnRetry:
         )
 
         await client.send_request(request)
-        expected_ids = [42, 1000 if regenerate_id else 42]
+        # Only a context retry regenerates the request ID; a generation leg keeps
+        # the ID that names its context KV cache.
+        regenerated = regenerate_id and role == ServerRole.CONTEXT
+        expected_ids = [42, 1000 if regenerated else 42]
 
         # Serialized attempts retain their own IDs when a context retry
         # regenerates the request ID.
@@ -916,7 +920,7 @@ class TestDisaggIdRegenOnRetry:
             assert (
                 headers[0][INTERNAL_DISAGG_AUTH_HEADER] == headers[1][INTERNAL_DISAGG_AUTH_HEADER]
             )
-        if regenerate_id:
+        if regenerated:
             assert (
                 headers[0][SUBAGENT_AFFINITY_AUTH_HEADER]
                 != headers[1][SUBAGENT_AFFINITY_AUTH_HEADER]
@@ -1502,9 +1506,6 @@ class TestRemoteTailHandoffRetry:
         "role,request_type,schedule_style,bounded_replay",
         [
             (ServerRole.GENERATION, None, None, True),
-            (ServerRole.GENERATION, "generation_only", None, False),
-            (ServerRole.GENERATION, "generation_only", DisaggScheduleStyle.CONTEXT_FIRST, False),
-            (ServerRole.GENERATION, "generation_only", DisaggScheduleStyle.GENERATION_FIRST, False),
             (ServerRole.CONTEXT, "context_only", DisaggScheduleStyle.GENERATION_FIRST, False),
             (ServerRole.CONTEXT, "context_only", DisaggScheduleStyle.CONTEXT_FIRST, True),
         ],
@@ -1559,3 +1560,159 @@ class TestRemoteTailHandoffRetry:
         mock_router.finish_request.assert_awaited_once_with(
             completion_request, mock_session, success=True, req_id=42
         )
+
+
+class TestGenerationLegRetry:
+    """A generation leg is retried only while it cannot have reached the server.
+
+    The generation leg names the context server's KV-cache send session through
+    ``disagg_request_id``. Once the generation server may have accepted it, the
+    KV cache went to that attempt (or was released after a failed transfer), so
+    a second post would wait for KV cache that is never sent.
+    """
+
+    _ORIGINAL_ID = 4242
+
+    def _make_client(self, session):
+        _reset_prometheus_registry()
+        router = AsyncMock(spec=Router)
+        router.servers = ["localhost:8000"]
+        router.get_next_server = AsyncMock(return_value=("localhost:8000", None))
+        router.finish_request = AsyncMock()
+        client = OpenAIHttpClient(
+            router=router,
+            role=ServerRole.GENERATION,
+            timeout_secs=10,
+            max_retries=1,
+            retry_interval_sec=0,
+            session=session,
+            disagg_id_generator=AsyncMock(return_value=9000),
+        )
+        return client, router
+
+    def _make_request(self, stream: bool) -> CompletionRequest:
+        return CompletionRequest(
+            model="m",
+            prompt=[1, 2, 3],
+            stream=stream,
+            disaggregated_params=DisaggregatedParams(
+                request_type="generation_only",
+                first_gen_tokens=[7],
+                ctx_request_id=self._ORIGINAL_ID,
+                disagg_request_id=self._ORIGINAL_ID,
+            ),
+        )
+
+    @staticmethod
+    def _mock_stream(iter_any):
+        r = AsyncMock()
+        r.status = 200
+        r.headers = {"Content-Type": "text/event-stream"}
+        r.content = AsyncMock()
+        r.content.iter_any = iter_any
+        r.__aenter__ = AsyncMock(return_value=r)
+        r.__aexit__ = AsyncMock(return_value=False)
+        return r
+
+    def _mock_truncated_stream(self):
+        """A 200 event stream that is cut before its first chunk."""
+
+        async def iter_any():
+            raise aiohttp.ClientPayloadError("Response payload is not completed")
+            yield b""  # pragma: no cover - makes this an async generator
+
+        return self._mock_stream(iter_any)
+
+    def _mock_ok_stream(self):
+        async def iter_any():
+            yield b'data: "ok"\n\n'
+
+        return self._mock_stream(iter_any)
+
+    @pytest.mark.asyncio
+    async def test_truncated_stream_is_not_retried(self):
+        """The generation server failed the request after sending its headers."""
+        session = AsyncMock(spec=aiohttp.ClientSession)
+        session.post.side_effect = [self._mock_truncated_stream(), self._mock_ok_stream()]
+        client, router = self._make_client(session)
+        req = self._make_request(stream=True)
+
+        generator = await client.send_request(req)
+        with patch("asyncio.sleep", new_callable=AsyncMock):
+            with pytest.raises(aiohttp.ClientPayloadError):
+                async for _ in generator:
+                    pass
+
+        assert session.post.call_count == 1
+        assert req.disaggregated_params.disagg_request_id == self._ORIGINAL_ID
+        assert router.finish_request.await_args.kwargs["success"] is False
+
+    @pytest.mark.asyncio
+    async def test_http_error_status_is_not_retried(self):
+        session = AsyncMock(spec=aiohttp.ClientSession)
+        r = AsyncMock()
+        r.status = 500
+        r.reason = "Internal Server Error"
+        r.headers = {"Content-Type": "application/json"}
+        r.text = AsyncMock(return_value="Error in kv cache transfer for generation requests")
+        r.__aenter__ = AsyncMock(return_value=r)
+        r.__aexit__ = AsyncMock(return_value=False)
+        session.post.return_value = r
+        client, _ = self._make_client(session)
+
+        with patch("asyncio.sleep", new_callable=AsyncMock):
+            with pytest.raises(aiohttp.ClientResponseError):
+                await client.send_request(self._make_request(stream=False))
+
+        assert session.post.call_count == 1
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "error",
+        [asyncio.TimeoutError(), aiohttp.ClientOSError(104, "write failed")],
+        ids=["timeout", "client_os_error"],
+    )
+    async def test_possibly_delivered_request_is_not_retried(self, error):
+        session = AsyncMock(spec=aiohttp.ClientSession)
+        session.post.side_effect = error
+        client, _ = self._make_client(session)
+
+        with patch("asyncio.sleep", new_callable=AsyncMock):
+            with pytest.raises(type(error)):
+                await client.send_request(self._make_request(stream=False))
+
+        assert session.post.call_count == 1
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "error",
+        [
+            aiohttp.ClientConnectorError(Mock(), OSError(111, "Connection refused")),
+            aiohttp.ServerDisconnectedError(),
+            ConnectionResetError(),
+        ],
+        ids=["connect", "server_disconnected", "connection_reset"],
+    )
+    async def test_undelivered_request_is_retried_with_same_id(self, error):
+        session = AsyncMock(spec=aiohttp.ClientSession)
+        session.post.side_effect = [error, self._mock_ok_stream()]
+        client, router = self._make_client(session)
+        req = self._make_request(stream=True)
+        hooks = MagicMock(spec=ResponseHooks)
+
+        with patch("asyncio.sleep", new_callable=AsyncMock):
+            generator = await client.send_request(req, hooks=hooks)
+            chunks = [chunk async for chunk in generator]
+
+        assert chunks == [b'data: "ok"\n\n']
+        assert session.post.call_count == 2
+        bodies = [
+            msgspec.msgpack.decode(call.kwargs["data"]) for call in session.post.call_args_list
+        ]
+        assert [body["disaggregated_params"]["disagg_request_id"] for body in bodies] == [
+            self._ORIGINAL_ID,
+            self._ORIGINAL_ID,
+        ]
+        client._disagg_id_generator.assert_not_awaited()
+        hooks.on_disagg_request_id.assert_not_called()
+        assert router.finish_request.await_args.kwargs["success"] is True
