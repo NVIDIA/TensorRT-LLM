@@ -1597,12 +1597,14 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def("assert_valid", &kv::DiskCacheTierConfig::assertValid) DEF_COPY(kv::DiskCacheTierConfig);
 
     nb::class_<kv::BufferConfig>(m, "BufferConfig")
-        .def(nb::init<kv::DataRole, size_t, std::optional<int>, bool>(), nb::arg("role"), nb::arg("size"),
-            nb::arg("tokens_per_block_override") = std::nullopt, nb::arg("is_sparse") = false)
+        .def(nb::init<kv::DataRole, size_t, std::optional<int>, bool, int>(), nb::arg("role"), nb::arg("size"),
+            nb::arg("tokens_per_block_override") = std::nullopt, nb::arg("is_sparse") = false,
+            nb::arg("coalescing_group") = 0)
         .def_rw("role", &kv::BufferConfig::role)
         .def_rw("size", &kv::BufferConfig::size)
         .def_rw("tokens_per_block_override", &kv::BufferConfig::tokensPerBlockOverride)
-        .def_rw("is_sparse", &kv::BufferConfig::isSparse) DEF_COPY(kv::BufferConfig);
+        .def_rw("is_sparse", &kv::BufferConfig::isSparse)
+        .def_rw("coalescing_group", &kv::BufferConfig::coalescingGroup) DEF_COPY(kv::BufferConfig);
 
     nb::class_<kv::AttentionLayerConfig>(m, "AttentionLayerConfig")
         .def(nb::init<kv::LayerId, std::vector<kv::BufferConfig>, std::optional<int>, std::optional<int>>(),
