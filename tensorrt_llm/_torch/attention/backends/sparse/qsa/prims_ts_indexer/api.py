@@ -53,6 +53,19 @@ def _aligned(t: torch.Tensor) -> torch.Tensor:
     return t if t.data_ptr() % 16 == 0 else t.clone()
 
 
+def _paged_view(index_cache: torch.Tensor) -> torch.Tensor:
+    # The KV pool may coalesce the index cache with K/V, so the page stride is
+    # arbitrary; the kernel's TMA map takes it as a dimension. Pages must stay
+    # dense inside and 16 B aligned; anything else is copied once.
+    if (
+        index_cache.stride()[1:] == (_k.HEAD_DIM, _k.HEAD_DIM, 1)
+        and index_cache.stride(0) * index_cache.element_size() % 16 == 0
+        and index_cache.data_ptr() % 16 == 0
+    ):
+        return index_cache
+    return index_cache.contiguous()
+
+
 def _ptr(t, dtype):
     import cutlass
     from cutlass.cute.runtime import make_ptr
@@ -79,6 +92,7 @@ def _compiled(blocks_per_page: int, compress_ratio: int):
         _ptr(i32, cutlass.Int32),
         _ptr(i32, cutlass.Int32),
         _ptr(f32, cutlass.Float32),
+        cutlass.Int32(1),
         cutlass.Int32(1),
         cutlass.Int32(1),
         cutlass.Int32(1),
@@ -156,7 +170,7 @@ def prepare_qsa_index_scores(
 
     block_table = _aligned(block_table)
     q = _aligned(q)
-    index_cache = _aligned(index_cache)
+    index_cache = _paged_view(index_cache)
     # Raw pointers go into the compiled call; these tensors own the storage.
     keepalive = (
         q,
@@ -178,7 +192,8 @@ def prepare_qsa_index_scores(
         cutlass.Int32(num_requests),
         cutlass.Int32(block_table.shape[1]),
         cutlass.Int32(max_blocks),
-        cutlass.Int32(index_cache.shape[0] * blocks_per_page),
+        cutlass.Int32(index_cache.shape[0]),
+        cutlass.Int32(index_cache.stride(0)),
         cutlass.Int32(rows),
         cutlass.Int32(n_splits),
         cutlass.Float32(head_dim**-0.5),

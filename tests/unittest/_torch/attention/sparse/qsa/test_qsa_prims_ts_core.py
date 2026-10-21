@@ -14,6 +14,7 @@ from tensorrt_llm._torch.attention.backends.sparse.qsa.params import (
 from tensorrt_llm._torch.attention.backends.sparse.qsa.prims_ts_core import (
     prims_ts_available,
     prims_ts_sparse_gqa,
+    slice_request_boundaries,
 )
 
 NUM_QO_HEADS = 12
@@ -160,3 +161,75 @@ def test_prims_ts_sparse_gqa_matches_reference(query_lens, is_decode) -> None:
     torch.cuda.synchronize()
     assert actual.shape == expected.shape
     torch.testing.assert_close(actual.float(), expected.float(), atol=2e-2, rtol=2e-2)
+
+
+def test_slice_request_boundaries() -> None:
+    cu_seq_lens = torch.tensor([37, 128, 131, 200], dtype=torch.int64)
+    assert slice_request_boundaries(cu_seq_lens, 0, 200).tolist() == [0, 37, 128, 131, 200]
+    assert slice_request_boundaries(cu_seq_lens, 0, 100).tolist() == [0, 37, 100]
+    assert slice_request_boundaries(cu_seq_lens, 37, 128).tolist() == [0, 91]
+    assert slice_request_boundaries(cu_seq_lens, 100, 140).tolist() == [0, 28, 31, 40]
+    assert slice_request_boundaries(cu_seq_lens, 131, 200).dtype == torch.int32
+
+
+def test_prims_ts_sparse_gqa_host_boundaries_match_readback() -> None:
+    _requires_prims_ts()
+    query_lens = [37, 91, 5]
+    q, k_cache, v_cache, block_table, block_ids, request_indices, positions, _, _ = _make_case(
+        query_lens, seed=99
+    )
+    kwargs = dict(
+        page_size=PAGE_SIZE, max_seq_len_kv=CONTEXT, softmax_scale=HEAD_DIM**-0.5, is_decode=False
+    )
+    readback = prims_ts_sparse_gqa(
+        q, k_cache, v_cache, block_table, block_ids, request_indices, positions, **kwargs
+    )
+    cu_seq_lens = torch.cumsum(torch.tensor(query_lens, dtype=torch.int64), dim=0)
+    host = prims_ts_sparse_gqa(
+        q,
+        k_cache,
+        v_cache,
+        block_table,
+        block_ids,
+        request_indices,
+        positions,
+        request_boundaries=slice_request_boundaries(cu_seq_lens, 0, sum(query_lens)),
+        **kwargs,
+    )
+    torch.cuda.synchronize()
+    assert torch.equal(readback, host)
+
+
+def test_prefill_rows_share_plans_within_bucket() -> None:
+    _requires_prims_ts()
+    from tensorrt_llm._torch.attention.backends.sparse.qsa.prims_ts_core import _CORE
+
+    kwargs = dict(
+        page_size=PAGE_SIZE, max_seq_len_kv=CONTEXT, softmax_scale=HEAD_DIM**-0.5, is_decode=False
+    )
+    q, k_cache, v_cache, block_table, block_ids, request_indices, positions, _, _ = _make_case(
+        [37, 91], seed=5
+    )
+    prims_ts_sparse_gqa(
+        q, k_cache, v_cache, block_table, block_ids, request_indices, positions, **kwargs
+    )
+    plans = len(_CORE._plans)
+    q2, _, _, block_table2, block_ids2, request_indices2, positions2, selected2, metadata = (
+        _make_case([100, 30], seed=6)
+    )
+    out = prims_ts_sparse_gqa(
+        q2, k_cache, v_cache, block_table2, block_ids2, request_indices2, positions2, **kwargs
+    )
+    assert len(_CORE._plans) == plans
+    assert out.shape[0] == 130
+    expected = qsa_sparse_gqa_reference(
+        q=q2,
+        k_cache=k_cache,
+        v_cache=v_cache,
+        selected_tokens=selected2,
+        request_indices=request_indices2,
+        metadata=metadata,
+        softmax_scale=HEAD_DIM**-0.5,
+    )
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out, expected, atol=2e-2, rtol=2e-2)
