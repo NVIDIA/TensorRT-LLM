@@ -1460,41 +1460,23 @@ def test_scheduler_spin_bound_follows_warmup_transitions_and_autotuning(
     # AutoTuner profiling outside warmup gets the warmup bound too.
     tuning[0] = True
     assert bound.cycles() == warmup_cycles
-    # The startup warmup launch always uses the warmup bound.
-    assert bound.warmup_cycles == warmup_cycles
 
 
-def test_scheduler_launches_pass_their_spin_bound_to_the_kernel():
-    # Locate spin_cycles in the registered operator schema rather than hard-coding it.
-    op_source = (
-        _ROOT / "cpp/tensorrt_llm/thop/moe/loadBalance/moeRebalanceHaloQOp.cpp"
-    ).read_text()
-    schema = "".join(re.findall(r'"([^"]*)"', op_source.split("m.def(", 1)[1].split(");", 1)[0]))
-    parameters = re.fullmatch(r"moe_rebalance_halo_q\((.*)\) -> \(\)", schema).group(1)
+def test_fused_launch_passes_its_spin_bound_to_the_kernel():
+    # Map the scheduler arguments onto the registered operator schema rather than hard-coding them.
+    op_source = (_ROOT / "cpp/tensorrt_llm/thop/moe/loadBalance/moeRebalanceTmaOp.cpp").read_text()
+    schemas = ["".join(re.findall(r'"([^"]*)"', block)) for block in op_source.split("m.def(")[1:]]
+    schema = next(text for text in schemas if text.startswith("moe_rebalance_tma_submit_fused("))
+    parameters = re.fullmatch(r"moe_rebalance_tma_submit_fused\((.*)\) -> \(\)", schema).group(1)
     names = [parameter.split()[-1] for parameter in parameters.split(",")]
-    spin_index = names.index("spin_cycles")
+    scheduler_names = names[names.index("routes") :]
 
-    launched = []
-    torch = SimpleNamespace(
-        Tensor=_Routes,
-        int32="int32",
-        ops=SimpleNamespace(
-            trtllm=SimpleNamespace(moe_rebalance_halo_q=lambda *args: launched.append(args))
-        ),
-    )
     namespace = _scheduler_spin_namespace()
-    namespace.update(
-        {
-            "torch": torch,
-            "enter_cuda_stream": lambda stream: stream,
-            "exit_cuda_stream": lambda state: None,
-            "_stream_handle": lambda stream: int(getattr(stream, "cuda_stream", stream)),
-        }
-    )
+    namespace["torch"] = SimpleNamespace(Tensor=_Routes, int32="int32")
     scheduler_cls = _extract_class(
         _SCHEDULER_RUNTIME,
         "CudaPhysicalSlotScheduler",
-        {"launch", "_launch_op", "_halo_q_args", "fused_submit_args", "_check_routes"},
+        {"fused_submit_args", "_check_routes"},
         namespace,
     )
     scheduler = scheduler_cls.__new__(scheduler_cls)
@@ -1504,9 +1486,8 @@ def test_scheduler_launches_pass_their_spin_bound_to_the_kernel():
         extra_slots_per_rank=4,
         local_rank=0,
         route_count=8192 * 6,
-        ctas=8,
+        ctas=4,
         threads=512,
-        enable_pdl=True,
         topk=6,
         max_tokens_per_rank=8192,
     )
@@ -1526,34 +1507,20 @@ def test_scheduler_launches_pass_their_spin_bound_to_the_kernel():
         "route_prefix",
     ):
         setattr(scheduler, name, name)
-    scheduler.logical_expert_ids = "staged routes"
     scheduler.device = "cuda:0"
-    scheduler._connected = True
-    scheduler._plan_channel_lock = nullcontext()
-    scheduler._plan_channel_bound = False
-    scheduler._plan_channel_pending = False
-    scheduler._plan_channel_ptr = 0
-    scheduler._plan_channel_abi_version = 0
-    scheduler._plan_channel_words = 0
-    scheduler._plan_channel_route_features = 0
-    scheduler._plan_channel_torch_stream = SimpleNamespace(cuda_stream=19)
-    scheduler._launch_stream_handle = None
+    scheduler._bound_stream = 19
 
-    # The standalone kernel keeps the native bound unless the caller passes one.
-    scheduler.launch(19)
-    scheduler.launch(19, spin_cycles=_WARMUP_SPIN_CYCLES)
-    assert [args[spin_index] for args in launched] == [_SERVING_SPIN_CYCLES, _WARMUP_SPIN_CYCLES]
-
-    # The fused launch takes the same scheduler arguments with the caller's bound.
-    scheduler._gpu_direct_bound = True
-    scheduler._plan_channel_stream_handle = 19
     routes = _Routes(16, [])
     routes.is_cuda = True
     args = scheduler.fused_submit_args(routes, 19, spin_cycles=_WARMUP_SPIN_CYCLES)
-    assert args[spin_index] == _WARMUP_SPIN_CYCLES
-    assert args[spin_index - 1] is False  # No programmatic dependency in the fused kernel.
+    assert len(args) == len(scheduler_names)
+    assert args[scheduler_names.index("spin_cycles")] == _WARMUP_SPIN_CYCLES
+    assert args[scheduler_names.index("valid_route_count")] == 16 * 6
     with pytest.raises(ValueError, match="positive exact int"):
         scheduler.fused_submit_args(routes, 19, spin_cycles=0)
+    # Every fused launch shares the workspace, so it must use the bound stream.
+    with pytest.raises(RuntimeError, match="one static stream"):
+        scheduler.fused_submit_args(routes, 20, spin_cycles=_WARMUP_SPIN_CYCLES)
 
 
 def test_raw_stream_switch_restores_the_previous_stream_and_device():

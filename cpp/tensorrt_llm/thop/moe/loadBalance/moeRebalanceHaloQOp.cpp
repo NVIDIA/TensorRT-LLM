@@ -16,8 +16,6 @@
 
 #include "tensorrt_llm/thop/moe/loadBalance/moeRebalanceHaloQOp.h"
 
-#include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDAGuard.h>
 #include <torch/extension.h>
 
 #include <algorithm>
@@ -54,11 +52,9 @@ int checkedInt(std::int64_t value, char const* name)
 kernels::MoeRebalanceHaloQParams makeMoeRebalanceHaloQParams(torch::Tensor const& routes, torch::Tensor& outSlots,
     torch::Tensor& outIds, torch::Tensor& outLevels, torch::Tensor& outOwners, torch::Tensor const& peerBases,
     torch::Tensor& status, torch::Tensor& partial, torch::Tensor& routeAux, torch::Tensor& gridSync,
-    torch::Tensor& planWorkspace, torch::Tensor& routePrefix, std::int64_t planChannelPtr, std::int64_t epValue,
-    std::int64_t expertsValue, std::int64_t helpersValue, std::int64_t localRankValue, std::int64_t routeCapacityValue,
-    std::int64_t ctasValue, std::int64_t threadsValue, bool enablePdl, std::int64_t spinCycles,
-    std::int64_t planAbiVersionValue, std::int64_t planChannelWordsValue, std::int64_t routeFeaturesValue,
-    std::int64_t validRouteCountValue)
+    torch::Tensor& planWorkspace, torch::Tensor& routePrefix, std::int64_t epValue, std::int64_t expertsValue,
+    std::int64_t helpersValue, std::int64_t localRankValue, std::int64_t routeCapacityValue, std::int64_t ctasValue,
+    std::int64_t threadsValue, std::int64_t spinCycles, std::int64_t validRouteCountValue)
 {
     int const ep = checkedInt(epValue, "ep");
     int const experts = checkedInt(expertsValue, "experts");
@@ -67,9 +63,6 @@ kernels::MoeRebalanceHaloQParams makeMoeRebalanceHaloQParams(torch::Tensor const
     int const routeCapacity = checkedInt(routeCapacityValue, "route_capacity");
     int const ctas = checkedInt(ctasValue, "ctas");
     int const threads = checkedInt(threadsValue, "threads");
-    int const planAbiVersion = checkedInt(planAbiVersionValue, "plan_abi_version");
-    int const planChannelWords = checkedInt(planChannelWordsValue, "plan_channel_words");
-    int const routeFeatures = checkedInt(routeFeaturesValue, "route_features");
     int const validRouteCount = checkedInt(validRouteCountValue, "valid_route_count");
     TORCH_CHECK(ep >= 2 && ep <= 32 && ep % 2 == 0, "ep must be even and in [2, 32]");
     TORCH_CHECK(experts > 0 && experts <= 384 && experts % ep == 0,
@@ -82,7 +75,6 @@ kernels::MoeRebalanceHaloQParams makeMoeRebalanceHaloQParams(torch::Tensor const
     TORCH_CHECK(ctas > 0 && ctas <= 128 && routeCapacity <= INT_MAX - ctas, "invalid ctas");
     TORCH_CHECK(threads == 512, "threads must be 512");
     TORCH_CHECK(spinCycles >= 0, "spin_cycles cannot be negative");
-    TORCH_CHECK(planChannelPtr >= 0, "plan_channel_ptr cannot be negative");
 
     c10::Device const device = routes.device();
     checkCudaTensor(routes, device, torch::kInt32, validRouteCount, "routes");
@@ -117,7 +109,6 @@ kernels::MoeRebalanceHaloQParams makeMoeRebalanceHaloQParams(torch::Tensor const
         gridSync.data_ptr<int>(),
         planWorkspace.data_ptr<int>(),
         routePrefix.data_ptr<int>(),
-        reinterpret_cast<int*>(static_cast<std::uintptr_t>(planChannelPtr)),
         ep,
         experts,
         helpers,
@@ -125,52 +116,11 @@ kernels::MoeRebalanceHaloQParams makeMoeRebalanceHaloQParams(torch::Tensor const
         routeCapacity,
         ctas,
         threads,
-        enablePdl,
         static_cast<std::uint64_t>(spinCycles),
-        planAbiVersion,
-        planChannelWords,
-        routeFeatures,
         validRouteCount,
     };
-}
-
-void moeRebalanceHaloQ(torch::Tensor const& routes, torch::Tensor& outSlots, torch::Tensor& outIds,
-    torch::Tensor& outLevels, torch::Tensor& outOwners, torch::Tensor const& peerBases, torch::Tensor& status,
-    torch::Tensor& partial, torch::Tensor& routeAux, torch::Tensor& gridSync, torch::Tensor& planWorkspace,
-    torch::Tensor& routePrefix, std::int64_t planChannelPtr, std::int64_t ep, std::int64_t experts,
-    std::int64_t helpers, std::int64_t localRank, std::int64_t routeCapacity, std::int64_t ctas, std::int64_t threads,
-    bool enablePdl, std::int64_t spinCycles, std::int64_t planAbiVersion, std::int64_t planChannelWords,
-    std::int64_t routeFeatures, std::int64_t validRouteCount)
-{
-    auto const params = makeMoeRebalanceHaloQParams(routes, outSlots, outIds, outLevels, outOwners, peerBases, status,
-        partial, routeAux, gridSync, planWorkspace, routePrefix, planChannelPtr, ep, experts, helpers, localRank,
-        routeCapacity, ctas, threads, enablePdl, spinCycles, planAbiVersion, planChannelWords, routeFeatures,
-        validRouteCount);
-    c10::cuda::CUDAGuard const deviceGuard(routes.device());
-    kernels::invokeMoeRebalanceHaloQ(params, at::cuda::getCurrentCUDAStream(routes.get_device()));
 }
 
 } // namespace torch_ext
 
 TRTLLM_NAMESPACE_END
-
-TORCH_LIBRARY_FRAGMENT(trtllm, m)
-{
-    m.def(
-        "moe_rebalance_halo_q(Tensor routes, Tensor(a!) out_slots, Tensor(b!) "
-        "out_ids, Tensor(c!) out_levels, "
-        "Tensor(d!) out_owners, Tensor peer_bases, Tensor(e!) status, "
-        "Tensor(f!) partial, Tensor(g!) route_aux, "
-        "Tensor(h!) grid_sync, Tensor(i!) plan_workspace, Tensor(j!) "
-        "route_prefix, int plan_channel_ptr, int ep, "
-        "int experts, int helpers, int local_rank, int route_capacity, int "
-        "ctas, int threads, bool enable_pdl, "
-        "int spin_cycles, int plan_abi_version, int plan_channel_words, int "
-        "route_features, "
-        "int valid_route_count) -> ()");
-}
-
-TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
-{
-    m.impl("moe_rebalance_halo_q", &tensorrt_llm::torch_ext::moeRebalanceHaloQ);
-}

@@ -383,15 +383,13 @@ void moeRebalanceTmaSubmitFused(MoeRebalanceTmaStatePtr const& state, int64_t fl
     int64_t routeTarget, torch::Tensor const& routes, torch::Tensor& outSlots, torch::Tensor& outIds,
     torch::Tensor& outLevels, torch::Tensor& outOwners, torch::Tensor const& peerBases, torch::Tensor& status,
     torch::Tensor& partial, torch::Tensor& routeAux, torch::Tensor& gridSync, torch::Tensor& planWorkspace,
-    torch::Tensor& routePrefix, int64_t planChannelPtr, int64_t ep, int64_t experts, int64_t helpers, int64_t localRank,
-    int64_t routeCapacity, int64_t ctas, int64_t threads, bool enablePdl, int64_t spinCycles, int64_t planAbiVersion,
-    int64_t planChannelWords, int64_t routeFeatures, int64_t validRouteCount)
+    torch::Tensor& routePrefix, int64_t ep, int64_t experts, int64_t helpers, int64_t localRank, int64_t routeCapacity,
+    int64_t ctas, int64_t threads, int64_t spinCycles, int64_t validRouteCount)
 {
     TORCH_CHECK(state, "moe rebalance TMA state is null");
     auto const scheduler = makeMoeRebalanceHaloQParams(routes, outSlots, outIds, outLevels, outOwners, peerBases,
-        status, partial, routeAux, gridSync, planWorkspace, routePrefix, planChannelPtr, ep, experts, helpers,
-        localRank, routeCapacity, ctas, threads, enablePdl, spinCycles, planAbiVersion, planChannelWords, routeFeatures,
-        validRouteCount);
+        status, partial, routeAux, gridSync, planWorkspace, routePrefix, ep, experts, helpers, localRank, routeCapacity,
+        ctas, threads, spinCycles, validRouteCount);
     state->submitFused(flagMc, scheduler, routeEpoch, routeTarget);
 }
 
@@ -445,9 +443,8 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "__torch__.torch.classes.trtllm.MoeRebalanceTmaState state, int flag_mc, Tensor(a!) route_epoch, "
         "int route_target, Tensor routes, Tensor(b!) out_slots, Tensor(c!) out_ids, Tensor(d!) out_levels, "
         "Tensor(e!) out_owners, Tensor peer_bases, Tensor(f!) status, Tensor(g!) partial, Tensor(h!) route_aux, "
-        "Tensor(i!) grid_sync, Tensor(j!) plan_workspace, Tensor(k!) route_prefix, int plan_channel_ptr, int ep, "
-        "int experts, int helpers, int local_rank, int route_capacity, int ctas, int threads, bool enable_pdl, "
-        "int spin_cycles, int plan_abi_version, int plan_channel_words, int route_features, "
+        "Tensor(i!) grid_sync, Tensor(j!) plan_workspace, Tensor(k!) route_prefix, int ep, int experts, "
+        "int helpers, int local_rank, int route_capacity, int ctas, int threads, int spin_cycles, "
         "int valid_route_count) -> ()");
     m.def(
         "moe_rebalance_tma_current_gen("

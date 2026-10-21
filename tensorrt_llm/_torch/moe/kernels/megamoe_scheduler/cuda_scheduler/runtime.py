@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Host runtime for the pure-CUDA HALO-Q scheduler."""
+"""Host runtime for the HALO-Q scheduler, launched with its GPU-direct TMA copy as one kernel."""
 
 from __future__ import annotations
 
@@ -37,29 +37,6 @@ def spin_cycles_for_timeout(seconds: int | None) -> int:
 def _check_spin_cycles(spin_cycles: int) -> None:
     if type(spin_cycles) is not int or spin_cycles <= 0:
         raise ValueError("spin_cycles must be a positive exact int")
-
-def _plan_channel_word_count(*, abi_version: int, channel_words: int | None,
-                             route_features: int, ep: int, helpers: int) -> int:
-    """Validate an explicitly negotiated private publication allocation."""
-    if type(abi_version) is not int or type(route_features) is not int:
-        raise ValueError("plan channel ABI and features must be exact integers")
-    if abi_version != 6:
-        raise ValueError("CUDA scheduler requires PlanChannel ABI6")
-    if route_features not in (0, 1):
-        raise ValueError("plan channel route features must be 0 or 1")
-    if type(ep) is not int or not MIN_EP <= ep <= MAX_EP or ep % 2:
-        raise ValueError("plan channel requires even EP in [2,32]")
-    if type(helpers) is not int or helpers <= 0:
-        raise ValueError("helper count must be a positive exact int")
-    stride = (helpers + 3) // 4 * 4
-    expected = 4 + 7 * stride
-    if expected > 2**31 - 1:
-        raise ValueError("plan channel word count does not fit its int32 ABI")
-    if channel_words is None:
-        channel_words = expected
-    if type(channel_words) is not int or channel_words != expected:
-        raise ValueError("plan channel allocation does not match its explicit ABI")
-    return channel_words
 
 
 def recommend_cuda_scheduler_ctas(
@@ -111,7 +88,6 @@ class CudaSchedulerConfig:
     local_rank: int = 0
     threads: int = 512
     ctas: int | None = None
-    enable_pdl: bool = True
 
     def __post_init__(self) -> None:
         if self.ctas is None:
@@ -189,8 +165,6 @@ class CudaSchedulerConfig:
             raise ValueError("the pure-CUDA scheduler currently requires threads=512")
         if not 1 <= self.ctas <= MAX_CTAS:
             raise ValueError(f"ctas must be in [1,{MAX_CTAS}]")
-        if type(self.enable_pdl) is not bool:
-            raise ValueError("enable_pdl must be bool")
 
 
 class CudaSchedulerOutputs:
@@ -260,7 +234,12 @@ def _stream_handle(stream: object) -> int:
 
 
 class CudaPhysicalSlotScheduler:
-    """Preallocated pure-CUDA scheduler with no CuTe JIT executor."""
+    """Preallocated HALO-Q outputs and workspace for the fused scheduler + copy kernel.
+
+    The GPU-direct copy endpoint binds it once (``bind_gpu_direct``) and
+    launches it with the copy (``moe_rebalance_tma_submit_fused``), taking the
+    scheduler's arguments from ``fused_submit_args``.
+    """
 
     def __init__(self, config: CudaSchedulerConfig, device: str | torch.device = "cuda"):
         config.validate()
@@ -277,16 +256,9 @@ class CudaPhysicalSlotScheduler:
         self.device = scheduler_device
         self.outputs = CudaSchedulerOutputs(config, scheduler_device)
         self.out = self.outputs
-        self.logical_expert_ids = torch.full(
-            (config.max_tokens_per_rank, config.topk),
-            -1,
-            dtype=torch.int32,
-            device=scheduler_device,
-        )
         self.status = torch.zeros(8, dtype=torch.int32, device=scheduler_device)
-        # Everything the kernel takes between `routes` and `stream` is fixed for
-        # the endpoint's lifetime.  Cache it so a submission does not rebuild 13
-        # data_ptr() calls and ~11 config lookups every generation.
+        # Every scheduler argument after `routes` is fixed for the endpoint's
+        # lifetime, so a launch passes these cached tensors and config values.
         self.partial = torch.zeros(
             config.ctas * config.logical_expert_count,
             dtype=torch.int32,
@@ -335,51 +307,10 @@ class CudaPhysicalSlotScheduler:
             device=scheduler_device,
         )
         self._connected = config.ep_size == 1
-        self._plan_channel_lock = threading.Lock()
-        self._plan_channel_ptr = 0
-        self._plan_channel_abi_version = 0
-        self._plan_channel_words = 0
-        self._plan_channel_route_features = 0
-        self._plan_channel_bound = False
-        self._gpu_direct_bound = False
-        self._plan_channel_pending = False
-        self._plan_channel_stream_handle: int | None = None
-        self._plan_channel_torch_stream: torch.cuda.Stream | None = None
-        self._launch_stream_handle: int | None = None
-
-    def _staging_stream(self) -> torch.cuda.Stream:
-        current = torch.cuda.current_stream(self.device)
-        bound = self._plan_channel_torch_stream
-        if bound is not None and _stream_handle(current) != self._plan_channel_stream_handle:
-            bound.wait_stream(current)
-            return bound
-        return current
-
-    def stage(self, logical_expert_ids: torch.Tensor, *, validate_values: bool = False) -> None:
-        expected = (self.cfg.max_tokens_per_rank, self.cfg.topk)
-        if not isinstance(logical_expert_ids, torch.Tensor):
-            raise TypeError("logical_expert_ids must be a torch.Tensor")
-        if tuple(logical_expert_ids.shape) != expected:
-            raise ValueError(f"logical_expert_ids must have shape {expected}")
-        if logical_expert_ids.dtype != torch.int32 or not logical_expert_ids.is_contiguous():
-            raise ValueError("logical_expert_ids must be contiguous torch.int32")
-        if not logical_expert_ids.is_cuda or logical_expert_ids.device != self.device:
-            raise ValueError("logical_expert_ids must be on the scheduler CUDA device")
-        if validate_values:
-            invalid = (logical_expert_ids < -1) | (
-                logical_expert_ids >= self.cfg.logical_expert_count
-            )
-            if bool(invalid.any().item()):
-                raise ValueError("logical expert IDs must be -1 or in [0,E)")
-        with torch.cuda.device(self.device):
-            stream = self._staging_stream()
-            with torch.cuda.stream(stream):
-                # No status clear: the kernel writes the failing generation into
-                # each flag rather than a bare 1, so a stale flag is
-                # distinguishable from a fresh one and clearing is only needed to
-                # acknowledge a fault (`reset_status()`).
-                self.logical_expert_ids.copy_(logical_expert_ids)
-                logical_expert_ids.record_stream(stream)
+        self._lock = threading.Lock()
+        # The bound copy's static stream: every fused launch shares the
+        # workspace and reusable barrier epochs, so all of them use it.
+        self._bound_stream: int | None = None
 
     def connect_peer_bases(self, peer_bases: object) -> None:
         if self._connected:
@@ -396,134 +327,47 @@ class CudaPhysicalSlotScheduler:
         torch.cuda.synchronize(self.device)
         self._connected = True
 
-    def bind_plan_channel(
-        self,
-        device_ptr: int,
-        stream: object,
-        *,
-        abi_version: int,
-        channel_words: int | None = None,
-        route_features: int = 0,
-    ) -> None:
-        with self._plan_channel_lock:
-            words = _plan_channel_word_count(
-                abi_version=abi_version, channel_words=channel_words,
-                route_features=route_features, ep=self.cfg.ep_size,
-                helpers=self.cfg.extra_slots_per_rank,
-            )
-            if self._plan_channel_bound:
-                raise RuntimeError("plan channel binding is single-assignment")
-            if type(device_ptr) is not int or device_ptr <= 0 or device_ptr % 16:
-                raise ValueError("device_ptr must be a positive 16-byte aligned address")
-            handle = _stream_handle(stream)
-            with torch.cuda.device(self.device):
-                self._plan_channel_torch_stream = torch.cuda.ExternalStream(
-                    handle, device=self.device
-                )
-            self._plan_channel_ptr = device_ptr
-            self._plan_channel_abi_version = abi_version
-            self._plan_channel_words = words
-            self._plan_channel_route_features = route_features
-            self._plan_channel_stream_handle = handle
-            self._plan_channel_bound = True
-
     def bind_gpu_direct(self, stream: object) -> None:
-        """Bind a copy consumer to the existing outputs/workspace, without publication.
+        """Bind the GPU-direct copy that launches this scheduler with its copy.
 
-        The consumer launches this scheduler with its copy on this static
-        stream through ``fused_submit_args``. No additional plan allocation or
-        GPU/host transfer is performed.
+        The copy reads the outputs and plan workspace in place, in the same
+        kernel, and every fused launch uses this static stream. No additional
+        plan allocation or GPU/host transfer is performed.
         """
-        with self._plan_channel_lock:
-            if self._plan_channel_bound:
-                raise RuntimeError("plan channel binding is single-assignment")
-            handle = _stream_handle(stream)
-            if self._launch_stream_handle is not None and handle != self._launch_stream_handle:
-                raise RuntimeError("GPU-direct binding requires the existing static stream")
-            with torch.cuda.device(self.device):
-                self._plan_channel_torch_stream = torch.cuda.ExternalStream(handle, device=self.device)
-            self._plan_channel_ptr = 0
-            self._plan_channel_abi_version = 0
-            self._plan_channel_words = 0
-            self._plan_channel_route_features = 0
-            self._plan_channel_stream_handle = handle
-            self._plan_channel_bound = True
-            self._gpu_direct_bound = True
+        with self._lock:
+            if self._bound_stream is not None:
+                raise RuntimeError("GPU-direct binding is single-assignment")
+            if not self._connected:
+                raise RuntimeError("EP peer bases are not connected")
+            self._bound_stream = _stream_handle(stream)
 
-    def release_plan_channel(self) -> None:
-        """Allow another publication after its copy has been enqueued.
-
-        GPU-direct readers and scheduler writers use the same static stream,
-        so stream order protects the single plan allocation without a host
-        completion wait. This does not release the weight bank's consumer lease.
-        """
-        with self._plan_channel_lock:
-            if not self._plan_channel_bound or not self._plan_channel_pending:
-                raise RuntimeError("plan channel has no pending publication")
-            self._plan_channel_pending = False
-
-    def launch(
-        self, stream: object | None = None, *, spin_cycles: int = SPIN_CYCLES
-    ) -> CudaSchedulerOutputs:
-        _check_spin_cycles(spin_cycles)
-        if not self._connected:
-            raise RuntimeError("EP peer bases are not connected")
-        with self._plan_channel_lock:
-            if self._plan_channel_bound:
-                if self._plan_channel_pending:
-                    raise RuntimeError("plan publication is still pending")
-                handle = self._plan_channel_stream_handle
-                if stream is not None and _stream_handle(stream) != handle:
-                    raise RuntimeError("bound plan channel requires its static stream")
-            else:
-                handle = _stream_handle(
-                    torch.cuda.current_stream(self.device) if stream is None else stream
-                )
-            if self._launch_stream_handle is None:
-                self._launch_stream_handle = handle
-            elif handle != self._launch_stream_handle:
-                raise RuntimeError(
-                    "CUDA scheduler uses one static stream because its workspace "
-                    "and reusable barrier epochs are shared"
-                )
-            self._launch_op(
-                self.logical_expert_ids,
-                int(handle),
-                valid_route_count=self.cfg.route_count,
-                spin_cycles=spin_cycles,
-            )
-            if self._plan_channel_bound:
-                self._plan_channel_pending = True
-        return self.outputs
-
-    def _launch_op(
-        self,
-        routes: torch.Tensor,
-        stream_handle: int,
-        *,
-        valid_route_count: int,
-        spin_cycles: int,
-    ) -> None:
-        stream = self._plan_channel_torch_stream
-        if stream is None or _stream_handle(stream) != stream_handle:
-            stream = torch.cuda.ExternalStream(stream_handle, device=self.device)
-        state = enter_cuda_stream(stream)
-        try:
-            torch.ops.trtllm.moe_rebalance_halo_q(
-                *self._halo_q_args(
-                    routes,
-                    valid_route_count,
-                    enable_pdl=self.cfg.enable_pdl,
-                    spin_cycles=spin_cycles,
-                )
-            )
-        finally:
-            exit_cuda_stream(state)
-
-    def _halo_q_args(
-        self, routes: torch.Tensor, valid_route_count: int, *, enable_pdl: bool, spin_cycles: int
+    def fused_submit_args(
+        self, routes: torch.Tensor, stream_handle: int, *, spin_cycles: int
     ) -> tuple:
-        """Positional moe_rebalance_halo_q arguments, shared by the fused copy op."""
+        """Scheduler arguments of the bound copy's fused launch, ``routes``
+        through ``valid_route_count`` of moe_rebalance_tma_submit_fused.
+
+        ``routes`` is a caller-owned CUDA int32[T,K] tensor, read without input
+        staging. T may be zero and may differ across ranks, up to
+        max_tokens_per_rank. The kernel never reads outside those T rows and
+        writes -1 to the unused output tail. All ranks, including empty ranks,
+        must launch each generation in the same collective order.
+
+        The caller must order input production before the bound static stream
+        and keep routes alive and unmodified until the scheduler completes.
+        Metadata checks below do not launch GPU work or synchronize; invalid
+        expert values are reported by the kernel through check_status().
+        ``spin_cycles`` bounds this launch's cross-rank waits.
+        """
+        _check_spin_cycles(spin_cycles)
+        if self._bound_stream is None:
+            raise RuntimeError("a fused launch requires a bound GPU-direct copy")
+        if stream_handle != self._bound_stream:
+            raise RuntimeError(
+                "CUDA scheduler uses one static stream because its workspace "
+                "and reusable barrier epochs are shared"
+            )
+        valid_tokens = self._check_routes(routes)
         return (
             routes,
             self.outputs.physical_slot_ids,
@@ -537,7 +381,6 @@ class CudaPhysicalSlotScheduler:
             self.grid_sync,
             self.plan_workspace,
             self.route_prefix,
-            self._plan_channel_ptr,
             self.cfg.ep_size,
             self.cfg.logical_expert_count,
             self.cfg.extra_slots_per_rank,
@@ -545,99 +388,11 @@ class CudaPhysicalSlotScheduler:
             self.cfg.route_count,
             self.cfg.ctas,
             self.cfg.threads,
-            enable_pdl,
             spin_cycles,
-            self._plan_channel_abi_version,
-            self._plan_channel_words,
-            self._plan_channel_route_features,
-            valid_route_count,
+            valid_tokens * self.cfg.topk,
         )
 
-    def submit(
-        self, routes: torch.Tensor, stream_handle: int, *,
-        valid_tokens: int | None = None,
-        spin_cycles: int = SPIN_CYCLES,
-    ) -> CudaSchedulerOutputs:
-        """Read a caller-owned CUDA int32[T,K] tensor without input staging.
-
-        T may be zero and may differ across ranks, up to max_tokens_per_rank.
-        By default all T rows are valid; valid_tokens can select a shorter
-        prefix of an existing allocation. The kernel never reads outside that
-        prefix and writes -1 to the unused output tail. All ranks, including
-        empty ranks, must submit each generation in the same collective order.
-
-        The caller must order input production before this static stream and
-        keep routes alive and unmodified until the scheduler completes. This
-        includes allocator lifetime protection for temporary cross-stream
-        inputs. Metadata checks below do not launch GPU work or synchronize;
-        invalid expert values are reported by the kernel through check_status().
-
-        Graph capture fixes both the input pointer and valid_tokens. For replay
-        with changing pointers/lengths use eager submit; stage()+launch() remains
-        available for a fixed-capacity graph input buffer.
-        """
-        _check_spin_cycles(spin_cycles)
-        with self._plan_channel_lock:
-            if self._plan_channel_bound:
-                if self._plan_channel_pending:
-                    raise RuntimeError("plan publication is still pending")
-                if stream_handle != self._plan_channel_stream_handle:
-                    raise RuntimeError("bound plan channel requires its static stream")
-            if self._launch_stream_handle is None:
-                self._launch_stream_handle = stream_handle
-            elif stream_handle != self._launch_stream_handle:
-                raise RuntimeError(
-                    "CUDA scheduler uses one static stream because its workspace "
-                    "and reusable barrier epochs are shared"
-                )
-            self._submit_routes(
-                routes, stream_handle, valid_tokens=valid_tokens, spin_cycles=spin_cycles
-            )
-            if self._plan_channel_bound:
-                self._plan_channel_pending = True
-        return self.outputs
-
-    def fused_submit_args(
-        self, routes: torch.Tensor, stream_handle: int, *, spin_cycles: int
-    ) -> tuple:
-        """Scheduler arguments of the bound GPU-direct copy's fused launch.
-
-        The input and stream contract is ``submit()``'s. The copy endpoint
-        launches this scheduler together with its copy, so no plan publication
-        becomes pending and the launch triggers no programmatic dependency.
-        ``spin_cycles`` bounds this launch's cross-rank waits.
-        """
-        _check_spin_cycles(spin_cycles)
-        with self._plan_channel_lock:
-            if not self._gpu_direct_bound:
-                raise RuntimeError("a fused launch requires a bound GPU-direct copy")
-            if stream_handle != self._plan_channel_stream_handle:
-                raise RuntimeError("bound plan channel requires its static stream")
-            if self._launch_stream_handle is None:
-                self._launch_stream_handle = stream_handle
-            elif stream_handle != self._launch_stream_handle:
-                raise RuntimeError(
-                    "CUDA scheduler uses one static stream because its workspace "
-                    "and reusable barrier epochs are shared"
-                )
-            valid_tokens = self._check_routes(routes, None)
-            return self._halo_q_args(
-                routes, valid_tokens * self.cfg.topk, enable_pdl=False, spin_cycles=spin_cycles
-            )
-
-    def _submit_routes(
-        self, routes: torch.Tensor, stream_handle: int, *,
-        valid_tokens: int | None, spin_cycles: int,
-    ) -> None:
-        valid_tokens = self._check_routes(routes, valid_tokens)
-        self._launch_op(
-            routes,
-            stream_handle,
-            valid_route_count=valid_tokens * self.cfg.topk,
-            spin_cycles=spin_cycles,
-        )
-
-    def _check_routes(self, routes: torch.Tensor, valid_tokens: int | None) -> int:
+    def _check_routes(self, routes: torch.Tensor) -> int:
         if not isinstance(routes, torch.Tensor):
             raise TypeError("routes must be a torch.Tensor")
         if (routes.ndim != 2 or routes.shape[1] != self.cfg.topk
@@ -647,30 +402,7 @@ class CudaPhysicalSlotScheduler:
             raise ValueError("routes must be contiguous torch.int32")
         if not routes.is_cuda or routes.device != self.device:
             raise ValueError("routes must be on the scheduler CUDA device")
-        if valid_tokens is None:
-            valid_tokens = routes.shape[0]
-        if type(valid_tokens) is not int or not 0 <= valid_tokens <= routes.shape[0]:
-            raise ValueError("valid_tokens must be an int in [0,T]")
-        return valid_tokens
-
-    def run(
-        self,
-        logical_expert_ids: torch.Tensor,
-        stream: object | None = None,
-        *,
-        validate_values: bool = False,
-        spin_cycles: int = SPIN_CYCLES,
-    ) -> CudaSchedulerOutputs:
-        if stream is not None and not self._plan_channel_bound:
-            with torch.cuda.device(self.device):
-                external = torch.cuda.ExternalStream(
-                    _stream_handle(stream), device=self.device
-                )
-                with torch.cuda.stream(external):
-                    self.stage(logical_expert_ids, validate_values=validate_values)
-        else:
-            self.stage(logical_expert_ids, validate_values=validate_values)
-        return self.launch(stream, spin_cycles=spin_cycles)
+        return routes.shape[0]
 
     def check_status(self) -> None:
         """Raise if any generation faulted since the last `reset_status()`.

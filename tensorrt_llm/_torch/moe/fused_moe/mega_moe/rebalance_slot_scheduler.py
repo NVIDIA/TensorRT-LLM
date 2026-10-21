@@ -231,7 +231,7 @@ class RebalanceSlotSchedulerGroup:
         self._route_epoch_ptr = int(self._route_epoch.data_ptr())
         self._route_target = 0
 
-        # Every peer address must be connected before either warmup or submit;
+        # Every peer address must be connected before the first fused launch;
         # HALO-Q performs an all-rank exchange on the COPY stream.
         self.symmetric = FabricSymmetricBuffer(
             4 * symmetric_buffer_ints(ep_size, logical_expert_count), self.device
@@ -249,13 +249,10 @@ class RebalanceSlotSchedulerGroup:
             ]
         )
 
-        # Warm all ranks before binding the plan channel: a bound launch would
-        # leave a pending publication that must be consumed by the broadcaster.
-        # The scheduler input is already initialized and peer allocations synchronized.
-        # Loading the kernel can still skew the ranks, so this launch always
-        # waits for its peers as long as warmup does.
-        self.scheduler.launch(self.scheduler_stream, spin_cycles=spin_bound.warmup_cycles)
-        torch.cuda.synchronize(self.device)
+        # connect_peer_bases() synchronized this device, so its zeroed exchange
+        # buffer and peer mappings are complete. The barrier extends that to every
+        # rank before any rank binds its copy and can launch the fused kernel,
+        # whose HALO-Q exchange writes into its peers' buffers.
         ep_comm.barrier()
 
         # The provider must return the existing arena with identical bundle geometry.

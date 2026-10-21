@@ -27,15 +27,13 @@ TRTLLM_NAMESPACE_BEGIN
 namespace torch_ext
 {
 
-// Validates the moe_rebalance_halo_q arguments and returns its launch parameters.
-// The fused scheduler + in-switch copy op takes the same scheduler arguments.
+// Validates the HALO-Q scheduler arguments of moe_rebalance_tma_submit_fused and returns its launch parameters.
 kernels::MoeRebalanceHaloQParams makeMoeRebalanceHaloQParams(torch::Tensor const& routes, torch::Tensor& outSlots,
     torch::Tensor& outIds, torch::Tensor& outLevels, torch::Tensor& outOwners, torch::Tensor const& peerBases,
     torch::Tensor& status, torch::Tensor& partial, torch::Tensor& routeAux, torch::Tensor& gridSync,
-    torch::Tensor& planWorkspace, torch::Tensor& routePrefix, std::int64_t planChannelPtr, std::int64_t ep,
-    std::int64_t experts, std::int64_t helpers, std::int64_t localRank, std::int64_t routeCapacity, std::int64_t ctas,
-    std::int64_t threads, bool enablePdl, std::int64_t spinCycles, std::int64_t planAbiVersion,
-    std::int64_t planChannelWords, std::int64_t routeFeatures, std::int64_t validRouteCount);
+    torch::Tensor& planWorkspace, torch::Tensor& routePrefix, std::int64_t ep, std::int64_t experts,
+    std::int64_t helpers, std::int64_t localRank, std::int64_t routeCapacity, std::int64_t ctas, std::int64_t threads,
+    std::int64_t spinCycles, std::int64_t validRouteCount);
 
 } // namespace torch_ext
 
