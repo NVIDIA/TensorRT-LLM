@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 import asyncio
 import time
 
@@ -26,7 +28,6 @@ class TestRpcWorkerTP1:
         )
         # Create RpcWorker instance
         self.worker = RpcWorker(
-            engine=model_path,
             llm_args=self.llm_args,
             hf_model_dir=model_path,
         )

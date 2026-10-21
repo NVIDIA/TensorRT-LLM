@@ -7,11 +7,13 @@ import shlex
 import subprocess  # nosec B404
 import sys
 import threading
+import time
 from pathlib import Path
 from subprocess import PIPE, Popen
 from typing import Literal
 
 import pytest
+import zmq
 
 from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
 from tensorrt_llm.llmapi.mpi_session import (_DEFAULT_IDENTITY_TIMEOUT,
@@ -837,3 +839,177 @@ def test_server_close_is_a_noop_without_a_global_executor(
     MPINodeState._global_comm_executor = None
     # Must not touch MPI at all (no abort callable is even constructed).
     RemoteMpiCommSessionServer._close_global_comm_executor(grace=0.1)
+
+
+def _pair_client(addr: str, hmac_key: bytes):
+    from tensorrt_llm.executor.ipc import ZeroMqQueue
+    return ZeroMqQueue((addr, hmac_key),
+                       is_server=False,
+                       socket_type=zmq.PAIR,
+                       use_hmac_encryption=True)
+
+
+def _bare_server_on(addr: str, hmac_key: bytes):
+    """A RemoteMpiCommSessionServer with a real control socket and no MPI."""
+    from tensorrt_llm.executor.ipc import ZeroMqQueue
+    server = object.__new__(RemoteMpiCommSessionServer)
+    server.addr = addr
+    server.queue = ZeroMqQueue((addr, hmac_key),
+                               is_server=True,
+                               socket_type=zmq.PAIR,
+                               use_hmac_encryption=True)
+    return server
+
+
+@pytest.fixture
+def _spawn_proxy_ipc(monkeypatch, tmp_path: Path):
+    """The IPC address and HMAC key trtllm-llmapi-launch exports."""
+    from tensorrt_llm.executor import utils as executor_utils
+    addr = f"ipc://{tmp_path / 'server.sock'}"
+    hmac_key = os.urandom(32)
+    monkeypatch.setenv("TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR", addr)
+    monkeypatch.setattr(executor_utils, "_SPAWN_PROXY_PROCESS_IPC_HMAC_KEY",
+                        hmac_key)
+    return addr, hmac_key
+
+
+@pytest.mark.cpu_only
+def test_stop_request_reaches_server_still_waiting_for_workers(
+        _spawn_proxy_ipc, monkeypatch) -> None:
+    """The stop client must stop a server whose workers are still running.
+
+    This is ``trtllm-llmapi-launch``'s teardown: the engine (the PAIR client
+    that submitted the worker task) exits, then the stop client connects and
+    asks the server to shut down while the server is still waiting for the
+    task's worker futures. A PAIR socket only takes the new client once it has
+    processed the engine's disconnect, so a single request sent right away was
+    dropped and the server, and every follower rank, hung. The request must
+    also be acknowledged during the wait: the client gives up on an attempt
+    after ``ack_timeout`` and reconnects, so an acknowledgment sent after the
+    wait finds no peer and the client resends until it runs out of attempts.
+    """
+    from concurrent.futures import Future
+
+    from tensorrt_llm.llmapi import mpi_session
+    from tensorrt_llm.llmapi.mgmn_leader_node import stop_server_main
+    from tensorrt_llm.llmapi.mpi_session import RemoteTask
+
+    addr, hmac_key = _spawn_proxy_ipc
+    server = _bare_server_on(addr, hmac_key)
+    worker_future = Future()
+    stopped = threading.Event()
+
+    class _Session:
+        """The MPI session the server drives, with one worker."""
+        n_workers = 1
+
+        def submit(self, *args, **kwargs):
+            return [worker_future]
+
+        def shutdown_abort(self):
+            stopped.set()
+
+    server.session = _Session()
+    monkeypatch.setattr(mpi_session, "mpi_world_size", lambda: 1, raising=False)
+    monkeypatch.setattr(RemoteMpiCommSessionServer,
+                        "_close_global_comm_executor",
+                        staticmethod(lambda: None))
+    server_thread = threading.Thread(target=server.serve, daemon=True)
+    server_thread.start()
+    try:
+        engine = _pair_client(addr, hmac_key)
+        engine.put(RemoteTask(print, (), {}))
+        engine.close()
+        # The worker keeps running until the stop client has its answer.
+        assert stop_server_main(ack_timeout=0.5, max_attempts=20)
+        assert not stopped.is_set()
+        worker_future.set_result(None)
+        assert stopped.wait(10)
+    finally:
+        if not worker_future.done():
+            worker_future.set_result(None)
+        server_thread.join(10)
+        # Close the socket only once the thread using it has exited.
+        if not server_thread.is_alive():
+            server.queue.close()
+
+
+@pytest.mark.cpu_only
+def test_stop_request_reads_past_other_messages_to_the_ack(
+        _spawn_proxy_ipc) -> None:
+    """A worker message sent to the stop client must not hide the ack."""
+    from tensorrt_llm.llmapi.mgmn_leader_node import stop_server_main
+    from tensorrt_llm.llmapi.mpi_session import RemoteWorkerDeath
+
+    addr, hmac_key = _spawn_proxy_ipc
+    server = _bare_server_on(addr, hmac_key)
+    stopped = threading.Event()
+
+    def answer_stop_request():
+        # Bounded, so a missing request ends the thread instead of leaving it
+        # blocked on the socket.
+        if server.queue.poll(10) and server.queue.get() is None:
+            server.queue.put(
+                RemoteWorkerDeath.from_exception(RuntimeError("rank 1 failed")))
+            server.queue.put(RemoteMpiCommSessionServer.SHUTDOWN_ACK)
+            stopped.set()
+
+    server_thread = threading.Thread(target=answer_stop_request, daemon=True)
+    server_thread.start()
+    try:
+        # One attempt only: a client that read just the first message would
+        # miss the ack and give up.
+        assert stop_server_main(ack_timeout=5.0, max_attempts=1)
+        assert stopped.wait(10)
+    finally:
+        server_thread.join(15)
+        # Close the socket only once the thread using it has exited.
+        if not server_thread.is_alive():
+            server.queue.close()
+
+
+@pytest.mark.cpu_only
+def test_stop_request_gives_up_without_a_server(_spawn_proxy_ipc) -> None:
+    from tensorrt_llm.llmapi.mgmn_leader_node import stop_server_main
+
+    start = time.monotonic()
+    assert not stop_server_main(ack_timeout=0.1, max_attempts=3)
+    # Every attempt is dropped with linger 0, so nothing blocks the exit.
+    assert time.monotonic() - start < 5
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("acknowledged, exit_code", [(True, 0), (False, 1)])
+def test_stop_cli_exit_code_reports_the_ack(monkeypatch, acknowledged,
+                                            exit_code) -> None:
+    from click.testing import CliRunner
+
+    from tensorrt_llm.llmapi import mgmn_leader_node
+
+    monkeypatch.setattr(mgmn_leader_node, "stop_server_main",
+                        lambda: acknowledged)
+    result = CliRunner().invoke(mgmn_leader_node.main, ["--action", "stop"])
+    assert result.exit_code == exit_code
+
+
+@pytest.mark.cpu_only
+def test_server_wait_for_futures_logs_failures_and_returns_no_messages(
+        tmp_path: Path, monkeypatch) -> None:
+    from concurrent.futures import Future
+
+    from tensorrt_llm.llmapi import mpi_session
+
+    errors = []
+    monkeypatch.setattr(mpi_session.logger, "error",
+                        lambda *msg: errors.append(" ".join(map(str, msg))))
+    server = _bare_server_on(f"ipc://{tmp_path / 'server.sock'}",
+                             os.urandom(32))
+    try:
+        ok, failed = Future(), Future()
+        ok.set_result(1)
+        failed.set_exception(RuntimeError("rank 1 failed"))
+        assert server._wait_for_pending_futures([ok, failed]) == []
+        assert len(errors) == 1
+        assert "1/2" in errors[0] and "rank 1 failed" in errors[0]
+    finally:
+        server.queue.close()

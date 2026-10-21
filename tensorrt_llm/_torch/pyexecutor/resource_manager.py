@@ -757,6 +757,10 @@ class KVCacheManager(BaseResourceManager):
 
         self.enable_indexer_k_cache = enable_indexer_k_cache
 
+        cold_tier_offload_min_priority = (
+            kv_cache_config.secondary_offload_min_priority if isinstance(
+                kv_cache_config, tensorrt_llm.bindings.executor.KvCacheConfig)
+            else kv_cache_config.cold_tier_offload_min_priority)
         kwargs = {
             'num_kv_heads_per_layer': self.num_kv_heads_per_layer,
             'size_per_head': head_dim,
@@ -772,8 +776,7 @@ class KVCacheManager(BaseResourceManager):
             'chunk_size': min(max_num_tokens, self.max_seq_len),
             'enable_block_reuse': kv_cache_config.enable_block_reuse,
             'cache_type': kv_cache_type,
-            'secondary_offload_min_priority':
-            kv_cache_config.secondary_offload_min_priority,
+            'secondary_offload_min_priority': cold_tier_offload_min_priority,
             'enable_partial_reuse': kv_cache_config.enable_partial_reuse,
             'copy_on_partial_reuse': kv_cache_config.copy_on_partial_reuse,
             'kv_connector_manager': self.kv_connector_manager,
@@ -1402,7 +1405,6 @@ class KVCacheManager(BaseResourceManager):
         # extra tokens and draft tokens.
         token_nums: Optional[List[int]] = None,
         is_gen: bool = False,
-        prepare_resource: bool = True,
         max_num_draft_tokens: int = 0,
         # Override of py_draft_tokens length for KV reserve (e.g. dynamic-tree
         # draft loop). Falls back to max_num_draft_tokens when None.
@@ -1413,6 +1415,25 @@ class KVCacheManager(BaseResourceManager):
         draft_kv_cache_manager: Optional[BaseResourceManager] = None,
         capture_sampling_params: Optional[SamplingParams] = None,
     ):
+        """Create dummy requests and eagerly allocate their KV cache resources.
+
+        Register each request in the target cache and, when supplied, the draft
+        cache, including extra KV tokens.
+        ``token_nums`` specifies history plus input length, excluding draft
+        tokens. With ``is_gen=True``, requests enter generation state and reserve
+        draft KV capacity; ``kv_reserve_draft_tokens`` overrides that reserve
+        without changing the ``max_num_draft_tokens`` proposal length.
+
+        Returns:
+            Requests in ``request_ids`` order, or ``None`` if the target cache
+            has no free blocks at entry. Allocation exceptions trigger an
+            attempt to release all sequences registered by this call, then
+            propagate (a cleanup exception takes precedence if cleanup fails).
+
+        The caller must release each returned request with ``free_resources``
+        on this manager and the supplied draft manager when it is no longer
+        needed, including when subsequent warmup or graph capture fails.
+        """
         _kv_draft = kv_reserve_draft_tokens if kv_reserve_draft_tokens is not None else max_num_draft_tokens
         available_blocks = self.get_num_free_blocks()
         # No padding if not enough KV cache space
@@ -1464,13 +1485,12 @@ class KVCacheManager(BaseResourceManager):
                 encoder_output_len=encoder_output_len)
             req.is_dummy_request = True
             req.paged_kv_block_ids = []
-            if prepare_resource:
-                batch_request_infos.append((req_id, token_num, beam_width))
-                batch_llm_requests.append(req)
-                if draft_kv_cache_manager is not None:
-                    draft_batch_request_infos.append(
-                        (req_id, token_num, beam_width))
-                    draft_batch_llm_requests.append(req)
+            batch_request_infos.append((req_id, token_num, beam_width))
+            batch_llm_requests.append(req)
+            if draft_kv_cache_manager is not None:
+                draft_batch_request_infos.append(
+                    (req_id, token_num, beam_width))
+                draft_batch_llm_requests.append(req)
 
             if use_mrope:
                 _populate_dummy_mrope_config(req, token_num, is_gen)
@@ -1521,13 +1541,12 @@ class KVCacheManager(BaseResourceManager):
                             req.total_input_len_cp = token_num * self.mapping.cp_size - 1
                             req.py_decoding_iter = 1
                     req.py_draft_tokens = [1] * max_num_draft_tokens
-                    if prepare_resource:
+                    for _ in range(_kv_draft):
+                        self.impl.add_token(req.request_id)
+                    if draft_kv_cache_manager is not None:
                         for _ in range(_kv_draft):
-                            self.impl.add_token(req.request_id)
-                        if draft_kv_cache_manager is not None:
-                            for _ in range(_kv_draft):
-                                draft_kv_cache_manager.impl.add_token(
-                                    req.request_id)
+                            draft_kv_cache_manager.impl.add_token(
+                                req.request_id)
         except Exception:
             # A partial allocation failure (e.g. add_token raising "no free
             # blocks left" after add_sequence_batch succeeded) must not leak
@@ -3194,10 +3213,13 @@ class ResourceManager:
         scheduled_batch: ScheduledRequests,
         attn_metadata: Optional["AttentionMetadata"] = None,
         kv_cache_dtype_byte_size: Optional[float] = None,
+        skip_kv_cache_manager: bool = False,
     ):
         for resource_type, resource_manager in self.resource_managers.items():
             if hasattr(resource_manager, "update_resources"):
                 if resource_type == ResourceManagerType.KV_CACHE_MANAGER:
+                    if skip_kv_cache_manager:
+                        continue
                     resource_manager.update_resources(scheduled_batch,
                                                       attn_metadata,
                                                       kv_cache_dtype_byte_size)
