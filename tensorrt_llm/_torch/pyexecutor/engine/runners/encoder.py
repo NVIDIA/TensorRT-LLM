@@ -340,7 +340,7 @@ class EncoderMixin:
         *,
         cache_indirection: torch.Tensor | None = None,
         enable_context_mla_with_cached_kv: bool | None = None,
-        num_heads_per_kv: int | None = None,
+        max_num_heads_per_kv: int | None = None,
     ) -> AttentionMetadata:
         metadata = build_attention_metadata(
             self._model.model_config,
@@ -353,7 +353,7 @@ class EncoderMixin:
             cache_indirection=cache_indirection,
             kv_cache_manager=None,
             enable_context_mla_with_cached_kv=enable_context_mla_with_cached_kv,
-            num_heads_per_kv=num_heads_per_kv,
+            max_num_heads_per_kv=max_num_heads_per_kv,
         )
         metadata.block_ids_per_seq = None
         metadata.kv_block_ids_per_seq = None
