@@ -245,6 +245,12 @@ class _LogicalOutcomes:
     def cancel(self, by_peer: bool) -> None:
         self._end(_LogicalOutcome(SessionStatus.CANCELLED, by_peer=by_peer))
 
+    @property
+    def failed(self) -> bool:
+        """Whether the first terminal decision was a failure; a later cancel does not change it."""
+        with self._lock:
+            return self._terminal is not None and self._terminal.status is SessionStatus.ERROR
+
     def _end(self, outcome: _LogicalOutcome) -> None:
         with self._lock:
             if self._terminal is not None:
@@ -3651,7 +3657,7 @@ class RxSession(RxSessionBase):
 
         cancel_request() must return False while this is True.
         """
-        return not self.resources_drained()
+        return not self.resources_drained() or self.failed_receive_awaits_writers()
 
     # A failed receive waits at most this many transfer timeouts for its remaining writers.
     _WRITER_WAIT_TIMEOUT_MULTIPLIER = 2
@@ -3666,9 +3672,12 @@ class RxSession(RxSessionBase):
         which comes before ``_WRITER_WAIT_TIMEOUT_MULTIPLIER`` transfer timeouts. A writer
         still silent then is presumed gone (e.g. its process died), and the receive is let go
         rather than pinning its pages and slot on a worker that may never act on its own
-        receive timeout. A cancelled receive is not held. Polled from the executor thread.
+        receive timeout. The hold covers cancellation too: a client abort or a timeout that
+        cancels the receive after it failed must not free it early either (``cancel_request``
+        refuses while ``has_transferring_tasks``). A receive cancelled before it failed is
+        not held. Polled from the executor thread.
         """
-        if self._enforce_physical_ownership or self.status != SessionStatus.ERROR:
+        if self._enforce_physical_ownership or not self._logical_outcomes.failed:
             return False
         if self._writer_wait_expired:
             return False

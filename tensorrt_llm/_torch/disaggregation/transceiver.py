@@ -1198,7 +1198,8 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             session = self._recv_sessions[rid]
             result = session.wait_complete(blocking=block_all)
             if session.status == SessionStatus.CANCELLED:
-                if self._ownership_blocks_retirement(session):
+                # A cancel after a failure must not free pages a writer is still writing.
+                if self._retirement_blocked(session):
                     continue
                 # Session cancelled — either by local cancel_request() (user
                 # cancel) or by a remote CANCEL_SESSION message (e.g. CTX

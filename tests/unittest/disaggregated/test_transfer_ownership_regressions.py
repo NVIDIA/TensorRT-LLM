@@ -1874,13 +1874,19 @@ def _two_writer_receive_failed_by_one(rid: int, timeout_s: float | None = None):
     (reply,) = [call.args[0] for call in dealer.send.call_args_list]
     receiver._process_kv_agent_result(b"ctx", reply)
 
-    request = SimpleNamespace(request_id=rid)
+    request = SimpleNamespace(
+        request_id=rid,
+        py_request_id=rid,
+        py_disaggregated_params=DisaggregatedParams(disagg_request_id=rid),
+    )
     transceiver = object.__new__(KvCacheTransceiverV2)
     transceiver._ever_had_recv_session = True
     transceiver._gen_need_sync = False
     transceiver._mapping = SimpleNamespace(pp_size=1, enable_attention_dp=False, world_size=1)
     transceiver._dist = SimpleNamespace(rank=0)
     transceiver._gen_allgather = Mock()
+    transceiver._wait_reqs = {}
+    transceiver._send_sessions = {}
     transceiver._recv_sessions = {rid: session}
     transceiver._recv_reqs = {rid: request}
     assert session.status == SessionStatus.ERROR
@@ -1888,7 +1894,7 @@ def _two_writer_receive_failed_by_one(rid: int, timeout_s: float | None = None):
 
 
 @pytest.mark.cpu_only
-@pytest.mark.parametrize("sibling", ["succeeds", "fails", "cancels"])
+@pytest.mark.parametrize("sibling", ["succeeds", "fails"])
 def test_failed_receive_is_kept_until_every_writer_has_reported(
     sibling: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1896,8 +1902,7 @@ def test_failed_receive_is_kept_until_every_writer_has_reported(
 
     Two context ranks write this receive. Rank 3 answers FAILED for its cleared
     session while rank 4 is still writing, so the receive stays open, on every
-    poll path, until rank 4 has reported, whatever it reports. A CANCEL_SESSION
-    from rank 4 ends the wait as before.
+    poll path, until rank 4 has reported, whatever it reports.
     """
     monkeypatch.setattr(transfer_mod.tensorrt_llm.bindings, "global_steady_clock_now", lambda: 0)
     rid = 115
@@ -1911,17 +1916,53 @@ def test_failed_receive_is_kept_until_every_writer_has_reported(
     assert rid in receiver._sessions
     assert not hasattr(request, "state")
 
-    if sibling == "cancels":
-        receiver._handle_cancel_session([MessageType.CANCEL_SESSION, str(rid).encode("ascii")])
-        assert transceiver.check_gen_transfer_status(None) == ([], [], [request])
+    result = AgentResult.SUCCESS if sibling == "succeeds" else AgentResult.FAILED
+    receiver._process_kv_agent_result(
+        b"ctx", transfer_mod._make_kv_result_msg(4, rid, 0, True, result)
+    )
+    assert not session.failed_receive_awaits_writers()
+    assert transceiver.check_gen_transfer_status(None) == ([], [rid], [])
+    assert request.state == LlmRequestState.DISAGG_TRANS_ERROR
+    assert rid not in receiver._sessions
+    assert transceiver._recv_sessions == {}
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("canceller", ["local", "peer"])
+def test_cancel_does_not_free_a_failed_receive_before_its_writers_stop(
+    canceller: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A cancel after one writer's FAILED keeps the hold until the other writer stops.
+
+    A client abort or a generation-side timeout (``cancel_request``), or a
+    peer's CANCEL_SESSION, overrides the failure; it must not free pages rank 4
+    is still writing. Before the FAILED reply existed, such a receive stayed
+    TRANSFERRING and ``cancel_request`` refused to free it; it still does.
+    """
+    monkeypatch.setattr(transfer_mod.tensorrt_llm.bindings, "global_steady_clock_now", lambda: 0)
+    rid = 118
+    receiver, session, transceiver, request = _two_writer_receive_failed_by_one(rid)
+
+    if canceller == "local":
+        assert transceiver.cancel_request(request) is False
     else:
-        result = AgentResult.SUCCESS if sibling == "succeeds" else AgentResult.FAILED
-        receiver._process_kv_agent_result(
-            b"ctx", transfer_mod._make_kv_result_msg(4, rid, 0, True, result)
-        )
-        assert not session.failed_receive_awaits_writers()
-        assert transceiver.check_gen_transfer_status(None) == ([], [rid], [])
-        assert request.state == LlmRequestState.DISAGG_TRANS_ERROR
+        receiver._handle_cancel_session([MessageType.CANCEL_SESSION, str(rid).encode("ascii")])
+    assert session.status == SessionStatus.CANCELLED
+    assert session.failed_receive_awaits_writers()
+    assert session.has_transferring_tasks()
+    for at_least in (0, None):
+        assert transceiver.check_gen_transfer_status(at_least) == ([], [], [])
+    assert transceiver._recv_sessions == {rid: session}
+    assert rid in receiver._sessions
+
+    receiver._process_kv_agent_result(
+        b"ctx", transfer_mod._make_kv_result_msg(4, rid, 0, True, AgentResult.SUCCESS)
+    )
+    assert not session.has_transferring_tasks()
+    if canceller == "local":
+        assert transceiver.cancel_request(request) is True
+    else:
+        assert transceiver.check_gen_transfer_status(None) == ([], [], [request])
     assert rid not in receiver._sessions
     assert transceiver._recv_sessions == {}
 
