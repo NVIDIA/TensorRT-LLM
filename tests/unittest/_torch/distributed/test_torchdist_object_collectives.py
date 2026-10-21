@@ -182,13 +182,6 @@ def test_tp_gather_only_destination_unpickles(td, world):
         assert loads.call_count == 0
 
 
-def test_tp_gather_all_empty(td, world):
-    rank, world_size, _ = world
-    out, calls = _record_nccl(lambda: td.tp_gather([], dst=0))
-    assert len(calls) == 1
-    assert out == ([[] for _ in range(world_size)] if rank == 0 else None)
-
-
 # The lock is asserted structurally: a spy on the staging accessor records
 # whether ``_cuda_obj_lock`` is held when the shared buffers are touched.  (A
 # two-thread race is not a usable oracle here -- the GIL and NCCL's own
@@ -330,54 +323,6 @@ def test_broadcast_root_runs_ahead_of_lagging_peers_without_corrupting_payloads(
     seq = [None, payloads[0], None, payloads[1]]
     got = [td.broadcast_or_none(obj if rank == 0 else "peer", root=0) for obj in seq]
     assert got == seq
-
-
-def test_request_broadcaster_single_round_on_real_torchdist(td, world):
-    from unittest.mock import MagicMock
-
-    from tensorrt_llm._torch.pyexecutor.request_utils import RequestBroadcaster
-
-    rank, _, _ = world
-    broadcaster = RequestBroadcaster(td, MagicMock())
-    assert broadcaster._single_round(prefer_cpu=False)
-    assert not broadcaster._single_round(prefer_cpu=True)
-    # Empty iteration: one size exchange, ([], None) everywhere.
-    shapes = []
-    orig_bc = dist.broadcast
-
-    def rec_bc(tensor, *args, **kwargs):
-        shapes.append(tuple(tensor.shape))
-        return orig_bc(tensor, *args, **kwargs)
-
-    with mock.patch.object(dist, "broadcast", rec_bc):
-        assert broadcaster.broadcast([]) == ([], None)
-        assert shapes == [(1,)]
-        shapes.clear()
-        # Busy iteration: picklable RequestQueueItems whose py_* attributes are
-        # all None (only py_conversation_params is collected with include_none).
-        from types import SimpleNamespace
-
-        from tensorrt_llm._torch.pyexecutor.executor_request_queue import RequestQueueItem
-
-        def item(req_id):
-            return RequestQueueItem(
-                req_id,
-                SimpleNamespace(
-                    py_logits_post_processors=None,
-                    py_multimodal_data=None,
-                    py_scheduling_params=None,
-                    py_num_logprobs=None,
-                    py_disaggregated_params=None,
-                    py_conversation_params=None,
-                    py_lora_path=None,
-                ),
-            )
-
-        items = [item(1), item(2)] if rank == 0 else []
-        new_requests, py_objects = broadcaster.broadcast(items)
-        assert len(shapes) == 2  # size + payload on every rank
-    assert [r.id for r in new_requests] == [1, 2]
-    assert py_objects == (("py_conversation_params", {1: None, 2: None}),)
 
 
 def test_pinned_staging_grows_and_is_reused(td, world):

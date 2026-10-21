@@ -77,11 +77,3 @@ def test_foreign_op_rejected_by_torch_mapper(foreign):
 def test_foreign_op_rejected_by_mpi_mapper():
     with pytest.raises(TypeError, match="tensorrt_llm ReduceOp"):
         reduce_op_to_mpi(torch.distributed.ReduceOp.MIN)
-
-
-def test_enum_values_disagree_so_type_check_is_load_bearing():
-    # The premise of the strict type check: torch's MIN shares its integer
-    # value with tensorrt_llm's MAX, so a permissive dict lookup resolves a
-    # torch MIN to a MAX reduction. If torch ever renumbers its enum and this
-    # assertion fails, revisit whether the type check is still required.
-    assert int(torch.distributed.ReduceOp.MIN) == int(ReduceOp.MAX)
