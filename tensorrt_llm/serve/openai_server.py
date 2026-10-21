@@ -17,13 +17,15 @@ import time
 import traceback
 import uuid
 from collections import deque
+from collections.abc import Awaitable, Callable
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from datetime import datetime
 from http import HTTPStatus
 from pathlib import Path
 from typing import (TYPE_CHECKING, Annotated, Any, AsyncGenerator,
-                    AsyncIterator, Dict, List, Optional, Tuple, Union)
+                    AsyncIterator, Dict, List, Literal, Optional, Tuple,
+                    TypeVar, Union)
 
 import msgspec
 import uvicorn
@@ -575,6 +577,9 @@ def resolve_spec_decode_num_spec_tokens(args: Any) -> Optional[int]:
     if spec_config is None or getattr(spec_config, "draft_len_schedule", None):
         return None
     return getattr(spec_config, "max_draft_len", None)
+
+
+_InputProcessingResult = TypeVar("_InputProcessingResult")
 
 
 class OpenAIServer(_VideoRoutesMixin):
@@ -2065,6 +2070,44 @@ class OpenAIServer(_VideoRoutesMixin):
         if self._iteration_stats_buffer is not None:
             self._iteration_stats_buffer.append(llm_stat)
 
+    async def _time_input_stage(
+        self,
+        stage: Literal["media_load", "chat_template"],
+        task: Awaitable[_InputProcessingResult],
+    ) -> _InputProcessingResult:
+        """Measure async stage wall time, including IO and worker waits."""
+        collector = self.metrics_collector
+        if collector is None:
+            return await task
+        started = time.perf_counter()
+        try:
+            return await task
+        finally:
+            collector.log_input_processing(stage, time.perf_counter() - started)
+
+    async def _run_input_processor(
+        self,
+        process: Callable[[], _InputProcessingResult],
+    ) -> _InputProcessingResult:
+        """Run preprocessing with separate thread queue and execution times."""
+        loop = asyncio.get_running_loop()
+        collector = self.metrics_collector
+        if collector is None:
+            return await loop.run_in_executor(self._input_proc_executor,
+                                              process)
+        queued = time.perf_counter()
+
+        def run() -> _InputProcessingResult:
+            started = time.perf_counter()
+            try:
+                return process()
+            finally:
+                collector.log_input_processing("processor",
+                                               time.perf_counter() - started,
+                                               started - queued)
+
+        return await loop.run_in_executor(self._input_proc_executor, run)
+
     async def openai_chat(self, request: ChatCompletionRequest,
                           raw_request: Request) -> Response:
 
@@ -2356,6 +2399,10 @@ class OpenAIServer(_VideoRoutesMixin):
                     resolve_media=resolve_media,
                 )
 
+            if resolve_media and mm_item_order:
+                mm_coroutines = self._time_input_stage("media_load",
+                                                       mm_coroutines)
+
             # Decode base64 int32 prompt_token_ids relayed by the orchestrator.
             if request.prompt_token_ids is None and request.prompt_token_ids_b64:
                 import numpy as np
@@ -2384,7 +2431,8 @@ class OpenAIServer(_VideoRoutesMixin):
                     forced_prefix=forced_tool_begin_prefix,
                 )
                 rendered, (mm_data, mm_embeddings) = await asyncio.gather(
-                    render_task, mm_coroutines)
+                    self._time_input_stage("chat_template", render_task),
+                    mm_coroutines)
                 if rendered.text is None:
                     prompt = rendered.token_ids
                 else:
@@ -2480,9 +2528,7 @@ class OpenAIServer(_VideoRoutesMixin):
             generate_inputs = prompt
             preprocess_fn = getattr(self.generator, "preprocess", None)
             if preprocess_fn is not None:
-                loop = asyncio.get_event_loop()
-                generate_inputs = await loop.run_in_executor(
-                    self._input_proc_executor,
+                generate_inputs = await self._run_input_processor(
                     functools.partial(preprocess_fn, prompt, sampling_params,
                                       disaggregated_params))
 
@@ -2906,6 +2952,10 @@ class OpenAIServer(_VideoRoutesMixin):
                     request_media_io_kwargs=request.media_io_kwargs,
                 )
 
+            if mm_item_order:
+                mm_coroutines = self._time_input_stage("media_load",
+                                                       mm_coroutines)
+
             if request.prompt_token_ids is not None:
                 prompt = request.prompt_token_ids
             else:
@@ -2922,7 +2972,8 @@ class OpenAIServer(_VideoRoutesMixin):
                     injected_chat_template_kwargs,
                 )
                 rendered, (mm_data, mm_embeddings) = await asyncio.gather(
-                    render_task, mm_coroutines)
+                    self._time_input_stage("chat_template", render_task),
+                    mm_coroutines)
                 prompt = (rendered.text
                           if rendered.text is not None else rendered.token_ids)
             prompt = prompt_inputs(prompt)
@@ -3116,9 +3167,7 @@ class OpenAIServer(_VideoRoutesMixin):
 
                 prompt = prompt_inputs(prompt)
                 if prompt.get("prompt") is not None:
-                    loop = asyncio.get_event_loop()
-                    prompt_token_ids, extra_processed_inputs = await loop.run_in_executor(
-                        self._input_proc_executor,
+                    prompt_token_ids, extra_processed_inputs = await self._run_input_processor(
                         functools.partial(self.generator.input_processor,
                                           prompt, sampling_params))
                     tokens_prompt = TokensPrompt(

@@ -17,7 +17,7 @@
 import math
 import time
 from functools import partial
-from typing import TYPE_CHECKING, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Dict, List, Literal, Optional, Union
 
 if TYPE_CHECKING:
     from prometheus_client import CollectorRegistry
@@ -33,6 +33,26 @@ from .enums import MetricNames
 # now grow with max_draft_len so per-request accuracy is not truncated, which
 # makes the metrics-side limit its own explicit concern.
 MAX_SPEC_DECODE_POSITION_LABELS = 16
+
+_PROCESSING_TIME_BUCKETS = (
+    0.0001,
+    0.00025,
+    0.0005,
+    0.001,
+    0.0025,
+    0.005,
+    0.01,
+    0.025,
+    0.05,
+    0.1,
+    0.25,
+    0.5,
+    1.0,
+    2.5,
+    5.0,
+    10.0,
+    30.0,
+)
 
 
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.10.0rc1/vllm/engine/metrics.py#L30
@@ -66,6 +86,8 @@ class MetricsCollector:
             trtllm_prefill_perplexity
             trtllm_generation_perplexity
             trtllm_request_error_total
+            trtllm_input_processing_seconds
+            trtllm_input_processing_queue_seconds
 
         Iteration-level metrics:
             trtllm_kv_cache_hit_rate
@@ -111,6 +133,7 @@ class MetricsCollector:
             trtllm_spec_decode_draft_overhead
             trtllm_prefill_batch_occupancy
             trtllm_prefill_batch_tokens
+            trtllm_multimodal_encoder_gpu_time_seconds
 
         Config info metrics (logged once at startup via log_config_info):
             trtllm_model_config_info
@@ -565,6 +588,29 @@ class MetricsCollector:
             buckets=[64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768],
             labelnames=self.labels.keys())
 
+        self.histogram_input_processing = Histogram(
+            name=self.metric_prefix + "input_processing_seconds",
+            documentation=(
+                "Server input processing wall time per stage. Media loading "
+                "and chat template stages can overlap and include async waits; "
+                "processor time excludes its thread-pool queue wait. Includes "
+                "failed attempts. Stages must not be added to obtain TTFT."),
+            buckets=_PROCESSING_TIME_BUCKETS,
+            labelnames=[*self.labels, "stage"])
+        self.histogram_input_processing_queue = Histogram(
+            name=self.metric_prefix + "input_processing_queue_seconds",
+            documentation="Time waiting for a server input-processor thread.",
+            buckets=_PROCESSING_TIME_BUCKETS,
+            labelnames=self.labels.keys())
+        self.histogram_multimodal_encoder_gpu_time = Histogram(
+            name=self.metric_prefix + "multimodal_encoder_gpu_time_seconds",
+            documentation=
+            ("Rank-0 GPU elapsed time per completed multimodal encoder "
+             "call through MultimodalModelMixin. Excludes pre-encoder H2D, cache-only "
+             "lookups and warmup. Batched work is not per-request latency."),
+            buckets=_PROCESSING_TIME_BUCKETS,
+            labelnames=self.labels.keys())
+
         # HTTP error counter
         self.labelname_http_code = "http_code"
         self.labels_with_http_code = {
@@ -898,6 +944,19 @@ class MetricsCollector:
 
             self.last_log_time = time.time()
 
+    def log_input_processing(
+        self,
+        stage: Literal["media_load", "chat_template", "processor"],
+        duration_seconds: float,
+        queue_seconds: float | None = None,
+    ) -> None:
+        """Observe an input stage; processor execution excludes queue time."""
+        self.histogram_input_processing.labels(
+            **self.labels, stage=stage).observe(duration_seconds)
+        if queue_seconds is not None:
+            self._log_histogram(self.histogram_input_processing_queue,
+                                queue_seconds)
+
     def log_iteration_stats(self, iteration_stats: dict) -> None:
         """Log iteration-level statistics from TRTLLM engine.
 
@@ -915,6 +974,11 @@ class MetricsCollector:
             - Needs `enable_iter_perf_stats: true` in LLM args to collect iteration-level stats.
             - inflightBatchingStats and specDecodingStats are only present when applicable.
         """
+        for elapsed_ms in (iteration_stats.get("multimodalEncoderStats")
+                           or {}).get("gpuTimesMS", ()):
+            self._log_histogram(self.histogram_multimodal_encoder_gpu_time,
+                                elapsed_ms / 1000.0)
+
         # Top-level queue & load metrics
         if "numActiveRequests" in iteration_stats:
             self._log_gauge(self.num_requests_running,
