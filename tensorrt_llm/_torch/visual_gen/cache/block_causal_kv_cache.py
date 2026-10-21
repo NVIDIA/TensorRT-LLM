@@ -288,6 +288,8 @@ class BlockCausalKVCacheManager(KVCacheManagerV2):
       and the TRTLLM attention op call it a block (``tokens_per_block``,
       ``kv_cache_block_offsets``).
     - page table: the cache's map from logical pages to pool pages, ``page_table()``.
+    - rollout: one generated video, from ``open`` to ``close``: the fixed region and every
+      chunk generated after it, one chunk at a time. One instance holds one open rollout.
     - chunk: the frames one forward processes. Their tokens are the staged tokens.
     - causal block: a run of staged tokens with full attention among themselves,
       causal to earlier causal blocks and to the cache. One request in the TRTLLM
