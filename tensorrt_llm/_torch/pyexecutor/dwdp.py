@@ -21,11 +21,11 @@ This module owns three concerns and delegates the rest:
     a TCPStore rendezvous for independently launched workers
   * Layer index registration (SSOT: ``add_layer`` → ``_registered_layers``)
     plus runtime entry points that forward to ``DWDPWeightManager``
-    (``prefetch_first_layers``, ``wait_and_bind``,
-    ``record_compute_and_prefetch_next``)
+    (``start_forward``, ``wait_and_bind``,
+    ``finish_layer``, ``invalidate_prefetch``)
 
 The heavy lifting — MNNVL handle allocation, composite VA layout,
-double-buffer scheduling — lives in ``tensorrt_llm._torch.modules.dwdp``
+prefetch scheduling — lives in ``tensorrt_llm._torch.modules.dwdp``
 and is wired up by ``setup_dwdp()`` during ``setup(model)``.
 """
 
@@ -76,8 +76,8 @@ class DwdpManager:
     passes that list to ``setup_dwdp()`` so ``collect_moe_params`` never has
     to re-discover layers by walking the model tree.
 
-    After ``setup()`` returns, the runtime methods (``prefetch_first_layers``,
-    ``wait_and_bind``, ``record_compute_and_prefetch_next``) forward to the
+    After ``setup()`` returns, the runtime methods (``start_forward``,
+    ``wait_and_bind``, ``finish_layer``) forward to the
     ``DWDPWeightManager`` instance produced by ``setup_dwdp``.
     """
 
@@ -291,15 +291,15 @@ class DwdpManager:
     # Runtime entry points (forwarded to DWDPWeightManager)
     # ------------------------------------------------------------------
 
-    def prefetch_first_layers(self) -> None:
-        """Warm-up: kick off prefetch for the first MoE layers (double-buffer depth)."""
+    def start_forward(self) -> None:
+        """Start a forward pass: prefetch its first MoE layers.
+
+        Enqueues nothing when the previous forward pass already prefetched
+        them (its last MoE layers gather the first layers of the next pass).
+        """
         if self._weight_manager is None:
             raise RuntimeError("DwdpManager.setup() has not been called yet")
-        first = self._weight_manager.first_moe_layer()
-        self._weight_manager.prefetch_layer(first)
-        second = self._weight_manager.next_moe_layer(first)
-        if second is not None:
-            self._weight_manager.prefetch_layer(second)
+        self._weight_manager.start_forward()
 
     def wait_and_bind(self, backend_module: nn.Module, layer_idx: int) -> None:
         """Wait for prefetch and bind full-tensor views onto backend weights."""
@@ -307,20 +307,21 @@ class DwdpManager:
             raise RuntimeError("DwdpManager.setup() has not been called yet")
         self._weight_manager.wait_and_bind(backend_module, layer_idx)
 
-    def record_compute_and_prefetch_next(self, layer_idx: int) -> None:
-        """Record compute and maintain the two-layer prefetch window.
+    def finish_layer(self, layer_idx: int) -> None:
+        """Release the layer's buffer slot and prefetch the layers it unblocks.
 
-        ``prefetch_first_layers`` warms the first two MoE layers. After each
-        layer's kernel has been enqueued, record consumption of its current
-        buffer slot and prefetch the layer two positions ahead. This avoids
-        duplicate prefetch of the second layer and prevents reuse of a slot
-        before the current kernel has finished reading it.
+        Called after the layer's MoE kernel has been enqueued, so the slot's
+        consume event covers that kernel.
         """
         if self._weight_manager is None:
             raise RuntimeError("DwdpManager.setup() has not been called yet")
-        self._weight_manager.record_compute(layer_idx)
-        next_idx = self._weight_manager.next_moe_layer(layer_idx)
-        if next_idx is not None:
-            next_next_idx = self._weight_manager.next_moe_layer(next_idx)
-            if next_next_idx is not None:
-                self._weight_manager.prefetch_layer(next_next_idx)
+        self._weight_manager.finish_layer(layer_idx)
+
+    def invalidate_prefetch(self) -> None:
+        """Drop the prefetches issued ahead of the next forward pass.
+
+        Call after the expert weights may have changed (e.g. a weight update);
+        the next forward pass gathers its first layers again.
+        """
+        if self._weight_manager is not None:
+            self._weight_manager.invalidate_prefetch()
