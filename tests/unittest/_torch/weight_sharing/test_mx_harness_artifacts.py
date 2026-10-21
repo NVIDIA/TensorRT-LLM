@@ -232,6 +232,7 @@ def test_manifest_roles_must_include_both_mx_roles(tmp_path: Path) -> None:
 
 
 def _image_probe_case() -> MxE2ECase:
+    """Return a unit-test row that requests the image probe."""
     return MxE2ECase(
         model_env="TRTLLM_MX_UNIT_MODEL",
         default_model_subdir="tiny",

@@ -1018,6 +1018,7 @@ class _UnregisteredMultimodalModel(_TinyMultimodalModel):
 def _tiny_multimodal_profile(
     root_model_class: type[nn.Module],
 ) -> PostTransformProfile:
+    """Return a complete-model test profile for `root_model_class`."""
     return PostTransformProfile(
         profile_id=f"{root_model_class.__name__}-complete-v1",
         root_model_class=root_model_class,

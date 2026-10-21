@@ -601,6 +601,7 @@ def test_qwen3_5_vl_source_identity_binds_runtime_max_num_tokens(tmp_path: Path)
 
 
 def _qualify_registry(**overrides: object):
+    """Qualify the registered Qwen3.5 identity directly, with `overrides` applied."""
     arguments = {
         "root_model_class": modeling_qwen3_5_mod.Qwen3_5VLModel,
         "architecture": "Qwen3_5ForConditionalGeneration",
