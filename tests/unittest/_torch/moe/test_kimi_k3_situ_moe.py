@@ -1670,7 +1670,7 @@ def test_materialize_handles_scalar_lazy_safetensors(tmp_path):
     import safetensors.torch
     from safetensors import safe_open
 
-    from tensorrt_llm._torch.models.modeling_kimi_linear import _materialize
+    from tensorrt_llm._torch.models.modeling_kimi_k3_loader import _materialize
 
     scalar = torch.tensor(0.00012207, dtype=torch.float32)
     matrix = torch.arange(6, dtype=torch.float32).reshape(2, 3)
@@ -2291,7 +2291,7 @@ def test_fp8_block_scaled_dequantization():
     loader's shape check passed and src.to(param.dtype) reinterpreted the
     quantized values as real ones, silently dropping the scale.
     """
-    from tensorrt_llm._torch.models.modeling_kimi_linear import _dequantize_fp8_block_scaled
+    from tensorrt_llm._torch.models.modeling_kimi_k3_loader import _dequantize_fp8_block_scaled
 
     n, k = 256, 384
     torch.manual_seed(3)
