@@ -34,28 +34,16 @@ class FusedSigmoidMulInplace(OpWrapper):
 
     CELLS: tuple[Cell, ...] = (
         Cell(
-            why="decode: 1 token, 24x256 gate as the strided half of q_proj (MTP)",
-            spec=dict(tokens=1, **_CKPT),
-        ),
-        Cell(
-            why="prefill 2048 tokens, strided q_proj half: >= 1024 rows picks 2048-wide blocks",
-            spec=dict(tokens=2048, **_CKPT),
-        ),
-        Cell(
-            why="decode 1 token: 2-D gate, the gate columns of the fused projection row",
-            spec=dict(tokens=1, heads=24, head_dim=256, dtype=torch.bfloat16, gate="fused_row"),
-        ),
-        Cell(
             why="decode 128 tokens: 2-D gate off the fused projection row (stride 14080)",
             spec=dict(tokens=128, heads=24, head_dim=256, dtype=torch.bfloat16, gate="fused_row"),
         ),
         Cell(
-            why="prefill 8192 tokens: 2-D gate off the fused projection row",
+            why="prefill 8192 tokens: 2-D gate off the fused projection row, 2048-wide blocks",
             spec=dict(tokens=8192, heads=24, head_dim=256, dtype=torch.bfloat16, gate="fused_row"),
         ),
         Cell(
-            why="0 tokens: returns without launching",
-            spec=dict(tokens=0, **_CKPT),
+            why="MTP decode: 1 token, 24x256 gate as the strided half of q_proj",
+            spec=dict(tokens=1, **_CKPT),
         ),
     )
 
@@ -68,8 +56,8 @@ class FusedSigmoidMulInplace(OpWrapper):
     (an AssertionError with no message): `attention_output` 2-D with
     `stride(-1) == 1` (row stride free); `gate` 2-D of `attention_output`'s
     shape, or 3-D with `shape[0] == T` and `shape[1] * shape[2] == hidden`,
-    `stride(-1) == 1`. A CPU tensor raises ValueError from Triton. Hence no
-    `is_valid`. Cross-device operands were not probed.
+    `stride(-1) == 1`. A CPU tensor raises ValueError from Triton (measured).
+    Hence no `is_valid`. Cross-device operands were not probed.
 
     The pre-call contents of `attention_output` are destroyed; the gate is
     left bitwise unchanged.
@@ -77,20 +65,21 @@ class FusedSigmoidMulInplace(OpWrapper):
     Numerics: bf16 bitwise equal to the fp32 reference except ~1e-6 of
     elements one ulp off (`tl.sigmoid`'s fast exp); default tolerance holds,
     nothing loosened. Feeding the q half instead of the gate half moves the
-    result by ~2.15 max abs at [17, 6144], so the per-head indexing is under
-    test.
+    result by ~2.15 max abs at [17, 6144] (measured), so the per-head indexing
+    is under test.
 
     Certified: bf16 operands at the checkpoint's hidden 6144, a compact
-    `attention_output`, and the target's two gate layouts (the strided q_proj
-    half and the 2-D window of the fused projection row).
+    `attention_output`; the 2-D window of the fused projection row at 128
+    tokens (decode, 1024-wide blocks) and 8192 tokens (prefill, 2048-wide
+    blocks), and the strided q_proj half (MTP) at 1 token.
 
     Hard limits
       T * row stride  token offset computed in int64  boundary 2^63  not probed
       (largest run 8192 rows)
 
-    Not certified: a strided `attention_output`, a gate dtype other than
-    `attention_output.dtype`, fp16/fp32 operands, other hidden sizes,
-    CUDA-graph capture, torch.compile.
+    Not certified: 0 tokens, the strided q_proj half above 1 token, a strided
+    `attention_output`, a gate dtype other than `attention_output.dtype`,
+    fp16/fp32 operands, other hidden sizes, CUDA-graph capture, torch.compile.
     """
 
     def __call__(self, attention_output: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:

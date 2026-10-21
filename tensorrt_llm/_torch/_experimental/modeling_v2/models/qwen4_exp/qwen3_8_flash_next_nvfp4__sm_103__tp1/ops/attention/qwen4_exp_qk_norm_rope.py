@@ -975,6 +975,8 @@ class Qwen4ExpQkNormRope(OpWrapper):
 
     ARCHS = frozenset({Arch.SM_103})
 
+    # Four cells, one per compiled launch the forward reaches: the Triton kernel's 1-, 2-
+    # and 8-head launches (by decode batch size) and the CuTe kernel (prefill).
     CELLS: tuple[Cell, ...] = (
         Cell(
             why="decode M=1: one token on the 1-head/2-warp launch, three distinct mRoPE rows",
@@ -985,14 +987,10 @@ class Qwen4ExpQkNormRope(OpWrapper):
             spec=dict(tokens=17, **CKPT),
         ),
         Cell(
-            why="decode M=65: first on the 8-head launch (last main program half masked)",
-            spec=dict(tokens=65, **CKPT),
-        ),  # fmt: skip
-        Cell(
-            why="decode M=128: max concurrency, positions up to the table end (262144 rows)",
+            why="decode M=128: max concurrency, 8-head launch (last main program half masked), "
+            "positions up to the table end (262144 rows)",
             spec=dict(tokens=128, max_position=262144, **CKPT),
         ),
-        Cell(why="prefill 1024 tokens: first on the CuTe kernel", spec=dict(tokens=1024, **CKPT)),
         Cell(why="prefill 16384 tokens: max_num_tokens", spec=dict(tokens=16384, **CKPT)),
     )
 
@@ -1015,12 +1013,12 @@ class Qwen4ExpQkNormRope(OpWrapper):
     bounded by load latency at three CTAs an SM).
 
     Numerics: fp32 throughout, one rounding at the store; the CuTe kernel is bitwise
-    the Triton kernel's eight-head launch (the test checks it at 1024-16384 tokens,
-    signed zeros included), so the cells' bands cover both. Against the fp64
+    the Triton kernel's eight-head launch (measured at 1024-16384 tokens, signed zeros
+    included; not pinned by a test). Against the fp64
     reference over the same table every cell is within one output rounding
     step (measured max 1.48 ulp of the row scale, relative RMS <= 0.011 ulp).
-    Against the CUDA pair it replaces, <= 1.41 ulp of the row scale and 0.09
-    ulp RMS (that op derives cos/sin with `__sincosf`, whose phase error grows
+    Against the CUDA pair it replaces (measured, not pinned by a test), <= 1.41
+    ulp of the row scale and 0.09 ulp RMS (that op derives cos/sin with `__sincosf`, whose phase error grows
     with position). Three agreeing position rows select the same table row for
     every pair, so a text batch is exactly the plain rope on row 0.
 
@@ -1032,7 +1030,11 @@ class Qwen4ExpQkNormRope(OpWrapper):
 
     Hard limits: token offsets in int64; positions index the table in int64.
 
-    Not certified: fp16/fp32 activations, `rotary_dim` > either head width,
+    CUDA graphs: the Triton kernel captured at M=4 replays bitwise an eager call on
+    inputs rewritten in place.
+
+    Not certified: non-zero index-plane mRoPE sections (the target passes (0, 0)),
+    capture of the CuTe kernel, `T == 0`, fp16/fp32 activations, `rotary_dim` > either head width,
     non-power-of-two head widths or head counts (tl.arange), YaRN, non-Gemma
     norm, a k plane on the index side (its scratch slot is not written).
     """

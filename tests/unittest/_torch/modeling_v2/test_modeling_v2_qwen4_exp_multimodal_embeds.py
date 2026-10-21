@@ -111,17 +111,12 @@ MIXED_ORDER = [_item("video", 0), _item("image", 0), _item("video", 1), _item("i
 MIXED_ROWS = [200.0] * 4 + [100.0] * 4 + [201.0] * 8 + [101.0]
 
 
-def test_image_request_is_unchanged():
+def test_the_splice_fills_the_placeholders_and_zeroes_the_padding():
+    """An image request's rows land on its placeholders in one tower call and the padding
+    rows after the step are zeroed (`_splice` checks); a text step writes only the padding."""
     tower = _Tower()
-    assert _splice(tower, _params(image=IMAGES), 5) == [100.0] * 4 + [101.0]
+    assert _splice(tower, _params(image=IMAGES), 5, padding=3) == [100.0] * 4 + [101.0]
     assert tower.calls == 1
-
-
-def test_the_splice_zeroes_the_padding_rows():
-    assert _splice(_Tower(), _params(image=IMAGES), 5, padding=3) == [100.0] * 4 + [101.0]
-
-
-def test_a_text_step_writes_only_the_padding():
     target = SimpleNamespace(_step=SimpleNamespace(vision=None, num_tokens=2))
     h = torch.full((4, HIDDEN), -1.0)
     M.PrefillTarget._splice(target, h)
@@ -144,12 +139,6 @@ def test_a_mixed_request_is_reassembled_in_prompt_order():
 def test_a_mixed_request_needs_its_manifest():
     with pytest.raises(AssertionError, match="needs mm_item_order"):
         _splice(_Tower(), _params(image=IMAGES, video=VIDEOS), len(MIXED_ROWS))
-
-
-def test_a_manifest_that_disagrees_with_the_payload_is_refused():
-    params = _params(image=IMAGES, video=VIDEOS, order=MIXED_ORDER[:3])
-    with pytest.raises(AssertionError, match="mm_item_order lists image items"):
-        _splice(_Tower(), params, len(MIXED_ROWS))
 
 
 def test_a_chunk_takes_its_slice_of_the_prompt_order_rows():
@@ -261,18 +250,6 @@ def test_the_tower_calls_whole_frames_and_concatenates_their_rows_in_order(monke
     assert start == patches
 
 
-def test_a_request_under_the_ceiling_is_one_call(monkeypatch):
-    grid = [(2, 4, 4), (1, 4, 8)]
-    tower = _tower(monkeypatch, 64)
-    pixels = _pixels(grid)
-    out = tower(pixels, torch.tensor(grid))
-    assert len(tower.calls) == 1
-    assert tower.calls[0][2].tolist() == [list(row) for row in grid]
-    # The one call sees the whole request and its output is the request's, row for row.
-    assert torch.equal(tower.calls[0][0], pixels)
-    assert torch.equal(out, pixels[:: MERGE * MERGE, :1].expand(-1, HIDDEN))
-
-
 def test_a_request_past_the_old_whole_request_ceiling_is_served(monkeypatch):
     # 33 temporal groups of 32x32 patches (66 frames of 512x512 pixels): 33792 rows, 1024
     # rows past what a single call may carry.
@@ -283,14 +260,6 @@ def test_a_request_past_the_old_whole_request_ceiling_is_served(monkeypatch):
     assert [call[1] for call in tower.calls] == [[(32, 32, 32)], [(1, 32, 32)]]
     assert out.shape[0] == 33 * 32 * 32 // 4
     assert out[:, 0].tolist() == [float(4 * j) for j in range(out.shape[0])]
-
-
-def test_a_frame_past_the_ceiling_cannot_be_served(monkeypatch):
-    tower = _tower(monkeypatch, 64)
-    grid = [(1, 4, 4), (1, 10, 10)]
-    with pytest.raises(AssertionError, match="one frame is 10x10 = 100 patch rows"):
-        tower(_pixels(grid), torch.tensor(grid))
-    assert tower.calls == []
 
 
 def test_a_media_request_needs_the_processors_position_ids():

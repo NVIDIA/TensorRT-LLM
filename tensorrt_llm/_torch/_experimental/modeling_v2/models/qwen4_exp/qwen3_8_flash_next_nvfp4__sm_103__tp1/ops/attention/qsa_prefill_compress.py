@@ -15,7 +15,8 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell
 from tensorrt_llm._torch.attention.backends.sparse.qsa import kernels as _qsa_kernels
 
 #: The mRoPE sections the checkpoint declares; the target passes `None` today
-#: (`_QSA_MROPE_SECTION`) and these are certified for when it flips.
+#: (`_QSA_MROPE_SECTION`) and these are certified, on the NVFP4 trunk-plane cell,
+#: for when it flips.
 MROPE_SECTION = (11, 11, 10)
 
 #: This checkpoint's index geometry and the engine's QSA metadata: index head
@@ -31,12 +32,8 @@ _CKPT = dict(
     mrope_section=None,
     logical_dtype=torch.int64,
     request_dtype=torch.int32,
-    distinct_axes=True,
     layout="plain",
-    duplicate=False,
 )
-
-_DECODE = ((4095, 1), (4096, 1), (4097, 1), (4098, 1), (4099, 1), (8191, 1), (3, 1), (2047, 1))
 
 #: 32 requests of one MTP7 verify block each (8 rows, two completed groups), at starts that put
 #: some blocks across a page edge and some inside one.
@@ -48,8 +45,8 @@ def _spec(segments, pages, **overrides) -> dict:
     return {**_CKPT, "segments": segments, "pages": pages, **overrides}
 
 
-def _old(segments, pages, **overrides) -> dict:
-    """The old receipt's scenes: prefill from 0 under mRoPE (11, 11, 10)."""
+def _mrope(segments, pages, **overrides) -> dict:
+    """Prefill from 0 under mRoPE (11, 11, 10)."""
     return _spec(segments, pages, mrope_section=MROPE_SECTION, **overrides)
 
 
@@ -87,18 +84,9 @@ class QsaPrefillCompress(OpWrapper):
     ARCHS = frozenset({Arch.SM_103})
 
     CELLS: tuple[Cell, ...] = (
-        # First on purpose: the process's first, JIT-compiling call.
-        Cell(
-            why="prefill 2 x 128 from 0, mRoPE, distinct t/h/w: cold call",
-            spec=_old(((0, 128),) * 2, pages=8),
-        ),
         Cell(
             why="prefill 2 x 128 from 0, mrope_section None: the target's call",
             spec=_spec(((0, 128),) * 2, pages=8),
-        ),
-        Cell(
-            why="decode: 8 rows to 8191, anchors and non-anchors, None",
-            spec=_spec(_DECODE, pages=1024),
         ),
         Cell(
             why="decode MTP7: 32 requests x 8 rows, two anchors each, None",
@@ -106,15 +94,10 @@ class QsaPrefillCompress(OpWrapper):
         ),
         # Under an NVFP4 KV pool the position page shares each physical page with the index
         # pages, so both caches are strided views of one allocation: index page stride
-        # 12 x 4096 + 192 = 49344 on the trunk (4288 on the draft), position strides
-        # (24672, 3, 1) (2144, 3, 1).
+        # 12 x 4096 + 192 = 49344 on the trunk, position strides (24672, 3, 1).
         Cell(
             why="NVFP4 trunk planes: 12 index roles and the position page share each page",
-            spec=_old(((0, 64),) * 2, pages=4, layout="shared_page", roles=12),
-        ),
-        Cell(
-            why="NVFP4 draft planes: one index role and the position page share each page",
-            spec=_old(((0, 64),) * 2, pages=4, layout="shared_page", roles=1),
+            spec=_mrope(((0, 64),) * 2, pages=4, layout="shared_page", roles=12),
         ),
     )
 
@@ -138,7 +121,7 @@ class QsaPrefillCompress(OpWrapper):
         dim of `cos_sin` are read with an assumed unit stride while the
         callable checks only shape: each was measured accepted and wrong
         (max abs 4.72, 6.20, 0.80, 7.16). `is_valid` refuses them.
-    The callable rejects loudly: metadata shape/dtype mismatches, a non-int32
+    The callable rejects loudly (not pinned by a test): metadata shape/dtype mismatches, a non-int32
     or non-2-D table, more than one index head, a position plane with fewer
     than 3 axes or not int32, a non-bf16 cache, page sizes that disagree with
     `tokens_per_block`, a malformed cos|sin table, `4 R != D`, a non-2^k `D`
@@ -148,14 +131,15 @@ class QsaPrefillCompress(OpWrapper):
 
     `cos_sin`'s dtype is the rotation's precision: bf16 is accepted and was
     measured 1.4% of elements off by up to 1.56e-2 -- not certified. Text
-    rows reduce mRoPE to plain RoPE bit for bit. Plain `@triton.jit`, no
+    rows reduce mRoPE to plain RoPE bit for bit (measured, not pinned by a
+    test). Plain `@triton.jit`, no
     autotune; CUDA-graph capturable at a fixed row count (captured at 256
     rows, 32 MTP7 verify blocks).
 
     Under an NVFP4 KV pool both caches are strided views of one per-slot
     allocation (each physical page holds the index roles, then the position
-    page); the cells check the other index roles and the position page
-    untouched.
+    page); the trunk-plane cell checks the other index roles and the position
+    page untouched.
 
     The kernel's `tl.rsqrt` is the hardware approximation, an fp32 ulp from the
     reference's: every cell is bitwise the reference but the 32-block MTP7 one, where
@@ -163,11 +147,12 @@ class QsaPrefillCompress(OpWrapper):
 
     Hard limits (read from the kernel, not probed): positions, requests and
     page ids are widened to int64 before any address arithmetic, so no int32
-    boundary inside the call. Certified extent: positions to 8191 through a
-    [32, 260] table over 1024 pages.
+    boundary inside the call. Certified extent: positions to 1928 through a
+    [40, 260] table over 1100 pages.
 
     Not certified: `compress_ratio` other than 4, `D` other than 128, a bf16
-    or fp16 `cos_sin`, positions past the table's rows, multiple devices,
+    or fp16 `cos_sin`, positions past 1928 or the table's rows, mRoPE outside
+    the NVFP4 trunk-plane cell, the NVFP4 draft planes (one index role a page), multiple devices,
     `tokens_per_block` other than 32 (no group straddles a page), eps other
     than 1e-6, int32 positions or int64 request indices, a strided view of the
     index cache, position plane or table other than the NVFP4 pool's shared

@@ -28,15 +28,6 @@ NUM_GRID = 48
 HIDDEN = 1152
 MERGE = 2
 
-#: Grids the processor produces: the smallest, the exact-fit grid, the
-#: non-square serving grid and the largest one call carries (32768 patches).
-CHECKPOINT_GRIDS = (
-    ((1, 2, 2),),
-    ((1, 48, 48),),
-    ((1, 62, 90),),
-    ((1, 128, 256),),
-)
-
 
 def _merge_order(x: torch.Tensor, height: int, width: int, merge: int) -> torch.Tensor:
     """`[h, w, ...]` raster -> `[h*w, ...]` in (h_block, w_block, row, col) order."""
@@ -67,15 +58,7 @@ class PosEmbedInterpolate(OpWrapper):
     ARCHS = frozenset({Arch.SM_103})
 
     # spec: grid (tuple of (t, h, w)), merge, dtype, rows (table rows), hidden.
-    CELLS: tuple[Cell, ...] = tuple(
-        Cell(
-            why=f"checkpoint table bf16, grid {list(map(list, grid))}",
-            spec=dict(
-                grid=grid, merge=MERGE, dtype=torch.bfloat16, rows=NUM_GRID**2, hidden=HIDDEN
-            ),
-        )
-        for grid in CHECKPOINT_GRIDS
-    ) + (
+    CELLS: tuple[Cell, ...] = (
         Cell(
             why="a 4-image batch incl. the 62x90 serving grid",
             spec=dict(
@@ -90,6 +73,17 @@ class PosEmbedInterpolate(OpWrapper):
             why="video: 3 frames repeat one 6x10 frame",
             spec=dict(
                 grid=((3, 6, 10),),
+                merge=MERGE,
+                dtype=torch.bfloat16,
+                rows=NUM_GRID**2,
+                hidden=HIDDEN,
+            ),
+        ),
+        # The largest grid one call carries (32768 patches).
+        Cell(
+            why="checkpoint table bf16, grid [[1, 128, 256]]",
+            spec=dict(
+                grid=((1, 128, 256),),
                 merge=MERGE,
                 dtype=torch.bfloat16,
                 rows=NUM_GRID**2,
@@ -116,8 +110,11 @@ class PosEmbedInterpolate(OpWrapper):
     at capture. Cost is ~225 us of launch-bound index construction per image,
     flat in token count; the gather is the only part that scales.
 
-    Not certified: a CPU table (it runs and returns on CPU); fp16 and fp32
-    tables; a `spatial_merge_size` other than the checkpoint's 2.
+    Certified at the checkpoint's bf16 table on a 4-image batch (4x8, a 2x6x4
+    video, the 48x48 exact fit and the 62x90 serving grid), a 3-frame 6x10
+    video and the 128x256 grid one call carries at most. Not certified: a CPU
+    table (it runs and returns on CPU); fp16 and fp32 tables; a
+    `spatial_merge_size` other than the checkpoint's 2.
     """
 
     def __call__(

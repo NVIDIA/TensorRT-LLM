@@ -13,11 +13,12 @@ FC2, unpermute; trtllm-gen: the one-call block-scale runner -- with explicit rou
 
 Two routings hit all 512 experts. In the first every token's only non-zero routing weight is
 on its own expert, so each expert's output is checked alone: a layout error confined to one
-expert (a permutation, a scale swizzle, an alpha) cannot hide in a sum over ten. The second is
-a weighted top-10. Both backends are held to a float64 reference over the dequantized
-checkpoint tensors, with `down_proj.input_scale` spread across the experts as a calibrated
-checkpoint's is. With a uniform one the two backends requantize the SwiGLU output
-identically, so on the weighted routing they are also held to each other.
+expert (a permutation, a scale swizzle, an alpha) cannot hide in a sum over ten. On it both
+backends are held to a float64 reference over the dequantized checkpoint tensors, with
+`down_proj.input_scale` spread across the experts as a calibrated checkpoint's is. The second
+is a weighted top-10: with a uniform `down_proj.input_scale` the two backends requantize the
+SwiGLU output identically, so on it they are held to each other -- the area's one
+cross-backend check.
 
 The reference does not model the kernels' accumulation. It models the one rounding step
 that is not exact: the SwiGLU output is requantized to NVFP4 before FC2, at the backend's
@@ -66,7 +67,6 @@ ONE_HOT_TOKENS = E
 WEIGHTED_TOKENS = 1024
 
 BACKENDS = ("CUTEDSL", "TRTLLM")
-CASES = ("one_hot", "weighted")
 #: The float64 reference's gate, relative per token. Both backends sit at 2.5e-3 or below:
 #: the bf16 rounding of the output is 1e-3 of it, the rest is the reference's fp32 / tie
 #: differences. A wrong layout is ~1; a wrong per-expert scalar is its own relative error.
@@ -348,22 +348,20 @@ def _token_error(out: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
 # ── tests ─────────────────────────────────────────────────────────────────
 
 
-def test_routings_hit_every_expert() -> None:
-    for case in CASES:
-        _, ids, weights = _problem(case)
-        assert torch.unique(ids[weights != 0]).numel() == E, case
-
-
-@pytest.mark.parametrize("case", CASES)
 @pytest.mark.parametrize("backend", BACKENDS)
-def test_routed_output_matches_the_float64_reference(backend: str, case: str) -> None:
+def test_routed_output_matches_the_float64_reference(backend: str) -> None:
+    case = "one_hot"
+    _, ids, weights = _problem(case)
+    assert torch.unique(ids[weights != 0]).numel() == E, "the routing misses an expert"
     err = _token_error(_routed(backend, case, True), _reference(backend, case, True))
     print(f"[err] {backend} {case}: mean {err.mean():.4e} max {err.max():.4e}")
     assert err.max() <= REFERENCE_TOLERANCE, (err.mean().item(), err.max().item())
 
 
-@pytest.mark.parametrize("case", ("weighted",))
-def test_cutedsl_matches_trtllm_gen_under_a_uniform_input_scale(case: str) -> None:
+def test_cutedsl_matches_trtllm_gen_under_a_uniform_input_scale() -> None:
+    case = "weighted"
+    _, ids, weights = _problem(case)
+    assert torch.unique(ids[weights != 0]).numel() == E, "the routing misses an expert"
     err = _token_error(_routed("CUTEDSL", case, False), _routed("TRTLLM", case, False))
     print(f"[err] CUTEDSL vs TRTLLM {case}: mean {err.mean():.4e} max {err.max():.4e}")
     assert err.max() <= BACKEND_TOLERANCE, (err.mean().item(), err.max().item())

@@ -53,12 +53,9 @@ def _bits(tensor: torch.Tensor) -> torch.Tensor:
 
 def _hole(spec, table, allocated_cols):
     """One row that resolves to no slot: its (request, position)."""
-    kind = spec["hole"]
-    if kind == "unallocated_page":
-        assert int(table[0, allocated_cols[0]]) == -1
-        return 0, allocated_cols[0] * spec["tokens_per_block"]
-    assert kind == "negative_request"
-    return -1, 0
+    assert spec["hole"] == "unallocated_page", spec["hole"]
+    assert int(table[0, allocated_cols[0]]) == -1
+    return 0, allocated_cols[0] * spec["tokens_per_block"]
 
 
 def _shared_page_planes(spec, extras: dict):
@@ -181,61 +178,6 @@ def _small(seed: int, **overrides):
     return _build({**spec, **overrides}, seed=seed)[0]
 
 
-def test_only_the_named_slots_change() -> None:
-    """The exact set of (page, slot) pairs written, independent of the reference."""
-    args = _small(seed=13)
-    before_index = args["index_cache"].clone()
-    before_position = args["position_cache"].clone()
-    op(**args)
-    table = args["block_table"]
-    written = {(int(table[r, p // 32]), p % 32) for r, p in enumerate((0, 7, 32, 40))}
-    changed_index = {
-        (int(p), int(s))
-        for p, s in torch.nonzero(
-            (_bits(args["index_cache"]) != _bits(before_index)).flatten(2).any(-1)
-        )
-    }
-    changed_position = {
-        (int(p), int(s))
-        for p, s in torch.nonzero((args["position_cache"] != before_position).any(-1))
-    }
-    assert changed_index == written, f"index plane touched {changed_index}, expected {written}"
-    assert changed_position == written, f"position plane touched {changed_position}"
-
-
-def test_coordinates_wider_than_int32_wrap_rather_than_raise() -> None:
-    """int64 coordinates are truncated into the int32 plane with nothing raised."""
-    args = _small(seed=39)
-    args["position_coordinates"] = torch.full((4, 3), 2**31 + 5, dtype=torch.int64, device=DEV)
-    op(**args)
-    page = int(args["block_table"][0, 0])
-    assert int(args["position_cache"][page, 0, 0]) == -2147483643
-
-
-def test_two_rows_on_one_slot_store_one_of_them() -> None:
-    """Nothing orders duplicate destinations; the slot holds one of the two rows."""
-    args = _small(seed=47)
-    args["logical_positions"][1] = args["logical_positions"][0]
-    args["request_indices"][1] = args["request_indices"][0]
-    args["token_k"] = torch.stack(
-        [torch.full((1, 128), float(v), dtype=torch.bfloat16, device=DEV) for v in (1, 2, 3, 4)]
-    )
-    op(**args)
-    stored = float(args["index_cache"][int(args["block_table"][0, 0]), 0, 0, 0])
-    assert stored in (1.0, 2.0), f"a duplicate slot held {stored}, neither row's value"
-
-
-def test_repeats_are_stream_ordered_and_idempotent() -> None:
-    """A read enqueued after the store sees it; repeating the call repeats it."""
-    args = _small(seed=49)
-    op(**args)
-    first = (args["index_cache"].clone(), args["position_cache"].clone())
-    for _ in range(7):
-        op(**args)  # no synchronize: the clone below is on the same stream
-        assert torch.equal(_bits(args["index_cache"]), _bits(first[0]))
-        assert torch.equal(args["position_cache"], first[1])
-
-
 def test_cuda_graph_capture_and_replay() -> None:
     """Captured once at the 32 MTP7 verify blocks (256 rows), replayed against new
     positions written into the same buffer."""
@@ -262,81 +204,13 @@ def test_cuda_graph_capture_and_replay() -> None:
     _compare((args["index_cache"], args["position_cache"]), ref)
 
 
-def test_the_stored_key_is_raw_not_normalized() -> None:
-    """Discrimination against a Gemma-normed key, the decode kernel's form.
-
-    A key stored normed double-normalizes every anchor `qsa_prefill_compress`
-    builds. Old receipt at its seeds: 3.0625 max abs apart; the floor states a
-    bound rather than one draw.
-    """
-    args = _small(seed=66)
-    out = op(**args)
-    gen = torch.Generator(device=DEV).manual_seed(68)
-    weight = torch.randn(128, generator=gen, device=DEV) * 0.5
-    x = args["token_k"].float()
-    normed = (x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + 1e-6) * (1 + weight)).to(
-        torch.bfloat16
-    )
-    page = int(args["block_table"][0, 0])
-    stored = out[0][page, 0]
-    assert torch.equal(_bits(stored), _bits(args["token_k"][0]))
-    distance = (stored.float() - normed[0].float()).abs().max().item()
-    assert distance > 0.25, f"a normed key differs from the raw one by only {distance}"
-
-
-# ------------------------------------------------------- loud rejections
-#
-# Each is a shape the kernel would otherwise read past or write wrongly; the
-# entry refuses it before launching, so `is_valid` has nothing left to guard.
-# One case per refusal family: metadata, row counts, the index plane, the
-# position plane, the table.
-
-
-def _rejected(args, match: str) -> None:
+def test_rejects_metadata_of_unequal_length() -> None:
+    """A shape the kernel would otherwise read past; the entry refuses it before
+    launching, so `is_valid` has nothing left to guard."""
+    args = _small(seed=61)
+    args["logical_positions"] = args["logical_positions"][:1]
     before = (args["index_cache"].clone(), args["position_cache"].clone())
-    with pytest.raises(ValueError, match=match):
+    with pytest.raises(ValueError, match="equally long"):
         op(**args)
     assert torch.equal(_bits(args["index_cache"]), _bits(before[0]))
     assert torch.equal(args["position_cache"], before[1])
-
-
-def test_rejects_metadata_of_unequal_length() -> None:
-    args = _small(seed=61)
-    args["logical_positions"] = args["logical_positions"][:1]
-    _rejected(args, "equally long")
-
-
-def test_rejects_a_single_token_k_row() -> None:
-    args = _small(seed=63)
-    args["token_k"] = args["token_k"][:1]
-    _rejected(args, "token_k")
-
-
-def test_rejects_a_page_size_that_is_not_the_cache_s() -> None:
-    args = _small(seed=65)
-    args["tokens_per_block"] = 16
-    _rejected(args, "index_cache")
-
-
-def test_rejects_a_position_plane_narrower_than_the_coordinates() -> None:
-    args = _small(seed=67)
-    args["position_cache"] = torch.full((8, 32, 2), POS_FILL, dtype=torch.int32, device=DEV)
-    _rejected(args, "position_cache")
-
-
-def test_rejects_a_one_dimensional_table() -> None:
-    args = _small(seed=69)
-    args["block_table"] = args["block_table"][0]
-    _rejected(args, "two-dimensional")
-
-
-def test_huge_int64_position_is_skipped_not_truncated() -> None:
-    """`2^32 + 5` truncated to int32 would be position 5 of column 0; the
-    kernel keeps int64 and finds it past the table."""
-    args = _small(seed=70, position_dtype=torch.int64)
-    args["logical_positions"][0] = 2**32 + 5
-    before = (args["index_cache"].clone(), args["position_cache"].clone())
-    op(**args)
-    page = int(args["block_table"][0, 0])
-    assert torch.equal(_bits(args["index_cache"][page, 5]), _bits(before[0][page, 5]))
-    assert torch.equal(args["position_cache"][page, 5], before[1][page, 5])

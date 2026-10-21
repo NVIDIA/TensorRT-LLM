@@ -12,35 +12,23 @@ import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtl
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 
 
-def _ckpt(
-    tokens: int,
-    tile_tokens_dim: int = 128,
-    dist: str = "router",
-    values: str = "normal",
-    non_local_from: int | None = None,
-) -> dict:
+def _ckpt(tokens: int, values: str = "normal") -> dict:
     """The checkpoint's routed-expert combine: top-10 of 512 experts, hidden 2560,
     bf16 FC2 rows, fp32 routing weights.
 
     The test lays `permuted_input` out exactly as the CuteDSL FC2 receives it: it
-    sorts the ids with `moe_sort` at `tile_tokens_dim` and writes each (token,
-    slot) row at the permuted index the sort gave it. `dist` names how the ids are
-    drawn, as in the moe_sort entry's test: `router` = each row's top-10 of uniform
-    scores; `hot` = every row on the same 10 experts; `round_robin` = row i takes
-    experts (10 i + j) mod 512. `values` is how the FC2 rows are drawn: `normal` =
-    standard normal; `wide` = standard normal times 2^u, u uniform in [-30, 30]
-    per element, so one sum adds terms up to 2^60 apart in magnitude.
-    `non_local_from` marks every slot whose expert is at or above it `-1`, as
-    moe_sort does for a pair on another rank's expert, and also token 0's ten
-    slots. The scales are a softmax over each row's ten slots, as the
-    renormalizing router emits them.
+    draws each row's top-10 of uniform scores over the 512 experts, sorts the ids
+    with `moe_sort` at `tile_tokens_dim` and writes each (token, slot) row at the
+    permuted index the sort gave it. `values` is how the FC2 rows are drawn:
+    `normal` = standard normal; `wide` = standard normal times 2^u, u uniform in
+    [-30, 30] per element, so one sum adds terms up to 2^60 apart in magnitude.
+    The scales are a softmax over each row's ten slots, as the renormalizing
+    router emits them.
     """
     return dict(
         tokens=tokens,
-        tile_tokens_dim=tile_tokens_dim,
-        dist=dist,
+        tile_tokens_dim=128,
         values=values,
-        non_local_from=non_local_from,
         num_experts=512,
         top_k=10,
         hidden_size=2560,
@@ -106,23 +94,10 @@ class MoeUnpermuteInplace(OpWrapper):
             why="decode, 1 request without MTP; rows from the sort's block kernel",
             spec=_ckpt(1),
         ),
-        Cell(
-            why="32 requests at MTP verify width 4; largest captured T, rows placed by the "
-            "sort's atomics",
-            spec=_ckpt(128),
-        ),
         Cell(why="8192 rows, max_num_tokens prefill", spec=_ckpt(8192)),
         Cell(
             why="FC2 rows spanning 2^-30..2^30; terms 2^60 apart in one sum",
             spec=_ckpt(8192, values="wide"),
-        ),
-        Cell(
-            why="510 experts with one row each; most permuted rows are padding",
-            spec=_ckpt(51, dist="round_robin"),
-        ),
-        Cell(
-            why="slots marked -1 (another rank's expert) skipped; a row of all -1 is 0",
-            spec=_ckpt(300, non_local_from=256),
         ),
     )
 
@@ -151,7 +126,8 @@ class MoeUnpermuteInplace(OpWrapper):
     this op. What it writes: every element of `output`, whatever it held, and none
     of its inputs.
 
-    Determinism (bitwise): repeated calls; a second moe_sort of the same ids, which
+    Determinism (bitwise, measured at bring-up; the test re-drives only graph
+    replay against eager): repeated calls; a second moe_sort of the same ids, which
     places an expert's rows in another order; a random permutation of all permuted
     rows; a prefix of a larger batch, with or without a fresh sort of the prefix
     alone; a shuffle of the tokens. The FC2 GEMM's fused finalize
@@ -170,13 +146,13 @@ class MoeUnpermuteInplace(OpWrapper):
     from `data_ptr()` as dense row-major); an `output` whose dtype is not
     `permuted_input`'s (an fp32 output receives the bf16 bit patterns in the first
     half of its bytes); 2^31 or more tokens (nothing is written and nothing
-    raises).
+    raises). The test holds the `permuted_input` refusal.
 
     Data hazards `is_valid` cannot see (values): a permuted index at or past
     `permuted_input.size(0)` is read without a bounds check; moe_sort never emits
     one.
 
-    Loud: int64 indices; hidden size not a multiple of 8; fp32 rows, or fp16 scales
+    Loud (measured, not re-driven): int64 indices; hidden size not a multiple of 8; fp32 rows, or fp16 scales
     with bf16 rows; fewer than `T * top_k` permuted rows; a scales or index shape
     that disagrees with `output`.
 
@@ -184,8 +160,9 @@ class MoeUnpermuteInplace(OpWrapper):
     rows; a CPU `output`.
 
     Certified only at the checkpoint's values: top_k 10, hidden 2560, bf16 rows and
-    output, fp32 scales, the sort's layout at tile 128, every slot local
-    except in the -1 cell.
+    output, fp32 scales, the sort's layout at tile 128, every slot local; T 1 and
+    8192 eager, 128 under CUDA-graph replay. Slots marked -1 (another rank's
+    expert) are not certified.
 
     Hard limits (sm_103)
       tokens           one thread block per token, the count narrowed to int32:

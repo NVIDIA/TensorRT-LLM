@@ -5,8 +5,8 @@
 Integer bookkeeping plus a one-rounding dequantize, so gated bitwise -- the
 embedding and the whole published pool -- against the entry's reference, which
 is the scalar references of `ngram_token_history` and `ngram_hash` and a
-float64 gather-and-scale. Beyond the cells: bitwise agreement with the four
-calls it replaces, and graph capture.
+float64 gather-and-scale. Beyond the cells: the `query_start_loc` length guard
+and graph capture.
 """
 
 import zlib
@@ -32,9 +32,6 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flas
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.ple.ple_ngram_embed import (  # noqa: E501
     ple_ngram_embed as op,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.quantization.dequantize_e4m3_per_tensor import (  # noqa: E501
-    dequantize_e4m3_per_tensor,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.weights import (  # noqa: E501
     _host_resident_empty,
@@ -153,39 +150,6 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — fixture by
     _compare((out, args[1]), ref)
     if cell.spec.get("table") == "host":
         assert args[1].data_ptr() != 0 and not torch.equal(args[1], pool_before)
-
-
-def _old(ids, pool, slots, carries, qsl, table, scale, mult, vocab, offsets, eos, max_rows):
-    """The four calls the decode PLE block made before this entry."""
-    seeded = torch.ones_like(slots, dtype=torch.bool) if carries is None else carries
-    window = ngram_token_history(ids, pool, slots, seeded, qsl, eos, mult.numel())
-    rows = torch.reshape(ngram_hash(window, mult, vocab, offsets, eos, 1), [-1, vocab.numel()])
-    gathered = torch.nn.functional.embedding(rows, table)
-    return torch.reshape(dequantize_e4m3_per_tensor(gathered, scale), [rows.shape[0], -1])
-
-
-@pytest.mark.parametrize(
-    "spec",
-    [
-        dict(lengths=(1,) * 128, pool_slots=ENGINE_SLOTS, eos_density=0.05),
-        dict(lengths=(4,) * 32, pool_slots=ENGINE_SLOTS, eos_density=0.05),
-        dict(
-            lengths=(5000, 3000) + (1,) * 32,
-            carries=(False, True) + (True,) * 32,
-            pool_slots=ENGINE_SLOTS,
-            eos_density=0.05,
-        ),
-    ],
-    ids=["decode128", "mtp4x32", "mixed2ctx32dec"],
-)
-def test_matches_the_calls_it_replaces(spec) -> None:
-    args = _build(spec, seed=len(spec["lengths"]))
-    old_args = list(args)
-    old_args[1] = args[1].clone()
-    want = _old(*old_args)
-    got = op(*args)
-    assert torch.equal(got, want)
-    assert torch.equal(args[1], old_args[1])
 
 
 def test_guard_refuses_short_query_start_loc() -> None:

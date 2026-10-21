@@ -18,8 +18,6 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell
 
 #: The checkpoint's GDN epilogue: 48 value heads of 128, `output_gate_type: sigmoid`.
 _CKPT = dict(heads=48, width=128, dtype=torch.bfloat16, eps=1e-6, gate_activation="sigmoid")
-#: The same geometry under the op's default silu gate.
-_SILU = dict(_CKPT, gate_activation="silu")
 #: Prefill-sized launches (at least this many rows, i.e. 683 tokens of 48 heads) run
 #: the multi-row kernel at `_PREFILL_ROWS` rows a program: at 16384 tokens 94 vs 143
 #: us on GB300 (traffic roofline ~81 us), where 4 rows a program leave 196608 small
@@ -80,18 +78,18 @@ class RmsNormGatedTokenMajor(OpWrapper):
     ARCHS = frozenset({Arch.SM_103})
 
     CELLS: tuple[Cell, ...] = (
-        *(
-            Cell(
-                why=f"z the in_proj column view: token stride 16480, {t} tokens",
-                spec=dict(tokens=t, z="in_proj", **_CKPT),
-            )
-            for t in (1, 128, 8192, 16384)
+        Cell(
+            why="decode: z the in_proj column view (token stride 16480), 128 tokens",
+            spec=dict(tokens=128, z="in_proj", **_CKPT),
+        ),
+        Cell(
+            why="prefill: z the in_proj column view, 16384 tokens at 8 rows a program",
+            spec=dict(tokens=16384, z="in_proj", **_CKPT),
         ),
         Cell(
             why="683 tokens: the first launch at 8 rows a program",
             spec=dict(tokens=683, z="in_proj", **_CKPT),
         ),
-        Cell(why="fp8 out, scale 0.5", spec=dict(tokens=17, fp8_scale=0.5, **_SILU)),
     )
 
     note = """
@@ -104,7 +102,7 @@ class RmsNormGatedTokenMajor(OpWrapper):
     it off. The 8-row programs reduce a row's mean square in another order
     than the 4-row ones (one-ulp differences on some outputs).
 
-    Loud, so not guarded: 3-D `x` (ValueError), a `z` not covering `x`
+    Loud (measured), so not guarded: 3-D `x` (ValueError), a `z` not covering `x`
     (AssertionError "does not match x shape"; 2-D `z` ValueError), an unknown
     `gate_activation` (ValueError before launch), and on the fallback a
     non-unit `x.stride(-1)` (bare AssertionError). `is_valid` covers what the
@@ -116,13 +114,14 @@ class RmsNormGatedTokenMajor(OpWrapper):
     output is freshly allocated and contiguous; no input is mutated.
 
     Certified: bf16 `x` with the sigmoid gate over the in_proj column view of
-    `z` (48 heads of N = 128) on the 4-row and 8-row kernels, plus one fp8-output
-    cell (silu gate, packed `z`). Not certified: the generic fallback kernel,
-    the silu gate without fp8 output, fp16/fp32 operands, a strided `x`.
+    `z` (48 heads of N = 128): 128 tokens on the 4-row kernel, 683 tokens (the
+    first 8-row launch) and 16384 tokens on the 8-row kernel. Not certified:
+    fp8 output, the silu gate, the generic fallback kernel, fp16/fp32
+    operands, a strided `x`.
 
     Numerics: bf16 inside the default tolerance against the fp32 reference,
     with one-ulp differences on ~1e-5 of elements at prefill row counts. fp8
-    output byte-identical. Nothing loosened.
+    output byte-identical (measured). Nothing loosened.
 
     Hard limits
       N * itemsize  fallback holds a row in 64 KB  boundary 65536 B

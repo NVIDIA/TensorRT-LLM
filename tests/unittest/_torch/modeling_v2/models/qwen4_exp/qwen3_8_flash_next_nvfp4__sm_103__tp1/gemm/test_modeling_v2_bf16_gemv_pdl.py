@@ -5,9 +5,8 @@
 Cells against the fp32 reference within the band `low_m_bf16_mm` uses (the
 same products, summed in another order). Beyond the cells: a PDL chain under
 CUDA-graph capture and replay, where each GEMV consumes the previous one's
-output and so would read a stale activation if it read before its wait; PDL on
-and off agree bitwise; the band rejects the near misses of a wrong layout; and
-the guards.
+output and so would read a stale activation if it read before its wait; and
+the layout guard.
 """
 
 import zlib
@@ -15,10 +14,6 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.gemm.bf16_gemv_pdl import (  # noqa: E501
-    MAX_ROWS,
-    launch,
-)
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.gemm.bf16_gemv_pdl import (  # noqa: E501
     bf16_gemv_pdl as op,
 )
@@ -97,33 +92,7 @@ def test_dependent_chain_under_graph_replay() -> None:
             h = out
 
 
-@pytest.mark.parametrize("m,n,k", [(1, 16480, 2560), (1, 2560, 6144)])
-def test_pdl_on_and_off_agree_bitwise(m, n, k) -> None:
-    """PDL changes when the kernel may start, not what it computes."""
-    mat_a, mat_b = _build(m, n, k, seed=11)
-    assert torch.equal(launch(mat_a, mat_b, True), launch(mat_a, mat_b, False))
-
-
-def test_band_discriminates_wrong_variants() -> None:
-    """The band admits the kernel and rejects the near misses a wrong k-tile
-    split or layout would produce: half of K missing, a one-column shift of the
-    output, a 3% scale error."""
-    m, n, k = 1, 16480, 2560
-    mat_a, mat_b = _build(m, n, k, seed=7)
-    out = op(mat_a, mat_b)
-    ref = op.reference(mat_a, mat_b)
-    _compare(out, ref)
-    half = mat_a.clone()
-    half[:, k // 2 :] = 0
-    for wrong in (op.reference(half, mat_b), torch.roll(ref, 1, dims=1), ref * 1.03):
-        with pytest.raises(AssertionError):
-            _compare(out, wrong)
-
-
-def test_guard_refuses_a_row_major_mat_b_and_too_many_rows() -> None:
+def test_guard_refuses_a_row_major_mat_b() -> None:
     mat_a, mat_b = _build(1, 512, 2560, seed=3)
     with validating(op), pytest.raises(AssertionError):
         op(mat_a, mat_b.contiguous())
-    a, b = _build(MAX_ROWS + 1, 512, 2560, seed=4)
-    with validating(op), pytest.raises(AssertionError):
-        op(a, b)

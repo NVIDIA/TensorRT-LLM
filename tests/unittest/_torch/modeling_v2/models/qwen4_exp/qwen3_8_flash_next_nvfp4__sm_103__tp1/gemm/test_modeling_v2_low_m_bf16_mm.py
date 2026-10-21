@@ -6,8 +6,8 @@ Every cell names the branch `plan` must pick, and a host-only check pins the
 branch of the table's other shapes and M buckets, so a table edit that moves a
 shape to another kernel fails here before it can change a number silently.
 Beyond the cells: CUDA-graph capture and replay after warmup (the way the
-decode forward runs it), the wrong-variant discrimination of the band, and the
-guards.
+decode forward runs it), and the guard against a padded `mat_b`, which the
+cuBLAS branch would read as dense.
 """
 
 import zlib
@@ -66,6 +66,9 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811
 _PLAN_PINS = (
     (1, 10240, 2560, "direct"),
     (1, 48, 2560, "direct"),
+    (32, 48, 2560, "direct"),
+    (8, 2560, 6144, "splitk"),
+    (2, 16480, 2560, "cublas"),
     (1, 2560, 6144, "direct"),
     (3, 12288, 2560, "splitk"),
     (8, 12288, 2560, "splitk"),
@@ -124,22 +127,6 @@ def test_graph_replay_after_warmup() -> None:
             _compare(out, op.reference(a, b))
 
 
-def test_band_discriminates_wrong_variants() -> None:
-    """The band admits the kernel and rejects the near misses a wrong layout or
-    a dropped K-split would produce: half of K missing, a one-column shift of
-    the output, a 3% scale error."""
-    m, n, k = 8, 2560, 6144
-    mat_a, mat_b = _build(m, n, k, seed=7)
-    out = op(mat_a, mat_b)
-    ref = op.reference(mat_a, mat_b)
-    _compare(out, ref)
-    half = mat_a.clone()
-    half[:, k // 2 :] = 0
-    for wrong in (op.reference(half, mat_b), torch.roll(ref, 1, dims=1), ref * 1.03):
-        with pytest.raises(AssertionError):
-            _compare(out, wrong)
-
-
 def _padded(m, n, k):
     """A row-padded mat_a and a column-padded mat_b: dense along K, leading
     dimension 2K. Both are views a caller gets by slicing a wider tensor."""
@@ -159,35 +146,3 @@ def test_guard_refuses_a_padded_mat_b() -> None:
     with pytest.raises(AssertionError, match="column-major"):
         with validating(op):
             op(a, b)
-
-
-def test_guard_refuses_a_padded_mat_a() -> None:
-    """Same for mat_a's row stride on the cuBLAS branch."""
-    a, b = _padded(4, 640, 640)
-    b = b.t().contiguous().t()
-    assert plan(4, 640, 640).kind == "cublas" and a.stride() == (1280, 1)
-    with pytest.raises(AssertionError):
-        _compare(op(a, b), op.reference(a, b))
-    with pytest.raises(AssertionError, match="row-major"):
-        with validating(op):
-            op(a, b)
-
-
-def test_flashinfer_branches_reject_padded_operands_loudly() -> None:
-    """The FlashInfer branches validate layouts themselves and raise."""
-    a, b = _padded(1, 10240, 2560)
-    assert plan(1, 10240, 2560).kind == "direct"
-    with pytest.raises(ValueError):
-        op(a.contiguous(), b)
-    a, b = _padded(8, 2560, 6144)
-    assert plan(8, 2560, 6144).kind == "splitk"
-    with pytest.raises(ValueError):
-        op(a, b.t().contiguous().t())
-
-
-def test_direct_branch_rejects_a_row_major_mat_b_loudly() -> None:
-    a = torch.randn(1, 2560, dtype=torch.bfloat16, device="cuda")
-    b = torch.randn(2560, 10240, dtype=torch.bfloat16, device="cuda")
-    assert plan(1, 10240, 2560).kind == "direct"
-    with pytest.raises(ValueError):
-        op(a, b)

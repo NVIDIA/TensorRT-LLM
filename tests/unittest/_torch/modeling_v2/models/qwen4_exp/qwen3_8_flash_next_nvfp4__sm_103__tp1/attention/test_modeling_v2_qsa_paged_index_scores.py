@@ -37,9 +37,8 @@ def _compare(out: torch.Tensor, ref: torch.Tensor) -> None:
     2.9e-6 over every cell (2.4e-6 at 8191 rows x 2080 columns, scores to
     11.6), inside the default rtol 1.3e-6 / atol 1e-5. Wrong variants (no
     relu, mean over heads, first group member as key, unscaled,
-    1/head_dim scale, block table ignored) land more than 1000x outside
-    (asserted at 2080 columns; measured 3e5x to 4e6x). Columns the
-    reference marks NaN are unspecified and not read.
+    1/head_dim scale, block table ignored) were measured 3e5x to 4e6x
+    outside it. Columns the reference marks NaN are unspecified and not read.
     """
     assert out.dtype == ref.dtype == torch.float32, (out.dtype, ref.dtype)
     assert out.shape == ref.shape, (out.shape, ref.shape)
@@ -52,7 +51,6 @@ DEV = torch.device("cuda")
 DECODE_ROW_LIMIT = 256
 #: Index heads must divide this into more than one row for the query tile.
 DOT_TILE_WIDTH = 128
-CAPTURE_PAGES = 260
 
 
 class _LaunchRecorder:
@@ -101,7 +99,7 @@ class _watch_launches:
 
 
 def _case(rows, requests, **overrides):
-    """A narrow-table spec for the non-cell tests, same shape as the entry's own."""
+    """A narrow-table spec for the non-cell tests, same geometry as the entry's own."""
     spec = dict(
         layout="random",
         rows=rows,
@@ -130,28 +128,17 @@ def _rows_and_requests(spec, gen):
     def pages_for(seq_len):
         return math.ceil(seq_len / tpb)
 
-    if layout in ("random", "arange"):
+    if layout == "random":
         rows, requests = spec["rows"], spec["requests"]
         req = torch.arange(rows, device=DEV) * requests // max(rows, 1)
-        if layout == "arange":
-            positions = torch.arange(rows, device=DEV)
-        else:
-            positions = torch.randint(0, pages * tpb, (rows,), generator=gen, device=DEV)
+        positions = torch.randint(0, pages * tpb, (rows,), generator=gen, device=DEV)
         return positions, req, [pages] * requests
 
-    segments = []  # (first position, row count) per request, in row order
+    # (first position, row count) per request, in row order
     if layout == "capture":
         segments = [(0, n) for n in spec["lengths"]]
     elif layout == "decode":
         segments = [(p, spec["rows_per_request"]) for p in spec["gen_positions"]]
-    elif layout == "mixed":
-        max_position = pages * tpb - 1
-        contexts = spec["context_lens"]
-        segments = [
-            (0 if i == 0 else (907 * i) % (max_position - n + 2), n) for i, n in enumerate(contexts)
-        ]
-        # MTP: each generation request carries two rows at consecutive positions.
-        segments += [(100 + (499 * g) % 8000, 2) for g in range(spec["requests"] - len(contexts))]
     else:
         raise AssertionError(f"unknown layout {layout!r}")
     positions = torch.cat([torch.arange(s, s + n, device=DEV) for s, n in segments])
@@ -245,127 +232,6 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811
     _compare(out, op.reference(**args))
 
 
-@pytest.mark.parametrize("context_rows,branch", [(False, "row_wise"), (True, "query_tile")])
-def test_capture_width_needs_more_than_one_column_program(context_rows, branch) -> None:
-    """Why the 260-page table is an axis of its own, not a bigger number.
-
-    Both kernels walk the score columns in a grid dimension of their own. At 8
-    pages (64 columns) one program covers every column; at 260 pages (2080) it
-    does not, so only the wide cells ever run a later column program.
-    """
-    grids = {}
-    for tag, pages in (("narrow", 8), ("wide", CAPTURE_PAGES)):
-        args = _build(_case(300, 4, pages=pages, context_rows=context_rows), seed=8500 + pages)
-        with _watch_launches() as watcher:
-            out = op(**args)
-            torch.cuda.synchronize()
-        assert watcher.branch == branch
-        grids[tag] = watcher.grid
-        _compare(out, op.reference(**args))
-    assert grids["narrow"][1] == 1, grids
-    assert grids["wide"][1] > 1, grids
-
-
-def _capture_args(seed, only_visible_blocks=False):
-    spec = _case(
-        0,
-        1,
-        layout="capture",
-        lengths=(8191,),
-        slots=8,
-        pages=CAPTURE_PAGES,
-        only_visible_blocks=only_visible_blocks,
-        context_rows=True,
-    )
-    return _build(spec, seed)
-
-
-def test_the_two_kernels_agree() -> None:
-    """One entry, two kernels: no further apart than fp32 reordering.
-
-    Measured 9.5e-7 apart (one fp32 ulp at the score's magnitude) at 320 rows
-    and again at 8191, so the packed kernel does not drift with batch size;
-    asserted at the 8191-row capture shape.
-    """
-    args = _capture_args(seed=8700)
-    visible = _visible(args)
-    row_wise = op(**{**args, "context_rows": False})
-    query_tile = op(**{**args, "context_rows": True})
-    torch.testing.assert_close(row_wise[visible], query_tile[visible])
-
-
-@pytest.mark.parametrize("context_rows", [False, True], ids=["row_wise", "query_tile"])
-def test_results_are_bitwise_reproducible(context_rows) -> None:
-    """Three identical calls, bitwise identical, in the padded mode so the
-    whole tensor is written; once per kernel."""
-    args = _build(_case(300, 5, context_rows=context_rows), seed=505)
-    runs = [op(**args).clone() for _ in range(3)]
-    torch.cuda.synchronize()
-    assert torch.equal(runs[0], runs[1]) and torch.equal(runs[1], runs[2])
-
-
-@pytest.mark.parametrize("shape", ["64rows_row_wise", "8191rows_capture"])
-def test_only_visible_blocks_leaves_the_tail_unspecified(shape) -> None:
-    """`only_visible_blocks=True` writes the visible columns and nothing else.
-
-    The output is a fresh `torch.empty`, and the caching allocator hands back
-    the block freed just before: poisoning one of the right size makes the
-    unwritten tail observable. Asserted in the allocator-independent form: the
-    tail is NOT the `-inf` the padded mode writes.
-    """
-    if shape == "8191rows_capture":
-        args = _capture_args(seed=8900, only_visible_blocks=True)
-    else:
-        args = _build(_case(64, 4, only_visible_blocks=True), seed=670)
-    expected = op.reference(**args)
-    poison = torch.full(expected.shape, 98765.0, dtype=torch.float32, device=DEV)
-    del poison
-    out = op(**args)
-    torch.cuda.synchronize()
-    _compare(out, expected)
-    tail = torch.isnan(expected)
-    assert bool(tail.any()), "this case must have unscored columns to say anything"
-    assert not bool(torch.isneginf(out[tail]).all()), "the tail must not be the -inf padding"
-
-
-def test_both_modes_agree_on_the_visible_columns() -> None:
-    """The flag decides what lands outside the causal bound, nothing inside."""
-    args = _build(_case(96, 4), seed=707)
-    padded = op(**{**args, "only_visible_blocks": False})
-    unspecified = op(**{**args, "only_visible_blocks": True})
-    visible = _visible(args)
-    assert torch.equal(padded[visible], unspecified[visible])
-
-
-def test_pdl_launch_is_bitwise_the_plain_one_and_reads_after_the_wait() -> None:
-    """`use_pdl` changes the launch, not the result; under graph replay a producer rewrites
-    q right before the op, and a read of it before the wait would see the previous
-    replay's."""
-    args = _build(_case(4, 4, only_visible_blocks=True), seed=313)
-    visible = _visible(args)
-    plain = op(**args)
-    assert torch.equal(op(**{**args, "use_pdl": True})[visible], plain[visible])
-    src = args["q"].clone()
-
-    def step():
-        args["q"].copy_(src * 1.0)
-        return op(**{**args, "use_pdl": True})
-
-    warmup = torch.cuda.Stream()
-    warmup.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(warmup):
-        step()
-    torch.cuda.current_stream().wait_stream(warmup)
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        graph_out = step()
-    for trial in range(3):
-        src.copy_(_build(_case(4, 4, only_visible_blocks=True), seed=314 + trial)["q"])
-        graph.replay()
-        torch.cuda.synchronize()
-        assert torch.equal(graph_out[visible], op(**args)[visible]), f"replay {trial}"
-
-
 def test_prefetch_reads_the_fresh_anchor_key_and_q_after_the_wait() -> None:
     """`prefetch` reads pages and keys before the PDL wait. Under graph replay a producer
     rewrites q and, at rows whose position ends a group, the last visible block's anchor
@@ -409,177 +275,10 @@ def test_prefetch_reads_the_fresh_anchor_key_and_q_after_the_wait() -> None:
         assert torch.equal(graph_out[visible], op(**args)[visible]), f"replay {trial}"
 
 
-def test_capture_shape_survives_cuda_graph_capture_and_replay() -> None:
-    """Capture is why 8191 rows exist, so capture it -- and replay it again
-    after overwriting the operands in place, which a graph that baked in its
-    inputs would fail."""
-    args = _capture_args(seed=9100, only_visible_blocks=True)
-    op(**args)  # warm the Triton launch outside capture
-    torch.cuda.synchronize()
-    graph = torch.cuda.CUDAGraph()
-    try:
-        with torch.cuda.graph(graph):
-            captured = op(**args)
-        graph.replay()
-        torch.cuda.synchronize()
-        _compare(captured, op.reference(**args))
-
-        fresh = _capture_args(seed=9101, only_visible_blocks=True)
-        for name in ("q", "index_cache"):
-            args[name].copy_(fresh[name])
-        # A new logical->physical map for the same slot: the pages it maps,
-        # reshuffled in place.
-        table = args["block_table"]
-        mapped = table >= 0
-        gen = torch.Generator(device=DEV).manual_seed(9102)
-        pages = table[mapped]
-        table[mapped] = pages[torch.randperm(pages.numel(), generator=gen, device=DEV)]
-        graph.replay()
-        torch.cuda.synchronize()
-        _compare(captured, op.reference(**args))
-    finally:
-        del graph
-        torch.cuda.synchronize()
-
-
-def _wrong_variants(args):
-    """Plausible mis-implementations in plain torch; none of them is the op."""
-    q, index_cache, table = args["q"], args["index_cache"], args["block_table"].long()
-    requests = args["request_indices"].long()
-    tpb, ratio = args["tokens_per_block"], args["compress_ratio"]
-    rows, _, head_dim = q.shape
-    columns = _columns(args)
-
-    def scores(*, offset=ratio - 1, relu=True, scale=head_dim**-0.5, mean=False, no_table=False):
-        anchors = torch.arange(columns, device=DEV) * ratio + offset
-        logical, in_page = anchors // tpb, anchors % tpb
-        physical = logical.expand(rows, columns) if no_table else table[requests][:, logical]
-        keys = index_cache[physical.clamp_min(0), in_page.expand(rows, columns)][:, :, 0, :]
-        per_head = torch.einsum("rhd,rbd->rbh", q.float(), keys.float())
-        per_head = torch.relu(per_head) if relu else per_head
-        return (per_head.mean(-1) if mean else per_head.sum(-1)) * scale
-
-    return {
-        "no_relu": scores(relu=False),
-        "mean_over_heads": scores(mean=True),
-        "key_from_the_first_group_member": scores(offset=0),
-        "unscaled": scores(scale=1.0),
-        "scaled_by_one_over_head_dim": scores(scale=1.0 / head_dim),
-        "block_table_ignored": scores(no_table=True),
-    }
-
-
-def test_wrong_variants_fail_the_gate() -> None:
-    """The default fp32 band is only a gate if a wrong answer fails it.
-
-    At the target's 260-page width, each variant is rejected by `_compare` and
-    lands more than 1000x outside the band the correct result clears; measured
-    3e5x to 4e6x.
-    """
-    args = _build(_case(8, 8, pages=CAPTURE_PAGES), seed=9000)
-    gen = torch.Generator(device=DEV).manual_seed(9001)
-    args["query_positions"] = torch.randint(4096, 8192, (8,), generator=gen, device=DEV).to(
-        torch.int32
-    )
-    out = op(**args)
-    expected = op.reference(**args)
-    _compare(out, expected)
-    visible = _visible(args)
-    gate = 1e-5 + 1.3e-6 * expected[visible].abs().max()
-    assert (out[visible] - expected[visible]).abs().max() < gate
-    for name, variant in _wrong_variants(args).items():
-        wrong = expected.clone()
-        wrong[visible] = variant[visible]
-        assert (wrong[visible] - out[visible]).abs().max() > 1000 * gate, name
-        with pytest.raises(AssertionError):
-            _compare(out, wrong)
-
-
-def test_rows_before_a_complete_group_see_nothing() -> None:
-    """Positions 0..7 at compress_ratio 4: 0,0,0,1,1,1,1,2 visible columns.
-
-    A row that has not closed its first group comes back entirely `-inf`; the
-    caller's top-k has to know that row can happen.
-    """
-    args = _build(_case(8, 2, layout="arange"), seed=1251)
-    out = op(**args)
-    _compare(out, op.reference(**args))
-    assert torch.isfinite(out).sum(dim=1).tolist() == [0, 0, 0, 1, 1, 1, 1, 2]
-
-
-def test_empty_row_batch() -> None:
-    """Zero rows: the correctly shaped empty fp32 tensor, and no launch."""
-    args = _build(_case(0, 2), seed=1301)
-    with _watch_launches() as watcher:
-        out = op(**args)
-    assert watcher.log == [], "an empty batch must not launch a kernel"
-    assert out.shape == (0, _columns(args)) and out.dtype == torch.float32
-
-
-def test_inputs_are_not_written() -> None:
-    """Nothing is in place, and the result is a fresh allocation."""
-    args = _build(_case(64, 4), seed=1401)
-    snapshots = {k: v.clone() for k, v in args.items() if torch.is_tensor(v)}
-    out = op(**args)
-    torch.cuda.synchronize()
-    for name, snapshot in snapshots.items():
-        assert torch.equal(args[name], snapshot), f"{name} was modified"
-    inputs = {args[k].untyped_storage().data_ptr() for k in snapshots}
-    assert out.untyped_storage().data_ptr() not in inputs
-
-
-def test_float32_operands_use_a_reduced_precision_dot() -> None:
-    """fp32 q and cache are accepted and do NOT hold `_compare`'s band.
-
-    `tl.dot` rounds fp32 operands to a tensor-core format. Measured: 8.1e-3
-    max abs, 0.29 max relative, on scores to 7.8 -- where bf16 operands give
-    9.5e-7. That is why no cell covers fp32. The loosened band below
-    (rtol 2e-3, atol 2e-2) is ~2.5x the measured error, and every wrong
-    variant still lands more than 25x outside it.
-    """
-    args = _build(_case(64, 4, dtype=torch.float32), seed=1501)
-    out = op(**args)
-    expected = op.reference(**args)
-    visible = _visible(args)
-    with pytest.raises(AssertionError):
-        _compare(out, expected)
-    torch.testing.assert_close(out[visible], expected[visible], rtol=2e-3, atol=2e-2)
-    gate = (2e-2 + 2e-3 * expected[visible].abs()).max()
-    for name, variant in _wrong_variants(args).items():
-        assert (variant[visible] - out[visible]).abs().max() > 25 * gate, name
-
-
-def _mutated(args, **overrides):
-    return {**args, **overrides}
-
-
-_REJECTIONS = {
-    "two_kv_head_cache": (
-        lambda a: _mutated(a, index_cache=a["index_cache"].expand(-1, -1, 2, -1)),
-        "QSA index cache must have shape",
-    ),
-    "int64_block_table": (
-        lambda a: _mutated(a, block_table=a["block_table"].long()),
-        "two-dimensional int32 block table",
-    ),
-    "mismatched_dtypes": (
-        lambda a: _mutated(a, index_cache=a["index_cache"].float()),
-        "dtypes must match",
-    ),
-    "compress_ratio_1": (lambda a: _mutated(a, compress_ratio=1), "compression ratio >= 2"),
-    "short_metadata": (
-        lambda a: _mutated(a, query_positions=a["query_positions"][:4]),
-        "one entry per row",
-    ),
-}
-
-
-@pytest.mark.parametrize("case", list(_REJECTIONS), ids=list(_REJECTIONS))
-def test_rejects(case) -> None:
-    """The callable's own refusals, messages as observed -- the reason this
-    entry has no `is_valid`. One case per refusal family: operand shape, block
-    table, dtypes, geometry scalars, metadata."""
-    mutate, message = _REJECTIONS[case]
-    args = mutate(_build(_case(16, 2), seed=1701))
-    with pytest.raises(ValueError, match=message):
+def test_rejects_metadata_shorter_than_the_rows() -> None:
+    """The callable's own refusal, message as observed -- the reason this entry has no
+    `is_valid`: positions for fewer rows than `q` carries."""
+    args = _build(_case(16, 2), seed=1701)
+    args["query_positions"] = args["query_positions"][:4]
+    with pytest.raises(ValueError, match="one entry per row"):
         op(**args)

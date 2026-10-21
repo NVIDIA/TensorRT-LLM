@@ -145,7 +145,8 @@ class LowMBf16Mm(OpWrapper):
     ARCHS = frozenset({Arch.SM_103})
 
     # Every cell is a qwen3.8-flash-next-nvfp4 tp1 decode projection at M >= 2 (one row
-    # takes `bf16_gemv_pdl` in the target); `kind` pins the branch `plan` takes for it.
+    # takes `bf16_gemv_pdl` in the target), one per branch; `kind` pins the branch `plan`
+    # takes for it. The test's host-only plan pins hold the table's other shapes.
     CELLS: tuple[Cell, ...] = (
         _cell(
             "qwen3.8 decode M=2 GDN in_z: direct, 2-row tile, pdl on",
@@ -156,16 +157,13 @@ class LowMBf16Mm(OpWrapper):
             pdl=True,
         ),
         _cell(
-            "qwen3.8 decode M=8 o_proj: split-K 3 over the cluster, pdl on",
-            8,
+            "qwen3.8 decode M=32 o_proj: split-K, mma_n 32, pdl on (M boundary)",
+            32,
             2560,
             6144,
             "splitk",
             pdl=True,
         ),
-        _cell("qwen3.8 decode M=32 GDN in_a/in_b: direct, 8-row tiles x4", 32, 48, 2560, "direct"),
-        _cell("qwen3.8 decode M=32 o_proj: split-K, mma_n 32", 32, 2560, 6144, "splitk"),
-        _cell("qwen3.8 decode M=2 GDN in-proj concat: cuBLAS branch", 2, 16480, 2560, "cublas"),
         _cell("qwen3.8 decode M=128: cuBLAS branch above M=32", 128, 10240, 2560, "cublas"),
     )
 

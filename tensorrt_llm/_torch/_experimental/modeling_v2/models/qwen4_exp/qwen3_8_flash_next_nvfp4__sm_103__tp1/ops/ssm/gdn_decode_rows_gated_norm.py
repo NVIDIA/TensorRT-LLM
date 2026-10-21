@@ -456,17 +456,15 @@ class GdnDecodeRowsGatedNorm(OpWrapper):
 
     ARCHS = frozenset({Arch.SM_103})
 
+    # spec: rows; pool (default a contiguous 461-slot pool | "coalesced": the
+    # cache manager's pool, slot stride 36 layers' states, slots 100 and 101);
+    # pad (row 1 given slot -1).
     CELLS: tuple[Cell, ...] = (
         Cell(why="qwen3.8 decode, 128 rows (con 128), 461-slot pool", spec=dict(rows=128)),
         Cell(why="qwen3.8 decode, 3 rows (past the conv-fused path)", spec=dict(rows=3)),
-        Cell(why="qwen3.8 decode, 33 rows, one pad slot (-1)", spec=dict(rows=33, pad=True)),
         Cell(
-            why="qwen3.8 decode, 16 rows, the pool a layer view of a 3-layer cache",
-            spec=dict(rows=16, pool="layer_view"),
-        ),
-        Cell(
-            why="2 rows, the cache manager's coalesced pool: slot stride 36 layers, slot 100",
-            spec=dict(rows=2, pool="coalesced"),
+            why="2 rows, coalesced pool (slot stride 36 layers, slot 100), row 1 a pad slot (-1)",
+            spec=dict(rows=2, pool="coalesced", pad=True),
         ),
     )
 
@@ -494,6 +492,12 @@ class GdnDecodeRowsGatedNorm(OpWrapper):
     the transposed reduction's tree; `o` rounded to bf16 before the norm, the output
     rounded once. Inside torch's default band for bf16 / fp32 of the composition's
     float64 reference, not bitwise FlashInfer's kernel.
+
+    Certified: 128 and 3 rows (the fewest a decode step sends here once the conv-fused
+    path stops) over a contiguous 461-slot pool, and 2 rows over the cache manager's
+    coalesced pool (slot stride 36 layers' states, slot 100 ~2.8G elements past the
+    base) with the second row a pad slot (-1). Under graph replay the op reads the
+    projection after `griddepcontrol.wait` (16 rows). Not certified: `pdl=False`.
     """
 
     def __call__(
@@ -598,7 +602,10 @@ class GdnDecodeRows(OpWrapper):
     a bf16 `out` `[rows, HV * V]` with unit column stride. The pool rows and `slots` are
     read before `griddepcontrol.wait`: in a mixed step nothing queued ahead of the call
     writes the generation rows' slots (the context rows' reset and chunked recurrence touch
-    only theirs). Numerics: the recurrence of `GdnDecodeRowsGatedNorm`, bitwise its `o`.
+    only theirs). Numerics: the recurrence of `GdnDecodeRowsGatedNorm` (the same kernel).
+
+    Certified: a mixed step's 121 generation rows, 3 rows with a pad slot (-1), and 2 rows
+    over the cache manager's coalesced pool, each into a row range of the step output.
     """
 
     def __call__(

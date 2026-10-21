@@ -64,25 +64,27 @@ class LayerNorm(OpWrapper):
     other `x`, and non-contiguous `weight`/`bias`, are silently `.contiguous()`d
     first (one extra copy). `weight`/`bias` dtype is free.
 
-    Certified: contiguous bf16 `[rows, 1152]` `x` with a bf16 weight and bias,
-    as the vision tower calls it. Not certified: strided or 3-D `x`,
-    `bias=None`, fp16/fp32 activations, weight/bias in another dtype than `x`.
+    Certified: contiguous bf16 `[rows, 1152]` `x` at 1, 1024 and 32768 rows
+    with a bf16 weight and bias, as the vision tower calls it. Not certified:
+    strided or 3-D `x`, `bias=None`, fp16/fp32 activations, weight/bias in
+    another dtype than `x`.
 
     Loud failures (left to the callable): weight or bias length != N raises a
     bare AssertionError with no message; `next_pow2(N) * x.element_size() >
     64KB` raises "This layer norm doesn't support feature dim >= 64KB" (N =
     65536 in bf16); CPU tensors fail before or at the Triton launch.
 
-    Accuracy: at the checkpoint's affine (weights to 17.5, biases to -25.6) the
-    bf16 result is the correctly rounded fp64 value on >= 99.9989% of elements;
-    where it differs, by <= 2^-7 of the summed term magnitude. A constant row
-    returns `bias` bitwise. `eps` sits inside the sqrt.
+    Accuracy, measured beyond the cells' default gate and not certified: at
+    the checkpoint's affine (weights to 17.5, biases to -25.6) the bf16 result
+    is the correctly rounded fp64 value on >= 99.9989% of elements; where it
+    differs, by <= 2^-7 of the summed term magnitude. A constant row returns
+    `bias` bitwise. `eps` sits inside the sqrt.
 
     Accepted but not certified: an fp8-e4m3 `x` returns fp8-e4m3 (output is
     `empty_like(x)`), within one e4m3 ulp of the exact value; fp64 `x`.
-    Forward only: the autograd Function has no backward. Runs unchanged under
-    `inference_mode`; CUDA-graph capturable after a warm-up call compiles the
-    Triton kernel.
+    Forward only: the autograd Function has no backward. Measured, not
+    certified: one kernel launch, runs unchanged under `inference_mode`,
+    CUDA-graph capturable after a warm-up call compiles the Triton kernel.
     """
 
     def __call__(

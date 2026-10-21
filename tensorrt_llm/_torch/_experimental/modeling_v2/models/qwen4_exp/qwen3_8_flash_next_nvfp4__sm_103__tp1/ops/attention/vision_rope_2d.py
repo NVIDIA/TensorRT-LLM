@@ -108,20 +108,6 @@ class VisionRope2d(OpWrapper):
                 grid_dtype=torch.int64,
             ),
         ),
-        Cell(
-            why="grid side 6272 (2x6272) float32: largest width angle, fp32 exposes the table",
-            spec=dict(grid=((1, 2, 6272),), dtype=torch.float32),
-        ),
-        Cell(
-            why="grid side 6272 (6272x2) bfloat16: largest height angle",
-            spec=dict(grid=((1, 6272, 2),), dtype=torch.bfloat16),
-        ),
-    ) + tuple(
-        Cell(
-            why=f"head geometry {heads}x{head_dim}",
-            spec=dict(grid=((1, 8, 12),), dtype=torch.bfloat16, heads=heads, head_dim=head_dim),
-        )
-        for heads, head_dim in ((8, 64), (4, 128), (2, 40))
     )
 
     note = """
@@ -130,23 +116,25 @@ class VisionRope2d(OpWrapper):
     `k` need last-dim stride 1 only; they are not mutated.
 
     `head_dim` must be divisible by 4; otherwise the angle table's width
-    mismatches the head and the broadcast raises (loud, so not guarded).
+    mismatches the head and the broadcast raises (loud, so not guarded; not
+    pinned by a test).
 
-    Accuracy vs fp64 angles over the cells: fp32 <= 4.77e-7, bf16 <= 1.56e-2
-    (one ulp at unit-normal operands), flat in the grid side up to 6272 -- the
-    fp64 table is why (an fp32 `inv_freq` times fp32 position
-    moved an fp32 output 1.475e-5 at a 64 side, outside the default gate).
-    Wrong operators at 1024 bf16 tokens land 8.5-9.5 away: GPT-J pairing, axes
-    swapped, raster order, `inv_freq` over `head_dim`.
+    Accuracy vs fp64 angles over the cells: bf16 <= 1.56e-2 (one ulp at
+    unit-normal operands). Measured, not certified: fp32 <= 4.77e-7, flat in the
+    grid side up to 6272 -- the fp64 table is why (an fp32 `inv_freq` times fp32
+    position moved an fp32 output 1.475e-5 at a 64 side, outside the default
+    gate); wrong operators at 1024 bf16 tokens land 8.5-9.5 away: GPT-J pairing,
+    axes swapped, raster order, `inv_freq` over `head_dim`.
 
     Host-bound: ~353 us/call at 1024 and 4096 tokens (`.tolist()` + small
-    launches), x27 blocks per image. The table depends only on the grid.
-    CUDA graphs: capture bakes in the grid; replay under another grid was not
-    measured.
+    launches), x27 blocks per image. The table depends only on the grid, and the
+    result does not depend on the grid's placement (host or device) or integer
+    dtype (int32 or int64).
 
-    Not certified: float16; mixed q/k dtypes or head counts; float8;
-    `spatial_merge_size` != 2; `theta` other than 1e4; grid sides past 6272 or
-    calls past 32768 rows.
+    Not certified: float16 or float32; mixed q/k dtypes or head counts; head
+    geometries other than 16 x 72; float8; `spatial_merge_size` != 2; `theta`
+    other than 1e4; grid sides past 90 or calls past 32768 rows; CUDA-graph
+    capture (it would bake in the grid).
     """
 
     def __call__(

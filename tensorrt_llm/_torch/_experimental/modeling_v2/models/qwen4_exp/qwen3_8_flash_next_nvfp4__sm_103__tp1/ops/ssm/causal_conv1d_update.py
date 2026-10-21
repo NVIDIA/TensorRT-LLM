@@ -310,8 +310,6 @@ def _decode_conv(x, conv_state, weight, indices, pad_slot_id) -> None:
 
 def _pinned(batch: int) -> tuple[int, ...]:
     """`batch` distinct slots of the engine pool, slot 0 and the last pinned in."""
-    if batch == 1:
-        return (0,)
     return (0,) + tuple(i * 14 + 3 for i in range(1, batch - 1)) + (ENGINE_SLOTS - 1,)
 
 
@@ -338,31 +336,29 @@ class CausalConv1dUpdate(OpWrapper):
 
     ARCHS = frozenset({Arch.SM_103})
 
-    # spec keys: dim, width (4), state_len (3), seqlen (1), batch, pool_slots,
-    # slots ("random" | tuple | None), dtype, bias, silu, cache_seqlens,
-    # pad_slot_id, x_form ("3d" | "2d" | "2d_row_slice" | "2d_in_proj" |
-    # "token_major"),
-    # strided_state.
-    CELLS: tuple[Cell, ...] = tuple(
+    # spec keys: dim, batch, pool_slots, slots ("random" | tuple), pool_layers
+    # (the pool a one-layer view of a buffer this many layers deep, default 1).
+    # Every cell is the call site: x the q|k|v column view of the decode rows
+    # of a [rows, 16480] in_proj output, bf16, W 4, a 3-column pool, no bias,
+    # SiLU, no ring, pad_slot_id -1.
+    CELLS: tuple[Cell, ...] = (
         Cell(
-            why=f"x the q|k|v column view of the [rows, 16480] in_proj, batch {batch}",
+            why="x the q|k|v column view of the [rows, 16480] in_proj, batch 32",
+            spec=dict(dim=CKPT_DIM, batch=32, pool_slots=ENGINE_SLOTS, slots=_pinned(32)),
+        ),
+        Cell(
+            why="x the q|k|v column view of the [rows, 16480] in_proj, batch 128",
+            spec=dict(dim=CKPT_DIM, batch=128, pool_slots=256, slots="random"),
+        ),
+        Cell(
+            why="64 rows (the CuTe kernel's first) over a layer view, pad -1 rows untouched",
             spec=dict(
                 dim=CKPT_DIM,
-                batch=batch,
-                pool_slots=pool,
-                slots=slots,
-                x_form="2d_in_proj",
+                batch=64,
+                pool_slots=ENGINE_SLOTS,
+                slots=tuple(-1 if i % 21 == 5 else i * 7 for i in range(64)),
+                pool_layers=2,
             ),
-        )
-        for batch, pool, slots in (
-            (1, ENGINE_SLOTS, _pinned(1)),
-            (32, ENGINE_SLOTS, _pinned(32)),
-            (128, 256, "random"),
-        )
-    ) + (
-        Cell(
-            why="pad_slot_id -1 rows: x rows and the pool untouched",
-            spec=dict(dim=CKPT_DIM, batch=6, pool_slots=128, slots=(3, -1, 7, 11, -1, 2)),
         ),
     )
 
@@ -382,9 +378,10 @@ class CausalConv1dUpdate(OpWrapper):
     `_DecodeConvKernel` (CuTe DSL) instead: 8 channels a thread by 16-byte
     loads, the TRT-LLM kernel's instructions, bitwise its result (x and pool,
     pad rows untouched); 128 rows 7.46 -> 5.41 us a layer (GB300, graph
-    replay over 8 rotating layers). Certified at that call: 1 and 32 rows
-    over the 461-slot pool, 128 rows (the CuTe kernel) over a 256-slot pool,
-    and pad rows over a 128-slot pool.
+    replay over 8 rotating layers). Certified at that call: 32 rows (the
+    TRT-LLM kernel) over the 461-slot pool, 128 rows (the CuTe kernel) over a
+    256-slot pool, and 64 rows (the CuTe kernel's first row count) with pad
+    rows over the 461-slot pool seen as one layer of a two-layer buffer.
 
     The op checks metadata itself, loudly: width 2..4, `state_len >= W - 1`,
     one dtype across x/conv_state/weight (bias matches weight), weight shape,
@@ -397,7 +394,8 @@ class CausalConv1dUpdate(OpWrapper):
     Out-of-range slot values are an illegal access, not probed.
 
     A row whose index equals `pad_slot_id` (-1 at the call site) is skipped:
-    its x rows and the pool stay bitwise unchanged.
+    its x rows and the pool stay bitwise unchanged (certified on the CuTe
+    kernel only).
 
     Hard limits
       none probed.

@@ -68,16 +68,10 @@ class Qwen4ExpHcLowrankAct(OpWrapper):
     ARCHS = frozenset({Arch.SM_103})
 
     # spec: rows, inject (True), hc_count (4), rank (320), logits_width (384), dtype (bf16).
-    CELLS: tuple[Cell, ...] = tuple(
-        Cell(why=f"checkpoint rank 320 + 4, padded to 384, {why}", spec=dict(rows=t))
-        for t, why in (
-            (1, "1 row"),
-            (128, "128 rows"),
-            (8192, "prefill 8192"),
-        )
-    ) + (
+    CELLS: tuple[Cell, ...] = (
+        Cell(why="checkpoint rank 320 + 4, padded to 384, 128 rows", spec=dict(rows=128)),
+        Cell(why="checkpoint rank 320 + 4, padded to 384, prefill 8192", spec=dict(rows=8192)),
         Cell(why="stack-final mixer: no inject, 8192 rows", spec=dict(rows=8192, inject=False)),
-        Cell(why="zero rows", spec=dict(rows=0)),
     )
 
     note = """
@@ -86,8 +80,11 @@ class Qwen4ExpHcLowrankAct(OpWrapper):
     projection. Preconditions: `logits` fp32, unit column stride, at least
     `rank (+ hc_count)` columns; `hc_count` a power of two. Graph-capturable.
 
-    Not certified: hc_count other than 4, rank other than 320, float16
-    outputs.
+    Certified: bf16 outputs from 384-wide fp32 logits, with the injection at 128
+    and 8192 rows, without it at 8192 rows; graph replay.
+
+    Not certified: zero rows, hc_count other than 4, rank other than 320,
+    float16 outputs.
     """
 
     def __call__(

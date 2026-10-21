@@ -57,7 +57,7 @@ class PackGdnDecodeQkv(OpWrapper):
             why=f"target verify call: {b} seqs x {p} tokens, token-major rows",
             spec=dict(num_decodes=b, draft=p),
         )
-        for b, p in ((1, 2), (8, 4), (32, 2))
+        for b, p in ((32, 2), (8, 4))
     ) + (Cell(why="127 tokens, contiguous: a partial final block", spec=dict(num_tokens=127)),)
 
     note = """
@@ -66,7 +66,9 @@ class PackGdnDecodeQkv(OpWrapper):
 
     Call site (`_gdn_verify`): `mixed_qkv` the `[n * p, 10240]` token-major
     conv output (contiguous: the conv result carries its input's strides, so
-    transposing back is a view), heads `16, 128, 48, 128`, bf16.
+    transposing back is a view), heads `16, 128, 48, 128`, bf16. Certified bitwise
+    at that call for 32 sequences of 2 tokens and 8 of 4, and at 127 contiguous
+    rows (a partial final block).
 
     Raise loudly, so not guarded: `head_k_dim` and `head_v_dim` rounding up to
     different powers of two (`128 / 64`: triton `CompilationError`

@@ -112,15 +112,6 @@ class Fp8BlockScaleMoeRunner(OpWrapper):
             spec=dict(tokens=20, **_CKPT),
         ),
         Cell(
-            why="256 tokens: ~5 rows per expert, past the small-T routing kernel",
-            spec=dict(tokens=256, **_CKPT),
-        ),
-        Cell(why="1024 tokens: ~20 rows per expert", spec=dict(tokens=1024, **_CKPT)),
-        Cell(
-            why="8192 tokens: max_num_tokens of the identity config; the last tuning bucket",
-            spec=dict(tokens=8192, **_CKPT),
-        ),
-        Cell(
             why="16384 rows: max_num_tokens of the tuned config; past the last tuning bucket",
             spec=dict(tokens=16384, **_CKPT),
         ),
@@ -129,7 +120,8 @@ class Fp8BlockScaleMoeRunner(OpWrapper):
     note = """
     Metadata consumed: none. Two process-global caches sit behind the call --
     the autotuner's profiling cache and the C++ runner cache -- and a warm
-    tuned tactic was measured bitwise equal to the cold fallback.
+    tuned tactic is bitwise equal to the cold fallback (the test holds this at
+    256 tokens).
 
     Preconditions. `hidden_states` is `[T, H]` e4m3 and `hidden_states_scale`
     `[H/128, T]` fp32 (see the class docstring); weights are the checkpoint's
@@ -157,8 +149,9 @@ class Fp8BlockScaleMoeRunner(OpWrapper):
     `use_dp`. `gemm1_clamp_limit` is live and one scalar for every expert,
     applied after the FC1 requantization; None is bitwise equal to omitting it.
 
-    Silent on the raw op, refused by `is_valid`: any non-contiguous tensor (read
-    as dense, 55-115 ulp RMS off); `act_type != 0` (the Python runner forces
+    Silent on the raw op, refused by `is_valid` (the test holds the strided
+    `hidden_states` refusal): any non-contiguous tensor (read as dense, 55-115
+    ulp RMS off); `act_type != 0` (the Python runner forces
     SwiGlu, so 1 and 2 are bitwise identical to 0); `routing_bias` alongside
     `topk_ids` (ignored; a +-1e3 bias leaves the output bitwise unchanged).
     `num_fused_shared_experts > 0` is rejected loudly on the pre-routed path,
@@ -168,7 +161,7 @@ class Fp8BlockScaleMoeRunner(OpWrapper):
     states): an upstream defect, eager is unaffected.
 
     Hard limits
-      T            certified 1..16384 (max_num_tokens of the tuned config);
+      T            certified at 1, 20 and 16384 (max_num_tokens of the tuned config);
                    chunk above it, not probed. Autotuner buckets stop at
                    `tune_max_num_tokens` (default 8192, which the target
                    leaves): past it a call runs the 8192 bucket's tactic; a
@@ -176,9 +169,13 @@ class Fp8BlockScaleMoeRunner(OpWrapper):
       top_k        <= 32 (raises past it); certified 10, the checkpoint's
       E, H, I      certified at the checkpoint's 512, 2560, 640
 
-    Not certified: the in-kernel routing path (`routing_logits` given),
-    multi-rank execution (the windows ran in one process), geometries other
-    than the checkpoint's, sm_100.
+    Not certified (the statements above were measured at bring-up and are not
+    re-driven by the test): expert windows (`local_expert_offset` /
+    `local_num_experts` other than the full stack), repeated or out-of-range
+    ids, `gemm1_clamp_limit`, the inert arguments, `output=`, the registered
+    fake, the op's loud rejections. Nor: the in-kernel routing path
+    (`routing_logits` given), multi-rank execution, geometries other than the
+    checkpoint's, sm_100.
     """
 
     def __call__(

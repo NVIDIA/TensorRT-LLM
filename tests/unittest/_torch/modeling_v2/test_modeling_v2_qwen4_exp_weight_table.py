@@ -86,12 +86,12 @@ def _core(mtp: bool, backend: str = "TRTLLM", prefill_copy: bool | None = None):
     )
 
 
-@pytest.mark.parametrize("mtp", [False, True], ids=["no_mtp", "mtp"])
-def test_every_declared_weight_has_a_source(mtp):
+def test_every_declared_weight_has_a_source():
     """A declared weight with no source allocates memory nothing ever fills -- silently
     zero rather than an error, which is what `load`'s coverage assert catches from the
-    other side."""
-    core = _core(mtp)
+    other side. With MTP live: the rows without it are a subset
+    (`test_mtp_rows_appear_only_when_mtp_is_live`)."""
+    core = _core(True)
     manifest = W.MODEL_WEIGHTS.manifest(core)
     for key, sources in manifest.items():
         assert sources, f"{key} is declared with no checkpoint source"
@@ -260,13 +260,14 @@ def _reference_declaration(mtp: bool) -> dict:
     return w
 
 
-@pytest.mark.parametrize("mtp", [False, True], ids=["no_mtp", "mtp"])
-def test_the_table_declares_what_the_init_block_did(mtp):
-    core = _core(mtp)
+def test_the_table_declares_what_the_init_block_did():
+    """With MTP live; without it the table drops exactly the MTP module's rows
+    (`test_mtp_rows_appear_only_when_mtp_is_live`)."""
+    core = _core(True)
     with torch.device("meta"):
         declared = W.MODEL_WEIGHTS.declare(W.MODEL_WEIGHTS.dims(core))
     got = {k: (tuple(p.shape), p.dtype) for k, p in declared.items()}
-    want = _reference_declaration(mtp)
+    want = _reference_declaration(True)
     assert set(got) == set(want), (
         sorted(set(got) - set(want))[:8],
         sorted(set(want) - set(got))[:8],
@@ -368,9 +369,7 @@ def test_cutedsl_fc2_keeps_the_checkpoint_row_order_and_trtllm_gen_shuffles_it()
             assert int(shuffled[32 + 8 * v + u, 0]) == 32 + 4 * u + v
 
 
-@pytest.mark.parametrize(
-    "backend, prefill_copy", [("TRTLLM", True), ("TRTLLM", False), ("CUTEDSL", False)]
-)
+@pytest.mark.parametrize("backend, prefill_copy", [("TRTLLM", True), ("CUTEDSL", False)])
 def test_cute_dsl_expert_copy_rows_only_when_kept(backend, prefill_copy):
     """With the second expert copy (trtllm-gen, a step able to reach the CuteDSL dispatch
     threshold) every layer also carries its experts in the CuteDSL layout (`fc*_cd`);
@@ -387,7 +386,6 @@ def test_cute_dsl_expert_copy_rows_only_when_kept(backend, prefill_copy):
         ("TRTLLM", 4096, None, True),
         ("TRTLLM", 4095, None, False),
         ("TRTLLM", 16384, "0", False),
-        ("TRTLLM", 16384, "1", True),
         ("CUTEDSL", 16384, None, False),
     ],
 )

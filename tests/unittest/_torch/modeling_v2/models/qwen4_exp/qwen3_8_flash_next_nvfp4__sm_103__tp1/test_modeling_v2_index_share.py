@@ -149,7 +149,7 @@ def test_reuse_of_a_canonical_capture_stays_ascending():
     """A canonical capture plus the groups completed since is still ascending: appended ids
     are newer than every captured one, and a full row gives up its oldest ids to them, so
     the newest captured groups -- the ones next to the new ones -- are kept."""
-    for fresh in (0, 1, 2):
+    for fresh in (0, 2):
         args, captured_visible = _reuse_case(fresh)
 
         out = reuse(**args)

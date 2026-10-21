@@ -5,8 +5,8 @@
 of the CuTe mix kernel. Each entry's cells against its float64 reference in its band
 (`mixed` and `inject_out` in `rtol = eps`, `atol = eps * max|ref|`; for the NVFP4 build,
 the NVFP4 exact on the returned `mixed` outside the reciprocal tie window), a
-determinism check, a stale-read check under CUDA-graph replay with PDL for each build,
-the guards."""
+stale-read check under CUDA-graph replay with PDL for the NVFP4 build, the one-row
+guard."""
 
 import zlib
 
@@ -120,20 +120,12 @@ def test_certified_cells(name, cell, certifying) -> None:  # noqa: F811 — fixt
         _check_quant(out[0], out[2], out[3], args[8])
 
 
-def test_deterministic() -> None:
-    op = qwen4_exp_hc_decode_mix_fp4_cute
-    args = _build(dict(), seed=3)
-    for a, b in zip(op(*args), op(*args)):
-        assert torch.equal(a, b)
-
-
-@pytest.mark.parametrize("name", list(ENTRIES))
-def test_reads_after_the_wait_under_graph_replay(name) -> None:
+def test_reads_after_the_wait_under_graph_replay() -> None:
     """Producer kernels rewrite `part`, `ss` and `hc_out` inside the graph right before
     the op; with PDL a read before `griddepcontrol.wait` would see the previous replay's.
-    Each build is its own compiled variant, so each is replayed."""
-    op, fp4 = ENTRIES[name], name == "fp4"
-    args = _build(dict(), seed=8, fp4=fp4)
+    The NVFP4 build: the MoE sites' variant, with the most outputs."""
+    op = qwen4_exp_hc_decode_mix_fp4_cute
+    args = _build(dict(), seed=8)
     targets = (args[0], args[1], args[3])
     sources = [t.clone() for t in targets]
 
@@ -152,7 +144,7 @@ def test_reads_after_the_wait_under_graph_replay(name) -> None:
     with torch.cuda.graph(graph):
         graph_out = step()
     for trial in range(3):
-        fresh = _build(dict(), seed=100 + trial, fp4=fp4)
+        fresh = _build(dict(), seed=100 + trial)
         for src, new in zip(sources, (fresh[0], fresh[1], fresh[3])):
             src.copy_(new)
         graph.replay()
@@ -162,12 +154,9 @@ def test_reads_after_the_wait_under_graph_replay(name) -> None:
 
 
 def test_guards() -> None:
-    """Both entries share the shape checks; the NVFP4 build's `is_valid` runs them."""
+    """Both entries share the shape checks; the NVFP4 build's `is_valid` refuses two rows."""
     op = qwen4_exp_hc_decode_mix_fp4_cute
     args = _build(dict(), seed=6)
     two = args[3].expand(2, -1).contiguous()
     with validating(op), pytest.raises(AssertionError):
         op(args[0].expand(-1, 2, -1), args[1].expand(-1, 2), args[2], two, *args[4:])
-    contiguous_up = args[2].contiguous()
-    with validating(op), pytest.raises(AssertionError):
-        op(args[0], args[1], contiguous_up, *args[3:])

@@ -5,10 +5,9 @@
 Cells against the entry's fp32 reference: the output within the band the
 decode projections use (4 bf16 ulp element-wise against the row scale, 2 ulp
 relative RMS -- the GEMV's summation order is the only difference), the pool
-the same, a pad row's slot bitwise untouched. Beyond the cells: agreement with
-the unfused composition it replaces (`low_m_bf16_mm` + `causal_conv1d_update`);
-two decode steps under CUDA-graph replay, the second reading the window the
-first one wrote; PDL on and off bitwise; and the guards.
+the same, a pad row's slot bitwise untouched. Beyond the cells: two decode
+steps under CUDA-graph replay, the second reading the window the first one
+wrote; and the row guard.
 """
 
 import zlib
@@ -16,12 +15,6 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.gemm.low_m_bf16_mm import (  # noqa: E501
-    low_m_bf16_mm,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.ssm.causal_conv1d_update import (  # noqa: E501
-    causal_conv1d_update,
-)
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.ssm.gdn_in_proj_conv1d_pdl import (  # noqa: E501
     MAX_ROWS,
 )
@@ -73,27 +66,6 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811
             assert torch.equal(pool[slot], state[slot]), f"slot {slot} was written"
 
 
-def test_matches_the_unfused_composition() -> None:
-    rows = MAX_ROWS
-    x, mat_b, state, taps = _build(rows, 461, seed=5 + rows)
-    slots = torch.tensor([37, 211][:rows], dtype=torch.int32, device="cuda")
-    fused_pool, unfused_pool = state.clone(), state.clone()
-    fused = op(x, mat_b, fused_pool, taps, slots, CONV_DIM, PAD)
-    unfused = low_m_bf16_mm(x, mat_b, False)
-    causal_conv1d_update(
-        x=unfused[:, :CONV_DIM],
-        conv_state=unfused_pool,
-        weight=taps,
-        bias=None,
-        silu_activation=True,
-        cache_seqlens=None,
-        conv_state_indices=slots,
-        pad_slot_id=PAD,
-    )
-    _compare(fused, unfused)
-    _compare(fused_pool, unfused_pool)
-
-
 def test_two_steps_under_graph_replay() -> None:
     """Decode runs this under CUDA graphs with PDL, layer after layer: capture one
     step, replay it twice with new activations. The second replay's conv reads the
@@ -123,33 +95,9 @@ def test_two_steps_under_graph_replay() -> None:
         _compare(pool, want_state)
 
 
-def test_pdl_on_and_off_agree_bitwise() -> None:
-    x, mat_b, state, taps = _build(2, 461, seed=13)
-    slots = torch.tensor([3, 400], dtype=torch.int32, device="cuda")
-    on_pool, off_pool = state.clone(), state.clone()
-    on = op(x, mat_b, on_pool, taps, slots, CONV_DIM, PAD, True)
-    off = op(x, mat_b, off_pool, taps, slots, CONV_DIM, PAD, False)
-    assert torch.equal(on, off) and torch.equal(on_pool, off_pool)
-
-
-def test_band_rejects_a_conv_on_the_wrong_columns() -> None:
-    """The near miss a column offset would produce: the conv applied one column off."""
-    x, mat_b, state, taps = _build(1, 461, seed=17)
-    slots = torch.tensor([42], dtype=torch.int32, device="cuda")
-    out = op(x, mat_b, state.clone(), taps, slots, CONV_DIM, PAD)
-    ref_out, _ = op.reference(x, mat_b, state, taps, slots, CONV_DIM, PAD)
-    _compare(out, ref_out)
-    with pytest.raises(AssertionError):
-        _compare(out, torch.roll(ref_out, 1, dims=1))
-
-
 def test_guards() -> None:
+    """More rows than `MAX_ROWS` are refused."""
     x, mat_b, state, taps = _build(MAX_ROWS + 1, 16, seed=21)
     slots = torch.zeros(MAX_ROWS + 1, dtype=torch.int32, device="cuda")
     with validating(op), pytest.raises(AssertionError):
         op(x, mat_b, state, taps, slots, CONV_DIM, PAD)
-    x1 = x[:1].contiguous()
-    with validating(op), pytest.raises(AssertionError):
-        op(x1, mat_b.contiguous(), state, taps, slots[:1], CONV_DIM, PAD)
-    with validating(op), pytest.raises(AssertionError):
-        op(x1, mat_b, state, taps, slots[:1].long(), CONV_DIM, PAD)

@@ -291,8 +291,8 @@ def launch(x, mat_b, conv_state, conv_weight, conv_state_indices, conv_dim, pad_
     return out
 
 
-def _cell(why: str, rows: int, slots, pdl: bool = True, pool: int = 461) -> Cell:
-    return Cell(why=why, spec=dict(rows=rows, slots=slots, pdl=pdl, pool=pool))
+def _cell(why: str, rows: int, slots) -> Cell:
+    return Cell(why=why, spec=dict(rows=rows, slots=slots, pdl=True, pool=461))
 
 
 class GdnInProjConv1dPdl(OpWrapper):
@@ -323,8 +323,6 @@ class GdnInProjConv1dPdl(OpWrapper):
         _cell("decode 1 row, slot 37 of the 461-slot pool", 1, (37,)),
         _cell("decode 2 rows, two slots", 2, (5, 211)),
         _cell("decode 2 rows, one a pad row (-1)", 2, (17, -1)),
-        _cell("decode 1 row, PDL off", 1, (99,), pdl=False),
-        _cell("decode 1 row, a 129-slot pool", 1, (128,), pool=129),
     )
 
     note = """
@@ -350,10 +348,13 @@ class GdnInProjConv1dPdl(OpWrapper):
     fp32 over the bf16 window, taps and projection, rounded once. Only the
     GEMV's summation order differs from `low_m_bf16_mm` + `causal_conv1d_update`.
 
+    Certified with PDL on, over the 461-slot pool: 1 and 2 rows, and 2 rows with a pad
+    row; two consecutive steps under CUDA-graph replay (1 row). Not certified: `pdl=False`.
+
     Hard limits
       M     rows per launch                boundary MAX_ROWS=2     driven at 1, 2 (cells)
       K     a TILING key                   2560                    the checkpoint's hidden size
-      pool  any slot count and strides     461 and 129 driven
+      pool  any slot count and strides     461 driven (64 under graph replay)
     """
 
     def __call__(

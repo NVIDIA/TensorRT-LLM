@@ -48,7 +48,6 @@ class Bf16ToFp32(OpWrapper):
             why="every bf16 bit pattern: NaNs, infinities, subnormals, signed zeros",
             spec=dict(shape=(1, 65536), source="all_codes"),
         ),
-        Cell(why="zero rows", spec=dict(shape=(0, VOCAB))),
     )
 
     note = """

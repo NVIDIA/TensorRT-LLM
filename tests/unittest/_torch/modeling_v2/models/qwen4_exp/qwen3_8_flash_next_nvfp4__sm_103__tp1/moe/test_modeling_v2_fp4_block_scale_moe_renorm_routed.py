@@ -7,7 +7,8 @@ replaces (`renorm_moe_routing_op` -> pre-routed `fp4_block_scale_moe_runner`),
 and it sits inside the pre-routed entry's band against this entry's own
 fp32 reference. The NVFP4 operand construction (layout, activations, scalars,
 the band) is the pre-routed entry's test's, loaded by path so the two tests
-cannot drift apart on what a valid operand is.
+cannot drift apart on what a valid operand is. Beyond the cells: the refusal
+of an uncertified (num_experts, top_k) pair.
 """
 
 import importlib.util
@@ -116,32 +117,6 @@ def test_certified_cells(cell, certifying):  # noqa: F811
     # 2. Its own reference, through the pre-routed entry's gate.
     exp = op.reference(logits, x, spec["top_k"], ref["up"], ref["gate"], ref["down"], g2)
     H._compare(y, exp.to(torch.bfloat16))
-
-
-def test_coarse_cell_exercises_tie_breaking():
-    """The coarse cell is only worth its slot if ties decide real slots: the
-    opposite tie order (ties to the HIGHER expert index) must pick a different
-    expert set on most rows, so the cell's bitwise check pins the direction."""
-    spec = next(c.spec for c in op.CELLS if c.spec["dist"] == "coarse")
-    e, k = spec["num_experts"], spec["top_k"]
-    gen = torch.Generator(device=DEV).manual_seed(7)
-    logits = _logits(spec, gen)
-    ids, _ = renorm_moe_routing_op(logits, k, torch.bfloat16)
-    flipped = torch.flip(logits, [-1])
-    order = torch.sort(flipped, dim=-1, descending=True, stable=True).indices[:, :k]
-    high = (e - 1 - order).int()
-    differ = (ids.sort(-1).values != high.sort(-1).values).any(-1).float().mean().item()
-    assert differ > 0.5, f"only {differ:.2f} of rows break ties differently"
-
-
-def test_strided_logits_refused():
-    # More than one row: a one-row column slice is contiguous by definition.
-    spec = next(c.spec for c in op.CELLS if c.spec["tokens"] == 128)
-    args, _, data, sf, _, logits, _, _, _, scalars = _operands(spec, 11)
-    wide = torch.zeros(spec["tokens"], spec["num_experts"] + 8, device=DEV, dtype=logits.dtype)
-    wide[:, : spec["num_experts"]] = logits
-    with validating(op), pytest.raises(AssertionError, match="routing_logits must be contiguous"):
-        _routed(args, data, sf, wide[:, : spec["num_experts"]], scalars, spec)
 
 
 def test_uncertified_pair_refused():

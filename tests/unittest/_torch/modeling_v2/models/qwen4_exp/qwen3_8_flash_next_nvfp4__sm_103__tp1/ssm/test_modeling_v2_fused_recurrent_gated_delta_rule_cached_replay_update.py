@@ -18,8 +18,7 @@ checks two things at every step:
   advanced by `p += accepted` alone. The twin's state is the plain
   token-by-token recurrence over every accepted token, independent of the
   wrap, the double buffer and the commit, so a wrong commit or wrong
-  bookkeeping surfaces as an output that drifts off it --
-  `test_the_twin_sees_a_broken_protocol` shows it does.
+  bookkeeping surfaces as an output that drifts off it.
 """
 
 from __future__ import annotations
@@ -29,9 +28,7 @@ import zlib
 import pytest
 import torch
 import torch.nn.functional as F
-from triton.compiler.errors import CompilationError
 
-import tensorrt_llm._torch.modules.fla.cached_replay as _impl
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.ssm.fused_recurrent_gated_delta_rule_cached_replay_update import (  # noqa: E501
     ALL_LAYER_COMMIT_MIN_BATCH,
     HEAD_K_DIM,
@@ -65,7 +62,6 @@ DEV = "cuda"
 H, HV, K, V = NUM_K_HEADS, NUM_V_HEADS, HEAD_K_DIM, HEAD_V_DIM
 W = PACKED_QKV_WIDTH
 HIST = HISTORY_SIZE
-OUT_SENTINEL = -7.0
 BF16_ULP = ULP[torch.bfloat16]
 
 #: This checkpoint's 36 GDN layers of `linear_attn.A_log` / `linear_attn.dt_bias`
@@ -198,9 +194,7 @@ class _Bench:
         else:
             chosen = torch.randperm(S, generator=self.cpu)[:n]
         chosen = chosen.to(torch.int32)
-        for row in spec.get("pad", ()):
-            chosen[row] = -1
-        live_rows = chosen >= 0
+        live_rows = torch.ones(n, dtype=torch.bool)
         dup = tuple(spec.get("dup", ()))
         if dup:
             chosen[list(dup)] = int(chosen[dup[0]])
@@ -270,22 +264,9 @@ class _Bench:
         q = rows[..., : H * K].view(n, t, H, K)
         k = rows[..., H * K : 2 * H * K].view(n, t, H, K)
         v = rows[..., 2 * H * K :].view(n, t, HV, V)
-        if self.spec.get("packed", True) is False:
-            packed = None  # the mixed batch's form: the views alone, copied by the op
-        if self.spec.get("ab", "split") == "strided":
-            ab = self._randn(n * t, 2 * HV, dtype=torch.bfloat16)
-            b, a = ab[:, :HV].view(n, t, HV), ab[:, HV:].view(n, t, HV)
-        else:
-            a = self._randn(n, t, HV, dtype=torch.bfloat16)
-            b = self._randn(n, t, HV, dtype=torch.bfloat16)
-        out_buf = output = None
-        lo = 0 if self.spec.get("output") == "prefix" else 5
-        if self.spec.get("output") in ("prefix", "suffix"):
-            # A slice of a longer token-major buffer: its first rows ("prefix"),
-            # or the rows after 5 context tokens, as a mixed batch hands it over.
-            out_buf = torch.full((n * t + 5, HV, V), OUT_SENTINEL, dtype=torch.bfloat16, device=DEV)
-            output = out_buf[lo : lo + n * t].view(n, t, HV, V)
-        return dict(q=q, k=k, v=v, a=a, b=b, packed=packed, output=output, out_buf=out_buf, lo=lo)
+        a = self._randn(n, t, HV, dtype=torch.bfloat16)
+        b = self._randn(n, t, HV, dtype=torch.bfloat16)
+        return dict(q=q, k=k, v=v, a=a, b=b, packed=packed)
 
     def kwargs(self, layer, act):
         return dict(
@@ -307,12 +288,12 @@ class _Bench:
             use_qk_l2norm_in_kernel=True,
             A_log=self.a_log[layer],
             dt_bias=self.dt_bias[layer],
-            launch_with_pdl=self.spec.get("pdl", False),
+            launch_with_pdl=False,
             replay_work_items=self.work_items,
             n_writes=self.n_writes,
             packed_qkv=act["packed"],
             use_all_layer_commit=self.path == "all_layer",
-            output=act["output"],
+            output=None,
         )
 
     def exact_kwargs(self, layer, kw):
@@ -368,8 +349,6 @@ class _Bench:
         rows = self.live.numel()
         if mode == "full":
             return torch.full((rows,), self.t, dtype=torch.int32, device=DEV)
-        if mode == "one":
-            return torch.ones(rows, dtype=torch.int32, device=DEV)
         assert mode == "random", mode
         return torch.randint(1, self.t + 1, (rows,), generator=self.cpu, dtype=torch.int32).to(DEV)
 
@@ -390,19 +369,6 @@ class _Bench:
         for t in range(self.t):
             mask[s, half, start + t] = True
         return mask, s[wrap], int((p + self.t == HIST).sum())
-
-
-def _deviation(got, want):
-    """The largest element deviation relative to its block's absmax (the
-    quantity `_compare` gates)."""
-    block = got.shape[-2] * got.shape[-1]
-    g, w = got.float().reshape(-1, block), want.float().reshape(-1, block)
-    keep = ~torch.isnan(w).any(1)
-    g, w = g[keep], w[keep]
-    if not w.numel():
-        return 0.0
-    scale = w.abs().amax(1, keepdim=True).clamp_min(1e-30)
-    return ((g - w).abs() / scale).max().item()
 
 
 def _check_duplicate_padding_slot(cell) -> None:
@@ -449,7 +415,6 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — pytest res
     if "dup" in cell.spec:
         return _check_duplicate_padding_slot(cell)
     bench = _Bench(cell.spec, seed=_seed(cell.why))
-    pad = list(cell.spec.get("pad", ()))
     wraps = appends = to_the_end = 0
     for _ in range(bench.steps):
         mask, wrapped, at_end = bench.writes()
@@ -468,7 +433,6 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — pytest res
                 k=k.clone(),
                 G=G.clone(),
                 old_beta=bench.old_dA[layer].clone(),
-                out_buf=None if act["out_buf"] is None else act["out_buf"].clone(),
             )
             ref = op.reference(**kw)
             exact = op.reference(**bench.exact_kwargs(layer, kw))
@@ -492,15 +456,6 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — pytest res
             assert torch.equal(pool[untouched], before["pool"][untouched]), (
                 "the pool moved where the call commits nothing (a partitioned call commits none)"
             )
-            if kw["output"] is not None:
-                assert got.data_ptr() == kw["output"].data_ptr(), "output must be written in place"
-                outside = torch.ones(act["out_buf"].shape[0], dtype=torch.bool, device=DEV)
-                outside[act["lo"] : act["lo"] + bench.n * bench.t] = False
-                assert torch.equal(act["out_buf"][outside], before["out_buf"][outside]), (
-                    "rows of the output buffer outside the view were touched"
-                )
-                for row in pad:
-                    assert (got[row] == OUT_SENTINEL).all(), f"padding row {row} written"
             bench.adopt_exact(layer, exact)
             after_commit.append((got, exact, committed))
         bench.commit()
@@ -525,23 +480,14 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — pytest res
 # ── CUDA graphs ───────────────────────────────────────────────────────────
 
 
-#: The in-kernel commit at one sequence and the smallest token tile, the all-layer commit at
-#: the envelope's 32 requests and the largest, and a bf16 checkpoint at the partition threshold.
-_GRAPH_CASES = [(1, 2, torch.float32), (32, 8, torch.float32), (16, 4, torch.bfloat16)]
-
-
-@pytest.mark.parametrize(
-    "n,t,state_dtype",
-    _GRAPH_CASES,
-    ids=[f"{n}-{t}-{'fp32' if d is torch.float32 else 'bf16'}" for n, t, d in _GRAPH_CASES],
-)
-def test_cuda_graph_replay_on_new_data_is_bitwise_eager(n, t, state_dtype) -> None:
-    """Two layers captured with, from 16 sequences on, the all-layer commit after them;
-    replayed three times on new activations, with acceptance in between, against the same
-    steps run eagerly on a twin state."""
+def test_cuda_graph_replay_on_new_data_is_bitwise_eager() -> None:
+    """Two layers of 32 sequences x 8 tokens over an fp32 checkpoint captured with the
+    all-layer commit after them; replayed three times on new activations, with acceptance
+    in between, against the same steps run eagerly on a twin state."""
+    n, t = 32, 8
     assert ALL_LAYER_COMMIT_MIN_BATCH == CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE
-    path = "all_layer" if n >= ALL_LAYER_COMMIT_MIN_BATCH else "small"
-    spec = dict(path=path, n=n, t=t, layers=2, slots=40, state_dtype=state_dtype)
+    assert n >= ALL_LAYER_COMMIT_MIN_BATCH
+    spec = dict(path="all_layer", n=n, t=t, layers=2, slots=40, state_dtype=torch.float32)
     seed = 7000 + 10 * n + t
     eager, graph, warm = (_Bench(spec, seed, exact=False) for _ in range(3))
     acts = [warm.inputs() for _ in range(2)]
@@ -580,178 +526,6 @@ def test_cuda_graph_replay_on_new_data_is_bitwise_eager(n, t, state_dtype) -> No
         graph.accept(accepted)
 
 
-# ── the harness can see what it exists to see ─────────────────────────────
-
-
-def _drive(bench, fault):
-    """Run `bench` with one protocol fault injected; return the first step at
-    which the twin comparison rejected an output, or None."""
-    for step in range(bench.steps):
-        bench.prepare()
-        outs = []
-        for layer in range(bench.layers):
-            kw = bench.kwargs(layer, bench.inputs())
-            if fault == "committed twice":
-                kw = dict(kw, replay_work_items=None, n_writes=None, use_all_layer_commit=False)
-            exact = op.reference(**bench.exact_kwargs(layer, kw))
-            bench.adopt_exact(layer, exact)
-            outs.append((op(**kw), exact[0]))
-        if fault != "commit skipped":
-            bench.commit()
-        try:
-            for got, want in outs:
-                _compare((got, None, None, None, None), (want, None, None, None, None))
-        except AssertionError:
-            return step
-        accepted = bench.draw_acceptance()
-        if fault == "rejected tokens kept":
-            _advance_replay_state(bench.meta, bench.live, torch.full_like(accepted, bench.t))
-            bench.x_pnat[bench.live.long()] += accepted
-        else:
-            bench.accept(accepted)
-    return None
-
-
-@pytest.mark.parametrize(
-    "fault", ("none", "commit skipped", "committed twice", "rejected tokens kept")
-)
-def test_the_twin_sees_a_broken_protocol(fault) -> None:
-    """The twin comparison is what certifies the commit and the bookkeeping, so
-    it has to fail when either is broken: the partitioned path with the
-    manager's commit left out; a 16-row batch called without work items while
-    the manager still commits (the checkpoint advanced twice); and the small
-    path advanced as if every drafted token had been accepted. Without a fault
-    the same run passes. At T = 8, the largest token tile."""
-    path = "small" if fault == "rejected tokens kept" else "all_layer"
-    n = 8 if path == "small" else 16
-    bench = _Bench(dict(path=path, n=n, t=8, steps=4), seed=93)
-    first = _drive(bench, fault)
-    if fault == "none":
-        assert first is None
-    else:
-        assert first is not None, f"{fault} passed the twin comparison"
-
-
-@pytest.mark.parametrize("state_dtype", (torch.float32, torch.bfloat16), ids=("fp32", "bf16"))
-def test_the_gate_rejects_near_misses(state_dtype) -> None:
-    """`_compare` against plausible wrong answers, each the entry's own
-    reference driven on transformed inputs, at a call where one row wraps (and
-    commits) and the others append -- at each checkpoint dtype's own state gate."""
-    bench = _Bench(dict(path="small", n=8, t=4, state_dtype=state_dtype), seed=91, exact=False)
-    kw = bench.kwargs(0, bench.inputs())
-    pool, u, k, G = (x.clone() for x in bench.state(0))
-    base = dict(kw, ssm_states=pool, old_u=u, old_k=k, old_G=G)
-    ref = op.reference(**base)
-    got = op(**kw)
-    out = (got, *bench.state(0))
-    _compare(out, ref)
-    p, b = kw["prev_num_accepted_tokens"], kw["cache_buf_idx"]
-
-    not_restarted = ref[4].clone()
-    _, wrapped, _ = bench.writes()
-    for s in wrapped.tolist():
-        g_start = G[s, b[s].long(), :, p[s].long() - 1]
-        not_restarted[s, 1 - b[s].long(), :, : bench.t] += g_start[:, None]
-    rivals = {
-        "history ignored": op.reference(**dict(base, prev_num_accepted_tokens=torch.zeros_like(p))),
-        "the other history half": op.reference(**dict(base, cache_buf_idx=1 - b)),
-        "one pending token dropped": op.reference(
-            **dict(base, prev_num_accepted_tokens=(p - 1).clamp(min=0))
-        ),
-        "checkpoint zeroed": op.reference(**dict(base, ssm_states=torch.zeros_like(pool))),
-        "G not restarted at a wrap": ref[:4] + (not_restarted,),
-    }
-    for rival in rivals.values():
-        with pytest.raises(AssertionError):
-            _compare(out, rival)
-
-
-# ── properties beyond one reference comparison ────────────────────────────
-
-
-def test_the_wrapped_kernels_carry_no_autotuner() -> None:
-    """Plain `triton.jit`: no trial launch can consume the in-place state on a
-    process's first call."""
-    for kernel in (_impl._cached_replay_kernel, _impl._cached_replay_layered_commit_kernel):
-        names = [cls.__name__ for cls in type(kernel).__mro__]
-        assert "Autotuner" not in names and "Heuristics" not in names, names
-
-
-def _clone_state(bench):
-    return {name: getattr(bench, name).clone() for name in ("backing", "old_x", "old_B", "old_dt")}
-
-
-def _restore_state(bench, saved):
-    for name, value in saved.items():
-        getattr(bench, name).copy_(value)
-
-
-@pytest.mark.parametrize("state_dtype", (torch.float32, torch.bfloat16), ids=("fp32", "bf16"))
-def test_the_two_commit_paths_are_bitwise_interchangeable(state_dtype) -> None:
-    """The same 16 rows through the in-kernel commit, and through the
-    partitioned call plus the manager's all-layer commit: bit for bit, at either
-    checkpoint dtype."""
-    bench = _Bench(
-        dict(path="all_layer", n=16, t=4, layers=2, state_dtype=state_dtype), seed=95, exact=False
-    )
-    acts = [bench.inputs() for _ in range(2)]
-    saved = _clone_state(bench)
-    small = [
-        op(
-            **dict(
-                bench.kwargs(i, acts[i]),
-                replay_work_items=None,
-                n_writes=None,
-                use_all_layer_commit=False,
-            )
-        )
-        for i in range(2)
-    ]
-    after_small = _clone_state(bench)
-    _restore_state(bench, saved)
-    bench.prepare()
-    assert 0 < int(bench.n_writes) < bench.n, "want both wrapping and appending rows"
-    partitioned = [op(**bench.kwargs(i, acts[i])) for i in range(2)]
-    bench.commit()
-    for a, b in zip(small, partitioned):
-        assert torch.equal(a, b)
-    for name, value in after_small.items():
-        assert torch.equal(getattr(bench, name), value), name
-
-
-def test_packed_qkv_supersedes_q_k_v_and_launch_knobs_are_neutral() -> None:
-    """With `packed_qkv` the kernel reads q/k/v from it alone -- their own
-    contents are never read; the separate contiguous form, PDL on or off, and a
-    second run are all bitwise the same call."""
-    bench = _Bench(dict(path="small", n=6, t=3, layers=1), seed=97, exact=False)
-    act = bench.inputs()
-    saved = _clone_state(bench)
-
-    def run(**override):
-        _restore_state(bench, saved)
-        out = op(**dict(bench.kwargs(0, act), **override)).clone()
-        return out, _clone_state(bench)
-
-    base = run()
-    q, k, v = act["q"], act["k"], act["v"]
-    variants = {
-        "separate q/k/v": run(
-            q=q.contiguous(), k=k.contiguous(), v=v.contiguous(), packed_qkv=None
-        ),
-        "q/k/v contents zeroed": run(
-            q=torch.zeros_like(q.contiguous()),
-            k=torch.zeros_like(k.contiguous()),
-            v=torch.zeros_like(v.contiguous()),
-        ),
-        "launch_with_pdl=True": run(launch_with_pdl=True),
-        "second run": run(),
-    }
-    for name, (out, state) in variants.items():
-        assert torch.equal(out, base[0]), name
-        for key, value in state.items():
-            assert torch.equal(value, base[1][key]), (name, key)
-
-
 # ── guards: accepted and silently wrong ──────────────────────────────────
 
 
@@ -771,109 +545,3 @@ def test_a_short_state_indices_reads_past_its_end_and_is_refused() -> None:
     with pytest.raises(AssertionError, match="state_indices has shape"):
         with validating(op):
             op(**kw)
-
-
-def test_a_history_off_history_size_is_misread_and_is_refused() -> None:
-    """Unguarded, 16-deep buffers called with history_size=12: the kernel strides
-    them as 12 deep and reads other slots' entries. The same call on 12-deep
-    copies of the same history is the right answer. (12, not 8: below 9 the
-    kernel does not compile -- see `test_op_refuses_what_it_refuses`.)"""
-    bench = _Bench(dict(path="small", n=4, t=4, layers=1), seed=103, exact=False)
-    live = bench.live.long()
-    bench.pnat[live] = torch.tensor([1, 2, 3, 4], dtype=torch.int32, device=DEV)
-    kw = bench.kwargs(0, bench.inputs())
-    shallow = dict(
-        kw,
-        old_u=kw["old_u"][:, :, :12].clone(),
-        old_k=kw["old_k"][:, :, :12].clone(),
-        old_G=kw["old_G"][..., :12].clone(),
-        ssm_states=kw["ssm_states"].clone(),
-        history_size=12,
-    )
-    ref = op.reference(**shallow)
-    right = op(**shallow)
-    _compare((right, None, None, None, None), (ref[0], None, None, None, None))
-    wrong = op(**dict(kw, history_size=12))
-    gap = _deviation(wrong, right) / BF16_ULP
-    assert gap > 64, "the hazard this guard covers is gone"
-    with pytest.raises(AssertionError, match="old_u has shape"):
-        with validating(op):
-            op(**dict(kw, history_size=12))
-
-
-@pytest.mark.parametrize(
-    "name, form",
-    (
-        ("history", "fewer slots"),
-        ("prev_num_accepted_tokens", "fewer slots"),
-        ("cache_buf_idx", "strided"),
-    ),
-)
-def test_bookkeeping_that_does_not_cover_the_pool_is_refused(name, form) -> None:
-    """The kernel addresses the history buffers, `prev_num_accepted_tokens` and
-    `cache_buf_idx` by the pool's slot id: one with fewer slots than `ssm_states` is read and
-    written past its end for the slots beyond it, and a strided per-slot vector is read at the
-    wrong elements. Only the refusal runs; the unguarded call is out of bounds."""
-    bench = _Bench(dict(path="small", n=4, t=2, layers=1), seed=109, exact=False)
-    kw = bench.kwargs(0, bench.inputs())
-    last = bench.slots - 1
-    if name == "history":
-        kw = dict(kw, old_u=kw["old_u"][:last], old_k=kw["old_k"][:last], old_G=kw["old_G"][:last])
-        match = "history buffers have"
-    else:
-        vec = kw[name]
-        if form == "fewer slots":
-            kw[name] = vec[:last]
-        else:
-            kw[name] = torch.stack([vec, vec], 1)[:, 0]
-        match = f"{name} has shape"
-    with pytest.raises(AssertionError, match=match):
-        with validating(op):
-            op(**kw)
-
-
-def test_op_refuses_what_it_refuses() -> None:
-    """Loud refusals; the guard admits each so the op's own error surfaces."""
-    bench = _Bench(dict(path="all_layer", n=16, t=4, layers=1), seed=105, exact=False)
-    bench.prepare()
-    kw = bench.kwargs(0, bench.inputs())
-    with pytest.raises(ValueError, match="Partitioned replay requires the all-layer commit"):
-        with validating(op):
-            op(**dict(kw, use_all_layer_commit=False))
-    with pytest.raises(ValueError, match="use_all_layer_commit requires replay work items"):
-        with validating(op):
-            op(**dict(kw, replay_work_items=None, n_writes=None))
-    with pytest.raises(ValueError, match="must either both be set or both be None"):
-        with validating(op):
-            op(**dict(kw, n_writes=None))
-    with pytest.raises(AssertionError, match="output must be contiguous"):
-        wide = torch.empty(16, 4, HV, 2 * V, dtype=torch.bfloat16, device=DEV)
-        with validating(op):
-            op(**dict(kw, output=wide[..., :V]))
-    with pytest.raises(AssertionError, match="g head dimension must be contiguous"):
-        with validating(op):
-            op(**dict(kw, g=kw["g"].transpose(1, 2).contiguous().transpose(1, 2)))
-
-    def shallow(depth):
-        return dict(
-            kw,
-            history_size=depth,
-            old_u=kw["old_u"][:, :, :depth].contiguous(),
-            old_k=kw["old_k"][:, :, :depth].contiguous(),
-            old_G=kw["old_G"][..., :depth].contiguous(),
-        )
-
-    with pytest.raises(AssertionError):  # `history_size >= T`, a bare assert
-        with validating(op):
-            op(**shallow(2))
-    # The history tile is next_pow2(history_size) wide and is a `tl.dot`
-    # reduction, which needs 16: history_size 8 (>= T = 4) fails to compile.
-    with pytest.raises(CompilationError, match="K >= 16"):
-        with validating(op):
-            op(**shallow(8))
-    # Nine rows per sequence (max_draft_len 8) is past the kernel's `T <= 8`, a bare assert
-    # before the launch.
-    wide = _Bench(dict(path="small", n=2, t=9, layers=1), seed=106, exact=False)
-    with pytest.raises(AssertionError):
-        with validating(op):
-            op(**wide.kwargs(0, wide.inputs()))

@@ -73,61 +73,23 @@ class ChunkGatedDeltaRule(OpWrapper):
 
     ARCHS = frozenset({Arch.SM_103})
 
-    # spec: seqlens (packed with cu_seqlens); initial: "indexed" (a `slots`-row
-    # pool at `indices`) | "positional"; pool_dtype (fp32 | bf16, the dtype of
-    # the indexed pool); output: None | "buffer" | "window" (wide[:, 50:146] of
-    # a 200-token buffer).
+    # spec: seqlens (packed with cu_seqlens); the initial state is the
+    # `ENGINE_SLOTS`-row pool at `indices`, written in place; pool_dtype (fp32 |
+    # bf16); output: None | "buffer" (a fresh `output=` tensor).
     CELLS: tuple[Cell, ...] = (
         Cell(
             why="fp32 pool (a verify step's context rows), 461 slots, output= buffer",
-            spec=dict(
-                seqlens=(200, 37, 91),
-                initial="indexed",
-                slots=ENGINE_SLOTS,
-                indices=_engine_slots(3),
-                output="buffer",
-            ),
-        ),
-        Cell(
-            why="fp32 pool, 461-slot pool, seqlens [1024]",
-            spec=dict(
-                seqlens=(1024,), initial="indexed", slots=ENGINE_SLOTS, indices=_engine_slots(1)
-            ),
-        ),
-        Cell(
-            why="bf16 pool, 461-slot pool, output= buffer",
-            spec=dict(
-                seqlens=(200, 37, 91),
-                initial="indexed",
-                slots=ENGINE_SLOTS,
-                indices=_engine_slots(3),
-                pool_dtype=torch.bfloat16,
-                output="buffer",
-            ),
+            spec=dict(seqlens=(200, 37, 91), indices=_engine_slots(3), output="buffer"),
         ),
         Cell(
             why="bf16 pool, 461-slot pool, seqlens [1024]",
-            spec=dict(
-                seqlens=(1024,),
-                initial="indexed",
-                slots=ENGINE_SLOTS,
-                indices=_engine_slots(1),
-                pool_dtype=torch.bfloat16,
-            ),
+            spec=dict(seqlens=(1024,), indices=_engine_slots(1), pool_dtype=torch.bfloat16),
         ),
         Cell(
             why="bf16 pool, mixed step: a context and four 1-token rows [200, 1, 1, 1, 1]",
             spec=dict(
-                seqlens=(200, 1, 1, 1, 1),
-                initial="indexed",
-                slots=ENGINE_SLOTS,
-                indices=_engine_slots(5),
-                pool_dtype=torch.bfloat16,
+                seqlens=(200, 1, 1, 1, 1), indices=_engine_slots(5), pool_dtype=torch.bfloat16
             ),
-        ),
-        Cell(
-            why="output= a token-window slice of a wider buffer",
-            spec=dict(seqlens=(96,), initial="positional", output="window"),
         ),
     )
 
@@ -140,7 +102,9 @@ class ChunkGatedDeltaRule(OpWrapper):
     or bf16 as `mamba_ssm_cache_dtype` allocated it, int32 slots, int64
     `cu_seqlens`; the MTP-verify context half passes the `si_p` / `qsl_long_p`
     prefixes, and a mixed batch's one-token decode rows ride in the same call.
-    Certified at 461 slots.
+    Certified at 461 slots: three ragged context rows over an fp32 pool into
+    an `output=` buffer, one 1024-token sequence over a bf16 pool, and a
+    mixed step (a context and four one-token rows) over a bf16 pool.
 
     Over a bf16 pool the initial state is read as fp32 and the final state is stored
     rounded once to bf16, once per call and sequence; the accumulation is unchanged.
@@ -160,14 +124,16 @@ class ChunkGatedDeltaRule(OpWrapper):
     by the caller or the in-kernel flag (raw q/k with the flag off return
     finite values ~1e25). `head_first` is pinned False.
 
-    Sequence lengths are unconstrained: certified at 1..1024, off and on the
-    64 boundary, mixed ragged. Memory: a `[B, NT, H, K, V]` per-chunk state
-    scratch in `q.dtype`, 24 MiB per 1024 tokens here. Deterministic.
+    Sequence lengths are unconstrained: certified at 1, 37, 91, 200 and 1024,
+    off and on the 64 boundary, mixed ragged. Memory: a `[B, NT, H, K, V]`
+    per-chunk state scratch in `q.dtype`, 24 MiB per 1024 tokens here.
+    Deterministic.
 
     Not certified: the FlashInfer sibling, fp16 (accepted), bf16 `g`/`beta`, an
     fp16 pool, `K = 256` (accepted, unmeasured), empty `T` or zero-length spans,
-    and what the target never passes: `initial_state=None`, `output_final_state`,
-    `use_qk_l2norm_in_kernel`, an explicit `scale`, no `cu_seqlens`.
+    and what the target never passes: `initial_state=None` or a positional
+    initial state, `output_final_state`, `use_qk_l2norm_in_kernel`, an explicit
+    `scale`, no `cu_seqlens`.
 
     Hard limits
       K  state kernel asserts K <= 256 (read, not probed)

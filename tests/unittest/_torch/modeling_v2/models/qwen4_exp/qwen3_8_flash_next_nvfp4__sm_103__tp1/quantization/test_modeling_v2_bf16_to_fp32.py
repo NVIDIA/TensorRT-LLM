@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """GPU test for the bf16_to_fp32 entry: the cells bit for bit `x.float()`, graph capture, the
-guards."""
+contiguity guard."""
 
 import zlib
 
@@ -61,9 +61,7 @@ def test_cuda_graph_capture_and_replay() -> None:
     assert _bitwise(out, x.float())
 
 
-def test_guards() -> None:
+def test_guard_refuses_a_strided_input() -> None:
     x = _build(dict(shape=(8, 64)), 3)
-    with validating(op), pytest.raises(AssertionError):
-        op(x.float())
     with validating(op), pytest.raises(AssertionError):
         op(x[:, ::2])

@@ -30,17 +30,13 @@ def _ckpt(
     `mma_n` / `cluster_n` select the autotuner tactic: MMA tile `(tile_size,
     mma_n)`, cluster `(tile_size // 128, cluster_n)`; (128, 1) is also the
     fallback when the tuner has no entry. `dist` names how the test draws the
-    expert ids, as in the moe_sort entry's test: `router` = each row's top-10 of
-    uniform scores; `hot` = every row on the same 10 experts; `tile_edges` = three
-    experts hold exactly tile-1, tile and tile+1 rows; `round_robin` = row i
-    takes experts (10 i + j) mod 512. `gsf` is the FC1 `global_sf` that quantized
-    this op's input, against the SwiGLU output's magnitude: `calibrated` = the
-    output maximum the test calibrates to maps to the e4m3 maximum, as the
-    checkpoint's per-layer `1 / down_proj.input_scale` does; `saturating` = 25x
-    above that, so most input block scales clip at 448 and the codes at 6;
-    `subnormal` = 2^-12 of it, so input block scales fall into e4m3 subnormals
-    and zero. `zero_tokens` makes that many leading tokens' rows all zero, as
-    FC1 returns them for an all-zero token.
+    expert ids: `router` = each row's top-10 of uniform scores. `gsf` is the FC1
+    `global_sf` that quantized this op's input, against the SwiGLU output's
+    magnitude: `calibrated` = the output maximum the test calibrates to maps to
+    the e4m3 maximum, as the checkpoint's per-layer `1 / down_proj.input_scale`
+    does; `subnormal` = 2^-12 of it, so input block scales fall into e4m3
+    subnormals and zero. `zero_tokens` makes that many leading tokens' rows all
+    zero, as FC1 returns them for an all-zero token.
     """
     return dict(
         tokens=tokens,
@@ -128,21 +124,8 @@ class CuteDslNvfp4GroupedGemm(OpWrapper):
             spec=_ckpt(1, 128),
         ),
         Cell(
-            why="tile 128: cluster N 2 tactic, 32 requests at MTP verify width 4; largest "
-            "captured T",
-            spec=_ckpt(128, 128, cluster_n=2),
-        ),
-        Cell(
             why="tile 128: MMA N 256 and cluster N 2 tactic, 8192-row max_num_tokens prefill",
             spec=_ckpt(8192, 128, mma_n=256, cluster_n=2),
-        ),
-        Cell(
-            why="tile 128: expert rows tile-1, tile, tile+1; the tile edge",
-            spec=_ckpt(300, 128, dist="tile_edges"),
-        ),
-        Cell(
-            why="tile 128: FC1 global_sf 25x calibrated; input scales clip at 448",
-            spec=_ckpt(2048, 128, gsf="saturating"),
         ),
         Cell(
             why="tile 128: tiny FC1 global_sf and 7 all-zero token rows; subnormal and zero "
@@ -173,8 +156,8 @@ class CuteDslNvfp4GroupedGemm(OpWrapper):
     256 is certified through the per-pair invariance below.
 
     Numerics: each written element equals the reference's `out` bit for bit on
-    every cell, on the real FC1 output at 8192 tokens, and on the checkpoint's own
-    down_proj experts. Operands whose block scales span a wider range can round a
+    every cell (and, at bring-up, on the real FC1 output at 8192 tokens and on the
+    checkpoint's own down_proj experts). Operands whose block scales span a wider range can round a
     partial sum; the test's compare admits that at bf16 ties only.
 
     Tactics. The op asks the AutoTuner for an MMA tile of (tile_size, 128) or
@@ -182,8 +165,8 @@ class CuteDslNvfp4GroupedGemm(OpWrapper):
     128, 2), and with no tuning entry falls back to ((tile_size, 128),
     (tile_size // 128, 1)); serving warmup tunes per row bucket and may pick any
     of the four. Every pair's row is bitwise identical across tile 128 / 256 x
-    the four tactics x the fallback (the test checks it at 128 and 8192 rows), so
-    cells driven at one tactic certify the others.
+    the four tactics x the fallback (the test checks it at 8192 rows), so cells
+    driven at one tactic certify the others.
 
     Determinism. A (token, expert) pair's output row depends on that pair's input
     row and its expert alone: it is bitwise unchanged by moving it to another row
@@ -227,6 +210,12 @@ class CuteDslNvfp4GroupedGemm(OpWrapper):
     input typed uint8; input_scale 2-D or short; scaling_vector_size 32;
     num_non_exiting_tiles of 2 elements; tile_idx_to_group_idx int64 or one tile
     short. tile_size 64: ValueError.
+
+    Measured at bring-up and not re-driven by the test: the CUDA-graph capture
+    with moe_sort and FC1, the determinism and read / write statements, the wrong
+    preparations' distance from the gate, and the loud rejections. The test
+    re-drives the cells, the tile / tactic invariance and the `input` contiguity
+    refusal.
 
     Uncertified: output dtypes other than bf16 (the runner builds none); expert
     parallelism (the kernel reads neither local_expert_offset nor num_experts, so

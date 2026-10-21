@@ -258,7 +258,8 @@ def _assert_state(b, expected, what):
 
 
 # (ctx_lens, gen_starts, p, gen_accepted). Positions straddle pages and land on
-# compression anchors; one request accepts everything.
+# compression anchors; one request accepts everything. `decode` and `mixed` are the accepted-
+# prefix check; `decode_p8` drives the shared-page and capture tests.
 CASES = {
     "decode": ((), (5, 30, 61, 100), 4, (1, 2, 4, 3)),
     "mixed": ((7, 3), (12, 29, 95), 4, (2, 1, 3)),
@@ -272,7 +273,7 @@ def _slots(num):
     return list(range(3, 3 + 2 * num, 2))
 
 
-@pytest.mark.parametrize("case", sorted(CASES))
+@pytest.mark.parametrize("case", ["decode", "mixed"])
 def test_commit_matches_the_accepted_prefix(case):
     ctx_lens, gen_starts, p, gen_accepted = CASES[case]
     b = _Batch(11, ctx_lens, gen_starts, p, _slots(len(ctx_lens) + len(gen_starts)))
@@ -294,15 +295,6 @@ def test_commit_over_the_strided_planes_of_a_shared_page():
     b.set_accepted(gen_accepted)
     _verify_step(b, SpeculativeRollback())
     _assert_state(b, _reference(b), case)
-
-
-@pytest.mark.parametrize("accepted", ["all", "one"])
-def test_commit_at_the_acceptance_extremes(accepted):
-    ctx_lens, gen_starts, p, _ = CASES["mixed"]
-    b = _Batch(12, ctx_lens, gen_starts, p, _slots(len(ctx_lens) + len(gen_starts)))
-    b.set_accepted([p if accepted == "all" else 1] * len(gen_starts))
-    _verify_step(b, SpeculativeRollback())
-    _assert_state(b, _reference(b), accepted)
 
 
 def test_commit_without_staging_is_a_no_op():

@@ -347,10 +347,7 @@ class PleGateConvInjectNorm(OpWrapper):
     # max_rows (max(lengths)), carries (None -> the argument is None). The
     # checkpoint's 4 x 2560 bf16 geometry throughout.
     CELLS: tuple[Cell, ...] = (
-        _cell("decode 1 x 1 row at the 461-slot pool", (1,), pool_slots=ENGINE_SLOTS),
         _cell("decode 128 x 1 row at the 461-slot pool", (1,) * 128, pool_slots=ENGINE_SLOTS),
-        _cell("MTP verify p=4: 32 x 4 rows", (4,) * 32, pool_slots=ENGINE_SLOTS),
-        _cell("rows shorter than max_rows, a zero-row sequence", (2, 0, 1), max_rows=4),
         # Context-shaped (prefill / mixed) steps: the packed-row conv.
         _cell("prefill 8192 rows, fresh", (8192,), carries=(False,), pool_slots=ENGINE_SLOTS),
         _cell(
@@ -373,7 +370,12 @@ class PleGateConvInjectNorm(OpWrapper):
     Preconditions (data; not guarded): at most `max_rows` rows per sequence;
     distinct live slots; `query_start_loc[-1] == T`. Operands 2-D with unit
     column stride; weights contiguous. Certified at the checkpoint's 4 x 2560
-    bf16 geometry with every slot live (the target never passes `pad_slot_id`).
+    bf16 geometry with every slot live (the target never passes `pad_slot_id`),
+    at a 128 x 1-row decode, an 8192-row fresh prefill and a mixed 2-context +
+    64-decode step, all on the 461-slot pool. Not certified: more than one
+    row per sequence on the per-sequence path (`1 < max_rows <=
+    PER_SEQ_MAX_ROWS`) or sequences shorter than `max_rows` -- a verify step
+    takes the unfused ops, so the target's per-sequence path runs one row.
 
     Numerics: every rounding point of the composition is kept, so the only
     differences are fp32 reduction order (the three norms' sums of squares

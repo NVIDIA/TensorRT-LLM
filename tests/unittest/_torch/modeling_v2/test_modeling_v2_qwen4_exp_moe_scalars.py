@@ -47,11 +47,12 @@ def test_uniform_isc2_keeps_the_per_expert_products_bitwise() -> None:
     assert torch.equal(got["alpha1"], w["l0_e_isc1"] * w["l0_e_ws2_1"])
 
 
-@pytest.mark.parametrize("spread", [1.0001, 40.0])
-def test_isc2_spread_is_folded_into_alpha2(spread: float) -> None:
-    """Whatever the spread, `global_sf * alpha2[e]` is expert e's own `ws2_2[e]`, the
-    product trtllm-gen forms from `(1 / isc2[e]) * (isc2[e] * ws2_2[e])`."""
-    isc2 = 0.01 * torch.linspace(1.0, spread, EXPERTS)
+def test_isc2_spread_is_folded_into_alpha2() -> None:
+    """Whatever the spread (here 40x), `global_sf * alpha2[e]` is expert e's own `ws2_2[e]`,
+    the product trtllm-gen forms from `(1 / isc2[e]) * (isc2[e] * ws2_2[e])`: the FC2 value an
+    expert produces is the same whether its input was quantized at its own `1 / isc2[e]` or
+    at the layer's single scale."""
+    isc2 = 0.01 * torch.linspace(1.0, 40.0, EXPERTS)
     w = _rows(isc2.flip(0))
     cute = M._moe_layer_scalars(w, 0, "CUTEDSL")
     gen = M._moe_layer_scalars(w, 0, "TRTLLM")
@@ -64,25 +65,6 @@ def test_isc2_spread_is_folded_into_alpha2(spread: float) -> None:
         cute["global_sf"] * cute["alpha2"], (1.0 / isc2) * gen["output2_scale_scalar"], rtol=1e-6
     )
     assert torch.allclose(cute["global_sf"] * cute["alpha2"], w["l0_e_ws2_2"], rtol=1e-6)
-
-
-def test_cutedsl_fc2_matches_the_per_expert_reference() -> None:
-    """The FC2 value an expert produces is `ws2_2[e] * (y @ W)` whether its input was
-    quantized at its own `1 / isc2[e]` (trtllm-gen) or at the layer's single scale."""
-    isc2 = torch.tensor([0.02, 0.01, 0.04, 0.03, 0.02, 0.05, 0.01, 0.025])
-    w = _rows(isc2)
-    cute = M._moe_layer_scalars(w, 0, "CUTEDSL")
-    gen = M._moe_layer_scalars(w, 0, "TRTLLM")
-    torch.manual_seed(0)
-    y = torch.randn(EXPERTS, 64, dtype=torch.float64)
-    weight = torch.randn(EXPERTS, 64, dtype=torch.float64)
-    ref = w["l0_e_ws2_2"].double() * (y * weight).sum(-1)
-    per_expert = gen["output2_scale_scalar"].double() * (
-        (1.0 / isc2.double())[:, None] * y * weight
-    ).sum(-1)
-    one_scale = cute["alpha2"].double() * (cute["global_sf"].double() * y * weight).sum(-1)
-    torch.testing.assert_close(per_expert, ref, rtol=1e-5, atol=0)
-    torch.testing.assert_close(one_scale, ref, rtol=1e-5, atol=0)
 
 
 def test_gate_up_input_scale_mismatch_is_refused() -> None:

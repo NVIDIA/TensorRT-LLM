@@ -62,26 +62,17 @@ class FusedGdnPostConv(OpWrapper):
 
     ARCHS = frozenset({Arch.SM_103})
 
-    # spec: num_prefill, num_decode; layout "contiguous" | "target_mixed"
-    # (decode a row slice of a [T, 10240] projection, a/b contiguous [T, 48]) |
-    # "in_proj" (the target's one [T, 16480] input projection: decode the
-    # q|k|v column view of its decode rows, a/b its column views); dt_bias_fill.
+    # spec: num_prefill, num_decode; dt_bias_fill. Every cell is the target's
+    # one [T, 16480] input projection: `decode` the q|k|v column view of its
+    # decode rows, `a`/`b` its column views, `prefill` the transposing
+    # extraction of its prefill rows.
     CELLS: tuple[Cell, ...] = (
         *(
             Cell(
                 why=f"target in_proj views, {p} prefill + {d} decode tokens",
-                spec=dict(num_prefill=p, num_decode=d, layout="in_proj"),
+                spec=dict(num_prefill=p, num_decode=d),
             )
             for p, d in ((200, 32), (2048, 0))
-        ),
-        Cell(
-            why="target mixed call: decode a row slice of the projection",
-            spec=dict(num_prefill=200, num_decode=32, layout="target_mixed"),
-        ),
-        Cell(why="prefill only, 1 token", spec=dict(num_prefill=1, num_decode=0)),
-        Cell(
-            why="mixed batch, 1 prefill + 1 decode tokens",
-            spec=dict(num_prefill=1, num_decode=1),
         ),
         Cell(
             why="every head above softplus_threshold: the linear branch",
@@ -100,7 +91,9 @@ class FusedGdnPostConv(OpWrapper):
     `extract_transpose_prefill_slice`'s contiguous output; `decode` and `a`/`b`
     column views (row stride 16480) of the layer's one `[T, 16480]`
     input-projection output. The stock mixer's verify call passes
-    `beta_dtype=b.dtype` (not certified here).
+    `beta_dtype=b.dtype` (not certified here). Certified in that form at a
+    mixed step of 200 prefill and 32 decode tokens, a 2048-token prefill-only
+    step, and a 64-token step with every head past the softplus threshold.
 
     Preconditions: `prefill.shape[0]` and `decode.shape[1]` >= qkv_dim (extra
     trailing features ignored; a short one is read out of bounds); `decode`
@@ -123,8 +116,9 @@ class FusedGdnPostConv(OpWrapper):
     checkpoint `a + dt_bias` reaches.
 
     Not certified: fp16/fp32 activations, other head geometries, a bf16
-    `beta_dtype`, bf16 `A_log`/`dt_bias`, a non-contiguous `prefill`, an empty
-    batch.
+    `beta_dtype`, bf16 `A_log`/`dt_bias`, a non-contiguous `prefill`, contiguous
+    `decode`/`a`/`b` (not views of the projection), single-token halves, an
+    empty batch.
 
     Hard limits
       none probed.

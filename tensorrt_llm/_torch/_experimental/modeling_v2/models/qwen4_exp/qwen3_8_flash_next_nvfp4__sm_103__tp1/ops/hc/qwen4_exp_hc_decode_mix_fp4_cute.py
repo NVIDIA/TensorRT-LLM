@@ -368,11 +368,8 @@ def _reference(part, ss, up, hc_out, norm_weight, eps, hc_count, with_inject):
     return mixed, inject_out
 
 
-_CELLS = (
-    Cell(why="checkpoint 4x2560 r320 bf16, inject, 1 row (con 1)", spec=dict(rows=1)),
-    Cell(why="stack-final mixer (no inject), 1 row", spec=dict(rows=1, with_inject=False)),
-    Cell(why="hc_out a row slice buf[::2], 1 row", spec=dict(rows=1, layout="row_slice")),
-)
+_INJECT = Cell(why="checkpoint 4x2560 r320 bf16, inject, 1 row (con 1)", spec=dict(rows=1))
+_ROW_SLICE = Cell(why="hc_out a row slice buf[::2], 1 row", spec=dict(rows=1, layout="row_slice"))
 
 
 class Qwen4ExpHcDecodeMixFp4Cute(OpWrapper):
@@ -400,7 +397,8 @@ class Qwen4ExpHcDecodeMixFp4Cute(OpWrapper):
     """
 
     ARCHS = frozenset({Arch.SM_103})
-    CELLS: tuple[Cell, ...] = _CELLS
+    # Its call sites always inject, so no stack-final (no-inject) cell.
+    CELLS: tuple[Cell, ...] = (_INJECT, _ROW_SLICE)
 
     note = """
     Metadata consumed: none. Call sites: `DecodeTarget`'s MoE sites at a one-row
@@ -414,8 +412,12 @@ class Qwen4ExpHcDecodeMixFp4Cute(OpWrapper):
     Numerics: `mixed` and `inject_out` as `qwen4_exp_hc_decode_mix_cute`; the NVFP4 is
     `fp4_quantize`'s arithmetic on the rounded `mixed` (`rcp.approx.ftz` reciprocals,
     e4m3 scale rounded to nearest, e2m1 nearest-even with saturation at 6).
-    Deterministic; graph-capturable once compiled (the first call per variant).
-    PDL: the weight rows and norm elements stream before `griddepcontrol.wait`.
+    Deterministic (measured); graph-capturable once compiled (the first call per
+    variant). PDL: the weight rows and norm elements stream before
+    `griddepcontrol.wait`.
+
+    Certified: one bf16 row with the injection, `hc_out` compact and a row slice;
+    graph replay under PDL. Not certified: `with_inject=False`.
     """
 
     def __call__(self, part, ss, up, hc_out, norm_weight, eps, hc_count, with_inject, global_scale):
@@ -460,7 +462,11 @@ class Qwen4ExpHcDecodeMixCute(OpWrapper):
     """
 
     ARCHS = frozenset({Arch.SM_103})
-    CELLS: tuple[Cell, ...] = _CELLS
+    CELLS: tuple[Cell, ...] = (
+        _INJECT,
+        Cell(why="stack-final mixer (no inject), 1 row", spec=dict(rows=1, with_inject=False)),
+        _ROW_SLICE,
+    )
 
     note = """
     Metadata consumed: none. Call sites: `DecodeTarget`'s non-MoE sites at a one-row
@@ -475,8 +481,12 @@ class Qwen4ExpHcDecodeMixCute(OpWrapper):
     `up` the `.t()` view of a contiguous `[width, R]` weight.
 
     Numerics: fp32 inside (`low`, the gate logits and `normed` are never rounded), one
-    rounding per output, inside the float64 reference's band. Deterministic;
-    graph-capturable once compiled (the first call per variant).
+    rounding per output, inside the float64 reference's band. Deterministic
+    (measured); graph-capturable once compiled (the first call per variant).
+
+    Certified: one bf16 row with and without the injection, `hc_out` compact and a
+    row slice. Not certified: graph replay of this build (the NVFP4 build's
+    replay test covers the shared kernel, not this compiled variant).
     """
 
     def __call__(self, part, ss, up, hc_out, norm_weight, eps, hc_count, with_inject):

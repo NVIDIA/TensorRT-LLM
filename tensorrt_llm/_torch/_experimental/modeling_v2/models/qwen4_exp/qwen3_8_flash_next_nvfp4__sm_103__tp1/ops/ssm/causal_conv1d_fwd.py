@@ -23,13 +23,6 @@ CKPT_DIM = 10240
 ENGINE_SLOTS = 461
 
 
-def _engine_batch_slots() -> tuple[int, ...]:
-    """32 distinct slots over the whole engine pool, slot 0 and the last included."""
-    slots = (0, ENGINE_SLOTS - 1) + tuple((i * 13 + 5) % (ENGINE_SLOTS - 2) + 1 for i in range(30))
-    assert len(set(slots)) == 32
-    return slots
-
-
 class CausalConv1dFwd(OpWrapper):
     """Depthwise causal conv1d (+ optional SiLU) of every sequence in a batch,
     against its carried window, publishing the new window -- one launch.
@@ -58,10 +51,9 @@ class CausalConv1dFwd(OpWrapper):
 
     ARCHS = frozenset({Arch.SM_103})
 
-    # spec keys: dim, width, dtype, lengths (varlen) or batch3d=(batch, seqlen),
-    # pool_slots (None -> no conv_states), slots (None -> cache_indices None),
-    # initial (None -> has_initial_state None), silu, bias, pad_slot_id,
-    # layout: "in_place" | "out" | "channel_last".
+    # spec keys: dim, lengths (varlen), pool_slots, slots (cache_indices),
+    # initial (has_initial_state); bf16, W 4, no bias, SiLU, pad_slot_id -1,
+    # channel-major in place throughout.
     CELLS: tuple[Cell, ...] = (
         Cell(
             why="checkpoint prefill at the engine's 461-slot pool: slots 460, 0, 230",
@@ -71,16 +63,6 @@ class CausalConv1dFwd(OpWrapper):
                 pool_slots=ENGINE_SLOTS,
                 slots=(ENGINE_SLOTS - 1, 0, ENGINE_SLOTS // 2),
                 initial=(True, False, True),
-            ),
-        ),
-        Cell(
-            why="32 sequences (the batch ceiling) scattered over the 461-slot pool",
-            spec=dict(
-                dim=CKPT_DIM,
-                lengths=tuple(1 + (i * 7) % 96 for i in range(32)),
-                pool_slots=ENGINE_SLOTS,
-                slots=_engine_batch_slots(),
-                initial=tuple(i % 3 != 0 for i in range(32)),
             ),
         ),
         Cell(
@@ -94,22 +76,8 @@ class CausalConv1dFwd(OpWrapper):
             ),
         ),
         Cell(
-            why="sequences shorter than the window: state part carry, part tokens",
-            spec=dict(
-                dim=512,
-                lengths=(2, 1, 2),
-                pool_slots=4,
-                slots=(0, 1, 2),
-                initial=(True, True, False),
-            ),
-        ),
-        Cell(
             why="one 2048-token sequence: the vectorised load, 128-thread block",
             spec=dict(dim=CKPT_DIM, lengths=(2048,), pool_slots=1, slots=(0,), initial=(True,)),
-        ),
-        Cell(
-            why="one 2047-token sequence: the scalar load, 128-thread block",
-            spec=dict(dim=CKPT_DIM, lengths=(2047,), pool_slots=1, slots=(0,), initial=(True,)),
         ),
     )
 
@@ -122,11 +90,12 @@ class CausalConv1dFwd(OpWrapper):
     channel-major output of `extract_transpose_prefill_slice`, W 4, no bias,
     SiLU on, the layer's whole conv pool unsliced, `pad_slot_id` -1, `out` None.
     The cells are that call (bf16, W 4, no bias, SiLU, channel-major in
-    place) at the engine's 461-slot pool, which tops every width the cache
-    manager was seen to allocate, and at small pools for the pad sentinel,
-    the sub-window sequences and both load forms of the 128-thread block
-    (single sequences of 2048 and 2047 tokens); the multi-sequence cells
-    run the 64-thread block with scalar loads.
+    place): a three-sequence prefill at the engine's 461-slot pool, which
+    tops every width the cache manager was seen to allocate (the 64-thread
+    block with scalar loads); one 2048-token sequence (the 128-thread block
+    with vectorised loads); and the pad sentinel on a small pool. The
+    128-thread block's scalar-load form (seen at a single 2047-token
+    sequence) is not certified.
 
     Preconditions the op checks itself (all raise): dtypes in {bf16, fp16,
     fp32}, `conv_states`/`bias` dtype, int32 `query_start_loc`/`cache_indices`,
@@ -137,8 +106,9 @@ class CausalConv1dFwd(OpWrapper):
     rather than a wrong number): a `cache_indices` value outside `[0, slots)`;
     `has_initial_state[s]` True with `conv_states=None` (reads through null);
     `conv_states`' shape (only its dtype is validated). Sequences shorter
-    than `W - 1` are legal and certified; a zero-length sequence, which the
-    target never schedules, is not certified. Unnamed slots are bitwise
+    than `W - 1` are legal; one (a single token without carried state) is
+    certified, one with carried state is not. A zero-length sequence, which
+    the target never schedules, is not certified. Unnamed slots are bitwise
     untouched.
 
     Only the channel-major kernel (the target's layout) is certified; the

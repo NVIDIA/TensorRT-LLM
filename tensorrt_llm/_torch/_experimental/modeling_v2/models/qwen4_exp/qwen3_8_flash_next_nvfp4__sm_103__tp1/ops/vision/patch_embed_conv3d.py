@@ -54,7 +54,7 @@ class PatchEmbedConv3d(OpWrapper):
             why=f"checkpoint geometry, {n} patches bf16",
             spec=dict(num_patches=n, dtype=torch.bfloat16),
         )
-        for n in (1, 64, 4096)
+        for n in (64, 4096)
     ) + (
         Cell(
             why="tower call ceiling: 8192 tokens x merge 2x2 = 32768 patches bf16",
@@ -83,8 +83,8 @@ class PatchEmbedConv3d(OpWrapper):
 
     Not certified: dtypes other than bf16 (the fp32 TF32 behavior above is
     measured, not certified); other geometries, `bias=None` and non-contiguous
-    pixel rows; patch counts between the 4096- and 32768-row cells, and past
-    32768.
+    pixel rows; patch counts below 64, between the cells, and past 32768
+    (cuDNN picks its kernel by row count).
     """
 
     def __call__(

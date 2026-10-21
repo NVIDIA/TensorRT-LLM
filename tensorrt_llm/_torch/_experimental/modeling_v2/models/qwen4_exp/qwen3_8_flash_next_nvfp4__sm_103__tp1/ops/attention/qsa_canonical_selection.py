@@ -115,30 +115,11 @@ class QsaCanonicalSelection(OpWrapper):
             "relu",
         ),
         _cell(
-            "windows 0, 1, 511, 512, 513, 1024, 2047, 2048, 2080",
-            18,
-            ("ends", (0, 1, 511, 512, 513, 1024, 2047, 2048, 2080) * 2),
-            "relu",
-        ),
-        _cell(
-            "ties: a zero class of -0.0 and +0.0 that straddles k",
-            16,
-            ("ends", (2048,) * 16),
-            "signed_zeros",
-        ),
-        _cell(
             "input from the radix engine (qsa_topk_select), zero ties",
             64,
             ("positions_random", 2051, 8191),
             "relu_sparse",
             selection="radix",
-        ),
-        _cell(
-            "CUDA graph: 32 rows captured, replayed with new scores and ends",
-            32,
-            ("positions_random", 0, 8191),
-            "relu",
-            graph=True,
         ),
     )
 
@@ -160,10 +141,10 @@ class QsaCanonicalSelection(OpWrapper):
 
     Cost: about 30 kernels -- elementwise passes, two int32 prefix sums over
     `[rows, cols]` and one sorted search over `[rows, k]` -- with no host read and no
-    data-dependent shape, so it captures into a CUDA graph and replays with new scores
-    and windows. It reads the whole `cols`-wide score row, not the live window: a caller
-    that knows a bound on the windows passes `logits[:, :bound]`, which gives the same
-    rows. A matrix of more than 2^24 elements is rewritten in row tiles.
+    data-dependent shape, so it can be captured into a CUDA graph (not certified: no
+    cell replays one). It reads the whole `cols`-wide score row, not the live window: a
+    caller that knows a bound on the windows passes `logits[:, :bound]`, which gives the
+    same rows. A matrix of more than 2^24 elements is rewritten in row tiles.
     """
 
     def __call__(

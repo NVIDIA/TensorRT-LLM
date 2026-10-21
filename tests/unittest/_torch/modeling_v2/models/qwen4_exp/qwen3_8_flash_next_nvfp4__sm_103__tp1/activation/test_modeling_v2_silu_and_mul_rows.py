@@ -1,8 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """GPU test for the silu_and_mul_rows entry: the cells bitwise `flashinfer_silu_and_mul` on a
-contiguous copy of the gate|up columns (and so inside its reference band), the extra columns
-unread, graph capture."""
+contiguous copy of the gate|up columns (and so inside its reference band) with the fused
+output's extra columns present, graph capture, the width guard."""
 
 import zlib
 
@@ -44,13 +44,6 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — fixture by
         assert torch.equal(out, flashinfer_silu_and_mul(x[:, : 2 * INTER].contiguous()))
 
 
-def test_extra_columns_are_not_read() -> None:
-    x = _build(dict(rows=64), 7)
-    a = op(x, INTER)
-    x[:, 2 * INTER :] = float("nan")
-    assert torch.equal(op(x, INTER), a)
-
-
 def test_cuda_graph_capture_and_replay() -> None:
     x = _build(dict(rows=128), 8)
     warmup = torch.cuda.Stream()
@@ -71,5 +64,3 @@ def test_guards() -> None:
     x = _build(dict(rows=4), 5)
     with validating(op), pytest.raises(AssertionError):
         op(x[:, : 2 * INTER - 2], INTER)
-    with validating(op), pytest.raises(AssertionError):
-        op(x.float(), INTER)

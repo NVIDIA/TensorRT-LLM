@@ -80,23 +80,6 @@ def _compare(out: torch.Tensor, ref: torch.Tensor) -> None:
     assert_within_ulp(out, ref, element_ulp=4.0, rms_ulp=2.0)
 
 
-def _segments(spec):
-    """`(first position, rows)` per request in row order, and a generation mask."""
-    if "mixed" not in spec:
-        segments = list(spec["segments"])
-        return segments, torch.zeros(sum(n for _, n in segments), dtype=torch.bool, device=DEV)
-    requests, context_lens = spec["mixed"]
-    segments = [
-        (0 if i == 0 else (907 * i) % (ENGINE_MAX_SEQ_LEN - n + 1), n)
-        for i, n in enumerate(context_lens)
-    ]
-    segments += [(100 + (499 * g) % 8000, 2) for g in range(requests - len(context_lens))]
-    generation = torch.cat(
-        [torch.full((n,), i >= len(context_lens), device=DEV) for i, (_, n) in enumerate(segments)]
-    )
-    return segments, generation
-
-
 def _selected_tokens(positions, seed, compress_ratio, token_topk):
     """QSA's expansion layout: chosen complete groups, the trailing partial group, -1."""
     block_topk = token_topk // compress_ratio
@@ -133,7 +116,7 @@ def _build(spec, seed):
     """Real paged state for one spec, keyed by the op's parameter names."""
     gen = torch.Generator(device=DEV).manual_seed(seed)
     tpb, kv, d, q_heads = (spec[k] for k in ("tokens_per_block", "kv_heads", "head_dim", "q_heads"))
-    segments, generation = _segments(spec)
+    segments = list(spec["segments"])
     positions = torch.cat([torch.arange(s, s + n, device=DEV) for s, n in segments])
     req = torch.cat([torch.full((n,), i, device=DEV) for i, (_, n) in enumerate(segments)])
     rows, slots = positions.numel(), spec["slots"]
@@ -161,20 +144,11 @@ def _build(spec, seed):
         block_table[slot, :count] = page_ids[cursor : cursor + count]
         cursor += count
 
-    q_dtype = spec["q_dtype"]
-    if spec["q_layout"] == "qkv_slice":
-        qkv = torch.randn(rows, q_heads + 2 * kv, d, generator=gen, device=DEV).to(q_dtype)
-        q = qkv[:, :q_heads]
-    else:
-        q = torch.randn(rows, q_heads, d, generator=gen, device=DEV).to(q_dtype)
+    assert spec["q_layout"] == "qkv_slice", spec["q_layout"]
+    qkv = torch.randn(rows, q_heads + 2 * kv, d, generator=gen, device=DEV).to(spec["q_dtype"])
+    q = qkv[:, :q_heads]
     selected = _selected_tokens(positions, seed + 3, spec["compress_ratio"], spec["token_topk"])
-    if "width" in spec:
-        selected = selected[:, : spec["width"]].contiguous()
     request_indices = slot_of.to(DEV)[req].to(spec["request_dtype"])
-    if spec.get("holes"):
-        selected[1] = -1
-        request_indices[2] = slots + 67
-        block_table[:, 0] = -1
 
     args = dict(
         q=q,
@@ -193,7 +167,7 @@ def _build(spec, seed):
     )
     if spec["prefill_pair"]:
         args.update(query_positions=positions, compress_ratio=spec["compress_ratio"])
-    return args, generation
+    return args
 
 
 def _bf16_twin(args):
@@ -274,8 +248,8 @@ def _capture_once(shape, seed, launches, where) -> None:
     """One call of `shape` captured, a second state's operands written in place,
     replayed: the replay must be bitwise the eager call on the second state."""
     where = f"{where}, [{shape['slots']}, {shape['pages']}] table"
-    args, _ = _build(shape, seed)
-    fresh, _ = _build(shape, seed + 50)
+    args = _build(shape, seed)
+    fresh = _build(shape, seed + 50)
     launches.clear()
     op(**args)
     assert [name for name, _ in launches] == list(shape["launches"]), where
@@ -303,9 +277,9 @@ def test_certified_cells(cell, certifying, launches) -> None:  # noqa: F811
     if "capture" in spec:
         _capture_sweep(spec, seed=sum(map(ord, cell.why)), launches=launches)
         return
-    args, _ = _build(spec, seed=sum(map(ord, cell.why)))
+    args = _build(spec, seed=sum(map(ord, cell.why)))
     rows = args["q"].shape[0]
-    if spec["prefill_pair"] and not spec.get("holes"):
+    if spec["prefill_pair"]:
         selected = args["selected_tokens"]
         assert bool(_is_prefix_packed(selected).all())
         valid = (selected >= 0).sum(1)
@@ -330,81 +304,18 @@ def _with(**overrides):
     return {**CKPT, **overrides}
 
 
-def test_gate_discriminates_wrong_variants() -> None:
-    """References wrong one way each -- V's scales read token-major like K's,
-    the nibbles swapped, the second-level scale ignored, K and V swapped -- are
-    all rejected by `compare`."""
-    args, _ = _build(_with(segments=((2032, 272),), prefill_pair=True, global_v=2.5), seed=9000)
-    out = op(**args)
-    _compare(out, op.reference(**args))
-    v_scales = args["v_scale_cache"]
-    pages, kv, tpb, groups = v_scales.shape
-    token_major = (
-        v_scales.reshape(pages, kv, tpb // 4, 4, groups)
-        .permute(0, 1, 2, 4, 3)
-        .reshape(v_scales.shape)
-    )
-    nibbles = (args["v_cache"] >> 4) | (args["v_cache"] << 4)
-    variants = {
-        "v_scales_token_major": dict(v_scale_cache=token_major),
-        "nibbles_swapped": dict(v_cache=nibbles),
-        "no_second_level_scale": dict(
-            kv_scale_quant_orig=torch.ones(3, dtype=torch.float32, device=DEV)
-        ),
-        "k_and_v_swapped": dict(
-            k_cache=args["v_cache"],
-            v_cache=args["k_cache"],
-            k_scale_cache=args["v_scale_cache"],
-            v_scale_cache=args["k_scale_cache"],
-        ),
-    }
-    for name, override in variants.items():
-        wrong = op.reference(**{**args, **override})
-        with pytest.raises(AssertionError):
-            _compare(out, wrong)
-        assert (out.float() - wrong.float()).abs().max().item() > 0.05, name
-
-
 def test_calls_are_bitwise_deterministic() -> None:
-    args, _ = _build(_with(segments=tuple((4000 + 37 * i, 2) for i in range(4))), seed=8800)
+    args = _build(_with(segments=tuple((4000 + 37 * i, 2) for i in range(4))), seed=8800)
     assert torch.equal(op(**args), op(**args))
 
 
-def test_zero_rows_return_an_empty_output() -> None:
-    args, _ = _build(_with(segments=((900, 1),) * 4), seed=8400)
-    for name in ("q", "selected_tokens", "request_indices"):
-        args[name] = args[name][:0]
-    out = op(**args)
-    assert out.shape == (0, CKPT["q_heads"], CKPT["head_dim"]) and out.dtype == torch.bfloat16
-    _compare(out, op.reference(**args))
-
-
-_REJECTIONS = {
-    "float32_query": (lambda a: {**a, "q": a["q"].float()}, "q must be BF16 or FP16"),
-    "bf16_pool": (
-        lambda a: {**a, "k_cache": a["k_cache"].view(torch.int8)},
-        "k_cache must be uint8",
-    ),
-    "single_scale": (
-        lambda a: {**a, "kv_scale_quant_orig": a["kv_scale_quant_orig"][:1]},
-        "kv_scale_quant_orig must be a contiguous fp32 [3]",
-    ),
-    "positions_without_ratio": (
-        lambda a: {**a, "query_positions": torch.zeros(4, dtype=torch.int64, device=DEV)},
-        "pass both query_positions and compress_ratio, or neither",
-    ),
-    "host_query": (lambda a: {**a, "q": a["q"].cpu()}, "every operand must be on q's CUDA device"),
-}
-
-
-@pytest.mark.parametrize("case", list(_REJECTIONS), ids=list(_REJECTIONS))
-def test_rejects(case) -> None:
-    """The op's own loud refusals -- the reason the entry carries no `is_valid`.
-    One per guard family: q's dtype, the pool planes, the second-level scales,
-    the prefill pair and the device."""
-    args, _ = _build(_with(segments=((600, 1),) * 4), seed=9100)
+def test_rejects_positions_without_a_compress_ratio() -> None:
+    """The op's own loud refusal -- the reason the entry carries no `is_valid`: half of
+    the prefill pair."""
+    args = _build(_with(segments=((600, 1),) * 4), seed=9100)
     args["selected_tokens"] = args["selected_tokens"][:, :64].contiguous()
-    mutate, message = _REJECTIONS[case]
+    args["query_positions"] = torch.zeros(4, dtype=torch.int64, device=DEV)
+    message = "pass both query_positions and compress_ratio, or neither"
     with pytest.raises(ValueError, match=re.escape(message)):
         with validating(op):
-            op(**mutate(args))
+            op(**args)

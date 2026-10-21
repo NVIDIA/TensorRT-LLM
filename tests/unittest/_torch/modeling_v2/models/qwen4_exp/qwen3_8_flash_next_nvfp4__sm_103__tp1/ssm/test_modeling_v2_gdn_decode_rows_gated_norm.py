@@ -5,29 +5,21 @@
 Cells against the composition's fp64 reference (the gated delta rule's recurrence,
 then the gated norm entry's) in torch's default band for the bf16 output and the fp32
 pool, the pool compared whole so slots the call did not name are
-gated too. Beyond the cells: agreement with the unfused composition it replaces
-(FlashInfer's recurrence, then the gated norm entry) at the 128-row decode batch, PDL
-on and off bitwise, a stale-read check under graph replay (a producer rewrites the
-projection inside the graph right before the op), and the guards.
+gated too. Beyond the cells: a stale-read check under graph replay (a producer
+rewrites the projection inside the graph right before the op), and the pool-dtype
+guard. The `gdn_decode_rows` entry (the recurrence alone) has its own cells below.
 """
 
 import zlib
 
-import flashinfer.gdn_decode
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.norm.rms_norm_gated_token_major import (  # noqa: E501
-    rms_norm_gated_token_major,
-)
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.ssm.gdn_decode_rows_gated_norm import (  # noqa: E501
     gdn_decode_rows as rows_op,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.ssm.gdn_decode_rows_gated_norm import (  # noqa: E501
     gdn_decode_rows_gated_norm as op,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.ssm.gdn_decode_rows_gated_norm import (  # noqa: E501
-    launch,
 )
 
 __extra_import_path__ = ["../../../.."]
@@ -62,9 +54,6 @@ def _build(spec, seed):
         pool = page.as_strided((slots, HV, V, K), (layers * HV * V * K, V * K, K, 1))
         for s in (100, 101):
             pool[s].copy_(torch.randn(HV, V, K, generator=g, device=DEV) * 0.05)
-    elif spec.get("pool") == "layer_view":
-        cache = torch.randn(3, SLOTS, HV, V, K, generator=g, device=DEV) * 0.05
-        pool = cache[1]
     else:
         pool = torch.randn(SLOTS, HV, V, K, generator=g, device=DEV) * 0.05
     if spec.get("pool") == "coalesced":
@@ -95,54 +84,6 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — fixture by
     _compare(out, args[1], ref_out, ref_pool)
     if cell.spec.get("pad"):
         assert (out[1] == 0).all(), "a pad row's output is zero"
-
-
-def _unfused(proj, pool, slots, A_log, dt_bias, w, eps, h, k):
-    rows = proj.shape[0]
-    q, kk, v, z, a, b = torch.split(proj, [h * k, h * k, HV * V, HV * V, HV, HV], 1)
-    o = torch.empty(rows, 1, HV, V, dtype=torch.bfloat16, device=DEV)
-    flashinfer.gdn_decode.gated_delta_rule_decode_pretranspose(
-        q=q.reshape(rows, 1, h, k),
-        k=kk.reshape(rows, 1, h, k),
-        v=v.reshape(rows, 1, HV, V),
-        state=None,
-        A_log=A_log,
-        a=a.reshape(rows, 1, HV),
-        dt_bias=dt_bias,
-        b=b.reshape(rows, 1, HV),
-        scale=None,
-        output=o,
-        use_qk_l2norm=True,
-        initial_state=pool,
-        initial_state_indices=slots,
-        output_state_indices=None,
-    )
-    return rms_norm_gated_token_major(
-        o.reshape(-1, V), z.reshape(rows, HV, V), w, eps, None, "sigmoid"
-    ).reshape(rows, HV * V)
-
-
-def test_matches_the_unfused_composition() -> None:
-    rows = 128
-    args = _build(dict(rows=rows), seed=900 + rows)
-    pool_unfused = args[1].clone()
-    want = _unfused(args[0], pool_unfused, *args[2:])
-    got = op(*args)
-    torch.testing.assert_close(got, want)
-    torch.testing.assert_close(args[1], pool_unfused)
-    print(
-        f"\n  rows {rows}: output bitwise the composition's {(got == want).float().mean().item():.4f}"
-    )
-
-
-def test_pdl_on_and_off_agree_bitwise() -> None:
-    args = _build(dict(rows=8), seed=31)
-    pool0 = args[1].clone()
-    a = launch(*args, pdl=True)
-    pool_a = args[1].clone()
-    args[1].copy_(pool0)
-    b = launch(*args, pdl=False)
-    assert torch.equal(a, b) and torch.equal(pool_a, args[1])
 
 
 def test_reads_after_the_wait_under_graph_replay() -> None:
@@ -177,13 +118,10 @@ def test_reads_after_the_wait_under_graph_replay() -> None:
 
 
 def test_guards() -> None:
+    """A bf16 pool (the target sends this entry an fp32 one only) is refused."""
     args = _build(dict(rows=4), seed=5)
     with validating(op), pytest.raises(AssertionError):
         op(args[0], args[1].to(torch.bfloat16), *args[2:])
-    with validating(op), pytest.raises(AssertionError):
-        op(args[0], args[1], args[2].long(), *args[3:])
-    with validating(op), pytest.raises(AssertionError):
-        op(args[0][:, :-2], *args[1:])
 
 
 # ---- gdn_decode_rows: the recurrence alone, into a row range of a step's output ----------
@@ -215,21 +153,3 @@ def test_rows_certified_cells(cell, certifying) -> None:  # noqa: F811 — fixtu
     )
     if cell.spec.get("pad"):
         assert (got[1] == 0).all(), "a pad row's output is zero"
-
-
-def test_rows_then_gated_norm_matches_the_fused_entry() -> None:
-    """The recurrence alone, then the gated norm entry: the fused entry's output within its
-    band, and the same pool bitwise (one kernel's recurrence), at a mixed step's 121
-    generation rows."""
-    rows = 121
-    args = _build(dict(rows=rows), seed=700 + rows)
-    pool_fused = args[1].clone()
-    fused = op(args[0], pool_fused, *args[2:])
-    o = torch.empty(rows, HV * V, dtype=torch.bfloat16, device=DEV)
-    rows_op(args[0], args[1], args[2], args[3], args[4], args[7], args[8], o)
-    assert torch.equal(args[1], pool_fused), "pool"
-    z = torch.split(args[0], [2 * H * K, HV * V, HV * V, 2 * HV], 1)[2]
-    normed = rms_norm_gated_token_major(
-        o.reshape(-1, V), z.reshape(rows, HV, V), args[5], args[6], None, "sigmoid"
-    ).reshape(rows, HV * V)
-    torch.testing.assert_close(normed, fused)

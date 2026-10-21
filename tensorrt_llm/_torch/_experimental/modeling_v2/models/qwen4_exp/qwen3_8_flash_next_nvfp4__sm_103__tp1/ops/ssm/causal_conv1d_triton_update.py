@@ -35,8 +35,6 @@ ENGINE_SNAPSHOT_ROWS = 32
 
 def _pinned(batch: int) -> tuple[int, ...]:
     """`batch` distinct slots of the engine pool, slot 0 and the last pinned in."""
-    if batch == 1:
-        return (0,)
     return (0,) + tuple(i * 14 + 3 for i in range(1, batch - 1)) + (ENGINE_SLOTS - 1,)
 
 
@@ -70,63 +68,38 @@ class CausalConv1dTritonUpdate(OpWrapper):
 
     ARCHS = frozenset({Arch.SM_103})
 
-    # spec keys: dim, width (4), state_len (pool columns, 3), seqlen (2), batch,
-    # pool_slots, slots ("random" | tuple | None), dtype, bias, activation
-    # ("silu"), pad_slot_id, x_form ("token_major" | "in_proj" (token_major
-    # over the q|k|v columns of a [n * p, 16480] projection) | "contiguous" | "2d"),
-    # snapshots (rows of the snapshot buffer, or 0 for none), snapshot_steps
-    # (the buffer's step depth, default seqlen), accepted, launch_dependent_kernels.
-    CELLS: tuple[Cell, ...] = (
-        tuple(
-            Cell(
-                why=f"verify, x over the [n*p, 16480] in_proj, batch {batch}, {seqlen} tok/row",
-                spec=dict(
-                    dim=CKPT_DIM,
-                    batch=batch,
-                    seqlen=seqlen,
-                    pool_slots=ENGINE_SLOTS,
-                    slots=_pinned(batch),
-                    snapshots=ENGINE_SNAPSHOT_ROWS,
-                    x_form="in_proj",
-                ),
-            )
-            for batch, seqlen in ((1, 2), (32, 3))
-        )
-        + tuple(
-            Cell(
-                why=f"verify at the 461-slot pool, batch {batch}, {seqlen} tokens/row",
-                spec=dict(
-                    dim=CKPT_DIM,
-                    batch=batch,
-                    seqlen=seqlen,
-                    pool_slots=ENGINE_SLOTS,
-                    slots=_pinned(batch),
-                    snapshots=ENGINE_SNAPSHOT_ROWS,
-                ),
-            )
-            # seqlen 8: max_draft_len 7, the widest verify step.
-            for batch, seqlen in ((17, 4), (32, 8))
-        )
-        + (
-            Cell(
-                why="seqlen 5 into an 8-step snapshot buffer: steps 5..7 untouched",
-                spec=dict(
-                    dim=CKPT_DIM,
-                    batch=8,
-                    seqlen=5,
-                    pool_slots=ENGINE_SLOTS,
-                    slots=_pinned(8),
-                    snapshots=ENGINE_SNAPSHOT_ROWS,
-                    snapshot_steps=8,
-                ),
-            ),
-            Cell(
-                why="pad_slot_id -1 rows: pool slot and snapshot rows untouched",
-                spec=dict(
-                    dim=512, batch=6, pool_slots=16, slots=(3, -1, 7, 11, -1, 2), snapshots=6
-                ),
+    # spec keys: dim, batch, seqlen, pool_slots, slots, snapshots (rows of the
+    # snapshot buffer), snapshot_steps (the buffer's step depth, default
+    # seqlen). Every cell is the call site: `x` the token-major q|k|v columns
+    # of a [n * p, 16480] projection seen as [n, C, p], bf16, W 4, no bias,
+    # SiLU, pad_slot_id -1, no accepted-token roll.
+    CELLS: tuple[Cell, ...] = tuple(
+        Cell(
+            why=f"verify, x over the [n*p, 16480] in_proj, batch 32, {seqlen} tok/row",
+            spec=dict(
+                dim=CKPT_DIM,
+                batch=32,
+                seqlen=seqlen,
+                pool_slots=ENGINE_SLOTS,
+                slots=_pinned(32),
+                snapshots=ENGINE_SNAPSHOT_ROWS,
             ),
         )
+        # seqlen 8: max_draft_len 7, the widest verify step.
+        for seqlen in (3, 8)
+    ) + (
+        Cell(
+            why="seqlen 5 into an 8-step snapshot buffer: steps 5..7 untouched",
+            spec=dict(
+                dim=CKPT_DIM,
+                batch=8,
+                seqlen=5,
+                pool_slots=ENGINE_SLOTS,
+                slots=_pinned(8),
+                snapshots=ENGINE_SNAPSHOT_ROWS,
+                snapshot_steps=8,
+            ),
+        ),
     )
 
     note = """
@@ -139,10 +112,12 @@ class CausalConv1dTritonUpdate(OpWrapper):
     with `intermediate_state_indices = arange(n)`, `num_accepted_tokens` None.
     The op advances the pool by all `p` tokens whatever is accepted later; the
     snapshots are what a rollback has to read. Certified at the 461-slot pool
-    with a 32-row snapshot buffer, `x` as the target's q|k|v column view of
-    the projection and as a contiguous `[n, p, 10240]` block, seqlen 2, 3, 4,
-    5 and 8 (a buffer deeper than seqlen keeps its later steps untouched), and
-    for pad-sentinel rows; bf16, W 4, no bias, SiLU only.
+    with a 32-row snapshot buffer and `x` as the target's q|k|v column view
+    of the projection: 32 rows at seqlen 3 and at seqlen 8 (the widest verify
+    step), and 8 rows at seqlen 5 into an 8-step buffer (a buffer deeper than
+    seqlen keeps its later steps untouched); bf16, W 4, no bias, SiLU only.
+    Not certified: a contiguous `x`, other seqlens, and pad-sentinel rows
+    (the target never sends one).
 
     Raise loudly, so not guarded: width 1 (triton CompilationError); a missing
     `intermediate_state_indices` with snapshots and slot indices given.
@@ -152,8 +127,8 @@ class CausalConv1dTritonUpdate(OpWrapper):
     roll is uncertified; the target passes None). Out-of-range slot values:
     illegal access, not probed.
 
-    Accepted and inert: `launch_dependent_kernels` (bitwise identical either
-    way). Accepted but not exposed: `cache_seqlens` (ignored by the kernel --
+    Accepted, uncertified: `launch_dependent_kernels` (the target passes
+    False). Accepted but not exposed: `cache_seqlens` (ignored by the kernel --
     there is no ring mode), the eagle-tree mask trio, `validate_data`,
     `metadata`, the `_block_n`/`_num_warps`/`_num_stages` overrides. A
     `conv_state` dtype different from `x` is accepted and uncertified.

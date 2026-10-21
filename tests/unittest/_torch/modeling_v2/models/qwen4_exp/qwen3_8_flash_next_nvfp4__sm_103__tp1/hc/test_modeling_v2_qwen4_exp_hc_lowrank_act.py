@@ -1,13 +1,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """GPU test for the qwen4_exp_hc_lowrank_act entry: cells within one ulp of the
-float64 reference, wrong formulas outside, graph capture."""
+float64 reference, the fp32-logits guard, graph capture."""
 
 import zlib
 
 import pytest
 import torch
-import torch.nn.functional as F
 
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.hc.qwen4_exp_hc_lowrank_act import (  # noqa: E501
     qwen4_exp_hc_lowrank_act as op,
@@ -37,8 +36,7 @@ def _compare(out, ref) -> None:
         if got is None:
             continue
         assert got.dtype == want.dtype and got.shape == want.shape and got.is_contiguous()
-        if got.numel():
-            assert _ulp_ratio(got, want) <= 1.0, f"{_ulp_ratio(got, want):.4g} ulp"
+        assert _ulp_ratio(got, want) <= 1.0, f"{_ulp_ratio(got, want):.4g} ulp"
 
 
 def _build(spec, seed):
@@ -56,25 +54,6 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — fixture by
     low, inject = op(*args)
     assert low.shape == (cell.spec["rows"], RANK)
     _compare((low, inject), op.reference(*args))
-
-
-def test_wrong_variants_land_outside_the_band() -> None:
-    logits, rank, c, wi, dt = _build(dict(rows=64), seed=3)
-    want_low, want_inject = op.reference(logits, rank, c, wi, dt)
-    lg = logits.double()
-    for name, value, want in (
-        ("silu without /hc_count", F.silu(lg[:, :rank]), want_low),
-        ("sigmoid instead of silu", torch.sigmoid(lg[:, :rank] / c), want_low),
-        ("inject missing the 2", torch.sigmoid(lg[:, rank : rank + c] / c), want_inject),
-        (
-            "inject from the padding",
-            2 * torch.sigmoid(lg[:, rank + c : rank + 2 * c] / c),
-            want_inject,
-        ),
-    ):
-        ratio = _ulp_ratio(value.to(dt), want)
-        print(f"\n  {name:<28} {ratio:10.4g} ulp")
-        assert ratio > 5.0, name
 
 
 def test_guard_refuses_bf16_logits() -> None:

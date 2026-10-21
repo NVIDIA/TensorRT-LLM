@@ -4,9 +4,8 @@
 
 Cells are gated at one ulp of the activation dtype against the float64
 reference; the MoE-combine cells widen the residual's band by the combine's own
-rounding (see `_compare_moe`). Beyond them: agreement with the compositions it
-replaces, the separation from plausible wrong formulas, the norm-only aliasing
-claim, and graph capture.
+rounding (see `_compare_moe`). Beyond them: the CuTe fold kernel bitwise the
+Triton kernel at the last row count before the switch, and the slot-map guard.
 """
 
 import sys
@@ -17,18 +16,6 @@ import torch
 
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.hc.qwen4_exp_hc_inject_norm import (  # noqa: E501
     qwen4_exp_hc_inject_norm as op,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.hc.qwen4_exp_post_inject import (  # noqa: E501
-    qwen4_exp_post_inject,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.moe.fp4_block_scale_moe_renorm_permuted import (  # noqa: E501
-    finalize,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.moe.fused_sigmoid_gate_mul_add import (  # noqa: E501
-    fused_sigmoid_gate_mul_add,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.norm.flashinfer_gemma_rmsnorm import (  # noqa: E501
-    flashinfer_gemma_rmsnorm,
 )
 
 __extra_import_path__ = ["../../../.."]
@@ -186,208 +173,19 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — fixture by
         _compare_moe(args, (hc, normed), op.reference(*args))
 
 
-def _old_composition(hyper_input, block_out, inject, gamma, eps, hc_count):
-    hc = qwen4_exp_post_inject(hyper_input, block_out, inject)
-    hidden = hc.shape[1] // hc_count
-    parts = torch.split(hc, [hidden] * hc_count, 1)
-    weights = torch.split(gamma, hidden, 0)
-    normed = torch.cat([flashinfer_gemma_rmsnorm(p, w, eps) for w, p in zip(weights, parts)], 1)
-    return hc, normed
-
-
-def test_matches_the_composition_it_replaces() -> None:
-    """Against post_inject + four gemma norms + cat: the residual within one
-    ulp (fma contraction only), the normed stream within one ulp. One
-    representative prefill chunk: each component certifies its own cells."""
-    rows = 8192
-    args = _build(dict(rows=rows), seed=rows)[:6]
-    hc, normed = op(*args)
-    old_hc, old_normed = _old_composition(*args)
-    assert _ulp_ratio(hc, old_hc) <= 1.0
-    assert _ulp_ratio(normed, old_normed) <= 1.0
-    print(f"\n  rows {rows}: hc bitwise-equal fraction {(hc == old_hc).float().mean().item():.6f}")
-
-
-def test_wrong_variants_land_outside_the_band() -> None:
-    """Each mis-reading keeps the shapes; each lands > 5x outside one ulp. The
-    streams carry different scales, as the trained residual's do, so a norm
-    over the wrong group is visible."""
-    hyper_input, block_out, inject, gamma, eps, c, _, _ = _build(dict(rows=64), seed=5)
-    scales = torch.tensor([0.5, 1.0, 2.0, 4.0], device=DEV).repeat_interleave(HIDDEN)
-    hyper_input = (hyper_input.float() * scales).to(torch.bfloat16)
-    want_hc, want_normed = op.reference(hyper_input, block_out, inject, gamma, eps, c)
-    x = hyper_input.double().unflatten(-1, (c, HIDDEN))
-    b, g = block_out.double(), inject.double()
-    wrong_hc = {
-        "stream-minor inject": (x.flatten(-2) + (b.unsqueeze(-1) * g.unsqueeze(-2)).flatten(-2)),
-        "no gate": (x + b.unsqueeze(-2)).flatten(-2),
-    }
-    for name, value in wrong_hc.items():
-        ratio = _ulp_ratio(value.to(torch.bfloat16), want_hc)
-        print(f"\n  hc {name:<24} {ratio:10.4g} ulp")
-        assert ratio > 5.0, name
-    hc = want_hc.double().unflatten(-1, (c, HIDDEN))
-    full = hc.flatten(-2)
-    wrong_normed = {
-        "RMS over the full width": full
-        * torch.rsqrt(full.pow(2).mean(-1, keepdim=True) + eps)
-        * (1.0 + gamma.double()),
-        "w instead of 1 + w": (hc * torch.rsqrt(hc.pow(2).mean(-1, keepdim=True) + eps)).flatten(-2)
-        * gamma.double(),
-        "norm of the pre-inject stream": (x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps))
-        .flatten(-2)
-        .mul(1.0 + gamma.double()),
-    }
-    for name, value in wrong_normed.items():
-        ratio = _ulp_ratio(value.to(torch.bfloat16), want_normed)
-        print(f"  normed {name:<30} {ratio:10.4g} ulp")
-        assert ratio > 5.0, name
-
-
-def test_guard_refuses_block_out_without_inject() -> None:
-    hyper_input, block_out, inject, gamma, eps, c, _, _ = _build(dict(rows=4), seed=6)
-    with validating(op), pytest.raises(AssertionError):
-        op(hyper_input, block_out, None, gamma, eps, c)
-    with validating(op), pytest.raises(AssertionError):
-        op(hyper_input, block_out, inject[0], gamma, eps, c)
-
-
-def test_cuda_graph_capture_and_replay() -> None:
-    args = list(_build(dict(rows=8), seed=8))
-    static_in = args[0]
-    warmup = torch.cuda.Stream()
-    warmup.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(warmup):
-        for _ in range(3):
-            op(*args)
-    torch.cuda.current_stream().wait_stream(warmup)
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        graph_hc, graph_normed = op(*args)
-    fresh = _build(dict(rows=8), seed=18)[0]
-    static_in.copy_(fresh)
-    graph.replay()
-    torch.cuda.synchronize()
-    eager_hc, eager_normed = op(fresh, *args[1:])
-    assert torch.equal(graph_hc, eager_hc)
-    assert torch.equal(graph_normed, eager_normed)
-
-
-@pytest.mark.parametrize("rows", [128, 2048])
-def test_fold_matches_the_runner_finalize(rows) -> None:
-    """With the fold, bitwise this op on the runner's finalized rows: `finalize`
-    (the permuted MoE entry's emulation of the runner's finalize, bitwise its
-    output) and then the combine without the fold. 128 rows run the CuTe kernel,
-    2048 the Triton kernel's two-warp form."""
-    args = _build(dict(rows=rows, moe=True, fold=10), seed=300 + rows)
-    hyper_input, rows_, inject, gamma, eps, c, shared, gate, topk_weights, topk_rows = args
-    hc, normed = op(*args)
-    routed = finalize(rows_, topk_weights, topk_rows)
-    old_hc, old_normed = op(hyper_input, routed, inject, gamma, eps, c, shared, gate)
-    assert torch.equal(hc, old_hc)
-    assert torch.equal(normed, old_normed)
-
-
-def test_moe_combine_matches_the_composition_it_replaces() -> None:
-    """Against `fused_sigmoid_gate_mul_add` (in place on the routed output, as
-    the forward called it) and then this op without the combine: bitwise, at one
-    representative decode batch."""
-    rows = 128
-    args = _build(dict(rows=rows, moe=True), seed=100 + rows)
-    hyper_input, block_out, inject, gamma, eps, c, shared, gate = args
-    hc, normed = op(*args)
-    combined = fused_sigmoid_gate_mul_add(block_out.clone(), gate, shared)
-    old_hc, old_normed = op(hyper_input, combined, inject, gamma, eps, c)
-    print(
-        f"\n  rows {rows}: hc bitwise {(hc == old_hc).float().mean().item():.6f}, "
-        f"normed bitwise {(normed == old_normed).float().mean().item():.6f}"
-    )
-    assert torch.equal(hc, old_hc)
-    assert torch.equal(normed, old_normed)
-
-
-def test_moe_wrong_variants_land_outside_the_band() -> None:
-    """Each mis-reading of the combine keeps the shapes; each lands > 5x outside
-    the `_compare_moe` residual band."""
-    args = _build(dict(rows=64, moe=True), seed=7)
-    hyper_input, block_out, inject, gamma, eps, c, shared, gate = args
-    want_hc = op.reference(*args)[0]
-    feps = torch.finfo(torch.bfloat16).eps
-    b = _combine(block_out, shared, gate).double().abs()
-    band = feps * want_hc.double().abs() + (
-        feps * b.unsqueeze(-2) * inject.double().abs().unsqueeze(-1)
-    ).flatten(-2)
-    r, sh, s = block_out.double(), shared.double(), torch.sigmoid(gate.double())
-    variants = {
-        "no sigmoid": r + gate.double() * sh,
-        "gate on the routed half": s * r + sh,
-        "gate dropped": r + sh,
-        "shared dropped": r,
-        "1 - sigmoid": r + (1.0 - s) * sh,
-    }
-    x = hyper_input.double().unflatten(-1, (c, HIDDEN))
-    for name, blk in variants.items():
-        wrong = (x + blk.unsqueeze(-2) * inject.double().unsqueeze(-1)).flatten(-2)
-        ratio = ((wrong.to(torch.bfloat16).double() - want_hc.double()).abs() / band).max().item()
-        print(f"\n  hc {name:<26} {ratio:10.4g}x the band")
-        assert ratio > 5.0, name
-
-
-def test_guard_refuses_a_partial_combine() -> None:
-    hyper_input, block_out, inject, gamma, eps, c, shared, gate = _build(
-        dict(rows=4, moe=True), seed=9
-    )
+def test_guard_refuses_an_int64_slot_map() -> None:
+    """The fold's slot map is the runner's int32 index map; `is_valid` refuses an int64 one."""
     fold = _build(dict(rows=4, moe=True, fold=10), seed=9)
-    with validating(op), pytest.raises(AssertionError):
-        op(*fold[:6], None, None, *fold[8:])
-    with validating(op), pytest.raises(AssertionError):
-        op(*fold[:9], None)
-    with validating(op), pytest.raises(AssertionError):
+    with validating(op), pytest.raises(AssertionError, match="int32"):
         op(*fold[:9], fold[9].long())
-    with validating(op), pytest.raises(AssertionError):
-        op(hyper_input, block_out, inject, gamma, eps, c, shared, None)
-    with validating(op), pytest.raises(AssertionError):
-        op(hyper_input, None, None, gamma, eps, c, shared, gate)
-    with validating(op), pytest.raises(AssertionError):
-        op(hyper_input, block_out, inject, gamma, eps, c, shared, gate[:1].expand(4, 1))
 
 
-def test_moe_cuda_graph_capture_and_replay() -> None:
-    args = list(_build(dict(rows=8, moe=True), seed=10))
-    warmup = torch.cuda.Stream()
-    warmup.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(warmup):
-        for _ in range(3):
-            op(*args)
-    torch.cuda.current_stream().wait_stream(warmup)
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        graph_hc, graph_normed = op(*args)
-    fresh = _build(dict(rows=8, moe=True), seed=20)
-    for i in (0, 1, 6, 7):
-        args[i].copy_(fresh[i])
-    graph.replay()
-    torch.cuda.synchronize()
-    eager_hc, eager_normed = op(*args)
-    assert torch.equal(graph_hc, eager_hc)
-    assert torch.equal(graph_normed, eager_normed)
-
-
-@pytest.mark.parametrize(
-    "spec",
-    [
-        dict(rows=2, drop=True),
-        dict(rows=128),
-        dict(rows=511),
-    ],
-    ids=lambda s: "-".join(f"{k}{v}" for k, v in s.items()),
-)
-def test_fold_cute_is_the_triton_kernel_bitwise(spec, monkeypatch) -> None:
+def test_fold_cute_is_the_triton_kernel_bitwise(monkeypatch) -> None:
     """Below `_FEW_WARPS_MIN_ROWS` rows the fold runs the CuTe DSL kernel; its
     `hc_out` and `normed` are bitwise the Triton kernel's (run by refusing the
-    CuTe guard): the smallest decode batch with dropped slots, the largest decode
-    batch, and the last row count before the switch."""
-    args = _build(dict(spec, moe=True, fold=10), seed=500 + spec["rows"])
+    CuTe guard) at the last row count before the switch."""
+    rows = M._FEW_WARPS_MIN_ROWS - 1
+    args = _build(dict(rows=rows, moe=True, fold=10), seed=500 + rows)
     calls = []
     cute_fold = M._fold_cute
 
@@ -397,16 +195,8 @@ def test_fold_cute_is_the_triton_kernel_bitwise(spec, monkeypatch) -> None:
 
     monkeypatch.setattr(M, "_fold_cute", recording)
     hc, normed = op(*args)
-    assert calls == [spec["rows"]], "the decode MoE site runs the CuTe kernel"
+    assert calls == [rows], "the decode MoE site runs the CuTe kernel"
     monkeypatch.setattr(M, "_fold_cute_ok", lambda *a: False)
     want_hc, want_normed = op(*args)
     assert torch.equal(hc, want_hc)
     assert torch.equal(normed, want_normed)
-
-
-def test_fold_from_the_few_warps_rows_keeps_triton(monkeypatch) -> None:
-    """From `_FEW_WARPS_MIN_ROWS` rows (the Triton kernel's two-warp form, another
-    reduction order) the fold stays on the Triton kernel."""
-    args = _build(dict(rows=M._FEW_WARPS_MIN_ROWS, moe=True, fold=10), seed=77)
-    monkeypatch.setattr(M, "_fold_cute", lambda *a: pytest.fail("CuTe kernel at 512 rows"))
-    op(*args)

@@ -53,7 +53,10 @@ def _scattered(num_seqs: int) -> tuple[int, ...]:
 
 
 def _ckpt(why: str, lengths: tuple[int, ...], **spec) -> Cell:
-    return Cell(why=why, spec=dict(channels=CKPT_CHANNELS, lengths=lengths, **spec))
+    return Cell(
+        why=why,
+        spec=dict(channels=CKPT_CHANNELS, lengths=lengths, pool_slots=ENGINE_SLOTS, **spec),
+    )
 
 
 class DilatedShortConvPaged(OpWrapper):
@@ -84,47 +87,20 @@ class DilatedShortConvPaged(OpWrapper):
 
     ARCHS = frozenset({Arch.SM_103})
 
-    # spec keys: channels, kernel_size (4), dilation (3), lengths, pool_slots (8),
-    # slots (None -> arange), initial (default all True; "none" -> None),
-    # dtype, bias, silu, pad_slot_id, x_form ("channel_major" | "token_major"),
-    # index_dtype (int32), qsl_dtype (int32), no_indices.
-    CELLS: tuple[Cell, ...] = tuple(
-        # The call site's own form: a bare .t() of the token-major activation,
-        # query_start_loc_long (int64), int32 slots, the whole pool.
+    # spec keys: lengths, slots, initial (default all True). Every cell is the
+    # call site's own form: a bare .t() of the token-major [T, 10240]
+    # activation, kernel 4, dilation 3, bf16, no bias, SiLU,
+    # query_start_loc_long (int64), int32 slots, the whole 461-slot pool.
+    CELLS: tuple[Cell, ...] = (
+        _ckpt("decode: 32 one-token rows", (1,) * 32, slots=_scattered(32)),
         _ckpt(
-            f"call-site form at the 461-slot pool, {why}",
-            lengths,
-            pool_slots=ENGINE_SLOTS,
-            slots=_scattered(len(lengths)),
-            x_form="token_major",
-            qsl_dtype=torch.int64,
-        )
-        for why, lengths in (
-            ("37+1+128", (37, 1, 128)),
-            ("2047+1+1+1", (2047, 1, 1, 1)),
-            ("32 one-token rows", (1,) * 32),
-        )
-    ) + (
+            "mixed: a 2047-token context + 3 one-token rows", (2047, 1, 1, 1), slots=_scattered(4)
+        ),
         _ckpt(
-            "MTP verify at 461 slots: a 37-token context + 8 rows of 3 drafts",
+            "MTP verify: a fresh 37-token context + 8 rows of 3 drafts",
             (37,) + (3,) * 8,
-            pool_slots=ENGINE_SLOTS,
             slots=_scattered(9),
             initial=(False,) + (True,) * 8,
-            x_form="token_major",
-            qsl_dtype=torch.int64,
-        ),
-        _ckpt(
-            "MTP verify p=8 at 461 slots: 32 rows of 8 tokens",
-            (8,) * 32,
-            pool_slots=ENGINE_SLOTS,
-            slots=_scattered(32),
-            x_form="token_major",
-            qsl_dtype=torch.int64,
-        ),
-        Cell(
-            why="pad_slot_id -1 row while slot 0 is itself live",
-            spec=dict(channels=256, lengths=(6, 4, 17), slots=(0, -1, 3), pool_slots=6),
         ),
     )
 
@@ -137,9 +113,9 @@ class DilatedShortConvPaged(OpWrapper):
     dilation 3 (state 9), SiLU on, the whole `[slots, 10240, 9]` pool, int32
     slots, `query_start_loc_long` (int64, rebuilt from `seq_lens` under MTP),
     carry flags covering the whole batch, `pad_slot_id` -1. Certified in that
-    form at the 461-slot pool (prefill mixes up to 2047 tokens, 32 one-token
-    decode rows, MTP verify batches of 3 and of 8 tokens per request, up to 32
-    requests), plus a pad row on a 6-slot pool.
+    form at the 461-slot pool: 32 one-token decode rows, a 2047-token context
+    mixed with three one-token rows, and an MTP verify step (a fresh 37-token
+    context and 8 requests of 3 tokens). A padded row is not certified.
 
     Preconditions: `query_start_loc[-1] == x.shape[1]`; a short one indexes
     past the internal history and fires a device-side assert that kills the
@@ -149,8 +125,9 @@ class DilatedShortConvPaged(OpWrapper):
     Only the checkpoint's kernel size 4 and dilation 3 are certified; there is
     no width dispatch.
 
-    CUDA-graph capture is certified: no host sync, all batch reads on device,
-    a captured graph stays correct when the batch tensors' values change.
+    CUDA-graph capture is certified (at 32 requests of 8 tokens): no host
+    sync, all batch reads on device, a captured graph stays correct when the
+    batch tensors' values change.
     Launch-bound on decode (8 rows: 0.461 ms eager vs 0.029 ms of conv; 0.094
     ms replayed from a graph).
 

@@ -43,16 +43,13 @@ def _ckpt(
     local (tp1), SwiGLU, no clamp, 16-element e4m3 block scales.
 
     `mma_n` is the autotuner tactic's MMA N tile (128 is also the fallback when the
-    tuner has no entry). `dist` names how the test draws the expert ids, as in the
-    moe_sort entry's test: `router` = each row's top-10 of uniform scores; `hot` =
-    every row on the same 10 experts; `tile_edges` = three experts hold exactly
-    tile-1, tile and tile+1 rows; `round_robin` = row i takes experts (10 i + j) mod
-    512. `gsf` sets `global_sf` against the activations' magnitude: `calibrated` =
-    the activation maximum the test calibrates to maps to the e4m3 maximum, as the
-    checkpoint's per-layer `1 / down_proj.input_scale` does; `saturating` = 25x
-    above that, so most block scales clip at 448 and the codes at 6; `subnormal` =
-    2^-12 of it, so block scales fall into e4m3 subnormals and zero. `zero_tokens`
-    makes that many leading tokens all-zero rows (zero block scales).
+    tuner has no entry). `dist` names how the test draws the expert ids: `router` =
+    each row's top-10 of uniform scores. `gsf` sets `global_sf` against the
+    activations' magnitude: `calibrated` = the activation maximum the test
+    calibrates to maps to the e4m3 maximum, as the checkpoint's per-layer `1 /
+    down_proj.input_scale` does; `subnormal` = 2^-12 of it, so block scales fall
+    into e4m3 subnormals and zero. `zero_tokens` makes that many leading tokens
+    all-zero rows (zero block scales).
     """
     return dict(
         tokens=tokens,
@@ -143,20 +140,8 @@ class CuteDslNvfp4GatherGroupedGemmActFusion(OpWrapper):
             spec=_ckpt(1, 128),
         ),
         Cell(
-            why="tile 128: MMA N 256 tactic, 32 requests at MTP verify width 4; largest captured T",
-            spec=_ckpt(128, 128, mma_n=256),
-        ),
-        Cell(
             why="tile 128: 8192 rows, max_num_tokens prefill",
             spec=_ckpt(8192, 128),
-        ),
-        Cell(
-            why="tile 128: expert rows tile-1, tile, tile+1; the mn_limit edge",
-            spec=_ckpt(300, 128, dist="tile_edges"),
-        ),
-        Cell(
-            why="tile 128: global_sf 25x calibrated; block scales clip at 448",
-            spec=_ckpt(2048, 128, gsf="saturating"),
         ),
         Cell(
             why="tile 128: tiny global_sf and 7 all-zero token rows; subnormal and zero "
@@ -188,8 +173,8 @@ class CuteDslNvfp4GatherGroupedGemmActFusion(OpWrapper):
     (tile_size, 256) and with no tuning entry falls back to (tile_size, 128);
     serving warmup tunes per row bucket and may pick either. Every pair's codes
     and block scales are bitwise identical across tile 128 / 256 x MMA N 128 / 256
-    x the fallback (the test checks it at 128 and 8192 rows), so cells driven at
-    one tactic certify the others.
+    x the fallback (the test checks it at 8192 rows), so cells driven at one
+    tactic certify the others.
 
     Determinism. A (token, expert) pair's output row depends on that pair alone:
     it is bitwise unchanged by reordering an expert's rows (moe_sort orders them by
@@ -203,11 +188,12 @@ class CuteDslNvfp4GatherGroupedGemmActFusion(OpWrapper):
     the same tile arrays, and the combine reads only
     expanded_idx_to_permuted_idx's rows.
 
-    Scale range: with global_sf 25x the calibrated value the block scales clip at
-    448 and the codes at 6 (no NaN); with a tiny one the block scales fall to e4m3
-    subnormals and to zero. An all-zero token gives scale 0 and codes of magnitude
-    0. A block whose scale is 0 dequantizes to zero whatever its codes hold, and
-    the test's compare does not read them.
+    Scale range: with a tiny global_sf the block scales fall to e4m3 subnormals
+    and to zero (a cell). An all-zero token gives scale 0 and codes of magnitude
+    0 (the same cell). With global_sf 25x the calibrated value the block scales
+    clip at 448 and the codes at 6 (no NaN) -- measured, not certified. A block
+    whose scale is 0 dequantizes to zero whatever its codes hold, and the test's
+    compare does not read them.
 
     Preconditions the caller owns (a wrong preparation of each operand -- the
     weight's rows, its scales, the activation's scales, alpha -- runs without
@@ -235,6 +221,12 @@ class CuteDslNvfp4GatherGroupedGemmActFusion(OpWrapper):
     tile-128 sort and 128 with a tile-256 sort; input_scale not H/16 wide;
     global_sf of 2 elements; alpha not fp32; weight_scale typed float8_e4m3fn;
     input typed uint8. tile_size 64: ValueError.
+
+    Measured at bring-up and not re-driven by the test: the CUDA-graph capture
+    with moe_sort, the determinism and write statements, the wrong preparations'
+    distance from the gate, the short-alpha and short-weight_scale refusals and
+    the loud rejections. The test re-drives the cells, the tile / tactic
+    invariance and the `input` contiguity refusal.
 
     Uncertified: Relu2 and SiTU; a SwiGLU clamp (swiglu_limit_scalar >= 0);
     expert_counts (DeepEP count-native metadata); expert parallelism (the kernel

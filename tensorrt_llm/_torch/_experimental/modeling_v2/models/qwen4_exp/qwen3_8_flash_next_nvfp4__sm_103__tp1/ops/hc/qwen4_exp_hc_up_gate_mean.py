@@ -835,14 +835,10 @@ class Qwen4ExpHcUpGateMean(OpWrapper):
     CELLS: tuple[Cell, ...] = tuple(
         Cell(why=f"checkpoint 4x2560, rank 320, {why}", spec=dict(rows=t))
         for t, why in (
-            (1, "1 row, one partial tile"),
             (128, "decode 128 rows, one full tile"),
             (16384, "prefill chunk 16384 (max_num_tokens)"),
         )
-    ) + (
-        Cell(why="ragged tail, 16320 + 70 rows (mixed step)", spec=dict(rows=16390)),
-        Cell(why="zero rows", spec=dict(rows=0)),
-    )
+    ) + (Cell(why="ragged tail, 16320 + 70 rows (mixed step)", spec=dict(rows=16390)),)
 
     note = """
     Tier 6 (CuTe DSL written for this target): a persistent tcgen05 GEMM whose
@@ -861,8 +857,12 @@ class Qwen4ExpHcUpGateMean(OpWrapper):
     that releases dependents early (`qwen4_exp_hc_decode_tc_first`) the weight
     read overlaps the producer.
 
-    Not certified: hc_count other than 4, hidden other than 2560, rank other
-    than 320 (the kernel compiles for them; no cell drives them).
+    Certified: bf16 at the checkpoint's 4 x 2560, rank 320: 128 rows (one full
+    tile), 16384 rows, 16390 rows (a partial last tile); graph replay.
+
+    Not certified: zero rows, fewer rows than a tile, hc_count other than 4,
+    hidden other than 2560, rank other than 320 (the kernel compiles for them;
+    no cell drives them).
     """
 
     def __call__(

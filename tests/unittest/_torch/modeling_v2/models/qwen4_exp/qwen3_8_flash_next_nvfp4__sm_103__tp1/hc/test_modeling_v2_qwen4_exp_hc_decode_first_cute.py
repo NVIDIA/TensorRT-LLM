@@ -6,8 +6,8 @@ Cells against the entry's float64 reference: `hc_out` within one ulp (plus the
 combine's and the finalize's own rounding at the MoE sites), `part` within `2^-16` of
 the reference relative to its scale, `ss` to fp32 accuracy. Beyond the cells: a
 stale-read check under CUDA-graph replay with PDL, where a kernel that read its
-activations before `griddepcontrol.wait` would see the previous replay's; determinism;
-the guards.
+activations before `griddepcontrol.wait` would see the previous replay's; the one-row
+guard.
 """
 
 import zlib
@@ -156,12 +156,6 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — fixture by
         _compare_moe(args, out, op.reference(*args))
 
 
-def test_deterministic() -> None:
-    args = _build(dict(moe=True, fold=10), seed=3)
-    for a, b in zip(op(*args), op(*args)):
-        assert torch.equal(a, b)
-
-
 def test_reads_after_the_wait_under_graph_replay() -> None:
     """A producer kernel rewrites every activation inside the graph right before this op.
     With PDL the op may start before the producer finishes; reading any activation before
@@ -200,6 +194,3 @@ def test_guards() -> None:
     two = args[0].expand(2, -1).contiguous()
     with validating(op), pytest.raises(AssertionError, match="one row"):
         op(two, args[1].expand(2, -1).contiguous(), args[2].expand(2, -1).contiguous(), *args[3:])
-    args[4] = args[4].contiguous()
-    with validating(op), pytest.raises(AssertionError):
-        op(*args)

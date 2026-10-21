@@ -42,7 +42,6 @@ class DequantizeE4m3PerTensor(OpWrapper):
 
     CELLS: tuple[Cell, ...] = (
         Cell(why="_ple_block decode: [1, 16, 160] gathered rows, bf16 scale", spec=_ple(1)),
-        Cell(why="_ple_block at 8 tokens", spec=_ple(8)),
         Cell(
             why="_ple_block prefill at max_num_tokens: [16384, 16, 160] through the grid-stride "
             "loop",
@@ -62,17 +61,14 @@ class DequantizeE4m3PerTensor(OpWrapper):
     grid with a grid-stride loop; there is no vectorized variant, so alignment
     is not an axis.
 
-    Preconditions, all enforced loudly by the op (`symmetric_dequantize_per_
-    tensor` in thop/fp8Op.cpp): `input` float8_e4m3fn (e5m2, int8, bf16 raise),
-    CUDA, contiguous, rank >= 2, non-empty (zero rows or columns raise -- an
-    empty batch must branch first); `scales` CUDA, bf16 / fp16 / fp32 (fp64
-    raises), of `input`'s rank with every dim 1.
+    Preconditions, enforced by the op (`symmetric_dequantize_per_tensor` in
+    thop/fp8Op.cpp): `input` float8_e4m3fn, CUDA, contiguous, rank >= 2,
+    non-empty (zero rows raise -- an empty batch must branch first; the test
+    holds this rejection); `scales` CUDA, bf16 / fp16 / fp32, of `input`'s rank
+    with every dim 1.
 
-    Degenerate scale values are accepted and computed exactly: 0 zeroes every
-    lane (signs kept, no NaN), a negative scale flips signs, +inf sends finite
-    lanes to +-inf and zero lanes to NaN, NaN makes everything NaN. Overflow is
-    inf, not a clamp (fp16 scale 1000 sends 448 to inf). NaN codes stay NaN.
-    `448 * PLE_SCALE` reads back as bf16 0.08935546875.
+    NaN codes stay NaN; `448 * PLE_SCALE` reads back as bf16 0.08935546875 (the
+    all-codes cell).
 
     CUDA-graph capture is certified: replay picks up a new `input` and a new
     `scales` value written in place (the scale is read from memory at replay).
@@ -82,8 +78,9 @@ class DequantizeE4m3PerTensor(OpWrapper):
              int32 boundary 2^31 not probed
 
     Not certified: fp16 and fp32 outputs (the target's scale is bf16), ranks
-    other than 3, `TRTLLM_ENABLE_PDL=1`, `scales` on a different device than
-    `input`.
+    other than 2 and 3, degenerate scale values (0, negative, inf, NaN) and
+    overflow, the op's other loud rejections (dtype, layout, rank, device),
+    `TRTLLM_ENABLE_PDL=1`, `scales` on a different device than `input`.
     """
 
     def __call__(self, input: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:

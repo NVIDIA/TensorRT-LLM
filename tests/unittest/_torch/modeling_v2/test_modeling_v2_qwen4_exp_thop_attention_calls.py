@@ -67,45 +67,33 @@ def _is_vision(call: ast.Call) -> bool:
     return "_VISION_CALL_CONSTANTS" in _unpacked(call)
 
 
-def test_the_target_calls_thop_attention_where_expected() -> None:
-    """Guards the checks below against going vacuous: the trunk and the draft layer each
-    call it from the prefill and the decode target, and the vision tower once."""
-    calls = _thop_attention_calls()
-    assert len([c for c in calls if not _is_vision(c)]) >= 4
-    assert len([c for c in calls if _is_vision(c)]) == 1
-
-
 _KV_CACHE_CALLS = [call for call in _thop_attention_calls() if not _is_vision(call)]
 
 
-@pytest.mark.parametrize(
-    "call", _KV_CACHE_CALLS, ids=[f"call{i}" for i in range(len(_KV_CACHE_CALLS))]
-)
-def test_every_kv_cache_call_passes_the_pool_storage(call) -> None:
-    keywords = _keywords(call)
-    for name in _KV_STORAGE_ARGS:
-        assert name in keywords, f"thop_attention call at line {call.lineno} omits {name}"
-        value = keywords[name]
-        # Read off the core, whose `FP8` / `None` resolution all three follow.
-        assert isinstance(value, ast.Attribute) and value.attr == name, (
-            f"line {call.lineno}: {name}={ast.unparse(value)}, not the core's `{name}`"
-        )
+def test_every_kv_cache_call_passes_the_pool_storage() -> None:
+    # Against going vacuous: the trunk and the draft layer each call it from the prefill
+    # and the decode target.
+    assert len(_KV_CACHE_CALLS) >= 4
+    for call in _KV_CACHE_CALLS:
+        keywords = _keywords(call)
+        for name in _KV_STORAGE_ARGS:
+            assert name in keywords, f"thop_attention call at line {call.lineno} omits {name}"
+            value = keywords[name]
+            # Read off the core, whose `FP8` / `None` resolution all three follow.
+            assert isinstance(value, ast.Attribute) and value.attr == name, (
+                f"line {call.lineno}: {name}={ast.unparse(value)}, not the core's `{name}`"
+            )
 
 
-def test_the_shared_constants_do_not_override_the_pool_storage() -> None:
-    """`**_CALL_CONSTANTS` is unpacked into every KV cache call; a storage argument in it
-    would either raise as a duplicate keyword or, if the call dropped its own, silently
-    pin the pool to one storage."""
+def test_the_unpacked_arguments_carry_no_pool_storage() -> None:
+    """`**_CALL_CONSTANTS` and `**step` (each target's `step_args`) are unpacked into every
+    KV cache call; a storage argument in either would raise as a duplicate keyword or, if the
+    call dropped its own, silently pin the pool to one storage."""
     constants = {kw.arg for kw in _module_dict("_CALL_CONSTANTS").keywords}
     assert constants
     assert not constants & set(_KV_STORAGE_ARGS)
     for call in _KV_CACHE_CALLS:
         assert "_CALL_CONSTANTS" in _unpacked(call)
-
-
-def test_the_step_state_carries_no_pool_storage() -> None:
-    """`**step` (each target's `step_args`) is unpacked into the same calls: a storage
-    argument there would collide with the call's own."""
     steps = [
         node
         for node in ast.walk(_TREE)
@@ -121,11 +109,12 @@ def test_the_step_state_carries_no_pool_storage() -> None:
 
 
 def test_the_vision_tower_runs_without_kv_storage() -> None:
-    """The encoder-only call states a bf16, unscaled, cache-less configuration."""
+    """The encoder-only call, made once, states a bf16, unscaled, cache-less configuration."""
     constants = {kw.arg: kw.value for kw in _module_dict("_VISION_CALL_CONSTANTS").keywords}
     assert ast.literal_eval(constants["quant_mode"]) == 0
     assert ast.literal_eval(constants["kv_scale_orig_quant"]) is None
     assert ast.literal_eval(constants["kv_scale_quant_orig"]) is None
-    for call in _thop_attention_calls():
-        if _is_vision(call):
-            assert not set(_keywords(call)) & set(_KV_STORAGE_ARGS)
+    vision = [call for call in _thop_attention_calls() if _is_vision(call)]
+    assert len(vision) == 1
+    for call in vision:
+        assert not set(_keywords(call)) & set(_KV_STORAGE_ARGS)

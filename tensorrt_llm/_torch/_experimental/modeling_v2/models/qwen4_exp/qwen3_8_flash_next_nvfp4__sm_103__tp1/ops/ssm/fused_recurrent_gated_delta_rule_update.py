@@ -65,13 +65,11 @@ class FusedRecurrentGatedDeltaRuleUpdate(OpWrapper):
     ARCHS = frozenset({Arch.SM_103})
 
     # spec: mode ("verify": disable_state_update + buffer with cache_steps = p
-    # | "write_back" | "both"), n sequences x p tokens (or lengths for the
-    # varlen form), pool_slots (None: no pool), cache_rows, slots (None:
-    # arange(n)), pool_dtype / cache_dtype, beta ("fp32" | "bf16": sigmoid of
-    # a bf16 projection, as the target passes it | "channel"), qkv ("views"
+    # | "write_back"), n sequences x p tokens, pool_slots, cache_rows, slots
+    # (None: arange(n)), pool_dtype / cache_dtype, beta ("fp32" | "bf16":
+    # sigmoid of a bf16 projection, as the target passes it), qkv ("views"
     # over a packed [T, 10240] row block | "contiguous", as the target passes
-    # them), output (None | "prefix" of a longer buffer | "fp32"),
-    # index_dtype, cu_dtype, pool_view ("layer_major").
+    # them).
     CELLS: tuple[Cell, ...] = tuple(
         _verify(
             n,
@@ -84,11 +82,11 @@ class FusedRecurrentGatedDeltaRuleUpdate(OpWrapper):
             pool_dtype=dtype,
             cache_dtype=dtype,
         )
-        for dtype, label, shapes in (
-            (torch.float32, "", ((1, 2), (32, 2), (8, 4))),
-            (torch.bfloat16, "bf16 state: ", ((1, 2), (32, 2), (8, 3))),
+        for dtype, label, n, p in (
+            (torch.float32, "", 32, 2),
+            (torch.float32, "", 8, 4),
+            (torch.bfloat16, "bf16 state: ", 32, 2),
         )
-        for n, p in shapes
     )
 
     note = """
@@ -129,15 +127,17 @@ class FusedRecurrentGatedDeltaRuleUpdate(OpWrapper):
     at cache_steps 2, P 4; `cache_steps` other than the buffer's step axis
     misplaces every row past 0 against the buffer's own indexing.
 
-    Deterministic; the first call in a fresh process is bitwise the second.
+    The first call in a fresh process is bitwise the second (measured on the
+    write-back sink; the kernel has no autotuner).
 
     Certified: the call site's form alone -- the per-step buffer sink with the pool
-    untouched, at 1, 8 and 32 sequences and P = 2..4, over an fp32 or a bf16 pool and buffer.
-    Not certified: the write-back sink (`disable_state_update=False`), alone or with the
-    buffer; the varlen form (`cu_seqlens`); negative, scattered or int64 indices; no pool;
-    fp32 or per-channel `beta`; q/k/v as views of the packed rows; an `output` buffer;
-    `disable_output_calculation=True`; `K` or `V` other than 128; fp16/fp32 q/k/v; P
-    outside 2..4; N above 32.
+    untouched, at 32 sequences of P = 2 and 8 of P = 4 over an fp32 pool and buffer, and
+    32 of P = 2 over a bf16 one. Not certified: the write-back sink
+    (`disable_state_update=False`), alone or with the buffer; the varlen form
+    (`cu_seqlens`); negative, scattered or int64 indices; no pool; fp32 or per-channel
+    `beta`; q/k/v as views of the packed rows; an `output` buffer;
+    `disable_output_calculation=True`; `K` or `V` other than 128; fp16/fp32 q/k/v; P = 3
+    and P outside 2..4; N above 32.
 
     Hard limits
       N * HV  gridDim.z  boundary 65535  probed at N=1300 (62400): runs;

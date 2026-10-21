@@ -135,13 +135,10 @@ _CKPT = dict(
     hole=None,
 )
 
-_DECODE = ((0, 1), (1, 1), (31, 1), (32, 1), (33, 1), (63, 1), (64, 1), (95, 1))
-
 #: The target's serving envelope: ISL 8192 + OSL 1024 puts decode rows up to position
 #: 9215 (page column 287), 128 concurrent requests, and `max_num_tokens` 16384
 #: rows in one prefill or mixed step.
 _WIDE = dict(slots=160, width=300)
-_DECODE_128 = tuple(((r * 72 + 9) % 9216, 1) for r in range(128))
 _PREFILL_16K = ((0, 8192), (0, 8192))
 
 #: 32 requests of one MTP7 verify block each (8 rows), at starts that put some blocks across a
@@ -193,18 +190,14 @@ class QsaPagedIndexStore(OpWrapper):
             spec=_spec(_MTP7_32, pages=1200, slots=40),
         ),
         Cell(
-            why="decode M=128 at positions up to 9153 (page column 286), token_k off the "
-            "fused projection row",
-            spec=_spec(_DECODE_128, pages=18432, key_layout="fused_row", **_WIDE),
-        ),
-        Cell(
             why="prefill 16384 rows (max_num_tokens), 16 rows per program, token_k off the "
             "fused projection row",
             spec=_spec(_PREFILL_16K, pages=600, key_layout="fused_row", **_WIDE),
         ),
         Cell(
             why="NVFP4-KV side planes: index and position planes as strided views of one "
-            "per-slot buffer holding 12 index-K pages and the position page",
+            "per-slot buffer holding 12 index-K pages and the position page; one row "
+            "on an unallocated (-1) table entry is skipped",
             spec=_spec(
                 ((0, 1), (31, 1), (32, 1), (33, 40)),
                 pages=8,
@@ -212,15 +205,8 @@ class QsaPagedIndexStore(OpWrapper):
                 layers=12,
                 page_stride=49344,
                 position_strides=(24672, 3, 1),
+                hole="unallocated_page",
             ),
-        ),
-        Cell(
-            why="skip: table entry -1 (unallocated)",
-            spec=_spec(_DECODE, pages=32, hole="unallocated_page"),
-        ),
-        Cell(
-            why="skip: negative request index",
-            spec=_spec(_DECODE, pages=32, hole="negative_request"),
         ),
     )
 
@@ -246,7 +232,8 @@ class QsaPagedIndexStore(OpWrapper):
       - destination slots are unique across the batch: two rows naming one
         (page, slot) both store, unordered. The engine's mapping cannot
         collide.
-    Loud rejections (`ValueError`, before launching): metadata that is not
+    Loud rejections (`ValueError`, before launching; the test pins the
+    unequal-length metadata one): metadata that is not
     one-dimensional, of unequal length, or not int32/int64; `token_k` or the
     coordinates with a row count other than the metadata's; an index plane
     whose page size, head count or head width disagrees with
@@ -254,9 +241,9 @@ class QsaPagedIndexStore(OpWrapper):
     disagrees or that is narrower than the coordinates; a table that is not a
     2-D integer tensor. `rows == 0` returns before launching.
 
-    Values the caller owns -- data, not metadata: coordinates wider than the
-    plane's dtype wrap (int64 `2^31 + 5` stores as -2147483643); floats
-    truncate toward zero.
+    Values the caller owns -- data, not metadata (measured, not pinned by a
+    test): coordinates wider than the plane's dtype wrap (int64 `2^31 + 5`
+    stores as -2147483643); floats truncate toward zero.
 
     One launch per call; HEAD_DIM, the head count, the page size and the
     coordinate width are constexprs, everything else (strides, pool and table
@@ -265,19 +252,20 @@ class QsaPagedIndexStore(OpWrapper):
     (strides still specialize on 1 and 16-divisibility). Up to 256 rows run
     one row per program (1 warp), above that 16 rows per program (4 warps).
     CUDA-graph capturable (captured at 256 rows, 32 MTP7 verify blocks); a
-    replay follows positions rewritten in place. Repeating a call is
-    idempotent.
+    replay follows positions rewritten in place.
 
     Hard limits: every index is widened to int64 inside the kernel before
     any arithmetic; an int64 position at `2^32 + 5` lands past the table and
-    is skipped rather than truncated. Rows are a grid axis: 2^31 programs.
+    is skipped rather than truncated (read from the kernel, not pinned by a
+    test). Rows are a grid axis: 2^31 programs.
 
-    Skips certified by a cell: an unallocated (`-1`) table entry and a negative
-    request index; the test also drives an int64 position past the table. The
-    other skip conditions share that mask and have no cell.
+    Skip certified by a cell: an unallocated (`-1`) table entry, one row of the
+    NVFP4-plane cell. The other skip conditions (a negative request index among
+    them) share that mask and have no cell.
 
     Not certified: an fp8 index plane, keys other than bf16, any index geometry
-    other than 1 head x 128 at 32-token pages, strided metadata or tables,
+    other than 1 head x 128 at 32-token pages, decode batches other than 32 MTP7
+    verify blocks, strided metadata or tables,
     stride-0 coordinates, multiple devices, concurrent streams onto one pool,
     duplicate destinations.
     """

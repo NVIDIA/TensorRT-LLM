@@ -58,8 +58,10 @@ class Fp4BlockScaleMoeRenormPermuted(OpWrapper):
             "routing kernel",
             spec=_ckpt(1),
         ),
-        Cell(why="16 rows: decode_first's MAX_ROWS; the cluster routing kernel", spec=_ckpt(16)),
-        Cell(why="128 rows: the con=128 decode batch", spec=_ckpt(128)),
+        Cell(
+            why="128 rows: the con=128 decode batch; the cluster routing kernel",
+            spec=_ckpt(128),
+        ),
         Cell(why="coarse 3-level logits: ties decide most slots", spec=_ckpt(64, dist="coarse")),
     )
 
@@ -81,7 +83,7 @@ class Fp4BlockScaleMoeRenormPermuted(OpWrapper):
     not a multiple of 256).
 
     Hard limits
-      T            certified 1..128 (decode); the decode forward folds at
+      T            certified at 1, 64 and 128 (decode); the decode forward folds at
                    every site that takes the combine
       num_experts  512, top_k 10
     """

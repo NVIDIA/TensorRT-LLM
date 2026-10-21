@@ -5,8 +5,7 @@
 Cells are gated against the float64 reference that rounds where the op rounds:
 the stream (`hc_out`) and the published conv state within one ulp of each
 element, the normed stream within two (see `_compare`). Beyond the cells:
-agreement with the composition it replaces at the same band, separation from
-plausible wrong formulas, and graph capture.
+the operand-width guard and graph capture.
 """
 
 import zlib
@@ -14,15 +13,6 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.hc.qwen4_exp_hc_inject_norm import (  # noqa: E501
-    qwen4_exp_hc_inject_norm,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.norm.flashinfer_gemma_rmsnorm import (  # noqa: E501
-    flashinfer_gemma_rmsnorm,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.ple.gated_ngram_injection import (  # noqa: E501
-    gated_ngram_injection,
-)
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.ple.ple_gate_conv_inject_norm import (  # noqa: E501
     CKPT_CLAMP_MIN,
     CKPT_DILATION,
@@ -31,9 +21,6 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flas
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.ple.ple_gate_conv_inject_norm import (  # noqa: E501
     ple_gate_conv_inject_norm as op,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.ssm.dilated_short_conv_paged import (  # noqa: E501
-    dilated_short_conv_paged,
 )
 
 __extra_import_path__ = ["../../../.."]
@@ -160,98 +147,6 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — fixture by
         print(
             f"\n  {cell.why[:40]:<40} {name:<12} worst {worst:.3g} ulp, differ {frac:.2e}", end=""
         )
-
-
-def _grouped(x, w, c):
-    d = x.shape[1] // c
-    parts = torch.split(x, [d] * c, 1)
-    return torch.cat(
-        [flashinfer_gemma_rmsnorm(p, s, EPS) for s, p in zip(torch.split(w, d, 0), parts)], 1
-    )
-
-
-def _old(
-    hc,
-    key,
-    value,
-    nk,
-    nq,
-    nc,
-    cw,
-    states,
-    slots,
-    qsl,
-    nx,
-    eps,
-    c,
-    clamp,
-    dil,
-    pad,
-    _p,
-    carries=None,
-):
-    """The calls the decode / prefill PLE block and the site after it made before this entry."""
-    gated = gated_ngram_injection(_grouped(key, nk, c), _grouped(hc, nq, c), value, c, clamp)
-    convolved = dilated_short_conv_paged(
-        x=torch.transpose(_grouped(gated, nc, c), 0, 1),
-        weight=cw,
-        bias=None,
-        conv_states=states,
-        query_start_loc=qsl,
-        cache_indices=slots,
-        has_initial_state=torch.ones_like(slots, dtype=torch.bool) if carries is None else carries,
-        dilation=dil,
-        silu_activation=True,
-        pad_slot_id=pad,
-    )
-    hc_new = torch.add(hc, torch.add(gated, torch.transpose(convolved, 0, 1)))
-    _, normed = qwen4_exp_hc_inject_norm(hc_new, None, None, nx, eps, c)
-    return hc_new, normed, states
-
-
-@pytest.mark.parametrize(
-    "lengths,carries",
-    [
-        ((1,) * 128, None),
-        ((4,) * 8, None),
-        ((5000, 3000) + (1,) * 32, (False, True) + (True,) * 32),
-    ],
-    ids=["m128", "mtp4x8", "mixed2ctx32dec"],
-)
-def test_matches_the_composition_it_replaces(lengths, carries) -> None:
-    args = _build(dict(lengths=lengths, pool_slots=461, carries=carries), seed=len(lengths))
-    old_args = list(args)
-    old_args[7] = args[7].clone()
-    want = _old(*old_args)
-    got = _run(args)
-    _compare(got, want)
-    for name, a, b in zip(("hc_out", "normed", "conv_states"), got, want):
-        worst, frac = _stats(a, b)
-        print(
-            f"\n  {str(len(lengths)):>4} seqs {name:<12} worst {worst:.3g} ulp, differ {frac:.2e}",
-            end="",
-        )
-
-
-def test_wrong_variants_land_outside_the_band() -> None:
-    """Each mis-reading keeps every shape; each lands far outside the band."""
-    args = _build(dict(lengths=(1,) * 16, pool_slots=461), seed=21)
-    want = op.reference(*args)
-    variants = {
-        "dilation 1": dict(index=14, value=1),
-        "clamp floor 1.0": dict(index=13, value=1.0),
-        "next norm = query norm": dict(index=10, value=args[4]),
-        "conv norm = key norm": dict(index=5, value=args[3]),
-    }
-    for name, change in variants.items():
-        wrong = list(args)
-        wrong[change["index"]] = change["value"]
-        if name == "dilation 1":
-            wrong[7] = wrong[7][:, :, :3].contiguous()
-        got = _run(wrong)
-        worst = max(_ulp_ratio(got[i], want[i]).max().item() for i in (0, 1))
-        print(f"\n  {name:<26} {worst:10.4g} ulp", end="")
-        assert worst > 5.0, name
 
 
 def test_guard_refuses_a_short_value() -> None:

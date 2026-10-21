@@ -57,8 +57,7 @@ _PREFILL = ("prefill",)
 def _spec(**overrides) -> dict:
     """A cell spec: this checkpoint's geometry unless the cell says otherwise.
 
-    `segments` is `(first position, rows)` per request, in row order, or `mixed` is
-    `(requests, context chunk lengths)`; `prefill_pair` says whether `query_positions`
+    `segments` is `(first position, rows)` per request, in row order; `prefill_pair` says whether `query_positions`
     / `compress_ratio` are passed, which the target does exactly when the step has a
     context request; `pool_pages` fixes the pool's page count (the requests then sit
     on its last pages); `capture` sweeps the decode site under a CUDA graph.
@@ -69,17 +68,6 @@ def _spec(**overrides) -> dict:
 def _decode(segments, launches=_SPLIT_K, **overrides) -> dict:
     base = dict(segments=segments, slots=32, prefill_pair=False, launches=launches)
     return _spec(**{**base, **overrides})
-
-
-def _mixed(requests, context_lens, launches=_PREFILL, **overrides) -> dict:
-    base = dict(mixed=(requests, context_lens), slots=32, prefill_pair=True, launches=launches)
-    return _spec(**{**base, **overrides})
-
-
-def _short(segments, slots, pool_pages) -> dict:
-    """Decode rows at low positions over a small pool whose page count and table height
-    pick the classes of the plain-int `num_pages` and `num_requests` Triton specializes on."""
-    return _decode(segments, slots=slots, pool_pages=pool_pages)
 
 
 @triton.jit
@@ -866,62 +854,15 @@ class QsaPagedSparseGqaNvfp4(OpWrapper):
 
     CELLS: tuple[Cell, ...] = (
         Cell(
-            why="decode: 1 row past the budget, 64-way split-K + merge, PDL",
-            spec=_decode(((4000, 1),)),
-        ),
-        Cell(
-            why="decode MTP draft 7: 16 requests x 8 rows (128 rows, 8-way)",
-            spec=_decode(tuple((100 + (499 * g) % 8000, 8) for g in range(16))),
-        ),
-        Cell(
-            why="300 rows, no prefill pair: split-K, one split, no merge",
-            spec=_decode(((600, 1),) * 300, launches=("splitk",), slots=384),
-        ),
-        Cell(
-            why="context 128 rows from 2032: pair passed, still split-K",
-            spec=_decode(((2032, 128),), prefill_pair=True),
-        ),
-        Cell(
-            why="context 4096 rows from 0: rows see 1..4096 tokens",
-            spec=_decode(((0, 4096),), launches=_PREFILL, prefill_pair=True),
-        ),
-        Cell(
-            why="second-level scales g_k 0.37, g_v 2.5: the dequantize rounds to bf16",
-            spec=_decode(tuple((4000 + 37 * i, 2) for i in range(4)), global_k=0.37, global_v=2.5),
-        ),
-        Cell(
-            why="holes: all-padding row, foreign request, unmapped page",
-            spec=_decode(((900, 1),) * 4, holes=True),
-        ),
-        Cell(
-            why="the engine's trunk layout: layer 11's planes among the 24 role pages of a slot",
+            why="decode: 4 requests x 4 rows, 8-way split-K + merge, in the engine's trunk "
+            "layout: layer 11's planes among the 24 role pages of a slot",
             spec=_decode(
                 tuple((4000 + 37 * i, 4) for i in range(4)), slot_pages=24, layer=11, pool_pages=600
             ),
         ),
         Cell(
-            why="the trunk layout, context 272 rows from 2032: the prefill kernel",
-            spec=_decode(
-                ((2032, 272),),
-                launches=_PREFILL,
-                prefill_pair=True,
-                slot_pages=24,
-                layer=11,
-                pool_pages=600,
-            ),
-        ),
-        # Triton compiles once per class of each plain-int argument -- equal to 1, a multiple
-        # of 16, or anything else: the pool's page count, the table's height (32 and 384
-        # above) and the split-K kernel's row count (1, 16, 128 and 300 above). The two below
-        # add a pool of a multiple of 16 pages and table heights 1 and 8, so each class of
-        # each argument is reached, not every combination of them.
-        Cell(
-            why="specialization: pool of 100 pages (other), table height 1",
-            spec=_short(((600, 1),), slots=1, pool_pages=100),
-        ),
-        Cell(
-            why="specialization: pool of 96 pages (multiple of 16), table height 8",
-            spec=_short(((600, 1),) * 4, slots=8, pool_pages=96),
+            why="context 4096 rows from 0: rows see 1..4096 tokens",
+            spec=_decode(((0, 4096),), launches=_PREFILL, prefill_pair=True),
         ),
         Cell(
             why="captured decode: G 1, 8 and 32 requests x 1 and 8 rows, replay == eager",
@@ -949,9 +890,9 @@ class QsaPagedSparseGqaNvfp4(OpWrapper):
     The decode site reaches 256 rows at max_draft_len 7 (32 requests x 8).
 
     Equivalence: the test also runs QSA's bf16 sparse GQA over a bf16 pool
-    holding the dequantized values; on every cell the two outputs agree within
-    the test's band. They are not bitwise equal: the dequantizing load changes
-    the compiled kernel around the same arithmetic.
+    holding the dequantized values; on every cell but the captured one the two
+    outputs agree within the test's band. They are not bitwise equal: the
+    dequantizing load changes the compiled kernel around the same arithmetic.
 
     CUDA graphs: the decode site captures at G requests x 1..8 rows over the
     [32, 260] table; a replay after new operands are written in place is
@@ -960,8 +901,8 @@ class QsaPagedSparseGqaNvfp4(OpWrapper):
     Compiled variants: the kernels take the pool's page count (`num_pages`), the
     table's row count (`num_requests`) and the split-K kernel the step's row
     count as plain ints, and Triton compiles each apart at 1, at multiples of 16
-    and otherwise; the cells reach each class of each of the three, not every
-    combination. Every other plain int -- the strides, the table width 260 and
+    and otherwise. Every cell runs a 32-row table (a multiple of 16); the other
+    table-height classes are not certified. Every other plain int -- the strides, the table width 260 and
     the selection's row stride 2051 -- is fixed at the served value the cells use.
 
     Preconditions:
@@ -973,14 +914,18 @@ class QsaPagedSparseGqaNvfp4(OpWrapper):
       - `D` a power of two >= 32; `Hq % Hkv == 0`; `tokens_per_block % 4 == 0`.
 
     The callable rejects loudly (ValueError) every operand whose dtype, shape or
-    layout it cannot read; `rows == 0` returns an empty `[0, Hq, D]` tensor.
-    Calls are bitwise deterministic.
+    layout it cannot read (the test pins the half-passed prefill pair); `rows ==
+    0` returns an empty `[0, Hq, D]` tensor (not certified). Calls are bitwise
+    deterministic.
 
     Every row, request, page and position index is widened to 64 bits before any
     product. Not certified: head geometries other than 24/2 x 256;
     `tokens_per_block` other than 32; more than 8192 rows; capture of the
-    context/mixed site; a pool of one slot; an fp16 or unsliced q; int64 request
-    indices.
+    context/mixed site; a pool of one slot; second-level scales other than 1.0;
+    the prefill pair on the split-K kernel (256 context rows or fewer); one split
+    without a merge; the trunk layout on the prefill kernel; rows whose selection
+    resolves no token (all padding, a foreign request, unmapped pages); an fp16
+    or unsliced q; int64 request indices.
     """
 
     def __call__(

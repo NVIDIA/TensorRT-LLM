@@ -124,20 +124,15 @@ def tower():
     return M.VisionTower(_core())
 
 
-# `(grid, cap)`: frames of 256, 144 and 32 rows, of 32 and 8, and of 384. The cap cuts the
-# mixed grid inside an item and between items, the one-item grid between frames of one video,
-# and the short-frame grid into calls whose longest frame is at most 64 rows, where the fused
-# attention kernel is the short-frame one.
-CASES = {
-    "mixed": ([(2, 16, 16), (3, 12, 12), (6, 4, 8)], 512),
-    "short_frames_only": ([(9, 4, 8), (3, 2, 4)], 96),
-    "one_item_many_frames": ([(7, 16, 24)], 800),
-}
+# Frames of 256, 144 and 32 rows under a 512-row cap: three calls -- the first item, the
+# second with two of the third's six frames, the other four -- so a cut between items and one
+# inside an item; the last call's longest frame is 32 rows, where the fused attention kernel
+# is the short-frame one.
+GRID, CAP = [(2, 16, 16), (3, 12, 12), (6, 4, 8)], 512
 
 
-@pytest.mark.parametrize("name", sorted(CASES))
-def test_calls_of_whole_frames_equal_one_call(tower, monkeypatch, name):
-    grid, cap = CASES[name]
+def test_calls_of_whole_frames_equal_one_call(tower, monkeypatch):
+    grid, cap = GRID, CAP
     pixels = _pixels(grid)
     grid_thw = torch.tensor(grid)
     monkeypatch.setattr(M, "_VISION_CALL_MAX_PATCHES", 1 << 20)

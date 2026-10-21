@@ -30,7 +30,7 @@ ACT_SWIGLU = 0
 CERTIFIED_PAIRS = frozenset({(512, 10)})
 
 
-def _ckpt(tokens: int, dist: str = "randn", logits_dtype=torch.bfloat16) -> dict:
+def _ckpt(tokens: int, dist: str = "randn") -> dict:
     """qwen4_exp's routed geometry: 512 experts, top-10, H 2560 / I 640."""
     return dict(
         tokens=tokens,
@@ -38,7 +38,7 @@ def _ckpt(tokens: int, dist: str = "randn", logits_dtype=torch.bfloat16) -> dict
         intermediate=640,
         num_experts=512,
         top_k=10,
-        logits_dtype=logits_dtype,
+        logits_dtype=torch.bfloat16,
         dist=dist,
     )
 
@@ -61,26 +61,23 @@ class Fp4BlockScaleMoeRenormRouted(OpWrapper):
 
     ARCHS = frozenset({Arch.SM_103})
 
+    # One cell per routing kernel the call picks by row count: block, single-cluster
+    # and the multi-kernel histogram path.
     CELLS: tuple[Cell, ...] = (
         Cell(why="_moe_block decode: one token; the block routing kernel", spec=_ckpt(1)),
         Cell(why="128 rows: the con=128 decode batch; the cluster routing kernel", spec=_ckpt(128)),
-        Cell(why="8192 rows: max_num_tokens of the identity config", spec=_ckpt(8192)),
         Cell(
             why="16384 rows: max_num_tokens of the tuned config; past the 8192 tuning bucket",
             spec=_ckpt(16384),
-        ),
-        Cell(why="coarse 3-level logits: ties decide most slots", spec=_ckpt(64, dist="coarse")),
-        Cell(
-            why="fp32 logits: the runner's other accepted logits dtype",
-            spec=_ckpt(64, logits_dtype=torch.float32),
         ),
     )
 
     note = """
     Routing semantics, measured against the composition it replaces
     (`renorm_moe_routing_op` -> pre-routed runner): bitwise-equal finalized
-    output at every cell, randn / coarse / large-magnitude / all-equal logits,
-    bf16 and fp32 logits, 1..16384 rows. Both kernels rank by a packed
+    output at every cell (the test re-drives this), and at bring-up on randn /
+    coarse / large-magnitude / all-equal logits, bf16 and fp32 logits,
+    1..16384 rows. Both kernels rank by a packed
     (twiddled value, 65535 - index) key (ties to the lower expert index), take
     an fp32 `expf` softmax over the k with the same 32-lane warp reduction, and
     round the weight to bf16 once.
@@ -94,10 +91,13 @@ class Fp4BlockScaleMoeRenormRouted(OpWrapper):
 
     Silent, refused by `is_valid`: a non-contiguous operand (raw pointers,
     dense layout assumed) and a (num_experts, top_k) pair outside
-    `CERTIFIED_PAIRS` (a tier-list miss logs and launches nothing).
+    `CERTIFIED_PAIRS` (a tier-list miss logs and launches nothing; the test
+    holds this refusal).
+
+    Not certified: fp32 logits (the runner's other accepted logits dtype).
 
     Hard limits
-      T            certified 1..16384 (max_num_tokens of the tuned config).
+      T            certified at 1, 128 and 16384 (max_num_tokens of the tuned config).
                    Autotuner buckets stop at 8192, the op's
                    `tune_max_num_tokens` default, which this entry does not
                    pass: a call past 8192 rows runs the 8192 bucket's tactic

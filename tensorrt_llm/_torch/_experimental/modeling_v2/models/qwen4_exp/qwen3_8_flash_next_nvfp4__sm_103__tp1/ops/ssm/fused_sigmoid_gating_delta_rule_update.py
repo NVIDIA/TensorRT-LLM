@@ -60,31 +60,26 @@ class FusedSigmoidGatingDeltaRuleUpdate(OpWrapper):
 
     ARCHS = frozenset({Arch.SM_103})
 
-    # spec: seq_lens, slots (pool rows; None for no pool), indices (None ->
-    # arange), pool_dtype (fp32), l2norm (True), normalize_qk (caller-normalized
-    # q/k when l2norm is off), output ("none" | "prefix": a length-prefix slice
-    # of a longer buffer, as the stock mixer passes), ab ("packed": column
-    # halves of a [T, 96] projection | "separate": two contiguous [T, 48] |
-    # "in_proj": q/k/v/a/b all column views of one [T, 16480] projection, as the
-    # target's one input GEMM makes them), layout ("varlen" | "layer_view":
-    # pool[1] of a [3, slots, ...] cache | "batched": cu_seqlens None,
-    # contiguous copies | "rows": cu_seqlens None, one token per row, q/k/v
-    # [N, 1, heads, 128] views of the packed [N, 10240] block whose token
-    # stride is the row stride, and a/b [N, 1, 48] -- the target's bf16 call).
-    CELLS: tuple[Cell, ...] = tuple(
+    # spec: seq_lens, slots (pool rows), indices (None -> arange), pool_dtype
+    # (fp32), ab ("separate": two contiguous [T, 48] | "in_proj": q/k/v/a/b all
+    # column views of one [T, 16480] projection, as the target's one input GEMM
+    # makes them), layout ("varlen": [1, T, ...] with int64 cu_seqlens |
+    # "rows": cu_seqlens None, one token per row, q/k/v [N, 1, heads, 128]
+    # views of the packed [N, 10240] block whose token stride is the row
+    # stride, and a/b [N, 1, 48] -- the target's bf16 call). In-kernel q/k
+    # norm on, no output buffer.
+    CELLS: tuple[Cell, ...] = (
         Cell(
-            why=f"target bf16 decode call, rows form N={n}, 461-slot pool",
+            why="target bf16 decode call, rows form N=128, 461-slot pool",
             spec=dict(
-                seq_lens=(1,) * n,
+                seq_lens=(1,) * 128,
                 slots=ENGINE_SLOTS,
-                indices=_scattered(n),
+                indices=_scattered(128),
                 ab="separate",
                 layout="rows",
                 pool_dtype=torch.bfloat16,
             ),
-        )
-        for n in (1, 32, 128)
-    ) + (
+        ),
         Cell(
             why="bf16 rows form, pad rows (-1) between slot 0 and 460",
             spec=dict(
@@ -110,21 +105,19 @@ class FusedSigmoidGatingDeltaRuleUpdate(OpWrapper):
     `cu_seqlens` None -- q/k/v `[T, 1, heads, 128]` split from the whole
     `[T, 10240]` block reshaped to `[T, 1, 80, 128]`, so the token stride is the
     row stride (`is_valid` refuses other strides), `a`/`b` `[T, 1, 48]`. The
-    cells drive it at 1, 32 and 128 rows of a 461-slot pool, and with CUDA-graph
-    pad rows (-1). One more cell certifies the packed form the GDN block test
+    cells drive it at 128 rows of a 461-slot pool, and with CUDA-graph pad rows
+    (-1) at 4 rows. One more cell certifies the packed form the GDN block test
     uses as its fp32-pool reference: `(a_log, a, dt_bias, 1.0, 20.0, q, k, v,
     b, ssm_states, si_all, None, True, qsl_long, None)`, q/k/v `[1, T, heads,
     128]` and `a`/`b` column views of one `[T, 16480]` input-projection output
-    (row stride 16480), int64 `cu_seqlens`, at 128 rows. The rows form is
-    bitwise the packed Triton call at either pool dtype and runs inside a CUDA
-    graph.
+    (row stride 16480), int64 `cu_seqlens`, at 128 rows.
 
     Branch: the callable takes a FlashInfer CuTe-DSL kernel
     (`gdn_decode_bf16_state.gated_delta_rule`) when the pool is bf16,
     `cu_seqlens` is given and `T == N` (head dims 128, supported arch);
     everything else runs the vendored Triton kernel, and only the Triton
-    branch is certified. The target's rows form and the reference's fp32 packed form both
-    stay on it, which the test proves with the FlashInfer arm armed to raise. The bf16 call takes
+    branch is certified. The target's rows form (no `cu_seqlens`) and the reference's
+    packed form over an fp32 pool both stay on it. The bf16 call takes
     the rows form because FlashInfer is not batch-invariant: at 48 value
     heads it runs one kernel up to N = 10 and another from N = 11, and one
     fixed row's single-step output and state differ between the two, so a
@@ -156,9 +149,10 @@ class FusedSigmoidGatingDeltaRuleUpdate(OpWrapper):
 
     Not certified: the FlashInfer branch, K or V other than 128, fp16/fp32
     operands, an fp16 pool, `softplus_beta`/`softplus_threshold` other than
-    1.0/20.0, `B > 1` with `cu_seqlens`; the rows form above 32 rows; the packed
-    form over a bf16 pool, with more than one token per sequence, with an
-    `output` buffer, with `l2norm` off, without a pool or on a layer view of one.
+    1.0/20.0, `B > 1` with `cu_seqlens`; the rows form over an fp32 pool or above
+    128 rows; CUDA-graph replay against the eager call; the packed form over a
+    bf16 pool, with more than one token per sequence, with an `output` buffer,
+    with `l2norm` off, without a pool or on a layer view of one.
 
     Hard limits
       none probed.

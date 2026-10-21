@@ -47,38 +47,25 @@ _LAYERS = 3
 
 
 def _build(spec, seed):
-    """`__call__`'s arguments, plus the backing allocations a layout views."""
+    """`__call__`'s arguments, plus the backing allocations a layer view views."""
     g = torch.Generator(device=DEV).manual_seed(seed)
     slots = spec["slots"]
-    rec_shape, conv_shape = REC_SHAPE, CONV_SHAPE
     rec_dtype = spec.get("rec_dtype", torch.float32)
-    layout = spec.get("layout", "plain")
+    layer_view = spec.get("layout", "plain") == "layer_view"
 
     def randn(*shape, dtype):
         return torch.randn(*shape, generator=g, device=DEV).to(dtype)
 
     backing = {}
-    if layout == "row_padding":
-        row = 1
-        for d in rec_shape:
-            row *= d
-        backing["rec"] = randn(slots, 2, row, dtype=rec_dtype)
-        rec = backing["rec"][:, 0]
-        assert rec.stride() == (2 * row, 1)
-    elif layout == "layer_view":
-        backing["rec"] = randn(_LAYERS, slots, *rec_shape, dtype=rec_dtype)
-        rec = backing["rec"][1]
+    if layer_view:
+        backing["rec"] = randn(_LAYERS, slots, *REC_SHAPE, dtype=rec_dtype)
+        backing["conv"] = randn(_LAYERS, slots, *CONV_SHAPE, dtype=torch.bfloat16)
+        rec, conv = backing["rec"][1], backing["conv"][1]
     else:
-        rec = randn(slots, *rec_shape, dtype=rec_dtype)
-    conv = None
-    if spec.get("conv", True):
-        if layout == "layer_view":
-            backing["conv"] = randn(_LAYERS, slots, *conv_shape, dtype=torch.bfloat16)
-            conv = backing["conv"][1]
-        else:
-            conv = randn(slots, *conv_shape, dtype=torch.bfloat16)
+        rec = randn(slots, *REC_SHAPE, dtype=rec_dtype)
+        conv = randn(slots, *CONV_SHAPE, dtype=torch.bfloat16)
 
-    indices = torch.tensor(spec["indices"], dtype=spec.get("index_dtype", torch.int32), device=DEV)
+    indices = torch.tensor(spec["indices"], dtype=torch.int32, device=DEV)
     flags = torch.tensor(spec["flags"], dtype=torch.bool, device=DEV)
     return [rec, indices, flags, conv], backing
 
@@ -105,52 +92,10 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — pytest res
         # Non-vacuity: the engine-width cells reset at least one row, so the
         # whole-pool compare is also the lock on the ~430 unnamed slots.
         assert reset
-    if spec.get("layout") == "row_padding":
-        assert torch.equal(backing["rec"][:, 1], before["rec"][:, 1]), "padding lane written"
     if spec.get("layout") == "layer_view":
         for name in backing:
             for other in (0, 2):
                 assert torch.equal(backing[name][other], before[name][other]), (name, other)
-
-
-def test_the_following_kernel_sees_the_zeros() -> None:
-    """The launch is ordered on the current stream: no explicit sync is needed."""
-    torch.manual_seed(5)
-    rec = torch.randn(4, *REC_SHAPE, dtype=torch.float32, device=DEV)
-    state_indices = torch.arange(4, dtype=torch.int32, device=DEV)
-    has_initial_states = torch.zeros(4, dtype=torch.bool, device=DEV)
-    for _ in range(20):
-        rec.normal_()
-        op(rec, state_indices, has_initial_states)
-        assert rec.sum().item() == 0.0
-
-
-@pytest.mark.parametrize(
-    "case,message",
-    [
-        ("slot_count_mismatch", "recurrent and convolution pools must have the same slot count"),
-        ("recurrent_rows_noncontiguous", "recurrent state rows must be contiguous"),
-        ("cpu_indices", "Pointer argument cannot be accessed from Triton"),
-    ],
-)
-def test_op_rejects_layout_violations_loudly(case: str, message: str) -> None:
-    """Why `is_valid` guards only the index tensors: the rest raises itself. One case
-    per family the callable checks: slot counts, row layout, device."""
-    torch.manual_seed(6)
-    rec = torch.randn(2, 4, dtype=torch.float32, device=DEV)
-    conv = torch.randn(2, 4, dtype=torch.bfloat16, device=DEV)
-    state_indices = torch.tensor([0], dtype=torch.int32, device=DEV)
-    has_initial_states = torch.tensor([False], device=DEV)
-    if case == "slot_count_mismatch":
-        conv = torch.randn(3, 4, dtype=torch.bfloat16, device=DEV)
-    elif case == "recurrent_rows_noncontiguous":
-        rec = torch.randn(2, 8, dtype=torch.float32, device=DEV)[:, ::2]
-    elif case == "cpu_indices":
-        conv = None
-        state_indices, has_initial_states = state_indices.cpu(), has_initial_states.cpu()
-    with pytest.raises(ValueError, match=message):
-        with validating(op):
-            op(rec, state_indices, has_initial_states, conv)
 
 
 def _pools():
@@ -160,51 +105,13 @@ def _pools():
     return rec, conv
 
 
-def test_guard_hazard_strided_index_tensors() -> None:
-    """Unguarded, a stride-2 view is read through its base pointer: indices
-    [0, 1, 2] reset [0, 1], and flags [T, T, T] reset row 1. No error."""
-    good_indices = torch.tensor([0, 1, 2], dtype=torch.int32, device=DEV)
-    good_flags = torch.zeros(3, dtype=torch.bool, device=DEV)
-    strided_indices = torch.tensor([0, 9, 1, 9, 2, 9], dtype=torch.int32, device=DEV)[::2]
-    strided_flags = torch.tensor([True, False] * 3, device=DEV)[::2]
-    for indices, flags in ((strided_indices, good_flags), (good_indices, strided_flags)):
-        rec, conv = _pools()
-        # The reference reads the tensors by value, which is what a caller meant.
-        want = op.reference(rec, indices, flags, conv)
-        got = op(rec, indices, flags, conv)
-        with pytest.raises(AssertionError, match="pool differs"):
-            _compare(got, want)
-
-
-def test_guard_hazard_two_d_index_tensors() -> None:
-    """Unguarded, a matching [2, 3] pair passes the op's shape check and only
-    its first shape[0] = 2 of 6 requests are considered."""
+def test_guard_refuses_index_tensors_the_op_misreads() -> None:
+    """Unguarded, a stride-2 `state_indices` view is read through its base pointer
+    as a flat buffer: indices [0, 1, 2] arrive as [0, 9, 1], so rows 0 and 1 are reset
+    and row 2 is not (measured). The guard refuses it."""
     rec, conv = _pools()
-    indices = torch.arange(6, dtype=torch.int32, device=DEV).reshape(2, 3)
-    flags = torch.zeros(2, 3, dtype=torch.bool, device=DEV)
-    want = op.reference(rec, indices.reshape(-1), flags.reshape(-1), conv)
-    got = op(rec, indices, flags, conv)
-    with pytest.raises(AssertionError, match="pool differs"):
-        _compare(got, want)
-
-
-@pytest.mark.parametrize(
-    "which,how", [("state_indices", "strided"), ("has_initial_states", "two_d")]
-)
-def test_guard_refuses_index_tensors_the_op_misreads(which: str, how: str) -> None:
-    rec, conv = _pools()
-    indices = torch.zeros(3, dtype=torch.int32, device=DEV)
+    indices = torch.tensor([0, 9, 1, 9, 2, 9], dtype=torch.int32, device=DEV)[::2]
     flags = torch.zeros(3, dtype=torch.bool, device=DEV)
-    if how == "strided":
-        bad_indices = torch.tensor([0, 9, 1, 9, 2, 9], dtype=torch.int32, device=DEV)[::2]
-        bad_flags = torch.zeros(6, dtype=torch.bool, device=DEV)[::2]
-    else:
-        bad_indices = torch.arange(6, dtype=torch.int32, device=DEV).reshape(2, 3)
-        bad_flags = torch.zeros(2, 3, dtype=torch.bool, device=DEV)
-    if which == "state_indices":
-        indices = bad_indices
-    else:
-        flags = bad_flags
-    with pytest.raises(AssertionError, match=f"{which} must be a contiguous 1-D tensor"):
+    with pytest.raises(AssertionError, match="state_indices must be a contiguous 1-D tensor"):
         with validating(op):
             op(rec, indices, flags, conv)

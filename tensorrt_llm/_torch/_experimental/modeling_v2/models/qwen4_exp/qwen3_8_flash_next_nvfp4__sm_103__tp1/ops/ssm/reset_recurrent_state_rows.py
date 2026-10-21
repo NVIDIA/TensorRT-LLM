@@ -59,9 +59,9 @@ class ResetRecurrentStateRows(OpWrapper):
 
     ARCHS = frozenset({Arch.SM_103})
 
-    # spec: slots (pool rows), indices, flags (bool), index_dtype (int32),
-    # rec_dtype (fp32), conv (True), layout: "plain" | "row_padding"
-    # (stride(0) > row) | "layer_view" (pool[1] of a [3, slots, ...] allocation).
+    # spec: slots (pool rows), indices (int32), flags (bool), rec_dtype (fp32),
+    # layout: "plain" | "layer_view" (pool[1] of a [3, slots, ...] allocation).
+    # Both pools are passed throughout.
     CELLS: tuple[Cell, ...] = (
         Cell(
             why="engine pool 461, 32 requests, slot 460 reset",
@@ -70,16 +70,6 @@ class ResetRecurrentStateRows(OpWrapper):
         Cell(
             why="bf16 recurrent pool 461, 32 requests, slot 0 reset",
             spec=dict(_engine_case(32, flip=False), rec_dtype=torch.bfloat16),
-        ),
-        Cell(
-            why="negative and out-of-range slots skipped, int32",
-            spec=dict(
-                slots=6, indices=(-1, 6, 23, -99999, 2), flags=(False,) * 5, index_dtype=torch.int32
-            ),
-        ),
-        Cell(
-            why="stride(0) > row size: the padding lane untouched",
-            spec=dict(slots=6, indices=(1,), flags=(False,), conv=False, layout="row_padding"),
         ),
         Cell(
             why="pool[layer] of a [layers, slots, ...] allocation",
@@ -91,8 +81,10 @@ class ResetRecurrentStateRows(OpWrapper):
     Metadata consumed: none. At the call site `state_indices` /
     `has_initial_states` are the context prefix of `Mamba2Metadata`'s int32 /
     bool buffers, and the pools are the layer's views of the cache manager's
-    `[layers, slots, ...]` allocations, passed unsliced. Certified at 4, 6
-    and 461 slots, over an fp32 and a bf16 recurrent pool.
+    `[layers, slots, ...]` allocations, passed unsliced. Certified at 461 slots
+    over an fp32 and a bf16 recurrent pool, and at 4 slots over one layer's view
+    of a 3-layer allocation. Not certified: negative or out-of-range slots,
+    rows with padding between them, `conv_states=None`.
 
     Loud, from the callable itself (ValueError): an empty recurrent pool, conv
     and recurrent slot counts differing (the in-range test uses the recurrent

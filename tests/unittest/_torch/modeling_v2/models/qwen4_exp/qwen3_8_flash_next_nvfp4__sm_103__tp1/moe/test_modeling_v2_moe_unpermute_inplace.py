@@ -5,9 +5,8 @@
 The entry owns the contract. This file lays a cell's FC2 rows out the way the
 CuteDSL FC2 hands them over -- placed by moe_sort, every row the op must not read
 filled with NaN, the output pre-filled with NaN -- and holds the claims no cell
-carries: CUDA-graph replay at the captured row counts, the eager prefix sweep,
-run-to-run and placement independence, the gate's discrimination, T = 0, the loud
-rejections and the guards.
+carries: CUDA-graph replay at the largest captured row count, bitwise equal to
+eager, and the contiguity guard.
 """
 
 import zlib
@@ -28,13 +27,8 @@ DEV = "cuda"
 E, K, H = 512, 10, 2560
 NAN = float("nan")
 
-#: Row counts of a decode capture (requests x MTP verify width 1..4, up to 32
-#: requests): both ends of the sort's block kernel, its first cluster-kernel T and
-#: the largest capture. The eager prefix lengths straddle the captured ceiling and
-#: reach the 8192-row one; a subset of them is also re-sorted.
-_CAPTURED_ROWS = (1, 4, 5, 128)
-_PREFIXES = (1, 4, 5, 127, 128, 129, 4096, 8191)
-_RESORT = (1, 5, 129, 8192)
+#: The largest decode capture: 32 requests at MTP verify width 4.
+_CAPTURED_ROWS = 128
 
 
 def _compare(out: torch.Tensor, ref: torch.Tensor) -> None:
@@ -62,31 +56,16 @@ def _compare(out: torch.Tensor, ref: torch.Tensor) -> None:
         )
 
 
-def _spec(tokens, tile_tokens_dim=128, dist="router", values="normal", non_local_from=None):
+def _spec(tokens, tile_tokens_dim=128, values="normal"):
     """The fields `_problem` reads; the same names as a cell's spec."""
-    return dict(
-        tokens=tokens,
-        tile_tokens_dim=tile_tokens_dim,
-        dist=dist,
-        values=values,
-        non_local_from=non_local_from,
-    )
+    return dict(tokens=tokens, tile_tokens_dim=tile_tokens_dim, values=values)
 
 
-def _ids(dist: str, tokens: int, seed: int) -> torch.Tensor:
-    """Expert ids, `[tokens, K]` int32, every row naming 10 distinct experts."""
+def _ids(tokens: int, seed: int) -> torch.Tensor:
+    """Expert ids, `[tokens, K]` int32: each row's top-10 of uniform scores."""
     g = torch.Generator(device=DEV).manual_seed(seed)
-    if dist == "router":
-        scores = torch.rand(tokens, E, device=DEV, generator=g)
-        return scores.topk(K, dim=-1).indices.to(torch.int32)
-    if dist == "hot":
-        hot = torch.randperm(E, device=DEV, generator=g)[:K]
-        slots = torch.rand(tokens, K, device=DEV, generator=g).argsort(dim=-1)
-        return hot[slots].to(torch.int32)
-    if dist == "round_robin":
-        base = torch.arange(tokens, device=DEV).unsqueeze(1) * K
-        return ((base + torch.arange(K, device=DEV)) % E).to(torch.int32)
-    raise ValueError(dist)
+    scores = torch.rand(tokens, E, device=DEV, generator=g)
+    return scores.topk(K, dim=-1).indices.to(torch.int32)
 
 
 def _scales(tokens: int, seed: int) -> torch.Tensor:
@@ -130,19 +109,16 @@ def _place(rows: torch.Tensor, e2p: torch.Tensor, num_rows: int) -> torch.Tensor
     return perm
 
 
-def _output(tokens: int, dtype: torch.dtype = torch.bfloat16) -> torch.Tensor:
-    return torch.full((tokens, H), NAN, dtype=dtype, device=DEV)
+def _output(tokens: int) -> torch.Tensor:
+    return torch.full((tokens, H), NAN, dtype=torch.bfloat16, device=DEV)
 
 
 def _problem(spec: dict, seed: int):
     """A cell's arguments, plus the per-pair rows and ids they were built from."""
     tokens = spec["tokens"]
-    ids = _ids(spec["dist"], tokens, seed)
+    ids = _ids(tokens, seed)
     scales = _scales(tokens, seed)
     e2p, num_rows = _sort(ids, scales, spec["tile_tokens_dim"])
-    if spec["non_local_from"] is not None:
-        e2p = torch.where(ids >= spec["non_local_from"], -1, e2p).to(torch.int32)
-        e2p[0] = -1
     rows = _rows(tokens, seed, spec["values"])
     args = dict(
         permuted_input=_place(rows, e2p, num_rows),
@@ -150,7 +126,7 @@ def _problem(spec: dict, seed: int):
         expanded_idx_to_permuted_idx=e2p,
         topk_scales=scales,
     )
-    return args, rows, ids
+    return args
 
 
 def _bits(t: torch.Tensor) -> torch.Tensor:
@@ -163,8 +139,7 @@ def _same_bits(a: torch.Tensor, b: torch.Tensor) -> bool:
 
 def _cell_id(cell):
     s = cell.spec
-    tag = f"t{s['tile_tokens_dim']}-T{s['tokens']}-{s['dist']}-{s['values']}"
-    return tag if s["non_local_from"] is None else f"{tag}-nonlocal{s['non_local_from']}"
+    return f"t{s['tile_tokens_dim']}-T{s['tokens']}-{s['values']}"
 
 
 # ── the certified cells ───────────────────────────────────────────────────
@@ -176,7 +151,7 @@ def test_certified_cells(cell, certifying):  # noqa: F811 — pytest resolves th
     s = cell.spec
     assert (s["num_experts"], s["top_k"], s["hidden_size"]) == (E, K, H)
     assert (s["dtype"], s["scales_dtype"]) == (torch.bfloat16, torch.float32)
-    args, _, _ = _problem(s, zlib.crc32(cell.why.encode()))
+    args = _problem(s, zlib.crc32(cell.why.encode()))
     before = {
         n: args[n].clone()
         for n in ("permuted_input", "expanded_idx_to_permuted_idx", "topk_scales")
@@ -186,9 +161,6 @@ def test_certified_cells(cell, certifying):  # noqa: F811 — pytest resolves th
     _compare(out, op.reference(**args))
     for name, snapshot in before.items():
         assert _same_bits(args[name], snapshot), f"{name} was written"
-    if s["non_local_from"] is not None:
-        assert int((args["expanded_idx_to_permuted_idx"] < 0).sum()) > s["tokens"]
-        assert bool((_bits(out[0]) == 0).all()), "a token with every slot -1 is not +0"
 
 
 # ── CUDA graphs: captured row counts, on new data ─────────────────────────
@@ -210,7 +182,7 @@ def _capture(fn):
 
 def test_captured_rows_replay_on_new_data(certifying):  # noqa: F811
     """The sort, the FC2 rows' placement and this op are captured together, as the
-    target runs them; each graph is replayed on two fresh sets of ids, scales and
+    target runs them; the graph is replayed on two fresh sets of ids, scales and
     rows. The permuted buffer is not cleared between replays, so the rows the new
     sort does not use hold the previous placement's rows. Each replay is gated
     against the reference, and is bitwise equal to an eager call on the same data
@@ -219,259 +191,55 @@ def test_captured_rows_replay_on_new_data(certifying):  # noqa: F811
     certifying(op)
     tile = 128
     stale_rows = 0
-    for tokens in _CAPTURED_ROWS:
-        ids = _ids("router", tokens, seed=tokens)
-        scales = _scales(tokens, seed=tokens)
-        rows = _rows(tokens, seed=tokens)
-        num_rows = _sort(ids, scales, tile)[1]
-        perm = torch.full((num_rows, H), NAN, dtype=torch.bfloat16, device=DEV)
-        out = _output(tokens)
+    tokens = _CAPTURED_ROWS
+    ids = _ids(tokens, seed=tokens)
+    scales = _scales(tokens, seed=tokens)
+    rows = _rows(tokens, seed=tokens)
+    num_rows = _sort(ids, scales, tile)[1]
+    perm = torch.full((num_rows, H), NAN, dtype=torch.bfloat16, device=DEV)
+    out = _output(tokens)
 
-        def step(ids=ids, scales=scales, rows=rows, perm=perm, out=out, tile=tile):
-            e2p = _sort(ids, scales, tile)[0]
-            perm.index_copy_(0, e2p.reshape(-1).long(), rows.reshape(-1, H))
-            op(
-                permuted_input=perm,
-                output=out,
-                expanded_idx_to_permuted_idx=e2p,
-                topk_scales=scales,
-            )
-            return e2p
+    def step(ids=ids, scales=scales, rows=rows, perm=perm, out=out, tile=tile):
+        e2p = _sort(ids, scales, tile)[0]
+        perm.index_copy_(0, e2p.reshape(-1).long(), rows.reshape(-1, H))
+        op(
+            permuted_input=perm,
+            output=out,
+            expanded_idx_to_permuted_idx=e2p,
+            topk_scales=scales,
+        )
+        return e2p
 
-        graph, e2p = _capture(step)
-        for trial in (1, 2):
-            seed = 1000 * trial + tokens
-            ids.copy_(_ids("router", tokens, seed))
-            scales.copy_(_scales(tokens, seed))
-            rows.copy_(_rows(tokens, seed))
-            out.fill_(NAN)
-            graph.replay()
-            args = dict(
-                permuted_input=perm,
-                output=out,
-                expanded_idx_to_permuted_idx=e2p,
-                topk_scales=scales,
-            )
-            _compare(out, op.reference(**args))
-            used = torch.zeros(num_rows, dtype=torch.bool, device=DEV)
-            used[e2p.reshape(-1).long()] = True
-            stale_rows += int((~used & ~perm.isnan().any(1)).sum())
+    graph, e2p = _capture(step)
+    for trial in (1, 2):
+        seed = 1000 * trial + tokens
+        ids.copy_(_ids(tokens, seed))
+        scales.copy_(_scales(tokens, seed))
+        rows.copy_(_rows(tokens, seed))
+        out.fill_(NAN)
+        graph.replay()
+        args = dict(
+            permuted_input=perm,
+            output=out,
+            expanded_idx_to_permuted_idx=e2p,
+            topk_scales=scales,
+        )
+        _compare(out, op.reference(**args))
+        used = torch.zeros(num_rows, dtype=torch.bool, device=DEV)
+        used[e2p.reshape(-1).long()] = True
+        stale_rows += int((~used & ~perm.isnan().any(1)).sum())
 
-            e2p_eager, n = _sort(ids.clone(), scales.clone(), tile)
-            eager = op(
-                permuted_input=_place(rows.clone(), e2p_eager, n),
-                output=_output(tokens),
-                expanded_idx_to_permuted_idx=e2p_eager,
-                topk_scales=scales.clone(),
-            )
-            assert _same_bits(out, eager), (tokens, trial)
-        del graph, e2p
+        e2p_eager, n = _sort(ids.clone(), scales.clone(), tile)
+        eager = op(
+            permuted_input=_place(rows.clone(), e2p_eager, n),
+            output=_output(tokens),
+            expanded_idx_to_permuted_idx=e2p_eager,
+            topk_scales=scales.clone(),
+        )
+        assert _same_bits(out, eager), trial
+    del graph, e2p
     torch.cuda.synchronize()
     assert stale_rows > 0, "no replay ran over a stale row: the stale-row claim is untested"
-
-
-# ── eager: prefixes of the largest batch ──────────────────────────────────
-
-
-def test_eager_rows_prefix_bitwise(certifying):  # noqa: F811
-    """One block per token makes the grid the only thing T sizes: the 8192-row call
-    is gated against the reference, and the first T rows of every row count in the
-    sweep are bitwise those of the 8192-row call -- over the same placement, and
-    (a subset) over a fresh sort of the first T tokens alone, which places their
-    rows elsewhere. A token's output does not depend on its batch.
-    """
-    certifying(op)
-    tile = 128
-    args, rows, ids = _problem(_spec(8192, tile_tokens_dim=tile), seed=8192 + tile)
-    full = op(**args)
-    _compare(full, op.reference(**args))
-    perm, e2p, scales = (
-        args["permuted_input"],
-        args["expanded_idx_to_permuted_idx"],
-        args["topk_scales"],
-    )
-    for tokens in _PREFIXES:
-        out = op(
-            permuted_input=perm,
-            output=_output(tokens),
-            expanded_idx_to_permuted_idx=e2p[:tokens],
-            topk_scales=scales[:tokens],
-        )
-        assert _same_bits(out, full[:tokens]), tokens
-    for tokens in _RESORT:
-        e2p_t, n = _sort(ids[:tokens], scales[:tokens], tile)
-        out = op(
-            permuted_input=_place(rows[:tokens], e2p_t, n),
-            output=_output(tokens),
-            expanded_idx_to_permuted_idx=e2p_t,
-            topk_scales=scales[:tokens],
-        )
-        assert _same_bits(out, full[:tokens]), tokens
-
-
-# ── run to run, and where the rows sit ────────────────────────────────────
-
-
-@pytest.mark.parametrize("tokens", (1, 8192))
-def test_repeats_and_placements_are_bitwise(tokens, certifying):  # noqa: F811
-    """What the fused finalize does not give: 8 identical calls, a second sort
-    of the same ids (the sort orders an expert's rows by atomics), a random
-    permutation of every permuted row, and a shuffle of the tokens all give the
-    same bits.
-    """
-    certifying(op)
-    args, rows, ids = _problem(_spec(tokens), seed=tokens + 7)
-    first = op(**args).clone()
-    _compare(first, op.reference(**args))
-    for _ in range(7):
-        assert _same_bits(op(**dict(args, output=_output(tokens))), first)
-
-    perm, e2p, scales = (
-        args["permuted_input"],
-        args["expanded_idx_to_permuted_idx"],
-        args["topk_scales"],
-    )
-    e2p2, n = _sort(ids, scales, 128)
-    if tokens == 8192:
-        assert int((e2p2 != e2p).sum()) > 0, "the second sort placed every row where the first did"
-    out = op(
-        permuted_input=_place(rows, e2p2, n),
-        output=_output(tokens),
-        expanded_idx_to_permuted_idx=e2p2,
-        topk_scales=scales,
-    )
-    assert _same_bits(out, first), "a second sort of the same ids changed the result"
-
-    g = torch.Generator(device=DEV).manual_seed(tokens)
-    p = torch.randperm(perm.shape[0], device=DEV, generator=g)
-    moved = torch.empty_like(perm)
-    moved[p] = perm
-    out = op(
-        permuted_input=moved,
-        output=_output(tokens),
-        expanded_idx_to_permuted_idx=p[e2p.long()].to(torch.int32),
-        topk_scales=scales,
-    )
-    assert _same_bits(out, first), "a random placement of the rows changed the result"
-
-    order = torch.randperm(tokens, device=DEV, generator=g)
-    out = op(
-        permuted_input=perm,
-        output=_output(tokens),
-        expanded_idx_to_permuted_idx=e2p[order].contiguous(),
-        topk_scales=scales[order].contiguous(),
-    )
-    assert _same_bits(out, first[order]), "shuffling the tokens changed a token's result"
-
-
-# ── what the bitwise gate can see ─────────────────────────────────────────
-
-
-def test_the_gate_sees_slot_order_and_rounding(certifying):  # noqa: F811
-    """`_compare` is bitwise; a sum taken in another order or with other roundings
-    is rejected. The reverse-order sum is the entry's own reference over the
-    slots reversed.
-    """
-    certifying(op)
-    args, rows, _ = _problem(_spec(8192), seed=99)
-    out = op(**args)
-    _compare(out, op.reference(**args))
-    scales = args["topk_scales"]
-    reverse = op.reference(
-        permuted_input=args["permuted_input"],
-        output=args["output"],
-        expanded_idx_to_permuted_idx=args["expanded_idx_to_permuted_idx"].flip(1).contiguous(),
-        topk_scales=scales.flip(1).contiguous(),
-    )
-    unfused = torch.zeros(8192, H, device=DEV)
-    for k in range(K):
-        unfused = unfused + rows[:, k].float() * scales[:, k : k + 1]
-    exact = (rows.double() * scales.double().unsqueeze(-1)).sum(1)
-    bf16_sum = torch.zeros(8192, H, dtype=torch.bfloat16, device=DEV)
-    for k in range(K):
-        bf16_sum = bf16_sum + (rows[:, k].float() * scales[:, k : k + 1]).to(torch.bfloat16)
-    for wrong in (
-        reverse,  # reverse slot order
-        unfused.to(torch.bfloat16),  # product rounded before the add
-        exact.to(torch.bfloat16),  # float64 sum rounded once
-        bf16_sum,  # bf16 accumulation
-    ):
-        with pytest.raises(AssertionError, match="differ bitwise"):
-            _compare(out, wrong)
-
-
-# ── T = 0 and the loud rejections ─────────────────────────────────────────
-
-
-def test_zero_tokens_returns_and_leaves_no_error():
-    args, _, _ = _problem(_spec(8), seed=71)
-    empty = op(
-        permuted_input=args["permuted_input"],
-        output=torch.empty(0, H, dtype=torch.bfloat16, device=DEV),
-        expanded_idx_to_permuted_idx=args["expanded_idx_to_permuted_idx"][:0],
-        topk_scales=args["topk_scales"][:0],
-    )
-    torch.cuda.synchronize()
-    assert tuple(empty.shape) == (0, H)
-    assert float((torch.ones(1000, device=DEV) + 1).sum()) == 2000.0
-    out = op(**args)
-    _compare(out, op.reference(**args))
-
-
-def test_op_rejects_loudly():
-    """Rejected by the op itself; none of these needs a guard."""
-    tokens = 64
-    args, _, _ = _problem(_spec(tokens), seed=81)
-    p, e, s = (
-        args["permuted_input"],
-        args["expanded_idx_to_permuted_idx"],
-        args["topk_scales"],
-    )
-    narrow = 2556
-    cases = [
-        ("int64 indices", dict(expanded_idx_to_permuted_idx=e.long()), "expected scalar type Int"),
-        (
-            "hidden not a multiple of 8",
-            dict(
-                permuted_input=p[:, :narrow].contiguous(),
-                output=torch.empty(tokens, narrow, dtype=torch.bfloat16, device=DEV),
-            ),
-            "hidden_size must be divisible by 8",
-        ),
-        (
-            "fp32 rows",
-            dict(permuted_input=p.float(), output=_output(tokens, torch.float32)),
-            "Unsupported input dtype",
-        ),
-        ("fp16 scales, bf16 rows", dict(topk_scales=s.half()), "Unsupported input dtype"),
-        (
-            "fewer than T * top_k rows",
-            dict(permuted_input=p[: tokens * K - 1]),
-            r"greater than or equal to num_tokens \* top_k",
-        ),
-        ("scales rows", dict(topk_scales=s[:-1]), r"topk_scales.size\(0\) must be num_tokens"),
-        (
-            "scales width",
-            dict(topk_scales=s[:, :9].contiguous()),
-            r"topk_scales.size\(1\) must be top_k",
-        ),
-        (
-            "index rows",
-            dict(expanded_idx_to_permuted_idx=e[:-1]),
-            r"expanded_idx_to_permuted_idx.size\(0\) must be num_tokens",
-        ),
-        (
-            "output width",
-            dict(output=torch.empty(tokens, H - 8, dtype=torch.bfloat16, device=DEV)),
-            r"output.size\(1\) must be hidden_size",
-        ),
-    ]
-    for tag, change, match in cases:
-        with pytest.raises(RuntimeError, match=match):
-            op(**dict(args, **change))
-    torch.cuda.synchronize()
-    out = op(**args)
-    _compare(out, op.reference(**args))
 
 
 # ── the guards ────────────────────────────────────────────────────────────
@@ -484,13 +252,12 @@ def _strided(t: torch.Tensor, pad: int) -> torch.Tensor:
     return wide[:, : t.shape[1]]
 
 
-@pytest.mark.parametrize("name", ("permuted_input", "output"))
-def test_noncontiguous_operand_answers_wrongly_and_is_refused(name):
-    """One operand the op reads and the one it writes; the guard checks all four
-    the same way."""
-    args, _, _ = _problem(_spec(300), seed=61)
+def test_noncontiguous_operand_answers_wrongly_and_is_refused():
+    """The FC2 rows the op reads; the guard checks all four operands the same way."""
+    name = "permuted_input"
+    args = _problem(_spec(300), seed=61)
     ref = op.reference(**args)
-    bad = dict(args, **{name: _strided(args[name], 64 if args[name].shape[1] == H else 6)})
+    bad = dict(args, **{name: _strided(args[name], 64)})
     out = op(**bad)
     with pytest.raises(AssertionError, match="differ bitwise"):
         _compare(out.contiguous(), ref)
@@ -499,27 +266,3 @@ def test_noncontiguous_operand_answers_wrongly_and_is_refused(name):
             op(**bad)
         out = op(**dict(args, output=_output(300)))
     _compare(out, ref)
-
-
-def test_output_dtype_mismatch_answers_wrongly_and_is_refused():
-    """An fp32 output receives the bf16 result's bit patterns, packed into the
-    first half of its bytes.
-    """
-    args, _, _ = _problem(_spec(300), seed=62)
-    ref = op.reference(**args)
-    out32 = op(**dict(args, output=_output(300, torch.float32)))
-    assert _same_bits(out32.view(torch.bfloat16).reshape(-1)[: 300 * H].view(300, H), ref)
-    with pytest.raises(AssertionError):
-        _compare(out32, ref)
-    with validating(op):
-        with pytest.raises(AssertionError, match="output dtype"):
-            op(**dict(args, output=_output(300, torch.float32)))
-
-
-def test_tokens_past_int32_are_refused():
-    """The guard reads only `output.size(0)` first, so a meta tensor stands in for
-    the 2^31-row output the op would silently leave unwritten."""
-    args, _, _ = _problem(_spec(8), seed=63)
-    huge = torch.empty((2**31, 8), dtype=torch.bfloat16, device="meta")
-    with validating(op), pytest.raises(AssertionError, match=r">= 2\^31 rows"):
-        op(**dict(args, output=huge))

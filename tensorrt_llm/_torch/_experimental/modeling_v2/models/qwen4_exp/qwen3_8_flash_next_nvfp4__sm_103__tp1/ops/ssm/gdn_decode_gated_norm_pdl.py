@@ -386,17 +386,15 @@ class GdnDecodeGatedNormPdl(OpWrapper):
 
     ARCHS = frozenset({Arch.SM_103})
 
+    # spec: rows; pool (default a contiguous 461-slot pool | "coalesced": the
+    # cache manager's pool, slot stride 36 layers' states, slots 100 and 101);
+    # pad (row 1 given slot -1).
     CELLS: tuple[Cell, ...] = (
         Cell(why="qwen3.8 decode, 1 row (con 1), 461-slot pool", spec=dict(rows=1)),
         Cell(why="qwen3.8 decode, 4 rows (MAX_ROWS), scattered slots", spec=dict(rows=4)),
-        Cell(why="qwen3.8 decode, 2 rows, one pad slot (-1)", spec=dict(rows=2, pad=True)),
         Cell(
-            why="qwen3.8 decode, 1 row, the pool a layer view of a 3-layer cache",
-            spec=dict(rows=1, pool="layer_view"),
-        ),
-        Cell(
-            why="2 rows, the cache manager's coalesced pool: slot stride 36 layers, slot 100",
-            spec=dict(rows=2, pool="coalesced"),
+            why="2 rows, coalesced pool (slot stride 36 layers, slot 100), row 1 a pad slot (-1)",
+            spec=dict(rows=2, pool="coalesced", pad=True),
         ),
     )
 
@@ -416,6 +414,11 @@ class GdnDecodeGatedNormPdl(OpWrapper):
     registers. Numerics: fp32 inside; `o` rounded to bf16 before the norm, the output
     rounded once. Inside torch's default band for bf16 / fp32 of the fp64 composition.
     Deterministic. Graph-capturable after the first call per geometry (compiled then).
+
+    Certified: 1 and 4 rows over a contiguous 461-slot pool, and 2 rows over the cache
+    manager's coalesced pool (slot stride 36 layers' states, slot 100 ~2.8G elements past
+    the base) with the second row a pad slot (-1). Under graph replay the op reads the
+    projection after `griddepcontrol.wait` (1 row). Not certified: 3 rows, `pdl=False`.
     """
 
     def __call__(

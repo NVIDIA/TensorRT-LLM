@@ -3123,8 +3123,8 @@ class PrefillTarget:
           invisible to the acceptance rate. `pack_gdn_decode_qkv` does no Q/K L2 norm,
           hence `use_qk_l2norm_in_kernel=True` below."""
         core = self.core
-        # [n*p, C] -> [n, C, p]: the multi-token conv reads channel-major (the
-        # transposed view is certified bitwise equal to the contiguous form).
+        # [n*p, C] -> [n, C, p]: the multi-token conv reads channel-major; its cells
+        # certify this transposed view directly.
         x3 = torch.transpose(torch.reshape(mq_d, [n, p, core.conv_dim]), 1, 2)
         conv_out = causal_conv1d_triton_update(
             x=x3,

@@ -498,16 +498,16 @@ class QsaTopkExpandDecode(OpWrapper):
 
     CELLS: tuple[Cell, ...] = (
         Cell(
-            why="decode, 1 row at position 8700: 2175 visible blocks of 2560",
-            spec=dict(rows=1, pos=(8700,)),
-        ),
-        Cell(
             why="decode, 4 rows across the budget, one below it",
             spec=dict(rows=4, pos=(8700, 4095, 1500, 9900)),
         ),
+        # The target writes a context chunk's rows through `out` into its rows of the
+        # step's selection; relu-sparse scores put the zero class (negative zeros among it)
+        # across the budget, the ties the canonical rule decides.
         Cell(
-            why="decode, 1 row with ties at the threshold",
-            spec=dict(rows=1, pos=(8700,), ties=True),
+            why="context chunk: 2048 rows of one request (positions 6144..8191), relu-sparse "
+            "scores, written through `out` into rows of a step-sized selection",
+            spec=dict(rows=2048, chunk=(6144, 2048), relu_sparse=True, out_margin=64),
         ),
         Cell(
             why="decode, 1 row of scores within 5% of each other",
@@ -525,7 +525,12 @@ class QsaTopkExpandDecode(OpWrapper):
 
     Compiled once per score-table width and row stride (the block table's, fixed for an
     engine), k, compress ratio, token budget, index dtypes and PDL: the row count is a
-    runtime argument, so an eager step's context rows, any count, reuse the kernel.
+    runtime argument, so an eager step's context rows, any count, reuse the kernel (read
+    from the launch, not pinned by a test).
+
+    Certified: decode batches of 1 and 4 rows over a 2560-wide score table, a 2048-row
+    context chunk written through `out`, and a replay under a CUDA graph that reads the
+    scores after its wait.
     """
 
     def __call__(

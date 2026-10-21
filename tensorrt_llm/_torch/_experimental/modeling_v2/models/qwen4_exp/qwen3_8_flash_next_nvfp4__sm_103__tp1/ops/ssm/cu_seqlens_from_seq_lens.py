@@ -25,16 +25,9 @@ _INTEGER_DTYPES = (torch.uint8, torch.int8, torch.int16, torch.int32, torch.int6
 #: under MTP (2..8: `max_draft_len` 1..7); at ``p = 1`` the target reuses the
 #: recurrent metadata's vector instead.
 BATCHES = {
-    "decode_p2": (2,) * 32,
     "mixed_p2": (1024, 37, 2, 2, 2, 2),
-    "chunked_prefill_p2": (512, 512, 96, 2, 2, 2, 2, 2, 2, 2),
     "padded_decode_p2": (2, 2, 2, 0, 0, 0),
-    "max_batch": (2,) * 256,
 }
-
-
-def _name(dtype: torch.dtype) -> str:
-    return str(dtype).removeprefix("torch.")
 
 
 class CuSeqlensFromSeqLens(OpWrapper):
@@ -68,12 +61,11 @@ class CuSeqlensFromSeqLens(OpWrapper):
                 lengths=(8,) * 32, in_dtype=torch.int32, out_dtype=torch.int64, layout="prefix"
             ),
         ),
-        *(
-            Cell(
-                why=f"{name} {_name(torch.int32)}->{_name(torch.int64)}",
-                spec=dict(lengths=BATCHES[name], in_dtype=torch.int32, out_dtype=torch.int64),
-            )
-            for name in ("chunked_prefill_p2", "padded_decode_p2", "max_batch")
+        Cell(
+            why="padded_decode_p2: zero-length padded rows, int32->int64",
+            spec=dict(
+                lengths=BATCHES["padded_decode_p2"], in_dtype=torch.int32, out_dtype=torch.int64
+            ),
         ),
     )
 
@@ -93,9 +85,12 @@ class CuSeqlensFromSeqLens(OpWrapper):
     `dtype` has no default: `causal_conv1d_fwd` requires int32 and
     `chunk_gated_delta_rule` keys its autotuner on `cu_seqlens`' dtype.
 
-    CUDA-graph capture is certified (only `seq_lens.shape[0]` reaches Python;
-    a captured graph follows lengths rewritten in place). Three launches, about
-    0.03 ms at batch 8..256 -- launch bound.
+    Certified bitwise at the call site's prefix view of `seq_lens_cuda` (a
+    mixed step at p 2, and the p 8 verify of 32 requests) and at a decode
+    batch padded with zero-length rows, int32 in and int64 out. CUDA-graph
+    capture is certified (only `seq_lens.shape[0]` reaches Python; a captured
+    graph follows lengths rewritten in place). Three launches, about 0.03 ms
+    at batch 8..256 -- launch bound.
 
     Not certified: a `seq_lens` dtype other than int32 (the guard admits any
     integer dtype), a non-contiguous `seq_lens` view.

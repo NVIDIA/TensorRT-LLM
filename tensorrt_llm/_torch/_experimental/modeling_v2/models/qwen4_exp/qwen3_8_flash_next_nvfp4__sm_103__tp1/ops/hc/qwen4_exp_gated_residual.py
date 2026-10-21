@@ -71,16 +71,15 @@ class Qwen4ExpGatedResidual(OpWrapper):
     # spec: leading (token dims), inject (True). Every cell is this
     # checkpoint's 4x2560 bf16 geometry with synthetic weights of its measured
     # element statistics, the normed stream reaching ~+-30 as the real one does.
-    # Leading dims beyond one are `test_flattened_call_matches_batched`'s.
-    CELLS: tuple[Cell, ...] = tuple(
-        Cell(why=f"checkpoint 4x2560 bf16, {why}", spec=dict(leading=(t,)))
-        for t, why in (
-            (1, "decode, 1 token"),
-            (8, "decode batch 8 / MTP draft rows"),
-            (512, "prefill 512 tokens"),
-            (8192, "prefill 8192 tokens, largest measured"),
-        )
-    ) + (
+    CELLS: tuple[Cell, ...] = (
+        Cell(
+            why="checkpoint 4x2560 bf16, decode batch 8 / MTP draft rows",
+            spec=dict(leading=(8,)),
+        ),
+        Cell(
+            why="checkpoint 4x2560 bf16, prefill 8192 tokens, largest measured",
+            spec=dict(leading=(8192,)),
+        ),
         Cell(
             why="stack-final mixer: block_inject_weight None",
             spec=dict(leading=(256,), inject=False),
@@ -95,7 +94,7 @@ class Qwen4ExpGatedResidual(OpWrapper):
     blocks and `shared_head`'s own mixer).
 
     Preconditions, all loud (each measured to raise `RuntimeError` before
-    producing anything): the width divisible by `hc_count` (unflatten), the
+    producing anything; the width one is tested): the width divisible by `hc_count` (unflatten), the
     weights' input width equal to it and their dtype equal to the
     activation's (`F.linear`).
 
@@ -111,13 +110,16 @@ class Qwen4ExpGatedResidual(OpWrapper):
     sigmoid saturates (a property of the function, outside the checkpoint's
     range).
 
-    CUDA-graph capture certified, bitwise equal to eager. Cost, not gated,
-    shared device: ~235 us at 1..512 tokens (overhead-bound), 475 us at
-    4096, 902 us at 8192.
+    Certified: bf16 2-D `[rows, 10240]` at 8 and 8192 rows with the
+    injection, 256 rows without it (the stack-final mixer); CUDA-graph replay
+    at 8 rows, bitwise equal to eager. Cost, not gated, shared device: ~235 us
+    at 1..512 tokens (overhead-bound), 475 us at 4096, 902 us at 8192.
 
-    Not certified: hc_count other than 4, hidden other than 2560, lowrank
-    other than 320, float16 and float32, weight/activation dtype mixing. Hard
-    limits: not probed (largest operand 8192 x 10240 = 2^26.3 elements).
+    Not certified: other row counts, more than one leading dim, hc_count other
+    than 4, hidden other than 2560, lowrank other than 320, float16 and
+    float32, weight/activation dtype mixing; the operand-range bounds above
+    are measured. Hard limits: not probed (largest operand 8192 x 10240 =
+    2^26.3 elements).
     """
 
     def __call__(

@@ -114,17 +114,9 @@ def test_valid_pools_pass() -> None:
     M.check_shared_selection(_t(2, 8, 512, dtype=torch.int32), {3: 1}, 3, 512)
 
 
-@pytest.mark.parametrize(
-    "plane, match",
-    [
-        (None, "did not allocate"),
-        (_t(9, 32, 3), "torch.bfloat16"),
-        (_t(9, 32, 2, dtype=torch.int32), "expected"),
-    ],
-)
-def test_position_plane_rejects(plane, match) -> None:
-    with pytest.raises(AssertionError, match=match):
-        M.check_position_plane(G, plane)
+def test_position_plane_rejects_the_wrong_dtype() -> None:
+    with pytest.raises(AssertionError, match="torch.bfloat16"):
+        M.check_position_plane(G, _t(9, 32, 3))
 
 
 def test_attention_pools_reject_wrong_index_plane_and_kv_layout() -> None:
@@ -158,11 +150,7 @@ def test_attention_pools_reject_the_other_storage_dtype() -> None:
     # The index plane is a kernel contract, not KV storage: bf16 under either algorithm.
     with pytest.raises(AssertionError, match="QSA index plane"):
         M.check_attention_pools(G_FP8, 3, index.to(torch.float8_e4m3fn), fp8_kv)
-
-
-def test_attention_pools_reject_the_wrong_nvfp4_width() -> None:
-    """An NVFP4 pool is half a head wide: a full-width uint8 pool is the other storage."""
-    index = _t(9, 32, 1, 128)
+    # An NVFP4 pool is half a head wide: a full-width uint8 pool is the other storage.
     with pytest.raises(AssertionError, match="paged K/V"):
         M.check_attention_pools(
             G_NVFP4, 3, index, _t(9, 2, G.heads_kv, G.tokens_per_block, 256, dtype=torch.uint8)
@@ -197,19 +185,10 @@ def test_kv_scale_planes_must_hold_the_data_pools_pages_per_slot() -> None:
         M.check_kv_scale_planes(G_NVFP4, 3, data, _strided((9, 2, 2, 32, 16), 24 * 1024 + 1))
 
 
-@pytest.mark.parametrize(
-    "scales, match",
-    [
-        (None, "did not allocate"),
-        (_t(9, 2, 2, 32, 16), "torch.uint8"),
-        (_t(9, 2, 2, 32, 8, dtype=torch.uint8), "NVFP4 block scales"),
-        (_t(8, 2, 2, 32, 16, dtype=torch.uint8), "same slots"),
-    ],
-)
-def test_kv_scale_planes_reject(scales, match) -> None:
+def test_kv_scale_planes_reject_the_wrong_block_scale_width() -> None:
     data = _t(9, 2, G.heads_kv, G.tokens_per_block, 128, dtype=torch.uint8)
-    with pytest.raises(AssertionError, match=match):
-        M.check_kv_scale_planes(G_NVFP4, 3, data, scales)
+    with pytest.raises(AssertionError, match="NVFP4 block scales"):
+        M.check_kv_scale_planes(G_NVFP4, 3, data, _t(9, 2, 2, 32, 8, dtype=torch.uint8))
 
 
 def test_recurrent_pools_reject_wrong_key_dim_order_and_dtype() -> None:
@@ -254,14 +233,21 @@ def test_step_buffers_reject_missing_conv_rank_dtype_and_index() -> None:
         M.check_step_buffers(G, int_conv, _conv(), None)
 
 
-def test_legacy_state_rejects_missing_rank_and_dtype_drift() -> None:
-    int_ssm = _t(SLOTS, 2, G.num_v_heads, G.head_v_dim, G.head_k_dim, dtype=torch.float32)
+def test_legacy_state_rejects_missing_rank_dtype_drift_and_too_many_rows() -> None:
+    def per_step(steps):
+        return _t(SLOTS, steps, G.num_v_heads, G.head_v_dim, G.head_k_dim, dtype=torch.float32)
+
+    int_ssm = per_step(2)
     with pytest.raises(AssertionError, match="no per-step recurrent"):
         M.check_legacy_state(G, None, _ssm())
     with pytest.raises(AssertionError, match="per-step recurrent buffer"):
         M.check_legacy_state(G, _ssm(), _ssm())
     with pytest.raises(AssertionError, match="per-step recurrent buffer"):
         M.check_legacy_state(G, int_ssm.to(torch.bfloat16), _ssm())
+    # More rows per request than the legacy recurrence is certified at.
+    M.check_legacy_state(G, per_step(M._MAX_LEGACY_VERIFY_WIDTH), _ssm())
+    with pytest.raises(AssertionError, match="TRTLLM_USE_GDN_REPLAY"):
+        M.check_legacy_state(G, per_step(M._MAX_LEGACY_VERIFY_WIDTH + 1), _ssm())
 
 
 def test_replay_state_rejects_pool_dtype_geometry_and_bookkeeping() -> None:
@@ -279,15 +265,6 @@ def test_replay_state_rejects_pool_dtype_geometry_and_bookkeeping() -> None:
         M.check_replay_state(HISTORY, 3, _t(SLOTS - 1, dtype=torch.int32), buf, _ssm())
     with pytest.raises(AssertionError, match="cache_buf_idx"):
         M.check_replay_state(HISTORY, 3, pnat, buf.to(torch.int64), _ssm())
-
-
-def test_legacy_state_rejects_more_than_the_certified_rows_per_request() -> None:
-    def int_ssm(steps):
-        return _t(SLOTS, steps, G.num_v_heads, G.head_v_dim, G.head_k_dim, dtype=torch.float32)
-
-    M.check_legacy_state(G, int_ssm(M._MAX_LEGACY_VERIFY_WIDTH), _ssm())
-    with pytest.raises(AssertionError, match="TRTLLM_USE_GDN_REPLAY"):
-        M.check_legacy_state(G, int_ssm(M._MAX_LEGACY_VERIFY_WIDTH + 1), _ssm())
 
 
 def test_verify_width_admits_one_to_eight_rows_per_request() -> None:

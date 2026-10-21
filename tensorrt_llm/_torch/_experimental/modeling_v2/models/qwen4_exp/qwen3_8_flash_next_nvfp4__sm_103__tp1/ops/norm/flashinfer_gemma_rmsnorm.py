@@ -33,10 +33,6 @@ class FlashinferGemmaRmsnorm(OpWrapper):
     # a contiguous row, is what the strided-kernel cells below certify.
     CELLS: tuple[Cell, ...] = (
         Cell(
-            why="decode: 1 token, stream 3 of the 4x2560 residual (column 7680)",
-            spec=dict(shape=(1, 2560), col_offset=7680, **_STREAM),
-        ),
-        Cell(
             why="decode batch 33: stream 1, row stride 10240 > width 2560",
             spec=dict(shape=(33, 2560), col_offset=2560, **_STREAM),
         ),
@@ -48,23 +44,21 @@ class FlashinferGemmaRmsnorm(OpWrapper):
             why="MTP pre_e_norm: the contiguous [T, 2560] embedding",
             spec=dict(shape=(4, 2560), dtype=torch.bfloat16, eps=1e-6),
         ),
-        Cell(
-            why="hidden 5120, 8192 tokens: the largest row count measured",
-            spec=dict(shape=(8192, 5120), dtype=torch.bfloat16, eps=1e-6),
-        ),
     )
 
     note = """
     Metadata consumed: none. Registered only when flashinfer is importable.
     Certified path: flashinfer's CuTe DSL `rmsnorm_cute` kernel for 2-D bf16
-    `x` (`weight_bias=1.0`), contiguous and at the residual's 10240 row stride;
-    a strided row selects a strided kernel variant. The 3-D per-head kernel
-    (`qk_rmsnorm_cute`) and fp16/fp32 operands are not certified. The CUDA-JIT fallback (`FLASHINFER_USE_CUDA_NORM=1`,
+    `x` (`weight_bias=1.0`) at hidden 2560: a stream slice at the residual's
+    10240 row stride (33 and 2048 rows; a strided row selects a strided kernel
+    variant) and a contiguous `[4, 2560]` (MTP `pre_e_norm`). Not certified: a
+    single strided row, other widths, other row counts, the 3-D per-head kernel
+    (`qk_rmsnorm_cute`) and fp16/fp32 operands. The CUDA-JIT fallback (`FLASHINFER_USE_CUDA_NORM=1`,
     or a DSL that cannot target the device) is a different implementation and
     is not certified. PDL (`TRTLLM_ENABLE_PDL`, default on) changes scheduling,
     not results.
 
-    Loud, so not guarded: 1-D and 4-D `x`, `x.stride(-1) != 1`, a weight of
+    Loud (measured), so not guarded: 1-D and 4-D `x`, `x.stride(-1) != 1`, a weight of
     the wrong length, dtype or device, and a CPU `x` raise ValueError;
     float64/int8/uint8 raise KeyError from the DSL dtype table. float8_e4m3fn
     and float8_e5m2 are in that table and return a plausible fp8 tensor --
@@ -75,8 +69,9 @@ class FlashinferGemmaRmsnorm(OpWrapper):
     pointers, so odd row strides and misaligned slices were not measured.
 
     Numerics: default tolerance holds for bf16, nothing loosened; the
-    largest deviation is one bf16 ulp (0.03125) at 2048 and 8192 rows of 5120.
-    The `+ 1` is measured: against a plain-`w` reference the output is ~4 away.
+    largest deviation measured is one bf16 ulp (0.03125) at 2048 and 8192 rows
+    of 5120. The `+ 1` is measured: against a plain-`w` reference the output is
+    ~4 away, so the cells tell the two apart.
 
     Hard limits
       T * H  contiguous inputs above 2^31 - 1 elements route to the strided

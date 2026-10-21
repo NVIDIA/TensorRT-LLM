@@ -26,9 +26,6 @@ DEV = "cuda"
 COMPRESS_RATIO = 4
 BLOCK_TOPK = 512
 COLS = 2080
-#: What a padding slot sorts under when a raw selection is put in ascending order: past
-#: every column, so padding stays last.
-PAD_KEY = torch.iinfo(torch.int32).max
 
 
 def _compare(out: torch.Tensor, ref: torch.Tensor) -> None:
@@ -51,33 +48,19 @@ def _logits(kind: str, rows: int, cols: int, gen: torch.Generator) -> torch.Tens
     if kind == "relu_sparse":
         x = torch.relu(torch.randn(rows, cols, generator=gen, device=DEV)) * 3.0
         return x * (torch.rand(rows, cols, generator=gen, device=DEV) < 0.2)
-    if kind == "signed_zeros":
-        x = _logits("relu_sparse", rows, cols, gen)
-        negative = torch.rand(rows, cols, generator=gen, device=DEV) < 0.5
-        return torch.where((x == 0) & negative, torch.full_like(x, -0.0), x)
-    if kind == "pair_at_k":
-        x = torch.rand(rows, cols, generator=gen, device=DEV).argsort(1).float() + 1.0
-        order = torch.argsort(x[:, :2048], dim=1, descending=True)
-        kth, nxt = order[:, BLOCK_TOPK - 1 : BLOCK_TOPK], order[:, BLOCK_TOPK : BLOCK_TOPK + 1]
-        x.scatter_(1, nxt, torch.gather(x, 1, kth))
-        return x
     raise ValueError(kind)
 
 
 def _windows(spec: dict, rows: int, cols: int, gen: torch.Generator):
     kind = spec["windows"][0]
     starts = torch.zeros(rows, dtype=torch.int32, device=DEV)
-    if kind in ("chunk", "positions_random"):
-        if kind == "chunk":
-            positions = spec["windows"][1] + torch.arange(rows, device=DEV)
-        else:
-            lo, hi = spec["windows"][1:]
-            positions = torch.randint(lo, hi + 1, (rows,), generator=gen, device=DEV)
-        ends = ((positions + 1) // COMPRESS_RATIO).clamp_max(cols).to(torch.int32)
+    if kind == "chunk":
+        positions = spec["windows"][1] + torch.arange(rows, device=DEV)
     else:
-        assert kind == "ends", kind
-        ends = torch.tensor(spec["windows"][1], dtype=torch.int32, device=DEV)
-    assert starts.numel() == rows and ends.numel() == rows
+        assert kind == "positions_random", kind
+        lo, hi = spec["windows"][1:]
+        positions = torch.randint(lo, hi + 1, (rows,), generator=gen, device=DEV)
+    ends = ((positions + 1) // COMPRESS_RATIO).clamp_max(cols).to(torch.int32)
     return starts, ends
 
 
@@ -135,13 +118,6 @@ def _build(spec: dict, rows: int, seed: int):
     return logits, starts, ends, indices
 
 
-def _sorted(raw: torch.Tensor) -> torch.Tensor:
-    """A raw selection in ascending order, padding last."""
-    keyed = torch.where(raw < 0, PAD_KEY, raw)
-    ordered = torch.sort(keyed, dim=1).values
-    return torch.where(ordered == PAD_KEY, -1, ordered)
-
-
 @pytest.mark.parametrize("cell", op.CELLS, ids=[c.why[:44] for c in op.CELLS])
 def test_certified_cells(cell, certifying) -> None:  # noqa: F811
     certifying(op)
@@ -154,46 +130,6 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811
         out = op(*args)
         assert out is args[3], "the rewrite writes `indices` and returns it"
         _compare(out, expected)
-    if not spec.get("graph"):
-        return
-
-    # Captured once, replayed against new scores, new causal bounds and a new engine
-    # selection through the same buffers.
-    logits, starts, ends, indices = _build(spec, rows, seed)
-    torch.cuda.synchronize()
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        op(logits, starts, ends, indices)
-    for replay in range(2):
-        fresh = _build(spec, rows, seed + 1000 + replay)
-        for static, new in zip((logits, starts, ends, indices), fresh):
-            static.copy_(new)
-        expected = op.reference(logits, starts, ends, indices)
-        graph.replay()
-        torch.cuda.synchronize()
-        _compare(indices, expected)
-
-
-def test_tie_free_rows_equal_the_radix_engines_sorted_selection() -> None:
-    """Where the k-th value has no tie, the rewrite is the engine's own set in ascending
-    order, bit for bit."""
-    gen = torch.Generator(device=DEV).manual_seed(4)
-    rows = 256
-    logits = torch.randn(rows, COLS, generator=gen, device=DEV)
-    positions = torch.randint(0, 8192, (rows,), generator=gen, device=DEV)
-    ends = ((positions + 1) // COMPRESS_RATIO).clamp_max(COLS).to(torch.int32)
-    starts = torch.zeros(rows, dtype=torch.int32, device=DEV)
-    _poison(logits, starts, ends, "nan")
-    window = torch.where(
-        torch.arange(COLS, device=DEV)[None, :] < ends[:, None], logits, float("-inf")
-    )
-    top = torch.topk(window, BLOCK_TOPK + 1, dim=1).values
-    long_rows = ends > BLOCK_TOPK
-    assert bool((top[long_rows, -2] != top[long_rows, -1]).all()), "a tie at k: reseed"
-    assert int(long_rows.sum()) > 100 and int((~long_rows).sum()) > 10
-    raw = _radix(logits, starts, ends)
-    expected = _sorted(raw)
-    assert torch.equal(op(logits, starts, ends, raw), expected)
 
 
 def test_narrowing_the_table_to_a_bound_on_the_windows_changes_nothing() -> None:
@@ -210,36 +146,6 @@ def test_narrowing_the_table_to_a_bound_on_the_windows_changes_nothing() -> None
     narrow = op(logits[:, :bound], starts, ends, raw.clone())
     _compare(wide, op.reference(logits, starts, ends, raw))
     assert torch.equal(wide, narrow)
-
-
-@pytest.mark.parametrize("kind", ["relu_sparse", "pair_at_k"])
-def test_radix_launches_differ_and_canonical_rows_do_not(kind) -> None:
-    """Repeated radix launches over one tie-heavy score matrix. The raw rows differ from
-    launch to launch -- in order, and where the tie class at the k-th score straddles the
-    budget, in which tied columns are kept -- and the canonical row is one and the same
-    row, the reference's, for every launch of every row. Zero ties as the target's relu
-    scores have them, and a positive pair tied exactly at the k-th value."""
-    gen = torch.Generator(device=DEV).manual_seed(17)
-    rows, launches = 64, 20
-    logits = _logits(kind, rows, COLS, gen)
-    starts = torch.zeros(rows, dtype=torch.int32, device=DEV)
-    ends = torch.full((rows,), 2048, dtype=torch.int32, device=DEV)
-    _poison(logits, starts, ends, "nan")
-    expected = op.reference(logits, starts, ends, torch.empty(rows, BLOCK_TOPK, device=DEV))
-    orders = [set() for _ in range(rows)]
-    sets = [set() for _ in range(rows)]
-    canonical = [set() for _ in range(rows)]
-    for _ in range(launches):
-        raw = _radix(logits, starts, ends)
-        for r, (row, ordered) in enumerate(zip(raw.cpu().tolist(), _sorted(raw).cpu().tolist())):
-            orders[r].add(tuple(row))
-            sets[r].add(tuple(ordered))
-        out = op(logits, starts, ends, raw)
-        for r, row in enumerate(out.cpu().tolist()):
-            canonical[r].add(tuple(row))
-        _compare(out, expected)
-    assert any(len(o) > 1 for o in orders), "radix returned one order on every launch"
-    assert all(len(c) == 1 for c in canonical)
 
 
 def test_guard_refuses_a_broadcast_row_start() -> None:

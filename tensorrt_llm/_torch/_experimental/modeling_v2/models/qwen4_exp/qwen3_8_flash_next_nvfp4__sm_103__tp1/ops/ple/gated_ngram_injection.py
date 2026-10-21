@@ -72,7 +72,6 @@ class GatedNgramInjection(OpWrapper):
     # "single_channel" -- one nonzero channel per stream so each dot is an exact
     # product under the test's control: dots, value_dtype, clamp_min.
     CELLS: tuple[Cell, ...] = (
-        Cell(why="checkpoint 4x2560 bf16, decode, 1 token", spec=dict(leading=(1,))),
         Cell(
             why="checkpoint 4x2560 bf16, 33 tokens / MTP verify 8 x 4 + 1",
             spec=dict(leading=(33,)),

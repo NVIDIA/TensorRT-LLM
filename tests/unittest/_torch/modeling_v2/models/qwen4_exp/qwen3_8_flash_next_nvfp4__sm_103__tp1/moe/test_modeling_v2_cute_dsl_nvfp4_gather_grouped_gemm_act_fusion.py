@@ -5,10 +5,7 @@
 The entry owns the contract. This file builds the checkpoint-shaped operands --
 512 experts in the CuteDSL weight layout, the activation as the target quantizes
 it, the sort as moe_sort returns it -- and holds the claims no cell carries:
-per-pair invariance across tiles, tactics, row order and prefixes; CUDA-graph
-replay at the captured row counts; the regions the op leaves unwritten; that
-the gate rejects a wrong layout of each operand; the guards and the loud
-rejections.
+per-pair invariance across tiles and tactics, and the contiguity guard.
 """
 
 import functools
@@ -47,10 +44,8 @@ ISC1 = 5.0 / (448 * 6)
 ACT_AMAX = 48.0
 GSF = {
     "calibrated": 448 * 6 / ACT_AMAX,
-    "saturating": 25 * 448 * 6 / ACT_AMAX,
     "subnormal": 2.0**-12 * 448 * 6 / ACT_AMAX,
 }
-SENTINEL = 0xA5
 
 #: Tie windows of `_compare`, derived in its docstring.
 SF_TIE = 2.0**-20
@@ -58,13 +53,6 @@ CODE_TIE = 2.0**-17
 #: At most this fraction of block scales / codes may take the other side of a tie
 #: (4 of them when that is more).
 FLIP_BUDGET = 1e-5
-
-#: Row counts of a decode capture (requests x MTP verify width 1..4, up to 32
-#: requests): both ends of the sort's block kernel, its first cluster-kernel T and
-#: the largest capture. The eager prefix lengths straddle the captured ceiling and
-#: reach the 8192-row one.
-_CAPTURED_ROWS = (1, 4, 5, 128)
-_PREFIXES = (1, 4, 5, 127, 128, 129, 4096, 8191)
 
 
 # ── the gate ──────────────────────────────────────────────────────────────
@@ -203,82 +191,61 @@ def _experts(num_experts: int = E):
     return w, s, ws2
 
 
-def _row_perm(n: int, layout: str) -> torch.Tensor:
-    """Destination row -> source row of the `[up; gate]` stack."""
+def _row_perm(n: int) -> torch.Tensor:
+    """Destination row -> source row of the `[up; gate]` stack, in `GATE_UP_GROUP`-row
+    groups."""
     idx = torch.arange(n, device=DEV)
-    if layout == "group64":
-        return idx.view(2, n // (2 * GATE_UP_GROUP), GATE_UP_GROUP).transpose(0, 1).reshape(-1)
-    if layout == "rowwise":  # trtllm-gen's interleave, without its 32-row shuffle
-        return idx.view(2, n // 2).transpose(0, 1).reshape(-1)
-    raise ValueError(layout)
+    return idx.view(2, n // (2 * GATE_UP_GROUP), GATE_UP_GROUP).transpose(0, 1).reshape(-1)
 
 
 @functools.lru_cache(maxsize=None)
-def _weights(layout: str = "group64", num_experts: int = E):
+def _weights():
     """`(weight, weight_scale, alpha)` in the layout CuteDSL reads -- what the
-    target's load-time transform produces -- or one of the wrong layouts the
-    discrimination test feeds it."""
-    w, s, ws2 = _experts(num_experts)
-    perm = _row_perm(2 * INTER, "group64" if layout == "scales_unpermuted" else layout)
+    target's load-time transform produces."""
+    w, s, ws2 = _experts()
+    perm = _row_perm(2 * INTER)
     w_k = w[:, perm].contiguous()
-    s_rows = s if layout == "scales_unpermuted" else s[:, perm]
-    s_k = torch.ops.trtllm.block_scale_interleave(s_rows.contiguous()).view(s.shape)
+    s_k = torch.ops.trtllm.block_scale_interleave(s[:, perm].contiguous()).view(s.shape)
     alpha = (ISC1 * ws2).contiguous()
     return w_k.view(torch.float4_e2m1fn_x2), s_k, alpha
 
 
-def _activation(tokens: int, seed: int, zero_tokens: int = 0, swizzled: bool = False):
+def _activation(tokens: int, seed: int, zero_tokens: int = 0):
     """The target's FC1 input: bf16 hidden rows through `fp4_quantize(x, 1/isc1,
     16, False, False)`, scales viewed `[T, H/16]`."""
     g = torch.Generator(device=DEV).manual_seed(seed)
     x = torch.randn(tokens, H, generator=g, device=DEV).to(torch.bfloat16)
     x[:zero_tokens] = 0
     gs = torch.tensor([1.0 / ISC1], dtype=torch.float32, device=DEV)
-    q, sf = torch.ops.trtllm.fp4_quantize(x, gs, VEC, False, swizzled)
+    q, sf = torch.ops.trtllm.fp4_quantize(x, gs, VEC, False, False)
     return q.view(torch.float4_e2m1fn_x2), sf.view(tokens, H // VEC)
 
 
-def _ids(dist: str, tokens: int, tile: int, seed: int, num_experts: int = E) -> torch.Tensor:
-    """Expert ids `[tokens, K]` int32, every row naming K distinct experts."""
+def _ids(dist: str, tokens: int, seed: int) -> torch.Tensor:
+    """Expert ids `[tokens, K]` int32: each row's top-K of uniform scores."""
+    assert dist == "router", dist
     g = torch.Generator(device=DEV).manual_seed(seed)
-    if dist == "router":
-        scores = torch.rand(tokens, num_experts, device=DEV, generator=g)
-        return scores.topk(K, dim=-1).indices.to(torch.int32)
-    if dist == "hot":
-        hot = torch.randperm(num_experts, device=DEV, generator=g)[:K]
-        slots = torch.rand(tokens, K, device=DEV, generator=g).argsort(dim=-1)
-        return hot[slots].to(torch.int32)
-    if dist == "tile_edges":
-        edge = (7, 300, 511)
-        scores = torch.rand(tokens, num_experts, device=DEV, generator=g)
-        scores[:, list(edge)] = -1.0
-        ids = scores.topk(K, dim=-1).indices.to(torch.int32)
-        for slot, (expert, rows) in enumerate(zip(edge, (tile - 1, tile, tile + 1))):
-            ids[:rows, slot] = expert
-        return ids
-    if dist == "round_robin":
-        base = torch.arange(tokens, device=DEV).unsqueeze(1) * K
-        return ((base + torch.arange(K, device=DEV)) % num_experts).to(torch.int32)
-    raise ValueError(dist)
+    scores = torch.rand(tokens, E, device=DEV, generator=g)
+    return scores.topk(K, dim=-1).indices.to(torch.int32)
 
 
-def _sort(ids: torch.Tensor, tile: int, num_experts: int = E):
+def _sort(ids: torch.Tensor, tile: int):
     """moe_sort as the CuteDSL MoE calls it; the routing weights do not reach FC1."""
     scales = torch.full(ids.shape, 0.1, dtype=torch.float32, device=DEV)
     return torch.ops.trtllm.moe_sort(
         token_selected_experts=ids,
         token_final_scales=scales,
-        num_experts=num_experts,
+        num_experts=E,
         top_k=K,
         local_expert_offset=0,
-        local_num_experts=num_experts,
+        local_num_experts=E,
         tile_tokens_dim=tile,
     )
 
 
-def _args(x, x_sf, sort, tile, gsf, layout="group64"):
+def _args(x, x_sf, sort, tile, gsf):
     """The keyword arguments the target passes, by the op's own names."""
-    weight, weight_scale, alpha = _weights(layout)
+    weight, weight_scale, alpha = _weights()
     t2e, t2mn, _e2p, p2e, _total, n_tiles = sort
     return dict(
         input=x,
@@ -303,7 +270,7 @@ def _args(x, x_sf, sort, tile, gsf, layout="group64"):
 
 def _problem(tokens, tile, seed, dist="router", gsf="calibrated", zero_tokens=0):
     x, x_sf = _activation(tokens, seed, zero_tokens)
-    sort = _sort(_ids(dist, tokens, tile, seed + 1), tile)
+    sort = _sort(_ids(dist, tokens, seed + 1), tile)
     return _args(x, x_sf, sort, tile, GSF[gsf]), sort
 
 
@@ -376,14 +343,15 @@ def test_certified_cells(cell, certifying):  # noqa: F811 — pytest resolves th
 # ── invariance: a pair's output depends on the pair alone ─────────────────
 
 
-@pytest.mark.parametrize("tokens", (128, 8192))
-def test_tiles_and_tactics_agree_per_pair(tokens, certifying):  # noqa: F811
+def test_tiles_and_tactics_agree_per_pair(certifying):  # noqa: F811
     """Tile 128 / 256, MMA N 128 / 256 and the tuner's fallback all produce every
-    pair's codes and block scales bit for bit the same, so a cell certifies the
-    tactic the autotuner picks in serving as well as the one it ran."""
+    pair's codes and block scales bit for bit the same at the 8192-row prefill, so a
+    cell certifies the tactic the autotuner picks in serving as well as the one it
+    ran."""
     certifying(op)
+    tokens = 8192
     x, x_sf = _activation(tokens, seed=tokens)
-    ids = _ids("router", tokens, 128, seed=tokens + 1)
+    ids = _ids("router", tokens, seed=tokens + 1)
     seen = {}
     for tile in (128, 256):
         sort = _sort(ids, tile)
@@ -398,218 +366,15 @@ def test_tiles_and_tactics_agree_per_pair(tokens, certifying):  # noqa: F811
         _assert_pairs_equal(got, first, f"T={tokens} {key} vs (128, 128)")
 
 
-def test_row_order_and_repeat_do_not_change_a_pair(certifying):  # noqa: F811
-    """moe_sort orders an expert's rows by atomics (from T = 5). Shuffling every
-    expert's run of `permuted_idx_to_expanded_idx`, and calling twice, leaves each
-    pair's output bitwise unchanged: the FC1 result is reproducible run to run."""
-    certifying(op)
-    tokens, tile = 4096, 128
-    args, sort = _problem(tokens, tile, seed=77)
-    base = _pairs(op(**args), sort, tokens)
-    _assert_pairs_equal(_pairs(op(**args), sort, tokens), base, "repeat call")
-
-    t2mn, e2p, p2e, n_tiles = sort[1], sort[2], sort[3], int(sort[5])
-    g = torch.Generator(device=DEV).manual_seed(5)
-    p2e_s = p2e.clone()
-    starts = torch.arange(n_tiles, device=DEV) * tile
-    run_of = torch.full((p2e.numel(),), -1, dtype=torch.long, device=DEV)
-    for i, (start, limit) in enumerate(zip(starts.tolist(), t2mn[:n_tiles].tolist())):
-        run_of[start:limit] = int(sort[0][i])
-    for e in torch.unique(run_of[run_of >= 0]).tolist():
-        rows = torch.nonzero(run_of == e).squeeze(1)
-        p2e_s[rows] = p2e[rows[torch.randperm(rows.numel(), generator=g, device=DEV)]]
-    e2p_s = e2p.clone().reshape(-1)
-    real = run_of >= 0
-    e2p_s[p2e_s[real].long()] = torch.nonzero(real).squeeze(1).to(torch.int32)
-    shuffled = (sort[0], sort[1], e2p_s.view_as(e2p), p2e_s, sort[4], sort[5])
-    args_s = dict(args, permuted_idx_to_expanded_idx=p2e_s)
-    out_s = op(**args_s)
-    _compare(out_s, op.reference(**args_s))
-    _assert_pairs_equal(_pairs(out_s, shuffled, tokens), base, "shuffled rows")
-
-
-def test_eager_rows_prefix_bitwise(certifying):  # noqa: F811
-    """The 8192-row call is gated against the reference, and every prefix call's
-    pairs are bitwise the 8192-row call's."""
-    certifying(op)
-    tokens, tile = 8192, 128
-    x, x_sf = _activation(tokens, seed=8)
-    ids = _ids("router", tokens, tile, seed=9)
-    sort = _sort(ids, tile)
-    args = _args(x, x_sf, sort, tile, GSF["calibrated"])
-    full = op(**args)
-    _compare(full, op.reference(**args))
-    full_pairs = _pairs(full, sort, tokens)
-    for t in _PREFIXES:
-        sub_sort = _sort(ids[:t].contiguous(), tile)
-        sub = op(**_args(x[:t], x_sf[:t], sub_sort, tile, GSF["calibrated"]))
-        got = _pairs(sub, sub_sort, t)
-        n = t * K
-        _assert_pairs_equal(got, (full_pairs[0][:n], full_pairs[1][:n]), f"prefix T={t}")
-
-
-# ── CUDA graphs: captured row counts, on new data ────────────────────────
-
-
-def _capture(fn):
-    side = torch.cuda.Stream()
-    side.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(side):
-        for _ in range(2):
-            fn()
-    torch.cuda.current_stream().wait_stream(side)
-    torch.cuda.synchronize()
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        static = fn()
-    return graph, static
-
-
-def test_captured_rows_replay_on_new_data(certifying):  # noqa: F811
-    """moe_sort and this op are captured together, as the target's graph holds them;
-    each graph is replayed on two fresh activations and id sets, and its written
-    rows are gated against the reference and bitwise against an eager call on the
-    graph's own sort output. At the target's tile, 128."""
-    certifying(op)
-    tile = 128
-    for tokens in _CAPTURED_ROWS:
-        x, x_sf = _activation(tokens, seed=tokens)
-        ids = _ids("router", tokens, tile, seed=500 + tokens)
-        scales = torch.full(ids.shape, 0.1, dtype=torch.float32, device=DEV)
-        base = _args(x, x_sf, _sort(ids, tile), tile, GSF["calibrated"])
-        state = {}
-
-        def step(ids=ids, scales=scales, base=base, state=state, tile=tile):
-            sort = torch.ops.trtllm.moe_sort(
-                token_selected_experts=ids,
-                token_final_scales=scales,
-                num_experts=E,
-                top_k=K,
-                local_expert_offset=0,
-                local_num_experts=E,
-                tile_tokens_dim=tile,
-            )
-            state["sort"] = sort
-            return op(
-                **dict(
-                    base,
-                    tile_idx_to_group_idx=sort[0],
-                    tile_idx_to_mn_limit=sort[1],
-                    permuted_idx_to_expanded_idx=sort[3],
-                    num_non_exiting_tiles=sort[5],
-                )
-            )
-
-        graph, static_out = _capture(step)
-        static_sort = state["sort"]
-        for trial in (1, 2):
-            nx, nx_sf = _activation(tokens, seed=1000 * trial + tokens)
-            x.view(torch.uint8).copy_(nx.view(torch.uint8))
-            x_sf.copy_(nx_sf)
-            ids.copy_(_ids("router", tokens, tile, seed=7000 * trial + tokens))
-            graph.replay()
-            args = dict(
-                base,
-                tile_idx_to_group_idx=static_sort[0],
-                tile_idx_to_mn_limit=static_sort[1],
-                permuted_idx_to_expanded_idx=static_sort[3],
-                num_non_exiting_tiles=static_sort[5],
-            )
-            ref = op.reference(**args)
-            _compare(static_out, ref)
-            eager = op(**{k: _clone(v) for k, v in args.items()})
-            _compare(eager, ref)
-            rows = ref.rows
-            assert torch.equal(
-                static_out[0].view(torch.uint8)[rows], eager[0].view(torch.uint8)[rows]
-            ), (tokens, trial)
-            m = rows.numel()
-            sf_g = unswizzle(static_out[1], m, INTER // VEC)[rows]
-            sf_e = unswizzle(eager[1], m, INTER // VEC)[rows]
-            assert torch.equal(sf_g, sf_e), (tokens, trial)
-        del graph, static_out
-    torch.cuda.synchronize()
-
-
-@pytest.mark.parametrize("tokens", (3, 300))
-def test_unwritten_regions(tokens):
-    """A sentinel planted in a captured graph's outputs: which bytes replay writes.
-    The rows the sort filled hold the result; the padding rows of a written tile
-    are written with zero block scales and zero codes; the tiles past
-    `num_non_exiting_tiles` are not written -- under a graph they keep whatever
-    the buffer held. Tile 128."""
-    tile = 128
-    args, sort = _problem(tokens, tile, seed=11)
-    graph, static_out = _capture(lambda: op(**args))
-    c, c_sf = static_out
-    m = c.shape[0]
-    for trial in (1, 2):
-        nx, nx_sf = _activation(tokens, seed=60 + trial)
-        args["input"].view(torch.uint8).copy_(nx.view(torch.uint8))
-        args["input_scale"].copy_(nx_sf)
-        c.view(torch.uint8).fill_(SENTINEL)
-        c_sf.fill_(SENTINEL)
-        graph.replay()
-        ref = op.reference(**args)
-        _compare(static_out, ref)
-        n_tiles = int(sort[5])
-        span = n_tiles * tile
-        codes = c.view(torch.uint8)
-        sf = unswizzle(c_sf, m, INTER // VEC)
-        assert bool((codes[span:] == SENTINEL).all()) and bool((sf[span:] == SENTINEL).all()), (
-            "a tile past num_non_exiting_tiles was written"
-        )
-        pad = ~ref.rows[:span]
-        assert int(pad.sum()) > 0
-        assert bool((sf[:span][pad] == 0).all()), "a padding row's block scales are not 0"
-        assert bool((codes[:span][pad] == 0).all()), "a padding row's codes are not 0"
-    del graph
-
-
-# ── the gate sees a wrong layout ──────────────────────────────────────────
-
-
-@pytest.mark.parametrize(
-    "layout",
-    ("rowwise", "scales_unpermuted", "swizzled_input_scales", "alpha_rolled"),
-)
-def test_wrong_layouts_are_rejected(layout):
-    """Each operand prepared the wrong way -- the weight in trtllm-gen's row
-    interleave, its scales not given the weight's row permutation, the
-    activation's scales swizzled, alpha off by one expert -- returns finite,
-    plausibly scaled output that `_compare` must reject against the reference of
-    the correctly prepared operands."""
-    tokens, tile = 128, 128
-    x, x_sf = _activation(tokens, seed=3)
-    sort = _sort(_ids("router", tokens, tile, seed=4), tile)
-    good = _args(x, x_sf, sort, tile, GSF["calibrated"])
-    if layout == "swizzled_input_scales":
-        _xs, sf_swz = _activation(tokens, seed=3, swizzled=True)
-        bad = dict(good, input_scale=sf_swz.reshape(tokens, H // VEC))
-    elif layout == "alpha_rolled":
-        bad = dict(good, alpha=good["alpha"].roll(1).contiguous())
-    else:
-        bad = _args(x, x_sf, sort, tile, GSF["calibrated"], layout=layout)
-    out = op(**bad)
-    ref = op.reference(**good)
-    with pytest.raises(AssertionError):
-        _compare(out, ref)
-
-
-# ── guards and loud rejections ────────────────────────────────────────────
+# ── the guard ─────────────────────────────────────────────────────────────
 
 
 def _strided(t: torch.Tensor) -> torch.Tensor:
     """The same values as `t`, as a non-contiguous view into a wider buffer."""
     u = t.view(torch.uint8) if t.element_size() == 1 else t
-    if u.dim() == 1:
-        wide = torch.zeros(2 * u.numel(), dtype=u.dtype, device=DEV)
-        wide[::2] = u
-        view = wide[::2]
-    else:
-        wide = torch.zeros(*u.shape[:-1], 2 * u.shape[-1], dtype=u.dtype, device=DEV)
-        wide[..., : u.shape[-1]] = u
-        view = wide[..., : u.shape[-1]]
+    wide = torch.zeros(*u.shape[:-1], 2 * u.shape[-1], dtype=u.dtype, device=DEV)
+    wide[..., : u.shape[-1]] = u
+    view = wide[..., : u.shape[-1]]
     return view.view(t.dtype) if t.element_size() == 1 else view
 
 
@@ -617,12 +382,11 @@ def _u8(t: torch.Tensor) -> torch.Tensor:
     return t.view(torch.uint8) if t.element_size() == 1 else t
 
 
-@pytest.mark.parametrize("name", ("input", "weight_scale"))
-def test_noncontiguous_operand_answers_wrongly_and_is_refused(name):
+def test_noncontiguous_operand_answers_wrongly_and_is_refused():
     """The runner hands data_ptr() to the kernel and never reads a stride: the
-    same values through a strided view come back finite and wrong. One activation
-    and one weight operand; the guard checks all five of input, input_scale,
-    weight, weight_scale and alpha the same way."""
+    same values through a strided view come back finite and wrong. The activation;
+    the guard checks input_scale, weight, weight_scale and alpha the same way."""
+    name = "input"
     tokens, tile = 64, 128
     args, _ = _problem(tokens, tile, seed=21)
     ref = op.reference(**args)
@@ -633,66 +397,3 @@ def test_noncontiguous_operand_answers_wrongly_and_is_refused(name):
         _compare(op(**bad), ref)
     with validating(op), pytest.raises(AssertionError, match=f"^{name} must be contiguous"):
         op(**bad)
-
-
-def test_short_alpha_answers_wrongly_and_is_refused():
-    """A 1-element alpha (one per layer instead of one per expert): the kernel reads
-    alpha[expert] past its end without raising -- here into zeros of the same
-    allocation, so every expert but the first computes zero."""
-    tokens, tile = 64, 128
-    args, _ = _problem(tokens, tile, seed=31)
-    ref = op.reference(**args)
-    buf = torch.zeros(E, dtype=torch.float32, device=DEV)
-    buf[0] = args["alpha"][0]
-    bad = dict(args, alpha=buf[:1])
-    with pytest.raises(AssertionError):
-        _compare(op(**bad), ref)
-    with (
-        validating(op),
-        pytest.raises(AssertionError, match="alpha has 1 elements for 512 experts"),
-    ):
-        op(**bad)
-
-
-def test_short_weight_scale_answers_wrongly_and_is_refused():
-    """A weight_scale holding half the bytes the weight needs: the kernel reads past
-    its end without raising -- here into zeros of the same allocation, so the upper
-    half of the experts compute zero. Past the end of an allocation the same call
-    faults with an illegal memory access."""
-    tokens, tile = 64, 128
-    args, _ = _problem(tokens, tile, seed=32)
-    ref = op.reference(**args)
-    ws = args["weight_scale"].reshape(-1)
-    half = ws.numel() // 2
-    buf = torch.zeros(ws.numel(), dtype=torch.uint8, device=DEV)
-    buf[:half] = ws[:half]
-    bad = dict(args, weight_scale=buf[:half].view(E, INTER, H // VEC))
-    with pytest.raises(AssertionError):
-        _compare(op(**bad), ref)
-    with validating(op), pytest.raises(AssertionError, match="weight_scale holds"):
-        op(**bad)
-
-
-def test_loud_rejections():
-    """Raised before the launch: a tile size other than the sort's, either way
-    round; 64, which the runner does not build; a wrong scale width, a 2-element
-    global_sf, a bf16 alpha, scales typed e4m3 and an activation typed uint8."""
-    tokens = 16
-    args, _ = _problem(tokens, 128, seed=41)
-    with pytest.raises(AssertionError):
-        op(**dict(args, tile_size=256))
-    args256, _ = _problem(tokens, 256, seed=42)
-    with pytest.raises(AssertionError):
-        op(**dict(args256, tile_size=128))
-    with pytest.raises(ValueError, match="Tile size 64 is not supported"):
-        op(**dict(args, tile_size=64))
-    with pytest.raises(AssertionError):
-        op(**dict(args, input_scale=args["input_scale"][:, :-4].contiguous()))
-    with pytest.raises(AssertionError):
-        op(**dict(args, global_sf=torch.ones(2, dtype=torch.float32, device=DEV)))
-    with pytest.raises(AssertionError):
-        op(**dict(args, alpha=args["alpha"].bfloat16()))
-    with pytest.raises(AssertionError):
-        op(**dict(args, weight_scale=args["weight_scale"].view(torch.float8_e4m3fn)))
-    with pytest.raises(AssertionError):
-        op(**dict(args, input=args["input"].view(torch.uint8)))

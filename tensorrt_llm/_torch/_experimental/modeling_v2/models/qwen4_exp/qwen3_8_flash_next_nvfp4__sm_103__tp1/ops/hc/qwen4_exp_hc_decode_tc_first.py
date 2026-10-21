@@ -564,7 +564,6 @@ class Qwen4ExpHcDecodeTcFirst(OpWrapper):
     # spec: rows, inject (True). The checkpoint's geometry throughout: hc_count 4,
     # rank 320, hidden 2560, the padded [384, K] weight, bf16.
     CELLS: tuple[Cell, ...] = (
-        Cell(why="checkpoint 4x2560, 324 cols of 384, inject, decode 2 rows", spec=dict(rows=2)),
         Cell(
             why="checkpoint 4x2560, 324 cols of 384, inject, decode 128 rows (MAX_ROWS)",
             spec=dict(rows=128),
@@ -573,7 +572,7 @@ class Qwen4ExpHcDecodeTcFirst(OpWrapper):
             why="stack-final mixer: 320 cols, no inject, 128 rows",
             spec=dict(rows=128, inject=False),
         ),
-        Cell(why="zero rows", spec=dict(rows=0)),
+        Cell(why="checkpoint 4x2560, 324 cols of 384, inject, decode 2 rows", spec=dict(rows=2)),
     )
 
     note = """
@@ -604,8 +603,11 @@ class Qwen4ExpHcDecodeTcFirst(OpWrapper):
     against 8.6 us for cuBLAS split-K + reduce + lowrank_act; tile sweep
     BN 32 / 48 / 64 / 112 x KS 8 / 10 / 16, 48 x 16 fastest at every row
     count.
-    Not certified: hc_count other than 4, an unpadded weight (N = R + C), a
-    single row (below the dispatch range; accepted, no cell drives them).
+    Certified: bf16, 324 columns with the injection at 2 and 128 rows, 320
+    columns without it at 128 rows; graph replay.
+    Not certified: hc_count other than 4, an unpadded weight (N = R + C), zero
+    rows, a single row (below the dispatch range; accepted, no cell drives
+    them), other row counts without the injection.
     """
 
     def __call__(

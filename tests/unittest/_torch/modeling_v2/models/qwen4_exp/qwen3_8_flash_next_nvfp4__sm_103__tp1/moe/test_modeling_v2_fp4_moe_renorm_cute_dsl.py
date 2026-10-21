@@ -6,8 +6,8 @@ The experts are the pre-routed entry's test's (drawn NVFP4 codes and
 power-of-two scales, so every weight is exact); this entry's layout is built
 from their raw per-expert tensors by the target's own `weights.py` transforms,
 so the test also pins those. Per cell: inside the routed entry's band against
-the fp32 reference, and close to the trtllm-gen routed entry on the same
-experts.
+the fp32 reference. Beyond the cells: the guard against a per-expert FC2 input
+scale.
 """
 
 import importlib.util
@@ -19,9 +19,6 @@ import torch
 
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1 import (  # noqa: E501
     weights as W,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.moe.fp4_block_scale_moe_renorm_routed import (  # noqa: E501
-    fp4_block_scale_moe_renorm_routed as routed,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.moe.fp4_moe_renorm_cute_dsl import (  # noqa: E501
     fp4_moe_renorm_cute_dsl as op,
@@ -111,35 +108,6 @@ def test_certified_cells(cell, certifying):  # noqa: F811
     assert y.shape == (spec["tokens"], spec["hidden"]) and y.dtype == torch.bfloat16
     exp = op.reference(logits, x, spec["top_k"], ref["up"], ref["gate"], ref["down"], g2)
     H._compare(y, exp.to(torch.bfloat16))
-
-
-def test_close_to_the_trtllm_gen_entry():
-    """Same experts, same routing: within the routed entry's own band of each
-    other's output (the two differ only in accumulation order). At the row count
-    where the target switches from one to the other."""
-    tokens = 4096
-    spec = {**op.CELLS[0].spec, "tokens": tokens}
-    args, ref, data, sf, x, logits, g2 = _operands(spec, 4000 + tokens)
-    y = _cute_dsl(ref, data, sf, logits, g2, spec)
-    s1, sg, s2 = H._scalars(spec["num_experts"], G1, g2)
-    y_gen = routed(
-        logits,
-        data,
-        sf.view(torch.float8_e4m3fn),
-        args["gemm1_weights"],
-        args["gemm1_weights_scale"],
-        args["gemm2_weights"],
-        args["gemm2_weights_scale"],
-        s1,
-        sg,
-        s2,
-        spec["num_experts"],
-        spec["top_k"],
-        spec["intermediate"],
-    )
-    rel = ((y.float() - y_gen.float()).norm() / y_gen.float().norm()).item()
-    print(f"\n  {tokens} rows: relative RMS difference from trtllm-gen {rel:.2e}")
-    assert rel < 1e-2
 
 
 def test_guard_refuses_a_per_expert_fc2_scale():

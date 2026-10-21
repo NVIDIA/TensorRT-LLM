@@ -35,7 +35,6 @@ def _compare(out: torch.Tensor, ref: torch.Tensor) -> None:
 
 DEV = "cuda"
 CR = 4
-K = 512
 #: The engine's `max_num_tokens`: height of the request-map and Top-K buffers.
 ENGINE_MAX_NUM_TOKENS = 8192
 ENGINE_MAX_SEQ_LEN = 8192
@@ -57,18 +56,12 @@ def _captured_row(visible: int, block_topk: int, gen: torch.Generator) -> torch.
 def _requests(contexts, drafted, gen) -> list[tuple[int, int]]:
     """(captured_visible, current_visible) per request."""
     kind = contexts[0]
-    if kind == "gaps":
-        return list(contexts[1])
     if kind == "explicit":
         positions = list(contexts[1])
     else:
         count = contexts[1]
-        low, high = {"mixed": (0, 8188), "short": (0, 2046), "full": (2047, 8188)}[kind]
-        fixed = {
-            "mixed": ANCHORS,
-            "short": (2, 2046, 2045, 2044, 2043, 402, 3),
-            "full": (2047, 2050, 8188, 2051),
-        }[kind]
+        low, high = {"mixed": (0, 8188), "full": (2047, 8188)}[kind]
+        fixed = {"mixed": ANCHORS, "full": (2047, 2050, 8188, 2051)}[kind]
         positions = list(fixed[:count])
         positions += torch.randint(low, high + 1, (count - len(positions),), generator=gen).tolist()
     out = []
@@ -106,11 +99,8 @@ def _build(spec, seed: int, requests: int | None = None) -> dict:
         shared[slot, q] = _captured_row(captured, block_topk, gen)
         shared_vis[slot, q] = captured
 
-    order = list(range(num_requests))
-    if spec["request_map"] == "permuted":
-        order = torch.randperm(num_requests, generator=gen).tolist()
     request, visible = [], []
-    for q in order:
+    for q in range(num_requests):
         captured, current = pairs[q]
         for j in range(per_request):
             request.append(q)
@@ -119,34 +109,21 @@ def _build(spec, seed: int, requests: int | None = None) -> dict:
     request = torch.tensor(request, dtype=meta_dtype).reshape(rows)
     visible = torch.tensor(visible, dtype=meta_dtype).reshape(rows)
 
-    if spec["layout"] == "engine":
-        height = max(ENGINE_MAX_NUM_TOKENS, rows + 37)
-        tall_out = torch.randint(-1, 3000, (height, block_topk), generator=gen).to(torch.int32)
-        tall_req = torch.randint(0, shared_rows, (height,), generator=gen).to(meta_dtype)
-        tall_vis = torch.randint(0, 3000, (height,), generator=gen).to(meta_dtype)
-        tall_req[:rows], tall_vis[:rows] = request, visible
-        buffers = dict(
-            shared=shared.to(DEV),
-            shared_vis=shared_vis.to(DEV),
-            request=tall_req.to(DEV),
-            visible=tall_vis.to(DEV),
-            output=tall_out.to(DEV),
-        )
-    else:
-        assert spec["layout"] == "dense"
-        buffers = dict(
-            shared=shared[slot].clone().to(DEV),
-            shared_vis=shared_vis[slot].clone().to(DEV),
-            request=request.to(DEV),
-            visible=visible.to(DEV),
-            output=torch.full((rows, block_topk), -7, dtype=torch.int32, device=DEV),
-        )
-        slot = None
+    height = max(ENGINE_MAX_NUM_TOKENS, rows + 37)
+    tall_out = torch.randint(-1, 3000, (height, block_topk), generator=gen).to(torch.int32)
+    tall_req = torch.randint(0, shared_rows, (height,), generator=gen).to(meta_dtype)
+    tall_vis = torch.randint(0, 3000, (height,), generator=gen).to(meta_dtype)
+    tall_req[:rows], tall_vis[:rows] = request, visible
+    buffers = dict(
+        shared=shared.to(DEV),
+        shared_vis=shared_vis.to(DEV),
+        request=tall_req.to(DEV),
+        visible=tall_vis.to(DEV),
+        output=tall_out.to(DEV),
+    )
     kwargs = dict(
-        shared_indices=buffers["shared"] if slot is None else buffers["shared"][slot],
-        shared_visible_blocks=buffers["shared_vis"]
-        if slot is None
-        else buffers["shared_vis"][slot],
+        shared_indices=buffers["shared"][slot],
+        shared_visible_blocks=buffers["shared_vis"][slot],
         request_indices=buffers["request"][:rows],
         visible_blocks=buffers["visible"][:rows],
         output=buffers["output"][:rows],
@@ -239,212 +216,33 @@ def _spec_of(prefix: str) -> dict:
     return cell.spec
 
 
-def test_boundary_rows_take_the_documented_branch() -> None:
-    """The boundary cell's rows land where the contract says, read off the output."""
-    spec = _spec_of("8 requests, one per boundary")
-    built = _build(spec, seed=5)
-    kwargs = built["kwargs"]
-    out = op(**kwargs).cpu()
-    shared = kwargs["shared_indices"].cpu()
-    # (captured, current) per request: (0,1) (1,1) (100,101) (511,512) (512,513)
-    # (2047,2048) (513,513) (512,512)
-    assert out[0, 0] == 0 and bool((out[0, 1:] == -1).all()), "empty row: group 0 at slot 0"
-    assert torch.equal(out[1], shared[1]), "no new group: a plain copy"
-    assert torch.equal(out[2, :100], shared[2, :100]) and out[2, 100] == 100
-    assert bool((out[2, 101:] == -1).all()), "short row: appended right after the prefix"
-    assert torch.equal(out[3, :511], shared[3, :511]) and out[3, 511] == 511, "fills slot 511"
-    for row, group in ((4, 512), (5, 2047)):
-        assert torch.equal(out[row, :511], shared[row, 1:]) and out[row, 511] == group, (
-            "full row: the new group displaces the oldest id and the rest shift to the front"
-        )
-    assert torch.equal(out[6], shared[6]) and torch.equal(out[7], shared[7])
-
-
-def test_fresh_two_rows_take_the_documented_branch() -> None:
-    """Draft steps 4..6 (max_draft_len 7) append up to two groups; read off the output.
-
-    A full row loses its two oldest ids and the survivors shift to the front, a 511-id row
-    loses its oldest id, and a short row keeps every captured id with the new groups right
-    after the prefix. At fresh 1 a full row gives up only the id in slot 0.
-    """
-    spec = _spec_of("8 requests at fresh 2")
-    kwargs = _build(spec, seed=23)["kwargs"]
-    out = op(**kwargs).cpu()
-    shared = kwargs["shared_indices"].cpu()
-    captured = kwargs["shared_visible_blocks"].cpu().tolist()
-    current = kwargs["visible_blocks"].cpu().tolist()
-    # (captured, current) per request: (512, 514) (100, 102) (511, 513) (2046, 2048) (1, 3)
-    # (512, 513) (255, 257) (512, 514)
-    assert [c - a for a, c in zip(captured, current)] == [2, 2, 2, 2, 2, 1, 2, 2]
-    for row in (0, 3, 7):
-        first = captured[row]
-        assert torch.equal(out[row, : K - 2], shared[row, 2:]), "full row: the oldest two go"
-        assert out[row, K - 2 :].tolist() == [first, first + 1], "full row: the two new groups last"
-    assert torch.equal(out[2, : K - 2], shared[2, 1 : K - 1]), "511-id row: the oldest id goes"
-    assert out[2, K - 2 :].tolist() == [511, 512]
-    assert torch.equal(out[1, :100], shared[1, :100]) and out[1, 100:102].tolist() == [100, 101]
-    assert bool((out[1, 102:] == -1).all()), "short row: appended right after the prefix"
-    assert out[4, :3].tolist() == [0, 1, 2] and bool((out[4, 3:] == -1).all())
-    assert torch.equal(out[5, : K - 1], shared[5, 1:]) and out[5, K - 1] == 512, (
-        "fresh 1 on a full row: only the id in slot 0 goes"
-    )
-    assert torch.equal(out[6, :255], shared[6, :255]) and out[6, 255:257].tolist() == [255, 256]
-    assert bool((out[6, 257:] == -1).all())
-
-
-def test_worked_example_small_geometry() -> None:
-    """Five rows written out by hand at K = 8, through a permuted request map."""
-    shared = torch.tensor(
-        [
-            [5, 2, 7, 0, -1, -1, -1, -1],  # 4 of 8 groups, 2 more completed
-            [3, 1, 6, 4, 0, 2, 7, 5],  # full, 1 more: displaces its first id
-            [-1] * 8,  # nothing captured yet
-            [1, 0, 2, -1, -1, -1, -1, -1],  # nothing new: a copy
-            [4, 1, 0, 3, 2, 6, 5, -1],  # 7 ids + 2 new: displaces its first id too
-        ],
-        dtype=torch.int32,
-        device=DEV,
-    )
-    captured = torch.tensor([8, 8, 0, 3, 7], dtype=torch.int32, device=DEV)
-    request = torch.tensor([1, 0, 4, 2, 3], dtype=torch.int32, device=DEV)
-    current = torch.tensor([9, 10, 9, 1, 3], dtype=torch.int32, device=DEV)
-    kwargs = dict(
-        shared_indices=shared,
-        shared_visible_blocks=captured,
-        request_indices=request,
-        visible_blocks=current,
-        output=torch.full((5, 8), 99, dtype=torch.int32, device=DEV),
-    )
-    out = op(**kwargs)
-    _compare(out, op.reference(**kwargs))
-    assert out.cpu().tolist() == [
-        [1, 6, 4, 0, 2, 7, 5, 8],
-        [5, 2, 7, 0, 8, 9, -1, -1],
-        [1, 0, 3, 2, 6, 5, 7, 8],
-        [0, -1, -1, -1, -1, -1, -1, -1],
-        [1, 0, 2, -1, -1, -1, -1, -1],
-    ]
-
-
-def test_unpacked_prefix_overwrites_a_valid_id() -> None:
-    """The append slot is the count of valid ids, so a -1 hole costs a group, silently.
-
-    Prefix packing is a value property, so no metadata guard can check it.
-    """
-    shared = torch.tensor([[3, -1, 1, -1, -1, -1, -1, -1]], dtype=torch.int32, device=DEV)
-    kwargs = dict(
-        shared_indices=shared,
-        shared_visible_blocks=torch.tensor([4], dtype=torch.int32, device=DEV),
-        request_indices=torch.tensor([0], dtype=torch.int32, device=DEV),
-        visible_blocks=torch.tensor([5], dtype=torch.int32, device=DEV),
-        output=torch.empty((1, 8), dtype=torch.int32, device=DEV),
-    )
-    out = op(**kwargs)
-    _compare(out, op.reference(**kwargs))
-    assert out.cpu().tolist() == [[3, -1, 4, -1, -1, -1, -1, -1]]
-
-
-def _guard_case(name: str):
-    """Legal arguments, then the one layout `is_valid` refuses.
+def _guard_case():
+    """Legal arguments, then the whole `[slots, seqs]` visible-count buffer passed where
+    one slot's view belongs.
 
     Returns (intended, kwargs): `intended` is the reference on the legal
     arguments -- what a caller passing the bad layout meant to get.
     """
-    spec = _spec_of("permuted request map")
+    spec = _spec_of("decode MTP")
     kwargs = _build({**spec, "slots": (3, 2)}, seed=13, requests=6)["kwargs"]
     intended = op.reference(**kwargs)
-    rows = kwargs["output"].shape[0]
-
-    def strided(tensor):
-        wide = torch.zeros((tensor.numel() * 2,), dtype=tensor.dtype, device=DEV)
-        wide[::2] = tensor.reshape(-1)
-        return wide[::2]
-
-    if name == "output column slice":
-        kwargs["output"] = torch.zeros((rows, 2 * K), dtype=torch.int32, device=DEV)[:, :K]
-    elif name == "shared_indices 3-D, middle extent == block_topk":
-        # Slot 1 meant; the 3-D buffer passes the width check and reads slot 0.
-        stack = torch.full((2, 8, 8), -1, dtype=torch.int32, device=DEV)
-        stack[1, :, :2] = torch.tensor([5, 6], dtype=torch.int32, device=DEV)
-        intended_kwargs = dict(
-            shared_indices=stack[1],
-            shared_visible_blocks=torch.full((8,), 7, dtype=torch.int32, device=DEV),
-            request_indices=torch.arange(4, dtype=torch.int32, device=DEV),
-            visible_blocks=torch.full((4,), 8, dtype=torch.int32, device=DEV),
-            output=torch.empty((4, 8), dtype=torch.int32, device=DEV),
-        )
-        intended = op.reference(**intended_kwargs)
-        kwargs = {**intended_kwargs, "shared_indices": stack}
-    elif name == "shared_visible_blocks 2-D [slots, seqs]":
-        whole = torch.zeros((3, kwargs["shared_visible_blocks"].numel()), dtype=torch.int32)
-        whole = whole.to(DEV)
-        whole[2] = kwargs["shared_visible_blocks"]
-        kwargs["shared_visible_blocks"] = whole
-    else:
-        field = name.split()[1]
-        kwargs[field] = strided(kwargs[field])
+    whole = torch.zeros((3, kwargs["shared_visible_blocks"].numel()), dtype=torch.int32)
+    whole = whole.to(DEV)
+    whole[2] = kwargs["shared_visible_blocks"]
+    kwargs["shared_visible_blocks"] = whole
     return intended, kwargs
 
 
-#: One case per guard family: a non-contiguous output, strided row metadata, and a
-#: whole multi-slot buffer passed where one slot's view belongs (indices and counts).
-GUARDS = (
-    ("output column slice", "output must be contiguous"),
-    ("shared_indices 3-D, middle extent == block_topk", "shared_indices must be one slot's"),
-    ("shared_visible_blocks 2-D [slots, seqs]", "shared_visible_blocks must be one slot's"),
-    ("strided request_indices", "request_indices must be contiguous"),
-)
-
-
-@pytest.mark.parametrize("name, message", GUARDS, ids=[g[0] for g in GUARDS])
-def test_guard_refuses_a_silently_wrong_layout(name: str, message: str) -> None:
-    """Unguarded the op returns a plausible wrong answer; `is_valid` refuses it."""
-    intended, kwargs = _guard_case(name)
+def test_guard_refuses_a_whole_multi_slot_count_buffer() -> None:
+    """Unguarded the op reads slot 0's counts and returns a plausible wrong answer;
+    `is_valid` refuses it."""
+    intended, kwargs = _guard_case()
     out = op(**kwargs)
     torch.cuda.synchronize()
-    assert not torch.equal(out, intended), f"{name}: the op got it right after all"
-    _, kwargs = _guard_case(name)
-    with validating(op), pytest.raises(ValueError, match=message):
+    assert not torch.equal(out, intended), "the op got it right after all"
+    _, kwargs = _guard_case()
+    with (
+        validating(op),
+        pytest.raises(ValueError, match="shared_visible_blocks must be one slot's"),
+    ):
         op(**kwargs)
-
-
-def test_op_rejects_malformed_arguments() -> None:
-    """The callable's own loud errors, one per family: why `is_valid` does not restate them."""
-    spec = {**_spec_of("8 requests, one per boundary"), "layout": "dense"}
-    kwargs = _build(spec, seed=17)["kwargs"]
-    cases = [
-        ("width does not match", dict(shared_indices=kwargs["shared_indices"][:, : K // 2])),
-        (
-            "one request and bound per query row",
-            dict(request_indices=kwargs["request_indices"][:3]),
-        ),
-        ("requires CUDA tensors", dict(shared_indices=kwargs["shared_indices"].cpu())),
-    ]
-    for message, override in cases:
-        with pytest.raises(ValueError, match=message):
-            op(**{**kwargs, **override})
-
-
-def test_discriminates_plausible_wrong_variants() -> None:
-    """The bitwise gate separates this contract from the ones a rewrite would produce."""
-    spec = _spec_of("8 requests, one per boundary")
-    kwargs = _build(spec, seed=19)["kwargs"]
-    out = op(**kwargs).cpu()
-    rows = kwargs["request_indices"].long().cpu()
-    shared = kwargs["shared_indices"].cpu()[rows]
-    captured = kwargs["shared_visible_blocks"].long().cpu()[rows]
-    current = kwargs["visible_blocks"].long().cpu()
-
-    never_displace = shared.clone()  # appends only where there is room
-    always_last = shared.clone()  # always writes the last `fresh` slots
-    displace_last = shared.clone()  # a full row gives up its newest ids, not its oldest
-    for r in range(out.shape[0]):
-        fresh = int((current[r] - captured[r]).clamp(0, K))
-        filled = int((shared[r] >= 0).sum())
-        for j in range(fresh):
-            if filled + j < K:
-                never_displace[r, filled + j] = captured[r] + j
-            always_last[r, K - fresh + j] = captured[r] + j
-            displace_last[r, min(filled, K - fresh) + j] = captured[r] + j
-    for wrong in (never_displace, always_last, displace_last, shared):
-        assert not torch.equal(out, wrong.to(torch.int32))

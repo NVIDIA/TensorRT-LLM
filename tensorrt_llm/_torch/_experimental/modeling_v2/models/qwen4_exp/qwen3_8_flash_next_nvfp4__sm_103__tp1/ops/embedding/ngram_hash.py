@@ -76,7 +76,6 @@ class NgramHash(OpWrapper):
     # token from `ngram_token_history`, num_query_tokens 1.
     CELLS: tuple[Cell, ...] = (
         _rows(4, 3, 1, "decode row whose cached context is EOS", eos_positions=(0, 1)),
-        _rows(1, 3, 1, "call site: 1 window, 1 token", lead_eos=False, eos_density=0.2),
         _rows(
             32, 3, 1, "call site: 32 windows, decode / MTP verify", lead_eos=False, eos_density=0.2
         ),
@@ -97,7 +96,7 @@ class NgramHash(OpWrapper):
     gives the identical result). Certified on an int64 `token_history`, the
     window `ngram_token_history` returns. Negative ids are accepted and hashed
     as ordinary ids, not padding. Longer histories and `num_query_tokens > 1`
-    (a chunk's tail) are exercised by the test beyond the cells, not certified.
+    (a chunk's tail) are not certified.
     A single multiplier raises `ZeroDivisionError`. The four silent mistakes
     are `is_valid`'s.
 

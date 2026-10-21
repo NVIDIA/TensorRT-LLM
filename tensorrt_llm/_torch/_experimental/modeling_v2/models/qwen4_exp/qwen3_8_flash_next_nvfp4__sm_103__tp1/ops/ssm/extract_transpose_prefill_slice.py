@@ -38,27 +38,17 @@ class ExtractTransposePrefillSlice(OpWrapper):
 
     ARCHS = frozenset({Arch.SM_103})
 
-    # `num_rows`/`num_cols` build `src`; `row_stop`/`col_slice` turn it into the
-    # view the call site passes (a row slice of a split token buffer, or a
-    # column slice of a wider projection).
+    # `num_rows`/`num_cols` build the [T, 16480] projection; `row_stop` and
+    # `col_slice` turn it into the view the call site passes (its q|k|v
+    # columns, and in a mixed step the prefill rows of those).
     CELLS: tuple[Cell, ...] = (
         Cell(
-            why="GDN prefill, whole 10240-wide row, 1 token",
-            spec=dict(
-                num_rows=1,
-                num_cols=GDN_MIXED_QKV_WIDTH,
-                n=1,
-                start_col=0,
-                width=GDN_MIXED_QKV_WIDTH,
-                dtype=torch.bfloat16,
-            ),
-        ),
-        Cell(
-            why="mixed batch: prefill half of a split [512, 10240] buffer, a row-slice view",
+            why="mixed batch: prefill rows of the q|k|v view of a [512, 16480] in_proj",
             spec=dict(
                 num_rows=512,
-                num_cols=GDN_MIXED_QKV_WIDTH,
+                num_cols=GDN_IN_PROJ_WIDTH,
                 row_stop=400,
+                col_slice=(0, GDN_MIXED_QKV_WIDTH),
                 n=400,
                 start_col=0,
                 width=GDN_MIXED_QKV_WIDTH,
@@ -84,6 +74,10 @@ class ExtractTransposePrefillSlice(OpWrapper):
 
     note = """
     Metadata consumed: none. Stateless.
+
+    Certified bitwise in bf16 at the call site's operand, the q|k|v column
+    view of the `[T, 16480]` input projection: 33 and 8192 tokens, and a mixed
+    step's 400 prefill rows of a 512-row projection.
 
     Preconditions: `src` 2-D on CUDA with `src.stride(1) == 1`; the row stride
     is free. A non-unit column stride (`src.t()`, `src[:, ::2]`) is refused

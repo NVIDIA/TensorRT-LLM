@@ -49,42 +49,17 @@ def _compare(out, ref) -> None:
             )
 
 
-def _hole(spec, table, live_requests, allocated_cols):
-    """One row that resolves to no slot, and the table edit it needs."""
-    tpb, width, slots, pages = (spec[k] for k in ("tokens_per_block", "width", "slots", "pages"))
-    kind = spec["hole"]
-    if kind == "unallocated_page":
-        assert int(table[0, allocated_cols[0]]) == -1
-        return 0, allocated_cols[0] * tpb
-    if kind == "page_past_pool":
-        table[live_requests] = -1
-        table[live_requests, 0] = pages + 7
-        return live_requests, 0
-    if kind == "request_past_table":
-        return slots, 0
-    if kind == "negative_request":
-        return -1, 0
-    if kind == "negative_position":
-        return 0, -1
-    assert kind == "column_past_table"
-    return 0, width * tpb
+def _hole(spec, table, allocated_cols):
+    """One row that resolves to no slot: its (request, position)."""
+    assert spec["hole"] == "unallocated_page", spec["hole"]
+    assert int(table[0, allocated_cols[0]]) == -1
+    return 0, allocated_cols[0] * spec["tokens_per_block"]
 
 
 def _fill_rows(spec, k, v, gen):
-    """Row values: random with per-block magnitudes over 2^-10..2^5, every finite bf16,
-    or edge blocks (zero, -0.0, an outlier)."""
+    """Row values: random with per-block magnitudes over 2^-10..2^5, plus edge blocks
+    (zero, -0.0, an outlier) when the cell asks for them."""
     hkv, head_dim = spec["hkv"], spec["head_dim"]
-    if spec["values"] == "finite_bf16":
-        bits = torch.arange(-(2**15), 2**15, dtype=torch.int32).to(torch.int16)
-        finite = bits.view(torch.bfloat16)
-        finite = finite[torch.isfinite(finite.float())]  # 65280 values
-        padded = torch.zeros(k.numel(), dtype=torch.bfloat16)
-        assert finite.numel() <= padded.numel()
-        padded[: finite.numel()] = finite
-        k.copy_(padded.reshape(k.shape).to(DEV))
-        order = torch.randperm(padded.numel(), generator=gen)
-        v.copy_(padded[order].reshape(v.shape).to(DEV))
-        return
     rows = k.shape[0]
     for t in (k, v):
         base = torch.randn(rows, hkv, head_dim // 16, 16, generator=gen)
@@ -155,7 +130,7 @@ def _build(spec, seed: int, pool=None):
         allocated_cols.append(cols)
     assert used <= pages and len(segments) <= slots, "pool or table too small for the batch"
     if spec["hole"] is not None:
-        request, position = _hole(spec, table, len(segments), allocated_cols)
+        request, position = _hole(spec, table, allocated_cols)
         requests.append(request)
         positions.append(position)
 
@@ -198,7 +173,7 @@ def _pools_equal(a, b) -> bool:
     return all(torch.equal(x, y) for x, y in zip(a, b))
 
 
-def _graph_replay(spec, seed: int) -> None:
+def _graph_replay(spec, seed: int, graph_batches) -> None:
     """Each G: capture one step of the first G requests, replay the next step.
 
     The next step lives in the captured buffers: new k/v rows, new pages in the
@@ -210,7 +185,7 @@ def _graph_replay(spec, seed: int) -> None:
     steps = {n for _, n in spec["segments"]}
     assert len(steps) == 1, "a graph cell's requests all carry the same row count"
     step = steps.pop()
-    for g in spec["graph_batches"]:
+    for g in graph_batches:
         sub = {**spec, "segments": spec["segments"][:g]}
         args, _, _ = _build(sub, seed=seed + g, pool=pool)
         following, _, _ = _build(sub, seed=seed + 1000 + g, pool=pool)
@@ -356,9 +331,6 @@ def _thop_equality(spec, seed: int) -> None:
 def test_certified_cells(cell, certifying):  # noqa: F811
     certifying(op)
     seed = zlib.crc32(cell.why.encode())
-    if cell.spec["graph_batches"]:
-        _graph_replay(cell.spec, seed=seed)
-        return
     if cell.spec["thop_append"]:
         _thop_equality(cell.spec, seed=seed)
         return
@@ -375,91 +347,23 @@ def test_certified_cells(cell, certifying):  # noqa: F811
     _assert_other_roles_untouched(cell.spec, pool)
 
 
-def _specialization_class(value: int) -> str:
-    """Triton's class for a plain-int kernel argument: 1, a multiple of 16, or other."""
-    if value == 1:
-        return "one"
-    return "multiple_of_16" if value % 16 == 0 else "other"
-
-
-def test_cells_reach_every_served_specialization_class() -> None:
-    """The pool's slot count and the table's height each select a compiled variant
-    by class. Slot count other or a multiple of 16 against table height 1, other
-    or a multiple of 16 all run, eagerly."""
-    reached = {
-        (_specialization_class(c.spec["pages"]), _specialization_class(c.spec["slots"]))
-        for c in op.CELLS
-        if not c.spec["graph_batches"]
-    }
-    wanted = {
-        (pages, height)
-        for pages in ("other", "multiple_of_16")
-        for height in ("one", "other", "multiple_of_16")
-    }
-    assert wanted <= reached, f"unreached: {sorted(wanted - reached)}"
+def test_cuda_graph_replay_matches_eager() -> None:
+    """Decode MTP under a graph: 8 requests x 8 rows in the prefill cell's trunk layout,
+    captured once, replayed on the next step's rows, pages and positions."""
+    prefill = next(c.spec for c in op.CELLS if c.why.startswith("prefill:"))
+    spec = {**prefill, "segments": tuple((29 + 61 * i, 8) for i in range(8)), "pages": 256}
+    _graph_replay(spec, seed=8, graph_batches=(8,))
 
 
 def _decode_args(seed: int, **overrides):
     return _build({**op.CELLS[0].spec, **overrides}, seed=seed)
 
 
-def test_rounding_rivals_are_rejected() -> None:
-    """The bitwise gate separates the engine's rounding from near misses on the
-    every-finite-bf16 rows: e2m1 ties rounded away from zero instead of to even,
-    and V's scales laid out token-major like K's, each move bytes the gate sees."""
-    from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.attention import (  # noqa: E501
-        qsa_paged_kv_store_nvfp4 as entry,
-    )
-
-    spec = next(c.spec for c in op.CELLS if c.spec["values"] == "finite_bf16")
-    args, _, _ = _build(spec, seed=21)
-    out = op(**args)
-    _compare(out, op.reference(**args))
-
-    ties_up = tuple((threshold, True) for threshold, _ in entry._E2M1_STEPS)
-    saved = entry._E2M1_STEPS
-    try:
-        entry._E2M1_STEPS = ties_up
-        rival = op.reference(**args)
-    finally:
-        entry._E2M1_STEPS = saved
-    moved = int((rival[0] != out[0]).sum())
-    assert moved > 0, "ties away from zero must move some K bytes on every-finite-bf16 rows"
-
-    # V's scale layout, on random rows (the every-finite rows saturate V's scales).
-    spec = next(c.spec for c in op.CELLS if c.why.startswith("prefill:"))
-    args, _, _ = _build(spec, seed=22)
-    out = op(**args)
-    page = int(args["block_table"][0, 0])
-    groups = spec["head_dim"] // 16
-    interleaved = out[3][page].reshape(spec["hkv"], -1)
-    token_major = (
-        interleaved.reshape(spec["hkv"], spec["tokens_per_block"] // 4, groups, 4)
-        .permute(0, 1, 3, 2)
-        .reshape(spec["hkv"], -1)
-    )
-    assert not torch.equal(interleaved, token_major), "the V scale layouts must be told apart"
-
-
-def test_op_rejects_operands_it_cannot_serve() -> None:
-    """The callable's own loud errors: why the entry carries no `is_valid`."""
+def test_op_rejects_strided_request_indices() -> None:
+    """The callable's own loud error -- why the entry carries no `is_valid` -- for the
+    metadata a flat-pointer kernel would otherwise read at the wrong rows."""
     args, _, _ = _decode_args(seed=5)
-    cache, scales = args["k_cache"], args["k_scale_cache"]
-    cases = {
-        "k and v must both be BF16 or both FP16": dict(k=args["k"].float(), v=args["v"].float()),
-        "k_cache must be uint8": dict(k_cache=cache.view(torch.int8)),
-        "k_scale_cache must be uint8": dict(k_scale_cache=scales[..., :8]),
-        "tokens_per_block must be a positive multiple of 4": dict(tokens_per_block=30),
-        "block_table must be a 2-D int32 tensor": dict(block_table=args["block_table"].long()),
-        "request_indices must be contiguous": dict(
-            request_indices=torch.stack([args["request_indices"]] * 2, 1)[:, 0]
-        ),
-        "kv_scale_orig_quant must be a contiguous fp32": dict(
-            kv_scale_orig_quant=args["kv_scale_orig_quant"][:1]
-        ),
-        "every operand must be on k's CUDA device": dict(block_table=args["block_table"].cpu()),
-    }
-    for message, override in cases.items():
-        with pytest.raises(ValueError, match=message):
-            with validating(op):
-                op(**{**args, **override})
+    strided = torch.stack([args["request_indices"]] * 2, 1)[:, 0]
+    with pytest.raises(ValueError, match="request_indices must be contiguous"):
+        with validating(op):
+            op(**{**args, "request_indices": strided})

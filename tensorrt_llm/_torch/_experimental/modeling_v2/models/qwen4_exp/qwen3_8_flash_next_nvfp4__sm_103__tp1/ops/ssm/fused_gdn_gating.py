@@ -52,26 +52,17 @@ class FusedGdnGating(OpWrapper):
     ARCHS = frozenset({Arch.SM_103})
 
     # spec: rows; layout "contiguous" | "target_rows" (the decode rows of a
-    # contiguous [T, 48] `a` projection, past T - rows prefill rows); a_dtype,
-    # a_scale, fill (constant a).
-    CELLS: tuple[Cell, ...] = tuple(
-        Cell(
-            why=f"target verify call: {b} seqs x {p} tokens, contiguous a",
-            spec=dict(rows=b * p),
-        )
-        for b, p in ((1, 2), (8, 4), (32, 2))
-    ) + (
+    # contiguous [T, 48] `a` projection, past T - rows prefill rows); fill
+    # (constant a). `a` bf16, softplus beta 1.0, threshold 20 throughout.
+    CELLS: tuple[Cell, ...] = (
+        Cell(why="target verify call: 32 seqs x 2 tokens, contiguous a", spec=dict(rows=64)),
         Cell(
             why="target mixed verify: decode rows of a [T, 48] projection",
             spec=dict(rows=16, layout="target_rows"),
         ),
         Cell(
-            why="softplus beta 1.0, threshold 20",
-            spec=dict(rows=96, beta=1.0, threshold=20.0, a_scale=4.0),
-        ),
-        Cell(
             why="a = 200: linear branch; exp(x) is evaluated, inf never leaks",
-            spec=dict(rows=4, fill=200.0, a_dtype=torch.float32),
+            spec=dict(rows=4, fill=200.0),
         ),
     )
 
@@ -81,7 +72,10 @@ class FusedGdnGating(OpWrapper):
     Call site (`_gdn_verify`): `(A_log, a_d, dt_bias, 1.0, 20.0)` with `a_d`
     the `[n * p, 48]` bf16 decode rows of the `a` projection (all of it on a
     pure verify step) and fp32 `A_log` / `dt_bias`; `g` is then reshaped to
-    `[n, p, 48]` for `fused_recurrent_gated_delta_rule_update`.
+    `[n, p, 48]` for `fused_recurrent_gated_delta_rule_update`. Certified at
+    that call: 32 sequences of 2 tokens, the 16 decode rows of a mixed step's
+    `[T, 48]` projection, and `a = 200` (the softplus's linear branch, where
+    `exp` overflows).
 
     Raise loudly, so not guarded: a non-2-D `a` (`ValueError` unpacking
     `a.shape`), CPU tensors (`ValueError: Pointer argument cannot be accessed

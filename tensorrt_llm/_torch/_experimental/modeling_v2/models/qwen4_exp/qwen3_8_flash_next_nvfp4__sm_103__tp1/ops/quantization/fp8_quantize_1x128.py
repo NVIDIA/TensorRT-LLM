@@ -72,16 +72,8 @@ class Fp8Quantize1x128(OpWrapper):
     CELLS: tuple[Cell, ...] = (
         Cell(why="MTPLayer._moe decode: one token at hidden 2560", spec=dict(tokens=1, **_CKPT)),
         Cell(
-            why="5 tokens: the first count spilling into a second 4-row pad unit",
-            spec=dict(tokens=5, **_CKPT),
-        ),
-        Cell(
             why="20 tokens == H/128: the scale buffer is square, its transpose undetectable",
             spec=dict(tokens=20, **_CKPT),
-        ),
-        Cell(
-            why="8192 tokens: max_num_tokens of the identity config",
-            spec=dict(tokens=8192, **_CKPT),
         ),
         Cell(
             why="16384 rows: max_num_tokens of the tuned config",
@@ -95,27 +87,26 @@ class Fp8Quantize1x128(OpWrapper):
     sm_100 family the op returns a 1-D padded buffer instead. That branch was
     read, not run.
 
-    Preconditions, all enforced loudly by the op: `input` bf16 (fp16, fp32 and
-    fp8 raise), 2-D (flatten `[B, S, H]` yourself), contiguous, CUDA, and
-    `H % 16 == 0` -- the width, not the block count, so H need not be a
-    multiple of 128. `T == 0` is accepted and returns `[0, H]` / `[NB, 0]`.
-    A consumer needing `H % 128 == 0` (the block-scale MoE runner) owns that
-    constraint.
+    Preconditions, enforced loudly by the op: `input` bf16, 2-D (flatten
+    `[B, S, H]` yourself), contiguous (the test holds the column-slice
+    rejection), CUDA, and `H % 16 == 0` -- the width, not the block count, so
+    H need not be a multiple of 128. A consumer needing `H % 128 == 0` (the
+    block-scale MoE runner) owns that constraint.
 
-    Edge behaviour, measured: an all-zero block takes scale
-    `bf16(1e-10) / 448` and all-zero codes; `inf` poisons its whole block
-    (scale inf, its own code NaN, every other code 0); NaN stays in its own
-    element (the running max ignores it); the block max maps to exactly +-448
-    and nothing overflows. `data` is a leading-row view of an allocation padded
-    to a multiple of 4 rows -- the padded rows are uninitialized, so a
-    raw-pointer reader must stop at `T`. CUDA-graph capturable; stream-
-    independent; the registered fake matches eager shapes.
+    `data` is a leading-row view of an allocation padded to a multiple of 4
+    rows -- the padded rows are uninitialized, so a raw-pointer reader must
+    stop at `T`. CUDA-graph capture and replay are certified.
 
     Hard limits
-      T   certified 0..16384 at H 2560 (max_num_tokens of the tuned config);
-          above that not probed
+      T   certified at 1, 20 and 16384 at H 2560 (16384: max_num_tokens of the
+          tuned config); above that not probed
       H   multiple of 16 (raises otherwise); certified at 2560, the draft layer's
-          width (the test also drives a 16-wide tail block)
+          width
+
+    Not certified: `T == 0` (the op accepts it and returns `[0, H]` /
+    `[NB, 0]`); a short tail block (`H % 128 != 0`); all-zero blocks (the
+    `AMAX_FLOOR` scale), `inf` / NaN inputs and saturation; `use_ue8m0=True`;
+    the registered fake.
     """
 
     def __call__(

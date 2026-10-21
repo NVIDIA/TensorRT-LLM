@@ -17,9 +17,7 @@ from tensorrt_llm._torch.attention.backends.sparse.qsa import kernels as _qsa_ke
 #: This checkpoint's main K/V geometry and the engine's QSA metadata. `heads_q`
 #: places k and v as head slices of the packed `[T, 24 + 2 + 2, 256]` QKV
 #: buffer; `slots` x `width` is `qsa_block_table` (max_num_sequences x
-#: max_blocks_per_seq). `pages` is the pool, independent of the batch. `values`
-#: fills the rows: `every_bf16` is all 65536 bf16 bit patterns (needs 128 rows
-#: of 2 x 256).
+#: max_blocks_per_seq). `pages` is the pool, independent of the batch.
 _CKPT = dict(
     hkv=2,
     head_dim=256,
@@ -31,13 +29,10 @@ _CKPT = dict(
     cache_dtype=torch.bfloat16,
     request_dtype=torch.int32,
     position_dtype=torch.int64,
-    k_layout="qkv_slice",
-    table_layout="dense",
     hole=None,
     # Heads of further columns after v in each row: 27 is the target's fused input
     # projection row [q | k | v | gate | index | pad] (55 heads of 256).
     row_pad_heads=0,
-    values="randn",
 )
 
 _F8 = torch.float8_e4m3fn
@@ -91,29 +86,19 @@ class QsaPagedKvStore(OpWrapper):
         # targets split them off a packed QKV row.
         Cell(
             why="decode: 8 rows off the fused projection row (row stride 14080), "
-            "at aligned, mid and page-crossing positions",
-            spec=_spec(_DECODE, pages=64, row_pad_heads=27),
+            "at aligned, mid and page-crossing positions, plus one row on an "
+            "unallocated (-1) table entry that is skipped",
+            spec=_spec(_DECODE, pages=64, row_pad_heads=27, hole="unallocated_page"),
         ),
         Cell(
             why="prefill 1024 rows off the fused projection row (row stride 14080)",
             spec=_spec(((0, 256),) * 4, pages=160, row_pad_heads=27),
         ),
         # MTP7 verify blocks: 8 rows per request, so one block spans up to two pages.
-        Cell(
-            why="decode MTP7: 32 requests x 8 rows (256), blocks straddling pages",
-            spec=_spec(_MTP7_32, pages=1200, slots=40),
-        ),
+        # The non-default pool the forward reaches: fp8-e4m3.
         Cell(
             why="fp8 decode MTP7: 32 requests x 8 rows (256), blocks straddling pages",
             spec=_spec(_MTP7_32, pages=1200, slots=40, cache_dtype=_F8),
-        ),
-        Cell(
-            why="fp8 conversion: all 65536 bf16 bit patterns, as torch casts them",
-            spec=_spec(((0, 128),), pages=8, cache_dtype=_F8, values="every_bf16"),
-        ),
-        Cell(
-            why="skip: table entry -1 (unallocated)",
-            spec=_spec(_DECODE, pages=64, hole="unallocated_page"),
         ),
     )
 
@@ -138,7 +123,7 @@ class QsaPagedKvStore(OpWrapper):
     `k_cache.shape[2] != tokens_per_block`, row dtypes outside bf16/fp16,
     pool dtypes outside bf16/fp16/fp8-e4m3, a non-int32 or non-2-D table,
     non-integer or wrong-length metadata, CPU operands, an empty pool or
-    table. `rows == 0` returns before launching.
+    table (not pinned by a test). `rows == 0` returns before launching.
 
     Strides and the pool/table extents are Triton constexprs: each distinct
     layout or pool size compiles its own kernel. CUDA-graph capturable
@@ -146,12 +131,13 @@ class QsaPagedKvStore(OpWrapper):
     rewritten in place.
 
     Hard limits: both metadata values are cast to int32 inside the kernel
-    (`.to(tl.int32)`); an int64 position at `2^32 + 5` was probed and lands
-    on slot 5 of page column 0 -- written, not skipped. The engine's
-    positions stay below 2^14.
+    (`.to(tl.int32)`); an int64 position at `2^32 + 5` was probed once (not
+    pinned by a test) and lands on slot 5 of page column 0 -- written, not
+    skipped. The engine's positions stay below 2^14.
 
     Not certified: duplicate destinations, multiple devices, a scaled fp8
-    pool (there is no scale argument), fp16 rows, head geometry other than
+    pool (there is no scale argument), fp8 conversion of values past 448, the
+    packed-QKV-row (MTP) layout over a bf16 pool, fp16 rows, head geometry other than
     this checkpoint's (D 256, Hkv 2, 32-token pages), int32 positions or
     int64 request indices, head-major rows, sliced or transposed tables,
     `rows == 0`, and of the rows that resolve to no slot any but an

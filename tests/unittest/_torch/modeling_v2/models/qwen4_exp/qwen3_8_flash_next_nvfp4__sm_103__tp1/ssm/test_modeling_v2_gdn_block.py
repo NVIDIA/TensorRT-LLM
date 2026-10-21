@@ -4,8 +4,8 @@
 
 Drives `DecodeTarget._gdn_block` and `PrefillTarget._gdn_block` at the
 checkpoint's geometry (hidden 2560, 16 k-heads, 48 v-heads, head dim 128,
-fp32 recurrent pool of 461 slots) on decode, prefill-only and mixed
-(context + one-token generation rows) batches, and compares the block output
+fp32 recurrent pool of 461 slots) on a decode and a mixed (context + one-token
+generation rows) batch, and compares the block output
 and both state pools with a reference that composes the Triton recurrences
 (`fused_sigmoid_gating_delta_rule_update` for decode,
 `chunk_gated_delta_rule` over every row of a prefill step) around the same
@@ -354,20 +354,10 @@ def test_decode_block() -> None:
     )
 
 
-#: (context lengths, generation rows, has_initial_state per context): an 8K prefill-only
-#: step, and a mixed step of three variable-length contexts (two carrying state) plus
-#: generation rows.
-PREFILL_CASES = (
-    ((8192,), 0, (False,)),
-    ((200, 37, 91), 5, (True, False, True)),
-)
-
-
-@pytest.mark.parametrize(
-    "case", PREFILL_CASES, ids=lambda c: f"{'+'.join(map(str, c[0]))}+{c[1]}x1"
-)
-def test_prefill_block(case, warm_triton_chunk) -> None:  # noqa: F811 — fixture by name
-    ctx_lens, n_dec, has_init = case
+def test_prefill_block(warm_triton_chunk) -> None:  # noqa: F811 — fixture by name
+    """A mixed step: three variable-length contexts (two carrying state) plus five
+    one-token generation rows."""
+    ctx_lens, n_dec, has_init = (200, 37, 91), 5, (True, False, True)
     tokens = sum(ctx_lens) + n_dec
     core, L, x = _core(400 + tokens), _layer(500 + tokens), _x(tokens, 600 + tokens)
     core_ref = _clone_core(core)

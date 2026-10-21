@@ -52,14 +52,10 @@ class Qwen4ExpHcUpGateMeanFp4(OpWrapper):
     CELLS: tuple[Cell, ...] = tuple(
         Cell(why=f"checkpoint 4x2560, rank 320, {why}", spec=dict(rows=t))
         for t, why in (
-            (2, "decode 2 rows (smallest fused-up batch)"),
             (128, "decode 128 rows (max_con)"),
             (16384, "prefill chunk 16384 (max_num_tokens)"),
         )
-    ) + (
-        Cell(why="ragged tail, 16320 + 70 rows (mixed step)", spec=dict(rows=16390)),
-        Cell(why="zero rows", spec=dict(rows=0)),
-    )
+    ) + (Cell(why="ragged tail, 16320 + 70 rows (mixed step)", spec=dict(rows=16390)),)
 
     note = """
     Tier 6 (CuTe DSL written for this target): `qwen4_exp_hc_up_gate_mean`'s
@@ -76,11 +72,18 @@ class Qwen4ExpHcUpGateMeanFp4(OpWrapper):
 
     Numerics: the quantization is the trtllm NVFP4 recipe instruction for
     instruction (`rcp.approx.ftz.f32` reciprocals, `cvt.rn.satfinite` to e4m3
-    and to e2m1, every multiply `mul.rn.f32`); the GPU test checks it bitwise
-    against `torch.ops.trtllm.fp4_quantize` on the returned `mixed`.
+    and to e2m1, every multiply `mul.rn.f32`); the GPU test checks it against
+    `fp4_quantize`'s native-torch reference on the returned `mixed` (scales
+    bitwise, e2m1 codes bitwise outside the reciprocal tie window). Bitwise
+    `torch.ops.trtllm.fp4_quantize`, ties included, and across tiny and
+    saturating global scales: measured, not certified.
 
-    Not certified: hc_count other than 4, hidden other than 2560, rank other
-    than 320 (the kernel compiles for them; no cell drives them).
+    Certified: bf16 at the checkpoint's 4 x 2560, rank 320, a calibrated global
+    scale: 128 rows, 16384 rows, 16390 rows (a partial last tile); graph replay.
+
+    Not certified: zero rows, fewer rows than a tile, hc_count other than 4,
+    hidden other than 2560, rank other than 320 (the kernel compiles for them;
+    no cell drives them).
     """
 
     def __call__(

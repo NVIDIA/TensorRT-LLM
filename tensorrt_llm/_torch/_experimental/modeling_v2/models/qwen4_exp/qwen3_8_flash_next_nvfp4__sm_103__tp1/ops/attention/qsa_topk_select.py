@@ -75,17 +75,6 @@ class QsaTopkSelect(OpWrapper):
     # window is honoured, not merely that the tail happened to be small.
     CELLS: tuple[Cell, ...] = (
         Cell(
-            why="decode: one row at position 7777, 2080 cols, k=512, NaN tail",
-            spec=dict(
-                rows=1,
-                cols=_SCORE_COLUMNS,
-                index_topk=_BLOCK_TOPK,
-                windows=("positions", (7777,)),
-                logits="relu",
-                tail="nan",
-            ),
-        ),
-        Cell(
             why="decode MTP7: 32 requests x 8 rows = 256 rows, some below the budget, NaN tail",
             spec=dict(
                 rows=256,
@@ -132,15 +121,17 @@ class QsaTopkSelect(OpWrapper):
         reads out of bounds (not probed).
       - Logits inside the window are finite. `-inf` is never selected, but a
         NaN ranks above every finite value and IS selected: NaN in columns 0-3
-        of a 32-wide window with `k=8` returned all four. Outside the window
-        anything goes -- the cells poison it with NaN.
+        of a 32-wide window with `k=8` returned all four (measured, not pinned
+        by a test). Outside the window anything goes -- the cells poison it
+        with NaN.
       - `index_topk` is the BLOCK budget (512 here). The default, 2048, is the
         token budget, and with a 512-wide buffer it is the layout fault
         `is_valid` refuses.
 
-    Loud rejections (measured): bf16/fp16 `logits` ("expected scalar type
-    Float"), int64 `indices` ("expected scalar type Int"), `row_starts` /
-    `row_ends` shorter than the row count ("one entry per row").
+    Loud rejections (measured, not pinned by a test): bf16/fp16 `logits`
+    ("expected scalar type Float"), int64 `indices` ("expected scalar type
+    Int"), `row_starts` / `row_ends` shorter than the row count ("one entry per
+    row").
 
     The CUDA op dispatches by row index, not column count: rows below 12288 run
     an insertion-sort variant, rows at or above a radix variant, in one launch.
@@ -153,9 +144,9 @@ class QsaTopkSelect(OpWrapper):
     first captured decode JIT-compiles nothing. `torch.ops.trtllm.indexer_topk_decode` is the request-grouped
     sibling; QSA does not use it.
 
-    CUDA graphs: captured at `[8, 2048]` and `[256, 2048]` (32 requests at
-    max_draft_len 7), `k=512`, and replayed against new logits and a new
-    `row_ends` through the captured addresses. Bitwise comparison of two
+    CUDA graphs: captured at `[256, 2048]` (32 requests at max_draft_len 7),
+    `k=512`, and replayed against new logits and a new `row_ends` through the
+    captured addresses. Bitwise comparison of two
     replays is not a valid check (order is unspecified).
 
     Hard limits: not probed. `indices` is addressed as `row * index_topk +

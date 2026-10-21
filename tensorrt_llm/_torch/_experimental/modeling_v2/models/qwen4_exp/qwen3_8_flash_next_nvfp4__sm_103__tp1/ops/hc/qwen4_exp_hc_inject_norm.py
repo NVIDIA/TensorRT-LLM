@@ -783,30 +783,26 @@ class Qwen4ExpHcInjectNorm(OpWrapper):
     # spec: rows, inject (True), moe (False: shared + gate_logits [T, 1] too), fold
     # (0: top-k of the finalize folded in), drop (False: some slots -1). The
     # checkpoint's geometry throughout: hc_count 4, hidden 2560, bf16, contiguous rows.
+    # Four cells: the forward reaches four distinct launches -- the Triton kernel's
+    # eight-warp form (decode), its two-warp form (prefill, here with the combine),
+    # the CuTe fold kernel (decode MoE sites; the -1 slots ride it) and the norm-only
+    # variant -- none of which another covers.
     CELLS: tuple[Cell, ...] = (
         Cell(
             why="checkpoint 4x2560 bf16, inject, decode batch 128 (eight-warp form)",
             spec=dict(rows=128),
         ),
         Cell(
-            why="checkpoint 4x2560 bf16, inject, prefill chunk 8192 (two-warp form)",
-            spec=dict(rows=8192),
-        ),
-        Cell(
-            why="norm only (no inject: stack start / after PLE), decode 128",
-            spec=dict(rows=128, inject=False),
-        ),
-        Cell(
             why="MoE combine, [T, 1] gate, prefill chunk 16384 (the ladder's max_num_tokens)",
             spec=dict(rows=16384, moe=True),
         ),
         Cell(
-            why="MoE combine + finalize fold (top-10, CuTe kernel), decode batch 128",
-            spec=dict(rows=128, moe=True, fold=10),
+            why="MoE combine + finalize fold (top-10, CuTe kernel), three slots -1, decode 128",
+            spec=dict(rows=128, moe=True, fold=10, drop=True),
         ),
         Cell(
-            why="MoE combine + finalize fold, three slots mapped to -1, 8 rows",
-            spec=dict(rows=8, moe=True, fold=10, drop=True),
+            why="norm only (no inject: stack start / after PLE), decode 128",
+            spec=dict(rows=128, inject=False),
         ),
     )
 
@@ -837,7 +833,8 @@ class Qwen4ExpHcInjectNorm(OpWrapper):
     `rsqrt`, one rounding. Against the float64 reference the combine can land
     one ulp of the block output away (its rounding midpoint), which the
     accumulate carries scaled by `inject`; the test's band states that.
-    Graph-capturable: no host sync, outputs allocated per call.
+    Graph-capturable by construction (no host sync, outputs allocated per
+    call); not certified.
 
     Launch: one program per (row, stream), stream-minor in a 1-D grid, so a
     row's `block_out` / `shared` are read from HBM once and from L2 by the
@@ -857,13 +854,21 @@ class Qwen4ExpHcInjectNorm(OpWrapper):
     a row's two CTAs one cluster, CTA j forming half the block output (the
     finalize and the combine) into both CTAs' shared memory, then each
     accumulating and normalizing two streams, in the Triton kernel's layout and
-    reduction tree -- bitwise its `hc_out` and `normed`. GB300, graph replay,
+    reduction tree -- bitwise its `hc_out` and `normed` (tested at 511 rows, the
+    last before the switch). GB300, graph replay,
     16 rotating sites, us: 128 rows 7.00 -> 5.97, 64 rows 6.63 -> 5.25, 8 rows
     3.59 -> 3.09; it releases dependents at its start as the Triton kernel does.
 
+    Certified: bf16, the checkpoint's 4 x 2560: the injection at 128 rows
+    (eight-warp form), the combine at 16384 rows (two-warp form), the combine
+    with the fold (three slots -1) at 128 rows (CuTe kernel), norm-only at 128
+    rows; the CuTe fold bitwise the Triton kernel at 511 rows.
+
     Not certified: hc_count other than 4, hidden other than 2560, float16
-    operands, a flat `[T]` gate, row strides other than the width, zero rows
-    (the kernels take them; no cell drives them).
+    operands, a flat `[T]` gate, row strides other than the width, zero rows,
+    the injection without the combine at prefill sizes, the combine without the
+    fold at decode sizes, CUDA-graph replay (the kernels take them; no cell
+    drives them).
 
     Hard limits: row offsets are int64 (`program_id(0)` widened); the grid is
     `rows * hc_count` programs along x (2^31 - 1); the column offset

@@ -77,15 +77,16 @@ class FlashinferChunkGatedDeltaRule(OpWrapper):
     # qwen3.8-flash-next-nvfp4's geometry, in place over an fp32 pool.
     CELLS: tuple[Cell, ...] = tuple(
         Cell(
-            why=f"qwen3.8 prefill, 461-slot pool, seqlens {list(s)}",
+            why=f"qwen3.8 prefill into output=, 461-slot pool, seqlens {list(s)}",
             spec=dict(
                 geometry=QWEN38_GEOMETRY,
                 seqlens=s,
                 slots=ENGINE_SLOTS,
                 indices=_engine_slots(len(s)),
+                output="buffer",
             ),
         )
-        for s in ((200, 37, 91), (8192,), (2048, 2048, 2048, 2048))
+        for s in ((200, 37, 91), (8192,))
     ) + (
         Cell(
             why="qwen3.8 context chunk + 1-token rows [8, 1, 1, 1], 461-slot pool",
@@ -94,16 +95,6 @@ class FlashinferChunkGatedDeltaRule(OpWrapper):
                 seqlens=(8, 1, 1, 1),
                 slots=ENGINE_SLOTS,
                 indices=_engine_slots(4),
-            ),
-        ),
-        Cell(
-            why="qwen3.8 output= buffer [1, T, HV, V], 6-slot pool",
-            spec=dict(
-                geometry=QWEN38_GEOMETRY,
-                seqlens=(128, 64),
-                slots=6,
-                indices=(4, 1),
-                output="buffer",
             ),
         ),
     )
@@ -122,6 +113,10 @@ class FlashinferChunkGatedDeltaRule(OpWrapper):
     with the 127 decode rows sent to FlashInfer's decode kernel
     (`gdn_decode.gated_delta_rule_decode_pretranspose`) instead (both halves
     plus the concatenation).
+
+    Certified at the 461-slot fp32 pool: three ragged context rows and one
+    8192-token row, each into an `output=` buffer, and an 8-token context
+    chunk with three one-token rows.
 
     Memory per call: a packed fp32 copy of the named slots in and out (2 x
     3 MiB per sequence), `exp(g)`, and the output. q/k/v/beta are not copied

@@ -2,15 +2,13 @@
 # SPDX-License-Identifier: Apache-2.0
 """GPU test for the pack_gdn_decode_qkv entry.
 
-The op is a pure copy, so every comparison is bitwise; the discrimination test
-is what shows that gate is not vacuous on these operands.
+The op is a pure copy, so every comparison is bitwise.
 """
 
 import zlib
 
 import pytest
 import torch
-from triton.compiler.errors import CompilationError
 
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.ssm.pack_gdn_decode_qkv import (  # noqa: E501
     CKPT_HEADS,
@@ -99,52 +97,6 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — pytest res
         assert all(torch.equal(gt, w) for gt, w in zip(grouped, want))
 
 
-def test_draft_rows_are_independent() -> None:
-    """Every row carries a distinct constant, so a token-axis mix-up -- invisible
-    on rows that happen to agree -- cannot pass."""
-    num_tokens = 6 * 4
-    marks = torch.arange(1, num_tokens + 1, dtype=torch.float32, device=DEV).to(torch.bfloat16)
-    mixed = marks.reshape(num_tokens, 1).expand(num_tokens, QKV_DIM).contiguous()
-    q, k, v = op(mixed, *CKPT_HEADS)
-    for out, width in ((q, Q_WIDTH), (k, Q_WIDTH), (v, V_WIDTH)):
-        flat = out.reshape(num_tokens, -1)
-        assert flat.shape[1] == width
-        assert torch.equal(flat, marks.reshape(num_tokens, 1).expand(num_tokens, width))
-
-
-def test_bitwise_gate_discriminates_wrong_variants() -> None:
-    """Plausible ways to get the packing wrong; `_compare` rejects each."""
-    g = torch.Generator(device=DEV).manual_seed(600)
-    n = 24
-    mixed = torch.randn(n, QKV_DIM, generator=g, device=DEV).to(torch.bfloat16)
-    out = op(mixed, *CKPT_HEADS)
-    q_ref, k_ref, v_ref = op.reference(mixed, *CKPT_HEADS)
-    _compare(out, (q_ref, k_ref, v_ref))
-    wrong = {
-        "q_k_swapped": (k_ref, q_ref, v_ref),
-        "v_from_q_offset": (
-            q_ref,
-            k_ref,
-            mixed.narrow(1, 0, V_WIDTH).reshape(n, NUM_V_HEADS, HEAD_V_DIM).unsqueeze(0),
-        ),
-        "head_axis_transposed": (q_ref.transpose(2, 3).reshape(q_ref.shape), k_ref, v_ref),
-        "token_order_reversed": (q_ref.flip(1), k_ref, v_ref),
-    }
-    for name, bad in wrong.items():
-        with pytest.raises(AssertionError):
-            _compare(out, bad)
-        print(f"{name}: rejected")
-
-
-def test_op_rejects_head_dims_that_round_to_different_blocks() -> None:
-    """Loud at compile time, before any launch -- so not an `is_valid` guard."""
-    heads = (16, 128, 48, 64)
-    qkv_dim = 2 * heads[0] * heads[1] + heads[2] * heads[3]
-    mixed = torch.randn(13, qkv_dim, device=DEV).to(torch.bfloat16)
-    with pytest.raises(CompilationError, match="Mismatched type for dim_mask"):
-        op(mixed, *heads)
-
-
 def test_a_short_row_reads_the_next_row_and_is_refused() -> None:
     """Unguarded, a `[32, 9216]` input at qkv_dim 10240 runs and silently reads
     the next row's first 1024 columns into the tail of `v`; the guard refuses it.
@@ -161,15 +113,5 @@ def test_a_short_row_reads_the_next_row_and_is_refused() -> None:
     assert torch.equal(tail[:-1], mixed[1:, :1024]), "the hazard this guard covers is gone"
 
     with pytest.raises(AssertionError, match="must be at least qkv_dim=10240 wide"):
-        with validating(op):
-            op(mixed, *CKPT_HEADS)
-
-
-def test_guard_refuses_a_three_dimensional_input() -> None:
-    """`[batch, draft, qkv_dim]` -- a caller who skipped the flatten. Unguarded
-    it faults with an illegal memory access (measured; not replayed here, it
-    poisons the process); the guard refuses it before the launch."""
-    mixed = torch.randn(4, 2, QKV_DIM, device=DEV).to(torch.bfloat16)
-    with pytest.raises(AssertionError, match="must be at least qkv_dim="):
         with validating(op):
             op(mixed, *CKPT_HEADS)

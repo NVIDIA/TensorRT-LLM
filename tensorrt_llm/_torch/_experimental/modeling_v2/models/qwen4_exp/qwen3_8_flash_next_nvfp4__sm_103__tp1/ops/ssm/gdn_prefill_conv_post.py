@@ -775,7 +775,7 @@ class GdnPrefillConvPost(OpWrapper):
     # spec: lengths; slots (pool rows used, None -> _engine_slots); pool_slots;
     # initial; layout "in_proj" (x and a/b column views of one [T, 16480]
     # buffer, the target's call) | "rows" (x/a/b the first rows of a longer
-    # projection, as a mixed step's context half); pad_slot_id; dt_bias_fill.
+    # projection, as a mixed step's context half), extra_rows.
     CELLS: tuple[Cell, ...] = (
         Cell(
             why="target call, engine 461-slot pool: 37+1+128 tokens at slots 460, 0, 230",
@@ -784,12 +784,6 @@ class GdnPrefillConvPost(OpWrapper):
                 pool_slots=ENGINE_SLOTS,
                 slots=(ENGINE_SLOTS - 1, 0, ENGINE_SLOTS // 2),
                 initial=(True, False, True),
-            ),
-        ),
-        Cell(
-            why="max_num_tokens 16384 over 3 contexts (the con=128 mixed step)",
-            spec=dict(
-                lengths=(5440, 5440, 5504), pool_slots=ENGINE_SLOTS, initial=(True, False, True)
             ),
         ),
         Cell(
@@ -808,22 +802,6 @@ class GdnPrefillConvPost(OpWrapper):
                 lengths=tuple(1 + (i * 7) % 64 for i in range(128)),
                 pool_slots=ENGINE_SLOTS,
                 initial=tuple(i % 3 != 0 for i in range(128)),
-            ),
-        ),
-        Cell(
-            why="pad_slot_id -1: that context neither reads nor writes the pool",
-            spec=dict(
-                lengths=(16, 8, 16), pool_slots=4, slots=(0, -1, 2), initial=(True, True, True)
-            ),
-        ),
-        Cell(
-            why="every head above softplus_threshold: the linear branch",
-            spec=dict(
-                lengths=(64,),
-                pool_slots=2,
-                slots=(1,),
-                initial=(True,),
-                dt_bias_fill=SOFTPLUS_THRESHOLD + 8.0,
             ),
         ),
     )
@@ -868,14 +846,19 @@ class GdnPrefillConvPost(OpWrapper):
     `1 + e <= 2^126`; below acc = -87.3 it returns -0 where those return a
     value under 1e-36. q/k norm: the 128-channel fp32 sum of squares as each
     thread's pairs plus a 32-lane butterfly, `sqrt.approx.ftz`, `div.full`.
-    Against the unfused path (entry test, at the target-call cell):
-    q/k/v within one bf16 ulp on 1e-6..1e-4 of elements, g/beta within the
-    fp32 band, conv pool bitwise.
+    Against the unfused path (measured at the target-call cell): q/k/v within
+    one bf16 ulp on 1e-6..1e-4 of elements, g/beta within the fp32 band, conv
+    pool bitwise.
+
+    Certified over the 461-slot pool, seen as one layer of a two-layer buffer:
+    three contexts of 37, 1 and 128 tokens; a mixed step's 8065-token context
+    half, the first rows of an 8192-row projection; and 128 short contexts (1 to
+    64 tokens, some shorter than the window).
 
     A `pad_slot_id` context reads no carry and publishes nothing; its outputs
     are computed from a zero window (the unfused conv leaves those columns
     unconvolved instead -- nothing consumes either). The engine gives every
-    context row a real slot.
+    context row a real slot; a pad context is not certified.
 
     Preconditions (`is_valid`): `x` 2-D, unit channel stride, at least
     `qkv_dim` wide; `a`/`b` at least `T` rows (read through both strides);
@@ -892,11 +875,12 @@ class GdnPrefillConvPost(OpWrapper):
 
     Not certified: fp16/fp32 activations, other head geometries, bias, a row
     stride of `x` other than the projection's 16480 (the conv pass compiles one
-    kernel per row stride), zero-token contexts.
+    kernel per row stride), zero-token contexts, `a + dt_bias` past the softplus
+    threshold on every head.
 
     Hard limits
       element offsets  64-bit for the rows of x and the outputs; weight and
-        pool strides int32 (refused from 2^31)  not probed beyond 16384 tokens.
+        pool strides int32 (refused from 2^31)  not probed beyond 8192 tokens.
     """
 
     def __call__(

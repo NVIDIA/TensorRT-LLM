@@ -428,17 +428,18 @@ class Qwen4ExpHcDecodeFirstCute(OpWrapper):
     # (0: top-k of the finalize folded in, block_out then the permuted rows), drop
     # (False: some slots -1), n_cols (324). The weight is the target's padded
     # [width, 384] (columns past n_cols never read).
+    # Four cells: the forward reaches four compiled variants (inject at 324 cols, the
+    # fold at 324, the fold at 320 into the stack-final mixer, norm-only), none of which
+    # another covers; the -1 slots ride the 324-col fold cell.
     CELLS: tuple[Cell, ...] = (
         Cell(why="checkpoint 4x2560, 324 cols of 384, bf16, inject, 1 row", spec=dict(rows=1)),
-        Cell(why="MoE combine, [T, 1] gate, 1 row", spec=dict(rows=1, moe=True)),
-        Cell(why="finalize fold, top-10, 1 row (con 1)", spec=dict(rows=1, moe=True, fold=10)),
+        Cell(
+            why="finalize fold, top-10, last 3 slots mapped to -1, 1 row",
+            spec=dict(rows=1, moe=True, fold=10, drop=True),
+        ),
         Cell(
             why="finalize fold into the stack-final mixer: 320 cols",
             spec=dict(rows=1, moe=True, fold=10, n_cols=320),
-        ),
-        Cell(
-            why="finalize fold, last 3 slots mapped to -1",
-            spec=dict(rows=1, moe=True, fold=10, drop=True),
         ),
         Cell(why="norm-only site (stack start / after PLE)", spec=dict(rows=1, inject=False)),
     )
@@ -462,15 +463,20 @@ class Qwen4ExpHcDecodeFirstCute(OpWrapper):
     finalize and the combine likewise); `part` and `ss` are fp32 reductions in a fixed
     order, inside the float64 reference's band (the combine and the finalize can each
     land one ulp of the block output from it, scaled into `hc_out` by `inject`).
-    Deterministic. Graph-capturable: compiled on the first call per variant, which
-    must precede capture (the engine's warmup forward does it).
+    Deterministic (measured). Graph-capturable: compiled on the first call per
+    variant, which must precede capture (the engine's warmup forward does it).
 
     PDL: with `TRTLLM_ENABLE_PDL` (default on, sm_90+) the weight rows and the norm
     slice stream before `griddepcontrol.wait`, every activation read and every
     write after it, and dependents are released before the wait.
 
-    Not certified: a flat `[T]` gate, a row-slice `hyper_input`, a weight
-    narrower than the padded 384 rows (accepted; no cell drives them).
+    Certified: one bf16 row, the injection at 324 columns, the fold (top-10, three
+    slots -1) at 324 columns, the fold into the stack-final mixer at 320 columns,
+    the norm-only site; graph replay under PDL with the fold.
+
+    Not certified: the combine without the fold, a flat `[T]` gate, a row-slice
+    `hyper_input`, a weight narrower than the padded 384 rows (accepted; no cell
+    drives them).
     """
 
     def __call__(

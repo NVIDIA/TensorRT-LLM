@@ -59,7 +59,6 @@ class FusedSigmoidGateMulAdd(OpWrapper):
             why="_moe_block / MTPLayer._moe decode: one token, in place; 8 warps",
             spec=_ckpt(1),
         ),
-        Cell(why="17 tokens: an odd multi-row count", spec=_ckpt(17)),
         Cell(why="2048 tokens: prefill-shaped", spec=_ckpt(2048)),
         Cell(
             why="gate as a strided column of a wider tensor, as the trunk's fused shared-expert "
@@ -73,13 +72,13 @@ class FusedSigmoidGateMulAdd(OpWrapper):
     The Triton kernel JIT-compiles on first call.
 
     Preconditions, all enforced loudly by the callable (AssertionError before
-    any launch): `final_hidden_states` 2-D; `shared_expert_output` and `output`
-    match it in shape and dtype; `gate_logits.numel() == num_tokens`; the
-    destination has `stride(-1) == 1` (its row stride is free). A
-    column-strided `final_hidden_states` or `shared_expert_output` is densified
-    inside the call (an extra copy kernel), as is a non-contiguous gate. Host
-    operands raise ValueError from Triton. `num_tokens == 0` returns the
-    destination without launching. `output` may alias `shared_expert_output`.
+    any launch; the test holds the wrong-length gate): `final_hidden_states`
+    2-D; `shared_expert_output` and `output` match it in shape and dtype;
+    `gate_logits.numel() == num_tokens`; the destination has `stride(-1) == 1`
+    (its row stride is free). A column-strided `final_hidden_states` or
+    `shared_expert_output` is densified inside the call (an extra copy kernel),
+    as is a non-contiguous gate. `num_tokens == 0` returns the destination
+    without launching (certified).
 
     Numerics: the default `assert_close` band holds for bf16, the dtype the target
     calls it with; fp16 and fp32 run the same kernel and are not certified.
@@ -93,9 +92,10 @@ class FusedSigmoidGateMulAdd(OpWrapper):
       num_tokens  row offset widened to int64 in the kernel; largest run 8192
 
     Not certified: hidden sizes other than 2560 (the column block and warp count
-    step with it), an `output` buffer other than `shared_expert_output`, row-padded
-    operands, CUDA-graph capture, torch.compile, operands on two devices, float8
-    activations.
+    step with it), gate layouts other than `[T, 1]` and the strided column, an
+    `output` buffer (including one aliasing `shared_expert_output`), row-padded
+    operands, host operands, CUDA-graph capture, torch.compile, operands on two
+    devices, float8 activations.
     """
 
     def __call__(

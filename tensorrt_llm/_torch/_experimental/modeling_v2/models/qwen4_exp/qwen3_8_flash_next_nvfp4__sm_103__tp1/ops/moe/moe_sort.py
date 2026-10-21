@@ -15,11 +15,9 @@ def _ckpt(tokens: int, tile_tokens_dim: int, dist: str = "router") -> dict:
     """The checkpoint's trunk MoE: 512 experts, top-10, all local (tp1), fp32 scales.
 
     `dist` names how the test draws the expert ids: `router` = each row's top-10 of
-    uniform scores over the 512 experts; `hot` = every row routes to the same 10
-    experts; `tile_edges` = three experts hold exactly tile-1, tile and tile+1 rows,
-    the rest `router`; `round_robin` = row i takes experts (10 i + j) mod 512;
-    `strided` = row i takes (h_i + 51 j) mod 512 with h_i uniform. All of them put 10
-    distinct experts on every row, as the router does.
+    uniform scores over the 512 experts; `tile_edges` = three experts hold exactly
+    tile-1, tile and tile+1 rows, the rest `router`. Both put 10 distinct experts on
+    every row, as the router does.
     """
     return dict(
         tokens=tokens,
@@ -71,32 +69,20 @@ class MoeSort(OpWrapper):
 
     ARCHS = frozenset({Arch.SM_103})
 
+    # One cell per kernel path the target reaches at its tile, 128: block (T <= 4),
+    # cluster (T 5..8192) and cooperative (T >= 8193).
     CELLS: tuple[Cell, ...] = (
         Cell(
             why="tile 128: decode, 1 request without MTP; block kernel",
             spec=_ckpt(1, 128),
         ),
         Cell(
-            why="tile 128: 128 rows, 32 requests at MTP verify width 4; largest captured T, "
-            "cluster kernel",
-            spec=_ckpt(128, 128),
-        ),
-        Cell(
-            why="tile 128: expert counts tile-1, tile, tile+1; the mn_limit clamp",
+            why="tile 128: expert counts tile-1, tile, tile+1; the mn_limit clamp; cluster kernel",
             spec=_ckpt(300, 128, "tile_edges"),
         ),
         Cell(
-            why="tile 128: 8192 rows all to the same 10 experts; full multi-tile runs at the "
-            "last single-cluster T",
-            spec=_ckpt(8192, 128, "hot"),
-        ),
-        Cell(
-            why="tile 128: 8193 rows; first cooperative-kernel T",
+            why="tile 128: 8193 rows; first cooperative-kernel T (prefill)",
             spec=_ckpt(8193, 128),
-        ),
-        Cell(
-            why="tile 256: expert counts tile-1, tile, tile+1; the other tile sm_103 admits",
-            spec=_ckpt(300, 256, "tile_edges"),
         ),
     )
 
@@ -155,10 +141,12 @@ class MoeSort(OpWrapper):
     <= 0 (the host divides by it).
 
     Certified only at the checkpoint's values: num_experts 512, top_k 10, all
-    experts local (offset 0), tile 128 (the target's) and 256, fp32 scales, and
-    T up to 8193 (block, cluster and the first cooperative T). Expert
-    parallelism, other tiles, other expert counts and the histogram path are
-    uncertified.
+    experts local (offset 0), tile 128 (the target's), fp32 scales, and T 1,
+    300 and 8193 (block, cluster and the first cooperative T); CUDA-graph replay
+    on new ids at T = 128; the contiguity guard. The order, unwritten-region,
+    data-hazard and loud-rejection statements above were measured at bring-up
+    and are not re-driven by the test. Expert parallelism, tile 256 and other
+    tiles, other expert counts and the histogram path are uncertified.
 
     Hard limits (sm_103)
       T * top_k         boundary 2^31 pairs (int32 product)

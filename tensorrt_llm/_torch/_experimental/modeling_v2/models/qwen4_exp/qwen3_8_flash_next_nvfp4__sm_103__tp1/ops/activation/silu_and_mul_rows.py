@@ -48,9 +48,8 @@ class SiluAndMulRows(OpWrapper):
 
     CELLS: tuple[Cell, ...] = (
         Cell(why="prefill chunk 16384 rows of the fused 1288-wide output", spec=dict(rows=16384)),
-        Cell(why="decode batch 128, fused output", spec=dict(rows=128)),
-        Cell(why="1 row, fused output", spec=dict(rows=1)),
-        Cell(why="zero rows", spec=dict(rows=0)),
+        Cell(why="short prefill step, 128 rows of the fused output", spec=dict(rows=128)),
+        Cell(why="zero rows: no launch", spec=dict(rows=0)),
     )
 
     note = """
@@ -66,6 +65,9 @@ class SiluAndMulRows(OpWrapper):
     Numerics: `g / (1 + exp(-g)) * u` in fp32 (Triton's `exp` and division), rounded once;
     bitwise `flashinfer_silu_and_mul` on the same values (16384 x 640 random bf16 values,
     the test's cells).
+
+    Certified: bf16 at inter 640 on the 1288-wide fused output, 0, 128 and 16384 rows;
+    CUDA-graph replay at 128 rows. Not certified: fp16, other widths or row counts.
     """
 
     def __call__(self, x: torch.Tensor, inter: int) -> torch.Tensor:

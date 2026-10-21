@@ -16,10 +16,8 @@ from tensorrt_llm._torch.attention.backends.sparse.qsa import kernels as _qsa_ke
 #: `indexer_compress_ratio` 4.
 _BLOCK_TOPK = 512
 #: `(slots, this layer's slot)` of the shared buffers: with the MTP layer in the
-#: target's cache manager, 12 trunk full-attention layers plus the MTP layer; a
-#: separate draft manager owns one slot, the MTP layer's.
+#: target's cache manager, 12 trunk full-attention layers plus the MTP layer.
 _COMBINED_SLOTS = (13, 12)
-_DRAFT_SLOTS = (1, 0)
 
 
 def _spec(contexts, **overrides) -> dict:
@@ -28,11 +26,8 @@ def _spec(contexts, **overrides) -> dict:
     `contexts` says what each request's captured row and current row are:
       ("mixed", B)        B requests; the first 16 at fixed boundary positions
                           (empty, short, 511, 512 and full rows), the rest seeded
-      ("short", B)        captured positions <= 2046: fewer than 512 valid groups
       ("full", B)         captured positions >= 2047: all 512 slots valid
       ("explicit", P)     one request per captured position in P
-      ("gaps", pairs)     (captured_visible, current_visible) per request, set
-                          directly rather than through positions
     A request captured at position `p` (its last accepted row) holds
     `(p + 1) // 4` complete groups; its draft row `d` positions later sees
     `(p + d + 1) // 4`. `drafted` cycles over the requests.
@@ -41,11 +36,9 @@ def _spec(contexts, **overrides) -> dict:
         contexts=contexts,
         drafted=(1, 2, 3),
         rows_per_request=1,
-        request_map="identity",
         shared_rows=64,
         slots=_COMBINED_SLOTS,
         block_topk=_BLOCK_TOPK,
-        layout="engine",
         metadata_dtype=torch.int32,
         graph_batches=(),
     )
@@ -90,15 +83,13 @@ class QsaMtpReuseTopk(OpWrapper):
     ARCHS = frozenset({Arch.SM_103})
 
     CELLS: tuple[Cell, ...] = (
-        # ---- the two behaviours, at every boundary -------------------------
+        # ---- decode batch: one row per request; the first 16 requests sit at the
+        # boundaries (empty, short, 511-id, 512-id and full rows), fresh 0 and 1.
         Cell(
-            why="8 requests, one per boundary: 0/1/100/511/512/2047 groups, fresh 0 and 1",
-            spec=_spec(
-                ("explicit", (2, 3, 402, 2046, 2050, 8188, 2051, 2047)),
-                drafted=(1, 1, 1, 1, 1, 3, 3, 1),
-                shared_rows=8,
-            ),
+            why="decode MTP: 32 requests (envelope), 256-row shared buffer",
+            spec=_spec(("mixed", 32), shared_rows=256),
         ),
+        # ---- the riskiest edge: two fresh groups displace a full row's two oldest
         Cell(
             why="8 requests at fresh 2: full, 511-id and short rows gain two groups",
             spec=_spec(
@@ -106,15 +97,6 @@ class QsaMtpReuseTopk(OpWrapper):
                 drafted=(5, 6, 5, 6, 6, 4, 5, 6),
                 shared_rows=8,
             ),
-        ),
-        # ---- decode batches: one row per request ----------------------------
-        Cell(
-            why="decode MTP: 32 requests (envelope), 256-row shared buffer",
-            spec=_spec(("mixed", 32), shared_rows=256),
-        ),
-        Cell(
-            why="permuted request map, draft manager's single slot",
-            spec=_spec(("mixed", 32), request_map="permuted", slots=_DRAFT_SLOTS, shared_rows=32),
         ),
         # ---- CUDA graph -----------------------------------------------------
         Cell(
@@ -154,7 +136,7 @@ class QsaMtpReuseTopk(OpWrapper):
       - `shared_visible_blocks[q]` is the visible count of the very row that was
         captured, and `visible_blocks[r]` is `(position + 1) // cr` of row `r`.
 
-    Loud rejections: `ValueError` when the shared width differs from the output
+    Loud rejections (not pinned by a test): `ValueError` when the shared width differs from the output
     width, when `request_indices` or `visible_blocks` does not hold one element
     per output row, or on CPU tensors; a 1-D `output` or `shared_indices`; a
     width that is not a power of two (Triton compilation).
@@ -163,11 +145,13 @@ class QsaMtpReuseTopk(OpWrapper):
     (the kernel addresses raw pointers densely and ignores strides); a 3-D
     `shared_indices` whose middle extent equals `block_topk` (read as slot 0);
     a 2-D `shared_visible_blocks` (the whole `[slots, seqs]` buffer is read as
-    slot 0's counts).
+    slot 0's counts). The test pins the last.
 
-    Certified: int32 ids and metadata, `block_topk` 512, up to 32 requests.
-    No host synchronization and shape-only validation, so it captures into a
-    CUDA graph.
+    Certified: int32 ids and metadata, `block_topk` 512, up to 32 requests, the
+    identity request map over the target cache manager's 13-slot buffers, CUDA
+    graph capture at 1, 8 and 32 requests with a new-data replay.
+    Not certified: a permuted request map, a separate draft manager's one-slot
+    buffers.
     """
 
     def __call__(

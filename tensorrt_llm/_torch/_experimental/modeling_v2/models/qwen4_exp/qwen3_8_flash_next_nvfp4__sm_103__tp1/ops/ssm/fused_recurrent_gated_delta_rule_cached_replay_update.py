@@ -33,8 +33,6 @@ HISTORY_SIZE = 16
 #: in-kernel commit, one all-layer commit after every layer has run):
 #: `CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE` in `modules/fla/cached_replay.py`.
 ALL_LAYER_COMMIT_MIN_BATCH = 16
-#: This checkpoint's GDN layer count at tp1 (36 of its 48 layers are linear attention).
-NUM_GDN_LAYERS = 36
 #: The recurrent pool's slot count of a full-size engine run.
 ENGINE_SLOTS = 461
 #: Layers per slot at which the last of `ENGINE_SLOTS` slots starts past 2^31 elements of
@@ -104,35 +102,42 @@ class FusedRecurrentGatedDeltaRuleCachedReplayUpdate(OpWrapper):
     # steps (consecutive verify steps, each followed by an acceptance per row),
     # accept ("random": 1..t per row, the default | "full": t every step, so from
     # a fresh slot at t=8 the second step appends at `pnat + t == 16` without
-    # wrapping and every second step after wraps | "one": 1 every step),
+    # wrapping and every second step after wraps),
     # state_dtype (the checkpoint pool's dtype: fp32 | bf16, as
     # `mamba_ssm_cache_dtype` allocates it; fp32 by default),
     # layers (each with its own activations, gates
     # and history; one V2-style pool interleaving the layers per slot), slots
     # (the pool's slot count), start ("warm": random pending histories in both
     # halves, a wrap and an append forced at step 0 | "fresh": pnat 0 and
-    # zeroed history, as the manager leaves a slot after prefill), pad (rows
-    # given slot -1), edge_slots (rows 0 and n-1 on the pool's last and first
-    # slot), output (None | "prefix" of a longer buffer | "suffix": its rows
-    # after 5 context tokens), packed (False: the q/k/v views over the packed
-    # rows without packed_qkv, as a mixed batch passes them), pdl
-    # (launch_with_pdl, default False, the form the target calls: PDL is a constexpr of the
-    # kernel, so True is a separate compile), ab ("split": separate [n, t, 48]
-    # projections | "strided": the column halves of one [n*t, 96] projection),
-    # dup (rows given the SAME slot, as CUDA-graph padding repeats one dummy slot;
-    # only the other rows and slots are held to the reference).
+    # zeroed history, as the manager leaves a slot after prefill), edge_slots
+    # (rows 0 and n-1 on the pool's last and first slot), dup (rows given the
+    # SAME slot, as CUDA-graph padding repeats one dummy slot; only the other
+    # rows and slots are held to the reference). Every cell passes `packed_qkv`,
+    # separate raw `a`/`b` projections, no `output` and `launch_with_pdl=False`.
+    #
+    # Four cells, one over the three-cell budget: the forward reaches two commit
+    # paths (in-kernel below 16 requests, all-layer from 16) at two checkpoint
+    # dtypes, and two edges no main-shape cell can carry -- CUDA-graph padding
+    # rows sharing one slot, and slot offsets past 2^31 elements at the engine's
+    # pool.
     CELLS: tuple[Cell, ...] = (
-        # In-kernel commit (below 16 requests), one cell per token tile BT = next_pow2(T).
-        Cell(why="small n=1 T=2: one sequence, MTP-1", spec=_cell_spec("small", 1, 2, steps=12)),
+        Cell(
+            why="all_layer n=32 T=8 full accept: commit every second step",
+            spec=_cell_spec("all_layer", 32, 8, start="fresh", accept="full", steps=8),
+        ),
+        _bf16_cell(
+            "small n=4 T=8 full accept: pnat+T==16 appends, then wraps",
+            "small",
+            4,
+            8,
+            start="fresh",
+            accept="full",
+            steps=8,
+        ),
         Cell(
             why="small n=8 T=3 dup: rows 5..7 share one padding slot",
             spec=_cell_spec("small", 8, 3, dup=(5, 6, 7), steps=6),
         ),
-        Cell(
-            why="small n=4 T=8 full accept: pnat+T==16 appends, then wraps",
-            spec=_cell_spec("small", 4, 8, start="fresh", accept="full", steps=8),
-        ),
-        # Partitioned call plus the all-layer commit (16 requests and up).
         Cell(
             why="all_layer n=16 T=3 L=8 S=461: slot 460's offset is past 2^31 elements",
             spec=_cell_spec(
@@ -144,29 +149,6 @@ class FusedRecurrentGatedDeltaRuleCachedReplayUpdate(OpWrapper):
                 edge_slots=True,
                 steps=3,
             ),
-        ),
-        Cell(
-            why="all_layer n=32 T=8 full accept: commit every second step",
-            spec=_cell_spec("all_layer", 32, 8, start="fresh", accept="full", steps=8),
-        ),
-        # ---- a bf16 checkpoint pool (`mamba_ssm_cache_dtype=bfloat16`) ----
-        _bf16_cell(
-            "small n=4 T=8 full accept: pnat+T==16 appends, then wraps",
-            "small",
-            4,
-            8,
-            start="fresh",
-            accept="full",
-            steps=8,
-        ),
-        _bf16_cell(
-            "all_layer n=32 T=3 L=36 S=40: every GDN layer, one commit",
-            "all_layer",
-            32,
-            3,
-            layers=NUM_GDN_LAYERS,
-            slots=40,
-            steps=6,
         ),
     )
 
@@ -227,17 +209,21 @@ class FusedRecurrentGatedDeltaRuleCachedReplayUpdate(OpWrapper):
     (`main_num_stages=3`, a 5-stage commit), which no cell drives. `FLA_USE_FAST_OPS=1` at
     import switches the kernel's `exp` to the approximate one; the cells run with it unset.
 
-    Bit for bit the same call: the in-kernel commit and the partitioned call plus
-    the all-layer commit; `packed_qkv` and the separate q/k/v (whose contents are
-    never read when `packed_qkv` is given); `launch_with_pdl` on and off; a second
-    run; CUDA-graph replay on new data (the test captures N = 1 at T = 2 and N = 32 at T = 8
-    over an fp32 checkpoint, N = 16 at T = 4 over a bf16 one).
+    CUDA-graph replay on new data is bit for bit the eager call (the test captures
+    N = 32 at T = 8 over an fp32 checkpoint, with the all-layer commit). The two commit
+    paths, `packed_qkv` against separate q/k/v, and `launch_with_pdl` on and off are not
+    certified against each other; each form the target calls is certified against the
+    reference by the cells.
 
-    T = 5..8 share one compiled token tile (`BT = next_pow2(T) = 8`); the cells drive
-    each tile (T = 2, 3 and 8) and both checkpoint dtypes, not every pairing of the two. At
-    T = 8 and history 16 a slot whose every draft is accepted appends rows 8..15 at
-    `pnat + T == 16` without wrapping and wraps on the next step, so it commits every second
-    step; the `accept="full"` cells drive that boundary (in-kernel and all-layer commit).
+    Certified: the all-layer commit over an fp32 checkpoint at N = 32, T = 8 and at
+    N = 16, T = 3 with 8 interleaved layers over the engine's 461-slot pool (the last
+    slot's offset past 2^31 elements); the in-kernel commit over a bf16 checkpoint at
+    N = 4, T = 8 and over an fp32 one at N = 8, T = 3 with three CUDA-graph padding rows
+    on one shared slot. T = 5..8 share one compiled token tile (`BT = next_pow2(T) = 8`);
+    the cells drive the BT = 4 and BT = 8 tiles, not BT = 2 (T = 2). At T = 8 and history
+    16 a slot whose every draft is accepted appends rows 8..15 at `pnat + T == 16` without
+    wrapping and wraps on the next step, so it commits every second step; the
+    `accept="full"` cells drive that boundary (in-kernel and all-layer commit).
 
     Loud refusals: work items without `use_all_layer_commit` (ValueError) and the
     reverse (ValueError); one of `replay_work_items` / `n_writes` alone
@@ -258,8 +244,8 @@ class FusedRecurrentGatedDeltaRuleCachedReplayUpdate(OpWrapper):
 
     Not certified: pre-gated `g`/`beta` (`A_log=None`); `use_qk_l2norm_in_kernel=
     False`; an `ssm_states` other than fp32 or bf16, or a bf16 one at N >= 128; HV/H other
-    than 3, K or V other than 128; T outside 2..8 (T = 9 raises: the kernel's bare
-    `assert T <= 8`), at either `ssm_states` dtype; `history_size` other than 16; `old_u` /
+    than 3, K or V other than 128; T = 2, or T outside 2..8 (T = 9 raises: the kernel's
+    bare `assert T <= 8`), at either `ssm_states` dtype; `history_size` other than 16; `old_u` /
     `old_k` other than bf16, `old_G` other than fp32; a `scale`; any launch-knob
     override (`block_v`, `num_warps`, `use_l2_*`, `main_num_stages`); an output
     dtype other than bf16; int64 `state_indices`; N above 32.

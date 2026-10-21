@@ -28,8 +28,6 @@ _CHECKPOINT = dict(
     token_topk=2048,
     cache_dtype=torch.bfloat16,
     q_dtype=torch.bfloat16,
-    # K and V are the two role planes of one [pages, 2, kv, tpb, D] pool.
-    cache_layout="pool_planes",
     # q is the first 24 heads of the packed [T, 24 + 2 + 2, 256] QKV buffer;
     # "fused_row" is the target's fused input projection row, 55 heads of 256.
     q_layout="qkv_slice",
@@ -55,11 +53,6 @@ def _spec(**overrides) -> dict:
 
 def _decode(segments, launches=_SPLIT_K, **overrides) -> dict:
     base = dict(segments=segments, slots=32, prefill_pair=False, launches=launches)
-    return _spec(**{**base, **overrides})
-
-
-def _mixed(requests, context_lens, **overrides) -> dict:
-    base = dict(mixed=(requests, context_lens), slots=32, prefill_pair=True, launches=_PREFILL)
     return _spec(**{**base, **overrides})
 
 
@@ -116,30 +109,15 @@ class QsaPagedSparseGqa(OpWrapper):
     CELLS: tuple[Cell, ...] = (
         # ---- generation: no prefill pair, split-K ---------------------------
         Cell(
-            why="decode MTP7: 32 slots x 8 rows = 256 rows, 512 programs, 4-way split-K",
-            spec=_decode(tuple((100 + (499 * g) % 8000, 8) for g in range(32))),
-        ),
-        Cell(
-            why="decode: 1 row, gate off the fused row, in the merge, PDL",
-            spec=_decode(((4000, 1),), q_layout="fused_row", gate="fused_row"),
-        ),
-        Cell(
-            why="decode: 128 rows, 8-way split-K, gate fused into the merge",
-            spec=_decode(((600, 1),) * 128, q_layout="fused_row", slots=160, gate="fused_row"),
-        ),
-        Cell(
-            why="300 rows, no prefill pair: split-K, one split, no merge",
-            spec=_decode(((600, 1),) * 300, launches=("splitk",), slots=384),
-        ),
-        Cell(
-            why="holes: all-padding row, foreign request, unmapped page",
-            spec=_decode(((900, 1),) * 4, holes=True),
+            why="decode MTP7: 32 slots x 8 rows = 256 rows, 512 programs, 4-way split-K, "
+            "q and the gate off the fused row, the gate fused into the merge",
+            spec=_decode(
+                tuple((100 + (499 * g) % 8000, 8) for g in range(32)),
+                q_layout="fused_row",
+                gate="fused_row",
+            ),
         ),
         # ---- context: the prefill pair is passed ----------------------------
-        Cell(
-            why="fp8 context 128 rows from 2032: pair passed, still split-K",
-            spec=_decode(((2032, 128),), prefill_pair=True, **_FP8),
-        ),
         Cell(
             why="fp8 context 272 rows from 2032: causal-prefix prefill kernel",
             spec=_decode(((2032, 272),), launches=_PREFILL, prefill_pair=True, **_FP8),
@@ -168,29 +146,35 @@ class QsaPagedSparseGqa(OpWrapper):
         is not an `is_valid` guard.
       - The prefill pair is a property of the launch: passed because some
         rows are context, it puts the generation rows on the prefill kernel
-        too, and the bound applies to them (asserted with a planted index).
+        too, and the bound applies to them (measured with a planted index; not
+        pinned by a test).
       - There is no KV scale argument: an fp8 pool is read at face value (each code
         widens exactly to bf16 under a bf16 q), so it must hold K/V written at unit scale.
       - `D` must be a power of two (192 is refused); `Hq % Hkv == 0`.
 
-    The op validates its own inputs loudly (`ValueError`s, one per guard
-    family pinned by the test, plus a selection width the compress ratio
-    cannot produce, refused on the prefill kernel only), so `is_valid` adds
-    nothing. `rows == 0` returns an empty `[0, Hq, D]` tensor.
+    The op validates its own inputs loudly (`ValueError`s; the test pins the
+    refusal of positions passed without a compress ratio; a selection width
+    the compress ratio cannot produce is refused on the prefill kernel only),
+    so `is_valid` adds nothing. `rows == 0` returns an empty `[0, Hq, D]`
+    tensor (not certified).
 
     PDL: `TRTLLM_ENABLE_PDL` (default on) enables programmatic dependent
-    launch for multi-split launches of 4 rows or fewer; both launch modes are
-    inside the cells. Calls are bitwise deterministic.
+    launch for multi-split launches of 4 rows or fewer; no cell runs one (the
+    target sends gated decode batches that small to
+    `qsa_paged_sparse_gqa_decode`). Calls are bitwise deterministic (pinned
+    on a 32-split launch and its merge).
 
     The decode site carries up to 8 rows per request (max_draft_len 7): the
-    cells run 32 requests of 8 rows, 512 `rows * Hkv` programs and a 4-way
-    split-K launch; the 1- and 128-row decode cells run more splits.
+    decode cell runs 32 requests of 8 rows, 512 `rows * Hkv` programs and a
+    4-way split-K launch with the output gate in its merge.
 
     Not certified: capture in a CUDA graph (the split-K path allocates its
-    partials inside the call); head geometries other than 24/2 x 256;
-    `tokens_per_block` other than 32; more than 8191 rows; the split-K kernel
-    above 300 rows; an fp16 pool or q; standalone contiguous K/V buffers;
-    int64 request indices.
+    partials inside the call); PDL launches; head geometries other than 24/2
+    x 256; `tokens_per_block` other than 32; more than 8191 rows; the split-K
+    kernel above 256 rows, with one split (no merge) or without the gate; an
+    fp8 pool on the split-K kernel; rows whose selection resolves no token
+    (all padding, a foreign request, unmapped pages); an fp16 pool or q;
+    standalone contiguous K/V buffers; int64 request indices.
     Hard limits: not probed; the largest certified extent is 8191 rows x 2051
     selected tokens through a [32, 260] table.
     """

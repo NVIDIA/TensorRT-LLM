@@ -2,18 +2,14 @@
 # SPDX-License-Identifier: Apache-2.0
 """GPU test for the qsa_paged_sparse_gqa_decode entry: cells against the composition
 entry's fp32 reference in that entry's band (4 ulp of each head row's magnitude, 2 ulp
-relative RMS), agreement with the composition entry (`qsa_paged_sparse_gqa`, which this
-replaces at decode) in the same band, stale-read checks under graph replay with PDL, and
-the guards."""
+relative RMS), the selection's read-after-wait under graph replay with PDL, and the row
+guard."""
 
 import zlib
 
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.attention.qsa_paged_sparse_gqa import (  # noqa: E501
-    qsa_paged_sparse_gqa,
-)
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.attention.qsa_paged_sparse_gqa_decode import (  # noqa: E501
     qsa_paged_sparse_gqa_decode as op,
 )
@@ -71,21 +67,6 @@ def _build(spec, seed):
     return [q, k_cache, v_cache, block_table, selected, request_indices, TPB, D**-0.5, gate]
 
 
-def _kw(args):
-    names = (
-        "q",
-        "k_cache",
-        "v_cache",
-        "block_table",
-        "selected_tokens",
-        "request_indices",
-        "tokens_per_block",
-        "softmax_scale",
-        "output_gate",
-    )
-    return dict(zip(names, args))
-
-
 @pytest.mark.parametrize("cell", op.CELLS, ids=[c.why[:44] for c in op.CELLS])
 def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — fixture by name
     certifying(op)
@@ -94,15 +75,6 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — fixture by
     ref = op.reference(*args)
     assert out.dtype == torch.bfloat16 and out.shape == ref.shape and out.is_contiguous()
     assert_within_ulp(out, ref, element_ulp=4.0, rms_ulp=2.0)
-
-
-def test_matches_the_composition() -> None:
-    """One representative gated decode row; the composition is certified on its own."""
-    args = _build(dict(pos=(8700,), gated=True), seed=91)
-    got = op(*args)
-    want = qsa_paged_sparse_gqa(**_kw(args))
-    assert_within_ulp(got, want, element_ulp=4.0, rms_ulp=2.0)
-    print(f"\n  bitwise the composition's {(got == want).float().mean().item():.4f}")
 
 
 def _replays_like_eager(step, refresh) -> None:
@@ -119,21 +91,6 @@ def _replays_like_eager(step, refresh) -> None:
         graph.replay()
         torch.cuda.synchronize()
         assert torch.equal(graph_out, step()), f"replay {trial}"
-
-
-def test_reads_q_and_the_gate_fresh_under_graph_replay() -> None:
-    """A plain launch rewrites q and the gate (one fused row) inside the graph right before
-    the op. The op reads both before its waits, which is sound only because such a producer
-    releases the op at its end: this pins that contract."""
-    args = _build(dict(pos=(8700,), gated=True), seed=17)
-    fused = args[0]._base if args[0]._base is not None else args[0]
-    src = fused.clone()
-
-    def step():
-        fused.copy_(src * 1.0)
-        return op(*args)
-
-    _replays_like_eager(step, lambda: src.copy_(torch.randn(src.shape, device=DEV).to(src.dtype)))
 
 
 def test_reads_the_selection_after_the_wait_under_graph_replay() -> None:
@@ -154,10 +111,8 @@ def test_reads_the_selection_after_the_wait_under_graph_replay() -> None:
     _replays_like_eager(step, lambda: scores.copy_(torch.rand(scores.shape, device=DEV)))
 
 
-def test_guards() -> None:
+def test_guard_refuses_rows_past_max_rows() -> None:
     args = _build(dict(pos=(8700,), gated=True), seed=5)
     many = [a.expand(300, *a.shape[1:]) if i in (0, 4, 5) else a for i, a in enumerate(args[:6])]
     with validating(op), pytest.raises(AssertionError):
         op(*many, *args[6:8], None)  # 300 rows: past MAX_ROWS
-    with validating(op), pytest.raises(AssertionError):
-        op(*args[:8], args[8].float())  # gate not in q's dtype

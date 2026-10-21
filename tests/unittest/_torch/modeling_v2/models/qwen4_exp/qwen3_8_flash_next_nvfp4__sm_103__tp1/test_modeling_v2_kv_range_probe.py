@@ -42,8 +42,9 @@ def test_a_forward_within_the_e4m3_range_is_silent(monkeypatch):
     logger.warning.assert_not_called()
 
 
-@pytest.mark.parametrize("peak", [1000.0, float("nan")])
+@pytest.mark.parametrize("peak", [-600.0, float("nan")])
 def test_a_magnitude_past_the_e4m3_maximum_is_reported_once(monkeypatch, peak):
+    """A negative value counts by its magnitude; a NaN counts as out of range."""
     logger = Mock()
     monkeypatch.setattr(m, "logger", logger)
 
@@ -52,15 +53,6 @@ def test_a_magnitude_past_the_e4m3_maximum_is_reported_once(monkeypatch, peak):
 
     logger.warning.assert_called_once()
     assert "e4m3 maximum 448" in logger.warning.call_args.args[0]
-
-
-def test_a_negative_value_counts_by_magnitude(monkeypatch):
-    logger = Mock()
-    monkeypatch.setattr(m, "logger", logger)
-
-    assert _run_forward(m._KvRangeProbe(LAST), (1.0, -600.0, 1.0)) == [True, True, False]
-
-    logger.warning.assert_called_once()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")

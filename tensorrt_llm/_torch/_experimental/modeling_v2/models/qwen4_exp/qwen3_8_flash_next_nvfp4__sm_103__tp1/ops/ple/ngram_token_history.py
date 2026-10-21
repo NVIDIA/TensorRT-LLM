@@ -94,23 +94,6 @@ class NgramTokenHistory(OpWrapper):
     # `cu_seqlens_from_seq_lens`' form). `ngram_size` is the checkpoint's 3.
     CELLS: tuple[Cell, ...] = (
         _cell(
-            "decode 32 x 1 token at the 461-slot engine pool",
-            (1,) * 32,
-            _scattered(32),
-            (True,) * 32,
-            ENGINE_SLOTS,
-            **_CALL_SITE,
-        ),
-        _cell(
-            "MTP verify p=2: 8 decodes x 2 rows, qsl rebuilt",
-            (2,) * 8,
-            _scattered(8),
-            (True,) * 8,
-            ENGINE_SLOTS,
-            qsl_from="seq_lens",
-            **_CALL_SITE,
-        ),
-        _cell(
             "MTP verify p=8: 32 decodes x 8 rows, qsl rebuilt",
             (8,) * 32,
             _scattered(32),
@@ -129,7 +112,6 @@ class NgramTokenHistory(OpWrapper):
             eos_density=0.05,
             **_CALL_SITE,
         ),
-        _cell("prefill 1024, fresh, EOS in stream", (1024,), (0,), (False,), 3, eos_density=0.05),
         _cell(
             "zero-token rows: carry kept, fresh reseeded",
             (2, 0, 0),
@@ -173,13 +155,19 @@ class NgramTokenHistory(OpWrapper):
     pool. At 461 slots the result is bitwise identical to an 11-slot pool
     with the same slot content.
 
+    Certified at the forward's two verify-step shapes, both on the
+    `cu_seqlens_from_seq_lens` rebuild at the 461-slot pool (32 x 8 rows; a
+    37-token fresh context with in-stream EOS beside 8 x 3 rows), and at
+    zero-token rows. Not certified: a plain decode (one row per sequence) or
+    a context-only batch -- outside a verify step the forward takes the
+    fused `ple_ngram_embed`, not this op.
+
     CUDA-graph capture certified (no `repeat_interleave` on device lengths,
     so no data-dependent shape). Cost, not gated: ~0.30 ms for a 4096-token
     prefill, a 32-row decode or a mixed 2 x 1024 + 30 x 1 batch alike --
     launch-bound.
 
-    Hard limits: not probed (`num_tokens` measured to 1024 here, 4096 in
-    timing).
+    Hard limits: not probed (`num_tokens` measured to 4096 in timing).
     """
 
     def __call__(

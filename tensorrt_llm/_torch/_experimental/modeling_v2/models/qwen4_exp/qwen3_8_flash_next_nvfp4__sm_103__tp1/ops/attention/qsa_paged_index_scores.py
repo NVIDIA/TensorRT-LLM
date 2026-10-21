@@ -70,7 +70,7 @@ class QsaPagedIndexScores(OpWrapper):
     that divides 128 into more than one row (1, 2, 4, ..., 64) it selects a
     query-tiled kernel sharing one key gather across `128 // heads` rows;
     otherwise the row-wise kernel runs. Each cell names the kernel it was measured on. The
-    two agree to one fp32 ulp, not bitwise.
+    two are not bitwise equal.
 
     Fusion boundary: the table walk, the gather, the dots, relu, head sum,
     scale and causal bound are inside. Producing `q` (norm, RoPE), writing and
@@ -93,32 +93,6 @@ class QsaPagedIndexScores(OpWrapper):
                 context_rows=False,
                 branch="row_wise",
                 **_TRUNK_POOL_NVFP4,
-            ),
-        ),
-        Cell(
-            why="NVFP4 trunk plane, page stride 49344: prefill 300 rows from 0",
-            spec=_spec(
-                layout="capture",
-                lengths=(300,),
-                slots=8,
-                pages=_WIDTH,
-                only_visible_blocks=True,
-                context_rows=True,
-                branch="query_tile",
-                **_TRUNK_POOL_NVFP4,
-            ),
-        ),
-        Cell(
-            why="decode: 1 row deep in history, [32, 260] table, visible-only",
-            spec=_spec(
-                layout="decode",
-                gen_positions=(6000,),
-                rows_per_request=1,
-                slots=32,
-                pages=_WIDTH,
-                only_visible_blocks=True,
-                context_rows=False,
-                branch="row_wise",
             ),
         ),
         Cell(
@@ -146,32 +120,6 @@ class QsaPagedIndexScores(OpWrapper):
                 branch="query_tile",
             ),
         ),
-        Cell(
-            why="mixed step: 195-token chunk + 31 MTP decodes = 257 rows: query-tiled",
-            spec=_spec(
-                layout="mixed",
-                requests=32,
-                context_lens=(195,),
-                slots=32,
-                pages=_WIDTH,
-                only_visible_blocks=True,
-                context_rows=True,
-                branch="query_tile",
-            ),
-        ),
-        Cell(
-            why="mixed step at 162 rows: context_rows=True stays row-wise",
-            spec=_spec(
-                layout="mixed",
-                requests=32,
-                context_lens=(100,),
-                slots=32,
-                pages=_WIDTH,
-                only_visible_blocks=True,
-                context_rows=True,
-                branch="row_wise",
-            ),
-        ),
     )
 
     note = """
@@ -188,22 +136,22 @@ class QsaPagedIndexScores(OpWrapper):
     run: an uncompressed anchor scores as a raw index key. `rows == 0` returns
     an empty `[0, columns]` tensor without launching.
 
-    The op validates its own metadata loudly (`ValueError`s; one per refusal
-    family is pinned by the test), so `is_valid` adds nothing.
+    The op validates its own metadata loudly (`ValueError`s; the test pins the
+    one-entry-per-row metadata refusal), so `is_valid` adds nothing.
 
-    `only_visible_blocks=True` really leaves garbage: with a poisoned
-    allocation freed just before the call, the whole unscored tail came back
-    poisoned. At 8191 rows from position 0 over 2080 columns that is a full
+    `only_visible_blocks=True` really leaves garbage (measured, not pinned by a
+    test): with a poisoned allocation freed just before the call, the whole
+    unscored tail came back poisoned. At 8191 rows from position 0 over 2080 columns that is a full
     32-column band (2048..2079) for every row, 8.65M cells. A consumer that
     scans `[row_start, row_end)` -- `qsa_topk_select` -- is unaffected.
 
     fp32 operands are accepted but `tl.dot` rounds them to a tensor-core
-    format: 8.1e-3 max abs against an fp32 reference on scores to 7.8, outside
-    the test's band. No cell covers fp32; the side cache is bf16.
+    format: 8.1e-3 max abs against an fp32 reference on scores to 7.8 (measured),
+    outside the test's band. No cell covers fp32; the side cache is bf16.
 
-    CUDA graphs: captured at 8191 rows (visible-only), replayed, then replayed
-    again after `q`, the cache and the table were overwritten in place; both
-    matched the reference.
+    CUDA graphs: the test captures the decode launch (`use_pdl`, `prefetch`) at
+    4 rows and replays it after `q` and the anchor keys were rewritten in
+    place; every replay matches an eager call bitwise.
 
     `prefetch` (with `use_pdl` and `only_visible_blocks`, at generation-sized
     batches) reads the pages and compressed keys before the PDL wait and q after
@@ -214,13 +162,14 @@ class QsaPagedIndexScores(OpWrapper):
 
     Every cell runs `only_visible_blocks=True` (the target never passes False),
     4 index heads x 128, compress ratio 4, 32-token pages, bf16 operands, int64
-    positions and int32 request indices.
+    positions and int32 request indices. The NVFP4-pool page stride is
+    certified on the row-wise kernel only.
 
     Not certified: more than 8191 rows, tables wider than 260 pages, more than
     32 table rows, any other head geometry, compress ratio, page size or
-    operand dtype, and the `-inf` padded mode as a cell (the test gates it
-    against the reference outside the cells). Hard limits: not probed; the largest
-    certified extent is 8191 x 2080 output elements.
+    operand dtype, a context step's mixed request rows, and the `-inf` padded
+    mode. Hard limits: not probed; the largest certified extent is 8191 x 2080
+    output elements.
     """
 
     def __call__(

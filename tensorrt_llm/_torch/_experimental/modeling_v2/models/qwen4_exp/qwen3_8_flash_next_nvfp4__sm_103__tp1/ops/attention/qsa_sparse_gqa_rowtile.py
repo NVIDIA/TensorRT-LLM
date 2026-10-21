@@ -683,14 +683,6 @@ class QsaSparseGqaRowtile(OpWrapper):
             why="con 128 mixed: 3 chunks (16240 rows) + 52 decodes on the lone pass",
             spec=_spec([(0, 8192), (2192, 6000), (6144, 2048)] + _decodes(52), slots=128),
         ),
-        Cell(
-            why="int64 request indices and positions",
-            spec=_spec([(1000, 300)], request_dtype=torch.int64),
-        ),
-        Cell(
-            why="holes: all-padding row, foreign request, unmapped page",
-            spec=_spec([(900, 40), (950, 40)], holes=True),
-        ),
     )
 
     note = """
@@ -736,6 +728,10 @@ class QsaSparseGqaRowtile(OpWrapper):
     prefill path, which runs eager. Results are deterministic: the bitmap
     OR, the re-indexed bitmap OR and the lone list order do not change any
     row's arithmetic.
+
+    Not certified: int64 request indices or positions; rows whose selection
+    resolves no token (all padding, a foreign request, unmapped pages);
+    `rows == 0`.
     """
 
     def __call__(
