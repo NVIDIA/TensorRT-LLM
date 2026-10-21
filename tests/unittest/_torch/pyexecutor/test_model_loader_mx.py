@@ -1183,40 +1183,78 @@ def _documented_names(text: str, start: str, end: str) -> set[str]:
     return {re.match(r"[\w.]+", item).group() for item in re.split(r",? and |, ", enumeration)}
 
 
-def _profile_family(profile: PostTransformProfile) -> str:
-    """Return the family that names a profile's donor/receiver rows, such as `qwen3_5`.
-
-    A profile ID names its family before `-for-`.
-    """
-    return profile.profile_id.split("-for-")[0]
-
-
 def _documented_family(profile: PostTransformProfile) -> str:
     """Return the family name by which the doc refers to a profile, such as `Qwen3.5`."""
     family = re.sub(r"For(?:CausalLM|ConditionalGeneration)$", "", profile.architecture)
     return family.replace("_", ".")
 
 
+def _moe_ep_row_partitions(profile: PostTransformProfile) -> list[tuple[int, int]]:
+    """Return the `(TP size, MoE EP size)` pairs with MoE EP above 1 that a profile admits.
+
+    MoE TP takes the rest of TP, so a pair is admitted when the profile admits that MoE TP size.
+    """
+    constraints = profile.runtime_constraints
+    if constraints.moe_backends is None:
+        return []
+    return [
+        (tp_size, moe_ep_size)
+        for tp_size in sorted(constraints.tp_sizes)
+        for moe_ep_size in sorted(constraints.moe_ep_sizes)
+        if moe_ep_size > 1
+        and tp_size % moe_ep_size == 0
+        and tp_size // moe_ep_size in constraints.moe_tp_sizes
+    ]
+
+
+# Donor/receiver rows of each qualified profile, as `(case-ID stem, repository
+# cache stem, model path override variable)`. The rows are `<case-ID stem>-tp1`
+# and `<case-ID stem>-tp2`. A family can have several profiles, so a profile ID
+# does not name its rows.
+_MX_E2E_ROWS = {
+    "llama-for-causal-lm-target-v1": ("llama-bf16", "llama", "TRTLLM_MX_LLAMA_MODEL"),
+    "qwen2-for-causal-lm-bf16-target-v1": ("qwen2-bf16", "qwen2", "TRTLLM_MX_QWEN2_MODEL"),
+    "qwen3-for-causal-lm-bf16-target-v1": ("qwen3-bf16", "qwen3", "TRTLLM_MX_QWEN3_MODEL"),
+    "mistral-for-causal-lm-bf16-target-v1": ("mistral-bf16", "mistral", "TRTLLM_MX_MISTRAL_MODEL"),
+    "phi3-for-causal-lm-bf16-target-v1": ("phi3-bf16", "phi3", "TRTLLM_MX_PHI3_MODEL"),
+    "qwen3_5-for-conditional-generation-bf16-complete-v1": (
+        "qwen3_5-bf16",
+        "qwen3_5",
+        "TRTLLM_MX_QWEN3_5_MODEL",
+    ),
+    "qwen3-moe-for-causal-lm-bf16-cutlass-target-v1": (
+        "qwen3-moe-bf16",
+        "qwen3-moe",
+        "TRTLLM_MX_QWEN3_MOE_MODEL",
+    ),
+}
+
+
 @pytest.mark.cpu_only
 def test_mx_e2e_rows_and_ci_list_match_qualified_profile_registry() -> None:
     """Every qualified profile has TP1 and TP2 donor/receiver rows that CI schedules.
 
-    The `_MX_CASES` rows must follow the shared naming scheme, and
-    `l0_model_express.yml` must list each row exactly once, in a block whose GPU
-    count matches the row's two TP groups.
+    `_MX_E2E_ROWS` names the rows of each profile and needs one entry per
+    qualified profile. The `_MX_CASES` rows must follow the shared naming
+    scheme, and `l0_model_express.yml` must list each row exactly once, in a
+    block whose GPU count matches the row's two TP groups.
     """
+    profiles = ModelLoader._post_transform_profile_registry().profiles
+    assert set(_MX_E2E_ROWS) == {profile.profile_id for profile in profiles}, (
+        "Every qualified profile needs exactly one `_MX_E2E_ROWS` entry"
+    )
     cases = _mx_e2e_cases()
     ci_case_ids = _l0_model_express_case_ids()
     expected_case_ids = set()
-    for profile in ModelLoader._post_transform_profile_registry().profiles:
-        family = _profile_family(profile)
+    for profile in profiles:
+        case_stem, cache_stem, model_env = _MX_E2E_ROWS[profile.profile_id]
         for tp_size in (1, 2):
-            case_id = f"{family}-bf16-tp{tp_size}"
+            case_id = f"{case_stem}-tp{tp_size}"
             expected_case_ids.add(case_id)
             expected_row = {
-                "model_env": f"TRTLLM_MX_{family.upper()}_MODEL",
-                "default_model_subdir": cases[f"{family}-bf16-tp1"]["default_model_subdir"],
-                "repository_cache_prefix": f"models--trtllm-mx-e2e--{family}-tp{tp_size}",
+                "model_env": model_env,
+                "default_model_subdir": cases[f"{case_stem}-tp1"]["default_model_subdir"],
+                "repository_cache_prefix": f"models--trtllm-mx-e2e--{cache_stem}-tp{tp_size}",
                 "tp_size": tp_size,
                 # The donor and the receiver each hold one TP group.
                 "min_devices": 2 * tp_size,
@@ -1224,7 +1262,24 @@ def test_mx_e2e_rows_and_ci_list_match_qualified_profile_registry() -> None:
             if profile.transfer_scope is PostTransformTransferScope.COMPLETE_MODEL:
                 # A complete-model profile carries a vision encoder, so its rows probe with images.
                 expected_row["probe"] = "image"
+            if profile.runtime_constraints.moe_backends is not None:
+                # MoE rows disable the CUTLASS FC2+finalize fusion, which is not
+                # deterministic across processes.
+                expected_row["moe_disable_finalize_fusion"] = True
             assert cases[case_id] == expected_row
+            assert case_id in ci_case_ids[2 * tp_size]
+        # A MoE profile has one more row for each admitted MoE EP size above 1. It
+        # repeats the row of its TP size with its own repository cache and MoE EP size.
+        for tp_size, moe_ep_size in _moe_ep_row_partitions(profile):
+            case_id = f"{case_stem}-tp{tp_size}-ep{moe_ep_size}"
+            expected_case_ids.add(case_id)
+            assert cases[case_id] == {
+                **cases[f"{case_stem}-tp{tp_size}"],
+                "repository_cache_prefix": (
+                    f"models--trtllm-mx-e2e--{cache_stem}-tp{tp_size}-ep{moe_ep_size}"
+                ),
+                "moe_ep_size": moe_ep_size,
+            }
             assert case_id in ci_case_ids[2 * tp_size]
 
     assert set(cases) == expected_case_ids

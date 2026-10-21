@@ -117,11 +117,17 @@ class MxE2ECase:
     `final_manifest_exempt_patterns` lists `fnmatch` patterns of tensor names
     whose final-tier digest may legitimately differ between roles (never a
     numeric tolerance, never at the transfer tier). Every pattern needs a code
-    comment explaining why; the qualified BF16 dense families use none.
+    comment explaining why; no current row uses any.
 
     `probe` selects the worker's behavioral probe: `text` sends token-ID
     prompts, and `image` sends image prompts so that vision-language rows also
     exercise the vision encoder on every role.
+
+    `moe_ep_size` selects the MoE expert-parallel size of a MoE row; MoE TP
+    takes the rest of TP. `moe_disable_finalize_fusion` disables the CUTLASS
+    MoE FC2+finalize fusion in every role, because the fused finalize is not
+    deterministic for top-k greater than 2 and the roles must produce
+    identical greedy tokens.
     """
 
     model_env: str
@@ -130,6 +136,8 @@ class MxE2ECase:
     tp_size: int
     final_manifest_exempt_patterns: tuple[str, ...] = ()
     probe: str = "text"
+    moe_ep_size: int = 1
+    moe_disable_finalize_fusion: bool = False
 
     def __post_init__(self) -> None:
         """Reject a probe that `mx_e2e_worker.py` does not implement."""
@@ -388,6 +396,16 @@ def worker_command(
         command.extend(("--max-serve-seconds", str(max_serve_seconds)))
     command.extend(extra_args)
     return command
+
+
+def moe_worker_args(case: MxE2ECase) -> tuple[str, ...]:
+    """Worker flags that apply a row's MoE settings identically to every role."""
+    args: list[str] = []
+    if case.moe_ep_size != 1:
+        args.extend(("--moe-ep-size", str(case.moe_ep_size)))
+    if case.moe_disable_finalize_fusion:
+        args.append("--moe-disable-finalize-fusion")
+    return tuple(args)
 
 
 def mx_metadata_ports(tp_size: int) -> tuple[int, int]:
@@ -903,6 +921,7 @@ __all__ = [
     "load_payload",
     "log_tail",
     "models_root",
+    "moe_worker_args",
     "mx_metadata_ports",
     "probe_worker_args",
     "qualification_required",
