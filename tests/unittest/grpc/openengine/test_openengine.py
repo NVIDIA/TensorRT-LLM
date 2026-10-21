@@ -17,6 +17,7 @@
 import asyncio
 import gc
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -46,6 +47,19 @@ def test_format_bind_address_brackets_ipv6() -> None:
     assert _format_bind_address("127.0.0.1", 8000) == "127.0.0.1:8000"
     assert _format_bind_address("::1", 8000) == "[::1]:8000"
     assert _format_bind_address("[::1]", 8000) == "[::1]:8000"
+
+
+def test_stop_closes_media_session_when_grpc_stop_fails() -> None:
+    async def exercise_stop() -> None:
+        server = OpenEngineServer.__new__(OpenEngineServer)
+        server._server = SimpleNamespace(stop=AsyncMock(side_effect=RuntimeError("stop failed")))
+        media_session = await _get_aiohttp_session()
+        with pytest.raises(RuntimeError, match="stop failed"):
+            await server.stop(grace=0)
+        server._server.stop.assert_awaited_once_with(grace=0)
+        assert media_session.closed
+
+    asyncio.run(exercise_stop())
 
 
 def test_openengine_server_serves_the_control_contract() -> None:

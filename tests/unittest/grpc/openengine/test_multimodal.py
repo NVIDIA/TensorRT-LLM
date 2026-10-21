@@ -9,6 +9,7 @@ import threading
 from collections.abc import AsyncIterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
+from io import BytesIO
 from types import SimpleNamespace
 from typing import Any
 
@@ -359,6 +360,137 @@ def test_decoded_audio_bytes_count_samples_and_reject_unknown_types():
     assert request_mapping._decoded_audio_bytes((np.zeros(8, dtype=np.float32), 16000)) == 8 * 4
     with pytest.raises(TypeError, match="unsupported decoded audio type"):
         request_mapping._decoded_audio_bytes(object())
+
+
+@pytest.mark.parametrize("channels", [1, 2])
+@pytest.mark.parametrize("source", ["bytes", "base64", "file"])
+def test_audio_reserves_before_decoding_and_preserves_samples(
+    channels, source, tmp_path, monkeypatch
+):
+    import base64
+
+    import soundfile
+
+    samples = np.arange(32 * channels, dtype=np.float64).reshape(32, channels) / 128
+    encoded = BytesIO()
+    soundfile.write(encoded, samples, 16000, format="FLAC")
+    data = encoded.getvalue()
+    expected, _ = soundfile.read(BytesIO(data))
+    budget = request_mapping._DecodedMediaBudget(samples.nbytes)
+    original_read = soundfile.SoundFile.read
+
+    def checked_read(audio, *args, **kwargs):
+        assert (budget._used, budget._reserved_retained) == (samples.nbytes, samples.nbytes)
+        assert kwargs["out"].nbytes == samples.nbytes
+        return original_read(audio, *args, **kwargs)
+
+    monkeypatch.setattr(soundfile.SoundFile, "read", checked_read)
+    loader = media_io.AudioMediaIO(decoded_memory_reserver=budget.reserve)
+    if source == "bytes":
+        decoded, rate = loader.load_bytes(data)
+    elif source == "base64":
+        decoded, rate = loader.load_base64("audio/flac", base64.b64encode(data).decode())
+    else:
+        path = tmp_path / "audio.flac"
+        path.write_bytes(data)
+        decoded, rate = loader.load_file(path.as_uri())
+    np.testing.assert_array_equal(decoded, expected)
+    assert rate == 16000
+    assert (budget._used, budget._retained, budget._reserved_retained) == (
+        samples.nbytes,
+        samples.nbytes,
+        0,
+    )
+
+
+@pytest.mark.parametrize("outcome", ["oversized", "failure", "truncated", "cancelled"])
+def test_audio_budget_rejects_before_allocation_and_cleans_up(outcome, monkeypatch):
+    import soundfile
+
+    encoded = BytesIO()
+    soundfile.write(encoded, np.zeros((32, 2)), 16000, format="FLAC")
+    budget = request_mapping._DecodedMediaBudget(511 if outcome == "oversized" else 512)
+    loader = media_io.AudioMediaIO(decoded_memory_reserver=budget.reserve)
+
+    def read(audio, *args, **kwargs):
+        if outcome == "oversized":
+            pytest.fail("oversized audio must be rejected before decoding")
+        if outcome == "failure":
+            raise RuntimeError("decode failed")
+        if outcome == "cancelled":
+            raise asyncio.CancelledError()
+        return kwargs["out"][:0]
+
+    monkeypatch.setattr(soundfile.SoundFile, "read", read)
+    if outcome == "oversized":
+        monkeypatch.setattr(
+            np, "empty", lambda *args, **kwargs: pytest.fail("allocated oversized audio")
+        )
+    error = {
+        "oversized": ValueError,
+        "failure": RuntimeError,
+        "truncated": ValueError,
+        "cancelled": asyncio.CancelledError,
+    }[outcome]
+    with pytest.raises(error):
+        loader.load_bytes(encoded.getvalue())
+    assert (budget._used, budget._retained, budget._reserved_retained) == (0, 0, 0)
+
+
+@pytest.mark.asyncio
+async def test_audio_request_uses_one_shared_budget_without_double_charging(
+    image_video_audio_llm, monkeypatch
+):
+    import soundfile
+
+    encoded = BytesIO()
+    soundfile.write(encoded, np.zeros(32), 16000, format="FLAC")
+    monkeypatch.setattr(request_mapping, "_MAX_TOTAL_DECODED_MEDIA_BYTES", 256)
+    item = generation_pb2.MediaItem(
+        modality=generation_pb2.MODALITY_AUDIO, raw_bytes=encoded.getvalue(), mime_type="audio/flac"
+    )
+    request = generation_pb2.GenerateRequest(prompt="transcribe", media=[item])
+    mapped = await request_mapping._input_from_request(request, image_video_audio_llm)
+    assert mapped["multi_modal_data"]["audio"][0][0].nbytes == 256
+    request.media.append(item)
+    with pytest.raises(ValueError, match="decoded media exceeds"):
+        await request_mapping._input_from_request(request, image_video_audio_llm)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("audio_encoder", [False, True])
+async def test_gemma4_audio_capability_requires_checkpoint_encoder(audio_encoder, monkeypatch):
+    class GemmaConfig:
+        model_type = "gemma4"
+        audio_config = object() if audio_encoder else None
+
+    llm = SimpleNamespace(input_processor=_ImageInputProcessor(GemmaConfig()))
+    monkeypatch.setattr(
+        MULTIMODAL_PLACEHOLDER_REGISTRY,
+        "is_valid",
+        lambda model_type, modality: modality in {"image", "audio"},
+    )
+    monkeypatch.setattr(
+        MULTIMODAL_PLACEHOLDER_REGISTRY,
+        "get_placeholder",
+        lambda model_type, modality: f"<{modality}_{{}}>",
+    )
+    capabilities = request_mapping.media_capabilities_for_model(llm)
+    assert "image" in capabilities.modalities
+    assert ("audio" in capabilities.modalities) == audio_encoder
+    if not audio_encoder:
+        request = generation_pb2.GenerateRequest(
+            prompt="transcribe",
+            media=[
+                generation_pb2.MediaItem(
+                    modality=generation_pb2.MODALITY_AUDIO,
+                    raw_bytes=b"unused",
+                    mime_type="audio/wav",
+                )
+            ],
+        )
+        with pytest.raises(UnsupportedFeatureError, match="audio"):
+            await request_mapping._input_from_request(request, llm, capabilities)
 
 
 def test_decoded_media_budget_settles_peak_to_retained_bytes():
@@ -748,7 +880,11 @@ async def test_media_sources_preserve_global_order(image_video_audio_llm, monkey
     assert set(video_runtime) == {"decoded_memory_reserver"}
     assert callable(video_runtime["decoded_memory_reserver"])
     assert created_with[1] == ("image", {"format": "np"}, None)
-    assert created_with[2] == ("audio", None, None)
+    audio_modality, audio_defaults, audio_runtime = created_with[2]
+    assert audio_modality == "audio"
+    assert audio_defaults is None
+    assert set(audio_runtime) == {"decoded_memory_reserver"}
+    assert callable(audio_runtime["decoded_memory_reserver"])
     assert audio_sources == ["https://example.com/audio.wav"]
     assert mapped["multi_modal_data"]["audio"][0][1] == 16000
     assert [video.metadata["source"] for video in mapped["multi_modal_data"]["video"]] == [

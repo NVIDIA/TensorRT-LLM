@@ -1300,29 +1300,55 @@ class AudioMediaIO(BaseMediaIO[Tuple[np.ndarray, int]]):
 
     _data_uri_mime_prefix: ClassVar[Optional[str]] = "audio/"
 
-    def __init__(self, **kwargs) -> None:
-        # AudioMediaIO has no configurable parameters. An explicit __init__
-        # is needed so that BaseMediaIO.create() does not crash when kwargs
-        # are present (e.g. via --media_io_kwargs or the per-request API).
+    def __init__(
+        self, decoded_memory_reserver: Optional[_DecodedMemoryReserver] = None, **kwargs
+    ) -> None:
+        self._decoded_memory_reserver = decoded_memory_reserver
         if kwargs:
             logger.warning(
-                "AudioMediaIO received unexpected kwargs %s — audio loading "
-                "has no configurable parameters; kwargs will be ignored.",
+                "AudioMediaIO received unexpected kwargs %s; kwargs will be ignored.",
                 sorted(kwargs),
             )
 
     def load_bytes(self, data: bytes) -> Tuple[np.ndarray, int]:
-        return soundfile.read(BytesIO(data))
+        return self._read(BytesIO(data))
 
     def load_base64(self, media_type: str, data: str) -> Tuple[np.ndarray, int]:
-        return soundfile.read(BytesIO(base64.b64decode(data)))
+        return self.load_bytes(base64.b64decode(data))
 
     def load_file(self, url: str) -> Tuple[np.ndarray, int]:
         # Strip `file://` and unquote the path for `file:` URIs; pass
         # empty-scheme URLs through verbatim.
         parsed = urlparse(url)
         path = _normalize_file_uri(url) if parsed.scheme == "file" else url
-        return soundfile.read(path)
+        return self._read(path)
+
+    def _read(self, source: Union[BytesIO, str]) -> Tuple[np.ndarray, int]:
+        if self._decoded_memory_reserver is None:
+            return soundfile.read(source)
+
+        reservation = None
+        try:
+            # Read metadata and samples from the same handle. Reserve the float64
+            # output before allocation; libsndfile's internal buffers are excluded.
+            with soundfile.SoundFile(source) as audio:
+                frames, channels = audio.frames, audio.channels
+                if frames < 0 or channels < 1:
+                    raise ValueError("invalid audio frame or channel count")
+                decoded_bytes = frames * channels * np.dtype(np.float64).itemsize
+                reservation = self._decoded_memory_reserver(decoded_bytes, decoded_bytes)
+                shape = (frames,) if channels == 1 else (frames, channels)
+                samples = np.empty(shape, dtype=np.float64)
+                decoded = audio.read(frames=frames, out=samples)
+                if decoded.shape != samples.shape:
+                    raise ValueError("audio decoded fewer frames than its header declares")
+                sample_rate = audio.samplerate
+            reservation.commit(samples.nbytes)
+            return samples, sample_rate
+        finally:
+            samples = decoded = None
+            if reservation is not None:
+                reservation.release()
 
 
 class VideoMediaIO(BaseMediaIO[VideoData]):

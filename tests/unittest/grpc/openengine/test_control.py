@@ -427,6 +427,24 @@ async def test_abort_all_fails_the_rpc_when_any_abort_is_refused():
 
 
 @pytest.mark.asyncio
+async def test_health_probe_is_not_applicable_to_text_only_input_models():
+    llm = _llm(_supports_token_ids_input=False)
+
+    def unexpected_generate(*args, **kwargs):
+        pytest.fail("a token-only probe must not reach a prompt-only model")
+
+    llm.generate_async = unexpected_generate
+    servicer = OpenEngineControlServicer(llm, MODEL, _inference(), kv_transfer_backend="")
+    response = await servicer.Health(
+        lifecycle_pb2.HealthRequest(include_inference_probe=True), FakeServicerContext()
+    )
+    probe = next(check for check in response.checks if check.name == "inference_probe")
+    assert probe.state == lifecycle_pb2.HEALTH_STATE_READY
+    assert "not applicable" in probe.message
+    assert response.state == lifecycle_pb2.HEALTH_STATE_READY
+
+
+@pytest.mark.asyncio
 async def test_health_inference_probe_is_bounded_and_aborts_a_stuck_request():
     """A wedged engine must yield DEGRADED, not a hung RPC or a leaked request."""
     import asyncio

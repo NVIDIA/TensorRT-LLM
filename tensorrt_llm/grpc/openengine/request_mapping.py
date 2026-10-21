@@ -475,8 +475,10 @@ def _video_loader_factory(llm: Any, budget: _DecodedMediaBudget) -> _MediaLoader
     return load
 
 
-def _audio_loader_factory(llm: Any, _budget: _DecodedMediaBudget) -> _MediaLoader:
-    audio_io = _media_io_for_model(llm, "audio", AudioMediaIO)
+def _audio_loader_factory(llm: Any, budget: _DecodedMediaBudget) -> _MediaLoader:
+    audio_io = _media_io_for_model(
+        llm, "audio", AudioMediaIO, {"decoded_memory_reserver": budget.reserve}
+    )
 
     async def load(item: generation_pb2.MediaItem, index: int) -> Any:
         return await _load_media_item(item, audio_io, index, "audio")
@@ -535,7 +537,7 @@ _MEDIA_HANDLERS: dict[int, _MediaHandler] = {
         reserves_decoded_bytes=True,
     ),
     generation_pb2.MODALITY_AUDIO: _MediaHandler(
-        "audio", _audio_loader_factory, _decoded_audio_bytes
+        "audio", _audio_loader_factory, _decoded_audio_bytes, reserves_decoded_bytes=True
     ),
 }
 
