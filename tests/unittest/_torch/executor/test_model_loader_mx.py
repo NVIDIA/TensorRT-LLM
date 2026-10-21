@@ -1049,26 +1049,53 @@ def _documented_names(text: str, start: str, end: str) -> set[str]:
     return {re.match(r"\w+", item).group() for item in re.split(r",? and |, ", enumeration)}
 
 
+# Donor/receiver rows of each qualified profile, as `(case-ID stem, repository
+# cache stem, model path override variable)`. The rows are `<case-ID stem>-tp1`
+# and `<case-ID stem>-tp2`. A family can have several profiles (Qwen3 has a BF16
+# and an FP8 block-scale one), so a profile ID does not name its rows.
+_MX_E2E_ROWS = {
+    "llama-for-causal-lm-target-v1": ("llama-bf16", "llama", "TRTLLM_MX_LLAMA_MODEL"),
+    "qwen2-for-causal-lm-bf16-target-v1": ("qwen2-bf16", "qwen2", "TRTLLM_MX_QWEN2_MODEL"),
+    "qwen3-for-causal-lm-fp8-block-sm90-target-v1": (
+        "qwen3-fp8-block",
+        "qwen3-fp8-block",
+        "TRTLLM_MX_QWEN3_FP8_MODEL",
+    ),
+    "qwen3-for-causal-lm-bf16-target-v1": ("qwen3-bf16", "qwen3", "TRTLLM_MX_QWEN3_MODEL"),
+    "mistral-for-causal-lm-bf16-target-v1": (
+        "mistral-bf16",
+        "mistral",
+        "TRTLLM_MX_MISTRAL_MODEL",
+    ),
+    "phi3-for-causal-lm-bf16-target-v1": ("phi3-bf16", "phi3", "TRTLLM_MX_PHI3_MODEL"),
+}
+
+
 @pytest.mark.cpu_only
 def test_mx_e2e_rows_and_ci_list_match_qualified_profile_registry() -> None:
     """Every qualified profile has TP1 and TP2 donor/receiver rows that CI schedules.
 
-    The `_MX_CASES` rows must follow the shared naming scheme, and
-    `l0_model_express.yml` must list each row exactly once, in a block whose GPU
-    count matches the row's two TP groups.
+    `_MX_E2E_ROWS` names the rows of each profile and needs one entry per
+    qualified profile. The `_MX_CASES` rows must follow the shared naming
+    scheme, and `l0_model_express.yml` must list each row exactly once, in a
+    block whose GPU count matches the row's two TP groups.
     """
+    profiles = ModelLoader._post_transform_profile_registry().profiles
+    assert set(_MX_E2E_ROWS) == {profile.profile_id for profile in profiles}, (
+        "Every qualified profile needs exactly one `_MX_E2E_ROWS` entry"
+    )
     cases = _mx_e2e_cases()
     ci_case_ids = _l0_model_express_case_ids()
     expected_case_ids = set()
-    for profile in ModelLoader._post_transform_profile_registry().profiles:
-        family = profile.profile_id.split("-for-causal-lm-")[0]
+    for profile in profiles:
+        case_stem, cache_stem, model_env = _MX_E2E_ROWS[profile.profile_id]
         for tp_size in (1, 2):
-            case_id = f"{family}-bf16-tp{tp_size}"
+            case_id = f"{case_stem}-tp{tp_size}"
             expected_case_ids.add(case_id)
             assert cases[case_id] == {
-                "model_env": f"TRTLLM_MX_{family.upper()}_MODEL",
-                "default_model_subdir": cases[f"{family}-bf16-tp1"]["default_model_subdir"],
-                "repository_cache_prefix": f"models--trtllm-mx-e2e--{family}-tp{tp_size}",
+                "model_env": model_env,
+                "default_model_subdir": cases[f"{case_stem}-tp1"]["default_model_subdir"],
+                "repository_cache_prefix": f"models--trtllm-mx-e2e--{cache_stem}-tp{tp_size}",
                 "tp_size": tp_size,
                 # The donor and the receiver each hold one TP group.
                 "min_devices": 2 * tp_size,
@@ -1115,8 +1142,10 @@ def test_documentation_prose_matches_qualified_profile_registry() -> None:
         )
     ]
     cases = _mx_e2e_cases()
-    assert set(re.findall(r"\b[a-z][a-z0-9]*-bf16-tp\d+\b", qualification_test)) == set(cases)
-    assert set(re.findall(r"\bTRTLLM_MX_[A-Z0-9]+_MODEL\b", qualification_test)) == {
+    case_id_pattern = r"\b[a-z][a-z0-9]*-(?:bf16|fp8-block)-tp\d+\b"
+    model_env_pattern = r"\bTRTLLM_MX_[A-Z0-9_]+_MODEL\b"
+    assert set(re.findall(case_id_pattern, qualification_test)) == set(cases)
+    assert set(re.findall(model_env_pattern, qualification_test)) == {
         row["model_env"] for row in cases.values()
     }
 
