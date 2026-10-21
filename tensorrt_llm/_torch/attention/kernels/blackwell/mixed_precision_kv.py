@@ -8,11 +8,9 @@ import torch
 from cutlass.base_dsl.dsl import BaseDSL
 from cutlass.cute.runtime import from_dlpack, make_fake_stream
 
-# These FlashInfer modules are internal, not public API. requirements.txt pins
-# flashinfer-python==0.6.18; a bump must keep get_ptr_as_int64, st_global_u64 and
-# the three process_nvfp4_block_* codecs, or update this module. The CPU-only
-# import test in tests/unittest/_torch/attention/test_mixed_precision_backends.py
-# fails fast on a bump that drops them.
+# Internal FlashInfer symbols; requirements.txt pins flashinfer-python==0.6.18.
+# A bump must keep these names or update this module. The CPU-only import test
+# in test_mixed_precision_backends.py fails fast if they disappear.
 from flashinfer.cute_dsl.fp4_common import get_ptr_as_int64, st_global_u64
 from flashinfer.quantization.quantization_cute_dsl_utils import (
     process_nvfp4_block_bfloat,

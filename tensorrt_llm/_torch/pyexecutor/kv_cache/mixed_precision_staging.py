@@ -13,12 +13,7 @@ from ...memory_buffer_utils import Buffers
 
 
 class MixedPrecisionKVStaging:
-    """Staging copy that lets attention read a mixed-precision layer as one ordinary KV cache.
-
-    Before attention runs, the low-precision history and the retained
-    high-precision tokens are gathered into it in the attention dtype; after
-    attention, the tokens just written are copied back to the two pools.
-    """
+    """Staging copy that lets attention read a mixed-precision layer as one plain KV cache."""
 
     def __init__(
         self,
@@ -30,11 +25,7 @@ class MixedPrecisionKVStaging:
         pool_layout: str,
         tokens_per_block: int,
     ) -> None:
-        """Allocate the staging copy once per rank, from the attention metadata's buffer pool.
-
-        It is sized for the largest batch and the longest sequence the engine
-        can run, in the page geometry the attention kernels read.
-        """
+        """Allocate the per-rank staging copy for the largest batch and longest sequence."""
         self.manager = manager
         self.buffers = buffers
         self.rows = rows

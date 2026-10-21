@@ -367,12 +367,7 @@ class AttentionMetadata:
 
     def prepare_mixed_precision_kv(self, layout: str,
                                    tokens_per_block: int) -> None:
-        """Refresh the mixed-precision staging cache for this batch.
-
-        Backends call this from prepare() with the paged layout their kernels
-        read. CUDA graph metadata keeps its staging object so the captured
-        addresses stay valid; only the page tables and lengths are reloaded.
-        """
+        """Create the staging copy on first use, then refresh it per batch."""
         from ...pyexecutor.kv_cache.mixed_precision_staging import \
             MixedPrecisionKVStaging
 
@@ -416,21 +411,15 @@ class AttentionMetadata:
 
     @contextlib.contextmanager
     def mixed_precision_kv_staging(self, layer_idx: int):
-        """Run attention for ``layer_idx`` against its native-dtype staging cache.
-
-        Converts the layer's mixed-precision pools into staging, points this
-        metadata at the staging cache for the duration of the block, restores
-        the metadata, and writes the new tokens back only if the block
-        completed. A no-op for layers without mixed-precision KV.
-        """
+        """Run attention on the staging copy, then write the new tokens back."""
         view = self.get_mixed_precision_kv_view(layer_idx)
         if view is None:
-            yield None
+            yield
             return
         view.convert(layer_idx)
         saved = self._swap_mixed_precision_kv(view)
         try:
-            yield view
+            yield
         finally:
             self._restore_mixed_precision_kv(saved)
         view.convert(layer_idx, writeback=True)

@@ -3116,11 +3116,9 @@ class KVCacheManagerV2(BaseResourceManager):
         self.is_vswa = uses_vswa_kv_cache_layout(self.max_attention_window_vec)
         return replace(config, layers=layers)
 
-    # Mixed-precision KV (kv_cache_config.dtype = "mixed_<low>_<high>"): every
-    # ordinary full-attention layer keeps its full history in a low-precision
-    # pool, and a second native SWA+sink layer group holds the first_n/last_n
-    # tokens of each sequence at the attention dtype. Attention reads and
-    # writes a native-dtype staging copy prepared by the attention metadata.
+    # Mixed-precision KV: each full-attention layer keeps its history in a low-precision pool
+    # and a native SWA+sink layer group keeps every sequence's first_n/last_n tokens at the
+    # attention dtype. Attention reads a staging copy prepared by the attention metadata.
 
     def _init_mixed_precision(
         self, kv_cache_config: KvCacheConfig, pretrained_config, max_seq_len: int, dtype: DataType
