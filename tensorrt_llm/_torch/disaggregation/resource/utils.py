@@ -118,6 +118,18 @@ def get_pool_view_num_layers(pool_view: PoolView) -> int:
     return len(get_unique_layers(pool_view))
 
 
+def get_pool_view_slot_bytes(pool_view: PoolView) -> int:
+    """Transferable bytes of *pool_view* within one physical slot.
+
+    Sum of the view's buffer-entry sizes: exactly the byte regions the
+    mappers move for this view, per slot. This is smaller than the physical
+    pool's ``slot_bytes`` whenever the slot also holds other role classes
+    (coalesced pools carry one view per class) or local-only ignored-role
+    buffers (which occupy slot offsets but appear in no view).
+    """
+    return int(pool_view.buffer_entries["size"].sum())
+
+
 def get_pool_view_global_layer_ids(pool_view: PoolView, layer_group: "LayerGroup") -> List[int]:
     """
     Global layer IDs for the layers that appear in *pool_view*, ordered by their

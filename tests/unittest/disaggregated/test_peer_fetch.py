@@ -64,8 +64,10 @@ class _StubSession:
         self.cancel_committed = 0
         self.notified = 0
         self.closed = 0
+        self.expected_write_bytes_seen = []
 
-    def receive(self, chunk):
+    def receive(self, chunk, expected_write_bytes=None):
+        self.expected_write_bytes_seen.append(expected_write_bytes)
         if self.raise_on_receive is not None:
             if self.append_before_raising:
                 self._append_task(chunk)
@@ -163,6 +165,15 @@ def test_each_attempt_holds_its_own_piece():
     worker.session._kv_tasks[0].complete()
     assert isinstance(first.poll(), Delivered)
     assert second.poll() is None
+
+
+def test_the_byte_total_rides_with_the_piece():
+    """A session that never hears the total can never verify coverage, and nothing would say so."""
+    worker = _StubWorker()
+    peer = PeerFetch(worker, _request())
+    peer.fetch(_extent(), expected_write_bytes=4096)
+    peer.fetch(_extent())
+    assert worker.session.expected_write_bytes_seen == [4096, None]
 
 
 def test_naming_a_peer_is_refused_rather_than_ignored():

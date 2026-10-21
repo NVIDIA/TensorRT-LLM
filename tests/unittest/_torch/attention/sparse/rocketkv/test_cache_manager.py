@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
@@ -58,3 +58,17 @@ def test_kt_pool_uses_local_heads():
     kt_bytes = sum(pool.numel() * pool.element_size() for pool in pools)
     main_bytes_per_token = 2 * sum(local_heads) * 128 * 2
     assert manager.get_cache_bytes_per_token() == main_bytes_per_token + kt_bytes // 128
+
+
+@pytest.mark.parametrize("is_gen", [False, True])
+def test_dummy_requests_without_free_blocks(is_gen: bool) -> None:
+    from tensorrt_llm._torch.attention.backends.sparse.rocket import cache_manager as module
+
+    manager = module.RocketKVCacheManager.__new__(module.RocketKVCacheManager)
+    manager.kt_cache_manager = SimpleNamespace(add_tokens=Mock())
+    with patch.object(module.KVCacheManager, "get_num_free_blocks", return_value=0) as free_blocks:
+        requests = manager.add_dummy_requests([1], token_nums=[8], is_gen=is_gen)
+
+    assert requests is None
+    free_blocks.assert_called_once_with()
+    manager.kt_cache_manager.add_tokens.assert_not_called()

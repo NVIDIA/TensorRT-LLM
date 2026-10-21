@@ -518,7 +518,6 @@ def build_progress_tools(ctx: ProgressContext) -> dict[str, list[Any]]:
                 },
                 "measured_gain_pct": {"type": "number"},
                 "measured_value": {"type": "number"},
-                "required_gain_pct": {"type": "number"},
                 "best_candidate_id": {"type": "string"},
                 "curve": _CURVE_FIELD_SCHEMA,
             },
@@ -530,7 +529,6 @@ def build_progress_tools(ctx: ProgressContext) -> dict[str, list[Any]]:
                 "remediation_attempts",
                 "measured_gain_pct",
                 "measured_value",
-                "required_gain_pct",
                 "best_candidate_id",
             ],
         },
@@ -546,7 +544,6 @@ def build_progress_tools(ctx: ProgressContext) -> dict[str, list[Any]]:
                 "remediation_attempts": int(args["remediation_attempts"]),
                 "measured_gain_pct": float(args["measured_gain_pct"]),
                 "measured_value": float(args["measured_value"]),
-                "required_gain_pct": float(args["required_gain_pct"]),
                 "best_candidate_id": str(args["best_candidate_id"]),
             }
         )

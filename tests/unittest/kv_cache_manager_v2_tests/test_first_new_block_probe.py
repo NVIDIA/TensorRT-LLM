@@ -30,6 +30,7 @@ variable-window managers -- supports VSWA here.
 
 import gc
 import os
+import sys
 import unittest
 from collections.abc import Sequence
 from dataclasses import replace
@@ -46,24 +47,33 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
 from tensorrt_llm.runtime.kv_cache_manager_v2 import sequence_to_blockchain_keys
 
 if not TYPE_CHECKING and find_spec("kv_cache_manager_v2") is not None:
-    from kv_cache_manager_v2 import CudaStream, KVCacheManager, TokenId, _introspection
-    from kv_cache_manager_v2._block_radix_tree import ReuseScope
-    from kv_cache_manager_v2._utils import TemporaryCudaStream, init_cuda_once, temporary_sys_path
+    from kv_cache_manager_v2 import CudaStream, KVCacheManager, ReuseScope, TokenId, _introspection
 else:
     from tensorrt_llm.runtime.kv_cache_manager_v2 import (
         CudaStream,
         KVCacheManager,
+        ReuseScope,
         TokenId,
         _introspection,
     )
-    from tensorrt_llm.runtime.kv_cache_manager_v2._block_radix_tree import ReuseScope
-    from tensorrt_llm.runtime.kv_cache_manager_v2._utils import (
+
+_TEST_DIR = os.path.dirname(os.path.abspath(__file__))
+# cuda_test_utils supplies temporary_sys_path, so its own path entry is added and
+# removed by hand here; every later sibling import goes through that helper.
+_ADDED_TEST_DIR = _TEST_DIR not in sys.path
+if _ADDED_TEST_DIR:
+    sys.path.insert(0, _TEST_DIR)
+try:
+    from cuda_test_utils import (  # noqa: E402
         TemporaryCudaStream,
         init_cuda_once,
         temporary_sys_path,
     )
+finally:
+    if _ADDED_TEST_DIR:
+        sys.path.remove(_TEST_DIR)
 
-with temporary_sys_path(os.path.dirname(os.path.abspath(__file__))):
+with temporary_sys_path(_TEST_DIR):
     from test_kv_cache_manager_v2 import create_config
 
 TOKENS_PER_BLOCK = 4
@@ -219,9 +229,9 @@ class TestFirstNewBlockProbe(unittest.TestCase):
         scopes = [
             ReuseScope(),
             ReuseScope(lora_id=0),
-            ReuseScope(salt=0),
-            ReuseScope(lora_id=0, salt=0),
-            ReuseScope(lora_id=7, salt=(1 << 64) - 1),
+            ReuseScope(salt=""),
+            ReuseScope(lora_id=0, salt=""),
+            ReuseScope(lora_id=7, salt="tenant-中文"),
         ]
         keys = [self.probe_key(tokens, scope) for scope in scopes]
         self.assertEqual(len(set(keys)), len(scopes))
@@ -243,7 +253,7 @@ class TestFirstNewBlockProbe(unittest.TestCase):
 
     def test_backoff_uses_the_last_complete_matched_block(self) -> None:
         tokens = self.tokens(0, 4 * TOKENS_PER_BLOCK)
-        scope = ReuseScope(lora_id=7, salt=1234)
+        scope = ReuseScope(lora_id=7, salt="1234")
         for backoff in (1, TOKENS_PER_BLOCK, TOKENS_PER_BLOCK + 1, len(tokens)):
             with self.subTest(backoff=backoff):
                 config = replace(self.manager.init_config, reuse_match_backoff=backoff)
@@ -268,7 +278,7 @@ class TestFirstNewBlockProbe(unittest.TestCase):
         tokens = self.tokens(0, 4 * TOKENS_PER_BLOCK)
         tokens[3] = bytes([17]) * 32
         tokens[9] = bytes([23]) * 32
-        scope = ReuseScope(lora_id=9, salt=4567)
+        scope = ReuseScope(lora_id=9, salt="4567")
         self.commit(tokens[: 2 * TOKENS_PER_BLOCK], scope)
         self.assertIsNotNone(self.probe_key(tokens, scope))
         self.assertNotEqual(self.probe_key(tokens, scope), self.probe_key(tokens, ReuseScope()))

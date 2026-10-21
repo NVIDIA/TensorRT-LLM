@@ -30,12 +30,19 @@ from torch import nn
 from torch.nn.attention import SDPBackend, sdpa_kernel
 from transformers import PretrainedConfig
 
+from tensorrt_llm.bindings import DataType
 from tensorrt_llm.functional import AllReduceStrategy, PositionEmbeddingType
+from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.quantization.mode import QuantAlgo
 
 from ..attention.attention import Attention
 from ..attention.backends import AttentionMetadata
+from ..attention.backends.fmha.fallback import FallbackFmha
+from ..attention.backends.fmha.flashinfer_trtllm_gen import FlashInferTrtllmGenFmha
+from ..attention.backends.fmha.msa_prefill import _aligned_nvfp4_dequant_scales
+from ..attention.backends.fmha.registry import get_enabled_fmha_lib_classes
 from ..attention.backends.interface import (
     AttentionForwardArgs,
     PositionalEmbeddingParams,
@@ -49,6 +56,7 @@ from ..attention.backends.sparse.minimax_m3 import (
 )
 from ..attention.backends.sparse.minimax_m3.common import index_head_range
 from ..attention.backends.sparse.params import SparseBackendForwardArgs
+from ..attention.backends.trtllm import TrtllmAttention
 from ..distributed import AllReduce, AllReduceFusionOp, AllReduceParams, MiniMaxAllReduceRMS
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
@@ -64,7 +72,6 @@ from ..modules.linear import (
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
 from ..moe.fused_moe import MiniMaxM3MoeRoutingMethod, SwigluBiasActivation, create_moe
-from ..moe.fused_moe.interface import MoESchedulerKind
 from ..pyexecutor.breakable_cuda_graph import eager_on_graph, is_in_breakable_cuda_graph
 from ..speculative import SpecMetadata
 from ..utils import AuxStreamType, EventType, get_model_extra_attrs, is_torch_compiling
@@ -73,16 +80,17 @@ from .checkpoints.hf.minimaxm3_weight_mapper import MINIMAX_M3_PARAMS_MAP, MiniM
 from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import DecoderModel, ModelConfig, filter_weights, register_auto_model
 
-# Dense layers use SDPA with non-contiguous Q/K/V and a bool attn_mask.
-# Limit backends to memory-efficient and math; cuDNN SDPA fails for this layout,
-# and flash SDPA does not accept attn_mask.
+# Legacy dense fallback: cuDNN cannot consume this SDPA layout.
 _DENSE_SDPA_BACKENDS = [SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH]
 
 
 def _moe_routed_output_is_global(experts: nn.Module) -> bool:
-    """Return whether the selected MoE backend performs fused communication."""
-    backend = getattr(experts, "backend", experts)
-    return getattr(backend, "scheduler_kind", None) == MoESchedulerKind.FUSED_COMM
+    """Return whether the MoE layer hands back an already-combined routed output.
+
+    ``VanillaMoE`` is not an ``MoE`` subclass; it owns its communication, so
+    its output is always a rank partial.
+    """
+    return getattr(experts, "returns_global_routed_output", False)
 
 
 class MiniMaxM3QKVIndexerLinear(Linear):
@@ -228,6 +236,14 @@ class MiniMaxM3QKVIndexerLinear(Linear):
                     [local_shards[name][key] for name in self._SHARD_NAMES], dim=0
                 ).contiguous()
 
+        # KV calibration is per tensor, independent of the TP row partition.
+        for key in ("k_scale", "v_scale"):
+            scales = [
+                shards[name][key].reshape(()) for name in ("q", "k", "v") if key in shards[name]
+            ]
+            if scales:
+                combined[key] = torch.stack(scales).amax()
+
         # The checkpoint tensors above are already rank-local and packed.
         # Temporarily select vanilla loading so Linear copies them without a
         # second TP split or the three-shard QKV loader.
@@ -323,6 +339,41 @@ def get_text_model_config(
     return cfg
 
 
+def _nvfp4_cache_supports_fused_write(
+    data: torch.Tensor, scales: torch.Tensor, num_heads: int
+) -> bool:
+    """Reject invalid HND pools; select fusion only for its packed layout."""
+    if (
+        data.dim() != 5
+        or scales.dim() != 5
+        or data.shape[0] <= 0
+        or data.shape[0] != scales.shape[0]
+        or tuple(data.shape[1:]) != (2, num_heads, 128, 64)
+        or tuple(scales.shape[1:]) != (2, num_heads, 128, 8)
+        or data.dtype not in (torch.int8, torch.uint8)
+        or scales.dtype != torch.uint8
+    ):
+        raise ValueError("MiniMax-M3 NVFP4 data and scale caches must have matching HND geometry")
+    for cache in (data, scales):
+        if (
+            cache.stride(4) != 1
+            or cache.stride(3) != cache.shape[4]
+            or cache.stride(2) < 128 * cache.stride(3)
+            or cache.stride(1) < num_heads * cache.stride(2)
+            or cache.stride(0) < 2 * cache.stride(1)
+        ):
+            raise ValueError(
+                "MiniMax-M3 NVFP4 cache rows must be packed and heads/planes/pages must not overlap"
+            )
+    if scales.stride(2) != 128 * 8:
+        # The MSA consumer, including the separate-producer path, requires
+        # each head's scale block to follow the preceding head immediately.
+        raise ValueError("MiniMax-M3 NVFP4 MSA scale cache must have packed head blocks")
+    # Separate cache writes can use padded head strides. The packed PCG
+    # boundary requires fusion and reports an error when this returns False.
+    return data.stride(2) == 128 * 64 and data.stride(0) % 2 == 0 and data.stride(1) % 2 == 0
+
+
 def _validate_sparse_attention_runtime_config(
     model_config: "ModelConfig[PretrainedConfig]",
 ) -> None:
@@ -340,8 +391,26 @@ def _validate_sparse_attention_runtime_config(
             "Set the following in the LLM API configuration:\n"
             "sparse_attention_config:\n  algorithm: minimax_m3"
         )
+    implementation = sparse_config.implementation
+    if implementation == "triton":
+        logger.warning_once(
+            "MiniMax-M3 is using implementation='triton'. "
+            "Set sparse_attention_config.implementation='msa' to use the recommended "
+            "MiniMax-M3 backend on SM100/SM103 GPUs.",
+            key="minimax_m3_recommend_msa",
+        )
+    quant_config = model_config.quant_config
+    if (
+        quant_config is not None
+        and quant_config.quant_mode is not None
+        and quant_config.quant_mode.has_fp4_kv_cache()
+        and implementation != "msa"
+    ):
+        raise ValueError(
+            "MiniMax-M3 NVFP4 KV cache requires sparse_attention_config.implementation='msa'."
+        )
     if getattr(sparse_config, "fuse_qkv_index_projection", False):
-        if getattr(sparse_config, "implementation", None) != "msa":
+        if implementation != "msa":
             raise ValueError(
                 "MiniMax-M3 fuse_qkv_index_projection=True requires the 'msa' implementation."
             )
@@ -349,14 +418,16 @@ def _validate_sparse_attention_runtime_config(
             raise ValueError(
                 "MiniMax-M3 fuse_qkv_index_projection=True requires indexer_kv_dtype='fp8'."
             )
-        quant_config = model_config.quant_config
         if (
             quant_config is None
             or quant_config.quant_mode is None
-            or not quant_config.quant_mode.has_fp8_kv_cache()
+            or not (
+                quant_config.quant_mode.has_fp8_kv_cache()
+                or quant_config.quant_mode.has_fp4_kv_cache()
+            )
         ):
             raise ValueError(
-                "MiniMax-M3 fuse_qkv_index_projection=True requires an FP8 main KV cache."
+                "MiniMax-M3 fuse_qkv_index_projection=True requires an FP8 or NVFP4 main KV cache."
             )
 
 
@@ -660,6 +731,10 @@ class MiniMaxM3MoE(nn.Module):
             layer_idx=layer_idx,
             override_quant_config=experts_quant_config,
             activation=self.moe_activation,
+            # Lets a FUSED_COMM backend return its globally combined routed
+            # output; ``routed_output_is_global`` then keeps it out of the
+            # external all-reduce.
+            accepts_global_routed_output=True,
         )
         self.routed_output_is_global = _moe_routed_output_is_global(self.experts)
         # Shared expert: dense MLP fused into MoE output. Constructed
@@ -843,27 +918,28 @@ def _minimax_m3_qkv_index_proj_fake(
 # the fused kernels; explicit mutable cache inputs keep their writes visible.
 @torch.library.custom_op(
     "trtllm::minimax_m3_fused_sparse_qkv_producer",
-    mutates_args=("kv_cache", "index_k_cache"),
+    mutates_args=("kv_cache", "index_k_cache", "kv_scale_cache"),
 )
 def minimax_m3_fused_sparse_qkv_producer(
     hidden_states: torch.Tensor,
     position_ids: Optional[torch.Tensor],
     kv_cache: torch.Tensor,
     index_k_cache: torch.Tensor,
+    kv_scale_cache: Optional[torch.Tensor],
     out_cache_loc: torch.Tensor,
     layer_idx: str,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Capture projection, norm, RoPE and FP8 cache insertion together."""
+    """Capture projection, norm, RoPE and FP8/NVFP4 cache insertion together."""
     attn_metadata, attn_layer = _extract_minimax_m3_attention_extra_attrs(layer_idx)
     packed = attn_layer.qkv_proj(hidden_states)
     result = attn_layer._fused_fp8_qkv_indexer_norm_rope_kv_insert(
         packed,
         position_ids,
         attn_metadata,
-        cache_tensors=(kv_cache, index_k_cache, out_cache_loc),
+        cache_tensors=(kv_cache, index_k_cache, kv_scale_cache, out_cache_loc),
     )
     if result is None:
-        raise RuntimeError("MiniMax-M3 piecewise graph requires the fused FP8 sparse QKV producer.")
+        raise RuntimeError("MiniMax-M3 piecewise graph requires the fused sparse QKV producer.")
     return result
 
 
@@ -873,6 +949,7 @@ def _minimax_m3_fused_sparse_qkv_producer_fake(
     position_ids: Optional[torch.Tensor],
     kv_cache: torch.Tensor,
     index_k_cache: torch.Tensor,
+    kv_scale_cache: Optional[torch.Tensor],
     out_cache_loc: torch.Tensor,
     layer_idx: str,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -883,6 +960,40 @@ def _minimax_m3_fused_sparse_qkv_producer_fake(
     return (
         hidden_states.new_empty((num_tokens, attn_layer.q_size), dtype=torch.float8_e4m3fn),
         hidden_states.new_empty((num_tokens, attn_layer.index_q_size), dtype=torch.float8_e4m3fn),
+    )
+
+
+def _dispatch_attention_over_live_tokens(
+    attn_layer: "MiniMaxM3Attention",
+    q: torch.Tensor,
+    k: Optional[torch.Tensor],
+    v: Optional[torch.Tensor],
+    idx_q: Optional[torch.Tensor],
+    idx_k: Optional[torch.Tensor],
+    attn_metadata: AttentionMetadata,
+    output: torch.Tensor,
+) -> None:
+    """Run the attention core over the step's live tokens alone.
+
+    A piecewise CUDA graph pads token-shaped inputs up to its capture bucket
+    without adding requests to go with them (see _get_padding_params in
+    model_engine), so q can outrun the rows the batch has. The kernels below
+    read a request out of a token index, so the pad comes off here, once for
+    both dispatch paths.
+
+    The pad rows of output are left as the buffer supplied them. Nothing reads
+    them for its own result, and clearing them would put a device launch behind
+    a host-side count on every layer of every step.
+    """
+    num_tokens = int(attn_metadata.num_tokens)
+    attn_layer._dispatch_attention_backend(
+        q[:num_tokens],
+        k[:num_tokens] if k is not None else None,
+        v[:num_tokens] if v is not None else None,
+        idx_q[:num_tokens] if idx_q is not None else None,
+        idx_k[:num_tokens] if idx_k is not None else None,
+        attn_metadata,
+        output[:num_tokens],
     )
 
 
@@ -923,15 +1034,9 @@ def minimax_m3_attn_custom_op_inplace(
         k = v = idx_k = None
     if q is None:
         raise RuntimeError(f"MiniMax-M3 attention layer {layer_idx} received no query tensor.")
-    attn_layer._dispatch_attention_backend(
-        q[:num_tokens],
-        k[:num_tokens] if k is not None else None,
-        v[:num_tokens] if v is not None else None,
-        idx_q[:num_tokens] if idx_q is not None else None,
-        idx_k[:num_tokens] if idx_k is not None else None,
-        attn_metadata,
-        output[:num_tokens],
-    )
+    # The live token count is a host value, so the compiled graph above must
+    # not see it: it would guard on it and recapture per count.
+    _dispatch_attention_over_live_tokens(attn_layer, q, k, v, idx_q, idx_k, attn_metadata, output)
 
 
 maybe_bcg_minimax_m3_attn_custom_op_inplace = eager_on_graph(minimax_m3_attn_custom_op_inplace)
@@ -1002,6 +1107,11 @@ class MiniMaxM3Attention(Attention):
             and quant_config.quant_mode is not None
             and quant_config.quant_mode.has_fp8_kv_cache()
         )
+        self.main_kv_is_nvfp4 = bool(
+            quant_config is not None
+            and quant_config.quant_mode is not None
+            and quant_config.quant_mode.has_fp4_kv_cache()
+        )
 
         # Per-head Gemma RMSNorm — one set of weights shared across heads.
         self.q_norm = RMSNorm(
@@ -1024,6 +1134,10 @@ class MiniMaxM3Attention(Attention):
         self.ln_events = [torch.cuda.Event(), torch.cuda.Event()]
 
         self.is_sparse_attention_layer = bool(is_sparse_attention_layer)
+        if not self.is_sparse_attention_layer and isinstance(
+            self.attn, MiniMaxM3SparseRuntimeBackend
+        ):
+            self._init_native_dense_attention(model_config)
         self.disable_index_value = bool(disable_index_value)
         sparse_runtime_cfg = getattr(model_config, "sparse_attention_config", None)
         self.enable_fused_qkv_index_projection = bool(
@@ -1108,6 +1222,38 @@ class MiniMaxM3Attention(Attention):
                 dtype=config.torch_dtype,
                 use_gemma=self.use_gemma_norm,
             )
+
+    def _init_native_dense_attention(self, model_config: ModelConfig) -> None:
+        """Use native attention for unquantized KV when TRTLLM-Gen is preferred."""
+        # FP8 native FMHA also quantizes Q; SDPA preserves the activation dtype.
+        # NVFP4 requires independent block-scale strides in its virtual pools.
+        if self.main_kv_is_fp8 or self.main_kv_is_nvfp4:
+            return
+        enabled_libs = get_enabled_fmha_lib_classes()
+        if FlashInferTrtllmGenFmha not in enabled_libs:
+            return
+        if FallbackFmha in enabled_libs and enabled_libs.index(FallbackFmha) < enabled_libs.index(
+            FlashInferTrtllmGenFmha
+        ):
+            # A fallback-first policy cannot serve P128 cached prefill safely.
+            return
+        if not FlashInferTrtllmGenFmha.is_environment_available():
+            return
+        # Q/K norm and partial RoPE run in the model before backend dispatch.
+        native_attn = TrtllmAttention(
+            self.layer_idx,
+            self.num_heads,
+            self.head_dim,
+            num_kv_heads=self.num_key_value_heads,
+            quant_config=self.quant_config,
+            q_scaling=self.q_scaling,
+            pos_embd_params=None,
+            skip_create_weights_in_init=model_config.skip_create_weights_in_init,
+        )
+        if not FlashInferTrtllmGenFmha.is_available(native_attn):
+            return
+        self.attn = native_attn
+        self.support_fused_qkv = self.attn.support_fused_qkv()
 
     def apply_qk_norm(self, q: torch.Tensor, k: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """Per-head Gemma RMSNorm on the main attention Q/K.
@@ -1340,18 +1486,22 @@ class MiniMaxM3Attention(Attention):
         position_ids: Optional[torch.Tensor],
         attn_metadata: AttentionMetadata,
         *,
-        cache_tensors: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
+        cache_tensors: Optional[
+            Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], torch.Tensor]
+        ] = None,
     ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
         """Run the vLLM-style horizontal producer for every sparse batch.
 
         The CUDA kernel is token-major and batch-type agnostic: per-token
         positions and cache slots cover pure prefill, mixed aggregate batches,
-        and CUDA-graph decode.
+        and CUDA-graph decode.  FP8 caches receive FP8 K/V directly.  NVFP4
+        caches receive packed E2M1 K/V plus their E4M3 SF16 scale bytes while
+        Q, index-Q, and index-K remain FP8.
         """
         if (
             not self.enable_fused_qkv_index_projection
             or not isinstance(self.attn, MiniMaxM3MsaSparseAttention)
-            or not self._emit_fp8_main_qkv()
+            or not (self.main_kv_is_fp8 or self.main_kv_is_nvfp4)
             or self.attn.indexer_kv_dtype != "fp8"
         ):
             return None
@@ -1386,30 +1536,53 @@ class MiniMaxM3Attention(Attention):
         if any(weight.dtype != torch.bfloat16 or not weight.is_cuda for weight in norm_weights):
             return None
 
+        kv_cache_manager = attn_metadata.kv_cache_manager
         if cache_tensors is None:
-            kv_cache_manager = attn_metadata.kv_cache_manager
             if kv_cache_manager is None:
                 return None
             buffers = kv_cache_manager.get_buffers(self.layer_idx, kv_layout="HND")
             index_k_cache = attn_metadata.msa_idx_k_cache(self.layer_idx)
+            scale_buffers = (
+                kv_cache_manager.get_block_scale_buffers(self.layer_idx, kv_layout="HND")
+                if kv_cache_manager.is_nvfp4_layer(self.layer_idx)
+                else None
+            )
             out_cache_loc = getattr(attn_metadata, "msa_out_cache_loc", None)
         else:
-            buffers, index_k_cache, out_cache_loc = cache_tensors
+            buffers, index_k_cache, scale_buffers, out_cache_loc = cache_tensors
         num_tokens = int(packed.shape[0])
-        supported_main_cache = (
-            buffers is not None
-            and buffers.is_cuda
-            and buffers.dtype == torch.float8_e4m3fn
-            and buffers.dim() == 5
-            and tuple(buffers.shape[1:]) == (2, self.num_key_value_heads, 128, 128)
-            and buffers.stride(4) == 1
-            and buffers.stride(3) == 128
-            and buffers.stride(2) == 128 * 128
-            and buffers.stride(1) >= self.num_key_value_heads * buffers.stride(2)
-            and buffers.stride(0) >= 2 * buffers.stride(1)
-            and buffers.stride(0) % 4 == 0
-            and buffers.stride(1) % 4 == 0
-        )
+        layer_uses_nvfp4 = scale_buffers is not None
+        kv_quant_scale = getattr(self.qkv_proj, "inv_kv_scales", None) if layer_uses_nvfp4 else None
+        if layer_uses_nvfp4:
+            supports_fused_layout = buffers is not None and _nvfp4_cache_supports_fused_write(
+                buffers, scale_buffers, self.num_key_value_heads
+            )
+            supported_main_cache = (
+                supports_fused_layout
+                and buffers.is_cuda
+                and scale_buffers.is_cuda
+                and scale_buffers.device == buffers.device
+                and kv_quant_scale is not None
+                and kv_quant_scale.is_cuda
+                and kv_quant_scale.dtype == torch.float32
+                and kv_quant_scale.numel() >= 3
+                and kv_quant_scale.is_contiguous()
+            )
+        else:
+            supported_main_cache = (
+                buffers is not None
+                and buffers.is_cuda
+                and buffers.dtype == torch.float8_e4m3fn
+                and buffers.dim() == 5
+                and tuple(buffers.shape[1:]) == (2, self.num_key_value_heads, 128, 128)
+                and buffers.stride(4) == 1
+                and buffers.stride(3) == 128
+                and buffers.stride(2) == 128 * 128
+                and buffers.stride(1) >= self.num_key_value_heads * buffers.stride(2)
+                and buffers.stride(0) >= 2 * buffers.stride(1)
+                and buffers.stride(0) % 4 == 0
+                and buffers.stride(1) % 4 == 0
+            )
         supported_index_cache = (
             index_k_cache.is_cuda
             and index_k_cache.dtype == torch.float8_e4m3fn
@@ -1444,10 +1617,7 @@ class MiniMaxM3Attention(Attention):
         ):
             return None
 
-        q, index_q = torch.ops.trtllm.minimax_m3_fp8_qkv_indexer_norm_rope_kv_insert(
-            packed.contiguous(),
-            buffers,
-            index_k_cache,
+        common_args = (
             out_cache_loc[:num_tokens],
             self.num_heads,
             self.num_key_value_heads,
@@ -1462,6 +1632,23 @@ class MiniMaxM3Attention(Attention):
             rotary_cos_sin,
             position_ids.reshape(-1).contiguous().to(torch.int32),
         )
+        if layer_uses_nvfp4:
+            q, index_q = torch.ops.trtllm.minimax_m3_nvfp4_qkv_indexer_norm_rope_kv_insert(
+                packed.contiguous(),
+                buffers.view(torch.uint8),
+                scale_buffers,
+                index_k_cache,
+                common_args[0],
+                kv_quant_scale,
+                *common_args[1:],
+            )
+        else:
+            q, index_q = torch.ops.trtllm.minimax_m3_fp8_qkv_indexer_norm_rope_kv_insert(
+                packed.contiguous(),
+                buffers,
+                index_k_cache,
+                *common_args,
+            )
         return q.flatten(1), index_q.flatten(1)
 
     def _expect_fused_qk_norm_rope(self, position_ids: Optional[torch.Tensor]) -> bool:
@@ -1558,39 +1745,7 @@ class MiniMaxM3Attention(Attention):
         all_reduce_params: Optional[AllReduceParams] = None,
         **kwargs,
     ) -> torch.Tensor:
-        """Dense MiniMax-M3 attention for layers 0-2.
-
-        Mirrors :meth:`_sparse_forward` minus the index branch and minus
-        the per-block top-k selection. Bypasses ``self.attn`` because the
-        LLM API constructs ``MiniMaxM3SparseRuntimeBackend`` for every
-        layer when ``sparse_attention_config=MiniMaxM3SparseAttentionConfig()``
-        is set (the only way to get the matching :class:`MiniMaxM3KVCacheManagerV2`
-        through the standard ``_create_kv_cache_manager`` factory), and
-        that backend's ``forward`` strictly requires the M3 index branch
-        and metadata which dense layers cannot supply.
-
-        Steps:
-          1. Project Q/K/V via fused ``qkv_proj``.
-          2-3. Apply per-head Gemma RMSNorm and partial RoPE to Q/K, fused
-             into one kernel by :meth:`_fused_qk_norm_rope` when it applies.
-          4. Pull the paged main K/V cache from the M3 cache manager.
-          5. Read the pre-built :class:`MiniMaxM3SparseAttentionMetadata`
-             from ``attn_metadata.minimax_m3``. Production code paths
-             build this attachment in
-             :meth:`MiniMaxM3AttentionMetadata.prepare` (called by the
-             pyexecutor outside any CUDA-graph capture window); test
-             code paths attach it directly. The forward path **never**
-             builds metadata itself and **never** migrates tensors
-             between devices — both would trigger
-             ``cudaErrorStreamCaptureUnsupported`` for the
-             ``cuda_graph=True`` hard-path runs.
-          6. Write new K/V to ``out_cache_loc`` slots.
-          7. Gather per-request K/V padded to ``[batch, max_k]`` using
-             :func:`_gather_paged_batched` and run standard dense GQA
-             via :func:`torch.nn.functional.scaled_dot_product_attention`
-             (causal for prefill, no-causal for decode).
-          8. Apply ``o_proj``.
-        """
+        """Apply MiniMax Q/K norm and partial RoPE, then dispatch dense attention."""
         if attn_metadata is None:
             raise RuntimeError(
                 f"MiniMax-M3 dense forward (layer {self.layer_idx}) requires "
@@ -1657,17 +1812,8 @@ class MiniMaxM3Attention(Attention):
         k_view = k.view(num_tokens, self.num_key_value_heads, self.head_dim)
         v_view = v.view(num_tokens, self.num_key_value_heads, self.head_dim)
 
-        # 4. Paged-block main K/V pool. Keep the multi-dim view (do not
-        # reshape) so writes propagate to the underlying pool storage:
-        # ``kv_pool[:, 0]`` is a non-contiguous view (its dim-0 stride
-        # is 2× the contiguous stride because dim 1 separates K from
-        # V), so reshaping to ``[-1, num_kv_heads, head_dim]`` silently
-        # forks a copy. Writing to the copy and then discarding it is
-        # exactly the bug that drove dense layer-0 decode attention to
-        # near-zero output: the next forward call would read zeros for
-        # the prefilled positions because the pool was never updated.
-        # Pass the 4-D view directly; the helpers below address slots
-        # via ``(page, within)`` fancy indexing.
+        # Preserve the strided pool view so writes update the backing cache.
+        # Flattening it can allocate a copy; the helpers address (page, slot).
         kv_pool = kv_cache_manager.get_buffers(self.layer_idx)
         k_cache_view = kv_pool[:, 0]
         v_cache_view = kv_pool[:, 1]
@@ -1717,13 +1863,8 @@ class MiniMaxM3Attention(Attention):
             v_cache_view, m3_meta.req_to_token, m3_meta.slot_ids, max_k
         )
 
-        # GQA via repeat_interleave on the KV head axis: each KV head is
-        # shared by ``num_heads / num_kv_heads`` Q heads. SDPA does not
-        # support GQA natively pre-PyTorch-2.4 on every backend, so we
-        # expand K/V to match Q's head count. The expansion is O(num_q *
-        # num_kv) memory; for the M3 geometry (Q=8, KV=1 per TP=8 rank)
-        # it adds ~7x KV memory transiently — acceptable for the smoke
-        # decode.
+        # SDPA expands KV heads to query heads for prefill. Decode processes
+        # one KV head at a time to bound the temporary GQA expansion.
         if self.num_heads % max(self.num_key_value_heads, 1) != 0:
             raise RuntimeError(
                 f"Dense GQA expects num_heads ({self.num_heads}) divisible "
@@ -1843,7 +1984,9 @@ class MiniMaxM3Attention(Attention):
                 output,
             )
         else:
-            self._dispatch_attention_backend(q, k, v, idx_q, idx_k, attn_metadata, output)
+            # A step that runs here rather than through compile is padded all
+            # the same, since the bucket is agreed across ranks.
+            _dispatch_attention_over_live_tokens(self, q, k, v, idx_q, idx_k, attn_metadata, output)
         return output
 
     def _dispatch_attention_backend(
@@ -1858,13 +2001,14 @@ class MiniMaxM3Attention(Attention):
     ) -> torch.Tensor:
         """Route the attention core to the configured backend.
 
-        self.attn is either a :class:`MiniMaxM3MsaSparseAttention`, which
-        handles both dense and sparse layers, or a
-        :class:`MiniMaxM3SparseRuntimeBackend` (Triton).
+        MSA handles both dense and sparse layers. The Triton configuration
+        uses MiniMaxM3SparseRuntimeBackend for sparse layers and
+        TrtllmAttention for unquantized dense layers when TRTLLM-Gen is available.
+        FP8 and NVFP4 KV caches retain the SDPA dense path.
 
         * MSA → :meth:`_msa_attention_core`
         * Triton sparse → :meth:`_triton_sparse_attention_core`
-        * SDPA dense → :meth:`_sdpa_dense_attention_core`
+        * Dense → generic TRTLLM paged attention
         """
         if isinstance(self.attn, MiniMaxM3MsaSparseAttention):
             return self._msa_attention_core(q, k, v, idx_q, idx_k, attn_metadata, output)
@@ -1873,7 +2017,24 @@ class MiniMaxM3Attention(Attention):
             assert idx_q is not None and idx_k is not None
             return self._triton_sparse_attention_core(q, k, v, idx_q, idx_k, attn_metadata, output)
         assert idx_q is None and idx_k is None
-        return self._sdpa_dense_attention_core(q, k, v, attn_metadata, output)
+        if isinstance(self.attn, MiniMaxM3SparseRuntimeBackend):
+            return self._sdpa_dense_attention_core(q, k, v, attn_metadata, output)
+        if attn_metadata.kv_cache_manager is not None and attn_metadata.kv_cache_manager.dtype in (
+            DataType.FP8,
+            DataType.NVFP4,
+        ):
+            raise ValueError(
+                "MiniMax-M3 native dense attention requires an unquantized KV cache; "
+                "the model quantization config and KV cache manager disagree."
+            )
+        # TRTLLM-Gen self-attention requires packed QKV when updating the cache.
+        # Pack only current tokens; separate K/V inputs are not supported.
+        # Historical K/V stays in the paged cache and is never gathered here.
+        qkv = torch.cat((q, k, v), dim=-1)
+        self.attn.forward(
+            qkv, None, None, attn_metadata, forward_args=AttentionForwardArgs(output=output)
+        )
+        return output
 
     def _msa_attention_core(
         self,
@@ -1898,12 +2059,22 @@ class MiniMaxM3Attention(Attention):
         receives k=v=None so neither FMHA phase writes them again.
         """
         assert (k is None) == (v is None)
+        kv_scale_orig_quant = (
+            getattr(self.qkv_proj, "inv_kv_scales", None) if self.main_kv_is_nvfp4 else None
+        )
+        kv_scale_quant_orig = (
+            getattr(self.qkv_proj, "kv_scales", None) if self.main_kv_is_nvfp4 else None
+        )
+        if self.main_kv_is_nvfp4 and (kv_scale_orig_quant is None or kv_scale_quant_orig is None):
+            raise RuntimeError("MiniMax-M3 NVFP4 KV cache requires QKV quantization scales")
         if self.is_sparse_attention_layer:
             assert idx_q is not None
             # Unfused PCG supplies live FP8 index-K; eager FP8 producers may
             # already have inserted it and supply None instead.
             if k is not None:
-                self.attn.write_layer_caches(k, v, idx_k, attn_metadata)
+                self.attn.write_layer_caches(
+                    k, v, idx_k, attn_metadata, kv_scale_orig_quant=kv_scale_orig_quant
+                )
                 if self.attn.indexer_kv_dtype == "fp8":
                     # The FP8 indexer accepts only an already-populated cache.
                     idx_k = None
@@ -1923,9 +2094,13 @@ class MiniMaxM3Attention(Attention):
         else:
             assert idx_q is None and idx_k is None
             if k is not None:
-                self.attn.write_layer_caches(k, v, None, attn_metadata)
+                self.attn.write_layer_caches(
+                    k, v, None, attn_metadata, kv_scale_orig_quant=kv_scale_orig_quant
+                )
             # No top-k selection means the FMHA attends the full page table.
             forward_args = AttentionForwardArgs(output=output)
+        forward_args.kv_scale_orig_quant = kv_scale_orig_quant
+        forward_args.kv_scale_quant_orig = kv_scale_quant_orig
         self.attn.forward(q, None, None, attn_metadata, forward_args=forward_args)
         return output
 
@@ -1988,17 +2163,20 @@ class MiniMaxM3Attention(Attention):
                 self.register_to_config
                 and is_torch_compiling()
                 and isinstance(self.attn, MiniMaxM3MsaSparseAttention)
-                and self._emit_fp8_main_qkv()
+                and (self.main_kv_is_fp8 or self.main_kv_is_nvfp4)
                 and self.attn.indexer_kv_dtype == "fp8"
             ):
                 # Metadata stages these zero-copy views before compilation;
                 # tracing the cache manager's native pointer access is unsafe.
-                kv_cache, index_k_cache = attn_metadata.msa_layer_cache_tensors[self.layer_idx]
+                kv_cache, index_k_cache, kv_scale_cache = attn_metadata.msa_layer_cache_tensors[
+                    self.layer_idx
+                ]
                 q, idx_q = torch.ops.trtllm.minimax_m3_fused_sparse_qkv_producer(
                     hidden_states,
                     position_ids,
                     kv_cache,
                     index_k_cache,
+                    kv_scale_cache,
                     attn_metadata.msa_out_cache_loc,
                     self.layer_idx_str,
                 )
@@ -2722,6 +2900,12 @@ class MiniMaxM3ForCausalLM(SpecDecOneEngineForCausalLM[MiniMaxM3Model, Pretraine
         raw_pretrained = model_config.pretrained_config
         if is_minimax_m3_vl_config(raw_pretrained):
             model_config = get_text_model_config(model_config)
+        if model_config.quant_config.kv_cache_quant_algo == QuantAlgo.NVFP4:
+            # M3's 57 sparse target layers have an MSA NVFP4 consumer, but the
+            # one-model Eagle layer has no shipped NVFP4 trtllm-gen cubin.
+            # Keep its modules and shared draft cache on their established FP8
+            # representation while the target remains NVFP4.
+            model_config.extra_attrs["draft_kv_cache_quant_algo_override"] = QuantAlgo.FP8
         super().__init__(MiniMaxM3Model(model_config), model_config)
 
     def load_weights(
@@ -2754,6 +2938,14 @@ class MiniMaxM3ForCausalLM(SpecDecOneEngineForCausalLM[MiniMaxM3Model, Pretraine
             params_map=merged_params_map,
             allow_partial_loading=allow_partial_loading,
         )
+        # CUDA graphs retain the aligned MSA buffers created at warmup. Refresh
+        # their contents after refit; a new allocation would leave replay stale.
+        for layer in self.model.layers:
+            attention = layer.self_attn
+            if getattr(attention.attn, "_msa_nvfp4_dequant_scales", None) is not None:
+                _aligned_nvfp4_dequant_scales(
+                    attention.attn, attention.qkv_proj.kv_scales, refresh=True
+                )
 
     def setup_aliases(self) -> None:
         """Chain each decoder layer's next_layer_layernorm for POST fusion.

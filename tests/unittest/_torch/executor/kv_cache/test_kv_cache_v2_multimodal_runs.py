@@ -11,9 +11,7 @@ import tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 as resource_m
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, SamplingConfig
-from tensorrt_llm.runtime.kv_cache_manager_v2._block_radix_tree import (
-    gen_multimodal_cache_key_tokens,
-)
+from tensorrt_llm.runtime.kv_cache_manager_v2 import gen_multimodal_cache_key_tokens
 
 pytestmark = pytest.mark.cpu_only
 
@@ -244,6 +242,8 @@ def test_multimodal_events_keep_chunked_commit_incremental(hybrid):
     manager._augment_tokens_for_block_reuse = Mock(wraps=manager._augment_tokens_for_block_reuse)
     manager.local_num_mamba_layers = 0
     manager._mark_context_position_as_history = Mock()
+    # Prompt-only commit: the cache stops at the last context chunk.
+    manager._can_commit_generation_blocks = lambda request: False
 
     request = SimpleNamespace(
         py_request_id=req.py_request_id,

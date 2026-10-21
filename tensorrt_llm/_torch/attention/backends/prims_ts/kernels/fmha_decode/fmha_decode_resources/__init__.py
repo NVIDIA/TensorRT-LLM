@@ -53,6 +53,11 @@ SMEM resources
 - SmemKvTileResource      : Dedicated SMEM tile used by split-head-dimension
                             profiles for one K or V producer instance.
 
+- SmemTransformedKvResource : Mixed Q/KV shadow of SmemKvResource. Producer
+                            (TransformKvTask): converts raw K/V into the
+                            Q-side MMA input type. Consumer (MmaTask): uses the
+                            same descriptor labels as SmemKvResource.
+
 - SmemPResource           : P operand for BMM2.  The validated one-instance
                             staged-D256 Keeps profile places P in two TMEM views
                             aliased with the matching S stages; other profiles
@@ -94,12 +99,17 @@ TMEM resources
                             overwriting S; Correction returns it after loading
                             the matching stats into registers.
 
+- TmemTransformedKvResource : Mixed FP8-Q/NVFP4 K/V operand ring. Producer
+                            (TransformKvTask) dequantizes unpacking-TMA SMEM
+                            stages into TMEM; BMM1 and BMM2 consume K and
+                            transposed V as operand A.
+
 - TmemSoftmaxGlobalResource : FP8 sum-correction helper.  Producer-only
                             resource that, after P quantization, reapplies the
                             running-max correction to the running denominator
                             (using the TmemS local-sum array) and publishes the
                             corrected sums back through TmemS.  Inactive when
-                            non-FP8 Q/K/V.
+                            non-FP8 Q.
 
 - TmemCorrResource        : Correction and output resource.  LOOP stages
                             rescale an in-flight O tile when the running max
@@ -125,6 +135,7 @@ from .smem_block_sparse_metadata import (
     SmemBlockSparseKvMetadataResource,
     SmemBlockSparseSoftmaxMetadataResource,
 )
+from .smem_transformed_kv import SmemTransformedKvResource
 from .tmem_corr import TmemCorrResource
 from .tmem_o import TmemOResource
 from .smem_p import SmemPResource
@@ -135,6 +146,7 @@ from .tmem_softmax_stats import (
     TmemSoftmaxLocalResource,
     TmemSoftmaxOrderResource,
 )
+from .tmem_transformed_kv import TmemTransformedKvResource
 
 __all__ = [
     "DecodeGenResourceBase",
@@ -145,6 +157,7 @@ __all__ = [
     "SmemQResource",
     "SmemBlockSparseKvMetadataResource",
     "SmemBlockSparseSoftmaxMetadataResource",
+    "SmemTransformedKvResource",
     "TmemCorrResource",
     "TmemOResource",
     "TmemSResource",
@@ -152,4 +165,5 @@ __all__ = [
     "TmemSoftmaxGlobalResource",
     "TmemSoftmaxLocalResource",
     "TmemSoftmaxOrderResource",
+    "TmemTransformedKvResource",
 ]

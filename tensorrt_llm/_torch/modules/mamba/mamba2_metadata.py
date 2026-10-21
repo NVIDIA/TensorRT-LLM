@@ -15,7 +15,7 @@
 
 import contextlib
 import math
-from typing import Tuple
+from typing import Optional, Tuple
 
 import torch
 import triton
@@ -324,6 +324,11 @@ class Mamba2Metadata:
     # inference from a stray shell export or a forked worker.
     _warmup_force_initial_states: bool = False
 
+    # Set by a subclass whose prefill kernel compiles a separate variant
+    # depending on whether every context length is a multiple of this value.
+    # Warmup reads it to cover both variants.
+    prefill_chunk_alignment: Optional[int] = None
+
     @classmethod
     @contextlib.contextmanager
     def force_initial_states_for_warmup(cls):
@@ -579,7 +584,7 @@ class Mamba2Metadata:
         # CppMambaHybridCacheManager.prepare_resources(). prepare_resources
         # only enqueues the async cudaMemcpyAsync calls and sets a pending
         # flag; we sync the onboard stream here, so CPU-side prep
-        # work in _prepare_tp_inputs overlaps with the in-flight transfers.
+        # work in DecoderInputPreparer.prepare_inputs overlaps with the in-flight transfers.
         # Cheap no-op on cache managers without this method or when no
         # transfers were scheduled this iteration.
         flush = getattr(kv_cache_manager, "flush_state_transfers", None)

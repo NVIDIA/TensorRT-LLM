@@ -14,6 +14,7 @@
 # limitations under the License.
 """Test KV Transfer with KVCacheManager (V1) and KVCacheManagerV2 (V2)."""
 
+import ast
 import os
 import random
 import time
@@ -35,6 +36,7 @@ os.environ["UCX_TLS"] = "^ib,gdr_copy"
 # transfer-engine threading.
 os.environ["TRTLLM_NIXL_NUM_THREADS"] = "1"
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import List, Optional
 
 import numpy as np
@@ -58,6 +60,7 @@ from tensorrt_llm._torch.disaggregation.base.transfer import SessionStatus, Wait
 from tensorrt_llm._torch.disaggregation.native.transfer import TransferWorker, TransferWorkerConfig
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
+from tensorrt_llm._torch.pyexecutor.kv_cache import kv_cache_manager_v2
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestType
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
@@ -65,7 +68,7 @@ from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor, get_size
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings import LayerType as LayerTypeCpp
 from tensorrt_llm.bindings import ModelConfig as ModelConfigCpp
-from tensorrt_llm.llmapi.llm_args import BlockReuseConfig, KvCacheConfig
+from tensorrt_llm.llmapi.llm_args import BlockReuseConfig, KvCacheConfig, KvPoolRebalanceConfig
 from tensorrt_llm.logger import logger
 
 # Default to 4 worker threads for all KV transfer tests in this module.
@@ -90,7 +93,7 @@ class KvCacheConfigV2:
     disk_cache_size: Optional[int] = None
     disk_cache_path: Optional[str] = None
     cross_kv_cache_fraction: Optional[float] = None
-    secondary_offload_min_priority: Optional[int] = None
+    cold_tier_offload_min_priority: Optional[int] = None
     event_buffer_max_size: int = 0
     kv_cache_event_hash_algo: str = "auto"
 
@@ -105,6 +108,73 @@ class KvCacheConfigV2:
     enable_swa_scratch_reuse: bool = False
     # V2 specific field
     max_util_for_resume: float = 0.95
+    # Mirrors KvCacheConfig.kv_pool_rebalance_config in
+    # tensorrt_llm/llmapi/llm_args.py; KVCacheManagerV2._build_base_config()
+    # reads it unconditionally.
+    kv_pool_rebalance_config: KvPoolRebalanceConfig = field(default_factory=KvPoolRebalanceConfig)
+
+
+_THIS_DIR = Path(__file__).resolve().parent
+_REPO_ROOT = _THIS_DIR.parents[2]
+
+# Every KvCacheConfigV2 stub in the repo: the duck-typed stand-ins handed to
+# KVCacheManagerV2 in place of the real pydantic KvCacheConfig. The example
+# driver lives outside the test tree and may be absent from a tests-only
+# checkout, hence the existence check in the test body.
+_CTT_EXAMPLE_DIR = _REPO_ROOT / "examples/disaggregated/slurm/cache_transceiver_test"
+_KV_CACHE_CONFIG_V2_STUBS = (
+    _THIS_DIR / "test_kv_transfer.py",
+    _THIS_DIR / "test_cache_transceiver_single_process.py",
+    _CTT_EXAMPLE_DIR / "run_cache_transceiver_test.py",
+)
+
+
+def _config_attrs_read_by_manager() -> set:
+    """Return the ``kv_cache_config.<attr>`` names KVCacheManagerV2 reads.
+
+    Parsed from the source rather than from the real ``KvCacheConfig`` because
+    the stubs only have to cover what the manager actually touches, not the
+    full (and much larger) public config surface.
+    """
+    source = Path(kv_cache_manager_v2.__file__).read_text()
+    return {
+        node.attr
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.Attribute)
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "kv_cache_config"
+    }
+
+
+def _stub_fields(path: Path) -> set:
+    for node in ast.walk(ast.parse(path.read_text())):
+        if isinstance(node, ast.ClassDef) and node.name == "KvCacheConfigV2":
+            return {stmt.target.id for stmt in node.body if isinstance(stmt, ast.AnnAssign)}
+    raise AssertionError(f"no KvCacheConfigV2 class found in {path}")
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("stub_path", _KV_CACHE_CONFIG_V2_STUBS, ids=lambda p: p.name)
+def test_kv_cache_config_v2_stub_covers_manager_reads(stub_path: Path):
+    """Guard the duck-typed KvCacheConfigV2 stubs against config drift.
+
+    KVCacheManagerV2 reads its settings straight off the config object, so a
+    field added to the real ``KvCacheConfig`` and consumed by
+    ``_build_base_config()`` turns into an ``AttributeError`` at manager
+    construction time for every caller passing one of these stubs. That has
+    now bitten repeatedly (``kv_cache_event_hash_algo``, ``pool_ratio``,
+    ``kv_pool_rebalance_*``), each time as a wave of red disaggregated tests
+    rather than as an obvious config error, so check the coverage directly.
+    """
+    if not stub_path.exists():
+        pytest.skip(f"{stub_path} not present in this checkout")
+
+    missing = sorted(_config_attrs_read_by_manager() - _stub_fields(stub_path))
+    assert not missing, (
+        f"{stub_path.relative_to(_REPO_ROOT)}: KvCacheConfigV2 is missing {missing}, "
+        "which KVCacheManagerV2 reads off kv_cache_config. Add the field(s) with the "
+        "same default as tensorrt_llm.llmapi.llm_args.KvCacheConfig."
+    )
 
 
 @pytest.mark.cpu_only
@@ -356,6 +426,8 @@ def test_build_prefill_chunk_defers_partial_swa_chunk(source_block_ids):
     req.py_last_context_chunk = (11 * tokens_per_block, 13 * tokens_per_block)
     req.context_remaining_length = 3 * tokens_per_block
     req.is_generation_only_request = False
+    req.py_csa2_remote_tail_start = None
+    req.py_csa2_remote_tail_split = None
 
     extent = KvCacheTransceiverV2._build_prefill_extent(transceiver, req)
 
@@ -1935,10 +2007,13 @@ def test_session_has_transferring_tasks_false():
 
 
 @pytest.mark.timeout(120)
-def test_incompatible_peer_fails_only_affected_requests():
+@pytest.mark.parametrize("replay_flags", [None, (False, True), (True, False)])
+def test_incompatible_peer_fails_only_affected_requests(
+    replay_flags: tuple[bool, bool] | None,
+) -> None:
     """An incompatible context peer must fail only the requests targeting it.
 
-    When MambaPolicy.validate_peer_compatible rejects a peer during first
+    When peer validation rejects a peer during first
     registration, the receiver must (a) not raise out of receive() — the
     session fails through the normal transfer-error path (WaitResult.FAILED)
     with the diagnostic preserved; (b) cache the incompatibility so later
@@ -1960,6 +2035,18 @@ def test_incompatible_peer_fails_only_affected_requests():
     gen_tw = setup_good["gen_transfer_workers"][0]
     receiver = gen_tw._receiver
     bad_endpoint = setup_bad["ctx_info_endpoint"]
+    expected_error = "synthetic recurrent-state mismatch"
+    expected_validate_calls = 1
+    if replay_flags is not None:
+        local_replay, peer_replay = replay_flags
+        gen_tw._rank_info.bounded_replay_on_generation = local_replay
+        setup_good["ctx_transfer_workers"][0]._rank_info.bounded_replay_on_generation = local_replay
+        setup_bad["ctx_transfer_workers"][0]._rank_info.bounded_replay_on_generation = peer_replay
+        expected_error = (
+            "bounded_replay_on_generation must match between peers "
+            f"(local={local_replay}, peer={peer_replay})"
+        )
+        expected_validate_calls = 0
 
     sampling_params = SamplingParams(temperature=0)
     sc = tensorrt_llm.bindings.SamplingConfig(sampling_params._get_sampling_config())
@@ -2013,8 +2100,8 @@ def test_incompatible_peer_fails_only_affected_requests():
             assert rx1.has_failed()
             exc = rx1._kv_tasks[0]._exception
             assert exc is not None
-            assert "synthetic recurrent-state mismatch" in str(exc)
-            assert len(validate_calls) == 1
+            assert expected_error in str(exc)
+            assert len(validate_calls) == expected_validate_calls
             rx1.close()
 
             # (b) Second request to the same endpoint: fails fast from the
@@ -2025,8 +2112,8 @@ def test_incompatible_peer_fails_only_affected_requests():
             assert rx2.wait_complete(blocking=True) == WaitResult.FAILED
             assert rx2.wait_complete(blocking=False) == WaitResult.FAILED
             assert rx2.has_failed()
-            assert "synthetic recurrent-state mismatch" in str(rx2._kv_tasks[0]._exception)
-            assert len(validate_calls) == 1
+            assert expected_error in str(rx2._kv_tasks[0]._exception)
+            assert len(validate_calls) == expected_validate_calls
             assert bad_endpoint in receiver._incompatible_peers
             assert bad_endpoint not in receiver._sender_ep_instance_map
             rx2.close()
