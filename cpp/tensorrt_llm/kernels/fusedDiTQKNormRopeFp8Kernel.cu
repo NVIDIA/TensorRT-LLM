@@ -607,14 +607,34 @@ int multiProcessorCount(int device)
     return sms;
 }
 
+// Rows per block of the general (per-head cos) kernel; matches kRowsPerBlock in that kernel.
+constexpr int kGeneralRows = 2;
+// Upper bound on the static shared memory of either kernel (mbarriers and warp sums).
+constexpr size_t kStaticSmemBytes = 256;
+
+// Dynamic shared memory of the pipelined (shared cos) kernel.
+size_t pipeSmemBytes(int numHeads)
+{
+    int const n = numHeads * kHeadDim;
+    return kStages * (3 * n * sizeof(__nv_bfloat16) + 2 * kHeadDim * sizeof(float));
+}
+
+// Dynamic shared memory of the general (per-head cos) kernel.
+size_t generalSmemBytes(int numHeads, bool perHeadCos)
+{
+    int const n = numHeads * kHeadDim;
+    int const cosStride = perHeadCos ? n : kHeadDim;
+    return 2 * kGeneralRows * n * sizeof(__nv_bfloat16) + 2 * kGeneralRows * cosStride * sizeof(float)
+        + kGeneralRows * 8 * sizeof(float);
+}
+
 template <bool IL, int NCH>
 void launchPipe(int tokens, int numHeads, float eps, cudaStream_t stream, __nv_bfloat16 const* qkv, __nv_fp8_e4m3* q8,
     __nv_fp8_e4m3* k8, __nv_fp8_e4m3* v8, float const* quantMul, __nv_bfloat16 const* qw, __nv_bfloat16 const* kw,
     float const* cosp, float const* sinp, int cosSeqPerBatch)
 {
-    int const n = numHeads * kHeadDim;
     auto* kernel = fusedDiTQKNormRopeFp8PipeKernel<IL, NCH>;
-    size_t const smem = kStages * (3 * n * sizeof(__nv_bfloat16) + 2 * kHeadDim * sizeof(float));
+    size_t const smem = pipeSmemBytes(numHeads);
     int device = 0;
     TLLM_CUDA_CHECK(cudaGetDevice(&device));
     // Resident blocks per device for this head count; one entry per (device, num_heads).
@@ -672,17 +692,29 @@ bool aligned16(void const* p)
 
 } // namespace
 
-bool fusedDiTQKNormRopeFp8Supported(int num_heads, int head_dim, int sm)
+bool fusedDiTQKNormRopeFp8Supported(int num_heads, int head_dim, bool per_head_cos, int device)
 {
-    return sm >= 90 && head_dim == kHeadDim && num_heads > 0 && num_heads <= kMaxHeads;
+    if (head_dim != kHeadDim || num_heads <= 0 || num_heads > kMaxHeads)
+    {
+        return false;
+    }
+    int major = 0;
+    int maxSmem = 0;
+    TLLM_CUDA_CHECK(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device));
+    TLLM_CUDA_CHECK(cudaDeviceGetAttribute(&maxSmem, cudaDevAttrMaxSharedMemoryPerBlockOptin, device));
+    size_t const smem = per_head_cos ? generalSmemBytes(num_heads, true) : pipeSmemBytes(num_heads);
+    return major >= 9 && smem + kStaticSmemBytes <= static_cast<size_t>(maxSmem);
 }
 
 void launchFusedDiTQKNormRopeFullDimFp8(void const* qkv, void* q8, void* k8, void* v8, int num_tokens, int num_heads,
     int head_dim, float eps, void const* q_weight, void const* k_weight, float const* cos_emb, float const* sin_emb,
     bool interleave, bool per_head_cos, int cos_seq_per_batch, float const* quant_mul, cudaStream_t stream)
 {
-    TLLM_CHECK_WITH_INFO(fusedDiTQKNormRopeFp8Supported(num_heads, head_dim, tensorrt_llm::common::getSMVersion()),
-        "fusedDiTQKNormRopeFp8 requires SM90+, head_dim 128 and at most 64 heads (got %d heads, head_dim %d)",
+    int device = 0;
+    TLLM_CUDA_CHECK(cudaGetDevice(&device));
+    TLLM_CHECK_WITH_INFO(fusedDiTQKNormRopeFp8Supported(num_heads, head_dim, per_head_cos, device),
+        "fusedDiTQKNormRopeFp8 requires SM90+, head_dim 128, at most 64 heads and enough shared memory "
+        "(got %d heads, head_dim %d)",
         num_heads, head_dim);
     if (num_tokens == 0)
     {
@@ -717,11 +749,8 @@ void launchFusedDiTQKNormRopeFullDimFp8(void const* qkv, void* q8, void* k8, voi
         return;
     }
 
-    constexpr int kRows = 2;
-    int const cosStride = per_head_cos ? n : kHeadDim;
-    size_t const smem
-        = 2 * kRows * n * sizeof(__nv_bfloat16) + 2 * kRows * cosStride * sizeof(float) + kRows * 8 * sizeof(float);
-    dim3 const grid((num_tokens + kRows - 1) / kRows);
+    size_t const smem = generalSmemBytes(num_heads, per_head_cos);
+    dim3 const grid((num_tokens + kGeneralRows - 1) / kGeneralRows);
 #define TLLM_DIT_NRQ_LAUNCH(IL, PH)                                                                                    \
     launchWithPdl(fusedDiTQKNormRopeFp8Kernel<IL, PH>, grid, dim3(256), smem, stream, src, q, k, v, quant_mul,         \
         num_heads, eps, qw, kw, cos_emb, sin_emb, num_tokens, cos_seq_per_batch)
