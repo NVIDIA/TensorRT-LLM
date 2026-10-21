@@ -34,7 +34,7 @@ never transposed into a real HND copy.
 import math
 import threading
 from dataclasses import dataclass, field
-from typing import Any, ClassVar, Dict, Optional, Tuple
+from typing import TYPE_CHECKING, Any, ClassVar, Dict, Optional, Tuple
 
 import cudnn
 import torch
@@ -44,7 +44,11 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.visual_gen.args import QuantAttentionConfig
 
 from ....attention.backends.interface import PredefinedAttentionMask
+from .cudnn_kv_cache import cudnn_causal_kv_attention
 from .interface import AttentionBackend, AttentionTensorLayout
+
+if TYPE_CHECKING:
+    from ...cache import CausalKVCacheManager
 
 
 def _ceil_div(a: int, b: int) -> int:
@@ -720,6 +724,7 @@ class CuDNNAttention(AttentionBackend):
         *,
         attention_mask: PredefinedAttentionMask = PredefinedAttentionMask.FULL,
         key_padding_mask: Optional[torch.Tensor] = None,
+        kv_cache: Optional["CausalKVCacheManager"] = None,
         **kwargs,
     ) -> torch.Tensor:
         """Run attention.
@@ -730,10 +735,30 @@ class CuDNNAttention(AttentionBackend):
             v: Value tensor ``[B, S_kv, H_kv, D_v]``.
             attention_mask: ``CAUSAL`` or ``FULL``.
             key_padding_mask: Not supported by this backend.
+            kv_cache: A ``CausalKVCacheManager`` built with ``extra_pages`` for
+                ``CuDNNCausalKVPages``. When given, ``k``/``v`` are the new tokens only: they are
+                written at ``staging_offset`` and each causal block attends to the cache's fixed
+                region, the ``window_tokens`` before the block, and the new tokens up to the
+                block's end. ``batch_size`` must be 1.
+            seq_len: Number of real tokens when ``kv_cache`` is given; all rows are real if it
+                is ``None``. Rows past it are padding: neither written to the cache nor
+                attended, and their output rows are zero.
+            causal_block_size: Requires ``kv_cache``. Cuts the real tokens into consecutive
+                causal blocks: full attention within a block, causal across blocks. Absent: one
+                block.
 
         Returns:
             Output tensor ``[B, S_q, H, D_v]``.
         """
+        causal_block_size = kwargs.pop("causal_block_size", None)
+        if kv_cache is not None:
+            return self._forward_with_kv_cache(
+                q, k, v, kv_cache, kwargs.get("seq_len"), causal_block_size, attention_mask
+            )
+        if causal_block_size is not None:
+            raise NotImplementedError(
+                "causal_block_size is only implemented over a K/V cache; pass kv_cache."
+            )
         output, _ = self._run(
             q, k, v, is_causal=self._resolve_mask(attention_mask, key_padding_mask), with_lse=False
         )
@@ -754,11 +779,66 @@ class CuDNNAttention(AttentionBackend):
             output: ``[B, S_q, H, D_v]``
             lse: ``[B, S_q, H]`` float32
         """
+        if kwargs.get("kv_cache") is not None:
+            raise NotImplementedError("forward_with_lse does not support a K/V cache.")
         output, lse = self._run(
             q, k, v, is_causal=self._resolve_mask(attention_mask, key_padding_mask), with_lse=True
         )
         assert lse is not None, "cuDNN graph was built with stats but returned none."
         return output, lse
+
+    def _forward_with_kv_cache(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        kv_cache: "CausalKVCacheManager",
+        seq_len: Optional[int],
+        causal_block_size: Optional[int],
+        attention_mask: PredefinedAttentionMask,
+    ) -> torch.Tensor:
+        """Stage ``k``/``v`` in ``kv_cache`` and attend over it. ``q``, ``k``, ``v`` are
+        ``[1, S, H, D]`` / ``[1, S, H_kv, D]``: one video. The first ``seq_len`` rows are real
+        (``None``: all of them); rows past that are padding, neither written nor attended, and
+        their output rows are zero."""
+        if attention_mask != PredefinedAttentionMask.FULL:
+            raise NotImplementedError("K/V cache attention is full attention over the cache.")
+        if self.quant_dtype is not None:
+            raise NotImplementedError("K/V cache attention does not combine with quantization.")
+        batch, num_rows, num_heads, head_dim = q.shape
+        if batch != 1 or k.shape[1] != num_rows or v.shape != k.shape:
+            raise ValueError(
+                "K/V cache attention takes one video: q, k, v of [1, S, heads, head_dim]."
+            )
+        if k.shape[2] != kv_cache.num_kv_heads:
+            raise ValueError(
+                f"k has {k.shape[2]} heads but the cache holds {kv_cache.num_kv_heads} per rank."
+            )
+        num_tokens = num_rows if seq_len is None else seq_len
+        if not 0 < num_tokens <= num_rows:
+            raise ValueError(
+                f"seq_len {seq_len} outside (0, {num_rows}]: it counts the real tokens; "
+                "rows past it are padding."
+            )
+        block_size, _ = kv_cache.causal_blocks(num_tokens, causal_block_size)
+        out = torch.empty(num_rows, num_heads, head_dim, dtype=q.dtype, device=q.device)
+        out[num_tokens:].zero_()
+        device = q.device
+        with torch.cuda.device(device):
+            handle = self._get_handle(device)
+            cudnn.set_stream(handle=handle, stream=torch.cuda.current_stream(device).cuda_stream)
+            cudnn_causal_kv_attention(
+                handle,
+                self.layer_idx,
+                q[0, :num_tokens].contiguous(),
+                k[0, :num_tokens],
+                v[0, :num_tokens],
+                out[:num_tokens],
+                kv_cache,
+                block_size,
+                self.scale,
+            )
+        return out.unsqueeze(0)
 
     @staticmethod
     def _resolve_mask(
@@ -777,6 +857,9 @@ class CuDNNAttention(AttentionBackend):
     @classmethod
     def support_fused_qkv(cls) -> bool:
         return False
+
+    def support_kv_cache(self) -> bool:
+        return True
 
     @property
     def preferred_layout(self) -> AttentionTensorLayout:

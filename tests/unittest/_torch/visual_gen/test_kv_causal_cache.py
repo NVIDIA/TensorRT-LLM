@@ -362,3 +362,31 @@ def test_staged_write_replays_in_a_cuda_graph_across_commits():
             cache.commit(count)
     finally:
         cache.shutdown()
+
+
+def test_write_staged_takes_slices_of_a_fused_projection():
+    """K and V sliced from one fused QKV buffer, with token and head strides of their own, land
+    at their logical positions, token for token."""
+    cache = make_cache(32, 48, 96, 4, 4)
+    try:
+        cache.open()
+        for _ in committed_chunks(cache, 3):
+            pass
+        count, hd = 200, NUM_KV_HEADS * HEAD_DIM
+        k_ref = stamp(1, cache.staging_offset, count, 0)
+        v_ref = stamp(1, cache.staging_offset, count, 1)
+        qkv = torch.zeros(count, 3 * hd + 8, dtype=DTYPE, device="cuda")
+        qkv[:, hd : 2 * hd] = k_ref.flatten(1)
+        qkv[:, 2 * hd : 3 * hd] = v_ref.flatten(1)
+        k = qkv[:, hd : 2 * hd].unflatten(1, (NUM_KV_HEADS, HEAD_DIM))
+        v = qkv[:, 2 * hd : 3 * hd].unflatten(1, (NUM_KV_HEADS, HEAD_DIM))
+        assert not k.is_contiguous()
+        cache.write_staged(1, k, v)
+        tpb, buf = cache.tokens_per_page, cache.kv_buffer(1)
+        pos = cache.staging_offset + torch.arange(count)
+        pages = cache.page_table.cpu()[pos // tpb].long().cuda()
+        slots = (pos % tpb).cuda()
+        torch.testing.assert_close(buf[pages, 0, :, slots], k_ref, rtol=0, atol=0)
+        torch.testing.assert_close(buf[pages, 1, :, slots], v_ref, rtol=0, atol=0)
+    finally:
+        cache.shutdown()

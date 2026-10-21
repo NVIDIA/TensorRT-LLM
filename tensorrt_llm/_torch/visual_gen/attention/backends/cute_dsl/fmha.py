@@ -1009,7 +1009,8 @@ class CuTeDSLAttention(AttentionBackend):
         q, k, v = q[0, :num_tokens], k[0, :num_tokens], v[0, :num_tokens]
         kv_cache.write_staged(self.layer_idx, k, v)
         cum_seqlen_k, kv_len = kv_cache.kv_ranges(num_blocks, block_size)
-        out = torch.zeros(num_rows, num_heads, head_dim, dtype=q.dtype, device=q.device)
+        out = torch.empty(num_rows, num_heads, head_dim, dtype=q.dtype, device=q.device)
+        out[num_tokens:].zero_()
         cute_dsl_paged_window_fmha_fwd(
             q,
             kv_cache.kv_buffer(self.layer_idx),

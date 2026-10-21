@@ -42,8 +42,47 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
+import triton
+import triton.language as tl
 
 from tensorrt_llm.math_utils import ceil_div
+
+
+@triton.jit
+def _write_staged_kernel(
+    pool_ptr,
+    k_ptr,
+    v_ptr,
+    pages_ptr,
+    slots_ptr,
+    num_tokens,
+    k_token_stride,
+    k_head_stride,
+    v_token_stride,
+    v_head_stride,
+    HEADS: tl.constexpr,
+    TOKENS_PER_PAGE: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    BLOCK_T: tl.constexpr,
+):
+    """Program ``(j, h)`` writes head ``h`` of staged tokens ``[j * BLOCK_T, (j + 1) * BLOCK_T)``
+    to their pool pages and slots, K to plane 0 and V to plane 1."""
+    t = tl.program_id(0) * BLOCK_T + tl.arange(0, BLOCK_T)
+    h = tl.program_id(1)
+    d = tl.arange(0, BLOCK_D)
+    in_tokens = t < num_tokens
+    mask = in_tokens[:, None] & (d < HEAD_DIM)[None, :]
+    page = tl.load(pages_ptr + t, mask=in_tokens, other=0)
+    slot = tl.load(slots_ptr + t, mask=in_tokens, other=0)
+    # Pool element offset of (page, plane 0, h, slot, 0); plane 1 is HEADS pages of heads later.
+    dst = (((page * 2 * HEADS + h) * TOKENS_PER_PAGE + slot) * HEAD_DIM)[:, None] + d[None, :]
+    plane = HEADS * TOKENS_PER_PAGE * HEAD_DIM
+    t64 = t.to(tl.int64)[:, None]
+    keys = tl.load(k_ptr + t64 * k_token_stride + h * k_head_stride + d[None, :], mask=mask)
+    tl.store(pool_ptr + dst, keys, mask=mask)
+    values = tl.load(v_ptr + t64 * v_token_stride + h * v_head_stride + d[None, :], mask=mask)
+    tl.store(pool_ptr + dst + plane, values, mask=mask)
 
 
 class CausalKVCacheManager:
@@ -66,6 +105,9 @@ class CausalKVCacheManager:
             (``chunk_frames * tokens_per_frame``).
         max_seq_len: most tokens one rollout may hold: the committed tokens and the room to stage
             after them. It sizes the page table, not the pool.
+        extra_pages: pool pages past the geometry's, numbered from ``num_pool_pages``, that the
+            cache never hands out: scratch for a backend that must keep its own pages in the same
+            pool (see ``CuDNNCausalKVPages``).
         device: where the pool lives; the current CUDA device by default.
 
     Device tensors, allocated once and rewritten in place by ``open`` and ``commit``
@@ -123,6 +165,7 @@ class CausalKVCacheManager:
         window_tokens: int,
         max_staged_tokens: int,
         max_seq_len: int,
+        extra_pages: int = 0,
         device: Optional[torch.device] = None,
     ) -> None:
         if dtype not in (torch.bfloat16, torch.float16):
@@ -142,6 +185,9 @@ class CausalKVCacheManager:
         self.window_tokens = window_tokens
         self.max_staged_tokens = max_staged_tokens
         self.max_seq_len = max_seq_len
+        if extra_pages < 0:
+            raise ValueError(f"extra_pages must be non-negative, got {extra_pages}")
+        self.extra_pages = extra_pages
         self.num_pool_pages = self.pool_pages_for(
             tokens_per_page=tokens_per_page,
             pin_tokens=pin_tokens,
@@ -153,7 +199,7 @@ class CausalKVCacheManager:
         # finite values.
         self._pool: Optional[torch.Tensor] = torch.zeros(
             num_layers,
-            self.num_pool_pages,
+            self.num_pool_pages + extra_pages,
             2,
             num_kv_heads,
             tokens_per_page,
@@ -332,16 +378,17 @@ class CausalKVCacheManager:
     # ------------------------------------------------------------------ pool access
 
     def kv_buffer(self, layer_idx: int) -> torch.Tensor:
-        """The layer's pool ``[pool_pages, 2, num_kv_heads, tokens_per_page, head_dim]``
-        (plane 0 is K, plane 1 is V). Pool page ``p`` of ``page_table`` is ``buf[p]``."""
+        """The layer's pool ``[num_pool_pages + extra_pages, 2, num_kv_heads, tokens_per_page,
+        head_dim]`` (plane 0 is K, plane 1 is V). Pool page ``p`` of ``page_table`` is ``buf[p]``."""
         self._require_open()
         return self._pool[layer_idx]
 
     def write_staged(self, layer_idx: int, k: torch.Tensor, v: torch.Tensor) -> None:
         """Stage ``T`` tokens of K/V, the forward's new tokens, at logical positions
-        ``[staging_offset, staging_offset + T)``. ``k``/``v`` are ``[T, num_kv_heads, head_dim]``;
-        strides are free, so slices of a fused QKV projection go in without a copy. Rewrites the
-        same positions on every call until ``commit``."""
+        ``[staging_offset, staging_offset + T)``. ``k``/``v`` are ``[T, num_kv_heads, head_dim]``
+        with a contiguous ``head_dim``; token and head strides are free, so slices of a fused QKV
+        projection go in without a copy. Rewrites the same positions on every call until
+        ``commit``."""
         buf = self.kv_buffer(layer_idx)
         num_tokens, heads, head_dim = k.shape
         if v.shape != k.shape:
@@ -353,12 +400,30 @@ class CausalKVCacheManager:
             )
         if k.dtype != buf.dtype or v.dtype != buf.dtype:
             raise TypeError(f"K/V dtype {k.dtype} does not match the cache's {buf.dtype}")
-        pages = self._staged_pages[:num_tokens]
-        slots = self._staged_slots[:num_tokens]
-        # The advanced indices on dims 0, 1 and 3 broadcast to [T] and come first, so the
-        # indexed view is [T, num_kv_heads, head_dim].
-        buf[pages, 0, :, slots] = k
-        buf[pages, 1, :, slots] = v
+        if num_tokens == 0:
+            return
+        if k.stride(2) != 1:
+            k = k.contiguous()
+        if v.stride(2) != 1:
+            v = v.contiguous()
+        block_t = 32
+        _write_staged_kernel[(triton.cdiv(num_tokens, block_t), heads)](
+            buf,
+            k,
+            v,
+            self._staged_pages,
+            self._staged_slots,
+            num_tokens,
+            k.stride(0),
+            k.stride(1),
+            v.stride(0),
+            v.stride(1),
+            HEADS=heads,
+            TOKENS_PER_PAGE=self.tokens_per_page,
+            HEAD_DIM=head_dim,
+            BLOCK_D=triton.next_power_of_2(head_dim),
+            BLOCK_T=block_t,
+        )
 
 
 def _check_geometry(
