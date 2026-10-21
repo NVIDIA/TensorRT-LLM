@@ -2,7 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Check Kimi K3 checkpoint shards for one logical rank on a single GPU."""
 
+import itertools
 import math
+import random
 
 import pytest
 import torch
@@ -11,6 +13,9 @@ pytest.importorskip("fla")
 
 from tensorrt_llm._torch.configs.kimi_linear import KimiLinearConfig  # noqa: E402
 from tensorrt_llm._torch.model_config import ModelConfig  # noqa: E402
+from tensorrt_llm._torch.models.checkpoints.model_streamer import (  # noqa: E402
+    model_loading as model_streamer,
+)
 from tensorrt_llm._torch.models.modeling_kimi_linear import KimiLinearForCausalLM  # noqa: E402
 from tensorrt_llm._utils import is_sm_100f  # noqa: E402
 from tensorrt_llm.functional import AllReduceStrategy  # noqa: E402
@@ -71,6 +76,13 @@ def load_mla_checkpoint(
     model: KimiLinearForCausalLM, projections: dict[str, torch.Tensor], prefix: str
 ) -> None:
     # Supply a synthetic one-layer checkpoint through the public model loader.
+    model.load_weights(mla_checkpoint(model, projections, prefix))
+
+
+def mla_checkpoint(
+    model: KimiLinearForCausalLM, projections: dict[str, torch.Tensor], prefix: str
+) -> dict[str, torch.Tensor]:
+    """Build a one-layer checkpoint: the given attention projections, other weights zero."""
     name_map, _, _ = model.checkpoint_name_plan(prefix)
     config = model.model_config.pretrained_config
     params = dict(model.named_parameters())
@@ -92,7 +104,7 @@ def load_mla_checkpoint(
     weights.update(
         {f"{prefix}model.layers.0.self_attn.{name}": value for name, value in projections.items()}
     )
-    model.load_weights(weights)
+    return weights
 
 
 def _weights(fp8: bool, *, scale_name: str = "weight_scale") -> dict:
@@ -221,3 +233,83 @@ def test_checkpoint_loads_fp8_mla_values(
                 (attention.v_b_proj_dequant, reference_v[v_start:v_end]),
             ):
                 torch.testing.assert_close(loaded.cpu(), expected.to(loaded.dtype))
+
+
+def _zero_storage(model: torch.nn.Module) -> None:
+    for tensor in itertools.chain(model.parameters(), model.buffers()):
+        data = tensor.data
+        (data.view(torch.uint8) if data.element_size() == 1 else data).zero_()
+
+
+def _same_bytes(actual: torch.Tensor, expected: torch.Tensor) -> bool:
+    if actual.dtype != expected.dtype or actual.shape != expected.shape:
+        return False
+    return torch.equal(
+        actual.detach().contiguous().reshape(-1).view(torch.uint8),
+        expected.detach().contiguous().reshape(-1).view(torch.uint8),
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("prefix", ["", "language_model."])
+@pytest.mark.parametrize("fp8,scale_name", [(False, "weight_scale"), (True, "weight_scale_inv")])
+@pytest.mark.parametrize("tp", [1, 2])
+def test_model_streamer_matches_regular_loader(
+    monkeypatch: pytest.MonkeyPatch, prefix: str, fp8: bool, scale_name: str, tp: int
+) -> None:
+    mapping = Mapping(world_size=tp, tp_size=tp, rank=tp - 1)
+
+    def build() -> KimiLinearForCausalLM:
+        with torch.device("cuda"):
+            model = KimiLinearForCausalLM(
+                _config(fp8, mapping=mapping, prefix=prefix, deferred=False, cute_bmm=True)
+            )
+        # Elements that neither loader writes then compare equal.
+        _zero_storage(model)
+        return model
+
+    regular = build()
+    projections = _weights(fp8, scale_name=scale_name)
+    weights = mla_checkpoint(regular, projections, prefix)
+    # Give the zero placeholders distinct values so every loaded tensor is checked.
+    projection_keys = {f"{prefix}model.layers.0.self_attn.{name}" for name in projections}
+    generator = torch.Generator().manual_seed(7)
+    for key in sorted(weights.keys() - projection_keys):
+        value = weights[key]
+        weights[key] = torch.randn(value.shape, generator=generator).to(value.dtype)
+    regular.load_weights(dict(weights))
+
+    streamed = build()
+    shuffle = random.Random(0).shuffle
+
+    def stream(weight_map, batches, consume, *, distributed):
+        # Deliver out of checkpoint order, so grouped inputs arrive apart.
+        for batch in batches:
+            names = sorted(batch)
+            shuffle(names)
+            for name in names:
+                consume(name, weights[name].cuda())
+        return {}
+
+    monkeypatch.setattr(model_streamer, "stream_batched_tensors", stream)
+    plan = streamed.plan_model_streamer_load(set(weights))
+    # This process stands in for one rank, so run_model_streamer() gathers no other ranks.
+    model_streamer.run_model_streamer(
+        plan, dict.fromkeys(weights, "model.safetensors"), rank=0, world_size=1
+    )
+
+    for kind, expected, actual in (
+        ("parameter", dict(regular.named_parameters()), dict(streamed.named_parameters())),
+        ("buffer", dict(regular.named_buffers()), dict(streamed.named_buffers())),
+    ):
+        assert actual.keys() == expected.keys(), kind
+        for name, value in expected.items():
+            assert _same_bytes(actual[name], value), f"{kind} {name}"
+    expected_attention = regular.model.layers[0].self_attn.mixer
+    actual_attention = streamed.model.layers[0].self_attn.mixer
+    for name in ("k_b_proj_trans_dequant", "v_b_proj_dequant"):
+        expected = getattr(expected_attention, name)
+        actual = getattr(actual_attention, name)
+        assert (actual is None) == (expected is None), name
+        if expected is not None:
+            assert _same_bytes(actual, expected), name

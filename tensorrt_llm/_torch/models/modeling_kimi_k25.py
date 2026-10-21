@@ -1629,7 +1629,7 @@ class KimiK25ForConditionalGeneration(PreTrainedModel):
         # succeed while parameters/buffers are still meta tensors. Those must
         # not be kept for runtime forward.
         self.mm_encoder = None
-        if not DISAGG:
+        if not DISAGG and not model_config.disable_mm_encoder:
             try:
                 mm_encoder = self._VISION_MODEL_CLS(model_config)
                 if _has_meta_tensors(mm_encoder):
@@ -1729,8 +1729,15 @@ class KimiK25ForConditionalGeneration(PreTrainedModel):
         """
         return self._mm_token_ids
 
-    def load_weights(self, weights) -> None:
-        """Load vision + projector + LLM weights from checkpoint."""
+    def _ensure_mm_encoder(self) -> None:
+        """Build the vision encoder before its weights load, if it is missing.
+
+        Under MetaInitMode, ``__init__`` defers the vision encoder or builds it
+        with meta tensors, so `load_weights()` and the Model Streamer plan of
+        Kimi K3 (``plan_model_streamer_load()``) call this first. The encoder
+        stays None for disaggregated serving and when
+        ``model_config.disable_mm_encoder`` is set.
+        """
         # Create vision encoder if it was skipped during meta init.
         # Use the saved VLM config since model_config.pretrained_config
         # has been overwritten with text_config by __init__.
@@ -1738,12 +1745,16 @@ class KimiK25ForConditionalGeneration(PreTrainedModel):
             logger.info("Recreating deferred vision encoder after MetaInitMode")
             self.mm_encoder = None
 
-        if self.mm_encoder is None and not DISAGG:
+        if self.mm_encoder is None and not DISAGG and not self.model_config.disable_mm_encoder:
             vision_model_config = copy.copy(self.model_config)
             vision_model_config._frozen = False
             vision_model_config.pretrained_config = self._vlm_pretrained_config
             vision_model_config._frozen = True
             self.mm_encoder = self._VISION_MODEL_CLS(vision_model_config)
+
+    def load_weights(self, weights) -> None:
+        """Load vision + projector + LLM weights from checkpoint."""
+        self._ensure_mm_encoder()
         if self.mm_encoder is not None:
             self.mm_encoder.load_weights(weights)
 
@@ -1777,6 +1788,8 @@ class KimiK25ForConditionalGeneration(PreTrainedModel):
         mm_token_ids = None
 
         if len(multimodal_params) > 0:
+            if self.model_config.disable_mm_encoder:
+                raise ValueError("Image and video inputs require the multimodal encoder")
             if DISAGG:
                 raise NotImplementedError("Disaggregated inference not yet supported for K2.5.")
             mm_ctx_params = multimodal_params[: attn_metadata.num_contexts]
