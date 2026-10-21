@@ -18,6 +18,7 @@ from tensorrt_llm._torch.pyexecutor.llm_request import (
     get_draft_token_length,
 )
 from tensorrt_llm._torch.pyexecutor.sampler.ops.custom import fused_compute_probs_from_logits
+from tensorrt_llm._torch.pyexecutor.sampler.ops.triton import selected_raw_logprobs
 from tensorrt_llm._torch.pyexecutor.sampler.sampler import Logprob, ScheduledRequests, TorchSampler
 from tensorrt_llm.bindings import SamplingConfig
 from tensorrt_llm.executor.result import TokenLogprobs
@@ -1485,7 +1486,9 @@ class TestLogsprobsInBatchedSampling:
                 expected_rows = sum(
                     get_draft_token_length(req) + 1
                     for req in requests
-                    if req.py_return_log_probs and req.py_beam_width == 1
+                    if req.py_return_log_probs
+                    and req.py_beam_width == 1
+                    and req.py_logprobs_mode == LogprobMode.PROCESSED
                 )
                 assert result.logprobs_cuda.shape == (expected_rows, vocab_size)
             else:
@@ -1507,4 +1510,48 @@ class TestLogsprobsInBatchedSampling:
             mock_requests=mock_requests,
             model_outputs=model_outputs,
             sampler=sampler,
+        )
+
+
+def test_selected_raw_logprobs():
+    generator = torch.Generator(device="cuda").manual_seed(123)
+    for vocab_size in (123, 4099, 131072):
+        logits = torch.randn((4, vocab_size + 7), device="cuda", generator=generator)
+        logits = logits[:, :vocab_size]
+        logits[1].zero_()
+        logits[2, ::2] = -torch.inf
+        logits[3].fill_(-torch.inf)
+        logits[3, 0] = 0
+        rows = torch.tensor([2, 1, 0, 2, 3], device="cuda")
+        tokens = torch.tensor([3, 10, 9, 0, 0], device="cuda")
+        reference = logits[rows].log_softmax(-1)
+        sampled = reference.gather(1, tokens[:, None]).squeeze(1)
+        ranks = (reference > sampled[:, None]).sum(-1, dtype=torch.int32)
+        for num_rows, top_k in ((5, 0), (5, 3), (5, 100), (1, 100)):
+            reference_rows = reference[:num_rows]
+            values, actual_ranks, top_values, top_tokens = selected_raw_logprobs(
+                logits, rows[:num_rows], tokens[:num_rows], top_k
+            )
+            torch.testing.assert_close(values, sampled[:num_rows], atol=2e-6, rtol=1e-6)
+            torch.testing.assert_close(actual_ranks, ranks[:num_rows], atol=0, rtol=0)
+            torch.testing.assert_close(
+                top_values, reference_rows.topk(top_k).values, atol=2e-6, rtol=1e-6
+            )
+            torch.testing.assert_close(
+                top_values, reference_rows.gather(1, top_tokens.long()), atol=2e-6, rtol=1e-6
+            )
+            sorted_tokens = top_tokens.sort(-1).values
+            assert (sorted_tokens[:, 1:] != sorted_tokens[:, :-1]).all()
+
+        sparse_logits = logits[:1].expand(65, -1)
+        values, _, top_values, top_tokens = selected_raw_logprobs(
+            sparse_logits, rows.new_zeros(1), tokens[:1], 100
+        )
+        sparse_reference = logits[:1].log_softmax(-1)
+        torch.testing.assert_close(values, sparse_reference[:, tokens[0]], atol=2e-6, rtol=1e-6)
+        torch.testing.assert_close(
+            top_values, sparse_reference.topk(100).values, atol=2e-6, rtol=1e-6
+        )
+        torch.testing.assert_close(
+            top_values, sparse_reference.gather(1, top_tokens.long()), atol=2e-6, rtol=1e-6
         )
