@@ -1431,6 +1431,34 @@ def test_staged_qwen3_tied_finalization_preserves_mx_tensor_catalog(
     assert published_catalog["model.embed_tokens.weight"][0] == model.lm_head.weight.data_ptr()
 
 
+@pytest.mark.parametrize(
+    "declared_tie",
+    [
+        pytest.param(True, id="declared-tie-not-realized"),
+        pytest.param(False, id="realized-tie-not-declared"),
+    ],
+)
+def test_qwen3_dense_profiles_reject_tie_the_model_does_not_realize(
+    monkeypatch: pytest.MonkeyPatch,
+    declared_tie: bool,
+) -> None:
+    model = _tiny_qwen3_model(monkeypatch, tie_word_embeddings=declared_tie)
+    if declared_tie:
+        model.lm_head.weight = nn.Parameter(model.model.embed_tokens.weight.detach().clone())
+    else:
+        model.lm_head.weight = model.model.embed_tokens.weight
+
+    decision = ModelLoader._qualify_post_transform_profile(
+        model,
+        speculative_mode=None,
+        loads_draft_weights=False,
+    )
+
+    assert not decision.qualified
+    assert decision.reason is PostTransformQualificationReason.RUNTIME_CONFIG_NOT_SUPPORTED
+    assert decision.unsupported_runtime_dimensions == frozenset({"tied_word_embeddings"})
+
+
 def test_qwen3_tied_and_untied_source_identities_never_pair(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
