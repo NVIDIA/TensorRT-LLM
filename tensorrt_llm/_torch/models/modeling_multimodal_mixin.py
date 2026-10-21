@@ -515,6 +515,10 @@ class MultimodalModelMixin:
     Concrete model forwards can call `prepare_multimodal_inputs` while keeping their explicit
     language-model delegation.
 
+    Models provide encoder computation and layout-specific input slicing. They declare optional
+    encoder TP/DP support through `get_multimodal_encoder_parallel_modes`; the shared execution
+    path handles DP work placement, communication, and output ordering.
+
     Current limitations:
 
     * For the time being, the persistent multimodal encoder cache stores per-item embeddings for
@@ -541,22 +545,54 @@ class MultimodalModelMixin:
     def get_multimodal_encoder_parallel_modes(
         cls, model_config: ModelConfig
     ) -> dict[str, frozenset[EncoderParallelMode]]:
-        """Declare supported parallel modes for each enabled encoder front end.
+        """Return supported parallel modes for each enabled encoder front end.
+
+        The model loader queries this before constructing weights when
+        ``encoder_data_parallel_size`` is set. Overrides inspect the config
+        without constructing modules. Encoder construction uses
+        ``make_multimodal_encoder_model_config`` to apply the selected mapping.
 
         Keys identify logical encoders, including their projectors. Image and
-        video may share one encoder; audio may use another with different modes.
-        Return only encoders constructed for this config. An empty mapping means
-        the model has not integrated explicit encoder parallelism.
+        video may share ``vision``; audio may have different capabilities.
+        ``tp`` requires encoder layers and the weight loader to shard weights
+        with the encoder mapping. ``dp`` requires independent replicas using
+        the shared input-slicing and encode interfaces; the framework handles
+        DP placement, communication, and output ordering.
 
-        ``tp`` promises weight sharding with the configured encoder mapping;
-        ``dp`` promises independent replicas and the shared item encode contract.
-        These are implementation capabilities, not validation or benchmark status.
+        Every enabled encoder must support the selected mode; hybrid TP/DP
+        requires both. The default empty mapping means explicit encoder
+        parallelism is not integrated. Omitting the encoder setting preserves
+        the existing model path. These declarations describe implementation
+        capabilities; accuracy and performance validation are separate.
+
+        Args:
+            model_config: Resolved model config identifying the enabled encoders.
+
+        Returns:
+            Mapping from enabled logical encoder names to supported modes.
+
+        Example:
+            A model with a TP/DP vision encoder and a DP-only audio encoder returns::
+
+                {"vision": frozenset({"tp", "dp"}), "audio": frozenset({"dp"})}
         """
         return {}
 
     @classmethod
     def validate_multimodal_encoder_parallelism(cls, model_config: ModelConfig) -> None:
-        """Validate explicit encoder parallelism before model construction."""
+        """Validate declared capabilities before model construction.
+
+        Called by the model loader for an explicit encoder parallel setting.
+        All enabled encoders must support the selected modes. Shared encoder
+        TP with LLM attention DP also requires the item scheduling contract.
+
+        Args:
+            model_config: Resolved model config with the requested encoder parallelism.
+
+        Raises:
+            NotImplementedError: An enabled encoder lacks a requested mode.
+            ValueError: Shared encoder TP requires unavailable item scheduling.
+        """
         mm_config = model_config.multimodal_config
         if (
             mm_config is None
