@@ -172,7 +172,11 @@ def _wait(stream: torch.cuda.Stream, timeout_s: float = 60.0) -> None:
         time.sleep(0.005)
 
 
-def test_fifo_v2_receives_bit_exact_entries() -> None:
+@pytest.mark.parametrize("zero_kv_rows", [False, True], ids=["dense", "zero_kv_rows"])
+def test_fifo_v2_receives_bit_exact_entries(zero_kv_rows: bool) -> None:
+    """With ``zero_kv_rows`` the sender also overwrites masked rows in shared memory with ordinary
+    stores before packing them, and its next entry is loaded into the same shared memory with
+    cp.async.bulk, which needs the same proxy fence on the sender side."""
     device = torch.device("cuda", torch.cuda.current_device())
     torch.manual_seed(0)
     cp, tokens = CP_SIZE, NUM_TOKENS
@@ -193,14 +197,24 @@ def test_fifo_v2_receives_bit_exact_entries() -> None:
         for _ in range(cp)
     ]
     stats = [torch.randn(tokens, cp, HEADS * 2, device=device) * 8 for _ in range(cp)]
+    # A sender replaces the rows its mask flags with the no-op contribution (zeros, (-inf, 0)).
+    masks = [torch.rand(tokens, device=device) < 0.25 if zero_kv_rows else None for _ in range(cp)]
+    sent_o = [o.clone() for o in partial_o]
+    sent_stats = [s.clone() for s in stats]
+    for o, s, mask in zip(sent_o, sent_stats, masks):
+        if mask is not None:
+            o[mask] = 0
+            pairs = s.view(tokens, cp, HEADS, 2)
+            pairs[mask, ..., 0] = float("-inf")
+            pairs[mask, ..., 1] = 0
     # Rank r receives entry [t, r] of every sender's tensors, at [t, sender] of its output.
     expected = [
         torch.cat(
             [
-                torch.stack([partial_o[src][:, rank] for src in range(cp)], dim=1).view(
+                torch.stack([sent_o[src][:, rank] for src in range(cp)], dim=1).view(torch.int64),
+                torch.stack([sent_stats[src][:, rank] for src in range(cp)], dim=1).view(
                     torch.int64
                 ),
-                torch.stack([stats[src][:, rank] for src in range(cp)], dim=1).view(torch.int64),
             ],
             dim=-1,
         )
@@ -229,7 +243,7 @@ def test_fifo_v2_receives_bit_exact_entries() -> None:
                 with torch.cuda.stream(streams[rank]):
                     outputs.append(
                         torch.ops.trtllm.alltoall_helix_native(
-                            partial_o[rank], stats[rank], workspace, rank, cp, None
+                            partial_o[rank], stats[rank], workspace, rank, cp, masks[rank]
                         )
                     )
             for rank in range(cp):
