@@ -2688,6 +2688,38 @@ class TestSSMSupport(unittest.TestCase):
         kv_cache.resume(stream)
         kv_cache.close()
 
+    def test_partial_endpoints_under_a_widely_shared_block(self) -> None:
+        """Snapshots in sibling partial blocks stay reusable past 32 siblings.
+
+        Every conversation behind a shared prefix that ends mid-block adds a partial child under
+        the prefix's last full block. Partial matching used to stop at 32 children, so past 32
+        conversations no next turn could reuse its prompt (a hybrid model needs the snapshot at
+        the prompt end, which sits in that partial block).
+        """
+        tokens_per_block = 32
+        cfg = self._make_ssm_config(tokens_per_block=tokens_per_block, enable_partial_reuse=True)
+        self.manager = KVCacheManager(cfg)
+        stream_holder = CachedCudaStream()
+        stream = cast(CudaStream, stream_holder.handle)
+        shared = [self.next_token() for _ in range(tokens_per_block + 15)]
+        prompts = []
+        for _ in range(40):
+            prompt = shared + [self.next_token() for _ in range(16)]
+            seed = self.manager.create_kv_cache()
+            seed.resume(stream)
+            seed.capacity = len(prompt)
+            seed.history_length = len(prompt)
+            seed.commit(prompt, is_end=True)
+            seed.close()
+            prompts.append(prompt)
+        for prompt in prompts:
+            next_turn = self.manager.create_kv_cache(
+                input_tokens=prompt + [self.next_token() for _ in range(20)]
+            )
+            self.assertEqual(next_turn.num_committed_tokens, len(prompt))
+            next_turn.resume(stream)
+            next_turn.close()
+
     @parameterized.expand(
         [
             ("miss", None, 48, False, (1, 0, 1, 0, 48, 0, 0)),

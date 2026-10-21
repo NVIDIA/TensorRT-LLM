@@ -27,6 +27,7 @@
 #include "tensorrt_llm/common/assert.h"
 #include <algorithm>
 #include <cassert>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 #include <utility>
@@ -749,6 +750,27 @@ RootBlock& BlockRadixTree::addOrGetExisting(ReuseScope const& reuseScope)
     return *newIt->second;
 }
 
+namespace
+{
+
+// Children scanned for a partial-block match. Every conversation that extends a shared prefix adds a child
+// under the prefix's last full block, so once this many conversations share a prefix, partial matching under
+// it stops -- and with it the reuse of every snapshot that ends in a partial block there (a hybrid model's
+// prompt end). The former cap of 32 is reached by a few dozen agentic sessions behind one system prompt; a scan
+// compares at most tokens-per-block tokens per child, so 1024 children cost tens of microseconds.
+// TRTLLM_KV_CACHE_PARTIAL_MATCH_MAX_CHILDREN overrides it.
+size_t partialMatchMaxChildren()
+{
+    static size_t const value = []
+    {
+        char const* env = std::getenv("TRTLLM_KV_CACHE_PARTIAL_MATCH_MAX_CHILDREN");
+        return env != nullptr ? static_cast<size_t>(std::strtoull(env, nullptr, 10)) : size_t{1024};
+    }();
+    return value;
+}
+
+} // anonymous namespace
+
 // Among all child nodes, find the one whose tokens have the longest leading match.
 // Returns (block, numMatchedTokens) or (nullptr, 0) if no match.
 // Mirrors Python's find_best_partial_match_in_next_nodes().
@@ -756,7 +778,7 @@ std::pair<Block*, int> findBestPartialMatchInNextNodes(
     std::unordered_map<BlockKey, SharedPtr<Block>> const& nextMap, TokenIdExt const* tokens, size_t tokenCount)
 {
     // Skip heuristic: too many children would be slow to iterate.
-    if (nextMap.size() >= 32)
+    if (nextMap.size() >= partialMatchMaxChildren())
         return {nullptr, 0};
     Block* best = nullptr;
     int bestMatch = 0;
