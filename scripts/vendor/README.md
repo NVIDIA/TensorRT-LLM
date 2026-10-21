@@ -80,6 +80,15 @@ selecting an arbitrary newer pin.
 
 ## Contributor metadata
 
+Source-update PRs must pin a temporary branch in a fork of the configured
+upstream, not the upstream repository itself (including upstream `main`).
+The pinned commit must contain the **latest canonical dev-branch tip**, even
+when the consumer's lock still names an older commit. Fetch and rebase onto
+the dev branch, push the temporary branch, then regenerate the consumer lock
+and vendor snapshot at the new SHA. Updating only the temporary branch or PR
+description is insufficient. A broader upstream refresh uses the separate,
+explicitly configured maintainer refresh workflow.
+
 Authors add exactly one block to the source-update PR description. Multiple
 vendors can share it; each monitor reads its configured vendor entry:
 
@@ -163,7 +172,12 @@ are retained during future refresh until equivalence is established separately.
 
 Before a new operation is committed, the source head and normalized metadata
 are rechecked before feedback and publication. Metadata corrections rerun
-validation. Durable promotion records remain authoritative; later description
+validation. The live canonical tip is checked before and after attribution and
+again before publication; it is not inferred from the consumer lock or cached
+successful feedback. A canonical tip already contained in the pinned source
+is allowed, including one advanced by another consumer branch. Divergent or
+newer tips require a rebase, and a canonical history rewrite requires maintainer
+inspection. Durable promotion records remain authoritative; later description
 edits or upstream PR changes do not rewrite a recorded operation's provenance.
 
 ## Launch the local monitor

@@ -816,11 +816,16 @@ class Monitor:
             promote._check_current(self.gh, plan)
         try:
             self.progress.operation("validating_metadata", number)
+            promote._check_source_repo(self.gh, promote._repo_name(reviewed.url))
+            promote._check_canonical_tip(self.gh, previous, reviewed)
             entry = metadata.parse(pr.get("body") or "", self.gh.vendor_name, self.gh.upstream_repo)
             cache = self.args.workdir / "sources.git"
             # Until provenance is committed, decisions follow current remote
             # inputs, not whichever upstream heads a previous process cached.
             _, evidence = metadata.resolve(self.gh, previous, reviewed, entry, cache)
+            # Attribution may take long enough for another consumer's promotion
+            # to advance the shared canonical branch. Do not report stale inputs as valid.
+            promote._check_canonical_tip(self.gh, previous, reviewed)
         except Diagnostic as error:
             self._feedback(pr, error)
             return

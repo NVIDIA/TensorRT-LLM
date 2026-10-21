@@ -734,6 +734,7 @@ class FakeGitHub(p.GitHub):
         self.reviews: list[dict] = []
         self.writes: list[tuple[str, str, dict]] = []
         self.merge_base_sha = "c" * 40
+        self.canonical_tip = "b" * 40
 
     def api(
         self, endpoint: str, *, method: str = "GET", payload: dict | None = None
@@ -742,6 +743,10 @@ class FakeGitHub(p.GitHub):
             self.writes.append((endpoint, method, payload))
         if endpoint == "user":
             return {"login": "operator"}
+        if endpoint in ("repos/author/library", "repos/operator/library", "repos/org/library"):
+            return {"source": {"full_name": self.upstream_repo}}
+        if endpoint == "repos/operator/library/git/ref/heads/dev":
+            return {"object": {"sha": self.canonical_tip}}
         if endpoint.startswith("repos/org/consumer/compare/"):
             return {"merge_base_commit": {"sha": self.merge_base_sha}}
         if endpoint.endswith("/pulls/7"):
@@ -1191,7 +1196,7 @@ def test_posted_marker_feedback_is_specific_and_recovers_without_cache(
     assert not any(payload.get("event") == "APPROVE" for _, _, payload in monitor.gh.writes)
 
 
-@pytest.mark.parametrize("stage", ["inputs", "resolve"])
+@pytest.mark.parametrize("stage", ["inputs", "resolve", "canonical-tip"])
 @pytest.mark.parametrize("error_type", [ValueError, RuntimeError, b.manage.VendorError])
 def test_unrecognized_failures_are_operator_errors_not_author_feedback(
     monitor: b.Monitor, monkeypatch: pytest.MonkeyPatch, stage: str, error_type: type[Exception]
@@ -1206,6 +1211,8 @@ def test_unrecognized_failures_are_operator_errors_not_author_feedback(
 
     if stage == "inputs":
         monkeypatch.setattr(monitor, "_inputs", fail)
+    elif stage == "canonical-tip":
+        monkeypatch.setattr(p, "_check_canonical_tip", fail)
     else:
         monkeypatch.setattr(m, "resolve", fail)
     monitor.poll()
@@ -1213,6 +1220,31 @@ def test_unrecognized_failures_are_operator_errors_not_author_feedback(
     health = monitor.store.get("health")
     assert health["counts"]["errors"] == 1
     assert "Operator failure" in health["last_error"]["message"]
+
+
+def test_valid_feedback_is_rechecked_when_only_dev_tip_changes(
+    monitor: b.Monitor, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    previous = _vendor("a" * 40, "https://github.com/operator/library.git", "dev")
+    reviewed = _vendor("b" * 40, "https://github.com/author/library.git", "temporary")
+    monkeypatch.setattr(monitor, "_inputs", lambda pr: (previous, reviewed))
+    monkeypatch.setattr(m, "resolve", lambda *args: ({}, {}))
+    monitor.gh.pr["body"] = m.template("toy", "org/library")
+    original_pr = copy.deepcopy(monitor.gh.pr)
+    monitor.inspect(7)
+    assert monitor.store.get("observation:7")["state"] == "metadata_valid"
+
+    monitor.gh.canonical_tip = "c" * 40
+    monkeypatch.setattr(
+        monitor.gh, "compare", lambda *args: {"merge_base_commit": {"sha": previous.commit}}
+    )
+    monitor.inspect(7)
+    assert monitor.gh.pr == original_pr
+    assert monitor.store.get("observation:7")["state"] == "blocked"
+    assert len(monitor.gh.comments) == 1
+    assert "latest canonical branch tip" in monitor.gh.comments[0]["body"]
+    assert monitor.gh.canonical_tip in monitor.gh.comments[0]["body"]
+    assert monitor.gh.reviews[0]["state"] == "CHANGES_REQUESTED"
 
 
 @pytest.mark.parametrize("change", ["other-vendor", "patch-only", "vendor-created"])
@@ -1261,6 +1293,7 @@ def test_refresh_source_update_uses_current_canonical_as_promotion_baseline(
 def refresh_candidate(monitor: b.Monitor, monkeypatch: pytest.MonkeyPatch):
     previous = _vendor("1" * 40, "https://github.com/operator/library.git", "dev")
     reviewed = _vendor("2" * 40, "https://github.com/operator/library.git", "dev-new")
+    monitor.gh.canonical_tip = previous.commit
     locks = {"c" * 40: previous, "a" * 40: reviewed}
     monkeypatch.setattr(p, "_main_sha", lambda gh: "c" * 40)
     monkeypatch.setattr(
@@ -1790,6 +1823,7 @@ def test_monitor_posts_similarity_and_deduplicates_feedback(
     )
     previous = _vendor(base, "https://github.com/operator/library.git", "dev")
     reviewed = _vendor(downstream, "https://github.com/author/library.git", "temporary")
+    monitor.gh.canonical_tip = previous.commit
     monkeypatch.setattr(monitor, "_inputs", lambda pr: (previous, reviewed))
     monitor.gh.pr["body"] = _body("    upstream_prs: [https://github.com/org/library/pull/42]")
     monkeypatch.setattr(

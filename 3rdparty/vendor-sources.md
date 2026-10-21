@@ -19,6 +19,13 @@ edit the YAML, generated patches, or digests by hand. All examples below use the
 default lock. For an isolated test or another consumer repository, place
 `--lock PATH` before the subcommand.
 
+For a code-changing PR, start with the
+[PrimTS contributor walkthrough](#contributor-workflow-primts-example).
+It covers editing the vendored code, exporting to a temporary branch in your
+fork, and pinning that branch in TensorRT-LLM. Do not point a normal PrimTS
+source-update PR at FlashInfer upstream `main`, even if your fix has merged
+there; canonical-branch promotion and upstream refresh are maintainer workflows.
+
 ## Lock contract
 
 A locked vendor has one of two durable states:
@@ -229,6 +236,199 @@ patch keeps either recovered lock version reproducible.
 The same rule applies when adopting a newer commit that was developed upstream
 first: prepare the destination to exactly match the proposed commit plus the
 existing patch, then run `pin`. Do not use `sync` to look for that commit.
+
+## Contributor workflow: PrimTS example
+
+Suppose you need to fix a validation check in the vendored PrimTS `context.py`.
+The source change belongs in FlashInfer; TensorRT-LLM's PR must contain both the
+updated vendored files and a lock pointing to your committed temporary branch.
+The same export/pin mechanics work for other vendors using their own lock
+entry, paths, upstream fork, and maintainer policy.
+
+### 1. Identify the canonical baseline
+
+Start with a clean TensorRT-LLM checkout based on the latest **target base
+branch** (`main` or the intended release branch), and your own FlashInfer fork.
+Read `vendors.flashinfer-prims-ts` in that base branch's
+`3rdparty/vendor_sources.lock.yaml`: its `url`, `branch`, and `commit` identify
+the canonical source baseline. If it still points to another contributor's
+temporary branch, wait for the preceding promotion or coordinate with the
+maintainer; do not treat that temporary branch as the canonical branch.
+
+Replace every placeholder below. `PRIMTS_REPO` must be a new local directory
+for this example. The dev-branch name is illustrative: use the branch for your
+target base, not a dated branch copied from this document or another PR.
+Run all commands from the TensorRT-LLM repository root; `git -C` commands act
+on the separate FlashInfer checkout.
+
+```bash
+PRIMTS_REPO=/absolute/path/to/new-flashinfer-checkout
+PRIMTS_FORK_URL=https://github.com/YOUR_ACCOUNT/flashinfer.git
+PRIMTS_DEV_URL=https://github.com/MAINTAINER/flashinfer.git
+PRIMTS_DEV_BRANCH=trtllm-prims-ts-dev-YYYYMMDD
+PRIMTS_LOCKED_SHA=FULL_40_CHARACTER_LOCKED_COMMIT
+PRIMTS_TMP_BRANCH=trtllm-prims-ts-validation-fix
+
+git switch -c feat/prims-ts-validation-fix
+python scripts/vendor/manage.py check flashinfer-prims-ts
+git clone "$PRIMTS_FORK_URL" "$PRIMTS_REPO"
+git -C "$PRIMTS_REPO" fetch "$PRIMTS_DEV_URL" "$PRIMTS_DEV_BRANCH"
+PRIMTS_DEV_TIP=$(git -C "$PRIMTS_REPO" rev-parse FETCH_HEAD)
+```
+
+Compare `PRIMTS_LOCKED_SHA` with `PRIMTS_DEV_TIP`. The straightforward path below
+assumes they are equal. If they differ, the lock is not the live dev-branch tip:
+first rebase onto the consumer base containing the completed promotion, or
+follow [the advanced-tip instructions](#if-the-dev-branch-advances). Never
+substitute the live tip for the locked SHA when calling `export`.
+
+### 2. Edit and test the vendored code
+
+For this example, edit
+`tensorrt_llm/_torch/attention/backends/prims_ts/context.py`, add the appropriate
+tests, and run the affected TensorRT-LLM tests. Inspect your pending source delta:
+
+```bash
+git diff -- tensorrt_llm/_torch/attention/backends/prims_ts
+```
+
+An offline vendor check now fails until you pin the exported change; this is
+expected. Do not run `sync`, which would discard the pending edits, or record
+an upstream-worthy fix in the TensorRT-LLM-only compatibility patch. Do not
+hand-edit the lock or its digests to bypass the check.
+
+### 3. Create the temporary source branch and export
+
+Create the branch at the **locked SHA** in your clean FlashInfer checkout:
+
+```bash
+git -C "$PRIMTS_REPO" switch -c "$PRIMTS_TMP_BRANCH" "$PRIMTS_LOCKED_SHA"
+python scripts/vendor/manage.py export flashinfer-prims-ts --repo "$PRIMTS_REPO"
+git -C "$PRIMTS_REPO" diff -- flashinfer/attention/prims_ts
+```
+
+`export` requires that exact starting SHA. It transfers only the pending delta
+to `flashinfer/attention/prims_ts`; it does not copy TensorRT-LLM's existing
+compatibility patch upstream, change the lock, or commit anything. If the edit
+overlaps the compatibility patch and export refuses it, resolve the upstream
+change and downstream adaptation deliberately rather than copying the whole
+vendored directory over FlashInfer.
+
+### 4. Commit, check the live dev tip, and push to your fork
+
+Run the relevant FlashInfer tests and review the exported changes before committing.
+Stage any additional upstream test files explicitly as well.
+
+```bash
+git -C "$PRIMTS_REPO" add flashinfer/attention/prims_ts
+git -C "$PRIMTS_REPO" commit -s -m 'Fix PrimTS context validation'
+git -C "$PRIMTS_REPO" fetch "$PRIMTS_DEV_URL" "$PRIMTS_DEV_BRANCH"
+PRIMTS_DEV_TIP=$(git -C "$PRIMTS_REPO" rev-parse FETCH_HEAD)
+git -C "$PRIMTS_REPO" merge-base --is-ancestor "$PRIMTS_DEV_TIP" HEAD
+```
+
+The ancestry check must succeed (exit status 0) before continuing. If it fails,
+follow the advanced-tip instructions below. The pinned commit must contain the
+**latest** dev tip, not just the older commit recorded in the consumer lock,
+because the maintainer must be able to fast-forward the dev branch after merge.
+
+```bash
+git -C "$PRIMTS_REPO" push "$PRIMTS_FORK_URL" "HEAD:refs/heads/$PRIMTS_TMP_BRANCH"
+PRIMTS_NEW_SHA=$(git -C "$PRIMTS_REPO" rev-parse HEAD)
+```
+
+Do not push directly to the canonical dev branch or use upstream `main` as the
+source of this consumer update. Open the related FlashInfer PR separately;
+if it needs a different base/history for upstream review, use a separate branch
+without changing the consumer pin to upstream `main`.
+
+### 5. Pin the pushed commit and verify
+
+```bash
+python scripts/vendor/manage.py pin flashinfer-prims-ts \
+  --url "$PRIMTS_FORK_URL" \
+  --branch "$PRIMTS_TMP_BRANCH" \
+  --commit "$PRIMTS_NEW_SHA" \
+  --repo "$PRIMTS_REPO"
+python scripts/vendor/manage.py check flashinfer-prims-ts
+python scripts/vendor/manage.py check flashinfer-prims-ts --repo "$PRIMTS_REPO"
+git diff -- 3rdparty/vendor_sources.lock.yaml \
+  3rdparty/vendor_patches/flashinfer-prims-ts.patch \
+  tensorrt_llm/_torch/attention/backends/prims_ts
+```
+
+`pin` verifies that the committed source plus the existing compatibility patch
+reproduces your destination. It updates the lock, not the destination files.
+Keep the patch unchanged unless it needs a reviewed downstream adaptation or
+`pin` removes it because upstream has absorbed it.
+
+### 6. Submit the TensorRT-LLM PR
+
+Stage the lock and vendored files together, plus the relevant tests and any
+intentional compatibility-patch changes. Commit with DCO sign-off and push to
+your TensorRT-LLM fork (replace the remote name below):
+
+```bash
+git add 3rdparty/vendor_sources.lock.yaml tensorrt_llm/_torch/attention/backends/prims_ts
+git commit -s -m '[None][fix] update vendored PrimTS context validation'
+git push -u YOUR_TRTLLM_FORK_REMOTE HEAD
+```
+
+Open the PR against the same target base used in step 1 and run normal CI.
+Put this block in the **PR description**, replacing `123` with the real paired
+FlashInfer PR number; list all upstream PRs needed to attribute the source delta:
+
+````markdown
+<!-- vendor-promotion:start -->
+```yaml
+schema_version: 1
+vendors:
+  flashinfer-prims-ts:
+    upstream_prs:
+      - https://github.com/flashinfer-ai/flashinfer/pull/123
+```
+<!-- vendor-promotion:end -->
+````
+
+If there genuinely is no paired upstream PR, replace `upstream_prs` with a
+nonempty `unpaired_reason` explaining why; do not use it to bypass a failed
+match. See [contributor metadata](../scripts/vendor/README.md#contributor-metadata)
+for multiple PRs and ambiguity resolution.
+
+Leave the lock on your temporary fork branch through review and merge. Do not
+delete or rewrite that branch before promotion completes. The maintainer or
+bot then fast-forwards the canonical dev branch and creates a separate
+**lock-only** PR restoring its URL/branch without changing the reviewed SHA or
+vendored code. Do not pin back to upstream after the paired FlashInfer PR merges.
+
+### If the dev branch advances
+
+If your changes have not yet been exported, first export and commit at the
+locked SHA as in steps 3–4. If you already exported and pinned the change, keep
+working on that temporary source branch; do not export the same change again.
+Fetch the latest canonical branch and rebase your temporary source branch onto
+it, resolving conflicts and rerunning tests:
+
+```bash
+git -C "$PRIMTS_REPO" fetch "$PRIMTS_DEV_URL" "$PRIMTS_DEV_BRANCH"
+PRIMTS_DEV_TIP=$(git -C "$PRIMTS_REPO" rev-parse FETCH_HEAD)
+git -C "$PRIMTS_REPO" rebase "$PRIMTS_DEV_TIP"
+```
+
+Update the TensorRT-LLM destination to match the rebased selected source files
+plus the existing compatibility patch, retaining downstream adaptations. This
+may require incorporating other promoted changes or resolving patch conflicts;
+neither `sync` nor `pin` imports a new revision for you. Then repeat the ancestry
+check, push, pin, source verification, and consumer tests with the **new SHA**.
+For an already-published branch, coordinate before rewriting it and use
+`--force-with-lease`, or push a new temporary branch and pin that instead.
+Never force-push the canonical branch.
+
+Updating only your source branch or PR description does not update the consumer
+pin. The bot rechecks live ancestry before promotion; repeat this process if
+another promotion advances the dev branch again. After a maintainer refresh
+changes the canonical branch name, rebase the consumer PR onto its latest target
+base and use that new canonical branch rather than continuing the retired one.
 
 ## Remove a vendor
 
