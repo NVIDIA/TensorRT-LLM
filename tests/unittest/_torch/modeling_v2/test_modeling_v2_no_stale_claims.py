@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""The audit that keeps pinned versions and dates out of the modeling_v2 tree.
+"""The audit that keeps pinned versions, dates and machine paths out of the modeling_v2 tree.
 
 Out of tree, modeling_v2 was a separate repo against a pinned `tensorrt_llm`, so
 writing that version into a contract was meaningful: the pin was the thing a
@@ -51,12 +51,23 @@ _STALE_CLAIM_PATTERNS = (
         "a measurement date, which says nothing about whether the claim still "
         "holds. Say that it was measured rather than when",
     ),
+    (
+        re.compile(r"\b20\d\d-[01]\d-[0-3]\d\b"),
+        "a calendar date. The code states what holds now; when something was "
+        "written or seen belongs in the history, not in the tree",
+    ),
+    (
+        re.compile(r"(?<![\w.~])/(?:home|lustre|scratch|tmp|root|mnt|data|raid|workspace)/"),
+        "an absolute path on some machine. Name the file relative to the "
+        "repository or describe what it holds",
+    ),
 )
 
 #: Scanned for the above. The catalog contracts are the point -- they are where
-#: a version pin last accumulated -- but a target's modeling code carries the
-#: same kind of prose, so the whole package is in.
-_PROSE_SUFFIXES = {".py", ".md", ".yaml", ".yml"}
+#: a version pin last accumulated -- but a target's modeling code, and the CUDA
+#: sources a target compiles at first use, carry the same kind of prose, so the
+#: whole package is in.
+_PROSE_SUFFIXES = {".py", ".md", ".yaml", ".yml", ".cu", ".cuh", ".h"}
 
 
 def _package_files():

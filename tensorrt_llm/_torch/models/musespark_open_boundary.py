@@ -266,11 +266,13 @@ if _HAS_CUTE_DSL:
 
 @functools.lru_cache(maxsize=16)
 def cluster_boundary_available(device: torch.device) -> bool:
-    """The measured dispatch is restricted to GB300."""
+    """The measured dispatch runs on SM103, and on SM107 when opted in (``fused_kernels_supported``)."""
+    from .modeling_musespark_open import fused_kernels_supported
+
     return (
         _HAS_CUTE_DSL
         and device.type == "cuda"
-        and torch.cuda.get_device_capability(device) == (10, 3)
+        and fused_kernels_supported(torch.cuda.get_device_capability(device))
     )
 
 

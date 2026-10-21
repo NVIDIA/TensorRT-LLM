@@ -7,7 +7,10 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from tensorrt_llm._torch.models.modeling_musespark_open import MuseSparkOpenMoE
+from tensorrt_llm._torch.models.modeling_musespark_open import (
+    MuseSparkOpenMoE,
+    fused_kernels_supported,
+)
 
 
 def _module(device, hidden=8192, experts=256):
@@ -146,8 +149,8 @@ def test_overlap_tuned_router_reads_mutable_graph_inputs(tokens: int) -> None:
 @pytest.mark.parametrize("tokens", [256, 512, 4096, 8193, 32768])
 @torch.no_grad()
 def test_bf16x3_router_large_batch_mutable_graph(tokens: int) -> None:
-    if torch.cuda.get_device_capability() != (10, 3):
-        pytest.skip("Validated on GB300")
+    if not fused_kernels_supported(torch.cuda.get_device_capability()):
+        pytest.skip("Requires SM103, or SM107 with MUSESPARK_OPEN_SM107_FUSED_KERNELS=1")
     torch.manual_seed(1927)
     module = _module("cuda")
     module._bf16x3_router_enabled = True

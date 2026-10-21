@@ -23,7 +23,7 @@ from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or not cluster_boundary_available(torch.device("cuda", 0)),
-    reason="GB300 and CuTeDSL required",
+    reason="SM103 (or SM107 with MUSESPARK_OPEN_SM107_FUSED_KERNELS=1) and CuTeDSL required",
 )
 
 

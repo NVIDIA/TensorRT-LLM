@@ -52,6 +52,12 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import (
     ResourceManager,
     ResourceManagerType,
 )
+from tensorrt_llm._torch.pyexecutor.runtime_hooks import (
+    DEFAULT_RUNTIME_HOOKS,
+    RuntimeHooks,
+    StepInputStager,
+    runtime_hooks_of,
+)
 from tensorrt_llm._torch.pyexecutor.sampler import SampleStateTensors
 from tensorrt_llm._torch.pyexecutor.sampler.ops.flashinfer import warmup_sampling_module
 from tensorrt_llm._torch.pyexecutor.sampler.sampler_common import SampleType
@@ -237,6 +243,11 @@ _NO_EXTRA_INPUTS = ExtraInputsCollector()
 class DecoderRunner(ScheduledModelRunner):
     """Run scheduled decoder generation with its own buffers, graphs and metadata."""
 
+    # Step-loop behaviour the model opted into (RuntimeHooks); all off unless it declares otherwise.
+    runtime_hooks: RuntimeHooks = DEFAULT_RUNTIME_HOOKS
+    # The model's step-input stager while it records this runner's writes, else None.
+    step_input_stager: StepInputStager | None = None
+
     # Optional execution paths that a subclass can turn off.
     _context_warmups_supported = True
     _context_graph_promotion_supported = True
@@ -265,6 +276,7 @@ class DecoderRunner(ScheduledModelRunner):
         kv_cache_manager_key: ResourceManagerType,
     ) -> None:
         self.model = model
+        self.runtime_hooks = runtime_hooks_of(self.model)
         self.input_processor = input_processor
         self._model_caller = model_caller
         self.mapping = mapping
@@ -3872,7 +3884,9 @@ class DecoderRunner(ScheduledModelRunner):
                 previous_batch_indices, dtype=torch.int, pin_memory=prefer_pinned()
             )
             previous_slots = self.previous_batch_indices_cuda[:previous_batch_len]
-            previous_slots.copy_(previous_batch_indices_host, non_blocking=True)
+            stager = self.step_input_stager
+            if stager is None or not stager.copy(previous_slots, previous_batch_indices_host):
+                previous_slots.copy_(previous_batch_indices_host, non_blocking=True)
             return previous_slots
 
         num_tokens = len(input_ids)
@@ -3882,21 +3896,48 @@ class DecoderRunner(ScheduledModelRunner):
             f"total_num_tokens ({total_num_tokens}) should be less than or equal to max_num_tokens ({self._config.max_num_tokens})"  # noqa: E501
         )
         # if exist requests that do not have previous batch, copy input_ids and draft_tokens
+        stager = self.step_input_stager
         if num_tokens > 0:
             input_ids = torch.tensor(input_ids, dtype=torch.int, pin_memory=prefer_pinned())
-            self.input_ids_cuda[:num_tokens].copy_(input_ids, non_blocking=True)
+            if stager is None or not stager.copy(self.input_ids_cuda[:num_tokens], input_ids):
+                self.input_ids_cuda[:num_tokens].copy_(input_ids, non_blocking=True)
 
         if num_draft_tokens > 0:
             draft_tokens = torch.tensor(draft_tokens, dtype=torch.int, pin_memory=prefer_pinned())
-            self.draft_tokens_cuda[: len(draft_tokens)].copy_(draft_tokens, non_blocking=True)
+            if stager is None or not stager.copy(
+                self.draft_tokens_cuda[: len(draft_tokens)], draft_tokens
+            ):
+                self.draft_tokens_cuda[: len(draft_tokens)].copy_(draft_tokens, non_blocking=True)
         if self._config.is_spec_decode and len(num_accepted_draft_tokens) > 0:
             num_accepted_draft_tokens = torch.tensor(
                 num_accepted_draft_tokens, dtype=torch.int, pin_memory=prefer_pinned()
             )
-            self.num_accepted_draft_tokens_cuda[: len(num_accepted_draft_tokens)].copy_(
-                num_accepted_draft_tokens, non_blocking=True
+            if stager is None or not stager.copy(
+                self.num_accepted_draft_tokens_cuda[: len(num_accepted_draft_tokens)],
+                num_accepted_draft_tokens,
+            ):
+                self.num_accepted_draft_tokens_cuda[: len(num_accepted_draft_tokens)].copy_(
+                    num_accepted_draft_tokens, non_blocking=True
+                )
+        if (
+            next_draft_tokens_device is not None
+            and stager is not None
+            and stager.overlap_inputs(
+                self,
+                new_tokens_device=new_tokens_device,
+                new_tokens_lens_device=new_tokens_lens_device,
+                next_draft_tokens_device=next_draft_tokens_device,
+                previous_batch_indices=previous_batch_indices,
+                previous_pos_indices=previous_pos_indices,
+                num_tokens=num_tokens,
+                num_draft_tokens=num_draft_tokens,
+                tokens_per_gen_step=self.get_runtime_tokens_per_gen_step(runtime_draft_len),
+                num_extend_requests=len(extend_requests) - len(extend_dummy_requests),
             )
-        if next_draft_tokens_device is not None:
+        ):
+            # The stager recorded every write of the branch below.
+            pass
+        elif next_draft_tokens_device is not None:
             # Initialize these two values to zeros
             self.previous_pos_id_offsets_cuda *= 0
             self.previous_kv_lens_offsets_cuda *= 0
@@ -3930,9 +3971,13 @@ class DecoderRunner(ScheduledModelRunner):
                 previous_pos_indices_host = torch.tensor(
                     previous_pos_indices, dtype=torch.int, pin_memory=prefer_pinned()
                 )
-                self.previous_pos_indices_cuda[0:previous_batch_tokens].copy_(
-                    previous_pos_indices_host, non_blocking=True
-                )
+                if stager is None or not stager.copy(
+                    self.previous_pos_indices_cuda[0:previous_batch_tokens],
+                    previous_pos_indices_host,
+                ):
+                    self.previous_pos_indices_cuda[0:previous_batch_tokens].copy_(
+                        previous_pos_indices_host, non_blocking=True
+                    )
 
                 # The order of requests in a batch: [context requests, generation requests]
                 # generation requests: ['requests that do not have previous batch', 'requests that
@@ -4031,14 +4076,23 @@ class DecoderRunner(ScheduledModelRunner):
                 )
             final_position_ids = self.mrope_position_ids_cuda[:, :, :total_num_tokens]
         else:
-            self.position_ids_cuda[:total_num_tokens].copy_(host_position_ids, non_blocking=True)
+            if stager is None or not stager.copy(
+                self.position_ids_cuda[:total_num_tokens], host_position_ids
+            ):
+                self.position_ids_cuda[:total_num_tokens].copy_(
+                    host_position_ids, non_blocking=True
+                )
             final_position_ids = self.position_ids_cuda[:total_num_tokens].unsqueeze(0)
 
         if enable_spec_decode:
-            self.gather_ids_cuda[: len(gather_ids)].copy_(
+            if stager is None or not stager.copy(
+                self.gather_ids_cuda[: len(gather_ids)],
                 torch.tensor(gather_ids, dtype=torch.int, pin_memory=prefer_pinned()),
-                non_blocking=True,
-            )
+            ):
+                self.gather_ids_cuda[: len(gather_ids)].copy_(
+                    torch.tensor(gather_ids, dtype=torch.int, pin_memory=prefer_pinned()),
+                    non_blocking=True,
+                )
 
         if self.mapping.has_cp_helix():
             # A non-None owned-count list is what arms
@@ -4584,21 +4638,55 @@ class DecoderRunner(ScheduledModelRunner):
                     execution_requests.generation_requests,
                 )
 
-            inputs, gather_ids, runtime_draft_len = self._prepare_inputs(
-                execution_requests,
-                kv_cache_manager,
-                attn_metadata,
-                spec_metadata,
-                new_tensors_device,
-                cache_indirection_buffer,
-                resource_manager,
-                can_run_graph,
-                execution_promoted_context_ids,
-                use_lora_graph=use_lora_graph,
-                enable_spec_decode=enable_spec_decode,
-                runtime_draft_len=runtime_draft_len,
-                is_dummy=is_dummy,
-            )
+            # When the model declares a step-input stager and it accepts this
+            # step, the device writes that _prepare_inputs routes through
+            # ``step_input_stager`` are recorded, and stager.end() issues them
+            # right after it. Contract: StepInputStagerSource and
+            # StepInputStager in runtime_hooks.py.
+            stager = None
+            stager_source = self.runtime_hooks.step_input_stager
+            if stager_source is not None:
+                # Static inputs staged for a replay that never ran are stale:
+                # only this step's window may tell the replay to skip its copies.
+                self.cuda_graph_runner.staged_static_inputs = None
+                stager = stager_source.begin_if_eligible(
+                    self,
+                    execution_requests,
+                    attn_metadata,
+                    spec_metadata,
+                    new_tensors_device,
+                    graph_replay=(
+                        can_run_graph
+                        and not self.cuda_graph_runner.is_warmup_only
+                        and not self.cuda_graph_runner.needs_capture(key)
+                    ),
+                    is_dummy=is_dummy,
+                    enable_spec_decode=enable_spec_decode,
+                    promoted=bool(execution_promoted_context_ids),
+                )
+            try:
+                inputs, gather_ids, runtime_draft_len = self._prepare_inputs(
+                    execution_requests,
+                    kv_cache_manager,
+                    attn_metadata,
+                    spec_metadata,
+                    new_tensors_device,
+                    cache_indirection_buffer,
+                    resource_manager,
+                    can_run_graph,
+                    execution_promoted_context_ids,
+                    use_lora_graph=use_lora_graph,
+                    enable_spec_decode=enable_spec_decode,
+                    runtime_draft_len=runtime_draft_len,
+                    is_dummy=is_dummy,
+                )
+            except BaseException:
+                if stager is not None:
+                    stager.discard()
+                raise
+            if stager is not None:
+                stager.end(inputs)
+                self.cuda_graph_runner.staged_static_inputs = stager.static_inputs()
             if execution_promoted_context_ids:
                 self.iter_states["num_ctx_requests"] = scheduled_requests.num_context_requests
                 self.iter_states["num_ctx_tokens"] = sum(

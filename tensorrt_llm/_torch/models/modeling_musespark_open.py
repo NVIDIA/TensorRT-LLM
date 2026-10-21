@@ -34,8 +34,12 @@ lever can be A/B'd on one image; see the ``_*_enabled`` helpers for rationale):
   TP4 all-reduce.
 - ``MUSESPARK_OPEN_FUSED_FINALIZE_AR_MNNVL`` (default off): extend finalize fusion
   to TP8/EP8 across two NVLink-connected four-GPU GB300 nodes.
+- ``MUSESPARK_OPEN_FUSED_FINALIZE_AR_CHUNKED`` (default off): serve batches of
+  129..512 tokens with the fused finalize + all-reduce, as consecutive calls of
+  at most 128 tokens.
 - ``MUSESPARK_OPEN_SHARDED_PROJECTIONS`` (default off, experimental): column-shard
-  TP8 pool/unpool projections for batches of at most eight tokens.
+  pool/unpool projections for batches of at most eight tokens, at TP8/EP8 over
+  two four-GPU GB300 nodes or TP4/EP4 on one.
 - ``MUSESPARK_OPEN_FUSED_PRE_EXPERT_QUANT`` (default on): fused pre-expert
   RMSNorm + NVFP4 quantization.
 - ``MUSESPARK_OPEN_LL_QKV_WEIGHT_LAYOUT`` (default off): BF16 TP4/TP8 QKV
@@ -49,8 +53,10 @@ lever can be A/B'd on one image; see the ``_*_enabled`` helpers for rationale):
   ``MUSESPARK_OPEN_FULL_ROUTING_TORCH_ORDER`` preserves Torch's large-batch order.
 - ``MUSESPARK_OPEN_LARGE_FINALIZE_4WARPS`` (default off): use four warps for large
   expert finalize kernels.
+- ``MUSESPARK_OPEN_LARGE_PREPARE_OVERLAP`` (default off): overlap the router with the
+  pool projection for batches of 129..512 tokens too.
 - ``MUSESPARK_OPEN_LARGE_NORM_GATE`` (default off): fuse H64 attention norm/gate with
-  the reference reduction order at large token counts.
+  the reference reduction order above 128 tokens.
 - ``MUSESPARK_OPEN_OVERLAP_SP_PROJECTION`` (default off): overlap two output-projection
   chunks with reduce-scatter in eager sequence-parallel prefills of >=8192 tokens.
 - ``MUSESPARK_OPEN_PAD_SP_PROJECTION`` (default off): pad narrower projection inputs
@@ -547,6 +553,38 @@ def _fused_residual_enabled() -> bool:
     )
 
 
+def _sm107_fused_kernels_enabled() -> bool:
+    """Whether the fused kernels this file measured on SM103 (GB300) also run on SM107 (VR).
+
+    Off unless MUSESPARK_OPEN_SM107_FUSED_KERNELS names a truthy value. The
+    kernels behind ``fused_kernels_supported`` run on SM107 but are not certified
+    there, and two of them are on by default on SM103 (the cluster residual
+    boundary and the TP4 fused finalize all-reduce): enabling them on SM107
+    changes this model's default arithmetic on that GPU, so it is an opt-in.
+    """
+    return os.environ.get("MUSESPARK_OPEN_SM107_FUSED_KERNELS", "0").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def fused_kernels_supported(capability: Tuple[int, int]) -> bool:
+    """Whether the SM103-measured fused kernels of this model run on ``capability``.
+
+    SM103: yes. SM107: only with ``_sm107_fused_kernels_enabled``. Any other GPU:
+    no. Read once where each kernel is set up (model construction, its workspace
+    or availability check), never per step.
+    """
+    capability = tuple(capability)
+    if capability == (10, 3):
+        return True
+    if capability == (10, 7):
+        return _sm107_fused_kernels_enabled()
+    return False
+
+
 def _preqkv_norm_fp32_residual_enabled() -> bool:
     """Whether the pre-QKV prenorm reads the FP32 residual (cast after norm).
 
@@ -629,6 +667,55 @@ def _fused_finalize_ar_enabled() -> bool:
         "false",
         "no",
         "off",
+    )
+
+
+#: The largest batch ``MUSESPARK_OPEN_FUSED_FINALIZE_AR_CHUNKED`` serves with the
+#: fused finalize + all-reduce: decode steps of up to 64 requests at eight rows
+#: each. Larger batches (prefill chunks) keep the unfused finalize and NCCL.
+_FINALIZE_AR_CHUNKED_MAX_TOKENS = 512
+
+
+def _fused_finalize_ar_chunked_enabled() -> bool:
+    """Whether batches of 129..512 tokens take the fused finalize + all-reduce in 128-token calls.
+
+    Off unless MUSESPARK_OPEN_FUSED_FINALIZE_AR_CHUNKED names a truthy value.
+    The fused kernel serves at most 128 tokens per call; this runs it once per
+    128-token chunk instead of falling back to the unfused finalize and the
+    NCCL all-reduce. Each token's result is bitwise what the fused kernel
+    returns for it at up to 128 tokens; against the unfused fallback it
+    differs as the fused path does there (per-rank BF16 partials summed in
+    FP32). Resolved at module construction, before warmup and any graph
+    capture.
+    """
+    return os.environ.get("MUSESPARK_OPEN_FUSED_FINALIZE_AR_CHUNKED", "0").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+#: The largest batch whose router and pool projection run on two streams:
+#: 128 tokens by default, decode steps of up to 64 requests at eight rows each
+#: with ``MUSESPARK_OPEN_LARGE_PREPARE_OVERLAP``.
+_PREPARE_OVERLAP_MAX_TOKENS = 128
+_LARGE_PREPARE_OVERLAP_MAX_TOKENS = 512
+
+
+def _large_prepare_overlap_enabled() -> bool:
+    """Whether batches of 129..512 tokens overlap the router with the pool projection.
+
+    Off unless MUSESPARK_OPEN_LARGE_PREPARE_OVERLAP names a truthy value. The
+    overlap only places the same kernels on two streams, so its outputs are
+    bitwise the serial ones. Resolved at module construction, before warmup
+    and any graph capture.
+    """
+    return os.environ.get("MUSESPARK_OPEN_LARGE_PREPARE_OVERLAP", "0").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
     )
 
 
@@ -1573,7 +1660,7 @@ class MuseSparkOpenAttention(QKNormRoPEAttention):
                 0 < attention_output.shape[0] <= 128
                 or (
                     getattr(self, "_large_norm_gate_enabled", False)
-                    and attention_output.shape[0] >= 512
+                    and attention_output.shape[0] > 128
                     and not torch.compiler.is_compiling()
                     and attention_output.stride(0) % 8 == 0
                     and attention_output.data_ptr() % 16 == 0
@@ -1593,7 +1680,8 @@ class MuseSparkOpenAttention(QKNormRoPEAttention):
             and gate.numel() == attention_output.numel()
             and (gate.ndim == 2 or gate.shape[-1] == self.head_dim)
         ):
-            if attention_output.shape[0] >= 512:
+            if attention_output.shape[0] > 128:
+                # Bitwise the unfused norm and gate below, at any token count.
                 from ..cute_dsl_kernels.blackwell.rmsnorm_gate import rmsnorm_gate
 
                 return rmsnorm_gate(attention_output, gate, self.o_head_norm.variance_epsilon)
@@ -1720,10 +1808,18 @@ class MuseSparkOpenMoE(nn.Module):
         self.metap_multiplier = config.metap_multiplier
         self.mapping = model_config.mapping
         self._large_finalize_4warps = os.getenv("MUSESPARK_OPEN_LARGE_FINALIZE_4WARPS", "0") == "1"
+        self._finalize_ar_max_tokens = (
+            _FINALIZE_AR_CHUNKED_MAX_TOKENS if _fused_finalize_ar_chunked_enabled() else 128
+        )
+        self._prepare_overlap_max_tokens = (
+            _LARGE_PREPARE_OVERLAP_MAX_TOKENS
+            if _large_prepare_overlap_enabled()
+            else _PREPARE_OVERLAP_MAX_TOKENS
+        )
         self._bf16x3_router_enabled = (
             os.getenv("MUSESPARK_OPEN_BF16X3_ROUTER", "0") == "1"
             and torch.cuda.is_available()
-            and torch.cuda.get_device_capability() == (10, 3)
+            and fused_kernels_supported(torch.cuda.get_device_capability())
         )
         # EP reduces normalized local experts; pure TP must instead reduce
         # each expert's FC2 partials before its nonlinear normalization.
@@ -2044,7 +2140,9 @@ class MuseSparkOpenMoE(nn.Module):
         overlap = (
             getattr(self, "_prepare_stream", None) is not None
             and hidden_states.is_cuda
-            and 0 < hidden_states.shape[0] <= 128
+            and 0
+            < hidden_states.shape[0]
+            <= getattr(self, "_prepare_overlap_max_tokens", _PREPARE_OVERLAP_MAX_TOKENS)
             and not torch.compiler.is_compiling()
             and getattr(self.experts, "comm", None) is None
         )
@@ -2224,12 +2322,17 @@ class MuseSparkOpenMoE(nn.Module):
             routing_method.clear_routing_memo()
             with self.nvtx("finalize"):
                 workspace = getattr(self, "_finalize_ar_workspace", None)
-                if (
-                    workspace is not None
-                    and 1 <= num_tokens <= 128
-                    and not torch.compiler.is_compiling()
-                ):
-                    combined = workspace.finalize(
+                # Batches above one fused call's 128 tokens need a workspace
+                # that chunks them; a wrapper without ``finalize_chunked``
+                # leaves them on the unfused path.
+                finalize = None
+                if workspace is not None and not torch.compiler.is_compiling():
+                    if 1 <= num_tokens <= 128:
+                        finalize = workspace.finalize
+                    elif num_tokens <= getattr(self, "_finalize_ar_max_tokens", 128):
+                        finalize = getattr(workspace, "finalize_chunked", None)
+                if finalize is not None:
+                    combined = finalize(
                         gemm2_output,
                         expanded_idx_to_permuted_idx,
                         token_final_scales,
@@ -2544,7 +2647,7 @@ class MuseSparkOpenModel(DecoderModel):
             and not mapping.enable_attention_dp
             and torch.cuda.is_available()
             and config.torch_dtype == torch.bfloat16
-            and torch.cuda.get_device_capability() == (10, 3)
+            and fused_kernels_supported(torch.cuda.get_device_capability())
             and all(
                 layer.feed_forward.expert_hidden_size == 4096 and layer.feed_forward.top_k == 8
                 for layer in self.layers
@@ -2559,13 +2662,20 @@ class MuseSparkOpenModel(DecoderModel):
                 for layer in self.layers:
                     layer.feed_forward._finalize_ar_workspace = self._finalize_ar_workspace
         if os.getenv("MUSESPARK_OPEN_SHARDED_PROJECTIONS", "0") == "1":
+            tp_nodes = len({rank // mapping.gpus_per_node for rank in mapping.tp_group})
+            if mapping.tp_size == 8:
+                sharded_topology = mapping.moe_ep_size == 8
+            elif mapping.tp_size == 4:
+                sharded_topology = mapping.moe_ep_size == 4 and tp_nodes == 1
+            else:
+                sharded_topology = False
             if not (
-                mapping.tp_size == mapping.moe_ep_size == 8
+                sharded_topology
                 and mapping.gpus_per_node == 4
                 and mapping.cp_size == mapping.pp_size == 1
                 and not mapping.enable_attention_dp
                 and config.torch_dtype == torch.bfloat16
-                and torch.cuda.get_device_capability() == (10, 3)
+                and fused_kernels_supported(torch.cuda.get_device_capability())
                 and all(
                     layer.feed_forward.expert_hidden_size == 4096
                     and getattr(layer.feed_forward.experts, "comm", None) is None
@@ -2573,8 +2683,10 @@ class MuseSparkOpenModel(DecoderModel):
                 )
             ):
                 raise ValueError(
-                    "Sharded projections require GB300 BF16 TP8/EP8, four GPUs per node, "
-                    "CP1/PP1, expert width 4096, and no attention DP or external MoE communication"
+                    "Sharded projections require SM103 (or SM107 with "
+                    "MUSESPARK_OPEN_SM107_FUSED_KERNELS=1) BF16 TP8/EP8 or single-node TP4/EP4, "
+                    "four GPUs per node, CP1/PP1, expert width 4096, and no attention DP or "
+                    "external MoE communication"
                 )
             from .musespark_open_projection_gather import ProjectionGatherWorkspace
 
@@ -2586,7 +2698,9 @@ class MuseSparkOpenModel(DecoderModel):
             for layer in self.layers:
                 layer.feed_forward._pool_gather_workspace = pool_workspace
                 layer.feed_forward._unpool_gather_workspace = unpool_workspace
-            logger.info("MuseSparkOpen experimental TP8 sharded projections enabled for M<=8")
+            logger.info(
+                f"MuseSparkOpen experimental TP{mapping.tp_size} sharded projections enabled for M<=8"
+            )
         # Final norm keeps the raw stored weight (gain center 0).
         self.norm = RMSNorm(
             hidden_size=config.hidden_size, eps=config.rms_norm_eps, dtype=config.torch_dtype
