@@ -30,7 +30,6 @@ from torch import Tensor, nn
 from transformers import (AutoProcessor, PretrainedConfig,
                           PreTrainedTokenizerBase)
 
-from .._utils import nvtx_range_debug
 from ..logger import logger
 from ..sampling_params import SamplingParams
 from .content_format import ContentFormat
@@ -44,6 +43,7 @@ from .multimodal import (MULTIMODAL_ENCODER_ITEM_METADATA_KEY, MultimodalInput,
                          hexdigest_to_int32, validate_mm_inputs)
 from .multimodal_data import serialize_item
 from .prefix_token_cache import create_prefix_token_cache
+from .tokenization import tokenize_prompt
 
 N = TypeVar("N", bound=Type[nn.Module])
 
@@ -175,49 +175,12 @@ class DefaultInputProcessor(InputProcessor):
         self, inputs: TextPrompt, sampling_params: SamplingParams
     ) -> Tuple[List[int], Optional[ExtraProcessedInputs]]:
         """The default input processor handles only tokenization."""
-        if self.tokenizer is None:
-            raise ValueError("tokenizer is required to tokenize string prompt")
-        # Only when the tokenizer would be called exactly as the cache calls it.
-        if (self._prefix_token_cache is not None
-                and not sampling_params.add_special_tokens
-                and sampling_params.truncate_prompt_tokens is None):
-            with nvtx_range_debug("tokenize prompt"), nvtx_range_debug(
-                    "prefix cache"):
-                return self._prefix_token_cache.encode(self.tokenizer,
-                                                       inputs["prompt"]), None
-        kwargs = {}
-        if sampling_params.truncate_prompt_tokens is not None:
-            kwargs = dict(truncation=True,
-                          max_length=sampling_params.truncate_prompt_tokens)
-        toktoken_special_tokens = {
-            "<|startoftext|>",
-            "<|endoftext|>",
-            "<|reserved_200000|>",
-            "<|reserved_200001|>",
-            "<|return|>",
-            "<|constrain|>",
-            "<|reserved_200004|>",
-            "<|channel|>",
-            "<|start|>",
-            "<|end|>",
-            "<|message|>",
-            "<|reserved_200009|>",
-            "<|reserved_200010|>",
-            "<|reserved_200011|>",
-            "<|call|>",
-            "<|reserved_200013|>",
-        }
-        with nvtx_range_debug("tokenize prompt"):
-            try:
-                token_ids = self.tokenizer.encode(
-                    inputs["prompt"],
-                    add_special_tokens=sampling_params.add_special_tokens,
-                    **kwargs)
-            except:
-                # Tiktoken path
-                token_ids = self.tokenizer.encode(
-                    inputs["prompt"], allowed_special=toktoken_special_tokens)
-
+        token_ids = tokenize_prompt(
+            self.tokenizer,
+            inputs["prompt"],
+            add_special_tokens=sampling_params.add_special_tokens,
+            truncate_prompt_tokens=sampling_params.truncate_prompt_tokens,
+            prefix_token_cache=self._prefix_token_cache)
         return token_ids, None
 
 

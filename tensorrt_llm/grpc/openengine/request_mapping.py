@@ -36,8 +36,8 @@ _MAX_STOP_CONDITIONS = 64
 # Bound per-request decode work and retained decoded media.
 _MAX_MEDIA_ITEMS = 64
 _MAX_CONCURRENT_MEDIA_LOADS = 8
-# Images are charged after decoding. Video decoders reserve their estimated
-# peak before allocating frame buffers, then settle to retained decoded bytes.
+# Images are charged after decoding. Video decoders reserve retained bytes and
+# counted peak buffers separately before allocating frames.
 # Encoded inputs have separate gRPC and remote-loader caps.
 _MAX_TOTAL_DECODED_MEDIA_BYTES = 512 * 1024 * 1024
 _CONVERSATION_ID_EXTRA_KEY = "conversation_id"
@@ -48,32 +48,44 @@ _MediaLoader = Callable[[generation_pb2.MediaItem, int], Awaitable[Any]]
 
 
 class _DecodedMediaReservation:
-    def __init__(self, budget: "_DecodedMediaBudget", reserved_bytes: int) -> None:
+    def __init__(self, budget: "_DecodedMediaBudget", peak_bytes: int, retained_bytes: int) -> None:
         self._budget = budget
-        self._reserved_bytes = reserved_bytes
+        self._peak_bytes = peak_bytes
+        self._retained_bytes = retained_bytes
         self._active = True
+
+    def shrink(self, retained_bytes: int) -> None:
+        if not self._active or not 0 <= retained_bytes <= self._retained_bytes:
+            raise ValueError("invalid decoded-media reservation shrink")
+        self._budget._shrink(self._peak_bytes, self._retained_bytes, retained_bytes)
+        self._peak_bytes = self._retained_bytes = retained_bytes
 
     def commit(self, retained_bytes: int) -> None:
         if not self._active:
             raise RuntimeError("decoded-media reservation is no longer active")
         try:
-            self._budget._commit(self._reserved_bytes, retained_bytes)
+            self._budget._settle(self._peak_bytes, self._retained_bytes, retained_bytes)
         finally:
             self._active = False
 
     def release(self) -> None:
         if self._active:
-            self._budget._release(self._reserved_bytes)
+            self._budget._settle(self._peak_bytes, self._retained_bytes, 0)
             self._active = False
 
 
 class _DecodedMediaBudget:
     """Thread-safe shared budget for all decoded media in one request."""
 
-    def __init__(self, limit: int) -> None:
+    def __init__(self, limit: int, peak_limit: int | None = None) -> None:
         self._limit = limit
+        # Conversion buffers have a separate allowance from retained output.
+        self._peak_limit = peak_limit if peak_limit is not None else 2 * limit
+        self._retained = 0
+        self._reserved_retained = 0
         self._used = 0
-        self._lock = threading.Lock()
+        self._condition = threading.Condition()
+        self._cancelled = False
 
     def _limit_error(self) -> ValueError:
         return ValueError(f"decoded media exceeds the per-request limit of {self._limit} bytes")
@@ -81,31 +93,58 @@ class _DecodedMediaBudget:
     def charge(self, retained_bytes: int) -> None:
         if retained_bytes < 0:
             raise ValueError("decoded media size cannot be negative")
-        with self._lock:
-            if self._used + retained_bytes > self._limit:
+        with self._condition:
+            if self._retained + self._reserved_retained + retained_bytes > self._limit:
                 raise self._limit_error()
+            self._retained += retained_bytes
             self._used += retained_bytes
 
-    def reserve(self, peak_bytes: int) -> _DecodedMediaReservation:
-        if peak_bytes < 0:
-            raise ValueError("decoded media size cannot be negative")
-        with self._lock:
-            if self._used + peak_bytes > self._limit:
-                raise self._limit_error()
+    def reserve(self, peak_bytes: int, retained_bytes: int) -> _DecodedMediaReservation:
+        if not 0 <= retained_bytes <= peak_bytes:
+            raise ValueError("decoded media sizes must satisfy 0 <= retained <= peak")
+        with self._condition:
+            while True:
+                if self._cancelled:
+                    raise ValueError("decoded media loading was cancelled")
+                if self._retained + self._reserved_retained + retained_bytes > self._limit:
+                    raise self._limit_error()
+                if self._retained + peak_bytes > self._peak_limit:
+                    raise ValueError(
+                        f"decoded media exceeds the peak buffer limit of {self._peak_limit} bytes"
+                    )
+                if self._used + peak_bytes <= self._peak_limit:
+                    break
+                self._condition.wait()
             self._used += peak_bytes
-        return _DecodedMediaReservation(self, peak_bytes)
+            self._reserved_retained += retained_bytes
+        return _DecodedMediaReservation(self, peak_bytes, retained_bytes)
 
-    def _commit(self, reserved_bytes: int, retained_bytes: int) -> None:
-        if retained_bytes < 0:
-            raise ValueError("decoded media size cannot be negative")
-        with self._lock:
-            self._used += retained_bytes - reserved_bytes
-            if self._used > self._limit:
-                raise self._limit_error()
+    def _shrink(self, peak_bytes: int, reserved_retained: int, retained_bytes: int) -> None:
+        with self._condition:
+            self._used -= peak_bytes - retained_bytes
+            self._reserved_retained -= reserved_retained - retained_bytes
+            self._condition.notify_all()
 
-    def _release(self, reserved_bytes: int) -> None:
-        with self._lock:
-            self._used -= reserved_bytes
+    def _settle(self, peak_bytes: int, reserved_retained: int, retained_bytes: int) -> None:
+        with self._condition:
+            self._used -= peak_bytes
+            self._reserved_retained -= reserved_retained
+            try:
+                if retained_bytes < 0:
+                    raise ValueError("decoded media size cannot be negative")
+                if self._retained + self._reserved_retained + retained_bytes > self._limit:
+                    raise self._limit_error()
+                if self._used + retained_bytes > self._peak_limit:
+                    raise self._limit_error()
+                self._used += retained_bytes
+                self._retained += retained_bytes
+            finally:
+                self._condition.notify_all()
+
+    def cancel(self) -> None:
+        with self._condition:
+            self._cancelled = True
+            self._condition.notify_all()
 
 
 def _always_available() -> bool:
@@ -574,6 +613,7 @@ async def _input_from_request(
         decoded_media = await asyncio.gather(*tasks)
     except (Exception, asyncio.CancelledError):
         # gather leaves siblings running after the first failure.
+        budget.cancel()
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)

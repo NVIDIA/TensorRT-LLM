@@ -53,12 +53,14 @@ class MediaFetchError(RuntimeError):
 
 
 class _DecodedMemoryReservation(Protocol):
+    def shrink(self, retained_bytes: int) -> None: ...
+
     def commit(self, retained_bytes: int) -> None: ...
 
     def release(self) -> None: ...
 
 
-_DecodedMemoryReserver = Callable[[int], _DecodedMemoryReservation]
+_DecodedMemoryReserver = Callable[[int, int], _DecodedMemoryReservation]
 
 
 def _decoded_video_bytes(video: Any) -> int:
@@ -159,7 +161,7 @@ async def _close_aiohttp_session() -> None:
         await session.close()
 
 
-# Maximum allowed response size for remote fetches (200 MB).
+# Maximum allowed response size and encoded video input size (200 MiB).
 _MAX_RESPONSE_BYTES = 200 * 1024 * 1024
 
 # Chunk size used while enforcing the response size cap.
@@ -467,12 +469,12 @@ def _audio_frame_to_array(frame, mono: bool) -> np.ndarray:
     return chunk
 
 
-# TODO(TRTLLM-12001): Add unit tests for this.
 def extract_audio_from_video(
     source: Union[str, BytesIO],
     *,
     sr: Optional[float] = None,
     mono: bool = True,
+    decoded_memory_reserver: Optional[_DecodedMemoryReserver] = None,
 ) -> Tuple[np.ndarray, int]:
     """Extract the audio track from a video file using PyAV.
 
@@ -480,6 +482,8 @@ def extract_audio_from_video(
         source: File path, URL, or BytesIO containing the video.
         sr: Target sample rate. If `None`, the native sample rate is kept.
         mono: If `True` (default), average channels to produce a mono waveform.
+        decoded_memory_reserver: Shared budget for retained chunks and the final
+            concatenation buffer. Codec and resampler working memory is excluded.
 
     Returns:
         `(waveform, sample_rate)` where *waveform* is a 1-D float32
@@ -498,51 +502,85 @@ def extract_audio_from_video(
     except ImportError:
         raise ImportError("PyAV is required for audio extraction from video but is not installed.")
 
+    chunks: List[np.ndarray] = []
+    reservations: List[Tuple[_DecodedMemoryReservation, int]] = []
+    concatenation_reservation: Optional[_DecodedMemoryReservation] = None
+
+    def append_frame(frame) -> None:
+        if decoded_memory_reserver is not None:
+            channels = 1 if mono else len(frame.layout.channels)
+            retained_bytes = frame.samples * channels * np.dtype(np.float32).itemsize
+            reservation = decoded_memory_reserver(retained_bytes, retained_bytes)
+            reservations.append((reservation, retained_bytes))
+        chunk = _audio_frame_to_array(frame, mono)
+        if decoded_memory_reserver is not None and (
+            chunk.dtype != np.float32 or chunk.nbytes != retained_bytes
+        ):
+            raise ValueError("Decoded audio chunk does not match its float32 reservation")
+        chunks.append(chunk)
+
     try:
-        with av.open(source) as container:
-            if not container.streams.audio:
-                raise ValueError("No audio stream found in the video.")
-            stream = container.streams.audio[0]
-            stream.thread_type = "AUTO"
-            native_sr = stream.rate
-            target_sr = int(sr) if sr is not None else native_sr
+        try:
+            with av.open(source) as container:
+                if not container.streams.audio:
+                    raise ValueError("No audio stream found in the video.")
+                stream = container.streams.audio[0]
+                stream.thread_type = "AUTO"
+                native_sr = stream.rate
+                target_sr = int(sr) if sr is not None else native_sr
 
-            chunks: List[np.ndarray] = []
-            target_layout = "mono" if mono else stream.layout.name
-            needs_resampling = (
-                not math.isclose(float(target_sr), float(native_sr), rel_tol=0.0, abs_tol=1e-6)
-                or stream.format.name != "fltp"
-                or stream.layout.name != target_layout
-            )
-            resampler = (
-                av.AudioResampler(
-                    format="fltp",
-                    layout=target_layout,
-                    rate=target_sr,
+                target_layout = "mono" if mono else stream.layout.name
+                needs_resampling = (
+                    not math.isclose(float(target_sr), float(native_sr), rel_tol=0.0, abs_tol=1e-6)
+                    or stream.format.name != "fltp"
+                    or stream.layout.name != target_layout
                 )
-                if needs_resampling
-                else None
+                resampler = (
+                    av.AudioResampler(
+                        format="fltp",
+                        layout=target_layout,
+                        rate=target_sr,
+                    )
+                    if needs_resampling
+                    else None
+                )
+                for frame in container.decode(stream):
+                    if needs_resampling:
+                        for out_frame in resampler.resample(frame):
+                            append_frame(out_frame)
+                    else:
+                        append_frame(frame)
+        except ValueError:
+            raise
+        except Exception as e:
+            raise ValueError(
+                "Invalid or corrupted video data when extracting audio. "
+                "Ensure the input is a valid video file."
+            ) from e
+
+        if not chunks:
+            raise ValueError("No audio frames decoded from the video.")
+
+        if decoded_memory_reserver is not None:
+            concatenation_reservation = decoded_memory_reserver(
+                sum(chunk.nbytes for chunk in chunks), 0
             )
-            for frame in container.decode(stream):
-                if needs_resampling:
-                    for out_frame in resampler.resample(frame):
-                        chunks.append(_audio_frame_to_array(out_frame, mono))
-                else:
-                    chunks.append(_audio_frame_to_array(frame, mono))
-    except ValueError:
-        raise
-    except Exception as e:
-        raise ValueError(
-            "Invalid or corrupted video data when extracting audio. "
-            "Ensure the input is a valid video file."
-        ) from e
+        audio = np.concatenate(chunks, axis=-1).astype(np.float32, copy=False)
+        chunks.clear()
+        if concatenation_reservation is not None:
+            concatenation_reservation.release()
+            concatenation_reservation = None
+        # The waveform replaces the chunks without changing retained-byte ownership.
+        for reservation, retained_bytes in reservations:
+            reservation.commit(retained_bytes)
 
-    if not chunks:
-        raise ValueError("No audio frames decoded from the video.")
-
-    audio = np.concatenate(chunks, axis=-1).astype(np.float32, copy=False)
-
-    return audio, target_sr
+        return audio, target_sr
+    finally:
+        chunks.clear()
+        if concatenation_reservation is not None:
+            concatenation_reservation.release()
+        for reservation, _ in reservations:
+            reservation.release()
 
 
 def _get_cv2():
@@ -810,7 +848,8 @@ def _load_video_by_cv2(
     counted peak frame buffers are sized from the first decoded frame and
     checked before the frame stack is allocated. This covers buffers allocated
     here, not codec state, compressed input, Python overhead, or the process's
-    complete memory peak.
+    complete memory peak. The reserver receives peak and retained byte estimates
+    and may wait for sibling conversions to release their temporary buffers.
     """
     assert format in ("pt", "np", "pil"), "format must be one of 'pt', 'np', 'pil'"
 
@@ -886,6 +925,7 @@ def _load_video_by_cv2(
                     if stacked_rgb is None:
                         H, W = fh, fw
                         frame_values = num_frames_to_sample * H * W * 3
+                        retained_frame_bytes = frame_values * (4 if format == "pt" else 1)
                         if format == "pt":
                             # uint8 RGB stack + float32 NumPy normalization
                             # buffer + contiguous float32 CHW tensor. A
@@ -899,7 +939,8 @@ def _load_video_by_cv2(
                                 else 0
                             )
                         else:
-                            peak_item_size = np.dtype(np.uint8).itemsize
+                            # RGB stack plus PIL copies or a compact truncated ndarray.
+                            peak_item_size = 2 * np.dtype(np.uint8).itemsize
                         peak_decoded_frame_bytes = frame_values * peak_item_size
                         if (
                             max_decoded_frame_bytes is not None
@@ -912,7 +953,7 @@ def _load_video_by_cv2(
                             )
                         if decoded_memory_reserver is not None:
                             decoded_memory_reservation = decoded_memory_reserver(
-                                peak_decoded_frame_bytes
+                                peak_decoded_frame_bytes, retained_frame_bytes
                             )
                         stacked_rgb = np.empty((num_frames_to_sample, H, W, 3), dtype=np.uint8)
                     if (fh, fw) == (H, W):
@@ -938,7 +979,10 @@ def _load_video_by_cv2(
 
         if stacked_rgb is None or not valid_indices:
             raise ValueError("Video has no readable frames.")
-        stacked_rgb = stacked_rgb[: len(valid_indices)]
+        if format == "np" and len(valid_indices) < num_frames_to_sample:
+            stacked_rgb = stacked_rgb[: len(valid_indices)].copy()
+        else:
+            stacked_rgb = stacked_rgb[: len(valid_indices)]
 
         if format == "pt":
             stacked_f32 = stacked_rgb.astype(np.float32)
@@ -954,6 +998,7 @@ def _load_video_by_cv2(
             loaded_frames = stacked_rgb
         else:  # "pil"
             loaded_frames = [Image.fromarray(frame) for frame in stacked_rgb]
+            del stacked_rgb
 
         metadata = {
             "total_num_frames": frame_count,
@@ -970,9 +1015,18 @@ def _load_video_by_cv2(
         # audio extraction on Windows) and to avoid leaking descriptors.
         vidcap.release()
 
+    video_data = VideoData(
+        frames=loaded_frames,
+        metadata=metadata,
+        raw_bytes_hash=raw_bytes_hash,
+    )
     try:
-        audio = None
+        frame_bytes = (
+            _decoded_video_bytes(video_data) if decoded_memory_reservation is not None else 0
+        )
         if extract_audio:
+            if decoded_memory_reservation is not None:
+                decoded_memory_reservation.shrink(frame_bytes)
             # extract_audio_from_video accepts Union[str, BytesIO]. When the
             # in-memory cv2 path was taken, `video` is still the original
             # bytes parameter — wrap in a fresh BytesIO (the one consumed by
@@ -984,30 +1038,21 @@ def _load_video_by_cv2(
                 else video
             )
             try:
-                audio_samples, audio_sample_rate = extract_audio_from_video(audio_source)
-                audio = AudioData(samples=audio_samples, sample_rate=audio_sample_rate)
+                audio_samples, audio_sample_rate = extract_audio_from_video(
+                    audio_source, decoded_memory_reserver=decoded_memory_reserver
+                )
+                video_data.audio = AudioData(samples=audio_samples, sample_rate=audio_sample_rate)
             except ValueError as e:
                 if "No audio stream found" in str(e):
                     logger.warning("Video has no audio track, skipping audio extraction.")
                 else:
                     raise
+        if decoded_memory_reservation is not None:
+            decoded_memory_reservation.commit(frame_bytes)
     except BaseException:
         if decoded_memory_reservation is not None:
             decoded_memory_reservation.release()
         raise
-
-    video_data = VideoData(
-        frames=loaded_frames,
-        metadata=metadata,
-        audio=audio,
-        raw_bytes_hash=raw_bytes_hash,
-    )
-    if decoded_memory_reservation is not None:
-        try:
-            decoded_memory_reservation.commit(_decoded_video_bytes(video_data))
-        except Exception:
-            decoded_memory_reservation.release()
-            raise
     return video_data
 
 
@@ -1019,7 +1064,24 @@ def _normalize_file_uri(uri: str) -> str:
     return uri
 
 
-def _safe_read_local_file(location: str) -> bytes:
+def _check_media_size(size: int, max_bytes: int) -> None:
+    if size > max_bytes:
+        raise ValueError(f"Media input exceeds maximum allowed size of {max_bytes} bytes.")
+
+
+def _decode_base64_with_limit(data: str) -> bytes:
+    """Decode base64 media under the shared encoded-input size limit."""
+    max_encoded_chars = 4 * ((_MAX_RESPONSE_BYTES + 2) // 3)
+    if len(data) > max_encoded_chars:
+        raise ValueError(
+            f"Base64 media input exceeds maximum allowed size of {_MAX_RESPONSE_BYTES} decoded bytes."
+        )
+    decoded = base64.b64decode(data)
+    _check_media_size(len(decoded), _MAX_RESPONSE_BYTES)
+    return decoded
+
+
+def _safe_read_local_file(location: str, *, max_bytes: int | None = None) -> bytes:
     """Read a local file, refusing anything that has no end.
 
     Takes a bare path or a ``file://`` URI.
@@ -1030,10 +1092,9 @@ def _safe_read_local_file(location: str) -> bytes:
     turns a caller into a denial of service. A regular file is finite, which is
     the property required here.
 
-    Size is deliberately not capped: naming a large file of one's own is the
-    normal case for a local caller, and no threshold separates that from an
-    abusive one. This bounds the shape of what may be read, then, not its size
-    or its reach — any regular file the process can read is still readable.
+    When ``max_bytes`` is set, check the file size before reading and bound
+    the read to one byte beyond the limit in case the file grows. Other
+    callers retain the uncapped default.
     """
     path = Path(_normalize_file_uri(location))
     try:
@@ -1046,10 +1107,19 @@ def _safe_read_local_file(location: str) -> bytes:
             f"path is not a regular file: {location!r}. Character devices, "
             "FIFOs and directories cannot be read as media."
         )
+    if max_bytes is not None:
+        _check_media_size(stat.st_size, max_bytes)
     try:
-        return path.read_bytes()
+        with path.open("rb") as source:
+            # Allocate for the observed size; use the remaining budget only if the file grows.
+            data = source.read(-1 if max_bytes is None else stat.st_size + 1)
+            if max_bytes is not None and len(data) > stat.st_size:
+                data += source.read(max_bytes + 1 - len(data))
     except OSError as exc:
         raise ValueError(f"file could not be read: {exc}") from exc
+    if max_bytes is not None:
+        _check_media_size(len(data), max_bytes)
+    return data
 
 
 _MediaT = TypeVar("_MediaT")
@@ -1256,7 +1326,7 @@ class AudioMediaIO(BaseMediaIO[Tuple[np.ndarray, int]]):
 
 
 class VideoMediaIO(BaseMediaIO[VideoData]):
-    """I/O for the video modality; customizes merge for `fps`/`num_frames` coupling."""
+    """Video I/O with a 200 MiB encoded-input limit and coupled sampling kwargs."""
 
     _data_uri_mime_prefix: ClassVar[Optional[str]] = "video/"
 
@@ -1305,6 +1375,7 @@ class VideoMediaIO(BaseMediaIO[VideoData]):
         return merged
 
     def load_bytes(self, data: bytes) -> VideoData:
+        _check_media_size(len(data), _MAX_RESPONSE_BYTES)
         # In-memory fast path when cv2 has a stream-buffered backend; spill
         # to a tempfile otherwise so cv2 can open it by path. The tempfile
         # is unlinked on context exit; the inode survives until cv2 closes
@@ -1341,10 +1412,10 @@ class VideoMediaIO(BaseMediaIO[VideoData]):
             )
 
     def load_base64(self, media_type: str, data: str) -> VideoData:
-        return self.load_bytes(base64.b64decode(data))
+        return self.load_bytes(_decode_base64_with_limit(data))
 
     def load_file(self, url: str) -> VideoData:
-        return self.load_bytes(Path(_normalize_file_uri(url)).read_bytes())
+        return self.load_bytes(_safe_read_local_file(url, max_bytes=_MAX_RESPONSE_BYTES))
 
 
 MEDIA_IO_REGISTRY: Mapping[MediaModality, Type[BaseMediaIO]] = MappingProxyType(
