@@ -5,8 +5,8 @@
 from copy import copy, deepcopy
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import (Any, Container, Dict, Hashable, Iterable, List, Optional,
-                    Union, cast)
+from typing import (TYPE_CHECKING, Any, Container, Dict, Hashable, Iterable,
+                    List, Optional, Union, cast)
 
 import torch
 
@@ -68,10 +68,10 @@ class MultimodalEncoderRequestError(ValueError):
 class MultimodalEncoderProgress(Enum):
     """Python-only progress derived from request-local MM item outputs.
 
-    Only `READY` gates control flow today (`is_multimodal_encoder_ready`);
-    `PENDING`/`PARTIAL` are the intermediate states the item-level chunked
-    MM prefill follow-up will consume (per-chunk readiness) and document the
-    FCFS priority in the meantime."""
+    It summarizes the ready flags of all items. Scheduling is gated by the
+    items the remaining prefill uses instead (`get_mm_pending_items`), because
+    items behind confirmed prefill progress or a reusable KV prefix are
+    released or never encoded."""
 
     PENDING = auto()
     """No MM item of the request has an encoder output yet."""
@@ -224,6 +224,10 @@ class MultimodalEncoderRequestState:
         self.item_cache_keys = [None] * len(self.item_cache_keys)
         self.item_ready = [False] * len(self.item_ready)
         return cache_keys
+
+
+if TYPE_CHECKING:
+    from ..tensor_lru_cache import TensorLRUCache
 
 
 @dataclass(slots=True)
@@ -861,7 +865,6 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             seq_slot: Optional[int] = None,
             target_seq_slot: Optional[int] = None,
             num_logprobs: int = 0,
-            is_first_draft: bool = False,
             use_chunked_generation_logits: bool = True,
             logits_chunk_size: int = 8,
             logprobs_mode: LogprobMode = LogprobMode.RAW,
@@ -905,8 +908,8 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
 
         # Cross-iter MM encoder prefetch event: stamped by the side-stream
         # producer in `modeling_multimodal_mixin._dispatch_cross_iter_prefetch`
-        # and consumed (then cleared) in `DecoderRunner._prepare_inputs` when
-        # the request is next scheduled.
+        # and consumed (then cleared) in `DecoderInputPreparer.prepare_inputs`
+        # when the request is next scheduled.
         self.py_mm_encoder_event: Optional[torch.cuda.Event] = None
 
         if llm_request is not None:
@@ -988,8 +991,6 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         # If the request is a draft request, target_seq_slot is the sequence slot ID of its target request.
         self.py_target_seq_slot = target_seq_slot
         self.use_draft_model = is_draft
-        # Whether the request is for the first forward of the draft model.
-        self.py_is_first_draft = is_first_draft
         self.d2t = None
         self.py_disable_speculative_decoding = False
 
@@ -1135,7 +1136,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         # flow, already holds the NEXT step's drafts by response time.
         self.py_num_draft_tokens_verified = 0
         # One-model rejection: set per-iteration by _handle_dynamic_draft_len when
-        # this gen request produced 0 real draft tokens, so _prepare_tp_inputs
+        # this gen request produced 0 real draft tokens, so _pack_extend_requests
         # one-hots its stale draft_probs slot. Consumed (and cleared) there.
         self.py_needs_onehot_draft_probs = False
         self.py_num_accepted_draft_tokens_indices = []
@@ -1404,17 +1405,61 @@ def format_multimodal_encoder_output_budget_error(
     effective_encoder_max_num_tokens: int,
     *,
     request_id: Optional[int] = None,
+    whole_request_output_resident: bool = False,
 ) -> str:
     """Format guidance for a request that exceeds the MM output budget."""
     request_label = ("Multimodal request" if request_id is None else
                      f"Multimodal request {request_id}")
+    chunking_hint = (
+        "; or enable chunked prefill so that only the items of the current "
+        "prompt window must be resident"
+        if whole_request_output_resident else "")
     return (
         f"{request_label} needs {required_bytes} bytes of resident encoder "
         f"output but the encoder output budget is only {budget_bytes} bytes; "
         "effective encoder_max_num_tokens is "
         f"{effective_encoder_max_num_tokens} (it falls back to max_num_tokens "
         "when unset); raise encoder_max_num_tokens to serve inputs of this size"
-    )
+        f"{chunking_hint}")
+
+
+def get_mm_max_resident_embeddings(
+        request: LlmRequest, embedding_lengths: List[int],
+        context_chunk_unit_size: Optional[int]) -> int:
+    """Return the most encoder output rows that prefill needs resident at once.
+
+    Without context chunking, or without `multimodal_embed_mask_cumsum` to
+    place item rows in the prompt, prefill uses every item at once. Otherwise
+    prefill holds only the items of its current chunk and releases each item
+    after consuming it. A chunk can end at any multiple of
+    `context_chunk_unit_size`, so the items that share one unit of the prompt
+    are the ones that must be resident together.
+    """
+    mm_data = request.py_multimodal_data
+    cumsum = (mm_data.get("multimodal_embed_mask_cumsum") if isinstance(
+        mm_data, dict) else None)
+    if context_chunk_unit_size is None or cumsum is None:
+        return sum(embedding_lengths)
+    first_rows, last_rows, lengths = [], [], []
+    row_end = 0
+    for length in embedding_lengths:
+        if length > 0:
+            first_rows.append(row_end + 1)
+            last_rows.append(row_end + length)
+            lengths.append(length)
+        row_end += length
+    # The prompt position of a row is the first position whose cumsum reaches it.
+    positions = torch.searchsorted(
+        cumsum, torch.tensor(first_rows + last_rows,
+                             dtype=cumsum.dtype)).tolist()
+    unit_ranges = [(first // context_chunk_unit_size,
+                    last // context_chunk_unit_size) for first, last in zip(
+                        positions[:len(lengths)], positions[len(lengths):])]
+    # A unit shared by several items is the last unit of the first of them.
+    return max((sum(length
+                    for (first, last), length in zip(unit_ranges, lengths)
+                    if first <= unit <= last) for _, unit in unit_ranges),
+               default=0)
 
 
 def initialize_multimodal_encoder_request(
@@ -1422,16 +1467,16 @@ def initialize_multimodal_encoder_request(
         max_num_tokens: int,
         *,
         max_output_bytes: Optional[int] = None,
-        bytes_per_encoder_embedding: int = 0) -> None:
+        bytes_per_encoder_embedding: int = 0,
+        context_chunk_unit_size: Optional[int] = None) -> None:
     """Initialize immutable request kind and mutable per-item encoder state.
 
     Raises `ValueError` (failing only this request) when raw encoder inputs
     have missing or empty item metadata, an atomic item is larger than the
     effective encoder token budget, the items' embedding rows do not match
     the prompt's embedding slots, or — when the encoder-output budget is
-    supplied — the request's complete embedding footprint could never fit.
-    Prefill currently waits for every item, so the complete footprint must
-    remain resident until the request becomes LLM-eligible.
+    supplied — the outputs that must be resident at once could never fit
+    (see `get_mm_max_resident_embeddings`).
     """
     mm_data = request.py_multimodal_data
     has_raw_payload = isinstance(mm_data, dict) and any(
@@ -1474,18 +1519,109 @@ def initialize_multimodal_encoder_request(
                     "embedding rows but the prompt has "
                     f"{num_embedding_slots} embedding slots")
         if (max_output_bytes is not None and bytes_per_encoder_embedding > 0):
-            total_bytes = (sum(embedding_lengths) * bytes_per_encoder_embedding)
-            if total_bytes > max_output_bytes:
+            resident_bytes = get_mm_max_resident_embeddings(
+                request, embedding_lengths,
+                context_chunk_unit_size) * bytes_per_encoder_embedding
+            if resident_bytes > max_output_bytes:
                 raise ValueError(
                     format_multimodal_encoder_output_budget_error(
-                        total_bytes,
+                        resident_bytes,
                         max_output_bytes,
                         max_num_tokens,
                         request_id=request.py_request_id,
+                        whole_request_output_resident=(context_chunk_unit_size
+                                                       is None),
                     ))
         request.py_mm_encoder_state = (
             MultimodalEncoderRequestState.from_embedding_lengths(
                 embedding_lengths, encoder_token_lengths=token_lengths))
+
+
+def get_mm_context_chunk_start(request: LlmRequest) -> int:
+    """Return confirmed prefill progress, including actually reused KV tokens."""
+    return request.context_current_position
+
+
+def get_mm_items_for_chunk(request: LlmRequest, chunk_start: int,
+                           chunk_end: int) -> List[int]:
+    """Return the MM items whose encoder rows a prompt range uses, in prompt order.
+
+    Without `multimodal_embed_mask_cumsum` the prompt rows of an item are
+    unknown, so every item is returned.
+    """
+    state = request.py_mm_encoder_state
+    if state is None or chunk_start >= chunk_end:
+        return []
+    mm_data = request.py_multimodal_data
+    cumsum = (mm_data.get("multimodal_embed_mask_cumsum") if isinstance(
+        mm_data, dict) else None)
+    if cumsum is None:
+        return list(range(state.num_items))
+    num_positions = len(cumsum)
+    chunk_start = min(chunk_start, num_positions)
+    chunk_end = min(chunk_end, num_positions)
+    row_begin = int(cumsum[chunk_start - 1]) if chunk_start > 0 else 0
+    row_end = int(cumsum[chunk_end - 1]) if chunk_end > 0 else 0
+    if row_begin >= row_end:
+        return []
+    item_indices = []
+    item_end = 0
+    for item_idx, length in enumerate(state.embedding_lengths):
+        item_begin, item_end = item_end, item_end + length
+        if item_begin >= row_end:
+            break
+        if item_end > row_begin:
+            item_indices.append(item_idx)
+    return item_indices
+
+
+def get_mm_pending_items(request: LlmRequest) -> List[int]:
+    """Return items the remaining prefill uses whose outputs are not ready.
+
+    Items wholly inside a confirmed reusable KV prefix or behind completed
+    prefill progress are not pending. Estimated reuse cannot skip encoder work.
+    """
+    state = request.py_mm_encoder_state
+    if state is None:
+        return []
+    return [
+        item_idx for item_idx in get_mm_items_for_chunk(
+            request, get_mm_context_chunk_start(request), request.prompt_len)
+        if not state.item_ready[item_idx]
+    ]
+
+
+def is_mm_context_chunk_ready(request: LlmRequest,
+                              begin: Optional[int] = None) -> bool:
+    """Return whether the MM outputs the next context chunk uses are ready.
+
+    The chunk starts at `begin`, or at the request's confirmed KV position.
+    """
+    state = request.py_mm_encoder_state
+    if state is None:
+        return True
+    if begin is None:
+        begin = get_mm_context_chunk_start(request)
+    return all(state.item_ready[item_idx]
+               for item_idx in get_mm_items_for_chunk(
+                   request, begin, begin + request.context_chunk_size))
+
+
+def release_consumed_mm_items(
+        request: LlmRequest, encoder_cache: Optional["TensorLRUCache"]) -> None:
+    """Release the cache entries of items behind confirmed prefill progress."""
+    state = request.py_mm_encoder_state
+    if state is None:
+        return
+    unconsumed_items = set(
+        get_mm_items_for_chunk(request, request.context_current_position,
+                               request.prompt_len))
+    for item_idx, cache_key in enumerate(state.item_cache_keys):
+        if cache_key is None or item_idx in unconsumed_items:
+            continue
+        if encoder_cache is None:
+            raise RuntimeError("MM request state requires an encoder cache")
+        encoder_cache.release(state.clear_item_cache_key(item_idx))
 
 
 def is_multimodal_encoder_ready(request: LlmRequest) -> bool:
@@ -1494,11 +1630,10 @@ def is_multimodal_encoder_ready(request: LlmRequest) -> bool:
     Readiness is purely a function of the request's encoder item state: a
     request without one (text-only, precomputed embedding, or a model
     outside item scheduling) needs no encoder work; otherwise the request
-    is ready once every item slot is filled (finer-grained progress lives
-    on `MultimodalEncoderRequestState.progress`).
+    is ready once every item its remaining prefill uses has an output
+    (finer-grained progress lives on `MultimodalEncoderRequestState.progress`).
     """
-    state = request.py_mm_encoder_state
-    return state is None or state.progress is MultimodalEncoderProgress.READY
+    return not get_mm_pending_items(request)
 
 
 def executor_request_to_llm_request(

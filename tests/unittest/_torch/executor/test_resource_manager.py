@@ -1307,8 +1307,13 @@ class TestKVCacheManagerConfigForwarding(unittest.TestCase):
 
     def test_secondary_offload_min_priority_forwarded_to_cpp_manager(self):
         """Regression guard: preserve explicit priority 0 when building C++ kwargs."""
-        kv_cache_config = KvCacheConfig(max_tokens=64,
-                                        secondary_offload_min_priority=0)
+        for config_type in (KvCacheConfig, tllm.KvCacheConfig):
+            with self.subTest(config_type=config_type):
+                self._check_offload_priority_forwarding(config_type)
+
+    def _check_offload_priority_forwarding(self, config_type):
+        kv_cache_config = config_type(max_tokens=64,
+                                      secondary_offload_min_priority=0)
 
         mock_impl = MagicMock()
         mock_impl.get_block_pool_pointers.return_value = torch.empty(0)
