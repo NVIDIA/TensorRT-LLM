@@ -1,5 +1,5 @@
 diff --git a/kda_chunked_bt16_small_bh.py b/kda_chunked_bt16_small_bh.py
-index e8bc9feb5ece3dbfe3156c90bb27e68fa5a4521a..d2fec926ad77700041b36005ca64e1348974c9b6 100644
+index e8bc9feb5ece3dbfe3156c90bb27e68fa5a4521a..7478dc054a5a9afb9de5d416588a4b074971f38c 100644
 --- a/kda_chunked_bt16_small_bh.py
 +++ b/kda_chunked_bt16_small_bh.py
 @@ -1,3 +1,4 @@
@@ -118,15 +118,6 @@ index e8bc9feb5ece3dbfe3156c90bb27e68fa5a4521a..d2fec926ad77700041b36005ca64e134
      cu_dtype = _cute_dtype(dtype)
      b, t, tp, nt = (cute.sym_int() for _ in range(4))
      feature: tuple[object, ...]
-@@ -2851,7 +2869,7 @@ def _compile_k1(
-         beta_shape = (t, h)
-         matrix = (nt, h, _BT, _BT)
-         gate = (nt, h, d)
--        cu_seqlens = _fake(_cute_dtype(seqlen_dtype), (b,))
-+        cu_seqlens = _fake(_cute_dtype(seqlen_dtype), (b,), assumed_align=4)
-     else:
-         feature = (b, t, h, d)
-         padded_feature = feature
 @@ -2904,7 +2922,11 @@ def _compile_k2(
      has_state_output: bool,
      transpose_state: bool,
@@ -139,15 +130,6 @@ index e8bc9feb5ece3dbfe3156c90bb27e68fa5a4521a..d2fec926ad77700041b36005ca64e134
      cu_dtype = _cute_dtype(dtype)
      b, bs, t, tp, h, nt = (cute.sym_int() for _ in range(6))
      feature: tuple[object, ...]
-@@ -2917,7 +2939,7 @@ def _compile_k2(
-         value = output = (t, h, d)
-         matrix = (nt, h, _BT, _BT)
-         gate = (nt, h, d)
--        cu_seqlens = _fake(_cute_dtype(seqlen_dtype), (bs,))
-+        cu_seqlens = _fake(_cute_dtype(seqlen_dtype), (bs,), assumed_align=4)
-     else:
-         feature = value = output = (b, t, h, d)
-         matrix = (b, nt, h, _BT, _BT)
 @@ -2925,6 +2947,14 @@ def _compile_k2(
          cu_seqlens = None
      state = (b, h, d, d)

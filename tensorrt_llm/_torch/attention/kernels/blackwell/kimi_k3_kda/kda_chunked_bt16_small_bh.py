@@ -2869,7 +2869,7 @@ def _compile_k1(
         beta_shape = (t, h)
         matrix = (nt, h, _BT, _BT)
         gate = (nt, h, d)
-        cu_seqlens = _fake(_cute_dtype(seqlen_dtype), (b,), assumed_align=4)
+        cu_seqlens = _fake(_cute_dtype(seqlen_dtype), (b,))
     else:
         feature = (b, t, h, d)
         padded_feature = feature
@@ -2939,7 +2939,7 @@ def _compile_k2(
         value = output = (t, h, d)
         matrix = (nt, h, _BT, _BT)
         gate = (nt, h, d)
-        cu_seqlens = _fake(_cute_dtype(seqlen_dtype), (bs,), assumed_align=4)
+        cu_seqlens = _fake(_cute_dtype(seqlen_dtype), (bs,))
     else:
         feature = value = output = (b, t, h, d)
         matrix = (b, nt, h, _BT, _BT)
