@@ -982,8 +982,8 @@ def test_rejects_unsupported_configuration(case, overrides, match) -> None:
 
 
 def test_rejects_other_blocks_and_devices() -> None:
-    for layer_idx in (0, 5):
-        with pytest.raises(ValueError, match="only block 3"):
+    for layer_idx in (0, 2, 6):
+        with pytest.raises(ValueError, match="only sparse blocks"):
             BeamSparseBlockBf16Sm103Tp1(block_config(), layer_idx, device="cuda")
     with pytest.raises(ValueError, match="sm_103"):
         BeamSparseBlockBf16Sm103Tp1(block_config(), LAYER_IDX, device="cpu")
@@ -1086,7 +1086,6 @@ _BAD_INPUTS = [
     "kv_cache_heads",
     "kv_cache_dtype",
     "layer0_cache",
-    "two_layer_cache",
 ]
 
 
@@ -1094,7 +1093,7 @@ _BAD_INPUTS = [
 def test_rejects_unsupported_inputs_before_dispatch(case) -> None:
     """Each declared restriction raises ValueError on the loaded block, and no op runs
     first -- including a cache manager that does not hold logical layer 3 (a default
-    one-layer manager holds layer 0) and one that holds layer 3 beside another layer."""
+    one-layer manager holds layer 0)."""
     blk = loaded_block(17)
     length = 17
     x = torch.randn(1, length, 5120, device="cuda").to(DTYPE)
@@ -1136,17 +1135,11 @@ def test_rejects_unsupported_inputs_before_dispatch(case) -> None:
         context = dict(num_tokens=length, dtype=DataType.HALF)
     elif case == "layer0_cache":
         context = dict(num_tokens=length, layer_mask=None)
-    elif case == "two_layer_cache":
-        context = dict(
-            num_tokens=length, num_layers=2, layer_mask=[i in (3, 4) for i in range(NUM_LAYERS)]
-        )
     with fresh_context(**context) as md:
         if case == "metadata_type":
             md = object()
         elif case == "layer0_cache":
             assert dict(md.kv_cache_manager.layer_offsets) == {0: 0}
-        elif case == "two_layer_cache":
-            assert dict(md.kv_cache_manager.layer_offsets) == {3: 0, 4: 1}
         with no_dispatch(), pytest.raises(ValueError):
             blk(x, positions, md)
 
@@ -1214,6 +1207,32 @@ def test_cache_slot_is_the_managers_local_index(ieee_fp32) -> None:
     k_in = qkv[:, 48 * 128 : 56 * 128].reshape(length, 8, 128)
     v_in = qkv[:, 56 * 128 :].reshape(length, 8, 128)
     assert torch.equal(keys, k_in) and torch.equal(values, v_in)
+
+
+def test_cache_slot_in_a_manager_holding_two_layers(ieee_fp32) -> None:
+    """In a manager that holds logical layers 2 and 3, layer 3 is local slot 1: the attention
+    op is called with that slot, the K and V are appended there, and the block output is
+    bitwise the output on a manager holding layer 3 alone."""
+    seed, length = 17, 17
+    blk = loaded_block(seed)
+    x, positions = case_inputs(seed, length)
+    with fresh_context(length) as md:
+        alone = blk(x, positions, md)
+    with fresh_context(
+        length, num_layers=2, layer_mask=[i in (2, 3) for i in range(NUM_LAYERS)]
+    ) as md:
+        assert dict(md.kv_cache_manager.layer_offsets) == {2: 0, 3: 1}
+        assert blk.step_args(md)["local_layer_idx"] == 1
+        with recording(thop_attention) as calls:
+            out = blk(x, positions, md)
+            torch.cuda.synchronize()
+        keys, values = cache_rows(md, length)
+    (call,) = calls
+    assert call["local_layer_idx"] == 1
+    qkv = call["qkv"]
+    assert torch.equal(keys, qkv[:, 48 * 128 : 56 * 128].reshape(length, 8, 128))
+    assert torch.equal(values, qkv[:, 56 * 128 :].reshape(length, 8, 128))
+    assert bitwise_equal(out, alone)
 
 
 # -------------------------------------------------- tests: the six cases

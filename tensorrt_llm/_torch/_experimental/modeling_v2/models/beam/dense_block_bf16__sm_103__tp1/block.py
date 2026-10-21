@@ -1,16 +1,16 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Beam decoder block 0 / sm_103 / tp1: one dense, sliding-attention block, constructed directly.
+"""Beam decoder blocks 0-2 / sm_103 / tp1: one dense, sliding-attention block, constructed directly.
 
 A component, not a routed target. There is no ``routing.py``, no router-index entry and
 no ``ForCausalLM``: nothing in the engine builds this class, and it serves no request.
-A caller constructs it from the checkpoint's configuration, loads the block's fifteen
-tensors and runs one fresh BF16 context through it, with the attention batch state
-prepared on a ``KVCacheManagerV2``. The forward is assembled from catalog entries, with
-the attention sublayer shared with the sparse block component in ``../_sliding_attention.py``,
-and it does not call the built-in Beam modeling.
+A caller constructs it from the checkpoint's configuration for one of the dense blocks
+0, 1 or 2, loads the block's fifteen tensors and runs one fresh BF16 context through it,
+with the attention batch state prepared on a ``KVCacheManagerV2``. The forward is
+assembled from catalog entries, with the attention sublayer shared with the sparse block
+component in ``../_attention.py``, and it does not call the built-in Beam modeling.
 
-The block::
+The block, with block 0's residual coefficients (block i's are in ``depth_scales``)::
 
     h = rmsnorm(x, input_layernorm)
     q, k, v, g = h @ q_proj^T, h @ k_proj^T, h @ v_proj^T, h @ gate_proj^T
@@ -47,7 +47,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.residual.beam_depth_r
 )
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 
-from .. import _sliding_attention
+from .. import _attention
 
 #: The configuration this component computes, as the checkpoint's config.json states it.
 #: Anything else is rejected at construction rather than computed approximately.
@@ -64,6 +64,8 @@ SUPPORTED_CONFIG = {
     "sliding_window": 512,
 }
 SUPPORTED_LAYER_IDX = 0
+#: The dense blocks of the checkpoint's schedule; ``layer_idx`` fixes the residual coefficients.
+SUPPORTED_LAYER_INDICES = (0, 1, 2)
 SUPPORTED_ROPE = {"rope_type": "default", "rope_theta": 10000.0}
 
 #: The longest fresh context the block was measured at; longer ones are rejected.
@@ -116,9 +118,9 @@ def depth_scales(layer_idx: int, is_attention: bool) -> tuple[float, float]:
 
 def check_config(config, layer_idx: int) -> None:
     """Raise ValueError naming the first field outside what this component computes."""
-    if layer_idx != SUPPORTED_LAYER_IDX:
+    if type(layer_idx) is not int or layer_idx not in SUPPORTED_LAYER_INDICES:
         raise ValueError(
-            f"only block {SUPPORTED_LAYER_IDX} is supported, got layer_idx={layer_idx}"
+            f"only dense blocks {SUPPORTED_LAYER_INDICES} are supported, got layer_idx={layer_idx!r}"
         )
     for field, expected in SUPPORTED_CONFIG.items():
         actual = getattr(config, field, None)
@@ -127,11 +129,15 @@ def check_config(config, layer_idx: int) -> None:
     layer_types = getattr(config, "layer_types", None) or []
     if len(layer_types) <= layer_idx or layer_types[layer_idx] != "sliding_attention":
         raise ValueError(
-            f"block {layer_idx} must be a sliding_attention layer: {layer_types[:1]!r}"
+            f"block {layer_idx} must be a sliding_attention layer: "
+            f"{layer_types[layer_idx] if len(layer_types) > layer_idx else None!r}"
         )
     mlp_types = getattr(config, "mlp_layer_types", None) or []
     if len(mlp_types) <= layer_idx or mlp_types[layer_idx] != "dense":
-        raise ValueError(f"block {layer_idx} must have a dense MLP: {mlp_types[:1]!r}")
+        raise ValueError(
+            f"block {layer_idx} must have a dense MLP: "
+            f"{mlp_types[layer_idx] if len(mlp_types) > layer_idx else None!r}"
+        )
     rope = (getattr(config, "rope_parameters", None) or {}).get("sliding_attention")
     if rope != SUPPORTED_ROPE:
         raise ValueError(
@@ -140,15 +146,15 @@ def check_config(config, layer_idx: int) -> None:
 
 
 class BeamDenseBlockBf16Sm103Tp1(nn.Module):
-    """Beam decoder block 0: BF16 weights and activations, one GPU, one fresh context.
+    """Beam dense decoder block 0, 1 or 2: BF16 weights and activations, one GPU, one fresh context.
 
     ``forward(hidden_states [1, T, 5120] bf16, position_ids [1, T], attn_metadata)``
     returns ``[1, T, 5120]`` bf16 for 1 <= T <= 129, positions ``arange(T)`` and a
     prepared ``TrtllmAttentionMetadata`` holding exactly that one context request on a
-    single-layer BF16 ``KVCacheManagerV2`` (8 kv heads of 128, no cached prefix) that
-    holds logical layer 0. Inputs outside that are rejected before any kernel runs;
-    decode, cached prefixes, chunked prefill, batches and other blocks are not computed
-    here.
+    BF16 ``KVCacheManagerV2`` (8 kv heads of 128, no cached prefix) that holds the
+    block's logical layer ``layer_idx``. Inputs outside that are rejected before any
+    kernel runs; decode, cached prefixes, chunked prefill, batches and other blocks are
+    not computed here.
     """
 
     def __init__(
@@ -198,7 +204,7 @@ class BeamDenseBlockBf16Sm103Tp1(nn.Module):
         self, hidden_states: torch.Tensor, position_ids: torch.Tensor, md: TrtllmAttentionMetadata
     ) -> None:
         """Raise ValueError on anything this block would otherwise compute wrongly."""
-        _sliding_attention.check_step(
+        _attention.check_step(
             hidden_states,
             position_ids,
             md,
@@ -216,11 +222,11 @@ class BeamDenseBlockBf16Sm103Tp1(nn.Module):
 
     def step_args(self, md: TrtllmAttentionMetadata) -> dict:
         """Project the prepared metadata onto thop_attention's explicit batch state."""
-        return _sliding_attention.step_args(md, self.layer_idx)
+        return _attention.step_args(md, self.layer_idx)
 
     def attention(self, h: torch.Tensor, positions: torch.Tensor, step: dict) -> torch.Tensor:
         """Normalized input [T, hidden] -> attention output [T, hidden], before post_attention_layernorm."""
-        return _sliding_attention.attention(
+        return _attention.attention(
             h,
             positions,
             step,

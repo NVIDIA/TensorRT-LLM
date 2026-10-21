@@ -1,15 +1,15 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Beam MoE router of decoder block 3 / sm_103 / tp1, constructed directly.
+"""Beam MoE router of the sparse decoder blocks 3-5 / sm_103 / tp1, constructed directly.
 
 A component, not a routed target. There is no ``routing.py``, no router-index entry and
 no ``ForCausalLM``: nothing in the engine builds this class, and it serves no request.
 A caller constructs it from the checkpoint's configuration, loads the router's two
-tensors and passes it the already-normalized hidden states that enter block 3's
-feed-forward sublayer. It returns the eight experts each token is routed to and their
-mixing weights. It runs no expert, dispatches no token and combines no expert output;
-the routed scaling factor belongs to that combine and is not applied here. It does not
-call the built-in Beam modeling.
+tensors and passes it the already-normalized hidden states that enter its sparse
+block's feed-forward sublayer; each sparse block owns its own router. It returns the
+eight experts each token is routed to and their mixing weights. It runs no expert,
+dispatches no token and combines no expert output; the routed scaling factor belongs to
+that combine and is not applied here. It does not call the built-in Beam modeling.
 
 The routing, every step fp32 (``ops/moe/beam_grouped_topk_router.py``)::
 
@@ -39,6 +39,8 @@ SUPPORTED_CONFIG = {
     "norm_topk_prob": True,
 }
 SUPPORTED_LAYER_IDX = 3
+#: The sparse blocks this router has been built for: the checkpoint's first three.
+SUPPORTED_LAYER_INDICES = (3, 4, 5)
 
 #: Added to the selected scores' sum before dividing, as the source model does.
 NORM_EPS = 1e-20
@@ -48,9 +50,10 @@ _SM = (10, 3)
 
 def check_config(config, layer_idx: int) -> None:
     """Raise ValueError naming the first field outside what this component computes."""
-    if layer_idx != SUPPORTED_LAYER_IDX:
+    if type(layer_idx) is not int or layer_idx not in SUPPORTED_LAYER_INDICES:
         raise ValueError(
-            f"only block {SUPPORTED_LAYER_IDX}'s router is supported, got layer_idx={layer_idx}"
+            f"only the routers of sparse blocks {SUPPORTED_LAYER_INDICES} are supported, "
+            f"got layer_idx={layer_idx!r}"
         )
     for field, expected in SUPPORTED_CONFIG.items():
         actual = getattr(config, field, None)
@@ -66,7 +69,7 @@ def check_config(config, layer_idx: int) -> None:
 
 
 class BeamMoeRouterBf16Sm103Tp1(nn.Module):
-    """Block 3's router: BF16 hidden states in, expert ids and FP32 mixing weights out.
+    """A sparse block's router: BF16 hidden states in, expert ids and FP32 mixing weights out.
 
     State is exactly two FP32 tensors, loaded with ``load_weights``: ``weight``
     ``[256, 5120]`` (checkpoint ``mlp.gate.weight``) and ``e_score_correction_bias``

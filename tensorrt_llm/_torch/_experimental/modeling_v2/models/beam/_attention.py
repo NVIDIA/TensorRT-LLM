@@ -1,26 +1,33 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""The sliding-window attention sublayer of the Beam decoder block components, one fresh context.
+"""The attention sublayer of the Beam decoder block components, one fresh context.
 
-Shared by the dense block 0 and the sparse block 3 components. It holds no parameters,
-cache or configuration: each block passes its own tensors and geometry and the prepared
-attention metadata of the call. The computation, before the block's post-attention norm::
+Shared by the dense and sparse block components. It holds no parameters, cache or
+configuration: each block passes its own tensors and geometry, its layer's position
+encoding and window, and the prepared attention metadata of the call. The computation,
+before the block's post-attention norm::
 
     q, k, v, g = h @ q_proj^T, h @ k_proj^T, h @ v_proj^T, h @ gate_proj^T
     q, k = rmsnorm(q, q_norm), rmsnorm(k, k_norm)          per head, rounded to bf16
-    q, k = rope(q, k)                                       fp32 NeoX rotation, rounded
-    a = causal attention(q, k, v), window 512, scale 1/sqrt(128), 6 q heads per kv head
+    sliding layer: q, k = rope(q, k)                        fp32 NeoX rotation, rounded
+    full layer:    q = q * exp(0.1 * log1p((p + 1) / 2048)) fp32 scale, rounded; k as is
+    a = causal attention(q, k, v), scale 1/sqrt(128), 6 q heads per kv head,
+        window 512 on a sliding layer, the whole context on a full one
     a = a * sigmoid(g + gate_bias)                          per head, bf16 steps
     out = a @ o_proj^T
 
+A full-attention layer has no position embedding: neither q nor k is rotated, and its
+only position dependence is the per-token query scale above.
+
 Logical layer and cache slot. A block's ``layer_idx`` is its depth in the model: it fixes
-the block's semantics (its residual coefficients, its feed-forward kind). The KV cache it
-appends to is a ``KVCacheManagerV2`` that holds only that layer, so its storage slot is the
-manager's local index for it -- ``layer_offsets[layer_idx]``, 0 for the one layer a
-``layer_mask`` selects. The attention op and the manager's per-layer arrays take that local
-index; manager APIs such as ``get_buffers`` take the logical one and translate it. The
-slot is resolved from each call's metadata, never stored, and a manager that does not hold
-the block's logical layer is rejected before any kernel runs.
+the block's semantics (its residual coefficients, its attention and feed-forward kind).
+The KV cache it appends to is a ``KVCacheManagerV2`` that holds that layer, so its storage
+slot is the manager's local index for it -- ``layer_offsets[layer_idx]``: 0 for the one
+layer a ``layer_mask`` selects, the layer's own position in a manager holding several.
+The attention op and the manager's per-layer arrays take that local index; manager APIs
+such as ``get_buffers`` take the logical one and translate it. The slot is resolved from
+each call's metadata, never stored, and a manager that does not hold the block's logical
+layer is rejected before any kernel runs.
 
 Host synchronization: the position check compares the positions with ``arange(T)`` on the
 device and reads the answer back, once per call. The metadata checks read host tensors only.
@@ -34,6 +41,9 @@ import torch
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.beam_neox_rope import (
     beam_neox_rope,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.beam_nope_query_scale import (  # noqa: E501
+    beam_nope_query_scale,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.beam_output_gate import (
     beam_output_gate,
@@ -50,8 +60,9 @@ from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadat
 from tensorrt_llm.bindings import DataType
 
 #: thop_attention arguments that do not change with the step on these blocks: packed q|k|v,
-#: append-and-attend, causal, bf16 pool, no quantization, and RoPE applied before the
-#: call -- the rope_* values are inert placeholders the op requires, not this model's RoPE.
+#: append-and-attend, causal, bf16 pool, no quantization, and any position transform
+#: applied before the call -- the rope_* values are inert placeholders the op requires,
+#: not this model's RoPE.
 CALL_CONSTANTS = dict(
     k=None,
     v=None,
@@ -109,10 +120,10 @@ CALL_CONSTANTS = dict(
 
 
 def local_layer_index(md: TrtllmAttentionMetadata, layer_idx: int) -> int:
-    """The cache slot of logical layer ``layer_idx`` in the call's single-layer cache manager.
+    """The cache slot of logical layer ``layer_idx`` in the call's cache manager.
 
-    Raises ValueError unless the manager holds exactly one local layer and that layer is
-    ``layer_idx``. Reads the manager's host-side layer map only.
+    Raises ValueError unless the manager holds ``layer_idx`` at an integer local index
+    within its local layers. Reads the manager's host-side layer map only.
     """
     mgr = md.kv_cache_manager
     offsets = getattr(mgr, "layer_offsets", None)
@@ -124,10 +135,15 @@ def local_layer_index(md: TrtllmAttentionMetadata, layer_idx: int) -> int:
         )
     num_local = getattr(mgr, "num_local_layers", None)
     local = offsets[layer_idx]
-    if num_local != 1 or not 0 <= local < num_local:
+    if (
+        type(num_local) is not int
+        or type(local) is not int
+        or len(offsets) != num_local
+        or not 0 <= local < num_local
+    ):
         raise ValueError(
-            f"a single-layer KV cache is supported: the manager has {num_local} local layers "
-            f"and maps logical layer {layer_idx} to slot {local}"
+            f"the KV cache manager maps logical layer {layer_idx} to slot {local!r} of "
+            f"{num_local!r} local layers holding {len(offsets)} logical layers"
         )
     return local
 
@@ -149,7 +165,7 @@ def check_step(
     Accepted: ``hidden_states`` contiguous ``[1, T, hidden_size]`` bf16 on ``device``,
     1 <= T <= ``max_tokens``; integer ``position_ids`` ``[1, T]`` equal to ``arange(T)``
     on that device; a prepared ``TrtllmAttentionMetadata`` holding one fresh context
-    request of T tokens on a BF16 ``KVCacheManagerV2`` that holds exactly logical layer
+    request of T tokens on a BF16 ``KVCacheManagerV2`` that holds logical layer
     ``layer_idx`` with ``num_kv_heads`` kv heads of ``head_dim``.
     """
     if not isinstance(hidden_states, torch.Tensor) or hidden_states.dtype != torch.bfloat16:
@@ -179,6 +195,23 @@ def check_step(
     expected = torch.arange(num_tokens, dtype=position_ids.dtype, device=position_ids.device)
     if not torch.equal(position_ids[0], expected):
         raise ValueError("a fresh context must have positions 0..T-1")
+    check_metadata(
+        md, num_tokens, layer_idx=layer_idx, num_kv_heads=num_kv_heads, head_dim=head_dim
+    )
+
+
+def check_metadata(
+    md: TrtllmAttentionMetadata,
+    num_tokens: int,
+    *,
+    layer_idx: int,
+    num_kv_heads: int,
+    head_dim: int,
+) -> None:
+    """Raise ValueError unless ``md`` is one prepared fresh context request of ``num_tokens``
+    tokens on a BF16 ``KVCacheManagerV2`` holding logical layer ``layer_idx`` with
+    ``num_kv_heads`` kv heads of ``head_dim``. Reads host-side state only.
+    """
     if not isinstance(md, TrtllmAttentionMetadata):
         raise ValueError(f"attn_metadata must be TrtllmAttentionMetadata, got {type(md).__name__}")
     mgr = md.kv_cache_manager
@@ -278,12 +311,16 @@ def attention(
     num_kv_heads: int,
     head_dim: int,
     eps: float,
-    rope_theta: float,
+    rope_theta: float | None,
     window: int,
 ) -> torch.Tensor:
     """Normalized input [T, hidden] -> attention output [T, hidden], before post_attention_layernorm.
 
     ``step`` is ``step_args`` of the call's metadata; the projections are ``[out, in]``.
+    ``rope_theta`` is the sliding layer's RoPE base; ``None`` is a full-attention layer
+    without position embedding, whose q takes the per-token query scale instead. ``window``
+    is the attention window the op applies: the sliding window, or the metadata's
+    ``max_seq_len`` for a full layer.
     """
     num_tokens = h.shape[0]
     heads, kv_heads, d = num_heads, num_kv_heads, head_dim
@@ -293,9 +330,11 @@ def attention(
     gate = cublas_mm(h, gate_proj.t())
     q = flashinfer_rmsnorm(q.view(num_tokens * heads, d), q_norm, eps)
     k = flashinfer_rmsnorm(k.view(num_tokens * kv_heads, d), k_norm, eps)
-    q, k = beam_neox_rope(
-        q.view(num_tokens, heads, d), k.view(num_tokens, kv_heads, d), positions, rope_theta, 1.0
-    )
+    q, k = q.view(num_tokens, heads, d), k.view(num_tokens, kv_heads, d)
+    if rope_theta is None:
+        q = beam_nope_query_scale(q, positions)
+    else:
+        q, k = beam_neox_rope(q, k, positions, rope_theta, 1.0)
     qkv = torch.cat((q.view(num_tokens, heads * d), k.view(num_tokens, kv_heads * d), v), dim=-1)
     core = torch.empty(num_tokens, heads * d, dtype=h.dtype, device=h.device)
     core = thop_attention(

@@ -72,7 +72,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.flashinfer_rmsno
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.residual.beam_depth_residual import (
     beam_depth_residual,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.beam import _sliding_attention
+from tensorrt_llm._torch._experimental.modeling_v2.models.beam import _attention
 from tensorrt_llm._torch._experimental.modeling_v2.models.beam.dense_block_bf16__sm_103__tp1 import (  # noqa: E501
     block as block_module,
 )
@@ -559,7 +559,7 @@ def replay(
         head_size=d,
         attention_window_size=BLOCK_CONFIG["sliding_window"],
         **step,
-        **_sliding_attention.CALL_CONSTANTS,
+        **_attention.CALL_CONSTANTS,
     )
     # No rule of its own: the attention core is judged through the attention module below.
     out.append(check("attention_core", None, core, "attention_core"))
@@ -884,10 +884,9 @@ def test_rejects_unsupported_configuration(match, overrides) -> None:
 
 
 def test_rejects_other_blocks_and_devices() -> None:
-    with pytest.raises(ValueError, match="only block 0"):
-        BeamDenseBlockBf16Sm103Tp1(
-            block_config(layer_types=["sliding_attention"] * 2), 1, device="cuda"
-        )
+    for layer_idx in (3, 5):
+        with pytest.raises(ValueError, match="only dense blocks"):
+            BeamDenseBlockBf16Sm103Tp1(block_config(), layer_idx, device="cuda")
     with pytest.raises(ValueError, match="sm_103"):
         BeamDenseBlockBf16Sm103Tp1(block_config(), LAYER_IDX, device="cpu")
 

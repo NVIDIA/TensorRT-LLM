@@ -27,6 +27,14 @@ _BEAM_DENSE_BLOCK = tuple(
     )
     for m in (1, 17, 129)
 )
+#: The Beam six-block model's bias-free, untied head: 5120 -> the 151936-entry vocabulary.
+_BEAM_HEAD = tuple(
+    Cell(
+        why=f"beam head 5120->151936, {m} tokens",
+        spec=dict(m=m, k=5120, n=151936, dtype=torch.bfloat16, bias=False, out_dtype=None),
+    )
+    for m in (1, 17, 129)
+)
 
 
 class CublasMm(OpWrapper):
@@ -64,6 +72,7 @@ class CublasMm(OpWrapper):
             spec=dict(m=1, k=7168, n=1536, dtype=torch.bfloat16, bias=False, out_dtype=None),
         ),
         *_BEAM_DENSE_BLOCK,
+        *_BEAM_HEAD,
     )
 
     note = """

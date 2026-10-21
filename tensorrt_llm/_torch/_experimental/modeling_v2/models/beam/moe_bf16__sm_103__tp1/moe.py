@@ -1,12 +1,14 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Beam MoE feed-forward of decoder block 3 / sm_103 / tp1, constructed directly.
+"""Beam MoE feed-forward of the sparse decoder blocks 3-5 / sm_103 / tp1, constructed directly.
 
 A component, not a routed target. There is no ``routing.py``, no router-index entry and
 no ``ForCausalLM``: nothing in the engine builds this class, and it serves no request.
 A caller constructs it from the checkpoint's configuration, loads the MoE's 770 tensors
-and passes it the already-normalized hidden states that enter block 3's feed-forward
-sublayer. It composes three accepted components and adds no arithmetic of its own::
+and passes it the already-normalized hidden states that enter its sparse block's
+feed-forward sublayer; ``layer_idx`` (3, 4 or 5, as the router accepts) names that block,
+and each block owns its own router and experts. It composes three accepted components and
+adds no arithmetic of its own::
 
     weights, ids = router(hidden)                  ../moe_router_bf16__sm_103__tp1
     out = dispatch_combine(hidden, ids, weights,   ../moe_dispatch_combine_bf16__sm_103__tp1
@@ -103,7 +105,7 @@ def check_weights(expected: Mapping, weights: Mapping[str, torch.Tensor], what: 
 
 
 class BeamMoeBf16Sm103Tp1(nn.Module):
-    """Block 3's MoE: normalized BF16 hidden states in, the combined BF16 MoE output out.
+    """A sparse block's MoE: normalized BF16 hidden states in, the combined BF16 MoE output out.
 
     State: ``gate``, the router (FP32 ``weight [256, 5120]`` and selection-only
     ``e_score_correction_bias [256]``), and ``experts``, 256 routed experts, each with its

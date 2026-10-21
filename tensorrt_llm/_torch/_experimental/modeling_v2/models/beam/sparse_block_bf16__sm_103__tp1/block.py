@@ -1,34 +1,40 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Beam decoder block 3 / sm_103 / tp1: one sparse, sliding-attention block, constructed directly.
+"""Beam decoder blocks 3-5 / sm_103 / tp1: one sparse (MoE) block, constructed directly.
 
 A component, not a routed target. There is no ``routing.py``, no router-index entry and
 no ``ForCausalLM``: nothing in the engine builds this class, and it serves no request.
-A caller constructs it from the checkpoint's configuration, loads the block's 782 tensors
-and runs one fresh BF16 context through it, with the attention batch state prepared on a
-``KVCacheManagerV2`` that holds logical layer 3. The forward is assembled from catalog
-entries, the attention sublayer shared with the dense block component
-(``../_sliding_attention.py``) and the MoE component (``../moe_bf16__sm_103__tp1``); it
-does not call the built-in Beam modeling and owns no dense MLP.
+A caller constructs it from the checkpoint's configuration for one of the sparse blocks
+3, 4 or 5, loads the block's 782 tensors and runs one fresh BF16 context through it, with
+the attention batch state prepared on a ``KVCacheManagerV2`` that holds the block's
+logical layer. The forward is assembled from catalog entries, the attention sublayer
+shared with the dense block component (``../_attention.py``) and the MoE component
+(``../moe_bf16__sm_103__tp1``); it does not call the built-in Beam modeling and owns no
+dense MLP.
 
-The block::
+The block, with block 3's residual coefficients (block i's are in ``depth_scales``)::
 
     h = rmsnorm(x, input_layernorm)
-    a = sliding attention(h)                                 see ../_sliding_attention.py
+    a = attention(h)                                         see ../_attention.py
     x = rmsnorm(a, post_attention_layernorm) / sqrt(8) + x * sqrt(7) / sqrt(8)
     h = rmsnorm(x, pre_feedforward_layernorm)
     m = moe(h)                                               routed scaling 2.5 included
     out = rmsnorm(m, post_feedforward_layernorm) / sqrt(9) + x * sqrt(8) / sqrt(9)
 
+Blocks 3 and 4 attend through the 512-token sliding window with NeoX RoPE; block 5 is a
+full-attention layer without position embedding: no rotation of q or k, the per-token
+query scale on q, and the whole context as its window.
+
 Every RMSNorm computes its statistics, normalization and affine in fp32 and rounds once;
 each residual add rounds both scaled terms to bf16, then their sum. The residual
-coefficients are logical block 3's: block i's attention add is the 2(i + 1)-th add of
+coefficients are the logical block's: block i's attention add is the 2(i + 1)-th add of
 the residual stream, its feed-forward add the next one.
 
-Logical layer and cache slot: ``layer_idx`` = 3 fixes the block's semantics; the cache
-slot is the call's manager's local index for layer 3, 0 for a manager whose
-``layer_mask`` selects only layer 3. A manager that does not hold layer 3 -- a default
-one-layer manager holds layer 0 -- is rejected before any kernel runs.
+Logical layer and cache slot: ``layer_idx`` fixes the block's semantics; the cache slot is
+the call's manager's local index for that layer -- 0 for a manager whose ``layer_mask``
+selects only it, its own position in a manager holding several layers. A manager that
+does not hold the layer -- a default one-layer manager holds layer 0 -- is rejected
+before any kernel runs.
 
 Host synchronization per call: one for the position check, and the MoE's dispatch
 synchronizations (two, plus two per selected expert). Lengths up to 129 tokens never
@@ -52,7 +58,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.residual.beam_depth_r
 )
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 
-from .. import _sliding_attention
+from .. import _attention
 from ..moe_bf16__sm_103__tp1.moe import BeamMoeBf16Sm103Tp1, check_weights
 from ..moe_bf16__sm_103__tp1.moe import check_config as check_moe_config
 
@@ -70,6 +76,10 @@ SUPPORTED_CONFIG = {
     "sliding_window": 512,
 }
 SUPPORTED_LAYER_IDX = 3
+#: The sparse blocks of the checkpoint's schedule and the attention each one runs.
+ATTENTION_TYPES = {3: "sliding_attention", 4: "sliding_attention", 5: "full_attention"}
+SUPPORTED_LAYER_INDICES = tuple(ATTENTION_TYPES)
+#: RoPE of the sliding layers; the full-attention layers have none.
 SUPPORTED_ROPE = {"rope_type": "default", "rope_theta": 10000.0}
 
 #: The longest fresh context the block was measured at; longer ones are rejected.
@@ -122,30 +132,34 @@ def depth_scales(layer_idx: int, is_attention: bool) -> tuple[float, float]:
 
 def check_config(config, layer_idx: int) -> None:
     """Raise ValueError naming the first field outside what this component computes."""
-    if layer_idx != SUPPORTED_LAYER_IDX:
+    if type(layer_idx) is not int or layer_idx not in SUPPORTED_LAYER_INDICES:
         raise ValueError(
-            f"only block {SUPPORTED_LAYER_IDX} is supported, got layer_idx={layer_idx}"
+            f"only sparse blocks {SUPPORTED_LAYER_INDICES} are supported, got layer_idx={layer_idx!r}"
         )
     for field, expected in SUPPORTED_CONFIG.items():
         actual = getattr(config, field, None)
         if actual != expected or type(actual) is not type(expected):
             raise ValueError(f"unsupported {field}={actual!r}; this block computes {expected!r}")
+    attention_type = ATTENTION_TYPES[layer_idx]
     layer_types = getattr(config, "layer_types", None) or []
-    if len(layer_types) <= layer_idx or layer_types[layer_idx] != "sliding_attention":
+    if len(layer_types) <= layer_idx or layer_types[layer_idx] != attention_type:
         raise ValueError(
-            f"block {layer_idx} must be a sliding_attention layer: "
+            f"block {layer_idx} must be a {attention_type} layer: "
             f"{layer_types[layer_idx] if len(layer_types) > layer_idx else None!r}"
         )
-    rope = (getattr(config, "rope_parameters", None) or {}).get("sliding_attention")
-    if rope != SUPPORTED_ROPE:
+    rope_parameters = getattr(config, "rope_parameters", None) or {}
+    rope = rope_parameters.get(attention_type)
+    expected_rope = SUPPORTED_ROPE if attention_type == "sliding_attention" else None
+    if rope != expected_rope or attention_type not in rope_parameters:
         raise ValueError(
-            f"unsupported sliding_attention rope parameters {rope!r}; need {SUPPORTED_ROPE!r}"
+            f"unsupported {attention_type} rope parameters {rope!r}; need {expected_rope!r}"
         )
     check_moe_config(config, layer_idx)
 
 
 class BeamSparseBlockBf16Sm103Tp1(nn.Module):
-    """Beam decoder block 3: BF16 weights and activations, an FP32 router, one GPU, one fresh context.
+    """Beam sparse decoder block 3, 4 or 5: BF16 weights and activations, an FP32 router, one GPU,
+    one fresh context.
 
     State: the twelve BF16 attention and norm tensors of ``weight_shapes`` and ``mlp``, the
     MoE component with its router and 256 experts; ``load_weights`` loads all 782.
@@ -153,8 +167,8 @@ class BeamSparseBlockBf16Sm103Tp1(nn.Module):
     ``forward(hidden_states [1, T, 5120] bf16, position_ids [1, T], attn_metadata)``
     returns ``[1, T, 5120]`` bf16 for 1 <= T <= 129, positions ``arange(T)`` and a
     prepared ``TrtllmAttentionMetadata`` holding exactly that one context request on a
-    BF16 ``KVCacheManagerV2`` (8 kv heads of 128, no cached prefix) that holds logical
-    layer 3 and nothing else. Inputs outside that are rejected before any kernel runs;
+    BF16 ``KVCacheManagerV2`` (8 kv heads of 128, no cached prefix) that holds the
+    block's logical layer. Inputs outside that are rejected before any kernel runs;
     decode, cached prefixes, chunked prefill, batches and other blocks are not computed
     here. Inputs and parameters are never modified.
     """
@@ -174,8 +188,9 @@ class BeamSparseBlockBf16Sm103Tp1(nn.Module):
         self.num_heads = config.num_attention_heads
         self.num_kv_heads = config.num_key_value_heads
         self.head_dim = config.head_dim
-        self.window = config.sliding_window
-        self.rope_theta = SUPPORTED_ROPE["rope_theta"]
+        self.is_sliding = ATTENTION_TYPES[layer_idx] == "sliding_attention"
+        self.window = config.sliding_window if self.is_sliding else None
+        self.rope_theta = SUPPORTED_ROPE["rope_theta"] if self.is_sliding else None
         self.attention_scales = depth_scales(layer_idx, is_attention=True)
         self.feed_forward_scales = depth_scales(layer_idx, is_attention=False)
         self._shapes = weight_shapes(config)
@@ -230,7 +245,7 @@ class BeamSparseBlockBf16Sm103Tp1(nn.Module):
         """Raise ValueError on anything this block would otherwise compute wrongly."""
         if not self._loaded:
             raise ValueError("load_weights must be called before the block runs")
-        _sliding_attention.check_step(
+        _attention.check_step(
             hidden_states,
             position_ids,
             md,
@@ -244,11 +259,11 @@ class BeamSparseBlockBf16Sm103Tp1(nn.Module):
 
     def step_args(self, md: TrtllmAttentionMetadata) -> dict:
         """Project the prepared metadata onto thop_attention's explicit batch state."""
-        return _sliding_attention.step_args(md, self.layer_idx)
+        return _attention.step_args(md, self.layer_idx)
 
     def attention(self, h: torch.Tensor, positions: torch.Tensor, step: dict) -> torch.Tensor:
         """Normalized input [T, hidden] -> attention output [T, hidden], before post_attention_layernorm."""
-        return _sliding_attention.attention(
+        return _attention.attention(
             h,
             positions,
             step,
@@ -265,7 +280,7 @@ class BeamSparseBlockBf16Sm103Tp1(nn.Module):
             head_dim=self.head_dim,
             eps=self.eps,
             rope_theta=self.rope_theta,
-            window=self.window,
+            window=self.window if self.is_sliding else step["max_seq_len"],
         )
 
     @torch.no_grad()

@@ -449,7 +449,7 @@ def test_construction_allocates_only_the_router_state() -> None:
         (dict(hidden_size=4096), LAYER_IDX, "unsupported hidden_size"),
         (dict(norm_topk_prob=False), LAYER_IDX, "unsupported norm_topk_prob"),
         (dict(mlp_layer_types=["dense"] * 4), LAYER_IDX, "sparse"),
-        ({}, 0, "only block 3"),
+        ({}, 0, "only the routers of sparse blocks"),
     ],
 )
 def test_construction_rejects_unsupported_configs(overrides, layer_idx, match) -> None:

@@ -759,7 +759,7 @@ _BAD_CONFIGS = [
     ("hidden_act", dict(hidden_act="gelu"), LAYER_IDX, "unsupported hidden_act"),
     ("num_experts", dict(num_experts=128), LAYER_IDX, "unsupported num_experts"),
     ("dense_block_3", dict(mlp_layer_types=["dense"] * 4), LAYER_IDX, "sparse"),
-    ("block_2", {}, 2, "only block 3"),
+    ("block_2", {}, 2, "only the routers of sparse blocks"),
 ]
 
 
