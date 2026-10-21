@@ -41,8 +41,9 @@ void launchFusedDiTQKNormRopeFullDimFp8(void const* qkv, void* q8, void* k8, voi
     int head_dim, float eps, void const* q_weight, void const* k_weight, float const* cos_emb, float const* sin_emb,
     bool interleave, bool per_head_cos, int cos_seq_per_batch, float const* quant_mul, cudaStream_t stream);
 
-// Whether launchFusedDiTQKNormRopeFullDimFp8 supports this layout on an SM `sm` GPU.
-bool fusedDiTQKNormRopeFp8Supported(int num_heads, int head_dim, int sm);
+// Whether launchFusedDiTQKNormRopeFullDimFp8 supports this layout on `device`: SM90+, and the
+// kernel's shared memory fits the device's per-block opt-in limit.
+bool fusedDiTQKNormRopeFp8Supported(int num_heads, int head_dim, bool per_head_cos, int device);
 
 // Number of fp32 partial maxima launchDiTVAmax needs in its workspace on `device`.
 int getDiTVAmaxWorkspaceSize(int device);

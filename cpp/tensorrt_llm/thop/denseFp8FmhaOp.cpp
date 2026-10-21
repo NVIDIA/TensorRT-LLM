@@ -23,6 +23,7 @@
 #include "tensorrt_llm/thop/thUtils.h"
 
 #include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
 #include <torch/extension.h>
 
 #include <climits>
@@ -122,6 +123,8 @@ torch::Tensor fmha_dense_fp8(torch::Tensor const& q, torch::Tensor const& k, tor
     TORCH_CHECK(q.is_contiguous() && k.is_contiguous() && v.is_contiguous(), "fmha_dense_fp8: q, k, v not contiguous");
     TORCH_CHECK(cu_seqlens.scalar_type() == c10::ScalarType::Int && cu_seqlens.dim() == 1 && cu_seqlens.numel() >= 2,
         "fmha_dense_fp8: cu_seqlens must be int32 [B + 1]");
+    TORCH_CHECK(max_seqlen > 0 && max_seqlen <= q.size(0),
+        "fmha_dense_fp8: max_seqlen must be in [1, num_tokens]; got ", max_seqlen);
     // The FP16-softmax kernels take the softmax scale folded into Q/K, so they always run with 1.0.
     auto const softmaxScale = fp16_softmax ? torch::ones({1}, q.options().dtype(torch::kFloat32)) : torch::Tensor();
     if (!fp16_softmax)
@@ -138,6 +141,7 @@ torch::Tensor fmha_dense_fp8(torch::Tensor const& q, torch::Tensor const& k, tor
         TORCH_CHECK(t->device() == q.device(), "fmha_dense_fp8: all tensors must be on the device of q");
     }
 
+    c10::cuda::CUDAGuard const deviceGuard(q.device());
     int const device = q.get_device();
     int64_t const batch = cu_seqlens.numel() - 1;
     auto const seqLens = (cu_seqlens.slice(0, 1) - cu_seqlens.slice(0, 0, batch)).contiguous();

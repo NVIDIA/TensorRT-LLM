@@ -20,6 +20,7 @@
 #include "tensorrt_llm/thop/thUtils.h"
 
 #include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
 #include <torch/extension.h>
 
 #include <cstdint>
@@ -38,6 +39,13 @@ namespace
 void checkAligned(torch::Tensor const& t, char const* name)
 {
     TORCH_CHECK(reinterpret_cast<uintptr_t>(t.data_ptr()) % 16 == 0, name, " must be 16-byte aligned");
+}
+
+// Every other input must live on the device of qkv.
+void checkSameDevice(torch::Tensor const& t, torch::Tensor const& qkv, char const* name)
+{
+    TORCH_CHECK(
+        t.device() == qkv.device(), name, " must be on the device of qkv (", qkv.device(), "); got ", t.device());
 }
 
 void checkQkv(torch::Tensor const& qkv, int64_t num_heads, int64_t head_dim)
@@ -68,6 +76,7 @@ torch::Tensor vAmax(torch::Tensor const& qkv, int64_t num_heads, int64_t head_di
 torch::Tensor dit_v_amax(torch::Tensor const& qkv, int64_t num_heads, int64_t head_dim)
 {
     checkQkv(qkv, num_heads, head_dim);
+    c10::cuda::CUDAGuard const deviceGuard(qkv.device());
     return vAmax(qkv, num_heads, head_dim, at::cuda::getCurrentCUDAStream(qkv.get_device()));
 }
 
@@ -82,19 +91,29 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> fused_dit
     double qk_mul, c10::optional<torch::Tensor> const& v_amax)
 {
     checkQkv(qkv, num_heads, head_dim);
+    c10::cuda::CUDAGuard const deviceGuard(qkv.device());
     int64_t const n = num_heads * head_dim;
     CHECK_INPUT(q_weight, torch::kBFloat16);
     CHECK_INPUT(k_weight, torch::kBFloat16);
+    checkSameDevice(q_weight, qkv, "q_weight");
+    checkSameDevice(k_weight, qkv, "k_weight");
     TORCH_CHECK(q_weight.dim() == 1 && q_weight.size(0) == n && k_weight.sizes() == q_weight.sizes(),
         "q_weight and k_weight must be [num_heads * head_dim] (full-dim norm)");
-    TORCH_CHECK(tensorrt_llm::kernels::fusedDiTQKNormRopeFp8Supported(
-                    static_cast<int>(num_heads), static_cast<int>(head_dim), tensorrt_llm::common::getSMVersion()),
-        "fused_dit_qk_norm_rope_fp8 requires SM90+, head_dim 128 and at most 64 heads");
 
     // cos/sin: [..., head_dim] shared across heads, or [..., num_heads, head_dim] per head.
     TORCH_CHECK(cos_emb.sizes() == sin_emb.sizes(), "sin_emb shape must match cos_emb");
+    for (auto const& [t, name] : {std::pair{&cos_emb, "cos_emb"}, std::pair{&sin_emb, "sin_emb"}})
+    {
+        checkSameDevice(*t, qkv, name);
+        TORCH_CHECK(at::isFloatingType(t->scalar_type()), name, " must be floating point; got ", t->scalar_type());
+    }
     bool const per_head_cos = cos_emb.dim() >= 3 && cos_emb.size(-2) == num_heads && cos_emb.size(-1) == head_dim;
     TORCH_CHECK(per_head_cos || cos_emb.size(-1) == head_dim, "cos_emb last dim must be head_dim");
+    TORCH_CHECK(tensorrt_llm::kernels::fusedDiTQKNormRopeFp8Supported(
+                    static_cast<int>(num_heads), static_cast<int>(head_dim), per_head_cos, qkv.get_device()),
+        "fused_dit_qk_norm_rope_fp8 requires SM90+, head_dim 128, at most 64 heads and a shared-memory footprint "
+        "within the device limit; got ",
+        num_heads, " heads, head_dim ", head_dim);
     auto const cos_2d = cos_emb.reshape({-1, per_head_cos ? n : head_dim}).to(torch::kFloat32).contiguous();
     auto const sin_2d = sin_emb.reshape({-1, per_head_cos ? n : head_dim}).to(torch::kFloat32).contiguous();
     int64_t const num_tokens = qkv.size(0);
@@ -114,6 +133,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> fused_dit
     if (v_amax.has_value())
     {
         CHECK_INPUT(v_amax.value(), torch::kFloat32);
+        checkSameDevice(v_amax.value(), qkv, "v_amax");
         TORCH_CHECK(v_amax.value().numel() == 1, "v_amax must have one element");
         amax = v_amax.value();
     }

@@ -66,7 +66,7 @@ def _v_amax(qkv, num_heads):
 
 
 @pytest.mark.parametrize("interleave", [False, True])
-@pytest.mark.parametrize("num_heads", [10, 24, 40])
+@pytest.mark.parametrize("num_heads", [4, 10, 24, 40, 64])
 @pytest.mark.parametrize("batch", [1, 2])
 def test_matches_bf16_op_shared_cos(interleave, num_heads, batch):
     """Shared [S, D] cos table, broadcast over the batch (pipelined kernel)."""
@@ -108,6 +108,20 @@ def test_given_v_amax_sets_v_scale():
     _assert_fp8_close(v8, _quant(v_ref, 1.0 / scale_v))
 
 
+def test_small_v_amax_saturates():
+    """A V amax below the local |V| maximum clamps V to the finite e4m3 range."""
+    tokens, num_heads = 1560, 40
+    qkv, q_w, k_w, cos, sin = _inputs(tokens, num_heads, tokens, seed=5)
+    small_amax = (_v_amax(qkv, num_heads) / 4).reshape(1)
+    _, _, v8, v_descale = _run(qkv, num_heads, q_w, k_w, cos, sin, False, small_amax)
+
+    v_ref = qkv.view(tokens, 3, num_heads, HEAD_DIM)[:, 2]
+    expected = _quant(v_ref, 1.0 / v_descale)
+    assert (expected.float().abs() == E4M3_MAX).any()
+    assert v8.float().abs().max().item() == E4M3_MAX
+    _assert_fp8_close(v8, expected)
+
+
 @pytest.mark.parametrize("tokens", [1, 33, 1560 * 2])
 def test_dit_v_amax(tokens):
     num_heads = 40
@@ -126,6 +140,8 @@ def test_rejects_unsupported_layouts():
     misaligned = misaligned[1:].view_as(qkv).copy_(qkv)
     with pytest.raises(RuntimeError, match="aligned"):
         _run(misaligned, num_heads, q_w, k_w, cos, sin, False)
+    with pytest.raises(RuntimeError, match="device of qkv"):
+        _run(qkv, num_heads, q_w, k_w, cos.cpu(), sin.cpu(), False)
 
 
 def test_fake_under_compile():
