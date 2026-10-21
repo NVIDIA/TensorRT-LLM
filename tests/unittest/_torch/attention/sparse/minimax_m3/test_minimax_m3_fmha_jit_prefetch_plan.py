@@ -348,7 +348,10 @@ def test_mxfp8_tune_modules_predicted_at_load_as_warmup_decides(
     with patch.object(jp, "start_flashinfer_build", return_value=True) as start:
         jp.start_model_builds(SimpleNamespace(modules=model.modules), llm_args=None)
         start.assert_not_called()  # without the engine's arguments, warmup starts them
-        with patch.object(jp, "tunes_flashinfer_mxfp8_at_load", return_value=tunes):
+        with (
+            patch.object(jp, "tunes_flashinfer_mxfp8_at_load", return_value=tunes),
+            patch.object(jp, "warmup_builds_sampling_module", return_value=False),
+        ):
             assert jp.start_model_builds(model, llm_args=llm_args) is tunes
     if tunes:
         start.assert_called_once_with(("trtllm_utils", "mxfp8_gemm_cutlass"))
@@ -430,3 +433,33 @@ def _provider_model(sites):
 
     layers = [Layer(*site) for site in sites]
     return SimpleNamespace(modules=lambda: iter(layers))
+
+
+@pytest.mark.parametrize(
+    "args_kw, sampling",
+    [
+        ({}, True),  # a decoder engine: warmup builds the sampling module
+        (dict(encode_only=True), False),  # the encoder runner never samples
+    ],
+    ids=["decoder", "encoder"],
+)
+def test_sampling_module_starts_after_the_layer_modules_at_load(monkeypatch, args_kw, sampling):
+    """``start_model_builds`` queues FlashInfer's sampling module, which every
+    decoder runner's warmup builds, in the same helper as the model's own
+    modules and after them, as the first forward needs those first; an engine
+    whose runner never samples does not build it."""
+    from unittest.mock import patch
+
+    from tensorrt_llm._torch import jit_prefetch as jp
+
+    model = _mxfp8_model(opt_in=False)
+    model.modules = _fi_model(monkeypatch, 60).modules
+    llm_args = _mxfp8_llm_args(**args_kw)
+    assert jp.warmup_builds_sampling_module(model, llm_args) is sampling
+    monkeypatch.setenv("TLLM_JIT_PREFETCH", "1")
+    with (
+        patch.object(jp, "start_flashinfer_build", return_value=True) as start,
+        patch.object(jp, "tunes_flashinfer_mxfp8_at_load", return_value=False),
+    ):
+        assert jp.start_model_builds(model, llm_args=llm_args)
+    start.assert_called_once_with(("fmha_gen", "sampling") if sampling else ("fmha_gen",))

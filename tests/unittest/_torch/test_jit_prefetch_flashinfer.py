@@ -72,6 +72,36 @@ _CASE = textwrap.dedent(
 )
 
 
+# The sampling module started by the model loader, while the weights load:
+# warmup finds that helper pending (it must not start another nor build the
+# module in place), joins it, and loads the helper's build.
+_LOAD_TIME_CASE = textwrap.dedent(
+    """
+    import json, os, time
+    import torch
+    from tensorrt_llm._torch import jit_prefetch as jp
+    from flashinfer.jit.sampling import gen_sampling_module
+
+    started = jp.start_flashinfer_build(("sampling",))
+    pending = [jp.flashinfer_build_pending("sampling"), jp.flashinfer_build_pending("fmha_gen")]
+    again = jp.start_flashinfer_build()
+    waited = jp.wait_flashinfer_build()
+    so = gen_sampling_module().jit_library_path
+    mtime = os.stat(so).st_mtime_ns if so.exists() else None
+    import flashinfer.sampling as s
+    t = time.time()
+    s.get_sampling_module()
+    load_s = time.time() - t
+    tok = s.sampling_from_probs(torch.softmax(torch.randn(4, 1000, device="cuda"), -1))
+    print(json.dumps({"started": started, "pending": pending, "again": again,
+                      "waited": waited, "built_before_load": mtime is not None,
+                      "rebuilt": mtime is not None and os.stat(so).st_mtime_ns != mtime,
+                      "load_s": load_s, "after": jp.flashinfer_build_pending("sampling"),
+                      "sampled": list(tok.shape)}))
+    """
+)
+
+
 _SESSION = textwrap.dedent(
     """
     import os, time
@@ -279,6 +309,17 @@ def test_helper_build_is_what_warmup_loads(tmp_path):
     assert r["waited"] is not None
     # The helper built the library, and loading it in this process did not
     # rebuild it (a compile takes about a minute; a load well under 10 s).
+    assert r["built_before_load"] and not r["rebuilt"], r
+    assert r["load_s"] < 10, r
+    assert r["sampled"] == [4]
+
+
+def test_load_time_sampling_build_is_joined_not_restarted(tmp_path):
+    r = _run_json(tmp_path, prefetch=True, case=_LOAD_TIME_CASE)
+    assert r["started"] is True and r["again"] is False, r
+    # The loader's helper builds the sampling module and nothing else.
+    assert r["pending"] == [True, False], r
+    assert r["waited"] is not None and r["after"] is False, r
     assert r["built_before_load"] and not r["rebuilt"], r
     assert r["load_s"] < 10, r
     assert r["sampled"] == [4]

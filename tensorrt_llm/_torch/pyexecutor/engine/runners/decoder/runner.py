@@ -772,11 +772,13 @@ class DecoderRunner(ScheduledModelRunner):
         self._eager_workspace_reclaimer = None
         from tensorrt_llm._torch.jit_prefetch import (
             cancel_flashinfer_build,
+            flashinfer_build_pending,
             start_flashinfer_build,
             start_mxfp8_tune_builds,
         )
 
         # With JIT prefetch on, a CPU-only helper builds the sampling module
+        # (started by the model loader while the weights loaded, or here)
         # while the eager warmup forwards below run on the GPU; it is joined
         # (and the module loaded) before CUDA graph capture, the first phase
         # that can launch the sampling kernels, together with any helper the
@@ -784,7 +786,9 @@ class DecoderRunner(ScheduledModelRunner):
         # builds the FlashInfer modules the autotuner warmup's FlashInfer
         # MXFP8 pass needs, if it runs and the model loader has not started
         # them already; the pass waits on their file locks.
-        sampling_in_helper = kv_cache_manager is not None and start_flashinfer_build()
+        sampling_in_helper = kv_cache_manager is not None and (
+            flashinfer_build_pending("sampling") or start_flashinfer_build()
+        )
         if kv_cache_manager is not None:
             start_mxfp8_tune_builds(self._tunes_flashinfer_mxfp8())
         try:
@@ -805,11 +809,11 @@ class DecoderRunner(ScheduledModelRunner):
                 self.before_warmup_forwards_callable()
             self._warmup_scheduled_forwards(resource_manager, kv_cache_manager, sampling_in_helper)
         finally:
-            if kv_cache_manager is not None:
-                # No-op once joined. Warmup raised before the join: stop the
-                # helpers rather than wait for them; their modules are built
-                # in place on first use.
-                cancel_flashinfer_build()
+            # No-op once joined. Warmup raised before the join, or the engine
+            # has no KV cache to warm up (a helper the model loader started
+            # is then not joined): stop the helpers rather than wait for
+            # them; their modules are built in place on first use.
+            cancel_flashinfer_build()
 
     def _join_sampling_module_build(self) -> None:
         """Wait for the helpers building FlashInfer modules (the sampling

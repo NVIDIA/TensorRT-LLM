@@ -2105,3 +2105,48 @@ def test_load_time_deep_gemm_limits_lead_with_the_warmup_token_counts(
     }
     engine.max_num_tokens = None
     assert engine._load_time_deep_gemm_limits() is None
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("pending", [True, False])
+def test_warmup_joins_the_sampling_build_the_model_loader_started(
+    monkeypatch: pytest.MonkeyPatch, pending: bool
+) -> None:
+    """A sampling-module helper the model loader started while the weights
+    loaded is joined before CUDA graph capture: warmup neither builds the
+    module in place nor starts a second helper. Without one, warmup starts
+    its own helper, as before."""
+    from tensorrt_llm._torch import jit_prefetch as jp
+
+    runner = object.__new__(DecoderRunner)
+    runner._warmup_timer = _WarmupTimer(rank=0)
+    runner._metrics = {}
+    runner.kv_cache_manager_key = ResourceManagerType.KV_CACHE_MANAGER
+    runner.before_warmup_forwards_callable = None
+    resource_manager = Mock()
+    events = []
+    monkeypatch.setattr(jp, "flashinfer_build_pending", lambda name: pending)
+    monkeypatch.setattr(jp, "start_flashinfer_build", lambda *a: events.append("start") or True)
+    monkeypatch.setattr(jp, "start_mxfp8_tune_builds", lambda *a: False)
+    monkeypatch.setattr(jp, "cancel_flashinfer_build", lambda: events.append("cancel"))
+    monkeypatch.setattr(
+        decoder_runner_module, "warmup_sampling_module", lambda: events.append("in_place")
+    )
+    for name in (
+        "_tunes_flashinfer_mxfp8",
+        "_prewarm_engram_kernels",
+        "_prewarm_csa2_sparse_indexer",
+    ):
+        monkeypatch.setattr(runner, name, lambda *a, **k: False, raising=False)
+    monkeypatch.setattr(
+        runner,
+        "_warmup_scheduled_forwards",
+        lambda rm, kv, sampling_in_helper: events.append(f"forwards(helper={sampling_in_helper})"),
+        raising=False,
+    )
+    runner._warmup_scheduled(resource_manager, Mock())
+    assert events == (
+        ["forwards(helper=True)", "cancel"]
+        if pending
+        else ["start", "forwards(helper=True)", "cancel"]
+    )

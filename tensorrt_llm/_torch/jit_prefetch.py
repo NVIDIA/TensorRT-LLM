@@ -391,6 +391,21 @@ def flashinfer_builds_pending() -> bool:
     return bool(_fi_builds)
 
 
+def flashinfer_build_pending(name: str) -> bool:
+    """Whether a helper still to be joined builds FlashInfer module ``name``."""
+    return any(name in modules for modules, _ in _fi_builds)
+
+
+def warmup_builds_sampling_module(model, llm_args) -> bool:
+    """Whether the engine ``llm_args`` describes builds FlashInfer's sampling
+    module in warmup, known once ``model`` is constructed: every decoder
+    runner's warmup does (``warmup_sampling_module``), other runners'
+    (encoder, pooling) do not."""
+    from .pyexecutor.engine.runners import DecoderRunner, resolve_runner_type
+
+    return issubclass(resolve_runner_type(model, llm_args), DecoderRunner)
+
+
 def start_model_builds(model, rank: int = 0, llm_args=None) -> bool:
     """Start building, in CPU-only helpers, the JIT kernels ``model``'s layers
     build in warmup's first forwards, which follow from the model's geometry
@@ -399,7 +414,9 @@ def start_model_builds(model, rank: int = 0, llm_args=None) -> bool:
 
     * FlashInfer JIT modules, one helper for all of them: each provider
       module that knows of such modules lists them (GLM-5.3-Flash's and
-      MiniMax-M3's TRTLLM-GEN attention launcher ``fmha_gen``);
+      MiniMax-M3's TRTLLM-GEN attention launcher ``fmha_gen``), then the
+      sampling module, if the engine ``llm_args`` describes builds it in
+      warmup (``warmup_builds_sampling_module``; warmup starts it otherwise);
     * the FlashInfer modules of the autotuner warmup's FlashInfer MXFP8 pass,
       in a helper of their own, if the engine ``llm_args`` describes will run
       that pass (``tunes_flashinfer_mxfp8_at_load``: DeepSeek-V4.1's Engram
@@ -432,6 +449,16 @@ def start_model_builds(model, rank: int = 0, llm_args=None) -> bool:
             logger.warning(
                 f"[JIT prefetch] FlashInfer builds of {provider_module} not planned: "
                 f"{type(e).__name__}: {e}"
+            )
+    if llm_args is not None:
+        # After the layers' modules, which the first forward needs: warmup
+        # loads the sampling module only before CUDA graph capture.
+        try:
+            if warmup_builds_sampling_module(model, llm_args):
+                modules.append("sampling")
+        except Exception as e:  # noqa: BLE001 - warmup then starts it
+            logger.warning(
+                f"[JIT prefetch] FlashInfer sampling build not planned: {type(e).__name__}: {e}"
             )
     if modules:
         started = start_flashinfer_build(tuple(dict.fromkeys(modules)))
