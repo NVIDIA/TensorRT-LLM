@@ -42,9 +42,9 @@ def test_dflash_is_refused_on_flashinfer(backend: str, uses_managed_pool: bool) 
     assert _flashinfer_one_engine_spec_supported("TRTLLM", config)
 
 
-def test_default_dflash_is_refused_without_a_separate_manager() -> None:
+def test_default_dflash_is_refused_on_flashinfer() -> None:
     config = DFlashDecodingConfig(max_draft_len=7)
-    assert not should_use_separate_draft_kv_cache(config)
+    assert config.attention_backend == "AUTO"
     assert not _flashinfer_one_engine_spec_supported("FLASHINFER", config)
 
 
