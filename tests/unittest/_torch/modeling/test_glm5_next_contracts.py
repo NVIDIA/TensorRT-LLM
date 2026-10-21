@@ -338,22 +338,23 @@ def test_mtp_rejects_unsupported_attention_dp_lm_head_sharding():
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize(
-    ("model_type", "separate"),
-    [("glm5_next", False), ("glm5_next_text", False), ("deepseek_v3", True)],
+    ("model_config", "separate"),
+    [
+        (_config(), False),
+        (_config().text_config, False),
+        (PretrainedConfig(model_type="deepseek_v3", num_nextn_predict_layers=1), True),
+    ],
+    ids=["glm5_next", "glm5_next_text", "deepseek_v3"],
 )
-def test_mtp_draft_layers_share_the_target_kv_cache(model_type, separate):
-    from tensorrt_llm._torch.pyexecutor.model_loader import (
-        disable_glm5_next_separate_draft_kv_cache,
-    )
+def test_mtp_draft_layers_share_the_target_kv_cache(model_config, separate):
+    from tensorrt_llm._torch.speculative import update_spec_config_from_model_config
     from tensorrt_llm._torch.speculative.interface import should_use_separate_draft_kv_cache
     from tensorrt_llm.llmapi import MTPDecodingConfig
 
     spec_config = MTPDecodingConfig(max_draft_len=3)
+    assert should_use_separate_draft_kv_cache(spec_config)
+    update_spec_config_from_model_config(spec_config, model_config)
     assert spec_config.spec_dec_mode.use_one_engine()
-    model_config = SimpleNamespace(
-        spec_config=spec_config, pretrained_config=SimpleNamespace(model_type=model_type)
-    )
-    disable_glm5_next_separate_draft_kv_cache(model_config)
     assert should_use_separate_draft_kv_cache(spec_config) is separate
 
 
