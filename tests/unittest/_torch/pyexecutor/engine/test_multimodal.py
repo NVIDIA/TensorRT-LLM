@@ -917,3 +917,29 @@ class MultimodalSetupTestCase(unittest.TestCase):
 
                 self.assertEqual(encoder.setup_args, encoder_max_num_tokens)
                 self.assertEqual(encoder.max_seq_len, expected_max_seq_len)
+
+
+@pytest.mark.parametrize("collective", [False, True])
+def test_empty_rank_participates_in_collective_encoder_step(collective):
+    class _Model(MultimodalModelMixin):
+        encoder_collective_required = collective
+        embedding_dtype = torch.float32
+        model_config = SimpleNamespace(mapping=None)
+
+        def _any_encoder_dp_rank_failed(self, failed):
+            assert not failed
+            return False
+
+        forward_multimodal_encoder_items = Mock(return_value=[])
+
+    model = _Model()
+    scheduler = bare_mm_item_scheduler(model)
+    scheduler.bytes_per_embedding = 4
+    with patch("tensorrt_llm._torch.pyexecutor.engine.multimodal.Distributed.get") as get_dist:
+        get_dist.return_value.tp_allreduce.return_value = 1  # A peer has work.
+        scheduler.forward_items([], {})
+        assert model.forward_multimodal_encoder_items.call_count == int(collective)
+        model.forward_multimodal_encoder_items.reset_mock()
+        get_dist.return_value.tp_allreduce.return_value = 0
+        scheduler.forward_items([], {})
+        model.forward_multimodal_encoder_items.assert_not_called()

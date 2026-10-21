@@ -3656,7 +3656,8 @@ class PyExecutor:
                         fitting_disagg_gen_init_requests)
 
                 if (self._mm_encoder_item_scheduling_enabled
-                        and scheduled_batch.scheduled_mm_encoder_items):
+                        and (scheduled_batch.scheduled_mm_encoder_items
+                             or self.enable_attention_dp)):
                     self._forward_multimodal_encoder_step(scheduled_batch)
 
                 if self._is_kv_manager_v2:
@@ -5635,7 +5636,8 @@ class PyExecutor:
                     continue
 
                 if (self._mm_encoder_item_scheduling_enabled
-                        and scheduled_batch.scheduled_mm_encoder_items):
+                        and (scheduled_batch.scheduled_mm_encoder_items
+                             or self.enable_attention_dp)):
                     self._forward_multimodal_encoder_step(scheduled_batch)
 
                 if self._is_kv_manager_v2:
@@ -6639,7 +6641,8 @@ class PyExecutor:
                     continue
 
                 if (self._mm_encoder_item_scheduling_enabled
-                        and scheduled_batch.scheduled_mm_encoder_items):
+                        and (scheduled_batch.scheduled_mm_encoder_items
+                             or self.enable_attention_dp)):
                     self._forward_multimodal_encoder_step(scheduled_batch)
 
                 if self._is_kv_manager_v2:
