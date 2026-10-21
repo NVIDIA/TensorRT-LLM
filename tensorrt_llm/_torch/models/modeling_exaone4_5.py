@@ -194,6 +194,7 @@ class Exaone4_5_VisionModel(Qwen2VisionModelBase):
 )
 class Exaone4_5_ForConditionalGeneration(Qwen2VLModelBase):
     supported_encoder_attention_backends = Qwen2VLModelBase.supported_encoder_attention_backends
+    supports_encoder_tensor_parallel = True
 
     def __init__(
         self,

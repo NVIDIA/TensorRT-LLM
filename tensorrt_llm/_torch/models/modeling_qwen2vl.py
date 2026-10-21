@@ -2776,6 +2776,7 @@ class Qwen2_5VLInputProcessorBase(Qwen2VLInputProcessorBase):
 class Qwen2_5_VLModel(Qwen2VLModelBase):
 
     supported_encoder_attention_backends = Qwen2VLModelBase.supported_encoder_attention_backends
+    supports_encoder_tensor_parallel = True
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig], *args,
                  **kwargs):

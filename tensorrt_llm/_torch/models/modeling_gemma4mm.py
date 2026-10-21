@@ -992,6 +992,7 @@ class Gemma4MultimodalModelBase(MultimodalModelMixin, PreTrainedModel):
     }
 
     supports_encoder_data_parallel = True
+    supports_encoder_tensor_parallel = True
     supports_encoder_cache = True
     supports_vision_gpu_normalize: ClassVar[bool] = True
     lora_owner = DecoderLoraOwner(module_path="language_model")

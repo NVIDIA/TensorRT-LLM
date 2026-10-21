@@ -1623,6 +1623,7 @@ class Qwen3VLModelBase(MultimodalModelMixin, PreTrainedModel):
     }
 
     supports_encoder_data_parallel = True
+    supports_encoder_tensor_parallel = True
     supports_mm_encoder_item_scheduling = True
     supports_vision_gpu_normalize = True
 
