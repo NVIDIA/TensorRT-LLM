@@ -81,6 +81,38 @@ def _cuda_tensors(
             _cuda_tensors(item, tensors, visited)
 
 
+# Argument types a scoped module call may receive window tensors through.
+_MODULE_CALL_TENSOR_ARGUMENT_TYPES = (
+    torch.Tensor,
+    Fp4QuantizedTensor,
+    MxFp8QuantizedTensor,
+    list,
+    tuple,
+    dict,
+)
+
+
+def _module_call_cuda_tensors(args: tuple, kwargs: dict[str, Any]) -> list[torch.Tensor]:
+    """Collect CUDA tensors passed directly to a scoped module call.
+
+    Activations flow between scoped modules as direct arguments: tensors,
+    quantized-tensor wrappers, and plain containers of them. Per-forward
+    metadata objects (attention, speculative-decoding, Mamba metadata, ...) are
+    shared by every scoped module in the forward pass, so one module must not
+    adopt and release leases they hold; their enclosing scope owns them.
+
+    Skipping those objects also bounds the per-call cost by the number of
+    arguments instead of the batch size. The eager hooks run once per scoped
+    module, i.e. once per decoder layer per iteration, so walking the
+    per-request lists inside attention metadata dominated eager iterations.
+    """
+    tensors: list[torch.Tensor] = []
+    for value in (*args, *kwargs.values()):
+        if isinstance(value, _MODULE_CALL_TENSOR_ARGUMENT_TYPES):
+            _cuda_tensors(value, tensors)
+    return tensors
+
+
 class _NCCLWindowTensorScope:
     """Deterministically release temporary NCCL-window tensor leases.
 
@@ -93,9 +125,11 @@ class _NCCLWindowTensorScope:
     scope's entry depth, quarantining their unescaped leases.
     """
 
-    def __init__(self, inputs: Any):
-        self._inputs: list[torch.Tensor] = []
-        _cuda_tensors(inputs, self._inputs)
+    def __init__(self, inputs: Any = None, *, input_tensors: list[torch.Tensor] | None = None):
+        if input_tensors is None:
+            input_tensors = []
+            _cuda_tensors(inputs, input_tensors)
+        self._inputs: list[torch.Tensor] = input_tensors
         self._outputs: list[torch.Tensor] = []
         self._entry_depth = 0
 
@@ -148,7 +182,7 @@ def install_module_nccl_window_tensor_scopes(
         )
 
         def begin_scope(_module, args, kwargs, *, active_scopes=active_scopes):
-            scope = nccl_window_tensor_scope((args, kwargs))
+            scope = _NCCLWindowTensorScope(input_tensors=_module_call_cuda_tensors(args, kwargs))
             scope.__enter__()
             active_scopes.set((*active_scopes.get(), scope))
 

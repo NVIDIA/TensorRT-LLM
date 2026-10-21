@@ -572,6 +572,105 @@ def test_eager_decoder_layer_hook_propagates_forward_failure(tensor_scope_events
     assert tensor_scope_events[-1][-1] is True
 
 
+def test_eager_decoder_layer_hook_adopts_only_direct_arguments(monkeypatch):
+    from tensorrt_llm._torch.modules.decoder_layer import DecoderLayer
+    from tensorrt_llm._torch.utils import Fp4QuantizedTensor
+
+    @dataclass
+    class Metadata:
+        seq_lens_cuda: torch.Tensor
+        request_ids: list
+
+    class TestLayer(DecoderLayer):
+        def forward(self, hidden_states, residual, attn_metadata, quantized, **kwargs):
+            return hidden_states, residual
+
+    with FakeTensorMode():
+        hidden_states = torch.empty(1, device="cuda")
+        residual = torch.empty(1, device="cuda")
+        fp4_tensor = torch.empty(1, device="cuda")
+        scaling_factor = torch.empty(1, device="cuda")
+        seq_lens_cuda = torch.empty(1, device="cuda")
+
+    # Per-request lists make the metadata walk O(batch size) per layer.
+    metadata = Metadata(seq_lens_cuda, list(range(512)))
+    events = []
+
+    def begin(tensors):
+        events.append(("begin", tensors))
+        return 0
+
+    def end(inputs, outputs, failed, entry_depth):
+        events.append(("end", inputs, outputs, failed))
+
+    monkeypatch.setattr(torch.ops.trtllm.begin_nccl_window_tensor_scope, "tracked", begin)
+    monkeypatch.setattr(torch.ops.trtllm.end_nccl_window_tensor_scope, "tracked", end)
+
+    layer = TestLayer()
+    handles = nccl_window_tensor_scope.install_eager_nccl_window_tensor_scopes(layer)
+    try:
+        layer(
+            hidden_states,
+            (residual,),
+            attn_metadata=metadata,
+            quantized=Fp4QuantizedTensor(fp4_tensor, scaling_factor),
+        )
+    finally:
+        for handle in handles:
+            handle.remove()
+
+    def same_tensors(actual, expected):
+        return len(actual) == len(expected) and all(a is b for a, b in zip(actual, expected))
+
+    assert [event[0] for event in events] == ["begin", "end"]
+    # Direct tensors, containers, and quantized wrappers are adopted; metadata is not.
+    assert same_tensors(events[0][1], [hidden_states, residual, fp4_tensor, scaling_factor])
+    assert same_tensors(events[1][2], [hidden_states, residual])
+    assert events[1][3] is False
+
+
+@pytest.mark.parametrize("scopes_enabled", [True, False])
+def test_model_forward_window_scope_follows_engine_gate(monkeypatch, scopes_enabled):
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    from tensorrt_llm._torch.pyexecutor import model_engine as model_engine_module
+    from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
+
+    events = []
+
+    class RecordingScope:
+        def __enter__(self):
+            events.append("enter")
+            return self
+
+        def __exit__(self, *exc_info):
+            events.append("exit")
+
+        def escape(self, outputs):
+            events.append(("escape", outputs))
+            return outputs
+
+    monkeypatch.setattr(
+        model_engine_module, "nccl_window_tensor_scope", lambda _inputs: RecordingScope()
+    )
+    monkeypatch.setattr(model_engine_module, "get_model_extra_attrs", lambda: {})
+    monkeypatch.setattr(model_engine_module, "is_trace_enabled", lambda _name: False)
+    engine = SimpleNamespace(
+        model=SimpleNamespace(
+            model_config=SimpleNamespace(extra_attrs={}), forward=lambda **_kwargs: "logits"
+        ),
+        _torch_compile_backend=None,
+        _torch_compile_prefill_only=False,
+        _eager_workspace_reclaimer=None,
+        is_warmup=False,
+        _nccl_window_tensor_scopes_enabled=scopes_enabled,
+    )
+
+    assert PyTorchModelEngine.model_forward(engine, attn_metadata=Mock()) == "logits"
+    assert events == (["enter", ("escape", "logits"), "exit"] if scopes_enabled else [])
+
+
 def test_each_decoder_layer_scope_survives_torch_compile():
     from tensorrt_llm._torch.compilation.nccl_window import insert_nccl_window_tensor_scopes
     from tensorrt_llm._torch.modules.decoder_layer import DecoderLayer
