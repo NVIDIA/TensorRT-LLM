@@ -746,11 +746,16 @@ def test_mixed_role_coalesced_pool_preserves_slot_stride(kv_first: bool, kv_layo
         manager.shutdown()
 
 
-def test_dflash_block_tables_with_fp8_target_and_bf16_draft() -> None:
+@pytest.mark.parametrize("grouped", [True, False], ids=["shared-table", "per-layer"])
+def test_dflash_block_tables_with_fp8_target_and_bf16_draft(
+    monkeypatch: pytest.MonkeyPatch, grouped: bool
+) -> None:
     if not torch.cuda.is_available():
         pytest.skip("requires CUDA")
     from tensorrt_llm._torch.speculative.dflash import DFlashWorker
 
+    if not grouped:
+        monkeypatch.setattr(KVCacheManagerV2, "_get_attention_op_pool_groups", lambda self: None)
     torch.cuda.init()
     target = KVCacheLayerSpec(
         global_layer_id=0,
@@ -788,7 +793,9 @@ def test_dflash_block_tables_with_fp8_target_and_bf16_draft() -> None:
         layer_specs=[target, draft],
     )
     try:
-        assert manager._use_per_layer_page_tables
+        # Same-size pages share one physical pool: one shared table, or one per layer.
+        assert manager._use_per_layer_page_tables != grouped
+        assert manager.num_attention_op_pools == (1 if grouped else 2)
         request_ids = [7, 9]
         for request_id, num_blocks in zip(request_ids, (2, 3)):
             cache = manager._create_kv_cache(request_id, None, None)
@@ -804,7 +811,8 @@ def test_dflash_block_tables_with_fp8_target_and_bf16_draft() -> None:
         assert worker._init_ctx_block_tables(
             manager, pool, len(request_ids), 1, draft.num_kv_heads, draft.head_dim, TOKENS_PER_BLOCK
         )
-        assert worker._ctx_block_offset > 0
+        # Per-layer tables carry the draft K buffer's offset; a shared one maps it.
+        assert (worker._ctx_block_offset > 0) != grouped
 
         block_offsets = torch.empty(
             (manager.num_attention_op_pools, len(request_ids), 2, manager.max_blocks_per_seq),

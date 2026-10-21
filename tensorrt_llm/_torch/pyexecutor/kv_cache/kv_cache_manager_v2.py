@@ -1381,6 +1381,16 @@ def _convert_batch_block_offsets(
     )
 
 
+class _AttentionOpPoolGroup(NamedTuple):
+    """Layers sharing one attention-op page table (see _get_attention_op_pool_groups)."""
+
+    pool_id: int  # life cycle whose base page indices fill the table
+    base_address: int  # pool pointer: the first member's page in the physical pool
+    scale: int  # pages per slot of the physical pool
+    kv_offset: int  # V page - K page
+    pool_mapping_offsets: Dict[int, int]  # local layer id -> kv_cache_pool_mapping offset
+
+
 def _rewind_context_cursor(req: LlmRequest, reuse: int) -> None:
     """Pull a context cursor back to a shallower prefix. ``setPrepopulatedPromptLen``
     only moves forward, so leave the forward case to it -- it re-floors chunk size too.
@@ -1453,6 +1463,8 @@ class KVCacheManagerV2(BaseResourceManager):
     _has_recurrent_state: bool = False
     # Block width of a drafter whose layers share this manager, else 0.
     _shared_draft_block_width: int = 0
+    # Attention-op tables shared by layer groups instead of one per layer, else None.
+    _attention_op_pool_groups: Optional[List["_AttentionOpPoolGroup"]] = None
 
     @property
     def _kv_alloc_extra_tokens(self) -> int:
@@ -2571,7 +2583,13 @@ class KVCacheManagerV2(BaseResourceManager):
             self._get_layer_dtype_by_local_id(layer_id) == DataType.NVFP4
             for layer_id in range(self.num_local_layers)
         )
-        if self._use_per_layer_page_tables:
+        if self._attention_op_pool_groups is not None:
+            kv_cache_pool_mapping_list = [None] * self.num_local_layers
+            for group_idx, group in enumerate(self._attention_op_pool_groups):
+                kv_cache_pool_pointers_list.append([group.base_address, 0])
+                for layer_id, offset in group.pool_mapping_offsets.items():
+                    kv_cache_pool_mapping_list[layer_id] = [group_idx, offset]
+        elif self._use_per_layer_page_tables:
             for layer_id in typed_range(LayerId(self.num_local_layers)):
                 pool_id = self.impl.get_layer_group_id(layer_id)
                 role_a, _ = self._get_layer_page_table_roles(layer_id, pool_id)
@@ -2727,7 +2745,14 @@ class KVCacheManagerV2(BaseResourceManager):
         if self.layer_specs is not None:
             storage_layouts = {(layer.dtype, layer.kv_factor) for layer in self.layer_specs}
             self._use_per_layer_page_tables |= len(storage_layouts) > 1
-        if self._use_per_layer_page_tables:
+        # Layers whose per-layer tables differ only by a page offset share one table.
+        self._attention_op_pool_groups = (
+            self._get_attention_op_pool_groups() if self._use_per_layer_page_tables else None
+        )
+        if self._attention_op_pool_groups is not None:
+            self._use_per_layer_page_tables = False
+            self.num_attention_op_pools = len(self._attention_op_pool_groups)
+        elif self._use_per_layer_page_tables:
             self.num_attention_op_pools = self.num_local_layers
         else:
             self.num_attention_op_pools = self.num_pools
@@ -2767,6 +2792,73 @@ class KVCacheManagerV2(BaseResourceManager):
         )
         if self._use_per_layer_page_tables:
             self._prepare_swa_scratch_copy_tensors(index_mapper_capacity)
+        elif self._attention_op_pool_groups is not None:
+            groups = self._attention_op_pool_groups
+            # Lane l of table t: scale * base index of the group's life cycle + K/V offset.
+            self._prepare_batch_block_offsets_copy(
+                index_mapper_capacity * self.max_copy_beam_width,
+                torch.tensor([[g.pool_id, g.pool_id] for g in groups], dtype=torch.int32),
+                torch.tensor([[g.scale, g.scale] for g in groups], dtype=torch.int32),
+                torch.tensor([[0, g.kv_offset] for g in groups], dtype=torch.int32),
+            )
+
+    def _get_attention_op_pool_groups(self) -> Optional[List[_AttentionOpPoolGroup]]:
+        """Group layers that can share one attention-op page table, else None.
+
+        A per-layer table holds ``base * scale + layer_offset`` pages from its
+        physical pool's origin. Layers of one life cycle and physical pool with
+        the same page stride, scale, K/V distance and kv factor differ only by
+        ``layer_offset``, which, as on the SHARED path, can move to the pool
+        mapping (the attention op adds ``offset * kv_factor`` pages). Unified
+        target/draft caches then need a table per (life cycle, page size), not
+        per layer. Not for SWA scratch slots, NVFP4 scale pools, expanded page
+        indices, or subclasses with their own layouts.
+        """
+        if type(self) is not KVCacheManagerV2 or self.enable_swa_scratch_reuse:
+            return None
+        members: Dict[tuple, List[Tuple[int, int]]] = {}
+        for layer_id in typed_range(LayerId(self.num_local_layers)):
+            if self._get_layer_dtype_by_local_id(layer_id) == DataType.NVFP4:
+                return None
+            pool_id = self.impl.get_layer_group_id(layer_id)
+            role_a, role_b = self._get_layer_page_table_roles(layer_id, pool_id)
+            roles = (role_a,) if role_b is None else (role_a, role_b)
+            key = self.impl.get_page_index_converter(layer_id, role_a)
+            value = key if role_b is None else self.impl.get_page_index_converter(layer_id, role_b)
+            strides = {self.impl.get_page_stride(layer_id, r) for r in roles}
+            origins = {
+                self.impl.get_mem_pool_base_address(layer_id, r, PageIndexMode.PER_LAYER)
+                for r in roles
+            }
+            # K and V must be addressable from one pool pointer with one stride.
+            if len(strides) > 1 or len(origins) > 1 or value.scale != key.scale:
+                return None
+            if key.expansion != 1 or value.expansion != 1:
+                return None
+            kv_factor = self._get_layer_kv_factor_by_local_id(layer_id)
+            group_key = (
+                int(pool_id),
+                origins.pop(),
+                strides.pop(),
+                int(key.scale),
+                int(value.layer_offset) - int(key.layer_offset),
+                kv_factor,
+                int(key.layer_offset) % kv_factor,
+            )
+            members.setdefault(group_key, []).append((int(layer_id), int(key.layer_offset)))
+        groups = []
+        for (pool_id, origin, stride, scale, kv_offset, kv_factor, _), layers in members.items():
+            first = min(offset for _, offset in layers)
+            groups.append(
+                _AttentionOpPoolGroup(
+                    pool_id,
+                    origin + first * stride,
+                    scale,
+                    kv_offset,
+                    {layer_id: (offset - first) // kv_factor for layer_id, offset in layers},
+                )
+            )
+        return groups
 
     def _kv_pool_mapping_offset(
         self, layer_id: LayerId, layer_group_id: int, key_base_addr: int
@@ -7097,6 +7189,9 @@ class KVCacheManagerV2(BaseResourceManager):
             self._copy_batch_block_offsets_per_layer(
                 dst_tensor, request_ids, copy_idx, num_contexts, num_seqs
             )
+            return
+        if self._attention_op_pool_groups is not None:
+            self._copy_batch_block_offsets_by_op_pool(dst_tensor, request_ids, copy_idx, num_seqs)
             return
 
         copy_batch_block_offsets_to_device(
