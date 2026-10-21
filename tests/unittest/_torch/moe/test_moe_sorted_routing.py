@@ -416,17 +416,18 @@ def test_latent_down_nvfp4_output_feeds_routed_experts(monkeypatch, m):
     same routed output."""
     from tensorrt_llm._torch.kernels.blackwell import fp8_block_scale_low_m_gemm
     from tensorrt_llm._torch.models import modeling_kimi_linear
+    from tensorrt_llm._torch.modules import fp8_block_scale_weight_read_linear as weight_read
     from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream
     from tensorrt_llm._torch.utils import Fp4QuantizedTensor
 
-    linear_cls = modeling_kimi_linear._Fp8BlockScaleWeightReadLinear
+    linear_cls = weight_read.Fp8BlockScaleWeightReadLinear
     in_features = 1024
     logits, bias = _logits(m, seed=90 + m)
     moe = _nvfp4_moe("CUTEDSL", _routing(bias))
     runtime = _runtime(moe, logits)
     monkeypatch.setattr(modeling_kimi_linear, "_SHARED_GEMMS_LEAD_MIN_ROUTED_ROWS", 1 << 30)
     # The SM107 route's range; without a route the NVFP4 output runs the BF16 GEMM's tactic.
-    monkeypatch.setattr(modeling_kimi_linear, "_low_m_gemm_nvfp4_max_m", lambda n, k: 256)
+    monkeypatch.setattr(weight_read, "_low_m_gemm_nvfp4_max_m", lambda n, k: 256)
     # SM107 selects the low-M GEMM only for the measured K3 weight shapes; serve this one too.
     monkeypatch.setattr(fp8_block_scale_low_m_gemm, "max_m_for", lambda n, k: 256)
     gen = torch.Generator(device="cuda").manual_seed(m)

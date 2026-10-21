@@ -272,6 +272,7 @@ def test_compiled_graphs_never_select_fused_fc12(monkeypatch: pytest.MonkeyPatch
 @skip_not_sm107
 @torch.inference_mode()
 def test_kimi_k3_load_converts_shared_experts(monkeypatch: pytest.MonkeyPatch) -> None:
+    from tensorrt_llm._torch.models import modeling_kimi_k3_loader as kimi_loader
     from tensorrt_llm._torch.models import modeling_kimi_linear as kimi
 
     torch.manual_seed(0)
@@ -290,10 +291,10 @@ def test_kimi_k3_load_converts_shared_experts(monkeypatch: pytest.MonkeyPatch) -
     original = model.layers[0].block_sparse_moe.shared_experts
 
     # Both variables set: MXFP8 runs first, the FP8 weight read takes the rest.
-    converted, kept = kimi._convert_shared_experts_to_mxfp8(model)
+    converted, kept = kimi_loader._convert_shared_experts_to_mxfp8(model)
     assert converted == 1
     assert kept == {"local intermediate size below 3072": 1}
-    assert kimi._convert_moe_mlps_to_fp8_weight_read(model) == 2
+    assert kimi_loader._convert_moe_mlps_to_fp8_weight_read(model) == 2
     expert = model.layers[0].block_sparse_moe.shared_experts
     assert isinstance(expert, Mxfp8SharedExpertMLP)
     # The replicated expert frees its BF16 weights.

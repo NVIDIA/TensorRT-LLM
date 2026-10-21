@@ -88,7 +88,7 @@ def _parameter(tensor: torch.Tensor) -> nn.Parameter:
 
 
 class ToyFp8Linear(nn.Module):
-    """Stands in for ``_Fp8BlockScaleWeightReadLinear``: weight and scale buffers."""
+    """Stands in for ``Fp8BlockScaleWeightReadLinear``: weight and scale buffers."""
 
     def __init__(self, weight: torch.Tensor, scale: torch.Tensor) -> None:
         super().__init__()

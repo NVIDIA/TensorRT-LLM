@@ -29,8 +29,8 @@ from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import (
     _kimi_k3_mxfp8_tuning_bucket,
 )
 from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_RUBIN_AVAILABLE
-from tensorrt_llm._torch.models.modeling_kimi_linear import (
-    _Fp8BlockScaleWeightReadLinear as K3Fp8Linear,
+from tensorrt_llm._torch.modules.fp8_block_scale_weight_read_linear import (
+    Fp8BlockScaleWeightReadLinear as K3Fp8Linear,
 )
 
 # K3-representative (out, in) projections, all 128-aligned.
