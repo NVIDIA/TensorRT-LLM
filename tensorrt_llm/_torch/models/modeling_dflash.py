@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
+import math
 from dataclasses import replace
 from typing import Callable, Dict, Optional, Tuple
 
@@ -27,6 +28,7 @@ from ..speculative.dflash_attention import (
     get_dflash_trtllm_gen_ops,
 )
 from ..speculative.interface import SpeculativeDecodingMode
+from ..utils import maybe_compile
 from .modeling_utils import FUSED_MODULE_COMPONENTS, get_model_architecture, register_draft_model
 
 
@@ -373,6 +375,34 @@ def resolve_draft_logit_transform(dflash_config: Dict) -> tuple[float, Optional[
         1.0 if multiplier is None else float(multiplier),
         float(softcap) if softcap else None,
     )
+
+
+@maybe_compile(dynamic=True)
+def block_upper_triangle_fixup(
+    out: torch.Tensor,
+    lse_log2: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    scale: float,
+    later: torch.Tensor,
+) -> torch.Tensor:
+    """Fold each query's later block keys into a causal TRTLLM-Gen block result.
+
+    The paged kernel attends a draft block causally, so query i misses block keys
+    j > i; ``later[i, j]`` marks the ones to attend here, merged by log-sum-exp (the
+    kernel's LSE is base 2). ``q``/``out`` are [B, block, Hkv, G, D], ``k``/``v``
+    [B, block, Hkv, D] and ``lse_log2`` [B, block, Hkv, G]. MLADSparkForCausalLM
+    keeps its own inline copy with bf16 scores, pinned bit-exact by its tests.
+    """
+    # fp32 scores, as in the kernel's accumulator: bf16 rounding before softmax costs accuracy.
+    scores = torch.einsum("bihgd,bjhd->bihgj", q.float(), k.float()) * scale
+    scores = scores.masked_fill(~later[:, None, None, :], float("-inf"))
+    # A query with no later key has an all -inf row: NaN probabilities, weight 0.
+    probs = torch.softmax(scores, dim=-1).nan_to_num().to(v.dtype)
+    out_later = torch.einsum("bihgj,bjhd->bihgd", probs, v)
+    weight = torch.sigmoid(scores.logsumexp(-1) - lse_log2.float() * math.log(2.0))
+    return torch.lerp(out.float(), out_later.float(), weight.unsqueeze(-1)).to(out.dtype)
 
 
 class DFlashForCausalLM(nn.Module):
@@ -1416,30 +1446,6 @@ class DFlashForCausalLM(nn.Module):
             window_size = swa_window
         return causal, window_size
 
-    def validate_block_attention_windows(self) -> None:
-        """Refuse windows the TRTLLM block-decode kernel cannot apply.
-
-        TRTLLM-Gen only implements sliding windows for causal masks: flashinfer
-        rejects ``causal=False`` with any finite ``window_left`` outright. A
-        non-causal windowed layer must therefore run on VANILLA or FA4, which
-        take a two-sided window.
-        """
-        if self.dflash_attention_backend != "TRTLLM":
-            return
-        num_layers = getattr(self.config, "num_hidden_layers", None)
-        if num_layers is None:
-            num_layers = len(self.model.layers)
-        for layer_idx in range(num_layers):
-            causal, (window_left, _) = self._resolve_block_attention(layer_idx)
-            if causal or window_left < 0:
-                continue
-            raise ValueError(
-                f"DFlash draft layer {layer_idx} attends non-causally within a "
-                f"{window_left + 1}-token sliding window. The TRTLLM DFlash "
-                "attention backend does not support non-causal sliding-window "
-                "attention. Use attention_backend=VANILLA or FA4."
-            )
-
     def _prepare_dflash_trtllm_gen_buffers(
         self,
         dtype: torch.dtype,
@@ -1462,6 +1468,10 @@ class DFlashForCausalLM(nn.Module):
             rotary_embedding_dim=0,
             fp8_context_fmha=False,
         )
+        # The non-causal window's decode returns its LSE; flashinfer carves those
+        # softmax stats (round_up(q_len, 256) float2 per head and request) plus a
+        # 1 MiB guard off the front of the workspace.
+        workspace_bytes += 8 * num_heads * max_batch_size * 256 * -(-block_size // 256) + (1 << 20)
         device = torch.device(device)
         is_capturing = torch.cuda.is_current_stream_capturing()
         if self._dflash_trtllm_gen_device != device:
@@ -1808,7 +1818,13 @@ class DFlashForCausalLM(nn.Module):
                 q_flat = Q_bshd.reshape(-1, num_heads_per_rank, head_dim)
                 out_flat = out.reshape(-1, num_heads_per_rank, head_dim)
                 window_left = window_size[0]
-                if causal:
+                # A non-causal window runs causally here, then takes each query's
+                # later block keys from block_upper_triangle_fixup.
+                fixup = not causal and window_left >= 0
+                lse = None
+                if fixup:
+                    lse = torch.empty(q_flat.shape[:2], dtype=torch.float32, device=out.device)
+                if causal or fixup:
                     trtllm_gen_ops.batch_decode_with_kv_cache(
                         query=q_flat,
                         kv_cache=(layer_cache[:, 0], layer_cache[:, 1]),
@@ -1831,7 +1847,20 @@ class DFlashForCausalLM(nn.Module):
                         uses_shared_paged_kv_idx=True,
                         bmm1_scale_log2=None,
                         multi_ctas_kv_counter_buffer=self._dflash_trtllm_gen_counters,
+                        lse=lse,
                     )
+                    if fixup:
+                        grouped = (B, block_size, num_kv_heads_per_rank, gqa_group_size)
+                        offsets = self._dflash_block_offsets
+                        out = block_upper_triangle_fixup(
+                            out_flat.view(*grouped, head_dim),
+                            lse.view(grouped),
+                            Q_bshd.reshape(*grouped, head_dim),
+                            k_noise_bshd,
+                            v_noise_bshd,
+                            head_dim**-0.5,
+                            (offsets[None, :] > offsets[:, None]).tril(window_size[1]),
+                        )
                 else:
                     cum_seq_lens_q = torch.arange(
                         0,
