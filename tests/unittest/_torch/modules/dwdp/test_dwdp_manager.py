@@ -28,6 +28,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from tensorrt_llm._torch.cute_dsl_utils import sm_reserve
 from tensorrt_llm._torch.distributed import MPIDist
 from tensorrt_llm._torch.pyexecutor.dwdp import (
     DwdpManager,
@@ -194,6 +195,25 @@ class TestDwdpManagerLifecycle(unittest.TestCase):
         self.assertIs(get_global_dwdp_manager(), mgr)
         mgr.__exit__(None, None, None)
         self.assertIsNone(get_global_dwdp_manager())
+
+    def test_enter_reserves_the_gather_sms(self, mock_comm_world, _rank, _setup):
+        """The gather's resident SMs reach the persistent grids through set_sm_reserve, from
+        __enter__ (before the model is built) to __exit__."""
+        _configure_mock_comm_world(mock_comm_world)
+        with patch(
+            "tensorrt_llm._torch.pyexecutor.dwdp.fabric_gather.resident_sms", return_value=30
+        ):
+            mgr = DwdpManager(
+                config=_make_config(),
+                dist=MagicMock(spec=MPIDist),
+                mapping=_make_mapping(),
+            )
+        self.assertEqual(mgr.resident_sms, 30)
+        self.assertEqual(sm_reserve(), 0)
+        mgr.__enter__()
+        self.assertEqual(sm_reserve(), 30)
+        mgr.__exit__(None, None, None)
+        self.assertEqual(sm_reserve(), 0)
 
     def test_cleanup_frees_comm_and_idempotent(self, mock_comm_world, _rank, _setup):
         sub_comm = MagicMock()

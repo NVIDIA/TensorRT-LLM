@@ -708,11 +708,15 @@ class KDAKernelDispatch:
         max_seqlen: int = 0,
         seq_order: Optional[torch.Tensor] = None,
         cu_chunks: Optional[torch.Tensor] = None,
+        sm_reserve: int = 0,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Run prefill on raw Q/K/V and gate/beta logits.
 
         FlashInfer updates indexed BF16/FP32 V-first state directly; FLA uses
         dense FP32 initial/final states. Both normalize Q/K internally.
+
+        ``sm_reserve`` SMs are left out of the optimized kernels' persistent
+        grids for a kernel that runs concurrently with prefill.
         """
         if state_pool is not None:
             if self.prefill_kernel_path != "optimized" or initial_state is not None:
@@ -737,6 +741,7 @@ class KDAKernelDispatch:
                 max_seqlen,
                 seq_order,
                 cu_chunks,
+                sm_reserve,
             )
             return out, None
 
