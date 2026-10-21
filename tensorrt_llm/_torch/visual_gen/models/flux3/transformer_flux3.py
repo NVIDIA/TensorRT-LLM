@@ -461,6 +461,7 @@ class Flux3Attention(Attention):
             bias=bias,
             interleave=True,
             fuse_qk_norm_rope=fuse_qk_norm_rope,
+            separate_qkv_is_self_attention=True,
             config=config,
             module_name=module_name,
         )
