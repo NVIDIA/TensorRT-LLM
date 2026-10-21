@@ -24,6 +24,7 @@
 #include <cstdlib>
 #include <limits>
 #include <stdexcept>
+#include <utility>
 
 namespace
 {
@@ -398,6 +399,7 @@ size_t NcclCommResourceManager::getResourceCount(ncclComm_t comm) const noexcept
 namespace
 {
 thread_local std::optional<uint64_t> gGraphPoolOwner;
+thread_local bool gWindowAllocationSuppressed = false;
 } // namespace
 
 NCCLWindowAllocator& NCCLWindowAllocator::getInstance()
@@ -415,6 +417,11 @@ void NCCLWindowAllocator::setGraphPoolOwner(int64_t owner)
 {
     TLLM_CHECK_WITH_INFO(owner >= -1, "NCCL window pool owner must be -1 (eager) or non-negative");
     gGraphPoolOwner = owner < 0 ? std::nullopt : std::optional<uint64_t>{static_cast<uint64_t>(owner)};
+}
+
+bool NCCLWindowAllocator::setWindowAllocationSuppressed(bool suppressed)
+{
+    return std::exchange(gWindowAllocationSuppressed, suppressed);
 }
 
 void NCCLWindowAllocator::releaseGraphPoolOwner(int64_t owner)
@@ -467,6 +474,12 @@ NCCLWindowBuffer NCCLWindowAllocator::requestBuffer(ncclComm_t comm, size_t size
 {
     if (!isNcclWindowSupported())
     {
+        return NCCLWindowBuffer();
+    }
+    if (gWindowAllocationSuppressed)
+    {
+        TLLM_LOG_TRACE("[NCCLUtil] NCCL window allocation suppressed on this thread for comm %p (requested: %zu)",
+            static_cast<void*>(comm), size);
         return NCCLWindowBuffer();
     }
 
