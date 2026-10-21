@@ -4132,7 +4132,7 @@
         },
         "role": {
           "default": "both",
-          "description": "What this server does with the pool. 'both' reads and writes, 'producer' only writes, 'consumer' only reads, and 'capacity' does neither: its ranks lend memory without moving any KV, so they pin no staging buffers and pay no per-request cost.",
+          "description": "What this server does with the pool. 'both' reads and writes, 'producer' only writes, 'consumer' only reads, and 'capacity' does neither: its ranks lend memory without registering any KV cache, so it needs no GPUDirect RDMA.",
           "enum": [
             "both",
             "producer",
@@ -4172,8 +4172,8 @@
           "title": "Segment Size"
         },
         "stage_through_host": {
-          "default": true,
-          "description": "Copy pages through a pinned host buffer instead of registering the KV pools with Mooncake. The only transfer path supported today, so 'false' is ignored with a warning. Costs a copy each way and needs no GPUDirect RDMA.",
+          "default": false,
+          "description": "Copy pages through a pinned host buffer instead of registering the KV pools with Mooncake. For a host whose HCA cannot pin GPU pages; costs a copy each way. Ignored when role is 'capacity'.",
           "telemetry": {
             "exclude": true
           },
