@@ -36,17 +36,17 @@ _POSITION_ELEMENT_BYTES = torch.empty((), dtype=QSA_POSITION_CACHE_DTYPE).elemen
 # 16-element block.
 _NVFP4_VALUES_PER_BYTE = 2
 _NVFP4_BLOCK_SIZE = 16
-# Granularity by which the packed side-plane page grows until its size is
-# distinct from every main-cache page; keeps each plane 16-byte aligned.
-_SIDE_PLANES_SIZE_STEP = 128
+# Granularity by which the packed side-plane page grows until its size cannot
+# be a main-cache page; keeps every slot's planes 16-byte aligned.
+_SIDE_PLANES_SIZE_STEP = 16
 
 # Per-token RoPE/mRoPE coordinates used when raw index keys are compressed.
 # They are request state shared by all local QSA layers.
 QSA_INDEX_POSITION = DataRole("qsa_index_position")
 # Every local layer's index-K page followed by the position page, as one
 # buffer per lifecycle slot. Registered instead of the per-layer INDEX_KEY and
-# the position role when either page would be the size of a K/V or
-# block-scale page (see `_extra_buffers_per_layer`).
+# the position role when either page could be the size of a K/V or block-scale
+# page (see `_extra_buffers_per_layer`).
 QSA_SIDE_PLANES = DataRole("qsa_side_planes")
 
 
@@ -65,9 +65,12 @@ class QSAMambaHybridCacheManagerV2(MambaHybridCacheManagerV2):
     attention op addresses a layer's K/V pages and its NVFP4 block-scale pages
     with one block-offset table, so a side page that lands in the K/V pool
     (NVFP4 at 32 tokens per block: index-K 8192 B == K == V) changes the K/V
-    slot stride but not the block-scale one. The side planes are then
-    registered as one packed per-slot buffer whose size matches no main-cache
-    page, and this manager serves their per-layer views itself.
+    slot stride but not the block-scale one, and any side page in the K/V pool
+    breaks the K/V pool mapping. When a side page could be the size of a main
+    page, the side planes are therefore registered as one packed per-slot buffer
+    whose size can be no main-cache page, and this manager serves their
+    per-layer views itself. Both the choice and the packed size are the same on
+    every TP and attention-DP layout, so disaggregated peers agree on the roles.
     """
 
     def __init__(
@@ -137,11 +140,14 @@ class QSAMambaHybridCacheManagerV2(MambaHybridCacheManagerV2):
     ) -> dict[int, list[BufferConfig]]:
         """Register per-layer index K and lifecycle-aligned position pages.
 
-        Both are registered as their own roles unless either page has the
-        size of a K/V or block-scale page, which V2 would coalesce into that
-        pool. They are then packed, in local sparse-layer order with the
-        position page last, into one `QSA_SIDE_PLANES` buffer on the first
-        local sparse layer, grown until its size matches no main-cache page.
+        Both are registered as their own roles unless either page could have
+        the size of a K/V or block-scale page at some split of the KV heads over
+        ranks (`_main_cache_page_sizes`), which V2 would coalesce into that pool.
+        They are then packed, in local sparse-layer order with the position page
+        last, into one `QSA_SIDE_PLANES` buffer on the first local sparse layer,
+        grown until its size is none of those page sizes. Neither the choice nor
+        the size depends on the KV heads this rank holds, so peers of different
+        TP or attention-DP layouts register the same transfer roles.
         """
         index_size = (
             self.qsa_index_kv_heads * self.qsa_index_dim * _INDEX_K_ELEMENT_BYTES * tokens_per_block
@@ -171,13 +177,22 @@ class QSAMambaHybridCacheManagerV2(MambaHybridCacheManagerV2):
         return result
 
     def _main_cache_page_sizes(self, tokens_per_block: int) -> set[int]:
-        """Page sizes of every local K/V and block-scale buffer, in bytes."""
+        """Every size, in bytes, a local layer's K/V or block-scale page can have
+        at any split of that layer's KV heads over ranks: one head per rank up to
+        all of them. The set is the same on every TP and attention-DP layout."""
+        global_layer = {local: layer for layer, local in self.layer_offsets.items()}
         sizes = set()
         for local_idx in range(self.num_local_layers):
+            heads = self.num_kv_heads_per_layer[local_idx]
+            total = (
+                self.num_kv_heads
+                if isinstance(self.num_kv_heads, int)
+                else self.num_kv_heads[global_layer[local_idx]]
+            )
             for role in self._get_buffer_roles_for_layer(local_idx):
-                size = self.get_layer_bytes_per_token(local_idx, role) * tokens_per_block
-                if size:
-                    sizes.add(size)
+                page = self.get_layer_bytes_per_token(local_idx, role) * tokens_per_block
+                if page:
+                    sizes.update(page // heads * h for h in range(1, total + 1))
         return sizes
 
     def _side_planes(self) -> torch.Tensor:

@@ -1520,8 +1520,8 @@ def test_qsa_side_buffers_pack_when_a_page_size_matches_the_main_cache() -> None
     assert list(buffers) == [2]
     (packed_buffer,) = buffers[2]
     assert packed_buffer.role == QSA_SIDE_PLANES
-    assert packed_buffer.size == packed + 128
-    assert manager.qsa_side_planes_size == packed + 128
+    assert packed_buffer.size == packed + 16
+    assert manager.qsa_side_planes_size == packed + 16
 
 
 def test_qsa_position_buffer_keeps_shared_index_mode_outside_dynamo() -> None:

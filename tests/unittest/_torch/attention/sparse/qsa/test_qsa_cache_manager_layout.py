@@ -42,8 +42,11 @@ _INDEX_PAGE = 1 * 128 * 2 * _TPB
 _POSITION_PAGE = 3 * 4 * _TPB
 
 
-def _manager(dtype: DataType, *, draft: bool) -> QSAMambaHybridCacheManagerV2:
-    """The trunk or the separate MTP draft manager, as the engine builds them."""
+def _manager(
+    dtype: DataType, *, draft: bool, tp_size: int = 1, attention_dp: bool = False
+) -> QSAMambaHybridCacheManagerV2:
+    """The trunk or the separate MTP draft manager, as the engine builds them (rank 0 of
+    `tp_size`, with attention data parallelism when `attention_dp`)."""
     if draft:
         attention_mask = [False] * _TRUNK_LAYERS + [True]
         mamba_mask = [False] * (_TRUNK_LAYERS + 1)
@@ -68,7 +71,13 @@ def _manager(dtype: DataType, *, draft: bool) -> QSAMambaHybridCacheManagerV2:
         tokens_per_block=_TPB,
         max_seq_len=1024,
         max_batch_size=4,
-        mapping=Mapping(world_size=1, rank=0, tp_size=1, pp_size=1),
+        mapping=Mapping(
+            world_size=tp_size,
+            rank=0,
+            tp_size=tp_size,
+            pp_size=1,
+            enable_attention_dp=attention_dp,
+        ),
         dtype=dtype,
         layer_mask=attention_mask,
         is_draft=draft,
@@ -145,18 +154,21 @@ def test_views_are_where_the_attention_op_addresses(dtype: DataType, draft: bool
 
 
 @pytest.mark.parametrize("draft", [False, True], ids=["trunk", "draft"])
-def test_nvfp4_scale_pages_follow_the_data_pages(draft: bool) -> None:
-    """Under NVFP4 the K/V pool and the block-scale pool hold the same number
-    of pages per slot, and the index and position planes are packed into a
-    buffer of their own instead of landing in the K/V pool."""
-    cm = _manager(DataType.NVFP4, draft=draft)
+@pytest.mark.parametrize("dtype", [DataType.FP8, DataType.NVFP4])
+def test_side_planes_pack_when_a_page_could_collide(dtype: DataType, draft: bool) -> None:
+    """An index page could be a K/V page here -- FP8 at one KV head a rank (1 x 256 x 32
+    tokens), NVFP4 at both -- so the index and position planes are packed into a buffer
+    of their own instead of landing in the K/V pool, and under NVFP4 the K/V and
+    block-scale pools hold the same number of pages per slot."""
+    cm = _manager(dtype, draft=draft)
     try:
         layers = _layers(draft)
         assert cm.qsa_side_planes_size == len(layers) * _INDEX_PAGE + _POSITION_PAGE
         for ordinal, layer in enumerate(layers):
             local = cm.layer_offsets[layer]
             data_scale = cm.impl.get_page_index_scale(local, Role.KEY)
-            assert data_scale == cm.impl.get_page_index_scale(local, Role.KEY_BLOCK_SCALE)
+            if dtype == DataType.NVFP4:
+                assert data_scale == cm.impl.get_page_index_scale(local, Role.KEY_BLOCK_SCALE)
             assert data_scale == 2 * len(layers)
             assert cm.kv_cache_pool_mapping[local, 1] == ordinal
         planes_owner = cm.layer_offsets[layers[0]]
@@ -166,12 +178,11 @@ def test_nvfp4_scale_pages_follow_the_data_pages(draft: bool) -> None:
 
 
 @pytest.mark.parametrize("draft", [False, True], ids=["trunk", "draft"])
-@pytest.mark.parametrize("dtype", [DataType.BF16, DataType.FP8])
-def test_bf16_and_fp8_keep_per_layer_side_roles(dtype: DataType, draft: bool) -> None:
-    """bf16 and fp8 pages never share a size with an index page, so the side
-    planes stay the per-layer INDEX_KEY role plus one position role, served by
-    the same views the generic accessor builds."""
-    cm = _manager(dtype, draft=draft)
+def test_bf16_keeps_per_layer_side_roles(draft: bool) -> None:
+    """A bf16 K/V page (at least 1 x 256 x 2 bytes x 32 tokens) can never be an index or
+    position page, so the side planes stay the per-layer INDEX_KEY role plus one position
+    role, served by the same views the generic accessor builds."""
+    cm = _manager(DataType.BF16, draft=draft)
     try:
         layers = _layers(draft)
         assert cm.qsa_side_planes_size is None
@@ -222,3 +233,49 @@ def test_side_and_main_views_do_not_alias(dtype: DataType, draft: bool) -> None:
             assert bool((raw == i + 1).all()), f"view {i} was overwritten by another view"
     finally:
         cm.shutdown()
+
+
+def _logical_page(view: torch.Tensor) -> tuple:
+    """What a peer copies of one side view per slot: the page's shape, dtype and bytes, and
+    whether they are contiguous. Where the page sits in its pool (the slot stride, other
+    buffers coalesced beside it) is physical and may differ between layouts."""
+    page = view[0]
+    return tuple(page.shape), page.dtype, page.numel() * page.element_size(), page.is_contiguous()
+
+
+#: (tp_size, attention_dp): the layouts a disaggregated pair can mix over one global
+#: geometry (2 KV heads): TP1 and ADP2 hold both heads per rank, TP2 one.
+_LAYOUTS = {"tp1": (1, False), "tp2": (2, False), "adp2": (2, True)}
+
+
+@pytest.mark.parametrize("dtype", [DataType.BF16, DataType.FP8, DataType.NVFP4])
+def test_transfer_views_do_not_depend_on_the_kv_head_split(dtype: DataType) -> None:
+    """Disaggregated peers compare the replicated side roles each layer registers and copy
+    their pages byte for byte, so roles, mapper kinds and every side view's page (shape,
+    dtype, bytes) must not depend on how many KV heads a rank holds; where pages sit in
+    their pools may. At TP2 an FP8 K/V page (1 head x 256 x 32 tokens) is the size of an
+    index page; under NVFP4 the same holds at TP1 and ADP2 (2 heads x 128 bytes x 32
+    tokens). Both pack on every layout; bf16, which can never collide, on none."""
+    seen = {}
+    for name, (tp_size, attention_dp) in _LAYOUTS.items():
+        cm = _manager(dtype, draft=False, tp_size=tp_size, attention_dp=attention_dp)
+        try:
+            buffers = cm._extra_buffers_per_layer(tokens_per_block=_TPB)
+            roles = {
+                layer: sorted(
+                    (str(b.role), b.size) for b in buffers.get(cm.layer_offsets[layer], [])
+                )
+                for layer in _QSA_LAYERS
+            }
+            views = {layer: cm.get_index_k_buffer(layer) for layer in _QSA_LAYERS}
+            views["position"] = cm.get_qsa_position_buffer()
+            logical = {key: _logical_page(view) for key, view in views.items()}
+            seen[name] = (roles, logical, cm.get_disagg_role_mapper_kinds())
+        finally:
+            cm.shutdown()
+    assert seen["tp1"] == seen["tp2"] == seen["adp2"]
+    roles = {role for layer in seen["tp1"][0].values() for role, _ in layer}
+    if dtype == DataType.BF16:
+        assert roles == {str(Role.INDEX_KEY), str(QSA_INDEX_POSITION)}
+    else:
+        assert roles == {str(QSA_SIDE_PLANES)}
