@@ -4948,3 +4948,420 @@ class TestMirrorAdmissionPreview:
             util.return_value = []  # no pool groups: C++ treats as 0.0
             assert mgr._resume_gate_refuses() is False
             util.assert_called_with(mgr.impl, 0)
+
+
+# ===========================================================================
+# Opt-in context admission: prefill-decode interval and shortest prefill first
+# ===========================================================================
+
+
+_INTERVAL_ENV = "TRTLLM_SCHED_PREFILL_DECODE_INTERVAL"
+_SPF_ENV = "TRTLLM_SCHED_SHORTEST_PREFILL_FIRST"
+_SPF_WAIT_ENV = "TRTLLM_SCHED_SPF_MAX_WAIT_PASSES"
+
+
+@pytest.fixture
+def admission_env(monkeypatch):
+    for name in (_INTERVAL_ENV, _SPF_ENV, _SPF_WAIT_ENV):
+        monkeypatch.delenv(name, raising=False)
+    return monkeypatch
+
+
+def _admit_chunk(req):
+    """Advance a mock context request past the chunk it was just given."""
+    req.context_current_position += req.context_chunk_size
+    req.context_remaining_length -= req.context_chunk_size
+    req.is_first_context_chunk = False
+
+
+class TestPrefillDecodeIntervalPolicy:
+    def test_off_by_default(self, admission_env):
+        sched = make_scheduler(make_kv_cache_manager())
+        assert sched._prefill_decode_interval is None
+        assert sched._shortest_prefill_first is None
+        gen = make_gen_request(0)
+        for request_id in (1, 2, 3):
+            ctx = make_ctx_request(request_id, context_remaining_length=100)
+            out = sched.schedule_request([gen, ctx], set())
+            assert ids(out.context_requests) == [request_id]
+            assert ids(out.generation_requests) == [0]
+
+    def test_zero_disables(self, admission_env):
+        admission_env.setenv(_INTERVAL_ENV, "0")
+        assert make_scheduler(make_kv_cache_manager())._prefill_decode_interval is None
+
+    @pytest.mark.parametrize("value", ["-1", "two", "1.5"])
+    def test_invalid_value_rejected(self, admission_env, value):
+        admission_env.setenv(_INTERVAL_ENV, value)
+        with pytest.raises(ValueError, match=_INTERVAL_ENV):
+            make_scheduler(make_kv_cache_manager())
+
+    @pytest.mark.parametrize("interval", [1, 2, 5])
+    def test_one_context_step_per_interval_while_decoding(self, admission_env, interval):
+        admission_env.setenv(_INTERVAL_ENV, str(interval))
+        sched = make_scheduler(make_kv_cache_manager())
+        gen = make_gen_request(0)
+        next_id = 1
+        pending = make_ctx_request(next_id, context_remaining_length=100)
+        admitted_passes = []
+        for step in range(3 * (interval + 1)):
+            out = sched.schedule_request([gen, pending], set())
+            # Decoding never waits on the cadence.
+            assert ids(out.generation_requests) == [0]
+            if out.context_requests:
+                assert ids(out.context_requests) == [pending.request_id]
+                admitted_passes.append(step)
+                next_id += 1
+                pending = make_ctx_request(next_id, context_remaining_length=100)
+        assert admitted_passes == [0, interval + 1, 2 * (interval + 1)]
+
+    def test_context_admitted_at_once_when_nothing_decodes(self, admission_env):
+        admission_env.setenv(_INTERVAL_ENV, "8")
+        sched = make_scheduler(make_kv_cache_manager())
+        gen = make_gen_request(0)
+        out = sched.schedule_request([gen, make_ctx_request(1, 100)], set())
+        assert ids(out.context_requests) == [1]
+        assert sched._prefill_decode_interval.remaining == 8
+        # No generation request: there is no decode to protect.
+        out = sched.schedule_request([make_ctx_request(2, 100)], set())
+        assert ids(out.context_requests) == [2]
+        assert sched._prefill_decode_interval.remaining == 8
+
+    def test_only_generation_passes_count(self, admission_env):
+        admission_env.setenv(_INTERVAL_ENV, "2")
+        sched = make_scheduler(make_kv_cache_manager())
+        gen = make_gen_request(0)
+        sched.schedule_request([gen, make_ctx_request(1, 100)], set())
+        assert sched._prefill_decode_interval.remaining == 2
+        # Generation passes without pending context still count down.
+        sched.schedule_request([gen], set())
+        assert sched._prefill_decode_interval.remaining == 1
+        # An empty pass (nothing to run) does not.
+        sched.schedule_request([], set())
+        assert sched._prefill_decode_interval.remaining == 1
+        out = sched.schedule_request([gen, make_ctx_request(2, 100)], set())
+        assert ids(out.context_requests) == []
+        assert sched._prefill_decode_interval.remaining == 0
+        out = sched.schedule_request([gen, make_ctx_request(2, 100)], set())
+        assert ids(out.context_requests) == [2]
+
+    def test_chunk_continuations_are_paced(self, admission_env):
+        admission_env.setenv(_INTERVAL_ENV, "2")
+        mgr = make_kv_cache_manager(tokens_per_block=64)
+        sched = make_scheduler(mgr, max_num_tokens=257, ctx_chunk_config=(None, 64))
+        gen = make_gen_request(0)
+        long_ctx = make_ctx_request(1, context_remaining_length=1000, is_last_context_chunk=False)
+        chunk_passes = []
+        for step in range(9):
+            out = sched.schedule_request([gen, long_ctx], set())
+            assert ids(out.generation_requests) == [0]
+            if out.context_requests:
+                # The admitted pass gets the whole remaining budget.
+                assert long_ctx.context_chunk_size == 256
+                chunk_passes.append(step)
+                _admit_chunk(long_ctx)
+        assert chunk_passes == [0, 3, 6]
+
+    def test_held_context_is_not_allocated(self, admission_env):
+        admission_env.setenv(_INTERVAL_ENV, "4")
+        mgr = make_kv_cache_manager()
+        sched = make_scheduler(mgr)
+        gen = make_gen_request(0)
+        sched.schedule_request([gen, make_ctx_request(1, 100)], set())
+        mgr.prepare_context.reset_mock()
+        mgr.resize_context.reset_mock()
+        held = make_ctx_request(2, 100)
+        out = sched.schedule_request([gen, held], set())
+        assert ids(out.context_requests) == []
+        mgr.prepare_context.assert_not_called()
+        mgr.resize_context.assert_not_called()
+
+    def test_holding_context_is_not_a_stall(self, admission_env):
+        admission_env.setenv(_INTERVAL_ENV, "64")
+        sched = make_scheduler(make_kv_cache_manager())
+        gen = make_gen_request(0)
+        sched.schedule_request([gen, make_ctx_request(1, 100)], set())
+        for _ in range(64):
+            out = sched.schedule_request([gen, make_ctx_request(2, 100)], set())
+            assert ids(out.context_requests) == []
+        assert sched._stalled_schedules == 0
+
+    def test_summary_logged_and_reset(self, admission_env):
+        admission_env.setenv(_INTERVAL_ENV, "1")
+        sched = make_scheduler(make_kv_cache_manager())
+        sched._CONTEXT_ADMISSION_LOG_PASSES = 4
+        gen = make_gen_request(0)
+        with patch("tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2.logger") as log:
+            for request_id in (1, 2, 2, 3):
+                sched.schedule_request([gen, make_ctx_request(request_id, 100)], set())
+        log.info.assert_called_once()
+        message = log.info.call_args.args[0]
+        assert (
+            "over 4 passes, 2 admitted context work, 2 held pending context back, "
+            "0 admissions withdrawn" in message
+        )
+        assert not sched._context_admission_stats
+
+
+def _reuse_settling_manager(reuse_by_id, **kwargs):
+    """Manager whose prefix probe and prepare agree on each request's reuse."""
+
+    def prepare_context(req, reuse_limit=None):
+        if req.is_first_context_chunk:
+            reused = reuse_by_id.get(req.py_request_id, 0)
+            req.context_remaining_length = req.prompt_len - reused
+        return True
+
+    mgr = make_kv_cache_manager(prepare_context_fn=prepare_context, **kwargs)
+    mgr.probe_context_reuse.side_effect = lambda req: reuse_by_id.get(req.py_request_id, 0)
+    return mgr
+
+
+class TestShortestPrefillFirstPolicy:
+    def test_arrival_order_without_opt_in(self, admission_env):
+        mgr = _reuse_settling_manager({})
+        sched = make_scheduler(mgr, max_num_tokens=150)
+        out = sched.schedule_request([make_ctx_request(1, 1000), make_ctx_request(2, 100)], set())
+        # FCFS: the long prompt does not fit and ends admission.
+        assert ids(out.context_requests) == []
+        mgr.probe_context_reuse.assert_not_called()
+
+    def test_shortest_uncached_prompt_first(self, admission_env):
+        admission_env.setenv(_SPF_ENV, "1")
+        mgr = _reuse_settling_manager({})
+        sched = make_scheduler(mgr, max_num_tokens=150)
+        out = sched.schedule_request([make_ctx_request(1, 1000), make_ctx_request(2, 100)], set())
+        assert ids(out.context_requests) == [2]
+
+    def test_order_uses_the_reusable_prefix(self, admission_env):
+        admission_env.setenv(_SPF_ENV, "1")
+        # Request 2 has the longer prompt but only 50 uncached tokens.
+        mgr = _reuse_settling_manager({2: 950})
+        sched = make_scheduler(mgr, max_num_tokens=120)
+        out = sched.schedule_request([make_ctx_request(1, 100), make_ctx_request(2, 1000)], set())
+        assert ids(out.context_requests) == [2]
+        assert sched._shortest_prefill_first._uncached_estimate == {1: 100, 2: 50}
+
+    def test_ties_keep_arrival_order(self, admission_env):
+        admission_env.setenv(_SPF_ENV, "1")
+        sched = make_scheduler(_reuse_settling_manager({}), max_num_tokens=150)
+        out = sched.schedule_request([make_ctx_request(3, 100), make_ctx_request(1, 100)], set())
+        assert ids(out.context_requests) == [3]
+
+    def test_started_prefill_ranks_by_remaining_context(self, admission_env):
+        admission_env.setenv(_SPF_ENV, "1")
+        mgr = _reuse_settling_manager({})
+        sched = make_scheduler(mgr, max_num_tokens=200, ctx_chunk_config=(None, 64))
+        started = make_ctx_request(
+            1, context_remaining_length=300, prompt_len=5000, is_first_context_chunk=False
+        )
+        fresh = make_ctx_request(2, context_remaining_length=150)
+        out = sched.schedule_request([started, fresh], set())
+        assert ids(out.context_requests)[0] == 2
+        assert fresh.context_chunk_size == 150
+        # The started request is ranked by what it has left, without a probe.
+        assert [c.args[0].py_request_id for c in mgr.probe_context_reuse.call_args_list] == [2]
+
+    def test_probe_runs_once_per_request(self, admission_env):
+        admission_env.setenv(_SPF_ENV, "1")
+        mgr = _reuse_settling_manager({})
+        sched = make_scheduler(mgr, max_num_tokens=50)
+        waiting = [make_ctx_request(1, 300), make_ctx_request(2, 200)]
+        for _ in range(3):
+            assert ids(sched.schedule_request(waiting, set()).context_requests) == []
+        assert mgr.probe_context_reuse.call_count == 2
+        # Bookkeeping is dropped once a request is no longer pending.
+        sched.schedule_request([waiting[1]], set())
+        assert set(sched._shortest_prefill_first._waiting_since) == {2}
+
+    def test_aging_restores_arrival_order(self, admission_env):
+        admission_env.setenv(_SPF_ENV, "1")
+        admission_env.setenv(_SPF_WAIT_ENV, "2")
+        sched = make_scheduler(_reuse_settling_manager({}), max_num_tokens=210)
+        long_ctx = make_ctx_request(1, 200)
+        admitted = []
+        for request_id in (2, 3, 4):
+            out = sched.schedule_request([long_ctx, make_ctx_request(request_id, 100)], set())
+            admitted.append(ids(out.context_requests))
+        # Shorter arrivals go first until the long request has waited 2 passes.
+        assert admitted == [[2], [3], [1]]
+
+    def test_prompt_that_keeps_progressing_does_not_age(self, admission_env):
+        admission_env.setenv(_SPF_ENV, "1")
+        admission_env.setenv(_SPF_WAIT_ENV, "2")
+        mgr = _reuse_settling_manager({})
+        sched = make_scheduler(mgr, max_num_tokens=192, ctx_chunk_config=(None, 64))
+        long_ctx = make_ctx_request(1, context_remaining_length=5000, is_last_context_chunk=False)
+        for request_id in range(2, 8):
+            short = make_ctx_request(request_id, 64)
+            out = sched.schedule_request([long_ctx, short], set())
+            # The short arrival goes first; the long prompt takes the rest.
+            assert ids(out.context_requests) == [1, request_id]  # non-last chunks sort first
+            assert short.context_chunk_size == 64
+            assert long_ctx.context_chunk_size == 128
+            _admit_chunk(long_ctx)
+
+    def test_prompt_crowded_out_ages(self, admission_env):
+        admission_env.setenv(_SPF_ENV, "1")
+        admission_env.setenv(_SPF_WAIT_ENV, "2")
+        mgr = _reuse_settling_manager({})
+        sched = make_scheduler(mgr, max_num_tokens=128, ctx_chunk_config=(None, 64))
+        long_ctx = make_ctx_request(1, context_remaining_length=5000, is_last_context_chunk=False)
+        admitted = []
+        for request_id in (2, 3, 4):
+            out = sched.schedule_request([long_ctx, make_ctx_request(request_id, 128)], set())
+            admitted.append(ids(out.context_requests))
+        # Shorter arrivals take the whole budget until request 1 has gone two
+        # passes without context tokens; then it goes first.
+        assert admitted == [[2], [3], [1]]
+
+    def test_aging_counts_passes_held_by_the_interval(self, admission_env):
+        admission_env.setenv(_SPF_ENV, "1")
+        admission_env.setenv(_SPF_WAIT_ENV, "2")
+        admission_env.setenv(_INTERVAL_ENV, "2")
+        sched = make_scheduler(_reuse_settling_manager({}), max_num_tokens=211)
+        gen = make_gen_request(0)
+        long_ctx = make_ctx_request(1, 200)
+        out = sched.schedule_request([gen, make_ctx_request(9, 100)], set())
+        assert ids(out.context_requests) == [9]
+        short = make_ctx_request(2, 100)
+        for _ in range(2):
+            out = sched.schedule_request([gen, long_ctx, short], set())
+            assert ids(out.context_requests) == []
+        out = sched.schedule_request([gen, long_ctx, short], set())
+        # Request 1 aged while it was held, so it now goes first.
+        assert ids(out.context_requests) == [1]
+
+
+class TestPrefillDecodeIntervalWithheldContext:
+    """Context the executor withholds after scheduling does not arm the interval."""
+
+    def test_withheld_admission_is_withdrawn(self, admission_env):
+        admission_env.setenv(_INTERVAL_ENV, "4")
+        sched = make_scheduler(make_kv_cache_manager())
+        gen = make_gen_request(0)
+        ctx = make_ctx_request(1, 100)
+        out = sched.schedule_request([gen, ctx], set())
+        assert ids(out.context_requests) == [1]
+        # The executor dropped it (e.g. batch waiting): same state and position.
+        out = sched.schedule_request([gen, ctx], set())
+        assert ids(out.context_requests) == [1]
+        assert sched._prefill_decode_interval.remaining == 4
+        assert sched._context_admission_stats["withdrawn"] == 1
+
+    def test_released_admission_is_withdrawn(self, admission_env):
+        admission_env.setenv(_INTERVAL_ENV, "4")
+        sched = make_scheduler(make_kv_cache_manager())
+        gen = make_gen_request(0)
+        ctx = make_ctx_request(1, 100)
+        ctx.context_current_position = 64  # where its reused prefix ended
+        sched.schedule_request([gen, ctx], set())
+        # Releasing the admission rewinds the request to a fresh prefix match.
+        ctx.context_current_position = 0
+        out = sched.schedule_request([gen, ctx], set())
+        assert ids(out.context_requests) == [1]
+
+    def test_admission_that_ran_a_chunk_is_kept(self, admission_env):
+        admission_env.setenv(_INTERVAL_ENV, "4")
+        sched = make_scheduler(make_kv_cache_manager(), ctx_chunk_config=(None, 64))
+        gen = make_gen_request(0)
+        ctx = make_ctx_request(1, context_remaining_length=5000, is_last_context_chunk=False)
+        sched.schedule_request([gen, ctx], set())
+        _admit_chunk(ctx)
+        out = sched.schedule_request([gen, ctx], set())
+        assert ids(out.context_requests) == []
+        assert sched._prefill_decode_interval.remaining == 3
+        assert sched._context_admission_stats["withdrawn"] == 0
+
+    def test_admission_that_finished_prefill_is_kept(self):
+        from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import PrefillDecodeInterval
+
+        interval = PrefillDecodeInterval(4)
+        ctx = make_ctx_request(1, 100)
+        interval.record_pass([ctx], has_generation=True)
+        ctx.state_value = GEN_IN_PROGRESS
+        assert not interval.withdraw_if_not_run([ctx], CONTEXT_INIT)
+        assert interval.remaining == 4
+
+    def test_partly_withheld_admission_is_kept(self):
+        from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import PrefillDecodeInterval
+
+        interval = PrefillDecodeInterval(4)
+        ran = make_ctx_request(1, 100)
+        withheld = make_ctx_request(2, 100)
+        interval.record_pass([ran, withheld], has_generation=True)
+        ran.state_value = GEN_IN_PROGRESS
+        assert not interval.withdraw_if_not_run([ran, withheld], CONTEXT_INIT)
+        assert interval.remaining == 4
+        # With every admitted request withheld the admission is withdrawn.
+        ran.state_value = CONTEXT_INIT
+        interval.record_pass([ran, withheld], has_generation=True)
+        assert interval.withdraw_if_not_run([ran, withheld], CONTEXT_INIT)
+        assert interval.remaining == 0
+
+    def test_admission_is_checked_only_once(self, admission_env):
+        admission_env.setenv(_INTERVAL_ENV, "4")
+        sched = make_scheduler(make_kv_cache_manager())
+        gen = make_gen_request(0)
+        ctx = make_ctx_request(1, 100)
+        sched.schedule_request([gen, ctx], set())
+        sched.schedule_request([gen], set())
+        # A later pass that finds the request unchanged must not reopen the
+        # cadence: the check belongs to the pass right after the admission.
+        out = sched.schedule_request([gen, ctx], set())
+        assert ids(out.context_requests) == []
+
+
+class TestShortestPrefillFirstBounds:
+    def test_aging_clock_runs_while_the_batch_is_full(self, admission_env):
+        admission_env.setenv(_SPF_ENV, "1")
+        admission_env.setenv(_SPF_WAIT_ENV, "2")
+        sched = make_scheduler(
+            make_kv_cache_manager(),
+            max_batch_size=2,
+            max_num_tokens=128,
+            ctx_chunk_config=(None, 64),
+        )
+        long_ctx = make_ctx_request(1, context_remaining_length=5000, is_last_context_chunk=False)
+        gen_a, gen_b = make_gen_request(100), make_gen_request(101)
+        admitted = []
+        for request_id in (2, 3, 4):
+            out = sched.schedule_request([long_ctx, make_ctx_request(request_id, 128)], set())
+            admitted.append(ids(out.context_requests))
+            # Two decoding requests ahead of it fill the batch: the scheduler
+            # never reaches the long prompt, but it is still waiting.
+            out = sched.schedule_request([gen_a, gen_b, long_ctx], set())
+            assert ids(out.context_requests) == []
+        # Request 1 goes two passes without context tokens (one open, one
+        # full) after each admission, so it is aged on every open pass.
+        assert admitted == [[2], [1], [1]]
+
+    @pytest.mark.parametrize("spf", [False, True])
+    def test_newcomer_short_of_pages_does_not_preempt_started_prefill(self, admission_env, spf):
+        if spf:
+            admission_env.setenv(_SPF_ENV, "1")
+        mgr = make_kv_cache_manager(
+            resize_context_fn=lambda req, n: req.py_request_id != 2,
+            has_cache_tier_below_gpu=False,
+        )
+        sched = make_scheduler(mgr, max_num_tokens=1000)
+        started = make_ctx_request(1, 300, prompt_len=5000, is_first_context_chunk=False)
+        newcomer = make_ctx_request(2, 100)
+        out = sched.schedule_request([started, newcomer], set())
+        assert ids(out.context_requests) == [1]
+        assert ids(out.recompute_paused_requests) == []
+        mgr.preempt_request.assert_not_called()
+
+    def test_started_prefill_may_still_preempt_under_spf(self, admission_env):
+        admission_env.setenv(_SPF_ENV, "1")
+        mgr = make_kv_cache_manager(
+            resize_context_fn=lambda req, n: req.py_request_id != 1,
+            has_cache_tier_below_gpu=False,
+        )
+        sched = make_scheduler(mgr, max_num_tokens=1000)
+        started = make_ctx_request(1, 300, prompt_len=5000, is_first_context_chunk=False)
+        newer_started = make_ctx_request(2, 600, prompt_len=5000, is_first_context_chunk=False)
+        out = sched.schedule_request([started, newer_started], set())
+        # The protection applies to requests that have not started prefilling;
+        # between started requests the usual newest-first preemption holds.
+        assert ids(out.recompute_paused_requests) == [2]
