@@ -29,6 +29,7 @@ The following is a table of supported models for the PyTorch backend:
 | `KimiK25ForConditionalGeneration`    | Kimi-K2.5                          | `moonshotai/Kimi-K2.5`                       |
 | `KimiK3ForConditionalGeneration` [^15]| Kimi-K3                            | `moonshotai/Kimi-K3`                         |
 | `KimiLinearForCausalLM` [^15]        | Kimi-K3 (text decoder)             | `moonshotai/Kimi-K3`                         |
+| `Kolibri1ForCausalLM`                | Kolibri 1                          | `aleph-alpha/kolibri-1`                      |
 | `LagunaForCausalLM`                  | Laguna-XS                          | `poolside/laguna-XS.2`                       |
 | `LiLiCorrDraftModel`                | [LiLiCorr draft model](../features/speculative-decoding.md#dflash) | Compatible checkpoint via `DFlashDecodingConfig.speculative_model` |
 | `LlamaForCausalLM`                   | Llama 3.1, Llama 3, Llama 2, LLaMA | `meta-llama/Meta-Llama-3.1-70B`              |
