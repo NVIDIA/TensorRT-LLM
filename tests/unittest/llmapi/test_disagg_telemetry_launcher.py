@@ -346,13 +346,21 @@ def test_launch_disaggregated_leader_signal_cleans_up_and_reports(
     ):
         serve._command_telemetry.run_with_terminal_reporting(
             lambda: serve._launch_disaggregated_leader(
-                SimpleNamespace(Get_rank=lambda: 0), 2, "disagg.yaml", "info"
+                SimpleNamespace(Get_rank=lambda: 0),
+                2,
+                "disagg.yaml",
+                "info",
+                b"k" * 32,
             ),
             default_usage_context="disaggregated",
         )
 
     assert observed["env"][serve.DisaggLauncherEnvs.TLLM_DISAGG_DEPLOYMENT_ID] == "deploy123"
     assert observed["env"][serve.DisaggLauncherEnvs.TLLM_DISAGG_INSTANCE_IDX] == "2"
+    assert (
+        observed["env"][serve.DisaggLauncherEnvs.TLLM_DISAGG_RANK_INFO_AUTH_KEY]
+        == (b"k" * 32).hex()
+    )
     assert observed["env"]["TRTLLM_NO_USAGE_STATS"] == "1"
     assert (
         observed["env"][serve.DisaggLauncherEnvs.TLLM_DISAGG_RUN_REMOTE_MPI_SESSION_CLIENT] == "1"
@@ -423,6 +431,30 @@ def test_disaggregated_mpi_worker_exposes_telemetry_option() -> None:
     assert "telemetry" in parameter_names
 
 
+def test_rank_info_auth_key_is_provisioned_and_consumed(monkeypatch) -> None:
+    auth_key = b"k" * 32
+    config = SimpleNamespace(internal_request_auth_key=None)
+    world_comm = mock.Mock()
+    world_comm.Get_rank.return_value = 0
+    world_comm.bcast.return_value = auth_key
+
+    with mock.patch.object(serve.secrets, "token_bytes", return_value=auth_key):
+        assert serve._resolve_rank_info_auth_key(config, False, world_comm) == auth_key
+    world_comm.bcast.assert_called_once_with(auth_key, root=0)
+
+    monkeypatch.setenv(serve.DisaggLauncherEnvs.TLLM_DISAGG_RANK_INFO_AUTH_KEY, auth_key.hex())
+    assert serve._resolve_rank_info_auth_key(config, True, world_comm) == auth_key
+    assert serve.DisaggLauncherEnvs.TLLM_DISAGG_RANK_INFO_AUTH_KEY not in os.environ
+
+
+def test_rank_info_auth_key_prefers_configured_secret() -> None:
+    config = SimpleNamespace(internal_request_auth_key="shared-secret")
+    world_comm = mock.Mock()
+
+    assert serve._resolve_rank_info_auth_key(config, False, world_comm) == b"shared-secret"
+    world_comm.bcast.assert_not_called()
+
+
 @pytest.mark.parametrize(
     ("server_type", "expected_role"),
     [
@@ -451,9 +483,11 @@ def test_launch_disaggregated_server_sets_worker_role(
         mock.patch.object(serve, "mpi_rank", return_value=0),
         mock.patch.object(serve, "launch_server") as mock_launch_server,
     ):
-        serve._launch_disaggregated_server("disagg.yaml", llm_args)
+        rank_info_auth_key = b"k" * 32
+        serve._launch_disaggregated_server("disagg.yaml", llm_args, rank_info_auth_key)
 
     assert os.environ[serve.DisaggLauncherEnvs.TLLM_DISAGG_ROLE] == expected_role
+    assert llm_args["_rank_info_auth_key"] == rank_info_auth_key
     mock_launch_server.assert_called_once_with(
         host="127.0.0.1",
         port=8000,

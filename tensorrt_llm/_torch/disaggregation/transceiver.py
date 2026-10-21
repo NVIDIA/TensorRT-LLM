@@ -207,6 +207,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                     else 0
                 ),
                 agent_bounce_params=cache_transceiver_config.agent_bounce_params,
+                rank_info_auth_key=cache_transceiver_config._rank_info_auth_key,
             )
         )
         if enforce_physical_ownership:
