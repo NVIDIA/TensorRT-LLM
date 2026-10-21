@@ -12,6 +12,7 @@ from tensorrt_llm._torch.disaggregation.native.transfer import (
     Receiver,
     _rank_info_auth_tag,
 )
+from tensorrt_llm.llmapi.llm import _resolve_rank_info_auth_key
 
 pytestmark = pytest.mark.cpu_only
 
@@ -92,3 +93,13 @@ def test_receiver_authenticates_rank_info_request():
         call(authenticated_request),
     ]
     messenger.stop.assert_called_once_with()
+
+
+def test_programmatic_llms_share_process_rank_info_auth_key():
+    first_key = _resolve_rank_info_auth_key(None, None)
+    second_key = _resolve_rank_info_auth_key(None, None)
+
+    assert first_key == second_key
+    assert len(first_key) == 32
+    assert _resolve_rank_info_auth_key("configured-key", None) == b"configured-key"
+    assert _resolve_rank_info_auth_key(None, _AUTH_KEY) == _AUTH_KEY
