@@ -26,8 +26,10 @@ The adapter consumes the dual-pool global indices that
 ``DeepseekV4TrtllmAttention.sparse_attn_predict`` already produces: SWA slots
 are storage rows of the SWA pool and compressed slots are storage rows of the
 layer's compress pool, so no page-table conversion happens here. The kernel
-takes the two index lists and their live lengths directly and masks ``-1``
-holes itself. The fused DSv4 epilogue (conjugate RoPE on ``D[448:512]`` +
+takes the two index lists and their live lengths directly; ``-1`` holes before a
+live length are masked in the kernel only on the configurations that can produce
+them (KV-cache offload, heuristic top-k), otherwise the plan promises valid
+prefixes. The fused DSv4 epilogue (conjugate RoPE on ``D[448:512]`` +
 1x128 block-scaled E4M3 output in the group-major ``[G, T, (H/G)*512]`` layout
 with FP32 scales ``[G, (H/G)*4, pad4(T)]``) maps one-to-one onto the kernel's
 ``output_quant_block_size=128`` / ``out_scale_format="fp32"`` mode, so the
@@ -457,6 +459,21 @@ class PrimsTSSparseMlaFmha(Fmha):
                 "PrimTS sparse MLA plans must be created during eager warmup, not under "
                 f"CUDA graph capture (rows={rows}, extra={extra}, dtype={q_dtype})."
             )
+        # DeepSeek-V4's producers emit valid prefixes: the window slots are
+        # the first min(pos + 1, window) rows, the compressed slots the first
+        # `topk_lens - window` rows (ratio 128 by construction, ratio 4 from
+        # the indexer's top-k), with -1 only in the tail. Promising that lets
+        # the kernel bound its work by the live lengths instead of scanning
+        # every capacity tile for holes. KV-cache offload breaks the promise
+        # (non-resident pages are masked to -1 in place), and the opt-in
+        # heuristic (GVR) top-k engines pad from their own candidate count,
+        # so both keep the generic hole-checking path. The first eager run of
+        # every plan validates the promise (run(validate=True)); the fields
+        # are read directly so a renamed config cannot silently fail open.
+        sparse_cfg = attn.sparse_attention_config
+        holes_possible = bool(sparse_cfg.enable_kv_cache_offload) or bool(
+            sparse_cfg.enable_heuristic_topk
+        )
         plan_kwargs = dict(
             max_topk=window,
             max_extra_topk=extra,
@@ -465,10 +482,7 @@ class PrimsTSSparseMlaFmha(Fmha):
             kv_layout="NHD",
             has_sinks=has_sinks,
             return_lse=False,
-            # Window slots and compressed slots are valid prefixes in the
-            # dual-pool layout, but the ratio-4 indexer top-k may carry holes;
-            # keep the generic mask path.
-            assume_valid_prefix=False,
+            assume_valid_prefix=not holes_possible,
         )
         if fused_groups:
             plan_kwargs.update(

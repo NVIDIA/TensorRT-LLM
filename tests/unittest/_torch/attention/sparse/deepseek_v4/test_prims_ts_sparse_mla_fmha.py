@@ -171,7 +171,9 @@ def test_plans_are_shared_through_the_metadata_cache(monkeypatch) -> None:
 
     class _Attn:  # weak-referenceable stand-in for TrtllmAttention
         num_heads = 16
-        sparse_attention_config = SimpleNamespace(window_size=128)
+        sparse_attention_config = SimpleNamespace(
+            window_size=128, enable_kv_cache_offload=False, enable_heuristic_topk=False
+        )
 
     attn_a, attn_b = _Attn(), _Attn()
     layer_a, layer_b = PrimsTSSparseMlaFmha(attn_a), PrimsTSSparseMlaFmha(attn_b)
@@ -190,6 +192,10 @@ def test_plans_are_shared_through_the_metadata_cache(monkeypatch) -> None:
     assert plan_a is plan_b
     assert len(planned) == 1
     assert planned[0][3]["max_topk"] == 128 and planned[0][3]["max_extra_topk"] == 256
+    # DeepSeek-V4's index producers emit valid prefixes, so the plan promises
+    # them unless KV-cache offload (which masks non-resident pages to -1 in
+    # place) or heuristic top-k is on; see test_plan_keeps_the_hole_checking_path.
+    assert planned[0][3]["assume_valid_prefix"] is True
     cache = metadata.fmha_plan_caches[PrimsTSSparseMlaFmha.PLAN_CACHE_KEY]
     assert list(cache.values()) == [plan_a]
     workspace = metadata.fmha_plan_caches[PrimsTSSparseMlaFmha.WORKSPACE_CACHE_KEY]["buffer"]
@@ -202,6 +208,45 @@ def test_plans_are_shared_through_the_metadata_cache(monkeypatch) -> None:
     grown = metadata.fmha_plan_caches[PrimsTSSparseMlaFmha.WORKSPACE_CACHE_KEY]["buffer"]
     assert larger is not plan_a and planned[2][4] is grown and grown.numel() == 3072
     assert len(planned) == 3 and len(cache) == 3
+
+
+@pytest.mark.parametrize("offload, heuristic_topk", [(True, False), (False, True)])
+def test_plan_keeps_the_hole_checking_path(monkeypatch, offload, heuristic_topk) -> None:
+    """Offload (pages masked to -1 in place) and the heuristic GVR top-k (pads from its
+    own candidate count) can leave -1 inside a live prefix, so no prefix promise."""
+    import tensorrt_llm._torch.attention.backends.prims_ts.mla_decode as mla_decode
+
+    planned = []
+
+    class _FakeWrapper:
+        def __init__(self, workspace_buffer=None):
+            pass
+
+        def plan(self, device, rows, heads, **kwargs):
+            planned.append(kwargs)
+
+    monkeypatch.setattr(mla_decode, "BatchSparseMLADecodePagedTSWrapper", _FakeWrapper)
+    monkeypatch.setattr(
+        mla_decode, "_resolve_sparse_mla_plan", lambda *a, **k: (None,) * 4 + (1024, None, None)
+    )
+
+    class _Attn:
+        num_heads = 16
+        sparse_attention_config = SimpleNamespace(
+            window_size=128, enable_kv_cache_offload=offload, enable_heuristic_topk=heuristic_topk
+        )
+
+    attn = _Attn()  # the library only holds a weak reference to its attention module
+    PrimsTSSparseMlaFmha(attn)._get_plan(
+        metadata=SimpleNamespace(fmha_plan_caches={}),
+        device=torch.device("cuda"),
+        rows=4,
+        extra=256,
+        q_dtype=torch.bfloat16,
+        has_sinks=False,
+        fused_groups=None,
+    )
+    assert planned[0]["assume_valid_prefix"] is False
 
 
 def _rope_table(max_positions: int, device: torch.device) -> torch.Tensor:
