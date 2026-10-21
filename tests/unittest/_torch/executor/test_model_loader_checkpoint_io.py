@@ -415,9 +415,9 @@ def _model_streamer_load(
     load runs `run_model_streamer()` for real. The returned list records the names
     that the fake streamer delivered.
     """
-    model = MagicMock(name="model")
-    # The model reads its weights from the main checkpoint.
-    del model.llm_checkpoint_dir
+    from tensorrt_llm._torch.models.modeling_kimi_linear import KimiLinearForCausalLM
+
+    model = MagicMock(spec=KimiLinearForCausalLM)
     model.modules.return_value = list(modules)
     model.plan_model_streamer_load.return_value = ModelStreamerPlan(
         groups=[({"weight"}, MagicMock(name="load_weight"))]

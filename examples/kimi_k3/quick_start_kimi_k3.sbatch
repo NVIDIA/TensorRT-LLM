@@ -27,14 +27,26 @@
 set -euo pipefail
 
 usage() {
-    echo "Usage: sbatch $0 --model PATH --image PATH [--enable-block-reuse]"
+    echo "Usage: sbatch $0 --model PATH --image PATH [--tp-size N] [--checkpoint-io-policy auto|native|rank_striped_read_ahead|model_streamer] [--enable-block-reuse]"
 }
 
 MODEL=""
 CONTAINER_IMAGE=""
 FEATURE_ARGS=""
+CHECKPOINT_IO_POLICY="auto"
+TP_SIZE=16
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        --tp-size)
+            [[ $# -ge 2 ]] || { echo "error: --tp-size requires a value" >&2; usage >&2; exit 2; }
+            TP_SIZE=$2
+            shift 2
+            ;;
+        --checkpoint-io-policy)
+            [[ $# -ge 2 ]] || { echo "error: --checkpoint-io-policy requires a value" >&2; usage >&2; exit 2; }
+            CHECKPOINT_IO_POLICY=$2
+            shift 2
+            ;;
         --enable-block-reuse)
             # Forwarded verbatim to quick_start_kimi_k3.py (see its --help).
             FEATURE_ARGS="$FEATURE_ARGS $1"
@@ -121,5 +133,6 @@ srun --mpi=pmix \
         exec '$REPO/tensorrt_llm/llmapi/trtllm-llmapi-launch' python3 \
             '$REPO/examples/kimi_k3/quick_start_kimi_k3.py' \
             --model \"$MODEL\" \
-            --tp-size 16$FEATURE_ARGS
+            --checkpoint-io-policy \"$CHECKPOINT_IO_POLICY\" \
+            --tp-size "$TP_SIZE"$FEATURE_ARGS
     "
