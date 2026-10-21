@@ -17,18 +17,10 @@ one rank swaps two calls and every rank gets a wrong answer without an error. Th
 
 Not a pytest module: one fixed sequence of checks inside one W-rank job (they share the workspaces and their
 counters). The collected entry point is ``test_modeling_v2_k3_sandwich_tail_op_matrix.py``.
-
-Shapes are TP16's per-rank shapes (latent [M, 3584], act [M, 384], tail_weight [7168, 256 + 384]) whatever W; rank
-r's latent slice ``lo`` moves from call to call over the 16 slices. The kernel sums the ranks in chunks of 8, so
-W <= 8 exercises one chunk. Every rank draws every rank's inputs from one seed, so each rank holds the whole
-reference: the fp64 tail partial rounded once to bf16 per rank, the ranks' sum and the prefix in fp32 as the kernel
-adds them. The kernel's latent rsqrt is not torch's, so a partial element may round to the neighbouring bf16:
-``updated`` is compared within 8e-3 of its largest magnitude (the negative control's wrong pairing is checked against
-the same bound), ``normed`` and the tapped mixture within 2e-2, the tapped ``updated`` bit for bit, every output
-bitwise across the ranks (``_k3_sandwich_common``).
 """
 
 import sys
+import zlib
 from pathlib import Path
 
 import torch
@@ -41,10 +33,10 @@ assert torch.cuda.is_available(), "k3_sandwich_tail requires CUDA devices"
 
 DEADLINE_S = 900
 LAYERS = 12
-SNAPSHOTS = (0, 1, 4, 8)  # candidates 1..9
 CAPTURED_OPTIONS = {3: {"tap": "mix"}, 7: {"updated_out": True}, 10: {"tap": "updated"}}
 
 R = None
+validating = None
 WORKSPACE = None  # the K3SandwichWorkspace type, as this entry's wrapper exports it
 WS_A = None
 WS_B = None
@@ -65,17 +57,22 @@ def check_create_refuses_capture() -> None:
 def check_single_calls() -> None:
     """M 1-8 x snapshots 0, 1, 4, 8 x prefix or none. Call i puts rank r's slice at ((5 r + i) % 16) x 224, so every
     rank takes every slice, lo = 0 to 3360 (the last one's padding columns run past the latent row)."""
-    i = 0
-    for t in cm.TOKENS:
-        for s in SNAPSHOTS:
-            for with_prefix in (True, False):
-                call = cm.TailCall(1000 + 37 * t + s, t, s, prefix=with_prefix or None, weights=t % cm.WEIGHT_SETS,
-                                   shift=i)  # fmt: skip
-                call.verify(
-                    call.run(WS_A),
-                    f"M {t} snapshots {s} prefix {with_prefix} lo {call.los[R.rank]}",
-                )
-                i += 1
+    entry = cm.OPS["tail"]
+    for cell in entry.CELLS:
+        spec = cell.spec
+        if spec["case"] != "single":
+            continue
+        call = cm.TailCall(
+            zlib.crc32(cell.why.encode()),
+            spec["tokens"],
+            spec["snapshots"],
+            prefix=spec["prefix"] or None,
+            weights=spec["weights"],
+            shift=spec["shift"],
+        )
+        with validating(entry):
+            got = call.run(WS_A)
+        call.verify(got, f"{cell.why} lo {call.los[R.rank]}")
 
 
 def check_tap_and_updated_out() -> None:
@@ -83,16 +80,22 @@ def check_tap_and_updated_out() -> None:
     buffer, ``updated`` tapped there, ``updated`` stored into a bank row (then returned as ``updated``). Every call
     against the reference, nothing written outside the tap and the bank row, and the four calls' ``normed`` and
     ``updated`` bit-identical."""
-    for t in cm.TOKENS:
-        base = cm.TailCall(1300 + t, t, 3)
-        got0 = base.run(WS_A)
-        base.verify(got0, f"M {t} no options")
-        for options in ({"tap": "mix"}, {"tap": "updated"}, {"updated_out": True}):
+    entry = cm.OPS["tail"]
+    for cell in entry.CELLS:
+        spec = cell.spec
+        if spec["case"] != "options":
+            continue
+        base = cm.TailCall(zlib.crc32(cell.why.encode()), spec["tokens"], spec["snapshots"])
+        with validating(entry):
+            got0 = base.run(WS_A)
+        base.verify(got0, f"{cell.why} no options")
+        for options in spec["options"]:
             call = base.with_options(**options)
-            got = call.run(WS_A)
-            call.verify(got, f"M {t} {options}")
+            with validating(entry):
+                got = call.run(WS_A)
+            call.verify(got, f"{cell.why} {options}")
             same = all(torch.equal(cm.bits(a), cm.bits(b)) for a, b in zip(got, got0))
-            assert same, f"M {t} {options}: outputs differ from the call without options"
+            assert same, f"{cell.why} {options}: outputs differ from the call without options"
 
 
 def check_counters_advance_once_per_call() -> None:
@@ -122,6 +125,43 @@ def check_unsupported_calls_raise_on_every_rank() -> None:
         ],
         cm.TailCall(2003, 8, 2),
     )
+
+
+def check_guard_rejects_unchecked_tail_inputs() -> None:
+    call = cm.TailCall(2100, 4, 2)
+    args = dict(
+        latent=call.latent,
+        act=call.acts[R.rank],
+        tail_weight=call.weights[R.rank],
+        lo=call.los[R.rank],
+        lat_eps=cm.LAT_EPS,
+        prefix=call.carry,
+        block_residual=call.block,
+        res_weight=call.res_w,
+        rms_weight=call.rms_w,
+        output_rms_weight=call.out_w,
+        rms_eps=cm.RMS_EPS,
+        output_rms_eps=cm.OUT_EPS,
+        workspace=WS_A,
+    )
+    unpadded = call.weights[R.rank].clone()
+    unpadded[:, 224] = 1
+    for invalid in (
+        dict(lo=-224),
+        dict(lo=1),
+        dict(lo=3584),
+        dict(tail_weight=unpadded),
+        dict(prefix=call.carry.float()),
+        dict(block_residual=call.block[:, :-1]),
+        dict(updated_out=call.carry),
+        dict(updated_out=call.block[0]),
+    ):
+        try:
+            cm.OPS["tail"].is_valid(**(args | invalid))
+        except AssertionError:
+            pass
+        else:
+            raise AssertionError(f"guard admitted {tuple(invalid)}")
 
 
 def _step(seed, tokens, options=None):
@@ -193,6 +233,7 @@ CHECKS = [
     check_tap_and_updated_out,
     check_counters_advance_once_per_call,
     check_unsupported_calls_raise_on_every_rank,
+    check_guard_rejects_unchecked_tail_inputs,
     check_dip_and_regrow_sequence,
     check_two_workspaces_interleaved,
     check_graph_capture_and_replay,
@@ -202,12 +243,16 @@ CHECKS = [
 
 
 def _run_one_rank(args) -> int:
-    global R, WORKSPACE, WS_A, WS_B
+    global R, WORKSPACE, WS_A, WS_B, validating
     R = ls.Rank(args)
     from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm.k3_sandwich_tail import (
         K3SandwichWorkspace,
     )
 
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from _validating import validating as validating_context
+
+    validating = validating_context
     WORKSPACE = K3SandwichWorkspace
     with torch.inference_mode():
         cm.bind(R, {"tail": cm.WEIGHT_SETS})

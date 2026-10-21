@@ -29,12 +29,12 @@ References. Every rank draws every rank's head slice and every call's input from
 whole reference. The payloads are exact: x is a multiple of 1/8 in [-1/4, 1/4], the latent-down and shared rows
 multiples of 1/16 in [-1/8, 1/8], the router rows multiples of 1/8 in [-1/4, 1/4] (_lockstep.exact_bf16), so every
 head and shared sum over K = 7168 is a multiple of 1/128 below 2^9 and exact in fp32 in any summation order: the
-front's split-K sums equal the reference's. The reference is the head in fp64 (exact, then fp32; the latent columns
-rounded to bf16), gathered, and the stock trtllm::kimi_k3_noaux_tc_mxfp8_quant on it: the front's routing ids and
-weights, MXFP8 codes and scales must equal it bit for bit (the front routes with k3_route_quant's selection, weights
-and quantization: the kernel's statement), and be bit for bit the same on every rank. The shared activation: this
-rank's gate_up in fp64 (exact) rounded to bf16, SiTU in fp32, within 2e-2 of its largest magnitude (the kernel's tanh
-and sigmoid are fast approximations). The routed partial of the front + k3_moe pair against the stock TRTLLM-Gen
+front's split-K sums equal the reference's. The entry's reference is the head in fp32 (exact for these payloads),
+gathered with latent columns rounded to bf16, then plain-torch routing and MXFP8 quantization. The stock
+trtllm::kimi_k3_noaux_tc_mxfp8_quant on the fp64-exact gathered head retains the bit-for-bit routing, weights,
+codes and scales check across ranks. The shared activation: this rank's gate_up in fp32 (exact) rounded to bf16,
+SiTU in fp32, within 2e-2 of its largest magnitude (the kernel's tanh and sigmoid are fast approximations).
+The routed partial of the front + k3_moe pair against the entry's reference and the stock TRTLLM-Gen
 W4A8_MXFP4_MXFP8 runner on the front's own routing and latent (op-catalog gates: 8 bf16 ulp of the row's max per
 element, 4 ulp relative RMS); the head_flags pair bit for bit against the plain one. Call sequences compare every
 call bit for bit with the same call made alone (itself checked against the references first).
@@ -43,6 +43,7 @@ call bit for bit with the same call made alone (itself checked against the refer
 import math
 import random
 import sys
+import zlib
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -72,7 +73,6 @@ EMPTY = -(2**31)
 WORKSPACE_WORDS = 2 * 8 * (LATENT // 8 + EXPERTS // 4) * 4 + 2 * 8 * 8 * EXPERTS
 ULP = 2.0**-8
 SHARED_TOL = 2e-2
-TOKENS = (1, 2, 3, 4, 5, 6, 7, 8)
 LAYERS = 3
 # Layer l of a step: the front then k3_moe on the plain state, the publishing front then k3_moe on the head_flags state,
 # and the front alone.
@@ -89,6 +89,7 @@ FLAGS = None  # the head_flags K3MoeState and its layers
 LAYER_WEIGHTS = []  # per layer: every rank's head slice, this rank's gate_up and front weight
 BIAS = None
 EXPERT_BUFFERS = None
+EXPERT_RAW = None
 OFFSET = 0
 WL = WE = 0  # latent columns and experts per rank
 STATS = {
@@ -176,29 +177,25 @@ class Call:
 def front_reference(x, layer: int, xs=None):
     """The unfused front for input ``x`` with layer ``layer``'s weights.
 
-    Every rank's head slice of its input (``xs[r]``; default ``x`` on every rank) in fp64 (exact for these payloads),
-    then fp32, gathered (latent columns rounded to bf16); the stock routing + MXFP8 quantization of the gathered head;
-    this rank's shared activation. Returns (ids, weights, quantized, scales, shared).
+    Every rank's head slice of its input (``xs[r]``; default ``x`` on every rank), gathered: the entry's plain-torch
+    reference and the stock routing + MXFP8 quantization of the exact gathered head. The latter retains the byte
+    identity check; the entry's own reference supplies the independent arithmetic and shared activation.
     """
     lw = LAYER_WEIGHTS[layer]
     xs = xs or [x] * R.world
+    ref = OPS.front.reference(
+        xs, lw.heads, lw.gate_up, BIAS, RSF, SHARED_COLS, GATE_CAP, LINEAR_CAP, R.rank
+    )
     heads = [(xr.double() @ w.double().t()).float() for xr, w in zip(xs, lw.heads)]
     latent = torch.cat([h[:, :WL] for h in heads], dim=1).bfloat16().contiguous()
     logits = torch.cat([h[:, WL:] for h in heads], dim=1).contiguous()
-    ids, w, q, s = torch.ops.trtllm.kimi_k3_noaux_tc_mxfp8_quant(logits, BIAS, latent, RSF)
-    gate_up = (xs[R.rank].double() @ lw.gate_up.double().t()).float().bfloat16().float()
-    gate, up = gate_up[:, :SHARED_COLS], gate_up[:, SHARED_COLS:]
-    shared = (
-        GATE_CAP
-        * torch.tanh(gate / GATE_CAP)
-        * torch.sigmoid(gate)
-        * (LINEAR_CAP * torch.tanh(up / LINEAR_CAP))
-    )
-    return ids, w, q, s, shared.bfloat16()
+    stock = torch.ops.trtllm.kimi_k3_noaux_tc_mxfp8_quant(logits, BIAS, latent, RSF)
+    return ref, stock
 
 
 def verify_front(got, ref, where: str) -> None:
     """The front's five outputs against ``ref`` (see the module docstring), and bit for bit across the ranks."""
+    ref, stock = ref
     ids, w, q, s, shared = got
     m = ids.shape[0]
     assert ids.dtype == torch.int32 and tuple(ids.shape) == (m, TOP_K), where
@@ -207,10 +204,13 @@ def verify_front(got, ref, where: str) -> None:
     assert s.dtype == torch.uint8 and tuple(s.shape) == (m, LATENT // SV), where
     assert shared.dtype == torch.bfloat16 and tuple(shared.shape) == (m, SHARED_COLS), where
     names = ("topk_ids", "topk_weights", "quantized", "scales")
-    for name, a, b in zip(names, got[:4], ref[:4]):
+    for name, a, b in zip(names, got[:4], stock):
         if not same(a, b):
             unequal = int((bits(a) != bits(b)).sum()) if a.shape == b.shape else -1
             raise AssertionError(f"{where}: {name} differs from the reference in {unequal} bytes")
+    for i in (0, 2, 3):
+        assert same(got[i], ref[i]), f"{where}: {names[i]} differs from the torch reference"
+    torch.testing.assert_close(w, ref[1], rtol=2**-7, atol=0)
     err = ls.rel_err(shared, ref[4])
     STATS["shared_err"] = max(STATS["shared_err"], err)
     STATS["fronts_checked"] += 1
@@ -387,30 +387,42 @@ def check_front_single_calls() -> None:
     also bit for bit on every rank, in verify_front); after each call this rank's head buffers empty, the sign-in
     count zero, flags[0] flipped once, and the epoch and ready words untouched: the standalone front publishes nothing.
     """
-    base = Call(100, 8, layer=0, kind="front")
-    out8 = base.run(WS_A)
-    torch.cuda.synchronize()
-    verify_front(out8, front_reference(base.x, 0), "front M 8 (base)")
-    for m in TOKENS:
-        call = base.first(m)
-        epoch_words = epoch_and_words(WS_A)
-        flag0 = between_barriers(lambda: int(WS_A.flags[0]))
-        got = call.run(WS_A)
+    for cell in OPS.front.CELLS:
+        if cell.spec["publish"]:
+            continue
+        assert (
+            cell.spec["hidden"],
+            cell.spec["shared_cols"],
+            cell.spec["routed_scaling_factor"],
+            cell.spec["gate_cap"],
+            cell.spec["linear_cap"],
+        ) == (HIDDEN, SHARED_COLS, RSF, GATE_CAP, LINEAR_CAP)
+        base = Call(zlib.crc32(cell.why.encode()), max(cell.spec["ms"]), layer=0, kind="front")
+        out8 = base.run(WS_A)
         torch.cuda.synchronize()
-        flag1 = between_barriers(lambda: int(WS_A.flags[0]))
-        assert flag1 == flag0 ^ 1, f"front M {m}: buffer index {flag0} -> {flag1}"
-        assert workspace_rearmed(WS_A), f"front M {m}: head buffers not re-armed after the call"
-        verify_front(got, front_reference(call.x, 0), f"front M {m}")
-        again = [call.run(WS_A) for _ in range(2)]
-        torch.cuda.synchronize()
-        assert all(same_result(a, got) for a in again), f"front M {m}: not run-to-run identical"
-        assert same_result(got, [t[:m] for t in out8]), (
-            f"front M {m}: rows differ from the 8-token call's"
-        )
-        assert workspace_rearmed(WS_A), f"front M {m}: head buffers not re-armed after the re-runs"
-        assert epoch_and_words(WS_A) == epoch_words, (
-            f"front M {m}: the standalone front moved the ready words"
-        )
+        verify_front(out8, front_reference(base.x, 0), "front M 8 (base)")
+        for m in cell.spec["ms"]:
+            call = base.first(m)
+            epoch_words = epoch_and_words(WS_A)
+            flag0 = between_barriers(lambda: int(WS_A.flags[0]))
+            got = call.run(WS_A)
+            torch.cuda.synchronize()
+            flag1 = between_barriers(lambda: int(WS_A.flags[0]))
+            assert flag1 == flag0 ^ 1, f"front M {m}: buffer index {flag0} -> {flag1}"
+            assert workspace_rearmed(WS_A), f"front M {m}: head buffers not re-armed after the call"
+            verify_front(got, front_reference(call.x, 0), f"front M {m}")
+            again = [call.run(WS_A) for _ in range(2)]
+            torch.cuda.synchronize()
+            assert all(same_result(a, got) for a in again), f"front M {m}: not run-to-run identical"
+            assert same_result(got, [t[:m] for t in out8]), (
+                f"front M {m}: rows differ from the 8-token call's"
+            )
+            assert workspace_rearmed(WS_A), (
+                f"front M {m}: head buffers not re-armed after the re-runs"
+            )
+            assert epoch_and_words(WS_A) == epoch_words, (
+                f"front M {m}: the standalone front moved the ready words"
+            )
 
 
 def check_front_and_k3_moe_single_calls() -> None:
@@ -423,30 +435,56 @@ def check_front_and_k3_moe_single_calls() -> None:
     FC2 groups a token's expert terms by the step's group count; bit-identity counted) and the shared rows their bits;
     run-to-run identical bits; afterwards both states armed with every counter zero and the head buffers empty.
     """
-    base = Call(200, 8, layer=0, kind="fused")
-    y8, sh8 = base.run(WS_A)
-    torch.cuda.synchronize()
-    verify_fused((y8, sh8), base, WS_A, "fused M 8 (base)")
-    for m in TOKENS:
-        plain = base.first(m)
-        got = plain.run(WS_A)
-        torch.cuda.synchronize()
-        verify_fused(got, plain, WS_A, f"fused M {m}")
-        y, sh = got
-        y_flags, sh_flags = flags_call_checked(plain.as_kind("flags"), WS_A, f"head_flags M {m}")
-        assert same(y_flags, y) and same(sh_flags, sh), (
-            f"M {m}: the head_flags build differs from the plain one"
+    for cell in OPS.k3_moe.CELLS:
+        if cell.spec["build"] != "front":
+            continue
+        front_cell = next(
+            c for c in OPS.front.CELLS if c.spec["publish"] == cell.spec["head_flags"]
         )
-        ulp = max_ulp(y, y8[:m])
-        STATS["rows_checked"] += 1
-        STATS["rows_bits_as_m8"] += int(same(y, y8[:m]))
-        assert ulp <= 1, f"fused M {m}: rows {ulp} ulp from the 8-token call's"
-        assert same(sh, sh8[:m]), f"fused M {m}: shared rows differ from the 8-token call's"
-        rerun = plain.run(WS_A)
+        assert front_cell.spec["ms"] == cell.spec["ms"]
+        assert (
+            front_cell.spec["hidden"],
+            front_cell.spec["shared_cols"],
+            front_cell.spec["routed_scaling_factor"],
+            front_cell.spec["gate_cap"],
+            front_cell.spec["linear_cap"],
+        ) == (HIDDEN, SHARED_COLS, RSF, GATE_CAP, LINEAR_CAP)
+        seed = zlib.crc32(cell.why.encode()) ^ zlib.crc32(front_cell.why.encode())
+        base = Call(seed, max(cell.spec["ms"]), layer=0, kind="fused")
+        y8, sh8 = base.run(WS_A)
         torch.cuda.synchronize()
-        assert same_result(rerun, got), f"fused M {m}: not run-to-run identical"
-        assert moe_rearmed(), f"fused M {m}: a k3_moe slab is not armed or a counter is not zero"
-        assert workspace_rearmed(WS_A), f"fused M {m}: head buffers not re-armed"
+        verify_fused((y8, sh8), base, WS_A, "fused M 8 (base)")
+        for m in cell.spec["ms"]:
+            plain = base.first(m)
+            got = plain.run(WS_A)
+            torch.cuda.synchronize()
+            verify_fused(got, plain, WS_A, f"fused M {m}")
+            y, sh = got
+            if cell.spec["head_flags"]:
+                y_flags, sh_flags = flags_call_checked(
+                    plain.as_kind("flags"), WS_A, f"head_flags M {m}"
+                )
+                assert same(y_flags, y) and same(sh_flags, sh), (
+                    f"M {m}: the head_flags build differs from the plain one"
+                )
+            front = plain.as_kind("front").run(WS_A)
+            verify_front(front, front_reference(plain.x, 0), f"paired front M {m}")
+            ids, weights, q, s, _ = front
+            ref = OPS.k3_moe.reference(EXPERT_RAW, q, s, ids, weights, OFFSET)
+            elt, rms, ok = compare(y, ref)
+            assert ok, f"fused M {m}: torch reference {elt:.2f} ulp per element, {rms:.2f} ulp RMS"
+            ulp = max_ulp(y, y8[:m])
+            STATS["rows_checked"] += 1
+            STATS["rows_bits_as_m8"] += int(same(y, y8[:m]))
+            assert ulp <= 1, f"fused M {m}: rows {ulp} ulp from the 8-token call's"
+            assert same(sh, sh8[:m]), f"fused M {m}: shared rows differ from the 8-token call's"
+            rerun = plain.run(WS_A)
+            torch.cuda.synchronize()
+            assert same_result(rerun, got), f"fused M {m}: not run-to-run identical"
+            assert moe_rearmed(), (
+                f"fused M {m}: a k3_moe slab is not armed or a counter is not zero"
+            )
+            assert workspace_rearmed(WS_A), f"fused M {m}: head buffers not re-armed"
 
 
 def check_head_flags_epoch_wraps() -> None:
@@ -843,6 +881,8 @@ def make_experts(seed: int):
         w2=torch.empty(E_LOCAL, LATENT, I_TP // 2, **kw),
         w2s=torch.empty(E_LOCAL, LATENT, I_TP // SV, **kw),
     )
+    raw = {name: [] for name in ("up", "up_s", "gate", "gate_s", "down", "down_s")}
+    lo, hi = I_TP, 2 * I_TP
     gen = torch.Generator(device="cuda").manual_seed(seed)
     for e in range(E_LOCAL):
         w1, w1s = rand_mxfp4(i_full, LATENT, gen)
@@ -852,8 +892,14 @@ def make_experts(seed: int):
         method.load_expert_w2_weight(module, w2, proc["w2"][e])
         method.load_expert_w3_w1_weight_scale_mxfp4(module, w1s, w3s, proc["w31s"][e])
         method.load_expert_w2_weight_scale_mxfp4(module, w2s, proc["w2s"][e])
+        raw["up"].append(w3[lo:hi])
+        raw["up_s"].append(w3s[lo:hi])
+        raw["gate"].append(w1[lo:hi])
+        raw["gate_s"].append(w1s[lo:hi])
+        raw["down"].append(w2[:, lo // 2 : hi // 2].contiguous())
+        raw["down_s"].append(w2s[:, lo // SV : hi // SV].contiguous())
     torch.cuda.synchronize()
-    return proc
+    return proc, raw
 
 
 def make_layer_weights(layer: int, front_weight):
@@ -885,11 +931,15 @@ def make_state(head_flags: bool):
 
 def _run_one_rank(args) -> int:
     global R, OPS, WS_A, WS_B, PLAIN, FLAGS, LAYER_WEIGHTS, BIAS, EXPERT_BUFFERS, OFFSET, WL, WE
+    global EXPERT_RAW
     R = ls.Rank(args)
     assert torch.cuda.get_device_capability() == (10, 0), "k3_moe_front and k3_moe need sm_100"
     import tensorrt_llm._torch.custom_ops  # noqa: F401 -- registers the stock path's ops
     from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe import k3_moe as moe
     from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe import k3_moe_front as front
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from _validating import validating
 
     OPS = SimpleNamespace(
         front=front.k3_moe_front,
@@ -899,7 +949,7 @@ def _run_one_rank(args) -> int:
     )
     WL, WE = LATENT // R.world, EXPERTS // R.world
     OFFSET = (R.rank % MOE_TP) * E_LOCAL
-    with torch.inference_mode():
+    with torch.inference_mode(), validating(OPS.front, OPS.k3_moe):
         device = torch.device("cuda", torch.cuda.current_device())
         assert front.weight_supported(R.world, SHARED_COLS, HIDDEN, device), (
             f"k3_moe_front does not support W {R.world} with {SHARED_COLS} shared columns on this device"
@@ -907,7 +957,7 @@ def _run_one_rank(args) -> int:
         g = torch.Generator(device="cuda").manual_seed(11)
         BIAS = (torch.randn(EXPERTS, generator=g, device="cuda") * 0.05).float()
         LAYER_WEIGHTS = [make_layer_weights(layer, front.front_weight) for layer in range(LAYERS)]
-        EXPERT_BUFFERS = make_experts(20260928 + R.rank)
+        EXPERT_BUFFERS, EXPERT_RAW = make_experts(20260928 + R.rank)
         WS_A = OPS.workspace.create(R.mapping, fabric_handle=R.fabric)
         WS_B = OPS.workspace.create(R.mapping, fabric_handle=R.fabric)
         PLAIN = make_state(head_flags=False)

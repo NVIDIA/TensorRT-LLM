@@ -27,6 +27,7 @@ the ranks (``_k3_sandwich_common``).
 """
 
 import sys
+import zlib
 from pathlib import Path
 
 import torch
@@ -41,6 +42,7 @@ DEADLINE_S = 900
 DRAFTER_LAYERS = 6  # two calls each: 12 per step
 
 R = None
+validating = None
 WORKSPACE = None  # the K3SandwichWorkspace type, as this entry's wrapper exports it
 WS_A = None
 WS_B = None
@@ -60,12 +62,18 @@ def check_create_refuses_capture() -> None:
 
 def check_single_calls() -> None:
     """M 1-8 x both forms x two draws."""
-    for t in cm.TOKENS:
-        for swiglu in (False, True):
-            for draw in (0, 1):
-                call = cm.PlainCall(1000 + 37 * t + 7 * draw + int(swiglu), t, swiglu=swiglu,
-                                    weights=(t + draw) % cm.WEIGHT_SETS)  # fmt: skip
-                call.verify(call.run(WS_A), f"M {t} swiglu {swiglu} draw {draw}")
+    entry = cm.OPS["plain"]
+    for cell in entry.CELLS:
+        spec = cell.spec
+        call = cm.PlainCall(
+            zlib.crc32(cell.why.encode()),
+            spec["tokens"],
+            swiglu=spec["swiglu"],
+            weights=spec["weights"],
+        )
+        with validating(entry):
+            got = call.run(WS_A)
+        call.verify(got, cell.why)
 
 
 def check_counters_advance_once_per_call() -> None:
@@ -169,12 +177,16 @@ CHECKS = [
 
 
 def _run_one_rank(args) -> int:
-    global R, WORKSPACE, WS_A, WS_B
+    global R, WORKSPACE, WS_A, WS_B, validating
     R = ls.Rank(args)
     from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm.k3_sandwich_plain import (
         K3SandwichWorkspace,
     )
 
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from _validating import validating as validating_context
+
+    validating = validating_context
     WORKSPACE = K3SandwichWorkspace
     with torch.inference_mode():
         cm.bind(R, {"plain": cm.WEIGHT_SETS, "down": cm.WEIGHT_SETS})

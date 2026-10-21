@@ -30,6 +30,7 @@ own matrices: sums bit for bit (small multiples of 1/16), normed outputs within 
 import copy
 import random
 import sys
+import zlib
 from pathlib import Path
 
 import torch
@@ -75,6 +76,7 @@ allgather_split = None
 required_buffer_bytes = None
 fusion_allreduce = None
 allreduce_attn_res = None
+validating = None
 MnnvlWorkspace = None
 BUFFER_BYTES = None
 WS_A = None
@@ -102,13 +104,6 @@ def bits(t: torch.Tensor) -> torch.Tensor:
 
 def bits_equal(a: torch.Tensor, b: torch.Tensor) -> bool:
     return a.shape == b.shape and a.dtype == b.dtype and torch.equal(bits(a), bits(b))
-
-
-def positive_zero(t: torch.Tensor) -> torch.Tensor:
-    """``t`` with every -0.0 made +0.0, by bit pattern: the Lamport buffers' empty word never travels."""
-    words = bits(t)
-    sign = torch.iinfo(words.dtype).min
-    return torch.where(words == sign, torch.zeros_like(words), words).view(t.dtype)
 
 
 def one_shot_bytes(tokens: int, hidden: int) -> int:
@@ -195,12 +190,7 @@ class AG:
         return allgather_split(self.inputs[R.rank] if x is None else x, self.bf16_columns, ws)
 
     def ref(self):
-        """Every rank's leading columns rounded to bf16 by torch (round to nearest even) and its other columns as
-        they are, in rank order, -0.0 made +0.0."""
-        b = self.bf16_columns
-        bf16_out = torch.cat([x[:, :b] for x in self.inputs], dim=1).bfloat16()
-        fp32_out = torch.cat([x[:, b:] for x in self.inputs], dim=1)
-        return positive_zero(bf16_out), positive_zero(fp32_out)
+        return allgather_split.reference(self.inputs, self.bf16_columns)
 
     def verify(self, got, where: str) -> None:
         want = self.ref()
@@ -269,13 +259,9 @@ class AR:
         return fusion_allreduce(x, ws, self.one_shot_max_bytes, residual, self.gamma, EPS)
 
     def ref(self):
-        total = positive_zero(torch.stack([x.float() for x in self.inputs]).sum(dim=0))
-        if not self.fused:
-            return total.bfloat16()
-        updated = (total + self.residual.float()).bfloat16()
-        x = updated.float()
-        normed = x * torch.rsqrt(x.square().mean(dim=-1, keepdim=True) + EPS) * self.gamma.float()
-        return normed.bfloat16(), updated
+        return fusion_allreduce.reference(
+            self.inputs, self.residual, self.gamma, EPS if self.fused else None
+        )
 
     def verify(self, got, where: str) -> None:
         want = self.ref()
@@ -346,11 +332,9 @@ class AttnRes:
         )
 
     def ref(self):
-        updated = (sum(x.float() for x in self.inputs) + self.prefix.float()).bfloat16()
-        normed = ls.residual_update_ref(
-            updated, self.block, self.res_w, self.rms_w, EPS, self.out_w, EPS
+        return allreduce_attn_res.reference(
+            self.inputs, self.prefix, self.block, self.res_w, self.rms_w, self.out_w, EPS, EPS
         )
-        return normed, updated
 
     def verify(self, got, where: str) -> None:
         (normed, updated), (want_normed, want_updated) = got, self.ref()
@@ -423,11 +407,15 @@ def check_single_calls() -> None:
     """Every certified split at every certified token count, one call after the other on one workspace, bit for bit
     against the reference (the rounding, ties to even, -0.0, special fp32 words), the flags after each recording one
     stage and the bytes the call wrote, which equal required_buffer_bytes."""
-    for b, f in SPLITS:
-        for t in TOKENS:
-            where = f"T {t} split {b} + {f}"
-            call = AG(1000 + 37 * t + b, t, b, f)
-            call_and_check(call, WS_A, where)
+    for cell in allgather_split.CELLS:
+        spec = cell.spec
+        b, f = spec["bf16_columns"], spec["fp32_columns"]
+        seed = zlib.crc32(cell.why.encode())
+        for t in spec["tokens"]:
+            where = f"{cell.why}: T {t}"
+            call = AG(seed + t, t, b, f)
+            with validating(allgather_split):
+                call_and_check(call, WS_A, where)
             need = required_buffer_bytes(t, b, f, R.world)
             assert need == call.record()[1][0], f"{where}: required_buffer_bytes {need}"
 
@@ -705,6 +693,7 @@ CHECKS = [
 def _run_one_rank(args) -> int:
     global R, allgather_split, required_buffer_bytes, fusion_allreduce, allreduce_attn_res
     global MnnvlWorkspace, BUFFER_BYTES, WS_A, WS_B
+    global validating
     R = ls.Rank(args)
     assert R.world in (2, 4, 8, 16), f"K3's shapes shard over 2, 4, 8 or 16 ranks, not {R.world}"
     from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm import (
@@ -716,6 +705,11 @@ def _run_one_rank(args) -> int:
     from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm import (
         mnnvl_fusion_allreduce as reduce_module,
     )
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from _validating import validating as validating_cm
+
+    validating = validating_cm
 
     allgather_split = module.mnnvl_allgather_split
     required_buffer_bytes = module.required_buffer_bytes

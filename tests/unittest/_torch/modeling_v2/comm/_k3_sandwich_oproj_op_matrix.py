@@ -27,6 +27,7 @@ output bitwise across the ranks (``_k3_sandwich_common``).
 
 import random
 import sys
+import zlib
 from pathlib import Path
 
 import torch
@@ -39,13 +40,13 @@ assert torch.cuda.is_available(), "k3_sandwich_oproj requires CUDA devices"
 
 DEADLINE_S = 900
 LAYERS = 12
-SNAPSHOTS = (0, 1, 4, 8)  # candidates 1..9
 TARGET_LAYERS = 3  # the shared step's target layers (one o_weight set each)
 SHARED_STEPS = ((8, 3), (2, 8), (7, 7))  # (target M, drafter M) of the eager shared steps
 SHARED_CAPTURED = (8, 4)
 SHARED_REPLAYS = 6
 
 R = None
+validating = None
 WORKSPACE = None  # the K3SandwichWorkspace type, as this entry's wrapper exports it
 WS_A = None
 WS_B = None
@@ -64,13 +65,19 @@ def check_create_refuses_capture() -> None:
 
 
 def check_single_calls() -> None:
-    for t in cm.TOKENS:
-        for s in SNAPSHOTS:
-            for with_prefix in (True, False):
-                call = cm.OprojCall(
-                    1000 + 37 * t + s, t, s, prefix=with_prefix or None, weights=t % cm.WEIGHT_SETS
-                )
-                call.verify(call.run(WS_A), f"M {t} snapshots {s} prefix {with_prefix}")
+    entry = cm.OPS["oproj"]
+    for cell in entry.CELLS:
+        spec = cell.spec
+        call = cm.OprojCall(
+            zlib.crc32(cell.why.encode()),
+            spec["tokens"],
+            spec["snapshots"],
+            prefix=spec["prefix"] or None,
+            weights=spec["weights"],
+        )
+        with validating(entry):
+            got = call.run(WS_A)
+        call.verify(got, cell.why)
 
 
 def check_counters_advance_once_per_call() -> None:
@@ -81,6 +88,37 @@ def check_unsupported_shape_raises_on_every_rank() -> None:
     """M 9 raises ValueError on every rank before any launch; the next call is correct."""
     bad = cm.OprojCall(2000, 9, 1)
     cm.unsupported_raises(WS_A, [("M 9", lambda: bad.run(WS_A))], cm.OprojCall(2001, 8, 2))
+
+
+def check_guard_rejects_unchecked_residual_inputs() -> None:
+    call = cm.OprojCall(2100, 4, 2)
+    args = dict(
+        core=call.cores[R.rank],
+        o_weight=call.weights[R.rank],
+        prefix=call.carry,
+        block_residual=call.block,
+        res_weight=call.res_w,
+        rms_weight=call.rms_w,
+        output_rms_weight=call.out_w,
+        rms_eps=cm.RMS_EPS,
+        output_rms_eps=cm.OUT_EPS,
+        workspace=WS_A,
+    )
+    for invalid in (
+        dict(prefix=call.carry.float()),
+        dict(prefix=call.carry[:, :-2]),
+        dict(block_residual=call.block.float()),
+        dict(block_residual=call.block[:, :-1]),
+        dict(res_weight=call.res_w.float()),
+        dict(rms_weight=call.rms_w[:-2]),
+        dict(output_rms_weight=call.out_w.float()),
+    ):
+        try:
+            cm.OPS["oproj"].is_valid(**(args | invalid))
+        except AssertionError:
+            pass
+        else:
+            raise AssertionError(f"guard admitted {tuple(invalid)}")
 
 
 def _step(seed, tokens):
@@ -213,6 +251,7 @@ CHECKS = [
     check_single_calls,
     check_counters_advance_once_per_call,
     check_unsupported_shape_raises_on_every_rank,
+    check_guard_rejects_unchecked_residual_inputs,
     check_dip_and_regrow_sequence,
     check_two_workspaces_interleaved,
     check_graph_capture_and_replay,
@@ -224,12 +263,16 @@ CHECKS = [
 
 
 def _run_one_rank(args) -> int:
-    global R, WORKSPACE, WS_A, WS_B
+    global R, WORKSPACE, WS_A, WS_B, validating
     R = ls.Rank(args)
     from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm.k3_sandwich_oproj import (
         K3SandwichWorkspace,
     )
 
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from _validating import validating as validating_context
+
+    validating = validating_context
     WORKSPACE = K3SandwichWorkspace
     with torch.inference_mode():
         cm.bind(R, {"oproj": cm.WEIGHT_SETS, "tail": 1, "plain": 1, "down": 1})

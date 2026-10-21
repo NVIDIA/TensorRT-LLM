@@ -9,9 +9,9 @@ and the stock runner read. Every call routes with moe/k3_route_quant first (its 
 launches k3_moe as a programmatic dependent), as a target does.
 
 References: the stock path (trtllm::kimi_k3_noaux_tc_mxfp8_quant, then the TRTLLM-Gen W4A8_MXFP4_MXFP8 MoE runner on
-those ids) and an fp64 reference over the dequantized MXFP4 experts (SiTU, the MXFP8 intermediate with the round-up
-scale, the down projection, the routing-weighted sum), both under the op-catalog gates: 8 bf16 ulp of the token row's
-largest magnitude per element, 4 ulp relative RMS. Everything about state is compared bit for bit.
+those ids) and the entry's fp32 reference over the dequantized MXFP4 experts (SiTU, the MXFP8 intermediate with the
+round-up scale, the down projection, the routing-weighted sum), both under the op-catalog gates: 8 bf16 ulp of the token
+row's largest magnitude per element, 4 ulp relative RMS. Everything about state is compared bit for bit.
 
 The checks run in file order and share the state objects: a K3MoeState with layers A, B, C (A and C over this rank's
 experts, B over other experts), a second K3MoeState, a K3MoeWideState with layers A and B. Each check makes its own
@@ -25,6 +25,7 @@ The head_flags build needs the TP group's head workspace and the MoE front: its 
 import contextlib
 import functools
 import math
+import zlib
 from types import SimpleNamespace
 
 import pytest
@@ -39,6 +40,9 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.k3_moe import (
 )
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.k3_route_quant import k3_route_quant
 
+__extra_import_path__ = [".."]
+from _validating import validating
+
 H, TOP_K, NUM_EXPERTS, SV = 3584, 16, 896, 32
 I_TP, E_LOCAL, MOE_TP, TP_RANK, EP_RANK = 768, 224, 4, 1, 1  # one rank of experts TP4 x EP4
 OFFSET = EP_RANK * E_LOCAL  # this rank's experts: global ids [224, 448)
@@ -46,16 +50,11 @@ OFFSET = EP_RANK * E_LOCAL  # this rank's experts: global ids [224, 448)
 GATE_CAP, LINEAR_CAP = 4.0, 25.0
 RSF = 2.827
 ULP = 2.0**-8
-E4M3_MAX = 448.0
 DECODE_MAX, WIDE_MAX = 8, 64
 DEV = "cuda"
-DECODE_CASES = ("random", "16_local_disjoint", "none_local")
-WIDE_CASES = ("random", "group_cap", "none_local")
-WIDE_M = (1, 2, 7, 8, 9, 16, 33, 40, 64)
 DIP_STEPS = (8, 8, 8, 2, 7, 8, 1, 1, 8, 3, 8)
 WIDE_DIP_STEPS = (64, 64, 16, 1, 40, 64, 8, 23, 64, 9, 64)
 REPLAYS = 6
-_E2M1 = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0]
 _CASE_SALT = {"random": 0, "16_local_disjoint": 1, "none_local": 2, "group_cap": 3}
 
 
@@ -69,7 +68,7 @@ pytestmark = pytest.mark.skipif(not _is_sm100(), reason="k3_moe needs sm_100")
 @pytest.fixture(autouse=True)
 def _inference_mode():
     """Run every check as the model runs these ops, under inference mode."""
-    with torch.inference_mode():
+    with torch.inference_mode(), validating(k3_moe):
         yield
 
 
@@ -179,7 +178,7 @@ def _chosen_logits(chosen, gen):
 
 
 @functools.lru_cache(maxsize=None)
-def _tokens(case: str, rows: int):
+def _tokens(case: str, rows: int, seed=None):
     """``rows`` tokens of a routing case: router logits fp32 [rows, 896] and the latent bf16 [rows, 3584].
 
     random: logits N(0, 3^2). none_local: no local expert in any token's top-16. 16_local_disjoint: 16 local experts
@@ -187,7 +186,7 @@ def _tokens(case: str, rows: int):
     local experts with 9 of the 64 tokens and 124 with one (324 groups at M 64, the wide build's group capacity).
     A call of M tokens takes the first M rows.
     """
-    seed = 7 + 1000 * _CASE_SALT[case] + rows
+    seed = 7 + 1000 * _CASE_SALT[case] + rows if seed is None else seed
     gen = torch.Generator(device=DEV).manual_seed(seed)
     cpu = torch.Generator().manual_seed(seed)
     x = torch.randn(rows, H, generator=gen, device=DEV).bfloat16()
@@ -316,56 +315,6 @@ def _cold_k3_moe_cache():
 
 
 # ── references ────────────────────────────────────────────────────────────
-
-
-def _deq_w(packed, sf):
-    lut = torch.tensor(_E2M1, device=packed.device)
-    vals = torch.empty(packed.shape[0], packed.shape[1] * 2, device=packed.device)
-    vals[:, 0::2] = lut[(packed & 0xF).long()]
-    vals[:, 1::2] = lut[(packed >> 4).long()]
-    return vals * torch.exp2(sf.float() - 127.0).repeat_interleave(SV, dim=1)
-
-
-def _deq_x(x_fp8, x_sf):
-    rows, k = x_fp8.shape
-    scale = torch.exp2(x_sf.reshape(rows, k // SV).float() - 127.0).repeat_interleave(SV, dim=1)
-    return x_fp8.float() * scale
-
-
-def _requant(act):
-    """The FC1 epilogue's MXFP8 requantization per 32 columns (round-up scale), dequantized."""
-    rows, cols = act.shape
-    blocks = act.reshape(rows, cols // SV, SV)
-    amax = blocks.abs().amax(dim=-1, keepdim=True)
-    ex = torch.ceil(torch.log2(amax / E4M3_MAX))
-    ex = torch.where(amax == 0, torch.full_like(amax, -127.0), ex).clamp(-127.0, 127.0)
-    scale = torch.exp2(ex)
-    q8 = (blocks / scale).clamp(-E4M3_MAX, E4M3_MAX).to(torch.float8_e4m3fn)
-    return (q8.float() * scale).reshape(rows, cols)
-
-
-def _reference(raw, x_deq, ids, weights):
-    """fp64 routed MoE over this rank's experts from the checkpoint tensors.
-
-    SiTU, the MXFP8 intermediate, the down projection, the routing-weighted sum.
-    """
-    out = torch.zeros(x_deq.shape[0], H, device=DEV)
-    for e in range(E_LOCAL):
-        tok, slot = (ids == OFFSET + e).nonzero(as_tuple=True)
-        if tok.numel() == 0:
-            continue
-        xe = x_deq[tok].double()
-        up = (xe @ _deq_w(raw["up"][e], raw["up_s"][e]).double().t()).float()
-        gate = (xe @ _deq_w(raw["gate"][e], raw["gate_s"][e]).double().t()).float()
-        act = (
-            GATE_CAP
-            * torch.tanh(gate / GATE_CAP)
-            * torch.sigmoid(gate)
-            * (LINEAR_CAP * torch.tanh(up / LINEAR_CAP))
-        )
-        y = (_requant(act).double() @ _deq_w(raw["down"][e], raw["down_s"][e]).double().t()).float()
-        out.index_add_(0, tok, y * weights[tok, slot].float().unsqueeze(1))
-    return out
 
 
 def _compare(y, ref):
@@ -504,18 +453,26 @@ def test_state_armed_and_sized():
     assert _armed(wide, [wide_layer])
 
 
-@pytest.mark.parametrize("m", range(1, DECODE_MAX + 1))
-@pytest.mark.parametrize("case", DECODE_CASES)
-def test_k3_moe_single_call(case, m):
-    """One call of M tokens on the K3MoeState's layer A against the fp64 reference and the stock path.
+@pytest.mark.parametrize(
+    "cell,m",
+    [
+        pytest.param(cell, m, id=f"{cell.spec['case']}-m{m}")
+        for cell in k3_moe.CELLS
+        if cell.spec["build"] == "m8" and not cell.spec.get("out", False)
+        for m in cell.spec["ms"]
+    ],
+)
+def test_k3_moe_single_call(cell, m):
+    """One call of M tokens on the K3MoeState's layer A against the fp32 reference and the stock path.
 
     Also: run-to-run identical bits; each row within one bf16 ulp of the same row of the 8-token call (the slice FC2
     adds a token's expert terms in slices whose bounds follow the step's group count; bit-identity is reported); the
     slab armed and every counter zero after the call; at 16_local_disjoint M 8 the group count at the capacity, 128.
     """
+    case = cell.spec["case"]
     proc, raw, bias = _experts()
     state, layers = _decode()
-    logits8, x8 = _tokens(case, DECODE_MAX)
+    logits8, x8 = _tokens(case, DECODE_MAX, zlib.crc32(cell.why.encode()))
     logits, x = logits8[:m].contiguous(), x8[:m].contiguous()
     y = _call(layers[0], logits, x)
     torch.cuda.synchronize()
@@ -530,6 +487,8 @@ def test_k3_moe_single_call(case, m):
     y8 = _call(layers[0], logits8, x8)
     ulp_m8 = _max_ulp(y, y8[:m])
     y_stock, ids, w, x_fp8, x_sf = _stock(proc, bias, x, logits)
+    ref = k3_moe.reference(raw, x_fp8, x_sf, ids, w, OFFSET)
+    assert _compare(y, ref)["ok"]
     local = _local_pairs(ids)
     groups = int(torch.unique(ids[(ids >= OFFSET) & (ids < OFFSET + E_LOCAL)]).numel())
     if case == "16_local_disjoint":
@@ -544,7 +503,6 @@ def test_k3_moe_single_call(case, m):
         )
         assert zeros and det and ulp_m8 == 0 and rearmed
         return
-    ref = _reference(raw, _deq_x(x_fp8, x_sf), ids, w).bfloat16()
     c_ref, c_stock, c_stock_ref = _compare(y, ref), _compare(y, y_stock), _compare(y_stock, ref)
     print(
         f"OPCHECK op=k3_moe build=m8 case={case} M={m} local_pairs={local} groups={groups} "
@@ -557,19 +515,27 @@ def test_k3_moe_single_call(case, m):
     assert det and ulp_m8 <= 1 and rearmed
 
 
-@pytest.mark.parametrize("m", WIDE_M)
-@pytest.mark.parametrize("case", WIDE_CASES)
-def test_k3_moe_wide_single_call(case, m):
-    """One call of M tokens on the K3MoeWideState's layer A against the fp64 reference and the stock path.
+@pytest.mark.parametrize(
+    "cell,m",
+    [
+        pytest.param(cell, m, id=f"{cell.spec['case']}-m{m}")
+        for cell in k3_moe.CELLS
+        if cell.spec["build"] == "m64" and not cell.spec.get("out", False)
+        for m in cell.spec["ms"]
+    ],
+)
+def test_k3_moe_wide_single_call(cell, m):
+    """One call of M tokens on the K3MoeWideState's layer A against the fp32 reference and the stock path.
 
     Also: run-to-run identical bits; the slab armed and every counter zero after the call; at M <= 8 within one bf16
     ulp of the M <= 8 build on the same experts (bit-identity reported); at group_cap M 64 the group count at the
     capacity, 324.
     """
+    case = cell.spec["case"]
     proc, raw, bias = _experts()
     state, layers = _wide()
     _, decode_layers = _decode()
-    logits64, x64 = _tokens(case, WIDE_MAX)
+    logits64, x64 = _tokens(case, WIDE_MAX, zlib.crc32(cell.why.encode()))
     logits, x = logits64[:m].contiguous(), x64[:m].contiguous()
     y = _call(layers[0], logits, x)
     torch.cuda.synchronize()
@@ -577,6 +543,8 @@ def test_k3_moe_wide_single_call(case, m):
     assert y.shape == (m, H) and y.dtype == torch.bfloat16 and y.is_contiguous()
     det = all(_same(_call(layers[0], logits, x), y) for _ in range(2))
     y_stock, ids, w, x_fp8, x_sf = _stock(proc, bias, x, logits)
+    ref = k3_moe.reference(raw, x_fp8, x_sf, ids, w, OFFSET)
+    assert _compare(y, ref)["ok"]
     groups = _groups_wide(ids)
     if case == "group_cap" and m == WIDE_MAX:
         assert groups == state.mod.G_CAP == 324
@@ -595,7 +563,6 @@ def test_k3_moe_wide_single_call(case, m):
         )
         assert zeros and det and rearmed
         return
-    ref = _reference(raw, _deq_x(x_fp8, x_sf), ids, w).bfloat16()
     c_ref, c_stock, c_stock_ref = _compare(y, ref), _compare(y, y_stock), _compare(y_stock, ref)
     print(
         f"OPCHECK op=k3_moe build=m64 case={case} M={m} local_pairs={local} groups={groups} "
@@ -635,15 +602,25 @@ def test_routing_from_a_parameter_that_requires_grad():
     )
 
 
-@pytest.mark.parametrize("build,m", [("m8", 3), ("m8", 8), ("m64", 9), ("m64", 64)])
-def test_k3_moe_out_buffer(build, m):
+@pytest.mark.parametrize(
+    "cell,m",
+    [
+        pytest.param(cell, m, id=f"{cell.spec['build']}-m{m}")
+        for cell in k3_moe.CELLS
+        if cell.spec.get("out", False)
+        for m in cell.spec["ms"]
+    ],
+)
+def test_k3_moe_out_buffer(cell, m):
     """``out``: the call writes out[:M], the bits of the call without ``out``, and returns an empty [0, 3584] tensor.
 
     The rows of ``out`` past M keep their bits.
     """
-    layer = (_decode() if build == "m8" else _wide())[1][0]
-    logits, x = _draw(900 + m, m)
+    layer = (_decode() if cell.spec["build"] == "m8" else _wide())[1][0]
+    logits, x = _draw(zlib.crc32(cell.why.encode()) + m, m)
     want = _call(layer, logits, x)
+    ids, weights, q, s = _route(layer, logits, x)
+    assert _compare(want, k3_moe.reference(_experts()[1], q, s, ids, weights, OFFSET))["ok"]
     out = torch.full((WIDE_MAX + 3, H), -3.0, dtype=torch.bfloat16, device=DEV)
     tail = out[m:].clone()
     got = _call(layer, logits, x, out=out)

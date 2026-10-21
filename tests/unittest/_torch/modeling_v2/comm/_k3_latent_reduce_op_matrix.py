@@ -34,6 +34,7 @@ Every output is also compared bitwise across the ranks.
 
 import random
 import sys
+import zlib
 from pathlib import Path
 from typing import List, Optional, Sequence
 
@@ -52,7 +53,6 @@ RANK_CHUNK = 8  # the one-shot sums the ranks in chunks of 8
 EMPTY_WORD = -(2**31)  # 0x80000000: a word no producer has written
 NEG_ZERO = -(2**15)  # bf16 -0.0 as int16, which the producers store as +0.0
 WORLDS = (4, 8, 16)  # the op's TP sizes
-TOKENS = (1, 2, 3, 4, 5, 6, 7, 8)
 LAYERS = 12  # even: a captured step keeps the halves' parity (check_graph_capture_and_replay)
 DIP_STEPS = (8, 8, 8, 2, 7, 8, 1, 1, 8, 3, 8)
 # One step of LAYERS calls whose M dips and grows back (check_ranks_run_a_step_apart).
@@ -67,6 +67,7 @@ WRAP_PRESET = 2**31 - 3
 
 R = None
 entry = None
+validating = None
 create_exchange = None
 mnnvl = None
 EX_A = None
@@ -179,7 +180,7 @@ class Call:
 
     def ref(self) -> torch.Tensor:
         """The MNNVL one-shot's order (``reduceOneshotLamport``), which the kernel states it follows."""
-        return ordered_sum(self.parts, RANK_CHUNK)
+        return entry.reference(self.parts)
 
     def run(self, ex: Exchange) -> torch.Tensor:
         ex.push(self.parts[R.rank])
@@ -341,10 +342,14 @@ def check_capture_refusals() -> None:
 def check_single_calls() -> None:
     """One push + reduce at every token count 1-8, exact partials: the reference bit for bit on every rank; after each
     call both halves are empty again, the count is up by one and the arrivals word is 0."""
-    for t in TOKENS:
-        call = Call(1000 + t, t)
-        verify(call, call.run(EX_A), f"M {t}")
-        assert_clean(EX_A, f"after M {t}")
+    for cell in entry.CELLS:
+        if cell.spec["kind"] != "exact":
+            continue
+        call = Call(zlib.crc32(cell.why.encode()), cell.spec["tokens"], cell.spec["kind"])
+        with validating(entry):
+            got = call.run(EX_A)
+        verify(call, got, cell.why)
+        assert_clean(EX_A, f"after {cell.why}")
 
 
 def check_bit_identical_to_mnnvl_oneshot() -> None:
@@ -352,25 +357,29 @@ def check_bit_identical_to_mnnvl_oneshot() -> None:
     count, with partials whose sum depends on the order (summing the ranks in reverse, or at W > 8 without chunks,
     changes at least ORDER_GUARD of the elements) and with normal-distributed ones, the op, ``mnnvl_fusion_allreduce``
     sent one-shot and the torch reference in the one-shot's order agree bit for bit."""
-    for t in TOKENS:
+    for cell in entry.CELLS:
+        kind = cell.spec["kind"]
+        if kind == "exact":
+            continue
+        t = cell.spec["tokens"]
         assert t * H * R.world * 2 <= MNNVL_BUFFER_BYTES, "the reference call must go one-shot"
-        for k, kind in enumerate(("cancel", "randn")):
-            call = Call(2000 + 10 * t + k, t, kind)
-            want = call.ref()
-            if kind == "cancel":
-                others = [ordered_sum(call.parts[::-1], R.world)]
-                if R.world > RANK_CHUNK:
-                    others.append(ordered_sum(call.parts, R.world))
-                share = min(differing(other, want) for other in others)
-                STATS["order_guard"] = min(STATS["order_guard"], share)
-                assert share >= ORDER_GUARD, f"M {t}: another order changes only {share:.2%}"
-            oneshot = mnnvl(call.parts[R.rank], MNNVL_WS, MNNVL_BUFFER_BYTES)
+        call = Call(zlib.crc32(cell.why.encode()), t, kind)
+        want = call.ref()
+        if kind == "cancel":
+            others = [ordered_sum(call.parts[::-1], R.world)]
+            if R.world > RANK_CHUNK:
+                others.append(ordered_sum(call.parts, R.world))
+            share = min(differing(other, want) for other in others)
+            STATS["order_guard"] = min(STATS["order_guard"], share)
+            assert share >= ORDER_GUARD, f"M {t}: another order changes only {share:.2%}"
+        oneshot = mnnvl(call.parts[R.rank], MNNVL_WS, MNNVL_BUFFER_BYTES)
+        with validating(entry):
             got = call.run(EX_A)
-            assert same_bits(got, oneshot), f"M {t} {kind}: differs from the MNNVL one-shot"
-            assert same_bits(oneshot, want), (
-                f"M {t} {kind}: the MNNVL one-shot differs from the reference"
-            )
-            verify(call, got, f"M {t} {kind}")
+        assert same_bits(got, oneshot), f"M {t} {kind}: differs from the MNNVL one-shot"
+        assert same_bits(oneshot, want), (
+            f"M {t} {kind}: the MNNVL one-shot differs from the reference"
+        )
+        verify(call, got, cell.why)
     assert_clean(EX_A, "after the bit-identity calls")
 
 
@@ -548,8 +557,8 @@ def check_swapped_calls_are_wrong() -> None:
     got = [call.run(EX_A) for call in order]
     # The k-th reduce sums every rank's k-th push: rank 0's partial of one call with the others' of the other.
     paired = [
-        ordered_sum([second.parts[0]] + first.parts[1:], RANK_CHUNK),
-        ordered_sum([first.parts[0]] + second.parts[1:], RANK_CHUNK),
+        entry.reference([second.parts[0]] + first.parts[1:]),
+        entry.reference([first.parts[0]] + second.parts[1:]),
     ]
     exact = all(same_bits(g, p) for g, p in zip(got, paired))
     wrong = [differing(g, call.ref()) for g, call in zip(got, order)]
@@ -621,7 +630,7 @@ CHECKS = [
 
 
 def _run_one_rank(args) -> int:
-    global R, entry, create_exchange, mnnvl, EX_A, EX_B, MNNVL_WS
+    global R, entry, validating, create_exchange, mnnvl, EX_A, EX_B, MNNVL_WS
     R = ls.Rank(args)
     assert R.world in WORLDS, f"k3_latent_reduce runs on TP groups of {WORLDS} ranks, not {R.world}"
     from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm import (
@@ -631,6 +640,10 @@ def _run_one_rank(args) -> int:
         mnnvl_fusion_allreduce as mnnvl_module,
     )
 
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from _validating import validating as validating_context
+
+    validating = validating_context
     entry = module.k3_latent_reduce
     create_exchange = module.K3LatentExchange.create
     mnnvl = mnnvl_module.mnnvl_fusion_allreduce

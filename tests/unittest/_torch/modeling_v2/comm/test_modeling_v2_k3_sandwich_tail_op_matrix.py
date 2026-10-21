@@ -13,7 +13,6 @@ import torch
 assert torch.cuda.is_available(), "k3_sandwich_tail requires CUDA devices"
 
 if torch.cuda.get_device_capability() != (10, 0):
-    # The entry is certified on sm_100 (GB200) only; see its contract's receipts.
     pytest.skip("k3_sandwich_tail is certified on sm_100 only", allow_module_level=True)
 
 

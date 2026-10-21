@@ -3,6 +3,8 @@
 """GPU test for the k3_drafter_attn catalog entry (sm_100); its graph-replay cell also replays
 k3_drafter_attn_qknorm."""
 
+import zlib
+
 import pytest
 import torch
 
@@ -19,6 +21,9 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.k3_drafter_
     k3_drafter_attn_qknorm,
 )
 
+__extra_import_path__ = [".."]
+from _validating import validating  # noqa: E402
+
 D = 64
 PAGE = 64
 EPS = 1e-5
@@ -28,10 +33,6 @@ TOL = 1e-2
 # Context lengths, cycled over the requests: none, a block crossing a page, page and 128-row tile boundaries, the
 # cluster's 16-tile round, several tiles per CTA.
 LENGTHS = (60, 2041, 0, 127, 1000, 64, 128, 5)
-# R x 7: DSpark's block at max_draft_len 7 (max_draft_len tokens under shift_label).
-SPLITS = ((1, 1), (1, 8), (2, 4), (4, 2), (8, 1), (3, 1), (2, 8), (8, 8)) + tuple(
-    (r, 7) for r in range(1, 9)
-)
 
 
 def _bits(t: torch.Tensor) -> torch.Tensor:
@@ -47,10 +48,16 @@ class _Case:
     (optionally with a page stride larger than a page), distinct random pages per request, page-table rows (a strided
     view into a wider table, or dense), qkv and lengths."""
 
-    def __init__(self, seed, heads, kv, num_requests, tokens, page_pad=0, strided_table=True):
+    def __init__(
+        self, seed, heads, kv, num_requests, tokens, page_pad=0, strided_table=True, lengths=None
+    ):
         gen = torch.Generator(device="cuda").manual_seed(seed)
         self.heads, self.kv, self.r, self.t = heads, kv, num_requests, tokens
-        self.lengths = [LENGTHS[(seed + 3 * r) % len(LENGTHS)] for r in range(num_requests)]
+        self.lengths = (
+            list(lengths)
+            if lengths is not None
+            else [LENGTHS[(seed + 3 * r) % len(LENGTHS)] for r in range(num_requests)]
+        )
         need = [(c + PAGE - 1) // PAGE for c in self.lengths]
         self.width = max(need) + 2
         n_pool = sum(need) + 2 * num_requests + 4
@@ -95,75 +102,59 @@ class _Case:
         return torch.empty(self.r * self.t, self.heads * D, dtype=torch.bfloat16, device="cuda")
 
 
-def _attention_ref(case: _Case, qkv: torch.Tensor) -> torch.Tensor:
-    """fp64: each request's q against its cached rows and its block's own k / v, softmax(q k^T / 8) v."""
-    h, kv, t = case.heads, case.kv, case.t
-    outs = []
-    for r, c in enumerate(case.lengths):
-        rows = qkv[r * t : (r + 1) * t].double()
-        q = rows[:, : h * D].view(t, h, D)
-        k_blk = rows[:, h * D : (h + kv) * D].view(t, kv, D).permute(1, 0, 2)
-        v_blk = rows[:, (h + kv) * D :].view(t, kv, D).permute(1, 0, 2)
-        pages = case.table[r, : (c + PAGE - 1) // PAGE].long()
-        k_ctx = case.pool[pages, 0].double().permute(1, 0, 2, 3).reshape(kv, -1, D)[:, :c]
-        v_ctx = case.pool[pages, 1].double().permute(1, 0, 2, 3).reshape(kv, -1, D)[:, :c]
-        k = torch.cat([k_ctx, k_blk], 1).repeat_interleave(h // kv, 0)
-        v = torch.cat([v_ctx, v_blk], 1).repeat_interleave(h // kv, 0)
-        p = torch.softmax(torch.einsum("thd,hld->thl", q, k) / D**0.5, dim=-1)
-        outs.append(torch.einsum("thl,hld->thd", p, v).reshape(t, h * D))
-    return torch.cat(outs)
-
-
-def _qk_norm_rope_ref(case: _Case, qkv: torch.Tensor, q_w, k_w) -> torch.Tensor:
-    """Per-head RMSNorm of the q and k heads, then NeoX RoPE (base THETA) at each row's position, in fp64 and rounded
-    to bf16 as fused_qk_norm_rope stores them; v as is."""
-    h, kv = case.heads, case.kv
-    x = qkv.double().view(qkv.shape[0], h + 2 * kv, D).clone()
-    inv_freq = 1.0 / THETA ** (torch.arange(0, D, 2, dtype=torch.float64, device="cuda") / D)
-    angle = case.positions.double()[:, None] * inv_freq
-    cos, sin = angle.cos()[:, None, :], angle.sin()[:, None, :]
-    for start, count, w in ((0, h, q_w), (h, kv, k_w)):
-        y = x[:, start : start + count]
-        y = y * torch.rsqrt(y.pow(2).mean(-1, keepdim=True) + EPS) * w.double()
-        y1, y2 = y[..., : D // 2], y[..., D // 2 :]
-        x[:, start : start + count] = torch.cat([y1 * cos - y2 * sin, y1 * sin + y2 * cos], -1)
-    return x.view(qkv.shape[0], -1).bfloat16()
-
-
 def _check_attn(case: _Case) -> None:
     before = case.pool.clone()
     out = case.out()
-    k3_drafter_attn(case.qkv, case.pool, case.table, case.ctx_len, case.heads, case.kv, out)
+    with validating(k3_drafter_attn):
+        k3_drafter_attn(case.qkv, case.pool, case.table, case.ctx_len, case.heads, case.kv, out)
     torch.cuda.synchronize()
     assert not torch.isnan(out.float()).any(), "NaN in the output (the pool's unused rows are NaN)"
     assert torch.equal(_bits(case.pool), _bits(before)), "the pool was written"
-    err = _rel_err(out, _attention_ref(case, case.qkv))
+    want = case.out()
+    k3_drafter_attn.reference(
+        case.qkv, case.pool, case.table, case.ctx_len, case.heads, case.kv, want
+    )
+    err = _rel_err(out, want)
     assert err <= TOL, f"rel err {err:.3e}"
     again = case.out()
-    k3_drafter_attn(case.qkv, case.pool, case.table, case.ctx_len, case.heads, case.kv, again)
+    with validating(k3_drafter_attn):
+        k3_drafter_attn(case.qkv, case.pool, case.table, case.ctx_len, case.heads, case.kv, again)
     assert torch.equal(_bits(again), _bits(out)), "a rerun differs"
 
 
-@pytest.mark.parametrize("heads,kv", [(6, 1), (24, 4)], ids=["h6kv1", "h24kv4"])
-@pytest.mark.parametrize("num_requests,tokens", SPLITS, ids=[f"{r}x{t}" for r, t in SPLITS])
-def test_k3_drafter_attn(heads, kv, num_requests, tokens) -> None:
+@pytest.mark.parametrize(
+    "cell",
+    [c for c in k3_drafter_attn.CELLS if not c.spec.get("table_forms")],
+    ids=lambda c: c.why,
+)
+def test_k3_drafter_attn(cell) -> None:
+    seed = zlib.crc32(cell.why.encode()) % 2**31
     with torch.inference_mode():
-        _check_attn(_Case(100 * num_requests + tokens + heads, heads, kv, num_requests, tokens))
+        _check_attn(_Case(seed, **cell.spec))
 
 
 @pytest.mark.parametrize(
-    "page_pad,strided_table", [(0, False), (3 * 2 * PAGE * D, True)], ids=["dense", "padded"]
+    "cell",
+    [c for c in k3_drafter_attn.CELLS if c.spec.get("table_forms")],
+    ids=lambda c: c.why,
 )
-def test_k3_drafter_attn_table_forms(page_pad, strided_table) -> None:
+def test_k3_drafter_attn_table_forms(cell) -> None:
     """Dense page-table rows; pages with a stride larger than a page; one request's 1-D page-table row."""
+    seed = zlib.crc32(cell.why.encode()) % 2**31
+    spec = dict(cell.spec)
+    spec.pop("table_forms")
     with torch.inference_mode():
-        case = _Case(7, 6, 1, 4, 8, page_pad=page_pad, strided_table=strided_table)
+        case = _Case(seed, **spec)
         _check_attn(case)
-        one = _Case(8, 6, 1, 1, 8, page_pad=page_pad)
+        one = _Case(seed + 1, 6, 1, 1, 8, page_pad=spec["page_pad"], lengths=(60,))
         out_2d, out_1d = one.out(), one.out()
-        k3_drafter_attn(one.qkv, one.pool, one.table, one.ctx_len, 6, 1, out_2d)
-        k3_drafter_attn(one.qkv, one.pool, one.table[0], one.ctx_len, 6, 1, out_1d)
+        with validating(k3_drafter_attn):
+            k3_drafter_attn(one.qkv, one.pool, one.table, one.ctx_len, 6, 1, out_2d)
+            k3_drafter_attn(one.qkv, one.pool, one.table[0], one.ctx_len, 6, 1, out_1d)
         assert torch.equal(_bits(out_1d), _bits(out_2d))
+        want = one.out()
+        k3_drafter_attn.reference(one.qkv, one.pool, one.table[0], one.ctx_len, 6, 1, want)
+        assert _rel_err(out_1d, want) <= TOL
 
 
 def test_k3_drafter_attn_graph_replay() -> None:
@@ -209,8 +200,23 @@ def test_k3_drafter_attn_graph_replay() -> None:
             )
             graph.replay()
             torch.cuda.synchronize()
-            assert _rel_err(out, _attention_ref(case, case.qkv)) <= TOL, f"replay {rep}"
-            want_n = _attention_ref(case, _qk_norm_rope_ref(case, case.qkv, q_w, k_w))
+            want, want_n = case.out(), case.out()
+            k3_drafter_attn.reference(case.qkv, case.pool, case.table, case.ctx_len, 6, 1, want)
+            assert _rel_err(out, want) <= TOL, f"replay {rep}"
+            k3_drafter_attn_qknorm.reference(
+                case.qkv,
+                q_w,
+                k_w,
+                case.positions,
+                EPS,
+                THETA,
+                case.pool,
+                case.table,
+                case.ctx_len,
+                6,
+                1,
+                want_n,
+            )
             assert _rel_err(out_n, want_n) <= TOL, f"replay {rep} (qknorm)"
 
 
@@ -235,3 +241,41 @@ def test_k3_drafter_attn_rejects_out_of_contract() -> None:
         with pytest.raises(ValueError):
             k3_drafter_attn(many.qkv.repeat(2, 1), many.pool, many.table, many.ctx_len, 6, 1,
                             torch.empty(16, 6 * D, dtype=torch.bfloat16, device="cuda"))  # fmt: skip
+
+
+@pytest.mark.parametrize(
+    "invalid", ["negative_length", "short_table", "negative_page", "large_page"]
+)
+@pytest.mark.parametrize("normalized", [False, True])
+def test_k3_drafter_attn_rejects_invalid_page_contents(invalid, normalized) -> None:
+    with torch.inference_mode():
+        case = _Case(5, 6, 1, 1, 8, lengths=(64,))
+        if invalid == "negative_length":
+            case.ctx_len.fill_(-1)
+        elif invalid == "short_table":
+            case.table = case.table[:, :1]
+        elif invalid == "negative_page":
+            case.table[0, 0] = -1
+        else:
+            case.table[0, 0] = case.pool.shape[0]
+        args = dict(
+            qkv=case.qkv,
+            cache=case.pool,
+            page_table=case.table,
+            ctx_len=case.ctx_len,
+            num_heads=6,
+            num_kv_heads=1,
+            out=case.out(),
+        )
+        op = k3_drafter_attn
+        if normalized:
+            op = k3_drafter_attn_qknorm
+            args.update(
+                q_w=torch.ones(D, dtype=torch.bfloat16, device="cuda"),
+                k_w=torch.ones(D, dtype=torch.bfloat16, device="cuda"),
+                positions=case.positions,
+                eps=EPS,
+                rope_base=THETA,
+            )
+        with pytest.raises(AssertionError), validating(op):
+            op(**args)

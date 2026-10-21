@@ -17,14 +17,8 @@ import torch
 H, NUM_EXPERTS, TOP_K, SV = 3584, 896, 16, 32
 # TP16: every expert on the rank, its 192-wide intermediate slice zero-padded to whole tiles (256) by the loader.
 I_TP, I_PAD, MOE_TP = 192, 256, 16
-GATE_CAP, LINEAR_CAP = (
-    4.0,
-    25.0,
-)  # the SiTU caps (activation_situ_beta, activation_situ_linear_beta)
 RSF = 2.827
 ULP = 2.0**-8
-E4M3_MAX = 448.0
-_E2M1 = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0]
 LAYERS = 3  # distinct weight sets; the sequences cycle through them
 TOKEN_SETS = 4
 STEPS = 12
@@ -106,50 +100,6 @@ def routed(m: int, seed: int):
     return x_fp8, x_sf, ids, weights
 
 
-def _deq_w(packed, sf):
-    lut = torch.tensor(_E2M1, device=packed.device)
-    vals = torch.empty(packed.shape[0], packed.shape[1] * 2, device=packed.device)
-    vals[:, 0::2] = lut[(packed & 0xF).long()]
-    vals[:, 1::2] = lut[(packed >> 4).long()]
-    return vals * torch.exp2(sf.float() - 127.0).repeat_interleave(SV, dim=1)
-
-
-def _requant(act):
-    """The FC1 epilogue's MXFP8 requantization per 32 columns (round-up scale), dequantized."""
-    rows, cols = act.shape
-    blocks = act.reshape(rows, cols // SV, SV)
-    amax = blocks.abs().amax(dim=-1, keepdim=True)
-    ex = torch.ceil(torch.log2(amax / E4M3_MAX))
-    ex = torch.where(amax == 0, torch.full_like(amax, -127.0), ex).clamp(-127.0, 127.0)
-    scale = torch.exp2(ex)
-    q8 = (blocks / scale).clamp(-E4M3_MAX, E4M3_MAX).to(torch.float8_e4m3fn)
-    return (q8.float() * scale).reshape(rows, cols)
-
-
-def reference(x_fp8, x_sf, ids, weights):
-    """fp32 routed MoE over layer 0's experts from the checkpoint slices (f64 GEMMs): SiTU, the MXFP8 intermediate,
-    the down projection, the routing-weighted sum, per token; bf16 out."""
-    _, raw = experts()
-    rows = x_fp8.shape[0]
-    x = x_fp8.float() * torch.exp2(x_sf.reshape(rows, H // SV).float() - 127.0).repeat_interleave(
-        SV, dim=1
-    )
-    out = torch.zeros(rows, H, device="cuda")
-    for t in range(rows):
-        for k in range(TOP_K):
-            e = int(ids[t, k])
-            xe = x[t : t + 1].double()
-            up = (xe @ _deq_w(raw["up"][e], raw["up_s"][e]).double().t()).float()
-            gate = (xe @ _deq_w(raw["gate"][e], raw["gate_s"][e]).double().t()).float()
-            act = (GATE_CAP * torch.tanh(gate / GATE_CAP) * torch.sigmoid(gate)
-                   * (LINEAR_CAP * torch.tanh(up / LINEAR_CAP)))  # fmt: skip
-            y = (
-                _requant(act).double() @ _deq_w(raw["down"][e], raw["down_s"][e]).double().t()
-            ).float()
-            out[t] += (y * weights[t, k].float())[0]
-    return out.bfloat16()
-
-
 def row_ulp(y, ref):
     """Largest |y - ref| in bf16 ulps of the row's max |ref|, and the relative RMS in ulps."""
     o, r = y.float(), ref.float()
@@ -210,7 +160,7 @@ def _alone(engine):
     return _reference_calls(engine.name, engine.m)
 
 
-def check_single_calls(engine, seeds=range(8)):
+def check_single_calls(engine, entry, seeds):
     """Single calls over the grid against the fp32 reference (8 ulp of the row max per element, 4 ulp relative
     RMS), and run to run bit for bit."""
     state = engine.create()
@@ -219,7 +169,7 @@ def check_single_calls(engine, seeds=range(8)):
         tokens = routed(engine.m, seed)
         y = engine.call(layer, tokens)
         again = engine.call(layer, tokens)
-        elt, rms = row_ulp(y, reference(*tokens))
+        elt, rms = row_ulp(y, entry.reference(experts()[1], *tokens, 0))
         print(
             f"OPCHECK op={engine.name} M={engine.m} seed={seed} vs_ref_elt_ulp={elt:.2f} vs_ref_rms_ulp={rms:.2f}"
         )

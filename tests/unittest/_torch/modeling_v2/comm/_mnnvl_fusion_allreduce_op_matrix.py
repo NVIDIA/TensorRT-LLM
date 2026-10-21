@@ -31,6 +31,7 @@ within ``TOL``. Every output is also compared bitwise across the ranks.
 import copy
 import random
 import sys
+import zlib
 from pathlib import Path
 
 import torch
@@ -43,7 +44,6 @@ assert torch.cuda.is_available(), "mnnvl_fusion_allreduce requires CUDA devices"
 DEADLINE_S = 900
 H_LATENT = 3584  # Kimi K3's routed latent: the MoE all-reduce
 H_MODEL = 7168  # Kimi K3's hidden size: the drafter's residual + RMSNorm all-reduces, a wide step's attention ones
-HIDDENS = (H_LATENT, H_MODEL)
 TOKENS = (1, 2, 3, 4, 5, 6, 7, 8, 16, 32, 64)
 EXPERTS = 896  # the router logits the MoE head all-gather carries beside the latent
 DECODE_MAX_TOKENS = 8
@@ -83,6 +83,7 @@ fusion_allreduce = None
 required_buffer_bytes = None
 allgather_split = None
 allreduce_attn_res = None
+validating = None
 MnnvlWorkspace = None
 BUFFER_BYTES = None
 WS_A = None
@@ -103,13 +104,6 @@ def bits(t: torch.Tensor) -> torch.Tensor:
 
 def bits_equal(a: torch.Tensor, b: torch.Tensor) -> bool:
     return a.shape == b.shape and a.dtype == b.dtype and torch.equal(bits(a), bits(b))
-
-
-def positive_zero(t: torch.Tensor) -> torch.Tensor:
-    """``t`` with every -0.0 made +0.0, by bit pattern: the Lamport buffers' empty word never travels."""
-    words = bits(t)
-    sign = torch.iinfo(words.dtype).min
-    return torch.where(words == sign, torch.zeros_like(words), words).view(t.dtype)
 
 
 def one_shot_bytes(tokens: int, hidden: int) -> int:
@@ -166,10 +160,11 @@ class AR:
     from an earlier call), True (drawn) or None (the plain sum). ``path``: see ``ceiling``. Every rank's input holds
     -0.0 in every NEG_ZERO_STRIDE-th column."""
 
-    def __init__(self, seed, tokens, hidden, residual=None, path="k3"):
+    def __init__(self, seed, tokens, hidden, residual=None, path="k3", eps=EPS):
         g = torch.Generator(device="cuda").manual_seed(seed)
         self.tokens, self.hidden, self.path = tokens, hidden, path
         self.one_shot_max_bytes = ceiling(tokens, hidden, path)
+        self.eps = eps
         self.inputs = []
         for _ in range(R.world):
             x = ls.exact_bf16(g, (tokens, hidden), -4, 5, 1 / 16)
@@ -193,7 +188,12 @@ class AR:
     def fresh(self, seed):
         """A call of the same shape, fusion and path with new inputs."""
         return AR(
-            seed, self.tokens, self.hidden, residual=True if self.fused else None, path=self.path
+            seed,
+            self.tokens,
+            self.hidden,
+            residual=True if self.fused else None,
+            path=self.path,
+            eps=self.eps,
         )
 
     def chain_from(self, updated: torch.Tensor) -> None:
@@ -206,18 +206,12 @@ class AR:
         if not self.fused:
             return fusion_allreduce(x, ws, self.one_shot_max_bytes)
         residual = self.residual if residual is None else residual
-        return fusion_allreduce(x, ws, self.one_shot_max_bytes, residual, self.gamma, EPS)
+        return fusion_allreduce(x, ws, self.one_shot_max_bytes, residual, self.gamma, self.eps)
 
     def ref(self):
-        """The exact sum (+0.0 where every rank sent -0.0); with a residual ``(normed, updated)``: ``updated`` exact,
-        ``normed`` the fp32 RMSNorm of it."""
-        total = positive_zero(torch.stack([x.float() for x in self.inputs]).sum(dim=0))
-        if not self.fused:
-            return total.bfloat16()
-        updated = (total + self.residual.float()).bfloat16()
-        x = updated.float()
-        normed = x * torch.rsqrt(x.square().mean(dim=-1, keepdim=True) + EPS) * self.gamma.float()
-        return normed.bfloat16(), updated
+        return fusion_allreduce.reference(
+            self.inputs, self.residual, self.gamma, self.eps if self.fused else None
+        )
 
     def verify(self, got, where: str) -> None:
         want = self.ref()
@@ -291,10 +285,7 @@ class AG:
         return allgather_split(self.inputs[R.rank] if x is None else x, self.bf16_columns, ws)
 
     def ref(self):
-        b = self.bf16_columns
-        bf16_out = torch.cat([x[:, :b] for x in self.inputs], dim=1).bfloat16()
-        fp32_out = torch.cat([x[:, b:] for x in self.inputs], dim=1)
-        return positive_zero(bf16_out), positive_zero(fp32_out)
+        return allgather_split.reference(self.inputs, self.bf16_columns)
 
     def verify(self, got, where: str) -> None:
         want = self.ref()
@@ -352,11 +343,9 @@ class AttnRes:
         )
 
     def ref(self):
-        updated = (sum(x.float() for x in self.inputs) + self.prefix.float()).bfloat16()
-        normed = ls.residual_update_ref(
-            updated, self.block, self.res_w, self.rms_w, EPS, self.out_w, EPS
+        return allreduce_attn_res.reference(
+            self.inputs, self.prefix, self.block, self.res_w, self.rms_w, self.out_w, EPS, EPS
         )
-        return normed, updated
 
     def verify(self, got, where: str) -> None:
         (normed, updated), (want_normed, want_updated) = got, self.ref()
@@ -446,32 +435,31 @@ def check_single_calls_both_paths() -> None:
     boundary is inclusive) and right after two-shot with one byte less, on one workspace, the same inputs both
     times: each against the reference, the flags after each recording the path and the bytes the formula says, and
     required_buffer_bytes equal to the space the call's stages take."""
-    for hidden in HIDDENS:
-        for t in TOKENS:
-            for fused in (False, True):
-                outs = []
-                for path in ("one", "two"):
-                    call = AR(
-                        1000 + 37 * t + 3 * hidden + int(fused),
-                        t,
-                        hidden,
-                        residual=fused or None,
-                        path=path,
-                    )
-                    where = f"T {t} H {hidden} fused {fused} {path}-shot"
-                    assert call.one_shot == (path == "one"), where
+    for cell in fusion_allreduce.CELLS:
+        spec = cell.spec
+        if R.world < spec.get("min_world", 2):
+            continue
+        hidden, fused = spec["hidden"], spec["fused"]
+        seed = zlib.crc32(cell.why.encode())
+        for t in spec["tokens"]:
+            outs = []
+            for path in spec["paths"]:
+                call = AR(seed + t, t, hidden, residual=fused or None, path=path, eps=spec["eps"])
+                where = f"{cell.why}: T {t} {path}-shot"
+                assert call.one_shot == (path == "one"), where
+                with validating(fusion_allreduce):
                     outs.append(call_and_check(call, WS_A, where))
-                    stages, written = call.record()
-                    need = required_buffer_bytes(
-                        t, hidden, R.world, torch.bfloat16, call.one_shot_max_bytes
-                    )
-                    assert need == (written[0] if stages == 1 else 2 * written[0]), (
-                        f"{where}: needs {need}"
-                    )
-                if fused:
-                    STATS["normed_paths"] = max(
-                        STATS["normed_paths"], ls.rel_err(outs[0][0], outs[1][0])
-                    )
+                stages, written = call.record()
+                need = required_buffer_bytes(
+                    t, hidden, R.world, spec["dtype"], call.one_shot_max_bytes
+                )
+                assert need == (written[0] if stages == 1 else 2 * written[0]), (
+                    f"{where}: needs {need}"
+                )
+            if fused and len(outs) == 2:
+                STATS["normed_paths"] = max(
+                    STATS["normed_paths"], ls.rel_err(outs[0][0], outs[1][0])
+                )
 
 
 def check_unsupported_calls_raise_on_every_rank() -> None:
@@ -494,6 +482,26 @@ def check_unsupported_calls_raise_on_every_rank() -> None:
     odd = AR(2002, 2, H_LATENT - 4)
     expect_refusal(lambda: odd.run(WS_A), RuntimeError, f"hidden {H_LATENT - 4}")
     call_and_check(AR(2003, 8, H_MODEL, residual=True), WS_A, "after the refused calls")
+
+
+def check_guard_rejects_mismatched_fusion_operands() -> None:
+    call = AR(2200, 4, H_LATENT, residual=True)
+    cases = (
+        (torch.cat((call.residual, call.residual)), call.gamma),
+        (call.residual, torch.cat((call.gamma, call.gamma))),
+        (call.residual.float(), call.gamma),
+        (call.residual, call.gamma.float()),
+    )
+    with validating(fusion_allreduce):
+        for residual, weight in cases:
+            expect_refusal(
+                lambda: fusion_allreduce(
+                    call.inputs[R.rank], WS_A, call.one_shot_max_bytes, residual, weight, EPS
+                ),
+                AssertionError,
+                "fusion operand shape or dtype mismatch",
+            )
+        call_and_check(call, WS_A, "after the rejected fusion operands")
 
 
 def run_step(ws, seed, tokens, late):
@@ -749,6 +757,7 @@ CHECKS = [
     check_workspaces_are_armed_and_sized,
     check_single_calls_both_paths,
     check_unsupported_calls_raise_on_every_rank,
+    check_guard_rejects_mismatched_fusion_operands,
     check_dip_and_regrow_sequence,
     check_two_workspaces_interleaved,
     check_one_workspace_three_ops,
@@ -763,6 +772,7 @@ CHECKS = [
 def _run_one_rank(args) -> int:
     global R, fusion_allreduce, required_buffer_bytes, allgather_split, allreduce_attn_res
     global MnnvlWorkspace, BUFFER_BYTES, WS_A, WS_B
+    global validating
     R = ls.Rank(args)
     assert R.world in (2, 4, 8, 16), f"K3's shapes shard over 2, 4, 8 or 16 ranks, not {R.world}"
     from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm import (
@@ -774,6 +784,11 @@ def _run_one_rank(args) -> int:
     from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm import (
         mnnvl_fusion_allreduce as module,
     )
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from _validating import validating as validating_cm
+
+    validating = validating_cm
 
     fusion_allreduce = module.mnnvl_fusion_allreduce
     required_buffer_bytes = module.required_buffer_bytes

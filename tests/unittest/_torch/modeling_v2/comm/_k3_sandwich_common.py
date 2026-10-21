@@ -8,24 +8,13 @@ matrices run the same way on a ``K3SandwichWorkspace``.
 
 Started by file path like ``_lockstep`` (this tree is not a package). Importing it pulls in torch only; ``bind``
 (called by the rank body) imports the catalog wrappers.
-
-Payloads and references. Every rank draws every rank's inputs from one seed, so each rank holds the whole reference.
-The projections' inputs are small multiples of powers of two (``_lockstep.exact_bf16``), so every partial product
-sum is exact in fp32 in whatever order the kernel accumulates: the reference is the fp64 product rounded once to bf16
-per rank (the kernel rounds its fp32 accumulator once), the ranks' partials added in fp32 and rounded to bf16, then
-the prefix sum (or residual) added in fp32 and rounded -- the kernel's own steps, so ``updated`` of
-``k3_sandwich_oproj`` and ``k3_sandwich_plain`` is compared bit for bit. ``k3_sandwich_tail`` scales its latent
-accumulator by the latent row's RMS, an fp32 rsqrt that is not torch's, so a partial element can round to the
-neighbouring bf16: its ``updated`` is compared within ``TOL_TAIL`` of an fp64 reference of the kernel's arithmetic.
-``normed`` and the tail's tap (softmax, rsqrt) are compared within ``TOL`` of an fp32 reference. Every output is also
-compared bitwise across the ranks.
 """
 
 from __future__ import annotations
 
 import copy
 import random
-from typing import Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import _lockstep as ls
 import torch
@@ -51,7 +40,6 @@ TOL_TAIL = (
 )
 GATES = (0.0, 32.0, 64.0)  # swiglu gate values on which silu is exact in fp32 (see PlainCall)
 WEIGHT_SETS = 3
-TOKENS = (1, 2, 3, 4, 5, 6, 7, 8)
 DIP_STEPS = (8, 8, 8, 2, 7, 8, 1, 1, 8, 3, 8)
 INTERLEAVE = "AABABBAAAB" * 2
 REPLAYS = 8
@@ -150,35 +138,6 @@ def bits(t: torch.Tensor) -> torch.Tensor:
     return t.contiguous().view(torch.int16)
 
 
-def bf16_partial(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
-    """bf16(x @ w^T) from the exact fp64 product: the kernel's one rounding of an fp32 accumulator that is exact for
-    these payloads."""
-    return (x.double() @ w.double().t()).float().bfloat16()
-
-
-def reduce_ref(partials: Sequence[torch.Tensor], carry: Optional[torch.Tensor]) -> torch.Tensor:
-    """bf16(carry + bf16(sum of the partials)): the partials added in fp32 in rank order (the kernel's order up to 8
-    ranks; exact sums make any order the same), then the carry -- the prefix sum or the residual -- added in fp32;
-    the rounded sum alone without a carry."""
-    total = partials[0].float()
-    for p in partials[1:]:
-        total = total + p.float()
-    updated = total.bfloat16()
-    if carry is not None:
-        updated = (carry.float() + updated.float()).bfloat16()
-    return updated
-
-
-def attn_res_mixture(updated, block, res_w, rms_w) -> torch.Tensor:
-    """The attention-residual mixture of [block..., updated] before the output RMSNorm, in fp32 and rounded to bf16:
-    the tensor ``_lockstep.residual_update_ref`` normalizes, and the tail's tap."""
-    v = torch.cat([block, updated.unsqueeze(0)], dim=0).float()
-    rs = (v.square().mean(dim=-1) + RMS_EPS).rsqrt()
-    logits = (v * rs[..., None] * (rms_w.float() * res_w.float())).sum(dim=-1)
-    probs = torch.softmax(logits, dim=0)
-    return (probs[..., None] * v).sum(dim=0).bfloat16()
-
-
 def _within(
     got: torch.Tensor, want: torch.Tensor, tol: float, key: str, where: str, what: str
 ) -> None:
@@ -238,13 +197,17 @@ class OprojCall(Call):
         self.block, self.res_w, self.rms_w, self.out_w = _attn_res_inputs(g, snapshots, tokens)
 
     def ref(self):
-        updated = reduce_ref(
-            [bf16_partial(c, w) for c, w in zip(self.cores, self.weights)], self.carry
+        return OPS["oproj"].reference(
+            self.cores,
+            self.weights,
+            self.carry,
+            self.block,
+            self.res_w,
+            self.rms_w,
+            self.out_w,
+            RMS_EPS,
+            OUT_EPS,
         )
-        normed = ls.residual_update_ref(
-            updated, self.block, self.res_w, self.rms_w, RMS_EPS, self.out_w, OUT_EPS
-        )
-        return normed, updated
 
     def run(self, ws):
         r = R.rank
@@ -311,25 +274,26 @@ class TailCall(Call):
         other._set_options(tap, updated_out)
         return other
 
-    def partials(self) -> List[torch.Tensor]:
-        """Every rank's partial in fp64: scale_t (acc_lat) + acc_act, one rounding to bf16; the padding columns of
-        tail_weight are zero, so the latent slice is the 224 columns from lo."""
-        lat = self.latent.double()
-        scale = (lat.square().mean(dim=1, keepdim=True) + LAT_EPS).rsqrt()
-        out = []
-        for act, w, lo in zip(self.acts, self.weights, self.los):
-            w64 = w.double()
-            acc_lat = lat[:, lo : lo + LAT_SLICE] @ w64[:, :LAT_SLICE].t()
-            acc_act = act.double() @ w64[:, LAT_PAD:].t()
-            out.append((acc_lat * scale + acc_act).float().bfloat16())
-        return out
-
-    def ref(self):
-        updated = reduce_ref(self.partials(), self.carry)
-        normed = ls.residual_update_ref(
-            updated, self.block, self.res_w, self.rms_w, RMS_EPS, self.out_w, OUT_EPS
+    def ref(self, tap=None):
+        return OPS["tail"].reference(
+            self.latent,
+            self.acts,
+            self.weights,
+            self.los,
+            LAT_EPS,
+            self.carry,
+            self.block,
+            self.res_w,
+            self.rms_w,
+            self.out_w,
+            RMS_EPS,
+            OUT_EPS,
+            tap=tap,
+            tap_updated=self.tap_kind == "updated",
+            updated_out=torch.empty_like(self.updated_out)
+            if self.updated_out is not None
+            else None,
         )
-        return normed, updated
 
     def run(self, ws):
         r = R.rank
@@ -347,7 +311,8 @@ class TailCall(Call):
 
     def verify(self, got, where):
         normed, updated = got
-        want_normed, want_updated = self.ref()
+        want_tap = torch.empty_like(self.tap) if self.tap is not None else None
+        want_normed, want_updated = self.ref(tap=want_tap)
         _within(updated, want_updated, TOL_TAIL, "tail_updated", where, "updated")
         _within(normed, want_normed, TOL, "normed", where, "normed")
         outputs = [normed, updated]
@@ -365,8 +330,7 @@ class TailCall(Call):
                 f"{where}: the capture buffer was written outside the tap"
             )
             if self.tap_kind == "mix":
-                mix = attn_res_mixture(want_updated, self.block, self.res_w, self.rms_w)
-                _within(self.tap, mix, TOL, "tap", where, "tapped mixture")
+                _within(self.tap, want_tap, TOL, "tap", where, "tapped mixture")
             else:
                 assert torch.equal(bits(self.tap), bits(updated)), (
                     f"{where}: the tap is not updated"
@@ -414,20 +378,10 @@ class PlainCall(Call):
         self.carry = _running_sum(g, tokens) if residual is True else residual
         self.norm_w = (1.0 + 0.1 * torch.randn(H, generator=g, device="cuda")).bfloat16()
 
-    def operand(self, x: torch.Tensor) -> torch.Tensor:
-        """The projection's input: x, or silu_and_mul(x) = gate * up (exact on these payloads)."""
-        if not self.swiglu:
-            return x
-        return (x[:, :DOWN_K].float() * x[:, DOWN_K:].float()).bfloat16()
-
     def ref(self):
-        partials = [bf16_partial(self.operand(x), w) for x, w in zip(self.xs, self.weights)]
-        updated = reduce_ref(partials, self.carry)
-        u = updated.float()
-        normed = (
-            u * (u.square().mean(dim=-1, keepdim=True) + EPS).rsqrt() * self.norm_w.float()
-        ).bfloat16()
-        return normed, updated
+        return OPS["plain"].reference(
+            self.xs, self.weights, self.carry, self.norm_w, EPS, swiglu=self.swiglu
+        )
 
     def run(self, ws):
         r = R.rank

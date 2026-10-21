@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """GPU test for the moe/k3_route_quant catalog entry: trtllm::k3_route_quant on one GPU (sm_100).
 
-The reference is the stock op it replaces, trtllm::kimi_k3_noaux_tc_mxfp8_quant: the four outputs (top-16 ids,
+The bitwise comparator is the stock op it replaces, trtllm::kimi_k3_noaux_tc_mxfp8_quant: the four outputs (top-16 ids,
 routing weights, MXFP8 codes, UE8M0 scales) must be its bits. Checks, in file order:
 - single calls at M 1-8, 16, 33 and 64 with random logits, with and without the early trigger: the stock op's bits,
   run-to-run identical, and each M's rows the bits of the same rows of the 64-token call;
@@ -17,17 +17,19 @@ The op keeps no state between calls: its only process state is the compile cache
 
 import contextlib
 import functools
+import zlib
 
 import pytest
 import torch
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.k3_route_quant import k3_route_quant
 
+__extra_import_path__ = [".."]
+from _validating import validating
+
 E, K, H = 896, 16, 3584
 RSF = 2.827
 DEV = "cuda"
-M_ALL = (1, 2, 3, 4, 5, 6, 7, 8, 16, 33, 64)
-EDGE_CASES = ("40_tied_keys", "all_equal_logits", "huge_logits", "zero_large_denormal_rows")
 REPLAYS = 4
 
 
@@ -41,7 +43,7 @@ pytestmark = pytest.mark.skipif(not _is_sm100(), reason="k3_route_quant needs sm
 @pytest.fixture(autouse=True)
 def _inference_mode():
     """Run every check as the model runs the op, under inference mode."""
-    with torch.inference_mode():
+    with torch.inference_mode(), validating(k3_route_quant):
         yield
 
 
@@ -58,9 +60,18 @@ def _same_outputs(got, want) -> bool:
     return len(got) == len(want) and all(_same(a, b) for a, b in zip(got, want))
 
 
+def _check_reference(got, want):
+    ids, weights, quantized, scales = got
+    ref_ids, ref_weights, ref_quantized, ref_scales = want
+    assert torch.equal(ids, ref_ids)
+    torch.testing.assert_close(weights, ref_weights, rtol=2.0**-7, atol=0.0)
+    assert _same(quantized, ref_quantized)
+    assert _same(scales, ref_scales)
+
+
 @functools.lru_cache(maxsize=None)
-def _bias() -> torch.Tensor:
-    gen = torch.Generator(device=DEV).manual_seed(20260929)
+def _bias(seed: int = 20260929) -> torch.Tensor:
+    gen = torch.Generator(device=DEV).manual_seed(seed)
     return (torch.randn(E, generator=gen, device=DEV) * 0.1).float()
 
 
@@ -71,15 +82,17 @@ def _draw(seed: int, m: int):
     return logits, (torch.randn(m, H, generator=gen, device=DEV) * 0.7).bfloat16()
 
 
-def _stock(logits, latent):
-    return torch.ops.trtllm.kimi_k3_noaux_tc_mxfp8_quant(logits, _bias(), latent, RSF)
+def _stock(logits, bias, latent, routed_scaling_factor):
+    return torch.ops.trtllm.kimi_k3_noaux_tc_mxfp8_quant(
+        logits, bias, latent, routed_scaling_factor
+    )
 
 
-def _edge_case(case: str):
+def _edge_case(case: str, seed: int):
     """8 tokens of an edge case: router logits, bias and latent."""
-    gen = torch.Generator(device=DEV).manual_seed(20260930)
+    gen = torch.Generator(device=DEV).manual_seed(seed)
     m = 8
-    bias = _bias().clone()
+    bias = _bias(seed + 1).clone()
     latent = (torch.randn(m, H, generator=gen, device=DEV) * 0.7).bfloat16()
     logits = torch.randn(m, E, generator=gen, device=DEV) * 2.5
     if case == "40_tied_keys":
@@ -134,49 +147,62 @@ def _raised_under_capture(fn) -> str:
     return message
 
 
-@pytest.mark.parametrize("m", M_ALL)
-def test_single_call(m):
+@pytest.mark.parametrize(
+    "cell", [c for c in k3_route_quant.CELLS if c.spec["case"] == "random"], ids=lambda c: c.why
+)
+def test_single_call(cell):
     """The stock op's four outputs bit for bit, with and without the early trigger.
 
     Shapes and dtypes as the contract states; run-to-run identical; the rows of each M the bits of the same rows of
     the 64-token call.
     """
-    logits64, latent64 = _draw(1, 64)
+    spec = cell.spec
+    m, early, scale = spec["m"], spec["early_trigger"], spec["routed_scaling_factor"]
+    seed = zlib.crc32(cell.why.encode()) % 2**31
+    logits64, latent64 = _draw(seed, 64)
+    bias = _bias(seed + 1)
     logits, latent = logits64[:m].contiguous(), latent64[:m].contiguous()
-    want = _stock(logits, latent)
-    full = k3_route_quant(logits64, _bias(), latent64, RSF)
-    for early in (False, True):
-        got = k3_route_quant(logits, _bias(), latent, RSF, early_trigger=early)
-        ids, weights, quantized, scales = got
-        assert ids.dtype == torch.int32 and tuple(ids.shape) == (m, K)
-        assert weights.dtype == torch.bfloat16 and tuple(weights.shape) == (m, K)
-        assert quantized.dtype == torch.float8_e4m3fn and tuple(quantized.shape) == (m, H)
-        assert scales.dtype == torch.uint8 and tuple(scales.shape) == (m, H // 32)
-        assert all(t.is_contiguous() and t.device == logits.device for t in got)
-        same = [_same(a, b) for a, b in zip(got, want)]
-        rerun = _same_outputs(
-            k3_route_quant(logits, _bias(), latent, RSF, early_trigger=early), got
-        )
-        rows = all(_same(a, b[:m]) for a, b in zip(got, full))
-        print(
-            f"OPCHECK op=k3_route_quant M={m} early_trigger={early} "
-            f"stock_bits(ids,w,q,sf)={same} det={rerun} rows_as_m64={rows}"
-        )
-        assert all(same) and rerun and rows
+    want = _stock(logits, bias, latent, scale)
+    full = k3_route_quant(logits64, bias, latent64, scale)
+    got = k3_route_quant(logits, bias, latent, scale, early_trigger=early)
+    ids, weights, quantized, scales = got
+    assert ids.dtype == torch.int32 and tuple(ids.shape) == (m, K)
+    assert weights.dtype == torch.bfloat16 and tuple(weights.shape) == (m, K)
+    assert quantized.dtype == torch.float8_e4m3fn and tuple(quantized.shape) == (m, H)
+    assert scales.dtype == torch.uint8 and tuple(scales.shape) == (m, H // 32)
+    assert all(t.is_contiguous() and t.device == logits.device for t in got)
+    same = [_same(a, b) for a, b in zip(got, want)]
+    rerun = _same_outputs(k3_route_quant(logits, bias, latent, scale, early_trigger=early), got)
+    rows = all(_same(a, b[:m]) for a, b in zip(got, full))
+    print(
+        f"OPCHECK op=k3_route_quant M={m} early_trigger={early} "
+        f"stock_bits(ids,w,q,sf)={same} det={rerun} rows_as_m64={rows}"
+    )
+    assert all(same) and rerun and rows
+    _check_reference(
+        got, k3_route_quant.reference(logits, bias, latent, scale, early_trigger=early)
+    )
 
 
-@pytest.mark.parametrize("case", EDGE_CASES)
-def test_edge_case(case):
+@pytest.mark.parametrize(
+    "cell", [c for c in k3_route_quant.CELLS if c.spec["case"] != "random"], ids=lambda c: c.why
+)
+def test_edge_case(cell):
     """Ties, saturation and zero / large / denormal latent rows at M 1, 3 and 8: the stock op's bits."""
-    logits8, bias, latent8 = _edge_case(case)
-    for m in (1, 3, 8):
-        logits, latent = logits8[:m].contiguous(), latent8[:m].contiguous()
-        want = torch.ops.trtllm.kimi_k3_noaux_tc_mxfp8_quant(logits, bias, latent, RSF)
-        for early in (False, True):
-            got = k3_route_quant(logits, bias, latent, RSF, early_trigger=early)
-            same = [_same(a, b) for a, b in zip(got, want)]
-            print(f"OPCHECK op=k3_route_quant case={case} M={m} early_trigger={early} same={same}")
-            assert all(same), f"{case} M {m} early_trigger {early}: {same}"
+    spec = cell.spec
+    case, m = spec["case"], spec["m"]
+    early, scale = spec["early_trigger"], spec["routed_scaling_factor"]
+    seed = zlib.crc32(cell.why.encode()) % 2**31
+    logits8, bias, latent8 = _edge_case(case, seed)
+    logits, latent = logits8[:m].contiguous(), latent8[:m].contiguous()
+    want = _stock(logits, bias, latent, scale)
+    got = k3_route_quant(logits, bias, latent, scale, early_trigger=early)
+    same = [_same(a, b) for a, b in zip(got, want)]
+    print(f"OPCHECK op=k3_route_quant case={case} M={m} early_trigger={early} same={same}")
+    assert all(same), f"{case} M {m} early_trigger {early}: {same}"
+    _check_reference(
+        got, k3_route_quant.reference(logits, bias, latent, scale, early_trigger=early)
+    )
 
 
 def test_graph_capture_and_replay():

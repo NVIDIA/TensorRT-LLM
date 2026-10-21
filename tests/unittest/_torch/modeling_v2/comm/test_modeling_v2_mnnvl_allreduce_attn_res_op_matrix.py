@@ -13,7 +13,6 @@ import torch
 assert torch.cuda.is_available(), "mnnvl_allreduce_attn_res requires CUDA devices"
 
 if torch.cuda.get_device_capability() != (10, 0):
-    # The entry is certified on sm_100 (GB200) only; see its contract's receipts.
     pytest.skip("mnnvl_allreduce_attn_res is certified on sm_100 only", allow_module_level=True)
 
 

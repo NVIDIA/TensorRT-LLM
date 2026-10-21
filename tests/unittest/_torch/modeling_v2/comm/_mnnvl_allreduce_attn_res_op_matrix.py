@@ -22,6 +22,7 @@ bitwise across the ranks.
 
 import random
 import sys
+import zlib
 from pathlib import Path
 
 import torch
@@ -37,13 +38,12 @@ BUFFER_BYTES = 4 << 20  # the Lamport buffer size Kimi K3 decodes with
 RMS_EPS = 1e-6
 OUT_EPS = 1e-6
 TOL = 2e-2  # normed: max |err| / max |ref|
-TOKENS = (1, 2, 3, 4, 5, 6, 7, 8, 16)
-SNAPSHOTS = (0, 1, 5, 8, 11)  # candidates 1..12
 LAYERS = 12
 DIP_STEPS = (8, 8, 8, 2, 7, 8, 1, 1, 8, 16, 3, 8)
 
 R = None
 entry = None
+validating = None
 WS_A = None
 WS_B = None
 STATS = {"normed_err": 0.0}
@@ -53,30 +53,51 @@ class Call:
     """One call's arguments on every rank and its reference. ``prefix``: a tensor (chained from the previous call's
     ``updated``), True (drawn), or None."""
 
-    def __init__(self, seed, tokens, snapshots, prefix=True):
+    def __init__(
+        self,
+        seed,
+        tokens,
+        snapshots,
+        prefix=True,
+        hidden=H,
+        rms_eps=RMS_EPS,
+        output_rms_eps=OUT_EPS,
+    ):
         g = torch.Generator(device="cuda").manual_seed(seed)
-        self.inputs = [ls.exact_bf16(g, (tokens, H), -4, 5, 1 / 16) for _ in range(R.world)]
+        self.inputs = [ls.exact_bf16(g, (tokens, hidden), -4, 5, 1 / 16) for _ in range(R.world)]
         if prefix is True:
-            prefix = ls.exact_bf16(g, (tokens, H), -32, 33, 1 / 16)
+            prefix = ls.exact_bf16(g, (tokens, hidden), -32, 33, 1 / 16)
         self.prefix = prefix
-        self.block = torch.randn(snapshots, tokens, H, generator=g, device="cuda").bfloat16()
-        self.res_w = (torch.randn(H, generator=g, device="cuda") * 0.05).bfloat16()
-        self.rms_w = (1.0 + 0.1 * torch.randn(H, generator=g, device="cuda")).bfloat16()
-        self.out_w = (1.0 + 0.1 * torch.randn(H, generator=g, device="cuda")).bfloat16()
+        self.block = torch.randn(snapshots, tokens, hidden, generator=g, device="cuda").bfloat16()
+        self.res_w = (torch.randn(hidden, generator=g, device="cuda") * 0.05).bfloat16()
+        self.rms_w = (1.0 + 0.1 * torch.randn(hidden, generator=g, device="cuda")).bfloat16()
+        self.out_w = (1.0 + 0.1 * torch.randn(hidden, generator=g, device="cuda")).bfloat16()
+        self.rms_eps, self.output_rms_eps = rms_eps, output_rms_eps
 
     def ref(self):
-        total = sum(x.float() for x in self.inputs)
-        if self.prefix is not None:
-            total = total + self.prefix.float()
-        updated = total.bfloat16()
-        normed = ls.residual_update_ref(
-            updated, self.block, self.res_w, self.rms_w, RMS_EPS, self.out_w, OUT_EPS
+        return entry.reference(
+            self.inputs,
+            self.prefix,
+            self.block,
+            self.res_w,
+            self.rms_w,
+            self.out_w,
+            self.rms_eps,
+            self.output_rms_eps,
         )
-        return normed, updated
 
     def run(self, ws):
-        return entry(self.inputs[R.rank], self.prefix, self.block, self.res_w, self.rms_w, self.out_w, RMS_EPS,
-                     OUT_EPS, ws)  # fmt: skip
+        return entry(
+            self.inputs[R.rank],
+            self.prefix,
+            self.block,
+            self.res_w,
+            self.rms_w,
+            self.out_w,
+            self.rms_eps,
+            self.output_rms_eps,
+            ws,
+        )
 
 
 def verify(call: Call, got, where: str) -> None:
@@ -172,11 +193,21 @@ def check_create_involves_only_the_tp_group() -> None:
 
 
 def check_single_calls() -> None:
-    for t in TOKENS:
-        for s in SNAPSHOTS:
-            for with_prefix in (True, False):
-                call = Call(1000 + 37 * t + s, t, s, prefix=with_prefix or None)
-                verify(call, call.run(WS_A), f"T {t} snapshots {s} prefix {with_prefix}")
+    for cell in entry.CELLS:
+        spec = cell.spec
+        seed = zlib.crc32(cell.why.encode())
+        for t in spec["tokens"]:
+            call = Call(
+                seed + t,
+                t,
+                spec["snapshots"],
+                prefix=spec["prefix"] or None,
+                hidden=spec["hidden"],
+                rms_eps=spec["rms_eps"],
+                output_rms_eps=spec["output_rms_eps"],
+            )
+            with validating(entry):
+                verify(call, call.run(WS_A), f"{cell.why}: T {t}")
 
 
 def check_a_call_over_one_buffer_raises_on_every_rank() -> None:
@@ -305,7 +336,7 @@ CHECKS = [
 
 
 def _run_one_rank(args) -> int:
-    global R, entry, WS_A, WS_B
+    global R, entry, validating, WS_A, WS_B
     R = ls.Rank(args)
     from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm import (
         mnnvl_allreduce_attn_res as module,
@@ -313,6 +344,11 @@ def _run_one_rank(args) -> int:
     from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm.mnnvl_workspace import (
         MnnvlWorkspace,
     )
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from _validating import validating as validating_cm
+
+    validating = validating_cm
 
     entry = module.mnnvl_allreduce_attn_res
     with torch.inference_mode():

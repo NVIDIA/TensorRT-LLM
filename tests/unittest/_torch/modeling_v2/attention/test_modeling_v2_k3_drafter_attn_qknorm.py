@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """GPU test for the k3_drafter_attn_qknorm catalog entry (sm_100)."""
 
+import zlib
+
 import pytest
 import torch
 
@@ -15,19 +17,16 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.k3_drafter_
     k3_drafter_attn_qknorm,
 )
 
+__extra_import_path__ = [".."]
+from _validating import validating  # noqa: E402
+
 D = 64
 PAGE = 64
-EPS = 1e-5
-THETA = 10000.0
 # max |err| / max |ref|: the kernel rounds P and the output to bf16 (~4e-3 each).
 TOL = 1e-2
 # Context lengths, cycled over the requests: none, a block crossing a page, page and 128-row tile boundaries, the
 # cluster's 16-tile round, several tiles per CTA.
 LENGTHS = (60, 2041, 0, 127, 1000, 64, 128, 5)
-# R x 7: DSpark's block at max_draft_len 7 (max_draft_len tokens under shift_label).
-SPLITS = ((1, 1), (1, 8), (2, 4), (4, 2), (8, 1), (3, 1), (2, 8), (8, 8)) + tuple(
-    (r, 7) for r in range(1, 9)
-)
 
 
 def _bits(t: torch.Tensor) -> torch.Tensor:
@@ -43,10 +42,16 @@ class _Case:
     (optionally with a page stride larger than a page), distinct random pages per request, page-table rows (a strided
     view into a wider table, or dense), qkv and lengths."""
 
-    def __init__(self, seed, heads, kv, num_requests, tokens, page_pad=0, strided_table=True):
+    def __init__(
+        self, seed, heads, kv, num_requests, tokens, page_pad=0, strided_table=True, lengths=None
+    ):
         gen = torch.Generator(device="cuda").manual_seed(seed)
         self.heads, self.kv, self.r, self.t = heads, kv, num_requests, tokens
-        self.lengths = [LENGTHS[(seed + 3 * r) % len(LENGTHS)] for r in range(num_requests)]
+        self.lengths = (
+            list(lengths)
+            if lengths is not None
+            else [LENGTHS[(seed + 3 * r) % len(LENGTHS)] for r in range(num_requests)]
+        )
         need = [(c + PAGE - 1) // PAGE for c in self.lengths]
         self.width = max(need) + 2
         n_pool = sum(need) + 2 * num_requests + 4
@@ -91,71 +96,62 @@ class _Case:
         return torch.empty(self.r * self.t, self.heads * D, dtype=torch.bfloat16, device="cuda")
 
 
-def _attention_ref(case: _Case, qkv: torch.Tensor) -> torch.Tensor:
-    """fp64: each request's q against its cached rows and its block's own k / v, softmax(q k^T / 8) v."""
-    h, kv, t = case.heads, case.kv, case.t
-    outs = []
-    for r, c in enumerate(case.lengths):
-        rows = qkv[r * t : (r + 1) * t].double()
-        q = rows[:, : h * D].view(t, h, D)
-        k_blk = rows[:, h * D : (h + kv) * D].view(t, kv, D).permute(1, 0, 2)
-        v_blk = rows[:, (h + kv) * D :].view(t, kv, D).permute(1, 0, 2)
-        pages = case.table[r, : (c + PAGE - 1) // PAGE].long()
-        k_ctx = case.pool[pages, 0].double().permute(1, 0, 2, 3).reshape(kv, -1, D)[:, :c]
-        v_ctx = case.pool[pages, 1].double().permute(1, 0, 2, 3).reshape(kv, -1, D)[:, :c]
-        k = torch.cat([k_ctx, k_blk], 1).repeat_interleave(h // kv, 0)
-        v = torch.cat([v_ctx, v_blk], 1).repeat_interleave(h // kv, 0)
-        p = torch.softmax(torch.einsum("thd,hld->thl", q, k) / D**0.5, dim=-1)
-        outs.append(torch.einsum("thl,hld->thd", p, v).reshape(t, h * D))
-    return torch.cat(outs)
-
-
-def _qk_norm_rope_ref(case: _Case, qkv: torch.Tensor, q_w, k_w) -> torch.Tensor:
-    """Per-head RMSNorm of the q and k heads, then NeoX RoPE (base THETA) at each row's position, in fp64 and rounded
-    to bf16 as fused_qk_norm_rope stores them; v as is."""
-    h, kv = case.heads, case.kv
-    x = qkv.double().view(qkv.shape[0], h + 2 * kv, D).clone()
-    inv_freq = 1.0 / THETA ** (torch.arange(0, D, 2, dtype=torch.float64, device="cuda") / D)
-    angle = case.positions.double()[:, None] * inv_freq
-    cos, sin = angle.cos()[:, None, :], angle.sin()[:, None, :]
-    for start, count, w in ((0, h, q_w), (h, kv, k_w)):
-        y = x[:, start : start + count]
-        y = y * torch.rsqrt(y.pow(2).mean(-1, keepdim=True) + EPS) * w.double()
-        y1, y2 = y[..., : D // 2], y[..., D // 2 :]
-        x[:, start : start + count] = torch.cat([y1 * cos - y2 * sin, y1 * sin + y2 * cos], -1)
-    return x.view(qkv.shape[0], -1).bfloat16()
-
-
-@pytest.mark.parametrize("num_requests,tokens", SPLITS, ids=[f"{r}x{t}" for r, t in SPLITS])
-def test_k3_drafter_attn_qknorm(num_requests, tokens) -> None:
-    """The raw projection output, normed and roped in the kernel, against the fp64 norm + RoPE + attention; ``qkv``
+@pytest.mark.parametrize("cell", k3_drafter_attn_qknorm.CELLS, ids=lambda c: c.why)
+def test_k3_drafter_attn_qknorm(cell) -> None:
+    """The raw projection output, normed and roped in the kernel, against the fp32 norm + RoPE + attention; ``qkv``
     left as it was; int64 positions give the same bits as int32."""
+    seed = zlib.crc32(cell.why.encode()) % 2**31
+    spec = cell.spec
     with torch.inference_mode():
-        case = _Case(300 + 10 * num_requests + tokens, 6, 1, num_requests, tokens)
-        gen = torch.Generator(device="cuda").manual_seed(num_requests * 9 + tokens)
+        case = _Case(
+            seed,
+            spec["heads"],
+            spec["kv"],
+            spec["num_requests"],
+            spec["tokens"],
+            lengths=spec["lengths"],
+        )
+        gen = torch.Generator(device="cuda").manual_seed(seed + 1)
         raw = (case.qkv.float() * 4.0).bfloat16()
         q_w = (1.0 + 0.2 * torch.randn(D, generator=gen, device="cuda")).bfloat16()
         k_w = (1.0 + 0.2 * torch.randn(D, generator=gen, device="cuda")).bfloat16()
         raw_before = raw.clone()
-        out, out64 = case.out(), case.out()
-        k3_drafter_attn_qknorm(
+        outs = []
+        for dtype in spec["position_dtypes"]:
+            out = case.out()
+            with validating(k3_drafter_attn_qknorm):
+                k3_drafter_attn_qknorm(
+                    raw,
+                    q_w,
+                    k_w,
+                    case.positions.to(dtype),
+                    spec["eps"],
+                    spec["rope_base"],
+                    case.pool,
+                    case.table,
+                    case.ctx_len,
+                    case.heads,
+                    case.kv,
+                    out,
+                )
+            outs.append(out)
+        assert torch.equal(_bits(raw), _bits(raw_before)), "qkv was written"
+        assert torch.equal(_bits(outs[1]), _bits(outs[0])), "int64 positions differ from int32"
+        out = outs[0]
+        want = case.out()
+        k3_drafter_attn_qknorm.reference(
             raw,
             q_w,
             k_w,
             case.positions,
-            EPS,
-            THETA,
+            spec["eps"],
+            spec["rope_base"],
             case.pool,
             case.table,
             case.ctx_len,
-            6,
-            1,
-            out,
+            case.heads,
+            case.kv,
+            want,
         )
-        k3_drafter_attn_qknorm(raw, q_w, k_w, case.positions.long(), EPS, THETA, case.pool, case.table, case.ctx_len,
-                               6, 1, out64)  # fmt: skip
-        assert torch.equal(_bits(raw), _bits(raw_before)), "qkv was written"
-        assert torch.equal(_bits(out64), _bits(out)), "int64 positions differ from int32"
-        want = _attention_ref(case, _qk_norm_rope_ref(case, raw, q_w, k_w))
         err = _rel_err(out, want)
         assert err <= TOL, f"rel err {err:.3e}"
