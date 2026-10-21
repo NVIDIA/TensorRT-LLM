@@ -1853,8 +1853,8 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         batch_next_tokens_cuda_int = torch.empty(
             (logits_cuda.size(0), self.max_beam_width), device=cuda_device, dtype=token_dtype
         )
-        # Raw and processed logprobs share this buffer. Beam-search logprobs
-        # come from beam history and do not occupy rows here.
+        # Only processed logprobs need a full-vocabulary buffer. Raw logprobs
+        # are selected directly from logits; beam search uses its own history.
         reqs_indices_needing_raw_logprobs: list[int] = []
         num_logprobs_rows = 0
         if return_log_probs:
@@ -1867,7 +1867,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                     continue
                 if need_raw_logprobs[slot]:
                     reqs_indices_needing_raw_logprobs.append(req_idx)
-                if need_raw_logprobs[slot] or need_processed_logprobs[slot]:
+                if need_processed_logprobs[slot]:
                     num_logprobs_rows += num_generated_tokens
         batch_processed_logprobs_cuda = (
             torch.empty(
