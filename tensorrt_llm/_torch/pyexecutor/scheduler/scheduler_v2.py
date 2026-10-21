@@ -1476,9 +1476,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         if not budget.can_fit_tokens(req_tokens):
             return ScheduleAction.STOP, 0, scheduled_beam_width, req_it_end
 
-        if scheduled_beam_width == 0:
-            scheduled_beam_width = beam_width
-        elif scheduled_beam_width != beam_width:
+        if scheduled_beam_width != 0 and scheduled_beam_width != beam_width:
             return ScheduleAction.SKIP, 0, scheduled_beam_width, req_it_end
 
         success = self._try_allocate_generation(req)
@@ -1496,9 +1494,10 @@ class KVCacheV2Scheduler(RequestScheduler):
                     f"or max_tokens (GLOBAL tokens across CP ranks, not "
                     f"per-rank), or reduce concurrency."
                 )
-            req_it_end, success = self._try_evict_for_gen(
-                req, requests_list, req_it, req_it_end, evicted, inflight_request_ids
-            )
+            if self.kv_cache_manager.can_evict:
+                req_it_end, success = self._try_evict_for_gen(
+                    req, requests_list, req_it, req_it_end, evicted, inflight_request_ids
+                )
 
         if not success:
             req_it_end, success = self._try_recompute_pause_for_gen(
@@ -1513,23 +1512,31 @@ class KVCacheV2Scheduler(RequestScheduler):
             )
 
         if success:
-            return ScheduleAction.SCHEDULED, req_tokens, scheduled_beam_width, req_it_end
+            # Only admitted requests constrain the batch's beam width. A
+            # skipped request must not prevent a runnable peer from progressing.
+            return ScheduleAction.SCHEDULED, req_tokens, beam_width, req_it_end
 
         # Self-eviction: suspend this gen request to free its
         # GPU pages so other requests can resume().
         # Skip if already suspended — suspending again is a no-op
         # that frees no pages.
-        if self.kv_cache_manager.is_request_active(
-            req.py_request_id
-        ) and not self._has_pending_connector_load(req):
+        if (
+            self.kv_cache_manager.can_evict
+            and self.kv_cache_manager.is_request_active(req.py_request_id)
+            and not self._has_pending_connector_load(req)
+        ):
             logger.debug(
                 f"[V2Scheduler] Self-evicting request {req.py_request_id} "
                 f"(state={req.state.name}) to free GPU pages"
             )
             self._suspend_request(req)
             evicted.append(req)
+            return ScheduleAction.STOP, 0, scheduled_beam_width, req_it_end
 
-        return ScheduleAction.STOP, 0, scheduled_beam_width, req_it_end
+        # Without a secondary tier, suspension cannot reclaim the held pages.
+        # Keep this request active and let peers run until they release capacity.
+        # The executor clears its batch index only after consuming that batch.
+        return ScheduleAction.SKIP, 0, scheduled_beam_width, req_it_end
 
     def _try_allocate_generation(self, req: LlmRequest) -> bool:
         """Atomically admit one generation step in target and draft pools.
@@ -1609,6 +1616,9 @@ class KVCacheV2Scheduler(RequestScheduler):
         Returns True when pages became available in this iteration.
         """
         if self.kv_cache_manager.has_cache_tier_below_gpu:
+            return False
+        # A deferred victim will release capacity when its connector saves finish.
+        if self.kv_cache_manager.has_pending_preemption():
             return False
         # A disaggregated generation worker received its context KV rather
         # than computing it, so it cannot replay a prefill at all.
@@ -1956,7 +1966,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         Recompute pause does not shrink the ordinary scheduling frontier; exact
         victim indices prevent destructively-freed requests from being revisited.
         """
-        if not self.enable_recompute_pause:
+        if not self.enable_recompute_pause or self.kv_cache_manager.has_pending_preemption():
             return req_it_end, False
 
         while True:
