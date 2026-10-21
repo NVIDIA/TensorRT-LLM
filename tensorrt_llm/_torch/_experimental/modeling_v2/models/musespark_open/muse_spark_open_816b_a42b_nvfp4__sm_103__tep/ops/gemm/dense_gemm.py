@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""The dense BF16 projections of a step of at most 8 rows, with the kernel named by the caller.
+"""The dense BF16 projections of a step of at most 8 rows (32 by split-K or cuBLAS), with the
+kernel named by the caller.
 
 At tep8 every decoder layer multiplies the step's rows by four BF16 weights per
 rank: the fused QKV projection ``[2304, 8192]``, the attention output projection
@@ -60,6 +61,9 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import (
 
 #: Rows this entry is certified for: one request's last accepted token and up to 7 drafts.
 MAX_ROWS = 8
+#: Rows the split-K and cuBLAS kernels are also certified for (flashinfer's split-K takes
+#: M <= 32): decode steps of up to four requests at K = 7, on the TP4 per-rank shapes.
+WIDE_MAX_ROWS = 32
 #: The four per-rank projection shapes ``(K, N)`` of this checkpoint at tep8.
 QKV_SHAPE = (8192, 2304)
 O_PROJ_SHAPE = (1024, 8192)
@@ -142,7 +146,8 @@ def _run(x, weight, out, enable_pdl, family, fields):
 
 
 class DenseGemm(OpWrapper):
-    """``x @ weight.T`` for ``x [M <= 8, K]`` and ``weight [N, K]``, BF16, by the named kernel."""
+    """``x @ weight.T`` for ``x [M, K]`` and ``weight [N, K]``, BF16, by the named kernel: M <= 8
+    for every kernel, M <= 32 for split-K and cuBLAS."""
 
     ARCHS = frozenset({Arch.SM_103})
 
@@ -206,6 +211,26 @@ class DenseGemm(OpWrapper):
         Cell(
             why="unpooler slice at the verify width by split-K 4, kept as an override",
             spec=dict(m=8, k=4096, n=1024, kernel="splitk:64,8,4,12"),
+        ),
+        Cell(
+            why="TP4 QKV of four requests at K=7: [32, 8192] x [4608, 8192]^T, split-K 2, 32-row MMA N",
+            spec=dict(m=32, k=8192, n=4608, kernel="splitk:64,32,2,9"),
+        ),
+        Cell(
+            why="TP4 QKV of two requests (16 rows), split-K 2, 16-row MMA N",
+            spec=dict(m=16, k=8192, n=4608, kernel="splitk:64,16,2,11"),
+        ),
+        Cell(
+            why="TP4 pooler slice of three requests (24 rows), split-K 4, two 16-row tiles",
+            spec=dict(m=24, k=8192, n=1024, kernel="splitk:64,16,4,10"),
+        ),
+        Cell(
+            why="TP4 unpooler slice of four requests (32 rows), split-K 2, two 16-row tiles",
+            spec=dict(m=32, k=4096, n=2048, kernel="splitk:64,16,2,11"),
+        ),
+        Cell(
+            why="TP4 unpooler slice of 9 rows (a row count that is not a multiple of 8) by cuBLAS",
+            spec=dict(m=9, k=4096, n=2048, kernel="cublas"),
         ),
     )
 
@@ -277,7 +302,8 @@ class DenseGemm(OpWrapper):
         # the error budget and the plan's shapes are BF16 only.
         assert x.dtype == torch.bfloat16 and weight.dtype == torch.bfloat16, "BF16 operands only"
         assert x.dim() == 2 and weight.dim() == 2, "x [M, K] and weight [N, K]"
-        assert 1 <= x.shape[0] <= MAX_ROWS, f"1 <= M <= {MAX_ROWS} rows"
+        top = MAX_ROWS if parse_kernel(kernel)[0] == DIRECT else WIDE_MAX_ROWS
+        assert 1 <= x.shape[0] <= top, f"1 <= M <= {top} rows for {kernel}"
         assert x.shape[1] == weight.shape[1], "weight is [N, K], not its transpose"
         parse_kernel(kernel)
         if out is not None:
