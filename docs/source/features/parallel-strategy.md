@@ -111,6 +111,9 @@ multimodal_config:
   encoder_data_parallel_size: 1  # Encoder TP2, with LLM attention DP2
 ```
 
+This example was run with Qwen3-VL. Qwen2.5-VL encoder TP and DP were checked
+only without LLM attention DP.
+
 With LLM TP, encoder DP distributes cache-miss items by physical encoder token
 cost and gathers their embeddings in prompt order. With LLM attention DP and a
 fully replicated encoder, each rank encodes only its own requests. With LLM
