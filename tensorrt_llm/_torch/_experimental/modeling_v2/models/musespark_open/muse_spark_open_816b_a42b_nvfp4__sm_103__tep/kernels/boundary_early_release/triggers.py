@@ -109,8 +109,10 @@ class _NormGatePdl:
     alone. A call carrying ``norm_gate_pdl`` (a trigger name; only
     ``DecodeTarget`` passes it) runs the PDL copy of the built-in kernel where
     the built-in ``apply_output_gate`` would launch that kernel for a decode
-    step (at most 8 rows); every other call, prefill among them, runs the
-    built-in method.
+    step (at most 8 rows); on a decode step of 33..512 rows it asks
+    ``batch_dense_gemms`` (``_batch_dense_gemms``, set on the attention when that
+    path is composed); every other call, prefill among them, runs the built-in
+    method.
     """
 
     _norm_gate_trigger: Optional[str]
@@ -132,8 +134,14 @@ class _NormGatePdl:
 
     def apply_output_gate(self, attention_output, gate):
         trigger = self._norm_gate_trigger
-        if trigger is None or not self._fits_norm_gate(attention_output, gate):
+        if trigger is None:
             return super().apply_output_gate(attention_output, gate)
+        if not self._fits_norm_gate(attention_output, gate):
+            # Larger decode steps: ``batch_dense_gemms`` (when composed) runs the PDL copy of
+            # whichever kernel the built-in would launch, or declines.
+            batch = getattr(self, "_batch_dense_gemms", None)
+            out = None if batch is None else batch.norm_gate(self, attention_output, gate, trigger)
+            return super().apply_output_gate(attention_output, gate) if out is None else out
         return _norm_gate.attention_norm_gate(
             attention_output, gate, self.o_head_norm.variance_epsilon, trigger
         )
