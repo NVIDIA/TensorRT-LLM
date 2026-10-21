@@ -40,7 +40,7 @@ from ....attention.backends.sparse.timestep_phase import graph_phase_for_timeste
 from ....attention.backends.trtllm import TrtllmAttention as BaseTrtllmAttention
 from ....attention.backends.trtllm import TrtllmAttentionMetadata as BaseTrtllmAttentionMetadata
 from ....metadata import KVCacheParams
-from ...cache import BlockCausalKVCacheManager
+from ...cache import BlockCausalKVCacheManager, ForwardPlan
 from ...cuda_graph_runner import resolved_extra_key
 from .interface import AttentionBackend, AttentionTensorLayout, as_fused_qkv, is_fused_qkv
 
@@ -214,19 +214,19 @@ class TrtllmAttentionMetadata:
         All requests are the one sequence; each reads its own causal block's page list
         (``kv_cache.causal_block_offsets``).
 
-        One object per (geometry, causal block count and size), stored on the cache
+        One object per (spec, causal block count and size), stored on the cache
         (``kv_cache.attention_metadata``) and shared by every layer that attends over it;
         ``BlockCausalKVCacheManager.shutdown`` drops it. It is built once, eagerly, and
         then bound to the cache's own device tensors: the page offsets and the
         per-causal-block key counts read by kernel are owned by the cache, rewritten in place by
         ``commit``. So nothing here changes after a commit, and a CUDA graph captured
         around the forward replays correctly with no refresh. The host-side lengths taken
-        by the op bear upper bound values, fixed at the geometry's capacity.
+        by the op are upper bounds fixed by the spec.
 
         ``prepare()`` runs exactly once, when the object is built. Right after it, four
         fields are replaced: ``kv_cache_block_offsets`` and ``kv_lens_cuda_runtime`` by
         views of the cache's device tensors, ``kv_lens_runtime`` and
-        ``host_total_kv_lens`` by bounds at the pool's capacity. Every other field keeps
+        ``host_total_kv_lens`` by ``kv_cache.max_keys_per_causal_block``. Every other field keeps
         the value ``prepare()`` computed.
 
         Mapping onto the LLM attention metadata: each causal block is one context
@@ -235,15 +235,15 @@ class TrtllmAttentionMetadata:
           (the fixed region, its window and the earlier causal blocks), not only to its
           own.
         - ``max_num_requests = max_num_sequences = max_causal_blocks``: one request per
-          causal block, sized for the most causal blocks any declared causal block size
-          cuts the staged tokens into. At the Cosmos geometry that is 4: 1 per denoising forward,
-          4 in the clean pass.
+          causal block, sized for the most causal blocks the spec declares for one
+          forward. At the Cosmos spec that is 4: 1 per denoising forward, 4 in the clean
+          pass.
         Unlike LLM chunked prefill, the requests are synthetic (no ``LlmRequest``) and
         all carry request id 0, the mask is FULL within a causal block, and the past is
         bounded by the window rather than a growing prefix. The total video length is
         never needed: ``num_causal_blocks`` counts causal blocks per forward.
         """
-        cache_key = ("trtllm", kv_cache.geometry, num_causal_blocks, causal_block_size)
+        cache_key = ("trtllm", kv_cache.spec, num_causal_blocks, causal_block_size)
         cached = kv_cache.attention_metadata.get(cache_key)
         if cached is not None:
             return cached
@@ -277,10 +277,10 @@ class TrtllmAttentionMetadata:
         # after the cached count, inside its private pages. Both tensors are the cache's.
         metadata.kv_cache_block_offsets = kv_cache.causal_block_offsets(size)[:, :n]
         metadata.kv_lens_cuda_runtime = kv_cache.causal_block_lengths(size)[1][:n]
-        # Actual per-causal-block lengths come from the device tensor above. Use pool capacity
-        # as the host upper bound so this metadata and captured graphs remain valid
-        # when the same geometry is reopened with a longer pinned prefix.
-        bound = kv_cache.pool_tokens
+        # Actual per-causal-block lengths come from the device tensor above. The host
+        # upper bound holds for every open of the spec, whatever prefix it pins, so this
+        # metadata and captured graphs stay valid across reopens.
+        bound = kv_cache.max_keys_per_causal_block
         metadata.kv_lens_runtime = torch.full((n,), bound, dtype=torch.int32)
         metadata.host_total_kv_lens[0] = n * bound
         metadata.host_total_kv_lens[1] = 0
@@ -441,7 +441,7 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
         seq_len_kv: Optional[int] = None,
         sparse_backend_args: Optional[SparseBackendForwardArgs] = None,
         timestep: Optional[torch.Tensor] = None,
-        kv_cache: Optional[BlockCausalKVCacheManager] = None,
+        kv: Optional[ForwardPlan] = None,
         **kwargs,
     ) -> torch.Tensor:
         """
@@ -464,11 +464,7 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
             k: Key tensor [B, S_kv, H_kv, D] or None if fused
             v: Value tensor [B, S_kv, H_kv, D] or None if fused
             batch_size: Batch size
-            seq_len: Query length used for metadata and reshaping. Without ``kv_cache``,
-                the Attention module supplies ``S``, including padding. With ``kv_cache``,
-                the caller supplies the global real query length (all ranks, before
-                padding, not this rank's shard), which may be smaller than
-                ``S``; trailing padding is neither cached nor attended and outputs zero.
+            seq_len: Query length ``S`` used for metadata and reshaping, padding included.
             attention_mask: Attention mask type
             seq_len_kv: Sequence length for K/V (for cross-attention, defaults to seq_len)
             sparse_backend_args: Module-predicted sparse inputs handed to the core
@@ -480,32 +476,22 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
                 backends. The TRTLLM kernels have no key-padding input, so callers
                 that need padded keys must guard at the model level or select the
                 ``VANILLA`` backend.
-            kv_cache: A ``BlockCausalKVCacheManager``. When given, ``k``/``v`` are the new
-                tokens only: the fused kernel writes them at ``staging_offset`` and
-                attends over everything cached before them plus themselves.
-                ``batch_size`` must be 1. Sparse attention is not supported on this path.
-            causal_block_size: Specifies how the real tokens will be cut into consecutive
-                causal blocks: full attention within a causal block, causal across causal
-                blocks. Requires ``kv_cache``; passing it without one raises. Use it when the
-                cache must hold each causal block's K/V as if the causal blocks had been
-                generated one at a time, so later ones never leak into earlier ones. Absent:
-                one causal block.
+            kv: A ``ForwardPlan`` from a ``BlockCausalKVCacheManager``. When given,
+                ``k``/``v`` are the new tokens only: the fused kernel writes them at
+                ``staging_offset`` and attends over everything cached before them plus
+                themselves, full within a causal block and causal across causal blocks.
+                The first ``kv.num_tokens`` rows are real; rows past them are padding,
+                neither cached nor attended, and output zero. ``batch_size`` must be 1.
+                Sparse attention is not supported on this path.
 
         Returns:
             Output tensor [B, S, H*D]
         """
-        causal_block_size = kwargs.pop("causal_block_size", None)
-        if kv_cache is not None:
+        if kv is not None:
             if sparse_backend_args is not None:
                 raise NotImplementedError("Sparse attention is not supported over a K/V cache.")
-            output = self._forward_with_kv_cache(
-                q, k, v, batch_size, seq_len, kv_cache, causal_block_size, attention_mask
-            )
+            output = self._forward_with_kv_cache(q, k, v, batch_size, kv, attention_mask)
             return output.view(1, q.shape[1], -1)
-        if causal_block_size is not None:
-            raise NotImplementedError(
-                "causal_block_size is only implemented over a K/V cache; pass kv_cache."
-            )
         sparse_attn_phase = self._sparse_attn_phase(timestep)
         block_sparse_inputs = (
             sparse_backend_args.block_sparse_inputs if sparse_backend_args is not None else None
@@ -568,13 +554,13 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
         k: Optional[torch.Tensor],
         v: Optional[torch.Tensor],
         batch_size: int,
-        seq_len: int,
-        kv_cache: BlockCausalKVCacheManager,
-        causal_block_size: Optional[int],
+        plan: ForwardPlan,
         attention_mask: PredefinedAttentionMask,
     ) -> torch.Tensor:
-        """Attention over ``kv_cache`` with the ``seq_len`` real new tokens; returns
-        ``[S, H*D]`` with zero rows past ``seq_len``."""
+        """Attention over the plan's cache with its ``num_tokens`` real new tokens;
+        returns ``[S, H*D]`` with zero rows past them."""
+        plan.validate()
+        kv_cache = plan.cache
         if attention_mask != PredefinedAttentionMask.FULL:
             raise NotImplementedError("K/V cache attention is full attention over the cache.")
         if self.quant_attention_config is not None:
@@ -617,17 +603,17 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
                 f"q is {tuple(q.shape)}, k is {tuple(k.shape)}; this backend was built for "
                 f"{self.num_heads} heads of {self.head_dim}"
             )
-        if not 0 < seq_len <= num_rows:
+        num_tokens = plan.num_tokens
+        if num_tokens > num_rows:
             raise ValueError(
-                f"seq_len {seq_len} outside (0, {num_rows}]: it counts the real tokens; "
-                "rows past it are padding."
+                f"the plan's {num_tokens} tokens exceed the {num_rows} rows: it counts the real "
+                "tokens; rows past it are padding."
             )
-        num_tokens = seq_len
         if num_tokens < num_rows:
             q, k, v = q[:, :num_tokens], k[:, :num_tokens], v[:, :num_tokens]
             if packed is not None:
                 packed = packed[:, :num_tokens]
-        causal_block_size, num_causal_blocks = kv_cache.causal_blocks(num_tokens, causal_block_size)
+        causal_block_size, num_causal_blocks = plan.causal_block_size, plan.num_causal_blocks
         # The fused kernel writes each causal block's own tokens into its private pages;
         # the shared pages, which later causal blocks and later forwards read, are
         # staged here.

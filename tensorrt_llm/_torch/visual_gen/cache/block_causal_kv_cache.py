@@ -73,7 +73,9 @@ storage positions here never grow past the resident capacity.
 
 from __future__ import annotations
 
+import collections.abc
 from dataclasses import dataclass
+from types import MappingProxyType
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -99,6 +101,94 @@ _DTYPES = {
 # integer id that normally comes from an LlmRequest; a rollout has none, so it
 # gets a fixed one, as V2's own guard-page and capture-dummy sequences do.
 _ROLLOUT_REQUEST_ID = 0
+
+
+@dataclass(frozen=True)
+class RolloutSpec:
+    """The geometry of a rollout: what ``open`` lays out in the pool and what every
+    forward of the rollout may ask for. The cache keeps device state per spec, so CUDA
+    graphs captured over a spec replay whenever it is opened again.
+
+    Args:
+        window_tokens: history each causal block may see before itself, in tokens
+            (``(window_frames - 1) * tokens_per_frame``).
+        max_staged_tokens: most tokens a forward may write before a commit
+            (``chunk_frames * tokens_per_frame``); a forward may write fewer.
+        causal_blocks: every causal block size a forward may use, mapped to the most
+            causal blocks of that size one forward cuts its tokens into. A denoising
+            step over a whole chunk is one causal block of ``max_staged_tokens``; the
+            clean pass is ``chunk_frames`` causal blocks of ``tokens_per_frame``. Each
+            size gets private pages for that many causal blocks.
+        max_pin_tokens: most tokens any ``open`` of this spec pins.
+    """
+
+    window_tokens: int
+    max_staged_tokens: int
+    causal_blocks: collections.abc.Mapping[int, int]
+    max_pin_tokens: int = 0
+
+    def __post_init__(self) -> None:
+        blocks = dict(sorted((int(size), int(n)) for size, n in dict(self.causal_blocks).items()))
+        object.__setattr__(self, "causal_blocks", MappingProxyType(blocks))
+        if min(self.window_tokens, self.max_staged_tokens) <= 0 or self.max_pin_tokens < 0:
+            raise ValueError(
+                "window_tokens and max_staged_tokens must be positive and max_pin_tokens "
+                "non-negative"
+            )
+        if not blocks or any(
+            size <= 0 or n <= 0 or size * n > self.max_staged_tokens for size, n in blocks.items()
+        ):
+            raise ValueError(
+                f"causal_blocks {blocks} must map positive sizes to positive counts whose "
+                f"tokens fit max_staged_tokens {self.max_staged_tokens}"
+            )
+
+    def __hash__(self) -> int:
+        return hash(
+            (
+                self.window_tokens,
+                self.max_staged_tokens,
+                tuple(self.causal_blocks.items()),
+                self.max_pin_tokens,
+            )
+        )
+
+    @property
+    def causal_block_sizes(self) -> Tuple[int, ...]:
+        """The declared causal block sizes, ascending."""
+        return tuple(self.causal_blocks)
+
+
+@dataclass(frozen=True)
+class ForwardPlan:
+    """One forward over the cache, the way attention takes it (``kv=``): the real new
+    tokens and how they are cut into causal blocks. Built by
+    ``BlockCausalKVCacheManager.plan`` for the open rollout.
+
+    ``num_tokens`` counts the real tokens of the forward across all ranks, before
+    sequence-parallel padding; rows past it are padding, neither cached nor attended.
+    ``graph_key`` holds every host value a forward captured in a CUDA graph bakes in,
+    so a graph runner keys on it; commits only rewrite device tensors and are not part
+    of it.
+    """
+
+    cache: "BlockCausalKVCacheManager"
+    spec: RolloutSpec
+    num_tokens: int
+    causal_block_size: int
+    num_causal_blocks: int
+
+    @property
+    def graph_key(self) -> Tuple:
+        return (id(self.cache), self.spec, self.num_tokens, self.causal_block_size)
+
+    def validate(self) -> None:
+        """Raise unless the plan's cache is open with the spec the plan was made for."""
+        if not self.cache.is_open or self.cache.spec != self.spec:
+            raise RuntimeError(
+                "this ForwardPlan was made for a rollout that is no longer open; make a new "
+                "one with cache.plan()"
+            )
 
 
 @dataclass
@@ -154,10 +244,10 @@ class _CausalBlockLayout:
 
 
 @dataclass
-class _GeometryState:
-    """Device state a geometry's forwards read, allocated the first time that
-    geometry is opened and kept at the same addresses for the life of the cache, so
-    a CUDA graph captured over it stays valid when the geometry is opened again.
+class _SpecState:
+    """Device state a spec's forwards read, allocated the first time that spec is
+    opened and kept at the same addresses for the life of the cache, so a CUDA graph
+    captured over it stays valid when the spec is opened again.
     Every per-layout tensor is a view into one of two packed buffers, rewritten in
     place on the device by ``commit``."""
 
@@ -181,8 +271,8 @@ class BlockCausalKVCacheManager(KVCacheManagerV2):
     """``KVCacheManagerV2`` driven as one long-lived sequence with a caller-owned page
     table.
 
-    The constructor allocates the page pool; ``open`` lays a rollout's geometry out
-    inside it: the pinned prefix, the sliding window, the staged tokens (written by
+    The constructor allocates the page pool; ``open`` lays a rollout's ``RolloutSpec``
+    out inside it: the pinned prefix, the sliding window, the staged tokens (written by
     forwards, not yet committed) and the causal blocks' private pages.
 
     One instance is one pool holding one open rollout at a time, batch size 1.
@@ -219,7 +309,7 @@ class BlockCausalKVCacheManager(KVCacheManagerV2):
         tokens_per_page: page size, a power of two (both paged kernels require
             it). Each backend may add its own constraint and raises if unmet.
         pool_tokens: size of the page pool, a multiple of ``tokens_per_page``;
-            ``pool_tokens_for`` gives what a geometry needs.
+            ``pool_tokens_for`` gives what a ``RolloutSpec`` needs.
     """
 
     @staticmethod
@@ -229,52 +319,28 @@ class BlockCausalKVCacheManager(KVCacheManagerV2):
         return ceil_div(3 * (tokens_per_page - 1) + causal_block_size, tokens_per_page)
 
     @staticmethod
-    def _geometry_pages(
-        tokens_per_page: int,
-        pin_tokens: int,
-        window_tokens: int,
-        max_staged_tokens: int,
-        causal_block_sizes: Sequence[int],
-    ) -> Tuple[int, int, Tuple[int, ...]]:
-        """Validate a geometry and return its page counts: ``(resident, private,
-        sizes)``. Resident tokens peak at pin + window + (tpb - 1) stale + staged; the
-        extra page covers the stale tokens and an unaligned fixed-region end."""
+    def _spec_pages(tokens_per_page: int, spec: RolloutSpec) -> Tuple[int, int]:
+        """A spec's page counts: ``(resident, private)``. Resident tokens peak at pin +
+        window + (tpb - 1) stale + staged; the extra page covers the stale tokens and an
+        unaligned fixed-region end."""
         tpb = tokens_per_page
         if tpb <= 0 or tpb & (tpb - 1):
             raise ValueError(f"tokens_per_page must be a power of two, got {tpb}")
-        if min(window_tokens, max_staged_tokens) <= 0 or pin_tokens < 0:
-            raise ValueError(
-                "window_tokens and max_staged_tokens must be positive and pin_tokens non-negative"
-            )
-        sizes = tuple(dict.fromkeys(int(b) for b in causal_block_sizes))
-        if not sizes or any(not 0 < b <= max_staged_tokens for b in sizes):
-            raise ValueError(
-                f"causal_block_sizes {tuple(causal_block_sizes)} must be positive and at most "
-                f"max_staged_tokens {max_staged_tokens}"
-            )
-        resident = ceil_div(pin_tokens + window_tokens + max_staged_tokens, tpb) + 1
-        private = sum(
-            (max_staged_tokens // b)
-            * BlockCausalKVCacheManager._private_pages_per_causal_block(tpb, b)
-            for b in sizes
+        resident = (
+            ceil_div(spec.max_pin_tokens + spec.window_tokens + spec.max_staged_tokens, tpb) + 1
         )
-        return resident, private, sizes
+        private = sum(
+            n * BlockCausalKVCacheManager._private_pages_per_causal_block(tpb, size)
+            for size, n in spec.causal_blocks.items()
+        )
+        return resident, private
 
     @staticmethod
-    def pool_tokens_for(
-        *,
-        tokens_per_page: int,
-        pin_tokens: int,
-        window_tokens: int,
-        max_staged_tokens: int,
-        causal_block_sizes: Sequence[int],
-    ) -> int:
-        """Pool tokens a geometry needs: resident pages (pinned prefix, window, staged
-        tokens, one spare) plus the private pages of every causal block size. A pool of at
-        least this many tokens can ``open`` the geometry."""
-        resident, private, _ = BlockCausalKVCacheManager._geometry_pages(
-            tokens_per_page, pin_tokens, window_tokens, max_staged_tokens, causal_block_sizes
-        )
+    def pool_tokens_for(spec: RolloutSpec, *, tokens_per_page: int) -> int:
+        """Pool tokens a spec needs: resident pages (pinned prefix, window, staged
+        tokens, one spare) plus the private pages of its causal blocks. A pool of at least
+        this many tokens can ``open`` the spec."""
+        resident, private = BlockCausalKVCacheManager._spec_pages(tokens_per_page, spec)
         return (resident + private) * tokens_per_page
 
     @staticmethod
@@ -296,26 +362,17 @@ class BlockCausalKVCacheManager(KVCacheManagerV2):
 
     @staticmethod
     def pool_bytes_for(
+        spec: RolloutSpec,
         *,
         num_layers: int,
         num_kv_heads: int,
         head_dim: int,
         dtype: torch.dtype,
         tokens_per_page: int,
-        pin_tokens: int,
-        window_tokens: int,
-        max_staged_tokens: int,
-        causal_block_sizes: Sequence[int],
     ) -> int:
-        """Device bytes a pool sized for this geometry takes from the GPU."""
+        """Device bytes a pool sized for this spec takes from the GPU."""
         return BlockCausalKVCacheManager.bytes_for_pool_tokens(
-            BlockCausalKVCacheManager.pool_tokens_for(
-                tokens_per_page=tokens_per_page,
-                pin_tokens=pin_tokens,
-                window_tokens=window_tokens,
-                max_staged_tokens=max_staged_tokens,
-                causal_block_sizes=causal_block_sizes,
-            ),
+            BlockCausalKVCacheManager.pool_tokens_for(spec, tokens_per_page=tokens_per_page),
             num_layers=num_layers,
             num_kv_heads=num_kv_heads,
             head_dim=head_dim,
@@ -335,7 +392,7 @@ class BlockCausalKVCacheManager(KVCacheManagerV2):
 
     @property
     def pool_tokens(self) -> int:
-        """Tokens the page pool holds, every geometry included."""
+        """Tokens the page pool holds, every spec included."""
         return self._pool_tokens
 
     def __init__(
@@ -417,7 +474,8 @@ class BlockCausalKVCacheManager(KVCacheManagerV2):
         # causal block size. Kept here, not by the backend, so the cache's lifetime is the
         # caller's; the entries hold the cache, so shutdown() clears them.
         self.attention_metadata: Dict[Tuple, object] = {}
-        # The open geometry; set by open().
+        # The open spec and its fields; set by open().
+        self.spec: Optional[RolloutSpec] = None
         self.window_tokens = 0
         self.max_staged_tokens = 0
         self.causal_block_sizes: Tuple[int, ...] = ()
@@ -426,6 +484,9 @@ class BlockCausalKVCacheManager(KVCacheManagerV2):
         self._pin_tokens = 0
         self._fixed_tokens = 0
         self._history_tokens = 0
+        # Most tokens a plan or a staged write covered since the last commit. Plans are
+        # made on the host for every forward, so this holds under CUDA graph replay too.
+        self._staged_tokens = 0
         # Device-side state read by the kernels. Every tensor here lives for the
         # life of the cache and is rewritten in place by open() and commit(), never
         # on the forward path, so a CUDA graph captured around a forward keeps
@@ -434,15 +495,15 @@ class BlockCausalKVCacheManager(KVCacheManagerV2):
         # The page table: layer-0 view indices in logical order, the fixed region's full
         # pages first (never rotated), then the ring: the page the fixed region's
         # tail shares with the first history tokens (if any), history, free pages.
-        # Sized for the whole pool; a geometry uses the first num_pages entries.
+        # Sized for the whole pool; a spec uses the first num_pages entries.
         self._table: Optional[torch.Tensor] = None  # [pool_pages] int32
         self._fixed_pages = 0
         # Host copy of the resident page table, rotated in lockstep with the device one, so
         # that nothing is ever read back; and the private pages' view indices.
         self._host_table: Optional[np.ndarray] = None  # [num_pages] int64
         self._host_private: Optional[np.ndarray] = None  # [pool_pages] int64
-        # Per-geometry state, and the open geometry's fields bound as attributes.
-        self._states: Dict[Tuple[int, int, Tuple[int, ...]], _GeometryState] = {}
+        # Per-spec state, and the open spec's fields bound as attributes.
+        self._states: Dict[RolloutSpec, _SpecState] = {}
         self._layouts: Dict[int, _CausalBlockLayout] = {}
         self._commit_copy_src: Optional[torch.Tensor] = None
         self._commit_copy_dst: Optional[torch.Tensor] = None
@@ -466,48 +527,34 @@ class BlockCausalKVCacheManager(KVCacheManagerV2):
 
     # ------------------------------------------------------------------ lifecycle
 
-    def open(
-        self,
-        *,
-        pin_tokens: int = 0,
-        window_tokens: int,
-        max_staged_tokens: int,
-        causal_block_sizes: Sequence[int],
-    ) -> None:
-        """Start a rollout with this geometry; the sequence starts empty.
+    def open(self, spec: RolloutSpec, *, pin_tokens: int = 0) -> None:
+        """Start a rollout with this spec; the sequence starts empty.
 
         Args:
+            spec: the rollout's geometry. It must fit the pool: ``pool_tokens_for`` of
+                it at most ``pool_tokens``.
             pin_tokens: the first tokens committed become the fixed region: always
-                visible, never evicted. Commit them like any other tokens; a commit
-                may exceed ``max_staged_tokens`` as long as the excess is pinned.
-            window_tokens: history each causal block may see before itself, in tokens
-                (``(window_frames - 1) * tokens_per_frame``).
-            max_staged_tokens: most tokens a forward may write before a commit
-                (``chunk_frames * tokens_per_frame``); a forward may write fewer.
-            causal_block_sizes: every causal block size a forward may use, at most
-                ``max_staged_tokens``. A forward of ``T`` tokens cut into causal blocks
-                of size ``b`` needs ``b`` declared and ``T`` a multiple of ``b`` within
-                ``max_staged_tokens``: all staged tokens as one causal block is a
-                denoising step, one frame per causal block is the clean pass, a shorter
-                final chunk as one causal block is its own size. Each size gets its own
-                private pages, ``max_staged_tokens // b`` causal blocks' worth.
+                visible, never evicted. At most ``spec.max_pin_tokens``. Commit them like
+                any other tokens; a commit may exceed ``max_staged_tokens`` as long as
+                the excess is pinned.
 
-        The geometry must fit the pool: ``pool_tokens_for`` of it at most
-        ``pool_tokens``. Device state is allocated per geometry the first time it is
-        opened and kept, so graphs captured over a geometry replay after it is
-        opened again.
+        Device state is allocated per spec the first time it is opened and kept, so
+        graphs captured over a spec replay after it is opened again, whatever
+        ``pin_tokens`` the reopen takes.
         """
         if self._kv_cache is not None:
             raise RuntimeError("cache already open; call close() first")
+        if not 0 <= pin_tokens <= spec.max_pin_tokens:
+            raise ValueError(
+                f"pin_tokens {pin_tokens} must be within [0, spec.max_pin_tokens "
+                f"{spec.max_pin_tokens}]"
+            )
         tpb = self.tokens_per_page
-        num_pages, num_private, sizes = self._geometry_pages(
-            tpb, pin_tokens, window_tokens, max_staged_tokens, causal_block_sizes
-        )
+        num_pages, num_private = self._spec_pages(tpb, spec)
         needed = (num_pages + num_private) * tpb
         if needed > self._pool_tokens:
             raise ValueError(
-                f"geometry needs {needed} pool tokens (pin {pin_tokens}, window {window_tokens}, "
-                f"staged {max_staged_tokens}, causal block sizes {sizes}); the pool holds {self._pool_tokens}"
+                f"{spec} needs {needed} pool tokens; the pool holds {self._pool_tokens}"
             )
 
         kv_cache = self._create_kv_cache(_ROLLOUT_REQUEST_ID, None, None, is_dummy=True)
@@ -551,17 +598,7 @@ class BlockCausalKVCacheManager(KVCacheManagerV2):
         self._buffers = buffers
         self._kv_cache = kv_cache
         try:
-            self._open_with_geometry(
-                kv_cache,
-                pages,
-                buf,
-                pin_tokens,
-                window_tokens,
-                max_staged_tokens,
-                sizes,
-                num_pages,
-                num_private,
-            )
+            self._open_with_spec(kv_cache, pages, buf, spec, pin_tokens, num_pages, num_private)
         except Exception:
             # Nothing may look open after a failed open: release the sequence and
             # forget the half-built state, so the caller can retry.
@@ -570,29 +607,29 @@ class BlockCausalKVCacheManager(KVCacheManagerV2):
             self._remove_kv_cache(_ROLLOUT_REQUEST_ID)
             raise
 
-    def _open_with_geometry(
+    def _open_with_spec(
         self,
         kv_cache,
         pages: np.ndarray,
         buf: torch.Tensor,
+        spec: RolloutSpec,
         pin_tokens: int,
-        window_tokens: int,
-        max_staged_tokens: int,
-        sizes: Tuple[int, ...],
         num_pages: int,
         num_private: int,
     ) -> None:
-        """The geometry-dependent half of ``open``: bind the pages, allocate or reuse
-        the geometry's device state and write the kernel-facing tensors."""
+        """The spec-dependent half of ``open``: bind the pages, allocate or reuse the
+        spec's device state and write the kernel-facing tensors."""
         tpb = self.tokens_per_page
-        self.window_tokens = window_tokens
-        self.max_staged_tokens = max_staged_tokens
-        self.causal_block_sizes = sizes
+        self.spec = spec
+        self.window_tokens = spec.window_tokens
+        self.max_staged_tokens = spec.max_staged_tokens
+        self.causal_block_sizes = spec.causal_block_sizes
         self.num_pages = num_pages
         self.capacity = num_pages * tpb
         self._pin_tokens = pin_tokens
         self._fixed_tokens = 0
         self._history_tokens = 0
+        self._staged_tokens = 0
         self._fixed_pages = 0
         device = buf.device
         self._kv_heads_local = buf.shape[2]
@@ -607,11 +644,10 @@ class BlockCausalKVCacheManager(KVCacheManagerV2):
         self._table[:num_pages].copy_(torch.from_numpy(scaled[:num_pages]))
         self._host_private[:num_private] = scaled[num_pages:]
         self._host_table = scaled[:num_pages].copy()
-        key = (window_tokens, max_staged_tokens, sizes)
-        state = self._states.get(key)
+        state = self._states.get(spec)
         if state is None:
-            state = self._allocate_state(device, max_staged_tokens, sizes, num_private)
-            self._states[key] = state
+            state = self._allocate_state(device, spec, num_private)
+            self._states[spec] = state
         self._bind_state(state)
         for layout in self._layouts.values():
             layout.private_pages.copy_(torch.from_numpy(layout.host_private_pages.astype(np.int32)))
@@ -643,7 +679,7 @@ class BlockCausalKVCacheManager(KVCacheManagerV2):
         """Whether the pool is gone for good; a closed cache may still be reopened."""
         return self._shut_down
 
-    # ------------------------------------------------------------------ geometry
+    # ------------------------------------------------------------------ the open rollout
 
     @property
     def tokens_per_page(self) -> int:
@@ -654,12 +690,6 @@ class BlockCausalKVCacheManager(KVCacheManagerV2):
     def pin_tokens(self) -> int:
         """Tokens the open rollout pins: the first this many committed become fixed."""
         return self._pin_tokens
-
-    @property
-    def geometry(self) -> Tuple[int, int, Tuple[int, ...]]:
-        """``(window_tokens, max_staged_tokens, causal_block_sizes)`` of the open rollout;
-        the key of its device state, for callers that cache metadata derived from it."""
-        return (self.window_tokens, self.max_staged_tokens, self.causal_block_sizes)
 
     @property
     def fixed_tokens(self) -> int:
@@ -699,12 +729,27 @@ class BlockCausalKVCacheManager(KVCacheManagerV2):
 
     # ------------------------------------------------------------------ the window
 
-    def commit(self, num_tokens: int) -> None:
-        """The ``num_tokens`` staged tokens, written at ``staging_offset``, are final. Those
-        that fall within the first ``pin_tokens`` become fixed; the rest become
-        history, and the window slides. The count is the caller's: a forward may stage
-        fewer tokens than ``max_staged_tokens``."""
+    def commit(self, num_tokens: Optional[int] = None) -> None:
+        """The ``num_tokens`` tokens written at ``staging_offset`` are final. Those that
+        fall within the first ``pin_tokens`` become fixed; the rest become history, and
+        the window slides.
+
+        After forwards (planned with ``plan`` or staged with ``write_staged``), the count
+        is the most tokens they covered (the default) and any other count raises. Tokens
+        written with ``write_range`` alone, such as a prompt, are committed by passing
+        their count.
+        """
         self._require_open()
+        staged = self._staged_tokens
+        if num_tokens is None:
+            if not staged:
+                raise ValueError("nothing was staged since the last commit; pass num_tokens")
+            num_tokens = staged
+        elif staged and num_tokens != staged:
+            raise ValueError(
+                f"commit of {num_tokens} tokens, but the forwards since the last commit "
+                f"staged {staged}"
+            )
         pinned = max(
             0, min(self._pin_tokens, self.staging_offset + num_tokens) - self._fixed_tokens
         )
@@ -717,6 +762,7 @@ class BlockCausalKVCacheManager(KVCacheManagerV2):
             self._fixed_tokens += pinned
             self._fixed_pages = self._fixed_tokens // self.tokens_per_page
         self._history_tokens += num_tokens - pinned
+        self._staged_tokens = 0
         drop_pages = 0
         excess = self._history_tokens - self.window_tokens
         if excess > 0:
@@ -734,25 +780,18 @@ class BlockCausalKVCacheManager(KVCacheManagerV2):
     # ------------------------------------------------------------------ causal blocks
 
     def _allocate_state(
-        self,
-        device: torch.device,
-        max_staged_tokens: int,
-        sizes: Tuple[int, ...],
-        num_private: int,
-    ) -> _GeometryState:
-        """Allocate a geometry's layouts as views into two packed buffers (int32 and
-        int64), plus the commit copy lists and the staged slot ids; once per geometry."""
+        self, device: torch.device, spec: RolloutSpec, num_private: int
+    ) -> _SpecState:
+        """Allocate a spec's layouts as views into two packed buffers (int32 and int64),
+        plus the commit copy lists and the staged slot ids; once per spec."""
         tpb = self.tokens_per_page
-        specs = []  # (size, n, num_private_pages, i32 fields, i64 fields)
-        for size in sizes:
-            n, num_private_pages = (
-                max_staged_tokens // size,
-                self._private_pages_per_causal_block(tpb, size),
-            )
+        entries = []  # (size, n, num_private_pages, i32 fields, i64 fields)
+        for size, n in spec.causal_blocks.items():
+            num_private_pages = self._private_pages_per_causal_block(tpb, size)
             i32 = {
                 # A page list holds a causal block's full pages then its private pages,
-                # never more than the pool has; sized for the pool so every geometry's
-                # lists agree.
+                # never more than the pool has; sized for the pool so every spec's lists
+                # agree.
                 "causal_block_pages": (n, self._pool_pages),
                 "causal_block_offsets": (1, n, 2, self._pool_pages),
                 "seq_len_q": (n,),
@@ -763,13 +802,13 @@ class BlockCausalKVCacheManager(KVCacheManagerV2):
                 "current_private_src": (n * self._current_private,),
                 "current_private_dst": (n * self._current_private,),
             }
-            specs.append((size, n, num_private_pages, i32, i64))
+            entries.append((size, n, num_private_pages, i32, i64))
         # Copies made at commit: the fixed tail's refill (one page of entries), then each
         # causal block's committed_private (at most three partial pages); contiguous, so one
         # launch copies all.
-        commit_copy_capacity = tpb + sum(n * 3 * (tpb - 1) for _, n, _, _, _ in specs)
-        numel_i32 = sum(int(np.prod(shape)) for *_, i32, _ in specs for shape in i32.values())
-        numel_i64 = sum(int(np.prod(shape)) for *_, i64 in specs for shape in i64.values())
+        commit_copy_capacity = tpb + sum(n * 3 * (tpb - 1) for _, n, _, _, _ in entries)
+        numel_i32 = sum(int(np.prod(shape)) for *_, i32, _ in entries for shape in i32.values())
+        numel_i64 = sum(int(np.prod(shape)) for *_, i64 in entries for shape in i64.values())
         numel_i64 += 2 * commit_copy_capacity
         packed_i32 = torch.zeros(numel_i32, dtype=torch.int32, device=device)
         packed_i64 = torch.zeros(numel_i64, dtype=torch.int64, device=device)
@@ -785,7 +824,7 @@ class BlockCausalKVCacheManager(KVCacheManagerV2):
         commit_copy_dst = take("i64", (commit_copy_capacity,))
         layouts: Dict[int, _CausalBlockLayout] = {}
         first_private, first_committed = 0, tpb
-        for size, n, num_private_pages, i32, i64 in specs:
+        for size, n, num_private_pages, i32, i64 in entries:
             fields = {name: take("i32", shape) for name, shape in i32.items()}
             fields.update({name: take("i64", shape) for name, shape in i64.items()})
             fields["seq_len_q"].fill_(size)
@@ -810,7 +849,7 @@ class BlockCausalKVCacheManager(KVCacheManagerV2):
             )
             first_committed += num_committed
         assert first_private == num_private and first_committed == commit_copy_capacity
-        return _GeometryState(
+        return _SpecState(
             layouts=layouts,
             packed_i32=packed_i32,
             packed_i64=packed_i64,
@@ -818,11 +857,11 @@ class BlockCausalKVCacheManager(KVCacheManagerV2):
             commit_copy_dst=commit_copy_dst,
             refill_src=commit_copy_src[:tpb],
             refill_dst=commit_copy_dst[:tpb],
-            staged_slots=torch.empty(max_staged_tokens, dtype=torch.int64, device=device),
+            staged_slots=torch.empty(spec.max_staged_tokens, dtype=torch.int64, device=device),
         )
 
-    def _bind_state(self, state: _GeometryState) -> None:
-        """Make ``state`` the open geometry's: its tensors become the attributes the
+    def _bind_state(self, state: _SpecState) -> None:
+        """Make ``state`` the open spec's: its tensors become the attributes the
         rest of the cache reads."""
         self._layouts = state.layouts
         self._commit_copy_src, self._commit_copy_dst = state.commit_copy_src, state.commit_copy_dst
@@ -834,20 +873,43 @@ class BlockCausalKVCacheManager(KVCacheManagerV2):
         layout = self._layouts.get(causal_block_size)
         if layout is None:
             raise ValueError(
-                f"causal block size {causal_block_size} was not declared; the open geometry "
-                f"serves {self.causal_block_sizes}"
+                f"causal block size {causal_block_size} was not declared; the open spec "
+                f"declares {self.causal_block_sizes}"
             )
         return layout
 
     @property
     def max_causal_blocks(self) -> int:
-        """Most causal blocks any declared size cuts the staged tokens into."""
-        return max(self.max_staged_tokens // b for b in self.causal_block_sizes)
+        """Most causal blocks one forward of the open spec uses, over every size."""
+        return max(self.spec.causal_blocks.values())
+
+    @property
+    def max_keys_per_causal_block(self) -> int:
+        """Upper bound on the keys any causal block of the open spec reads, whatever
+        ``pin_tokens`` an open takes: the fixed region, the window and itself."""
+        spec = self.spec
+        return spec.max_pin_tokens + spec.window_tokens + max(spec.causal_block_sizes)
+
+    def plan(self, num_tokens: int, causal_block_size: Optional[int] = None) -> ForwardPlan:
+        """A forward of ``num_tokens`` real new tokens cut into causal blocks of
+        ``causal_block_size`` (default: one causal block of all of them), for the attention
+        layers to take as ``kv=``. The size must be declared in the open spec, divide
+        ``num_tokens``, and cut it into at most the declared count of causal blocks."""
+        self._require_open()
+        size, num_causal_blocks = self._causal_blocks(num_tokens, causal_block_size)
+        layout = self._layout(size)
+        if num_tokens > self.max_staged_tokens or num_causal_blocks > layout.num_causal_blocks:
+            raise ValueError(
+                f"{num_tokens} tokens in causal blocks of {size} exceed the open spec: at most "
+                f"{layout.num_causal_blocks} causal blocks and {self.max_staged_tokens} tokens"
+            )
+        self._staged_tokens = max(self._staged_tokens, num_tokens)
+        return ForwardPlan(self, self.spec, num_tokens, size, num_causal_blocks)
 
     def causal_block_lengths(self, causal_block_size: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Per-causal-block int32 device tensors ``(seq_len_q, seq_len_kv)`` for every
-        causal block of that size when all ``max_staged_tokens`` are staged; a forward
-        of fewer tokens uses the leading ones.
+        """Per-causal-block int32 device tensors ``(seq_len_q, seq_len_kv)`` for as many
+        causal blocks of that size as the open spec declares; a forward of fewer causal
+        blocks uses the leading ones.
 
         ``seq_len_kv[i]`` is the number of keys in causal block ``i``'s page list: the
         fixed region, the window before it, the earlier causal blocks and itself.
@@ -872,11 +934,10 @@ class BlockCausalKVCacheManager(KVCacheManagerV2):
         return self._layout(causal_block_size).causal_block_pages
 
     @staticmethod
-    def causal_blocks(num_tokens: int, causal_block_size: Optional[int]) -> Tuple[int, int]:
+    def _causal_blocks(num_tokens: int, causal_block_size: Optional[int]) -> Tuple[int, int]:
         """The causal block size and count a forward of ``num_tokens`` real tokens uses:
         one causal block of all of them when ``causal_block_size`` is None; otherwise
-        the size must be positive and divide ``num_tokens``. Shared by the cache and the
-        attention backends so they agree on the contract."""
+        the size must be positive and divide ``num_tokens``."""
         size = num_tokens if causal_block_size is None else int(causal_block_size)
         if size <= 0 or num_tokens % size:
             raise ValueError(
@@ -1175,13 +1236,14 @@ class BlockCausalKVCacheManager(KVCacheManagerV2):
             )
         if k.dtype != buf.dtype or v.dtype != buf.dtype:
             raise TypeError(f"K/V dtype {k.dtype} does not match the cache's {buf.dtype}")
-        size, num_causal_blocks = self.causal_blocks(num_tokens, causal_block_size)
+        size, num_causal_blocks = self._causal_blocks(num_tokens, causal_block_size)
         layout = self._layout(size)
         if num_causal_blocks > layout.num_causal_blocks:
             raise ValueError(
                 f"{num_tokens} tokens are more than the {layout.num_causal_blocks} causal blocks of "
-                f"{size} this geometry stages"
+                f"{size} the open spec declares"
             )
+        self._staged_tokens = max(self._staged_tokens, num_tokens)
         torch.ops.trtllm.scatter_kv_slots_(
             buf,
             k,

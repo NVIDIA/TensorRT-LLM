@@ -348,10 +348,9 @@ class UlyssesAttention(AttentionBackend):
     Not a standalone backend -- compose around a real backend (VANILLA/TRTLLM).
     Backend-specific kwargs are forwarded to the inner backend. Sequence
     lengths are updated after all-to-all, and VSA gates are redistributed with
-    the same sequence/head mapping as Q before they are forwarded. With a
-    ``kv_cache`` the caller's ``seq_len`` is the global number of real tokens (all
-    ranks, before padding, not this rank's shard), the same on every rank, and is
-    passed through untouched; rows past it are padding from the exchange.
+    the same sequence/head mapping as Q before they are forwarded. A ``kv`` plan
+    (a forward over a K/V cache) is passed through untouched: its token count is
+    the real tokens of all ranks, and rows past it after the exchange are padding.
 
     Architecture:
         Input:  [B, S/P, H, D] (sequence sharded across P processes)
@@ -441,19 +440,15 @@ class UlyssesAttention(AttentionBackend):
                 f"by world_size ({self.world_size})."
             )
 
-        if kwargs.get("kv_cache") is not None:
-            # With a cache, seq_len counts the real tokens of the whole sequence and
-            # rows past it are padding. Only the upper bound can be checked here: a
-            # heavily padded short chunk is indistinguishable from a shard length.
+        if kwargs.get("kv") is not None:
+            # The plan counts the real tokens of the whole sequence and rows past it are
+            # padding. Only the upper bound can be checked here: a heavily padded short
+            # chunk is indistinguishable from a shard length.
             rows = q.shape[1] * self.world_size
-            seq_len = kwargs.get("seq_len")
-            if seq_len is None:
+            num_tokens = kwargs["kv"].num_tokens
+            if not 0 < num_tokens <= rows:
                 raise ValueError(
-                    "with a K/V cache, pass seq_len: the real token count of the chunk"
-                )
-            if not 0 < seq_len <= rows:
-                raise ValueError(
-                    f"seq_len {seq_len} with a K/V cache must count the real tokens of the whole "
+                    f"the plan's {num_tokens} tokens must count the real tokens of the whole "
                     f"sequence: at least 1, at most the {rows} rows after the exchange"
                 )
         # The fused path stacks q/k/v on one axis, which needs equal head counts;
@@ -462,7 +457,7 @@ class UlyssesAttention(AttentionBackend):
         if (
             self.inner_backend.support_fused_qkv()
             and q.shape[2] == k.shape[2]
-            and kwargs.get("kv_cache") is None
+            and kwargs.get("kv") is None
         ):
             return self._forward_fused(q, k, v, **kwargs)
         return self._forward_unfused(q, k, v, **kwargs)
@@ -623,12 +618,11 @@ class UlyssesAttention(AttentionBackend):
             if gate_fine is not None:
                 gate_fine = gate_fine.transpose(1, 2)
 
+        # Caller passed pre-A2A (sharded) seq_lens; hand the inner
+        # backend the post-A2A lengths instead.
         kwargs["batch_size"] = batch_size
-        if kwargs.get("kv_cache") is None:
-            # Caller passed pre-A2A (sharded) seq_lens; hand the inner
-            # backend the post-A2A lengths instead.
-            kwargs["seq_len"] = seq_len_full
-            kwargs["seq_len_kv"] = kv_seq_len_full
+        kwargs["seq_len"] = seq_len_full
+        kwargs["seq_len_kv"] = kv_seq_len_full
         if gate_compress is not None:
             kwargs["gate_compress"] = gate_compress
         if gate_fine is not None:
@@ -716,7 +710,7 @@ class UlyssesAttention(AttentionBackend):
         makes default wait on the last push.
         Post-attention permute / SDPA / reverse A2A run in the caller's outer
         compile region for additional inductor fusion."""
-        if attn_kwargs.get("kv_cache") is not None:
+        if attn_kwargs.get("kv") is not None:
             raise NotImplementedError("The async Ulysses path does not support a K/V cache.")
         P = self.world_size
 

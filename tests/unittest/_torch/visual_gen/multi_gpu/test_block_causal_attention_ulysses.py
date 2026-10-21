@@ -39,7 +39,7 @@ from tensorrt_llm._torch.visual_gen.attention.attention import Attention
 from tensorrt_llm._torch.visual_gen.attention.backends import UlyssesAttention
 from tensorrt_llm._torch.visual_gen.attention.backends.cudnn import CuDNNAttention
 from tensorrt_llm._torch.visual_gen.attention.backends.trtllm import TrtllmAttention
-from tensorrt_llm._torch.visual_gen.cache import BlockCausalKVCacheManager
+from tensorrt_llm._torch.visual_gen.cache import BlockCausalKVCacheManager, RolloutSpec
 from tensorrt_llm._torch.visual_gen.config import (
     DiffusionModelConfig,
     create_attention_metadata_state,
@@ -105,12 +105,14 @@ def make_backend(name, chunk, prompt=PROMPT, window=WINDOW):
 
 
 def make_cache(chunk, prompt=PROMPT, window=WINDOW, kv_heads=NUM_KV_HEADS // WORLD, sizes=None):
-    """A cache whose pool is sized for this geometry; the geometry rides on the
-    object so ``open_cache`` can open it (tests only)."""
-    geometry = dict(
+    """A cache whose pool is sized for this spec; the spec rides on the object so
+    ``open_cache`` can open it (tests only)."""
+    sizes = sizes if sizes is not None else (chunk, chunk // 4)
+    spec = RolloutSpec(
         window_tokens=window,
         max_staged_tokens=chunk,
-        causal_block_sizes=sizes if sizes is not None else (chunk, chunk // 4),
+        causal_blocks={size: chunk // size for size in sizes},
+        max_pin_tokens=prompt,
     )
     cache = BlockCausalKVCacheManager(
         num_layers=1,
@@ -118,16 +120,14 @@ def make_cache(chunk, prompt=PROMPT, window=WINDOW, kv_heads=NUM_KV_HEADS // WOR
         head_dim=HEAD_DIM,
         dtype=DTYPE,
         tokens_per_page=TPB,
-        pool_tokens=BlockCausalKVCacheManager.pool_tokens_for(
-            tokens_per_page=TPB, pin_tokens=prompt, **geometry
-        ),
+        pool_tokens=BlockCausalKVCacheManager.pool_tokens_for(spec, tokens_per_page=TPB),
     )
-    cache.test_geometry = geometry
+    cache.test_spec = spec
     return cache
 
 
 def open_cache(cache, pin_tokens=0):
-    cache.open(pin_tokens=pin_tokens, **cache.test_geometry)
+    cache.open(cache.test_spec, pin_tokens=pin_tokens)
 
 
 def rand_qkv(n):
@@ -167,18 +167,19 @@ def read_kv(cache, positions):
     return buf[page, 0, :, slot, :], buf[page, 1, :, slot, :]
 
 
-def forward(attn, cache, q, k, v, rank, causal_block_size=None, seq_len=None):
-    """``q``/``k``/``v`` hold all tokens, padded to a multiple of ``WORLD``; ``seq_len``
-    is the real count (default: all rows). Returns this rank's rows of the output."""
+def forward(attn, cache, q, k, v, rank, causal_block_size=None, num_tokens=None):
+    """``q``/``k``/``v`` hold all tokens, padded to a multiple of ``WORLD``;
+    ``num_tokens`` is the real count (default: all rows). Returns this rank's rows of the
+    output."""
     per = q.shape[0] // WORLD
+    num_tokens = q.shape[0] if num_tokens is None else num_tokens
     out = attn.forward(
         token_slice(q, rank),
         token_slice(k, rank),
         token_slice(v, rank),
         batch_size=1,
-        seq_len=q.shape[0] if seq_len is None else seq_len,
-        kv_cache=cache,
-        causal_block_size=causal_block_size,
+        seq_len=per,
+        kv=cache.plan(num_tokens, causal_block_size),
     )
     return out.reshape(per, NUM_HEADS, HEAD_DIM)
 
@@ -261,8 +262,8 @@ def _logic_causal_blocks(
 
 
 def _logic_padded_first_chunk(rank, world_size, backend):
-    """A first chunk of one causal causal_block_size whose length does not divide by the rank count: the
-    model pads it, passes the real ``seq_len``, and the padding is neither
+    """A first chunk of one causal block whose length does not divide by the rank
+    count: the model pads it, plans the real token count, and the padding is neither
     attended nor written."""
     torch.manual_seed(2)  # same tensors on every rank
     chunk, causal_block_size = 44, 11  # 11 real tokens on 2 ranks: padded to 12
@@ -282,7 +283,7 @@ def _logic_padded_first_chunk(rank, world_size, backend):
             *padded,
             rank,
             causal_block_size=causal_block_size,
-            seq_len=causal_block_size,
+            num_tokens=causal_block_size,
         )
         torch.cuda.synchronize()
 
@@ -323,7 +324,7 @@ def _logic_head_count_guard(rank, world_size, backend):
 
 def _logic_through_the_attention_module(rank, world_size, backend):
     """The model's path: the shared Attention module builds the Ulysses wrapper and
-    must hand the caller's real token count through, padding included."""
+    must hand the plan's real token count through, padding included."""
     torch.manual_seed(3)
     chunk = 44  # declares causal blocks of 11, the padded single-frame chunk below
     vgm = VisualGenMapping(world_size=world_size, rank=rank, ulysses_size=world_size)
@@ -364,9 +365,7 @@ def _logic_through_the_attention_module(rank, world_size, backend):
             padded = [torch.cat([x, torch.randn_like(x[:pad])]) for x in (q, k, v)]
             per = (real + pad) // world_size
             flat = [token_slice(x, rank).flatten(2) for x in padded]  # [1, per, heads * dim]
-            out = attn._attn_impl(*flat, kv_cache=cache, seq_len=real).view(
-                per, NUM_HEADS, HEAD_DIM
-            )
+            out = attn._attn_impl(*flat, kv=cache.plan(real)).view(per, NUM_HEADS, HEAD_DIM)
             torch.cuda.synchronize()
             full = exact_reference(q, pk, pv, empty, empty, k, v, 0, real, WINDOW)
             full = torch.cat([full, full.new_zeros((pad, NUM_HEADS, HEAD_DIM))])

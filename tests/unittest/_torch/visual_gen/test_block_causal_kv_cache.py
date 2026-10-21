@@ -18,7 +18,7 @@ causal block page lists attention reads."""
 import pytest
 import torch
 
-from tensorrt_llm._torch.visual_gen.cache import BlockCausalKVCacheManager
+from tensorrt_llm._torch.visual_gen.cache import BlockCausalKVCacheManager, RolloutSpec
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 
@@ -29,10 +29,21 @@ DEVICE = torch.device("cuda")
 DTYPE = torch.float16  # integer stamps up to 2048 stay exact; bf16 loses them above 256
 
 
+def spec_for(*, max_pin_tokens, window_tokens, max_staged_tokens, causal_block_sizes):
+    """A spec with every size allowed as many causal blocks as fit the staged tokens."""
+    return RolloutSpec(
+        window_tokens=window_tokens,
+        max_staged_tokens=max_staged_tokens,
+        causal_blocks={size: max_staged_tokens // size for size in causal_block_sizes},
+        max_pin_tokens=max_pin_tokens,
+    )
+
+
 def make_cache_for(tpb, *, max_pin_tokens, window_tokens, max_staged_tokens, causal_block_sizes):
-    """A cache whose pool is sized for exactly this geometry. The geometry rides on
-    the object so ``open_cache`` can open it (tests only)."""
-    geometry = dict(
+    """A cache whose pool is sized for exactly this spec. The spec rides on the object
+    so ``open_cache`` can open it (tests only)."""
+    spec = spec_for(
+        max_pin_tokens=max_pin_tokens,
         window_tokens=window_tokens,
         max_staged_tokens=max_staged_tokens,
         causal_block_sizes=causal_block_sizes,
@@ -43,11 +54,9 @@ def make_cache_for(tpb, *, max_pin_tokens, window_tokens, max_staged_tokens, cau
         head_dim=HEAD_DIM,
         dtype=DTYPE,
         tokens_per_page=tpb,
-        pool_tokens=BlockCausalKVCacheManager.pool_tokens_for(
-            tokens_per_page=tpb, pin_tokens=max_pin_tokens, **geometry
-        ),
+        pool_tokens=BlockCausalKVCacheManager.pool_tokens_for(spec, tokens_per_page=tpb),
     )
-    cache.test_geometry = geometry
+    cache.test_spec = spec
     cache.test_max_pin = max_pin_tokens
     return cache
 
@@ -66,7 +75,7 @@ def make_cache(tokens_per_page: int):
 
 
 def open_cache(cache, pin_tokens=0):
-    cache.open(pin_tokens=pin_tokens, **cache.test_geometry)
+    cache.open(cache.test_spec, pin_tokens=pin_tokens)
 
 
 @pytest.fixture(params=[32, 128], ids=["tpb32", "tpb128"])
@@ -217,15 +226,15 @@ def test_pinned_tokens_are_the_first_committed_and_never_evicted(cache):
     """``open(pin_tokens)`` pins the first tokens committed, whatever they are: a
     prompt in one commit, then generated tokens up to the pin size inside a later
     commit, which splits it. They survive every rotation, in every layer."""
-    tpb, chunk = cache.tokens_per_page, cache.test_geometry["max_staged_tokens"]
+    tpb, chunk = cache.tokens_per_page, cache.test_spec.max_staged_tokens
     unopened = make_cache(tpb)
     try:
         with pytest.raises(RuntimeError):
             unopened.table
     finally:
         unopened.shutdown()
-    with pytest.raises(ValueError, match="pool holds"):
-        open_cache(cache, pin_tokens=cache.pool_tokens)
+    with pytest.raises(ValueError, match="max_pin_tokens"):
+        open_cache(cache, pin_tokens=cache.test_max_pin + 1)
     prompt, sink = cache.test_max_pin - 8, 8
     open_cache(cache, pin_tokens=prompt + sink)
     prompts = layer_kv(prompt)
@@ -253,7 +262,7 @@ def test_pinned_tokens_are_the_first_committed_and_never_evicted(cache):
 
 
 def test_commit_beyond_a_chunk_only_into_the_pinned_part(cache):
-    chunk = cache.test_geometry["max_staged_tokens"]
+    chunk = cache.test_spec.max_staged_tokens
     open_cache(cache, pin_tokens=cache.test_max_pin)
     with pytest.raises(ValueError):
         cache.commit(cache.test_max_pin + chunk + 1)  # more than a chunk past the pin
@@ -330,7 +339,7 @@ def page_list_stamps(cache, layer, size, i, plane):
 def test_edits_to_committed_tokens_reach_the_private_copies(cache):
     """write_range and zero_values on committed tokens update the private copies the
     causal blocks read, not only the home slots. Chunk tokens and other layers stay."""
-    chunk = cache.test_geometry["max_staged_tokens"]
+    chunk = cache.test_spec.max_staged_tokens
     sizes = (chunk, chunk // 4)
     open_with_fixed(cache, 20)
     for _ in range(3):  # past the window, so both the fixed tail and the window edge are copies
@@ -436,7 +445,7 @@ def check_page_lists_present_exactly_the_window(cache, fixed, size, steps=8, exp
     of history before it (or fewer while the window fills), the earlier causal blocks it
     may see and itself; nothing stale, nothing later, nothing twice. Checked by stamping
     every token with its position and layer."""
-    chunk, window = cache.test_geometry["max_staged_tokens"], cache.test_geometry["window_tokens"]
+    chunk, window = cache.test_spec.max_staged_tokens, cache.test_spec.window_tokens
     num_causal_blocks = chunk // size
     open_cache(cache, pin_tokens=fixed)
     for layer in range(NUM_LAYERS):
@@ -522,7 +531,7 @@ def host_model_page_lists(cache, size):
 def test_device_layout_matches_the_host_model(cache):
     """The layout kernel's page lists, lengths and committed_private copies agree with the host model across
     commits, with and without eviction and with a fixed tail on a shared page."""
-    chunk = cache.test_geometry["max_staged_tokens"]
+    chunk = cache.test_spec.max_staged_tokens
     open_with_fixed(cache, 13)
     for _ in range(5):
         for size in (chunk, chunk // 4):
@@ -561,7 +570,7 @@ def test_device_layout_matches_the_host_model(cache):
 
 
 def test_causal_block_page_lists_present_exactly_the_window(cache):
-    chunk = cache.test_geometry["max_staged_tokens"]
+    chunk = cache.test_spec.max_staged_tokens
     check_page_lists_present_exactly_the_window(cache, fixed=13, size=chunk // 4)
     with pytest.raises(ValueError, match="not declared"):
         cache.causal_block_lengths(chunk // 2)
@@ -720,14 +729,19 @@ def test_rejects_bad_geometry():
         BlockCausalKVCacheManager(
             tokens_per_page=32, pool_tokens=320, **{**pool, "dtype": torch.float32}
         )
+    with pytest.raises(ValueError, match="fit max_staged_tokens"):
+        RolloutSpec(window_tokens=64, max_staged_tokens=40, causal_blocks={41: 1})
+    with pytest.raises(ValueError, match="fit max_staged_tokens"):
+        RolloutSpec(window_tokens=64, max_staged_tokens=40, causal_blocks={10: 5})
+    with pytest.raises(ValueError, match="positive"):
+        RolloutSpec(window_tokens=0, max_staged_tokens=40, causal_blocks={40: 1})
     cache = BlockCausalKVCacheManager(tokens_per_page=32, pool_tokens=320, **pool)
     try:
-        with pytest.raises(ValueError, match="at most"):
-            cache.open(window_tokens=64, max_staged_tokens=40, causal_block_sizes=(40, 41))
-        with pytest.raises(ValueError, match="positive"):
-            cache.open(window_tokens=0, max_staged_tokens=40, causal_block_sizes=(40,))
         with pytest.raises(ValueError, match="pool holds"):
-            cache.open(window_tokens=64, max_staged_tokens=320, causal_block_sizes=(320,))
+            cache.open(RolloutSpec(window_tokens=64, max_staged_tokens=320, causal_blocks={320: 1}))
+        small = RolloutSpec(window_tokens=32, max_staged_tokens=32, causal_blocks={32: 1})
+        with pytest.raises(ValueError, match="max_pin_tokens"):
+            cache.open(small, pin_tokens=1)
         assert not cache.is_open
     finally:
         cache.shutdown()
@@ -751,15 +765,19 @@ def test_failed_open_leaves_the_cache_closed(cache, monkeypatch):
     assert cache.is_open and len(set(cache.page_table())) == cache.num_pages
 
 
-def test_each_geometry_keeps_its_device_state(cache):
-    """Geometries opened on one pool keep their kernel-facing tensors at fixed
-    addresses across other geometries, so a graph captured over one replays when it
-    is opened again; the pool-sized table is shared and refilled."""
+def test_each_spec_keeps_its_device_state(cache):
+    """Specs opened on one pool keep their kernel-facing tensors at fixed addresses
+    across other specs, so a graph captured over one replays when it is opened again;
+    the pool-sized table is shared and refilled."""
     tpb = cache.tokens_per_page
-    narrow = dict(window_tokens=tpb, max_staged_tokens=tpb, causal_block_sizes=(tpb, tpb // 2))
+    narrow = RolloutSpec(
+        window_tokens=tpb,
+        max_staged_tokens=tpb,
+        causal_blocks={tpb: 1, tpb // 2: 2},
+        max_pin_tokens=5,
+    )
     open_cache(cache, pin_tokens=9)
-    wide = cache.test_geometry
-    size = wide["causal_block_sizes"][-1]
+    size = min(cache.test_spec.causal_block_sizes)
     pages_a, (_, lkv_a) = cache.causal_block_pages(size), cache.causal_block_lengths(size)
     table_ptr = cache.table.data_ptr()
     cache.write_range(0, 0, *rand_kv(9))
@@ -769,8 +787,8 @@ def test_each_geometry_keeps_its_device_state(cache):
     cached_a = cache.cached_tokens(size)
     cache.close()
 
-    cache.open(pin_tokens=5, **narrow)
-    assert cache.geometry == (tpb, tpb, (tpb, tpb // 2))
+    cache.open(narrow, pin_tokens=5)
+    assert cache.spec == narrow
     assert cache.causal_block_pages(tpb // 2).data_ptr() != pages_a.data_ptr()
     cache.commit(5)
     cache.commit(tpb)
@@ -808,23 +826,111 @@ def test_commit_takes_the_tokens_actually_written(cache):
         cache.commit(cache.max_staged_tokens + 1)
 
 
+def test_commit_checks_what_was_staged(cache):
+    """After forwards, commit() takes the most tokens they covered by default and
+    refuses any other count; a plan alone counts, since under CUDA graph replay no
+    staged write runs on the host. Tokens written with write_range alone need their
+    count."""
+    open_with_fixed(cache, 9)
+    chunk = cache.max_staged_tokens
+    small = min(cache.test_spec.causal_block_sizes)
+    with pytest.raises(ValueError, match="nothing was staged"):
+        cache.commit()
+    for layer in range(NUM_LAYERS):
+        cache.write_staged(layer, *rand_kv(chunk))
+        cache.write_staged(layer, *rand_kv(small))  # a shorter forward does not lower it
+    with pytest.raises(ValueError, match="staged"):
+        cache.commit(chunk - 1)
+    offset = cache.staging_offset
+    cache.commit()
+    assert cache.staging_offset > offset
+    cache.plan(small)
+    with pytest.raises(ValueError, match="staged"):
+        cache.commit(chunk)
+    cache.commit(small)
+    cache.write_range(0, cache.staging_offset, *rand_kv(3))
+    cache.commit(3)
+
+
+def test_plan_follows_the_open_spec(cache):
+    """A plan carries the forward's real tokens and causal blocks and a graph key for
+    exactly the host values a capture bakes in; it refuses what the spec does not
+    declare and goes stale when another spec is opened."""
+    open_with_fixed(cache, 9)
+    chunk = cache.max_staged_tokens
+    small = min(cache.test_spec.causal_block_sizes)
+    plan = cache.plan(chunk, small)
+    assert (plan.num_tokens, plan.causal_block_size, plan.num_causal_blocks) == (
+        chunk,
+        small,
+        chunk // small,
+    )
+    assert plan.spec == cache.spec
+    assert plan.graph_key == cache.plan(chunk, small).graph_key
+    assert plan.graph_key != cache.plan(chunk).graph_key
+    with pytest.raises(ValueError, match="not declared"):
+        cache.plan(chunk, chunk // 2)
+    with pytest.raises(ValueError):
+        cache.plan(chunk, 7)  # does not divide the tokens
+    plan.validate()
+    cache.close()
+    tpb = cache.tokens_per_page
+    cache.open(RolloutSpec(window_tokens=tpb, max_staged_tokens=tpb, causal_blocks={tpb: 1}))
+    with pytest.raises(RuntimeError, match="no longer open"):
+        plan.validate()
+
+
+def test_spec_counts_size_the_causal_blocks():
+    """Each causal block size gets exactly the causal blocks its count declares: no
+    more private pages, page lists or plans than that."""
+    tpb, chunk = 32, 40
+    full = RolloutSpec(window_tokens=64, max_staged_tokens=chunk, causal_blocks={chunk: 1, 10: 4})
+    tight = RolloutSpec(window_tokens=64, max_staged_tokens=chunk, causal_blocks={chunk: 1, 10: 2})
+    assert tight == RolloutSpec(
+        window_tokens=64, max_staged_tokens=chunk, causal_blocks={10: 2, chunk: 1}
+    )
+    assert hash(tight) == hash(
+        RolloutSpec(window_tokens=64, max_staged_tokens=chunk, causal_blocks={10: 2, chunk: 1})
+    )
+    pool_tokens = BlockCausalKVCacheManager.pool_tokens_for(tight, tokens_per_page=tpb)
+    assert pool_tokens < BlockCausalKVCacheManager.pool_tokens_for(full, tokens_per_page=tpb)
+    cache = BlockCausalKVCacheManager(
+        num_layers=NUM_LAYERS,
+        num_kv_heads=NUM_KV_HEADS,
+        head_dim=HEAD_DIM,
+        dtype=DTYPE,
+        tokens_per_page=tpb,
+        pool_tokens=pool_tokens,
+    )
+    try:
+        cache.open(tight)
+        assert cache.max_causal_blocks == 2
+        assert cache.causal_block_pages(10).shape[0] == 2
+        assert cache.plan(20, 10).num_causal_blocks == 2
+        with pytest.raises(ValueError, match="exceed the open spec"):
+            cache.plan(chunk, 10)
+        with pytest.raises(ValueError):
+            cache.write_staged(0, *rand_kv(chunk), 10)
+    finally:
+        cache.shutdown()
+
+
 def test_pool_bytes_for_is_what_the_gpu_loses():
     """``pool_bytes_for`` is the device memory a cache really takes, measured with the
     driver's free-memory counter, so a window sized against a budget before anything
     is built fits. The rounding beyond the raw K/V bytes is less than one allocator
     chunk, and the size grows with the window."""
     pool = dict(num_layers=3, num_kv_heads=2, head_dim=64, dtype=torch.bfloat16)
-    geometry = dict(
-        tokens_per_page=32, pin_tokens=40, max_staged_tokens=120, causal_block_sizes=(120, 60)
-    )
     previous = 0
     for window_tokens in (600, 6000, 60000):  # each step crosses an allocator chunk
-        expected = BlockCausalKVCacheManager.pool_bytes_for(
-            window_tokens=window_tokens, **pool, **geometry
+        spec = RolloutSpec(
+            window_tokens=window_tokens,
+            max_staged_tokens=120,
+            causal_blocks={120: 1, 60: 2},
+            max_pin_tokens=40,
         )
-        pool_tokens = BlockCausalKVCacheManager.pool_tokens_for(
-            window_tokens=window_tokens, **geometry
-        )
+        expected = BlockCausalKVCacheManager.pool_bytes_for(spec, tokens_per_page=32, **pool)
+        pool_tokens = BlockCausalKVCacheManager.pool_tokens_for(spec, tokens_per_page=32)
         torch.cuda.synchronize()
         free_before, _ = torch.cuda.mem_get_info()
         cache = BlockCausalKVCacheManager(tokens_per_page=32, pool_tokens=pool_tokens, **pool)

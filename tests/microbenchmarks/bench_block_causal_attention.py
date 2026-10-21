@@ -50,7 +50,7 @@ import torch.nn.functional as F
 
 from tensorrt_llm._torch.visual_gen.attention.backends.cudnn import CuDNNAttention
 from tensorrt_llm._torch.visual_gen.attention.backends.trtllm import TrtllmAttention
-from tensorrt_llm._torch.visual_gen.cache import BlockCausalKVCacheManager
+from tensorrt_llm._torch.visual_gen.cache import BlockCausalKVCacheManager, RolloutSpec
 
 # The fp32 reference shared with the unit tests lives in the unittest tree.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "unittest"))
@@ -196,10 +196,11 @@ def build_cache(
     Returns the manager plus dense copies of the prompt and of every committed
     history token, oldest first (layer 0's values; other layers get the same).
     """
-    geometry = dict(
+    spec = RolloutSpec(
         window_tokens=window_tokens,
         max_staged_tokens=CHUNK,
-        causal_block_sizes=(CHUNK, TOKENS_PER_FRAME),
+        causal_blocks={CHUNK: 1, TOKENS_PER_FRAME: CHUNK // TOKENS_PER_FRAME},
+        max_pin_tokens=prompt_len,
     )
     mgr = BlockCausalKVCacheManager(
         num_layers=num_layers,
@@ -208,10 +209,10 @@ def build_cache(
         dtype=DTYPE,
         tokens_per_page=tokens_per_page,
         pool_tokens=BlockCausalKVCacheManager.pool_tokens_for(
-            tokens_per_page=tokens_per_page, pin_tokens=prompt_len, **geometry
+            spec, tokens_per_page=tokens_per_page
         ),
     )
-    mgr.open(pin_tokens=prompt_len, **geometry)
+    mgr.open(spec, pin_tokens=prompt_len)
     kp = torch.randn(prompt_len, NUM_KV_HEADS, HEAD_DIM, device=DEV, dtype=DTYPE, generator=gen)
     vp = torch.randn_like(kp)
     for layer in range(num_layers):
@@ -269,16 +270,9 @@ def chunk_cycle(args, gen) -> None:
         ]
 
         def forward(causal_block_size):
+            plan = mgr.plan(CHUNK, causal_block_size)
             for attn in attns:
-                attn.forward(
-                    q4,
-                    k4,
-                    v4,
-                    batch_size=1,
-                    seq_len=CHUNK,
-                    kv_cache=mgr,
-                    causal_block_size=causal_block_size,
-                )
+                attn.forward(q4, k4, v4, batch_size=1, seq_len=CHUNK, kv=plan)
     else:
         attns = [
             CuDNNAttention(
@@ -292,8 +286,9 @@ def chunk_cycle(args, gen) -> None:
         ]
 
         def forward(causal_block_size):
+            plan = mgr.plan(CHUNK, causal_block_size)
             for attn in attns:
-                attn.forward(q4, k4, v4, kv_cache=mgr, causal_block_size=causal_block_size)
+                attn.forward(q4, k4, v4, kv=plan)
 
     print(
         f"chunk cycle: {layers} layers, backend {args.backend}, prompt {args.prompt_len}, "
@@ -311,8 +306,7 @@ def chunk_cycle(args, gen) -> None:
                 v4,
                 batch_size=1,
                 seq_len=CHUNK,
-                kv_cache=mgr,
-                causal_block_size=causal_block_size,
+                kv=mgr.plan(CHUNK, causal_block_size),
             )
             .reshape(CHUNK, NUM_HEADS, HEAD_DIM)
         )
@@ -458,21 +452,13 @@ def main() -> None:
         layer_idx=0, num_heads=NUM_HEADS, head_dim=HEAD_DIM, num_kv_heads=NUM_KV_HEADS, dtype=DTYPE
     )
     q4, k4, v4 = q[None], k[None], v[None]
-    causal_block_arg = causal_block_size if num_causal_blocks > 1 else None
+    plan = mgr.plan(CHUNK, causal_block_size)
 
     def run_trtllm():
-        return trtllm_attn.forward(
-            q4,
-            k4,
-            v4,
-            batch_size=1,
-            seq_len=CHUNK,
-            kv_cache=mgr,
-            causal_block_size=causal_block_arg,
-        )
+        return trtllm_attn.forward(q4, k4, v4, batch_size=1, seq_len=CHUNK, kv=plan)
 
     def run_cudnn_paged():
-        return cudnn_attn.forward(q4, k4, v4, kv_cache=mgr, causal_block_size=causal_block_arg)
+        return cudnn_attn.forward(q4, k4, v4, kv=plan)
 
     # Dense paths have no per-causal-block key count, so causal blocks cost them one launch each:
     # that is the per-frame clean pass as the reference runs it.

@@ -664,13 +664,13 @@ class Attention(nn.Module):
         1. HND backends (VANILLA): [B, S, H*D] -> [B, H, S, D]
         2. NHD backends (TRTLLM, UlyssesAttention, Attention2DAttention): [B, S, H*D] -> [B, S, H, D]
 
-        ``seq_len`` is derived from ``q.shape[1]`` and overrides any caller value,
-        except with a ``kv_cache``: then the caller must pass it, as the global number
-        of real tokens of this forward (all ranks, before sequence-parallel padding,
-        not this rank's shard), because the rows may carry padding from the
-        sequence-parallel exchange and the backend writes this forward's K/V into
-        the cache. Only the caller knows where the real tokens end; a padding row
-        written as history would be attended by every later forward of the rollout.
+        ``seq_len`` is derived from ``q.shape[1]`` and overrides any caller value. A
+        forward over a K/V cache takes ``kv``, a ``ForwardPlan`` from the cache: it
+        carries the real token count of this forward across all ranks, because the rows
+        may carry padding from the sequence-parallel exchange and the backend writes
+        this forward's K/V into the cache. Only the caller knows where the real tokens
+        end; a padding row written as history would be attended by every later forward
+        of the rollout.
         """
         backend_layout = getattr(self.attn, "preferred_layout", AttentionTensorLayout.NHD)
 
@@ -700,19 +700,12 @@ class Attention(nn.Module):
             k = k.view(batch_size, -1, self.local_num_key_value_heads, self.head_dim)
             v = v.view(batch_size, -1, self.local_num_key_value_heads, self.head_dim)
 
-        # With a K/V cache the caller states seq_len, the real token count of the
-        # whole sequence: the rows here may include padding for the sequence
-        # exchange, and under Ulysses they are one rank's shard.
-        if kwargs.get("kv_cache") is None:
-            kwargs["seq_len"] = seq_len
-        elif kwargs.get("seq_len") is None:
-            raise ValueError("with a K/V cache, pass seq_len: the real token count of the chunk")
-        kwargs.update({"batch_size": batch_size, "seq_len_kv": seq_len_kv})
+        kwargs.update({"batch_size": batch_size, "seq_len": seq_len, "seq_len_kv": seq_len_kv})
         for gate_key in ("gate_compress", "gate_fine"):
             if kwargs.get(gate_key) is not None:
                 kwargs[gate_key] = _reshape_gate(kwargs[gate_key])
 
-        if kwargs.get("kv_cache") is not None and not self.attn.support_kv_cache():
+        if kwargs.get("kv") is not None and not self.attn.support_kv_cache():
             raise NotImplementedError(
                 f"{type(self.attn).__name__} does not support a K/V cache "
                 "(support_kv_cache() is False for this backend/parallel configuration)."

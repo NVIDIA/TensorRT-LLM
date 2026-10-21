@@ -44,7 +44,7 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.visual_gen.args import QuantAttentionConfig
 
 from ....attention.backends.interface import PredefinedAttentionMask
-from ...cache import BlockCausalKVCacheManager
+from ...cache import ForwardPlan
 from .interface import AttentionBackend, AttentionTensorLayout, as_fused_qkv, is_fused_qkv
 
 
@@ -601,20 +601,20 @@ class CuDNNAttention(AttentionBackend):
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        kv_cache: BlockCausalKVCacheManager,
-        causal_block_size: Optional[int],
+        plan: ForwardPlan,
         attention_mask: PredefinedAttentionMask,
         key_padding_mask: Optional[torch.Tensor],
-        seq_len: Optional[int],
     ) -> torch.Tensor:
         """Write ``k``/``v`` at ``staging_offset``, then attend over the cache.
 
         ``q``, ``k``, ``v`` are ``[1, S, H, D]`` / ``[1, S, H_kv, D]``: one video. The
-        first ``seq_len`` rows are real (``None``: all of them are real); rows past that are
-        padding and are neither written nor attended. ``causal_block_size`` cuts the
-        real tokens into consecutive causal blocks that are causal across each other
-        (``None``: one causal block). Output is ``[1, S, H, D]`` with zero padding rows.
+        first ``plan.num_tokens`` rows are real; rows past that are padding and are
+        neither written nor attended. The plan cuts the real tokens into consecutive
+        causal blocks that are causal across each other. Output is ``[1, S, H, D]`` with
+        zero padding rows.
         """
+        plan.validate()
+        kv_cache = plan.cache
         if self._resolve_mask(attention_mask, key_padding_mask):
             raise NotImplementedError("K/V cache attention is full attention over the cache.")
         if self.quant_dtype is not None:
@@ -631,15 +631,15 @@ class CuDNNAttention(AttentionBackend):
             )
         if q.stride(3) != 1:
             raise ValueError("q must be contiguous along head_dim.")
-        num_tokens = num_rows if seq_len is None else seq_len
-        if not 0 < num_tokens <= num_rows:
+        num_tokens = plan.num_tokens
+        if num_tokens > num_rows:
             raise ValueError(
-                f"seq_len {seq_len} outside (0, {num_rows}]: it counts the real tokens; "
-                "rows past it are padding."
+                f"the plan's {num_tokens} tokens exceed the {num_rows} rows: it counts the real "
+                "tokens; rows past it are padding."
             )
         if num_tokens < num_rows:
             q, k, v = q[:, :num_tokens], k[:, :num_tokens], v[:, :num_tokens]
-        causal_block_size, num_causal_blocks = kv_cache.causal_blocks(num_tokens, causal_block_size)
+        causal_block_size, num_causal_blocks = plan.causal_block_size, plan.num_causal_blocks
         device = q.device
         # Cut to the last layer's view, which still covers every page-list entry, so
         # all layers share one num_pages and therefore one cuDNN graph.
@@ -884,7 +884,7 @@ class CuDNNAttention(AttentionBackend):
         *,
         attention_mask: PredefinedAttentionMask = PredefinedAttentionMask.FULL,
         key_padding_mask: Optional[torch.Tensor] = None,
-        kv_cache: Optional[BlockCausalKVCacheManager] = None,
+        kv: Optional[ForwardPlan] = None,
         **kwargs,
     ) -> torch.Tensor:
         """Run attention.
@@ -895,39 +895,19 @@ class CuDNNAttention(AttentionBackend):
             v: Value tensor ``[B, S_kv, H_kv, D_v]``.
             attention_mask: ``CAUSAL`` or ``FULL``.
             key_padding_mask: Not supported by this backend.
-            kv_cache: A ``BlockCausalKVCacheManager``. When given, ``k``/``v`` are the new
-                tokens only: they are written at ``staging_offset`` and attention runs
-                over everything cached before them plus themselves.
-            seq_len: Global number of real tokens when ``kv_cache`` is given (all
-                ranks, before padding, not this rank's shard); all ``S_q`` rows
-                are real if it is ``None`` or ``kv_cache`` is absent. Rows past it are
-                padding added so the sequence splits evenly across ranks; they are
-                neither written to the cache nor attended, and their output rows are zero.
-            causal_block_size: Specifies how the real tokens are cut into consecutive
-                causal blocks: full attention within a causal block, causal across causal
-                blocks. Requires ``kv_cache``; passing it without one raises. Use it when
-                the cache must hold each causal block's K/V as if the causal blocks had
-                been generated one at a time, so later ones never leak into earlier ones.
-                Absent: one causal block.
+            kv: A ``ForwardPlan`` from a ``BlockCausalKVCacheManager``. When given,
+                ``k``/``v`` are the new tokens only: they are written at
+                ``staging_offset`` and attention runs over everything cached before them
+                plus themselves, full within a causal block and causal across causal
+                blocks. The first ``kv.num_tokens`` rows are real; rows past them are
+                padding added so the sequence splits evenly across ranks, neither written
+                to the cache nor attended, and their output rows are zero.
 
         Returns:
             Output tensor ``[B, S_q, H, D_v]``.
         """
-        if kv_cache is not None:
-            return self._run_paged(
-                q,
-                k,
-                v,
-                kv_cache,
-                kwargs.pop("causal_block_size", None),
-                attention_mask,
-                key_padding_mask,
-                kwargs.pop("seq_len", None),
-            )
-        if kwargs.pop("causal_block_size", None) is not None:
-            raise NotImplementedError(
-                "causal_block_size is only implemented over a K/V cache; pass kv_cache."
-            )
+        if kv is not None:
+            return self._run_paged(q, k, v, kv, attention_mask, key_padding_mask)
         output, _ = self._run(
             q, k, v, is_causal=self._resolve_mask(attention_mask, key_padding_mask), with_lse=False
         )
@@ -948,7 +928,7 @@ class CuDNNAttention(AttentionBackend):
             output: ``[B, S_q, H, D_v]``
             lse: ``[B, S_q, H]`` float32
         """
-        if kwargs.get("kv_cache") is not None:
+        if kwargs.get("kv") is not None:
             raise NotImplementedError("forward_with_lse does not support a K/V cache.")
         output, lse = self._run(
             q, k, v, is_causal=self._resolve_mask(attention_mask, key_padding_mask), with_lse=True
