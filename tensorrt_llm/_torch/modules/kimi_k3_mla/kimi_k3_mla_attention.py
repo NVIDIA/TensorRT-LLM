@@ -26,7 +26,7 @@ from ...model_config import ModelConfig
 from ...utils import AuxStreamType
 from ..linear import Linear, TensorParallelMode
 from ..multi_stream_utils import do_multi_stream
-from ..projection_capabilities import GatedEpilogueProjection
+from ..projection_capabilities import GatedEpilogueProjection, PrequantizedInputProjection
 
 
 def _make_pos_embd_params(
@@ -197,6 +197,7 @@ class KimiK3MLAAttention(MLA):
             if self.mapping.has_cp_helix():
                 # The gate GEMM runs beside the Helix all-to-all (_output_gate).
                 self.helix_exchange_event = torch.cuda.Event()
+                self._gate_ready = torch.cuda.Event()
 
         if use_output_gate:
             # The gate must match o_proj's input sharding (under helix the
@@ -241,7 +242,9 @@ class KimiK3MLAAttention(MLA):
         # loaded projections are known (cache_derived_state). Not under Helix +
         # attention DP, whose output projection reduce-scatters.
         self._fused_output_gate = False
-        self._gate_ready = torch.cuda.Event()
+        # Whether the fused q_a / kv_a projection can consume a prequantized
+        # input (PrequantizedInputProjection); set in cache_derived_state.
+        self._qkv_a_takes_prequantized = False
 
     def cache_derived_state(self) -> None:
         super().cache_derived_state()
@@ -251,6 +254,30 @@ class KimiK3MLAAttention(MLA):
             and isinstance(self.g_proj, GatedEpilogueProjection)
             and isinstance(self.o_proj, GatedEpilogueProjection)
         )
+        self._qkv_a_takes_prequantized = self.fuse_qkv_a_proj and isinstance(
+            self.kv_a_proj_with_mqa, PrequantizedInputProjection
+        )
+
+    def takes_prequantized_input(self, num_rows: int, attn_metadata: AttentionMetadata) -> bool:
+        """Generation-only batches whose fused q_a / kv_a projection runs the low-M kernel on
+        all ``num_rows`` rows: there the MXFP8 form of the rows (E4M3 and UE8M0 1x32 R128c4
+        scales, quantized with the low-M kernel's arithmetic) projects bitwise like the rows."""
+        return (
+            self._qkv_a_takes_prequantized
+            and attn_metadata.num_contexts == 0
+            and num_rows == attn_metadata.num_tokens
+            and self.kv_a_proj_with_mqa.takes_prequantized_input(num_rows)
+        )
+
+    def _project_qkv_a(
+        self,
+        hidden_states: torch.Tensor,
+        prequantized_input: Optional[tuple[torch.Tensor, torch.Tensor]],
+    ) -> torch.Tensor:
+        if prequantized_input is None:
+            return super()._project_qkv_a(hidden_states, None)
+        assert prequantized_input[0].shape[0] == hidden_states.shape[0]
+        return self.kv_a_proj_with_mqa.forward_prequantized(*prequantized_input)
 
     def _output_gate(
         self, hidden_states: torch.Tensor, attn_metadata: AttentionMetadata

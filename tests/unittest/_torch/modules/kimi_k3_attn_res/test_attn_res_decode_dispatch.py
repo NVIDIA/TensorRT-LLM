@@ -186,36 +186,43 @@ class _FakeKdaMixer:
         return (h.float() * 0.75).to(torch.bfloat16)
 
 
+@pytest.mark.parametrize("attention", ["kda", "mla"])
 @pytest.mark.parametrize("m", [7, 32])
 @torch.no_grad()
-def test_decoder_layers_mxfp8_handoff(m: int):
-    """A KDA layer whose pre-attention mix folds in the previous MoE residual hands the mixer the
-    MXFP8 form of the normed mix, bitwise the FP8 low-M GEMM's quantization of the BF16 rows; the
-    layer outputs do not change, and context batches get no hand-off."""
+def test_decoder_layers_mxfp8_handoff(m: int, attention: str):
+    """A KDA or MLA layer whose pre-attention mix folds in the previous MoE residual hands the
+    attention the MXFP8 form of the normed mix, bitwise the FP8 low-M GEMM's quantization of the
+    BF16 rows; the layer outputs do not change, and context batches get no hand-off."""
     from types import SimpleNamespace
 
     from tensorrt_llm._torch.kernels.blackwell import fp8_block_scale_low_m_gemm as low_m
 
     layers = [_fake_layer(1, 10), _fake_layer(2, 20)]
+    mixers = []
     for layer in layers:
-        layer.linear_attn = _FakeKdaMixer()
+        mixers.append(_FakeKdaMixer())
+        layer.is_kda = attention == "kda"
+        if layer.is_kda:
+            layer.linear_attn = mixers[-1]
+        else:
+            layer.self_attn = mixers[-1]
     bank = _rows(8, m, HIDDEN)
     hidden = _rows(m, HIDDEN)
 
     def run(num_contexts):
         metadata = SimpleNamespace(num_contexts=num_contexts)
-        for layer in layers:
-            layer.linear_attn.seen.clear()
+        for mixer in mixers:
+            mixer.seen.clear()
         h, snaps = hidden, 3
         for layer in layers:
             h, snaps = layer(h, bank, snaps, metadata)
         return h.materialize()
 
     ref = run(num_contexts=1)
-    assert all(x is None for layer in layers for _, x in layer.linear_attn.seen)
+    assert all(x is None for mixer in mixers for _, x in mixer.seen)
     assert torch.equal(run(num_contexts=0), ref)
     # The first layer's input is a plain row (no deferred MoE update), the second one's is not.
-    (_, first), (rows, handoff) = layers[0].linear_attn.seen[0], layers[1].linear_attn.seen[0]
+    (_, first), (rows, handoff) = mixers[0].seen[0], mixers[1].seen[0]
     assert first is None and handoff is not None
     ref_q, ref_s = low_m.mxfp8_quantize_reference(rows)
     xq, xs = handoff

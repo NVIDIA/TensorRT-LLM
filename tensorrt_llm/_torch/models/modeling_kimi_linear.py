@@ -136,7 +136,7 @@ from ..modules.linear import (
 )
 from ..modules.linear import Linear as TrtllmLinear
 from ..modules.multi_stream_utils import do_multi_stream, maybe_execute_in_parallel
-from ..modules.projection_capabilities import GatedEpilogueProjection
+from ..modules.projection_capabilities import GatedEpilogueProjection, PrequantizedInputProjection
 from ..modules.rms_norm import RMSNorm
 from ..modules.situ import SituAndMul
 from ..moe.fused_moe import ConfigurableMoE, SiTuActivation, TRTLLMGenFusedMoE, create_moe
@@ -921,7 +921,7 @@ def _low_m_gemm_scale_from_mxfp8(weight_scale: torch.Tensor, n: int, k: int) -> 
     return fp8_block_scale_low_m_gemm.pack_block_scale_from_mxfp8_layout(weight_scale, n, k)
 
 
-class _Fp8BlockScaleWeightReadLinear(GatedEpilogueProjection):
+class _Fp8BlockScaleWeightReadLinear(GatedEpilogueProjection, PrequantizedInputProjection):
     """Bias-free FP8 block-scale GEMM for checkpoint attention and converted MLPs.
 
     Attention loads checkpoint E4M3 codes and 128x128 scales directly. The optional
@@ -2401,11 +2401,19 @@ class KimiMLARuntime(nn.Module):
             mapping_with_cp=mapping_with_cp,
         )
 
+    def takes_prequantized_input(self, num_rows: int, attn_metadata: AttentionMetadata) -> bool:
+        """Whether :meth:`forward` consumes the MXFP8 form of its ``num_rows`` input rows
+        (``prequantized_input``, see ``KimiK3MLAAttention.takes_prequantized_input``)."""
+        return self.mixer.takes_prequantized_input(num_rows, attn_metadata)
+
     def forward(
-        self, hidden_states: torch.Tensor, attn_metadata: AttentionMetadata
+        self,
+        hidden_states: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+        prequantized_input: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> torch.Tensor:
         # MLA.forward takes position_ids first; K3 is NoPE, so pass None.
-        out = self.mixer(None, hidden_states, attn_metadata)
+        out = self.mixer(None, hidden_states, attn_metadata, prequantized_input=prequantized_input)
         if self._o_allreduce is not None:
             # Head-sharded TP: sum the row-sharded o_proj partials across
             # the head-shard group.
@@ -2591,9 +2599,10 @@ class KimiLinearDecoderLayer(nn.Module):
         attn_input_mxfp8 = None
         if isinstance(hidden_states, _DeferredMoEResidual):
             # The previous MoE layer's residual update, folded into this layer's mix, which
-            # also hands the KDA mixer the MXFP8 form of its input where it consumes one.
+            # also hands the attention the MXFP8 form of its input where it consumes one.
             if capture is None and num_snapshots > 0:
                 num_rows = hidden_states.residual.shape[0]
+                attention = self.linear_attn if self.is_kda else self.self_attn
                 folded = _attn_res_decode_kernel(
                     hidden_states.residual,
                     (hidden_states.routed, hidden_states.shared),
@@ -2602,9 +2611,8 @@ class KimiLinearDecoderLayer(nn.Module):
                     self.self_attention_res_norm,
                     self.input_layernorm,
                     # Under row slicing the mixer reads the gathered rows, not this rank's.
-                    mxfp8=self.is_kda
-                    and sliced is None
-                    and self.linear_attn.takes_prequantized_input(num_rows, attn_metadata),
+                    mxfp8=sliced is None
+                    and attention.takes_prequantized_input(num_rows, attn_metadata),
                 )
                 if folded is not None:
                     hidden_states, normed, *attn_input_mxfp8 = folded
@@ -2651,16 +2659,19 @@ class KimiLinearDecoderLayer(nn.Module):
         # Attention is head-TP over every row: KDA rows are gathered in and its
         # row-sharded o_proj partials reduce-scattered back out here; helix MLA
         # does both itself (_helix_cp_allgather_input / _helix_cp_output_projection).
+        prequantized_input = tuple(attn_input_mxfp8) if attn_input_mxfp8 else None
         if self.is_kda:
             hidden_states = self.linear_attn(
                 _full_rows(hidden_states),
                 attn_metadata,
-                prequantized_input=tuple(attn_input_mxfp8) if attn_input_mxfp8 else None,
+                prequantized_input=prequantized_input,
             )
             if sliced is not None:
                 hidden_states = sliced.reduce_scatter(hidden_states, num_tokens)
         else:
-            hidden_states = self.self_attn(hidden_states, attn_metadata)
+            hidden_states = self.self_attn(
+                hidden_states, attn_metadata, prequantized_input=prequantized_input
+            )
 
         if prefix_sum is None:
             prefix_sum = hidden_states

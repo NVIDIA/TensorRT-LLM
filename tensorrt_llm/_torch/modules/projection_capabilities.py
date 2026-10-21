@@ -35,3 +35,21 @@ class GatedEpilogueProjection(nn.Module):
 
     def forward_gated(self, x: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
         raise NotImplementedError
+
+
+class PrequantizedInputProjection(nn.Module):
+    """A projection that can consume an input its producer already quantized.
+
+    ``takes_prequantized_input(num_rows)`` says whether a producer should hand
+    ``forward_prequantized`` the quantized form of ``num_rows`` rows (an
+    activation and its scale, in the layout the projection documents) instead
+    of the rows themselves; there ``forward_prequantized`` equals ``self(rows)``.
+    """
+
+    def takes_prequantized_input(self, num_rows: int) -> bool:
+        raise NotImplementedError
+
+    def forward_prequantized(
+        self, activation: torch.Tensor, activation_scale: torch.Tensor
+    ) -> torch.Tensor:
+        raise NotImplementedError

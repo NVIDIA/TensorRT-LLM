@@ -10,6 +10,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 from _torch.attention.multi_gpu.helix_test_utils import CACHE_TYPE_SELFKONLY, setup_kv_and_metadata
+from _torch.kernels.parallel.test_fp8_block_scale_low_m_gemm import _mxfp8_operand
 from _torch.modeling.kimi_k3_mla_reference import KimiMLAAttention
 from _torch.modeling.test_kimi_k3_checkpoint import load_mla_checkpoint
 from utils.util import skip_pre_blackwell
@@ -242,9 +243,20 @@ def test_k3_mla_matches_huggingface(fp8: bool, gate: bool) -> None:
         )
         metadata.prepare()
         extra_attrs["attention_metadata"] = weakref.ref(metadata)
+        decode_input = hidden[:, -1].contiguous()
         with model_extra_attrs(extra_attrs):
-            actual = runtime(hidden[:, -1].contiguous(), metadata)
+            actual = runtime(decode_input, metadata)
         _assert_matches_reference(actual, expected[:, -1], fp8)
+
+        # The fused q_a / kv_a projection on the MXFP8 form of the decode rows (the attention
+        # residual kernel's hand-off) gives the same output, bit for bit.
+        assert runtime.takes_prequantized_input(batch, metadata) == fp8
+        if fp8:
+            with model_extra_attrs(extra_attrs):
+                prequantized = runtime(
+                    decode_input, metadata, prequantized_input=_mxfp8_operand(decode_input)
+                )
+            assert torch.equal(prequantized, actual)
     finally:
         manager.shutdown()
 

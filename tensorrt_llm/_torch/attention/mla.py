@@ -18,7 +18,7 @@ import math
 import os
 import weakref
 from contextlib import nullcontext
-from typing import Dict, Optional, cast
+from typing import Dict, Optional, Tuple, cast
 
 import torch
 from torch import nn
@@ -143,6 +143,8 @@ def mla_custom_op_inplace(
     latent_cache_gen: Optional[torch.Tensor],
     hidden_states_fp4: Optional[torch.Tensor] = None,
     hidden_states_sf: Optional[torch.Tensor] = None,
+    prequantized_activation: Optional[torch.Tensor] = None,
+    prequantized_scale: Optional[torch.Tensor] = None,
 ) -> None:
     metadata, mla_layer = _extract_mla_extra_attrs(layer_idx)
     if hidden_states_fp4 is not None or hidden_states_sf is not None:
@@ -160,6 +162,11 @@ def mla_custom_op_inplace(
         metadata,
         attn_output=[output],
         latent_cache_gen=latent_cache_gen,
+        prequantized_input=(
+            None
+            if prequantized_activation is None
+            else (prequantized_activation, prequantized_scale)
+        ),
     )
 
 
@@ -997,9 +1004,14 @@ class MLA(nn.Module):
         attn_metadata: AttentionMetadata,
         attn_output: list[torch.Tensor],
         latent_cache_gen: Optional[torch.Tensor] = None,
+        prequantized_input: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> None:
-        """Run the dense or sparse implementation of the shared MLA module."""
+        """Run the dense or sparse implementation of the shared MLA module.
+
+        ``prequantized_input`` is described in :meth:`takes_prequantized_input`.
+        """
         if self.sparse_attn_hooks is not None:
+            assert prequantized_input is None, "sparse MLA takes no prequantized input"
             self.sparse_attn_hooks.forward(
                 self,
                 position_ids,
@@ -1020,6 +1032,7 @@ class MLA(nn.Module):
                 attn_metadata,
                 attn_output[0],
                 latent_cache_gen=latent_cache_gen,
+                prequantized_input=prequantized_input,
             )
 
     def _project_q_by_phase(
@@ -1061,6 +1074,7 @@ class MLA(nn.Module):
         attn_metadata: AttentionMetadata,
         output: torch.Tensor,
         latent_cache_gen: Optional[torch.Tensor] = None,
+        prequantized_input: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> None:
         """
         Forward pass for the MLA module. Writes result into output tensor in-place.
@@ -1071,6 +1085,9 @@ class MLA(nn.Module):
             attn_metadata (AttentionMetadata): The attention metadata.
             output (torch.Tensor): The output tensor to write results into.
             latent_cache_gen (Optional[torch.Tensor]): The latent cache used in generation.
+            prequantized_input (Optional[Tuple[torch.Tensor, torch.Tensor]]): The
+                quantized form of every hidden_states row for the fused q_a /
+                kv_a projection (see :meth:`takes_prequantized_input`).
         """
         # split q, k, v into context and gen batches
         num_contexts = attn_metadata.num_contexts
@@ -1090,7 +1107,8 @@ class MLA(nn.Module):
             q = hidden_states
         else:
             if self.fuse_qkv_a_proj:
-                q, compressed_kv, k_pe = self.kv_a_proj_with_mqa(hidden_states).split(
+                qkv_a = self._project_qkv_a(hidden_states, prequantized_input)
+                q, compressed_kv, k_pe = qkv_a.split(
                     [self.q_lora_rank, self.kv_lora_rank, self.qk_rope_head_dim], -1
                 )
             else:
@@ -2337,8 +2355,11 @@ class MLA(nn.Module):
         position_ids: Optional[torch.Tensor],
         attn_output: list[torch.Tensor],
         latent_cache_gen: Optional[torch.Tensor],
+        prequantized_input: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> None:
         """Run the dense or sparse registered custom-op implementation."""
+        if self.sparse_attn_hooks is not None:
+            assert prequantized_input is None, "sparse MLA takes no prequantized input"
         if self.sparse_attn_hooks is not None and self.sparse_attn_hooks.forward_custom_op(
             self,
             hidden_states,
@@ -2353,6 +2374,7 @@ class MLA(nn.Module):
             raise RuntimeError("MLA custom ops require exactly one output tensor.")
 
         if isinstance(hidden_states, Fp4QuantizedTensor):
+            assert prequantized_input is None, "an NVFP4 input takes no prequantized input"
             maybe_bcg_mla_custom_op_inplace(
                 hidden_states.unquantized_hidden_states,
                 position_ids,
@@ -2369,6 +2391,10 @@ class MLA(nn.Module):
                 self.layer_idx_str,
                 output,
                 latent_cache_gen,
+                prequantized_activation=(
+                    None if prequantized_input is None else prequantized_input[0]
+                ),
+                prequantized_scale=None if prequantized_input is None else prequantized_input[1],
             )
 
     def _gate_and_project_output(
@@ -2436,6 +2462,27 @@ class MLA(nn.Module):
             self.layer_idx,
         )
 
+    def takes_prequantized_input(self, num_rows: int, attn_metadata: AttentionMetadata) -> bool:
+        """Whether :meth:`forward` on ``num_rows`` rows consumes their quantized form
+        (``prequantized_input``: an activation and its scale, in the layout the
+        subclass's :meth:`_project_qkv_a` reads) instead of quantizing the rows
+        itself. The base MLA never does.
+        """
+        return False
+
+    def _project_qkv_a(
+        self,
+        hidden_states: torch.Tensor,
+        prequantized_input: Optional[Tuple[torch.Tensor, torch.Tensor]],
+    ) -> torch.Tensor:
+        """The fused q_a / kv_a projection of ``hidden_states``.
+
+        A subclass whose :meth:`takes_prequantized_input` can be true overrides
+        this to project ``prequantized_input`` instead; the base takes none.
+        """
+        assert prequantized_input is None, f"{type(self).__name__} takes no prequantized input"
+        return self.kv_a_proj_with_mqa(hidden_states)
+
     def forward(
         self,
         position_ids: Optional[torch.Tensor],
@@ -2443,6 +2490,7 @@ class MLA(nn.Module):
         attn_metadata: AttentionMetadata,
         all_reduce_params: Optional[AllReduceParams] = None,
         latent_cache_gen: Optional[torch.Tensor] = None,
+        prequantized_input: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> torch.Tensor:
         hidden_states = _helix_cp_allgather_input(
             hidden_states, attn_metadata, self.mapping, self.layer_idx
@@ -2467,6 +2515,7 @@ class MLA(nn.Module):
                 position_ids,
                 attn_output,
                 latent_cache_gen,
+                prequantized_input,
             )
         else:
             attn_output = self._create_outputs(hidden_states, attn_metadata)
@@ -2476,6 +2525,7 @@ class MLA(nn.Module):
                 attn_metadata,
                 attn_output=attn_output,
                 latent_cache_gen=latent_cache_gen,
+                prequantized_input=prequantized_input,
             )
 
         return self._gate_and_project_output(

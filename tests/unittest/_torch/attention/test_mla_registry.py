@@ -91,6 +91,7 @@ class _OutputGateStub:
         attn_metadata: object,
         attn_output: list[torch.Tensor],
         latent_cache_gen: object = None,
+        prequantized_input: object = None,
     ) -> None:
         attn_output[0].fill_(2.0)
 
@@ -100,6 +101,7 @@ class _OutputGateStub:
         position_ids: object,
         attn_output: list[torch.Tensor],
         latent_cache_gen: object,
+        prequantized_input: object = None,
     ) -> None:
         attn_output[0].fill_(2.0)
 
