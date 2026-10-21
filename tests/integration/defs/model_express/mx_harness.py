@@ -48,6 +48,7 @@ from defs.model_express.mx_evidence import (
     DONOR_PROCESS_FAILURE_MARKERS,
     DONOR_PROCESS_FAILURE_OVERLAP,
     check_receiver_log,
+    rdma_transfers_by_rank,
 )
 from defs.trt_test_alternative import cleanup_process_tree, popen
 from tensorrt_llm._torch.weight_sharing import (
@@ -603,6 +604,57 @@ def assert_transfer_evidence(case: MxE2ECase, receiver_log_path: Path) -> None:
         )
 
 
+def mx_transfer_upper_bound(manifest: WeightManifest) -> tuple[int, int]:
+    """Return the most tensors and bytes ModelExpress can move for one rank's manifest.
+
+    ModelExpress registers one tensor per distinct parameter data pointer and
+    no buffers. Non-empty parameters that view one storage at the same offset,
+    such as a tied LM head and its token-embedding table, are one view and
+    count once. Empty parameters count once each, although they can share the
+    null data pointer, so the result bounds the transfer from above.
+    """
+    storage_of = {fqn: index for index, group in enumerate(manifest.alias_groups) for fqn in group}
+    views: dict[tuple[object, ...], int] = {}
+    for entry in manifest.entries:
+        if entry.kind != "param":
+            continue
+        storage = storage_of.get(entry.fqn, entry.fqn) if entry.nbytes else entry.fqn
+        views.setdefault((storage, entry.dtype, entry.storage_offset), entry.nbytes)
+    return len(views), sum(views.values())
+
+
+def assert_transfer_within_manifests(
+    case: MxE2ECase,
+    receiver_log_path: Path,
+    manifests: Mapping[ManifestKey, WeightManifest],
+) -> None:
+    """Require no receiver rank's RDMA record to move more than its distinct parameter views.
+
+    Run after `assert_transfer_evidence`, which guarantees one record per rank.
+    A storage that several parameters share must cross the wire once.
+    """
+    transfers = rdma_transfers_by_rank(
+        receiver_log_path.read_text(encoding="utf-8", errors="replace")
+    )
+    problems = []
+    for rank in range(case.tp_size):
+        tensor_count, total_bytes = mx_transfer_upper_bound(
+            manifests[("transfer", "receiver", rank)]
+        )
+        (record,) = transfers[rank]
+        # ModelExpress logs the size in GB rounded to two decimals.
+        if record.tensor_count > tensor_count or record.size_gb > total_bytes / 1e9 + 0.0051:
+            problems.append(
+                f"rank {rank} moved {record.tensor_count} tensors, {record.size_gb} GB; its "
+                f"transfer manifest has at most {tensor_count} distinct parameter views, "
+                f"{total_bytes / 1e9:.4f} GB"
+            )
+    if problems:
+        pytest.fail(
+            "MX receiver moved more than its transfer manifest holds:\n- " + "\n- ".join(problems)
+        )
+
+
 # --------------------------------------------------------------------------- #
 # Weight manifests
 # --------------------------------------------------------------------------- #
@@ -853,6 +905,7 @@ __all__ = [
     "archive_run_artifacts",
     "assert_probe_payload",
     "assert_transfer_evidence",
+    "assert_transfer_within_manifests",
     "assert_weight_manifests",
     "build_canonical_snapshot",
     "build_metadata_only_snapshot",
@@ -864,6 +917,7 @@ __all__ = [
     "load_payload",
     "log_tail",
     "mx_metadata_ports",
+    "mx_transfer_upper_bound",
     "qualification_required",
     "report_timings",
     "require_mx_environment",
