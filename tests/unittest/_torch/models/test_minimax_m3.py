@@ -484,6 +484,10 @@ def test_fused_qkv_index_projection_preserves_index_head_groups(
         MiniMaxM3SparseAttentionConfig(implementation="triton", fuse_qkv_index_projection=True)
     with pytest.raises(ValueError, match=r"requires indexer_kv_dtype='fp8'"):
         MiniMaxM3SparseAttentionConfig(implementation="msa", fuse_qkv_index_projection=True)
+    with pytest.raises(ValueError, match=r"index_tp_split=True requires"):
+        MiniMaxM3SparseAttentionConfig(implementation="msa", index_tp_split=True)
+    with pytest.raises(ValueError, match=r"index_k_tp_shard=True requires"):
+        MiniMaxM3SparseAttentionConfig(implementation="msa", index_k_tp_shard=True)
 
 
 @pytest.mark.cpu_only
@@ -992,6 +996,7 @@ def test_piecewise_attention_boundary_preserves_indexer_cache_contract(
         msa_qo_lens_cpu=torch.tensor([2], dtype=torch.int32),
         msa_kv_lens_cpu=torch.tensor([2], dtype=torch.int32),
         msa_qo_offset_cpu=torch.tensor([0], dtype=torch.int32),
+        msa_index_split=None,
     )
 
     def write_caches(
@@ -1602,7 +1607,11 @@ def test_minimax_m3_five_way_projection_shard_geometry(tp_size: int) -> None:
     shard_geometry = MiniMaxM3QKVIndexerLinear._shard_geometry
     for tp_rank in range(tp_size):
         module = SimpleNamespace(
-            tp_size=tp_size, tp_rank=tp_rank, total_num_kv_heads=4, total_num_index_heads=4
+            tp_size=tp_size,
+            tp_rank=tp_rank,
+            total_num_kv_heads=4,
+            total_num_index_heads=4,
+            replicate_index_q=False,
         )
         kv_world = min(tp_size, 4)
         kv_rank = tp_rank // max(tp_size // 4, 1)

@@ -48,6 +48,7 @@ from .common import (
     build_paged_kv_slot_mapping,
     write_kv_slots,
 )
+from .index_tp_split import IndexTpSplit
 from .kernels.msa_utils import (
     MSA_REQUIRED_HEAD_DIM,
     MSA_REQUIRED_TOPK,
@@ -217,6 +218,8 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
     # True only with speculative decoding; otherwise on_update_kv_lens and its
     # staging are skipped and non-speculative steps run as before.
     _msa_kv_lens_dynamic: bool = False
+    # Decode index scoring split across the TP ranks (index_tp_split), else None.
+    msa_index_split: Optional[IndexTpSplit] = None
 
     def __post_init__(self) -> None:
         super().__post_init__()
@@ -379,7 +382,12 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         # num_index_heads * query tokens into one Q block, which bounds the
         # draft length it can verify.
         decode_query_len = self._msa_max_decode_query_len()
-        num_index_heads = params.sharded_index_head_count(self.mapping)
+        # The TP split scores every index head on every rank.
+        num_index_heads = (
+            params.num_index_heads
+            if params.index_tp_split
+            else params.sharded_index_head_count(self.mapping)
+        )
         if not self._cutedsl_indexer_supported(
             num_index_heads=num_index_heads,
             page_size=page_size,
@@ -533,6 +541,14 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
                 max_k_tiles=max_k_tiles,
                 capture_graph=capture_graph,
             )
+            if params.index_tp_split:
+                self.msa_index_split = IndexTpSplit.get(
+                    self.mapping,
+                    list(self.msa_layer_cache_tensors),
+                    params.num_index_heads,
+                    max_blocks_per_seq,
+                    self._msa_max_decode_tokens(),
+                )
         self._msa_buffers_ready = True
 
     def _msa_max_decode_query_len(self) -> int:
@@ -1434,7 +1450,7 @@ class MiniMaxM3MsaSparseAttention(TrtllmAttention):
         span = metadata.msa_decode_span
         # Preserve split column views without allowing an implicit copy. The
         # scorer and cache writer below both honor their source strides.
-        idx_q_view = idx_q.view(num_tokens, config.num_index_heads, config.sparse_index_dim)
+        idx_q_view = idx_q.view(num_tokens, -1, config.sparse_index_dim)
         idx_k_cache = metadata.msa_idx_k_cache(self.layer_idx)
         configured_for_fp8 = self.indexer_kv_dtype == "fp8"
         expected_cache_dtype = torch.float8_e4m3fn if configured_for_fp8 else torch.bfloat16
@@ -1523,11 +1539,34 @@ class MiniMaxM3MsaSparseAttention(TrtllmAttention):
                 if span is not None
                 else None
             )
+        split = metadata.msa_index_split
+        if split is not None:
+            # idx_q holds every index head: the split scores all of them on the
+            # generation span; the proxy and the selection take this rank's heads.
+            if span is not None:
+                max_score = split.score(
+                    self.layer_idx,
+                    idx_q_view[gen_first:],
+                    idx_k_cache,
+                    block_table,
+                    seq_lens_cuda,
+                    max_score,
+                    decode_query_len,
+                )
+            idx_q_view = idx_q_view[:, split.heads]
+        kv_indices = metadata.msa_kv_indices
+        if split is not None and idx_k_cache.shape[2] < 128 and metadata.num_contexts > 0:
+            # The proxy scores the context rows on full pages, which the ranks'
+            # index-K row shards hold only together.
+            kv_lens = metadata.msa_kv_lens_cpu[: metadata.num_contexts]
+            num_pages = int(((kv_lens + 127) // 128).sum())
+            idx_k_cache = split.gather(idx_k_cache, kv_indices[:num_pages])
+            kv_indices = torch.arange(num_pages, dtype=torch.int32, device=idx_k_cache.device)
         return self.indexer.select_blocks(
             idx_q_view,
             idx_k_cache,
             idx_sm_scale=idx_sm_scale,
-            kv_indices=metadata.msa_kv_indices,
+            kv_indices=kv_indices,
             qo_lens_cpu=metadata.msa_qo_lens_cpu,
             kv_lens_cpu=metadata.msa_kv_lens_cpu,
             qo_offset_cpu=metadata.msa_qo_offset_cpu,
@@ -1540,6 +1579,7 @@ class MiniMaxM3MsaSparseAttention(TrtllmAttention):
             decode_query_len=decode_query_len,
             gen_token_first=gen_first,
             ctx_rows=ctx_rows,
+            gen_scored=split is not None and span is not None,
         )
 
     def sparse_attn_predict(

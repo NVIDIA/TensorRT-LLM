@@ -99,8 +99,10 @@ class MiniMaxM3QKVIndexerLinear(Linear):
     Each rank emits ``[Q | K | V | index-Q | index-K]``. Q follows normal
     attention head sharding, K/V/index-Q follow KV-head sharding (including
     replication when TP exceeds the KV-head count), and the single index-K
-    head is replicated. The underlying :class:`Linear` remains the standard
-    quantized implementation; only checkpoint packing is model-specific.
+    head is replicated. With ``replicate_index_q`` every rank also gets all
+    index-Q heads (the TP-split indexer scores every head on every rank). The
+    underlying :class:`Linear` remains the standard quantized implementation;
+    only checkpoint packing is model-specific.
     """
 
     _SHARD_NAMES = ("q", "k", "v", "index_q", "index_k")
@@ -123,6 +125,7 @@ class MiniMaxM3QKVIndexerLinear(Linear):
         use_custom_cublas_mm: bool,
         use_cute_dsl_bf16_gemm: bool,
         use_cute_dsl_blockscaling_mm: bool,
+        replicate_index_q: bool = False,
     ) -> None:
         if total_num_index_heads != total_num_kv_heads:
             raise ValueError(
@@ -159,12 +162,15 @@ class MiniMaxM3QKVIndexerLinear(Linear):
         self.index_head_dim = int(index_head_dim)
         self.local_num_heads = total_num_heads // tp_size
         self.local_num_kv_heads = local_num_kv_heads
-        self.local_num_index_heads = local_num_kv_heads
+        self.replicate_index_q = replicate_index_q
+        self.local_num_index_heads = (
+            total_num_index_heads if replicate_index_q else local_num_kv_heads
+        )
         self.local_output_sizes = (
             self.local_num_heads * head_dim,
             local_num_kv_heads * head_dim,
             local_num_kv_heads * head_dim,
-            local_num_kv_heads * index_head_dim,
+            self.local_num_index_heads * index_head_dim,
             index_head_dim,
         )
         local_out_features = sum(self.local_output_sizes)
@@ -191,7 +197,7 @@ class MiniMaxM3QKVIndexerLinear(Linear):
         """Return effective (world size, rank) for one checkpoint shard."""
         if shard_name == "q":
             return self.tp_size, self.tp_rank
-        if shard_name == "index_k":
+        if shard_name == "index_k" or (shard_name == "index_q" and self.replicate_index_q):
             return 1, 0
 
         total_heads = (
@@ -1205,6 +1211,8 @@ class MiniMaxM3Attention(Attention):
             and sparse_runtime_cfg is not None
             and getattr(sparse_runtime_cfg, "fuse_qkv_index_projection", False)
         )
+        # index_k_tp_shard: TP rank r stores index-K rows r, r + TP, ...
+        self.index_shard_rank, self.index_shard_world = 0, 1
         if self.is_sparse_attention_layer:
             sparse_cfg = getattr(config, "sparse_attention_config", None) or {}
             total_num_index_heads = int(sparse_cfg.get("sparse_num_index_heads", 4))
@@ -1234,7 +1242,11 @@ class MiniMaxM3Attention(Attention):
                     use_custom_cublas_mm=old_qkv_proj.use_custom_cublas_mm,
                     use_cute_dsl_bf16_gemm=old_qkv_proj.use_cute_dsl_bf16_gemm,
                     use_cute_dsl_blockscaling_mm=old_qkv_proj.use_cute_dsl_blockscaling_mm,
+                    replicate_index_q=sparse_runtime_cfg.index_tp_split,
                 )
+                if sparse_runtime_cfg.index_k_tp_shard:
+                    self.index_shard_rank = self.qkv_proj.tp_rank
+                    self.index_shard_world = self.qkv_proj.tp_size
                 self.sparse_num_index_heads = self.qkv_proj.local_num_index_heads
             else:
                 # Use the same KV-group ownership as the five-way projection.
@@ -1572,7 +1584,6 @@ class MiniMaxM3Attention(Attention):
             or position_ids is None
             or self.head_dim != 128
             or self.sparse_index_dim != 128
-            or self.sparse_num_index_heads != self.num_key_value_heads
             or not self.use_gemma_norm
             or self.pos_embd_params is None
             or not self.pos_embd_params.is_neox
@@ -1647,10 +1658,10 @@ class MiniMaxM3Attention(Attention):
             index_k_cache.is_cuda
             and index_k_cache.dtype == torch.float8_e4m3fn
             and index_k_cache.dim() == 4
-            and tuple(index_k_cache.shape[1:]) == (1, 128, 128)
+            and tuple(index_k_cache.shape[1:]) == (1, 128 // self.index_shard_world, 128)
             and index_k_cache.stride(3) == 1
             and index_k_cache.stride(2) == 128
-            and index_k_cache.stride(1) >= 128 * 128
+            and index_k_cache.stride(1) >= index_k_cache.shape[2] * 128
             and index_k_cache.stride(0) >= index_k_cache.stride(1)
             and index_k_cache.stride(0) % 4 == 0
             and index_k_cache.stride(1) % 4 == 0
@@ -1691,6 +1702,7 @@ class MiniMaxM3Attention(Attention):
             self.index_k_norm.weight,
             rotary_cos_sin,
             position_ids.reshape(-1).contiguous().to(torch.int32),
+            self.index_shard_rank,
         )
         if layer_uses_nvfp4:
             q, index_q = torch.ops.trtllm.minimax_m3_nvfp4_qkv_indexer_norm_rope_kv_insert(
@@ -2277,6 +2289,9 @@ class MiniMaxM3Attention(Attention):
                 q, idx_q = horizontal
                 o = self._forward_attention_core(q, None, None, idx_q, None, attn_metadata)
                 return self.o_proj(o, all_reduce_params=all_reduce_params)
+            if self.index_shard_world > 1:
+                # The fallback writes whole 128-row index-K pages.
+                raise RuntimeError("MiniMax-M3 index_k_tp_shard requires the fused QKV producer.")
             main_size = self.q_size + 2 * self.kv_size
             packed_qkv, packed_idx_qk = packed.split(
                 [main_size, self.index_q_size + self.index_k_size], dim=-1

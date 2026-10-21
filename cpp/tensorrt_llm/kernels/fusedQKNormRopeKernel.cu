@@ -572,7 +572,8 @@ __global__ void minimaxM3Fp8QKVIndexerNormRopeKVInsertKernel(__nv_bfloat16 const
     int64_t kvPageStride, int64_t kvPlaneStride, int64_t kvHeadStride, int64_t kvTokenStride, int64_t indexPageStride,
     int64_t indexTokenStride, int64_t numPages, int numTokens, int numHeadsQ, int numHeadsKV, int numHeadsIndex,
     float eps, __nv_bfloat16 const* qWeight, __nv_bfloat16 const* kWeight, __nv_bfloat16 const* indexQWeight,
-    __nv_bfloat16 const* indexKWeight, float const* rotaryCosSin, int const* positionIds)
+    __nv_bfloat16 const* indexKWeight, float const* rotaryCosSin, int const* positionIds, int indexShardRank,
+    int indexShardWorld)
 {
     int const warpsPerBlock = blockDim.x / 32;
     int const warpId = threadIdx.x / 32;
@@ -693,8 +694,13 @@ __global__ void minimaxM3Fp8QKVIndexerNormRopeKVInsertKernel(__nv_bfloat16 const
     int const withinPage = slot & (kMinimaxM3PageSize - 1);
     if (isIndexK)
     {
+        // Rank r of W stores tokens r, r + W, ... of each page as its rows.
+        if (withinPage % indexShardWorld != indexShardRank)
+        {
+            return;
+        }
         int64_t const outputOffset = static_cast<int64_t>(page) * indexPageStride
-            + static_cast<int64_t>(withinPage) * indexTokenStride + laneId * kMinimaxM3ElemsPerThread;
+            + static_cast<int64_t>(withinPage / indexShardWorld) * indexTokenStride + laneId * kMinimaxM3ElemsPerThread;
         storeFp8HeadElements64<kMinimaxM3ElemsPerThread>(indexKCache, outputOffset, elements);
         return;
     }
@@ -720,7 +726,7 @@ __global__ void minimaxM3Nvfp4QKVIndexerNormRopeKVInsertKernel(__nv_bfloat16 con
     int64_t scaleHeadStride, int64_t indexPageStride, int64_t indexTokenStride, int64_t numPages, int numTokens,
     int numHeadsQ, int numHeadsKV, int numHeadsIndex, float eps, __nv_bfloat16 const* qWeight,
     __nv_bfloat16 const* kWeight, __nv_bfloat16 const* indexQWeight, __nv_bfloat16 const* indexKWeight,
-    float const* rotaryCosSin, int const* positionIds)
+    float const* rotaryCosSin, int const* positionIds, int indexShardRank, int indexShardWorld)
 {
     int const warpsPerBlock = blockDim.x / 32;
     int const warpId = threadIdx.x / 32;
@@ -837,8 +843,13 @@ __global__ void minimaxM3Nvfp4QKVIndexerNormRopeKVInsertKernel(__nv_bfloat16 con
     int const withinPage = slot & (kMinimaxM3PageSize - 1);
     if (isIndexK)
     {
+        // Rank r of W stores tokens r, r + W, ... of each page as its rows.
+        if (withinPage % indexShardWorld != indexShardRank)
+        {
+            return;
+        }
         int64_t const outputOffset = static_cast<int64_t>(page) * indexPageStride
-            + static_cast<int64_t>(withinPage) * indexTokenStride + laneId * kMinimaxM3ElemsPerThread;
+            + static_cast<int64_t>(withinPage / indexShardWorld) * indexTokenStride + laneId * kMinimaxM3ElemsPerThread;
         storeFp8HeadElements64<kMinimaxM3ElemsPerThread>(indexKCache, outputOffset, elements);
         return;
     }
@@ -1001,15 +1012,14 @@ void launchMinimaxM3Fp8QKVIndexerNormRopeKVInsert(void const* packed_input, void
     int64_t kv_head_stride, int64_t kv_token_stride, int64_t index_page_stride, int64_t index_token_stride,
     int64_t num_pages, int page_size, int num_tokens, int num_heads_q, int num_heads_kv, int num_heads_index,
     int head_dim, int rotary_dim, float eps, void const* q_weight, void const* k_weight, void const* index_q_weight,
-    void const* index_k_weight, float const* rotary_cos_sin, int const* position_ids, cudaStream_t stream)
+    void const* index_k_weight, float const* rotary_cos_sin, int const* position_ids, int index_shard_rank,
+    int index_shard_world, cudaStream_t stream)
 {
     TLLM_CHECK_WITH_INFO(head_dim == kMinimaxM3HeadDim, "MiniMax-M3 horizontal producer requires head_dim=128");
     TLLM_CHECK_WITH_INFO(rotary_dim == kMinimaxM3RotaryDim, "MiniMax-M3 horizontal producer requires rotary_dim=64");
     TLLM_CHECK_WITH_INFO(page_size == kMinimaxM3PageSize, "MiniMax-M3 horizontal producer requires page_size=128");
     TLLM_CHECK_WITH_INFO(num_heads_q > 0 && num_heads_kv > 0 && num_heads_index > 0,
         "MiniMax-M3 horizontal producer requires Q, KV, and index heads");
-    TLLM_CHECK_WITH_INFO(
-        num_heads_index == num_heads_kv, "MiniMax-M3 horizontal producer requires index heads to equal KV heads");
 
     constexpr int kBlockSize = 256;
     constexpr int kWarpsPerBlock = kBlockSize / 32;
@@ -1024,7 +1034,7 @@ void launchMinimaxM3Fp8QKVIndexerNormRopeKVInsert(void const* packed_input, void
         kv_token_stride, index_page_stride, index_token_stride, num_pages, num_tokens, num_heads_q, num_heads_kv,
         num_heads_index, eps, static_cast<__nv_bfloat16 const*>(q_weight), static_cast<__nv_bfloat16 const*>(k_weight),
         static_cast<__nv_bfloat16 const*>(index_q_weight), static_cast<__nv_bfloat16 const*>(index_k_weight),
-        rotary_cos_sin, position_ids);
+        rotary_cos_sin, position_ids, index_shard_rank, index_shard_world);
 }
 
 void launchMinimaxM3Nvfp4QKVIndexerNormRopeKVInsert(void const* packed_input, void* q_output, void* index_q_output,
@@ -1034,7 +1044,8 @@ void launchMinimaxM3Nvfp4QKVIndexerNormRopeKVInsert(void const* packed_input, vo
     int64_t index_page_stride, int64_t index_token_stride, int64_t num_pages, int page_size, int num_tokens,
     int num_heads_q, int num_heads_kv, int num_heads_index, int head_dim, int rotary_dim, float eps,
     void const* q_weight, void const* k_weight, void const* index_q_weight, void const* index_k_weight,
-    float const* rotary_cos_sin, int const* position_ids, cudaStream_t stream)
+    float const* rotary_cos_sin, int const* position_ids, int index_shard_rank, int index_shard_world,
+    cudaStream_t stream)
 {
     TLLM_CHECK_WITH_INFO(head_dim == kMinimaxM3HeadDim, "MiniMax-M3 NVFP4 horizontal producer requires head_dim=128");
     TLLM_CHECK_WITH_INFO(
@@ -1043,8 +1054,6 @@ void launchMinimaxM3Nvfp4QKVIndexerNormRopeKVInsert(void const* packed_input, vo
         page_size == kMinimaxM3PageSize, "MiniMax-M3 NVFP4 horizontal producer requires page_size=128");
     TLLM_CHECK_WITH_INFO(num_heads_q > 0 && num_heads_kv > 0 && num_heads_index > 0,
         "MiniMax-M3 NVFP4 horizontal producer requires Q, KV, and index heads");
-    TLLM_CHECK_WITH_INFO(
-        num_heads_index == num_heads_kv, "MiniMax-M3 NVFP4 horizontal producer requires index heads to equal KV heads");
 
     constexpr int kBlockSize = 256;
     constexpr int kWarpsPerBlock = kBlockSize / 32;
@@ -1069,7 +1078,8 @@ void launchMinimaxM3Nvfp4QKVIndexerNormRopeKVInsert(void const* packed_input, vo
         scale_plane_stride, scale_head_stride, index_page_stride, index_token_stride, num_pages, num_tokens,
         num_heads_q, num_heads_kv, num_heads_index, eps, static_cast<__nv_bfloat16 const*>(q_weight),
         static_cast<__nv_bfloat16 const*>(k_weight), static_cast<__nv_bfloat16 const*>(index_q_weight),
-        static_cast<__nv_bfloat16 const*>(index_k_weight), rotary_cos_sin, position_ids));
+        static_cast<__nv_bfloat16 const*>(index_k_weight), rotary_cos_sin, position_ids, index_shard_rank,
+        index_shard_world));
 }
 } // namespace kernels
 

@@ -45,6 +45,7 @@ from tensorrt_llm.bindings.internal.batch_manager import CacheType as CacheTypeC
 from tensorrt_llm.bindings.internal.batch_manager.kv_cache_manager_v2_utils import (
     copy_batch_block_offsets_to_device,
 )
+from tensorrt_llm.llmapi.llm_args import MiniMaxM3SparseAttentionConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     BAD_PAGE_INDEX,
@@ -334,6 +335,12 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
                 "MiniMax M3 indexer_kv_dtype must be 'bf16' or 'fp8', got "
                 f"{self.indexer_kv_dtype!r}."
             )
+        # index_k_tp_shard: TP rank r stores tokens r, r + TP, ... of every block.
+        shard = (
+            isinstance(sparse_attention_config, MiniMaxM3SparseAttentionConfig)
+            and sparse_attention_config.index_k_tp_shard
+        )
+        self.index_k_shard_world = kwargs["mapping"].tp_size if shard else 1
         # Filled at the end of __init__; the base __init__ may already call get_buffers.
         self._kv_buffers: dict[tuple[int, str], torch.Tensor] = {}
         self._block_scale_buffers: dict[tuple[int, str], torch.Tensor] = {}
@@ -353,6 +360,13 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
             )
 
         self._draft_kv_cache_view: Optional["MiniMaxM3DraftKVCacheView"] = None
+        # Only the fused FP8/NVFP4 producer writes a sharded index-K; disagg maps it as replicated.
+        if self.index_k_shard_world > 1 and (
+            self.is_disagg or self.dtype not in (DataType.FP8, DataType.NVFP4)
+        ):
+            raise ValueError(
+                "MiniMax-M3 index_k_tp_shard requires an FP8 or NVFP4 KV cache and no disaggregation."
+            )
         index_v_layer_ids = set(self.sparse_layer_ids) - self.disable_index_value_layer_ids
         if self.is_disagg and index_v_layer_ids:
             raise ValueError(
@@ -379,13 +393,17 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         for layer_idx in self.sparse_layer_ids:
             if layer_idx not in self.layer_offsets:
                 continue
-            self._index_k_buffers[layer_idx] = super().get_index_k_buffer(
+            index_k = super().get_index_k_buffer(
                 layer_idx,
                 num_heads=1,
-                head_dim=self.sparse_index_dim,
+                head_dim=self.sparse_index_dim // self.index_k_shard_world,
                 dtype=torch_dtype,
                 kv_layout=kv_layout,
             )
+            if self.index_k_shard_world > 1:
+                # A sharded page is the bytes of tokens_per_block / W full rows.
+                index_k = index_k.view(index_k.shape[0], 1, -1, self.sparse_index_dim)
+            self._index_k_buffers[layer_idx] = index_k
             if layer_idx not in self.disable_index_value_layer_ids:
                 self._index_v_buffers[layer_idx] = torch.zeros(
                     (num_total_slots, 1, self.sparse_index_dim),
@@ -624,7 +642,7 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         """Register a per-sparse-layer ``Role.INDEX_KEY`` :class:`BufferConfig`.
 
         ``size`` is bytes per **block**: ``1 * sparse_index_dim *
-        elem_bytes * tokens_per_block``. Keyed by **local** layer id —
+        elem_bytes * tokens_per_block // index_k_shard_world``. Keyed by **local** layer id —
         the base ``_build_base_config`` iterates local ids, so keying
         by global ids would silently skip registration on non-trivial
         PP ranks.
@@ -632,7 +650,7 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         torch_dtype = self._torch_dtype_for_index_cache()
         elem_bytes = torch.tensor([], dtype=torch_dtype).element_size()
         bytes_per_token = 1 * self.sparse_index_dim * elem_bytes
-        size_per_block = bytes_per_token * tokens_per_block
+        size_per_block = bytes_per_token * tokens_per_block // self.index_k_shard_world
         return {
             self.layer_offsets[layer_id]: [BufferConfig(role=Role.INDEX_KEY, size=size_per_block)]
             for layer_id in self.sparse_layer_ids

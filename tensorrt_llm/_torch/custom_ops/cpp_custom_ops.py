@@ -490,7 +490,7 @@ def _register_fake():
           head_dim: int, rotary_dim: int, eps: float, q_weight: torch.Tensor,
           k_weight: torch.Tensor, index_q_weight: torch.Tensor,
           index_k_weight: torch.Tensor, rotary_cos_sin: torch.Tensor,
-          position_ids: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+          position_ids: torch.Tensor, *_) -> Tuple[torch.Tensor, torch.Tensor]:
         """Infer main and index query shapes without mutating either cache."""
         del kv_cache, index_k_cache, out_cache_loc, num_heads_kv, rotary_dim
         del eps, q_weight, k_weight, index_q_weight, index_k_weight
@@ -506,7 +506,7 @@ def _register_fake():
     def _(packed, kv_data_cache, kv_scale_cache, index_k_cache, out_cache_loc,
           kv_quant_scale, num_heads_q, num_heads_kv, num_heads_index, head_dim,
           rotary_dim, eps, q_weight, k_weight, index_q_weight, index_k_weight,
-          rotary_cos_sin, position_ids):
+          rotary_cos_sin, position_ids, *_):
         del kv_data_cache, kv_scale_cache, index_k_cache, out_cache_loc
         del kv_quant_scale, num_heads_kv, rotary_dim, eps, q_weight, k_weight
         del index_q_weight, index_k_weight, rotary_cos_sin, position_ids
