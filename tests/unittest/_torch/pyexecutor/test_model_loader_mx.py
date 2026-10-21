@@ -1166,11 +1166,13 @@ def _l0_model_express_case_ids() -> dict[int, list[str]]:
     return case_ids
 
 
-def _documented_names(text: str, start: str, end: str) -> set[str]:
-    """Return the leading name of each item enumerated between `start` and `end`.
+def _documented_names(text: str, start: str, end: str, known_names: set[str]) -> set[str]:
+    """Return the family name that starts each item enumerated between `start` and `end`.
 
-    A missing anchor fails with its text, so whoever rewords
-    `docs/source/features/model-express.md` knows which anchor to update here.
+    Each item starts with one of `known_names`, and the longest match wins, so
+    `Qwen3 MoE` is not read as `Qwen3`. A missing anchor fails with its text, so
+    whoever rewords `docs/source/features/model-express.md` knows which anchor
+    to update here.
     """
     doc = "docs/source/features/model-express.md"
     stop = text.find(end)
@@ -1180,11 +1182,22 @@ def _documented_names(text: str, start: str, end: str) -> set[str]:
     if begin < 0:
         pytest.fail(f"{doc} has no anchor {start!r} before {end!r}; update this test's anchors")
     enumeration = text[begin + len(start) : stop]
-    return {re.match(r"[\w.]+", item).group() for item in re.split(r",? and |, ", enumeration)}
+    documented = set()
+    for item in re.split(r",? and |, ", enumeration):
+        matches = [name for name in known_names if re.match(re.escape(name) + r"\b", item)]
+        assert matches, f"{doc} names {item!r}, which no qualified profile covers"
+        documented.add(max(matches, key=len))
+    return documented
+
+
+# The documentation spells these families differently from their architecture names.
+_MX_FAMILY_DISPLAY_NAMES = {"Qwen3MoeForCausalLM": "Qwen3 MoE"}
 
 
 def _documented_family(profile: PostTransformProfile) -> str:
     """Return the family name by which the doc refers to a profile, such as `Qwen3.5`."""
+    if profile.architecture in _MX_FAMILY_DISPLAY_NAMES:
+        return _MX_FAMILY_DISPLAY_NAMES[profile.architecture]
     family = re.sub(r"For(?:CausalLM|ConditionalGeneration)$", "", profile.architecture)
     return family.replace("_", ".")
 
@@ -1310,16 +1323,22 @@ def test_documentation_prose_matches_qualified_profile_registry() -> None:
     documentation = _repository_text("docs/source/features/model-express.md")
     text = " ".join(documentation.split())
 
-    assert _documented_names(text, "The ", " profiles are text-only") == text_only_families
+    assert (
+        _documented_names(text, "The ", " profiles are text-only", families) == text_only_families
+    )
     assert (
         _documented_names(
             text,
             "pins its qualified RoPE realization: ",
             " require the default fused RoPE path",
+            families,
         )
         == fused_rope_families
     )
-    assert _documented_names(text, "currently limited to the exact ", " profiles above") == families
+    assert (
+        _documented_names(text, "currently limited to the exact ", " profiles above", families)
+        == families
+    )
 
     qualification_test = documentation[
         documentation.index("### Qualification Test") : documentation.index(
@@ -1327,7 +1346,8 @@ def test_documentation_prose_matches_qualified_profile_registry() -> None:
         )
     ]
     cases = _mx_e2e_cases()
-    assert set(re.findall(r"\b[a-z][a-z0-9_]*-bf16-tp\d+\b", qualification_test)) == set(cases)
+    case_id_pattern = r"\b[a-z][a-z0-9_]*(?:-[a-z0-9_]+)*?-(?:bf16|fp8-block)-tp\d+(?:-ep\d+)?\b"
+    assert set(re.findall(case_id_pattern, qualification_test)) == set(cases)
     assert set(re.findall(r"\bTRTLLM_MX_[A-Z0-9_]+_MODEL\b", qualification_test)) == {
         row["model_env"] for row in cases.values()
     }
