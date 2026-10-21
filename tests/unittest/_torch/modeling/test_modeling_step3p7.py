@@ -449,6 +449,55 @@ class TestStep3p7Helpers(unittest.TestCase):
                     python_output.assert_called_once()
                     experts.assert_not_called()
 
+    @parameterized.expand(
+        [
+            ("fused_backend_available", "CutlassFusedMoE", "FP8_BLOCK_SCALES", 43, False, "", True),
+            ("no_fused_backend", None, "FP8_BLOCK_SCALES", 43, True, "clamp", True),
+            ("bf16_checkpoint", "CutlassFusedMoE", None, 43, True, "clamp", False),
+            ("non_clamp_layer", "CutlassFusedMoE", "FP8_BLOCK_SCALES", 20, False, "", False),
+        ]
+    )
+    def test_clamp_layer_uses_python_experts_only_without_fused_post_silu_clamp(
+        self, _name, winner, quant_algo, layer_idx, expect_python, expect_reason, expect_resolve
+    ):
+        """Clamp layers run in a fused backend whenever one applies the clamp after SiLU."""
+        import tensorrt_llm._torch.models.modeling_step3p7 as step3p7_module
+
+        limits = [0.0] * 45
+        limits[43] = 7.0
+        text_config = types.SimpleNamespace(
+            hidden_size=4096,
+            moe_num_experts=288,
+            moe_intermediate_size=1280,
+            torch_dtype=torch.bfloat16,
+            swiglu_limits=limits,
+        )
+        model_config = types.SimpleNamespace(
+            quant_config=types.SimpleNamespace(quant_algo=quant_algo),
+        )
+        routing_method = object()
+
+        with patch.object(
+            step3p7_module,
+            "resolve_moe_impl",
+            return_value=types.SimpleNamespace(winner=winner),
+        ) as resolve:
+            limit, use_python, reason = step3p7_module._select_python_expert_path(
+                model_config, text_config, layer_idx, routing_method
+            )
+
+        self.assertEqual(use_python, expect_python)
+        self.assertEqual(reason, expect_reason)
+        self.assertEqual(limit, 7.0 if layer_idx == 43 else None)
+        if expect_resolve:
+            kwargs = resolve.call_args.kwargs
+            self.assertEqual(kwargs["activation"].clamp, 7.0)
+            self.assertTrue(kwargs["activation"].clamp_after_silu)
+            self.assertIs(kwargs["routing"], routing_method)
+            self.assertEqual(kwargs["layer_idx"], layer_idx)
+        else:
+            resolve.assert_not_called()
+
     def test_dummy_weights_initialize_nonpersistent_clamp_buffers(self):
         """Dummy loading initializes the Python clamp path's private buffers."""
         from tensorrt_llm._torch.models.modeling_step3p7 import Step3p7MoE

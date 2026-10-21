@@ -58,7 +58,7 @@ from ..modules.embedding import Embedding, LMHead
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import Linear, TensorParallelMode
 from ..modules.rms_norm import RMSNorm
-from ..moe.fused_moe import SwigluActivation, create_moe
+from ..moe.fused_moe import SwigluActivation, create_moe, resolve_moe_impl
 from ..moe.fused_moe.interface import MoEWeightLoadingMode
 from ..moe.fused_moe.routing import MiniMaxM2MoeRoutingMethod
 from ..peft.lora.layer import LoraLayer
@@ -318,22 +318,60 @@ def _parse_python_fallback_threshold() -> int:
         return _PYTHON_FALLBACK_DISABLED_LAYER
 
 
+def _fused_moe_applies_post_silu_clamp(
+    model_config: ModelConfig,
+    text_config: PretrainedConfig,
+    layer_idx: int,
+    swiglu_limit: float,
+    routing_method: Optional[MiniMaxM2MoeRoutingMethod],
+) -> bool:
+    """Whether a fused MoE backend can run this layer with a post-SiLU clamp.
+
+    Mirrors the problem ``create_moe`` resolves for the layer.
+    """
+    report = resolve_moe_impl(
+        model_config,
+        dtype=text_config.torch_dtype,
+        num_experts=int(text_config.moe_num_experts),
+        hidden_size=text_config.hidden_size,
+        intermediate_size=int(text_config.moe_intermediate_size),
+        swiglu_gptoss_style=False,
+        bias=False,
+        activation=SwigluActivation(clamp=swiglu_limit, clamp_after_silu=True),
+        routing=routing_method,
+        layer_idx=layer_idx,
+    )
+    return report.winner is not None
+
+
 def _select_python_expert_path(
     model_config: ModelConfig,
     text_config: PretrainedConfig,
     layer_idx: int,
+    routing_method: Optional[MiniMaxM2MoeRoutingMethod] = None,
 ) -> tuple[float | None, bool, str]:
     """Return ``(swiglu_limit, use_python_path, reason)`` for a routed MoE layer.
 
-    The Python expert loop is selected for clamp-active layers (no FP8 backend
-    on B200 supports ``swiglu_limit``), for BF16 checkpoints (the FP8 kernel
-    can't run against bf16 weights), and via an env-var diagnostic override.
+    The Python expert loop is selected for clamp-active layers that no fused
+    MoE backend can run with a post-SiLU clamp (e.g. FP8 block scales on
+    SM100, where only CUTLASS implements the clamp order and it does not run
+    that format), for BF16 checkpoints (the FP8 kernel can't run against bf16
+    weights), and via an env-var diagnostic override.
     """
     swiglu_limit = _layer_swiglu_limit(text_config, layer_idx, shared=False)
     qc = getattr(model_config, "quant_config", None)
     is_bf16_checkpoint = qc is None or getattr(qc, "quant_algo", None) is None
 
-    if swiglu_limit is not None and swiglu_limit > 0:
+    if (
+        swiglu_limit is not None
+        and swiglu_limit > 0
+        and (
+            is_bf16_checkpoint
+            or not _fused_moe_applies_post_silu_clamp(
+                model_config, text_config, layer_idx, swiglu_limit, routing_method
+            )
+        )
+    ):
         return swiglu_limit, True, "clamp"
     if layer_idx >= _parse_python_fallback_threshold():
         return swiglu_limit, True, "late_layer"
@@ -777,7 +815,7 @@ class Step3p7MoE(nn.Module):
             self._routed_swiglu_limit,
             self._use_python_clamp,
             self._python_path_reason,
-        ) = _select_python_expert_path(model_config, text_config, layer_idx)
+        ) = _select_python_expert_path(model_config, text_config, layer_idx, routing_method)
         self._moe_lora_enabled = has_moe_lora_targets(model_config.lora_config)
         # Routed-expert LoRA must execute in the fused backend. Otherwise the
         # selected Python path owns expert execution and its dequantized weights.
