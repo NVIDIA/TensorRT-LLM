@@ -75,7 +75,7 @@ def prepare_head(lm_head: torch.nn.Module) -> Optional[UgpuHead]:
     Before capture."""
     from tensorrt_llm._torch.modules import low_m_gemm
 
-    from ...kernels.m3_locality import LocalityMap
+    from ..m3_locality import LocalityMap
 
     w = getattr(lm_head, "weight", None)
     if (

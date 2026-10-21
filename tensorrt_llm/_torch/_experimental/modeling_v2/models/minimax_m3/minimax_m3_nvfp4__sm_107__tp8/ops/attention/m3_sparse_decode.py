@@ -10,7 +10,7 @@ import torch
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 
-from ...kernels.triton_sparse_decode import minimax_m3_sparse_attn_decode
+from ..triton_sparse_decode import minimax_m3_sparse_attn_decode
 from .m3_sparse_decode_lc8 import PAGE, sparse_attention_reference
 
 

@@ -17,7 +17,7 @@ assert torch.cuda.is_available(), "the uGPU head requires a CUDA device"
 
 
 def _locality():
-    from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2.kernels.m3_locality import (  # noqa: E501
+    from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2.ops.m3_locality import (  # noqa: E501
         LocalityMap,
     )
 

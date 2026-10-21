@@ -12,7 +12,7 @@ from .m3_select_long import _M3, MAX_BLOCKS, M3SelectLong
 
 
 class M3SelectLongDsl(OpWrapper):
-    """``m3_select_long``'s contract, cells and reference, run by ``kernels/m3_select_long_dsl``: the same selection
+    """``m3_select_long``'s contract, cells and reference, run by ``ops/m3_select_long_dsl``: the same selection
     bit for bit as the 1024-thread ``minimax_m3_sm107_tp4_select_long`` (also on rows where more than 2048 blocks tie
     at the 16th-largest score), from one 384-thread CTA per row. ``fast_tail`` (the 1024-thread kernel's warp-0 rank)
     does not apply and is ignored. Returns ``out``."""
@@ -102,7 +102,7 @@ class M3SelectLongDsl(OpWrapper):
 
     The kernel is compiled per (PDL launch, early trigger, trigger phase) with
     symbolic shapes and strides; the target compiles its keys before warmup
-    (`kernels/m3_select_long_dsl.prebuild`), and a call outside them compiles
+    (`ops/m3_select_long_dsl.prebuild`), and a call outside them compiles
     on first use.
     """
 
@@ -118,7 +118,7 @@ class M3SelectLongDsl(OpWrapper):
         trigger_phase: int = 0,
         fast_tail: bool = True,
     ) -> torch.Tensor:
-        from ...kernels.m3_select_long_dsl import select_long_dsl
+        from ..m3_select_long_dsl import select_long_dsl
 
         if scores.shape[1] > MAX_BLOCKS:
             raise RuntimeError(

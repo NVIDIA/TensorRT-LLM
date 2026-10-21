@@ -317,7 +317,7 @@ OWNER_RANK = 0  # capacity: fixed: a split index, not a size
 
 
 # The drafter-boundary push (``ar_push``, modeling's DRAFT_AR_PUSH): the exchange words of
-# kernels/m3_mc_allreduce, as m3_mx_gemv's ``ar`` push stores them.
+# ops/m3_mc_allreduce, as m3_mx_gemv's ``ar`` push stores them.
 @dsl_user_op
 def _ld_volatile_s32(addr, *, loc=None, ip=None):
     return Int32(
@@ -935,7 +935,7 @@ class SplitKDenseGemmKernel:
         ar_n: cutlass.Int32,
     ):
         """ar_push: the owner's tile rows into the boundary all-reduce's exchange, as its own push of the output
-        would store them (kernels/m3_mc_allreduce: word (t, column pair) at the call parity of the (t, column / (N / 8))
+        would store them (ops/m3_mc_allreduce: word (t, column pair) at the call parity of the (t, column / (N / 8))
         cluster CTA, -0.0 halves as +0.0), then the release of the dependents (the prepushed all-reduce)."""
         cute_ext.partition_and_copy(thr_t2r, rD, sD)
         cute.arch.barrier(barrier_id=1, number_of_threads=self.epilog_threads)

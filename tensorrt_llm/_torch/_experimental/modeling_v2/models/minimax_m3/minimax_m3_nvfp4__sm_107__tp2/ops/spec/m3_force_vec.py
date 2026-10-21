@@ -8,7 +8,7 @@ import torch
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 
-from ...kernels.m3_force_vec import force_vec_kernel, force_vec_req_kernel
+from ..m3_force_vec import force_vec_kernel, force_vec_req_kernel
 
 
 class M3ForceVec(OpWrapper):

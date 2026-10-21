@@ -4,7 +4,7 @@
 # PyTorch oracle ported from vLLM (Apache-2.0), _reference_decode_index_score:
 # https://github.com/vllm-project/vllm/blob/6f91edf96d3f3272945809c04702380053bff4de/tests/kernels/attention/test_minimax_m3.py#L188
 """The MSA index scorer of a sparse decode step: per (index head, query token, KV block) the causal max of Q . K over
-the block's 128 index-K positions, with the pre-wait schedule of ``kernels/m3_index_score_t2sc`` (T2SC: the sm_107
+the block's 128 index-K positions, with the pre-wait schedule of ``ops/m3_index_score_t2sc`` (T2SC: the sm_107
 TP2 / TP8 scorer as this target's copy, at its 1 index head per rank; ``modeling.INDEX_SCORE_T2SC``)."""
 
 from __future__ import annotations
@@ -27,7 +27,7 @@ HEAD_DIM = 128
 def compiled_scorer(key: tuple):
     """The compiled kernel of ``key`` (dtype, heads, query length, head dim, split_k, early), compiling it on a miss
     (the target compiles every key it can take before warmup: ``layers.prebuild_index_scorer_t2sc``)."""
-    from ...kernels.m3_index_score_t2sc import IndexScoreRunner
+    from ..m3_index_score_t2sc import IndexScoreRunner
 
     if key not in IndexScoreRunner.kernel_cache:
         IndexScoreRunner._compile(*key)

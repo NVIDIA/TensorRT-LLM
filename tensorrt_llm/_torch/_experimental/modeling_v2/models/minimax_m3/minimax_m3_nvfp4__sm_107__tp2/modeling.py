@@ -39,12 +39,12 @@ Every fast path the decode step can take, the rows each covers (``FAST_PATHS``, 
 range: log once, run the generic path) or **missed** (inside a covered range but a precondition is missing: raise
 ``FastPathUnavailable`` under ``modeling_v2='require'``, else log once and fall back). A row range is empty unless a
 landed cell has certified it at the TP2 geometry on Rubin. Every fast path a GEN rank takes prints a rank-tagged
-engagement line once per (path, rows) (``taken``). Kernel modules report through ``kernels/m3_report``, which this
+engagement line once per (path, rows) (``taken``). Kernel modules report through ``ops/m3_report``, which this
 module wires to the same policy at import.
 
 **Hand-offs between kernels.** A producer that already holds an activation in registers writes its MXFP8 form for the
 next MXFP8 projection: the decode boundary all-reduce for the next layer's QKV, the sparse-decode merge and the
-long-context decode for the o_proj. It publishes it in ``kernels/m3_prequant.SLOT`` keyed by the BF16 tensor; the next
+long-context decode for the o_proj. It publishes it in ``ops/m3_prequant.SLOT`` keyed by the BF16 tensor; the next
 MXFP8 projection on a decode graph takes it, and every take clears the slot. The decode boundaries' push targets (the
 o_proj / dense-down / shared-expert GEMVs and the MoE engine writing straight into the boundary all-reduce's exchange)
 are passed explicitly from the layer to the producer and back.
@@ -166,8 +166,8 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization.mode import QuantAlgo
 
 from . import weights as _weights
-from .kernels import m3_draft_step as m3_draft_step_kernel
-from .kernels import (
+from .ops import m3_draft_step as m3_draft_step_kernel
+from .ops import (
     m3_drafter_attn,
     m3_fold_tail,
     m3_mc_allreduce,
@@ -175,15 +175,12 @@ from .kernels import (
     m3_report,
     m3_spec_tail,
 )
-from .kernels import m3_fullctx_decode as m3_fullctx_decode_kernel
-from .kernels import m3_index_score as _index_score_kernel
-from .kernels import m3_sampled_accept as m3_sampled_accept_kernel
-from .kernels import m3_shard_accept as m3_shard_accept_kernel
-from .kernels import msa_kv_update as _msa_kv_update_kernel
-from .kernels import triton_sparse_decode as _sparse_decode_kernel
-from .kernels.long_select import long_select_blocks
-from .kernels.m3_moe_finalize import m3_moe_finalize
-from .kernels.mx_gemv import op as mx_gemv
+from .ops import m3_fullctx_decode as m3_fullctx_decode_kernel
+from .ops import m3_index_score as _index_score_kernel
+from .ops import m3_sampled_accept as m3_sampled_accept_kernel
+from .ops import m3_shard_accept as m3_shard_accept_kernel
+from .ops import msa_kv_update as _msa_kv_update_kernel
+from .ops import triton_sparse_decode as _sparse_decode_kernel
 from .ops.activation.m3_silu_and_mul import m3_silu_and_mul
 from .ops.attention.m3_draft_attention import m3_draft_attention
 from .ops.attention.m3_fp8_indexer_qk_norm_rope import m3_fp8_indexer_qk_norm_rope
@@ -226,8 +223,11 @@ from .ops.gemm.m3_mx_gemv_bf16 import m3_mx_gemv_bf16
 from .ops.gemm.m3_mxfp8_gemm import m3_mxfp8_gemm
 from .ops.gemm.m3_mxfp8_linear import m3_mxfp8_linear
 from .ops.gemm.m3_ugpu_head import m3_ugpu_head
+from .ops.long_select import long_select_blocks
+from .ops.m3_moe_finalize import m3_moe_finalize
 from .ops.moe.m3_moe_engine import M3MoeState, ar_push_desc, m3_moe_engine
 from .ops.moe.m3_router_tc import m3_router_tc
+from .ops.mx_gemv import op as mx_gemv
 from .ops.norm.m3_embedding_firstnorm import DecodeEmbedding, m3_embedding_firstnorm
 from .ops.spec.m3_capture_norm import m3_capture_norm
 from .ops.spec.m3_chunk_norm import m3_chunk_norm
@@ -280,7 +280,7 @@ class DecodePlan:
 
 
 # tiny: every step up to 8 tokens (c1..c8 without speculation, the c1 verify, every draft pass); small: the c2
-# verify; verify: the c4 / c8 verifies. Each is one multicast all-reduce bucket (kernels/m3_mc_allreduce.BUCKETS).
+# verify; verify: the c4 / c8 verifies. Each is one multicast all-reduce bucket (ops/m3_mc_allreduce.BUCKETS).
 # The multicast all-reduce + residual + RMSNorm at both boundaries of every TP2 decode step (one 8-token bucket), the
 # MoE boundary's also publishing the next QKV activation in MXFP8. SM107 TP2 hop: 3.5..4.4 us at 1..8 rows against
 # 8.7..9.5 us for the stock AUTO (NCCL) all-reduce + fused residual RMSNorm, and 13.3..14.0 us at the MoE boundary
@@ -356,7 +356,7 @@ DECODE_PLANS = (
 # TP2 skeleton: no cap (the built-in split) until a TP2 cap is measured and certified.
 DENSE_DECODE_MAX_SEQ_LEN_BY_BATCH: Mapping[int, int] = MappingProxyType({})
 
-# The dense layers' decode attention on PrimTS split-KV decode (kernels/m3_fullctx_decode) instead of the trtllm-gen
+# The dense layers' decode attention on PrimTS split-KV decode (ops/m3_fullctx_decode) instead of the trtllm-gen
 # call, per (query rows per request, requests): the Q tile (``config``) and the split-KV fanout (``splits``) with the
 # standalone reducer. Rubin TP2, FP8 KV, 165k context, graph-us per call (stock trtllm-gen in brackets): (4, 1) 18.8
 # (29.3), (1, 1) 15.7 (28.0), (4, 2) 24.5 (29.3), (1, 2) 20.2 (28.1). The stock split is capped at 16 cluster CTAs
@@ -398,7 +398,7 @@ FULLCTX_DECODE_OWN_REDUCER = True
 # The K/V length bound the full-context plans are compiled for; a step whose cache length bound is longer is a miss. It
 # covers the TP2 AgentX config's max_seq_len (1 << 20) plus the speculative rows the cache reserves past it.
 FULLCTX_DECODE_MAX_KV_LEN = 1 << 21  # capacity: fixed: the full-context plans' compiled K/V bound
-# The Eagle3 drafter layer's generation phase on the same full-context decode (kernels/m3_drafter_attn: the in-tree
+# The Eagle3 drafter layer's generation phase on the same full-context decode (ops/m3_drafter_attn: the in-tree
 # RoPE + FP8 K/V append, then the pinned PrimTS recipe) instead of thop.attention's in-tree runner, which caps its
 # split at 8 CTAs per (request, KV head) on SM 10.7: 45-46 us per draft pass at 165k.
 DRAFTER_FULLCTX_ENABLED = True
@@ -415,7 +415,7 @@ DRAFTER_ROPE_MODE = 1
 # thop.trtllm_gen_generation_preprocess builds its workspace token map only for several requests, yet a one-request
 # multi-token generation (the drafter's first pass at one request, any stock trtllm-gen fallback) places its rows by
 # that map: without a rebuild it applies the last multi-request call's map (rows on another request's length and pages,
-# token-0 drafts). kernels/m3_tokmap_guard writes the one-request map (0, t) into the op's map slice right before such
+# token-0 drafts). ops/m3_tokmap_guard writes the one-request map (0, t) into the op's map slice right before such
 # calls: what the build writes (padded rows included), so bitwise the op with a fresh map. False:.
 PREPROCESS_TOKMAP_PATH = "m3_preprocess_tokmap"
 
@@ -490,7 +490,7 @@ GENERIC_MC_AR_FOLDED_MAX_TOKENS = 48 if MC_AR_TP2 else 0  # capacity: fixed: the
 # decode layer's MC_FINALIZE does. 48 as the agg canon runs it (v1.8.3; the same gates as above).
 GENERIC_MC_FINALIZE_MAX_TOKENS = 48 if MC_AR_TP2 else 0  # capacity: fixed: the finalize rows
 # The MoE finalize (+ the shared expert add) of a finalized MoE forward with at least MOE_TRITON_FINALIZE_MIN_TOKENS
-# rows (prefill, mixed and wide decode past the folds) runs as kernels/m3_moe_finalize: the trtllm-gen runner returns
+# rows (prefill, mixed and wide decode past the folds) runs as ops/m3_moe_finalize: the trtllm-gen runner returns
 # its FC2 output unfinalized and one Triton kernel gathers the top-k rows together, bitwise to the runner's own
 # finalize and the separate shared add (153 -> 98 us per layer at 16K rows on SM107). False: the runner finalizes.
 MOE_TRITON_FINALIZE = True
@@ -513,7 +513,7 @@ MOE_PUSH_MAX_TOKENS = MOE_ENGINE_MAX_TOKENS if MC_AR_TP2 else 0
 # False: releases after the push.
 MOE_EARLY_AR_RELEASE = True
 # A greedy Eagle3 verify step of up to this many requests verifies with the fused shard argmax + acceptance kernel
-# over the target lm_head's BF16 shard logits (kernels/m3_shard_accept), at the configured draft length.
+# over the target lm_head's BF16 shard logits (ops/m3_shard_accept), at the configured draft length.
 SHARD_ACCEPT_DRAFT_LEN = 3  # capacity: fixed: the built Eagle3 draft length
 # B4 spec tail: the fused verify (shard / sampled accept), the fused first drafter inputs (chunk / capture norm) and the
 # fused draft loop (draft_step, its draft input, the drafter boundary all-reduce) also take the 9..32-row steps, up to
@@ -524,7 +524,7 @@ SHARD_ACCEPT_DRAFT_LEN = 3  # capacity: fixed: the built Eagle3 draft length
 B4_SPEC_TAIL = True
 SPEC_TAIL_MAX_TOKENS = DECODE_MAX_TOKENS if B4_SPEC_TAIL else TINY_MAX_TOKENS
 SPEC_TAIL_MAX_REQUESTS = SPEC_TAIL_MAX_TOKENS // (SHARD_ACCEPT_DRAFT_LEN + 1)
-# W2 (SpecTail, agg wide decode): the greedy fused verify (kernels/m3_shard_accept) also takes the
+# W2 (SpecTail, agg wide decode): the greedy fused verify (ops/m3_shard_accept) also takes the
 # 33..WIDE_MAX_TOKENS-row decode-only steps, as whole-request chunks of the kernel's certified 48-row geometry (12
 # requests per launch at draft length 3; m3_shard_accept.WIDE_SPEC_TAIL), instead of the gathered target logits +
 # argmax; and the in-tree draft loop takes the drafter's top-1 from its local head shard (W2b). Sampled verifies keep
@@ -538,7 +538,7 @@ WIDE_VERIFY_MAX_REQUESTS = WIDE_VERIFY_MAX_TOKENS // (SHARD_ACCEPT_DRAFT_LEN + 1
 # with the coded head 117.0 us; the BF16-head + shard-accept arm is not measured yet.
 SHARD_ACCEPT_MAX_REQUESTS = WIDE_VERIFY_MAX_REQUESTS
 # A sampled (temperature + top-p, advanced_sampling_mode no_topk) Eagle3 verify step of up to this many requests
-# verifies with the fused sampled acceptance (kernels/m3_sampled_accept, the TP2-shard kernel) over the target
+# verifies with the fused sampled acceptance (ops/m3_sampled_accept, the TP2-shard kernel) over the target
 # lm_head's BF16 shard logits, at the configured draft length (the AgentX contract). 0: (the gathered logits
 # and the in-tree sampler run). Rubin TP2 b1/b2 (p5 microbench): 180.1 / 181.8 -> 115.1 / 113.9 us per verify.
 SAMPLED_VERIFY_MAX_REQUESTS = SPEC_TAIL_MAX_REQUESTS
@@ -558,7 +558,7 @@ CAPTURE_NORM_MAX_ROWS = SPEC_TAIL_MAX_TOKENS
 # to this many verify rows; wider first passes take the in-tree first drafter inputs. 0:.
 CHUNK_NORM_MAX_ROWS = SPEC_TAIL_MAX_TOKENS
 # The fused draft loop's two all-reduce boundaries per pass (o_proj -> post-attention norm, down -> final norm) of up
-# to this many rows run the multicast all-reduce + residual + RMSNorm (kernels/m3_mc_allreduce, opts bit 16: the
+# to this many rows run the multicast all-reduce + residual + RMSNorm (ops/m3_mc_allreduce, opts bit 16: the
 # drafter's stock rounding, normalizing the unrounded FP32 sum as FlashInfer fused_add_rmsnorm does) instead of the
 # built-in all-reduce + RMSNorm. 0:. Rubin TP2 (p16 microbench): 10.0..11.0 -> 4.6..5.3 us per boundary.
 # (The drafter epilogue, opts bit 16, is built for the 8-token bucket only: a B4 spec-tail first pass of 16 / 32 rows
@@ -573,7 +573,7 @@ DRAFT_AR_PUSH = True
 # The drafter boundary all-reduce fed by its projection's push (DRAFT_AR_PUSH): its own taken / not-taken lines.
 DRAFT_AR_PUSH_PATH = "m3_draft_ar_push"
 # The same push from the drafter's direct ('d') low-M linears (the 1-row passes' o_proj and down at TP2), through this
-# target's copy of FlashInfer's direct kernel (kernels/m3_lowm_direct; its output FlashInfer's): the owning thread
+# target's copy of FlashInfer's direct kernel (ops/m3_lowm_direct; its output FlashInfer's): the owning thread
 # stores the CTA's column pairs into the exchange before the kernel's last-instruction release. Bitwise. Rubin TP2
 # world 2 (dpush-1 782685), per 1-row boundary: o_proj 9.22 -> 8.09 us, down 13.81 -> 12.72. False:.
 DRAFT_AR_PUSH_DIRECT = True
@@ -593,9 +593,9 @@ FC_EARLY_MAX_ROWS = 0  # capacity: fixed: measured fork crossover
 # late. 0:. Rubin TP2 c1 (locked nsys 768559): the head started 17.4 us after its input was ready.
 FC_AFTER_HEAD_MAX_ROWS = SPEC_TAIL_MAX_TOKENS
 # A decode-only Eagle3 step of up to this many requests drafts with the fused draft loop (spec_worker): per pass the
-# draft input in one launch (kernels/m3_spec_tail.draft_input), the drafter layer's in-tree attention, MLP and
+# draft input in one launch (ops/m3_spec_tail.draft_input), the drafter layer's in-tree attention, MLP and
 # all-reduces, and one kernel for the draft head (its 12-bit coded copy, or the BF16 fragments when the coding does
-# not decode bit for bit), the cross-rank argmax and the pass's bookkeeping (kernels/m3_draft_step), at the
+# not decode bit for bit), the cross-rank argmax and the pass's bookkeeping (ops/m3_draft_step), at the
 # configured draft length. The head kernel takes one row per request, at most 8.
 # The fused draft loop streams the 12-bit coded copy of the draft head (when it decodes bit for bit); False keeps the
 # BF16 fragments.
@@ -608,7 +608,7 @@ DRAFT_STEP_MAX_REQUESTS = min(SPEC_TAIL_MAX_REQUESTS, 8)  # capacity: fixed: the
 # keep the in-tree cuBLAS GEMM. 0:. Rubin TP2 (mclk locked, 4 rotating sets) at 1 row: qkv 13.18 -> 9.71,
 # o 7.17 -> 5.33, gate_up 22.27 -> 17.70, down 12.52 -> 9.76, fc 21.50 -> 17.77 us.
 DRAFT_LOWM_MAX_ROWS = 4  # capacity: fixed: the certified low-M rows
-# The split-K ('s') tactics run this target's copy of FlashInfer's kernel (kernels/m3_lowm_splitk): bit for bit the
+# The split-K ('s') tactics run this target's copy of FlashInfer's kernel (ops/m3_lowm_splitk): bit for bit the
 # same output at every certified cell (spec/test_modeling_v2_m3_lowm_splitk.py); the seam for the drafter-boundary push
 # epilogue and the down projection's SwiGLU prologue. False: (FlashInfer's kernel).
 DRAFT_LOWM_OWN_SPLITK = True
@@ -617,7 +617,7 @@ DRAFT_LOWM_ROWS: Dict[Tuple[int, int], FrozenSet[int]] = {
     for nk, rows in DRAFT_LOWM_TACTIC_ROWS.items()
 }
 # The identity-selection sparse decode moves from the per-row producer to the multi-query producer at this many rows
-# (kernels/triton_sparse_decode.MQ_MIN_TOKENS); the multi-query producer needs one KV head, so at the TP2 heads every
+# (ops/triton_sparse_decode.MQ_MIN_TOKENS); the multi-query producer needs one KV head, so at the TP2 heads every
 # identity step takes the per-row producer.
 SPARSE_DECODE_MQ_MIN_TOKENS = 17  # capacity: fixed: the multi-query crossover
 SPARSE_DECODE_KV_HEADS = 2  # capacity: fixed: the tp2 KV heads per rank
@@ -640,7 +640,7 @@ SELECT_EARLY_MAX_ROWS = 0  # capacity: fixed: measured early-release crossover
 # 16-CTA cluster launch and prologue then overlap the rank: Rubin TP2 in-model, locked memory clock, AgentX draws,
 # 2 instances vs the r4.3 stored A: replay period -162 us fixed, -94 at a 323K-token request.
 SELECT_LONG_TRIGGER_PHASE = 1
-# The long-row select runs as kernels/m3_select_long_dsl (ops/attention/m3_select_long_dsl): one 384-thread CTA per
+# The long-row select runs as ops/m3_select_long_dsl (ops/attention/m3_select_long_dsl): one 384-thread CTA per
 # (query row, KV head) instead of one 1024-thread CTA, the same selection bit for bit (ties included), with 4, 11 or
 # 24 keys per thread (LONG_SELECT_DSL_KEY_WIDTHS) and the same trigger choices. Rubin TP2 decode chain (2 KV heads,
 # 4 rows, 57 layers behind the producer stream and the scorer, both orders x 3 rounds): -0.127 / -0.148 / -0.037 us
@@ -683,10 +683,10 @@ INDEX_SCORE_EARLY_MAX_REQUESTS = 48  # capacity: fixed: measured early-issue cro
 # sequence).
 FORCE_AL_PER_REQUEST = True
 
-# The decode MXFP8 GEMVs (kernels/mx_gemv, SM107 TP2 table), per projection (N, K): the rows each serves, on an
+# The decode MXFP8 GEMVs (ops/mx_gemv, SM107 TP2 table), per projection (N, K): the rows each serves, on an
 # activation its producer quantized (the MoE boundary for the QKV, the attention merge for the o_proj) and on a bf16
 # one (quantized in the GEMV's prologue, bit-identical to mxfp8_quantize). SM107 graph us per projection at 1..8 rows:
-# 2.2..8.6 against 4.7..10.5 for the stock MXFP8 quantize + FlashInfer CuTe DSL GEMM (kernels/mx_gemv/op.py).
+# 2.2..8.6 against 4.7..10.5 for the stock MXFP8 quantize + FlashInfer CuTe DSL GEMM (ops/mx_gemv/op.py).
 # False puts every projection back on the stock decode-graph GEMM.
 # On by default since r4.2: the intermittent illegal memory access first seen with the GEMM/AR stack on was the
 # built-in Triton sparse decode's (fixed in r4); with the stack on, GSM8K 4-in-flight ran crash-free on r4.1.
@@ -1284,7 +1284,7 @@ def reset_logged() -> None:
         _logged.clear()
 
 
-# Kernel modules report from inside their calls through kernels/m3_report: the same policy.
+# Kernel modules report from inside their calls through ops/m3_report: the same policy.
 m3_report.install(
     on_taken=taken, on_missed=missed, on_uncovered=uncovered, on_capture_missed=capture_missed
 )
@@ -1383,8 +1383,8 @@ def _text_model_config(model_config: ModelConfig) -> ModelConfig:
 
 
 def _validate_runtime(model_config: ModelConfig) -> None:
-    """The runtime this target is written for (it is not in the checkpoint): routing declines every other one
-    (``routing._runtime_mismatch``), so this is the backstop for a construction that did not go through routing.
+    """The runtime this target is written for. It is set by engine arguments rather than the checkpoint, so routing
+    sees only its KV cache algorithm; this check at construction refuses every other runtime.
 
     The MiniMax-M3 MSA backend (it owns the step metadata and the index-K cache), the fused five-way QKV/index
     projection or the separate QKV and index projections, an FP8 indexer and an FP8 or NVFP4 main KV cache.
@@ -1817,7 +1817,7 @@ def _decode_routed_unfinalized(core, i: int, h: torch.Tensor):
 
 
 def _triton_finalize(rows: int, routed, shared: Optional[torch.Tensor]) -> torch.Tensor:
-    """The finalized routed output (+ ``shared``) from the runner's unfinalized parts via kernels/m3_moe_finalize
+    """The finalized routed output (+ ``shared``) from the runner's unfinalized parts via ops/m3_moe_finalize
     (``MOE_TRITON_FINALIZE``). Raises if the parts are not the trtllm-gen layout (the runner did not finalize them:
     no fallback)."""
     out = None
@@ -2919,9 +2919,9 @@ class MiniMaxM3Tp2ModelingV2(DecoderModel):
         )
         if not self.mxfp8.quant_method.use_cutlass:
             raise ValueError("the MiniMax-M3 decode dispatch needs the CUTLASS MXFP8 GEMM")
-        from .kernels import m3_fullctx_decode as _fullctx_decode_kernel
-        from .kernels import m3_select_long_dsl as _select_long_dsl_kernel
-        from .kernels import m3_tokmap_guard
+        from .ops import m3_fullctx_decode as _fullctx_decode_kernel
+        from .ops import m3_select_long_dsl as _select_long_dsl_kernel
+        from .ops import m3_tokmap_guard
 
         device = self.w["embed"].device
         # The one-request token-map guard of the stock generation preprocess (``PREPROCESS_TOKMAP_FIX``): every path
@@ -4408,7 +4408,7 @@ class DecodeTarget:
 
     def _fullctx_plan(self, i: int, device: torch.device, step):
         """(the PrimTS split-KV decode plan, the step's query tokens) where dense layer ``i``'s decode attention runs
-        on ``kernels/m3_fullctx_decode`` (``FULLCTX_DECODE``): a covered (query rows per request, requests) shape over
+        on ``ops/m3_fullctx_decode`` (``FULLCTX_DECODE``): a covered (query rows per request, requests) shape over
         the layer's FP8 pool. None otherwise (the MSA backend runs).
 
         Rubin TP2, FP8 KV, 165k context, graph-us per call (stock trtllm-gen in brackets): (4, 1) 18.8 (29.3), (1, 1)
@@ -4433,7 +4433,7 @@ class DecodeTarget:
         if pool.dtype != torch.float8_e4m3fn:
             missed(path, num_tokens, "the dense layer's KV pool is not FP8")
             return None
-        from .kernels import m3_fullctx_decode as _fullctx_decode_kernel
+        from .ops import m3_fullctx_decode as _fullctx_decode_kernel
 
         own_reducer = FULLCTX_DECODE_OWN_REDUCER
         if own_reducer and not _fullctx_decode_kernel.has_own_reducer():
@@ -4455,7 +4455,7 @@ class DecodeTarget:
             write_msa_phase_kv,
         )
 
-        from .kernels import m3_fullctx_decode as _fullctx_decode_kernel
+        from .ops import m3_fullctx_decode as _fullctx_decode_kernel
 
         core = self.core
         plan, num_tokens = plan_tokens
@@ -4624,7 +4624,7 @@ class DecodeTarget:
             if group > 1
             else max_score
         )
-        from .kernels import m3_select_long_dsl as _select_long_dsl_kernel
+        from .ops import m3_select_long_dsl as _select_long_dsl_kernel
 
         num_blocks = int(max_score_kv.shape[1])
         table = None
@@ -4681,7 +4681,7 @@ class DecodeTarget:
         selected blocks recur one step later; same layer, not the next one as at TP4: the MoE between two sparse layers
         streams ~250 MB through the 126 MB L2, so an earlier issue would be evicted; hints only).
         """
-        from .kernels import m3_attn_lc as _attn_lc_kernel
+        from .ops import m3_attn_lc as _attn_lc_kernel
 
         core = self.core
         backend = core.attn[i]
@@ -4993,10 +4993,10 @@ class M3Eagle3Draft(nn.Module):
     (``ops/gemm/m3_draft_lowm``, the TP8 port) at the rows ``DRAFT_LOWM`` covers, compiled before the warmup
     (``prebuild_linears``); every other call is the in-tree cuBLAS GEMM. Rubin TP2 (mclk locked, 4 rotating sets) at
     1 row: qkv 13.18 -> 9.71, o 7.17 -> 5.33, gate_up 22.27 -> 17.70, down 12.52 -> 9.76, fc 21.50 -> 17.77 us. The
-    split-K ('s') tactics run this target's copy of FlashInfer's kernel (``kernels/m3_lowm_splitk``, bit for bit the
+    split-K ('s') tactics run this target's copy of FlashInfer's kernel (``ops/m3_lowm_splitk``, bit for bit the
     same output); with ``DRAFT_AR_PUSH`` the o_proj and down projection of the fused draft loop also push their rows
     into the drafter boundary all-reduce's exchange (``arm_push`` / ``take_pushed``), as do the direct ('d') 1-row
-    linears through this target's copy of the direct kernel (``kernels/m3_lowm_direct``; o_proj 9.22 -> 8.09 us,
+    linears through this target's copy of the direct kernel (``ops/m3_lowm_direct``; o_proj 9.22 -> 8.09 us,
     down 13.81 -> 12.72 us per 1-row boundary).
     """
 
@@ -5169,8 +5169,8 @@ class M3Eagle3Draft(nn.Module):
     def prebuild_linears(self) -> int:
         """Compile (and run once) every covered row count of every drafter projection, outside capture, on the
         current stream, before the executor's warmup. Returns the number of calls compiled."""
-        from .kernels.m3_lowm_direct import compile_direct_push
-        from .kernels.m3_lowm_splitk import compile_push
+        from .ops.m3_lowm_direct import compile_direct_push
+        from .ops.m3_lowm_splitk import compile_push
 
         use_pdl = get_env_enable_pdl()
         built = 0
@@ -5190,7 +5190,7 @@ class M3Eagle3Draft(nn.Module):
                     # (its pushes need the all-reduce's exchange and a matching call).
                     compile_push(x, weight.t(), out, use_pdl, tactic)
                 if DRAFT_AR_PUSH and DRAFT_AR_PUSH_DIRECT and kind == "d" and tactic[1] % 2 == 0:
-                    # The direct kernel's push variant (kernels/m3_lowm_direct), compiled only.
+                    # The direct kernel's push variant (ops/m3_lowm_direct), compiled only.
                     compile_direct_push(x, weight.t(), out, use_pdl, tactic)
                 self._lowm_built.add((n, k, m, use_pdl))
                 built += 1
@@ -5247,7 +5247,7 @@ class M3Eagle3Draft(nn.Module):
     def attention(self, x: torch.Tensor, md, reduce: bool) -> torch.Tensor:
         """QKV, the backend's fused RoPE + KV append + causal attention, o_proj (all-reduced unless ``reduce`` is
         False, where the caller fuses the reduction). The backend's generation phase runs this target's full-context
-        decode with the fused RoPE + FP8 K/V append when the shell installed it (``kernels/m3_drafter_attn``)."""
+        decode with the fused RoPE + FP8 K/V append when the shell installed it (``ops/m3_drafter_attn``)."""
         qkv = self.linear(x, "qkv")
         _record("m3_draft_attention", int(md.num_tokens))
         if is_in_breakable_cuda_graph():
@@ -6383,7 +6383,7 @@ class M3Eagle3Worker(Eagle3OneModelWorker):
         self, logits: torch.Tensor, spec_metadata=None, mapping_lm_head_tp=None
     ) -> torch.Tensor:
         """W2b (``WIDE_SPEC_TAIL``): the in-tree draft loop's greedy top-1 over this rank's vocab shard of the drafter
-        logits, from the fused shard argmax + cross-rank key exchange (kernels/m3_shard_accept at draft length 0, at
+        logits, from the fused shard argmax + cross-rank key exchange (ops/m3_shard_accept at draft length 0, at
         most 48 rows per launch) instead of the per-rank max, the all-gather of (index, value) pairs and the pick. The
         same tokens (keys order BF16 values exactly; ties take the lowest global index, as the pick over ranks and the
         first-index max within a shard). Plain TP only (no LM-head TP in ADP); else, or when the logits are not a

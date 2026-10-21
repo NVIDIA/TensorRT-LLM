@@ -131,7 +131,7 @@ def _walk_outputs(args, one_round_k, ilp, calls=3, offset_step=1000):
 @pytest.mark.parametrize("one_round_k", [0, 82])
 @pytest.mark.parametrize("cell", op.CELLS, ids=[c.why[:44] for c in op.CELLS])
 def test_the_ilp_walk_changes_nothing(cell, one_round_k) -> None:
-    """kernels/m3_sampled_accept.ILP_WALK (SA-PW) only computes the owner's token weights 8 at a time; the walk adds
+    """ops/m3_sampled_accept.ILP_WALK (SA-PW) only computes the owner's token weights 8 at a time; the walk adds
     them in the same order with the same early exit, so the draws and acceptance outputs are the one-token walk's,
     bit for bit, call after call, with SA-1R off and on."""
     one = _walk_outputs(_case(cell.spec, seed_of(cell.why)), one_round_k, False)

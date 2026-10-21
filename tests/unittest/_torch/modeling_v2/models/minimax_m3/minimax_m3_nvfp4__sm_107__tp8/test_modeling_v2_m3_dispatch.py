@@ -16,10 +16,10 @@ import pytest
 from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp8 import (  # noqa: E501
     modeling as dispatch,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp8.kernels import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp8.ops import (  # noqa: E501
     m3_draft_step as draft_step_kernel,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp8.kernels import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp8.ops import (  # noqa: E501
     triton_sparse_decode as tsd,
 )
 
@@ -226,7 +226,7 @@ def test_the_sparse_decode_writes_the_mxfp8_handoff() -> None:
 def test_sparse_decode_lc8_covers_the_decode_steps_with_the_handoff() -> None:
     """Every decode step (at most DECODE_MAX_TOKENS rows) writes the MXFP8 o_proj hand-off; the one-launch decode
     stages its pre-wait reads up to m3_attn_lc8.PREWAIT_MAX_ROWS rows and merges once."""
-    from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp8.kernels import (  # noqa: E501
+    from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp8.ops import (  # noqa: E501
         m3_attn_lc8,
     )
 

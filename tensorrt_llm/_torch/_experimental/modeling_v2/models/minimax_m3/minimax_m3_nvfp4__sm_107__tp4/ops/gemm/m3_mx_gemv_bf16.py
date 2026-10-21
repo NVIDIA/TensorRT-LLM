@@ -10,8 +10,8 @@ import torch
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 
-from ...kernels.mx_gemv import op as _gemv
 from ..moe.m3_moe_engine import mxfp8_quant_dequant
+from ..mx_gemv import op as _gemv
 from .m3_mx_gemv import (
     DENSE_DOWN,
     DENSE_GATE_UP,

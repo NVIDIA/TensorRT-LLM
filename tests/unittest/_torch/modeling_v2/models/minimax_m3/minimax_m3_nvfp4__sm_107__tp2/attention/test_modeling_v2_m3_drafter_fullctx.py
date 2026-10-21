@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test (SM 10.7) for kernels/m3_drafter_attn: the Eagle3 drafter layer's generation pass on the full-context
+"""GPU test (SM 10.7) for ops/m3_drafter_attn: the Eagle3 drafter layer's generation pass on the full-context
 PrimTS decode, driven through ``M3DrafterFullCtxFmha.run_generation`` (in-tree preprocess with the step's FP8 K/V
 append, the K / V sub-page views of the drafter cache, the pinned plan) at every recipe the target pins: the 4-row
 first draft pass and the 1-row later passes of 1-2 requests.
@@ -20,10 +20,10 @@ import torch
 from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2 import (  # noqa: E501
     modeling,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2.kernels import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2.ops import (  # noqa: E501
     m3_drafter_attn as drafter,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2.kernels import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2.ops import (  # noqa: E501
     m3_fullctx_decode as fullctx,
 )
 

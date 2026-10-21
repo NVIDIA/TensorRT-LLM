@@ -319,7 +319,7 @@ _LC_VS_KILLED_RMS_ULP = 0.25
 
 
 def _target_decode(c, killed):
-    from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2.kernels import (  # noqa: E501
+    from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2.ops import (  # noqa: E501
         m3_prequant,
         triton_sparse_decode,
     )

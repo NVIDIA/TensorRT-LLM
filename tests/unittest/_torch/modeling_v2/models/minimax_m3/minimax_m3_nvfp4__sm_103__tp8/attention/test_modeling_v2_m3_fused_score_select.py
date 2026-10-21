@@ -18,7 +18,7 @@ import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtl
 from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_103__tp8 import (  # noqa: E501
     modeling as dispatch,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_103__tp8.kernels import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_103__tp8.ops import (  # noqa: E501
     m3_fused_score_select as fss,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_103__tp8.ops.attention.m3_fused_score_select import (  # noqa: E501
@@ -157,7 +157,7 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — pytest res
 
 @pytest.mark.parametrize("cell", op.CELLS[:2], ids=[c.why[:44] for c in op.CELLS[:2]])
 def test_the_target_wrapper_is_the_entry(cell) -> None:
-    """``kernels/m3_fused_score_select``: the geometry check admits the cell, the scratch and counters are created
+    """``ops/m3_fused_score_select``: the geometry check admits the cell, the scratch and counters are created
     once per (device, engine block count), and the wrapper's table is the entry's."""
     spec = cell.spec
     inputs = _inputs(spec, 3)

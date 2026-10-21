@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Who finalizes the wide target's MoE at each generic row count: past the decode rows, up to
 GENERIC_MC_FINALIZE_MAX_TOKENS, the finalize (+ the shared expert) folds into the boundary's multicast all-reduce
-(M3DecoderLayer._mc_finalize_boundary); from MOE_TRITON_FINALIZE_MIN_TOKENS, kernels/m3_moe_finalize finalizes it.
+(M3DecoderLayer._mc_finalize_boundary); from MOE_TRITON_FINALIZE_MIN_TOKENS, ops/m3_moe_finalize finalizes it.
 The two ranges meet with no gap and no overlap, and the fold declines from shapes alone past its cap.
 
 CPU only: nothing here launches a kernel.
@@ -16,7 +16,7 @@ import torch
 from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2 import (  # noqa: E501
     modeling as dispatch,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2.kernels import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2.ops import (  # noqa: E501
     m3_mc_allreduce,
 )
 

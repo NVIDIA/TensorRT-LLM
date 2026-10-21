@@ -4,7 +4,7 @@
 kernels (direct SIMT and split-K tensor-core), at the TP4 drafter shards, at the rows its table certifies.
 
 Every cell is held to the fp64 reference within the derived band. The drafter's projections (``M3Eagle3Draft._linear``
-over ``kernels/m3_draft_lowm``) are held on the drafter's weight table: a covered row count is the entry's call bit for
+over ``ops/m3_draft_lowm``) are held on the drafter's weight table: a covered row count is the entry's call bit for
 bit, an uncovered one the plain GEMM's.
 """
 
@@ -17,7 +17,7 @@ import torch.nn.functional as F
 from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp4 import (  # noqa: E501
     modeling as dispatch,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp4.kernels import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp4.ops import (  # noqa: E501
     m3_draft_lowm,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp4.ops.gemm.m3_draft_lowm import (  # noqa: E501

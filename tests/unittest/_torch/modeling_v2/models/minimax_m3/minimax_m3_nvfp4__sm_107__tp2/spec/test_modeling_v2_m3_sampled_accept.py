@@ -115,7 +115,7 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — pytest res
 
 @pytest.mark.parametrize("cell", SINGLE, ids=[c.why[:44] for c in SINGLE])
 def test_prewait_parameter_loads_change_nothing(cell) -> None:
-    """kernels/m3_sampled_accept.PREWAIT_PARAMS moves only where the sampling parameters load (before or after the PDL
+    """ops/m3_sampled_accept.PREWAIT_PARAMS moves only where the sampling parameters load (before or after the PDL
     wait): the same draws and acceptance outputs, bit for bit, call after call."""
     outs = []
     for prewait in (True, False):
@@ -134,7 +134,7 @@ def test_prewait_parameter_loads_change_nothing(cell) -> None:
 
 @pytest.mark.parametrize("cell", SINGLE, ids=[c.why[:44] for c in SINGLE])
 def test_the_early_trigger_changes_nothing(cell) -> None:
-    """kernels/m3_sampled_accept.EARLY_TRIGGER moves only where the grid releases its dependents: the same draws and
+    """ops/m3_sampled_accept.EARLY_TRIGGER moves only where the grid releases its dependents: the same draws and
     acceptance outputs, bit for bit, call after call, PDL launch on."""
     outs = []
     for early in (True, False):
@@ -167,7 +167,7 @@ def _walk_outputs(args, ilp, calls=3, offset_step=1000):
 
 @pytest.mark.parametrize("cell", SINGLE, ids=[c.why[:44] for c in SINGLE])
 def test_the_ilp_walk_changes_nothing(cell) -> None:
-    """kernels/m3_sampled_accept.ILP_WALK (SA-PW) only computes the owner's token weights 8 at a time; the walk adds
+    """ops/m3_sampled_accept.ILP_WALK (SA-PW) only computes the owner's token weights 8 at a time; the walk adds
     them in the same order with the same early exit, so the draws and acceptance outputs are the one-token walk's,
     bit for bit, call after call."""
     one = _walk_outputs(_case(cell.spec, seed_of(cell.why)), False)

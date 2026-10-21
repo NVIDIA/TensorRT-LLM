@@ -16,10 +16,10 @@ import torch
 from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2 import (  # noqa: E501
     modeling,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2.kernels import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2.ops import (  # noqa: E501
     m3_drafter_attn as drafter,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2.kernels import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2.ops import (  # noqa: E501
     m3_fullctx_decode as fullctx,
 )
 from tensorrt_llm._torch.attention.backends.fmha.utils import (
@@ -376,10 +376,10 @@ def test_crafted_inputs_pin_the_rope_mode() -> None:
 
 def test_one_request_multi_token_matches_the_guarded_preprocess() -> None:
     """The drafter's first pass at one request (several tokens): the in-tree preprocess places those rows by a
-    workspace token map it does not build for one request, which the TP2 token-map guard (kernels/m3_tokmap_guard)
+    workspace token map it does not build for one request, which the TP2 token-map guard (ops/m3_tokmap_guard)
     writes right before the call. After POISONING the map with a two-request call, the fused op must be bitwise the
     guarded preprocess + cast; this is what drafter.ROPE_ONE_REQUEST_MULTI rests on."""
-    from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2.kernels import (  # noqa: E501
+    from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2.ops import (  # noqa: E501
         m3_tokmap_guard as guard,
     )
 

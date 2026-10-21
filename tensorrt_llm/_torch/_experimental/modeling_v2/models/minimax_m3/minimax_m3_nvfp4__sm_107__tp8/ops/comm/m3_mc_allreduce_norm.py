@@ -97,7 +97,7 @@ class M3McAllreduceNorm(OpWrapper):
     ARCHS = frozenset({Arch.SM_107})
 
     # The tp2 decode boundaries (hidden 6144, 2 ranks, eps 1e-6): every decode step fits the 8-token bucket, epilogue
-    # option 7 at 1, 2, 7, 8 tokens and 15 at 3..6 (kernels/m3_mc_allreduce.AR_OPTS_BY_M; every option is
+    # option 7 at 1, 2, 7, 8 tokens and 15 at 3..6 (ops/m3_mc_allreduce.AR_OPTS_BY_M; every option is
     # bit-identical).
     CELLS: tuple[Cell, ...] = (
         Cell(

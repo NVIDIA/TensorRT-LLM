@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp4.kernels import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp4.ops import (  # noqa: E501
     m3_report,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp4.ops.attention.m3_sparse_decode import (  # noqa: E501
@@ -223,7 +223,7 @@ def test_identity_route_is_bitwise_the_stock_decode(requests, monkeypatch) -> No
 
 def _triton_route(monkeypatch) -> None:
     """Route selected steps to the target's Triton producer + merge (this target takes the LC whenever it applies)."""
-    from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp4.kernels import (
+    from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp4.ops import (
         m3_attn_lc,
     )
 
@@ -379,7 +379,7 @@ def test_lc_identity_route_reads_its_own_lengths_not_the_table(
 def test_lc_identity_step_reads_q_after_the_wait(requests, monkeypatch) -> None:
     """An identity step has no select, so the LC must read q after its grid wait: the op gets identity_step (and the
     device identity selection) on every identity step."""
-    from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp4.kernels import (  # noqa: E501
+    from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp4.ops import (  # noqa: E501
         m3_attn_lc,
         m3_prequant,
     )
@@ -410,7 +410,7 @@ def test_lc_fails_closed_on_ids_past_the_row(requests) -> None:
     """A selected id past the token's row (a stale table, e.g. a padded row keeping a 500K request's n_valid) is
     skipped, as the Triton producer skips it: the rows equal those with that slot at -1, bit for bit, and stay finite
     even though the block-table tail it would reach points at a page whose block scales are NaN (0xFF)."""
-    from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp4.kernels import (  # noqa: E501
+    from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp4.ops import (  # noqa: E501
         m3_prequant,
     )
 

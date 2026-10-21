@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """The MSA page table is written on the host side only, before the graph replay.
 
-The index scorer's early issue (``kernels/m3_index_score.py``, ``early_issue``) reads ``block_table[b, split]`` BEFORE
+The index scorer's early issue (``ops/m3_index_score.py``, ``early_issue``) reads ``block_table[b, split]`` BEFORE
 its PDL grid-dependency wait and loads that page's K tile right after it. That is exact only while no kernel of the
 step writes ``MsaMetadata.msa_block_table``: today its one writer is the host-to-device copy in
 ``_build_msa_fields`` (called from ``prepare()``, before the replay), besides the allocation. This test scans
@@ -99,7 +99,7 @@ def test_only_prepare_writes_the_msa_page_table() -> None:
         for func, line in _write_sites(ast.parse(src)):
             assert (rel, func) in _ALLOWED, (
                 f"{rel}:{line} ({func}) writes msa_block_table; the index scorer's early issue reads it before its "
-                "PDL grid wait (kernels/m3_index_score.py), so an in-graph writer must be ordered before it or the "
+                "PDL grid wait (ops/m3_index_score.py), so an in-graph writer must be ordered before it or the "
                 "early page read moved after the wait"
             )
             found.add((rel, func))

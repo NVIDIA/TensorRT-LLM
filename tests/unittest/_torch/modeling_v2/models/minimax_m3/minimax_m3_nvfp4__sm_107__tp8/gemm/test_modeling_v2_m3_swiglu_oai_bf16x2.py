@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Bitwise oracle of the mx_gemv swigluoai prologue arithmetic (kernels/mx_gemv/_swiglu_oai_bf16x2) against the
+"""Bitwise oracle of the mx_gemv swigluoai prologue arithmetic (ops/mx_gemv/_swiglu_oai_bf16x2) against the
 Triton silu_and_mul kernel the dense MLP runs today (modules/swiglu.py, alpha 1.702, limit 7, beta 1): every bf16 gate
 bit pattern against special and random up values, and every up bit pattern against special and random gates."""
 
@@ -10,7 +10,7 @@ import pytest
 import torch
 from cutlass.cute.runtime import from_dlpack
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp8.kernels.mx_gemv.m3_mx_gemv_kernel import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp8.ops.mx_gemv.m3_mx_gemv_kernel import (  # noqa: E501
     SWIGLU_OAI_ALPHA,
     SWIGLU_OAI_LIMIT,
     _swiglu_oai_bf16x2,
@@ -121,7 +121,7 @@ def test_random_pairs_are_bitwise_the_triton_kernel(seed: int) -> None:
 from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp8 import (  # noqa: E402
     modeling,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp8.kernels.mx_gemv import (  # noqa: E402, E501
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp8.ops.mx_gemv import (  # noqa: E402, E501
     op as gemv,
 )
 

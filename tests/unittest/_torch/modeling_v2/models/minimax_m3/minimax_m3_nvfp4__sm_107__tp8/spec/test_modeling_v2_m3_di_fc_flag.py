@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test of the fc fork's counter wait (modeling's DI_FC_FLAG, kernels/m3_fc_wait): the one-thread wait kernel
+"""GPU test of the fc fork's counter wait (modeling's DI_FC_FLAG, ops/m3_fc_wait): the one-thread wait kernel
 queued on the main stream releases its successor only after the fork's bump on another stream (so the successor reads
 what the fork wrote, with no stream join before it), eagerly and on CUDA-graph replays; it counts an overrun instead
 of hanging when no bump comes."""
@@ -8,7 +8,7 @@ of hanging when no bump comes."""
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp8.kernels import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp8.ops import (  # noqa: E501
     m3_fc_wait,
 )
 

@@ -14,7 +14,7 @@ against the whole row (re-read).
 
 The kernel is ``torch.ops.trtllm.minimax_m3_sm107_tp2_select_long`` (this target's copy of ``minimax_m3_select_long``
 with a choice of where it releases the sparse decode), called through this target's ``m3_select_long`` entry, or with
-``dsl`` the same selection from one 384-thread CTA per row (``m3_select_long_dsl``, kernels/m3_select_long_dsl).
+``dsl`` the same selection from one 384-thread CTA per row (``m3_select_long_dsl``, ops/m3_select_long_dsl).
 """
 
 from typing import Optional

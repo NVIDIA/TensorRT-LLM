@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test for the forward-tail spec fold (kernels/m3_fold_tail and M3SpecStepFold.in_forward).
+"""GPU test for the forward-tail spec fold (ops/m3_fold_tail and M3SpecStepFold.in_forward).
 
 The tail must write exactly what the sampler's store (slot_scatter) and then the engine's next-step gathers
 (step_gather, rows = the stored rows in order, first previous row 0) write, for the rows the step armed, and nothing
@@ -15,7 +15,7 @@ import torch
 from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2 import (
     modeling,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2.kernels import (
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2.ops import (
     m3_fold_tail,
     m3_spec_tail,
 )

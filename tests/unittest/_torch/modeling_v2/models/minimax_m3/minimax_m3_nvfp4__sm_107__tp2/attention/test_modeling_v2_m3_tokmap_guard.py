@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test (SM 10.7) for kernels/m3_tokmap_guard: a one-request multi-token call of
+"""GPU test (SM 10.7) for ops/m3_tokmap_guard: a one-request multi-token call of
 thop.trtllm_gen_generation_preprocess (rows padded to the bucket, the request's generation length 1..bucket) with a
 stale token map in the workspace gives, through the guard, the bytes the op gives with a freshly built map: the
 appended FP8 K/V pages and the processed query's live rows, bit for bit, eager and from one captured graph replayed for
@@ -16,7 +16,7 @@ import math
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2.kernels import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2.ops import (  # noqa: E501
     m3_tokmap_guard as guard,
 )
 from tensorrt_llm.bindings.internal import thop

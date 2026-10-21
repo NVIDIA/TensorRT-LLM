@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Rule 1b gate a for the TP2 decode GEMV order override (kernels/mx_gemv/op.STRIDED_K_TILES: strided k-tiles):
+"""Rule 1b gate a for the TP2 decode GEMV order override (ops/mx_gemv/op.STRIDED_K_TILES: strided k-tiles):
 for every overridden (projection, rows) the output is the same on 3 eager calls and on a CUDA graph replay
 (deterministic), and its max abs / max rel error vs the fp64 product of the dequantized operands stays within the
 shipped order's band (the shared table's config on the same operands, over several seeds)."""
@@ -8,9 +8,6 @@ shipped order's band (the shared table's config on the same operands, over sever
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2.kernels.mx_gemv import (  # noqa: E501
-    op,
-)
 from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2.ops.gemm.m3_mx_gemv import (  # noqa: E501
     DENSE_GATE_UP,
     O_PROJ,
@@ -20,6 +17,9 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2.ops.moe.m3_moe_engine import (  # noqa: E501
     mxfp8_dequant,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2.ops.mx_gemv import (  # noqa: E501
+    op,
 )
 
 pytestmark = pytest.mark.skipif(
