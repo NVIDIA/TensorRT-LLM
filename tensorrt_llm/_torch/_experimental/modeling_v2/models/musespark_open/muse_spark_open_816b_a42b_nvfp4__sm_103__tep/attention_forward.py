@@ -131,7 +131,8 @@ def preprocess_reachable() -> Optional[str]:
 
 
 class _DecodeStandIn:
-    """``flashinfer.decode`` whose trtllm-gen decode call launches ``full_attention_split_kv`` for one call."""
+    """``flashinfer.decode`` whose trtllm-gen decode call goes through ``call`` for one call: its
+    ``launch`` on the plain case, the real FMHA (named by ``call.PATH``) on any other."""
 
     def __init__(self, real, call: SplitKvCall) -> None:
         self._real = real
@@ -149,9 +150,9 @@ class _DecodeStandIn:
             if call.fallback is None:
                 call.fallback = reason
             logger.warning_once(
-                f"[musespark_open] full_attention_split_kv: a full-attention decode call runs the "
-                f"built-in FMHA ({reason})",
-                key=f"musespark_open.split_kv.builtin_{reason}",
+                f"[musespark_open] {call.PATH}: a full-attention decode call runs the built-in "
+                f"FMHA ({reason})",
+                key=f"musespark_open.{call.PATH}.builtin_{reason}",
             )
             return self._real.trtllm_batch_decode_with_kv_cache(*args, **kwargs)
         call.launch(kwargs)

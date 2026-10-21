@@ -56,7 +56,9 @@ def install_loaded_features(
     are installed on the owner-only window (``_install_owner_window``: no
     replication, every expert on its owner), at tp 4 or tp 8.
 
-    Then ``early_expert_ids`` (``early_ids.install``, on the layers just installed),
+    Then ``hot_replicas`` (``hot_replicas.install``: hooks only, at tp 4; the copies are
+    gathered on the first forward of a deployment that serves 33..512-row decode steps),
+    then ``early_expert_ids`` (``early_ids.install``, on the layers just installed),
     then ``pool_into_route`` (``DirectPool.install_sites``, whose routed kernel
     variants carry the placement and the early expert ids), each collective over the
     TP group, and last ``next_qkv_prefetch``'s wrapper around every hooked layer's
@@ -67,6 +69,11 @@ def install_loaded_features(
         _install_ring_buddy(text_model, mapping, plan)
     elif plan.enabled("persistent_experts") or plan.enabled("bf16_routed_experts"):
         _install_owner_window(text_model, mapping, plan)
+    if plan.enabled("hot_replicas"):
+        from .kernels.replicated_experts import hot_replicas as _hot_replicas
+
+        # After the owner-window install, whose expert and routing hooks it wraps.
+        _hot_replicas.install(text_model, mapping)
     if plan.enabled("early_expert_ids"):
         _install_early_expert_ids(text_model, mapping)
     if plan.enabled("pool_into_route"):

@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
-from typing import Optional, Tuple
+from typing import Callable, Optional, Tuple
 
 import torch
 
@@ -23,6 +23,7 @@ from . import dispatch as _dispatch
 from . import dispatch as _tp_agreement
 from .attention import _PREATTN_PREP_MAX_ROWS, DecodeAttentionPlan, _attention_class
 from .ops.allreduce import post_attn_hop as _hop
+from .ops.allreduce import post_attn_hop_wide as _wide
 
 
 def _refuse_unfused_sites(layer_kwargs: dict, plan: "_dispatch.Plan") -> None:
@@ -249,6 +250,11 @@ class PostAttnHopCall:
         self.direct = direct
 
     @staticmethod
+    def takes_call(*tensors: torch.Tensor) -> bool:
+        """Whether the armed hop computes one join call (``post_attn_hop.hop_takes``)."""
+        return _hop.hop_takes(*tensors)
+
+    @staticmethod
     def takes(rows: int) -> bool:
         """Whether a decode step of ``rows`` rows runs through the armed joins.
 
@@ -288,21 +294,123 @@ class PostAttnHopCall:
                 join._armed = None
 
 
+#: Free device memory a rank must keep beyond the 1024-row hop transport for the first
+#: decode step above 512 rows to build it (``WideHopCall.takes``).
+WIDE_BUILD_HEADROOM_BYTES = 64 * 2**20
+
+
+def _free_device_bytes() -> int:
+    """The current device's free memory as the driver reports it."""
+    return torch.cuda.mem_get_info()[0]
+
+
+class WideHopCall:
+    """What ``DecodeTarget`` holds under ``wide_post_attention_hop``: the wide op, its workspaces
+    and the joins it arms.
+
+    The joins are ``post_attention_hop``'s (``MuseSparkOpenTepPostAttnJoin``): a decode step of
+    ``post_attn_hop_wide.MIN_ROWS``..``WIDE_MAX_ROWS`` rows arms them with this call instead of
+    the 8-row hop's, and an armed join runs ``post_attn_hop_wide`` where the 8-row hop would run,
+    on ``workspace``: the served one (capacity ``MAX_ROWS``) for a step of up to ``MAX_ROWS``
+    rows, the larger one for a step above. The larger workspace is built by ``wide_factory`` on
+    the first step that needs it (collective: every rank of the group runs the same step), never
+    inside a CUDA-graph capture; a step that would need it while capturing before it exists is
+    not taken, on every rank alike. A factory that refuses (``ValueError``, agreed over the
+    group before any allocation) or whose collective construction fails (``RuntimeError``,
+    raised on every rank alike) declines the steps above ``MAX_ROWS`` for the rest of the run,
+    on every rank alike; they run the built-in o_proj all-reduce.
+
+    Precondition for that untaken case: it runs the built-in o_proj all-reduce, whose MNNVL
+    workspace must already hold the step (two-shot buffers of ``2 * rows * hidden`` BF16
+    elements), since a workspace grown inside a capture would leave earlier graphs on freed
+    memory. The served runtime never reaches it: an eager forward of the same batch precedes
+    every capture (the general warmup of ``max_batch_size`` requests, and the eager warmup of
+    each graph), and it builds the larger workspace first.
+    """
+
+    def __init__(
+        self,
+        workspace: "_wide.WideHopWorkspace",
+        joins: "tuple[MuseSparkOpenTepPostAttnJoin, ...]",
+        wide_factory: "Optional[Callable[[], _wide.WideHopWorkspace]]" = None,
+    ) -> None:
+        self.op = _wide.post_attn_hop_wide
+        self.served = workspace
+        self.workspace = workspace
+        self.wide: "Optional[_wide.WideHopWorkspace]" = None
+        self.wide_factory = wide_factory
+        self.joins = tuple(joins)
+        #: The joins read ``direct`` off any armed call; the wide op has no direct publication.
+        self.direct = None
+
+    @staticmethod
+    def takes_call(*tensors: torch.Tensor) -> bool:
+        """Whether the wide op computes one join call (``post_attn_hop_wide.wide_takes``)."""
+        return _wide.wide_takes(*tensors)
+
+    def takes(self, rows: int) -> bool:
+        """Whether a decode step of ``rows`` rows runs through the joins armed with this call.
+
+        Every rank of the group sees the same rows and the same capture state, so every rank
+        arms or none does. A step of more than ``MAX_ROWS`` rows first builds the larger
+        workspace (collective) when it does not exist yet and no capture is running.
+        """
+        if not _wide.wide_takes_rows(rows):
+            return False
+        if _wide.capacity_for(rows) == _wide.MAX_ROWS:
+            return True
+        if self.wide is None:
+            if self.wide_factory is None or torch.cuda.is_current_stream_capturing():
+                return False
+            try:
+                self.wide = self.wide_factory()
+            except (ValueError, RuntimeError) as error:
+                self.wide_factory = None
+                logger.warning(
+                    f"[musespark_open] wide_post_attention_hop: no {_wide.WIDE_MAX_ROWS}-row "
+                    f"transport ({error}); decode steps above {_wide.MAX_ROWS} rows run the "
+                    f"built-in o_proj all-reduce"
+                )
+                return False
+        return True
+
+    def workspace_for(self, rows: int) -> "_wide.WideHopWorkspace":
+        """The workspace a step of ``rows`` rows runs on (``takes`` must have taken it)."""
+        if _wide.capacity_for(rows) == _wide.MAX_ROWS:
+            return self.served
+        assert self.wide is not None, "takes() builds the larger workspace first"
+        return self.wide
+
+    @contextlib.contextmanager
+    def armed(self, rows: Optional[int] = None, residual: Optional[torch.Tensor] = None):
+        """Arm every join with this call for the duration of one decode forward; disarm on any exit."""
+        self.workspace = self.served if rows is None else self.workspace_for(rows)
+        for join in self.joins:
+            join._armed = self
+        try:
+            yield
+        finally:
+            for join in self.joins:
+                join._armed = None
+            self.workspace = self.served
+
+
 class MuseSparkOpenTepPostAttnJoin(MuseSparkOpenGatedResidual):
     """A layer's built-in attention-side residual join, which ``DecodeTarget`` can arm.
 
     Never constructed directly: ``adopt`` re-classes a layer's built-in
     ``add_attn`` in place and adds two plain attributes. It is the only module
-    ``post_attention_hop`` re-classes. Armed (by ``PostAttnHopCall.armed``, for one decode
-    forward whose layer calls carry ``all_reduce_params=_NO_ALLREDUCE``), the
+    ``post_attention_hop`` re-classes. Armed (by ``PostAttnHopCall.armed``, or by
+    ``WideHopCall.armed`` on a multi-request step, for one decode forward whose layer
+    calls carry ``all_reduce_params=_NO_ALLREDUCE``), the
     join receives the unreduced o_proj partial as ``branch`` and returns what
     the built-in all-reduce followed by the built-in join returns: through the
-    fused hop when the call fits it, through those two built-in steps
+    armed call's fused op when the call fits it, through those two built-in steps
     otherwise. Unarmed it is the built-in join.
 
-    The fused hop and the built-in all-reduce are two different collectives, so
+    The fused op and the built-in all-reduce are two different collectives, so
     the choice between them is made on what every rank of the group shares --
-    the row count, dtypes, shapes and devices (``hop_takes``) and the layer's
+    the row count, dtypes, shapes and devices (the armed call's ``takes_call``) and the layer's
     configuration -- never on a tensor's address or strides: a rank that chose
     the other one would leave every rank waiting. A rank-local layout the
     kernel cannot read in place is copied (``readable``) rather than declined.
@@ -354,7 +462,7 @@ class MuseSparkOpenTepPostAttnJoin(MuseSparkOpenGatedResidual):
             and self._fused_enabled
             and next_norm.use_gemma
             and not torch.compiler.is_compiling()
-            and _hop.hop_takes(branch, residual, alpha, beta, weight)
+            and call.takes_call(branch, residual, alpha, beta, weight)
         ):
             branch, residual, alpha, beta, weight = _hop.readable(
                 branch, residual, alpha, beta, weight
@@ -522,6 +630,78 @@ def _build_post_attn_hop(
     return PostAttnHopCall(workspace, joins)
 
 
+def _build_wide_hop(model: MuseSparkOpenModel, call: PostAttnHopCall) -> WideHopCall:
+    """``wide_post_attention_hop``: take the group's wide-hop workspace (collective) for ``call``'s joins.
+
+    The joins are ``post_attention_hop``'s, whose refusals already read every layer; the
+    wide op computes the same pair on more rows, so nothing else is checked. The workspace
+    comes from ``shared_wide_workspace``, so a constructor that runs again reuses it.
+    """
+    if not _wide.HAS_CUTE_DSL:
+        raise ValueError("[musespark_open] wide_post_attention_hop needs the CuTe DSL")
+    if len(call.joins) != len(model.layers):
+        raise ValueError(
+            f"[musespark_open] wide_post_attention_hop: {len(call.joins)} post-attention joins "
+            f"for {len(model.layers)} layers"
+        )
+    variants = sorted(
+        {
+            (
+                float(layer.post_attn_norm.variance_epsilon),
+                float(layer.pre_ffn_norm.variance_epsilon),
+                bool(layer.add_attn._preqkv_norm_fp32),
+            )
+            for layer in model.layers
+        }
+    )
+    workspace = _wide.shared_wide_workspace(
+        model.layers[0].mapping,
+        multicast=_wide.SERVED_MULTICAST,
+        variants=variants,
+        early_launch=_wide.SERVED_EARLY_LAUNCH,
+    )
+    _wide.log_once_enabled(
+        len(model.layers),
+        workspace.multicast,
+        workspace.two_shot_rows,
+        workspace.early_launch,
+    )
+
+    mapping = model.layers[0].mapping
+
+    def wide_factory() -> "_wide.WideHopWorkspace":
+        # The construction below is collective; a rank that cannot hold the transport refuses
+        # here, agreed over the group, before any rank enters it.
+        _, needed = _wide.receive_layout(
+            _tp_agreement.group_size(mapping), _wide.MIN_ROWS, _wide.WIDE_MAX_ROWS
+        )
+        free = _free_device_bytes()
+        local = None
+        if free < needed + WIDE_BUILD_HEADROOM_BYTES:
+            local = (
+                f"{free / 2**20:.0f} MiB free, the transport needs {needed / 2**20:.0f} MiB "
+                f"+ {WIDE_BUILD_HEADROOM_BYTES / 2**20:.0f} MiB of headroom"
+            )
+        reason = _tp_agreement.agreed_refusal(mapping, local)
+        if reason is not None:
+            raise ValueError(reason)
+        built = _wide.shared_wide_workspace(
+            model.layers[0].mapping,
+            multicast=_wide.SERVED_MULTICAST,
+            variants=variants,
+            early_launch=_wide.SERVED_EARLY_LAUNCH,
+            max_rows=_wide.WIDE_MAX_ROWS,
+        )
+        logger.info(
+            f"[musespark_open] wide_post_attention_hop: first decode step above "
+            f"{_wide.MAX_ROWS} rows; built the {_wide.WIDE_MAX_ROWS}-row two-shot transport "
+            f"(+{built.workspace_bytes / 2**20:.1f} MiB of fabric memory per rank)"
+        )
+        return built
+
+    return WideHopCall(workspace, call.joins, wide_factory)
+
+
 def _build_direct_publish(
     model: MuseSparkOpenModel, call: PostAttnHopCall, early_trigger: bool = False
 ) -> DirectPublish:
@@ -660,6 +840,12 @@ def verify_direct_publish(text_model: MuseSparkOpenModel) -> str:
     return direct.workspace.check_producer(publish, warm)
 
 
+def _raise_refusal(reason: Optional[str], path: str) -> None:
+    """Raise ``ValueError`` naming ``path`` when ``reason`` is not None."""
+    if reason is not None:
+        raise ValueError(f"[musespark_open] {path} cannot run: {reason}")
+
+
 @dataclasses.dataclass
 class AdoptedLayers:
     """What ``adopt_model`` installed, which the core keeps as its attributes."""
@@ -674,6 +860,14 @@ class AdoptedLayers:
     unpool_direct: Optional[object]
     pool_direct: Optional[object]
     qkv_prefetch: Optional[object]
+    router_gemm: Optional[object] = None
+    decode_kv_splits: Optional[object] = None
+    wide_moe_allreduce: Optional[object] = None
+    wide_hop: Optional[WideHopCall] = None
+    wide_projections: Optional[object] = None
+    published_projections: Optional[object] = None
+    finalize_two_shot: Optional[object] = None
+    batch_dense_gemms: Optional[object] = None
 
 
 def adopt_model(
@@ -738,6 +932,16 @@ def adopt_model(
             attention_class.check(layer.self_attn)
         for layer in model.layers:
             attention_class.adopt(layer.self_attn)
+    if plan.enabled("context_prep"):
+        # context_prep depends on preattn_prep, so every attention is a
+        # MuseSparkOpenTepAttention by now; the later mixins keep the instance attribute.
+        for layer in model.layers:
+            layer.self_attn._zero_padded_rows = True
+        logger.info(
+            "[musespark_open] context_prep: context steps' pre-attention prep in one launch on "
+            f"all {len(model.layers)} layers; a replayed prefill graph's padded rows get a zero "
+            "attention output"
+        )
     if any(plan.enabled(path) for path in _attention.TRTLLM_GEN_DECODE_PATHS):
         # The full-attention paths below intercept the trtllm-gen FMHA's decode call, and
         # every attention path reads its KV-pool page bound.
@@ -780,6 +984,37 @@ def adopt_model(
         _tp_agreement.agreed_install(
             model.layers[0].mapping, lambda: prep_fold_attention.install(model)
         )
+    decode_kv_splits = None
+    if plan.enabled("decode_kv_splits"):
+        # Re-classes nothing: DecodeTarget arms it around a forward of 72..512 rows.
+        # Its refusal is agreed over the TP group, as the other attention installs.
+        from .kernels.decode_kv_splits import splits as _decode_kv_splits
+
+        decode_kv_splits = _tp_agreement.agreed_install(
+            model.layers[0].mapping, lambda: _decode_kv_splits.install(model)
+        )
+    if plan.enabled("multi_request_split_kv"):
+        # After every other attention re-class but multi_request_prep_append's: its mixin
+        # goes in front of them and acts only on decode steps of two or more sequences, where
+        # it swaps the decode FMHA launch (``intercepting``). Agreed like split-KV's.
+        from .kernels.multi_request_split_kv import attention as multi_request_attention
+
+        _tp_agreement.agreed_install(
+            model.layers[0].mapping,
+            lambda: multi_request_attention.install(
+                model, sliding=multi_request_attention.SLIDING_LAYERS
+            ),
+        )
+    if plan.enabled("multi_request_prep_append"):
+        # After every other attention re-class: its mixin goes in front of all of them and
+        # acts only on decode steps of two or more sequences, where it swaps the generation
+        # preprocess (``eliding``); the two swaps nest in either order. Agreed like the prep
+        # fold's.
+        from .kernels.multi_request_prep_append import attention as multi_request_append
+
+        _tp_agreement.agreed_install(
+            model.layers[0].mapping, lambda: multi_request_append.install(model)
+        )
     if preattn_prep_on:
         logger.info(
             f"[musespark_open] preattn_prep: fused pre-attention prep on the decode path of all "
@@ -813,6 +1048,17 @@ def adopt_model(
         # The router fork: its refusals (PDL off, a stream not created) are agreed over
         # the TP group.
         moe_prologue.install_router_fork(model)
+    router_gemm = None
+    if plan.enabled("router_gemm"):
+        # After moe_prologue and the router fork, which check the MoE class they re-class:
+        # the router GEMM's mixin goes in front of whatever class the MoE has. The paths
+        # installed later that ask for the prologue MoE (pool_into_route,
+        # early_expert_ids) take a subclass of it. Agreed like the attention installs.
+        from .kernels.router_gemm import router as _router_gemm
+
+        router_gemm = _tp_agreement.agreed_install(
+            model.layers[0].mapping, lambda: _router_gemm.install(model)
+        )
     # The capture layers whose boundary writes the DFlash capture (capture_fold): no
     # plain capture copy follows their boundary, so boundary_early_release converts
     # their QKV edge too.
@@ -890,9 +1136,67 @@ def adopt_model(
         from .kernels.finalize_transport import transport as _finalize_transport
 
         finalize_transport = _finalize_transport.install(model)
+    wide_moe_allreduce = None
+    if plan.enabled("wide_moe_allreduce"):
+        # Replaces only the module every MoE layer reduces its unfused output with;
+        # DecodeTarget arms it around a decode forward of 129..1024 rows. Its refusal
+        # is agreed over the TP group before the MNNVL workspace's collective
+        # construction.
+        from .kernels.wide_moe_allreduce import allreduce as _wide_moe_allreduce
+
+        _tp_agreement.agreed_install(
+            model.layers[0].mapping, lambda: _wide_moe_allreduce.check(model)
+        )
+        wide_moe_allreduce = _wide_moe_allreduce.install(model)
+    finalize_two_shot = None
+    if plan.enabled("finalize_two_shot"):
+        # After finalize_transport, whose workspace it wraps (every layer shares it), and
+        # wide_moe_allreduce, which stays the reduce of every unarmed unfused finalize.
+        # DecodeTarget arms it around a decode forward of 64..512 rows. Its refusal is
+        # agreed over the TP group before the workspace's collective construction.
+        from .kernels.finalize_two_shot import install as _finalize_two_shot
+
+        _tp_agreement.agreed_install(
+            model.layers[0].mapping,
+            lambda: _raise_refusal(_finalize_two_shot.refusal(model), "finalize_two_shot"),
+        )
+        finalize_two_shot = _finalize_two_shot.install(model)
     if plan.enabled("attention_output_into_hop"):
         # After dense_gemms (its o_proj dispatchers) and post_attention_hop (its joins).
         post_attn_hop.direct = _build_direct_publish(model, post_attn_hop, early_trigger=True)
+    wide_hop = None
+    if plan.enabled("wide_post_attention_hop"):
+        # After post_attention_hop, whose joins it arms on 9..1024-row decode steps.
+        wide_hop = _build_wide_hop(model, post_attn_hop)
+    wide_projections = None
+    if plan.enabled("wide_projection_gathers"):
+        # After projection_gathers (whose MoE and join classes read its inboxes) and
+        # dense_gemms (whose plan takes its 9..32-row table). Its refusal is agreed over the
+        # TP group before the inboxes' collective construction.
+        from .kernels.wide_projection_gathers import gathers as _wide_projections
+
+        _tp_agreement.agreed_install(
+            model.layers[0].mapping, lambda: _wide_projections.check(model, dense_gemm_plan)
+        )
+        wide_projections = _wide_projections.install(model, dense_gemm_plan)
+    published_projections = None
+    if plan.enabled("projection_publish"):
+        # After projection_gathers, whose MoE and join classes carry its hooks. Its refusal is
+        # agreed over the TP group before the collective communicator split; the transports
+        # are built at the first armed (eager) forward.
+        from .kernels.projection_publish import publish as _projection_publish
+
+        _tp_agreement.agreed_install(
+            model.layers[0].mapping, lambda: _projection_publish.check(model, layer_kwargs)
+        )
+        published_projections = _projection_publish.install(model)
+    batch_dense_gemms = None
+    if plan.enabled("batch_dense_gemms"):
+        # After dense_gemms (whose re-classed projections and plan it arms) and every
+        # attention re-class (it hands each attention the switch its PDL norm-gate reads).
+        from .kernels.batch_dense_gemms import chain as _batch_dense_gemms
+
+        batch_dense_gemms = _batch_dense_gemms.install(model, dense_gemm_plan)
     return AdoptedLayers(
         finalize_transport=finalize_transport,
         decode_attention=decode_attention,
@@ -904,4 +1208,12 @@ def adopt_model(
         unpool_direct=unpool_direct,
         pool_direct=pool_direct,
         qkv_prefetch=qkv_prefetch,
+        router_gemm=router_gemm,
+        decode_kv_splits=decode_kv_splits,
+        wide_moe_allreduce=wide_moe_allreduce,
+        wide_hop=wide_hop,
+        wide_projections=wide_projections,
+        published_projections=published_projections,
+        finalize_two_shot=finalize_two_shot,
+        batch_dense_gemms=batch_dense_gemms,
     )
