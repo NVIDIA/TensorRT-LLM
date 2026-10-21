@@ -134,6 +134,7 @@ def llm_check_output(llm: LLM,
                  similar_threshold=similar_threshold,
                  finish_reasons=finish_reasons,
                  stop_reasons=stop_reasons)
+    return outputs
 
 
 default_model_name = "Qwen3/Qwen3-0.6B"
@@ -647,14 +648,19 @@ def test_generate_with_bad_words():
                      sampling_params=SamplingParams(max_tokens=15,
                                                     bad_token_ids=[bad_id]))
 
-    llm_check_output(llm,
-                     prompts, ["D E F G H I K L M N O P Q R S"],
-                     sampling_params=SamplingParams(max_tokens=15, bad=" I J"))
+    # Similarity alone also accepts the unbanned " ... I J K ..." output, so
+    # also check that the banned sequence was not generated.
+    outputs = llm_check_output(llm,
+                               prompts, ["D E F G H I K L M N O P Q R S"],
+                               sampling_params=SamplingParams(max_tokens=15,
+                                                              bad=" I J"))
+    assert " I J" not in outputs[0].outputs[0].text
 
-    llm_check_output(llm,
-                     prompts, ["D E F G H I K L M N O P Q R S"],
-                     sampling_params=SamplingParams(max_tokens=15,
-                                                    bad=[" F E", " I J"]))
+    outputs = llm_check_output(llm,
+                               prompts, ["D E F G H I K L M N O P Q R S"],
+                               sampling_params=SamplingParams(
+                                   max_tokens=15, bad=[" F E", " I J"]))
+    assert " I J" not in outputs[0].outputs[0].text
 
 
 class MyLogitsProcessor(LogitsProcessor):
