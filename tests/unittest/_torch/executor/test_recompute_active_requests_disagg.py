@@ -286,6 +286,23 @@ class TestRecomputeSkipsTransferBoundRequests:
         assert [r.py_request_id for r in ex.freed] == [31]
         assert 30 in manager.requests_in_transfer()
 
+    def test_dispatched_connector_load_is_left_alone(self):
+        """A dispatched connector load still owns the request's pages, so the
+        recompute must not free or pause it; an unstarted load is released and
+        the request is recomputed as usual."""
+        loading, unstarted = _request(40), _request(41)
+        connector = MagicMock()
+        connector.has_pending_load.side_effect = lambda r: r is loading
+        ex = _RecomputeExecutor([loading, unstarted], transceiver=None, transfer_manager=None)
+        ex.kv_connector_manager = connector
+
+        PyExecutor.recompute_active_requests(ex)
+
+        assert ex.freed == [unstarted]
+        assert ex.paused == [unstarted]
+        connector.release_unstarted_prefix_loads.assert_any_call(loading)
+        connector.release_unstarted_prefix_loads.assert_any_call(unstarted)
+
 
 if __name__ == "__main__":
     pytest.main([__file__])

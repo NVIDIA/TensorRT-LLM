@@ -9696,7 +9696,9 @@ class PyExecutor:
         engine, where it starves behind the running decodes. Both keep the
         cache computed with the previous weights for the remainder of their
         current turn, exactly as ``recompute_kv=False`` would treat every
-        request. The reuse-tree reset below drops the blocks released so far;
+        request. A request whose KV connector load is already dispatched is
+        left untouched the same way, since the load still owns its pages. The
+        reuse-tree reset below drops the blocks released so far;
         requests left untouched may still register their old-weight blocks
         for reuse when they finish (inert on hybrid engines, whose release
         path stores no attention blocks; a residual staleness hazard on
@@ -9727,13 +9729,22 @@ class PyExecutor:
                 "in-flight batch); call it from within control_action(), "
                 "which retires the in-flight batch on every rank first.")
 
+        connector = getattr(self, "kv_connector_manager", None)
         requests_to_recompute = []
         transfer_bound = []
+        load_bound = []
         for request in self.active_requests:
             if self._is_disagg_transfer_bound(request):
                 transfer_bound.append(request)
-            else:
-                requests_to_recompute.append(request)
+                continue
+            if connector is not None:
+                connector.release_unstarted_prefix_loads(request)
+                if connector.has_pending_load(request):
+                    # A dispatched load still owns the request's pages and may
+                    # write to them, so they cannot be freed until it finishes.
+                    load_bound.append(request)
+                    continue
+            requests_to_recompute.append(request)
         logger.info(
             f"recompute_active_requests: recomputing {len(requests_to_recompute)} "
             f"of {len(self.active_requests)} active request(s)")
@@ -9743,16 +9754,19 @@ class PyExecutor:
                 f"{len(transfer_bound)} disaggregated transfer-bound request(s) "
                 "untouched (their KV cache keeps the previous weights): "
                 f"{[r.py_request_id for r in transfer_bound[:8]]}")
+        if load_bound:
+            logger.info(
+                "recompute_active_requests: leaving "
+                f"{len(load_bound)} request(s) with an in-flight KV connector "
+                "load untouched (their KV cache keeps the previous weights): "
+                f"{[r.py_request_id for r in load_bound[:8]]}")
 
         # The same teardown an immediate recompute pause does (see
         # ``_resume_preempted_request``): free the execution resources, then
         # reset the request for a re-prefill. Terminating instead would pop
         # the request's response routing (``result_wait_queues``) and release
         # its multimodal inputs, neither of which a continuing request can lose.
-        connector = getattr(self, "kv_connector_manager", None)
         for request in requests_to_recompute:
-            if connector is not None:
-                connector.release_unstarted_prefix_loads(request)
             self._free_request_resources(request)
             self._pause_recompute_request(request)
 
