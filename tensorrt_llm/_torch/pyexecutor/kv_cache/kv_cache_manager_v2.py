@@ -5496,7 +5496,6 @@ class KVCacheManagerV2(BaseResourceManager):
         # Set when the caller writes the history itself and needs those blocks backed,
         # instead of letting sliding-window pools keep only the last window_size.
         materialize_history: bool = False,
-        prepare_resource: bool = True,
         max_num_draft_tokens: int = 0,
         kv_reserve_draft_tokens: Optional[int] = None,
         use_mrope: bool = False,
@@ -5505,6 +5504,26 @@ class KVCacheManagerV2(BaseResourceManager):
         draft_kv_cache_manager: Optional["BaseResourceManager"] = None,
         capture_sampling_params: Optional[SamplingParams] = None,
     ):
+        """Create dummy requests with allocated target and optional draft KV caches.
+
+        ``token_nums`` specifies history plus input length, excluding draft
+        tokens; extra KV tokens are reserved internally. With ``is_gen=True``,
+        requests enter generation state and
+        reserve draft capacity. ``kv_reserve_draft_tokens`` overrides this
+        reserve without changing the ``max_num_draft_tokens`` proposal length.
+        ``materialize_history=True`` also backs the declared generation history
+        with blocks instead of using the committed-history capacity hint.
+
+        Returns:
+            Requests in ``request_ids`` order, or ``None`` when cache creation,
+            resume, resize, or beam expansion reports insufficient capacity.
+            These failure returns release resources allocated by this call;
+            unexpected exceptions propagate.
+
+        The caller must release each returned request with ``free_resources``
+        on this manager and the supplied draft manager when it is no longer
+        needed, including when subsequent warmup or graph capture fails.
+        """
         _kv_draft = (
             kv_reserve_draft_tokens if kv_reserve_draft_tokens is not None else max_num_draft_tokens
         )
@@ -5570,56 +5589,55 @@ class KVCacheManagerV2(BaseResourceManager):
             )
             req.is_dummy_request = True
             req.paged_kv_block_ids = []
-            if prepare_resource:
-                expected_prompt_length = token_num - 1 if is_gen else token_num
-                # Dummy caches skip the prefix lookup and never commit, so they
-                # neither claim nor publish real prefixes (see _create_kv_cache).
-                kv_cache = self._create_kv_cache(
+            expected_prompt_length = token_num - 1 if is_gen else token_num
+            # Dummy caches skip the prefix lookup and never commit, so they
+            # neither claim nor publish real prefixes (see _create_kv_cache).
+            kv_cache = self._create_kv_cache(
+                req.py_request_id,
+                req.lora_task_id,
+                input_tokens,
+                is_dummy=req.is_dummy,
+                expected_prompt_length=expected_prompt_length,
+            )
+            # Saturated IndexMapper (e.g. disagg gen trans in progress)
+            # returns None; retry next iter.
+            if kv_cache is None:
+                release_resources(req)
+                return None
+            assert kv_cache.num_committed_tokens == 0
+            success = kv_cache.resume(self._stream.cuda_stream)
+            if not success:
+                release_resources(req)
+                return None
+            dummy_capacity = token_num + self.num_extra_kv_tokens
+            if is_gen and not materialize_history:
+                kv_cache.enable_swa_scratch_reuse = False
+            # Need to hint the committed history to activate stale-block
+            # optimization and match the solver's pool budget.
+            success = kv_cache.resize(dummy_capacity, history_length=history_hint)
+            if not success:
+                release_resources(req)
+                return None
+            draft_kv_cache = None
+            if draft_kv_cache_manager is not None:
+                draft_kv_cache = draft_kv_cache_manager._create_kv_cache(
                     req.py_request_id,
                     req.lora_task_id,
                     input_tokens,
                     is_dummy=req.is_dummy,
                     expected_prompt_length=expected_prompt_length,
                 )
-                # Saturated IndexMapper (e.g. disagg gen trans in progress)
-                # returns None; retry next iter.
-                if kv_cache is None:
+                if draft_kv_cache is None:
                     release_resources(req)
                     return None
-                assert kv_cache.num_committed_tokens == 0
-                success = kv_cache.resume(self._stream.cuda_stream)
+                success = draft_kv_cache.resume(draft_kv_cache_manager._stream.cuda_stream)
                 if not success:
-                    release_resources(req)
+                    release_resources(req, free_draft_resources=True)
                     return None
-                dummy_capacity = token_num + self.num_extra_kv_tokens
-                if is_gen and not materialize_history:
-                    kv_cache.enable_swa_scratch_reuse = False
-                # Need to hint the committed history to activate stale-block
-                # optimization and match the solver's pool budget.
-                success = kv_cache.resize(dummy_capacity, history_length=history_hint)
+                success = draft_kv_cache.resize(dummy_capacity)
                 if not success:
-                    release_resources(req)
+                    release_resources(req, free_draft_resources=True)
                     return None
-                draft_kv_cache = None
-                if draft_kv_cache_manager is not None:
-                    draft_kv_cache = draft_kv_cache_manager._create_kv_cache(
-                        req.py_request_id,
-                        req.lora_task_id,
-                        input_tokens,
-                        is_dummy=req.is_dummy,
-                        expected_prompt_length=expected_prompt_length,
-                    )
-                    if draft_kv_cache is None:
-                        release_resources(req)
-                        return None
-                    success = draft_kv_cache.resume(draft_kv_cache_manager._stream.cuda_stream)
-                    if not success:
-                        release_resources(req, free_draft_resources=True)
-                        return None
-                    success = draft_kv_cache.resize(dummy_capacity)
-                    if not success:
-                        release_resources(req, free_draft_resources=True)
-                        return None
 
             if is_gen:
                 req.state = LlmRequestState.GENERATION_IN_PROGRESS
@@ -5640,26 +5658,25 @@ class KVCacheManagerV2(BaseResourceManager):
                     req.seqlen_this_rank_cp = req.prompt_len
                     req.total_input_len_cp = token_num * self._helix_cp_size - 1
                     req.py_decoding_iter = 1
-                if prepare_resource:
-                    if not self._ensure_generation_beam_width(req, kv_cache):
-                        release_resources(req, free_draft_resources=draft_kv_cache is not None)
+                if not self._ensure_generation_beam_width(req, kv_cache):
+                    release_resources(req, free_draft_resources=draft_kv_cache is not None)
+                    return None
+                # token_num already includes the current generation input.
+                new_capacity = kv_cache.capacity + _kv_draft
+                success = kv_cache.resize(new_capacity, history_length=history_hint)
+                if not success:
+                    release_resources(req, free_draft_resources=draft_kv_cache is not None)
+                    return None
+                if draft_kv_cache is not None:
+                    if not draft_kv_cache_manager._ensure_generation_beam_width(
+                        req, draft_kv_cache
+                    ):
+                        release_resources(req, free_draft_resources=True)
                         return None
-                    # token_num already includes the current generation input.
-                    new_capacity = kv_cache.capacity + _kv_draft
-                    success = kv_cache.resize(new_capacity, history_length=history_hint)
+                    success = draft_kv_cache.resize(new_capacity)
                     if not success:
-                        release_resources(req, free_draft_resources=draft_kv_cache is not None)
+                        release_resources(req, free_draft_resources=True)
                         return None
-                    if draft_kv_cache is not None:
-                        if not draft_kv_cache_manager._ensure_generation_beam_width(
-                            req, draft_kv_cache
-                        ):
-                            release_resources(req, free_draft_resources=True)
-                            return None
-                        success = draft_kv_cache.resize(new_capacity)
-                        if not success:
-                            release_resources(req, free_draft_resources=True)
-                            return None
 
             if use_mrope:
                 _populate_dummy_mrope_config(req, token_num, is_gen)
