@@ -491,6 +491,42 @@ class TestOpenAIHttpClient:
         )
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("together", [False, True], ids=["separate", "same-chunk"])
+    async def test_responses_first_token_follows_the_opening_events(
+        self, openai_client, mock_session, together
+    ):
+        """The worker sends response.created and response.in_progress before generating."""
+        request = ResponsesRequest(model="test-model", input="hi", stream=True)
+        opening = b"event: response.created\ndata: {}\n\nevent: response.in_progress\ndata: {}\n\n"
+        delta = b"event: response.output_text.delta\ndata: {}\n\n"
+        sent = [opening + delta] if together else [opening, delta]
+
+        async def mock_iter_any():
+            for data in sent:
+                yield data
+
+        mock_http_response = AsyncMock()
+        mock_http_response.status = 200
+        mock_http_response.headers = {"Content-Type": "text/event-stream"}
+        mock_http_response.content = AsyncMock()
+        mock_http_response.content.iter_any = mock_iter_any
+        mock_http_response.__aenter__ = AsyncMock(return_value=mock_http_response)
+        mock_http_response.__aexit__ = AsyncMock()
+        mock_session.post.return_value = mock_http_response
+        received = []
+        hooks = MagicMock(spec=ResponseHooks)
+        first_token_after = []
+        hooks.on_first_token.side_effect = lambda *args: first_token_after.append(len(received))
+
+        response_generator = await openai_client.send_request(request, hooks=hooks)
+        async for chunk in response_generator:
+            received.append(chunk)
+
+        assert received == sent
+        # Fired on the chunk carrying the first output, not on the opening pair.
+        assert first_token_after == [len(sent) - 1]
+
+    @pytest.mark.asyncio
     async def test_streaming_perf_metrics_preserve_sse_event_boundaries(
         self, openai_client, streaming_completion_request, mock_session, mock_router
     ):

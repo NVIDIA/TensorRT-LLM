@@ -77,6 +77,18 @@ from tensorrt_llm.serve.router import Router
 _msgpack_encoder = msgspec.msgpack.Encoder()
 MSGPACK_HEADERS = {"Content-Type": "application/json", "X-TRTLLM-Msgpack": "1"}
 
+# A Responses stream opens with these events before the model emits anything.
+_RESPONSES_OPENING_EVENTS = frozenset((b"response.created", b"response.in_progress"))
+
+
+def _has_responses_output_event(chunk: bytes) -> bool:
+    """Whether an SSE chunk of a Responses stream carries an event past its opening."""
+    return any(
+        line.startswith(b"event: ")
+        and line[len(b"event: ") :].strip() not in _RESPONSES_OPENING_EVENTS
+        for line in chunk.split(b"\n")
+    )
+
 
 # post_json's request and response are ordinary pydantic models, but not the
 # UCompletion* union: it carries auxiliary payloads such as count-tokens. The
@@ -575,13 +587,18 @@ class OpenAIHttpClient(OpenAIClient):
         try:
             last_token_time = start_time
             chunk_count = 0
+            # The first token of a Responses stream is the first frame after
+            # its opening events, which the worker sends before generating.
+            awaiting_output = isinstance(request, ResponsesRequest)
             marker = f"event: {SSE_METRICS_EVENT}\n".encode()
             event_delimiter = b"\n\n"
             pending = b""
             metrics_event = b""
             async for chunk in http_response.content.iter_any():
                 now_time = get_steady_clock_now_in_seconds()
-                if chunk:
+                if awaiting_output and chunk:
+                    awaiting_output = not _has_responses_output_event(chunk)
+                if chunk and not awaiting_output:
                     if chunk_count == 0 and hooks:
                         hooks.on_first_token(server, request)
                     latency = now_time - last_token_time
