@@ -14,6 +14,7 @@
 # limitations under the License.
 import asyncio
 import json
+import sys
 import threading
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
@@ -259,6 +260,9 @@ async def test_stats_read_for_a_cancelled_scrape_goes_to_the_next_scrape():
     assert len(server.generator.stats_timeouts) == 2
 
 
+@pytest.mark.skipif(
+    sys.version_info < (3, 12), reason="asyncio.Task(eager_start=...) requires Python 3.12+"
+)
 @pytest.mark.asyncio
 async def test_finished_read_stays_with_its_scrape_until_the_scrape_resumes():
     """A scrape arriving after a read finished, but before its scrape resumed, does not replace it.
