@@ -443,6 +443,38 @@ def test_tensor_scope_skips_computed_dataclass_properties():
     assert tensors == [hidden_states]
 
 
+def test_tensor_scope_collects_cuda_tensors_nested_among_leaf_values():
+    @dataclass
+    class Params:
+        use_cache: bool
+        lengths: list[int]
+        nested: list[object]
+
+    @dataclass
+    class Metadata:
+        request_ids: list[int]
+        params: Params
+        buffers: dict[str, object]
+
+    with FakeTensorMode():
+        first = torch.empty(1, device="cuda")
+        second = torch.empty(1, device="cuda")
+        third = torch.empty(1, device="cuda")
+        host = torch.empty(1)
+
+    metadata = Metadata(
+        request_ids=list(range(512)),
+        params=Params(True, [2000] * 512, [1, "a", None, (2.0, first)]),
+        buffers={"count": 3, "host": host, "device": [second, 4]},
+    )
+    tensors = []
+    nccl_window_tensor_scope._cuda_tensors(
+        ((metadata,), {"residual": third, "dtype": torch.int32}), tensors
+    )
+
+    assert tensors == [first, second, third]
+
+
 def test_eager_decoder_layer_hooks_scope_each_invocation(tensor_scope_events):
     from tensorrt_llm._torch.modules.decoder_layer import DecoderLayer
 

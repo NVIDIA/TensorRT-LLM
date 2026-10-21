@@ -42,6 +42,27 @@ def is_nccl_window_tensor_scoped_module(module_type: type[torch.nn.Module]) -> b
     return getattr(module_type, _SCOPED_MODULE_MARKER, False)
 
 
+# Values that can never hold a tensor. Metadata passed to every decoder layer
+# carries per-request lists of these, so they are skipped without recursion.
+_LEAF_TYPES = frozenset((bool, int, float, str, bytes, type(None), torch.dtype, torch.device))
+
+# Per dataclass type: the names of the fields tensor discovery reads.
+_DATACLASS_FIELD_NAMES: dict[type, tuple[str, ...]] = {}
+
+
+def _dataclass_field_names(value_type: type) -> tuple[str, ...]:
+    names = _DATACLASS_FIELD_NAMES.get(value_type)
+    if names is None:
+        # Computed metadata properties can require initialization or read CUDA values.
+        names = tuple(
+            field.name
+            for field in fields(value_type)
+            if not isinstance(getattr(value_type, field.name, None), property)
+        )
+        _DATACLASS_FIELD_NAMES[value_type] = names
+    return names
+
+
 def _cuda_tensors(
     value: Any,
     tensors: list[torch.Tensor],
@@ -50,6 +71,8 @@ def _cuda_tensors(
     if isinstance(value, torch.Tensor):
         if value.is_cuda:
             tensors.append(value)
+        return
+    if type(value) in _LEAF_TYPES:
         return
 
     if visited is None:
@@ -67,18 +90,22 @@ def _cuda_tensors(
         _cuda_tensors(value.fp8_tensor, tensors, visited)
         _cuda_tensors(value.scaling_factor, tensors, visited)
     elif is_dataclass(value) and not isinstance(value, type):
-        for field in fields(value):
-            # Computed metadata properties can require initialization or read CUDA values.
-            if isinstance(getattr(type(value), field.name, None), property):
-                continue
+        for name in _dataclass_field_names(type(value)):
             # ``init=False`` fields need not exist until the dataclass initializes them.
-            _cuda_tensors(getattr(value, field.name, None), tensors, visited)
+            item = getattr(value, name, None)
+            if type(item) not in _LEAF_TYPES:
+                _cuda_tensors(item, tensors, visited)
     elif isinstance(value, dict):
         for item in value.values():
-            _cuda_tensors(item, tensors, visited)
+            if type(item) not in _LEAF_TYPES:
+                _cuda_tensors(item, tensors, visited)
     elif isinstance(value, (list, tuple)):
+        # Per-request lists (request ids, prompt lengths) hold only leaves.
+        if _LEAF_TYPES.issuperset(map(type, value)):
+            return
         for item in value:
-            _cuda_tensors(item, tensors, visited)
+            if type(item) not in _LEAF_TYPES:
+                _cuda_tensors(item, tensors, visited)
 
 
 class _NCCLWindowTensorScope:
