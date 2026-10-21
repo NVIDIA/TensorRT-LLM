@@ -16,7 +16,7 @@
 
 import math
 import time
-from typing import Dict, List, Literal, Optional, Union
+from typing import Dict, List, Optional, Union
 
 from .enums import MetricNames
 
@@ -82,6 +82,7 @@ class MetricsCollector:
             trtllm_request_error_total
             trtllm_input_processing_seconds
             trtllm_input_processing_queue_seconds
+            trtllm_media_processing_seconds
 
         Iteration-level metrics:
             trtllm_kv_cache_hit_rate
@@ -557,6 +558,15 @@ class MetricsCollector:
             documentation="Time waiting for a server input-processor thread.",
             buckets=_PROCESSING_TIME_BUCKETS,
             labelnames=self.labels.keys())
+        self.histogram_media_processing = Histogram(
+            name=self.metric_prefix + "media_processing_seconds",
+            documentation=
+            ("Per-media-item download, decode execution and decode "
+             "worker queue times. Local file decode includes file IO; "
+             "data-URI decode includes base64 conversion. Includes failed attempts."
+             ),
+            buckets=_PROCESSING_TIME_BUCKETS,
+            labelnames=[*self.labels, "stage", "modality"])
         self.histogram_multimodal_encoder_gpu_time = Histogram(
             name=self.metric_prefix + "multimodal_encoder_gpu_time_seconds",
             documentation=
@@ -809,16 +819,22 @@ class MetricsCollector:
 
     def log_input_processing(
         self,
-        stage: Literal["media_load", "chat_template", "processor"],
+        stage: str,
         duration_seconds: float,
-        queue_seconds: float | None = None,
+        modality: str | None = None,
     ) -> None:
-        """Observe an input stage; processor execution excludes queue time."""
-        self.histogram_input_processing.labels(
-            **self.labels, stage=stage).observe(duration_seconds)
-        if queue_seconds is not None:
+        """Observe the same input-stage sample stored in the request record."""
+        if modality is not None:
+            self.histogram_media_processing.labels(**self.labels,
+                                                   stage=stage,
+                                                   modality=modality).observe(
+                                                       duration_seconds)
+        elif stage == "processor_queue":
             self._log_histogram(self.histogram_input_processing_queue,
-                                queue_seconds)
+                                duration_seconds)
+        else:
+            self.histogram_input_processing.labels(
+                **self.labels, stage=stage).observe(duration_seconds)
 
     def log_iteration_stats(self, iteration_stats: dict) -> None:
         """Log iteration-level statistics from TRTLLM engine.
