@@ -2584,6 +2584,8 @@ class Qwen2_5VLInputProcessorBase(Qwen2VLInputProcessorBase):
     ))
 class Qwen2_5_VLModel(Qwen2VLModelBase):
 
+    supports_encoder_tensor_parallel = True
+
     def __init__(self, model_config: ModelConfig[PretrainedConfig], *args,
                  **kwargs):
         kwargs['vision_model_class'] = Qwen2_5_VisionModel

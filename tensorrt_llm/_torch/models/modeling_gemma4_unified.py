@@ -225,6 +225,8 @@ class Gemma4UnifiedInputProcessor(Gemma4InputProcessor):
 class Gemma4UnifiedForConditionalGeneration(Gemma4MultimodalModelBase):
     """Gemma 4 12B Unified model with encoder-free multimodal projections."""
 
+    supports_encoder_tensor_parallel = False
+
     def __init__(self, model_config: ModelConfig):
         config = model_config.pretrained_config
         if config.image_token_id is None:

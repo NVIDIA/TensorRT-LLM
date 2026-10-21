@@ -64,6 +64,7 @@ from .multimodal_encoder_data_parallel import (
     EncoderDpItem,
     encoder_dp_error_guard,
     execute_encoder_dp_items,
+    iter_encoder_rank_inputs,
 )
 
 
@@ -345,57 +346,48 @@ def _encoder_data_parallel_size(model_config: ModelConfig) -> int:
     multimodal_config = model_config.multimodal_config
     if multimodal_config is None:
         return 1
-    return multimodal_config.encoder_data_parallel_size
+    return multimodal_config.encoder_data_parallel_size or 1
 
 
 def make_multimodal_encoder_model_config(model_config: ModelConfig) -> ModelConfig:
-    """Copy ``model_config`` and replicate encoder weights when MM DP is active.
+    """Resolve encoder TP/DP independently of the language model mapping.
 
-    Attention DP already distributes requests between ranks. Explicit encoder
-    data parallelism distributes encoder items over the ordinary TP group.
-    Both modes need an unsharded encoder on every participating rank, while the
-    language model keeps the original mapping.
+    An omitted encoder setting preserves existing model-specific behavior.
+    Explicit DP divides the LLM TP group into encoder TP subgroups. The copied
+    config shares the engine's module registry with the language model.
     """
-    # Encoder submodules register with the execution engine's shared registry.
     encoder_config = copy.deepcopy(
         model_config, {id(model_config.extra_attrs): model_config.extra_attrs}
     )
-    mapping = model_config.mapping
-    encoder_dp_size = _encoder_data_parallel_size(model_config)
-
-    if mapping.enable_attention_dp and encoder_dp_size > 1:
-        raise ValueError(
-            "Explicit multimodal encoder data parallelism cannot be combined "
-            "with attention data parallelism. Hierarchical encoder DP is not supported."
-        )
-
-    replicate_encoder = mapping.enable_attention_dp or encoder_dp_size > 1
-    if not replicate_encoder:
+    mm_config = model_config.multimodal_config
+    if mm_config is None or mm_config.encoder_data_parallel_size is None:
         return encoder_config
 
-    if encoder_dp_size > 1 and (mapping.pp_size != 1 or mapping.cp_size != 1):
+    mapping = model_config.mapping
+    encoder_dp_size = mm_config.encoder_data_parallel_size
+    if mapping.pp_size != 1 or mapping.cp_size != 1:
         raise NotImplementedError(
-            "Multimodal encoder data parallelism currently requires pipeline "
+            "Explicit multimodal encoder parallelism requires pipeline "
             "parallel size 1 and context parallel size 1."
         )
-    if encoder_dp_size > 1 and encoder_dp_size != mapping.tp_size:
+    if mapping.tp_size % encoder_dp_size:
         raise ValueError(
-            "multimodal_config.encoder_data_parallel_size must equal the tensor "
+            "multimodal_config.encoder_data_parallel_size must divide the tensor "
             f"parallel size ({mapping.tp_size}), got {encoder_dp_size}."
         )
 
-    # Keep the process rank (and therefore local_rank) while making every TP
-    # group a singleton. pp_size is used only to satisfy Mapping's world-size
-    # invariant; multimodal encoders do not pipeline-partition their layers.
-    replicated_mapping = Mapping(
+    encoder_tp_size = mapping.tp_size // encoder_dp_size
+    # pp_size only satisfies Mapping's world-size invariant. The encoder does
+    # not pipeline-partition layers; contiguous TP subgroups are its replicas.
+    encoder_mapping = Mapping(
         world_size=mapping.world_size,
         rank=mapping.rank,
         gpus_per_node=mapping.gpus_per_node,
-        tp_size=1,
-        pp_size=mapping.world_size,
+        tp_size=encoder_tp_size,
+        pp_size=mapping.world_size // encoder_tp_size,
     )
     encoder_config._frozen = False
-    encoder_config.mapping = replicated_mapping
+    encoder_config.mapping = encoder_mapping
     encoder_config._frozen = model_config._frozen
     return encoder_config
 
@@ -534,6 +526,9 @@ class MultimodalModelMixin:
 
     supports_encoder_data_parallel: ClassVar[bool] = False
     """Whether the model constructs a replicated encoder for encoder DP."""
+
+    supports_encoder_tensor_parallel: ClassVar[bool] = False
+    """Whether explicit encoder mappings can shard the model's encoder weights."""
 
     supports_mm_encoder_item_scheduling: ClassVar[bool] = False
     """Whether the model supports item-level MM encoder scheduling: it implements the item-encode
@@ -705,6 +700,28 @@ class MultimodalModelMixin:
             One encoder output tensor **per item** (not per input tuple). Each tensor has the
             declared embedding row count and retains scheduler input order.
         """
+        if not self.encoder_collective_required:
+            return self._forward_multimodal_encoder_items_local(encoder_inputs)
+
+        outputs: list[torch.Tensor] = []
+        mapping = self.model_config.mapping
+        # Visit one owner's bounded batch at a time. Cache state and returned
+        # embeddings remain on the rank that owns the original requests.
+        for owner, shared_inputs in iter_encoder_rank_inputs(
+            encoder_inputs,
+            mapping=mapping,
+            any_rank_failed=self._any_encoder_dp_rank_failed,
+        ):
+            with encoder_dp_error_guard(self._any_encoder_dp_rank_failed):
+                shared_outputs = self._forward_multimodal_encoder_items_local(shared_inputs)
+            if owner == mapping.tp_rank:
+                outputs = shared_outputs
+        return outputs
+
+    def _forward_multimodal_encoder_items_local(
+        self,
+        encoder_inputs: Sequence[tuple[MultimodalParams, list[int], str]],
+    ) -> list[torch.Tensor]:
         outputs: list[torch.Tensor] = []
         group_params: list[MultimodalParams] = []
         group_lengths: list[int] = []
@@ -765,16 +782,42 @@ class MultimodalModelMixin:
         return _encoder_data_parallel_size(self.model_config)
 
     @property
+    def encoder_collective_required(self) -> bool:
+        """Whether rank-local ADP requests must rendezvous for encoder TP."""
+        model_config = getattr(self, "model_config", None)
+        if model_config is None:
+            return False
+        mapping = model_config.mapping
+        mm_config = model_config.multimodal_config
+        return (
+            mapping.enable_attention_dp
+            and mm_config is not None
+            and mm_config.encoder_data_parallel_size is not None
+            and mm_config.encoder_data_parallel_size < mapping.tp_size
+        )
+
+    @property
     def encoder_data_parallel_active(self) -> bool:
-        """Whether encoder items are distributed over the model's TP group."""
+        """Whether an encoder call distributes items between replicas."""
         mapping = self.model_config.mapping
-        encoder_dp_size = self.encoder_data_parallel_size
-        return not mapping.enable_attention_dp and encoder_dp_size > 1
+        size = self.encoder_data_parallel_size
+        # Fully replicated ADP encoders consume only their owner's requests.
+        return size > 1 and (not mapping.enable_attention_dp or size < mapping.tp_size)
 
     def _allgather_encoder_dp_output(
         self, tensor: torch.Tensor, row_counts: list[int]
     ) -> torch.Tensor:
-        return allgather(tensor, self.model_config.mapping, dim=0, sizes=row_counts)
+        mapping = self.model_config.mapping
+        tp_size = mapping.tp_size // self.encoder_data_parallel_size
+        if tp_size > 1:
+            # Encoder TP ranks hold identical outputs. Send one copy per DP
+            # replica rather than multiplying the gathered output by TP size.
+            if mapping.tp_rank % tp_size:
+                tensor = tensor[:0]
+            row_counts = [
+                rows if rank % tp_size == 0 else 0 for rows in row_counts for rank in range(tp_size)
+            ]
+        return allgather(tensor, mapping, dim=0, sizes=row_counts)
 
     def _any_encoder_dp_rank_failed(self, local_failed: bool) -> bool:
         """Exchange CPU status without waiting for queued encoder CUDA work."""
@@ -862,10 +905,7 @@ class MultimodalModelMixin:
             return self.encode_multimodal_inputs(params, **encoder_kwargs)
         mapping = model_config.mapping
 
-        # Attention DP has already routed different requests to each rank.
-        # Its encoder weights are replicated, so no inner partition or gather
-        # is needed here.
-        if mapping.enable_attention_dp or not self.encoder_data_parallel_active:
+        if not self.encoder_data_parallel_active:
             return self.encode_multimodal_inputs(params, **encoder_kwargs)
 
         encoder_dp_inputs = self._build_encoder_dp_items(params)
@@ -887,8 +927,8 @@ class MultimodalModelMixin:
             embedding_weight = self.text_embedding_layer.weight
             return execute_encoder_dp_items(
                 items,
-                rank=mapping.tp_rank,
-                num_ranks=mapping.tp_size,
+                rank=mapping.tp_rank // (mapping.tp_size // self.encoder_data_parallel_size),
+                num_ranks=self.encoder_data_parallel_size,
                 prepare_local_inputs=prepare_local_inputs,
                 encode_local_inputs=encode_local_inputs,
                 any_rank_failed=self._any_encoder_dp_rank_failed,

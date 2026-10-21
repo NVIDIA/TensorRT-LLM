@@ -787,6 +787,7 @@ class Mistral3VLM(MultimodalModelMixin, PreTrainedModel):
     """
 
     supports_encoder_data_parallel = True
+    supports_encoder_tensor_parallel = True
     supports_encoder_cache = True
     supports_mm_encoder_item_scheduling = True
 

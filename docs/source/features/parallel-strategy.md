@@ -82,6 +82,47 @@ EOF
 
 then set `--config parallel_config.yaml` in `trtllm-serve` or `trtllm-bench`.
 
+### Multimodal encoders
+
+`multimodal_config.encoder_data_parallel_size` controls encoder parallelism
+independently of LLM attention parallelism. Omitting it (or setting it to
+`null`) preserves the model's existing encoder mapping. It does not turn on
+encoder weight replication when LLM attention DP is enabled.
+
+An explicit value divides the LLM TP group into that many encoder replicas.
+Each replica uses `tensor_parallel_size / encoder_data_parallel_size` TP ranks.
+The value must divide `tensor_parallel_size`; PP and CP must both be 1.
+For example, on two GPUs:
+
+| LLM attention | `enable_attention_dp` | `encoder_data_parallel_size` | Encoder |
+|---|---|---|---|
+| TP2 | `false` | `1` | TP2 |
+| TP2 | `false` | `2` | DP2 |
+| DP2 | `true` | `1` | TP2 |
+| DP2 | `true` | `2` | DP2 |
+
+```yaml
+tensor_parallel_size: 2
+enable_attention_dp: true
+multimodal_config:
+  encoder_data_parallel_size: 1  # Encoder TP2, with LLM attention DP2
+```
+
+With LLM TP, encoder DP distributes cache-miss items by physical encoder token
+cost and gathers their embeddings in prompt order. With LLM attention DP and a
+fully replicated encoder, each rank encodes only its own requests. With LLM
+attention DP and encoder TP, all ranks participate in a common item-encoding
+step, including ranks with only cache hits or no multimodal work. Prepared
+inputs are shared one request owner's scheduled batch at a time; CUDA payloads
+stay on the GPU, and only the owner keeps the returned embeddings in its cache.
+
+Explicit encoder TP is supported by the native Qwen2.5-VL, Qwen3-VL, Mistral3,
+Gemma4, and EXAONE 4.5 integrations. The Hugging Face Qwen2-VL and encoder-free
+Gemma4 Unified integrations support encoder DP but do not shard their front ends.
+Encoder DP currently excludes encoder-only execution, encoder CUDA graphs, and
+side-stream prefetch. Encoder TP with LLM attention DP requires item scheduling
+and also excludes encoder CUDA graphs and side-stream prefetch.
+
 ### FFN Module
 
 #### Dense Models

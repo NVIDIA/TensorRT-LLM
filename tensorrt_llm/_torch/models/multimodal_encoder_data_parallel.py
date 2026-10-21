@@ -29,6 +29,11 @@ from itertools import accumulate, pairwise
 from typing import Callable, Iterator, Sequence, TypeVar
 
 import torch
+from torch.utils._pytree import tree_flatten, tree_unflatten
+
+from tensorrt_llm._torch.distributed import Distributed, allgather
+from tensorrt_llm.inputs.multimodal import MultimodalParams
+from tensorrt_llm.mapping import Mapping
 
 
 @dataclass(frozen=True)
@@ -135,6 +140,10 @@ def plan_encoder_dp_items(
     )
 
 
+class EncoderDpError(RuntimeError):
+    """A coordinated Python failure, propagated before the next GPU collective."""
+
+
 @contextmanager
 def encoder_dp_error_guard(any_rank_failed: Callable[[bool], bool]) -> Iterator[None]:
     """Propagate rank-local Python failures before the next GPU collective.
@@ -151,8 +160,8 @@ def encoder_dp_error_guard(any_rank_failed: Callable[[bool], bool]) -> Iterator[
 
     if any_rank_failed(local_error is not None):
         if local_error is not None:
-            raise RuntimeError("Multimodal encoder data-parallel rank failed.") from local_error
-        raise RuntimeError("Multimodal encoder data-parallel peer rank failed.")
+            raise EncoderDpError("Multimodal encoder data-parallel rank failed.") from local_error
+        raise EncoderDpError("Multimodal encoder data-parallel peer rank failed.")
 
 
 _LocalInputsT = TypeVar("_LocalInputsT")
@@ -222,3 +231,69 @@ def execute_encoder_dp_items(
         ordered_outputs.append(gathered[row_start:row_end])
         rank_row_starts[placement.rank] = row_end
     return torch.cat(ordered_outputs, dim=0)
+
+
+def iter_encoder_rank_inputs(
+    encoder_inputs: Sequence[tuple[MultimodalParams, list[int], str]],
+    *,
+    mapping: Mapping,
+    any_rank_failed: Callable[[bool], bool],
+) -> Iterator[tuple[int, list[tuple[MultimodalParams, list[int], str]]]]:
+    """Share one ADP owner's prepared encoder batch at a time for encoder TP.
+
+    Only CPU descriptors and metadata use object collectives. CUDA tensor
+    payloads stay on the GPU and use the existing variable-size allgather.
+    Processing owners in order bounds temporary GPU storage by one owner's
+    encoder budget, rather than the sum of all ranks' budgets.
+    """
+    with encoder_dp_error_guard(any_rank_failed):
+        leaves, spec = tree_flatten(
+            [
+                (param.multimodal_data, param.mm_item_order, lengths, modality)
+                for param, lengths, modality in encoder_inputs
+            ]
+        )
+        gpu_leaves: dict[torch.dtype, list[tuple[int, torch.Tensor]]] = {}
+        descriptors = []
+        for index, leaf in enumerate(leaves):
+            if isinstance(leaf, torch.Tensor) and leaf.is_cuda:
+                gpu_leaves.setdefault(leaf.dtype, []).append((index, leaf))
+                descriptors.append((index, tuple(leaf.shape), leaf.dtype))
+                leaves[index] = None
+    rank_metadata = Distributed.get(mapping).tp_allgather((leaves, spec, descriptors))
+
+    for owner, (owner_leaves, owner_spec, owner_descriptors) in enumerate(rank_metadata):
+        if not owner_descriptors and not tree_unflatten(owner_leaves, owner_spec):
+            continue
+        shared_leaves = list(owner_leaves)
+        by_dtype: dict[torch.dtype, list[tuple[int, tuple[int, ...]]]] = {}
+        for index, shape, dtype in owner_descriptors:
+            by_dtype.setdefault(dtype, []).append((index, shape))
+        for dtype, entries in by_dtype.items():
+            with encoder_dp_error_guard(any_rank_failed):
+                total_elements = sum(torch.Size(shape).numel() for _, shape in entries)
+                if mapping.tp_rank == owner:
+                    payload = torch.cat([tensor.reshape(-1) for _, tensor in gpu_leaves[dtype]])
+                else:
+                    payload = torch.empty(0, dtype=dtype, device="cuda")
+            if total_elements:
+                payload = allgather(
+                    payload,
+                    mapping,
+                    dim=0,
+                    sizes=[
+                        total_elements if rank == owner else 0 for rank in range(mapping.tp_size)
+                    ],
+                )
+            offset = 0
+            for index, shape in entries:
+                numel = torch.Size(shape).numel()
+                shared_leaves[index] = payload[offset : offset + numel].view(shape)
+                offset += numel
+        yield (
+            owner,
+            [
+                (MultimodalParams(multimodal_data=data, mm_item_order=order), lengths, modality)
+                for data, order, lengths, modality in tree_unflatten(shared_leaves, owner_spec)
+            ],
+        )

@@ -151,7 +151,7 @@ class DataParallelEncoderMultimodalModel(DummyMultimodalModel):
                 enable_attention_dp=enable_attention_dp,
             ),
             multimodal_config=MultimodalConfig(
-                encoder_data_parallel_size=1 if enable_attention_dp else 2,
+                encoder_data_parallel_size=2,
                 encoder_cache_max_bytes=0,
             ),
         )
@@ -298,32 +298,45 @@ def test_make_multimodal_encoder_model_config_replicates_encoder_mapping(world_s
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("pp_size", [1, 2])
-def test_attention_dp_replicates_encoder_mapping_without_explicit_encoder_dp(pp_size):
+@pytest.mark.parametrize("enable_attention_dp", [False, True])
+def test_default_encoder_config_preserves_mapping(pp_size, enable_attention_dp):
     model_config = ModelConfig(
         mapping=Mapping(
             world_size=2 * pp_size,
             rank=0,
             tp_size=2,
             pp_size=pp_size,
-            enable_attention_dp=True,
+            enable_attention_dp=enable_attention_dp,
         ),
         multimodal_config=MultimodalConfig(),
     )
 
     encoder_config = make_multimodal_encoder_model_config(model_config)
 
-    assert model_config.mapping.enable_attention_dp
-    assert encoder_config.mapping.tp_size == 1
+    assert encoder_config.mapping.tp_size == model_config.mapping.tp_size
+    assert encoder_config.mapping.pp_size == model_config.mapping.pp_size
+    assert encoder_config.mapping.enable_attention_dp == enable_attention_dp
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("attention_dp", [False, True])
+@pytest.mark.parametrize("encoder_dp", [1, 2, 4])
+def test_explicit_encoder_mapping_is_independent_of_llm_attention_dp(attention_dp, encoder_dp):
+    model_config = ModelConfig(
+        mapping=Mapping(world_size=4, rank=3, tp_size=4, enable_attention_dp=attention_dp),
+        multimodal_config=MultimodalConfig(encoder_data_parallel_size=encoder_dp),
+    )
+    encoder_config = make_multimodal_encoder_model_config(model_config)
+    assert encoder_config.mapping.tp_size == 4 // encoder_dp
+    assert encoder_config.mapping.tp_group == list(range(4 - 4 // encoder_dp, 4))
     assert not encoder_config.mapping.enable_attention_dp
+    assert model_config.mapping.enable_attention_dp == attention_dp
+    assert model_config.mapping.tp_size == 4
 
 
 @pytest.mark.parametrize(
     "mapping,error_match",
     [
-        (
-            Mapping(world_size=2, rank=0, tp_size=2, enable_attention_dp=True),
-            "cannot be combined with attention data parallelism",
-        ),
         (
             Mapping(world_size=4, rank=0, tp_size=2, pp_size=2),
             "requires pipeline parallel size 1 and context parallel size 1",
@@ -333,11 +346,11 @@ def test_attention_dp_replicates_encoder_mapping_without_explicit_encoder_dp(pp_
             "requires pipeline parallel size 1 and context parallel size 1",
         ),
         (
-            Mapping(world_size=4, rank=0, tp_size=4),
-            "must equal the tensor parallel size",
+            Mapping(world_size=3, rank=0, tp_size=3),
+            "must divide the tensor parallel size",
         ),
     ],
-    ids=["attention_dp", "pipeline_parallel", "context_parallel", "partial_tp_group"],
+    ids=["pipeline_parallel", "context_parallel", "non_divisor"],
 )
 @pytest.mark.cpu_only
 def test_encoder_data_parallel_rejects_unsupported_parallelism(mapping, error_match):
@@ -489,6 +502,26 @@ def test_encoder_data_parallel_checks_model_opt_in_before_construction():
         patch.object(AutoModelForCausalLM, "from_config") as constructor,
     ):
         with pytest.raises(NotImplementedError, match="does not support"):
+            object.__new__(ModelLoader).load("unused", None)
+        constructor.assert_not_called()
+
+
+@pytest.mark.cpu_only
+def test_encoder_tp_checks_model_opt_in_before_construction():
+    config = ModelConfig(
+        mapping=Mapping(world_size=2, rank=0, tp_size=2, enable_attention_dp=True),
+        multimodal_config=MultimodalConfig(encoder_data_parallel_size=1),
+    )
+    with (
+        patch.object(
+            AutoModelForCausalLM, "_resolve_class", return_value=DataParallelEncoderMultimodalModel
+        ),
+        patch.object(ModelLoader, "_load_and_validate_config", return_value=config),
+        patch.object(AutoModelForCausalLM, "from_config") as constructor,
+    ):
+        with pytest.raises(
+            NotImplementedError, match="does not support multimodal encoder tensor parallelism"
+        ):
             object.__new__(ModelLoader).load("unused", None)
         constructor.assert_not_called()
 
