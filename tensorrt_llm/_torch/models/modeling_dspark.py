@@ -108,6 +108,7 @@ from ..modules.mhc.hyper_connection import HCHead
 from ..modules.rms_norm import RMSNorm
 from ..pyexecutor.config_utils import is_mla
 from ..speculative.interface import SpeculativeDecodingMode
+from ..speculative.vocab_parallel import markov_chain_logits
 from ..utils import AuxStreamType
 from .modeling_deepseekv4 import (
     DeepseekV4DecoderLayer,
@@ -123,7 +124,6 @@ from .modeling_speculative import (
     DSparkConfidenceHead,
     SpecDecOneEngineForCausalLM,
     build_markov_head,
-    dspark_markov_chain_logits,
 )
 from .modeling_utils import DecoderModel, register_auto_model, register_draft_model
 
@@ -2652,23 +2652,20 @@ class _DSparkHeadMixin:
         self,
         base_logits: torch.Tensor,
         first_prev_tokens: torch.Tensor,
-        argmax_fn=None,
-        vocab_slice: Optional[slice] = None,
+        tp_exchange=None,
     ) -> torch.Tensor:
-        """Apply the vanilla-Markov intra-block bias to block logits.
+        """Apply the vanilla-Markov intra-block bias to float32 block logits.
 
         No-op (returns ``base_logits`` unchanged) when the checkpoint ships no
-        Markov head. See :func:`dspark_markov_chain` for the semantics; when
-        ``base_logits`` is a TP vocab shard the caller must pass this rank's
-        ``vocab_slice`` (to shard the markov_w2 rows identically) and an
-        ``argmax_fn`` returning full-vocab token ids -- ``DFlashWorker`` handles
-        both.
+        Markov head. See :func:`dspark_markov_chain` for the semantics and
+        :func:`markov_chain_logits` for the arguments: ``base_logits`` is the
+        full vocab, or this rank's vocab shard with the TP group's
+        ``tp_exchange`` -- ``DSparkWorker`` handles both.
         """
         if not self.has_markov_head:
             return base_logits
-        markov_w2 = self.markov_w2 if vocab_slice is None else self.markov_w2[vocab_slice]
-        return dspark_markov_chain_logits(
-            base_logits, first_prev_tokens, self.markov_w1, markov_w2, argmax_fn=argmax_fn
+        return markov_chain_logits(
+            base_logits, first_prev_tokens, self.markov_w1, self.markov_w2, tp_exchange
         )
 
     def _take_dspark_head_weights(self, weights: Dict) -> tuple[Dict, Dict]:

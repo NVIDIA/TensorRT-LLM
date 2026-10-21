@@ -31,6 +31,7 @@ from types import SimpleNamespace
 import cloudpickle
 import pytest
 import torch
+from _torch.helpers import dspark_markov_chain_logits_reference
 from mpi4py import MPI
 
 import tensorrt_llm
@@ -208,9 +209,7 @@ def _sample_check(rank, tp, mnnvl):
 
 
 def _markov_reference(full, anchors, w1, w2):
-    from tensorrt_llm._torch.models.modeling_speculative import dspark_markov_chain_logits
-
-    biased = dspark_markov_chain_logits(full.float(), anchors, w1, w2)
+    biased = dspark_markov_chain_logits_reference(full.float(), anchors, w1, w2)
     return torch.argmax(biased, dim=-1).to(torch.int32)
 
 
@@ -229,6 +228,24 @@ def _markov_check(rank, tp, mnnvl):
             anchors[0] = -1  # out-of-vocab anchor: zero bias
         expected = _markov_reference(full, anchors, w1, w2)
         assert torch.equal(head.markov_tokens(_shard(full, rank), anchors, w1, w2), expected)
+    # The biased shard logits of a vocab-sharded draft head.
+    from tensorrt_llm._torch.distributed import AllReduceStrategy
+    from tensorrt_llm._torch.speculative.vocab_parallel import markov_chain_logits, tp_pair_exchange
+
+    def global_argmax(step_logits):
+        gathered = MPI.COMM_WORLD.allgather(step_logits.cpu())
+        return torch.cat(gathered, dim=-1).argmax(dim=-1).cuda()
+
+    exchange = tp_pair_exchange(head.lm_head.mapping, AllReduceStrategy.NCCL)
+    full = torch.randn(6, 7, vocab, device="cuda", generator=gen) * 3
+    anchors = torch.randint(0, vocab, (6,), device="cuda", generator=gen)
+    local = _shard(full, rank)
+    biased = markov_chain_logits(local, anchors, w1, w2, exchange)
+    # The eager chain on the shard: this rank's markov_w2 rows, global argmax.
+    expected = dspark_markov_chain_logits_reference(
+        local, anchors, w1, w2[rank * SHARD : (rank + 1) * SHARD], argmax_fn=global_argmax
+    )
+    assert torch.equal(biased.view(torch.int32), expected.view(torch.int32))
     # Quantized logits and a zero bias make many cross-shard ties.
     full = torch.randint(0, 3, (16, 6, vocab), device="cuda", generator=gen).to(torch.bfloat16)
     anchors = torch.randint(0, vocab, (16,), device="cuda", generator=gen)

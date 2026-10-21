@@ -273,31 +273,6 @@ def dspark_markov_chain(
     return torch.stack(sampled, dim=1), torch.cat(corrected, dim=1)
 
 
-def dspark_markov_chain_logits(base_logits: torch.Tensor,
-                               first_prev_tokens: torch.Tensor,
-                               markov_w1: torch.Tensor,
-                               markov_w2: torch.Tensor,
-                               argmax_fn=None) -> torch.Tensor:
-    """Raw-tensor entry to :func:`dspark_markov_chain`, corrected logits only.
-
-    For drafters that keep the Markov head as plain checkpoint tensors rather
-    than a :class:`VanillaMarkov` module (the DFlash path). ``markov_w2`` may
-    already be sliced down to this rank's TP vocab shard, in which case
-    ``argmax_fn`` must map a shard-local row back to a full-vocab token id.
-    """
-
-    def _step_bias(prev_tokens, step_hidden):
-        del step_hidden
-        return dspark_markov_step_bias(prev_tokens, markov_w1, markov_w2)
-
-    _, corrected = dspark_markov_chain(base_logits,
-                                       first_prev_tokens,
-                                       _step_bias,
-                                       next_token_fn=argmax_fn,
-                                       cast_bias_to_logits=True)
-    return corrected
-
-
 class VanillaMarkov(nn.Module):
     """Low-rank token-bigram logit bias: ``bias = W2(W1[token])``."""
 
