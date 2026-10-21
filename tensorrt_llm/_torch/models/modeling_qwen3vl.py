@@ -54,6 +54,7 @@ from .modeling_auto import AutoModelForCausalLM
 from .modeling_multimodal_encoder import MultimodalEncoderMixin, prepare_encoder_attn_metadata
 from .modeling_multimodal_mixin import (
     EncoderGroup,
+    EncoderParallelMode,
     MultimodalModelMixin,
     PreparedLlmInputs,
     encode_multimodal_by_groups,
@@ -1426,9 +1427,13 @@ class Qwen3VisionModelBase(nn.Module):
 
 
 class Qwen3VLModelBase(MultimodalModelMixin, PreTrainedModel):
-    supports_encoder_data_parallel = True
-    supports_encoder_tensor_parallel = True
     supports_mm_encoder_item_scheduling = True
+
+    @classmethod
+    def get_multimodal_encoder_parallel_modes(
+        cls, model_config: ModelConfig
+    ) -> dict[str, frozenset[EncoderParallelMode]]:
+        return {"vision": frozenset({"tp", "dp"})}
 
     def get_multimodal_item_partitions(
         self,

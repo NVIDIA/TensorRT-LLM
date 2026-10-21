@@ -24,7 +24,7 @@ from ...sampling_params import SamplingParams
 from ..attention.backends import AttentionMetadata
 from .checkpoints.hf.exaone4_5_weight_mapper import Exaone4_5HfWeightMapper
 from .modeling_auto import AutoModelForCausalLM
-from .modeling_multimodal_mixin import make_multimodal_encoder_model_config
+from .modeling_multimodal_mixin import EncoderParallelMode, make_multimodal_encoder_model_config
 from .modeling_multimodal_utils import (
     find_input_mm_embeds,
     fuse_input_embeds,
@@ -193,7 +193,11 @@ class Exaone4_5_VisionModel(Qwen2VisionModelBase):
     ),
 )
 class Exaone4_5_ForConditionalGeneration(Qwen2VLModelBase):
-    supports_encoder_tensor_parallel = True
+    @classmethod
+    def get_multimodal_encoder_parallel_modes(
+        cls, model_config: ModelConfig
+    ) -> dict[str, frozenset[EncoderParallelMode]]:
+        return {"vision": frozenset({"tp", "dp"})}
 
     def __init__(
         self,
