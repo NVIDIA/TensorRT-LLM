@@ -253,6 +253,14 @@ def test_ultra_bf16_tp8ep2_near_misses_do_not_match(mapping_kwargs, missed):
     _refused(config, missed)
 
 
-def test_ultra_bf16_tp8ep2_refuses_an_fp8_kv_cache():
+@pytest.mark.parametrize("mode", ["auto", "require"])
+def test_ultra_bf16_tp8ep2_matches_over_an_fp8_kv_cache(mode):
+    """tp8ep2 binds an fp8-e4m3 pool at unit scales; tep8 does not (see above)."""
     config = _model_config(_ultra_bf16_config(), **_TP8EP2)
-    _refused(config, "KV cache", kv_cache_config=_kv(dtype="fp8"))
+    resolved = modeling_v2_resolve(config, _llm_args(mode, kv_cache_config=_kv(dtype="fp8")))
+    assert _qualified(resolved) == _ULTRA_BF16_TP8EP2_TARGET
+
+
+def test_ultra_bf16_tp8ep2_refuses_an_nvfp4_kv_cache():
+    config = _model_config(_ultra_bf16_config(), **_TP8EP2)
+    _refused(config, "KV cache", kv_cache_config=_kv(dtype="nvfp4"))

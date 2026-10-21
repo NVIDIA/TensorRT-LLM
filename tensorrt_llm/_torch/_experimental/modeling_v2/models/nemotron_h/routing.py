@@ -19,6 +19,8 @@ from typing import TYPE_CHECKING, Any, Optional, Tuple
 
 import torch
 
+from tensorrt_llm.quantization.mode import QuantAlgo
+
 from ..._router_index import NoTarget, engine_kv_cache_quant_algo, routes
 
 if TYPE_CHECKING:
@@ -53,7 +55,8 @@ _BF16_TP8EP2 = (8, False, 4, 2)
 # The KV cache algorithms each BF16 layout was gated with (None: the checkpoint's bf16).
 _BF16_KV_ALGOS = {
     _BF16_TEP8: (None,),
-    _BF16_TP8EP2: (None,),
+    # tp8ep2 also binds an fp8-e4m3 pool at unit kv scales (`kv_cache_config.dtype: fp8`).
+    _BF16_TP8EP2: (None, QuantAlgo.FP8),
 }
 
 # The MoE backends the targets stand for: they run their own fused_moe, so a

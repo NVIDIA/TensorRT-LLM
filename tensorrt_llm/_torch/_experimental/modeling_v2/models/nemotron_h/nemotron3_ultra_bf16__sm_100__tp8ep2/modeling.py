@@ -41,6 +41,7 @@ from transformers import PretrainedConfig
 
 from tensorrt_llm._torch._experimental.modeling_v2._router_index import step_contract_enabled
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.thop_attention import (
+    QM_FP8_KV_CACHE,
     thop_attention,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm.allreduce import (
@@ -145,10 +146,9 @@ _CALL_CONSTANTS = dict(
     is_mla_enable=False,
     mask_type=1,
     q_scaling=1.0,
-    # bf16 KV cache: no quantization of Q, K, V or the cache, so no scale tensors.
-    quant_mode=0,
-    kv_scale_orig_quant=None,
-    kv_scale_quant_orig=None,
+    # quant_mode and the kv scales come from the bound pool (`_Bound`): quant_mode 0 and no
+    # scales over a bf16 pool; QM_FP8_KV_CACHE and one fp32 [1] tensor of ones as both scales
+    # over an fp8-e4m3 pool, which runs at unit kv scales.
     attention_sinks=None,
     # No positional encoding: in-kernel RoPE is disabled; the rope_* values below are
     # inert placeholders.
@@ -237,6 +237,8 @@ class _Bound(NamedTuple):
     pool_row: dict
     conv: dict
     ssm: dict
+    kv_quant_mode: int
+    kv_scale: "torch.Tensor | None"
 
 
 def _layer_views(core) -> list:
@@ -354,6 +356,9 @@ class NemotronUltraBf16Tp8ep2ModelingV2(DecoderModel):
                 )
             )
         # Whether kernels that take the choice launch as programmatic dependents.
+        # Both kv scales of an fp8 pool: unit, as the checkpoint family declares them.
+        self.kv_unit_scale = torch.ones(1, dtype=torch.float32, device="cuda")
+
         self.pdl = get_env_enable_pdl()
         # The shared expert runs on this stream beside the routed experts.
         self.side_stream = torch.cuda.Stream()
@@ -412,11 +417,15 @@ class NemotronUltraBf16Tp8ep2ModelingV2(DecoderModel):
             f"[slots, {d.heads_r}, {d.head_dim_ssm}, {d.ssm_state}]"
         )
         # The pools hold what the runtime was configured with, not what this target was gated on:
-        # `kv_cache_config.dtype` or `mamba_ssm_cache_dtype` can change them, and the kernels
-        # would read and write bf16 KV (no scales, quant_mode 0) and an fp32 SSM state regardless.
-        assert getattr(cm, "dtype", DataType.BF16) == DataType.BF16, (
-            f"KV cache dtype {cm.dtype}: this target reads and writes a bf16 KV cache"
+        # `kv_cache_config.dtype` picks the KV pool -- bf16, or fp8-e4m3 at unit scales (what the
+        # NVFP4 checkpoint declares; GSM8K at parity) -- and the attention calls follow it;
+        # `mamba_ssm_cache_dtype` can change the SSM state, which the kernels read as fp32 only.
+        kv_dtype = getattr(cm, "dtype", DataType.BF16)
+        assert kv_dtype in (DataType.BF16, DataType.FP8), (
+            f"KV cache dtype {kv_dtype}: this target reads and writes a bf16 or fp8 KV cache"
         )
+        kv_quant_mode = QM_FP8_KV_CACHE if kv_dtype == DataType.FP8 else 0
+        kv_scale = self.kv_unit_scale if kv_dtype == DataType.FP8 else None
         assert c0.dtype == torch.bfloat16 and s0.dtype == torch.float32, (
             f"conv state {c0.dtype} / ssm state {s0.dtype}: this target needs bf16 / fp32"
         )
@@ -431,7 +440,7 @@ class NemotronUltraBf16Tp8ep2ModelingV2(DecoderModel):
         assert md.effective_beam_width == 1, "beam search is not implemented"
         assert md.cache_indirection is None, "beam search is not implemented"
         assert not md.is_cross, "cross attention is not implemented"
-        self._bound = _Bound(cm, pool_row, conv, ssm)
+        self._bound = _Bound(cm, pool_row, conv, ssm, kv_quant_mode, kv_scale)
 
     def _select_target(self, attn_metadata) -> "PrefillTarget | DecodeTarget":
         """One host-side integer read: a mixed batch goes to prefill, so prefill is the
@@ -663,6 +672,9 @@ class PrefillTarget:
                     num_kv_heads=1,
                     head_size=d.head_dim,
                     attention_window_size=window,
+                    quant_mode=bound.kv_quant_mode,
+                    kv_scale_orig_quant=bound.kv_scale,
+                    kv_scale_quant_orig=bound.kv_scale,
                     **step,
                     **_CALL_CONSTANTS,
                 )
@@ -893,6 +905,9 @@ class DecodeTarget:
                     num_kv_heads=1,
                     head_size=d.head_dim,
                     attention_window_size=window,
+                    quant_mode=bound.kv_quant_mode,
+                    kv_scale_orig_quant=bound.kv_scale,
+                    kv_scale_quant_orig=bound.kv_scale,
                     **step,
                     **_CALL_CONSTANTS,
                 )
