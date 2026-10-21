@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import os
 from dataclasses import dataclass, field
 from unittest import TestCase
@@ -66,6 +69,44 @@ def test_python_agent_accepts_topology_without_forwarding_it_to_nixl():
 
     agent_config.assert_called_once_with(enable_prog_thread=False, backends=["UCX"], num_threads=3)
     nixl_agent.assert_called_once_with("testAgent", agent_config.return_value)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("outcome", [True, False, RuntimeError("metadata lookup failed")])
+def test_python_check_remote_descs(
+    outcome: bool | RuntimeError,
+) -> None:
+    agent_py = pytest.importorskip(_AGENT_PY_MODULE, exc_type=ImportError)
+    with patch.object(agent_py, "nixl_agent_config"), patch.object(agent_py, "nixl_agent"):
+        agent = agent_py.NixlTransferAgent("testAgent")
+    backend = agent.agent
+    memory_descs = Mock(descs=[(1024, 64, 0)], type="VRAM")
+    converted = backend.get_xfer_descs.return_value
+    if isinstance(outcome, Exception):
+        backend.check_remote_metadata.side_effect = outcome
+    else:
+        backend.check_remote_metadata.return_value = outcome
+
+    if isinstance(outcome, Exception):
+        with pytest.raises(RuntimeError):
+            agent.check_remote_descs("peer", memory_descs)
+    else:
+        assert agent.check_remote_descs("peer", memory_descs) is outcome
+    backend.get_xfer_descs.assert_called_once_with(memory_descs.descs, "VRAM")
+    backend.check_remote_metadata.assert_called_once_with("peer", converted)
+    backend.initialize_xfer.assert_not_called()
+    backend.transfer.assert_not_called()
+
+
+@pytest.mark.cpu_only
+def test_python_check_remote_descs_rejects_failed_conversion() -> None:
+    agent_py = pytest.importorskip(_AGENT_PY_MODULE, exc_type=ImportError)
+    with patch.object(agent_py, "nixl_agent_config"), patch.object(agent_py, "nixl_agent"):
+        agent = agent_py.NixlTransferAgent("testAgent")
+    agent.agent.get_xfer_descs.return_value = None
+    with pytest.raises(RuntimeError, match="returned None"):
+        agent.check_remote_descs("peer", Mock(descs=[(1024, 64, 0)], type="VRAM"))
+    agent.agent.check_remote_metadata.assert_not_called()
 
 
 def _convert_to_memory_descs(reg_descs: RegMemoryDescs) -> MemoryDescs:

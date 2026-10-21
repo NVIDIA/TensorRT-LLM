@@ -782,6 +782,18 @@ class Sender(SenderBase):
         peer_rank: int,
         request: TransferRequest,
     ) -> tuple[bool, Optional[str]]:
+        try:
+            # This query cannot submit a transfer. Reject before acquiring backend ownership.
+            if request.op == TransferOp.WRITE and not self._agent.check_remote_descs(
+                request.remote_name, request.dst_descs
+            ):
+                raise RuntimeError("NIXL WRITE remote descriptors unavailable")
+        except Exception as error:
+            if self._enforce_physical_ownership:
+                task.retire_unsubmitted_physical_operation(peer_rank)
+            raise _TransferNotSubmittedError(
+                "NIXL sender rejected transfer before backend submission"
+            ) from error
         if not self._enforce_physical_ownership:
             status = self._agent.submit_transfer_requests(request)
             completed = status.wait()
@@ -1063,6 +1075,19 @@ class Sender(SenderBase):
         submitted_and_completed = False
         if write_meta.src_ptrs.size > 0:
             try:
+                # Bounce rewrites the submitted destination to its registered arena,
+                # but the receiver later scatters into these original KV addresses.
+                if write_meta.bounce_dst_base is not None:
+                    if write_meta.dst_device_id is None:
+                        raise RuntimeError("bounce destination validation requires dst_device_id")
+                    final_dst_descs = MemoryDescs.from_arrays_uniform_device(
+                        MemoryType.VRAM,
+                        write_meta.dst_ptrs,
+                        write_meta.sizes,
+                        write_meta.dst_device_id,
+                    )
+                    if not self._agent.check_remote_descs(write_meta.peer_name, final_dst_descs):
+                        raise RuntimeError("NIXL WRITE final remote descriptors unavailable")
                 request, send_slot_id = build_send_request(
                     self._bounce,
                     write_meta,
@@ -1072,12 +1097,12 @@ class Sender(SenderBase):
                 # Don't let a gather fault escape: without a result the receiver would hang and its
                 # region leak. Tell the receiver it failed and fail the local task instead.
                 logger.error(
-                    f"_deliver_kv_to_agent: failed to build the KV send request for "
+                    f"_deliver_kv_to_agent: failed to validate or build the KV send request for "
                     f"{write_meta.unique_rid} slice={write_meta.slice_id}: {e}"
                 )
                 if owned:
                     task.retire_unsubmitted_physical_operation(write_meta.peer_rank)
-                task.fail(RuntimeError(f"build_send_request failed: {e}"))
+                task.fail(RuntimeError(f"validate/build send request failed: {e}"))
                 self._get_result_dealer(write_meta.peer_endpoint, legacy_shared=True).send(
                     _make_kv_result_msg(
                         self._instance_rank,

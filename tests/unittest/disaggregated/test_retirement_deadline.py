@@ -429,7 +429,7 @@ def test_blocked_backend_cannot_delay_fatal_deadline(blocked_call: str) -> None:
     task = transfer_mod.SendTaskBase(DisaggregatedParams(disagg_request_id=4))
     task.bind_logical_outcomes(transfer_mod._LogicalOutcomes(retirement))
     assert task.begin_physical_operation(7)
-    request = object()
+    request = _write_request()
     status = Mock(wait=Mock(return_value=True), is_completed=Mock(return_value=True))
 
     def block() -> object:
@@ -444,7 +444,10 @@ def test_blocked_backend_cannot_delay_fatal_deadline(blocked_call: str) -> None:
     sender._enforce_physical_ownership = True
     sender._ownership_poisoned = None
     sender._ownership_poison_lock = watchdog.lock
-    sender._agent = Mock(submit_transfer_requests=Mock(return_value=status))
+    sender._agent = Mock(
+        submit_transfer_requests=Mock(return_value=status),
+        check_remote_descs=Mock(return_value=True),
+    )
     if blocked_call == "query":
         task.begin_backend_submission(7, request)
         task.record_backend_submission(7, status)
@@ -608,6 +611,11 @@ def _rx_session(receiver: transfer_mod.Receiver) -> transfer_mod.RxSession:
     )
 
 
+def _write_request() -> Mock:
+    """A NIXL WRITE request whose remote descriptors pass the sender preflight."""
+    return Mock(op=transfer_mod.TransferOp.WRITE, remote_name="peer")
+
+
 def _tx_session(watchdog: RetirementWatchdog, *, need_aux: bool = True) -> transfer_mod.TxSession:
     """Use real session/admission logic with only queue and backend boundary doubles."""
     sender = object.__new__(transfer_mod.Sender)
@@ -625,6 +633,7 @@ def _tx_session(watchdog: RetirementWatchdog, *, need_aux: bool = True) -> trans
     sender._peer_requests_timestamps = {}
     sender.dispatch_task = Mock()
     sender._agent = Mock()
+    sender._agent.check_remote_descs.return_value = True
     sender._agent.submit_transfer_requests.return_value.wait.return_value = True
     params = DisaggregatedParams(disagg_request_id=4)
     if need_aux:
@@ -637,7 +646,7 @@ def _tx_session(watchdog: RetirementWatchdog, *, need_aux: bool = True) -> trans
 def _submit_piece(session: transfer_mod.TxSession, task: transfer_mod.SendTaskBase) -> None:
     """Drive the real sender's submission, backend-DONE and delivery transitions."""
     assert session._sender._begin_task_operation(task, 7)
-    assert session._sender._submit_transfer(task, 7, object()) == (True, None)
+    assert session._sender._submit_transfer(task, 7, _write_request()) == (True, None)
     task.complete()
 
 
@@ -664,12 +673,12 @@ def test_idle_session_keeps_original_deadline_for_later_piece(piece: str, submit
     assert session._sender._begin_task_operation(later, 7)
     clock.return_value = submit_at
     if submit_at < 15.0:
-        assert session._sender._submit_transfer(later, 7, object()) == (True, None)
+        assert session._sender._submit_transfer(later, 7, _write_request()) == (True, None)
         later.complete()
         assert session.is_completed()
     else:
         with pytest.raises(transfer_mod._TransferNotSubmittedError):
-            session._sender._submit_transfer(later, 7, object())
+            session._sender._submit_transfer(later, 7, _write_request())
         assert (
             later._physical_operations[7].state
             is transfer_mod._PhysicalOperationState.NOT_SUBMITTED
@@ -889,7 +898,7 @@ def test_completion_at_transfer_deadline_cannot_replace_timeout() -> None:
     _submit_piece(session, session.kv_tasks[0])
     task = session.send_aux()
     assert session._sender._begin_task_operation(task, 7)
-    assert session._sender._submit_transfer(task, 7, object()) == (True, None)
+    assert session._sender._submit_transfer(task, 7, _write_request()) == (True, None)
     clock.return_value = 15.0
     task.complete()
     assert task.logical_outcome.status is SessionStatus.ERROR
@@ -912,7 +921,7 @@ def test_expired_fanout_rejects_queued_peer_but_retains_submitted_sibling() -> N
     assert session._sender._begin_task_operation(task, 8)
     clock.return_value = 15.0
     with pytest.raises(transfer_mod._TransferNotSubmittedError):
-        session._sender._submit_transfer(task, 8, object())
+        session._sender._submit_transfer(task, 8, _write_request())
     session._sender._agent.submit_transfer_requests.assert_not_called()
     assert task._physical_operations[8].state is transfer_mod._PhysicalOperationState.NOT_SUBMITTED
     assert list(session._retirement._claims.values()) == [task._physical_operations[7]]

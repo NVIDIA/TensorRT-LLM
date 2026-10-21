@@ -338,7 +338,7 @@ def test_failed_sender_write_retains_roots_until_fatal_deadline() -> None:
     task = transfer_mod.SendTaskBase(DisaggregatedParams(disagg_request_id=12))
     task.bind_logical_outcomes(transfer_mod._LogicalOutcomes(owner))
     assert task.begin_physical_operation(7)
-    request = object()
+    request = Mock(op=transfer_mod.TransferOp.WRITE, remote_name="peer")
     status = Mock(wait=Mock(return_value=False), is_completed=Mock(return_value=False))
     status.last_status_str.return_value = "ERROR"
     sender = object.__new__(transfer_mod.Sender)
@@ -347,7 +347,10 @@ def test_failed_sender_write_retains_roots_until_fatal_deadline() -> None:
     sender._enforce_physical_ownership = True
     sender._ownership_poisoned = None
     sender._ownership_poison_lock = watchdog.lock
-    sender._agent = Mock(submit_transfer_requests=Mock(return_value=status))
+    sender._agent = Mock(
+        submit_transfer_requests=Mock(return_value=status),
+        check_remote_descs=Mock(return_value=True),
+    )
 
     assert sender._submit_transfer(task, 7, request) == (False, "ERROR")
     operation = task._physical_operations[7]
@@ -360,7 +363,9 @@ def test_failed_sender_write_retains_roots_until_fatal_deadline() -> None:
     later = transfer_mod.SendTaskBase(DisaggregatedParams(disagg_request_id=13))
     assert later.begin_physical_operation(8)
     with pytest.raises(transfer_mod._TransferNotSubmittedError, match="before backend submission"):
-        sender._submit_transfer(later, 8, object())
+        sender._submit_transfer(
+            later, 8, Mock(op=transfer_mod.TransferOp.WRITE, remote_name="peer")
+        )
     sender._agent.submit_transfer_requests.assert_called_once_with(request)
     assert later._physical_operations[8].state is transfer_mod._PhysicalOperationState.NOT_SUBMITTED
     assert later.resources_drained
