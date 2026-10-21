@@ -110,6 +110,26 @@ _MX_CASES = (
     ),
     pytest.param(
         MxE2ECase(
+            model_env="TRTLLM_MX_QWEN3_TIED_MODEL",
+            default_model_subdir="Qwen3/Qwen3-4B",
+            repository_cache_prefix="models--trtllm-mx-e2e--qwen3-tied-tp1",
+            tp_size=1,
+        ),
+        id="qwen3-tied-bf16-tp1",
+        marks=pytest.mark.skip_less_device(2),
+    ),
+    pytest.param(
+        MxE2ECase(
+            model_env="TRTLLM_MX_QWEN3_TIED_MODEL",
+            default_model_subdir="Qwen3/Qwen3-4B",
+            repository_cache_prefix="models--trtllm-mx-e2e--qwen3-tied-tp2",
+            tp_size=2,
+        ),
+        id="qwen3-tied-bf16-tp2",
+        marks=pytest.mark.skip_less_device(4),
+    ),
+    pytest.param(
+        MxE2ECase(
             model_env="TRTLLM_MX_MISTRAL_MODEL",
             default_model_subdir="Mistral-7B-Instruct-v0.3",
             repository_cache_prefix="models--trtllm-mx-e2e--mistral-tp1",
