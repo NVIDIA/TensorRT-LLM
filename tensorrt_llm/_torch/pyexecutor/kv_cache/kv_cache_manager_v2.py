@@ -34,6 +34,8 @@ from typing import (
 
 import numpy as np
 import torch
+import triton
+import triton.language as tl
 from strenum import StrEnum
 
 from tensorrt_llm._torch.disaggregation.resource.page import MapperKind, RoleLayout
@@ -1328,6 +1330,55 @@ def _copy_swa_block_offsets_with_scratch_compiled(
     converted = torch.where(scratch_mask, scratch_index, converted)
 
     output.copy_(converted.permute(0, 2, 1, 3))
+
+
+@triton.jit(do_not_specialize=["num_seqs", "rows_width"])
+def _convert_batch_block_offsets_kernel(
+    rows_ptr,
+    out_ptr,
+    params_ptr,
+    num_seqs,
+    rows_width,
+    out_pool_stride,
+    num_blocks,
+    BLOCK: tl.constexpr,
+):
+    # grid = (num_op_pools, num_seqs, cdiv(num_blocks, BLOCK)): one column tile
+    # of both lanes of one sequence's row in one attention-op table.
+    op_pool = tl.program_id(0)
+    seq = tl.program_id(1).to(tl.int64)
+    cols = tl.program_id(2) * BLOCK + tl.arange(0, BLOCK)
+    num_params = tl.num_programs(0) * 2
+    for lane in tl.static_range(2):
+        param = params_ptr + op_pool * 2 + lane
+        pool = tl.load(param).to(tl.int64)
+        scale = tl.load(param + num_params)
+        offset = tl.load(param + 2 * num_params)
+        # Columns past the snapshot's width are BAD_PAGE_INDEX, as in the host rows.
+        src = rows_ptr + (pool * num_seqs + seq) * rows_width + cols
+        base = tl.load(src, mask=cols < rows_width, other=-1)
+        value = tl.where(base < 0, -1, base * scale + offset)
+        dst = out_ptr + op_pool.to(tl.int64) * out_pool_stride + seq * 2 * num_blocks
+        tl.store(dst + lane * num_blocks + cols, value, mask=cols < num_blocks)
+
+
+def _convert_batch_block_offsets(
+    rows: torch.Tensor, out: torch.Tensor, params: torch.Tensor, num_seqs: int
+) -> None:
+    """out[t, :num_seqs, lane] = rows[params[0, t, lane]] * params[1, t, lane] + params[2, t, lane].
+
+    ``rows`` is [num_pools, num_seqs, width] base page indices; BAD_PAGE_INDEX is kept and
+    written to the columns past ``width``.
+    """
+    num_blocks = out.shape[-1]
+    assert rows.is_contiguous() and rows.shape[1] == num_seqs and rows.shape[2] <= num_blocks
+    assert out.shape[2] == 2 and out[0].is_contiguous()
+    assert params.shape == (3, out.shape[0], 2) and params.dtype == torch.int32
+    block = 1024
+    grid = (out.shape[0], num_seqs, triton.cdiv(num_blocks, block))
+    _convert_batch_block_offsets_kernel[grid](
+        rows, out, params, num_seqs, rows.shape[2], out.stride(0), num_blocks, BLOCK=block
+    )
 
 
 def _rewind_context_cursor(req: LlmRequest, reuse: int) -> None:
@@ -2999,6 +3050,12 @@ class KVCacheManagerV2(BaseResourceManager):
 
         staging_capacity = index_mapper_capacity * self.max_copy_beam_width
         device = torch.device("cuda", torch.cuda.current_device())
+        if not self.enable_swa_scratch_reuse:
+            # No scratch slots: each step converts only the batch's rows.
+            self._prepare_batch_block_offsets_copy(
+                staging_capacity, pool_ids, scales, layer_offsets
+            )
+            return
         self._device_kv_cache_block_offsets_input = torch.empty_like(
             self.host_kv_cache_block_offsets,
             device=device,
@@ -3126,6 +3183,61 @@ class KVCacheManagerV2(BaseResourceManager):
             self._device_scratch_slots_staging,
         )
 
+    def _prepare_batch_block_offsets_copy(
+        self,
+        capacity: int,
+        pool_ids: torch.Tensor,
+        scales: torch.Tensor,
+        offsets: torch.Tensor,
+    ) -> None:
+        """Buffers for converting only the batch's rows of the attention-op tables.
+
+        Lane ``l`` of table ``t`` is ``scales[t, l] * base + offsets[t, l]``, where
+        ``base`` is the request's base page index in pool ``pool_ids[t, l]``.
+        """
+        device = torch.device("cuda", torch.cuda.current_device())
+        # Device copy of each step's host-row snapshot, viewed at that step's shape.
+        self._device_batch_block_offsets = torch.empty(
+            self.num_pools * capacity * self.max_blocks_per_seq, dtype=torch.int32, device=device
+        )
+        self._device_attention_op_params = torch.stack(
+            [pool_ids.to(torch.int32), scales, offsets]
+        ).to(device)
+
+    def _copy_batch_block_offsets_by_op_pool(
+        self,
+        dst_tensor: torch.Tensor,
+        request_ids: List[int],
+        copy_idx: torch.Tensor,
+        num_seqs: int,
+    ) -> None:
+        # A captured graph would replay this step's transient snapshot.
+        assert not torch.cuda.is_current_stream_capturing()
+        if num_seqs == 0:
+            return
+        # A row is BAD_PAGE_INDEX past its cache's num_blocks: snapshot up to the widest.
+        caches = [self.kv_cache_map.get(request_id) for request_id in request_ids]
+        width = (
+            self.max_blocks_per_seq
+            if None in caches
+            else max([1] + [cache.num_blocks for cache in caches])
+        )
+        # Snapshot the batch's host rows now: an async copy reads its source when it
+        # runs, and the host table keeps changing for the next step (nvbug 6293536).
+        # The caching host allocator keeps this buffer until the copy has run.
+        rows = torch.empty(
+            self.num_pools, num_seqs, width, dtype=torch.int32, pin_memory=prefer_pinned()
+        )
+        torch.index_select(self.host_kv_cache_block_offsets[:, :, 0, :width], 1, copy_idx, out=rows)
+        device_rows = self._device_batch_block_offsets[: rows.numel()].view(rows.shape)
+        device_rows.copy_(rows, non_blocking=True)
+        _convert_batch_block_offsets(
+            device_rows,
+            dst_tensor[: self.num_attention_op_pools],
+            self._device_attention_op_params,
+            num_seqs,
+        )
+
     def _copy_batch_block_offsets_per_layer(
         self,
         dst_tensor: torch.Tensor,
@@ -3134,6 +3246,9 @@ class KVCacheManagerV2(BaseResourceManager):
         num_contexts: int,
         num_seqs: int,
     ) -> None:
+        if not self.enable_swa_scratch_reuse:
+            self._copy_batch_block_offsets_by_op_pool(dst_tensor, request_ids, copy_idx, num_seqs)
+            return
         device_copy_idx = self._copy_idx_to_device(copy_idx)
         self._device_kv_cache_block_offsets_input.copy_(
             self.host_kv_cache_block_offsets,
