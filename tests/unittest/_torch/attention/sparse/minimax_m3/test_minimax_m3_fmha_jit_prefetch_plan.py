@@ -233,6 +233,129 @@ def test_mxfp8_tune_modules_start_only_when_the_pass_runs(
         start.assert_not_called()
 
 
+def _mxfp8_model(opt_in=True, cutlass=True, cp_size=1):
+    """A decoder model with one MXFP8 Linear, opted into FlashInfer for decode
+    CUDA graphs like DeepSeek-V4.1's Engram WKV and MiniMax-M3's layers."""
+    from unittest.mock import patch
+
+    from torch import nn
+
+    from tensorrt_llm._torch.models.modeling_utils import DecoderModelForCausalLM
+    from tensorrt_llm._torch.modules.linear import MXFP8LinearMethod
+    from tensorrt_llm.mapping import Mapping
+
+    with patch(
+        "tensorrt_llm._torch.modules.linear._mxfp8_cutlass_op_available", return_value=cutlass
+    ):
+        method = MXFP8LinearMethod()
+    model = DecoderModelForCausalLM.__new__(DecoderModelForCausalLM)
+    nn.Module.__init__(model)
+    mapping = Mapping(world_size=cp_size, cp_size=cp_size) if cp_size > 1 else Mapping()
+    model.model_config = SimpleNamespace(
+        is_generation=True, is_encoder_decoder=False, mapping=mapping
+    )
+    model.wkv = nn.Module()
+    model.wkv.quant_method = method
+    model.wkv._use_flashinfer_mxfp8_decode_graph_default = opt_in
+    return model
+
+
+def _mxfp8_llm_args(compile_mode="eager", **overrides):
+    """Engine arguments; ``compile_mode`` "all" compiles every batch,
+    "prefill_only" only the piecewise prefill CUDA graphs."""
+    from tensorrt_llm.llmapi.llm_args import PrefillCudaGraphBackend
+
+    args = dict(
+        encode_only=False,
+        mm_encoder_only=False,
+        enable_autotuner=True,
+        cuda_graph_config=SimpleNamespace(),
+        torch_compile_config=None,
+        prefill_cuda_graph_backend=PrefillCudaGraphBackend.DISABLED,
+    )
+    if compile_mode != "eager":
+        args["torch_compile_config"] = SimpleNamespace(
+            compile_only_piecewise_graphs=compile_mode == "prefill_only"
+        )
+        if compile_mode == "prefill_only":
+            args["prefill_cuda_graph_backend"] = PrefillCudaGraphBackend.PIECEWISE
+    args.update(overrides)
+    return SimpleNamespace(**args)
+
+
+@pytest.mark.parametrize(
+    "model_kw, args_kw, tunes",
+    [
+        ({}, {}, True),  # the GEN worker: decode CUDA graphs, eager decode
+        ({}, dict(cuda_graph_config=None), False),  # the CTX worker: no decode graphs
+        ({}, dict(enable_autotuner=False), False),
+        (dict(opt_in=False), {}, False),  # no module opts its MXFP8 Linears in
+        (dict(cutlass=False), {}, False),  # no CUTLASS MXFP8 op to run it on
+        (dict(cp_size=2), {}, False),  # non-Helix CP skips warmup
+        ({}, dict(encode_only=True), False),  # the encoder runner has no such pass
+        ({}, dict(compile_mode="all"), False),  # torch.compile runs the decode batches
+        ({}, dict(compile_mode="prefill_only"), True),  # ... only the prefill graphs
+    ],
+    ids=[
+        "gen-worker",
+        "no-cuda-graphs",
+        "no-autotuner",
+        "no-opt-in",
+        "no-cutlass",
+        "cp",
+        "encoder",
+        "compiled-decode",
+        "compiled-prefill-only",
+    ],
+)
+def test_mxfp8_tune_modules_predicted_at_load_as_warmup_decides(
+    monkeypatch, model_kw, args_kw, tunes
+):
+    """``start_model_builds`` predicts the FlashInfer MXFP8 pass from the
+    engine's arguments with the decoder runner's own selection, which its
+    warmup applies to the engine's resolved settings: both agree."""
+    from unittest.mock import patch
+
+    import torch
+
+    from tensorrt_llm._torch import jit_prefetch as jp
+    from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import DecoderRunner
+
+    monkeypatch.delenv("TRTLLM_MXFP8_GEMM_BACKEND", raising=False)
+    monkeypatch.setattr(torch.ops.trtllm, "flashinfer_mm_mxfp8", object(), raising=False)
+    model = _mxfp8_model(**model_kw)
+    llm_args = _mxfp8_llm_args(**args_kw)
+    assert jp.tunes_flashinfer_mxfp8_at_load(model, llm_args) is tunes
+    if not llm_args.encode_only:
+        # The engine's resolved settings for these arguments (the compile
+        # ones are PyTorchModelEngine's, see test_pcg_fx_fallback_policy_*).
+        compile_mode = args_kw.get("compile_mode", "eager")
+        runner = SimpleNamespace(
+            model=model,
+            mapping=model.model_config.mapping,
+            cuda_graph_runner=SimpleNamespace(enabled=llm_args.cuda_graph_config is not None),
+            _config=SimpleNamespace(
+                enable_autotuner=llm_args.enable_autotuner,
+                torch_compile_enabled=compile_mode != "eager",
+                torch_compile_prefill_only=compile_mode == "prefill_only",
+            ),
+            flashinfer_mxfp8_pass_selected=DecoderRunner.flashinfer_mxfp8_pass_selected,
+        )
+        assert DecoderRunner._tunes_flashinfer_mxfp8(runner) is tunes
+
+    monkeypatch.setenv("TLLM_JIT_PREFETCH", "1")
+    monkeypatch.setattr("tensorrt_llm._utils.is_sm_100f", lambda *a: True)
+    with patch.object(jp, "start_flashinfer_build", return_value=True) as start:
+        jp.start_model_builds(SimpleNamespace(modules=model.modules), llm_args=None)
+        start.assert_not_called()  # without the engine's arguments, warmup starts them
+        with patch.object(jp, "tunes_flashinfer_mxfp8_at_load", return_value=tunes):
+            assert jp.start_model_builds(model, llm_args=llm_args) is tunes
+    if tunes:
+        start.assert_called_once_with(("trtllm_utils", "mxfp8_gemm_cutlass"))
+    else:
+        start.assert_not_called()
+
+
 def _llm_args(algorithm="minimax_m3", implementation="msa", tokens_per_block=128, indexer="fp8"):
     return SimpleNamespace(
         sparse_attention_config=SimpleNamespace(

@@ -1048,12 +1048,16 @@ class TestWarmupCleanup(unittest.TestCase):
     def test_jit_prefetch_deep_gemm_priority_token_counts(self) -> None:
         """The DeepGEMM FP8 Linear provider builds first every token count
         warmup and graph capture launch: each CUDA graph batch size, times the
-        tokens per decode step, and max_num_tokens, the general warmup's and
-        the autotuner's pure-context shape."""
+        tokens per decode step; before those, on every rank, those of the
+        warmup forwards ahead of graph capture: the attention warmup's (one
+        generation request, one context token, and both together) and
+        max_num_tokens, the general warmup's and the autotuner's pure-context
+        shape."""
         model_engine = object.__new__(PyTorchModelEngine)
         model_engine.model = torch.nn.Module()
         model_engine.max_num_tokens = 9216
         model_engine.original_max_total_draft_tokens = 5
+        model_engine.max_total_draft_tokens = 5
         model_engine._cuda_graph_batch_sizes = [1, 2, 4]
         model_engine.attn_runtime_features = SimpleNamespace(
             chunked_prefill=False, cache_reuse=False, chunk_size=0,
@@ -1061,8 +1065,12 @@ class TestWarmupCleanup(unittest.TestCase):
         )  # fmt: skip
         captured = {}
 
-        def provider(model, max_num_tokens, priority_ms):
-            captured.update(max_num_tokens=max_num_tokens, priority_ms=sorted(priority_ms))
+        def provider(model, max_num_tokens, priority_ms, first_ms):
+            captured.update(
+                max_num_tokens=max_num_tokens,
+                priority_ms=sorted(priority_ms),
+                first_ms=sorted(first_ms),
+            )
             return Mock()
 
         with (
@@ -1071,7 +1079,8 @@ class TestWarmupCleanup(unittest.TestCase):
         ):
             model_engine._deep_gemm_providers()
         self.assertEqual(captured["max_num_tokens"], 9216)
-        self.assertEqual(captured["priority_ms"], [1, 2, 4, 6, 12, 24, 9216])
+        self.assertEqual(captured["priority_ms"], [1, 2, 4, 6, 12, 24])
+        self.assertEqual(captured["first_ms"], [1, 6, 7, 9216])
 
     @pytest.mark.cpu_only
     def test_decoder_runner_warmup_sampling_and_kv_cache_cleanup(self) -> None:

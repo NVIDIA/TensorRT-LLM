@@ -165,6 +165,22 @@ def test_provider_enumerates_priority_tokens_first():
     assert sorted(other[:5]) == ms[:5]
 
 
+def test_provider_enumerates_first_tokens_first_on_every_rank():
+    # The token counts of warmup's first forwards (here 4, 1, 5 for three
+    # draft tokens) lead on every rank, unrotated, then the priority list
+    # and the grid as before, without repeats.
+    p = jdg.FP8LinearDeepGemmProvider(
+        torch.nn.Module(), max_num_tokens=100, priority_ms=[1, 2, 4, 8, 16, 100], first_ms=[4, 1, 5]
+    )
+    p.shapes = [(128, 512)]
+    grid = list(range(1, 17)) + [32, 48, 64, 80, 96, 100]
+    for rank in range(4):
+        ms = [json.loads(s)["m"] for s in p.enumerate_specs(rank=rank, world=4)]
+        assert ms[:3] == [1, 4, 5]
+        assert sorted(ms[3:7]) == [2, 8, 16, 100]
+        assert sorted(ms) == grid
+
+
 # A DeepSeek-V3-like expert slice (G experts per rank, gate+up / down), at
 # batch sizes far apart: one helper compile must serve all of them.
 @pytest.mark.parametrize("g,n,k", [(32, 4096, 7168), (32, 7168, 2048)])

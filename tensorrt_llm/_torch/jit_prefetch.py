@@ -39,10 +39,10 @@ are built from the moment the model is constructed, while its weights load,
 rather than at the end of warmup (:class:`FmhaSm100Builds`,
 ``start_model_builds``). So do FlashInfer JIT modules: a module a model's
 layers build in their first forward (the TRTLLM-GEN attention launcher of
-GLM-5.3-Flash and MiniMax-M3) from the moment the model is constructed; the
-sampling module, and the MXFP8 GEMM the autotuner warmup tunes for
-MiniMax-M3's decode graphs (``start_mxfp8_tune_builds``), from the start of
-warmup.
+GLM-5.3-Flash and MiniMax-M3), and the MXFP8 GEMM the autotuner warmup tunes
+for decode graphs (DeepSeek-V4.1's Engram WKV, MiniMax-M3;
+``start_mxfp8_tune_builds``), from the moment the model is constructed; the
+sampling module from the start of warmup.
 
 For every planned Triton variant, Triton's own binder computes Triton's own
 cache key, which is checked against the kernel's in-memory cache and then the
@@ -384,6 +384,11 @@ def start_model_builds(model, rank: int = 0, llm_args=None) -> bool:
     * FlashInfer JIT modules, one helper for all of them: each provider
       module that knows of such modules lists them (GLM-5.3-Flash's and
       MiniMax-M3's TRTLLM-GEN attention launcher ``fmha_gen``);
+    * the FlashInfer modules of the autotuner warmup's FlashInfer MXFP8 pass,
+      in a helper of their own, if the engine ``llm_args`` describes will run
+      that pass (``tunes_flashinfer_mxfp8_at_load``: DeepSeek-V4.1's Engram
+      WKV and MiniMax-M3's MXFP8 Linears with decode CUDA graphs). Warmup
+      starts them otherwise (``start_mxfp8_tune_builds``);
     * the CuTe DSL FP8 blockwise GEMM tactics the autotuner benchmarks
       (``jit_prefetch_cute_dsl.Fp8GemmProvider``: block-FP8 Linear layers
       without DeepGEMM, and the batched GEMM of DeepSeek-V4's grouped FP8
@@ -411,6 +416,15 @@ def start_model_builds(model, rank: int = 0, llm_args=None) -> bool:
             )
     if modules:
         started = start_flashinfer_build(tuple(dict.fromkeys(modules)))
+    if llm_args is not None:
+        try:
+            started = (
+                start_mxfp8_tune_builds(tunes_flashinfer_mxfp8_at_load(model, llm_args)) or started
+            )
+        except Exception as e:  # noqa: BLE001 - warmup then starts them
+            logger.warning(
+                f"[JIT prefetch] FlashInfer MXFP8 builds not planned: {type(e).__name__}: {e}"
+            )
     try:
         from .cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 
@@ -455,12 +469,15 @@ FLASHINFER_MXFP8_TUNE_MODULES = ("trtllm_utils", "mxfp8_gemm_cutlass")
 
 def start_mxfp8_tune_builds(tunes_flashinfer_mxfp8: bool) -> bool:
     """Start building, in a CPU-only helper, the FlashInfer modules the
-    autotuner warmup's FlashInfer MXFP8 pass builds; called at the start of
-    warmup with whether this engine runs that pass. The GEMM module is a
-    ~75 s nvcc build, which then overlaps the warmup forwards before the
-    autotuner; the pass waits on FlashInfer's file lock, held by the helper,
-    instead of compiling it itself. Returns False if prefetch is off, the
-    pass does not run, or there is nothing to build."""
+    autotuner warmup's FlashInfer MXFP8 pass builds; called with whether this
+    engine runs that pass, once the model is constructed
+    (``start_model_builds``, which predicts it from the engine's arguments)
+    and again at the start of warmup, where the engine decides it. The GEMM
+    module is a ~75-100 s nvcc build, which then overlaps the weight load, or
+    at least the warmup forwards before the autotuner; the pass waits on
+    FlashInfer's file lock, held by the helper, instead of compiling it
+    itself. Returns False if prefetch is off, the pass does not run, or there
+    is nothing to build (the modules are built, or a helper is on them)."""
     if not prefetch_enabled() or not tunes_flashinfer_mxfp8:
         return False
     from tensorrt_llm._utils import is_sm_100f
@@ -468,6 +485,47 @@ def start_mxfp8_tune_builds(tunes_flashinfer_mxfp8: bool) -> bool:
     if not is_sm_100f():
         return False
     return start_flashinfer_build(FLASHINFER_MXFP8_TUNE_MODULES)
+
+
+def decode_batches_compiled(model, llm_args) -> bool:
+    """Whether ``torch.compile`` runs the decode batches of ``model`` in the
+    engine ``llm_args`` describes, as ``PyTorchModelEngine`` decides it: with
+    a ``torch_compile_config``, unless piecewise prefill CUDA graphs confine
+    a decoder model's compiled graph to prefill (the engine's
+    ``_torch_compile_prefill_only``)."""
+    from tensorrt_llm.llmapi.llm_args import PrefillCudaGraphBackend
+
+    from .models.modeling_utils import DecoderModelForCausalLM
+
+    compile_cfg = llm_args.torch_compile_config
+    if compile_cfg is None:
+        return False
+    return not (
+        isinstance(model, DecoderModelForCausalLM)
+        and llm_args.prefill_cuda_graph_backend == PrefillCudaGraphBackend.PIECEWISE
+        and (compile_cfg.compile_only_piecewise_graphs or not model.use_fx_for_pcg_fallback)
+    )
+
+
+def tunes_flashinfer_mxfp8_at_load(model, llm_args) -> bool:
+    """Whether the engine ``llm_args`` describes will run the autotuner
+    warmup's FlashInfer MXFP8 pass on ``model``, known once the model is
+    constructed: the decoder runner's own selection
+    (``DecoderRunner.flashinfer_mxfp8_pass_selected``) on the settings
+    ``PyTorchModelEngine`` derives from ``llm_args``. False if the engine
+    runs another runner (encoder, pooling), which has no such pass."""
+    from .pyexecutor.engine.runners import DecoderRunner, resolve_runner_type
+
+    runner_cls = resolve_runner_type(model, llm_args)
+    if not issubclass(runner_cls, DecoderRunner):
+        return False
+    return runner_cls.flashinfer_mxfp8_pass_selected(
+        model,
+        model.model_config.mapping,
+        enable_autotuner=llm_args.enable_autotuner,
+        cuda_graphs=llm_args.cuda_graph_config is not None,
+        compile_all_batches=decode_batches_compiled(model, llm_args),
+    )
 
 
 # ---------------------------------------------------------------------------

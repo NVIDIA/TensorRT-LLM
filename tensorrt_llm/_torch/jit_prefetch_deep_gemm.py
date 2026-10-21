@@ -264,7 +264,7 @@ class MegaMoEProvider:
 class FP8LinearDeepGemmProvider:
     """Plans the DeepGEMM FP8 GEMMs a batch with M tokens will run."""
 
-    def __init__(self, model, max_num_tokens: int, priority_ms=()):
+    def __init__(self, model, max_num_tokens: int, priority_ms=(), first_ms=()):
         from .modules.linear import FP8BlockScalesLinearMethod, Linear
 
         # Kimi K3's FP8 weight-read projections (attention, shared experts)
@@ -294,9 +294,11 @@ class FP8LinearDeepGemmProvider:
         self.shapes = sorted(shapes)
         self.max_num_tokens = int(max_num_tokens)
         # Token counts known to run before serving (the CUDA graph shapes):
-        # enumerated first, so they are built before warmup reaches them.
+        # enumerated first, so they are built before warmup reaches them;
+        # before them, the token counts of warmup's first forwards.
+        self.first_ms = sorted({int(m) for m in first_ms if 0 < int(m) <= self.max_num_tokens})
         self.priority_ms = sorted(
-            {int(m) for m in priority_ms if 0 < int(m) <= self.max_num_tokens}
+            {int(m) for m in priority_ms if 0 < int(m) <= self.max_num_tokens} - set(self.first_ms)
         )
         self._seen_m: set = set()
 
@@ -325,16 +327,18 @@ class FP8LinearDeepGemmProvider:
         share ``DG_JIT_CACHE_DIR``. Ranks that do share one start at different
         points of the list (``rank``/``world``), so they compile different
         variants first and find the rest already on disk. ``priority_ms``
-        come before all of them, in the same rotated order.
+        come before all of them, in the same rotated order, and ``first_ms``
+        before those, in the same order on every rank: each rank launches
+        them in its first forwards, and waits for its own helpers' builds.
         """
         ms = list(range(1, 17)) + list(range(32, self.max_num_tokens + 1, 16))
         if self.max_num_tokens not in ms:
             ms.append(self.max_num_tokens)
         world = max(1, world)
-        first = self.priority_ms
-        rest = [m for m in ms if m not in set(first)]
-        order = []
-        for part in (first, rest):
+        early = set(self.first_ms) | set(self.priority_ms)
+        rest = [m for m in ms if m not in early]
+        order = list(self.first_ms)
+        for part in (self.priority_ms, rest):
             start = (len(part) * (rank % world)) // world
             order += part[start:] + part[:start]
         for m in order:

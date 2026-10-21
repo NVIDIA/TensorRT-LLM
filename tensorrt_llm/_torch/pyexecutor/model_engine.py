@@ -1139,16 +1139,21 @@ class PyTorchModelEngine(ModelEngine):
                 int(rf.chunk_size or 0) *
                 int(rf.chunked_prefill_buffer_batch_size or 1))
         # Built first, as warmup and graph capture launch them all before
-        # serving: every CUDA graph shape's token count, and max_num_tokens,
-        # the general warmup's (and the autotuner's) pure-context shape.
+        # serving: every CUDA graph shape's token count. Before those, on
+        # every rank, the token counts of the warmup forwards ahead of graph
+        # capture: the attention warmup's (one generation request, one
+        # context token, both together) and max_num_tokens, the general
+        # warmup's and the autotuner's pure-context shape.
         tokens_per_request = 1 + self.original_max_total_draft_tokens
         graph_bs = self._cuda_graph_batch_sizes or []
         graph_ms = sorted({bs * tokens_per_request
-                           for bs in graph_bs} | set(graph_bs)
-                          | {self.max_num_tokens})
-        dg_provider = jdg.FP8LinearDeepGemmProvider(self.model,
-                                                    max_num_tokens=max_m,
-                                                    priority_ms=graph_ms)
+                           for bs in graph_bs} | set(graph_bs))
+        gen_tokens = 1 + self.max_total_draft_tokens
+        dg_provider = jdg.FP8LinearDeepGemmProvider(
+            self.model,
+            max_num_tokens=max_m,
+            priority_ms=graph_ms,
+            first_ms=(gen_tokens, 1, gen_tokens + 1, self.max_num_tokens))
         return dg_provider, jdg.DeepGemmMoEProvider(self.model)
 
     def _init_jit_prefetch(self,

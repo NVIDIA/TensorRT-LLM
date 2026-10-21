@@ -776,7 +776,8 @@ class DecoderRunner(ScheduledModelRunner):
         # that can launch the sampling kernels, together with any helper the
         # model loader started on a module of the model's layers. Another
         # builds the FlashInfer modules the autotuner warmup's FlashInfer
-        # MXFP8 pass needs, if it runs; the pass waits on their file locks.
+        # MXFP8 pass needs, if it runs and the model loader has not started
+        # them already; the pass waits on their file locks.
         sampling_in_helper = kv_cache_manager is not None and start_flashinfer_build()
         if kv_cache_manager is not None:
             start_mxfp8_tune_builds(self._tunes_flashinfer_mxfp8())
@@ -1520,20 +1521,49 @@ class DecoderRunner(ScheduledModelRunner):
         changing any layer's backend, so JIT prefetch can start that build at
         the beginning of warmup; the autotuner warmup still decides.
         """
+        return self.flashinfer_mxfp8_pass_selected(
+            self.model,
+            self.mapping,
+            enable_autotuner=self._config.enable_autotuner,
+            cuda_graphs=self.cuda_graph_runner.enabled,
+            compile_all_batches=(
+                self._config.torch_compile_enabled and not self._config.torch_compile_prefill_only
+            ),
+        )
+
+    @classmethod
+    def flashinfer_mxfp8_pass_selected(
+        cls,
+        model: torch.nn.Module,
+        mapping: Mapping,
+        *,
+        enable_autotuner: bool,
+        cuda_graphs: bool,
+        compile_all_batches: bool,
+    ) -> bool:
+        """Whether a runner of this class, on ``model``, runs the autotuner
+        warmup's FlashInfer MXFP8 pass: ``_tunes_flashinfer_mxfp8`` with the
+        engine's settings as arguments, so JIT prefetch can also decide it
+        once the model is constructed (``jit_prefetch.start_model_builds``).
+
+        ``cuda_graphs`` is whether the decode CUDA graph runner is enabled and
+        ``compile_all_batches`` whether ``torch.compile`` runs the decode
+        batches as well as the prefill ones.
+        """
         from tensorrt_llm._torch.modules.linear import MXFP8LinearMethod
 
         # The autotuner warmup runs only with the autotuner on, for a runner
         # with context warmups; context parallelism other than Helix skips
         # warmup altogether.
         if (
-            not self._config.enable_autotuner
-            or not self._context_warmups_supported
-            or (self.mapping.cp_size > 1 and not self.mapping.has_cp_helix())
+            not enable_autotuner
+            or not cls._context_warmups_supported
+            or (mapping.cp_size > 1 and not mapping.has_cp_helix())
         ):
             return False
         methods = [
             quant_method
-            for module in self.model.modules()
+            for module in model.modules()
             if isinstance(
                 (quant_method := getattr(module, "quant_method", None)), MXFP8LinearMethod
             )
@@ -1544,9 +1574,6 @@ class DecoderRunner(ScheduledModelRunner):
             return False
         if getattr(torch.ops.trtllm, "flashinfer_mm_mxfp8", None) is None:
             return False
-        compile_all_batches = (
-            self._config.torch_compile_enabled and not self._config.torch_compile_prefill_only
-        )
         if "TRTLLM_MXFP8_GEMM_BACKEND" in os.environ:
             return any(
                 method.backend == "flashinfer"
@@ -1554,11 +1581,11 @@ class DecoderRunner(ScheduledModelRunner):
                 for method in methods
             )
         return (
-            self.cuda_graph_runner.enabled
+            cuda_graphs
             and not compile_all_batches
             and any(
                 getattr(module, "_use_flashinfer_mxfp8_decode_graph_default", False)
-                for module in self.model.modules()
+                for module in model.modules()
             )
         )
 
