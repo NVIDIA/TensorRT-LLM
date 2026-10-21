@@ -724,8 +724,11 @@ class PyTorchModelEngine(ModelEngine):
                 torch._dynamo.config.cache_size_limit = 16
             else:
                 set_torch_compiling(False)
-                self._nccl_window_tensor_scope_hooks = (
-                    install_eager_nccl_window_tensor_scopes(self.model))
+                # NCCL window tensors are only created by collectives with
+                # peers, so a forward without peers has no leases to scope.
+                if self._is_distributed_forward():
+                    self._nccl_window_tensor_scope_hooks = (
+                        install_eager_nccl_window_tensor_scopes(self.model))
         except Exception as e:
             import traceback
             traceback.print_exception(Exception, e, e.__traceback__)
