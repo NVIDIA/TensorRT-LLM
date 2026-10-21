@@ -17,11 +17,8 @@
 import json
 import logging
 import os
-import subprocess
-import sys
 import threading
 import time
-from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -44,7 +41,6 @@ def _reset_process_telemetry_state():
     usage_lib._REPORTER_STOP = threading.Event()
     usage_lib._PENDING_TERMINAL = None
     usage_lib._PROCESS_PID = os.getpid()
-    usage_lib._DISAGG_DEPLOYMENT_ID = ""
     yield
     usage_lib._REPORTER_STOP.set()
     usage_lib._SESSION = None
@@ -52,7 +48,6 @@ def _reset_process_telemetry_state():
     usage_lib._REPORTER_STARTED = False
     usage_lib._REPORTER_ACTIVE = False
     usage_lib._PENDING_TERMINAL = None
-    usage_lib._DISAGG_DEPLOYMENT_ID = ""
 
 
 pytestmark = pytest.mark.cpu_only
@@ -439,56 +434,31 @@ class TestClampStrIntegration:
 
 
 class TestDisaggMetadata:
-    """Verify disagg correlation without accepting user-provided deployment IDs."""
+    """Verify disagg correlation accepts UUIDs but excludes arbitrary identifying text."""
 
-    @pytest.mark.parametrize("inherit_launcher_id", [False, True])
-    def test_fresh_process_ignores_deployment_id_environment(
-        self, monkeypatch, inherit_launcher_id
-    ):
-        """Only explicit internal propagation correlates a fresh process with its launcher."""
-        monkeypatch.setenv("TRTLLM_DISAGG_DEPLOYMENT_ID", "/home/alice/deployment")
-        deployment_id = usage_lib.uuid.uuid4()
-        usage_lib._set_disagg_deployment_id(deployment_id)
-        expected = deployment_id.hex if inherit_launcher_id else ""
-        script = """
-import sys
-import types
-import uuid
-
-package = types.ModuleType("tensorrt_llm")
-package.__path__ = [sys.argv[1]]
-sys.modules["tensorrt_llm"] = package
-from tensorrt_llm.usage import usage_lib
-
-if sys.argv[2]:
-    usage_lib._set_disagg_deployment_id(uuid.UUID(hex=sys.argv[2]))
-session = usage_lib._TelemetrySession("disaggregated", "server", "config_validation")
-print(session.snapshot()["deploymentId"])
-"""
-        child = subprocess.run(
-            [sys.executable, "-c", script, str(Path(usage_lib.__file__).parents[1]), expected],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-        assert child.returncode == 0, child.stderr
-        assert child.stdout.strip() == expected
-
-    @pytest.mark.parametrize("generated", [False, True])
     @pytest.mark.parametrize(
-        "user_id",
-        ["/home/alice/model", "alice@example.com", "a" * 128, "7cd46f928e324879b82a7cabd3c0ecde"],
+        ("deployment_id", "expected"),
+        [
+            (None, ""),
+            ("", ""),
+            ("/home/alice/model", ""),
+            ("alice@example.com", ""),
+            ("a" * 128, ""),
+            ("7cd46f928e324879b82a7cabd3c0ecd", ""),
+            ("7cd46f928e324879b82a7cabd3c0ecdZ", ""),
+            ("7cd46f928e324879b82a7cabd3c0ecde", "7cd46f928e324879b82a7cabd3c0ecde"),
+            ("7CD46F92-8E32-4879-B82A-7CABD3C0ECDE", "7cd46f928e324879b82a7cabd3c0ecde"),
+        ],
     )
-    def test_deployment_id_ignores_environment(
-        self, monkeypatch, reporter_session, generated, user_id
+    def test_deployment_id_validated_in_payloads(
+        self, monkeypatch, reporter_session, deployment_id, expected
     ):
-        """Initial, heartbeat, and exit payloads only use launcher-owned IDs."""
+        """Initial, heartbeat, and exit payloads contain only normalized UUIDs or empty IDs."""
         monkeypatch.setenv("TRTLLM_DISAGG_ROLE", "context")
-        monkeypatch.setenv("TRTLLM_DISAGG_DEPLOYMENT_ID", user_id)
-        deployment_id = usage_lib.uuid.uuid4()
-        if generated:
-            usage_lib._set_disagg_deployment_id(deployment_id)
-        expected = deployment_id.hex if generated else ""
+        if deployment_id is None:
+            monkeypatch.delenv("TRTLLM_DISAGG_DEPLOYMENT_ID", raising=False)
+        else:
+            monkeypatch.setenv("TRTLLM_DISAGG_DEPLOYMENT_ID", deployment_id)
         assert usage_lib._empty_event_snapshot()["deploymentId"] == expected
         captured = []
         stop_event = MagicMock()
@@ -510,7 +480,8 @@ print(session.snapshot()["deploymentId"])
         for event in events:
             assert event["parameters"]["disaggRole"] == "context"
             assert event["parameters"]["deploymentId"] == expected
-        assert user_id not in json.dumps(captured)
+        if deployment_id and not expected:
+            assert deployment_id not in json.dumps(captured)
 
     def test_disagg_payload_includes_llm_api_config_json(self, monkeypatch, reporter_session):
         """Disagg payloads retain sanitized LLM API config JSON fields."""
@@ -522,7 +493,7 @@ print(session.snapshot()["deploymentId"])
 
         monkeypatch.setenv("TRTLLM_DISAGG_ROLE", "generation")
         deployment_id = usage_lib.uuid.uuid4()
-        usage_lib._set_disagg_deployment_id(deployment_id)
+        monkeypatch.setenv("TRTLLM_DISAGG_DEPLOYMENT_ID", deployment_id.hex)
 
         captured = {}
 
@@ -1146,16 +1117,17 @@ class TestProcessTelemetrySession:
         assert event["parameters"]["ingressPoint"] == "cli_serve"
         assert event["parameters"]["exitCode"] == 130
 
-    @pytest.mark.parametrize("generated", [False, True])
+    @pytest.mark.parametrize("valid_id", [False, True])
     def test_terminal_event_contains_correlation_and_counter_snapshot(
-        self, monkeypatch, enable_telemetry, generated
+        self, monkeypatch, enable_telemetry, valid_id
     ):
         """Terminal-only sessions carry enough state for independent analysis."""
         monkeypatch.setenv("TRTLLM_DISAGG_ROLE", "ctx0")
-        monkeypatch.setenv("TRTLLM_DISAGG_DEPLOYMENT_ID", "/home/alice/deployment")
         deployment_id = usage_lib.uuid.uuid4()
-        if generated:
-            usage_lib._set_disagg_deployment_id(deployment_id)
+        monkeypatch.setenv(
+            "TRTLLM_DISAGG_DEPLOYMENT_ID",
+            str(deployment_id) if valid_id else "/home/alice/deployment",
+        )
         assert usage_lib.record_llm_initialization_attempt(default_usage_context="cli_serve")
         usage_lib.record_llm_initialization_failure()
 
@@ -1172,7 +1144,7 @@ class TestProcessTelemetrySession:
             )
 
         params = sent[0]["events"][0]["parameters"]
-        assert params["deploymentId"] == (deployment_id.hex if generated else "")
+        assert params["deploymentId"] == (deployment_id.hex if valid_id else "")
         assert "/home/alice/deployment" not in json.dumps(sent)
         assert params["disaggRole"] == "ctx0"
         assert params["llmInitializationAttempts"] == 1

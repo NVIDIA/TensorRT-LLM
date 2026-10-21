@@ -72,7 +72,7 @@ logger = logging.getLogger("tensorrt_llm")
 # ---------------------------------------------------------------------------
 
 _DISAGG_ROLE_ENV = "TRTLLM_DISAGG_ROLE"
-_DISAGG_DEPLOYMENT_ID = ""
+_DISAGG_DEPLOYMENT_ID_ENV = "TRTLLM_DISAGG_DEPLOYMENT_ID"
 _DEFAULT_ENDPOINT = "https://events.gfe.nvidia.com/v1.1/events/json"
 _HTTP_TIMEOUT = 2.0
 _MAX_HEARTBEATS = 1000
@@ -83,15 +83,12 @@ _ARCHITECTURE_HASH_PREFIX = "sha256:"
 _T = TypeVar("_T")
 
 
-def _set_disagg_deployment_id(deployment_id: uuid.UUID) -> None:
-    """Install the launcher's generated ID, shared through internal worker startup."""
-    global _DISAGG_DEPLOYMENT_ID
-    _DISAGG_DEPLOYMENT_ID = deployment_id.hex
-
-
 def _get_disagg_deployment_id() -> str:
-    """Return the launcher-owned deployment ID, or empty outside its workers."""
-    return _DISAGG_DEPLOYMENT_ID
+    """Return the environment's deployment UUID as lowercase hex, or empty if invalid."""
+    try:
+        return uuid.UUID(os.environ.get(_DISAGG_DEPLOYMENT_ID_ENV, "")).hex
+    except ValueError:
+        return ""
 
 
 @dataclass(frozen=True)
@@ -840,7 +837,8 @@ class _TelemetrySession:
     def _refresh_metadata_unlocked(self) -> None:
         if not self.disagg_role:
             self.disagg_role = os.environ.get(_DISAGG_ROLE_ENV, "")
-        self.deployment_id = _get_disagg_deployment_id()
+        if not self.deployment_id:
+            self.deployment_id = _get_disagg_deployment_id()
 
         normalized_role = self.disagg_role.lower()
         if self.component == "server" and (
