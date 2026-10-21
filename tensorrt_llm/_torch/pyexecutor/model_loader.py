@@ -1102,6 +1102,15 @@ class ModelLoader:
             logger.info(
                 f"Use {rank_model_storage / (1024**3):.2f} GB for model weights."
             )
+            # With JIT prefetch on, the DeepGEMM and low-M GEMM helpers start
+            # now, once the weights are materialized on the GPU (their dozens
+            # of start-ups would slow that host-side step) and as their values
+            # load from the checkpoint.
+            deep_gemm_limits = getattr(self, "deep_gemm_limits", None)
+            if deep_gemm_limits is not None:
+                from ..jit_prefetch import start_weight_load_builds
+                start_weight_load_builds(model, self.mapping.rank,
+                                         deep_gemm_limits)
             weights_preloaded = False
             # Set when either GMS RW or GMS RO branch has already run the
             # post_load_* hooks itself, so the shared post-load block below

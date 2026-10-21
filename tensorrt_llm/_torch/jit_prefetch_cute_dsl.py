@@ -51,6 +51,9 @@ Covered kernels, each a builder in ``_BUILDERS`` / ``_PRECOMPILED``:
   block-FP8 Linear layers that opt out of DeepGEMM and for the grouped FP8
   O-LoRA projection of DeepSeek-V4 / V4.1 attention, whose batched GEMM is
   the same TVM-FFI kernel.
+* FlashInfer's low-M BF16 direct GEMM (``LowMDirectGemmProvider``), which
+  ``modules.low_m_gemm``'s AutoTuner race benchmarks: specialized on M, N, K
+  and the tactic, so one variant per (M bucket, Linear shape, tactic).
 
 A spec is canonical JSON naming the kernel and its compile-time arguments;
 its SHA-1 is the file name, so helper and executor agree without sharing
@@ -590,6 +593,60 @@ def _build_fp8_gemm(s: Dict[str, Any]):
     return gemm.wrapper, (args, kwargs), "--opt-level 2 --enable-tvm-ffi"
 
 
+# FlashInfer's low-M BF16 direct (SIMT) GEMM, which ``modules.low_m_gemm``'s
+# AutoTuner race benchmarks once per tactic and runtime shape
+# (``TRTLLM_LOW_M_GEMM_BACKEND``). Its compiled form is specialized on M, N
+# and K, so every (M, tactic) of every eligible Linear is its own kernel:
+# keyed like ``dense_bf16_gemm_direct._get_compiled_direct_kernel``.
+_LOWM_DIRECT = "flashinfer_lowm_direct_gemm"
+
+
+def lowm_direct_spec(m: int, n: int, k: int, tactic, use_pdl: bool) -> str:
+    """Spec for one ``_get_compiled_direct_kernel(bf16, m, n, k, tactic, pdl)``."""
+    return json.dumps(
+        {
+            "kernel": _LOWM_DIRECT,
+            "m": int(m),
+            "n": int(n),
+            "k": int(k),
+            "tactic": [int(x) for x in tactic],
+            "pdl": bool(use_pdl),
+        },
+        sort_keys=True,
+    )
+
+
+def _build_lowm_direct(s: Dict[str, Any]):
+    """Compile one low-M direct GEMM the way ``_get_compiled_direct_kernel``
+    does (``cute.experimental.compile``, static compact BF16 operands, 32-byte
+    aligned), from fake tensors, for the helper's target arch."""
+    import cutlass
+    import cutlass.cute as cute
+    from cutlass.cute import experimental as cute_ext
+    from flashinfer.gemm.kernels import dense_bf16_gemm_direct as d
+
+    m, n, k = s["m"], s["n"], s["k"]
+    kernel = d.DirectDenseGemmKernel(
+        element_type=cutlass.BFloat16,
+        num_rows=m,
+        k_extent=k,
+        tactic=d.DirectTactic(*s["tactic"]),
+        use_pdl=s["pdl"],
+    )
+
+    def t(shape):
+        return cute.runtime.make_fake_compact_tensor(
+            cutlass.BFloat16, shape, stride_order=(1, 0), assumed_align=32
+        )
+
+    options = d._COMPILE_OPTIONS
+    arch = os.environ.get("CUTE_DSL_ARCH")
+    if arch:
+        options = f"{options} --gpu-arch {arch}"
+    stream = cute.runtime.make_fake_stream()
+    return cute_ext.compile(kernel, t((m, k)), t((n, k)), t((m, n)), stream, options=options)
+
+
 _BUILDERS = {
     _K123: _build_k123,
     _K4: _build_k4,
@@ -598,7 +655,7 @@ _BUILDERS = {
     _FP8_GEMM: _build_fp8_gemm,
 }
 # Builders that return an already compiled kernel instead of (fn, args, options).
-_PRECOMPILED = {_TOPK: _build_topk}
+_PRECOMPILED = {_TOPK: _build_topk, _LOWM_DIRECT: _build_lowm_direct}
 # Kernels compiled with TVM-FFI are loaded as TVM-FFI functions.
 _TVM_FFI = {_FI_NORM, _TOPK, _FP8_GEMM}
 
@@ -985,6 +1042,120 @@ class FlashInferNormProvider:
 
     def enumerate_specs(self) -> List[str]:
         return list(self.specs)
+
+
+class LowMDirectGemmProvider:
+    """Every FlashInfer low-M direct GEMM variant ``modules.low_m_gemm``'s
+    AutoTuner race benchmarks, while the low-M path is active
+    (``TRTLLM_LOW_M_GEMM_BACKEND``).
+
+    The race runs on every bias-free BF16 ``Linear`` the dispatcher attaches
+    to, at every M the autotuner profiles (``_M_TUNING_BUCKETS`` and the M of
+    each warmup batch, i.e. 1..``max_num_tokens`` within the low-M range), and
+    benchmarks each direct tactic valid for the shape; each (M, N, K, tactic)
+    is a separate ~1 s compile on the executor thread. They follow from the
+    Linear shapes and the engine limits, so the helpers build them while the
+    weights load.
+    """
+
+    def __init__(self, model, max_num_tokens: int):
+        self.shapes: List[Tuple[int, int]] = []
+        self.specs: List[str] = []
+        try:
+            from flashinfer.gemm.kernels import dense_bf16_gemm_direct as d
+
+            from .._utils import get_sm_version, is_sm_100f
+            from .modules import low_m_gemm as lm
+        except ImportError:
+            return
+        if not lm.LOW_M_GEMM_ACTIVE or not is_sm_100f(get_sm_version()):
+            return
+        import dataclasses
+
+        import torch
+
+        from .flashinfer_utils import get_env_enable_pdl
+        from .modules.linear import Linear, UnquantizedLinearMethod
+
+        # The modules the dispatcher attaches to (``LowMGemmDispatcher.attach``)
+        # whose forward reaches it: unquantized BF16 Linears off the custom
+        # cuBLAS path (``UnquantizedLinearMethod.apply``), and opt-in modules.
+        shapes = set()
+        for mod in model.modules():
+            if isinstance(mod, Linear):
+                if not isinstance(getattr(mod, "quant_method", None), UnquantizedLinearMethod):
+                    continue
+                if getattr(mod, "use_custom_cublas_mm", False):
+                    continue
+            elif not getattr(mod, lm.LOW_M_GEMM_OPT_IN_ATTR, False):
+                continue
+            if getattr(mod, "bias", None) is not None:
+                continue  # the direct kernel takes no bias, so it never races
+            w = getattr(mod, "weight", None)
+            if w is None or w.dim() != 2 or w.dtype != torch.bfloat16:
+                continue
+            n, k = int(w.shape[0]), int(w.shape[1])
+            if k % 128:
+                continue
+            shapes.add((n, k))
+        self.shapes = sorted(shapes)
+        if not self.shapes:
+            return
+        # The race profiles every tuning bucket (the autotuner's bucket list
+        # is not capped by the batch) plus the M of the shape that starts it:
+        # warmup's batches, up to max_num_tokens rows within the low-M range.
+        top = min(int(max_num_tokens), lm._MAX_M)
+        ms = sorted(set(lm._M_TUNING_BUCKETS) | set(range(1, top + 1)))
+        pdl = bool(get_env_enable_pdl())
+        seen = set()
+        for m in ms:
+            for n, k in self.shapes:
+                try:
+                    tactics = [d.default_tactic(m, n, k), *d.autotune_tactics(m, n, k)]
+                except ValueError:
+                    continue
+                for t in tactics:
+                    spec = lowm_direct_spec(m, n, k, dataclasses.astuple(t), pdl)
+                    if spec not in seen:
+                        seen.add(spec)
+                        self.specs.append(spec)
+
+    def __bool__(self):
+        return bool(self.specs)
+
+    def enumerate_specs(self) -> List[str]:
+        return list(self.specs)
+
+
+def install_lowm_direct_loader(loader: Callable[[str], Optional[Callable]]) -> bool:
+    """Route FlashInfer's ``_get_compiled_direct_kernel`` through
+    ``loader(spec)``: a helper-exported kernel, or None to compile in place
+    as before. The wrapper keeps the getter's ``functools.cache``, so a
+    variant is resolved once per process. Returns False if FlashInfer's
+    direct GEMM is unavailable."""
+    import functools
+
+    try:
+        import torch
+        from flashinfer.gemm.kernels import dense_bf16_gemm_direct as d
+    except ImportError:
+        return False
+    orig = d._get_compiled_direct_kernel
+    if getattr(orig, "_jitp_wrapped", False):
+        return True
+    import dataclasses
+
+    @functools.cache
+    def getter(dtype, m, n, k, tactic, use_pdl):
+        if dtype == torch.bfloat16:
+            fn = loader(lowm_direct_spec(m, n, k, dataclasses.astuple(tactic), use_pdl))
+            if fn is not None:
+                return fn
+        return orig(dtype, m, n, k, tactic, use_pdl)
+
+    getter._jitp_wrapped = True
+    d._get_compiled_direct_kernel = getter
+    return True
 
 
 def _modules_with_attention_backends(model) -> List[Any]:

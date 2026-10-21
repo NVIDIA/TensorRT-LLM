@@ -2630,8 +2630,17 @@ def _launch_disaggregated_server(disagg_config_file: str, llm_args: dict):
 
     # Set disagg role for telemetry (server_cfg.type is 'ctx' or 'gen')
     role_map = {"ctx": "context", "gen": "generation"}
-    os.environ[DisaggLauncherEnvs.TLLM_DISAGG_ROLE] = role_map.get(
-        server_cfg.type, "")
+    role = role_map.get(server_cfg.type, "")
+    os.environ[DisaggLauncherEnvs.TLLM_DISAGG_ROLE] = role
+    # The executor runs on the MPI worker ranks, which do not inherit this
+    # process's environment; env_overrides is exported on every rank before
+    # the executor is built (executor/worker.py), so the engine sees its
+    # role there too.
+    if role:
+        env_overrides = dict(llm_args.get("env_overrides") or {})
+        env_overrides.setdefault(DisaggLauncherEnvs.TLLM_DISAGG_ROLE.value,
+                                 role)
+        llm_args["env_overrides"] = env_overrides
 
     logger.info(
         f"rank {mpi_rank()} for index {instance_idx} launch the disagg server")

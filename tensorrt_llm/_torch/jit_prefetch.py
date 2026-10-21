@@ -42,7 +42,10 @@ layers build in their first forward (the TRTLLM-GEN attention launcher of
 GLM-5.3-Flash and MiniMax-M3), and the MXFP8 GEMM the autotuner warmup tunes
 for decode graphs (DeepSeek-V4.1's Engram WKV, MiniMax-M3;
 ``start_mxfp8_tune_builds``), from the moment the model is constructed; the
-sampling module from the start of warmup.
+sampling module from the start of warmup. The DeepGEMM kernels and
+FlashInfer's low-M BF16 GEMM variants follow from the weight shapes and the
+engine limits; they start once the weights are materialized on the GPU, while
+their values load (``start_weight_load_builds``).
 
 For every planned Triton variant, Triton's own binder computes Triton's own
 cache key, which is checked against the kernel's in-memory cache and then the
@@ -152,6 +155,19 @@ def warmup_jit_coverage_enabled() -> bool:
     if v is not None:
         return v == "1"
     return not prefetch_enabled()
+
+
+def disagg_context_only() -> bool:
+    """Whether this process is a disaggregated context (prefill) worker, set
+    by the disaggregated server for its executor ranks (``TRTLLM_DISAGG_ROLE``).
+
+    Such a worker serves context-only requests and hands the KV cache to a
+    generation worker; the only generation steps it runs are attention-DP
+    padding dummies. When the JIT-coverage passes are off
+    (``warmup_jit_coverage_enabled``), warmup then also skips the one that
+    exists only for the kernels of generation requests (the TRTLLM-Gen
+    generation FMHA's NVRTC grid)."""
+    return os.environ.get("TRTLLM_DISAGG_ROLE") == "context"
 
 
 def stats_enabled() -> bool:
@@ -397,6 +413,9 @@ def start_model_builds(model, rank: int = 0, llm_args=None) -> bool:
       whose plan also needs the KV cache's page size and dtypes, taken from
       ``llm_args``. Without it they start at the beginning of warmup instead.
 
+    The DeepGEMM and low-M GEMM kernels start a little later, once the weights
+    are on the GPU (``start_weight_load_builds``).
+
     Returns False if prefetch is off or nothing was started."""
     if not prefetch_enabled():
         return False
@@ -458,6 +477,78 @@ def start_model_builds(model, rank: int = 0, llm_args=None) -> bool:
         except Exception as e:  # noqa: BLE001 - the kernels then build in place
             logger.warning(f"[JIT prefetch] fmha_sm100 builds not started: {type(e).__name__}: {e}")
     return started
+
+
+def start_weight_load_builds(model, rank: int, deep_gemm_limits) -> bool:
+    """Start, in CPU-only helpers, the GEMM kernels ``model``'s first warmup
+    forwards and the autotuner warmup build, once its weights are
+    materialized on the GPU and while their values load from the checkpoint:
+
+    * the DeepGEMM FP8 Linear and MoE kernels (``start_deep_gemm_builds``);
+    * FlashInfer's low-M BF16 direct GEMM variants the low-M dispatcher's
+      AutoTuner race benchmarks (``jit_prefetch_cute_dsl.LowMDirectGemmProvider``).
+
+    ``deep_gemm_limits`` are the engine limits the providers plan from
+    (``max_num_tokens``, ``priority_ms``, ``first_ms``). Returns False if
+    prefetch is off or nothing was started."""
+    if not prefetch_enabled():
+        return False
+    started = start_deep_gemm_builds(model, rank, **deep_gemm_limits)
+    try:
+        from .cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
+
+        if IS_CUTLASS_DSL_AVAILABLE:
+            from . import jit_prefetch_cute_dsl as jcd
+
+            lowm_provider = jcd.LowMDirectGemmProvider(model, deep_gemm_limits["max_num_tokens"])
+            if lowm_provider:
+                prefetcher = JitPrefetcher.init(rank)
+                if prefetcher is not None:
+                    started = prefetcher.enable_lowm_direct_gemm(lowm_provider) or started
+    except Exception as e:  # noqa: BLE001 - the kernels then compile in place
+        logger.warning(f"[JIT prefetch] low-M GEMM builds not planned: {type(e).__name__}: {e}")
+    return started
+
+
+def start_deep_gemm_builds(
+    model, rank: int, max_num_tokens: int, priority_ms=(), first_ms=()
+) -> bool:
+    """Start the DeepGEMM helpers on the FP8 Linear and MoE kernels of
+    ``model`` while its weights load.
+
+    The variants follow from the weight shapes and the engine limits, which
+    is everything ``FP8LinearDeepGemmProvider`` and ``DeepGemmMoEProvider``
+    read. Started here, the ~10 s start-up of the helpers and the first
+    layouts the first warmup forwards need (``first_ms``, then ``priority_ms``,
+    then M = 1..16) are done by the time the weights are in; started at
+    warmup, the first forward waits for them. Shapes created by weight loading itself
+    come from the model's ``jit_prefetch_fp8_weight_read_shapes`` where it
+    names them, and are otherwise added at warmup
+    (``JitPrefetcher.refresh_deep_gemm``). Once per process; returns False if
+    prefetch is off or nothing was started."""
+    if not prefetch_enabled():
+        return False
+    try:
+        from .._utils import get_sm_version
+        from . import jit_prefetch_deep_gemm as jdg
+
+        if get_sm_version() not in (100, 103) or not jdg.supported():
+            return False
+        prefetcher = JitPrefetcher.init(rank)
+        if prefetcher is None or prefetcher.deep_gemm_enabled():
+            return False
+        dg_provider = jdg.FP8LinearDeepGemmProvider(
+            model, max_num_tokens=max_num_tokens, priority_ms=priority_ms, first_ms=first_ms
+        )
+        dg_moe = jdg.DeepGemmMoEProvider(model)
+        if not (dg_provider or dg_moe):
+            return False
+        return prefetcher.enable_deep_gemm(dg_provider, dg_moe)
+    except Exception as e:  # noqa: BLE001 - the helpers then start at warmup
+        logger.warning(
+            f"[JIT prefetch] DeepGEMM helpers not started at model load: {type(e).__name__}: {e}"
+        )
+        return False
 
 
 # FlashInfer modules the autotuner warmup's FlashInfer MXFP8 pass builds the
@@ -1009,6 +1100,7 @@ class JitPrefetcher:
         self._cd = None  # CuTe DSL KDA provider (jit_prefetch_cute_dsl)
         self._cd_dir = None
         self._fp8_gemm = False  # the FP8 blockwise GEMM loader is installed
+        self._lowm = False  # the low-M direct GEMM loader is installed
 
         self._executor_thread: Optional[int] = None
         # The thread running JitPrefetcher.tune, while it runs.
@@ -1150,6 +1242,65 @@ class JitPrefetcher:
     def deep_gemm_enabled(self) -> bool:
         """Whether ``enable_deep_gemm`` has started the DeepGEMM helpers."""
         return self._dg is not None
+
+    def refresh_deep_gemm(self, provider, moe_provider=None) -> int:
+        """Swap in providers built from the loaded model, keeping the helpers
+        ``enable_deep_gemm`` started from the constructed one.
+
+        Weight loading can add FP8 GEMM shapes and drops none. A model that
+        creates GEMMs while its weights load names their shapes up front
+        (Kimi K3's ``jit_prefetch_fp8_weight_read_shapes``), so the first
+        providers already plan them; the variants of any shape added here are
+        queued the way ``enable_deep_gemm`` queued the first ones. Returns the
+        number of new shapes."""
+        from . import jit_prefetch_deep_gemm as jdg
+
+        if self._dg is None:
+            return 0
+        old = set(self._dg.shapes)
+        old_moe = set(self._dg_moe.shapes) if self._dg_moe else set()
+        new = [s for s in provider.shapes if s not in old]
+        new_moe = [s for s in (moe_provider.shapes if moe_provider else ()) if s not in old_moe]
+        provider.adopt_seen(self._dg)
+        self._dg = provider
+        if moe_provider:
+            self._dg_moe = moe_provider
+        if not (new or new_moe):
+            return 0
+        extra = jdg.FP8LinearDeepGemmProvider.with_shapes(provider, new)
+        extra_moe = jdg.DeepGemmMoEProvider.with_shapes(moe_provider, new_moe) if new_moe else None
+
+        # The enumeration of the constructed model's shapes is already
+        # queued, so the new shapes' layouts the first warmup forwards reach
+        # go ahead of it, in that order: the token counts of warmup's first
+        # forwards (``first_ms``), the priority token counts, one token and a
+        # full max_num_tokens batch.
+        first_ms = list(dict.fromkeys(
+            [*extra.first_ms, *extra.priority_ms, 1, extra.max_num_tokens]
+        ))  # fmt: skip
+
+        def _enumerate():
+            n = 0
+            if extra_moe:
+                for spec in extra_moe.enumerate_specs():
+                    if self._submit(spec, spec, "deep_gemm", _PRIO_BATCH, kind=jdg.KIND):
+                        n += 1
+            for m in first_ms:
+                for spec in extra.specs_for_m(m):
+                    if self._submit(spec, spec, "deep_gemm", _PRIO_BATCH, kind=jdg.KIND):
+                        n += 1
+            world = int(os.environ.get("TLLM_JIT_PREFETCH_DG_WORLD", "0")) or _local_world()
+            for spec in extra.enumerate_specs(self.rank, world):
+                if self._submit(spec, spec, "deep_gemm", _PRIO_ENUM, kind=jdg.KIND):
+                    n += 1
+            self._event(f"DeepGEMM enumeration of shapes added by weight loading: {n} requests")
+
+        threading.Thread(target=_enumerate, daemon=True, name="jit_prefetch_dg_enum2").start()
+        self._event(
+            f"DeepGEMM prefetch: weight loading added {len(new)} FP8 Linear and "
+            f"{len(new_moe)} MoE shape(s)"
+        )
+        return len(new) + len(new_moe)
 
     def enable_deep_gemm(self, provider, moe_provider=None) -> bool:
         """Start the DeepGEMM helpers and planning (needs the patched DeepGEMM).
@@ -1398,11 +1549,25 @@ class JitPrefetcher:
         n = max(1, int(os.environ.get("TLLM_JIT_PREFETCH_CD_WORKERS", "2")))
         self._queues[jcd.KIND] = queue.PriorityQueue()
         props = _json.dumps(jcd.device_props())
-        self._spawn(
-            jcd.KIND, [sys.executable, "-u", helper, jcd.gpu_arch(), out_dir, props], env, n
-        )
+        self._cd_argv = [sys.executable, "-u", helper, jcd.gpu_arch(), out_dir, props]
+        self._cd_env = env
+        self._spawn(jcd.KIND, self._cd_argv, env, n)
         self._event(f"CuTe DSL helpers: {n}, exporting to {out_dir}")
         return True
+
+    def _grow_cute_dsl_helpers(self, num_variants: int) -> None:
+        """Add CuTe DSL helpers for a provider with many variants (one per
+        ~32, up to the per-rank helper budget), unless
+        ``TLLM_JIT_PREFETCH_CD_WORKERS`` fixes the pool size."""
+        from . import jit_prefetch_cute_dsl as jcd
+
+        if "TLLM_JIT_PREFETCH_CD_WORKERS" in os.environ or self._cd_dir is None:
+            return
+        have = len(self._procs_by_kind.get(jcd.KIND, []))
+        want = min(_default_workers(), max(have, num_variants // 32))
+        if want > have:
+            self._spawn(jcd.KIND, self._cd_argv, self._cd_env, want - have)
+            self._event(f"CuTe DSL helpers: {have} -> {want}")
 
     def _cute_dsl_load(self, spec: str):
         """Executor side: the helper-exported kernel for ``spec``; None to
@@ -1523,6 +1688,34 @@ class JitPrefetcher:
         self._event(
             f"CuTe DSL FP8 GEMM prefetch: {len(gemm_provider.shapes)} GEMM shape(s), "
             f"{len(gemm_provider.specs)} tactic(s)"
+        )
+        return True
+
+    def enable_lowm_direct_gemm(self, lowm_provider) -> bool:
+        """Compile FlashInfer's low-M BF16 direct GEMM variants the low-M
+        dispatcher's AutoTuner race benchmarks in the CuTe DSL helpers, and
+        have FlashInfer's compiled-kernel getter load them.
+
+        Called once the weights are materialized on the GPU
+        (``start_weight_load_builds``), before warmup: the race's first pass
+        compiles every (M bucket, Linear shape, direct tactic) on the executor
+        thread, ~1 s each and hundreds of them on a low-latency generation
+        worker. A variant whose export is missing when the race needs it
+        compiles in place, as without prefetch.
+        """
+        from . import jit_prefetch_cute_dsl as jcd
+
+        if self._lowm or not lowm_provider or not self._start_cute_dsl_helpers():
+            return False
+        if not jcd.install_lowm_direct_loader(self._cute_dsl_load):
+            return False
+        self._lowm = True
+        self._grow_cute_dsl_helpers(len(lowm_provider.specs))
+        for spec in lowm_provider.enumerate_specs():
+            self._submit(spec, spec, "cute_dsl", _PRIO_BATCH, kind=jcd.KIND)
+        self._event(
+            f"Low-M direct GEMM prefetch: {len(lowm_provider.shapes)} Linear shape(s), "
+            f"{len(lowm_provider.specs)} variant(s)"
         )
         return True
 

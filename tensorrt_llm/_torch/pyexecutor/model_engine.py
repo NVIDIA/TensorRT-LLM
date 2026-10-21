@@ -294,6 +294,10 @@ class PyTorchModelEngine(ModelEngine):
                 model_weights_memory_tag=model_weights_memory_tag,
                 model_weights_restore_mode=model_weights_restore_mode,
             )
+            # With JIT prefetch on, the loader starts the DeepGEMM helpers
+            # from these limits once the weights are materialized on the GPU.
+            self.model_loader.deep_gemm_limits = (
+                self._load_time_deep_gemm_limits())
             # Open checkpoint and load the LLM module object.
             self.model, moe_load_balancer = self.model_loader.load(
                 checkpoint_dir=model_path, checkpoint_loader=checkpoint_loader)
@@ -1112,22 +1116,26 @@ class PyTorchModelEngine(ModelEngine):
             from .. import jit_prefetch_deep_gemm as jdg
             from ..jit_prefetch import JitPrefetcher
             prefetcher = JitPrefetcher.init(rank=self.mapping.rank)
-            if prefetcher is None or prefetcher.deep_gemm_enabled():
+            if prefetcher is None:
                 return
             if get_sm_version() not in (100, 103) or not jdg.supported():
                 return
             dg_provider, dg_moe = self._deep_gemm_providers()
-            if dg_provider or dg_moe:
+            if prefetcher.deep_gemm_enabled():
+                # Started by the model loader on the constructed model: add
+                # the shapes weight loading created.
+                prefetcher.refresh_deep_gemm(dg_provider, dg_moe)
+            elif dg_provider or dg_moe:
                 prefetcher.enable_deep_gemm(dg_provider, dg_moe)
         except Exception as e:  # noqa: BLE001 - prefetch must never fail startup
             logger.warning(
                 f"[JIT prefetch] DeepGEMM helpers not started early: "
                 f"{type(e).__name__}: {e}")
 
-    def _deep_gemm_providers(self):
-        """The DeepGEMM FP8 Linear and MoE providers of this engine."""
-        from .. import jit_prefetch_deep_gemm as jdg
-
+    def _deep_gemm_limits(self, graph_batch_sizes, draft_tokens: int) -> dict:
+        """The engine limits the DeepGEMM FP8 Linear provider plans from,
+        for CUDA graph batch sizes ``graph_batch_sizes`` and ``draft_tokens``
+        draft tokens per generation request."""
         # MLA with a cached prefix runs kv_b_proj over up to chunk_size x
         # chunked_prefill_buffer_batch_size cached tokens per loop, more
         # than max_num_tokens rows.
@@ -1145,15 +1153,51 @@ class PyTorchModelEngine(ModelEngine):
         # context token, both together) and max_num_tokens, the general
         # warmup's and the autotuner's pure-context shape.
         tokens_per_request = 1 + self.original_max_total_draft_tokens
-        graph_bs = self._cuda_graph_batch_sizes or []
+        graph_bs = graph_batch_sizes or []
         graph_ms = sorted({bs * tokens_per_request
                            for bs in graph_bs} | set(graph_bs))
-        gen_tokens = 1 + self.max_total_draft_tokens
-        dg_provider = jdg.FP8LinearDeepGemmProvider(
-            self.model,
-            max_num_tokens=max_m,
-            priority_ms=graph_ms,
-            first_ms=(gen_tokens, 1, gen_tokens + 1, self.max_num_tokens))
+        gen_tokens = 1 + draft_tokens
+        return {
+            "max_num_tokens": max_m,
+            "priority_ms": graph_ms,
+            "first_ms": (gen_tokens, 1, gen_tokens + 1, self.max_num_tokens),
+        }
+
+    def _load_time_deep_gemm_limits(self) -> Optional[dict]:
+        """``_deep_gemm_limits`` from the arguments alone, for the model
+        loader to start the DeepGEMM helpers while the weights load; None
+        with prefetch off or limits not known before the model is loaded
+        (the helpers then start at warmup)."""
+        from ..jit_prefetch import prefetch_enabled
+        if not prefetch_enabled():
+            return None
+        if self.max_num_tokens is None or self.batch_size is None:
+            return None  # set from the model's config once it is loaded
+        try:
+            cuda_graph_config = self.llm_args.cuda_graph_config
+            graph_bs = []
+            if isinstance(cuda_graph_config, CudaGraphConfig):
+                graph_bs = filter_cuda_graph_batch_sizes(
+                    cuda_graph_config.batch_sizes or [], self.batch_size,
+                    self.max_num_tokens,
+                    1 + self.original_max_total_draft_tokens,
+                    cuda_graph_config.enable_padding)
+            # The loaded model can still update the speculative config; the
+            # arguments' draft length is the one known now.
+            return self._deep_gemm_limits(graph_bs,
+                                          self.original_max_total_draft_tokens)
+        except Exception as e:  # noqa: BLE001 - prefetch must never fail startup
+            logger.warning(f"[JIT prefetch] DeepGEMM limits not known at load: "
+                           f"{type(e).__name__}: {e}")
+            return None
+
+    def _deep_gemm_providers(self):
+        """The DeepGEMM FP8 Linear and MoE providers of this engine."""
+        from .. import jit_prefetch_deep_gemm as jdg
+
+        limits = self._deep_gemm_limits(self._cuda_graph_batch_sizes,
+                                        self.max_total_draft_tokens)
+        dg_provider = jdg.FP8LinearDeepGemmProvider(self.model, **limits)
         return dg_provider, jdg.DeepGemmMoEProvider(self.model)
 
     def _init_jit_prefetch(self,

@@ -162,6 +162,14 @@ class DeepGemmMoEProvider:
                     shapes.add(tuple(int(x) for x in w.shape))
         self.shapes = sorted(shapes)
 
+    @classmethod
+    def with_shapes(cls, base: "DeepGemmMoEProvider", shapes) -> "DeepGemmMoEProvider":
+        """A provider over ``shapes`` only, otherwise like ``base``."""
+        p = cls.__new__(cls)
+        p.__dict__.update(base.__dict__)
+        p.shapes = sorted(shapes)
+        return p
+
     def __bool__(self):
         return bool(self.shapes)
 
@@ -291,6 +299,19 @@ class FP8LinearDeepGemmProvider:
                 continue
             n, k = int(w.shape[0]), int(w.shape[1])
             shapes.add((n, k))
+        # GEMMs a model creates only while its weights load (Kimi K3's FP8
+        # weight-read projections): the model names their shapes up front,
+        # so a provider built before loading plans them too.
+        for mod in model.modules():
+            loaded = getattr(mod, "jit_prefetch_fp8_weight_read_shapes", None)
+            if not callable(loaded):
+                continue
+            try:
+                shapes.update((int(n), int(k)) for n, k in loaded())
+            except Exception as e:  # noqa: BLE001 - planned once loaded instead
+                logger.warning(
+                    f"[JIT prefetch] FP8 weight-read shapes not predicted: {type(e).__name__}: {e}"
+                )
         self.shapes = sorted(shapes)
         self.max_num_tokens = int(max_num_tokens)
         # Token counts known to run before serving (the CUDA graph shapes):
@@ -301,6 +322,21 @@ class FP8LinearDeepGemmProvider:
             {int(m) for m in priority_ms if 0 < int(m) <= self.max_num_tokens} - set(self.first_ms)
         )
         self._seen_m: set = set()
+
+    @classmethod
+    def with_shapes(cls, base: "FP8LinearDeepGemmProvider", shapes) -> "FP8LinearDeepGemmProvider":
+        """A provider over ``shapes`` only, otherwise like ``base`` (its
+        limits, priority token counts and the M it has planned so far)."""
+        p = cls.__new__(cls)
+        p.__dict__.update(base.__dict__)
+        p.shapes = sorted(shapes)
+        p._seen_m = set()
+        return p
+
+    def adopt_seen(self, other: "FP8LinearDeepGemmProvider") -> None:
+        """Continue from the M ``other`` has planned for batches; the shapes
+        ``other`` did not have are queued by enumeration instead."""
+        self._seen_m = set(other._seen_m)
 
     def __bool__(self):
         return bool(self.shapes)

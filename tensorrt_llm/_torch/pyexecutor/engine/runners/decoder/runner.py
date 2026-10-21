@@ -1469,6 +1469,23 @@ class DecoderRunner(ScheduledModelRunner):
                 "Skipped TRTLLM-Gen flashinfer_trtllm_gen FMHA lib JIT warmup When enable cute_dsl_mla FMHA lib"
             )
 
+        # A disaggregated context worker never decodes a real request (its
+        # only generation steps are attention-DP padding dummies), so the
+        # TRTLLM-Gen generation FMHA's NVRTC grid over every batch size x KV
+        # length (tens of seconds per rank) is a JIT-coverage pass it can
+        # drop with the others. The forward still runs, on the kernels of its
+        # own shape.
+        from tensorrt_llm._torch.jit_prefetch import (
+            disagg_context_only,
+            warmup_jit_coverage_enabled,
+        )
+
+        gen_fmha_grid = not disagg_context_only() or warmup_jit_coverage_enabled()
+        if not gen_fmha_grid:
+            logger.info(
+                "Context-only worker: skipping the TRTLLM-Gen generation FMHA JIT grid in warmup"
+            )
+
         for num_tokens, num_gen_requests in warmup_requests_configs:
             warmup_request = self._create_warmup_request(
                 resource_manager, num_tokens=num_tokens, num_gen_requests=num_gen_requests
@@ -1493,7 +1510,9 @@ class DecoderRunner(ScheduledModelRunner):
                     record=False,
                     log_start=True,
                 ):
-                    with trtllm_gen_fmha_jit_warmup():
+                    with (
+                        trtllm_gen_fmha_jit_warmup() if gen_fmha_grid else contextlib.nullcontext()
+                    ):
                         self._forward_warmup(
                             batch,
                             resource_manager,

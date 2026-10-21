@@ -662,3 +662,93 @@ def test_start_model_builds_queues_the_gemm_tactics_before_warmup(monkeypatch):
     queued.clear()
     assert not jp.start_model_builds(model)
     assert queued == [] and ops.fp8_gemm_loader is None
+
+
+def test_lowm_direct_export_is_what_flashinfer_runs(tmp_path):
+    """FlashInfer's low-M BF16 direct GEMM, compiled by the helper (no
+    visible GPU) for the variants the low-M AutoTuner race benchmarks and
+    loaded through the wrapped getter, matches FlashInfer's own compile
+    bitwise; the getter compiles nothing."""
+    import dataclasses
+
+    d = pytest.importorskip("flashinfer.gemm.kernels.dense_bf16_gemm_direct")
+
+    cases = [(1, 16896, 7168), (7, 768, 7168), (14, 7168, 8448)]
+    variants = [(m, n, k, t) for m, n, k in cases for t in d.autotune_tactics(m, n, k)[:2]]
+    specs = [jcd.lowm_direct_spec(m, n, k, dataclasses.astuple(t), True) for m, n, k, t in variants]
+    out_dir = str(tmp_path / "aot")
+    replies = _helper_build(out_dir, specs)
+    assert all(r["ok"] and r["built"] for r in replies), replies
+
+    g = torch.Generator(device="cuda").manual_seed(0)
+    inputs = {}
+    for m, n, k, _ in variants:
+        if (m, n, k) not in inputs:
+            a = torch.randn(m, k, generator=g, device="cuda").to(torch.bfloat16)
+            b = torch.randn(n, k, generator=g, device="cuda").to(torch.bfloat16)
+            inputs[(m, n, k)] = (a, b)
+
+    def run():
+        outs = []
+        for m, n, k, t in variants:
+            a, b = inputs[(m, n, k)]
+            out = torch.empty(m, n, dtype=torch.bfloat16, device="cuda")
+            d.run_direct_dense(a, b.t(), out, True, t)
+            outs.append(out)
+        torch.cuda.synchronize()
+        return outs
+
+    saved = d._get_compiled_direct_kernel
+    try:
+        ref = run()
+        loads = []
+
+        def loader(spec):
+            fn = jcd.load(spec, out_dir)
+            loads.append(fn is not None)
+            return fn
+
+        assert jcd.install_lowm_direct_loader(loader)
+        got = run()
+    finally:
+        d._get_compiled_direct_kernel = saved
+    assert loads == [True] * len(variants), loads
+    for a, b in zip(got, ref):
+        assert torch.equal(a, b)
+
+
+def test_lowm_provider_lists_the_race_variants(monkeypatch):
+    """With the low-M path on, the provider sees the bias-free BF16 Linears
+    of the constructed model and lists every direct tactic at every M the
+    race profiles (the tuning buckets and 1..max_num_tokens); quantized and
+    biased Linears never race the direct kernel."""
+    import dataclasses
+
+    d = pytest.importorskip("flashinfer.gemm.kernels.dense_bf16_gemm_direct")
+    from tensorrt_llm._torch.modules import low_m_gemm as lm
+    from tensorrt_llm._torch.modules.linear import Linear
+    from tensorrt_llm.models.modeling_utils import QuantConfig
+    from tensorrt_llm.quantization.mode import QuantAlgo
+
+    monkeypatch.setattr(lm, "LOW_M_GEMM_ACTIVE", True)
+    model = torch.nn.Module()
+    model.a = Linear(7168, 768, bias=False, dtype=torch.bfloat16)
+    model.b = Linear(7168, 768, bias=True, dtype=torch.bfloat16)
+    model.c = Linear(
+        7168, 1024, bias=False, dtype=torch.bfloat16,
+        quant_config=QuantConfig(quant_algo=QuantAlgo.FP8_BLOCK_SCALES),
+    )  # fmt: skip
+    from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
+
+    p = jcd.LowMDirectGemmProvider(model, max_num_tokens=14)
+    assert p.shapes == [(768, 7168)]
+    ms = sorted(set(lm._M_TUNING_BUCKETS) | set(range(1, 15)))
+    pdl = bool(get_env_enable_pdl())
+    want = {
+        jcd.lowm_direct_spec(m, 768, 7168, dataclasses.astuple(t), pdl)
+        for m in ms
+        for t in [d.default_tactic(m, 768, 7168), *d.autotune_tactics(m, 768, 7168)]
+    }
+    assert set(p.specs) == want and len(p.specs) == len(want)
+    monkeypatch.setattr(lm, "LOW_M_GEMM_ACTIVE", False)
+    assert not jcd.LowMDirectGemmProvider(model, max_num_tokens=14)

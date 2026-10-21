@@ -1865,3 +1865,117 @@ class TestWarmupCleanup(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "role,prefetch,coverage,grid",
+    [
+        (None, "1", None, True),
+        ("generation", "1", None, True),
+        ("context", "1", None, False),
+        ("context", None, None, True),
+        ("context", "1", "1", True),
+        ("context", None, "0", False),
+    ],
+)
+def test_attention_warmup_skips_gen_fmha_grid_on_context_workers(
+    monkeypatch: pytest.MonkeyPatch, role, prefetch, coverage, grid
+) -> None:
+    """With the JIT-coverage passes off (JIT prefetch on, or
+    TLLM_WARMUP_JIT_COVERAGE=0), a disaggregated context worker runs warmup's
+    attention forward without the TRTLLM-Gen generation FMHA's NVRTC grid;
+    every other role, and a context worker with the passes on, keeps it."""
+    from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
+
+    for name, value in (
+        ("TRTLLM_DISAGG_ROLE", role),
+        ("TLLM_JIT_PREFETCH", prefetch),
+        ("TLLM_WARMUP_JIT_COVERAGE", coverage),
+    ):
+        if value is None:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, value)
+    runner = object.__new__(DecoderRunner)
+    runner._config = SimpleNamespace(
+        attention_backend=SimpleNamespace(Metadata=TrtllmAttentionMetadata),
+        max_total_draft_tokens=0,
+        is_spec_decode=False,
+        spec_config=None,
+    )
+    runner.guided_decoder = None
+    runner._trtllm_gen_jit_warmup = False
+    runner._warmup_timer = _WarmupTimer(rank=0)
+    seen = []
+    monkeypatch.setattr(runner, "_create_warmup_request", lambda *a, **k: object(), raising=False)
+    monkeypatch.setattr(
+        runner, "_release_batch_context", lambda *a, **k: contextlib.nullcontext(object()),
+        raising=False,
+    )  # fmt: skip
+    monkeypatch.setattr(runner, "_should_run_warmup_batch", lambda *a, **k: True, raising=False)
+    monkeypatch.setattr(runner, "no_cuda_graph", lambda: contextlib.nullcontext(), raising=False)
+    monkeypatch.setattr(
+        runner, "_forward_warmup", lambda *a, **k: seen.append(runner._trtllm_gen_jit_warmup),
+        raising=False,
+    )  # fmt: skip
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda *a, **k: None)
+    # A Mamba-hybrid model (Kimi K3) runs only the generation request here.
+    runner._run_attention_warmup(Mock(), can_run_general_warmup=False)
+    assert seen == [grid]
+    assert runner._trtllm_gen_jit_warmup is False
+
+
+@pytest.mark.cpu_only
+def test_disagg_server_forwards_its_role_to_the_executor_ranks(monkeypatch: pytest.MonkeyPatch):
+    """The disaggregated server passes its role to the executor's MPI ranks
+    through env_overrides (they do not inherit the server's environment),
+    keeping any override the config already sets."""
+    from tensorrt_llm.commands import serve
+
+    launched = {}
+    cfg = SimpleNamespace(
+        server_configs=[SimpleNamespace(type="ctx", hostname="h", port=1)],
+        allow_request_chat_template=False,
+        internal_request_auth_key=None,
+    )
+    monkeypatch.setenv("TLLM_DISAGG_INSTANCE_IDX", "0")
+    monkeypatch.setattr(serve, "parse_disagg_config_file", lambda path: cfg)
+    monkeypatch.setattr(serve, "launch_server", lambda **kw: launched.update(kw))
+    monkeypatch.setattr(serve, "mpi_rank", lambda: 0, raising=False)
+    serve._launch_disaggregated_server("cfg.yaml", {"env_overrides": {"A": "1"}})
+    assert launched["llm_args"]["env_overrides"] == {"A": "1", "TRTLLM_DISAGG_ROLE": "context"}
+    assert os.environ["TRTLLM_DISAGG_ROLE"] == "context"
+    monkeypatch.delenv("TRTLLM_DISAGG_ROLE", raising=False)
+
+
+@pytest.mark.cpu_only
+def test_load_time_deep_gemm_limits_lead_with_the_warmup_token_counts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The DeepGEMM limits the model loader starts the helpers from: every
+    CUDA graph token count, and before those the token counts of warmup's
+    first forwards (one generation request, one context token, both
+    together, a max_num_tokens context batch), with the draft length the
+    arguments give. Prefetch off, or limits unknown before the model is
+    loaded, leave the start to warmup."""
+    from tensorrt_llm._torch.attention.backends.interface import AttentionRuntimeFeatures
+    from tensorrt_llm.llmapi.llm_args import CudaGraphConfig
+
+    engine = object.__new__(PyTorchModelEngine)
+    engine.attn_runtime_features = AttentionRuntimeFeatures()
+    engine.original_max_total_draft_tokens = 6
+    engine.batch_size = 2
+    engine.max_num_tokens = 14
+    engine.llm_args = SimpleNamespace(cuda_graph_config=CudaGraphConfig(batch_sizes=[1, 2, 4]))
+    monkeypatch.delenv("TLLM_JIT_PREFETCH", raising=False)
+    assert engine._load_time_deep_gemm_limits() is None
+    monkeypatch.setenv("TLLM_JIT_PREFETCH", "1")
+    # Graph batch sizes above max_batch_size are dropped, as the engine does.
+    assert engine._load_time_deep_gemm_limits() == {
+        "max_num_tokens": 14,
+        "priority_ms": [1, 2, 7, 14],
+        "first_ms": (7, 1, 8, 14),
+    }
+    engine.max_num_tokens = None
+    assert engine._load_time_deep_gemm_limits() is None
