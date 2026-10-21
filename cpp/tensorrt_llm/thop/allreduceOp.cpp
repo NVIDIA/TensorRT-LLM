@@ -2609,6 +2609,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "end_nccl_window_tensor_scope.tracked(Tensor[] inputs, Tensor[] outputs, bool failed, int entry_depth) -> ()");
     m.def("set_nccl_window_graph_owner(int owner) -> ()");
     m.def("release_nccl_window_graph_owner(int owner) -> ()");
+    m.def("set_nccl_window_allocation_suppressed(bool suppressed) -> bool");
     m.def("get_nccl_window_buffer_release_epoch() -> int");
     m.def("promote_nccl_window_buffer_releases(int device, int release_epoch) -> ()");
     m.def(
@@ -2671,6 +2672,12 @@ TORCH_LIBRARY_IMPL(trtllm, CatchAll, m)
     m.impl("release_nccl_window_graph_owner",
         [](int64_t owner)
         { tensorrt_llm::common::nccl_util::NCCLWindowAllocator::getInstance().releaseGraphPoolOwner(owner); });
+    m.impl("set_nccl_window_allocation_suppressed",
+        [](bool suppressed)
+        {
+            return tensorrt_llm::common::nccl_util::NCCLWindowAllocator::getInstance().setWindowAllocationSuppressed(
+                suppressed);
+        });
     m.impl("get_nccl_window_buffer_release_epoch",
         []()
         {
@@ -2687,6 +2694,7 @@ TORCH_LIBRARY_IMPL(trtllm, CatchAll, m)
 #else
     m.impl("set_nccl_window_graph_owner", [](int64_t) {});
     m.impl("release_nccl_window_graph_owner", [](int64_t) {});
+    m.impl("set_nccl_window_allocation_suppressed", [](bool) { return false; });
     m.impl("get_nccl_window_buffer_release_epoch", []() { return int64_t{0}; });
     m.impl("promote_nccl_window_buffer_releases", [](int64_t, int64_t) {});
 #endif
