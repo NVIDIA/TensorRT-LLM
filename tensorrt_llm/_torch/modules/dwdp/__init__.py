@@ -16,7 +16,7 @@
 """DWDP (Distributed Weight Data Parallelism) VA-based infrastructure.
 
 MNNVL-based physical memory allocation, composite VA layout, page-aligned
-mapping, and double buffer lifecycle management for DWDP expert weights.
+mapping, and prefetch slot lifecycle management for DWDP expert weights.
 
 Key design principles:
 - No D2D copy: local experts are always zero-copy via cuMemMap

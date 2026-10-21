@@ -217,7 +217,7 @@ def _drive(h: _Harness, moe_delay: int, num_slots: int) -> None:
 
 
 @pytest.mark.parametrize("num_layers", [4, 5])
-@pytest.mark.parametrize("num_slots", [2])
+@pytest.mark.parametrize("num_slots", [2, 3])
 @pytest.mark.parametrize("slow", ["moe", "copy"])
 def test_bound_weights_across_passes(monkeypatch, num_layers, num_slots, slow):
     monkeypatch.delenv("TRTLLM_DWDP_PREFETCH_GATHER", raising=False)
@@ -278,7 +278,7 @@ def _enable_peer_access(devices: List[int]) -> None:
             pytest.skip(f"cudaDeviceEnablePeerAccess({dev}) failed: {err}")
 
 
-@pytest.mark.parametrize("num_slots", [2])
+@pytest.mark.parametrize("num_slots", [2, 3])
 @pytest.mark.parametrize("slow", ["moe", "copy"])
 def test_fabric_gather_from_peer_gpus(monkeypatch, num_slots, slow):
     """The production transport: the SM gather kernel pulls the remote experts from peer GPUs."""

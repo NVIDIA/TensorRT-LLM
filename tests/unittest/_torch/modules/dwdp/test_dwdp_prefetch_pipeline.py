@@ -27,6 +27,7 @@ from tensorrt_llm._torch.modules.dwdp.weight_manager import DWDPWeightManager
 pytestmark = pytest.mark.cpu_only
 
 LAYERS = [3, 5, 7]
+NUM_SLOTS = 2
 
 
 class _Event:
@@ -48,14 +49,18 @@ class _Stream:
 
 
 class TestDWDPPrefetchPipeline:
+    num_slots = NUM_SLOTS
+    repeated_layers: Tuple[int, ...] = ()
+
     def setup_method(self):
         self.log: List[Tuple[str, ...]] = []
         self.weight_buffer = MagicMock()
         self.weight_buffer.device_id = 0
         self.weight_buffer.local_start = 0
         self.weight_buffer.local_end = 2
+        self.weight_buffer.num_slots = self.num_slots
         self.weight_buffer.buffer_index_for_layer.side_effect = lambda layer: (
-            LAYERS.index(layer) % 2
+            LAYERS.index(layer) % self.num_slots
         )
         self.weight_buffer.get_full_tensor.side_effect = lambda layer, name: torch.tensor(
             [float(layer)]
@@ -63,9 +68,9 @@ class TestDWDPPrefetchPipeline:
 
         self.copy_stream = _Stream("copy", self.log)
         self.compute_stream = _Stream("compute", self.log)
-        events = iter(
-            [_Event(name, self.log) for name in ("prefetch0", "prefetch1", "consume0", "consume1")]
-        )
+        names = [f"prefetch{slot}" for slot in range(self.num_slots)]
+        names += [f"consume{slot}" for slot in range(self.num_slots)]
+        events = iter([_Event(name, self.log) for name in names])
         self.patches = [
             patch(
                 "tensorrt_llm._torch.modules.dwdp.weight_manager.torch.cuda.Stream",
@@ -104,6 +109,7 @@ class TestDWDPPrefetchPipeline:
             weight_names=["gate_up_proj", "down_proj"],
             dwdp_rank=0,
             dwdp_size=2,
+            repeated_layer_indices=self.repeated_layers,
         )
         self.backend = nn.Module()
         self.backend.gate_up_proj = nn.Parameter(torch.empty(1), requires_grad=False)
@@ -123,12 +129,18 @@ class TestDWDPPrefetchPipeline:
             ("record", f"prefetch{slot}", "copy"),
         ]
 
+    def _first_layers(self) -> List[Tuple[str, ...]]:
+        """Copies of the first MoE layers, one per slot."""
+        return [entry for slot in range(self.num_slots) for entry in self._copy(LAYERS[slot], slot)]
+
     def _bind(self, layer: int) -> None:
         self.manager.wait_and_bind(self.backend, layer)
         assert self.backend.gate_up_proj.data.item() == float(layer)
         assert self.backend.down_proj.data.item() == float(layer)
 
     def test_event_order_across_passes(self):
+        if self.num_slots != 2:
+            pytest.skip("two-slot sequence")
         self.manager.start_forward()
         assert self.log == self._copy(3, 0) + self._copy(5, 1)
 
@@ -169,14 +181,14 @@ class TestDWDPPrefetchPipeline:
 
     def test_bind_without_start_forward_issues_its_copy_first(self):
         self._bind(3)
-        assert self.log == self._copy(3, 0) + self._copy(5, 1) + [("wait", "compute", "prefetch0")]
+        assert self.log == self._first_layers() + [("wait", "compute", "prefetch0")]
 
     def test_abandoned_pass_synchronizes_before_reusing_slots(self):
         self.manager.start_forward()
         self._bind(3)
         self.log.clear()
         self.manager.start_forward()
-        assert self.log == [("synchronize",)] + self._copy(3, 0) + self._copy(5, 1)
+        assert self.log == [("synchronize",)] + self._first_layers()
 
     def test_invalidate_regathers_the_first_layers(self):
         self.manager.start_forward()
@@ -187,10 +199,89 @@ class TestDWDPPrefetchPipeline:
         self.manager.invalidate_prefetch()
         assert self.log == []
         self.manager.start_forward()
-        assert self.log == self._copy(3, 0) + self._copy(5, 1)
+        assert self.log == self._first_layers()
 
     def test_unknown_layer_raises(self):
         with pytest.raises(KeyError):
             self.manager.wait_and_bind(self.backend, 4)
         with pytest.raises(KeyError):
             self.manager.finish_layer(4)
+
+
+class TestDWDPPrefetchPipelineRepeatedLayer(TestDWDPPrefetchPipeline):
+    """The last MoE layer runs three times per pass, like the one-model MTP-Eagle layer."""
+
+    repeated_layers = (7,)
+
+    def _pass(self, repeats: int = 3) -> None:
+        for layer in LAYERS[:-1] + [LAYERS[-1]] * repeats:
+            self._bind(layer)
+            self.manager.finish_layer(layer)
+
+    def test_event_order_across_passes(self):
+        self.manager.start_forward()
+        self._bind(3)
+        self.manager.finish_layer(3)
+        self._bind(5)
+        self.manager.finish_layer(5)
+        self.log.clear()
+
+        # Every use of layer 7 binds the copy in slot 0; the slot stays held.
+        for _ in range(3):
+            self._bind(7)
+            self.manager.finish_layer(7)
+        assert self.log == [("wait", "compute", "prefetch0")] * 3
+
+        # The next pass releases it after the last use and gathers its first layers once.
+        self.log.clear()
+        self.manager.start_forward()
+        assert self.log == [("record", "consume0", "compute")] + self._first_layers()
+        self.log.clear()
+        self._pass()
+        self.manager.start_forward()
+        copies = [entry for entry in self.log if entry[0] == "copy"]
+        assert copies == [("copy", 7), ("copy", 3), ("copy", 5)]
+        assert self.manager._schedule.num_restarts == 0
+
+    def test_invalidate_regathers_the_first_layers(self):
+        self.manager.start_forward()
+        self._pass()
+        self.log.clear()
+        self.manager.invalidate_prefetch()
+        assert self.log == [("record", "consume0", "compute")]
+        self.log.clear()
+        self.manager.start_forward()
+        assert self.log == self._first_layers()
+
+    def test_repeated_layer_must_be_a_dwdp_layer(self):
+        with pytest.raises(ValueError):
+            DWDPWeightManager(
+                weight_buffer=self.weight_buffer,
+                peer_views={},
+                peer_ranges=[(0, 2), (2, 4)],
+                moe_layer_indices=LAYERS,
+                weight_names=["gate_up_proj", "down_proj"],
+                dwdp_rank=0,
+                dwdp_size=2,
+                repeated_layer_indices=[4],
+            )
+
+
+class TestDWDPPrefetchPipelineThreeSlots(TestDWDPPrefetchPipeline):
+    num_slots = 3
+
+    def test_three_slots_prefetch_a_whole_pass_ahead(self):
+        self.manager.start_forward()
+        assert self.log == self._copy(3, 0) + self._copy(5, 1) + self._copy(7, 2)
+        for layer, slot in zip(LAYERS, range(3)):
+            self.log.clear()
+            self._bind(layer)
+            self.manager.finish_layer(layer)
+            # Each finish frees the slot of the same layer in the next pass.
+            assert self.log == [
+                ("wait", "compute", f"prefetch{slot}"),
+                ("record", f"consume{slot}", "compute"),
+            ] + self._copy(layer, slot)
+        self.log.clear()
+        self.manager.start_forward()
+        assert self.log == []

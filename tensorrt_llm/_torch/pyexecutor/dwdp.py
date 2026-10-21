@@ -166,6 +166,8 @@ class DwdpManager:
 
         # SSOT for MoE layer indices; populated by configurable_moe.add_layer()
         self._registered_layers: List[int] = []
+        # Layers that run several times in a row per pass; see add_repeated_layer()
+        self._repeated_layers: List[int] = []
 
         # Set by setup(model); None until then
         self._weight_manager: Optional[DWDPWeightManager] = None
@@ -260,6 +262,16 @@ class DwdpManager:
             return
         self._registered_layers.append(layer_idx)
 
+    def add_repeated_layer(self, layer_idx: int) -> None:
+        """Declare that layer ``layer_idx`` runs several times in a row per forward pass.
+
+        Called by models that reuse a decoder layer, e.g. the one-model MTP-Eagle layer that runs
+        once per draft step. Its repeats bind the expert copy still in the prefetch slot instead
+        of gathering the layer again. Layers whose MoE does not use DWDP are ignored.
+        """
+        if layer_idx not in self._repeated_layers:
+            self._repeated_layers.append(layer_idx)
+
     def setup(self, model: nn.Module) -> Optional[DWDPWeightManager]:
         """Run the VA initialization pipeline on ``model``.
 
@@ -280,6 +292,10 @@ class DwdpManager:
             num_experts_per_worker=self.num_experts_per_worker,
             num_prefetch_experts=self.num_prefetch_experts,
             contention_opt=self.config.contention_opt,
+            num_prefetch_slots=self.config.num_prefetch_slots,
+            repeated_layer_indices=[
+                layer for layer in self._repeated_layers if layer in self._registered_layers
+            ],
         )
         self._model_ref = weakref.ref(model)
         if self._store_rendezvous:

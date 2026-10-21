@@ -13,15 +13,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Page pool for DWDP remote double buffer.
+"""Page pool for the DWDP remote prefetch slots.
 
 The page pool manages per-page fabric handles for the remote regions of the
-composite buffer. Two pools (slot 0, slot 1) support double buffering.
+composite buffer. One pool per prefetch slot (``DwdpConfig.num_prefetch_slots``,
+two by default).
 
 Each pool is a list of page-sized fabric handles that can be mapped at different
 VA positions for different layers. Pages are reused across layers in the same slot:
     - Layer 3 (buf_idx=0): pool[0] pages 0..K for pre/post regions
-    - Layer 5 (buf_idx=0): SAME pool[0] pages (double buffer reuse)
+    - Layer 5 (buf_idx=0): SAME pool[0] pages (slot reuse)
     - Layer 4 (buf_idx=1): pool[1] pages 0..M
 
 This naturally handles heterogeneous layers: each layer maps exactly the pages
@@ -50,15 +51,15 @@ from .vmm import (
 
 
 class PagePool:
-    """Pool of per-page fabric handles for remote double buffer.
+    """Pool of per-page fabric handles for the remote prefetch slots.
 
-    Two pools (slot 0, slot 1) for double buffering. Each pool is a list
+    One pool per prefetch slot. Each pool is a list
     of page-sized fabric handles. Different layers map these pages at
     different VA positions within their composite VA.
 
     Pages are reused across layers in the same slot:
         - Layer 3 (buf_idx=0): pool[0] pages 0..K for pre/post regions
-        - Layer 5 (buf_idx=0): SAME pool[0] pages (double buffer reuse)
+        - Layer 5 (buf_idx=0): SAME pool[0] pages (slot reuse)
         - Layer 4 (buf_idx=1): pool[1] pages 0..M
 
     Pool page size vs VMM granularity:
@@ -101,8 +102,8 @@ class PagePool:
         """Create a page pool with the specified slot sizes.
 
         Args:
-            slot_sizes: [max_remote_bytes_slot0, max_remote_bytes_slot1]
-                Computed as max over all layers assigned to each slot.
+            slot_sizes: Per-slot ``max_remote_bytes``, computed as max over
+                all layers assigned to each slot.
             device_id: CUDA device ordinal.
             granularity: VMM page granularity in bytes. If None, queries the
                 device.
@@ -180,8 +181,8 @@ class PagePool:
         """Factory method to create a page pool.
 
         Args:
-            slot_sizes: [max_remote_bytes_slot0, max_remote_bytes_slot1]
-                Computed as max over all layers assigned to each slot.
+            slot_sizes: Per-slot ``max_remote_bytes``, computed as max over
+                all layers assigned to each slot.
             device_id: CUDA device ordinal.
             page_size: Pool page handle size in bytes. If None, uses default
                 (8 * granularity = 16MB on GB200).
@@ -208,14 +209,14 @@ class PagePool:
 
     @property
     def num_slots(self) -> int:
-        """Get number of double buffer slots."""
+        """Get number of prefetch slots."""
         return len(self._page_handles)
 
     def num_pages(self, slot: int) -> int:
         """Get number of pages in a slot.
 
         Args:
-            slot: Double buffer slot (0 or 1).
+            slot: Prefetch slot index.
 
         Returns:
             Number of pages in the slot.
@@ -226,7 +227,7 @@ class PagePool:
         """Get the size of a slot in bytes.
 
         Args:
-            slot: Double buffer slot (0 or 1).
+            slot: Prefetch slot index.
 
         Returns:
             Size of the slot in bytes.
@@ -237,7 +238,7 @@ class PagePool:
         """Get handle for a specific page.
 
         Args:
-            slot: Double buffer slot (0 or 1).
+            slot: Prefetch slot index.
             page_idx: Page index within the slot.
 
         Returns:
@@ -276,7 +277,7 @@ class PagePool:
         number of cuMemMap calls by 8x.
 
         Args:
-            slot: Double buffer slot (0 or 1).
+            slot: Prefetch slot index.
             va_start: Page-aligned VA position to start mapping.
             size: Total bytes to map (must be a multiple of page_size;
                 callers should use pool_granularity-aligned pre/post sizes).
@@ -346,7 +347,7 @@ class PagePool:
                         f"[PagePool] Failed to release page {page_idx} in slot {slot_idx}: {e}"
                     )
 
-        self._page_handles = [[], []]
+        self._page_handles = [[] for _ in self._slot_pages]
         logger.debug("[PagePool] Released all page handles")
 
     def __del__(self):
@@ -369,6 +370,7 @@ class PagePool:
 def compute_slot_sizes(
     layouts: dict[int, dict[str, "PageAlignedLayout"]],  # noqa: F821
     buffer_slot_assignments: dict[int, int],
+    num_slots: int,
 ) -> List[int]:
     """Compute the required slot sizes for a set of layouts.
 
@@ -377,16 +379,18 @@ def compute_slot_sizes(
 
     Args:
         layouts: Mapping from layer_idx to {weight_name: PageAlignedLayout}.
-        buffer_slot_assignments: Mapping from layer_idx to slot (0 or 1).
+        buffer_slot_assignments: Slot of every layer in ``layouts``, in
+            ``[0, num_slots)`` (``WeightBuffer.buffer_index_for_layer``).
+        num_slots: Number of prefetch slots.
 
     Returns:
-        [slot0_size, slot1_size] in bytes.
+        Per-slot sizes in bytes, ``num_slots`` entries.
     """
 
-    slot_sizes = [0, 0]
+    slot_sizes = [0] * num_slots
 
     for layer_idx, weight_layouts in layouts.items():
-        slot = buffer_slot_assignments.get(layer_idx, layer_idx % 2)
+        slot = buffer_slot_assignments[layer_idx]
 
         # Sum remote sizes across all weight names within a layer.
         # Each weight name needs its own pool pages (they hold different data
