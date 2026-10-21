@@ -1,14 +1,67 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-from unittest.mock import AsyncMock, patch
+from concurrent.futures import ThreadPoolExecutor
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from tensorrt_llm.inputs import MultimodalDataTracker
 from tensorrt_llm.inputs.media_io import AudioMediaIO, BaseMediaIO, ImageMediaIO, VideoMediaIO
+from tensorrt_llm.metrics.perf_utils import _input_processing_observer
 from tensorrt_llm.serve.chat_utils import parse_chat_message_content_part
 
 pytestmark = pytest.mark.cpu_only
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "media_cls, mime",
+    [(ImageMediaIO, "image/png"), (AudioMediaIO, "audio/wav"), (VideoMediaIO, "video/mp4")],
+)
+@pytest.mark.parametrize("scheme", ["http", "data", "file"])
+async def test_media_metrics_separate_download_decode_and_queue(media_cls, mime, scheme):
+    media = media_cls()
+    observer = MagicMock()
+    token = _input_processing_observer.set(observer)
+    url, method = {
+        "http": ("http://example.test/media", "load_bytes"),
+        "data": (f"data:{mime};base64,AA==", "load_base64"),
+        "file": ("file:///unused", "load_file"),
+    }[scheme]
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            with (
+                patch.object(BaseMediaIO, "_executor", pool),
+                patch.object(media_cls, method, return_value="decoded"),
+                patch("tensorrt_llm.inputs.media_io._get_aiohttp_session", new_callable=AsyncMock),
+                patch(
+                    "tensorrt_llm.inputs.media_io._safe_aiohttp_get",
+                    new_callable=AsyncMock,
+                    return_value=b"data",
+                ),
+            ):
+                assert await media.async_load(url) == "decoded"
+    finally:
+        _input_processing_observer.reset(token)
+    samples = [args.args for args in observer.call_args_list]
+    assert [stage for stage, _, _ in samples] == (["download"] if scheme == "http" else []) + [
+        "decode_queue",
+        "decode",
+    ]
+    assert all(seconds >= 0 and modality == mime.split("/")[0] for _, seconds, modality in samples)
+
+
+@pytest.mark.asyncio
+async def test_media_decode_failure_is_recorded():
+    observer = MagicMock()
+    token = _input_processing_observer.set(observer)
+    try:
+        with patch.object(ImageMediaIO, "load_base64", side_effect=ValueError("bad media")):
+            with pytest.raises(ValueError, match="bad media"):
+                await ImageMediaIO().async_load("data:image/png;base64,AA==")
+    finally:
+        _input_processing_observer.reset(token)
+    assert [args.args[0] for args in observer.call_args_list] == ["decode_queue", "decode"]
 
 
 class CustomError(Exception):
