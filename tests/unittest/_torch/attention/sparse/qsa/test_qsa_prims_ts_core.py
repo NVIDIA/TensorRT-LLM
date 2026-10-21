@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import itertools
 from types import SimpleNamespace
 
 import pytest
@@ -12,6 +13,7 @@ from tensorrt_llm._torch.attention.backends.sparse.qsa.params import (
     QSASparseParams,
 )
 from tensorrt_llm._torch.attention.backends.sparse.qsa.prims_ts_core import (
+    align_prefill_chunk,
     prims_ts_available,
     prims_ts_sparse_gqa,
     slice_request_boundaries,
@@ -164,12 +166,12 @@ def test_prims_ts_sparse_gqa_matches_reference(query_lens, is_decode) -> None:
 
 
 def test_slice_request_boundaries() -> None:
-    cu_seq_lens = torch.tensor([37, 128, 131, 200], dtype=torch.int64)
-    assert slice_request_boundaries(cu_seq_lens, 0, 200).tolist() == [0, 37, 128, 131, 200]
-    assert slice_request_boundaries(cu_seq_lens, 0, 100).tolist() == [0, 37, 100]
-    assert slice_request_boundaries(cu_seq_lens, 37, 128).tolist() == [0, 91]
-    assert slice_request_boundaries(cu_seq_lens, 100, 140).tolist() == [0, 28, 31, 40]
-    assert slice_request_boundaries(cu_seq_lens, 131, 200).dtype == torch.int32
+    cu_seq_lens = [37, 128, 131, 200]
+    assert slice_request_boundaries(cu_seq_lens, 0, 200) == (0, 37, 128, 131, 200)
+    assert slice_request_boundaries(cu_seq_lens, 0, 100) == (0, 37, 100)
+    assert slice_request_boundaries(cu_seq_lens, 37, 128) == (0, 91)
+    assert slice_request_boundaries(cu_seq_lens, 100, 140) == (0, 28, 31, 40)
+    assert slice_request_boundaries(cu_seq_lens, 131, 200) == (0, 69)
 
 
 def test_prims_ts_sparse_gqa_host_boundaries_match_readback() -> None:
@@ -184,7 +186,7 @@ def test_prims_ts_sparse_gqa_host_boundaries_match_readback() -> None:
     readback = prims_ts_sparse_gqa(
         q, k_cache, v_cache, block_table, block_ids, request_indices, positions, **kwargs
     )
-    cu_seq_lens = torch.cumsum(torch.tensor(query_lens, dtype=torch.int64), dim=0)
+    cu_seq_lens = list(itertools.accumulate(query_lens))
     host = prims_ts_sparse_gqa(
         q,
         k_cache,
@@ -233,3 +235,130 @@ def test_prefill_rows_share_plans_within_bucket() -> None:
     )
     torch.cuda.synchronize()
     torch.testing.assert_close(out, expected, atol=2e-2, rtol=2e-2)
+
+
+def test_route_offsets_follow_layout_changes_without_replanning() -> None:
+    _requires_prims_ts()
+    import flashinfer.attention.prims_ts.q_token_kv_block_sparse_metadata as fi_metadata
+
+    kwargs = dict(
+        page_size=PAGE_SIZE, max_seq_len_kv=CONTEXT, softmax_scale=HEAD_DIM**-0.5, is_decode=False
+    )
+    # Same row count and route count, different request boundaries.
+    layouts = ([36, 92], [64, 64], [36, 92])
+    cases = [_make_case(lens, seed=40 + i) for i, lens in enumerate(layouts)]
+    k_cache, v_cache, block_table = cases[0][1], cases[0][2], cases[0][3]
+
+    def run(case, lens):
+        q, _, _, _, block_ids, request_indices, positions, _, _ = case
+        cu_seq_lens = list(itertools.accumulate(lens))
+        return prims_ts_sparse_gqa(
+            q,
+            k_cache,
+            v_cache,
+            block_table,
+            block_ids,
+            request_indices,
+            positions,
+            request_boundaries=slice_request_boundaries(cu_seq_lens, 0, sum(lens)),
+            **kwargs,
+        )
+
+    expected = [
+        prims_ts_sparse_gqa(
+            case[0], k_cache, v_cache, block_table, case[4], case[5], case[6], **kwargs
+        ).clone()
+        for case in cases
+    ]
+    prepares = 0
+    original = fi_metadata._prepare_q_token_kv_block_sparse_attention
+
+    def counted(*args, **kw):
+        nonlocal prepares
+        prepares += 1
+        return original(*args, **kw)
+
+    fi_metadata._prepare_q_token_kv_block_sparse_attention = counted
+    try:
+        outputs = [run(case, lens).clone() for case, lens in zip(cases, layouts)]
+    finally:
+        fi_metadata._prepare_q_token_kv_block_sparse_attention = original
+    torch.cuda.synchronize()
+    assert prepares == 0
+    for out, ref in zip(outputs, expected):
+        assert torch.equal(out, ref)
+
+
+def test_auto_gates_small_decode_batches(monkeypatch) -> None:
+    _requires_prims_ts()
+    from tensorrt_llm._torch.attention.backends.sparse.qsa.prims_ts_core import (
+        resolve_sparse_core_backend,
+        use_prims_ts_indexer,
+    )
+
+    monkeypatch.delenv("TLLM_QSA_SPARSE_CORE", raising=False)
+    monkeypatch.delenv("TLLM_QSA_INDEXER", raising=False)
+    device = torch.device("cuda")
+    k_cache = torch.empty(1, NUM_KV_HEADS, PAGE_SIZE, HEAD_DIM, dtype=torch.bfloat16, device=device)
+
+    def core(backend, rows, is_decode):
+        q = torch.empty(rows, NUM_QO_HEADS, HEAD_DIM, dtype=torch.bfloat16, device=device)
+        return resolve_sparse_core_backend(
+            _params(sparse_core_backend=backend),
+            q=q,
+            k_cache=k_cache,
+            page_size=PAGE_SIZE,
+            is_decode=is_decode,
+            num_rows=rows,
+        )
+
+    def indexer(backend, rows, is_decode):
+        q = torch.empty(rows, 4, 128, dtype=torch.bfloat16, device=device)
+        return use_prims_ts_indexer(_params(sparse_core_backend=backend), q, is_decode=is_decode)
+
+    assert core("auto", 1, True) == "triton"
+    assert core("auto", 2, True) == "prims_ts"
+    assert core("auto", 1, False) == "prims_ts"
+    assert core("prims_ts", 1, True) == "prims_ts"
+    assert not indexer("auto", 31, True)
+    assert indexer("auto", 32, True)
+    assert indexer("auto", 1, False)
+    assert indexer("prims_ts", 1, True)
+    assert not indexer("triton", 4096, False)
+
+
+def test_align_prefill_chunk() -> None:
+    assert align_prefill_chunk(4048) == 3840
+    assert align_prefill_chunk(8192) == 8192
+    assert align_prefill_chunk(256) == 256
+    assert align_prefill_chunk(255) == 255
+    assert align_prefill_chunk(96) == 96
+
+
+def test_prefill_writes_into_caller_output() -> None:
+    _requires_prims_ts()
+    kwargs = dict(
+        page_size=PAGE_SIZE, max_seq_len_kv=CONTEXT, softmax_scale=HEAD_DIM**-0.5, is_decode=False
+    )
+    for query_lens in ([128, 128], [37, 91]):
+        q, k_cache, v_cache, block_table, block_ids, request_indices, positions, _, _ = _make_case(
+            query_lens, seed=77
+        )
+        expected = prims_ts_sparse_gqa(
+            q, k_cache, v_cache, block_table, block_ids, request_indices, positions, **kwargs
+        ).clone()
+        out = torch.full_like(q, float("nan"))
+        result = prims_ts_sparse_gqa(
+            q,
+            k_cache,
+            v_cache,
+            block_table,
+            block_ids,
+            request_indices,
+            positions,
+            out=out,
+            **kwargs,
+        )
+        torch.cuda.synchronize()
+        assert result.data_ptr() == out.data_ptr()
+        assert torch.equal(out, expected)

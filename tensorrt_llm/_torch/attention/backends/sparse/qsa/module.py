@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Module-layer integration for QSA sparse attention."""
 
+import itertools
 import math
 from typing import TYPE_CHECKING, Optional
 
@@ -426,7 +427,7 @@ def select_qsa_paged_tokens(
     only_visible_blocks = top_k is not None and q.is_cuda
     from .prims_ts_core import use_prims_ts_indexer
 
-    if use_prims_ts_indexer(params, q):
+    if use_prims_ts_indexer(params, q, is_decode=not context_rows):
         from .prims_ts_indexer import prims_ts_qsa_index_scores
 
         logits = prims_ts_qsa_index_scores(
@@ -767,10 +768,11 @@ class QSASparseHooks(AttentionSparseHooks):
         )
         chunk_size = _query_chunk_size(num_tokens, score_columns)
         if use_prims_ts:
-            from .prims_ts_core import slice_request_boundaries
+            from .prims_ts_core import align_prefill_chunk, slice_request_boundaries
 
-            cu_seq_lens = torch.cumsum(
-                attn_metadata.seq_lens[: attn_metadata.num_seqs].to(torch.int64), dim=0
+            chunk_size = align_prefill_chunk(chunk_size)
+            cu_seq_lens = list(
+                itertools.accumulate(attn_metadata.seq_lens[: attn_metadata.num_seqs].tolist())
             )
         output = torch.empty_like(q)
         for start in range(0, num_tokens, chunk_size):
@@ -792,7 +794,7 @@ class QSASparseHooks(AttentionSparseHooks):
                 expand_blocks=not use_prims_ts,
             )
             if use_prims_ts:
-                output[packed_slice] = prims_ts_sparse_gqa(
+                prims_ts_sparse_gqa(
                     q[packed_slice],
                     k_cache,
                     v_cache,
@@ -805,6 +807,7 @@ class QSASparseHooks(AttentionSparseHooks):
                     softmax_scale=softmax_scale,
                     is_decode=False,
                     request_boundaries=slice_request_boundaries(cu_seq_lens, start, end),
+                    out=output[packed_slice],
                 )
                 continue
             output[packed_slice] = qsa_sparse_gqa(
