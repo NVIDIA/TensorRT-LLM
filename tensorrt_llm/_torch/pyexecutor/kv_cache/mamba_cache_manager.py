@@ -3144,6 +3144,9 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
     _ple_ngram_context_shape: list[int] = []
     # Set per instance on a disaggregated context server of a KDA model.
     kda_context_only = False
+    # ``[num_layers, *replay buffer]`` view per KDA replay buffer when the
+    # per-layer views are affine (see _stack_state_views); set per instance.
+    _stacked_kda_replay_layers: Optional[Dict[str, torch.Tensor]] = None
     # Request id -> snapshot points requested by requests waiting for its
     # prefix (KVCacheManagerV2.plan_context_waits). Set per instance.
     _requested_snapshot_points: Optional[Dict[int, set[int]]] = None
@@ -3737,6 +3740,15 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                         f"{cache_size}")
                 layer[name] = view
             self._kda_replay_layers.append(layer)
+        # The drafts' records are never seeded (see _seed_kda_replay_slots).
+        stacked = {
+            name:
+            self._stack_state_views(
+                [layer[name] for layer in self._kda_replay_layers])
+            for name in layout if name != _KDA_DRAFT_RECORDS_ROLE
+        }
+        self._stacked_kda_replay_layers = (None if any(
+            view is None for view in stacked.values()) else stacked)
         # All SSM layers share a slot lifecycle, so the accepted-draft count is
         # stored once, on the first local KDA layer.
         self.prev_num_accepted_tokens = self._get_state_buffer(
@@ -4862,6 +4874,22 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             section_offsets.append(section_offsets[-1] + section_dim)
 
         self.prev_num_accepted_tokens.index_fill_(0, state_indices, 0)
+        stacked_replay = self._stacked_kda_replay_layers
+        if stacked_replay is not None and self._stacked_conv_states is not None:
+            # All layers at once: one launch per replay buffer and section.
+            # The stacked views leave out the drafts' records, which need no
+            # reset (see the per-layer loop below).
+            for replay_buffer in stacked_replay.values():
+                replay_buffer.index_fill_(1, state_indices, 0)
+            selected_conv = self._stacked_conv_states.index_select(
+                1, state_indices)
+            for section_idx, name in enumerate(_KDA_REPLAY_CONV_ROLES):
+                replay_buffer = stacked_replay[name]
+                section = selected_conv[:, :, section_offsets[section_idx]:
+                                        section_offsets[section_idx + 1], :]
+                replay_buffer[..., :committed_window].index_copy_(
+                    1, state_indices, section.to(replay_buffer.dtype))
+            return
         for replay_layer, conv_state in zip(self._kda_replay_layers,
                                             self.all_conv_states):
             for name, replay_buffer in replay_layer.items():
@@ -5152,6 +5180,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         self.all_conv_states = []
         self._stacked_ssm_states = None
         self._stacked_conv_states = None
+        self._stacked_kda_replay_layers = None
         self._ple_ngram_contexts = {}
         self._ple_conv_states = {}
         self.intermediate_ssm_states = None

@@ -6033,3 +6033,65 @@ def test_v2_kda_admission_slot_updates_without_sync(device):
 
     # Reset 5, 1 and 3; seeding resets 4 and 2; 0, 6 and 7 untouched.
     assert mgr.prev_num_accepted_tokens.tolist() == [1, 0, 0, 0, 0, 0, 7, 8]
+
+
+def _kda_replay_seed_manager(stacked: bool):
+    """Two KDA layers whose state and replay buffers are per-layer views of
+    one allocation each, like the KVCM pool views."""
+    generator = torch.Generator().manual_seed(0)
+    mgr = object.__new__(MambaHybridCacheManagerV2)
+    mgr._use_kda_replay_update = True
+    mgr._kda_replay_unseeded = set()
+    mgr.local_num_mamba_layers = 2
+    mgr.conv_state_shape = [6, 4]
+    mgr.conv_section_dims = [2, 2, 2]
+    mgr._request_id_to_state_index = {101: 1, 202: 3}
+    mgr.prev_num_accepted_tokens = torch.full((4,), 5, dtype=torch.int32, device="cuda")
+    conv = torch.randn(2, 4, 6, 4, generator=generator).to("cuda", torch.bfloat16)
+    mgr.all_conv_states = [conv[layer] for layer in range(2)]
+    replay = {
+        name: torch.randn(2, 4, 6, 2, generator=generator)
+        .to("cuda", torch.bfloat16)
+        .transpose(-1, -2)
+        for name in ("kda_conv_q", "kda_conv_k", "kda_conv_v")
+    }
+    for name, dtype in (
+        ("kda_k_cache", torch.bfloat16),
+        ("kda_g_cache", torch.float32),
+        ("kda_v_cache", torch.bfloat16),
+    ):
+        replay[name] = torch.randn(2, 4, 2, 2, generator=generator).to("cuda", dtype)
+    replay["kda_beta_cache"] = torch.randn(2, 4, 2, 4, generator=generator).to(
+        "cuda", torch.bfloat16
+    )[..., :2]
+    mgr._kda_replay_layers = [
+        {name: buffer[layer] for name, buffer in replay.items()} for layer in range(2)
+    ]
+    if stacked:
+        mgr._stacked_conv_states = MambaHybridCacheManagerV2._stack_state_views(mgr.all_conv_states)
+        mgr._stacked_kda_replay_layers = {
+            name: MambaHybridCacheManagerV2._stack_state_views(
+                [layer[name] for layer in mgr._kda_replay_layers]
+            )
+            for name in replay
+        }
+        assert all(view is not None for view in mgr._stacked_kda_replay_layers.values())
+    return mgr, replay
+
+
+@skip_no_cuda
+def test_v2_kda_replay_seed_of_all_layers_at_once_is_bit_identical():
+    per_layer, per_layer_replay = _kda_replay_seed_manager(stacked=False)
+    stacked, stacked_replay = _kda_replay_seed_manager(stacked=True)
+
+    per_layer.seed_kda_replay_caches_for_disagg_gen([101, 202])
+    stacked.seed_kda_replay_caches_for_disagg_gen([101, 202])
+
+    for name, buffer in per_layer_replay.items():
+        assert torch.equal(stacked_replay[name], buffer), name
+    assert torch.equal(stacked.prev_num_accepted_tokens, per_layer.prev_num_accepted_tokens)
+    # The seeded slots hold the committed windows, the others are untouched.
+    assert torch.equal(
+        stacked_replay["kda_conv_k"][1, 3, :, :4], stacked.all_conv_states[1][3, 2:4, :]
+    )
+    assert stacked.prev_num_accepted_tokens.tolist() == [5, 0, 5, 0]
