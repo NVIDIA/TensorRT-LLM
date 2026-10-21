@@ -678,11 +678,12 @@ class PyTorchModelEngine(ModelEngine):
                 self.llm_args.allreduce_strategy == "NCCL_SYMMETRIC"
                 and self._init_userbuffers(self.model.config.hidden_size))
             self._nccl_window_tensor_scope_hooks = []
-            # NCCL window tensors are only allocated through a multi-rank NCCL
-            # communicator, so a single-rank engine never holds a lease to
-            # scope. Skip the scopes there: the eager hooks run on every
-            # scoped layer of every eager iteration.
-            self._nccl_window_tensor_scopes_enabled = self.mapping.world_size > 1
+            # NCCL window tensors are only created by collectives with peers, so
+            # a forward without peers never holds a lease to scope. Skip the
+            # scopes there: the eager hooks run on every scoped layer of every
+            # eager iteration.
+            self._nccl_window_tensor_scopes_enabled = (
+                self._is_distributed_forward())
             if self._torch_compile_enabled:
                 set_torch_compiling(True)
                 use_ub = not use_ub_for_nccl and (
