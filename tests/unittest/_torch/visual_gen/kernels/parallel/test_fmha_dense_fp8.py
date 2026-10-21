@@ -131,6 +131,81 @@ def test_fp16_softmax_uses_a_unit_softmax_scale():
     assert _cosine(out, ref) > 0.999
 
 
+@pytest.mark.parametrize("fp16_softmax", [False, True])
+def test_variable_seqlens_match_sdpa(fp16_softmax):
+    """Packed sequences of different lengths; each one attends only to itself."""
+    _require(10, torch.bfloat16, fp16_softmax)
+    num_heads, seq_lens = 10, [700, 1560, 129]
+    cu = torch.tensor([0] + seq_lens, dtype=torch.int32, device="cuda").cumsum(0, dtype=torch.int32)
+    q, k, v = _inputs(1, sum(seq_lens), num_heads, seed=4)
+    vs = v.abs().amax() / E4M3_MAX
+    v8 = _quant(v, vs)
+    if fp16_softmax:
+        qk_mul = math.sqrt(HEAD_DIM**-0.5 * LOG2E)
+        q8, k8 = _quant(q * qk_mul, 1.0), _quant(k * qk_mul, 1.0)
+        q_deq, k_deq, bmm1 = q8.float() / qk_mul, k8.float() / qk_mul, None
+    else:
+        qs, ks = q.abs().amax() / E4M3_MAX, k.abs().amax() / E4M3_MAX
+        q8, k8 = _quant(q, qs), _quant(k, ks)
+        q_deq, k_deq = q8.float() * qs, k8.float() * ks
+        softmax_scale = HEAD_DIM**-0.5
+        bmm1 = torch.stack([softmax_scale * qs * ks, softmax_scale * qs * ks * LOG2E]).float()
+
+    out = torch.ops.trtllm.fmha_dense_fp8(
+        q8, k8, v8, cu, max(seq_lens), bmm1, vs.reshape(1).float(), fp16_softmax, torch.bfloat16
+    )
+    v_deq = v8.float() * vs
+    for start, end in zip(cu[:-1].tolist(), cu[1:].tolist()):
+        ref = _reference(q_deq[start:end], k_deq[start:end], v_deq[start:end], 1, end - start)
+        assert _cosine(out[start:end], ref) > _min_cosine(torch.bfloat16)
+
+
+@pytest.mark.parametrize("fp16_softmax", [False, True])
+def test_cuda_graph_replay(fp16_softmax):
+    """Scales come from device memory, so a captured graph follows new inputs and scales."""
+    _require(10, torch.bfloat16, fp16_softmax)
+    num_heads, batch, seq_len = 10, 1, 1560
+    q8, k8, v8 = (_quant(t * 0.5, 1.0) for t in _inputs(batch, seq_len, num_heads, seed=5))
+    cu = _cu_seqlens(batch, seq_len)
+    bmm1 = torch.tensor([HEAD_DIM**-0.5, HEAD_DIM**-0.5 * LOG2E], device="cuda")
+    scale_out = torch.ones(1, device="cuda")
+
+    def run():
+        return torch.ops.trtllm.fmha_dense_fp8(
+            q8, k8, v8, cu, seq_len, bmm1, scale_out, fp16_softmax, torch.bfloat16
+        )
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        run()  # warm up: loads the cubins outside the capture
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = run()
+
+    for seed in (6, 7):
+        new_q, new_k, new_v = (
+            _quant(t * 0.5, 1.0) for t in _inputs(batch, seq_len, num_heads, seed)
+        )
+        q8.copy_(new_q), k8.copy_(new_k), v8.copy_(new_v)
+        scale_out.fill_(0.5 * seed)
+        graph.replay()
+        torch.testing.assert_close(captured, run(), rtol=0, atol=0)
+
+
+def test_rejects_bad_max_seqlen():
+    _require(10, torch.bfloat16, fp16_softmax=False)
+    q8, k8, v8 = (_quant(t, 1.0) for t in _inputs(1, 256, 10, seed=8))
+    bmm1 = torch.tensor([HEAD_DIM**-0.5, HEAD_DIM**-0.5 * LOG2E], device="cuda")
+    for max_seqlen in (0, 257):
+        with pytest.raises(RuntimeError, match="max_seqlen"):
+            torch.ops.trtllm.fmha_dense_fp8(
+                q8, k8, v8, _cu_seqlens(1, 256), max_seqlen, bmm1, torch.ones(1, device="cuda"),
+                False, torch.bfloat16,
+            )  # fmt: skip
+
+
 def test_is_supported_probe():
     assert not _supported(40, torch.float16, fp16_softmax=False)
     for fp16_softmax in (False, True):
