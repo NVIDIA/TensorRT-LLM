@@ -96,3 +96,30 @@ def test_drafter_block_outside_the_allocation_is_an_error():
 
     with pytest.raises(RuntimeError, match="block of 7 positions falls outside"):
         DFlashWorker._check_block_within_allocation(num_ctx, allocated, block_size=7)
+
+
+def _refresh_worker(*, num_slots, width, divisor):
+    worker = object.__new__(DFlashWorker)
+    worker._ctx_unified_cache = True
+    worker._ctx_pool_idx = 0
+    worker._ctx_block_offset = 0
+    worker._ctx_block_divisor = divisor
+    worker._ctx_block_tables = torch.zeros(num_slots, width, dtype=torch.int32)
+    worker._ctx_block_counts = torch.zeros(num_slots, dtype=torch.long)
+    worker._ctx_block_cols = torch.arange(1, width + 1, dtype=torch.long)
+    return worker
+
+
+def test_block_count_is_the_allocation_extent_past_a_sliding_window():
+    # Encoded offsets [pool, seq, K/V field, block]. Row 0's first three blocks
+    # were evicted by a sliding window ahead of its live tail; row 1 is a short
+    # allocation; row 2 holds nothing.
+    rows = [[-1, -1, -1, 8, 10, -1], [0, 2, -1, -1, -1, -1], [-1] * 6]
+    offsets = torch.tensor(rows, dtype=torch.int32)[None, :, None, :].expand(1, 3, 2, 6)
+    worker = _refresh_worker(num_slots=4, width=6, divisor=2)
+
+    assert worker._refresh_ctx_block_tables(SimpleNamespace(kv_cache_block_offsets=offsets), 3)
+
+    # A count of valid entries would cap row 0 at its two live pages.
+    assert worker._ctx_block_counts[:3].tolist() == [5, 2, 0]
+    assert worker._ctx_block_tables[0].tolist() == [0, 0, 0, 4, 5, 0]
