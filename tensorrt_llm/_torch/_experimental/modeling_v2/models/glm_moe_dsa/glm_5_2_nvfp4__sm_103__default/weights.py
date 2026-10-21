@@ -13,9 +13,9 @@ from typing import TYPE_CHECKING, Any
 from tensorrt_llm._torch.models.modeling_deepseekv3 import GlmMoeDsaForCausalLM
 
 if TYPE_CHECKING:
-    from .modeling import ModelingV2Glm52Nvfp4Sm103Tep
+    from .modeling import ModelingV2Glm52Nvfp4Sm103Default
 
 
-def load(model: "ModelingV2Glm52Nvfp4Sm103Tep", weights: Any) -> None:
+def load(model: "ModelingV2Glm52Nvfp4Sm103Default", weights: Any) -> None:
     """Load the checkpoint ``weights`` into ``model`` with the built-in loader."""
     GlmMoeDsaForCausalLM.load_weights(model, weights)

@@ -3,26 +3,27 @@
 """Where a GlmMoeDsaForCausalLM config lands. Read this file and you know.
 
 ``route`` is one forward-reading decision: the facts that fix which code runs,
-compared against the deployment the target below was written for. When it does
-not fit, ``route`` raises ``NoTarget`` stating those facts. In ``auto`` the
-engine then uses the built-in GlmMoeDsa implementation; in ``require`` it raises
-that error.
+compared against the deployments the target below was written for. When none
+fits, ``route`` raises ``NoTarget`` stating those facts. In ``auto`` the engine
+then uses the built-in GlmMoeDsa implementation; in ``require`` it raises that
+error.
 
-The three targets are decode specializations of one checkpoint on one GPU
-architecture, and differ in how the attention and the experts are split. Their
-fast paths are built for the checkpoint's operand shapes and layer pattern, their
-ranks and the rows per request (the target token and its draft tokens), so each of
-those facts is a routing criterion rather than a runtime branch:
+One target, ``glm_5_2_nvfp4__sm_103__default``, serves one checkpoint on one GPU
+architecture at the layouts below; it picks the fast paths of each layout when
+it is built. The fast paths are built for the checkpoint's operand shapes and
+layer pattern, the ranks and the rows per request (the target token and its
+draft tokens), so each of those facts is a routing criterion rather than a
+runtime branch. A layout is admitted only once it has passed its gate:
 
-* ``glm_5_2_nvfp4__sm_103__tp8``: attention and experts tensor-parallel over
-  eight ranks, five draft tokens;
-* ``glm_5_2_nvfp4__sm_103__tep``: attention tensor-parallel over four or eight
-  ranks and the experts expert-parallel over the same ranks, five draft tokens;
-* ``glm_5_2_nvfp4__sm_103__dep``: attention data parallelism and the experts
-  expert-parallel over the same ranks, at the rank counts, LM-head splits and
-  draft lengths of ``_DEP``. Two more facts fix what its fast paths serve, the
-  KV-cache dtype and the MoE backend; ``route`` does not read them, so the
-  target checks them when it is built.
+* tp8: attention and experts tensor-parallel over eight ranks, five draft
+  tokens. The fast paths were designed and tuned for this layout;
+* tep: attention tensor-parallel over four or eight ranks and the experts
+  expert-parallel over the same ranks, five draft tokens;
+* dep: attention data parallelism and the experts expert-parallel over the same
+  ranks, at the rank counts, LM-head splits and draft lengths of ``_DEP``. Two
+  more facts fix what its fast paths serve, the KV-cache dtype and the MoE
+  backend; the target checks both when it is built, since ``route`` does not see
+  the MoE backend.
 """
 
 from __future__ import annotations
@@ -123,8 +124,8 @@ def _tp8(m: Any) -> bool:
     """Attention heads and experts both tensor-parallel over eight ranks, with every
     expert on every rank and no attention data parallelism.
 
-    The split decides which weights each rank loads and into which shapes, so it
-    selects a target rather than a runtime branch.
+    The split decides which weights each rank loads and into which shapes, so it is
+    a routing criterion; the target picks the layout's fast paths when it is built.
     """
     return (
         m.world_size == _TP
@@ -141,8 +142,8 @@ def _tep(m: Any) -> bool:
     """Attention heads tensor-parallel over four or eight ranks and the experts expert-parallel
     over the same ranks (each rank holds whole experts), with no attention data parallelism.
 
-    The split decides which weights each rank loads and into which shapes, so it
-    selects a target rather than a runtime branch.
+    The split decides which weights each rank loads and into which shapes, so it is
+    a routing criterion; the target picks the layout's fast paths when it is built.
     """
     return (
         m.world_size == m.tp_size
@@ -160,8 +161,8 @@ def _dep(m: Any) -> bool:
     and the experts expert-parallel over the same ranks, at a rank count and LM-head split
     of ``_DEP``.
 
-    The split decides which weights each rank loads and into which shapes, so it
-    selects a target rather than a runtime branch.
+    The split decides which weights each rank loads and into which shapes, so it is
+    a routing criterion; the target picks the layout's fast paths when it is built.
     """
     return (
         m.world_size == m.tp_size
@@ -210,6 +211,16 @@ def _speculation(spec_config: Optional[Any]) -> str:
     return words
 
 
+def _layout_and_speculation(mapping: Any, spec_config: Optional[Any]) -> bool:
+    """One of the admitted layouts, with the speculation its fast paths are built for."""
+    if _tp8(mapping) or _tep(mapping):
+        return _mtp_eagle_linear(spec_config, _DRAFT_LEN)
+    if _dep(mapping):
+        draft_len = _DEP[(mapping.world_size, bool(mapping.enable_lm_head_tp_in_adp))]
+        return _mtp_eagle_linear(spec_config, draft_len)
+    return False
+
+
 def route(
     pretrained_config: Any,
     mapping: Any,
@@ -220,7 +231,7 @@ def route(
     """Return the target class for this deployment, or raise ``NoTarget`` saying why none fits.
 
     ``kv_cache_quant_algo`` is the KV-cache algorithm the engine will run with. It
-    selects the fast paths of a dep deployment, which the dep target checks together
+    selects the fast paths of a dep deployment, which the target checks together
     with the MoE backend when it is built, so ``route`` only reports it.
 
     The target is imported where it is returned, so declining costs no import
@@ -230,52 +241,19 @@ def route(
     # None and the shape does not match.
     shape = tuple(getattr(pretrained_config, name, None) for name in _SHAPE_FIELDS)
 
-    # GLM-5.2-NVFP4 (bf16 MTP layer) on sm103, 8 ranks of tensor-parallel attention
-    # and experts, one-model MTP-Eagle at five draft tokens. The quantization is
-    # read last, and only for this deployment.
+    # GLM-5.2-NVFP4 (bf16 MTP layer) on sm103 at an admitted layout with its speculation.
+    # The quantization is read last, and only for such a deployment.
     quantization = "not read"
     if (
         compute_capability == _SM
         and shape == _SHAPE
-        and _tp8(mapping)
-        and _mtp_eagle_linear(spec_config, _DRAFT_LEN)
+        and _layout_and_speculation(mapping, spec_config)
     ):
         served, quantization = _nvfp4_with_bf16_mtp_layer(pretrained_config)
         if served:
-            from .glm_5_2_nvfp4__sm_103__tp8.modeling import ModelingV2Glm52Nvfp4Sm103Tp8
+            from .glm_5_2_nvfp4__sm_103__default.modeling import ModelingV2Glm52Nvfp4Sm103Default
 
-            return ModelingV2Glm52Nvfp4Sm103Tp8
-
-    # The same checkpoint, architecture and speculation, with 4 or 8 ranks of
-    # tensor-parallel attention and the experts expert-parallel over them.
-    if (
-        compute_capability == _SM
-        and shape == _SHAPE
-        and _tep(mapping)
-        and _mtp_eagle_linear(spec_config, _DRAFT_LEN)
-    ):
-        served, quantization = _nvfp4_with_bf16_mtp_layer(pretrained_config)
-        if served:
-            from .glm_5_2_nvfp4__sm_103__tep.modeling import ModelingV2Glm52Nvfp4Sm103Tep
-
-            return ModelingV2Glm52Nvfp4Sm103Tep
-
-    # The same checkpoint and architecture with attention data parallelism and the experts
-    # expert-parallel over the same ranks, at the draft length of the rank count and LM-head
-    # split.
-    if (
-        compute_capability == _SM
-        and shape == _SHAPE
-        and _dep(mapping)
-        and _mtp_eagle_linear(
-            spec_config, _DEP[(mapping.world_size, bool(mapping.enable_lm_head_tp_in_adp))]
-        )
-    ):
-        served, quantization = _nvfp4_with_bf16_mtp_layer(pretrained_config)
-        if served:
-            from .glm_5_2_nvfp4__sm_103__dep.modeling import ModelingV2Glm52Nvfp4Sm103Dep
-
-            return ModelingV2Glm52Nvfp4Sm103Dep
+            return ModelingV2Glm52Nvfp4Sm103Default
 
     raise NoTarget(
         f"compute capability {compute_capability}, config shape {shape}, quantization "
@@ -284,7 +262,7 @@ def route(
         f"moe_ep={mapping.moe_ep_size} attention_dp={mapping.enable_attention_dp} "
         f"lm_head_tp_in_adp={mapping.enable_lm_head_tp_in_adp}, "
         f"speculative decoding {_speculation(spec_config)}, KV cache "
-        f"{kv_cache_quant_algo or 'bf16'}; the glm_moe_dsa targets are "
+        f"{kv_cache_quant_algo or 'bf16'}; the glm_moe_dsa target is "
         "the GLM-5.2 modelopt NVFP4 checkpoint (bf16 MTP layer) on sm103, with one-model "
         "MTP-Eagle as a linear chain, without the suffix-automaton enhancer or relaxed "
         "acceptance, at tp8 (8 ranks of tensor-parallel attention and experts) or tep (4 or 8 "

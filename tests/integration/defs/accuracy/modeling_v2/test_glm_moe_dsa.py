@@ -12,19 +12,19 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Whole-model gates for the glm_moe_dsa modeling_v2 targets (GLM-5.2 NVFP4, sm_103).
+"""Whole-model gates for the glm_moe_dsa modeling_v2 target (GLM-5.2 NVFP4, sm_103).
 
-One case per target, each serving GSM8K end to end with ``modeling_v2="require"``.
-Under ``"auto"`` a deployment that missed a target's route would fall back to the
-built-in model, pass, and report the built-in's accuracy as the target's; under
-``"require"`` it raises instead, and so does a step a fast path covers but cannot
-run. The mode and the environment below are LLM API arguments, so they reach every
-rank.
+One case per layout family the target admits (tp8, tep, dep), each serving GSM8K end
+to end with ``modeling_v2="require"``. Under ``"auto"`` a deployment that missed the
+route would fall back to the built-in model, pass, and report the built-in's accuracy
+as the target's; under ``"require"`` it raises instead, and so does a step a fast
+path covers but cannot run. The mode and the environment below are LLM API
+arguments, so they reach every rank.
 
 Each deployment is one the family's ``route()`` claims: the GLM-5.2 modelopt NVFP4
 checkpoint (bf16 MTP layer) with one-model MTP-Eagle as a linear chain, at the
-target's topology and draft length; the DEP case also matches its cell's KV-cache
-dtype and MoE backend.
+layout's draft length; the dep case also matches its cell's KV-cache dtype and MoE
+backend.
 """
 
 import pytest
@@ -43,20 +43,20 @@ from tensorrt_llm.llmapi import (
 from ...conftest import llm_models_root
 from ..accuracy_core import GSM8K, LlmapiAccuracyTestHarness
 
-# The targets assert their own SM at construction.
+# The target asserts its own SM at construction.
 skip_not_sm103 = pytest.mark.skipif(
-    get_sm_version() != 103, reason="the glm_moe_dsa targets are certified on sm_103 only"
+    get_sm_version() != 103, reason="the glm_moe_dsa target is certified on sm_103 only"
 )
 
 # On every rank: check the target's step contract on the first forward, and run the
 # indexer key projection in BF16, the form the family's fused indexer paths take.
-# The deployments below are the ones the targets were validated at: per-target batch,
+# The deployments below are the ones the target was validated at: per-layout batch,
 # KV-cache dtype, MoE backend and DSA kernels.
 _RANK_ENV = {MODELING_V2_VALIDATE_ENV: "1", "TRTLLM_DSA_INDEXER_BF16": "1"}
 
 
-class TestModelingV2Glm52Nvfp4Sm103(LlmapiAccuracyTestHarness):
-    """glm-5.2-nvfp4 / sm_103 at tp8, tep4 and dep8."""
+class TestModelingV2Glm52Nvfp4Sm103Default(LlmapiAccuracyTestHarness):
+    """glm-5.2-nvfp4 / sm_103 / default at tp8, tep4 and dep8."""
 
     MODEL_NAME = "zai-org/GLM-5.2"
     MODEL_PATH = f"{llm_models_root()}/GLM-5.2-NVFP4"
@@ -89,7 +89,7 @@ class TestModelingV2Glm52Nvfp4Sm103(LlmapiAccuracyTestHarness):
     @skip_not_sm103
     @pytest.mark.skip_less_mpi_world_size(8)
     def test_gsm8k_tp8(self):
-        """The low-latency target: attention and experts tensor-parallel over 8 ranks."""
+        """tp8, the layout the fast paths are tuned for: attention and experts TP over 8 ranks."""
         self._evaluate(
             tensor_parallel_size=8,
             moe_expert_parallel_size=1,

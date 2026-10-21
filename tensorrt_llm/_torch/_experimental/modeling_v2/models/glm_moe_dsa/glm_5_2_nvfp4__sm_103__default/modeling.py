@@ -1,55 +1,53 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""ModelingV2 target: glm-5.2-nvfp4 / sm_103 / dep.
+"""ModelingV2 target: glm-5.2-nvfp4 / sm_103 / default.
 
 GLM-5.2, modelopt NVFP4 export: 78 layers, hidden 6144, 64 query heads, MLA with
 DSA sparse attention (index top-k 2048), layers 0-2 dense and 3-77 MoE (256
 routed experts at top-8 plus a shared expert). Layer 78 is the checkpoint's bf16
-MTP module, driven by the one-model MTP-Eagle loop. `dep` is attention data
-parallelism over eight or sixteen ranks (each rank runs the whole attention on its
-own requests) and the experts expert-parallel over the same ranks.
+MTP module, driven by the one-model MTP-Eagle loop.
 
-``route`` claims three deployments by the facts it reads: the rank count, whether
-the LM head is tensor-parallel in attention DP, and the draft tokens per request.
-Two more facts fix what the fast paths can serve there, the KV-cache dtype and the
-MoE backend, and only the model config carries them, so this target checks them
-first, at construction (``CELLS``, ``target_paths``). Under ``require`` a
-deployment outside the cells raises; under ``auto`` it serves no fast path and
-runs the built-in forward.
+One target serves every layout ``route`` admits; what differs between them is
+which fast paths run (``target_paths``):
 
-Under attention DP the fast paths that take this target's shapes are rank-local:
-the attention's rope, KV append and top-k bridge with an FP8 KV cache
-(``rope_kv_append``), the rope of the full-indexer layers' query front
-(``indexer_layer_front``), the draft loop (``draft_loop``), the decode step's
-prologue (``decode_prologue``) and the host page retention policy
-(``host_page_retention``). The plan of a cell serves those and the bases they
-extend; the bases decline every call under attention DP. The other fast paths of
-the family take tensor-parallel attention, so this target serves none of them: its
-decoder layers, MoE modules and draft layer stay the built-in classes, which run
-the built-in model's attention-DP communication on every step.
+* tp8, the attention heads and the experts tensor-parallel over eight ranks:
+  every fast path of the family. The fast paths were designed and tuned for this
+  layout's low-latency decode.
+* tep, the attention heads tensor-parallel over four or eight ranks and the
+  experts expert-parallel over the same ranks: at eight ranks every fast path
+  but the routed-MoE ones, which take only tensor-parallel experts; at four
+  ranks the paths whose kernels take four ranks and the bases they extend. The
+  experts run the built-in expert-parallel MoE.
+* dep, attention data parallelism and the experts expert-parallel over the
+  same ranks: the rank-local paths of the cell the deployment falls in
+  (``DEP_CELLS``). Two facts of a cell, the KV-cache dtype and the MoE backend,
+  are not read by ``route``, so this target checks them at construction.
 
-The shell is the built-in ``GlmMoeDsaForCausalLM``: the same module tree, the
-same weights and the same engine preferences (KV cache manager, KV transceiver,
-sparse-attention defaults), so a built-in context server and this target's
-generation server exchange the same KV and indexer-K layout. Construction runs,
-in order:
+Construction runs, in order:
 
-1. the cell check (``target_paths``), from the model config alone, so every rank
-   decides alike before any collective;
+1. the fast paths of the layout (``target_paths``), from the model config
+   alone, so every rank decides alike before any collective;
 2. the rank-uniform check of the knobs (``dispatch.check_rank_uniform``), before
    every collective the construction below makes;
-3. the dispatch plan (``dispatch.resolve``) of the paths the cell serves, before
-   the built-in model is built, so a knob value no rank can parse fails early;
+3. the dispatch plan (``dispatch.resolve``) of those paths, before the built-in
+   model is built, so a knob value no rank can parse fails early;
 4. the plan is installed (``dispatch.install``): from here on the fast paths read
    it;
 5. the built-in model, then the core: its text model adopted as
-   ``GlmMoeDsaDepModelingV2``, whose forward hands each step to
-   ``PrefillTarget`` or ``DecodeTarget``;
-6. ``adopt_model``, which re-classes the attention modules of every layer
-   (``shared.attention``) when the plan runs an attention path, and the
-   speculative worker (``shared.spec_worker``) when it runs the draft loop;
-7. the rank-uniform check of the attached fast-path state
-   (``dispatch.check_rank_uniform_adopted``, ``shared.layers.adopted_state``).
+   ``GlmMoeDsaModelingV2``, whose forward hands each step to ``PrefillTarget``
+   or ``DecodeTarget``;
+6. the adoption of the layout. With tensor-parallel attention, ``adopt_model``
+   (``shared.layers``) re-classes the decoder layers, the draft layer, their
+   attention modules (``shared.attention``) and their MoE modules as the
+   family's layer classes and attaches the fast-path objects the plan enables
+   to them, then re-classes the speculative worker (``shared.spec_worker``).
+   Under attention DP, ``_adopt_attention_dp`` re-classes only the attention
+   modules and the speculative worker, as far as the plan runs their paths; the
+   layers, their MoE modules and the draft layer stay the built-in classes,
+   which run the built-in attention-DP communication. The attention backends
+   build their FMHA libraries after construction, in ``create_weights``, each
+   with the libraries adoption declared on it first;
+7. the rank-uniform check of that state (``dispatch.check_rank_uniform_adopted``).
 
 The step-loop hooks the target declares to the engine (``runtime_hooks``,
 ``shared.runtime.make_runtime_hooks``) are built later, on the engine's first
@@ -61,11 +59,10 @@ read and the modeling_v2 mode (``dispatch.rank_uniform_inputs``).
 Every step runs under the phase of the target that takes it
 (``dispatch.step``): the shell's forward enters it around the built-in forward,
 so the model, the speculative worker and its draft loop all run in it. A
-prefill step runs the built-in decoder forward and the built-in draft loop; a
-decode step runs ``DecodeTarget``'s loop over the built-in layers, the attention
-modules' decode composition and the worker's draft loop. Each rank picks its
-phase from its own requests; the layers' communication is the built-in one in
-both phases.
+prefill step runs the built-in decoder forward, the built-in layers and the
+built-in draft loop; a decode step runs ``DecodeTarget``'s loop, the layers'
+decode composition and the worker's draft loop. Under attention DP each rank
+picks its phase from its own requests.
 """
 
 from __future__ import annotations
@@ -90,7 +87,7 @@ from tensorrt_llm.quantization.mode import QuantAlgo
 
 from ..shared import dispatch, runtime
 from ..shared.attention import GlmMLA
-from ..shared.layers import adopted_state
+from ..shared.layers import adopt_model, adopted_state
 from ..shared.spec_worker import GlmMtpWorker
 from . import weights as _weights
 
@@ -98,10 +95,73 @@ if TYPE_CHECKING:
     from ..shared.kernels.decode_prologue import DecodePrologueHook
 
 
-# The paths that engage under attention DP with an FP8 KV cache: the attention's rope, KV append
-# and top-k bridge, the full-indexer layers' query-front rope, the draft loop, the decode
-# prologue and the host page retention policy.
-_FP8_KV_ENGAGED = frozenset(
+# The routed-MoE paths, which run from this target's own kernel packages. They take
+# tensor-parallel experts (every expert on every rank).
+_ROUTED_MOE_PACKAGES = {
+    "routed_moe": "routed_moe",
+    "routed_moe_into_hop": "routed_moe",
+    "hop_routing": "hop_routing",
+    "shared_expert_prefetch": "shared_expert_prefetch",
+    "draft_routed_moe": "draft_routed_moe",
+    "cross_layer_expert_prefetch": "cross_layer_expert_prefetch",
+}
+_KERNEL_MODULES = {
+    path: f"{__package__}.kernels.{package}" for path, package in _ROUTED_MOE_PACKAGES.items()
+}
+_NO_LAYERS: frozenset = frozenset()
+
+#: tp8: every fast path of the family, with the family's tables.
+TP8_PATHS = dispatch.TargetPaths(kernel_modules=_KERNEL_MODULES)
+
+# tep at four ranks: the attention operands, the attention output and the post-MoE hop are
+# outside the kernels' shapes (sixteen local heads, a four-rank output projection, a
+# single-node group); these paths take four ranks.
+_TEP4_PATHS = frozenset(
+    {
+        "indexer_layer_front",
+        "rope_kv_append",
+        "indexer_topk",
+        "cross_rank_topk",
+        "cross_rank_topk_cluster_merge",
+        "cross_rank_topk_global_emit",
+        "router_gemm",
+        "dense_mlp",
+        "draft_front",
+        "draft_tail",
+        "draft_loop",
+        "decode_prologue",
+        "deferred_input_prep",
+        "sampler_store",
+        "execution_stream_loop",
+        "host_page_retention",
+    }
+)
+# The bases these paths extend at four ranks. Their kernels decline every layer there: the query
+# fronts on their layer cells, the post-attention hop on its native all-reduce, which a
+# single-node group runs without multi-node NVLink.
+_TEP4_BASES = frozenset({"absorbed_query", "draft_absorbed_query", "post_attention_hop"})
+
+#: tep, per tensor-parallel size.
+TEP_PATHS = {
+    4: dispatch.TargetPaths(
+        served=_TEP4_PATHS | _TEP4_BASES,
+        layer_cells={
+            **dispatch.LAYER_CELLS,
+            "absorbed_query": {"layer": _NO_LAYERS},
+            "draft_absorbed_query": {"layer": _NO_LAYERS},
+            "indexer_layer_front": {"target_layer": _NO_LAYERS, "draft_layer": _NO_LAYERS},
+        },
+        uncovered={"post_attention_hop": ("does not use MNNVL",)},
+    ),
+    8: dispatch.TargetPaths(
+        served=frozenset(dispatch.FAST_PATH_NAMES) - frozenset(_ROUTED_MOE_PACKAGES)
+    ),
+}
+
+# dep with an FP8 KV cache: the attention's rope, KV append and top-k bridge, the full-indexer
+# layers' query-front rope, the draft loop, the decode prologue and the host page retention
+# policy engage.
+_DEP_FP8_KV_ENGAGED = frozenset(
     {
         "rope_kv_append",
         "indexer_layer_front",
@@ -113,7 +173,7 @@ _FP8_KV_ENGAGED = frozenset(
 # The bases these paths extend. Under attention DP their kernels decline every call: the query
 # fronts on every layer, the top-k selection on every step, and the post-attention hop is never
 # built (the built-in layers run no post-attention all-reduce under attention DP).
-_FP8_KV_BASES = frozenset(
+_DEP_FP8_KV_BASES = frozenset(
     {
         "absorbed_query",
         "draft_absorbed_query",
@@ -122,16 +182,15 @@ _FP8_KV_BASES = frozenset(
         "post_attention_hop",
     }
 )
-# With an NVFP4 KV cache the attention paths are outside the shapes their kernels take; the
+# dep with an NVFP4 KV cache: the attention paths are outside the shapes their kernels take; the
 # draft loop, the decode prologue and the host page retention policy engage.
-_NVFP4_KV_ENGAGED = frozenset({"draft_loop", "decode_prologue", "host_page_retention"})
-_NVFP4_KV_BASES = frozenset({"post_attention_hop"})
-_NO_LAYERS: frozenset = frozenset()
+_DEP_NVFP4_KV_ENGAGED = frozenset({"draft_loop", "decode_prologue", "host_page_retention"})
+_DEP_NVFP4_KV_BASES = frozenset({"post_attention_hop"})
 
-#: What this target serves with an FP8 KV cache. The query fronts decline attention DP on every
-#: layer, which is outside their shapes here.
-FP8_KV_PATHS = dispatch.TargetPaths(
-    served=_FP8_KV_ENGAGED | _FP8_KV_BASES,
+#: dep with an FP8 KV cache. The query fronts decline attention DP on every layer, which is
+#: outside their shapes here.
+DEP_FP8_KV_PATHS = dispatch.TargetPaths(
+    served=_DEP_FP8_KV_ENGAGED | _DEP_FP8_KV_BASES,
     layer_cells={
         **dispatch.LAYER_CELLS,
         "absorbed_query": {"layer": _NO_LAYERS},
@@ -139,38 +198,36 @@ FP8_KV_PATHS = dispatch.TargetPaths(
         "indexer_layer_front": {"target_layer": _NO_LAYERS, "draft_layer": _NO_LAYERS},
     },
 )
-#: What this target serves with an NVFP4 KV cache.
-NVFP4_KV_PATHS = dispatch.TargetPaths(served=_NVFP4_KV_ENGAGED | _NVFP4_KV_BASES)
-#: What a deployment outside the cells serves under ``auto``: no fast path.
+#: dep with an NVFP4 KV cache.
+DEP_NVFP4_KV_PATHS = dispatch.TargetPaths(served=_DEP_NVFP4_KV_ENGAGED | _DEP_NVFP4_KV_BASES)
+#: What a dep deployment outside the cells serves under ``auto``: no fast path.
 NO_PATHS = dispatch.TargetPaths(served=frozenset())
 
 
 @dataclass(frozen=True)
 class Cell:
-    """One deployment this target serves: the facts ``route`` does not read, and the plan."""
+    """One dep deployment this target serves: the facts ``route`` does not read, and the plan."""
 
     kv_cache: QuantAlgo
     moe_backend: str
     paths: dispatch.TargetPaths
 
 
-#: The deployments this target serves, per (ranks, LM head tensor-parallel in attention DP,
+#: The dep deployments this target serves, per (ranks, LM head tensor-parallel in attention DP,
 #: draft tokens per request), the facts ``route`` claims them by.
-CELLS: Mapping[Tuple[int, bool, int], Cell] = {
-    (16, False, 3): Cell(QuantAlgo.FP8, "TRTLLM", FP8_KV_PATHS),
-    (8, False, 3): Cell(QuantAlgo.FP8, "CUTEDSL", FP8_KV_PATHS),
-    (8, True, 5): Cell(QuantAlgo.NVFP4, "CUTEDSL", NVFP4_KV_PATHS),
+DEP_CELLS: Mapping[Tuple[int, bool, int], Cell] = {
+    (16, False, 3): Cell(QuantAlgo.FP8, "TRTLLM", DEP_FP8_KV_PATHS),
+    (8, False, 3): Cell(QuantAlgo.FP8, "CUTEDSL", DEP_FP8_KV_PATHS),
+    (8, True, 5): Cell(QuantAlgo.NVFP4, "CUTEDSL", DEP_NVFP4_KV_PATHS),
 }
 
 
-def target_paths(model_config: ModelConfig, mode: ModelingV2Mode) -> dispatch.TargetPaths:
-    """What this target serves on ``model_config``'s deployment: its cell's paths, or none.
-
-    Reads only the model config, so every rank decides alike.
+def _dep_paths(model_config: ModelConfig, mode: ModelingV2Mode) -> dispatch.TargetPaths:
+    """What this target serves on a dep deployment: its cell's paths, or none.
 
     Raises:
-        ValueError: under ``require``, if the deployment is not one of ``CELLS`` (its KV-cache
-            dtype or MoE backend is not its cell's).
+        ValueError: under ``require``, if the deployment is not one of ``DEP_CELLS`` (its
+            KV-cache dtype or MoE backend is not its cell's).
     """
     mapping = model_config.mapping
     spec_config = model_config.spec_config
@@ -180,7 +237,7 @@ def target_paths(model_config: ModelConfig, mode: ModelingV2Mode) -> dispatch.Ta
         getattr(spec_config, "max_draft_len", None),
     )
     kv_cache = model_config.quant_config.kv_cache_quant_algo
-    cell = CELLS.get(key)
+    cell = DEP_CELLS.get(key)
     if cell is not None and (kv_cache, model_config.moe_backend) == (
         cell.kv_cache,
         cell.moe_backend,
@@ -189,12 +246,12 @@ def target_paths(model_config: ModelConfig, mode: ModelingV2Mode) -> dispatch.Ta
     served = "; ".join(
         f"{ranks} ranks, LM head tensor-parallel in attention DP {lm_head_tp}, {draft} draft "
         f"tokens: KV cache {cell.kv_cache.value}, MoE backend {cell.moe_backend}"
-        for (ranks, lm_head_tp, draft), cell in CELLS.items()
+        for (ranks, lm_head_tp, draft), cell in DEP_CELLS.items()
     )
     words = (
         f"{key[0]} ranks, LM head tensor-parallel in attention DP {key[1]}, {key[2]} draft "
         f"tokens, KV cache {kv_cache}, MoE backend {model_config.moe_backend} is not a "
-        f"deployment this target serves ({served})"
+        f"dep deployment this target serves ({served})"
     )
     if mode is ModelingV2Mode.REQUIRE:
         raise ValueError(f"modeling_v2='require': {words}")
@@ -202,15 +259,32 @@ def target_paths(model_config: ModelConfig, mode: ModelingV2Mode) -> dispatch.Ta
     return NO_PATHS
 
 
-def adopt_model(model: "ModelingV2Glm52Nvfp4Sm103Dep", plan: dispatch.Plan) -> None:
+def target_paths(model_config: ModelConfig, mode: ModelingV2Mode) -> dispatch.TargetPaths:
+    """What this target serves on ``model_config``'s layout.
+
+    ``route`` admits only the tp8, tep and dep layouts, so attention DP and expert
+    parallelism tell them apart. Reads only the model config, so every rank decides alike.
+
+    Raises:
+        ValueError: under ``require``, if a dep deployment is not one of ``DEP_CELLS``.
+    """
+    mapping = model_config.mapping
+    if mapping.enable_attention_dp:
+        return _dep_paths(model_config, mode)
+    if mapping.moe_ep_size > 1:
+        return TEP_PATHS[mapping.tp_size]
+    return TP8_PATHS
+
+
+def _adopt_attention_dp(model: "ModelingV2Glm52Nvfp4Sm103Default") -> None:
     """Re-class the attention modules of every layer and the speculative worker, as far as
-    ``plan`` runs their fast paths.
+    the installed plan runs their fast paths.
 
     The attention modules of the decoder layers and of the draft layer, in index order, when
     the plan runs the rope and KV append (the attention paths that engage under attention DP
     extend it); then the speculative worker, which the built-in model builds after the draft
     layer, when the plan runs the draft loop. The layers, their MoE modules and the draft
-    layer stay the built-in classes. The fast paths read the installed plan, which is ``plan``.
+    layer stay the built-in classes.
 
     Raises:
         TypeError: if an attention module or the speculative worker is not exactly the
@@ -223,7 +297,7 @@ def adopt_model(model: "ModelingV2Glm52Nvfp4Sm103Dep", plan: dispatch.Plan) -> N
         GlmMtpWorker.adopt(model.spec_worker)
 
 
-class GlmMoeDsaDepModelingV2(DeepseekV3Model):
+class GlmMoeDsaModelingV2(DeepseekV3Model):
     """The text model: the built-in ``DeepseekV3Model``, whose forward picks a target per step.
 
     Never constructed directly: ``adopt`` re-classes the built-in model the shell
@@ -238,7 +312,7 @@ class GlmMoeDsaDepModelingV2(DeepseekV3Model):
     decode_prologue: Optional["DecodePrologueHook"] = None
 
     @classmethod
-    def adopt(cls, model: DeepseekV3Model) -> "GlmMoeDsaDepModelingV2":
+    def adopt(cls, model: DeepseekV3Model) -> "GlmMoeDsaModelingV2":
         """Re-class the built-in text model as this core and build its two targets.
 
         Raises:
@@ -290,7 +364,7 @@ class PrefillTarget:
 
     phase = dispatch.Phase.PREFILL
 
-    def __init__(self, core: GlmMoeDsaDepModelingV2) -> None:
+    def __init__(self, core: GlmMoeDsaModelingV2) -> None:
         self.core = core
 
     def forward(
@@ -321,7 +395,7 @@ class DecodeTarget:
 
     phase = dispatch.Phase.DECODE
 
-    def __init__(self, core: GlmMoeDsaDepModelingV2) -> None:
+    def __init__(self, core: GlmMoeDsaModelingV2) -> None:
         self.core = core
 
     def forward(
@@ -335,10 +409,10 @@ class DecodeTarget:
     ) -> torch.Tensor:
         """The decoder layers of the text model on a decode step.
 
-        The built-in loop with the decode prologue's embedding. Each layer is the built-in
-        decoder layer, called as a module, so its forward hooks run; its attention runs the
-        attention modules' decode composition under the step's phase. The draft layer is not
-        run here; the last decoder layer applies the final norm.
+        The built-in loop with the decode prologue's embedding and the expert-prefetch join.
+        Each layer is called as a module, so its forward hooks run, and runs its decode
+        composition under the step's phase. The draft layer is not run here; the last decoder
+        layer applies the final norm.
         """
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError(
@@ -366,6 +440,9 @@ class DecodeTarget:
                 residual=residual,
                 spec_metadata=spec_metadata,
             )
+        if dispatch.is_enabled("cross_layer_expert_prefetch"):
+            # The expert-prefetch stream rejoins before the drafts.
+            dispatch.get_impl("cross_layer_expert_prefetch", "join")()
 
         hidden_states = maybe_allgather_for_helix_cp(
             hidden_states, attn_metadata, self.core.mapping_with_cp
@@ -373,8 +450,8 @@ class DecodeTarget:
         return hidden_states
 
 
-class ModelingV2Glm52Nvfp4Sm103Dep(GlmMoeDsaForCausalLM):
-    """GLM-5.2-NVFP4 on sm_103 at dep: the built-in causal LM with this target's core and dispatch."""
+class ModelingV2Glm52Nvfp4Sm103Default(GlmMoeDsaForCausalLM):
+    """GLM-5.2-NVFP4 on sm_103: the built-in causal LM with this target's core and dispatch."""
 
     def __init__(self, model_config: ModelConfig):
         world_size = model_config.mapping.world_size
@@ -385,9 +462,12 @@ class ModelingV2Glm52Nvfp4Sm103Dep(GlmMoeDsaForCausalLM):
         plan = dispatch.resolve(mode, dict(knobs), paths)
         dispatch.install(plan)
         super().__init__(model_config)
-        GlmMoeDsaDepModelingV2.adopt(self.model)
+        GlmMoeDsaModelingV2.adopt(self.model)
         self.plan = plan
-        adopt_model(self, self.plan)
+        if model_config.mapping.enable_attention_dp:
+            _adopt_attention_dp(self)
+        else:
+            adopt_model(self, self.plan)
         dispatch.check_rank_uniform_adopted(adopted_state(self), world_size)
 
     @property
@@ -437,6 +517,16 @@ class ModelingV2Glm52Nvfp4Sm103Dep(GlmMoeDsaForCausalLM):
                 spec_metadata=spec_metadata,
                 resource_manager=resource_manager,
                 **kwargs,
+            )
+
+    def setup_aliases(self) -> None:
+        """The built-in aliases, then the cross-layer expert prefetch links."""
+        super().setup_aliases()
+        # Bind each decoder MoE layer to the next MoE layer's gate and experts (structural
+        # references only).
+        if dispatch.is_enabled("cross_layer_expert_prefetch"):
+            dispatch.get_impl("cross_layer_expert_prefetch", "link_layers")(
+                self.model.layers, self.config.num_hidden_layers
             )
 
     def load_weights(self, weights):

@@ -115,27 +115,17 @@ models/<family>/
 catalog/<category>/ entries more than one target calls
 ```
 
-The targets, as `models/<family>/<target>`:
-
-* `deepseek_v3/r1_0528_nvfp4__sm_10x__default`
-* `glm_moe_dsa/glm_5_2_nvfp4__sm_103__tp8`: GLM-5.2 NVFP4 low-latency decode with attention
-  and experts tensor-parallel over eight ranks. The fast paths shared by the GLM-5.2 targets are
-  under `glm_moe_dsa/shared/kernels/`, the routed-MoE ones only this target calls under its own
-  `kernels/`, with their C++ kernels and ops in `cpp/tensorrt_llm/kernels/glmMoeDsa` and
-  `cpp/tensorrt_llm/thop/glmMoeDsa`; `shared/dispatch.py` selects them and lists the knobs.
-  The tp8 and tep targets run the layer composition of `shared/layers.py`, each with its own plan.
-  Each GLM-5.2 target is gated end to end by
-  `tests/integration/defs/accuracy/modeling_v2/test_glm_moe_dsa.py` (GSM8K under `require`).
-* `glm_moe_dsa/glm_5_2_nvfp4__sm_103__tep`: the same checkpoint with attention tensor-parallel
-  over four or eight ranks and the experts expert-parallel over the same ranks. It runs the
-  shared fast paths that take its tensor-parallel size, in front of the built-in
-  expert-parallel MoE.
-* `glm_moe_dsa/glm_5_2_nvfp4__sm_103__dep`: the same checkpoint with attention data parallelism
-  and the experts expert-parallel over the same ranks. Its built-in layers run the shared
-  attention, draft-loop and step-loop fast paths that are rank-local under attention DP; it
-  checks the KV-cache dtype and the MoE backend, which `route` does not read, when it is built.
-* `gpt_oss/gpt_oss_120b__sm_10x__default`
-* `qwen4_exp/qwen3_8_flash_next_nvfp4__sm_103__tp1`
+GLM-5.2's target, `glm_moe_dsa/glm_5_2_nvfp4__sm_103__default`, is a default target (see
+"Default and specialized targets") for GLM-5.2 NVFP4 low-latency decode. It admits tp8, tep
+at four or eight ranks, and dep at the cells its routing module lists, and picks the fast
+paths of the layout when it is built; the fast paths were designed and tuned for tp8, and
+tep and dep run the subset that applies to them. The fast paths are under
+`glm_moe_dsa/shared/kernels/`, the routed-MoE ones under the target's own `kernels/`, with
+their C++ kernels and ops in `cpp/tensorrt_llm/kernels/glmMoeDsa` and
+`cpp/tensorrt_llm/thop/glmMoeDsa`; `shared/dispatch.py` selects them and lists the knobs.
+With tensor-parallel attention the layers run the composition of `shared/layers.py`. The
+target is gated end to end by `tests/integration/defs/accuracy/modeling_v2/test_glm_moe_dsa.py`
+(GSM8K under `require` at tp8, tep4 and dep8).
 
 An entry, shared or owned, is one `OpWrapper` subclass: `__call__` is the op
 call a target makes, `reference` is what it is supposed to compute in plain
