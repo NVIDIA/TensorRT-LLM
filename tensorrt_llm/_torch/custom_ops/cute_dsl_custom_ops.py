@@ -5690,6 +5690,41 @@ if IS_CUTLASS_DSL_AVAILABLE:
         return input.new_empty((input.shape[0], weight.shape[0]),
                                dtype=torch.bfloat16)
 
+    @torch.library.custom_op("trtllm::fp8_block_scale_low_m_gemm_nvfp4",
+                             mutates_args=(),
+                             device_types="cuda")
+    def fp8_block_scale_low_m_gemm_nvfp4(
+            input: torch.Tensor, weight: torch.Tensor,
+            weight_scale: torch.Tensor,
+            global_sf: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """``fp4_quantize`` (``global_sf``, 16-element groups, linear scales)
+        of this GEMM's BF16 output from the low-M / mid-M kernel's NVFP4
+        epilogue, byte for byte at the kernel's tactic: E2M1 codes
+        ``uint8 [M, N / 2]`` and E4M3 scales ``uint8 [M * N / 16]``. Runs the
+        current device's NVFP4 route (``nvfp4_out_tactic``) where it selects
+        this output, the BF16 GEMM's default tactic otherwise. ``1 <= M <=
+        256``, ``N`` a multiple of 128, ``global_sf`` an FP32 one-element
+        tensor (see ``can_run_nvfp4``)."""
+        if not fp8_low_m.can_run_nvfp4(input, weight, weight_scale, global_sf):
+            raise ValueError(
+                "fp8_block_scale_low_m_gemm_nvfp4: unsupported operands "
+                f"(M={input.shape[0]}, N={weight.shape[0]}, K={input.shape[-1]})"
+            )
+        m, n = input.shape[0], weight.shape[0]
+        codes = torch.empty((m, n // 2), dtype=torch.uint8, device=input.device)
+        scales = torch.empty((m * n // 16, ),
+                             dtype=torch.uint8,
+                             device=input.device)
+        return fp8_low_m.run_low_m_gemm_nvfp4(input, weight, weight_scale,
+                                              global_sf, codes, scales)
+
+    @torch.library.register_fake("trtllm::fp8_block_scale_low_m_gemm_nvfp4")
+    def _(input: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor,
+          global_sf: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        m, n = input.shape[0], weight.shape[0]
+        return (input.new_empty((m, n // 2), dtype=torch.uint8),
+                input.new_empty((m * n // 16, ), dtype=torch.uint8))
+
     # Kimi-K3 decode attention-residual mix + RMSNorm with a PDL prologue
     # (``kimi_k3_attn_res.py``). ``layer``/``prefix``/``residual`` and the
     # addends are BF16 ``[M, H]``, ``block`` BF16 ``[N - 1, M, H]``, the
