@@ -344,7 +344,16 @@ class PostTransformRuntimeConstraints:
 
 
 class PostTransformTransferScope(str, Enum):
-    """The model component represented by a post-transform transfer."""
+    """The model component represented by a post-transform transfer.
+
+    `TARGET_MODEL` is a text-only root. `ModelLoader` also derives it for a
+    multimodal root that no profile registers, or whose language model it
+    cannot determine, so such a root never matches a multimodal profile.
+    `COMPLETE_MODEL` is a registered multimodal root together with its local
+    multimodal encoder. `LANGUAGE_MODEL` is a registered multimodal root
+    without a local encoder, for example when the encoder is disabled or runs
+    in a separate disaggregated worker.
+    """
 
     TARGET_MODEL = "target_model"
     LANGUAGE_MODEL = "language_model"
