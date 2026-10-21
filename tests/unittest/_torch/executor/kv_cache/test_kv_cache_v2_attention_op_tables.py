@@ -15,12 +15,15 @@
 """Attention-op page tables of a KV cache whose life cycles mix page sizes.
 
 A unified target/draft cache (FP8 target, BF16 draft sharing a sliding window)
-cannot use one table per life cycle. The batch's rows of its per-layer tables
-must match the old full-capacity rebuild bit for bit, and be the host rows at
-enqueue time, however the host table changes before the asynchronous copy runs.
+cannot use one table per life cycle. The batch's rows of its tables must match
+the old full-capacity per-layer rebuild: bit for bit with per-layer tables, and
+page for page (same addresses, same BAD_PAGE_INDEX entries) with shared tables.
+They must also be the host rows at enqueue time, however the host table changes
+before the asynchronous copy runs.
 """
 
 from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -37,7 +40,7 @@ from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.internal.batch_manager import CacheType
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
-from tensorrt_llm.runtime.kv_cache_manager_v2 import BAD_PAGE_INDEX
+from tensorrt_llm.runtime.kv_cache_manager_v2 import BAD_PAGE_INDEX, PageIndexMode
 
 TOKENS_PER_BLOCK = 4
 WINDOW = 2 * TOKENS_PER_BLOCK
@@ -71,8 +74,13 @@ def _layer_specs():
     return specs + [replace(draft, global_layer_id=6 + i) for i in range(2)]
 
 
-def _make_manager() -> KVCacheManagerV2:
+def _make_manager(monkeypatch, grouped: bool) -> KVCacheManagerV2:
     torch.cuda.init()
+    if not grouped:
+        # raising=False: also runs against a tree without shared tables.
+        monkeypatch.setattr(
+            KVCacheManagerV2, "_get_attention_op_pool_groups", lambda self: None, raising=False
+        )
     manager = KVCacheManagerV2(
         KvCacheConfig(
             max_gpu_total_bytes=16 << 20,
@@ -164,8 +172,8 @@ def eager_full_rebuild(monkeypatch):
     monkeypatch.setattr(torch_utils, "is_piecewise_running", lambda: True)
 
 
-def test_per_layer_tables_match_full_rebuild() -> None:
-    manager = _make_manager()
+def test_per_layer_tables_match_full_rebuild(monkeypatch) -> None:
+    manager = _make_manager(monkeypatch, grouped=False)
     try:
         assert manager._use_per_layer_page_tables
         assert manager.num_attention_op_pools == manager.num_local_layers
@@ -178,9 +186,86 @@ def test_per_layer_tables_match_full_rebuild() -> None:
         manager.shutdown()
 
 
-def test_copy_is_a_snapshot_of_the_host_table() -> None:
+def test_grouped_tables_address_the_full_rebuild_pages(monkeypatch) -> None:
+    manager = _make_manager(monkeypatch, grouped=True)
+    try:
+        assert not manager._use_per_layer_page_tables
+        # (window, FP8 pages), (window, BF16 pages), (full, FP8 pages).
+        assert manager.num_attention_op_pools == 3
+        tables, copy_idx = _copy_batch(manager)
+        _check_windowed_out_pages(manager, copy_idx)
+        reference = _full_rebuild(manager, copy_idx).cpu()
+        tables = tables.cpu()
+        pointers = manager.kv_cache_pool_pointers[:, 0].tolist()
+        for layer_id in range(manager.num_local_layers):
+            op_pool, offset = manager.kv_cache_pool_mapping[layer_id].tolist()
+            stride = manager.impl.get_page_stride(layer_id, Role.KEY)
+            # The attention op's pool pointer plus the mapping offset is the layer's own base.
+            layer_base = pointers[op_pool] + offset * 2 * stride
+            assert layer_base == manager.impl.get_mem_pool_base_address(
+                layer_id, Role.KEY, PageIndexMode.SHARED
+            )
+            origin = manager.impl.get_mem_pool_base_address(
+                layer_id, Role.KEY, PageIndexMode.PER_LAYER
+            )
+            expected = reference[layer_id]
+            actual = tables[op_pool]
+            bad = expected == BAD_PAGE_INDEX
+            assert torch.equal(actual == BAD_PAGE_INDEX, bad)
+            assert torch.equal(
+                (layer_base + actual.long() * stride)[~bad],
+                (origin + expected.long() * stride)[~bad],
+            )
+    finally:
+        manager.shutdown()
+
+
+@pytest.mark.parametrize("grouped", [True, False], ids=["grouped", "per-layer"])
+def test_dflash_decodes_the_same_draft_tables(monkeypatch, grouped: bool) -> None:
+    from tensorrt_llm._torch.speculative.dflash import DFlashWorker
+
+    manager = _make_manager(monkeypatch, grouped=grouped)
+    try:
+        num_draft_layers, nkv, head_dim = 2, 2, 16
+        num_seqs = len(REQUESTS)
+        tables, copy_idx = _copy_batch(manager)
+        worker = object.__new__(DFlashWorker)
+        worker._ctx_unified_cache = True
+        pool = worker._managed_ctx_pool(manager, num_draft_layers, nkv, head_dim, torch.bfloat16, 2)
+        assert pool is not None
+        assert worker._init_ctx_block_tables(
+            manager, pool, num_seqs, num_draft_layers, nkv, head_dim, TOKENS_PER_BLOCK
+        )
+        assert worker._refresh_ctx_block_tables(
+            SimpleNamespace(kv_cache_block_offsets=tables), num_seqs
+        )
+        # Decode the pre-change per-layer tables with the pre-change constants.
+        draft_layer = manager.layer_offsets[worker._ctx_layer_ids[0]]
+        reference = object.__new__(DFlashWorker)
+        reference._ctx_unified_cache = True
+        reference._ctx_pool_idx = draft_layer
+        reference._ctx_block_offset = manager.impl.get_page_index_converter(
+            draft_layer, Role.KEY
+        ).layer_offset
+        reference._ctx_block_divisor = worker._ctx_block_divisor
+        reference._ctx_block_tables = torch.zeros_like(worker._ctx_block_tables)
+        reference._ctx_block_counts = torch.zeros_like(worker._ctx_block_counts)
+        reference._ctx_block_cols = worker._ctx_block_cols
+        assert reference._refresh_ctx_block_tables(
+            SimpleNamespace(kv_cache_block_offsets=_full_rebuild(manager, copy_idx)), num_seqs
+        )
+        assert torch.equal(worker._ctx_block_tables, reference._ctx_block_tables)
+        assert torch.equal(worker._ctx_block_counts, reference._ctx_block_counts)
+        # The long request's extent runs past its windowed-out pages.
+        assert int(worker._ctx_block_counts[0]) * TOKENS_PER_BLOCK >= 36
+    finally:
+        manager.shutdown()
+
+
+@pytest.mark.parametrize("grouped", [True, False], ids=["grouped", "per-layer"])
+def test_copy_is_a_snapshot_of_the_host_table(monkeypatch, grouped: bool) -> None:
     """The next step's host-table writes must not reach this step's pending copy."""
-    manager = _make_manager()
+    manager = _make_manager(monkeypatch, grouped=grouped)
     try:
         expected, _ = _copy_batch(manager)
         request_ids = [request_id for request_id, *_ in REQUESTS]
