@@ -461,6 +461,68 @@ def test_default_io_counts_are_preserved(adapter, processor, count):
     assert list(result["video_metadata"][0].frames_indices) == video.metadata["frames_indices"]
 
 
+@pytest.mark.parametrize("target", ["num_frames", "fps"])
+@pytest.mark.parametrize("value", [0, -1, -2])
+@pytest.mark.parametrize("nested", [False, True])
+@pytest.mark.parametrize("presampled", [False, True])
+def test_nonpositive_single_target_preserves_available_frames(
+    adapter, processor, target, value, nested, presampled
+):
+    indices = np.linspace(0, 239, 40).astype(int).tolist() if presampled else list(range(40))
+    video = _video(indices)
+    original = copy.deepcopy(video.metadata)
+    targets = {target: value}
+    kwargs = {"videos_kwargs": targets} if nested else targets
+    result = _run(adapter, processor, [video], **kwargs)
+    assert result["video_grid_thw"][0, 0].item() == 20
+    assert list(result["video_metadata"][0].frames_indices) == indices
+    patches = result["pixel_values_videos"].reshape(20, -1, 3, 2, 16, 16)
+    assert patches[:, 0, 0, :, 0, 0].flatten().tolist() == list(range(40))
+    assert video.metadata == original
+
+
+@pytest.mark.parametrize("target", ["num_frames", "fps"])
+def test_explicit_sampling_with_nonpositive_target_keeps_available_frames(
+    adapter, processor, target
+):
+    video = _video(list(range(40)))
+    result = _run(adapter, processor, [video], do_sample_frames=True, **{target: 0})
+    assert result["video_grid_thw"][0, 0].item() == 20
+    assert list(result["video_metadata"][0].frames_indices) == list(range(40))
+
+
+@pytest.mark.parametrize("nested", [False, True])
+@pytest.mark.parametrize("num_frames", [None, 0, 40])
+@pytest.mark.parametrize(
+    "missing_prefix_field", [None, "fps", "duration", "frames_indices", "total_num_frames"]
+)
+def test_explicit_fps_uses_available_prefix_duration(
+    adapter, processor, nested, num_frames, missing_prefix_field
+):
+    prefix = _video(list(range(40)))
+    if missing_prefix_field is not None:
+        del prefix.metadata[missing_prefix_field]
+    presampled = _video(np.linspace(0, 239, 40).astype(int).tolist())
+    originals = [copy.deepcopy(v.metadata) for v in (prefix, presampled)]
+    targets = {"fps": 4}
+    if num_frames is not None:
+        targets["num_frames"] = num_frames
+    kwargs = {"videos_kwargs": targets} if nested else targets
+    result = _run(adapter, processor, [prefix, presampled], **kwargs)
+    assert result["video_grid_thw"][:, 0].tolist() == [3, 20]
+    selected = np.linspace(0, 39, 6).round().astype(int).tolist()
+    metadata = result["video_metadata"]
+    assert list(metadata[0].frames_indices) == selected
+    assert list(metadata[1].frames_indices) == presampled.metadata["frames_indices"]
+    patches = result["pixel_values_videos"].reshape(23, -1, 3, 2, 16, 16)
+    assert patches[:3, 0, 0, :, 0, 0].flatten().tolist() == selected
+    for actual, original, video in zip(metadata, originals, (prefix, presampled), strict=True):
+        for key in ("fps", "duration", "total_num_frames"):
+            if key in original:
+                assert actual[key] == original[key]
+        assert video.metadata == original
+
+
 @pytest.mark.parametrize(
     "kwargs,count",
     [
@@ -503,13 +565,26 @@ def test_disabled_processor_preserves_combined_target_override(adapter, processo
     assert result["video_grid_thw"][0, 0].item() == 20
 
 
-@pytest.mark.parametrize("presampled", [False, True])
+@pytest.mark.parametrize("layout", ["presampled", "full", "prefix"])
 @pytest.mark.parametrize(
-    "kwargs", [{}, {"num_frames": 8}, {"videos_kwargs": {"fps": 2}}, {"num_frames": 40, "fps": 2}]
+    "kwargs",
+    [
+        {},
+        {"num_frames": 8},
+        {"videos_kwargs": {"fps": 2}},
+        {"num_frames": 40, "fps": 2},
+        {"num_frames": 0},
+        {"fps": 0},
+        {"fps": 4},
+    ],
 )
-def test_token_count_fallback_matches_encoder_grid(adapter, processor, presampled, kwargs):
-    indices = np.linspace(0, 239, 40).astype(int).tolist() if presampled else list(range(48))
-    video = _video(indices, total=240 if presampled else 48)
+def test_token_count_fallback_matches_encoder_grid(adapter, processor, layout, kwargs):
+    if layout == "presampled":
+        video = _video(np.linspace(0, 239, 40).astype(int).tolist())
+    elif layout == "full":
+        video = _video(list(range(48)), total=48)
+    else:
+        video = _video(list(range(40)))
     original = copy.deepcopy(video.metadata)
     result = _run(adapter, processor, [video], **kwargs)
     expected = int(result["video_grid_thw"][0].prod().item()) // 4

@@ -86,6 +86,30 @@ class TestDecideDoSampleFrames:
         vd = _fake_video({}, n_frames=8)
         assert _decide_do_sample_frames([vd], {"num_frames": 4}) is True
 
+    @pytest.mark.parametrize("target", ["num_frames", "fps"])
+    @pytest.mark.parametrize("value", [0, -1, -2])
+    def test_nonpositive_single_target_disables_limit(self, target, value):
+        vd = _fake_video(
+            {"fps": 24.0, "duration": 10.0, "frames_indices": list(range(40))}, n_frames=40
+        )
+        assert _decide_do_sample_frames([vd], {target: value}) is False
+
+    @pytest.mark.parametrize("num_frames", [None, 0, 40])
+    def test_fps_target_uses_decoded_prefix_duration(self, num_frames):
+        vd = _fake_video(
+            {
+                "fps": 24.0,
+                "total_num_frames": 240,
+                "duration": 10.0,
+                "frames_indices": list(range(40)),
+            },
+            n_frames=40,
+        )
+        kwargs = {"fps": 4}
+        if num_frames is not None:
+            kwargs["num_frames"] = num_frames
+        assert _decide_do_sample_frames([vd], kwargs) is True
+
     def test_fps_target_computed_from_duration(self):
         # Target = floor(duration * fps) = floor(4.0 * 2.0) = 8 → no resample.
         vd_match = _fake_video({"duration": 4.0}, n_frames=8)

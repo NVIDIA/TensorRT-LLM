@@ -169,6 +169,24 @@ def _expand_prompt_token_ids_for_mm_handoff(
     )
 
 
+def _get_video_sampling_duration(metadata: dict[str, Any], n_decoded: int) -> float:
+    """Return the duration represented by the decoded frames for sampling."""
+    source_fps = metadata.get("fps")
+    source_total = metadata.get("total_num_frames")
+    source_duration = metadata.get("duration")
+    if not source_fps and source_total and source_duration:
+        source_fps = source_total / source_duration
+    indices = metadata.get("frames_indices")
+    if indices is not None and list(indices) != list(range(n_decoded)):
+        if source_total and source_fps:
+            return source_total / source_fps
+        if source_duration:
+            return source_duration
+    # Continuous decoded frames cover only the available prefix, even when
+    # metadata still describes the full source video.
+    return n_decoded / source_fps if source_fps else source_duration or n_decoded / 24
+
+
 def _decide_do_sample_frames(
     video_datas: Optional[List[Any]],
     mm_processor_kwargs: Dict[str, Any],
@@ -181,7 +199,8 @@ def _decide_do_sample_frames(
          keep IO-sampled frames with source indices; otherwise sample
          according to HF's class default.
       3. Otherwise, compare the requested frame count with the decoded count.
-         When both targets are supplied, use the smaller count, as VideoIO does.
+         Nonpositive targets impose no limit. When both targets are supplied,
+         use the smaller count, as VideoIO does.
          The adapter calls this function for one video at a time.
 
     The input adapter applies this decision separately to each video before
@@ -195,8 +214,8 @@ def _decide_do_sample_frames(
 
     user_num_frames = mm_processor_kwargs.get("num_frames")
     user_fps = mm_processor_kwargs.get("fps")
-    has_num_frames = user_num_frames is not None and user_num_frames != -1
-    has_fps = user_fps is not None and user_fps != -1
+    has_num_frames = user_num_frames is not None
+    has_fps = user_fps is not None
 
     if not has_num_frames and not has_fps:
         return any(
@@ -208,19 +227,18 @@ def _decide_do_sample_frames(
 
     for vd in video_datas:
         n_decoded = len(vd.frames)
+        duration = _get_video_sampling_duration(vd.metadata or {}, n_decoded)
         if user_num_frames is not None and user_fps is not None:
             n_target = n_decoded
             if user_num_frames > 0:
                 n_target = min(n_target, user_num_frames)
             if user_fps > 0:
-                duration = (vd.metadata or {}).get("duration") or 0
                 n_target = min(n_target, math.floor(duration * user_fps))
             n_target = max(1, n_target)
         elif has_num_frames:
-            n_target = user_num_frames
+            n_target = user_num_frames if user_num_frames > 0 else n_decoded
         else:  # has_fps
-            duration = (vd.metadata or {}).get("duration") or 0
-            n_target = math.floor(duration * user_fps)
+            n_target = math.floor(duration * user_fps) if user_fps > 0 else n_decoded
         if n_target != n_decoded:
             return True
     return False
@@ -426,10 +444,10 @@ class Qwen3VLInputProcessorBase(Qwen2VLInputProcessorBase):
                         else max(source_indices) + 1
                     )
                 frames = vd.frames
+                duration = _get_video_sampling_duration(m, n_decoded)
                 per_video_kwargs = dict(sampling_kwargs)
                 sample_num_frames, sample_fps = num_frames, fps
                 if num_frames is not None and fps is not None:
-                    duration = m.get("duration") or m["total_num_frames"] / (m.get("fps") or 24)
                     sample_num_frames = n_decoded
                     if num_frames > 0:
                         sample_num_frames = min(sample_num_frames, num_frames)
@@ -439,16 +457,14 @@ class Qwen3VLInputProcessorBase(Qwen2VLInputProcessorBase):
                     sample_fps = None
                     per_video_kwargs["num_frames"] = sample_num_frames
                     per_video_kwargs.pop("fps", None)
+                elif (num_frames is not None and num_frames <= 0) or (fps is not None and fps <= 0):
+                    sample_num_frames, sample_fps = n_decoded, None
+                    per_video_kwargs["num_frames"] = n_decoded
+                    per_video_kwargs.pop("fps", None)
                 if _decide_do_sample_frames([vd], per_video_kwargs):
-                    sampling_metadata = VideoMetadata(total_num_frames=n_decoded, fps=m.get("fps"))
-                    source_total = m.get("total_num_frames")
-                    has_source_sampling = m.get("frames_indices") is not None and list(
-                        source_indices
-                    ) != list(range(n_decoded))
-                    if has_source_sampling and source_total and sampling_metadata.fps:
-                        sampling_metadata.fps *= n_decoded / source_total
-                    elif has_source_sampling and m.get("duration"):
-                        sampling_metadata.fps = n_decoded / m["duration"]
+                    sampling_metadata = VideoMetadata(
+                        total_num_frames=n_decoded, fps=n_decoded / duration
+                    )
                     selected = self.processor.video_processor.sample_frames(
                         metadata=sampling_metadata,
                         num_frames=sample_num_frames,
