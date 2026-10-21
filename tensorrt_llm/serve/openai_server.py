@@ -126,6 +126,7 @@ from tensorrt_llm.serve.openai_protocol import (
 from tensorrt_llm.serve.openai_video_routes import _VideoRoutesMixin
 from tensorrt_llm.serve.perf_metrics import (PerfMetricsJsonlWriter,
                                              PerfMetricsMiddleware,
+                                             _input_processing_context,
                                              build_request_metrics_record)
 from tensorrt_llm.serve.postprocess_handlers import (
     ChatCompletionPostprocArgs, ChatPostprocArgs, CompletionPostprocArgs,
@@ -2673,9 +2674,6 @@ class OpenAIServer(_VideoRoutesMixin):
                         or get_request_conversation_id(request), preprocess)
                 generate_inputs = await self._run_input_processor(preprocess)
 
-            _record_input_processing("total", input_started)
-            input_started = None
-
             promise = self.generator.generate_async(
                 inputs=generate_inputs,
                 sampling_params=sampling_params,
@@ -2692,6 +2690,9 @@ class OpenAIServer(_VideoRoutesMixin):
                 priority=request.priority
                 if request.priority is not None else DEFAULT_REQUEST_PRIORITY,
             )
+            _record_input_processing("total", input_started)
+            input_started = None
+
             asyncio.create_task(self.await_disconnected(raw_request, promise))
             if raw_request is not None:
                 # The executor client id, which the perf metrics, the
@@ -2918,7 +2919,16 @@ class OpenAIServer(_VideoRoutesMixin):
 
         raw_request = self._synthetic_request(
             chat_request.model_dump(exclude_none=True))
-        response = await self.openai_chat(chat_request, raw_request)
+        if self._collect_perf_metrics:
+            observer = (self.metrics_collector.log_input_processing
+                        if self.metrics_collector else None)
+            with _input_processing_context(raw_request.scope["state"],
+                                           observer):
+                response = await self.openai_chat(chat_request, raw_request)
+            for record in raw_request.state.perf_metrics_records:
+                self._perf_metrics_writer.submit(record)
+        else:
+            response = await self.openai_chat(chat_request, raw_request)
         if response is None:
             return "errored", {
                 "type": "api_error",
@@ -3144,10 +3154,10 @@ class OpenAIServer(_VideoRoutesMixin):
                 self._attach_multimodal_data(prompt, request, mm_data,
                                              mm_item_order)
 
+            promise = self.generator.generate_async(inputs=prompt, )
             _record_input_processing("total", input_started)
             input_started = None
 
-            promise = self.generator.generate_async(inputs=prompt, )
             asyncio.create_task(self.await_disconnected(raw_request, promise))
 
             response = await create_mm_embedding_response(promise)
@@ -3517,9 +3527,6 @@ class OpenAIServer(_VideoRoutesMixin):
                 request, raw_request)
 
             # Generate
-            _record_input_processing("total", input_started)
-            input_started = None
-
             promise = self.generator.generate_async(
                 inputs=harmony_tokens,
                 sampling_params=sampling_params,
@@ -3535,6 +3542,9 @@ class OpenAIServer(_VideoRoutesMixin):
                 priority=request.priority
                 if request.priority is not None else DEFAULT_REQUEST_PRIORITY,
             )
+            _record_input_processing("total", input_started)
+            input_started = None
+
             if not self.postproc_worker_enabled:
                 postproc_args.num_prompt_tokens = len(promise.prompt_token_ids)
 
@@ -3774,9 +3784,6 @@ class OpenAIServer(_VideoRoutesMixin):
                 request.disaggregated_params)
             conversation_params = to_llm_conversation_params(
                 request.conversation_params)
-            _record_input_processing("total", input_started)
-            input_started = None
-
             promise = self.generator.generate_async(
                 inputs=input_tokens,
                 sampling_params=sampling_params,
@@ -3787,6 +3794,9 @@ class OpenAIServer(_VideoRoutesMixin):
                 _postproc_params=postproc_params
                 if self.postproc_worker_enabled else None,
             )
+            _record_input_processing("total", input_started)
+            input_started = None
+
             if not self.postproc_worker_enabled:
                 # Set by the executor only for postprocessing it runs itself.
                 postproc_args.num_prompt_tokens = len(promise.prompt_token_ids)

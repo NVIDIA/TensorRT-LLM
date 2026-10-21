@@ -87,7 +87,7 @@ enable_iter_perf_stats: true
 
 | Metric | Measurement |
 | --- | --- |
-| `trtllm_input_processing_seconds{stage="total"}` | Wall time from entry into a chat, completion, encoder, Harmony or Responses handler until its inputs are prepared, before waiting for generation. Includes message parsing, rendering, media resolution, preprocessing and their waits. |
+| `trtllm_input_processing_seconds{stage="total"}` | Wall time from entry into a chat, completion, encoder, Harmony or Responses handler through synchronous input preparation and request submission, before waiting for generation. Includes message parsing, rendering, media resolution, preprocessing and their waits. |
 | `trtllm_input_processing_seconds{stage="media_load"}` | Time awaiting the common media resolver, including concurrent downloads, decodes and worker waits. |
 | `trtllm_input_processing_seconds{stage="chat_template"}` | Time awaiting chat template rendering, when rendering is needed. |
 | `trtllm_input_processing_seconds{stage="processor"}` | Input processor wall time inside its worker, including tokenization, model preprocessing and hashing. |
@@ -97,7 +97,7 @@ enable_iter_perf_stats: true
 | `trtllm_media_processing_seconds{stage="decode_queue", modality="image"}` | Per-item wait for a media decode worker. |
 | `trtllm_multimodal_encoder_gpu_time_seconds` | Rank-0 CUDA-event elapsed time per encoder call through `MultimodalModelMixin`, including item scheduling, inline encoding and side-stream prefetch. |
 
-Input timings are captured in a request context independently of Prometheus. Completed requests also carry them in `perf_metrics.input_processing_metrics` in the existing JSONL output (`perf_metrics_output_dir`). Values are seconds: request-level stages use keys such as `total`, `media_load`, `chat_template`, `processor` and `processor_queue`. Per-item times are summed by stage and modality within each request, for example `media_download_image` and `media_decode_image`; these sums can exceed elapsed request time when items overlap. Batched completion inputs share the HTTP request's frontend timings.
+Input timings are captured in a request context independently of Prometheus. When a route emits a completed executor metrics record, it also carries them in `perf_metrics.input_processing_metrics` in the existing JSONL output (`perf_metrics_output_dir`). Values are seconds: request-level stages use keys such as `total`, `media_load`, `chat_template`, `processor` and `processor_queue`. Per-item times are summed by stage and modality within each request, for example `media_download_image` and `media_decode_image`; these sums can exceed elapsed request time when items overlap. Batched completion inputs share the HTTP request's frontend timings. Anthropic Message Batch items have separate request contexts and JSONL records.
 
 For selected requests, send `X-TRTLLM-return-metrics: 1` to receive the same values in `Server-Timing`, for example `server_input_total;dur=150.000000` (milliseconds). Streaming responses use the existing `trtllm.perf_metrics` SSE event. These fields survive context/generation worker handoff and remain separate from executor timing and batch-level encoder GPU measurements. Stage histograms include failed attempts; request JSONL records follow the existing completed-request reporting path.
 
