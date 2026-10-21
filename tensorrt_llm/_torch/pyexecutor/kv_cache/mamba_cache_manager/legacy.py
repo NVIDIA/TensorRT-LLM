@@ -2026,7 +2026,6 @@ class CppMambaHybridCacheManager(KVCacheManager, _LegacyMambaHybridCacheManager)
         # extra tokens and draft tokens.
         token_nums: Optional[List[int]] = None,
         is_gen: bool = False,
-        prepare_resource: bool = True,
         max_num_draft_tokens: int = 0,
         kv_reserve_draft_tokens: Optional[int] = None,
         use_mrope: bool = False,
@@ -2039,7 +2038,6 @@ class CppMambaHybridCacheManager(KVCacheManager, _LegacyMambaHybridCacheManager)
             request_ids=request_ids,
             token_nums=token_nums,
             is_gen=is_gen,
-            prepare_resource=prepare_resource,
             max_num_draft_tokens=max_num_draft_tokens,
             kv_reserve_draft_tokens=kv_reserve_draft_tokens,
             use_mrope=use_mrope,

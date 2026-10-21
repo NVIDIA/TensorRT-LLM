@@ -104,8 +104,10 @@ from .kv_cache_stats import append_kv_cache_iteration_stats
 from .llm_request import (ATTENTION_DP_DUMMY_REQUEST_ID, ExecutorRequest,
                           LlmRequest, LlmRequestState, LlmResponse,
                           MultimodalEncoderRequestError, get_draft_token_length,
+                          get_mm_context_chunk_start, get_mm_items_for_chunk,
+                          get_mm_pending_items,
                           initialize_multimodal_encoder_request,
-                          is_multimodal_encoder_ready)
+                          is_mm_context_chunk_ready, release_consumed_mm_items)
 from .model_engine import ModelEngine
 from .perf_metrics_manager import PerfMetricsManager
 from .pp_utils import (MpiProgressPump, PPCommTag, get_with_mpi_progress,
@@ -6588,10 +6590,11 @@ class PyExecutor:
             new_requests: List[RequestQueueItem]) -> List[RequestQueueItem]:
         """Apply MM encoder item/token budgets to capacity-admitted requests.
 
-        Active requests consume this iteration's encoder budget first. New
-        requests then preserve waiting-queue FCFS order: once the head request
-        cannot make encoder progress, all later requests are deferred and
-        prepended to the waiting queue.
+        Active requests consume this iteration's encoder budget first.
+        Chunked DEFAULT scheduling charges only the current chunk; EAGER
+        also charges future items. New requests preserve waiting-queue FCFS
+        order: once the head cannot make encoder progress, later requests
+        are deferred and prepended to the waiting queue.
         """
         remaining_batch_slots = self.model_engine.encoder_batch_size
         remaining_tokens = self.model_engine.encoder_max_num_tokens
@@ -6612,10 +6615,24 @@ class PyExecutor:
 
         for request in self.active_requests:
             state = request.py_mm_encoder_state
-            if state is None or is_multimodal_encoder_ready(request):
+            if state is None:
                 continue
-            consume_pending(state.encoder_token_lengths,
-                            state.pending_item_indices())
+            if (self.scheduler.context_chunk_unit_size is not None
+                    and not self.scheduler.prepares_future_items):
+                begin = get_mm_context_chunk_start(request)
+                # A completed chunk resets its size before the next scheduling pass.
+                chunk_size = (request.context_chunk_size
+                              or self.scheduler.context_chunk_unit_size)
+                pending_item_indices = [
+                    item_idx for item_idx in get_mm_items_for_chunk(
+                        request, begin, begin + chunk_size)
+                    if not state.item_ready[item_idx]
+                ]
+            else:
+                pending_item_indices = get_mm_pending_items(request)
+            if pending_item_indices:
+                consume_pending(state.encoder_token_lengths,
+                                pending_item_indices)
 
         admitted = []
         deferred = []
@@ -6887,7 +6904,9 @@ class PyExecutor:
                             self.model_engine,
                             "bytes_per_mm_encoder_embedding",
                             0,
-                        ))
+                        ),
+                        context_chunk_unit_size=getattr(
+                            self.scheduler, "context_chunk_unit_size", None))
                 return False
             except Exception as e:
                 self._handle_errors(str(e),
@@ -7343,7 +7362,7 @@ class PyExecutor:
         scheduled_requests.reset_context_requests([
             request for request in scheduled_requests.context_requests
             if request.request_id not in failed_request_ids
-            and is_multimodal_encoder_ready(request)
+            and is_mm_context_chunk_ready(request)
         ])
         scheduled_requests.scheduled_mm_encoder_items = None
 
@@ -7855,7 +7874,6 @@ class PyExecutor:
                     request_ids=dummy_request_ids,
                     token_nums=token_nums,
                     is_gen=self._adp_dummy_is_gen,
-                    prepare_resource=True,
                     max_num_draft_tokens=self.max_total_draft_tokens,
                 )
             except OutOfPagesError:
@@ -7891,7 +7909,6 @@ class PyExecutor:
                 request_ids=dummy_request_ids,
                 token_nums=token_nums,
                 is_gen=self._adp_dummy_is_gen,
-                prepare_resource=True,
                 max_num_draft_tokens=self.max_total_draft_tokens,
             )
         except OutOfPagesError:
@@ -7980,7 +7997,6 @@ class PyExecutor:
                 request_ids=dummy_request_ids,
                 token_nums=None,
                 is_gen=True,
-                prepare_resource=True,
                 max_num_draft_tokens=self.max_total_draft_tokens,
             )
         except (OutOfPagesError, NoFreeSlotsError):
@@ -8534,6 +8550,10 @@ class PyExecutor:
                     request.context_current_position +
                     request.context_chunk_size)
                 request.move_to_next_context_chunk()
+                if (self._is_kv_manager_v2
+                        and request.py_mm_encoder_state is not None):
+                    release_consumed_mm_items(
+                        request, self.model_engine.mm_encoder_cache)
             if request.context_remaining_length == 0:
                 # Prefill is done for this request; drop pinned encoder outputs
                 # (multimodal_embedding) and raw pre-encoder tensors that multimodal models stashed

@@ -4343,6 +4343,12 @@ def create_py_executor_instance(
             bytes_per_encoder_embedding=(
                 model_engine.bytes_per_mm_encoder_embedding),
             retain_cache_entries=model_engine.model.encoder_cache_active,
+            # V2 resolves actual KV reuse before encoder item selection.
+            # V1 keeps whole-request encoder scheduling.
+            context_chunk_unit_size=(
+                ctx_chunk_config[1]
+                if isinstance(kv_cache_manager, KVCacheManagerV2)
+                and ctx_chunk_config is not None else None),
         )
 
     config = model_engine.model.model_config.pretrained_config
