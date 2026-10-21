@@ -21,6 +21,7 @@ from tensorrt_llm._torch.weight_sharing import (
     LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1,
     MISTRAL_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
     QWEN2_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
+    QWEN3_5_DENSE_VL_POST_TRANSFORM_LAYOUT_ABI_V1,
     QWEN3_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1, ArtifactIdentity,
     IdentityCheckPolicy, LazyRootModelIdentity, PostTransformConfigIdentity,
     PostTransformFeature, PostTransformProfile, PostTransformProfileRegistry,
@@ -101,6 +102,14 @@ _MX_QWEN3_BF16_DENSE_RUNTIME_CONSTRAINTS = replace(
 _MX_MISTRAL_BF16_DENSE_RUNTIME_CONSTRAINTS = replace(
     _MX_BF16_DENSE_RUNTIME_CONSTRAINTS,
     sliding_windows=frozenset({"none"}),
+)
+# Qwen3.5 vision-language roots realize interleaved M-RoPE (`rope_type`
+# `mrope`), applied by the fused QK-norm/RoPE kernel rather than the
+# attention op.
+_MX_QWEN3_5_VL_BF16_RUNTIME_CONSTRAINTS = replace(
+    _MX_BF16_DENSE_RUNTIME_CONSTRAINTS,
+    rope_types=frozenset({"mrope"}),
+    rope_fusion=frozenset({False}),
 )
 
 
@@ -711,6 +720,19 @@ class ModelLoader:
             transform_abi_id=MISTRAL_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
             transfer_scope=PostTransformTransferScope.TARGET_MODEL,
             runtime_constraints=_MX_MISTRAL_BF16_DENSE_RUNTIME_CONSTRAINTS,
+        ),
+        PostTransformProfile(
+            profile_id="qwen3_5-for-conditional-generation-bf16-complete-v1",
+            root_model_class=LazyRootModelIdentity(
+                "tensorrt_llm._torch.models.modeling_qwen3_5",
+                "Qwen3_5VLModel"),
+            architecture="Qwen3_5ForConditionalGeneration",
+            model_type="qwen3_5",
+            speculative_mode=None,
+            protocol_version=_MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION,
+            transform_abi_id=QWEN3_5_DENSE_VL_POST_TRANSFORM_LAYOUT_ABI_V1,
+            transfer_scope=PostTransformTransferScope.COMPLETE_MODEL,
+            runtime_constraints=_MX_QWEN3_5_VL_BF16_RUNTIME_CONSTRAINTS,
         ),
     ))
 

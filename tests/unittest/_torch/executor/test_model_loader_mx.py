@@ -637,7 +637,31 @@ def _format_documented_values(
     return " or ".join(labels.get(value, str(value)) for value in sorted(values, key=str))
 
 
-def _documented_dense_constraints(profile: PostTransformProfile) -> str:
+# Constraint phrases of the public support table, keyed by registry values.
+# A profile that needs a new phrase adds it here rather than special-casing
+# its model type.
+_DOCUMENTED_SCOPES = {
+    PostTransformTransferScope.TARGET_MODEL: "dense {dtypes}",
+    PostTransformTransferScope.COMPLETE_MODEL: (
+        "dense {dtypes} vision-language model with its local vision encoder"
+    ),
+}
+_DOCUMENTED_ROPE_TYPES = {
+    frozenset({"default"}): "default",
+    frozenset({"mrope"}): "M-RoPE",
+}
+_DOCUMENTED_ROPE_FUSION = {
+    frozenset({True}): "fused RoPE",
+    frozenset({False}): "fused QK-norm/RoPE",
+}
+_DOCUMENTED_SLIDING_WINDOWS = {
+    None: "",
+    frozenset({"none"}): ", no sliding window",
+}
+
+
+def _documented_constraints(profile: PostTransformProfile) -> str:
+    """Render the support-table constraint text that a registry profile implies."""
     constraints = profile.runtime_constraints
     assert constraints.quant_algorithms == frozenset({"none"})
     assert constraints.kv_cache_quant_algorithms == frozenset({"none"})
@@ -648,11 +672,6 @@ def _documented_dense_constraints(profile: PostTransformProfile) -> str:
     assert constraints.attention_dp == frozenset({False})
     assert constraints.multi_node == frozenset({False})
     assert constraints.tied_word_embeddings == frozenset({False})
-    assert constraints.rope_types == frozenset({"default"})
-    qwen3_profile = profile.model_type == "qwen3"
-    assert constraints.rope_fusion == frozenset({not qwen3_profile})
-    mistral_profile = profile.model_type == "mistral"
-    assert constraints.sliding_windows == (frozenset({"none"}) if mistral_profile else None)
     assert constraints.moe_backends is None
     assert constraints.moe_tp_sizes is None
     assert constraints.moe_ep_sizes is None
@@ -669,10 +688,14 @@ def _documented_dense_constraints(profile: PostTransformProfile) -> str:
     attention_backends = _format_documented_values(constraints.attention_backends)
     tp_sizes = _format_documented_values(constraints.tp_sizes)
     pp_cp_sizes = _format_documented_values(constraints.pp_sizes)
-    rope_description = "default fused QK-norm/RoPE" if qwen3_profile else "default fused RoPE"
-    sliding_window_description = ", no sliding window" if mistral_profile else ""
+    model_description = _DOCUMENTED_SCOPES[profile.transfer_scope].format(dtypes=dtypes)
+    rope_description = (
+        f"{_DOCUMENTED_ROPE_TYPES[constraints.rope_types]} "
+        f"{_DOCUMENTED_ROPE_FUSION[constraints.rope_fusion]}"
+    )
+    sliding_window_description = _DOCUMENTED_SLIDING_WINDOWS[constraints.sliding_windows]
     return (
-        f"Single-node dense {dtypes}, unquantized weights and KV cache, "
+        f"Single-node {model_description}, unquantized weights and KV cache, "
         f"{attention_backends} attention, {rope_description}{sliding_window_description}, "
         f"untied embeddings, TP={tp_sizes}, PP/CP={pp_cp_sizes}, no LoRA, sparse attention, "
         "attention DP, speculative mode, or separately loaded draft model"
@@ -704,7 +727,7 @@ def test_public_support_table_matches_qualified_profile_registry() -> None:
             f"| `{profile.profile_id}` | `{profile.root_model_class.class_name}` | "
             f"`{profile.architecture}` / `{profile.model_type}` | {scope} | "
             f"{profile.protocol_version} | `{profile.transform_abi_id}` | "
-            f"{_documented_dense_constraints(profile)} |"
+            f"{_documented_constraints(profile)} |"
         )
         assert expected_row in table_rows
 
