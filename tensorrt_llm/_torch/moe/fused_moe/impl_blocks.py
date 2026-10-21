@@ -149,6 +149,10 @@ class MoEWeightOwnerMixin:
     # Declared here so the mixin's own lifecycle methods never depend on a
     # subclass constructor having assigned it first.
     _weights_created: bool = False
+    # The one-shot transform guard exists before any weight load, so a staged
+    # receiver that installs already transformed bytes without loading can
+    # mark this owner transformed, as it does for `Linear`.
+    _weights_transformed: bool = False
 
     # ---- weight lifecycle -------------------------------------------------
     def create_weights(self) -> None:
