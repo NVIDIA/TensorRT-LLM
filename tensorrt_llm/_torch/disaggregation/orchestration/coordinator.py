@@ -12,6 +12,7 @@ import os
 import time
 from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple
 
+from tensorrt_llm import _disagg_late_receiver_diagnostic as late_receiver_diagnostic
 from tensorrt_llm._torch.disaggregation.base.transfer import get_unique_rid
 from tensorrt_llm._torch.disaggregation.kv_cache_transceiver import (
     is_disagg_inflight_cancel_enabled,
@@ -265,6 +266,16 @@ class DisaggTransferCoordinator:
                     f"kv_transfer_timeout_ms={timeout_ms}ms"
                 )
                 req.py_kv_transfer_timed_out = True
+                if kind == "generation" and late_receiver_diagnostic.is_enabled():
+                    late_receiver_diagnostic.observe(
+                        "gen_timeout_expired",
+                        get_unique_rid(req),
+                        request_id=req.py_request_id,
+                        rank=self._dist.rank,
+                        timeout_start_monotonic=req.py_kv_transfer_start_time,
+                        kv_transfer_timeout_ms=timeout_ms,
+                        observed_elapsed_ms=elapsed_ms,
+                    )
 
         # Context requests start their clock on the last chunk, which is also
         # when they enter the transfer manager, so this covers the whole
@@ -429,6 +440,15 @@ class DisaggTransferCoordinator:
         for req in requests:
             if req.state == LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS:
                 req.py_kv_transfer_start_time = time.monotonic()
+                if late_receiver_diagnostic.is_enabled():
+                    late_receiver_diagnostic.observe(
+                        "gen_timeout_started",
+                        get_unique_rid(req),
+                        request_id=req.py_request_id,
+                        rank=self._dist.rank,
+                        timeout_start_monotonic=req.py_kv_transfer_start_time,
+                        kv_transfer_timeout_ms=self._transceiver.kv_transfer_timeout_ms,
+                    )
 
     def poll_progress_when_idle(self) -> None:
         """Reap completed context KV transfers so their blocks can be freed.
@@ -522,6 +542,15 @@ class DisaggTransferCoordinator:
                     continue
                 if self._transceiver.kv_transfer_timeout_ms is not None:
                     req.py_kv_transfer_start_time = time.monotonic()
+                    if late_receiver_diagnostic.is_enabled():
+                        late_receiver_diagnostic.observe(
+                            "ctx_timeout_started",
+                            get_unique_rid(req),
+                            request_id=req.py_request_id,
+                            rank=self._dist.rank,
+                            timeout_start_monotonic=req.py_kv_transfer_start_time,
+                            kv_transfer_timeout_ms=self._transceiver.kv_transfer_timeout_ms,
+                        )
             elif (
                 self._transceiver.pipeline_transfer_enabled
                 and req.state != LlmRequestState.GENERATION_COMPLETE
@@ -735,6 +764,16 @@ class DisaggTransferCoordinator:
                     f"{request.py_request_id} due to KV cache transfer timeout"
                 )
                 request.py_kv_transfer_timed_out = True
+                if late_receiver_diagnostic.is_enabled():
+                    late_receiver_diagnostic.observe(
+                        "gen_timeout_expired",
+                        get_unique_rid(request),
+                        request_id=request.py_request_id,
+                        rank=self._dist.rank,
+                        timeout_start_monotonic=request.py_kv_transfer_start_time,
+                        kv_transfer_timeout_ms=timeout_ms,
+                        observed_elapsed_ms=elapsed_ms,
+                    )
 
         user_canceled_ids = set(self._registry.canceled_request_ids())
         local_timed_out_ids = sorted(

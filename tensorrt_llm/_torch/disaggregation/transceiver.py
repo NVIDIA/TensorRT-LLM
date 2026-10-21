@@ -24,6 +24,7 @@ import numpy as np
 import torch
 
 import tensorrt_llm.bindings
+from tensorrt_llm import _disagg_late_receiver_diagnostic as late_receiver_diagnostic
 from tensorrt_llm import logger
 from tensorrt_llm._torch.disaggregation.base import CacheKind, TokenRange
 from tensorrt_llm._torch.disaggregation.base.agent import use_pure_python_transfer_agent
@@ -243,6 +244,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         kv_cache_manager: KVCacheManager,
         cache_transceiver_config: CacheTransceiverConfig,
     ):
+        late_receiver_diagnostic.validate_environment()
         self._shutdown_lock = threading.Lock()
         self._shutdown_complete = False
         self._dist: Distributed = dist
@@ -987,6 +989,20 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             disagg_info_endpoint=self._context_info_endpoint,
         )
         self._send_reqs[rid] = req
+        if late_receiver_diagnostic.is_enabled():
+            late_receiver_diagnostic.observe(
+                "ctx_send_published",
+                rid,
+                request_id=req.py_request_id,
+                ctx_dp_rank=self._dp_rank,
+                rank=self._mapping.rank,
+                pp_size=self._mapping.pp_size,
+                cp_size=self._mapping.cp_size,
+                attention_dp=self._mapping.enable_attention_dp,
+                bridge_enabled=self._fp4_mla_bridge_enabled,
+                pipeline_transfer=self.pipeline_transfer_enabled,
+                kv_transfer_timeout_ms=self.kv_transfer_timeout_ms,
+            )
 
     @property
     def pipeline_transfer_enabled(self) -> bool:
@@ -1214,6 +1230,15 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             # The handle that comes back is the contract's answer about this piece. What retires
             # the request is the sweep over the session tables, as it was before.
             fetches.fetch(extent, expected_write_bytes=chunk_bytes)
+            if late_receiver_diagnostic.is_enabled():
+                late_receiver_diagnostic.observe(
+                    "gen_receive_published",
+                    rid,
+                    request_id=req.py_request_id,
+                    rank=self._mapping.rank,
+                    ctx_dp_rank=req.py_disaggregated_params.ctx_dp_rank,
+                    publication="fetch_returned",
+                )
         except Exception:
             # No session means no publication and nothing the sweep could ever pair the request
             # with, so the registration made here is undone here and the request goes terminal.
@@ -1526,6 +1551,19 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                     outcome="cancelled",
                     session_already_closed=True,
                 )
+                if late_receiver_diagnostic.is_enabled():
+                    late_receiver_diagnostic.observe(
+                        "ctx_retired",
+                        rid,
+                        request_id=req.py_request_id,
+                        ctx_dp_rank=self._dp_rank,
+                        rank=self._mapping.rank,
+                        timed_out=req.py_kv_transfer_timed_out,
+                        close_confirmed=True,
+                        session_absent=rid not in self._send_sessions
+                        and rid not in self._send_reqs,
+                        retired_flag=req.py_kv_send_session_retired,
+                    )
 
         if rid in self._recv_sessions:
             self._recv_sessions[rid].cancel()
