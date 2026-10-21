@@ -164,8 +164,6 @@ def tokenize_chat_request_for_serving(
             set_prompt_token_ids=set_prompt_token_ids,
         )
 
-    if model_type is None and model_type_resolver is not None:
-        model_type = model_type_resolver()
     tokenizer = tokenizer_factory()
     rendered = render_chat_request_for_tokenizer(request, tokenizer, model_type=model_type)
     result = encode_rendered(rendered, tokenizer) if isinstance(rendered, str) else rendered
