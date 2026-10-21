@@ -197,6 +197,20 @@ def _created_ms(data):
     return ts if ts > 1e12 else ts * 1000
 
 
+def _stored_baseline_predates_floor(baseline_threshold, metric, metric_history_floors_ms):
+    """Whether a stored d_baseline_* for *metric* may predate the metric's history floor.
+
+    The stored fields come from one history record (see get_history_data), whose
+    ts_created says when they were set. A metric with no floor is never affected;
+    under a floor, a record of unknown age counts as older than the floor.
+    """
+    floor_ms = (metric_history_floors_ms or {}).get(metric)
+    if floor_ms is None:
+        return False
+    stored_ms = _created_ms(baseline_threshold or {})
+    return stored_ms is None or stored_ms < floor_ms
+
+
 def _daily_aggregate_values(data_list, metric, min_created_ms=None):
     """Aggregate multiple data points on the same day to a single mean value.
 
@@ -325,9 +339,10 @@ def prepare_regressive_test_cases(
 
     Uses baseline/threshold fields from latest_baseline_threshold_dict when
     available, otherwise falls back to calculating baseline from history data.
-    A metric listed in metric_history_floors_ms ignores any stored baseline and
-    always takes the floor-filtered calculation (see calculate_baseline_metrics);
-    its threshold is still read from latest_baseline_threshold_dict.
+    For a metric listed in metric_history_floors_ms, a stored baseline is used only
+    when the record it came from (its ts_created) is at or after the metric's floor;
+    otherwise the floor-filtered calculation is used (see calculate_baseline_metrics).
+    Its threshold is read from latest_baseline_threshold_dict either way.
 
     Returns the set of pre-merge cmd_idx whose regression must not fail the
     stage because the latest post-merge record for the same case is itself
@@ -381,10 +396,13 @@ def prepare_regressive_test_cases(
             # then fall back to calculating from history data
             baseline_key = f"d_baseline_{metric_suffix}"
             baseline_value = baseline_threshold.get(baseline_key) if baseline_threshold else None
-            # A stored baseline carries no record of which history produced it, so
-            # it cannot be trusted to respect a floor; a floored metric always
-            # recomputes its baseline from the floor-filtered history.
-            if metric_history_floors_ms and metric in metric_history_floors_ms:
+            # A stored baseline recorded before a metric's floor predates the
+            # metric's current definition, so the floored metric recomputes its
+            # baseline from the floor-filtered history instead. One recorded at or
+            # after the floor (or with no floor) is honoured as before.
+            if baseline_value is not None and _stored_baseline_predates_floor(
+                baseline_threshold, metric, metric_history_floors_ms
+            ):
                 baseline_value = None
             if baseline_value is None or baseline_value <= 0:
                 if fallback_baseline is None:
@@ -476,7 +494,11 @@ def _safe_float(value, default):
 
 
 def add_baseline_fields_to_post_merge_data(
-    latest_baseline_threshold_dict, new_data_dict, maximize_metrics, minimize_metrics
+    latest_baseline_threshold_dict,
+    new_data_dict,
+    maximize_metrics,
+    minimize_metrics,
+    metric_history_floors_ms=None,
 ):
     """Embed baseline fields directly into each post-merge data entry.
 
@@ -484,6 +506,10 @@ def add_baseline_fields_to_post_merge_data(
       - d_baseline_{metric_suffix}
       - d_threshold_post_merge_{metric_suffix}
       - d_threshold_pre_merge_{metric_suffix}
+
+    A d_baseline_* that predates the metric's floor in metric_history_floors_ms is
+    not carried forward: the gate no longer uses it, and copying it onto a new
+    record would give it a current ts_created.
     """
     if latest_baseline_threshold_dict is None:
         return
@@ -511,7 +537,13 @@ def add_baseline_fields_to_post_merge_data(
                 new_data[pre_merge_key] = pre_merge_val
 
             baseline_val = _safe_float(baseline_threshold.get(baseline_key), None)
-            if baseline_val is not None and baseline_val > 0:
+            if (
+                baseline_val is not None
+                and baseline_val > 0
+                and not _stored_baseline_predates_floor(
+                    baseline_threshold, metric, metric_history_floors_ms
+                )
+            ):
                 new_data[baseline_key] = baseline_val
 
 
@@ -651,7 +683,11 @@ def process_and_upload_test_results(
     # Step 7: For post-merge, embed baseline fields
     if is_post_merge:
         add_baseline_fields_to_post_merge_data(
-            latest_baseline_threshold_dict, new_data_dict, maximize_metrics, minimize_metrics
+            latest_baseline_threshold_dict,
+            new_data_dict,
+            maximize_metrics,
+            minimize_metrics,
+            metric_history_floors_ms=metric_history_floors_ms,
         )
 
     # Step 8: Upload to DB

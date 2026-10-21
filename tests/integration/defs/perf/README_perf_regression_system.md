@@ -66,6 +66,12 @@ the P5/P95 baseline is pulled by the most extreme of them. Rows with no numeric
 `ts_created` are excluded under a floor. A metric with no history left above its floor
 gets no baseline, so it is not gated until new rows accrue.
 
+A stored `d_baseline_*` pin is still honoured for a floored metric when the record it
+came from was created at or after the floor. A pin from before the floor (or of unknown
+age) is ignored for gating and is not copied onto new post-merge records (Step 7); its
+`d_threshold_*` fields are kept. Remove a floor once `QUERY_LOOKBACK_DAYS` have passed,
+since the history window then no longer reaches back past it.
+
 **Regression detection** (`prepare_regressive_test_cases`):
 - A metric is regressive if the new value breaches `baseline * (1 +/- threshold)`
 - Default thresholds: **5%** for post-merge, **10%** for pre-merge (can be overridden per-metric via embedded `d_threshold_*` fields from history)

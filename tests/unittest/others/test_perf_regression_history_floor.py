@@ -238,53 +238,188 @@ def test_prepare_regressive_test_cases_applies_the_floor():
     assert verdict({STEP: FLOOR, MEDIAN: FLOOR}) is False
 
 
-def test_stored_baseline_cannot_bypass_the_floor():
-    """A d_baseline_* inherited from history says nothing about which rows produced it.
-
-    A floored metric must ignore it and recompute from the floored history; an unfloored
-    metric keeps using it.
-    """
+def _gate_with_stored_baseline(stored, floors):
+    """Run prepare_regressive_test_cases with a stored baseline; return each metric's baseline."""
     old, new = _two_wave_history()
     history = [dict(r, **{MEDIAN: r[STEP]}) for r in old + new]
-    stored = {
-        f"d_baseline_{STEP[2:]}": 31.6,
-        f"d_baseline_{MEDIAN[2:]}": 31.5,
-        f"d_baseline_{THROUGHPUT[2:]}": 600000.0,
+    data = {
+        0: {
+            "b_is_post_merge": True,
+            STEP: 98.5,
+            MEDIAN: 98.4,
+            THROUGHPUT: 517000.0,
+            "s_test_case_name": "c",
+        }
+    }
+    pru.prepare_regressive_test_cases(
+        {0: history[-1]},
+        {0: dict(stored)},
+        {0: history},
+        data,
+        [THROUGHPUT],
+        [STEP, MEDIAN],
+        [STEP, MEDIAN, THROUGHPUT],
+        metric_history_floors_ms=floors,
+    )
+    return {
+        line.split(":")[0].strip(): float(line.split("baseline=")[1].split()[0])
+        for line in data[0]["s_regression_info"].splitlines()
+        if "baseline=" in line
     }
 
-    def run(floors):
-        data = {
-            0: {
-                "b_is_post_merge": True,
-                STEP: 98.5,
-                MEDIAN: 98.4,
-                THROUGHPUT: 517000.0,
-                "s_test_case_name": "c",
-            }
-        }
-        pru.prepare_regressive_test_cases(
-            {0: history[-1]},
-            {0: dict(stored)},
-            {0: history},
-            data,
-            [THROUGHPUT],
-            [STEP, MEDIAN],
-            [STEP, MEDIAN, THROUGHPUT],
-            metric_history_floors_ms=floors,
-        )
-        info = {
-            line.split(":")[0].strip(): float(line.split("baseline=")[1].split()[0])
-            for line in data[0]["s_regression_info"].splitlines()
-            if "baseline=" in line
-        }
-        return info
 
-    unfloored = run(None)
-    assert unfloored[STEP] == pytest.approx(31.6)
-    floored = run({STEP: FLOOR, MEDIAN: FLOOR})
-    assert floored[STEP] == pytest.approx(98.5)
-    assert floored[MEDIAN] == pytest.approx(98.5)
-    assert floored[THROUGHPUT] == pytest.approx(600000.0)
+_STORED = {
+    f"d_baseline_{STEP[2:]}": 31.6,
+    f"d_baseline_{MEDIAN[2:]}": 31.5,
+    f"d_baseline_{THROUGHPUT[2:]}": 600000.0,
+}
+_FLOORS = {STEP: FLOOR, MEDIAN: FLOOR}
+
+
+@pytest.mark.parametrize(
+    "stored_created",
+    [
+        pytest.param(FLOOR - 1, id="recorded-before-floor"),
+        pytest.param(None, id="unknown-age"),
+    ],
+)
+def test_stored_baseline_older_than_the_floor_is_recomputed(stored_created):
+    """A d_baseline_* that may predate the metric's current definition cannot set its baseline."""
+    stored = dict(_STORED)
+    if stored_created is not None:
+        stored["ts_created"] = stored_created
+    baselines = _gate_with_stored_baseline(stored, _FLOORS)
+
+    assert baselines[STEP] == pytest.approx(98.5)
+    assert baselines[MEDIAN] == pytest.approx(98.5)
+    # The unfloored metric keeps its stored baseline.
+    assert baselines[THROUGHPUT] == pytest.approx(600000.0)
+
+
+@pytest.mark.parametrize(
+    "stored_created",
+    [pytest.param(FLOOR, id="at-floor"), pytest.param(FLOOR + 1, id="after-floor")],
+)
+def test_stored_baseline_set_after_the_floor_is_honoured(stored_created):
+    """A pin set under the current definition still applies to a floored metric."""
+    baselines = _gate_with_stored_baseline(dict(_STORED, ts_created=stored_created), _FLOORS)
+
+    assert baselines[STEP] == pytest.approx(31.6)
+    assert baselines[MEDIAN] == pytest.approx(31.5)
+
+
+def test_stored_baseline_is_honoured_without_a_floor():
+    baselines = _gate_with_stored_baseline(dict(_STORED, ts_created=FLOOR - 1), None)
+
+    assert baselines[STEP] == pytest.approx(31.6)
+    assert baselines[THROUGHPUT] == pytest.approx(600000.0)
+
+
+@pytest.mark.parametrize(
+    ("stored_created", "carried"),
+    [
+        pytest.param(FLOOR - 1, False, id="recorded-before-floor"),
+        pytest.param(None, False, id="unknown-age"),
+        pytest.param(FLOOR, True, id="at-floor"),
+    ],
+)
+def test_post_merge_record_does_not_inherit_a_pre_floor_baseline(stored_created, carried):
+    """Step 7 must not copy a baseline the gate refuses onto a new record with a fresh timestamp."""
+    stored = {
+        f"d_baseline_{STEP[2:]}": 31.6,
+        f"d_baseline_{THROUGHPUT[2:]}": 600000.0,
+        f"d_threshold_post_merge_{STEP[2:]}": 0.07,
+    }
+    if stored_created is not None:
+        stored["ts_created"] = stored_created
+    data = {0: {STEP: 98.5, THROUGHPUT: 517000.0}}
+    pru.add_baseline_fields_to_post_merge_data(
+        {0: stored}, data, [THROUGHPUT], [STEP], metric_history_floors_ms={STEP: FLOOR}
+    )
+
+    assert (f"d_baseline_{STEP[2:]}" in data[0]) is carried
+    # Thresholds and unfloored metrics are carried as before.
+    assert data[0][f"d_threshold_post_merge_{STEP[2:]}"] == 0.07
+    assert data[0][f"d_baseline_{THROUGHPUT[2:]}"] == 600000.0
+    assert "ts_created" not in data[0]
+
+
+def _load_open_search_db_utils(history_rows):
+    """Load the real open_search_db_utils with its OpenSearch client stubbed to *history_rows*."""
+    defs_pkg = types.ModuleType("defs")
+    defs_pkg.__path__ = []
+    alternative = types.ModuleType("defs.trt_test_alternative")
+    alternative.print_info = lambda *args, **kwargs: None
+    alternative.print_warning = lambda *args, **kwargs: None
+    perf_pkg = types.ModuleType("defs.perf")
+    perf_pkg.__path__ = []
+    matching = types.ModuleType("test_common.perf_sanity_matching")
+    matching.benchmark_data_matches = lambda history, new, keys: True
+    test_common_pkg = types.ModuleType("test_common")
+    test_common_pkg.__path__ = []
+    jenkins_pkg = types.ModuleType("jenkins")
+    jenkins_pkg.__path__ = []
+    scripts_pkg = types.ModuleType("jenkins.scripts")
+    scripts_pkg.__path__ = []
+    osdb = types.ModuleType("jenkins.scripts.open_search_db")
+    osdb.PERF_SANITY_PROJECT_NAME = "perf_sanity_info"
+
+    class _OpenSearchDB:
+        @staticmethod
+        def queryPerfDataFromOpenSearchDB(project, must_clauses, size=0):
+            return [dict(row) for row in history_rows]
+
+    osdb.OpenSearchDB = _OpenSearchDB
+    stubs = {
+        "defs": defs_pkg,
+        "defs.trt_test_alternative": alternative,
+        "defs.perf": perf_pkg,
+        "test_common": test_common_pkg,
+        "test_common.perf_sanity_matching": matching,
+        "jenkins": jenkins_pkg,
+        "jenkins.scripts": scripts_pkg,
+        "jenkins.scripts.open_search_db": osdb,
+    }
+    saved = {name: sys.modules.get(name) for name in stubs}
+    sys.modules.update(stubs)
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "defs.perf.open_search_db_utils", _PERF_DIR / "open_search_db_utils.py"
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+    finally:
+        for name, previous in saved.items():
+            if previous is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = previous
+    return module
+
+
+def test_stored_baseline_lookup_carries_its_source_records_age():
+    """get_history_data must report when the stored baseline was recorded, or no pin can be aged."""
+    rows = [
+        {"@timestamp": "2026-10-03T00:00:00.000Z", "ts_created": FLOOR + 10, STEP: 98.4},
+        {
+            "@timestamp": "2026-10-02T00:00:00.000Z",
+            "ts_created": FLOOR + 5,
+            STEP: 98.5,
+            f"d_baseline_{STEP[2:]}": 97.0,
+        },
+        {
+            "@timestamp": "2026-09-20T00:00:00.000Z",
+            "ts_created": FLOOR - 5,
+            STEP: 31.6,
+            f"d_baseline_{STEP[2:]}": 31.6,
+        },
+    ]
+    osdbu = _load_open_search_db_utils(rows)
+    _, latest_baseline_threshold, _ = osdbu.get_history_data({0: {}}, [], {})
+
+    stored = latest_baseline_threshold[0]
+    assert stored[f"d_baseline_{STEP[2:]}"] == 97.0
+    assert stored["ts_created"] == FLOOR + 5
 
 
 def test_process_and_upload_test_results_forwards_the_floor(monkeypatch):
@@ -318,6 +453,44 @@ def test_process_and_upload_test_results_forwards_the_floor(monkeypatch):
 
     assert verdict(None) is True
     assert verdict({STEP: FLOOR, MEDIAN: FLOOR}) is False
+
+
+def test_process_and_upload_test_results_drops_a_pre_floor_pin_from_the_upload(monkeypatch):
+    """A pre-floor d_baseline_* neither gates the run nor rides onto the uploaded record."""
+    old, new = _two_wave_history()
+    history = [dict(r, **{MEDIAN: r[STEP]}) for r in old + new]
+    pin = {
+        f"d_baseline_{STEP[2:]}": 31.6,
+        f"d_baseline_{MEDIAN[2:]}": 31.5,
+        "ts_created": FLOOR - 1,
+    }
+    uploaded = {}
+    monkeypatch.setenv(
+        "globalVars",
+        '{"build_branch": "main", "action_info": {"parents": '
+        '[{"url": "https://ci/job/LLM/job/main/job/L0_PostMerge/3018/", "build_number": "3018"}]}}',
+    )
+    monkeypatch.setattr(pru, "get_common_values", lambda data_dict, keys: {})
+    monkeypatch.setattr(
+        pru,
+        "get_history_data",
+        lambda data_dict, keys, common: ({0: history[-1]}, {0: dict(pin)}, {0: history}),
+    )
+    monkeypatch.setattr(pru, "post_new_perf_data", lambda data_dict: uploaded.update(data_dict))
+
+    data = {0: {"s_test_case_name": "c", STEP: 98.5, MEDIAN: 98.4}}
+    pru.process_and_upload_test_results(
+        data,
+        ["s_test_case_name"],
+        maximize_metrics=[],
+        minimize_metrics=[STEP, MEDIAN],
+        regression_metrics=[STEP, MEDIAN],
+        metric_history_floors_ms={STEP: FLOOR, MEDIAN: FLOOR},
+    )
+
+    assert uploaded[0]["b_is_regression"] is False
+    assert f"d_baseline_{STEP[2:]}" not in uploaded[0]
+    assert f"d_baseline_{MEDIAN[2:]}" not in uploaded[0]
 
 
 def test_harness_floors_every_gen_worker_statistic_and_nothing_else():

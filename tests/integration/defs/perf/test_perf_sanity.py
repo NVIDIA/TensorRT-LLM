@@ -338,6 +338,10 @@ GEN_ONLY_REGRESSION_METRICS = (
 # into the 90-day history drags the P5 baseline down to the tail wave and flags
 # every current run. e2e still describes the modal bucket, so its series is
 # continuous and is not floored.
+#
+# TODO(2026-12-31): remove this floor and GEN_ONLY_METRIC_HISTORY_FLOORS_MS. From
+# that day the 90-day history window (QUERY_LOOKBACK_DAYS) starts after the floor,
+# so it no longer filters any row.
 GEN_ONLY_DEVICE_STEP_TIME_HISTORY_FLOOR_MS = 1790856543000
 
 # Metric -> ts_created floor applied when computing gen_only-mode baselines. Every
