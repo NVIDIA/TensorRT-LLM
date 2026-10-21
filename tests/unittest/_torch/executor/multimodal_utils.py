@@ -21,8 +21,11 @@ from tensorrt_llm._torch.pyexecutor.llm_request import (
 )
 from tensorrt_llm._torch.tensor_lru_cache import TensorLRUCache
 from tensorrt_llm.bindings import SamplingConfig
-from tensorrt_llm.inputs.multimodal import MULTIMODAL_ENCODER_ITEM_METADATA_KEY
-from tensorrt_llm.inputs.registry import BaseMultimodalDummyInputsBuilder, MultimodalItemMetadata
+from tensorrt_llm.inputs.multimodal import (
+    MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
+    MultimodalItemMetadata,
+)
+from tensorrt_llm.inputs.registry import BaseMultimodalDummyInputsBuilder
 
 
 def bare_mm_item_scheduler(

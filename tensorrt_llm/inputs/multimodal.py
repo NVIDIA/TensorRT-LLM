@@ -295,7 +295,13 @@ def get_multimodal_item_metadata(
 
 
 class MultimodalEncoderProgress(Enum):
-    """Readiness derived from the request's cached item outputs."""
+    """Python-only progress derived from request-local MM item outputs.
+
+    It summarizes the ready flags of all items. Scheduling is gated by the
+    items the remaining prefill uses instead (`get_mm_pending_items`), because
+    items behind confirmed prefill progress or a reusable KV prefix are
+    released or never encoded.
+    """
 
     PENDING = auto()
     """No MM item of the request has an encoder output yet."""
