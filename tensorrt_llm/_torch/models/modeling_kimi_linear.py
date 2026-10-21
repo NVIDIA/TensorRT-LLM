@@ -136,6 +136,7 @@ from ..modules.linear import (
 )
 from ..modules.linear import Linear as TrtllmLinear
 from ..modules.multi_stream_utils import do_multi_stream, maybe_execute_in_parallel
+from ..modules.projection_capabilities import GatedEpilogueProjection
 from ..modules.rms_norm import RMSNorm
 from ..modules.situ import SituAndMul
 from ..moe.fused_moe import ConfigurableMoE, SiTuActivation, TRTLLMGenFusedMoE, create_moe
@@ -920,7 +921,7 @@ def _low_m_gemm_scale_from_mxfp8(weight_scale: torch.Tensor, n: int, k: int) -> 
     return fp8_block_scale_low_m_gemm.pack_block_scale_from_mxfp8_layout(weight_scale, n, k)
 
 
-class _Fp8BlockScaleWeightReadLinear(nn.Module):
+class _Fp8BlockScaleWeightReadLinear(GatedEpilogueProjection):
     """Bias-free FP8 block-scale GEMM for checkpoint attention and converted MLPs.
 
     Attention loads checkpoint E4M3 codes and 128x128 scales directly. The optional

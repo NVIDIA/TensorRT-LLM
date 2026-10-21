@@ -71,12 +71,8 @@ def _assert_matches_reference(actual: torch.Tensor, expected: torch.Tensor, fp8:
     assert relative_l2 < (0.08 if fp8 else 0.01), f"relative L2 error: {relative_l2}"
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-@pytest.mark.parametrize(
-    "fp8", [False, pytest.param(True, marks=skip_pre_blackwell)], ids=["bf16", "fp8"]
-)
-@pytest.mark.parametrize("gate", [False, True], ids=["no_gate", "gate"])
-def test_k3_mla_matches_huggingface(fp8: bool, gate: bool) -> None:
+def _build_k3_mla(fp8: bool, gate: bool):
+    """A one-layer K3 MLA runtime loaded through the model loader, and the HF reference."""
     torch.manual_seed(42)
     mapping = Mapping(world_size=1, rank=0, tp_size=1)
     config = KimiLinearConfig(
@@ -133,6 +129,61 @@ def test_k3_mla_matches_huggingface(fp8: bool, gate: bool) -> None:
         if callable(getattr(module, "post_load_weights", None)):
             module.post_load_weights()
     reference.cuda()
+    return config, mapping, reference, runtime
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("helix_adp", [False, True], ids=["single_rank", "helix_adp"])
+def test_k3_mla_output_gate_unfused_under_helix_with_attention_dp(monkeypatch, helix_adp) -> None:
+    """The fused output gate bypasses the output projection's Helix + attention-DP
+    reduce-scatter, so with that mapping the gate falls back to the unfused path."""
+    from tensorrt_llm._torch.modules.kimi_k3_mla import kimi_k3_mla_attention
+    from tensorrt_llm._torch.modules.linear import Linear
+
+    mapping_with_cp = (
+        Mapping(
+            world_size=4,
+            tp_size=2,
+            cp_size=2,
+            rank=0,
+            cp_config={"cp_type": "HELIX"},
+            enable_attention_dp=True,
+        )
+        if helix_adp
+        else None
+    )
+    model_config = ModelConfig(
+        mapping=Mapping(world_size=1, rank=0, tp_size=1),
+        quant_config=QuantConfig(),
+        skip_create_weights_in_init=True,
+    )
+    mla = kimi_k3_mla_attention.KimiK3MLAAttention(
+        hidden_size=256,
+        num_heads=32,
+        q_lora_rank=1536,
+        kv_lora_rank=512,
+        qk_nope_head_dim=128,
+        qk_rope_head_dim=64,
+        v_head_dim=128,
+        dtype=torch.bfloat16,
+        use_output_gate=True,
+        model_config=model_config,
+        aux_stream_dict={},
+        mapping_with_cp=mapping_with_cp,
+    )
+    # Both projections declare the gated epilogue, so only the mapping decides.
+    monkeypatch.setattr(kimi_k3_mla_attention, "GatedEpilogueProjection", Linear)
+    mla.cache_derived_state()
+    assert mla._fused_output_gate == (not helix_adp)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize(
+    "fp8", [False, pytest.param(True, marks=skip_pre_blackwell)], ids=["bf16", "fp8"]
+)
+@pytest.mark.parametrize("gate", [False, True], ids=["no_gate", "gate"])
+def test_k3_mla_matches_huggingface(fp8: bool, gate: bool) -> None:
+    config, mapping, reference, runtime = _build_k3_mla(fp8, gate)
 
     batch, context_length = 2, 128
     generator = torch.Generator(device="cuda").manual_seed(1234)
@@ -491,3 +542,52 @@ def test_k3_mla_nvfp4_kv_chunked_prefill_with_cached_prefix_matches_huggingface(
     errors = f"relative L2: context {context_error:.4f}, generation {generation_error:.4f}"
     assert context_error < 0.1, errors
     assert generation_error < 0.2, errors
+
+
+@skip_pre_blackwell
+@pytest.mark.parametrize("num_tokens", [1, 8, 64, 96])
+def test_k3_mla_fused_output_gate_matches_unfused(num_tokens: int) -> None:
+    """The output gate fused into g_proj / o_proj (sigmoid and gated low-M GEMMs), also on
+    the aux stream from the Helix exchange event, equals sigmoid, multiply and o_proj."""
+    from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream
+
+    _, _, _, runtime = _build_k3_mla(fp8=True, gate=True)
+    mixer = runtime.mixer
+    assert mixer._fused_output_gate
+    generator = torch.Generator(device="cuda").manual_seed(7)
+    hidden = torch.randn(
+        num_tokens, mixer.hidden_size, dtype=torch.bfloat16, device="cuda", generator=generator
+    )
+    attn = torch.randn(
+        num_tokens,
+        mixer.o_proj.in_features,
+        dtype=torch.bfloat16,
+        device="cuda",
+        generator=generator,
+    )
+    metadata = SimpleNamespace(num_generations=num_tokens)
+
+    def project():
+        return mixer._gate_and_project_output(hidden, [attn.clone()], None, metadata, None)
+
+    fused = project()
+    mixer._fused_output_gate = False
+    try:
+        expected = project()
+    finally:
+        mixer._fused_output_gate = True
+    assert torch.equal(expected, mixer.o_proj(attn * mixer.g_proj(hidden).sigmoid()))
+    assert torch.equal(fused, expected)
+
+    # Helix: the gate runs on the aux stream once the all-to-all is enqueued (the events a
+    # Helix mapping creates at construction).
+    mixer.helix_exchange_event = torch.cuda.Event()
+    mixer._gate_ready = torch.cuda.Event()
+    try:
+        with with_multi_stream(True):
+            mixer.helix_exchange_event.record()
+            side = project()
+        torch.cuda.synchronize()
+    finally:
+        mixer.helix_exchange_event = None
+    assert torch.equal(side, expected)

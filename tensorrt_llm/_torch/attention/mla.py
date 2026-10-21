@@ -363,15 +363,15 @@ class MLA(nn.Module):
                 "fuse_qkv_a_proj=True; the separate q_a_proj layout is not "
                 "supported with sparse MLA."
             )
-        if self.sparse_attn_hooks is not None and type(self)._apply_output_gate is not (
-            MLA._apply_output_gate
+        if self.sparse_attn_hooks is not None and type(self)._gate_and_project_output is not (
+            MLA._gate_and_project_output
         ):
-            # _apply_output_gate is defined against the dense output path, where
-            # attn_output[0] is o_proj's input. Sparse hooks own _create_outputs
-            # and _project_output, so the tensor's rank, shape and projection
-            # differ and the gate would not compose.
+            # _gate_and_project_output is defined against the dense output path,
+            # where attn_output[0] is o_proj's input. Sparse hooks own
+            # _create_outputs and _project_output, so the tensor's rank, shape
+            # and projection differ and the gate would not compose.
             raise NotImplementedError(
-                f"{type(self).__name__} overrides _apply_output_gate, which is "
+                f"{type(self).__name__} overrides _gate_and_project_output, which is "
                 "only defined for the dense MLA output path; it cannot be "
                 "combined with sparse MLA hooks."
             )
@@ -577,6 +577,11 @@ class MLA(nn.Module):
             else self.aux_stream
         )
         self.ln_events = [torch.cuda.Event(), torch.cuda.Event()]
+        # Helix CP hook: a subclass that runs work beside the generation
+        # all-to-all sets an event here; it is recorded on the current stream
+        # right before the all-to-all is enqueued, so work that only depends on
+        # the module input can wait on it.
+        self.helix_exchange_event: Optional[torch.cuda.Event] = None
         need_absorption = self.sparse_attn_hooks is None or self.sparse_attn_hooks.need_absorption
         if need_absorption:
             self.kv_a_layernorm = RMSNorm(
@@ -871,10 +876,12 @@ class MLA(nn.Module):
             kv_lora_rank = partial_o.shape[-1] // self.num_heads_tp
             assert self.kv_lora_rank == kv_lora_rank
 
-            helix_kv_bounds = getattr(attn_metadata, "helix_kv_bounds", None)
-            # helix_kv_bounds is non-None only on TrtllmAttentionMetadata,
-            # where _helix_spec_tokens_valid is a declared field.
-            if helix_kv_bounds is not None and attn_metadata._helix_spec_tokens_valid:
+            # TrtllmAttentionMetadata fills helix_zero_kv_tokens once per step
+            # together with the other Helix spec buffers.
+            if (
+                isinstance(attn_metadata, TrtllmAttentionMetadata)
+                and attn_metadata._helix_spec_tokens_valid
+            ):
                 # Speculative verify groups: KV ownership is per-TOKEN. A rank
                 # owning only the tail page of a group has zero visible KV for
                 # the group's leading tokens while its per-sequence kv_len is
@@ -884,7 +891,7 @@ class MLA(nn.Module):
                 # pool values; the combine multiplies by corr = 0 and
                 # 0 * NaN would poison the token on every CP rank — sanitize
                 # by the per-token bound instead.
-                zero_kv_mask = helix_kv_bounds[: partial_o.shape[0]] == 0
+                zero_kv_mask = attn_metadata.helix_zero_kv_tokens[: partial_o.shape[0]]
             else:
                 # MLA processes only the generation token slice here, so build
                 # the mask from [num_contexts, num_seqs). Skip this expansion
@@ -899,6 +906,8 @@ class MLA(nn.Module):
             if helix_v_up:
                 partial_o = self._helix_project_v_partials(partial_o)
                 value_dim = self.v_head_dim
+            if self.helix_exchange_event is not None:
+                self.helix_exchange_event.record()
             return _helix_post_process(
                 partial_o,
                 softmax_stats,
@@ -2362,26 +2371,29 @@ class MLA(nn.Module):
                 latent_cache_gen,
             )
 
-    def _apply_output_gate(
+    def _gate_and_project_output(
         self,
         hidden_states: torch.Tensor,
-        attn_output: torch.Tensor,
+        attn_output: list[torch.Tensor],
+        position_ids: Optional[torch.Tensor],
+        attn_metadata: AttentionMetadata,
+        all_reduce_params: Optional[AllReduceParams],
     ) -> torch.Tensor:
-        """Transform the attention output before the output projection.
+        """Apply the optional output gate and the output projection.
 
-        ``attn_output`` is the row-parallel ``o_proj``'s input and
+        ``attn_output[0]`` is the row-parallel ``o_proj``'s input and
         ``hidden_states`` is the unquantized module input, so an override that
         derives a gate from ``hidden_states`` must match ``o_proj``'s input
-        sharding. Runs on both the ``register_to_config`` and eager branches,
-        and ahead of the helix-CP reduce-scatter.
+        sharding and apply it ahead of the helix-CP reduce-scatter. Runs on
+        both the ``register_to_config`` and eager branches.
 
         Dense output path only: ``__init__`` rejects an override combined with
         sparse MLA hooks, which replace ``o_proj`` and may hand
         ``attn_output[0]`` on in a different rank and layout.
 
-        The base is the identity.
+        The base has no gate.
         """
-        return attn_output
+        return self._project_output(attn_output, position_ids, attn_metadata, all_reduce_params)
 
     def _project_output(
         self,
@@ -2437,7 +2449,7 @@ class MLA(nn.Module):
         )
 
         # Unquantized view of the module input, used by create_mla_outputs and
-        # by _apply_output_gate.
+        # by _gate_and_project_output.
         output_hidden_states = hidden_states
         if isinstance(hidden_states, Fp4QuantizedTensor):
             assert hidden_states.unquantized_hidden_states is not None, (
@@ -2466,8 +2478,9 @@ class MLA(nn.Module):
                 latent_cache_gen=latent_cache_gen,
             )
 
-        attn_output[0] = self._apply_output_gate(output_hidden_states, attn_output[0])
-        return self._project_output(attn_output, position_ids, attn_metadata, all_reduce_params)
+        return self._gate_and_project_output(
+            output_hidden_states, attn_output, position_ids, attn_metadata, all_reduce_params
+        )
 
     def resmooth_parameters(self, module_weight, module_weight_scale, recipe=(1, 128, 128)):
         weight, weight_scale = fp8_utils.resmooth_to_fp8_e8m0(module_weight, module_weight_scale)

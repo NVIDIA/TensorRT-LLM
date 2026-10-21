@@ -263,6 +263,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     # recompute_helix_spec_buffers for the derivation.
     helix_local_slots: Optional[torch.Tensor] = None
     helix_kv_bounds: Optional[torch.Tensor] = None
+    helix_zero_kv_tokens: Optional[torch.Tensor] = None
     helix_owned_new_tokens_cpu: Optional[torch.Tensor] = None
     _helix_spec_tokens_valid: bool = False
 
@@ -666,6 +667,9 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             #   helix_kv_bounds[t]: number of rank-local KV entries token t
             #     may attend to, i.e. local_len(pos_t + 1) (consumed by the
             #     CuTe DSL MLA decode mask and the helix stats identity).
+            #   helix_zero_kv_tokens[t]: helix_kv_bounds[t] == 0, the tokens
+            #     whose partial output the helix combine must ignore (shared
+            #     by every layer of the step).
             # Filled by recompute_helix_spec_buffers() on the spec path only.
             self.helix_local_slots = self.get_empty(
                 buffers,
@@ -679,6 +683,13 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 (self.max_num_tokens, ),
                 cache_name="helix_kv_bounds",
                 dtype=torch.int,
+                capture_graph=capture_graph,
+            )
+            self.helix_zero_kv_tokens = self.get_empty(
+                buffers,
+                (self.max_num_tokens, ),
+                cache_name="helix_zero_kv_tokens",
+                dtype=torch.bool,
                 capture_graph=capture_graph,
             )
             # Host-side per-sequence count of this step's new tokens owned by
@@ -828,6 +839,11 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             tokens_per_block=self.kv_cache_manager.tokens_per_block,
             cp_size=self.mapping.cp_size,
             cp_rank=self.mapping.cp_rank)
+        # The tokens whose partial output the helix combine must ignore, shared
+        # by every layer of the step. Allocation-free like the launch above.
+        torch.eq(self.helix_kv_bounds[:num_gen_tokens],
+                 0,
+                 out=self.helix_zero_kv_tokens[:num_gen_tokens])
 
     def _bind_runtime_views(
         self,

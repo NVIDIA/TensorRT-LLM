@@ -18,12 +18,15 @@ import torch
 from ....functional import PositionEmbeddingType
 from ....mapping import Mapping
 from ....quantization import QuantAlgo
-from ...attention.backends import TrtllmAttention
+from ...attention.backends import AttentionMetadata, TrtllmAttention
 from ...attention.backends.interface import PositionalEmbeddingParams, RopeParams
 from ...attention.mla import MLA
+from ...distributed import AllReduceParams
 from ...model_config import ModelConfig
 from ...utils import AuxStreamType
 from ..linear import Linear, TensorParallelMode
+from ..multi_stream_utils import do_multi_stream
+from ..projection_capabilities import GatedEpilogueProjection
 
 
 def _make_pos_embd_params(
@@ -190,6 +193,10 @@ class KimiK3MLAAttention(MLA):
         # the registered and eager paths before the row-parallel o_proj.
 
         self.use_output_gate = use_output_gate
+        if use_output_gate:
+            if self.mapping.has_cp_helix():
+                # The gate GEMM runs beside the Helix all-to-all (_output_gate).
+                self.helix_exchange_event = torch.cuda.Event()
 
         if use_output_gate:
             # The gate must match o_proj's input sharding (under helix the
@@ -229,15 +236,75 @@ class KimiK3MLAAttention(MLA):
         _install_identity_rope_table(self.mqa)
         self.rotary_emb = None
         self.apply_rotary_emb = False
+        # Whether g_proj and o_proj fuse the gate into their GEMMs
+        # (GatedEpilogueProjection) in place of _project_output; set once the
+        # loaded projections are known (cache_derived_state). Not under Helix +
+        # attention DP, whose output projection reduce-scatters.
+        self._fused_output_gate = False
+        self._gate_ready = torch.cuda.Event()
 
-    def _apply_output_gate(
+    def cache_derived_state(self) -> None:
+        super().cache_derived_state()
+        self._fused_output_gate = (
+            self.use_output_gate
+            and not (self.mapping.has_cp_helix() and self.mapping.enable_attention_dp)
+            and isinstance(self.g_proj, GatedEpilogueProjection)
+            and isinstance(self.o_proj, GatedEpilogueProjection)
+        )
+
+    def _output_gate(
+        self, hidden_states: torch.Tensor, attn_metadata: AttentionMetadata
+    ) -> torch.Tensor:
+        """``sigmoid(g_proj(hidden_states))``, the gate on o_proj's input.
+
+        Under Helix CP with generation tokens it runs on the aux stream from
+        the moment the all-to-all is enqueued, on the SMs the exchange leaves
+        idle; it only depends on the module input.
+        """
+
+        def gate() -> torch.Tensor:
+            if self._fused_output_gate:
+                return self.g_proj.forward_sigmoid(hidden_states)
+            return self.g_proj(hidden_states).sigmoid()
+
+        if not (
+            self.helix_exchange_event is not None
+            and attn_metadata.num_generations > 0
+            and self.aux_stream is not None
+            and do_multi_stream()
+            and not torch.compiler.is_compiling()
+        ):
+            return gate()
+        # Multi-stream follows maybe_execute_in_parallel: any later aux-stream
+        # work first waits for the calling stream, which waits for the gate.
+        self.aux_stream.wait_event(self.helix_exchange_event)
+        with torch.cuda.stream(self.aux_stream):
+            result = gate()
+            self._gate_ready.record()
+        torch.cuda.current_stream().wait_event(self._gate_ready)
+        if not torch.cuda.is_current_stream_capturing():
+            result.record_stream(torch.cuda.current_stream())
+        return result
+
+    def _gate_and_project_output(
         self,
         hidden_states: torch.Tensor,
-        attn_output: torch.Tensor,
+        attn_output: list[torch.Tensor],
+        position_ids: Optional[torch.Tensor],
+        attn_metadata: AttentionMetadata,
+        all_reduce_params: Optional[AllReduceParams],
     ) -> torch.Tensor:
-        # Sigmoid gate on o_proj's input. g_proj matches o_proj's input
-        # sharding, so the multiply composes with the helix-CP output
-        # projection.
-        if self.use_output_gate:
-            return attn_output * self.g_proj(hidden_states).sigmoid()
-        return attn_output
+        # g_proj matches o_proj's input sharding, so the gate composes with the
+        # helix-CP output projection. The fused projection runs only where the
+        # output projection needs no reduction (cache_derived_state).
+        if not self.use_output_gate:
+            return super()._gate_and_project_output(
+                hidden_states, attn_output, position_ids, attn_metadata, all_reduce_params
+            )
+        gate = self._output_gate(hidden_states, attn_metadata)
+        if self._fused_output_gate:
+            return self.o_proj.forward_gated(attn_output[0], gate)
+        attn_output[0] = attn_output[0] * gate
+        return super()._gate_and_project_output(
+            hidden_states, attn_output, position_ids, attn_metadata, all_reduce_params
+        )
