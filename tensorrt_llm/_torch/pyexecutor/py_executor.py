@@ -7874,7 +7874,6 @@ class PyExecutor:
                     request_ids=dummy_request_ids,
                     token_nums=token_nums,
                     is_gen=self._adp_dummy_is_gen,
-                    prepare_resource=True,
                     max_num_draft_tokens=self.max_total_draft_tokens,
                 )
             except OutOfPagesError:
@@ -7910,7 +7909,6 @@ class PyExecutor:
                 request_ids=dummy_request_ids,
                 token_nums=token_nums,
                 is_gen=self._adp_dummy_is_gen,
-                prepare_resource=True,
                 max_num_draft_tokens=self.max_total_draft_tokens,
             )
         except OutOfPagesError:
@@ -7999,7 +7997,6 @@ class PyExecutor:
                 request_ids=dummy_request_ids,
                 token_nums=None,
                 is_gen=True,
-                prepare_resource=True,
                 max_num_draft_tokens=self.max_total_draft_tokens,
             )
         except (OutOfPagesError, NoFreeSlotsError):
