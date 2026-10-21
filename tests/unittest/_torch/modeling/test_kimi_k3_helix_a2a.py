@@ -93,11 +93,12 @@ def _make_layer(layer_idx, attn_weight, moe_weight, rank, token_sliced):
     layer.linear_attn = lambda x, _md: x @ attn_weight if owns_output else torch.zeros_like(x)
     layer.seen_all_rank_num_tokens = []
 
-    def moe(x, all_rank_num_tokens):
-        layer.seen_all_rank_num_tokens.append(all_rank_num_tokens)
-        return torch.tanh(x @ moe_weight)
+    class _MoE:
+        def forward_parts(self, x, all_rank_num_tokens):
+            layer.seen_all_rank_num_tokens.append(all_rank_num_tokens)
+            return torch.tanh(x @ moe_weight), torch.zeros_like(x)
 
-    layer.block_sparse_moe = moe
+    layer.block_sparse_moe = _MoE()
     return layer
 
 
