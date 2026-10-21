@@ -4133,7 +4133,7 @@
       "description": "Configure per-layer dynamic EPLB with Halo-Q scheduling.",
       "properties": {
         "auxiliary_sms": {
-          "default": 8,
+          "default": 4,
           "description": "Number of SMs that the routed-input quantization and shared-expert FC12 kernels leave free for the kernel that runs the HALO-Q scheduler and then the in-switch copy of its plan on the copy stream, one CTA per SM. Must be smaller than the device SM count.",
           "maximum": 8,
           "minimum": 1,

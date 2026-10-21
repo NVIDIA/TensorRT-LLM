@@ -274,7 +274,7 @@ class TestMoeConfigPerLayerDynamicEplb:
         assert isinstance(config.load_balancer,
                           MoePerLayerDynamicLoadBalancerConfig)
         assert config.backend == "MEGAMOE_CUTEDSL"
-        assert config.load_balancer.auxiliary_sms == 8
+        assert config.load_balancer.auxiliary_sms == 4
         assert config.load_balancer.helper_slot_mode == "per_layer_resident"
 
     @pytest.mark.parametrize(
@@ -327,8 +327,8 @@ class TestMoeConfigPerLayerDynamicEplb:
         with pytest.raises(ValidationError, match=field):
             MoeConfig(load_balancer=values)
 
-    @pytest.mark.parametrize("auxiliary_sms", [1, 4])
-    def test_per_layer_dynamic_accepts_smaller_auxiliary_sm_budget(
+    @pytest.mark.parametrize("auxiliary_sms", [1, 8])
+    def test_per_layer_dynamic_accepts_other_auxiliary_sm_budgets(
             self, auxiliary_sms: int) -> None:
         values = self._per_layer_dynamic()
         values["auxiliary_sms"] = auxiliary_sms
