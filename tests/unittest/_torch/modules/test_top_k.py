@@ -330,6 +330,46 @@ def test_gvr_v2_decode_is_hint_free(monkeypatch) -> None:
     assert not top_k.needs_gvr_prior
 
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("padded_rows", [False, True])
+def test_gvr_v2_decode_preserves_native_input(monkeypatch, dtype, padded_rows) -> None:
+    runner = _install_fake_selfsampling_runner(monkeypatch)
+    decode = Mock()
+    monkeypatch.setattr(torch.ops.trtllm, "indexer_topk_decode", decode)
+    top_k = TopK(2, decode_implementation=TopKImplementation.CUTE_DSL_GVR)
+    # Multirow views use the aligned arena stride, even for an odd logical
+    # width. A single row must have an aligned logical width as well.
+    width = 12 if dtype == torch.float32 else 16
+    scores = (
+        torch.randn(2, 16, dtype=dtype)[:, :13]
+        if padded_rows
+        else torch.randn(1, width, dtype=dtype)
+    )
+    lengths = torch.full((scores.shape[0],), scores.shape[1], dtype=torch.int32)
+    output = torch.empty(scores.shape[0], 2, dtype=torch.int32)
+
+    result = top_k(
+        scores,
+        output,
+        is_prefill=False,
+        sequence_lengths=lengths,
+        scan_lengths=lengths,
+        max_seq_len=scores.shape[1],
+    )
+
+    assert result is output
+    runner.assert_called_once()
+    assert runner.call_args.args[0] is scores
+    assert runner.call_args.args[1] is lengths
+    assert runner.call_args.args[2] is output
+    assert runner.call_args.kwargs == {
+        "next_n": 1,
+        "compress_ratio": 1,
+        "max_seq_len": scores.shape[1],
+    }
+    decode.assert_not_called()
+
+
 def test_gvr_v2_decode_forwards_deterministic_kwargs(monkeypatch) -> None:
     runner = _install_fake_selfsampling_runner(monkeypatch)
     top_k = TopK(
@@ -352,6 +392,50 @@ def test_gvr_v2_decode_forwards_deterministic_kwargs(monkeypatch) -> None:
     }
 
 
+def test_gvr_v2_decode_deterministic_bf16_widens_to_fp32(monkeypatch) -> None:
+    runner = _install_fake_selfsampling_runner(monkeypatch)
+    decode = Mock()
+    monkeypatch.setattr(torch.ops.trtllm, "indexer_topk_decode", decode)
+    top_k = TopK(
+        2,
+        decode_implementation=TopKImplementation.CUTE_DSL_GVR,
+        gvr_deterministic=True,
+        gvr_sorting="ascending",
+    )
+    # an aligned bf16 arena view with an odd logical width (multirow stride 16)
+    scores = torch.randn(2, 16, dtype=torch.bfloat16)[:, :13]
+    lengths = torch.full((2,), 13, dtype=torch.int32)
+    output = torch.empty(2, 2, dtype=torch.int32)
+
+    result = top_k(
+        scores,
+        output,
+        is_prefill=False,
+        sequence_lengths=lengths,
+        scan_lengths=lengths,
+        max_seq_len=13,
+    )
+
+    assert result is output
+    decode.assert_not_called()
+    args, kwargs = runner.call_args
+    widened = args[0]
+    # the deterministic engine is fp32-only: an exact float4-aligned fp32 view
+    assert widened.dtype == torch.float32
+    assert widened.shape == scores.shape
+    assert widened.stride(1) == 1 and widened.stride(0) % 4 == 0
+    assert widened.data_ptr() % 16 == 0
+    assert torch.equal(widened, scores.float())
+    assert args[1] is lengths and args[2] is output
+    assert kwargs == {
+        "next_n": 1,
+        "compress_ratio": 1,
+        "max_seq_len": 13,
+        "deterministic": True,
+        "sorting": "ascending",
+    }
+
+
 def test_gvr_v2_hardware_gate_falls_back_without_prior(monkeypatch) -> None:
     runner = _install_fake_selfsampling_runner(monkeypatch)
     decode = Mock()
@@ -361,7 +445,7 @@ def test_gvr_v2_hardware_gate_falls_back_without_prior(monkeypatch) -> None:
         decode_implementation=TopKImplementation.CUTE_DSL_GVR,
         compress_ratio=4,
     )
-    scores = torch.randn(1, 8, dtype=torch.bfloat16)
+    scores = torch.randn(1, 8, dtype=torch.float16)
     lengths = torch.tensor([32], dtype=torch.int32)
     output = torch.empty(1, 2, dtype=torch.int32)
 
@@ -382,6 +466,45 @@ def test_gvr_v2_hardware_gate_falls_back_without_prior(monkeypatch) -> None:
         1,
         2,
         compress_ratio=4,
+        radix_aux_indices=None,
+        radix_aux_logits=None,
+    )
+
+
+@pytest.mark.parametrize("layout", ["row_stride", "inner_stride", "base", "single_row_width"])
+def test_gvr_v2_bf16_unaligned_layout_falls_back(monkeypatch, layout) -> None:
+    runner = _install_fake_selfsampling_runner(monkeypatch)
+    decode = Mock()
+    monkeypatch.setattr(torch.ops.trtllm, "indexer_topk_decode", decode)
+    top_k = TopK(2, decode_implementation=TopKImplementation.CUTE_DSL_GVR)
+    if layout == "row_stride":
+        scores = torch.randn(2, 12, dtype=torch.bfloat16)
+    elif layout == "inner_stride":
+        scores = torch.randn(2, 16, dtype=torch.bfloat16)[:, ::2]
+    elif layout == "base":
+        scores = torch.randn(2, 16, dtype=torch.bfloat16)[:, 1:9]
+    else:
+        scores = torch.randn(1, 16, dtype=torch.bfloat16)[:, :12]
+    lengths = torch.full((scores.shape[0],), scores.shape[1], dtype=torch.int32)
+    output = torch.empty(scores.shape[0], 2, dtype=torch.int32)
+
+    top_k(
+        scores,
+        output,
+        is_prefill=False,
+        sequence_lengths=lengths,
+        scan_lengths=lengths,
+        max_seq_len=scores.shape[1],
+    )
+
+    runner.assert_not_called()
+    decode.assert_called_once_with(
+        scores,
+        lengths,
+        output,
+        1,
+        2,
+        compress_ratio=1,
         radix_aux_indices=None,
         radix_aux_logits=None,
     )
