@@ -1655,6 +1655,113 @@ def test_bf16_dense_profiles_ignore_moe_only_runtime_dimensions(
     assert decision.qualified
 
 
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("sm_version", [None, -1, 90, 100, 103, 120])
+@pytest.mark.parametrize(
+    "root_model_class, architecture, model_type, supported_rope_fusion, supported_sliding_window",
+    [
+        pytest.param(
+            modeling_llama_mod.LlamaForCausalLM,
+            "LlamaForCausalLM",
+            "llama",
+            True,
+            None,
+            id="llama",
+        ),
+        pytest.param(
+            modeling_qwen_mod.Qwen2ForCausalLM,
+            "Qwen2ForCausalLM",
+            "qwen2",
+            True,
+            None,
+            id="qwen2",
+        ),
+        pytest.param(
+            modeling_qwen3_mod.Qwen3ForCausalLM,
+            "Qwen3ForCausalLM",
+            "qwen3",
+            False,
+            None,
+            id="qwen3",
+        ),
+        pytest.param(
+            modeling_mistral_mod.MistralForCausalLM,
+            "MistralForCausalLM",
+            "mistral",
+            True,
+            "none",
+            id="mistral",
+        ),
+    ],
+)
+def test_bf16_dense_profiles_qualify_on_any_sm_version(
+    sm_version: int | None,
+    root_model_class: type[nn.Module],
+    architecture: str,
+    model_type: str,
+    supported_rope_fusion: bool,
+    supported_sliding_window: str | None,
+) -> None:
+    decision = ModelLoader._post_transform_profile_registry().qualify(
+        root_model_class=root_model_class,
+        architecture=architecture,
+        model_type=model_type,
+        speculative_mode=None,
+        protocol_version=ModelLoader._MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION,
+        transfer_scope=PostTransformTransferScope.TARGET_MODEL,
+        runtime_config=_bf16_dense_runtime_config(
+            rope_fusion=supported_rope_fusion,
+            sliding_window=supported_sliding_window,
+            sm_version=sm_version,
+        ),
+    )
+
+    assert decision.qualified
+    assert decision.profile is not None
+    assert decision.profile.runtime_constraints.sm_versions is None
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "device_sm_version, expected_dimensions",
+    [
+        pytest.param(90, frozenset(), id="sm90"),
+        pytest.param(100, frozenset({"sm_version"}), id="sm100"),
+        pytest.param(-1, frozenset({"sm_version"}), id="no-cuda-device"),
+    ],
+)
+def test_qualify_post_transform_profile_uses_device_sm_version(
+    monkeypatch: pytest.MonkeyPatch,
+    device_sm_version: int,
+    expected_dimensions: frozenset[str],
+) -> None:
+    (tiny_profile,) = _tiny_profile_registry().profiles
+    monkeypatch.setattr(
+        ModelLoader,
+        "_POST_TRANSFORM_PROFILE_REGISTRY",
+        PostTransformProfileRegistry(
+            profiles=(
+                replace(
+                    tiny_profile,
+                    runtime_constraints=PostTransformRuntimeConstraints(
+                        sm_versions=frozenset({90})
+                    ),
+                ),
+            )
+        ),
+    )
+    monkeypatch.setattr(model_loader_mod, "get_sm_version", lambda: device_sm_version)
+
+    decision = ModelLoader._qualify_post_transform_profile(
+        _TinyModel([]),
+        speculative_mode=None,
+        loads_draft_weights=False,
+    )
+
+    assert decision.qualified is (not expected_dimensions)
+    assert decision.unsupported_runtime_dimensions == expected_dimensions
+
+
 def test_staged_llama_finalization_preserves_mx_tensor_catalog(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

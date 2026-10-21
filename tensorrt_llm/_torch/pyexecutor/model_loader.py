@@ -1635,7 +1635,7 @@ class ModelLoader:
             transfer_scope=PostTransformTransferScope.TARGET_MODEL,
             enabled_features=frozenset(enabled_features),
             runtime_config=PostTransformRuntimeConfig.from_model_config(
-                model.model_config, model=model),
+                model.model_config, model=model, sm_version=get_sm_version()),
         )
 
     def _dump_final_weight_manifest(
