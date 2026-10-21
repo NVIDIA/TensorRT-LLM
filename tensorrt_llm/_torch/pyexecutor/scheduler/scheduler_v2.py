@@ -195,6 +195,13 @@ class KVCacheV2Scheduler(RequestScheduler):
         self.cross_kv_cache_manager = cross_kv_cache_manager
         self.enable_prefix_aware_scheduling = enable_prefix_aware_scheduling
         self.enable_recompute_pause = enable_recompute_pause
+        # Once a first context chunk finds the iteration's token budget spent, the later first
+        # chunks of the same pass are skipped before prepare_context: preparing one (radix
+        # match, cache creation, resume) only to release it again costs host time in proportion
+        # to its prompt, and it would repeat for every waiting request on every iteration, which
+        # makes a loaded context tier host-bound. TRTLLM_SCHED_CTX_EARLY_EXIT=0 turns it off.
+        self._ctx_early_exit = os.environ.get("TRTLLM_SCHED_CTX_EARLY_EXIT", "1") != "0"
+        self._ctx_budget_spent = False
         # Every input to the prefix-aware skip is fixed for this scheduler's
         # lifetime: the knob is a constructor argument, and both manager
         # attributes are assigned once in ``KVCacheManagerV2.__init__``. Resolve
@@ -357,6 +364,7 @@ class KVCacheV2Scheduler(RequestScheduler):
     def _schedule_loop(
         self, active_requests, inflight_request_ids, *, defer_remote_tail_context=False
     ):
+        self._ctx_budget_spent = False
         scheduled_ctx: RequestList = []
         scheduled_remote_mode = None
         scheduled_encoder: RequestList = []
@@ -979,6 +987,8 @@ class KVCacheV2Scheduler(RequestScheduler):
 
         if not self._has_context_chunk_budget(budget):
             return ScheduleAction.SKIP, 0, False
+        if self._ctx_budget_spent and req.is_first_context_chunk:
+            return ScheduleAction.SKIP, 0, False
 
         # Prepare context (create _KVCache, block reuse, resume — no resize)
         if not self._prepare_context_pair(req):
@@ -1044,6 +1054,8 @@ class KVCacheV2Scheduler(RequestScheduler):
             # Out of token budget rather than out of pages, so releasing pages
             # would not help; the next iteration gets a fresh budget. Not
             # suspended either, to avoid pathological suspend/resume cycles.
+            if self._ctx_early_exit:
+                self._ctx_budget_spent = True
             return ScheduleAction.SKIP, 0, False
 
         chunk_size = self._align_chunk_to_mm_block(

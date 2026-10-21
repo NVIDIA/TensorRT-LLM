@@ -5016,3 +5016,49 @@ def test_rewind_context_after_cache_drop_handles_empty_rank_local_prompt(
     assert request.context_chunk_size == prompt_len
     assert request.estimated_reusable_tokens == 0
     assert request.py_ctx_pre_resize_cap is None
+
+
+class TestContextAdmissionEarlyExit:
+    """A spent token budget ends first-chunk context admission for the rest of the pass.
+
+    Under FORCE_CHUNK a waiting first chunk passes the cheap budget gate whenever any budget
+    is left, is prepared (radix match, cache creation, resume), rounds to a zero-token chunk
+    and is released again. Without the early exit that happens to every waiting request on
+    every iteration; with it, only to the first one of the pass.
+    """
+
+    @staticmethod
+    def _pass(monkeypatch, early_exit: bool):
+        # On by default; TRTLLM_SCHED_CTX_EARLY_EXIT=0 restores the old admission loop.
+        monkeypatch.setenv("TRTLLM_SCHED_CTX_EARLY_EXIT", "1" if early_exit else "0")
+        mgr = make_kv_cache_manager()
+        sched = make_scheduler(
+            mgr, max_num_tokens=1000, ctx_chunk_config=(ContextChunkingPolicy.FORCE_CHUNK, 128)
+        )
+        # The first request leaves 100 tokens, less than one 128-token chunk unit; every later
+        # one is too long to finish in them, so its chunk rounds down to zero.
+        reqs = [make_ctx_request(0, 900)] + [make_ctx_request(i, 2000) for i in range(1, 11)]
+        out = sched.schedule_request(reqs, set())
+        return mgr, out
+
+    def test_same_schedule_with_bounded_prepares(self, monkeypatch):
+        mgr_base, out_base = self._pass(monkeypatch, early_exit=False)
+        mgr_exit, out_exit = self._pass(monkeypatch, early_exit=True)
+        assert ids(out_base.context_requests) == ids(out_exit.context_requests) == [0]
+        assert mgr_base.prepare_context.call_count == 11
+        # The scheduled request and the first one to find the budget spent.
+        assert mgr_exit.prepare_context.call_count == 2
+
+    def test_continuation_chunks_are_still_scheduled(self, monkeypatch):
+        monkeypatch.delenv("TRTLLM_SCHED_CTX_EARLY_EXIT", raising=False)
+        mgr = make_kv_cache_manager()
+        sched = make_scheduler(
+            mgr, max_num_tokens=1000, ctx_chunk_config=(ContextChunkingPolicy.FORCE_CHUNK, 128)
+        )
+        first = make_ctx_request(0, 900)
+        blocked = make_ctx_request(1, 2000)
+        continuation = make_ctx_request(2, 64, is_first_context_chunk=False)
+        out = sched.schedule_request([first, blocked, continuation], set())
+        # The continuation is mid-prefill: it is never skipped for a spent first-chunk budget,
+        # and its 64 tokens fit in the 100 left.
+        assert ids(out.context_requests) == [0, 2]
