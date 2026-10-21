@@ -765,6 +765,132 @@ def test_generation_capture_passes_local_speculation_state(fails: bool) -> None:
     assert runner._force_lora_graph_for_capture is None
 
 
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "prefetch,coverage,cache_path,once",
+    [
+        ("1", None, None, True),
+        ("1", "1", None, False),
+        (None, None, None, False),
+        ("1", None, "autotuner.json", False),
+    ],
+    ids=["prefetch", "prefetch_jit_coverage", "prefetch_off", "prefetch_tactic_file"],
+)
+def test_flashinfer_mxfp8_graph_tuning_runs_once_per_shape(
+    prefetch: str | None,
+    coverage: str | None,
+    cache_path: str | None,
+    once: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With JIT prefetch on, the warmup-only pass tunes the FlashInfer MXFP8
+    decode-graph backends around the first forward of each (batch size, draft
+    length) shape only; a repeat (the advanced-sampling variant, the final
+    executor's second warmup) runs outside tuning mode, like the capture pass.
+    A forward that raises leaves its shape untuned. TLLM_WARMUP_JIT_COVERAGE=1,
+    which prefetch off implies, tunes every warmup-only forward, and so does a
+    TLLM_AUTOTUNER_CACHE_PATH, whose reload in the next pass replaces the
+    in-memory tactics."""
+    for name, value in (
+        ("TLLM_JIT_PREFETCH", prefetch),
+        ("TLLM_WARMUP_JIT_COVERAGE", coverage),
+        ("TLLM_AUTOTUNER_CACHE_PATH", cache_path),
+    ):
+        if value is None:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, value)
+    runner = object.__new__(DecoderRunner)
+    runner._flashinfer_mxfp8_tuned_graph_shapes = set()
+    runner._tuning_flashinfer_mxfp8_graphs = False
+    tuned = []
+
+    @contextlib.contextmanager
+    def fake_autotune() -> Iterator[None]:
+        tuned.append("enter")
+        yield
+
+    def forward(shape):
+        with runner._flashinfer_mxfp8_graph_tuning(*shape):
+            pass
+
+    with patch("tensorrt_llm._torch.modules.linear.flashinfer_mxfp8_autotune", fake_autotune):
+        # Capture pass (not warmup-only): never tunes.
+        forward((32, 3))
+        assert tuned == []
+
+        # Warmup-only pass, greedy then advanced sampling over the same shapes.
+        runner._tuning_flashinfer_mxfp8_graphs = True
+        for _variant in ("greedy", "advanced sampling"):
+            for shape in ((32, 3), (1, 3)):
+                forward(shape)
+        assert len(tuned) == (2 if once else 4)
+        assert runner._flashinfer_mxfp8_tuned_graph_shapes == {(32, 3), (1, 3)}
+
+        # A failed forward does not mark its shape tuned.
+        with pytest.raises(RuntimeError, match="forward failed"):
+            with runner._flashinfer_mxfp8_graph_tuning(8, 3):
+                raise RuntimeError("forward failed")
+        assert (8, 3) not in runner._flashinfer_mxfp8_tuned_graph_shapes
+        tuned.clear()
+
+        # The final executor's warmup-only pass reuses the tuned shapes.
+        forward((32, 3))
+        forward((8, 3))
+        assert len(tuned) == (1 if once else 2)
+        assert (8, 3) in runner._flashinfer_mxfp8_tuned_graph_shapes
+
+
+@pytest.mark.cpu_only
+def test_cuda_graph_warmup_scopes_flashinfer_mxfp8_tuning_to_warmup_only_pass() -> None:
+    """_run_cuda_graph_warmup arms the per-shape FlashInfer MXFP8 tuning only
+    for the warmup-only pass of an engine with FlashInfer MXFP8 layers, and
+    disarms it afterwards, including when the capture raises."""
+    method = object.__new__(MXFP8LinearMethod)
+    method.backend = "auto"
+    method._flashinfer_mxfp8 = object()
+    runner = object.__new__(DecoderRunner)
+    runner.model = SimpleNamespace(modules=lambda: [SimpleNamespace(quant_method=method)])
+    runner._config = SimpleNamespace(
+        enable_autotuner=True, prefill_cuda_graph_backend=PrefillCudaGraphBackend.DISABLED
+    )
+    runner._lora = SimpleNamespace(cuda_graph_manager=None)
+    runner.cuda_graph_runner = SimpleNamespace(enabled=True, is_warmup_only=True)
+    runner._metrics = {}
+    runner.kv_cache_manager_key = ResourceManagerType.KV_CACHE_MANAGER
+    runner._flashinfer_mxfp8_tuned_graph_shapes = set()
+    runner._tuning_flashinfer_mxfp8_graphs = False
+    resource_manager = ResourceManager({})
+    armed = []
+
+    def capture(_resources):
+        armed.append(runner._tuning_flashinfer_mxfp8_graphs)
+
+    with (
+        patch.object(runner, "_capture_generation_cuda_graphs", side_effect=capture) as gen,
+        patch.object(runner, "_capture_additional_cuda_graphs"),
+    ):
+        runner._run_cuda_graph_warmup(resource_manager)
+        runner.cuda_graph_runner.is_warmup_only = False
+        with patch.object(runner, "_capture_prefill_cuda_graphs"):
+            runner._run_cuda_graph_warmup(resource_manager)
+        assert armed == [True, False]
+        assert runner._tuning_flashinfer_mxfp8_graphs is False
+
+        runner.cuda_graph_runner.is_warmup_only = True
+        gen.side_effect = RuntimeError("capture failed")
+        with pytest.raises(RuntimeError, match="capture failed"):
+            runner._run_cuda_graph_warmup(resource_manager)
+        assert runner._tuning_flashinfer_mxfp8_graphs is False
+
+        # Without FlashInfer MXFP8 layers the warmup-only pass does not tune.
+        gen.side_effect = capture
+        method._flashinfer_mxfp8 = None
+        armed.clear()
+        runner._run_cuda_graph_warmup(resource_manager)
+        assert armed == [False]
+
+
 @pytest.mark.parametrize("phase", ["general", "attention", "mamba", "prefill"])
 def test_warmup_phases_pass_configured_speculation_state(phase: str) -> None:
     engine, resource_manager = _build_engine_and_resource_manager()
