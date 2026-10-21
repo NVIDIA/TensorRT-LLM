@@ -50,6 +50,7 @@ from tensorrt_llm._torch.weight_sharing import (
     PostTransformFeature,
     PostTransformProfile,
     PostTransformProfileRegistry,
+    PostTransformQualificationDecision,
     PostTransformQualificationReason,
     PostTransformRuntimeConfig,
     PostTransformRuntimeConstraints,
@@ -509,6 +510,7 @@ def _bf16_dense_runtime_config(**overrides: object) -> PostTransformRuntimeConfi
         "cp_size": 1,
         "moe_tp_size": 1,
         "moe_ep_size": 1,
+        "moe_cluster_size": 1,
         "attention_tp_size": 1,
         "attention_cp_size": 1,
         "attention_dp": False,
@@ -2059,6 +2061,16 @@ def test_bf16_dense_profiles_reject_wrong_realized_dimension(
             },
             id="alternate-moe-partition",
         ),
+        pytest.param(
+            {
+                "tp_size": 2,
+                "moe_tp_size": 1,
+                "moe_ep_size": 1,
+                "moe_cluster_size": 2,
+                "attention_tp_size": 2,
+            },
+            id="moe-cluster-partition",
+        ),
     ],
 )
 @pytest.mark.parametrize(
@@ -2170,6 +2182,121 @@ def test_separate_draft_model_is_not_qualified_by_target_only_profile(
     assert not decision.qualified
     assert decision.reason is PostTransformQualificationReason.FEATURE_NOT_SUPPORTED
     assert decision.unsupported_features == frozenset({PostTransformFeature.SEPARATE_DRAFT_MODEL})
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "layer_load_balancer, dwdp_enabled, expected_features",
+    [
+        pytest.param(None, False, frozenset(), id="no-moe-feature"),
+        pytest.param(
+            object(),
+            False,
+            frozenset({PostTransformFeature.MOE_LOAD_BALANCER}),
+            id="realized-load-balancer",
+        ),
+        pytest.param(
+            None,
+            True,
+            frozenset({PostTransformFeature.DWDP}),
+            id="dwdp",
+        ),
+    ],
+)
+def test_qualification_reports_realized_moe_lifecycle_features(
+    monkeypatch: pytest.MonkeyPatch,
+    layer_load_balancer: object | None,
+    dwdp_enabled: bool,
+    expected_features: frozenset[PostTransformFeature],
+) -> None:
+    """A realized EPLB balancer or a DWDP mapping fails qualification closed.
+
+    Both change which experts a rank stores without changing the MoE TP or EP
+    sizes, so the loader reports them as features that no profile supports.
+    MoE layers keep `layer_load_balancer` at `None` unless EPLB applies.
+    """
+    monkeypatch.setattr(
+        ModelLoader,
+        "_POST_TRANSFORM_PROFILE_REGISTRY",
+        _tiny_profile_registry(),
+    )
+    model = _TinyModel([])
+    model.linear.layer_load_balancer = layer_load_balancer
+    model.model_config.mapping = SimpleNamespace(
+        dwdp_enabled=dwdp_enabled,
+        is_multi_node=lambda: False,
+    )
+
+    decision = ModelLoader._qualify_post_transform_profile(
+        model,
+        speculative_mode=None,
+        loads_draft_weights=False,
+    )
+
+    assert decision.qualified == (not expected_features)
+    assert decision.unsupported_features == expected_features
+    if expected_features:
+        assert decision.reason is PostTransformQualificationReason.FEATURE_NOT_SUPPORTED
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "decision, expected_details",
+    [
+        pytest.param(
+            PostTransformQualificationDecision(
+                PostTransformQualificationReason.ROOT_MODEL_CLASS_NOT_REGISTERED
+            ),
+            "",
+            id="reason-only",
+        ),
+        pytest.param(
+            PostTransformQualificationDecision(
+                PostTransformQualificationReason.RUNTIME_CONFIG_NOT_SUPPORTED,
+                unsupported_runtime_dimensions=frozenset({"tp_size", "moe_backend"}),
+            ),
+            ", unsupported_runtime_dimensions=moe_backend,tp_size",
+            id="runtime-dimensions",
+        ),
+        pytest.param(
+            PostTransformQualificationDecision(
+                PostTransformQualificationReason.FEATURE_NOT_SUPPORTED,
+                unsupported_features=frozenset(
+                    {PostTransformFeature.MOE_LOAD_BALANCER, PostTransformFeature.DWDP}
+                ),
+            ),
+            ", unsupported_features=dwdp,moe_load_balancer",
+            id="features",
+        ),
+    ],
+)
+def test_skipped_mx_publish_logs_only_reported_details(
+    monkeypatch: pytest.MonkeyPatch,
+    decision: PostTransformQualificationDecision,
+    expected_details: str,
+) -> None:
+    """The skip-publish log names only the details the decision reports.
+
+    `qualify()` stops at a runtime mismatch before it checks features, so an
+    empty feature set there does not mean that no unsupported feature is active.
+    """
+    messages: list[str] = []
+    monkeypatch.setattr(model_loader_mod.logger, "info", messages.append)
+    checkpoint_loader = SimpleNamespace(checkpoint_format="MX", post_load_publish=MagicMock())
+
+    ModelLoader.__new__(ModelLoader)._post_load_publish(
+        checkpoint_loader,
+        _TinyModel([]),
+        checkpoint_dir="/checkpoint",
+        weights_preloaded=False,
+        qualification=decision,
+    )
+
+    assert messages == [
+        "Skipping MX post-transform publish for _TinyModel: qualification "
+        f"reason={decision.reason.value}{expected_details}."
+    ]
+    checkpoint_loader.post_load_publish.assert_not_called()
 
 
 @pytest.mark.cpu_only

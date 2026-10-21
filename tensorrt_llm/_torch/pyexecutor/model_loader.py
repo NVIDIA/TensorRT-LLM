@@ -1751,6 +1751,15 @@ class ModelLoader:
         if getattr(locality_domain_policy, "enabled", False):
             enabled_features.add(
                 PostTransformFeature.LOCALITY_DOMAIN_LOCALIZED_WEIGHTS)
+        # The realized balancer, not the configured one, decides the expert
+        # slot layout: MoE layers create it only when EPLB actually applies.
+        if any(
+                getattr(module, "layer_load_balancer", None) is not None
+                for module in model.modules()):
+            enabled_features.add(PostTransformFeature.MOE_LOAD_BALANCER)
+        mapping = getattr(model.model_config, "mapping", None)
+        if getattr(mapping, "dwdp_enabled", False) is True:
+            enabled_features.add(PostTransformFeature.DWDP)
         return cls._post_transform_profile_registry().qualify(
             root_model_class=type(model),
             architecture=config_identity.architecture,
@@ -1805,11 +1814,22 @@ class ModelLoader:
                 if not weights_preloaded:
                     unsupported_runtime_dimensions = ",".join(
                         sorted(qualification.unsupported_runtime_dimensions))
+                    unsupported_features = ",".join(
+                        sorted(
+                            feature.value
+                            for feature in qualification.unsupported_features))
+                    # A runtime mismatch ends qualification before features
+                    # are checked, so print only the details it reports.
+                    runtime_detail = (", unsupported_runtime_dimensions="
+                                      f"{unsupported_runtime_dimensions}"
+                                      if unsupported_runtime_dimensions else "")
+                    feature_detail = (
+                        f", unsupported_features={unsupported_features}"
+                        if unsupported_features else "")
                     logger.info("Skipping MX post-transform publish for "
                                 f"{type(model).__name__}: qualification "
-                                f"reason={qualification.reason.value}, "
-                                "unsupported_runtime_dimensions="
-                                f"{unsupported_runtime_dimensions or 'none'}.")
+                                f"reason={qualification.reason.value}"
+                                f"{runtime_detail}{feature_detail}.")
                 return
             kwargs["source_identity"] = self._source_identity
         checkpoint_loader.post_load_publish(model, **kwargs)
