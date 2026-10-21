@@ -914,7 +914,7 @@
    "perf/test_perf_sanity.py::test_e2e[disagg_upload-e2e-gb300_deepseek-v4-pro-fp4_8k1k_con4301_ctx12_dep4_gen1_dep8_eplb384_mtp1_ccb-NIXL]": 1625.0253529411764,
    "perf/test_perf_sanity.py::test_e2e[disagg_upload-e2e-gb300_deepseek-v4-pro-fp4_8k1k_con666_ctx6_dep4_gen1_dep16_eplb384_mtp3_ccb-NIXL]": 1182.7676666666669,
    "perf/test_perf_sanity.py::test_e2e[disagg_upload-e2e-gb300_deepseek-v4-pro-fp4_8k1k_con8_ctx1_dep4_gen4_tep8_eplb0_mtp3_ccb-NIXL]": 1031.3825555555554,
-   "perf/test_perf_sanity.py::test_e2e[disagg_upload-e2e-gb300_deepseek-v41-flash-fp4-dspark_agentx_con1579_ctx2_dep2_gen1_dep16_eplb0_dspark5_ccb-NIXL]": 6864.0,
+   "perf/test_perf_sanity.py::test_e2e[disagg_upload-e2e-gb300_deepseek-v41-flash-fp4-dspark_agentx_con1579_ctx2_dep2_gen1_dep16_eplb0_dspark5_ccb-NIXL]": 4416.0,
    "perf/test_perf_sanity.py::test_e2e[disagg_upload-e2e-gb300_glm-5-fp4_8k1k_con1024_ctx1_dep2_gen1_dep8_eplb256_mtp1_ccb-NIXL]": 3123.161052631579,
    "perf/test_perf_sanity.py::test_e2e[disagg_upload-e2e-gb300_nemotron-ultra-v3-fp4_50k2k_con12_ctx1_dep4_gen6_tep4_eplb0_mtp6_ccb-NIXL]": 1648.269888888889,
    "perf/test_perf_sanity.py::test_e2e[disagg_upload-gen_only-gb200_qwen3-235b-fp4_8k1k_con1024_ctx1_tp1_gen1_dep8_eplb0_mtp0_ccb-NIXL]": 499.76885714285714,

@@ -25,4 +25,4 @@ l0_gb300_multi_nodes_perf_sanity_gen1_node4_gpu16:
   # deepseek-v4-pro-dspark agentx con1456, DEP16 gen worker
   - perf/test_perf_sanity.py::test_e2e[aggr_upload-gen_only_no_context-gb300_deepseek-v4-pro-dspark_agentx_con1456_ctx3_dep8_gen1_dep16_eplb0_dspark5_ccb-NIXL] TIMEOUT (150)
   # deepseek-v4.1-flash-fp4 dspark agentx con1579, DEP16 gen worker
-  - perf/test_perf_sanity.py::test_e2e[aggr_upload-gen_only_no_context-gb300_deepseek-v41-flash-fp4-dspark_agentx_con1579_ctx2_dep2_gen1_dep16_eplb0_dspark5_ccb-NIXL] TIMEOUT (150)
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-gen_only_no_context-gb300_deepseek-v41-flash-fp4-dspark_agentx_con1579_ctx2_dep2_gen1_dep16_eplb0_dspark5_ccb-NIXL] TIMEOUT (90)
