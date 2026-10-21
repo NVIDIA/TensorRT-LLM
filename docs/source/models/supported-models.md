@@ -14,7 +14,7 @@ The following is a table of supported models for the PyTorch backend:
 | `DeepseekV32ForCausalLM`             | DeepSeek-V3.2                      | `deepseek-ai/DeepSeek-V3.2`                  |
 | `DeepseekV4ForCausalLM` [^11]        | DeepSeek-V4                        | `deepseek-ai/DeepSeek-V4-Pro`                |
 | `DeepseekV41ForCausalLM`            | DeepSeek-V4.1 (text decoder)       | —                                          |
-| `DeepseekV41ForConditionalGeneration` | DeepSeek-V4.1                    | `deepseek-ai/DeepSeek-V4.1-Flash-1017`        |
+| `DeepseekV41ForConditionalGeneration` | DeepSeek-V4.1                    | —                                          |
 | `Exaone4ForCausalLM`                 | EXAONE 4.0                         | `LGAI-EXAONE/EXAONE-4.0-32B`                 |
 | `ExaoneMoeForCausalLM`               | K-EXAONE                           | `LGAI-EXAONE/K-EXAONE-236B-A23B`             |
 | `ExaoneMoeForCausalLM`               | K-EXAONE 2.0                       | `LGAI-EXAONE/K-EXAONE-2.0-750B-A37B`         |
@@ -41,8 +41,6 @@ The following is a table of supported models for the PyTorch backend:
 | `MllamaForConditionalGeneration`     | Llama 3.2                          | `meta-llama/Llama-3.2-11B-Vision`            |
 | `NemotronForCausalLM`                | Nemotron-3, Nemotron-4, Minitron   | `nvidia/Minitron-8B-Base`                    |
 | `NemotronHForCausalLM`               | Nemotron-3-Nano, Nemotron-3-Super, Nemotron-3-Ultra | `nvidia/nvidia-nemotron-v3`                  |
-| `NemotronH_Nano_Omni_Reasoning_V3`    | Nemotron-3-Nano-Omni               | `nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16` |
-| `NemotronH_Omni_Reasoning_V3`         | Nemotron-3.5-Super-VL, Nemotron-3.5-Bolt | `nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16`, `nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-BF16` |
 | `NemotronNASForCausalLM`             | NemotronNAS                        | `nvidia/Llama-3_3-Nemotron-Super-49B-v1`     |
 | `Phi3ForCausalLM`                    | Phi-4                              | `microsoft/Phi-4`                            |
 | `Qwen2ForCausalLM`                   | QwQ, Qwen2                         | `Qwen/Qwen2-7B-Instruct`                     |
@@ -53,7 +51,6 @@ The following is a table of supported models for the PyTorch backend:
 | `Qwen3MoeForCausalLM`                | Qwen3MoE                           | `Qwen/Qwen3-30B-A3B`                         |
 | `Qwen3NextForCausalLM`               | Qwen3Next                          | `Qwen/Qwen3-Next-80B-A3B-Thinking`           |
 | `Qwen3_5MoeForCausalLM`              | Qwen3.8-MoE, Qwen3.5-MoE           | `Qwen/Qwen3.8-2.4T-A95B`, `Qwen/Qwen3.5-397B-A17B` |
-| `Qwen3_5ForConditionalGeneration`    | Qwen3.8, Qwen3.5                   | `Qwen/Qwen3.8-27B`, `Qwen/Qwen3.5-27B`        |
 | `Qwen4ExpForCausalLM`                | Qwen3.8-Flash-Next (text)          | `Qwen/Qwen3.8-Flash-Next`                    |
 | `Qwen4ExpForConditionalGeneration`   | Qwen3.8-Flash-Next                 | `Qwen/Qwen3.8-Flash-Next`                    |
 | `Step3p7ForConditionalGeneration` [^8]| Step-3.7-Flash                    | `stepfun-ai/Step-3.7-Flash`                  |
@@ -128,30 +125,33 @@ complete encoder input must fit in the iteration token budget.
 Entries in this matrix require a request with at least one listed non-language modality; language-only test evidence is
 not used to mark a feature as supported here.
 
-| Model Architecture/Feature           | Overlap Scheduler | CUDA Graph | Chunked Prefill | Torch Sampler | KV Cache Reuse | Logits Post Processor | EPD Disaggregated Serving | Modality  |
-| ------------------------------------ | ----------------- | ---------- | --------------- | ------------- | -------------- | --------------------- | ------------------------- | --------- |
-| `Exaone4_5_ForConditionalGeneration` | Yes               | Yes        | Yes             | Yes           | Yes            | Yes                   | No                        | L + I + V |
-| `Gemma3ForConditionalGeneration`     | Yes               | Yes        | N/A             | Yes           | N/A            | Yes                   | No                        | L + I     |
-| `Gemma4ForConditionalGeneration`     | Yes                | Yes        | Yes             | Yes           | No             | Yes                   | No                        | L + I + V + A [^9] |
-| `Gemma4UnifiedForConditionalGeneration` | Yes                | Yes        | Untested        | Yes           | No             | Yes                   | No                        | L + I + A |
-| `HCXVisionForCausalLM`               | Yes               | Yes        | No              | Yes           | Yes            | Yes                   | No                        | L + I     |
-| `LlavaLlamaModel (VILA)`             | Yes               | Yes        | No              | Yes           | No             | Yes                   | No                        | L + I + V |
-| `LlavaNextForConditionalGeneration`  | Yes               | Yes        | Yes             | Yes           | Yes            | Yes                   | Yes                       | L + I     |
-| `Llama4ForConditionalGeneration`     | Yes               | Yes        | No              | Yes           | No             | Yes                   | No                        | L + I     |
-| `MiniCPMV4_6ForConditionalGeneration` [^14] | Yes               | Untested   | Untested        | Yes           | Untested       | Untested              | No                        | L + I + V |
-| `Mistral3ForConditionalGeneration`   | Yes               | Yes        | Yes             | Yes           | Yes            | Yes                   | No                        | L + I     |
-| `NemotronH_Nano_VL_V2`               | Yes               | Yes        | Yes             | Yes           | N/A            | Yes                   | Yes                       | L + I + V + A [^10] |
-| `Phi4MMForCausalLM`                  | Yes               | Yes        | Yes             | Yes           | Yes            | Yes                   | No                        | L + I + A |
-| `Qwen2VLForConditionalGeneration`    | Yes               | Yes        | Yes             | Yes           | Yes            | Yes                   | No                        | L + I + V |
-| `Qwen2_5_VLForConditionalGeneration` | Yes               | Yes        | Yes             | Yes           | Yes            | Yes                   | Yes                       | L + I + V |
-| `Qwen3VLForConditionalGeneration`    | Yes               | Yes        | Yes             | Yes           | Yes            | Yes                   | Yes                       | L + I + V |
-| `Qwen3VLMoeForConditionalGeneration` | Yes               | Yes        | Yes             | Yes           | Yes            | Yes                   | Yes                       | L + I + V |
-| `Step3p7ForConditionalGeneration`    | Yes               | Yes        | Untested        | Yes           | Untested       | Yes                   | Untested                  | L + I     |
-| `MiniMaxM3SparseForConditionalGeneration` [^12] | Yes               | Yes        | Untested        | Yes           | No             | Yes                   | Untested                  | L + I + V |
-| `Cosmos3ForConditionalGeneration` [^13] | Yes               | Yes        | Yes             | Yes           | Yes            | Untested              | Untested                  | L + I + V |
-| `Qwen3_5ForConditionalGeneration`    | Yes               | Yes        | Untested        | Yes           | No             | Untested              | Yes                       | L + I + V |
-| `Qwen3_5MoeForConditionalGeneration` | Yes               | Yes        | Untested        | Yes           | No             | Untested              | Yes                       | L + I + V |
-| `Qwen4ExpForConditionalGeneration`   | Untested          | Untested   | Untested        | Yes           | Untested       | Yes                   | No                        | L + I     |
+| Model Architecture/Feature           | Overlap Scheduler | CUDA Graph | Chunked Prefill | Torch Sampler | KV Cache Reuse | Logits Post Processor | EPD Disaggregated Serving | Encoder TP [^21] | Encoder DP [^21] | Modality  |
+| ------------------------------------ | ----------------- | ---------- | --------------- | ------------- | -------------- | --------------------- | ------------------------- | ---------------- | ---------------- | --------- |
+| `Exaone4_5_ForConditionalGeneration` | Yes               | Yes        | Yes             | Yes           | Yes            | Yes                   | No                        | Untested | Untested | L + I + V |
+| `Gemma3ForConditionalGeneration`     | Yes               | Yes        | N/A             | Yes           | N/A            | Yes                   | No                        | No | No | L + I     |
+| `Gemma4ForConditionalGeneration`     | Yes                | Yes        | Yes             | Yes           | No             | Yes                   | No                        | Untested (vision only) [^22] | Untested | L + I + V + A [^9] |
+| `Gemma4UnifiedForConditionalGeneration` | Yes                | Yes        | Untested        | Yes           | No             | Yes                   | No                        | No | Untested | L + I + A |
+| `HCXVisionForCausalLM`               | Yes               | Yes        | No              | Yes           | Yes            | Yes                   | No                        | No | No | L + I     |
+| `LlavaLlamaModel (VILA)`             | Yes               | Yes        | No              | Yes           | No             | Yes                   | No                        | No | No | L + I + V |
+| `LlavaNextForConditionalGeneration`  | Yes               | Yes        | Yes             | Yes           | Yes            | Yes                   | Yes                       | No | No | L + I     |
+| `Llama4ForConditionalGeneration`     | Yes               | Yes        | No              | Yes           | No             | Yes                   | No                        | No | No | L + I     |
+| `MiniCPMV4_6ForConditionalGeneration` [^14] | Yes               | Untested   | Untested        | Yes           | Untested       | Untested              | No                        | No | No | L + I + V |
+| `Mistral3ForConditionalGeneration`   | Yes               | Yes        | Yes             | Yes           | Yes            | Yes                   | No                        | Untested | Untested | L + I     |
+| `NemotronH_Nano_VL_V2`               | Yes               | Yes        | Yes             | Yes           | N/A            | Yes                   | Yes                       | No | No | L + I + V + A [^10] |
+| `Phi4MMForCausalLM`                  | Yes               | Yes        | Yes             | Yes           | Yes            | Yes                   | No                        | No | No | L + I + A |
+| `Qwen2VLForConditionalGeneration`    | Yes               | Yes        | Yes             | Yes           | Yes            | Yes                   | No                        | No | Untested | L + I + V |
+| `Qwen2_5_VLForConditionalGeneration` | Yes               | Yes        | Yes             | Yes           | Yes            | Yes                   | Yes                       | Yes | Yes | L + I + V |
+| `Qwen3VLForConditionalGeneration`    | Yes               | Yes        | Yes             | Yes           | Yes            | Yes                   | Yes                       | Yes | Yes | L + I + V |
+| `Qwen3VLMoeForConditionalGeneration` | Yes               | Yes        | Yes             | Yes           | Yes            | Yes                   | Yes                       | Untested | Untested | L + I + V |
+| `Step3p7ForConditionalGeneration`    | Yes               | Yes        | Untested        | Yes           | Untested       | Yes                   | Untested                  | No | No | L + I     |
+| `MiniMaxM3SparseForConditionalGeneration` [^12] | Yes               | Yes        | Untested        | Yes           | No             | Yes                   | Untested                  | No | No | L + I + V |
+| `Cosmos3ForConditionalGeneration` [^13] | Yes               | Yes        | Yes             | Yes           | Yes            | Untested              | Untested                  | Untested | Untested | L + I + V |
+| `Qwen3_5ForConditionalGeneration`    | Yes               | Yes        | Untested        | Yes           | No             | Untested              | Yes                       | Untested | Untested | L + I + V |
+| `Qwen3_5MoeForConditionalGeneration` | Yes               | Yes        | Untested        | Yes           | No             | Untested              | Yes                       | Untested | Untested | L + I + V |
+| `Qwen4ExpForConditionalGeneration`   | Untested          | Untested   | Untested        | Yes           | Untested       | Yes                   | No                        | Untested | Untested | L + I     |
+
+[^21]: Encoder TP/DP refers to the explicit `multimodal_config.encoder_data_parallel_size` option, independently of language-model parallelism. `No` means this option is not integrated, even if a native encoder TP path exists. `Untested` means the mode is integrated but has not been validated with multimodal GPU requests. Qwen2.5-VL was checked with production towers and small random weights; Qwen3-VL was checked with HTTP image requests. These checks do not establish full-model accuracy or validate every checkpoint and modality. Omitting the option preserves the existing model path. See [multimodal encoder parallelism](../features/parallel-strategy.md#multimodal-encoders) for configuration and restrictions.
+[^22]: Gemma4 audio is not TP-sharded, so checkpoints with audio enabled reject explicit encoder TP. Gemma4 also lacks item scheduling, so shared encoder TP with LLM attention DP is unavailable even for vision-only checkpoints. Gemma4 Unified uses unsharded vision/audio projections and supports explicit encoder DP only.
 
 Note:
 - L: Language
@@ -201,50 +201,6 @@ The following optimizations are available to models that implement
     support side-stream prefetch or pipeline parallelism yet. With `pipeline_parallel_size > 1`,
     the `DEFAULT` policy, explicit or unset, logs a warning and falls back to the inline path, and
     the `EAGER` policy raises an error.
-
-### Encoder Parallelism
-
-The table below describes integration with the explicit
-`multimodal_config.encoder_data_parallel_size` option. It covers encoder front ends,
-including their projectors, rather than language-model TP. `Yes` indicates an implemented
-capability; checkpoint-specific accuracy and performance validation are separate.
-`Not integrated` means this option is unavailable, even if the model already has a native
-encoder TP path. Leaving the option unset preserves the existing model path and mapping.
-
-| Model Architecture | Encoder | Explicit Encoder TP | Explicit Encoder DP |
-| ------------------ | ------- | ------------------- | ------------------- |
-| `Exaone4_5_ForConditionalGeneration` | Vision | Yes | Yes |
-| `Gemma4ForConditionalGeneration` | Vision | Yes | Yes |
-| `Gemma4ForConditionalGeneration` | Audio, when present | No | Yes |
-| `Gemma4UnifiedForConditionalGeneration` | Vision/audio projections, when present | No | Yes |
-| `Mistral3ForConditionalGeneration` | Vision | Yes | Yes |
-| `Qwen2VLForConditionalGeneration` | Vision (Hugging Face implementation) | No | Yes |
-| `Qwen2_5_VLForConditionalGeneration` | Vision | Yes | Yes |
-| `Qwen3VLForConditionalGeneration`, `Qwen3VLMoeForConditionalGeneration` | Vision | Yes | Yes |
-| `Qwen3_5ForConditionalGeneration`, `Qwen3_5MoeForConditionalGeneration` | Vision | Yes | Yes |
-| `Qwen4ExpForConditionalGeneration` | Vision | Yes | Yes |
-| `Cosmos3ForConditionalGeneration` | Vision | Yes | Yes |
-| `DeepseekV41ForConditionalGeneration` | Vision | Not integrated | Not integrated |
-| `Glm5NextForConditionalGeneration` | Vision | Not integrated | Not integrated |
-| `KimiK25ForConditionalGeneration`, `KimiK3ForConditionalGeneration` | Vision | Not integrated | Not integrated |
-| `MiniCPMV4_6ForConditionalGeneration` | Vision | Not integrated | Not integrated |
-| `MiniMaxM3SparseForConditionalGeneration` | Vision | Not integrated | Not integrated |
-| `NemotronH_Nano_Omni_Reasoning_V3`, `NemotronH_Omni_Reasoning_V3` | Vision/audio, when present | Not integrated | Not integrated |
-| `Step3p7ForConditionalGeneration` | Vision | Not integrated | Not integrated |
-
-All enabled encoders must support the selected mode. Gemma4 checkpoints with an audio
-encoder therefore reject explicit encoder TP; Gemma4 Unified uses projections without
-separate encoder towers, and these projections are not TP-sharded. Gemma4 also lacks item
-scheduling, so shared encoder TP with LLM attention DP is unavailable even for vision-only
-checkpoints. DeepSeek-V4.1 currently uses unsharded vision and projector weights; its
-multimodal implementation does not imply encoder TP support.
-
-Qwen3.8-27B uses `Qwen3_5ForConditionalGeneration`, and Qwen3.8-Flash-Next uses
-`Qwen4ExpForConditionalGeneration`. Qwen3.8-2.4T-A95B is a text-only checkpoint.
-See [multimodal encoder parallelism](../features/parallel-strategy.md#multimodal-encoders)
-for configuration examples and execution restrictions, and
-[adding a multimodal model](../torch/adding_new_model.md#multimodal-encoder-parallelism)
-for the integration contract.
 
 # Visual Generation Models
 
