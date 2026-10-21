@@ -734,7 +734,31 @@ def _format_documented_values(
     return " or ".join(labels.get(value, str(value)) for value in sorted(values, key=str))
 
 
-def _documented_dense_constraints(profile: PostTransformProfile) -> str:
+# Constraint phrases of the public support table, keyed by registry values.
+# A profile that needs a new phrase adds it here rather than special-casing
+# its model type.
+_DOCUMENTED_SCOPES = {
+    PostTransformTransferScope.TARGET_MODEL: "dense {dtypes}",
+    PostTransformTransferScope.COMPLETE_MODEL: (
+        "dense {dtypes} vision-language model with its local vision encoder"
+    ),
+}
+_DOCUMENTED_ROPE_TYPES = {
+    frozenset({"default"}): "default",
+    frozenset({"mrope"}): "M-RoPE",
+}
+_DOCUMENTED_ROPE_FUSION = {
+    frozenset({True}): "fused RoPE",
+    frozenset({False}): "fused QK-norm/RoPE",
+}
+_DOCUMENTED_SLIDING_WINDOWS = {
+    None: "",
+    frozenset({"none"}): ", no sliding window",
+}
+
+
+def _documented_constraints(profile: PostTransformProfile) -> str:
+    """Render the support-table constraint text that a registry profile implies."""
     constraints = profile.runtime_constraints
     assert constraints.quant_algorithms == frozenset({"none"})
     assert constraints.kv_cache_quant_algorithms == frozenset({"none"})
@@ -745,11 +769,6 @@ def _documented_dense_constraints(profile: PostTransformProfile) -> str:
     assert constraints.attention_dp == frozenset({False})
     assert constraints.multi_node == frozenset({False})
     assert constraints.tied_word_embeddings == frozenset({False})
-    assert constraints.rope_types == frozenset({"default"})
-    qwen3_profile = profile.model_type == "qwen3"
-    assert constraints.rope_fusion == frozenset({not qwen3_profile})
-    mistral_profile = profile.model_type == "mistral"
-    assert constraints.sliding_windows == (frozenset({"none"}) if mistral_profile else None)
     assert constraints.moe_backends is None
     assert constraints.moe_tp_sizes is None
     assert constraints.moe_ep_sizes is None
@@ -766,10 +785,14 @@ def _documented_dense_constraints(profile: PostTransformProfile) -> str:
     attention_backends = _format_documented_values(constraints.attention_backends)
     tp_sizes = _format_documented_values(constraints.tp_sizes)
     pp_cp_sizes = _format_documented_values(constraints.pp_sizes)
-    rope_description = "default fused QK-norm/RoPE" if qwen3_profile else "default fused RoPE"
-    sliding_window_description = ", no sliding window" if mistral_profile else ""
+    model_description = _DOCUMENTED_SCOPES[profile.transfer_scope].format(dtypes=dtypes)
+    rope_description = (
+        f"{_DOCUMENTED_ROPE_TYPES[constraints.rope_types]} "
+        f"{_DOCUMENTED_ROPE_FUSION[constraints.rope_fusion]}"
+    )
+    sliding_window_description = _DOCUMENTED_SLIDING_WINDOWS[constraints.sliding_windows]
     return (
-        f"Single-node dense {dtypes}, unquantized weights and KV cache, "
+        f"Single-node {model_description}, unquantized weights and KV cache, "
         f"{attention_backends} attention, {rope_description}{sliding_window_description}, "
         f"untied embeddings, TP={tp_sizes}, PP/CP={pp_cp_sizes}, no LoRA, sparse attention, "
         "attention DP, speculative mode, or separately loaded draft model"
@@ -801,7 +824,7 @@ def test_public_support_table_matches_qualified_profile_registry() -> None:
             f"| `{profile.profile_id}` | `{profile.root_model_class.class_name}` | "
             f"`{profile.architecture}` / `{profile.model_type}` | {scope} | "
             f"{profile.protocol_version} | `{profile.transform_abi_id}` | "
-            f"{_documented_dense_constraints(profile)} |"
+            f"{_documented_constraints(profile)} |"
         )
         assert expected_row in table_rows
 
@@ -871,7 +894,21 @@ def _documented_names(text: str, start: str, end: str) -> set[str]:
     if begin < 0:
         pytest.fail(f"{doc} has no anchor {start!r} before {end!r}; update this test's anchors")
     enumeration = text[begin + len(start) : stop]
-    return {re.match(r"\w+", item).group() for item in re.split(r",? and |, ", enumeration)}
+    return {re.match(r"[\w.]+", item).group() for item in re.split(r",? and |, ", enumeration)}
+
+
+def _profile_family(profile: PostTransformProfile) -> str:
+    """Return the family that names a profile's donor/receiver rows, such as `qwen3_5`.
+
+    A profile ID names its family before `-for-`.
+    """
+    return profile.profile_id.split("-for-")[0]
+
+
+def _documented_family(profile: PostTransformProfile) -> str:
+    """Return the family name by which the doc refers to a profile, such as `Qwen3.5`."""
+    family = re.sub(r"For(?:CausalLM|ConditionalGeneration)$", "", profile.architecture)
+    return family.replace("_", ".")
 
 
 @pytest.mark.cpu_only
@@ -886,7 +923,7 @@ def test_mx_e2e_rows_and_ci_list_match_qualified_profile_registry() -> None:
     ci_case_ids = _l0_model_express_case_ids()
     expected_case_ids = set()
     for profile in ModelLoader._post_transform_profile_registry().profiles:
-        family = profile.profile_id.split("-for-causal-lm-")[0]
+        family = _profile_family(profile)
         for tp_size in (1, 2):
             case_id = f"{family}-bf16-tp{tp_size}"
             expected_case_ids.add(case_id)
@@ -914,16 +951,21 @@ def test_documentation_prose_matches_qualified_profile_registry() -> None:
     in the "Qualification Test" section.
     """
     profiles = ModelLoader._post_transform_profile_registry().profiles
-    families = {profile.architecture.removesuffix("ForCausalLM") for profile in profiles}
+    families = {_documented_family(profile) for profile in profiles}
+    text_only_families = {
+        _documented_family(profile)
+        for profile in profiles
+        if profile.transfer_scope is PostTransformTransferScope.TARGET_MODEL
+    }
     fused_rope_families = {
-        profile.architecture.removesuffix("ForCausalLM")
+        _documented_family(profile)
         for profile in profiles
         if profile.runtime_constraints.rope_fusion == frozenset({True})
     }
     documentation = _repository_text("docs/source/features/model-express.md")
     text = " ".join(documentation.split())
 
-    assert _documented_names(text, "The ", " profiles are text-only") == families
+    assert _documented_names(text, "The ", " profiles are text-only") == text_only_families
     assert (
         _documented_names(
             text,
@@ -940,8 +982,8 @@ def test_documentation_prose_matches_qualified_profile_registry() -> None:
         )
     ]
     cases = _mx_e2e_cases()
-    assert set(re.findall(r"\b[a-z][a-z0-9]*-bf16-tp\d+\b", qualification_test)) == set(cases)
-    assert set(re.findall(r"\bTRTLLM_MX_[A-Z0-9]+_MODEL\b", qualification_test)) == {
+    assert set(re.findall(r"\b[a-z][a-z0-9_]*-bf16-tp\d+\b", qualification_test)) == set(cases)
+    assert set(re.findall(r"\bTRTLLM_MX_[A-Z0-9_]+_MODEL\b", qualification_test)) == {
         row["model_env"] for row in cases.values()
     }
 

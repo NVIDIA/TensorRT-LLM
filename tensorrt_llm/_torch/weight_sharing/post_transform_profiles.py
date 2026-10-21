@@ -56,6 +56,13 @@ MISTRAL_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1 = "trtllm-mistral-dense-target-layout
 # tensors plus target-only receiver finalization. Phi3 checkpoints store both
 # projections pre-fused and the root splits them per TP rank while loading.
 PHI3_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1 = "trtllm-phi3-dense-target-layout-v1"
+# Stable contract for the unquantized Qwen3.5 dense vision-language root: the
+# vision tower's fused-QKV tensors, the gated-delta-net input projections in
+# their dense per-rank `[Q|K|V|Z]` and `[b|a]` row order, rank-interleaved
+# `conv1d` weights and fp32 `A_log`/`dt_bias`, gated fused-QKV attention with
+# Q/K norm state, fused gate-up MLP tensors, and complete-model receiver
+# finalization.
+QWEN3_5_DENSE_VL_POST_TRANSFORM_LAYOUT_ABI_V1 = "trtllm-qwen3_5-dense-vl-complete-layout-v1"
 _MISSING = object()
 
 

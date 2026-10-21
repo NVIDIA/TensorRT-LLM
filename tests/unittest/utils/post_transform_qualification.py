@@ -32,6 +32,7 @@ from tensorrt_llm._torch.weight_sharing import (
 ModelFactory = Callable[[], nn.Module]
 ModelQualifier = Callable[[nn.Module], PostTransformQualificationDecision]
 ReceiverPreparer = Callable[[nn.Module, nn.Module], None]
+ProducerLoader = Callable[[nn.Module], None]
 StateProbe = Callable[[nn.Module], object]
 OutputProbe = Callable[[nn.Module], object]
 
@@ -86,6 +87,11 @@ class PostTransformQualificationCase:
     `prepare_receiver` simulates installation of a producer's post-transform
     tensors when a family needs value-level coverage. A real MX donor/receiver
     test is still required before enabling a production profile.
+
+    `load_producer`, when set, runs the family's real checkpoint load path on
+    the producer before its full post-load walk. The receiver never loads, as
+    on a staged MX receiver, so the state and output probes then also cover
+    any state that only `load_weights` sets.
     """
 
     profile_id: str
@@ -95,6 +101,7 @@ class PostTransformQualificationCase:
     state_probes: tuple[tuple[str, StateProbe], ...]
     output_probes: tuple[tuple[str, OutputProbe], ...]
     prepare_receiver: ReceiverPreparer = copy_post_transform_parameters
+    load_producer: ProducerLoader | None = None
 
     def __post_init__(self) -> None:
         if not self.profile_id:
@@ -228,6 +235,8 @@ def assert_post_transform_lifecycle_equivalent(
     )
 
     transform_calls = _install_transform_call_recorders(receiver)
+    if case.load_producer is not None:
+        case.load_producer(producer)
     ModelLoader._walk_full_post_load(producer)
     ModelLoader._setup_aliases(receiver)
     case.prepare_receiver(producer, receiver)
