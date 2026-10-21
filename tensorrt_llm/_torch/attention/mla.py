@@ -17,6 +17,7 @@ import functools
 import math
 import os
 import weakref
+from contextlib import nullcontext
 from typing import Dict, Optional, cast
 
 import torch
@@ -967,7 +968,11 @@ class MLA(nn.Module):
             )
             return
 
-        with attn_metadata.mixed_precision_kv_staging(self.layer_idx):
+        if attn_metadata is None:  # backend-only unit tests mock the forward
+            staging = nullcontext()
+        else:
+            staging = attn_metadata.mixed_precision_kv_staging(self.layer_idx)
+        with staging:
             self._forward_impl(
                 position_ids,
                 hidden_states,
