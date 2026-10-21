@@ -298,6 +298,7 @@ def _runtime(moe, logits):
     runtime._shared_all_reduce = True
     runtime._reduce_routed_output = False
     runtime._defer_shared_allreduce = False
+    runtime._shared_gemms_can_lead = True
     runtime.moe_routed_event = None
     runtime.shared_expert_stream = torch.cuda.Stream()
     runtime.latent_down_stream = torch.cuda.Stream()
@@ -326,22 +327,28 @@ def test_shared_gemms_lead_routed_experts(monkeypatch, m):
     logits, bias = _logits(m, seed=80 + m)
     moe = _nvfp4_moe(moe_backend, _routing(bias))
     runtime = _runtime(moe, logits)
-    # m * 16 routed rows on the single rank: both sizes lead at a threshold of one row.
-    monkeypatch.setattr(modeling_kimi_linear, "_SHARED_GEMMS_LEAD_MIN_ROUTED_ROWS", 1)
-    assert runtime._shared_gemms_lead(m)
+    # m * 16 routed rows on the single rank: both sizes lead at a threshold of one row and
+    # neither at an unreachable one.
+    min_rows = {True: 1, False: 1 << 30}
+    monkeypatch.setattr(modeling_kimi_linear, "_SHARED_GEMMS_LEAD_MIN_ROUTED_ROWS", min_rows[True])
+    plan = runtime._front_plan(m)
+    assert plan.shared_first and plan.nvfp4_scale is not None and not plan.latent_down_nvfp4
 
     quantized_inputs = []
-    real_quantize = runtime._quantize_routed_input
+    real_quantize = moe.quantize_nvfp4_input
 
     def counting_quantize(latent):
         quantized_inputs.append(latent.shape[0])
         return real_quantize(latent)
 
-    monkeypatch.setattr(runtime, "_quantize_routed_input", counting_quantize)
+    monkeypatch.setattr(moe, "quantize_nvfp4_input", counting_quantize)
     hidden = (torch.randn((m, HIDDEN), device="cuda") * 0.5).to(torch.bfloat16)
     outputs = {}
     for lead in (False, False, True):
-        monkeypatch.setattr(runtime, "_shared_gemms_lead", lambda num_tokens, lead=lead: lead)
+        monkeypatch.setattr(
+            modeling_kimi_linear, "_SHARED_GEMMS_LEAD_MIN_ROUTED_ROWS", min_rows[lead]
+        )
+        assert runtime._front_plan(m).shared_first == lead
         quantized_inputs.clear()
         with torch.inference_mode(), with_multi_stream(True):
             routed, shared = runtime(hidden, return_parts=True)
@@ -357,6 +364,86 @@ def test_shared_gemms_lead_routed_experts(monkeypatch, m):
         assert torch.equal(outputs[True][0], outputs[False][0])
     else:
         _assert_same_rows(outputs[True][0], outputs[False][0], _local_counts(ids, 0, NUM_EXPERTS))
+
+
+@pytest.mark.parametrize("blocker", [None, "comm", "eplb", "router_weight_on_input", "chunked"])
+def test_nvfp4_input_scale_only_where_the_forward_takes_the_input_as_is(blocker):
+    """``ConfigurableMoE.nvfp4_input_scale`` declares an NVFP4 input only where the scheduler
+    takes it unchanged: no comm strategy, EPLB or router weight folded into the input, one chunk."""
+    from types import SimpleNamespace
+
+    from tensorrt_llm._torch.moe.fused_moe.configurable_moe import ConfigurableMoE
+
+    scale = torch.tensor(1.0)
+    moe = SimpleNamespace(
+        comm=object() if blocker == "comm" else None,
+        _using_load_balancer=lambda: blocker == "eplb",
+        apply_router_weight_on_input=blocker == "router_weight_on_input",
+        moe_max_num_tokens=4 if blocker == "chunked" else 64,
+        backend=SimpleNamespace(prequantized_nvfp4_input_scale=lambda: scale),
+    )
+    expected = scale if blocker is None else None
+    assert ConfigurableMoE.nvfp4_input_scale(moe, 8) is expected
+
+
+@cute_dsl
+@pytest.mark.parametrize("m", [1, 8, 16])
+def test_latent_down_nvfp4_output_feeds_routed_experts(monkeypatch, m):
+    """latent_down's NVFP4 epilogue output (routed only on SM107, forced here on any device the
+    low-M GEMM runs on) is the input the routed experts' own quantization makes of latent_down's
+    BF16 output at the same GEMM tactic: the same E2M1 codes and linear scale factors, and the
+    same routed output."""
+    from tensorrt_llm._torch.kernels.blackwell import fp8_block_scale_low_m_gemm
+    from tensorrt_llm._torch.models import modeling_kimi_linear
+    from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream
+    from tensorrt_llm._torch.utils import Fp4QuantizedTensor
+
+    linear_cls = modeling_kimi_linear._Fp8BlockScaleWeightReadLinear
+    in_features = 1024
+    logits, bias = _logits(m, seed=90 + m)
+    moe = _nvfp4_moe("CUTEDSL", _routing(bias))
+    runtime = _runtime(moe, logits)
+    monkeypatch.setattr(modeling_kimi_linear, "_SHARED_GEMMS_LEAD_MIN_ROUTED_ROWS", 1 << 30)
+    # The SM107 route's range; without a route the NVFP4 output runs the BF16 GEMM's tactic.
+    monkeypatch.setattr(modeling_kimi_linear, "_low_m_gemm_nvfp4_max_m", lambda n, k: 256)
+    # SM107 selects the low-M GEMM only for the measured K3 weight shapes; serve this one too.
+    monkeypatch.setattr(fp8_block_scale_low_m_gemm, "max_m_for", lambda n, k: 256)
+    gen = torch.Generator(device="cuda").manual_seed(m)
+    weight = torch.randn((HIDDEN, in_features), device="cuda", generator=gen) / in_features**0.5
+    down = linear_cls(*linear_cls.quantize_weight(weight.to(torch.bfloat16)), HIDDEN)
+    down.post_load_weights()
+    runtime.routed_expert_down_proj = down
+    runtime._routed_projection = lambda value, projection: projection(value)
+    hidden = (torch.randn((m, in_features), device="cuda", generator=gen) * 0.5).to(torch.bfloat16)
+
+    routed_inputs = []
+    real_forward = moe.forward
+
+    def recording_forward(x, *args, **kwargs):
+        routed_inputs.append(x)
+        return real_forward(x, *args, **kwargs)
+
+    monkeypatch.setattr(moe, "forward", recording_forward)
+    outputs = []
+    for epilogue in (True, False):
+        if not epilogue:
+            monkeypatch.setattr(down, "_nvfp4_out_max_m", 0)
+        plan = runtime._front_plan(m)
+        assert plan.latent_down_nvfp4 == epilogue and not plan.shared_first
+        with torch.inference_mode(), with_multi_stream(True):
+            routed, _ = runtime(hidden, return_parts=True)
+        torch.cuda.synchronize()
+        outputs.append(routed)
+
+    handed, latent = routed_inputs
+    assert isinstance(handed, Fp4QuantizedTensor) and not handed.is_sf_swizzled
+    assert latent.dtype == torch.bfloat16
+    expected = moe.quantize_nvfp4_input(latent)
+    assert handed.fp4_tensor.shape == expected.fp4_tensor.shape == (m, HIDDEN // 2)
+    assert torch.equal(handed.fp4_tensor, expected.fp4_tensor)
+    assert torch.equal(handed.scaling_factor.view(-1), expected.scaling_factor.view(-1))
+    ids = torch.ops.trtllm.noaux_tc_op(logits, bias, 1, 1, TOP_K, SCALE)[1]
+    _assert_same_rows(outputs[0], outputs[1], _local_counts(ids, 0, NUM_EXPERTS))
 
 
 @cute_dsl
@@ -390,7 +477,7 @@ def test_shared_expert_runs_beside_fc12_on_reserved_sms(monkeypatch, m):
     assert moe.backend.reserve_sms_for_concurrent_kernels(shared_sms) == shared_sms
     runtime._shared_sms = shared_sms
     monkeypatch.setattr(modeling_kimi_linear, "_SHARED_GEMMS_LEAD_MIN_ROUTED_ROWS", 1)
-    assert not runtime._shared_gemms_lead(m)
+    assert not runtime._front_plan(m).shared_first
 
     reserves = []
     real_reserved = cute_dsl_custom_ops.reserved_max_active_clusters

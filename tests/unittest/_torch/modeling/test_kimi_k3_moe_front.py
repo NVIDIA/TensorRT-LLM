@@ -47,11 +47,17 @@ class _SharedExperts(nn.Module):
 
 
 class _RoutedExperts:
-    """Stand-in routed experts: join ``input_ready_event``, return ``3 x + logits``."""
+    """Stand-in routed experts (BF16 input, no sorting routing kernel): join
+    ``input_ready_event``, return ``3 x + logits``."""
 
     all_reduce = None
     comm = None
-    backend = SimpleNamespace(has_nvfp4=False)
+
+    def nvfp4_input_scale(self, num_tokens):
+        return None
+
+    def routes_with_sort_tables(self, num_tokens):
+        return False
 
     def __call__(self, value, router_logits, all_rank_num_tokens=None, input_ready_event=None):
         if input_ready_event is not None:
@@ -84,6 +90,7 @@ def _runtime(log):
     runtime._shared_all_reduce = False
     runtime._reduce_routed_output = False
     runtime._defer_shared_allreduce = False
+    runtime._shared_gemms_can_lead = True
     runtime.moe_routed_event = None
     runtime.shared_expert_stream = torch.cuda.Stream()
     runtime.latent_down_stream = torch.cuda.Stream()

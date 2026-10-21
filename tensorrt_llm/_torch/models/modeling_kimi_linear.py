@@ -179,10 +179,11 @@ _KIMI_K3_MLA_DERIVED_PARAM_SUFFIXES = (
 # Checkpoint-native attention FP8 is independent of this lossy conversion.
 _KIMI_K3_FP8_WEIGHT_READ_MOE_MLP_ENV = "KIMI_K3_FP8_WEIGHT_READ_MOE_MLP"
 
+# The two token-count bounds of the MoE front's issue order (``KimiK3MoERuntime._front_plan``).
 # Expected routed rows per rank (tokens x top-k x local experts / experts) from which the routed
-# experts of a decode forward wait for the shared expert's GEMMs (``_shared_gemms_lead``).
+# experts wait for the shared expert's GEMMs.
 _SHARED_GEMMS_LEAD_MIN_ROUTED_ROWS = 80
-# Largest token count for which the router GEMM is issued before latent_down (``forward_parts``).
+# Largest token count for which the router GEMM is issued before latent_down.
 _ROUTER_FIRST_MAX_TOKENS = 64
 # SMs the shared expert's GEMMs keep to while they run beside routed experts whose backend leaves
 # that many SMs free of its persistent grid (``MoEImplBase.reserve_sms_for_concurrent_kernels``;
@@ -207,6 +208,21 @@ def _cublas_sm_limit(num_sms: int):
         yield
     finally:
         torch._C._set_sm_carveout_experimental(previous)
+
+
+class _MoEFrontPlan(NamedTuple):
+    """Issue order of one decode MoE front on the latent stream (``KimiK3MoERuntime._front_plan``).
+
+    ``router_first``: the router GEMM is issued before latent_down. ``shared_first``: the routed
+    experts wait for the shared expert's GEMMs. ``nvfp4_scale``: global scale of the NVFP4 input the
+    latent chain hands the routed experts (``None``: BF16). ``latent_down_nvfp4``: latent_down's
+    epilogue produces it (else the latent chain quantizes latent_down's output).
+    """
+
+    router_first: bool
+    shared_first: bool
+    nvfp4_scale: Optional[torch.Tensor]
+    latent_down_nvfp4: bool
 
 
 class KimiK3MoEGate(nn.Module):
@@ -1061,6 +1077,14 @@ def _rubin_mxfp8_is_available() -> bool:
     return get_sm_version() == 107 and IS_CUTLASS_DSL_RUBIN_AVAILABLE
 
 
+def _low_m_gemm_nvfp4_max_m(out_features: int, in_features: int) -> int:
+    """Largest token count for which the low-M GEMM emits the NVFP4 quantization of its output
+    on the current device (0: never)."""
+    from ..kernels.blackwell import fp8_block_scale_low_m_gemm
+
+    return fp8_block_scale_low_m_gemm.nvfp4_out_max_m_for(out_features, in_features)
+
+
 def _low_m_gemm_gated_applies(x: torch.Tensor, gate: torch.Tensor, out_features: int) -> bool:
     from ..kernels.blackwell import fp8_block_scale_low_m_gemm
 
@@ -1106,6 +1130,8 @@ class _Fp8BlockScaleWeightReadLinear(nn.Module):
         # Rows the low-M GEMM serves and the DeepGEMM-packed scale it reads; set at post-load.
         self._low_m = Fp8BlockScaleLowMGemmRange()
         self._low_m_weight_scale: Optional[torch.Tensor] = None
+        # Largest row count :meth:`forward_nvfp4` serves (0: never); set at post-load.
+        self._nvfp4_out_max_m = 0
 
     @property
     def has_fp8_qdq(self) -> bool:
@@ -1222,6 +1248,7 @@ class _Fp8BlockScaleWeightReadLinear(nn.Module):
             self._low_m_weight_scale = _low_m_gemm_scale_from_mxfp8(self.weight_scale, n, k)
         else:
             self._low_m, self._low_m_weight_scale = Fp8BlockScaleLowMGemmRange(), None
+        self._nvfp4_out_max_m = _low_m_gemm_nvfp4_max_m(n, k) if self._low_m.max_m else 0
 
     def forward_slice(self, x: torch.Tensor, start: int, end: int) -> torch.Tensor:
         self.prepare_output_slice(start, end)
@@ -1274,6 +1301,21 @@ class _Fp8BlockScaleWeightReadLinear(nn.Module):
                 fine_grained_m=True,
             )
         return out.reshape(out_shape)
+
+    def emits_nvfp4(self, num_rows: int) -> bool:
+        """Whether :meth:`forward_nvfp4` serves ``num_rows`` rows."""
+        return 1 <= num_rows <= self._nvfp4_out_max_m
+
+    def forward_nvfp4(
+        self, x: torch.Tensor, global_scale: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """``fp4_quantize`` (``global_scale``, 16-element groups, linear scales) of the
+        projection, from one low-M GEMM whose epilogue quantizes (bitwise the GEMM at the same
+        tactic followed by ``fp4_quantize``). Returns E2M1 codes ``uint8 [M, out / 2]`` and E4M3
+        scales ``uint8 [M * out / 16]``. For ``num_rows`` where :meth:`emits_nvfp4`."""
+        return torch.ops.trtllm.fp8_block_scale_low_m_gemm_nvfp4(
+            x.reshape(-1, x.shape[-1]), self.weight, self._low_m_weight_scale, global_scale
+        )
 
     def forward_gated(self, x: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
         """``forward(x * gate)``, bit for bit, for an output-gated projection.
@@ -1760,8 +1802,18 @@ class KimiK3MoERuntime(nn.Module):
         has_latent_stream = self.latent_down_stream is not None
         self.moe_latent_fork_event = torch.cuda.Event() if has_latent_stream else None
         self.moe_latent_ready_event = torch.cuda.Event() if has_latent_stream else None
-        # Shared GEMMs and the latent chain done (``_shared_gemms_lead``).
+        # Shared GEMMs and the latent chain done (``_MoEFrontPlan.shared_first``).
         self.moe_shared_gemm_event = torch.cuda.Event() if has_latent_stream else None
+        # The shared GEMMs can lead the routed experts (``_front_plan``) only as their own
+        # step on the shared stream, with the all-reduce following them there: not deferred
+        # behind a fused-comm MoE, and not fused into the down projection's GEMM.
+        shared_down = self.shared_experts.down_proj
+        self._shared_gemms_can_lead = (
+            has_latent_stream
+            and self.shared_expert_stream is not None
+            and not self._defer_shared_allreduce
+            and not (isinstance(shared_down, TrtllmLinear) and shared_down.use_fused_gemm_allreduce)
+        )
         # A persistent routed grid that leaves SMs free (CUTEDSL_FC12) runs beside the shared
         # expert, whose GEMMs keep to those SMs, instead of waiting for them. MoE modules and
         # backends outside the ``MoEImplBase`` contract do not offer it.
@@ -2057,40 +2109,66 @@ class KimiK3MoERuntime(nn.Module):
         routed_model_config._frozen = True
         return routed_model_config
 
-    def _shared_gemms_lead(self, num_tokens: int) -> bool:
-        """Whether this forward's routed experts run after the shared expert's GEMMs.
+    def _front_plan(self, num_tokens: int) -> _MoEFrontPlan:
+        """Issue order of a decode MoE front with the latent stream (multi-stream, i.e. CUDA
+        graphs), decided in this one place from what the routed experts and latent_down declare.
 
-        Routed by ``kimi_k3_routing`` (decode batches, no dispatch), the routing chain is short
-        enough that the persistent routed grid, which holds every SM, launches while the shared
-        expert's GEMMs or all-reduce are pending; those then wait for the whole grid. From
-        ``_SHARED_GEMMS_LEAD_MIN_ROUTED_ROWS`` expected routed rows per rank the routed experts
-        wait for the shared GEMMs instead, on an NVFP4 input the latent chain quantized, and
-        the shared all-reduce follows its GEMMs on the shared stream. Same kernels on the same
-        inputs. Needs the latent and shared-expert streams; a GEMM fused with its all-reduce
-        cannot be split. Not where the shared expert runs beside the routed grid on SMs that grid
-        leaves free (``_shared_sms``).
+        - The router GEMM goes before latent_down up to ``_ROUTER_FIRST_MAX_TOKENS`` tokens.
+          The graph edges are the same either way; the creation order decides which of the two
+          independent GEMMs launches first when the MoE input's producer releases them. At
+          decode sizes each fills most of the SMs, so the second one runs on what the first
+          leaves, and the routing gates the routed experts. (Which router kernel computes the
+          logits is the gate's choice, see ``KimiK3MoEGate``.)
+        - When the routed experts take an NVFP4 input as is (``nvfp4_input_scale``), latent_down
+          emits it from its GEMM epilogue where the projection serves this many rows
+          (``_Fp8BlockScaleWeightReadLinear.emits_nvfp4``).
+        - When the routing kernel also writes the experts' ``moe_sort`` tables
+          (``routes_with_sort_tables``), the routing chain is short enough that the persistent
+          routed grid, which holds every SM, launches while the shared expert's GEMMs or
+          all-reduce are pending; those then wait for the whole grid. From
+          ``_SHARED_GEMMS_LEAD_MIN_ROUTED_ROWS`` expected routed rows per rank the routed
+          experts therefore wait for the shared GEMMs, on an NVFP4 input the latent chain
+          produced, and the shared all-reduce follows its GEMMs on the shared stream. Below
+          that the wait costs more than it saves. A routed grid that leaves SMs free
+          (``_shared_sms``) instead runs beside the shared expert, never after it.
+        Same kernels on the same inputs in every order.
         """
-        if self.shared_expert_stream is None or self._defer_shared_allreduce or self._shared_sms:
-            return False
-        down = self.shared_experts.down_proj
-        if isinstance(down, TrtllmLinear) and down.use_fused_gemm_allreduce:
-            return False
-        rows = num_tokens * self.top_k * self.experts_per_rank // self.num_experts
         moe = self.routed_experts
-        if (
-            rows < _SHARED_GEMMS_LEAD_MIN_ROUTED_ROWS
-            or moe.comm is not None
-            or not moe.backend.has_nvfp4
-        ):
-            return False
-        from ..moe.kernels.blackwell import kimi_k3_routing
+        nvfp4_scale = moe.nvfp4_input_scale(num_tokens)
+        down = self.routed_expert_down_proj
+        return _MoEFrontPlan(
+            router_first=num_tokens <= _ROUTER_FIRST_MAX_TOKENS,
+            shared_first=(
+                self._shared_gemms_can_lead
+                and not self._shared_sms
+                and nvfp4_scale is not None
+                and num_tokens * self.top_k * self.experts_per_rank // self.num_experts
+                >= _SHARED_GEMMS_LEAD_MIN_ROUTED_ROWS
+                and moe.routes_with_sort_tables(num_tokens)
+            ),
+            nvfp4_scale=nvfp4_scale,
+            latent_down_nvfp4=(
+                nvfp4_scale is not None
+                and isinstance(down, _Fp8BlockScaleWeightReadLinear)
+                and down.emits_nvfp4(num_tokens)
+            ),
+        )
 
-        return num_tokens <= kimi_k3_routing.MAX_M
-
-    def _quantize_routed_input(self, latent: torch.Tensor) -> Fp4QuantizedTensor:
-        """The routed experts' NVFP4 input, quantized like their ``quantize_input``."""
-        x_fp4, x_sf = self.routed_experts.backend.quantize_input(latent, post_quant_comm=False)
-        return Fp4QuantizedTensor(x_fp4, x_sf, is_sf_swizzled=False)
+    def _latent_chain(
+        self, hidden_states: torch.Tensor, plan: _MoEFrontPlan
+    ) -> torch.Tensor | Fp4QuantizedTensor:
+        """latent_down and, as ``plan`` says, the routed experts' NVFP4 quantization."""
+        if plan.latent_down_nvfp4:
+            codes, scales = self.routed_expert_down_proj.forward_nvfp4(
+                hidden_states, plan.nvfp4_scale
+            )
+            return Fp4QuantizedTensor(codes, scales, is_sf_swizzled=False)
+        latent = self._routed_projection(hidden_states, self.routed_expert_down_proj)
+        if plan.shared_first:
+            # Quantized here, the routed input waits for neither the routing nor the shared
+            # expert.
+            return self.routed_experts.quantize_nvfp4_input(latent)
+        return latent
 
     def _issue_shared_gemms(self, identity: torch.Tensor) -> torch.Tensor:
         """The shared expert's GEMMs, without their all-reduce, on the shared stream after the
@@ -2136,40 +2214,29 @@ class KimiK3MoERuntime(nn.Module):
                 hidden_states, self.gate.weight, self.routed_expert_down_proj.weight
             )
         else:
-            shared_first = False
+            plan = None
             router_logits = None
             if (
                 self.latent_down_stream is not None
                 and do_multi_stream()
                 and not torch.compiler.is_compiling()
             ):
-                shared_first = self._shared_gemms_lead(hidden_states.shape[0])
+                plan = self._front_plan(hidden_states.shape[0])
                 # Forked ahead of the router GEMM: the latent chain needs only
                 # hidden_states.
                 self.moe_latent_fork_event.record()
-                if hidden_states.shape[0] <= _ROUTER_FIRST_MAX_TOKENS:
-                    # Same graph edges either way; issued first, the router GEMM is launched
-                    # first once the MoE input is ready. At decode sizes it and latent_down's
-                    # GEMM each fill most of an SM, so the one launched second runs on the SMs
-                    # the other leaves; the routing gates the routed experts, so the router
-                    # goes first.
+                if plan.router_first:
                     router_logits = self.gate.compute_logits(hidden_states)
                 with torch.cuda.stream(self.latent_down_stream):
                     self.moe_latent_fork_event.wait()
-                    early_routed_in = self._routed_projection(
-                        hidden_states, self.routed_expert_down_proj
-                    )
-                    if shared_first:
-                        # Quantized here, the routed input waits for neither the
-                        # routing nor the shared expert.
-                        early_routed_in = self._quantize_routed_input(early_routed_in)
+                    early_routed_in = self._latent_chain(hidden_states, plan)
                     self.moe_latent_ready_event.record()
                 # No record_stream (under graph capture it holds every layer's
                 # blocks until capture ends): both tensors are read on main only
                 # after the join, and later work on this stream forks from main.
             if router_logits is None:
                 router_logits = self.gate.compute_logits(hidden_states)
-            if shared_first:
+            if plan is not None and plan.shared_first:
                 shared_partial = self._issue_shared_gemms(identity)
         moe_all_reduce = self.routed_experts.all_reduce if self._reduce_routed_output else None
         overlap_shared_allreduce = (
