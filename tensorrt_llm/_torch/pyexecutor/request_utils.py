@@ -446,6 +446,7 @@ class RequestBroadcaster:
             new_requests, "py_conversation_params", include_none=True
         )
         py_lora_path = collect_py_objects_from_requests(new_requests, "py_lora_path")
+        py_lora_ckpt_source = collect_py_objects_from_requests(new_requests, "py_lora_ckpt_source")
 
         return tuple(
             filter(
@@ -458,6 +459,7 @@ class RequestBroadcaster:
                     py_disaggregated_params,
                     py_conversation_params,
                     py_lora_path,
+                    py_lora_ckpt_source,
                 ],
             )
         )
