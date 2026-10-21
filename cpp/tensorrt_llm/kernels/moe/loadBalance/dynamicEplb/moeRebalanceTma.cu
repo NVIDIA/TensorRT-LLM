@@ -752,8 +752,8 @@ __global__ void __launch_bounds__(512, 1) halo_q_tma_fused_kernel(FusedScheduler
     tensorrt_llm::kernels::halo_q_scheduler_body<FixedEp, FixedExperts, FixedHelpers>(scheduler.routes,
         scheduler.out_slots, scheduler.out_ids, scheduler.out_levels, scheduler.out_owners, scheduler.peer_bases,
         scheduler.status, scheduler.partial, scheduler.route_aux, scheduler.grid_sync, scheduler.plan,
-        scheduler.route_prefix, nullptr, scheduler.ep, scheduler.experts, scheduler.helpers, scheduler.local_rank,
-        scheduler.route_capacity, static_cast<int>(gridDim.x), 0, scheduler.spin_cycles, 0, 0, 0, scheduler.capacity,
+        scheduler.route_prefix, scheduler.ep, scheduler.experts, scheduler.helpers, scheduler.local_rank,
+        scheduler.route_capacity, static_cast<int>(gridDim.x), scheduler.spin_cycles, scheduler.capacity,
         scheduler.route_count);
     // Orders every thread's scheduler writes before thread 0's release.
     __syncthreads();
@@ -1246,10 +1246,10 @@ int megamoe_tma_copy_submit_fused(MegamoeTmaCopyState* state,
     auto const& d = state->direct;
     // The copy reads the bound scheduler outputs, so the scheduler must write exactly those.
     if (!state->direct_bound || scheduler.ctas != c.sms || scheduler.threads != kFusedThreads
-        || scheduler.planChannel != nullptr || scheduler.outIds != d.ids || scheduler.outLevels != d.levels
-        || scheduler.outOwners != d.owners || scheduler.planWorkspace != d.workspace || scheduler.status != d.status
-        || scheduler.gridSync != d.grid_sync || scheduler.ep != d.config.world
-        || scheduler.experts != d.config.global_experts || scheduler.helpers != d.config.helper_count)
+        || scheduler.outIds != d.ids || scheduler.outLevels != d.levels || scheduler.outOwners != d.owners
+        || scheduler.planWorkspace != d.workspace || scheduler.status != d.status || scheduler.gridSync != d.grid_sync
+        || scheduler.ep != d.config.world || scheduler.experts != d.config.global_experts
+        || scheduler.helpers != d.config.helper_count)
         return cudaErrorInvalidValue;
     int device = -1;
     cudaError_t error = cudaGetDevice(&device);
