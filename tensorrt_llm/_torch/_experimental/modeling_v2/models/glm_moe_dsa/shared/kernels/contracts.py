@@ -103,7 +103,7 @@ ATTENTION_TAIL_PDL_RULE = (
 )
 
 # Physical form of the routed_moe contract's unfinalized tuple as routed_moe returns it.
-ROUTED_MOE_TOKEN_MAJOR_RULE = (
+ROUTED_MOE_UNFINALIZED_LAYOUT_RULE = (
     "A routed-MoE package may return the unfinalized tuple in token-major "
     "form: fc2_output[R*8,6144] BF16 whose row t*8+k holds token t's k-th "
     "expert output (row pitch 6144 elements), expert scales [R,8] BF16 with "
@@ -126,7 +126,7 @@ POST_MOE_HOP_ROUTED_INPUT_RULE = (
     "rank that disagrees on the mode, the buffers or the compile keeps every "
     "rank on the native seam. Modes: row = finalized rows [R,6144] BF16; "
     "identity = token-major raw rows [R*8,6144] BF16 and scales [R,8] "
-    "(ROUTED_MOE_TOKEN_MAJOR_RULE); fp32 = an FP32 accumulator [R,6144] that is "
+    "(ROUTED_MOE_UNFINALIZED_LAYOUT_RULE); fp32 = an FP32 accumulator [R,6144] that is "
     "zero when routed_moe's kernel starts, to which routed_moe adds the eight weighted rows "
     "of a token with atomic FP32 adds (order run-to-run nondeterministic), "
     "and whose rows the hop clears after reading them. routed_moe never reuses a "
@@ -217,7 +217,7 @@ CONTRACTS = {
             "or (fc2_output, expert_scale_factor, expanded_idx_to_permuted_idx)",
             "or the post_moe_hop hop's routed-input buffer (routed_moe_into_hop)",
         ),
-        (ROUTED_MOE_TOKEN_MAJOR_RULE, POST_MOE_HOP_ROUTED_INPUT_RULE),
+        (ROUTED_MOE_UNFINALIZED_LAYOUT_RULE, POST_MOE_HOP_ROUTED_INPUT_RULE),
     ),
     "post_moe_hop": Contract(
         "post-MoE hop",
