@@ -39,8 +39,7 @@ have no separate client generation observation. Both populate the existing
 `d_*_generation` fields; server timings under `timings` are diagnostic only.
 
 Historical server-generation baselines are not interchangeable with client timing.
-Reconciling those baselines is separate work; this adapter does not filter or
-rewrite history, change thresholds, or remove the Flux waiver.
+Reconciling those baselines is separate work.
 
 ## Match Keys
 
