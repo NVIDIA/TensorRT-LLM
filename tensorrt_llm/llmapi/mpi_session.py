@@ -983,6 +983,8 @@ class RemoteMpiCommSessionServer():
             # Let exceptions reach their futures even when a peer is stuck.
             # The server gates the next batch on completion of all futures.
 
+    SHUTDOWN_ACK = "shutdown-ack"
+
     @staticmethod
     def _close_global_comm_executor(
             grace: float = 60.0,
@@ -1087,7 +1089,7 @@ class RemoteMpiCommSessionServer():
                     self._close_global_comm_executor(grace=remaining,
                                                      abort=self.session.abort)
 
-    def serve(self):
+    def serve(self) -> None:
         """Handle completions and control messages without waiting on a rank.
 
         All socket operations run here, never in executor callbacks. Normal
@@ -1175,18 +1177,18 @@ class RemoteMpiCommSessionServer():
                     if time.monotonic() >= stop_deadline:
                         raise RuntimeError(
                             "Remote MPI shutdown deadline expired")
-                    # Preserve tasks submitted before stop, but bound the whole
-                    # drain so a wedged rank cannot strand server teardown.
-                    time.sleep(0.1)
-                    continue
+                    # Keep servicing reconnecting stop clients while the
+                    # original shutdown deadline bounds the worker drain.
 
                 # Keep receiving stop requests even while workers are stuck.
                 # Other requests wait until every future in the batch is done.
                 if self.queue.poll(0.1):
                     message = self.queue.get()
                     if message is None:
-                        stop_deadline = time.monotonic() + grace
-                    elif not async_failed:
+                        self.queue.put_noblock(self.SHUTDOWN_ACK, retry=2)
+                        if stop_deadline is None:
+                            stop_deadline = time.monotonic() + grace
+                    elif stop_deadline is None and not async_failed:
                         queued_tasks.append(message)
         finally:
             try:

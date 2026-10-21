@@ -290,7 +290,6 @@ def test_worker_publishes_identities_before_backend_construction(monkeypatch):
         result_queue_addr=("result", b"key"),
     )
     worker_module.worker_main(
-        engine=object(),
         worker_queues=worker_queues,
         log_level=worker_module.logger.level,
         worker_cls=_FailingWorker,
@@ -307,7 +306,6 @@ def test_worker_publishes_identities_before_backend_construction(monkeypatch):
     init_status_queue.succeeds = False
     with pytest.raises(RuntimeError, match="Failed to deliver worker process identities to proxy"):
         worker_module.worker_main(
-            engine=object(),
             worker_queues=worker_queues,
             log_level=worker_module.logger.level,
             worker_cls=_FailingWorker,

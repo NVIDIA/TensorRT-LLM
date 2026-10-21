@@ -4,7 +4,9 @@
 """Control-loop and owner-teardown regressions; real MPI coverage is separate."""
 
 import threading
+import time
 from collections import deque
+from collections.abc import Callable
 from concurrent.futures import CancelledError, Future
 from types import SimpleNamespace
 from unittest.mock import Mock, call
@@ -31,21 +33,28 @@ def _task():
 
 
 class _Queue:
-    def __init__(self, messages, on_poll=None):
+    def __init__(
+        self,
+        messages: list[mpi.RemoteTask | None],
+        on_poll: Callable[["_Queue"], None] | None = None,
+    ) -> None:
         self.messages = deque(messages)
         self.sent = []
+        self.acknowledgments: list[str] = []
         self.socket = Mock()
         self.closed = False
         self.on_poll = on_poll
         self.thread_ids = set()
         self.polls = 0
 
-    def poll(self, timeout):
+    def poll(self, timeout: float) -> bool:
         self.thread_ids.add(threading.get_ident())
         self.polls += 1
         assert self.polls < 100, "server failed to make progress"
         if self.on_poll:
             self.on_poll(self)
+        elif not self.messages:
+            time.sleep(timeout)
         return bool(self.messages)
 
     def get(self):
@@ -55,6 +64,10 @@ class _Queue:
     def put(self, message):
         self.thread_ids.add(threading.get_ident())
         self.sent.append(message)
+
+    def put_noblock(self, message: str, *, retry: int) -> None:
+        self.thread_ids.add(threading.get_ident())
+        self.acknowledgments.append(message)
 
     def close(self):
         self.closed = True
@@ -84,7 +97,7 @@ def test_failed_task_publishes_without_a_final_collective(monkeypatch):
     barrier.assert_called_once()
 
 
-def test_stop_is_processed_while_all_futures_are_pending(monkeypatch):
+def test_stop_is_processed_while_all_futures_are_pending(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(mpi, "_mgmn_shutdown_grace_seconds", lambda: 0.01)
     queue = _Queue([mpi.RemoteTask(_task, (), {}), None])
     server = _server(queue, [[Future(), Future()]])
@@ -92,7 +105,30 @@ def test_stop_is_processed_while_all_futures_are_pending(monkeypatch):
         server.serve()
     server.session.submit.assert_called_once()
     server._shutdown_session.assert_called_once_with(0)
+    assert queue.acknowledgments == [mpi.RemoteMpiCommSessionServer.SHUTDOWN_ACK]
     assert queue.closed
+
+
+def test_repeated_stop_is_acknowledged_without_extending_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = [100.0]
+    monkeypatch.setattr(mpi.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(mpi, "_mgmn_shutdown_grace_seconds", lambda: 3.0)
+
+    def advance(queue: _Queue) -> None:
+        now[0] += 1
+        if queue.polls >= 2:
+            queue.messages.append(None)
+
+    queue = _Queue([mpi.RemoteTask(_task, (), {})], on_poll=advance)
+    server = _server(queue, [[Future(), Future()]])
+    with pytest.raises(RuntimeError, match="shutdown deadline expired"):
+        server.serve()
+    assert now[0] == 105.0
+    assert queue.acknowledgments == [mpi.RemoteMpiCommSessionServer.SHUTDOWN_ACK] * 4
+    server.session.submit.assert_called_once()
+    server._shutdown_session.assert_called_once_with(0)
 
 
 @pytest.mark.parametrize("peer_fails", [False, True], ids=["stuck-peer", "all-failed"])

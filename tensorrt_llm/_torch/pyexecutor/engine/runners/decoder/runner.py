@@ -424,7 +424,6 @@ class DecoderRunner(ScheduledModelRunner):
             dynamic_draft_len_mapping=self._dynamic_draft_len_mapping,
             max_num_tokens=self._config.max_num_tokens,
             use_mrope=self._config.use_mrope,
-            original_max_draft_len=self._config.original_max_draft_len,
             original_max_total_draft_tokens=self._config.original_max_total_draft_tokens,
             enable_attention_dp=self._config.enable_attention_dp,
             is_encoder_decoder=False,
