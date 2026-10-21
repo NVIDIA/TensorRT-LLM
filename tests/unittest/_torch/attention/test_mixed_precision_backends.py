@@ -771,6 +771,8 @@ def test_staging_allocation_follows_rank_geometry(tp_size, attention_dp, heads_p
         # and reused by later metadata objects (the final engine after profiling).
         blocks = get_memory_buffers().buffers["mixed_kv_staging"]
         assert any(b.is_reserved and b.buffer.data_ptr() == staging.data_ptr() for b in blocks)
+        # Both layers draw from the same pool pair, so they share one page table per batch.
+        assert view.page_tables[1].data_ptr() == view.page_tables[0].data_ptr()
         again = make_metadata().mixed_precision_staging
         assert again.get_buffers(0).data_ptr() == staging.data_ptr()
         assert len(get_memory_buffers().buffers["mixed_kv_staging"]) == len(blocks)

@@ -64,6 +64,17 @@ class MixedPrecisionKVStaging:
             layer_idx: (Buffers._view_as(storage, shape, high.dtype), low, high)
             for layer_idx, (shape, low, high) in pools.items()
         }
+        # Layers that draw from the same two pools have identical page tables, so
+        # each batch builds one table per pool pair and every layer shares it.
+        self.table_owner: Dict[int, int] = {}
+        owners: Dict[Tuple[int, int], int] = {}
+        for layer_idx in self.pools:
+            local = manager.layer_offsets[layer_idx]
+            key = tuple(
+                int(manager.impl.get_layer_group_id(layer))
+                for layer in (local, manager.high_layers[local])
+            )
+            self.table_owner[layer_idx] = owners.setdefault(key, layer_idx)
         # Cache manager interface read by the attention backends.
         self.layer_offsets = {layer: layer for layer in self.pools}
         self.max_attention_window_vec = (None,) * (max(self.pools) + 1)
@@ -94,7 +105,11 @@ class MixedPrecisionKVStaging:
         max_pages = -(-self.max_seq_len // self.block_size)
         self.page_tables = {}
         for layer_idx in self.pools:
-            page_tables = manager.get_mixed_precision_page_tables(request_ids, layer_idx)
+            owner = self.table_owner[layer_idx]
+            if owner in self.page_tables:
+                self.page_tables[layer_idx] = self.page_tables[owner]
+                continue
+            page_tables = manager.get_mixed_precision_page_tables(request_ids, owner)
             tables = torch.full(
                 (2, batch, max_pages), -1, dtype=torch.int32, pin_memory=prefer_pinned()
             )
@@ -105,7 +120,7 @@ class MixedPrecisionKVStaging:
             self.page_tables[layer_idx] = buffers.get_buffer(
                 (2, self.rows, max_pages),
                 torch.int32,
-                f"mixed_page_tables_{layer_idx}",
+                f"mixed_page_tables_{owner}",
                 capture_graph,
             )[:, :batch]
             self.page_tables[layer_idx].copy_(tables, non_blocking=True)
