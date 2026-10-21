@@ -16,8 +16,7 @@ The following is a table of supported models for the PyTorch backend:
 | `DeepseekV41ForCausalLM`            | DeepSeek-V4.1 (text decoder)       | —                                          |
 | `DeepseekV41ForConditionalGeneration` | DeepSeek-V4.1                    | —                                          |
 | `Exaone4ForCausalLM`                 | EXAONE 4.0                         | `LGAI-EXAONE/EXAONE-4.0-32B`                 |
-| `ExaoneMoeForCausalLM`               | K-EXAONE                           | `LGAI-EXAONE/K-EXAONE-236B-A23B`             |
-| `ExaoneMoeForCausalLM`               | K-EXAONE 2.0                       | `LGAI-EXAONE/K-EXAONE-2.0-750B-A37B`         |
+| `ExaoneMoeForCausalLM`               | K-EXAONE, K-EXAONE 2.0             | `LGAI-EXAONE/K-EXAONE-236B-A23B`, `LGAI-EXAONE/K-EXAONE-2.0-750B-A37B` |
 | `Gemma3ForCausalLM`                  | Gemma 3                            | `google/gemma-3-1b-it`                       |
 | `Gemma4ForConditionalGeneration`     | Gemma 4                            | `google/gemma-4-E2B-it`, `google/gemma-4-E4B-it`, `google/gemma-4-26B-A4B-it`, `google/gemma-4-31B-it` |
 | `Gemma4UnifiedForConditionalGeneration` | Gemma 4 12B Unified (encoder-free) | `google/gemma-4-12B`, `google/gemma-4-12B-it`              |
