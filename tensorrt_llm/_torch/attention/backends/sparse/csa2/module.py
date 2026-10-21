@@ -112,8 +112,10 @@ class DeepseekV41Attention(nn.Module):
             if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in (
                 (10, 0),
                 (10, 3),
+                (12, 0),
+                (12, 1),
             ):
-                raise ValueError("CSA2 native MXFP8 projections require SM100/SM103")
+                raise ValueError("CSA2 native MXFP8 projections require SM100/SM103/SM120/SM121")
             if not hasattr(torch.ops.trtllm, "mxfp8_mxfp8_gemm"):
                 raise RuntimeError("CSA2 native MXFP8 GEMM is not compiled")
             quant_config = QuantConfig(quant_algo=QuantAlgo.MXFP8)

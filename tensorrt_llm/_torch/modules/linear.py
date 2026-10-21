@@ -3360,6 +3360,18 @@ def _mxfp8_cutlass_op_available() -> bool:
                    ) and torch.cuda.get_device_capability()[0] >= 10
 
 
+def mxfp8_gemm_backend_override() -> Optional[str]:
+    """Return the fixed MXFP8 GEMM backend, or None to let the engine choose.
+
+    ``TRTLLM_MXFP8_GEMM_BACKEND`` takes precedence. Outside the SM100 family
+    the native GEMM is not compiled, so FlashInfer is the only backend.
+    """
+    backend = os.environ.get("TRTLLM_MXFP8_GEMM_BACKEND")
+    if backend is None and _mxfp8_cutlass_op_available() and not is_sm_100f():
+        backend = "flashinfer"
+    return backend
+
+
 _FLASHINFER_MXFP8_AUTOTUNE_ACTIVE = ContextVar(
     "flashinfer_mxfp8_autotune_active", default=False)
 _FLASHINFER_MXFP8_DECODE_GRAPH_CAPTURE_ACTIVE = ContextVar(
@@ -3420,7 +3432,7 @@ class MXFP8LinearMethod(LinearMethodBase):
     def __init__(self) -> None:
         super().__init__()
         self.use_cutlass = _mxfp8_cutlass_op_available()
-        self.backend = os.environ.get("TRTLLM_MXFP8_GEMM_BACKEND", "trtllm")
+        self.backend = mxfp8_gemm_backend_override() or "trtllm"
         # Only PyTorchModelEngine owns the startup tuning lifecycle. Keep
         # standalone modules and engine paths that skip warmup (for example,
         # Helix CP) on the direct native op instead of leaving Python
@@ -3483,7 +3495,7 @@ class MXFP8LinearMethod(LinearMethodBase):
 
     def enable_flashinfer_auto(self) -> bool:
         """Enable graph-only FlashInfer dispatch unless the user overrode it."""
-        if "TRTLLM_MXFP8_GEMM_BACKEND" in os.environ:
+        if mxfp8_gemm_backend_override() is not None:
             return self.backend == "auto"
         if not self._load_flashinfer(required=False):
             return False
