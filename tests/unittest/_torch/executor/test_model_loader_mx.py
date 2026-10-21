@@ -927,7 +927,7 @@ def test_mx_e2e_rows_and_ci_list_match_qualified_profile_registry() -> None:
         for tp_size in (1, 2):
             case_id = f"{family}-bf16-tp{tp_size}"
             expected_case_ids.add(case_id)
-            assert cases[case_id] == {
+            expected_row = {
                 "model_env": f"TRTLLM_MX_{family.upper()}_MODEL",
                 "default_model_subdir": cases[f"{family}-bf16-tp1"]["default_model_subdir"],
                 "repository_cache_prefix": f"models--trtllm-mx-e2e--{family}-tp{tp_size}",
@@ -935,6 +935,10 @@ def test_mx_e2e_rows_and_ci_list_match_qualified_profile_registry() -> None:
                 # The donor and the receiver each hold one TP group.
                 "min_devices": 2 * tp_size,
             }
+            if profile.transfer_scope is PostTransformTransferScope.COMPLETE_MODEL:
+                # A complete-model profile carries a vision encoder, so its rows probe with images.
+                expected_row["probe"] = "image"
+            assert cases[case_id] == expected_row
             assert case_id in ci_case_ids[2 * tp_size]
 
     assert set(cases) == expected_case_ids
