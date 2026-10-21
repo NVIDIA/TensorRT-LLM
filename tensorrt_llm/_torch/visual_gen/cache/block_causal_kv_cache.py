@@ -184,6 +184,10 @@ class BlockCausalKVCacheManager(KVCacheManagerV2):
     inside it: the pinned prefix, the sliding window, the staged tokens (written by
     forwards, not yet committed) and the causal blocks' private pages.
 
+    One instance is one pool holding one open rollout at a time, batch size 1.
+    Several streams (for example the two branches of classifier-free guidance) take
+    one instance each.
+
     Terms, used the same way in this cache, its attention backends and its kernels.
     "Block" alone is never used: in the LLM code it means a page.
 
