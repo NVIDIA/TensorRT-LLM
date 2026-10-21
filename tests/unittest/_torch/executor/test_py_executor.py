@@ -2137,7 +2137,7 @@ def test_nonzero_pp_rank_prepares_snapshot_points_before_local_schedule(
 
     executor = object.__new__(PyExecutor)
     executor._is_kv_manager_v2 = False
-    executor.dist = Mock(pp_rank=1, rank=1)
+    executor.dist = Mock(pp_rank=1, rank=1, is_first_pp_rank=False)
     executor.device_id = 0
     profiler = MagicMock()
     profiler.__enter__.return_value = Mock()
@@ -2182,6 +2182,74 @@ def test_nonzero_pp_rank_prepares_snapshot_points_before_local_schedule(
     ]
 
 
+@pytest.mark.parametrize(
+    ("rank", "is_first_pp_rank", "enable_attention_dp", "schedules_batch"),
+    [
+        (0, True, False, True),
+        # A TP rank receives the batch rank 0 scheduled.
+        (1, True, False, False),
+        # Each first-stage rank of an attention-DP group schedules its own batch.
+        (1, True, True, True),
+        # A later stage receives the batch of the stage before it.
+        (3, False, True, False),
+    ],
+    ids=["rank0", "tp-first-stage", "adp-first-stage", "adp-later-stage"],
+)
+def test_each_pp_rank_schedules_once_per_iteration(
+    monkeypatch, rank, is_first_pp_rank, enable_attention_dp, schedules_batch
+):
+    """Scheduler state that advances per pass, such as a prefix wait's budget,
+    must advance in step on every PP rank. A rank that scheduled the batch
+    itself must not run its scheduler again; every other rank runs it once."""
+
+    class StopAfterSchedule(RuntimeError):
+        pass
+
+    executor = object.__new__(PyExecutor)
+    executor._is_kv_manager_v2 = True
+    executor._pp_rebalance_drain_iters = None
+    executor._can_pause_for_rebalance = Mock(return_value=False)
+    executor.enable_attention_dp = enable_attention_dp
+    executor.dist = Mock(rank=rank, pp_rank=rank // 2, tp_size=2, is_first_pp_rank=is_first_pp_rank)
+    executor.device_id = 0
+    profiler = MagicMock()
+    profiler.__enter__.return_value = Mock()
+    executor._profiler = Mock(return_value=profiler)
+    executor.hang_detector = MagicMock()
+    executor.enable_iter_perf_stats = False
+    executor._fetch_and_activate_new_requests = Mock(return_value=[])
+    executor.is_shutdown = False
+    executor._handle_control_request = Mock()
+    executor.kv_cache_transceiver = None
+    executor._pad_attention_dp_dummy_request = Mock()
+    executor._pp_retry_until_can_schedule = Mock()
+    executor._mm_encoder_item_scheduling_enabled = False
+    executor._terminate_recompute_paused_requests = Mock(side_effect=StopAfterSchedule)
+    executor.active_requests = [Mock()]
+    executor.inflight_req_ids = set()
+    executor.kv_cache_manager = Mock()
+    executor.scheduler = Mock()
+
+    def schedule_and_propagate(microbatch_id):
+        if executor._pp_rank_schedules():
+            # PyExecutor._schedule runs the scheduler.
+            executor.scheduler.schedule_request(executor.active_requests, executor.inflight_req_ids)
+        return ScheduledRequests(), [], 0, False
+
+    executor._pp_schedule_and_propagate = schedule_and_propagate
+
+    monkeypatch.setattr("tensorrt_llm._torch.pyexecutor.py_executor.torch.cuda.set_device", Mock())
+    monkeypatch.setattr("tensorrt_llm._torch.pyexecutor.py_executor.cudart.cudaSetDevice", Mock())
+    monkeypatch.setattr("tensorrt_llm._torch.pyexecutor.py_executor.CUASSERT", Mock())
+
+    with pytest.raises(StopAfterSchedule):
+        PyExecutor._executor_loop_pp(executor)
+
+    assert executor._pp_rank_schedules() is schedules_batch
+    executor.scheduler.schedule_request.assert_called_once()
+    assert executor._pp_retry_until_can_schedule.called is not schedules_batch
+
+
 def test_nonzero_pp_rank_reconciles_local_only_disagg_allocations(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2189,7 +2257,7 @@ def test_nonzero_pp_rank_reconciles_local_only_disagg_allocations(
         pass
 
     executor = object.__new__(PyExecutor)
-    executor.dist = Mock(pp_rank=1, rank=1)
+    executor.dist = Mock(pp_rank=1, rank=1, is_first_pp_rank=False)
     executor.device_id = 0
     profiler = MagicMock()
     profiler.__enter__.return_value = Mock()

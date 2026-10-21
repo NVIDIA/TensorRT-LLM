@@ -3213,6 +3213,91 @@ def test_v2_hybrid_retains_configured_number_of_conversation_turns():
         mgr.shutdown()
 
 
+@skip_no_cuda
+@pytest.mark.parametrize("enable_block_reuse", [False, True])
+def test_v2_hybrid_shares_an_inflight_prefix_without_branch_snapshots(enable_block_reuse):
+    """The recurrent manager snapshots a prefilling request where a waiting
+    request asks, so it needs neither block_reuse_config.enable_branch_snapshot
+    nor a reuse policy that commits every chunk. An attention-only SWA cache
+    with scratch reuse and branch snapshots off cannot (see
+    test_kv_cache_v2_inflight_prefix.py)."""
+    mgr = _build_v2_hybrid_with_mamba_layer(
+        enable_block_reuse=enable_block_reuse,
+        enable_branch_snapshot=False,
+        enable_swa_scratch_reuse=True,
+    )
+    try:
+        assert mgr.can_share_inflight_prefix is enable_block_reuse
+    finally:
+        mgr.shutdown()
+
+
+@skip_no_cuda
+def test_v2_hybrid_waiter_points_after_history_advanced_commit():
+    """Two waiters ask a prefilling owner for snapshots after its history passed
+    its committed tokens. commit_min_snapshot accepts a commit only if it starts
+    or ends at history_length, so each commit must still meet that."""
+    mgr = _build_v2_hybrid_with_mamba_layer(enable_block_reuse=True)
+    owner = LlmRequest(
+        request_id=1,
+        max_new_tokens=1,
+        input_tokens=list(range(100)),
+        sampling_config=SamplingConfig(),
+        is_streaming=False,
+    )
+    probes = [
+        LlmRequest(
+            request_id=2 + i,
+            max_new_tokens=1,
+            input_tokens=list(range(shared)) + [1000],
+            sampling_config=SamplingConfig(),
+            is_streaming=False,
+        )
+        for i, shared in enumerate((64, 96))
+    ]
+
+    def run_chunk(end: int) -> None:
+        mgr.prepare_expect_snapshot_points([owner])
+        assert mgr.prepare_context(owner)
+        assert mgr.resize_context(owner, num_tokens=end - owner.context_current_position)
+        batch = ScheduledRequests()
+        batch.append_context_request(owner)
+        mgr.prepare_resources(batch)
+        owner.context_current_position = end
+        mgr.update_context_resources(batch)
+
+    try:
+        assert mgr.block_reuse_policy is BlockReusePolicy.PER_REQUEST
+        run_chunk(32)
+        kv_cache = mgr.kv_cache_map[owner.py_request_id]
+        # No snapshot point is pending, so history follows the context.
+        assert (kv_cache.num_committed_tokens, kv_cache.history_length) == (0, 32)
+
+        assert mgr.request_prefix_snapshot(owner, 64)
+        assert mgr.request_prefix_snapshot(owner, 96)
+        run_chunk(64)
+        assert (kv_cache.num_committed_tokens, kv_cache.history_length) == (64, 64)
+        run_chunk(96)
+        assert (kv_cache.num_committed_tokens, kv_cache.history_length) == (96, 96)
+        run_chunk(100)
+        assert kv_cache.num_committed_tokens == 96
+
+        # Both waiters reuse their whole shared prefix.
+        for probe, shared in zip(probes, (64, 96)):
+            mgr.prepare_expect_snapshot_points([probe])
+            assert mgr.prepare_context(probe)
+            batch = ScheduledRequests()
+            batch.append_context_request(probe)
+            mgr.prepare_resources(batch)
+            assert probe.prepopulated_prompt_len == shared
+            mgr.free_resources(probe)
+    finally:
+        for request in (owner, *probes):
+            if request.py_request_id in mgr.kv_cache_map:
+                mgr.free_resources(request)
+        mgr.shutdown()
+
+
 def _branch_snapshot_manager(
     enable_branch_snapshot=True,
     enable_block_reuse=True,
