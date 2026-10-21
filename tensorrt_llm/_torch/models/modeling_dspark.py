@@ -108,6 +108,7 @@ from ..modules.mhc.hyper_connection import HCHead
 from ..modules.rms_norm import RMSNorm
 from ..pyexecutor.config_utils import is_mla
 from ..speculative.interface import SpeculativeDecodingMode
+from ..speculative.spec_tail_kernels import DraftBlockPlacement
 from ..speculative.vocab_parallel import markov_chain_logits
 from ..utils import AuxStreamType
 from .modeling_deepseekv4 import (
@@ -2524,18 +2525,21 @@ def cute_dsl_mla_decode_unavailability_reason() -> Optional[str]:
     return None
 
 
+def _block_upper_triangle(block_size: int, device) -> torch.Tensor:
+    """``[1, block, 1, block]``: query i sees block key j > i (the fixup's part)."""
+    idx = torch.arange(block_size, device=device)
+    return (idx.view(1, block_size) > idx.view(block_size, 1)).view(1, block_size, 1, block_size)
+
+
 def _build_mla_block_fixup(ctx_len, page_tables, block_size, page_size) -> _MLABlockFixup:
     """Where the block's latents go, and the upper-triangle mask, for all layers."""
     device = ctx_len.device
     pos = ctx_len.view(-1, 1) + torch.arange(block_size, device=device)
-    idx = torch.arange(block_size, device=device)
     seq_lens = (ctx_len + block_size).to(torch.int32)
     return _MLABlockFixup(
         pages=page_tables.gather(1, pos // page_size),
         offsets=pos % page_size,
-        valid=(idx.view(1, block_size) > idx.view(block_size, 1)).view(
-            1, block_size, 1, block_size
-        ),
+        valid=_block_upper_triangle(block_size, device),
         page_tables_i32=page_tables.to(torch.int32),
         seq_lens_i32=seq_lens,
         # repeat_interleave, not repeat: the kernel indexes kv_bounds at
@@ -3296,12 +3300,14 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
         ctx_cache_batch_idx,
         ctx_kv_cache=None,
         ctx_page_table=None,
+        block_placement: Optional[DraftBlockPlacement] = None,
     ):
         """Eager absorbed-MLA block decode over the drafter's latent cache.
 
         Args mirror the base: ``ctx_k_cache`` is
         ``[pool_slots, L, max_ctx+block_size, 1, kv_cache_head_dim]`` and
-        ``ctx_v_cache`` is unused (``None``).
+        ``ctx_v_cache`` is unused (``None``). ``block_placement`` is where the
+        worker already placed the block in the pages (paged context only).
         """
         if self._fused_kv_weight is None:
             self._build_fused_kv_buffers()
@@ -3316,43 +3322,54 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
         blk_freqs = self._mla_freqs_cis(device)[query_positions.long()]
 
         slots = ctx_cache_batch_idx.long()
+        paged = ctx_page_table is not None
+        # attention_backend picks the implementation; both kernel backends need
+        # page tables, so the eager gather also covers the private arena.
+        variant = self._mla_block_decode_variant(paged)
+        use_kernel = variant != "eager"
         # Context pages for this batch, resolved once: rows are batch positions
         # when bound to the manager's per-request block table and slots on the
         # private arena, which is exactly what ctx_cache_batch_idx already is.
-        page_tables = (
-            None if ctx_page_table is None else ctx_page_table.index_select(0, slots).long()
-        )
+        page_tables = None if not paged else ctx_page_table.index_select(0, slots)
 
         # Valid-key mask, shared by every layer: context slots below this
         # request's length, then the whole block (DSpark is non-causal). Pages
         # past a request's allocation hold another request's data, so the mask
         # is what keeps them out -- not the block table.
-        page_size = None if page_tables is None else ctx_kv_cache[0].shape[-2]
-        capacity = ctx_k_cache.shape[2] if page_tables is None else page_tables.shape[1] * page_size
-        # attention_backend picks the implementation; both kernel backends need
-        # page tables, so the eager gather also covers the private arena.
-        variant = self._mla_block_decode_variant(page_tables is not None)
-        use_kernel = variant != "eager"
+        page_size = None if not paged else ctx_kv_cache[0].shape[-2]
+        capacity = ctx_k_cache.shape[2] if not paged else ctx_page_table.shape[1] * page_size
         # Kernel path: index and mask operands are layer-invariant, so build
         # them once here rather than five times inside the decode loop.
-        fixup = (
-            _build_mla_block_fixup(num_ctx_per_req[:batch], page_tables, block_size, page_size)
-            if use_kernel
-            else None
-        )
+        if not use_kernel:
+            fixup = None
+        elif block_placement is not None:
+            fixup = _MLABlockFixup(
+                pages=block_placement.pages,
+                offsets=block_placement.offsets,
+                valid=_block_upper_triangle(block_size, device),
+                page_tables_i32=page_tables,
+                seq_lens_i32=block_placement.seq_lens,
+                kv_bounds_i32=block_placement.kv_bounds,
+            )
+        else:
+            fixup = _build_mla_block_fixup(
+                num_ctx_per_req[:batch], page_tables.long(), block_size, page_size
+            )
         logger.info_once(
             "MLA DSpark block decode: "
             + {
                 "trtllm_gen": "trtllm-gen paged kernel, block in pool + upper-triangle fixup",
                 "cute_dsl": "one cute-dsl pass over context and block, no fixup",
                 "eager": f"eager (backend={self.dflash_attention_backend!r}, "
-                f"paged={page_tables is not None}, "
+                f"paged={paged}, "
                 f"flashinfer={self._mla_decode_op() is not None})",
             }[variant],
             key="mla_dspark_block_decode_variant",
         )
         # Eager path only: dense key mask over the gathered context.
         if not use_kernel:
+            if paged:
+                page_tables = page_tables.long()
             ctx_valid = torch.arange(capacity, device=device).unsqueeze(0) < num_ctx_per_req[
                 :batch
             ].view(-1, 1)
@@ -3439,7 +3456,7 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
                     capacity,
                 )
             else:
-                if page_tables is None:
+                if not paged:
                     ctx = ctx_k_cache[slots, layer_idx, :, 0, :]
                 else:
                     # [pages, kv_factor=1, nkv=1, page, hd] -> gather this

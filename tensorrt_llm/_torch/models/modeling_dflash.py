@@ -28,6 +28,7 @@ from ..speculative.dflash_attention import (
     get_dflash_trtllm_gen_ops,
 )
 from ..speculative.interface import SpeculativeDecodingMode
+from ..speculative.spec_tail_kernels import DraftBlockPlacement
 from .modeling_utils import FUSED_MODULE_COMPONENTS, get_model_architecture, register_draft_model
 
 
@@ -1454,6 +1455,7 @@ class DFlashForCausalLM(nn.Module):
         ctx_cache_batch_idx: torch.Tensor,
         ctx_kv_cache: Optional[torch.Tensor] = None,
         ctx_page_table: Optional[torch.Tensor] = None,
+        block_placement: Optional[DraftBlockPlacement] = None,
     ) -> torch.Tensor:
         """DFlash draft forward with cross-attention over a pooled K/V buffer.
 
@@ -1466,6 +1468,9 @@ class DFlashForCausalLM(nn.Module):
             ctx_k_cache: [pool_batch, L, max_ctx+block_size, nkv, hd]
             ctx_v_cache: [pool_batch, L, max_ctx+block_size, nkv, hd]
             ctx_cache_batch_idx: [B] — slot index into the pool per batch entry
+            block_placement: where the block's own positions sit in the
+                context pages, from the worker's paged single-latent
+                preparation; a drafter that appends the block itself ignores it
         Returns:
             [B * block_size, hidden_size]
         """

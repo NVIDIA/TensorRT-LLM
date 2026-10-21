@@ -41,6 +41,12 @@ from .dflash_attention import (
     validate_dflash_trtllm_gen_runtime,
 )
 from .interface import SpecMetadata, SpecWorkerBase
+from .spec_tail_kernels import (
+    DraftBlockPlacement,
+    decode_draft_block_table,
+    dflash_paged_latent_prepare,
+    store_context_latents,
+)
 from .vocab_parallel import VocabParallelHead, VocabShardedLogits
 
 # Backends that keep the draft's private context K/V in a paged HND pool.
@@ -769,6 +775,11 @@ class DFlashWorker(SpecWorkerBase):
         # [L, pages, K/V, nkv, page, hd] when privately allocated, or the draft
         # KV cache manager's per-layer pool views when bound to it.
         self._ctx_kv_buf = None
+        # [L] int64 base addresses of the manager's per-layer pool views.
+        self._ctx_kv_ptrs = None
+        # Whether a generation step's drafter inputs can be prepared by
+        # _prepare_paged_latent_gen_inputs; decided with the pool binding.
+        self._paged_latent_prepare = False
         # The manager _ctx_kv_buf is borrowed from, so a swap can be detected.
         self._ctx_kv_manager = None
         # Static per-slot page table for the private arena. When bound to the
@@ -1162,15 +1173,16 @@ class DFlashWorker(SpecWorkerBase):
                 "draft_kv_cache_block_offsets this iteration."
             )
         # Field 0 of the K/V pair: both name the same block for a kv_factor=2
-        # pool, and the drafter addresses blocks, not planes.
-        # clone(): .to() is a no-op for an int64 source, and the in-place ops
-        # below would then edit attn_metadata's own tensor.
-        encoded = src[self._ctx_pool_idx, :num_seqs, 0].to(torch.int64).clone()
-        # Before the clamp erases the placeholders. Informative only on the
-        # python V2 backend; the cpp one already mapped BAD_PAGE_INDEX to 0.
-        self._ctx_block_counts[:num_seqs].copy_((encoded >= 0).sum(dim=1))
-        decoded = encoded.clamp_(min=0).div_(self._ctx_block_divisor, rounding_mode="floor")
-        self._ctx_block_tables[:num_seqs].copy_(decoded.to(torch.int32))
+        # pool, and the drafter addresses blocks, not planes. The block count
+        # is taken before the clamp erases the placeholders; it is informative
+        # only on the python V2 backend, the cpp one already mapped
+        # BAD_PAGE_INDEX to 0.
+        decode_draft_block_table(
+            src[self._ctx_pool_idx, :num_seqs, 0],
+            self._ctx_block_divisor,
+            self._ctx_block_tables,
+            self._ctx_block_counts,
+        )
         return True
 
     def _lazy_init_ctx_buffers(
@@ -1202,6 +1214,7 @@ class DFlashWorker(SpecWorkerBase):
         self._ctx_kv_manager = draft_kv_cache_manager
         self._ctx_block_tables = None
         self._ctx_block_counts = None
+        self._paged_latent_prepare = False
         max_batch = spec_metadata.max_num_requests
 
         # ctx_len is 1:1 with the target's positions, so max_seq_len bounds it.
@@ -1372,6 +1385,14 @@ class DFlashWorker(SpecWorkerBase):
                 # block table one iteration at a time, so the footprint follows
                 # the sequences served rather than max_batch x max_seq_len.
                 self._ctx_kv_buf = pool
+                self._ctx_kv_ptrs = torch.tensor(
+                    [layer.data_ptr() for layer in pool], dtype=torch.int64, device="cuda"
+                )
+                # The fused preparation stores single-latent context entries
+                # projected from the captured target features through fc and
+                # hidden_norm (which every loaded DFlash drafter owns), as the
+                # eager path does; LiLiCorr drafters keep the eager path.
+                self._paged_latent_prepare = kv_factor == 1 and not draft_model._uses_lilicorr
                 # Only a manager that publishes and matches its own blocks can
                 # hand back a reused prefix's drafter K/V; the private arena and
                 # an unpaired draft pool both start every request at 0.
@@ -1896,6 +1917,7 @@ class DFlashWorker(SpecWorkerBase):
                     ctx_cache_batch_idx=inputs["ctx_cache_batch_idx"],
                     ctx_kv_cache=inputs["ctx_kv_cache"],
                     ctx_page_table=inputs["ctx_page_table"],
+                    block_placement=inputs["block_placement"],
                 )
 
                 # Gather K logits per gen request from the block outputs.
@@ -2237,6 +2259,24 @@ class DFlashWorker(SpecWorkerBase):
             spec_metadata.hidden_size if spec_metadata.hidden_size > 0 else hidden_states.shape[-1]
         )
         lilicorr_anchor = None
+        # The drafter's own trained mask row, if it kept one for the mask id in use.
+        trained_mask_embedding = (
+            getattr(draft_model, "mask_token_embedding", None)
+            if mask_token_id == getattr(draft_model, "mask_token_id", None)
+            else None
+        )
+
+        if num_gens > 0 and self._fused_gen_prepare_applies(spec_metadata):
+            return self._prepare_paged_latent_gen_inputs(
+                accepted_tokens,
+                num_accepted_tokens,
+                attn_metadata,
+                spec_metadata,
+                draft_model,
+                total_target_tokens,
+                mask_token_id,
+                trained_mask_embedding,
+            )
 
         if num_gens > 0:
             gen_num_accepted = num_accepted_tokens[num_contexts : num_contexts + num_gens]
@@ -2281,12 +2321,6 @@ class DFlashWorker(SpecWorkerBase):
             query_position_ids = ctx_len_now.unsqueeze(1) + j_block.unsqueeze(0)
             ctx_position_ids = ctx_len_gen.unsqueeze(1) + offsets_kp1.unsqueeze(0)
 
-            # The drafter's own trained mask row, if it kept one for the mask id in use.
-            trained_mask_embedding = (
-                getattr(draft_model, "mask_token_embedding", None)
-                if mask_token_id == getattr(draft_model, "mask_token_id", None)
-                else None
-            )
             noise_embed_2d = dflash_noise_block_embedding(
                 embed_tokens, bonus, mask_token_id, query_tokens_per_req, trained_mask_embedding
             )
@@ -2400,5 +2434,97 @@ class DFlashWorker(SpecWorkerBase):
                 self._ctx_block_tables
                 if self._ctx_block_tables is not None
                 else self._ctx_page_table
+            ),
+            "block_placement": None,
+        }
+
+    def _fused_gen_prepare_applies(self, spec_metadata) -> bool:
+        """Whether :meth:`_prepare_paged_latent_gen_inputs` covers this step: a
+        drafter it supports (``_paged_latent_prepare``), captured target
+        features, drafting from all ``K + 1`` target tokens."""
+        return (
+            self._paged_latent_prepare
+            and spec_metadata.runtime_draft_len + 1 == self._draft_tokens_per_req
+            and spec_metadata.captured_hidden_states is not None
+        )
+
+    def _prepare_paged_latent_gen_inputs(
+        self,
+        accepted_tokens: torch.Tensor,
+        num_accepted_tokens: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+        spec_metadata: DFlashSpecMetadata,
+        draft_model: nn.Module,
+        total_target_tokens: int,
+        mask_token_id: int,
+        trained_mask_embedding: Optional[torch.Tensor],
+    ) -> dict:
+        """:meth:`prepare_1st_drafter_inputs` for the generation requests of a
+        step (context requests may precede them) whose drafter context is a
+        paged single-latent cache.
+
+        Same inputs and side effects (context latents stored, ``_ctx_len``
+        advanced, ``seq_lens`` set) with the per-request bookkeeping in one
+        kernel and the latent store of every layer in another; also places the
+        block's own positions in the pages for the drafter's block decode.
+        """
+        num_contexts = attn_metadata.num_contexts
+        num_gens = attn_metadata.num_seqs - num_contexts
+        width = self._draft_tokens_per_req
+        block_size = self._compute_block_size
+        prep = dflash_paged_latent_prepare(
+            num_accepted_tokens,
+            accepted_tokens,
+            self._batch_to_slot_buffer.tensor[num_contexts : num_contexts + num_gens],
+            self._ctx_len,
+            self._ctx_block_counts,
+            self._ctx_block_tables,
+            attn_metadata._seq_lens_cuda,
+            num_contexts,
+            self._dummy_slot,
+            self._max_ctx,
+            self._ctx_page_size,
+            block_size,
+            width,
+        )
+        attn_metadata._seq_lens[num_contexts : num_contexts + num_gens] = width
+
+        noise_embedding = dflash_noise_block_embedding(
+            draft_model.draft_model_full.model.embed_tokens,
+            prep.bonus,
+            mask_token_id,
+            block_size,
+            trained_mask_embedding,
+        )
+        gen_start = attn_metadata.num_ctx_tokens
+        captured_hs = spec_metadata.get_hidden_states(total_target_tokens)
+        gen_hs = captured_hs[gen_start : gen_start + num_gens * width]
+        projected = draft_model.project_target_hidden(gen_hs.reshape(-1, gen_hs.shape[-1]))
+        latent, _ = draft_model.precompute_context_kv(
+            projected.to(self._ctx_kv_buf[0].dtype), prep.ctx_positions
+        )
+        store_context_latents(
+            latent[:, :, 0],
+            self._ctx_kv_buf,
+            self._ctx_kv_ptrs,
+            prep.store_pages,
+            prep.store_offsets,
+            prep.store_mask,
+        )
+        return {
+            "lilicorr_anchor": None,
+            "noise_embedding": noise_embedding,
+            "query_positions": prep.query_positions,
+            "num_ctx_per_req": prep.num_ctx,
+            "ctx_k_cache": self._ctx_k_buf,
+            "ctx_v_cache": self._ctx_v_buf,
+            "ctx_cache_batch_idx": torch.arange(
+                num_contexts, num_contexts + num_gens, dtype=torch.long, device="cuda"
+            ),
+            "first_prev_tokens": prep.bonus,
+            "ctx_kv_cache": self._ctx_kv_buf,
+            "ctx_page_table": self._ctx_block_tables,
+            "block_placement": DraftBlockPlacement(
+                prep.blk_pages, prep.blk_offsets, prep.blk_seq_lens, prep.blk_kv_bounds
             ),
         }
